@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 120 120" width="120" height="120" role="img" aria-label="tessl — tesseract">
+  <title>tessl — tesseract</title>
+  <g fill="none" stroke="#6C4CF1" stroke-width="7" stroke-linejoin="round" stroke-linecap="round">
+    <rect x="12" y="12" width="96" height="96" rx="6"/>
+    <rect x="40" y="40" width="40" height="40" rx="4"/>
+    <path d="M12 12 L40 40 M108 12 L80 40 M12 108 L40 80 M108 108 L80 80"/>
+  </g>
+</svg>

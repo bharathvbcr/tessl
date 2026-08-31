@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 120 120" width="120" height="120" role="img" aria-label="tessl — isometric tile">
+  <title>tessl — isometric tile</title>
+  <path d="M60 8 L110 37 L110 83 L60 112 L10 83 L10 37 Z" fill="#6C4CF1"/>
+  <path d="M60 8 L110 37 L60 66 L10 37 Z" fill="#FFFFFF" fill-opacity="0.22"/>
+  <path d="M60 66 L110 37 L110 83 L60 112 Z" fill="#000000" fill-opacity="0.18"/>
+</svg>

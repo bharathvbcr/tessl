@@ -33,15 +33,52 @@ fn main() {
     println!("cargo:rustc-link-lib=framework=Metal");
     println!("cargo:rustc-link-lib=framework=Foundation");
 
+    // docs.rs builds on x86_64 Linux with no Xcode and no Metal toolchain, and
+    // `default.metallib` is gitignored so it is not in the published .crate
+    // either. Every other branch below shells out to `xcrun`, which does not
+    // exist there — so without this the crate has no path to a rendered docs
+    // page at all, only a red build.
+    //
+    // Documentation does not run kernels, so an empty metallib path is the
+    // honest answer: `metallib_path()` returns "" and `GpuRuntime::new` fails
+    // loudly if anything ever tried. `DOCS_RS` is set only by docs.rs, so this
+    // cannot silently swallow a real build.
+    if env::var_os("DOCS_RS").is_some() {
+        println!("cargo:warning=DOCS_RS set; skipping metallib AOT (docs only, no GPU)");
+        println!(
+            "cargo:kernels={}",
+            PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap())
+                .join("kernels")
+                .display()
+        );
+        println!("cargo:rustc-env=TESSL_METALLIB=");
+        return;
+    }
+
     // Legacy spelling still honoured: this one is set by hand in CI/offline runs.
     if env::var_os("TESSL_SKIP_AOT").is_some() || env::var_os("METAL_RUNTIME_SKIP_AOT").is_some() {
         println!("cargo:warning=TESSL_SKIP_AOT set; skipping metallib AOT");
         let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
         let crate_lib = manifest_dir.join("default.metallib");
-        println!(
-            "cargo:rustc-env=TESSL_METALLIB={}",
-            crate_lib.display()
-        );
+        // Fail here rather than at every `GpuRuntime::new()`.
+        //
+        // `default.metallib` is gitignored, so it is absent on a fresh
+        // checkout. Baking the path unconditionally produced a build that
+        // succeeded and a binary in which every runtime construction failed —
+        // the error surfacing thousands of lines away from its cause. This is
+        // an escape hatch for offline builds over a known-good artefact, so
+        // requiring that artefact to exist is the whole contract.
+        if !crate_lib.is_file() {
+            panic!(
+                "TESSL_SKIP_AOT is set but {} does not exist. That variable skips \
+                 the metallib compile and points the crate at a prebuilt artefact; \
+                 it is gitignored and absent on a fresh checkout. Either unset \
+                 TESSL_SKIP_AOT and build the shaders, or place a known-good \
+                 default.metallib at the crate root.",
+                crate_lib.display()
+            );
+        }
+        println!("cargo:rustc-env=TESSL_METALLIB={}", crate_lib.display());
         return;
     }
 
@@ -68,21 +105,27 @@ fn main() {
     // nothing dispatches at runtime. Linking it took the shipped metallib from
     // 0.22 MB to 1.09 MB, so it is opt-in. It lives in a subdirectory precisely
     // so the directory glob below cannot pick it up by accident.
-    let want_tune = env::var_os("TESSL_GEMM_TUNE").is_some()
-        || env::var_os("METAL_NATIVE_GEMM_TUNE").is_some();
+    let want_tune =
+        env::var_os("TESSL_GEMM_TUNE").is_some() || env::var_os("METAL_NATIVE_GEMM_TUNE").is_some();
     let mut tensorops_sources: Vec<PathBuf> = vec![kernels_dir.join("matmul_tensorops.metal")];
     if want_tune {
         tensorops_sources.push(kernels_dir.join("tune/matmul_tensorops_tune.metal"));
     }
     for src in &tensorops_sources {
-        let name = src.file_name().and_then(|n| n.to_str()).unwrap_or("<unnamed>");
+        let name = src
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("<unnamed>");
         if !src.exists() {
             panic!(
                 "required TensorOps source missing: {}; Metal 4 / macOS 26 toolchain required",
                 src.display()
             );
         }
-        let air = out_dir.join(format!("{}.air", src.file_stem().unwrap().to_string_lossy()));
+        let air = out_dir.join(format!(
+            "{}.air",
+            src.file_stem().unwrap().to_string_lossy()
+        ));
         let status = Command::new(&metal)
             .args([
                 "-std=metal4.0",
@@ -153,9 +196,14 @@ fn main() {
 
     // Metal can retain file-backed library data after loading. Never relink a
     // pathname baked into a prior binary: each build owns an immutable artifact.
-    let build_id = format!("{}-{}", std::process::id(),
-        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
-            .expect("system clock before Unix epoch").as_nanos());
+    let build_id = format!(
+        "{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock before Unix epoch")
+            .as_nanos()
+    );
     let metallib_out = out_dir.join(format!("default-{build_id}.metallib"));
     fs::File::create_new(&metallib_out).expect("reserve unique metallib output");
     let mut link = Command::new(&metallib);
@@ -183,10 +231,7 @@ fn main() {
         fs::rename(&staged_copy, &crate_copy).expect("publish offline metallib");
     }
 
-    println!(
-        "cargo:rustc-env=TESSL_METALLIB={}",
-        metallib_out.display()
-    );
+    println!("cargo:rustc-env=TESSL_METALLIB={}", metallib_out.display());
 }
 
 fn try_metal_compile(metal: &Path, sdk: &str, src: &Path, air: &Path, metal_std: &str) -> bool {
@@ -302,6 +347,12 @@ fn is_packaging_dir(manifest_dir: &Path) -> bool {
     let mut it = manifest_dir.components().rev();
     // .../target/package/<name>-<version>
     it.next().is_some()
-        && it.next().map(|c| c.as_os_str() == "package").unwrap_or(false)
-        && it.next().map(|c| c.as_os_str() == "target").unwrap_or(false)
+        && it
+            .next()
+            .map(|c| c.as_os_str() == "package")
+            .unwrap_or(false)
+        && it
+            .next()
+            .map(|c| c.as_os_str() == "target")
+            .unwrap_or(false)
 }

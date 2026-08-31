@@ -1,5 +1,12 @@
-target/
+/target/
+
+# Build artefacts from the Metal AOT step in build.rs. `default.metallib` is
+# the compiled output and `*.air` the intermediate; both are regenerated on
+# every build and must not be committed — TESSL_SKIP_AOT exists precisely so a
+# known-good one can be dropped in locally without it becoming repo state.
 default.metallib
 *.metallib
+*.air
+
 .DS_Store
 __pycache__/

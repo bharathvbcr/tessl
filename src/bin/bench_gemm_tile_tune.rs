@@ -5,11 +5,15 @@
 //! the production kernel accumulates on the first K block. Every variant is
 //! checked against the production kernel's output before its time is reported.
 
+// A tuning sweep takes the full GEMM shape plus the tile parameters it is
+// sweeping. Bundling them would add a struct that every call site unpacks.
+#![allow(clippy::too_many_arguments)]
+
+use objc2_metal::MTLComputePipelineState;
+use std::time::Instant;
 use tessl::gemm::{cast_f32_to_bf16, gemm, GemmBackend};
 use tessl::runtime::{mtl_size, GpuRuntime};
 use tessl::tensor::Tensor;
-use objc2_metal::MTLComputePipelineState;
-use std::time::Instant;
 
 struct Variant {
     kernel: &'static str,
@@ -22,18 +26,88 @@ struct Variant {
 }
 
 const VARIANTS: &[Variant] = &[
-    Variant { kernel: "mm_bf16_64x32_bk128_sg4_accf", sm: 64, sn: 32, bk: 128, nsg: 4, needs_zero: true },
-    Variant { kernel: "mm_bf16_64x64_bk256_sg4",      sm: 64, sn: 64, bk: 256, nsg: 4, needs_zero: false },
-    Variant { kernel: "mm_bf16_128x64_bk256_sg8",     sm: 128, sn: 64, bk: 256, nsg: 8, needs_zero: false },
-    Variant { kernel: "mm_bf16_128x128_bk256_sg4",    sm: 128, sn: 128, bk: 256, nsg: 4, needs_zero: false },
+    Variant {
+        kernel: "mm_bf16_64x32_bk128_sg4_accf",
+        sm: 64,
+        sn: 32,
+        bk: 128,
+        nsg: 4,
+        needs_zero: true,
+    },
+    Variant {
+        kernel: "mm_bf16_64x64_bk256_sg4",
+        sm: 64,
+        sn: 64,
+        bk: 256,
+        nsg: 4,
+        needs_zero: false,
+    },
+    Variant {
+        kernel: "mm_bf16_128x64_bk256_sg8",
+        sm: 128,
+        sn: 64,
+        bk: 256,
+        nsg: 8,
+        needs_zero: false,
+    },
+    Variant {
+        kernel: "mm_bf16_128x128_bk256_sg4",
+        sm: 128,
+        sn: 128,
+        bk: 256,
+        nsg: 4,
+        needs_zero: false,
+    },
     // Cooperative destination tensor: register accumulator, C written once,
     // single dynamic-K run. bk: 1 so the divisibility gate never skips on K.
-    Variant { kernel: "mm_bf16_coop_64x32_sg4",    sm: 64,  sn: 32,  bk: 1, nsg: 4, needs_zero: false },
-    Variant { kernel: "mm_bf16_coop_64x64_sg4",    sm: 64,  sn: 64,  bk: 1, nsg: 4, needs_zero: false },
-    Variant { kernel: "mm_bf16_coop_128x64_sg4",   sm: 128, sn: 64,  bk: 1, nsg: 4, needs_zero: false },
-    Variant { kernel: "mm_bf16_coop_128x64_sg8",   sm: 128, sn: 64,  bk: 1, nsg: 8, needs_zero: false },
-    Variant { kernel: "mm_bf16_coop_128x128_sg8",  sm: 128, sn: 128, bk: 1, nsg: 8, needs_zero: false },
-    Variant { kernel: "mm_bf16_coop_256x64_sg8",   sm: 256, sn: 64,  bk: 1, nsg: 8, needs_zero: false },
+    Variant {
+        kernel: "mm_bf16_coop_64x32_sg4",
+        sm: 64,
+        sn: 32,
+        bk: 1,
+        nsg: 4,
+        needs_zero: false,
+    },
+    Variant {
+        kernel: "mm_bf16_coop_64x64_sg4",
+        sm: 64,
+        sn: 64,
+        bk: 1,
+        nsg: 4,
+        needs_zero: false,
+    },
+    Variant {
+        kernel: "mm_bf16_coop_128x64_sg4",
+        sm: 128,
+        sn: 64,
+        bk: 1,
+        nsg: 4,
+        needs_zero: false,
+    },
+    Variant {
+        kernel: "mm_bf16_coop_128x64_sg8",
+        sm: 128,
+        sn: 64,
+        bk: 1,
+        nsg: 8,
+        needs_zero: false,
+    },
+    Variant {
+        kernel: "mm_bf16_coop_128x128_sg8",
+        sm: 128,
+        sn: 128,
+        bk: 1,
+        nsg: 8,
+        needs_zero: false,
+    },
+    Variant {
+        kernel: "mm_bf16_coop_256x64_sg8",
+        sm: 256,
+        sn: 64,
+        bk: 1,
+        nsg: 8,
+        needs_zero: false,
+    },
 ];
 
 const SHAPES: &[(usize, usize, usize, &str)] = &[
@@ -51,16 +125,24 @@ const SHAPES: &[(usize, usize, usize, &str)] = &[
 
 fn fill(n: usize, seed: u64) -> Vec<f32> {
     let mut s = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
-    (0..n).map(|_| {
-        s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-        ((((s >> 32) as u32) as f64 / u32::MAX as f64) * 2.0 - 1.0) as f32
-    }).collect()
+    (0..n)
+        .map(|_| {
+            s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((((s >> 32) as u32) as f64 / u32::MAX as f64) * 2.0 - 1.0) as f32
+        })
+        .collect()
 }
 
 fn median(mut v: Vec<f64>) -> f64 {
     v.sort_by(|a, b| a.partial_cmp(b).unwrap());
     let n = v.len();
-    if n % 2 == 1 { v[n / 2] } else { (v[n / 2 - 1] + v[n / 2]) / 2.0 }
+    if n % 2 == 1 {
+        v[n / 2]
+    } else {
+        (v[n / 2 - 1] + v[n / 2]) / 2.0
+    }
 }
 
 fn run_variant(
@@ -77,10 +159,10 @@ fn run_variant(
     let zero_p = rt.pipeline("zero_f32")?;
     let tiles_n = n / v.sn;
     let tg = tiles_n * (m / v.sm);
-    let tpt = p.threadExecutionWidth() as usize * v.nsg;
+    let tpt = p.threadExecutionWidth() * v.nsg;
     let numel = c.numel();
-    let z_tpt = (zero_p.threadExecutionWidth() as usize).min(numel).max(1);
-    let z_groups = (numel + z_tpt - 1) / z_tpt;
+    let z_tpt = zero_p.threadExecutionWidth().min(numel).max(1);
+    let z_groups = numel.div_ceil(z_tpt);
     let needs_zero = v.needs_zero;
     rt.with_binder(|bnd| {
         if needs_zero {
@@ -105,18 +187,30 @@ fn run_variant(
 
 fn main() -> Result<(), String> {
     let rt = GpuRuntime::new()?;
-    let warmup: usize = std::env::var("BENCH_WARMUP").ok().and_then(|s| s.parse().ok()).unwrap_or(10);
-    let iters: usize = std::env::var("BENCH_ITERS").ok().and_then(|s| s.parse().ok()).unwrap_or(30);
+    let warmup: usize = std::env::var("BENCH_WARMUP")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(10);
+    let iters: usize = std::env::var("BENCH_ITERS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(30);
 
-    println!("{:<32}{:>12}{:>14}{:>16}", "kernel", "maxTPTG", "tgMem(B)", "requested TPTG");
+    println!(
+        "{:<32}{:>12}{:>14}{:>16}",
+        "kernel", "maxTPTG", "tgMem(B)", "requested TPTG"
+    );
     for v in VARIANTS {
         match rt.pipeline(v.kernel) {
             Ok(p) => {
-                let w = p.threadExecutionWidth() as usize;
-                println!("{:<32}{:>12}{:>14}{:>16}", v.kernel,
-                         p.maxTotalThreadsPerThreadgroup(),
-                         p.staticThreadgroupMemoryLength(),
-                         w * v.nsg);
+                let w = p.threadExecutionWidth();
+                println!(
+                    "{:<32}{:>12}{:>14}{:>16}",
+                    v.kernel,
+                    p.maxTotalThreadsPerThreadgroup(),
+                    p.staticThreadgroupMemoryLength(),
+                    w * v.nsg
+                );
             }
             Err(e) => println!("{:<32}  pipeline error: {e}", v.kernel),
         }
@@ -139,7 +233,10 @@ fn main() -> Result<(), String> {
 
         let flop = 2.0 * m as f64 * n as f64 * k as f64;
         let prod = {
-            for _ in 0..warmup { gemm(&a_bf, &b_bf, &c_ref, GemmBackend::TensorOps)?; rt.synchronize()?; }
+            for _ in 0..warmup {
+                gemm(&a_bf, &b_bf, &c_ref, GemmBackend::TensorOps)?;
+                rt.synchronize()?;
+            }
             let mut s = Vec::new();
             for _ in 0..iters {
                 let t0 = Instant::now();
@@ -149,9 +246,14 @@ fn main() -> Result<(), String> {
             }
             median(s)
         };
-        println!("\n{label}  M={m} N={n} K={k}   production {prod:.3} ms  {:.0} GFLOP/s",
-                 flop / (prod * 1e6));
-        println!("  {:<32}{:>10}{:>12}{:>9}{:>12}", "variant", "ms", "GFLOP/s", "vs prod", "max_rel_err");
+        println!(
+            "\n{label}  M={m} N={n} K={k}   production {prod:.3} ms  {:.0} GFLOP/s",
+            flop / (prod * 1e6)
+        );
+        println!(
+            "  {:<32}{:>10}{:>12}{:>9}{:>12}",
+            "variant", "ms", "GFLOP/s", "vs prod", "max_rel_err"
+        );
 
         for v in VARIANTS {
             if m % v.sm != 0 || n % v.sn != 0 || k % v.bk != 0 {
@@ -165,11 +267,17 @@ fn main() -> Result<(), String> {
             }
             rt.synchronize()?;
             let got = c.buffer.read_f32()[..m * n].to_vec();
-            let err = got.iter().zip(&refv)
+            let err = got
+                .iter()
+                .zip(&refv)
                 .map(|(x, y)| (*x as f64 - *y as f64).abs())
-                .fold(0.0, f64::max) / refmax;
+                .fold(0.0, f64::max)
+                / refmax;
 
-            for _ in 0..warmup { run_variant(&rt, v, &a_bf, &b_bf, &c, m, n, k)?; rt.synchronize()?; }
+            for _ in 0..warmup {
+                run_variant(&rt, v, &a_bf, &b_bf, &c, m, n, k)?;
+                rt.synchronize()?;
+            }
             let mut s = Vec::new();
             for _ in 0..iters {
                 let t0 = Instant::now();
@@ -178,8 +286,14 @@ fn main() -> Result<(), String> {
                 s.push(t0.elapsed().as_secs_f64() * 1000.0);
             }
             let med = median(s);
-            println!("  {:<32}{:>10.3}{:>12.0}{:>8.2}×{:>12.2e}",
-                     v.kernel, med, flop / (med * 1e6), prod / med, err);
+            println!(
+                "  {:<32}{:>10.3}{:>12.0}{:>8.2}×{:>12.2e}",
+                v.kernel,
+                med,
+                flop / (med * 1e6),
+                prod / med,
+                err
+            );
         }
 
         let prod_after = {
@@ -192,9 +306,12 @@ fn main() -> Result<(), String> {
             }
             median(s)
         };
-        println!("  production re-measured after: {prod_after:.3} ms ({:.0} GFLOP/s) \
+        println!(
+            "  production re-measured after: {prod_after:.3} ms ({:.0} GFLOP/s) \
 — drift vs before: {:+.1}%",
-                 flop / (prod_after * 1e6), (prod_after / prod - 1.0) * 100.0);
+            flop / (prod_after * 1e6),
+            (prod_after / prod - 1.0) * 100.0
+        );
     }
     Ok(())
 }

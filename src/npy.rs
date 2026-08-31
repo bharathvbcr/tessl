@@ -68,6 +68,13 @@ pub fn read_npy(path: &Path) -> Result<NpyArray, String> {
             let mut data = vec![0.0f32; numel];
             #[cfg(target_endian = "little")]
             {
+                // SAFETY: reinterprets an owned, freshly allocated `Vec`'s
+                // storage as the byte slice `read_exact` fills. The pointer is
+                // valid and uniquely owned for the whole block, the length is
+                // `size_of_val` of that same allocation so it cannot overrun,
+                // and every bit pattern is a valid `f32`/`i64` — the file may
+                // hold nonsense numbers but never an invalid value. Gated on
+                // little-endian, where the on-disk layout matches memory.
                 let bytes = unsafe {
                     std::slice::from_raw_parts_mut(
                         data.as_mut_ptr().cast::<u8>(),
@@ -94,6 +101,13 @@ pub fn read_npy(path: &Path) -> Result<NpyArray, String> {
             let mut data = vec![0i64; numel];
             #[cfg(target_endian = "little")]
             {
+                // SAFETY: reinterprets an owned, freshly allocated `Vec`'s
+                // storage as the byte slice `read_exact` fills. The pointer is
+                // valid and uniquely owned for the whole block, the length is
+                // `size_of_val` of that same allocation so it cannot overrun,
+                // and every bit pattern is a valid `f32`/`i64` — the file may
+                // hold nonsense numbers but never an invalid value. Gated on
+                // little-endian, where the on-disk layout matches memory.
                 let bytes = unsafe {
                     std::slice::from_raw_parts_mut(
                         data.as_mut_ptr().cast::<u8>(),
@@ -245,6 +259,11 @@ pub fn write_npy_f32(path: &Path, shape: &[usize], data: &[f32]) -> Result<(), S
     // already-contiguous slice as bytes and submit one bulk payload instead.
     #[cfg(target_endian = "little")]
     {
+        // SAFETY: read-only view of a caller-owned `&[f32]` as bytes. The
+        // borrow keeps it alive and immutable for the call, the length is
+        // `size_of_val` of that same slice, and `u8` has no alignment or
+        // validity requirement any `f32` allocation could fail. Gated on
+        // little-endian, matching the `<f4` descriptor written above.
         let bytes = unsafe {
             std::slice::from_raw_parts(data.as_ptr().cast::<u8>(), std::mem::size_of_val(data))
         };

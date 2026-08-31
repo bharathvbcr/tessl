@@ -41,28 +41,44 @@ pub struct Binder<'a> {
 
 impl<'a> Binder<'a> {
     pub(crate) fn finish(&self) -> Result<(), String> {
-        match &self.error { Some(e) => Err(e.clone()), None => Ok(()) }
+        match &self.error {
+            Some(e) => Err(e.clone()),
+            None => Ok(()),
+        }
     }
     fn fail(&mut self, message: impl Into<String>) {
-        if self.error.is_none() { self.error = Some(message.into()); }
+        if self.error.is_none() {
+            self.error = Some(message.into());
+        }
     }
     fn valid_index(&mut self, index: usize) -> bool {
-        if index >= self.max_buffers { self.fail("argument-table buffer index out of range"); }
+        if index >= self.max_buffers {
+            self.fail("argument-table buffer index out of range");
+        }
         self.error.is_none()
     }
     fn write_constants(&mut self, bytes: &[u8]) -> u64 {
-        if self.error.is_some() { return 0; }
+        if self.error.is_some() {
+            return 0;
+        }
         let start = self.const_cursor.checked_add(15).map(|n| n & !15);
         let end = start.and_then(|n| n.checked_add(bytes.len().max(4)));
         let (Some(start), Some(end)) = (start, end) else {
-            self.fail("constant arena offset overflow"); return 0;
+            self.fail("constant arena offset overflow");
+            return 0;
         };
         if bytes.is_empty() || end > self.const_staging.length() {
-            self.fail("constant arena exhausted or empty payload"); return 0;
+            self.fail("constant arena exhausted or empty payload");
+            return 0;
         }
         // SAFETY: checked the entire destination range before writing.
         unsafe {
-            let dst = self.const_staging.contents().as_ptr().cast::<u8>().add(start);
+            let dst = self
+                .const_staging
+                .contents()
+                .as_ptr()
+                .cast::<u8>()
+                .add(start);
             std::ptr::write_bytes(dst, 0, bytes.len().max(4));
             std::ptr::copy_nonoverlapping(bytes.as_ptr(), dst, bytes.len());
         }
@@ -125,10 +141,7 @@ impl<'a> Binder<'a> {
     /// `setArgumentTable` call was issued; `false` when the encoder already
     /// held this same table (pointer identity — A2 v0.5.7 sticky adopt).
     #[inline]
-    pub fn adopt_argument_table(
-        &mut self,
-        table: &ProtocolObject<dyn MTL4ArgumentTable>,
-    ) -> bool {
+    pub fn adopt_argument_table(&mut self, table: &ProtocolObject<dyn MTL4ArgumentTable>) -> bool {
         let ptr = table as *const _ as usize;
         if self.arg_table_latched && self.last_arg_table_ptr == Some(ptr) {
             return false;
@@ -148,7 +161,9 @@ impl<'a> Binder<'a> {
     }
 
     pub fn set_pipeline(&mut self, pipeline: &ProtocolObject<dyn MTLComputePipelineState>) {
-        if self.error.is_some() { return; }
+        if self.error.is_some() {
+            return;
+        }
         self.max_threads = Some(pipeline.maxTotalThreadsPerThreadgroup());
         self.enc.setComputePipelineState(pipeline);
         if crate::decode_icb::decode_icb_capture_active() {
@@ -157,8 +172,7 @@ impl<'a> Binder<'a> {
             // SAFETY: pipeline is a live Objective-C object retained by the caller
             // for the duration of with_binder; we retain an extra ref for the tape.
             let retained = unsafe {
-                Retained::retain(pipeline as *const _ as *mut _)
-                    .expect("retain pipeline")
+                Retained::retain(pipeline as *const _ as *mut _).expect("retain pipeline")
             };
             self.last_pipeline = Some(retained);
             if let Some(ref p) = self.last_pipeline {
@@ -167,36 +181,48 @@ impl<'a> Binder<'a> {
         }
     }
 
-    pub fn bind_buf(
-        &mut self,
-        buf: &ProtocolObject<dyn MTLBuffer>,
-        offset: usize,
-        index: usize,
-    ) {
-        if !self.valid_index(index) { return; }
+    pub fn bind_buf(&mut self, buf: &ProtocolObject<dyn MTLBuffer>, offset: usize, index: usize) {
+        if !self.valid_index(index) {
+            return;
+        }
         if offset >= buf.length() {
-            self.fail("buffer binding offset out of bounds"); return;
+            self.fail("buffer binding offset out of bounds");
+            return;
         }
         let Some(addr) = buf.gpuAddress().checked_add(offset as u64) else {
-            self.fail("GPU address overflow"); return;
+            self.fail("GPU address overflow");
+            return;
         };
+        // A raw `MTLBuffer` carries no owning `GpuBuffer`, so there is nothing
+        // for the capture tape to record or to pin. Mark the tape incomplete
+        // instead of letting it silently omit the operand.
+        crate::decode_icb::capture_note_unrecordable_bind();
         self.bind_addr(addr, index);
     }
 
     /// Bind a precomputed GPU address (DecodeIcb tape replay bind-tax cut).
     #[inline]
     pub fn bind_addr(&mut self, gpu_addr: u64, index: usize) {
-        if !self.valid_index(index) { return; }
-        if gpu_addr == 0 { self.fail("null GPU address"); return; }
+        if !self.valid_index(index) {
+            return;
+        }
+        if gpu_addr == 0 {
+            self.fail("null GPU address");
+            return;
+        }
         unsafe {
             self.table.setAddress_atIndex(gpu_addr, index);
         }
     }
 
     pub fn bind_tensor(&mut self, t: &Tensor, index: usize) {
-        if let Err(e) = t.validate() { self.fail(e); return; }
+        if let Err(e) = t.validate() {
+            self.fail(e);
+            return;
+        }
         if !std::ptr::eq(t.runtime().as_ref(), self.runtime) {
-            self.fail("tensor belongs to another runtime"); return;
+            self.fail("tensor belongs to another runtime");
+            return;
         }
         self.bind_buf(t.buffer.metal(), t.byte_offset, index);
         if crate::decode_icb::decode_icb_capture_active() {
@@ -206,7 +232,8 @@ impl<'a> Binder<'a> {
 
     pub fn bind_gpu_buf(&mut self, b: &GpuBuffer, index: usize) {
         if !std::ptr::eq(b.inner.runtime.as_ptr(), self.runtime) {
-            self.fail("buffer belongs to another runtime"); return;
+            self.fail("buffer belongs to another runtime");
+            return;
         }
         self.bind_buf(b.metal(), 0, index);
         if crate::decode_icb::decode_icb_capture_active() {
@@ -219,7 +246,27 @@ impl<'a> Binder<'a> {
     ///
     /// # Safety
     /// `index` must be within the argument table's buffer bind count.
+    /// # Safety
+    ///
+    /// `resource_id` must name a resource that stays alive and resident for the
+    /// duration of the encode. That is the caller's to guarantee and cannot be
+    /// checked here, which is why this stays `unsafe`.
+    ///
+    /// The range of `index` is *not* the caller's problem any more: it is
+    /// checked below. It used to be part of this contract while
+    /// `Binder::max_buffers` was private, so an out-of-crate caller had no way
+    /// to satisfy it — and an out-of-range index reached
+    /// `setResource:atBufferIndex:` on a 31-slot table. Probed directly: index
+    /// 31 passed through silently, `usize::MAX` took the process down with
+    /// SIGSEGV. Checking here fixes the class at the one place every caller
+    /// goes through.
     pub unsafe fn bind_resource_id(&mut self, resource_id: MTLResourceID, index: usize) {
+        if !self.valid_index(index) {
+            return;
+        }
+        // As `bind_buf`: a bare `MTLResourceID` carries no owning handle, so a
+        // capture that contains one cannot be replayed faithfully.
+        crate::decode_icb::capture_note_unrecordable_bind();
         unsafe {
             self.table
                 .setResource_atBufferIndex(resource_id, index as _);
@@ -228,9 +275,13 @@ impl<'a> Binder<'a> {
 
     /// Bind raw bytes into the const arena; returns the GPU address written.
     pub fn bind_bytes(&mut self, bytes: &[u8], index: usize) -> u64 {
-        if !self.valid_index(index) { return 0; }
+        if !self.valid_index(index) {
+            return 0;
+        }
         let addr = self.write_constants(bytes);
-        if self.error.is_some() { return 0; }
+        if self.error.is_some() {
+            return 0;
+        }
         self.bind_addr(addr, index);
         if crate::decode_icb::decode_icb_capture_active() {
             crate::decode_icb::capture_note_immediate(index, bytes);
@@ -248,6 +299,16 @@ impl<'a> Binder<'a> {
 
     /// Dynamic threadgroup memory (`threadgroup T *ptr [[threadgroup(index)]]`).
     pub fn set_threadgroup_memory(&mut self, index: usize, length: usize) {
+        // Same slot space as the buffer binds, and previously unchecked while
+        // every `bind_*` validated. An out-of-range index reached Metal
+        // directly.
+        if !self.valid_index(index) {
+            return;
+        }
+        // SAFETY: `index` is within the argument table's bind count, checked
+        // immediately above; `length` is a byte count Metal validates against
+        // the device's threadgroup memory limit; and `self.enc` is a live
+        // encoder for the duration of the borrow.
         unsafe {
             self.enc
                 .setThreadgroupMemoryLength_atIndex(length as _, index as _);
@@ -262,13 +323,23 @@ impl<'a> Binder<'a> {
     /// `METAL_RUNTIME_HAZARD_BARRIERS=1`). Packed multi-dispatch ops that need
     /// RAW/WAR still call [`Self::barrier`] explicitly.
     pub fn dispatch(&mut self, threadgroups: MTLSize, threads_per_tg: MTLSize) {
-        if self.error.is_some() { return; }
-        let lanes = threads_per_tg.width.checked_mul(threads_per_tg.height)
-            .and_then(|n|n.checked_mul(threads_per_tg.depth));
-        let valid = lanes.zip(self.max_threads).is_some_and(|(n,max)| n>0 && n<=max)
-            && [threadgroups.width,threadgroups.height,threadgroups.depth].iter()
-                .all(|&n|n>0 && n<=u32::MAX as usize);
-        if !valid { self.fail("invalid dispatch geometry or missing pipeline"); return; }
+        if self.error.is_some() {
+            return;
+        }
+        let lanes = threads_per_tg
+            .width
+            .checked_mul(threads_per_tg.height)
+            .and_then(|n| n.checked_mul(threads_per_tg.depth));
+        let valid = lanes
+            .zip(self.max_threads)
+            .is_some_and(|(n, max)| n > 0 && n <= max)
+            && [threadgroups.width, threadgroups.height, threadgroups.depth]
+                .iter()
+                .all(|&n| n > 0 && n <= u32::MAX as usize);
+        if !valid {
+            self.fail("invalid dispatch geometry or missing pipeline");
+            return;
+        }
 
         self.latch_argument_table();
         self.enc
@@ -295,7 +366,9 @@ impl<'a> Binder<'a> {
     /// Explicit producer→consumer barrier inside a packed encoder
     /// (Dispatch→Dispatch Device).
     pub fn barrier(&mut self) {
-        if self.error.is_some() { return; }
+        if self.error.is_some() {
+            return;
+        }
         self.enc
             .barrierAfterEncoderStages_beforeEncoderStages_visibilityOptions(
                 MTLStages::Dispatch,
@@ -332,6 +405,22 @@ impl<'a> Binder<'a> {
         count: u64,
         inherit_arg_table: bool,
     ) {
+        // Do not encode over a poisoned binder: a prior failure means the
+        // argument table is not in the state this range assumes.
+        if self.error.is_some() {
+            return;
+        }
+        // A range past the end of the ICB is caller data, not a Metal detail.
+        // `executeCommandsInBuffer` with an out-of-range range is undefined,
+        // and `start`/`count` reach here straight from the caller.
+        let icb_len = icb.size();
+        match start.checked_add(count) {
+            Some(end) if end <= icb_len as u64 => {}
+            _ => {
+                self.fail("ICB execute range out of bounds");
+                return;
+            }
+        }
         let range = NSRange {
             location: start as _,
             length: count as _,
@@ -340,9 +429,11 @@ impl<'a> Binder<'a> {
             // Latch so ICB `inheritBuffers=true` sees MTL4 binds.
             self.latch_argument_table();
         }
+        // SAFETY: `range` is within `icb`'s command count, checked above; `icb`
+        // outlives this call through the borrow; and the argument table has
+        // been latched when the commands inherit it.
         unsafe {
-            self.enc
-                .executeCommandsInBuffer_withRange(icb, range);
+            self.enc.executeCommandsInBuffer_withRange(icb, range);
         }
         crate::infer_trace::on_dispatch();
         if !self.skip_auto_barriers {
@@ -371,8 +462,7 @@ impl<'a> Binder<'a> {
             length: count as _,
         };
         unsafe {
-            self.enc
-                .optimizeIndirectCommandBuffer_withRange(icb, range);
+            self.enc.optimizeIndirectCommandBuffer_withRange(icb, range);
         }
     }
 }
@@ -417,7 +507,9 @@ pub fn dispatch_1d(
     if n == 0 {
         return Ok(());
     }
-    if n > u32::MAX as usize { return Err("1D dispatch exceeds uint indexing".into()); }
+    if n > u32::MAX as usize {
+        return Err("1D dispatch exceeds uint indexing".into());
+    }
     let width = pipeline.threadExecutionWidth();
     let tpt = width.min(n).max(1);
     let groups = n.div_ceil(tpt);
@@ -527,9 +619,8 @@ mod tests {
         })
         .unwrap();
         rt.synchronize().unwrap();
-        let out = unsafe {
-            std::slice::from_raw_parts(dst.metal().contents().as_ptr() as *const f32, n)
-        };
+        let out =
+            unsafe { std::slice::from_raw_parts(dst.metal().contents().as_ptr() as *const f32, n) };
         for (i, v) in out.iter().take(n).enumerate() {
             assert_eq!(*v, (i as f32) * 2.0);
         }
@@ -557,25 +648,39 @@ mod audit_tests {
         let other = GpuRuntime::new().unwrap();
         let t = other.alloc_tensor_f32(&[4]).unwrap();
         let map = t.buffer.contents_f32();
-        assert!(rt.with_binder(|b| { b.bind_tensor(&t, 0); Ok(()) }).is_err());
+        assert!(rt
+            .with_binder(|b| {
+                b.bind_tensor(&t, 0);
+                Ok(())
+            })
+            .is_err());
         assert_eq!(map[0], 0.0);
     }
 
     #[test]
     fn oversized_constants_return_error_instead_of_panicking() {
-        let rt=GpuRuntime::new().unwrap();
-        let bytes=vec![0u8;rt.metal4.const_staging.length()+1];
-        let result=std::panic::catch_unwind(std::panic::AssertUnwindSafe(||
-            rt.with_binder(|b| { b.bind_bytes(&bytes,0); Ok(()) })));
+        let rt = GpuRuntime::new().unwrap();
+        let bytes = vec![0u8; rt.metal4.const_staging.length() + 1];
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            rt.with_binder(|b| {
+                b.bind_bytes(&bytes, 0);
+                Ok(())
+            })
+        }));
         assert!(result.is_ok(), "Result API panicked on full arena");
         assert!(result.unwrap().is_err());
     }
     #[test]
     fn binder_rejects_bad_view_without_a_dispatch() {
-        let rt=GpuRuntime::new().unwrap();
-        let mut t=rt.alloc_tensor_f32(&[4]).unwrap();
-        t.byte_offset=usize::MAX;
-        assert!(rt.with_binder(|b| { b.bind_tensor(&t,0); Ok(()) }).is_err());
+        let rt = GpuRuntime::new().unwrap();
+        let mut t = rt.alloc_tensor_f32(&[4]).unwrap();
+        t.byte_offset = usize::MAX;
+        assert!(rt
+            .with_binder(|b| {
+                b.bind_tensor(&t, 0);
+                Ok(())
+            })
+            .is_err());
     }
 
     /// Moved here with `dispatch_2d`/`dispatch_3d`. The extent check must reject

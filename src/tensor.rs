@@ -17,6 +17,12 @@ use crate::runtime::{BufferKind, GpuRuntime};
 pub enum DType {
     F32,
     BF16,
+    /// IEEE binary16. Two bytes like [`DType::BF16`], but the bits are spent
+    /// differently: 10 mantissa against bf16's 7, and 5 exponent against 8. It
+    /// carries more precision and far less range — anything above 65504
+    /// becomes infinity rather than merely losing digits. It exists here for
+    /// interoperability, since it is what most external tooling exchanges.
+    F16,
 }
 
 impl DType {
@@ -24,6 +30,7 @@ impl DType {
         match self {
             DType::F32 => 4,
             DType::BF16 => 2,
+            DType::F16 => 2,
         }
     }
 }
@@ -70,6 +77,14 @@ pub struct GpuBuffer {
     pub(crate) inner: Arc<PooledBuffer>,
 }
 
+impl std::fmt::Debug for GpuBuffer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GpuBuffer")
+            .field("nbytes", &self.nbytes())
+            .finish_non_exhaustive()
+    }
+}
+
 /// Exclusive mapped host view. GPU encoding/submission on this runtime is
 /// rejected until the mapping drops. Mapping first waits for prior GPU work.
 /// Use a short scope; an escaped `&mut` slice cannot outlive this guard.
@@ -85,28 +100,49 @@ impl<T> std::ops::Deref for HostMapping<'_, T> {
     fn deref(&self) -> &[T] {
         // SAFETY: only private map_host constructs this, checking type alignment
         // and length. The runtime lease excludes other host/GPU accesses.
-        unsafe { std::slice::from_raw_parts(self.buffer.metal().contents().as_ptr().cast::<T>(),
-            self.buffer.nbytes() / std::mem::size_of::<T>()) }
+        unsafe {
+            std::slice::from_raw_parts(
+                self.buffer.metal().contents().as_ptr().cast::<T>(),
+                self.buffer.nbytes() / std::mem::size_of::<T>(),
+            )
+        }
     }
 }
 impl<T> std::ops::DerefMut for HostMapping<'_, T> {
     fn deref_mut(&mut self) -> &mut [T] {
-        unsafe { std::slice::from_raw_parts_mut(self.buffer.metal().contents().as_ptr().cast::<T>(),
-            self.buffer.nbytes() / std::mem::size_of::<T>()) }
+        // SAFETY: as `Deref`, plus exclusivity. `&mut self` on a guard that
+        // only `map_host` constructs means no other `HostMapping` to this
+        // buffer is alive, and the runtime lease the guard holds rejects GPU
+        // encoding until it drops — so nothing else, host or device, can be
+        // reading these bytes while this `&mut [T]` exists.
+        unsafe {
+            std::slice::from_raw_parts_mut(
+                self.buffer.metal().contents().as_ptr().cast::<T>(),
+                self.buffer.nbytes() / std::mem::size_of::<T>(),
+            )
+        }
     }
 }
 
 impl GpuBuffer {
     fn map_host<T>(&self) -> Result<HostMapping<'_, T>, String> {
-        if self.nbytes() % std::mem::size_of::<T>() != 0 ||
-            self.metal().contents().as_ptr() as usize % std::mem::align_of::<T>() != 0 {
+        if self.nbytes() % std::mem::size_of::<T>() != 0
+            || self.metal().contents().as_ptr() as usize % std::mem::align_of::<T>() != 0
+        {
             return Err("host mapping size/alignment mismatch".into());
         }
-        let runtime = self.inner.runtime.upgrade()
+        let runtime = self
+            .inner
+            .runtime
+            .upgrade()
             .ok_or_else(|| "host mapping runtime has been dropped".to_string())?;
         let access = runtime.host_access()?;
-        Ok(HostMapping { buffer: self, _runtime: runtime, _access: access,
-            _element: std::marker::PhantomData })
+        Ok(HostMapping {
+            buffer: self,
+            _runtime: runtime,
+            _access: access,
+            _element: std::marker::PhantomData,
+        })
     }
 
     pub fn nbytes(&self) -> usize {
@@ -133,7 +169,8 @@ impl GpuBuffer {
     }
 
     pub fn contents_f32(&self) -> HostMapping<'_, f32> {
-        self.try_contents_f32().expect("exclusive host mapping failed")
+        self.try_contents_f32()
+            .expect("exclusive host mapping failed")
     }
 
     pub fn try_contents_u16(&self) -> Result<HostMapping<'_, u16>, String> {
@@ -141,7 +178,8 @@ impl GpuBuffer {
     }
 
     pub fn contents_u16(&self) -> HostMapping<'_, u16> {
-        self.try_contents_u16().expect("exclusive host mapping failed")
+        self.try_contents_u16()
+            .expect("exclusive host mapping failed")
     }
 
     pub fn write_f32(&self, data: &[f32]) {
@@ -166,10 +204,24 @@ impl GpuBuffer {
         self.contents_f32().to_vec()
     }
 
+    /// Write raw 16-bit elements. Named for bf16 because that was the only
+    /// two-byte dtype when it was added; [`GpuBuffer::write_f16_bits`] is the
+    /// same call under the name an f16 caller expects.
     pub fn write_bf16_bits(&self, data: &[u16]) {
         let mut dst = self.contents_u16();
         assert_eq!(dst.len(), data.len());
         dst.copy_from_slice(data);
+    }
+
+    /// Write raw IEEE binary16 elements.
+    ///
+    /// Identical to [`GpuBuffer::write_bf16_bits`] — both move `u16` — but the
+    /// name is the point. f16 and bf16 have different bit layouts, so a call
+    /// site reading `write_bf16_bits(&f32_slice_to_f16(..))` states two
+    /// different formats in one line and invites exactly the mix-up that
+    /// produces plausible, wrong numbers.
+    pub fn write_f16_bits(&self, data: &[u16]) {
+        self.write_bf16_bits(data);
     }
 
     pub fn try_contents_u8(&self) -> Result<HostMapping<'_, u8>, String> {
@@ -177,7 +229,8 @@ impl GpuBuffer {
     }
 
     pub fn contents_u8(&self) -> HostMapping<'_, u8> {
-        self.try_contents_u8().expect("exclusive host mapping failed")
+        self.try_contents_u8()
+            .expect("exclusive host mapping failed")
     }
 
     pub fn write_bytes(&self, data: &[u8]) {
@@ -191,7 +244,8 @@ impl GpuBuffer {
     }
 
     pub fn contents_u32(&self) -> HostMapping<'_, u32> {
-        self.try_contents_u32().expect("exclusive host mapping failed")
+        self.try_contents_u32()
+            .expect("exclusive host mapping failed")
     }
 
     pub fn write_u32(&self, data: &[u32]) {
@@ -205,17 +259,36 @@ impl GpuBuffer {
     }
 
     pub fn zero(&self) {
-        self.map_host::<u8>().expect("exclusive host zero failed").fill(0);
+        self.map_host::<u8>()
+            .expect("exclusive host zero failed")
+            .fill(0);
     }
 
     /// # Safety
     /// Storage must be fresh or retired after GPU completion, with no live views.
     pub(crate) unsafe fn zero_unsubmitted(&self) {
-        unsafe { std::ptr::write_bytes(self.metal().contents().as_ptr().cast::<u8>(), 0, self.nbytes()) };
+        // SAFETY: discharged by this function's own contract, which the caller
+        // accepted by calling an `unsafe fn` — the storage is fresh or retired
+        // after GPU completion with no live views, so nothing else is reading
+        // these bytes. The write is exactly `nbytes()` from the buffer's own
+        // base, so it cannot overrun.
+        unsafe {
+            std::ptr::write_bytes(
+                self.metal().contents().as_ptr().cast::<u8>(),
+                0,
+                self.nbytes(),
+            )
+        };
     }
 }
 
 /// Logical tensor: shape + dtype over a GpuBuffer (row-major, contiguous view).
+///
+/// `Debug` is implemented by hand rather than derived: `GpuRuntime` is not
+/// `Debug` and printing it would be noise anyway. Without it,
+/// `Result<Tensor, String>::unwrap_err()` does not compile, so every caller
+/// testing a rejection from `bump_alloc_f32`, `alloc_tensor_*`, `deep_copy` or
+/// `cast_*` had to write `.map(|_| ()).unwrap_err()`.
 #[derive(Clone)]
 pub struct Tensor {
     pub buffer: GpuBuffer,
@@ -224,6 +297,17 @@ pub struct Tensor {
     /// Byte offset into `buffer` for bank / slice views.
     pub byte_offset: usize,
     pub(crate) runtime: Arc<GpuRuntime>,
+}
+
+impl std::fmt::Debug for Tensor {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Tensor")
+            .field("shape", &self.shape)
+            .field("dtype", &self.dtype)
+            .field("byte_offset", &self.byte_offset)
+            .field("buffer", &self.buffer)
+            .finish()
+    }
 }
 
 impl Tensor {
@@ -293,7 +377,8 @@ impl Tensor {
         if self.byte_offset % self.dtype.size_of() != 0
             || self
                 .byte_offset
-                .checked_add(bytes).is_none_or(|end| end > self.buffer.nbytes())
+                .checked_add(bytes)
+                .is_none_or(|end| end > self.buffer.nbytes())
         {
             return Err("tensor view is misaligned or out of bounds".into());
         }
@@ -320,6 +405,7 @@ impl Tensor {
         let t = match self.dtype {
             DType::F32 => self.runtime.alloc_tensor_f32(&self.shape)?,
             DType::BF16 => self.runtime.alloc_tensor_bf16(&self.shape)?,
+            DType::F16 => self.runtime.alloc_tensor_f16(&self.shape)?,
         };
         gpu_copy(self, &t)?;
         Ok(t)
@@ -330,8 +416,10 @@ impl Tensor {
 pub fn gpu_copy(src: &Tensor, dst: &Tensor) -> Result<(), String> {
     src.validate()?;
     dst.validate()?;
-    if src.numel() != dst.numel() || src.dtype != dst.dtype ||
-        !Arc::ptr_eq(src.runtime(), dst.runtime()) {
+    if src.numel() != dst.numel()
+        || src.dtype != dst.dtype
+        || !Arc::ptr_eq(src.runtime(), dst.runtime())
+    {
         return Err("copy requires equal element counts/dtypes and the same runtime".into());
     }
     if src.numel() > u32::MAX as usize {
@@ -340,12 +428,15 @@ pub fn gpu_copy(src: &Tensor, dst: &Tensor) -> Result<(), String> {
     if Arc::ptr_eq(&src.buffer.inner, &dst.buffer.inner) && src.byte_offset == dst.byte_offset {
         return Ok(());
     }
-    if src.overlaps(dst) { return Err("copy source and destination overlap".into()); }
+    if src.overlaps(dst) {
+        return Err("copy source and destination overlap".into());
+    }
     let rt = src.runtime();
     let n = src.numel();
     let kernel = match src.dtype {
         DType::F32 => "copy_f32",
         DType::BF16 => "copy_bf16",
+        DType::F16 => "copy_f16",
     };
     let p = rt.pipeline(kernel)?;
     crate::dispatch::dispatch_1d(rt, &p, n, |bnd| {
@@ -373,6 +464,82 @@ pub fn bf16_bits_to_f32(b: u16) -> f32 {
 
 pub fn f32_slice_to_bf16(data: &[f32]) -> Vec<u16> {
     data.iter().copied().map(f32_to_bf16_bits).collect()
+}
+
+/// f32 -> IEEE binary16 bits, round-to-nearest-even, saturating to infinity.
+///
+/// Unlike [`f32_to_bf16_bits`] this cannot be a shift: bf16 shares f32's
+/// exponent field, so truncating the low 16 bits is already a bf16. Half has 5
+/// exponent bits, so the exponent must be re-biased and the value can overflow
+/// to infinity — 65504 is the largest finite half, and f32 reaches 3.4e38.
+pub fn f32_to_f16_bits(x: f32) -> u16 {
+    let bits = x.to_bits();
+    let sign = ((bits >> 16) & 0x8000) as u16;
+    let mag = bits & 0x7fff_ffff;
+
+    // Inf and NaN. A NaN whose payload lives entirely in the discarded low
+    // bits must stay a NaN, so the quiet bit is set rather than the payload
+    // copied — the same concern `f32_to_bf16_bits` documents.
+    if mag >= 0x7f80_0000 {
+        return sign | if mag > 0x7f80_0000 { 0x7e00 } else { 0x7c00 };
+    }
+
+    let unbiased = ((mag >> 23) as i32) - 127;
+
+    // Above half's range. 65504 is the largest finite half and f32 reaches
+    // 3.4e38, so this is a saturation, not a truncation — the difference from
+    // bf16, which shares f32's exponent field and never gets here.
+    if unbiased > 15 {
+        return sign | 0x7c00;
+    }
+
+    if unbiased < -14 {
+        // Subnormal half: the value is `m * 2^-24` for integer `m`. Scaling by
+        // 2^24 in f64 is exact for any f32 this small, so the rounding is a
+        // single round-ties-even with no bit surgery to get wrong. `m` reaching
+        // 1024 encodes as 0x0400, the smallest normal, which is the correct
+        // carry out of the subnormal range.
+        let m = (f64::from(f32::from_bits(mag)) * 16_777_216.0).round_ties_even() as u32;
+        return sign | (m as u16);
+    }
+
+    // Normal half. Round the 23-bit mantissa to 10, ties to even; a carry out
+    // of the mantissa lands in the exponent, and a carry out of the exponent
+    // lands on 0x7c00 (infinity), both of which are the right answers.
+    let e = ((unbiased + 15) as u32) << 10;
+    let m = (mag & 0x007f_ffff) >> 13;
+    let rem = mag & 0x1fff;
+    let round_up = u32::from(rem > 0x1000 || (rem == 0x1000 && (m & 1) == 1));
+    sign | ((e | m) + round_up) as u16
+}
+
+/// IEEE binary16 bits -> f32. Exact: every half is representable in f32.
+pub fn f16_bits_to_f32(h: u16) -> f32 {
+    let sign = ((h & 0x8000) as u32) << 16;
+    let exp = ((h >> 10) & 0x1f) as u32;
+    let mant = (h & 0x03ff) as u32;
+    if exp == 0 {
+        if mant == 0 {
+            return f32::from_bits(sign);
+        }
+        // Subnormal half: value is `mant * 2^-24`, which f32 represents as a
+        // normal. Renormalise by the position of the leading set bit — write
+        // `mant = 1.f * 2^msb`, so the exponent is `msb - 24` and the stored
+        // fraction is what remains after shifting that leading one out.
+        let msb = 31 - mant.leading_zeros();
+        let e = (msb as i32 - 24 + 127) as u32;
+        let frac = (mant << (23 - msb)) & 0x007f_ffff;
+        return f32::from_bits(sign | (e << 23) | frac);
+    }
+    if exp == 0x1f {
+        return f32::from_bits(sign | 0x7f80_0000 | (mant << 13));
+    }
+    f32::from_bits(sign | ((exp + 127 - 15) << 23) | (mant << 13))
+}
+
+/// Convert a slice to IEEE binary16 bits.
+pub fn f32_slice_to_f16(data: &[f32]) -> Vec<u16> {
+    data.iter().copied().map(f32_to_f16_bits).collect()
 }
 
 #[cfg(test)]
@@ -447,7 +614,8 @@ mod audit_tests {
         rt.with_binder(|_| {
             assert!(rt.with_binder(|_| Ok(())).is_err());
             Ok(())
-        }).unwrap();
+        })
+        .unwrap();
         rt.synchronize().unwrap();
     }
 
@@ -481,7 +649,10 @@ mod audit_tests {
         rt.ensure_bump(512).unwrap();
         let first = rt.bump_alloc_f32(&[4]).unwrap();
         let map = first.buffer.contents_f32();
-        assert!(rt.bump_alloc_f32(&[4]).is_err(), "host mapping aliases slab initialization");
+        assert!(
+            rt.bump_alloc_f32(&[4]).is_err(),
+            "host mapping aliases slab initialization"
+        );
         assert_eq!(map[0], 0.0);
     }
 
@@ -490,16 +661,19 @@ mod audit_tests {
         let rt = GpuRuntime::new().unwrap();
         let t = rt.alloc_tensor_f32(&[4]).unwrap();
         let map = t.buffer.contents_f32();
-        assert!(rt.with_binder(|_| Ok(())).is_err(), "encoding accepted during host mapping");
-        assert_eq!(map[0],0.0);
+        assert!(
+            rt.with_binder(|_| Ok(())).is_err(),
+            "encoding accepted during host mapping"
+        );
+        assert_eq!(map[0], 0.0);
     }
 
     #[test]
     fn copy_rejects_overlap_before_encoding() {
         let rt = GpuRuntime::new().unwrap();
         let t = rt.alloc_tensor_f32(&[16]).unwrap();
-        assert!(gpu_copy(&t.view(&[8],0),&t.view(&[8],4)).is_err());
-        assert_eq!(rt.take_dispatch_count(),0);
+        assert!(gpu_copy(&t.view(&[8], 0), &t.view(&[8], 4)).is_err());
+        assert_eq!(rt.take_dispatch_count(), 0);
     }
 
     #[test]
@@ -507,7 +681,7 @@ mod audit_tests {
         let rt = GpuRuntime::new().unwrap();
         let a = rt.alloc_tensor_f32(&[4]).unwrap();
         let b = rt.alloc_tensor_f32(&[3]).unwrap();
-        let result=std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| gpu_copy(&a,&b)));
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| gpu_copy(&a, &b)));
         assert!(result.is_ok(), "Result API panicked");
         assert!(result.unwrap().is_err());
     }
@@ -517,25 +691,28 @@ mod audit_tests {
         let rt = GpuRuntime::new().unwrap();
         rt.ensure_bump(256).unwrap();
         let view = rt.bump_alloc_f32(&[64]).unwrap();
-        view.buffer.write_f32(&[7.0;64]);
+        view.buffer.write_f32(&[7.0; 64]);
         rt.ensure_bump(512).unwrap();
         let new = rt.alloc_tensor_f32(&[64]).unwrap();
-        new.buffer.write_f32(&[3.0;64]);
-        assert!(view.buffer.read_f32().iter().all(|&x|x==7.0), "live bump allocation recycled");
+        new.buffer.write_f32(&[3.0; 64]);
+        assert!(
+            view.buffer.read_f32().iter().all(|&x| x == 7.0),
+            "live bump allocation recycled"
+        );
     }
 
     #[test]
     fn bump_reset_preserves_live_views() {
         let rt = GpuRuntime::new().unwrap();
         rt.ensure_bump(256).unwrap();
-        let a=rt.bump_alloc_f32(&[64]).unwrap();
-        a.buffer.write_f32(&[7.0;64]);
+        let a = rt.bump_alloc_f32(&[64]).unwrap();
+        a.buffer.write_f32(&[7.0; 64]);
         // Reset must either reject outstanding views, or move to a fresh slab.
-        let reset=std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| rt.bump_reset()));
+        let reset = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| rt.bump_reset()));
         if reset.is_ok() {
-            let b=rt.bump_alloc_f32(&[64]).unwrap();
-            b.buffer.write_f32(&[3.0;64]);
-            assert!(a.buffer.read_f32().iter().all(|&x|x==7.0));
+            let b = rt.bump_alloc_f32(&[64]).unwrap();
+            b.buffer.write_f32(&[3.0; 64]);
+            assert!(a.buffer.read_f32().iter().all(|&x| x == 7.0));
         }
     }
 }

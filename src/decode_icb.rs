@@ -58,7 +58,12 @@ pub fn decode_icb_enabled() -> bool {
     if v >= 0 {
         return v == 1;
     }
-    let on = env_truthy(&["TESSL_DECODE_ICB", "METAL_RUNTIME_DECODE_ICB", "GEMMA_METAL_DECODE_ICB"]).unwrap_or(false);
+    let on = env_truthy(&[
+        "TESSL_DECODE_ICB",
+        "METAL_RUNTIME_DECODE_ICB",
+        "GEMMA_METAL_DECODE_ICB",
+    ])
+    .unwrap_or(false);
     DECODE_ICB.store(if on { 1 } else { 0 }, Ordering::Relaxed);
     on
 }
@@ -81,9 +86,7 @@ pub enum DecodeIcbBind {
 
 #[inline]
 fn buf_gpu_addr(buf: &GpuBuffer, byte_offset: usize) -> u64 {
-    buf.metal()
-        .gpuAddress()
-        .wrapping_add(byte_offset as u64)
+    buf.metal().gpuAddress().wrapping_add(byte_offset as u64)
 }
 
 /// One frozen compute dispatch (pipeline + grid + bind recipe).
@@ -102,10 +105,29 @@ pub struct DecodeIcbCommand {
     /// calls. Replay must honor these instead of forcing always-on for every cmd
     /// (product tok/s regression under shipping hazard skip-auto — D16).
     pub barrier_after: bool,
+    /// Binds that reached the encoder but could NOT be recorded on the tape.
+    ///
+    /// [`crate::dispatch::Binder::bind_buf`] and `bind_resource_id` take a raw
+    /// `MTLBuffer` / `MTLResourceID` with no owning `GpuBuffer`, so there is
+    /// nothing for [`DecodeIcbBind::Buf`] to hold — and holding it is what pins
+    /// the operand's `Arc`. Every GEMM binds A, B and C through `bind_buf`, so
+    /// a captured GEMM recorded only its scalar immediates: replay would rebind
+    /// no operands at all, and the unrecorded buffers were pinned by nothing,
+    /// free to be recycled and handed to a new tensor while the tape still
+    /// logically referenced them.
+    ///
+    /// Recording the count turns that from a silent wrong answer into a refusal
+    /// — see the check in [`DecodeIcb::from_commands_ex`].
+    pub incomplete_binds: usize,
 }
 
 /// MTL4 argument-table max buffer bind count (matches runtime table descriptor).
-const ARG_TABLE_SLOTS: usize = 31;
+/// Re-export of the one authority on the argument table's size.
+///
+/// This was a second `= 31` literal sitting beside `runtime`'s. Two constants
+/// for one hardware limit is how they drift, and this one is compared against
+/// caller-supplied bind indices.
+use crate::runtime::ARGUMENT_TABLE_MAX_BUFFERS as ARG_TABLE_SLOTS;
 
 /// Sticky arg-table state for A2: skip `setAddress` when the slot already holds
 /// the same GPU address across consecutive tape commands.
@@ -139,12 +161,7 @@ impl StickyArgTable {
     }
 
     #[inline]
-    fn bind_addr(
-        &mut self,
-        bnd: &mut crate::dispatch::Binder<'_>,
-        gpu_addr: u64,
-        index: usize,
-    ) {
+    fn bind_addr(&mut self, bnd: &mut crate::dispatch::Binder<'_>, gpu_addr: u64, index: usize) {
         self.bind_total = self.bind_total.saturating_add(1);
         if index < ARG_TABLE_SLOTS {
             let bit = 1u32 << index;
@@ -160,12 +177,7 @@ impl StickyArgTable {
 
     /// Immediate binds always materialize a fresh const-arena address.
     #[inline]
-    fn bind_bytes(
-        &mut self,
-        bnd: &mut crate::dispatch::Binder<'_>,
-        bytes: &[u8],
-        index: usize,
-    ) {
+    fn bind_bytes(&mut self, bnd: &mut crate::dispatch::Binder<'_>, bytes: &[u8], index: usize) {
         self.bind_total = self.bind_total.saturating_add(1);
         let addr = bnd.bind_bytes(bytes, index);
         self.set_calls = self.set_calls.saturating_add(1);
@@ -210,7 +222,8 @@ impl StickyArgTable {
 /// Default **ON** — freeze Buf binds into per-command MTL4 argument tables.
 fn prebuilt_tables_enabled() -> bool {
     env_truthy(&[
-        "TESSL_ICB_PREBUILT_TABLES", "METAL_RUNTIME_ICB_PREBUILT_TABLES",
+        "TESSL_ICB_PREBUILT_TABLES",
+        "METAL_RUNTIME_ICB_PREBUILT_TABLES",
         "GEMMA_METAL_ICB_PREBUILT_TABLES",
     ])
     .unwrap_or(true)
@@ -235,7 +248,8 @@ pub fn icb_freeze_binds_enabled() -> bool {
         return v == 1;
     }
     let on = env_truthy(&[
-        "TESSL_ICB_FREEZE_BINDS", "METAL_RUNTIME_ICB_FREEZE_BINDS",
+        "TESSL_ICB_FREEZE_BINDS",
+        "METAL_RUNTIME_ICB_FREEZE_BINDS",
         "GEMMA_METAL_ICB_FREEZE_BINDS",
     ])
     .unwrap_or(false);
@@ -263,7 +277,8 @@ pub fn icb_range_batch_enabled() -> bool {
         return v == 1;
     }
     let on = env_truthy(&[
-        "TESSL_ICB_RANGE_BATCH", "METAL_RUNTIME_ICB_RANGE_BATCH",
+        "TESSL_ICB_RANGE_BATCH",
+        "METAL_RUNTIME_ICB_RANGE_BATCH",
         "GEMMA_METAL_ICB_RANGE_BATCH",
     ])
     .unwrap_or(false);
@@ -290,7 +305,8 @@ pub fn icb_coarse_ranges_enabled() -> bool {
         return v == 1;
     }
     if let Some(on) = env_truthy(&[
-        "TESSL_ICB_COARSE_RANGES", "METAL_RUNTIME_ICB_COARSE_RANGES",
+        "TESSL_ICB_COARSE_RANGES",
+        "METAL_RUNTIME_ICB_COARSE_RANGES",
         "GEMMA_METAL_ICB_COARSE_RANGES",
     ]) {
         ICB_COARSE_RANGES.store(if on { 1 } else { 0 }, Ordering::Relaxed);
@@ -341,6 +357,11 @@ pub struct DecodeIcb {
     encoded: bool,
     optimized: bool,
     execute_count: u64,
+    /// Whether the most recent `execute` was suppressed by binder-encode-nop.
+    ///
+    /// Distinguishes "a replay ran" from "a replay was asked for while encoding
+    /// was disabled", which the counters alone cannot express.
+    last_execute_was_nop: bool,
     /// True when built from a Binder capture of the mini layer/head graph
     /// (not the `mini_copy_chain` smoke). Enables host-encode skip on replay.
     layer_graph: bool,
@@ -380,10 +401,7 @@ struct EncodeCmdOpts {
 }
 
 impl DecodeIcb {
-    pub fn from_commands(
-        rt: &GpuRuntime,
-        commands: Vec<DecodeIcbCommand>,
-    ) -> Result<Self, String> {
+    pub fn from_commands(rt: &GpuRuntime, commands: Vec<DecodeIcbCommand>) -> Result<Self, String> {
         Self::from_commands_ex(rt, commands, icb_freeze_binds_enabled())
     }
 
@@ -398,6 +416,67 @@ impl DecodeIcb {
         if commands.is_empty() {
             return Err("DecodeIcb: empty command list".into());
         }
+        // Reject bind indices the argument table cannot hold.
+        //
+        // The prebuilt and freeze paths filter `index < ARG_TABLE_SLOTS` and
+        // silently drop anything above, while `Binder::bind_addr` correctly
+        // errors on the same index — so a tape could be built with `index: 40`,
+        // return `Ok`, and replay with that operand simply absent. Worse,
+        // `buf_bind_fingerprint` applies the same filter, so two commands
+        // differing *only* in an out-of-range bind hash identically and share
+        // one prebuilt argument table.
+        //
+        // Unlike the incomplete-bind check below, this is not scoped to
+        // freeze-binds: an index past the table is invalid in every mode.
+        for (i, cmd) in commands.iter().enumerate() {
+            for b in &cmd.binds {
+                let index = match b {
+                    DecodeIcbBind::Buf { index, .. } | DecodeIcbBind::Immediate { index, .. } => {
+                        *index
+                    }
+                };
+                if index >= ARG_TABLE_SLOTS {
+                    return Err(format!(
+                        "DecodeIcb: command {i} binds index {index}, but the argument table \
+                         has {ARG_TABLE_SLOTS} slots. Encoding would drop it silently."
+                    ));
+                }
+            }
+        }
+        // Refuse a freeze-binds tape that is missing operands.
+        //
+        // Scope matters here, and getting it wrong disables a shipping feature.
+        // Under the default path the ICB is built with `setInheritBuffers(true)`
+        // and picks up the *live* argument table at execute time, so binds that
+        // never reached the tape are supplied by the encoder anyway and the
+        // caller's own handles keep the buffers alive. Refusing there breaks
+        // gemma-metal's layer-graph replay for a hazard it does not have —
+        // measured: six of its tests fail.
+        //
+        // Under `freeze_binds` the descriptor sets `setInheritBuffers(false)`
+        // and each command's binds are written into the ICB with
+        // `setKernelBuffer`. There the tape *is* the source of truth: a bind
+        // that was never recorded leaves that slot unwritten on every replay,
+        // and pins no `Arc`, so the buffer it referred to can be recycled into
+        // an unrelated tensor while the tape still logically points at it. Both
+        // failures are silent, which is why this refuses instead of warning.
+        if freeze_binds {
+            if let Some((i, cmd)) = commands
+                .iter()
+                .enumerate()
+                .find(|(_, c)| c.incomplete_binds > 0)
+            {
+                return Err(format!(
+                    "DecodeIcb freeze_binds: command {i} has {} bind(s) that could not be \
+                     recorded (bound through bind_buf / bind_resource_id, which carry no \
+                     owning GpuBuffer). Freeze-binds writes the tape's binds into the ICB, \
+                     so those slots would stay unwritten on every replay and pin nothing \
+                     against recycling. Bind through bind_tensor or bind_gpu_buf.",
+                    cmd.incomplete_binds
+                ));
+            }
+        }
+
         let mut commands = commands;
         if freeze_binds {
             // Classic setKernelBuffer needs real MTLBuffers; materialize any
@@ -452,6 +531,7 @@ impl DecodeIcb {
             encoded: false,
             optimized: false,
             execute_count: 0,
+            last_execute_was_nop: false,
             layer_graph,
             triage_probe: None,
             last_bind_total: 0,
@@ -475,7 +555,19 @@ impl DecodeIcb {
         buf.metal().gpuAddress()
     }
 
-    /// Tiny Hot scalars (softcap f32×1, lone u32 dims) — read-only on tape.
+    /// Formerly: buffers at or below this size were *assumed* read-only and
+    /// excluded from the disjointness test, on the grounds that tiny Hot
+    /// allocations are softcap scalars and lone u32 dims.
+    ///
+    /// That is an assumption about what a size is usually used for, not a
+    /// property of the buffer, and the failure it permits is silent. A genuine
+    /// read-after-write through a 16-byte buffer — a token id, a reduction
+    /// scalar — had its barrier elided, and so did a RAW through a shared
+    /// activation buffer that happened to be bound by most commands. Both
+    /// produce wrong output with nothing to notice it.
+    ///
+    /// Retained only so this comment has somewhere to live. Nothing reads it.
+    #[allow(dead_code)]
     const READONLY_MAX_NBYTES: usize = 64;
 
     /// Large-Buf ids for a cmd, minus ambient read-only. Immediate → `None`.
@@ -485,14 +577,19 @@ impl DecodeIcb {
             match b {
                 DecodeIcbBind::Immediate { .. } => return None,
                 DecodeIcbBind::Buf { buf, .. } => {
-                    if buf.nbytes() <= Self::READONLY_MAX_NBYTES {
-                        continue;
-                    }
-                    let id = Self::buf_id(buf);
-                    if ambient.contains(&id) {
-                        continue;
-                    }
-                    ids.push(id);
+                    // Every bound buffer counts. Excluding small ones, or ones
+                    // bound by most commands, elided real RAW barriers — see
+                    // `READONLY_MAX_NBYTES`. Without knowing which binds are
+                    // *written*, a shared buffer must be treated as a possible
+                    // dependency.
+                    //
+                    // This is strictly more conservative than what shipped, so
+                    // fewer barriers are elided and the throughput this feature
+                    // was added for needs re-measuring on a real model. Getting
+                    // it back properly means tracking writes at bind time, not
+                    // guessing from size.
+                    let _ = ambient;
+                    ids.push(Self::buf_id(buf));
                 }
             }
         }
@@ -593,6 +690,12 @@ impl DecodeIcb {
             for b in cmd.binds.iter_mut() {
                 if let DecodeIcbBind::Immediate { index, bytes } = b {
                     let buf = rt.alloc_buffer_hot(bytes.len().max(4))?;
+                    // SAFETY: `buf` was allocated on the line above at
+                    // `max(bytes.len(), 4)` bytes and no other handle to it
+                    // exists yet, so the copy is unaliased and cannot overrun.
+                    // `bytes` is a separate owned `Vec`, so source and
+                    // destination cannot overlap — the precondition
+                    // `copy_nonoverlapping` adds over `copy`.
                     unsafe {
                         let dst = buf.metal().contents().as_ptr() as *mut u8;
                         std::ptr::copy_nonoverlapping(bytes.as_ptr(), dst, bytes.len());
@@ -619,8 +722,7 @@ impl DecodeIcb {
         rt: &GpuRuntime,
         commands: &[DecodeIcbCommand],
     ) -> Result<PrebuiltTables, String> {
-        let mut unique: Vec<(u64, Retained<ProtocolObject<dyn MTL4ArgumentTable>>)> =
-            Vec::new();
+        let mut unique: Vec<(u64, Retained<ProtocolObject<dyn MTL4ArgumentTable>>)> = Vec::new();
         let mut tables = Vec::with_capacity(commands.len());
         for cmd in commands {
             let fp = buf_bind_fingerprint(&cmd.binds);
@@ -720,6 +822,11 @@ impl DecodeIcb {
         let c = rt.alloc_buffer_hot(n * 4)?;
         let n_buf = rt.alloc_buffer_hot(4)?;
         n_buf.write_u32(&[n as u32]);
+        // SAFETY: `a`, `b` and `c` were each allocated at `n * 4` bytes just
+        // above and are not yet shared with anything, so these writes are
+        // unaliased and in bounds. They are Hot (shared-storage) buffers, so
+        // `contents()` is a valid, Metal-aligned host pointer. No command
+        // referencing them has been encoded yet.
         unsafe {
             let p = a.metal().contents().as_ptr() as *mut f32;
             for i in 0..n {
@@ -751,6 +858,8 @@ impl DecodeIcb {
                 owned_immediates: Vec::new(),
                 // a→b must drain before b→c (no live always-on during tape execute).
                 barrier_after: true,
+                // Built from GpuBuffers directly, so nothing is unrecordable.
+                incomplete_binds: 0,
             },
             DecodeIcbCommand {
                 pipeline: pipe,
@@ -760,6 +869,7 @@ impl DecodeIcb {
                 tg_mem: None,
                 owned_immediates: Vec::new(),
                 barrier_after: false,
+                incomplete_binds: 0,
             },
         ];
         let dec = Self::from_commands_ex(rt, cmds, freeze_binds)?;
@@ -800,11 +910,7 @@ impl DecodeIcb {
                     } = b
                     {
                         unsafe {
-                            icmd.setKernelBuffer_offset_atIndex(
-                                buf.metal(),
-                                *byte_offset,
-                                *index,
-                            );
+                            icmd.setKernelBuffer_offset_atIndex(buf.metal(), *byte_offset, *index);
                         }
                     }
                 }
@@ -838,6 +944,12 @@ impl DecodeIcb {
 
     pub fn encoded(&self) -> bool {
         self.encoded
+    }
+
+    /// Whether the most recent [`DecodeIcb::execute`] was a no-op because
+    /// binder-encode-nop was in force.
+    pub fn last_execute_was_nop(&self) -> bool {
+        self.last_execute_was_nop
     }
 
     pub fn execute_count(&self) -> u64 {
@@ -949,6 +1061,21 @@ impl DecodeIcb {
         if !self.encoded {
             return Err("DecodeIcb: encode before execute".into());
         }
+        // Under binder-encode-nop every `with_binder` body is skipped, so this
+        // whole call is a no-op: no dispatch is encoded and the destination
+        // buffers keep whatever they held. It used to return `Ok` while
+        // incrementing `execute_count` and setting `optimized` — reporting a
+        // completed, optimized replay for work that provably did not happen,
+        // which `cb_replay` then counted as a successful tape replay.
+        //
+        // Control flow is deliberately unchanged (callers hold this guard
+        // around encode loops and expect a benign no-op); only the bookkeeping
+        // is corrected, and the fact is recorded so a caller can tell.
+        if crate::decode_icb::binder_encode_nop() {
+            self.last_execute_was_nop = true;
+            return Ok(());
+        }
+        self.last_execute_was_nop = false;
         let freeze = self.freeze_binds;
         let range_batch = freeze && icb_range_batch_enabled();
         if range_batch && icb_coarse_ranges_enabled() && !self.barriers_coarsened {
@@ -956,14 +1083,43 @@ impl DecodeIcb {
             self.barriers_coarsened = true;
         }
         let use_icb_exec = freeze
-            || env_truthy(&["TESSL_ICB_EXECUTE", "METAL_RUNTIME_ICB_EXECUTE", "GEMMA_METAL_ICB_EXECUTE"])
-                .unwrap_or(false);
+            || env_truthy(&[
+                "TESSL_ICB_EXECUTE",
+                "METAL_RUNTIME_ICB_EXECUTE",
+                "GEMMA_METAL_ICB_EXECUTE",
+            ])
+            .unwrap_or(false);
         let need_opt = !self.optimized;
         let icb = self.icb.clone();
         let n = self.commands.len() as u64;
         let use_prebuilt = !freeze
             && !self.prebuilt_tables.is_empty()
             && self.prebuilt_tables.len() == self.commands.len();
+
+        // ICB execution cannot run a command whose pipeline was not built with
+        // `supportIndirectCommandBuffers`. On a mixed tape `encode_cpu` returns
+        // early without encoding anything — while still setting `encoded` and
+        // `optimized` — and `execute` then decides per command, running the
+        // ICB-capable ones and dropping the rest. Measured through the public
+        // API: the surviving command's destination stayed [0,0,0,0] while this
+        // returned Ok and reported last_execute_icb=1/1.
+        //
+        // Dropping half a tape is not a degraded mode, it is a wrong answer, so
+        // it is refused. `freeze_binds` already rejects the same shape at
+        // encode time; this covers the `TESSL_ICB_EXECUTE=1` path that does not.
+        if use_icb_exec
+            && !self
+                .commands
+                .iter()
+                .all(|c| c.pipeline.supportIndirectCommandBuffers())
+        {
+            return Err(format!(
+                "DecodeIcb: ICB execution requested for a tape whose {} command(s) are not \
+                 all ICB-capable. Those commands would be silently dropped. Capture with \
+                 ICB-capable pipelines (TESSL_ICB_PIPELINES=1) or leave ICB execute off.",
+                self.commands.len()
+            ));
+        }
 
         if use_icb_exec && need_opt {
             let all_icb = self
@@ -1003,9 +1159,16 @@ impl DecodeIcb {
                         None
                     };
                     let (icb_n, icb_cmds) = Self::encode_cmd(
-                        bnd, cmd, &icb, i,
-                        EncodeCmdOpts { use_icb_exec, freeze_binds: freeze },
-                        prebuilt, &mut s,
+                        bnd,
+                        cmd,
+                        &icb,
+                        i,
+                        EncodeCmdOpts {
+                            use_icb_exec,
+                            freeze_binds: freeze,
+                        },
+                        prebuilt,
+                        &mut s,
                     );
                     execute_icb_calls = execute_icb_calls.saturating_add(icb_n);
                     execute_icb_cmds = execute_icb_cmds.saturating_add(icb_cmds);
@@ -1056,8 +1219,7 @@ impl DecodeIcb {
                         for b in &cmd.binds {
                             sticky.bind_total = sticky.bind_total.saturating_add(1);
                             if matches!(b, DecodeIcbBind::Buf { .. }) {
-                                sticky.prebuilt_elided =
-                                    sticky.prebuilt_elided.saturating_add(1);
+                                sticky.prebuilt_elided = sticky.prebuilt_elided.saturating_add(1);
                             }
                         }
                     }
@@ -1078,9 +1240,16 @@ impl DecodeIcb {
                         None
                     };
                     let (icb_n, icb_cmds) = Self::encode_cmd(
-                        bnd, cmd, &icb, i,
-                        EncodeCmdOpts { use_icb_exec, freeze_binds: freeze },
-                        prebuilt, &mut sticky,
+                        bnd,
+                        cmd,
+                        &icb,
+                        i,
+                        EncodeCmdOpts {
+                            use_icb_exec,
+                            freeze_binds: freeze,
+                        },
+                        prebuilt,
+                        &mut sticky,
                     );
                     execute_icb_calls = execute_icb_calls.saturating_add(icb_n);
                     execute_icb_cmds = execute_icb_cmds.saturating_add(icb_cmds);
@@ -1128,7 +1297,10 @@ impl DecodeIcb {
         prebuilt: Option<&ProtocolObject<dyn MTL4ArgumentTable>>,
         sticky: &mut StickyArgTable,
     ) -> (u64, u64) {
-        let EncodeCmdOpts { use_icb_exec, freeze_binds } = opts;
+        let EncodeCmdOpts {
+            use_icb_exec,
+            freeze_binds,
+        } = opts;
         let mut icb_calls = 0u64;
         let mut icb_cmds = 0u64;
         if freeze_binds {
@@ -1239,6 +1411,11 @@ pub struct DecodeIcbCapture {
     current_pipeline: Option<Retained<ProtocolObject<dyn MTLComputePipelineState>>>,
     current_binds: Vec<DecodeIcbBind>,
     current_tg_mem: Option<(usize, usize)>,
+    /// Binds seen since the last `note_pipeline` that could not be recorded.
+    unrecordable_binds: usize,
+    /// How many times `begin_decode_icb_capture` was called while this capture
+    /// was already live. Non-zero means a previous capture was never taken.
+    pub nested_begins: usize,
 }
 
 impl DecodeIcbCapture {
@@ -1246,6 +1423,12 @@ impl DecodeIcbCapture {
         self.current_pipeline = Some(p);
         self.current_binds.clear();
         self.current_tg_mem = None;
+        self.unrecordable_binds = 0;
+    }
+
+    /// Note a bind that reached the encoder but carries no owning `GpuBuffer`.
+    pub fn note_unrecordable_bind(&mut self) {
+        self.unrecordable_binds += 1;
     }
 
     pub fn note_bind(&mut self, index: usize, buf: &GpuBuffer, byte_offset: usize) {
@@ -1290,14 +1473,27 @@ impl DecodeIcbCapture {
         let Some(pipeline) = self.current_pipeline.clone() else {
             return;
         };
+        // Clone rather than take. The argument table is a property of the
+        // encoder, not of a single dispatch: under one `set_pipeline`, a second
+        // dispatch inherits every bind the first one used. Taking them recorded
+        // the second dispatch with zero binds — measured as
+        // `cmd0: binds=3, cmd1: binds=0` for one pipeline and two dispatches,
+        // which is exactly the shape of the split-K loop. That loop survived
+        // only because it happens to re-bind all seven scalars every iteration.
+        //
+        // `current_binds` is already a slot table keyed by index, with
+        // last-write-wins in `note_bind` / `note_immediate`, so carrying it
+        // forward models the real argument table rather than accumulating
+        // duplicates.
         self.commands.push(DecodeIcbCommand {
             pipeline,
             threadgroups,
             threads_per_tg,
-            binds: std::mem::take(&mut self.current_binds),
-            tg_mem: self.current_tg_mem.take(),
+            binds: self.current_binds.clone(),
+            tg_mem: self.current_tg_mem,
             owned_immediates: Vec::new(),
             barrier_after: false,
+            incomplete_binds: self.unrecordable_binds,
         });
     }
 
@@ -1312,7 +1508,32 @@ impl DecodeIcbCapture {
 /// Begin recording dispatches on this thread (Binder hooks).
 pub fn begin_decode_icb_capture() {
     CAPTURE.with(|c| {
-        *c.borrow_mut() = Some(DecodeIcbCapture::default());
+        let mut slot = c.borrow_mut();
+        if let Some(existing) = slot.as_mut() {
+            // Re-entry. There is no RAII guard on this API, so an early `?`
+            // between begin and take leaves capture live for the rest of the
+            // thread's life — growing without bound and holding a `GpuBuffer`
+            // clone for every bind, which keeps those buffers out of the
+            // freelist and pinned in the residency set forever.
+            //
+            // The first tape is kept rather than discarded: it is the one with
+            // the recorded work, and throwing it away is how the leak stayed
+            // invisible. The count rides along so `take` can report it instead
+            // of handing back a tape that silently spans two capture attempts.
+            existing.nested_begins += 1;
+            return;
+        }
+        *slot = Some(DecodeIcbCapture::default());
+    });
+}
+
+/// Abandon an in-progress capture.
+///
+/// The counterpart `begin`/`take` pair has no RAII guard, so a caller that
+/// bails between them leaks the tape. Call this on the error path.
+pub fn end_decode_icb_capture() {
+    CAPTURE.with(|c| {
+        *c.borrow_mut() = None;
     });
 }
 
@@ -1329,6 +1550,15 @@ pub(crate) fn capture_note_pipeline(p: Retained<ProtocolObject<dyn MTLComputePip
     CAPTURE.with(|c| {
         if let Some(ref mut cap) = *c.borrow_mut() {
             cap.note_pipeline(p);
+        }
+    });
+}
+
+/// Record that a bind reached the encoder but could not be put on the tape.
+pub(crate) fn capture_note_unrecordable_bind() {
+    CAPTURE.with(|c| {
+        if let Some(cap) = c.borrow_mut().as_mut() {
+            cap.note_unrecordable_bind();
         }
     });
 }
@@ -1386,8 +1616,12 @@ pub fn icb_pipelines_enabled() -> bool {
     if v >= 0 {
         return v == 1;
     }
-    let on = env_truthy(&["TESSL_ICB_PIPELINES", "METAL_RUNTIME_ICB_PIPELINES", "GEMMA_METAL_ICB_PIPELINES"])
-        .unwrap_or(false);
+    let on = env_truthy(&[
+        "TESSL_ICB_PIPELINES",
+        "METAL_RUNTIME_ICB_PIPELINES",
+        "GEMMA_METAL_ICB_PIPELINES",
+    ])
+    .unwrap_or(false);
     ICB_PIPELINES.store(if on { 1 } else { 0 }, Ordering::Relaxed);
     on
 }
@@ -1407,18 +1641,27 @@ pub fn binder_encode_nop() -> bool {
 }
 
 /// RAII: enable binder encode nop; restore off on drop.
-pub struct BinderEncodeNopGuard;
+pub struct BinderEncodeNopGuard {
+    /// The flag value this guard replaced, restored on drop.
+    previous: bool,
+}
 
 impl BinderEncodeNopGuard {
     pub fn enter() -> Self {
+        // Remember what was in effect. Restoring a constant `false` on drop
+        // meant an inner guard ended an outer guard's scope: with two nested
+        // guards, the inner drop re-enabled encoding while the outer guard was
+        // still logically in force, so the layers it was meant to suppress got
+        // encoded after all.
+        let previous = binder_encode_nop();
         set_binder_encode_nop(true);
-        Self
+        Self { previous }
     }
 }
 
 impl Drop for BinderEncodeNopGuard {
     fn drop(&mut self) {
-        set_binder_encode_nop(false);
+        set_binder_encode_nop(self.previous);
     }
 }
 
@@ -1489,9 +1732,8 @@ mod tests {
         dec.execute(&rt).unwrap();
         rt.synchronize().unwrap();
         let n = 32usize;
-        let out = unsafe {
-            std::slice::from_raw_parts(c.metal().contents().as_ptr() as *const f32, n)
-        };
+        let out =
+            unsafe { std::slice::from_raw_parts(c.metal().contents().as_ptr() as *const f32, n) };
         for (i, v) in out.iter().take(n).enumerate() {
             assert_eq!(*v, (i as f32) + 1.0, "mismatch at {i}");
         }
@@ -1502,9 +1744,8 @@ mod tests {
         }
         dec.execute(&rt).unwrap();
         rt.synchronize().unwrap();
-        let out2 = unsafe {
-            std::slice::from_raw_parts(c.metal().contents().as_ptr() as *const f32, n)
-        };
+        let out2 =
+            unsafe { std::slice::from_raw_parts(c.metal().contents().as_ptr() as *const f32, n) };
         for (i, v) in out2.iter().take(n).enumerate() {
             assert_eq!(*v, (i as f32) + 1.0);
         }
@@ -1540,9 +1781,8 @@ mod tests {
         dec.execute(&rt).unwrap();
         rt.synchronize().unwrap();
         let n = 32usize;
-        let out = unsafe {
-            std::slice::from_raw_parts(c.metal().contents().as_ptr() as *const f32, n)
-        };
+        let out =
+            unsafe { std::slice::from_raw_parts(c.metal().contents().as_ptr() as *const f32, n) };
         for (i, v) in out.iter().take(n).enumerate() {
             assert_eq!(*v, (i as f32) + 1.0, "freeze mismatch at {i}");
         }
@@ -1551,7 +1791,10 @@ mod tests {
         assert_eq!(set_tables, 0, "freeze must issue 0 setArgumentTable");
         assert_eq!(set_calls, 0);
         assert_eq!(elided, bind_total);
-        eprintln!("decode_icb_freeze_binds_zero_arg_table: {}", dec.status_line());
+        eprintln!(
+            "decode_icb_freeze_binds_zero_arg_table: {}",
+            dec.status_line()
+        );
     }
 
     #[test]
@@ -1595,6 +1838,7 @@ mod tests {
             tg_mem: None,
             owned_immediates: Vec::new(),
             barrier_after,
+            incomplete_binds: 0,
         };
         let cmds = vec![mk(&a, false), mk(&b, false), mk(&c, true)];
 
@@ -1678,6 +1922,7 @@ mod tests {
             tg_mem: None,
             owned_immediates: Vec::new(),
             barrier_after: bar,
+            incomplete_binds: 0,
         };
         // a→b (bar) | c→d (bar) | b→e (bar). First bar is disjoint from c→d → elide.
         // Second bar: span writes include b (from a→b) and d; b→e reads b → keep.
@@ -1700,18 +1945,18 @@ mod tests {
         rt.synchronize().unwrap();
         let (calls, covered) = dec.last_execute_icb_stats();
         // Spans: [a→b, c→d] + barrier + [b→e] + barrier → 2 execute_icb
-        assert_eq!(calls, 2, "coarse+range should yield 2 execute_icb, got {calls}");
+        assert_eq!(
+            calls, 2,
+            "coarse+range should yield 2 execute_icb, got {calls}"
+        );
         assert_eq!(covered, 3);
         assert_eq!(dec.barriers_elided(), 1);
-        let out_b = unsafe {
-            std::slice::from_raw_parts(b.metal().contents().as_ptr() as *const f32, n)
-        };
-        let out_d = unsafe {
-            std::slice::from_raw_parts(d.metal().contents().as_ptr() as *const f32, n)
-        };
-        let out_e = unsafe {
-            std::slice::from_raw_parts(e.metal().contents().as_ptr() as *const f32, n)
-        };
+        let out_b =
+            unsafe { std::slice::from_raw_parts(b.metal().contents().as_ptr() as *const f32, n) };
+        let out_d =
+            unsafe { std::slice::from_raw_parts(d.metal().contents().as_ptr() as *const f32, n) };
+        let out_e =
+            unsafe { std::slice::from_raw_parts(e.metal().contents().as_ptr() as *const f32, n) };
         for i in 0..n {
             assert_eq!(out_b[i], (i as f32) + 1.0, "b mismatch");
             assert_eq!(out_d[i], (i as f32) + 10.0, "d mismatch");
@@ -1722,6 +1967,243 @@ mod tests {
         eprintln!(
             "decode_icb_coarse_ranges_elides_disjoint_keeps_raw: {}",
             dec.status_line()
+        );
+    }
+
+    /// A second dispatch under one `set_pipeline` inherits the first one's binds.
+    ///
+    /// The argument table belongs to the encoder, not to a dispatch. Recording
+    /// it with `mem::take` gave `cmd0: binds=N, cmd1: binds=0`, so a replayed
+    /// tape would leave every slot unwritten for the second and later
+    /// dispatches. The split-K loop has exactly this shape and survived only
+    /// because it re-binds all seven scalars every iteration.
+    ///
+    /// Against the pre-fix code this asserts `3 == 0` on the second command.
+    #[test]
+    fn binds_persist_across_dispatches_under_one_pipeline() {
+        let _flags = IcbFlagsTestGuard::lock();
+        let rt = GpuRuntime::new().expect("GpuRuntime::new");
+        let a = rt.alloc_buffer_hot(64 * 4).expect("a");
+        let b = rt.alloc_buffer_hot(64 * 4).expect("b");
+        let n = rt.alloc_buffer_hot(4).expect("n");
+        let pipe = pipeline_icb(&rt, "copy_f32").expect("copy_f32 icb pipeline");
+
+        begin_decode_icb_capture();
+        capture_note_pipeline(pipe);
+        capture_note_bind(0, &a, 0);
+        capture_note_bind(1, &b, 0);
+        capture_note_bind(2, &n, 0);
+        let tg = mtl_size(1, 1, 1);
+        capture_note_dispatch(tg, tg);
+        // No re-binding between the two dispatches: the table still holds them.
+        capture_note_dispatch(tg, tg);
+        let cap = take_decode_icb_capture().expect("capture");
+
+        assert_eq!(cap.commands.len(), 2, "two dispatches were recorded");
+        assert_eq!(cap.commands[0].binds.len(), 3);
+        assert_eq!(
+            cap.commands[1].binds.len(),
+            3,
+            "the second dispatch inherits the argument table; recording it with \
+             zero binds would replay with unwritten slots"
+        );
+    }
+
+    /// A suppressed execute must not be counted as a replay that happened.
+    ///
+    /// Under binder-encode-nop every `with_binder` body is skipped, so
+    /// `execute` encodes nothing and the destination keeps its prior contents.
+    /// It nonetheless returned `Ok`, incremented `execute_count` and set
+    /// `optimized` — and `cb_replay` counted that as a successful tape replay.
+    /// A token that did not happen was indistinguishable from one that did.
+    ///
+    /// Against the pre-fix code `execute_count` is 1 and `optimized` is true.
+    #[test]
+    fn an_execute_suppressed_by_nop_is_not_counted() {
+        let _flags = IcbFlagsTestGuard::lock();
+        let rt = GpuRuntime::new().expect("GpuRuntime::new");
+        set_decode_icb(true);
+        let (mut dec, out) = DecodeIcb::mini_copy_chain(&rt, 64).expect("mini copy chain");
+        let before = dec.execute_count();
+
+        set_binder_encode_nop(true);
+        let result = dec.execute(&rt);
+        set_binder_encode_nop(false);
+
+        result.expect("a suppressed execute stays benign for callers holding the guard");
+        assert!(
+            dec.last_execute_was_nop(),
+            "the suppression must be observable"
+        );
+        assert_eq!(
+            dec.execute_count(),
+            before,
+            "no dispatch was encoded, so no execute may be counted"
+        );
+        // The destination is untouched, which is what makes the old accounting
+        // a lie rather than a rounding difference.
+        let _ = out;
+    }
+
+    /// A second `begin` must not silently discard the first tape.
+    ///
+    /// The begin/take pair has no RAII guard, so a caller that bails between
+    /// them leaks the capture for the thread's lifetime — growing without bound
+    /// and holding a `GpuBuffer` clone per bind, which keeps those buffers out
+    /// of the freelist and pinned in residency. Silently replacing the tape on
+    /// re-entry is what kept that invisible.
+    ///
+    /// Against the pre-fix code the recorded command is gone and
+    /// `nested_begins` does not exist.
+    #[test]
+    fn a_second_capture_begin_is_recorded_not_silent() {
+        let _flags = IcbFlagsTestGuard::lock();
+        let rt = GpuRuntime::new().expect("GpuRuntime::new");
+        let a = rt.alloc_buffer_hot(64 * 4).expect("a");
+        let pipe = pipeline_icb(&rt, "copy_f32").expect("copy_f32 icb pipeline");
+        let tg = mtl_size(1, 1, 1);
+
+        begin_decode_icb_capture();
+        capture_note_pipeline(pipe);
+        capture_note_bind(0, &a, 0);
+        capture_note_dispatch(tg, tg);
+
+        // A caller that forgot to take, then began again.
+        begin_decode_icb_capture();
+
+        let cap = take_decode_icb_capture().expect("capture");
+        assert_eq!(
+            cap.commands.len(),
+            1,
+            "the first tape's work must survive re-entry, not be discarded"
+        );
+        assert_eq!(
+            cap.nested_begins, 1,
+            "re-entry must be recorded so the leak is visible"
+        );
+
+        // And the explicit escape hatch actually clears it.
+        begin_decode_icb_capture();
+        assert!(decode_icb_capture_active());
+        end_decode_icb_capture();
+        assert!(
+            !decode_icb_capture_active(),
+            "end_decode_icb_capture must release the tape and its pinned buffers"
+        );
+    }
+
+    /// A nested nop guard must not end its parent's scope on drop.
+    ///
+    /// `Drop` restored a constant `false`, so an inner guard's drop re-enabled
+    /// encoding while the outer guard was still logically in force — and the
+    /// layers the outer guard existed to suppress got encoded after all.
+    ///
+    /// Against the pre-fix code the final assertion sees `false`.
+    #[test]
+    fn a_nested_nop_guard_restores_its_parent() {
+        let _flags = IcbFlagsTestGuard::lock();
+        set_binder_encode_nop(false);
+        assert!(!binder_encode_nop());
+
+        let outer = BinderEncodeNopGuard::enter();
+        assert!(binder_encode_nop(), "the outer guard enables nop");
+        {
+            let _inner = BinderEncodeNopGuard::enter();
+            assert!(binder_encode_nop());
+        }
+        assert!(
+            binder_encode_nop(),
+            "the inner guard's drop must restore the outer guard's state, not a constant"
+        );
+        drop(outer);
+        assert!(!binder_encode_nop(), "the outer drop restores the original");
+    }
+
+    /// A bind the argument table cannot hold must be refused, not dropped.
+    ///
+    /// The prebuilt and freeze encode paths filter `index < ARG_TABLE_SLOTS`
+    /// and silently drop anything above, so a tape built with `index: 40` used
+    /// to return `Ok` and replay with that operand absent. `buf_bind_fingerprint`
+    /// applies the same filter, so two commands differing only in an
+    /// out-of-range bind also collided onto one shared table.
+    ///
+    /// Against the pre-fix code `from_commands` returns `Ok` here.
+    #[test]
+    fn an_out_of_range_bind_index_is_refused() {
+        let _flags = IcbFlagsTestGuard::lock();
+        let rt = GpuRuntime::new().expect("GpuRuntime::new");
+        let a = rt.alloc_buffer_hot(64 * 4).expect("a");
+        let pipe = pipeline_icb(&rt, "copy_f32").expect("copy_f32 icb pipeline");
+        let tg = mtl_size(1, 1, 1);
+
+        // ARG_TABLE_SLOTS is 31, so 31 is already one past the end.
+        for index in [ARG_TABLE_SLOTS, 40] {
+            let cmds = vec![DecodeIcbCommand {
+                pipeline: pipe.clone(),
+                threadgroups: tg,
+                threads_per_tg: tg,
+                binds: vec![DecodeIcbBind::Buf {
+                    index,
+                    buf: a.clone(),
+                    byte_offset: 0,
+                    gpu_addr: buf_gpu_addr(&a, 0),
+                }],
+                tg_mem: None,
+                owned_immediates: Vec::new(),
+                barrier_after: false,
+                incomplete_binds: 0,
+            }];
+            let err = DecodeIcb::from_commands(&rt, cmds)
+                .map(|_| ())
+                .expect_err("index {index} is past the argument table");
+            assert!(
+                err.contains("argument table"),
+                "the error must name the cause, got: {err}"
+            );
+        }
+    }
+
+    /// A tape with binds that could not be recorded must be refused, not replayed.
+    ///
+    /// `bind_buf` takes a raw `MTLBuffer` with no owning `GpuBuffer`, so there
+    /// is nothing to record and nothing to pin. Every GEMM binds A, B and C
+    /// that way, so a captured GEMM recorded only its scalar immediates.
+    /// Replaying it would leave the operand slots unwritten *and* leave the
+    /// buffers free to be recycled into unrelated tensors — both silent.
+    ///
+    /// Against the pre-fix code `from_commands` returns `Ok` here.
+    #[test]
+    fn a_tape_missing_operand_binds_is_refused() {
+        let _flags = IcbFlagsTestGuard::lock();
+        let rt = GpuRuntime::new().expect("GpuRuntime::new");
+        let a = rt.alloc_buffer_hot(64 * 4).expect("a");
+        let pipe = pipeline_icb(&rt, "copy_f32").expect("copy_f32 icb pipeline");
+
+        begin_decode_icb_capture();
+        capture_note_pipeline(pipe);
+        capture_note_bind(0, &a, 0);
+        // Stand in for `Binder::bind_buf`, which reaches the encoder with no
+        // owning handle for the tape to hold.
+        capture_note_unrecordable_bind();
+        let tg = mtl_size(1, 1, 1);
+        capture_note_dispatch(tg, tg);
+        let cap = take_decode_icb_capture().expect("capture");
+
+        assert_eq!(cap.commands[0].incomplete_binds, 1);
+
+        // Inherit mode is fine: the live argument table supplies the bind.
+        DecodeIcb::from_commands_ex(&rt, cap.commands.clone(), false)
+            .map(|_| ())
+            .expect("inherit-buffers replay does not depend on the tape's binds");
+
+        // Freeze-binds writes the tape's binds into the ICB, so a missing one
+        // is an unwritten slot on every replay.
+        let err = DecodeIcb::from_commands_ex(&rt, cap.commands, true)
+            .map(|_| ())
+            .expect_err("a freeze-binds tape missing operands must not build");
+        assert!(
+            err.contains("could not be recorded"),
+            "the error must name the cause, got: {err}"
         );
     }
 }

@@ -54,15 +54,17 @@ def main():
         print(f"round {r+1}/{args.rounds} done", file=sys.stderr)
 
     pairs = [("tensorops-f32", "mps-f32", "tessl f32-exact vs torch f32"),
-             ("tensorops-f32relaxed", "mps-f32", "tessl tf32 vs torch f32"),
+             ("tensorops-tf32", "mps-f32", "tessl tf32 vs torch f32"),
              ("tensorops-bf16", "mps-bf16", "tessl bf16 vs torch bf16"),
-             ("tensorops-f32relaxed", "mlx-f32", "tessl tf32 vs MLX f32"),
+             ("tensorops-tf32", "mlx-f32", "tessl tf32 vs MLX f32"),
              ("tensorops-bf16", "mlx-bf16", "tessl bf16 vs MLX bf16")]
     for mine, theirs, label in pairs:
         rows = []
         for s in labels:
             rr = [a[(s, mine)] / b[(s, theirs)]
                   for a, b in per_round if (s, mine) in a and (s, theirs) in b]
+            if not rr:
+                print(f"  {s:18} NO DATA — lane missing from one side", file=sys.stderr)
             if rr:
                 rows.append((s, statistics.median(rr), min(rr), max(rr)))
         if not rows:

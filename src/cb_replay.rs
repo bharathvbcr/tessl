@@ -368,10 +368,20 @@ pub struct PingPongCbReplay {
     dry_run: bool,
     /// Successful live-encode steps recorded while encode-once mode is on.
     live_encodes: u64,
-    /// Times [`Self::try_replay`] returned [`CbReplayError::NotWired`].
+    /// Times a replay attempt found no wired ICB path (never-wired / flag off).
+    /// Kept separate from [`Self::icb_execute_failures`]: "we never had a tape"
+    /// and "the tape ran and failed" are different bugs to chase.
     not_wired_hits: u64,
-    /// Successful ICB executes via [`Self::try_replay`].
+    /// Times a wired DecodeIcb was executed and the execute itself failed.
+    icb_execute_failures: u64,
+    /// Successful DecodeIcb tape executes (real GPU replay work).
     icb_replays: u64,
+    /// Steps where a captured layer graph existed but the GPU work was
+    /// live-encoded ([`Self::note_layer_live_replay`]) — no tape ran.
+    layer_live_replays: u64,
+    /// [`Self::on_gpu_complete`] calls dropped because the slot was still
+    /// Recording (mis-sequenced caller).
+    stale_completes: u64,
     /// Argument-table / ICB next-step stub (plan telemetry).
     icb: IcbReplayStub,
     /// Owned mini/full decode ICB (compute path). When set, [`Self::try_replay`]
@@ -394,7 +404,10 @@ impl PingPongCbReplay {
             dry_run: false,
             live_encodes: 0,
             not_wired_hits: 0,
+            icb_execute_failures: 0,
             icb_replays: 0,
+            layer_live_replays: 0,
+            stale_completes: 0,
             icb: IcbReplayStub::new(),
             decode_icb: None,
         }
@@ -422,8 +435,20 @@ impl PingPongCbReplay {
         self.not_wired_hits
     }
 
+    /// Answers "did a tape replay actually happen?" — successful
+    /// [`crate::decode_icb::DecodeIcb`] executes only.
     pub fn icb_replays(&self) -> u64 {
         self.icb_replays
+    }
+
+    /// Wired-but-failed executes (see [`CbReplayError::IcbExecuteFailed`]).
+    pub fn icb_execute_failures(&self) -> u64 {
+        self.icb_execute_failures
+    }
+
+    /// Steps a layer graph was wired for but that ran as a live encode.
+    pub fn layer_live_replays(&self) -> u64 {
+        self.layer_live_replays
     }
 
     pub fn icb_stub(&self) -> &IcbReplayStub {
@@ -462,9 +487,7 @@ impl PingPongCbReplay {
 
     /// Any slot in Ready (eligible for ICB replay).
     pub fn has_ready_slot(&self) -> bool {
-        self.slots
-            .iter()
-            .any(|s| s.phase == CbReplayPhase::Ready)
+        self.slots.iter().any(|s| s.phase == CbReplayPhase::Ready)
     }
 
     /// Execute the attached DecodeIcb (after a successful [`Self::try_replay`]).
@@ -498,9 +521,11 @@ impl PingPongCbReplay {
         }
         self.slots[slot.index()].phase = CbReplayPhase::InFlight;
         if let Err(e) = self.execute_decode_icb(rt) {
-            // Roll back so a caller can fall through to live encode.
+            // Roll back so a caller can fall through to live encode. This is a
+            // wired tape that ran and failed — not a missing wiring, so it must
+            // not land in not_wired_hits.
             self.slots[slot.index()].phase = CbReplayPhase::Ready;
-            self.not_wired_hits = self.not_wired_hits.saturating_add(1);
+            self.icb_execute_failures = self.icb_execute_failures.saturating_add(1);
             return Err(CbReplayError::IcbExecuteFailed(e));
         }
         Ok(())
@@ -537,14 +562,17 @@ impl PingPongCbReplay {
 
     /// Layer-graph is wired, but GPU work was **live-encoded** (frozen-tape
     /// `DecodeIcb::execute` still not token-correct — residual blow-up ~cmd 19).
-    /// Advances the Ready ledger and counts `icb_replays` without tape execute.
+    /// Advances the Ready ledger and counts [`Self::layer_live_replays`].
+    ///
+    /// Deliberately does **not** touch `icb_replays` or the stub's execute
+    /// telemetry: no tape ran, and counting it as one made "did a tape replay
+    /// actually happen?" unanswerable from the metrics.
     pub fn note_layer_live_replay(
         &mut self,
         label: impl Into<String>,
     ) -> Result<(), CbReplayError> {
         self.mark_replay_step(label)?;
-        self.icb_replays = self.icb_replays.saturating_add(1);
-        self.icb.mark_mini_execute_ok();
+        self.layer_live_replays = self.layer_live_replays.saturating_add(1);
         Ok(())
     }
 
@@ -554,12 +582,23 @@ impl PingPongCbReplay {
         count_live: bool,
     ) -> Result<(), CbReplayError> {
         let slot = self.active;
-        // Recover from a partial record if a prior step erred mid-encode.
-        if self.slots[slot.index()].phase == CbReplayPhase::Recording {
-            self.finish_record(slot)?;
-        } else {
-            self.begin_record(slot, label)?;
-            self.finish_record(slot)?;
+        match self.slots[slot.index()].phase {
+            // Recover from a partial record if a prior step erred mid-encode.
+            CbReplayPhase::Recording => self.finish_record(slot)?,
+            // Reaching this slot again means a whole step ran on the peer since
+            // it was submitted, which is exactly the drain window two-slot
+            // ping-pong buys. Recycle it: nothing else clears InFlight (callers
+            // drive `on_gpu_complete` only on the try_replay_icb path), so
+            // leaving it would wedge every later step at Err(InFlight) forever.
+            CbReplayPhase::InFlight => {
+                self.on_gpu_complete(slot);
+                self.begin_record(slot, label)?;
+                self.finish_record(slot)?;
+            }
+            CbReplayPhase::Idle | CbReplayPhase::Ready => {
+                self.begin_record(slot, label)?;
+                self.finish_record(slot)?;
+            }
         }
         if count_live {
             self.live_encodes = self.live_encodes.saturating_add(1);
@@ -588,7 +627,11 @@ impl PingPongCbReplay {
     }
 
     /// Begin recording into `slot` (must be Idle or Ready after GPU wait).
-    pub fn begin_record(&mut self, slot: CbSlot, label: impl Into<String>) -> Result<(), CbReplayError> {
+    pub fn begin_record(
+        &mut self,
+        slot: CbSlot,
+        label: impl Into<String>,
+    ) -> Result<(), CbReplayError> {
         let s = &mut self.slots[slot.index()];
         match s.phase {
             CbReplayPhase::Idle | CbReplayPhase::Ready => {}
@@ -615,28 +658,38 @@ impl PingPongCbReplay {
 
     /// Attempt to replay a Ready slot without re-encoding the MTL4 CB.
     ///
-    /// When a [`crate::decode_icb::DecodeIcb`] is attached, returns `Ok` and
-    /// marks the slot InFlight — caller must [`Self::execute_decode_icb`].
-    /// Otherwise [`CbReplayError::NotWired`] (or dry_run state transition).
+    /// Always [`CbReplayError::NotWired`] outside `dry_run`, even with a
+    /// [`crate::decode_icb::DecodeIcb`] attached: this entry point takes no
+    /// [`crate::runtime::GpuRuntime`], so it cannot run the tape. Returning `Ok`
+    /// for an attachment alone reported GPU work that nobody performed and left
+    /// the slot InFlight with no committed submission behind it. Callers that
+    /// hold a runtime use [`Self::try_replay_icb`] / [`Self::try_replay_ready_icb`].
     pub fn try_replay(&mut self, slot: CbSlot) -> Result<(), CbReplayError> {
         if self.slots[slot.index()].phase != CbReplayPhase::Ready {
             return Err(CbReplayError::NotReady);
-        }
-        if self.decode_icb_wired() {
-            self.slots[slot.index()].phase = CbReplayPhase::InFlight;
-            return Ok(());
         }
         if !self.dry_run {
             self.not_wired_hits = self.not_wired_hits.saturating_add(1);
             let _ = self.icb.try_execute();
             return Err(CbReplayError::NotWired);
         }
+        // dry_run only: drive the phase machine with no Metal behind it.
         self.slots[slot.index()].phase = CbReplayPhase::InFlight;
         Ok(())
     }
 
     /// Mark GPU complete; slot returns to Idle (allocator may reset).
+    ///
+    /// A `Recording` slot is left untouched: nothing was submitted from it yet,
+    /// so a completion naming it is stale bookkeeping, and resetting would drop
+    /// the in-progress recording and make the caller's [`Self::finish_record`]
+    /// fail with [`CbReplayError::NotRecording`]. Counted in [`Self::status_line`]
+    /// so a mis-sequenced caller is visible instead of silent.
     pub fn on_gpu_complete(&mut self, slot: CbSlot) {
+        if self.slots[slot.index()].phase == CbReplayPhase::Recording {
+            self.stale_completes = self.stale_completes.saturating_add(1);
+            return;
+        }
         let s = &mut self.slots[slot.index()];
         s.phase = CbReplayPhase::Idle;
         s.label.clear();
@@ -656,7 +709,7 @@ impl PingPongCbReplay {
             .map(|d| d.status_line())
             .unwrap_or_else(|| self.icb.status_line());
         format!(
-            "cb_replay active={:?} A={:?}/{} B={:?}/{} dry_run={} wired={wired} live_encodes={} not_wired={} icb_replays={} | {icb_s}",
+            "cb_replay active={:?} A={:?}/{} B={:?}/{} dry_run={} wired={wired} live_encodes={} not_wired={} icb_replays={} icb_exec_fail={} layer_live_replays={} stale_completes={} | {icb_s}",
             self.active,
             self.slots[0].phase,
             self.slots[0].generation,
@@ -666,6 +719,9 @@ impl PingPongCbReplay {
             self.live_encodes,
             self.not_wired_hits,
             self.icb_replays,
+            self.icb_execute_failures,
+            self.layer_live_replays,
+            self.stale_completes,
         )
     }
 }
@@ -690,14 +746,20 @@ impl std::fmt::Display for CbReplayError {
             CbReplayError::NotRecording => write!(f, "CB slot not recording"),
             CbReplayError::NotReady => write!(f, "CB slot not Ready for replay"),
             CbReplayError::InFlight => write!(f, "CB slot still in flight"),
-            CbReplayError::NotWired => write!(
-                f,
-                "encode-once replay not wired: {}",
-                survey_cb_replay_api_gaps()
-                    .first()
-                    .map(|g| g.as_str())
-                    .unwrap_or("unknown gap")
-            ),
+            // NotWired is raised for several distinct reasons (no MTL4 replay
+            // API on `try_replay`, flag off / no attached tape on
+            // `try_replay_icb`); naming only the first surveyed gap picked the
+            // wrong cause for every caller but one. List them all.
+            CbReplayError::NotWired => {
+                write!(f, "encode-once replay not wired: {}", {
+                    let s = cb_replay_api_gap_summary();
+                    if s.is_empty() {
+                        "unknown gap".to_string()
+                    } else {
+                        s
+                    }
+                })
+            }
             CbReplayError::IcbExecuteFailed(e) => write!(f, "decode ICB execute failed: {e}"),
         }
     }
@@ -794,14 +856,21 @@ mod tests {
         pp.mark_live_step("capture0").unwrap();
         // Ready slot is A after flip; replay it via execute_icb.
         assert_eq!(pp.slot(CbSlot::A).phase, CbReplayPhase::Ready);
+        // `attach_decode_icb` already set the stub to Allocated, so asserting
+        // that phase again proves nothing about the replay. Pin what the replay
+        // itself must have done: one more stub execute, the slot claimed, and
+        // no not-wired / failure accounting.
+        let exec_before = pp.icb_stub().execute_attempts;
         pp.try_replay_icb(CbSlot::A, &rt).expect("try_replay_icb");
         rt.synchronize().unwrap();
         assert_eq!(pp.icb_replays(), 1);
-        assert_eq!(pp.icb_stub().phase, IcbStubPhase::Allocated);
+        assert_eq!(pp.icb_stub().execute_attempts, exec_before + 1);
+        assert_eq!(pp.slot(CbSlot::A).phase, CbReplayPhase::InFlight);
+        assert_eq!(pp.not_wired_hits(), 0);
+        assert_eq!(pp.icb_execute_failures(), 0);
         let n = 32usize;
-        let got = unsafe {
-            std::slice::from_raw_parts(out.metal().contents().as_ptr() as *const f32, n)
-        };
+        let got =
+            unsafe { std::slice::from_raw_parts(out.metal().contents().as_ptr() as *const f32, n) };
         for (i, v) in got.iter().take(n).enumerate() {
             assert_eq!(*v, (i as f32) + 1.0, "mismatch at {i}");
         }
@@ -813,15 +882,101 @@ mod tests {
             let q = out.metal().contents().as_ptr() as *mut u8;
             std::ptr::write_bytes(q, 0xFF, n * 4);
         }
-        pp.try_replay_icb(CbSlot::A, &rt).expect("second try_replay_icb");
+        pp.try_replay_icb(CbSlot::A, &rt)
+            .expect("second try_replay_icb");
         rt.synchronize().unwrap();
-        let got2 = unsafe {
-            std::slice::from_raw_parts(out.metal().contents().as_ptr() as *const f32, n)
-        };
+        let got2 =
+            unsafe { std::slice::from_raw_parts(out.metal().contents().as_ptr() as *const f32, n) };
         for (i, v) in got2.iter().take(n).enumerate() {
             assert_eq!(*v, (i as f32) + 1.0);
         }
         assert_eq!(pp.icb_replays(), 2);
         eprintln!("decode_icb_mini_replay: {}", pp.status_line());
+    }
+
+    /// Defect 1: `try_replay` takes no runtime, so an attached tape does not
+    /// make it a replay — it must not report success for work it cannot do.
+    #[test]
+    fn try_replay_stays_not_wired_with_a_decode_icb_attached() {
+        let _flags = crate::decode_icb::IcbFlagsTestGuard::lock();
+        crate::set_decode_icb(true);
+        let rt = crate::GpuRuntime::new().expect("runtime");
+        let (dicb, _out) = crate::DecodeIcb::mini_copy_chain(&rt, 32).expect("mini DecodeIcb");
+        let mut pp = PingPongCbReplay::new();
+        pp.attach_decode_icb(dicb);
+        assert!(pp.decode_icb_wired());
+        pp.mark_live_step("capture0").unwrap();
+        assert_eq!(pp.slot(CbSlot::A).phase, CbReplayPhase::Ready);
+        assert_eq!(pp.try_replay(CbSlot::A), Err(CbReplayError::NotWired));
+        // Nothing was submitted, so the slot must still be replayable.
+        assert_eq!(pp.slot(CbSlot::A).phase, CbReplayPhase::Ready);
+        assert_eq!(pp.icb_replays(), 0);
+        assert_eq!(pp.not_wired_hits(), 1);
+        // The runtime-carrying sibling is the one that really replays it.
+        pp.try_replay_icb(CbSlot::A, &rt).expect("try_replay_icb");
+        rt.synchronize().unwrap();
+        assert_eq!(pp.icb_replays(), 1);
+    }
+
+    /// Defect 2: nothing internal clears InFlight, so once both slots were
+    /// claimed the ledger answered Err(InFlight) to every later step.
+    #[test]
+    fn ledger_recycles_an_in_flight_slot_instead_of_wedging() {
+        let mut pp = PingPongCbReplay::new().with_dry_run(true);
+        pp.mark_live_step("s0").unwrap();
+        // A is Ready and active is B: claim A the way a replay would.
+        pp.try_replay(CbSlot::A).unwrap();
+        assert_eq!(pp.slot(CbSlot::A).phase, CbReplayPhase::InFlight);
+        pp.mark_live_step("s1").unwrap();
+        assert_eq!(pp.active_slot(), CbSlot::A);
+        // A full step ran on B since A was claimed — A must be reusable.
+        pp.mark_live_step("s2")
+            .expect("in-flight slot must recycle");
+        pp.mark_live_step("s3").unwrap();
+        assert_eq!(pp.live_encodes(), 4);
+        assert_eq!(pp.slot(CbSlot::A).phase, CbReplayPhase::Ready);
+    }
+
+    /// Defect 3: a completion for a slot the host is still recording used to
+    /// reset it to Idle, stranding the caller's `finish_record`.
+    #[test]
+    fn on_gpu_complete_does_not_discard_an_open_recording() {
+        let mut pp = PingPongCbReplay::new();
+        pp.begin_record(CbSlot::A, "mid_encode").unwrap();
+        pp.on_gpu_complete(CbSlot::A);
+        assert_eq!(pp.slot(CbSlot::A).phase, CbReplayPhase::Recording);
+        pp.finish_record(CbSlot::A)
+            .expect("recording must survive a stale completion");
+        assert_eq!(pp.slot(CbSlot::A).phase, CbReplayPhase::Ready);
+        assert!(pp.status_line().contains("stale_completes=1"));
+        // A completion for a slot that really was submitted still recycles it.
+        pp.on_gpu_complete(CbSlot::A);
+        assert_eq!(pp.slot(CbSlot::A).phase, CbReplayPhase::Idle);
+    }
+
+    /// Defect 4a: live-encoded layer work is not a tape replay.
+    #[test]
+    fn note_layer_live_replay_is_not_counted_as_a_tape_replay() {
+        let mut pp = PingPongCbReplay::new();
+        pp.note_layer_live_replay("live_layer_replay pos=0")
+            .unwrap();
+        assert_eq!(pp.layer_live_replays(), 1);
+        assert_eq!(pp.icb_replays(), 0, "no DecodeIcb tape ran");
+        assert_eq!(pp.live_encodes(), 0, "mark_replay_step must not count live");
+        assert_eq!(pp.icb_stub().execute_attempts, 0);
+        assert_ne!(pp.icb_stub().phase, IcbStubPhase::Allocated);
+    }
+
+    /// Defect 4c: NotWired is raised for several causes, so the message must
+    /// not pin the blame on the first surveyed gap every time.
+    #[test]
+    fn not_wired_message_names_every_surveyed_gap() {
+        let msg = CbReplayError::NotWired.to_string();
+        for gap in survey_cb_replay_api_gaps() {
+            assert!(
+                msg.contains(gap.as_str()),
+                "NotWired message omits {gap:?}: {msg}"
+            );
+        }
     }
 }

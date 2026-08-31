@@ -14,6 +14,29 @@ license = "MIT OR Apache-2.0"
 # sources instead of keeping a copy that silently drifts.
 links = "tessl"
 
+# The repo keeps the full logo exploration — four concepts x three palettes x
+# six raster sizes — because that is design history worth having in git. None of
+# it is worth shipping to a consumer: unexcluded it was 99 of 175 packaged files
+# and took the .crate from 235 KiB to 4.3 MiB compressed, all of it discarded
+# variants. Only the two marks the README actually references stay in the
+# package.
+exclude = [
+    "assets/concepts/**",
+    "assets/build_logo.py",
+    "assets/png/*@2048.png",
+]
+
+# tessl is Apple-silicon only: `objc2-metal` is an unconditional dependency and
+# `build.rs` drives the Metal toolchain. Documenting it on docs.rs's default
+# x86_64-linux target is not possible, so point it at the target the crate
+# actually supports. `build.rs` detects `DOCS_RS` and skips the AOT shader
+# compile, which needs Xcode.
+[package.metadata.docs.rs]
+default-target = "aarch64-apple-darwin"
+targets = ["aarch64-apple-darwin"]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
 [features]
 default = []
 # Quantized MTLTensor prep (WWDC26-330). Off by default because it is exactly

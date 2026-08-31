@@ -16,6 +16,13 @@
 
 The name is short for *tessellation* — the design centers around how matrix operations are partitioned into tile geometries and the order in which those tiles are traversed.
 
+| | |
+| --- | --- |
+| **Status** | `0.1.0` — Metal 4 / MPP TensorOps verified on M5 Pro |
+| **Tests** | 199 passing (`cargo test --release -- --test-threads=1`) |
+| **Platform** | Apple silicon, macOS 26+, Xcode 26 Metal Toolchain |
+| **License** | MIT OR Apache-2.0 |
+
 ---
 
 ## Key Highlights
@@ -25,6 +32,10 @@ The name is short for *tessellation* — the design centers around how matrix op
 - **Cooperative Register Accumulators:** High-throughput cooperative destination kernels (`get_destination_cooperative_tensor`) holding `f32` accumulators in GPU registers across the entire $K$-reduction, eliminating device memory round-trips for NN, TN, NT, and accumulating paths.
 - **In-Kernel Grid Swizzling & Bounds Checking:** Column-panel tile swizzling for large grids ($\ge 2048$ tiles) bounding operand rereads, combined with origin-shifted slice bounds checking for ragged edges.
 - **Zero-Wait Execution Pipeline:** Packed command encoding with bump-allocated constant arenas (16 MiB) and `MTLSharedEvent` synchronization—host threads never block mid-step.
+- **Neural-Network Kernel Library:** 18 Metal source files providing 72 kernel entry points — RMSNorm, gated MLP activations (SiLU / GELU-tanh), flash attention (sliding-window $h{=}128/256$, global $h{=}512$), fused RMSNorm+QKV+RoPE, MLX-format Q4 GEMV/GEMM, Q8 GEMV, KV-cache stores, embedding lookup, row-wise softmax/sum/max, and softcap sampling. All reachable through 62 shape-checked entry points in `tessl::nn`, not as raw pipeline-name strings.
+- **Fused GEMM Epilogue:** `C = activation(alpha * A@B + beta * C_prev + bias)` in a single dispatch, applied while the accumulator is still in registers — measured 1.6–2.4× cheaper than the same work as a separate pass over $C$.
+- **Mixed Precision & Quantization:** `f32`, `bf16`, `tf32-relaxed`, IEEE `binary16` (`DType::F16`), and an exact `int8 x int8 -> int32` GEMM with fused per-column dequantization (`nn::gemm_i8_dequant`).
+- **Strided Batched GEMM:** `gemm_batched` with explicit per-operand batch strides, so a batch dimension is expressed rather than inferred from a rank-2 shape.
 - **Decode ICB Capture & Replay:** Low-latency Indirect Command Buffer (ICB) capture and ping-pong execution with freeze-binds and range-batching for decode-shaped inference workloads.
 
 > [!IMPORTANT]
@@ -46,7 +57,8 @@ graph TD
 
     subgraph TesslAPI["tessl Public API"]
         GpuRt["GpuRuntime"]
-        GemmFn["gemm() / gemm_f32()"]
+        GemmFn["gemm() / gemm_epilogue() / gemm_batched()"]
+        NnFn["nn::* (RMSNorm, attention, softmax, Q4/Q8)"]
         TensorObj["Tensor / GpuBuffer"]
         IcbObj["DecodeIcb / PingPongCbReplay"]
     end
@@ -56,12 +68,13 @@ graph TD
         GemmMod["gemm.rs<br/>Validation, Layouts & Coop Dispatch"]
         DispatchMod["dispatch.rs<br/>Binder & Argument Table Encode"]
         IcbMod["decode_icb.rs / cb_replay.rs<br/>ICB Capture, Tape Replay & Coalescing"]
+        NnMod["nn.rs<br/>Typed API over the NN kernel library"]
         MtlTensorMod["mtl_tensor.rs<br/>Quantized MTLTensor Prep (WWDC26-330)"]
     end
 
     subgraph Metal4Layer["Metal 4 Driver & Hardware Layer"]
         CmdBuf["MTL4CommandBuffer / Allocator"]
-        ArgTable["MTL4ArgumentTable (32-slot)"]
+        ArgTable["MTL4ArgumentTable (31-slot)"]
         ResSet["MTLResidencySet (Hot / Cold Pools)"]
         SharedEvt["MTLSharedEvent (Zero-wait Sync)"]
     end
@@ -206,13 +219,249 @@ sequenceDiagram
 
 ---
 
+## Quickstart
+
+```bash
+cargo add tessl
+```
+
+Both snippets below are compiled and run as examples, so they cannot drift from
+the API:
+
+```bash
+cargo run --release --example gemm      # the GEMM quickstart
+cargo run --release --example nn_layer  # RMSNorm -> gate/up -> GELU -> residual
+```
+
+### Basic GEMM
+
+```rust
+use tessl::{gemm, GemmBackend, GpuRuntime};
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let rt = GpuRuntime::new()?;
+
+    let a = rt.alloc_tensor_f32(&[4096, 2304])?;
+    let b = rt.alloc_tensor_f32(&[2304, 768])?;
+    let c = rt.alloc_tensor_f32(&[4096, 768])?;
+
+    gemm(&a, &b, &c, GemmBackend::TensorOps)?;   // C = A @ B via MPP TensorOps
+    rt.synchronize()?;
+    Ok(())
+}
+```
+
+### Consuming kernels from a downstream crate
+
+`tessl` sets `links = "tessl"` and exports `DEP_TESSL_KERNELS`, so a crate that
+compiles its own metallib can build against the canonical kernel sources rather
+than keeping a copy that silently drifts. In a downstream `build.rs`:
+
+```rust
+let tessl_kernels = std::path::PathBuf::from(std::env::var("DEP_TESSL_KERNELS").unwrap());
+let matmul_shader = tessl_kernels.join("matmul_tensorops.metal");
+// ... compile matmul_shader into your own metallib
+```
+
+To overlay a custom metallib at runtime:
+
+```rust
+use std::path::Path;
+
+let rt = GpuRuntime::from_metallib_path(Path::new("/path/to/custom.metallib"))?;
+
+// Or overlay onto tessl's default library. Pipeline names must be unique across
+// the primary library and every overlay: `pipeline()` resolves the primary
+// first, so a duplicate name in an overlay is silently unreachable.
+let rt = GpuRuntime::new()?;
+rt.add_metallib(Path::new("/path/to/custom_overlay.metallib"))?;
+```
+
+---
+
+## Neural-Network Kernels
+
+Every kernel is reached through a typed, shape-checked function in `tessl::nn`.
+None of them require the caller to name a pipeline string or hand-compute a
+threadgroup grid.
+
+| Group | Entry points | Notes |
+|---|---|---|
+| Normalization | `rms_norm_f32` | Fused weight multiply; `eps` applied inside the kernel. |
+| MLP | `mlp_silu`, `mlp_gelu_tanh`, `gate_up_*` | `GeluTanh` uses a clamped `precise::tanh`; plain `tanh` lowers to `air.fast_tanh` at `-O2` and returns NaN past roughly \|10\|. |
+| Attention | `flash_attn_swa_h128/h256`, `flash_attn_global_h512` | Sliding-window and global variants, selected by `AttnHeadDim`. |
+| Fused prologue | `rms_qkv_rope` | RMSNorm → QKV projection → RoPE in one dispatch. |
+| Reductions | `softmax_rows_f32`, `row_sum_f32`, `row_max_f32` | Max-subtracted softmax; a fully masked row returns uniform, not NaN. |
+| Quantized | `Q4Bank`, `Q4MlxBank`, `gemv_q8`, `gemm_i8_dequant` | Both the signed-int4 and the MLX unsigned-affine conventions. |
+| Cache / IO | `kv_store`, `embed_lookup`, `softcap_sample` | |
+
+Argument validation is not advisory. Every entry point checks buffer capacity
+and dimension products before encoding anything, and returns `Err` without
+dispatching — `tests/nn_adversarial.rs` asserts all three properties (error
+returned, no panic, dispatch count still zero) across the whole surface.
+
+---
+
+## Fused GEMM Epilogue
+
+`gemm_epilogue` computes `C = activation(alpha * A@B + beta * C_prev + bias)` in
+one dispatch.
+
+Every term there is otherwise a separate kernel that reads all of `C` and writes
+all of `C`. A bias plus an activation costs two extra full round-trips through
+device memory — on a bandwidth-bound machine, most of what the GEMM saved.
+Applied inside the cooperative-destination kernel the accumulator is still in
+registers, so `C` is written exactly once and read at most once, only when
+`beta != 0`.
+
+```rust
+use tessl::{gemm_epilogue, Activation, Epilogue, GemmBackend};
+
+gemm_epilogue(&a, &b, &c, GemmBackend::TensorOps, Epilogue {
+    alpha: 1.0,
+    beta: 0.0,                 // skips reading C entirely
+    bias: Some(&bias),         // per-column, length N
+    activation: Activation::GeluTanh,
+})?;
+```
+
+Bias is per-column and broadcasts across rows through a **row-stride-0 tensor
+view**, so the same cooperative `load` that fetches `C_prev` fetches the bias
+with no separate indexing.
+
+| Shape | `gemm` | Fused | `gemm` + one pass over C | Epilogue cost | vs. one pass |
+|---|---:|---:|---:|---:|---:|
+| 512³ | 0.377 ms | 0.558 ms | 0.661 ms | 0.181 ms | **1.57× cheaper** |
+| 1024³ | 0.471 ms | 0.584 ms | 0.746 ms | 0.113 ms | **2.43× cheaper** |
+| 2048×2048×512 | 0.916 ms | 1.139 ms | 1.297 ms | 0.223 ms | **1.71× cheaper** |
+
+`cargo run --release --example epilogue_cost`. The comparison arm is `gemm` plus
+a *single* `add_inplace_f32` sweep — strictly less work than a real bias
+broadcast, and half the work of bias plus a separate activation. Fusing beats
+even that lower bound at every shape. All three arms are GPU-side in one
+interleaved run, so machine load during measurement affects them alike.
+
+It requires the cooperative-destination path — bf16 operands, or f32 with
+relaxed precision. The exact-f32 and simdgroup kernels write `C` straight from
+the matmul with no register accumulator, so there is nothing to fuse into; those
+are refused rather than silently falling back to separate dispatches, which
+would make the call quietly slower than the unfused code it replaced.
+
+---
+
+## Verification
+
+```bash
+# Full suite. GPU tests are not thread-safe across concurrent OS threads
+# sharing default command encoders, so --test-threads=1 is required.
+cargo test --release -- --test-threads=1
+
+# Validate static TileGeom definitions against compiled Metal kernel constants
+python3 scripts/audit_gemm_tiles.py
+
+# Quick shape fuzz (160 cases) runs as part of the ordinary suite:
+cargo test --release --lib -- --test-threads=1 --nocapture gemm_fuzz_quick
+
+# Deep soak (2500 cases), #[ignore]d so it stays out of the default run:
+cargo test --release --lib -- --ignored --test-threads=1 --nocapture gemm_fuzz_deep
+
+# Replay a specific failing seed:
+STRESS_SEED=0xdeadbeef cargo test --release --lib -- --test-threads=1 gemm_fuzz_quick
+```
+
+**Static tile audit** (`scripts/audit_gemm_tiles.py`) cross-references every Rust
+`TileGeom` struct against the `constexpr int SM/SN` parameters compiled into
+`matmul_tensorops.metal`, including macro-instantiated kernels
+(`NN_COOP_KERNEL`, `TN_NT_COOP_KERNEL`). A mismatch would make the host dispatch
+incorrect threadgroup grids, silently leaving output tiles unwritten.
+
+**Shape fuzzer** `gemm_fuzz_quick` / `gemm_fuzz_deep` check numerical correctness
+across non-standard dimensions, reporting the failing seed for replay via
+`STRESS_SEED`.
+
+> [!NOTE]
+> An earlier version of this section claimed the fuzzer "asserts its own
+> coverage — the test panics if any selectable NN kernel is exercised in fewer
+> than 1% of fuzz iterations". No such assertion is implemented. It named a test
+> (`gemm_randomized_shape_fuzz`) and environment variables (`GEMM_FUZZ_SEED`,
+> `GEMM_FUZZ_CASES`) that do not exist either, so the documented command ran zero
+> tests and reported success. Per-kernel coverage accounting would be worth
+> adding; until it is, the fuzzer checks correctness on the shapes it happens to
+> draw and nothing more.
+
+---
+
+## Benchmarking & Tuning Binaries
+
+Tuning and A/B measurement kernels (92 variants) are excluded from the default
+metallib to keep release binaries light (0.20 MB vs. 1.07 MB):
+
+```bash
+TESSL_GEMM_TUNE=1 cargo build --release --bins
+```
+
+| Binary | Purpose |
+|---|---|
+| `bench_gemm_tile_tune` | Exhaustive tile geometry ($SM \times SN$) and $BK$ ladder benchmark. |
+| `bench_gemm_tnnt_tune` | TN/NT tile sweep; the paired, round-interleaved A/B comparison lane. |
+| `bench_gemm_sweep` | Cross-runtime sweep (`f32`, `tf32`, `bf16`) with JSON telemetry output. |
+| `probe_gemm_parity` | Bit-exact verification probe comparing TensorOps against the reference SIMD path. |
+| `bench/paired_cross_runtime.py` | Python harness driving paired `tessl` vs. PyTorch MPS / MLX evaluation. |
+
+---
+
+## Environment Variables
+
+All runtime configuration uses the canonical `TESSL_*` prefix. Legacy
+`METAL_RUNTIME_*` and `METAL_NATIVE_*` variants are still accepted.
+
+| Variable | Default | Description |
+|---|---|---|
+| `TESSL_GEMM_TUNE` | `0` | Compiles the 92-kernel A/B tuning suite into the metallib (build-time). |
+| `TESSL_GEMM_ACCUM` | `0` | Enables native TensorOps `multiply_accumulate` for TN/NT accumulate paths. |
+| `TESSL_GEMM_ACCUM_DX` | `0` | Enables the hardware accumulate path specifically for $dX$ NT GEMM. |
+| `TESSL_GEMM_INTERIOR` | `0` | Enables interior-offset tile optimizations for `f32` GEMM. |
+| `TESSL_HAZARD_BARRIERS` | `0` (barriers on) | **Unsafe, do not enable.** `1` *removes* the always-on Dispatch→Dispatch device barrier. The sense is the opposite of what this row said until 2026-08-31, and following the old wording to "enforce barriers" removed them. Enabling it requires the caller to place an explicit `Binder::barrier` at every RAW edge, and tessl's own ops do not: measured on an M5 Pro, `gemm_tn_accum_train` 64×64×128 under async encode produced wrong results in **300 of 300** repetitions with this set. |
+| `TESSL_COARSE_BARRIERS` | inherits `TESSL_HAZARD_BARRIERS` | Replaces per-RAW barriers with coarse phase-level synchronization. |
+| `TESSL_MID_COMMIT=N` | `0` | Overlaps host command encoding with GPU execution every $N$ dispatches. |
+| `TESSL_DECODE_ICB` | `0` | Enables the Indirect Command Buffer capture and execution path. |
+| `TESSL_ICB_FREEZE_BINDS` | `0` | Freezes argument table buffer bindings directly into ICB commands. |
+| `TESSL_ICB_RANGE_BATCH` | `0` | Coalesces contiguous ICB command ranges into single execution dispatches. |
+| `TESSL_SKIP_AOT` | `0` | Bypasses the `build.rs` AOT shader compile and reuses an existing `default.metallib`. Panics if that file is absent rather than baking a path that fails at every `GpuRuntime::new()`. |
+
+---
+
+## Feature Flags
+
+| Feature | Default | Description |
+|---|---|---|
+| `quant-prep` | **Disabled** | Compiles `mtl_tensor` for native quantized `MTLTensor` bindings (WWDC26-330). Off by default because it is exactly that — prep: `try_quant_tensorops_prefill_gemm` returns an error and nothing calls it. Kept compiling behind a flag rather than shipped as public API that does not work. |
+
+---
+
 ## Documentation
 
 | Document | Topic & Scope |
 |---|---|
 | [**Architecture**](docs/architecture.md) | Deep dive into kernel selection, cooperative destination register mechanics, $K$-reduction bandwidth analysis, and TN/NT layout optimizations. |
 | [**Benchmarking**](docs/benchmarking.md) | The paired measurement protocol, GPU thermal and frequency scaling mitigation, and five measurement pitfalls. |
-| [**Verification**](docs/verification.md) | Static tile geometry audit, self-asserting randomized shape fuzzing, and fault injection test suites. |
+| [**Verification**](docs/verification.md) | Static tile geometry audit, randomized shape fuzzing, and fault injection test suites. |
+| [**Tuning log**](bench/results/bf16_tile_tune_FINDINGS.md) | Empirical $BK$ ladder benchmarks, root causes, and the landed M5 Pro speedups. |
+| [**Changelog**](CHANGELOG.md) | Release history. |
+
+---
+
+## Known Gaps
+
+Recorded rather than implied. Every kernel is wired to a typed Rust API, the
+suite is warning-free, and there are no stubs; these are capabilities the crate
+does not have.
+
+| Gap | Why it matters | Why not yet |
+|---|---|---|
+| **Int4 TensorOps GEMM** | Half the weight bandwidth of int8. | TensorOps itself accepts `int4b_format` — the block is the shader-side tensor constructor for a sub-byte element type, not the objc2 binding this table used to blame. `nn::gemm_i8_dequant` ships the int8 case. |
+| **No CPU fallback** | Without a Metal 4 device, nothing runs. | Deliberate. This is an Apple-silicon runtime, and a silent CPU path would make every "GPU" benchmark here meaningless. |
+| **GPU CI** | The published numbers are reproducible only by hand. | GitHub's hosted macOS runners have no Metal 4 GPU. Correctness and benchmark claims in this README were verified locally on an M5 Pro; CI covers build, format, and lint only. |
 
 ---
 

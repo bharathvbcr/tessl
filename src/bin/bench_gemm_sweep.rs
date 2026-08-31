@@ -6,12 +6,12 @@
 //!
 //! `--dump-parity DIR` writes A/B/C as .npy for the numeric check in the Python lane.
 
+use std::path::Path;
+use std::time::Instant;
 use tessl::gemm::{cast_f32_to_bf16, gemm, GemmBackend};
 use tessl::npy::write_npy_f32;
 use tessl::runtime::GpuRuntime;
 use tessl::tensor::Tensor;
-use std::path::Path;
-use std::time::Instant;
 
 /// (M, N, K, label). Square ladder + the projection shapes arch_02 actually runs.
 const SHAPES: &[(usize, usize, usize, &str)] = &[
@@ -33,7 +33,9 @@ fn fill(n: usize, seed: u64) -> Vec<f32> {
     let mut s = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
     let mut out = Vec::with_capacity(n);
     for _ in 0..n {
-        s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        s = s
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         let u = ((s >> 32) as u32) as f64 / (u32::MAX as f64);
         out.push((u * 2.0 - 1.0) as f32);
     }
@@ -43,7 +45,11 @@ fn fill(n: usize, seed: u64) -> Vec<f32> {
 fn median(mut v: Vec<f64>) -> f64 {
     v.sort_by(|a, b| a.partial_cmp(b).unwrap());
     let n = v.len();
-    if n % 2 == 1 { v[n / 2] } else { (v[n / 2 - 1] + v[n / 2]) / 2.0 }
+    if n % 2 == 1 {
+        v[n / 2]
+    } else {
+        (v[n / 2 - 1] + v[n / 2]) / 2.0
+    }
 }
 
 fn time_backend(
@@ -84,11 +90,20 @@ fn shapes_from_env() -> Option<Vec<(usize, usize, usize, String)>> {
 
 fn main() -> Result<(), String> {
     let rt = GpuRuntime::new()?;
-    let warmup: usize = std::env::var("BENCH_WARMUP").ok().and_then(|s| s.parse().ok()).unwrap_or(10);
-    let iters: usize = std::env::var("BENCH_ITERS").ok().and_then(|s| s.parse().ok()).unwrap_or(50);
+    let warmup: usize = std::env::var("BENCH_WARMUP")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(10);
+    let iters: usize = std::env::var("BENCH_ITERS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(50);
 
     let args: Vec<String> = std::env::args().collect();
-    let dump_dir = args.iter().position(|a| a == "--dump-parity").map(|i| args[i + 1].clone());
+    let dump_dir = args
+        .iter()
+        .position(|a| a == "--dump-parity")
+        .map(|i| args[i + 1].clone());
 
     let mut backends = vec![("simdgroup", GemmBackend::Simdgroup)];
     if rt.has_tensorops() {
@@ -100,7 +115,10 @@ fn main() -> Result<(), String> {
     let owned = shapes_from_env();
     let shapes: Vec<(usize, usize, usize, String)> = match owned {
         Some(v) => v,
-        None => SHAPES.iter().map(|&(m, n, k, l)| (m, n, k, l.to_string())).collect(),
+        None => SHAPES
+            .iter()
+            .map(|&(m, n, k, l)| (m, n, k, l.to_string()))
+            .collect(),
     };
 
     let mut rows: Vec<String> = Vec::new();
@@ -117,7 +135,12 @@ fn main() -> Result<(), String> {
         let flop = 2.0 * m as f64 * n as f64 * k as f64;
         let mut lanes: Vec<(String, GemmBackend, Tensor, Tensor)> = Vec::new();
         for &(bname, backend) in &backends {
-            lanes.push((format!("{bname}-f32"), backend, a.view(&[m, k], 0), b.view(&[k, n], 0)));
+            lanes.push((
+                format!("{bname}-f32"),
+                backend,
+                a.view(&[m, k], 0),
+                b.view(&[k, n], 0),
+            ));
         }
         if rt.has_tensorops() {
             // bf16 operands, f32 accumulate — the path `gemm_train` takes under
@@ -147,7 +170,9 @@ fn main() -> Result<(), String> {
             let med = median(samples.clone());
             let best = samples.iter().cloned().fold(f64::INFINITY, f64::min);
             let gflops = flop / (med * 1e6);
-            eprintln!("{label:<12} {bname:<10} M={m} N={n} K={k}  {med:8.3} ms  {gflops:8.1} GFLOP/s");
+            eprintln!(
+                "{label:<12} {bname:<10} M={m} N={n} K={k}  {med:8.3} ms  {gflops:8.1} GFLOP/s"
+            );
             rows.push(format!(
                 r#"{{"shape":"{label}","backend":"{bname}","runtime":"metal-native","m":{m},"n":{n},"k":{k},"median_ms":{med:.6},"best_ms":{best:.6},"gflops":{gflops:.3}}}"#
             ));

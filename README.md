@@ -1,7 +1,7 @@
 <p align="center">
   <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="assets/logo-dark.svg">
-    <img src="assets/logo.svg" alt="tessl" width="330">
+    <source media="(prefers-color-scheme: dark)" srcset="assets/png/logo-dark@900.png">
+    <img src="assets/png/logo@900.png" alt="tessl" width="420">
   </picture>
 </p>
 

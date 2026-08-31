@@ -1,0 +1,33 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" width="128" height="128"
+     role="img" aria-label="tessl — Morton walk · oxide">
+  <title>tessl — Morton walk · oxide</title>
+  <defs>
+    <filter id="coglow" x="-50%" y="-50%" width="200%" height="200%">
+      <feGaussianBlur stdDeviation="3.2" result="b"/>
+      <feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+    <clipPath id="coclip"><rect x="6" y="6" width="116" height="116" rx="26"/></clipPath>
+  </defs>
+  <rect x="6" y="6" width="116" height="116" rx="26" fill="#0A0A0C"/>
+  <g clip-path="url(#coclip)">
+    <rect x="22" y="22" width="20" height="20" rx="2.6" fill="#1F2428" stroke="#39424A" stroke-width="1.4"/>
+    <rect x="46" y="22" width="20" height="20" rx="2.6" fill="#1F2428" stroke="#39424A" stroke-width="1.4"/>
+    <rect x="70" y="22" width="20" height="20" rx="2.6" fill="#1F2428" stroke="#39424A" stroke-width="1.4"/>
+    <rect x="94" y="22" width="20" height="20" rx="2.6" fill="#1F2428" stroke="#39424A" stroke-width="1.4"/>
+    <rect x="22" y="46" width="20" height="20" rx="2.6" fill="#1F2428" stroke="#39424A" stroke-width="1.4"/>
+    <rect x="46" y="46" width="20" height="20" rx="2.6" fill="#1F2428" stroke="#39424A" stroke-width="1.4"/>
+    <rect x="70" y="46" width="20" height="20" rx="2.6" fill="#1F2428" stroke="#39424A" stroke-width="1.4"/>
+    <rect x="94" y="46" width="20" height="20" rx="2.6" fill="#1F2428" stroke="#39424A" stroke-width="1.4"/>
+    <rect x="22" y="70" width="20" height="20" rx="2.6" fill="#1F2428" stroke="#39424A" stroke-width="1.4"/>
+    <rect x="46" y="70" width="20" height="20" rx="2.6" fill="#1F2428" stroke="#39424A" stroke-width="1.4"/>
+    <rect x="70" y="70" width="20" height="20" rx="2.6" fill="#1F2428" stroke="#39424A" stroke-width="1.4"/>
+    <rect x="94" y="70" width="20" height="20" rx="2.6" fill="#1F2428" stroke="#39424A" stroke-width="1.4"/>
+    <rect x="22" y="94" width="20" height="20" rx="2.6" fill="#1F2428" stroke="#39424A" stroke-width="1.4"/>
+    <rect x="46" y="94" width="20" height="20" rx="2.6" fill="#1F2428" stroke="#39424A" stroke-width="1.4"/>
+    <rect x="70" y="94" width="20" height="20" rx="2.6" fill="#1F2428" stroke="#39424A" stroke-width="1.4"/>
+    <rect x="94" y="94" width="20" height="20" rx="2.6" fill="#1F2428" stroke="#39424A" stroke-width="1.4"/>
+    <path d="M32.0 32.0 L56.0 32.0 L32.0 56.0 L56.0 56.0 L80.0 32.0 L104.0 32.0 L80.0 56.0 L104.0 56.0 L32.0 80.0 L56.0 80.0 L32.0 104.0 L56.0 104.0 L80.0 80.0 L104.0 80.0 L80.0 104.0 L104.0 104.0" fill="none" stroke="#FF5722" stroke-width="3.4" stroke-linecap="round" stroke-linejoin="round" filter="url(#coglow)" opacity="0.45"/>
+    <path d="M32.0 32.0 L56.0 32.0 L32.0 56.0 L56.0 56.0 L80.0 32.0 L104.0 32.0 L80.0 56.0 L104.0 56.0 L32.0 80.0 L56.0 80.0 L32.0 104.0 L56.0 104.0 L80.0 80.0 L104.0 80.0 L80.0 104.0 L104.0 104.0" fill="none" stroke="#FF5722" stroke-width="3.4" stroke-linecap="round" stroke-linejoin="round"/>
+  </g>
+  <rect x="6.5" y="6.5" width="115" height="115" rx="25.5" fill="none" stroke="#39424A" stroke-width="1"/>
+</svg>

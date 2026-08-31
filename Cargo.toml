@@ -1,0 +1,82 @@
+[package]
+name = "tessl"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.82"
+description = "Metal 4 GEMM and encode runtime for Apple silicon, built on Metal Performance Primitives TensorOps"
+repository = "https://github.com/bharathvbcr/tessl"
+readme = "README.md"
+keywords = ["metal", "gemm", "gpu", "apple-silicon", "bf16"]
+categories = ["science", "hardware-support", "api-bindings"]
+license = "MIT OR Apache-2.0"
+# Exposes `DEP_TESSL_KERNELS` to dependents' build scripts (see build.rs), so a
+# crate that compiles its own metallib can pull tessl's canonical GEMM kernel
+# sources instead of keeping a copy that silently drifts.
+links = "tessl"
+
+[features]
+default = []
+# Quantized MTLTensor prep (WWDC26-330). Off by default because it is exactly
+# that — prep. `try_quant_tensorops_prefill_gemm` returns
+# Err("not wired yet"), and nothing in this workspace calls the module. It is
+# kept compiling behind a flag rather than shipped as public API that does not
+# work yet.
+quant-prep = []
+
+[dependencies]
+objc2 = "0.6"
+objc2-foundation = { version = "0.3", features = ["NSString", "NSURL", "NSError", "NSData", "NSValue", "NSRange"] }
+objc2-metal = { version = "0.3", features = [
+    "MTLDevice",
+    "MTLLibrary",
+    "MTLBuffer",
+    "MTLResource",
+    "MTLAllocation",
+    # Classic MTLCommandQueue/Buffer/Encoder/ComputeCommandEncoder pruned —
+    # encode is Metal 4 only (MTL4*).
+    "MTLComputePipeline",
+    "MTLTypes",
+    "MTLGPUAddress",
+    "MTLEvent",
+    "MTLResidencySet",
+    "MTL4CommandQueue",
+    "MTL4CommandBuffer",
+    "MTL4CommandAllocator",
+    "MTL4CommandEncoder",
+    "MTL4ComputeCommandEncoder",
+    "MTL4ArgumentTable",
+    "MTL4Counters",
+    # Compute ICB (D16): ConcurrentDispatch + classic setKernelBuffer bridge.
+    # Opt-in smoke only — not the default decode encode path.
+    "MTLIndirectCommandBuffer",
+    "MTLIndirectCommandEncoder",
+    "MTL4Compiler",
+    "MTL4ComputePipeline",
+    "MTL4PipelineState",
+    "MTL4FunctionDescriptor",
+    "MTL4LibraryFunctionDescriptor",
+    # WWDC26-330 prep: native MTLTensor (incl. quantized Int8 today; Int4 when bindings land).
+    "MTLTensor",
+] }
+libc = "0.2"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+
+[[bin]]
+name = "bench_gemm_sweep"
+path = "src/bin/bench_gemm_sweep.rs"
+
+[[bin]]
+name = "bench_gemm_tnnt_tune"
+path = "src/bin/bench_gemm_tnnt_tune.rs"
+
+[[bin]]
+name = "bench_gemm_tile_tune"
+path = "src/bin/bench_gemm_tile_tune.rs"
+
+[[bin]]
+name = "probe_gemm_parity"
+path = "src/bin/probe_gemm_parity.rs"

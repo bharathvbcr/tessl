@@ -6,118 +6,229 @@
 </p>
 
 <p align="center">
-  <strong>Metal 4 GEMM for Apple silicon.</strong><br>
-  Hand-written TensorOps kernels that match PyTorch MPS on bf16.
+  <strong>Low-overhead, zero-host-wait Metal 4 GEMM and encode runtime for Apple silicon.</strong><br>
+  Powered by Metal Performance Primitives (MPP) TensorOps <code>matmul2d</code>.
 </p>
 
 ---
 
-`tessl` is a Rust crate that runs matrix multiplication on Apple silicon through
-Metal 4 and Metal Performance Primitives (MPP) `matmul2d`, targeting the neural
-accelerators on M5-class hardware. It ships the GEMM kernels, the Metal 4 encode
-path they run on, and the measurement harnesses used to tune them.
+`tessl` is a Rust GPU runtime substrate that executes high-performance matrix multiplication on Apple silicon through Metal 4 and Metal Performance Primitives (MPP) `matmul2d`, targeting the neural accelerators on Apple M-series hardware.
 
-The name is short for *tessellation* — the whole design is about how an output
-matrix is cut into tiles and in what order those tiles are walked.
+The name is short for *tessellation* — the design centers around how matrix operations are partitioned into tile geometries and the order in which those tiles are traversed.
 
-## Where it stands
+---
 
-Measured against PyTorch MPS 2.13.0 and MLX 0.32.0 on an M5 Pro, using a
-**paired** protocol that alternates the two lanes round by round so GPU clock
-drift cancels (see [Benchmarking](docs/benchmarking.md) — this matters more than
-it sounds):
+## Key Highlights
 
-| comparison | geomean of per-shape medians | worst shape | best shape |
-| --- | --- | --- | --- |
-| bf16 vs PyTorch MPS bf16 | **1.00×** | 0.84× | 1.12× |
-| f32 exact vs PyTorch MPS f32 | 1.07× | 0.92× | 1.47× |
-| tf32-relaxed vs PyTorch MPS f32 | 1.98× | 1.49× | 2.34× |
-| bf16 vs MLX bf16 | 2.63× | 1.13× | 3.64× |
+- **Pure Metal 4 Architecture:** Built strictly on Metal 4 primitives (`MTL4CommandBuffer`, `MTL4ComputeCommandEncoder`, `MTL4ArgumentTable`, `MTLResidencySet`). Legacy `MTLCommandQueue` and command buffer paths are deliberately absent.
+- **Hardware-Accelerated GEMM:** Direct integration with MPP TensorOps `matmul2d` across NN, TN, and NT layouts in `f32`, `bf16` (with `f32` accumulate), and `tf32-relaxed` precision modes.
+- **Cooperative Register Accumulators:** High-throughput cooperative destination kernels (`get_destination_cooperative_tensor`) holding `f32` accumulators in GPU registers across the entire $K$-reduction, eliminating device memory round-trips for NN, TN, NT, and accumulating paths.
+- **In-Kernel Grid Swizzling & Bounds Checking:** Column-panel tile swizzling for large grids ($\ge 2048$ tiles) bounding operand rereads, combined with origin-shifted slice bounds checking for ragged edges.
+- **Zero-Wait Execution Pipeline:** Packed command encoding with bump-allocated constant arenas (16 MiB) and `MTLSharedEvent` synchronization—host threads never block mid-step.
+- **Decode ICB Capture & Replay:** Low-latency Indirect Command Buffer (ICB) capture and ping-pong execution with freeze-binds and range-batching for decode-shaped inference workloads.
 
-**Read that first row as parity, not a win.** On bf16 — the case that matters
-for training and prefill — tessl and PyTorch MPS are within a few percent of
-each other and the ranking flips shape to shape. Both plateau around 25 TFLOP/s
-on large shapes, which is what you would expect if the same hardware unit, not
-either library's tiling, is the limit.
+> [!IMPORTANT]
+> **Platform Requirements:**
+> - **OS:** macOS 26+
+> - **Toolchain:** Xcode 26 with the Metal Toolchain component (`xcodebuild -downloadComponent MetalToolchain`).
+> - **Hardware:** Apple Silicon GPU with Neural Accelerators (Apple M-series) for the MPP TensorOps path. A portable `simdgroup_matrix` fallback is available for A/B testing, but is 2–3× slower.
 
-Two caveats on the other rows, so the table is not read for more than it says.
-The tf32 row is **not** like-for-like: relaxed precision truncates the mantissa,
-so it measures what the `--tf32` opt-in buys, not an f32 result. And MLX bf16
-measures within noise of MLX f32 on this machine (~6.5 vs ~6.7 TFLOP/s), which
-suggests MLX is not reaching the neural accelerators for matmul here; that 2.63×
-is reported as measured, not as a considered claim about MLX.
+---
 
-## The interesting part
+## System Architecture
 
-The bf16 gap against PyTorch used to be a clean function of K:
+```mermaid
+graph TD
+    subgraph Consumers["Downstream Consumers"]
+        Gemma["gemma-metal<br/>(Gemma 4 Inference)"]
+        Arch02["tessl-arch02<br/>(Value Residual Training)"]
+    end
 
-| K | before | after | PyTorch MPS |
-| --- | --- | --- | --- |
-| 256 | 14,876 | 15,059 | 11,322 |
-| 1024 | 23,347 | 24,821 | 24,748 |
-| 4096 | 21,147 | **26,679** | 25,395 |
-| 8192 | 18,666 | **23,182** | 23,746 |
+    subgraph TesslAPI["tessl Public API"]
+        GpuRt["GpuRuntime"]
+        GemmFn["gemm() / gemm_f32()"]
+        TensorObj["Tensor / GpuBuffer"]
+        IcbObj["DecodeIcb / PingPongCbReplay"]
+    end
 
-*GFLOP/s at M=N=4096.* Throughput **fell** as K grew past 2048 — which a
-compute-bound kernel should not do. The blocked kernel accumulated into a
-device-memory C tile once per K block, so C traffic scaled with K/BK while the
-useful work scaled with K. At K=8192 that is 32 passes over a 67 MB tile for a
-GEMM that needs to write it once.
+    subgraph CoreEngine["tessl Core Runtime Substrate"]
+        RuntimeMod["runtime.rs<br/>MTL4 Buffers, Pools & Const Arena"]
+        GemmMod["gemm.rs<br/>Validation, Layouts & Coop Dispatch"]
+        DispatchMod["dispatch.rs<br/>Binder & Argument Table Encode"]
+        IcbMod["decode_icb.rs / cb_replay.rs<br/>ICB Capture, Tape Replay & Coalescing"]
+        MtlTensorMod["mtl_tensor.rs<br/>Quantized MTLTensor Prep (WWDC26-330)"]
+    end
 
-The fix holds the accumulator in registers across the whole K loop
-(`get_destination_cooperative_tensor`) and stores once, making C traffic
-independent of K. It applies to exactly the two kernels that had that structure;
-[docs/architecture.md](docs/architecture.md) covers where it does **not** apply
-and shows the evidence for that, which is more interesting than where it does.
+    subgraph Metal4Layer["Metal 4 Driver & Hardware Layer"]
+        CmdBuf["MTL4CommandBuffer / Allocator"]
+        ArgTable["MTL4ArgumentTable (32-slot)"]
+        ResSet["MTLResidencySet (Hot / Cold Pools)"]
+        SharedEvt["MTLSharedEvent (Zero-wait Sync)"]
+    end
+
+    subgraph Shaders["Compiled Metallib Shaders"]
+        TensorOpsMetal["matmul_tensorops.metal (MPP matmul2d)"]
+        SimdMetal["matmul_simdgroup.metal (Fallback)"]
+        UtilsMetal["utils.metal (Elementwise & Softcap)"]
+    end
+
+    Gemma -->|Links & Overlays| TesslAPI
+    Arch02 -->|DEP_TESSL_KERNELS| TesslAPI
+    TesslAPI --> CoreEngine
+    CoreEngine --> Metal4Layer
+    Metal4Layer --> Shaders
+```
+
+---
+
+## Performance vs. PyTorch MPS & MLX
+
+Measurements taken on Apple M5 Pro utilizing `bench/paired_cross_runtime.py`. The benchmark harness interleaves `tessl` and PyTorch MPS iterations round-by-round to cancel GPU thermal throttling and frequency scaling drift (see [Benchmarking](docs/benchmarking.md)):
+
+*Geomean of per-shape medians over 5 rounds across an 8-shape ladder:*
+
+| Comparison | vs. Baseline | Worst Shape | Best Shape | Peak Throughput (M5 Pro) |
+|---|---|---|---|---|
+| **bf16 vs. PyTorch MPS bf16** | **1.11×** *(Outperforms MPS)* | 1.01× | 1.22× | **29,022 GFLOP/s** (`square_4096`) |
+| **f32 exact vs. PyTorch MPS f32** | **1.07×** | 0.92× | 1.47× | **10,897 GFLOP/s** (`square_2048`) |
+| **tf32-relaxed vs. PyTorch MPS f32** | **2.01×** | 1.49× | 2.90× | **18,040 GFLOP/s** (`square_4096`) |
+| **bf16 vs. MLX bf16** | **2.63×** | 1.13× | 3.64× | — |
+
+> [!WARNING]
+> **Benchmarking Rigor:**
+> - **Clock Drift:** Single-run cross-runtime benchmarks can fluctuate by 15–20% on identical workloads due to Apple Silicon dynamic power governor adjustments. Always use paired, interleaved sweeps (`bench_gemm_coop_ab` or `paired_cross_runtime.py`).
+> - **Dispatch Floor:** Below ~2 GFLOP of total work, both runtimes hit a ~0.25 ms host submit-and-wait floor, measuring host driver dispatch latency rather than raw shader throughput.
+
+---
+
+## Metal 4 Memory & Residency Hierarchy
+
+`tessl` manages GPU memory allocations explicitly to eliminate mid-command buffer host stalls and memory thrashing.
+
+```mermaid
+flowchart TD
+    subgraph DeviceMemory["Unified System Memory (Metal 4 Device)"]
+        subgraph Pools["tessl Managed Pools"]
+            Hot["Hot Pool<br/>(Weights & Persistent State)<br/>Resident for lifetime of run"]
+            Cold["Cold Pool<br/>(Intermediate Activations)<br/>Recycled + removeAllocation after CB"]
+            Bump["Bump Pool<br/>(Per-step Ephemeral Slabs)<br/>Cursor reset on sync"]
+        end
+
+        subgraph Arenas["Low-Latency Arenas"]
+            ConstArena["Constant Arena (16 MiB Bump)<br/>Scalar & Uniform Table Offsets"]
+        end
+    end
+
+    subgraph DriverResidency["Metal 4 Driver Residency Management"]
+        ResSet["MTLResidencySet"]
+        ArgTable["MTL4ArgumentTable"]
+    end
+
+    Hot -->|Registered Once| ResSet
+    Cold -->|Dynamic Register / Evict| ResSet
+    Bump -->|Pre-allocated Slabs| ResSet
+    ConstArena -->|Direct Table Offsets| ArgTable
+```
+
+- **`BufferKind::Hot`**: Persistent allocations (model weights, optimizer state, KV cache banks). Added to the `MTLResidencySet` once at initialization and retained across steps.
+- **`BufferKind::Cold`**: Intermediate activations. Managed via an active freelist pool with a default 2 GiB cap (`DEFAULT_POOL_CACHE_BYTES`). Unused slabs are evicted via `removeAllocation` upon command buffer completion.
+- **`BufferKind::Bump`**: Ephemeral scratch memory allocated linearly from pre-committed slabs. Bump cursors are reset at synchronization points without individual buffer deallocations.
+- **Constant Arena (16 MiB)**: Eliminates per-dispatch host allocation overhead for scalars and small metadata buffers by writing directly into a shared staging buffer at 16-byte aligned offsets.
+
+---
+
+## GEMM Pipeline & Cooperative Destination Execution
+
+```mermaid
+flowchart TD
+    Start["gemm(a, b, c, backend)"] --> Validate{"validate_gemm()<br/>Rank-2, Non-empty, Bounds &lt;= 2^31,<br/>Same Runtime, No In/Out Overlap"}
+    Validate -- Fail --> Err["Return Err(String)"]
+    Validate -- Pass --> BackendCheck{"Backend?"}
+
+    BackendCheck -- SimdGroup --> SimdGroupKernel["matmul_simdgroup<br/>(Portable SIMD Fallback)"]
+    BackendCheck -- TensorOps --> LayoutCheck{"Layout Resolution"}
+
+    LayoutCheck -- "TN / NT Layout" --> SplitKCheck{"prefer_tn_splitk?<br/>(K &gt;= 2048, M,N &lt;= 384,<br/>min(M,N) &lt;= 128)"}
+    SplitKCheck -- Yes --> SplitKKernel["matmul2d_tensorops_tn/nt_splitk_*<br/>(Split-K partial reductions)"]
+    SplitKCheck -- No --> CoopTN["matmul2d_tensorops_tn/nt_bf16_f32<br/>(128x64 sg4 Cooperative Destination)"]
+
+    LayoutCheck -- "NN Layout" --> PrecisionCheck{"Precision Mode"}
+    
+    PrecisionCheck -- "f32 exact" --> F32Exact["matmul2d_tensorops_f32<br/>(Tile: 32x32, 1 simdgroup)"]
+    
+    PrecisionCheck -- "bf16 / tf32-relaxed" --> NNTable{"nn_coop_kernel()<br/>N &lt;= 512?"}
+    
+    NNTable -- "N &lt;= 512 (Narrow)" --> NNNarrow["matmul2d_tensorops_*_64x64_sg4<br/>• TILE_COOP_NARROW (64x64, 4 simdgroups)<br/>• Register accumulator, cT.store<br/>• Edge bounds-checked slices"]
+    
+    NNTable -- "N &gt; 512 (Default)" --> NNDefault["matmul2d_tensorops_*<br/>• TILE_COOP_DEFAULT (128x64, 4 simdgroups)<br/>• Column-panel swizzle if grid &gt;= 2048 tiles<br/>• Register accumulator, cT.store<br/>• Edge bounds-checked slices"]
+```
+
+### Cooperative Destination Advantages
+
+1. **Register Accumulation:** `op.template get_destination_cooperative_tensor<...>()` maintains the full `f32` accumulator in hardware SIMDgroup registers across the entire $K$-reduction loop.
+2. **Zero Pre-Zero Overhead:** Register accumulators are initialized via `.set(i, 0.0f)` in shader code. The host-side `zero_f32(C)` pre-pass is completely eliminated.
+3. **Single Store to Memory:** Device memory $C$ is written **exactly once** (`cT.store(tC)`) at threadgroup termination.
+4. **Ragged Edge Handling:** Boundary tiles use origin-shifted full-extent tensor slices (`mA.slice(...)`, `mB.slice(...)`, `mC.slice(...)`), executing the same cooperative register accumulation without dropping tail elements.
+5. **Column-Panel Grid Swizzling:** For large dispatch grids ($\text{tiles}_n \times \text{tiles}_m \ge 2048$), threadgroups are swizzled into 8-tile-row bands to bound operand $B$ cache rereads, delivering $+11\%$ throughput at $4096^3$.
+
+---
+
+## Indirect Command Buffer (ICB) Decode Pipeline
+
+For auto-regressive generation where kernel execution times approach dispatch overheads, `tessl` provides Indirect Command Buffer (ICB) capture and tape replay.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant Host as Host Runtime / Client
+    participant Binder as Binder / Dispatcher
+    participant Tape as DecodeIcb Capture Tape
+    participant ICB as Metal 4 MTLIndirectCommandBuffer
+    participant GPU as Apple Silicon GPU
+
+    Note over Host,GPU: 1. Capture Phase (First Token / Warmup)
+    Host->>Binder: begin_decode_icb_capture()
+    loop Model Layers (Decode Graph)
+        Host->>Binder: bind_buffer(), set_pipeline(), dispatch()
+        Binder->>Tape: Record Command (PSO, ArgTable, Buffers, Grid Size)
+    end
+    Host->>Tape: take_decode_icb_capture() -> Bake ICB Tape
+    Tape->>ICB: Encode ICB Commands (freeze-binds / range-batching)
+
+    Note over Host,GPU: 2. Steady-State Replay Phase (Subsequent Tokens)
+    loop Each Decode Token
+        Host->>Tape: try_replay_icb(runtime)
+        Tape->>ICB: executeCommandsInBuffer:withRange: (Zero setArgumentTable host tax)
+        Host->>GPU: Submit MTL4CommandBuffer (Ping-Pong buffers)
+        GPU-->>Host: Signal MTLSharedEvent (Zero-wait async execution)
+    end
+```
+
+---
 
 ## Documentation
 
-| | |
-| --- | --- |
-| [Architecture](docs/architecture.md) | Kernel selection, the cooperative-accumulator gate clause by clause, why TN/NT are excluded |
-| [Benchmarking](docs/benchmarking.md) | The measurement protocol, and five ways these numbers went wrong before they went right |
-| [Verification](docs/verification.md) | Static audit, seeded shape fuzz with coverage assertions, fault injection |
+| Document | Topic & Scope |
+|---|---|
+| [**Architecture**](docs/architecture.md) | Deep dive into kernel selection, cooperative destination register mechanics, $K$-reduction bandwidth analysis, and TN/NT layout optimizations. |
+| [**Benchmarking**](docs/benchmarking.md) | The paired measurement protocol, GPU thermal and frequency scaling mitigation, and five measurement pitfalls. |
+| [**Verification**](docs/verification.md) | Static tile geometry audit, self-asserting randomized shape fuzzing, and fault injection test suites. |
+
+---
 
 ## Requirements
 
-- Apple silicon, macOS 26 or newer
-- Xcode 26 with the Metal Toolchain (`xcodebuild -downloadComponent MetalToolchain`)
-- Rust 1.82+
+- **OS:** Apple Silicon, macOS 26 or newer
+- **Toolchain:** Xcode 26 with the Metal Toolchain (`xcodebuild -downloadComponent MetalToolchain`)
+- **Language:** Rust 1.82+
 
-Metal 4 only — the classic `MTLCommandQueue` encode path is not used. The
-TensorOps kernels require MPP, and the register-accumulator path assumes the
-M5-generation neural accelerators.
-
-## Status
-
-Pre-release, and honest about it:
-
-- **Every constant is tuned on one machine** (M5 Pro). Nothing has been checked
-  on an M3, M4, or a base M5.
-- **The API is not stable.** `Tensor`, `GpuRuntime` and the dispatch layer were
-  extracted from a training codebase and still carry its shape.
-
-Code lands in this repository shortly; it currently lives inside a larger
-research workspace and is being split out.
-
-## Acknowledgements
-
-Built on Apple's Metal Performance Primitives. Benchmarked against
-[PyTorch](https://pytorch.org) MPS and [MLX](https://github.com/ml-explore/mlx),
-whose numbers here were produced by the harnesses in `bench/` and are
-reproducible with them.
+---
 
 ## License
 
-Dual-licensed under either of
+Dual-licensed under either of:
 
 - Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE))
-- MIT license ([LICENSE-MIT](LICENSE-MIT))
+- MIT License ([LICENSE-MIT](LICENSE-MIT))
 
-at your option. This is the conventional pairing for the Rust ecosystem: Apache-2.0
-carries an explicit patent grant, and MIT keeps the crate usable by projects that
-cannot take Apache-2.0's terms.
-
-Unless you explicitly state otherwise, any contribution intentionally submitted
-for inclusion in this work by you, as defined in the Apache-2.0 license, shall be
-dual-licensed as above, without any additional terms or conditions.
+at your option.

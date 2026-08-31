@@ -1,0 +1,45 @@
+kernel                               maxTPTG      tgMem(B)  requested TPTG
+mm_bf16_64x32_bk128_sg4_accf            1024             0             128
+mm_bf16_64x64_bk256_sg4                 1024             0             128
+mm_bf16_128x64_bk256_sg8                1024             0             256
+mm_bf16_128x128_bk256_sg4               1024             0             128
+
+square_2048  M=2048 N=2048 K=2048   production 1.763 ms  9744 GFLOP/s
+  variant                                 ms     GFLOP/s  vs prod max_rel_err
+  mm_bf16_64x32_bk128_sg4_accf         1.714       10022    1.03×      0.00e0
+  mm_bf16_64x64_bk256_sg4              1.272       13505    1.39×     2.26e-7
+  mm_bf16_128x64_bk256_sg8             1.436       11962    1.23×     2.26e-7
+  mm_bf16_128x128_bk256_sg4            1.265       13580    1.39×     2.26e-7
+  production re-measured after: 2.005 ms (8569 GFLOP/s) — drift vs before: +13.7%
+
+square_4096  M=4096 N=4096 K=4096   production 16.490 ms  8335 GFLOP/s
+  variant                                 ms     GFLOP/s  vs prod max_rel_err
+  mm_bf16_64x32_bk128_sg4_accf        16.481        8339    1.00×      0.00e0
+  mm_bf16_64x64_bk256_sg4              9.105       15095    1.81×     3.99e-7
+  mm_bf16_128x64_bk256_sg8             8.787       15641    1.88×     3.99e-7
+  mm_bf16_128x128_bk256_sg4            7.659       17945    2.15×     3.99e-7
+  production re-measured after: 16.890 ms (8137 GFLOP/s) — drift vs before: +2.4%
+
+mlp_up  M=8192 N=3072 K=768   production 5.433 ms  7115 GFLOP/s
+  variant                                 ms     GFLOP/s  vs prod max_rel_err
+  mm_bf16_64x32_bk128_sg4_accf         5.576        6932    0.97×      0.00e0
+  mm_bf16_64x64_bk256_sg4              2.584       14957    2.10×     2.62e-7
+  mm_bf16_128x64_bk256_sg8             2.292       16869    2.37×     2.62e-7
+  mm_bf16_128x128_bk256_sg4            2.502       15451    2.17×     2.62e-7
+  production re-measured after: 5.572 ms (6937 GFLOP/s) — drift vs before: +2.6%
+
+mlp_down  M=8192 N=768 K=3072   production 5.071 ms  7622 GFLOP/s
+  variant                                 ms     GFLOP/s  vs prod max_rel_err
+  mm_bf16_64x32_bk128_sg4_accf         5.124        7544    0.99×      0.00e0
+  mm_bf16_64x64_bk256_sg4              2.459       15717    2.06×     2.75e-7
+  mm_bf16_128x64_bk256_sg8             2.530       15276    2.00×     2.75e-7
+  mm_bf16_128x128_bk256_sg4            2.109       18326    2.40×     2.75e-7
+  production re-measured after: 5.134 ms (7530 GFLOP/s) — drift vs before: +1.2%
+
+tall_k1024  M=4096 N=4096 K=1024   production 4.757 ms  7222 GFLOP/s
+  variant                                 ms     GFLOP/s  vs prod max_rel_err
+  mm_bf16_64x32_bk128_sg4_accf         4.645        7398    1.02×      0.00e0
+  mm_bf16_64x64_bk256_sg4              2.516       13656    1.89×     1.94e-7
+  mm_bf16_128x64_bk256_sg8             2.368       14508    2.01×     1.94e-7
+  mm_bf16_128x128_bk256_sg4            2.190       15689    2.17×     1.94e-7
+  production re-measured after: 4.844 ms (7093 GFLOP/s) — drift vs before: +1.8%

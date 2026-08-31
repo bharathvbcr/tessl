@@ -1,0 +1,25 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" width="128" height="128" role="img" aria-label="tessl">
+  <title>tessl</title>
+  <defs>
+      <radialGradient id="splb0" cx="50%" cy="50%" r="50%"><stop offset="0" stop-color="#43596F" stop-opacity="0.95"/><stop offset="1" stop-color="#43596F" stop-opacity="0"/></radialGradient>
+      <radialGradient id="splb1" cx="50%" cy="50%" r="50%"><stop offset="0" stop-color="#376B76" stop-opacity="0.9"/><stop offset="1" stop-color="#376B76" stop-opacity="0"/></radialGradient>
+      <radialGradient id="splb2" cx="50%" cy="50%" r="50%"><stop offset="0" stop-color="#4C4F6B" stop-opacity="0.85"/><stop offset="1" stop-color="#4C4F6B" stop-opacity="0"/></radialGradient>
+      <radialGradient id="splb3" cx="50%" cy="50%" r="50%"><stop offset="0" stop-color="#2C3C52" stop-opacity="0.9"/><stop offset="1" stop-color="#2C3C52" stop-opacity="0"/></radialGradient>
+    <linearGradient id="spls" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#101820"/><stop offset="1" stop-color="#28394A"/></linearGradient>
+    <clipPath id="splc"><rect x="6" y="6" width="116" height="116" rx="27"/></clipPath>
+  </defs>
+  <rect x="6" y="6" width="116" height="116" rx="27" fill="#EDF1F4"/>
+  <g clip-path="url(#splc)">
+    <circle cx="56" cy="38" r="44" fill="url(#splb0)"/>
+    <circle cx="100" cy="64" r="40" fill="url(#splb1)"/>
+    <circle cx="52" cy="100" r="41" fill="url(#splb2)"/>
+    <circle cx="30" cy="66" r="34" fill="url(#splb3)"/>
+  </g>
+  <g fill="none" stroke="url(#spls)" stroke-width="6.5" stroke-linejoin="round" stroke-linecap="round">
+      <rect x="18" y="18" width="92" height="92" rx="11"/>
+      <rect x="45" y="45" width="38" height="38" rx="6"/>
+      <path d="M24 24 L45 45 M104 24 L83 45 M24 104 L45 83 M104 104 L83 83"/>
+  </g>
+  <rect x="6" y="6" width="116" height="116" rx="27" fill="none"
+        stroke="#0D1226" stroke-opacity="0.10" stroke-width="2"/>
+</svg>

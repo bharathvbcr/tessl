@@ -1,0 +1,29 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" width="128" height="128" role="img" aria-label="tessl">
+  <title>tessl</title>
+  <defs>
+      <radialGradient id="sflb0" cx="50%" cy="50%" r="50%"><stop offset="0" stop-color="#43596F" stop-opacity="0.95"/><stop offset="1" stop-color="#43596F" stop-opacity="0"/></radialGradient>
+      <radialGradient id="sflb1" cx="50%" cy="50%" r="50%"><stop offset="0" stop-color="#376B76" stop-opacity="0.9"/><stop offset="1" stop-color="#376B76" stop-opacity="0"/></radialGradient>
+      <radialGradient id="sflb2" cx="50%" cy="50%" r="50%"><stop offset="0" stop-color="#4C4F6B" stop-opacity="0.85"/><stop offset="1" stop-color="#4C4F6B" stop-opacity="0"/></radialGradient>
+      <radialGradient id="sflb3" cx="50%" cy="50%" r="50%"><stop offset="0" stop-color="#2C3C52" stop-opacity="0.9"/><stop offset="1" stop-color="#2C3C52" stop-opacity="0"/></radialGradient>
+    <mask id="sflm"><g fill="none" stroke="#fff" stroke-width="10" stroke-linejoin="round" stroke-linecap="round">
+      <rect x="18" y="18" width="92" height="92" rx="11"/>
+      <rect x="45" y="45" width="38" height="38" rx="6"/>
+      <path d="M24 24 L45 45 M104 24 L83 45 M24 104 L45 83 M104 104 L83 83"/>
+    </g></mask>
+    <filter id="sflg" x="-40%" y="-40%" width="180%" height="180%">
+      <feGaussianBlur stdDeviation="5" result="b"/><feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+  </defs>
+  <g filter="url(#sflg)" opacity="0.3" mask="url(#sflm)"><rect width="128" height="128" fill="#2A3A4D"/>
+    <circle cx="56" cy="38" r="62" fill="url(#sflb0)"/>
+    <circle cx="100" cy="64" r="56" fill="url(#sflb1)"/>
+    <circle cx="52" cy="100" r="58" fill="url(#sflb2)"/>
+    <circle cx="30" cy="66" r="48" fill="url(#sflb3)"/>
+  </g>
+  <g mask="url(#sflm)"><rect width="128" height="128" fill="#2A3A4D"/>
+    <circle cx="56" cy="38" r="62" fill="url(#sflb0)"/>
+    <circle cx="100" cy="64" r="56" fill="url(#sflb1)"/>
+    <circle cx="52" cy="100" r="58" fill="url(#sflb2)"/>
+    <circle cx="30" cy="66" r="48" fill="url(#sflb3)"/>
+  </g>
+</svg>

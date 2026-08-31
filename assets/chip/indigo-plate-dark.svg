@@ -1,0 +1,23 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" width="128" height="128" role="img" aria-label="tessl">
+  <title>tessl</title>
+  <defs>
+      <radialGradient id="ipdb0" cx="50%" cy="50%" r="50%"><stop offset="0" stop-color="#6E63D8" stop-opacity="0.95"/><stop offset="1" stop-color="#6E63D8" stop-opacity="0"/></radialGradient>
+      <radialGradient id="ipdb1" cx="50%" cy="50%" r="50%"><stop offset="0" stop-color="#4E7FC4" stop-opacity="0.9"/><stop offset="1" stop-color="#4E7FC4" stop-opacity="0"/></radialGradient>
+      <radialGradient id="ipdb2" cx="50%" cy="50%" r="50%"><stop offset="0" stop-color="#7A5AAE" stop-opacity="0.85"/><stop offset="1" stop-color="#7A5AAE" stop-opacity="0"/></radialGradient>
+      <radialGradient id="ipdb3" cx="50%" cy="50%" r="50%"><stop offset="0" stop-color="#3E4C9E" stop-opacity="0.9"/><stop offset="1" stop-color="#3E4C9E" stop-opacity="0"/></radialGradient>
+    <linearGradient id="ipds" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#EEF2FF"/><stop offset="1" stop-color="#C3CEF0"/></linearGradient>
+    <clipPath id="ipdc"><rect x="6" y="6" width="116" height="116" rx="27"/></clipPath>
+  </defs>
+  <rect x="6" y="6" width="116" height="116" rx="27" fill="#070A12"/>
+  <g clip-path="url(#ipdc)">
+    <circle cx="56" cy="38" r="62" fill="url(#ipdb0)"/>
+    <circle cx="100" cy="64" r="56" fill="url(#ipdb1)"/>
+    <circle cx="52" cy="100" r="58" fill="url(#ipdb2)"/>
+    <circle cx="30" cy="66" r="48" fill="url(#ipdb3)"/>
+  </g>
+  <g fill="none" stroke="url(#ipds)" stroke-width="6.5" stroke-linejoin="round" stroke-linecap="round">
+      <rect x="18" y="18" width="92" height="92" rx="11"/>
+      <rect x="45" y="45" width="38" height="38" rx="6"/>
+      <path d="M24 24 L45 45 M104 24 L83 45 M24 104 L45 83 M104 104 L83 83"/>
+  </g>
+</svg>

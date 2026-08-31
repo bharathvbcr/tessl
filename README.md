@@ -16,10 +16,14 @@
 
 The name is short for *tessellation* — the design centers around how matrix operations are partitioned into tile geometries and the order in which those tiles are traversed.
 
+<p align="center">
+  <a href="https://github.com/bharathvbcr/tessl/actions/workflows/ci.yml"><img src="https://github.com/bharathvbcr/tessl/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+</p>
+
 | | |
 | --- | --- |
 | **Status** | `0.1.0` — Metal 4 / MPP TensorOps verified on M5 Pro |
-| **Tests** | 199 passing (`cargo test --release -- --test-threads=1`) |
+| **Tests** | 199 passing, including doc tests (`cargo test --release -- --test-threads=1`) |
 | **Platform** | Apple silicon, macOS 26+, Xcode 26 Metal Toolchain |
 | **License** | MIT OR Apache-2.0 |
 
@@ -461,7 +465,8 @@ does not have.
 |---|---|---|
 | **Int4 TensorOps GEMM** | Half the weight bandwidth of int8. | TensorOps itself accepts `int4b_format` — the block is the shader-side tensor constructor for a sub-byte element type, not the objc2 binding this table used to blame. `nn::gemm_i8_dequant` ships the int8 case. |
 | **No CPU fallback** | Without a Metal 4 device, nothing runs. | Deliberate. This is an Apple-silicon runtime, and a silent CPU path would make every "GPU" benchmark here meaningless. |
-| **GPU CI** | The published numbers are reproducible only by hand. | GitHub's hosted macOS runners have no Metal 4 GPU. Correctness and benchmark claims in this README were verified locally on an M5 Pro; CI covers build, format, and lint only. |
+| **GPU CI on hosted runners** | Whether the suite runs unattended, or only on hardware I own. | Undetermined, and stated that way rather than guessed. CI builds, lints, documents and runs the static tile audit on `macos-26`; it also attempts the full GPU suite. macOS 26 supplies the Metal 4 API and these runners do expose a Metal device, but MPP TensorOps `matmul2d` needs the neural accelerators on M5-class silicon and the runner image manifest documents no GPU at all. The `gpu` job gates rather than skipping, so its result is the answer. |
+| **Benchmark numbers in CI** | The GFLOP/s figures above are reproducible only by hand. | Hosted runners are virtualised and shared, so a timing from one describes the runner. The `bench` job runs the sweep on bare-metal Apple silicon and is gated behind a repository variable until such a runner is registered. |
 
 ---
 

@@ -1,0 +1,232 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+# A newer push to the same branch supersedes an in-flight run.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Formatting is the only check that does not need a Metal toolchain, because
+  # rustfmt parses rather than builds. It runs on Linux so a broken macOS image
+  # cannot hide a formatting regression.
+  # ---------------------------------------------------------------------------
+  fmt:
+    name: fmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all --check
+
+  # ---------------------------------------------------------------------------
+  # Everything that compiles, on a runner that can compile shaders.
+  #
+  # `build.rs` AOT-compiles kernels/*.metal by shelling out to `xcrun metal`, so
+  # this is not only the test job's problem: `cargo check` and `cargo clippy`
+  # both run build scripts, and neither can succeed without the Metal compiler.
+  # That compiler is NOT part of Xcode. Locally it resolves to
+  # `~/Library/Developer/DVTDownloads/MetalToolchain/.../metal`, which is a
+  # separately downloaded cryptex component. On a fresh runner it is absent, and
+  # without the download step below every cargo invocation here dies inside
+  # build.rs with a spawn failure that names no cause.
+  # ---------------------------------------------------------------------------
+  check:
+    name: build + clippy + docs
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Report the toolchain this runner actually has
+        # Recorded rather than assumed: the image's default Xcode floats, and
+        # GitHub has already announced one move for macOS 26. If a future image
+        # ships an Xcode whose Metal compiler rejects these kernels, the version
+        # that did it is in the log.
+        run: |
+          echo "xcode-select: $(xcode-select -p)"
+          xcodebuild -version
+          sw_vers
+
+      - name: Install the Metal Toolchain
+        # Idempotent: already-present is the common case once the cache warms,
+        # and downloading takes minutes.
+        run: |
+          if xcrun --find metal >/dev/null 2>&1; then
+            echo "Metal compiler already present: $(xcrun --find metal)"
+          else
+            echo "Metal compiler absent; downloading the component"
+            xcodebuild -downloadComponent MetalToolchain
+          fi
+
+      - name: Prove the Metal compiler runs
+        # `-downloadComponent` can report success while leaving nothing runnable.
+        # A component that failed to install and one that installed correctly
+        # must not produce the same CI result, so this asserts the compiler
+        # actually executes before anything depends on it.
+        run: |
+          xcrun --find metal
+          xcrun metal --version
+
+      - name: Build
+        run: cargo build --release --all-targets
+
+      - name: Clippy
+        run: cargo clippy --release --all-targets -- -D warnings
+
+      - name: Rustdoc
+        # `[package.metadata.docs.rs]` renders this crate for
+        # aarch64-apple-darwin, so the configuration readers see is the one
+        # checked here.
+        run: cargo doc --no-deps
+        env:
+          RUSTDOCFLAGS: -D warnings
+
+      - name: Static tile audit
+        # The one correctness gate on this job that needs no GPU: it parses the
+        # `constexpr int SM/SN` values out of matmul_tensorops.metal and
+        # cross-references every Rust TileGeom against them. A mismatch makes the
+        # host dispatch the wrong threadgroup grid and silently leave output
+        # tiles unwritten — wrong numbers, no error. Source analysis catches that
+        # on any machine.
+        run: python3 scripts/audit_gemm_tiles.py
+
+  # ---------------------------------------------------------------------------
+  # The GPU suite.
+  #
+  # Two capabilities are needed and only one of them is established. macOS 26 on
+  # an arm64 runner supplies the Metal 4 API, and the sibling `sparsl` crate
+  # demonstrates that these runners do expose a working Metal device — its own
+  # probe disproved the opposite assumption. What is NOT established is MPP
+  # TensorOps `matmul2d`, which needs the neural accelerators on M5-class
+  # silicon; the runner image manifest documents no GPU at all, so the only way
+  # to find out is to run it.
+  #
+  # So this job gates, deliberately. If the hosted GPU cannot do TensorOps it
+  # will fail, and that failure is the answer to a question nothing else here
+  # can answer. The fix at that point is to move this job behind
+  # `vars.HAS_METAL_RUNNER` and a self-hosted M5, exactly as `bench` below —
+  # NOT to add `continue-on-error`, which would make a suite that could not run
+  # report the same green as a suite that ran and passed.
+  # ---------------------------------------------------------------------------
+  gpu:
+    name: GPU suite
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install the Metal Toolchain
+        run: |
+          if xcrun --find metal >/dev/null 2>&1; then
+            echo "Metal compiler already present: $(xcrun --find metal)"
+          else
+            xcodebuild -downloadComponent MetalToolchain
+          fi
+          xcrun metal --version
+
+      - name: Report which GPU this runner has
+        # Printed before anything depends on it, so a later kernel failure can be
+        # read against the hardware that produced it instead of guessing.
+        run: system_profiler SPDisplaysDataType | head -20
+
+      - name: Device probe
+        # The example constructs a GpuRuntime, prints the chipset, and checks a
+        # known GEMM result. It is the narrowest thing that distinguishes "no
+        # Metal 4 device" from "device present, TensorOps unusable" from
+        # "working", and it runs before the suite so the distinction appears at
+        # the top of the log rather than inside 199 tests.
+        run: cargo run --release --example gemm
+
+      - name: Full suite
+        # --test-threads=1 is mandatory, not tuning. GPU tests share default
+        # command encoders across threads and are not safe to run concurrently.
+        #
+        # This covers doc tests too: passing a harness argument does not
+        # suppress them, and the `Doc-tests tessl` section is part of the 199.
+        run: cargo test --release -- --test-threads=1
+
+      - name: Examples run, since the README says they do
+        # The quickstart claims these "are compiled and run as examples, so they
+        # cannot drift from the API". That claim is only true if something runs
+        # them.
+        run: |
+          cargo run --release --example nn_layer
+          cargo run --release --example epilogue_cost
+
+  # ---------------------------------------------------------------------------
+  # Cargo.toml claims `rust-version = "1.82"`. Unverified that is just a string
+  # in a manifest, so this builds against exactly that toolchain.
+  #
+  # `--locked` because the MSRV promise is about building the shipped lockfile,
+  # not about whatever a fresh resolve happens to pick today.
+  # ---------------------------------------------------------------------------
+  msrv:
+    name: MSRV 1.82
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.82.0
+      - uses: Swatinem/rust-cache@v2
+      - name: Install the Metal Toolchain
+        run: |
+          if xcrun --find metal >/dev/null 2>&1; then
+            echo "Metal compiler already present"
+          else
+            xcodebuild -downloadComponent MetalToolchain
+          fi
+          xcrun metal --version
+      - name: Check the library and all targets
+        # `--all-targets` is safe here: this crate declares no dev-dependencies,
+        # so the tests build against the same toolchain floor as the library.
+        run: cargo check --locked --all-targets
+      - name: Check with quant-prep enabled
+        # The feature is off by default, which means nothing else in this
+        # workflow compiles `mtl_tensor`'s quantized path. A feature that is
+        # never built is a feature that has already broken.
+        run: cargo check --locked --features quant-prep
+
+  # ---------------------------------------------------------------------------
+  # Bare-metal measurement, for numbers rather than coverage.
+  #
+  # A hosted runner is virtualised and shared, so timings from one describe the
+  # runner, not the hardware anyone runs this on. Every GFLOP/s figure in the
+  # README came from an M5 Pro; this is where a regression against those would
+  # show up.
+  #
+  # Gated on a repository variable rather than merely targeting `self-hosted`,
+  # because a job whose runner labels match nothing queues indefinitely instead
+  # of skipping. Set HAS_METAL_RUNNER to `true` under
+  # Settings -> Secrets and variables -> Actions -> Variables once a runner
+  # exists.
+  # ---------------------------------------------------------------------------
+  bench:
+    name: GEMM sweep on bare metal
+    if: ${{ vars.HAS_METAL_RUNNER == 'true' }}
+    runs-on: [self-hosted, macOS, ARM64]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --release -- --test-threads=1
+      - name: Bit-exact parity probe against the reference SIMD path
+        run: cargo run --release --bin probe_gemm_parity
+      - name: GEMM sweep
+        # Not a gate — the numbers land in the job log so a throughput
+        # regression is visible without anyone running it by hand.
+        run: cargo run --release --bin bench_gemm_sweep

@@ -1,0 +1,18 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" width="128" height="128" role="img" aria-label="tessl — z-order-walk">
+  <title>tessl — z-order-walk</title>
+  <defs>
+    <linearGradient id="gAa" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#5B8DEF"/><stop offset="1" stop-color="#3A5FCD"/>
+    </linearGradient>
+    <linearGradient id="gAb" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#F5A524"/><stop offset="1" stop-color="#E8760A"/>
+    </linearGradient>
+  </defs>
+  <rect x="4" y="4" width="120" height="120" rx="26" fill="#0E1526"/>
+  <rect x="26" y="26" width="34" height="34" rx="7" fill="url(#gAb)"/>
+  <rect x="68" y="26" width="34" height="34" rx="7" fill="url(#gAa)"/>
+  <rect x="26" y="68" width="34" height="34" rx="7" fill="url(#gAa)" opacity="0.72"/>
+  <rect x="68" y="68" width="34" height="34" rx="7" fill="url(#gAa)" opacity="0.48"/>
+  <path d="M43 43 L85 43 L43 85 L85 85" fill="none" stroke="#F2F5FA" stroke-width="5.5"
+        stroke-linecap="round" stroke-linejoin="round" opacity="0.92"/>
+</svg>

@@ -1,0 +1,19 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" width="128" height="128" role="img" aria-label="tessl — subdivision">
+  <title>tessl — subdivision</title>
+  <defs>
+    <linearGradient id="gEa" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#5B8DEF"/><stop offset="1" stop-color="#3A5FCD"/>
+    </linearGradient>
+    <linearGradient id="gEb" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#F5A524"/><stop offset="1" stop-color="#E8760A"/>
+    </linearGradient>
+  </defs>
+  <rect x="4" y="4" width="120" height="120" rx="26" fill="#0E1526"/>
+  <rect x="24" y="24" width="80" height="80" rx="14" fill="url(#gEa)" opacity="0.26"/>
+  <rect x="64" y="24" width="40" height="40" rx="10" fill="url(#gEa)" opacity="0.5"/>
+  <rect x="24" y="64" width="40" height="40" rx="10" fill="url(#gEa)" opacity="0.5"/>
+  <rect x="44" y="44" width="20" height="20" rx="5" fill="url(#gEa)" opacity="0.8"/>
+  <rect x="54" y="34" width="10" height="10" rx="2.5" fill="url(#gEb)"/>
+  <path d="M64 24 L64 104 M24 64 L104 64" stroke="#0E1526" stroke-width="3" opacity="0.55"/>
+  <path d="M44 44 L64 44 M44 44 L44 64" stroke="#0E1526" stroke-width="2.4" opacity="0.55"/>
+</svg>

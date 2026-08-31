@@ -1,0 +1,20 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" width="128" height="128" role="img" aria-label="tessl — tile-monogram">
+  <title>tessl — tile-monogram</title>
+  <defs>
+    <linearGradient id="gFa" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#5B8DEF"/><stop offset="1" stop-color="#3A5FCD"/>
+    </linearGradient>
+    <linearGradient id="gFb" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#F5A524"/><stop offset="1" stop-color="#E8760A"/>
+    </linearGradient>
+  </defs>
+  <rect x="4" y="4" width="120" height="120" rx="26" fill="#0E1526"/>
+  <g fill="url(#gFa)">
+    <rect x="55" y="22" width="20" height="20" rx="4.5" opacity="0.55"/>
+    <rect x="55" y="44" width="20" height="20" rx="4.5" opacity="0.75"/>
+    <rect x="55" y="66" width="20" height="20" rx="4.5" opacity="0.9"/>
+    <rect x="33" y="44" width="20" height="20" rx="4.5" opacity="0.6"/>
+    <rect x="77" y="44" width="20" height="20" rx="4.5" opacity="0.6"/>
+  </g>
+  <rect x="55" y="88" width="20" height="18" rx="4.5" fill="url(#gFb)"/>
+</svg>

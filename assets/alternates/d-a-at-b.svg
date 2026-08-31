@@ -1,0 +1,17 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" width="128" height="128" role="img" aria-label="tessl — a-at-b">
+  <title>tessl — a-at-b</title>
+  <defs>
+    <linearGradient id="gDa" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#5B8DEF"/><stop offset="1" stop-color="#3A5FCD"/>
+    </linearGradient>
+    <linearGradient id="gDb" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#F5A524"/><stop offset="1" stop-color="#E8760A"/>
+    </linearGradient>
+  </defs>
+  <rect x="4" y="4" width="120" height="120" rx="26" fill="#0E1526"/>
+  <rect x="24" y="60" width="30" height="44" rx="7" fill="url(#gDa)" opacity="0.85"/>
+  <rect x="60" y="24" width="44" height="30" rx="7" fill="url(#gDa)" opacity="0.55"/>
+  <rect x="60" y="60" width="44" height="44" rx="9" fill="url(#gDb)"/>
+  <path d="M56 82 L58 82 M82 56 L82 58" stroke="#F2F5FA" stroke-width="4"
+        stroke-linecap="round" opacity="0.85"/>
+</svg>

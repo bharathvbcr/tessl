@@ -96,7 +96,6 @@ Pre-release, and honest about it:
   on an M3, M4, or a base M5.
 - **The API is not stable.** `Tensor`, `GpuRuntime` and the dispatch layer were
   extracted from a training codebase and still carry its shape.
-- **No license yet.** This has to be settled before the crate can be published.
 
 Code lands in this repository shortly; it currently lives inside a larger
 research workspace and is being split out.
@@ -107,3 +106,18 @@ Built on Apple's Metal Performance Primitives. Benchmarked against
 [PyTorch](https://pytorch.org) MPS and [MLX](https://github.com/ml-explore/mlx),
 whose numbers here were produced by the harnesses in `bench/` and are
 reproducible with them.
+
+## License
+
+Dual-licensed under either of
+
+- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE))
+- MIT license ([LICENSE-MIT](LICENSE-MIT))
+
+at your option. This is the conventional pairing for the Rust ecosystem: Apache-2.0
+carries an explicit patent grant, and MIT keeps the crate usable by projects that
+cannot take Apache-2.0's terms.
+
+Unless you explicitly state otherwise, any contribution intentionally submitted
+for inclusion in this work by you, as defined in the Apache-2.0 license, shall be
+dual-licensed as above, without any additional terms or conditions.

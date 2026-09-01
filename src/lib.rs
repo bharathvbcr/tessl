@@ -1,25 +1,167 @@
 //! Metal 4 GEMM, encode runtime, and neural-network kernel library for Apple
-//! silicon.
+//! silicon, built on Metal Performance Primitives (MPP) TensorOps `matmul2d`.
 //!
-//! Extracted from `arch_02_value_resid/metal-native`: encode path, tensors,
-//! TensorOps/simdgroup GEMM, util kernels. **Metal 4-only** encode — residency,
-//! packed encoder, no host-zero mid-CB (Audit 4/6 lessons preserved).
+//! # Platform
 //!
-//! # Promoted kernels
+//! This crate is Apple-silicon only, and it does not degrade gracefully.
+//! `objc2-metal` is an unconditional dependency and `build.rs` drives the Metal
+//! shader compiler, so the crate **does not build at all** on Linux or on Intel
+//! Macs. That is deliberate: a silent CPU fallback would make every "GPU"
+//! benchmark here meaningless, so there isn't one.
 //!
-//! 44 model-agnostic kernels moved here out of `gemma-metal` — RMSNorm, gated
-//! MLP activations, flash attention, quantized GEMV/GEMM, KV-cache stores,
-//! embedding lookup, sampling. They had lived in one model's crate, reachable
-//! only as raw strings through an overlay metallib. [`nn`] is the typed surface
-//! over the subset with a stable host-side contract; the rest are dispatched by
-//! name through [`runtime::GpuRuntime::pipeline`] until that surface grows.
+//! | Requirement | |
+//! |---|---|
+//! | OS | macOS 26 or newer |
+//! | Hardware | Apple M-series with neural accelerators, for the TensorOps path |
+//! | Toolchain | Xcode 26 with the Metal Toolchain component |
+//! | Rust | 1.82+ |
+//!
+//! The Metal compiler is **not** part of Xcode. It is a separately downloaded
+//! component, and without it `build.rs` fails at the shader compile step:
+//!
+//! ```sh
+//! xcodebuild -downloadComponent MetalToolchain
+//! ```
+//!
+//! # Quickstart
+//!
+//! ```no_run
+//! use tessl::{gemm, GemmBackend, GpuRuntime};
+//!
+//! # fn main() -> Result<(), String> {
+//! let rt = GpuRuntime::new()?;
+//!
+//! let a = rt.alloc_tensor_f32(&[4096, 2304])?;
+//! let b = rt.alloc_tensor_f32(&[2304, 768])?;
+//! let c = rt.alloc_tensor_f32(&[4096, 768])?;
+//!
+//! gemm(&a, &b, &c, GemmBackend::TensorOps)?;   // C = A @ B
+//! rt.synchronize()?;
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! Neural-network kernels go through [`nn`], which validates every operand
+//! before encoding anything:
+//!
+//! ```no_run
+//! use tessl::{nn, GpuRuntime};
+//!
+//! # fn main() -> Result<(), String> {
+//! let rt = GpuRuntime::new()?;
+//! let (rows, dim) = (512u32, 4096u32);
+//!
+//! let x = rt.alloc_buffer(rows as usize * dim as usize * 4)?;
+//! let weight = rt.alloc_buffer(dim as usize * 4)?;
+//! let out = rt.alloc_buffer(rows as usize * dim as usize * 4)?;
+//!
+//! nn::rms_norm_f32(&rt, &x, &weight, &out, rows, dim, 1e-6)?;
+//! rt.synchronize()?;
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! # Module map
+//!
+//! | Module | What it holds |
+//! |---|---|
+//! | [`runtime`] | [`GpuRuntime`], buffer pools, residency sets, the encoder lease |
+//! | [`gemm`](mod@gemm) | GEMM entry points, layout and precision selection, the fused epilogue |
+//! | [`nn`] | Typed, shape-checked API over the promoted kernel library |
+//! | [`tensor`] | [`Tensor`], [`GpuBuffer`], [`DType`], and the f16/bf16 conversions |
+//! | [`dispatch`] | `Binder`, argument-table encoding, threadgroup dispatch helpers |
+//! | [`decode_icb`], [`cb_replay`] | Indirect Command Buffer capture and ping-pong replay |
+//! | [`ops`] | Elementwise helpers that are not part of a larger kernel family |
+//! | `mtl_tensor` | Quantized `MTLTensor` prep, behind the `quant-prep` feature |
+//! | [`ab_flags`], [`infer_trace`], [`icb_smoke`], [`npy`] | Tuning switches, tracing, smoke tests, and `.npy` I/O for benchmark parity |
+//!
+//! # Encode model
+//!
+//! Encoding is **Metal 4 only**: `MTL4CommandBuffer`, `MTL4ComputeCommandEncoder`,
+//! `MTL4ArgumentTable`, `MTLResidencySet`. The legacy `MTLCommandQueue` path is
+//! deliberately absent rather than merely unused.
+//!
+//! By default each dispatch gets its own command buffer and commits. That is
+//! the safe shape for a caller who synchronizes after every step, and it is
+//! also the expensive one: a submit-and-wait round trip is roughly 0.25 ms, so
+//! a small kernel measures the driver rather than the shader. Call
+//! [`runtime::GpuRuntime::set_async_encode`] with `true` and dispatches
+//! accumulate into one command buffer until [`runtime::GpuRuntime::synchronize`].
+//! On an elementwise kernel at n=4096 that is 203 µs against 4.1 µs, a factor
+//! of about 49.
+//!
+//! # Kernels
+//!
+//! 18 Metal sources compile to 72 kernel entry points: RMSNorm, gated MLP
+//! activations, flash attention (sliding-window and global), fused
+//! RMSNorm+QKV+RoPE, MLX-format Q4 GEMV/GEMM, Q8 GEMV, an exact int8 GEMM, KV
+//! cache stores, embedding lookup, row-wise softmax/sum/max, and softcap
+//! sampling. [`nn`] exposes them through 62 shape-checked functions.
+//!
+//! 44 of these were promoted out of `gemma-metal`, where they were reachable
+//! only as raw pipeline-name strings through an overlay metallib. All 44 now
+//! carry a numeric test against an independent reference rather than a name
+//! check; see the crate's `tests/` directory and `docs/verification.md`.
 //!
 //! Gemma-specific kernels stayed behind: Per-Layer Embeddings (`ple_lookup*`)
 //! and the persistent-interpreter prototype (`persistent_interp*`).
 //!
-//! Quantized `MTLTensor` hooks (WWDC26-330) live in `mtl_tensor`, behind the
-//! off-by-default `quant-prep` feature — prep only, the prefill entry point
-//! still returns an error.
+//! # Feature flags
+//!
+//! | Feature | Default | |
+//! |---|---|---|
+//! | `quant-prep` | off | Compiles `mtl_tensor`'s quantized `MTLTensor` path. Prep only: the prefill entry point returns an error and nothing dispatches it. Kept compiling behind a flag rather than shipped as public API that does not work. |
+//!
+//! # Performance
+//!
+//! Apple M5 Pro, paired interleaved rounds against torch 2.13 (MPS) and MLX,
+//! geomean of per-shape medians over an eight-shape ladder:
+//!
+//! | Comparison | Geomean | Shapes below 1.0 |
+//! |---|---|---|
+//! | tf32-relaxed vs. MPS f32 | 2.11× | 0 of 8 |
+//! | bf16 vs. MLX bf16 | 2.55× | 0 of 8 |
+//! | f32 exact vs. MPS f32 | 1.12× | 2 of 8 |
+//! | bf16 vs. MPS bf16 | 1.03× | 4 of 8 |
+//!
+//! bf16 against Apple's own bf16 GEMM is **parity, not a win**. The result
+//! worth quoting is the tf32 lane. Peak observed throughput is 26,642 GFLOP/s
+//! (bf16, 4096³), 16,293 (tf32) and 6,431 (f32 exact).
+//!
+//! Reproduce with `cargo run --release --bin bench_gemm_sweep` and
+//! `python3 bench/paired_cross_runtime.py --rounds 5 --lanes torch,mlx`. Single
+//! runs on this hardware fluctuate 15–20% as the power governor moves, so
+//! cross-runtime claims come from paired sweeps only.
+//!
+//! # Notes for contributors
+//!
+//! **Tests need `--test-threads=1`.** GPU tests share default command encoders
+//! across threads and are not safe to run concurrently. The integration suite
+//! serializes itself with a mutex regardless, because a suite that only passes
+//! when the caller remembers a flag is a suite that fails in CI.
+//!
+//! **A `.metal` edit must reach the build.** Kernel sources are compiled
+//! ahead-of-time by `build.rs` into a metallib, and shader files reach that
+//! build through a path Cargo does not infer. `build.rs` therefore emits
+//! `rerun-if-changed` for every `.metal` **and `.h`** individually — not for the
+//! directory, whose mtime does not move when a file is edited in place. Without
+//! that, an edited kernel silently stays stale while the tests report a pass.
+//!
+//! **Name checks are not correctness tests.** `tests/promoted_kernels.rs`
+//! asserts each promoted entry point resolves from this crate's own metallib.
+//! That gates the migration, not the arithmetic: a kernel can resolve, dispatch,
+//! and return wrong numbers, and one of them wrote 4 output rows out of 512
+//! while passing that test and an adversarial error-path test. New kernels need
+//! a numeric test against an independent reference.
+//!
+//! **Seed outputs with a sentinel when testing.** Zero-filling makes "never
+//! written" indistinguishable from "written correctly", because zero is a
+//! plausible result. Several tests here fill the output with an implausible
+//! value first and assert none of it survives.
+//!
+//! **Where a kernel family is selected by an enum or a bool, test every arm.**
+//! Two dispatch-geometry bugs lived in non-default arms of families whose
+//! default arm was tested and correct.
 //!
 //! # Unsafe code
 //!

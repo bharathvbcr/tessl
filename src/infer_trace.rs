@@ -1,5 +1,15 @@
-//! Lightweight inference-path counters for `gemma_metal::trace`.
-//! Off by default — atomics only touch when [`set_enabled`] is true.
+//! Lightweight inference-path counters, off by default.
+//!
+//! Downstream inference crates need to know where a token's time went without
+//! paying for that knowledge on every run. The atomics here are only touched
+//! when [`set_enabled`] is true, so a production decode loop that never enables
+//! tracing pays a single relaxed load per counter site.
+//!
+//! These are counters, not a profiler. They answer "how many dispatches, how
+//! many bytes, how long in this phase", and they are the numbers to reach for
+//! when a decode step is slower than the sum of its kernels — which usually
+//! means encode overhead rather than shader time. See
+//! [`crate::runtime::GpuRuntime::set_async_encode`] for the usual cause.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Instant;

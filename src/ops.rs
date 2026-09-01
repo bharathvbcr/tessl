@@ -1,4 +1,12 @@
-//! Small device ops built on the shared util metallib (`softcap_f32`, …).
+//! Small elementwise device ops that do not belong to a larger kernel family.
+//!
+//! These live in `utils.metal` rather than in one of the named kernel sources,
+//! and they are the operations a caller needs *between* the big kernels: a
+//! logit softcap, an in-place scale, a buffer zero.
+//!
+//! Anything with a shape contract worth checking belongs in [`crate::nn`]
+//! instead, which validates operands before encoding. The split is by whether
+//! there is an invariant to enforce, not by kernel size.
 
 use std::sync::Arc;
 

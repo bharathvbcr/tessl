@@ -1,4 +1,17 @@
-//! Minimal NumPy `.npy` reader (v1.0 / v2.0, C-order, f32 / i64 / f64 scalar).
+//! Minimal NumPy `.npy` reader and writer (v1.0 / v2.0, C-order, f32 / i64 /
+//! f64 scalar).
+//!
+//! This exists for benchmark parity, not as a general-purpose format library.
+//! The cross-runtime benchmarks compare this crate against PyTorch and MLX on
+//! the same operands, and "the same operands" has to mean the same bytes: a
+//! lane that generated its own random matrix would be comparing two different
+//! problems and calling the difference a speedup. `bench_gemm_sweep` dumps its
+//! operands here and the Python lanes read them back.
+//!
+//! Scope is deliberately narrow. C-order only, no structured dtypes, no
+//! Fortran order, no object arrays. An unsupported header is an error rather
+//! than a best-effort parse, because a benchmark that silently transposed its
+//! input would produce a plausible number for the wrong problem.
 
 use std::fs::File;
 use std::io::{Read, Write};

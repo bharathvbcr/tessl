@@ -22,6 +22,15 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 fn main() {
+    // Without this, a single `DOCS_RS=1 cargo build` poisons the cache: the
+    // branch below bakes `TESSL_METALLIB=""` via `rustc-env`, cargo has no
+    // reason to re-run this script when the variable disappears, and every
+    // later build keeps the empty path. The crate then compiles and every
+    // `GpuRuntime::new()` fails with "metallib missing at " — an empty path,
+    // thousands of lines from the cause. Found by running the docs.rs
+    // simulation immediately before the test suite: 62 of 88 lib tests failed
+    // on a tree whose only change was doc comments.
+    println!("cargo:rerun-if-env-changed=DOCS_RS");
     println!("cargo:rerun-if-env-changed=DEVELOPER_DIR");
     println!("cargo:rerun-if-env-changed=TESSL_SKIP_AOT");
     println!("cargo:rerun-if-env-changed=METAL_RUNTIME_SKIP_AOT");

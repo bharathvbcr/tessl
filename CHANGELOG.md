@@ -8,10 +8,19 @@ All notable changes to `tessl` are recorded here. The format follows
 
 ## [0.1.1] — 2026-09-01
 
-Documentation only. No code, kernel or API changes; the compiled crate is
-identical to 0.1.0.
+One build-script fix, and documentation. No kernel or API changes.
 
 ### Fixed
+
+- **A `DOCS_RS=1` build left the crate permanently broken until `cargo clean`.**
+  That branch bakes `TESSL_METALLIB=""` through `cargo:rustc-env`, and
+  `build.rs` never declared `rerun-if-env-changed=DOCS_RS` — so cargo had no
+  reason to re-run it when the variable disappeared, and every later build kept
+  the empty path. The crate still compiled; every `GpuRuntime::new()` then failed
+  with `metallib missing at ` and an empty path, thousands of lines from the
+  cause. Found by running the docs.rs simulation immediately before the test
+  suite, which turned 88 passing lib tests into 62 failures on a tree whose only
+  other change was doc comments.
 
 - **The README's headline benchmark claim was wrong.** It read 1.11x against
   PyTorch MPS on bf16 with a worst shape of 1.01x, which reads as "never loses".

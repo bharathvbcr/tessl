@@ -6,7 +6,34 @@ All notable changes to `tessl` are recorded here. The format follows
 
 ## [Unreleased]
 
+### Fixed
+
+- **`docs/verification.md` documented a command that ran zero tests and
+  reported `ok`.** It named a test `gemm_randomized_shape_fuzz` and two
+  environment variables `GEMM_FUZZ_SEED` / `GEMM_FUZZ_CASES`; none of the three
+  exist, so `cargo test ... gemm_randomized_shape_fuzz` matched nothing and
+  printed `test result: ok. 0 passed; 89 filtered out`. The real entry points
+  are `gemm_fuzz_quick`, `gemm_fuzz_deep` and `STRESS_SEED`. The same section
+  claimed the fuzzer asserts per-kernel coverage at a 1% floor; no such
+  assertion is implemented, and the retraction is now in the document rather
+  than only in the README.
+- **`docs/benchmarking.md` named a binary that does not exist.** The reproducing
+  block invoked `bench_gemm_coop_ab` with a `BENCH_ROUNDS` variable. This crate
+  builds four binaries and neither the target nor the variable is among them.
+- `docs/verification.md` reported 68 unit tests; the suite is 199 across 89 lib
+  and 110 integration tests.
+
 ### Added
+
+- **Docs cover the promoted library.** `docs/architecture.md` previously
+  described only GEMM — no mention of `nn`, the fused epilogue, the reductions,
+  or the integer GEMM. It now documents the validate-before-encode boundary,
+  the row-stride-0 bias broadcast, softmax's masked-row behaviour, and the
+  int32 wrap bound at `k = 131072`.
+- **A measured GEMM sweep in `docs/benchmarking.md`**: bf16 TensorOps at 26,642
+  GFLOP/s on 4096³, 11.8x the portable simdgroup fallback and 4.2x exact f32,
+  with the 512³ inversion explained by the dispatch floor rather than left as
+  an anomaly.
 
 - **Quantized int8 GEMM with fused dequantization**: `nn::gemm_i8_dequant`.
   `int8 x int8` accumulates into `int32` natively on TensorOps, and every

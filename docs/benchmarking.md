@@ -107,16 +107,62 @@ per-GEMM.
 ## Reproducing
 
 ```bash
-# Rust lanes, JSON to stdout
+# Rust lanes, human table plus JSON to stdout. BENCH_SHAPES overrides the
+# built-in ladder; BENCH_WARMUP and BENCH_ITERS default to 10 and 50.
+cargo run --release --bin bench_gemm_sweep
 BENCH_SHAPES="2048x2048x2048,4096x4096x1024" cargo run --release --bin bench_gemm_sweep
 
 # Paired cross-runtime (needs torch and/or mlx importable)
 python3 bench/paired_cross_runtime.py --rounds 5 --lanes torch,mlx
 
-# Kernel A/B, 7 interleaved rounds
+# Tile-geometry and TN/NT A/B lanes. These live behind TESSL_GEMM_TUNE because
+# the 92 measurement kernels are excluded from the default metallib.
 TESSL_GEMM_TUNE=1 cargo build --release --bins
-BENCH_ROUNDS=7 cargo run --release --bin bench_gemm_coop_ab
+cargo run --release --bin bench_gemm_tile_tune
+cargo run --release --bin bench_gemm_tnnt_tune
+
+# Bit-exact parity of TensorOps against the reference SIMD path
+cargo run --release --bin probe_gemm_parity
 ```
 
-Every table in this repository is reproducible with these, on an M5 Pro. On
-different silicon expect different constants — see Status in the README.
+> [!NOTE]
+> This block previously named a binary `bench_gemm_coop_ab` and an environment
+> variable `BENCH_ROUNDS`. Neither exists; the crate builds four binaries and
+> they are the ones listed above. The command failed with "no bin target named
+> `bench_gemm_coop_ab`" for anyone who tried it.
+
+## Measured — M5 Pro, 2026-08-31
+
+`cargo run --release --bin bench_gemm_sweep`, medians over 50 iterations after
+10 warmup, single run rather than paired, so treat these as the machine's shape
+rather than a cross-runtime claim:
+
+| shape | f32 exact | tf32-relaxed | bf16 | simdgroup f32 |
+| --- | ---: | ---: | ---: | ---: |
+| 512³ | 796 | 1,284 | 1,358 | 912 |
+| 1024³ | 4,167 | 7,291 | 8,410 | 2,380 |
+| 2048³ | 6,431 | 13,383 | 21,220 | 2,735 |
+| 4096³ | 6,292 | 13,624 | **26,642** | 2,254 |
+| qkv_proj (2048×768×768) | 4,262 | 7,639 | 9,209 | 2,348 |
+| mlp_up (8192×3072×768) | 6,127 | 16,293 | 24,776 | 2,639 |
+| mlp_down (8192×768×3072) | 6,403 | 15,301 | 25,288 | 2,334 |
+| tall_k1024 (4096×4096×1024) | 6,180 | 16,096 | 25,126 | 2,732 |
+
+GFLOP/s. Three things in that table are worth reading rather than skimming.
+
+**bf16 TensorOps is 11.8× the portable simdgroup fallback at 4096³** (26,642 vs
+2,254) and 4.2× exact f32. That ratio is the entire argument for the
+cooperative-destination path.
+
+**At 512³ the simdgroup fallback beats TensorOps f32** — 912 against 796. Not a
+regression: at that size the whole GEMM is inside the dispatch floor described
+above, so the comparison measures submit-and-wait latency, not the kernels.
+
+**f32 exact flattens at ~6,400 GFLOP/s from 2048³ onward** while bf16 keeps
+climbing to 4096³. Exact f32 uses the 32×32 single-simdgroup kernel with no
+register accumulator, so it is bandwidth-bound where the cooperative kernels are
+not.
+
+Every table in this repository is reproducible with the commands above, on an
+M5 Pro. On different silicon expect different constants — see Status in the
+README.

@@ -9,7 +9,7 @@
 
 use std::sync::{Arc, Mutex, MutexGuard};
 
-use tessl::tensor::{bf16_bits_to_f32, f32_slice_to_bf16};
+use tessl::tensor::{bf16_bits_to_f32, f32_slice_to_bf16, GpuBuffer};
 use tessl::{GpuRuntime, Tensor};
 
 /// One GPU at a time, whatever `--test-threads` says.
@@ -231,4 +231,90 @@ pub fn assert_within_bound(label: &str, got: &[f32], r: &Reference, k: usize, op
         r.mag[worst_at],
         tolerance(k, r.mag[worst_at], operand_u),
     );
+}
+
+// --------------------------------------------------- Buffers and Q4 banks ---
+
+/// f32 buffer holding `data`.
+pub fn buf(rt: &Arc<GpuRuntime>, data: &[f32]) -> GpuBuffer {
+    let b = rt.alloc_buffer(data.len().max(1) * 4).expect("alloc");
+    b.write_f32(data);
+    b
+}
+
+/// Zeroed f32 buffer of `elems` elements.
+pub fn empty(rt: &Arc<GpuRuntime>, elems: usize) -> GpuBuffer {
+    let b = rt.alloc_buffer(elems.max(1) * 4).expect("alloc");
+    b.zero();
+    b
+}
+
+/// bf16 buffer holding `data` rounded to bf16.
+pub fn buf_bf16(rt: &Arc<GpuRuntime>, data: &[f32]) -> GpuBuffer {
+    let b = rt.alloc_buffer(data.len().max(1) * 2).expect("alloc");
+    b.write_bf16_bits(&f32_slice_to_bf16(data));
+    b
+}
+
+/// Buffer seeded with `value`, for detecting elements a kernel never wrote.
+pub fn seeded(rt: &Arc<GpuRuntime>, elems: usize, value: f32) -> GpuBuffer {
+    buf(rt, &vec![value; elems.max(1)])
+}
+
+/// Two nibbles per byte, low nibble first — the MLX Q4 packing.
+pub fn pack_nibbles(nibbles: &[u8]) -> Vec<u8> {
+    nibbles
+        .chunks(2)
+        .map(|p| (p[0] & 0x0f) | ((p.get(1).copied().unwrap_or(0) & 0x0f) << 4))
+        .collect()
+}
+
+/// An MLX Q4 weight bank plus the dense matrix it dequantizes to.
+///
+/// Scales and biases are rounded through bf16 first, so the reference sees the
+/// values the kernel actually loads rather than their f32 originals — otherwise
+/// the test would be measuring host-side quantization, not the kernel.
+pub fn q4_mlx_matrix(rows: usize, cols: usize, group: usize) -> (Vec<u8>, Vec<f32>, Vec<f32>) {
+    let nibbles: Vec<u8> = (0..rows * cols).map(|i| ((i * 5) % 16) as u8).collect();
+    let groups = rows * (cols / group);
+    let sb_f32: Vec<f32> = (0..groups * 2)
+        .map(|i| {
+            if i % 2 == 0 {
+                0.03 + (i % 7) as f32 * 0.002
+            } else {
+                (i % 5) as f32 * 0.1 - 0.2
+            }
+        })
+        .collect();
+    let sb_round = round_trip_bf16(&sb_f32);
+    let mut dense = vec![0.0f32; rows * cols];
+    for r in 0..rows {
+        for c in 0..cols {
+            let gi = r * (cols / group) + c / group;
+            dense[r * cols + c] =
+                sb_round[gi * 2] * nibbles[r * cols + c] as f32 + sb_round[gi * 2 + 1];
+        }
+    }
+    (pack_nibbles(&nibbles), sb_f32, dense)
+}
+
+/// `y[r] = sum_c dense[r, c] * x[c]`, in f64.
+pub fn dense_gemv(dense: &[f32], x: &[f32], rows: usize, cols: usize) -> Vec<f32> {
+    (0..rows)
+        .map(|r| {
+            (0..cols)
+                .map(|c| dense[r * cols + c] as f64 * x[c] as f64)
+                .sum::<f64>() as f32
+        })
+        .collect()
+}
+
+/// Assert `got ~= want` elementwise with a relative-plus-absolute tolerance.
+pub fn close_rel(what: &str, got: &[f32], want: &[f32], rel: f32) {
+    assert_eq!(got.len(), want.len(), "{what}: length");
+    for (i, (g, w)) in got.iter().zip(want).enumerate() {
+        assert!(g.is_finite(), "{what}[{i}]: non-finite {g}");
+        let tol = rel * w.abs().max(1.0);
+        assert!((g - w).abs() <= tol, "{what}[{i}]: got {g} want {w}");
+    }
 }

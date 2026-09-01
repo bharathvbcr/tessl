@@ -8,6 +8,41 @@ All notable changes to `tessl` are recorded here. The format follows
 
 ### Fixed
 
+- **`gemv_q4_mlx` with `Q4MlxRowVariant::Tiled` left most of its output
+  unwritten** — the same defect as `gemv_q4_tiled`, in the sibling family.
+  `gemv_q4_mlx_tiled` indexes its output row by `threadgroup_position_in_grid`
+  and needs one threadgroup per row; all three row variants were dispatched with
+  the one-thread-per-row grid, so `Tiled` wrote `rows / 128` rows and returned
+  no error. Found by giving the three variants one shared numeric test instead
+  of testing `Standard` alone: 508 of 512 rows never written.
+
+### Documented
+
+- **`gemv_q4_mlx_blocked` requires a block-interleaved bank, and nothing said
+  so.** It takes the same `Q4MlxBank` as its row-major siblings — a type with no
+  layout tag — and returns wrong numbers rather than an error when given a
+  row-major one. The kernel reads scale/bias and nibbles at
+  `block * groups_per_row * 16 + group * 16 + row_in_block`. Measured at 64x256
+  with `group_size` 64: 63 of 64 rows wrong row-major, 0 of 64 repacked. The two
+  layouts coincide only when `groups_per_row == 1`, which is exactly the shape a
+  small smoke test would pick. `tests/promoted_numeric.rs` carries a reference
+  repacking.
+
+### Added
+
+- **`tests/promoted_numeric.rs`** — numeric coverage for promoted kernels that
+  had only a name check in `promoted_kernels.rs`. That file asserts each of the
+  44 entry points resolves from tessl's own metallib, which is a real gate on
+  the move and not a correctness test: `gemv_q4_tiled` resolved, had adversarial
+  coverage, and wrote 4 rows of 512. Eight tests now cover the three MLX Q4 row
+  variants, the blocked GEMV, the fused K/V GEMV, `gemm_q4_mlx` against the GEMV
+  row by row, `mlp_gelu_tanh_bf16` against its f32 sibling,
+  `kv_store_timestep_pair`, `kv_ring_densify`'s rotation, and
+  `embed_lookup_q4_mlx` including out-of-range token ids. Every one uses `rows`
+  above the 128 the row kernels group by, because below that the competing grids
+  coincide and a mismatch is invisible. Shared Q4 scaffolding moved to
+  `tests/common/mod.rs`.
+
 - **`gemv_q4` with `tiled = true` silently left most of its output unwritten.**
   `gemv_q4_tiled` indexes its output row by `threadgroup_position_in_grid` and
   so needs one threadgroup per row, but it was dispatched with

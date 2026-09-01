@@ -1819,24 +1819,42 @@ pub fn gemv_q4_mlx_with_scalars(
     }
 
     let p = rt.pipeline(entry)?;
-    let tg_mem = (shape.cols as usize).saturating_mul(4);
-    let limit = rt.max_threadgroup_memory();
-    if tg_mem > limit {
-        return Err(format!(
-            "{entry}: caching x needs {tg_mem} bytes of threadgroup memory but \
-             this device allows {limit}; cols {} is too large for this kernel",
-            shape.cols
-        ));
-    }
-    let tptg = reduction_tptg(
-        p.maxTotalThreadsPerThreadgroup(),
-        GEMV_ROW_TPTG,
-        GEMV_ROW_TPTG,
-    )
-    .min(shape.rows as usize)
-    .max(1);
-    let groups = (shape.rows as usize).div_ceil(tptg);
-    dispatch_tg_1d(rt, &p, groups, tptg, Some((0, tg_mem)), |bnd| {
+    // `Tiled` takes a different grid from `Standard` and `Wide`, and until
+    // 2026-08-31 all three got the one-thread-per-row geometry below.
+    //
+    // `gemv_q4_mlx_tiled` indexes its output row by
+    // `threadgroup_position_in_grid`, so it needs one threadgroup per row.
+    // With `rows.div_ceil(128)` groups it wrote the first `rows / 128` rows and
+    // left the rest of `y` untouched, returning no error. This is the same
+    // defect `gemv_q4_tiled` had, in the sibling family — found by giving the
+    // three variants one shared numeric test rather than testing `Standard`
+    // alone.
+    //
+    // The tiled kernel also declares its scratch statically and does not cache
+    // `x`, so the dynamic threadgroup allocation and its `cols` ceiling belong
+    // to the other two.
+    let (groups, tptg, tg_mem) = if variant == Q4MlxRowVariant::Tiled {
+        (shape.rows as usize, GEMV_TILED_TPTG, None)
+    } else {
+        let bytes = (shape.cols as usize).saturating_mul(4);
+        let limit = rt.max_threadgroup_memory();
+        if bytes > limit {
+            return Err(format!(
+                "{entry}: caching x needs {bytes} bytes of threadgroup memory but this \
+                 device allows {limit}; cols {} is too large for this kernel",
+                shape.cols
+            ));
+        }
+        let t = reduction_tptg(
+            p.maxTotalThreadsPerThreadgroup(),
+            GEMV_ROW_TPTG,
+            GEMV_ROW_TPTG,
+        )
+        .min(shape.rows as usize)
+        .max(1);
+        ((shape.rows as usize).div_ceil(t), t, Some((0, bytes)))
+    };
+    dispatch_tg_1d(rt, &p, groups, tptg, tg_mem, |bnd| {
         bind_mlx_bank(bnd, &bank, 0);
         set_gpu_buf(bnd, x, 3);
         set_gpu_buf(bnd, y, 4);
@@ -1864,6 +1882,25 @@ const GEMV_X_TILE: usize = 4096;
 /// Each row gets 16 K-lanes that `simd_sum` their partial products, and `x` is
 /// staged a tile at a time rather than whole — so unlike [`gemv_q4_mlx`] this
 /// has no `cols` ceiling from threadgroup memory.
+///
+/// # The bank must be block-interleaved, not row-major
+///
+/// This is the one entry point whose [`Q4MlxBank`] is **not** laid out the way
+/// every other one here expects, and the type cannot express the difference —
+/// `Q4MlxBank` carries no layout tag, so passing a row-major bank compiles,
+/// dispatches, and returns wrong numbers with no error.
+///
+/// The kernel indexes within a 16-row block: for block `b`, group `g` and row
+/// `r` inside the block, it reads scale/bias at
+/// `b * groups_per_row * 16 + g * 16 + r` and the matching nibbles at the same
+/// index, rather than the row-major `row * groups_per_row + g`. Repack with
+/// that mapping before calling.
+///
+/// The two layouts coincide only when `groups_per_row == 1`, which is why a
+/// single-group matrix appears to work and anything wider silently does not.
+/// Measured on a 64x256 matrix with `group_size` 64: 63 of 64 rows wrong with a
+/// row-major bank, 0 of 64 once repacked.
+/// `promoted_numeric.rs` carries a reference repacking.
 ///
 /// Scalar indices for `_with_scalars`: 5 = `rows`, 6 = `cols`, 7 = `group_size`.
 pub fn gemv_q4_mlx_blocked(

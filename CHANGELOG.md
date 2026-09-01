@@ -4,6 +4,28 @@ All notable changes to `tessl` are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this crate follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- **The README's bf16-vs-MPS claim was wrong, and it was the headline.** It read
+  1.11x with a worst shape of 1.01x — "never loses". Re-measured with the same
+  harness against torch 2.13 MPS on the same machine: **1.03x, losing on 4 of the
+  8 shapes**, worst 0.86x at 8192x3072x768. The tf32 lane (2.11x, wins every
+  shape) and the MLX comparison (2.55x) hold up; bf16 against Apple's own tuned
+  GEMM is parity, and the table says so now.
+- **The published f32 and tf32 peak throughputs were not reproducible.** 10,897
+  and 18,040 GFLOP/s; the crate's own committed sweep in `bench/results/` records
+  6,606 for f32 and a fresh run gives 6,431 — two independent sources agreeing
+  against the README. Replaced with measured values (26,642 bf16 / 16,293 tf32 /
+  6,431 f32) rather than averaged.
+- **Two more references to a binary that does not exist.** `docs/benchmarking.md`
+  named `bench_gemm_coop_ab` in its tool table and in the Pitfall 1 prose. An
+  earlier pass corrected only the *Reproducing* block at the end of that file, so
+  its note could truthfully say the phantom was fixed while two live references
+  survived above it. The paired A/B lane is `bench_gemm_tnnt_tune`. Every command
+  named in the README and docs is now checked to exist.
+
 ## [0.1.0] — 2026-08-31
 
 First published release. The crate has not been on crates.io before, so

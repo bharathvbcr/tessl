@@ -101,21 +101,51 @@ graph TD
 
 ## Performance vs. PyTorch MPS & MLX
 
-Measurements taken on Apple M5 Pro utilizing `bench/paired_cross_runtime.py`. The benchmark harness interleaves `tessl` and PyTorch MPS iterations round-by-round to cancel GPU thermal throttling and frequency scaling drift (see [Benchmarking](docs/benchmarking.md)):
+Apple M5 Pro, `python3 bench/paired_cross_runtime.py --rounds 5 --lanes torch,mlx`
+against torch 2.13 (MPS) and MLX, re-measured 2026-09-01. The harness interleaves
+`tessl` and the baseline round by round so thermal throttling and frequency
+scaling hit both lanes alike — see [Benchmarking](docs/benchmarking.md).
 
 *Geomean of per-shape medians over 5 rounds across an 8-shape ladder:*
 
-| Comparison | vs. Baseline | Worst Shape | Best Shape | Peak Throughput (M5 Pro) |
+| Comparison | Geomean | Worst shape | Best shape | Shapes below 1.0 |
 |---|---|---|---|---|
-| **bf16 vs. PyTorch MPS bf16** | **1.11×** *(Outperforms MPS)* | 1.01× | 1.22× | **29,022 GFLOP/s** (`square_4096`) |
-| **f32 exact vs. PyTorch MPS f32** | **1.07×** | 0.92× | 1.47× | **10,897 GFLOP/s** (`square_2048`) |
-| **tf32-relaxed vs. PyTorch MPS f32** | **2.01×** | 1.49× | 2.90× | **18,040 GFLOP/s** (`square_4096`) |
-| **bf16 vs. MLX bf16** | **2.63×** | 1.13× | 3.64× | — |
+| **bf16 vs. PyTorch MPS bf16** | **1.03×** | 0.86× | 1.16× | **4 of 8** |
+| **f32 exact vs. PyTorch MPS f32** | **1.12×** | 0.87× | 1.78× | 2 of 8 |
+| **tf32-relaxed vs. PyTorch MPS f32** | **2.11×** | 1.76× | 2.45× | 0 of 8 |
+| **bf16 vs. MLX bf16** | **2.55×** | 1.12× | 3.67× | 0 of 8 |
+
+> [!IMPORTANT]
+> **bf16 against MPS is parity, not a win.** An earlier version of this table
+> claimed 1.11× with a worst shape of 1.01×, which reads as "never loses". Re-run
+> with the same harness it is 1.03× and it loses on half the ladder, by as much as
+> 0.86× at 8192×3072×768. The number that is worth something is the **tf32 lane at
+> 2.11×**, which wins on every shape — and the MLX comparison at 2.55×, also clean.
+> Apple's own bf16 GEMM is well tuned; matching it is the honest claim.
+
+Peak observed throughput, `cargo run --release --bin bench_gemm_sweep`, medians
+over 50 iterations after 10 warmup:
+
+| Precision | Peak | Shape |
+|---|---:|---|
+| bf16 | **26,642 GFLOP/s** | `square_4096` |
+| tf32-relaxed | 16,293 GFLOP/s | `mlp_up` |
+| f32 exact | 6,431 GFLOP/s | `square_2048` |
 
 > [!WARNING]
-> **Benchmarking Rigor:**
-> - **Clock Drift:** Single-run cross-runtime benchmarks can fluctuate by 15–20% on identical workloads due to Apple Silicon dynamic power governor adjustments. Always use paired, interleaved sweeps (`bench_gemm_coop_ab` or `paired_cross_runtime.py`).
-> - **Dispatch Floor:** Below ~2 GFLOP of total work, both runtimes hit a ~0.25 ms host submit-and-wait floor, measuring host driver dispatch latency rather than raw shader throughput.
+> **Benchmarking rigor.**
+> - **Clock drift.** Single-run cross-runtime numbers fluctuate 15–20% on identical
+>   work as the power governor moves. Use the paired sweep
+>   (`bench/paired_cross_runtime.py`); for kernel-vs-kernel A/B use
+>   `bench_gemm_tile_tune` or `bench_gemm_tnnt_tune` behind `TESSL_GEMM_TUNE=1`.
+> - **Dispatch floor.** Below ~2 GFLOP of total work both runtimes sit on a
+>   ~0.25 ms host submit-and-wait floor, which measures driver dispatch latency
+>   rather than shader throughput.
+> - **These figures are reproducible, and were reproduced.** The f32 and tf32
+>   peaks previously published here (10,897 and 18,040 GFLOP/s) are not: the
+>   crate's own committed sweep in `bench/results/` records 6,606 for f32, and a
+>   fresh run gives 6,431. Two independent sources agreeing against a third is
+>   why they were replaced rather than averaged.
 
 ---
 

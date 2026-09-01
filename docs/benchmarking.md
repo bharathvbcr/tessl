@@ -9,7 +9,7 @@ you changed in the kernel.**
 
 | tool | for |
 | --- | --- |
-| `bench_gemm_coop_ab` | Paired, interleaved kernel A/B. Use this for kernel comparisons. |
+| `bench_gemm_tnnt_tune` | Paired, interleaved TN/NT kernel A/B. Use this for kernel comparisons. |
 | `bench_gemm_tile_tune` | Broad tile/BK ladder. Blocked-style timing — see pitfall 1. |
 | `bench_gemm_sweep` | Cross-runtime lane (f32 exact / tf32 / bf16), JSON out. |
 | `bench/paired_cross_runtime.py` | Alternates the tessl and PyTorch/MLX lanes round by round. |
@@ -31,9 +31,16 @@ GPU clock drift lands entirely in the ratio. Run four times, it showed the
 **production kernel measured against itself** ranging **0.92×–1.46×**.
 
 Any single-run conclusion from that rig is inside its own noise.
-`bench_gemm_coop_ab` interleaves baseline and candidate iteration by iteration
-(A,B,A,B,… alternating which goes first) and reports the ratio of per-round
+The paired lanes interleave baseline and candidate iteration by iteration
+(A,B,A,B,… alternating which goes first) and report the ratio of per-round
 medians across repeated rounds. That brought the spread to roughly ±5%.
+
+> [!NOTE]
+> Both places above named `bench_gemm_coop_ab` until 2026-09-01. No such binary
+> exists — the crate builds five, and the paired A/B lane is
+> `bench_gemm_tnnt_tune`. A first pass at this corrected only the *Reproducing*
+> block at the end of this document and left these two, which is why the note
+> there could truthfully say it was fixed while two live references survived.
 
 ## Pitfall 2 — a harness that contaminates its own baseline
 

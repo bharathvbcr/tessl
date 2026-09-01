@@ -8,6 +8,24 @@ All notable changes to `tessl` are recorded here. The format follows
 
 ### Fixed
 
+- **`gemv_q4` with `tiled = true` silently left most of its output unwritten.**
+  `gemv_q4_tiled` indexes its output row by `threadgroup_position_in_grid` and
+  so needs one threadgroup per row, but it was dispatched with
+  `rows.div_ceil(128)` groups — the geometry the one-thread-per-row `gemv_q4`
+  needs. It wrote the first `rows / 128` rows and left the rest of `y` holding
+  whatever was there before, with no error returned. Measured at 512 rows: 4
+  written, 508 untouched. The dynamic threadgroup allocation and the `cols`
+  ceiling that bounds it are now applied only to the kernel that caches `x`;
+  the tiled kernel declares its scratch statically and never did.
+  **Anyone who passed `tiled: true` was getting wrong results**, and with the
+  grid corrected that variant is slower than the default one at every shape
+  measured — its apparent speed was the work it was skipping.
+- **Nothing tested `gemv_q4_tiled` numerically.** `promoted_kernels.rs` checks
+  the pipeline name exists and `nn_adversarial.rs` checks error paths, so a
+  kernel writing 0.8% of its rows passed both. Added a test that asserts the two
+  variants agree row for row and that neither leaves a seeded sentinel behind,
+  at 512x256 and a ragged 300x128.
+
 - **Q8 GEMV ran one thread per row, uncoalesced.** `gemv_q8` dispatched `rows`
   threads, so adjacent threads read addresses `cols` bytes apart and a
   simdgroup's 32 loads touched 32 cache lines. Now one simdgroup per four rows

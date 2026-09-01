@@ -513,6 +513,78 @@ fn gemv_q8_covers_the_row_tail_and_the_scalar_fallback() {
     });
 }
 
+/// `gemv_q4`'s two variants take different grids, and the tiled one was getting
+/// the other's.
+///
+/// `gemv_q4_tiled` indexes its output row by `threadgroup_position_in_grid`, so
+/// it needs one threadgroup per row. It was dispatched with
+/// `rows.div_ceil(128)` groups — the geometry the one-thread-per-row kernel
+/// needs — and so wrote the first `rows / 128` rows and left the rest of `y`
+/// untouched. No error, no partial-write signal. At 512 rows it wrote 4.
+///
+/// Nothing caught it: `promoted_kernels.rs` checks the pipeline name exists and
+/// `nn_adversarial.rs` checks the error paths, and neither runs the kernel for a
+/// number. This asserts the two variants agree and that every row is written.
+#[test]
+fn gemv_q4_tiled_writes_every_row_and_agrees_with_the_row_kernel() {
+    with_gpu(|rt| {
+        // rows must exceed the 128 threads the row kernel groups by, or the two
+        // grids coincide and the bug is invisible. 512 and a ragged 300 both do.
+        for &(rows, cols, group) in &[(512usize, 256usize, 64usize), (300, 128, 32)] {
+            let packed: Vec<u8> = (0..rows * cols / 2)
+                .map(|i| ((i * 7) % 251) as u8)
+                .collect();
+            let groups = rows * (cols / group);
+            let scales: Vec<f32> = (0..groups).map(|i| 0.02 + (i % 5) as f32 * 0.001).collect();
+            let zeros: Vec<f32> = (0..groups).map(|i| 7.0 + (i % 3) as f32).collect();
+            let x = random_f32(cols, 0xC400 + cols as u64);
+
+            let pb = rt.alloc_buffer(packed.len()).unwrap();
+            pb.write_bytes(&packed);
+            let sb = buf(rt, &scales);
+            let zb = buf(rt, &zeros);
+            let xb = buf(rt, &x);
+            let shape = nn::QuantShape {
+                rows: rows as u32,
+                cols: cols as u32,
+                group_size: group as u32,
+            };
+            let bank = nn::Q4Bank {
+                packed: &pb,
+                scales: &sb,
+                zeros: &zb,
+            };
+
+            const SENTINEL: f32 = -98765.0;
+            let mut out = Vec::new();
+            for tiled in [false, true] {
+                // Re-seeded per variant: filled once, the first variant's write
+                // would mask whatever the second failed to write.
+                let yb = buf(rt, &vec![SENTINEL; rows]);
+                nn::gemv_q4(rt, bank, &xb, &yb, shape, tiled).unwrap();
+                rt.synchronize().unwrap();
+                out.push(yb.read_f32());
+            }
+
+            for (which, y) in out.iter().enumerate() {
+                let name = if which == 0 { "row" } else { "tiled" };
+                let unwritten = y[..rows].iter().filter(|v| **v == SENTINEL).count();
+                assert_eq!(
+                    unwritten, 0,
+                    "gemv_q4 [{name}] {rows}x{cols}: {unwritten} of {rows} rows never written"
+                );
+            }
+            for (i, (row_y, tiled_y)) in out[0][..rows].iter().zip(&out[1][..rows]).enumerate() {
+                let tol = 1e-3 * row_y.abs().max(1.0);
+                assert!(
+                    (row_y - tiled_y).abs() <= tol,
+                    "gemv_q4 {rows}x{cols} row {i}: row kernel {row_y} vs tiled {tiled_y}"
+                );
+            }
+        }
+    });
+}
+
 // -------------------------------------------------------------- KV cache ---
 
 #[test]

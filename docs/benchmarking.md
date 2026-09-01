@@ -198,6 +198,8 @@ encode path is worth, and at `mlp_silu n=4096` it is 4.1 µs against 203 µs —
 | `row_sum_f32` | 2048×8192 | 276.3 | 502.9 | **242.9** |
 | `row_max_f32` | 2048×8192 | 277.7 | 435.3 | 241.7 |
 | `gemv_q8` | 4096×4096 | 95.8 | 259.2 | 197.4 |
+| `gemv_q4` [row] | 4096×4096 | 81.6 | 261.9 | 128.8 |
+| `gemv_q4` [tiled] | 4096×4096 | 131.8 | 305.1 | 79.8 |
 | `gemv_q8` | 11008×4096 | 307.9 | 786.8 | 164.9 |
 | `gemm_i8_dequant` | 512³ | 18.9 | 210.6 | — |
 | `gemm_i8_dequant` | 2048³ | 343.4 | 526.7 | — |
@@ -286,6 +288,59 @@ group width divisible by four, so it exercised neither. Verified: forcing
 `xv = 0` in the fallback and removing the `row < rows` writeback guard both left
 it green. The new test seeds `y` past `rows` with a sentinel, because a tail
 threadgroup writing rows it does not own is otherwise invisible.
+
+### The sweep that found a correctness bug — 2026-08-31
+
+After RMSNorm and Q8 GEMV, the remaining `dispatch_1d` call sites in `src/nn.rs`
+were swept for the same shape: a thread per *row* with a serial loop inside,
+rather than a thread per element.
+
+Seven were clean. `mlp_silu`, `mlp_gelu_tanh`, `mlp_gelu_tanh_bf16`,
+`scale_f32_inplace`, `kv_store_timestep`, `kv_ring_densify`, `softcap_logits`
+and `embed_lookup_q4` are genuinely elementwise — zero inner loops — so one
+thread per element is the right grid.
+
+The MLX Q4 row variants (`gemv_q4_mlx`, `_wide`, `_tiled`) are one thread per
+row deliberately: they take an **f32** activation vector, and their own doc
+comment points at `gemv_q4_mlx_simd` for the bandwidth-limited decode shape,
+which reads bf16 and halves the traffic. A faster sibling already exists; these
+are a different input contract, not an oversight.
+
+`gemv_q4` was the one left, and benchmarking it turned up something worse than a
+slow kernel:
+
+| shape | `[row]` | `[tiled]` before fix | `[tiled]` after fix |
+| --- | ---: | ---: | ---: |
+| 4096×4096 | 128.8 GB/s | *3,077 GB/s* | 79.8 GB/s |
+| 11008×4096 | 143.9 GB/s | *1,217 GB/s* | 81.6 GB/s |
+
+3,077 GB/s is not a number this machine can produce, and that is the whole tell.
+`gemv_q4_tiled` indexes its output row by `threadgroup_position_in_grid`, so it
+needs one threadgroup per row; it was being dispatched with
+`rows.div_ceil(128)` groups — the geometry the *other* kernel needs. It wrote
+the first `rows / 128` rows and left the rest of `y` untouched. No error, no
+partial-write signal, just whatever was in the buffer before.
+
+Measured directly: at 512 rows, `nn::gemv_q4(.., tiled = true)` wrote **4 rows
+and left 508** holding their sentinel.
+
+Nothing caught it. `promoted_kernels.rs` checks the pipeline name exists;
+`nn_adversarial.rs` checks the error paths; neither runs the kernel for a
+number. `gemv_q4_tiled_writes_every_row_and_agrees_with_the_row_kernel` now
+does, at 512×256 and a ragged 300×128, seeding `y` per variant so the row
+kernel's output cannot mask what the tiled one failed to write.
+
+With the grid corrected, the tiled variant is **slower** than the row variant at
+both shapes. Its apparent speed was entirely the work it was skipping.
+
+This benchmark's own check was too weak to catch it: it required only that
+*some* output element be non-zero, and 4 correct rows satisfied that. It now
+seeds every output with a sentinel immediately before the kernel runs and fails
+if any live element survives — verified by re-breaking the dispatch, which
+reports "4064 of 4096 output elements were never written (first at 32)". Seeding
+per call rather than per allocation matters: the two `gemv_q4` arms share one
+`y`, and a buffer seeded once would be filled by the first arm before the second
+was checked.
 
 Every table in this repository is reproducible with the commands above, on an
 M5 Pro. On different silicon expect different constants — see Status in the

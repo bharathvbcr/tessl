@@ -1519,24 +1519,44 @@ pub fn gemv_q4_with_scalars(
     }
 
     let p = rt.pipeline(entry)?;
-    let tg_mem = (shape.cols as usize).saturating_mul(4);
-    let limit = rt.max_threadgroup_memory();
-    if tg_mem > limit {
-        return Err(format!(
-            "{entry}: caching x needs {tg_mem} bytes of threadgroup memory but \
-             this device allows {limit}; cols {} is too large for this kernel",
-            shape.cols
-        ));
-    }
-    let tptg = reduction_tptg(
-        p.maxTotalThreadsPerThreadgroup(),
-        GEMV_ROW_TPTG,
-        GEMV_ROW_TPTG,
-    )
-    .min(shape.rows as usize)
-    .max(1);
-    let groups = (shape.rows as usize).div_ceil(tptg);
-    dispatch_tg_1d(rt, &p, groups, tptg, Some((0, tg_mem)), |bnd| {
+    // The two kernels take *different* grids, and until 2026-08-31 both were
+    // dispatched with the one-thread-per-row geometry in the `else` arm.
+    //
+    // `gemv_q4_tiled` indexes its output row by `threadgroup_position_in_grid`
+    // and returns when that exceeds `rows`, so it needs one threadgroup per row.
+    // Handing it `rows.div_ceil(128)` groups meant it wrote the first
+    // `rows / 128` rows and left every other row of `y` untouched — no error, no
+    // partial-write signal, just whatever was in the buffer before. Measured at
+    // 512 rows it wrote 4 and left 508 holding a sentinel. The benchmark is what
+    // caught it: 3,077 GB/s is not a number this machine can produce, and it was
+    // doing 0.8% of the work.
+    //
+    // It also declares its scratch statically (`threadgroup float
+    // partial[GEMV_TG]`) and never caches `x`, so the dynamic threadgroup
+    // allocation, and the `cols` ceiling that exists to bound it, belong to the
+    // one-thread-per-row kernel alone.
+    let (groups, tptg, tg_mem) = if tiled {
+        (shape.rows as usize, GEMV_TILED_TPTG, None)
+    } else {
+        let bytes = (shape.cols as usize).saturating_mul(4);
+        let limit = rt.max_threadgroup_memory();
+        if bytes > limit {
+            return Err(format!(
+                "{entry}: caching x needs {bytes} bytes of threadgroup memory but this \
+                 device allows {limit}; cols {} is too large for this kernel",
+                shape.cols
+            ));
+        }
+        let t = reduction_tptg(
+            p.maxTotalThreadsPerThreadgroup(),
+            GEMV_ROW_TPTG,
+            GEMV_ROW_TPTG,
+        )
+        .min(shape.rows as usize)
+        .max(1);
+        ((shape.rows as usize).div_ceil(t), t, Some((0, bytes)))
+    };
+    dispatch_tg_1d(rt, &p, groups, tptg, tg_mem, |bnd| {
         set_gpu_buf(bnd, bank.packed, 0);
         set_gpu_buf(bnd, bank.scales, 1);
         set_gpu_buf(bnd, bank.zeros, 2);
@@ -1551,6 +1571,14 @@ pub fn gemv_q4_with_scalars(
 /// 128 amortizes the shared `x` cache across enough rows to pay for staging it,
 /// without making the tail group wasteful on short matrices.
 const GEMV_ROW_TPTG: usize = 128;
+
+/// Threads per threadgroup for `gemv_q4_tiled`.
+///
+/// Must equal `GEMV_TG` in `kernels/gemv_q4.metal`: the kernel sizes its
+/// `partial[]` scratch and its tree reduction by that constant, so a smaller
+/// launch leaves the upper half of the array uninitialised and a larger one
+/// overruns it.
+const GEMV_TILED_TPTG: usize = 128;
 
 // ---------------------------------------------------- Embedding lookup ---
 

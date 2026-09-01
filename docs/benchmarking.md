@@ -163,6 +163,77 @@ climbing to 4096³. Exact f32 uses the 32×32 single-simdgroup kernel with no
 register accumulator, so it is bandwidth-bound where the cooperative kernels are
 not.
 
+## The `nn` kernels — M5 Pro, 2026-08-31
+
+```bash
+cargo run --release --bin bench_nn_kernels
+```
+
+These kernels are small enough that the dispatch floor above dominates them
+entirely. A 1×4096 RMSNorm moves 32 KB; issued alone with a `synchronize()` it
+reports ~620 µs, which is the driver, not the shader. So each kernel is timed
+twice and both columns are printed:
+
+* **batched** — `set_async_encode(true)`, 64 dispatches accumulated into one
+  command buffer, one `synchronize()`, divided by 64. What a decode loop pays.
+* **solo** — `set_async_encode(false)`, one dispatch, one synchronize.
+
+`async_encode` defaults to **off**, so the solo column is what a caller gets
+without asking for anything. The gap between the columns is what the packed
+encode path is worth, and at `mlp_silu n=4096` it is 4.1 µs against 203 µs —
+**49×**.
+
+| kernel | shape | batched µs | solo µs | GB/s |
+| --- | ---: | ---: | ---: | ---: |
+| `rms_norm_f32` | 1×4096 | 404.3 | 622.4 | 0.1 |
+| `rms_norm_f32` | 512×4096 | 556.2 | 731.5 | 30.2 |
+| `rms_norm_f32` | 2048×4096 | 770.7 | 926.2 | 87.1 |
+| `mlp_silu` | n=4096 | 4.1 | 203.2 | 11.9 |
+| `mlp_gelu_tanh` | n=4096 | 4.0 | 199.7 | 12.2 |
+| `mlp_silu` | n=1M | 30.0 | 213.0 | 419.2 |
+| `mlp_gelu_tanh` | n=1M | 30.9 | 216.4 | 406.7 |
+| `mlp_silu` | n=8M | 440.1 | 582.4 | 228.8 |
+| `softmax_rows_f32` | 512×4096 | 79.8 | 259.2 | 210.4 |
+| `softmax_rows_f32` | 2048×8192 | 588.2 | 796.2 | 228.2 |
+| `row_sum_f32` | 2048×8192 | 276.3 | 502.9 | **242.9** |
+| `row_max_f32` | 2048×8192 | 277.7 | 435.3 | 241.7 |
+| `gemv_q8` | 4096×4096 | 274.5 | 487.9 | 68.9 |
+| `gemv_q8` | 11008×4096 | 383.6 | 721.8 | 132.4 |
+| `gemm_i8_dequant` | 512³ | 18.9 | 210.6 | — |
+| `gemm_i8_dequant` | 2048³ | 343.4 | 526.7 | — |
+
+The two integer GEMMs are compute-bound rather than bandwidth-bound: 14,221 and
+**50,032 GFLOP/s**. The latter is 1.9× the bf16 TensorOps peak in the table
+above, which is the expected shape for int8 on these accelerators.
+
+The `n=1M` row at 419 GB/s is the honest ceiling estimate for this machine —
+above it the working set stops fitting and `n=8M` settles at 229 GB/s, which is
+where the large reductions also land. Read ~240 GB/s as "saturating memory" for
+these shapes.
+
+### RMSNorm is one thread per row, and it costs
+
+`rms_norm_f32` peaks at **87 GB/s** where `row_sum_f32` on the same machine and
+the same reduction shape reaches **243 GB/s**. At 1×4096 it takes 404 µs to move
+32 KB.
+
+That is not a measurement artifact. The kernel's own first line says so — "One
+thread per row" — and `dispatch_1d(rt, &p, rows)` launches exactly `rows`
+threads. Each one loops the whole row serially, twice: once to accumulate the
+sum of squares, once to scale. At decode shape, `rows = 1`, so the entire kernel
+executes on a single GPU thread.
+
+`reduce.metal` in this same crate demonstrates the alternative in its own first
+line: "One threadgroup per row, so a row's reduction is a tree inside
+threadgroup". That is why `row_sum_f32` gets 2.8× the bandwidth on identical
+traffic.
+
+This matters more than the table suggests. RMSNorm runs twice per transformer
+layer on every token, and decode is the `rows = 1` case — the single worst point
+on this curve. Restructuring it onto the `REDUCE_TREE` path the reductions
+already use is the obvious fix; it is recorded here rather than quietly left in
+the numbers.
+
 Every table in this repository is reproducible with the commands above, on an
 M5 Pro. On different silicon expect different constants — see Status in the
 README.

@@ -106,26 +106,36 @@ jobs:
         run: python3 scripts/audit_gemm_tiles.py
 
   # ---------------------------------------------------------------------------
-  # The GPU suite.
+  # The GPU suite. Answered by running it, on 2026-08-31.
   #
-  # Two capabilities are needed and only one of them is established. macOS 26 on
-  # an arm64 runner supplies the Metal 4 API, and the sibling `sparsl` crate
-  # demonstrates that these runners do expose a working Metal device — its own
-  # probe disproved the opposite assumption. What is NOT established is MPP
-  # TensorOps `matmul2d`, which needs the neural accelerators on M5-class
-  # silicon; the runner image manifest documents no GPU at all, so the only way
-  # to find out is to run it.
+  # This job was written to gate on `macos-26` because the question could not be
+  # settled from documentation: macOS 26 supplies the Metal 4 API and these
+  # runners do expose a Metal device — sparsl's probe disproved the opposite
+  # assumption — but MPP TensorOps `matmul2d` needs the neural accelerators on
+  # M5-class silicon, and the runner image manifest documents no GPU at all.
   #
-  # So this job gates, deliberately. If the hosted GPU cannot do TensorOps it
-  # will fail, and that failure is the answer to a question nothing else here
-  # can answer. The fix at that point is to move this job behind
-  # `vars.HAS_METAL_RUNNER` and a self-hosted M5, exactly as `bench` below —
-  # NOT to add `continue-on-error`, which would make a suite that could not run
-  # report the same green as a suite that ran and passed.
+  # It ran, and the device probe failed. Everything upstream of it succeeded:
+  # the Metal Toolchain installed, `xcrun metal --version` executed, and the
+  # `check` job compiled all 18 kernel sources and linted clean on the same
+  # image. So the shaders build on a hosted runner; what fails is executing
+  # them. Whether the runner has no Metal 4 device or a device without
+  # TensorOps, the consequence for this workflow is identical.
+  #
+  # Applied here is the remedy this comment named in advance: the job moves to
+  # the gated self-hosted runner. NOT `continue-on-error`, which would make a
+  # suite that could not run report the same green as one that ran and passed.
+  #
+  # Gated on a repository variable rather than merely targeting `self-hosted`,
+  # because a job whose runner labels match nothing queues indefinitely instead
+  # of skipping. Set HAS_METAL_RUNNER to `true` under
+  # Settings -> Secrets and variables -> Actions -> Variables once an M5-class
+  # runner is registered; until then this skips, and the README's Known Gaps
+  # table says so rather than implying the suite runs unattended.
   # ---------------------------------------------------------------------------
   gpu:
-    name: GPU suite
-    runs-on: macos-26
+    name: GPU suite on bare metal
+    if: ${{ vars.HAS_METAL_RUNNER == 'true' }}
+    runs-on: [self-hosted, macOS, ARM64]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -223,7 +233,8 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - run: cargo test --release -- --test-threads=1
+      # No `cargo test` here: the `gpu` job above runs the suite on this same
+      # runner. This job is for numbers.
       - name: Bit-exact parity probe against the reference SIMD path
         run: cargo run --release --bin probe_gemm_parity
       - name: GEMM sweep

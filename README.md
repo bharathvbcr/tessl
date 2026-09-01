@@ -23,7 +23,8 @@ The name is short for *tessellation* — the design centers around how matrix op
 | | |
 | --- | --- |
 | **Status** | `0.1.0` — Metal 4 / MPP TensorOps verified on M5 Pro |
-| **Tests** | 199 passing, including doc tests (`cargo test --release -- --test-threads=1`) |
+| **Tests** | 228 passing, including doc tests (`cargo test --release -- --test-threads=1`) |
+| **Kernel coverage** | All 44 promoted kernels have a numeric test, not only a name check |
 | **Platform** | Apple silicon, macOS 26+, Xcode 26 Metal Toolchain |
 | **License** | MIT OR Apache-2.0 |
 

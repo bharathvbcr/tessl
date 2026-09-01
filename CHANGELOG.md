@@ -4,7 +4,13 @@ All notable changes to `tessl` are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this crate follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.1.0] — 2026-08-31
+
+First published release. The crate has not been on crates.io before, so
+everything below ships in it. The entries were written as the work landed and
+are kept in that form rather than reflowed, because each records why it was
+done — several of them are defects found by giving a kernel its first numeric
+test, and the reasoning is the useful part.
 
 ### Added
 
@@ -306,4 +312,3 @@ All notable changes to `tessl` are recorded here. The format follows
   `nax_verify_readiness` reports, replacing a second copy of the same sentinel
   that existed alongside it.
 
-[Unreleased]: https://github.com/bharathvbcr/tessl

@@ -8,6 +8,21 @@ All notable changes to `tessl` are recorded here. The format follows
 
 ### Fixed
 
+- **Q8 GEMV ran one thread per row, uncoalesced.** `gemv_q8` dispatched `rows`
+  threads, so adjacent threads read addresses `cols` bytes apart and a
+  simdgroup's 32 loads touched 32 cache lines. Now one simdgroup per four rows
+  with lanes striding K and `char4` loads covering a full cache line per
+  instruction, reusing the `simd_gemv_threadgroups` / `SIMD_TPTG` geometry the
+  MLX Q4 GEMVs already used. Measured on an M5 Pro: **2.9x at 4096x4096**
+  (274.5 -> 95.8 us, 68.9 -> 197.4 GB/s) and 1.25x at 11008x4096. The tall
+  case is bound by something else and is recorded as such rather than
+  explained away.
+- **The Q8 GEMV test covered neither new path.** rows = 24 is a multiple of the
+  8 rows a threadgroup owns and group = 16 is divisible by 4, so the ragged row
+  tail and the scalar fallback never ran; breaking either left it green. The new
+  case sweeps rows 13/37/100 and groups 15/32/64, and seeds `y` past `rows` with
+  a sentinel to catch a tail threadgroup writing rows it does not own.
+
 - **RMSNorm ran one thread per row.** All three kernels (`rms_norm_f32`,
   `rms_norm_bf16`, `rms_norm_residual_add_f32`) dispatched `rows` threads, each
   walking its row serially twice, which capped parallelism at the row count and

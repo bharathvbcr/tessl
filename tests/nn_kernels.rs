@@ -411,6 +411,108 @@ fn gemv_q8_matches_cpu_dequant_reference() {
     });
 }
 
+/// CPU reference for Q8 GEMV, in f64 so it measures the kernel's error rather
+/// than sharing its rounding.
+fn gemv_q8_ref(
+    packed: &[i8],
+    scales: &[f32],
+    zeros: &[f32],
+    x: &[f32],
+    rows: usize,
+    cols: usize,
+    group: usize,
+) -> Vec<f32> {
+    let gpr = cols / group;
+    (0..rows)
+        .map(|r| {
+            let mut acc = 0.0f64;
+            for g in 0..gpr {
+                let gi = r * gpr + g;
+                for i in 0..group {
+                    let w = scales[gi] as f64
+                        * (packed[r * cols + g * group + i] as f64 - zeros[gi] as f64);
+                    acc += w * x[g * group + i] as f64;
+                }
+            }
+            acc as f32
+        })
+        .collect()
+}
+
+/// Shapes that reach the two paths the original test could not.
+///
+/// `gemv_q8` is one simdgroup per four rows, and it takes a `char4` fast path
+/// when `group_size % 4 == 0`. The only pre-existing test used rows = 24 and
+/// group = 16 — a multiple of the 8 rows a threadgroup covers, and a group
+/// width divisible by 4 — so neither the row tail nor the scalar fallback ran.
+/// Verified: forcing `xv = 0` in the fallback, and removing the `row < rows`
+/// writeback guard, both left that test green.
+#[test]
+fn gemv_q8_covers_the_row_tail_and_the_scalar_fallback() {
+    with_gpu(|rt| {
+        // group 15 is not divisible by 4 -> scalar path; rows 13 and 37 are not
+        // multiples of 8 -> partially filled final threadgroup.
+        for &(rows, cols, group) in &[
+            (13usize, 60usize, 15usize),
+            (37, 128, 32),
+            (13, 120, 15),
+            (100, 4096, 64),
+        ] {
+            let packed: Vec<i8> = (0..rows * cols)
+                .map(|i| (i as i32 % 251 - 125) as i8)
+                .collect();
+            let groups = rows * (cols / group);
+            let scales: Vec<f32> = (0..groups).map(|i| 0.01 + (i % 7) as f32 * 0.003).collect();
+            let zeros: Vec<f32> = (0..groups).map(|i| (i % 5) as f32 - 2.0).collect();
+            let x = random_f32(cols, 0xB100 + cols as u64);
+
+            let pb = rt.alloc_buffer(packed.len()).unwrap();
+            pb.write_bytes(&packed.iter().map(|v| *v as u8).collect::<Vec<u8>>());
+            let sb = buf(rt, &scales);
+            let zb = buf(rt, &zeros);
+            let xb = buf(rt, &x);
+
+            // y is allocated past `rows` and seeded with a sentinel: a kernel
+            // whose tail threadgroup writes rows it does not own would land
+            // here, and a bounds bug that only ever wrote plausible numbers
+            // inside the live range would otherwise be invisible.
+            const SENTINEL: f32 = -12345.0;
+            let yb = buf(rt, &vec![SENTINEL; rows + 16]);
+
+            nn::gemv_q8(
+                rt,
+                &pb,
+                &sb,
+                &zb,
+                &xb,
+                &yb,
+                rows as u32,
+                cols as u32,
+                group as u32,
+            )
+            .unwrap();
+            rt.synchronize().unwrap();
+
+            let got = yb.read_f32();
+            let want = gemv_q8_ref(&packed, &scales, &zeros, &x, rows, cols, group);
+            for (i, w) in want.iter().enumerate() {
+                let tol = 1e-3 * w.abs().max(1.0);
+                assert!(
+                    (got[i] - w).abs() <= tol,
+                    "gemv_q8 {rows}x{cols} g{group} [{i}]: got {} want {w}",
+                    got[i]
+                );
+            }
+            for (i, v) in got[rows..rows + 16].iter().enumerate() {
+                assert_eq!(
+                    *v, SENTINEL,
+                    "gemv_q8 {rows}x{cols} g{group} wrote past row {rows} at +{i}"
+                );
+            }
+        }
+    });
+}
+
 // -------------------------------------------------------------- KV cache ---
 
 #[test]

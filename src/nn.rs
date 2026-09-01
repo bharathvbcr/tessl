@@ -430,15 +430,29 @@ pub fn gemv_q8_with_scalars(
     require::<f32>(zeros, groups, "gemv_q8 zeros")?;
     require::<f32>(x, cols as usize, "gemv_q8 x")?;
     require::<f32>(y, rows as usize, "gemv_q8 y")?;
+    if rows == 0 {
+        return Ok(());
+    }
     let p = rt.pipeline("gemv_q8")?;
-    dispatch_1d(rt, &p, rows as usize, |bnd| {
-        set_gpu_buf(bnd, packed, 0);
-        set_gpu_buf(bnd, scales, 1);
-        set_gpu_buf(bnd, zeros, 2);
-        set_gpu_buf(bnd, x, 3);
-        set_gpu_buf(bnd, y, 4);
-        scalars(bnd);
-    })
+    // One simdgroup per `SIMD_ROWS` output rows with lanes striding K, the same
+    // geometry the MLX Q4 simd GEMVs use. Was `dispatch_1d(rt, &p, rows)` — one
+    // thread per row — which left adjacent threads reading `cols` bytes apart,
+    // so nothing in a simdgroup's loads coalesced.
+    dispatch_tg_1d(
+        rt,
+        &p,
+        simd_gemv_threadgroups(rows),
+        SIMD_TPTG,
+        None,
+        |bnd| {
+            set_gpu_buf(bnd, packed, 0);
+            set_gpu_buf(bnd, scales, 1);
+            set_gpu_buf(bnd, zeros, 2);
+            set_gpu_buf(bnd, x, 3);
+            set_gpu_buf(bnd, y, 4);
+            scalars(bnd);
+        },
+    )
 }
 
 // -------------------------------------------------------------- KV cache ---

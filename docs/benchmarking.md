@@ -197,8 +197,8 @@ encode path is worth, and at `mlp_silu n=4096` it is 4.1 µs against 203 µs —
 | `softmax_rows_f32` | 2048×8192 | 588.2 | 796.2 | 228.2 |
 | `row_sum_f32` | 2048×8192 | 276.3 | 502.9 | **242.9** |
 | `row_max_f32` | 2048×8192 | 277.7 | 435.3 | 241.7 |
-| `gemv_q8` | 4096×4096 | 274.5 | 487.9 | 68.9 |
-| `gemv_q8` | 11008×4096 | 383.6 | 721.8 | 132.4 |
+| `gemv_q8` | 4096×4096 | 95.8 | 259.2 | 197.4 |
+| `gemv_q8` | 11008×4096 | 307.9 | 786.8 | 164.9 |
 | `gemm_i8_dequant` | 512³ | 18.9 | 210.6 | — |
 | `gemm_i8_dequant` | 2048³ | 343.4 | 526.7 | — |
 
@@ -252,6 +252,40 @@ And `REDUCE_TREE` moved into `kernels/reduce_tree.h` so the two callers share
 one definition; `build.rs` had to start tracking `.h` for `rerun-if-changed`,
 without which editing the shared reduction would leave both dependents stale in
 the metallib while the tests reported a pass.
+
+### Q8 GEMV had the same defect, plus one of its own — fixed 2026-08-31
+
+`gemv_q8` was also one thread per row, and for a kernel whose entire cost is
+streaming weights that was wrong twice over. Parallelism was capped at `rows`,
+and adjacent threads read addresses `cols` bytes apart, so a simdgroup's 32
+loads touched 32 different cache lines and nothing coalesced.
+
+It now uses one simdgroup per four output rows with lanes striding K — the
+geometry the MLX Q4 simd GEMVs already used, reusing the existing
+`simd_gemv_threadgroups` and `SIMD_TPTG` host helpers rather than inventing a
+second convention. Lanes take four bytes each through a `char4` load, so a
+simdgroup covers 128 contiguous bytes per instruction instead of 32.
+
+| shape | before | after | speedup | GB/s before → after |
+| --- | ---: | ---: | ---: | --- |
+| 4096×4096 | 274.5 µs | **95.8 µs** | **2.9×** | 68.9 → 197.4 |
+| 11008×4096 | 383.6 µs | **307.9 µs** | **1.25×** | 132.4 → 164.9 |
+
+The tall case gains least and is the honest limit of this change. Vectorising to
+`char4` moved 4096² from 161.6 to 197.4 GB/s but left 11008×4096 flat at ~163,
+so that shape is bound by something the access pattern does not control —
+plausibly the 5.6 MB of scale/zero pairs it also streams, which are read
+uniformly by all 32 lanes of a simdgroup. Recorded as measured rather than
+explained away; the next thing to try is loading them once per simdgroup.
+
+The `char4` path needs `group_size % 4 == 0`, so a scalar fallback stays for
+other group widths. Both paths and the ragged row tail are covered by
+`gemv_q8_covers_the_row_tail_and_the_scalar_fallback` — the pre-existing test
+used rows = 24 and group = 16, a multiple of the 8 rows a threadgroup owns and a
+group width divisible by four, so it exercised neither. Verified: forcing
+`xv = 0` in the fallback and removing the `row < rows` writeback guard both left
+it green. The new test seeds `y` past `rows` with a sentinel, because a tail
+threadgroup writing rows it does not own is otherwise invisible.
 
 Every table in this repository is reproducible with the commands above, on an
 M5 Pro. On different silicon expect different constants — see Status in the

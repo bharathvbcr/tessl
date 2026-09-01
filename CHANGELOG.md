@@ -6,6 +6,24 @@ All notable changes to `tessl` are recorded here. The format follows
 
 ## [Unreleased]
 
+## [0.1.2] — 2026-09-01
+
+Documentation only.
+
+### Fixed
+
+- **Internal monorepo paths and audit numbering leaked into the published
+  docs.** Eight doc comments referenced `arch_02_value_resid/metal-native`,
+  `arch_02`, and "Audit 4 P0 / P1 / 4 6 / 7" — a directory layout and an
+  internal review series that mean nothing to a reader arriving from crates.io,
+  and cannot be looked up. Each cited note is replaced by the reasoning it stood
+  for, so the *why* survives without the unresolvable citation: cold buffers
+  recycle only after the command buffer completes because releasing earlier
+  hands memory back while the GPU may still read it; one encoder is packed
+  across dispatches because opening one per dispatch costs setup on every op.
+  References to `gemma-metal` are kept, since that is a real crate and explains
+  where the promoted kernels came from.
+
 ## [0.1.1] — 2026-09-01
 
 One build-script fix, and documentation. No kernel or API changes.

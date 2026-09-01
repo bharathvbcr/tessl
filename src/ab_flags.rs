@@ -1,6 +1,7 @@
 //! GEMM / encode A/B flags (env, read once, then overridable for inference).
 //!
-//! Preserves metal-native Audit 4/6 lessons that affect the shared runtime:
+//! The defaults below are conservative on purpose. Each one was measured to
+//! matter, and the unsafe direction is the one that looks like free speed:
 //! - always-on Device barrier after each dispatch (golden-safe)
 //! - f32 GEMM interior offset tiles off by default
 //! - TensorOps multiply_accumulate off by default

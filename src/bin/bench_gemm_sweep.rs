@@ -13,7 +13,8 @@ use tessl::npy::write_npy_f32;
 use tessl::runtime::GpuRuntime;
 use tessl::tensor::Tensor;
 
-/// (M, N, K, label). Square ladder + the projection shapes arch_02 actually runs.
+/// (M, N, K, label). A square ladder plus the projection shapes a transformer
+/// layer actually issues: QKV, MLP up and down, and a tall reduction.
 const SHAPES: &[(usize, usize, usize, &str)] = &[
     (512, 512, 512, "square_512"),
     (1024, 1024, 1024, "square_1024"),

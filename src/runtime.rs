@@ -6,9 +6,12 @@
 //! registry, and SharedEvent sync. Steady-state work never host-waits except
 //! at log / loss / eval boundaries via [`GpuRuntime::synchronize`].
 //!
-//! Audit 4 lessons preserved: cold-buffer recycle + `removeAllocation` after CB
-//! complete; one compute encoder packed across `with_binder` calls (P1);
-//! working-set probe; no host-zero mid-CB.
+//! Four properties this module exists to hold, each of which was a measured
+//! regression before it was a rule: cold buffers recycle and call
+//! `removeAllocation` only after the command buffer completes, never while the
+//! GPU may still read them; one compute encoder is packed across `with_binder`
+//! calls rather than opened per dispatch; the working set is probed rather than
+//! assumed; and nothing zeroes a buffer from the host mid-command-buffer.
 
 use core::ptr::NonNull;
 use objc2::rc::Retained;
@@ -48,7 +51,7 @@ const DEFAULT_POOL_CACHE_BYTES: usize = 2 * 1024 * 1024 * 1024;
 /// against the same number the table was built with.
 pub const ARGUMENT_TABLE_MAX_BUFFERS: usize = 31;
 
-/// Residency / recycle policy for pooled buffers (Audit 4 P0).
+/// Residency and recycle policy for pooled buffers.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BufferKind {
     /// Mid-step temps — recycle + removeAllocation after CB complete.
@@ -282,7 +285,10 @@ fn mid_commit_threshold() -> usize {
 }
 
 /// Open Metal 4 command buffer for the current step (one allocator CB at a time).
-/// Audit 4 P1: keep a single compute encoder open across `with_binder` calls.
+///
+/// A single compute encoder stays open across `with_binder` calls. Opening one
+/// per dispatch costs an encoder setup on every op, which at decode sizes is a
+/// large fraction of the step.
 struct ActiveMetal4Batch {
     dispatches: usize,
     /// Dispatches since last commit (mid-token overlap).
@@ -955,9 +961,11 @@ impl GpuRuntime {
 
     /// Encode a compute pass via [`crate::dispatch::Binder`] (Metal 4).
     ///
-    /// Audit 4 P1: one compute encoder is kept open across calls within a CB
-    /// (packed dispatches + per-dispatch barriers). Call sites still use one
-    /// `with_binder` per op for telemetry (`dispatch_count`).
+    /// One compute encoder is kept open across calls within a command buffer,
+    /// so dispatches pack rather than each paying encoder setup; the
+    /// per-dispatch barrier is still emitted. Call sites use one `with_binder`
+    /// per op regardless, because `dispatch_count` is the telemetry every
+    /// benchmark and the adversarial suite read.
     pub fn with_binder<F>(&self, f: F) -> Result<(), String>
     where
         F: FnOnce(&mut crate::dispatch::Binder<'_>) -> Result<(), String>,

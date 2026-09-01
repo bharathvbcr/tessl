@@ -1272,7 +1272,7 @@ pub fn gemm_tn_accum_train(
 /// All call sites are **dX-class** accumulations into fresh pre-zeroed
 /// activation-grad buffers (never weight banks), so this path additionally
 /// honors `METAL_NATIVE_GEMM_ACCUM_DX` — accumulate-mode dX with dW kept on
-/// the Soft-safe temp+add path (Audit 7).
+/// the safer temp-plus-add path.
 pub fn gemm_nt_accum_train(
     a_mk: &Tensor,
     b_nk: &Tensor,

@@ -3,8 +3,10 @@
 //! Phase 4: optional byte offset for bank/slice views (no host round-trip),
 //! and GPU blit copy for deep_copy (no host memcpy).
 //!
-//! Audit 4 P0: pooled buffers are Arc-owned; last drop schedules cold recycle +
-//! `removeAllocation` after the in-flight CB completes (see [`GpuRuntime`]).
+//! Pooled buffers are `Arc`-owned, and the last drop schedules a cold recycle
+//! plus `removeAllocation` only after the in-flight command buffer completes.
+//! Releasing earlier hands memory back while the GPU may still be reading it
+//! (see [`GpuRuntime`]).
 
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;

@@ -5,6 +5,7 @@ edition = "2021"
 rust-version = "1.82"
 description = "Metal 4 GEMM and encode runtime for Apple silicon, built on Metal Performance Primitives TensorOps"
 repository = "https://github.com/bharathvbcr/tessl"
+documentation = "https://docs.rs/tessl"
 readme = "README.md"
 keywords = ["metal", "gemm", "gpu", "apple-silicon", "bf16"]
 categories = ["science", "hardware-support", "api-bindings"]

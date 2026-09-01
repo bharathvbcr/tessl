@@ -6,6 +6,21 @@ All notable changes to `tessl` are recorded here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- **`documentation` in `Cargo.toml`, and the published docs linked from the
+  README.** The crate page fell back to docs.rs implicitly and the README named
+  neither, so the one surface a GitHub reader lands on had no path to the API
+  reference. The README now carries crates.io, docs.rs, CI and license badges,
+  a nav line to docs.rs and the three `docs/` deep dives, and an API reference
+  row at the top of the Documentation table.
+
+### Fixed
+
+- The README Status row said `0.1.0` while crates.io served `0.1.2`. Corrected,
+  and linked to the crate page so the number has somewhere to be checked
+  against.
+
 ## [0.1.2] — 2026-09-01
 
 Documentation only.

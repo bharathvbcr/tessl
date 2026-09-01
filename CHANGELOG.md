@@ -6,6 +6,42 @@ All notable changes to `tessl` are recorded here. The format follows
 
 ## [Unreleased]
 
+## [0.1.1] — 2026-09-01
+
+Documentation only. No code, kernel or API changes; the compiled crate is
+identical to 0.1.0.
+
+### Fixed
+
+- **The README's headline benchmark claim was wrong.** It read 1.11x against
+  PyTorch MPS on bf16 with a worst shape of 1.01x, which reads as "never loses".
+  Re-measured with the same paired harness on the same machine: **1.03x, losing
+  on 4 of the 8 shapes**, worst 0.86x. The tf32 lane (2.11x, wins every shape)
+  and the MLX comparison (2.55x) hold up. The table now carries a "shapes below
+  1.0" column, because a geomean above 1.0 with half the ladder underneath it is
+  not the same result as a clean win.
+- **The published f32 and tf32 peak throughputs were not reproducible.** 10,897
+  and 18,040 GFLOP/s; the crate's own committed sweep records 6,606 for f32 and
+  a fresh run gives 6,431. Replaced with measured values rather than averaged.
+- Two remaining references to `bench_gemm_coop_ab`, a binary that does not
+  exist, in the benchmarking doc's tool table and prose. The paired A/B lane is
+  `bench_gemm_tnnt_tune`.
+- Stale counts in `docs/verification.md` (199 tests across 14 files; it is 228
+  across 18) and in the README's known-gaps table.
+
+### Added
+
+- **A docs.rs landing page written for someone outside the monorepo.** Platform
+  constraints first, since this crate does not build on Linux or Intel Macs at
+  all, and the Metal Toolchain is a separately downloaded Xcode component rather
+  than part of Xcode. Adds two `no_run` quickstarts, a module map, the feature
+  table, the measured cross-runtime results, and the encode-model note that
+  `async_encode` is off by default and worth roughly 49x on a small kernel.
+- Contributor notes covering `--test-threads=1`, why `build.rs` tracks every
+  `.metal` and `.h` individually, that a name check is not a correctness test,
+  seeding outputs with a sentinel, and testing every arm of a kernel family.
+- Real module docs for `npy`, `ops` and `infer_trace`, which had one line each.
+
 ### Fixed
 
 - **The README's bf16-vs-MPS claim was wrong, and it was the headline.** It read

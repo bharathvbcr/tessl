@@ -746,7 +746,8 @@ pub fn flash_attn_swa_with_scalars(
     scalars: impl FnOnce(&mut Binder<'_>),
 ) -> Result<(), String> {
     let d = head_dim.dim();
-    validate_attn_dims(&dims, d, q, o, "flash_attn_swa")?;
+    // The sliding-window kernels always write f32.
+    validate_attn_dims(&dims, d, q, o, "flash_attn_swa", false)?;
     require::<u32>(tkv, 1, "flash_attn_swa tkv")?;
     require::<u32>(q_pos_offset, 1, "flash_attn_swa q_pos_offset")?;
     require::<u32>(kv_pos_offset, 1, "flash_attn_swa kv_pos_offset")?;
@@ -838,15 +839,7 @@ pub fn flash_attn_global_h512_with_scalars(
     const D: u32 = 512;
     // `BR = 4` for this kernel, not 8 — see its `constant uint BR`.
     const BR: usize = 4;
-    let out_elems = elems(
-        dims.batch * dims.tq * dims.heads,
-        D,
-        "flash_attn_global_h512",
-    )?;
-    validate_attn_dims(&dims, D, q, o, "flash_attn_global_h512")?;
-    if out_bf16 {
-        require::<u16>(o, out_elems, "flash_attn_global_h512 o (bf16)")?;
-    }
+    validate_attn_dims(&dims, D, q, o, "flash_attn_global_h512", out_bf16)?;
     require::<u32>(tkv, 1, "flash_attn_global_h512 tkv")?;
     require::<u32>(q_pos_offset, 1, "flash_attn_global_h512 q_pos_offset")?;
     require::<u32>(kv_pos_offset, 1, "flash_attn_global_h512 kv_pos_offset")?;
@@ -886,6 +879,7 @@ fn validate_attn_dims(
     q: &GpuBuffer,
     o: &GpuBuffer,
     what: &str,
+    out_bf16: bool,
 ) -> Result<(), String> {
     if dims.heads_kv == 0 {
         return Err(format!("{what}: heads_kv must be non-zero"));
@@ -902,7 +896,16 @@ fn validate_attn_dims(
     }
     let n = elems(dims.batch * dims.tq * dims.heads, d, what)?;
     require::<f32>(q, n, &format!("{what} q"))?;
-    require::<f32>(o, n, &format!("{what} o"))?;
+    if out_bf16 {
+        // `out_bf16` exists to halve this buffer — the kernel writes `bfloat`
+        // into it. Validating `o` as f32 regardless demanded twice the memory
+        // the kernel touches, so a caller who sized it correctly for bf16 got
+        // "buffer holds 2560 elements, kernel reads/writes 5120" and the
+        // documented half-width scratch was unreachable.
+        require::<u16>(o, n, &format!("{what} o (bf16)"))?;
+    } else {
+        require::<f32>(o, n, &format!("{what} o"))?;
+    }
     Ok(())
 }
 

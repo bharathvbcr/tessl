@@ -8,6 +8,48 @@ All notable changes to `tessl` are recorded here. The format follows
 
 ### Fixed
 
+- **The sliding-window attention kernels read uninitialised threadgroup memory
+  for half of every query block.** `flash_attn_swa_h128` and `_h256` zeroed
+  their `scores[BR * BC]` scratch with `if (lid < BR * BC)` — 64 entries — while
+  the host dispatches **32 threads per threadgroup**. Entries 32..63 were never
+  zeroed, and those are query rows 4..7 of every block, which then accumulated
+  QK products into whatever a previous dispatch had left there. The result was
+  plausible numbers rather than NaN, so nothing looked wrong. Zeroing is now
+  strided, which is correct for any relation between `tptg` and `BR * BC`.
+  `flash_attn_global_h512` was unaffected only because its `BR = BC = 4` gives
+  16 entries, under the 32 threads; it is fixed the same way so the property
+  does not depend on the tile constants.
+- **A fully masked block produced NaN in the online softmax.** The FA-2 rescale
+  computes `alpha = exp(m_i - m_new)`, and when a row had seen nothing yet and
+  the current block was entirely masked for it, both were `-inf` — so `alpha`
+  was `exp(NaN)`, which then propagated through `Oacc` and `l_i` and poisoned
+  the row. This is reachable whenever the block-level skip admits a block on
+  behalf of another row in the same `BR` tile, which the union window makes
+  routine at small `window`. Guarded with `m_i == -inf ? 0`, which is also the
+  right value for the ordinary first-real-block case.
+- **`out_bf16` demanded an output buffer sized for f32.** `flash_attn_global_h512`
+  validated `o` through `validate_attn_dims`, which always required
+  `require::<f32>`, and then added a `u16` check on top. A caller who sized the
+  buffer for bf16 — the whole point of the flag, documented as "half-width act
+  scratch" — got "buffer holds 2560 elements, kernel reads/writes 5120". The
+  output width now follows `out_bf16`.
+
+### Added
+
+- **`tests/attention.rs`** — six tests against an f64 reference transcribed from
+  the kernels' own masking rule: prefill at both sliding-window head dims with
+  ragged query and key tails, window bounding (including `window = 1`, which
+  must reduce each row to its own V), decode with the device-side position
+  offsets, a fully masked decode row that must be zeros rather than NaN, GQA
+  head grouping across four `H:Hkv` ratios, and the global kernel's causal rule
+  plus its bf16 output arm.
+- **`tests/qkv_rope.rs`** — four tests for the fused RMSNorm to QKV to RoPE
+  kernels: the constant-position variant against an f64 reference at full and
+  partial `rotary_dim`, V normalised but never rotated, `PosBuffer` agreeing
+  bit for bit with `PosConst`, and `PosBufferKvStore` writing the rotated K and
+  V into the cache at a device offset without touching anything outside the
+  slot. All four passed on the first run; these kernels were correct.
+
 - **`gemv_q4_mlx` with `Q4MlxRowVariant::Tiled` left most of its output
   unwritten** — the same defect as `gemv_q4_tiled`, in the sibling family.
   `gemv_q4_mlx_tiled` indexes its output row by `threadgroup_position_in_grid`

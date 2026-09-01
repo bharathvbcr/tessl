@@ -87,8 +87,16 @@ kernel void flash_attn_swa_h128(
             }
         }
 
-        if (lid < BR * BC) {
-            scores[lid] = 0.0f;
+        // Strided, not `if (lid < BR * BC)`. The host dispatches 32 threads
+        // per threadgroup while `scores` holds BR*BC entries — 64 for the
+        // sliding-window kernels — so the guarded form left entries 32..63
+        // untouched. Those are query rows 4..7 of every block, and the `+=`
+        // below then accumulated into whatever threadgroup memory held from a
+        // previous dispatch: plausible numbers, not NaN, so nothing looked
+        // wrong. Striding is correct for any relation between `tptg` and
+        // BR*BC, which is the property the guarded form quietly depended on.
+        for (uint i = lid; i < BR * BC; i += tptg) {
+            scores[i] = 0.0f;
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -126,7 +134,18 @@ kernel void flash_attn_swa_h128(
                 m_block = max(m_block, score);
             }
             const float m_new = max(m_i, m_block);
-            const float alpha = exp(m_i - m_new);
+            // `exp(m_i - m_new)` is `exp(-inf - -inf)` = `exp(NaN)` = NaN when
+            // this row has seen nothing yet and this block is entirely masked
+            // for it. That happens whenever the block-level skip admits a block
+            // on behalf of another row in the same BR tile — the union window
+            // is computed over the whole tile, so a block needed by the last
+            // row can be fully masked for the first. The NaN then propagated
+            // through `Oacc *= alpha` and `l_i` and poisoned the row.
+            //
+            // `m_i == -inf` means the accumulator is still zero, so scaling it
+            // by zero is exactly right, and it also covers the ordinary
+            // first-real-block case where `exp(-inf - finite)` is already 0.
+            const float alpha = (m_i == -INFINITY) ? 0.0f : exp(m_i - m_new);
             float l_block = 0.0f;
             for (uint tk = 0; tk < n_k; ++tk) {
                 float p = (scores[lid * BC + tk] > -INFINITY)

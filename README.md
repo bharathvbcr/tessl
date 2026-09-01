@@ -17,12 +17,24 @@
 The name is short for *tessellation* — the design centers around how matrix operations are partitioned into tile geometries and the order in which those tiles are traversed.
 
 <p align="center">
+  <a href="https://crates.io/crates/tessl"><img src="https://img.shields.io/crates/v/tessl.svg" alt="crates.io"></a>
+  <a href="https://docs.rs/tessl"><img src="https://img.shields.io/docsrs/tessl" alt="docs.rs"></a>
   <a href="https://github.com/bharathvbcr/tessl/actions/workflows/ci.yml"><img src="https://github.com/bharathvbcr/tessl/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+  <a href="#license"><img src="https://img.shields.io/crates/l/tessl.svg" alt="MIT OR Apache-2.0"></a>
+</p>
+
+<p align="center">
+  <a href="https://docs.rs/tessl"><strong>API documentation</strong></a> ·
+  <a href="https://crates.io/crates/tessl"><strong>crates.io</strong></a> ·
+  <a href="docs/architecture.md">Architecture</a> ·
+  <a href="docs/benchmarking.md">Benchmarking</a> ·
+  <a href="docs/verification.md">Verification</a>
 </p>
 
 | | |
 | --- | --- |
-| **Status** | `0.1.0` — Metal 4 / MPP TensorOps verified on M5 Pro |
+| **Status** | [`0.1.2`](https://crates.io/crates/tessl) — Metal 4 / MPP TensorOps verified on M5 Pro |
+| **API docs** | [docs.rs/tessl](https://docs.rs/tessl) — built on `aarch64-apple-darwin` with all features |
 | **Tests** | 228 passing, including doc tests (`cargo test --release -- --test-threads=1`) |
 | **Kernel coverage** | All 44 promoted kernels have a numeric test, not only a name check |
 | **Platform** | Apple silicon, macOS 26+, Xcode 26 Metal Toolchain |
@@ -479,6 +491,7 @@ All runtime configuration uses the canonical `TESSL_*` prefix. Legacy
 
 | Document | Topic & Scope |
 |---|---|
+| [**API reference**](https://docs.rs/tessl) | Every public type, entry point and feature flag on docs.rs, rendered from the source of the released version. Start at the crate root for the platform requirements, the two quickstarts and the module map. |
 | [**Architecture**](docs/architecture.md) | Deep dive into kernel selection, cooperative destination register mechanics, $K$-reduction bandwidth analysis, and TN/NT layout optimizations. |
 | [**Benchmarking**](docs/benchmarking.md) | The paired measurement protocol, GPU thermal and frequency scaling mitigation, and five measurement pitfalls. |
 | [**Verification**](docs/verification.md) | Static tile geometry audit, randomized shape fuzzing, and fault injection test suites. |

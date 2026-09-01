@@ -6,6 +6,33 @@ All notable changes to `tessl` are recorded here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- **`tests/q4_interleaved.rs`** — numeric coverage for the seven `_i4`
+  (Interleaved4) MLX Q4 kernels, which had only a name check. They read a
+  different weight packing from their row-major twins, and `Q4MlxBank` carries
+  no layout tag, so the wrong packing dispatches and returns numbers — the same
+  hazard `gemv_q4_mlx_blocked` turned out to be. The packer is transcribed from
+  `gemv_q4_mlx_simd_i4`'s indexing: weights at
+  `((tile * packs + pack2) * 4 + r) * 8` bytes with `tile = row / 4`, scale/bias
+  at `(tile * groups_per_row + g) * 4 + r`; the nibble order inside each 8-byte
+  group is unchanged, only the placement moves. Each test checks the `_i4`
+  kernel against the dense f64 reference *and* against its row-major twin over
+  the same logical weights.
+
+  **All seven kernels were correct.** Verified the tests can fail: feeding the
+  `_i4` path a row-major bank fails all six, and mutating the kernel's scale
+  stride fails the one test that covers it.
+
+- **The GEMM residual arm.** `gemm_q4_mlx_simd_add` and `_add_i4` are reached
+  only by passing `Some(resid)`, and every other GEMM test passed `None`, so
+  they were the last two promoted kernels with a name and no number. The
+  residual is the full `m x rows`, matching the output — `resid[m * rows + row]`
+  in the kernel — not a per-row vector broadcast across `m`, which is what the
+  first draft of the test assumed and what the host validation caught.
+
+  With this, all 44 promoted kernels have a numeric test.
+
 ### Fixed
 
 - **The sliding-window attention kernels read uninitialised threadgroup memory

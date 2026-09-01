@@ -330,7 +330,14 @@ fn track_kernel_sources(dir: &Path) {
         let p = entry.path();
         if p.is_dir() {
             track_kernel_sources(&p);
-        } else if p.extension().and_then(|s| s.to_str()) == Some("metal") {
+        } else if matches!(
+            p.extension().and_then(|s| s.to_str()),
+            Some("metal") | Some("h")
+        ) {
+            // `.h` as well as `.metal`: `reduce_tree.h` is included by two
+            // kernels and compiled as neither. Tracking only sources would let
+            // an edit to the shared reduction leave both dependents stale in
+            // the metallib while `cargo test` reported a pass.
             println!("cargo:rerun-if-changed={}", p.display());
         }
     }

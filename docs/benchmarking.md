@@ -185,9 +185,9 @@ encode path is worth, and at `mlp_silu n=4096` it is 4.1 µs against 203 µs —
 
 | kernel | shape | batched µs | solo µs | GB/s |
 | --- | ---: | ---: | ---: | ---: |
-| `rms_norm_f32` | 1×4096 | 404.3 | 622.4 | 0.1 |
-| `rms_norm_f32` | 512×4096 | 556.2 | 731.5 | 30.2 |
-| `rms_norm_f32` | 2048×4096 | 770.7 | 926.2 | 87.1 |
+| `rms_norm_f32` | 1×4096 | 24.2 | 388.6 | 2.0 |
+| `rms_norm_f32` | 512×4096 | 55.1 | 254.5 | 305.0 |
+| `rms_norm_f32` | 2048×4096 | 310.5 | 512.7 | 216.2 |
 | `mlp_silu` | n=4096 | 4.1 | 203.2 | 11.9 |
 | `mlp_gelu_tanh` | n=4096 | 4.0 | 199.7 | 12.2 |
 | `mlp_silu` | n=1M | 30.0 | 213.0 | 419.2 |
@@ -211,28 +211,47 @@ above it the working set stops fitting and `n=8M` settles at 229 GB/s, which is
 where the large reductions also land. Read ~240 GB/s as "saturating memory" for
 these shapes.
 
-### RMSNorm is one thread per row, and it costs
+### RMSNorm was one thread per row — fixed 2026-08-31
 
-`rms_norm_f32` peaks at **87 GB/s** where `row_sum_f32` on the same machine and
-the same reduction shape reaches **243 GB/s**. At 1×4096 it takes 404 µs to move
-32 KB.
+This benchmark's first run found `rms_norm_f32` peaking at **87 GB/s** where
+`row_sum_f32` reached **243 GB/s** on identical traffic, and taking 404 µs to
+move 32 KB at 1×4096.
 
-That is not a measurement artifact. The kernel's own first line says so — "One
-thread per row" — and `dispatch_1d(rt, &p, rows)` launches exactly `rows`
-threads. Each one loops the whole row serially, twice: once to accumulate the
-sum of squares, once to scale. At decode shape, `rows = 1`, so the entire kernel
-executes on a single GPU thread.
+Not an artifact. The kernel's own first line said "One thread per row", and
+`dispatch_1d(rt, &p, rows)` launched exactly `rows` threads, each walking its
+row serially twice — once to accumulate the sum of squares, once to scale. At
+the decode shape `rows = 1`, so the whole kernel ran on a single GPU thread.
+RMSNorm runs twice per transformer layer on every token, making decode the worst
+point on that curve.
 
-`reduce.metal` in this same crate demonstrates the alternative in its own first
-line: "One threadgroup per row, so a row's reduction is a tree inside
-threadgroup". That is why `row_sum_f32` gets 2.8× the bandwidth on identical
-traffic.
+All three variants — `rms_norm_f32`, `rms_norm_bf16`,
+`rms_norm_residual_add_f32` — now use one threadgroup per row with the sum of
+squares reduced as a tree, which is the pattern `reduce.metal` already used:
 
-This matters more than the table suggests. RMSNorm runs twice per transformer
-layer on every token, and decode is the `rows = 1` case — the single worst point
-on this curve. Restructuring it onto the `REDUCE_TREE` path the reductions
-already use is the obvious fix; it is recorded here rather than quietly left in
-the numbers.
+| shape | before | after | speedup | GB/s before → after |
+| --- | ---: | ---: | ---: | --- |
+| 1×4096 (decode) | 404.3 µs | **24.2 µs** | **16.7×** | 0.1 → 2.0 |
+| 512×4096 | 556.2 µs | **55.1 µs** | **10.1×** | 30.2 → 305.0 |
+| 2048×4096 | 770.7 µs | **310.5 µs** | **2.5×** | 87.1 → 216.2 |
+
+The 512×4096 case now reaches 305 GB/s, above the large reductions, because its
+working set still fits cache where a 2048-row sweep does not.
+
+The reduction reassociates where the serial loop did not, so results differ in
+the low bits. That is why the new tests compare against an f64 reference rather
+than a matching f32 accumulation — the old `rms_norm_ref` summed in f32 in the
+same order the serial kernel did, which agreed with the kernel's rounding
+instead of measuring it.
+
+Two things this exposed beyond the kernel itself. The existing tests used `dim`
+of 16 to 64, and `reduce_tptg` hands a 4096-wide row 1024 threads, so every
+lane's strided loop ran exactly once — **deleting the loop entirely left all
+three tests green**. `rms_norm_sums_rows_wider_than_one_threadgroup` and its
+sibling now cover 4096, a ragged 3000, and 8192, and both kill that mutation.
+And `REDUCE_TREE` moved into `kernels/reduce_tree.h` so the two callers share
+one definition; `build.rs` had to start tracking `.h` for `rerun-if-changed`,
+without which editing the shared reduction would leave both dependents stale in
+the metallib while the tests reported a pass.
 
 Every table in this repository is reproducible with the commands above, on an
 M5 Pro. On different silicon expect different constants — see Status in the

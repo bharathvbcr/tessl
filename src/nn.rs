@@ -96,8 +96,16 @@ pub fn rms_norm_f32_with_scalars(
     require::<f32>(x, n, "rms_norm_f32 x")?;
     require::<f32>(weight, dim as usize, "rms_norm_f32 weight")?;
     require::<f32>(out, n, "rms_norm_f32 out")?;
+    if rows == 0 {
+        return Ok(());
+    }
     let p = rt.pipeline("rms_norm_f32")?;
-    dispatch_1d(rt, &p, rows as usize, |bnd| {
+    // One threadgroup per row with a tree reduction, matching `row_reduce`.
+    // Was `dispatch_1d(rt, &p, rows)` — one thread per row — which capped
+    // parallelism at `rows` and ran the whole kernel on a single GPU thread at
+    // the decode shape.
+    let tptg = reduce_tptg(p.maxTotalThreadsPerThreadgroup(), dim as usize);
+    dispatch_tg_1d(rt, &p, rows as usize, tptg, None, |bnd| {
         set_gpu_buf(bnd, x, 0);
         set_gpu_buf(bnd, weight, 1);
         set_gpu_buf(bnd, out, 2);
@@ -139,8 +147,12 @@ pub fn rms_norm_bf16_with_scalars(
     require::<f32>(weight, dim as usize, "rms_norm_bf16 weight")?;
     // bf16 output: two bytes per element, not four.
     require::<u16>(out, n, "rms_norm_bf16 out")?;
+    if rows == 0 {
+        return Ok(());
+    }
     let p = rt.pipeline("rms_norm_bf16")?;
-    dispatch_1d(rt, &p, rows as usize, |bnd| {
+    let tptg = reduce_tptg(p.maxTotalThreadsPerThreadgroup(), dim as usize);
+    dispatch_tg_1d(rt, &p, rows as usize, tptg, None, |bnd| {
         set_gpu_buf(bnd, x, 0);
         set_gpu_buf(bnd, weight, 1);
         set_gpu_buf(bnd, out, 2);
@@ -188,8 +200,12 @@ pub fn rms_norm_residual_add_f32_with_scalars(
     require::<f32>(x, n, "rms_norm_residual_add_f32 x")?;
     require::<f32>(weight, dim as usize, "rms_norm_residual_add_f32 weight")?;
     require::<f32>(resid, n, "rms_norm_residual_add_f32 resid")?;
+    if rows == 0 {
+        return Ok(());
+    }
     let p = rt.pipeline("rms_norm_residual_add_f32")?;
-    dispatch_1d(rt, &p, rows as usize, |bnd| {
+    let tptg = reduce_tptg(p.maxTotalThreadsPerThreadgroup(), dim as usize);
+    dispatch_tg_1d(rt, &p, rows as usize, tptg, None, |bnd| {
         set_gpu_buf(bnd, x, 0);
         set_gpu_buf(bnd, weight, 1);
         set_gpu_buf(bnd, resid, 2);

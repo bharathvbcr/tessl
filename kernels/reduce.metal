@@ -8,27 +8,9 @@
 // Every kernel here strides: lane `lid` visits `cols[lid], cols[lid + tptg],
 // ...`, so `cols` is unbounded and adjacent lanes read adjacent addresses.
 #include <metal_stdlib>
+#include "reduce_tree.h"
 using namespace metal;
 
-/// Threadgroup scratch depth. Every lane writes its own slot before the tree
-/// reduction, so the launch must never exceed this.
-constant uint REDUCE_MAX_TG = 1024u;
-
-/// Tree-reduce `scratch[0..tptg]` with `op`, leaving the result in slot 0.
-///
-/// `tptg` must be a power of two: the loop halves it, and an odd width would
-/// drop the top element silently rather than failing. The host rounds down to
-/// a power of two before dispatch.
-#define REDUCE_TREE(scratch, tptg, lid, combine)                               \
-    for (uint stride = (tptg) >> 1; stride > 0u; stride >>= 1) {               \
-        if ((lid) < stride) {                                                  \
-            (scratch)[lid] = combine((scratch)[lid], (scratch)[(lid) + stride]);\
-        }                                                                      \
-        threadgroup_barrier(mem_flags::mem_threadgroup);                       \
-    }
-
-inline float reduce_add(float a, float b) { return a + b; }
-inline float reduce_max(float a, float b) { return fmax(a, b); }
 
 /// `out[r, :] = softmax(x[r, :])`, numerically stable.
 ///

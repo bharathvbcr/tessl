@@ -157,6 +157,120 @@ fn rms_norm_residual_add_folds_the_layer_scale() {
     });
 }
 
+/// `dim` beyond one threadgroup's width, which is where the strided loop is the
+/// only thing summing the tail.
+///
+/// The three tests above all use `dim` of 16 to 64. `reduce_tptg` hands the
+/// kernel 1024 threads for a row that wide, so every lane's `for (d = lid; d <
+/// dim; d += tptg)` executes exactly once and a kernel that dropped the loop
+/// entirely would still pass them. Verified: replacing the loop with a single
+/// `xin[lid]` left all three green. These shapes take 4 strided iterations at
+/// 4096 and a ragged 3 at 3000, so the tail cannot go unsummed unnoticed.
+#[test]
+fn rms_norm_sums_rows_wider_than_one_threadgroup() {
+    with_gpu(|rt| {
+        for &(rows, dim) in &[(2usize, 4096usize), (3, 3000), (1, 8192)] {
+            let eps = 1e-6f32;
+            let mut x = random_f32(rows * dim, 0x9001 + dim as u64);
+            // A zero row here too: eps has to survive the reduction rewrite.
+            x[..dim].fill(0.0);
+            let w = random_f32(dim, 0x9002);
+            let xb = buf(rt, &x);
+            let wb = buf(rt, &w);
+            let ob = empty(rt, rows * dim);
+
+            nn::rms_norm_f32(rt, &xb, &wb, &ob, rows as u32, dim as u32, eps).unwrap();
+            rt.synchronize().unwrap();
+
+            let got = ob.read_f32();
+            assert!(
+                got[..rows * dim].iter().all(|v| v.is_finite()),
+                "{rows}x{dim}: non-finite output"
+            );
+            // The kernel now reduces as a tree, so it does NOT match a
+            // sequential f32 sum bit for bit. The reference is f64 and the
+            // tolerance is relative, which measures the error rather than
+            // agreeing with the kernel's own ordering.
+            let want = rms_norm_ref_f64(&x, &w, rows, dim, eps);
+            for (i, (g, wv)) in got[..rows * dim].iter().zip(&want).enumerate() {
+                let tol = 1e-5 * wv.abs().max(1e-3);
+                assert!(
+                    (g - wv).abs() <= tol,
+                    "rms_norm {rows}x{dim} [{i}]: got {g} want {wv}"
+                );
+            }
+        }
+    });
+}
+
+/// Same width sweep for the two sibling kernels, because the strided loop and
+/// the tree reduction are shared code and a fix applied to one of three is not
+/// a fix.
+#[test]
+fn rms_norm_siblings_handle_rows_wider_than_one_threadgroup() {
+    with_gpu(|rt| {
+        let (rows, dim, eps) = (2usize, 4096usize, 1e-6f32);
+        let x = random_f32(rows * dim, 0x9101);
+        let w = random_f32(dim, 0x9102);
+        let want = rms_norm_ref_f64(&x, &w, rows, dim, eps);
+        let xb = buf(rt, &x);
+        let wb = buf(rt, &w);
+
+        // bf16: same reduction, narrower store.
+        let ob = rt.alloc_buffer(rows * dim * 2).unwrap();
+        ob.zero();
+        nn::rms_norm_bf16(rt, &xb, &wb, &ob, rows as u32, dim as u32, eps).unwrap();
+        rt.synchronize().unwrap();
+        let got: Vec<f32> = ob.read_u32()[..rows * dim / 2]
+            .iter()
+            .flat_map(|p| {
+                [
+                    bf16_bits_to_f32((*p & 0xffff) as u16),
+                    bf16_bits_to_f32((*p >> 16) as u16),
+                ]
+            })
+            .collect();
+        for (i, (g, wv)) in got.iter().zip(&want).enumerate() {
+            let tol = 1e-2 * wv.abs().max(1e-3);
+            assert!(
+                (g - wv).abs() <= tol,
+                "rms_norm_bf16 wide [{i}]: {g} vs {wv}"
+            );
+        }
+
+        // residual_add with layer_scale = 1: resid += norm.
+        let resid = vec![0.0f32; rows * dim];
+        let rb = buf(rt, &resid);
+        nn::rms_norm_residual_add_f32(rt, &xb, &wb, &rb, rows as u32, dim as u32, eps, 1.0)
+            .unwrap();
+        rt.synchronize().unwrap();
+        let got = rb.read_f32();
+        for (i, (g, wv)) in got[..rows * dim].iter().zip(&want).enumerate() {
+            let tol = 1e-5 * wv.abs().max(1e-3);
+            assert!(
+                (g - wv).abs() <= tol,
+                "rms_norm_residual_add wide [{i}]: {g} vs {wv}"
+            );
+        }
+    });
+}
+
+/// f64 reference. Distinct from `rms_norm_ref` above, which accumulates in f32
+/// in the same order the old serial kernel did — a comparison that agreed with
+/// the kernel's rounding instead of measuring it.
+fn rms_norm_ref_f64(x: &[f32], weight: &[f32], rows: usize, dim: usize, eps: f32) -> Vec<f32> {
+    let mut out = vec![0.0f32; rows * dim];
+    for r in 0..rows {
+        let row = &x[r * dim..(r + 1) * dim];
+        let ss: f64 = row.iter().map(|v| (*v as f64) * (*v as f64)).sum();
+        let inv = 1.0 / (ss / dim as f64 + eps as f64).sqrt();
+        for d in 0..dim {
+            out[r * dim + d] = (row[d] as f64 * inv * weight[d] as f64) as f32;
+        }
+    }
+    out
+}
+
 // ------------------------------------------------------------ MLP gating ---
 
 #[test]

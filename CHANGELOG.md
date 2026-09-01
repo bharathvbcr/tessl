@@ -8,6 +8,28 @@ All notable changes to `tessl` are recorded here. The format follows
 
 ### Fixed
 
+- **RMSNorm ran one thread per row.** All three kernels (`rms_norm_f32`,
+  `rms_norm_bf16`, `rms_norm_residual_add_f32`) dispatched `rows` threads, each
+  walking its row serially twice, which capped parallelism at the row count and
+  ran the entire kernel on a single GPU thread at the decode shape. Now one
+  threadgroup per row with the sum of squares reduced as a tree, the pattern
+  `reduce.metal` already used. Measured on an M5 Pro: **16.7x at 1x4096**
+  (404.3 -> 24.2 us), 10.1x at 512x4096, 2.5x at 2048x4096, with effective
+  bandwidth going from 87 GB/s to 216-305 GB/s. RMSNorm runs twice per
+  transformer layer on every token. The reduction reassociates, so results
+  differ in the low bits from the previous serial sum.
+- **The RMSNorm tests could not see the bug they now cover.** Every existing
+  case used `dim` of 16 to 64 against a 1024-thread group, so each lane's
+  strided loop ran once and deleting the loop entirely left all three green.
+  Added `dim` of 4096, a ragged 3000, and 8192 across all three variants; both
+  new tests kill that mutation, as do removals of `REDUCE_TREE` and of `eps`.
+- **`build.rs` tracked only `.metal` for `rerun-if-changed`.** `REDUCE_TREE` now
+  lives in `kernels/reduce_tree.h`, shared by `reduce.metal` and
+  `rms_norm.metal`; without tracking headers an edit to the shared reduction
+  would leave both dependents stale in the metallib while the suite reported a
+  pass. Verified by mutating only the header and confirming a rebuild and five
+  failures.
+
 - **`docs/verification.md` documented a command that ran zero tests and
   reported `ok`.** It named a test `gemm_randomized_shape_fuzz` and two
   environment variables `GEMM_FUZZ_SEED` / `GEMM_FUZZ_CASES`; none of the three

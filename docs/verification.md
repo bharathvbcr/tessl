@@ -97,6 +97,25 @@ The checks are load-bearing rather than decorative. Compiling `nn` with the
 `require` capacity checks disabled does not produce a clean failure — the suite
 hangs the GPU past a 120-second timeout, against 0.06 s with them in place.
 
+## 5. Numeric coverage of the promoted kernels
+
+`promoted_kernels.rs` asserts each of the 44 promoted entry points resolves out
+of tessl's own metallib. That is a gate on the *move*, not on correctness: a
+kernel can resolve, dispatch, and return wrong numbers.
+
+It did. `gemv_q4_tiled` resolved, had adversarial coverage of its error paths,
+and wrote 4 rows of 512 because the host handed it the other Q4 kernel's grid.
+Giving every promoted kernel a numeric test found six defects in total — two
+grid mismatches, one undocumented weight layout, uninitialised threadgroup
+scratch across half of every attention query block, a NaN in the online softmax,
+and an output-width validation that made `out_bf16` unusable.
+
+All 44 now have one, in `nn_kernels.rs`, `reductions.rs`, `nn_wiring.rs`,
+`promoted_numeric.rs`, `attention.rs`, `qkv_rope.rs` and `q4_interleaved.rs`.
+Where a family is selected by an enum or a bool, every arm is exercised: the
+three Q4 MLX row variants share one reference, and both `Q4MlxLayout` packings
+are checked against each other as well as against the dense reference.
+
 ## Fault injection
 
 The suite is only worth its green tick if it can go red. Six faults injected
@@ -123,8 +142,9 @@ log.
 audit          PASS, 0 mismatches, fires on 3 injected faults
 fault tests    6 of 6 caught
 lib tests      89 (88 passing, 1 #[ignore]d deep soak)
-integration    110 across 14 files
-total          199 passing, including doc tests
+integration    139 across 18 files
+doc tests      1
+total          228 passing
 ```
 
 Measured with `cargo test --release -- --test-threads=1`, which is mandatory

@@ -35,7 +35,7 @@ The name is short for *tessellation* — the design centers around how matrix op
 
 | | |
 | --- | --- |
-| **Status** | [`0.1.3`](https://crates.io/crates/tessl) — Metal 4 / MPP TensorOps verified on M5 Pro |
+| **Status** | [`0.1.4`](https://crates.io/crates/tessl) — Metal 4 / MPP TensorOps verified on M5 Pro |
 | **API docs** | [docs.rs/tessl](https://docs.rs/tessl) — built on `aarch64-apple-darwin` with all features |
 | **Tests** | 228 passing, including doc tests (`cargo test --release -- --test-threads=1`) |
 | **Kernel coverage** | All 44 promoted kernels have a numeric test, not only a name check |

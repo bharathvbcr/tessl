@@ -6,6 +6,20 @@ All notable changes to `tessl` are recorded here. The format follows
 
 ## [Unreleased]
 
+## [0.1.4] — 2026-09-14
+
+Manifest metadata only. No code, API or behaviour change; the compiled crate is
+identical to 0.1.3.
+
+### Added
+
+- **`homepage` in `Cargo.toml`.** 0.1.3 put a website badge in the README, which
+  only reaches someone already reading the rendered README. crates.io shows a
+  Homepage link in the crate page sidebar when the manifest declares one, and
+  this crate declared none — so the showcase was missing from the one place a
+  reader scanning the page looks for it. `sparsl` gained the same field in the
+  same change.
+
 ## [0.1.3] — 2026-09-14
 
 Documentation and repository hygiene only. No kernel, API or behaviour change,

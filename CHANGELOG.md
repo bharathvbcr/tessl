@@ -6,6 +6,13 @@ All notable changes to `tessl` are recorded here. The format follows
 
 ## [Unreleased]
 
+## [0.1.3] — 2026-09-14
+
+Documentation and repository hygiene only. No kernel, API or behaviour change,
+so the compiled crate is identical to 0.1.2. It ships because the README is
+rendered on the crate page, and the links below are the reason to publish it
+there rather than only on GitHub.
+
 ### Added
 
 - **`documentation` in `Cargo.toml`, and the published docs linked from the
@@ -14,6 +21,10 @@ All notable changes to `tessl` are recorded here. The format follows
   reference. The README now carries crates.io, docs.rs, CI and license badges,
   a nav line to docs.rs and the three `docs/` deep dives, and an API reference
   row at the top of the Documentation table.
+- **The interactive benchmark showcase at
+  [tessl.vbcr.dev](https://tessl.vbcr.dev/) linked from the README**, as a badge
+  and as the first entry in the nav line. The measurements the README quotes in
+  prose are explorable there; nothing else pointed to it.
 
 ### Fixed
 

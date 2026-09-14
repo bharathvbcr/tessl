@@ -17,6 +17,7 @@
 The name is short for *tessellation* — the design centers around how matrix operations are partitioned into tile geometries and the order in which those tiles are traversed.
 
 <p align="center">
+  <a href="https://tessl.vbcr.dev/"><img src="https://img.shields.io/badge/website-tessl.vbcr.dev-F59E0B?style=flat&logo=safari&logoColor=white" alt="Website"></a>
   <a href="https://crates.io/crates/tessl"><img src="https://img.shields.io/crates/v/tessl.svg" alt="crates.io"></a>
   <a href="https://docs.rs/tessl"><img src="https://img.shields.io/docsrs/tessl" alt="docs.rs"></a>
   <a href="https://github.com/bharathvbcr/tessl/actions/workflows/ci.yml"><img src="https://github.com/bharathvbcr/tessl/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
@@ -24,6 +25,7 @@ The name is short for *tessellation* — the design centers around how matrix op
 </p>
 
 <p align="center">
+  <a href="https://tessl.vbcr.dev/"><strong>Live Interactive Benchmark Showcase (tessl.vbcr.dev)</strong></a> ·
   <a href="https://docs.rs/tessl"><strong>API documentation</strong></a> ·
   <a href="https://crates.io/crates/tessl"><strong>crates.io</strong></a> ·
   <a href="docs/architecture.md">Architecture</a> ·
@@ -33,7 +35,7 @@ The name is short for *tessellation* — the design centers around how matrix op
 
 | | |
 | --- | --- |
-| **Status** | [`0.1.2`](https://crates.io/crates/tessl) — Metal 4 / MPP TensorOps verified on M5 Pro |
+| **Status** | [`0.1.3`](https://crates.io/crates/tessl) — Metal 4 / MPP TensorOps verified on M5 Pro |
 | **API docs** | [docs.rs/tessl](https://docs.rs/tessl) — built on `aarch64-apple-darwin` with all features |
 | **Tests** | 228 passing, including doc tests (`cargo test --release -- --test-threads=1`) |
 | **Kernel coverage** | All 44 promoted kernels have a numeric test, not only a name check |

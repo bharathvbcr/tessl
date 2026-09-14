@@ -10,3 +10,7 @@ default.metallib
 
 .DS_Store
 __pycache__/
+
+# devmap's code-index cache. Regenerated on demand from the source tree, so it
+# is derived state, not repo state.
+.devmap/

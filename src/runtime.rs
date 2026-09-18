@@ -685,7 +685,7 @@ impl GpuRuntime {
     /// share an `MTLBuffer` (for example sparsl SpMV reading a tessl GEMM
     /// output) wait on this event after tessl work — queues are not merged.
     pub fn shared_event(&self) -> &ProtocolObject<dyn MTLSharedEvent> {
-        &*self.metal4.shared_event
+        &self.metal4.shared_event
     }
 
     /// Last timeline value this runtime has submitted a signal for (`0` if no

@@ -206,6 +206,7 @@ pub fn validate_attn_storage(
     validate_attn_storage_for(dims, d, q, k, v, o, "attention", out_bf16)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn validate_attn_storage_for(
     dims: &AttnDims,
     d: u32,
@@ -333,6 +334,10 @@ pub fn rms_norm_f32(
 }
 
 /// [`rms_norm_f32`] with caller-supplied scalar binds. See the module docs.
+/// # Safety
+/// Caller must uphold the same buffer aliasing and lifetime contracts as the
+/// safe wrapper: operands remain live for the encode, and `scalars` only
+/// writes binder entries the kernel reads.
 pub unsafe fn rms_norm_f32_with_scalars(
     rt: &Arc<GpuRuntime>,
     x: &GpuBuffer,
@@ -388,6 +393,10 @@ pub fn rms_norm_bf16(
 }
 
 /// [`rms_norm_bf16`] with caller-supplied scalar binds.
+/// # Safety
+/// Caller must uphold the same buffer aliasing and lifetime contracts as the
+/// safe wrapper: operands remain live for the encode, and `scalars` only
+/// writes binder entries the kernel reads.
 pub unsafe fn rms_norm_bf16_with_scalars(
     rt: &Arc<GpuRuntime>,
     x: &GpuBuffer,
@@ -451,6 +460,10 @@ pub fn rms_norm_residual_add_f32(
 }
 
 /// [`rms_norm_residual_add_f32`] with caller-supplied scalar binds.
+/// # Safety
+/// Caller must uphold the same buffer aliasing and lifetime contracts as the
+/// safe wrapper: operands remain live for the encode, and `scalars` only
+/// writes binder entries the kernel reads.
 pub unsafe fn rms_norm_residual_add_f32_with_scalars(
     rt: &Arc<GpuRuntime>,
     x: &GpuBuffer,
@@ -498,6 +511,10 @@ pub fn mlp_silu(
 }
 
 /// [`mlp_silu`] with caller-supplied scalar binds.
+/// # Safety
+/// Caller must uphold the same buffer aliasing and lifetime contracts as the
+/// safe wrapper: operands remain live for the encode, and `scalars` only
+/// writes binder entries the kernel reads.
 pub unsafe fn mlp_silu_with_scalars(
     rt: &Arc<GpuRuntime>,
     gate: &GpuBuffer,
@@ -537,6 +554,10 @@ pub fn mlp_gelu_tanh(
 }
 
 /// [`mlp_gelu_tanh`] with caller-supplied scalar binds.
+/// # Safety
+/// Caller must uphold the same buffer aliasing and lifetime contracts as the
+/// safe wrapper: operands remain live for the encode, and `scalars` only
+/// writes binder entries the kernel reads.
 pub unsafe fn mlp_gelu_tanh_with_scalars(
     rt: &Arc<GpuRuntime>,
     gate: &GpuBuffer,
@@ -572,6 +593,10 @@ pub fn mlp_gelu_tanh_bf16(
 }
 
 /// [`mlp_gelu_tanh_bf16`] with caller-supplied scalar binds.
+/// # Safety
+/// Caller must uphold the same buffer aliasing and lifetime contracts as the
+/// safe wrapper: operands remain live for the encode, and `scalars` only
+/// writes binder entries the kernel reads.
 pub unsafe fn mlp_gelu_tanh_bf16_with_scalars(
     rt: &Arc<GpuRuntime>,
     gate: &GpuBuffer,
@@ -621,6 +646,10 @@ pub fn scale_f32_inplace(
 }
 
 /// [`scale_f32_inplace`] with caller-supplied scalar binds.
+/// # Safety
+/// Caller must uphold the same buffer aliasing and lifetime contracts as the
+/// safe wrapper: operands remain live for the encode, and `scalars` only
+/// writes binder entries the kernel reads.
 pub unsafe fn scale_f32_inplace_with_scalars(
     rt: &Arc<GpuRuntime>,
     x: &GpuBuffer,
@@ -678,6 +707,10 @@ pub fn gemv_q8(
 }
 
 /// [`gemv_q8`] with caller-supplied scalar binds.
+/// # Safety
+/// Caller must uphold the same buffer aliasing and lifetime contracts as the
+/// safe wrapper: operands remain live for the encode, and `scalars` only
+/// writes binder entries the kernel reads.
 #[allow(clippy::too_many_arguments)]
 pub unsafe fn gemv_q8_with_scalars(
     rt: &Arc<GpuRuntime>,
@@ -964,6 +997,10 @@ pub fn kv_ring_densify(
 }
 
 /// [`kv_ring_densify`] with caller-supplied scalar binds.
+/// # Safety
+/// Caller must uphold the same buffer aliasing and lifetime contracts as the
+/// safe wrapper: operands remain live for the encode, and `scalars` only
+/// writes binder entries the kernel reads.
 #[allow(clippy::too_many_arguments)]
 pub unsafe fn kv_ring_densify_with_scalars(
     rt: &Arc<GpuRuntime>,
@@ -2764,6 +2801,10 @@ pub fn softcap_logits(
 }
 
 /// [`softcap_logits`] with caller-supplied scalar binds.
+/// # Safety
+/// Caller must uphold the same buffer aliasing and lifetime contracts as the
+/// safe wrapper: operands remain live for the encode, and `scalars` only
+/// writes binder entries the kernel reads.
 pub unsafe fn softcap_logits_with_scalars(
     rt: &Arc<GpuRuntime>,
     logits: &GpuBuffer,
@@ -2828,6 +2869,10 @@ pub fn argmax_pass_groups(n: u32) -> usize {
 const ARGMAX_TG: usize = 256;
 
 /// [`argmax_f32_pass`] with caller-supplied scalar binds.
+/// # Safety
+/// Caller must uphold the same buffer aliasing and lifetime contracts as the
+/// safe wrapper: operands remain live for the encode, and `scalars` only
+/// writes binder entries the kernel reads.
 #[allow(clippy::too_many_arguments)]
 pub unsafe fn argmax_f32_pass_with_scalars(
     rt: &Arc<GpuRuntime>,
@@ -2909,6 +2954,10 @@ pub fn softcap_sample(
 }
 
 /// [`softcap_sample`] with caller-supplied scalar binds.
+/// # Safety
+/// Caller must uphold the same buffer aliasing and lifetime contracts as the
+/// safe wrapper: operands remain live for the encode, and `scalars` only
+/// writes binder entries the kernel reads.
 pub unsafe fn softcap_sample_with_scalars(
     rt: &Arc<GpuRuntime>,
     logits: &GpuBuffer,
@@ -2969,6 +3018,10 @@ pub fn softcap_argmax_one_pass(
 }
 
 /// [`softcap_argmax_one_pass`] with caller-supplied scalar binds.
+/// # Safety
+/// Caller must uphold the same buffer aliasing and lifetime contracts as the
+/// safe wrapper: operands remain live for the encode, and `scalars` only
+/// writes binder entries the kernel reads.
 pub unsafe fn softcap_argmax_one_pass_with_scalars(
     rt: &Arc<GpuRuntime>,
     logits: &GpuBuffer,
@@ -3166,6 +3219,10 @@ pub fn gemv_q4(
 }
 
 /// [`gemv_q4`] with caller-supplied scalar binds.
+/// # Safety
+/// Caller must uphold the same buffer aliasing and lifetime contracts as the
+/// safe wrapper: operands remain live for the encode, and `scalars` only
+/// writes binder entries the kernel reads.
 pub unsafe fn gemv_q4_with_scalars(
     rt: &Arc<GpuRuntime>,
     bank: Q4Bank<'_>,
@@ -3268,6 +3325,10 @@ pub fn embed_lookup_q4(
 }
 
 /// [`embed_lookup_q4`] with caller-supplied scalar binds.
+/// # Safety
+/// Caller must uphold the same buffer aliasing and lifetime contracts as the
+/// safe wrapper: operands remain live for the encode, and `scalars` only
+/// writes binder entries the kernel reads.
 #[allow(clippy::too_many_arguments)]
 pub unsafe fn embed_lookup_q4_with_scalars(
     rt: &Arc<GpuRuntime>,
@@ -3352,6 +3413,10 @@ pub fn embed_lookup_q4_mlx(
 }
 
 /// [`embed_lookup_q4_mlx`] with caller-supplied scalar binds.
+/// # Safety
+/// Caller must uphold the same buffer aliasing and lifetime contracts as the
+/// safe wrapper: operands remain live for the encode, and `scalars` only
+/// writes binder entries the kernel reads.
 #[allow(clippy::too_many_arguments)]
 pub unsafe fn embed_lookup_q4_mlx_with_scalars(
     rt: &Arc<GpuRuntime>,
@@ -3478,6 +3543,10 @@ pub fn gemv_q4_mlx(
 }
 
 /// [`gemv_q4_mlx`] with caller-supplied scalar binds.
+/// # Safety
+/// Caller must uphold the same buffer aliasing and lifetime contracts as the
+/// safe wrapper: operands remain live for the encode, and `scalars` only
+/// writes binder entries the kernel reads.
 pub unsafe fn gemv_q4_mlx_with_scalars(
     rt: &Arc<GpuRuntime>,
     bank: Q4MlxBank<'_>,
@@ -3606,6 +3675,10 @@ pub fn gemv_q4_mlx_blocked(
 }
 
 /// [`gemv_q4_mlx_blocked`] with caller-supplied scalar binds.
+/// # Safety
+/// Caller must uphold the same buffer aliasing and lifetime contracts as the
+/// safe wrapper: operands remain live for the encode, and `scalars` only
+/// writes binder entries the kernel reads.
 pub unsafe fn gemv_q4_mlx_blocked_with_scalars(
     rt: &Arc<GpuRuntime>,
     bank: Q4MlxBank<'_>,
@@ -3679,6 +3752,10 @@ pub fn gemv_q4_mlx_simd(
 }
 
 /// [`gemv_q4_mlx_simd`] with caller-supplied scalar binds.
+/// # Safety
+/// Caller must uphold the same buffer aliasing and lifetime contracts as the
+/// safe wrapper: operands remain live for the encode, and `scalars` only
+/// writes binder entries the kernel reads.
 #[allow(clippy::too_many_arguments)]
 pub unsafe fn gemv_q4_mlx_simd_with_scalars(
     rt: &Arc<GpuRuntime>,
@@ -3781,6 +3858,10 @@ pub fn gemv_q4_mlx_gate_up_gelu(
 }
 
 /// [`gemv_q4_mlx_gate_up_gelu`] with caller-supplied scalar binds.
+/// # Safety
+/// Caller must uphold the same buffer aliasing and lifetime contracts as the
+/// safe wrapper: operands remain live for the encode, and `scalars` only
+/// writes binder entries the kernel reads.
 #[allow(clippy::too_many_arguments)]
 pub unsafe fn gemv_q4_mlx_gate_up_gelu_with_scalars(
     rt: &Arc<GpuRuntime>,
@@ -3886,6 +3967,10 @@ pub fn gemv_q4_mlx_kv(
 }
 
 /// [`gemv_q4_mlx_kv`] with caller-supplied scalar binds.
+/// # Safety
+/// Caller must uphold the same buffer aliasing and lifetime contracts as the
+/// safe wrapper: operands remain live for the encode, and `scalars` only
+/// writes binder entries the kernel reads.
 #[allow(clippy::too_many_arguments)]
 pub unsafe fn gemv_q4_mlx_kv_with_scalars(
     rt: &Arc<GpuRuntime>,
@@ -3999,6 +4084,10 @@ pub struct QkvOutputs<'a> {
 }
 
 /// [`gemv_q4_mlx_qkv`] with caller-supplied scalar binds.
+/// # Safety
+/// Caller must uphold the same buffer aliasing and lifetime contracts as the
+/// safe wrapper: operands remain live for the encode, and `scalars` only
+/// writes binder entries the kernel reads.
 #[allow(clippy::too_many_arguments)]
 pub unsafe fn gemv_q4_mlx_qkv_with_scalars(
     rt: &Arc<GpuRuntime>,
@@ -4137,6 +4226,10 @@ pub fn gemm_q4_mlx(
 }
 
 /// [`gemm_q4_mlx`] with caller-supplied scalar binds.
+/// # Safety
+/// Caller must uphold the same buffer aliasing and lifetime contracts as the
+/// safe wrapper: operands remain live for the encode, and `scalars` only
+/// writes binder entries the kernel reads.
 #[allow(clippy::too_many_arguments)]
 pub unsafe fn gemm_q4_mlx_with_scalars(
     rt: &Arc<GpuRuntime>,

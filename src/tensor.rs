@@ -474,7 +474,7 @@ impl Tensor {
         if buffer.device().registryID() != runtime.device.registryID() {
             return Err("MTLBuffer device registryID does not match GpuRuntime device".into());
         }
-        let nbytes = buffer.length() as usize;
+        let nbytes = buffer.length();
         let weak = runtime.weak_self();
         runtime.register_residency(&buffer);
         #[allow(clippy::arc_with_non_send_sync)]

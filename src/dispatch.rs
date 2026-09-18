@@ -93,6 +93,7 @@ impl<'a> Binder<'a> {
         self.const_staging.gpuAddress() + start as u64
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         enc: &'a ProtocolObject<dyn MTL4ComputeCommandEncoder>,
         table: &'a ProtocolObject<dyn MTL4ArgumentTable>,

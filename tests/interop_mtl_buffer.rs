@@ -73,7 +73,9 @@ fn from_mtl_buffer_rejects_foreign_device_when_available() {
         if devices.count() < 2 {
             return;
         }
-        let Some(foreign) = devices.iter().find(|d| d.registryID() != rt.device.registryID())
+        let Some(foreign) = devices
+            .iter()
+            .find(|d| d.registryID() != rt.device.registryID())
         else {
             return;
         };

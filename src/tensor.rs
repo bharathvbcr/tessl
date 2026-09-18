@@ -472,9 +472,7 @@ impl Tensor {
         byte_offset: usize,
     ) -> Result<Tensor, String> {
         if buffer.device().registryID() != runtime.device.registryID() {
-            return Err(
-                "MTLBuffer device registryID does not match GpuRuntime device".into(),
-            );
+            return Err("MTLBuffer device registryID does not match GpuRuntime device".into());
         }
         let nbytes = buffer.length() as usize;
         let weak = runtime.weak_self();
@@ -771,10 +769,7 @@ mod contract_tests {
         let err = t
             .try_view(&[1], usize::MAX / 4 + 1)
             .expect_err("overflowing view must Err");
-        assert!(
-            err.contains("overflow") || err.contains("bounds"),
-            "{err}"
-        );
+        assert!(err.contains("overflow") || err.contains("bounds"), "{err}");
         let ok = t.try_view(&[2], 1).expect("in-bounds view");
         assert_eq!(ok.shape, vec![2]);
         assert_eq!(ok.byte_offset, 4);

@@ -678,10 +678,7 @@ impl GpuRuntime {
     }
 
     pub(crate) fn weak_self(&self) -> Weak<GpuRuntime> {
-        self.self_weak
-            .lock()
-            .map(|g| g.clone())
-            .unwrap_or_default()
+        self.self_weak.lock().map(|g| g.clone()).unwrap_or_default()
     }
 
     /// SharedEvent signaled on every Metal 4 commit. Cross-crate callers that
@@ -746,10 +743,7 @@ impl GpuRuntime {
     ///
     /// Hot storage never enters the freelist, but must leave the residency set
     /// when its final handle drops.
-    pub(crate) fn schedule_hot_retirement(
-        &self,
-        buffer: Retained<ProtocolObject<dyn MTLBuffer>>,
-    ) {
+    pub(crate) fn schedule_hot_retirement(&self, buffer: Retained<ProtocolObject<dyn MTLBuffer>>) {
         if let Ok(mut q) = self.pending_retirement.lock() {
             q.push(buffer);
         }
@@ -2237,4 +2231,3 @@ mod drop_wait_tests {
         assert_eq!(max_event_value([u64::MAX, 1].into_iter()), u64::MAX);
     }
 }
-

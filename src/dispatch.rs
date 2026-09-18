@@ -9,8 +9,8 @@ use objc2::runtime::ProtocolObject;
 use objc2_foundation::NSRange;
 use objc2_metal::{
     MTL4ArgumentTable, MTL4CommandEncoder, MTL4ComputeCommandEncoder, MTL4VisibilityOptions,
-    MTLAllocation, MTLBuffer, MTLComputePipelineState, MTLResidencySet, MTLIndirectCommandBuffer, MTLResourceID,
-    MTLSize, MTLStages,
+    MTLAllocation, MTLBuffer, MTLComputePipelineState, MTLIndirectCommandBuffer, MTLResidencySet,
+    MTLResourceID, MTLSize, MTLStages,
 };
 
 use crate::runtime::{mtl_size, GpuRuntime};
@@ -196,7 +196,12 @@ impl<'a> Binder<'a> {
         }
     }
 
-    pub(crate) fn bind_buf(&mut self, buf: &ProtocolObject<dyn MTLBuffer>, offset: usize, index: usize) {
+    pub(crate) fn bind_buf(
+        &mut self,
+        buf: &ProtocolObject<dyn MTLBuffer>,
+        offset: usize,
+        index: usize,
+    ) {
         if !self.valid_index(index) {
             return;
         }

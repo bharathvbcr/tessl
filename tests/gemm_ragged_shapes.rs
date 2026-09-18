@@ -227,8 +227,7 @@ fn output_views_at_a_byte_offset_stay_inside_their_window() {
             0.0,
         );
         assert!(
-            all[..off].iter().all(|&x| x == 0.0)
-                && all[off + m * n..].iter().all(|&x| x == 0.0),
+            all[..off].iter().all(|&x| x == 0.0) && all[off + m * n..].iter().all(|&x| x == 0.0),
             "GEMM wrote outside the destination view's window"
         );
     });

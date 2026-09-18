@@ -1098,12 +1098,9 @@ fn flash_attn_refuses_output_aliased_with_live_scalars() {
             scale: 0.125,
         };
         let scalar = u32_buf(rt, 0);
-        assert!(
-            nn::validate_attn_output_scalar_aliases(&dims, &o, &[("tkv", &scalar)]).is_ok()
-        );
-        let alias_err =
-            nn::validate_attn_output_scalar_aliases(&dims, &o, &[("tkv", &o)])
-                .expect_err("aliased output/scalar must be refused");
+        assert!(nn::validate_attn_output_scalar_aliases(&dims, &o, &[("tkv", &scalar)]).is_ok());
+        let alias_err = nn::validate_attn_output_scalar_aliases(&dims, &o, &[("tkv", &o)])
+            .expect_err("aliased output/scalar must be refused");
         assert!(
             alias_err.contains("output must not alias live"),
             "{alias_err}"

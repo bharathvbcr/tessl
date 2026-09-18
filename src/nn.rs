@@ -717,7 +717,12 @@ pub unsafe fn gemv_q8_with_scalars(
     require_disjoint_writes(
         "gemv_q8",
         &[("y", y)],
-        &[("packed", packed), ("scales", scales), ("zeros", zeros), ("x", x)],
+        &[
+            ("packed", packed),
+            ("scales", scales),
+            ("zeros", zeros),
+            ("x", x),
+        ],
     )?;
     let p = rt.pipeline("gemv_q8")?;
     // One simdgroup per `SIMD_ROWS` output rows with lanes striding K, the same
@@ -2849,7 +2854,11 @@ pub unsafe fn argmax_f32_pass_with_scalars(
         Some(indices) => require_disjoint_writes(
             "argmax_f32_pass",
             &[("out_idx", out_idx), ("out_val", out_val)],
-            &[("logits", logits), ("idx_in", indices), ("softcap", softcap)],
+            &[
+                ("logits", logits),
+                ("idx_in", indices),
+                ("softcap", softcap),
+            ],
         )?,
         None => require_disjoint_writes(
             "argmax_f32_pass",
@@ -2894,7 +2903,9 @@ pub fn softcap_sample(
     softcap: &GpuBuffer,
     n: u32,
 ) -> Result<(), String> {
-    unsafe { softcap_sample_with_scalars(rt, logits, out_token, softcap, n, |bnd| set_u32(bnd, n, 3)) }
+    unsafe {
+        softcap_sample_with_scalars(rt, logits, out_token, softcap, n, |bnd| set_u32(bnd, n, 3))
+    }
 }
 
 /// [`softcap_sample`] with caller-supplied scalar binds.
@@ -3062,7 +3073,12 @@ impl Q4Bank<'_> {
         }
         let groups = shape.groups()?;
         let weights = elems(shape.rows, shape.cols, what)?;
-        require::<u8>(rt, self.packed, weights.div_ceil(2), &format!("{what} packed"))?;
+        require::<u8>(
+            rt,
+            self.packed,
+            weights.div_ceil(2),
+            &format!("{what} packed"),
+        )?;
         require::<f32>(rt, self.scales, groups, &format!("{what} scales"))?;
         require::<f32>(rt, self.zeros, groups, &format!("{what} zeros"))?;
         Ok(())
@@ -3102,7 +3118,12 @@ impl Q4MlxBank<'_> {
         }
         let groups = shape.groups()?;
         let weights = elems(shape.rows, shape.cols, what)?;
-        require::<u8>(rt, self.packed, weights.div_ceil(2), &format!("{what} packed"))?;
+        require::<u8>(
+            rt,
+            self.packed,
+            weights.div_ceil(2),
+            &format!("{what} packed"),
+        )?;
         // One bfloat2 = two u16 = 4 bytes per group.
         require::<u32>(
             rt,
@@ -3266,13 +3287,23 @@ pub unsafe fn embed_lookup_q4_with_scalars(
     };
     bank.validate(rt, &shape, "embed_lookup_q4")?;
     let total = elems(n_tokens, hidden, "embed_lookup_q4")?;
-    require::<u32>(rt, token_ids, n_tokens as usize, "embed_lookup_q4 token_ids")?;
+    require::<u32>(
+        rt,
+        token_ids,
+        n_tokens as usize,
+        "embed_lookup_q4 token_ids",
+    )?;
     require::<f32>(rt, out, total, "embed_lookup_q4 out")?;
 
     require_disjoint_writes(
         "embed_lookup_q4",
         &[("out", out)],
-        &[("packed", bank.packed), ("scales", bank.scales), ("zeros", bank.zeros), ("token_ids", token_ids)],
+        &[
+            ("packed", bank.packed),
+            ("scales", bank.scales),
+            ("zeros", bank.zeros),
+            ("token_ids", token_ids),
+        ],
     )?;
     let p = rt.pipeline("embed_lookup_q4")?;
     dispatch_1d(rt, &p, total, |bnd| {
@@ -3340,7 +3371,8 @@ pub unsafe fn embed_lookup_q4_mlx_with_scalars(
     };
     bank.validate(rt, &shape, "embed_lookup_q4_mlx")?;
     let total = elems(n_tokens, hidden, "embed_lookup_q4_mlx")?;
-    require::<u32>(rt, 
+    require::<u32>(
+        rt,
         token_ids,
         n_tokens as usize,
         "embed_lookup_q4_mlx token_ids",
@@ -3350,7 +3382,11 @@ pub unsafe fn embed_lookup_q4_mlx_with_scalars(
     require_disjoint_writes(
         "embed_lookup_q4_mlx",
         &[("out", out)],
-        &[("packed", bank.packed), ("scales_biases", bank.scales_biases), ("token_ids", token_ids)],
+        &[
+            ("packed", bank.packed),
+            ("scales_biases", bank.scales_biases),
+            ("token_ids", token_ids),
+        ],
     )?;
     let p = rt.pipeline("embed_lookup_q4_mlx")?;
     dispatch_1d(rt, &p, total, |bnd| {
@@ -3462,7 +3498,11 @@ pub unsafe fn gemv_q4_mlx_with_scalars(
     require_disjoint_writes(
         "gemv_q4_mlx",
         &[("y", y)],
-        &[("packed", bank.packed), ("scales_biases", bank.scales_biases), ("x", x)],
+        &[
+            ("packed", bank.packed),
+            ("scales_biases", bank.scales_biases),
+            ("x", x),
+        ],
     )?;
     let p = rt.pipeline(entry)?;
     // `Tiled` takes a different grid from `Standard` and `Wide`, and until
@@ -3584,7 +3624,11 @@ pub unsafe fn gemv_q4_mlx_blocked_with_scalars(
     require_disjoint_writes(
         "gemv_q4_mlx_blocked",
         &[("y", y)],
-        &[("packed", bank.packed), ("scales_biases", bank.scales_biases), ("x", x)],
+        &[
+            ("packed", bank.packed),
+            ("scales_biases", bank.scales_biases),
+            ("x", x),
+        ],
     )?;
     let p = rt.pipeline("gemv_q4_mlx_blocked")?;
     let groups = (shape.rows as usize).div_ceil(GEMV_BN);
@@ -3665,7 +3709,11 @@ pub unsafe fn gemv_q4_mlx_simd_with_scalars(
     require_disjoint_writes(
         "gemv_q4_mlx_simd",
         &[("y", y)],
-        &[("packed", bank.packed), ("scales_biases", bank.scales_biases), ("x_bf16", x_bf16)],
+        &[
+            ("packed", bank.packed),
+            ("scales_biases", bank.scales_biases),
+            ("x_bf16", x_bf16),
+        ],
     )?;
     let p = rt.pipeline(entry)?;
     let groups = simd_gemv_threadgroups(shape.rows);
@@ -3761,8 +3809,12 @@ pub unsafe fn gemv_q4_mlx_gate_up_gelu_with_scalars(
     gate.validate(rt, &shape, &format!("{entry} gate"))?;
     up.validate(rt, &shape, &format!("{entry} up"))?;
     match dispatch {
-        GateUpDispatch::Simd(_) => require::<u16>(rt, x, shape.cols as usize, &format!("{entry} x"))?,
-        GateUpDispatch::Blocked => require::<f32>(rt, x, shape.cols as usize, &format!("{entry} x"))?,
+        GateUpDispatch::Simd(_) => {
+            require::<u16>(rt, x, shape.cols as usize, &format!("{entry} x"))?
+        }
+        GateUpDispatch::Blocked => {
+            require::<f32>(rt, x, shape.cols as usize, &format!("{entry} x"))?
+        }
     }
     if mid_as_bf16 {
         require::<u16>(rt, mid, shape.rows as usize, &format!("{entry} mid (bf16)"))?;
@@ -4115,7 +4167,8 @@ pub unsafe fn gemm_q4_mlx_with_scalars(
     }
     bank.validate(rt, &shape, entry)?;
     let out_elems = elems(m, shape.rows, entry)?;
-    require::<u16>(rt, 
+    require::<u16>(
+        rt,
         x_bf16,
         elems(m, shape.cols, entry)?,
         &format!("{entry} x_bf16"),
@@ -4131,7 +4184,11 @@ pub unsafe fn gemm_q4_mlx_with_scalars(
     require_disjoint_writes(
         "gemm_q4_mlx",
         &[("y", y)],
-        &[("packed", bank.packed), ("scales_biases", bank.scales_biases), ("x_bf16", x_bf16)],
+        &[
+            ("packed", bank.packed),
+            ("scales_biases", bank.scales_biases),
+            ("x_bf16", x_bf16),
+        ],
     )?;
     let p = rt.pipeline(entry)?;
     let groups = simd_gemv_threadgroups(shape.rows);
@@ -4222,7 +4279,8 @@ fn row_reduce(
         return Err(format!("{entry}: cols must be non-zero"));
     }
     require::<f32>(rt, x, elems(rows, cols, entry)?, &format!("{entry} x"))?;
-    require::<f32>(rt, 
+    require::<f32>(
+        rt,
         out,
         elems(rows, out_per_row, entry)?,
         &format!("{entry} out"),
@@ -4303,11 +4361,7 @@ pub fn gemm_i8_dequant(
             &[("c", c)],
             &[("a", a), ("b", b), ("b_scale", sc)],
         )?,
-        None => require_disjoint_writes(
-            "gemm_i8_dequant",
-            &[("c", c)],
-            &[("a", a), ("b", b)],
-        )?,
+        None => require_disjoint_writes("gemm_i8_dequant", &[("c", c)], &[("a", a), ("b", b)])?,
     }
     let p = rt.pipeline("matmul2d_tensorops_i8_f32")?;
     // Geometry must match the I8_DEQUANT_KERNEL instantiation.

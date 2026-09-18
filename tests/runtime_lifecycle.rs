@@ -224,10 +224,7 @@ fn bump_arena_hands_out_zeroed_slices_and_reports_exhaustion() {
         // Resetting with views still outstanding must move to a fresh slab
         // rather than alias them; the previously handed-out windows keep their
         // contents.
-        let marks: Vec<f32> = views
-            .iter()
-            .map(|t| t.read_f32().unwrap()[0])
-            .collect();
+        let marks: Vec<f32> = views.iter().map(|t| t.read_f32().unwrap()[0]).collect();
         rt.bump_reset().unwrap();
         let after_reset = rt.bump_alloc_f32(&[512]).unwrap();
         after_reset

@@ -101,13 +101,13 @@ pub struct DecodeIcbCommand {
     pub owned_immediates: Vec<GpuBuffer>,
     /// Insert a Dispatch→Dispatch Device barrier after this cmd on replay.
     ///
-    /// Captured from live always-on auto-barriers and explicit [`crate::dispatch::Binder::barrier`]
-    /// calls. Replay must honor these instead of forcing always-on for every cmd
+    /// Captured from live always-on auto-barriers and explicit binder barriers
+    /// (`Binder::barrier`). Replay must honor these instead of forcing always-on for every cmd
     /// (product tok/s regression under shipping hazard skip-auto — D16).
     pub barrier_after: bool,
     /// Binds that reached the encoder but could NOT be recorded on the tape.
     ///
-    /// [`crate::dispatch::Binder::bind_buf`] and `bind_resource_id` take a raw
+    /// `Binder::bind_buf` and `bind_resource_id` take a raw
     /// `MTLBuffer` / `MTLResourceID` with no owning `GpuBuffer`, so there is
     /// nothing for [`DecodeIcbBind::Buf`] to hold — and holding it is what pins
     /// the operand's `Arc`. Every GEMM binds A, B and C through `bind_buf`, so

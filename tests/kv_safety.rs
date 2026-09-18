@@ -508,13 +508,15 @@ fn rope_position_addition_does_not_wrap_at_u32_max() {
 /// Lock the three capacity ABI slots, wide shader arithmetic, and both Rust
 /// binders together. This is allocation-free coverage for extents too large to
 /// materialize in a test process.
+///
+/// The Gemma adapter checks run only when the sibling `MLSystemsLab` tree is
+/// present (local monorepo). Published crates.io / GitHub Actions checkouts of
+/// tessl alone must not fail on those paths.
 #[test]
 fn kv_shader_and_host_capacity_abis_are_locked() {
     let kv = include_str!("../kernels/kv_store.metal");
     let qkv = include_str!("../kernels/rms_qkv_rope.metal");
     let host = include_str!("../src/nn.rs");
-    let gemma = include_str!("../../MLSystemsLab/Rust_MLKit/gemma-metal/src/kernels.rs");
-    let model = include_str!("../../MLSystemsLab/Rust_MLKit/gemma-metal/src/gpu_model.rs");
 
     assert!(kv.contains("constant uint &dst_capacity [[buffer(4)]]"));
     assert!(kv.contains("constant uint &dst_capacity [[buffer(6)]]"));
@@ -558,6 +560,18 @@ fn kv_shader_and_host_capacity_abis_are_locked() {
             < fused_host.find("let p = rt.pipeline").unwrap(),
         "the canonical QKV preflight must run before pipeline lookup and scalar callback"
     );
+
+    let gemma_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../MLSystemsLab/Rust_MLKit/gemma-metal/src/kernels.rs");
+    let model_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../MLSystemsLab/Rust_MLKit/gemma-metal/src/gpu_model.rs");
+    let (Ok(gemma), Ok(model)) = (
+        std::fs::read_to_string(&gemma_path),
+        std::fs::read_to_string(&model_path),
+    ) else {
+        // Sibling tree absent on crates.io package verify and GitHub Actions.
+        return;
+    };
 
     assert!(gemma.contains("bind_u32(bnd, capacity_off, 4)"));
     assert!(gemma.contains("bind_u32(bnd, capacity_off, 6)"));

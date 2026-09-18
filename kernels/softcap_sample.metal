@@ -1,6 +1,7 @@
 // Logit softcap (default 30) + greedy argmax.
 // softcap: y = softcap * tanh(x / softcap)
 #include <metal_stdlib>
+#include "softcap.h"
 using namespace metal;
 
 /// In-place softcap over logits[0..n).
@@ -13,14 +14,16 @@ kernel void softcap_logits(
 {
     const float softcap = *softcap_ptr;
     if (gid >= n) return;
-    float z = logits[gid] / softcap;
-    logits[gid] = softcap * tanh(z);
+    logits[gid] = tessl_apply_softcap(logits[gid], softcap);
 }
 
 /// Hierarchical argmax: one threadgroup reduces a slice, writes (max, idx) pairs.
 /// When `has_idx_in != 0`, `idx_in[i]` carries the original vocab index through
 /// subsequent reduce passes (no host remap).
-/// When `softcap > 0`, apply softcap to logits[i] before compare (fused first pass).
+/// When `softcap > 0` and this is the first pass (`has_idx_in == 0`), apply
+/// softcap to logits[i] before compare. Later passes reduce partial maxima that
+/// are already capped, and tanh is not idempotent: capping again would shrink
+/// every value the first pass produced.
 /// `softcap` from stable device f32 (ICB freeze).
 kernel void argmax_f32(
     device const float *logits [[buffer(0)]],
@@ -44,9 +47,8 @@ kernel void argmax_f32(
     uint idx = 0u;
     if (i < n) {
         v = logits[i];
-        if (softcap > 0.0f) {
-            float z = v / softcap;
-            v = softcap * tanh(z);
+        if (has_idx_in == 0u && softcap > 0.0f) {
+            v = tessl_apply_softcap(v, softcap);
         }
         idx = (has_idx_in != 0u) ? idx_in[i] : i;
     }
@@ -87,8 +89,7 @@ kernel void softcap_sample(
     const float softcap = *softcap_ptr;
 
     if (lid < n) {
-        float z = logits[lid] / softcap;
-        float sc = softcap * tanh(z);
+        float sc = tessl_apply_softcap(logits[lid], softcap);
         logits[lid] = sc;
         tg_val[lid] = sc;
         tg_idx[lid] = lid;
@@ -132,15 +133,14 @@ kernel void softcap_argmax_one_pass(
 
     float best = -INFINITY;
     uint best_i = 0u;
-    for (uint i = lid; i < n; i += tptg) {
+    for (ulong i = lid; i < (ulong)n; i += tptg) {
         float v = logits[i];
         if (softcap > 0.0f) {
-            float z = v / softcap;
-            v = softcap * tanh(z);
+            v = tessl_apply_softcap(v, softcap);
         }
-        if (v > best || (v == best && i < best_i)) {
+        if (v > best || (v == best && i < (ulong)best_i)) {
             best = v;
-            best_i = i;
+            best_i = (uint)i;
         }
     }
     tg_val[lid] = best;

@@ -9,8 +9,8 @@ use objc2::runtime::ProtocolObject;
 use objc2_foundation::NSRange;
 use objc2_metal::{
     MTL4ArgumentTable, MTL4CommandEncoder, MTL4ComputeCommandEncoder, MTL4VisibilityOptions,
-    MTLBuffer, MTLComputePipelineState, MTLIndirectCommandBuffer, MTLResourceID, MTLSize,
-    MTLStages,
+    MTLAllocation, MTLBuffer, MTLComputePipelineState, MTLResidencySet, MTLIndirectCommandBuffer, MTLResourceID,
+    MTLSize, MTLStages,
 };
 
 use crate::runtime::{mtl_size, GpuRuntime};
@@ -37,6 +37,13 @@ pub struct Binder<'a> {
     /// at construction keeps every dispatch and explicit-barrier decision in one
     /// scope consistent even if another thread changes the flag mid-encode.
     skip_auto_barriers: bool,
+    /// An unbarriered dispatch sits behind the encoder's current point — from
+    /// an earlier scope on the same encoder, or from this one in hazard mode.
+    /// The next dispatch emits a barrier first and an explicit [`Self::barrier`]
+    /// clears it, so cross-scope producer→consumer edges are ordered without
+    /// every caller knowing the graph. The runtime carries the flag from one
+    /// scope to the next.
+    hazard_pending: bool,
 }
 
 impl<'a> Binder<'a> {
@@ -92,6 +99,7 @@ impl<'a> Binder<'a> {
         const_staging: &'a ProtocolObject<dyn MTLBuffer>,
         const_cursor: &'a mut usize,
         skip_auto_barriers: bool,
+        hazard_pending: bool,
         max_buffers: usize,
         runtime: &'a GpuRuntime,
     ) -> Self {
@@ -108,6 +116,7 @@ impl<'a> Binder<'a> {
             arg_table_latched: false,
             last_arg_table_ptr: None,
             skip_auto_barriers,
+            hazard_pending,
         }
     }
 
@@ -118,6 +127,12 @@ impl<'a> Binder<'a> {
     #[inline]
     pub fn needs_explicit_barriers(&self) -> bool {
         self.skip_auto_barriers
+    }
+
+    /// Whether an unbarriered producer still sits on this encoder.
+    #[inline]
+    pub(crate) fn hazard_pending(&self) -> bool {
+        self.hazard_pending
     }
 
     /// Latch the persistent argument table onto the encoder (idempotent).
@@ -181,7 +196,7 @@ impl<'a> Binder<'a> {
         }
     }
 
-    pub fn bind_buf(&mut self, buf: &ProtocolObject<dyn MTLBuffer>, offset: usize, index: usize) {
+    pub(crate) fn bind_buf(&mut self, buf: &ProtocolObject<dyn MTLBuffer>, offset: usize, index: usize) {
         if !self.valid_index(index) {
             return;
         }
@@ -231,13 +246,23 @@ impl<'a> Binder<'a> {
     }
 
     pub fn bind_gpu_buf(&mut self, b: &GpuBuffer, index: usize) {
-        if !std::ptr::eq(b.inner.runtime.as_ptr(), self.runtime) {
+        self.bind_gpu_buf_offset(b, 0, index);
+    }
+
+    /// Bind an owned buffer at a byte offset and retain that exact bind in an
+    /// active DecodeIcb capture.
+    pub fn bind_gpu_buf_offset(&mut self, b: &GpuBuffer, byte_offset: usize, index: usize) {
+        if !b.belongs_to(self.runtime) {
             self.fail("buffer belongs to another runtime");
             return;
         }
-        self.bind_buf(b.metal(), 0, index);
+        if byte_offset >= b.nbytes() {
+            self.fail("owned buffer binding offset out of logical bounds");
+            return;
+        }
+        self.bind_buf(b.metal(), byte_offset, index);
         if crate::decode_icb::decode_icb_capture_active() {
-            crate::decode_icb::capture_note_bind(index, b, 0);
+            crate::decode_icb::capture_note_bind(index, b, byte_offset);
         }
     }
 
@@ -341,10 +366,16 @@ impl<'a> Binder<'a> {
             return;
         }
 
+        if self.hazard_pending {
+            // A producer with no barrier after it precedes this dispatch on the
+            // encoder (hazard mode, possibly from an earlier scope). Order it now.
+            self.barrier();
+        }
         self.latch_argument_table();
         self.enc
             .dispatchThreadgroups_threadsPerThreadgroup(threadgroups, threads_per_tg);
         crate::infer_trace::on_dispatch();
+        self.hazard_pending = self.skip_auto_barriers;
         if crate::decode_icb::decode_icb_capture_active() {
             crate::decode_icb::capture_note_dispatch(threadgroups, threads_per_tg);
         }
@@ -376,6 +407,7 @@ impl<'a> Binder<'a> {
                 MTL4VisibilityOptions::Device,
             );
         crate::infer_trace::on_barrier();
+        self.hazard_pending = false;
         // Shipping hazard skip-auto: RAW edges land here — capture for tape replay.
         if crate::decode_icb::decode_icb_capture_active() {
             crate::decode_icb::capture_note_barrier();
@@ -429,6 +461,9 @@ impl<'a> Binder<'a> {
             // Latch so ICB `inheritBuffers=true` sees MTL4 binds.
             self.latch_argument_table();
         }
+        if self.hazard_pending {
+            self.barrier();
+        }
         // SAFETY: `range` is within `icb`'s command count, checked above; `icb`
         // outlives this call through the borrow; and the argument table has
         // been latched when the commands inherit it.
@@ -436,6 +471,7 @@ impl<'a> Binder<'a> {
             self.enc.executeCommandsInBuffer_withRange(icb, range);
         }
         crate::infer_trace::on_dispatch();
+        self.hazard_pending = self.skip_auto_barriers;
         if !self.skip_auto_barriers {
             self.enc
                 .barrierAfterEncoderStages_beforeEncoderStages_visibilityOptions(
@@ -457,6 +493,20 @@ impl<'a> Binder<'a> {
         start: u64,
         count: u64,
     ) {
+        if self.error.is_some() {
+            return;
+        }
+        if let Err(error) = validate_icb_range(icb.size(), start, count) {
+            self.fail(format!("ICB optimize {error}"));
+            return;
+        }
+        let allocation = ProtocolObject::<dyn MTLAllocation>::from_ref(icb);
+        if !self.runtime.metal4.residency.containsAllocation(allocation) {
+            self.fail(
+                "indirect command buffer is not registered with this runtime's residency set",
+            );
+            return;
+        }
         let range = NSRange {
             location: start as _,
             length: count as _,
@@ -465,6 +515,17 @@ impl<'a> Binder<'a> {
             self.enc.optimizeIndirectCommandBuffer_withRange(icb, range);
         }
     }
+}
+
+fn validate_icb_range(icb_len: usize, start: u64, count: u64) -> Result<(), String> {
+    if count == 0 {
+        return Err("range must contain at least one command".into());
+    }
+    let len = u64::try_from(icb_len).map_err(|_| "command count does not fit u64")?;
+    if start.checked_add(count).is_none_or(|end| end > len) {
+        return Err("range out of bounds".into());
+    }
+    Ok(())
 }
 
 // --- Free helpers (call-site sugar) -----------------------------------------
@@ -479,10 +540,7 @@ pub fn set_gpu_buf(bnd: &mut Binder<'_>, buf: &GpuBuffer, index: usize) {
 
 /// Bind `buf` at a byte offset (slice / slot views without host round-trip).
 pub fn set_gpu_buf_offset(bnd: &mut Binder<'_>, buf: &GpuBuffer, byte_offset: usize, index: usize) {
-    bnd.bind_buf(buf.metal(), byte_offset, index);
-    if crate::decode_icb::decode_icb_capture_active() {
-        crate::decode_icb::capture_note_bind(index, buf, byte_offset);
-    }
+    bnd.bind_gpu_buf_offset(buf, byte_offset, index);
 }
 
 pub fn set_u32(bnd: &mut Binder<'_>, v: u32, index: usize) {
@@ -570,6 +628,32 @@ pub fn dispatch_3d(
         bnd.dispatch(mtl_size(groups_x, ny, nz), mtl_size(tx, 1, 1));
         Ok(())
     })
+}
+
+/// Validate the geometry common to direct and captured Metal dispatches.
+///
+/// Tessl's shader-side coordinates and element counts are `uint`, so each grid
+/// dimension is intentionally capped at `u32::MAX` even though `MTLSize` uses
+/// the wider host `NSUInteger` type.
+pub(crate) fn validate_dispatch_geometry(
+    threadgroups: MTLSize,
+    threads_per_tg: MTLSize,
+    max_threads: Option<usize>,
+) -> Result<(), String> {
+    let grid_ok = [threadgroups.width, threadgroups.height, threadgroups.depth]
+        .iter()
+        .all(|&n| n > 0 && n <= u32::MAX as usize);
+    let lanes = threads_per_tg
+        .width
+        .checked_mul(threads_per_tg.height)
+        .and_then(|n| n.checked_mul(threads_per_tg.depth));
+    let threads_ok = lanes
+        .zip(max_threads)
+        .is_some_and(|(n, max)| n > 0 && n <= max);
+    if !grid_ok || !threads_ok {
+        return Err("invalid dispatch geometry or missing pipeline".into());
+    }
+    Ok(())
 }
 
 /// 2D grid of threadgroups with fixed threads-per-threadgroup (FA-2 tiles).

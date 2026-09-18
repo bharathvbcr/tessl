@@ -14,7 +14,7 @@
 //! assumed; and nothing zeroes a buffer from the host mid-command-buffer.
 
 use core::ptr::NonNull;
-use objc2::rc::Retained;
+use objc2::rc::{autoreleasepool, Retained};
 use objc2::runtime::ProtocolObject;
 use objc2::ClassType;
 use objc2_foundation::{NSData, NSRange, NSString, NSURL};
@@ -53,16 +53,23 @@ pub const ARGUMENT_TABLE_MAX_BUFFERS: usize = 31;
 
 /// Residency and recycle policy for pooled buffers.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum BufferKind {
     /// Mid-step temps — recycle + removeAllocation after CB complete.
     Cold,
-    /// Weights / optim / long-lived — stay resident for the run.
+    /// Weights / optim / long-lived — stay resident while owned; retire after
+    /// their final handle drops (never enter the freelist).
     Hot,
     /// Bump slab — sub-allocated views share it and the cursor resets after
     /// sync. Storage retires exactly like [`Self::Cold`]: `Drop` schedules the
     /// slab for recycle, so it returns to the freelist once its last view has
     /// dropped and the CB that used it has completed.
     Bump,
+    /// Caller-owned `MTLBuffer` wrapped via [`crate::Tensor::from_mtl_buffer`].
+    /// Stays resident while the handle lives; on drop, residency is removed
+    /// after in-flight work (same schedule as [`Self::Hot`]) but the buffer is
+    /// never returned to the Cold freelist.
+    External,
 }
 
 /// Probed device memory budget (logged in train banner).
@@ -297,6 +304,9 @@ struct ActiveMetal4Batch {
     stamped_t0: bool,
     encoder: Option<Retained<ProtocolObject<dyn MTL4ComputeCommandEncoder>>>,
     alloc_idx: usize,
+    /// The previous scope on `encoder` ended with an unbarriered dispatch
+    /// (hazard mode). The next scope opens with a barrier and clears it.
+    hazard_pending: bool,
 }
 
 struct BumpState {
@@ -324,6 +334,73 @@ impl Drop for RuntimeAccess {
 /// ```
 /// A pooled buffer awaiting recycle, with the size it was allocated at.
 type PendingRecycle = (Retained<ProtocolObject<dyn MTLBuffer>>, usize);
+
+/// Hot allocations whose last owner dropped while GPU work may still reference them.
+type PendingRetirement = Retained<ProtocolObject<dyn MTLBuffer>>;
+
+/// Persistent Hot scalar workspace (pos-buffer style). Bounded bump arena for
+/// stable GPU addresses across encodes — not a full decode ICB scalar graph.
+pub struct ParamsBuffer {
+    buffer: crate::tensor::GpuBuffer,
+    cursor: Mutex<usize>,
+    capacity: usize,
+}
+
+impl ParamsBuffer {
+    /// 4 KiB of Hot u32/f32 slots — enough for per-token dims without migrating
+    /// the full decode graph into an ICB scalar pool.
+    pub const CAPACITY_BYTES: usize = 4096;
+
+    fn new(rt: &GpuRuntime) -> Result<Self, String> {
+        let buffer = rt.alloc_buffer_kind(Self::CAPACITY_BYTES, BufferKind::Hot)?;
+        // SAFETY: freshly allocated Hot buffer; no live views or in-flight CB.
+        unsafe {
+            buffer.zero_unsubmitted();
+        }
+        Ok(Self {
+            buffer,
+            cursor: Mutex::new(0),
+            capacity: Self::CAPACITY_BYTES,
+        })
+    }
+
+    /// Reset the bump cursor (call once per step before binding scalars).
+    pub fn reset(&self) {
+        *self.cursor.lock().unwrap_or_else(|p| p.into_inner()) = 0;
+    }
+
+    /// Push a `u32`; returns byte offset into the params buffer.
+    pub fn push_u32(&self, v: u32) -> Result<usize, String> {
+        let mut cursor = self.cursor.lock().map_err(|e| e.to_string())?;
+        let offset = *cursor;
+        let next = offset
+            .checked_add(4)
+            .ok_or_else(|| "params buffer cursor overflow".to_string())?;
+        if next > self.capacity {
+            return Err(format!(
+                "params buffer exhausted (cap {} bytes)",
+                self.capacity
+            ));
+        }
+        // SAFETY: exclusive host write into StorageModeShared Hot buffer; caller
+        // must not race GPU reads of this slot until after the push completes.
+        let ptr = self.buffer.metal().contents().as_ptr() as *mut u8;
+        unsafe {
+            std::ptr::write_unaligned(ptr.add(offset) as *mut u32, v);
+        }
+        *cursor = next;
+        Ok(offset)
+    }
+
+    /// Push an `f32`; returns byte offset into the params buffer.
+    pub fn push_f32(&self, v: f32) -> Result<usize, String> {
+        self.push_u32(v.to_bits())
+    }
+
+    pub fn buffer(&self) -> &crate::tensor::GpuBuffer {
+        &self.buffer
+    }
+}
 
 pub struct GpuRuntime {
     access_busy: Arc<AtomicBool>,
@@ -358,10 +435,50 @@ pub struct GpuRuntime {
     residency_dirty: Mutex<bool>,
     /// Cold buffers whose last Arc dropped mid-step; recycled after CB wait.
     pending_cold_recycle: Mutex<Vec<PendingRecycle>>,
+    /// Hot buffers whose last Arc dropped; removed from residency after CB wait.
+    pending_retirement: Mutex<Vec<PendingRetirement>>,
+    /// Bounded Hot params workspace for stable scalar binds (pos-buffer style).
+    params: Mutex<Option<ParamsBuffer>>,
     /// Self weak handle so Drop on pooled buffers can schedule recycle.
     self_weak: Mutex<Weak<GpuRuntime>>,
     /// Probed working-set / wired budget (P0b).
     memory_info: Mutex<DeviceMemoryInfo>,
+}
+
+/// Kernel-use trace, gated on `TESSL_KERNEL_TRACE=1`.
+///
+/// Off by default and read through a `OnceLock`, so the cost on the dispatch
+/// path when disabled is one relaxed load.
+static KERNEL_TRACE_ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+static KERNEL_TRACE: std::sync::Mutex<std::collections::BTreeSet<String>> =
+    std::sync::Mutex::new(std::collections::BTreeSet::new());
+
+fn record_kernel_use(name: &str) {
+    if !*KERNEL_TRACE_ON.get_or_init(|| std::env::var_os("TESSL_KERNEL_TRACE").is_some()) {
+        return;
+    }
+    if let Ok(mut set) = KERNEL_TRACE.lock() {
+        if !set.contains(name) {
+            set.insert(name.to_string());
+        }
+    }
+}
+
+/// Every distinct kernel this process has requested a pipeline for, sorted.
+///
+/// Empty unless `TESSL_KERNEL_TRACE` is set — a caller that forgets to set it
+/// would otherwise read an empty trace as "nothing ran".
+pub fn traced_kernels() -> Vec<String> {
+    KERNEL_TRACE
+        .lock()
+        .map(|s| s.iter().cloned().collect())
+        .unwrap_or_default()
+}
+
+/// Whether the trace is recording. Lets a caller distinguish "nothing
+/// dispatched" from "tracing was never switched on".
+pub fn kernel_trace_enabled() -> bool {
+    *KERNEL_TRACE_ON.get_or_init(|| std::env::var_os("TESSL_KERNEL_TRACE").is_some())
 }
 
 impl GpuRuntime {
@@ -388,6 +505,14 @@ impl GpuRuntime {
             return Err(e);
         }
         Ok(access)
+    }
+
+    /// Test-only: apply the same poison `encode_failed` bit that a SharedEvent
+    /// wait timeout stores before returning. Proves subsequent encode/alloc
+    /// refuse reuse without needing to wedge a real GPU timeline.
+    #[cfg(test)]
+    pub fn poison_as_shared_event_timeout_for_test(&self) {
+        self.encode_failed.store(true, Ordering::Release);
     }
 
     pub fn new() -> Result<Arc<Self>, String> {
@@ -467,6 +592,8 @@ impl GpuRuntime {
             flash_tensorops: Mutex::new(false),
             residency_dirty: Mutex::new(false),
             pending_cold_recycle: Mutex::new(Vec::new()),
+            pending_retirement: Mutex::new(Vec::new()),
+            params: Mutex::new(None),
             self_weak: Mutex::new(Weak::new()),
             memory_info: Mutex::new(mem_info),
         });
@@ -550,6 +677,30 @@ impl GpuRuntime {
         self.last_m4_stamps.lock().ok().and_then(|mut g| g.take())
     }
 
+    pub(crate) fn weak_self(&self) -> Weak<GpuRuntime> {
+        self.self_weak
+            .lock()
+            .map(|g| g.clone())
+            .unwrap_or_default()
+    }
+
+    /// SharedEvent signaled on every Metal 4 commit. Cross-crate callers that
+    /// share an `MTLBuffer` (for example sparsl SpMV reading a tessl GEMM
+    /// output) wait on this event after tessl work — queues are not merged.
+    pub fn shared_event(&self) -> &ProtocolObject<dyn MTLSharedEvent> {
+        &*self.metal4.shared_event
+    }
+
+    /// Last timeline value this runtime has submitted a signal for (`0` if no
+    /// commit has signaled yet). Pair with [`Self::shared_event`] for handoff.
+    pub fn last_signaled_value(&self) -> u64 {
+        *self
+            .metal4
+            .event_value
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+    }
+
     /// Register a buffer in the Metal 4 residency set (deferred commit).
     pub fn register_residency(&self, buf: &ProtocolObject<dyn MTLBuffer>) {
         self.register_allocation(ProtocolObject::<dyn MTLAllocation>::from_ref(buf));
@@ -591,23 +742,67 @@ impl GpuRuntime {
         }
     }
 
-    /// After GPU catch-up: remove cold allocs from residency and return to freelist.
+    /// Retire a Hot buffer after all submitted work has completed.
+    ///
+    /// Hot storage never enters the freelist, but must leave the residency set
+    /// when its final handle drops.
+    pub(crate) fn schedule_hot_retirement(
+        &self,
+        buffer: Retained<ProtocolObject<dyn MTLBuffer>>,
+    ) {
+        if let Ok(mut q) = self.pending_retirement.lock() {
+            q.push(buffer);
+        }
+    }
+
+    /// After GPU catch-up: remove cold allocs from residency and return to
+    /// freelist; remove retired Hot allocs from residency without recycling.
     fn drain_cold_recycles(&self) {
-        let pending = if let Ok(mut q) = self.pending_cold_recycle.lock() {
+        let cold = if let Ok(mut q) = self.pending_cold_recycle.lock() {
             std::mem::take(&mut *q)
         } else {
-            return;
+            Vec::new()
         };
-        if pending.is_empty() {
+        let retired = if let Ok(mut q) = self.pending_retirement.lock() {
+            std::mem::take(&mut *q)
+        } else {
+            Vec::new()
+        };
+        if cold.is_empty() && retired.is_empty() {
             return;
         }
-        for (buf, _nbytes) in pending {
-            self.unregister_residency(&buf);
+        for (buf, _nbytes) in &cold {
+            self.unregister_residency(buf);
+        }
+        for buf in &retired {
+            self.unregister_residency(buf);
+        }
+        self.flush_residency();
+        for (buf, _nbytes) in cold {
             if let Ok(mut pool) = self.pool.lock() {
                 pool.recycle(buf);
             }
         }
-        self.flush_residency();
+        drop(retired);
+    }
+
+    /// Lazily create and return the persistent params workspace.
+    pub fn params_buffer(&self) -> Result<(), String> {
+        let mut guard = self.params.lock().map_err(|e| e.to_string())?;
+        if guard.is_none() {
+            *guard = Some(ParamsBuffer::new(self)?);
+        }
+        Ok(())
+    }
+
+    /// Access the persistent params workspace, creating it on first use.
+    pub fn with_params<R>(&self, f: impl FnOnce(&ParamsBuffer) -> R) -> Result<R, String> {
+        self.params_buffer()?;
+        let guard = self.params.lock().map_err(|e| e.to_string())?;
+        let params = guard
+            .as_ref()
+            .ok_or_else(|| "params buffer missing after init".to_string())?;
+        Ok(f(params))
     }
 
     /// Commit pending residency adds/removes and request residency (batched).
@@ -683,6 +878,7 @@ impl GpuRuntime {
         &self,
         name: &str,
     ) -> Result<Retained<ProtocolObject<dyn MTLComputePipelineState>>, String> {
+        record_kernel_use(name);
         // Cache hit without holding overlay lock or allocating a key String.
         let icb = crate::decode_icb::icb_pipelines_enabled();
         {
@@ -724,6 +920,9 @@ impl GpuRuntime {
         nbytes: usize,
         kind: BufferKind,
     ) -> Result<crate::tensor::GpuBuffer, String> {
+        if self.encode_failed.load(Ordering::Acquire) {
+            return Err("runtime is poisoned after encode/submit failure; recreate it".into());
+        }
         if kind == BufferKind::Cold {
             crate::infer_trace::on_cold_alloc();
         }
@@ -823,23 +1022,23 @@ impl GpuRuntime {
 
     /// Synchronize and reset the bump cursor. Retained views keep their old slab;
     /// a fresh slab is allocated when resetting would otherwise alias them.
-    pub fn bump_reset(&self) {
-        let _access = self
-            .host_access()
-            .expect("bump reset requires exclusive completed GPU work");
-        let mut bump = self.bump.lock().expect("bump state poisoned");
+    pub fn bump_reset(&self) -> Result<(), String> {
+        let _access = self.host_access()?;
+        let mut bump = self
+            .bump
+            .lock()
+            .map_err(|_| "bump state poisoned".to_string())?;
         if let Some(b) = bump.as_mut() {
             // Keep the old arena alive until its last outstanding view drops.
             if Arc::strong_count(&b.buffer.inner) == 1 {
                 b.cursor = 0;
             } else {
-                let buffer = self
-                    .alloc_buffer_kind(b.capacity, BufferKind::Bump)
-                    .expect("cannot replace bump arena with outstanding views");
+                let buffer = self.alloc_buffer_kind(b.capacity, BufferKind::Bump)?;
                 b.buffer = buffer;
                 b.cursor = 0;
             }
         }
+        Ok(())
     }
 
     pub fn bump_enabled(&self) -> bool {
@@ -847,14 +1046,21 @@ impl GpuRuntime {
     }
 
     /// Prefer bump slab when initialized; otherwise pool-alloc a fresh tensor.
+    ///
+    /// Only an exhausted bump arena falls through to the pool. A busy runtime
+    /// (a live host mapping, or a call from inside a binder closure) and a
+    /// poisoned one are errors the caller has to see; silently serving them
+    /// from the pool used to hand out tensors from a runtime that could no
+    /// longer run anything.
     pub fn alloc_temp_f32(
         self: &Arc<Self>,
         shape: &[usize],
     ) -> Result<crate::tensor::Tensor, String> {
         if self.bump_enabled() {
-            // Fall through to the general pool when the bump slab is exhausted.
-            if let Ok(t) = self.bump_alloc_f32(shape) {
-                return Ok(t);
+            match self.bump_alloc_f32(shape) {
+                Ok(t) => return Ok(t),
+                Err(e) if e.starts_with("bump arena exhausted:") => {}
+                Err(e) => return Err(e),
             }
         }
         self.alloc_tensor_f32(shape)
@@ -1032,6 +1238,7 @@ impl GpuRuntime {
                     let (i1, v1) = (1usize, slots[1].in_flight);
                     let (i, v) = if v0 <= v1 { (i0, v0) } else { (i1, v1) };
                     if !m4.shared_event.waitUntilSignaledValue_timeoutMS(v, 30_000) {
+                        self.encode_failed.store(true, Ordering::Release);
                         return Err("Metal 4 allocator SharedEvent wait timed out".to_string());
                     }
                     // Reset every slot that has completed (event ≥ in_flight).
@@ -1070,6 +1277,7 @@ impl GpuRuntime {
                 stamped_t0: stamped,
                 encoder: None,
                 alloc_idx,
+                hazard_pending: false,
             });
         }
         Ok(())
@@ -1079,10 +1287,17 @@ impl GpuRuntime {
     where
         F: FnOnce(&mut crate::dispatch::Binder<'_>) -> Result<(), String>,
     {
+        autoreleasepool(|_| self.encode_into_batch_m4_inner(skip_auto, f))
+    }
+
+    fn encode_into_batch_m4_inner<F>(&self, skip_auto: Option<bool>, f: F) -> Result<(), String>
+    where
+        F: FnOnce(&mut crate::dispatch::Binder<'_>) -> Result<(), String>,
+    {
         let m4 = &self.metal4;
         // Clone Retained encoder so we do not hold `active_m4` across `f`
         // (nested with_binder / flush would otherwise deadlock the Mutex).
-        let enc = {
+        let (enc, pending_edge) = {
             let mut guard = self.active_m4.lock().map_err(|e| e.to_string())?;
             self.ensure_m4_cb_open(&mut guard)?;
             let batch = guard
@@ -1100,13 +1315,15 @@ impl GpuRuntime {
                 );
                 batch.encoder = Some(e);
             }
-            batch
+            let pending_edge = std::mem::take(&mut batch.hazard_pending);
+            let enc = batch
                 .encoder
                 .as_ref()
                 .ok_or_else(|| "M4 encoder missing".to_string())?
-                .clone()
+                .clone();
+            (enc, pending_edge)
         };
-        {
+        let hazard_pending = {
             let mut cursor = m4.const_cursor.lock().map_err(|e| e.to_string())?;
             let mut binder = crate::dispatch::Binder::new(
                 enc.as_ref(),
@@ -1114,6 +1331,13 @@ impl GpuRuntime {
                 &m4.const_staging,
                 &mut cursor,
                 skip_auto.unwrap_or_else(crate::ab_flags::hazard_barriers),
+                // A previous scope on this encoder ended with an unbarriered
+                // dispatch (hazard mode). The binder orders it before this
+                // scope's first dispatch — lazily, so a scope whose first act
+                // is its own explicit barrier does not pay for two. Going
+                // through the binder also lands the barrier in a decode
+                // capture as the previous command's `barrier_after`.
+                pending_edge,
                 m4.argument_table.max_buffers as usize,
                 self,
             );
@@ -1123,19 +1347,23 @@ impl GpuRuntime {
                 Ok(Ok(())) => {}
                 Ok(Err(e)) => {
                     self.encode_failed.store(true, Ordering::Release);
+                    self.abort_open_batch();
                     return Err(e);
                 }
                 Err(panic) => {
                     self.encode_failed.store(true, Ordering::Release);
+                    self.abort_open_batch();
                     std::panic::resume_unwind(panic);
                 }
             }
-        }
+            binder.hazard_pending()
+        };
         let hit_mid = {
             let mut guard = self.active_m4.lock().map_err(|e| e.to_string())?;
             let batch = guard
                 .as_mut()
                 .ok_or_else(|| "M4 batch missing".to_string())?;
+            batch.hazard_pending = hazard_pending;
             batch.dispatches += 1;
             batch.since_commit += 1;
             let thresh = mid_commit_threshold();
@@ -1154,21 +1382,25 @@ impl GpuRuntime {
         F: FnOnce(&mut crate::dispatch::Binder<'_>) -> Result<(), String>,
     {
         // Encode into the async-style batch then wait (keeps timestamps + residency).
-        let was_async = self.async_encode_enabled();
-        if !was_async {
-            *self.async_encode.lock().map_err(|e| e.to_string())? = true;
-        }
-        let result = (|| {
-            self.encode_into_batch_m4(skip_auto, f)?;
-            self.commit_m4(true)
-        })();
-        if !was_async {
-            *self.async_encode.lock().map_err(|e| e.to_string())? = false;
-        }
-        if let Ok(mut c) = self.dispatch_count.lock() {
-            *c += 1;
-        }
-        result
+        // One autorelease pool per CB commit drains transient ObjC objects from
+        // argument-table / encoder traffic that would otherwise accumulate.
+        autoreleasepool(|_| {
+            let was_async = self.async_encode_enabled();
+            if !was_async {
+                *self.async_encode.lock().map_err(|e| e.to_string())? = true;
+            }
+            let result = (|| {
+                self.encode_into_batch_m4(skip_auto, f)?;
+                self.commit_m4(true)
+            })();
+            if !was_async {
+                *self.async_encode.lock().map_err(|e| e.to_string())? = false;
+            }
+            if let Ok(mut c) = self.dispatch_count.lock() {
+                *c += 1;
+            }
+            result
+        })
     }
 
     /// End encoding and commit without waiting (multi-step / low-sync path).
@@ -1272,6 +1504,7 @@ impl GpuRuntime {
                 .shared_event
                 .waitUntilSignaledValue_timeoutMS(next, 30_000)
             {
+                self.encode_failed.store(true, Ordering::Release);
                 return Err("Metal 4 SharedEvent wait timed out".to_string());
             }
             crate::infer_trace::record_sync_wait(t0);
@@ -1317,6 +1550,7 @@ impl GpuRuntime {
             .shared_event
             .waitUntilSignaledValue_timeoutMS(max_v, 30_000)
         {
+            self.encode_failed.store(true, Ordering::Release);
             return Err("Metal 4 SharedEvent wait timed out".to_string());
         }
         crate::infer_trace::record_sync_wait(t0);
@@ -1344,6 +1578,143 @@ impl GpuRuntime {
     /// True when a timestamp `MTL4CounterHeap` was created with the M4 package.
     pub fn metal4_counter_heap_available(&self) -> bool {
         self.metal4.counter_heap.is_some()
+    }
+
+    /// End an open, uncommitted batch without submitting it.
+    ///
+    /// A closure that fails or panics after it has already encoded commands
+    /// leaves the encoder and command buffer open. The runtime is poisoned, so
+    /// nothing will ever commit them, and releasing a Metal 4 encoder or
+    /// command buffer mid-recording is not a defined operation. Ending both
+    /// here closes the allocator lifecycle cleanly. Also run at final drop for
+    /// a batch the caller never committed.
+    fn abort_open_batch(&self) {
+        let mut guard = self
+            .active_m4
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(batch) = guard.as_mut() else {
+            return;
+        };
+        if !batch.cb_open {
+            return;
+        }
+        if let Some(enc) = batch.encoder.take() {
+            enc.endEncoding();
+        }
+        self.metal4.command_buffer.endCommandBuffer();
+        batch.cb_open = false;
+        *guard = None;
+    }
+
+    /// Leak one strong reference to every object an in-flight unretained MTL4
+    /// command can reach.
+    ///
+    /// Only called after the final runtime owner's bounded completion wait
+    /// times out. Apple documents MTL4 command buffers as not retaining their
+    /// resource graph, so returning from Drop normally at that point would
+    /// permit a GPU use-after-free.
+    fn leak_in_flight_anchors(&mut self) {
+        let resident_allocations = self.metal4.residency.allAllocations();
+        std::mem::forget(resident_allocations);
+
+        std::mem::forget(self.device.clone());
+        std::mem::forget(self.library.clone());
+        for library in mutex_value_mut(&mut self.overlay_libraries).iter() {
+            std::mem::forget(library.clone());
+        }
+        for pipeline in mutex_value_mut(&mut self.pipelines).map.values() {
+            std::mem::forget(pipeline.clone());
+        }
+
+        std::mem::forget(self.metal4.queue.clone());
+        for slot in mutex_value_mut(&mut self.metal4.allocators).iter() {
+            std::mem::forget(slot.allocator.clone());
+        }
+        std::mem::forget(self.metal4.allocator.clone());
+        std::mem::forget(self.metal4.command_buffer.clone());
+        std::mem::forget(self.metal4.argument_table.table.clone());
+        if let Some(counter_heap) = &self.metal4.counter_heap {
+            std::mem::forget(counter_heap.clone());
+        }
+        std::mem::forget(self.metal4.residency.clone());
+        std::mem::forget(self.metal4.shared_event.clone());
+        std::mem::forget(self.metal4.const_staging.clone());
+
+        if let Some(batch) = mutex_value_mut(&mut self.active_m4).as_ref() {
+            if let Some(encoder) = &batch.encoder {
+                std::mem::forget(encoder.clone());
+            }
+        }
+        if let Some(bump) = mutex_value_mut(&mut self.bump).as_ref() {
+            std::mem::forget(bump.buffer.clone());
+        }
+        for buffers in mutex_value_mut(&mut self.pool).freelist.values() {
+            for buffer in buffers {
+                std::mem::forget(buffer.clone());
+            }
+        }
+        for (buffer, _) in mutex_value_mut(&mut self.pending_cold_recycle).iter() {
+            std::mem::forget(buffer.clone());
+        }
+        for buffer in mutex_value_mut(&mut self.pending_retirement).iter() {
+            std::mem::forget(buffer.clone());
+        }
+    }
+}
+
+const FINAL_DROP_WAIT_MS: u64 = 30_000;
+
+#[inline]
+fn max_event_value(events: impl Iterator<Item = u64>) -> u64 {
+    events.max().unwrap_or(0)
+}
+
+/// Recover the inner value during final destruction even if a prior panic
+/// poisoned the mutex. Drop must never panic and abandon GPU lifetime anchors.
+#[inline]
+fn mutex_value_mut<T>(mutex: &mut Mutex<T>) -> &mut T {
+    match mutex.get_mut() {
+        Ok(value) => value,
+        Err(poisoned) => poisoned.into_inner(),
+    }
+}
+
+impl Drop for GpuRuntime {
+    fn drop(&mut self) {
+        // A batch that was never committed must not have its encoder and
+        // command buffer released mid-recording.
+        self.abort_open_batch();
+        let max_event = max_event_value(
+            mutex_value_mut(&mut self.metal4.allocators)
+                .iter()
+                .map(|slot| slot.in_flight),
+        );
+        if max_event == 0 {
+            return;
+        }
+
+        if self
+            .metal4
+            .shared_event
+            .waitUntilSignaledValue_timeoutMS(max_event, FINAL_DROP_WAIT_MS)
+        {
+            for slot in mutex_value_mut(&mut self.metal4.allocators).iter_mut() {
+                if slot.in_flight != 0 && slot.in_flight <= max_event {
+                    slot.allocator.reset();
+                    slot.in_flight = 0;
+                }
+            }
+            return;
+        }
+
+        use std::io::Write as _;
+        let _ = writeln!(
+            std::io::stderr().lock(),
+            "tessl: final GpuRuntime drop timed out after {FINAL_DROP_WAIT_MS} ms waiting for \
+             Metal event {max_event}; leaking in-flight MTL4 objects to prevent GPU use-after-free"
+        );
+        self.leak_in_flight_anchors();
     }
 }
 
@@ -1826,6 +2197,25 @@ mod audit_tests {
             "failed batch was submitted as success"
         );
     }
+
+    #[test]
+    fn shared_event_timeout_poison_rejects_further_encode() {
+        let rt = GpuRuntime::new().unwrap();
+        rt.poison_as_shared_event_timeout_for_test();
+        let err = rt
+            .with_binder(|_| Ok(()))
+            .expect_err("poisoned runtime must refuse encode");
+        assert!(
+            err.contains("poison"),
+            "expected poison refusal after SharedEvent-timeout latch, got {err}"
+        );
+        let alloc_err = rt.alloc_tensor_f32(&[4]).map(|_| ()).unwrap_err();
+        assert!(
+            alloc_err.contains("poison"),
+            "expected alloc refusal after SharedEvent-timeout latch, got {alloc_err}"
+        );
+    }
+
     #[test]
     fn oversized_raw_allocations_fail_without_panicking() {
         let rt = GpuRuntime::new().unwrap();
@@ -1835,3 +2225,16 @@ mod audit_tests {
         assert!(outcome.unwrap().is_err());
     }
 }
+
+#[cfg(test)]
+mod drop_wait_tests {
+    use super::max_event_value;
+
+    #[test]
+    fn max_event_value_picks_the_largest_signal() {
+        assert_eq!(max_event_value([].into_iter()), 0);
+        assert_eq!(max_event_value([0, 4, 2, 9, 0, 7].into_iter()), 9);
+        assert_eq!(max_event_value([u64::MAX, 1].into_iter()), u64::MAX);
+    }
+}
+

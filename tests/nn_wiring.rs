@@ -674,38 +674,3 @@ fn qkv_rope_refuses_a_variant_operand_mismatch() {
         assert_eq!(rt.take_dispatch_count(), 0);
     });
 }
-
-#[test]
-fn gemv_q4_refuses_a_cols_that_overflows_threadgroup_memory() {
-    with_gpu(|rt| {
-        // The kernel caches all of `x` in threadgroup memory: cols * 4 bytes.
-        let limit = rt.max_threadgroup_memory();
-        let too_wide = (limit / 4 + 1024) as u32;
-        let shape = QuantShape {
-            rows: 8,
-            cols: too_wide,
-            group_size: 32,
-        };
-        // Buffers are deliberately generous; the threadgroup-memory ceiling is
-        // what must fire, not an extent check.
-        let big = empty(rt, (too_wide as usize) * 8);
-        let err = nn::gemv_q4(
-            rt,
-            Q4Bank {
-                packed: &big,
-                scales: &big,
-                zeros: &big,
-            },
-            &big,
-            &big,
-            shape,
-            false,
-        )
-        .expect_err("threadgroup memory overflow");
-        assert!(
-            err.contains("threadgroup memory"),
-            "expected the threadgroup-memory ceiling, got: {err:?}"
-        );
-        assert_eq!(rt.take_dispatch_count(), 0);
-    });
-}

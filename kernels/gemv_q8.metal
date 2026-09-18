@@ -63,7 +63,7 @@ kernel void gemv_q8(
         for (uint r = 0u; r < Q8_SIMD_ROWS; ++r) {
             const uint row = row0 + r;
             if (row < rows) {
-                const uint gi = row * groups_per_row + g;
+                const ulong gi = (ulong)row * groups_per_row + g;
                 s[r] = scales[gi];
                 z[r] = zeros[gi];
             } else {
@@ -71,16 +71,21 @@ kernel void gemv_q8(
                 z[r] = 0.0f;
             }
         }
-        const uint c0 = g * group_size;
+        const ulong c0 = (ulong)g * group_size;
         if (vec4_ok) {
             // Four bytes per lane, so a simdgroup's 32 loads cover 128
             // contiguous bytes — one cache line per instruction instead of a
             // quarter of one. `vec4_ok` guarantees the char4 access is aligned
             // and that a lane's four columns lie inside a single group, which
             // is what lets `s[r]`/`z[r]` stay hoisted.
-            for (uint i = lane * 4u; i < group_size; i += Q8_SIMD_SIZE * 4u) {
-                const uint c = c0 + i;
-                const float4 xv = float4(x[c], x[c + 1u], x[c + 2u], x[c + 3u]);
+            for (ulong i = (ulong)lane * 4ul;
+                 i < (ulong)group_size;
+                 i += (ulong)Q8_SIMD_SIZE * 4ul) {
+                const ulong c = c0 + i;
+                // `vec4_ok` makes `c` a multiple of four floats and `x` is a
+                // buffer base, so this is one aligned 16-byte load where four
+                // scalar loads used to sit in the innermost loop.
+                const float4 xv = ((device const float4 *)(x + c))[0];
                 for (uint r = 0u; r < Q8_SIMD_ROWS; ++r) {
                     const uint row = row0 + r;
                     if (row >= rows) break;
@@ -97,7 +102,7 @@ kernel void gemv_q8(
             // Lanes stride the group one element at a time. When group_size <
             // Q8_SIMD_SIZE the upper lanes idle for that group; correctness
             // holds and the shapes this kernel is for use 32 or more.
-            for (uint i = lane; i < group_size; i += Q8_SIMD_SIZE) {
+            for (ulong i = lane; i < (ulong)group_size; i += Q8_SIMD_SIZE) {
                 const float xv = x[c0 + i];
                 for (uint r = 0u; r < Q8_SIMD_ROWS; ++r) {
                     const uint row = row0 + r;

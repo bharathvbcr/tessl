@@ -1,8 +1,9 @@
 // Residual / hidden RMSNorm (f32 and bf16).
 //
-// One threadgroup per row, with the sum of squares reduced as a tree in
-// threadgroup memory. Lane `lid` visits `dim[lid], dim[lid + tptg], ...`, so
-// `dim` has no ceiling and adjacent lanes read adjacent addresses.
+// One threadgroup per row, with the sum of squares reduced simdgroup-first
+// (`reduce_row_add` in `reduce_tree.h`: shuffles, then one barrier). Lane
+// `lid` visits `dim[lid], dim[lid + tptg], ...`, so `dim` has no ceiling and
+// adjacent lanes read adjacent addresses.
 //
 // These kernels were one *thread* per row until 2026-08-31, which meant the
 // parallelism available was `rows` and each thread walked its row serially
@@ -20,26 +21,24 @@
 #include "reduce_tree.h"
 using namespace metal;
 
-/// Sum of squares of `xin[0..dim]`, reduced across the threadgroup.
-///
-/// Leaves the total in every lane via `scratch[0]`. Callers must not reuse
-/// `scratch` until after the barrier this returns past.
+/// Sum of squares of `xin[0..dim]`, reduced across the threadgroup and
+/// returned in every lane (`reduce_row_add`: simdgroup shuffles, then one
+/// barrier for the simdgroup partials).
 inline float row_sum_squares(
     device const float *xin,
     threadgroup float *scratch,
     uint dim,
     uint lid,
+    uint sgid,
+    uint lane,
     uint tptg)
 {
     float ss = 0.0f;
-    for (uint d = lid; d < dim; d += tptg) {
+    for (ulong d = lid; d < (ulong)dim; d += tptg) {
         float v = xin[d];
         ss += v * v;
     }
-    scratch[lid] = ss;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    REDUCE_TREE(scratch, tptg, lid, reduce_add)
-    return scratch[0];
+    return reduce_row_add(ss, scratch, sgid, lane, tptg);
 }
 
 /// out[row, :] = rms_norm(x[row, :], weight[:], eps)
@@ -52,17 +51,19 @@ kernel void rms_norm_f32(
     constant float &eps [[buffer(5)]],
     uint row [[threadgroup_position_in_grid]],
     uint lid [[thread_position_in_threadgroup]],
+    uint sgid [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]],
     uint tptg [[threads_per_threadgroup]])
 {
     if (row >= rows) return;
-    threadgroup float scratch[REDUCE_MAX_TG];
+    threadgroup float scratch[REDUCE_MAX_SIMDGROUPS];
     device const float *xin = x + (ulong)row * dim;
     device float *xout = out + (ulong)row * dim;
 
     // `eps` is what keeps an all-zero row finite: rsqrt(0) is inf, and the row
     // would leave here as inf or NaN without it.
-    const float inv = rsqrt(row_sum_squares(xin, scratch, dim, lid, tptg) / (float)dim + eps);
-    for (uint d = lid; d < dim; d += tptg) {
+    const float inv = rsqrt(row_sum_squares(xin, scratch, dim, lid, sgid, lane, tptg) / (float)dim + eps);
+    for (ulong d = lid; d < (ulong)dim; d += tptg) {
         xout[d] = xin[d] * inv * weight[d];
     }
 }
@@ -77,15 +78,17 @@ kernel void rms_norm_bf16(
     constant float &eps [[buffer(5)]],
     uint row [[threadgroup_position_in_grid]],
     uint lid [[thread_position_in_threadgroup]],
+    uint sgid [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]],
     uint tptg [[threads_per_threadgroup]])
 {
     if (row >= rows) return;
-    threadgroup float scratch[REDUCE_MAX_TG];
+    threadgroup float scratch[REDUCE_MAX_SIMDGROUPS];
     device const float *xin = x + (ulong)row * dim;
     device bfloat *xout = out + (ulong)row * dim;
 
-    const float inv = rsqrt(row_sum_squares(xin, scratch, dim, lid, tptg) / (float)dim + eps);
-    for (uint d = lid; d < dim; d += tptg) {
+    const float inv = rsqrt(row_sum_squares(xin, scratch, dim, lid, sgid, lane, tptg) / (float)dim + eps);
+    for (ulong d = lid; d < (ulong)dim; d += tptg) {
         xout[d] = (bfloat)(xin[d] * inv * weight[d]);
     }
 }
@@ -102,21 +105,23 @@ kernel void rms_norm_residual_add_f32(
     constant float &layer_scale [[buffer(6)]],
     uint row [[threadgroup_position_in_grid]],
     uint lid [[thread_position_in_threadgroup]],
+    uint sgid [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]],
     uint tptg [[threads_per_threadgroup]])
 {
     if (row >= rows) return;
-    threadgroup float scratch[REDUCE_MAX_TG];
+    threadgroup float scratch[REDUCE_MAX_SIMDGROUPS];
     device const float *xin = x + (ulong)row * dim;
     device float *xout = resid + (ulong)row * dim;
 
-    const float inv = rsqrt(row_sum_squares(xin, scratch, dim, lid, tptg) / (float)dim + eps);
+    const float inv = rsqrt(row_sum_squares(xin, scratch, dim, lid, sgid, lane, tptg) / (float)dim + eps);
     const float s = layer_scale;
     if (s == 1.0f) {
-        for (uint d = lid; d < dim; d += tptg) {
+        for (ulong d = lid; d < (ulong)dim; d += tptg) {
             xout[d] += xin[d] * inv * weight[d];
         }
     } else {
-        for (uint d = lid; d < dim; d += tptg) {
+        for (ulong d = lid; d < (ulong)dim; d += tptg) {
             float h = xin[d] * inv * weight[d];
             xout[d] = s * (xout[d] + h);
         }

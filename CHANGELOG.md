@@ -6,6 +6,57 @@ All notable changes to `tessl` are recorded here. The format follows
 
 ## [Unreleased]
 
+## [0.2.0] — 2026-09-18
+
+Fail-closed encode / attention / quantized paths, Tensor metadata hygiene, and
+SharedEvent interop with sparsl. The minor version moves because public
+`Tensor.shape` / `Tensor.byte_offset` fields become `pub(crate)` (use
+`shape()` / `byte_offset()`), `BufferKind` gains `External` and is marked
+`#[non_exhaustive]`, and several previously-accepted shapes / aliases are now
+refused with errors.
+
+### Added
+
+- **Flash attention decode and rows kernels**, with host routing that picks the
+  right specialization and refuses aliased / dimensionally inconsistent outputs.
+- **`BufferKind::External`** and `Tensor::from_mtl_buffer` for zero-copy
+  MTLBuffer handoff (BINN / sparsl SharedEvent paths).
+- **Dispatch geometry validation** and traced kernel names so a bad grid fails
+  closed instead of writing partial tiles.
+- **Q4 / Q8 shape-domain checks** and widened index arithmetic in the Metal
+  kernels that previously truncated under large extents.
+- **Release tooling:** `scripts/ci_local.sh`, `scripts/check_release_ready.sh`,
+  and a tag-triggered `.github/workflows/release.yml` that publishes to
+  crates.io and creates the GitHub Release from this changelog.
+
+### Changed
+
+- **`Tensor.shape` / `Tensor.byte_offset` are no longer public fields.** Mutating
+  them by assignment could desynchronize the logical view from the buffer;
+  construct via allocators / `try_view` and read via accessors.
+- **`BufferKind` is `#[non_exhaustive]`** so exhaustive matches stop breaking on
+  every new kind.
+- **Busy bump-reset and poisoned `alloc_temp` fail closed** instead of
+  fallthrough.
+- **Hazard tracking** (`hazard_pending`) so decode / attention writers cannot
+  race a subsequent reader without a barrier.
+
+### Performance (Apple M5 Pro, 2026-09-18)
+
+Sequential A/B vs clean `v0.1.4` HEAD, `bench_gemm_sweep` with
+`BENCH_WARMUP=10` / `BENCH_ITERS=30`, shapes `512³,1024³,2048³`, cooled
+cur→prev pass:
+
+| shape / backend | prev (ms) | 0.2.0 (ms) | Δ |
+|---|---:|---:|---:|
+| 1024³ tensorops-bf16 | 0.217 | 0.196 | **−10%** |
+| 1024³ tensorops-f32 | 0.508 | 0.514 | +1% |
+| 2048³ tensorops-f32 | 3.883 | 3.859 | ≈0% |
+| 2048³ tensorops-bf16 | 0.876 | 0.888 | +1% |
+
+Small square shapes sit near the ~0.25 ms dispatch floor and are not quoted as
+wins. Host load was elevated during measurement; treat ±~10% as noise.
+
 ## [0.1.4] — 2026-09-14
 
 Manifest metadata only. No code, API or behaviour change; the compiled crate is
@@ -437,3 +488,10 @@ test, and the reasoning is the useful part.
   `nax_verify_readiness` reports, replacing a second copy of the same sentinel
   that existed alongside it.
 
+
+[0.2.0]: https://github.com/bharathvbcr/tessl/releases/tag/v0.2.0
+[0.1.4]: https://github.com/bharathvbcr/tessl/releases/tag/v0.1.4
+[0.1.3]: https://github.com/bharathvbcr/tessl/releases/tag/v0.1.3
+[0.1.2]: https://github.com/bharathvbcr/tessl/releases/tag/v0.1.2
+[0.1.1]: https://github.com/bharathvbcr/tessl/releases/tag/v0.1.1
+[0.1.0]: https://github.com/bharathvbcr/tessl/releases/tag/v0.1.0

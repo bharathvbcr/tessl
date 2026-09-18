@@ -17,8 +17,8 @@ kernel void embed_lookup_q4_mlx(
     uint gid [[thread_position_in_grid]])
 {
     (void)biases_unused;
-    const uint total = n_tokens * hidden;
-    if (gid >= total) return;
+    const ulong total = (ulong)n_tokens * hidden;
+    if ((ulong)gid >= total) return;
     const uint m = gid / hidden;
     const uint d = gid % hidden;
     const uint tid = token_ids[m];
@@ -28,13 +28,13 @@ kernel void embed_lookup_q4_mlx(
     }
     const uint groups_per_row = hidden / group_size;
     const uint g = d / group_size;
-    const uint scale_i = tid * groups_per_row + g;
+    const ulong scale_i = (ulong)tid * groups_per_row + g;
     const bfloat2 sbv = sb[scale_i];
     const float scale = float(sbv.x);
     const float bias = float(sbv.y);
-    const uint idx = tid * hidden + d;
-    const uchar byte = packed[idx / 2u];
-    const uchar nibble = ((idx & 1u) == 0u) ? (byte & 0x0fu) : ((byte >> 4) & 0x0fu);
+    const ulong idx = (ulong)tid * hidden + d;
+    const uchar byte = packed[idx / 2ul];
+    const uchar nibble = ((idx & 1ul) == 0ul) ? (byte & 0x0fu) : ((byte >> 4) & 0x0fu);
     out[gid] = scale * float(nibble) + bias;
 }
 
@@ -50,8 +50,8 @@ kernel void embed_lookup_q4(
     constant uint &n_tokens [[buffer(8)]],
     uint gid [[thread_position_in_grid]])
 {
-    const uint total = n_tokens * hidden;
-    if (gid >= total) return;
+    const ulong total = (ulong)n_tokens * hidden;
+    if ((ulong)gid >= total) return;
     const uint m = gid / hidden;
     const uint d = gid % hidden;
     const uint tid = token_ids[m];
@@ -61,12 +61,12 @@ kernel void embed_lookup_q4(
     }
     const uint groups_per_row = hidden / group_size;
     const uint g = d / group_size;
-    const uint scale_i = tid * groups_per_row + g;
+    const ulong scale_i = (ulong)tid * groups_per_row + g;
     const float scale = scales[scale_i];
     const float zero = zeros[scale_i];
-    const uint idx = tid * hidden + d;
-    const uchar byte = packed[idx / 2u];
-    const uchar nibble = ((idx & 1u) == 0u) ? (byte & 0x0fu) : ((byte >> 4) & 0x0fu);
+    const ulong idx = (ulong)tid * hidden + d;
+    const uchar byte = packed[idx / 2ul];
+    const uchar nibble = ((idx & 1ul) == 0ul) ? (byte & 0x0fu) : ((byte >> 4) & 0x0fu);
     const int q = (int)(nibble << 28) >> 28;
     out[gid] = scale * ((float)q - zero);
 }

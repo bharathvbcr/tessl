@@ -1,5 +1,6 @@
 // Causal sliding-window FlashAttention @ head_dim=256 (FA-2 tiled).
-// Q: [B,Tq,H,D], K/V: [B,Tkv,Hkv,D], O: [B,Tq,H,D]
+// Q: [B,Tq,H,D], K/V: [B,kv_capacity,Hkv,D], O: [B,Tq,H,D]
+// Tkv is the live prefix; kv_capacity is the fixed per-batch K/V stride.
 // Absolute positions: q_abs = q_pos_offset + t_q, k_abs = kv_pos_offset + t_k.
 // Prefill dense: Tq=Tkv=T, offsets 0. Decode / ring densify: Tq=1, Tkv=cache_len.
 // scale = 1.0 after QK-Norm. Window: q_abs - window < k_abs <= q_abs.
@@ -29,6 +30,7 @@ kernel void flash_attn_swa_h256(
     device const uint *q_pos_offset_ptr [[buffer(11)]],
     device const uint *kv_pos_offset_ptr [[buffer(12)]],
     constant uint &out_bf16 [[buffer(13)]],
+    constant uint &kv_capacity [[buffer(14)]],
     uint2 tgpig [[threadgroup_position_in_grid]],
     uint2 tpitg [[thread_position_in_threadgroup]],
     uint2 tptg_vec [[threads_per_threadgroup]])
@@ -38,9 +40,11 @@ kernel void flash_attn_swa_h256(
     threadgroup float Vs[BC * D_TILE];
     threadgroup float scores[BR * BC];
 
-    const uint Tkv = *Tkv_ptr;
-    const uint q_pos_offset = *q_pos_offset_ptr;
-    const uint kv_pos_offset = *kv_pos_offset_ptr;
+    // Tkv is mutable device state. Never trust it past the jointly-backed K/V
+    // capacity supplied by the host, even during an ICB replay.
+    const uint Tkv = min(*Tkv_ptr, kv_capacity);
+    const ulong q_pos_offset = (ulong)(*q_pos_offset_ptr);
+    const ulong kv_pos_offset = (ulong)(*kv_pos_offset_ptr);
 
     const uint lid = tpitg.x;
     const uint tptg = tptg_vec.x;
@@ -50,12 +54,38 @@ kernel void flash_attn_swa_h256(
     const uint b = bh / H;
     const uint group = max(H / Hkv, 1u);
     const uint hkv = h / group;
+    const ulong kv_pos_stride = (ulong)Hkv * HEAD_DIM;
+    const ulong kv_head_base =
+        (ulong)b * kv_capacity * kv_pos_stride + (ulong)hkv * HEAD_DIM;
+    const ulong q_pos_stride = (ulong)H * HEAD_DIM;
+    const ulong q_head_base =
+        (ulong)b * Tq * q_pos_stride + (ulong)h * HEAD_DIM;
 
     const uint t_q0 = q_block * BR;
-    if (t_q0 >= Tq || Tkv == 0) return;
+    if (t_q0 >= Tq) return;
 
-    const uint t_q = t_q0 + lid;
-    const bool row_valid = (lid < BR) && (t_q < Tq);
+    const uint live_rows = min(BR, Tq - t_q0);
+    const bool row_valid = lid < live_rows;
+    const uint t_q = row_valid ? t_q0 + lid : t_q0;
+    const ulong q_row_base = q_head_base + (ulong)t_q * q_pos_stride;
+
+    // Empty history is a valid state. Match the rows/decode kernels by
+    // overwriting every live output row rather than exposing recycled bytes.
+    if (Tkv == 0) {
+        if (row_valid) {
+            if (out_bf16 != 0u) {
+                device bfloat *Ob = (device bfloat *)O;
+                for (uint d = 0; d < HEAD_DIM; ++d) {
+                    Ob[q_row_base + d] = bfloat(0.0f);
+                }
+            } else {
+                for (uint d = 0; d < HEAD_DIM; ++d) {
+                    O[q_row_base + d] = 0.0f;
+                }
+            }
+        }
+        return;
+    }
 
     if (lid < BR) {
         for (uint d = 0; d < HEAD_DIM; d++) {
@@ -67,23 +97,28 @@ kernel void flash_attn_swa_h256(
     float m_i = -INFINITY;
     float l_i = 0.0f;
 
-    const int q_abs = row_valid ? (int)(q_pos_offset + t_q) : -1;
-    const int k_lo = row_valid ? max(0, q_abs - (int)window + 1) : 0;
-    const int k_hi = row_valid ? q_abs : -1;
+    const ulong q_abs = q_pos_offset + (ulong)t_q;
+    const ulong window_back = (window == 0u) ? 0ul : (ulong)window - 1ul;
+    const ulong k_lo = (window == 0u || q_abs < window_back)
+        ? 0ul
+        : q_abs - window_back;
+    const ulong k_hi = q_abs;
     // Union window over the BR tile (uniform for all TG lanes → safe early continue).
-    const int q_abs_lo = (int)(q_pos_offset + t_q0);
-    const int q_abs_hi = (int)(q_pos_offset + min(t_q0 + BR, Tq) - 1u);
-    const int k_lo_blk = max(0, q_abs_lo - (int)window + 1);
-    const int k_hi_blk = q_abs_hi;
-    const uint n_k_blocks = (Tkv + BC - 1) / BC;
+    const ulong q_abs_lo = q_pos_offset + (ulong)t_q0;
+    const ulong q_abs_hi = q_pos_offset + (ulong)t_q0 + live_rows - 1ul;
+    const ulong k_lo_blk = (window == 0u || q_abs_lo < window_back)
+        ? 0ul
+        : q_abs_lo - window_back;
+    const ulong k_hi_blk = q_abs_hi;
+    const uint n_k_blocks = Tkv / BC + ((Tkv % BC) != 0u ? 1u : 0u);
 
     for (uint kb = 0; kb < n_k_blocks; ++kb) {
         const uint t_k0 = kb * BC;
         const uint n_k = min(BC, Tkv - t_k0);
         // Skip K blocks entirely outside the sliding window (decode / long ctx).
         {
-            const int block_lo = (int)(kv_pos_offset + t_k0);
-            const int block_hi = block_lo + (int)n_k - 1;
+            const ulong block_lo = kv_pos_offset + (ulong)t_k0;
+            const ulong block_hi = block_lo + (ulong)n_k - 1ul;
             if (block_hi < k_lo_blk || block_lo > k_hi_blk) {
                 continue;
             }
@@ -106,17 +141,16 @@ kernel void flash_attn_swa_h256(
             for (uint i = lid; i < n_k * D_TILE; i += tptg) {
                 const uint tk = i / D_TILE;
                 const uint d = i % D_TILE;
-                const uint k_off = ((b * Tkv + (t_k0 + tk)) * Hkv + hkv) * HEAD_DIM;
+                const ulong k_off = kv_head_base + (ulong)(t_k0 + tk) * kv_pos_stride;
                 Ks[tk * D_TILE + d] = K[k_off + d0 + d];
             }
             threadgroup_barrier(mem_flags::mem_threadgroup);
 
             if (row_valid) {
-                const uint q_off = ((b * Tq + t_q) * H + h) * HEAD_DIM;
                 for (uint tk = 0; tk < n_k; ++tk) {
                     float s = 0.0f;
                     for (uint d = 0; d < D_TILE; ++d) {
-                        s += Q[q_off + d0 + d] * Ks[tk * D_TILE + d];
+                        s += Q[q_row_base + d0 + d] * Ks[tk * D_TILE + d];
                     }
                     scores[lid * BC + tk] += s;
                 }
@@ -127,7 +161,7 @@ kernel void flash_attn_swa_h256(
         float m_block = -INFINITY;
         if (row_valid) {
             for (uint tk = 0; tk < n_k; ++tk) {
-                const int k_abs = (int)(kv_pos_offset + t_k0 + tk);
+                const ulong k_abs = kv_pos_offset + (ulong)t_k0 + tk;
                 float score = scores[lid * BC + tk] * scale;
                 if (k_abs < k_lo || k_abs > k_hi) {
                     score = -INFINITY;
@@ -168,7 +202,7 @@ kernel void flash_attn_swa_h256(
             for (uint i = lid; i < n_k * D_TILE; i += tptg) {
                 const uint tk = i / D_TILE;
                 const uint d = i % D_TILE;
-                const uint v_off = ((b * Tkv + (t_k0 + tk)) * Hkv + hkv) * HEAD_DIM;
+                const ulong v_off = kv_head_base + (ulong)(t_k0 + tk) * kv_pos_stride;
                 Vs[tk * D_TILE + d] = V[v_off + d0 + d];
             }
             threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -187,15 +221,14 @@ kernel void flash_attn_swa_h256(
 
     if (row_valid) {
         const float inv_l = (l_i > 0.0f) ? (1.0f / l_i) : 0.0f;
-        const uint o_off = ((b * Tq + t_q) * H + h) * HEAD_DIM;
         if (out_bf16 != 0u) {
             device bfloat *Ob = (device bfloat *)O;
             for (uint d = 0; d < HEAD_DIM; ++d) {
-                Ob[o_off + d] = bfloat(Oacc[lid * HEAD_DIM + d] * inv_l);
+                Ob[q_row_base + d] = bfloat(Oacc[lid * HEAD_DIM + d] * inv_l);
             }
         } else {
             for (uint d = 0; d < HEAD_DIM; ++d) {
-                O[o_off + d] = Oacc[lid * HEAD_DIM + d] * inv_l;
+                O[q_row_base + d] = Oacc[lid * HEAD_DIM + d] * inv_l;
             }
         }
     }

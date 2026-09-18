@@ -211,11 +211,11 @@ pub use cb_replay::{
 };
 pub use decode_icb::{
     begin_decode_icb_capture, binder_encode_nop, decode_icb_capture_active, decode_icb_enabled,
-    icb_coarse_ranges_enabled, icb_freeze_binds_enabled, icb_pipelines_enabled,
-    icb_range_batch_enabled, pipeline_icb, set_binder_encode_nop, set_decode_icb,
-    set_icb_coarse_ranges, set_icb_freeze_binds, set_icb_pipelines, set_icb_range_batch,
-    take_decode_icb_capture, BinderEncodeNopGuard, DecodeIcb, DecodeIcbBind, DecodeIcbCapture,
-    DecodeIcbCommand,
+    end_decode_icb_capture, icb_coarse_ranges_enabled, icb_freeze_binds_enabled,
+    icb_pipelines_enabled, icb_range_batch_enabled, pipeline_icb, set_binder_encode_nop,
+    set_decode_icb, set_icb_coarse_ranges, set_icb_freeze_binds, set_icb_pipelines,
+    set_icb_range_batch, take_decode_icb_capture, BinderEncodeNopGuard, DecodeIcb, DecodeIcbBind,
+    DecodeIcbCapture, DecodeIcbCommand,
 };
 pub use gemm::{
     cast_f16_to_f32, cast_f32_to_f16, gemm, gemm_batched, gemm_epilogue, gemm_f32, Activation,
@@ -229,7 +229,7 @@ pub use mtl_tensor::{
     nax_verify_readiness, NaxVerifyReadiness, QuantDType, QUANT_PREFILL_GEMM_WIRED,
 };
 pub use ops::softcap_f32;
-pub use runtime::{BufferKind, DeviceMemoryInfo, GpuRuntime, PrecisionMode};
+pub use runtime::{BufferKind, DeviceMemoryInfo, GpuRuntime, ParamsBuffer, PrecisionMode};
 pub use tensor::{DType, GpuBuffer, Tensor};
 
 /// Metallib produced by `build.rs` (absolute path baked at compile time).

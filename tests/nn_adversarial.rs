@@ -169,7 +169,7 @@ fn undersized_buffers_are_refused_across_the_whole_surface() {
         refuses!(
             rt,
             "kv_store_timestep",
-            nn::kv_store_timestep(rt, &t, &t, &t, 1 << 20)
+            nn::kv_store_timestep(rt, &t, &t, &t, 1 << 20, 1 << 20)
         );
         refuses!(
             rt,
@@ -292,7 +292,7 @@ fn zero_and_degenerate_dimensions_never_panic() {
             nn::softmax_rows_f32(rt, &r, &r, 0, 16),
             nn::row_sum_f32(rt, &r, &r, 0, 16),
             nn::gemv_q8(rt, &r, &r, &r, &r, &r, 0, 64, 32),
-            nn::kv_store_timestep(rt, &r, &r, &r, 0),
+            nn::kv_store_timestep(rt, &r, &r, &r, 0, 0),
         ];
         for (i, o) in outcomes.iter().enumerate() {
             assert!(o.is_ok(), "zero-work call {i} errored unexpectedly: {o:?}");
@@ -369,6 +369,30 @@ fn non_finite_scalars_are_refused_rather_than_propagated() {
 }
 
 #[test]
+fn rms_norm_refuses_non_positive_or_non_finite_eps() {
+    with_gpu(|rt| {
+        let r = roomy(rt);
+        for bad_eps in [0.0, -1.0, f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            refuses!(
+                rt,
+                "rms_norm_f32 eps",
+                nn::rms_norm_f32(rt, &r, &r, &r, 1, 16, bad_eps)
+            );
+            refuses!(
+                rt,
+                "rms_norm_bf16 eps",
+                nn::rms_norm_bf16(rt, &r, &r, &r, 1, 16, bad_eps)
+            );
+        }
+        refuses!(
+            rt,
+            "rms_norm_f32 zero dim",
+            nn::rms_norm_f32(rt, &r, &r, &r, 1, 0, 1e-6)
+        );
+    });
+}
+
+#[test]
 fn dimension_products_that_overflow_are_refused_not_wrapped() {
     with_gpu(|rt| {
         let r = roomy(rt);
@@ -396,6 +420,19 @@ fn dimension_products_that_overflow_are_refused_not_wrapped() {
             rt,
             "gemm_i8_dequant huge",
             nn::gemm_i8_dequant(rt, &r, &r, &r, u32::MAX, u32::MAX, 8, 1.0, None)
+        );
+        let huge_attn = AttnDims {
+            batch: u32::MAX,
+            tq: u32::MAX,
+            heads: 2,
+            heads_kv: 1,
+            window: 1,
+            scale: 1.0,
+        };
+        refuses!(
+            rt,
+            "flash attention dimension product overflow",
+            nn::flash_attn_swa(rt, AttnHeadDim::D128, &r, &r, &r, &r, &r, &r, &r, huge_attn)
         );
     });
 }

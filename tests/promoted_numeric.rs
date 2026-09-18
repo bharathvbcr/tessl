@@ -334,7 +334,7 @@ fn kv_store_timestep_pair_writes_both_halves_and_nothing_else() {
         let off = rt.alloc_buffer(4).unwrap();
         off.write_u32(&[(3 * n) as u32]);
 
-        nn::kv_store_timestep_pair(rt, &kb, &vb, &dk, &dv, &off, n as u32).unwrap();
+        nn::kv_store_timestep_pair(rt, &kb, &vb, &dk, &dv, &off, n as u32, (5 * n) as u32).unwrap();
         rt.synchronize().unwrap();
 
         for (name, src, dst) in [("k", &k, dk.read_f32()), ("v", &v, dv.read_f32())] {

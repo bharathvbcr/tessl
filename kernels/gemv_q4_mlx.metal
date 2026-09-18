@@ -6,6 +6,8 @@
 //   gemv_q4_mlx_blocked_gate_up_gelu — fused gate∥up → gelu_pytorch_tanh mid
 //   gemv_q4_mlx_simd* — true qmv_fast peel + bfloat2 sb; row-major or Interleaved4
 #include <metal_stdlib>
+#include "gelu.h"
+#include "q4_mlx_dot.h"
 using namespace metal;
 
 constant uint GEMV_TG = 128u;
@@ -17,12 +19,12 @@ constant uint GEMV_X_TILE = 4096u;
 
 inline float dequant_q4_u_bias(
     device const uchar *packed,
-    uint idx,
+    ulong idx,
     float scale,
     float bias)
 {
     uchar byte = packed[idx / 2];
-    uchar nibble = (idx & 1u) == 0u ? (byte & 0x0fu) : ((byte >> 4) & 0x0fu);
+    uchar nibble = (idx & 1ul) == 0ul ? (byte & 0x0fu) : ((byte >> 4) & 0x0fu);
     return scale * (float)nibble + bias;
 }
 
@@ -31,7 +33,7 @@ inline float peel_uint_dot8(
     float scale,
     float bias,
     threadgroup float *x_cache,
-    uint xbase)
+    ulong xbase)
 {
     // xbase is group-aligned (typically 32) → float4-safe.
     float4 x0 = *((threadgroup float4 *)(x_cache + xbase));
@@ -56,25 +58,25 @@ inline float peel_group_dot(
     float scale,
     float bias,
     threadgroup float *x_cache,
-    uint xbase,
+    ulong xbase,
     uint group_size)
 {
     device const uint *pwords = (device const uint *)packed_at_group;
     float acc = 0.0f;
-    uint i = 0u;
-    for (; i + 32u <= group_size; i += 32u) {
-        const uint4 ww = ((device const uint4 *)(pwords + (i / 8u)))[0];
+    ulong i = 0ul;
+    for (; i + 32ul <= (ulong)group_size; i += 32ul) {
+        const uint4 ww = ((device const uint4 *)(pwords + (i / 8ul)))[0];
         acc += peel_uint_dot8(ww.x, scale, bias, x_cache, xbase + i);
         acc += peel_uint_dot8(ww.y, scale, bias, x_cache, xbase + i + 8u);
         acc += peel_uint_dot8(ww.z, scale, bias, x_cache, xbase + i + 16u);
         acc += peel_uint_dot8(ww.w, scale, bias, x_cache, xbase + i + 24u);
     }
-    for (; i + 8u <= group_size; i += 8u) {
-        acc += peel_uint_dot8(pwords[i / 8u], scale, bias, x_cache, xbase + i);
+    for (; i + 8ul <= (ulong)group_size; i += 8ul) {
+        acc += peel_uint_dot8(pwords[i / 8ul], scale, bias, x_cache, xbase + i);
     }
-    for (; i < group_size; ++i) {
-        uchar byte = packed_at_group[i / 2u];
-        uchar nibble = (i & 1u) == 0u ? (byte & 0x0fu) : ((byte >> 4) & 0x0fu);
+    for (; i < (ulong)group_size; ++i) {
+        uchar byte = packed_at_group[i / 2ul];
+        uchar nibble = (i & 1ul) == 0ul ? (byte & 0x0fu) : ((byte >> 4) & 0x0fu);
         acc += (scale * float(nibble) + bias) * x_cache[xbase + i];
     }
     return acc;
@@ -90,9 +92,9 @@ inline float gemv_q4_mlx_body_acc(
     uint row)
 {
     const uint groups_per_row = cols / group_size;
-    const uint row_base = row * cols;
-    const uint scale_base = row * groups_per_row;
-    const uint packed_row = row_base / 2u;
+    const ulong row_base = (ulong)row * cols;
+    const ulong scale_base = (ulong)row * groups_per_row;
+    const ulong packed_row = row_base / 2ul;
 
     float acc = 0.0f;
     for (uint g = 0u; g < groups_per_row; ++g) {
@@ -100,8 +102,8 @@ inline float gemv_q4_mlx_body_acc(
         const bfloat2 sbv = sb[scale_base + g];
         const float scale = float(sbv.x);
         const float bias = float(sbv.y);
-        const uint xbase = g * group_size;
-        const uint pbase = packed_row + (g * group_size) / 2u;
+        const ulong xbase = (ulong)g * group_size;
+        const ulong pbase = packed_row + ((ulong)g * group_size) / 2ul;
         acc += peel_group_dot(packed + pbase, scale, bias, x_cache, xbase, group_size);
     }
     return acc;
@@ -134,7 +136,7 @@ kernel void gemv_q4_mlx(
     uint tptg [[threads_per_threadgroup]],
     threadgroup float *x_cache [[threadgroup(0)]])
 {
-    for (uint i = lid; i < cols; i += tptg) {
+    for (ulong i = lid; i < (ulong)cols; i += tptg) {
         x_cache[i] = x[i];
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -156,7 +158,7 @@ kernel void gemv_q4_mlx_wide(
     uint tptg [[threads_per_threadgroup]],
     threadgroup float *x_cache [[threadgroup(0)]])
 {
-    for (uint i = lid; i < cols; i += tptg) {
+    for (ulong i = lid; i < (ulong)cols; i += tptg) {
         x_cache[i] = x[i];
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -213,15 +215,15 @@ kernel void gemv_q4_mlx_blocked(
     const uint row = tg * GEMV_BN + row_local;
     const uint groups_per_row = cols / group_size;
     const uint bytes_per_group = group_size / 2u;
-    const uint block_bytes = groups_per_row * GEMV_BN * bytes_per_group;
-    const uint block_scales = groups_per_row * GEMV_BN;
-    const uint block_base = tg * block_bytes;
-    const uint scale_block = tg * block_scales;
+    const ulong block_bytes = (ulong)groups_per_row * GEMV_BN * bytes_per_group;
+    const ulong block_scales = (ulong)groups_per_row * GEMV_BN;
+    const ulong block_base = (ulong)tg * block_bytes;
+    const ulong scale_block = (ulong)tg * block_scales;
     const bool active = (lane < n_lanes) && (row < rows);
     const bool use_tg_x = (cols <= GEMV_X_TILE);
 
     if (use_tg_x) {
-        for (uint i = lid; i < cols; i += tptg) {
+        for (ulong i = lid; i < (ulong)cols; i += tptg) {
             x_cache[i] = x[i];
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -229,13 +231,13 @@ kernel void gemv_q4_mlx_blocked(
 
     float acc = 0.0f;
     if (active) {
-        for (uint g = lane; g < groups_per_row; g += n_lanes) {
-            const uint sg = scale_block + g * GEMV_BN + row_local;
+        for (ulong g = lane; g < (ulong)groups_per_row; g += n_lanes) {
+            const ulong sg = scale_block + g * GEMV_BN + row_local;
             const bfloat2 sbv = sb[sg];
             const float scale = float(sbv.x);
             const float bias = float(sbv.y);
-            const uint xbase = g * group_size;
-            const uint pbase =
+            const ulong xbase = g * group_size;
+            const ulong pbase =
                 block_base + g * GEMV_BN * bytes_per_group + row_local * bytes_per_group;
             if (use_tg_x) {
                 acc += peel_group_dot(packed + pbase, scale, bias, x_cache, xbase, group_size);
@@ -284,17 +286,6 @@ kernel void gemv_q4_mlx_blocked(
     }
 }
 
-/// File-local: avoid ODR merge with mlp_gelu_tanh.metal. Use precise::tanh —
-/// fast_tanh NaNs for |inner|≳10 (gelu @ |x|≈20 → inner≈301).
-static inline float gelu_pytorch_tanh(float v) {
-    const float k = 0.7978845608028654f;
-    const float c = 0.044715f;
-    float xc = clamp(v, -20.0f, 20.0f);
-    float v3 = xc * xc * xc;
-    float inner = clamp(k * (xc + c * v3), -10.0f, 10.0f);
-    return 0.5f * xc * (1.0f + precise::tanh(inner));
-}
-
 /// Fused gated-MLP mid: mid[row] = gelu(W_gate[row]@x) * (W_up[row]@x).
 /// Expects cols ≤ GEMV_X_TILE (E4B/31B gate·up).
 kernel void gemv_q4_mlx_blocked_gate_up_gelu(
@@ -324,13 +315,13 @@ kernel void gemv_q4_mlx_blocked_gate_up_gelu(
     const uint row = tg * GEMV_BN + row_local;
     const uint groups_per_row = cols / group_size;
     const uint bytes_per_group = group_size / 2u;
-    const uint block_bytes = groups_per_row * GEMV_BN * bytes_per_group;
-    const uint block_scales = groups_per_row * GEMV_BN;
-    const uint block_base = tg * block_bytes;
-    const uint scale_block = tg * block_scales;
+    const ulong block_bytes = (ulong)groups_per_row * GEMV_BN * bytes_per_group;
+    const ulong block_scales = (ulong)groups_per_row * GEMV_BN;
+    const ulong block_base = (ulong)tg * block_bytes;
+    const ulong scale_block = (ulong)tg * block_scales;
     const bool active = (lane < n_lanes) && (row < rows);
 
-    for (uint i = lid; i < cols; i += tptg) {
+    for (ulong i = lid; i < (ulong)cols; i += tptg) {
         x_cache[i] = x[i];
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -338,8 +329,8 @@ kernel void gemv_q4_mlx_blocked_gate_up_gelu(
     float acc_g = 0.0f;
     float acc_u = 0.0f;
     if (active) {
-        for (uint g = lane; g < groups_per_row; g += n_lanes) {
-            const uint sg = scale_block + g * GEMV_BN + row_local;
+        for (ulong g = lane; g < (ulong)groups_per_row; g += n_lanes) {
+            const ulong sg = scale_block + g * GEMV_BN + row_local;
             (void)gate_biases_unused; (void)up_biases_unused;
             const bfloat2 gsbv = gate_sb[sg];
             const bfloat2 usbv = up_sb[sg];
@@ -347,8 +338,8 @@ kernel void gemv_q4_mlx_blocked_gate_up_gelu(
             const float gb = float(gsbv.y);
             const float us = float(usbv.x);
             const float ub = float(usbv.y);
-            const uint xbase = g * group_size;
-            const uint pbase =
+            const ulong xbase = g * group_size;
+            const ulong pbase =
                 block_base + g * GEMV_BN * bytes_per_group + row_local * bytes_per_group;
             acc_g += peel_group_dot(gate_packed + pbase, gs, gb, x_cache, xbase, group_size);
             acc_u += peel_group_dot(up_packed + pbase, us, ub, x_cache, xbase, group_size);
@@ -369,7 +360,7 @@ kernel void gemv_q4_mlx_blocked_gate_up_gelu(
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
     if (lane == 0u && row < rows) {
-        float v = gelu_pytorch_tanh(partial_g[lid]) * partial_u[lid];
+        float v = tessl_gelu_pytorch_tanh(partial_g[lid]) * partial_u[lid];
         if (mid_as_bf16 != 0u) {
             ((device bfloat *)mid)[row] = bfloat(v);
         } else {
@@ -395,46 +386,6 @@ constant uint SIMD_PACKS = 2u;
 constant uint SIMD_VPT = 8u * SIMD_PACKS;     // 16
 constant uint SIMD_BLOCK = SIMD_SIZE * SIMD_VPT; // 512
 
-/// MLX load_vector bits=4: store x with 16^k prescale + return sum(x).
-inline float load_x16_qdot(device const bfloat *x, thread float *xp)
-{
-    bfloat4 x0 = ((device const bfloat4 *)(x))[0];
-    bfloat4 x1 = ((device const bfloat4 *)(x + 4u))[0];
-    bfloat4 x2 = ((device const bfloat4 *)(x + 8u))[0];
-    bfloat4 x3 = ((device const bfloat4 *)(x + 12u))[0];
-    float a0 = float(x0.x), a1 = float(x0.y), a2 = float(x0.z), a3 = float(x0.w);
-    float a4 = float(x1.x), a5 = float(x1.y), a6 = float(x1.z), a7 = float(x1.w);
-    float a8 = float(x2.x), a9 = float(x2.y), a10 = float(x2.z), a11 = float(x2.w);
-    float a12 = float(x3.x), a13 = float(x3.y), a14 = float(x3.z), a15 = float(x3.w);
-    float sum = (a0 + a1 + a2 + a3) + (a4 + a5 + a6 + a7)
-              + (a8 + a9 + a10 + a11) + (a12 + a13 + a14 + a15);
-    // values_per_thread chunk of 4: /1, /16, /256, /4096
-    xp[0] = a0;             xp[1] = a1 / 16.0f;   xp[2] = a2 / 256.0f;  xp[3] = a3 / 4096.0f;
-    xp[4] = a4;             xp[5] = a5 / 16.0f;   xp[6] = a6 / 256.0f;  xp[7] = a7 / 4096.0f;
-    xp[8] = a8;             xp[9] = a9 / 16.0f;   xp[10] = a10 / 256.0f; xp[11] = a11 / 4096.0f;
-    xp[12] = a12;           xp[13] = a13 / 16.0f; xp[14] = a14 / 256.0f; xp[15] = a15 / 4096.0f;
-    return sum;
-}
-
-/// MLX qdot bits=4 over 16 values (2×uint / 4×ushort): scale*accum + sum*bias.
-inline float qdot16(
-    device const uchar *w,
-    thread const float *xp,
-    float scale,
-    float bias,
-    float xsum)
-{
-    device const ushort *ws = (device const ushort *)w;
-    float accum = 0.0f;
-    for (uint i = 0u; i < 4u; ++i) {
-        const ushort ww = ws[i];
-        accum += xp[4u * i] * float(ww & 0x000fu)
-               + xp[4u * i + 1u] * float(ww & 0x00f0u)
-               + xp[4u * i + 2u] * float(ww & 0x0f00u)
-               + xp[4u * i + 3u] * float(ww & 0xf000u);
-    }
-    return scale * accum + xsum * bias;
-}
 
 kernel void gemv_q4_mlx_simd(
     device const uchar *packed [[buffer(0)]],
@@ -456,20 +407,20 @@ kernel void gemv_q4_mlx_simd(
     const uint row_bytes = cols >> 1;
     const uint lane_col0 = lane * SIMD_VPT;
     // MLX qmv_fast occupancy: pointer-walk ws/sb/x across K blocks.
-    device const uchar *ws = packed + row0 * row_bytes + (lane_col0 >> 1);
-    device const bfloat2 *sbr = sb + row0 * gpr + (lane_col0 / group_size);
+    device const uchar *ws = packed + (ulong)row0 * row_bytes + (lane_col0 >> 1);
+    device const bfloat2 *sbr = sb + (ulong)row0 * gpr + (lane_col0 / group_size);
     device const bfloat *xr = x + lane_col0;
     const uint sb_k_step = SIMD_BLOCK / group_size;
     float acc[SIMD_ROWS];
     for (uint r = 0u; r < SIMD_ROWS; ++r) acc[r] = 0.0f;
-    for (uint k0 = 0u; k0 < cols; k0 += SIMD_BLOCK) {
-        if (k0 + lane_col0 + SIMD_VPT <= cols) {
+    for (ulong k0 = 0ul; k0 < (ulong)cols; k0 += SIMD_BLOCK) {
+        if (k0 + lane_col0 + SIMD_VPT <= (ulong)cols) {
             float xt[16];
             const float xsum = load_x16_qdot(xr, xt);
             for (uint r = 0u; r < SIMD_ROWS; ++r) {
                 if (row0 + r >= rows) break;
-                const bfloat2 sbv = sbr[r * gpr];
-                acc[r] += qdot16(ws + r * row_bytes, xt, float(sbv.x), float(sbv.y), xsum);
+                const bfloat2 sbv = sbr[(ulong)r * gpr];
+                acc[r] += qdot16(ws + (ulong)r * row_bytes, xt, float(sbv.x), float(sbv.y), xsum);
             }
         }
         ws += SIMD_BLOCK >> 1;
@@ -503,20 +454,20 @@ kernel void gemv_q4_mlx_simd_add(
     const uint gpr = cols / group_size;
     const uint row_bytes = cols >> 1;
     const uint lane_col0 = lane * SIMD_VPT;
-    device const uchar *ws = packed + row0 * row_bytes + (lane_col0 >> 1);
-    device const bfloat2 *sbr = sb + row0 * gpr + (lane_col0 / group_size);
+    device const uchar *ws = packed + (ulong)row0 * row_bytes + (lane_col0 >> 1);
+    device const bfloat2 *sbr = sb + (ulong)row0 * gpr + (lane_col0 / group_size);
     device const bfloat *xr = x + lane_col0;
     const uint sb_k_step = SIMD_BLOCK / group_size;
     float acc[SIMD_ROWS];
     for (uint r = 0u; r < SIMD_ROWS; ++r) acc[r] = 0.0f;
-    for (uint k0 = 0u; k0 < cols; k0 += SIMD_BLOCK) {
-        if (k0 + lane_col0 + SIMD_VPT <= cols) {
+    for (ulong k0 = 0ul; k0 < (ulong)cols; k0 += SIMD_BLOCK) {
+        if (k0 + lane_col0 + SIMD_VPT <= (ulong)cols) {
             float xt[16];
             const float xsum = load_x16_qdot(xr, xt);
             for (uint r = 0u; r < SIMD_ROWS; ++r) {
                 if (row0 + r >= rows) break;
-                const bfloat2 sbv = sbr[r * gpr];
-                acc[r] += qdot16(ws + r * row_bytes, xt, float(sbv.x), float(sbv.y), xsum);
+                const bfloat2 sbv = sbr[(ulong)r * gpr];
+                acc[r] += qdot16(ws + (ulong)r * row_bytes, xt, float(sbv.x), float(sbv.y), xsum);
             }
         }
         ws += SIMD_BLOCK >> 1;
@@ -553,25 +504,25 @@ kernel void gemv_q4_mlx_simd_gate_up_gelu(
     const uint gpr = cols / group_size;
     const uint row_bytes = cols >> 1;
     const uint lane_col0 = lane * SIMD_VPT;
-    device const uchar *gws = gate_packed + row0 * row_bytes + (lane_col0 >> 1);
-    device const uchar *uws = up_packed + row0 * row_bytes + (lane_col0 >> 1);
-    device const bfloat2 *gsbr = gate_sb + row0 * gpr + (lane_col0 / group_size);
-    device const bfloat2 *usbr = up_sb + row0 * gpr + (lane_col0 / group_size);
+    device const uchar *gws = gate_packed + (ulong)row0 * row_bytes + (lane_col0 >> 1);
+    device const uchar *uws = up_packed + (ulong)row0 * row_bytes + (lane_col0 >> 1);
+    device const bfloat2 *gsbr = gate_sb + (ulong)row0 * gpr + (lane_col0 / group_size);
+    device const bfloat2 *usbr = up_sb + (ulong)row0 * gpr + (lane_col0 / group_size);
     device const bfloat *xr = x + lane_col0;
     const uint sb_k_step = SIMD_BLOCK / group_size;
     float acc_g[SIMD_ROWS];
     float acc_u[SIMD_ROWS];
     for (uint r = 0u; r < SIMD_ROWS; ++r) { acc_g[r] = 0.0f; acc_u[r] = 0.0f; }
-    for (uint k0 = 0u; k0 < cols; k0 += SIMD_BLOCK) {
-        if (k0 + lane_col0 + SIMD_VPT <= cols) {
+    for (ulong k0 = 0ul; k0 < (ulong)cols; k0 += SIMD_BLOCK) {
+        if (k0 + lane_col0 + SIMD_VPT <= (ulong)cols) {
             float xt[16];
             const float xsum = load_x16_qdot(xr, xt);
             for (uint r = 0u; r < SIMD_ROWS; ++r) {
                 if (row0 + r >= rows) break;
-                const bfloat2 gv = gsbr[r * gpr];
-                const bfloat2 uv = usbr[r * gpr];
-                acc_g[r] += qdot16(gws + r * row_bytes, xt, float(gv.x), float(gv.y), xsum);
-                acc_u[r] += qdot16(uws + r * row_bytes, xt, float(uv.x), float(uv.y), xsum);
+                const bfloat2 gv = gsbr[(ulong)r * gpr];
+                const bfloat2 uv = usbr[(ulong)r * gpr];
+                acc_g[r] += qdot16(gws + (ulong)r * row_bytes, xt, float(gv.x), float(gv.y), xsum);
+                acc_u[r] += qdot16(uws + (ulong)r * row_bytes, xt, float(uv.x), float(uv.y), xsum);
             }
         }
         gws += SIMD_BLOCK >> 1;
@@ -585,7 +536,7 @@ kernel void gemv_q4_mlx_simd_gate_up_gelu(
         const float usum = simd_sum(acc_u[r]);
         const uint row = row0 + r;
         if (lane == 0u && row < rows) {
-            float v = gelu_pytorch_tanh(gsum) * usum;
+            float v = tessl_gelu_pytorch_tanh(gsum) * usum;
             if (mid_as_bf16 != 0u) {
                 ((device bfloat *)mid)[row] = bfloat(v);
             } else {
@@ -632,20 +583,20 @@ kernel void gemv_q4_mlx_simd_kv(
     const uint gpr = cols / group_size;
     const uint row_bytes = cols >> 1;
     const uint lane_col0 = lane * SIMD_VPT;
-    device const uchar *ws = packed + row0 * row_bytes + (lane_col0 >> 1);
-    device const bfloat2 *sbr = sb + row0 * gpr + (lane_col0 / group_size);
+    device const uchar *ws = packed + (ulong)row0 * row_bytes + (lane_col0 >> 1);
+    device const bfloat2 *sbr = sb + (ulong)row0 * gpr + (lane_col0 / group_size);
     device const bfloat *xr = x + lane_col0;
     const uint sb_k_step = SIMD_BLOCK / group_size;
     float acc[SIMD_ROWS];
     for (uint r = 0u; r < SIMD_ROWS; ++r) acc[r] = 0.0f;
-    for (uint k0 = 0u; k0 < cols; k0 += SIMD_BLOCK) {
-        if (k0 + lane_col0 + SIMD_VPT <= cols) {
+    for (ulong k0 = 0ul; k0 < (ulong)cols; k0 += SIMD_BLOCK) {
+        if (k0 + lane_col0 + SIMD_VPT <= (ulong)cols) {
             float xt[16];
             const float xsum = load_x16_qdot(xr, xt);
             for (uint r = 0u; r < SIMD_ROWS; ++r) {
                 if (row0 + r >= rows) break;
-                const bfloat2 sbv = sbr[r * gpr];
-                acc[r] += qdot16(ws + r * row_bytes, xt, float(sbv.x), float(sbv.y), xsum);
+                const bfloat2 sbv = sbr[(ulong)r * gpr];
+                acc[r] += qdot16(ws + (ulong)r * row_bytes, xt, float(sbv.x), float(sbv.y), xsum);
             }
         }
         ws += SIMD_BLOCK >> 1;
@@ -685,15 +636,15 @@ kernel void gemv_q4_mlx_simd_i4(
     const uint lane_col0 = lane * SIMD_VPT;
     float acc[SIMD_ROWS];
     for (uint r = 0u; r < SIMD_ROWS; ++r) acc[r] = 0.0f;
-    for (uint k0 = 0u; k0 < cols; k0 += SIMD_BLOCK) {
-        const uint col = k0 + lane_col0;
-        if (col + SIMD_VPT <= cols) {
+    for (ulong k0 = 0ul; k0 < (ulong)cols; k0 += SIMD_BLOCK) {
+        const ulong col = k0 + lane_col0;
+        if (col + SIMD_VPT <= (ulong)cols) {
             float xt[16];
             const float xsum = load_x16_qdot(x + col, xt);
-            const uint g = col / group_size;
-            const uint pack2 = col >> 4;
-            device const uchar *wp = packed + ((tile * packs_u2 + pack2) * SIMD_ROWS) * 8u;
-            const uint sb0 = (tile * gpr + g) * SIMD_ROWS;
+            const ulong g = col / group_size;
+            const ulong pack2 = col >> 4;
+            device const uchar *wp = packed + (((ulong)tile * packs_u2 + pack2) * SIMD_ROWS) * 8ul;
+            const ulong sb0 = ((ulong)tile * gpr + g) * SIMD_ROWS;
             for (uint r = 0u; r < SIMD_ROWS; ++r) {
                 if (row0 + r >= rows) break;
                 const bfloat2 sbv = sb[sb0 + r];
@@ -731,15 +682,15 @@ kernel void gemv_q4_mlx_simd_add_i4(
     const uint lane_col0 = lane * SIMD_VPT;
     float acc[SIMD_ROWS];
     for (uint r = 0u; r < SIMD_ROWS; ++r) acc[r] = 0.0f;
-    for (uint k0 = 0u; k0 < cols; k0 += SIMD_BLOCK) {
-        const uint col = k0 + lane_col0;
-        if (col + SIMD_VPT <= cols) {
+    for (ulong k0 = 0ul; k0 < (ulong)cols; k0 += SIMD_BLOCK) {
+        const ulong col = k0 + lane_col0;
+        if (col + SIMD_VPT <= (ulong)cols) {
             float xt[16];
             const float xsum = load_x16_qdot(x + col, xt);
-            const uint g = col / group_size;
-            const uint pack2 = col >> 4;
-            device const uchar *wp = packed + ((tile * packs_u2 + pack2) * SIMD_ROWS) * 8u;
-            const uint sb0 = (tile * gpr + g) * SIMD_ROWS;
+            const ulong g = col / group_size;
+            const ulong pack2 = col >> 4;
+            device const uchar *wp = packed + (((ulong)tile * packs_u2 + pack2) * SIMD_ROWS) * 8ul;
+            const ulong sb0 = ((ulong)tile * gpr + g) * SIMD_ROWS;
             for (uint r = 0u; r < SIMD_ROWS; ++r) {
                 if (row0 + r >= rows) break;
                 const bfloat2 sbv = sb[sb0 + r];
@@ -781,15 +732,15 @@ kernel void gemv_q4_mlx_simd_gate_up_gelu_i4(
     float acc_g[SIMD_ROWS];
     float acc_u[SIMD_ROWS];
     for (uint r = 0u; r < SIMD_ROWS; ++r) { acc_g[r] = 0.0f; acc_u[r] = 0.0f; }
-    for (uint k0 = 0u; k0 < cols; k0 += SIMD_BLOCK) {
-        const uint col = k0 + lane_col0;
-        if (col + SIMD_VPT <= cols) {
+    for (ulong k0 = 0ul; k0 < (ulong)cols; k0 += SIMD_BLOCK) {
+        const ulong col = k0 + lane_col0;
+        if (col + SIMD_VPT <= (ulong)cols) {
             float xt[16];
             const float xsum = load_x16_qdot(x + col, xt);
-            const uint g = col / group_size;
-            const uint pack2 = col >> 4;
-            const uint base = ((tile * packs_u2 + pack2) * SIMD_ROWS) * 8u;
-            const uint sb0 = (tile * gpr + g) * SIMD_ROWS;
+            const ulong g = col / group_size;
+            const ulong pack2 = col >> 4;
+            const ulong base = (((ulong)tile * packs_u2 + pack2) * SIMD_ROWS) * 8ul;
+            const ulong sb0 = ((ulong)tile * gpr + g) * SIMD_ROWS;
             for (uint r = 0u; r < SIMD_ROWS; ++r) {
                 if (row0 + r >= rows) break;
                 const bfloat2 gv = gate_sb[sb0 + r];
@@ -804,7 +755,7 @@ kernel void gemv_q4_mlx_simd_gate_up_gelu_i4(
         const float usum = simd_sum(acc_u[r]);
         const uint row = row0 + r;
         if (lane == 0u && row < rows) {
-            float v = gelu_pytorch_tanh(gsum) * usum;
+            float v = tessl_gelu_pytorch_tanh(gsum) * usum;
             if (mid_as_bf16 != 0u) {
                 ((device bfloat *)mid)[row] = bfloat(v);
             } else {
@@ -851,15 +802,15 @@ kernel void gemv_q4_mlx_simd_kv_i4(
     const uint lane_col0 = lane * SIMD_VPT;
     float acc[SIMD_ROWS];
     for (uint r = 0u; r < SIMD_ROWS; ++r) acc[r] = 0.0f;
-    for (uint k0 = 0u; k0 < cols; k0 += SIMD_BLOCK) {
-        const uint col = k0 + lane_col0;
-        if (col + SIMD_VPT <= cols) {
+    for (ulong k0 = 0ul; k0 < (ulong)cols; k0 += SIMD_BLOCK) {
+        const ulong col = k0 + lane_col0;
+        if (col + SIMD_VPT <= (ulong)cols) {
             float xt[16];
             const float xsum = load_x16_qdot(x + col, xt);
-            const uint g = col / group_size;
-            const uint pack2 = col >> 4;
-            device const uchar *wp = packed + ((tile * packs_u2 + pack2) * SIMD_ROWS) * 8u;
-            const uint sb0 = (tile * gpr + g) * SIMD_ROWS;
+            const ulong g = col / group_size;
+            const ulong pack2 = col >> 4;
+            device const uchar *wp = packed + (((ulong)tile * packs_u2 + pack2) * SIMD_ROWS) * 8ul;
+            const ulong sb0 = ((ulong)tile * gpr + g) * SIMD_ROWS;
             for (uint r = 0u; r < SIMD_ROWS; ++r) {
                 if (row0 + r >= rows) break;
                 const bfloat2 sbv = sb[sb0 + r];
@@ -892,14 +843,14 @@ kernel void gemv_q4_mlx_tiled(
     const uint row = tg;
     const uint groups_per_row = cols / group_size;
     float acc = 0.0f;
-    for (uint g = tid; g < groups_per_row; g += GEMV_TG) {
-        const uint gi = row * groups_per_row + g;
+    for (ulong g = tid; g < (ulong)groups_per_row; g += GEMV_TG) {
+        const ulong gi = (ulong)row * groups_per_row + g;
         const bfloat2 sbv = sb[gi];
         const float scale = float(sbv.x);
         const float bias = float(sbv.y);
-        const uint base = row * cols + g * group_size;
-        const uint xbase = g * group_size;
-        for (uint i = 0; i < group_size; ++i) {
+        const ulong base = (ulong)row * cols + g * group_size;
+        const ulong xbase = g * group_size;
+        for (ulong i = 0ul; i < (ulong)group_size; ++i) {
             acc += dequant_q4_u_bias(packed, base + i, scale, bias) * x[xbase + i];
         }
     }
@@ -977,20 +928,20 @@ kernel void gemv_q4_mlx_simd_qkv(
     const uint gpr = cols / group_size;
     const uint row_bytes = cols >> 1;
     const uint lane_col0 = lane * SIMD_VPT;
-    device const uchar *ws = packed + row0 * row_bytes + (lane_col0 >> 1);
-    device const bfloat2 *sbr = sb + row0 * gpr + (lane_col0 / group_size);
+    device const uchar *ws = packed + (ulong)row0 * row_bytes + (lane_col0 >> 1);
+    device const bfloat2 *sbr = sb + (ulong)row0 * gpr + (lane_col0 / group_size);
     device const bfloat *xr = x + lane_col0;
     const uint sb_k_step = SIMD_BLOCK / group_size;
     float acc[SIMD_ROWS];
     for (uint r = 0u; r < SIMD_ROWS; ++r) acc[r] = 0.0f;
-    for (uint k0 = 0u; k0 < cols; k0 += SIMD_BLOCK) {
-        if (k0 + lane_col0 + SIMD_VPT <= cols) {
+    for (ulong k0 = 0ul; k0 < (ulong)cols; k0 += SIMD_BLOCK) {
+        if (k0 + lane_col0 + SIMD_VPT <= (ulong)cols) {
             float xt[16];
             const float xsum = load_x16_qdot(xr, xt);
             for (uint r = 0u; r < SIMD_ROWS; ++r) {
                 if (row0 + r >= rows) break;
-                const bfloat2 sbv = sbr[r * gpr];
-                acc[r] += qdot16(ws + r * row_bytes, xt, float(sbv.x), float(sbv.y), xsum);
+                const bfloat2 sbv = sbr[(ulong)r * gpr];
+                acc[r] += qdot16(ws + (ulong)r * row_bytes, xt, float(sbv.x), float(sbv.y), xsum);
             }
         }
         ws += SIMD_BLOCK >> 1;
@@ -1049,15 +1000,15 @@ kernel void gemv_q4_mlx_simd_qkv_i4(
     const uint lane_col0 = lane * SIMD_VPT;
     float acc[SIMD_ROWS];
     for (uint r = 0u; r < SIMD_ROWS; ++r) acc[r] = 0.0f;
-    for (uint k0 = 0u; k0 < cols; k0 += SIMD_BLOCK) {
-        const uint col = k0 + lane_col0;
-        if (col + SIMD_VPT <= cols) {
+    for (ulong k0 = 0ul; k0 < (ulong)cols; k0 += SIMD_BLOCK) {
+        const ulong col = k0 + lane_col0;
+        if (col + SIMD_VPT <= (ulong)cols) {
             float xt[16];
             const float xsum = load_x16_qdot(x + col, xt);
-            const uint g = col / group_size;
-            const uint pack2 = col >> 4;
-            device const uchar *wp = packed + ((tile * packs_u2 + pack2) * SIMD_ROWS) * 8u;
-            const uint sb0 = (tile * gpr + g) * SIMD_ROWS;
+            const ulong g = col / group_size;
+            const ulong pack2 = col >> 4;
+            device const uchar *wp = packed + (((ulong)tile * packs_u2 + pack2) * SIMD_ROWS) * 8ul;
+            const ulong sb0 = ((ulong)tile * gpr + g) * SIMD_ROWS;
             for (uint r = 0u; r < SIMD_ROWS; ++r) {
                 if (row0 + r >= rows) break;
                 const bfloat2 sbv = sb[sb0 + r];

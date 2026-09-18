@@ -257,9 +257,11 @@ fn an_offset_output_view_matches_the_same_gemm_at_offset_zero() {
         rt.synchronize().unwrap();
         let baseline = flat.buffer.read_f32();
 
-        let backing = rt.alloc_tensor_f32(&[4 * m * n]).unwrap();
+        let backing = rt.alloc_tensor_f32(&[4 * m * n + 16]).unwrap();
+        // Stride between slots must keep every view 16-byte aligned.
+        let stride = (m * n).div_ceil(4) * 4;
         for slot in 0..4 {
-            let view: Tensor = backing.view(&[m, n], slot * m * n);
+            let view: Tensor = backing.view(&[m, n], slot * stride);
             gemm_f32(&a, &b, &view, GemmBackend::TensorOps).unwrap();
             rt.synchronize().unwrap();
             let all = backing.buffer.read_f32();
@@ -267,9 +269,53 @@ fn an_offset_output_view_matches_the_same_gemm_at_offset_zero() {
                 "f32 NN at an offset",
                 slot,
                 &baseline,
-                &all[slot * m * n..(slot + 1) * m * n],
+                &all[slot * stride..slot * stride + m * n],
             );
         }
         assert!(baseline.iter().any(|&x| x != 0.0), "output stayed zero");
+    });
+}
+
+#[test]
+fn splitk_under_hazard_skip_auto_stays_bit_identical_amid_neighbours() {
+    with_gpu(|rt| {
+        // Plan 2.3: under HAZARD_BARRIERS skip-auto the per-dispatch auto
+        // barrier is gone; split-K still places explicit barriers between
+        // partitions. Pack neighbouring GEMMs around a split-K shape under
+        // async encode — if partition serialization ever races, bits drift.
+        // Scratch tree reduction is *not* added unless this fails.
+        tessl::ab_flags::set_hazard_barriers(true);
+        rt.set_async_encode(true).unwrap();
+
+        let (m, n, k) = (128, 128, 2048);
+        let a = tensor_f32(rt, &[k, m], &random_f32(k * m, 21));
+        let b = tensor_f32(rt, &[k, n], &random_f32(k * n, 22));
+        let c = rt.alloc_tensor_f32(&[m, n]).unwrap();
+
+        let noise_a = tensor_f32(rt, &[64, 96], &random_f32(64 * 96, 23));
+        let noise_b = tensor_f32(rt, &[96, 80], &random_f32(96 * 80, 24));
+        let noise_c = rt.alloc_tensor_f32(&[64, 80]).unwrap();
+
+        let mut first: Option<Vec<f32>> = None;
+        for run in 0..24 {
+            for _ in 0..(run % 3) {
+                gemm_f32(&noise_a, &noise_b, &noise_c, GemmBackend::TensorOps).unwrap();
+            }
+            gemm_tn_f32(&a, &b, &c, GemmBackend::TensorOps).unwrap();
+            for _ in 0..(run % 2) {
+                gemm_f32(&noise_a, &noise_b, &noise_c, GemmBackend::Simdgroup).unwrap();
+            }
+            rt.synchronize().unwrap();
+            let got = c.buffer.read_f32();
+            match &first {
+                None => first = Some(got),
+                Some(f) => assert_same_bits("f32 TN split-K hazard skip-auto", run, f, &got),
+            }
+        }
+        assert!(
+            first.unwrap().iter().any(|&x| x != 0.0),
+            "split-K output stayed zero"
+        );
+        tessl::ab_flags::set_hazard_barriers(false);
     });
 }

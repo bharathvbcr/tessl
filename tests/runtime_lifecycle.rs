@@ -206,12 +206,10 @@ fn bump_arena_hands_out_zeroed_slices_and_reports_exhaustion() {
         for i in 0..8 {
             let t = rt.bump_alloc_f32(&[64]).unwrap();
             assert!(
-                t.buffer.read_f32()[t.byte_offset / 4..][..64]
-                    .iter()
-                    .all(|&x| x == 0.0),
+                t.read_f32().unwrap().iter().all(|&x| x == 0.0),
                 "bump slice {i} was not zeroed"
             );
-            t.buffer.write_f32_prefix(&[i as f32 + 1.0]);
+            t.write_f32(&[i as f32 + 1.0; 64]).unwrap();
             views.push(t);
         }
 
@@ -228,16 +226,16 @@ fn bump_arena_hands_out_zeroed_slices_and_reports_exhaustion() {
         // contents.
         let marks: Vec<f32> = views
             .iter()
-            .map(|t| t.buffer.read_f32()[t.byte_offset / 4])
+            .map(|t| t.read_f32().unwrap()[0])
             .collect();
-        rt.bump_reset();
+        rt.bump_reset().unwrap();
         let after_reset = rt.bump_alloc_f32(&[512]).unwrap();
         after_reset
-            .buffer
-            .write_f32_prefix(&vec![-1.0f32; after_reset.numel()]);
+            .write_f32(&vec![-1.0f32; after_reset.numel()])
+            .unwrap();
         for (i, t) in views.iter().enumerate() {
             assert_eq!(
-                t.buffer.read_f32()[t.byte_offset / 4],
+                t.read_f32().unwrap()[0],
                 marks[i],
                 "bump reset aliased a live view (slice {i})"
             );
@@ -249,6 +247,59 @@ fn bump_arena_hands_out_zeroed_slices_and_reports_exhaustion() {
             rt.ensure_bump(usize::MAX).unwrap_err(),
             "bump capacity overflow"
         );
+    });
+}
+
+/// Views hand out their own window, not the slab: reading or writing through
+/// the view reaches only its elements, and a wrong-length write is refused.
+#[test]
+fn bump_views_read_and_write_only_their_own_window() {
+    with_gpu(|rt| {
+        rt.ensure_bump(1 << 16).unwrap();
+        let a = rt.bump_alloc_f32(&[64]).unwrap();
+        let b = rt.bump_alloc_f32(&[64]).unwrap();
+        assert_ne!(a.byte_offset(), b.byte_offset());
+        b.write_f32(&[1.0; 64]).unwrap();
+        assert!(
+            a.read_f32().unwrap().iter().all(|&x| x == 0.0),
+            "writing b landed on a's window"
+        );
+        assert!(b.read_f32().unwrap().iter().all(|&x| x == 1.0));
+        assert!(
+            b.write_f32(&[0.0; 63]).is_err(),
+            "a short write must be refused, not silently partial"
+        );
+        // The whole-slab accessor still exists for callers who want it; the
+        // view's window is where b's ones actually are.
+        assert_eq!(b.buffer.read_f32()[b.byte_offset() / 4], 1.0);
+    });
+}
+
+/// `bump_reset` reports the conditions `bump_alloc_f32` reports, instead of
+/// panicking on them: a live host mapping makes the runtime busy.
+#[test]
+fn bump_reset_reports_a_busy_runtime_instead_of_panicking() {
+    with_gpu(|rt| {
+        rt.ensure_bump(4096).unwrap();
+        let t = rt.bump_alloc_f32(&[4]).unwrap();
+        let mapping = t.buffer.contents_f32();
+        let err = rt.bump_reset().unwrap_err();
+        assert!(err.contains("busy"), "{err}");
+        drop(mapping);
+        rt.bump_reset().unwrap();
+    });
+}
+
+/// Only an exhausted arena falls through to the pool. A poisoned runtime is
+/// an error, not a pool allocation that quietly bypasses the arena.
+#[test]
+fn alloc_temp_refuses_a_poisoned_runtime_instead_of_bypassing_the_bump_arena() {
+    with_gpu(|rt| {
+        rt.ensure_bump(1 << 16).unwrap();
+        rt.set_async_encode(true).unwrap();
+        assert!(rt.with_binder(|_| Err("injected".into())).is_err());
+        let err = rt.alloc_temp_f32(&[64]).map(|_| ()).unwrap_err();
+        assert!(err.contains("poisoned"), "{err}");
     });
 }
 
@@ -326,15 +377,20 @@ fn externally_allocated_storage_can_back_a_gemm_output() {
         let b_host = random_f32(k * n, 52);
         let expect = reference(Layout::Nn, &a_host, &b_host, m, n, k);
 
-        let bytes = (m * k + k * n + m * n) * DType::F32.size_of();
-        let arena = rt.alloc_buffer(bytes).unwrap();
+        // Pad each matrix start to a 16-byte boundary so validate_gemm's
+        // alignment gate is not what this wiring test exercises.
+        let a_elems = m * k;
+        let b_off_elems = a_elems.div_ceil(4) * 4;
+        let c_off_elems = (b_off_elems + k * n).div_ceil(4) * 4;
+        let total_elems = c_off_elems + m * n;
+        let arena = rt.alloc_buffer(total_elems * DType::F32.size_of()).unwrap();
         let a = Tensor::from_buffer(rt, arena.clone(), &[m, k], DType::F32, 0).unwrap();
         let b = Tensor::from_buffer(
             rt,
             arena.clone(),
             &[k, n],
             DType::F32,
-            m * k * DType::F32.size_of(),
+            b_off_elems * DType::F32.size_of(),
         )
         .unwrap();
         let c = Tensor::from_buffer(
@@ -342,31 +398,35 @@ fn externally_allocated_storage_can_back_a_gemm_output() {
             arena.clone(),
             &[m, n],
             DType::F32,
-            (m * k + k * n) * DType::F32.size_of(),
+            c_off_elems * DType::F32.size_of(),
         )
         .unwrap();
 
         {
             let mut host = arena.contents_f32();
-            host[..m * k].copy_from_slice(&a_host);
-            host[m * k..m * k + k * n].copy_from_slice(&b_host);
-            host[m * k + k * n..].fill(-7.0);
+            host[..a_elems].copy_from_slice(&a_host);
+            host[b_off_elems..b_off_elems + k * n].copy_from_slice(&b_host);
+            host[c_off_elems..].fill(-7.0);
         }
         gemm_f32(&a, &b, &c, GemmBackend::TensorOps).unwrap();
         rt.synchronize().unwrap();
 
         let host = arena.read_f32();
         assert_within_bound(
-            "gemm into caller-owned storage",
-            &host[m * k + k * n..],
+            "external arena GEMM",
+            &host[c_off_elems..c_off_elems + m * n],
             &expect,
             k,
             0.0,
         );
         // The operands share the allocation; a kernel writing outside C's
         // window would have corrupted them.
-        assert_eq!(&host[..m * k], &a_host[..], "A was modified");
-        assert_eq!(&host[m * k..m * k + k * n], &b_host[..], "B was modified");
+        assert_eq!(&host[..a_elems], &a_host[..], "A was modified");
+        assert_eq!(
+            &host[b_off_elems..b_off_elems + k * n],
+            &b_host[..],
+            "B was modified"
+        );
     });
 }
 

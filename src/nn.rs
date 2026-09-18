@@ -14,26 +14,49 @@
 //! happened to be resident. The wrappers below reject that on the host, before
 //! encoding, because it is the only place it can still be caught.
 //!
-//! # The `_with_scalars` seam
+//! # Safety of the `_with_scalars` seam
 //!
 //! Each kernel has two entry points. The plain one binds its scalar operands
 //! through the runtime's const arena and is what most callers want. The
-//! `_with_scalars` one takes a closure that binds them itself, for callers
+//! `unsafe` `_with_scalars` one takes a closure that binds them itself, for callers
 //! that need *stable* GPU addresses across encodes — const-arena offsets move
 //! from one encode to the next, which breaks an Indirect Command Buffer that
 //! froze its binds. `gemma-metal` drives these from a persistent scalar pool
 //! for exactly that reason.
 //!
-//! The closure receives the binder and must fill the scalar indices named in
-//! each function's docs. Buffer operands and the dispatch shape are bound here,
-//! so the two paths cannot disagree about them.
+//! The closure receives the full [`Binder`], so the type system cannot stop it
+//! from replacing a validated data-buffer bind, changing the pipeline, or
+//! binding a device scalar whose contents disagree with the host values used
+//! for validation and dispatch. A violation can turn a safe-looking call into
+//! an out-of-bounds GPU access. Every `_with_scalars` caller must therefore:
+//!
+//! - bind every scalar index documented by that function exactly once, with the
+//!   documented ABI type and the exact value passed to the host wrapper;
+//! - bind no other index and perform no pipeline, dispatch, ICB, or resource
+//!   mutation through the supplied binder; and
+//! - ensure every buffer used as stable scalar storage belongs to `rt`, covers
+//!   the bound value at its offset, and remains alive and resident until the
+//!   encoded work completes (or through every replay of an ICB that froze it).
+//!
+//! Prefer the plain safe entry points unless stable addresses are required.
+//!
+//! ```compile_fail
+//! use std::sync::Arc;
+//! use tessl::{nn, GpuBuffer, GpuRuntime};
+//!
+//! fn invalid_safe_call(rt: &Arc<GpuRuntime>, x: &GpuBuffer, w: &GpuBuffer, out: &GpuBuffer) {
+//!     nn::rms_norm_f32_with_scalars(rt, x, w, out, 1, 1, |_| {});
+//! }
+//! ```
 
 use std::sync::Arc;
 
 use objc2::runtime::ProtocolObject;
 use objc2_metal::MTLComputePipelineState;
 
-use crate::dispatch::{dispatch_1d, dispatch_2d_tg, set_f32, set_gpu_buf, set_u32, Binder};
+use crate::dispatch::{
+    dispatch_1d, dispatch_2d_tg, set_f32, set_gpu_buf, set_u32, validate_dispatch_geometry, Binder,
+};
 use crate::runtime::{mtl_size, GpuRuntime};
 use crate::tensor::GpuBuffer;
 
@@ -44,18 +67,241 @@ fn capacity_of<T>(buf: &GpuBuffer) -> usize {
 
 /// `rows * dim`, or an error naming the overflow rather than wrapping.
 fn elems(rows: u32, dim: u32, what: &str) -> Result<usize, String> {
-    (rows as usize)
-        .checked_mul(dim as usize)
-        .ok_or_else(|| format!("{what}: rows {rows} x dim {dim} overflows usize"))
+    elems_product(&[rows, dim], what)
 }
 
-/// Reject a buffer that cannot hold `need` elements of `T`.
-fn require<T>(buf: &GpuBuffer, need: usize, what: &str) -> Result<(), String> {
+/// Product of device `u32` dimensions, widened before every multiplication.
+fn elems_product(dims: &[u32], what: &str) -> Result<usize, String> {
+    dims.iter()
+        .try_fold(1usize, |product, &dim| product.checked_mul(dim as usize))
+        .ok_or_else(|| format!("{what}: dimension product overflows usize"))
+}
+
+/// Tessl's 1D NN shaders expose `thread_position_in_grid` as Metal `uint`.
+/// Reject a larger host extent before pipeline lookup or binder creation rather
+/// than relying on a late dispatch-layer refusal.
+fn require_1d_indexable(n: usize, what: &str) -> Result<(), String> {
+    if n > u32::MAX as usize {
+        return Err(format!("{what}: 1D extent {n} exceeds Metal uint indexing"));
+    }
+    Ok(())
+}
+
+fn require_runtime(rt: &GpuRuntime, buf: &GpuBuffer, what: &str) -> Result<(), String> {
+    if !buf.belongs_to(rt) {
+        return Err(format!("{what}: buffer belongs to another runtime"));
+    }
+    Ok(())
+}
+
+fn require_capacity<T>(buf: &GpuBuffer, need: usize, what: &str) -> Result<(), String> {
     let have = capacity_of::<T>(buf);
     if have < need {
         return Err(format!(
             "{what}: buffer holds {have} elements, kernel reads/writes {need}"
         ));
+    }
+    Ok(())
+}
+
+fn require<T>(rt: &GpuRuntime, buf: &GpuBuffer, need: usize, what: &str) -> Result<(), String> {
+    require_runtime(rt, buf, what)?;
+    require_capacity::<T>(buf, need, what)
+}
+
+fn require_disjoint_writes(
+    entry: &str,
+    writes: &[(&str, &GpuBuffer)],
+    reads: &[(&str, &GpuBuffer)],
+) -> Result<(), String> {
+    for (i, &(lhs_name, lhs)) in writes.iter().enumerate() {
+        for &(rhs_name, rhs) in &writes[i + 1..] {
+            if lhs.aliases(rhs) {
+                return Err(format!(
+                    "{entry}: writable buffers {lhs_name} and {rhs_name} overlap"
+                ));
+            }
+        }
+        for &(read_name, read) in reads {
+            if lhs.aliases(read) {
+                return Err(format!(
+                    "{entry}: writable buffer {lhs_name} overlaps read-only buffer {read_name}"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_rms_scalars(dim: u32, eps: f32, what: &str) -> Result<(), String> {
+    if dim == 0 {
+        return Err(format!("{what}: dim must be non-zero"));
+    }
+    if !eps.is_finite() || eps <= 0.0 {
+        return Err(format!("{what}: eps must be finite and positive"));
+    }
+    Ok(())
+}
+
+pub fn attn_kv_capacity(
+    k: &GpuBuffer,
+    v: &GpuBuffer,
+    batch: u32,
+    heads_kv: u32,
+    head_dim: u32,
+) -> Result<u32, String> {
+    attn_kv_capacity_for(k, v, batch, heads_kv, head_dim, "attention")
+}
+
+fn attn_kv_capacity_for(
+    k: &GpuBuffer,
+    v: &GpuBuffer,
+    batch: u32,
+    heads_kv: u32,
+    head_dim: u32,
+    what: &str,
+) -> Result<u32, String> {
+    if heads_kv == 0 {
+        return Err(format!("{what}: heads_kv must be non-zero"));
+    }
+    if head_dim == 0 {
+        return Err(format!("{what}: head_dim must be non-zero"));
+    }
+    let per_position = elems_product(&[batch, heads_kv, head_dim], what)?;
+    if per_position == 0 {
+        return Ok(0);
+    }
+    let k_positions = capacity_of::<f32>(k) / per_position;
+    let v_positions = capacity_of::<f32>(v) / per_position;
+    if k_positions != v_positions {
+        return Err(format!(
+            "{what}: K and V imply different fixed capacities ({k_positions} vs \
+             {v_positions} positions)"
+        ));
+    }
+    u32::try_from(k_positions)
+        .map_err(|_| format!("{what}: KV capacity {k_positions} exceeds the device u32 range"))
+}
+
+/// Validate shared attention storage and return the safe fixed KV capacity.
+///
+/// This is exposed for host adapters that bind Tessl's Metal entry points
+/// directly to stable scalar pools. It validates dimensions, Q/O extents,
+/// output-vs-input aliasing, and derives the complete position count jointly
+/// backed by K and V. The returned capacity is the batch stride required by the
+/// kernels as well as the upper bound for their live device-side `Tkv`.
+/// F32 output may alias Q: one-pass kernels retain a query row until its output
+/// store, and decode finishes every Q read in the partial pass before reduce
+/// writes. BF16 output may not alias Q because its packed addresses overlap
+/// different f32 query rows. Output never aliases K or V.
+pub fn validate_attn_storage(
+    dims: &AttnDims,
+    d: u32,
+    q: &GpuBuffer,
+    k: &GpuBuffer,
+    v: &GpuBuffer,
+    o: &GpuBuffer,
+    out_bf16: bool,
+) -> Result<u32, String> {
+    validate_attn_storage_for(dims, d, q, k, v, o, "attention", out_bf16)
+}
+
+fn validate_attn_storage_for(
+    dims: &AttnDims,
+    d: u32,
+    q: &GpuBuffer,
+    k: &GpuBuffer,
+    v: &GpuBuffer,
+    o: &GpuBuffer,
+    what: &str,
+    out_bf16: bool,
+) -> Result<u32, String> {
+    validate_attn_dims(dims, d, q, o, what, out_bf16)?;
+    let capacity = attn_kv_capacity_for(k, v, dims.batch, dims.heads_kv, d, what)?;
+    let has_work = dims.batch != 0 && dims.tq != 0 && dims.heads != 0;
+    if !has_work {
+        return Ok(capacity);
+    }
+    if out_bf16 && o.aliases(q) {
+        return Err(format!(
+            "{what}: bf16 output must not alias the f32 q input"
+        ));
+    }
+    for (input, name) in [(k, "k"), (v, "v")] {
+        if o.aliases(input) {
+            return Err(format!(
+                "{what}: output must not alias read-only {name} input"
+            ));
+        }
+    }
+    if capacity == 0 {
+        return Err(format!(
+            "{what}: K/V buffers do not jointly back one complete KV position"
+        ));
+    }
+    Ok(capacity)
+}
+
+fn require_attn_runtime(
+    rt: &GpuRuntime,
+    q: &GpuBuffer,
+    k: &GpuBuffer,
+    v: &GpuBuffer,
+    o: &GpuBuffer,
+    what: &str,
+) -> Result<(), String> {
+    for (name, buffer) in [("q", q), ("k", k), ("v", v), ("o", o)] {
+        require_runtime(rt, buffer, &format!("{what} {name}"))?;
+    }
+    Ok(())
+}
+
+fn validate_attn_live_scalar_aliases(
+    dims: &AttnDims,
+    o: &GpuBuffer,
+    tkv: &GpuBuffer,
+    q_pos_offset: &GpuBuffer,
+    kv_pos_offset: &GpuBuffer,
+    what: &str,
+) -> Result<(), String> {
+    validate_attn_output_scalar_aliases_for(
+        dims,
+        o,
+        &[
+            ("tkv", tkv),
+            ("q_pos_offset", q_pos_offset),
+            ("kv_pos_offset", kv_pos_offset),
+        ],
+        what,
+    )
+}
+
+/// Reject output aliases with caller-owned scalar storage used by attention.
+///
+/// Direct adapters that bind Tessl kernels from stable scalar pools must call
+/// this alongside [`validate_attn_storage`]. Read/read scalar aliases remain
+/// valid. A zero-work shape is a clean no-op and accepts placeholder aliases.
+pub fn validate_attn_output_scalar_aliases(
+    dims: &AttnDims,
+    o: &GpuBuffer,
+    scalars: &[(&str, &GpuBuffer)],
+) -> Result<(), String> {
+    validate_attn_output_scalar_aliases_for(dims, o, scalars, "attention")
+}
+
+fn validate_attn_output_scalar_aliases_for(
+    dims: &AttnDims,
+    o: &GpuBuffer,
+    scalars: &[(&str, &GpuBuffer)],
+    what: &str,
+) -> Result<(), String> {
+    if dims.batch == 0 || dims.tq == 0 || dims.heads == 0 {
+        return Ok(());
+    }
+    for &(name, scalar) in scalars {
+        if o.aliases(scalar) {
+            return Err(format!("{what}: output must not alias live {name} scalar"));
+        }
     }
     Ok(())
 }
@@ -75,15 +321,19 @@ pub fn rms_norm_f32(
     dim: u32,
     eps: f32,
 ) -> Result<(), String> {
-    rms_norm_f32_with_scalars(rt, x, weight, out, rows, dim, |bnd| {
-        set_u32(bnd, rows, 3);
-        set_u32(bnd, dim, 4);
-        set_f32(bnd, eps, 5);
-    })
+    validate_rms_scalars(dim, eps, "rms_norm_f32")?;
+    // SAFETY: binds only documented scalar slots with validated host values.
+    unsafe {
+        rms_norm_f32_with_scalars(rt, x, weight, out, rows, dim, |bnd| {
+            set_u32(bnd, rows, 3);
+            set_u32(bnd, dim, 4);
+            set_f32(bnd, eps, 5);
+        })
+    }
 }
 
 /// [`rms_norm_f32`] with caller-supplied scalar binds. See the module docs.
-pub fn rms_norm_f32_with_scalars(
+pub unsafe fn rms_norm_f32_with_scalars(
     rt: &Arc<GpuRuntime>,
     x: &GpuBuffer,
     weight: &GpuBuffer,
@@ -93,12 +343,13 @@ pub fn rms_norm_f32_with_scalars(
     scalars: impl FnOnce(&mut Binder<'_>),
 ) -> Result<(), String> {
     let n = elems(rows, dim, "rms_norm_f32")?;
-    require::<f32>(x, n, "rms_norm_f32 x")?;
-    require::<f32>(weight, dim as usize, "rms_norm_f32 weight")?;
-    require::<f32>(out, n, "rms_norm_f32 out")?;
+    require::<f32>(rt, x, n, "rms_norm_f32 x")?;
+    require::<f32>(rt, weight, dim as usize, "rms_norm_f32 weight")?;
+    require::<f32>(rt, out, n, "rms_norm_f32 out")?;
     if rows == 0 {
         return Ok(());
     }
+    require_disjoint_writes("rms_norm_f32", &[("out", out)], &[("weight", weight)])?;
     let p = rt.pipeline("rms_norm_f32")?;
     // One threadgroup per row with a tree reduction, matching `row_reduce`.
     // Was `dispatch_1d(rt, &p, rows)` — one thread per row — which capped
@@ -125,15 +376,19 @@ pub fn rms_norm_bf16(
     dim: u32,
     eps: f32,
 ) -> Result<(), String> {
-    rms_norm_bf16_with_scalars(rt, x, weight, out, rows, dim, |bnd| {
-        set_u32(bnd, rows, 3);
-        set_u32(bnd, dim, 4);
-        set_f32(bnd, eps, 5);
-    })
+    validate_rms_scalars(dim, eps, "rms_norm_bf16")?;
+    // SAFETY: binds only documented scalar slots with validated host values.
+    unsafe {
+        rms_norm_bf16_with_scalars(rt, x, weight, out, rows, dim, |bnd| {
+            set_u32(bnd, rows, 3);
+            set_u32(bnd, dim, 4);
+            set_f32(bnd, eps, 5);
+        })
+    }
 }
 
 /// [`rms_norm_bf16`] with caller-supplied scalar binds.
-pub fn rms_norm_bf16_with_scalars(
+pub unsafe fn rms_norm_bf16_with_scalars(
     rt: &Arc<GpuRuntime>,
     x: &GpuBuffer,
     weight: &GpuBuffer,
@@ -143,13 +398,18 @@ pub fn rms_norm_bf16_with_scalars(
     scalars: impl FnOnce(&mut Binder<'_>),
 ) -> Result<(), String> {
     let n = elems(rows, dim, "rms_norm_bf16")?;
-    require::<f32>(x, n, "rms_norm_bf16 x")?;
-    require::<f32>(weight, dim as usize, "rms_norm_bf16 weight")?;
+    require::<f32>(rt, x, n, "rms_norm_bf16 x")?;
+    require::<f32>(rt, weight, dim as usize, "rms_norm_bf16 weight")?;
     // bf16 output: two bytes per element, not four.
-    require::<u16>(out, n, "rms_norm_bf16 out")?;
+    require::<u16>(rt, out, n, "rms_norm_bf16 out")?;
     if rows == 0 {
         return Ok(());
     }
+    require_disjoint_writes(
+        "rms_norm_bf16",
+        &[("out", out)],
+        &[("x", x), ("weight", weight)],
+    )?;
     let p = rt.pipeline("rms_norm_bf16")?;
     let tptg = reduce_tptg(p.maxTotalThreadsPerThreadgroup(), dim as usize);
     dispatch_tg_1d(rt, &p, rows as usize, tptg, None, |bnd| {
@@ -178,16 +438,20 @@ pub fn rms_norm_residual_add_f32(
     eps: f32,
     layer_scale: f32,
 ) -> Result<(), String> {
-    rms_norm_residual_add_f32_with_scalars(rt, x, weight, resid, rows, dim, |bnd| {
-        set_u32(bnd, rows, 3);
-        set_u32(bnd, dim, 4);
-        set_f32(bnd, eps, 5);
-        set_f32(bnd, layer_scale, 6);
-    })
+    validate_rms_scalars(dim, eps, "rms_norm_residual_add_f32")?;
+    // SAFETY: binds only documented scalar slots with validated host values.
+    unsafe {
+        rms_norm_residual_add_f32_with_scalars(rt, x, weight, resid, rows, dim, |bnd| {
+            set_u32(bnd, rows, 3);
+            set_u32(bnd, dim, 4);
+            set_f32(bnd, eps, 5);
+            set_f32(bnd, layer_scale, 6);
+        })
+    }
 }
 
 /// [`rms_norm_residual_add_f32`] with caller-supplied scalar binds.
-pub fn rms_norm_residual_add_f32_with_scalars(
+pub unsafe fn rms_norm_residual_add_f32_with_scalars(
     rt: &Arc<GpuRuntime>,
     x: &GpuBuffer,
     weight: &GpuBuffer,
@@ -197,12 +461,17 @@ pub fn rms_norm_residual_add_f32_with_scalars(
     scalars: impl FnOnce(&mut Binder<'_>),
 ) -> Result<(), String> {
     let n = elems(rows, dim, "rms_norm_residual_add_f32")?;
-    require::<f32>(x, n, "rms_norm_residual_add_f32 x")?;
-    require::<f32>(weight, dim as usize, "rms_norm_residual_add_f32 weight")?;
-    require::<f32>(resid, n, "rms_norm_residual_add_f32 resid")?;
+    require::<f32>(rt, x, n, "rms_norm_residual_add_f32 x")?;
+    require::<f32>(rt, weight, dim as usize, "rms_norm_residual_add_f32 weight")?;
+    require::<f32>(rt, resid, n, "rms_norm_residual_add_f32 resid")?;
     if rows == 0 {
         return Ok(());
     }
+    require_disjoint_writes(
+        "rms_norm_residual_add_f32",
+        &[("resid", resid)],
+        &[("weight", weight)],
+    )?;
     let p = rt.pipeline("rms_norm_residual_add_f32")?;
     let tptg = reduce_tptg(p.maxTotalThreadsPerThreadgroup(), dim as usize);
     dispatch_tg_1d(rt, &p, rows as usize, tptg, None, |bnd| {
@@ -225,11 +494,11 @@ pub fn mlp_silu(
     out: &GpuBuffer,
     n: u32,
 ) -> Result<(), String> {
-    mlp_silu_with_scalars(rt, gate, up, out, n, |bnd| set_u32(bnd, n, 3))
+    unsafe { mlp_silu_with_scalars(rt, gate, up, out, n, |bnd| set_u32(bnd, n, 3)) }
 }
 
 /// [`mlp_silu`] with caller-supplied scalar binds.
-pub fn mlp_silu_with_scalars(
+pub unsafe fn mlp_silu_with_scalars(
     rt: &Arc<GpuRuntime>,
     gate: &GpuBuffer,
     up: &GpuBuffer,
@@ -238,9 +507,9 @@ pub fn mlp_silu_with_scalars(
     scalars: impl FnOnce(&mut Binder<'_>),
 ) -> Result<(), String> {
     let n_us = n as usize;
-    require::<f32>(gate, n_us, "mlp_silu gate")?;
-    require::<f32>(up, n_us, "mlp_silu up")?;
-    require::<f32>(out, n_us, "mlp_silu out")?;
+    require::<f32>(rt, gate, n_us, "mlp_silu gate")?;
+    require::<f32>(rt, up, n_us, "mlp_silu up")?;
+    require::<f32>(rt, out, n_us, "mlp_silu out")?;
     let p = rt.pipeline("mlp_silu")?;
     dispatch_1d(rt, &p, n_us, |bnd| {
         set_gpu_buf(bnd, gate, 0);
@@ -264,11 +533,11 @@ pub fn mlp_gelu_tanh(
     out: &GpuBuffer,
     n: u32,
 ) -> Result<(), String> {
-    mlp_gelu_tanh_with_scalars(rt, gate, up, out, n, |bnd| set_u32(bnd, n, 3))
+    unsafe { mlp_gelu_tanh_with_scalars(rt, gate, up, out, n, |bnd| set_u32(bnd, n, 3)) }
 }
 
 /// [`mlp_gelu_tanh`] with caller-supplied scalar binds.
-pub fn mlp_gelu_tanh_with_scalars(
+pub unsafe fn mlp_gelu_tanh_with_scalars(
     rt: &Arc<GpuRuntime>,
     gate: &GpuBuffer,
     up: &GpuBuffer,
@@ -277,9 +546,9 @@ pub fn mlp_gelu_tanh_with_scalars(
     scalars: impl FnOnce(&mut Binder<'_>),
 ) -> Result<(), String> {
     let n_us = n as usize;
-    require::<f32>(gate, n_us, "mlp_gelu_tanh gate")?;
-    require::<f32>(up, n_us, "mlp_gelu_tanh up")?;
-    require::<f32>(out, n_us, "mlp_gelu_tanh out")?;
+    require::<f32>(rt, gate, n_us, "mlp_gelu_tanh gate")?;
+    require::<f32>(rt, up, n_us, "mlp_gelu_tanh up")?;
+    require::<f32>(rt, out, n_us, "mlp_gelu_tanh out")?;
     let p = rt.pipeline("mlp_gelu_tanh")?;
     dispatch_1d(rt, &p, n_us, |bnd| {
         set_gpu_buf(bnd, gate, 0);
@@ -299,11 +568,11 @@ pub fn mlp_gelu_tanh_bf16(
     out: &GpuBuffer,
     n: u32,
 ) -> Result<(), String> {
-    mlp_gelu_tanh_bf16_with_scalars(rt, gate, up, out, n, |bnd| set_u32(bnd, n, 3))
+    unsafe { mlp_gelu_tanh_bf16_with_scalars(rt, gate, up, out, n, |bnd| set_u32(bnd, n, 3)) }
 }
 
 /// [`mlp_gelu_tanh_bf16`] with caller-supplied scalar binds.
-pub fn mlp_gelu_tanh_bf16_with_scalars(
+pub unsafe fn mlp_gelu_tanh_bf16_with_scalars(
     rt: &Arc<GpuRuntime>,
     gate: &GpuBuffer,
     up: &GpuBuffer,
@@ -312,9 +581,17 @@ pub fn mlp_gelu_tanh_bf16_with_scalars(
     scalars: impl FnOnce(&mut Binder<'_>),
 ) -> Result<(), String> {
     let n_us = n as usize;
-    require::<f32>(gate, n_us, "mlp_gelu_tanh_bf16 gate")?;
-    require::<f32>(up, n_us, "mlp_gelu_tanh_bf16 up")?;
-    require::<u16>(out, n_us, "mlp_gelu_tanh_bf16 out")?;
+    require::<f32>(rt, gate, n_us, "mlp_gelu_tanh_bf16 gate")?;
+    require::<f32>(rt, up, n_us, "mlp_gelu_tanh_bf16 up")?;
+    require::<u16>(rt, out, n_us, "mlp_gelu_tanh_bf16 out")?;
+    if n == 0 {
+        return Ok(());
+    }
+    require_disjoint_writes(
+        "mlp_gelu_tanh_bf16",
+        &[("out", out)],
+        &[("gate", gate), ("up", up)],
+    )?;
     let p = rt.pipeline("mlp_gelu_tanh_bf16")?;
     dispatch_1d(rt, &p, n_us, |bnd| {
         set_gpu_buf(bnd, gate, 0);
@@ -335,20 +612,22 @@ pub fn scale_f32_inplace(
     scale: f32,
     n: u32,
 ) -> Result<(), String> {
-    scale_f32_inplace_with_scalars(rt, x, n, |bnd| {
-        set_f32(bnd, scale, 1);
-        set_u32(bnd, n, 2);
-    })
+    unsafe {
+        scale_f32_inplace_with_scalars(rt, x, n, |bnd| {
+            set_f32(bnd, scale, 1);
+            set_u32(bnd, n, 2);
+        })
+    }
 }
 
 /// [`scale_f32_inplace`] with caller-supplied scalar binds.
-pub fn scale_f32_inplace_with_scalars(
+pub unsafe fn scale_f32_inplace_with_scalars(
     rt: &Arc<GpuRuntime>,
     x: &GpuBuffer,
     n: u32,
     scalars: impl FnOnce(&mut Binder<'_>),
 ) -> Result<(), String> {
-    require::<f32>(x, n as usize, "scale_f32_inplace x")?;
+    require::<f32>(rt, x, n as usize, "scale_f32_inplace x")?;
     let p = rt.pipeline("scale_f32_inplace")?;
     dispatch_1d(rt, &p, n as usize, |bnd| {
         set_gpu_buf(bnd, x, 0);
@@ -378,27 +657,29 @@ pub fn gemv_q8(
     cols: u32,
     group_size: u32,
 ) -> Result<(), String> {
-    gemv_q8_with_scalars(
-        rt,
-        packed,
-        scales,
-        zeros,
-        x,
-        y,
-        rows,
-        cols,
-        group_size,
-        |bnd| {
-            set_u32(bnd, rows, 5);
-            set_u32(bnd, cols, 6);
-            set_u32(bnd, group_size, 7);
-        },
-    )
+    unsafe {
+        gemv_q8_with_scalars(
+            rt,
+            packed,
+            scales,
+            zeros,
+            x,
+            y,
+            rows,
+            cols,
+            group_size,
+            |bnd| {
+                set_u32(bnd, rows, 5);
+                set_u32(bnd, cols, 6);
+                set_u32(bnd, group_size, 7);
+            },
+        )
+    }
 }
 
 /// [`gemv_q8`] with caller-supplied scalar binds.
 #[allow(clippy::too_many_arguments)]
-pub fn gemv_q8_with_scalars(
+pub unsafe fn gemv_q8_with_scalars(
     rt: &Arc<GpuRuntime>,
     packed: &GpuBuffer,
     scales: &GpuBuffer,
@@ -425,14 +706,19 @@ pub fn gemv_q8_with_scalars(
     }
     let weights = elems(rows, cols, "gemv_q8")?;
     let groups = elems(rows, cols / group_size, "gemv_q8 groups")?;
-    require::<i8>(packed, weights, "gemv_q8 packed")?;
-    require::<f32>(scales, groups, "gemv_q8 scales")?;
-    require::<f32>(zeros, groups, "gemv_q8 zeros")?;
-    require::<f32>(x, cols as usize, "gemv_q8 x")?;
-    require::<f32>(y, rows as usize, "gemv_q8 y")?;
+    require::<i8>(rt, packed, weights, "gemv_q8 packed")?;
+    require::<f32>(rt, scales, groups, "gemv_q8 scales")?;
+    require::<f32>(rt, zeros, groups, "gemv_q8 zeros")?;
+    require::<f32>(rt, x, cols as usize, "gemv_q8 x")?;
+    require::<f32>(rt, y, rows as usize, "gemv_q8 y")?;
     if rows == 0 {
         return Ok(());
     }
+    require_disjoint_writes(
+        "gemv_q8",
+        &[("y", y)],
+        &[("packed", packed), ("scales", scales), ("zeros", zeros), ("x", x)],
+    )?;
     let p = rt.pipeline("gemv_q8")?;
     // One simdgroup per `SIMD_ROWS` output rows with lanes striding K, the same
     // geometry the MLX Q4 simd GEMVs use. Was `dispatch_1d(rt, &p, rows)` — one
@@ -464,44 +750,97 @@ pub fn gemv_q8_with_scalars(
 /// froze its binds needs a stable address whose *contents* move, not a new
 /// const-arena slot each encode.
 ///
-/// Scalar index for `_with_scalars`: 2 = `n`. Buffer 3 (`dst_offset`) is bound
-/// here in both paths — it is a device buffer, not a scalar.
+/// `dst_capacity` is the fixed logical capacity of `dst`, in f32 elements. It
+/// must cover `n` and be backed by the allocation. The kernel checks the live
+/// device offset against this bound with widened arithmetic; an offset at or
+/// beyond the end, an offset-plus-length crossing the end, and arithmetic
+/// wraparound all make the complete store a no-op rather than an OOB write.
+///
+/// Scalar indices for `_with_scalars`: 2 = `n`, 4 = the callback's validated
+/// `dst_capacity`. Buffer 3 (`dst_offset`) is bound here in both paths — it is
+/// a device buffer, not a scalar.
+/// `dst` must not alias `src` or `dst_offset`: the device-controlled offset can
+/// select an overlapping region that the host cannot prove race-free.
 pub fn kv_store_timestep(
     rt: &Arc<GpuRuntime>,
     src: &GpuBuffer,
     dst: &GpuBuffer,
     dst_offset: &GpuBuffer,
     n: u32,
+    dst_capacity: u32,
 ) -> Result<(), String> {
-    kv_store_timestep_with_scalars(rt, src, dst, dst_offset, n, |bnd| set_u32(bnd, n, 2))
+    // SAFETY: the closure binds only documented slots 2 and 4 to this call's
+    // validated `n` and capacity; the runtime owns the const-arena storage.
+    unsafe {
+        kv_store_timestep_with_scalars(
+            rt,
+            src,
+            dst,
+            dst_offset,
+            n,
+            dst_capacity,
+            |bnd, capacity| {
+                set_u32(bnd, n, 2);
+                set_u32(bnd, capacity, 4);
+            },
+        )
+    }
 }
 
 /// [`kv_store_timestep`] with caller-supplied scalar binds.
-pub fn kv_store_timestep_with_scalars(
+///
+/// # Safety
+///
+/// `scalars` must obey the module-level `_with_scalars` contract: bind exactly
+/// the documented scalar slots and values, mutate no other binder state, and
+/// keep all stable scalar storage alive and resident for every execution.
+pub unsafe fn kv_store_timestep_with_scalars(
     rt: &Arc<GpuRuntime>,
     src: &GpuBuffer,
     dst: &GpuBuffer,
     dst_offset: &GpuBuffer,
     n: u32,
-    scalars: impl FnOnce(&mut Binder<'_>),
+    dst_capacity: u32,
+    scalars: impl FnOnce(&mut Binder<'_>, u32),
 ) -> Result<(), String> {
-    require::<f32>(src, n as usize, "kv_store_timestep src")?;
-    require::<u32>(dst_offset, 1, "kv_store_timestep dst_offset")?;
-    // `dst` is indexed at `*dst_offset + gid`, and the offset lives on the
-    // device — its value is not knowable here. Only the floor is checkable.
-    require::<f32>(dst, n as usize, "kv_store_timestep dst")?;
+    require::<f32>(rt, src, n as usize, "kv_store_timestep src")?;
+    require::<u32>(rt, dst_offset, 1, "kv_store_timestep dst_offset")?;
+    if dst_capacity < n {
+        return Err(format!(
+            "kv_store_timestep: dst_capacity {dst_capacity} is smaller than n {n}"
+        ));
+    }
+    require::<f32>(
+        rt,
+        dst,
+        dst_capacity as usize,
+        "kv_store_timestep dst capacity",
+    )?;
+    if n == 0 {
+        return Ok(());
+    }
+    require_disjoint_writes(
+        "kv_store_timestep",
+        &[("dst", dst)],
+        &[("src", src), ("dst_offset", dst_offset)],
+    )?;
     let p = rt.pipeline("kv_store_timestep")?;
     dispatch_1d(rt, &p, n as usize, |bnd| {
         set_gpu_buf(bnd, src, 0);
         set_gpu_buf(bnd, dst, 1);
-        scalars(bnd);
+        scalars(bnd, dst_capacity);
         set_gpu_buf(bnd, dst_offset, 3);
     })
 }
 
 /// [`kv_store_timestep`] for K and V in one dispatch.
 ///
-/// Scalar index for `_with_scalars`: 4 = `n`. Buffer 5 is `dst_offset`.
+/// Both destinations share one explicit logical capacity. Scalar indices for
+/// `_with_scalars`: 4 = `n`, 6 = the callback's validated `dst_capacity`.
+/// Buffer 5 is `dst_offset`.
+/// The two destinations must be distinct and neither may alias either source
+/// or the device-controlled offset.
+#[allow(clippy::too_many_arguments)]
 pub fn kv_store_timestep_pair(
     rt: &Arc<GpuRuntime>,
     src_k: &GpuBuffer,
@@ -510,15 +849,37 @@ pub fn kv_store_timestep_pair(
     dst_v: &GpuBuffer,
     dst_offset: &GpuBuffer,
     n: u32,
+    dst_capacity: u32,
 ) -> Result<(), String> {
-    kv_store_timestep_pair_with_scalars(rt, src_k, src_v, dst_k, dst_v, dst_offset, n, |bnd| {
-        set_u32(bnd, n, 4)
-    })
+    // SAFETY: the closure binds only documented slots 4 and 6 to this call's
+    // validated `n` and capacity; the runtime owns the const-arena storage.
+    unsafe {
+        kv_store_timestep_pair_with_scalars(
+            rt,
+            src_k,
+            src_v,
+            dst_k,
+            dst_v,
+            dst_offset,
+            n,
+            dst_capacity,
+            |bnd, capacity| {
+                set_u32(bnd, n, 4);
+                set_u32(bnd, capacity, 6);
+            },
+        )
+    }
 }
 
 /// [`kv_store_timestep_pair`] with caller-supplied scalar binds.
+///
+/// # Safety
+///
+/// `scalars` must obey the module-level `_with_scalars` contract: bind exactly
+/// the documented scalar slots and values, mutate no other binder state, and
+/// keep all stable scalar storage alive and resident for every execution.
 #[allow(clippy::too_many_arguments)]
-pub fn kv_store_timestep_pair_with_scalars(
+pub unsafe fn kv_store_timestep_pair_with_scalars(
     rt: &Arc<GpuRuntime>,
     src_k: &GpuBuffer,
     src_v: &GpuBuffer,
@@ -526,21 +887,49 @@ pub fn kv_store_timestep_pair_with_scalars(
     dst_v: &GpuBuffer,
     dst_offset: &GpuBuffer,
     n: u32,
-    scalars: impl FnOnce(&mut Binder<'_>),
+    dst_capacity: u32,
+    scalars: impl FnOnce(&mut Binder<'_>, u32),
 ) -> Result<(), String> {
     let n_us = n as usize;
-    require::<f32>(src_k, n_us, "kv_store_timestep_pair src_k")?;
-    require::<f32>(src_v, n_us, "kv_store_timestep_pair src_v")?;
-    require::<f32>(dst_k, n_us, "kv_store_timestep_pair dst_k")?;
-    require::<f32>(dst_v, n_us, "kv_store_timestep_pair dst_v")?;
-    require::<u32>(dst_offset, 1, "kv_store_timestep_pair dst_offset")?;
+    require::<f32>(rt, src_k, n_us, "kv_store_timestep_pair src_k")?;
+    require::<f32>(rt, src_v, n_us, "kv_store_timestep_pair src_v")?;
+    require::<u32>(rt, dst_offset, 1, "kv_store_timestep_pair dst_offset")?;
+    if dst_capacity < n {
+        return Err(format!(
+            "kv_store_timestep_pair: dst_capacity {dst_capacity} is smaller than n {n}"
+        ));
+    }
+    require::<f32>(
+        rt,
+        dst_k,
+        dst_capacity as usize,
+        "kv_store_timestep_pair dst_k capacity",
+    )?;
+    require::<f32>(
+        rt,
+        dst_v,
+        dst_capacity as usize,
+        "kv_store_timestep_pair dst_v capacity",
+    )?;
+    if n == 0 {
+        return Ok(());
+    }
+    require_disjoint_writes(
+        "kv_store_timestep_pair",
+        &[("dst_k", dst_k), ("dst_v", dst_v)],
+        &[
+            ("src_k", src_k),
+            ("src_v", src_v),
+            ("dst_offset", dst_offset),
+        ],
+    )?;
     let p = rt.pipeline("kv_store_timestep_pair")?;
     dispatch_1d(rt, &p, n_us, |bnd| {
         set_gpu_buf(bnd, src_k, 0);
         set_gpu_buf(bnd, src_v, 1);
         set_gpu_buf(bnd, dst_k, 2);
         set_gpu_buf(bnd, dst_v, 3);
-        scalars(bnd);
+        scalars(bnd, dst_capacity);
         set_gpu_buf(bnd, dst_offset, 5);
     })
 }
@@ -561,15 +950,17 @@ pub fn kv_ring_densify(
     n_slot: u32,
     capacity: u32,
 ) -> Result<(), String> {
-    kv_ring_densify_with_scalars(rt, src, dst, filled, start, n_slot, capacity, |bnd| {
-        set_u32(bnd, n_slot, 2);
-        set_u32(bnd, capacity, 3);
-    })
+    unsafe {
+        kv_ring_densify_with_scalars(rt, src, dst, filled, start, n_slot, capacity, |bnd| {
+            set_u32(bnd, n_slot, 2);
+            set_u32(bnd, capacity, 3);
+        })
+    }
 }
 
 /// [`kv_ring_densify`] with caller-supplied scalar binds.
 #[allow(clippy::too_many_arguments)]
-pub fn kv_ring_densify_with_scalars(
+pub unsafe fn kv_ring_densify_with_scalars(
     rt: &Arc<GpuRuntime>,
     src: &GpuBuffer,
     dst: &GpuBuffer,
@@ -583,10 +974,19 @@ pub fn kv_ring_densify_with_scalars(
         return Err("kv_ring_densify: capacity must be non-zero (kernel takes % capacity)".into());
     }
     let ring = elems(capacity, n_slot, "kv_ring_densify")?;
-    require::<f32>(src, ring, "kv_ring_densify src")?;
-    require::<f32>(dst, ring, "kv_ring_densify dst")?;
-    require::<u32>(filled, 1, "kv_ring_densify filled")?;
-    require::<u32>(start, 1, "kv_ring_densify start")?;
+    require_1d_indexable(ring, "kv_ring_densify fixed grid")?;
+    require::<f32>(rt, src, ring, "kv_ring_densify src")?;
+    require::<f32>(rt, dst, ring, "kv_ring_densify dst")?;
+    require::<u32>(rt, filled, 1, "kv_ring_densify filled")?;
+    require::<u32>(rt, start, 1, "kv_ring_densify start")?;
+    if ring == 0 {
+        return Ok(());
+    }
+    require_disjoint_writes(
+        "kv_ring_densify",
+        &[("dst", dst)],
+        &[("src", src), ("filled", filled), ("start", start)],
+    )?;
     let p = rt.pipeline("kv_ring_densify")?;
     dispatch_1d(rt, &p, ring, |bnd| {
         set_gpu_buf(bnd, src, 0);
@@ -658,9 +1058,807 @@ impl AttnHeadDim {
         }
     }
 
+    /// The Metal entry point this head dimension dispatches to.
+    ///
+    /// Exposed so a benchmark can report the kernel it actually ran rather
+    /// than a second mapping of its own that could drift from this one.
+    pub fn kernel(self) -> &'static str {
+        self.entry()
+    }
+
     /// Query-block rows per threadgroup, from the kernel's `constant uint BR`.
     fn br(self) -> usize {
         8
+    }
+}
+
+/// The shader's declared default chunk size. Kept mirrored so
+/// `tests/attention.rs` can catch a drift between the two files; the value the
+/// router actually uses comes from [`decode_chunk_for`].
+pub const DECODE_KV_CHUNK: usize = 256;
+
+/// Keys per chunk for a decode dispatch.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum DecodeChunk {
+    C64,
+    C128,
+    C256,
+}
+
+impl DecodeChunk {
+    pub fn keys(self) -> usize {
+        match self {
+            DecodeChunk::C64 => 64,
+            DecodeChunk::C128 => 128,
+            DecodeChunk::C256 => 256,
+        }
+    }
+
+    pub fn parse(v: &str) -> Result<Self, String> {
+        match v {
+            "64" => Ok(DecodeChunk::C64),
+            "128" => Ok(DecodeChunk::C128),
+            "256" => Ok(DecodeChunk::C256),
+            other => Err(format!(
+                "decode chunk must be 64, 128 or 256; got {other:?}"
+            )),
+        }
+    }
+}
+
+/// Which query heads share a threadgroup in the decode partial pass.
+///
+/// They walk the same K/V, so co-residency decides how many times a line is
+/// pulled through the load path. A *policy* rather than a count, because the
+/// useful widths are shape-derived: `Group` is `H/Hkv` simdgroups, `AllHeads`
+/// is `H`.
+///
+/// Measured, `bench/attn_tune.py --knob decode-sgs --batched 32`, median ms:
+///
+/// | config | one | group | all |
+/// |---|---|---|---|
+/// | `swa128_decode_1k` | 0.037 | **0.035** | 0.058 |
+/// | `swa128_decode_4k` | 0.046 | **0.041** | 0.062 |
+/// | `swa128_decode_b8_4k` | 0.439 | **0.339** | 0.340 |
+/// | `swa256_decode_4k` | 0.057 | **0.054** | 0.080 |
+/// | `global512_decode_4k` | 0.193 | 0.170 | **0.168** |
+/// | `global512_decode_4k_mha` | 0.610 | 0.585 | **0.578** |
+///
+/// `Group` beats one-head-per-threadgroup by **1.3–1.7x everywhere**, which is
+/// far outside the ~3% run-to-run noise floor and is the finding here.
+///
+/// `AllHeads` is the marginal one. It makes a threadgroup's per-key read the
+/// whole contiguous `[Hkv][D]` row instead of a strided slice, and at D=512
+/// (where `H` is 8) it wins — but by 4% in one sweep and 1.2% in another, so
+/// the honest reading is a tie that two independent sweeps broke the same way,
+/// not a measured gain. At D=128 `H` is 32, so it asks for 1024-thread
+/// threadgroups and loses **1.7x** to the occupancy that costs; that half is
+/// unambiguous. Chosen per head dim for that reason.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DecodeHeadBlock {
+    /// One query head per threadgroup: the original dispatch.
+    One,
+    /// The `H/Hkv` heads that share a KV head.
+    Group,
+    /// Every head of a batch item.
+    AllHeads,
+}
+
+impl DecodeHeadBlock {
+    /// Simdgroups per threadgroup for this shape, or `None` if the width does
+    /// not divide `H` or does not fit a threadgroup — the caller steps down.
+    ///
+    /// Public because it is the rule that keeps a threadgroup's head-block
+    /// arithmetic exact: `grid.y` is decoded as `(batch, block)` with
+    /// `H / sgs` blocks, so an `sgs` that does not divide `H` would address the
+    /// wrong head rather than fail. Nothing but a reference check would see
+    /// that, so the rule is pinned by a test.
+    pub fn simdgroups(self, heads: usize, group: usize) -> Option<usize> {
+        let n = match self {
+            DecodeHeadBlock::One => 1,
+            DecodeHeadBlock::Group => group,
+            DecodeHeadBlock::AllHeads => heads,
+        };
+        ((1..=32).contains(&n) && heads % n == 0).then_some(n)
+    }
+
+    pub fn parse(v: &str) -> Result<Self, String> {
+        match v {
+            "one" => Ok(DecodeHeadBlock::One),
+            "group" => Ok(DecodeHeadBlock::Group),
+            "all" => Ok(DecodeHeadBlock::AllHeads),
+            other => Err(format!(
+                "decode head block must be one, group or all; got {other:?}"
+            )),
+        }
+    }
+}
+
+pub const DECODE_HEAD_BLOCK_D128: DecodeHeadBlock = DecodeHeadBlock::Group;
+pub const DECODE_HEAD_BLOCK_D256: DecodeHeadBlock = DecodeHeadBlock::Group;
+pub const DECODE_HEAD_BLOCK_D512: DecodeHeadBlock = DecodeHeadBlock::AllHeads;
+
+pub fn decode_head_block_for(d: u32) -> DecodeHeadBlock {
+    match d {
+        512 => DECODE_HEAD_BLOCK_D512,
+        256 => DECODE_HEAD_BLOCK_D256,
+        _ => DECODE_HEAD_BLOCK_D128,
+    }
+}
+
+/// Threads per threadgroup in the decode reduce pass.
+///
+/// Swept with `bench/attn_tune.py --knob reduce-w --batched 32`; it is a
+/// dispatch parameter, not a compiled constant, so the values are not kernels.
+pub const DECODE_REDUCE_THREADS: usize = 256;
+
+/// Chunk size chosen per head dimension.
+///
+/// Measured with `bench/attn_tune.py --knob decode --batched 32`, five
+/// interleaved rounds (median ms). The `--batched 32` matters: swept at one
+/// launch per submit, ~88% of every number is the host round trip, which
+/// compresses the margins towards 1.0x and decides near-ties on noise.
+///
+/// | config | 64 | 128 | 256 |
+/// |---/// |---/// |---/// |---|
+/// | `swa128_decode_1k` | 0.035 | **0.031** | 0.033 |
+/// | `swa128_decode_4k` | 0.054 | 0.040 | **0.037** |
+/// | `swa128_decode_b8_4k` | 0.360 | 0.316 | **0.304** |
+/// | `swa256_decode_4k` | 0.053 | **0.044** | 0.056 |
+/// | `global512_decode_4k` | 0.183 | **0.154** | 0.160 |
+///
+/// Two of the three are clear and one is not. **D=256 is 128**, ahead of 64 by
+/// 21% — a real margin. **D=512 is 128**, ahead of 256 by 4%, which is at the
+/// edge of what this measurement resolves. **D=128 is 256 by 1.4% on the
+/// geometric mean over its three configs (0.0719 against 0.0729)**, which is
+/// inside the ~3% run-to-run noise floor and is therefore recorded as a tie
+/// broken by measurement, not as a rule. Per config it splits: `decode_1k`
+/// prefers 128, `decode_4k` and `decode_b8_4k` prefer 256.
+///
+/// Unlike the rows knob there is no clean rule here: the trade is grid
+/// parallelism against the number of partials the reduce pass combines, and
+/// where that balances depends on how many threadgroups `B*H` already supplies
+/// and how much K/V reuse a threadgroup already has.
+pub const DECODE_CHUNK_D128: DecodeChunk = DecodeChunk::C256;
+pub const DECODE_CHUNK_D256: DecodeChunk = DecodeChunk::C128;
+pub const DECODE_CHUNK_D512: DecodeChunk = DecodeChunk::C128;
+
+pub fn decode_chunk_for(d: u32) -> DecodeChunk {
+    match d {
+        512 => DECODE_CHUNK_D512,
+        256 => DECODE_CHUNK_D256,
+        _ => DECODE_CHUNK_D128,
+    }
+}
+
+/// Head dimensions the FlashDecoding path is compiled for.
+fn decode_entries(d: u32, c: DecodeChunk, r: RowsLanes) -> Option<(String, String)> {
+    if !matches!(d, 128 | 256 | 512) {
+        return None;
+    }
+    Some((
+        format!(
+            "flash_attn_decode_partial_h{d}_c{}_r{}",
+            c.keys(),
+            r.width()
+        ),
+        format!("flash_attn_decode_reduce_h{d}_c{}", c.keys()),
+    ))
+}
+
+/// Lanes per key in the decode partial pass, per head dimension.
+///
+/// Measured with `bench/attn_tune.py --knob decode-r --batched 32`, five
+/// interleaved rounds (median ms):
+///
+/// | config | R=8 | R=16 | R=32 |
+/// |---/// |---/// |---/// |---|
+/// | `swa128_decode_1k` | **0.032** | 0.047 | 0.076 |
+/// | `swa128_decode_4k` | **0.037** | 0.051 | 0.080 |
+/// | `swa128_decode_b8_4k` | **0.304** | 0.312 | 0.342 |
+/// | `swa256_decode_4k` | 0.102 | **0.044** | 0.058 |
+/// | `global512_decode_4k` | 0.345 | 0.268 | **0.154** |
+///
+/// Kept separate from [`rows_lanes_for`] because the two kernels are bound by
+/// different things. Prefill is ALU bound and lands cleanly on `D/R = 16`.
+/// Decode *was* latency bound — 0.6% of ALU peak and 5% of bandwidth when these
+/// values were first chosen — and is now bandwidth bound at 48-65% of the
+/// memory roof and under 10% of the ALU roof, which is why the later rounds of
+/// tuning stopped paying. D=256 and D=512 land on `D/R = 16`; D=128 does not,
+/// and takes R=8.
+///
+/// D=128 was R=16 until this sweep was re-run kernel-only. At one launch per
+/// submit the two were a 3% tie that R=16 won; with the ~88% dispatch share
+/// removed, R=8 is ahead or level at every D=128 config.
+///
+/// Choosing wrong is expensive even where choosing right gains little: R=16 at
+/// D=512 is **9.3x** slower than R=32.
+pub const DECODE_LANES_D128: RowsLanes = RowsLanes::R8;
+pub const DECODE_LANES_D256: RowsLanes = RowsLanes::R16;
+pub const DECODE_LANES_D512: RowsLanes = RowsLanes::R32;
+
+pub fn decode_lanes_for(d: u32) -> RowsLanes {
+    match d {
+        512 => DECODE_LANES_D512,
+        256 => DECODE_LANES_D256,
+        _ => DECODE_LANES_D128,
+    }
+}
+
+/// Single-query attention, split over the KV sequence (FlashDecoding).
+///
+/// The general kernels tile over query rows, so at `Tq == 1` they run one live
+/// lane in 32 over a grid of `B*H` threadgroups. This splits over KV instead:
+/// `n_chunks x B*H` threadgroups, every lane live. `window == 0` selects the
+/// global (causal) rule; anything else is the sliding window.
+///
+/// `Tkv` is a device value, so the host cannot size the grid to the live chunk
+/// count and dispatches for the fixed `kv_capacity` instead. Both passes clamp
+/// the live value to that capacity and derive the same live chunk count. Every
+/// chunk the reduce pass visits was therefore written by this partial pass;
+/// capacity-only chunks return without writing and are never reduced, so the
+/// scratch needs no zero fill.
+#[allow(clippy::too_many_arguments)]
+pub fn flash_attn_decode(
+    rt: &Arc<GpuRuntime>,
+    q: &GpuBuffer,
+    k: &GpuBuffer,
+    v: &GpuBuffer,
+    o: &GpuBuffer,
+    tkv: &GpuBuffer,
+    q_pos_offset: &GpuBuffer,
+    kv_pos_offset: &GpuBuffer,
+    dims: AttnDims,
+    head_dim: u32,
+    // Declared fixed capacity of both K and V. This is checked against their
+    // logical sizes before it is used as either the grid bound or batch stride.
+    kv_capacity: usize,
+    out_bf16: bool,
+) -> Result<(), String> {
+    flash_attn_decode_with_chunk(
+        rt,
+        q,
+        k,
+        v,
+        o,
+        tkv,
+        q_pos_offset,
+        kv_pos_offset,
+        dims,
+        head_dim,
+        kv_capacity,
+        decode_chunk_for(head_dim),
+        decode_lanes_for(head_dim),
+        None,
+        None,
+        out_bf16,
+    )
+}
+
+/// [`flash_attn_decode`] with an explicit chunk size, for the tuning sweep.
+#[allow(clippy::too_many_arguments)]
+pub fn flash_attn_decode_with_chunk(
+    rt: &Arc<GpuRuntime>,
+    q: &GpuBuffer,
+    k: &GpuBuffer,
+    v: &GpuBuffer,
+    o: &GpuBuffer,
+    tkv: &GpuBuffer,
+    q_pos_offset: &GpuBuffer,
+    kv_pos_offset: &GpuBuffer,
+    dims: AttnDims,
+    head_dim: u32,
+    kv_capacity: usize,
+    chunk: DecodeChunk,
+    lanes: RowsLanes,
+    // Threads per threadgroup for the reduce pass; `None` takes
+    // [`DECODE_REDUCE_THREADS`]. A dispatch parameter, so a sweep of it costs
+    // no extra kernels.
+    reduce_threads: Option<usize>,
+    // Which query heads share a threadgroup in the partial pass; `None` takes
+    // [`decode_head_block_for`]. A width that does not divide `H` or does not
+    // fit a threadgroup steps down rather than mis-indexing.
+    head_block: Option<DecodeHeadBlock>,
+    out_bf16: bool,
+) -> Result<(), String> {
+    let (partial_entry, reduce_entry) =
+        decode_entries(head_dim, chunk, lanes).ok_or_else(|| {
+            format!("flash_attn_decode: head dim {head_dim} has no decode kernel (128, 256 or 512)")
+        })?;
+    if dims.tq != 1 {
+        return Err(format!(
+            "flash_attn_decode is the Tq == 1 path; got Tq = {}. Use flash_attn_swa \
+             or flash_attn_global_h512 for prefill.",
+            dims.tq
+        ));
+    }
+    require_attn_runtime(rt, q, k, v, o, "flash_attn_decode")?;
+    let actual_kv_capacity =
+        validate_attn_storage_for(&dims, head_dim, q, k, v, o, "flash_attn_decode", out_bf16)?;
+    validate_attn_live_scalar_aliases(
+        &dims,
+        o,
+        tkv,
+        q_pos_offset,
+        kv_pos_offset,
+        "flash_attn_decode",
+    )?;
+    require::<u32>(rt, tkv, 1, "flash_attn_decode tkv")?;
+    require::<u32>(rt, q_pos_offset, 1, "flash_attn_decode q_pos_offset")?;
+    require::<u32>(rt, kv_pos_offset, 1, "flash_attn_decode kv_pos_offset")?;
+    let kv_capacity = u32::try_from(kv_capacity)
+        .map_err(|_| "flash_attn_decode: kv_capacity exceeds the device u32 range")?;
+    if kv_capacity == 0 {
+        return Err("flash_attn_decode: kv_capacity must be at least 1".into());
+    }
+
+    let bh = elems_product(&[dims.batch, dims.heads], "flash_attn_decode B*H")?;
+    if bh == 0 {
+        return Ok(());
+    }
+    if kv_capacity != actual_kv_capacity {
+        return Err(format!(
+            "flash_attn_decode: declared kv_capacity {kv_capacity} does not match the fixed K/V \
+             layout capacity {actual_kv_capacity}"
+        ));
+    }
+    let chunks = (kv_capacity as usize).div_ceil(chunk.keys()).max(1);
+    let stride = head_dim as usize + 2;
+    let scratch_elems = bh
+        .checked_mul(chunks)
+        .and_then(|x| x.checked_mul(stride))
+        .ok_or("flash_attn_decode: partial scratch size overflows")?;
+    let scratch_bytes = scratch_elems
+        .checked_mul(std::mem::size_of::<f32>())
+        .ok_or("flash_attn_decode: partial scratch byte size overflows")?;
+    let scratch = rt.alloc_buffer(scratch_bytes)?;
+    // Deliberately not zeroed. The reduce pass reads chunks
+    // `0 .. ceil(Tkv/KV_CHUNK)`, and the partial pass returns early only for
+    // `chunk * KV_CHUNK >= Tkv` -- which by construction is exactly the chunks
+    // outside that range. So every slot the reduce reads was written by this
+    // dispatch, and zero-filling was a 66 KB host allocation and memcpy on
+    // every decode step. `decode_is_immune_to_a_recycled_scratch` is what
+    // holds that invariant: it alternates long and short histories through the
+    // pooled buffer, so a stale partial would be exactly what it reads.
+
+    // Query heads that walk the same K/V go in one threadgroup, so grid.y
+    // enumerates (batch, head-block) and the threadgroup is `sgs` simdgroups
+    // wide. [`DecodeHeadBlock`] carries the measurements behind the choice.
+    // Metal caps a threadgroup at 1024 threads, and past that the kernel's
+    // `sgs == 1` path is the original one-head-per-threadgroup dispatch.
+    let heads = dims.heads.max(1) as usize;
+    let group = (dims.heads / dims.heads_kv.max(1)).max(1) as usize;
+    let want = head_block.unwrap_or_else(|| decode_head_block_for(head_dim));
+    // Step down through the policies rather than rounding a count, so a shape
+    // the requested width cannot serve lands on one that can — ultimately the
+    // original one-head-per-threadgroup dispatch, which always divides.
+    let partial_sgs = [want, DecodeHeadBlock::Group, DecodeHeadBlock::One]
+        .into_iter()
+        .find_map(|p| p.simdgroups(heads, group))
+        .unwrap_or(1);
+    let partial_y = (dims.batch as usize)
+        .checked_mul(heads / partial_sgs)
+        .ok_or("flash_attn_decode: partial grid height overflows")?;
+    let p = rt.pipeline(&partial_entry)?;
+    let r = rt.pipeline(&reduce_entry)?;
+    // The reduce pass is a serial tail: one threadgroup per (batch, head), so
+    // at B*H = 8 the whole GPU folds partials on 8 threadgroups. Its width is a
+    // dispatch parameter rather than a compiled-in one -- the kernel strides
+    // its output loop by `threads_per_threadgroup` -- so widening it costs no
+    // extra kernel. Capped at D because a lane past the head dim does nothing,
+    // and at the Metal maximum of 1024.
+    let reduce_width = reduce_threads
+        .unwrap_or(DECODE_REDUCE_THREADS)
+        .min(head_dim as usize)
+        .max(32);
+    let partial_groups = mtl_size(chunks, partial_y, 1);
+    let partial_threads = mtl_size(partial_sgs * 32, 1, 1);
+    let reduce_groups = mtl_size(1, bh, 1);
+    let reduce_threads = mtl_size(reduce_width, 1, 1);
+    // Validate both commands before opening a binder. If the reduce geometry
+    // is invalid, encoding only the producer would leave an incomplete op in
+    // the active batch and poison the next caller's view of `scratch`.
+    validate_dispatch_geometry(
+        partial_groups,
+        partial_threads,
+        Some(p.maxTotalThreadsPerThreadgroup()),
+    )?;
+    validate_dispatch_geometry(
+        reduce_groups,
+        reduce_threads,
+        Some(r.maxTotalThreadsPerThreadgroup()),
+    )?;
+
+    // Keep the producer and consumer in one binder scope. Besides avoiding a
+    // second access/residency pass, this makes the scratch RAW edge explicit
+    // in the one place that knows whether automatic dispatch barriers were
+    // disabled for this encoder.
+    rt.with_binder(|bnd| {
+        bnd.set_pipeline(&p);
+        set_gpu_buf(bnd, q, 0);
+        set_gpu_buf(bnd, k, 1);
+        set_gpu_buf(bnd, v, 2);
+        set_gpu_buf(bnd, &scratch, 3);
+        set_u32(bnd, dims.batch, 4);
+        set_gpu_buf(bnd, tkv, 6);
+        set_u32(bnd, dims.heads, 7);
+        set_u32(bnd, dims.heads_kv, 8);
+        set_u32(bnd, dims.window, 9);
+        set_f32(bnd, dims.scale, 10);
+        set_gpu_buf(bnd, q_pos_offset, 11);
+        set_gpu_buf(bnd, kv_pos_offset, 12);
+        set_u32(bnd, kv_capacity, 13);
+        bnd.dispatch(partial_groups, partial_threads);
+        if bnd.needs_explicit_barriers() {
+            bnd.barrier();
+        }
+
+        bnd.set_pipeline(&r);
+        set_gpu_buf(bnd, &scratch, 0);
+        set_gpu_buf(bnd, o, 1);
+        set_u32(bnd, dims.batch, 2);
+        set_gpu_buf(bnd, tkv, 3);
+        set_u32(bnd, dims.heads, 4);
+        set_u32(bnd, u32::from(out_bf16), 5);
+        set_u32(bnd, kv_capacity, 6);
+        bnd.dispatch(reduce_groups, reduce_threads);
+        Ok(())
+    })
+}
+
+/// Simdgroups per threadgroup in the row-parallel kernels.
+///
+/// Every simdgroup in a threadgroup walks the same key range, so this is how
+/// much K/V reuse one global read buys: a threadgroup's lines are read once
+/// from L2 and served `SGT` times from L1. Rows per threadgroup are
+/// `SGT * 32/R`, which is why it interacts with [`RowsLanes`] and is swept
+/// against it rather than chosen alone. 32 simdgroups is 1024 threads, the
+/// Metal maximum. Compiled into the kernel name; `tests/attention.rs` pins the
+/// host and shader agreeing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RowsGroups {
+    G8,
+    G16,
+    G32,
+}
+
+impl RowsGroups {
+    pub fn count(self) -> usize {
+        match self {
+            RowsGroups::G8 => 8,
+            RowsGroups::G16 => 16,
+            RowsGroups::G32 => 32,
+        }
+    }
+
+    pub fn parse(v: &str) -> Result<Self, String> {
+        match v {
+            "8" => Ok(RowsGroups::G8),
+            "16" => Ok(RowsGroups::G16),
+            "32" => Ok(RowsGroups::G32),
+            other => Err(format!(
+                "rows simdgroups-per-threadgroup must be 8, 16 or 32; got {other:?}"
+            )),
+        }
+    }
+}
+
+/// Lanes per query row in the row-parallel kernels.
+///
+/// The reduction that turns per-lane partial dots into a score costs log2(R)
+/// shuffle-and-add steps against 2*D/R fused multiply-adds, so narrowing R
+/// trades reduction overhead for per-lane work and puts 32/R query rows in one
+/// simdgroup. Which value wins is measured per head dimension, not assumed --
+/// `bench_flash_attn` sweeps it with `BENCH_ATTN_ROWS_R`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum RowsLanes {
+    R8,
+    R16,
+    R32,
+}
+
+impl RowsLanes {
+    pub fn width(self) -> usize {
+        match self {
+            RowsLanes::R8 => 8,
+            RowsLanes::R16 => 16,
+            RowsLanes::R32 => 32,
+        }
+    }
+
+    pub fn parse(v: &str) -> Result<Self, String> {
+        match v {
+            "8" => Ok(RowsLanes::R8),
+            "16" => Ok(RowsLanes::R16),
+            "32" => Ok(RowsLanes::R32),
+            other => Err(format!(
+                "rows lanes-per-row must be 8, 16 or 32; got {other:?}"
+            )),
+        }
+    }
+}
+
+/// Lanes per row chosen for each head dimension.
+///
+/// Measured on an M5 Pro; see the tessl README. Kept as a table rather than a
+/// formula because the winner is a cache and register-pressure outcome, not a
+/// derivable one.
+pub fn rows_lanes_for(d: u32) -> RowsLanes {
+    match d {
+        512 => ROWS_LANES_D512,
+        256 => ROWS_LANES_D256,
+        _ => ROWS_LANES_D128,
+    }
+}
+
+/// Measured with `bench/attn_tune.py --knob rows`, five interleaved rounds
+/// (median ms) -- generated from
+/// `bench/results/attn_tune_rows_m5pro.json`, not transcribed:
+///
+/// | config | R=8 | R=16 | R=32 | winner |
+/// |---|---|---|---|---|
+/// | `swa128_prefill_512` | **1.096** | 1.283 | 1.672 | 8 |
+/// | `swa128_prefill_2048` | **11.493** | 17.062 | 21.064 | 8 |
+/// | `swa128_prefill_4096` | **27.291** | 44.191 | 52.045 | 8 |
+/// | `swa256_prefill_2048` | 22.973 | **14.891** | 16.667 | 16 |
+/// | `global512_prefill_1024` | 21.898 | 8.208 | **5.195** | 32 |
+///
+/// The winners are not arbitrary: all three land at **D/R = 16 dims per lane**.
+/// Below that the log2(R) reduction steps dominate the 2*D/R multiply-adds;
+/// above it `q_reg[D/R] + acc[D/R]` exceeds 32 floats per lane and the register
+/// file spills — which is the cliff visible at D=256/R=8 and D=512/R=16, both
+/// of which want 32 dims per lane.
+pub const ROWS_LANES_D128: RowsLanes = RowsLanes::R8;
+pub const ROWS_LANES_D256: RowsLanes = RowsLanes::R16;
+pub const ROWS_LANES_D512: RowsLanes = RowsLanes::R32;
+
+/// Simdgroups per threadgroup, per head dimension.
+///
+/// Swept with `bench/attn_tune.py --knob rows-g`. It was a single constant 8
+/// for every head dim, and that is what left D=512 behind: rows per threadgroup
+/// are `SGT * 32/R`, so at R=32 eight simdgroups gave 8 rows of reuse per K/V
+/// line against 32 at D=128/R=8 — the same arithmetic per byte over four times
+/// the L1 traffic. Median ms, 5 interleaved rounds:
+///
+/// | config | 8 | 16 | 32 |
+/// |---|---|---|---|
+/// | `swa128_prefill_512` | **1.125** | 1.197 | 1.282 |
+/// | `swa128_prefill_2048` | **12.278** | 13.743 | 12.943 |
+/// | `swa128_prefill_4096` | **29.006** | 35.975 | 31.021 |
+/// | `swa256_prefill_2048` | 15.110 | 16.624 | **14.243** |
+/// | `global512_prefill_1024` | 7.298 | 7.234 | **5.986** |
+///
+/// Prefill is ~100% kernel, so this is swept at one launch per submit: the
+/// batched arm buys nothing here and costs 32x the wall clock.
+pub const ROWS_GROUPS_D128: RowsGroups = RowsGroups::G8;
+pub const ROWS_GROUPS_D256: RowsGroups = RowsGroups::G32;
+pub const ROWS_GROUPS_D512: RowsGroups = RowsGroups::G32;
+
+pub fn rows_groups_for(d: u32) -> RowsGroups {
+    match d {
+        512 => ROWS_GROUPS_D512,
+        256 => ROWS_GROUPS_D256,
+        _ => ROWS_GROUPS_D128,
+    }
+}
+
+fn rows_entry(d: u32, r: RowsLanes, g: RowsGroups) -> Option<String> {
+    if !matches!(d, 128 | 256 | 512) {
+        return None;
+    }
+    Some(format!(
+        "flash_attn_rows_h{d}_r{}_g{}",
+        r.width(),
+        g.count()
+    ))
+}
+
+/// Row-parallel flash attention: one simdgroup per query row.
+///
+/// The tiled kernels put BR query rows in a 32-thread threadgroup and guard the
+/// inner loops with `lid < BR`, so 8 lanes in 32 do the arithmetic. This gives
+/// each simdgroup its own row and each lane its own slice of the head
+/// dimension, which makes every lane live, removes the `Oacc` threadgroup array
+/// and its barriers, and — because a simdgroup owns one row rather than a tile
+/// — lets each row walk its exact key range instead of the union window over
+/// the tile followed by masking inside it.
+///
+/// `window == 0` selects the global (causal) rule.
+#[allow(clippy::too_many_arguments)]
+pub fn flash_attn_rows(
+    rt: &Arc<GpuRuntime>,
+    q: &GpuBuffer,
+    k: &GpuBuffer,
+    v: &GpuBuffer,
+    o: &GpuBuffer,
+    tkv: &GpuBuffer,
+    q_pos_offset: &GpuBuffer,
+    kv_pos_offset: &GpuBuffer,
+    dims: AttnDims,
+    head_dim: u32,
+    out_bf16: bool,
+) -> Result<(), String> {
+    flash_attn_rows_with_lanes(
+        rt,
+        q,
+        k,
+        v,
+        o,
+        tkv,
+        q_pos_offset,
+        kv_pos_offset,
+        dims,
+        head_dim,
+        rows_lanes_for(head_dim),
+        rows_groups_for(head_dim),
+        out_bf16,
+    )
+}
+
+/// [`flash_attn_rows`] with an explicit lanes-per-row, for the tuning sweep.
+#[allow(clippy::too_many_arguments)]
+pub fn flash_attn_rows_with_lanes(
+    rt: &Arc<GpuRuntime>,
+    q: &GpuBuffer,
+    k: &GpuBuffer,
+    v: &GpuBuffer,
+    o: &GpuBuffer,
+    tkv: &GpuBuffer,
+    q_pos_offset: &GpuBuffer,
+    kv_pos_offset: &GpuBuffer,
+    dims: AttnDims,
+    head_dim: u32,
+    lanes: RowsLanes,
+    groups: RowsGroups,
+    out_bf16: bool,
+) -> Result<(), String> {
+    let entry = rows_entry(head_dim, lanes, groups).ok_or_else(|| {
+        format!("flash_attn_rows: head dim {head_dim} has no kernel (128, 256 or 512)")
+    })?;
+    require_attn_runtime(rt, q, k, v, o, "flash_attn_rows")?;
+    let kv_capacity =
+        validate_attn_storage_for(&dims, head_dim, q, k, v, o, "flash_attn_rows", out_bf16)?;
+    validate_attn_live_scalar_aliases(
+        &dims,
+        o,
+        tkv,
+        q_pos_offset,
+        kv_pos_offset,
+        "flash_attn_rows",
+    )?;
+    require::<u32>(rt, tkv, 1, "flash_attn_rows tkv")?;
+    require::<u32>(rt, q_pos_offset, 1, "flash_attn_rows q_pos_offset")?;
+    require::<u32>(rt, kv_pos_offset, 1, "flash_attn_rows kv_pos_offset")?;
+
+    // Rows per threadgroup is `SGT` simdgroups times 32/R rows each, so the
+    // grid depends on both values the kernel was compiled for.
+    let rows_per_tg = groups.count() * (32 / lanes.width());
+    let groups_x = (dims.tq as usize).div_ceil(rows_per_tg);
+    let groups_y = elems_product(&[dims.batch, dims.heads], "flash_attn_rows grid")?;
+    let p = rt.pipeline(&entry)?;
+    dispatch_2d_tg(rt, &p, groups_x, groups_y, groups.count() * 32, |bnd| {
+        set_gpu_buf(bnd, q, 0);
+        set_gpu_buf(bnd, k, 1);
+        set_gpu_buf(bnd, v, 2);
+        set_gpu_buf(bnd, o, 3);
+        set_u32(bnd, dims.batch, 4);
+        set_u32(bnd, dims.tq, 5);
+        set_gpu_buf(bnd, tkv, 6);
+        set_u32(bnd, dims.heads, 7);
+        set_u32(bnd, dims.heads_kv, 8);
+        set_u32(bnd, dims.window, 9);
+        set_f32(bnd, dims.scale, 10);
+        set_gpu_buf(bnd, q_pos_offset, 11);
+        set_gpu_buf(bnd, kv_pos_offset, 12);
+        set_u32(bnd, u32::from(out_bf16), 13);
+        set_u32(bnd, kv_capacity, 14);
+    })
+}
+
+/// `TESSL_ATTN_TILED=1` forces the original tiled kernels.
+///
+/// Read once: this sits on the attention dispatch path, and the A/B harness
+/// sets it per process rather than per call.
+fn tiled_attn_forced() -> bool {
+    static FORCED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FORCED.get_or_init(|| std::env::var_os("TESSL_ATTN_TILED").is_some())
+}
+
+/// Which kernel an attention dispatch routes to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AttnKernel {
+    /// FlashDecoding: `n_chunks x B*H` threadgroups plus a reduce pass.
+    SplitKv,
+    /// One simdgroup per query row: `Tq x B*H` threadgroups, single pass.
+    Rows,
+}
+
+/// The routing rule, as a pure function of what it actually depends on.
+///
+/// Extracted so the rule can be pinned by a test rather than inferred from a
+/// timing run. The rule it replaced -- `Tq == 1 && B*H < 128` -- was wrong for
+/// two years' worth of batch sizes and nothing failed when it changed, because
+/// both kernels compute the same thing and only the clock could tell them
+/// apart.
+///
+/// `kv_capacity` is the shared fixed position capacity of K and V. The split
+/// kernel sizes its grid from it, because the live `Tkv` is a device value, so
+/// buffers too small to hold one position have no grid to launch and fall back
+/// rather than dispatching an empty one.
+pub fn attn_kernel_for(tq: u32, kv_capacity: usize) -> AttnKernel {
+    if tq == 1 && kv_capacity > 0 {
+        AttnKernel::SplitKv
+    } else {
+        AttnKernel::Rows
+    }
+}
+
+/// Pick the attention kernel for a dispatch and run it.
+#[allow(clippy::too_many_arguments)]
+fn route_attn(
+    rt: &Arc<GpuRuntime>,
+    q: &GpuBuffer,
+    k: &GpuBuffer,
+    v: &GpuBuffer,
+    o: &GpuBuffer,
+    tkv: &GpuBuffer,
+    q_pos_offset: &GpuBuffer,
+    kv_pos_offset: &GpuBuffer,
+    dims: AttnDims,
+    head_dim: u32,
+    out_bf16: bool,
+) -> Result<(), String> {
+    // Every `Tq == 1` dispatch takes the KV split. There used to be a
+    // `B*H < 128` threshold here, on the evidence that at `B*H = 256` the split
+    // lost 0.96 ms to the row kernel's 0.65 -- but that was measured at one
+    // launch per submit, where ~85% of a decode call is the host round trip and
+    // the split pays two submits to the row kernel's one. Measured kernel-only,
+    // 32 launches per submit, the split wins at every batch the config set
+    // reaches, and by more as the batch grows:
+    //
+    // | `B*H` | split | rows | |
+    // |---|---|---|---|
+    // | 32 | 0.033 | 0.327 | 9.9x |
+    // | 256 | 0.344 | 0.494 | 1.4x |
+    // | 1024 | 1.229 | 2.775 | 2.3x |
+    // | 2048 | 2.476 | 5.127 | 2.1x |
+    //
+    // It also wins at one launch per submit once the decode kernel's own
+    // constants were retuned on a kernel-only signal (1.18x at 32, 1.31x at
+    // 256, 1.86x at 2048), so the threshold was not trading one protocol
+    // against the other -- it was reading dispatch cost as kernel cost.
+    // `Tkv` is a device value, so route from the complete positions jointly
+    // backed by K and V. The selected kernel independently clamps to this same
+    // bound before indexing either buffer.
+    let capacity = attn_kv_capacity_for(k, v, dims.batch, dims.heads_kv, head_dim, "flash_attn")?;
+    match attn_kernel_for(dims.tq, capacity as usize) {
+        AttnKernel::SplitKv => flash_attn_decode(
+            rt,
+            q,
+            k,
+            v,
+            o,
+            tkv,
+            q_pos_offset,
+            kv_pos_offset,
+            dims,
+            head_dim,
+            capacity as usize,
+            out_bf16,
+        ),
+        AttnKernel::Rows => flash_attn_rows(
+            rt,
+            q,
+            k,
+            v,
+            o,
+            tkv,
+            q_pos_offset,
+            kv_pos_offset,
+            dims,
+            head_dim,
+            out_bf16,
+        ),
     }
 }
 
@@ -673,11 +1871,16 @@ impl AttnHeadDim {
 /// constants: during decode they change every token, and an Indirect Command
 /// Buffer that froze its binds needs a stable address whose contents move.
 ///
-/// `Tkv` therefore is not knowable on the host, so `k` and `v` extents cannot
-/// be validated here — only `q` and `o`, against `B * Tq * H * D`.
+/// `Tkv` therefore is not knowable on the host without a stall. The wrapper
+/// derives a capacity from the complete positions jointly backed by `k` and
+/// `v`; the kernel clamps its live value to that capacity before any indexing.
 ///
 /// Scalar indices for `_with_scalars`: 4 = `B`, 5 = `Tq`, 7 = `H`, 8 = `Hkv`,
-/// 9 = `window`, 10 = `scale` (f32). Buffers 6, 11, 12 are bound here.
+/// 9 = `window`, 10 = `scale` (f32), plus the callback's validated capacity
+/// argument at slot 13 for D=128 or slot 14 for D=256. Buffers 6, 11 and 12 are
+/// bound here. For D=256 slot 13 is the kernel's `out_bf16` flag; this entry
+/// point validates `o` as f32, so the wrapper binds that slot to 0 after the
+/// callback whatever the callback did with it.
 #[allow(clippy::too_many_arguments)]
 pub fn flash_attn_swa(
     rt: &Arc<GpuRuntime>,
@@ -691,7 +1894,26 @@ pub fn flash_attn_swa(
     kv_pos_offset: &GpuBuffer,
     dims: AttnDims,
 ) -> Result<(), String> {
-    flash_attn_swa_with_scalars(
+    // The tiled kernel is 4.5-6.4x slower on prefill -- 8 of its 32 lanes do
+    // the arithmetic -- and 12-22x slower on decode. It stays reachable as
+    // [`flash_attn_swa_tiled`], which is what the A/B benchmark and
+    // `tests/attention.rs` compare the fast paths against.
+    if !tiled_attn_forced() {
+        return route_attn(
+            rt,
+            q,
+            k,
+            v,
+            o,
+            tkv,
+            q_pos_offset,
+            kv_pos_offset,
+            dims,
+            head_dim.dim(),
+            false,
+        );
+    }
+    flash_attn_swa_tiled(
         rt,
         head_dim,
         q,
@@ -702,15 +1924,57 @@ pub fn flash_attn_swa(
         q_pos_offset,
         kv_pos_offset,
         dims,
-        |bnd| {
-            set_u32(bnd, dims.batch, 4);
-            set_u32(bnd, dims.tq, 5);
-            set_u32(bnd, dims.heads, 7);
-            set_u32(bnd, dims.heads_kv, 8);
-            set_u32(bnd, dims.window, 9);
-            set_f32(bnd, dims.scale, 10);
-        },
     )
+}
+
+/// The original BR-tiled sliding-window kernel, unrouted.
+///
+/// Kept as the A/B baseline the fast paths are measured and tested against.
+#[allow(clippy::too_many_arguments)]
+pub fn flash_attn_swa_tiled(
+    rt: &Arc<GpuRuntime>,
+    head_dim: AttnHeadDim,
+    q: &GpuBuffer,
+    k: &GpuBuffer,
+    v: &GpuBuffer,
+    o: &GpuBuffer,
+    tkv: &GpuBuffer,
+    q_pos_offset: &GpuBuffer,
+    kv_pos_offset: &GpuBuffer,
+    dims: AttnDims,
+) -> Result<(), String> {
+    // SAFETY: the closure binds only the documented scalar slots to `dims`;
+    // the runtime owns their const-arena storage through execution.
+    unsafe {
+        flash_attn_swa_with_scalars(
+            rt,
+            head_dim,
+            q,
+            k,
+            v,
+            o,
+            tkv,
+            q_pos_offset,
+            kv_pos_offset,
+            dims,
+            |bnd, kv_capacity| {
+                set_u32(bnd, dims.batch, 4);
+                set_u32(bnd, dims.tq, 5);
+                set_u32(bnd, dims.heads, 7);
+                set_u32(bnd, dims.heads_kv, 8);
+                set_u32(bnd, dims.window, 9);
+                set_f32(bnd, dims.scale, 10);
+                match head_dim {
+                    AttnHeadDim::D128 => set_u32(bnd, kv_capacity, 13),
+                    AttnHeadDim::D256 => {
+                        // D=256 shares its shader with Gemma's bf16-output variant.
+                        set_u32(bnd, 0, 13);
+                        set_u32(bnd, kv_capacity, 14);
+                    }
+                }
+            },
+        )
+    }
 }
 
 /// Shapes and scalars shared by the attention entry points.
@@ -731,8 +1995,16 @@ pub struct AttnDims {
 }
 
 /// [`flash_attn_swa`] with caller-supplied scalar binds.
+///
+/// # Safety
+///
+/// `scalars` must obey the module-level `_with_scalars` contract: bind exactly
+/// the documented scalar slots and values, including its validated
+/// `kv_capacity` argument at the head-dimension-specific slot, mutate no other
+/// binder state, and keep all stable scalar storage alive and resident for
+/// every execution.
 #[allow(clippy::too_many_arguments)]
-pub fn flash_attn_swa_with_scalars(
+pub unsafe fn flash_attn_swa_with_scalars(
     rt: &Arc<GpuRuntime>,
     head_dim: AttnHeadDim,
     q: &GpuBuffer,
@@ -743,38 +2015,45 @@ pub fn flash_attn_swa_with_scalars(
     q_pos_offset: &GpuBuffer,
     kv_pos_offset: &GpuBuffer,
     dims: AttnDims,
-    scalars: impl FnOnce(&mut Binder<'_>),
+    scalars: impl FnOnce(&mut Binder<'_>, u32),
 ) -> Result<(), String> {
     let d = head_dim.dim();
     // The sliding-window kernels always write f32.
-    validate_attn_dims(&dims, d, q, o, "flash_attn_swa", false)?;
-    require::<u32>(tkv, 1, "flash_attn_swa tkv")?;
-    require::<u32>(q_pos_offset, 1, "flash_attn_swa q_pos_offset")?;
-    require::<u32>(kv_pos_offset, 1, "flash_attn_swa kv_pos_offset")?;
-    // K/V hold at least one position each; `Tkv` lives on the device.
-    require::<f32>(
-        k,
-        elems(dims.batch * dims.heads_kv, d, "flash_attn_swa k")?,
-        "flash_attn_swa k",
+    require_attn_runtime(rt, q, k, v, o, "flash_attn_swa")?;
+    let kv_capacity = validate_attn_storage_for(&dims, d, q, k, v, o, "flash_attn_swa", false)?;
+    validate_attn_live_scalar_aliases(
+        &dims,
+        o,
+        tkv,
+        q_pos_offset,
+        kv_pos_offset,
+        "flash_attn_swa",
     )?;
-    require::<f32>(
-        v,
-        elems(dims.batch * dims.heads_kv, d, "flash_attn_swa v")?,
-        "flash_attn_swa v",
-    )?;
+    require::<u32>(rt, tkv, 1, "flash_attn_swa tkv")?;
+    require::<u32>(rt, q_pos_offset, 1, "flash_attn_swa q_pos_offset")?;
+    require::<u32>(rt, kv_pos_offset, 1, "flash_attn_swa kv_pos_offset")?;
 
     let p = rt.pipeline(head_dim.entry())?;
     let groups_x = (dims.tq as usize).div_ceil(head_dim.br());
-    let groups_y = (dims.batch as usize).saturating_mul(dims.heads as usize);
+    let groups_y = elems_product(&[dims.batch, dims.heads], "flash_attn_swa grid")?;
     dispatch_2d_tg(rt, &p, groups_x, groups_y, 32, |bnd| {
         set_gpu_buf(bnd, q, 0);
         set_gpu_buf(bnd, k, 1);
         set_gpu_buf(bnd, v, 2);
         set_gpu_buf(bnd, o, 3);
         set_gpu_buf(bnd, tkv, 6);
-        scalars(bnd);
         set_gpu_buf(bnd, q_pos_offset, 11);
         set_gpu_buf(bnd, kv_pos_offset, 12);
+        scalars(bnd, kv_capacity);
+        if head_dim == AttnHeadDim::D256 {
+            // The D=256 kernel reads `out_bf16` from slot 13, which the D=128
+            // kernel uses for its capacity. `o` was validated as f32 above, so
+            // a callback that left the slot unbound (a stale bind from an
+            // earlier dispatch in this scope) or set it would have the kernel
+            // write two-byte values into a four-byte output. This wrapper
+            // owns the slot: bound to 0 after the callback, whatever it did.
+            set_u32(bnd, 0, 13);
+        }
     })
 }
 
@@ -785,7 +2064,8 @@ pub fn flash_attn_swa_with_scalars(
 /// carries an `out_bf16` flag instead of a position offset.
 ///
 /// Scalar indices for `_with_scalars`: 4 = `B`, 5 = `Tq`, 7 = `H`, 8 = `Hkv`,
-/// 9 = `scale` (f32), 12 = `out_bf16`. Buffers 6, 10, 11 are bound here.
+/// 9 = `scale` (f32), 12 = `out_bf16`, and the callback's validated capacity
+/// argument at slot 13. Buffers 6, 10 and 11 are bound here.
 #[allow(clippy::too_many_arguments)]
 pub fn flash_attn_global_h512(
     rt: &Arc<GpuRuntime>,
@@ -799,7 +2079,28 @@ pub fn flash_attn_global_h512(
     dims: AttnDims,
     out_bf16: bool,
 ) -> Result<(), String> {
-    flash_attn_global_h512_with_scalars(
+    if !tiled_attn_forced() {
+        // This entry point's contract is that `window` is ignored: the tiled
+        // h512 kernel has no window parameter at all. The routed kernels take
+        // one and treat 0 as "global", so it is zeroed here rather than passed
+        // through -- otherwise a caller who left a window set in `dims` would
+        // silently get sliding-window attention from the global entry point.
+        let global = AttnDims { window: 0, ..dims };
+        return route_attn(
+            rt,
+            q,
+            k,
+            v,
+            o,
+            tkv,
+            q_pos_offset,
+            kv_pos_offset,
+            global,
+            512,
+            out_bf16,
+        );
+    }
+    flash_attn_global_h512_tiled(
         rt,
         q,
         k,
@@ -810,20 +2111,12 @@ pub fn flash_attn_global_h512(
         kv_pos_offset,
         dims,
         out_bf16,
-        |bnd| {
-            set_u32(bnd, dims.batch, 4);
-            set_u32(bnd, dims.tq, 5);
-            set_u32(bnd, dims.heads, 7);
-            set_u32(bnd, dims.heads_kv, 8);
-            set_f32(bnd, dims.scale, 9);
-            set_u32(bnd, u32::from(out_bf16), 12);
-        },
     )
 }
 
-/// [`flash_attn_global_h512`] with caller-supplied scalar binds.
+/// The original BR-tiled global kernel, unrouted. A/B baseline.
 #[allow(clippy::too_many_arguments)]
-pub fn flash_attn_global_h512_with_scalars(
+pub fn flash_attn_global_h512_tiled(
     rt: &Arc<GpuRuntime>,
     q: &GpuBuffer,
     k: &GpuBuffer,
@@ -834,29 +2127,77 @@ pub fn flash_attn_global_h512_with_scalars(
     kv_pos_offset: &GpuBuffer,
     dims: AttnDims,
     out_bf16: bool,
-    scalars: impl FnOnce(&mut Binder<'_>),
+) -> Result<(), String> {
+    // SAFETY: the closure binds only the documented scalar slots to this
+    // call's dimensions/output mode; the runtime owns their const-arena storage.
+    unsafe {
+        flash_attn_global_h512_with_scalars(
+            rt,
+            q,
+            k,
+            v,
+            o,
+            tkv,
+            q_pos_offset,
+            kv_pos_offset,
+            dims,
+            out_bf16,
+            |bnd, kv_capacity| {
+                set_u32(bnd, dims.batch, 4);
+                set_u32(bnd, dims.tq, 5);
+                set_u32(bnd, dims.heads, 7);
+                set_u32(bnd, dims.heads_kv, 8);
+                set_f32(bnd, dims.scale, 9);
+                set_u32(bnd, u32::from(out_bf16), 12);
+                set_u32(bnd, kv_capacity, 13);
+            },
+        )
+    }
+}
+
+/// [`flash_attn_global_h512`] with caller-supplied scalar binds.
+///
+/// # Safety
+///
+/// `scalars` must obey the module-level `_with_scalars` contract: bind exactly
+/// the documented scalar slots and values, including its validated
+/// `kv_capacity` argument at slot 13, mutate no other binder state, and keep all
+/// stable scalar storage alive and resident for every execution.
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn flash_attn_global_h512_with_scalars(
+    rt: &Arc<GpuRuntime>,
+    q: &GpuBuffer,
+    k: &GpuBuffer,
+    v: &GpuBuffer,
+    o: &GpuBuffer,
+    tkv: &GpuBuffer,
+    q_pos_offset: &GpuBuffer,
+    kv_pos_offset: &GpuBuffer,
+    dims: AttnDims,
+    out_bf16: bool,
+    scalars: impl FnOnce(&mut Binder<'_>, u32),
 ) -> Result<(), String> {
     const D: u32 = 512;
     // `BR = 4` for this kernel, not 8 — see its `constant uint BR`.
     const BR: usize = 4;
-    validate_attn_dims(&dims, D, q, o, "flash_attn_global_h512", out_bf16)?;
-    require::<u32>(tkv, 1, "flash_attn_global_h512 tkv")?;
-    require::<u32>(q_pos_offset, 1, "flash_attn_global_h512 q_pos_offset")?;
-    require::<u32>(kv_pos_offset, 1, "flash_attn_global_h512 kv_pos_offset")?;
-    require::<f32>(
-        k,
-        elems(dims.batch * dims.heads_kv, D, "k")?,
-        "flash_attn_global_h512 k",
+    require_attn_runtime(rt, q, k, v, o, "flash_attn_global_h512")?;
+    let kv_capacity =
+        validate_attn_storage_for(&dims, D, q, k, v, o, "flash_attn_global_h512", out_bf16)?;
+    validate_attn_live_scalar_aliases(
+        &dims,
+        o,
+        tkv,
+        q_pos_offset,
+        kv_pos_offset,
+        "flash_attn_global_h512",
     )?;
-    require::<f32>(
-        v,
-        elems(dims.batch * dims.heads_kv, D, "v")?,
-        "flash_attn_global_h512 v",
-    )?;
+    require::<u32>(rt, tkv, 1, "flash_attn_global_h512 tkv")?;
+    require::<u32>(rt, q_pos_offset, 1, "flash_attn_global_h512 q_pos_offset")?;
+    require::<u32>(rt, kv_pos_offset, 1, "flash_attn_global_h512 kv_pos_offset")?;
 
     let p = rt.pipeline("flash_attn_global_h512")?;
     let groups_x = (dims.tq as usize).div_ceil(BR);
-    let groups_y = (dims.batch as usize).saturating_mul(dims.heads as usize);
+    let groups_y = elems_product(&[dims.batch, dims.heads], "flash_attn_global grid")?;
     dispatch_2d_tg(rt, &p, groups_x, groups_y, 32, |bnd| {
         set_gpu_buf(bnd, q, 0);
         set_gpu_buf(bnd, k, 1);
@@ -865,7 +2206,7 @@ pub fn flash_attn_global_h512_with_scalars(
         set_gpu_buf(bnd, tkv, 6);
         set_gpu_buf(bnd, q_pos_offset, 10);
         set_gpu_buf(bnd, kv_pos_offset, 11);
-        scalars(bnd);
+        scalars(bnd, kv_capacity);
     })
 }
 
@@ -881,6 +2222,9 @@ fn validate_attn_dims(
     what: &str,
     out_bf16: bool,
 ) -> Result<(), String> {
+    if d == 0 {
+        return Err(format!("{what}: head_dim must be non-zero"));
+    }
     if dims.heads_kv == 0 {
         return Err(format!("{what}: heads_kv must be non-zero"));
     }
@@ -894,17 +2238,23 @@ fn validate_attn_dims(
     if !dims.scale.is_finite() {
         return Err(format!("{what}: scale must be finite, got {}", dims.scale));
     }
-    let n = elems(dims.batch * dims.tq * dims.heads, d, what)?;
-    require::<f32>(q, n, &format!("{what} q"))?;
+    let grid_y = elems_product(&[dims.batch, dims.heads], what)?;
+    if grid_y > u32::MAX as usize {
+        return Err(format!(
+            "{what}: B*H grid extent {grid_y} exceeds Metal uint indexing"
+        ));
+    }
+    let n = elems_product(&[dims.batch, dims.tq, dims.heads, d], what)?;
+    require_capacity::<f32>(q, n, &format!("{what} q"))?;
     if out_bf16 {
         // `out_bf16` exists to halve this buffer — the kernel writes `bfloat`
         // into it. Validating `o` as f32 regardless demanded twice the memory
         // the kernel touches, so a caller who sized it correctly for bf16 got
         // "buffer holds 2560 elements, kernel reads/writes 5120" and the
         // documented half-width scratch was unreachable.
-        require::<u16>(o, n, &format!("{what} o (bf16)"))?;
+        require_capacity::<u16>(o, n, &format!("{what} o (bf16)"))?;
     } else {
-        require::<f32>(o, n, &format!("{what} o"))?;
+        require_capacity::<f32>(o, n, &format!("{what} o"))?;
     }
     Ok(())
 }
@@ -938,8 +2288,9 @@ impl QkvRopeDims {
         let kv = (self.t as usize).checked_mul(self.heads_kv as usize);
         match (q, kv) {
             (Some(q), Some(_)) if q_only => Ok(q),
-            (Some(q), Some(kv)) => q
-                .checked_add(2 * kv)
+            (Some(q), Some(kv)) => kv
+                .checked_mul(2)
+                .and_then(|kv_twice| q.checked_add(kv_twice))
                 .ok_or_else(|| "qkv_rope: head count overflows usize".to_string()),
             _ => Err("qkv_rope: head count overflows usize".to_string()),
         }
@@ -1005,12 +2356,25 @@ pub struct KvStoreTarget<'a> {
     pub dst_v: &'a GpuBuffer,
     /// Device `u32` element offset into both caches.
     pub dst_offset: &'a GpuBuffer,
+    /// Fixed logical capacity of each cache, in f32 elements.
+    ///
+    /// This may be smaller than the backing allocation when multiple logical
+    /// regions share a slab. The host proves both buffers cover it; the shader
+    /// refuses the complete fused operation when its live offset plus the K/V
+    /// span would cross it.
+    pub capacity: u32,
 }
 
 /// Fused per-head RMSNorm, QKV projection scaling, and rotary embedding.
 ///
 /// `q`, `k` and `v` are read and written in place: they arrive holding the raw
 /// projection output and leave normalized and rotated.
+/// Every active in/out buffer must name a distinct allocation and must not
+/// alias the shared weights or device offsets. The fused cache destinations
+/// are active writes as well. When `q_only` is true, K/V and cache targets are
+/// not dispatched and therefore are excluded from this alias contract; the
+/// cache-store variant is rejected because its device-side cache guard runs
+/// before the Q branch and could otherwise suppress an ostensibly Q-only op.
 ///
 /// `pos_offset` is a constant for [`QkvRopeVariant::PosConst`] and a device
 /// `u32` buffer for the other two. Exactly one must be supplied; passing the
@@ -1018,7 +2382,9 @@ pub struct KvStoreTarget<'a> {
 ///
 /// Scalar indices for `_with_scalars`: 6 = `T`, 7 = `Hq`, 8 = `Hkv`,
 /// 9 = `D`, 10 = `rotary_dim`, 11 = `pos_offset` (`PosConst` only),
-/// 12 = `theta` (f32), 13 = `eps` (f32).
+/// 12 = `theta` (f32), 13 = `eps` (f32), and for
+/// [`QkvRopeVariant::PosBufferKvStore`] 17 = the callback's validated cache
+/// capacity.
 #[allow(clippy::too_many_arguments)]
 pub fn rms_qkv_rope(
     rt: &Arc<GpuRuntime>,
@@ -1030,27 +2396,35 @@ pub fn rms_qkv_rope(
     kv_store: Option<KvStoreTarget<'_>>,
     q_only: bool,
 ) -> Result<(), String> {
-    rms_qkv_rope_with_scalars(
-        rt,
-        variant,
-        qkv,
-        dims,
-        pos_offset_buf,
-        kv_store,
-        q_only,
-        |bnd| {
-            set_u32(bnd, dims.t, 6);
-            set_u32(bnd, dims.heads_q, 7);
-            set_u32(bnd, dims.heads_kv, 8);
-            set_u32(bnd, dims.head_dim, 9);
-            set_u32(bnd, dims.rotary_dim, 10);
-            if variant == QkvRopeVariant::PosConst {
-                set_u32(bnd, pos_offset, 11);
-            }
-            set_f32(bnd, dims.theta, 12);
-            set_f32(bnd, dims.eps, 13);
-        },
-    )
+    // SAFETY: the closure binds only the scalar slots documented for the
+    // selected variant, with the same values this call validates; the runtime
+    // owns their const-arena storage through execution.
+    unsafe {
+        rms_qkv_rope_with_scalars(
+            rt,
+            variant,
+            qkv,
+            dims,
+            pos_offset_buf,
+            kv_store,
+            q_only,
+            |bnd, kv_capacity| {
+                set_u32(bnd, dims.t, 6);
+                set_u32(bnd, dims.heads_q, 7);
+                set_u32(bnd, dims.heads_kv, 8);
+                set_u32(bnd, dims.head_dim, 9);
+                set_u32(bnd, dims.rotary_dim, 10);
+                if variant == QkvRopeVariant::PosConst {
+                    set_u32(bnd, pos_offset, 11);
+                }
+                set_f32(bnd, dims.theta, 12);
+                set_f32(bnd, dims.eps, 13);
+                if let Some(capacity) = kv_capacity {
+                    set_u32(bnd, capacity, 17);
+                }
+            },
+        )
+    }
 }
 
 /// The six in/out buffers every fused QKV+RoPE entry point takes.
@@ -1070,9 +2444,14 @@ pub struct QkvBuffers<'a> {
     pub v_weight: &'a GpuBuffer,
 }
 
-/// [`rms_qkv_rope`] with caller-supplied scalar binds.
+/// Validate the complete [`rms_qkv_rope`] storage/variant contract without
+/// looking up a pipeline, staging scalars, or encoding work.
+///
+/// Stable-scalar adapters should call this before reserving slots in their own
+/// scalar pool. [`rms_qkv_rope_with_scalars`] calls the same function, so the
+/// preflight cannot drift from the eventual dispatch boundary.
 #[allow(clippy::too_many_arguments)]
-pub fn rms_qkv_rope_with_scalars(
+pub fn validate_rms_qkv_rope(
     rt: &Arc<GpuRuntime>,
     variant: QkvRopeVariant,
     qkv: QkvBuffers<'_>,
@@ -1080,9 +2459,14 @@ pub fn rms_qkv_rope_with_scalars(
     pos_offset_buf: Option<&GpuBuffer>,
     kv_store: Option<KvStoreTarget<'_>>,
     q_only: bool,
-    scalars: impl FnOnce(&mut Binder<'_>),
 ) -> Result<(), String> {
     dims.validate("rms_qkv_rope")?;
+    if q_only && variant == QkvRopeVariant::PosBufferKvStore {
+        return Err(
+            "rms_qkv_rope: q_only cannot use PosBufferKvStore because its cache guard can suppress Q"
+                .into(),
+        );
+    }
 
     // The variant selects the kernel, and the kernel decides which of these
     // operands exist. Accepting a mismatched pair and ignoring the extra one
@@ -1093,7 +2477,7 @@ pub fn rms_qkv_rope_with_scalars(
         }
         (QkvRopeVariant::PosConst, None) => {}
         (_, None) => return Err("rms_qkv_rope: PosBuffer variants require pos_offset_buf".into()),
-        (_, Some(b)) => require::<u32>(b, 1, "rms_qkv_rope pos_offset_buf")?,
+        (_, Some(b)) => require::<u32>(rt, b, 1, "rms_qkv_rope pos_offset_buf")?,
     }
     match (variant, kv_store.is_some()) {
         (QkvRopeVariant::PosBufferKvStore, false) => {
@@ -1104,41 +2488,245 @@ pub fn rms_qkv_rope_with_scalars(
     }
 
     let d = dims.head_dim as usize;
-    let q_heads = (dims.t as usize).saturating_mul(dims.heads_q as usize);
-    let kv_heads = (dims.t as usize).saturating_mul(dims.heads_kv as usize);
-    require::<f32>(qkv.q, q_heads * d, "rms_qkv_rope q")?;
-    require::<f32>(qkv.q_weight, d, "rms_qkv_rope q_weight")?;
+    let q_heads = elems_product(&[dims.t, dims.heads_q], "rms_qkv_rope q heads")?;
+    let kv_heads = elems_product(&[dims.t, dims.heads_kv], "rms_qkv_rope kv heads")?;
+    let q_elems = q_heads
+        .checked_mul(d)
+        .ok_or("rms_qkv_rope q extent overflows usize")?;
+    let kv_elems = kv_heads
+        .checked_mul(d)
+        .ok_or("rms_qkv_rope kv extent overflows usize")?;
+    require::<f32>(rt, qkv.q, q_elems, "rms_qkv_rope q")?;
+    require::<f32>(rt, qkv.q_weight, d, "rms_qkv_rope q_weight")?;
     if !q_only {
-        require::<f32>(qkv.k, kv_heads * d, "rms_qkv_rope k")?;
-        require::<f32>(qkv.v, kv_heads * d, "rms_qkv_rope v")?;
-        require::<f32>(qkv.k_weight, d, "rms_qkv_rope k_weight")?;
-        require::<f32>(qkv.v_weight, d, "rms_qkv_rope v_weight")?;
+        require::<f32>(rt, qkv.k, kv_elems, "rms_qkv_rope k")?;
+        require::<f32>(rt, qkv.v, kv_elems, "rms_qkv_rope v")?;
+        require::<f32>(rt, qkv.k_weight, d, "rms_qkv_rope k_weight")?;
+        require::<f32>(rt, qkv.v_weight, d, "rms_qkv_rope v_weight")?;
     }
     if let Some(t) = &kv_store {
-        require::<f32>(t.dst_k, kv_heads * d, "rms_qkv_rope dst_k")?;
-        require::<f32>(t.dst_v, kv_heads * d, "rms_qkv_rope dst_v")?;
-        require::<u32>(t.dst_offset, 1, "rms_qkv_rope kv_dst_offset")?;
+        if (t.capacity as usize) < kv_elems {
+            return Err(format!(
+                "rms_qkv_rope: cache capacity {} is smaller than the K/V span {kv_elems}",
+                t.capacity
+            ));
+        }
+        require::<f32>(
+            rt,
+            t.dst_k,
+            t.capacity as usize,
+            "rms_qkv_rope dst_k capacity",
+        )?;
+        require::<f32>(
+            rt,
+            t.dst_v,
+            t.capacity as usize,
+            "rms_qkv_rope dst_v capacity",
+        )?;
+        require::<u32>(rt, t.dst_offset, 1, "rms_qkv_rope kv_dst_offset")?;
     }
 
     let n = dims.head_count(q_only)?;
+    require_1d_indexable(n, "rms_qkv_rope head grid")?;
+    if n == 0 {
+        return Ok(());
+    }
+    if q_only {
+        match pos_offset_buf {
+            Some(pos) => require_disjoint_writes(
+                "rms_qkv_rope",
+                &[("q", qkv.q)],
+                &[("q_weight", qkv.q_weight), ("pos_offset_buf", pos)],
+            )?,
+            None => require_disjoint_writes(
+                "rms_qkv_rope",
+                &[("q", qkv.q)],
+                &[("q_weight", qkv.q_weight)],
+            )?,
+        }
+    } else {
+        match (pos_offset_buf, kv_store) {
+            (None, None) => require_disjoint_writes(
+                "rms_qkv_rope",
+                &[("q", qkv.q), ("k", qkv.k), ("v", qkv.v)],
+                &[
+                    ("q_weight", qkv.q_weight),
+                    ("k_weight", qkv.k_weight),
+                    ("v_weight", qkv.v_weight),
+                ],
+            )?,
+            (Some(pos), None) => require_disjoint_writes(
+                "rms_qkv_rope",
+                &[("q", qkv.q), ("k", qkv.k), ("v", qkv.v)],
+                &[
+                    ("q_weight", qkv.q_weight),
+                    ("k_weight", qkv.k_weight),
+                    ("v_weight", qkv.v_weight),
+                    ("pos_offset_buf", pos),
+                ],
+            )?,
+            (Some(pos), Some(target)) => require_disjoint_writes(
+                "rms_qkv_rope",
+                &[
+                    ("q", qkv.q),
+                    ("k", qkv.k),
+                    ("v", qkv.v),
+                    ("dst_k", target.dst_k),
+                    ("dst_v", target.dst_v),
+                ],
+                &[
+                    ("q_weight", qkv.q_weight),
+                    ("k_weight", qkv.k_weight),
+                    ("v_weight", qkv.v_weight),
+                    ("pos_offset_buf", pos),
+                    ("dst_offset", target.dst_offset),
+                ],
+            )?,
+            // Variant validation above makes a cache target without a device
+            // position impossible, but keep this exhaustive and fail closed if
+            // the variant contract changes.
+            (None, Some(target)) => require_disjoint_writes(
+                "rms_qkv_rope",
+                &[
+                    ("q", qkv.q),
+                    ("k", qkv.k),
+                    ("v", qkv.v),
+                    ("dst_k", target.dst_k),
+                    ("dst_v", target.dst_v),
+                ],
+                &[
+                    ("q_weight", qkv.q_weight),
+                    ("k_weight", qkv.k_weight),
+                    ("v_weight", qkv.v_weight),
+                    ("dst_offset", target.dst_offset),
+                ],
+            )?,
+        }
+    }
+    Ok(())
+}
+
+/// [`rms_qkv_rope`] with caller-supplied scalar binds.
+///
+/// # Safety
+///
+/// `scalars` must obey the module-level `_with_scalars` contract: bind exactly
+/// the documented scalar slots and values, mutate no other binder state, and
+/// keep all stable scalar storage alive and resident for every execution.
+/// For [`QkvRopeVariant::PosBufferKvStore`] only, the callback may additionally
+/// replace slot 16 with an aligned, in-bounds byte-offset view of the validated
+/// [`KvStoreTarget::dst_offset`] buffer. This supports a stable scalar pool;
+/// the callback must preserve that buffer's runtime, lifetime, and `u32` ABI.
+///
+/// When `q_only` is set, slot 8 (`Hkv`) is rebound to zero after `scalars`
+/// returns. The q-only grid is `T * Hq` head rows rounded up to a whole
+/// threadgroup of rows (one simdgroup per row), and the kernel's bounds guard
+/// counts `2 * T * Hkv` K/V rows after the Q ones, so a non-zero `Hkv` would
+/// let the padding simdgroups run the K/V branches over Q storage. The
+/// callback may still bind slot 8 as documented; the override is this
+/// wrapper's responsibility, not the adapter's.
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn rms_qkv_rope_with_scalars(
+    rt: &Arc<GpuRuntime>,
+    variant: QkvRopeVariant,
+    qkv: QkvBuffers<'_>,
+    dims: QkvRopeDims,
+    pos_offset_buf: Option<&GpuBuffer>,
+    kv_store: Option<KvStoreTarget<'_>>,
+    q_only: bool,
+    scalars: impl FnOnce(&mut Binder<'_>, Option<u32>),
+) -> Result<(), String> {
+    validate_rms_qkv_rope(rt, variant, qkv, dims, pos_offset_buf, kv_store, q_only)?;
+    let n = dims.head_count(q_only)?;
+    if n == 0 {
+        return Ok(());
+    }
+    let kv_capacity = kv_store.map(|target| target.capacity);
     let p = rt.pipeline(variant.entry())?;
-    dispatch_1d(rt, &p, n, |bnd| {
-        set_gpu_buf(bnd, qkv.q, 0);
-        set_gpu_buf(bnd, qkv.k, 1);
-        set_gpu_buf(bnd, qkv.v, 2);
-        set_gpu_buf(bnd, qkv.q_weight, 3);
-        set_gpu_buf(bnd, qkv.k_weight, 4);
-        set_gpu_buf(bnd, qkv.v_weight, 5);
-        scalars(bnd);
-        if let Some(b) = pos_offset_buf {
-            set_gpu_buf(bnd, b, 11);
-        }
-        if let Some(t) = kv_store {
-            set_gpu_buf(bnd, t.dst_k, 14);
-            set_gpu_buf(bnd, t.dst_v, 15);
-            set_gpu_buf(bnd, t.dst_offset, 16);
-        }
-    })
+    let (rows_per_tg, threads_per_tg) = rope_row_geometry(&p)?;
+    dispatch_tg_1d(
+        rt,
+        &p,
+        n.div_ceil(rows_per_tg),
+        threads_per_tg,
+        None,
+        |bnd| {
+            set_gpu_buf(bnd, qkv.q, 0);
+            set_gpu_buf(bnd, qkv.q_weight, 3);
+            if q_only {
+                // These slots are part of the fixed argument-table ABI but the
+                // q-only grid never reaches either K/V branch. Bind already
+                // validated Q storage rather than touching caller-provided
+                // inactive placeholders (which may intentionally be foreign or
+                // empty under this contract).
+                set_gpu_buf(bnd, qkv.q, 1);
+                set_gpu_buf(bnd, qkv.q, 2);
+                set_gpu_buf(bnd, qkv.q_weight, 4);
+                set_gpu_buf(bnd, qkv.q_weight, 5);
+            } else {
+                set_gpu_buf(bnd, qkv.k, 1);
+                set_gpu_buf(bnd, qkv.v, 2);
+                set_gpu_buf(bnd, qkv.k_weight, 4);
+                set_gpu_buf(bnd, qkv.v_weight, 5);
+            }
+            if let Some(b) = pos_offset_buf {
+                set_gpu_buf(bnd, b, 11);
+            }
+            if let Some(t) = kv_store {
+                set_gpu_buf(bnd, t.dst_k, 14);
+                set_gpu_buf(bnd, t.dst_v, 15);
+                set_gpu_buf(bnd, t.dst_offset, 16);
+            }
+            // The unsafe stable-scalar seam runs last so a fused-cache adapter may
+            // replace slot 16 with a validated byte-offset view of `dst_offset`.
+            scalars(bnd, kv_capacity);
+            if q_only {
+                // The grid is `T * Hq` rows rounded up to whole threadgroups and
+                // the kernel's guard is `T*Hq + 2*T*Hkv`: with the real `Hkv`
+                // bound, the padding simdgroups fall into the K/V branches, which
+                // in this mode point at Q and re-normalize rows other simdgroups
+                // own. Force `Hkv = 0` after the callback so the guard is exactly
+                // the Q grid, whatever slot 8 held.
+                set_u32(bnd, 0, 8);
+            }
+        },
+    )
+}
+
+/// Lanes in the simdgroup the RoPE kernels give each head row.
+const ROPE_SIMD_WIDTH: usize = 32;
+/// Head rows per threadgroup: eight simdgroups, 256 threads, the usual
+/// occupancy point for a row kernel with no threadgroup memory.
+const ROPE_ROWS_PER_TG: usize = 8;
+
+/// `(rows_per_tg, threads_per_tg)` for the one-simdgroup-per-row RoPE
+/// kernels.
+///
+/// The kernel folds each row's sum of squares with `simd_sum` over exactly
+/// 32 lanes and derives its row from `threads_per_threadgroup / 32`, so a
+/// pipeline whose execution width is not 32 would reduce the wrong lanes and
+/// address the wrong rows. That is refused here rather than dispatched. The
+/// row count per group bends to the pipeline's thread limit so a register
+/// -heavy compile still gets whole simdgroups.
+fn rope_row_geometry(
+    pipeline: &ProtocolObject<dyn MTLComputePipelineState>,
+) -> Result<(usize, usize), String> {
+    let width = pipeline.threadExecutionWidth();
+    if width != ROPE_SIMD_WIDTH {
+        return Err(format!(
+            "rms_qkv_rope: kernel assumes a {ROPE_SIMD_WIDTH}-lane simdgroup, \
+             pipeline reports an execution width of {width}"
+        ));
+    }
+    let max_threads = pipeline.maxTotalThreadsPerThreadgroup();
+    if max_threads < ROPE_SIMD_WIDTH {
+        return Err(format!(
+            "rms_qkv_rope: pipeline allows {max_threads} threads per \
+             threadgroup, fewer than one simdgroup"
+        ));
+    }
+    let rows = (max_threads / ROPE_SIMD_WIDTH).min(ROPE_ROWS_PER_TG);
+    Ok((rows, rows * ROPE_SIMD_WIDTH))
 }
 
 // -------------------------------------------------------------- Sampling ---
@@ -1167,19 +2755,24 @@ pub fn softcap_logits(
     softcap: &GpuBuffer,
     n: u32,
 ) -> Result<(), String> {
-    softcap_logits_with_scalars(rt, logits, softcap, n, |bnd| set_u32(bnd, n, 2))
+    unsafe { softcap_logits_with_scalars(rt, logits, softcap, n, |bnd| set_u32(bnd, n, 2)) }
 }
 
 /// [`softcap_logits`] with caller-supplied scalar binds.
-pub fn softcap_logits_with_scalars(
+pub unsafe fn softcap_logits_with_scalars(
     rt: &Arc<GpuRuntime>,
     logits: &GpuBuffer,
     softcap: &GpuBuffer,
     n: u32,
     scalars: impl FnOnce(&mut Binder<'_>),
 ) -> Result<(), String> {
-    require::<f32>(logits, n as usize, "softcap_logits logits")?;
-    require::<f32>(softcap, 1, "softcap_logits softcap")?;
+    require::<f32>(rt, logits, n as usize, "softcap_logits logits")?;
+    require::<f32>(rt, softcap, 1, "softcap_logits softcap")?;
+    require_disjoint_writes(
+        "softcap_logits",
+        &[("logits", logits)],
+        &[("softcap", softcap)],
+    )?;
     let p = rt.pipeline("softcap_logits")?;
     dispatch_1d(rt, &p, n as usize, |bnd| {
         set_gpu_buf(bnd, logits, 0);
@@ -1211,10 +2804,12 @@ pub fn argmax_f32_pass(
     n: u32,
 ) -> Result<(), String> {
     let has = u32::from(idx_in.is_some());
-    argmax_f32_pass_with_scalars(rt, logits, out_idx, out_val, idx_in, softcap, n, |bnd| {
-        set_u32(bnd, n, 3);
-        set_u32(bnd, has, 5);
-    })
+    unsafe {
+        argmax_f32_pass_with_scalars(rt, logits, out_idx, out_val, idx_in, softcap, n, |bnd| {
+            set_u32(bnd, n, 3);
+            set_u32(bnd, has, 5);
+        })
+    }
 }
 
 /// Threadgroups [`argmax_f32_pass`] launches for `n` inputs, and therefore the
@@ -1229,7 +2824,7 @@ const ARGMAX_TG: usize = 256;
 
 /// [`argmax_f32_pass`] with caller-supplied scalar binds.
 #[allow(clippy::too_many_arguments)]
-pub fn argmax_f32_pass_with_scalars(
+pub unsafe fn argmax_f32_pass_with_scalars(
     rt: &Arc<GpuRuntime>,
     logits: &GpuBuffer,
     out_idx: &GpuBuffer,
@@ -1243,12 +2838,24 @@ pub fn argmax_f32_pass_with_scalars(
         return Err("argmax_f32_pass: n must be non-zero".into());
     }
     let groups = argmax_pass_groups(n);
-    require::<f32>(logits, n as usize, "argmax_f32_pass logits")?;
-    require::<u32>(out_idx, groups, "argmax_f32_pass out_idx")?;
-    require::<f32>(out_val, groups, "argmax_f32_pass out_val")?;
-    require::<f32>(softcap, 1, "argmax_f32_pass softcap")?;
+    require::<f32>(rt, logits, n as usize, "argmax_f32_pass logits")?;
+    require::<u32>(rt, out_idx, groups, "argmax_f32_pass out_idx")?;
+    require::<f32>(rt, out_val, groups, "argmax_f32_pass out_val")?;
+    require::<f32>(rt, softcap, 1, "argmax_f32_pass softcap")?;
     if let Some(b) = idx_in {
-        require::<u32>(b, n as usize, "argmax_f32_pass idx_in")?;
+        require::<u32>(rt, b, n as usize, "argmax_f32_pass idx_in")?;
+    }
+    match idx_in {
+        Some(indices) => require_disjoint_writes(
+            "argmax_f32_pass",
+            &[("out_idx", out_idx), ("out_val", out_val)],
+            &[("logits", logits), ("idx_in", indices), ("softcap", softcap)],
+        )?,
+        None => require_disjoint_writes(
+            "argmax_f32_pass",
+            &[("out_idx", out_idx), ("out_val", out_val)],
+            &[("logits", logits), ("softcap", softcap)],
+        )?,
     }
 
     let p = rt.pipeline("argmax_f32")?;
@@ -1287,11 +2894,11 @@ pub fn softcap_sample(
     softcap: &GpuBuffer,
     n: u32,
 ) -> Result<(), String> {
-    softcap_sample_with_scalars(rt, logits, out_token, softcap, n, |bnd| set_u32(bnd, n, 3))
+    unsafe { softcap_sample_with_scalars(rt, logits, out_token, softcap, n, |bnd| set_u32(bnd, n, 3)) }
 }
 
 /// [`softcap_sample`] with caller-supplied scalar binds.
-pub fn softcap_sample_with_scalars(
+pub unsafe fn softcap_sample_with_scalars(
     rt: &Arc<GpuRuntime>,
     logits: &GpuBuffer,
     out_token: &GpuBuffer,
@@ -1302,9 +2909,14 @@ pub fn softcap_sample_with_scalars(
     if n == 0 {
         return Err("softcap_sample: n must be non-zero".into());
     }
-    require::<f32>(logits, n as usize, "softcap_sample logits")?;
-    require::<u32>(out_token, 1, "softcap_sample out_token")?;
-    require::<f32>(softcap, 1, "softcap_sample softcap")?;
+    require::<f32>(rt, logits, n as usize, "softcap_sample logits")?;
+    require::<u32>(rt, out_token, 1, "softcap_sample out_token")?;
+    require::<f32>(rt, softcap, 1, "softcap_sample softcap")?;
+    require_disjoint_writes(
+        "softcap_sample",
+        &[("logits", logits), ("out_token", out_token)],
+        &[("softcap", softcap)],
+    )?;
 
     let p = rt.pipeline("softcap_sample")?;
     let max_threads = p.maxTotalThreadsPerThreadgroup();
@@ -1338,13 +2950,15 @@ pub fn softcap_argmax_one_pass(
     softcap: &GpuBuffer,
     n: u32,
 ) -> Result<(), String> {
-    softcap_argmax_one_pass_with_scalars(rt, logits, out_token, softcap, n, |bnd| {
-        set_u32(bnd, n, 3)
-    })
+    unsafe {
+        softcap_argmax_one_pass_with_scalars(rt, logits, out_token, softcap, n, |bnd| {
+            set_u32(bnd, n, 3)
+        })
+    }
 }
 
 /// [`softcap_argmax_one_pass`] with caller-supplied scalar binds.
-pub fn softcap_argmax_one_pass_with_scalars(
+pub unsafe fn softcap_argmax_one_pass_with_scalars(
     rt: &Arc<GpuRuntime>,
     logits: &GpuBuffer,
     out_token: &GpuBuffer,
@@ -1355,9 +2969,14 @@ pub fn softcap_argmax_one_pass_with_scalars(
     if n == 0 {
         return Err("softcap_argmax_one_pass: n must be non-zero".into());
     }
-    require::<f32>(logits, n as usize, "softcap_argmax_one_pass logits")?;
-    require::<u32>(out_token, 1, "softcap_argmax_one_pass out_token")?;
-    require::<f32>(softcap, 1, "softcap_argmax_one_pass softcap")?;
+    require::<f32>(rt, logits, n as usize, "softcap_argmax_one_pass logits")?;
+    require::<u32>(rt, out_token, 1, "softcap_argmax_one_pass out_token")?;
+    require::<f32>(rt, softcap, 1, "softcap_argmax_one_pass softcap")?;
+    require_disjoint_writes(
+        "softcap_argmax_one_pass",
+        &[("out_token", out_token)],
+        &[("logits", logits), ("softcap", softcap)],
+    )?;
 
     let p = rt.pipeline("softcap_argmax_one_pass")?;
     // The kernel's threadgroup arrays are 1024 long and every lane writes its
@@ -1430,13 +3049,22 @@ pub struct Q4Bank<'a> {
 }
 
 impl Q4Bank<'_> {
-    fn validate(&self, shape: &QuantShape, what: &str) -> Result<(), String> {
+    fn validate(&self, rt: &GpuRuntime, shape: &QuantShape, what: &str) -> Result<(), String> {
         shape.validate(what)?;
+        if shape.group_size % 8 != 0 {
+            return Err(format!(
+                "{what}: group_size {} must be a multiple of 8; the kernels peel each \
+                 group through 4-byte `uint` loads at `packed + row * cols / 2 + \
+                 g * group_size / 2`, which is aligned for every row and group only \
+                 when group_size is a multiple of 8",
+                shape.group_size
+            ));
+        }
         let groups = shape.groups()?;
         let weights = elems(shape.rows, shape.cols, what)?;
-        require::<u8>(self.packed, weights.div_ceil(2), &format!("{what} packed"))?;
-        require::<f32>(self.scales, groups, &format!("{what} scales"))?;
-        require::<f32>(self.zeros, groups, &format!("{what} zeros"))?;
+        require::<u8>(rt, self.packed, weights.div_ceil(2), &format!("{what} packed"))?;
+        require::<f32>(rt, self.scales, groups, &format!("{what} scales"))?;
+        require::<f32>(rt, self.zeros, groups, &format!("{what} zeros"))?;
         Ok(())
     }
 }
@@ -1460,13 +3088,24 @@ pub struct Q4MlxBank<'a> {
 }
 
 impl Q4MlxBank<'_> {
-    fn validate(&self, shape: &QuantShape, what: &str) -> Result<(), String> {
+    fn validate(&self, rt: &GpuRuntime, shape: &QuantShape, what: &str) -> Result<(), String> {
         shape.validate(what)?;
+        const SIMD_BLOCK: u32 = 512;
+        if shape.group_size % 32 != 0 || SIMD_BLOCK % shape.group_size != 0 {
+            return Err(format!(
+                "{what}: group_size {} is outside the MLX kernel domain \
+                 {{32, 64, 128, 256, 512}}; the row kernels peel each group through \
+                 16-byte loads and the simdgroup kernels stride their scale pointer \
+                 by 512 / group_size",
+                shape.group_size
+            ));
+        }
         let groups = shape.groups()?;
         let weights = elems(shape.rows, shape.cols, what)?;
-        require::<u8>(self.packed, weights.div_ceil(2), &format!("{what} packed"))?;
+        require::<u8>(rt, self.packed, weights.div_ceil(2), &format!("{what} packed"))?;
         // One bfloat2 = two u16 = 4 bytes per group.
         require::<u32>(
+            rt,
             self.scales_biases,
             groups,
             &format!("{what} scales_biases (bfloat2 per group)"),
@@ -1496,15 +3135,17 @@ pub fn gemv_q4(
     shape: QuantShape,
     tiled: bool,
 ) -> Result<(), String> {
-    gemv_q4_with_scalars(rt, bank, x, y, shape, tiled, |bnd| {
-        set_u32(bnd, shape.rows, 5);
-        set_u32(bnd, shape.cols, 6);
-        set_u32(bnd, shape.group_size, 7);
-    })
+    unsafe {
+        gemv_q4_with_scalars(rt, bank, x, y, shape, tiled, |bnd| {
+            set_u32(bnd, shape.rows, 5);
+            set_u32(bnd, shape.cols, 6);
+            set_u32(bnd, shape.group_size, 7);
+        })
+    }
 }
 
 /// [`gemv_q4`] with caller-supplied scalar binds.
-pub fn gemv_q4_with_scalars(
+pub unsafe fn gemv_q4_with_scalars(
     rt: &Arc<GpuRuntime>,
     bank: Q4Bank<'_>,
     x: &GpuBuffer,
@@ -1514,52 +3155,33 @@ pub fn gemv_q4_with_scalars(
     scalars: impl FnOnce(&mut Binder<'_>),
 ) -> Result<(), String> {
     let entry = if tiled { "gemv_q4_tiled" } else { "gemv_q4" };
-    bank.validate(&shape, entry)?;
-    require::<f32>(x, shape.cols as usize, &format!("{entry} x"))?;
-    require::<f32>(y, shape.rows as usize, &format!("{entry} y"))?;
+    bank.validate(rt, &shape, entry)?;
+    require::<f32>(rt, x, shape.cols as usize, &format!("{entry} x"))?;
+    require::<f32>(rt, y, shape.rows as usize, &format!("{entry} y"))?;
     if shape.rows == 0 {
         return Ok(());
     }
 
+    require_disjoint_writes(
+        "gemv_q4",
+        &[("y", y)],
+        &[
+            ("packed", bank.packed),
+            ("scales", bank.scales),
+            ("zeros", bank.zeros),
+            ("x", x),
+        ],
+    )?;
     let p = rt.pipeline(entry)?;
-    // The two kernels take *different* grids, and until 2026-08-31 both were
-    // dispatched with the one-thread-per-row geometry in the `else` arm.
-    //
-    // `gemv_q4_tiled` indexes its output row by `threadgroup_position_in_grid`
-    // and returns when that exceeds `rows`, so it needs one threadgroup per row.
-    // Handing it `rows.div_ceil(128)` groups meant it wrote the first
-    // `rows / 128` rows and left every other row of `y` untouched — no error, no
-    // partial-write signal, just whatever was in the buffer before. Measured at
-    // 512 rows it wrote 4 and left 508 holding a sentinel. The benchmark is what
-    // caught it: 3,077 GB/s is not a number this machine can produce, and it was
-    // doing 0.8% of the work.
-    //
-    // It also declares its scratch statically (`threadgroup float
-    // partial[GEMV_TG]`) and never caches `x`, so the dynamic threadgroup
-    // allocation, and the `cols` ceiling that exists to bound it, belong to the
-    // one-thread-per-row kernel alone.
-    let (groups, tptg, tg_mem) = if tiled {
-        (shape.rows as usize, GEMV_TILED_TPTG, None)
+    // `gemv_q4` is one simdgroup per `SIMD_ROWS_PER_TG / 2` output rows with
+    // lanes striding K. `gemv_q4_tiled` indexes its output row by
+    // `threadgroup_position_in_grid` and needs one threadgroup per row.
+    let (groups, tptg) = if tiled {
+        (shape.rows as usize, GEMV_TILED_TPTG)
     } else {
-        let bytes = (shape.cols as usize).saturating_mul(4);
-        let limit = rt.max_threadgroup_memory();
-        if bytes > limit {
-            return Err(format!(
-                "{entry}: caching x needs {bytes} bytes of threadgroup memory but this \
-                 device allows {limit}; cols {} is too large for this kernel",
-                shape.cols
-            ));
-        }
-        let t = reduction_tptg(
-            p.maxTotalThreadsPerThreadgroup(),
-            GEMV_ROW_TPTG,
-            GEMV_ROW_TPTG,
-        )
-        .min(shape.rows as usize)
-        .max(1);
-        ((shape.rows as usize).div_ceil(t), t, Some((0, bytes)))
+        (simd_gemv_threadgroups(shape.rows), SIMD_TPTG)
     };
-    dispatch_tg_1d(rt, &p, groups, tptg, tg_mem, |bnd| {
+    dispatch_tg_1d(rt, &p, groups, tptg, None, |bnd| {
         set_gpu_buf(bnd, bank.packed, 0);
         set_gpu_buf(bnd, bank.scales, 1);
         set_gpu_buf(bnd, bank.zeros, 2);
@@ -1604,27 +3226,29 @@ pub fn embed_lookup_q4(
     group_size: u32,
     n_tokens: u32,
 ) -> Result<(), String> {
-    embed_lookup_q4_with_scalars(
-        rt,
-        bank,
-        token_ids,
-        out,
-        vocab,
-        hidden,
-        group_size,
-        n_tokens,
-        |bnd| {
-            set_u32(bnd, hidden, 5);
-            set_u32(bnd, group_size, 6);
-            set_u32(bnd, vocab, 7);
-            set_u32(bnd, n_tokens, 8);
-        },
-    )
+    unsafe {
+        embed_lookup_q4_with_scalars(
+            rt,
+            bank,
+            token_ids,
+            out,
+            vocab,
+            hidden,
+            group_size,
+            n_tokens,
+            |bnd| {
+                set_u32(bnd, hidden, 5);
+                set_u32(bnd, group_size, 6);
+                set_u32(bnd, vocab, 7);
+                set_u32(bnd, n_tokens, 8);
+            },
+        )
+    }
 }
 
 /// [`embed_lookup_q4`] with caller-supplied scalar binds.
 #[allow(clippy::too_many_arguments)]
-pub fn embed_lookup_q4_with_scalars(
+pub unsafe fn embed_lookup_q4_with_scalars(
     rt: &Arc<GpuRuntime>,
     bank: Q4Bank<'_>,
     token_ids: &GpuBuffer,
@@ -1640,11 +3264,16 @@ pub fn embed_lookup_q4_with_scalars(
         cols: hidden,
         group_size,
     };
-    bank.validate(&shape, "embed_lookup_q4")?;
+    bank.validate(rt, &shape, "embed_lookup_q4")?;
     let total = elems(n_tokens, hidden, "embed_lookup_q4")?;
-    require::<u32>(token_ids, n_tokens as usize, "embed_lookup_q4 token_ids")?;
-    require::<f32>(out, total, "embed_lookup_q4 out")?;
+    require::<u32>(rt, token_ids, n_tokens as usize, "embed_lookup_q4 token_ids")?;
+    require::<f32>(rt, out, total, "embed_lookup_q4 out")?;
 
+    require_disjoint_writes(
+        "embed_lookup_q4",
+        &[("out", out)],
+        &[("packed", bank.packed), ("scales", bank.scales), ("zeros", bank.zeros), ("token_ids", token_ids)],
+    )?;
     let p = rt.pipeline("embed_lookup_q4")?;
     dispatch_1d(rt, &p, total, |bnd| {
         set_gpu_buf(bnd, bank.packed, 0);
@@ -1671,27 +3300,29 @@ pub fn embed_lookup_q4_mlx(
     group_size: u32,
     n_tokens: u32,
 ) -> Result<(), String> {
-    embed_lookup_q4_mlx_with_scalars(
-        rt,
-        bank,
-        token_ids,
-        out,
-        vocab,
-        hidden,
-        group_size,
-        n_tokens,
-        |bnd| {
-            set_u32(bnd, hidden, 5);
-            set_u32(bnd, group_size, 6);
-            set_u32(bnd, vocab, 7);
-            set_u32(bnd, n_tokens, 8);
-        },
-    )
+    unsafe {
+        embed_lookup_q4_mlx_with_scalars(
+            rt,
+            bank,
+            token_ids,
+            out,
+            vocab,
+            hidden,
+            group_size,
+            n_tokens,
+            |bnd| {
+                set_u32(bnd, hidden, 5);
+                set_u32(bnd, group_size, 6);
+                set_u32(bnd, vocab, 7);
+                set_u32(bnd, n_tokens, 8);
+            },
+        )
+    }
 }
 
 /// [`embed_lookup_q4_mlx`] with caller-supplied scalar binds.
 #[allow(clippy::too_many_arguments)]
-pub fn embed_lookup_q4_mlx_with_scalars(
+pub unsafe fn embed_lookup_q4_mlx_with_scalars(
     rt: &Arc<GpuRuntime>,
     bank: Q4MlxBank<'_>,
     token_ids: &GpuBuffer,
@@ -1707,15 +3338,20 @@ pub fn embed_lookup_q4_mlx_with_scalars(
         cols: hidden,
         group_size,
     };
-    bank.validate(&shape, "embed_lookup_q4_mlx")?;
+    bank.validate(rt, &shape, "embed_lookup_q4_mlx")?;
     let total = elems(n_tokens, hidden, "embed_lookup_q4_mlx")?;
-    require::<u32>(
+    require::<u32>(rt, 
         token_ids,
         n_tokens as usize,
         "embed_lookup_q4_mlx token_ids",
     )?;
-    require::<f32>(out, total, "embed_lookup_q4_mlx out")?;
+    require::<f32>(rt, out, total, "embed_lookup_q4_mlx out")?;
 
+    require_disjoint_writes(
+        "embed_lookup_q4_mlx",
+        &[("out", out)],
+        &[("packed", bank.packed), ("scales_biases", bank.scales_biases), ("token_ids", token_ids)],
+    )?;
     let p = rt.pipeline("embed_lookup_q4_mlx")?;
     dispatch_1d(rt, &p, total, |bnd| {
         set_gpu_buf(bnd, bank.packed, 0);
@@ -1796,15 +3432,17 @@ pub fn gemv_q4_mlx(
     shape: QuantShape,
     variant: Q4MlxRowVariant,
 ) -> Result<(), String> {
-    gemv_q4_mlx_with_scalars(rt, bank, x, y, shape, variant, |bnd| {
-        set_u32(bnd, shape.rows, 5);
-        set_u32(bnd, shape.cols, 6);
-        set_u32(bnd, shape.group_size, 7);
-    })
+    unsafe {
+        gemv_q4_mlx_with_scalars(rt, bank, x, y, shape, variant, |bnd| {
+            set_u32(bnd, shape.rows, 5);
+            set_u32(bnd, shape.cols, 6);
+            set_u32(bnd, shape.group_size, 7);
+        })
+    }
 }
 
 /// [`gemv_q4_mlx`] with caller-supplied scalar binds.
-pub fn gemv_q4_mlx_with_scalars(
+pub unsafe fn gemv_q4_mlx_with_scalars(
     rt: &Arc<GpuRuntime>,
     bank: Q4MlxBank<'_>,
     x: &GpuBuffer,
@@ -1814,13 +3452,18 @@ pub fn gemv_q4_mlx_with_scalars(
     scalars: impl FnOnce(&mut Binder<'_>),
 ) -> Result<(), String> {
     let entry = variant.entry();
-    bank.validate(&shape, entry)?;
-    require::<f32>(x, shape.cols as usize, &format!("{entry} x"))?;
-    require::<f32>(y, shape.rows as usize, &format!("{entry} y"))?;
+    bank.validate(rt, &shape, entry)?;
+    require::<f32>(rt, x, shape.cols as usize, &format!("{entry} x"))?;
+    require::<f32>(rt, y, shape.rows as usize, &format!("{entry} y"))?;
     if shape.rows == 0 {
         return Ok(());
     }
 
+    require_disjoint_writes(
+        "gemv_q4_mlx",
+        &[("y", y)],
+        &[("packed", bank.packed), ("scales_biases", bank.scales_biases), ("x", x)],
+    )?;
     let p = rt.pipeline(entry)?;
     // `Tiled` takes a different grid from `Standard` and `Wide`, and until
     // 2026-08-31 all three got the one-thread-per-row geometry below.
@@ -1913,15 +3556,17 @@ pub fn gemv_q4_mlx_blocked(
     y: &GpuBuffer,
     shape: QuantShape,
 ) -> Result<(), String> {
-    gemv_q4_mlx_blocked_with_scalars(rt, bank, x, y, shape, |bnd| {
-        set_u32(bnd, shape.rows, 5);
-        set_u32(bnd, shape.cols, 6);
-        set_u32(bnd, shape.group_size, 7);
-    })
+    unsafe {
+        gemv_q4_mlx_blocked_with_scalars(rt, bank, x, y, shape, |bnd| {
+            set_u32(bnd, shape.rows, 5);
+            set_u32(bnd, shape.cols, 6);
+            set_u32(bnd, shape.group_size, 7);
+        })
+    }
 }
 
 /// [`gemv_q4_mlx_blocked`] with caller-supplied scalar binds.
-pub fn gemv_q4_mlx_blocked_with_scalars(
+pub unsafe fn gemv_q4_mlx_blocked_with_scalars(
     rt: &Arc<GpuRuntime>,
     bank: Q4MlxBank<'_>,
     x: &GpuBuffer,
@@ -1929,13 +3574,18 @@ pub fn gemv_q4_mlx_blocked_with_scalars(
     shape: QuantShape,
     scalars: impl FnOnce(&mut Binder<'_>),
 ) -> Result<(), String> {
-    bank.validate(&shape, "gemv_q4_mlx_blocked")?;
-    require::<f32>(x, shape.cols as usize, "gemv_q4_mlx_blocked x")?;
-    require::<f32>(y, shape.rows as usize, "gemv_q4_mlx_blocked y")?;
+    bank.validate(rt, &shape, "gemv_q4_mlx_blocked")?;
+    require::<f32>(rt, x, shape.cols as usize, "gemv_q4_mlx_blocked x")?;
+    require::<f32>(rt, y, shape.rows as usize, "gemv_q4_mlx_blocked y")?;
     if shape.rows == 0 {
         return Ok(());
     }
 
+    require_disjoint_writes(
+        "gemv_q4_mlx_blocked",
+        &[("y", y)],
+        &[("packed", bank.packed), ("scales_biases", bank.scales_biases), ("x", x)],
+    )?;
     let p = rt.pipeline("gemv_q4_mlx_blocked")?;
     let groups = (shape.rows as usize).div_ceil(GEMV_BN);
     let tg_mem = (shape.cols as usize).min(GEMV_X_TILE) * 4;
@@ -1975,16 +3625,18 @@ pub fn gemv_q4_mlx_simd(
     layout: Q4MlxLayout,
     resid: Option<&GpuBuffer>,
 ) -> Result<(), String> {
-    gemv_q4_mlx_simd_with_scalars(rt, bank, x_bf16, y, shape, layout, resid, |bnd| {
-        set_u32(bnd, shape.rows, 5);
-        set_u32(bnd, shape.cols, 6);
-        set_u32(bnd, shape.group_size, 7);
-    })
+    unsafe {
+        gemv_q4_mlx_simd_with_scalars(rt, bank, x_bf16, y, shape, layout, resid, |bnd| {
+            set_u32(bnd, shape.rows, 5);
+            set_u32(bnd, shape.cols, 6);
+            set_u32(bnd, shape.group_size, 7);
+        })
+    }
 }
 
 /// [`gemv_q4_mlx_simd`] with caller-supplied scalar binds.
 #[allow(clippy::too_many_arguments)]
-pub fn gemv_q4_mlx_simd_with_scalars(
+pub unsafe fn gemv_q4_mlx_simd_with_scalars(
     rt: &Arc<GpuRuntime>,
     bank: Q4MlxBank<'_>,
     x_bf16: &GpuBuffer,
@@ -2000,16 +3652,21 @@ pub fn gemv_q4_mlx_simd_with_scalars(
         (true, Q4MlxLayout::RowMajor) => "gemv_q4_mlx_simd_add",
         (true, Q4MlxLayout::Interleaved4) => "gemv_q4_mlx_simd_add_i4",
     };
-    bank.validate(&shape, entry)?;
-    require::<u16>(x_bf16, shape.cols as usize, &format!("{entry} x_bf16"))?;
-    require::<f32>(y, shape.rows as usize, &format!("{entry} y"))?;
+    bank.validate(rt, &shape, entry)?;
+    require::<u16>(rt, x_bf16, shape.cols as usize, &format!("{entry} x_bf16"))?;
+    require::<f32>(rt, y, shape.rows as usize, &format!("{entry} y"))?;
     if let Some(r) = resid {
-        require::<f32>(r, shape.rows as usize, &format!("{entry} resid"))?;
+        require::<f32>(rt, r, shape.rows as usize, &format!("{entry} resid"))?;
     }
     if shape.rows == 0 {
         return Ok(());
     }
 
+    require_disjoint_writes(
+        "gemv_q4_mlx_simd",
+        &[("y", y)],
+        &[("packed", bank.packed), ("scales_biases", bank.scales_biases), ("x_bf16", x_bf16)],
+    )?;
     let p = rt.pipeline(entry)?;
     let groups = simd_gemv_threadgroups(shape.rows);
     dispatch_tg_1d(rt, &p, groups, SIMD_TPTG, None, |bnd| {
@@ -2055,27 +3712,29 @@ pub fn gemv_q4_mlx_gate_up_gelu(
     dispatch: GateUpDispatch,
     mid_as_bf16: bool,
 ) -> Result<(), String> {
-    gemv_q4_mlx_gate_up_gelu_with_scalars(
-        rt,
-        gate,
-        up,
-        x,
-        mid,
-        shape,
-        dispatch,
-        mid_as_bf16,
-        |bnd| {
-            set_u32(bnd, shape.rows, 8);
-            set_u32(bnd, shape.cols, 9);
-            set_u32(bnd, shape.group_size, 10);
-            set_u32(bnd, u32::from(mid_as_bf16), 11);
-        },
-    )
+    unsafe {
+        gemv_q4_mlx_gate_up_gelu_with_scalars(
+            rt,
+            gate,
+            up,
+            x,
+            mid,
+            shape,
+            dispatch,
+            mid_as_bf16,
+            |bnd| {
+                set_u32(bnd, shape.rows, 8);
+                set_u32(bnd, shape.cols, 9);
+                set_u32(bnd, shape.group_size, 10);
+                set_u32(bnd, u32::from(mid_as_bf16), 11);
+            },
+        )
+    }
 }
 
 /// [`gemv_q4_mlx_gate_up_gelu`] with caller-supplied scalar binds.
 #[allow(clippy::too_many_arguments)]
-pub fn gemv_q4_mlx_gate_up_gelu_with_scalars(
+pub unsafe fn gemv_q4_mlx_gate_up_gelu_with_scalars(
     rt: &Arc<GpuRuntime>,
     gate: Q4MlxBank<'_>,
     up: Q4MlxBank<'_>,
@@ -2093,21 +3752,38 @@ pub fn gemv_q4_mlx_gate_up_gelu_with_scalars(
         },
         GateUpDispatch::Blocked => "gemv_q4_mlx_blocked_gate_up_gelu",
     };
-    gate.validate(&shape, &format!("{entry} gate"))?;
-    up.validate(&shape, &format!("{entry} up"))?;
+    if dispatch == GateUpDispatch::Blocked && shape.cols as usize > GEMV_X_TILE {
+        return Err(format!(
+            "{entry}: cols {} exceeds the blocked kernel x-cache capacity {GEMV_X_TILE}",
+            shape.cols
+        ));
+    }
+    gate.validate(rt, &shape, &format!("{entry} gate"))?;
+    up.validate(rt, &shape, &format!("{entry} up"))?;
     match dispatch {
-        GateUpDispatch::Simd(_) => require::<u16>(x, shape.cols as usize, &format!("{entry} x"))?,
-        GateUpDispatch::Blocked => require::<f32>(x, shape.cols as usize, &format!("{entry} x"))?,
+        GateUpDispatch::Simd(_) => require::<u16>(rt, x, shape.cols as usize, &format!("{entry} x"))?,
+        GateUpDispatch::Blocked => require::<f32>(rt, x, shape.cols as usize, &format!("{entry} x"))?,
     }
     if mid_as_bf16 {
-        require::<u16>(mid, shape.rows as usize, &format!("{entry} mid (bf16)"))?;
+        require::<u16>(rt, mid, shape.rows as usize, &format!("{entry} mid (bf16)"))?;
     } else {
-        require::<f32>(mid, shape.rows as usize, &format!("{entry} mid"))?;
+        require::<f32>(rt, mid, shape.rows as usize, &format!("{entry} mid"))?;
     }
     if shape.rows == 0 {
         return Ok(());
     }
 
+    require_disjoint_writes(
+        "gemv_q4_mlx_gate_up_gelu",
+        &[("mid", mid)],
+        &[
+            ("gate_packed", gate.packed),
+            ("gate_scales_biases", gate.scales_biases),
+            ("up_packed", up.packed),
+            ("up_scales_biases", up.scales_biases),
+            ("x", x),
+        ],
+    )?;
     let p = rt.pipeline(entry)?;
     let (groups, tptg, tg_mem) = match dispatch {
         GateUpDispatch::Simd(_) => (simd_gemv_threadgroups(shape.rows), SIMD_TPTG, None),
@@ -2147,17 +3823,19 @@ pub fn gemv_q4_mlx_kv(
     layout: Q4MlxLayout,
 ) -> Result<(), String> {
     let tg_k = simd_gemv_threadgroups(shape.rows) as u32;
-    gemv_q4_mlx_kv_with_scalars(rt, k, v, x_bf16, k_out, v_out, shape, layout, |bnd| {
-        set_u32(bnd, shape.rows, 9);
-        set_u32(bnd, shape.cols, 10);
-        set_u32(bnd, shape.group_size, 11);
-        set_u32(bnd, tg_k, 12);
-    })
+    unsafe {
+        gemv_q4_mlx_kv_with_scalars(rt, k, v, x_bf16, k_out, v_out, shape, layout, |bnd| {
+            set_u32(bnd, shape.rows, 9);
+            set_u32(bnd, shape.cols, 10);
+            set_u32(bnd, shape.group_size, 11);
+            set_u32(bnd, tg_k, 12);
+        })
+    }
 }
 
 /// [`gemv_q4_mlx_kv`] with caller-supplied scalar binds.
 #[allow(clippy::too_many_arguments)]
-pub fn gemv_q4_mlx_kv_with_scalars(
+pub unsafe fn gemv_q4_mlx_kv_with_scalars(
     rt: &Arc<GpuRuntime>,
     k: Q4MlxBank<'_>,
     v: Q4MlxBank<'_>,
@@ -2172,15 +3850,26 @@ pub fn gemv_q4_mlx_kv_with_scalars(
         Q4MlxLayout::RowMajor => "gemv_q4_mlx_simd_kv",
         Q4MlxLayout::Interleaved4 => "gemv_q4_mlx_simd_kv_i4",
     };
-    k.validate(&shape, &format!("{entry} k"))?;
-    v.validate(&shape, &format!("{entry} v"))?;
-    require::<u16>(x_bf16, shape.cols as usize, &format!("{entry} x_bf16"))?;
-    require::<f32>(k_out, shape.rows as usize, &format!("{entry} k_out"))?;
-    require::<f32>(v_out, shape.rows as usize, &format!("{entry} v_out"))?;
+    k.validate(rt, &shape, &format!("{entry} k"))?;
+    v.validate(rt, &shape, &format!("{entry} v"))?;
+    require::<u16>(rt, x_bf16, shape.cols as usize, &format!("{entry} x_bf16"))?;
+    require::<f32>(rt, k_out, shape.rows as usize, &format!("{entry} k_out"))?;
+    require::<f32>(rt, v_out, shape.rows as usize, &format!("{entry} v_out"))?;
     if shape.rows == 0 {
         return Ok(());
     }
 
+    require_disjoint_writes(
+        "gemv_q4_mlx_kv",
+        &[("k_out", k_out), ("v_out", v_out)],
+        &[
+            ("k_packed", k.packed),
+            ("k_scales_biases", k.scales_biases),
+            ("v_packed", v.packed),
+            ("v_scales_biases", v.scales_biases),
+            ("x_bf16", x_bf16),
+        ],
+    )?;
     let p = rt.pipeline(entry)?;
     let per_matrix = simd_gemv_threadgroups(shape.rows);
     dispatch_tg_1d(rt, &p, per_matrix * 2, SIMD_TPTG, None, |bnd| {
@@ -2221,27 +3910,29 @@ pub fn gemv_q4_mlx_qkv(
 ) -> Result<(), String> {
     let tg_q = simd_gemv_threadgroups(rows_q) as u32;
     let tg_k = simd_gemv_threadgroups(rows_kv) as u32;
-    gemv_q4_mlx_qkv_with_scalars(
-        rt,
-        q,
-        k,
-        v,
-        x_bf16,
-        out,
-        rows_q,
-        rows_kv,
-        cols,
-        group_size,
-        layout,
-        |bnd| {
-            set_u32(bnd, rows_q, 10);
-            set_u32(bnd, rows_kv, 11);
-            set_u32(bnd, cols, 12);
-            set_u32(bnd, group_size, 13);
-            set_u32(bnd, tg_q, 14);
-            set_u32(bnd, tg_k, 15);
-        },
-    )
+    unsafe {
+        gemv_q4_mlx_qkv_with_scalars(
+            rt,
+            q,
+            k,
+            v,
+            x_bf16,
+            out,
+            rows_q,
+            rows_kv,
+            cols,
+            group_size,
+            layout,
+            |bnd| {
+                set_u32(bnd, rows_q, 10);
+                set_u32(bnd, rows_kv, 11);
+                set_u32(bnd, cols, 12);
+                set_u32(bnd, group_size, 13);
+                set_u32(bnd, tg_q, 14);
+                set_u32(bnd, tg_k, 15);
+            },
+        )
+    }
 }
 
 /// The three destination buffers of [`gemv_q4_mlx_qkv`].
@@ -2257,7 +3948,7 @@ pub struct QkvOutputs<'a> {
 
 /// [`gemv_q4_mlx_qkv`] with caller-supplied scalar binds.
 #[allow(clippy::too_many_arguments)]
-pub fn gemv_q4_mlx_qkv_with_scalars(
+pub unsafe fn gemv_q4_mlx_qkv_with_scalars(
     rt: &Arc<GpuRuntime>,
     q: Q4MlxBank<'_>,
     k: Q4MlxBank<'_>,
@@ -2285,15 +3976,55 @@ pub fn gemv_q4_mlx_qkv_with_scalars(
         cols,
         group_size,
     };
-    q.validate(&q_shape, &format!("{entry} q"))?;
-    k.validate(&kv_shape, &format!("{entry} k"))?;
-    v.validate(&kv_shape, &format!("{entry} v"))?;
-    require::<u16>(x_bf16, cols as usize, &format!("{entry} x_bf16"))?;
-    require::<f32>(out.q_out, rows_q as usize, &format!("{entry} q_out"))?;
-    require::<f32>(out.k_out, rows_kv as usize, &format!("{entry} k_out"))?;
-    require::<f32>(out.v_out, rows_kv as usize, &format!("{entry} v_out"))?;
+    q.validate(rt, &q_shape, &format!("{entry} q"))?;
+    k.validate(rt, &kv_shape, &format!("{entry} k"))?;
+    v.validate(rt, &kv_shape, &format!("{entry} v"))?;
+    require::<u16>(rt, x_bf16, cols as usize, &format!("{entry} x_bf16"))?;
+    require::<f32>(rt, out.q_out, rows_q as usize, &format!("{entry} q_out"))?;
+    require::<f32>(rt, out.k_out, rows_kv as usize, &format!("{entry} k_out"))?;
+    require::<f32>(rt, out.v_out, rows_kv as usize, &format!("{entry} v_out"))?;
     if rows_q == 0 && rows_kv == 0 {
         return Ok(());
+    }
+    match (rows_q == 0, rows_kv == 0) {
+        (true, false) => require_disjoint_writes(
+            entry,
+            &[("k_out", out.k_out), ("v_out", out.v_out)],
+            &[
+                ("k_packed", k.packed),
+                ("k_scales_biases", k.scales_biases),
+                ("v_packed", v.packed),
+                ("v_scales_biases", v.scales_biases),
+                ("x_bf16", x_bf16),
+            ],
+        )?,
+        (false, true) => require_disjoint_writes(
+            entry,
+            &[("q_out", out.q_out)],
+            &[
+                ("q_packed", q.packed),
+                ("q_scales_biases", q.scales_biases),
+                ("x_bf16", x_bf16),
+            ],
+        )?,
+        (false, false) => require_disjoint_writes(
+            entry,
+            &[
+                ("q_out", out.q_out),
+                ("k_out", out.k_out),
+                ("v_out", out.v_out),
+            ],
+            &[
+                ("q_packed", q.packed),
+                ("q_scales_biases", q.scales_biases),
+                ("k_packed", k.packed),
+                ("k_scales_biases", k.scales_biases),
+                ("v_packed", v.packed),
+                ("v_scales_biases", v.scales_biases),
+                ("x_bf16", x_bf16),
+            ],
+        )?,
+        (true, true) => unreachable!("zero-output case returned above"),
     }
 
     let p = rt.pipeline(entry)?;
@@ -2343,17 +4074,19 @@ pub fn gemm_q4_mlx(
     layout: Q4MlxLayout,
     resid: Option<&GpuBuffer>,
 ) -> Result<(), String> {
-    gemm_q4_mlx_with_scalars(rt, bank, x_bf16, y, shape, m, layout, resid, |bnd| {
-        set_u32(bnd, shape.rows, 5);
-        set_u32(bnd, shape.cols, 6);
-        set_u32(bnd, shape.group_size, 7);
-        set_u32(bnd, m, 8);
-    })
+    unsafe {
+        gemm_q4_mlx_with_scalars(rt, bank, x_bf16, y, shape, m, layout, resid, |bnd| {
+            set_u32(bnd, shape.rows, 5);
+            set_u32(bnd, shape.cols, 6);
+            set_u32(bnd, shape.group_size, 7);
+            set_u32(bnd, m, 8);
+        })
+    }
 }
 
 /// [`gemm_q4_mlx`] with caller-supplied scalar binds.
 #[allow(clippy::too_many_arguments)]
-pub fn gemm_q4_mlx_with_scalars(
+pub unsafe fn gemm_q4_mlx_with_scalars(
     rt: &Arc<GpuRuntime>,
     bank: Q4MlxBank<'_>,
     x_bf16: &GpuBuffer,
@@ -2380,21 +4113,26 @@ pub fn gemm_q4_mlx_with_scalars(
              left unwritten rather than computed"
         ));
     }
-    bank.validate(&shape, entry)?;
+    bank.validate(rt, &shape, entry)?;
     let out_elems = elems(m, shape.rows, entry)?;
-    require::<u16>(
+    require::<u16>(rt, 
         x_bf16,
         elems(m, shape.cols, entry)?,
         &format!("{entry} x_bf16"),
     )?;
-    require::<f32>(y, out_elems, &format!("{entry} y"))?;
+    require::<f32>(rt, y, out_elems, &format!("{entry} y"))?;
     if let Some(r) = resid {
-        require::<f32>(r, out_elems, &format!("{entry} resid"))?;
+        require::<f32>(rt, r, out_elems, &format!("{entry} resid"))?;
     }
     if shape.rows == 0 {
         return Ok(());
     }
 
+    require_disjoint_writes(
+        "gemm_q4_mlx",
+        &[("y", y)],
+        &[("packed", bank.packed), ("scales_biases", bank.scales_biases), ("x_bf16", x_bf16)],
+    )?;
     let p = rt.pipeline(entry)?;
     let groups = simd_gemv_threadgroups(shape.rows);
     dispatch_tg_1d(rt, &p, groups, SIMD_TPTG, None, |bnd| {
@@ -2483,15 +4221,12 @@ fn row_reduce(
     if cols == 0 {
         return Err(format!("{entry}: cols must be non-zero"));
     }
-    require::<f32>(x, elems(rows, cols, entry)?, &format!("{entry} x"))?;
-    require::<f32>(
+    require::<f32>(rt, x, elems(rows, cols, entry)?, &format!("{entry} x"))?;
+    require::<f32>(rt, 
         out,
         elems(rows, out_per_row, entry)?,
         &format!("{entry} out"),
     )?;
-    if rows == 0 {
-        return Ok(());
-    }
     let p = rt.pipeline(entry)?;
     let tptg = reduce_tptg(p.maxTotalThreadsPerThreadgroup(), cols as usize);
     dispatch_tg_1d(rt, &p, rows as usize, tptg, None, |bnd| {
@@ -2555,13 +4290,25 @@ pub fn gemm_i8_dequant(
              silently rather than saturating"
         ));
     }
-    require::<i8>(a, elems(m, k, "gemm_i8_dequant")?, "gemm_i8_dequant a")?;
-    require::<i8>(b, elems(k, n, "gemm_i8_dequant")?, "gemm_i8_dequant b")?;
-    require::<f32>(c, elems(m, n, "gemm_i8_dequant")?, "gemm_i8_dequant c")?;
+    require::<i8>(rt, a, elems(m, k, "gemm_i8_dequant")?, "gemm_i8_dequant a")?;
+    require::<i8>(rt, b, elems(k, n, "gemm_i8_dequant")?, "gemm_i8_dequant b")?;
+    require::<f32>(rt, c, elems(m, n, "gemm_i8_dequant")?, "gemm_i8_dequant c")?;
     if let Some(sc) = b_scale {
-        require::<f32>(sc, n as usize, "gemm_i8_dequant b_scale")?;
+        require::<f32>(rt, sc, n as usize, "gemm_i8_dequant b_scale")?;
     }
 
+    match b_scale {
+        Some(sc) => require_disjoint_writes(
+            "gemm_i8_dequant",
+            &[("c", c)],
+            &[("a", a), ("b", b), ("b_scale", sc)],
+        )?,
+        None => require_disjoint_writes(
+            "gemm_i8_dequant",
+            &[("c", c)],
+            &[("a", a), ("b", b)],
+        )?,
+    }
     let p = rt.pipeline("matmul2d_tensorops_i8_f32")?;
     // Geometry must match the I8_DEQUANT_KERNEL instantiation.
     const SM: usize = 128;

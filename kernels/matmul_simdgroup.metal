@@ -36,16 +36,16 @@ kernel void matmul_simdgroup_f32(
 
     simdgroup_float8x8 acc = make_filled_simdgroup_matrix<float, TM, TN>(0.0f);
 
-    for (uint k0 = 0; k0 < K; k0 += TK) {
+    for (ulong k0 = 0ul; k0 < (ulong)K; k0 += TK) {
         simdgroup_float8x8 a_tile;
         simdgroup_float8x8 b_tile;
         // Assumes K % 8 == 0 and tiles fully in-bounds (Phase 0 contract).
-        simdgroup_load(a_tile, A + row0 * K + k0, K, ulong2(0, 0), false);
+        simdgroup_load(a_tile, A + (ulong)row0 * K + k0, K, ulong2(0, 0), false);
         simdgroup_load(b_tile, B + k0 * N + col0, N, ulong2(0, 0), false);
         simdgroup_multiply_accumulate(acc, a_tile, b_tile, acc);
     }
 
-    simdgroup_store(acc, C + row0 * N + col0, N, ulong2(0, 0), false);
+    simdgroup_store(acc, C + (ulong)row0 * N + col0, N, ulong2(0, 0), false);
     (void)lane;
 }
 
@@ -70,11 +70,13 @@ kernel void matmul_simdgroup_edges_f32(
     threadgroup float tile_b[4][64];
     threadgroup float tile_c[4][64];
     simdgroup_float8x8 acc = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
-    for (uint k0 = 0; k0 < K; k0 += 8) {
+    for (ulong k0 = 0ul; k0 < (ulong)K; k0 += 8ul) {
         for (uint i = lane; i < 64; i += 32) {
             const uint r = i / 8, c = i % 8;
-            tile_a[sid][i] = (row0+r < M && k0+c < K) ? A[(row0+r)*K+k0+c] : 0.0f;
-            tile_b[sid][i] = (k0+r < K && col0+c < N) ? B[(k0+r)*N+col0+c] : 0.0f;
+            tile_a[sid][i] = (row0+r < M && k0+c < (ulong)K)
+                ? A[(ulong)(row0+r)*K+k0+c] : 0.0f;
+            tile_b[sid][i] = (k0+r < (ulong)K && col0+c < N)
+                ? B[(k0+r)*N+col0+c] : 0.0f;
         }
         simdgroup_barrier(mem_flags::mem_threadgroup);
         simdgroup_float8x8 a, b;
@@ -87,6 +89,6 @@ kernel void matmul_simdgroup_edges_f32(
     simdgroup_barrier(mem_flags::mem_threadgroup);
     for (uint i = lane; i < 64; i += 32) {
         const uint r = row0 + i / 8, c = col0 + i % 8;
-        if (r < M && c < N) C[r*N+c] = tile_c[sid][i];
+        if (r < M && c < N) C[(ulong)r*N+c] = tile_c[sid][i];
     }
 }

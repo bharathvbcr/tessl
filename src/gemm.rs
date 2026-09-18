@@ -44,6 +44,7 @@ fn validate_gemm(
         if t.numel() > i32::MAX as usize {
             return Err("GEMM exceeds signed 32-bit kernel indexing".into());
         }
+        require_byte_offset_alignment(t, 16, "GEMM")?;
     }
     if !std::sync::Arc::ptr_eq(a.runtime(), b.runtime())
         || !std::sync::Arc::ptr_eq(a.runtime(), c.runtime())
@@ -65,6 +66,19 @@ fn validate_gemm(
         return Err("GEMM output must not overlap either input".into());
     }
     Ok((m, n, k))
+}
+
+/// TensorOps / simdgroup buffer offsets must be dtype-aligned already via
+/// [`Tensor::validate`]; GEMM additionally requires 16-byte alignment so float4
+/// / half8 device loads cannot fault on an otherwise in-bounds view.
+fn require_byte_offset_alignment(t: &Tensor, align: usize, what: &str) -> Result<(), String> {
+    if align == 0 || t.byte_offset % align != 0 {
+        return Err(format!(
+            "{what}: byte_offset {} is not {align}-byte aligned",
+            t.byte_offset
+        ));
+    }
+    Ok(())
 }
 
 /// Tall-K / small-MN → split-K accumulate.
@@ -326,9 +340,9 @@ pub fn gemm(a: &Tensor, b: &Tensor, c: &Tensor, backend: GemmBackend) -> Result<
             let (tg_w, tg_h, tpt) = threadgroup_geometry_simdgroup(&pipeline, m, n);
             rt.with_binder(|bnd| {
                 bnd.set_pipeline(&pipeline);
-                bnd.bind_buf(a.buffer.metal(), a.byte_offset, 0);
-                bnd.bind_buf(b.buffer.metal(), b.byte_offset, 1);
-                bnd.bind_buf(c.buffer.metal(), c.byte_offset, 2);
+                bnd.bind_tensor(a, 0);
+                bnd.bind_tensor(b, 1);
+                bnd.bind_tensor(c, 2);
                 bnd.bind_u32(m_u, 3);
                 bnd.bind_u32(n_u, 4);
                 bnd.bind_u32(k_u, 5);
@@ -361,18 +375,18 @@ impl BatchStrides {
     /// Contiguous batches of all three operands.
     pub fn contiguous(m: usize, n: usize, k: usize) -> Self {
         Self {
-            a: m * k,
-            b: k * n,
-            c: m * n,
+            a: m.saturating_mul(k),
+            b: k.saturating_mul(n),
+            c: m.saturating_mul(n),
         }
     }
 
     /// Contiguous A and C against one shared B.
     pub fn shared_b(m: usize, n: usize, k: usize) -> Self {
         Self {
-            a: m * k,
+            a: m.saturating_mul(k),
             b: 0,
-            c: m * n,
+            c: m.saturating_mul(n),
         }
     }
 }
@@ -433,16 +447,39 @@ pub fn gemm_batched(
     if m == 0 || n == 0 || k == 0 {
         return Err("batched GEMM requires nonzero m, n and k".into());
     }
+    for (name, value) in [("m", m), ("n", n), ("k", k), ("batch", batch)] {
+        if value > i32::MAX as usize {
+            return Err(format!(
+                "batched GEMM {name} exceeds signed 32-bit kernel indexing"
+            ));
+        }
+    }
+    let matrix_a = m
+        .checked_mul(k)
+        .ok_or_else(|| "batched GEMM: A matrix extent overflows usize".to_string())?;
+    let matrix_b = k
+        .checked_mul(n)
+        .ok_or_else(|| "batched GEMM: B matrix extent overflows usize".to_string())?;
+    let matrix_c = m
+        .checked_mul(n)
+        .ok_or_else(|| "batched GEMM: C matrix extent overflows usize".to_string())?;
     for t in [a, b, c] {
         t.validate()?;
         if t.numel() > i32::MAX as usize {
             return Err("batched GEMM exceeds signed 32-bit kernel indexing".into());
         }
+        require_byte_offset_alignment(t, 16, "batched GEMM")?;
+        // Batched GEMM is cooperative-destination only; require the stricter
+        // 64-byte offset that those kernels / MTLTensor views expect.
+        require_byte_offset_alignment(t, 64, "batched GEMM cooperative path")?;
     }
     if !std::sync::Arc::ptr_eq(a.runtime(), b.runtime())
         || !std::sync::Arc::ptr_eq(a.runtime(), c.runtime())
     {
         return Err("batched GEMM tensors must belong to the same runtime".into());
+    }
+    if a.overlaps(c) || b.overlaps(c) {
+        return Err("batched GEMM output must not overlap either input".into());
     }
     if c.dtype != DType::F32 {
         return Err("batched GEMM writes f32 output".into());
@@ -461,13 +498,20 @@ pub fn gemm_batched(
         );
     }
 
+    if batch > 1 && strides.c < matrix_c {
+        return Err(format!(
+            "batched GEMM output batches overlap: C stride {} is smaller than one matrix ({matrix_c} elements)",
+            strides.c
+        ));
+    }
+
     // The last batch element must fit. Without this the kernel walks off the
     // end of whichever operand was sized for a smaller batch and reads whatever
     // happens to be resident.
     for (t, first, stride, what) in [
-        (a, m * k, strides.a, "A"),
-        (b, k * n, strides.b, "B"),
-        (c, m * n, strides.c, "C"),
+        (a, matrix_a, strides.a, "A"),
+        (b, matrix_b, strides.b, "B"),
+        (c, matrix_c, strides.c, "C"),
     ] {
         let need = stride
             .checked_mul(batch - 1)
@@ -509,9 +553,9 @@ pub fn gemm_batched(
     let tpt = threads_per_tg(&pipeline, tile);
     rt.with_binder(|bnd| {
         bnd.set_pipeline(&pipeline);
-        bnd.bind_buf(a.buffer.metal(), a.byte_offset, 0);
-        bnd.bind_buf(b.buffer.metal(), b.byte_offset, 1);
-        bnd.bind_buf(c.buffer.metal(), c.byte_offset, 2);
+        bnd.bind_tensor(a, 0);
+        bnd.bind_tensor(b, 1);
+        bnd.bind_tensor(c, 2);
         bnd.bind_u32(m as u32, 3);
         bnd.bind_u32(n as u32, 4);
         bnd.bind_u32(k as u32, 5);
@@ -632,6 +676,9 @@ pub fn gemm_epilogue(
         return gemm(a, b, c, backend);
     }
     let (m, n, k) = validate_gemm(a, b, c, Layout::NN, true)?;
+    for t in [a, b, c] {
+        require_byte_offset_alignment(t, 64, "GEMM epilogue cooperative path")?;
+    }
     if !epi.alpha.is_finite() || !epi.beta.is_finite() {
         return Err(format!(
             "GEMM epilogue: alpha and beta must be finite, got alpha={} beta={}",
@@ -693,15 +740,15 @@ pub fn gemm_epilogue(
     let bias_buf = epi.bias.unwrap_or(c);
     rt.with_binder(|bnd| {
         bnd.set_pipeline(&pipeline);
-        bnd.bind_buf(a.buffer.metal(), a.byte_offset, 0);
-        bnd.bind_buf(b.buffer.metal(), b.byte_offset, 1);
-        bnd.bind_buf(c.buffer.metal(), c.byte_offset, 2);
+        bnd.bind_tensor(a, 0);
+        bnd.bind_tensor(b, 1);
+        bnd.bind_tensor(c, 2);
         bnd.bind_u32(m as u32, 3);
         bnd.bind_u32(n as u32, 4);
         bnd.bind_u32(k as u32, 5);
         bnd.bind_u32(tiles_n as u32, 6);
         bnd.bind_u32(tiles_m as u32, 7);
-        bnd.bind_buf(bias_buf.buffer.metal(), bias_buf.byte_offset, 8);
+        bnd.bind_tensor(bias_buf, 8);
         bnd.bind_f32(alpha, 9);
         bnd.bind_f32(beta, 10);
         bnd.bind_u32(act, 11);
@@ -777,15 +824,18 @@ fn dispatch_tensorops_nn_coop(
     k: usize,
     tile: TileGeom,
 ) -> Result<(), String> {
+    for t in [a, b, c] {
+        require_byte_offset_alignment(t, 64, "GEMM cooperative path")?;
+    }
     let tiles_n = n.div_ceil(tile.sn);
     let tiles_m = m.div_ceil(tile.sm);
     let tg = morton_tg_count(tiles_n, tiles_m);
     let tpt = threads_per_tg(pipeline, tile);
     rt.with_binder(|bnd| {
         bnd.set_pipeline(pipeline);
-        bnd.bind_buf(a.buffer.metal(), a.byte_offset, 0);
-        bnd.bind_buf(b.buffer.metal(), b.byte_offset, 1);
-        bnd.bind_buf(c.buffer.metal(), c.byte_offset, 2);
+        bnd.bind_tensor(a, 0);
+        bnd.bind_tensor(b, 1);
+        bnd.bind_tensor(c, 2);
         bnd.bind_u32(m as u32, 3);
         bnd.bind_u32(n as u32, 4);
         bnd.bind_u32(k as u32, 5);
@@ -831,9 +881,9 @@ fn dispatch_tensorops_nn(
         }
 
         bnd.set_pipeline(pipeline);
-        bnd.bind_buf(a.buffer.metal(), a.byte_offset, 0);
-        bnd.bind_buf(b.buffer.metal(), b.byte_offset, 1);
-        bnd.bind_buf(c.buffer.metal(), c.byte_offset, 2);
+        bnd.bind_tensor(a, 0);
+        bnd.bind_tensor(b, 1);
+        bnd.bind_tensor(c, 2);
         bnd.bind_u32(m as u32, 3);
         bnd.bind_u32(n as u32, 4);
         bnd.bind_u32(k as u32, 5);
@@ -881,6 +931,9 @@ fn dispatch_tensorops_accum(
     tile: TileGeom,
     bind_interior: bool,
 ) -> Result<(), String> {
+    for t in [a, b, c] {
+        require_byte_offset_alignment(t, 64, "GEMM cooperative path")?;
+    }
     let tiles_n = n.div_ceil(tile.sn);
     let tiles_m = m.div_ceil(tile.sm);
     let tg = morton_tg_count(tiles_n, tiles_m);
@@ -888,9 +941,9 @@ fn dispatch_tensorops_accum(
 
     rt.with_binder(|bnd| {
         bnd.set_pipeline(pipeline);
-        bnd.bind_buf(a.buffer.metal(), a.byte_offset, 0);
-        bnd.bind_buf(b.buffer.metal(), b.byte_offset, 1);
-        bnd.bind_buf(c.buffer.metal(), c.byte_offset, 2);
+        bnd.bind_tensor(a, 0);
+        bnd.bind_tensor(b, 1);
+        bnd.bind_tensor(c, 2);
         bnd.bind_u32(m as u32, 3);
         bnd.bind_u32(n as u32, 4);
         bnd.bind_u32(k as u32, 5);
@@ -1055,9 +1108,9 @@ fn gemm_tn_splitk_f32_opts(
             if pi > 0 && need_explicit {
                 bnd.barrier();
             }
-            bnd.bind_buf(a_km.buffer.metal(), a_km.byte_offset, 0);
-            bnd.bind_buf(b_kn.buffer.metal(), b_kn.byte_offset, 1);
-            bnd.bind_buf(c.buffer.metal(), c.byte_offset, 2);
+            bnd.bind_tensor(a_km, 0);
+            bnd.bind_tensor(b_kn, 1);
+            bnd.bind_tensor(c, 2);
             bnd.bind_u32(m as u32, 3);
             bnd.bind_u32(n as u32, 4);
             bnd.bind_u32(k as u32, 5);
@@ -1117,9 +1170,9 @@ fn gemm_tn_splitk_bf16_opts(
             if pi > 0 && need_explicit {
                 bnd.barrier();
             }
-            bnd.bind_buf(a_km.buffer.metal(), a_km.byte_offset, 0);
-            bnd.bind_buf(b_kn.buffer.metal(), b_kn.byte_offset, 1);
-            bnd.bind_buf(c.buffer.metal(), c.byte_offset, 2);
+            bnd.bind_tensor(a_km, 0);
+            bnd.bind_tensor(b_kn, 1);
+            bnd.bind_tensor(c, 2);
             bnd.bind_u32(m as u32, 3);
             bnd.bind_u32(n as u32, 4);
             bnd.bind_u32(k as u32, 5);
@@ -1877,6 +1930,24 @@ mod contract_tests {
     }
 
     #[test]
+    fn in_bounds_four_byte_offset_is_refused_as_misaligned() {
+        let rt = GpuRuntime::new().unwrap();
+        let a = rt.alloc_tensor_f32(&[16, 16]).unwrap();
+        let b = rt.alloc_tensor_f32(&[16, 16]).unwrap();
+        // One f32 of headroom so elem_offset=1 stays inside the bank — this is
+        // an alignment probe, not the OOB case already covered above.
+        let bank = rt.alloc_tensor_f32(&[16 * 16 + 1]).unwrap();
+        let c = bank.view(&[16, 16], 1);
+        assert_eq!(c.byte_offset, 4);
+        let err = gemm(&a, &b, &c, GemmBackend::Simdgroup).expect_err("offset 4 must fail");
+        assert!(
+            err.contains("16-byte aligned"),
+            "expected 16-byte alignment refusal, got: {err}"
+        );
+        assert_eq!(rt.take_dispatch_count(), 0);
+    }
+
+    #[test]
     fn disjoint_bank_views_work_and_overlap_is_rejected() {
         let rt = GpuRuntime::new().unwrap();
         let bank = rt.alloc_tensor_f32(&[3 * 256]).unwrap();
@@ -1918,11 +1989,13 @@ mod contract_tests {
                             (0..n * k).map(|i| (i % 7) as f32 / 16.0 - 0.125).collect();
                         let a = rt.alloc_tensor_f32(&ashape).unwrap();
                         let b = rt.alloc_tensor_f32(&bshape).unwrap();
-                        let bank = rt.alloc_tensor_f32(&[m * n + 8]).unwrap();
+                        let bank = rt.alloc_tensor_f32(&[m * n + 32]).unwrap();
                         a.buffer.write_f32(&av);
                         b.buffer.write_f32(&bv);
-                        bank.buffer.write_f32(&vec![2.0; m * n + 8]);
-                        let c = bank.view(&[m, n], 4);
+                        bank.buffer.write_f32(&vec![2.0; m * n + 32]);
+                        // 16 elems = 64 bytes: valid for both simdgroup (16B)
+                        // and cooperative TensorOps (64B) paths.
+                        let c = bank.view(&[m, n], 16);
                         let launch: Launch = match (tn, accum) {
                             (true, false) => gemm_tn_train,
                             (false, false) => gemm_nt_train,
@@ -1932,8 +2005,8 @@ mod contract_tests {
                         launch(&a, &b, &c, backend).unwrap();
                         rt.synchronize().unwrap();
                         let got = bank.buffer.read_f32();
-                        assert_eq!(&got[..4], &[2.0; 4]);
-                        assert_eq!(&got[m * n + 4..], &[2.0; 4]);
+                        assert_eq!(&got[..16], &[2.0; 16]);
+                        assert_eq!(&got[m * n + 16..], &[2.0; 16]);
                         for row in 0..m {
                             for col in 0..n {
                                 let mut expected = if accum { 2.0 } else { 0.0 };
@@ -1941,7 +2014,7 @@ mod contract_tests {
                                     expected += av[if tn { p * m + row } else { row * k + p }]
                                         * bv[if tn { p * n + col } else { col * k + p }];
                                 }
-                                let x = got[4 + row * n + col];
+                                let x = got[16 + row * n + col];
                                 assert!(x.is_finite() && (x-expected).abs()<1e-4,
                                 "{m}x{n}x{k} {backend:?} {precision:?} TN={tn} accum={accum}: {x} vs {expected}");
                             }
@@ -2030,6 +2103,8 @@ mod contract_tests {
             poisoned[..4].fill(123.0);
             poisoned[m * n + 4..].fill(123.0);
             bank.buffer.write_f32(&poisoned);
+            // 4 elems = 16 bytes: simdgroup-legal, deliberately not 64-byte
+            // (cooperative TensorOps would refuse this offset).
             let c = bank.view(&[m, n], 4);
             gemm(&a, &b, &c, GemmBackend::Simdgroup).unwrap();
             rt.synchronize().unwrap();
@@ -2145,7 +2220,10 @@ mod stress_tests {
         bf16: bool,
     ) -> Tensor {
         let numel: usize = shape.iter().product();
-        let off = if rng.below(3) == 0 { 8 } else { 0 };
+        // Offset in elements so the resulting byte_offset is 64-byte aligned
+        // for both f32 (16 elems) and bf16/f16 (32 elems) coop paths.
+        let align_elems = 64 / if bf16 { 2 } else { 4 };
+        let off = if rng.below(3) == 0 { align_elems } else { 0 };
         if bf16 {
             let bank = rt.alloc_tensor_bf16(&[numel + off]).unwrap();
             let mut bits = vec![0u16; numel + off];
@@ -2234,17 +2312,17 @@ mod stress_tests {
         let a = upload(rt, rng, &a_shape, &a_data, raw_bf16);
         let b = upload(rt, rng, &b_shape, &b_data, raw_bf16);
 
-        let bank = rt.alloc_tensor_f32(&[m * n + 8]).unwrap();
-        let mut poisoned = vec![f32::NAN; m * n + 8];
-        poisoned[..4].fill(777.0);
-        poisoned[m * n + 4..].fill(777.0);
+        let bank = rt.alloc_tensor_f32(&[m * n + 32]).unwrap();
+        let mut poisoned = vec![f32::NAN; m * n + 32];
+        poisoned[..16].fill(777.0);
+        poisoned[m * n + 16..].fill(777.0);
         if accum {
-            for v in poisoned[4..m * n + 4].iter_mut() {
+            for v in poisoned[16..m * n + 16].iter_mut() {
                 *v = prefill;
             }
         }
         bank.buffer.write_f32(&poisoned);
-        let c = bank.view(&[m, n], 4);
+        let c = bank.view(&[m, n], 16);
 
         match family {
             Family::Nn => gemm_train(&a, &b, &c, GemmBackend::TensorOps).unwrap(),
@@ -2259,7 +2337,7 @@ mod stress_tests {
 
         let got = bank.buffer.read_f32();
         assert!(
-            got[..4] == [777.0; 4] && got[m * n + 4..] == [777.0; 4],
+            got[..16] == [777.0; 16] && got[m * n + 16..] == [777.0; 16],
             "guard zone clobbered: {family:?} {m}x{n}x{k} seed={seed_note}"
         );
         let expected = gemm_f32_cpu(&a_ref, &b_ref, m, n, k);
@@ -2271,7 +2349,7 @@ mod stress_tests {
             1e-4 + 1e-7 * k as f32
         };
         let mut max_err = 0.0f32;
-        for (i, (&x, &e)) in got[4..m * n + 4].iter().zip(expected.iter()).enumerate() {
+        for (i, (&x, &e)) in got[16..m * n + 16].iter().zip(expected.iter()).enumerate() {
             let want = e + prefill;
             let err = (x - want).abs();
             assert!(

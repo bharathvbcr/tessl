@@ -173,9 +173,9 @@ fn run_variant(
             bnd.barrier();
         }
         bnd.set_pipeline(&p);
-        bnd.bind_buf(a.buffer.metal(), a.byte_offset, 0);
-        bnd.bind_buf(b.buffer.metal(), b.byte_offset, 1);
-        bnd.bind_buf(c.buffer.metal(), c.byte_offset, 2);
+        bnd.bind_tensor(a, 0);
+        bnd.bind_tensor(b, 1);
+        bnd.bind_tensor(c, 2);
         bnd.bind_u32(m as u32, 3);
         bnd.bind_u32(n as u32, 4);
         bnd.bind_u32(k as u32, 5);

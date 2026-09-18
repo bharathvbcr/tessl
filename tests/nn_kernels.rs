@@ -598,7 +598,7 @@ fn kv_store_timestep_writes_at_the_device_side_offset() {
         let off = rt.alloc_buffer(4).unwrap();
         off.write_u32(&[(2 * n) as u32]);
 
-        nn::kv_store_timestep(rt, &sb, &dst, &off, n as u32).unwrap();
+        nn::kv_store_timestep(rt, &sb, &dst, &off, n as u32, (4 * n) as u32).unwrap();
         rt.synchronize().unwrap();
 
         let got = dst.read_f32();

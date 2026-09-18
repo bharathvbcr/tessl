@@ -11,10 +11,9 @@
 //! breaks cryptex Metal Toolchain resolution on Xcode 26+. Use `xcrun metal`
 //! plus an explicit `-isysroot`.
 //!
-//! `TESSL_SKIP_AOT` hazard: when set, this script skips compilation and
-//! points `TESSL_METALLIB` at the crate-root `default.metallib`. That
-//! file may be stale or missing — only use for intentional offline/CI skips
-//! after a known-good metallib is already present at the crate root.
+//! `TESSL_SKIP_AOT` is an explicit offline escape hatch. It requires
+//! `TESSL_PREBUILT_METALLIB` to name an existing absolute path; the build
+//! script never creates or replaces files in `CARGO_MANIFEST_DIR`.
 
 use std::env;
 use std::fs;
@@ -22,18 +21,11 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 fn main() {
-    // Without this, a single `DOCS_RS=1 cargo build` poisons the cache: the
-    // branch below bakes `TESSL_METALLIB=""` via `rustc-env`, cargo has no
-    // reason to re-run this script when the variable disappears, and every
-    // later build keeps the empty path. The crate then compiles and every
-    // `GpuRuntime::new()` fails with "metallib missing at " — an empty path,
-    // thousands of lines from the cause. Found by running the docs.rs
-    // simulation immediately before the test suite: 62 of 88 lib tests failed
-    // on a tree whose only change was doc comments.
-    println!("cargo:rerun-if-env-changed=DOCS_RS");
     println!("cargo:rerun-if-env-changed=DEVELOPER_DIR");
+    println!("cargo:rerun-if-env-changed=DOCS_RS");
     println!("cargo:rerun-if-env-changed=TESSL_SKIP_AOT");
     println!("cargo:rerun-if-env-changed=METAL_RUNTIME_SKIP_AOT");
+    println!("cargo:rerun-if-env-changed=TESSL_PREBUILT_METALLIB");
     println!("cargo:rerun-if-env-changed=TESSL_GEMM_TUNE");
     println!("cargo:rerun-if-env-changed=METAL_NATIVE_GEMM_TUNE");
 
@@ -42,11 +34,19 @@ fn main() {
     println!("cargo:rustc-link-lib=framework=Metal");
     println!("cargo:rustc-link-lib=framework=Foundation");
 
-    // docs.rs builds on x86_64 Linux with no Xcode and no Metal toolchain, and
-    // `default.metallib` is gitignored so it is not in the published .crate
-    // either. Every other branch below shells out to `xcrun`, which does not
-    // exist there — so without this the crate has no path to a rendered docs
-    // page at all, only a red build.
+    let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
+    let kernels_dir = manifest_dir.join("kernels");
+
+    // Canonical kernel sources. Dependents that build their own metallib read
+    // this as `DEP_TESSL_KERNELS` (Cargo derives the name from `links`). Emit
+    // it on every branch, including docs.rs and offline builds, so a global
+    // skip setting cannot silently erase the downstream contract.
+    println!("cargo:kernels={}", kernels_dir.display());
+
+    // docs.rs builds on x86_64 Linux with no Xcode or Metal toolchain. Every
+    // other branch below shells out to `xcrun`, which does not exist there — so
+    // without this the crate has no path to a rendered docs page, only a red
+    // build.
     //
     // Documentation does not run kernels, so an empty metallib path is the
     // honest answer: `metallib_path()` returns "" and `GpuRuntime::new` fails
@@ -54,12 +54,7 @@ fn main() {
     // cannot silently swallow a real build.
     if env::var_os("DOCS_RS").is_some() {
         println!("cargo:warning=DOCS_RS set; skipping metallib AOT (docs only, no GPU)");
-        println!(
-            "cargo:kernels={}",
-            PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap())
-                .join("kernels")
-                .display()
-        );
+        println!("cargo:metallib=");
         println!("cargo:rustc-env=TESSL_METALLIB=");
         return;
     }
@@ -67,40 +62,42 @@ fn main() {
     // Legacy spelling still honoured: this one is set by hand in CI/offline runs.
     if env::var_os("TESSL_SKIP_AOT").is_some() || env::var_os("METAL_RUNTIME_SKIP_AOT").is_some() {
         println!("cargo:warning=TESSL_SKIP_AOT set; skipping metallib AOT");
-        let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
-        let crate_lib = manifest_dir.join("default.metallib");
-        // Fail here rather than at every `GpuRuntime::new()`.
-        //
-        // `default.metallib` is gitignored, so it is absent on a fresh
-        // checkout. Baking the path unconditionally produced a build that
-        // succeeded and a binary in which every runtime construction failed —
-        // the error surfacing thousands of lines away from its cause. This is
-        // an escape hatch for offline builds over a known-good artefact, so
-        // requiring that artefact to exist is the whole contract.
-        if !crate_lib.is_file() {
+        let configured = env::var_os("TESSL_PREBUILT_METALLIB").unwrap_or_else(|| {
             panic!(
-                "TESSL_SKIP_AOT is set but {} does not exist. That variable skips \
-                 the metallib compile and points the crate at a prebuilt artefact; \
-                 it is gitignored and absent on a fresh checkout. Either unset \
-                 TESSL_SKIP_AOT and build the shaders, or place a known-good \
-                 default.metallib at the crate root.",
-                crate_lib.display()
+                "TESSL_SKIP_AOT is set but TESSL_PREBUILT_METALLIB is not. \
+                 Name an existing absolute metallib path explicitly, or unset \
+                 TESSL_SKIP_AOT and build the shaders"
+            )
+        });
+        let configured = PathBuf::from(configured);
+        if !configured.is_absolute() {
+            panic!(
+                "TESSL_PREBUILT_METALLIB must be an absolute path, got {}",
+                configured.display()
             );
         }
-        println!("cargo:rustc-env=TESSL_METALLIB={}", crate_lib.display());
+        let prebuilt = configured.canonicalize().unwrap_or_else(|e| {
+            panic!(
+                "TESSL_PREBUILT_METALLIB={} is not accessible: {e}",
+                configured.display()
+            )
+        });
+        if !prebuilt.is_file() {
+            panic!(
+                "TESSL_PREBUILT_METALLIB={} is not a file",
+                prebuilt.display()
+            );
+        }
+        println!("cargo:rerun-if-changed={}", prebuilt.display());
+        println!("cargo:metallib={}", prebuilt.display());
+        println!("cargo:rustc-env=TESSL_METALLIB={}", prebuilt.display());
         return;
     }
 
     ensure_developer_dir();
 
-    let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
-    let kernels_dir = manifest_dir.join("kernels");
     track_kernel_sources(&kernels_dir);
-
-    // Canonical GEMM kernel sources. Dependents that build their own metallib
-    // read this as `DEP_TESSL_KERNELS` (Cargo derives the name from `links`).
-    println!("cargo:kernels={}", kernels_dir.display());
 
     let sdk = xcrun_stdout(&["--sdk", "macosx", "--show-sdk-path"]);
     let metal = resolve_metal();
@@ -110,10 +107,10 @@ fn main() {
 
     // TensorOps kernels — Metal 4 dialect (macOS 26+ / MPP). Hard-fail: NAX GEMM
     // is the hot path; a simdgroup-only metallib is not acceptable.
-    // The GEMM A/B rig (kernels/tune/) is 92 measurement-only kernels that
-    // nothing dispatches at runtime. Linking it took the shipped metallib from
-    // 0.22 MB to 1.09 MB, so it is opt-in. It lives in a subdirectory precisely
-    // so the directory glob below cannot pick it up by accident.
+    // The GEMM A/B rig (kernels/tune/) is 34 measurement-only kernels that
+    // nothing dispatches at runtime, so it stays opt-in to keep the shipped
+    // metallib small. It lives in a subdirectory precisely so the directory
+    // glob below cannot pick it up by accident.
     let want_tune =
         env::var_os("TESSL_GEMM_TUNE").is_some() || env::var_os("METAL_NATIVE_GEMM_TUNE").is_some();
     let mut tensorops_sources: Vec<PathBuf> = vec![kernels_dir.join("matmul_tensorops.metal")];
@@ -177,34 +174,40 @@ fn main() {
     for src in &others {
         let stem = src.file_stem().unwrap().to_string_lossy();
         let air = out_dir.join(format!("{stem}.air"));
-        let ok_m4 = try_metal_compile(&metal, &sdk, src, &air, "metal4.0");
-        if !ok_m4 {
+        if let Err(metal4_diag) = try_metal_compile(&metal, &sdk, src, &air, "metal4.0") {
+            // The fallback is a dialect downgrade, so its cause is printed with
+            // it rather than discarded: a green build whose kernel silently
+            // compiled under metal3.2 should be diagnosable from the log, and
+            // when the fallback fails too the real (metal4.0) error must not
+            // hide behind an unrelated metal3.2 one.
+            let name = src.file_name().and_then(|n| n.to_str()).unwrap_or(&stem);
             println!(
-                "cargo:warning={} failed under -std=metal4.0; falling back to -std=metal3.2 \
-                 (shader dialect only; encode remains Metal 4)",
-                src.file_name().and_then(|n| n.to_str()).unwrap_or(&stem)
+                "cargo:warning={name} failed under -std=metal4.0; falling back to -std=metal3.2 \
+                 (shader dialect only; encode remains Metal 4). metal4.0 diagnostic follows."
             );
-            run(
-                Command::new(&metal)
-                    .args([
-                        "-std=metal3.2",
-                        "-O2",
-                        "-isysroot",
-                        &sdk,
-                        "-mmacosx-version-min=26.0",
-                        "-c",
-                    ])
-                    .arg(src)
-                    .arg("-o")
-                    .arg(&air),
-                &format!("metal compile {} (metal3.2 fallback)", src.display()),
-            );
+            for line in metal4_diag.lines().take(40) {
+                println!("cargo:warning=  {line}");
+            }
+            if let Err(metal32_diag) = try_metal_compile(&metal, &sdk, src, &air, "metal3.2") {
+                panic!(
+                    "{name} failed under both -std=metal4.0 and -std=metal3.2.\n\
+                     --- metal4.0 ---\n{metal4_diag}\n--- metal3.2 ---\n{metal32_diag}"
+                );
+            }
         }
         air_files.push(air);
     }
 
     // Metal can retain file-backed library data after loading. Never relink a
     // pathname baked into a prior binary: each build owns an immutable artifact.
+    //
+    // Immutable, not eternal: every earlier build's artifact in this OUT_DIR is
+    // removed first. A binary that referenced one of them is rebuilt by Cargo
+    // whenever this script reruns (`TESSL_METALLIB` is baked in through
+    // `rustc-env`, and dependents read `DEP_TESSL_METALLIB`), so nothing
+    // current can still name a swept path, and OUT_DIR no longer grows by one
+    // metallib per build.
+    sweep_previous_metallibs(&out_dir);
     let build_id = format!(
         "{}-{}",
         std::process::id(),
@@ -222,30 +225,41 @@ fn main() {
     link.arg("-o").arg(&metallib_out);
     run(&mut link, "metallib link");
 
-    // Offline compatibility copy at the crate root, for the TESSL_SKIP_AOT path.
-    //
-    // This writes outside OUT_DIR, which Cargo forbids while verifying a package
-    // ("Source directory was modified by build.rs during cargo publish") — it
-    // made `cargo package` fail outright. Skipped when building from a packaging
-    // directory, where the copy is useless anyway: a consumer building tessl
-    // from a registry always compiles the metallib fresh into OUT_DIR, and only
-    // this repository's offline/CI runs ever set TESSL_SKIP_AOT.
-    if !is_packaging_dir(&manifest_dir) {
-        // Do not truncate an inode a running process may still have mapped;
-        // stage beside it and rename. Failure is surfaced, never swallowed.
-        let crate_copy = manifest_dir.join("default.metallib");
-        let staged_copy = manifest_dir.join(format!(".default-{build_id}.metallib"));
-        fs::File::create_new(&staged_copy).expect("reserve offline metallib staging file");
-        fs::copy(&metallib_out, &staged_copy).expect("stage offline metallib");
-        fs::rename(&staged_copy, &crate_copy).expect("publish offline metallib");
-    }
-
+    // Keep the compiled artifact inside Cargo's build-owned directory. Besides
+    // making registry and vendored sources immutable, this isolates concurrent
+    // profiles/targets/builds from one another. `links = "tessl"` exposes the
+    // same path to direct dependents as `DEP_TESSL_METALLIB`.
+    println!("cargo:metallib={}", metallib_out.display());
     println!("cargo:rustc-env=TESSL_METALLIB={}", metallib_out.display());
 }
 
-fn try_metal_compile(metal: &Path, sdk: &str, src: &Path, air: &Path, metal_std: &str) -> bool {
+/// Delete `default-*.metallib` left in `out_dir` by previous builds.
+fn sweep_previous_metallibs(out_dir: &Path) {
+    let Ok(entries) = fs::read_dir(out_dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name.starts_with("default-") && name.ends_with(".metallib") {
+            // A stale artifact that cannot be removed is not an error worth a
+            // red build; it costs disk, not correctness.
+            let _ = fs::remove_file(entry.path());
+        }
+    }
+}
+
+/// Compile one kernel under `metal_std`; on failure return the compiler's
+/// diagnostic (or the spawn error) instead of swallowing it.
+fn try_metal_compile(
+    metal: &Path,
+    sdk: &str,
+    src: &Path,
+    air: &Path,
+    metal_std: &str,
+) -> Result<(), String> {
     let std_flag = format!("-std={metal_std}");
-    Command::new(metal)
+    let out = Command::new(metal)
         .args([
             std_flag.as_str(),
             "-O2",
@@ -257,11 +271,18 @@ fn try_metal_compile(metal: &Path, sdk: &str, src: &Path, air: &Path, metal_std:
         .arg(src)
         .arg("-o")
         .arg(air)
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
+        .output()
+        .map_err(|e| format!("failed to spawn {}: {e}", metal.display()))?;
+    if out.status.success() {
+        return Ok(());
+    }
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let stderr = stderr.trim();
+    Err(if stderr.is_empty() {
+        format!("metal exited with {}", out.status)
+    } else {
+        stderr.to_string()
+    })
 }
 
 fn ensure_developer_dir() {
@@ -343,32 +364,11 @@ fn track_kernel_sources(dir: &Path) {
             p.extension().and_then(|s| s.to_str()),
             Some("metal") | Some("h")
         ) {
-            // `.h` as well as `.metal`: `reduce_tree.h` is included by two
-            // kernels and compiled as neither. Tracking only sources would let
-            // an edit to the shared reduction leave both dependents stale in
-            // the metallib while `cargo test` reported a pass.
+            // `.h` as well as `.metal`: shared reduction/activation helpers are
+            // included by multiple kernels and compiled as neither. Tracking
+            // only sources would let a helper edit leave every dependent stale
+            // in the metallib while `cargo test` reported a pass.
             println!("cargo:rerun-if-changed={}", p.display());
         }
     }
-}
-
-/// True when this build is Cargo verifying a package tarball.
-///
-/// `cargo package` unpacks into `<target>/package/<name>-<version>/` and builds
-/// there, then fails the run if the build script touched anything in that
-/// directory. Detecting it by path is the available signal — Cargo exposes no
-/// "am I packaging" variable — and it is precise: a normal checkout is not
-/// nested under `target/package/`.
-fn is_packaging_dir(manifest_dir: &Path) -> bool {
-    let mut it = manifest_dir.components().rev();
-    // .../target/package/<name>-<version>
-    it.next().is_some()
-        && it
-            .next()
-            .map(|c| c.as_os_str() == "package")
-            .unwrap_or(false)
-        && it
-            .next()
-            .map(|c| c.as_os_str() == "target")
-            .unwrap_or(false)
 }

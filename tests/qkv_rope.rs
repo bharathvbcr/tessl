@@ -379,6 +379,7 @@ fn kv_store_variant_writes_the_rotated_k_and_v_into_the_cache() {
                 dst_k: &dst_k,
                 dst_v: &dst_v,
                 dst_offset: &off,
+                capacity: (kv_elems * 3) as u32,
             }),
             false,
         )

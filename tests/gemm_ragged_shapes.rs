@@ -210,21 +210,25 @@ fn output_views_at_a_byte_offset_stay_inside_their_window() {
 
         let a = tensor_f32(rt, &[m, k], &a_host);
         let b = tensor_f32(rt, &[k, n], &b_host);
-        let big = rt.alloc_tensor_f32(&[3 * m * n]).unwrap();
-        let c = big.view(&[m, n], m * n);
+        // Pad the middle window start to a 16-byte (4-element) boundary so
+        // validate_gemm's alignment gate is not what this test exercises.
+        let off = (m * n).div_ceil(4) * 4;
+        let big = rt.alloc_tensor_f32(&[off + m * n + off]).unwrap();
+        let c = big.view(&[m, n], off);
         gemm_f32(&a, &b, &c, GemmBackend::TensorOps).unwrap();
         rt.synchronize().unwrap();
 
         let all = big.buffer.read_f32();
         assert_within_bound(
             "f32 NN offset view",
-            &all[m * n..2 * m * n],
+            &all[off..off + m * n],
             &expect,
             k,
             0.0,
         );
         assert!(
-            all[..m * n].iter().all(|&x| x == 0.0) && all[2 * m * n..].iter().all(|&x| x == 0.0),
+            all[..off].iter().all(|&x| x == 0.0)
+                && all[off + m * n..].iter().all(|&x| x == 0.0),
             "GEMM wrote outside the destination view's window"
         );
     });

@@ -7,6 +7,10 @@
 
 #![allow(dead_code)]
 
+/// The gated delta rule as an f64 sequential reference — the CPU oracle for the
+/// GDN kernels. Pure arithmetic, no GPU, so it runs on any host.
+pub mod gdn;
+
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use tessl::tensor::{bf16_bits_to_f32, f32_slice_to_bf16, GpuBuffer};

@@ -68,47 +68,48 @@ The name is short for *tessellation* — the design centers around how matrix op
 ## System Architecture
 
 ```mermaid
-graph TD
-    subgraph Consumers["Downstream Consumers"]
-        Gemma["gemma-metal<br/>(Gemma 4 Inference)"]
+flowchart TD
+    subgraph Downstream["Downstream Consumers & Ecosystem"]
+        Gemma["gemma-metal<br/>(LLM Inference Runtime)"]
         Arch02["tessl-arch02<br/>(Value Residual Training)"]
+        CustomApp["Custom Overlays & Pipelines<br/>(links = 'tessl', DEP_TESSL_KERNELS)"]
     end
 
-    subgraph TesslAPI["tessl Public API"]
-        GpuRt["GpuRuntime"]
-        GemmFn["gemm() / gemm_epilogue() / gemm_batched()"]
-        NnFn["nn::* (RMSNorm, attention, softmax, Q4/Q8)"]
-        TensorObj["Tensor / GpuBuffer"]
-        IcbObj["DecodeIcb / PingPongCbReplay"]
+    subgraph TesslAPI["tessl Public API Surface"]
+        GpuRt["GpuRuntime<br/>(Device, Allocator, Encoder Lease)"]
+        GemmAPI["GEMM Suite<br/>gemm() · gemm_epilogue() · gemm_batched()"]
+        NnAPI["tessl::nn (62 Typed Entry Points)<br/>RMSNorm · FlashAttn · Softmax · Q4/Q8 GEMV"]
+        TensorTypes["Tensor &lt;T&gt; / GpuBuffer<br/>(DType: F32, BF16, F16, I8, I32)"]
+        IcbAPI["DecodeIcb &amp; PingPongCbReplay<br/>(ICB Capture &amp; Dual-Slot Replay)"]
     end
 
-    subgraph CoreEngine["tessl Core Runtime Substrate"]
-        RuntimeMod["runtime.rs<br/>MTL4 Buffers, Pools & Const Arena"]
-        GemmMod["gemm.rs<br/>Validation, Layouts & Coop Dispatch"]
-        DispatchMod["dispatch.rs<br/>Binder & Argument Table Encode"]
-        IcbMod["decode_icb.rs / cb_replay.rs<br/>ICB Capture, Tape Replay & Coalescing"]
-        NnMod["nn.rs<br/>Typed API over the NN kernel library"]
-        MtlTensorMod["mtl_tensor.rs<br/>Quantized MTLTensor Prep (WWDC26-330)"]
+    subgraph CoreEngine["tessl Core Runtime Engine"]
+        RuntimeMod["runtime.rs<br/>• MTL4 Buffers, FreeList Pools, Bump Arena<br/>• 16 MiB Constant Arena (Scalar Binds)<br/>• Deferred Recycle on MTLSharedEvent"]
+        GemmMod["gemm.rs<br/>• Rank-2 Extent &amp; Alignment Validation<br/>• Layout Resolution (NN, TN, NT, Batched)<br/>• Coop Destination (128x64 &amp; 64x64 sg4)"]
+        DispatchMod["dispatch.rs<br/>• Binder &amp; 31-slot MTL4ArgumentTable<br/>• Threadgroup Grid Geometry Helpers"]
+        NnMod["nn.rs<br/>• Checked elems() &amp; require::&lt;T&gt; Bounds<br/>• _with_scalars Binding Seam"]
+        IcbMod["decode_icb.rs &amp; cb_replay.rs<br/>• Capture Tape, Freeze-Binds &amp; Range-Batching<br/>• Dual-Slot Ping-Pong State Machine"]
+        MtlTensorMod["mtl_tensor.rs<br/>• Quantized MTLTensor Prep (WWDC26-330)"]
     end
 
-    subgraph Metal4Layer["Metal 4 Driver & Hardware Layer"]
-        CmdBuf["MTL4CommandBuffer / Allocator"]
-        ArgTable["MTL4ArgumentTable (31-slot)"]
-        ResSet["MTLResidencySet (Hot / Cold Pools)"]
-        SharedEvt["MTLSharedEvent (Zero-wait Sync)"]
+    subgraph Metal4Driver["Metal 4 Driver &amp; Hardware Abstraction Layer"]
+        CmdBuf["MTL4CommandBuffer &amp; CommandAllocator"]
+        ComputeEnc["MTL4ComputeCommandEncoder<br/>(Packed with_binder encoding)"]
+        ArgTable["MTL4ArgumentTable (31 Buffer Slots)"]
+        ResSet["MTLResidencySet (Hot, Cold, Bump, External)"]
+        SharedEvt["MTLSharedEvent (Zero-Host-Wait Synchronization)"]
     end
 
-    subgraph Shaders["Compiled Metallib Shaders"]
-        TensorOpsMetal["matmul_tensorops.metal (MPP matmul2d)"]
-        SimdMetal["matmul_simdgroup.metal (Fallback)"]
-        UtilsMetal["utils.metal (Elementwise & Softcap)"]
+    subgraph MetallibShaders["Compiled Metallib Shader Kernels"]
+        TensorOps["matmul_tensorops.metal<br/>(MPP TensorOps matmul2d · Register Accumulation)"]
+        SimdFallback["matmul_simdgroup.metal<br/>(Portable SIMDgroup Matrix Fallback)"]
+        NnKernels["18 NN Kernel Sources (72 Entry Points)<br/>RMSNorm · FlashAttn SWA/Global · MLX Q4/Q8 · RoPE"]
     end
 
-    Gemma -->|Links & Overlays| TesslAPI
-    Arch02 -->|DEP_TESSL_KERNELS| TesslAPI
+    Downstream -->|Typed API Calls| TesslAPI
     TesslAPI --> CoreEngine
-    CoreEngine --> Metal4Layer
-    Metal4Layer --> Shaders
+    CoreEngine --> Metal4Driver
+    Metal4Driver --> MetallibShaders
 ```
 
 ---
@@ -169,33 +170,40 @@ over 50 iterations after 10 warmup:
 
 ```mermaid
 flowchart TD
-    subgraph DeviceMemory["Unified System Memory (Metal 4 Device)"]
-        subgraph Pools["tessl Managed Pools"]
-            Hot["Hot Pool<br/>(Weights & Persistent State)<br/>Resident for lifetime of run"]
-            Cold["Cold Pool<br/>(Intermediate Activations)<br/>Recycled + removeAllocation after CB"]
-            Bump["Bump Pool<br/>(Per-step Ephemeral Slabs)<br/>Cursor reset on sync"]
+    subgraph UnifiedMem["Unified System Memory (Apple Silicon Unified Memory)"]
+        subgraph Pools["tessl Managed Buffer Pools (BufferKind)"]
+            Hot["BufferKind::Hot<br/>(Weights, Biases, Long-lived State)<br/>• Registered once in MTLResidencySet<br/>• Retired on Drop after in-flight CBs"]
+            Cold["BufferKind::Cold<br/>(Intermediate Activations)<br/>• Active FreeList (2 GiB default cap)<br/>• Recycled via removeAllocation on CB completion"]
+            Bump["BufferKind::Bump<br/>(Ephemeral Per-Step Slabs)<br/>• Sub-allocated linear views<br/>• Cursor reset at synchronize()"]
+            Ext["BufferKind::External<br/>(Caller-Owned MTLBuffer)<br/>• Wrapped via from_mtl_buffer()<br/>• Stays resident; never enters FreeList"]
         end
 
-        subgraph Arenas["Low-Latency Arenas"]
-            ConstArena["Constant Arena (16 MiB Bump)<br/>Scalar & Uniform Table Offsets"]
+        subgraph LowLatencyArenas["Low-Latency Host-to-Device Staging"]
+            ConstArena["Constant Arena (16 MiB Linear Bump)<br/>• 16-byte aligned scalar &amp; uniform offsets<br/>• Zero per-dispatch allocation tax<br/>• Bump offset reset at synchronize()"]
         end
     end
 
-    subgraph DriverResidency["Metal 4 Driver Residency Management"]
-        ResSet["MTLResidencySet"]
-        ArgTable["MTL4ArgumentTable"]
+    subgraph DriverResidency["Metal 4 Driver &amp; Synchronization Architecture"]
+        ResSet["MTLResidencySet<br/>(Driver Residency Management)"]
+        ArgTable["MTL4ArgumentTable (31-slot Buffer Table)"]
+        SharedEvt["MTLSharedEvent<br/>(Deferred Drop &amp; FreeList Recycling)"]
     end
 
     Hot -->|Registered Once| ResSet
-    Cold -->|Dynamic Register / Evict| ResSet
+    Ext -->|Registered for Lifetime| ResSet
+    Cold -->|Dynamic Register / FreeList Recycle| ResSet
     Bump -->|Pre-allocated Slabs| ResSet
-    ConstArena -->|Direct Table Offsets| ArgTable
+    ConstArena -->|Direct 16-byte Offset Binds| ArgTable
+    Cold -.->|Arc::drop triggers pending_cold_recycle| SharedEvt
+    Hot -.->|Arc::drop triggers pending_retirement| SharedEvt
+    SharedEvt -->|Signal on CB Completion| Pools
 ```
 
-- **`BufferKind::Hot`**: Persistent allocations (model weights, optimizer state, KV cache banks). Added to the `MTLResidencySet` once at initialization and retained across steps.
-- **`BufferKind::Cold`**: Intermediate activations. Managed via an active freelist pool with a default 2 GiB cap (`DEFAULT_POOL_CACHE_BYTES`). Unused slabs are evicted via `removeAllocation` upon command buffer completion.
+- **`BufferKind::Hot`**: Persistent allocations (model weights, optimizer state, KV cache banks). Added to the `MTLResidencySet` once at initialization and retained across steps. Retired via `pending_retirement` on `Drop` after GPU in-flight completion.
+- **`BufferKind::Cold`**: Intermediate activations. Managed via an active freelist pool with a default 2 GiB cap (`DEFAULT_POOL_CACHE_BYTES`). Unused slabs are evicted via `removeAllocation` upon command buffer completion (`pending_cold_recycle`).
 - **`BufferKind::Bump`**: Ephemeral scratch memory allocated linearly from pre-committed slabs. Bump cursors are reset at synchronization points without individual buffer deallocations.
-- **Constant Arena (16 MiB)**: Eliminates per-dispatch host allocation overhead for scalars and small metadata buffers by writing directly into a shared staging buffer at 16-byte aligned offsets.
+- **`BufferKind::External`**: Caller-owned `MTLBuffer` allocations wrapped through [`Tensor::from_mtl_buffer`](https://docs.rs/tessl). Stays resident in the working set without entering the cold freelist upon drop.
+- **Constant Arena (16 MiB)**: Eliminates per-dispatch host allocation overhead for scalars and small metadata buffers by writing directly into a shared staging buffer at 16-byte aligned offsets into the 31-slot argument table.
 
 ---
 
@@ -203,26 +211,30 @@ flowchart TD
 
 ```mermaid
 flowchart TD
-    Start["gemm(a, b, c, backend)"] --> Validate{"validate_gemm()<br/>Rank-2, Non-empty, Bounds &lt;= 2^31,<br/>Same Runtime, No In/Out Overlap"}
+    Start["gemm(a, b, c, backend) / gemm_epilogue() / gemm_batched()"] --> Validate{"validate_gemm()<br/>• Rank-2, Non-empty, Bounds &lt;= 2^31<br/>• 16-byte (or 64-byte coop) alignment<br/>• Same runtime, No In/Out overlap"}
     Validate -- Fail --> Err["Return Err(String)"]
-    Validate -- Pass --> BackendCheck{"Backend?"}
+    Validate -- Pass --> EpilogueCheck{"Epilogue / Batched?"}
 
-    BackendCheck -- SimdGroup --> SimdGroupKernel["matmul_simdgroup<br/>(Portable SIMD Fallback)"]
+    EpilogueCheck -- "Batched GEMM" --> BatchedDispatch["gemm_batched()<br/>• BatchStrides (A, B, C strides)<br/>• Stride-B = 0 broadcasts weight B<br/>• Coop-destination 64-byte alignment"]
+    EpilogueCheck -- "Fused Epilogue" --> EpilogueDispatch["gemm_epilogue()<br/>• Requires Coop Path (BF16, F16, TF32)<br/>• Evaluates alpha*A@B + beta*C + bias<br/>• Row-stride-0 column bias broadcast<br/>• In-register clamped activation"]
+    EpilogueCheck -- "Standard GEMM" --> BackendCheck{"Backend?"}
+
+    BackendCheck -- SimdGroup --> SimdGroupKernel["matmul_simdgroup / edges<br/>• Portable fallback (16x16 / 32x32)<br/>• Direct write to device memory C"]
     BackendCheck -- TensorOps --> LayoutCheck{"Layout Resolution"}
 
     LayoutCheck -- "TN / NT Layout" --> SplitKCheck{"prefer_tn_splitk?<br/>(K &gt;= 2048, M,N &lt;= 384,<br/>min(M,N) &lt;= 128)"}
     SplitKCheck -- Yes --> SplitKKernel["matmul2d_tensorops_tn/nt_splitk_*<br/>(Split-K partial reductions)"]
-    SplitKCheck -- No --> CoopTN["matmul2d_tensorops_tn/nt_bf16_f32<br/>(128x64 sg4 Cooperative Destination)"]
+    SplitKCheck -- No --> CoopTN["matmul2d_tensorops_tn/nt_*_f32<br/>• 128x64 sg4 Cooperative Destination<br/>• Single store, zero host pre-zeroing"]
 
     LayoutCheck -- "NN Layout" --> PrecisionCheck{"Precision Mode"}
     
-    PrecisionCheck -- "f32 exact" --> F32Exact["matmul2d_tensorops_f32<br/>(Tile: 32x32, 1 simdgroup)"]
+    PrecisionCheck -- "f32 exact" --> F32Exact["matmul2d_tensorops_f32<br/>• Tile: 32x32, 1 simdgroup<br/>• Packed C-zero + matmul binder"]
     
-    PrecisionCheck -- "bf16 / tf32-relaxed" --> NNTable{"nn_coop_kernel()<br/>N &lt;= 512?"}
+    PrecisionCheck -- "bf16 / f16 / tf32-relaxed" --> NNTable{"nn_coop_kernel()<br/>N &lt;= 512?"}
     
-    NNTable -- "N &lt;= 512 (Narrow)" --> NNNarrow["matmul2d_tensorops_*_64x64_sg4<br/>• TILE_COOP_NARROW (64x64, 4 simdgroups)<br/>• Register accumulator, cT.store<br/>• Edge bounds-checked slices"]
+    NNTable -- "N &lt;= 512 (Narrow)" --> NNNarrow["matmul2d_tensorops_*_64x64_sg4<br/>• TILE_COOP_NARROW (64x64, 4 simdgroups)<br/>• Register accumulator, cT.store<br/>• Origin-shifted edge-checked slices"]
     
-    NNTable -- "N &gt; 512 (Default)" --> NNDefault["matmul2d_tensorops_*<br/>• TILE_COOP_DEFAULT (128x64, 4 simdgroups)<br/>• Column-panel swizzle if grid &gt;= 2048 tiles<br/>• Register accumulator, cT.store<br/>• Edge bounds-checked slices"]
+    NNTable -- "N &gt; 512 (Default)" --> NNDefault["matmul2d_tensorops_*<br/>• TILE_COOP_DEFAULT (128x64, 4 simdgroups)<br/>• 8-tile-row column swizzle if grid &gt;= 2048<br/>• Register accumulator, cT.store<br/>• Origin-shifted edge-checked slices"]
 ```
 
 ### Cooperative Destination Advantages
@@ -248,21 +260,25 @@ sequenceDiagram
     participant ICB as Metal 4 MTLIndirectCommandBuffer
     participant GPU as Apple Silicon GPU
 
-    Note over Host,GPU: 1. Capture Phase (First Token / Warmup)
+    rect rgb(240, 245, 255)
+    Note over Host,GPU: Phase 1: Capture &amp; Bake Tape (Warmup / Initial Step)
     Host->>Binder: begin_decode_icb_capture()
-    loop Model Layers (Decode Graph)
+    loop Decode Graph Dispatches
         Host->>Binder: bind_buffer(), set_pipeline(), dispatch()
-        Binder->>Tape: Record Command (PSO, ArgTable, Buffers, Grid Size)
+        Binder->>Tape: Record Command (PSO, ArgTable, Buffer Pointers, Grid Geometry)
     end
-    Host->>Tape: take_decode_icb_capture() -> Bake ICB Tape
-    Tape->>ICB: Encode ICB Commands (freeze-binds / range-batching)
+    Host->>Tape: take_decode_icb_capture()
+    Tape->>ICB: Encode ICB Commands<br/>(Freeze-binds: bake pointers &amp; tg_mem · Range-batching: coalesce spans)
+    end
 
-    Note over Host,GPU: 2. Steady-State Replay Phase (Subsequent Tokens)
-    loop Each Decode Token
+    rect rgb(245, 255, 245)
+    Note over Host,GPU: Phase 2: Steady-State Low-Latency Replay (Subsequent Tokens)
+    loop Each Autoregressive Token
         Host->>Tape: try_replay_icb(runtime)
-        Tape->>ICB: executeCommandsInBuffer:withRange: (Zero setArgumentTable host tax)
-        Host->>GPU: Submit MTL4CommandBuffer (Ping-Pong buffers)
+        Tape->>ICB: executeCommandsInBuffer:withRange:<br/>(0 setArgumentTable host calls · Coalesced barrier spans)
+        Host->>GPU: Commit MTL4CommandBuffer (Ping-Pong A/B allocators)
         GPU-->>Host: Signal MTLSharedEvent (Zero-wait async execution)
+    end
     end
 ```
 

@@ -14,6 +14,30 @@ you changed in the kernel.**
 | `bench_gemm_sweep` | Cross-runtime lane (f32 exact / tf32 / bf16), JSON out. |
 | `bench/paired_cross_runtime.py` | Alternates the tessl and PyTorch/MLX lanes round by round. |
 
+```mermaid
+flowchart TD
+    subgraph Suite["tessl Benchmarking Suite"]
+        Sweep["bench_gemm_sweep<br/>(f32, tf32, bf16 sweep · JSON telemetry)"]
+        NnBench["bench_nn_kernels<br/>(62 nn entry points · batched vs solo)"]
+        Parity["probe_gemm_parity<br/>(Bit-exact TensorOps vs SIMD verification)"]
+        
+        subgraph TuneGated["Behind TESSL_GEMM_TUNE=1 (92 A/B Kernels)"]
+            TnNtTune["bench_gemm_tnnt_tune<br/>(Paired interleaved TN/NT A/B lane)"]
+            TileTune["bench_gemm_tile_tune<br/>(Tile geometry &amp; BK ladder search)"]
+        end
+    end
+
+    subgraph CrossRuntime["Cross-Runtime Evaluation"]
+        PyHarness["paired_cross_runtime.py<br/>(Python 3 driver)"]
+        TorchMPS["PyTorch 2.13 (MPS)"]
+        MLX["Apple MLX"]
+    end
+
+    PyHarness -->|Round-Interleaved Subprocess| Sweep
+    PyHarness -->|In-Process Dispatch| TorchMPS
+    PyHarness -->|In-Process Dispatch| MLX
+```
+
 The A/B rig is 92 measurement-only kernels and is **not** in the default
 metallib — linking it took the shipped artifact from 0.22 MB to 1.09 MB. Opt in:
 
@@ -73,6 +97,33 @@ numbers should not be quoted**, including earlier ones from this project: a
 "1.07× ahead of PyTorch on bf16" claim did not survive the paired protocol and
 became 1.00×.
 
+```mermaid
+sequenceDiagram
+    autonumber
+    participant Py as paired_cross_runtime.py
+    participant Tessl as tessl (subprocess)
+    participant MPS as PyTorch MPS
+    participant MLX as Apple MLX
+
+    rect rgb(245, 245, 255)
+    Note over Py,MLX: Round 1 (Forward Order)
+    Py->>Tessl: Run shape ladder (50 iters) -> report median
+    Py->>MPS: Run shape ladder (50 iters) -> report median
+    Py->>MLX: Run shape ladder (50 iters) -> report median
+    end
+
+    Note over Py,MLX: Clock frequency &amp; thermals drift identically across all lanes
+
+    rect rgb(255, 245, 245)
+    Note over Py,MLX: Round 2 (Reverse Order)
+    Py->>MLX: Run shape ladder (50 iters) -> report median
+    Py->>MPS: Run shape ladder (50 iters) -> report median
+    Py->>Tessl: Run shape ladder (50 iters) -> report median
+    end
+
+    Note over Py: Compute per-round ratio medians &amp; flag spread &gt; 10%
+```
+
 ## Pitfall 4 — stale binaries
 
 `cargo test --lib` rebuilds the library but **not** the binaries. Two rounds of
@@ -97,6 +148,29 @@ penalised on square shapes.
 
 Under this submit-and-wait protocol both tessl and PyTorch sit on a **~0.25 ms
 per-GEMM floor**. tessl's wall time is flat from 4 MFLOP to 2416 MFLOP:
+
+```mermaid
+flowchart TD
+    subgraph Small["Workload &lt; 2 GFLOP (e.g., 64² to 1536² with K=512)"]
+        direction LR
+        S_Wall["Total Wall Time: ~0.25 ms (FLAT)"]
+        S_Driver["Host Submit-and-Wait Floor: ~0.24 ms (96%)"]
+        S_Shader["Actual GPU Compute: ~0.01 ms (4%)"]
+        S_Wall --- S_Driver
+        S_Wall --- S_Shader
+        S_Concl["⚠️ Ratio measures driver submission latency, NOT shader speed!"]
+    end
+
+    subgraph Large["Workload &gt; 2 GFLOP (e.g., 2048² to 4096²)"]
+        direction LR
+        L_Wall["Total Wall Time: Scales with FLOPs"]
+        L_Driver["Host Driver Overhead: ~0.25 ms"]
+        L_Shader["GPU Shader Compute: Dominates (70–98%)"]
+        L_Wall --- L_Driver
+        L_Wall --- L_Shader
+        L_Concl["✅ Measured GFLOP/s accurately reflects GPU kernel throughput"]
+    end
+```
 
 | shape (K=512) | MFLOP | tessl ms | PyTorch ms |
 | --- | --- | --- | --- |
@@ -226,6 +300,28 @@ This benchmark's first run found `rms_norm_f32` peaking at **87 GB/s** where
 `row_sum_f32` reached **243 GB/s** on identical traffic, and taking 404 µs to
 move 32 KB at 1×4096.
 
+```mermaid
+flowchart TD
+    subgraph Before["Before: 1 Thread Per Row (dispatch_1d)"]
+        direction TB
+        B_Desc["Single GPU thread per row walks entire dimension"]
+        B_Loop1["Pass 1: Serial loop sums squares over 4096 cols"]
+        B_Loop2["Pass 2: Serial loop scales output"]
+        B_Bottleneck["❌ At decode (rows=1), entire kernel runs on 1 GPU thread!<br/>404.3 µs (0.1 GB/s)"]
+        B_Desc --> B_Loop1 --> B_Loop2 --> B_Bottleneck
+    end
+
+    subgraph After["After: 1 Threadgroup Per Row + Parallel Tree Reduction"]
+        direction TB
+        A_Desc["1 Threadgroup per row (up to 1024 threads)"]
+        A_Strided["Strided parallel accumulation across lanes"]
+        A_Tree["Threadgroup SIMD Shuffle Tree Reduction (reduce_tree.h)"]
+        A_Scale["Parallel output writeback across 1024 threads"]
+        A_Win["✅ Decode (rows=1): 24.2 µs (16.7× speedup)<br/>512×4096: 305 GB/s (10.1× speedup)"]
+        A_Desc --> A_Strided --> A_Tree --> A_Scale --> A_Win
+    end
+```
+
 Not an artifact. The kernel's own first line said "One thread per row", and
 `dispatch_1d(rt, &p, rows)` launched exactly `rows` threads, each walking its
 row serially twice — once to accumulate the sum of squares, once to scale. At
@@ -268,6 +364,25 @@ the metallib while the tests reported a pass.
 streaming weights that was wrong twice over. Parallelism was capped at `rows`,
 and adjacent threads read addresses `cols` bytes apart, so a simdgroup's 32
 loads touched 32 different cache lines and nothing coalesced.
+
+```mermaid
+flowchart LR
+    subgraph Uncoalesced["Before: Thread-Per-Row Access Pattern"]
+        direction TB
+        T0["Lane 0: Row 0, Col K → Cache Line A"]
+        T1["Lane 1: Row 1, Col K → Cache Line B (+cols away)"]
+        T31["Lane 31: Row 31, Col K → Cache Line X"]
+        UncoalescedNote["❌ 32 independent cache lines per instruction<br/>Severe memory controller thrashing (68.9 GB/s)"]
+    end
+
+    subgraph Coalesced["After: Simdgroup per 4 Rows + char4 Vector Loads"]
+        direction TB
+        C_Simd["32 Lanes cooperate across K dimension"]
+        C_Load["char4 loads: 4 contiguous bytes per lane<br/>32 lanes × 4 bytes = 128 contiguous bytes!"]
+        CoalescedNote["✅ Perfectly coalesced single cache line access<br/>197.4 GB/s at 4096² (2.9× speedup)"]
+        C_Simd --> C_Load --> CoalescedNote
+    end
+```
 
 It now uses one simdgroup per four output rows with lanes striding K — the
 geometry the MLX Q4 simd GEMVs already used, reusing the existing

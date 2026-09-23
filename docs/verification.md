@@ -5,10 +5,44 @@ check that has never failed is not known to work — and a check that *can no
 longer* fail has stopped working while still printing a pass, which is what §1's
 note now records for half of the static audit.
 
+```mermaid
+flowchart TD
+    subgraph VHierarchy["tessl Six-Tier Verification Hierarchy"]
+        direction TB
+        T1["Tier 1: Static Tile Audit<br/>(audit_gemm_tiles.py · Rust TileGeom vs Metal constexpr)"]
+        T2["Tier 2: Adversarial Shape Sweeps<br/>(1e30 Sentinel-seeded buffers · 1x1, primes, tile edge boundaries)"]
+        T3["Tier 3: Seeded Randomized Shape Fuzzing<br/>(gemm_fuzz_quick [160 cases] · gemm_fuzz_deep [2500 soak])"]
+        T4["Tier 4: Hostile NN Input Boundary Suite<br/>(nn_adversarial.rs · overflow dims, capacity check, zero-dispatch)"]
+        T5["Tier 5: Promoted Kernel Numeric Goldens<br/>(44 promoted kernels checked for exact values vs CPU references)"]
+        T6["Tier 6: GDN Mathematical Oracles<br/>(f64 sequential reference · error damping &amp; saturation bounds)"]
+
+        T1 --> T2 --> T3 --> T4 --> T5 --> T6
+    end
+```
+
 ## 1. Static audit
 
 ```bash
 python3 scripts/audit_gemm_tiles.py
+```
+
+```mermaid
+flowchart LR
+    subgraph RustLand["Rust Host Side (src/gemm.rs)"]
+        TileDef["TileGeom Constants<br/>• TILE_COOP_DEFAULT (128x64)<br/>• TILE_COOP_NARROW (64x64)<br/>• TILE_COOP_TN_NT (128x64)<br/>• TILE_F32 (32x32)"]
+    end
+
+    subgraph Script["scripts/audit_gemm_tiles.py"]
+        Extractor["AST Regex Matcher<br/>Cross-checks SM &amp; SN values"]
+    end
+
+    subgraph MetalLand["Metal Shader Side (kernels/matmul_tensorops.metal)"]
+        ShaderDef["Compiled Kernel Constants<br/>• constexpr int SM = 128;<br/>• constexpr int SN = 64;<br/>• NN_COOP_KERNEL macros"]
+    end
+
+    RustLand --> Extractor
+    MetalLand --> Extractor
+    Extractor --> Pass["15 Pipelines Verified<br/>0 Mismatches"]
 ```
 
 Intended to cross-check, mechanically, the two relationships Rust's type system
@@ -56,6 +90,22 @@ tile drift, a BKC drift, and an unpinned kernel.
 Hand-picked shapes across every dispatch path: degenerate (1×1×1), primes,
 one-off tile boundaries (63/65/127/129/257), exact tile multiples, extreme
 aspect ratios, and shapes straddling each clause of the cooperative gate.
+
+```mermaid
+flowchart TD
+    subgraph SentinelPattern["Sentinel-Based Buffer Verification (Catch Silent Partial Writes)"]
+        direction TB
+        Seed["1. Pre-seed Output Buffer with 1e30 Sentinel<br/>(prevents zero-fill masking unwritten regions)"]
+        Dispatch["2. Dispatch Kernel under Test<br/>(Adversarial shape: prime dimensions, ragged edges)"]
+        Probe["3. Scan Output Buffer for Sentinel Survivals"]
+        
+        Seed --> Dispatch --> Probe
+        Probe --> Check{"Any 1e30 Survives?"}
+        Check -- Yes --> Fail["❌ Caught Silent Partial Write!<br/>(e.g., gemv_q4_tiled wrote 4 rows of 512)"]
+        Check -- No --> Compare["Compare written values against f64 CPU reference"]
+        Compare -- Match --> Pass["✅ Verified Numerically Sound"]
+    end
+```
 
 Output buffers are pre-seeded with a `1e30` sentinel, so a tile the kernel fails
 to write is **caught** rather than read as a plausible number. Results are
@@ -166,6 +216,30 @@ rather than assert its absence:
 | --- | --- |
 | `Rule::Repo` — the delta correction reads the undecayed state | nanolab's *default*. Diverges up to 31% of output magnitude, and **coincides exactly at `t = 0`** |
 | `alpha_mamba2_refuted` — the build plan's K7 | the Mamba2/SSD decay from a different mixer in the same source file |
+
+```mermaid
+flowchart TD
+    subgraph ErrorDynamics["GDN Numerical Error Dynamics: Saturation vs Recurrence Damping"]
+        direction TB
+        
+        subgraph Saturation["Gate Saturation Hazard (K7: gdn_gates.rs)"]
+            direction TB
+            Sat_f32["f32 unit roundoff (2^-24):<br/>sigmoid saturates to 1.0 at x ≈ 16.6355"]
+            Sat_f64["f64 precision:<br/>sigmoid saturates to 1.0 at x ≈ 36.7368"]
+            Sat_Comp["⚠️ Between thresholds: f32 yields 1.0 while f64 yields 1.0 - eps.<br/>Gap multiplies state every step → compounds as O(L · u_f32)<br/>At L=8191: gap is ~8200 u_f32 (4.9e-4) — 4 orders above fixture bound!"]
+            Sat_f32 --> Sat_Comp
+            Sat_f64 --> Sat_Comp
+        end
+
+        subgraph Damping["State Recurrence Error Damping (K3: gdn_state.rs)"]
+            direction TB
+            Damp_Reassoc["Reassociation Divergence:<br/>Sequential vs PairwiseTree sum"]
+            Damp_Alpha["Decay Gate alpha &lt;= 1.0<br/>Errors multiply by prod(alpha) &lt;= 1"]
+            Damp_Bound["✅ Damped Geometric Sum: Error does NOT compound over sequence!<br/>Measured: 1.5 u_f64 at L=1 → 6.0 u_f64 at L=8191 (only 4.0× across 8191× steps)"]
+            Damp_Reassoc --> Damp_Alpha --> Damp_Bound
+        end
+    end
+```
 
 ### What K7's reference owns
 

@@ -10,31 +10,62 @@ Every GEMM invocation validates tensors, resolves layout orientations (NN, TN, N
 
 ```mermaid
 flowchart TD
-    Start["gemm(a, b, c, backend)"] --> Validate{"validate_gemm()<br/>Rank-2, Non-empty, Bounds &lt;= 2^31,<br/>Same Runtime, No In/Out Overlap"}
+    Start["gemm(a, b, c, backend) / gemm_epilogue() / gemm_batched()"] --> Validate{"validate_gemm()<br/>• Rank-2, Non-empty, Bounds &lt;= 2^31<br/>• 16-byte (or 64-byte coop) alignment<br/>• Same runtime, No In/Out overlap"}
     Validate -- Fail --> Err["Return Err(String)"]
-    Validate -- Pass --> BackendCheck{"Backend?"}
+    Validate -- Pass --> ModeCheck{"Call Variant?"}
 
-    BackendCheck -- SimdGroup --> SimdGroupKernel["matmul_simdgroup<br/>(Portable SIMD Fallback)"]
+    ModeCheck -- "gemm_batched()" --> Batched["gemm_batched()<br/>• Explicit BatchStrides<br/>• Stride-B=0 broadcasts weight<br/>• Strict 64-byte alignment"]
+    ModeCheck -- "gemm_epilogue()" --> EpiCheck{"Epilogue Requirements<br/>• BF16, F16 or Relaxed F32<br/>• TensorOps backend"}
+    EpiCheck -- No --> EpiErr["Return Err(Epilogue needs coop path)"]
+    EpiCheck -- Yes --> EpiDispatch["matmul2d_tensorops_*_epi<br/>• Accumulator in registers<br/>• In-register alpha*A@B + beta*C + bias<br/>• Row-stride-0 column bias broadcast<br/>• Clamped precise::tanh / SiLU"]
+    
+    ModeCheck -- "gemm()" --> BackendCheck{"Backend?"}
+
+    BackendCheck -- SimdGroup --> SimdGroupKernel["matmul_simdgroup / edges<br/>• Portable SIMDgroup Fallback<br/>• 16x16 / 32x32 tiles, device store"]
     BackendCheck -- TensorOps --> LayoutCheck{"Layout Resolution"}
 
     LayoutCheck -- "TN / NT Layout" --> SplitKCheck{"prefer_tn_splitk?<br/>(K &gt;= 2048, M,N &lt;= 384,<br/>min(M,N) &lt;= 128)"}
     SplitKCheck -- Yes --> SplitKKernel["matmul2d_tensorops_tn/nt_splitk_*<br/>(Split-K partial reductions)"]
-    SplitKCheck -- No --> CoopTN["matmul2d_tensorops_tn/nt_bf16_f32<br/>(128x64 sg4 Cooperative Destination)"]
+    SplitKCheck -- No --> CoopTN["matmul2d_tensorops_tn/nt_*_f32<br/>• 128x64 sg4 Cooperative Destination<br/>• Single store, zero host pre-zeroing"]
 
     LayoutCheck -- "NN Layout" --> PrecisionCheck{"Precision Mode"}
     
-    PrecisionCheck -- "f32 exact" --> F32Exact["matmul2d_tensorops_f32<br/>(Tile: 32x32, 1 simdgroup)"]
+    PrecisionCheck -- "f32 exact" --> F32Exact["matmul2d_tensorops_f32<br/>• Tile: 32x32, 1 simdgroup<br/>• Packed C-zero + matmul binder"]
     
-    PrecisionCheck -- "bf16 / tf32-relaxed" --> NNTable{"nn_coop_kernel()<br/>N &lt;= 512?"}
+    PrecisionCheck -- "bf16 / f16 / tf32-relaxed" --> NNTable{"nn_coop_kernel()<br/>N &lt;= 512?"}
     
     NNTable -- "N &lt;= 512 (Narrow)" --> NNNarrow["matmul2d_tensorops_*_64x64_sg4<br/>• TILE_COOP_NARROW (64x64, 4 simdgroups)<br/>• Register accumulator, cT.store<br/>• Edge bounds-checked slices"]
     
-    NNTable -- "N &gt; 512 (Default)" --> NNDefault["matmul2d_tensorops_*<br/>• TILE_COOP_DEFAULT (128x64, 4 simdgroups)<br/>• Column-panel swizzle if grid &gt;= 2048 tiles<br/>• Register accumulator, cT.store<br/>• Edge bounds-checked slices"]
+    NNTable -- "N &gt; 512 (Default)" --> NNDefault["matmul2d_tensorops_*<br/>• TILE_COOP_DEFAULT (128x64, 4 simdgroups)<br/>• 8-tile-row column swizzle if grid &gt;= 2048 tiles<br/>• Register accumulator, cT.store<br/>• Edge bounds-checked slices"]
 ```
 
 ---
 
 ## Two Accumulation Models
+
+```mermaid
+flowchart LR
+    subgraph Blocked["1. Blocked Accumulation (Legacy / Fallback)"]
+        direction TB
+        B_Loop["Loop over K in BK=256 chunks<br/>(e.g., 32 iterations for K=8192)"]
+        B_Read["Read C tile from Device Memory<br/>(67 MB working set at 4096²)"]
+        B_Compute["TensorOps Multiply / Accumulate"]
+        B_Write["Write C tile back to Device Memory"]
+        
+        B_Loop --> B_Read --> B_Compute --> B_Write --> B_Loop
+        B_Note["❌ O(K/BK) Memory Bandwidth Traffic<br/>Repeated read-modify-write passes thrash L2"]
+    end
+
+    subgraph Coop["2. Cooperative Destination Accumulation (tessl Production)"]
+        direction TB
+        C_Init["Initialize Accumulator in SIMDgroup Registers<br/>#pragma unroll: cT.set(i, 0.0f)"]
+        C_Loop["Loop over entire K dimension<br/>op.run(tA, tB, cT) in hardware registers"]
+        C_Store["Single Writeback to Device Memory<br/>cT.store(tC) at threadgroup exit"]
+        
+        C_Init --> C_Loop --> C_Store
+        C_Note["✅ O(1) Memory Bandwidth Traffic<br/>Zero host pre-zeroing · Exactly ONE write to C"]
+    end
+```
 
 ### 1. Blocked Accumulation (Legacy / Fallback)
 Loops over $K$ in $BK = 256$ chunks, accumulating into a **device-memory** $C$ tile. Block 0 uses `mode::multiply` (seeding $C$ to avoid host-side pre-zero passes); subsequent blocks use `mode::multiply_accumulate`.
@@ -79,6 +110,19 @@ In Round 2 optimization, cooperative destination registers were extended across 
 ### Column-Panel Grid Swizzling
 
 For large grids ($\text{tiles}_n \times \text{tiles}_m \ge 2048$), threadgroups are swizzled into 8-tile-row bands:
+
+```mermaid
+flowchart TD
+    subgraph Raster["Linear / Raster Traversal (Unbounded B-Cache Thrashing)"]
+        direction LR
+        L0["Row 0: Tiles (0,0) → (N-1,0)<br/>Streams all of Matrix B"] --> L1["Row 1: Tiles (0,1) → (N-1,1)<br/>B is evicted; Streams B again"] --> L2["... Row M-1: Evicts and re-reads B every row"]
+    end
+
+    subgraph Swizzled["Column-Panel 8-Row Swizzling (tiles_n × tiles_m ≥ 2048)"]
+        direction LR
+        S0["Band 0 (8 rows tall):<br/>Iterate col by col across 8 rows<br/>Matrix B tile stays warm in L2 cache!"] --> S1["Band 1 (Next 8 rows):<br/>Iterate col by col across next 8 rows"] --> S2["Bounds B re-reads to tiles_m / 8 passes<br/>(+11% throughput at 4096³)"]
+    end
+```
 
 ```metal
 if (tiles_n * tiles_m >= 2048u) {
@@ -154,6 +198,22 @@ parameter block stays at the call site.
 `gemm_epilogue` computes `C = activation(alpha * A@B + beta * C_prev + bias)`
 inside the cooperative-destination kernel, while the accumulator is still in
 registers.
+
+```mermaid
+flowchart LR
+    Acc["Cooperative Accumulator<br/>(in SIMDgroup registers)"] --> MulAlpha["Scale by alpha"]
+    Bias["Per-Column Bias (N)<br/>Row-stride-0 Tensor View"] --> LoadBias["Coop load (stride 0)"]
+    PrevC["C_prev (Device Memory)<br/>(skipped if beta == 0)"] --> MulBeta["Scale by beta"]
+    
+    MulAlpha --> Sum["In-Register Accumulation<br/>alpha*(A@B) + bias + beta*C_prev"]
+    LoadBias --> Sum
+    MulBeta --> Sum
+    
+    Sum --> Act{"Activation"}
+    Act -- Identity --> Store["Single Device Store<br/>cT.store(tC)"]
+    Act -- GeluTanh --> Gelu["Clamped precise::tanh<br/>(prevents NaN past |10|)"] --> Store
+    Act -- SiLU --> Silu["SiLU: x / (1 + exp(-x))"] --> Store
+```
 
 The saving is memory traffic, not arithmetic. Bias and activation as separate
 kernels each read all of `C` and write all of `C`; on a bandwidth-bound machine
@@ -240,3 +300,111 @@ Because Rust's type system cannot verify shader constants at compile time, [`scr
 1. Every Rust `TileGeom` matches the `constexpr int SM/SN` or macro arguments in Metal shaders.
 2. Every cooperative kernel is pinned in `NN_PAIRS` so no variable-dispatched pipeline escapes examination.
 3. 100% of all 15 compiled GEMM pipelines pass verification with 0 mismatches.
+
+---
+
+## Metal 4 Execution Model & Zero-Host-Wait Pipeline
+
+`tessl` avoids mid-step host stalls by maintaining an encoder lease across dispatches and executing through asynchronous command batches.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant Host as Host CPU (Caller)
+    participant RT as GpuRuntime (with_binder)
+    participant Enc as MTL4ComputeCommandEncoder
+    participant CB as MTL4CommandBuffer
+    participant GPU as Apple Silicon GPU
+    participant Evt as MTLSharedEvent
+
+    rect rgb(255, 245, 245)
+    Note over Host,Evt: Default Mode: Solo Submit (submit-and-wait floor: ~0.25 ms per dispatch)
+    Host->>RT: dispatch_op_1()
+    RT->>Enc: encode
+    RT->>CB: commit() &amp; waitUntilCompleted()
+    CB->>GPU: Execute
+    GPU-->>Host: Unblocks (Pays ~250 µs driver overhead)
+    end
+
+    rect rgb(240, 255, 240)
+    Note over Host,Evt: High-Throughput Mode: set_async_encode(true) (49x cheaper on elementwise)
+    Host->>RT: set_async_encode(true)
+    loop N Kernel Dispatches (e.g., Decode Layer Graph)
+        Host->>RT: with_binder(|bnd| { ... dispatch() })
+        RT->>Enc: Packed command encoding into active batch
+    end
+    Host->>RT: synchronize()
+    RT->>Enc: endEncoding()
+    RT->>CB: commit() with MTLSharedEvent signal
+    CB->>GPU: Pipelined GPU Execution
+    GPU-->>Evt: Signal event completion value
+    Evt-->>RT: Flush pending_cold_recycle &amp; pending_retirement
+    RT-->>Host: Return control to caller
+    end
+```
+
+---
+
+## Memory Allocation Lifecycle & Residency Pools
+
+Memory is partitioned into four explicit pools (`BufferKind`) to avoid mid-step memory stalls and heap fragmentation:
+
+```mermaid
+flowchart TD
+    subgraph AllocPools["tessl Buffer Allocation Pools (BufferKind)"]
+        HotPool["BufferKind::Hot<br/>• Model weights, KV cache, optimizer<br/>• Allocated via alloc_buffer_kind(..., Hot)"]
+        ColdPool["BufferKind::Cold<br/>• Intermediate layer activations<br/>• Active FreeList pool (2 GiB cap)"]
+        BumpPool["BufferKind::Bump<br/>• Ephemeral per-token scratch slabs<br/>• Sub-allocated views share slab"]
+        ExtPool["BufferKind::External<br/>• Caller-owned MTLBuffer<br/>• Wrapped via Tensor::from_mtl_buffer"]
+    end
+
+    subgraph Residency["Metal 4 Driver Residency (MTLResidencySet)"]
+        ResSet["MTLResidencySet<br/>(Device Working Set)"]
+    end
+
+    subgraph SyncLifecycle["Completion &amp; Recycling (MTLSharedEvent)"]
+        InFlight["In-Flight MTL4CommandBuffer"]
+        SharedEvent["MTLSharedEvent Signal"]
+        ColdFreeList["Cold FreeList Recycle<br/>(reused for future activations)"]
+        EvictMem["removeAllocation<br/>(evicted if cap exceeded)"]
+    end
+
+    HotPool -->|Registered at Init| ResSet
+    ExtPool -->|Registered for Lifetime| ResSet
+    ColdPool -->|Added to Working Set| ResSet
+    BumpPool -->|Slab Registered| ResSet
+
+    ColdPool -.->|Arc::drop mid-step| InFlight
+    InFlight -->|GPU finishes CB| SharedEvent
+    SharedEvent -->|pending_cold_recycle| ColdFreeList
+    ColdFreeList -->|Pool overflow &gt; 2 GiB| EvictMem
+    HotPool -.->|Final Arc::drop| SharedEvent
+    SharedEvent -->|pending_retirement| ResSet
+```
+
+---
+
+## Indirect Command Buffer (ICB) & Dual-Slot Replay State Machine
+
+For low-latency autoregressive generation, `DecodeIcb` captures graph commands once and executes them via indirect command buffers with ping-pong command buffers.
+
+```mermaid
+stateDiagram-v2
+    [*] --> Idle: Runtime Initialized
+
+    state "Recording / Capture Phase" as Capture {
+        Idle --> Capturing: begin_decode_icb_capture()
+        Capturing --> RecordingCommands: with_binder dispatches
+        RecordingCommands --> RecordingCommands: Record PSO, ArgTable, Buffers
+        RecordingCommands --> BakingTape: take_decode_icb_capture()
+        BakingTape --> ICBReady: Encode into MTLIndirectCommandBuffer<br/>(Freeze-binds &amp; Range-batching)
+    }
+
+    state "Steady-State Replay Phase" as Replay {
+        ICBReady --> SlotA: try_replay_icb() (Slot 0)
+        SlotA --> PingPongWait: Submit CB 0 with SharedEvent
+        PingPongWait --> SlotB: Next token: Replay into Slot 1
+        SlotB --> PingPongWait: Submit CB 1 with SharedEvent
+        PingPongWait --> SlotA: Recycle Slot 0 Allocator
+    }
+```

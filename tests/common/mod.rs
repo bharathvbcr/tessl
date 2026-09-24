@@ -55,11 +55,15 @@ pub fn with_two_gpus<R>(f: impl FnOnce(&Arc<GpuRuntime>, &Arc<GpuRuntime>) -> R)
 }
 
 /// splitmix64 — a deterministic stream so a failure reproduces exactly.
-pub struct Rng(u64);
+///
+/// Named apart from the stress-test `Rng` in `src/gemm.rs`. Those two
+/// generators are different functions; sharing the type name left both
+/// `new` and `unit` unbound.
+pub struct SplitMix(u64);
 
-impl Rng {
+impl SplitMix {
     pub fn new(seed: u64) -> Self {
-        Rng(seed ^ 0x9e37_79b9_7f4a_7c15)
+        SplitMix(seed ^ 0x9e37_79b9_7f4a_7c15)
     }
 
     fn next_u64(&mut self) -> u64 {
@@ -78,8 +82,8 @@ impl Rng {
 }
 
 pub fn random_f32(n: usize, seed: u64) -> Vec<f32> {
-    let mut rng = Rng::new(seed);
-    (0..n).map(|_| rng.unit()).collect()
+    let mut rng = SplitMix::new(seed);
+    (0..n).map(|_| SplitMix::unit(&mut rng)).collect()
 }
 
 /// Round through bf16 and back, so the CPU reference sees exactly the operands

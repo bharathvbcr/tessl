@@ -27,10 +27,13 @@ using namespace metal;
 constant uint ROPE_SIMD_WIDTH = 32u;
 
 /// Normalize one head row in place and, when `rotate`, apply RoPE to its
-/// first `rotary_dim` lanes. With `STORE`, every rewritten element is also
+/// first `rotary_dim` lanes. With `store`, every rewritten element is also
 /// written to `dst` at the same index (the fused KV-cache store), straight
 /// from the register that holds it, so no lane re-reads what another wrote.
-template <bool STORE>
+///
+/// `store` is a value, not a template argument: both callers pass a literal,
+/// and an `inline` literal still constant-folds the stores away on the
+/// scratch-only path.
 inline void norm_rope_row(
     device float *row,
     device const float *weight,
@@ -41,7 +44,8 @@ inline void norm_rope_row(
     float theta,
     float eps,
     bool rotate,
-    uint lane)
+    uint lane,
+    bool store)
 {
     float ss = 0.0f;
     for (uint d = lane; d < D; d += ROPE_SIMD_WIDTH) {
@@ -76,7 +80,7 @@ inline void norm_rope_row(
         }
         row[p] = x0;
         row[p + half_dim] = x1;
-        if (STORE) {
+        if (store) {
             dst[p] = x0;
             dst[p + half_dim] = x1;
         }
@@ -85,7 +89,7 @@ inline void norm_rope_row(
         // The odd tail element pairs with nothing and is never rotated.
         const float tail = row[D - 1u] * inv * weight[D - 1u];
         row[D - 1u] = tail;
-        if (STORE) {
+        if (store) {
             dst[D - 1u] = tail;
         }
     }
@@ -129,8 +133,8 @@ kernel void rms_qkv_rope(
         const ulong t = gid64 / (ulong)Hq;
         const ulong h = gid64 % (ulong)Hq;
         device float *row = q + ((t * (ulong)Hq + h) * (ulong)D);
-        norm_rope_row<false>(row, q_weight, row, D, rotary_dim,
-                             (ulong)pos_offset + t, theta, eps, true, lane);
+        norm_rope_row(row, q_weight, row, D, rotary_dim,
+                             (ulong)pos_offset + t, theta, eps, true, lane, false);
         return;
     }
     ulong g2 = gid64 - total_q;
@@ -138,8 +142,8 @@ kernel void rms_qkv_rope(
         const ulong t = g2 / (ulong)Hkv;
         const ulong h = g2 % (ulong)Hkv;
         device float *row = k + ((t * (ulong)Hkv + h) * (ulong)D);
-        norm_rope_row<false>(row, k_weight, row, D, rotary_dim,
-                             (ulong)pos_offset + t, theta, eps, true, lane);
+        norm_rope_row(row, k_weight, row, D, rotary_dim,
+                             (ulong)pos_offset + t, theta, eps, true, lane, false);
         return;
     }
     g2 -= total_kv;
@@ -148,8 +152,8 @@ kernel void rms_qkv_rope(
         const ulong h = g2 % (ulong)Hkv;
         device float *row = v + ((t * (ulong)Hkv + h) * (ulong)D);
         // V-norm: weight RMS only, no RoPE, no attn scale.
-        norm_rope_row<false>(row, v_weight, row, D, rotary_dim,
-                             0ul, theta, eps, false, lane);
+        norm_rope_row(row, v_weight, row, D, rotary_dim,
+                             0ul, theta, eps, false, lane, false);
     }
 }
 
@@ -186,8 +190,8 @@ kernel void rms_qkv_rope_posbuf(
         const ulong t = gid64 / (ulong)Hq;
         const ulong h = gid64 % (ulong)Hq;
         device float *row = q + ((t * (ulong)Hq + h) * (ulong)D);
-        norm_rope_row<false>(row, q_weight, row, D, rotary_dim,
-                             pos_offset + t, theta, eps, true, lane);
+        norm_rope_row(row, q_weight, row, D, rotary_dim,
+                             pos_offset + t, theta, eps, true, lane, false);
         return;
     }
     ulong g2 = gid64 - total_q;
@@ -195,8 +199,8 @@ kernel void rms_qkv_rope_posbuf(
         const ulong t = g2 / (ulong)Hkv;
         const ulong h = g2 % (ulong)Hkv;
         device float *row = k + ((t * (ulong)Hkv + h) * (ulong)D);
-        norm_rope_row<false>(row, k_weight, row, D, rotary_dim,
-                             pos_offset + t, theta, eps, true, lane);
+        norm_rope_row(row, k_weight, row, D, rotary_dim,
+                             pos_offset + t, theta, eps, true, lane, false);
         return;
     }
     g2 -= total_kv;
@@ -204,8 +208,8 @@ kernel void rms_qkv_rope_posbuf(
         const ulong t = g2 / (ulong)Hkv;
         const ulong h = g2 % (ulong)Hkv;
         device float *row = v + ((t * (ulong)Hkv + h) * (ulong)D);
-        norm_rope_row<false>(row, v_weight, row, D, rotary_dim,
-                             0ul, theta, eps, false, lane);
+        norm_rope_row(row, v_weight, row, D, rotary_dim,
+                             0ul, theta, eps, false, lane, false);
     }
 }
 
@@ -256,8 +260,8 @@ kernel void rms_qkv_rope_kv_store(
         const ulong t = gid64 / (ulong)Hq;
         const ulong h = gid64 % (ulong)Hq;
         device float *row = q + ((t * (ulong)Hq + h) * (ulong)D);
-        norm_rope_row<false>(row, q_weight, row, D, rotary_dim,
-                             pos_offset + t, theta, eps, true, lane);
+        norm_rope_row(row, q_weight, row, D, rotary_dim,
+                             pos_offset + t, theta, eps, true, lane, false);
         return;
     }
     ulong g2 = gid64 - total_q;
@@ -266,8 +270,8 @@ kernel void rms_qkv_rope_kv_store(
         const ulong h = g2 % (ulong)Hkv;
         device float *row = k + ((t * (ulong)Hkv + h) * (ulong)D);
         device float *dst = dst_k + (kv_dst_offset + (t * (ulong)Hkv + h) * (ulong)D);
-        norm_rope_row<true>(row, k_weight, dst, D, rotary_dim,
-                            pos_offset + t, theta, eps, true, lane);
+        norm_rope_row(row, k_weight, dst, D, rotary_dim,
+                            pos_offset + t, theta, eps, true, lane, true);
         return;
     }
     g2 -= total_kv;
@@ -276,7 +280,7 @@ kernel void rms_qkv_rope_kv_store(
         const ulong h = g2 % (ulong)Hkv;
         device float *row = v + ((t * (ulong)Hkv + h) * (ulong)D);
         device float *dst = dst_v + (kv_dst_offset + (t * (ulong)Hkv + h) * (ulong)D);
-        norm_rope_row<true>(row, v_weight, dst, D, rotary_dim,
-                            0ul, theta, eps, false, lane);
+        norm_rope_row(row, v_weight, dst, D, rotary_dim,
+                            0ul, theta, eps, false, lane, true);
     }
 }

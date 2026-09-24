@@ -2265,8 +2265,8 @@ mod stress_tests {
             PrecisionMode::F32
         });
 
-        let a_host: Vec<f32> = (0..m * k).map(|_| rng.unit()).collect();
-        let b_host: Vec<f32> = (0..n * k).map(|_| rng.unit()).collect();
+        let a_host: Vec<f32> = (0..m * k).map(|_| Rng::unit(rng)).collect();
+        let b_host: Vec<f32> = (0..n * k).map(|_| Rng::unit(rng)).collect();
         // bf16 paths: reference on the same RNE-rounded values the GPU consumes,
         // so the only remaining divergence is f32 accumulation order.
         let (a_ref, b_ref) = if bf16 {
@@ -2459,8 +2459,8 @@ mod stress_tests {
                     let m_ = m;
                     let n_ = n;
                     let k_ = k;
-                    let a_host: Vec<f32> = (0..m_ * k_).map(|_| case_rng.unit()).collect();
-                    let b_host: Vec<f32> = (0..n_ * k_).map(|_| case_rng.unit()).collect();
+                    let a_host: Vec<f32> = (0..m_ * k_).map(|_| Rng::unit(&mut case_rng)).collect();
+                    let b_host: Vec<f32> = (0..n_ * k_).map(|_| Rng::unit(&mut case_rng)).collect();
                     let bf16 = matches!(family, Family::NnRawBf16);
                     rt.set_precision(if bf16 {
                         PrecisionMode::Bf16
@@ -2522,8 +2522,8 @@ mod stress_tests {
             } else {
                 PrecisionMode::F32
             });
-            let a_host: Vec<f32> = (0..m * k).map(|_| rng.unit()).collect();
-            let b_host: Vec<f32> = (0..k * n).map(|_| rng.unit()).collect();
+            let a_host: Vec<f32> = (0..m * k).map(|_| Rng::unit(&mut rng)).collect();
+            let b_host: Vec<f32> = (0..k * n).map(|_| Rng::unit(&mut rng)).collect();
             let (a_ref, b_ref) = if bf16 {
                 (round_bf16(&a_host), round_bf16(&b_host))
             } else {
@@ -2578,8 +2578,8 @@ mod stress_tests {
         // 4096x4096 with 128x64 tiles = 64*32 = 2048 tiles: swizzle ON.
         // The ragged twin keeps the same grid with edge tiles in play.
         for (m, n, k) in [(4096usize, 4096usize, 64usize), (4095, 4033, 65)] {
-            let a_host: Vec<f32> = (0..m * k).map(|_| rng.unit()).collect();
-            let b_host: Vec<f32> = (0..k * n).map(|_| rng.unit()).collect();
+            let a_host: Vec<f32> = (0..m * k).map(|_| Rng::unit(&mut rng)).collect();
+            let b_host: Vec<f32> = (0..k * n).map(|_| Rng::unit(&mut rng)).collect();
             let a_ref = round_bf16(&a_host);
             let b_ref = round_bf16(&b_host);
             let a = upload(&rt, &mut rng, &[m, k], &a_host, true);

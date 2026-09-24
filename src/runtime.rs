@@ -659,7 +659,7 @@ impl GpuRuntime {
             info.pool_cache_cap = bytes;
         }
         if let Ok(mut pool) = self.pool.lock() {
-            pool.set_max_cache_bytes(bytes);
+            BufferPool::set_max_cache_bytes(&mut pool, bytes);
         }
     }
 
@@ -774,7 +774,7 @@ impl GpuRuntime {
         self.flush_residency();
         for (buf, _nbytes) in cold {
             if let Ok(mut pool) = self.pool.lock() {
-                pool.recycle(buf);
+                BufferPool::recycle(&mut pool, buf);
             }
         }
         drop(retired);
@@ -890,7 +890,7 @@ impl GpuRuntime {
         }
         let overlays = self.overlay_libraries.lock().map_err(|e| e.to_string())?;
         let mut cache = self.pipelines.lock().map_err(|e| e.to_string())?;
-        cache.get_or_create(&self.device, &self.library, &overlays, name)
+        PipelineCache::get_or_create(&mut cache, &self.device, &self.library, &overlays, name)
     }
 
     /// Snapshot of overlay metallibs (for ICB pipeline construction).
@@ -921,7 +921,7 @@ impl GpuRuntime {
             crate::infer_trace::on_cold_alloc();
         }
         let mut pool = self.pool.lock().map_err(|e| e.to_string())?;
-        let (buffer, _from_pool) = pool.alloc(&self.device, nbytes)?;
+        let (buffer, _from_pool) = BufferPool::alloc(&mut pool, &self.device, nbytes)?;
         // Always (re)register — freelist buffers were removed on recycle.
         self.register_residency(&buffer);
         let weak = self.self_weak.lock().map(|g| g.clone()).unwrap_or_default();

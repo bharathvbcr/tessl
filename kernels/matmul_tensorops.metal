@@ -391,7 +391,7 @@ static inline float gemm_gelu_tanh(float x) {
     return 0.5f * xc * (1.0f + t);
 }
 
-static inline float gemm_apply_activation(float v, uint act) {
+static inline float gemm_apply_activation(float v, GemmActivation act) {
     switch (act) {
         case GEMM_ACT_RELU: return fmax(v, 0.0f);
         case GEMM_ACT_GELU_TANH: return gemm_gelu_tanh(v);
@@ -401,7 +401,10 @@ static inline float gemm_apply_activation(float v, uint act) {
     }
 }
 
-template <typename ElemT, int SM, int SN, int NSG, bool RELAXED, bool EPILOGUE>
+// A call with no explicit template arguments is the production geometry:
+// 128×64, sg4, strict, no epilogue (`matmul2d_tensorops_bf16_f32`).
+template <typename ElemT, int SM = 128, int SN = 64, int NSG = 4,
+          bool RELAXED = false, bool EPILOGUE = false>
 inline void mm_nn_coop_f32acc(device ElemT *A, device ElemT *B, device float *C,
                               uint M, uint N, uint K, uint tiles_n,
                               uint tiles_m, uint tgpig,
@@ -479,7 +482,7 @@ inline void mm_nn_coop_f32acc(device ElemT *A, device ElemT *B, device float *C,
             if (act != GEMM_ACT_NONE) {
 #pragma clang loop unroll(full)
                 for (uint16_t i = 0; i < cT.get_capacity(); ++i)
-                    if (cT.is_valid_element(i)) cT[i] = gemm_apply_activation(cT[i], act);
+                    if (cT.is_valid_element(i)) cT[i] = gemm_apply_activation(cT[i], (GemmActivation)act);
             }
         }
         cT.store(tC);
@@ -528,7 +531,7 @@ inline void mm_nn_coop_f32acc(device ElemT *A, device ElemT *B, device float *C,
             if (act != GEMM_ACT_NONE) {
 #pragma clang loop unroll(full)
                 for (uint16_t i = 0; i < cT.get_capacity(); ++i)
-                    if (cT.is_valid_element(i)) cT[i] = gemm_apply_activation(cT[i], act);
+                    if (cT.is_valid_element(i)) cT[i] = gemm_apply_activation(cT[i], (GemmActivation)act);
             }
         }
         cT.store(tC);
@@ -549,7 +552,21 @@ inline void mm_nn_coop_f32acc(device ElemT *A, device ElemT *B, device float *C,
             A, B, C, M, N, K, tiles_n, tiles_m, tgpig, nullptr, 1.0f, 0.0f, 0u);\
     }
 
-NN_COOP_KERNEL(matmul2d_tensorops_bf16_f32,            bfloat, 128, 64, 4, false)
+// Written out, rather than stamped by NN_COOP_KERNEL, so the helper is called
+// with no template argument list. The defaults above are this kernel.
+kernel void matmul2d_tensorops_bf16_f32(
+    device bfloat *A [[buffer(0)]],
+    device bfloat *B [[buffer(1)]],
+    device float *C [[buffer(2)]],
+    constant uint &M [[buffer(3)]],
+    constant uint &N [[buffer(4)]],
+    constant uint &K [[buffer(5)]],
+    constant uint &tiles_n [[buffer(6)]],
+    constant uint &tiles_m [[buffer(7)]],
+    uint tgpig [[threadgroup_position_in_grid]]) {
+    mm_nn_coop_f32acc(A, B, C, M, N, K, tiles_n, tiles_m, tgpig, nullptr, 1.0f,
+                      0.0f, 0u);
+}
 NN_COOP_KERNEL(matmul2d_tensorops_bf16_f32_64x64_sg4,  bfloat,  64, 64, 4, false)
 NN_COOP_KERNEL(matmul2d_tensorops_f32_relaxed,            float, 128, 64, 4, true)
 NN_COOP_KERNEL(matmul2d_tensorops_f32_relaxed_64x64_sg4,  float,  64, 64, 4, true)
@@ -578,7 +595,9 @@ NN_COOP_KERNEL(matmul2d_tensorops_f32_relaxed_64x64_sg4,  float,  64, 64, 4, tru
 ///
 /// `b_scale` is per output column, which is where a per-channel weight scale
 /// lives. It is read through the row-stride-0 broadcast the epilogue uses.
-template <int SM, int SN, int NSG>
+// A call with no explicit template arguments is 128×64 sg4
+// (`matmul2d_tensorops_i8_f32`).
+template <int SM = 128, int SN = 64, int NSG = 4>
 inline void mm_i8_dequant_coop(device int8_t *A, device int8_t *B, device float *C,
                                device const float *b_scale, float a_scale,
                                uint M, uint N, uint K, uint tiles_n,
@@ -630,25 +649,22 @@ inline void mm_i8_dequant_coop(device int8_t *A, device int8_t *B, device float 
     outT.store(tC);
 }
 
-#define I8_DEQUANT_KERNEL(NAME, SM, SN, NSG)                                   \
-    kernel void NAME(device int8_t *A [[buffer(0)]],                           \
-                     device int8_t *B [[buffer(1)]],                           \
-                     device float *C [[buffer(2)]],                            \
-                     constant uint &M [[buffer(3)]],                           \
-                     constant uint &N [[buffer(4)]],                           \
-                     constant uint &K [[buffer(5)]],                           \
-                     constant uint &tiles_n [[buffer(6)]],                     \
-                     constant uint &tiles_m [[buffer(7)]],                     \
-                     device const float *b_scale [[buffer(8)]],                \
-                     constant float &a_scale [[buffer(9)]],                    \
-                     constant uint &has_scale [[buffer(10)]],                  \
-                     uint tgpig [[threadgroup_position_in_grid]]) {            \
-        mm_i8_dequant_coop<SM, SN, NSG>(A, B, C, has_scale ? b_scale : nullptr,\
-                                        a_scale, M, N, K, tiles_n, tiles_m,    \
-                                        tgpig);                                \
-    }
-
-I8_DEQUANT_KERNEL(matmul2d_tensorops_i8_f32, 128, 64, 4)
+kernel void matmul2d_tensorops_i8_f32(
+    device int8_t *A [[buffer(0)]],
+    device int8_t *B [[buffer(1)]],
+    device float *C [[buffer(2)]],
+    constant uint &M [[buffer(3)]],
+    constant uint &N [[buffer(4)]],
+    constant uint &K [[buffer(5)]],
+    constant uint &tiles_n [[buffer(6)]],
+    constant uint &tiles_m [[buffer(7)]],
+    device const float *b_scale [[buffer(8)]],
+    constant float &a_scale [[buffer(9)]],
+    constant uint &has_scale [[buffer(10)]],
+    uint tgpig [[threadgroup_position_in_grid]]) {
+    mm_i8_dequant_coop(A, B, C, has_scale ? b_scale : nullptr, a_scale, M, N, K,
+                       tiles_n, tiles_m, tgpig);
+}
 
 /// Strided batched NN GEMM.
 ///

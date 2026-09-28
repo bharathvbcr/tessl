@@ -11,6 +11,9 @@
 /// GDN kernels. Pure arithmetic, no GPU, so it runs on any host.
 pub mod gdn;
 
+/// f64 references for the Qwen3.5 kernels, anchored to transformers by fixture.
+pub mod qwen35;
+
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use tessl::tensor::{bf16_bits_to_f32, f32_slice_to_bf16, GpuBuffer};

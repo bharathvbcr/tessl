@@ -23,6 +23,9 @@ const ATTN_ROWS: &str = include_str!("../kernels/flash_attn_rows.metal");
 const ATTN_SWA_128: &str = include_str!("../kernels/flash_attn_swa_h128.metal");
 const ATTN_SWA_256: &str = include_str!("../kernels/flash_attn_swa_h256.metal");
 const ATTN_GLOBAL: &str = include_str!("../kernels/flash_attn_global_h512.metal");
+const QWEN35_GDN: &str = include_str!("../kernels/qwen35_gdn.metal");
+const QWEN35_ATTN: &str = include_str!("../kernels/qwen35_attn.metal");
+const QWEN35_SCORE: &str = include_str!("../kernels/qwen35_score.metal");
 
 /// Every `.metal` file this suite inspects.
 ///
@@ -42,6 +45,9 @@ const INSPECTED_KERNELS: &[&str] = &[
     "gemv_q8.metal",
     "kv_store.metal",
     "matmul_simdgroup.metal",
+    "qwen35_attn.metal",
+    "qwen35_gdn.metal",
+    "qwen35_score.metal",
     "reduce.metal",
     "rms_norm.metal",
     "rms_qkv_rope.metal",
@@ -261,6 +267,72 @@ fn strided_shader_scans_cannot_roll_over_to_zero() {
         "for (uint i = lane; i < group_size; i += Q8_SIMD_SIZE)",
         "Q8 scalar group scan",
     );
+}
+
+/// The Qwen3.5 kernels read the fused projection in place, so their row stride
+/// is the projection's full width — about 12.5k columns for a GDN layer at
+/// Qwen3.5's small sizes — and a row offset is `row * ld`. At an 8k-token
+/// prefill that is 1e8 elements per sequence, so a batch of 43 crosses
+/// `u32::MAX`, and a wrapped offset reads another sequence's activations
+/// without faulting. Every row offset widens before it multiplies.
+#[test]
+fn qwen35_row_offsets_are_widened_before_multiplication() {
+    let rows = 43u32 * 8192;
+    let ld = 12_544u32;
+    assert!(rows.checked_mul(ld).is_none());
+
+    for (label, source, widened) in [
+        ("GDN conv input", QWEN35_GDN, "(ulong)b * T * (ulong)ld_x"),
+        (
+            "GDN q/k/v rows",
+            QWEN35_GDN,
+            "((ulong)b * T + t) * (ulong)ld_qkv",
+        ),
+        (
+            "GDN chunk output",
+            QWEN35_GDN,
+            "((ulong)b * T + t) * (ulong)ld_out",
+        ),
+        (
+            "GDN recurrent row",
+            QWEN35_GDN,
+            "const ulong row = (ulong)b * T + t;",
+        ),
+        (
+            "GDN workspace row",
+            QWEN35_GDN,
+            "const ulong row_base = head * tp + t0;",
+        ),
+        ("gated norm x", QWEN35_GDN, "r * (ulong)ld_x"),
+        ("gated norm z", QWEN35_GDN, "r * (ulong)ld_z"),
+        ("attention projection", QWEN35_ATTN, "p + r * (ulong)ld_p"),
+        ("attention gate", QWEN35_ATTN, "(ulong)r * ld_p"),
+        (
+            "attention cache slot",
+            QWEN35_ATTN,
+            "(((ulong)b * kv_capacity + pos) * Hkv + h) * (ulong)D",
+        ),
+        (
+            "scoring row",
+            QWEN35_SCORE,
+            "(ulong)(row_ok ? row : 0u) * hidden",
+        ),
+        (
+            "scoring LM head row",
+            QWEN35_SCORE,
+            "(ulong)(ok ? tok : 0u) * hidden",
+        ),
+    ] {
+        require(source, widened, label);
+    }
+    for (label, source, narrow) in [
+        ("GDN q/k/v rows", QWEN35_GDN, "(b * T + t) * ld_qkv"),
+        ("GDN chunk output", QWEN35_GDN, "(b * T + t) * ld_out"),
+        ("attention gate", QWEN35_ATTN, "p[r * ld_p"),
+        ("scoring row", QWEN35_SCORE, "row * hidden"),
+    ] {
+        forbid(source, narrow, label);
+    }
 }
 
 /// The KV cache is where a `u32` product is actually reachable.

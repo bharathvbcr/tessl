@@ -1,0 +1,1524 @@
+//! Numeric tests for the Qwen3.5 kernels (`tessl::qwen35`).
+//!
+//! Three layers of evidence, from the model down:
+//!
+//! 1. **The references are transformers.** `tests/fixtures/qwen35/` holds goldens
+//!    that `scripts/gen_qwen35_fixtures.py` generated from
+//!    `transformers.models.qwen3_5` itself. The first tests hold the f64
+//!    references in `common::qwen35` to them, with no GPU involved.
+//! 2. **The kernels match the references**, on the fixtures and on randomized
+//!    shapes chosen for their edges: T = 1, T one either side of the 64-row
+//!    chunk, grouped heads, a shared snapshot, strong decay, strided windows.
+//! 3. **They compose**: a chunked prefill followed by recurrent decode steps
+//!    equals the recurrence over the whole sequence, and likewise for the conv.
+//!
+//! The same kernels are also checked, off-device, by
+//! `tools/msl_emu/check_qwen35.py`, which runs their source on a CPU emulator
+//! against transformers directly.
+//!
+//! The error bound is relative to the output's magnitude: `1e-4 * max|y|`. The
+//! kernels land around `1e-6` relative (the emulator measures them next to
+//! transformers' own fp32 error), and every defect the mutation run injected
+//! moved the output by more than `1e-2` relative, so the bound sits two orders
+//! from each.
+
+mod common;
+
+use std::sync::Arc;
+
+use common::qwen35::*;
+use common::{buf, random_f32, seeded, with_gpu};
+use tessl::qwen35::{
+    self, AttnProjLayout, AttnShape, AttnTargets, Cols, GdnDims, GdnGateLogits, GdnParams,
+    GdnProjLayout, GdnQkv, GdnWorkspace, LmHead, OutCols, StateIn,
+};
+use tessl::tensor::{bf16_bits_to_f32, f32_slice_to_bf16, DType, GpuBuffer};
+use tessl::{GemmBackend, GpuRuntime};
+
+/// Written to every output before a kernel runs, so an element it never wrote
+/// is visible as such.
+const SENTINEL: f32 = -7.25e27;
+
+fn max_abs(v: &[f64]) -> f64 {
+    v.iter().fold(0.0, |m, x| m.max(x.abs()))
+}
+
+fn assert_close(label: &str, got: &[f32], want: &[f64], atol: f64) {
+    assert_eq!(got.len(), want.len(), "{label}: length");
+    let mut worst = (0.0f64, 0usize);
+    for (i, (&g, &w)) in got.iter().zip(want).enumerate() {
+        assert!(g != SENTINEL, "{label}[{i}]: never written");
+        assert!(g.is_finite(), "{label}[{i}]: non-finite {g}");
+        let e = (f64::from(g) - w).abs();
+        if e > worst.0 {
+            worst = (e, i);
+        }
+    }
+    assert!(
+        worst.0 <= atol,
+        "{label}: max err {:.3e} at {} (got {} want {}), bound {atol:.3e}",
+        worst.0,
+        worst.1,
+        got[worst.1],
+        want[worst.1]
+    );
+}
+
+/// The magnitude-relative bound this file holds every GDN output to.
+fn rel_bound(want: &[f64]) -> f64 {
+    1e-4 * max_abs(want).max(1e-3)
+}
+
+fn read_bf16(b: &GpuBuffer, n: usize) -> Vec<f32> {
+    b.contents_u16()[..n]
+        .iter()
+        .map(|&x| bf16_bits_to_f32(x))
+        .collect()
+}
+
+fn u32_buf(rt: &Arc<GpuRuntime>, v: &[u32]) -> GpuBuffer {
+    let b = rt.alloc_buffer(v.len().max(1) * 4).unwrap();
+    b.write_u32(v);
+    b
+}
+
+// ------------------------------------------------ 1. references vs transformers ---
+
+struct GdnData {
+    s: GdnShape,
+    q: Vec<f32>,
+    k: Vec<f32>,
+    v: Vec<f32>,
+    a: Vec<f32>,
+    b: Vec<f32>,
+    a_log: Vec<f32>,
+    dt_bias: Vec<f32>,
+    state0: Option<Vec<f32>>,
+    snapshot: bool,
+}
+
+impl GdnData {
+    fn problem(&self) -> GdnProblem<'_> {
+        GdnProblem {
+            s: self.s,
+            q: &self.q,
+            k: &self.k,
+            v: &self.v,
+            a: &self.a,
+            b: &self.b,
+            a_log: &self.a_log,
+            dt_bias: &self.dt_bias,
+            state0: self.state0.as_deref(),
+            snapshot: self.snapshot,
+        }
+    }
+
+    fn fixture() -> Self {
+        let (qs, q) = load_f32("gdn_q");
+        let (vs, v) = load_f32("gdn_v");
+        Self {
+            s: GdnShape {
+                b: qs[0],
+                t: qs[1],
+                hk: qs[2],
+                hv: vs[2],
+                dv: vs[3],
+            },
+            q,
+            k: load_f32("gdn_k").1,
+            v,
+            a: load_f32("gdn_a").1,
+            b: load_f32("gdn_b").1,
+            a_log: load_f32("gdn_a_log").1,
+            dt_bias: load_f32("gdn_dt_bias").1,
+            state0: Some(load_f32("gdn_state0").1),
+            snapshot: false,
+        }
+    }
+
+    fn random(s: GdnShape, state: &str, seed: u64) -> Self {
+        let scale = |v: Vec<f32>, k: f32| v.into_iter().map(|x| x * k).collect::<Vec<_>>();
+        let state0 = match state {
+            "batch" => Some(scale(random_f32(s.b * s.hv * DK * s.dv, seed + 7), 0.1)),
+            "snapshot" => Some(scale(random_f32(s.hv * DK * s.dv, seed + 7), 0.1)),
+            _ => None,
+        };
+        Self {
+            s,
+            q: random_f32(s.b * s.t * s.hk * DK, seed),
+            k: random_f32(s.b * s.t * s.hk * DK, seed + 1),
+            v: random_f32(s.b * s.t * s.hv * s.dv, seed + 2),
+            a: scale(random_f32(s.b * s.t * s.hv, seed + 3), 2.0),
+            b: scale(random_f32(s.b * s.t * s.hv, seed + 4), 2.0),
+            // A_log in [-2, 1], dt_bias in [-1, 1].
+            a_log: random_f32(s.hv, seed + 5)
+                .into_iter()
+                .map(|x| -0.5 + 1.5 * x)
+                .collect(),
+            dt_bias: random_f32(s.hv, seed + 6),
+            state0,
+            snapshot: state == "snapshot",
+        }
+    }
+}
+
+#[test]
+fn gdn_reference_matches_transformers() {
+    let d = GdnData::fixture();
+    let (y, st) = gdn_f64(&d.problem());
+    let (_, y64) = load("gdn_y_f64");
+    let (_, st64) = load("gdn_state_f64");
+    let (_, yhf) = load("gdn_y_hf");
+    let diff =
+        |a: &[f64], b: &[f64]| max_abs(&a.iter().zip(b).map(|(x, y)| x - y).collect::<Vec<_>>());
+    // Same arithmetic in the same precision: agreement to rounding.
+    assert!(
+        diff(&y, &y64) < 1e-12,
+        "y vs f64 golden: {:e}",
+        diff(&y, &y64)
+    );
+    assert!(
+        diff(&st, &st64) < 1e-12,
+        "state vs f64 golden: {:e}",
+        diff(&st, &st64)
+    );
+    // transformers' own fp32 chunked run: measured 2.6e-8 at generation.
+    assert!(
+        diff(&y, &yhf) < 1e-6,
+        "y vs transformers fp32: {:e}",
+        diff(&y, &yhf)
+    );
+}
+
+#[test]
+fn rope_reference_matches_transformers() {
+    let (qs, q) = load_f32("rope_q_in");
+    let (_, k) = load_f32("rope_k_in");
+    let (_, qw) = load_f32("rope_q_norm_w");
+    let (_, kw) = load_f32("rope_k_norm_w");
+    let (_, qo) = load("rope_q_out");
+    let (_, ko) = load("rope_k_out");
+    let (t, hq, d) = (qs[1], qs[2], qs[3]);
+    for ti in 0..t {
+        let pos = 20_000 + ti as u64;
+        for h in 0..hq {
+            let row = (ti * hq + h) * d;
+            let got = norm_rope_row_f64(&q[row..row + d], &qw, 64, pos, 1e7, 1e-6);
+            for i in 0..d {
+                assert!((got[i] - qo[row + i]).abs() < 5e-6, "q t{ti} h{h} [{i}]");
+            }
+        }
+        let got = norm_rope_row_f64(&k[ti * d..(ti + 1) * d], &kw, 64, pos, 1e7, 1e-6);
+        for i in 0..d {
+            assert!((got[i] - ko[ti * d + i]).abs() < 5e-6, "k t{ti} [{i}]");
+        }
+    }
+}
+
+// -------------------------------------------------------------- GDN on device ---
+
+/// The operands packed as the kernels read them: q|k|v in one strided buffer
+/// (as the conv writes them, plus padding columns), a|b in another.
+struct Packed {
+    qkv: GpuBuffer,
+    ld: u32,
+    gates: GpuBuffer,
+    g_ld: u32,
+    a_log: GpuBuffer,
+    dt_bias: GpuBuffer,
+    key_w: u32,
+}
+
+impl Packed {
+    fn new(rt: &Arc<GpuRuntime>, d: &GdnData) -> Self {
+        let GdnShape { b, t, hk, hv, dv } = d.s;
+        let key_w = hk * DK;
+        let ld = 1 + 2 * key_w + hv * dv + 4;
+        let mut qkv = vec![SENTINEL; b * t * ld];
+        for r in 0..b * t {
+            let row = &mut qkv[r * ld..(r + 1) * ld];
+            row[1..1 + key_w].copy_from_slice(&d.q[r * key_w..(r + 1) * key_w]);
+            row[1 + key_w..1 + 2 * key_w].copy_from_slice(&d.k[r * key_w..(r + 1) * key_w]);
+            row[1 + 2 * key_w..1 + 2 * key_w + hv * dv]
+                .copy_from_slice(&d.v[r * hv * dv..(r + 1) * hv * dv]);
+        }
+        let g_ld = 1 + 2 * hv + 2;
+        let mut gates = vec![SENTINEL; b * t * g_ld];
+        for r in 0..b * t {
+            let row = &mut gates[r * g_ld..(r + 1) * g_ld];
+            row[1..1 + hv].copy_from_slice(&d.a[r * hv..(r + 1) * hv]);
+            row[1 + hv..1 + 2 * hv].copy_from_slice(&d.b[r * hv..(r + 1) * hv]);
+        }
+        Self {
+            qkv: buf(rt, &qkv),
+            ld: ld as u32,
+            gates: buf(rt, &gates),
+            g_ld: g_ld as u32,
+            a_log: buf(rt, &d.a_log),
+            dt_bias: buf(rt, &d.dt_bias),
+            key_w: key_w as u32,
+        }
+    }
+
+    fn qkv(&self) -> GdnQkv<'_> {
+        GdnQkv {
+            buf: &self.qkv,
+            ld: self.ld,
+            q_off: 1,
+            k_off: 1 + self.key_w,
+            v_off: 1 + 2 * self.key_w,
+        }
+    }
+
+    fn gates(&self, hv: u32) -> GdnGateLogits<'_> {
+        GdnGateLogits {
+            buf: &self.gates,
+            ld: self.g_ld,
+            a_off: 1,
+            b_off: 1 + hv,
+        }
+    }
+
+    fn params(&self) -> GdnParams<'_> {
+        GdnParams {
+            a_log: &self.a_log,
+            dt_bias: &self.dt_bias,
+        }
+    }
+}
+
+fn dims_of(s: GdnShape) -> GdnDims {
+    GdnDims {
+        batch: s.b as u32,
+        seq: s.t as u32,
+        k_heads: s.hk as u32,
+        v_heads: s.hv as u32,
+        v_dim: s.dv as u32,
+    }
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum Path {
+    Chunk,
+    Recurrent,
+}
+
+/// Run one GDN call; returns (y [B*T, Hv*Dv], final state).
+fn run_gdn(rt: &Arc<GpuRuntime>, d: &GdnData, path: Path) -> (Vec<f32>, Vec<f32>) {
+    let s = d.s;
+    let dims = dims_of(s);
+    let p = Packed::new(rt, d);
+    let width = s.hv * s.dv;
+    let (out_ld, out_off) = (width + 3, 2usize);
+    let out = seeded(rt, s.b * s.t * out_ld, SENTINEL);
+    let state_elems = s.b * s.hv * DK * s.dv;
+    let state_out = seeded(rt, state_elems, SENTINEL);
+    let state_buf = d.state0.as_ref().map(|s0| buf(rt, s0));
+    let state = match (&state_buf, d.snapshot) {
+        (None, _) => StateIn::Zero,
+        (Some(b), false) => StateIn::PerBatch(b),
+        (Some(b), true) => StateIn::Snapshot(b),
+    };
+    let out_cols = Cols {
+        buf: &out,
+        ld: out_ld as u32,
+        off: out_off as u32,
+    };
+    match path {
+        Path::Chunk => {
+            let ws = GdnWorkspace::new(rt, &dims).unwrap();
+            qwen35::gdn_chunk_forward(
+                rt,
+                &dims,
+                &p.qkv(),
+                &p.gates(dims.v_heads),
+                &p.params(),
+                state,
+                &ws,
+                out_cols,
+                Some(&state_out),
+            )
+            .unwrap();
+        }
+        Path::Recurrent => qwen35::gdn_recurrent(
+            rt,
+            &dims,
+            &p.qkv(),
+            &p.gates(dims.v_heads),
+            &p.params(),
+            state,
+            out_cols,
+            Some(&state_out),
+        )
+        .unwrap(),
+    }
+    rt.synchronize().unwrap();
+
+    let all = out.read_f32();
+    let mut y = Vec::with_capacity(s.b * s.t * width);
+    for r in 0..s.b * s.t {
+        let row = &all[r * out_ld..(r + 1) * out_ld];
+        // Only the window is the kernel's to write.
+        assert!(
+            row[..out_off]
+                .iter()
+                .chain(&row[out_off + width..])
+                .all(|&x| x == SENTINEL),
+            "row {r}: wrote outside the output window"
+        );
+        y.extend_from_slice(&row[out_off..out_off + width]);
+    }
+    if let (Some(b), Some(s0)) = (&state_buf, &d.state0) {
+        assert_eq!(
+            &b.read_f32()[..s0.len()],
+            &s0[..],
+            "the input state was written"
+        );
+    }
+    (y, state_out.read_f32()[..state_elems].to_vec())
+}
+
+fn check_gdn(label: &str, rt: &Arc<GpuRuntime>, d: &GdnData, path: Path) {
+    let (want_y, want_s) = gdn_f64(&d.problem());
+    let (y, st) = run_gdn(rt, d, path);
+    assert_close(&format!("{label} y"), &y, &want_y, rel_bound(&want_y));
+    assert_close(&format!("{label} state"), &st, &want_s, rel_bound(&want_s));
+}
+
+#[test]
+fn gdn_chunk_matches_transformers_golden() {
+    with_gpu(|rt| {
+        let d = GdnData::fixture();
+        let (y, st) = run_gdn(rt, &d, Path::Chunk);
+        assert_close(
+            "chunk y",
+            &y,
+            &load("gdn_y_f64").1,
+            rel_bound(&load("gdn_y_f64").1),
+        );
+        assert_close(
+            "chunk state",
+            &st,
+            &load("gdn_state_f64").1,
+            rel_bound(&load("gdn_state_f64").1),
+        );
+    });
+}
+
+#[test]
+fn gdn_recurrent_matches_transformers_golden() {
+    with_gpu(|rt| {
+        let d = GdnData::fixture();
+        let (y, st) = run_gdn(rt, &d, Path::Recurrent);
+        assert_close(
+            "rec y",
+            &y,
+            &load("gdn_y_f64").1,
+            rel_bound(&load("gdn_y_f64").1),
+        );
+        assert_close(
+            "rec state",
+            &st,
+            &load("gdn_state_f64").1,
+            rel_bound(&load("gdn_state_f64").1),
+        );
+    });
+}
+
+#[test]
+fn gdn_chunk_edges_of_the_chunk_and_head_grouping() {
+    with_gpu(|rt| {
+        let cases = [
+            (
+                GdnShape {
+                    b: 1,
+                    t: 1,
+                    hk: 1,
+                    hv: 1,
+                    dv: 32,
+                },
+                "none",
+            ),
+            (
+                GdnShape {
+                    b: 1,
+                    t: 63,
+                    hk: 1,
+                    hv: 1,
+                    dv: 64,
+                },
+                "none",
+            ),
+            (
+                GdnShape {
+                    b: 1,
+                    t: 64,
+                    hk: 1,
+                    hv: 2,
+                    dv: 32,
+                },
+                "batch",
+            ),
+            (
+                GdnShape {
+                    b: 2,
+                    t: 65,
+                    hk: 1,
+                    hv: 2,
+                    dv: 64,
+                },
+                "batch",
+            ),
+            (
+                GdnShape {
+                    b: 3,
+                    t: 100,
+                    hk: 1,
+                    hv: 1,
+                    dv: 128,
+                },
+                "snapshot",
+            ),
+            (
+                GdnShape {
+                    b: 1,
+                    t: 200,
+                    hk: 2,
+                    hv: 4,
+                    dv: 128,
+                },
+                "none",
+            ),
+        ];
+        for (i, (s, state)) in cases.into_iter().enumerate() {
+            let d = GdnData::random(s, state, 100 + i as u64);
+            check_gdn(&format!("chunk {s:?} {state}"), rt, &d, Path::Chunk);
+        }
+    });
+}
+
+#[test]
+fn gdn_recurrent_decode_shapes() {
+    with_gpu(|rt| {
+        let cases = [
+            (
+                GdnShape {
+                    b: 4,
+                    t: 1,
+                    hk: 2,
+                    hv: 4,
+                    dv: 64,
+                },
+                "snapshot",
+            ),
+            (
+                GdnShape {
+                    b: 2,
+                    t: 7,
+                    hk: 1,
+                    hv: 2,
+                    dv: 128,
+                },
+                "batch",
+            ),
+            (
+                GdnShape {
+                    b: 1,
+                    t: 20,
+                    hk: 1,
+                    hv: 1,
+                    dv: 32,
+                },
+                "none",
+            ),
+        ];
+        for (i, (s, state)) in cases.into_iter().enumerate() {
+            let d = GdnData::random(s, state, 200 + i as u64);
+            check_gdn(&format!("recurrent {s:?} {state}"), rt, &d, Path::Recurrent);
+        }
+    });
+}
+
+#[test]
+fn gdn_strong_decay_stays_finite_and_exact() {
+    // A_log up to 2.5 and |a| up to 4: g reaches about -50 per step, so every
+    // decay product in a chunk underflows. No exponent in either kernel is
+    // positive, so nothing may overflow on the way.
+    with_gpu(|rt| {
+        let s = GdnShape {
+            b: 1,
+            t: 150,
+            hk: 1,
+            hv: 1,
+            dv: 32,
+        };
+        let mut d = GdnData::random(s, "none", 300);
+        d.a_log = vec![2.5];
+        d.a = d.a.iter().map(|x| x * 2.0).collect();
+        check_gdn("chunk strong decay", rt, &d, Path::Chunk);
+        check_gdn("recurrent strong decay", rt, &d, Path::Recurrent);
+    });
+}
+
+/// Split rows `[t0, t1)` of every sequence out of a problem.
+fn slice_time(d: &GdnData, t0: usize, t1: usize) -> GdnData {
+    let GdnShape { b, t, hk, hv, dv } = d.s;
+    let take = |v: &[f32], w: usize| -> Vec<f32> {
+        (0..b)
+            .flat_map(|bi| v[(bi * t + t0) * w..(bi * t + t1) * w].to_vec())
+            .collect()
+    };
+    GdnData {
+        s: GdnShape {
+            b,
+            t: t1 - t0,
+            hk,
+            hv,
+            dv,
+        },
+        q: take(&d.q, hk * DK),
+        k: take(&d.k, hk * DK),
+        v: take(&d.v, hv * dv),
+        a: take(&d.a, hv),
+        b: take(&d.b, hv),
+        a_log: d.a_log.clone(),
+        dt_bias: d.dt_bias.clone(),
+        state0: None,
+        snapshot: false,
+    }
+}
+
+#[test]
+fn gdn_prefill_then_decode_in_place_continues_the_sequence() {
+    with_gpu(|rt| {
+        let full = GdnData::random(
+            GdnShape {
+                b: 2,
+                t: 103,
+                hk: 1,
+                hv: 2,
+                dv: 64,
+            },
+            "none",
+            400,
+        );
+        let (want, want_state) = gdn_f64(&full.problem());
+        let pre = slice_time(&full, 0, 100);
+        let dims = dims_of(pre.s);
+        let p = Packed::new(rt, &pre);
+        let width = pre.s.hv * pre.s.dv;
+        let out = seeded(rt, 2 * 100 * width, SENTINEL);
+        let state = seeded(rt, 2 * pre.s.hv * DK * pre.s.dv, SENTINEL);
+        let ws = GdnWorkspace::new(rt, &dims).unwrap();
+        qwen35::gdn_chunk_forward(
+            rt,
+            &dims,
+            &p.qkv(),
+            &p.gates(dims.v_heads),
+            &p.params(),
+            StateIn::Zero,
+            &ws,
+            Cols::dense(&out, width as u32),
+            Some(&state),
+        )
+        .unwrap();
+        // Three decode steps, one token each, advancing the state in place.
+        let mut dec_out = Vec::new();
+        for step in 0..3 {
+            let tok = slice_time(&full, 100 + step, 101 + step);
+            let dd = dims_of(tok.s);
+            let tp = Packed::new(rt, &tok);
+            let o = seeded(rt, 2 * width, SENTINEL);
+            qwen35::gdn_recurrent(
+                rt,
+                &dd,
+                &tp.qkv(),
+                &tp.gates(dd.v_heads),
+                &tp.params(),
+                StateIn::PerBatch(&state),
+                Cols::dense(&o, width as u32),
+                Some(&state),
+            )
+            .unwrap();
+            rt.synchronize().unwrap();
+            dec_out.push(o.read_f32()[..2 * width].to_vec());
+        }
+        let prefill = out.read_f32();
+        for bi in 0..2 {
+            for t in 0..103 {
+                let got = if t < 100 {
+                    &prefill[(bi * 100 + t) * width..(bi * 100 + t + 1) * width]
+                } else {
+                    &dec_out[t - 100][bi * width..(bi + 1) * width]
+                };
+                let w = &want[(bi * 103 + t) * width..(bi * 103 + t + 1) * width];
+                assert_close(&format!("b{bi} t{t}"), got, w, rel_bound(&want));
+            }
+        }
+        let st = state.read_f32();
+        assert_close(
+            "final state",
+            &st[..want_state.len()],
+            &want_state,
+            rel_bound(&want_state),
+        );
+    });
+}
+
+// ------------------------------------------------------------------ conv1d ---
+
+#[test]
+fn conv1d_prefill_then_decode_continues() {
+    with_gpu(|rt| {
+        let (b, t, c, kw) = (2usize, 38usize, 100usize, 4usize);
+        let x = random_f32(b * t * c, 500);
+        let w = random_f32(c * kw, 501);
+        let (want, want_state) = conv1d_silu_f64(&x, &w, None, b, t, c, kw);
+        // Prefill the first 37 steps from a strided window, then decode step 38.
+        let (ld, off) = (c + 13, 5usize);
+        let mut xs = vec![SENTINEL; b * t * ld];
+        for r in 0..b * t {
+            xs[r * ld + off..r * ld + off + c].copy_from_slice(&x[r * c..(r + 1) * c]);
+        }
+        let pre_rows: Vec<f32> = (0..b)
+            .flat_map(|bi| xs[bi * t * ld..(bi * t + t - 1) * ld].to_vec())
+            .collect();
+        let xb = buf(rt, &pre_rows);
+        let wb = buf(rt, &w);
+        let y = seeded(rt, b * (t - 1) * c, SENTINEL);
+        let st = seeded(rt, b * c * (kw - 1), SENTINEL);
+        let x_cols = Cols {
+            buf: &xb,
+            ld: ld as u32,
+            off: off as u32,
+        };
+        qwen35::conv1d_silu(
+            rt,
+            x_cols,
+            &wb,
+            kw as u32,
+            StateIn::Zero,
+            &y,
+            Some(&st),
+            b as u32,
+            (t - 1) as u32,
+            c as u32,
+        )
+        .unwrap();
+        let last: Vec<f32> = (0..b)
+            .flat_map(|bi| x[(bi * t + t - 1) * c..(bi * t + t) * c].to_vec())
+            .collect();
+        let lb = buf(rt, &last);
+        let y1 = seeded(rt, b * c, SENTINEL);
+        let st1 = seeded(rt, b * c * (kw - 1), SENTINEL);
+        qwen35::conv1d_silu(
+            rt,
+            Cols::dense(&lb, c as u32),
+            &wb,
+            kw as u32,
+            StateIn::PerBatch(&st),
+            &y1,
+            Some(&st1),
+            b as u32,
+            1,
+            c as u32,
+        )
+        .unwrap();
+        rt.synchronize().unwrap();
+        let yp = y.read_f32();
+        let yd = y1.read_f32();
+        for bi in 0..b {
+            for ti in 0..t {
+                let got = if ti < t - 1 {
+                    &yp[(bi * (t - 1) + ti) * c..(bi * (t - 1) + ti + 1) * c]
+                } else {
+                    &yd[bi * c..(bi + 1) * c]
+                };
+                assert_close(
+                    &format!("conv b{bi} t{ti}"),
+                    got,
+                    &want[(bi * t + ti) * c..(bi * t + ti + 1) * c],
+                    1e-5,
+                );
+            }
+        }
+        assert_close(
+            "conv state",
+            &st1.read_f32()[..want_state.len()],
+            &want_state,
+            0.0,
+        );
+    });
+}
+
+#[test]
+fn conv1d_snapshot_state_is_shared_and_read_only() {
+    with_gpu(|rt| {
+        let (b, t, c, kw) = (3usize, 2usize, 64usize, 4usize);
+        let x = random_f32(b * t * c, 510);
+        let w = random_f32(c * kw, 511);
+        let snap = random_f32(c * (kw - 1), 512);
+        let (want, want_state) = conv1d_silu_f64(&x, &w, Some((&snap, true)), b, t, c, kw);
+        let (xb, wb, sb) = (buf(rt, &x), buf(rt, &w), buf(rt, &snap));
+        let y = seeded(rt, b * t * c, SENTINEL);
+        let st = seeded(rt, b * c * (kw - 1), SENTINEL);
+        qwen35::conv1d_silu(
+            rt,
+            Cols::dense(&xb, c as u32),
+            &wb,
+            kw as u32,
+            StateIn::Snapshot(&sb),
+            &y,
+            Some(&st),
+            b as u32,
+            t as u32,
+            c as u32,
+        )
+        .unwrap();
+        rt.synchronize().unwrap();
+        assert_close("conv y", &y.read_f32()[..want.len()], &want, 1e-5);
+        assert_close(
+            "conv state",
+            &st.read_f32()[..want_state.len()],
+            &want_state,
+            0.0,
+        );
+        assert_eq!(
+            sb.read_f32()[..snap.len()],
+            snap[..],
+            "snapshot was written"
+        );
+    });
+}
+
+// -------------------------------------------------------------- gated norm ---
+
+#[test]
+fn gated_rms_norm_f32_and_bf16() {
+    with_gpu(|rt| {
+        let (rows, h, d) = (37usize, 4usize, 128usize);
+        let width = h * d;
+        let (x_ld, x_off, z_ld, z_off) = (width + 3, 2usize, width + 11, 7usize);
+        let x = random_f32(rows * x_ld, 600);
+        let z: Vec<f32> = random_f32(rows * z_ld, 601)
+            .iter()
+            .map(|v| v * 3.0)
+            .collect();
+        let w: Vec<f32> = random_f32(d, 602).iter().map(|v| 1.0 + 0.2 * v).collect();
+        let dense = |v: &[f32], ld: usize, off: usize| -> Vec<f32> {
+            (0..rows)
+                .flat_map(|r| v[r * ld + off..r * ld + off + width].to_vec())
+                .collect()
+        };
+        let want = gated_rms_norm_f64(
+            &dense(&x, x_ld, x_off),
+            &dense(&z, z_ld, z_off),
+            &w,
+            d,
+            1e-6,
+        );
+        let (xb, zb, wb) = (buf(rt, &x), buf(rt, &z), buf(rt, &w));
+        let xc = Cols {
+            buf: &xb,
+            ld: x_ld as u32,
+            off: x_off as u32,
+        };
+        let zc = Cols {
+            buf: &zb,
+            ld: z_ld as u32,
+            off: z_off as u32,
+        };
+        let out = seeded(rt, rows * width, SENTINEL);
+        let oc = OutCols {
+            cols: Cols::dense(&out, width as u32),
+            dtype: DType::F32,
+        };
+        qwen35::gated_rms_norm(rt, xc, zc, &wb, oc, rows as u32, h as u32, d as u32, 1e-6).unwrap();
+        let outb = rt.alloc_buffer(rows * width * 2).unwrap();
+        let ob = OutCols {
+            cols: Cols::dense(&outb, width as u32),
+            dtype: DType::BF16,
+        };
+        qwen35::gated_rms_norm(rt, xc, zc, &wb, ob, rows as u32, h as u32, d as u32, 1e-6).unwrap();
+        rt.synchronize().unwrap();
+        assert_close("gated norm f32", &out.read_f32()[..want.len()], &want, 1e-5);
+        let got = read_bf16(&outb, want.len());
+        for (i, (&g, &w)) in got.iter().zip(&want).enumerate() {
+            // One bf16 rounding of the f32 result: half an ulp of 2^-8, plus slack.
+            assert!(
+                (f64::from(g) - w).abs() <= w.abs() * 2f64.powi(-8) + 1e-6,
+                "bf16 [{i}] {g} vs {w}"
+            );
+        }
+    });
+}
+
+// ------------------------------------------------------- attention extras ---
+
+fn attn_proj_rows(
+    layout: AttnProjLayout,
+    rows: usize,
+    q: &[f32],
+    k: &[f32],
+    v: &[f32],
+    gate: &[f32],
+) -> Vec<f32> {
+    let (hq, hkv, d) = (
+        layout.q_heads as usize,
+        layout.kv_heads as usize,
+        layout.head_dim as usize,
+    );
+    let w = layout.width() as usize;
+    let mut p = vec![SENTINEL; rows * w];
+    for r in 0..rows {
+        for h in 0..hq {
+            let dst = r * w + layout.q_off() as usize + h * 2 * d;
+            p[dst..dst + d].copy_from_slice(&q[(r * hq + h) * d..(r * hq + h + 1) * d]);
+            p[dst + d..dst + 2 * d].copy_from_slice(&gate[(r * hq + h) * d..(r * hq + h + 1) * d]);
+        }
+        for h in 0..hkv {
+            let kd = r * w + layout.k_off() as usize + h * d;
+            let vd = r * w + layout.v_off() as usize + h * d;
+            p[kd..kd + d].copy_from_slice(&k[(r * hkv + h) * d..(r * hkv + h + 1) * d]);
+            p[vd..vd + d].copy_from_slice(&v[(r * hkv + h) * d..(r * hkv + h + 1) * d]);
+        }
+    }
+    p
+}
+
+/// Run the norm/RoPE/cache kernel; returns (q_out, k_cache, v_cache).
+#[allow(clippy::too_many_arguments)]
+fn run_qk_rope(
+    rt: &Arc<GpuRuntime>,
+    shape: AttnShape,
+    p: &[f32],
+    qw: &[f32],
+    kw: &[f32],
+    cap: u32,
+    pos: u32,
+    theta: f32,
+) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
+    let (b, t, hq, hkv, d) = (
+        shape.batch as usize,
+        shape.seq as usize,
+        shape.q_heads as usize,
+        shape.kv_heads as usize,
+        shape.head_dim as usize,
+    );
+    let layout = AttnProjLayout {
+        q_heads: shape.q_heads,
+        kv_heads: shape.kv_heads,
+        head_dim: shape.head_dim,
+    };
+    let (pb, qwb, kwb) = (buf(rt, p), buf(rt, qw), buf(rt, kw));
+    let q_out = seeded(rt, b * t * hq * d, SENTINEL);
+    let cache = b * cap as usize * hkv * d;
+    let (kc, vc) = (seeded(rt, cache, SENTINEL), seeded(rt, cache, SENTINEL));
+    let targets = AttnTargets {
+        q_out: &q_out,
+        k_cache: &kc,
+        v_cache: &vc,
+        kv_capacity: cap,
+    };
+    qwen35::attn_qk_norm_rope(
+        rt,
+        &shape,
+        Cols::dense(&pb, layout.width()),
+        &qwb,
+        &kwb,
+        &targets,
+        pos,
+        theta,
+        1e-6,
+    )
+    .unwrap();
+    rt.synchronize().unwrap();
+    (
+        q_out.read_f32()[..b * t * hq * d].to_vec(),
+        kc.read_f32()[..cache].to_vec(),
+        vc.read_f32()[..cache].to_vec(),
+    )
+}
+
+#[test]
+fn attn_qk_norm_rope_matches_transformers_golden() {
+    with_gpu(|rt| {
+        let (qs, q) = load_f32("rope_q_in");
+        let (_, k) = load_f32("rope_k_in");
+        let (t, hq, d) = (qs[1], qs[2], qs[3]);
+        let shape = AttnShape {
+            batch: 1,
+            seq: t as u32,
+            q_heads: hq as u32,
+            kv_heads: 1,
+            head_dim: d as u32,
+            rotary_dim: 64,
+        };
+        let layout = AttnProjLayout {
+            q_heads: hq as u32,
+            kv_heads: 1,
+            head_dim: d as u32,
+        };
+        let v = random_f32(t * d, 700);
+        let gate = random_f32(t * hq * d, 701);
+        let p = attn_proj_rows(layout, t, &q, &k, &v, &gate);
+        let (cap, pos) = (20_008u32, 20_000u32);
+        let (qo, kc, vc) = run_qk_rope(
+            rt,
+            shape,
+            &p,
+            &load_f32("rope_q_norm_w").1,
+            &load_f32("rope_k_norm_w").1,
+            cap,
+            pos,
+            1e7,
+        );
+        // At position 20000 the fp32 angle transformers forms carries ~1e-3 rad
+        // of its own rounding (see `norm_rope_row_f64`), and one ulp of
+        // difference in `pow` between Metal and the host moves it by as much.
+        // The bound admits that and nothing structural: a wrong pairing or
+        // frequency denominator is O(1).
+        assert_close("q", &qo, &load("rope_q_out").1, 4e-3);
+        let kslot = &kc[pos as usize * d..(pos as usize + t) * d];
+        assert_close("k", kslot, &load("rope_k_out").1, 4e-3);
+        assert_eq!(
+            &vc[pos as usize * d..(pos as usize + t) * d],
+            &v[..],
+            "v cache"
+        );
+        assert!(
+            kc[..pos as usize * d].iter().all(|&x| x == SENTINEL),
+            "k cache written below pos"
+        );
+    });
+}
+
+#[test]
+fn attn_qk_norm_rope_small_positions_are_tight() {
+    with_gpu(|rt| {
+        let (b, t, hq, hkv, d, rot) = (2usize, 9usize, 4usize, 2usize, 256usize, 64usize);
+        let shape = AttnShape {
+            batch: b as u32,
+            seq: t as u32,
+            q_heads: hq as u32,
+            kv_heads: hkv as u32,
+            head_dim: d as u32,
+            rotary_dim: rot as u32,
+        };
+        let layout = AttnProjLayout {
+            q_heads: hq as u32,
+            kv_heads: hkv as u32,
+            head_dim: d as u32,
+        };
+        let q = random_f32(b * t * hq * d, 710);
+        let k = random_f32(b * t * hkv * d, 711);
+        let v = random_f32(b * t * hkv * d, 712);
+        let gate = random_f32(b * t * hq * d, 713);
+        let qw: Vec<f32> = random_f32(d, 714).iter().map(|x| 0.1 * x).collect();
+        let kw: Vec<f32> = random_f32(d, 715).iter().map(|x| 0.1 * x).collect();
+        let p = attn_proj_rows(layout, b * t, &q, &k, &v, &gate);
+        let (cap, pos) = (24u32, 11u32);
+        let (qo, kc, vc) = run_qk_rope(rt, shape, &p, &qw, &kw, cap, pos, 1e7);
+        for bi in 0..b {
+            for ti in 0..t {
+                let r = bi * t + ti;
+                let at = u64::from(pos) + ti as u64;
+                for h in 0..hq {
+                    let want = norm_rope_row_f64(
+                        &q[(r * hq + h) * d..(r * hq + h + 1) * d],
+                        &qw,
+                        rot,
+                        at,
+                        1e7,
+                        1e-6,
+                    );
+                    assert_close(
+                        &format!("q b{bi} t{ti} h{h}"),
+                        &qo[(r * hq + h) * d..(r * hq + h + 1) * d],
+                        &want,
+                        2e-5,
+                    );
+                }
+                for h in 0..hkv {
+                    let want = norm_rope_row_f64(
+                        &k[(r * hkv + h) * d..(r * hkv + h + 1) * d],
+                        &kw,
+                        rot,
+                        at,
+                        1e7,
+                        1e-6,
+                    );
+                    let slot = ((bi * cap as usize + pos as usize + ti) * hkv + h) * d;
+                    assert_close(
+                        &format!("k b{bi} t{ti} h{h}"),
+                        &kc[slot..slot + d],
+                        &want,
+                        2e-5,
+                    );
+                    assert_eq!(
+                        &vc[slot..slot + d],
+                        &v[(r * hkv + h) * d..(r * hkv + h + 1) * d]
+                    );
+                }
+            }
+        }
+    });
+}
+
+#[test]
+fn attn_output_gate_f32_bf16_and_in_place() {
+    with_gpu(|rt| {
+        let (rows, hq, d) = (11usize, 3usize, 64usize);
+        let width = hq * d;
+        let layout = AttnProjLayout {
+            q_heads: hq as u32,
+            kv_heads: 1,
+            head_dim: d as u32,
+        };
+        let gate: Vec<f32> = random_f32(rows * width, 800)
+            .iter()
+            .map(|x| 4.0 * x)
+            .collect();
+        let zeros = vec![0.0f32; rows * width];
+        let p = attn_proj_rows(
+            layout,
+            rows,
+            &zeros,
+            &zeros[..rows * d],
+            &zeros[..rows * d],
+            &gate,
+        );
+        let attn = random_f32(rows * width, 801);
+        let want: Vec<f64> = attn
+            .iter()
+            .zip(&gate)
+            .map(|(&a, &g)| f64::from(a) * sigmoid(f64::from(g)))
+            .collect();
+        let pb = buf(rt, &p);
+        let pc = Cols::dense(&pb, layout.width());
+        let ab = buf(rt, &attn);
+        let out = seeded(rt, rows * width, SENTINEL);
+        qwen35::attn_output_gate(
+            rt,
+            &ab,
+            pc,
+            OutCols {
+                cols: Cols::dense(&out, width as u32),
+                dtype: DType::F32,
+            },
+            rows as u32,
+            hq as u32,
+            d as u32,
+        )
+        .unwrap();
+        let outb = rt.alloc_buffer(rows * width * 2).unwrap();
+        qwen35::attn_output_gate(
+            rt,
+            &ab,
+            pc,
+            OutCols {
+                cols: Cols::dense(&outb, width as u32),
+                dtype: DType::BF16,
+            },
+            rows as u32,
+            hq as u32,
+            d as u32,
+        )
+        .unwrap();
+        rt.synchronize().unwrap();
+        assert_close("gate f32", &out.read_f32()[..want.len()], &want, 1e-6);
+        let bf = read_bf16(&outb, want.len());
+        for (i, (&g, &w)) in bf.iter().zip(&want).enumerate() {
+            assert!(
+                (f64::from(g) - w).abs() <= w.abs() * 2f64.powi(-8) + 1e-7,
+                "bf16 [{i}]"
+            );
+        }
+        // In place over the attention output.
+        qwen35::attn_output_gate(
+            rt,
+            &ab,
+            pc,
+            OutCols {
+                cols: Cols::dense(&ab, width as u32),
+                dtype: DType::F32,
+            },
+            rows as u32,
+            hq as u32,
+            d as u32,
+        )
+        .unwrap();
+        rt.synchronize().unwrap();
+        assert_close("gate in place", &ab.read_f32()[..want.len()], &want, 1e-6);
+    });
+}
+
+// ----------------------------------------------------------------- scoring ---
+
+#[test]
+fn score_answer_rows_f32_and_bf16() {
+    with_gpu(|rt| {
+        let (rows, hidden, vocab) = (20usize, 300usize, 50usize);
+        let h = random_f32(rows * hidden, 900);
+        let nw: Vec<f32> = random_f32(hidden, 901).iter().map(|x| 0.1 * x).collect();
+        let emb: Vec<f32> = random_f32(vocab * hidden, 902)
+            .iter()
+            .map(|x| 0.05 * x)
+            .collect();
+        let answers: Vec<u32> = (0..17).map(|i| (i * 7 + 3) % vocab as u32).collect();
+        let slots = [3u32, 19, 0, 7];
+        let (hb, nwb) = (buf(rt, &h), buf(rt, &nw));
+        let (ab, sb) = (u32_buf(rt, &answers), u32_buf(rt, &slots));
+        for dtype in [DType::F32, DType::BF16] {
+            let (eb, emb_seen) = match dtype {
+                DType::BF16 => {
+                    let bits = f32_slice_to_bf16(&emb);
+                    let b = rt.alloc_buffer(bits.len() * 2).unwrap();
+                    b.write_bf16_bits(&bits);
+                    (
+                        b,
+                        bits.into_iter().map(bf16_bits_to_f32).collect::<Vec<_>>(),
+                    )
+                }
+                _ => (buf(rt, &emb), emb.clone()),
+            };
+            let n = slots.len() * answers.len();
+            let (lg, lp) = (seeded(rt, n, SENTINEL), seeded(rt, n, SENTINEL));
+            let head = LmHead {
+                weight: &eb,
+                dtype,
+                vocab: vocab as u32,
+            };
+            qwen35::score_answer_rows(
+                rt,
+                &hb,
+                rows as u32,
+                hidden as u32,
+                &sb,
+                slots.len() as u32,
+                &nwb,
+                1.0,
+                1e-6,
+                head,
+                &ab,
+                answers.len() as u32,
+                &lg,
+                &lp,
+            )
+            .unwrap();
+            rt.synchronize().unwrap();
+            let (gl, gp) = (lg.read_f32(), lp.read_f32());
+            for (si, &slot) in slots.iter().enumerate() {
+                let rows_e: Vec<&[f32]> = answers
+                    .iter()
+                    .map(|&a| &emb_seen[a as usize * hidden..(a as usize + 1) * hidden])
+                    .collect();
+                let (wl, wp) = score_row_f64(
+                    &h[slot as usize * hidden..(slot as usize + 1) * hidden],
+                    &nw,
+                    1.0,
+                    1e-6,
+                    &rows_e,
+                );
+                let r = si * answers.len()..(si + 1) * answers.len();
+                assert_close(
+                    &format!("{dtype:?} logits slot {slot}"),
+                    &gl[r.clone()],
+                    &wl,
+                    1e-5,
+                );
+                assert_close(
+                    &format!("{dtype:?} logprobs slot {slot}"),
+                    &gp[r],
+                    &wp,
+                    1e-5,
+                );
+            }
+        }
+    });
+}
+
+#[test]
+fn score_out_of_range_indices_score_nan() {
+    with_gpu(|rt| {
+        let (rows, hidden, vocab) = (4usize, 64usize, 8usize);
+        let (hb, nwb, eb) = (
+            buf(rt, &random_f32(rows * hidden, 910)),
+            buf(rt, &vec![0.0; hidden]),
+            buf(rt, &random_f32(vocab * hidden, 911)),
+        );
+        let ab = u32_buf(rt, &[1, vocab as u32, 2]);
+        let sb = u32_buf(rt, &[rows as u32, 1]);
+        let (lg, lp) = (seeded(rt, 6, SENTINEL), seeded(rt, 6, SENTINEL));
+        let head = LmHead {
+            weight: &eb,
+            dtype: DType::F32,
+            vocab: vocab as u32,
+        };
+        qwen35::score_answer_rows(
+            rt,
+            &hb,
+            rows as u32,
+            hidden as u32,
+            &sb,
+            2,
+            &nwb,
+            1.0,
+            1e-6,
+            head,
+            &ab,
+            3,
+            &lg,
+            &lp,
+        )
+        .unwrap();
+        rt.synchronize().unwrap();
+        let l = lg.read_f32();
+        assert!(
+            l[..3].iter().all(|x| x.is_nan()),
+            "bad slot must score NaN: {:?}",
+            &l[..3]
+        );
+        assert!(
+            l[3].is_finite() && l[4].is_nan() && l[5].is_finite(),
+            "bad answer id: {:?}",
+            &l[3..6]
+        );
+    });
+}
+
+// -------------------------------------------------------- projection fusion ---
+
+#[test]
+fn fused_projection_equals_the_separate_linears() {
+    with_gpu(|rt| {
+        let (rows, hidden) = (16usize, 64usize);
+        let layout = GdnProjLayout {
+            k_heads: 1,
+            v_heads: 2,
+            v_dim: 32,
+        };
+        let widths = layout.part_widths();
+        let parts: Vec<Vec<f32>> = widths
+            .iter()
+            .enumerate()
+            .map(|(i, &o)| random_f32(o * hidden, 1000 + i as u64))
+            .collect();
+        let refs: Vec<&[f32]> = parts.iter().map(|p| p.as_slice()).collect();
+        let packed = qwen35::pack_linear_weights_f32(&refs, &widths, hidden).unwrap();
+        let x = random_f32(rows * hidden, 1010);
+        let total = layout.width() as usize;
+        let xt = common::tensor_f32(rt, &[rows, hidden], &x);
+        let wt = common::tensor_f32(rt, &[hidden, total], &packed);
+        let pt = rt.alloc_tensor_f32(&[rows, total]).unwrap();
+        qwen35::fused_projection(&xt, &wt, &pt, GemmBackend::TensorOps).unwrap();
+        rt.synchronize().unwrap();
+        let got = pt.read_f32().unwrap();
+        let mut col0 = 0;
+        for (part, &o) in parts.iter().zip(&widths) {
+            for r in 0..rows {
+                for j in 0..o {
+                    // nn.Linear: y = x @ W^T.
+                    let want: f64 = (0..hidden)
+                        .map(|k| f64::from(x[r * hidden + k]) * f64::from(part[j * hidden + k]))
+                        .sum();
+                    let g = f64::from(got[r * total + col0 + j]);
+                    assert!(
+                        (g - want).abs() < 1e-4,
+                        "part col {j} row {r}: {g} vs {want}"
+                    );
+                }
+            }
+            col0 += o;
+        }
+        assert_eq!(col0, total);
+        assert_eq!(layout.a_off() as usize, total - 2);
+    });
+}
+
+// ------------------------------------------------------------ host contract ---
+
+#[test]
+fn every_qwen35_kernel_is_in_the_metallib() {
+    with_gpu(|rt| {
+        for name in [
+            "qwen35_conv1d_silu",
+            "qwen35_gdn_chunk_prep",
+            "qwen35_gdn_chunk_scan",
+            "qwen35_gdn_recurrent",
+            "qwen35_gated_rms_norm_f32",
+            "qwen35_gated_rms_norm_bf16",
+            "qwen35_attn_qk_norm_rope",
+            "qwen35_attn_gate_f32",
+            "qwen35_attn_gate_bf16",
+            "qwen35_score_rows_f32",
+            "qwen35_score_rows_bf16",
+        ] {
+            rt.pipeline(name).unwrap_or_else(|e| panic!("{name}: {e}"));
+        }
+    });
+}
+
+#[test]
+fn host_rejects_what_the_kernels_cannot_do() {
+    with_gpu(|rt| {
+        let s = GdnShape {
+            b: 1,
+            t: 10,
+            hk: 1,
+            hv: 2,
+            dv: 32,
+        };
+        let d = GdnData::random(s, "batch", 1100);
+        let p = Packed::new(rt, &d);
+        // Big enough to pass as a state too, so the aliasing check is what fires.
+        let out = seeded(rt, 2 * DK * 32, 0.0);
+        let st = buf(rt, d.state0.as_ref().unwrap());
+        let good = dims_of(s);
+        let ws = GdnWorkspace::new(rt, &good).unwrap();
+        let run = |dims: GdnDims, state: StateIn<'_>, so: Option<&GpuBuffer>, ws: &GdnWorkspace| {
+            qwen35::gdn_chunk_forward(
+                rt,
+                &dims,
+                &p.qkv(),
+                &p.gates(2),
+                &p.params(),
+                state,
+                ws,
+                Cols::dense(&out, 64),
+                so,
+            )
+        };
+        assert!(
+            run(good, StateIn::PerBatch(&st), Some(&st), &ws).is_ok(),
+            "in-place per-batch state is allowed"
+        );
+        let err = |r: Result<(), String>, what: &str| {
+            let e = r.expect_err(what);
+            assert!(!e.is_empty(), "{what}");
+        };
+        err(
+            run(GdnDims { v_dim: 48, ..good }, StateIn::Zero, None, &ws),
+            "v_dim not a multiple of 32",
+        );
+        err(
+            run(GdnDims { v_heads: 3, ..good }, StateIn::Zero, None, &ws),
+            "v_heads not a multiple of k_heads",
+        );
+        let small = GdnWorkspace::new(rt, &GdnDims { seq: 1, ..good }).unwrap();
+        err(
+            run(GdnDims { seq: 70, ..good }, StateIn::Zero, None, &small),
+            "workspace too small",
+        );
+        err(
+            run(good, StateIn::Snapshot(&st), Some(&st), &ws),
+            "writing into a shared snapshot",
+        );
+        err(
+            run(good, StateIn::Zero, Some(&out), &ws),
+            "state_out aliasing out",
+        );
+
+        let x = buf(rt, &random_f32(64 * 3, 1101));
+        let w = buf(rt, &random_f32(64 * 4, 1102));
+        let cs = buf(rt, &random_f32(64 * 3, 1103));
+        let y = seeded(rt, 64 * 3, 0.0);
+        err(
+            qwen35::conv1d_silu(
+                rt,
+                Cols::dense(&x, 64),
+                &w,
+                4,
+                StateIn::PerBatch(&cs),
+                &y,
+                Some(&cs),
+                1,
+                3,
+                64,
+            ),
+            "conv state in place",
+        );
+        err(
+            qwen35::conv1d_silu(
+                rt,
+                Cols::dense(&x, 64),
+                &w,
+                9,
+                StateIn::Zero,
+                &y,
+                None,
+                1,
+                3,
+                64,
+            ),
+            "conv width 9",
+        );
+
+        let shape = AttnShape {
+            batch: 1,
+            seq: 2,
+            q_heads: 1,
+            kv_heads: 1,
+            head_dim: 64,
+            rotary_dim: 63,
+        };
+        let pb = seeded(rt, 2 * 256, 0.0);
+        let nw = seeded(rt, 64, 0.0);
+        let c = seeded(rt, 4 * 64, 0.0);
+        let targets = AttnTargets {
+            q_out: &c,
+            k_cache: &y,
+            v_cache: &x,
+            kv_capacity: 2,
+        };
+        err(
+            qwen35::attn_qk_norm_rope(
+                rt,
+                &shape,
+                Cols::dense(&pb, 256),
+                &nw,
+                &nw,
+                &targets,
+                0,
+                1e4,
+                1e-6,
+            ),
+            "odd rotary_dim",
+        );
+        let shape = AttnShape {
+            rotary_dim: 64,
+            ..shape
+        };
+        err(
+            qwen35::attn_qk_norm_rope(
+                rt,
+                &shape,
+                Cols::dense(&pb, 256),
+                &nw,
+                &nw,
+                &targets,
+                1,
+                1e4,
+                1e-6,
+            ),
+            "positions past capacity",
+        );
+        err(
+            qwen35::gated_rms_norm(
+                rt,
+                Cols::dense(&x, 64),
+                Cols::dense(&x, 64),
+                &nw,
+                OutCols {
+                    cols: Cols::dense(&y, 64),
+                    dtype: DType::F16,
+                },
+                1,
+                1,
+                64,
+                1e-6,
+            ),
+            "f16 output",
+        );
+    });
+}

@@ -87,7 +87,7 @@ fn require_1d_indexable(n: usize, what: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn require_runtime(rt: &GpuRuntime, buf: &GpuBuffer, what: &str) -> Result<(), String> {
+pub(crate) fn require_runtime(rt: &GpuRuntime, buf: &GpuBuffer, what: &str) -> Result<(), String> {
     if !buf.belongs_to(rt) {
         return Err(format!("{what}: buffer belongs to another runtime"));
     }
@@ -104,12 +104,17 @@ fn require_capacity<T>(buf: &GpuBuffer, need: usize, what: &str) -> Result<(), S
     Ok(())
 }
 
-fn require<T>(rt: &GpuRuntime, buf: &GpuBuffer, need: usize, what: &str) -> Result<(), String> {
+pub(crate) fn require<T>(
+    rt: &GpuRuntime,
+    buf: &GpuBuffer,
+    need: usize,
+    what: &str,
+) -> Result<(), String> {
     require_runtime(rt, buf, what)?;
     require_capacity::<T>(buf, need, what)
 }
 
-fn require_disjoint_writes(
+pub(crate) fn require_disjoint_writes(
     entry: &str,
     writes: &[(&str, &GpuBuffer)],
     reads: &[(&str, &GpuBuffer)],

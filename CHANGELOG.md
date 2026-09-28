@@ -6,6 +6,32 @@ All notable changes to `tessl` are recorded here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- **Qwen3.5 layer kernels (`tessl::qwen35`)**, the Metal replacement for the
+  pure-torch GDN fallback transformers runs on MPS. See `docs/qwen35.md`.
+  - Chunked gated delta rule as two dispatches: `qwen35_gdn_chunk_prep`
+    (parallel over chunks: l2norm, Qwen3.5's gates, both 64x64 products, and
+    the triangular solve in threadgroup memory) and `qwen35_gdn_chunk_scan`
+    (the sequential state pass, on `simdgroup_matrix` tiles).
+  - `qwen35_gdn_recurrent`, a token-by-token decode that reads a shared
+    snapshot state without writing it, so one prefix serves many questions.
+  - `qwen35_conv1d_silu` (prefill and decode, snapshot-capable),
+    `qwen35_gated_rms_norm_{f32,bf16}`, `qwen35_attn_qk_norm_rope` (zero-centred
+    norm, transformers' partial RoPE, K/V cache store),
+    `qwen35_attn_gate_{f32,bf16}`, and `qwen35_score_rows_{f32,bf16}` (final
+    norm + LM head for the answer tokens at the slot rows only).
+  - Fused-projection helpers: weight packing, column layouts that every kernel
+    reads in place, and `project_residual` (the residual add as a GEMM
+    epilogue).
+- **`tools/msl_emu`**, a CPU emulator that runs the kernel sources as C++ with
+  real threadgroup barriers and simdgroup collectives, and a driver that checks
+  them against transformers' own Qwen3.5 code.
+- `tests/qwen35_kernels.rs` with transformers-generated goldens in
+  `tests/fixtures/qwen35/` (`scripts/gen_qwen35_fixtures.py`). The Qwen3.5
+  sources join the widened-index-arithmetic inspection in
+  `tests/shader_index_arithmetic.rs`.
+
 ## [0.2.0] — 2026-09-18
 
 Fail-closed encode / attention / quantized paths, Tensor metadata hygiene, and

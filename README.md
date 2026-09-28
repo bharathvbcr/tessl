@@ -51,7 +51,8 @@ The name is short for *tessellation* — the design centers around how matrix op
 - **Cooperative Register Accumulators:** High-throughput cooperative destination kernels (`get_destination_cooperative_tensor`) holding `f32` accumulators in GPU registers across the entire $K$-reduction, eliminating device memory round-trips for NN, TN, NT, and accumulating paths.
 - **In-Kernel Grid Swizzling & Bounds Checking:** Column-panel tile swizzling for large grids ($\ge 2048$ tiles) bounding operand rereads, combined with origin-shifted slice bounds checking for ragged edges.
 - **Zero-Wait Execution Pipeline:** Packed command encoding with bump-allocated constant arenas (16 MiB) and `MTLSharedEvent` synchronization—host threads never block mid-step.
-- **Neural-Network Kernel Library:** 18 Metal source files providing 72 kernel entry points — RMSNorm, gated MLP activations (SiLU / GELU-tanh), flash attention (sliding-window $h{=}128/256$, global $h{=}512$), fused RMSNorm+QKV+RoPE, MLX-format Q4 GEMV/GEMM, Q8 GEMV, KV-cache stores, embedding lookup, row-wise softmax/sum/max, and softcap sampling. All reachable through 62 shape-checked entry points in `tessl::nn`, not as raw pipeline-name strings.
+- **Neural-Network Kernel Library:** 21 Metal source files providing 83 kernel entry points — RMSNorm, gated MLP activations (SiLU / GELU-tanh), flash attention (sliding-window $h{=}128/256$, global $h{=}512$), fused RMSNorm+QKV+RoPE, MLX-format Q4 GEMV/GEMM, Q8 GEMV, KV-cache stores, embedding lookup, row-wise softmax/sum/max, and softcap sampling. All reachable through 62 shape-checked entry points in `tessl::nn`, not as raw pipeline-name strings.
+- **Qwen3.5 Layer Kernels (`tessl::qwen35`):** the gated delta net as two fused dispatches (a parallel per-chunk prep with the 64×64 triangular solve in threadgroup memory, then a sequential `simdgroup_matrix` scan), a snapshot-reading recurrent decode, causal conv+SiLU, gated RMSNorm, Qwen's partial RoPE and output gate, and scoring of only the answer rows — see [docs/qwen35.md](docs/qwen35.md). Checked against transformers' own Qwen3.5 code on a CPU emulator of the kernels; not yet run on device.
 - **Fused GEMM Epilogue:** `C = activation(alpha * A@B + beta * C_prev + bias)` in a single dispatch, applied while the accumulator is still in registers — measured 1.6–2.4× cheaper than the same work as a separate pass over $C$.
 - **Mixed Precision & Quantization:** `f32`, `bf16`, `tf32-relaxed`, IEEE `binary16` (`DType::F16`), and an exact `int8 x int8 -> int32` GEMM with fused per-column dequantization (`nn::gemm_i8_dequant`).
 - **Strided Batched GEMM:** `gemm_batched` with explicit per-operand batch strides, so a batch dimension is expressed rather than inferred from a rank-2 shape.
@@ -103,7 +104,7 @@ flowchart TD
     subgraph MetallibShaders["Compiled Metallib Shader Kernels"]
         TensorOps["matmul_tensorops.metal<br/>(MPP TensorOps matmul2d · Register Accumulation)"]
         SimdFallback["matmul_simdgroup.metal<br/>(Portable SIMDgroup Matrix Fallback)"]
-        NnKernels["18 NN Kernel Sources (72 Entry Points)<br/>RMSNorm · FlashAttn SWA/Global · MLX Q4/Q8 · RoPE"]
+        NnKernels["21 NN Kernel Sources (83 Entry Points)<br/>RMSNorm · FlashAttn SWA/Global · MLX Q4/Q8 · RoPE"]
     end
 
     Downstream -->|Typed API Calls| TesslAPI

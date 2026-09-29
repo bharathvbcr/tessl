@@ -27,7 +27,7 @@ mod common;
 use std::sync::Arc;
 
 use common::qwen35::*;
-use common::{buf, random_f32, seeded, with_gpu};
+use common::{buf, buf_u32, random_f32, seeded, with_gpu};
 use tessl::qwen35::{
     self, AttnProjLayout, AttnShape, AttnTargets, Cols, GdnDims, GdnGateLogits, GdnParams,
     GdnProjLayout, GdnQkv, GdnWorkspace, LmHead, OutCols, StateIn,
@@ -90,12 +90,6 @@ fn read_bf16(b: &GpuBuffer, n: usize) -> Vec<f32> {
         .iter()
         .map(|&x| bf16_bits_to_f32(x))
         .collect()
-}
-
-fn u32_buf(rt: &Arc<GpuRuntime>, v: &[u32]) -> GpuBuffer {
-    let b = rt.alloc_buffer(v.len().max(1) * 4).unwrap();
-    b.write_u32(v);
-    b
 }
 
 // ------------------------------------------------ 1. references vs transformers ---
@@ -1237,7 +1231,7 @@ fn score_answer_rows_f32_and_bf16() {
         let answers: Vec<u32> = (0..17).map(|i| (i * 7 + 3) % vocab as u32).collect();
         let slots = [3u32, 19, 0, 7];
         let (hb, nwb) = (buf(rt, &h), buf(rt, &nw));
-        let (ab, sb) = (u32_buf(rt, &answers), u32_buf(rt, &slots));
+        let (ab, sb) = (buf_u32(rt, &answers), buf_u32(rt, &slots));
         for dtype in [DType::F32, DType::BF16] {
             let (eb, emb_seen) = match dtype {
                 DType::BF16 => {
@@ -1317,8 +1311,8 @@ fn score_out_of_range_indices_score_nan_and_spare_the_rest() {
         let nw = vec![0.0f32; hidden];
         let emb = random_f32(vocab * hidden, 911);
         let (hb, nwb, eb) = (buf(rt, &h), buf(rt, &nw), buf(rt, &emb));
-        let ab = u32_buf(rt, &[1, vocab as u32, 2]);
-        let sb = u32_buf(rt, &[rows as u32, 1]);
+        let ab = buf_u32(rt, &[1, vocab as u32, 2]);
+        let sb = buf_u32(rt, &[rows as u32, 1]);
         let (lg, lp) = (seeded(rt, 6, SENTINEL), seeded(rt, 6, SENTINEL));
         let head = LmHead {
             weight: &eb,
@@ -1960,8 +1954,8 @@ fn host_rejects_what_the_kernels_cannot_do() {
             "does not fit a row",
         );
 
-        let ans = u32_buf(rt, &[0, 1]);
-        let slots = u32_buf(rt, &[0]);
+        let ans = buf_u32(rt, &[0, 1]);
+        let slots = buf_u32(rt, &[0]);
         let (lg, lp) = (seeded(rt, 2, 0.0), seeded(rt, 2, 0.0));
         let head = LmHead {
             weight: &w,
@@ -2058,9 +2052,9 @@ fn attention_layer_through_flash_attn_rows() {
         let o = seeded(rt, b * t * hq * d, SENTINEL);
         let scale = 1.0 / (d as f32).sqrt();
         let (tkv, qpos, kvpos) = (
-            u32_buf(rt, &[(prefix + t) as u32]),
-            u32_buf(rt, &[prefix as u32]),
-            u32_buf(rt, &[0]),
+            buf_u32(rt, &[(prefix + t) as u32]),
+            buf_u32(rt, &[prefix as u32]),
+            buf_u32(rt, &[0]),
         );
         let dims = tessl::nn::AttnDims {
             batch: b as u32,
@@ -2159,7 +2153,7 @@ fn attn_qk_norm_rope_posbuf_matches_the_scalar_variant_step_by_step() {
         let cache = b * cap * hkv * d;
         let (kc_a, vc_a) = (seeded(rt, cache, SENTINEL), seeded(rt, cache, SENTINEL));
         let (kc_b, vc_b) = (seeded(rt, cache, SENTINEL), seeded(rt, cache, SENTINEL));
-        let pos_buf = u32_buf(rt, &[0]);
+        let pos_buf = buf_u32(rt, &[0]);
         for step in 0..4u32 {
             let p = buf(
                 rt,

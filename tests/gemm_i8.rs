@@ -10,7 +10,7 @@ mod common;
 
 use std::sync::Arc;
 
-use common::with_gpu;
+use common::{buf, with_gpu};
 use tessl::nn;
 use tessl::tensor::GpuBuffer;
 use tessl::GpuRuntime;
@@ -18,12 +18,6 @@ use tessl::GpuRuntime;
 fn i8_buf(rt: &Arc<GpuRuntime>, data: &[i8]) -> GpuBuffer {
     let b = rt.alloc_buffer(data.len().max(1)).expect("alloc");
     b.write_bytes(&data.iter().map(|v| *v as u8).collect::<Vec<u8>>());
-    b
-}
-
-fn f32_buf(rt: &Arc<GpuRuntime>, data: &[f32]) -> GpuBuffer {
-    let b = rt.alloc_buffer(data.len().max(1) * 4).expect("alloc");
-    b.write_f32(data);
     b
 }
 
@@ -52,7 +46,7 @@ fn the_integer_accumulation_is_exact() {
             let b = i8_data(k * n, 0x2_8000 + n as u64);
             let ab = i8_buf(rt, &a);
             let bb = i8_buf(rt, &b);
-            let cb = f32_buf(rt, &vec![0.0f32; m * n]);
+            let cb = buf(rt, &vec![0.0f32; m * n]);
 
             // a_scale of 1 and no b_scale, so the output *is* the integer sum
             // and any deviation is a real arithmetic error, not rounding.
@@ -92,8 +86,8 @@ fn the_per_column_scale_is_applied_per_column() {
         let scale: Vec<f32> = (0..n).map(|j| (j as f32 + 1.0) * 0.25).collect();
         let ab = i8_buf(rt, &a);
         let bb = i8_buf(rt, &b);
-        let sb = f32_buf(rt, &scale);
-        let cb = f32_buf(rt, &vec![0.0f32; m * n]);
+        let sb = buf(rt, &scale);
+        let cb = buf(rt, &vec![0.0f32; m * n]);
 
         nn::gemm_i8_dequant(
             rt,
@@ -132,7 +126,7 @@ fn full_range_operands_do_not_overflow_the_accumulator() {
         let b = vec![-128i8; k * n];
         let ab = i8_buf(rt, &a);
         let bb = i8_buf(rt, &b);
-        let cb = f32_buf(rt, &vec![0.0f32; m * n]);
+        let cb = buf(rt, &vec![0.0f32; m * n]);
 
         nn::gemm_i8_dequant(rt, &ab, &bb, &cb, m as u32, n as u32, k as u32, 1.0, None)
             .expect("gemm_i8_dequant");

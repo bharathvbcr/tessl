@@ -7,23 +7,9 @@
 
 mod common;
 
-use common::{random_f32, with_gpu};
-use std::sync::Arc;
+use common::{buf, empty, random_f32, with_gpu};
 use tessl::nn;
 use tessl::tensor::bf16_bits_to_f32;
-use tessl::GpuRuntime;
-
-fn buf(rt: &Arc<GpuRuntime>, data: &[f32]) -> tessl::tensor::GpuBuffer {
-    let b = rt.alloc_buffer(data.len().max(1) * 4).expect("alloc");
-    b.write_f32(data);
-    b
-}
-
-fn empty(rt: &Arc<GpuRuntime>, elems: usize) -> tessl::tensor::GpuBuffer {
-    let b = rt.alloc_buffer(elems.max(1) * 4).expect("alloc");
-    b.zero();
-    b
-}
 
 /// Assert `got ≈ want` with an absolute tolerance scaled to the accumulation.
 fn close(what: &str, got: &[f32], want: &[f32], tol: f32) {

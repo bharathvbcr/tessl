@@ -8,36 +8,9 @@
 
 mod common;
 
-use std::sync::Arc;
-
-use common::{random_f32, with_gpu};
+use common::{buf, buf_bf16, buf_u32, empty, random_f32, with_gpu};
 use tessl::nn::{self, Q4Bank, Q4MlxBank, Q4MlxLayout, Q4MlxRowVariant, QuantShape};
-use tessl::tensor::{f32_slice_to_bf16, GpuBuffer};
-use tessl::GpuRuntime;
-
-fn buf(rt: &Arc<GpuRuntime>, data: &[f32]) -> GpuBuffer {
-    let b = rt.alloc_buffer(data.len().max(1) * 4).expect("alloc");
-    b.write_f32(data);
-    b
-}
-
-fn buf_u32(rt: &Arc<GpuRuntime>, data: &[u32]) -> GpuBuffer {
-    let b = rt.alloc_buffer(data.len().max(1) * 4).expect("alloc");
-    b.write_u32(data);
-    b
-}
-
-fn buf_bf16(rt: &Arc<GpuRuntime>, data: &[f32]) -> GpuBuffer {
-    let b = rt.alloc_buffer(data.len().max(1) * 2).expect("alloc");
-    b.write_bf16_bits(&f32_slice_to_bf16(data));
-    b
-}
-
-fn empty(rt: &Arc<GpuRuntime>, elems: usize) -> GpuBuffer {
-    let b = rt.alloc_buffer(elems.max(1) * 4).expect("alloc");
-    b.zero();
-    b
-}
+use tessl::tensor::f32_slice_to_bf16;
 
 /// Pack 4-bit values two to a byte, low nibble first — the layout every Q4
 /// kernel here indexes as `packed[i / 2]`, low nibble for even `i`.

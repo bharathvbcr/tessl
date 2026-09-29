@@ -7,24 +7,8 @@
 
 mod common;
 
-use std::sync::Arc;
-
-use common::{random_f32, with_gpu};
+use common::{buf, empty, random_f32, with_gpu};
 use tessl::nn;
-use tessl::tensor::GpuBuffer;
-use tessl::GpuRuntime;
-
-fn buf(rt: &Arc<GpuRuntime>, data: &[f32]) -> GpuBuffer {
-    let b = rt.alloc_buffer(data.len().max(1) * 4).expect("alloc");
-    b.write_f32(data);
-    b
-}
-
-fn empty(rt: &Arc<GpuRuntime>, n: usize) -> GpuBuffer {
-    let b = rt.alloc_buffer(n.max(1) * 4).expect("alloc");
-    b.zero();
-    b
-}
 
 /// f64 reference, so the comparison is against better arithmetic than the
 /// kernel's rather than against the same rounding.

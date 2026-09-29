@@ -1761,15 +1761,48 @@ pub fn attn_output_gate(
 
 // ------------------------------------------------ matrix-unit prefill attention ---
 
-/// Query rows per threadgroup of `qwen35_attn_tiled_h256` and its simdgroups
-/// per threadgroup (`TILED_ATTN_BQ`, `TILED_ATTN_SG` in the kernel). The key
-/// block is internal to the kernel.
-const TILED_ATTN_BQ: usize = 32;
-const TILED_ATTN_SIMDGROUPS: usize = 4;
+/// Block geometry of [`attn_prefill_with_tile`]: queries per threadgroup (BQ)
+/// by keys per step (BK), on NSG simdgroups. Each is its own entry point,
+/// `qwen35_attn_tiled_h256_q{BQ}_k{BK}_sg{NSG}`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AttnTile {
+    Q32K32Sg4,
+    Q32K64Sg4,
+    Q64K32Sg8,
+    Q64K64Sg8,
+}
+
+impl AttnTile {
+    pub const ALL: [AttnTile; 4] = [
+        AttnTile::Q32K32Sg4,
+        AttnTile::Q32K64Sg4,
+        AttnTile::Q64K32Sg8,
+        AttnTile::Q64K64Sg8,
+    ];
+
+    /// `(BQ, BK, NSG)`.
+    pub fn geometry(self) -> (u32, u32, u32) {
+        match self {
+            AttnTile::Q32K32Sg4 => (32, 32, 4),
+            AttnTile::Q32K64Sg4 => (32, 64, 4),
+            AttnTile::Q64K32Sg8 => (64, 32, 8),
+            AttnTile::Q64K64Sg8 => (64, 64, 8),
+        }
+    }
+
+    /// The name a bench flag or log uses: `q{BQ}_k{BK}_sg{NSG}`.
+    pub fn label(self) -> String {
+        let (bq, bk, sg) = self.geometry();
+        format!("q{bq}_k{bk}_sg{sg}")
+    }
+}
+
+/// The tile [`attn_prefill`] uses.
+pub const ATTN_PREFILL_TILE: AttnTile = AttnTile::Q32K32Sg4;
 
 /// [`crate::nn::flash_attn_rows`] at head_dim 256 and `window = 0`, with both
 /// products on the TensorOps matrix units: `S = Q·Kᵀ` and `P·V` are
-/// `matmul2d` over 32-query by 32-key blocks, with an f32 online softmax
+/// `matmul2d` over query-by-key blocks ([`ATTN_PREFILL_TILE`]), with an f32 online softmax
 /// between them. Same buffers, layouts and masking contract as
 /// `flash_attn_rows` (`q`/`o` `[batch, tq, heads, 256]`, `k`/`v`
 /// `[batch, capacity, kv_heads, 256]`, live `min(*tkv, capacity)`, query `t`
@@ -1789,6 +1822,36 @@ pub fn attn_prefill(
     kv_pos_offset: &GpuBuffer,
     dims: crate::nn::AttnDims,
     out_bf16: bool,
+) -> Result<(), String> {
+    attn_prefill_with_tile(
+        rt,
+        q,
+        k,
+        v,
+        o,
+        tkv,
+        q_pos_offset,
+        kv_pos_offset,
+        dims,
+        out_bf16,
+        ATTN_PREFILL_TILE,
+    )
+}
+
+/// [`attn_prefill`] at an explicit block geometry, for the tuning sweep.
+#[allow(clippy::too_many_arguments)]
+pub fn attn_prefill_with_tile(
+    rt: &Arc<GpuRuntime>,
+    q: &GpuBuffer,
+    k: &GpuBuffer,
+    v: &GpuBuffer,
+    o: &GpuBuffer,
+    tkv: &GpuBuffer,
+    q_pos_offset: &GpuBuffer,
+    kv_pos_offset: &GpuBuffer,
+    dims: crate::nn::AttnDims,
+    out_bf16: bool,
+    tile: AttnTile,
 ) -> Result<(), String> {
     const WHAT: &str = "qwen35::attn_prefill";
     const D: u32 = PREFIX_ATTN_HEAD_DIM;
@@ -1822,13 +1885,23 @@ pub fn attn_prefill(
             dims.tq
         ));
     }
-    let threads = TILED_ATTN_SIMDGROUPS * 32;
+    // Literal names, so the emulator's host-contract check can see which
+    // kernels this site binds; it also holds each name's spelled geometry to
+    // the kernel's instantiation, and the GPU tests run every tile.
+    let entry = match tile {
+        AttnTile::Q32K32Sg4 => "qwen35_attn_tiled_h256_q32_k32_sg4",
+        AttnTile::Q32K64Sg4 => "qwen35_attn_tiled_h256_q32_k64_sg4",
+        AttnTile::Q64K32Sg8 => "qwen35_attn_tiled_h256_q64_k32_sg8",
+        AttnTile::Q64K64Sg8 => "qwen35_attn_tiled_h256_q64_k64_sg8",
+    };
+    let (bq, _, sg) = tile.geometry();
+    let threads = sg as usize * 32;
     let groups_y = usize_product(&[dims.batch as usize, dims.heads as usize], WHAT)?;
-    let p = pipeline_for(rt, "qwen35_attn_tiled_h256", threads, 0)?;
+    let p = pipeline_for(rt, entry, threads, 0)?;
     dispatch_groups(
         rt,
         &p,
-        ((dims.tq as usize).div_ceil(TILED_ATTN_BQ), groups_y, 1),
+        ((dims.tq as usize).div_ceil(bq as usize), groups_y, 1),
         threads,
         0,
         |bnd| {

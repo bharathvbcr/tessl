@@ -1636,7 +1636,10 @@ fn every_qwen35_kernel_is_in_the_metallib() {
             "qwen35_attn_qk_norm_rope_posbuf",
             "qwen35_attn_gate_f32",
             "qwen35_attn_gate_bf16",
-            "qwen35_attn_tiled_h256",
+            "qwen35_attn_tiled_h256_q32_k32_sg4",
+            "qwen35_attn_tiled_h256_q32_k64_sg4",
+            "qwen35_attn_tiled_h256_q64_k32_sg8",
+            "qwen35_attn_tiled_h256_q64_k64_sg8",
             "qwen35_score_rows_f32",
             "qwen35_score_rows_bf16",
         ] {
@@ -3399,18 +3402,37 @@ fn max_err(got: &[f32], want: &[f64]) -> f64 {
         .fold(0.0, f64::max)
 }
 
+/// One `attn_prefill_with_tile` call into a fresh sentinel-filled output.
+#[allow(clippy::too_many_arguments)]
+fn run_tiled(
+    rt: &Arc<GpuRuntime>,
+    (q, k, v): (&GpuBuffer, &GpuBuffer, &GpuBuffer),
+    (tkv, qpos, kvpos): (&GpuBuffer, &GpuBuffer, &GpuBuffer),
+    dims: tessl::nn::AttnDims,
+    n: usize,
+    bf16: bool,
+    tile: qwen35::AttnTile,
+) -> GpuBuffer {
+    let o = seeded(rt, n, SENTINEL);
+    qwen35::attn_prefill_with_tile(rt, q, k, v, &o, tkv, qpos, kvpos, dims, bf16, tile).unwrap();
+    o
+}
+
 #[test]
 fn attn_prefill_matches_an_f64_reference_as_closely_as_flash_attn_rows() {
-    // (batch, tq, live tkv, capacity, q_pos_offset, kv_pos_offset). The block
-    // is 32 queries by 32 keys: one query; either side of one block; a few
-    // hundred (several blocks on and below the diagonal); a continuation whose
-    // queries start mid-cache; a key offset; and leading queries that precede
-    // every key, which must come out as zeros.
-    let cases: [(usize, usize, usize, usize, usize, usize); 8] = [
+    // (batch, tq, live tkv, capacity, q_pos_offset, kv_pos_offset), run at
+    // every tile (32 or 64 queries by 32 or 64 keys): one query; either side
+    // of each block edge; a few hundred (several blocks on and below the
+    // diagonal); a continuation whose queries start mid-cache; a key offset;
+    // and leading queries that precede every key, which must come out zeros.
+    let cases: [(usize, usize, usize, usize, usize, usize); 11] = [
         (1, 1, 1, 1, 0, 0),
         (1, 31, 31, 40, 0, 0),
         (1, 32, 32, 32, 0, 0),
         (2, 33, 33, 35, 0, 0),
+        (1, 63, 63, 70, 0, 0),
+        (1, 64, 64, 64, 0, 0),
+        (2, 65, 65, 66, 0, 0),
         (2, 300, 300, 301, 0, 0),
         (2, 37, 100, 128, 63, 0),
         (1, 50, 50, 64, 40, 30),
@@ -3438,8 +3460,6 @@ fn attn_prefill_matches_an_f64_reference_as_closely_as_flash_attn_rows() {
             let qpos = buf_u32(rt, &[q_off as u32]);
             let kvpos = buf_u32(rt, &[kv_off as u32]);
             let dims = pfx_dims(batch, tq);
-            let label = format!("B{batch} Tq{tq} Tkv{tkv}/{cap} q@{q_off} k@{kv_off}");
-
             let scalar = seeded(rt, n, SENTINEL);
             tessl::nn::flash_attn_rows(
                 rt,
@@ -3455,51 +3475,46 @@ fn attn_prefill_matches_an_f64_reference_as_closely_as_flash_attn_rows() {
                 false,
             )
             .unwrap();
-            let tiled = seeded(rt, n, SENTINEL);
-            qwen35::attn_prefill(rt, &qb, &kb, &vb, &tiled, &tkvb, &qpos, &kvpos, dims, false)
-                .unwrap();
-            let tiled_bf16 = seeded(rt, n, SENTINEL);
-            qwen35::attn_prefill(
-                rt,
-                &qb,
-                &kb,
-                &vb,
-                &tiled_bf16,
-                &tkvb,
-                &qpos,
-                &kvpos,
-                dims,
-                true,
-            )
-            .unwrap();
             rt.synchronize().unwrap();
-
-            let (s, t) = (scalar.read_f32(), tiled.read_f32());
-            let (s, t) = (&s[..n], &t[..n]);
-            assert!(
-                t.iter().all(|x| x.is_finite()),
-                "{label}: non-finite output (unwritten, or read a poisoned K/V slot)"
-            );
-            let (es, et) = (max_err(s, &want), max_err(t, &want));
-            eprintln!("{label}: max |err| scalar {es:.2e}, tiled {et:.2e}");
-            assert!(
-                et <= 4.0 * es.max(1e-7),
-                "{label}: tiled error {et:.2e} is more than 4x the scalar kernel's {es:.2e}"
-            );
-            // Rows that precede every key are exactly zero, as in flash_attn_rows.
-            for (i, (&ti, &wi)) in t.iter().zip(&want).enumerate() {
-                if wi == 0.0 {
-                    assert_eq!(ti, 0.0, "{label}[{i}]: a fully masked row must be zeros");
-                }
-            }
-            // The bf16 store is the f32 result rounded, element for element.
-            let rounded = f32_slice_to_bf16(t);
-            let got16 = &tiled_bf16.contents_u16()[..n];
-            for (i, (&g, &w)) in got16.iter().zip(&rounded).enumerate() {
-                assert_eq!(
-                    g, w,
-                    "{label}[{i}]: bf16 output {g:#x} vs rounded f32 {w:#x}"
+            let s = scalar.read_f32();
+            let es = max_err(&s[..n], &want);
+            for tile in qwen35::AttnTile::ALL {
+                let label = format!(
+                    "{} B{batch} Tq{tq} Tkv{tkv}/{cap} q@{q_off} k@{kv_off}",
+                    tile.label()
                 );
+                let bufs = (&qb, &kb, &vb);
+                let scalars = (&tkvb, &qpos, &kvpos);
+                let tiled = run_tiled(rt, bufs, scalars, dims, n, false, tile);
+                let tiled_bf16 = run_tiled(rt, bufs, scalars, dims, n, true, tile);
+                rt.synchronize().unwrap();
+                let t = tiled.read_f32();
+                let t = &t[..n];
+                assert!(
+                    t.iter().all(|x| x.is_finite()),
+                    "{label}: non-finite output (unwritten, or read a poisoned K/V slot)"
+                );
+                let et = max_err(t, &want);
+                eprintln!("{label}: max |err| scalar {es:.2e}, tiled {et:.2e}");
+                assert!(
+                    et <= 4.0 * es.max(1e-7),
+                    "{label}: tiled error {et:.2e} is more than 4x the scalar kernel's {es:.2e}"
+                );
+                // Rows that precede every key are exactly zero, as in flash_attn_rows.
+                for (i, (&ti, &wi)) in t.iter().zip(&want).enumerate() {
+                    if wi == 0.0 {
+                        assert_eq!(ti, 0.0, "{label}[{i}]: a fully masked row must be zeros");
+                    }
+                }
+                // The bf16 store is the f32 result rounded, element for element.
+                let rounded = f32_slice_to_bf16(t);
+                let got16 = &tiled_bf16.contents_u16()[..n];
+                for (i, (&g, &w)) in got16.iter().zip(&rounded).enumerate() {
+                    assert_eq!(
+                        g, w,
+                        "{label}[{i}]: bf16 output {g:#x} vs rounded f32 {w:#x}"
+                    );
+                }
             }
         }
 
@@ -3513,7 +3528,7 @@ fn attn_prefill_matches_an_f64_reference_as_closely_as_flash_attn_rows() {
         let v = buf(rt, &random_f32(batch * t * PFX_HKV * PFX_D, 9192));
         let (qb, tkv, zero) = (buf(rt, &q), buf_u32(rt, &[t as u32]), buf_u32(rt, &[0]));
         let dims = pfx_dims(batch, t);
-        let (scalar, tiled) = (seeded(rt, n, SENTINEL), seeded(rt, n, SENTINEL));
+        let scalar = seeded(rt, n, SENTINEL);
         tessl::nn::flash_attn_rows(
             rt,
             &qb,
@@ -3528,12 +3543,30 @@ fn attn_prefill_matches_an_f64_reference_as_closely_as_flash_attn_rows() {
             false,
         )
         .unwrap();
-        qwen35::attn_prefill(rt, &qb, &k, &v, &tiled, &tkv, &zero, &zero, dims, false).unwrap();
         rt.synchronize().unwrap();
         let want: Vec<f64> = scalar.read_f32()[..n].iter().map(|&x| x as f64).collect();
-        let diff = max_err(&tiled.read_f32()[..n], &want);
-        eprintln!("B{batch} T{t}: max |tiled - scalar| {diff:.2e}");
-        assert!(diff <= 1e-5, "B{batch} T{t}: tiled vs scalar {diff:.2e}");
+        for tile in qwen35::AttnTile::ALL {
+            let tiled = run_tiled(
+                rt,
+                (&qb, &k, &v),
+                (&tkv, &zero, &zero),
+                dims,
+                n,
+                false,
+                tile,
+            );
+            rt.synchronize().unwrap();
+            let diff = max_err(&tiled.read_f32()[..n], &want);
+            eprintln!(
+                "{} B{batch} T{t}: max |tiled - scalar| {diff:.2e}",
+                tile.label()
+            );
+            assert!(
+                diff <= 1e-5,
+                "{} B{batch} T{t}: tiled vs scalar {diff:.2e}",
+                tile.label()
+            );
+        }
     });
 }
 
@@ -3567,22 +3600,25 @@ fn attn_prefill_rejects_a_window_and_bad_storage() {
                 pfx_dims(batch, tq),
                 false,
             ),
-            "qwen35::attn_prefill",
+            "qwen35::attn_prefill o: buffer holds",
         );
+        // K/V big enough to hold an output, so the alias check is what fires.
+        let big_k = buf(rt, &random_f32(n, 9203));
+        let big_v = buf(rt, &random_f32(n, 9204));
         expect_err(
             qwen35::attn_prefill(
                 rt,
                 &q,
-                &k,
-                &v,
-                &k,
+                &big_k,
+                &big_v,
+                &big_k,
                 &tkv,
                 &zero,
                 &zero,
                 pfx_dims(batch, tq),
                 false,
             ),
-            "qwen35::attn_prefill",
+            "qwen35::attn_prefill: output must not alias read-only k input",
         );
     });
 }

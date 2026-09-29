@@ -47,7 +47,7 @@ that fusion for Metal.
 | 6. Attention extras | `qwen35_attn_qk_norm_rope`, `qwen35_attn_gate_{f32,bf16}` | `attn_qk_norm_rope`, `attn_output_gate` | `q_norm`/`k_norm` (`1 + w`), `apply_rotary_pos_emb` (partial), `* sigmoid(gate)` |
 | 6b. Decode loops replayed from an ICB | `qwen35_attn_qk_norm_rope_posbuf` | `attn_qk_norm_rope_posbuf` | the position comes from a device buffer, like `rms_qkv_rope_posbuf` |
 | 6c. Shared-prefix attention | `qwen35_attn_prefix_rows`, `qwen35_attn_prefix_decode_{partial,reduce}` (+ `slot_base` in 6/6b) | `attn_prefix_rows`, `attn_prefix_decode`, `attn_qk_norm_rope_suffix{,_posbuf}` | attention over a per-row copy of a shared KV prefix, without the copy |
-| 6d. Prefill attention on the matrix units | `qwen35_attn_tiled_h256` | `attn_prefill` | causal `sdpa` over the layer's own K/V; `nn::flash_attn_rows` with both products on TensorOps |
+| 6d. Prefill attention on the matrix units | `qwen35_attn_tiled_h256_*` (4 tiles) | `attn_prefill`, `attn_prefill_with_tile` | causal `sdpa` over the layer's own K/V; `nn::flash_attn_rows` with both products on TensorOps |
 | 7. Score only the answer rows | `qwen35_score_rows_{f32,bf16}` | `score_answer_rows` | final norm + `lm_head`, restricted to the answer tokens |
 | 7b. Embedding gather | `qwen35_embed_rows_bf16` | `embed_rows` | `embed_tokens(ids)` from the bf16 table, on the device, so a forward needs no host gather |
 | 8. Fused projections | tessl's GEMM | `pack_linear_weights_*`, `fused_projection`, `project_residual` | `in_proj_qkv/z/b/a`, `q/k/v_proj`, `out_proj` + residual |
@@ -214,10 +214,10 @@ attention layer at 28732de, about 1.6 TFLOP/s and half the whole forward. The
 same machine's exact-f32 TensorOps GEMM runs at 6.4 TFLOP/s
 (`docs/benchmarking.md`).
 
-`attn_prefill` (`qwen35_attn_tiled_h256`) is FlashAttention-2 with both
+`attn_prefill` (`qwen35_attn_tiled_h256_*`) is FlashAttention-2 with both
 products on `mpp::tensor_ops::matmul2d`, in exact f32 (`relaxed_precision`
-off). Each threadgroup takes 32 queries of one head. It walks the keys in
-blocks of 32, only up to its last query's position, so blocks above the
+off). Each threadgroup takes BQ queries of one head. It walks the keys in
+blocks of BK, only up to its last query's position, so blocks above the
 diagonal are never visited. Per block:
 
 1. `S = Q·Kᵀ` into a cooperative tensor, stored to threadgroup memory.
@@ -237,7 +237,7 @@ each is ~1e-6 from an f64 reference (details under Verification).
 
 The shared-prefix kernels (6c) are still the scalar `flash_attn_rows`
 instantiation. They serve the questions, a few tokens each over the prefix,
-where the tiled kernel's 32-query blocks would sit mostly idle. A prefix
+where the tiled kernel's query blocks would sit mostly idle. A prefix
 prefilled by `attn_prefill` and continued by `attn_prefix_rows` therefore
 mixes the two kernels' rounding, at the ~1e-6 level above.
 
@@ -471,8 +471,11 @@ throughput in prefill tokens/s. `+lm_head` adds the full-vocab head, timed on
 
 The attention stage alone, per layer, `attn_prefill` vs `flash_attn_rows`:
 0.91 vs 2.28 ms at T = 1024, 2.89 vs 10.12 at 2048, and 43.1 vs 140.1 at 8192.
-At 8192 that is 275 GFLOP in 43 ms, 6.4 TFLOP/s: the exact-f32 TensorOps
-GEMM ceiling. The next factor needs bf16 operands.
+At 8192 that is 275 GFLOP in 43 ms, 6.4 TFLOP/s. That equals the measured
+exact-f32 GEMM in `docs/benchmarking.md`, but that GEMM is a single-simdgroup
+kernel with no register accumulator, and this one is cooperative. Whether
+6.4 is the units' exact-f32 limit is untested. The tile sweep (`AttnTile`,
+`--attn-tile`) is the test.
 
 The 1k and 2k forwards do not show the stage saving. In that run the GEMM
 stages also came out 10–20% slower than in the control run straight after,
@@ -498,8 +501,8 @@ is the largest non-GEMM share: 18 × 1.4 ms.
   share its K/V lines in one threadgroup, but no measurement says that is
   worth doing yet.
 - **Prefill attention, remaining gaps.** `attn_prefill` is exact f32
-  TensorOps, whose GEMM ceiling on this machine is 6.4 TFLOP/s against
-  26.6 for bf16. A variant that casts the Q/K/V tiles to bf16 on load, with
+  TensorOps. The measured exact-f32 GEMM on this machine reaches 6.4 TFLOP/s,
+  against 26.6 for bf16. A variant that casts the Q/K/V tiles to bf16 on load, with
   f32 accumulation and softmax, is the next step. It would move the
   attention output by bf16 rounding, which has to be measured at the model's
   logits first. Each of a KV head's 4 query heads reads that head's K/V
@@ -513,4 +516,5 @@ is the largest non-GEMM share: 18 × 1.4 ms.
   products are uneven across simdgroups (triangular). Both are
   performance-only.
 - **Untuned tiles.** GDN's 64-row chunks and 32-column value slices, and the
-  prefill attention's 32x32 blocks, are first choices, not swept ones.
+  prefill attention's tile (`ATTN_PREFILL_TILE`, 32x32), are first
+  choices, not swept ones. Four attention tiles are compiled for the sweep.

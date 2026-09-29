@@ -24,13 +24,14 @@ All notable changes to `tessl` are recorded here. The format follows
   - Fused-projection helpers: weight packing, column layouts that every kernel
     reads in place, and `project_residual` (the residual add as a GEMM
     epilogue).
-- **Prefill attention on the TensorOps matrix units** (`qwen35_attn_tiled_h256`,
+- **Prefill attention on the TensorOps matrix units** (`qwen35_attn_tiled_h256_*`,
   `qwen35::attn_prefill`): `flash_attn_rows`' contract at head_dim 256 and
   `window = 0`, with `Q·Kᵀ` and `P·V` on `matmul2d` in exact f32 over
-  32x32 blocks and an f32 online softmax between them. It skips key blocks
+  query-by-key blocks (four geometries, `qwen35::AttnTile`,
+  `attn_prefill_with_tile`) and an f32 online softmax between them. It skips key blocks
   above the diagonal. `bench_qwen35_layers` now times it, and
-  `--attn-rows` selects the scalar kernel. `nn::validate_rows_attn_call` is
-  the one check of that buffer contract, used by both.
+  `--attn-tile=LABEL` / `--attn-rows` select another tile or the scalar
+  kernel.
 - **Shared-prefix attention for Qwen3.5** (`qwen35_attn_prefix_rows`,
   `qwen35::attn_prefix_rows`). Many questions over one prefilled context now
   share the 6 full-attention layers' KV prefix at batch stride 0, as the GDN

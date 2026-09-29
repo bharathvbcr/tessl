@@ -872,17 +872,24 @@ def case_host_contract():
         print(f"  [{'ok  ' if ok else 'FAIL'}] {host} = {consts[host]} vs kernel {kernel} x{scale} = {kc[kernel] * scale}")
         if not ok:
             FAILURES.append(f"constant {host}")
-    # The harness cannot include the TensorOps kernel, so its constants are read
-    # from the source.
+    # The harness cannot include the TensorOps kernel, so its geometry is read
+    # from the source: each instantiation's name spells the (BQ, BK, NSG) the
+    # host builds its grid from, and must match the arguments it passes.
     import re
     tiled = open(os.path.join(ROOT, "kernels", "qwen35_attn_tiled.metal")).read()
-    tc = {m.group(1): int(m.group(2)) for m in re.finditer(r"^constant uint (\w+) = (\d+);", tiled, re.M)}
-    for host, kernel in [("TILED_ATTN_BQ", "TILED_ATTN_BQ"), ("TILED_ATTN_SIMDGROUPS", "TILED_ATTN_SG"),
-                         ("PREFIX_ATTN_HEAD_DIM", "TILED_ATTN_D")]:
-        ok = consts[host] == tc[kernel]
-        print(f"  [{'ok  ' if ok else 'FAIL'}] {host} = {consts[host]} vs kernel {kernel} = {tc[kernel]} (source)")
+    insts = re.findall(r"^TILED_ATTN_KERNEL\((\w+), (\d+), (\d+), (\d+)\)", tiled, re.M)
+    if not insts:
+        FAILURES.append("no TILED_ATTN_KERNEL instantiations found")
+    for name, bq, bk, sg in insts:
+        ok = name.endswith(f"_q{bq}_k{bk}_sg{sg}")
+        print(f"  [{'ok  ' if ok else 'FAIL'}] {name} spells its geometry ({bq}, {bk}, {sg})")
         if not ok:
-            FAILURES.append(f"constant {host}")
+            FAILURES.append(f"geometry of {name}")
+    d = re.search(r"^constant uint TILED_ATTN_D = (\d+);", tiled, re.M)
+    ok = d is not None and int(d.group(1)) == consts["PREFIX_ATTN_HEAD_DIM"]
+    print(f"  [{'ok  ' if ok else 'FAIL'}] PREFIX_ATTN_HEAD_DIM = {consts['PREFIX_ATTN_HEAD_DIM']} vs kernel TILED_ATTN_D (source)")
+    if not ok:
+        FAILURES.append("constant TILED_ATTN_D")
 
 
 CASES = [

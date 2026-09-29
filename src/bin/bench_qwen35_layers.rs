@@ -5,11 +5,13 @@
 //! cargo run --release --bin bench_qwen35_layers -- 1024 4096    # chosen T
 //! cargo run --release --bin bench_qwen35_layers -- --check-only # plausibility gate, no timing
 //! cargo run --release --bin bench_qwen35_layers -- --attn-rows  # scalar nn::flash_attn_rows
+//! cargo run --release --bin bench_qwen35_layers -- --attn-tile=q64_k64_sg8
 //! ```
 //!
-//! Attention runs on `qwen35::attn_prefill` (the TensorOps kernel) unless
-//! `--attn-rows` selects `nn::flash_attn_rows`, the kernel it replaced, so the
-//! two can be compared in one binary on one machine state.
+//! Attention runs on `qwen35::attn_prefill` (the TensorOps kernel) at its
+//! default tile. `--attn-tile=LABEL` picks another `qwen35::AttnTile`, and
+//! `--attn-rows` selects `nn::flash_attn_rows`, the kernel it replaced. So
+//! the choices can be compared in one binary on one machine state.
 //!
 //! Shapes are Qwen3.5-2B's `text_config` (hidden 2048, 16 key and 16 value GDN
 //! heads of 128, 8 query and 2 KV attention heads of 256, rotary 64, MLP 6144,
@@ -422,9 +424,16 @@ const ATTN_STAGES: [&str; 5] = [
     "o-proj + resid",
 ];
 
-/// `--attn-rows`: time the scalar `nn::flash_attn_rows` instead of
-/// `qwen35::attn_prefill`.
-static ATTN_ROWS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+/// Which attention kernel the attention stage times.
+#[derive(Clone, Copy, Debug)]
+enum AttnChoice {
+    /// `--attn-rows`: the scalar `nn::flash_attn_rows`.
+    Rows,
+    /// `qwen35::attn_prefill_with_tile` (default: `ATTN_PREFILL_TILE`).
+    Tiled(qwen35::AttnTile),
+}
+
+static ATTN: std::sync::OnceLock<AttnChoice> = std::sync::OnceLock::new();
 
 fn attn_stage(rt: &Arc<GpuRuntime>, m: &Model, w: &AttnWeights, a: &Acts, s: usize) -> Res<()> {
     let pc = Cols::dense(&a.a_proj.buffer, m.attn.width());
@@ -462,10 +471,13 @@ fn attn_stage(rt: &Arc<GpuRuntime>, m: &Model, w: &AttnWeights, a: &Acts, s: usi
                 scale: 1.0 / (HEAD_DIM as f32).sqrt(),
             };
             let (q, k, v, o, pos) = (&a.a_q, &a.a_kc, &a.a_vc, &a.a_o, &a.zero_pos);
-            if *ATTN_ROWS.get().expect("set in main") {
-                nn::flash_attn_rows(rt, q, k, v, o, &a.tkv, pos, pos, dims, HEAD_DIM, false)
-            } else {
-                qwen35::attn_prefill(rt, q, k, v, o, &a.tkv, pos, pos, dims, false)
+            match *ATTN.get().expect("set in main") {
+                AttnChoice::Rows => {
+                    nn::flash_attn_rows(rt, q, k, v, o, &a.tkv, pos, pos, dims, HEAD_DIM, false)
+                }
+                AttnChoice::Tiled(tile) => qwen35::attn_prefill_with_tile(
+                    rt, q, k, v, o, &a.tkv, pos, pos, dims, false, tile,
+                ),
             }
         }
         3 => qwen35::attn_output_gate(
@@ -707,16 +719,29 @@ fn lm_head_ms_per_row(rt: &Arc<GpuRuntime>) -> Res<f64> {
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut check_only = false;
-    let mut attn_rows = false;
+    let mut attn = AttnChoice::Tiled(qwen35::ATTN_PREFILL_TILE);
     let mut ts = Vec::new();
     for arg in std::env::args().skip(1) {
         if arg == "--check-only" {
             check_only = true;
         } else if arg == "--attn-rows" {
-            attn_rows = true;
+            attn = AttnChoice::Rows;
+        } else if let Some(label) = arg.strip_prefix("--attn-tile=") {
+            let tile = qwen35::AttnTile::ALL
+                .into_iter()
+                .find(|t| t.label() == label)
+                .ok_or_else(|| {
+                    let known: Vec<String> =
+                        qwen35::AttnTile::ALL.iter().map(|t| t.label()).collect();
+                    format!("unknown --attn-tile {label:?}; one of {}", known.join(", "))
+                })?;
+            attn = AttnChoice::Tiled(tile);
         } else {
             let t: usize = arg.parse().map_err(|_| {
-                format!("expected a token count, --check-only or --attn-rows, got {arg:?}")
+                format!(
+                    "expected a token count, --check-only, --attn-rows or --attn-tile=LABEL, \
+                     got {arg:?}"
+                )
             })?;
             if t == 0 {
                 return Err("T must be positive".into());
@@ -740,17 +765,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let n_attn = (0..LAYERS).filter(|&l| is_full_attention(l)).count();
     let n_gdn = LAYERS - n_attn;
     println!("layers: {n_gdn} GDN + {n_attn} attention, batch 1, bf16 weights distinct per layer");
-    ATTN_ROWS
-        .set(attn_rows)
+    ATTN.set(attn)
         .map_err(|_| "attention kernel chosen twice")?;
-    println!(
-        "attention kernel: {}",
-        if attn_rows {
-            "nn::flash_attn_rows (scalar f32)"
-        } else {
-            "qwen35::attn_prefill (TensorOps f32)"
-        }
-    );
+    match attn {
+        AttnChoice::Rows => println!("attention kernel: nn::flash_attn_rows (scalar f32)"),
+        AttnChoice::Tiled(tile) => println!(
+            "attention kernel: qwen35::attn_prefill (TensorOps f32), tile {}",
+            tile.label()
+        ),
+    }
 
     let t0 = Instant::now();
     let model = Model::new(&rt)?;

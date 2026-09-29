@@ -258,7 +258,10 @@ The shared-prefix kernels (6c) are still the scalar `flash_attn_rows`
 instantiation. They serve the questions, a few tokens each over the prefix,
 where the tiled kernel's query blocks would sit mostly idle. A prefix
 prefilled by `attn_prefill` and continued by `attn_prefix_rows` therefore
-mixes the two kernels' rounding, at the ~1e-6 level above.
+mixes the two kernels' rounding. A test holds three 37-token questions over
+one 200-token prefix, through `attn_prefix_rows`, to `attn_prefill` over
+each row's whole sequence. They agree to 6–8e-7, and the bound is 1e-5.
+Moving the prefix/suffix boundary by one moves them by 9e-2.
 
 ### The MLP activation
 

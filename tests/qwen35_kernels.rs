@@ -3798,6 +3798,97 @@ fn attn_prefill_matches_an_f64_reference_as_closely_as_flash_attn_rows() {
 }
 
 #[test]
+fn attn_prefix_rows_continuing_attn_prefill_matches_attn_prefill_on_the_whole_row() {
+    // Lappi's shape of use: a context prefilled with `attn_prefill`, then
+    // several questions attending to it through `attn_prefix_rows` without a
+    // per-row copy. The two kernels round differently (matrix units vs scalar
+    // f32), so each question's attention must agree with `attn_prefill` over
+    // that row's own `prefix ‖ suffix` to rounding, not bit for bit.
+    with_gpu(|rt| {
+        let (batch, p, s) = (3usize, 200usize, 37usize);
+        let t = p + s;
+        let row = PFX_HKV * PFX_D;
+        let qrow = PFX_HQ * PFX_D;
+        let pk = random_f32(p * row, 9300);
+        let pv = random_f32(p * row, 9301);
+        let sk = random_f32(batch * s * row, 9302);
+        let sv = random_f32(batch * s * row, 9303);
+        let q: Vec<f32> = random_f32(batch * s * qrow, 9304)
+            .iter()
+            .map(|x| 4.0 * x)
+            .collect();
+        let (pkb, pvb, skb, svb, qb) = (
+            buf(rt, &pk),
+            buf(rt, &pv),
+            buf(rt, &sk),
+            buf(rt, &sv),
+            buf(rt, &q),
+        );
+        let (slen, qpos) = (buf_u32(rt, &[s as u32]), buf_u32(rt, &[p as u32]));
+        let got = seeded(rt, batch * s * qrow, SENTINEL);
+        let prefix = qwen35::SharedPrefix {
+            k: &pkb,
+            v: &pvb,
+            len: p as u32,
+        };
+        qwen35::attn_prefix_rows(
+            rt,
+            &qb,
+            prefix,
+            &skb,
+            &svb,
+            &slen,
+            &qpos,
+            &got,
+            pfx_dims(batch, s),
+            false,
+        )
+        .unwrap();
+        rt.synchronize().unwrap();
+        let got = got.read_f32();
+        for b in 0..batch {
+            // Row b alone, as one sequence: its whole cache, and queries for
+            // every position with the question's at the end.
+            let mut fk = pk.clone();
+            fk.extend_from_slice(&sk[b * s * row..(b + 1) * s * row]);
+            let mut fv = pv.clone();
+            fv.extend_from_slice(&sv[b * s * row..(b + 1) * s * row]);
+            let mut fq = random_f32(p * qrow, 9310 + b as u64);
+            fq.extend_from_slice(&q[b * s * qrow..(b + 1) * s * qrow]);
+            let full = seeded(rt, t * qrow, SENTINEL);
+            let (tkv, zero) = (buf_u32(rt, &[t as u32]), buf_u32(rt, &[0]));
+            let (fkb, fvb, fqb) = (buf(rt, &fk), buf(rt, &fv), buf(rt, &fq));
+            qwen35::attn_prefill(
+                rt,
+                &fqb,
+                &fkb,
+                &fvb,
+                &full,
+                &tkv,
+                &zero,
+                &zero,
+                pfx_dims(1, t),
+                false,
+            )
+            .unwrap();
+            rt.synchronize().unwrap();
+            let want: Vec<f64> = full.read_f32()[p * qrow..t * qrow]
+                .iter()
+                .map(|&x| x as f64)
+                .collect();
+            let mine = &got[b * s * qrow..(b + 1) * s * qrow];
+            assert!(mine.iter().all(|x| x.is_finite()), "row {b}: non-finite");
+            let diff = max_err(mine, &want);
+            eprintln!("row {b}: max |prefix_rows - attn_prefill| {diff:.2e}");
+            assert!(
+                diff <= 1e-5,
+                "row {b}: shared-prefix questions vs attn_prefill {diff:.2e}"
+            );
+        }
+    });
+}
+
+#[test]
 fn attn_prefill_rejects_a_window_and_bad_storage() {
     with_gpu(|rt| {
         let (batch, tq, cap) = (1usize, 4usize, 4usize);

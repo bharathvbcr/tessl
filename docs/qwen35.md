@@ -131,8 +131,12 @@ the default `Cols32`, bit for bit the same result. At Qwen3.5-2B's shapes
 the 32-column scan is only 64 threadgroups at batch 1. `probe_gdn_scan`
 measured the scan at 1.37–1.55× its batch-1 time at batch 2, and 2.8× at
 batch 4, so batch 1 leaves the GPU partly idle. It is a same-session ratio
-under UI load. The default stays `Cols32` until a clean A/B
-(`probe_gdn_scan`, `bench_qwen35_layers --gdn-scan16`).
+under UI load. A first A/B at aae935f, also under UI load (GPU 51–59% busy),
+put the 16-column scan at 0.82× the 32-column scan at T = 8192, batch 1
+(6.79 vs 8.27 ms), but 1.10× at batch 2 and 1.30× at batch 4. At T = 1024 the
+batch-1 comparison was inside the noise. So the narrow slice helps a long
+batch-1 prefill and hurts larger batches. The default stays `Cols32`; a
+batch-dependent choice waits for a clean measurement.
 
 ### Many questions from one prefilled snapshot
 

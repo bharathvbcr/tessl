@@ -181,7 +181,13 @@ by `seq` now uses the row's own length: the conv's output bound and the
 window its carried state is taken from, the prep's row masks and the chunks it
 runs, the scan's chunk count and masks, and the recurrence's step count. So
 each row, `state_out` included, is bit-identical to that row run alone at its
-length, and its rows past that length are not written. The workspace is still
+length, and its rows past that length are not written. Those padded rows then
+flow through the rest of the layer as garbage (stale memory, NaN on the
+emulator). Every later op is row-wise or causal, so they never reach a real
+token, but their outputs are unspecified: never score them. The model check's
+ragged flow shows both halves. Leaving out `seq_lens` leaves the question
+logits intact but moves the next decode step's logits by ~13, because the
+carried state was taken at the padded length. The workspace is still
 laid out for `seq`. The scan stops at the row's own chunk count, so it never
 reads a chunk the prep skipped for that row, which on a workspace reused
 across layers would hold an earlier call's data.
@@ -279,6 +285,8 @@ model's own:
 | 3 questions from one 66-token snapshot (mixed recurrent and chunked GDN paths) | 2.7e-5 |
 | the same 3 questions with the attention's KV prefix shared (`qwen35_attn_prefix_rows`) | 1.4e-5 |
 | then one decode step per question (`qwen35_attn_prefix_decode`, per-row suffix cache and GDN state) | 3.3e-5 |
+| 3 questions of lengths 5, 2, 4 in one right-padded batch, through every `_varlen` path | 1.8e-5 |
+| then one decode step each, at each row's own position | 2.1e-5 |
 
 Four injected wiring errors were each caught with O(1) logit errors: gate
 columns swapped, the projection packed out of order, rotary width from the

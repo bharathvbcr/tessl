@@ -26,7 +26,10 @@ Three flows:
   `StateIn::Snapshot`, against the model run separately on each full sequence;
 - **shared_prefix**: the same, with the attention's KV prefix shared too
   (`qwen35_attn_prefix_rows`), then one decode step per question
-  (`qwen35_attn_prefix_decode`).
+  (`qwen35_attn_prefix_decode`);
+- **ragged**: questions of different lengths in one right-padded batch,
+  through every `_varlen` path, then one decode step each at its own
+  position.
 """
 
 import os
@@ -106,14 +109,19 @@ def kernel(name, params, inputs, outputs):
 # ------------------------------------------------------------------- layers
 
 
-def gdn_layer(attn, h, B, T, conv_state=None, gdn_state=None, snapshot=False, path="chunk"):
-    """One Qwen3_5GatedDeltaNet on the kernels. Returns (out, conv_state, gdn_state)."""
+def gdn_layer(attn, h, B, T, conv_state=None, gdn_state=None, snapshot=False, path="chunk", seq_lens=None):
+    """One Qwen3_5GatedDeltaNet on the kernels. Returns (out, conv_state, gdn_state).
+
+    `seq_lens` makes the rows ragged (flag 4): row b is seq_lens[b] tokens,
+    right-padded to T, and its carried states are taken at that length."""
+    lens = {} if seq_lens is None else {"seq_lens": torch.tensor(seq_lens, dtype=torch.int32)}
+    ragged = 0 if seq_lens is None else 4
     L = Layout
     proj = (h.reshape(B * T, HIDDEN) @ pack(attn.in_proj_qkv, attn.in_proj_z, attn.in_proj_b,
                                             attn.in_proj_a)).contiguous()           # the fused GEMM
     hist = KW - 1
-    conv_in = {"x": proj, "w": attn.conv1d.weight.detach().squeeze(1).contiguous()}
-    flags = 2
+    conv_in = {"x": proj, "w": attn.conv1d.weight.detach().squeeze(1).contiguous(), **lens}
+    flags = 2 | ragged
     if conv_state is not None:
         conv_in["state_in"] = conv_state
         flags |= 1
@@ -121,8 +129,8 @@ def gdn_layer(attn, h, B, T, conv_state=None, gdn_state=None, snapshot=False, pa
                dict(B=B, T=T, C=L.conv_dim, KW=KW, ld_x=L.width, x_off=0,
                     state_bstride=0 if snapshot else L.conv_dim * hist, flags=flags),
                conv_in, {"y": B * T * L.conv_dim, "state_out": B * L.conv_dim * hist})
-    g_in = {"qkv": c["y"], "ab": proj, "a_log": attn.A_log.detach(), "dt_bias": attn.dt_bias.detach()}
-    flags = 2
+    g_in = {"qkv": c["y"], "ab": proj, "a_log": attn.A_log.detach(), "dt_bias": attn.dt_bias.detach(), **lens}
+    flags = 2 | ragged
     if gdn_state is not None:
         g_in["state_in"] = gdn_state
         flags |= 1
@@ -139,23 +147,31 @@ def gdn_layer(attn, h, B, T, conv_state=None, gdn_state=None, snapshot=False, pa
     return out.reshape(B, T, HIDDEN), c["state_out"], o["state_out"]
 
 
-def attn_layer(sa, h, B, T, pos, k_cache, v_cache, prefix=None):
+def attn_layer(sa, h, B, T, pos, k_cache, v_cache, prefix=None, rows=None):
     """One Qwen3_5Attention on the kernels, appending to `[B, cap, Hkv, D]` caches.
 
     With `prefix = (kp, vp, P)` the caches are suffix caches (slot s is position
     P + s, written with slot_base = P, as `attn_qk_norm_rope_suffix` does) and
     the attention reads the shared `[P, Hkv, D]` prefix at batch stride 0:
-    `qwen35_attn_prefix_rows`, or `qwen35_attn_prefix_decode` for one token."""
+    `qwen35_attn_prefix_rows`, or `qwen35_attn_prefix_decode` for one token.
+
+    With `rows = {"pos": [..], "suffix_lens": [..]}` (shared prefix only) each
+    row has its own token-0 position and live suffix length: the per-row
+    writer (`attn_qk_norm_rope_suffix_rows`, pos_stride 1) and the `_varlen`
+    attention (row_stride 1)."""
     L = Layout
     cap = k_cache.shape[1]
     P = 0 if prefix is None else prefix[2]
     proj = (h.reshape(B * T, HIDDEN) @ pack(sa.q_proj, sa.k_proj, sa.v_proj)).contiguous()
-    r = kernel("qwen35_attn_qk_norm_rope",
-               dict(B=B, T=T, Hq=HQ, Hkv=HKV, D=D, rotary_dim=D // 4, ld_p=L.attn_width, q_off=0,
-                    k_off=L.attn_k_off, v_off=L.attn_v_off, pos_offset=pos, kv_capacity=cap,
-                    theta=1e7, eps=EPS, slot_base=P),
-               {"p": proj, "q_norm_w": sa.q_norm.weight.detach(), "k_norm_w": sa.k_norm.weight.detach(),
-                "k_cache": k_cache, "v_cache": v_cache},
+    rope_params = dict(B=B, T=T, Hq=HQ, Hkv=HKV, D=D, rotary_dim=D // 4, ld_p=L.attn_width, q_off=0,
+                       k_off=L.attn_k_off, v_off=L.attn_v_off, pos_offset=pos, kv_capacity=cap,
+                       theta=1e7, eps=EPS, slot_base=P)
+    rope_in = {"p": proj, "q_norm_w": sa.q_norm.weight.detach(), "k_norm_w": sa.k_norm.weight.detach(),
+               "k_cache": k_cache, "v_cache": v_cache}
+    if rows is not None:
+        rope_params.update(pos_offset=0, posbuf=1, pos_stride=1)
+        rope_in["pos_buf"] = torch.tensor(rows["pos"], dtype=torch.int32)
+    r = kernel("qwen35_attn_qk_norm_rope", rope_params, rope_in,
                {"q_out": B * T * HQ * D, "k_cache": k_cache.numel(), "v_cache": v_cache.numel()})
     q = r["q_out"].reshape(B, T, HQ, D)
     kc = r["k_cache"].reshape(B, cap, HKV, D)
@@ -177,21 +193,41 @@ def attn_layer(sa, h, B, T, pos, k_cache, v_cache, prefix=None):
     else:
         kp, vp, _ = prefix
         name = "qwen35_attn_prefix_decode" if T == 1 else "qwen35_attn_prefix_rows"
-        fa = cq.run(name, dict(B=B, Tq=T, H=HQ, Hkv=HKV, P=P, suffix_cap=cap, scale=D ** -0.5),
+        if rows is None:
+            lens_t, qpos_t, extra = torch.tensor([n - P], dtype=torch.int32), q_pos, {}
+        else:
+            lens_t = torch.tensor(rows["suffix_lens"], dtype=torch.int32)
+            qpos_t = torch.tensor(rows["pos"], dtype=torch.int32)
+            extra = {"row_stride": 1}
+        fa = cq.run(name, dict(B=B, Tq=T, H=HQ, Hkv=HKV, P=P, suffix_cap=cap, scale=D ** -0.5, **extra),
                     {"q": q.contiguous(), "kp": kp, "vp": vp, "ks": kc.contiguous(), "vs": vc.contiguous(),
-                     "suffix_len": torch.tensor([n - P], dtype=torch.int32), "q_pos": q_pos},
+                     "suffix_len": lens_t, "q_pos": qpos_t},
                     {"o": ("f32", B * T * HQ * D)})
-        k_all = torch.cat([kp.expand(B, P, HKV, D), kc[:, :n - P]], dim=1)
-        v_all = torch.cat([vp.expand(B, P, HKV, D), vc[:, :n - P]], dim=1)
     a = fa["o"].reshape(B * T, HQ * D).contiguous()
-    # The same attention in torch, so a disagreement names the attention kernel
-    # rather than surfacing only as wrong logits three steps later.
-    kk = k_all.repeat_interleave(HQ // HKV, dim=2)
-    vv = v_all.repeat_interleave(HQ // HKV, dim=2)
-    sc = torch.einsum("bthd,bshd->bhts", q, kk) * D ** -0.5
-    mask = torch.arange(n)[None, :] > (pos + torch.arange(T))[:, None]
-    ref = torch.einsum("bhts,bshd->bthd", sc.masked_fill(mask, float("-inf")).softmax(-1), vv)
-    cq.check(f"{name} vs torch (B{B} T{T} pos{pos})", a, ref.reshape(B * T, HQ * D), 1e-5, 1e-5)
+    # The same attention in torch, per row, so a disagreement names the
+    # attention kernel rather than surfacing only as wrong logits later.
+    ref = torch.empty(B, T, HQ, D)
+    for b in range(B):
+        if prefix is None:
+            p0, k_all, v_all = pos, kc[b, :n], vc[b, :n]
+        else:
+            p0 = pos if rows is None else rows["pos"][b]
+            live = n - P if rows is None else rows["suffix_lens"][b]
+            k_all = torch.cat([kp[:P], kc[b, :live]], dim=0)
+            v_all = torch.cat([vp[:P], vc[b, :live]], dim=0)
+        kk = k_all.repeat_interleave(HQ // HKV, dim=1)
+        vv = v_all.repeat_interleave(HQ // HKV, dim=1)
+        sc = torch.einsum("thd,shd->hts", q[b], kk) * D ** -0.5
+        mask = torch.arange(k_all.shape[0])[None, :] > (p0 + torch.arange(T))[:, None]
+        ref[b] = torch.einsum("hts,shd->thd", sc.masked_fill(mask, float("-inf")).softmax(-1), vv)
+    where = f"pos{pos}" if rows is None else f"pos{rows['pos']} lens{rows['suffix_lens']}"
+    # Only real queries: in a ragged batch the layers before leave padded rows
+    # unwritten (NaN here), so their outputs are unspecified by contract.
+    real = torch.ones(B, T, dtype=torch.bool)
+    if rows is not None and rows.get("seq_lens") is not None:
+        real = torch.arange(T)[None, :] < torch.tensor(rows["seq_lens"])[:, None]
+    cq.check(f"{name} vs torch (B{B} T{T} {where}, real queries)", a.reshape(B, T, -1)[real],
+             ref.reshape(B, T, -1)[real], 1e-5, 1e-5)
     gt = kernel("qwen35_attn_gate_f32",
                 dict(rows=B * T, Hq=HQ, D=D, ld_p=L.attn_width, q_off=0, ld_out=HQ * D, out_off=0),
                 {"attn": a, "p": proj}, {"out": B * T * HQ * D})
@@ -206,12 +242,16 @@ class State:
         self.conv, self.gdn, self.k, self.v = {}, {}, {}, {}
 
 
-def forward(model, ids, pos=0, state=None, cap=None, snapshot=False, paths=None, shared=None):
+def forward(model, ids, pos=0, state=None, cap=None, snapshot=False, paths=None, shared=None, rows=None):
     """Run the stack on the kernels. `ids` [B, T]. Returns (hidden [B*T, H], state).
 
     `shared` runs attention over a shared prefix: {"P": P, "prefix": {layer:
     (kp, vp)}, "cap": suffix capacity, "suffix": {layer: (kc, vc)} or absent
-    for a fresh suffix}. The state's K/V are then the suffix caches."""
+    for a fresh suffix}. The state's K/V are then the suffix caches.
+
+    `rows` (with `shared`) makes the batch ragged: {"pos": each row's token-0
+    position, "suffix_lens": each row's live suffix after this call,
+    "seq_lens": each row's real tokens in this call, or None when all T are}."""
     B, T = ids.shape
     cap = cap or pos + T
     st_in = state
@@ -225,7 +265,8 @@ def forward(model, ids, pos=0, state=None, cap=None, snapshot=False, paths=None,
                 layer.linear_attn, h, B, T,
                 conv_state=None if st_in is None else st_in.conv[i],
                 gdn_state=None if st_in is None else st_in.gdn[i],
-                snapshot=snapshot, path=(paths or {}).get(i, "chunk"))
+                snapshot=snapshot, path=(paths or {}).get(i, "chunk"),
+                seq_lens=None if rows is None else rows.get("seq_lens"))
         elif shared is not None:
             kp, vp = shared["prefix"][i]
             if "suffix" in shared:
@@ -234,14 +275,14 @@ def forward(model, ids, pos=0, state=None, cap=None, snapshot=False, paths=None,
                 kc = torch.full((B, shared["cap"], HKV, D), float("nan"))
                 vc = torch.full((B, shared["cap"], HKV, D), float("nan"))
             out, st.k[i], st.v[i] = attn_layer(layer.self_attn, h, B, T, pos, kc, vc,
-                                               prefix=(kp, vp, shared["P"]))
+                                               prefix=(kp, vp, shared["P"]), rows=rows)
         else:
             if st_in is None:
                 kc = torch.full((B, cap, HKV, D), float("nan"))
                 vc = torch.full((B, cap, HKV, D), float("nan"))
             else:
-                # A shared prefix's KV, copied per row: the attention kernel
-                # has a batch dimension (docs/qwen35.md, "Not done").
+                # The prefix's KV copied per row, so this flow runs tessl's
+                # own flash_attn_rows; flow_shared_prefix shares it instead.
                 kc = torch.full((B, cap, HKV, D), float("nan"))
                 vc = torch.full((B, cap, HKV, D), float("nan"))
                 kc[:, :pos] = st_in.k[i][:, :pos]
@@ -355,14 +396,58 @@ def flow_shared_prefix(model):
     compare(f"shared prefix: one decode step for each of {N} questions", lg, lp, want)
 
 
+def flow_ragged(model):
+    """Questions of different lengths over one shared prefix, in one batch:
+    right-padded to the longest, through the ragged conv / GDN (per-row
+    seq_lens), the per-row suffix writer and the _varlen attention; each
+    scored at its own last token, then one decode step each at its own
+    position from its own carried state."""
+    P, lens = 66, [5, 2, 4]
+    N, S = len(lens), max(lens)
+    g = torch.Generator().manual_seed(9)
+    prefix = torch.randint(0, VOCAB, (1, P), generator=g)
+    suffixes = torch.randint(0, VOCAB, (N, S), generator=g)   # past lens[b]: padding
+    nxt = torch.randint(0, VOCAB, (N, 1), generator=g)
+    _, st = forward(model, prefix, cap=P)
+    shared = {"P": P, "cap": S + 1,
+              "prefix": {i: (st.k[i][0].contiguous(), st.v[i][0].contiguous()) for i in st.k}}
+    paths = {0: "recurrent", 1: "chunk", 2: "chunk"}
+    rows = {"pos": [P] * N, "suffix_lens": lens, "seq_lens": lens}
+    h, st2 = forward(model, suffixes, pos=P, state=st, snapshot=True, paths=paths, shared=shared, rows=rows)
+    lg, lp = score(model, h, [b * S + lens[b] - 1 for b in range(N)])
+    with torch.no_grad():
+        want = torch.stack([model(torch.cat([prefix, suffixes[b:b + 1, :lens[b]]], 1)).logits[0, -1]
+                            for b in range(N)])
+    compare(f"ragged: questions of lengths {lens} in one batch", lg, lp, want)
+    step = dict(shared, suffix={i: (st2.k[i], st2.v[i]) for i in st2.k})
+    rows2 = {"pos": [P + n for n in lens], "suffix_lens": [n + 1 for n in lens], "seq_lens": None}
+    rec = {i: "recurrent" for i in range(3)}
+    h2, _ = forward(model, nxt, pos=P, state=st2, paths=rec, shared=step, rows=rows2)
+    lg, lp = score(model, h2, list(range(N)))
+    with torch.no_grad():
+        want = torch.stack([model(torch.cat([prefix, suffixes[b:b + 1, :lens[b]], nxt[b:b + 1]], 1)).logits[0, -1]
+                            for b in range(N)])
+    compare("ragged: one decode step each, at each row's own position", lg, lp, want)
+
+
 def main():
     torch.set_num_threads(1)
     cq.HARNESS = cq.build()
     # Order invariance is check_qwen35.py's job; one order keeps this quick.
     cq.ORDERS = ["forward"]
     model = build_model(35)
-    for name, flow in (("prefill", flow_prefill), ("decode", flow_decode), ("snapshot", flow_snapshot),
-                       ("shared_prefix", flow_shared_prefix)):
+    flows = (("prefill", flow_prefill), ("decode", flow_decode), ("snapshot", flow_snapshot),
+             ("shared_prefix", flow_shared_prefix), ("ragged", flow_ragged))
+    # Optional flow names on the command line select flows; none runs all.
+    wanted = sys.argv[1:]
+    unknown = [w for w in wanted if w not in dict(flows)]
+    if unknown:
+        # A filter that matches nothing must not report "all passed".
+        print(f"unknown flow(s) {unknown}; flows: {', '.join(n for n, _ in flows)}")
+        sys.exit(2)
+    for name, flow in flows:
+        if wanted and name not in wanted:
+            continue
         print(f"{name}:")
         flow(model)
     if cq.FAILURES:

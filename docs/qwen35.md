@@ -453,6 +453,39 @@ cargo test --release --test qwen35_kernels -- --test-threads=1
 cargo test --release --test shader_index_arithmetic   # includes the qwen35 sources
 ```
 
+## Performance
+
+`cargo run --release --bin bench_qwen35_layers` builds Qwen3.5-2B's shapes
+with random bf16 weights: 18 GDN and 6 attention layers, batch 1. It times
+the whole 24-layer forward in one command buffer, with 307 launches, and each
+stage alone. Before timing, every stage must pass a NaN-poison gate. Runs are
+on an M5 Pro, with nothing else of ours on the GPU. Forward times are in ms,
+throughput in prefill tokens/s. `+lm_head` adds the full-vocab head, timed on
+1024 rows and scaled linearly in T.
+
+| T | 28732de: `flash_attn_rows` (2 runs) | 8a881eb: `attn_prefill` | 8a881eb, `--attn-rows` (same state) |
+|---|---|---|---|
+| 1024 | 168.5 / 165.9 ms, 6078 / 6172 tok/s | 179.0 ms, 5722 tok/s | 164.1 ms, 6240 tok/s |
+| 2048 | 344.5 / 363.0 ms, 5945 / 5642 tok/s | 344.4 ms, 5946 tok/s | 340.3 ms, 6018 tok/s |
+| 8192 | 1986 / 1998 ms, 4124 / 4099 tok/s | **1318 ms, 6213 tok/s** (+lm_head 5004) | 1956 ms, 4189 tok/s |
+
+The attention stage alone, per layer, `attn_prefill` vs `flash_attn_rows`:
+0.91 vs 2.28 ms at T = 1024, 2.89 vs 10.12 at 2048, and 43.1 vs 140.1 at 8192.
+At 8192 that is 275 GFLOP in 43 ms, 6.4 TFLOP/s: the exact-f32 TensorOps
+GEMM ceiling. The next factor needs bf16 operands.
+
+The 1k and 2k forwards do not show the stage saving. In that run the GEMM
+stages also came out 10–20% slower than in the control run straight after,
+and the GPU read 85% busy at the start from something else. They are
+unresolved until re-run. For comparison, on the same machine MLX measured
+7,606 / 7,528 / 5,285 tok/s at 1k / 2k / 8k, and torch MPS about 2.8k at 1k
+(both by the Lappi project).
+
+Where the 8192 forward goes now: the GEMMs, at 25–29 TFLOP/s (the bf16
+TensorOps peak), take about 0.8 s. Attention takes 6 × 43 ms, the GDN chunked
+rule 18 × 8.4 ms, and SwiGLU + cast 24 × 3.6 ms. At 1024 the GDN chunked rule
+is the largest non-GEMM share: 18 × 1.4 ms.
+
 ## Not done
 
 - **Training.** No backward kernels. Autograd through transformers' loops is
@@ -479,7 +512,5 @@ cargo test --release --test shader_index_arithmetic   # includes the qwen35 sour
   value head, so it is duplicated `Hv/Hk` times (2× for Qwen3.5). The prep
   products are uneven across simdgroups (triangular). Both are
   performance-only.
-- **Performance is unmeasured.** The design targets launch count first: one
-  GEMM, one conv, two GDN dispatches and one norm per GDN layer, against
-  thousands. Tile sizes (64-row chunks, 32-column value slices) are first
-  choices, not tuned ones.
+- **Untuned tiles.** GDN's 64-row chunks and 32-column value slices, and the
+  prefill attention's 32x32 blocks, are first choices, not swept ones.

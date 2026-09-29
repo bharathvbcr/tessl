@@ -1,0 +1,7 @@
+# The oracle for tools/msl_emu/check_qwen35.py and scripts/gen_qwen35_fixtures.py.
+# Pinned: the checks compare against transformers' Qwen3.5 code itself, so a
+# silent upstream change to that code must arrive as a deliberate bump here.
+# CPU wheels: pip install -r tools/msl_emu/requirements.txt --extra-index-url https://download.pytorch.org/whl/cpu
+numpy==2.4.6
+torch==2.14.0
+transformers==5.17.0

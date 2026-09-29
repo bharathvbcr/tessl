@@ -56,7 +56,7 @@ inline void qwen35_norm_rope_row(
         // throughout: the angle reaches tens of thousands of radians, where the
         // fast approximations lose whole digits.
         const float inv_freq =
-            precise::divide(1.0f, precise::pow(theta, (float)(2u * p) / (float)rotary_dim));
+            precise::divide(1.0f, precise::pow(theta, precise::divide((float)(2u * p), (float)rotary_dim)));
         const float angle = (float)pos * inv_freq;
         const float c = precise::cos(angle);
         const float s = precise::sin(angle);
@@ -140,6 +140,14 @@ kernel void qwen35_attn_qk_norm_rope(
     }
 }
 
+/// `sigmoid(x)` without forming `e^|x|`, which fast math may assume finite.
+inline float attn_sigmoid(float x)
+{
+    const float e = exp(-fabs(x));
+    const float r = 1.0f / (1.0f + e);
+    return x >= 0.0f ? r : e * r;
+}
+
 /// `out = attn * sigmoid(gate)`, with the gate read in place from the fused
 /// projection (head h's gate is columns `q_off + h*2D + D ..`).
 ///
@@ -169,7 +177,7 @@ kernel void NAME(                                                               
     const uint d = col % D;                                                       \
     const float g = p[(ulong)r * ld_p + q_off + (ulong)h * 2u * D + D + d];       \
     const float a = attn[(ulong)r * Hq * D + col];                                \
-    out[(ulong)r * ld_out + out_off + col] = (OUT_T)(a / (1.0f + exp(-g)));       \
+    out[(ulong)r * ld_out + out_off + col] = (OUT_T)(a * attn_sigmoid(g));       \
 }
 
 ATTN_GATE_KERNEL(qwen35_attn_gate_f32, float)

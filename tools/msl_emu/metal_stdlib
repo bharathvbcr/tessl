@@ -99,12 +99,42 @@ struct bfloat {
 
 // ------------------------------------------------------------------- math ---
 
-inline float rsqrt(float x) { return 1.0f / std::sqrt(x); }
-using std::cos;
-using std::exp;
-using std::log;
-using std::pow;
-using std::sin;
+namespace emu {
+/// MSL_EMU_ULP=N perturbs every fast-math transcendental below by a
+/// deterministic -N..N ulps (hashed from its argument), standing in for Metal's
+/// approximate `exp`/`log`/`rsqrt`/`pow`/`sin`/`cos`. `precise::` is left exact,
+/// as on the device. It is how the on-device tolerances get tested here.
+inline int ulp_noise() {
+    static const int n = [] {
+        const char *e = std::getenv("MSL_EMU_ULP");
+        return e ? std::atoi(e) : 0;
+    }();
+    return n;
+}
+inline float perturb(float r, float x) {
+    const int n = ulp_noise();
+    if (n == 0 || !std::isfinite(r)) return r;
+    uint32_t h;
+    std::memcpy(&h, &x, 4);
+    h ^= h >> 16;
+    h *= 0x7feb352du;
+    h ^= h >> 15;
+    h *= 0x846ca68bu;
+    h ^= h >> 16;
+    int k = int(h % uint32_t(2 * n + 1)) - n;
+    for (; k > 0; --k) r = std::nextafter(r, INFINITY);
+    for (; k < 0; ++k) r = std::nextafter(r, -INFINITY);
+    return r;
+}
+} // namespace emu
+
+inline float rsqrt(float x) { return emu::perturb(1.0f / std::sqrt(x), x); }
+inline float exp(float x) { return emu::perturb(std::exp(x), x); }
+inline float log(float x) { return emu::perturb(std::log(x), x); }
+inline float pow(float a, float b) { return emu::perturb(std::pow(a, b), a * 31.0f + b); }
+inline float sin(float x) { return emu::perturb(std::sin(x), x); }
+inline float cos(float x) { return emu::perturb(std::cos(x), x); }
+using std::fabs;
 using std::sqrt;
 template <typename T>
 inline T min(T a, T b) { return a < b ? a : b; }
@@ -123,12 +153,12 @@ inline float log(float x) { return std::log(x); }
 } // namespace precise
 
 namespace fast {
-using precise::cos;
+using metal::cos;
+using metal::exp;
+using metal::log;
+using metal::pow;
+using metal::sin;
 using precise::divide;
-using precise::exp;
-using precise::log;
-using precise::pow;
-using precise::sin;
 } // namespace fast
 
 template <typename To, typename From>
@@ -200,10 +230,29 @@ inline void launch(uint3 grid, uint3 tpg, size_t tg_floats,
                    const std::function<void(const Ids &, float *tgm)> &body) {
     const uint n = tpg.x * tpg.y * tpg.z;
     if (n == 0 || n > 1024) fail("threads per threadgroup must be in 1..1024");
-    std::vector<float> tgm(tg_floats + 1);
+    // Exactly the requested size: slack here would hide a one-past-the-end
+    // threadgroup access from AddressSanitizer.
+    std::vector<float> tgm(std::max<size_t>(tg_floats, 1));
+    // A GPU promises no order between threadgroups, so neither does this:
+    // MSL_EMU_TG_ORDER=reverse|shuffle runs them out of grid order. A kernel
+    // whose threadgroups write each other's outputs passes in one order and
+    // fails in another.
+    std::vector<uint3> order;
     for (uint gz = 0; gz < grid.z; ++gz)
         for (uint gy = 0; gy < grid.y; ++gy)
-            for (uint gx = 0; gx < grid.x; ++gx) {
+            for (uint gx = 0; gx < grid.x; ++gx) order.emplace_back(gx, gy, gz);
+    const char *mode = std::getenv("MSL_EMU_TG_ORDER");
+    if (mode && std::strcmp(mode, "reverse") == 0) {
+        std::reverse(order.begin(), order.end());
+    } else if (mode && std::strcmp(mode, "shuffle") == 0) {
+        uint64_t x = 0x9e3779b97f4a7c15ull;
+        for (size_t i = order.size(); i > 1; --i) {
+            x ^= x << 13, x ^= x >> 7, x ^= x << 17;
+            std::swap(order[i - 1], order[x % i]);
+        }
+    }
+    for (const uint3 &g : order) {
+                const uint gx = g.x, gy = g.y, gz = g.z;
                 // Poison rather than zero: a kernel that reads threadgroup
                 // memory it never wrote should produce garbage, not a pass.
                 std::fill(tgm.begin(), tgm.end(), std::nanf(""));

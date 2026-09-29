@@ -7,9 +7,11 @@ has no fast Mac path for. Sources: `kernels/qwen35_gdn.metal`,
 > **Status: built and checked off-device, not yet run on Apple silicon.** Every
 > kernel below was compiled as C++ and executed on a CPU emulator of the Metal
 > execution model, then compared against transformers' own Qwen3.5 code (see
-> [Verification](#verification)). The Rust wrappers type-check and pass clippy
-> for `aarch64-apple-darwin`. Nothing here has been through the Metal compiler
-> or a GPU yet. `cargo test --release --test qwen35_kernels -- --test-threads=1`
+> [Verification](#verification)), including under AddressSanitizer and
+> ThreadSanitizer, in shuffled threadgroup order, and with fast-math-like
+> error injected. The Rust wrappers type-check and pass clippy for
+> `aarch64-apple-darwin`. Nothing here has been through the Metal compiler or a
+> GPU yet. `cargo test --release --test qwen35_kernels -- --test-threads=1`
 > on a Mac is the first time either happens.
 
 ## Why
@@ -59,6 +61,12 @@ read q, k and v from that, and read `a`/`b` straight out of the projection. The
 gated norm reads `z` from the projection too. Attention works the same way with
 `AttnProjLayout`: `[q+gate (per head: D query, then D gate) | k | v]`.
 
+Build the layout once with `GdnProjLayout::new(k_heads, v_heads, v_dim)` (it
+validates the shape and that every offset fits `u32`) and take the rest from
+it: `layout.dims(batch, seq)` for the call shape, `conv_qkv`, `gates` and `z`
+for the windows. A layout and a separately stated shape that disagree on
+`v_heads` would still pass every capacity check, and read the wrong columns.
+
 ### The GDN layer, end to end
 
 ```text
@@ -93,7 +101,8 @@ column-parallel in threadgroup memory: `A`ᵀ sits in the upper triangle and `W`
 in the lower triangle of one 16 KB block, and a quad of lanes owns each column,
 so the 63 steps need no barrier at all. Only `qwen35_gdn_chunk_scan` walks the
 chunks in order. Its per-chunk work is four `simdgroup_matrix` products against
-a 128×32 state slice held in 27 KB of threadgroup memory. A single fused kernel
+a 128×32 state slice held in 30 KB of threadgroup memory (row strides padded
+against bank conflicts). A single fused kernel
 would have put 63 dependent steps of solve on the sequential critical path of
 every chunk.
 
@@ -112,14 +121,33 @@ is prefilled once, and N questions run as a batch of N continuations, each
 writing its own `state_out` if it wants one. The attention layers' KV cache is
 not shared this way yet (see [Not done](#not-done)).
 
+State rules, all enforced on the host:
+
+- A snapshot is never a `state_out`: every row reads it.
+- A GDN `state_out` may be the `PerBatch` input state itself (in place).
+  Each thread reads exactly the elements it later writes. In place, the state
+  is still checked against every other input and output.
+- A conv `state_out` may never be its input state: output slot `j` is input
+  slot `j + seq`, which another thread reads.
+- A call with `seq = 0` and a `state_out` copies the start state through. A
+  decode loop that alternates two state buffers never finds a stale one after
+  an empty step.
+
 ### Scoring only the answer rows
 
 `score_answer_rows` applies the final norm (`w_offset = 1.0` for Qwen3.5's
 zero-centred `Qwen3_5RMSNorm`) and dots each slot row with just the answer
 tokens' LM-head rows. It returns the logits and a log-softmax over the answer
 set. That softmax is the distribution restricted to those tokens, not the
-full-vocabulary log-probability, which needs every row. An out-of-range slot or
-token id produces NaN rather than an out-of-bounds read.
+full-vocabulary log-probability, which needs every row.
+
+Slot rows and answer ids live in device memory, so they are checked in the
+kernel. An out-of-range slot makes that slot's whole row NaN. An out-of-range
+answer id makes that entry NaN in both outputs and leaves it out of the
+softmax, so the valid answers beside it keep correct log-probabilities.
+Validity is tracked as explicit flags and NaN is stored as integer bits,
+because under fast math a NaN passing through float arithmetic, or even a
+float `select`, may be optimised away.
 
 ## Numerics
 
@@ -136,6 +164,17 @@ token id produces NaN rather than an out-of-bounds read.
   therefore moves by ~1e-3 rad. The kernel reproduces that fp32 angle and
   matches transformers to 1e-6. An f64-angle reference would disagree with both
   by 1.4e-3. The Mac test at position 20000 allows 4e-3 for exactly this.
+- **Fast math is on** (Metal's default). Every sigmoid/SiLU is written
+  `e = exp(−|x|)`, so no intermediate is ever infinite, which fast math may
+  assume. Softplus needs care too, because MSL has no `log1p`: rounding
+  `1 + e^x` plus the fast `log` near 1 is off by 1–60% for `x` in [−15, −8],
+  and `a + dt_bias` lands there routinely (Qwen's `dt_bias` sits around −2 to
+  −7). Below −3 the kernel uses the 8-term `log1p` series, and above that
+  `precise::log`.
+- **Chunk-local cumulative decay** is summed in fp32, as transformers sums it.
+  After a step with a large decay, later small differences `G_i − G_j` lose
+  relative precision, in both implementations alike. The token-by-token decode
+  path doesn't have this.
 - **Partial RoPE is not `rms_qkv_rope`'s.** transformers pairs `p` with
   `p + rotary_dim/2` and uses `θ^(−2p/rotary_dim)`. tessl's existing kernel
   implements Gemma's proportional RoPE (pairs across `D/2`, denominator `D`).
@@ -145,15 +184,28 @@ token id produces NaN rather than an out-of-bounds read.
 
 ### Off-device: `tools/msl_emu`
 
-`python3 tools/msl_emu/check_qwen35.py` (needs torch and transformers) builds the
-kernel sources as C++20 against a CPU stand-in for `<metal_stdlib>`. It launches
-every threadgroup as real threads with real barriers and simdgroup collectives,
-using the dispatch geometry `src/qwen35.rs` uses. The results are compared
-against transformers' Qwen3.5 functions, called directly, and against an f64
-sequential recurrence. See [tools/msl_emu/README.md](../tools/msl_emu/README.md)
-for what the emulator does and does not model.
+`python3 tools/msl_emu/check_qwen35.py` (requirements pinned in
+`tools/msl_emu/requirements.txt`) builds the kernel sources as C++20 against a
+CPU stand-in for `<metal_stdlib>`. It launches every threadgroup as real
+threads with real barriers and simdgroup collectives, using the dispatch
+geometry `src/qwen35.rs` uses. The results are compared against transformers'
+Qwen3.5 functions, called directly, and against an f64 sequential recurrence.
+CI runs it on Linux (`kernel-emulator` job) in four modes:
 
-Last run, all checks passing. GDN rows show the kernel's max error next to
+| Mode | What it adds | Shown to catch |
+|---|---|---|
+| plain | Every case runs in forward, reverse and shuffled threadgroup order, and the outputs must agree **bit for bit** | a threadgroup writing past its rows into another's; passes in grid order, fails reversed |
+| `--fast-math` | Each non-`precise::` transcendental perturbed by ±4 ulps; GDN held to the on-device bound (`1e-4·max|y|`) | whether the Mac test bounds survive approximate math. At 64 ulps the GDN still sits ~10× inside them |
+| `MSL_EMU_SANITIZE=address` | Every device buffer and threadgroup allocation exactly sized | an unmasked tail-row store (heap overflow) |
+| `MSL_EMU_SANITIZE=thread` | Data-race detection across the real threads | removing the barrier before U = W·X overwrites X |
+
+The `host_contract` case parses `src/qwen35.rs` and the kernel signatures. It
+checks that every `set_*` bind has the kernel's index and kind (buffer, `uint`,
+`float`), and that the host's thread counts and threadgroup-memory sizes equal
+the kernel's constants. Swapping a single bind fails it. The kernels also
+`static_assert` their lane mappings against those constants.
+
+Last run, 84 checks passing. GDN rows show the kernel's max error next to
 transformers' own fp32 error, both measured against f64:
 
 | Case | kernel err | transformers fp32 err |
@@ -162,24 +214,28 @@ transformers' own fp32 error, both measured against f64:
 | chunk, T=64 | 1.5e-8 | 3.6e-8 |
 | chunk, T=65, grouped heads, B=2 | 5.8e-8 | 6.0e-8 |
 | chunk, T=130, 4 heads, per-batch state | 4.9e-8 | 8.6e-8 |
-| chunk, T=100, Dv=128, shared snapshot, B=3 | 2.5e-8 | 2.9e-8 |
+| chunk, T=100, Dv=128, shared snapshot, B=3 | 2.9e-8 | 2.9e-8 |
 | chunk, T=150, strong decay | 3.9e-7 | 3.2e-7 |
+| chunk, T=130, `a + dt_bias` in the softplus-series range | 5.4e-8 | 5.8e-8 |
 | chunk, T=200, Dv=128 | 2.8e-8 | 2.7e-8 |
+| chunk, T=1000 | 2.4e-8 | 2.9e-8 |
 | recurrent, T=1, snapshot, B=4 | 5.8e-9 | 8.3e-9 |
-| recurrent, T=7, per-batch state | 5.6e-9 | 6.5e-9 |
+| recurrent, T=7, per-batch state | 5.7e-9 | 6.5e-9 |
+| chunk / recurrent / conv, T=0 with state_out | state copied exactly | — |
 | chunk workspace: `W(I+A) = I` | 5.4e-8 | — |
 | conv1d (prefill, state, snapshot, T < KW−1) | 4.8e-7 / state exact | — |
 | gated norm f32 / bf16 | 1e-6 / within one bf16 rounding | — |
 | Q/K norm + partial RoPE, D=256, pos 30000 | 9.5e-7 | — |
 | output gate f32 / bf16 / in place | 2.4e-7 / exact / 2.4e-7 | — |
-| scoring f32 / bf16, out-of-range → NaN | 4.8e-7 | — |
+| scoring f32 / bf16; a bad slot or answer → NaN, the rest intact | 4.8e-7 | — |
 
 **The checks catch defects.** Mutations injected into the GDN kernel were each
 caught: dropping the inter-chunk decay, using the wrong state-update decay,
 halving the solve's quad reduction, removing the `simdgroup_barrier` before a
-stage read (surfaces as a race), and skipping k's normalization in the
-recurrent kernel. The one survivor (`j < i` → `j <= i` in building `A`) is
-equivalent, because the solve never reads the diagonal slot.
+stage read, skipping k's normalization in the recurrent kernel, an unmasked
+tail store (ASan, and reverse order), and a missing threadgroup barrier (TSan).
+The one survivor (`j < i` → `j <= i` in building `A`) is equivalent, because
+the solve never reads the diagonal slot.
 
 ### On device: `tests/qwen35_kernels.rs`
 
@@ -189,8 +245,13 @@ reference matches the f64 golden to 1e-16. The RoPE reference matches
 transformers to 7e-7. Both were checked off-device. The GPU tests cover every
 kernel, including randomized chunk-edge shapes, grouped heads, snapshots,
 strided windows, and a chunked prefill followed by in-place recurrent decode
-steps that must equal the recurrence over the whole sequence. They also check
-the projection packing through tessl's GEMM and the host-side rejections.
+steps that must equal the recurrence over the whole sequence. There is also a
+whole GDN layer (projection GEMM → conv → chunked rule → gated norm) wired only
+through `GdnProjLayout` against the same chain in f64. The tests cover
+`state_out` discarded, separate and in place on both paths, and `seq = 0`
+passthrough. Every host rejection asserts on its error message, so none can be
+credited to a different check. Bounds are relative, the shape of fast-math
+error.
 
 ```sh
 cargo test --release --test qwen35_kernels -- --test-threads=1
@@ -212,6 +273,10 @@ cargo test --release --test shader_index_arithmetic   # includes the qwen35 sour
   streams are equal and the rotation reduces to plain RoPE.
 - **Key head dim other than 128**, and value head dims that aren't multiples of
   32, are rejected on the host.
+- **Redundant work left in.** The normalized-k/q workspace is stored per
+  value head, so it is duplicated `Hv/Hk` times (2× for Qwen3.5). The prep
+  products are uneven across simdgroups (triangular). Both are
+  performance-only.
 - **Performance is unmeasured.** The design targets launch count first: one
   GEMM, one conv, two GDN dispatches and one norm per GDN layer, against
   thousands. Tile sizes (64-row chunks, 32-column value slices) are first

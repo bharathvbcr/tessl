@@ -5,9 +5,15 @@ cloud container), so indexing, masking, barrier placement and algebra can be
 checked before a kernel ever reaches a GPU.
 
 ```sh
-python3 tools/msl_emu/check_qwen35.py          # needs torch + transformers
-python3 tools/msl_emu/check_qwen35.py -k chunk # a subset
+pip install -r tools/msl_emu/requirements.txt --extra-index-url https://download.pytorch.org/whl/cpu
+python3 tools/msl_emu/check_qwen35.py                   # every case, three threadgroup orders
+python3 tools/msl_emu/check_qwen35.py -k chunk,score    # cases whose name contains any of these
+python3 tools/msl_emu/check_qwen35.py --fast-math       # ±4-ulp transcendentals, on-device bounds
+MSL_EMU_SANITIZE=address MSL_EMU_OUT=/tmp/asan python3 tools/msl_emu/check_qwen35.py
+MSL_EMU_SANITIZE=thread  MSL_EMU_OUT=/tmp/tsan python3 tools/msl_emu/check_qwen35.py -k chunk_T65
 ```
+
+CI runs all four on Linux (the `kernel-emulator` job).
 
 ## How it works
 
@@ -20,8 +26,19 @@ python3 tools/msl_emu/check_qwen35.py -k chunk # a subset
   `simdgroup_float8x8` is held whole by each lane, and a store writes only the
   lane's own two elements, so a missing `simdgroup_barrier` shows up as a race
   here too. Threadgroup memory starts as NaN, so an unwritten read is visible.
+- Threadgroups run in grid, reverse or shuffled order (`MSL_EMU_TG_ORDER`), and
+  the driver requires all three to agree bit for bit: a GPU promises no order,
+  so a kernel whose threadgroups write each other's outputs must not pass on
+  the luck of one.
+- `MSL_EMU_ULP=N` perturbs each non-`precise::` `exp`/`log`/`rsqrt`/`pow`/`sin`/
+  `cos` by a deterministic ±N ulps, a stand-in for Metal's fast math.
+- `MSL_EMU_SANITIZE=address|thread` builds under ASan or TSan. Every device
+  buffer and threadgroup allocation is exactly sized, never grown, so an
+  overrun can't hide in spare capacity.
 - `harness.cpp` launches each kernel with exactly the grid, threadgroup size
-  and threadgroup memory that `src/qwen35.rs` uses.
+  and threadgroup memory that `src/qwen35.rs` uses. `harness --constants`
+  prints the kernels' shape constants, and the `host_contract` case holds
+  `src/qwen35.rs`'s binds and constants to them.
 - `check_qwen35.py` generates inputs, runs the harness, and compares against
   transformers' `modeling_qwen3_5` functions and an f64 recurrence. Outputs are
   pre-filled with NaN, so a skipped element fails.
@@ -35,8 +52,10 @@ cover:
 - the Metal compiler: MSL dialect errors, address-space mismatches, or
   register pressure;
 - the GPU memory model beyond barrier placement, or real scheduling;
-- fast-math precision (the emulator uses IEEE `exp`, `pow` and friends);
-- threadgroup memory limits (the host wrappers check those).
+- fast-math precision exactly (the ulp-noise mode is a model of it, not a copy,
+  and it cannot perturb division, which is an operator);
+- the device's threadgroup-memory limit (the kernels `static_assert` their
+  budgets against 32 KB, and the host wrappers check the device's own limit).
 
 Running `tests/qwen35_kernels.rs` on a Mac is still the real test. This tool
 makes the first on-device run far more likely to be about the device than about

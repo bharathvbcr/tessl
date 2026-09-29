@@ -30,6 +30,10 @@ from transformers.models.qwen3_5.configuration_qwen3_5 import Qwen3_5TextConfig
 HERE = os.path.dirname(os.path.abspath(__file__))
 DK = 128
 FAILURES = []
+# --fast-math: perturb the kernels' fast-math transcendentals by a few ulps and
+# hold the GDN to tests/qwen35_kernels.rs's bound (1e-4 of max|y|) instead of
+# to transformers' own fp32 error, which no perturbed kernel can match.
+FAST_MATH = False
 
 
 def build():
@@ -42,8 +46,31 @@ def build():
 HARNESS = None
 
 
+# Threadgroup orders every case runs in. A GPU promises none, so a correct
+# kernel's output is bitwise identical in all of them; one whose threadgroups
+# write each other's outputs is not, even when a single order happens to pass.
+ORDERS = ["forward", "reverse", "shuffle"]
+
+
 def run(kernel, params, inputs, outputs):
-    """Write inputs, run the harness, return outputs as flat tensors."""
+    """Write inputs, run the harness in each threadgroup order, and return the
+    outputs as flat tensors after checking every order agrees bit for bit."""
+    results = []
+    for order in ORDERS:
+        results.append(_run_once(kernel, params, inputs, outputs, order))
+    first = results[0]
+    for order, res in zip(ORDERS[1:], results[1:]):
+        for name in outputs:
+            a, b = first[name], res[name]
+            same = torch.equal(a.view(torch.int32), b.view(torch.int32)) if a.dtype == torch.float32 \
+                else torch.equal(a, b)
+            if not same:
+                FAILURES.append(f"{kernel}: output {name} depends on threadgroup order ({order})")
+                print(f"  [FAIL] {kernel}: output {name} differs between forward and {order} threadgroup order")
+    return first
+
+
+def _run_once(kernel, params, inputs, outputs, order):
     with tempfile.TemporaryDirectory() as d:
         for name, t in inputs.items():
             t = t.contiguous()
@@ -65,11 +92,13 @@ def run(kernel, params, inputs, outputs):
             f.write("outputs " + " ".join(outputs) + "\n")
             for k, v in params.items():
                 f.write(f"{k} {v}\n")
-        subprocess.run([HARNESS, d], check=True)
+        subprocess.run([HARNESS, d], check=True, env=dict(os.environ, MSL_EMU_TG_ORDER=order))
         res = {}
         for name, (dtype, n) in outputs.items():
             raw = open(os.path.join(d, name + ".bin"), "rb").read()
-            if dtype == "bf16":
+            if not raw:
+                res[name] = torch.zeros(0)
+            elif dtype == "bf16":
                 res[name] = torch.frombuffer(bytearray(raw), dtype=torch.bfloat16).float()
             else:
                 res[name] = torch.frombuffer(bytearray(raw), dtype=torch.float32).clone()
@@ -80,6 +109,9 @@ def check(name, got, want, atol, rtol=0.0):
     got = got.double().flatten()
     want = want.double().flatten()
     assert got.numel() == want.numel(), f"{name}: {got.numel()} vs {want.numel()} elements"
+    if got.numel() == 0:
+        print(f"  [ok  ] {name}: empty")
+        return
     bad_nan = torch.isnan(got) & ~torch.isnan(want)
     err = (got - want).abs()
     err[torch.isnan(want) & torch.isnan(got)] = 0
@@ -114,8 +146,13 @@ def case_conv(B, T, C, KW, with_state, bcast_state, seed):
         st = None
         st_b = torch.zeros(B, C, KW - 1)
     ref_state = st_b.clone()
-    ref = m.causal_conv1d_update(x.clone(), ref_state, w, None, "silu")  # updates ref_state in place
-    if not with_state:
+    if T == 0:
+        # Nothing to convolve (transformers' conv rejects the empty input); the
+        # state passes through unchanged.
+        ref = torch.zeros(B, C, 0)
+    else:
+        ref = m.causal_conv1d_update(x.clone(), ref_state, w, None, "silu")  # updates ref_state in place
+    if not with_state and T > 0:
         # Zero state is the prefill path; hold the two transformers paths to each other.
         ref_fn = m.causal_conv1d_fn(x.clone(), w, None, activation="silu")
         check(f"conv1d ref self-consistency B{B} T{T}", ref_fn, ref, 1e-6)
@@ -135,7 +172,7 @@ def case_conv(B, T, C, KW, with_state, bcast_state, seed):
 # ------------------------------------------------------------------- the GDN
 
 
-def gdn_layout(B, T, Hk, Hv, Dv, seed, a_scale=1.0, a_log_lo=-2.0, a_log_hi=1.0):
+def gdn_layout(B, T, Hk, Hv, Dv, seed, a_scale=1.0, a_log_lo=-2.0, a_log_hi=1.0, dt_shift=0.0):
     """Random operands in the fused-projection layouts the kernels read."""
     g = seeded(seed)
     key_dim, value_dim = Hk * DK, Hv * Dv
@@ -148,7 +185,7 @@ def gdn_layout(B, T, Hk, Hv, Dv, seed, a_scale=1.0, a_log_lo=-2.0, a_log_hi=1.0)
     b_off, a_off = value_dim + 1, value_dim + 1 + Hv
     ab = torch.randn(B * T, ld_ab, generator=g) * a_scale
     a_log = torch.empty(Hv).uniform_(a_log_lo, a_log_hi, generator=g)
-    dt_bias = torch.randn(Hv, generator=g)
+    dt_bias = torch.randn(Hv, generator=g) + dt_shift
     return dict(qkv=qkv, ab=ab, a_log=a_log, dt_bias=dt_bias, ld_qkv=ld_qkv, q_off=q_off, k_off=k_off,
                 v_off=v_off, ld_ab=ld_ab, a_off=a_off, b_off=b_off)
 
@@ -204,7 +241,10 @@ def case_gdn(kernel, B, T, Hk, Hv, Dv, seed, state_mode="none", **layout_kw):
     ref, ref_state = gdn_f64(*gdn_operands(L, B, T, Hk, Hv, Dv, torch.float64), state0)
     q, k, v, g, beta = gdn_operands(L, B, T, Hk, Hv, Dv, torch.float32)
     init = None if state_mode == "none" else state0.contiguous().float()
-    if kernel == "qwen35_gdn_chunk":
+    if T == 0:
+        # transformers has no empty-sequence path; the answer is the start state.
+        hf, hf_state = ref.float(), state0.float()
+    elif kernel == "qwen35_gdn_chunk":
         hf, hf_state = m.torch_chunk_gated_delta_rule(q, k, v, g, beta, initial_state=init,
                                                       output_final_state=True, use_qk_l2norm_in_kernel=True)
     else:
@@ -233,15 +273,21 @@ def case_gdn(kernel, B, T, Hk, Hv, Dv, seed, state_mode="none", **layout_kw):
         FAILURES.append(tag + " window")
 
     want = ref.reshape(B * T, Hv * Dv)
-    hf_err = (hf.double().reshape(B * T, Hv * Dv) - want).abs().max().item()
-    hf_state_err = (hf_state.double() - ref_state).abs().max().item()
-    scale = max(want.abs().max().item(), 1e-3)
+    amax = lambda t: t.abs().max().item() if t.numel() else 0.0
+    hf_err = amax(hf.double().reshape(B * T, Hv * Dv) - want)
+    hf_state_err = amax(hf_state.double() - ref_state)
+    scale = max(amax(want), 1e-3)
     print(f"  {tag}: transformers fp32 err vs f64 {hf_err:.2e} (out), {hf_state_err:.2e} (state); |y|max {scale:.2e}")
     # The bound: 8x what transformers' own fp32 run misses by, floored at a few
     # ulps of the output scale for cases where the fp32 reference is exact.
-    atol = max(8 * hf_err, 64 * 2 ** -24 * scale)
-    check(tag + " out", got_heads, want, atol)
-    satol = max(8 * hf_state_err, 64 * 2 ** -24 * max(ref_state.abs().max().item(), 1e-3))
+    state_scale = max(ref_state.abs().max().item(), 1e-3)
+    if FAST_MATH:
+        atol, satol = 1e-4 * scale, 1e-4 * state_scale
+    else:
+        atol = max(8 * hf_err, 64 * 2 ** -24 * scale)
+        satol = max(8 * hf_state_err, 64 * 2 ** -24 * state_scale)
+    if T > 0:
+        check(tag + " out", got_heads, want, atol)
     check(tag + " state", out["state_out"], ref_state.reshape(-1), satol)
 
 
@@ -424,13 +470,126 @@ def case_score(bf16, seed):
                "slots": torch.tensor([rows, 1], dtype=torch.int32)},
               {"logits": ("f32", 6), "logprobs": ("f32", 6)})
     lg = bad["logits"].reshape(2, 3)
-    ok = bool(torch.isnan(lg[0]).all() and torch.isnan(lg[1, 1]) and not torch.isnan(lg[1, 0]))
-    print(f"  [{'ok  ' if ok else 'FAIL'}] {kname} out-of-range slot/answer -> NaN")
+    lp = bad["logprobs"].reshape(2, 3)
+    ok = bool(torch.isnan(lg[0]).all() and torch.isnan(lp[0]).all()
+              and torch.isnan(lg[1, 1]) and torch.isnan(lp[1, 1]))
+    print(f"  [{'ok  ' if ok else 'FAIL'}] {kname} out-of-range slot/answer -> NaN in both outputs")
     if not ok:
         FAILURES.append(kname + " out-of-range")
+    # The valid answers beside the bad one are a two-way softmax, unpoisoned.
+    with torch.no_grad():
+        l2 = norm(h[1:2]) @ emb.float()[[1, 2]].T
+    check(kname + " valid logits beside a bad answer", lg[1, [0, 2]], l2[0], 1e-5, 1e-5)
+    check(kname + " valid logprobs beside a bad answer", lp[1, [0, 2]],
+          torch.log_softmax(l2[0].double(), dim=-1), 1e-5, 1e-5)
+
+
+# ------------------------------------------------------------ host contract
+
+ROOT = os.path.dirname(os.path.dirname(HERE))
+
+
+def _kernel_signatures():
+    """{kernel name: [(buffer index, 'buf'|'u32'|'f32')]} from the .metal sources,
+    expanding the macro-generated kernels through their instantiations."""
+    import re
+    sigs, macros = {}, {}
+    for f in ("qwen35_gdn", "qwen35_attn", "qwen35_score"):
+        src = open(os.path.join(ROOT, "kernels", f + ".metal")).read()
+        for m in re.finditer(r"kernel void (\w+)\((.*?)\)\s*\\?\s*\{", src, re.S):
+            params = []
+            for p in re.finditer(r"([^,()]*?)\b\w+\s*\[\[buffer\((\d+)\)\]\]", m.group(2)):
+                decl = p.group(1)
+                kind = "buf" if "device" in decl else ("f32" if "float" in decl else "u32")
+                params.append((int(p.group(2)), kind))
+            (macros if m.group(1) == "NAME" else sigs)[m.group(1)] = params
+        for m in re.finditer(r"^#define (\w+)\(NAME", src, re.M):
+            body = src[m.start():]
+            body_sig = re.search(r"kernel void NAME\((.*?)\)\s*\\?\s*\{", body, re.S).group(1)
+            params = []
+            for p in re.finditer(r"([^,()]*?)\b\w+\s*\[\[buffer\((\d+)\)\]\]", body_sig):
+                decl = p.group(1)
+                kind = "buf" if "device" in decl else ("f32" if "float" in decl else "u32")
+                params.append((int(p.group(2)), kind))
+            for inst in re.finditer(rf"^{m.group(1)}\((\w+),", src, re.M):
+                sigs[inst.group(1)] = params
+    return sigs
+
+
+def _host_binds():
+    """{kernel name: [(index, kind)]} from src/qwen35.rs's dispatch closures."""
+    import re
+    rs = open(os.path.join(ROOT, "src", "qwen35.rs")).read()
+    # `let name = out_kernel("base", ..)` picks the _f32 or _bf16 variant; like
+    # the pipelines below, the name is reused, so resolve it by position.
+    name_defs = [(m.start(), m.group(1), [m.group(2) + "_f32", m.group(2) + "_bf16"])
+                 for m in re.finditer(r'let (\w+) = out_kernel\(\s*"(\w+)"', rs)]
+    # (position, variable, kernels): a dispatch resolves its pipeline variable
+    # to the nearest `let` before it, since most functions reuse the name `p`.
+    pipe_defs = []
+    for m in re.finditer(r'let (\w+) = (?:pipeline_for\(\s*rt,\s*|rt\.pipeline\(\s*)(&?)("?)(\w+)', rs):
+        var, lit, name = m.group(1), m.group(3), m.group(4)
+        if lit:
+            kernels = [name]
+        else:
+            found = [k for pos, v, k in name_defs if v == name and pos < m.start()]
+            if not found:
+                continue  # `pipeline_for`'s own body, not a dispatch site
+            kernels = found[-1]
+        pipe_defs.append((m.start(), var, kernels))
+    binds = {}
+    # Calls only: the helper's own `fn dispatch_groups(` definition is not one.
+    for m in re.finditer(r"(?<!fn )\b(dispatch_groups|dispatch_2d)\(", rs):
+        depth, i = 0, m.end() - 1
+        while True:
+            depth += {"(": 1, ")": -1}.get(rs[i], 0)
+            if depth == 0:
+                break
+            i += 1
+        call = rs[m.end():i]
+        var = re.search(r"&(\w+)", call).group(1)
+        kinds = {"gpu_buf": "buf", "u32": "u32", "f32": "f32"}
+        b = [(int(x.group(2)), kinds[x.group(1)])
+             for x in re.finditer(r"set_(gpu_buf|u32|f32)\(bnd,[^;]*?, (\d+)\)", call, re.S)]
+        kernels = [k for pos, v, k in pipe_defs if v == var and pos < m.start()][-1]
+        for k in kernels:
+            assert k not in binds, f"{k} is dispatched twice; the contract check needs one site"
+            binds[k] = b
+    consts = {}
+    for m in re.finditer(r"^const (\w+): usize = ([^;]+);", rs, re.M):
+        consts[m.group(1)] = eval(m.group(2))
+    for m in re.finditer(r"^pub const (\w+): u32 = ([^;]+);", rs, re.M):
+        consts[m.group(1)] = eval(m.group(2))
+    return binds, consts
+
+
+def case_host_contract():
+    sigs = _kernel_signatures()
+    binds, consts = _host_binds()
+    for k, sig in sorted(sigs.items()):
+        got = sorted(binds.get(k, []))
+        ok = got == sorted(sig)
+        print(f"  [{'ok  ' if ok else 'FAIL'}] binds {k}: {len(sig)} slots"
+              + ("" if ok else f"\n      kernel {sorted(sig)}\n      host   {got}"))
+        if not ok:
+            FAILURES.append(f"host binds for {k}")
+    kc = dict(l.split() for l in subprocess.run([HARNESS, "--constants"], check=True, capture_output=True,
+                                                   text=True).stdout.splitlines())
+    kc = {k: int(v) for k, v in kc.items()}
+    for host, kernel, scale in [("GDN_KEY_DIM", "GDN_DK", 1), ("GDN_CHUNK", "GDN_C", 1),
+                                ("GDN_VALUE_BLOCK", "GDN_BV", 1), ("PREP_THREADS", "GDN_PREP_THREADS", 1),
+                                ("SCAN_THREADS", "GDN_SCAN_THREADS", 1),
+                                ("PREP_TG_BYTES", "GDN_PREP_TG_FLOATS", 4), ("SCAN_TG_BYTES", "GDN_SCAN_TG_FLOATS", 4),
+                                ("REC_TG_BYTES", "GDN_REC_TG_FLOATS", 4),
+                                ("REDUCE_MAX_SIMDGROUPS", "REDUCE_MAX_SIMDGROUPS", 1)]:
+        ok = consts[host] == kc[kernel] * scale
+        print(f"  [{'ok  ' if ok else 'FAIL'}] {host} = {consts[host]} vs kernel {kernel} x{scale} = {kc[kernel] * scale}")
+        if not ok:
+            FAILURES.append(f"constant {host}")
 
 
 CASES = [
+    ("host_contract", case_host_contract),
     ("conv", lambda: [case_conv(2, 37, 100, 4, s, b, 1) for s, b in ((False, False), (True, False), (True, True))]),
     ("conv_short", lambda: case_conv(3, 2, 64, 4, True, False, 2)),  # T < KW-1: state carries old entries
     ("chunk_ws", lambda: case_chunk_ws(3)),
@@ -442,6 +601,12 @@ CASES = [
     ("chunk_strong_decay", lambda: case_gdn("qwen35_gdn_chunk", 1, 150, 1, 1, 32, 9, a_scale=4.0,
                                             a_log_lo=1.0, a_log_hi=2.5)),
     ("chunk_T200", lambda: case_gdn("qwen35_gdn_chunk", 1, 200, 1, 1, 128, 10)),
+    ("chunk_softplus_series", lambda: case_gdn("qwen35_gdn_chunk", 1, 130, 1, 2, 32, 19, dt_shift=-10.0)),
+    ("recurrent_softplus_series", lambda: case_gdn("qwen35_gdn_recurrent", 1, 9, 1, 2, 32, 20, dt_shift=-10.0)),
+    ("chunk_T1000", lambda: case_gdn("qwen35_gdn_chunk", 1, 1000, 1, 1, 32, 21)),
+    ("chunk_T0_passthrough", lambda: case_gdn("qwen35_gdn_chunk", 2, 0, 1, 2, 32, 22, state_mode="batch")),
+    ("recurrent_T0_passthrough", lambda: case_gdn("qwen35_gdn_recurrent", 2, 0, 1, 2, 32, 23, state_mode="snapshot")),
+    ("conv_T0_passthrough", lambda: case_conv(2, 0, 64, 4, True, True, 24)),
     ("recurrent_T1_snapshot", lambda: case_gdn("qwen35_gdn_recurrent", 4, 1, 2, 4, 64, 11, state_mode="snapshot")),
     ("recurrent_T7_state", lambda: case_gdn("qwen35_gdn_recurrent", 2, 7, 1, 2, 128, 12, state_mode="batch")),
     ("recurrent_T20", lambda: case_gdn("qwen35_gdn_recurrent", 1, 20, 1, 1, 32, 13)),
@@ -456,14 +621,24 @@ CASES = [
 def main():
     global HARNESS
     ap = argparse.ArgumentParser()
-    ap.add_argument("-k", default="", help="run only cases whose name contains this")
+    ap.add_argument("-k", default="", help="run only cases whose name contains one of these (comma-separated)")
+    ap.add_argument("--fast-math", action="store_true",
+                    help="perturb fast-math transcendentals by 4 ulps; use the on-device bounds")
     args = ap.parse_args()
+    global FAST_MATH
+    if args.fast_math:
+        FAST_MATH = True
+        os.environ.setdefault("MSL_EMU_ULP", "4")
     torch.set_num_threads(1)
     HARNESS = build()
-    for name, fn in CASES:
-        if args.k in name:
-            print(f"{name}:")
-            fn()
+    selected = [(name, fn) for name, fn in CASES if any(k in name for k in args.k.split(","))]
+    if not selected:
+        # A filter that matches nothing must not report "all checks passed".
+        print(f"no case matches -k {args.k!r}; cases: {', '.join(n for n, _ in CASES)}")
+        sys.exit(2)
+    for name, fn in selected:
+        print(f"{name}:")
+        fn()
     if FAILURES:
         print(f"\n{len(FAILURES)} check(s) FAILED:")
         for f in FAILURES:

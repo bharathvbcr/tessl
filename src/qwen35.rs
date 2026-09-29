@@ -60,8 +60,8 @@ pub const GDN_CHUNK: u32 = 64;
 pub const GDN_VALUE_BLOCK: u32 = 32;
 
 // Threadgroup memory, mirroring `GDN_*_TG_FLOATS` in kernels/qwen35_gdn.metal.
-const PREP_TG_BYTES: usize = 4 * (64 * 64 + 4 * 64);
-const SCAN_TG_BYTES: usize = 4 * (128 * 32 + 64 * 32 + 4 * 128 + 2 * 64);
+const PREP_TG_BYTES: usize = 4 * (64 * 65 + 4 * 64);
+const SCAN_TG_BYTES: usize = 4 * (128 * 36 + 64 * 36 + 4 * 128 + 4 * 64);
 const REC_TG_BYTES: usize = 4 * (2 * 4 * 32);
 const PREP_THREADS: usize = 256;
 const SCAN_THREADS: usize = 128;
@@ -70,6 +70,10 @@ const ROWS_PER_TG: usize = 8;
 /// `REDUCE_MAX_SIMDGROUPS` in kernels/reduce_tree.h.
 const REDUCE_MAX_SIMDGROUPS: usize = 32;
 const SCORE_THREADS: usize = 256;
+/// Threads per conv threadgroup, along the channel axis. The kernel indexes by
+/// grid position, so this is an occupancy choice only: 32-thread groups (one
+/// per 32 channels x 1 token) left the per-core threadgroup limit the cap.
+const CONV_THREADS: usize = 256;
 /// Answers per scoring call. Far above any real answer set; it bounds the
 /// threadgroup memory the logits occupy.
 pub const MAX_ANSWERS: u32 = 4096;
@@ -196,14 +200,54 @@ fn dispatch_groups(
 /// Column layout of a GDN layer's fused in-projection output:
 /// `[q | k | v | z | b | a]`, as [`pack_linear_weights_f32`] builds it from
 /// `[in_proj_qkv, in_proj_z, in_proj_b, in_proj_a]`.
+///
+/// Built by [`GdnProjLayout::new`], which checks the shape the GDN kernels
+/// accept and that every offset fits `u32`, so the getters cannot overflow.
+/// Take the call shape from [`GdnProjLayout::dims`] rather than restating it:
+/// a layout and a [`GdnDims`] that disagree on `v_heads` still pass every
+/// capacity check, and read the wrong columns.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct GdnProjLayout {
-    pub k_heads: u32,
-    pub v_heads: u32,
-    pub v_dim: u32,
+    k_heads: u32,
+    v_heads: u32,
+    v_dim: u32,
 }
 
 impl GdnProjLayout {
+    pub fn new(k_heads: u32, v_heads: u32, v_dim: u32) -> Result<Self, String> {
+        let l = Self {
+            k_heads,
+            v_heads,
+            v_dim,
+        };
+        l.dims(0, 0).validate("GdnProjLayout")?;
+        // The widest offset: 2*key + 2*value + 2*v_heads.
+        let key = u64::from(k_heads) * u64::from(GDN_KEY_DIM);
+        let value = u64::from(v_heads) * u64::from(v_dim);
+        if 2 * key + 2 * value + 2 * u64::from(v_heads) > u64::from(u32::MAX) {
+            return Err("GdnProjLayout: projection width exceeds u32".into());
+        }
+        Ok(l)
+    }
+    pub fn k_heads(&self) -> u32 {
+        self.k_heads
+    }
+    pub fn v_heads(&self) -> u32 {
+        self.v_heads
+    }
+    pub fn v_dim(&self) -> u32 {
+        self.v_dim
+    }
+    /// The GDN call shape for `batch` sequences of `seq` tokens in this layout.
+    pub fn dims(&self, batch: u32, seq: u32) -> GdnDims {
+        GdnDims {
+            batch,
+            seq,
+            k_heads: self.k_heads,
+            v_heads: self.v_heads,
+            v_dim: self.v_dim,
+        }
+    }
     pub fn key_dim(&self) -> u32 {
         self.k_heads * GDN_KEY_DIM
     }
@@ -255,19 +299,51 @@ impl GdnProjLayout {
             b_off: self.b_off(),
         }
     }
+    /// Where the fused projection holds `z`, the gated norm's gate.
+    pub fn z<'a>(&self, proj: &'a GpuBuffer) -> Cols<'a> {
+        Cols {
+            buf: proj,
+            ld: self.width(),
+            off: self.z_off(),
+        }
+    }
 }
 
 /// Column layout of a full-attention layer's fused projection:
 /// `[q+gate (2*Hq*D, per head: D query then D gate) | k (Hkv*D) | v (Hkv*D)]`,
-/// from `[q_proj, k_proj, v_proj]`.
+/// from `[q_proj, k_proj, v_proj]`. [`AttnProjLayout::new`] checks every
+/// offset fits `u32`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AttnProjLayout {
-    pub q_heads: u32,
-    pub kv_heads: u32,
-    pub head_dim: u32,
+    q_heads: u32,
+    kv_heads: u32,
+    head_dim: u32,
 }
 
 impl AttnProjLayout {
+    pub fn new(q_heads: u32, kv_heads: u32, head_dim: u32) -> Result<Self, String> {
+        if q_heads == 0 || kv_heads == 0 || head_dim == 0 {
+            return Err("AttnProjLayout: head counts and head_dim must be non-zero".into());
+        }
+        let width = (2 * u64::from(q_heads) + 2 * u64::from(kv_heads)) * u64::from(head_dim);
+        if width > u64::from(u32::MAX) {
+            return Err("AttnProjLayout: projection width exceeds u32".into());
+        }
+        Ok(Self {
+            q_heads,
+            kv_heads,
+            head_dim,
+        })
+    }
+    pub fn q_heads(&self) -> u32 {
+        self.q_heads
+    }
+    pub fn kv_heads(&self) -> u32 {
+        self.kv_heads
+    }
+    pub fn head_dim(&self) -> u32 {
+        self.head_dim
+    }
     pub fn q_off(&self) -> u32 {
         0
     }
@@ -442,6 +518,10 @@ pub fn conv1d_silu(
         ));
     }
     let hist = kernel_width - 1;
+    // The kernel's grid (and its `T + KW - 1` bound) is seq + hist positions.
+    let positions = seq
+        .checked_add(hist)
+        .ok_or_else(|| format!("{WHAT}: seq + kernel_width - 1 exceeds u32"))?;
     let rows = u64::from(batch) * u64::from(seq);
     require_window::<f32>(rt, x, rows, u64::from(channels), "conv1d_silu x")?;
     require::<f32>(
@@ -465,9 +545,14 @@ pub fn conv1d_silu(
     if let Some(s) = state_out {
         require::<f32>(rt, s, state_elems, "conv1d_silu state_out")?;
     }
-    if rows == 0 || channels == 0 {
+    // seq == 0 with a state_out still runs: the kernel copies the input state
+    // through, so a caller swapping state buffers each step never reads a
+    // stale one after an empty step.
+    if batch == 0 || channels == 0 || (seq == 0 && state_out.is_none()) {
         return Ok(());
     }
+    // state_out may never be the input state: output slot j of channel c is
+    // input slot j + seq of the extended sequence, which another thread reads.
     let mut writes = vec![("y", y)];
     if let Some(s) = state_out {
         writes.push(("state_out", s));
@@ -479,16 +564,16 @@ pub fn conv1d_silu(
     require_disjoint_writes(WHAT, &writes, &reads)?;
 
     let flags = in_flag | if state_out.is_some() { 2 } else { 0 };
-    let p = pipeline_for(rt, "qwen35_conv1d_silu", 32, 0)?;
+    let p = pipeline_for(rt, "qwen35_conv1d_silu", CONV_THREADS, 0)?;
     dispatch_groups(
         rt,
         &p,
         (
-            (channels as usize).div_ceil(32),
-            (seq + hist) as usize,
+            (channels as usize).div_ceil(CONV_THREADS),
+            positions as usize,
             batch as usize,
         ),
-        32,
+        CONV_THREADS,
         0,
         |bnd| {
             set_gpu_buf(bnd, x.buf, 0);
@@ -617,6 +702,7 @@ impl GdnWorkspace {
         let (rows, blocks) = workspace_extent(max)?;
         let f = std::mem::size_of::<f32>();
         let kq = usize_product(&[rows, GDN_KEY_DIM as usize, f], "GdnWorkspace")?;
+        let row_bytes = usize_product(&[rows, f], "GdnWorkspace")?;
         let blk = usize_product(
             &[blocks, (GDN_CHUNK * GDN_CHUNK) as usize, f],
             "GdnWorkspace",
@@ -626,8 +712,8 @@ impl GdnWorkspace {
         Ok(Self {
             k: alloc(kq)?,
             q: alloc(kq)?,
-            g: alloc(rows * f)?,
-            beta: alloc(rows * f)?,
+            g: alloc(row_bytes)?,
+            beta: alloc(row_bytes)?,
             w: alloc(blk)?,
             aq: alloc(blk)?,
         })
@@ -636,9 +722,15 @@ impl GdnWorkspace {
     /// Bytes this workspace needs for `dims`.
     pub fn bytes_for(dims: &GdnDims) -> Result<usize, String> {
         let (rows, blocks) = workspace_extent(dims)?;
-        let per =
-            rows * (2 * GDN_KEY_DIM as usize + 2) + blocks * 2 * (GDN_CHUNK * GDN_CHUNK) as usize;
-        usize_product(&[per, 4], "GdnWorkspace")
+        let per_row = usize_product(&[rows, 2 * GDN_KEY_DIM as usize + 2], "GdnWorkspace")?;
+        let per_blk = usize_product(
+            &[blocks, 2 * (GDN_CHUNK * GDN_CHUNK) as usize],
+            "GdnWorkspace",
+        )?;
+        let floats = per_row
+            .checked_add(per_blk)
+            .ok_or_else(|| "GdnWorkspace: size overflows usize".to_string())?;
+        usize_product(&[floats, 4], "GdnWorkspace")
     }
 
     fn check(&self, rt: &GpuRuntime, dims: &GdnDims) -> Result<(), String> {
@@ -740,8 +832,18 @@ fn validate_gdn(
     let in_place = matches!((state, state_out), (StateIn::PerBatch(i), Some(o)) if i.aliases(o));
     let mut writes: Vec<(&str, &GpuBuffer)> = vec![("out", out.buf)];
     writes.extend_from_slice(extra_writes);
-    if let (Some(s), false) = (state_out, in_place) {
-        writes.push(("state_out", s));
+    if let Some(s) = state_out {
+        // In place, the state is one buffer that is both read and written; as
+        // a write it is still checked against every input below, so it cannot
+        // also be, say, the qkv buffer other threadgroups are reading.
+        writes.push((
+            if in_place {
+                "state (in place)"
+            } else {
+                "state_out"
+            },
+            s,
+        ));
     }
     let mut reads: Vec<(&str, &GpuBuffer)> = vec![
         ("qkv", qkv.buf),
@@ -753,15 +855,6 @@ fn validate_gdn(
         reads.push(("state_in", s));
     }
     require_disjoint_writes(what, &writes, &reads)?;
-    if in_place {
-        // Still disjoint from everything else that is written.
-        let s = state_out.expect("in_place implies state_out");
-        for &(name, w) in &writes {
-            if s.aliases(w) {
-                return Err(format!("{what}: state (in place) overlaps {name}"));
-            }
-        }
-    }
     Ok((in_flag | if state_out.is_some() { 2 } else { 0 }, bstride))
 }
 
@@ -804,7 +897,9 @@ pub fn gdn_chunk_forward(
         state_out,
         &ws.buffers(),
     )?;
-    if dims.batch == 0 || dims.seq == 0 {
+    // seq == 0 with a state_out still dispatches: it copies the start state
+    // through, so a caller alternating state buffers never reads a stale one.
+    if dims.batch == 0 || (dims.seq == 0 && state_out.is_none()) {
         return Ok(());
     }
 
@@ -910,7 +1005,9 @@ pub fn gdn_recurrent(
         state_out,
         &[],
     )?;
-    if dims.batch == 0 || dims.seq == 0 {
+    // seq == 0 with a state_out still dispatches: it copies the start state
+    // through, so a caller alternating state buffers never reads a stale one.
+    if dims.batch == 0 || (dims.seq == 0 && state_out.is_none()) {
         return Ok(());
     }
     let p = pipeline_for(rt, "qwen35_gdn_recurrent", SCAN_THREADS, REC_TG_BYTES)?;
@@ -964,9 +1061,7 @@ fn out_kernel(base: &str, dtype: DType, what: &str) -> Result<String, String> {
     match dtype {
         DType::F32 => Ok(format!("{base}_f32")),
         DType::BF16 => Ok(format!("{base}_bf16")),
-        other => Err(format!(
-            "{what}: output dtype must be F32 or BF16, got {other:?}"
-        )),
+        other => Err(format!("{what}: dtype must be F32 or BF16, got {other:?}")),
     }
 }
 
@@ -1059,13 +1154,17 @@ pub struct AttnShape {
 
 /// Where [`attn_qk_norm_rope`] writes. The caches are `[batch, capacity,
 /// kv_heads, head_dim]`, the layout [`crate::nn::flash_attn_rows`] reads.
+///
+/// There is no capacity field: it is derived from the cache buffers with
+/// [`crate::nn::attn_kv_capacity`], exactly as flash attention derives it. A
+/// capacity passed alongside the buffers could disagree with the one attention
+/// reads, and every batch row after the first would land in the wrong slots.
 #[derive(Clone, Copy, Debug)]
 pub struct AttnTargets<'a> {
     /// `[batch, seq, q_heads, head_dim]`.
     pub q_out: &'a GpuBuffer,
     pub k_cache: &'a GpuBuffer,
     pub v_cache: &'a GpuBuffer,
-    pub kv_capacity: u32,
 }
 
 /// Q/K RMSNorm with zero-centred weights (`* (1 + w)`), transformers' partial
@@ -1101,18 +1200,21 @@ pub fn attn_qk_norm_rope(
     if !theta.is_finite() || theta <= 0.0 || !eps.is_finite() || eps <= 0.0 {
         return Err(format!("{WHAT}: theta and eps must be positive and finite"));
     }
-    if u64::from(pos_offset) + u64::from(s.seq) > u64::from(targets.kv_capacity) {
+    let layout = AttnProjLayout::new(s.q_heads, s.kv_heads, s.head_dim)?;
+    let kv_capacity = crate::nn::attn_kv_capacity(
+        targets.k_cache,
+        targets.v_cache,
+        s.batch,
+        s.kv_heads,
+        s.head_dim,
+    )?;
+    if u64::from(pos_offset) + u64::from(s.seq) > u64::from(kv_capacity) {
         return Err(format!(
-            "{WHAT}: positions [{pos_offset}, {pos_offset} + {}) exceed kv_capacity {}",
-            s.seq, targets.kv_capacity
+            "{WHAT}: positions [{pos_offset}, {pos_offset} + {}) exceed the caches' capacity {kv_capacity}",
+            s.seq
         ));
     }
-    let layout = AttnProjLayout {
-        q_heads: s.q_heads,
-        kv_heads: s.kv_heads,
-        head_dim: s.head_dim,
-    };
-    let width = u64::from(u32_product(&[s.q_heads + s.kv_heads, 2, s.head_dim], WHAT)?);
+    let width = u64::from(layout.width());
     let rows = u64::from(s.batch) * u64::from(s.seq);
     require_window::<f32>(rt, proj, rows, width, "attn_qk_norm_rope proj")?;
     require::<f32>(rt, q_norm_w, s.head_dim as usize, "attn q_norm weight")?;
@@ -1124,7 +1226,7 @@ pub fn attn_qk_norm_rope(
     let cache_elems = usize_product(
         &[
             s.batch as usize,
-            targets.kv_capacity as usize,
+            kv_capacity as usize,
             s.kv_heads as usize,
             s.head_dim as usize,
         ],
@@ -1150,7 +1252,7 @@ pub fn attn_qk_norm_rope(
         ],
     )?;
     let units = usize_product(
-        &[rows as usize, (s.q_heads + 2 * s.kv_heads) as usize],
+        &[rows as usize, s.q_heads as usize + 2 * s.kv_heads as usize],
         WHAT,
     )?;
     let p = pipeline_for(rt, "qwen35_attn_qk_norm_rope", ROWS_PER_TG * 32, 0)?;
@@ -1178,7 +1280,7 @@ pub fn attn_qk_norm_rope(
             set_u32(bnd, proj.off + layout.k_off(), 14);
             set_u32(bnd, proj.off + layout.v_off(), 15);
             set_u32(bnd, pos_offset, 16);
-            set_u32(bnd, targets.kv_capacity, 17);
+            set_u32(bnd, kv_capacity, 17);
             set_f32(bnd, theta, 18);
             set_f32(bnd, eps, 19);
         },
@@ -1289,10 +1391,21 @@ pub fn score_answer_rows(
     logprobs: &GpuBuffer,
 ) -> Result<(), String> {
     const WHAT: &str = "qwen35::score_answer_rows";
-    let name = out_kernel("qwen35_score_rows", lm_head.dtype, WHAT)?;
+    let name = out_kernel(
+        "qwen35_score_rows",
+        lm_head.dtype,
+        "qwen35::score_answer_rows lm_head",
+    )?;
     if hidden == 0 || n_answers == 0 || n_answers > MAX_ANSWERS {
         return Err(format!(
             "{WHAT}: hidden must be non-zero and n_answers in 1..={MAX_ANSWERS}"
+        ));
+    }
+    // An invalid slot or answer id still reads row 0 (then discards it) rather
+    // than branching around the load, so row 0 must exist in both tables.
+    if rows == 0 || lm_head.vocab == 0 {
+        return Err(format!(
+            "{WHAT}: rows and vocab must be non-zero (invalid indices read row 0)"
         ));
     }
     if !eps.is_finite() || eps <= 0.0 || !w_offset.is_finite() {
@@ -1330,7 +1443,8 @@ pub fn score_answer_rows(
             ("answers", answers),
         ],
     )?;
-    let tg_bytes = ((REDUCE_MAX_SIMDGROUPS + n_answers as usize) * 4).next_multiple_of(16);
+    // Reduction partials, then the answers' logits and validity flags.
+    let tg_bytes = ((REDUCE_MAX_SIMDGROUPS + 2 * n_answers as usize) * 4).next_multiple_of(16);
     let p = pipeline_for(rt, &name, SCORE_THREADS, tg_bytes)?;
     dispatch_groups(
         rt,
@@ -1373,16 +1487,24 @@ mod tests {
 
     #[test]
     fn gdn_layout_matches_the_packing_order() {
-        let l = GdnProjLayout {
-            k_heads: 16,
-            v_heads: 32,
-            v_dim: 128,
-        };
+        let l = GdnProjLayout::new(16, 32, 128).unwrap();
         assert_eq!(l.conv_dim(), 2 * 2048 + 4096);
         assert_eq!(l.z_off(), l.conv_dim());
         assert_eq!(l.b_off(), l.conv_dim() + 4096);
         assert_eq!(l.a_off(), l.b_off() + 32);
         assert_eq!(l.width() as usize, l.part_widths().iter().sum::<usize>());
+        assert!(
+            GdnProjLayout::new(16, 24, 128).is_err(),
+            "v_heads not a multiple of k_heads"
+        );
+        assert!(
+            GdnProjLayout::new(1, 1, 48).is_err(),
+            "v_dim not a multiple of 32"
+        );
+        assert!(
+            AttnProjLayout::new(u32::MAX / 4, 1, 4).is_err(),
+            "width overflow"
+        );
     }
 
     #[test]

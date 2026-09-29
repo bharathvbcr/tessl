@@ -27,6 +27,26 @@ All notable changes to `tessl` are recorded here. The format follows
 - **`tools/msl_emu`**, a CPU emulator that runs the kernel sources as C++ with
   real threadgroup barriers and simdgroup collectives, and a driver that checks
   them against transformers' own Qwen3.5 code.
+- Hardening pass over the Qwen3.5 kernels after an independent audit:
+  - **Numerics:** overflow-free sigmoid/SiLU. A `log1p`-accurate softplus (fast
+    `log(1+e)` was 1-60% off where `a + dt_bias` routinely lands). Scoring keeps
+    invalid answers out of the softmax and stores NaN as integer bits, which fast
+    math cannot fold away.
+  - **Scan and prep tiles:** the `const` diagonal matmul (a likely compile error)
+    is gone. Threadgroup strides are padded against bank conflicts, the per-row
+    decays are cached, and redundant tile loads are removed.
+  - **Kernel structure:** thread counts are named constants with `static_assert`s
+    on the lane mappings, and the conv runs with 256-thread groups.
+  - **Host fixes:** the in-place GDN state is now checked against the inputs too.
+    `score_answer_rows` rejects `rows == 0` / `vocab == 0`, which read out of
+    bounds before. `AttnTargets` derives the KV capacity from the caches instead
+    of taking one that could disagree with flash attention. Layouts get
+    validating constructors and `GdnProjLayout::dims`. `seq = 0` with a
+    `state_out` now copies the state through. Host arithmetic is checked
+    throughout.
+  - **Emulator:** threadgroup-order invariance, ASan/TSan builds with exactly
+    sized allocations, fast-math ulp noise, a host-contract check of binds and
+    constants, and a `kernel-emulator` CI job.
 - `tests/qwen35_kernels.rs` with transformers-generated goldens in
   `tests/fixtures/qwen35/` (`scripts/gen_qwen35_fixtures.py`). The Qwen3.5
   sources join the widened-index-arithmetic inspection in

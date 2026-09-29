@@ -16,19 +16,26 @@
 #include "reduce_tree.h"
 using namespace metal;
 
-/// A quiet NaN, from its bits. Metal compiles with fast math, under which a
-/// NaN produced by arithmetic may be assumed away; stored bits are not.
-inline float score_nan()
+/// A quiet NaN's bits. Metal compiles with fast math, under which a NaN that
+/// flows through float arithmetic *or a float select* may be assumed away, so
+/// results are chosen and stored as integer bits (`store_or_nan`).
+constant uint SCORE_NAN_BITS = 0x7fc00000u;
+
+inline void store_or_nan(device float *dst, ulong i, bool ok, float v)
 {
-    return as_type<float>(0x7fc00000u);
+    ((device uint *)dst)[i] = ok ? as_type<uint>(v) : SCORE_NAN_BITS;
 }
 
 /// Shared body. One threadgroup per slot; `tgm` holds `REDUCE_MAX_SIMDGROUPS`
-/// reduction partials followed by `n_ans` logits.
+/// reduction partials, then `n_ans` logits, then `n_ans` validity flags.
 ///
 /// A slot row `>= rows` or an answer id `>= vocab` scores NaN instead of
 /// reading out of bounds: those indices live in device memory, so the host
-/// cannot check them without a synchronising read.
+/// cannot check them without a synchronising read. Validity is tracked
+/// explicitly rather than by testing for NaN, because fast math may fold
+/// `isnan` away: an invalid answer is left out of its slot's softmax, so the
+/// valid answers beside it keep their log-probabilities, and gets NaN (as
+/// stored bits) in both outputs. A bad slot row makes the whole row NaN.
 template <typename W>
 inline void score_rows_impl(
     device const float *hidden_states,
@@ -53,6 +60,7 @@ inline void score_rows_impl(
 {
     threadgroup float *scratch = tgm;
     threadgroup float *lg = tgm + REDUCE_MAX_SIMDGROUPS;
+    threadgroup float *valid = lg + n_ans;
     const uint row = slots[slot];
     // Uniform: every thread of the threadgroup reads the same slot.
     const bool row_ok = row < rows;
@@ -75,28 +83,40 @@ inline void score_rows_impl(
         }
         dot = simd_sum(dot);
         if (lane == 0u) {
-            lg[a] = ok ? dot * inv : score_nan();
+            lg[a] = ok ? dot * inv : 0.0f;
+            valid[a] = ok ? 1.0f : 0.0f;
         }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     // n_ans is small (the host caps it); every thread folds it serially rather
     // than paying two more reductions for a few dozen elements.
-    float mx = lg[0];
-    for (uint a = 1u; a < n_ans; ++a) {
-        mx = max(mx, lg[a]);
+    // Seeded from the first valid logit rather than -INFINITY, which fast
+    // math may treat as undefined. No valid answer leaves `any` false.
+    bool any = false;
+    float mx = 0.0f;
+    for (uint a = 0u; a < n_ans; ++a) {
+        if (valid[a] != 0.0f) {
+            mx = any ? max(mx, lg[a]) : lg[a];
+            any = true;
+        }
     }
     float sum = 0.0f;
     for (uint a = 0u; a < n_ans; ++a) {
-        sum += exp(lg[a] - mx);
+        if (valid[a] != 0.0f) {
+            sum += exp(lg[a] - mx);
+        }
     }
-    const float lse = mx + log(sum);
+    // sum >= 1 whenever `any`: the maximum contributes exp(0).
+    const float lse = mx + log(max(sum, 1.0f));
     for (uint a = lid; a < n_ans; a += tptg) {
-        logits[(ulong)slot * n_ans + a] = lg[a];
-        logprobs[(ulong)slot * n_ans + a] = lg[a] - lse;
+        const bool ok = valid[a] != 0.0f;
+        store_or_nan(logits, (ulong)slot * n_ans + a, ok, lg[a]);
+        store_or_nan(logprobs, (ulong)slot * n_ans + a, ok, lg[a] - lse);
     }
 }
 
+/// Threadgroup memory: `REDUCE_MAX_SIMDGROUPS + 2 * n_ans` floats.
 /// `emb` is the LM head, [vocab, hidden] row-major (the tied embedding for the
 /// small Qwen3.5 checkpoints). Outputs are [n_slots, n_ans]. Grid: one
 /// threadgroup per slot.

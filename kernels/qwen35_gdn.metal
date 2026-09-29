@@ -72,17 +72,50 @@ constant uint GDN_DK = 128u;
 constant uint GDN_C = 64u;
 /// Value columns one scan/decode threadgroup owns.
 constant uint GDN_BV = 32u;
+/// Threads per threadgroup the prep kernel is written for: a quad of lanes per
+/// column of the C x C solve, and 8 simdgroups of 8 rows each.
+constant uint GDN_PREP_THREADS = 256u;
+/// Threads per threadgroup of the scan and recurrent kernels: 4 simdgroups,
+/// owning 2 row blocks of each chunk (scan) or 32 key rows (recurrent) apiece.
+constant uint GDN_SCAN_THREADS = 128u;
+
+// The lane mappings below are written against these shapes; a change to one
+// constant that forgot the others must fail to compile, not mis-index.
+static_assert(GDN_PREP_THREADS == 4u * GDN_C, "prep: one quad of lanes per solve column");
+static_assert(GDN_PREP_THREADS / 32u * 8u == GDN_C, "prep: one simdgroup per 8-row block");
+static_assert(GDN_SCAN_THREADS / 32u * 16u == GDN_C, "scan: two 8-row blocks per simdgroup");
+static_assert(GDN_SCAN_THREADS == GDN_DK, "recurrent: 32 key rows per simdgroup");
+static_assert(GDN_BV == 32u, "scan and recurrent: one value column per lane, 4 column tiles");
 /// transformers' `l2norm` epsilon, added to the sum of squares (not the mean).
 constant float GDN_L2_EPS = 1e-6f;
 
 /// torch's `F.softplus` at its defaults (beta = 1, threshold = 20): linear above
-/// the threshold. Below -15, `log(1 + e^x)` rounds to 0 in f32 while `e^x` is
-/// the correctly rounded answer, so use it there.
+/// the threshold, `log1p(e^x)` below it.
+///
+/// MSL has no `log1p`, and `log(1 + e)` is not a substitute where it matters:
+/// rounding `1 + e` alone costs `2^-24 / e` relative, and the fast `log` near 1
+/// has an absolute error around 2^-21 — together 1-60% of the result for x in
+/// [-15, -8], which `a + dt_bias` reaches routinely (Qwen's dt_bias sits around
+/// -2 to -7). Below -3 the series `e - e^2/2 + ... - e^8/8` is exact to f32
+/// (the first dropped term is 1e-11 relative); above it `1 + e` loses at most
+/// 1.2e-6 relative, and `precise::log` adds half an ulp.
 inline float gdn_softplus(float x)
 {
     if (x > 20.0f) return x;
     const float e = exp(x);
-    return x < -15.0f ? e : log(1.0f + e);
+    if (x < -3.0f) {
+        // log1p(e) by Horner: e * (1 - e/2 + e^2/3 - ... - e^7/8).
+        float p = -1.0f / 8.0f;
+        p = p * e + 1.0f / 7.0f;
+        p = p * e - 1.0f / 6.0f;
+        p = p * e + 1.0f / 5.0f;
+        p = p * e - 1.0f / 4.0f;
+        p = p * e + 1.0f / 3.0f;
+        p = p * e - 1.0f / 2.0f;
+        p = p * e + 1.0f;
+        return e * p;
+    }
+    return precise::log(1.0f + e);
 }
 
 /// `g = -exp(A_log) * softplus(a + dt_bias)`: the log of the per-step decay.
@@ -92,14 +125,19 @@ inline float gdn_log_decay(float a, float a_log, float dt_bias)
     return -exp(a_log) * gdn_softplus(a + dt_bias);
 }
 
+/// `1 / (1 + e^-x)` without ever forming `e^|x|`: Metal compiles with fast
+/// math, which may assume no intermediate is infinite, so the textbook form's
+/// `exp(-x) = inf` for x < -88 is not a safe route to 0 on device.
 inline float gdn_sigmoid(float x)
 {
-    return 1.0f / (1.0f + exp(-x));
+    const float e = exp(-fabs(x));
+    const float r = 1.0f / (1.0f + e);
+    return x >= 0.0f ? r : e * r;
 }
 
 inline float gdn_silu(float x)
 {
-    return x / (1.0f + exp(-x));
+    return x * gdn_sigmoid(x);
 }
 
 // ------------------------------------------------------------------ conv1d ---
@@ -174,7 +212,12 @@ kernel void qwen35_conv1d_silu(
 
 /// Threadgroup memory for `qwen35_gdn_chunk_prep`, in floats: one C x C block
 /// plus four per-row arrays.
-constant uint GDN_PREP_TG_FLOATS = GDN_C * GDN_C + 4u * GDN_C;
+/// Row stride of the prep kernel's C x C threadgroup block. Odd, so the solve's
+/// column walks (`blk[j * LD + n]` over j) and the tile stores touch distinct
+/// memory banks; at 64 a whole column sits in one bank.
+constant uint GDN_BLK_LD = GDN_C + 1u;
+constant uint GDN_PREP_TG_FLOATS = GDN_C * GDN_BLK_LD + 4u * GDN_C;
+static_assert(GDN_PREP_TG_FLOATS * 4u <= 32768u, "prep threadgroup memory exceeds 32 KB");
 
 /// Per (batch, value head, chunk): gates, norms, both C x C products, the solve.
 ///
@@ -226,8 +269,8 @@ kernel void qwen35_gdn_chunk_prep(
     const uint t0 = chunk * GDN_C;
     const float q_scale = rsqrt((float)GDN_DK);
 
-    threadgroup float *blk = tgm;                    // [C][C]
-    threadgroup float *G = tgm + GDN_C * GDN_C;      // [C]
+    threadgroup float *blk = tgm;                    // [C][BLK_LD]
+    threadgroup float *G = tgm + GDN_C * GDN_BLK_LD; // [C]
     threadgroup float *beta = G + GDN_C;             // [C]
     threadgroup float *rk = beta + GDN_C;            // [C]
     threadgroup float *rq = rk + GDN_C;              // [C]
@@ -283,7 +326,7 @@ kernel void qwen35_gdn_chunk_prep(
     const ulong row_base = head * tp + t0;
     device float *wk = ws_k + row_base * GDN_DK;
     device float *wq = ws_q + row_base * GDN_DK;
-    for (uint idx = lid; idx < GDN_C * GDN_DK; idx += 256u) {
+    for (uint idx = lid; idx < GDN_C * GDN_DK; idx += GDN_PREP_THREADS) {
         const uint i = idx / GDN_DK;
         const uint d = idx % GDN_DK;
         const uint t = t0 + i;
@@ -331,16 +374,16 @@ kernel void qwen35_gdn_chunk_prep(
         }
         for (uint cb = 0u; cb < 8u; ++cb) {
             if (cb <= rb) {
-                simdgroup_store(acc[cb], blk + rb * 8u * GDN_C + cb * 8u, GDN_C);
+                simdgroup_store(acc[cb], blk + rb * 8u * GDN_BLK_LD + cb * 8u, GDN_BLK_LD);
             }
         }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (uint idx = lid; idx < GDN_C * GDN_C; idx += 256u) {
+    for (uint idx = lid; idx < GDN_C * GDN_C; idx += GDN_PREP_THREADS) {
         const uint i = idx / GDN_C;
         const uint j = idx % GDN_C;
         // Tiles above the diagonal were never stored; the mask never reads them.
-        ws_aq[blk_base + idx] = j <= i ? blk[idx] * exp(G[i] - G[j]) : 0.0f;
+        ws_aq[blk_base + idx] = j <= i ? blk[i * GDN_BLK_LD + j] * exp(G[i] - G[j]) : 0.0f;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -367,16 +410,16 @@ kernel void qwen35_gdn_chunk_prep(
         }
         for (uint cb = 0u; cb < 8u; ++cb) {
             if (cb >= rb) {
-                simdgroup_store(acc[cb], blk + rb * 8u * GDN_C + cb * 8u, GDN_C);
+                simdgroup_store(acc[cb], blk + rb * 8u * GDN_BLK_LD + cb * 8u, GDN_BLK_LD);
             }
         }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (uint idx = lid; idx < GDN_C * GDN_C; idx += 256u) {
+    for (uint idx = lid; idx < GDN_C * GDN_C; idx += GDN_PREP_THREADS) {
         const uint j = idx / GDN_C; // row of the stored element
         const uint i = idx % GDN_C; // column
         if (j < i) {
-            blk[idx] = beta[i] * exp(G[i] - G[j]) * blk[idx];
+            blk[j * GDN_BLK_LD + i] = beta[i] * exp(G[i] - G[j]) * blk[j * GDN_BLK_LD + i];
         }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -394,33 +437,38 @@ kernel void qwen35_gdn_chunk_prep(
             float s = 0.0f;
             if (i > n) {
                 for (uint j = n + q; j < i; j += 4u) {
-                    const float wj = j == n ? 1.0f : blk[j * GDN_C + n];
-                    s += blk[j * GDN_C + i] * wj; // A[i][j], from the upper triangle
+                    const float wj = j == n ? 1.0f : blk[j * GDN_BLK_LD + n];
+                    s += blk[j * GDN_BLK_LD + i] * wj; // A[i][j], from the upper triangle
                 }
             }
             // Uniform across the simdgroup: every lane runs every `i`.
             s += simd_shuffle_xor(s, 1u);
             s += simd_shuffle_xor(s, 2u);
             if (i > n && ((i - n) & 3u) == q) {
-                blk[i * GDN_C + n] = -s;
+                blk[i * GDN_BLK_LD + n] = -s;
             }
         }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (uint idx = lid; idx < GDN_C * GDN_C; idx += 256u) {
+    for (uint idx = lid; idx < GDN_C * GDN_C; idx += GDN_PREP_THREADS) {
         const uint i = idx / GDN_C;
         const uint j = idx % GDN_C;
-        ws_w[blk_base + idx] = i > j ? blk[idx] : (i == j ? 1.0f : 0.0f);
+        ws_w[blk_base + idx] = i > j ? blk[i * GDN_BLK_LD + j] : (i == j ? 1.0f : 0.0f);
     }
 }
 
 // ------------------------------------------------------------- chunk scan ---
 
+/// Row stride of the scan's [.][BV] threadgroup tiles. Padded past 32 so the
+/// eight rows of an 8x8 tile load do not all start in the same memory bank.
+constant uint GDN_TLD = GDN_BV + 4u;
+
 /// Threadgroup memory for `qwen35_gdn_chunk_scan`, in floats: the state slice
-/// [DK][BV], one [C][BV] block, a 2 x 8 x 8 output stage per simdgroup, and the
-/// chunk's G and beta.
+/// [DK][TLD], one [C][TLD] block, a 2 x 8 x 8 output stage per simdgroup, and
+/// four per-row arrays for the chunk (G, beta, exp(G), exp(G_last - G)).
 constant uint GDN_SCAN_TG_FLOATS =
-    GDN_DK * GDN_BV + GDN_C * GDN_BV + 4u * 128u + 2u * GDN_C;
+    GDN_DK * GDN_TLD + GDN_C * GDN_TLD + (GDN_SCAN_THREADS / 32u) * 2u * 64u + 4u * GDN_C;
+static_assert(GDN_SCAN_TG_FLOATS * 4u <= 32768u, "scan threadgroup memory exceeds 32 KB");
 
 /// The sequential pass over chunks, for one (batch, value head, 32-column
 /// slice of Dv). Reads what `qwen35_gdn_chunk_prep` wrote, plus V.
@@ -430,7 +478,8 @@ constant uint GDN_SCAN_TG_FLOATS =
 /// shared snapshot, which is never written. When `flags & 2` the final state is
 /// written to `state_out` ([B, Hv, DK, Dv]). A thread reads the same state
 /// elements at the start that it writes at the end, so `state_out` may be
-/// `state_in` itself when `state_bstride = Hv*DK*Dv`.
+/// `state_in` itself when `state_bstride = Hv*DK*Dv`. With T = 0 there are no
+/// chunks, and the start state is copied through.
 ///
 /// Output head `hv` goes to columns [out_off + hv*Dv, +Dv) of row `b*T + t`.
 ///
@@ -469,19 +518,21 @@ kernel void qwen35_gdn_chunk_scan(
     const ulong head = (ulong)b * Hv + hv;
     const uint v0 = vs * GDN_BV;
 
-    threadgroup float *S = tgm;                          // [DK][BV]
-    threadgroup float *X = S + GDN_DK * GDN_BV;          // [C][BV]
-    threadgroup float *stage = X + GDN_C * GDN_BV;       // [4][2][64]
-    threadgroup float *Gc = stage + 4u * 128u;           // [C]
-    threadgroup float *Bc = Gc + GDN_C;                  // [C]
-    threadgroup float *st1 = stage + sg * 128u;
+    threadgroup float *S = tgm;                                  // [DK][TLD]
+    threadgroup float *X = S + GDN_DK * GDN_TLD;                 // [C][TLD]
+    threadgroup float *stage = X + GDN_C * GDN_TLD;              // [4][2][64]
+    threadgroup float *Gc = stage + (GDN_SCAN_THREADS / 32u) * 2u * 64u; // [C]
+    threadgroup float *Bc = Gc + GDN_C;                          // [C] beta
+    threadgroup float *Ec = Bc + GDN_C;                          // [C] exp(G)
+    threadgroup float *Dc = Ec + GDN_C;                          // [C] exp(G_last - G)
+    threadgroup float *st1 = stage + sg * 2u * 64u;
     threadgroup float *st2 = st1 + 64u;
 
     const ulong state_head = (ulong)hv * GDN_DK * Dv;
-    for (uint idx = lid; idx < GDN_DK * GDN_BV; idx += 128u) {
+    for (uint idx = lid; idx < GDN_DK * GDN_BV; idx += GDN_SCAN_THREADS) {
         const uint kk = idx / GDN_BV;
         const uint v = idx % GDN_BV;
-        S[idx] = (flags & 1u) != 0u
+        S[kk * GDN_TLD + v] = (flags & 1u) != 0u
             ? state_in[(ulong)b * state_bstride + state_head + (ulong)kk * Dv + v0 + v]
             : 0.0f;
     }
@@ -501,6 +552,13 @@ kernel void qwen35_gdn_chunk_scan(
         }
         // Also orders the state initialisation / the previous chunk's update.
         threadgroup_barrier(mem_flags::mem_threadgroup);
+        // Read after the next barrier (the one closing X = K S): computed once
+        // a chunk here rather than once an element below. Both exponents are
+        // <= 0 because G is non-increasing.
+        if (lid < GDN_C) {
+            Ec[lid] = exp(Gc[lid]);
+            Dc[lid] = exp(Gc[GDN_C - 1u] - Gc[lid]);
+        }
 
         // --- X = K S; simdgroup sg owns row blocks 2sg, 2sg+1 ----------------
         {
@@ -511,33 +569,36 @@ kernel void qwen35_gdn_chunk_scan(
                 }
             }
             for (uint kk = 0u; kk < GDN_DK / 8u; ++kk) {
+                simdgroup_float8x8 a[2];
                 for (uint r = 0u; r < 2u; ++r) {
-                    simdgroup_float8x8 a;
-                    simdgroup_load(a, wk + (ulong)((2u * sg + r) * 8u) * GDN_DK + kk * 8u, GDN_DK);
-                    for (uint ct = 0u; ct < 4u; ++ct) {
-                        simdgroup_float8x8 s;
-                        simdgroup_load(s, S + kk * 8u * GDN_BV + ct * 8u, GDN_BV);
-                        simdgroup_multiply_accumulate(acc[r][ct], a, s, acc[r][ct]);
+                    simdgroup_load(a[r], wk + (ulong)((2u * sg + r) * 8u) * GDN_DK + kk * 8u, GDN_DK);
+                }
+                // Each state tile is loaded once for both row blocks.
+                for (uint ct = 0u; ct < 4u; ++ct) {
+                    simdgroup_float8x8 st;
+                    simdgroup_load(st, S + kk * 8u * GDN_TLD + ct * 8u, GDN_TLD);
+                    for (uint r = 0u; r < 2u; ++r) {
+                        simdgroup_multiply_accumulate(acc[r][ct], a[r], st, acc[r][ct]);
                     }
                 }
             }
             for (uint r = 0u; r < 2u; ++r) {
                 for (uint ct = 0u; ct < 4u; ++ct) {
-                    simdgroup_store(acc[r][ct], X + (2u * sg + r) * 8u * GDN_BV + ct * 8u, GDN_BV);
+                    simdgroup_store(acc[r][ct], X + (2u * sg + r) * 8u * GDN_TLD + ct * 8u, GDN_TLD);
                 }
             }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
         // --- X = beta * (V - exp(G) * X) --------------------------------------
-        for (uint idx = lid; idx < GDN_C * GDN_BV; idx += 128u) {
+        for (uint idx = lid; idx < GDN_C * GDN_BV; idx += GDN_SCAN_THREADS) {
             const uint i = idx / GDN_BV;
             const uint v = idx % GDN_BV;
             const uint t = t0 + i;
             const float vv = t < T
                 ? qkv[((ulong)b * T + t) * (ulong)ld_qkv + v_off + (ulong)hv * Dv + v0 + v]
                 : 0.0f;
-            X[idx] = Bc[i] * (vv - exp(Gc[i]) * X[idx]);
+            X[i * GDN_TLD + v] = Bc[i] * (vv - Ec[i] * X[i * GDN_TLD + v]);
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -554,7 +615,7 @@ kernel void qwen35_gdn_chunk_scan(
                     simdgroup_load(a, ww + rt * 8u * GDN_C + kb * 8u, GDN_C);
                     for (uint ct = 0u; ct < 4u; ++ct) {
                         simdgroup_float8x8 x;
-                        simdgroup_load(x, X + kb * 8u * GDN_BV + ct * 8u, GDN_BV);
+                        simdgroup_load(x, X + kb * 8u * GDN_TLD + ct * 8u, GDN_TLD);
                         simdgroup_multiply_accumulate(acc[r][ct], a, x, acc[r][ct]);
                     }
                 }
@@ -563,7 +624,7 @@ kernel void qwen35_gdn_chunk_scan(
             threadgroup_barrier(mem_flags::mem_threadgroup);
             for (uint r = 0u; r < 2u; ++r) {
                 for (uint ct = 0u; ct < 4u; ++ct) {
-                    simdgroup_store(acc[r][ct], X + (2u * sg + r) * 8u * GDN_BV + ct * 8u, GDN_BV);
+                    simdgroup_store(acc[r][ct], X + (2u * sg + r) * 8u * GDN_TLD + ct * 8u, GDN_TLD);
                 }
             }
         }
@@ -586,9 +647,9 @@ kernel void qwen35_gdn_chunk_scan(
                 simdgroup_float8x8 a;
                 simdgroup_load(a, wq + (ulong)(rt * 8u) * GDN_DK + kk * 8u, GDN_DK);
                 for (uint ct = 0u; ct < 4u; ++ct) {
-                    simdgroup_float8x8 s;
-                    simdgroup_load(s, S + kk * 8u * GDN_BV + ct * 8u, GDN_BV);
-                    simdgroup_multiply_accumulate(o1[ct], a, s, o1[ct]);
+                    simdgroup_float8x8 st;
+                    simdgroup_load(st, S + kk * 8u * GDN_TLD + ct * 8u, GDN_TLD);
+                    simdgroup_multiply_accumulate(o1[ct], a, st, o1[ct]);
                 }
             }
             for (uint kb = 0u; kb <= rt; ++kb) {
@@ -596,7 +657,7 @@ kernel void qwen35_gdn_chunk_scan(
                 simdgroup_load(a, waq + rt * 8u * GDN_C + kb * 8u, GDN_C);
                 for (uint ct = 0u; ct < 4u; ++ct) {
                     simdgroup_float8x8 u;
-                    simdgroup_load(u, X + kb * 8u * GDN_BV + ct * 8u, GDN_BV);
+                    simdgroup_load(u, X + kb * 8u * GDN_TLD + ct * 8u, GDN_TLD);
                     simdgroup_multiply_accumulate(o2[ct], a, u, o2[ct]);
                 }
             }
@@ -609,7 +670,7 @@ kernel void qwen35_gdn_chunk_scan(
                     const uint t = t0 + i;
                     if (t < T) {
                         out[((ulong)b * T + t) * (ulong)ld_out + out_off + (ulong)hv * Dv
-                            + v0 + ct * 8u + e % 8u] = exp(Gc[i]) * st1[e] + st2[e];
+                            + v0 + ct * 8u + e % 8u] = Ec[i] * st1[e] + st2[e];
                     }
                 }
                 simdgroup_barrier(mem_flags::mem_threadgroup);
@@ -618,48 +679,53 @@ kernel void qwen35_gdn_chunk_scan(
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
         // --- S = exp(G_last) S + K^T (exp(G_last - G) * U) --------------------
-        const float g_last = Gc[GDN_C - 1u];
-        for (uint idx = lid; idx < GDN_C * GDN_BV; idx += 128u) {
-            X[idx] *= exp(g_last - Gc[idx / GDN_BV]);
+        // Both scalings are elementwise passes: nothing reads S or U until the
+        // barrier after them.
+        const float decay = Ec[GDN_C - 1u];
+        for (uint idx = lid; idx < GDN_C * GDN_BV; idx += GDN_SCAN_THREADS) {
+            const uint i = idx / GDN_BV;
+            X[i * GDN_TLD + idx % GDN_BV] *= Dc[i];
+        }
+        for (uint idx = lid; idx < GDN_DK * GDN_BV; idx += GDN_SCAN_THREADS) {
+            S[(idx / GDN_BV) * GDN_TLD + idx % GDN_BV] *= decay;
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        {
-            // A diagonal matrix: multiplying by it scales exactly, adding zeros.
-            const simdgroup_float8x8 decay = simdgroup_float8x8(exp(g_last));
-            // simdgroup sg owns state row blocks 4sg .. 4sg+3; nobody else
-            // reads or writes them until the next chunk's barrier. Each K^T
-            // tile is loaded once for the four column tiles of its row block.
-            for (uint r = 0u; r < 4u; ++r) {
-                const uint kt = 4u * sg + r;
-                simdgroup_float8x8 acc[4];
+        // simdgroup sg owns state row blocks 4sg .. 4sg+3; nobody else reads or
+        // writes them until the next chunk's barrier. Each K^T tile is loaded
+        // once for the four column tiles of its row block.
+        for (uint r = 0u; r < 4u; ++r) {
+            const uint kt = 4u * sg + r;
+            simdgroup_float8x8 acc[4];
+            for (uint ct = 0u; ct < 4u; ++ct) {
+                simdgroup_load(acc[ct], S + kt * 8u * GDN_TLD + ct * 8u, GDN_TLD);
+            }
+            for (uint kb = 0u; kb < GDN_C / 8u; ++kb) {
+                simdgroup_float8x8 a;
+                simdgroup_load(a, wk + (ulong)(kb * 8u) * GDN_DK + kt * 8u, GDN_DK,
+                               ulong2(0, 0), true);
                 for (uint ct = 0u; ct < 4u; ++ct) {
-                    simdgroup_float8x8 s;
-                    simdgroup_load(s, S + kt * 8u * GDN_BV + ct * 8u, GDN_BV);
-                    simdgroup_multiply(acc[ct], decay, s);
+                    simdgroup_float8x8 u;
+                    simdgroup_load(u, X + kb * 8u * GDN_TLD + ct * 8u, GDN_TLD);
+                    simdgroup_multiply_accumulate(acc[ct], a, u, acc[ct]);
                 }
-                for (uint kb = 0u; kb < GDN_C / 8u; ++kb) {
-                    simdgroup_float8x8 a;
-                    simdgroup_load(a, wk + (ulong)(kb * 8u) * GDN_DK + kt * 8u, GDN_DK,
-                                   ulong2(0, 0), true);
-                    for (uint ct = 0u; ct < 4u; ++ct) {
-                        simdgroup_float8x8 u;
-                        simdgroup_load(u, X + kb * 8u * GDN_BV + ct * 8u, GDN_BV);
-                        simdgroup_multiply_accumulate(acc[ct], a, u, acc[ct]);
-                    }
-                }
-                for (uint ct = 0u; ct < 4u; ++ct) {
-                    simdgroup_store(acc[ct], S + kt * 8u * GDN_BV + ct * 8u, GDN_BV);
-                }
+            }
+            for (uint ct = 0u; ct < 4u; ++ct) {
+                simdgroup_store(acc[ct], S + kt * 8u * GDN_TLD + ct * 8u, GDN_TLD);
             }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 
     if ((flags & 2u) != 0u) {
-        for (uint idx = lid; idx < GDN_DK * GDN_BV; idx += 128u) {
+        // With no chunks this reads the initialisation above, which the final
+        // write needs ordered after it: the barrier is uniform (nc is).
+        if (nc == 0u) {
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+        for (uint idx = lid; idx < GDN_DK * GDN_BV; idx += GDN_SCAN_THREADS) {
             const uint kk = idx / GDN_BV;
             const uint v = idx % GDN_BV;
-            state_out[head * GDN_DK * Dv + (ulong)kk * Dv + v0 + v] = S[idx];
+            state_out[head * GDN_DK * Dv + (ulong)kk * Dv + v0 + v] = S[kk * GDN_TLD + v];
         }
     }
 }

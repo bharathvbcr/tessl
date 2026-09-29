@@ -43,6 +43,22 @@ fn max_abs(v: &[f64]) -> f64 {
     v.iter().fold(0.0, |m, x| m.max(x.abs()))
 }
 
+/// `got` within `abs + rel * |want|` elementwise. The shape of error Metal's
+/// fast-math `exp`, division and `rsqrt` produce (a few ulps of each result),
+/// which a flat absolute bound misjudges at both ends of the range.
+fn assert_close_rel(label: &str, got: &[f32], want: &[f64], rel: f64, abs: f64) {
+    assert_eq!(got.len(), want.len(), "{label}: length");
+    for (i, (&g, &w)) in got.iter().zip(want).enumerate() {
+        assert!(g != SENTINEL, "{label}[{i}]: never written");
+        assert!(g.is_finite(), "{label}[{i}]: non-finite {g}");
+        let bound = abs + rel * w.abs();
+        assert!(
+            (f64::from(g) - w).abs() <= bound,
+            "{label}[{i}]: got {g} want {w} (bound {bound:.3e})"
+        );
+    }
+}
+
 fn assert_close(label: &str, got: &[f32], want: &[f64], atol: f64) {
     assert_eq!(got.len(), want.len(), "{label}: length");
     let mut worst = (0.0f64, 0usize);
@@ -188,6 +204,13 @@ fn gdn_reference_matches_transformers() {
         "y vs transformers fp32: {:e}",
         diff(&y, &yhf)
     );
+    // ...and its final state, which transformers returns as output_final_state.
+    let (_, sthf) = load("gdn_state_hf");
+    assert!(
+        diff(&st, &sthf) < 1e-5,
+        "state vs transformers fp32: {:e}",
+        diff(&st, &sthf)
+    );
 }
 
 #[test]
@@ -297,14 +320,32 @@ fn dims_of(s: GdnShape) -> GdnDims {
     }
 }
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, PartialEq, Debug)]
 enum Path {
     Chunk,
     Recurrent,
 }
 
-/// Run one GDN call; returns (y [B*T, Hv*Dv], final state).
-fn run_gdn(rt: &Arc<GpuRuntime>, d: &GdnData, path: Path) -> (Vec<f32>, Vec<f32>) {
+/// Where a GDN call puts its final state.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum StateOut {
+    /// A buffer of its own.
+    Separate,
+    /// Nowhere (`state_out = None`): the output must still be right, and the
+    /// buffer bound as a placeholder in the state_out slot must be untouched.
+    Discard,
+    /// Back into the per-batch input state.
+    InPlace,
+}
+
+/// Run one GDN call; returns (y [B*T, Hv*Dv], final state — empty for
+/// [`StateOut::Discard`]).
+fn run_gdn_with(
+    rt: &Arc<GpuRuntime>,
+    d: &GdnData,
+    path: Path,
+    mode: StateOut,
+) -> (Vec<f32>, Vec<f32>) {
     let s = d.s;
     let dims = dims_of(s);
     let p = Packed::new(rt, d);
@@ -312,12 +353,21 @@ fn run_gdn(rt: &Arc<GpuRuntime>, d: &GdnData, path: Path) -> (Vec<f32>, Vec<f32>
     let (out_ld, out_off) = (width + 3, 2usize);
     let out = seeded(rt, s.b * s.t * out_ld, SENTINEL);
     let state_elems = s.b * s.hv * DK * s.dv;
-    let state_out = seeded(rt, state_elems, SENTINEL);
+    let separate = seeded(rt, state_elems, SENTINEL);
     let state_buf = d.state0.as_ref().map(|s0| buf(rt, s0));
     let state = match (&state_buf, d.snapshot) {
         (None, _) => StateIn::Zero,
         (Some(b), false) => StateIn::PerBatch(b),
         (Some(b), true) => StateIn::Snapshot(b),
+    };
+    let state_out = match mode {
+        StateOut::Separate => Some(&separate),
+        StateOut::Discard => None,
+        StateOut::InPlace => Some(
+            state_buf
+                .as_ref()
+                .expect("in place needs a per-batch state"),
+        ),
     };
     let out_cols = Cols {
         buf: &out,
@@ -336,7 +386,7 @@ fn run_gdn(rt: &Arc<GpuRuntime>, d: &GdnData, path: Path) -> (Vec<f32>, Vec<f32>
                 state,
                 &ws,
                 out_cols,
-                Some(&state_out),
+                state_out,
             )
             .unwrap();
         }
@@ -348,7 +398,7 @@ fn run_gdn(rt: &Arc<GpuRuntime>, d: &GdnData, path: Path) -> (Vec<f32>, Vec<f32>
             &p.params(),
             state,
             out_cols,
-            Some(&state_out),
+            state_out,
         )
         .unwrap(),
     }
@@ -368,14 +418,33 @@ fn run_gdn(rt: &Arc<GpuRuntime>, d: &GdnData, path: Path) -> (Vec<f32>, Vec<f32>
         );
         y.extend_from_slice(&row[out_off..out_off + width]);
     }
-    if let (Some(b), Some(s0)) = (&state_buf, &d.state0) {
-        assert_eq!(
-            &b.read_f32()[..s0.len()],
-            &s0[..],
-            "the input state was written"
-        );
+    if mode != StateOut::InPlace {
+        if let (Some(b), Some(s0)) = (&state_buf, &d.state0) {
+            assert_eq!(
+                &b.read_f32()[..s0.len()],
+                &s0[..],
+                "the input state was written"
+            );
+        }
     }
-    (y, state_out.read_f32()[..state_elems].to_vec())
+    let state = match mode {
+        StateOut::Separate => separate.read_f32()[..state_elems].to_vec(),
+        StateOut::Discard => {
+            assert!(
+                separate.read_f32()[..state_elems]
+                    .iter()
+                    .all(|&x| x == SENTINEL),
+                "a state was written with state_out = None"
+            );
+            Vec::new()
+        }
+        StateOut::InPlace => state_buf.unwrap().read_f32()[..state_elems].to_vec(),
+    };
+    (y, state)
+}
+
+fn run_gdn(rt: &Arc<GpuRuntime>, d: &GdnData, path: Path) -> (Vec<f32>, Vec<f32>) {
+    run_gdn_with(rt, d, path, StateOut::Separate)
 }
 
 fn check_gdn(label: &str, rt: &Arc<GpuRuntime>, d: &GdnData, path: Path) {
@@ -734,11 +803,12 @@ fn conv1d_prefill_then_decode_continues() {
                 } else {
                     &yd[bi * c..(bi + 1) * c]
                 };
-                assert_close(
+                assert_close_rel(
                     &format!("conv b{bi} t{ti}"),
                     got,
                     &want[(bi * t + ti) * c..(bi * t + ti + 1) * c],
                     1e-5,
+                    1e-6,
                 );
             }
         }
@@ -776,7 +846,7 @@ fn conv1d_snapshot_state_is_shared_and_read_only() {
         )
         .unwrap();
         rt.synchronize().unwrap();
-        assert_close("conv y", &y.read_f32()[..want.len()], &want, 1e-5);
+        assert_close_rel("conv y", &y.read_f32()[..want.len()], &want, 1e-5, 1e-6);
         assert_close(
             "conv state",
             &st.read_f32()[..want_state.len()],
@@ -841,12 +911,18 @@ fn gated_rms_norm_f32_and_bf16() {
         };
         qwen35::gated_rms_norm(rt, xc, zc, &wb, ob, rows as u32, h as u32, d as u32, 1e-6).unwrap();
         rt.synchronize().unwrap();
-        assert_close("gated norm f32", &out.read_f32()[..want.len()], &want, 1e-5);
+        assert_close_rel(
+            "gated norm f32",
+            &out.read_f32()[..want.len()],
+            &want,
+            1e-5,
+            1e-6,
+        );
         let got = read_bf16(&outb, want.len());
         for (i, (&g, &w)) in got.iter().zip(&want).enumerate() {
             // One bf16 rounding of the f32 result: half an ulp of 2^-8, plus slack.
             assert!(
-                (f64::from(g) - w).abs() <= w.abs() * 2f64.powi(-8) + 1e-6,
+                (f64::from(g) - w).abs() <= w.abs() * (2f64.powi(-8) + 1e-5) + 1e-6,
                 "bf16 [{i}] {g} vs {w}"
             );
         }
@@ -864,9 +940,9 @@ fn attn_proj_rows(
     gate: &[f32],
 ) -> Vec<f32> {
     let (hq, hkv, d) = (
-        layout.q_heads as usize,
-        layout.kv_heads as usize,
-        layout.head_dim as usize,
+        layout.q_heads() as usize,
+        layout.kv_heads() as usize,
+        layout.head_dim() as usize,
     );
     let w = layout.width() as usize;
     let mut p = vec![SENTINEL; rows * w];
@@ -905,11 +981,7 @@ fn run_qk_rope(
         shape.kv_heads as usize,
         shape.head_dim as usize,
     );
-    let layout = AttnProjLayout {
-        q_heads: shape.q_heads,
-        kv_heads: shape.kv_heads,
-        head_dim: shape.head_dim,
-    };
+    let layout = AttnProjLayout::new(shape.q_heads, shape.kv_heads, shape.head_dim).unwrap();
     let (pb, qwb, kwb) = (buf(rt, p), buf(rt, qw), buf(rt, kw));
     let q_out = seeded(rt, b * t * hq * d, SENTINEL);
     let cache = b * cap as usize * hkv * d;
@@ -918,7 +990,6 @@ fn run_qk_rope(
         q_out: &q_out,
         k_cache: &kc,
         v_cache: &vc,
-        kv_capacity: cap,
     };
     qwen35::attn_qk_norm_rope(
         rt,
@@ -954,11 +1025,7 @@ fn attn_qk_norm_rope_matches_transformers_golden() {
             head_dim: d as u32,
             rotary_dim: 64,
         };
-        let layout = AttnProjLayout {
-            q_heads: hq as u32,
-            kv_heads: 1,
-            head_dim: d as u32,
-        };
+        let layout = AttnProjLayout::new(hq as u32, 1, d as u32).unwrap();
         let v = random_f32(t * d, 700);
         let gate = random_f32(t * hq * d, 701);
         let p = attn_proj_rows(layout, t, &q, &k, &v, &gate);
@@ -990,6 +1057,10 @@ fn attn_qk_norm_rope_matches_transformers_golden() {
             kc[..pos as usize * d].iter().all(|&x| x == SENTINEL),
             "k cache written below pos"
         );
+        assert!(
+            vc[..pos as usize * d].iter().all(|&x| x == SENTINEL),
+            "v cache written below pos"
+        );
     });
 }
 
@@ -1005,11 +1076,7 @@ fn attn_qk_norm_rope_small_positions_are_tight() {
             head_dim: d as u32,
             rotary_dim: rot as u32,
         };
-        let layout = AttnProjLayout {
-            q_heads: hq as u32,
-            kv_heads: hkv as u32,
-            head_dim: d as u32,
-        };
+        let layout = AttnProjLayout::new(hq as u32, hkv as u32, d as u32).unwrap();
         let q = random_f32(b * t * hq * d, 710);
         let k = random_f32(b * t * hkv * d, 711);
         let v = random_f32(b * t * hkv * d, 712);
@@ -1070,11 +1137,7 @@ fn attn_output_gate_f32_bf16_and_in_place() {
     with_gpu(|rt| {
         let (rows, hq, d) = (11usize, 3usize, 64usize);
         let width = hq * d;
-        let layout = AttnProjLayout {
-            q_heads: hq as u32,
-            kv_heads: 1,
-            head_dim: d as u32,
-        };
+        let layout = AttnProjLayout::new(hq as u32, 1, d as u32).unwrap();
         let gate: Vec<f32> = random_f32(rows * width, 800)
             .iter()
             .map(|x| 4.0 * x)
@@ -1126,11 +1189,11 @@ fn attn_output_gate_f32_bf16_and_in_place() {
         )
         .unwrap();
         rt.synchronize().unwrap();
-        assert_close("gate f32", &out.read_f32()[..want.len()], &want, 1e-6);
+        assert_close_rel("gate f32", &out.read_f32()[..want.len()], &want, 1e-5, 1e-7);
         let bf = read_bf16(&outb, want.len());
         for (i, (&g, &w)) in bf.iter().zip(&want).enumerate() {
             assert!(
-                (f64::from(g) - w).abs() <= w.abs() * 2f64.powi(-8) + 1e-7,
+                (f64::from(g) - w).abs() <= w.abs() * (2f64.powi(-8) + 1e-5) + 1e-7,
                 "bf16 [{i}]"
             );
         }
@@ -1149,7 +1212,13 @@ fn attn_output_gate_f32_bf16_and_in_place() {
         )
         .unwrap();
         rt.synchronize().unwrap();
-        assert_close("gate in place", &ab.read_f32()[..want.len()], &want, 1e-6);
+        assert_close_rel(
+            "gate in place",
+            &ab.read_f32()[..want.len()],
+            &want,
+            1e-5,
+            1e-7,
+        );
     });
 }
 
@@ -1221,16 +1290,18 @@ fn score_answer_rows_f32_and_bf16() {
                     &rows_e,
                 );
                 let r = si * answers.len()..(si + 1) * answers.len();
-                assert_close(
+                assert_close_rel(
                     &format!("{dtype:?} logits slot {slot}"),
                     &gl[r.clone()],
                     &wl,
                     1e-5,
+                    1e-5,
                 );
-                assert_close(
+                assert_close_rel(
                     &format!("{dtype:?} logprobs slot {slot}"),
                     &gp[r],
                     &wp,
+                    1e-5,
                     1e-5,
                 );
             }
@@ -1239,14 +1310,13 @@ fn score_answer_rows_f32_and_bf16() {
 }
 
 #[test]
-fn score_out_of_range_indices_score_nan() {
+fn score_out_of_range_indices_score_nan_and_spare_the_rest() {
     with_gpu(|rt| {
         let (rows, hidden, vocab) = (4usize, 64usize, 8usize);
-        let (hb, nwb, eb) = (
-            buf(rt, &random_f32(rows * hidden, 910)),
-            buf(rt, &vec![0.0; hidden]),
-            buf(rt, &random_f32(vocab * hidden, 911)),
-        );
+        let h = random_f32(rows * hidden, 910);
+        let nw = vec![0.0f32; hidden];
+        let emb = random_f32(vocab * hidden, 911);
+        let (hb, nwb, eb) = (buf(rt, &h), buf(rt, &nw), buf(rt, &emb));
         let ab = u32_buf(rt, &[1, vocab as u32, 2]);
         let sb = u32_buf(rt, &[rows as u32, 1]);
         let (lg, lp) = (seeded(rt, 6, SENTINEL), seeded(rt, 6, SENTINEL));
@@ -1273,17 +1343,30 @@ fn score_out_of_range_indices_score_nan() {
         )
         .unwrap();
         rt.synchronize().unwrap();
-        let l = lg.read_f32();
+        let (l, p) = (lg.read_f32(), lp.read_f32());
+        // Slot 0 names row 4 of 4: the whole row is NaN, in both outputs.
         assert!(
-            l[..3].iter().all(|x| x.is_nan()),
-            "bad slot must score NaN: {:?}",
-            &l[..3]
+            l[..3].iter().chain(&p[..3]).all(|x| x.is_nan()),
+            "bad slot: {:?} {:?}",
+            &l[..3],
+            &p[..3]
         );
+        // Slot 1 is valid; its middle answer id is past the vocabulary. That
+        // entry is NaN, and the other two are scored as a two-way softmax, not
+        // poisoned by it.
         assert!(
-            l[3].is_finite() && l[4].is_nan() && l[5].is_finite(),
-            "bad answer id: {:?}",
-            &l[3..6]
+            l[4].is_nan() && p[4].is_nan(),
+            "bad answer: {} {}",
+            l[4],
+            p[4]
         );
+        let rows_e: Vec<&[f32]> = [1usize, 2]
+            .iter()
+            .map(|&a| &emb[a * hidden..(a + 1) * hidden])
+            .collect();
+        let (wl, wp) = score_row_f64(&h[hidden..2 * hidden], &nw, 1.0, 1e-6, &rows_e);
+        assert_close_rel("valid logits", &[l[3], l[5]], &wl, 1e-5, 1e-5);
+        assert_close_rel("valid logprobs", &[p[3], p[5]], &wp, 1e-5, 1e-5);
     });
 }
 
@@ -1293,11 +1376,7 @@ fn score_out_of_range_indices_score_nan() {
 fn fused_projection_equals_the_separate_linears() {
     with_gpu(|rt| {
         let (rows, hidden) = (16usize, 64usize);
-        let layout = GdnProjLayout {
-            k_heads: 1,
-            v_heads: 2,
-            v_dim: 32,
-        };
+        let layout = GdnProjLayout::new(1, 2, 32).unwrap();
         let widths = layout.part_widths();
         let parts: Vec<Vec<f32>> = widths
             .iter()
@@ -1360,6 +1439,275 @@ fn every_qwen35_kernel_is_in_the_metallib() {
 }
 
 #[test]
+fn gdn_state_out_discarded_and_in_place_on_both_paths() {
+    with_gpu(|rt| {
+        let s = GdnShape {
+            b: 2,
+            t: 70,
+            hk: 1,
+            hv: 2,
+            dv: 32,
+        };
+        let d = GdnData::random(s, "batch", 1200);
+        let (want_y, want_s) = gdn_f64(&d.problem());
+        for path in [Path::Chunk, Path::Recurrent] {
+            let (y, _) = run_gdn_with(rt, &d, path, StateOut::Discard);
+            assert_close(
+                &format!("{path:?} discard y"),
+                &y,
+                &want_y,
+                rel_bound(&want_y),
+            );
+            let (y, st) = run_gdn_with(rt, &d, path, StateOut::InPlace);
+            assert_close(
+                &format!("{path:?} in-place y"),
+                &y,
+                &want_y,
+                rel_bound(&want_y),
+            );
+            assert_close(
+                &format!("{path:?} in-place state"),
+                &st,
+                &want_s,
+                rel_bound(&want_s),
+            );
+        }
+    });
+}
+
+#[test]
+fn empty_sequence_copies_the_state_through() {
+    // A decode loop that alternates two state buffers must not find a stale one
+    // after a step with no tokens.
+    with_gpu(|rt| {
+        let s = GdnShape {
+            b: 2,
+            t: 0,
+            hk: 1,
+            hv: 2,
+            dv: 32,
+        };
+        let mut d = GdnData::random(GdnShape { t: 1, ..s }, "batch", 1300);
+        d.s = s;
+        (d.q, d.k, d.v, d.a, d.b) = (vec![], vec![], vec![], vec![], vec![]);
+        let want: Vec<f64> = d
+            .state0
+            .as_ref()
+            .unwrap()
+            .iter()
+            .map(|&x| f64::from(x))
+            .collect();
+        for path in [Path::Chunk, Path::Recurrent] {
+            let (y, st) = run_gdn_with(rt, &d, path, StateOut::Separate);
+            assert!(y.is_empty());
+            assert_close(&format!("{path:?} T=0 state"), &st, &want, 0.0);
+        }
+        let (c, kw) = (64usize, 4usize);
+        let snap = random_f32(c * (kw - 1), 1301);
+        let (xb, wb, sb) = (
+            seeded(rt, 1, 0.0),
+            buf(rt, &random_f32(c * kw, 1302)),
+            buf(rt, &snap),
+        );
+        let (y, st) = (
+            seeded(rt, 1, SENTINEL),
+            seeded(rt, 3 * c * (kw - 1), SENTINEL),
+        );
+        qwen35::conv1d_silu(
+            rt,
+            Cols::dense(&xb, c as u32),
+            &wb,
+            kw as u32,
+            StateIn::Snapshot(&sb),
+            &y,
+            Some(&st),
+            3,
+            0,
+            c as u32,
+        )
+        .unwrap();
+        rt.synchronize().unwrap();
+        let got = st.read_f32();
+        for bi in 0..3 {
+            assert_eq!(
+                &got[bi * snap.len()..(bi + 1) * snap.len()],
+                &snap[..],
+                "conv T=0 row {bi}"
+            );
+        }
+    });
+}
+
+#[test]
+fn a_whole_gdn_layer_through_the_layout_helpers() {
+    // Projection GEMM -> conv -> chunked delta rule -> gated norm, wired only
+    // through `GdnProjLayout`, against the same chain in f64. This is what
+    // holds the layout's column offsets to the kernels' expectations.
+    with_gpu(|rt| {
+        let (t, hidden, kw) = (70usize, 64usize, 4usize);
+        let layout = GdnProjLayout::new(1, 2, 32).unwrap();
+        let widths = layout.part_widths();
+        let width = layout.width() as usize;
+        let conv_dim = layout.conv_dim() as usize;
+        let parts: Vec<Vec<f32>> = widths
+            .iter()
+            .enumerate()
+            .map(|(i, &o)| {
+                random_f32(o * hidden, 1400 + i as u64)
+                    .iter()
+                    .map(|v| v * 0.3)
+                    .collect()
+            })
+            .collect();
+        let refs: Vec<&[f32]> = parts.iter().map(|p| p.as_slice()).collect();
+        let packed = qwen35::pack_linear_weights_f32(&refs, &widths, hidden).unwrap();
+        let x = random_f32(t * hidden, 1410);
+        let conv_w: Vec<f32> = random_f32(conv_dim * kw, 1411)
+            .iter()
+            .map(|v| v * 0.5)
+            .collect();
+        let a_log = vec![-1.0f32, 0.5];
+        let dt_bias = vec![-4.0f32, -2.0];
+        let norm_w: Vec<f32> = random_f32(32, 1412).iter().map(|v| 1.0 + 0.1 * v).collect();
+
+        // --- device ---
+        let xt = common::tensor_f32(rt, &[t, hidden], &x);
+        let wt = common::tensor_f32(rt, &[hidden, width], &packed);
+        let pt = rt.alloc_tensor_f32(&[t, width]).unwrap();
+        assert_eq!(
+            pt.byte_offset(),
+            0,
+            "the kernels address the projection from its buffer's start"
+        );
+        qwen35::fused_projection(&xt, &wt, &pt, GemmBackend::TensorOps).unwrap();
+        let proj = &pt.buffer;
+        let qkv = seeded(rt, t * conv_dim, SENTINEL);
+        let cwb = buf(rt, &conv_w);
+        qwen35::conv1d_silu(
+            rt,
+            Cols::dense(proj, width as u32),
+            &cwb,
+            kw as u32,
+            StateIn::Zero,
+            &qkv,
+            None,
+            1,
+            t as u32,
+            conv_dim as u32,
+        )
+        .unwrap();
+        let dims = layout.dims(1, t as u32);
+        let ws = GdnWorkspace::new(rt, &dims).unwrap();
+        let (alb, dtb) = (buf(rt, &a_log), buf(rt, &dt_bias));
+        let o = seeded(rt, t * 64, SENTINEL);
+        let params = GdnParams {
+            a_log: &alb,
+            dt_bias: &dtb,
+        };
+        qwen35::gdn_chunk_forward(
+            rt,
+            &dims,
+            &layout.conv_qkv(&qkv),
+            &layout.gates(proj),
+            &params,
+            StateIn::Zero,
+            &ws,
+            Cols::dense(&o, 64),
+            None,
+        )
+        .unwrap();
+        let nwb = buf(rt, &norm_w);
+        let y = seeded(rt, t * 64, SENTINEL);
+        let yc = OutCols {
+            cols: Cols::dense(&y, 64),
+            dtype: DType::F32,
+        };
+        qwen35::gated_rms_norm(
+            rt,
+            Cols::dense(&o, 64),
+            layout.z(proj),
+            &nwb,
+            yc,
+            t as u32,
+            2,
+            32,
+            1e-6,
+        )
+        .unwrap();
+        rt.synchronize().unwrap();
+
+        // --- f64 ---
+        let p64: Vec<f64> = (0..t * width)
+            .map(|i| {
+                let (r, col) = (i / width, i % width);
+                (0..hidden)
+                    .map(|k| f64::from(x[r * hidden + k]) * f64::from(packed[k * width + col]))
+                    .sum()
+            })
+            .collect();
+        let pf: Vec<f32> = p64.iter().map(|&v| v as f32).collect();
+        let cols = |off: usize, w: usize| -> Vec<f32> {
+            (0..t)
+                .flat_map(|r| pf[r * width + off..r * width + off + w].to_vec())
+                .collect()
+        };
+        let (c64, _) = conv1d_silu_f64(&cols(0, conv_dim), &conv_w, None, 1, t, conv_dim, kw);
+        let cf: Vec<f32> = c64.iter().map(|&v| v as f32).collect();
+        let pick = |off: usize, w: usize| -> Vec<f32> {
+            (0..t)
+                .flat_map(|r| cf[r * conv_dim + off..r * conv_dim + off + w].to_vec())
+                .collect()
+        };
+        let q = pick(0, 128);
+        let k = pick(128, 128);
+        let v = pick(256, 64);
+        let a = cols(layout.a_off() as usize, 2);
+        let b = cols(layout.b_off() as usize, 2);
+        let problem = GdnProblem {
+            s: GdnShape {
+                b: 1,
+                t,
+                hk: 1,
+                hv: 2,
+                dv: 32,
+            },
+            q: &q,
+            k: &k,
+            v: &v,
+            a: &a,
+            b: &b,
+            a_log: &a_log,
+            dt_bias: &dt_bias,
+            state0: None,
+            snapshot: false,
+        };
+        let (o64, _) = gdn_f64(&problem);
+        let of: Vec<f32> = o64.iter().map(|&v| v as f32).collect();
+        let want = gated_rms_norm_f64(&of, &cols(layout.z_off() as usize, 64), &norm_w, 32, 1e-6);
+        let got = y.read_f32();
+        assert_close_rel(
+            "layer output",
+            &got[..want.len()],
+            &want,
+            1e-3,
+            1e-4 * max_abs(&want),
+        );
+    });
+}
+
+/// Expect an error whose message names the check, so a rejection can never be
+/// credited to some other validation that happened to fire first.
+fn expect_err(r: Result<(), String>, needle: &str) {
+    match r {
+        Ok(()) => panic!("expected an error containing {needle:?}, got Ok"),
+        Err(e) => assert!(
+            e.contains(needle),
+            "expected an error containing {needle:?}, got {e:?}"
+        ),
+    }
+}
+
+#[test]
 fn host_rejects_what_the_kernels_cannot_do() {
     with_gpu(|rt| {
         let s = GdnShape {
@@ -1371,59 +1719,135 @@ fn host_rejects_what_the_kernels_cannot_do() {
         };
         let d = GdnData::random(s, "batch", 1100);
         let p = Packed::new(rt, &d);
-        // Big enough to pass as a state too, so the aliasing check is what fires.
+        // Big enough to pass as a state too, so aliasing is what fires.
         let out = seeded(rt, 2 * DK * 32, 0.0);
         let st = buf(rt, d.state0.as_ref().unwrap());
         let good = dims_of(s);
         let ws = GdnWorkspace::new(rt, &good).unwrap();
-        let run = |dims: GdnDims, state: StateIn<'_>, so: Option<&GpuBuffer>, ws: &GdnWorkspace| {
+        let chunk = |dims: GdnDims,
+                     qkv: GdnQkv<'_>,
+                     state: StateIn<'_>,
+                     out: Cols<'_>,
+                     so: Option<&GpuBuffer>,
+                     ws: &GdnWorkspace| {
             qwen35::gdn_chunk_forward(
                 rt,
                 &dims,
-                &p.qkv(),
+                &qkv,
                 &p.gates(2),
                 &p.params(),
                 state,
                 ws,
-                Cols::dense(&out, 64),
+                out,
                 so,
             )
         };
-        assert!(
-            run(good, StateIn::PerBatch(&st), Some(&st), &ws).is_ok(),
-            "in-place per-batch state is allowed"
+        let o = Cols::dense(&out, 64);
+        chunk(good, p.qkv(), StateIn::PerBatch(&st), o, Some(&st), &ws)
+            .expect("in-place per-batch state is allowed");
+
+        expect_err(
+            chunk(
+                GdnDims { v_dim: 48, ..good },
+                p.qkv(),
+                StateIn::Zero,
+                o,
+                None,
+                &ws,
+            ),
+            "multiple of 32",
         );
-        let err = |r: Result<(), String>, what: &str| {
-            let e = r.expect_err(what);
-            assert!(!e.is_empty(), "{what}");
-        };
-        err(
-            run(GdnDims { v_dim: 48, ..good }, StateIn::Zero, None, &ws),
-            "v_dim not a multiple of 32",
-        );
-        err(
-            run(GdnDims { v_heads: 3, ..good }, StateIn::Zero, None, &ws),
-            "v_heads not a multiple of k_heads",
+        expect_err(
+            chunk(
+                GdnDims {
+                    k_heads: 2,
+                    v_heads: 3,
+                    ..good
+                },
+                p.qkv(),
+                StateIn::Zero,
+                o,
+                None,
+                &ws,
+            ),
+            "multiple of k_heads",
         );
         let small = GdnWorkspace::new(rt, &GdnDims { seq: 1, ..good }).unwrap();
-        err(
-            run(GdnDims { seq: 70, ..good }, StateIn::Zero, None, &small),
-            "workspace too small",
+        expect_err(
+            chunk(
+                GdnDims { seq: 70, ..good },
+                p.qkv(),
+                StateIn::Zero,
+                o,
+                None,
+                &small,
+            ),
+            "GdnWorkspace k",
         );
-        err(
-            run(good, StateIn::Snapshot(&st), Some(&st), &ws),
-            "writing into a shared snapshot",
+        expect_err(
+            chunk(good, p.qkv(), StateIn::Snapshot(&st), o, Some(&st), &ws),
+            "state_out overlaps read-only buffer state_in",
         );
-        err(
-            run(good, StateIn::Zero, Some(&out), &ws),
-            "state_out aliasing out",
+        expect_err(
+            chunk(good, p.qkv(), StateIn::Zero, o, Some(&out), &ws),
+            "out and state_out overlap",
+        );
+        let tiny = seeded(rt, 10, 0.0);
+        expect_err(
+            chunk(
+                good,
+                p.qkv(),
+                StateIn::Zero,
+                Cols::dense(&tiny, 64),
+                None,
+                &ws,
+            ),
+            "gdn out",
+        );
+        let qkv_as_out = GdnQkv {
+            buf: &out,
+            ..p.qkv()
+        };
+        expect_err(
+            chunk(good, qkv_as_out, StateIn::Zero, o, None, &ws),
+            "out overlaps read-only buffer qkv",
+        );
+        // In place, the state must still be disjoint from every input.
+        let big = buf(rt, &random_f32(2 * DK * 32, 1104));
+        let qkv_in_state = GdnQkv {
+            buf: &big,
+            ..p.qkv()
+        };
+        expect_err(
+            chunk(
+                good,
+                qkv_in_state,
+                StateIn::PerBatch(&big),
+                o,
+                Some(&big),
+                &ws,
+            ),
+            "state (in place) overlaps read-only buffer qkv",
+        );
+        expect_err(
+            qwen35::gdn_recurrent(
+                rt,
+                &good,
+                &qkv_in_state,
+                &p.gates(2),
+                &p.params(),
+                StateIn::PerBatch(&big),
+                o,
+                Some(&big),
+            ),
+            "state (in place) overlaps read-only buffer qkv",
         );
 
         let x = buf(rt, &random_f32(64 * 3, 1101));
         let w = buf(rt, &random_f32(64 * 4, 1102));
         let cs = buf(rt, &random_f32(64 * 3, 1103));
         let y = seeded(rt, 64 * 3, 0.0);
-        err(
+        expect_err(
             qwen35::conv1d_silu(
                 rt,
                 Cols::dense(&x, 64),
@@ -1436,9 +1860,9 @@ fn host_rejects_what_the_kernels_cannot_do() {
                 3,
                 64,
             ),
-            "conv state in place",
+            "state_out overlaps read-only buffer state_in",
         );
-        err(
+        expect_err(
             qwen35::conv1d_silu(
                 rt,
                 Cols::dense(&x, 64),
@@ -1451,7 +1875,7 @@ fn host_rejects_what_the_kernels_cannot_do() {
                 3,
                 64,
             ),
-            "conv width 9",
+            "kernel_width must be 2..=8",
         );
 
         let shape = AttnShape {
@@ -1464,46 +1888,45 @@ fn host_rejects_what_the_kernels_cannot_do() {
         };
         let pb = seeded(rt, 2 * 256, 0.0);
         let nw = seeded(rt, 64, 0.0);
-        let c = seeded(rt, 4 * 64, 0.0);
+        let qo = seeded(rt, 2 * 64, 0.0);
+        // Caches of capacity 2 (batch 1, one KV head of 64).
+        let (kc, vc) = (seeded(rt, 2 * 64, 0.0), seeded(rt, 2 * 64, 0.0));
         let targets = AttnTargets {
-            q_out: &c,
-            k_cache: &y,
-            v_cache: &x,
-            kv_capacity: 2,
+            q_out: &qo,
+            k_cache: &kc,
+            v_cache: &vc,
         };
-        err(
+        let rope = |shape: &AttnShape, t: &AttnTargets<'_>, pos: u32| {
             qwen35::attn_qk_norm_rope(
                 rt,
-                &shape,
+                shape,
                 Cols::dense(&pb, 256),
                 &nw,
                 &nw,
-                &targets,
-                0,
+                t,
+                pos,
                 1e4,
                 1e-6,
-            ),
-            "odd rotary_dim",
-        );
+            )
+        };
+        expect_err(rope(&shape, &targets, 0), "rotary_dim must be even");
         let shape = AttnShape {
             rotary_dim: 64,
             ..shape
         };
-        err(
-            qwen35::attn_qk_norm_rope(
-                rt,
-                &shape,
-                Cols::dense(&pb, 256),
-                &nw,
-                &nw,
-                &targets,
-                1,
-                1e4,
-                1e-6,
-            ),
-            "positions past capacity",
+        rope(&shape, &targets, 0).expect("positions 0..2 fit capacity 2");
+        expect_err(rope(&shape, &targets, 1), "exceed the caches' capacity 2");
+        let vc3 = seeded(rt, 3 * 64, 0.0);
+        let uneven = AttnTargets {
+            v_cache: &vc3,
+            ..targets
+        };
+        expect_err(
+            rope(&shape, &uneven, 0),
+            "K and V imply different fixed capacities",
         );
-        err(
+
+        expect_err(
             qwen35::gated_rms_norm(
                 rt,
                 Cols::dense(&x, 64),
@@ -1518,7 +1941,55 @@ fn host_rejects_what_the_kernels_cannot_do() {
                 64,
                 1e-6,
             ),
-            "f16 output",
+            "dtype must be F32 or BF16",
         );
+        expect_err(
+            qwen35::attn_output_gate(
+                rt,
+                &x,
+                Cols::dense(&pb, 100),
+                OutCols {
+                    cols: Cols::dense(&y, 64),
+                    dtype: DType::F32,
+                },
+                1,
+                1,
+                64,
+            ),
+            "does not fit a row",
+        );
+
+        let ans = u32_buf(rt, &[0, 1]);
+        let slots = u32_buf(rt, &[0]);
+        let (lg, lp) = (seeded(rt, 2, 0.0), seeded(rt, 2, 0.0));
+        let head = LmHead {
+            weight: &w,
+            dtype: DType::F32,
+            vocab: 4,
+        };
+        let score = |rows: u32, head: LmHead<'_>, n_ans: u32| {
+            qwen35::score_answer_rows(
+                rt, &x, rows, 64, &slots, 1, &nw, 1.0, 1e-6, head, &ans, n_ans, &lg, &lp,
+            )
+        };
+        score(3, head, 2).expect("a valid scoring call");
+        expect_err(score(0, head, 2), "rows and vocab must be non-zero");
+        expect_err(
+            score(3, LmHead { vocab: 0, ..head }, 2),
+            "rows and vocab must be non-zero",
+        );
+        expect_err(score(3, head, 0), "n_answers in 1..=");
+        expect_err(
+            score(
+                3,
+                LmHead {
+                    dtype: DType::F16,
+                    ..head
+                },
+                2,
+            ),
+            "lm_head: dtype must be F32 or BF16",
+        );
+        rt.synchronize().unwrap();
     });
 }

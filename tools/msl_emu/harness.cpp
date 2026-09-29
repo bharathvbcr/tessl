@@ -39,7 +39,13 @@ std::vector<uint8_t> &buf(const std::string &name) {
         std::fprintf(stderr, "harness: missing buffer %s\n", name.c_str());
         std::exit(2);
     }
-    std::vector<uint8_t> data((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+    // Sized exactly, never grown: a vector's spare capacity is memory
+    // AddressSanitizer cannot see past, so an overrun into it would go unseen.
+    f.seekg(0, std::ios::end);
+    const auto size = static_cast<size_t>(f.tellg());
+    f.seekg(0);
+    std::vector<uint8_t> data(size);
+    f.read(reinterpret_cast<char *>(data.data()), std::streamsize(size));
     return bufs[name] = std::move(data);
 }
 
@@ -73,6 +79,16 @@ int main(int argc, char **argv) {
         std::fprintf(stderr, "usage: harness <case_dir>\n");
         return 2;
     }
+    if (argc == 2 && std::string(argv[1]) == "--constants") {
+        // The shapes the kernels are compiled for, for check_qwen35.py to hold
+        // src/qwen35.rs's copies of them to.
+        std::printf("GDN_DK %u\nGDN_C %u\nGDN_BV %u\nGDN_PREP_THREADS %u\nGDN_SCAN_THREADS %u\n"
+                    "GDN_PREP_TG_FLOATS %u\nGDN_SCAN_TG_FLOATS %u\nGDN_REC_TG_FLOATS %u\n"
+                    "REDUCE_MAX_SIMDGROUPS %u\n",
+                    GDN_DK, GDN_C, GDN_BV, GDN_PREP_THREADS, GDN_SCAN_THREADS, GDN_PREP_TG_FLOATS,
+                    GDN_SCAN_TG_FLOATS, GDN_REC_TG_FLOATS, REDUCE_MAX_SIMDGROUPS);
+        return 0;
+    }
     // A barrier deadlock is a failure, not a hang.
     alarm(600);
     dir = argv[1];
@@ -99,7 +115,7 @@ int main(int argc, char **argv) {
         const uint B = P("B"), T = P("T"), C = P("C"), KW = P("KW"), ld_x = P("ld_x"), x_off = P("x_off"),
                    sb = P("state_bstride"), flags = P("flags");
         float *x = F("x"), *w = F("w"), *si = Fopt("state_in"), *y = F("y"), *so = Fopt("state_out");
-        launch(uint3(cdiv(C, 32), T + KW - 1, B), uint3(32, 1, 1), 0, [&](const Ids &id, float *) {
+        launch(uint3(cdiv(C, 256), T + KW - 1, B), uint3(256, 1, 1), 0, [&](const Ids &id, float *) {
             qwen35_conv1d_silu(x, w, si, y, so, B, T, C, KW, ld_x, x_off, sb, flags, id.gid);
         });
     } else if (kname == "qwen35_gdn_chunk") {
@@ -114,12 +130,12 @@ int main(int argc, char **argv) {
             wb(wg.size()), ww(size_t(B) * Hv * nc * GDN_C * GDN_C), waq(ww.size());
         float *qkv = F("qkv"), *ab = F("ab"), *alog = F("a_log"), *dtb = F("dt_bias"), *out = F("out");
         float *si = Fopt("state_in"), *so = Fopt("state_out");
-        launch(uint3(nc, Hv, B), uint3(256, 1, 1), GDN_PREP_TG_FLOATS, [&](const Ids &id, float *tgm) {
+        launch(uint3(nc, Hv, B), uint3(GDN_PREP_THREADS, 1, 1), GDN_PREP_TG_FLOATS, [&](const Ids &id, float *tgm) {
             qwen35_gdn_chunk_prep(qkv, ab, alog, dtb, wk.data(), wq.data(), wg.data(), wb.data(), ww.data(),
                                   waq.data(), T, Hk, Hv, ld_qkv, q_off, k_off, ld_ab, a_off, b_off, tgm, id.tg,
                                   id.lid, id.sg, id.lane);
         });
-        launch(uint3(Dv / GDN_BV, Hv, B), uint3(128, 1, 1), GDN_SCAN_TG_FLOATS, [&](const Ids &id, float *tgm) {
+        launch(uint3(Dv / GDN_BV, Hv, B), uint3(GDN_SCAN_THREADS, 1, 1), GDN_SCAN_TG_FLOATS, [&](const Ids &id, float *tgm) {
             qwen35_gdn_chunk_scan(qkv, wk.data(), wq.data(), wg.data(), wb.data(), ww.data(), waq.data(), si, out,
                                   so, T, Hv, Dv, ld_qkv, v_off, ld_out, out_off, sb, flags, tgm, id.tg, id.lid,
                                   id.sg, id.lane);
@@ -137,7 +153,7 @@ int main(int argc, char **argv) {
                    sb = P("state_bstride"), flags = P("flags");
         float *qkv = F("qkv"), *ab = F("ab"), *alog = F("a_log"), *dtb = F("dt_bias"), *out = F("out");
         float *si = Fopt("state_in"), *so = params.count("in_place") ? si : Fopt("state_out");
-        launch(uint3(Dv / GDN_BV, Hv, B), uint3(128, 1, 1), GDN_REC_TG_FLOATS, [&](const Ids &id, float *tgm) {
+        launch(uint3(Dv / GDN_BV, Hv, B), uint3(GDN_SCAN_THREADS, 1, 1), GDN_REC_TG_FLOATS, [&](const Ids &id, float *tgm) {
             qwen35_gdn_recurrent(qkv, ab, alog, dtb, si, out, so, T, Hk, Hv, Dv, ld_qkv, q_off, k_off, v_off,
                                  ld_ab, a_off, b_off, ld_out, out_off, sb, flags, tgm, id.tg, id.sg, id.lane);
         });
@@ -198,7 +214,7 @@ int main(int argc, char **argv) {
         uint *slots = U("slots"), *ans = U("answers");
         bfloat *emb_bf = bf ? BF("emb") : nullptr;
         float *emb_f = bf ? nullptr : F("emb");
-        launch(uint3(n_slots, 1, 1), uint3(256, 1, 1), REDUCE_MAX_SIMDGROUPS + n_ans,
+        launch(uint3(n_slots, 1, 1), uint3(256, 1, 1), REDUCE_MAX_SIMDGROUPS + 2 * n_ans,
                [&](const Ids &id, float *tgm) {
                    if (bf) {
                        qwen35_score_rows_bf16(h, slots, nw, emb_bf, ans, lg, lp, rows, hidden, n_ans, vocab, eps,

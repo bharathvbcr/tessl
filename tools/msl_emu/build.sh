@@ -13,7 +13,14 @@ mkdir -p "$OUT/gen"
 for k in qwen35_gdn qwen35_attn qwen35_score; do
   sed -E 's/\[\[[^]]*\]\]//g' "$ROOT/kernels/$k.metal" > "$OUT/gen/$k.cpp"
 done
-"${CXX:-g++}" -std=c++20 -O2 -g -pthread -Wall -Wno-unused-variable -Wno-unused-parameter \
+# MSL_EMU_SANITIZE=address makes any out-of-bounds device-buffer or
+# threadgroup-memory access fatal; =thread reports data races, which is what a
+# missing barrier looks like.
+SAN=()
+if [[ -n "${MSL_EMU_SANITIZE:-}" ]]; then
+  SAN=(-fsanitize="$MSL_EMU_SANITIZE" -fno-omit-frame-pointer -O1)
+fi
+"${CXX:-g++}" -std=c++20 -O2 -g -pthread -Wall -Wno-unused-variable -Wno-unused-parameter "${SAN[@]}" \
   -Wno-unknown-pragmas -Wno-sign-compare \
   -I "$HERE" -I "$ROOT/kernels" -I "$OUT/gen" \
   "$HERE/harness.cpp" -o "$OUT/harness"

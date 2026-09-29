@@ -195,9 +195,29 @@ CI runs it on Linux (`kernel-emulator` job) in four modes:
 | Mode | What it adds | Shown to catch |
 |---|---|---|
 | plain | Every case runs in forward, reverse and shuffled threadgroup order, and the outputs must agree **bit for bit** | a threadgroup writing past its rows into another's; passes in grid order, fails reversed |
-| `--fast-math` | Each non-`precise::` transcendental perturbed by ±4 ulps; GDN held to the on-device bound (`1e-4·max|y|`) | whether the Mac test bounds survive approximate math. At 64 ulps the GDN still sits ~10× inside them |
+| `--fast-math` | Each non-`precise::` transcendental perturbed by ±4 ulps (`exp` by ±(4 + ⌊2|x|⌋), after Metal's documented bound); GDN held to the on-device bound (`1e-4·max|y|`) | whether the Mac test bounds survive approximate math. At 64 ulps the GDN still sits ~10× inside them |
 | `MSL_EMU_SANITIZE=address` | Every device buffer and threadgroup allocation exactly sized | an unmasked tail-row store (heap overflow) |
 | `MSL_EMU_SANITIZE=thread` | Data-race detection across the real threads | removing the barrier before U = W·X overwrites X |
+
+**Against the model, not only its functions.** `check_qwen35_model.py` builds
+a small random `Qwen3_5ForCausalLM` (three GDN layers and one attention layer;
+Qwen3.5's head_dim 256 and rotary 64; a shared key head) and runs its forward
+pass on the kernels. It uses this module's weight packing and column layouts,
+and tessl's own `flash_attn_rows`, emulated, for the attention. torch does only
+the GEMMs, the MLP and the pre-attention norms. The answer-row logits match the
+model's own:
+
+| Flow | max logit err (scale ~75) |
+|---|---:|
+| prefill, 70 tokens, 5 slots | 3.1e-5 |
+| cached decode, 2 steps after a 40-token prefill | 9.5e-6 |
+| 3 questions from one 66-token snapshot (mixed recurrent and chunked GDN paths) | 2.7e-5 |
+
+Four injected wiring errors were each caught with O(1) logit errors: gate
+columns swapped, the projection packed out of order, rotary width from the
+wrong factor, and the final norm missing its `+1`. So was a wrong query
+position handed to flash attention during decode. Under the fast-math noise
+model, the logits move by less than 4e-5.
 
 The `host_contract` case parses `src/qwen35.rs` and the kernel signatures. It
 checks that every `set_*` bind has the kernel's index and kind (buffer, `uint`,
@@ -245,7 +265,10 @@ reference matches the f64 golden to 1e-16. The RoPE reference matches
 transformers to 7e-7. Both were checked off-device. The GPU tests cover every
 kernel, including randomized chunk-edge shapes, grouped heads, snapshots,
 strided windows, and a chunked prefill followed by in-place recurrent decode
-steps that must equal the recurrence over the whole sequence. There is also a
+steps that must equal the recurrence over the whole sequence. The attention
+seam runs on the device too: `attn_qk_norm_rope` into `nn::flash_attn_rows`
+into `attn_output_gate`, continuing a cache that already holds a prefix, at
+head_dim 256. There is also a
 whole GDN layer (projection GEMM → conv → chunked rule → gated norm) wired only
 through `GdnProjLayout` against the same chain in f64. The tests cover
 `state_out` discarded, separate and in place on both paths, and `seq = 0`

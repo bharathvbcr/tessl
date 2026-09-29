@@ -47,6 +47,15 @@ All notable changes to `tessl` are recorded here. The format follows
   - **Emulator:** threadgroup-order invariance, ASan/TSan builds with exactly
     sized allocations, fast-math ulp noise, a host-contract check of binds and
     constants, and a `kernel-emulator` CI job.
+- `tools/msl_emu/check_qwen35_model.py`: a whole random `Qwen3_5ForCausalLM`
+  through the kernels and tessl's own `flash_attn_rows` (emulated), against
+  the model's logits, for prefill, cached decode and a shared snapshot. The
+  Mac suite gains the same attention seam:
+  `attention_layer_through_flash_attn_rows`.
+- Scoring re-derives validity from the indices instead of storing flags. This
+  restores the full `MAX_ANSWERS = 4096` inside 32 KB of threadgroup memory,
+  and a unit test pins it. `attn_qk_norm_rope` accepts `batch = 0`. Softplus
+  uses `precise::exp`.
 - `tests/qwen35_kernels.rs` with transformers-generated goldens in
   `tests/fixtures/qwen35/` (`scripts/gen_qwen35_fixtures.py`). The Qwen3.5
   sources join the widened-index-arithmetic inspection in

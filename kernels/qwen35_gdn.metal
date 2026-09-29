@@ -102,7 +102,10 @@ constant float GDN_L2_EPS = 1e-6f;
 inline float gdn_softplus(float x)
 {
     if (x > 20.0f) return x;
-    const float e = exp(x);
+    // precise: fast `exp` is documented to 3 + floor(2|x|) ulp, ~33 ulp at
+    // x = -15, and below -3 softplus is e^x to within the series. Once per
+    // token per head, so the cost is nothing.
+    const float e = precise::exp(x);
     if (x < -3.0f) {
         // log1p(e) by Horner: e * (1 - e/2 + e^2/3 - ... - e^7/8).
         float p = -1.0f / 8.0f;
@@ -210,12 +213,12 @@ kernel void qwen35_conv1d_silu(
 
 // ------------------------------------------------------------- chunk prep ---
 
-/// Threadgroup memory for `qwen35_gdn_chunk_prep`, in floats: one C x C block
-/// plus four per-row arrays.
 /// Row stride of the prep kernel's C x C threadgroup block. Odd, so the solve's
 /// column walks (`blk[j * LD + n]` over j) and the tile stores touch distinct
 /// memory banks; at 64 a whole column sits in one bank.
 constant uint GDN_BLK_LD = GDN_C + 1u;
+/// Threadgroup memory for `qwen35_gdn_chunk_prep`, in floats: one C x BLK_LD
+/// block plus four per-row arrays.
 constant uint GDN_PREP_TG_FLOATS = GDN_C * GDN_BLK_LD + 4u * GDN_C;
 static_assert(GDN_PREP_TG_FLOATS * 4u <= 32768u, "prep threadgroup memory exceeds 32 KB");
 

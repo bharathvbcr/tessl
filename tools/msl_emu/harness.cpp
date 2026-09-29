@@ -13,6 +13,7 @@
 #include "qwen35_attn.cpp"
 #include "qwen35_gdn.cpp"
 #include "qwen35_score.cpp"
+#include "flash_attn_rows.cpp"
 
 #include <csignal>
 #include <fstream>
@@ -205,6 +206,29 @@ int main(int argc, char **argv) {
                 qwen35_attn_gate_f32(attn, p, outf, rows, Hq, D, ld_p, q_off, ld_out, out_off, gid);
             }
         });
+    } else if (kname == "flash_attn_rows") {
+        // The instantiation nn::flash_attn_rows picks for this head dim
+        // (rows_lanes_for / rows_groups_for in src/nn.rs), and its grid.
+        const uint B = P("B"), Tq = P("Tq"), H = P("H"), Hkv = P("Hkv"), D = P("D"), cap = P("kv_capacity");
+        const float scale = PF("scale");
+        uint R, G;
+        decltype(&flash_attn_rows_h128_r8_g8) fn;
+        if (D == 128) {
+            R = 8, G = 8, fn = &flash_attn_rows_h128_r8_g8;
+        } else if (D == 256) {
+            R = 16, G = 32, fn = &flash_attn_rows_h256_r16_g32;
+        } else {
+            std::fprintf(stderr, "harness: flash_attn_rows has no D=%u default\n", D);
+            return 2;
+        }
+        const uint rows_per_tg = G * (32 / R);
+        float *q = F("q"), *k = F("k"), *v = F("v"), *o = F("o");
+        uint *tkv = U("tkv"), *qpos = U("q_pos"), *kvpos = U("kv_pos");
+        const uint window = 0, out_bf16 = 0;
+        launch(uint3(cdiv(Tq, rows_per_tg), B * H, 1), uint3(G * 32, 1, 1), 0, [&](const Ids &id, float *) {
+            fn(q, k, v, o, B, Tq, tkv, H, Hkv, window, scale, qpos, kvpos, out_bf16, cap,
+               uint2(id.tg.x, id.tg.y), uint2(id.tid_in_tg.x, 0));
+        });
     } else if (kname == "qwen35_score_rows_f32" || kname == "qwen35_score_rows_bf16") {
         const uint rows = P("rows"), hidden = P("hidden"), n_ans = P("n_ans"), vocab = P("vocab"),
                    n_slots = P("n_slots");
@@ -214,7 +238,7 @@ int main(int argc, char **argv) {
         uint *slots = U("slots"), *ans = U("answers");
         bfloat *emb_bf = bf ? BF("emb") : nullptr;
         float *emb_f = bf ? nullptr : F("emb");
-        launch(uint3(n_slots, 1, 1), uint3(256, 1, 1), REDUCE_MAX_SIMDGROUPS + 2 * n_ans,
+        launch(uint3(n_slots, 1, 1), uint3(256, 1, 1), REDUCE_MAX_SIMDGROUPS + n_ans,
                [&](const Ids &id, float *tgm) {
                    if (bf) {
                        qwen35_score_rows_bf16(h, slots, nw, emb_bf, ans, lg, lp, rows, hidden, n_ans, vocab, eps,

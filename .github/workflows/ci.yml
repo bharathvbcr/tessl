@@ -35,7 +35,9 @@ jobs:
   #
   # Linux, because it needs no Metal toolchain: tools/msl_emu compiles the
   # kernel sources as C++ and runs every threadgroup on real threads. Four
-  # passes, each catching what the others cannot: plain (numerics, three
+  # passes, each catching what the others cannot, plus the whole-model check
+  # (a small random Qwen3_5ForCausalLM through every kernel and tessl's own
+  # flash_attn_rows, against the model's logits): plain (numerics, three
   # threadgroup orders that must agree bit for bit), fast-math (the on-device
   # error bounds under perturbed transcendentals), AddressSanitizer (any
   # out-of-bounds device or threadgroup access), ThreadSanitizer (missing
@@ -56,6 +58,8 @@ jobs:
         run: pip install -r tools/msl_emu/requirements.txt --extra-index-url https://download.pytorch.org/whl/cpu
       - name: Emulator vs transformers
         run: python3 tools/msl_emu/check_qwen35.py
+      - name: Whole model vs transformers (prefill, cached decode, shared snapshot)
+        run: python3 tools/msl_emu/check_qwen35_model.py
       - name: Fast-math bounds
         run: MSL_EMU_OUT=/tmp/emu-fast python3 tools/msl_emu/check_qwen35.py --fast-math
       - name: Let the sanitizers map their shadow memory
@@ -64,7 +68,9 @@ jobs:
         # mapping"). 28 is the long-standing default.
         run: sudo sysctl -w vm.mmap_rnd_bits=28
       - name: AddressSanitizer
-        run: MSL_EMU_SANITIZE=address MSL_EMU_OUT=/tmp/emu-asan python3 tools/msl_emu/check_qwen35.py
+        run: |
+          MSL_EMU_SANITIZE=address MSL_EMU_OUT=/tmp/emu-asan python3 tools/msl_emu/check_qwen35.py
+          MSL_EMU_SANITIZE=address MSL_EMU_OUT=/tmp/emu-asan python3 tools/msl_emu/check_qwen35_model.py
       - name: ThreadSanitizer
         # Every case is slow under TSan; these cover each kernel's barrier structure.
         run: >-

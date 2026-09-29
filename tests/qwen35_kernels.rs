@@ -1993,3 +1993,147 @@ fn host_rejects_what_the_kernels_cannot_do() {
         rt.synchronize().unwrap();
     });
 }
+
+#[test]
+fn attention_layer_through_flash_attn_rows() {
+    // The seam the Qwen3.5 attention kernels exist to feed: attn_qk_norm_rope
+    // writes q and the caches, tessl's own flash_attn_rows reads them, and
+    // attn_output_gate gates its output — continuing a cache that already
+    // holds a prefix, at Qwen3.5's head_dim and rotary width.
+    with_gpu(|rt| {
+        let (b, t, hq, hkv, d, rot) = (2usize, 3usize, 2usize, 1usize, 256usize, 64usize);
+        let (prefix, cap) = (5usize, 12usize);
+        let layout = AttnProjLayout::new(hq as u32, hkv as u32, d as u32).unwrap();
+        let q = random_f32(b * t * hq * d, 1500);
+        let k = random_f32(b * t * hkv * d, 1501);
+        let v = random_f32(b * t * hkv * d, 1502);
+        let gate: Vec<f32> = random_f32(b * t * hq * d, 1503)
+            .iter()
+            .map(|x| 3.0 * x)
+            .collect();
+        let qw: Vec<f32> = random_f32(d, 1504).iter().map(|x| 0.1 * x).collect();
+        let kw: Vec<f32> = random_f32(d, 1505).iter().map(|x| 0.1 * x).collect();
+        let p = attn_proj_rows(layout, b * t, &q, &k, &v, &gate);
+        // A prefix already in the caches; the slots after it are the kernel's.
+        let cache_len = b * cap * hkv * d;
+        let mut kc_host = vec![SENTINEL; cache_len];
+        let mut vc_host = vec![SENTINEL; cache_len];
+        let pk = random_f32(cache_len, 1506);
+        let pv = random_f32(cache_len, 1507);
+        for bi in 0..b {
+            let r = bi * cap * hkv * d..(bi * cap + prefix) * hkv * d;
+            kc_host[r.clone()].copy_from_slice(&pk[r.clone()]);
+            vc_host[r.clone()].copy_from_slice(&pv[r]);
+        }
+        let (pb, qwb, kwb) = (buf(rt, &p), buf(rt, &qw), buf(rt, &kw));
+        let (kc, vc) = (buf(rt, &kc_host), buf(rt, &vc_host));
+        let q_out = seeded(rt, b * t * hq * d, SENTINEL);
+        let targets = AttnTargets {
+            q_out: &q_out,
+            k_cache: &kc,
+            v_cache: &vc,
+        };
+        let shape = AttnShape {
+            batch: b as u32,
+            seq: t as u32,
+            q_heads: hq as u32,
+            kv_heads: hkv as u32,
+            head_dim: d as u32,
+            rotary_dim: rot as u32,
+        };
+        let pc = Cols::dense(&pb, layout.width());
+        qwen35::attn_qk_norm_rope(
+            rt,
+            &shape,
+            pc,
+            &qwb,
+            &kwb,
+            &targets,
+            prefix as u32,
+            1e7,
+            1e-6,
+        )
+        .unwrap();
+        let o = seeded(rt, b * t * hq * d, SENTINEL);
+        let scale = 1.0 / (d as f32).sqrt();
+        let (tkv, qpos, kvpos) = (
+            u32_buf(rt, &[(prefix + t) as u32]),
+            u32_buf(rt, &[prefix as u32]),
+            u32_buf(rt, &[0]),
+        );
+        let dims = tessl::nn::AttnDims {
+            batch: b as u32,
+            tq: t as u32,
+            heads: hq as u32,
+            heads_kv: hkv as u32,
+            window: 0,
+            scale,
+        };
+        tessl::nn::flash_attn_rows(
+            rt, &q_out, &kc, &vc, &o, &tkv, &qpos, &kvpos, dims, d as u32, false,
+        )
+        .unwrap();
+        let out = seeded(rt, b * t * hq * d, SENTINEL);
+        let oc = OutCols {
+            cols: Cols::dense(&out, (hq * d) as u32),
+            dtype: DType::F32,
+        };
+        qwen35::attn_output_gate(rt, &o, pc, oc, (b * t) as u32, hq as u32, d as u32).unwrap();
+        rt.synchronize().unwrap();
+
+        // f64: keys and values per (batch, position), prefix then new tokens.
+        let mut want = vec![0.0f64; b * t * hq * d];
+        for bi in 0..b {
+            let key = |s: usize| -> Vec<f64> {
+                if s < prefix {
+                    let at = ((bi * cap + s) * hkv) * d;
+                    pk[at..at + d].iter().map(|&x| f64::from(x)).collect()
+                } else {
+                    let r = (bi * t + s - prefix) * hkv * d;
+                    norm_rope_row_f64(&k[r..r + d], &kw, rot, s as u64, 1e7, 1e-6)
+                }
+            };
+            let val = |s: usize| -> Vec<f64> {
+                let src = if s < prefix {
+                    &pv[((bi * cap + s) * hkv) * d..]
+                } else {
+                    &v[(bi * t + s - prefix) * hkv * d..]
+                };
+                src[..d].iter().map(|&x| f64::from(x)).collect()
+            };
+            for ti in 0..t {
+                let at = prefix + ti;
+                for h in 0..hq {
+                    let r = (bi * t + ti) * hq + h;
+                    let qv =
+                        norm_rope_row_f64(&q[r * d..(r + 1) * d], &qw, rot, at as u64, 1e7, 1e-6);
+                    let scores: Vec<f64> = (0..=at)
+                        .map(|s| {
+                            key(s).iter().zip(&qv).map(|(a, b)| a * b).sum::<f64>()
+                                * f64::from(scale)
+                        })
+                        .collect();
+                    let mx = scores.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+                    let w: Vec<f64> = scores.iter().map(|s| (s - mx).exp()).collect();
+                    let z: f64 = w.iter().sum();
+                    for (s, ws) in w.iter().enumerate() {
+                        let vs = val(s);
+                        for i in 0..d {
+                            want[r * d + i] += ws / z * vs[i];
+                        }
+                    }
+                    for i in 0..d {
+                        want[r * d + i] *= sigmoid(f64::from(gate[r * d + i]));
+                    }
+                }
+            }
+        }
+        assert_close_rel(
+            "gated attention",
+            &out.read_f32()[..want.len()],
+            &want,
+            1e-4,
+            1e-5,
+        );
+    });
+}

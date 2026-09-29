@@ -75,8 +75,15 @@ const SCORE_THREADS: usize = 256;
 /// per 32 channels x 1 token) left the per-core threadgroup limit the cap.
 const CONV_THREADS: usize = 256;
 /// Answers per scoring call. Far above any real answer set; it bounds the
-/// threadgroup memory the logits occupy.
+/// threadgroup memory the logits occupy, which `score_tg_bytes` must keep
+/// inside 32 KB at this maximum (a unit test holds it to that).
 pub const MAX_ANSWERS: u32 = 4096;
+
+/// Threadgroup memory of one scoring call: the reduction partials, then one
+/// logit per answer.
+fn score_tg_bytes(n_answers: u32) -> usize {
+    ((REDUCE_MAX_SIMDGROUPS + n_answers as usize) * 4).next_multiple_of(16)
+}
 
 // ---------------------------------------------------------------- views ---
 
@@ -1201,6 +1208,11 @@ pub fn attn_qk_norm_rope(
         return Err(format!("{WHAT}: theta and eps must be positive and finite"));
     }
     let layout = AttnProjLayout::new(s.q_heads, s.kv_heads, s.head_dim)?;
+    if s.batch == 0 || s.seq == 0 {
+        // Nothing to write; and with no batch rows the caches imply no
+        // capacity, which must not read as "positions past capacity".
+        return Ok(());
+    }
     let kv_capacity = crate::nn::attn_kv_capacity(
         targets.k_cache,
         targets.v_cache,
@@ -1443,8 +1455,8 @@ pub fn score_answer_rows(
             ("answers", answers),
         ],
     )?;
-    // Reduction partials, then the answers' logits and validity flags.
-    let tg_bytes = ((REDUCE_MAX_SIMDGROUPS + 2 * n_answers as usize) * 4).next_multiple_of(16);
+    // Reduction partials, then the answers' logits.
+    let tg_bytes = score_tg_bytes(n_answers);
     let p = pipeline_for(rt, &name, SCORE_THREADS, tg_bytes)?;
     dispatch_groups(
         rt,
@@ -1516,7 +1528,12 @@ mod tests {
 
     #[test]
     fn threadgroup_budgets_fit_32k() {
-        for bytes in [PREP_TG_BYTES, SCAN_TG_BYTES, REC_TG_BYTES] {
+        for bytes in [
+            PREP_TG_BYTES,
+            SCAN_TG_BYTES,
+            REC_TG_BYTES,
+            score_tg_bytes(MAX_ANSWERS),
+        ] {
             assert!(bytes <= 32 * 1024 && bytes % 16 == 0, "{bytes}");
         }
     }

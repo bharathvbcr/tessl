@@ -320,7 +320,7 @@ fn qwen35_row_offsets_are_widened_before_multiplication() {
         (
             "scoring LM head row",
             QWEN35_SCORE,
-            "(ulong)(ok ? tok : 0u) * hidden",
+            "(ulong)(ok ? answers[a] : 0u) * hidden",
         ),
     ] {
         require(source, widened, label);

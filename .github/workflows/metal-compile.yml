@@ -1,0 +1,126 @@
+name: Metal compile
+
+# Apple's Metal compiler over the kernels, on GitHub-hosted macOS only.
+#
+# CI's `gpu` and `bench` jobs run on a self-hosted Mac; this workflow never
+# does. It compiles and links, and runs nothing on a GPU, so it can check a
+# branch whose kernels have never met a Metal compiler without putting them on
+# anyone's hardware.
+on:
+  push:
+    paths:
+      - "kernels/**"
+      - "src/**"
+      - "tests/**"
+      - "build.rs"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/metal-compile.yml"
+  pull_request:
+    paths:
+      - "kernels/**"
+      - "src/**"
+      - "tests/**"
+      - "build.rs"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/metal-compile.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  compile:
+    name: Metal 4 compile + link (no GPU)
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Report the toolchain
+        run: |
+          echo "xcode-select: $(xcode-select -p)"
+          xcodebuild -version
+          sw_vers
+
+      - name: Install the Metal Toolchain
+        run: |
+          if xcrun --find metal >/dev/null 2>&1; then
+            echo "Metal compiler already present: $(xcrun --find metal)"
+          else
+            xcodebuild -downloadComponent MetalToolchain
+          fi
+          xcrun metal --version
+
+      - name: Qwen3.5 kernels under -std=metal4.0, warnings as errors
+        # build.rs retries a file that fails under metal4.0 with metal3.2 and
+        # only warns, so `cargo build` alone could pass while a Metal 4 error
+        # hides behind the fallback. Same flags as build.rs, no fallback.
+        run: |
+          set -euo pipefail
+          sdk="$(xcrun --sdk macosx --show-sdk-path)"
+          mkdir -p "$RUNNER_TEMP/air"
+          status=0
+          for src in kernels/qwen35_gdn.metal kernels/qwen35_attn.metal kernels/qwen35_score.metal; do
+            echo "::group::$src"
+            if xcrun metal -std=metal4.0 -O2 -isysroot "$sdk" -mmacosx-version-min=26.0 \
+                 -Wall -Werror -c "$src" -o "$RUNNER_TEMP/air/$(basename "$src" .metal).air"; then
+              echo "ok: $src"
+            else
+              echo "::error file=$src::failed to compile under -std=metal4.0 -Wall -Werror"
+              status=1
+            fi
+            echo "::endgroup::"
+          done
+          exit $status
+
+      - name: Link the Qwen3.5 kernels and check every entry point is exported
+        run: |
+          set -euo pipefail
+          xcrun metallib "$RUNNER_TEMP"/air/*.air -o "$RUNNER_TEMP/qwen35.metallib"
+          # To a file first: `strings | grep -q` under pipefail can report a
+          # false miss when grep exits early and strings takes SIGPIPE.
+          strings "$RUNNER_TEMP/qwen35.metallib" > "$RUNNER_TEMP/symbols.txt"
+          missing=0
+          for fn in qwen35_conv1d_silu qwen35_gdn_chunk_prep qwen35_gdn_chunk_scan qwen35_gdn_recurrent \
+                    qwen35_gated_rms_norm_f32 qwen35_gated_rms_norm_bf16 qwen35_attn_qk_norm_rope \
+                    qwen35_attn_qk_norm_rope_posbuf qwen35_attn_gate_f32 qwen35_attn_gate_bf16 \
+                    qwen35_score_rows_f32 qwen35_score_rows_bf16; do
+            if grep -qx "$fn" "$RUNNER_TEMP/symbols.txt"; then
+              echo "exported: $fn"
+            else
+              echo "::error::$fn is not in the linked metallib"
+              missing=1
+            fi
+          done
+          if [ "$missing" -ne 0 ]; then
+            echo "strings in the metallib that mention qwen35:"
+            grep qwen35 "$RUNNER_TEMP/symbols.txt" || true
+          fi
+          exit $missing
+
+      - name: Build everything (the real build.rs, every test target)
+        # pipefail: without it `tee` would turn a failed build into a pass.
+        run: |
+          set -o pipefail
+          cargo build --release --all-targets 2>&1 | tee "$RUNNER_TEMP/build.log"
+
+      - name: No kernel fell back to metal3.2
+        run: |
+          if grep -q "falling back to -std=metal3.2" "$RUNNER_TEMP/build.log"; then
+            grep -A40 "falling back to -std=metal3.2" "$RUNNER_TEMP/build.log"
+            echo "::error::a kernel only compiled under the metal3.2 fallback"
+            exit 1
+          fi
+          echo "every kernel compiled under -std=metal4.0"
+
+      - name: Clippy
+        run: cargo clippy --release --all-targets -- -D warnings

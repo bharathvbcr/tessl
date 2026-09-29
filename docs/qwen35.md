@@ -500,6 +500,14 @@ unresolved until re-run. For comparison, on the same machine MLX measured
 7,606 / 7,528 / 5,285 tok/s at 1k / 2k / 8k, and torch MPS about 2.8k at 1k
 (both by the Lappi project).
 
+A second session at c6fc555 ran with the GPU 93–99% busy from the desktop
+compositor and app renderers, so its absolute times are not recorded here.
+Its same-session stage ratios are: the GDN chunk scan is ~75% of the chunked
+rule (prep 0.47 / scan 1.18 ms at T = 1024, 2.32 / 7.42 at 8192). The fused
+`swiglu` takes half the time of `mlp_silu` + cast (0.28 vs 0.56 ms at 1024,
+2.43 vs 4.05 at 8192). The four attention tiles land within the noise of
+each other at 8192 (54–58 ms under that load).
+
 Where the 8192 forward goes now: the GEMMs, at 25–29 TFLOP/s (the bf16
 TensorOps peak), take about 0.8 s. Attention takes 6 × 43 ms, the GDN chunked
 rule 18 × 8.4 ms, and SwiGLU + cast 24 × 3.6 ms. At 1024 the GDN chunked rule

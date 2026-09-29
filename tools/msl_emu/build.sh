@@ -12,7 +12,7 @@ OUT="${MSL_EMU_OUT:-$HERE/build}"
 mkdir -p "$OUT/gen"
 # flash_attn_rows is tessl's existing attention kernel, built here so the
 # model-level check runs the attention the Qwen3.5 kernels actually feed.
-for k in qwen35_gdn qwen35_attn qwen35_score flash_attn_rows; do
+for k in qwen35_gdn qwen35_attn qwen35_mlp qwen35_score flash_attn_rows; do
   sed -E 's/\[\[[^]]*\]\]//g' "$ROOT/kernels/$k.metal" > "$OUT/gen/$k.cpp"
 done
 # MSL_EMU_SANITIZE=address makes any out-of-bounds device-buffer or

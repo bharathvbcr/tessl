@@ -6,6 +6,7 @@
 //! cargo run --release --bin bench_qwen35_layers -- --check-only # plausibility gate, no timing
 //! cargo run --release --bin bench_qwen35_layers -- --attn-rows  # scalar nn::flash_attn_rows
 //! cargo run --release --bin bench_qwen35_layers -- --attn-tile=q64_k64_sg8
+//! cargo run --release --bin bench_qwen35_layers -- --mlp-unfused # mlp_silu + cast
 //! ```
 //!
 //! Attention runs on `qwen35::attn_prefill` (the TensorOps kernel) at its
@@ -505,32 +506,48 @@ fn attn_stage(rt: &Arc<GpuRuntime>, m: &Model, w: &AttnWeights, a: &Acts, s: usi
     }
 }
 
-/// The MLP block's stages, post-attention norm first. SwiGLU has no fused
-/// bf16-out kernel, so its f32 result takes a cast pass before the down GEMM;
-/// that pass is its own row so it is not read as kernel cost.
-const MLP_STAGES: [&str; 6] = [
+/// The MLP block's stages, post-attention norm first. SwiGLU is
+/// `qwen35::swiglu` straight to bf16 for the down GEMM, or with
+/// `--mlp-unfused` the generic `nn::mlp_silu` into f32 plus a cast pass, the
+/// path it replaced; either way it is one row, so the two compare directly.
+const MLP_STAGES: [&str; 5] = [
     "post-norm",
     "gate GEMM",
     "up GEMM",
-    "silu * up",
-    "cast to bf16",
+    "swiglu -> bf16",
     "down + resid",
 ];
+
+/// `--mlp-unfused`: time `nn::mlp_silu` + cast instead of `qwen35::swiglu`.
+static MLP_UNFUSED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
 
 fn mlp_stage(rt: &Arc<GpuRuntime>, m: &Model, l: &Layer, a: &Acts, s: usize) -> Res<()> {
     match s {
         0 => input_norm(rt, m, a),
         1 => gemm(&a.xb, &l.w_gate, &a.m_gate, BACKEND),
         2 => gemm(&a.xb, &l.w_up, &a.m_up, BACKEND),
-        3 => nn::mlp_silu(
+        3 if *MLP_UNFUSED.get().expect("set in main") => {
+            nn::mlp_silu(
+                rt,
+                &a.m_gate.buffer,
+                &a.m_up.buffer,
+                &a.m_mid.buffer,
+                (a.t * INTER) as u32,
+            )?;
+            cast_f32_to_bf16_into(&a.m_mid, &a.m_midb)
+        }
+        3 => qwen35::swiglu(
             rt,
-            &a.m_gate.buffer,
-            &a.m_up.buffer,
-            &a.m_mid.buffer,
-            (a.t * INTER) as u32,
+            Cols::dense(&a.m_gate.buffer, INTER as u32),
+            Cols::dense(&a.m_up.buffer, INTER as u32),
+            OutCols {
+                cols: Cols::dense(&a.m_midb.buffer, INTER as u32),
+                dtype: DType::BF16,
+            },
+            a.t as u32,
+            INTER as u32,
         ),
-        4 => cast_f32_to_bf16_into(&a.m_mid, &a.m_midb),
-        5 => gemm_epilogue(&a.m_midb, &l.w_down, &a.resid, BACKEND, residual_add()),
+        4 => gemm_epilogue(&a.m_midb, &l.w_down, &a.resid, BACKEND, residual_add()),
         _ => unreachable!(),
     }
 }
@@ -606,8 +623,10 @@ fn plausibility_gate(rt: &Arc<GpuRuntime>, m: &Model, a: &Acts) -> Res<()> {
     finite_bf16("attn gated out", &a.a_y)?;
     finite_f32("mlp gate", &a.m_gate.buffer, a.m_gate.numel())?;
     finite_f32("mlp up", &a.m_up.buffer, a.m_up.numel())?;
-    finite_f32("mlp silu", &a.m_mid.buffer, a.m_mid.numel())?;
-    finite_bf16("mlp cast", &a.m_midb)?;
+    if *MLP_UNFUSED.get().expect("set in main") {
+        finite_f32("mlp silu", &a.m_mid.buffer, a.m_mid.numel())?;
+    }
+    finite_bf16("mlp swiglu", &a.m_midb)?;
     let after = a.resid.buffer.read_f32();
     let moved = before.iter().zip(&after).filter(|(x, y)| x != y).count();
     if moved < t * HIDDEN / 2 {
@@ -728,10 +747,13 @@ fn lm_head_ms_per_row(rt: &Arc<GpuRuntime>) -> Res<f64> {
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut check_only = false;
     let mut attn = AttnChoice::Tiled(qwen35::ATTN_PREFILL_TILE);
+    let mut mlp_unfused = false;
     let mut ts = Vec::new();
     for arg in std::env::args().skip(1) {
         if arg == "--check-only" {
             check_only = true;
+        } else if arg == "--mlp-unfused" {
+            mlp_unfused = true;
         } else if arg == "--attn-rows" {
             attn = AttnChoice::Rows;
         } else if let Some(label) = arg.strip_prefix("--attn-tile=") {
@@ -747,8 +769,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         } else {
             let t: usize = arg.parse().map_err(|_| {
                 format!(
-                    "expected a token count, --check-only, --attn-rows or --attn-tile=LABEL, \
-                     got {arg:?}"
+                    "expected a token count, --check-only, --attn-rows, --attn-tile=LABEL or \
+                     --mlp-unfused, got {arg:?}"
                 )
             })?;
             if t == 0 {
@@ -773,6 +795,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let n_attn = (0..LAYERS).filter(|&l| is_full_attention(l)).count();
     let n_gdn = LAYERS - n_attn;
     println!("layers: {n_gdn} GDN + {n_attn} attention, batch 1, bf16 weights distinct per layer");
+    MLP_UNFUSED
+        .set(mlp_unfused)
+        .map_err(|_| "MLP path chosen twice")?;
+    println!(
+        "swiglu: {}",
+        if mlp_unfused {
+            "nn::mlp_silu (f32) + cast to bf16"
+        } else {
+            "qwen35::swiglu (bf16 out)"
+        }
+    );
     ATTN.set(attn)
         .map_err(|_| "attention kernel chosen twice")?;
     match attn {

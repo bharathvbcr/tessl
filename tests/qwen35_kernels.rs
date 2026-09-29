@@ -1213,6 +1213,122 @@ fn gated_rms_norm_f32_and_bf16() {
     });
 }
 
+#[test]
+fn swiglu_f32_and_bf16_from_a_fused_gate_up_buffer() {
+    with_gpu(|rt| {
+        // Gate and up as two windows of one [gate | up] row, as a fused GEMM
+        // would write them; a width off every 32-lane edge; gates out to +-120,
+        // where a textbook sigmoid's exp(-x) overflows under fast math.
+        let (rows, width) = (37usize, 300usize);
+        let ld = 2 * width + 5;
+        let (g_off, u_off) = (1usize, 1 + width);
+        let mut fused: Vec<f32> = random_f32(rows * ld, 700).iter().map(|v| 8.0 * v).collect();
+        fused[g_off] = 120.0;
+        fused[g_off + 1] = -120.0;
+        fused[ld + g_off] = -89.0;
+        let silu = |x: f64| x / (1.0 + (-x).exp());
+        let want: Vec<f64> = (0..rows)
+            .flat_map(|r| {
+                let f = &fused;
+                (0..width)
+                    .map(move |c| silu(f[r * ld + g_off + c] as f64) * f[r * ld + u_off + c] as f64)
+            })
+            .collect();
+        let fb = buf(rt, &fused);
+        let gate = Cols {
+            buf: &fb,
+            ld: ld as u32,
+            off: g_off as u32,
+        };
+        let up = Cols {
+            buf: &fb,
+            ld: ld as u32,
+            off: u_off as u32,
+        };
+        // f32 into a window of a wider row: the padding must stay untouched.
+        let (o_ld, o_off) = (width + 4, 3usize);
+        let out = seeded(rt, rows * o_ld, SENTINEL);
+        let oc = OutCols {
+            cols: Cols {
+                buf: &out,
+                ld: o_ld as u32,
+                off: o_off as u32,
+            },
+            dtype: DType::F32,
+        };
+        qwen35::swiglu(rt, gate, up, oc, rows as u32, width as u32).unwrap();
+        let outb = rt.alloc_buffer(rows * width * 2).unwrap();
+        let ob = OutCols {
+            cols: Cols::dense(&outb, width as u32),
+            dtype: DType::BF16,
+        };
+        qwen35::swiglu(rt, gate, up, ob, rows as u32, width as u32).unwrap();
+        rt.synchronize().unwrap();
+        let all = out.read_f32();
+        let mut got = Vec::with_capacity(rows * width);
+        for r in 0..rows {
+            let row = &all[r * o_ld..(r + 1) * o_ld];
+            assert!(
+                row[..o_off]
+                    .iter()
+                    .chain(&row[o_off + width..])
+                    .all(|&x| x == SENTINEL),
+                "row {r}: wrote outside the output window"
+            );
+            got.extend_from_slice(&row[o_off..o_off + width]);
+        }
+        assert!(
+            got.iter().all(|x| x.is_finite()),
+            "non-finite swiglu output"
+        );
+        assert_close_rel("swiglu f32", &got, &want, 1e-6, 1e-7);
+        // The bf16 store is the same f32 value rounded, element for element.
+        // (Scoped: the host mapping must be released before the next encode.)
+        {
+            let rounded = f32_slice_to_bf16(&got);
+            let got16 = &outb.contents_u16()[..rows * width];
+            for (i, (&g, &w)) in got16.iter().zip(&rounded).enumerate() {
+                assert_eq!(g, w, "swiglu bf16 [{i}]: {g:#x} vs rounded f32 {w:#x}");
+            }
+        }
+
+        let dense_out = seeded(rt, rows * width, SENTINEL);
+        let dense = OutCols {
+            cols: Cols::dense(&dense_out, width as u32),
+            dtype: DType::F32,
+        };
+        let onto_input = OutCols {
+            cols: Cols {
+                buf: &fb,
+                ld: ld as u32,
+                off: 0,
+            },
+            dtype: DType::F32,
+        };
+        expect_err(
+            qwen35::swiglu(rt, gate, up, onto_input, rows as u32, width as u32),
+            "qwen35::swiglu: writable buffer out overlaps read-only buffer gate",
+        );
+        let short = Cols {
+            buf: &fb,
+            ld: ld as u32,
+            off: (ld - width + 1) as u32,
+        };
+        expect_err(
+            qwen35::swiglu(rt, gate, short, dense, rows as u32, width as u32),
+            "swiglu up",
+        );
+        let f16 = OutCols {
+            cols: Cols::dense(&dense_out, width as u32),
+            dtype: DType::F16,
+        };
+        expect_err(
+            qwen35::swiglu(rt, gate, up, f16, rows as u32, width as u32),
+            "qwen35::swiglu: dtype must be F32 or BF16",
+        );
+    });
+}
+
 // ------------------------------------------------------- attention extras ---
 
 fn attn_proj_rows(
@@ -1719,6 +1835,8 @@ fn every_qwen35_kernel_is_in_the_metallib() {
             "qwen35_attn_tiled_h256_q32_k64_sg4",
             "qwen35_attn_tiled_h256_q64_k32_sg8",
             "qwen35_attn_tiled_h256_q64_k64_sg8",
+            "qwen35_swiglu_f32",
+            "qwen35_swiglu_bf16",
             "qwen35_score_rows_f32",
             "qwen35_score_rows_bf16",
         ] {

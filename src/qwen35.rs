@@ -1828,6 +1828,51 @@ pub fn attn_output_gate(
     })
 }
 
+// ---------------------------------------------------------------------- MLP ---
+
+/// `out = silu(gate) * up`, elementwise over `rows x width`: transformers'
+/// `Qwen3_5MLP` between its projections. Both inputs are f32 column windows
+/// (they may be two windows of one buffer, as a fused `[gate | up]` GEMM would
+/// write them). A bf16 `out` is what the down projection's GEMM reads, so it
+/// needs no separate cast pass. `out` may not overlap either input.
+pub fn swiglu(
+    rt: &Arc<GpuRuntime>,
+    gate: Cols<'_>,
+    up: Cols<'_>,
+    out: OutCols<'_>,
+    rows: u32,
+    width: u32,
+) -> Result<(), String> {
+    const WHAT: &str = "qwen35::swiglu";
+    let name = out_kernel("qwen35_swiglu", out.dtype, WHAT)?;
+    let (r, w) = (u64::from(rows), u64::from(width));
+    require_window::<f32>(rt, gate, r, w, "swiglu gate")?;
+    require_window::<f32>(rt, up, r, w, "swiglu up")?;
+    require_out_window(rt, out, r, w, "swiglu out")?;
+    if rows == 0 || width == 0 {
+        return Ok(());
+    }
+    require_disjoint_writes(
+        WHAT,
+        &[("out", out.cols.buf)],
+        &[("gate", gate.buf), ("up", up.buf)],
+    )?;
+    let p = rt.pipeline(&name)?;
+    dispatch_2d(rt, &p, width as usize, rows as usize, |bnd| {
+        set_gpu_buf(bnd, gate.buf, 0);
+        set_gpu_buf(bnd, up.buf, 1);
+        set_gpu_buf(bnd, out.cols.buf, 2);
+        set_u32(bnd, rows, 3);
+        set_u32(bnd, width, 4);
+        set_u32(bnd, gate.ld, 5);
+        set_u32(bnd, gate.off, 6);
+        set_u32(bnd, up.ld, 7);
+        set_u32(bnd, up.off, 8);
+        set_u32(bnd, out.cols.ld, 9);
+        set_u32(bnd, out.cols.off, 10);
+    })
+}
+
 // ------------------------------------------------ matrix-unit prefill attention ---
 
 /// Block geometry of [`attn_prefill_with_tile`]: queries per threadgroup (BQ)

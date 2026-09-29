@@ -32,6 +32,10 @@ All notable changes to `tessl` are recorded here. The format follows
   above the diagonal. `bench_qwen35_layers` now times it, and
   `--attn-tile=LABEL` / `--attn-rows` select another tile or the scalar
   kernel.
+- **`qwen35_swiglu_{f32,bf16}` / `qwen35::swiglu`**: Qwen3.5's MLP activation,
+  `silu(gate) * up`, from f32 column windows straight to bf16 for the down
+  GEMM, replacing `nn::mlp_silu` plus a cast pass in `bench_qwen35_layers`
+  (`--mlp-unfused` times the old path).
 - `bench_qwen35_layers` times the GDN chunked rule's two dispatches apart
   (`gdn chunk prep`, `gdn chunk scan`) through the doc-hidden
   `qwen35::gdn_chunk_phase`. Run in order, they are bit-identical to

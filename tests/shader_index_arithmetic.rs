@@ -26,6 +26,7 @@ const ATTN_GLOBAL: &str = include_str!("../kernels/flash_attn_global_h512.metal"
 const QWEN35_GDN: &str = include_str!("../kernels/qwen35_gdn.metal");
 const QWEN35_ATTN: &str = include_str!("../kernels/qwen35_attn.metal");
 const QWEN35_ATTN_TILED: &str = include_str!("../kernels/qwen35_attn_tiled.metal");
+const QWEN35_MLP: &str = include_str!("../kernels/qwen35_mlp.metal");
 const QWEN35_SCORE: &str = include_str!("../kernels/qwen35_score.metal");
 
 /// Every `.metal` file this suite inspects.
@@ -49,6 +50,7 @@ const INSPECTED_KERNELS: &[&str] = &[
     "qwen35_attn.metal",
     "qwen35_attn_tiled.metal",
     "qwen35_gdn.metal",
+    "qwen35_mlp.metal",
     "qwen35_score.metal",
     "reduce.metal",
     "rms_norm.metal",
@@ -460,6 +462,28 @@ fn qwen35_tiled_attention_plane_bases_are_widened() {
         QWEN35_ATTN_TILED,
         "const uint Tkv = min(*Tkv_ptr, kv_capacity);",
         "tiled attention live length clamp",
+    );
+}
+
+/// SwiGLU reads two windows and writes a third of `rows x ld` matrices; at
+/// T = 8192 a fused `[gate | up]` row is 12288 wide, so the row offset is
+/// widened before it is multiplied.
+#[test]
+fn qwen35_swiglu_row_offsets_are_widened() {
+    require(
+        QWEN35_MLP,
+        "gate[(ulong)r * ld_gate + gate_off + col]",
+        "SwiGLU gate address",
+    );
+    require(
+        QWEN35_MLP,
+        "up[(ulong)r * ld_up + up_off + col]",
+        "SwiGLU up address",
+    );
+    require(
+        QWEN35_MLP,
+        "out[(ulong)r * ld_out + out_off + col]",
+        "SwiGLU output address",
     );
 }
 

@@ -18,7 +18,7 @@ import re
 import sys
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-NEW = [os.path.join(ROOT, "kernels", f"{k}.metal") for k in ("qwen35_gdn", "qwen35_attn", "qwen35_score")]
+NEW = [os.path.join(ROOT, "kernels", f"{k}.metal") for k in ("qwen35_gdn", "qwen35_attn", "qwen35_mlp", "qwen35_score")]
 
 # Constructs the Qwen3.5 kernels introduce, each checked against the Metal
 # Shading Language specification when it was added.

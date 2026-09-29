@@ -48,6 +48,7 @@ that fusion for Metal.
 | 6b. Decode loops replayed from an ICB | `qwen35_attn_qk_norm_rope_posbuf` | `attn_qk_norm_rope_posbuf` | the position comes from a device buffer, like `rms_qkv_rope_posbuf` |
 | 6c. Shared-prefix attention | `qwen35_attn_prefix_rows`, `qwen35_attn_prefix_decode_{partial,reduce}` (+ `slot_base` in 6/6b) | `attn_prefix_rows`, `attn_prefix_decode`, `attn_qk_norm_rope_suffix{,_posbuf}` | attention over a per-row copy of a shared KV prefix, without the copy |
 | 6d. Prefill attention on the matrix units | `qwen35_attn_tiled_h256_*` (4 tiles) | `attn_prefill`, `attn_prefill_with_tile` | causal `sdpa` over the layer's own K/V; `nn::flash_attn_rows` with both products on TensorOps |
+| 6e. MLP activation | `qwen35_swiglu_{f32,bf16}` | `swiglu` | `act_fn(gate_proj(x)) * up_proj(x)` in `Qwen3_5MLP`, stored as bf16 for `down_proj` |
 | 7. Score only the answer rows | `qwen35_score_rows_{f32,bf16}` | `score_answer_rows` | final norm + `lm_head`, restricted to the answer tokens |
 | 7b. Embedding gather | `qwen35_embed_rows_bf16` | `embed_rows` | `embed_tokens(ids)` from the bf16 table, on the device, so a forward needs no host gather |
 | 8. Fused projections | tessl's GEMM | `pack_linear_weights_*`, `fused_projection`, `project_residual` | `in_proj_qkv/z/b/a`, `q/k/v_proj`, `out_proj` + residual |
@@ -241,6 +242,20 @@ where the tiled kernel's query blocks would sit mostly idle. A prefix
 prefilled by `attn_prefill` and continued by `attn_prefix_rows` therefore
 mixes the two kernels' rounding, at the ~1e-6 level above.
 
+### The MLP activation
+
+`swiglu` computes `silu(gate) * up` over f32 column windows and stores
+either f32 or the bf16 the down projection's GEMM reads. The generic
+`nn::mlp_silu` writes f32 only, so a forward used to add a cast pass per
+layer. That pass was 0.18 of the MLP's 0.52 ms of elementwise work at
+T = 1024 (28732de). The gate and up windows may be two windows of one
+buffer, which is what a single `[gate | up]` GEMM would write. The sigmoid is
+the overflow-free one in `kernels/qwen35_act.h`, shared with the GDN gates and
+the attention output gate. On this GPU the textbook `1 / (1 + exp(-x))`
+also returns 0 at x = -120, so no test here can tell the two forms apart.
+The safe form is kept because fast math is allowed to assume `exp` never
+returns infinity.
+
 ### Scoring only the answer rows
 
 `score_answer_rows` applies the final norm (`w_offset = 1.0` for Qwen3.5's
@@ -371,6 +386,7 @@ transformers' own fp32 error, both measured against f64:
 | gated norm f32 / bf16 | 1e-6 / within one bf16 rounding | — |
 | Q/K norm + partial RoPE, D=256, pos 30000 | 9.5e-7 | — |
 | output gate f32 / bf16 / in place | 2.4e-7 / exact / 2.4e-7 | — |
+| SwiGLU f32 / bf16 (`Qwen3_5MLP.act_fn`), gate and up as windows of one row, gates to ±120 | 1e-6 + 1e-6·\|x\| (max 1.5e-5 at \|x\| ~ 10³) / within one bf16 rounding | — |
 | scoring f32 / bf16; a bad slot or answer → NaN, the rest intact | 4.8e-7 | — |
 | embedding gather, bf16 table; a bad id → NaN row, the rest intact | exact | — |
 | Q/K norm + RoPE with `slot_base`: absolute RoPE, relative slot | bit-identical to slot_base 0 | — |

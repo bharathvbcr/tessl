@@ -23,7 +23,10 @@ Three flows:
 - **decode**: prefill, then one token with the carried conv/GDN state and KV
   cache, against the model's own cached decode;
 - **snapshot**: one prefilled prefix answers several questions at once through
-  `StateIn::Snapshot`, against the model run separately on each full sequence.
+  `StateIn::Snapshot`, against the model run separately on each full sequence;
+- **shared_prefix**: the same, with the attention's KV prefix shared too
+  (`qwen35_attn_prefix_rows`), then one decode step per question
+  (`qwen35_attn_prefix_decode`).
 """
 
 import os
@@ -136,15 +139,21 @@ def gdn_layer(attn, h, B, T, conv_state=None, gdn_state=None, snapshot=False, pa
     return out.reshape(B, T, HIDDEN), c["state_out"], o["state_out"]
 
 
-def attn_layer(sa, h, B, T, pos, k_cache, v_cache):
-    """One Qwen3_5Attention on the kernels, appending to `[B, cap, Hkv, D]` caches."""
+def attn_layer(sa, h, B, T, pos, k_cache, v_cache, prefix=None):
+    """One Qwen3_5Attention on the kernels, appending to `[B, cap, Hkv, D]` caches.
+
+    With `prefix = (kp, vp, P)` the caches are suffix caches (slot s is position
+    P + s, written with slot_base = P, as `attn_qk_norm_rope_suffix` does) and
+    the attention reads the shared `[P, Hkv, D]` prefix at batch stride 0:
+    `qwen35_attn_prefix_rows`, or `qwen35_attn_prefix_decode` for one token."""
     L = Layout
     cap = k_cache.shape[1]
+    P = 0 if prefix is None else prefix[2]
     proj = (h.reshape(B * T, HIDDEN) @ pack(sa.q_proj, sa.k_proj, sa.v_proj)).contiguous()
     r = kernel("qwen35_attn_qk_norm_rope",
                dict(B=B, T=T, Hq=HQ, Hkv=HKV, D=D, rotary_dim=D // 4, ld_p=L.attn_width, q_off=0,
                     k_off=L.attn_k_off, v_off=L.attn_v_off, pos_offset=pos, kv_capacity=cap,
-                    theta=1e7, eps=EPS),
+                    theta=1e7, eps=EPS, slot_base=P),
                {"p": proj, "q_norm_w": sa.q_norm.weight.detach(), "k_norm_w": sa.k_norm.weight.detach(),
                 "k_cache": k_cache, "v_cache": v_cache},
                {"q_out": B * T * HQ * D, "k_cache": k_cache.numel(), "v_cache": v_cache.numel()})
@@ -152,24 +161,37 @@ def attn_layer(sa, h, B, T, pos, k_cache, v_cache):
     kc = r["k_cache"].reshape(B, cap, HKV, D)
     vc = r["v_cache"].reshape(B, cap, HKV, D)
     n = pos + T
-    # The attention: tessl's flash_attn_rows, reading q_out and the caches
-    # exactly as attn_qk_norm_rope wrote them. Tkv is the live prefix, the
-    # query rows sit at absolute positions pos.., the keys at 0.., scale D^-0.5.
-    fa = cq.run("flash_attn_rows",
-                dict(B=B, Tq=T, H=HQ, Hkv=HKV, D=D, kv_capacity=cap, scale=D ** -0.5),
-                {"q": q.contiguous(), "k": kc.contiguous(), "v": vc.contiguous(),
-                 "tkv": torch.tensor([n], dtype=torch.int32), "q_pos": torch.tensor([pos], dtype=torch.int32),
-                 "kv_pos": torch.tensor([0], dtype=torch.int32)},
-                {"o": ("f32", B * T * HQ * D)})
+    q_pos = torch.tensor([pos], dtype=torch.int32)
+    if prefix is None:
+        # The attention: tessl's flash_attn_rows, reading q_out and the caches
+        # exactly as attn_qk_norm_rope wrote them. Tkv is the live prefix, the
+        # query rows sit at absolute positions pos.., the keys at 0.., scale
+        # D^-0.5.
+        name = "flash_attn_rows"
+        fa = cq.run(name, dict(B=B, Tq=T, H=HQ, Hkv=HKV, D=D, kv_capacity=cap, scale=D ** -0.5),
+                    {"q": q.contiguous(), "k": kc.contiguous(), "v": vc.contiguous(),
+                     "tkv": torch.tensor([n], dtype=torch.int32), "q_pos": q_pos,
+                     "kv_pos": torch.tensor([0], dtype=torch.int32)},
+                    {"o": ("f32", B * T * HQ * D)})
+        k_all, v_all = kc[:, :n], vc[:, :n]
+    else:
+        kp, vp, _ = prefix
+        name = "qwen35_attn_prefix_decode" if T == 1 else "qwen35_attn_prefix_rows"
+        fa = cq.run(name, dict(B=B, Tq=T, H=HQ, Hkv=HKV, P=P, suffix_cap=cap, scale=D ** -0.5),
+                    {"q": q.contiguous(), "kp": kp, "vp": vp, "ks": kc.contiguous(), "vs": vc.contiguous(),
+                     "suffix_len": torch.tensor([n - P], dtype=torch.int32), "q_pos": q_pos},
+                    {"o": ("f32", B * T * HQ * D)})
+        k_all = torch.cat([kp.expand(B, P, HKV, D), kc[:, :n - P]], dim=1)
+        v_all = torch.cat([vp.expand(B, P, HKV, D), vc[:, :n - P]], dim=1)
     a = fa["o"].reshape(B * T, HQ * D).contiguous()
     # The same attention in torch, so a disagreement names the attention kernel
     # rather than surfacing only as wrong logits three steps later.
-    kk = kc[:, :n].repeat_interleave(HQ // HKV, dim=2)
-    vv = vc[:, :n].repeat_interleave(HQ // HKV, dim=2)
+    kk = k_all.repeat_interleave(HQ // HKV, dim=2)
+    vv = v_all.repeat_interleave(HQ // HKV, dim=2)
     sc = torch.einsum("bthd,bshd->bhts", q, kk) * D ** -0.5
     mask = torch.arange(n)[None, :] > (pos + torch.arange(T))[:, None]
     ref = torch.einsum("bhts,bshd->bthd", sc.masked_fill(mask, float("-inf")).softmax(-1), vv)
-    cq.check(f"flash_attn_rows vs torch (B{B} T{T} pos{pos})", a, ref.reshape(B * T, HQ * D), 1e-5, 1e-5)
+    cq.check(f"{name} vs torch (B{B} T{T} pos{pos})", a, ref.reshape(B * T, HQ * D), 1e-5, 1e-5)
     gt = kernel("qwen35_attn_gate_f32",
                 dict(rows=B * T, Hq=HQ, D=D, ld_p=L.attn_width, q_off=0, ld_out=HQ * D, out_off=0),
                 {"attn": a, "p": proj}, {"out": B * T * HQ * D})
@@ -184,8 +206,12 @@ class State:
         self.conv, self.gdn, self.k, self.v = {}, {}, {}, {}
 
 
-def forward(model, ids, pos=0, state=None, cap=None, snapshot=False, paths=None):
-    """Run the stack on the kernels. `ids` [B, T]. Returns (hidden [B*T, H], state)."""
+def forward(model, ids, pos=0, state=None, cap=None, snapshot=False, paths=None, shared=None):
+    """Run the stack on the kernels. `ids` [B, T]. Returns (hidden [B*T, H], state).
+
+    `shared` runs attention over a shared prefix: {"P": P, "prefix": {layer:
+    (kp, vp)}, "cap": suffix capacity, "suffix": {layer: (kc, vc)} or absent
+    for a fresh suffix}. The state's K/V are then the suffix caches."""
     B, T = ids.shape
     cap = cap or pos + T
     st_in = state
@@ -200,6 +226,15 @@ def forward(model, ids, pos=0, state=None, cap=None, snapshot=False, paths=None)
                 conv_state=None if st_in is None else st_in.conv[i],
                 gdn_state=None if st_in is None else st_in.gdn[i],
                 snapshot=snapshot, path=(paths or {}).get(i, "chunk"))
+        elif shared is not None:
+            kp, vp = shared["prefix"][i]
+            if "suffix" in shared:
+                kc, vc = shared["suffix"][i]
+            else:
+                kc = torch.full((B, shared["cap"], HKV, D), float("nan"))
+                vc = torch.full((B, shared["cap"], HKV, D), float("nan"))
+            out, st.k[i], st.v[i] = attn_layer(layer.self_attn, h, B, T, pos, kc, vc,
+                                               prefix=(kp, vp, shared["P"]))
         else:
             if st_in is None:
                 kc = torch.full((B, cap, HKV, D), float("nan"))
@@ -287,13 +322,47 @@ def flow_snapshot(model):
     compare(f"snapshot: {N} questions from one {P}-token prefix", lg, lp, want)
 
 
+def flow_shared_prefix(model):
+    """The snapshot flow with the attention prefix shared too: the prefix's K/V
+    is stored once, with no batch dimension, and each question keeps only
+    its own suffix cache. That is `attn_qk_norm_rope_suffix` into
+    `attn_prefix_rows` for the questions, then one step of
+    `attn_prefix_decode` per question, continuing its suffix cache and
+    per-row GDN/conv state."""
+    P, S, N = 66, 5, 3
+    g = torch.Generator().manual_seed(7)
+    prefix = torch.randint(0, VOCAB, (1, P), generator=g)
+    suffixes = torch.randint(0, VOCAB, (N, S), generator=g)
+    nxt = torch.randint(0, VOCAB, (N, 1), generator=g)
+    _, st = forward(model, prefix, cap=P)
+    shared = {"P": P, "cap": S + 1,
+              "prefix": {i: (st.k[i][0].contiguous(), st.v[i][0].contiguous()) for i in st.k}}
+    paths = {0: "recurrent", 1: "chunk", 2: "recurrent"}
+    h, st2 = forward(model, suffixes, pos=P, state=st, snapshot=True, paths=paths, shared=shared)
+    slots = [b * S + S - 1 for b in range(N)] + [S - 3]
+    lg, lp = score(model, h, slots)
+    with torch.no_grad():
+        want = torch.stack([model(torch.cat([prefix, suffixes[b:b + 1]], 1)).logits[0, -1] for b in range(N)]
+                           + [model(torch.cat([prefix, suffixes[:1]], 1)).logits[0, P + S - 3]])
+    compare(f"shared prefix: {N} questions over one {P}-token KV prefix", lg, lp, want)
+    step = dict(shared, suffix={i: (st2.k[i], st2.v[i]) for i in st2.k})
+    rec = {i: "recurrent" for i in range(3)}
+    h2, _ = forward(model, nxt, pos=P + S, state=st2, paths=rec, shared=step)
+    lg, lp = score(model, h2, list(range(N)))
+    with torch.no_grad():
+        want = torch.stack([model(torch.cat([prefix, suffixes[b:b + 1], nxt[b:b + 1]], 1)).logits[0, -1]
+                            for b in range(N)])
+    compare(f"shared prefix: one decode step for each of {N} questions", lg, lp, want)
+
+
 def main():
     torch.set_num_threads(1)
     cq.HARNESS = cq.build()
     # Order invariance is check_qwen35.py's job; one order keeps this quick.
     cq.ORDERS = ["forward"]
     model = build_model(35)
-    for name, flow in (("prefill", flow_prefill), ("decode", flow_decode), ("snapshot", flow_snapshot)):
+    for name, flow in (("prefill", flow_prefill), ("decode", flow_decode), ("snapshot", flow_snapshot),
+                       ("shared_prefix", flow_shared_prefix)):
         print(f"{name}:")
         flow(model)
     if cq.FAILURES:

@@ -31,7 +31,9 @@ All notable changes to `tessl` are recorded here. The format follows
   own suffix cache. The result is bit-identical to `nn::flash_attn_rows` over
   a per-row copy of the prefix. `qwen35_attn_prefix_decode_{partial,reduce}`
   (`qwen35::attn_prefix_decode`) are the split-KV single-query form, and are
-  bit-identical to `nn::flash_attn_decode` the same way. `qwen35::attn_qk_norm_rope_suffix` caches a
+  bit-identical to `nn::flash_attn_decode` the same way.
+  `qwen35::attn_qk_norm_rope_suffix_posbuf` is the suffix writer with the
+  position in a device buffer, for ICB replay. `qwen35::attn_qk_norm_rope_suffix` caches a
   suffix at prefix-relative slots with absolute RoPE positions, through a new
   `slot_base` argument (buffer 20) to both `qwen35_attn_qk_norm_rope` kernels.
 - **`tools/msl_emu`**, a CPU emulator that runs the kernel sources as C++ with

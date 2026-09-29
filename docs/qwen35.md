@@ -46,7 +46,7 @@ that fusion for Metal.
 | 5. Read-only GDN decode | `qwen35_gdn_recurrent` | `gdn_recurrent` | `torch_recurrent_gated_delta_rule` |
 | 6. Attention extras | `qwen35_attn_qk_norm_rope`, `qwen35_attn_gate_{f32,bf16}` | `attn_qk_norm_rope`, `attn_output_gate` | `q_norm`/`k_norm` (`1 + w`), `apply_rotary_pos_emb` (partial), `* sigmoid(gate)` |
 | 6b. Decode loops replayed from an ICB | `qwen35_attn_qk_norm_rope_posbuf` | `attn_qk_norm_rope_posbuf` | the position comes from a device buffer, like `rms_qkv_rope_posbuf` |
-| 6c. Shared-prefix attention | `qwen35_attn_prefix_rows`, `qwen35_attn_prefix_decode_{partial,reduce}` (+ `slot_base` in 6/6b) | `attn_prefix_rows`, `attn_prefix_decode`, `attn_qk_norm_rope_suffix` | attention over a per-row copy of a shared KV prefix, without the copy |
+| 6c. Shared-prefix attention | `qwen35_attn_prefix_rows`, `qwen35_attn_prefix_decode_{partial,reduce}` (+ `slot_base` in 6/6b) | `attn_prefix_rows`, `attn_prefix_decode`, `attn_qk_norm_rope_suffix{,_posbuf}` | attention over a per-row copy of a shared KV prefix, without the copy |
 | 7. Score only the answer rows | `qwen35_score_rows_{f32,bf16}` | `score_answer_rows` | final norm + `lm_head`, restricted to the answer tokens |
 | 8. Fused projections | tessl's GEMM | `pack_linear_weights_*`, `fused_projection`, `project_residual` | `in_proj_qkv/z/b/a`, `q/k/v_proj`, `out_proj` + residual |
 
@@ -155,8 +155,14 @@ threadgroup), with the key address and the live key count `P + S` changed.
 It returns the same bits as `nn::flash_attn_decode` over the copy.
 
 The live suffix length is one device `u32` shared by every row, like
-`flash_attn_rows`' `tkv`, so the questions in a batch have equal lengths (pad
-the short ones and ignore their padded rows). At B = 16 and P = 8k, the copy
+`flash_attn_rows`' `tkv`, so the questions in a batch have equal lengths.
+Questions of different lengths are **right**-padded to the longest and scored
+at each one's own last real token. Causal attention and the GDN recurrence
+never let a token see anything after it, so padding at the end changes no
+real token's output, while padding between the prefix and a question would.
+For an ICB-replayed decode loop, `attn_qk_norm_rope_suffix_posbuf` reads
+the absolute position from a device buffer, the one `attn_prefix_decode`
+reads as `q_pos_offset`. At B = 16 and P = 8k, the copy
 this avoids is 16 × 8k × 2 KV heads × 256 × 4 B = 268 MB per K or V per layer,
 or 3.2 GB across the 6 layers.
 
@@ -251,6 +257,8 @@ model's own:
 | prefill, 70 tokens, 5 slots | 3.1e-5 |
 | cached decode, 2 steps after a 40-token prefill | 9.5e-6 |
 | 3 questions from one 66-token snapshot (mixed recurrent and chunked GDN paths) | 2.7e-5 |
+| the same 3 questions with the attention's KV prefix shared (`qwen35_attn_prefix_rows`) | 1.4e-5 |
+| then one decode step per question (`qwen35_attn_prefix_decode`, per-row suffix cache and GDN state) | 3.3e-5 |
 
 Four injected wiring errors were each caught with O(1) logit errors: gate
 columns swapped, the projection packed out of order, rotary width from the
@@ -370,8 +378,8 @@ cargo test --release --test shader_index_arithmetic   # includes the qwen35 sour
 - **bf16 inputs.** The kernels read f32 activations, which is what tessl's GEMM
   writes. A bf16-activation variant would halve their read traffic.
 - **Shared-prefix attention, remaining gaps.** Suffix lengths are equal across
-  a batch (one device `u32`). Only head_dim 256 is compiled. There is no
-  `_posbuf` form of `attn_qk_norm_rope_suffix` for ICB replay. The rows of
+  a batch (one device `u32`), so ragged questions are right-padded. Only
+  head_dim 256 is compiled. The rows of
   a batch read the shared prefix independently: rows that share a head could
   share its K/V lines in one threadgroup, but no measurement says that is
   worth doing yet.

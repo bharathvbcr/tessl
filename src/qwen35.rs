@@ -1283,6 +1283,43 @@ pub fn attn_qk_norm_rope_suffix(
     )
 }
 
+/// [`attn_qk_norm_rope_suffix`] with the **absolute** position of token 0,
+/// `prefix_len + suffix_offset`, read from `pos_offset` (one device u32)
+/// instead of bound as a scalar: the suffix writer for a decode loop replayed
+/// from an Indirect Command Buffer, as [`attn_qk_norm_rope_posbuf`] is for an
+/// ordinary cache. Advance the buffer between replays; `attn_prefix_decode`
+/// reads its `q_pos_offset` the same way, so one buffer can serve both.
+///
+/// The host cannot see the position. The kernel skips any token whose slot,
+/// `position - prefix_len`, falls outside `[0, capacity)`, computed in 64
+/// bits.
+#[allow(clippy::too_many_arguments)]
+pub fn attn_qk_norm_rope_suffix_posbuf(
+    rt: &Arc<GpuRuntime>,
+    shape: &AttnShape,
+    proj: Cols<'_>,
+    q_norm_w: &GpuBuffer,
+    k_norm_w: &GpuBuffer,
+    targets: &AttnTargets<'_>,
+    prefix_len: u32,
+    pos_offset: &GpuBuffer,
+    theta: f32,
+    eps: f32,
+) -> Result<(), String> {
+    qk_norm_rope_impl(
+        rt,
+        shape,
+        proj,
+        q_norm_w,
+        k_norm_w,
+        targets,
+        RopePos::Buffer(pos_offset),
+        prefix_len,
+        theta,
+        eps,
+    )
+}
+
 /// Where the RoPE / cache position comes from.
 #[derive(Clone, Copy)]
 enum RopePos<'a> {

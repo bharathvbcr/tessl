@@ -2611,6 +2611,105 @@ fn attn_prefix_rows_continue_a_prefix_written_by_attn_qk_norm_rope_suffix() {
 }
 
 #[test]
+fn attn_qk_norm_rope_suffix_posbuf_matches_the_scalar_suffix_writer_step_by_step() {
+    // The ICB decode shape: one token per step, the absolute position advanced
+    // through a device buffer, against the scalar suffix writer at the same
+    // positions. Then positions the kernel must skip, since the host cannot
+    // see them: before the suffix's first slot, past its capacity, and an
+    // offset that would wrap in 32 bits.
+    with_gpu(|rt| {
+        let (b, p, cap, rot) = (3usize, 20u32, 4usize, 64u32);
+        let layout = AttnProjLayout::new(PFX_HQ as u32, PFX_HKV as u32, PFX_D as u32).unwrap();
+        let w = layout.width();
+        let row = PFX_HKV * PFX_D;
+        let qw: Vec<f32> = random_f32(PFX_D, 7801).iter().map(|x| 0.1 * x).collect();
+        let kw: Vec<f32> = random_f32(PFX_D, 7802).iter().map(|x| 0.1 * x).collect();
+        let (qwb, kwb) = (buf(rt, &qw), buf(rt, &kw));
+        let shape = AttnShape {
+            batch: b as u32,
+            seq: 1,
+            q_heads: PFX_HQ as u32,
+            kv_heads: PFX_HKV as u32,
+            head_dim: PFX_D as u32,
+            rotary_dim: rot,
+        };
+        let qn = b * PFX_HQ * PFX_D;
+        let fresh = || {
+            (
+                seeded(rt, qn, SENTINEL),
+                seeded(rt, b * cap * row, SENTINEL),
+                seeded(rt, b * cap * row, SENTINEL),
+            )
+        };
+        let (sq, sk, sv) = fresh();
+        let (bq, bk, bv) = fresh();
+        let pos = buf_u32(rt, &[0]);
+        for step in 0..cap as u32 {
+            let proj = buf(rt, &random_f32(b * w as usize, 7810 + u64::from(step)));
+            let pc = Cols::dense(&proj, w);
+            let scalar = AttnTargets {
+                q_out: &sq,
+                k_cache: &sk,
+                v_cache: &sv,
+            };
+            qwen35::attn_qk_norm_rope_suffix(
+                rt, &shape, pc, &qwb, &kwb, &scalar, p, step, 1e7, 1e-6,
+            )
+            .unwrap();
+            pos.write_u32(&[p + step]);
+            let buffered = AttnTargets {
+                q_out: &bq,
+                k_cache: &bk,
+                v_cache: &bv,
+            };
+            qwen35::attn_qk_norm_rope_suffix_posbuf(
+                rt, &shape, pc, &qwb, &kwb, &buffered, p, &pos, 1e7, 1e-6,
+            )
+            .unwrap();
+            rt.synchronize().unwrap();
+            for (name, x, y) in [("q", &sq, &bq), ("k", &sk, &bk), ("v", &sv, &bv)] {
+                let (x, y) = (x.read_f32(), y.read_f32());
+                assert!(
+                    x.iter().zip(&y).all(|(a, c)| a.to_bits() == c.to_bits()),
+                    "step {step}: {name} differs between the scalar and buffer positions"
+                );
+            }
+        }
+        // Positions whose slot is out of range write nothing at all.
+        let proj = buf(rt, &random_f32(b * w as usize, 7820));
+        for bad in [p - 1, p + cap as u32, u32::MAX] {
+            let (q, k, v) = fresh();
+            pos.write_u32(&[bad]);
+            let t = AttnTargets {
+                q_out: &q,
+                k_cache: &k,
+                v_cache: &v,
+            };
+            qwen35::attn_qk_norm_rope_suffix_posbuf(
+                rt,
+                &shape,
+                Cols::dense(&proj, w),
+                &qwb,
+                &kwb,
+                &t,
+                p,
+                &pos,
+                1e7,
+                1e-6,
+            )
+            .unwrap();
+            rt.synchronize().unwrap();
+            for (name, x) in [("q", &q), ("k", &k), ("v", &v)] {
+                assert!(
+                    x.read_f32().iter().all(|&e| e == SENTINEL),
+                    "position {bad}: {name} was written"
+                );
+            }
+        }
+    });
+}
+
+#[test]
 fn attn_prefix_rows_rejects_bad_shapes_and_aliases() {
     with_gpu(|rt| {
         let (b, tq, p, s_cap) = (2usize, 3usize, 4usize, 4usize);

@@ -18,11 +18,13 @@ done
 # MSL_EMU_SANITIZE=address makes any out-of-bounds device-buffer or
 # threadgroup-memory access fatal; =thread reports data races, which is what a
 # missing barrier looks like.
+# Expanded as ${SAN[@]+...}: macOS's bash 3.2 treats an empty array as unbound
+# under `set -u`.
 SAN=()
 if [[ -n "${MSL_EMU_SANITIZE:-}" ]]; then
   SAN=(-fsanitize="$MSL_EMU_SANITIZE" -fno-omit-frame-pointer -O1)
 fi
-"${CXX:-g++}" -std=c++20 -O2 -g -pthread -fno-strict-aliasing -Wall -Wno-unused-variable -Wno-unused-parameter "${SAN[@]}" \
+"${CXX:-g++}" -std=c++20 -O2 -g -pthread -fno-strict-aliasing -Wall -Wno-unused-variable -Wno-unused-parameter ${SAN[@]+"${SAN[@]}"} \
   -Wno-unknown-pragmas -Wno-sign-compare \
   -I "$HERE" -I "$ROOT/kernels" -I "$OUT/gen" \
   "$HERE/harness.cpp" -o "$OUT/harness"

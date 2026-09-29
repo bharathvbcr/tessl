@@ -1948,6 +1948,64 @@ pub fn score_answer_rows(
     )
 }
 
+// --------------------------------------------------------------- embedding ---
+
+/// The embedding gather on the device: `out[r, :] = table[ids[r], :]`, bf16
+/// widened exactly to f32. `table` is the `[vocab, hidden]` vocabulary matrix
+/// (Qwen3.5 ties it to the LM head, so it is the [`LmHead`] that
+/// [`score_answer_rows`] reads); only [`DType::BF16`] is compiled. `ids` is
+/// `n` u32 token ids on the device and `out` is dense `[n, hidden]` f32, the
+/// residual stream's first value, so the whole forward stays in one command
+/// buffer with no host gather.
+///
+/// An id `>= vocab` cannot be seen by the host; its row comes out NaN and
+/// every other row is unaffected.
+pub fn embed_rows(
+    rt: &Arc<GpuRuntime>,
+    ids: &GpuBuffer,
+    n: u32,
+    table: LmHead<'_>,
+    hidden: u32,
+    out: &GpuBuffer,
+) -> Result<(), String> {
+    const WHAT: &str = "qwen35::embed_rows";
+    if table.dtype != DType::BF16 {
+        return Err(format!(
+            "{WHAT}: only a bf16 table is compiled, got {:?}",
+            table.dtype
+        ));
+    }
+    if table.vocab == 0 || hidden == 0 {
+        return Err(format!("{WHAT}: vocab and hidden must be non-zero"));
+    }
+    let table_elems = usize_product(&[table.vocab as usize, hidden as usize], WHAT)?;
+    require::<u16>(rt, table.weight, table_elems, "embed_rows table")?;
+    require::<u32>(rt, ids, n as usize, "embed_rows ids")?;
+    require::<f32>(
+        rt,
+        out,
+        usize_product(&[n as usize, hidden as usize], WHAT)?,
+        "embed_rows out",
+    )?;
+    if n == 0 {
+        return Ok(());
+    }
+    require_disjoint_writes(
+        WHAT,
+        &[("out", out)],
+        &[("ids", ids), ("table", table.weight)],
+    )?;
+    let p = rt.pipeline("qwen35_embed_rows_bf16")?;
+    dispatch_2d(rt, &p, hidden as usize, n as usize, |bnd| {
+        set_gpu_buf(bnd, ids, 0);
+        set_gpu_buf(bnd, table.weight, 1);
+        set_gpu_buf(bnd, out, 2);
+        set_u32(bnd, n, 3);
+        set_u32(bnd, hidden, 4);
+        set_u32(bnd, table.vocab, 5);
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

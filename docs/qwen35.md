@@ -9,7 +9,7 @@ has no fast Mac path for. Sources: `kernels/qwen35_gdn.metal`,
 > (41 test binaries, 0 failures), including every kernel here in
 > `tests/qwen35_kernels.rs`. The `Metal compile` workflow (GitHub-hosted macOS,
 > Xcode 26.6) builds all three sources under `-std=metal4.0 -Wall -Werror`,
-> links them, confirms all fifteen entry points are exported, and builds the
+> links them, confirms all sixteen entry points are exported, and builds the
 > crate and every test target with no `metal3.2` fallback. Every kernel below
 > was also compiled as C++ and executed on a CPU emulator of the Metal
 > execution model, then compared against transformers' own Qwen3.5 code (see
@@ -48,6 +48,7 @@ that fusion for Metal.
 | 6b. Decode loops replayed from an ICB | `qwen35_attn_qk_norm_rope_posbuf` | `attn_qk_norm_rope_posbuf` | the position comes from a device buffer, like `rms_qkv_rope_posbuf` |
 | 6c. Shared-prefix attention | `qwen35_attn_prefix_rows`, `qwen35_attn_prefix_decode_{partial,reduce}` (+ `slot_base` in 6/6b) | `attn_prefix_rows`, `attn_prefix_decode`, `attn_qk_norm_rope_suffix{,_posbuf}` | attention over a per-row copy of a shared KV prefix, without the copy |
 | 7. Score only the answer rows | `qwen35_score_rows_{f32,bf16}` | `score_answer_rows` | final norm + `lm_head`, restricted to the answer tokens |
+| 7b. Embedding gather | `qwen35_embed_rows_bf16` | `embed_rows` | `embed_tokens(ids)` from the bf16 table, on the device, so a forward needs no host gather |
 | 8. Fused projections | tessl's GEMM | `pack_linear_weights_*`, `fused_projection`, `project_residual` | `in_proj_qkv/z/b/a`, `q/k/v_proj`, `out_proj` + residual |
 
 ### Layout: everything reads the fused projection in place
@@ -307,6 +308,7 @@ transformers' own fp32 error, both measured against f64:
 | Q/K norm + partial RoPE, D=256, pos 30000 | 9.5e-7 | — |
 | output gate f32 / bf16 / in place | 2.4e-7 / exact / 2.4e-7 | — |
 | scoring f32 / bf16; a bad slot or answer → NaN, the rest intact | 4.8e-7 | — |
+| embedding gather, bf16 table; a bad id → NaN row, the rest intact | exact | — |
 | Q/K norm + RoPE with `slot_base`: absolute RoPE, relative slot | bit-identical to slot_base 0 | — |
 | shared-prefix attention, 8 query / 2 KV heads of 256; P = 0, 1, 30 (no suffix), 65 | bit-identical to `flash_attn_rows` on a copied prefix; ≤ 5.0e-7 vs torch | — |
 | shared-prefix decode, P = 5, 128 (chunk edge), 120 with a chunk straddling the suffix | ≤ 3.4e-7 vs torch | — |

@@ -2814,3 +2814,80 @@ fn attn_prefix_rows_rejects_bad_shapes_and_aliases() {
         rt.synchronize().unwrap();
     });
 }
+
+// ------------------------------------------------------------ embedding ---
+
+#[test]
+fn embed_rows_equals_the_host_gather_bit_for_bit() {
+    // The device gather qd-metal needs to keep a forward in one command buffer,
+    // against the host gather it replaces: bf16 bits widened to f32, which is
+    // exact, so the bits must match. Qwen3.5's hidden size, a small vocab.
+    with_gpu(|rt| {
+        let (vocab, hidden) = (1000usize, 2048usize);
+        let bits = f32_slice_to_bf16(&random_f32(vocab * hidden, 7900));
+        let table = rt.alloc_buffer(bits.len() * 2).unwrap();
+        table.write_bf16_bits(&bits);
+        let head = LmHead {
+            weight: &table,
+            dtype: DType::BF16,
+            vocab: vocab as u32,
+        };
+        let bad = [vocab as u32, u32::MAX];
+        let ids: Vec<u32> = vec![0, 999, 17, 17, 523, bad[0], 1, bad[1], 998];
+        let n = ids.len();
+        let idb = buf_u32(rt, &ids);
+        let out = seeded(rt, n * hidden, SENTINEL);
+        qwen35::embed_rows(rt, &idb, n as u32, head, hidden as u32, &out).unwrap();
+        rt.synchronize().unwrap();
+        let got = out.read_f32();
+        for (r, &id) in ids.iter().enumerate() {
+            let row = &got[r * hidden..(r + 1) * hidden];
+            if bad.contains(&id) {
+                assert!(
+                    row.iter().all(|x| x.is_nan()),
+                    "row {r}: id {id} is not NaN"
+                );
+                continue;
+            }
+            let want = &bits[id as usize * hidden..(id as usize + 1) * hidden];
+            for (c, (g, &w)) in row.iter().zip(want).enumerate() {
+                assert_eq!(
+                    g.to_bits(),
+                    bf16_bits_to_f32(w).to_bits(),
+                    "row {r} (id {id}) col {c}"
+                );
+            }
+        }
+        // Nothing to gather is a clean no-op that writes nothing.
+        let untouched = seeded(rt, hidden, SENTINEL);
+        qwen35::embed_rows(rt, &idb, 0, head, hidden as u32, &untouched).unwrap();
+        rt.synchronize().unwrap();
+        assert!(untouched.read_f32().iter().all(|&x| x == SENTINEL));
+        // Rejections, each by its own message.
+        let f32_head = LmHead {
+            dtype: DType::F32,
+            ..head
+        };
+        expect_err(
+            qwen35::embed_rows(rt, &idb, n as u32, f32_head, hidden as u32, &out),
+            "only a bf16 table is compiled",
+        );
+        let short = LmHead {
+            vocab: vocab as u32 + 1,
+            ..head
+        };
+        expect_err(
+            qwen35::embed_rows(rt, &idb, n as u32, short, hidden as u32, &out),
+            "embed_rows table",
+        );
+        let big_out = rt.alloc_buffer(bits.len() * 4).unwrap();
+        let aliased = LmHead {
+            weight: &big_out,
+            ..head
+        };
+        expect_err(
+            qwen35::embed_rows(rt, &idb, n as u32, aliased, hidden as u32, &big_out),
+            "overlaps read-only buffer table",
+        );
+    });
+}

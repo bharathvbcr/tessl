@@ -332,6 +332,16 @@ fn qwen35_row_offsets_are_widened_before_multiplication() {
             QWEN35_SCORE,
             "(ulong)(ok ? answers[a] : 0u) * hidden",
         ),
+        (
+            "embedding table row",
+            QWEN35_SCORE,
+            "(ulong)(ok ? id : 0u) * hidden",
+        ),
+        (
+            "embedding output row",
+            QWEN35_SCORE,
+            "(ulong)r * hidden + col",
+        ),
     ] {
         require(source, widened, label);
     }

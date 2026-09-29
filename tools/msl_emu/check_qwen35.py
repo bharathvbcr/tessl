@@ -528,6 +528,24 @@ def case_prefix_decode(seed, B, P, S, s_cap, q_pos):
     check(f"attn_prefix_decode B{B} P{P} S{S}/{s_cap} q@{q_pos} vs torch", got, ref, 1e-5, 1e-5)
 
 
+def case_embed_rows(seed):
+    """The bf16 embedding gather: exact against indexing the table in torch;
+    an out-of-range id is a NaN row and the others are intact."""
+    g = seeded(seed)
+    vocab, hidden = 50, 96
+    table = torch.randn(vocab, hidden, generator=g).to(torch.bfloat16)
+    ids = torch.tensor([0, 49, 7, 7, 50, 3, 2 ** 31 - 1], dtype=torch.int32)
+    out = run("qwen35_embed_rows_bf16", dict(n=len(ids), hidden=hidden, vocab=vocab),
+              {"ids": ids, "table": table.view(torch.int16)}, {"out": ("f32", len(ids) * hidden)})["out"]
+    out = out.reshape(len(ids), hidden)
+    good = ids < vocab
+    want = table.float()[ids[good].long()]
+    ok = torch.equal(out[good].view(torch.int32), want.view(torch.int32)) and bool(torch.isnan(out[~good]).all())
+    print(f"  [{'ok  ' if ok else 'FAIL'}] embed_rows_bf16: exact gather, bad ids NaN")
+    if not ok:
+        FAILURES.append("embed_rows_bf16")
+
+
 def case_qk_rope_slot_base(seed):
     """`slot_base` moves only the cache slot: a suffix cached relative to a
     prefix of P holds, bit for bit, what a cache from position 0 holds at P.."""
@@ -806,6 +824,7 @@ CASES = [
     ("prefix_rows", lambda: [case_prefix_rows(32 + i, *c) for i, c in enumerate(
         [(2, 0, 3, 4, 3, 0), (3, 1, 2, 2, 2, 1), (2, 65, 66, 66, 66, 65), (2, 30, 0, 1, 2, 28)])]),
     ("attn_gate", lambda: [case_attn_gate(bf, ip, 17) for bf, ip in ((False, False), (True, False), (False, True))]),
+    ("embed_rows", lambda: case_embed_rows(50)),
     ("score", lambda: [case_score(bf, 18) for bf in (False, True)]),
 ]
 

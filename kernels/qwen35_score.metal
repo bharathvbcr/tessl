@@ -155,3 +155,30 @@ kernel void NAME(                                                               
 
 SCORE_ROWS_KERNEL(qwen35_score_rows_f32, float)
 SCORE_ROWS_KERNEL(qwen35_score_rows_bf16, bfloat)
+
+/// The embedding gather, from the same bf16 vocabulary table the scoring
+/// kernels read as the (tied) LM head: `out[r, :] = f32(table[ids[r], :])`.
+///
+/// Token ids live in device memory, so the host cannot check them: an id
+/// `>= vocab` makes its row NaN and leaves the others intact. The widening is
+/// integer-only (a bf16 is the top half of an f32), so it is exact and fast
+/// math has nothing to fold.
+///
+/// Grid: x = column in [0, hidden), y = row in [0, n).
+kernel void qwen35_embed_rows_bf16(
+    device const uint *ids [[buffer(0)]],
+    device const ushort *table [[buffer(1)]],
+    device float *out [[buffer(2)]],
+    constant uint &n [[buffer(3)]],
+    constant uint &hidden [[buffer(4)]],
+    constant uint &vocab [[buffer(5)]],
+    uint2 gid [[thread_position_in_grid]])
+{
+    const uint col = gid.x;
+    const uint r = gid.y;
+    if (col >= hidden || r >= n) return;
+    const uint id = ids[r];
+    const bool ok = id < vocab;
+    const uint bits = (uint)table[(ulong)(ok ? id : 0u) * hidden + col] << 16;
+    ((device uint *)out)[(ulong)r * hidden + col] = ok ? bits : SCORE_NAN_BITS;
+}

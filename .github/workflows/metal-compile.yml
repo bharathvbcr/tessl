@@ -94,7 +94,8 @@ jobs:
                     qwen35_gated_rms_norm_f32 qwen35_gated_rms_norm_bf16 qwen35_attn_qk_norm_rope \
                     qwen35_attn_qk_norm_rope_posbuf qwen35_attn_gate_f32 qwen35_attn_gate_bf16 \
                     qwen35_attn_prefix_rows qwen35_attn_prefix_decode_partial \
-                    qwen35_attn_prefix_decode_reduce qwen35_score_rows_f32 qwen35_score_rows_bf16; do
+                    qwen35_attn_prefix_decode_reduce qwen35_score_rows_f32 qwen35_score_rows_bf16 \
+                    qwen35_embed_rows_bf16; do
             if grep -qx "$fn" "$RUNNER_TEMP/symbols.txt"; then
               echo "exported: $fn"
             else

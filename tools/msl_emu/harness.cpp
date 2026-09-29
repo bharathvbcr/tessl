@@ -285,6 +285,15 @@ int main(int argc, char **argv) {
             qwen35_attn_prefix_decode_reduce(part, o, prefix_len, slen, H, out_bf16, suffix_cap,
                                              uint2(id.tg.x, id.tg.y), uint2(id.tid_in_tg.x, 0), uint2(256, 1));
         });
+    } else if (kname == "qwen35_embed_rows_bf16") {
+        // qwen35::embed_rows: dispatch_2d over (hidden, n), 32-wide rows.
+        const uint n = P("n"), hidden = P("hidden"), vocab = P("vocab");
+        uint *ids = U("ids");
+        ushort *table = reinterpret_cast<ushort *>(buf("table").data());
+        float *out = F("out");
+        launch(uint3(cdiv(hidden, 32), n, 1), uint3(32, 1, 1), 0, [&](const Ids &id, float *) {
+            qwen35_embed_rows_bf16(ids, table, out, n, hidden, vocab, uint2(id.gid.x, id.gid.y));
+        });
     } else if (kname == "qwen35_score_rows_f32" || kname == "qwen35_score_rows_bf16") {
         const uint rows = P("rows"), hidden = P("hidden"), n_ans = P("n_ans"), vocab = P("vocab"),
                    n_slots = P("n_slots");

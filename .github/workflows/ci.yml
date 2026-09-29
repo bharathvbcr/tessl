@@ -31,6 +31,58 @@ jobs:
       - run: cargo fmt --all --check
 
   # ---------------------------------------------------------------------------
+  # The Qwen3.5 kernels on a CPU emulator, against transformers' own code.
+  #
+  # Linux, because it needs no Metal toolchain: tools/msl_emu compiles the
+  # kernel sources as C++ and runs every threadgroup on real threads. Four
+  # passes, each catching what the others cannot, plus the whole-model check
+  # (a small random Qwen3_5ForCausalLM through every kernel and tessl's own
+  # flash_attn_rows, against the model's logits): plain (numerics, three
+  # threadgroup orders that must agree bit for bit), fast-math (the on-device
+  # error bounds under perturbed transcendentals), AddressSanitizer (any
+  # out-of-bounds device or threadgroup access), ThreadSanitizer (missing
+  # barriers). The host-contract case also holds src/qwen35.rs's buffer binds
+  # and constants to the kernel signatures.
+  # ---------------------------------------------------------------------------
+  kernel-emulator:
+    name: qwen35 kernels (CPU emulator vs transformers)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: tools/msl_emu/requirements.txt
+      - name: MSL dialect lint
+        # No Metal compiler on Linux: fail instead on any construct the Qwen3.5
+        # kernels use that no compiling tessl kernel uses and nobody reviewed.
+        run: python3 tools/msl_emu/dialect_lint.py
+      - name: Install the oracle
+        run: pip install -r tools/msl_emu/requirements.txt --extra-index-url https://download.pytorch.org/whl/cpu
+      - name: Emulator vs transformers
+        run: python3 tools/msl_emu/check_qwen35.py
+      - name: Whole model vs transformers (prefill, cached decode, shared snapshot)
+        run: python3 tools/msl_emu/check_qwen35_model.py
+      - name: Fast-math bounds
+        run: MSL_EMU_OUT=/tmp/emu-fast python3 tools/msl_emu/check_qwen35.py --fast-math
+      - name: Let the sanitizers map their shadow memory
+        # Recent runner kernels randomise mmap with 32 bits, which leaves ASan
+        # and TSan no room for their fixed shadow ranges ("unexpected memory
+        # mapping"). 28 is the long-standing default.
+        run: sudo sysctl -w vm.mmap_rnd_bits=28
+      - name: AddressSanitizer
+        run: |
+          MSL_EMU_SANITIZE=address MSL_EMU_OUT=/tmp/emu-asan python3 tools/msl_emu/check_qwen35.py
+          MSL_EMU_SANITIZE=address MSL_EMU_OUT=/tmp/emu-asan python3 tools/msl_emu/check_qwen35_model.py
+      - name: ThreadSanitizer
+        # Every case is slow under TSan; these cover each kernel's barrier structure.
+        run: >-
+          MSL_EMU_SANITIZE=thread MSL_EMU_OUT=/tmp/emu-tsan TSAN_OPTIONS=halt_on_error=1
+          python3 tools/msl_emu/check_qwen35.py
+          -k chunk_T65,chunk_ws,recurrent_T7,recurrent_in_place,gated_norm,score,conv_short,qk_norm,attn_gate
+
+  # ---------------------------------------------------------------------------
   # Everything that compiles, on a runner that can compile shaders.
   #
   # `build.rs` AOT-compiles kernels/*.metal by shelling out to `xcrun metal`, so

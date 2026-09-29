@@ -17,3 +17,6 @@ __pycache__/
 
 # DevCouncil local ledger cache.
 .devcouncil/
+
+# CPU emulator build output (tools/msl_emu/build.sh).
+/tools/msl_emu/build/

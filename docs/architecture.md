@@ -142,7 +142,9 @@ This bounds operand $B$ rereads to $\text{tiles}_m / 8$ passes, boosting large s
 
 ## The Kernel Library and the `nn` Boundary
 
-The 18 Metal sources compile to 72 kernel entry points. They arrived here by
+The 18 Metal sources of the `nn` library compile to 72 kernel entry points (the
+Qwen3.5 kernels in `tessl::qwen35` add three sources and eleven more — see
+[qwen35.md](qwen35.md)). The `nn` ones arrived here by
 promotion out of `gemma-metal`, where they were reachable only as raw pipeline
 name strings through an overlay metallib — meaning a typo in a name was a
 runtime failure, and nothing checked that a buffer was large enough for the grid

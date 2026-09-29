@@ -1,0 +1,463 @@
+// A CPU stand-in for <metal_stdlib>, so tessl's Metal kernels can be compiled
+// as C++20 and executed on a host with no Metal toolchain (Linux CI, a cloud
+// container) — see tools/msl_emu/README.md.
+//
+// What it models:
+//
+//   * a threadgroup is `threads_per_threadgroup` real OS threads, and
+//     `threadgroup_barrier` is a real barrier across them;
+//   * a simdgroup is 32 consecutive threads, and every `simd_*` collective is a
+//     real exchange through shared slots with a 32-way barrier, so a lane that
+//     skips a collective its siblings reach deadlocks here as surely as it
+//     misbehaves on a GPU;
+//   * `simdgroup_matrix<float, 8, 8>` is held whole by every lane (a real GPU
+//     spreads it across lanes, but the arithmetic is the same), and a store
+//     writes only the lane's own two elements, as a GPU's does — so a missing
+//     `simdgroup_barrier` between a store and another lane's read is a race
+//     here too, not a silent pass.
+//
+// What it does not model: memory-model reorderings, threadgroup-memory limits
+// beyond what the harness allocates, fast-math precision, and anything a
+// kernel in this repo does not use. A pass here is evidence the indexing,
+// masking, barrier placement and algebra are right — not a substitute for
+// running on the device.
+#pragma once
+
+#include <algorithm>
+#include <atomic>
+#include <barrier>
+#include <cmath>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <functional>
+#include <memory>
+#include <thread>
+#include <vector>
+// Pulled in here, before the qualifier macros at the bottom of this file, so no
+// standard header is ever parsed with `thread` or `device` defined away.
+#include <csignal>
+#include <fstream>
+#include <map>
+#include <sstream>
+#include <string>
+#include <unistd.h>
+
+using uint = unsigned int;
+using ulong = unsigned long;
+using ushort = unsigned short;
+using uchar = unsigned char;
+
+namespace metal {
+
+// ---------------------------------------------------------------- vectors ---
+
+template <typename T>
+struct vec2 {
+    T x, y;
+    vec2() : x(0), y(0) {}
+    vec2(T a, T b) : x(a), y(b) {}
+    template <typename U>
+    explicit vec2(U a) : x(T(a)), y(T(a)) {}
+};
+template <typename T>
+struct vec3 {
+    T x, y, z;
+    vec3() : x(0), y(0), z(0) {}
+    vec3(T a, T b, T c) : x(a), y(b), z(c) {}
+};
+/// `float4` as tessl's flash-attention kernels use it: elementwise arithmetic
+/// and scalar broadcast, 16-byte aligned so a `float *` reinterpreted as
+/// `float4 *` (with -fno-strict-aliasing) reads the same four floats.
+struct alignas(16) float4 {
+    float x, y, z, w;
+    float4() = default;
+    explicit float4(float s) : x(s), y(s), z(s), w(s) {}
+    float4(float a, float b, float c, float d) : x(a), y(b), z(c), w(d) {}
+    float4 operator+(const float4 &o) const { return {x + o.x, y + o.y, z + o.z, w + o.w}; }
+    float4 operator*(const float4 &o) const { return {x * o.x, y * o.y, z * o.z, w * o.w}; }
+    float4 operator*(float s) const { return {x * s, y * s, z * s, w * s}; }
+    float4 &operator+=(const float4 &o) { return *this = *this + o; }
+};
+inline float4 operator*(float s, const float4 &v) { return v * s; }
+
+using uint2 = vec2<uint>;
+using uint3 = vec3<uint>;
+using ulong2 = vec2<ulong>;
+using float2 = vec2<float>;
+
+// ----------------------------------------------------------------- bfloat ---
+
+/// bfloat16 with round-to-nearest-even on conversion, as the GPU's `(bfloat)`
+/// cast does.
+struct bfloat {
+    uint16_t bits = 0;
+    bfloat() = default;
+    bfloat(float f) {
+        uint32_t u;
+        std::memcpy(&u, &f, 4);
+        if ((u & 0x7fffffffu) > 0x7f800000u) {
+            bits = uint16_t((u >> 16) | 0x40u); // quiet NaN
+        } else {
+            u += 0x7fffu + ((u >> 16) & 1u);
+            bits = uint16_t(u >> 16);
+        }
+    }
+    operator float() const {
+        uint32_t u = uint32_t(bits) << 16;
+        float f;
+        std::memcpy(&f, &u, 4);
+        return f;
+    }
+};
+
+// ------------------------------------------------------------------- math ---
+
+namespace emu {
+/// MSL_EMU_ULP=N perturbs every fast-math transcendental below by a
+/// deterministic -N..N ulps (hashed from its argument), standing in for Metal's
+/// approximate `exp`/`log`/`rsqrt`/`pow`/`sin`/`cos`. `precise::` is left exact,
+/// as on the device. It is how the on-device tolerances get tested here.
+inline int ulp_noise() {
+    static const int n = [] {
+        const char *e = std::getenv("MSL_EMU_ULP");
+        return e ? std::atoi(e) : 0;
+    }();
+    return n;
+}
+inline float perturb(float r, float x, int extra = 0) {
+    const int n = ulp_noise() == 0 ? 0 : ulp_noise() + extra;
+    if (n == 0 || !std::isfinite(r)) return r;
+    uint32_t h;
+    std::memcpy(&h, &x, 4);
+    h ^= h >> 16;
+    h *= 0x7feb352du;
+    h ^= h >> 15;
+    h *= 0x846ca68bu;
+    h ^= h >> 16;
+    int k = int(h % uint32_t(2 * n + 1)) - n;
+    for (; k > 0; --k) r = std::nextafter(r, INFINITY);
+    for (; k < 0; ++k) r = std::nextafter(r, -INFINITY);
+    return r;
+}
+} // namespace emu
+
+inline float rsqrt(float x) { return emu::perturb(1.0f / std::sqrt(x), x); }
+// Metal documents fast `exp` to 3 + floor(2|x|) ulp: the error grows with the
+// argument, so a flat N would understate it exactly where softmax-like and
+// decay-like arguments live.
+inline float exp(float x) {
+    return emu::perturb(std::exp(x), x, int(std::min(std::floor(2.0f * std::fabs(x)), 1000.0f)));
+}
+inline float log(float x) { return emu::perturb(std::log(x), x); }
+inline float pow(float a, float b) { return emu::perturb(std::pow(a, b), a * 31.0f + b); }
+inline float sin(float x) { return emu::perturb(std::sin(x), x); }
+inline float cos(float x) { return emu::perturb(std::cos(x), x); }
+using std::fabs;
+using std::sqrt;
+template <typename T>
+inline T min(T a, T b) { return a < b ? a : b; }
+template <typename T>
+inline T max(T a, T b) { return a > b ? a : b; }
+template <typename T>
+inline T clamp(T x, T lo, T hi) { return min(max(x, lo), hi); }
+
+namespace precise {
+inline float divide(float a, float b) { return a / b; }
+inline float pow(float a, float b) { return std::pow(a, b); }
+inline float cos(float x) { return std::cos(x); }
+inline float sin(float x) { return std::sin(x); }
+inline float exp(float x) { return std::exp(x); }
+inline float log(float x) { return std::log(x); }
+} // namespace precise
+
+namespace fast {
+using metal::cos;
+using metal::exp;
+using metal::log;
+using metal::pow;
+using metal::sin;
+using precise::divide;
+} // namespace fast
+
+template <typename To, typename From>
+inline To as_type(From v) {
+    static_assert(sizeof(To) == sizeof(From), "as_type needs equal sizes");
+    To out;
+    std::memcpy(&out, &v, sizeof(To));
+    return out;
+}
+
+// --------------------------------------------------------- execution model ---
+
+enum class mem_flags : unsigned { mem_none = 0, mem_device = 1, mem_threadgroup = 2, mem_texture = 4 };
+inline mem_flags operator|(mem_flags a, mem_flags b) {
+    return mem_flags(unsigned(a) | unsigned(b));
+}
+
+namespace emu {
+
+constexpr uint SIMD = 32;
+
+/// Shared state of one simdgroup: an exchange slot per lane and a barrier.
+struct Simd {
+    explicit Simd(uint lanes) : bar(lanes), n(lanes) {}
+    std::barrier<> bar;
+    uint n;
+    float slot[SIMD] = {};
+};
+
+/// Shared state of one threadgroup.
+struct Group {
+    explicit Group(uint threads) : bar(threads) {}
+    std::barrier<> bar;
+    std::atomic<uint> exited{0};
+    std::atomic<bool> error{false};
+    std::vector<std::unique_ptr<Simd>> simds;
+};
+
+struct ThreadCtx {
+    Group *group = nullptr;
+    Simd *simd = nullptr;
+    uint lane = 0;
+};
+
+inline thread_local ThreadCtx ctx;
+
+inline void fail(const char *msg) {
+    std::fprintf(stderr, "msl_emu: %s\n", msg);
+    std::fflush(stderr);
+    std::abort();
+}
+
+/// Builtin coordinates handed to the kernel body of one thread.
+struct Ids {
+    uint3 tg;          // threadgroup_position_in_grid
+    uint3 tid_in_tg;   // thread_position_in_threadgroup
+    uint3 gid;         // thread_position_in_grid
+    uint lid;          // thread_index_in_threadgroup
+    uint sg;           // simdgroup_index_in_threadgroup
+    uint lane;         // thread_index_in_simdgroup
+    uint tptg;         // threads_per_threadgroup (total)
+};
+
+/// Run `body` for every thread of a `grid` x `tpg` dispatch (both in
+/// threadgroups / threads, 3-D), one threadgroup at a time, the threads of a
+/// threadgroup concurrently. `tg_floats` floats of zero-initialised
+/// threadgroup memory are handed to each group as `tgm`.
+inline void launch(uint3 grid, uint3 tpg, size_t tg_floats,
+                   const std::function<void(const Ids &, float *tgm)> &body) {
+    const uint n = tpg.x * tpg.y * tpg.z;
+    if (n == 0 || n > 1024) fail("threads per threadgroup must be in 1..1024");
+    // Exactly the requested size: slack here would hide a one-past-the-end
+    // threadgroup access from AddressSanitizer.
+    std::vector<float> tgm(std::max<size_t>(tg_floats, 1));
+    // A GPU promises no order between threadgroups, so neither does this:
+    // MSL_EMU_TG_ORDER=reverse|shuffle runs them out of grid order. A kernel
+    // whose threadgroups write each other's outputs passes in one order and
+    // fails in another.
+    std::vector<uint3> order;
+    for (uint gz = 0; gz < grid.z; ++gz)
+        for (uint gy = 0; gy < grid.y; ++gy)
+            for (uint gx = 0; gx < grid.x; ++gx) order.emplace_back(gx, gy, gz);
+    const char *mode = std::getenv("MSL_EMU_TG_ORDER");
+    if (mode && std::strcmp(mode, "reverse") == 0) {
+        std::reverse(order.begin(), order.end());
+    } else if (mode && std::strcmp(mode, "shuffle") == 0) {
+        uint64_t x = 0x9e3779b97f4a7c15ull;
+        for (size_t i = order.size(); i > 1; --i) {
+            x ^= x << 13, x ^= x >> 7, x ^= x << 17;
+            std::swap(order[i - 1], order[x % i]);
+        }
+    }
+    for (const uint3 &g : order) {
+                const uint gx = g.x, gy = g.y, gz = g.z;
+                // Poison rather than zero: a kernel that reads threadgroup
+                // memory it never wrote should produce garbage, not a pass.
+                std::fill(tgm.begin(), tgm.end(), std::nanf(""));
+                Group group(n);
+                for (uint s = 0; s < (n + SIMD - 1) / SIMD; ++s) {
+                    group.simds.push_back(std::make_unique<Simd>(std::min(SIMD, n - s * SIMD)));
+                }
+                std::vector<std::thread> threads;
+                threads.reserve(n);
+                for (uint i = 0; i < n; ++i) {
+                    threads.emplace_back([&, i] {
+                        Ids id;
+                        id.tg = uint3(gx, gy, gz);
+                        id.tid_in_tg = uint3(i % tpg.x, (i / tpg.x) % tpg.y, i / (tpg.x * tpg.y));
+                        id.gid = uint3(gx * tpg.x + id.tid_in_tg.x, gy * tpg.y + id.tid_in_tg.y,
+                                       gz * tpg.z + id.tid_in_tg.z);
+                        id.lid = i;
+                        id.sg = i / SIMD;
+                        id.lane = i % SIMD;
+                        id.tptg = n;
+                        ctx.group = &group;
+                        ctx.simd = group.simds[id.sg].get();
+                        ctx.lane = id.lane;
+                        body(id, tgm.data());
+                        // Leave both barriers so an early-returning simdgroup
+                        // cannot deadlock the rest; `threadgroup_barrier`
+                        // reports it if anyone still needed this thread.
+                        group.exited.fetch_add(1);
+                        ctx.simd->bar.arrive_and_drop();
+                        group.bar.arrive_and_drop();
+                    });
+                }
+                for (auto &t : threads) t.join();
+            }
+}
+
+} // namespace emu
+
+inline void threadgroup_barrier(mem_flags) {
+    auto *g = emu::ctx.group;
+    if (g->exited.load() != 0) {
+        emu::fail("threadgroup_barrier reached after a thread of the group returned "
+                  "(non-uniform barrier: undefined on a GPU)");
+    }
+    g->bar.arrive_and_wait();
+}
+
+inline void simdgroup_barrier(mem_flags) { emu::ctx.simd->bar.arrive_and_wait(); }
+
+// ------------------------------------------------------ simd collectives ---
+
+namespace emu {
+/// Publish `v`, then let `pick` read any lane's value.
+template <typename F>
+inline float exchange(float v, F pick) {
+    Simd *s = ctx.simd;
+    s->slot[ctx.lane] = v;
+    s->bar.arrive_and_wait();
+    const float out = pick(s->slot, s->n);
+    s->bar.arrive_and_wait();
+    return out;
+}
+} // namespace emu
+
+inline float simd_sum(float v) {
+    return emu::exchange(v, [](const float *slot, uint n) {
+        // A shuffle-down tree, like the hardware reduction — not a serial sum.
+        float buf[emu::SIMD];
+        std::copy(slot, slot + n, buf);
+        for (uint w = emu::SIMD / 2; w > 0; w /= 2)
+            for (uint i = 0; i < w; ++i)
+                if (i + w < n) buf[i] += buf[i + w];
+        return buf[0];
+    });
+}
+
+inline float simd_max(float v) {
+    return emu::exchange(v, [](const float *slot, uint n) {
+        float m = slot[0];
+        for (uint i = 1; i < n; ++i) m = std::max(m, slot[i]);
+        return m;
+    });
+}
+
+inline float simd_shuffle_xor(float v, uint mask) {
+    const uint lane = emu::ctx.lane;
+    return emu::exchange(v, [lane, mask](const float *slot, uint n) {
+        const uint src = lane ^ mask;
+        return src < n ? slot[src] : slot[lane];
+    });
+}
+
+inline float simd_broadcast(float v, uint src) {
+    return emu::exchange(v, [src](const float *slot, uint) { return slot[src]; });
+}
+
+inline float simd_shuffle(float v, uint src) { return simd_broadcast(v, src); }
+
+// ----------------------------------------------------- simdgroup_matrix ---
+
+template <typename T, int Cols, int Rows>
+struct simdgroup_matrix {
+    static_assert(Cols == 8 && Rows == 8, "only 8x8 is modelled");
+    T m[8][8];
+    simdgroup_matrix() {
+        for (auto &r : m)
+            for (auto &x : r) x = std::nanf("");
+    }
+    /// A diagonal matrix, as MSL's single-value constructor makes.
+    explicit simdgroup_matrix(T d) {
+        for (int i = 0; i < 8; ++i)
+            for (int j = 0; j < 8; ++j) m[i][j] = i == j ? d : T(0);
+    }
+};
+using simdgroup_float8x8 = simdgroup_matrix<float, 8, 8>;
+
+template <typename T, int C, int R>
+inline simdgroup_matrix<T, C, R> make_filled_simdgroup_matrix(T v) {
+    simdgroup_matrix<T, C, R> out;
+    for (auto &r : out.m)
+        for (auto &x : r) x = v;
+    return out;
+}
+
+/// `elements_per_row` is the source row stride; `transpose` loads the
+/// transpose of the 8x8 block at `src` (+ origin).
+template <typename T>
+inline void simdgroup_load(simdgroup_matrix<T, 8, 8> &d, const T *src, ulong elements_per_row = 8,
+                           ulong2 origin = ulong2(0, 0), bool transpose = false) {
+    const T *base = src + origin.y * elements_per_row + origin.x;
+    // Every lane reads the whole tile. The load is collective on a GPU, so
+    // make the lanes arrive together, as a stale read would otherwise be
+    // hidden by timing.
+    emu::ctx.simd->bar.arrive_and_wait();
+    for (int r = 0; r < 8; ++r)
+        for (int c = 0; c < 8; ++c)
+            d.m[r][c] = transpose ? base[c * elements_per_row + r] : base[r * elements_per_row + c];
+    emu::ctx.simd->bar.arrive_and_wait();
+}
+
+template <typename T>
+inline void simdgroup_store(const simdgroup_matrix<T, 8, 8> &s, T *dst, ulong elements_per_row = 8,
+                            ulong2 origin = ulong2(0, 0), bool transpose = false) {
+    T *base = dst + origin.y * elements_per_row + origin.x;
+    // Each lane writes its own two elements only.
+    const uint e0 = emu::ctx.lane * 2;
+    for (uint e = e0; e < e0 + 2; ++e) {
+        const uint r = e / 8, c = e % 8;
+        if (transpose) {
+            base[c * elements_per_row + r] = s.m[r][c];
+        } else {
+            base[r * elements_per_row + c] = s.m[r][c];
+        }
+    }
+}
+
+template <typename T>
+inline void simdgroup_multiply_accumulate(simdgroup_matrix<T, 8, 8> &d, const simdgroup_matrix<T, 8, 8> &a,
+                                          const simdgroup_matrix<T, 8, 8> &b,
+                                          const simdgroup_matrix<T, 8, 8> &c) {
+    simdgroup_matrix<T, 8, 8> out;
+    for (int i = 0; i < 8; ++i)
+        for (int j = 0; j < 8; ++j) {
+            T acc = c.m[i][j];
+            for (int k = 0; k < 8; ++k) acc += a.m[i][k] * b.m[k][j];
+            out.m[i][j] = acc;
+        }
+    d = out;
+}
+
+template <typename T>
+inline void simdgroup_multiply(simdgroup_matrix<T, 8, 8> &d, const simdgroup_matrix<T, 8, 8> &a,
+                               const simdgroup_matrix<T, 8, 8> &b) {
+    simdgroup_multiply_accumulate(d, a, b, make_filled_simdgroup_matrix<T, 8, 8>(T(0)));
+}
+
+} // namespace metal
+
+using metal::bfloat;
+
+// Address-space and function qualifiers vanish; `[[attributes]]` are stripped
+// from kernel sources by the build (tools/msl_emu/build.sh) before this sees
+// them. Last in the file: `thread` would otherwise erase `std::thread` above.
+#define kernel
+#define device
+#define threadgroup
+#define constant const
+#define thread

@@ -6,6 +6,74 @@ All notable changes to `tessl` are recorded here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- **Qwen3.5 layer kernels (`tessl::qwen35`)**, the Metal replacement for the
+  pure-torch GDN fallback transformers runs on MPS. See `docs/qwen35.md`.
+  - Chunked gated delta rule as two dispatches: `qwen35_gdn_chunk_prep`
+    (parallel over chunks: l2norm, Qwen3.5's gates, both 64x64 products, and
+    the triangular solve in threadgroup memory) and `qwen35_gdn_chunk_scan`
+    (the sequential state pass, on `simdgroup_matrix` tiles).
+  - `qwen35_gdn_recurrent`, a token-by-token decode that reads a shared
+    snapshot state without writing it, so one prefix serves many questions.
+  - `qwen35_conv1d_silu` (prefill and decode, snapshot-capable),
+    `qwen35_gated_rms_norm_{f32,bf16}`, `qwen35_attn_qk_norm_rope` (zero-centred
+    norm, transformers' partial RoPE, K/V cache store),
+    `qwen35_attn_gate_{f32,bf16}`, and `qwen35_score_rows_{f32,bf16}` (final
+    norm + LM head for the answer tokens at the slot rows only).
+  - Fused-projection helpers: weight packing, column layouts that every kernel
+    reads in place, and `project_residual` (the residual add as a GEMM
+    epilogue).
+- **`tools/msl_emu`**, a CPU emulator that runs the kernel sources as C++ with
+  real threadgroup barriers and simdgroup collectives, and a driver that checks
+  them against transformers' own Qwen3.5 code.
+- Hardening pass over the Qwen3.5 kernels after an independent audit:
+  - **Numerics:** overflow-free sigmoid/SiLU. A `log1p`-accurate softplus (fast
+    `log(1+e)` was 1-60% off where `a + dt_bias` routinely lands). Scoring keeps
+    invalid answers out of the softmax and stores NaN as integer bits, which fast
+    math cannot fold away.
+  - **Scan and prep tiles:** the `const` diagonal matmul (a likely compile error)
+    is gone. Threadgroup strides are padded against bank conflicts, the per-row
+    decays are cached, and redundant tile loads are removed.
+  - **Kernel structure:** thread counts are named constants with `static_assert`s
+    on the lane mappings, and the conv runs with 256-thread groups.
+  - **Host fixes:** the in-place GDN state is now checked against the inputs too.
+    `score_answer_rows` rejects `rows == 0` / `vocab == 0`, which read out of
+    bounds before. `AttnTargets` derives the KV capacity from the caches instead
+    of taking one that could disagree with flash attention. Layouts get
+    validating constructors and `GdnProjLayout::dims`. `seq = 0` with a
+    `state_out` now copies the state through. Host arithmetic is checked
+    throughout.
+  - **Emulator:** threadgroup-order invariance, ASan/TSan builds with exactly
+    sized allocations, fast-math ulp noise, a host-contract check of binds and
+    constants, and a `kernel-emulator` CI job.
+- `tools/msl_emu/check_qwen35_model.py`: a whole random `Qwen3_5ForCausalLM`
+  through the kernels and tessl's own `flash_attn_rows` (emulated), against
+  the model's logits, for prefill, cached decode and a shared snapshot. The
+  Mac suite gains the same attention seam:
+  `attention_layer_through_flash_attn_rows`.
+- Scoring re-derives validity from the indices instead of storing flags. This
+  restores the full `MAX_ANSWERS = 4096` inside 32 KB of threadgroup memory,
+  and a unit test pins it. `attn_qk_norm_rope` accepts `batch = 0`. Softplus
+  uses `precise::exp`.
+- `qwen35_attn_qk_norm_rope_posbuf` / `attn_qk_norm_rope_posbuf`: the RoPE
+  position comes from a device buffer, so a decode loop replayed from an ICB,
+  which freezes scalar binds, advances correctly. Both variants form the
+  position in 64 bits before the capacity check. In 32 bits, an offset near
+  `u32::MAX` wrapped to slot 0 and passed the check.
+- `tools/msl_emu/dialect_lint.py` (in CI): every MSL construct the Qwen3.5
+  kernels use that no compiling tessl kernel uses must be on a reviewed list.
+- Emulator cases at Qwen3.5's real head counts and at T=4096.
+- `.github/workflows/metal-compile.yml`: Apple's Metal compiler on GitHub-hosted
+  macOS, never the self-hosted runner. It compiles the Qwen3.5 sources under
+  `-std=metal4.0 -Wall -Werror`, links them, checks every entry point is
+  exported, and builds everything with no `metal3.2` fallback. Its first run
+  found one unused constant; every other line compiled clean.
+- `tests/qwen35_kernels.rs` with transformers-generated goldens in
+  `tests/fixtures/qwen35/` (`scripts/gen_qwen35_fixtures.py`). The Qwen3.5
+  sources join the widened-index-arithmetic inspection in
+  `tests/shader_index_arithmetic.rs`.
+
 ## [0.2.0] — 2026-09-18
 
 Fail-closed encode / attention / quantized paths, Tensor metadata hygiene, and

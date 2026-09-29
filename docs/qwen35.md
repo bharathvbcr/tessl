@@ -173,6 +173,19 @@ reads as `q_pos_offset`. At B = 16 and P = 8k, the copy
 this avoids is 16 × 8k × 2 KV heads × 256 × 4 B = 268 MB per K or V per layer,
 or 3.2 GB across the 6 layers.
 
+**Questions of different lengths in one call.** `conv1d_silu_varlen`,
+`gdn_chunk_forward_varlen` and `gdn_recurrent_varlen` take `seq_lens`, a
+`[batch]` u32 device buffer. Row b is `min(seq_lens[b], seq)` tokens, with
+rows still `seq` apart (right-padded). Everything that measured the sequence
+by `seq` now uses the row's own length: the conv's output bound and the
+window its carried state is taken from, the prep's row masks and the chunks it
+runs, the scan's chunk count and masks, and the recurrence's step count. So
+each row, `state_out` included, is bit-identical to that row run alone at its
+length, and its rows past that length are not written. The workspace is still
+laid out for `seq`. The scan stops at the row's own chunk count, so it never
+reads a chunk the prep skipped for that row, which on a workspace reused
+across layers would hold an earlier call's data.
+
 State rules, all enforced on the host:
 
 - A snapshot is never a `state_out`: every row reads it.
@@ -319,6 +332,7 @@ transformers' own fp32 error, both measured against f64:
 | shared-prefix attention, 8 query / 2 KV heads of 256; P = 0, 1, 30 (no suffix), 65 | bit-identical to `flash_attn_rows` on a copied prefix; ≤ 5.0e-7 vs torch | — |
 | shared-prefix decode, P = 5, 128 (chunk edge), 120 with a chunk straddling the suffix | ≤ 3.4e-7 vs torch | — |
 | shared-prefix rows / decode with per-row lengths and query positions | each row bit-identical to it alone | — |
+| chunked GDN, recurrent GDN and conv with per-row `seq_lens` (0, 1, 63–65, T, > T) | each row, `state_out` included, bit-identical to it alone | — |
 
 † These are **not the 2B's** head counts. `Qwen/Qwen3.5-2B-Base`'s `config.json`
 has `linear_num_key_heads` 16 and `linear_num_value_heads` **16** (Hv/Hk = 1),

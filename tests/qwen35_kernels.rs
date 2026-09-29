@@ -340,6 +340,17 @@ fn run_gdn_with(
     path: Path,
     mode: StateOut,
 ) -> (Vec<f32>, Vec<f32>) {
+    run_gdn_lens(rt, d, path, mode, None)
+}
+
+/// [`run_gdn_with`], through the `_varlen` entry points when `lens` is given.
+fn run_gdn_lens(
+    rt: &Arc<GpuRuntime>,
+    d: &GdnData,
+    path: Path,
+    mode: StateOut,
+    lens: Option<&[u32]>,
+) -> (Vec<f32>, Vec<f32>) {
     let s = d.s;
     let dims = dims_of(s);
     let p = Packed::new(rt, d);
@@ -368,31 +379,45 @@ fn run_gdn_with(
         ld: out_ld as u32,
         off: out_off as u32,
     };
-    match path {
-        Path::Chunk => {
+    let lens_buf = lens.map(|l| buf_u32(rt, l));
+    let (qkv, gates, params) = (p.qkv(), p.gates(dims.v_heads), p.params());
+    match (path, &lens_buf) {
+        (Path::Chunk, _) => {
             let ws = GdnWorkspace::new(rt, &dims).unwrap();
-            qwen35::gdn_chunk_forward(
-                rt,
-                &dims,
-                &p.qkv(),
-                &p.gates(dims.v_heads),
-                &p.params(),
-                state,
-                &ws,
-                out_cols,
-                state_out,
-            )
+            if lens_buf.is_some() {
+                // A workspace is reused across layers, so a ragged call must
+                // not read what an earlier call left there. Fill it with live
+                // chunks first: a fresh one is zero, and zero chunks are inert.
+                let scratch = seeded(rt, s.b * s.t * width, 0.0);
+                qwen35::gdn_chunk_forward(
+                    rt,
+                    &dims,
+                    &qkv,
+                    &gates,
+                    &params,
+                    StateIn::Zero,
+                    &ws,
+                    Cols::dense(&scratch, width as u32),
+                    None,
+                )
+                .unwrap();
+            }
+            match &lens_buf {
+                None => qwen35::gdn_chunk_forward(
+                    rt, &dims, &qkv, &gates, &params, state, &ws, out_cols, state_out,
+                ),
+                Some(l) => qwen35::gdn_chunk_forward_varlen(
+                    rt, &dims, &qkv, &gates, &params, state, &ws, out_cols, state_out, l,
+                ),
+            }
             .unwrap();
         }
-        Path::Recurrent => qwen35::gdn_recurrent(
-            rt,
-            &dims,
-            &p.qkv(),
-            &p.gates(dims.v_heads),
-            &p.params(),
-            state,
-            out_cols,
-            state_out,
+        (Path::Recurrent, None) => {
+            qwen35::gdn_recurrent(rt, &dims, &qkv, &gates, &params, state, out_cols, state_out)
+                .unwrap()
+        }
+        (Path::Recurrent, Some(l)) => qwen35::gdn_recurrent_varlen(
+            rt, &dims, &qkv, &gates, &params, state, out_cols, state_out, l,
         )
         .unwrap(),
     }
@@ -649,6 +674,192 @@ fn slice_time(d: &GdnData, t0: usize, t1: usize) -> GdnData {
         state0: None,
         snapshot: false,
     }
+}
+
+/// Row `bi` of `d`, cut to its first `len` tokens, as a batch of one; its own
+/// start state, or the shared snapshot.
+fn row_of(d: &GdnData, bi: usize, len: usize) -> GdnData {
+    let GdnShape { t, hk, hv, dv, .. } = d.s;
+    let take = |v: &[f32], w: usize| v[bi * t * w..(bi * t + len) * w].to_vec();
+    let per_state = hv * DK * dv;
+    GdnData {
+        s: GdnShape {
+            b: 1,
+            t: len,
+            hk,
+            hv,
+            dv,
+        },
+        q: take(&d.q, hk * DK),
+        k: take(&d.k, hk * DK),
+        v: take(&d.v, hv * dv),
+        a: take(&d.a, hv),
+        b: take(&d.b, hv),
+        a_log: d.a_log.clone(),
+        dt_bias: d.dt_bias.clone(),
+        state0: d.state0.as_ref().map(|s0| {
+            if d.snapshot {
+                s0.clone()
+            } else {
+                s0[bi * per_state..(bi + 1) * per_state].to_vec()
+            }
+        }),
+        snapshot: d.snapshot,
+    }
+}
+
+/// A ragged GDN batch through the `_varlen` path against each row alone at
+/// its own length through the equal-length path: outputs, final state, and
+/// the rows past each length left unwritten, all bit for bit.
+fn gdn_varlen_case(rt: &Arc<GpuRuntime>, d: &GdnData, path: Path, lens: &[u32]) {
+    let GdnShape { t, hv, dv, .. } = d.s;
+    let width = hv * dv;
+    let per_state = hv * DK * dv;
+    let (y, st) = run_gdn_lens(rt, d, path, StateOut::Separate, Some(lens));
+    for (bi, &len) in lens.iter().enumerate() {
+        let live = (len as usize).min(t);
+        let (y1, st1) = run_gdn(rt, &row_of(d, bi, live), path);
+        let label = format!("{path:?} row {bi} (len {len} of {t})");
+        let mine = &y[bi * t * width..(bi + 1) * t * width];
+        for (i, (a, w)) in mine[..live * width].iter().zip(&y1).enumerate() {
+            assert_eq!(a.to_bits(), w.to_bits(), "{label} y[{i}]: {a} vs {w} alone");
+        }
+        assert!(
+            mine[live * width..].iter().all(|&x| x == SENTINEL),
+            "{label}: wrote a row past its length"
+        );
+        let s_mine = &st[bi * per_state..(bi + 1) * per_state];
+        assert!(
+            s_mine
+                .iter()
+                .zip(&st1)
+                .all(|(a, w)| a.to_bits() == w.to_bits()),
+            "{label}: final state differs from the row alone"
+        );
+    }
+}
+
+#[test]
+fn gdn_varlen_rows_equal_each_row_alone_bit_for_bit() {
+    // Ragged continuations in one call, on both GDN paths, from per-row start
+    // states and from one shared snapshot. Lengths either side of the 64-row
+    // chunk, 0 (the state passes through), the full T, and one past it
+    // (clamped).
+    with_gpu(|rt| {
+        let shape = GdnShape {
+            b: 7,
+            t: 130,
+            hk: 1,
+            hv: 2,
+            dv: 32,
+        };
+        let lens = [0u32, 1, 63, 64, 65, 130, 200];
+        for (i, state) in ["batch", "snapshot", "zero"].iter().enumerate() {
+            let d = GdnData::random(shape, state, 8200 + 10 * i as u64);
+            gdn_varlen_case(rt, &d, Path::Chunk, &lens);
+        }
+        let short = GdnShape {
+            b: 5,
+            t: 9,
+            hk: 1,
+            hv: 2,
+            dv: 64,
+        };
+        let lens = [0u32, 1, 5, 9, 12];
+        for (i, state) in ["batch", "snapshot"].iter().enumerate() {
+            let d = GdnData::random(short, state, 8250 + 10 * i as u64);
+            gdn_varlen_case(rt, &d, Path::Recurrent, &lens);
+        }
+    });
+}
+
+#[test]
+fn conv1d_varlen_rows_equal_each_row_alone_bit_for_bit() {
+    // The conv's ragged form: each row's outputs and its carried state (the
+    // last KW - 1 inputs before its own length, reaching back into the input
+    // state when the row is shorter than that) equal the row run alone.
+    with_gpu(|rt| {
+        let (t, c, kw) = (20usize, 70usize, 4usize);
+        let hist = kw - 1;
+        let lens = [0u32, 1, 2, 3, 4, 19, 20, 25];
+        let b = lens.len();
+        let x = random_f32(b * t * c, 8300);
+        let w = random_f32(c * kw, 8301);
+        let (xb, wb) = (buf(rt, &x), buf(rt, &w));
+        for snapshot in [false, true] {
+            let st0 = random_f32(if snapshot { c * hist } else { b * c * hist }, 8302);
+            let sb = buf(rt, &st0);
+            let state = if snapshot {
+                StateIn::Snapshot(&sb)
+            } else {
+                StateIn::PerBatch(&sb)
+            };
+            let y = seeded(rt, b * t * c, SENTINEL);
+            let so = seeded(rt, b * c * hist, SENTINEL);
+            let lb = buf_u32(rt, &lens);
+            qwen35::conv1d_silu_varlen(
+                rt,
+                Cols::dense(&xb, c as u32),
+                &wb,
+                kw as u32,
+                state,
+                &y,
+                Some(&so),
+                b as u32,
+                t as u32,
+                c as u32,
+                &lb,
+            )
+            .unwrap();
+            rt.synchronize().unwrap();
+            let (yh, soh) = (y.read_f32(), so.read_f32());
+            for (bi, &len) in lens.iter().enumerate() {
+                let live = (len as usize).min(t);
+                let x1 = buf(rt, &x[bi * t * c..(bi * t + live) * c]);
+                let s1 = buf(
+                    rt,
+                    if snapshot {
+                        &st0[..]
+                    } else {
+                        &st0[bi * c * hist..(bi + 1) * c * hist]
+                    },
+                );
+                let y1 = seeded(rt, live * c, SENTINEL);
+                let so1 = seeded(rt, c * hist, SENTINEL);
+                qwen35::conv1d_silu(
+                    rt,
+                    Cols::dense(&x1, c as u32),
+                    &wb,
+                    kw as u32,
+                    StateIn::PerBatch(&s1),
+                    &y1,
+                    Some(&so1),
+                    1,
+                    live as u32,
+                    c as u32,
+                )
+                .unwrap();
+                rt.synchronize().unwrap();
+                let label = format!("conv row {bi} (len {len}, snapshot {snapshot})");
+                let mine = &yh[bi * t * c..(bi + 1) * t * c];
+                let alone = y1.read_f32();
+                for (i, (a, w)) in mine[..live * c].iter().zip(&alone).enumerate() {
+                    assert_eq!(a.to_bits(), w.to_bits(), "{label} y[{i}]");
+                }
+                assert!(
+                    mine[live * c..].iter().all(|&v| v == SENTINEL),
+                    "{label}: wrote past its length"
+                );
+                let sm = &soh[bi * c * hist..(bi + 1) * c * hist];
+                assert!(
+                    sm.iter()
+                        .zip(&so1.read_f32())
+                        .all(|(a, w)| a.to_bits() == w.to_bits()),
+                    "{label}: state differs from the row alone"
+                );
+            }
+        }
+    });
 }
 
 #[test]

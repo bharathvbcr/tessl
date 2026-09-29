@@ -171,6 +171,10 @@ inline float conv_ext(
 /// When `flags & 2` the last `KW - 1` inputs of each sequence are written to
 /// `state_out` (`[B, C, KW-1]`), so a later call can continue from them.
 ///
+/// **Ragged rows.** With `flags & 4`, row b is `min(seq_lens[b], T)` tokens
+/// long (rows stay `T` apart): outputs past it are not written, and the state
+/// is the last `KW - 1` inputs before it, exactly as a call with that `T`.
+///
 /// Grid: x = channel, y = `T + KW - 1` (the first T are outputs, the rest are
 /// state slots), z = batch.
 kernel void qwen35_conv1d_silu(
@@ -187,6 +191,7 @@ kernel void qwen35_conv1d_silu(
     constant uint &x_off [[buffer(10)]],
     constant uint &state_bstride [[buffer(11)]],
     constant uint &flags [[buffer(12)]],
+    device const uint *seq_lens [[buffer(13)]],
     uint3 gid [[thread_position_in_grid]])
 {
     const uint c = gid.x;
@@ -194,12 +199,15 @@ kernel void qwen35_conv1d_silu(
     const uint b = gid.z;
     const uint hist = KW - 1u;
     if (c >= C || e >= T + hist || b >= B) return;
+    // Row b's live length; the row stride stays T.
+    const uint Tb = (flags & 4u) != 0u ? min(seq_lens[b], T) : T;
 
     const bool has_state = (flags & 1u) != 0u;
     device const float *st = state_in + (ulong)b * state_bstride + (ulong)c * hist;
     device const float *xc = x + (ulong)b * T * (ulong)ld_x + x_off + c;
 
     if (e < T) {
+        if (e >= Tb) return;
         float acc = 0.0f;
         for (uint j = 0u; j < KW; ++j) {
             acc += w[(ulong)c * KW + j] * conv_ext(xc, st, ld_x, hist, has_state, e + j);
@@ -207,7 +215,7 @@ kernel void qwen35_conv1d_silu(
         y[((ulong)b * T + e) * (ulong)C + c] = gdn_silu(acc);
     } else if ((flags & 2u) != 0u) {
         const uint j = e - T;
-        state_out[((ulong)b * C + c) * hist + j] = conv_ext(xc, st, ld_x, hist, has_state, T + j);
+        state_out[((ulong)b * C + c) * hist + j] = conv_ext(xc, st, ld_x, hist, has_state, Tb + j);
     }
 }
 
@@ -257,6 +265,8 @@ kernel void qwen35_gdn_chunk_prep(
     constant uint &ld_ab [[buffer(16)]],
     constant uint &a_off [[buffer(17)]],
     constant uint &b_off [[buffer(18)]],
+    device const uint *seq_lens [[buffer(19)]],
+    constant uint &use_lens [[buffer(20)]],
     threadgroup float *tgm [[threadgroup(0)]],
     uint3 tg [[threadgroup_position_in_grid]],
     uint lid [[thread_index_in_threadgroup]],
@@ -266,7 +276,12 @@ kernel void qwen35_gdn_chunk_prep(
     const uint chunk = tg.x;
     const uint hv = tg.y;
     const uint b = tg.z;
+    // The workspace is laid out for T; row b is live for Tb tokens (ragged
+    // rows, `use_lens`), and its chunks past that are never scanned.
     const uint nc = (T + GDN_C - 1u) / GDN_C;
+    const uint Tb = use_lens != 0u ? min(seq_lens[b], T) : T;
+    // Uniform per threadgroup, before any barrier.
+    if (chunk * GDN_C >= Tb) return;
     const ulong tp = (ulong)nc * GDN_C;
     const uint hk = hv / max(Hv / Hk, 1u);
     const uint t0 = chunk * GDN_C;
@@ -286,7 +301,7 @@ kernel void qwen35_gdn_chunk_prep(
         // 32 lanes on both sides of this branch.
         float ssq = 0.0f;
         float ssk = 0.0f;
-        if (t < T) {
+        if (t < Tb) {
             device const float *row = qkv + ((ulong)b * T + t) * (ulong)ld_qkv;
             for (uint d = lane; d < GDN_DK; d += 32u) {
                 const float qv = row[q_off + hk * GDN_DK + d];
@@ -298,7 +313,7 @@ kernel void qwen35_gdn_chunk_prep(
         ssq = simd_sum(ssq);
         ssk = simd_sum(ssk);
         if (lane == 0u) {
-            if (t < T) {
+            if (t < Tb) {
                 device const float *gr = ab + ((ulong)b * T + t) * (ulong)ld_ab;
                 rq[i] = rsqrt(ssq + GDN_L2_EPS) * q_scale;
                 rk[i] = rsqrt(ssk + GDN_L2_EPS);
@@ -335,7 +350,7 @@ kernel void qwen35_gdn_chunk_prep(
         const uint t = t0 + i;
         float kv = 0.0f;
         float qv = 0.0f;
-        if (t < T) {
+        if (t < Tb) {
             device const float *row = qkv + ((ulong)b * T + t) * (ulong)ld_qkv;
             kv = row[k_off + hk * GDN_DK + d] * rk[i];
             qv = row[q_off + hk * GDN_DK + d] * rq[i];
@@ -507,6 +522,7 @@ kernel void qwen35_gdn_chunk_scan(
     constant uint &out_off [[buffer(16)]],
     constant uint &state_bstride [[buffer(17)]],
     constant uint &flags [[buffer(18)]],
+    device const uint *seq_lens [[buffer(19)]],
     threadgroup float *tgm [[threadgroup(0)]],
     uint3 tg [[threadgroup_position_in_grid]],
     uint lid [[thread_index_in_threadgroup]],
@@ -516,7 +532,11 @@ kernel void qwen35_gdn_chunk_scan(
     const uint vs = tg.x;
     const uint hv = tg.y;
     const uint b = tg.z;
+    // `nc` lays out the workspace; row b scans only its own `nc_b` chunks
+    // (`flags & 4`: ragged rows, Tb = min(seq_lens[b], T)).
     const uint nc = (T + GDN_C - 1u) / GDN_C;
+    const uint Tb = (flags & 4u) != 0u ? min(seq_lens[b], T) : T;
+    const uint nc_b = (Tb + GDN_C - 1u) / GDN_C;
     const ulong tp = (ulong)nc * GDN_C;
     const ulong head = (ulong)b * Hv + hv;
     const uint v0 = vs * GDN_BV;
@@ -540,7 +560,7 @@ kernel void qwen35_gdn_chunk_scan(
             : 0.0f;
     }
 
-    for (uint chunk = 0u; chunk < nc; ++chunk) {
+    for (uint chunk = 0u; chunk < nc_b; ++chunk) {
         const uint t0 = chunk * GDN_C;
         const ulong row_base = head * tp + t0;
         device const float *wk = ws_k + row_base * GDN_DK;
@@ -598,7 +618,7 @@ kernel void qwen35_gdn_chunk_scan(
             const uint i = idx / GDN_BV;
             const uint v = idx % GDN_BV;
             const uint t = t0 + i;
-            const float vv = t < T
+            const float vv = t < Tb
                 ? qkv[((ulong)b * T + t) * (ulong)ld_qkv + v_off + (ulong)hv * Dv + v0 + v]
                 : 0.0f;
             X[i * GDN_TLD + v] = Bc[i] * (vv - Ec[i] * X[i * GDN_TLD + v]);
@@ -671,7 +691,7 @@ kernel void qwen35_gdn_chunk_scan(
                 for (uint e = lane; e < 64u; e += 32u) {
                     const uint i = rt * 8u + e / 8u;
                     const uint t = t0 + i;
-                    if (t < T) {
+                    if (t < Tb) {
                         out[((ulong)b * T + t) * (ulong)ld_out + out_off + (ulong)hv * Dv
                             + v0 + ct * 8u + e % 8u] = Ec[i] * st1[e] + st2[e];
                     }
@@ -749,7 +769,8 @@ static_assert(GDN_REC_TG_FLOATS * 4u <= 32768u, "recurrent threadgroup memory ex
 /// perturbing it. When `flags & 2` the state after the last token of each row
 /// goes to `state_out` ([B, Hv, DK, Dv]); a thread reads and writes the same
 /// state elements, so in-place (`state_out == state_in`, stride Hv*DK*Dv) is
-/// also safe. Without `flags & 1` the start state is zero.
+/// also safe. Without `flags & 1` the start state is zero. With `flags & 4`
+/// row b runs `min(seq_lens[b], T)` steps and its later rows are not written.
 ///
 /// Mapping: lane = value column `v0 + lane`, simdgroup = 32 key rows. Each lane
 /// keeps its 32 x 1 piece of S in registers for all T steps; the two per-token
@@ -779,6 +800,7 @@ kernel void qwen35_gdn_recurrent(
     constant uint &out_off [[buffer(19)]],
     constant uint &state_bstride [[buffer(20)]],
     constant uint &flags [[buffer(21)]],
+    device const uint *seq_lens [[buffer(22)]],
     threadgroup float *tgm [[threadgroup(0)]],
     uint3 tg [[threadgroup_position_in_grid]],
     uint sg [[simdgroup_index_in_threadgroup]],
@@ -802,7 +824,9 @@ kernel void qwen35_gdn_recurrent(
             : 0.0f;
     }
 
-    for (uint t = 0u; t < T; ++t) {
+    // Row b's live length (`flags & 4`: ragged rows); the row stride stays T.
+    const uint Tb = (flags & 4u) != 0u ? min(seq_lens[b], T) : T;
+    for (uint t = 0u; t < Tb; ++t) {
         const ulong row = (ulong)b * T + t;
         device const float *qp = qkv + row * (ulong)ld_qkv + q_off + hk * GDN_DK;
         device const float *kp = qkv + row * (ulong)ld_qkv + k_off + hk * GDN_DK;

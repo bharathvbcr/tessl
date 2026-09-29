@@ -39,6 +39,11 @@ All notable changes to `tessl` are recorded here. The format follows
   `attn_qk_norm_rope_suffix_rows`. Each row is bit-identical to that row
   alone. The shared-prefix kernels gained a `row_stride` slot, and both
   `qwen35_attn_qk_norm_rope` kernels gained `pos_stride` (buffer 21).
+- **Ragged rows for the stateful layers:** `conv1d_silu_varlen`,
+  `gdn_chunk_forward_varlen` and `gdn_recurrent_varlen` take per-row
+  `seq_lens`, so the questions in a batch can have different lengths. Each
+  row, final state included, is bit-identical to that row run alone. The
+  kernels gained a `seq_lens` slot (flag bit 4; `use_lens` in the prep).
 - **`qwen35_embed_rows_bf16` (`qwen35::embed_rows`)**, the embedding gather
   from the bf16 vocabulary table on the device. It is exact, and a bad id
   gives a NaN row. A forward no longer needs a host gather and a

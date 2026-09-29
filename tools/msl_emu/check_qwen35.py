@@ -582,6 +582,75 @@ def case_prefix_varlen(seed, decode):
         FAILURES.append(tag)
 
 
+def case_gdn_varlen(kname, seed, T, lens, Dv=32):
+    """Ragged rows (flags & 4, per-row seq_lens) on a GDN path: each row's
+    outputs and final state bit-identical to that row run alone at its own
+    length, and its rows past that length never written."""
+    g = seeded(seed)
+    B, Hk, Hv, DK = len(lens), 1, 2, 128
+    key_w, val_w = Hk * DK, Hv * Dv
+    ld_qkv = 2 * key_w + val_w
+    qkv = torch.randn(B, T, ld_qkv, generator=g)
+    ab = torch.randn(B, T, 2 * Hv, generator=g) * 2
+    a_log = torch.rand(Hv, generator=g) * 1.5 - 0.5
+    dt_bias = torch.randn(Hv, generator=g)
+    st = torch.randn(B, Hv, DK, Dv, generator=g) * 0.1
+    per_state = Hv * DK * Dv
+
+    def params(b, t, extra):
+        return dict(B=b, T=t, Hk=Hk, Hv=Hv, Dv=Dv, ld_qkv=ld_qkv, q_off=0, k_off=key_w, v_off=2 * key_w,
+                    ld_ab=2 * Hv, a_off=0, b_off=Hv, ld_out=val_w, out_off=0, state_bstride=per_state, **extra)
+
+    outs = lambda b, t: {"out": ("f32", b * t * val_w), "state_out": ("f32", b * per_state)}
+    got = run(kname, params(B, T, dict(flags=1 | 2 | 4)),
+              {"qkv": qkv, "ab": ab, "a_log": a_log, "dt_bias": dt_bias, "state_in": st,
+               "seq_lens": torch.tensor(lens, dtype=torch.int32)}, outs(B, T))
+    y, so = got["out"].reshape(B, T, val_w), got["state_out"].reshape(B, per_state)
+    ok = True
+    for b, n in enumerate(lens):
+        live = min(n, T)
+        one = run(kname, params(1, live, dict(flags=1 | 2)),
+                  {"qkv": qkv[b, :live], "ab": ab[b, :live], "a_log": a_log, "dt_bias": dt_bias,
+                   "state_in": st[b]}, outs(1, live))
+        ok &= torch.equal(y[b, :live].reshape(-1).view(torch.int32), one["out"].view(torch.int32))
+        ok &= bool(torch.isnan(y[b, live:]).all())
+        ok &= torch.equal(so[b].view(torch.int32), one["state_out"].view(torch.int32))
+    tag = f"{kname} varlen T{T} lens {lens}: each row bit-identical to it alone"
+    print(f"  [{'ok  ' if ok else 'FAIL'}] {tag}")
+    if not ok:
+        FAILURES.append(tag)
+
+
+def case_conv_varlen(seed):
+    """The conv's ragged form: outputs and carried state per row equal the row
+    run alone, including rows shorter than the kernel's history."""
+    g = seeded(seed)
+    T, Ch, KW = 12, 40, 4
+    lens = [0, 1, 2, 3, 7, 12, 15]
+    B, hist = len(lens), KW - 1
+    x = torch.randn(B, T, Ch, generator=g)
+    w = torch.randn(Ch, KW, generator=g)
+    st = torch.randn(B, Ch, hist, generator=g)
+    base = lambda b, t, flags: dict(B=b, T=t, C=Ch, KW=KW, ld_x=Ch, x_off=0, state_bstride=Ch * hist,
+                                    flags=flags)
+    got = run("qwen35_conv1d_silu", base(B, T, 1 | 2 | 4),
+              {"x": x, "w": w, "state_in": st, "seq_lens": torch.tensor(lens, dtype=torch.int32)},
+              {"y": ("f32", B * T * Ch), "state_out": ("f32", B * Ch * hist)})
+    y, so = got["y"].reshape(B, T, Ch), got["state_out"].reshape(B, Ch * hist)
+    ok = True
+    for b, n in enumerate(lens):
+        live = min(n, T)
+        one = run("qwen35_conv1d_silu", base(1, live, 1 | 2),
+                  {"x": x[b, :live], "w": w, "state_in": st[b]},
+                  {"y": ("f32", live * Ch), "state_out": ("f32", Ch * hist)})
+        ok &= torch.equal(y[b, :live].reshape(-1).view(torch.int32), one["y"].view(torch.int32))
+        ok &= bool(torch.isnan(y[b, live:]).all())
+        ok &= torch.equal(so[b].view(torch.int32), one["state_out"].view(torch.int32))
+    print(f"  [{'ok  ' if ok else 'FAIL'}] conv1d_silu varlen: each row bit-identical to it alone")
+    if not ok:
+        FAILURES.append("conv1d_silu varlen")
+
+
 def case_qk_rope_slot_base(seed):
     """`slot_base` moves only the cache slot: a suffix cached relative to a
     prefix of P holds, bit for bit, what a cache from position 0 holds at P.."""
@@ -857,6 +926,9 @@ CASES = [
     # straddles the prefix/suffix boundary.
     ("prefix_decode", lambda: [case_prefix_decode(40 + i, *c) for i, c in enumerate(
         [(2, 5, 2, 3, 6), (2, 128, 1, 2, 128), (3, 120, 20, 24, 139)])]),
+    ("gdn_varlen", lambda: [case_gdn_varlen("qwen35_gdn_chunk", 70, 130, [0, 1, 63, 64, 65, 130, 150]),
+                            case_gdn_varlen("qwen35_gdn_recurrent", 71, 7, [0, 1, 4, 7, 9])]),
+    ("conv_varlen", lambda: case_conv_varlen(72)),
     ("prefix_varlen", lambda: [case_prefix_varlen(60, False), case_prefix_varlen(61, True)]),
     ("prefix_rows", lambda: [case_prefix_rows(32 + i, *c) for i, c in enumerate(
         [(2, 0, 3, 4, 3, 0), (3, 1, 2, 2, 2, 1), (2, 65, 66, 66, 66, 65), (2, 30, 0, 1, 2, 28)])]),

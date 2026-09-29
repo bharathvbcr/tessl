@@ -518,6 +518,71 @@ pub fn conv1d_silu(
     seq: u32,
     channels: u32,
 ) -> Result<(), String> {
+    conv1d_silu_impl(
+        rt,
+        x,
+        weight,
+        kernel_width,
+        state,
+        y,
+        state_out,
+        batch,
+        seq,
+        channels,
+        None,
+    )
+}
+
+/// [`conv1d_silu`] with a length per row.
+///
+/// For ragged batches: `seq_lens` holds `batch` u32s on the device, row b
+/// being `min(seq_lens[b], seq)` tokens long (rows stay `seq` apart, so
+/// right-pad each row to `seq`). Each row is exactly what the equal-length
+/// call computes for it alone at that length, `state_out` included; outputs
+/// past a row's length are not written.
+#[allow(clippy::too_many_arguments)]
+pub fn conv1d_silu_varlen(
+    rt: &Arc<GpuRuntime>,
+    x: Cols<'_>,
+    weight: &GpuBuffer,
+    kernel_width: u32,
+    state: StateIn<'_>,
+    y: &GpuBuffer,
+    state_out: Option<&GpuBuffer>,
+    batch: u32,
+    seq: u32,
+    channels: u32,
+    seq_lens: &GpuBuffer,
+) -> Result<(), String> {
+    conv1d_silu_impl(
+        rt,
+        x,
+        weight,
+        kernel_width,
+        state,
+        y,
+        state_out,
+        batch,
+        seq,
+        channels,
+        Some(seq_lens),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn conv1d_silu_impl(
+    rt: &Arc<GpuRuntime>,
+    x: Cols<'_>,
+    weight: &GpuBuffer,
+    kernel_width: u32,
+    state: StateIn<'_>,
+    y: &GpuBuffer,
+    state_out: Option<&GpuBuffer>,
+    batch: u32,
+    seq: u32,
+    channels: u32,
+    seq_lens: Option<&GpuBuffer>,
+) -> Result<(), String> {
     const WHAT: &str = "qwen35::conv1d_silu";
     if !(2..=8).contains(&kernel_width) {
         return Err(format!(
@@ -552,6 +617,9 @@ pub fn conv1d_silu(
     if let Some(s) = state_out {
         require::<f32>(rt, s, state_elems, "conv1d_silu state_out")?;
     }
+    if let Some(l) = seq_lens {
+        require::<u32>(rt, l, batch as usize, "conv1d_silu seq_lens")?;
+    }
     // seq == 0 with a state_out still runs: the kernel copies the input state
     // through, so a caller swapping state buffers each step never reads a
     // stale one after an empty step.
@@ -568,9 +636,13 @@ pub fn conv1d_silu(
     if let Some(s) = state.buffer() {
         reads.push(("state_in", s));
     }
+    if let Some(l) = seq_lens {
+        reads.push(("seq_lens", l));
+    }
     require_disjoint_writes(WHAT, &writes, &reads)?;
 
-    let flags = in_flag | if state_out.is_some() { 2 } else { 0 };
+    let flags =
+        in_flag | if state_out.is_some() { 2 } else { 0 } | if seq_lens.is_some() { 4 } else { 0 };
     let p = pipeline_for(rt, "qwen35_conv1d_silu", CONV_THREADS, 0)?;
     dispatch_groups(
         rt,
@@ -597,6 +669,8 @@ pub fn conv1d_silu(
             set_u32(bnd, x.off, 10);
             set_u32(bnd, bstride, 11);
             set_u32(bnd, flags, 12);
+            // Unread without flag 4.
+            set_gpu_buf(bnd, seq_lens.unwrap_or(weight), 13);
         },
     )
 }
@@ -778,6 +852,7 @@ fn validate_gdn(
     out: Cols<'_>,
     state_out: Option<&GpuBuffer>,
     extra_writes: &[(&'static str, &GpuBuffer)],
+    seq_lens: Option<&GpuBuffer>,
 ) -> Result<(u32, u32), String> {
     dims.validate(what)?;
     let rows = u64::from(dims.batch) * u64::from(dims.seq);
@@ -861,8 +936,14 @@ fn validate_gdn(
     if let (Some(s), false) = (state.buffer(), in_place) {
         reads.push(("state_in", s));
     }
+    if let Some(l) = seq_lens {
+        require::<u32>(rt, l, dims.batch as usize, "gdn seq_lens")?;
+        reads.push(("seq_lens", l));
+    }
     require_disjoint_writes(what, &writes, &reads)?;
-    Ok((in_flag | if state_out.is_some() { 2 } else { 0 }, bstride))
+    let flags =
+        in_flag | if state_out.is_some() { 2 } else { 0 } | if seq_lens.is_some() { 4 } else { 0 };
+    Ok((flags, bstride))
 }
 
 /// The gated delta rule over a whole sequence, chunked: transformers'
@@ -889,6 +970,58 @@ pub fn gdn_chunk_forward(
     out: Cols<'_>,
     state_out: Option<&GpuBuffer>,
 ) -> Result<(), String> {
+    gdn_chunk_forward_impl(
+        rt, dims, qkv, gates, params, state, ws, out, state_out, None,
+    )
+}
+
+/// [`gdn_chunk_forward`] with a length per row.
+///
+/// For ragged batches: `seq_lens` holds `batch` u32s on the device, row b
+/// being `min(seq_lens[b], seq)` tokens long (rows stay `seq` apart, so
+/// right-pad each row to `seq`). Each row is exactly what the equal-length
+/// call computes for it alone at that length, `state_out` included; outputs
+/// past a row's length are not written.
+#[allow(clippy::too_many_arguments)]
+pub fn gdn_chunk_forward_varlen(
+    rt: &Arc<GpuRuntime>,
+    dims: &GdnDims,
+    qkv: &GdnQkv<'_>,
+    gates: &GdnGateLogits<'_>,
+    params: &GdnParams<'_>,
+    state: StateIn<'_>,
+    ws: &GdnWorkspace,
+    out: Cols<'_>,
+    state_out: Option<&GpuBuffer>,
+    seq_lens: &GpuBuffer,
+) -> Result<(), String> {
+    gdn_chunk_forward_impl(
+        rt,
+        dims,
+        qkv,
+        gates,
+        params,
+        state,
+        ws,
+        out,
+        state_out,
+        Some(seq_lens),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn gdn_chunk_forward_impl(
+    rt: &Arc<GpuRuntime>,
+    dims: &GdnDims,
+    qkv: &GdnQkv<'_>,
+    gates: &GdnGateLogits<'_>,
+    params: &GdnParams<'_>,
+    state: StateIn<'_>,
+    ws: &GdnWorkspace,
+    out: Cols<'_>,
+    state_out: Option<&GpuBuffer>,
+    seq_lens: Option<&GpuBuffer>,
+) -> Result<(), String> {
     const WHAT: &str = "qwen35::gdn_chunk_forward";
     dims.validate(WHAT)?;
     ws.check(rt, dims)?;
@@ -903,6 +1036,7 @@ pub fn gdn_chunk_forward(
         out,
         state_out,
         &ws.buffers(),
+        seq_lens,
     )?;
     // seq == 0 with a state_out still dispatches: it copies the start state
     // through, so a caller alternating state buffers never reads a stale one.
@@ -942,6 +1076,9 @@ pub fn gdn_chunk_forward(
             set_u32(bnd, gates.ld, 16);
             set_u32(bnd, gates.a_off, 17);
             set_u32(bnd, gates.b_off, 18);
+            // Unread when use_lens is 0.
+            set_gpu_buf(bnd, seq_lens.unwrap_or(qkv.buf), 19);
+            set_u32(bnd, u32::from(seq_lens.is_some()), 20);
         },
     )?;
     // The binder orders this after the prep dispatch (a Dispatch->Dispatch
@@ -976,6 +1113,7 @@ pub fn gdn_chunk_forward(
             set_u32(bnd, out.off, 16);
             set_u32(bnd, bstride, 17);
             set_u32(bnd, flags, 18);
+            set_gpu_buf(bnd, seq_lens.unwrap_or(qkv.buf), 19);
         },
     )
 }
@@ -999,6 +1137,53 @@ pub fn gdn_recurrent(
     out: Cols<'_>,
     state_out: Option<&GpuBuffer>,
 ) -> Result<(), String> {
+    gdn_recurrent_impl(rt, dims, qkv, gates, params, state, out, state_out, None)
+}
+
+/// [`gdn_recurrent`] with a length per row.
+///
+/// For ragged batches: `seq_lens` holds `batch` u32s on the device, row b
+/// being `min(seq_lens[b], seq)` tokens long (rows stay `seq` apart, so
+/// right-pad each row to `seq`). Each row is exactly what the equal-length
+/// call computes for it alone at that length, `state_out` included; outputs
+/// past a row's length are not written.
+#[allow(clippy::too_many_arguments)]
+pub fn gdn_recurrent_varlen(
+    rt: &Arc<GpuRuntime>,
+    dims: &GdnDims,
+    qkv: &GdnQkv<'_>,
+    gates: &GdnGateLogits<'_>,
+    params: &GdnParams<'_>,
+    state: StateIn<'_>,
+    out: Cols<'_>,
+    state_out: Option<&GpuBuffer>,
+    seq_lens: &GpuBuffer,
+) -> Result<(), String> {
+    gdn_recurrent_impl(
+        rt,
+        dims,
+        qkv,
+        gates,
+        params,
+        state,
+        out,
+        state_out,
+        Some(seq_lens),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn gdn_recurrent_impl(
+    rt: &Arc<GpuRuntime>,
+    dims: &GdnDims,
+    qkv: &GdnQkv<'_>,
+    gates: &GdnGateLogits<'_>,
+    params: &GdnParams<'_>,
+    state: StateIn<'_>,
+    out: Cols<'_>,
+    state_out: Option<&GpuBuffer>,
+    seq_lens: Option<&GpuBuffer>,
+) -> Result<(), String> {
     const WHAT: &str = "qwen35::gdn_recurrent";
     let (flags, bstride) = validate_gdn(
         rt,
@@ -1011,6 +1196,7 @@ pub fn gdn_recurrent(
         out,
         state_out,
         &[],
+        seq_lens,
     )?;
     // seq == 0 with a state_out still dispatches: it copies the start state
     // through, so a caller alternating state buffers never reads a stale one.
@@ -1051,6 +1237,7 @@ pub fn gdn_recurrent(
             set_u32(bnd, out.off, 19);
             set_u32(bnd, bstride, 20);
             set_u32(bnd, flags, 21);
+            set_gpu_buf(bnd, seq_lens.unwrap_or(qkv.buf), 22);
         },
     )
 }

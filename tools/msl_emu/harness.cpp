@@ -120,8 +120,10 @@ int main(int argc, char **argv) {
         const uint B = P("B"), T = P("T"), C = P("C"), KW = P("KW"), ld_x = P("ld_x"), x_off = P("x_off"),
                    sb = P("state_bstride"), flags = P("flags");
         float *x = F("x"), *w = F("w"), *si = Fopt("state_in"), *y = F("y"), *so = Fopt("state_out");
+        // Read only under flags & 4 (ragged rows), as the host binds it.
+        uint *lens = reinterpret_cast<uint *>(Fopt("seq_lens"));
         launch(uint3(cdiv(C, 256), T + KW - 1, B), uint3(256, 1, 1), 0, [&](const Ids &id, float *) {
-            qwen35_conv1d_silu(x, w, si, y, so, B, T, C, KW, ld_x, x_off, sb, flags, id.gid);
+            qwen35_conv1d_silu(x, w, si, y, so, B, T, C, KW, ld_x, x_off, sb, flags, lens, id.gid);
         });
     } else if (kname == "qwen35_gdn_chunk") {
         // prep + scan, as `qwen35::gdn_chunk_forward` encodes them.
@@ -135,15 +137,17 @@ int main(int argc, char **argv) {
             wb(wg.size()), ww(size_t(B) * Hv * nc * GDN_C * GDN_C), waq(ww.size());
         float *qkv = F("qkv"), *ab = F("ab"), *alog = F("a_log"), *dtb = F("dt_bias"), *out = F("out");
         float *si = Fopt("state_in"), *so = Fopt("state_out");
+        uint *lens = reinterpret_cast<uint *>(Fopt("seq_lens"));
+        const uint use_lens = (flags & 4u) != 0u ? 1u : 0u;
         launch(uint3(nc, Hv, B), uint3(GDN_PREP_THREADS, 1, 1), GDN_PREP_TG_FLOATS, [&](const Ids &id, float *tgm) {
             qwen35_gdn_chunk_prep(qkv, ab, alog, dtb, wk.data(), wq.data(), wg.data(), wb.data(), ww.data(),
-                                  waq.data(), T, Hk, Hv, ld_qkv, q_off, k_off, ld_ab, a_off, b_off, tgm, id.tg,
-                                  id.lid, id.sg, id.lane);
+                                  waq.data(), T, Hk, Hv, ld_qkv, q_off, k_off, ld_ab, a_off, b_off, lens, use_lens,
+                                  tgm, id.tg, id.lid, id.sg, id.lane);
         });
         launch(uint3(Dv / GDN_BV, Hv, B), uint3(GDN_SCAN_THREADS, 1, 1), GDN_SCAN_TG_FLOATS, [&](const Ids &id, float *tgm) {
             qwen35_gdn_chunk_scan(qkv, wk.data(), wq.data(), wg.data(), wb.data(), ww.data(), waq.data(), si, out,
-                                  so, T, Hv, Dv, ld_qkv, v_off, ld_out, out_off, sb, flags, tgm, id.tg, id.lid,
-                                  id.sg, id.lane);
+                                  so, T, Hv, Dv, ld_qkv, v_off, ld_out, out_off, sb, flags, lens, tgm, id.tg,
+                                  id.lid, id.sg, id.lane);
         });
         if (params.count("dump_ws")) {
             bufs["ws_w"] = std::vector<uint8_t>((uint8_t *)ww.data(), (uint8_t *)(ww.data() + ww.size()));
@@ -158,9 +162,11 @@ int main(int argc, char **argv) {
                    sb = P("state_bstride"), flags = P("flags");
         float *qkv = F("qkv"), *ab = F("ab"), *alog = F("a_log"), *dtb = F("dt_bias"), *out = F("out");
         float *si = Fopt("state_in"), *so = params.count("in_place") ? si : Fopt("state_out");
+        uint *lens = reinterpret_cast<uint *>(Fopt("seq_lens"));
         launch(uint3(Dv / GDN_BV, Hv, B), uint3(GDN_SCAN_THREADS, 1, 1), GDN_REC_TG_FLOATS, [&](const Ids &id, float *tgm) {
             qwen35_gdn_recurrent(qkv, ab, alog, dtb, si, out, so, T, Hk, Hv, Dv, ld_qkv, q_off, k_off, v_off,
-                                 ld_ab, a_off, b_off, ld_out, out_off, sb, flags, tgm, id.tg, id.sg, id.lane);
+                                 ld_ab, a_off, b_off, ld_out, out_off, sb, flags, lens, tgm, id.tg, id.sg,
+                                 id.lane);
         });
     } else if (kname == "qwen35_gated_rms_norm_f32" || kname == "qwen35_gated_rms_norm_bf16") {
         const uint rows = P("rows"), H = P("H"), D = P("D"), ld_x = P("ld_x"), x_off = P("x_off"),

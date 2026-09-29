@@ -762,7 +762,9 @@ def _kernel_signatures():
     expanding the macro-generated kernels through their instantiations."""
     import re
     sigs, macros = {}, {}
-    for f in ("qwen35_gdn", "qwen35_attn", "qwen35_score"):
+    # qwen35_attn_tiled runs on the TensorOps units, which the emulator cannot
+    # execute, but its signature is plain source text and is checked here.
+    for f in ("qwen35_gdn", "qwen35_attn", "qwen35_attn_tiled", "qwen35_score"):
         src = open(os.path.join(ROOT, "kernels", f + ".metal")).read()
         for m in re.finditer(r"kernel void (\w+)\((.*?)\)\s*\\?\s*\{", src, re.S):
             params = []
@@ -868,6 +870,17 @@ def case_host_contract():
                                 ("PREFIX_DECODE_LANES", "PREFIX_DECODE_R", 1)]:
         ok = consts[host] == kc[kernel] * scale
         print(f"  [{'ok  ' if ok else 'FAIL'}] {host} = {consts[host]} vs kernel {kernel} x{scale} = {kc[kernel] * scale}")
+        if not ok:
+            FAILURES.append(f"constant {host}")
+    # The harness cannot include the TensorOps kernel, so its constants are read
+    # from the source.
+    import re
+    tiled = open(os.path.join(ROOT, "kernels", "qwen35_attn_tiled.metal")).read()
+    tc = {m.group(1): int(m.group(2)) for m in re.finditer(r"^constant uint (\w+) = (\d+);", tiled, re.M)}
+    for host, kernel in [("TILED_ATTN_BQ", "TILED_ATTN_BQ"), ("TILED_ATTN_SIMDGROUPS", "TILED_ATTN_SG"),
+                         ("PREFIX_ATTN_HEAD_DIM", "TILED_ATTN_D")]:
+        ok = consts[host] == tc[kernel]
+        print(f"  [{'ok  ' if ok else 'FAIL'}] {host} = {consts[host]} vs kernel {kernel} = {tc[kernel]} (source)")
         if not ok:
             FAILURES.append(f"constant {host}")
 

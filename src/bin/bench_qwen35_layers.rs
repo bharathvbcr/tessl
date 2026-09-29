@@ -4,7 +4,12 @@
 //! cargo run --release --bin bench_qwen35_layers                 # T = 1024, 2048, 8192
 //! cargo run --release --bin bench_qwen35_layers -- 1024 4096    # chosen T
 //! cargo run --release --bin bench_qwen35_layers -- --check-only # plausibility gate, no timing
+//! cargo run --release --bin bench_qwen35_layers -- --attn-rows  # scalar nn::flash_attn_rows
 //! ```
+//!
+//! Attention runs on `qwen35::attn_prefill` (the TensorOps kernel) unless
+//! `--attn-rows` selects `nn::flash_attn_rows`, the kernel it replaced, so the
+//! two can be compared in one binary on one machine state.
 //!
 //! Shapes are Qwen3.5-2B's `text_config` (hidden 2048, 16 key and 16 value GDN
 //! heads of 128, 8 query and 2 KV attention heads of 256, rotary 64, MLP 6144,
@@ -412,10 +417,14 @@ fn gdn_stage(rt: &Arc<GpuRuntime>, m: &Model, w: &GdnWeights, a: &Acts, s: usize
 const ATTN_STAGES: [&str; 5] = [
     "qkv+gate GEMM",
     "qk_norm_rope",
-    "flash_attn_rows",
+    "attention",
     "output gate",
     "o-proj + resid",
 ];
+
+/// `--attn-rows`: time the scalar `nn::flash_attn_rows` instead of
+/// `qwen35::attn_prefill`.
+static ATTN_ROWS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
 
 fn attn_stage(rt: &Arc<GpuRuntime>, m: &Model, w: &AttnWeights, a: &Acts, s: usize) -> Res<()> {
     let pc = Cols::dense(&a.a_proj.buffer, m.attn.width());
@@ -443,26 +452,22 @@ fn attn_stage(rt: &Arc<GpuRuntime>, m: &Model, w: &AttnWeights, a: &Acts, s: usi
             ROPE_THETA,
             EPS,
         ),
-        2 => nn::flash_attn_rows(
-            rt,
-            &a.a_q,
-            &a.a_kc,
-            &a.a_vc,
-            &a.a_o,
-            &a.tkv,
-            &a.zero_pos,
-            &a.zero_pos,
-            nn::AttnDims {
+        2 => {
+            let dims = nn::AttnDims {
                 batch: 1,
                 tq: a.t as u32,
                 heads: Q_HEADS,
                 heads_kv: KV_HEADS,
                 window: 0,
                 scale: 1.0 / (HEAD_DIM as f32).sqrt(),
-            },
-            HEAD_DIM,
-            false,
-        ),
+            };
+            let (q, k, v, o, pos) = (&a.a_q, &a.a_kc, &a.a_vc, &a.a_o, &a.zero_pos);
+            if *ATTN_ROWS.get().expect("set in main") {
+                nn::flash_attn_rows(rt, q, k, v, o, &a.tkv, pos, pos, dims, HEAD_DIM, false)
+            } else {
+                qwen35::attn_prefill(rt, q, k, v, o, &a.tkv, pos, pos, dims, false)
+            }
+        }
         3 => qwen35::attn_output_gate(
             rt,
             &a.a_o,
@@ -577,7 +582,7 @@ fn plausibility_gate(rt: &Arc<GpuRuntime>, m: &Model, a: &Acts) -> Res<()> {
     finite_f32("attn q", &a.a_q, qd)?;
     finite_f32("attn k cache", &a.a_kc, kv)?;
     finite_f32("attn v cache", &a.a_vc, kv)?;
-    finite_f32("flash_attn_rows out", &a.a_o, qd)?;
+    finite_f32("attention out", &a.a_o, qd)?;
     finite_bf16("attn gated out", &a.a_y)?;
     finite_f32("mlp gate", &a.m_gate.buffer, a.m_gate.numel())?;
     finite_f32("mlp up", &a.m_up.buffer, a.m_up.numel())?;
@@ -702,14 +707,17 @@ fn lm_head_ms_per_row(rt: &Arc<GpuRuntime>) -> Res<f64> {
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut check_only = false;
+    let mut attn_rows = false;
     let mut ts = Vec::new();
     for arg in std::env::args().skip(1) {
         if arg == "--check-only" {
             check_only = true;
+        } else if arg == "--attn-rows" {
+            attn_rows = true;
         } else {
-            let t: usize = arg
-                .parse()
-                .map_err(|_| format!("expected a token count or --check-only, got {arg:?}"))?;
+            let t: usize = arg.parse().map_err(|_| {
+                format!("expected a token count, --check-only or --attn-rows, got {arg:?}")
+            })?;
             if t == 0 {
                 return Err("T must be positive".into());
             }
@@ -732,6 +740,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let n_attn = (0..LAYERS).filter(|&l| is_full_attention(l)).count();
     let n_gdn = LAYERS - n_attn;
     println!("layers: {n_gdn} GDN + {n_attn} attention, batch 1, bf16 weights distinct per layer");
+    ATTN_ROWS
+        .set(attn_rows)
+        .map_err(|_| "attention kernel chosen twice")?;
+    println!(
+        "attention kernel: {}",
+        if attn_rows {
+            "nn::flash_attn_rows (scalar f32)"
+        } else {
+            "qwen35::attn_prefill (TensorOps f32)"
+        }
+    );
 
     let t0 = Instant::now();
     let model = Model::new(&rt)?;

@@ -47,6 +47,7 @@ that fusion for Metal.
 | 6. Attention extras | `qwen35_attn_qk_norm_rope`, `qwen35_attn_gate_{f32,bf16}` | `attn_qk_norm_rope`, `attn_output_gate` | `q_norm`/`k_norm` (`1 + w`), `apply_rotary_pos_emb` (partial), `* sigmoid(gate)` |
 | 6b. Decode loops replayed from an ICB | `qwen35_attn_qk_norm_rope_posbuf` | `attn_qk_norm_rope_posbuf` | the position comes from a device buffer, like `rms_qkv_rope_posbuf` |
 | 6c. Shared-prefix attention | `qwen35_attn_prefix_rows`, `qwen35_attn_prefix_decode_{partial,reduce}` (+ `slot_base` in 6/6b) | `attn_prefix_rows`, `attn_prefix_decode`, `attn_qk_norm_rope_suffix{,_posbuf}` | attention over a per-row copy of a shared KV prefix, without the copy |
+| 6d. Prefill attention on the matrix units | `qwen35_attn_tiled_h256` | `attn_prefill` | causal `sdpa` over the layer's own K/V; `nn::flash_attn_rows` with both products on TensorOps |
 | 7. Score only the answer rows | `qwen35_score_rows_{f32,bf16}` | `score_answer_rows` | final norm + `lm_head`, restricted to the answer tokens |
 | 7b. Embedding gather | `qwen35_embed_rows_bf16` | `embed_rows` | `embed_tokens(ids)` from the bf16 table, on the device, so a forward needs no host gather |
 | 8. Fused projections | tessl's GEMM | `pack_linear_weights_*`, `fused_projection`, `project_residual` | `in_proj_qkv/z/b/a`, `q/k/v_proj`, `out_proj` + residual |
@@ -203,6 +204,42 @@ State rules, all enforced on the host:
 - A call with `seq = 0` and a `state_out` copies the start state through. A
   decode loop that alternates two state buffers never finds a stale one after
   an empty step.
+
+### Prefill attention on the matrix units
+
+`nn::flash_attn_rows` is scalar f32: a simdgroup per query row, one
+multiply-add per lane per dim. It is exact and simple, but at Qwen3.5-2B's
+shapes (8 query / 2 KV heads of 256) at T = 8192 it measured 169 ms per
+attention layer at 28732de, about 1.6 TFLOP/s and half the whole forward. The
+same machine's exact-f32 TensorOps GEMM runs at 6.4 TFLOP/s
+(`docs/benchmarking.md`).
+
+`attn_prefill` (`qwen35_attn_tiled_h256`) is FlashAttention-2 with both
+products on `mpp::tensor_ops::matmul2d`, in exact f32 (`relaxed_precision`
+off). Each threadgroup takes 32 queries of one head. It walks the keys in
+blocks of 32, only up to its last query's position, so blocks above the
+diagonal are never visited. Per block:
+
+1. `S = Q·Kᵀ` into a cooperative tensor, stored to threadgroup memory.
+2. An f32 online softmax, 4 threads per row, masks the diagonal block and the
+   partial block at `Tkv`, and writes `P` over `S`.
+3. The `[32, 256]` output accumulator, a cooperative tensor, is rescaled per
+   row and then `O += P·V`.
+
+Q, K and V are read straight from the `[B, T, H, 256]` buffers through
+strided tensor views, so nothing is staged by hand. The buffers, slots and
+masking contract are `flash_attn_rows`': live `min(*tkv, capacity)`, query
+and key position offsets, causal, and a row that sees no key is zeros. The
+matrix units sum in a different order, so the two agree to f32 rounding
+rather than bit for bit. On random inputs with softmax scores of a few units,
+each is ~1e-6 from an f64 reference (details under Verification).
+`dims.window` must be 0.
+
+The shared-prefix kernels (6c) are still the scalar `flash_attn_rows`
+instantiation. They serve the questions, a few tokens each over the prefix,
+where the tiled kernel's 32-query blocks would sit mostly idle. A prefix
+prefilled by `attn_prefill` and continued by `attn_prefix_rows` therefore
+mixes the two kernels' rounding, at the ~1e-6 level above.
 
 ### Scoring only the answer rows
 
@@ -388,7 +425,22 @@ fails the second. The decode path is held bit for bit to `flash_attn_decode`
 in the same way. The prefix runs 0, 1, 127–129, 255–257, 300 (no suffix), 2100
 and 8200; B runs 1 through 16; chunks straddle the prefix/suffix boundary.
 Moving the boundary by one fails it, and so does reducing over the suffix
-capacity instead of its live length. There is also a
+capacity instead of its live length. `attn_prefill` is held to an f64
+reference at T = 1, 31, 32, 33 and 300, B = 1 and 2, for:
+
+- a continuation (37 queries from position 63 over 100 keys);
+- a key offset;
+- leading queries that precede every key, which must be exactly zero.
+
+Its error may be at most 4× `flash_attn_rows`' on the same inputs. It
+measures 2–3× (7e-7 to 1.2e-6, against 2.3e-7 to 5.3e-7). At T = 1500,
+B = 2, it is checked against `flash_attn_rows`: 1.0e-6. K/V past the live
+length is NaN. The bf16 output must be the f32 output rounded. Six kernel
+mutations are all caught: no causal mask, the diagonal off by one, no
+rescale, the rescale indexed by column, `t_end` ignoring `Tkv`, and
+`1/l` on an empty row. The emulator cannot run TensorOps, so this kernel has
+no off-device check. `check_qwen35.py`'s host contract still reads its
+buffer slots and its `TILED_ATTN_*` constants from the source. There is also a
 whole GDN layer (projection GEMM → conv → chunked rule → gated norm) wired only
 through `GdnProjLayout` against the same chain in f64. The tests cover
 `state_out` discarded, separate and in place on both paths, and `seq = 0`
@@ -412,6 +464,13 @@ cargo test --release --test shader_index_arithmetic   # includes the qwen35 sour
   a batch read the shared prefix independently: rows that share a head could
   share its K/V lines in one threadgroup, but no measurement says that is
   worth doing yet.
+- **Prefill attention, remaining gaps.** `attn_prefill` is exact f32
+  TensorOps, whose GEMM ceiling on this machine is 6.4 TFLOP/s against
+  26.6 for bf16. A variant that casts the Q/K/V tiles to bf16 on load, with
+  f32 accumulation and softmax, is the next step. It would move the
+  attention output by bf16 rounding, which has to be measured at the model's
+  logits first. Each of a KV head's 4 query heads reads that head's K/V
+  separately, and head_dim 256 is the only size compiled.
 - **mRoPE with image positions.** Text positions only. For text, the three mRoPE
   streams are equal and the rotation reduces to plain RoPE.
 - **Key head dim other than 128**, and value head dims that aren't multiples of

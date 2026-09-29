@@ -1759,6 +1759,98 @@ pub fn attn_output_gate(
     })
 }
 
+// ------------------------------------------------ matrix-unit prefill attention ---
+
+/// Query rows per threadgroup of `qwen35_attn_tiled_h256` and its simdgroups
+/// per threadgroup (`TILED_ATTN_BQ`, `TILED_ATTN_SG` in the kernel). The key
+/// block is internal to the kernel.
+const TILED_ATTN_BQ: usize = 32;
+const TILED_ATTN_SIMDGROUPS: usize = 4;
+
+/// [`crate::nn::flash_attn_rows`] at head_dim 256 and `window = 0`, with both
+/// products on the TensorOps matrix units: `S = Q·Kᵀ` and `P·V` are
+/// `matmul2d` over 32-query by 32-key blocks, with an f32 online softmax
+/// between them. Same buffers, layouts and masking contract as
+/// `flash_attn_rows` (`q`/`o` `[batch, tq, heads, 256]`, `k`/`v`
+/// `[batch, capacity, kv_heads, 256]`, live `min(*tkv, capacity)`, query `t`
+/// at `*q_pos_offset + t`, key `t` at `*kv_pos_offset + t`, causal).
+///
+/// The matrix units sum in a different order from the scalar kernel, so the
+/// two agree to f32 rounding, not bit for bit.
+#[allow(clippy::too_many_arguments)]
+pub fn attn_prefill(
+    rt: &Arc<GpuRuntime>,
+    q: &GpuBuffer,
+    k: &GpuBuffer,
+    v: &GpuBuffer,
+    o: &GpuBuffer,
+    tkv: &GpuBuffer,
+    q_pos_offset: &GpuBuffer,
+    kv_pos_offset: &GpuBuffer,
+    dims: crate::nn::AttnDims,
+    out_bf16: bool,
+) -> Result<(), String> {
+    const WHAT: &str = "qwen35::attn_prefill";
+    const D: u32 = PREFIX_ATTN_HEAD_DIM;
+    if dims.window != 0 {
+        return Err(format!(
+            "{WHAT}: window must be 0 (Qwen3.5's full attention is global), got {}",
+            dims.window
+        ));
+    }
+    let kv_capacity = crate::nn::validate_rows_attn_call(
+        rt,
+        q,
+        k,
+        v,
+        o,
+        tkv,
+        q_pos_offset,
+        kv_pos_offset,
+        &dims,
+        D,
+        out_bf16,
+        WHAT,
+    )?;
+    // MPP tensor views index one (batch, head) plane with i32 extents and
+    // strides, so a plane's last element must be addressable in i32.
+    let q_plane = u64::from(dims.tq) * u64::from(dims.heads) * u64::from(D);
+    let kv_plane = u64::from(kv_capacity) * u64::from(dims.heads_kv) * u64::from(D);
+    if q_plane > i32::MAX as u64 || kv_plane > i32::MAX as u64 {
+        return Err(format!(
+            "{WHAT}: a head's plane exceeds i32 indexing (tq = {}, kv capacity = {kv_capacity})",
+            dims.tq
+        ));
+    }
+    let threads = TILED_ATTN_SIMDGROUPS * 32;
+    let groups_y = usize_product(&[dims.batch as usize, dims.heads as usize], WHAT)?;
+    let p = pipeline_for(rt, "qwen35_attn_tiled_h256", threads, 0)?;
+    dispatch_groups(
+        rt,
+        &p,
+        ((dims.tq as usize).div_ceil(TILED_ATTN_BQ), groups_y, 1),
+        threads,
+        0,
+        |bnd| {
+            set_gpu_buf(bnd, q, 0);
+            set_gpu_buf(bnd, k, 1);
+            set_gpu_buf(bnd, v, 2);
+            set_gpu_buf(bnd, o, 3);
+            set_u32(bnd, dims.batch, 4);
+            set_u32(bnd, dims.tq, 5);
+            set_gpu_buf(bnd, tkv, 6);
+            set_u32(bnd, dims.heads, 7);
+            set_u32(bnd, dims.heads_kv, 8);
+            set_u32(bnd, dims.window, 9);
+            set_f32(bnd, dims.scale, 10);
+            set_gpu_buf(bnd, q_pos_offset, 11);
+            set_gpu_buf(bnd, kv_pos_offset, 12);
+            set_u32(bnd, u32::from(out_bf16), 13);
+            set_u32(bnd, kv_capacity, 14);
+        },
+    )
+}
+
 // --------------------------------------------------- shared-prefix attention ---
 
 /// Head dim of [`attn_prefix_rows`]: Qwen3.5's full-attention heads.

@@ -1636,6 +1636,7 @@ fn every_qwen35_kernel_is_in_the_metallib() {
             "qwen35_attn_qk_norm_rope_posbuf",
             "qwen35_attn_gate_f32",
             "qwen35_attn_gate_bf16",
+            "qwen35_attn_tiled_h256",
             "qwen35_score_rows_f32",
             "qwen35_score_rows_bf16",
         ] {
@@ -3331,6 +3332,257 @@ fn embed_rows_equals_the_host_gather_bit_for_bit() {
         expect_err(
             qwen35::embed_rows(rt, &idb, n as u32, aliased, hidden as u32, &big_out),
             "overlaps read-only buffer table",
+        );
+    });
+}
+
+// ------------------------------------------------ matrix-unit prefill attention ---
+
+/// Causal attention in f64 over `[batch, tq, heads, 256]` queries and
+/// `[batch, cap, kv_heads, 256]` keys/values, live `tkv`, query `t` at
+/// `q_off + t` and key `t` at `kv_off + t`. A row that sees no key is zeros.
+#[allow(clippy::too_many_arguments)]
+fn causal_attn_f64(
+    q: &[f32],
+    k: &[f32],
+    v: &[f32],
+    batch: usize,
+    tq: usize,
+    tkv: usize,
+    cap: usize,
+    q_off: usize,
+    kv_off: usize,
+) -> Vec<f64> {
+    let (h, hkv, d) = (PFX_HQ, PFX_HKV, PFX_D);
+    let scale = 1.0 / (d as f64).sqrt();
+    let mut out = vec![0.0f64; batch * tq * h * d];
+    for b in 0..batch {
+        for t in 0..tq {
+            for hi in 0..h {
+                let g = hi / (h / hkv);
+                let qr = &q[((b * tq + t) * h + hi) * d..][..d];
+                let keys: Vec<usize> = (0..tkv).filter(|&s| kv_off + s <= q_off + t).collect();
+                if keys.is_empty() {
+                    continue;
+                }
+                let scores: Vec<f64> = keys
+                    .iter()
+                    .map(|&s| {
+                        let kr = &k[((b * cap + s) * hkv + g) * d..][..d];
+                        scale
+                            * qr.iter()
+                                .zip(kr)
+                                .map(|(&a, &c)| a as f64 * c as f64)
+                                .sum::<f64>()
+                    })
+                    .collect();
+                let m = scores.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+                let w: Vec<f64> = scores.iter().map(|s| (s - m).exp()).collect();
+                let l: f64 = w.iter().sum();
+                let o = &mut out[((b * tq + t) * h + hi) * d..][..d];
+                for (&s, &wi) in keys.iter().zip(&w) {
+                    let vr = &v[((b * cap + s) * hkv + g) * d..][..d];
+                    for (oi, &vi) in o.iter_mut().zip(vr) {
+                        *oi += wi / l * vi as f64;
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+fn max_err(got: &[f32], want: &[f64]) -> f64 {
+    got.iter()
+        .zip(want)
+        .map(|(&g, &w)| (g as f64 - w).abs())
+        .fold(0.0, f64::max)
+}
+
+#[test]
+fn attn_prefill_matches_an_f64_reference_as_closely_as_flash_attn_rows() {
+    // (batch, tq, live tkv, capacity, q_pos_offset, kv_pos_offset). The block
+    // is 32 queries by 32 keys: one query; either side of one block; a few
+    // hundred (several blocks on and below the diagonal); a continuation whose
+    // queries start mid-cache; a key offset; and leading queries that precede
+    // every key, which must come out as zeros.
+    let cases: [(usize, usize, usize, usize, usize, usize); 8] = [
+        (1, 1, 1, 1, 0, 0),
+        (1, 31, 31, 40, 0, 0),
+        (1, 32, 32, 32, 0, 0),
+        (2, 33, 33, 35, 0, 0),
+        (2, 300, 300, 301, 0, 0),
+        (2, 37, 100, 128, 63, 0),
+        (1, 50, 50, 64, 40, 30),
+        (1, 40, 40, 48, 0, 5),
+    ];
+    with_gpu(|rt| {
+        for (ci, &(batch, tq, tkv, cap, q_off, kv_off)) in cases.iter().enumerate() {
+            let seed = 9100 + 10 * ci as u64;
+            let row = PFX_HKV * PFX_D;
+            let n = batch * tq * PFX_HQ * PFX_D;
+            // Sharper than a near-uniform softmax: scores of a few units.
+            let q: Vec<f32> = random_f32(n, seed).iter().map(|x| 4.0 * x).collect();
+            let mut k = random_f32(batch * cap * row, seed + 1);
+            let mut v = random_f32(batch * cap * row, seed + 2);
+            // Every slot past the live length is NaN, so a kernel that read
+            // one would print NaN into the output.
+            for b in 0..batch {
+                let dead = (b * cap + tkv) * row..(b + 1) * cap * row;
+                k[dead.clone()].fill(f32::NAN);
+                v[dead].fill(f32::NAN);
+            }
+            let want = causal_attn_f64(&q, &k, &v, batch, tq, tkv, cap, q_off, kv_off);
+            let (qb, kb, vb) = (buf(rt, &q), buf(rt, &k), buf(rt, &v));
+            let tkvb = buf_u32(rt, &[tkv as u32]);
+            let qpos = buf_u32(rt, &[q_off as u32]);
+            let kvpos = buf_u32(rt, &[kv_off as u32]);
+            let dims = pfx_dims(batch, tq);
+            let label = format!("B{batch} Tq{tq} Tkv{tkv}/{cap} q@{q_off} k@{kv_off}");
+
+            let scalar = seeded(rt, n, SENTINEL);
+            tessl::nn::flash_attn_rows(
+                rt,
+                &qb,
+                &kb,
+                &vb,
+                &scalar,
+                &tkvb,
+                &qpos,
+                &kvpos,
+                dims,
+                PFX_D as u32,
+                false,
+            )
+            .unwrap();
+            let tiled = seeded(rt, n, SENTINEL);
+            qwen35::attn_prefill(rt, &qb, &kb, &vb, &tiled, &tkvb, &qpos, &kvpos, dims, false)
+                .unwrap();
+            let tiled_bf16 = seeded(rt, n, SENTINEL);
+            qwen35::attn_prefill(
+                rt,
+                &qb,
+                &kb,
+                &vb,
+                &tiled_bf16,
+                &tkvb,
+                &qpos,
+                &kvpos,
+                dims,
+                true,
+            )
+            .unwrap();
+            rt.synchronize().unwrap();
+
+            let (s, t) = (scalar.read_f32(), tiled.read_f32());
+            let (s, t) = (&s[..n], &t[..n]);
+            assert!(
+                t.iter().all(|x| x.is_finite()),
+                "{label}: non-finite output (unwritten, or read a poisoned K/V slot)"
+            );
+            let (es, et) = (max_err(s, &want), max_err(t, &want));
+            eprintln!("{label}: max |err| scalar {es:.2e}, tiled {et:.2e}");
+            assert!(
+                et <= 4.0 * es.max(1e-7),
+                "{label}: tiled error {et:.2e} is more than 4x the scalar kernel's {es:.2e}"
+            );
+            // Rows that precede every key are exactly zero, as in flash_attn_rows.
+            for (i, (&ti, &wi)) in t.iter().zip(&want).enumerate() {
+                if wi == 0.0 {
+                    assert_eq!(ti, 0.0, "{label}[{i}]: a fully masked row must be zeros");
+                }
+            }
+            // The bf16 store is the f32 result rounded, element for element.
+            let rounded = f32_slice_to_bf16(t);
+            let got16 = &tiled_bf16.contents_u16()[..n];
+            for (i, (&g, &w)) in got16.iter().zip(&rounded).enumerate() {
+                assert_eq!(
+                    g, w,
+                    "{label}[{i}]: bf16 output {g:#x} vs rounded f32 {w:#x}"
+                );
+            }
+        }
+
+        // Long enough for dozens of blocks per row, off every block edge, at
+        // B = 2: against the scalar kernel, since the f64 reference is too slow
+        // here. Each lands ~1e-6 from the truth at T = 300.
+        let (batch, t) = (2usize, 1500usize);
+        let n = batch * t * PFX_HQ * PFX_D;
+        let q: Vec<f32> = random_f32(n, 9190).iter().map(|x| 4.0 * x).collect();
+        let k = buf(rt, &random_f32(batch * t * PFX_HKV * PFX_D, 9191));
+        let v = buf(rt, &random_f32(batch * t * PFX_HKV * PFX_D, 9192));
+        let (qb, tkv, zero) = (buf(rt, &q), buf_u32(rt, &[t as u32]), buf_u32(rt, &[0]));
+        let dims = pfx_dims(batch, t);
+        let (scalar, tiled) = (seeded(rt, n, SENTINEL), seeded(rt, n, SENTINEL));
+        tessl::nn::flash_attn_rows(
+            rt,
+            &qb,
+            &k,
+            &v,
+            &scalar,
+            &tkv,
+            &zero,
+            &zero,
+            dims,
+            PFX_D as u32,
+            false,
+        )
+        .unwrap();
+        qwen35::attn_prefill(rt, &qb, &k, &v, &tiled, &tkv, &zero, &zero, dims, false).unwrap();
+        rt.synchronize().unwrap();
+        let want: Vec<f64> = scalar.read_f32()[..n].iter().map(|&x| x as f64).collect();
+        let diff = max_err(&tiled.read_f32()[..n], &want);
+        eprintln!("B{batch} T{t}: max |tiled - scalar| {diff:.2e}");
+        assert!(diff <= 1e-5, "B{batch} T{t}: tiled vs scalar {diff:.2e}");
+    });
+}
+
+#[test]
+fn attn_prefill_rejects_a_window_and_bad_storage() {
+    with_gpu(|rt| {
+        let (batch, tq, cap) = (1usize, 4usize, 4usize);
+        let n = batch * tq * PFX_HQ * PFX_D;
+        let q = buf(rt, &random_f32(n, 9200));
+        let k = buf(rt, &random_f32(batch * cap * PFX_HKV * PFX_D, 9201));
+        let v = buf(rt, &random_f32(batch * cap * PFX_HKV * PFX_D, 9202));
+        let o = seeded(rt, n, SENTINEL);
+        let (tkv, zero) = (buf_u32(rt, &[tq as u32]), buf_u32(rt, &[0]));
+        let mut dims = pfx_dims(batch, tq);
+        dims.window = 16;
+        expect_err(
+            qwen35::attn_prefill(rt, &q, &k, &v, &o, &tkv, &zero, &zero, dims, false),
+            "window must be 0",
+        );
+        let short = seeded(rt, n - 1, SENTINEL);
+        expect_err(
+            qwen35::attn_prefill(
+                rt,
+                &q,
+                &k,
+                &v,
+                &short,
+                &tkv,
+                &zero,
+                &zero,
+                pfx_dims(batch, tq),
+                false,
+            ),
+            "qwen35::attn_prefill",
+        );
+        expect_err(
+            qwen35::attn_prefill(
+                rt,
+                &q,
+                &k,
+                &v,
+                &k,
+                &tkv,
+                &zero,
+                &zero,
+                pfx_dims(batch, tq),
+                false,
+            ),
+            "qwen35::attn_prefill",
         );
     });
 }

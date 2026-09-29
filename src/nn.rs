@@ -1762,20 +1762,20 @@ pub fn flash_attn_rows_with_lanes(
     let entry = rows_entry(head_dim, lanes, groups).ok_or_else(|| {
         format!("flash_attn_rows: head dim {head_dim} has no kernel (128, 256 or 512)")
     })?;
-    require_attn_runtime(rt, q, k, v, o, "flash_attn_rows")?;
-    let kv_capacity =
-        validate_attn_storage_for(&dims, head_dim, q, k, v, o, "flash_attn_rows", out_bf16)?;
-    validate_attn_live_scalar_aliases(
-        &dims,
+    let kv_capacity = validate_rows_attn_call(
+        rt,
+        q,
+        k,
+        v,
         o,
         tkv,
         q_pos_offset,
         kv_pos_offset,
+        &dims,
+        head_dim,
+        out_bf16,
         "flash_attn_rows",
     )?;
-    require::<u32>(rt, tkv, 1, "flash_attn_rows tkv")?;
-    require::<u32>(rt, q_pos_offset, 1, "flash_attn_rows q_pos_offset")?;
-    require::<u32>(rt, kv_pos_offset, 1, "flash_attn_rows kv_pos_offset")?;
 
     // Rows per threadgroup is `SGT` simdgroups times 32/R rows each, so the
     // grid depends on both values the kernel was compiled for.
@@ -1800,6 +1800,33 @@ pub fn flash_attn_rows_with_lanes(
         set_u32(bnd, u32::from(out_bf16), 13);
         set_u32(bnd, kv_capacity, 14);
     })
+}
+
+/// Every check [`flash_attn_rows`]' buffer contract needs, for any kernel that
+/// binds that contract: runtime ownership, Q/K/V/O storage, output-vs-scalar
+/// aliases and the three live device scalars. Returns the fixed KV capacity.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn validate_rows_attn_call(
+    rt: &GpuRuntime,
+    q: &GpuBuffer,
+    k: &GpuBuffer,
+    v: &GpuBuffer,
+    o: &GpuBuffer,
+    tkv: &GpuBuffer,
+    q_pos_offset: &GpuBuffer,
+    kv_pos_offset: &GpuBuffer,
+    dims: &AttnDims,
+    head_dim: u32,
+    out_bf16: bool,
+    what: &str,
+) -> Result<u32, String> {
+    require_attn_runtime(rt, q, k, v, o, what)?;
+    let kv_capacity = validate_attn_storage_for(dims, head_dim, q, k, v, o, what, out_bf16)?;
+    validate_attn_live_scalar_aliases(dims, o, tkv, q_pos_offset, kv_pos_offset, what)?;
+    require::<u32>(rt, tkv, 1, &format!("{what} tkv"))?;
+    require::<u32>(rt, q_pos_offset, 1, &format!("{what} q_pos_offset"))?;
+    require::<u32>(rt, kv_pos_offset, 1, &format!("{what} kv_pos_offset"))?;
+    Ok(kv_capacity)
 }
 
 /// `TESSL_ATTN_TILED=1` forces the original tiled kernels.

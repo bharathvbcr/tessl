@@ -25,6 +25,7 @@ const ATTN_SWA_256: &str = include_str!("../kernels/flash_attn_swa_h256.metal");
 const ATTN_GLOBAL: &str = include_str!("../kernels/flash_attn_global_h512.metal");
 const QWEN35_GDN: &str = include_str!("../kernels/qwen35_gdn.metal");
 const QWEN35_ATTN: &str = include_str!("../kernels/qwen35_attn.metal");
+const QWEN35_ATTN_TILED: &str = include_str!("../kernels/qwen35_attn_tiled.metal");
 const QWEN35_SCORE: &str = include_str!("../kernels/qwen35_score.metal");
 
 /// Every `.metal` file this suite inspects.
@@ -46,6 +47,7 @@ const INSPECTED_KERNELS: &[&str] = &[
     "kv_store.metal",
     "matmul_simdgroup.metal",
     "qwen35_attn.metal",
+    "qwen35_attn_tiled.metal",
     "qwen35_gdn.metal",
     "qwen35_score.metal",
     "reduce.metal",
@@ -439,6 +441,28 @@ fn attention_and_kv_cache_offsets_are_widened_before_multiplication() {
 /// were unlisted, so "shader index arithmetic is pinned" was true of half the
 /// shaders and unexamined for the rest. A file must now be on one list or the
 /// other, and the exempt list carries the reason.
+/// The TensorOps prefill attention addresses one (batch, head) plane by a
+/// 64-bit base pointer offset; MPP then indexes inside the plane with i32
+/// extents and strides, which the host bounds (`qwen35::attn_prefill`).
+#[test]
+fn qwen35_tiled_attention_plane_bases_are_widened() {
+    require(
+        QWEN35_ATTN_TILED,
+        "const ulong q_base = (ulong)b * Tq * q_row + (ulong)h * D;",
+        "tiled attention query plane base",
+    );
+    require(
+        QWEN35_ATTN_TILED,
+        "const ulong kv_base = (ulong)b * kv_capacity * kv_row + (ulong)hkv * D;",
+        "tiled attention K/V plane base",
+    );
+    require(
+        QWEN35_ATTN_TILED,
+        "const uint Tkv = min(*Tkv_ptr, kv_capacity);",
+        "tiled attention live length clamp",
+    );
+}
+
 #[test]
 fn every_kernel_source_is_inspected_or_explicitly_exempt() {
     let root = concat!(env!("CARGO_MANIFEST_DIR"), "/kernels");

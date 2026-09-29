@@ -61,6 +61,7 @@
 // Grouped heads follow transformers' `repeat_interleave`: value head `h`
 // reads key head `h / (Hv / Hk)`.
 #include <metal_stdlib>
+#include "qwen35_act.h"
 using namespace metal;
 
 /// Key head dim. Qwen3.5's `linear_key_head_dim` is 128 at every published size;
@@ -126,21 +127,6 @@ inline float gdn_softplus(float x)
 inline float gdn_log_decay(float a, float a_log, float dt_bias)
 {
     return -exp(a_log) * gdn_softplus(a + dt_bias);
-}
-
-/// `1 / (1 + e^-x)` without ever forming `e^|x|`: Metal compiles with fast
-/// math, which may assume no intermediate is infinite, so the textbook form's
-/// `exp(-x) = inf` for x < -88 is not a safe route to 0 on device.
-inline float gdn_sigmoid(float x)
-{
-    const float e = exp(-fabs(x));
-    const float r = 1.0f / (1.0f + e);
-    return x >= 0.0f ? r : e * r;
-}
-
-inline float gdn_silu(float x)
-{
-    return x * gdn_sigmoid(x);
 }
 
 // ------------------------------------------------------------------ conv1d ---
@@ -212,7 +198,7 @@ kernel void qwen35_conv1d_silu(
         for (uint j = 0u; j < KW; ++j) {
             acc += w[(ulong)c * KW + j] * conv_ext(xc, st, ld_x, hist, has_state, e + j);
         }
-        y[((ulong)b * T + e) * (ulong)C + c] = gdn_silu(acc);
+        y[((ulong)b * T + e) * (ulong)C + c] = qwen35_silu(acc);
     } else if ((flags & 2u) != 0u) {
         const uint j = e - T;
         state_out[((ulong)b * C + c) * hist + j] = conv_ext(xc, st, ld_x, hist, has_state, Tb + j);
@@ -318,7 +304,7 @@ kernel void qwen35_gdn_chunk_prep(
                 rq[i] = rsqrt(ssq + GDN_L2_EPS) * q_scale;
                 rk[i] = rsqrt(ssk + GDN_L2_EPS);
                 G[i] = gdn_log_decay(gr[a_off + hv], a_log[hv], dt_bias[hv]);
-                beta[i] = gdn_sigmoid(gr[b_off + hv]);
+                beta[i] = qwen35_sigmoid(gr[b_off + hv]);
             } else {
                 rq[i] = 0.0f;
                 rk[i] = 0.0f;
@@ -843,7 +829,7 @@ kernel void qwen35_gdn_recurrent(
         const float rq = rsqrt(simd_sum(ssq) + GDN_L2_EPS) * q_scale;
         const float rk = rsqrt(simd_sum(ssk) + GDN_L2_EPS);
         const float decay = exp(gdn_log_decay(gr[a_off + hv], a_log[hv], dt_bias[hv]));
-        const float beta = gdn_sigmoid(gr[b_off + hv]);
+        const float beta = qwen35_sigmoid(gr[b_off + hv]);
 
         // kv_mem = (decay * S)^T k
         float kv = 0.0f;
@@ -912,7 +898,7 @@ inline void gated_rms_norm_row(
     }
     const float inv = rsqrt(simd_sum(ss) / (float)D + eps);
     for (uint d = lane; d < D; d += 32u) {
-        orow[d] = (OutT)(w[d] * (xr[d] * inv) * gdn_silu(zr[d]));
+        orow[d] = (OutT)(w[d] * (xr[d] * inv) * qwen35_silu(zr[d]));
     }
 }
 

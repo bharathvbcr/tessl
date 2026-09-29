@@ -737,7 +737,8 @@ kernel void qwen35_gdn_chunk_scan(
 
 /// Threadgroup memory for `qwen35_gdn_recurrent`, in floats: two cross-simdgroup
 /// partial-sum arrays of 4 x 32.
-constant uint GDN_REC_TG_FLOATS = 2u * 4u * 32u;
+constant uint GDN_REC_TG_FLOATS = 2u * (GDN_SCAN_THREADS / 32u) * 32u;
+static_assert(GDN_REC_TG_FLOATS * 4u <= 32768u, "recurrent threadgroup memory exceeds 32 KB");
 
 /// Token-by-token gated delta rule, for decode and short suffixes, with the
 /// gates, norms and q scale folded into the loads exactly as in chunk prep.
@@ -791,7 +792,7 @@ kernel void qwen35_gdn_recurrent(
     const uint k0 = sg * 32u;
     const float q_scale = rsqrt((float)GDN_DK);
     threadgroup float *red_kv = tgm;          // [4][32]
-    threadgroup float *red_y = tgm + 128u;    // [4][32]
+    threadgroup float *red_y = tgm + GDN_REC_TG_FLOATS / 2u; // [4][32]
 
     float s[32];
     const ulong state_head = (ulong)hv * GDN_DK * Dv;

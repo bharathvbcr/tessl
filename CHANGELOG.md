@@ -24,6 +24,14 @@ All notable changes to `tessl` are recorded here. The format follows
   - Fused-projection helpers: weight packing, column layouts that every kernel
     reads in place, and `project_residual` (the residual add as a GEMM
     epilogue).
+- **Shared-prefix attention for Qwen3.5** (`qwen35_attn_prefix_rows`,
+  `qwen35::attn_prefix_rows`). Many questions over one prefilled context now
+  share the 6 full-attention layers' KV prefix at batch stride 0, as the GDN
+  and conv state already did through `StateIn::Snapshot`. Each row keeps its
+  own suffix cache. The result is bit-identical to `nn::flash_attn_rows` over
+  a per-row copy of the prefix. `qwen35::attn_qk_norm_rope_suffix` caches a
+  suffix at prefix-relative slots with absolute RoPE positions, through a new
+  `slot_base` argument (buffer 20) to both `qwen35_attn_qk_norm_rope` kernels.
 - **`tools/msl_emu`**, a CPU emulator that runs the kernel sources as C++ with
   real threadgroup barriers and simdgroup collectives, and a driver that checks
   them against transformers' own Qwen3.5 code.

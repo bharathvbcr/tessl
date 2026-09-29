@@ -457,6 +457,80 @@ def case_qk_rope_posbuf(seed):
         FAILURES.append("qk_norm_rope_posbuf wrap")
 
 
+def case_prefix_rows(seed, B, P, S, s_cap, Tq, q_pos):
+    """Shared-prefix attention: bit-identical to flash_attn_rows over each row's
+    copied `prefix ‖ suffix`, and equal to torch's causal softmax. K/V slots
+    past every live length are NaN, so reading one would show."""
+    g = seeded(seed)
+    H, Hkv, D = 8, 2, 256
+    p_cap = P + 2
+    kp, vp = torch.randn(p_cap, Hkv, D, generator=g), torch.randn(p_cap, Hkv, D, generator=g)
+    ks, vs = torch.randn(B, s_cap, Hkv, D, generator=g), torch.randn(B, s_cap, Hkv, D, generator=g)
+    for t in (kp, vp):
+        t[P:] = float("nan")
+    for t in (ks, vs):
+        t[:, S:] = float("nan")
+    q = torch.randn(B, Tq, H, D, generator=g)
+    scale = D ** -0.5
+    n = B * Tq * H * D
+    got = run("qwen35_attn_prefix_rows",
+              dict(B=B, Tq=Tq, H=H, Hkv=Hkv, P=P, suffix_cap=s_cap, scale=scale),
+              {"q": q, "kp": kp, "vp": vp, "ks": ks, "vs": vs,
+               "suffix_len": torch.tensor([S], dtype=torch.int32),
+               "q_pos": torch.tensor([q_pos], dtype=torch.int32)},
+              {"o": ("f32", n)})["o"]
+    kf = torch.cat([kp[:P].expand(B, P, Hkv, D), ks], dim=1).contiguous()
+    vf = torch.cat([vp[:P].expand(B, P, Hkv, D), vs], dim=1).contiguous()
+    want = run("flash_attn_rows", dict(B=B, Tq=Tq, H=H, Hkv=Hkv, D=D, kv_capacity=P + s_cap, scale=scale),
+               {"q": q, "k": kf, "v": vf, "tkv": torch.tensor([P + S], dtype=torch.int32),
+                "q_pos": torch.tensor([q_pos], dtype=torch.int32),
+                "kv_pos": torch.tensor([0], dtype=torch.int32)},
+               {"o": ("f32", n)})["o"]
+    tag = f"attn_prefix_rows B{B} P{P} S{S}/{s_cap} Tq{Tq} q@{q_pos}"
+    same = torch.equal(got.view(torch.int32), want.view(torch.int32)) and not torch.isnan(got).any()
+    print(f"  [{'ok  ' if same else 'FAIL'}] {tag}: bit-identical to flash_attn_rows on a copied prefix")
+    if not same:
+        FAILURES.append(tag + " vs flash_attn_rows")
+    n_kv = P + S
+    kk = kf[:, :n_kv].double().repeat_interleave(H // Hkv, dim=2)
+    vv = vf[:, :n_kv].double().repeat_interleave(H // Hkv, dim=2)
+    sc = torch.einsum("bthd,bshd->bhts", q.double(), kk) * scale
+    mask = torch.arange(n_kv)[None, :] > (q_pos + torch.arange(Tq))[:, None]
+    ref = torch.einsum("bhts,bshd->bthd", sc.masked_fill(mask, float("-inf")).softmax(-1), vv)
+    check(tag + " vs torch", got, ref, 1e-5, 1e-5)
+
+
+def case_qk_rope_slot_base(seed):
+    """`slot_base` moves only the cache slot: a suffix cached relative to a
+    prefix of P holds, bit for bit, what a cache from position 0 holds at P.."""
+    g = seeded(seed)
+    B, T, Hq, Hkv, D, P, cap = 2, 4, 2, 1, 256, 9, 6
+    ld_p = 2 * Hq * D + 2 * Hkv * D
+    p = torch.randn(B * T, ld_p, generator=g)
+    qw, kw = torch.randn(D, generator=g) * 0.1, torch.randn(D, generator=g) * 0.1
+    base = dict(B=B, T=T, Hq=Hq, Hkv=Hkv, D=D, rotary_dim=64, ld_p=ld_p, q_off=0, k_off=2 * Hq * D,
+                v_off=2 * Hq * D + Hkv * D, theta=1e7, eps=1e-6)
+    inputs = {"p": p, "q_norm_w": qw, "k_norm_w": kw}
+
+    def outs(c):
+        return {"q_out": ("f32", B * T * Hq * D), "k_cache": ("f32", B * c * Hkv * D),
+                "v_cache": ("f32", B * c * Hkv * D)}
+
+    whole = run("qwen35_attn_qk_norm_rope", dict(base, pos_offset=P + 1, kv_capacity=P + cap),
+                inputs, outs(P + cap))
+    rel = run("qwen35_attn_qk_norm_rope", dict(base, pos_offset=P + 1, kv_capacity=cap, slot_base=P),
+              inputs, outs(cap))
+    ok = torch.equal(whole["q_out"].view(torch.int32), rel["q_out"].view(torch.int32))
+    for name in ("k_cache", "v_cache"):
+        w = whole[name].reshape(B, P + cap, Hkv * D)
+        r = rel[name].reshape(B, cap, Hkv * D)
+        ok &= torch.equal(w[:, P + 1:P + 1 + T].view(torch.int32), r[:, 1:1 + T].view(torch.int32))
+        ok &= bool(torch.isnan(r[:, :1]).all() and torch.isnan(r[:, 1 + T:]).all())
+    print(f"  [{'ok  ' if ok else 'FAIL'}] qk_norm_rope slot_base: absolute RoPE, relative slot, nothing else written")
+    if not ok:
+        FAILURES.append("qk_norm_rope slot_base")
+
+
 def case_attn_gate(bf16, in_place, seed):
     g = seeded(seed)
     rows, Hq, D = 11, 3, 64
@@ -635,7 +709,10 @@ def case_host_contract():
                                 ("SCAN_THREADS", "GDN_SCAN_THREADS", 1),
                                 ("PREP_TG_BYTES", "GDN_PREP_TG_FLOATS", 4), ("SCAN_TG_BYTES", "GDN_SCAN_TG_FLOATS", 4),
                                 ("REC_TG_BYTES", "GDN_REC_TG_FLOATS", 4),
-                                ("REDUCE_MAX_SIMDGROUPS", "REDUCE_MAX_SIMDGROUPS", 1)]:
+                                ("REDUCE_MAX_SIMDGROUPS", "REDUCE_MAX_SIMDGROUPS", 1),
+                                ("PREFIX_ATTN_HEAD_DIM", "PREFIX_ATTN_D", 1),
+                                ("PREFIX_ATTN_LANES", "PREFIX_ATTN_R", 1),
+                                ("PREFIX_ATTN_SIMDGROUPS", "PREFIX_ATTN_SGT", 1)]:
         ok = consts[host] == kc[kernel] * scale
         print(f"  [{'ok  ' if ok else 'FAIL'}] {host} = {consts[host]} vs kernel {kernel} x{scale} = {kc[kernel] * scale}")
         if not ok:
@@ -669,14 +746,20 @@ CASES = [
     ("config_chunk", lambda: case_gdn("qwen35_gdn_chunk", 1, 130, 16, 32, 128, 25, state_mode="batch")),
     ("config_recurrent", lambda: case_gdn("qwen35_gdn_recurrent", 2, 2, 16, 32, 128, 26, state_mode="snapshot")),
     ("config_gated_norm", lambda: case_gated_norm(False, 27, H=32, rows=9)),
-    ("config_qk_norm_rope", lambda: case_qk_norm_rope(28, Hq=16, Hkv=4, B=1, T=5)),
-    ("recurrent_T1_snapshot", lambda: case_gdn("qwen35_gdn_recurrent", 4, 1, 2, 4, 64, 11, state_mode="snapshot")),
+    ("config_qk_norm_rope", lambda: case_qk_norm_rope(28, Hq=16, Hkv=4, B=1, T=5)),    ("recurrent_T1_snapshot", lambda: case_gdn("qwen35_gdn_recurrent", 4, 1, 2, 4, 64, 11, state_mode="snapshot")),
     ("recurrent_T7_state", lambda: case_gdn("qwen35_gdn_recurrent", 2, 7, 1, 2, 128, 12, state_mode="batch")),
     ("recurrent_T20", lambda: case_gdn("qwen35_gdn_recurrent", 1, 20, 1, 1, 32, 13)),
     ("recurrent_in_place", lambda: case_recurrent_in_place(14)),
     ("gated_norm", lambda: [case_gated_norm(bf, 15) for bf in (False, True)]),
     ("qk_norm_rope", lambda: case_qk_norm_rope(16)),
     ("qk_rope_posbuf", lambda: case_qk_rope_posbuf(29)),
+    ("qk_rope_slot_base", lambda: case_qk_rope_slot_base(31)),
+    # Shared-prefix attention at Qwen3.5's full-attention heads (8 query over 2
+    # KV heads of 256): no prefix, a one-token prefix, a prefix one past the
+    # 64-row query tile with a partial second tile of queries, and queries
+    # inside the prefix with no suffix.
+    ("prefix_rows", lambda: [case_prefix_rows(32 + i, *c) for i, c in enumerate(
+        [(2, 0, 3, 4, 3, 0), (3, 1, 2, 2, 2, 1), (2, 65, 66, 66, 66, 65), (2, 30, 0, 1, 2, 28)])]),
     ("attn_gate", lambda: [case_attn_gate(bf, ip, 17) for bf, ip in ((False, False), (True, False), (False, True))]),
     ("score", lambda: [case_score(bf, 18) for bf in (False, True)]),
 ]

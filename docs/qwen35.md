@@ -6,7 +6,7 @@ has no fast Mac path for. Sources: `kernels/qwen35_gdn.metal`,
 
 > **Status: compiled by Apple's Metal compiler; not yet run on a GPU.** The
 > `Metal compile` workflow (GitHub-hosted macOS, Xcode 26.6) builds all three
-> sources under `-std=metal4.0 -Wall -Werror`, links them, confirms all twelve
+> sources under `-std=metal4.0 -Wall -Werror`, links them, confirms all thirteen
 > entry points are exported, and builds the crate and every test target with
 > no `metal3.2` fallback. Its first run caught one diagnostic, an unused
 > constant, which was fixed. Every
@@ -47,6 +47,7 @@ that fusion for Metal.
 | 5. Read-only GDN decode | `qwen35_gdn_recurrent` | `gdn_recurrent` | `torch_recurrent_gated_delta_rule` |
 | 6. Attention extras | `qwen35_attn_qk_norm_rope`, `qwen35_attn_gate_{f32,bf16}` | `attn_qk_norm_rope`, `attn_output_gate` | `q_norm`/`k_norm` (`1 + w`), `apply_rotary_pos_emb` (partial), `* sigmoid(gate)` |
 | 6b. Decode loops replayed from an ICB | `qwen35_attn_qk_norm_rope_posbuf` | `attn_qk_norm_rope_posbuf` | the position comes from a device buffer, like `rms_qkv_rope_posbuf` |
+| 6c. Shared-prefix attention | `qwen35_attn_prefix_rows` (+ `slot_base` in 6/6b) | `attn_prefix_rows`, `attn_qk_norm_rope_suffix` | attention over a per-row copy of a shared KV prefix, without the copy |
 | 7. Score only the answer rows | `qwen35_score_rows_{f32,bf16}` | `score_answer_rows` | final norm + `lm_head`, restricted to the answer tokens |
 | 8. Fused projections | tessl's GEMM | `pack_linear_weights_*`, `fused_projection`, `project_residual` | `in_proj_qkv/z/b/a`, `q/k/v_proj`, `out_proj` + residual |
 
@@ -123,8 +124,35 @@ identical.
 **never writes it**. This works for `gdn_recurrent` and `gdn_chunk_forward`
 (the recurrence) and for `conv1d_silu` (the conv history). So one shared context
 is prefilled once, and N questions run as a batch of N continuations, each
-writing its own `state_out` if it wants one. The attention layers' KV cache is
-not shared this way yet (see [Not done](#not-done)).
+writing its own `state_out` if it wants one.
+
+The 6 full-attention layers share their KV prefix the same way. The prefix is
+prefilled once at batch 1 into caches with no batch dimension,
+`[prefix_capacity, kv_heads, 256]`. Each question's tokens go into its own
+suffix cache, `[batch, suffix_capacity, kv_heads, 256]`, whose slot `s` is
+position `P + s`:
+
+```text
+attn_qk_norm_rope(batch 1, pos_offset 0)            -> prefix K/V   (once)
+attn_qk_norm_rope_suffix(prefix_len P, offset s0)   -> q, suffix K/V (per question batch)
+attn_prefix_rows(q, prefix, suffix, suffix_len, q_pos)
+```
+
+`attn_qk_norm_rope_suffix` rotates each token at its absolute position
+`P + s0 + t` and stores it at slot `s0 + t`. Underneath, it is
+`qwen35_attn_qk_norm_rope` with `slot_base = P`; slot_base 0 is the
+ordinary cache. `qwen35_attn_prefix_rows` is `flash_attn_rows`' D=256
+instantiation (R=16, 32 simdgroups) with only the address of key `t` changed:
+the prefix below `P`, at batch stride 0, then the row's suffix. A masked key is
+an exact no-op in the online softmax, so it returns **the same bits** as
+`nn::flash_attn_rows` over each row's copied `prefix ‖ suffix`. The tests hold
+it to exactly that.
+
+The live suffix length is one device `u32` shared by every row, like
+`flash_attn_rows`' `tkv`, so the questions in a batch have equal lengths (pad
+the short ones and ignore their padded rows). At B = 16 and P = 8k, the copy
+this avoids is 16 × 8k × 2 KV heads × 256 × 4 B = 268 MB per K or V per layer,
+or 3.2 GB across the 6 layers.
 
 State rules, all enforced on the host:
 
@@ -263,6 +291,8 @@ transformers' own fp32 error, both measured against f64:
 | Q/K norm + partial RoPE, D=256, pos 30000 | 9.5e-7 | — |
 | output gate f32 / bf16 / in place | 2.4e-7 / exact / 2.4e-7 | — |
 | scoring f32 / bf16; a bad slot or answer → NaN, the rest intact | 4.8e-7 | — |
+| Q/K norm + RoPE with `slot_base`: absolute RoPE, relative slot | bit-identical to slot_base 0 | — |
+| shared-prefix attention, 8 query / 2 KV heads of 256; P = 0, 1, 30 (no suffix), 65 | bit-identical to `flash_attn_rows` on a copied prefix; ≤ 5.0e-7 vs torch | — |
 
 **The checks catch defects.** Mutations injected into the GDN kernel were each
 caught: dropping the inter-chunk decay, using the wrong state-update decay,
@@ -283,7 +313,16 @@ strided windows, and a chunked prefill followed by in-place recurrent decode
 steps that must equal the recurrence over the whole sequence. The attention
 seam runs on the device too: `attn_qk_norm_rope` into `nn::flash_attn_rows`
 into `attn_output_gate`, continuing a cache that already holds a prefix, at
-head_dim 256. There is also a
+head_dim 256. Shared-prefix attention is held **bit for bit** to
+`flash_attn_rows` over each row's copied `prefix ‖ suffix`, at 8 query / 2 KV
+heads of 256. The prefix runs 0, 1, 63–65, 127–129, 300 (no suffix) and
+2049–2100 tokens; B runs 1 through 16; output is f32 and bf16. Every K/V slot
+past a live length is NaN, so an over-read would show. A second test prefills
+the prefix with `attn_qk_norm_rope`, caches the questions with
+`attn_qk_norm_rope_suffix`, and requires the same bits, for q and for the
+attention output, as the whole sequence cached per row. Shifting the
+prefix/suffix boundary by one fails both tests. Shifting the suffix slot by one
+fails the second. There is also a
 whole GDN layer (projection GEMM → conv → chunked rule → gated norm) wired only
 through `GdnProjLayout` against the same chain in f64. The tests cover
 `state_out` discarded, separate and in place on both paths, and `seq = 0`
@@ -303,10 +342,13 @@ cargo test --release --test shader_index_arithmetic   # includes the qwen35 sour
   is out of scope here.
 - **bf16 inputs.** The kernels read f32 activations, which is what tessl's GEMM
   writes. A bf16-activation variant would halve their read traffic.
-- **Shared-prefix attention.** The snapshot flow shares GDN and conv state, but
-  the 6 full-attention layers' KV cache still has a batch dimension. Many
-  questions over one prefix need either the prefix copied per row or an
-  attention kernel with a batch-stride-0 prefix.
+- **Shared-prefix attention, remaining gaps.** `attn_prefix_rows` is the
+  row-parallel kernel only. A single-token step over a long prefix has
+  B·H threadgroups, each walking all P + S keys serially; a split-KV
+  (`flash_attn_decode`-style) variant would parallelize that, and nothing
+  has measured whether it is needed. Suffix lengths are equal across a batch
+  (one device `u32`). Only head_dim 256 is compiled, and there is no `_posbuf`
+  form of `attn_qk_norm_rope_suffix` for ICB replay.
 - **mRoPE with image positions.** Text positions only. For text, the three mRoPE
   streams are equal and the rotation reduces to plain RoPE.
 - **Key head dim other than 128**, and value head dims that aren't multiples of

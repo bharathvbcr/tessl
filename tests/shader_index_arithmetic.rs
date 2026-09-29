@@ -310,7 +310,17 @@ fn qwen35_row_offsets_are_widened_before_multiplication() {
         (
             "attention cache slot",
             QWEN35_ATTN,
-            "(((ulong)b * kv_capacity + pos) * Hkv + h) * (ulong)D",
+            "(((ulong)b * kv_capacity + cache_pos) * Hkv + h) * (ulong)D",
+        ),
+        (
+            "shared-prefix suffix row",
+            QWEN35_ATTN,
+            "(ulong)b * suffix_cap * kv_pos_stride",
+        ),
+        (
+            "shared-prefix query row",
+            QWEN35_ATTN,
+            "(ulong)b * Tq * q_pos_stride",
         ),
         (
             "scoring row",

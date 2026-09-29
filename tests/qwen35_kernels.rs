@@ -2218,3 +2218,431 @@ fn attn_qk_norm_rope_posbuf_matches_the_scalar_variant_step_by_step() {
         );
     });
 }
+
+// ------------------------------------------------- shared-prefix attention ---
+
+/// Qwen3.5's full-attention heads: 8 query heads over 2 KV heads of 256.
+const PFX_HQ: usize = 8;
+const PFX_HKV: usize = 2;
+const PFX_D: usize = 256;
+
+fn pfx_dims(batch: usize, tq: usize) -> tessl::nn::AttnDims {
+    tessl::nn::AttnDims {
+        batch: batch as u32,
+        tq: tq as u32,
+        heads: PFX_HQ as u32,
+        heads_kv: PFX_HKV as u32,
+        window: 0,
+        scale: 1.0 / (PFX_D as f32).sqrt(),
+    }
+}
+
+/// Output words as bits: `f32` words, or the bf16 halves when `bf16`.
+fn out_bits(o: &GpuBuffer, n: usize, bf16: bool) -> Vec<u32> {
+    if bf16 {
+        o.contents_u16()[..n]
+            .iter()
+            .map(|&x| u32::from(x))
+            .collect()
+    } else {
+        o.read_f32()[..n].iter().map(|x| x.to_bits()).collect()
+    }
+}
+
+/// One shared-prefix case against `nn::flash_attn_rows` over the per-row copy
+/// `prefix ‖ suffix_b`. Every K/V slot past the live prefix and suffix is NaN,
+/// in both layouts, so a kernel that read one would print NaN into the output.
+#[allow(clippy::too_many_arguments)]
+fn prefix_rows_case(
+    rt: &Arc<GpuRuntime>,
+    batch: usize,
+    p: usize,
+    s: usize,
+    s_cap: usize,
+    tq: usize,
+    q_pos: usize,
+    seed: u64,
+) {
+    let row = PFX_HKV * PFX_D;
+    let p_cap = p + 3;
+    let mut pk = random_f32(p_cap * row, seed);
+    let mut pv = random_f32(p_cap * row, seed + 1);
+    pk[p * row..].fill(f32::NAN);
+    pv[p * row..].fill(f32::NAN);
+    let mut sk = random_f32(batch * s_cap * row, seed + 2);
+    let mut sv = random_f32(batch * s_cap * row, seed + 3);
+    for bi in 0..batch {
+        let dead = (bi * s_cap + s) * row..(bi + 1) * s_cap * row;
+        sk[dead.clone()].fill(f32::NAN);
+        sv[dead].fill(f32::NAN);
+    }
+    // The per-row copy the shared layout exists to avoid.
+    let full_cap = p + s_cap;
+    let (mut fk, mut fv) = (Vec::new(), Vec::new());
+    for bi in 0..batch {
+        fk.extend_from_slice(&pk[..p * row]);
+        fv.extend_from_slice(&pv[..p * row]);
+        fk.extend_from_slice(&sk[bi * s_cap * row..(bi + 1) * s_cap * row]);
+        fv.extend_from_slice(&sv[bi * s_cap * row..(bi + 1) * s_cap * row]);
+    }
+    assert_eq!(fk.len(), batch * full_cap * row);
+    let n = batch * tq * PFX_HQ * PFX_D;
+    let q = buf(rt, &random_f32(n, seed + 4));
+    let (pkb, pvb, skb, svb) = (buf(rt, &pk), buf(rt, &pv), buf(rt, &sk), buf(rt, &sv));
+    let (fkb, fvb) = (buf(rt, &fk), buf(rt, &fv));
+    let slen = buf_u32(rt, &[s as u32]);
+    let qpos = buf_u32(rt, &[q_pos as u32]);
+    let tkv = buf_u32(rt, &[(p + s) as u32]);
+    let zero = buf_u32(rt, &[0]);
+    let dims = pfx_dims(batch, tq);
+    for bf16 in [false, true] {
+        let got = seeded(rt, n, SENTINEL);
+        let want = seeded(rt, n, SENTINEL);
+        let prefix = qwen35::SharedPrefix {
+            k: &pkb,
+            v: &pvb,
+            len: p as u32,
+        };
+        qwen35::attn_prefix_rows(rt, &q, prefix, &skb, &svb, &slen, &qpos, &got, dims, bf16)
+            .unwrap();
+        tessl::nn::flash_attn_rows(
+            rt,
+            &q,
+            &fkb,
+            &fvb,
+            &want,
+            &tkv,
+            &qpos,
+            &zero,
+            dims,
+            PFX_D as u32,
+            bf16,
+        )
+        .unwrap();
+        rt.synchronize().unwrap();
+        let label = format!("B{batch} P{p} S{s}/{s_cap} Tq{tq} q@{q_pos} bf16={bf16}");
+        let (g, w) = (out_bits(&got, n, bf16), out_bits(&want, n, bf16));
+        for (i, (&gi, &wi)) in g.iter().zip(&w).enumerate() {
+            // A half of SENTINEL can be a real bf16 value, so unwritten
+            // elements are checked on the f32 pass, which writes the same set.
+            assert!(
+                bf16 || gi != SENTINEL.to_bits(),
+                "{label}[{i}]: never written"
+            );
+            assert_eq!(
+                gi, wi,
+                "{label}[{i}]: shared prefix {gi:#x} vs copied prefix {wi:#x}"
+            );
+        }
+        let finite = if bf16 {
+            read_bf16(&got, n).iter().all(|x| x.is_finite())
+        } else {
+            got.read_f32()[..n].iter().all(|x| x.is_finite())
+        };
+        assert!(
+            finite,
+            "{label}: read a poisoned K/V slot past a live length"
+        );
+    }
+}
+
+#[test]
+fn attn_prefix_rows_equal_flash_attn_rows_on_a_copied_prefix_bit_for_bit() {
+    // The gate for the shared-prefix kernel: the same bits as tessl's own
+    // flash_attn_rows run on each row's copied `prefix ‖ suffix`, at Qwen3.5's
+    // head shape. Prefix lengths at 0, 1, and either side of the 64-row
+    // query tile and a KV chunk; a long prefix; queries at the end of the
+    // suffix, inside the prefix (no suffix), and past every key.
+    with_gpu(|rt| {
+        #[rustfmt::skip]
+        let cases: &[(usize, usize, usize, usize, usize, usize)] = &[
+            // (batch, P, S, S capacity, Tq, q position)
+            (1, 0, 5, 8, 5, 0),
+            (3, 1, 4, 4, 4, 1),
+            (2, 63, 1, 2, 1, 63),
+            (4, 64, 2, 2, 1, 65),
+            (5, 65, 7, 9, 7, 65),
+            (16, 127, 3, 3, 2, 128),
+            (7, 128, 65, 70, 65, 128),
+            (2, 129, 64, 64, 64, 129),
+            (3, 300, 0, 1, 2, 298),
+            (2, 40, 3, 4, 3, 50),
+            (16, 2100, 5, 6, 5, 2100),
+            (9, 2049, 1, 1, 1, 2049),
+        ];
+        for (i, &(b, p, s, cap, tq, qp)) in cases.iter().enumerate() {
+            prefix_rows_case(rt, b, p, s, cap, tq, qp, 7000 + 10 * i as u64);
+        }
+        // Every batch size 1..=16 on one mid-sized shape.
+        for b in 1..=16usize {
+            prefix_rows_case(rt, b, 70, 3, 5, 3, 70, 7500 + b as u64);
+        }
+    });
+}
+
+#[test]
+fn attn_prefix_rows_continue_a_prefix_written_by_attn_qk_norm_rope_suffix() {
+    // End to end: the prefix is prefilled once (batch 1) with
+    // attn_qk_norm_rope, each row's continuation is cached relative to it by
+    // attn_qk_norm_rope_suffix, and attention reads both. The reference writes
+    // every row's full cache with attn_qk_norm_rope and runs flash_attn_rows.
+    // The suffix must be rotated at its absolute position but stored at its
+    // relative slot; either mistake changes the bits.
+    with_gpu(|rt| {
+        let (b, p, t, rot) = (4usize, 70usize, 5usize, 64usize);
+        let s_cap = t + 2;
+        let layout = AttnProjLayout::new(PFX_HQ as u32, PFX_HKV as u32, PFX_D as u32).unwrap();
+        let w = layout.width() as usize;
+        let qw: Vec<f32> = random_f32(PFX_D, 7601).iter().map(|x| 0.1 * x).collect();
+        let kw: Vec<f32> = random_f32(PFX_D, 7602).iter().map(|x| 0.1 * x).collect();
+        let (qwb, kwb) = (buf(rt, &qw), buf(rt, &kw));
+        let proj_p = random_f32(p * w, 7603);
+        let proj_s = random_f32(b * t * w, 7604);
+        let shape = |batch: usize, seq: usize| AttnShape {
+            batch: batch as u32,
+            seq: seq as u32,
+            q_heads: PFX_HQ as u32,
+            kv_heads: PFX_HKV as u32,
+            head_dim: PFX_D as u32,
+            rotary_dim: rot as u32,
+        };
+        let row = PFX_HKV * PFX_D;
+
+        // Shared: one prefix cache, per-row suffix caches.
+        let (pp, ps) = (buf(rt, &proj_p), buf(rt, &proj_s));
+        let pq = seeded(rt, p * PFX_HQ * PFX_D, SENTINEL);
+        let (pk, pv) = (seeded(rt, p * row, SENTINEL), seeded(rt, p * row, SENTINEL));
+        let prefill = AttnTargets {
+            q_out: &pq,
+            k_cache: &pk,
+            v_cache: &pv,
+        };
+        qwen35::attn_qk_norm_rope(
+            rt,
+            &shape(1, p),
+            Cols::dense(&pp, w as u32),
+            &qwb,
+            &kwb,
+            &prefill,
+            0,
+            1e7,
+            1e-6,
+        )
+        .unwrap();
+        let sq = seeded(rt, b * t * PFX_HQ * PFX_D, SENTINEL);
+        let sk = seeded(rt, b * s_cap * row, SENTINEL);
+        let sv = seeded(rt, b * s_cap * row, SENTINEL);
+        let suffix = AttnTargets {
+            q_out: &sq,
+            k_cache: &sk,
+            v_cache: &sv,
+        };
+        qwen35::attn_qk_norm_rope_suffix(
+            rt,
+            &shape(b, t),
+            Cols::dense(&ps, w as u32),
+            &qwb,
+            &kwb,
+            &suffix,
+            p as u32,
+            0,
+            1e7,
+            1e-6,
+        )
+        .unwrap();
+        let n = b * t * PFX_HQ * PFX_D;
+        let got = seeded(rt, n, SENTINEL);
+        let (slen, qpos) = (buf_u32(rt, &[t as u32]), buf_u32(rt, &[p as u32]));
+        let prefix = qwen35::SharedPrefix {
+            k: &pk,
+            v: &pv,
+            len: p as u32,
+        };
+        qwen35::attn_prefix_rows(
+            rt,
+            &sq,
+            prefix,
+            &sk,
+            &sv,
+            &slen,
+            &qpos,
+            &got,
+            pfx_dims(b, t),
+            false,
+        )
+        .unwrap();
+
+        // Reference: every row's whole sequence through attn_qk_norm_rope.
+        let mut full_proj = Vec::with_capacity(b * (p + t) * w);
+        for bi in 0..b {
+            full_proj.extend_from_slice(&proj_p);
+            full_proj.extend_from_slice(&proj_s[bi * t * w..(bi + 1) * t * w]);
+        }
+        let fp = buf(rt, &full_proj);
+        let fq = seeded(rt, b * (p + t) * PFX_HQ * PFX_D, SENTINEL);
+        let fk = seeded(rt, b * (p + t) * row, SENTINEL);
+        let fv = seeded(rt, b * (p + t) * row, SENTINEL);
+        let full = AttnTargets {
+            q_out: &fq,
+            k_cache: &fk,
+            v_cache: &fv,
+        };
+        qwen35::attn_qk_norm_rope(
+            rt,
+            &shape(b, p + t),
+            Cols::dense(&fp, w as u32),
+            &qwb,
+            &kwb,
+            &full,
+            0,
+            1e7,
+            1e-6,
+        )
+        .unwrap();
+        rt.synchronize().unwrap();
+        // The suffix queries are the last t of each full row; flash_attn_rows
+        // wants them dense, so gather them.
+        let fq_host = fq.read_f32();
+        let qrow = PFX_HQ * PFX_D;
+        let mut tail = Vec::with_capacity(n);
+        for bi in 0..b {
+            let at = (bi * (p + t) + p) * qrow;
+            tail.extend_from_slice(&fq_host[at..at + t * qrow]);
+        }
+        let sq_host = sq.read_f32();
+        for (i, (g, w)) in sq_host[..n].iter().zip(&tail).enumerate() {
+            assert_eq!(g.to_bits(), w.to_bits(), "suffix q[{i}]: {g} vs {w}");
+        }
+        let want = seeded(rt, n, SENTINEL);
+        let tq_buf = buf(rt, &tail);
+        let (tkv, zero) = (buf_u32(rt, &[(p + t) as u32]), buf_u32(rt, &[0]));
+        tessl::nn::flash_attn_rows(
+            rt,
+            &tq_buf,
+            &fk,
+            &fv,
+            &want,
+            &tkv,
+            &qpos,
+            &zero,
+            pfx_dims(b, t),
+            PFX_D as u32,
+            false,
+        )
+        .unwrap();
+        rt.synchronize().unwrap();
+        let (g, w) = (got.read_f32(), want.read_f32());
+        for i in 0..n {
+            assert!(g[i] != SENTINEL, "attention[{i}]: never written");
+            assert_eq!(
+                g[i].to_bits(),
+                w[i].to_bits(),
+                "attention[{i}]: {} vs {}",
+                g[i],
+                w[i]
+            );
+        }
+        // The slots past the live suffix were never written.
+        let sk_host = sk.read_f32();
+        for bi in 0..b {
+            let dead = &sk_host[(bi * s_cap + t) * row..(bi + 1) * s_cap * row];
+            assert!(
+                dead.iter().all(|&x| x == SENTINEL),
+                "row {bi} wrote past its suffix"
+            );
+        }
+    });
+}
+
+#[test]
+fn attn_prefix_rows_rejects_bad_shapes_and_aliases() {
+    with_gpu(|rt| {
+        let (b, tq, p, s_cap) = (2usize, 3usize, 4usize, 4usize);
+        let row = PFX_HKV * PFX_D;
+        let n = b * tq * PFX_HQ * PFX_D;
+        let q = buf(rt, &random_f32(n, 7700));
+        let (pk, pv) = (
+            buf(rt, &random_f32(p * row, 7701)),
+            buf(rt, &random_f32(p * row, 7702)),
+        );
+        let (sk, sv) = (
+            buf(rt, &random_f32(b * s_cap * row, 7703)),
+            buf(rt, &random_f32(b * s_cap * row, 7704)),
+        );
+        let (slen, qpos) = (buf_u32(rt, &[3]), buf_u32(rt, &[p as u32]));
+        let o = seeded(rt, n, SENTINEL);
+        let prefix = qwen35::SharedPrefix {
+            k: &pk,
+            v: &pv,
+            len: p as u32,
+        };
+        let run = |prefix: qwen35::SharedPrefix<'_>, o: &GpuBuffer, dims: tessl::nn::AttnDims| {
+            qwen35::attn_prefix_rows(rt, &q, prefix, &sk, &sv, &slen, &qpos, o, dims, false)
+        };
+        let mut windowed = pfx_dims(b, tq);
+        windowed.window = 16;
+        expect_err(run(prefix, &o, windowed), "window must be 0");
+        let too_long = qwen35::SharedPrefix {
+            len: p as u32 + 1,
+            ..prefix
+        };
+        expect_err(
+            run(too_long, &o, pfx_dims(b, tq)),
+            "exceeds the prefix K/V capacity",
+        );
+        // Writing the output over the shared prefix would corrupt every row.
+        // K and V of one capacity, so only the alias can be what fails.
+        let pk_as_o = seeded(rt, n, SENTINEL);
+        let pv_same = seeded(rt, n, 0.0);
+        let aliased = qwen35::SharedPrefix {
+            k: &pk_as_o,
+            v: &pv_same,
+            len: p as u32,
+        };
+        expect_err(
+            run(aliased, &pk_as_o, pfx_dims(b, tq)),
+            "overlaps read-only buffer prefix k",
+        );
+        let mut grouped = pfx_dims(b, tq);
+        grouped.heads_kv = 3;
+        expect_err(run(prefix, &o, grouped), "is not a multiple of heads_kv");
+        // The suffix writer: positions past the suffix cache, and a position
+        // that overflows u32.
+        let layout = AttnProjLayout::new(PFX_HQ as u32, PFX_HKV as u32, PFX_D as u32).unwrap();
+        let w = layout.width();
+        let proj = buf(rt, &random_f32(b * tq * w as usize, 7705));
+        let qo = seeded(rt, n, SENTINEL);
+        let targets = AttnTargets {
+            q_out: &qo,
+            k_cache: &sk,
+            v_cache: &sv,
+        };
+        let shape = AttnShape {
+            batch: b as u32,
+            seq: tq as u32,
+            q_heads: PFX_HQ as u32,
+            kv_heads: PFX_HKV as u32,
+            head_dim: PFX_D as u32,
+            rotary_dim: 64,
+        };
+        let (qwb, kwb) = (buf(rt, &vec![0.0; PFX_D]), buf(rt, &vec![0.0; PFX_D]));
+        let suffix = |prefix_len: u32, offset: u32| {
+            qwen35::attn_qk_norm_rope_suffix(
+                rt,
+                &shape,
+                Cols::dense(&proj, w),
+                &qwb,
+                &kwb,
+                &targets,
+                prefix_len,
+                offset,
+                1e7,
+                1e-6,
+            )
+        };
+        expect_err(suffix(1000, 2), "exceed the caches' capacity");
+        expect_err(suffix(u32::MAX, 1), "exceeds u32 positions");
+        suffix(1000, 1).unwrap();
+        rt.synchronize().unwrap();
+    });
+}

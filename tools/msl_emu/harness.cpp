@@ -85,9 +85,10 @@ int main(int argc, char **argv) {
         // src/qwen35.rs's copies of them to.
         std::printf("GDN_DK %u\nGDN_C %u\nGDN_BV %u\nGDN_PREP_THREADS %u\nGDN_SCAN_THREADS %u\n"
                     "GDN_PREP_TG_FLOATS %u\nGDN_SCAN_TG_FLOATS %u\nGDN_REC_TG_FLOATS %u\n"
-                    "REDUCE_MAX_SIMDGROUPS %u\n",
+                    "REDUCE_MAX_SIMDGROUPS %u\nPREFIX_ATTN_D %u\nPREFIX_ATTN_R %u\nPREFIX_ATTN_SGT %u\n",
                     GDN_DK, GDN_C, GDN_BV, GDN_PREP_THREADS, GDN_SCAN_THREADS, GDN_PREP_TG_FLOATS,
-                    GDN_SCAN_TG_FLOATS, GDN_REC_TG_FLOATS, REDUCE_MAX_SIMDGROUPS);
+                    GDN_SCAN_TG_FLOATS, GDN_REC_TG_FLOATS, REDUCE_MAX_SIMDGROUPS, PREFIX_ATTN_D, PREFIX_ATTN_R,
+                    PREFIX_ATTN_SGT);
         return 0;
     }
     // A barrier deadlock is a failure, not a hang.
@@ -181,7 +182,8 @@ int main(int argc, char **argv) {
     } else if (kname == "qwen35_attn_qk_norm_rope") {
         const uint B = P("B"), T = P("T"), Hq = P("Hq"), Hkv = P("Hkv"), D = P("D"), R = P("rotary_dim"),
                    ld_p = P("ld_p"), q_off = P("q_off"), k_off = P("k_off"), v_off = P("v_off"),
-                   pos = P("pos_offset"), cap = P("kv_capacity");
+                   pos = P("pos_offset"), cap = P("kv_capacity"),
+                   slot_base = params.count("slot_base") ? P("slot_base") : 0u;
         const float theta = PF("theta"), eps = PF("eps");
         const uint per_tg = 8;
         float *p = F("p"), *qw = F("q_norm_w"), *kw = F("k_norm_w"), *q = F("q_out"), *kc = F("k_cache"),
@@ -194,11 +196,12 @@ int main(int argc, char **argv) {
                [&](const Ids &id, float *) {
                    if (posbuf) {
                        qwen35_attn_qk_norm_rope_posbuf(p, qw, kw, q, kc, vc, B, T, Hq, Hkv, D, R, ld_p, q_off, k_off,
-                                                       v_off, pos_ptr, cap, theta, eps, id.tg.x, id.sg, id.lane,
+                                                       v_off, pos_ptr, cap, theta, eps, slot_base, id.tg.x, id.sg, id.lane,
                                                        id.tptg);
                    } else {
                        qwen35_attn_qk_norm_rope(p, qw, kw, q, kc, vc, B, T, Hq, Hkv, D, R, ld_p, q_off, k_off,
-                                                v_off, pos, cap, theta, eps, id.tg.x, id.sg, id.lane, id.tptg);
+                                                v_off, pos, cap, theta, eps, slot_base, id.tg.x, id.sg, id.lane,
+                                                id.tptg);
                    }
                });
     } else if (kname == "qwen35_attn_gate_f32" || kname == "qwen35_attn_gate_bf16") {
@@ -239,6 +242,22 @@ int main(int argc, char **argv) {
             fn(q, k, v, o, B, Tq, tkv, H, Hkv, window, scale, qpos, kvpos, out_bf16, cap,
                uint2(id.tg.x, id.tg.y), uint2(id.tid_in_tg.x, 0));
         });
+    } else if (kname == "qwen35_attn_prefix_rows") {
+        // qwen35::attn_prefix_rows' grid: x = ceil(Tq / rows per threadgroup),
+        // y = B*H, SGT simdgroups.
+        const uint B = P("B"), Tq = P("Tq"), H = P("H"), Hkv = P("Hkv"), prefix_len = P("P"),
+                   suffix_cap = P("suffix_cap");
+        const float scale = PF("scale");
+        const uint rows_per_tg = PREFIX_ATTN_SGT * (32 / PREFIX_ATTN_R);
+        float *q = F("q"), *kp = F("kp"), *vp = F("vp"), *ks = F("ks"), *vs = F("vs"), *o = F("o");
+        uint *slen = U("suffix_len"), *qpos = U("q_pos");
+        const uint out_bf16 = 0;
+        launch(uint3(cdiv(Tq, rows_per_tg), B * H, 1), uint3(PREFIX_ATTN_SGT * 32, 1, 1), 0,
+               [&](const Ids &id, float *) {
+                   qwen35_attn_prefix_rows(q, kp, vp, ks, vs, o, Tq, prefix_len, slen, H, Hkv, scale, qpos,
+                                           out_bf16, suffix_cap, uint2(id.tg.x, id.tg.y),
+                                           uint2(id.tid_in_tg.x, 0));
+               });
     } else if (kname == "qwen35_score_rows_f32" || kname == "qwen35_score_rows_bf16") {
         const uint rows = P("rows"), hidden = P("hidden"), n_ans = P("n_ans"), vocab = P("vocab"),
                    n_slots = P("n_slots");

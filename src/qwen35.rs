@@ -1201,6 +1201,7 @@ pub fn attn_qk_norm_rope(
         k_norm_w,
         targets,
         RopePos::Scalar(pos_offset),
+        0,
         theta,
         eps,
     )
@@ -1236,6 +1237,47 @@ pub fn attn_qk_norm_rope_posbuf(
         k_norm_w,
         targets,
         RopePos::Buffer(pos_offset),
+        0,
+        theta,
+        eps,
+    )
+}
+
+/// [`attn_qk_norm_rope`] for a continuation of a shared prefix: token `t` is
+/// rotated to the absolute position `prefix_len + suffix_offset + t` but
+/// cached at slot `suffix_offset + t` of `targets`' suffix caches, the layout
+/// [`attn_prefix_rows`] reads (slot `s` is position `prefix_len + s`).
+///
+/// With `prefix_len = 0` it is exactly [`attn_qk_norm_rope`] at
+/// `pos_offset = suffix_offset`.
+#[allow(clippy::too_many_arguments)]
+pub fn attn_qk_norm_rope_suffix(
+    rt: &Arc<GpuRuntime>,
+    shape: &AttnShape,
+    proj: Cols<'_>,
+    q_norm_w: &GpuBuffer,
+    k_norm_w: &GpuBuffer,
+    targets: &AttnTargets<'_>,
+    prefix_len: u32,
+    suffix_offset: u32,
+    theta: f32,
+    eps: f32,
+) -> Result<(), String> {
+    let pos_offset = prefix_len.checked_add(suffix_offset).ok_or_else(|| {
+        format!(
+            "qwen35::attn_qk_norm_rope: prefix length {prefix_len} plus suffix offset \
+             {suffix_offset} exceeds u32 positions"
+        )
+    })?;
+    qk_norm_rope_impl(
+        rt,
+        shape,
+        proj,
+        q_norm_w,
+        k_norm_w,
+        targets,
+        RopePos::Scalar(pos_offset),
+        prefix_len,
         theta,
         eps,
     )
@@ -1257,6 +1299,7 @@ fn qk_norm_rope_impl(
     k_norm_w: &GpuBuffer,
     targets: &AttnTargets<'_>,
     pos: RopePos<'_>,
+    slot_base: u32,
     theta: f32,
     eps: f32,
 ) -> Result<(), String> {
@@ -1289,7 +1332,12 @@ fn qk_norm_rope_impl(
     )?;
     match pos {
         RopePos::Scalar(pos_offset) => {
-            if u64::from(pos_offset) + u64::from(s.seq) > u64::from(kv_capacity) {
+            if pos_offset < slot_base {
+                return Err(format!(
+                    "{WHAT}: position {pos_offset} precedes the cache's first position {slot_base}"
+                ));
+            }
+            if u64::from(pos_offset - slot_base) + u64::from(s.seq) > u64::from(kv_capacity) {
                 return Err(format!(
                     "{WHAT}: positions [{pos_offset}, {pos_offset} + {}) exceed the caches' capacity {kv_capacity}",
                     s.seq
@@ -1378,6 +1426,7 @@ fn qk_norm_rope_impl(
             set_u32(bnd, kv_capacity, 17);
             set_f32(bnd, theta, 18);
             set_f32(bnd, eps, 19);
+            set_u32(bnd, slot_base, 20);
         },
     )
 }
@@ -1442,6 +1491,135 @@ pub fn attn_output_gate(
         set_u32(bnd, out.cols.ld, 8);
         set_u32(bnd, out.cols.off, 9);
     })
+}
+
+// --------------------------------------------------- shared-prefix attention ---
+
+/// Head dim of [`attn_prefix_rows`]: Qwen3.5's full-attention heads.
+pub const PREFIX_ATTN_HEAD_DIM: u32 = 256;
+/// Lanes per query row and simdgroups per threadgroup of
+/// `qwen35_attn_prefix_rows`: the kernel is `flash_attn_rows` at the
+/// instantiation [`crate::nn::rows_lanes_for`] / [`crate::nn::rows_groups_for`]
+/// pick for D = 256, so it runs the same per-row arithmetic.
+const PREFIX_ATTN_LANES: usize = 16;
+const PREFIX_ATTN_SIMDGROUPS: usize = 32;
+
+/// A K/V prefix shared by every batch row: `[capacity, kv_heads, head_dim]`
+/// with no batch dimension, holding positions `0 .. len`.
+#[derive(Clone, Copy, Debug)]
+pub struct SharedPrefix<'a> {
+    pub k: &'a GpuBuffer,
+    pub v: &'a GpuBuffer,
+    pub len: u32,
+}
+
+/// Causal attention for many continuations of one prefilled prefix, without
+/// copying the prefix's K/V per row.
+///
+/// Row `b` attends to the shared `prefix` (positions `0 .. prefix.len`) and
+/// then to its own suffix cache, `[batch, suffix_capacity, kv_heads, 256]`,
+/// whose slot `s` is position `prefix.len + s`; the live suffix length is
+/// `min(*suffix_len, suffix_capacity)`, one u32 on the device shared by all
+/// rows, like `flash_attn_rows`' `tkv`. Query `t` of `q` (`[batch, tq, heads,
+/// 256]`) is at position `*q_pos_offset + t`. Write the suffix with
+/// [`attn_qk_norm_rope_suffix`], which rotates to the absolute position but
+/// caches at the suffix-relative slot.
+///
+/// The result is bit-identical to [`crate::nn::flash_attn_rows`] over a per-row
+/// cache `prefix ‖ suffix_b` with `window = 0`: this is that kernel with only
+/// the key address changed. `dims.window` must be 0 (Qwen3.5's full attention
+/// is global), and only head_dim 256 is compiled.
+#[allow(clippy::too_many_arguments)]
+pub fn attn_prefix_rows(
+    rt: &Arc<GpuRuntime>,
+    q: &GpuBuffer,
+    prefix: SharedPrefix<'_>,
+    suffix_k: &GpuBuffer,
+    suffix_v: &GpuBuffer,
+    suffix_len: &GpuBuffer,
+    q_pos_offset: &GpuBuffer,
+    o: &GpuBuffer,
+    dims: crate::nn::AttnDims,
+    out_bf16: bool,
+) -> Result<(), String> {
+    const WHAT: &str = "qwen35::attn_prefix_rows";
+    const D: u32 = PREFIX_ATTN_HEAD_DIM;
+    if dims.window != 0 {
+        return Err(format!(
+            "{WHAT}: window must be 0 (global causal attention), got {}",
+            dims.window
+        ));
+    }
+    for (name, b) in [
+        ("q", q),
+        ("prefix k", prefix.k),
+        ("prefix v", prefix.v),
+        ("suffix k", suffix_k),
+        ("suffix v", suffix_v),
+        ("o", o),
+    ] {
+        require_runtime(rt, b, &format!("{WHAT} {name}"))?;
+    }
+    // Q/O extents, head grouping, scale, and o against q and the suffix.
+    let suffix_cap = crate::nn::validate_attn_storage(&dims, D, q, suffix_k, suffix_v, o, out_bf16)
+        .map_err(|e| format!("{WHAT}: {e}"))?;
+    let prefix_cap = crate::nn::attn_kv_capacity(prefix.k, prefix.v, 1, dims.heads_kv, D)
+        .map_err(|e| format!("{WHAT}: prefix {e}"))?;
+    if prefix.len > prefix_cap {
+        return Err(format!(
+            "{WHAT}: prefix length {} exceeds the prefix K/V capacity {prefix_cap}",
+            prefix.len
+        ));
+    }
+    if u64::from(prefix.len) + u64::from(suffix_cap) > u64::from(u32::MAX) {
+        return Err(format!(
+            "{WHAT}: prefix length {} plus suffix capacity {suffix_cap} exceeds u32 positions",
+            prefix.len
+        ));
+    }
+    require::<u32>(rt, suffix_len, 1, "attn_prefix_rows suffix_len")?;
+    require::<u32>(rt, q_pos_offset, 1, "attn_prefix_rows q_pos_offset")?;
+    if dims.batch == 0 || dims.tq == 0 || dims.heads == 0 {
+        return Ok(());
+    }
+    require_disjoint_writes(
+        WHAT,
+        &[("o", o)],
+        &[
+            ("prefix k", prefix.k),
+            ("prefix v", prefix.v),
+            ("suffix_len", suffix_len),
+            ("q_pos_offset", q_pos_offset),
+        ],
+    )?;
+    let rows_per_tg = PREFIX_ATTN_SIMDGROUPS * (32 / PREFIX_ATTN_LANES);
+    let threads = PREFIX_ATTN_SIMDGROUPS * 32;
+    let groups_y = usize_product(&[dims.batch as usize, dims.heads as usize], WHAT)?;
+    let p = pipeline_for(rt, "qwen35_attn_prefix_rows", threads, 0)?;
+    dispatch_groups(
+        rt,
+        &p,
+        ((dims.tq as usize).div_ceil(rows_per_tg), groups_y, 1),
+        threads,
+        0,
+        |bnd| {
+            set_gpu_buf(bnd, q, 0);
+            set_gpu_buf(bnd, prefix.k, 1);
+            set_gpu_buf(bnd, prefix.v, 2);
+            set_gpu_buf(bnd, suffix_k, 3);
+            set_gpu_buf(bnd, suffix_v, 4);
+            set_gpu_buf(bnd, o, 5);
+            set_u32(bnd, dims.tq, 6);
+            set_u32(bnd, prefix.len, 7);
+            set_gpu_buf(bnd, suffix_len, 8);
+            set_u32(bnd, dims.heads, 9);
+            set_u32(bnd, dims.heads_kv, 10);
+            set_f32(bnd, dims.scale, 11);
+            set_gpu_buf(bnd, q_pos_offset, 12);
+            set_u32(bnd, u32::from(out_bf16), 13);
+            set_u32(bnd, suffix_cap, 14);
+        },
+    )
 }
 
 // ----------------------------------------------------------------- scoring ---
@@ -1607,6 +1785,19 @@ mod tests {
         assert_eq!(window_elems(3, 10, 2, 5, "t").unwrap(), 2 * 10 + 7);
         assert!(window_elems(3, 10, 6, 5, "t").is_err());
         assert_eq!(window_elems(0, 10, 0, 5, "t").unwrap(), 0);
+    }
+
+    #[test]
+    fn prefix_attention_is_flash_attn_rows_instantiation() {
+        // `qwen35_attn_prefix_rows` copies flash_attn_rows' body at these
+        // knobs; its bit-for-bit equality with `nn::flash_attn_rows` holds only
+        // while nn picks the same ones for D = 256.
+        let d = PREFIX_ATTN_HEAD_DIM;
+        assert_eq!(crate::nn::rows_lanes_for(d).width(), PREFIX_ATTN_LANES);
+        assert_eq!(
+            crate::nn::rows_groups_for(d).count(),
+            PREFIX_ATTN_SIMDGROUPS
+        );
     }
 
     #[test]

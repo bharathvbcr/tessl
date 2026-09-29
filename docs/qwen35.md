@@ -155,12 +155,18 @@ chunks across simdgroups and then reduces. Both passes are
 threadgroup), with the key address and the live key count `P + S` changed.
 It returns the same bits as `nn::flash_attn_decode` over the copy.
 
-The live suffix length is one device `u32` shared by every row, like
-`flash_attn_rows`' `tkv`, so the questions in a batch have equal lengths.
-Questions of different lengths are **right**-padded to the longest and scored
-at each one's own last real token. Causal attention and the GDN recurrence
-never let a token see anything after it, so padding at the end changes no
-real token's output, while padding between the prefix and a question would.
+The live suffix length and query position are one device `u32` each, shared by
+every row, like `flash_attn_rows`' `tkv`. For questions of different lengths,
+the `_varlen` forms (`attn_prefix_rows_varlen`, `attn_prefix_decode_varlen`)
+take them as `[batch]` arrays instead, and `attn_qk_norm_rope_suffix_rows`
+writes each row's tokens from its own position. The kernels read element
+`b * row_stride`, so the shared form is stride 0 and the same code. Each row of
+a ragged batch is bit-identical to that row run alone. Batch the questions
+**right**-padded to the longest: causal attention never lets a token see
+anything after it, so padding at the end changes no real token's output,
+while padding between the prefix and a question would. The decode scratch is
+laid out at the capacity's chunk count, not the live one, so rows with
+different live lengths cannot overlap.
 For an ICB-replayed decode loop, `attn_qk_norm_rope_suffix_posbuf` reads
 the absolute position from a device buffer, the one `attn_prefix_decode`
 reads as `q_pos_offset`. At B = 16 and P = 8k, the copy
@@ -312,6 +318,7 @@ transformers' own fp32 error, both measured against f64:
 | Q/K norm + RoPE with `slot_base`: absolute RoPE, relative slot | bit-identical to slot_base 0 | — |
 | shared-prefix attention, 8 query / 2 KV heads of 256; P = 0, 1, 30 (no suffix), 65 | bit-identical to `flash_attn_rows` on a copied prefix; ≤ 5.0e-7 vs torch | — |
 | shared-prefix decode, P = 5, 128 (chunk edge), 120 with a chunk straddling the suffix | ≤ 3.4e-7 vs torch | — |
+| shared-prefix rows / decode with per-row lengths and query positions | each row bit-identical to it alone | — |
 
 † These are **not the 2B's** head counts. `Qwen/Qwen3.5-2B-Base`'s `config.json`
 has `linear_num_key_heads` 16 and `linear_num_value_heads` **16** (Hv/Hk = 1),
@@ -379,9 +386,7 @@ cargo test --release --test shader_index_arithmetic   # includes the qwen35 sour
   is out of scope here.
 - **bf16 inputs.** The kernels read f32 activations, which is what tessl's GEMM
   writes. A bf16-activation variant would halve their read traffic.
-- **Shared-prefix attention, remaining gaps.** Suffix lengths are equal across
-  a batch (one device `u32`), so ragged questions are right-padded. Only
-  head_dim 256 is compiled. The rows of
+- **Shared-prefix attention, remaining gaps.** Only head_dim 256 is compiled. The rows of
   a batch read the shared prefix independently: rows that share a head could
   share its K/V lines in one threadgroup, but no measurement says that is
   worth doing yet.

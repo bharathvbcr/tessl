@@ -546,6 +546,42 @@ def case_embed_rows(seed):
         FAILURES.append("embed_rows_bf16")
 
 
+def case_prefix_varlen(seed, decode):
+    """Per-row suffix lengths and query positions (row_stride 1): each row of
+    a ragged batch is bit-identical to that row run alone with shared values."""
+    g = seeded(seed)
+    H, Hkv, D, P, s_cap = 8, 2, 256, 20, 6
+    rows = [(0, 19), (1, 20), (6, 25), (3, 22)] if decode else [(0, 20), (2, 20), (6, 21), (9, 20)]
+    Tq = 1 if decode else 3
+    B = len(rows)
+    kp, vp = torch.randn(P, Hkv, D, generator=g), torch.randn(P, Hkv, D, generator=g)
+    ks, vs = torch.randn(B, s_cap, Hkv, D, generator=g), torch.randn(B, s_cap, Hkv, D, generator=g)
+    for b, (n, _) in enumerate(rows):
+        ks[b, min(n, s_cap):] = float("nan")
+        vs[b, min(n, s_cap):] = float("nan")
+    q = torch.randn(B, Tq, H, D, generator=g)
+    kname = "qwen35_attn_prefix_decode" if decode else "qwen35_attn_prefix_rows"
+    base = dict(Tq=Tq, H=H, Hkv=Hkv, P=P, suffix_cap=s_cap, scale=D ** -0.5)
+    per = Tq * H * D
+    got = run(kname, dict(base, B=B, row_stride=1),
+              {"q": q, "kp": kp, "vp": vp, "ks": ks, "vs": vs,
+               "suffix_len": torch.tensor([n for n, _ in rows], dtype=torch.int32),
+               "q_pos": torch.tensor([p for _, p in rows], dtype=torch.int32)},
+              {"o": ("f32", B * per)})["o"].reshape(B, per)
+    ok = True
+    for b, (n, p) in enumerate(rows):
+        one = run(kname, dict(base, B=1),
+                  {"q": q[b:b + 1], "kp": kp, "vp": vp, "ks": ks[b:b + 1], "vs": vs[b:b + 1],
+                   "suffix_len": torch.tensor([min(n, s_cap)], dtype=torch.int32),
+                   "q_pos": torch.tensor([p], dtype=torch.int32)},
+                  {"o": ("f32", per)})["o"]
+        ok &= torch.equal(got[b].view(torch.int32), one.view(torch.int32))
+    tag = f"{kname} varlen: each row bit-identical to it alone"
+    print(f"  [{'ok  ' if ok else 'FAIL'}] {tag}")
+    if not ok:
+        FAILURES.append(tag)
+
+
 def case_qk_rope_slot_base(seed):
     """`slot_base` moves only the cache slot: a suffix cached relative to a
     prefix of P holds, bit for bit, what a cache from position 0 holds at P.."""
@@ -821,6 +857,7 @@ CASES = [
     # straddles the prefix/suffix boundary.
     ("prefix_decode", lambda: [case_prefix_decode(40 + i, *c) for i, c in enumerate(
         [(2, 5, 2, 3, 6), (2, 128, 1, 2, 128), (3, 120, 20, 24, 139)])]),
+    ("prefix_varlen", lambda: [case_prefix_varlen(60, False), case_prefix_varlen(61, True)]),
     ("prefix_rows", lambda: [case_prefix_rows(32 + i, *c) for i, c in enumerate(
         [(2, 0, 3, 4, 3, 0), (3, 1, 2, 2, 2, 1), (2, 65, 66, 66, 66, 65), (2, 30, 0, 1, 2, 28)])]),
     ("attn_gate", lambda: [case_attn_gate(bf, ip, 17) for bf, ip in ((False, False), (True, False), (False, True))]),

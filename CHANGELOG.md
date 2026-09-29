@@ -34,6 +34,11 @@ All notable changes to `tessl` are recorded here. The format follows
   bit-identical to `nn::flash_attn_decode` the same way.
   `qwen35::attn_qk_norm_rope_suffix_posbuf` is the suffix writer with the
   position in a device buffer, for ICB replay.
+  Ragged continuations take per-row lengths and positions:
+  `attn_prefix_rows_varlen`, `attn_prefix_decode_varlen` and
+  `attn_qk_norm_rope_suffix_rows`. Each row is bit-identical to that row
+  alone. The shared-prefix kernels gained a `row_stride` slot, and both
+  `qwen35_attn_qk_norm_rope` kernels gained `pos_stride` (buffer 21).
 - **`qwen35_embed_rows_bf16` (`qwen35::embed_rows`)**, the embedding gather
   from the bf16 vocabulary table on the device. It is exact, and a bad id
   gives a NaN row. A forward no longer needs a host gather and a

@@ -1320,11 +1320,46 @@ pub fn attn_qk_norm_rope_suffix_posbuf(
     )
 }
 
+/// [`attn_qk_norm_rope_suffix_posbuf`] with a position **per row**:
+/// `positions` is `[batch]` device u32s, row b's token 0 at the absolute
+/// position `positions[b]`, cached at slot `positions[b] - prefix_len`. For
+/// continuations of different lengths (see [`attn_prefix_decode_varlen`]):
+/// each row's next token lands at its own position.
+#[allow(clippy::too_many_arguments)]
+pub fn attn_qk_norm_rope_suffix_rows(
+    rt: &Arc<GpuRuntime>,
+    shape: &AttnShape,
+    proj: Cols<'_>,
+    q_norm_w: &GpuBuffer,
+    k_norm_w: &GpuBuffer,
+    targets: &AttnTargets<'_>,
+    prefix_len: u32,
+    positions: &GpuBuffer,
+    theta: f32,
+    eps: f32,
+) -> Result<(), String> {
+    qk_norm_rope_impl(
+        rt,
+        shape,
+        proj,
+        q_norm_w,
+        k_norm_w,
+        targets,
+        RopePos::PerRow(positions),
+        prefix_len,
+        theta,
+        eps,
+    )
+}
+
 /// Where the RoPE / cache position comes from.
 #[derive(Clone, Copy)]
 enum RopePos<'a> {
     Scalar(u32),
+    /// One device u32 shared by every row.
     Buffer(&'a GpuBuffer),
+    /// `[batch]` device u32s, row b's offset at element b.
+    PerRow(&'a GpuBuffer),
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1382,6 +1417,12 @@ fn qk_norm_rope_impl(
             }
         }
         RopePos::Buffer(b) => require::<u32>(rt, b, 1, "attn_qk_norm_rope pos_offset")?,
+        RopePos::PerRow(b) => require::<u32>(
+            rt,
+            b,
+            s.batch as usize,
+            "attn_qk_norm_rope per-row pos_offset",
+        )?,
     }
     let width = u64::from(layout.width());
     let rows = u64::from(s.batch) * u64::from(s.seq);
@@ -1412,7 +1453,7 @@ fn qk_norm_rope_impl(
         ("q_norm", q_norm_w),
         ("k_norm", k_norm_w),
     ];
-    if let RopePos::Buffer(b) = pos {
+    if let RopePos::Buffer(b) | RopePos::PerRow(b) = pos {
         reads.push(("pos_offset", b));
     }
     require_disjoint_writes(
@@ -1430,7 +1471,7 @@ fn qk_norm_rope_impl(
     )?;
     let name = match pos {
         RopePos::Scalar(_) => "qwen35_attn_qk_norm_rope",
-        RopePos::Buffer(_) => "qwen35_attn_qk_norm_rope_posbuf",
+        RopePos::Buffer(_) | RopePos::PerRow(_) => "qwen35_attn_qk_norm_rope_posbuf",
     };
     let p = pipeline_for(rt, name, ROWS_PER_TG * 32, 0)?;
     dispatch_groups(
@@ -1458,12 +1499,13 @@ fn qk_norm_rope_impl(
             set_u32(bnd, proj.off + layout.v_off(), 15);
             match pos {
                 RopePos::Scalar(v) => set_u32(bnd, v, 16),
-                RopePos::Buffer(b) => set_gpu_buf(bnd, b, 16),
+                RopePos::Buffer(b) | RopePos::PerRow(b) => set_gpu_buf(bnd, b, 16),
             }
             set_u32(bnd, kv_capacity, 17);
             set_f32(bnd, theta, 18);
             set_f32(bnd, eps, 19);
             set_u32(bnd, slot_base, 20);
+            set_u32(bnd, u32::from(matches!(pos, RopePos::PerRow(_))), 21);
         },
     )
 }
@@ -1579,23 +1621,110 @@ pub fn attn_prefix_rows(
     dims: crate::nn::AttnDims,
     out_bf16: bool,
 ) -> Result<(), String> {
-    const WHAT: &str = "qwen35::attn_prefix_rows";
-    let Some(suffix_cap) = validate_prefix_attn(
+    prefix_rows_impl(
         rt,
-        WHAT,
         q,
         prefix,
         suffix_k,
         suffix_v,
-        suffix_len,
-        q_pos_offset,
+        RowLens::Shared {
+            suffix_len,
+            q_pos_offset,
+        },
         o,
-        &dims,
+        dims,
         out_bf16,
+    )
+}
+
+/// [`attn_prefix_rows`] for continuations of **different lengths**:
+/// `suffix_lens` and `q_pos_offsets` are `[batch]` device u32s, row b's live
+/// suffix length and the absolute position of its query 0. Each row is
+/// exactly what [`attn_prefix_rows`] computes for that row alone with those
+/// two values. Rows are right-padded to `dims.tq`; outputs for a row's padded
+/// queries are computed but meaningless.
+#[allow(clippy::too_many_arguments)]
+pub fn attn_prefix_rows_varlen(
+    rt: &Arc<GpuRuntime>,
+    q: &GpuBuffer,
+    prefix: SharedPrefix<'_>,
+    suffix_k: &GpuBuffer,
+    suffix_v: &GpuBuffer,
+    suffix_lens: &GpuBuffer,
+    q_pos_offsets: &GpuBuffer,
+    o: &GpuBuffer,
+    dims: crate::nn::AttnDims,
+    out_bf16: bool,
+) -> Result<(), String> {
+    prefix_rows_impl(
+        rt,
+        q,
+        prefix,
+        suffix_k,
+        suffix_v,
+        RowLens::PerRow {
+            suffix_lens,
+            q_pos_offsets,
+        },
+        o,
+        dims,
+        out_bf16,
+    )
+}
+
+/// The device lengths the shared-prefix kernels read: one value for every
+/// row, or one per row (the kernels' `row_stride` 0 or 1).
+#[derive(Clone, Copy)]
+enum RowLens<'a> {
+    Shared {
+        suffix_len: &'a GpuBuffer,
+        q_pos_offset: &'a GpuBuffer,
+    },
+    PerRow {
+        suffix_lens: &'a GpuBuffer,
+        q_pos_offsets: &'a GpuBuffer,
+    },
+}
+
+impl<'a> RowLens<'a> {
+    fn buffers(self) -> (&'a GpuBuffer, &'a GpuBuffer) {
+        match self {
+            RowLens::Shared {
+                suffix_len,
+                q_pos_offset,
+            } => (suffix_len, q_pos_offset),
+            RowLens::PerRow {
+                suffix_lens,
+                q_pos_offsets,
+            } => (suffix_lens, q_pos_offsets),
+        }
+    }
+
+    fn row_stride(self) -> u32 {
+        u32::from(matches!(self, RowLens::PerRow { .. }))
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prefix_rows_impl(
+    rt: &Arc<GpuRuntime>,
+    q: &GpuBuffer,
+    prefix: SharedPrefix<'_>,
+    suffix_k: &GpuBuffer,
+    suffix_v: &GpuBuffer,
+    lens: RowLens<'_>,
+    o: &GpuBuffer,
+    dims: crate::nn::AttnDims,
+    out_bf16: bool,
+) -> Result<(), String> {
+    const WHAT: &str = "qwen35::attn_prefix_rows";
+    let Some(suffix_cap) = validate_prefix_attn(
+        rt, WHAT, q, prefix, suffix_k, suffix_v, lens, o, &dims, out_bf16,
     )?
     else {
         return Ok(());
     };
+    let (suffix_len, q_pos_offset) = lens.buffers();
     let rows_per_tg = PREFIX_ATTN_SIMDGROUPS * (32 / PREFIX_ATTN_LANES);
     let threads = PREFIX_ATTN_SIMDGROUPS * 32;
     let groups_y = usize_product(&[dims.batch as usize, dims.heads as usize], WHAT)?;
@@ -1622,6 +1751,7 @@ pub fn attn_prefix_rows(
             set_gpu_buf(bnd, q_pos_offset, 12);
             set_u32(bnd, u32::from(out_bf16), 13);
             set_u32(bnd, suffix_cap, 14);
+            set_u32(bnd, lens.row_stride(), 15);
         },
     )
 }
@@ -1662,6 +1792,66 @@ pub fn attn_prefix_decode(
     dims: crate::nn::AttnDims,
     out_bf16: bool,
 ) -> Result<(), String> {
+    prefix_decode_impl(
+        rt,
+        q,
+        prefix,
+        suffix_k,
+        suffix_v,
+        RowLens::Shared {
+            suffix_len,
+            q_pos_offset,
+        },
+        o,
+        dims,
+        out_bf16,
+    )
+}
+
+/// [`attn_prefix_decode`] with a live suffix length and query position per
+/// row (`[batch]` device u32s), for continuations of different lengths. Each
+/// row is exactly what [`attn_prefix_decode`] computes for it alone.
+#[allow(clippy::too_many_arguments)]
+pub fn attn_prefix_decode_varlen(
+    rt: &Arc<GpuRuntime>,
+    q: &GpuBuffer,
+    prefix: SharedPrefix<'_>,
+    suffix_k: &GpuBuffer,
+    suffix_v: &GpuBuffer,
+    suffix_lens: &GpuBuffer,
+    q_pos_offsets: &GpuBuffer,
+    o: &GpuBuffer,
+    dims: crate::nn::AttnDims,
+    out_bf16: bool,
+) -> Result<(), String> {
+    prefix_decode_impl(
+        rt,
+        q,
+        prefix,
+        suffix_k,
+        suffix_v,
+        RowLens::PerRow {
+            suffix_lens,
+            q_pos_offsets,
+        },
+        o,
+        dims,
+        out_bf16,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prefix_decode_impl(
+    rt: &Arc<GpuRuntime>,
+    q: &GpuBuffer,
+    prefix: SharedPrefix<'_>,
+    suffix_k: &GpuBuffer,
+    suffix_v: &GpuBuffer,
+    lens: RowLens<'_>,
+    o: &GpuBuffer,
+    dims: crate::nn::AttnDims,
+    out_bf16: bool,
+) -> Result<(), String> {
     const WHAT: &str = "qwen35::attn_prefix_decode";
     if dims.tq != 1 {
         return Err(format!(
@@ -1670,21 +1860,12 @@ pub fn attn_prefix_decode(
         ));
     }
     let Some(suffix_cap) = validate_prefix_attn(
-        rt,
-        WHAT,
-        q,
-        prefix,
-        suffix_k,
-        suffix_v,
-        suffix_len,
-        q_pos_offset,
-        o,
-        &dims,
-        out_bf16,
+        rt, WHAT, q, prefix, suffix_k, suffix_v, lens, o, &dims, out_bf16,
     )?
     else {
         return Ok(());
     };
+    let (suffix_len, q_pos_offset) = lens.buffers();
     // The device suffix length is unknown here, so the grid covers every key
     // the capacities allow; both passes clamp it and derive the same live
     // chunk count, so every chunk the reduce reads was written by this
@@ -1737,6 +1918,7 @@ pub fn attn_prefix_decode(
             set_f32(bnd, dims.scale, 10);
             set_gpu_buf(bnd, q_pos_offset, 11);
             set_u32(bnd, suffix_cap, 12);
+            set_u32(bnd, lens.row_stride(), 13);
         },
     )?;
     // The binder orders this after the partial pass, as for the GDN prep and
@@ -1755,6 +1937,7 @@ pub fn attn_prefix_decode(
             set_u32(bnd, dims.heads, 4);
             set_u32(bnd, u32::from(out_bf16), 5);
             set_u32(bnd, suffix_cap, 6);
+            set_u32(bnd, lens.row_stride(), 7);
         },
     )
 }
@@ -1769,12 +1952,16 @@ fn validate_prefix_attn(
     prefix: SharedPrefix<'_>,
     suffix_k: &GpuBuffer,
     suffix_v: &GpuBuffer,
-    suffix_len: &GpuBuffer,
-    q_pos_offset: &GpuBuffer,
+    lens: RowLens<'_>,
     o: &GpuBuffer,
     dims: &crate::nn::AttnDims,
     out_bf16: bool,
 ) -> Result<Option<u32>, String> {
+    let (suffix_len, q_pos_offset) = lens.buffers();
+    let len_elems = match lens {
+        RowLens::Shared { .. } => 1,
+        RowLens::PerRow { .. } => dims.batch as usize,
+    };
     const D: u32 = PREFIX_ATTN_HEAD_DIM;
     if dims.window != 0 {
         return Err(format!(
@@ -1809,8 +1996,8 @@ fn validate_prefix_attn(
             prefix.len
         ));
     }
-    require::<u32>(rt, suffix_len, 1, &format!("{what} suffix_len"))?;
-    require::<u32>(rt, q_pos_offset, 1, &format!("{what} q_pos_offset"))?;
+    require::<u32>(rt, suffix_len, len_elems, &format!("{what} suffix_len"))?;
+    require::<u32>(rt, q_pos_offset, len_elems, &format!("{what} q_pos_offset"))?;
     if dims.batch == 0 || dims.tq == 0 || dims.heads == 0 {
         return Ok(None);
     }

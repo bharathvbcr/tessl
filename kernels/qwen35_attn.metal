@@ -76,6 +76,10 @@ inline void qwen35_norm_rope_row(
 /// anything is written: `pos_offset + t` in 32 bits could wrap to a small slot
 /// and pass the check, and in the `_posbuf` variant the offset is device data
 /// the host never sees.
+///
+/// Row b's offset is `pos_ptr[b * pos_stride]` when `pos_ptr` is given (the
+/// `_posbuf` kernel; stride 0 shares one offset, 1 gives each row its own, for
+/// ragged continuations) and `pos_scalar` otherwise.
 inline void qk_norm_rope_unit(
     device const float *p,
     device const float *q_norm_w,
@@ -85,7 +89,8 @@ inline void qk_norm_rope_unit(
     device float *v_cache,
     uint B, uint T, uint Hq, uint Hkv, uint D, uint rotary_dim,
     uint ld_p, uint q_off, uint k_off, uint v_off,
-    ulong pos_offset, uint slot_base, uint kv_capacity, float theta, float eps,
+    device const uint *pos_ptr, uint pos_stride, ulong pos_scalar,
+    uint slot_base, uint kv_capacity, float theta, float eps,
     uint tg, uint sg, uint lane, uint tptg)
 {
     const ulong heads = (ulong)Hq + 2ul * Hkv;
@@ -95,6 +100,7 @@ inline void qk_norm_rope_unit(
     const ulong r = unit / heads;
     const uint j = (uint)(unit % heads);
     const ulong b = r / T;
+    const ulong pos_offset = pos_ptr ? (ulong)pos_ptr[b * pos_stride] : pos_scalar;
     const ulong pos64 = pos_offset + (r % T);
     // The cache slot is the position less `slot_base`: 0 for a cache that
     // starts at position 0, the shared prefix's length for a suffix cache
@@ -162,13 +168,15 @@ kernel void qwen35_attn_qk_norm_rope(
     constant float &theta [[buffer(18)]],
     constant float &eps [[buffer(19)]],
     constant uint &slot_base [[buffer(20)]],
+    constant uint &pos_stride [[buffer(21)]],
     uint tg [[threadgroup_position_in_grid]],
     uint sg [[simdgroup_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]],
     uint tptg [[threads_per_threadgroup]])
 {
     qk_norm_rope_unit(p, q_norm_w, k_norm_w, q_out, k_cache, v_cache, B, T, Hq, Hkv, D,
-                      rotary_dim, ld_p, q_off, k_off, v_off, (ulong)pos_offset, slot_base, kv_capacity,
+                      rotary_dim, ld_p, q_off, k_off, v_off, nullptr, pos_stride, (ulong)pos_offset,
+                      slot_base, kv_capacity,
                       theta, eps, tg, sg, lane, tptg);
 }
 
@@ -200,13 +208,15 @@ kernel void qwen35_attn_qk_norm_rope_posbuf(
     constant float &theta [[buffer(18)]],
     constant float &eps [[buffer(19)]],
     constant uint &slot_base [[buffer(20)]],
+    constant uint &pos_stride [[buffer(21)]],
     uint tg [[threadgroup_position_in_grid]],
     uint sg [[simdgroup_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]],
     uint tptg [[threads_per_threadgroup]])
 {
     qk_norm_rope_unit(p, q_norm_w, k_norm_w, q_out, k_cache, v_cache, B, T, Hq, Hkv, D,
-                      rotary_dim, ld_p, q_off, k_off, v_off, (ulong)*pos_offset_ptr, slot_base, kv_capacity,
+                      rotary_dim, ld_p, q_off, k_off, v_off, pos_offset_ptr, pos_stride, 0ul,
+                      slot_base, kv_capacity,
                       theta, eps, tg, sg, lane, tptg);
 }
 
@@ -300,6 +310,7 @@ kernel void qwen35_attn_prefix_rows(
     device const uint *q_pos_offset_ptr [[buffer(12)]],
     constant uint &out_bf16 [[buffer(13)]],
     constant uint &suffix_cap [[buffer(14)]],
+    constant uint &row_stride [[buffer(15)]],
     uint2 tgpig [[threadgroup_position_in_grid]],
     uint2 tpitg [[thread_position_in_threadgroup]])
 {
@@ -315,12 +326,13 @@ kernel void qwen35_attn_prefix_rows(
     const uint sub = lane / R;
     const uint dl = lane % R;
 
-    // Clamp mutable device state before it participates in any address.
-    const uint S = min(*suffix_len_ptr, suffix_cap);
-    const ulong Tkv = (ulong)P + S;
     const uint bh = tgpig.y;
     const uint h = bh % H;
     const uint b = bh / H;
+    // Clamp mutable device state before it participates in any address. With
+    // row_stride 1 each row has its own suffix length and query position.
+    const uint S = min(suffix_len_ptr[b * row_stride], suffix_cap);
+    const ulong Tkv = (ulong)P + S;
     const ulong base_row = (ulong)tgpig.x * RPT + sg * RPS;
     // Uniform across the simdgroup: the butterfly needs every lane.
     if (base_row >= (ulong)Tq) { return; }
@@ -336,7 +348,7 @@ kernel void qwen35_attn_prefix_rows(
     const ulong suffix_head_base = (ulong)b * suffix_cap * kv_pos_stride + (ulong)hkv * D;
     const ulong q_pos_stride = (ulong)H * D;
     const ulong q_head_base = (ulong)b * Tq * q_pos_stride + (ulong)h * D;
-    const ulong q_off_i = (ulong)(*q_pos_offset_ptr);
+    const ulong q_off_i = (ulong)q_pos_offset_ptr[b * row_stride];
     const ulong q_abs = q_off_i + (ulong)t_q;
 
     // Union key range over this simdgroup's rows; rows mask inside it.
@@ -416,11 +428,21 @@ kernel void qwen35_attn_prefix_rows(
 constant uint PREFIX_DECODE_CHUNK = 128;
 constant uint PREFIX_DECODE_R = 16;
 
-/// Live keys of a shared-prefix row set: the prefix, then the suffix clamped
-/// to its capacity. Both decode passes derive their chunk count from this.
-inline uint prefix_decode_tkv(uint P, device const uint *suffix_len_ptr, uint suffix_cap)
+/// Live keys of row b: the prefix, then its suffix clamped to the capacity.
+/// Both decode passes derive the row's live chunk count from this.
+inline uint prefix_decode_tkv(uint P, device const uint *suffix_len_ptr, uint b, uint row_stride,
+                              uint suffix_cap)
 {
-    return P + min(*suffix_len_ptr, suffix_cap);
+    return P + min(suffix_len_ptr[b * row_stride], suffix_cap);
+}
+
+/// Chunks per (row, head) in the scratch layout: the capacity's count, not the
+/// live one. Rows may have different live lengths, and a live-count stride
+/// would lay one row's chunks over the next row's.
+inline uint prefix_decode_chunk_stride(uint P, uint suffix_cap)
+{
+    const uint cap = P + suffix_cap;
+    return max(cap / PREFIX_DECODE_CHUNK + ((cap % PREFIX_DECODE_CHUNK) != 0u ? 1u : 0u), 1u);
 }
 
 /// Single-query attention over a shared prefix plus per-row suffix, split over
@@ -445,6 +467,7 @@ kernel void qwen35_attn_prefix_decode_partial(
     constant float &scale [[buffer(10)]],
     device const uint *q_pos_offset_ptr [[buffer(11)]],
     constant uint &suffix_cap [[buffer(12)]],
+    constant uint &row_stride [[buffer(13)]],
     uint2 tgpig [[threadgroup_position_in_grid]],
     uint2 tpitg [[thread_position_in_threadgroup]],
     uint2 tptg [[threads_per_threadgroup]])
@@ -460,11 +483,11 @@ kernel void qwen35_attn_prefix_decode_partial(
     const uint lane = tpitg.x % 32u;
     const uint grp = lane / R;
     const uint dl = lane % R;
-    // Clamp mutable device state before it participates in any address.
-    const uint Tkv = prefix_decode_tkv(P, suffix_len_ptr, suffix_cap);
     const uint chunk = tgpig.x;
     const uint blocks = max(H / sgs, 1u);
     const uint b = tgpig.y / blocks;
+    // Clamp mutable device state before it participates in any address.
+    const uint Tkv = prefix_decode_tkv(P, suffix_len_ptr, b, row_stride, suffix_cap);
     const uint hb = tgpig.y % blocks;
     const uint h = hb * sgs + sg;
     if (h >= H) { return; }
@@ -478,7 +501,7 @@ kernel void qwen35_attn_prefix_decode_partial(
     const ulong prefix_head_base = (ulong)hkv * D;
     const ulong suffix_head_base = (ulong)b * suffix_cap * kv_pos_stride + (ulong)hkv * D;
 
-    const ulong q_abs = (ulong)(*q_pos_offset_ptr);
+    const ulong q_abs = (ulong)q_pos_offset_ptr[b * row_stride];
     const ulong q_off = bh * D;
     device const float4 *Q4 = (device const float4 *)(Q + q_off);
     float4 q_reg[DPV];
@@ -494,8 +517,7 @@ kernel void qwen35_attn_prefix_decode_partial(
     const ulong lo_i = (ulong)t_k0;
     const ulong hi_i = min((ulong)t_k0 + n_k, local_hi);
     const uint stride0 = D + 2u;
-    const uint n_chunks = Tkv / CH + ((Tkv % CH) != 0u ? 1u : 0u);
-    const ulong base0 = (bh * n_chunks + chunk) * stride0;
+    const ulong base0 = (bh * prefix_decode_chunk_stride(P, suffix_cap) + chunk) * stride0;
     if (lo_i >= hi_i) {
         // Chunk fully masked; uniform across the simdgroup.
         if (lane == 0u) {
@@ -587,6 +609,7 @@ kernel void qwen35_attn_prefix_decode_reduce(
     constant uint &H [[buffer(4)]],
     constant uint &out_bf16 [[buffer(5)]],
     constant uint &suffix_cap [[buffer(6)]],
+    constant uint &row_stride [[buffer(7)]],
     uint2 tgpig [[threadgroup_position_in_grid]],
     uint2 tpitg [[thread_position_in_threadgroup]],
     uint2 tptg [[threads_per_threadgroup]])
@@ -595,11 +618,11 @@ kernel void qwen35_attn_prefix_decode_reduce(
     constexpr uint CH = PREFIX_DECODE_CHUNK;
     const uint lid = tpitg.x;
     const uint width = max(tptg.x, 1u);
-    const uint Tkv = prefix_decode_tkv(P, suffix_len_ptr, suffix_cap);
     const uint bh = tgpig.y;
+    const uint Tkv = prefix_decode_tkv(P, suffix_len_ptr, bh / H, row_stride, suffix_cap);
     const uint n_chunks = Tkv / CH + ((Tkv % CH) != 0u ? 1u : 0u);
     const uint stride = D + 2u;
-    const ulong chunk0 = (ulong)bh * n_chunks;
+    const ulong chunk0 = (ulong)bh * prefix_decode_chunk_stride(P, suffix_cap);
 
     float m_all = -INFINITY;
     for (uint c = 0; c < n_chunks; ++c) {
@@ -630,5 +653,4 @@ kernel void qwen35_attn_prefix_decode_reduce(
         if (out_bf16 != 0u) { Ob[o_off + d] = bfloat(o); }
         else { O[o_off + d] = o; }
     }
-    (void)H;
 }

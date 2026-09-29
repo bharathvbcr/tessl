@@ -109,3 +109,7 @@ path = "src/bin/probe_gemm_parity.rs"
 [[bin]]
 name = "bench_nn_kernels"
 path = "src/bin/bench_nn_kernels.rs"
+
+[[bin]]
+name = "bench_qwen35_layers"
+path = "src/bin/bench_qwen35_layers.rs"

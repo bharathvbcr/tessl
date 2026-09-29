@@ -246,10 +246,31 @@ pub fn assert_within_bound(label: &str, got: &[f32], r: &Reference, k: usize, op
 
 // --------------------------------------------------- Buffers and Q4 banks ---
 
-/// f32 buffer holding `data`.
+/// The slice actually uploaded for `data`.
+///
+/// Metal cannot allocate a zero-byte buffer, so every helper here rounds an
+/// empty request up to one element — and the `write_*` calls check the length
+/// exactly, so the upload has to be rounded up the same way. The stand-in is
+/// zero, not whatever the pool last left in that element.
+fn padded<T: Copy + Default>(data: &[T]) -> std::borrow::Cow<'_, [T]> {
+    if data.is_empty() {
+        std::borrow::Cow::Owned(vec![T::default()])
+    } else {
+        std::borrow::Cow::Borrowed(data)
+    }
+}
+
+/// f32 buffer holding `data` (one zero element when `data` is empty).
 pub fn buf(rt: &Arc<GpuRuntime>, data: &[f32]) -> GpuBuffer {
     let b = rt.alloc_buffer(data.len().max(1) * 4).expect("alloc");
-    b.write_f32(data);
+    b.write_f32(&padded(data));
+    b
+}
+
+/// u32 buffer holding `data` (one zero element when `data` is empty).
+pub fn buf_u32(rt: &Arc<GpuRuntime>, data: &[u32]) -> GpuBuffer {
+    let b = rt.alloc_buffer(data.len().max(1) * 4).expect("alloc");
+    b.write_u32(&padded(data));
     b
 }
 
@@ -260,10 +281,10 @@ pub fn empty(rt: &Arc<GpuRuntime>, elems: usize) -> GpuBuffer {
     b
 }
 
-/// bf16 buffer holding `data` rounded to bf16.
+/// bf16 buffer holding `data` rounded to bf16 (one zero element when empty).
 pub fn buf_bf16(rt: &Arc<GpuRuntime>, data: &[f32]) -> GpuBuffer {
     let b = rt.alloc_buffer(data.len().max(1) * 2).expect("alloc");
-    b.write_bf16_bits(&f32_slice_to_bf16(data));
+    b.write_bf16_bits(&f32_slice_to_bf16(&padded(data)));
     b
 }
 

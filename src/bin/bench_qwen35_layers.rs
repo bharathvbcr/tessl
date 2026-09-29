@@ -47,8 +47,8 @@ use std::time::Instant;
 
 use tessl::gemm::cast_f32_to_bf16_into;
 use tessl::qwen35::{
-    self, AttnProjLayout, AttnShape, AttnTargets, Cols, GdnDims, GdnParams, GdnProjLayout,
-    GdnWorkspace, OutCols, StateIn,
+    self, AttnProjLayout, AttnShape, AttnTargets, Cols, GdnChunkPhase, GdnDims, GdnParams,
+    GdnProjLayout, GdnWorkspace, OutCols, StateIn,
 };
 use tessl::tensor::{f32_slice_to_bf16, GpuBuffer};
 use tessl::{gemm, gemm_epilogue, nn, DType, Epilogue, GemmBackend, GpuRuntime, Tensor};
@@ -358,10 +358,13 @@ fn residual_add() -> Epilogue<'static> {
 }
 
 /// The GDN mixer's stages, in order. `input_norm` precedes them in a layer.
-const GDN_STAGES: [&str; 5] = [
+/// `gdn_chunk_forward` is its two dispatches, timed apart; run in order they are
+/// exactly `gdn_chunk_forward`.
+const GDN_STAGES: [&str; 6] = [
     "in-proj GEMM",
     "conv1d_silu",
-    "gdn_chunk_forward",
+    "gdn chunk prep",
+    "gdn chunk scan",
     "gated_rms_norm",
     "out-proj + resid",
 ];
@@ -383,7 +386,7 @@ fn gdn_stage(rt: &Arc<GpuRuntime>, m: &Model, w: &GdnWeights, a: &Acts, s: usize
             a.t as u32,
             m.gdn.conv_dim(),
         ),
-        2 => qwen35::gdn_chunk_forward(
+        2 | 3 => qwen35::gdn_chunk_phase(
             rt,
             &a.g_dims,
             &m.gdn.conv_qkv(&a.g_qkv),
@@ -396,8 +399,13 @@ fn gdn_stage(rt: &Arc<GpuRuntime>, m: &Model, w: &GdnWeights, a: &Acts, s: usize
             &a.g_ws,
             Cols::dense(&a.g_o, vd),
             None,
+            if s == 2 {
+                GdnChunkPhase::Prep
+            } else {
+                GdnChunkPhase::Scan
+            },
         ),
-        3 => qwen35::gated_rms_norm(
+        4 => qwen35::gated_rms_norm(
             rt,
             Cols::dense(&a.g_o, vd),
             m.gdn.z(proj),
@@ -411,7 +419,7 @@ fn gdn_stage(rt: &Arc<GpuRuntime>, m: &Model, w: &GdnWeights, a: &Acts, s: usize
             GDN_V_DIM,
             EPS,
         ),
-        4 => qwen35::project_residual(&a.g_y, &w.w_out, &a.resid, BACKEND),
+        5 => qwen35::project_residual(&a.g_y, &w.w_out, &a.resid, BACKEND),
         _ => unreachable!(),
     }
 }

@@ -514,6 +514,85 @@ fn gdn_recurrent_matches_transformers_golden() {
 }
 
 #[test]
+fn gdn_chunk_phases_in_order_are_gdn_chunk_forward_bit_for_bit() {
+    // The bench times the chunked rule's two dispatches apart through
+    // `gdn_chunk_phase`; that is only an attribution of `gdn_chunk_forward` if
+    // Prep then Scan is exactly it, and Prep alone writes no output or state.
+    with_gpu(|rt| {
+        let s = GdnShape {
+            b: 2,
+            t: 130,
+            hk: 2,
+            hv: 4,
+            dv: 64,
+        };
+        let d = GdnData::random(s, "batch", 7300);
+        let dims = dims_of(s);
+        let p = Packed::new(rt, &d);
+        let (qkv, gates, params) = (p.qkv(), p.gates(dims.v_heads), p.params());
+        let width = s.hv * s.dv;
+        let n_state = s.b * s.hv * DK * s.dv;
+        let state_in = buf(rt, d.state0.as_ref().unwrap());
+        let run = |phases: &[Option<qwen35::GdnChunkPhase>]| {
+            let ws = GdnWorkspace::new(rt, &dims).unwrap();
+            let out = seeded(rt, s.b * s.t * width, SENTINEL);
+            let st = seeded(rt, n_state, SENTINEL);
+            for phase in phases {
+                let cols = Cols::dense(&out, width as u32);
+                let si = StateIn::PerBatch(&state_in);
+                match phase {
+                    None => qwen35::gdn_chunk_forward(
+                        rt,
+                        &dims,
+                        &qkv,
+                        &gates,
+                        &params,
+                        si,
+                        &ws,
+                        cols,
+                        Some(&st),
+                    ),
+                    Some(ph) => qwen35::gdn_chunk_phase(
+                        rt,
+                        &dims,
+                        &qkv,
+                        &gates,
+                        &params,
+                        si,
+                        &ws,
+                        cols,
+                        Some(&st),
+                        *ph,
+                    ),
+                }
+                .unwrap();
+            }
+            rt.synchronize().unwrap();
+            let bits = |b: &GpuBuffer, n: usize| -> Vec<u32> {
+                b.read_f32()[..n].iter().map(|x| x.to_bits()).collect()
+            };
+            (bits(&out, s.b * s.t * width), bits(&st, n_state))
+        };
+        use qwen35::GdnChunkPhase::{Prep, Scan};
+        let whole = run(&[None]);
+        assert!(
+            whole.0.iter().all(|&x| x != SENTINEL.to_bits()),
+            "gdn_chunk_forward left outputs unwritten"
+        );
+        assert_eq!(run(&[Some(Prep), Some(Scan)]), whole, "Prep then Scan");
+        let prep_only = run(&[Some(Prep)]);
+        assert!(
+            prep_only
+                .0
+                .iter()
+                .chain(&prep_only.1)
+                .all(|&x| x == SENTINEL.to_bits()),
+            "Prep alone wrote an output or a state"
+        );
+    });
+}
+
+#[test]
 fn gdn_chunk_edges_of_the_chunk_and_head_grouping() {
     with_gpu(|rt| {
         let cases = [

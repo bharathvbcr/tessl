@@ -971,7 +971,17 @@ pub fn gdn_chunk_forward(
     state_out: Option<&GpuBuffer>,
 ) -> Result<(), String> {
     gdn_chunk_forward_impl(
-        rt, dims, qkv, gates, params, state, ws, out, state_out, None,
+        rt,
+        dims,
+        qkv,
+        gates,
+        params,
+        state,
+        ws,
+        out,
+        state_out,
+        None,
+        ChunkPhases::Both,
     )
 }
 
@@ -1006,6 +1016,57 @@ pub fn gdn_chunk_forward_varlen(
         out,
         state_out,
         Some(seq_lens),
+        ChunkPhases::Both,
+    )
+}
+
+/// One of [`gdn_chunk_forward`]'s two dispatches, for timing them apart.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GdnChunkPhase {
+    /// `qwen35_gdn_chunk_prep`: norms, gates, the C x C products and the
+    /// solve, into `ws`.
+    Prep,
+    /// `qwen35_gdn_chunk_scan`: the state pass over `ws`. Only meaningful
+    /// after a `Prep` over the same inputs has filled the workspace.
+    Scan,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ChunkPhases {
+    Both,
+    Only(GdnChunkPhase),
+}
+
+/// [`gdn_chunk_forward`] running only one of its two dispatches, with the same
+/// validation. For benchmarks that attribute the chunked rule's time; a
+/// forward pass calls [`gdn_chunk_forward`].
+#[doc(hidden)]
+#[allow(clippy::too_many_arguments)]
+pub fn gdn_chunk_phase(
+    rt: &Arc<GpuRuntime>,
+    dims: &GdnDims,
+    qkv: &GdnQkv<'_>,
+    gates: &GdnGateLogits<'_>,
+    params: &GdnParams<'_>,
+    state: StateIn<'_>,
+    ws: &GdnWorkspace,
+    out: Cols<'_>,
+    state_out: Option<&GpuBuffer>,
+    phase: GdnChunkPhase,
+) -> Result<(), String> {
+    gdn_chunk_forward_impl(
+        rt,
+        dims,
+        qkv,
+        gates,
+        params,
+        state,
+        ws,
+        out,
+        state_out,
+        None,
+        ChunkPhases::Only(phase),
     )
 }
 
@@ -1021,6 +1082,7 @@ fn gdn_chunk_forward_impl(
     out: Cols<'_>,
     state_out: Option<&GpuBuffer>,
     seq_lens: Option<&GpuBuffer>,
+    phases: ChunkPhases,
 ) -> Result<(), String> {
     const WHAT: &str = "qwen35::gdn_chunk_forward";
     dims.validate(WHAT)?;
@@ -1046,41 +1108,48 @@ fn gdn_chunk_forward_impl(
 
     let prep = pipeline_for(rt, "qwen35_gdn_chunk_prep", PREP_THREADS, PREP_TG_BYTES)?;
     let scan = pipeline_for(rt, "qwen35_gdn_chunk_scan", SCAN_THREADS, SCAN_TG_BYTES)?;
-    dispatch_groups(
-        rt,
-        &prep,
-        (
-            dims.chunks() as usize,
-            dims.v_heads as usize,
-            dims.batch as usize,
-        ),
-        PREP_THREADS,
-        PREP_TG_BYTES,
-        |bnd| {
-            set_gpu_buf(bnd, qkv.buf, 0);
-            set_gpu_buf(bnd, gates.buf, 1);
-            set_gpu_buf(bnd, params.a_log, 2);
-            set_gpu_buf(bnd, params.dt_bias, 3);
-            set_gpu_buf(bnd, &ws.k, 4);
-            set_gpu_buf(bnd, &ws.q, 5);
-            set_gpu_buf(bnd, &ws.g, 6);
-            set_gpu_buf(bnd, &ws.beta, 7);
-            set_gpu_buf(bnd, &ws.w, 8);
-            set_gpu_buf(bnd, &ws.aq, 9);
-            set_u32(bnd, dims.seq, 10);
-            set_u32(bnd, dims.k_heads, 11);
-            set_u32(bnd, dims.v_heads, 12);
-            set_u32(bnd, qkv.ld, 13);
-            set_u32(bnd, qkv.q_off, 14);
-            set_u32(bnd, qkv.k_off, 15);
-            set_u32(bnd, gates.ld, 16);
-            set_u32(bnd, gates.a_off, 17);
-            set_u32(bnd, gates.b_off, 18);
-            // Unread when use_lens is 0.
-            set_gpu_buf(bnd, seq_lens.unwrap_or(qkv.buf), 19);
-            set_u32(bnd, u32::from(seq_lens.is_some()), 20);
-        },
-    )?;
+    let run_prep = phases != ChunkPhases::Only(GdnChunkPhase::Scan);
+    let run_scan = phases != ChunkPhases::Only(GdnChunkPhase::Prep);
+    if run_prep {
+        dispatch_groups(
+            rt,
+            &prep,
+            (
+                dims.chunks() as usize,
+                dims.v_heads as usize,
+                dims.batch as usize,
+            ),
+            PREP_THREADS,
+            PREP_TG_BYTES,
+            |bnd| {
+                set_gpu_buf(bnd, qkv.buf, 0);
+                set_gpu_buf(bnd, gates.buf, 1);
+                set_gpu_buf(bnd, params.a_log, 2);
+                set_gpu_buf(bnd, params.dt_bias, 3);
+                set_gpu_buf(bnd, &ws.k, 4);
+                set_gpu_buf(bnd, &ws.q, 5);
+                set_gpu_buf(bnd, &ws.g, 6);
+                set_gpu_buf(bnd, &ws.beta, 7);
+                set_gpu_buf(bnd, &ws.w, 8);
+                set_gpu_buf(bnd, &ws.aq, 9);
+                set_u32(bnd, dims.seq, 10);
+                set_u32(bnd, dims.k_heads, 11);
+                set_u32(bnd, dims.v_heads, 12);
+                set_u32(bnd, qkv.ld, 13);
+                set_u32(bnd, qkv.q_off, 14);
+                set_u32(bnd, qkv.k_off, 15);
+                set_u32(bnd, gates.ld, 16);
+                set_u32(bnd, gates.a_off, 17);
+                set_u32(bnd, gates.b_off, 18);
+                // Unread when use_lens is 0.
+                set_gpu_buf(bnd, seq_lens.unwrap_or(qkv.buf), 19);
+                set_u32(bnd, u32::from(seq_lens.is_some()), 20);
+            },
+        )?;
+    }
+    if !run_scan {
+        return Ok(());
+    }
     // The binder orders this after the prep dispatch (a Dispatch->Dispatch
     // barrier after every dispatch, or before the next in hazard mode).
     dispatch_groups(

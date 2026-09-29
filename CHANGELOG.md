@@ -32,6 +32,10 @@ All notable changes to `tessl` are recorded here. The format follows
   above the diagonal. `bench_qwen35_layers` now times it, and
   `--attn-tile=LABEL` / `--attn-rows` select another tile or the scalar
   kernel.
+- `bench_qwen35_layers` times the GDN chunked rule's two dispatches apart
+  (`gdn chunk prep`, `gdn chunk scan`) through the doc-hidden
+  `qwen35::gdn_chunk_phase`. Run in order, they are bit-identical to
+  `gdn_chunk_forward`.
 - **Shared-prefix attention for Qwen3.5** (`qwen35_attn_prefix_rows`,
   `qwen35::attn_prefix_rows`). Many questions over one prefilled context now
   share the 6 full-attention layers' KV prefix at batch stride 0, as the GDN

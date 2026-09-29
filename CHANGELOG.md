@@ -32,6 +32,12 @@ All notable changes to `tessl` are recorded here. The format follows
   above the diagonal. `bench_qwen35_layers` now times it, and
   `--attn-tile=LABEL` / `--attn-rows` select another tile or the scalar
   kernel.
+- **`qwen35_gdn_chunk_scan_bv16`**, the chunked GDN scan in 16-column value
+  slices, selected by `GdnWorkspace::with_scan_slice(GdnScanSlice::Cols16)`.
+  It launches twice the threadgroups and is bit-identical to the 32-column
+  scan. `probe_gdn_scan` found the 32-column scan underfilling the GPU at
+  batch 1; `bench_qwen35_layers --gdn-scan16` selects it. The default stays
+  32 until a clean A/B.
 - **`qwen35_swiglu_{f32,bf16}` / `qwen35::swiglu`**: Qwen3.5's MLP activation,
   `silu(gate) * up`, from f32 column windows straight to bf16 for the down
   GEMM, replacing `nn::mlp_silu` plus a cast pass in `bench_qwen35_layers`

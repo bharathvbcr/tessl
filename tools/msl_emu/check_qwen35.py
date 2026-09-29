@@ -259,8 +259,16 @@ def case_gdn(kernel, B, T, Hk, Hv, Dv, seed, state_mode="none", **layout_kw):
     inputs = {k_: L[k_] for k_ in ("qkv", "ab", "a_log", "dt_bias")}
     if snap is not None:
         inputs["state_in"] = snap
-    out = run(kernel, params, inputs,
-              {"out": ("f32", B * T * ld_out), "state_out": ("f32", B * Hv * DK * Dv)})
+    outs = {"out": ("f32", B * T * ld_out), "state_out": ("f32", B * Hv * DK * Dv)}
+    out = run(kernel, params, inputs, outs)
+    # The 16-column-slice scan runs each element's arithmetic unchanged, so it
+    # must match bit for bit (bounded to T <= 1000 to keep the run's length).
+    if kernel == "qwen35_gdn_chunk" and T <= 1000:
+        out16 = run(kernel, dict(params, scan_bv16=1), inputs, outs)
+        for name in outs:
+            if not torch.equal(out[name].view(torch.int32), out16[name].view(torch.int32)):
+                print(f"  [FAIL] B{B} T{T} Hv{Hv} Dv{Dv}: scan_bv16 {name} differs from the 32-column scan")
+                FAILURES.append(f"scan_bv16 {name} B{B} T{T}")
 
     got = out["out"].reshape(B * T, ld_out)
     got_heads = got[:, out_off:out_off + Hv * Dv]
@@ -885,6 +893,7 @@ def case_host_contract():
                                 ("GDN_VALUE_BLOCK", "GDN_BV", 1), ("PREP_THREADS", "GDN_PREP_THREADS", 1),
                                 ("SCAN_THREADS", "GDN_SCAN_THREADS", 1),
                                 ("PREP_TG_BYTES", "GDN_PREP_TG_FLOATS", 4), ("SCAN_TG_BYTES", "GDN_SCAN_TG_FLOATS", 4),
+                                ("SCAN16_TG_BYTES", "GDN_SCAN16_TG_FLOATS", 4),
                                 ("REC_TG_BYTES", "GDN_REC_TG_FLOATS", 4),
                                 ("REDUCE_MAX_SIMDGROUPS", "REDUCE_MAX_SIMDGROUPS", 1),
                                 ("PREFIX_ATTN_HEAD_DIM", "PREFIX_ATTN_D", 1),

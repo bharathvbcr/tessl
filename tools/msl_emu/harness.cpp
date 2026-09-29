@@ -87,11 +87,11 @@ int main(int argc, char **argv) {
         // The shapes the kernels are compiled for, for check_qwen35.py to hold
         // src/qwen35.rs's copies of them to.
         std::printf("GDN_DK %u\nGDN_C %u\nGDN_BV %u\nGDN_PREP_THREADS %u\nGDN_SCAN_THREADS %u\n"
-                    "GDN_PREP_TG_FLOATS %u\nGDN_SCAN_TG_FLOATS %u\nGDN_REC_TG_FLOATS %u\n"
+                    "GDN_PREP_TG_FLOATS %u\nGDN_SCAN_TG_FLOATS %u\nGDN_SCAN16_TG_FLOATS %u\nGDN_REC_TG_FLOATS %u\n"
                     "REDUCE_MAX_SIMDGROUPS %u\nPREFIX_ATTN_D %u\nPREFIX_ATTN_R %u\nPREFIX_ATTN_SGT %u\n"
                     "PREFIX_DECODE_CHUNK %u\nPREFIX_DECODE_R %u\n",
                     GDN_DK, GDN_C, GDN_BV, GDN_PREP_THREADS, GDN_SCAN_THREADS, GDN_PREP_TG_FLOATS,
-                    GDN_SCAN_TG_FLOATS, GDN_REC_TG_FLOATS, REDUCE_MAX_SIMDGROUPS, PREFIX_ATTN_D, PREFIX_ATTN_R,
+                    GDN_SCAN_TG_FLOATS, GDN_SCAN16_TG_FLOATS, GDN_REC_TG_FLOATS, REDUCE_MAX_SIMDGROUPS, PREFIX_ATTN_D, PREFIX_ATTN_R,
                     PREFIX_ATTN_SGT, PREFIX_DECODE_CHUNK, PREFIX_DECODE_R);
         return 0;
     }
@@ -145,10 +145,19 @@ int main(int argc, char **argv) {
                                   waq.data(), T, Hk, Hv, ld_qkv, q_off, k_off, ld_ab, a_off, b_off, lens, use_lens,
                                   tgm, id.tg, id.lid, id.sg, id.lane);
         });
-        launch(uint3(Dv / GDN_BV, Hv, B), uint3(GDN_SCAN_THREADS, 1, 1), GDN_SCAN_TG_FLOATS, [&](const Ids &id, float *tgm) {
-            qwen35_gdn_chunk_scan(qkv, wk.data(), wq.data(), wg.data(), wb.data(), ww.data(), waq.data(), si, out,
-                                  so, T, Hv, Dv, ld_qkv, v_off, ld_out, out_off, sb, flags, lens, tgm, id.tg,
-                                  id.lid, id.sg, id.lane);
+        // `scan_bv16`: the 16-column-slice scan (qwen35_gdn_chunk_scan_bv16).
+        const bool bv16 = params.count("scan_bv16") != 0;
+        launch(uint3(Dv / (bv16 ? 16u : GDN_BV), Hv, B), uint3(GDN_SCAN_THREADS, 1, 1),
+               bv16 ? GDN_SCAN16_TG_FLOATS : GDN_SCAN_TG_FLOATS, [&](const Ids &id, float *tgm) {
+            if (bv16) {
+                qwen35_gdn_chunk_scan_bv16(qkv, wk.data(), wq.data(), wg.data(), wb.data(), ww.data(), waq.data(),
+                                           si, out, so, T, Hv, Dv, ld_qkv, v_off, ld_out, out_off, sb, flags, lens,
+                                           tgm, id.tg, id.lid, id.sg, id.lane);
+            } else {
+                qwen35_gdn_chunk_scan(qkv, wk.data(), wq.data(), wg.data(), wb.data(), ww.data(), waq.data(), si,
+                                      out, so, T, Hv, Dv, ld_qkv, v_off, ld_out, out_off, sb, flags, lens, tgm,
+                                      id.tg, id.lid, id.sg, id.lane);
+            }
         });
         if (params.count("dump_ws")) {
             bufs["ws_w"] = std::vector<uint8_t>((uint8_t *)ww.data(), (uint8_t *)(ww.data() + ww.size()));

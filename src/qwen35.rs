@@ -62,6 +62,7 @@ pub const GDN_VALUE_BLOCK: u32 = 32;
 // Threadgroup memory, mirroring `GDN_*_TG_FLOATS` in kernels/qwen35_gdn.metal.
 const PREP_TG_BYTES: usize = 4 * (64 * 65 + 4 * 64);
 const SCAN_TG_BYTES: usize = 4 * (128 * 36 + 64 * 36 + 4 * 128 + 4 * 64);
+const SCAN16_TG_BYTES: usize = 4 * (128 * 20 + 64 * 20 + 4 * 128 + 4 * 64);
 const REC_TG_BYTES: usize = 4 * (2 * 4 * 32);
 const PREP_THREADS: usize = 256;
 const SCAN_THREADS: usize = 128;
@@ -753,9 +754,24 @@ pub struct GdnParams<'a> {
     pub dt_bias: &'a GpuBuffer,
 }
 
+/// How many value columns one threadgroup of the chunked rule's sequential scan
+/// owns. Each output element runs the same arithmetic either way, so the
+/// results are bit-identical; `Cols16` launches twice the threadgroups, which
+/// pays when a small batch leaves the GPU underfilled (`probe_gdn_scan`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum GdnScanSlice {
+    /// `qwen35_gdn_chunk_scan`: `v_dim / 32` threadgroups per head.
+    #[default]
+    Cols32,
+    /// `qwen35_gdn_chunk_scan_bv16`: `v_dim / 16` threadgroups per head.
+    Cols16,
+}
+
 /// Scratch for [`gdn_chunk_forward`]'s two passes. Allocate once for the
-/// largest call and reuse it across layers.
+/// largest call and reuse it across layers. It also carries the scan's
+/// [`GdnScanSlice`], so every chunked entry point that takes it honours it.
 pub struct GdnWorkspace {
+    scan: GdnScanSlice,
     k: GpuBuffer,
     q: GpuBuffer,
     g: GpuBuffer,
@@ -791,6 +807,7 @@ impl GdnWorkspace {
         // A zero-length Metal buffer is not a buffer; keep every slot non-empty.
         let alloc = |n: usize| rt.alloc_buffer(n.max(16));
         Ok(Self {
+            scan: GdnScanSlice::default(),
             k: alloc(kq)?,
             q: alloc(kq)?,
             g: alloc(row_bytes)?,
@@ -798,6 +815,12 @@ impl GdnWorkspace {
             w: alloc(blk)?,
             aq: alloc(blk)?,
         })
+    }
+
+    /// This workspace with the scan run in `slice`-column slices.
+    pub fn with_scan_slice(mut self, slice: GdnScanSlice) -> Self {
+        self.scan = slice;
+        self
     }
 
     /// Bytes this workspace needs for `dims`.
@@ -1107,7 +1130,17 @@ fn gdn_chunk_forward_impl(
     }
 
     let prep = pipeline_for(rt, "qwen35_gdn_chunk_prep", PREP_THREADS, PREP_TG_BYTES)?;
-    let scan = pipeline_for(rt, "qwen35_gdn_chunk_scan", SCAN_THREADS, SCAN_TG_BYTES)?;
+    // Literal names, so the emulator's host-contract check sees both kernels
+    // this site binds.
+    let scan_name = match ws.scan {
+        GdnScanSlice::Cols32 => "qwen35_gdn_chunk_scan",
+        GdnScanSlice::Cols16 => "qwen35_gdn_chunk_scan_bv16",
+    };
+    let (scan_cols, scan_bytes) = match ws.scan {
+        GdnScanSlice::Cols32 => (GDN_VALUE_BLOCK, SCAN_TG_BYTES),
+        GdnScanSlice::Cols16 => (16, SCAN16_TG_BYTES),
+    };
+    let scan = pipeline_for(rt, scan_name, SCAN_THREADS, scan_bytes)?;
     let run_prep = phases != ChunkPhases::Only(GdnChunkPhase::Scan);
     let run_scan = phases != ChunkPhases::Only(GdnChunkPhase::Prep);
     if run_prep {
@@ -1156,12 +1189,12 @@ fn gdn_chunk_forward_impl(
         rt,
         &scan,
         (
-            (dims.v_dim / GDN_VALUE_BLOCK) as usize,
+            (dims.v_dim / scan_cols) as usize,
             dims.v_heads as usize,
             dims.batch as usize,
         ),
         SCAN_THREADS,
-        SCAN_TG_BYTES,
+        scan_bytes,
         |bnd| {
             set_gpu_buf(bnd, qkv.buf, 0);
             set_gpu_buf(bnd, &ws.k, 1);
@@ -2732,6 +2765,7 @@ mod tests {
         for bytes in [
             PREP_TG_BYTES,
             SCAN_TG_BYTES,
+            SCAN16_TG_BYTES,
             REC_TG_BYTES,
             score_tg_bytes(MAX_ANSWERS),
         ] {

@@ -7,6 +7,7 @@
 //! cargo run --release --bin bench_qwen35_layers -- --attn-rows  # scalar nn::flash_attn_rows
 //! cargo run --release --bin bench_qwen35_layers -- --attn-tile=q64_k64_sg8
 //! cargo run --release --bin bench_qwen35_layers -- --mlp-unfused # mlp_silu + cast
+//! cargo run --release --bin bench_qwen35_layers -- --gdn-scan16  # 16-column GDN scan
 //! ```
 //!
 //! Attention runs on `qwen35::attn_prefill` (the TensorOps kernel) at its
@@ -276,7 +277,8 @@ impl Acts {
             g_qkv: rt.alloc_buffer(t * m.gdn.conv_dim() as usize * 4)?,
             g_o: rt.alloc_buffer(t * m.gdn.value_dim() as usize * 4)?,
             g_y: rt.alloc_tensor_bf16(&[t, m.gdn.value_dim() as usize])?,
-            g_ws: GdnWorkspace::new(rt, &g_dims)?,
+            g_ws: GdnWorkspace::new(rt, &g_dims)?
+                .with_scan_slice(*GDN_SCAN.get().expect("set in main")),
             g_dims,
             a_proj: rt.alloc_tensor_f32(&[t, m.attn.width() as usize])?,
             a_q: rt.alloc_buffer(t * qd * 4)?,
@@ -432,6 +434,9 @@ const ATTN_STAGES: [&str; 5] = [
     "output gate",
     "o-proj + resid",
 ];
+
+/// `--gdn-scan16`: the chunked GDN rule's scan in 16-column slices.
+static GDN_SCAN: std::sync::OnceLock<qwen35::GdnScanSlice> = std::sync::OnceLock::new();
 
 /// Which attention kernel the attention stage times.
 #[derive(Clone, Copy, Debug)]
@@ -748,10 +753,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut check_only = false;
     let mut attn = AttnChoice::Tiled(qwen35::ATTN_PREFILL_TILE);
     let mut mlp_unfused = false;
+    let mut gdn_scan = qwen35::GdnScanSlice::Cols32;
     let mut ts = Vec::new();
     for arg in std::env::args().skip(1) {
         if arg == "--check-only" {
             check_only = true;
+        } else if arg == "--gdn-scan16" {
+            gdn_scan = qwen35::GdnScanSlice::Cols16;
         } else if arg == "--mlp-unfused" {
             mlp_unfused = true;
         } else if arg == "--attn-rows" {
@@ -769,8 +777,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         } else {
             let t: usize = arg.parse().map_err(|_| {
                 format!(
-                    "expected a token count, --check-only, --attn-rows, --attn-tile=LABEL or \
-                     --mlp-unfused, got {arg:?}"
+                    "expected a token count, --check-only, --attn-rows, --attn-tile=LABEL, \
+                     --mlp-unfused or --gdn-scan16, got {arg:?}"
                 )
             })?;
             if t == 0 {
@@ -795,6 +803,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let n_attn = (0..LAYERS).filter(|&l| is_full_attention(l)).count();
     let n_gdn = LAYERS - n_attn;
     println!("layers: {n_gdn} GDN + {n_attn} attention, batch 1, bf16 weights distinct per layer");
+    GDN_SCAN
+        .set(gdn_scan)
+        .map_err(|_| "GDN scan slice chosen twice")?;
+    println!("gdn scan: {gdn_scan:?}");
     MLP_UNFUSED
         .set(mlp_unfused)
         .map_err(|_| "MLP path chosen twice")?;

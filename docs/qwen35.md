@@ -120,6 +120,20 @@ it once and reuse it across layers. Very long prompts can be split into segments
 and carried through `StateIn::PerBatch` + `state_out` to bound it; the result is
 identical.
 
+### The scan's value slice
+
+The scan's threadgroups each own a slice of the value columns, and its math
+is separable by column: every per-chunk product maps value column c only to
+column c. So the slice width sets the parallelism without changing any
+element's arithmetic. `GdnScanSlice::Cols16` (`qwen35_gdn_chunk_scan_bv16`,
+18 KB of threadgroup memory against 30 KB) launches twice the threadgroups of
+the default `Cols32`, bit for bit the same result. At Qwen3.5-2B's shapes
+the 32-column scan is only 64 threadgroups at batch 1. `probe_gdn_scan`
+measured the scan at 1.37–1.55× its batch-1 time at batch 2, and 2.8× at
+batch 4, so batch 1 leaves the GPU partly idle. It is a same-session ratio
+under UI load. The default stays `Cols32` until a clean A/B
+(`probe_gdn_scan`, `bench_qwen35_layers --gdn-scan16`).
+
 ### Many questions from one prefilled snapshot
 
 `StateIn::Snapshot(buf)` makes every batch row start from the same state and

@@ -90,7 +90,7 @@ jobs:
           # false miss when grep exits early and strings takes SIGPIPE.
           strings "$RUNNER_TEMP/qwen35.metallib" > "$RUNNER_TEMP/symbols.txt"
           missing=0
-          for fn in qwen35_conv1d_silu qwen35_gdn_chunk_prep qwen35_gdn_chunk_scan qwen35_gdn_recurrent \
+          for fn in qwen35_conv1d_silu qwen35_gdn_chunk_prep qwen35_gdn_chunk_scan qwen35_gdn_chunk_scan_bv16 qwen35_gdn_recurrent \
                     qwen35_gated_rms_norm_f32 qwen35_gated_rms_norm_bf16 qwen35_attn_qk_norm_rope \
                     qwen35_attn_qk_norm_rope_posbuf qwen35_attn_gate_f32 qwen35_attn_gate_bf16 \
                     qwen35_attn_prefix_rows qwen35_attn_prefix_decode_partial \

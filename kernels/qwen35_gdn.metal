@@ -473,6 +473,9 @@ constant uint GDN_TLD = GDN_BV + 4u;
 constant uint GDN_SCAN_TG_FLOATS =
     GDN_DK * GDN_TLD + GDN_C * GDN_TLD + (GDN_SCAN_THREADS / 32u) * 2u * 64u + 4u * GDN_C;
 static_assert(GDN_SCAN_TG_FLOATS * 4u <= 32768u, "scan threadgroup memory exceeds 32 KB");
+/// The same layout for `qwen35_gdn_chunk_scan_bv16`'s 16-column slices.
+constant uint GDN_SCAN16_TG_FLOATS =
+    GDN_DK * (16u + 4u) + GDN_C * (16u + 4u) + (GDN_SCAN_THREADS / 32u) * 2u * 64u + 4u * GDN_C;
 
 /// The sequential pass over chunks, for one (batch, value head, 32-column
 /// slice of Dv). Reads what `qwen35_gdn_chunk_prep` wrote, plus V.
@@ -488,33 +491,21 @@ static_assert(GDN_SCAN_TG_FLOATS * 4u <= 32768u, "scan threadgroup memory exceed
 /// Output head `hv` goes to columns [out_off + hv*Dv, +Dv) of row `b*T + t`.
 ///
 /// 128 threads = 4 simdgroups. Grid: x = Dv / 32, y = value head, z = batch.
-kernel void qwen35_gdn_chunk_scan(
-    device const float *qkv [[buffer(0)]],
-    device const float *ws_k [[buffer(1)]],
-    device const float *ws_q [[buffer(2)]],
-    device const float *ws_g [[buffer(3)]],
-    device const float *ws_beta [[buffer(4)]],
-    device const float *ws_w [[buffer(5)]],
-    device const float *ws_aq [[buffer(6)]],
-    device const float *state_in [[buffer(7)]],
-    device float *out [[buffer(8)]],
-    device float *state_out [[buffer(9)]],
-    constant uint &T [[buffer(10)]],
-    constant uint &Hv [[buffer(11)]],
-    constant uint &Dv [[buffer(12)]],
-    constant uint &ld_qkv [[buffer(13)]],
-    constant uint &v_off [[buffer(14)]],
-    constant uint &ld_out [[buffer(15)]],
-    constant uint &out_off [[buffer(16)]],
-    constant uint &state_bstride [[buffer(17)]],
-    constant uint &flags [[buffer(18)]],
-    device const uint *seq_lens [[buffer(19)]],
-    threadgroup float *tgm [[threadgroup(0)]],
-    uint3 tg [[threadgroup_position_in_grid]],
-    uint lid [[thread_index_in_threadgroup]],
-    uint sg [[simdgroup_index_in_threadgroup]],
-    uint lane [[thread_index_in_simdgroup]])
+/// The scan body for one BV-column slice of Dv (BV = 32 or 16); see
+/// `GDN_SCAN_KERNEL` below for the contract.
+template <uint BV>
+inline void gdn_scan_body(
+    device const float *qkv, device const float *ws_k, device const float *ws_q,
+    device const float *ws_g, device const float *ws_beta, device const float *ws_w,
+    device const float *ws_aq, device const float *state_in, device float *out,
+    device float *state_out, uint T, uint Hv, uint Dv, uint ld_qkv, uint v_off,
+    uint ld_out, uint out_off, uint state_bstride, uint flags,
+    device const uint *seq_lens, threadgroup float *tgm, uint3 tg, uint lid, uint sg,
+    uint lane)
 {
+    static_assert(BV % 8u == 0u && BV <= 32u, "8-column tiles, at most 4");
+    constexpr uint CT = BV / 8u;   // 8-column tiles per slice
+    constexpr uint TLD = BV + 4u;  // tile row stride, padded off the banks
     const uint vs = tg.x;
     const uint hv = tg.y;
     const uint b = tg.z;
@@ -525,11 +516,11 @@ kernel void qwen35_gdn_chunk_scan(
     const uint nc_b = (Tb + GDN_C - 1u) / GDN_C;
     const ulong tp = (ulong)nc * GDN_C;
     const ulong head = (ulong)b * Hv + hv;
-    const uint v0 = vs * GDN_BV;
+    const uint v0 = vs * BV;
 
     threadgroup float *S = tgm;                                  // [DK][TLD]
-    threadgroup float *X = S + GDN_DK * GDN_TLD;                 // [C][TLD]
-    threadgroup float *stage = X + GDN_C * GDN_TLD;              // [4][2][64]
+    threadgroup float *X = S + GDN_DK * TLD;                 // [C][TLD]
+    threadgroup float *stage = X + GDN_C * TLD;              // [4][2][64]
     threadgroup float *Gc = stage + (GDN_SCAN_THREADS / 32u) * 2u * 64u; // [C]
     threadgroup float *Bc = Gc + GDN_C;                          // [C] beta
     threadgroup float *Ec = Bc + GDN_C;                          // [C] exp(G)
@@ -538,10 +529,10 @@ kernel void qwen35_gdn_chunk_scan(
     threadgroup float *st2 = st1 + 64u;
 
     const ulong state_head = (ulong)hv * GDN_DK * Dv;
-    for (uint idx = lid; idx < GDN_DK * GDN_BV; idx += GDN_SCAN_THREADS) {
-        const uint kk = idx / GDN_BV;
-        const uint v = idx % GDN_BV;
-        S[kk * GDN_TLD + v] = (flags & 1u) != 0u
+    for (uint idx = lid; idx < GDN_DK * BV; idx += GDN_SCAN_THREADS) {
+        const uint kk = idx / BV;
+        const uint v = idx % BV;
+        S[kk * TLD + v] = (flags & 1u) != 0u
             ? state_in[(ulong)b * state_bstride + state_head + (ulong)kk * Dv + v0 + v]
             : 0.0f;
     }
@@ -571,9 +562,9 @@ kernel void qwen35_gdn_chunk_scan(
 
         // --- X = K S; simdgroup sg owns row blocks 2sg, 2sg+1 ----------------
         {
-            simdgroup_float8x8 acc[2][4];
+            simdgroup_float8x8 acc[2][CT];
             for (uint r = 0u; r < 2u; ++r) {
-                for (uint ct = 0u; ct < 4u; ++ct) {
+                for (uint ct = 0u; ct < CT; ++ct) {
                     acc[r][ct] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
                 }
             }
@@ -583,48 +574,48 @@ kernel void qwen35_gdn_chunk_scan(
                     simdgroup_load(a[r], wk + (ulong)((2u * sg + r) * 8u) * GDN_DK + kk * 8u, GDN_DK);
                 }
                 // Each state tile is loaded once for both row blocks.
-                for (uint ct = 0u; ct < 4u; ++ct) {
+                for (uint ct = 0u; ct < CT; ++ct) {
                     simdgroup_float8x8 st;
-                    simdgroup_load(st, S + kk * 8u * GDN_TLD + ct * 8u, GDN_TLD);
+                    simdgroup_load(st, S + kk * 8u * TLD + ct * 8u, TLD);
                     for (uint r = 0u; r < 2u; ++r) {
                         simdgroup_multiply_accumulate(acc[r][ct], a[r], st, acc[r][ct]);
                     }
                 }
             }
             for (uint r = 0u; r < 2u; ++r) {
-                for (uint ct = 0u; ct < 4u; ++ct) {
-                    simdgroup_store(acc[r][ct], X + (2u * sg + r) * 8u * GDN_TLD + ct * 8u, GDN_TLD);
+                for (uint ct = 0u; ct < CT; ++ct) {
+                    simdgroup_store(acc[r][ct], X + (2u * sg + r) * 8u * TLD + ct * 8u, TLD);
                 }
             }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
         // --- X = beta * (V - exp(G) * X) --------------------------------------
-        for (uint idx = lid; idx < GDN_C * GDN_BV; idx += GDN_SCAN_THREADS) {
-            const uint i = idx / GDN_BV;
-            const uint v = idx % GDN_BV;
+        for (uint idx = lid; idx < GDN_C * BV; idx += GDN_SCAN_THREADS) {
+            const uint i = idx / BV;
+            const uint v = idx % BV;
             const uint t = t0 + i;
             const float vv = t < Tb
                 ? qkv[((ulong)b * T + t) * (ulong)ld_qkv + v_off + (ulong)hv * Dv + v0 + v]
                 : 0.0f;
-            X[i * GDN_TLD + v] = Bc[i] * (vv - Ec[i] * X[i * GDN_TLD + v]);
+            X[i * TLD + v] = Bc[i] * (vv - Ec[i] * X[i * TLD + v]);
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
         // --- U = W X (W unit lower triangular: skip the zero tiles) ----------
         {
-            simdgroup_float8x8 acc[2][4];
+            simdgroup_float8x8 acc[2][CT];
             for (uint r = 0u; r < 2u; ++r) {
                 const uint rt = 2u * sg + r;
-                for (uint ct = 0u; ct < 4u; ++ct) {
+                for (uint ct = 0u; ct < CT; ++ct) {
                     acc[r][ct] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
                 }
                 for (uint kb = 0u; kb <= rt; ++kb) {
                     simdgroup_float8x8 a;
                     simdgroup_load(a, ww + rt * 8u * GDN_C + kb * 8u, GDN_C);
-                    for (uint ct = 0u; ct < 4u; ++ct) {
+                    for (uint ct = 0u; ct < CT; ++ct) {
                         simdgroup_float8x8 x;
-                        simdgroup_load(x, X + kb * 8u * GDN_TLD + ct * 8u, GDN_TLD);
+                        simdgroup_load(x, X + kb * 8u * TLD + ct * 8u, TLD);
                         simdgroup_multiply_accumulate(acc[r][ct], a, x, acc[r][ct]);
                     }
                 }
@@ -632,8 +623,8 @@ kernel void qwen35_gdn_chunk_scan(
             // Every simdgroup reads all of X above; none may overwrite it early.
             threadgroup_barrier(mem_flags::mem_threadgroup);
             for (uint r = 0u; r < 2u; ++r) {
-                for (uint ct = 0u; ct < 4u; ++ct) {
-                    simdgroup_store(acc[r][ct], X + (2u * sg + r) * 8u * GDN_TLD + ct * 8u, GDN_TLD);
+                for (uint ct = 0u; ct < CT; ++ct) {
+                    simdgroup_store(acc[r][ct], X + (2u * sg + r) * 8u * TLD + ct * 8u, TLD);
                 }
             }
         }
@@ -646,31 +637,31 @@ kernel void qwen35_gdn_chunk_scan(
         // straight to `out` would write the padding rows into the next sequence.
         for (uint r = 0u; r < 2u; ++r) {
             const uint rt = 2u * sg + r;
-            simdgroup_float8x8 o1[4];
-            simdgroup_float8x8 o2[4];
-            for (uint ct = 0u; ct < 4u; ++ct) {
+            simdgroup_float8x8 o1[CT];
+            simdgroup_float8x8 o2[CT];
+            for (uint ct = 0u; ct < CT; ++ct) {
                 o1[ct] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
                 o2[ct] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
             }
             for (uint kk = 0u; kk < GDN_DK / 8u; ++kk) {
                 simdgroup_float8x8 a;
                 simdgroup_load(a, wq + (ulong)(rt * 8u) * GDN_DK + kk * 8u, GDN_DK);
-                for (uint ct = 0u; ct < 4u; ++ct) {
+                for (uint ct = 0u; ct < CT; ++ct) {
                     simdgroup_float8x8 st;
-                    simdgroup_load(st, S + kk * 8u * GDN_TLD + ct * 8u, GDN_TLD);
+                    simdgroup_load(st, S + kk * 8u * TLD + ct * 8u, TLD);
                     simdgroup_multiply_accumulate(o1[ct], a, st, o1[ct]);
                 }
             }
             for (uint kb = 0u; kb <= rt; ++kb) {
                 simdgroup_float8x8 a;
                 simdgroup_load(a, waq + rt * 8u * GDN_C + kb * 8u, GDN_C);
-                for (uint ct = 0u; ct < 4u; ++ct) {
+                for (uint ct = 0u; ct < CT; ++ct) {
                     simdgroup_float8x8 u;
-                    simdgroup_load(u, X + kb * 8u * GDN_TLD + ct * 8u, GDN_TLD);
+                    simdgroup_load(u, X + kb * 8u * TLD + ct * 8u, TLD);
                     simdgroup_multiply_accumulate(o2[ct], a, u, o2[ct]);
                 }
             }
-            for (uint ct = 0u; ct < 4u; ++ct) {
+            for (uint ct = 0u; ct < CT; ++ct) {
                 simdgroup_store(o1[ct], st1, 8);
                 simdgroup_store(o2[ct], st2, 8);
                 simdgroup_barrier(mem_flags::mem_threadgroup);
@@ -691,12 +682,12 @@ kernel void qwen35_gdn_chunk_scan(
         // Both scalings are elementwise passes: nothing reads S or U until the
         // barrier after them.
         const float decay = Ec[GDN_C - 1u];
-        for (uint idx = lid; idx < GDN_C * GDN_BV; idx += GDN_SCAN_THREADS) {
-            const uint i = idx / GDN_BV;
-            X[i * GDN_TLD + idx % GDN_BV] *= Dc[i];
+        for (uint idx = lid; idx < GDN_C * BV; idx += GDN_SCAN_THREADS) {
+            const uint i = idx / BV;
+            X[i * TLD + idx % BV] *= Dc[i];
         }
-        for (uint idx = lid; idx < GDN_DK * GDN_BV; idx += GDN_SCAN_THREADS) {
-            S[(idx / GDN_BV) * GDN_TLD + idx % GDN_BV] *= decay;
+        for (uint idx = lid; idx < GDN_DK * BV; idx += GDN_SCAN_THREADS) {
+            S[(idx / BV) * TLD + idx % BV] *= decay;
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
         // simdgroup sg owns state row blocks 4sg .. 4sg+3; nobody else reads or
@@ -704,22 +695,22 @@ kernel void qwen35_gdn_chunk_scan(
         // once for the four column tiles of its row block.
         for (uint r = 0u; r < 4u; ++r) {
             const uint kt = 4u * sg + r;
-            simdgroup_float8x8 acc[4];
-            for (uint ct = 0u; ct < 4u; ++ct) {
-                simdgroup_load(acc[ct], S + kt * 8u * GDN_TLD + ct * 8u, GDN_TLD);
+            simdgroup_float8x8 acc[CT];
+            for (uint ct = 0u; ct < CT; ++ct) {
+                simdgroup_load(acc[ct], S + kt * 8u * TLD + ct * 8u, TLD);
             }
             for (uint kb = 0u; kb < GDN_C / 8u; ++kb) {
                 simdgroup_float8x8 a;
                 simdgroup_load(a, wk + (ulong)(kb * 8u) * GDN_DK + kt * 8u, GDN_DK,
                                ulong2(0, 0), true);
-                for (uint ct = 0u; ct < 4u; ++ct) {
+                for (uint ct = 0u; ct < CT; ++ct) {
                     simdgroup_float8x8 u;
-                    simdgroup_load(u, X + kb * 8u * GDN_TLD + ct * 8u, GDN_TLD);
+                    simdgroup_load(u, X + kb * 8u * TLD + ct * 8u, TLD);
                     simdgroup_multiply_accumulate(acc[ct], a, u, acc[ct]);
                 }
             }
-            for (uint ct = 0u; ct < 4u; ++ct) {
-                simdgroup_store(acc[ct], S + kt * 8u * GDN_TLD + ct * 8u, GDN_TLD);
+            for (uint ct = 0u; ct < CT; ++ct) {
+                simdgroup_store(acc[ct], S + kt * 8u * TLD + ct * 8u, TLD);
             }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -731,13 +722,53 @@ kernel void qwen35_gdn_chunk_scan(
         if (nc == 0u) {
             threadgroup_barrier(mem_flags::mem_threadgroup);
         }
-        for (uint idx = lid; idx < GDN_DK * GDN_BV; idx += GDN_SCAN_THREADS) {
-            const uint kk = idx / GDN_BV;
-            const uint v = idx % GDN_BV;
-            state_out[head * GDN_DK * Dv + (ulong)kk * Dv + v0 + v] = S[kk * GDN_TLD + v];
+        for (uint idx = lid; idx < GDN_DK * BV; idx += GDN_SCAN_THREADS) {
+            const uint kk = idx / BV;
+            const uint v = idx % BV;
+            state_out[head * GDN_DK * Dv + (ulong)kk * Dv + v0 + v] = S[kk * TLD + v];
         }
     }
 }
+
+#define GDN_SCAN_KERNEL(NAME, BV)                                                  \
+kernel void NAME(                                                                  \
+    device const float *qkv [[buffer(0)]],                                         \
+    device const float *ws_k [[buffer(1)]],                                        \
+    device const float *ws_q [[buffer(2)]],                                        \
+    device const float *ws_g [[buffer(3)]],                                        \
+    device const float *ws_beta [[buffer(4)]],                                     \
+    device const float *ws_w [[buffer(5)]],                                        \
+    device const float *ws_aq [[buffer(6)]],                                       \
+    device const float *state_in [[buffer(7)]],                                    \
+    device float *out [[buffer(8)]],                                               \
+    device float *state_out [[buffer(9)]],                                         \
+    constant uint &T [[buffer(10)]],                                               \
+    constant uint &Hv [[buffer(11)]],                                              \
+    constant uint &Dv [[buffer(12)]],                                              \
+    constant uint &ld_qkv [[buffer(13)]],                                          \
+    constant uint &v_off [[buffer(14)]],                                           \
+    constant uint &ld_out [[buffer(15)]],                                          \
+    constant uint &out_off [[buffer(16)]],                                         \
+    constant uint &state_bstride [[buffer(17)]],                                   \
+    constant uint &flags [[buffer(18)]],                                           \
+    device const uint *seq_lens [[buffer(19)]],                                    \
+    threadgroup float *tgm [[threadgroup(0)]],                                     \
+    uint3 tg [[threadgroup_position_in_grid]],                                     \
+    uint lid [[thread_index_in_threadgroup]],                                      \
+    uint sg [[simdgroup_index_in_threadgroup]],                                    \
+    uint lane [[thread_index_in_simdgroup]])                                       \
+{                                                                                  \
+    gdn_scan_body<BV>(qkv, ws_k, ws_q, ws_g, ws_beta, ws_w, ws_aq, state_in, out,  \
+                      state_out, T, Hv, Dv, ld_qkv, v_off, ld_out, out_off,        \
+                      state_bstride, flags, seq_lens, tgm, tg, lid, sg, lane);     \
+}
+
+/// `qwen35_gdn_chunk_scan`: 32-column slices, Dv / 32 threadgroups per head.
+GDN_SCAN_KERNEL(qwen35_gdn_chunk_scan, 32u)
+/// 16-column slices: twice the threadgroups, for when a batch leaves the GPU
+/// underfilled (`probe_gdn_scan`). Each output element runs the same
+/// arithmetic in either, so the two agree bit for bit.
+GDN_SCAN_KERNEL(qwen35_gdn_chunk_scan_bv16, 16u)
 
 // --------------------------------------------------------------- recurrent ---
 

@@ -14,14 +14,19 @@
 //! is occupancy-bound and more parallelism per sequence would pay. Time that
 //! grows linearly means it already fills the machine.
 //!
-//! Only the ratios across B are meaningful: the inputs are random, and a
+//! Each B also runs the 16-column-slice scan (`GdnScanSlice::Cols16`), twice
+//! the threadgroups for the same work; its last column is its time over the
+//! 32-column scan's in the same session.
+//!
+//! Only the ratios are meaningful: the inputs are random, and a
 //! contended GPU slows every B alike.
 
 use std::sync::Arc;
 use std::time::Instant;
 
 use tessl::qwen35::{
-    self, Cols, GdnChunkPhase, GdnDims, GdnGateLogits, GdnParams, GdnQkv, GdnWorkspace, StateIn,
+    self, Cols, GdnChunkPhase, GdnDims, GdnGateLogits, GdnParams, GdnQkv, GdnScanSlice,
+    GdnWorkspace, StateIn,
 };
 use tessl::GpuRuntime;
 
@@ -60,7 +65,7 @@ fn median(mut v: Vec<f64>) -> f64 {
 }
 
 /// Median ms of one scan over `batch` sequences of `t` tokens.
-fn scan_ms(rt: &Arc<GpuRuntime>, batch: u32, t: u32) -> Res<f64> {
+fn scan_ms(rt: &Arc<GpuRuntime>, batch: u32, t: u32, slice: GdnScanSlice) -> Res<f64> {
     let dims = GdnDims {
         batch,
         seq: t,
@@ -87,7 +92,7 @@ fn scan_ms(rt: &Arc<GpuRuntime>, batch: u32, t: u32) -> Res<f64> {
         .buffer
         .write_f32(&fill(V_HEADS as usize, 4, 1.0, -3.0));
     let out = rt.alloc_tensor_f32(&[rows, out_w as usize])?;
-    let ws = GdnWorkspace::new(rt, &dims)?;
+    let ws = GdnWorkspace::new(rt, &dims)?.with_scan_slice(slice);
     let q = GdnQkv {
         buf: &qkv.buffer,
         ld: qkv_ld,
@@ -166,16 +171,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
          {REPS} per command buffer"
     );
     println!(
-        "{:>6} {:>3} {:>7} {:>10} {:>12}",
-        "T", "B", "TGs", "ms", "ms / B=1"
+        "{:>6} {:>3} {:>5} {:>7} {:>10} {:>12} {:>14}",
+        "T", "B", "cols", "TGs", "ms", "ms / B=1", "ms / cols 32"
     );
     for &t in &ts {
         let mut base = None;
         for b in [1u32, 2, 4] {
-            let ms = scan_ms(&rt, b, t)?;
-            let b1 = *base.get_or_insert(ms);
-            let tgs = b * V_HEADS * (V_DIM / 32);
-            println!("{t:>6} {b:>3} {tgs:>7} {ms:>10.3} {:>12.2}", ms / b1);
+            let mut wide = None;
+            for (slice, cols) in [(GdnScanSlice::Cols32, 32u32), (GdnScanSlice::Cols16, 16)] {
+                let ms = scan_ms(&rt, b, t, slice)?;
+                let w = *wide.get_or_insert(ms);
+                let tgs = b * V_HEADS * (V_DIM / cols);
+                let rel_b = if cols == 32 {
+                    format!("{:.2}", ms / *base.get_or_insert(ms))
+                } else {
+                    String::new()
+                };
+                println!(
+                    "{t:>6} {b:>3} {cols:>5} {tgs:>7} {ms:>10.3} {rel_b:>12} {:>14.2}",
+                    ms / w
+                );
+            }
         }
     }
     Ok(())

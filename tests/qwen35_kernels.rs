@@ -30,7 +30,7 @@ use common::qwen35::*;
 use common::{buf, buf_u32, random_f32, seeded, with_gpu};
 use tessl::qwen35::{
     self, AttnProjLayout, AttnShape, AttnTargets, Cols, GdnDims, GdnGateLogits, GdnParams,
-    GdnProjLayout, GdnQkv, GdnWorkspace, LmHead, OutCols, StateIn,
+    GdnProjLayout, GdnQkv, GdnScanSlice, GdnWorkspace, LmHead, OutCols, StateIn,
 };
 use tessl::tensor::{bf16_bits_to_f32, f32_slice_to_bf16, DType, GpuBuffer};
 use tessl::{GemmBackend, GpuRuntime};
@@ -344,12 +344,41 @@ fn run_gdn_with(
 }
 
 /// [`run_gdn_with`], through the `_varlen` entry points when `lens` is given.
+///
+/// The chunked path runs with both scan slices (`GdnScanSlice`), which must
+/// agree bit for bit, so every chunked test holds both kernels.
 fn run_gdn_lens(
     rt: &Arc<GpuRuntime>,
     d: &GdnData,
     path: Path,
     mode: StateOut,
     lens: Option<&[u32]>,
+) -> (Vec<f32>, Vec<f32>) {
+    let base = run_gdn_slice(rt, d, path, mode, lens, GdnScanSlice::Cols32);
+    if path == Path::Chunk {
+        let narrow = run_gdn_slice(rt, d, path, mode, lens, GdnScanSlice::Cols16);
+        let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+        assert_eq!(
+            bits(&narrow.0),
+            bits(&base.0),
+            "16-column scan output vs 32-column"
+        );
+        assert_eq!(
+            bits(&narrow.1),
+            bits(&base.1),
+            "16-column scan state vs 32-column"
+        );
+    }
+    base
+}
+
+fn run_gdn_slice(
+    rt: &Arc<GpuRuntime>,
+    d: &GdnData,
+    path: Path,
+    mode: StateOut,
+    lens: Option<&[u32]>,
+    slice: GdnScanSlice,
 ) -> (Vec<f32>, Vec<f32>) {
     let s = d.s;
     let dims = dims_of(s);
@@ -383,7 +412,7 @@ fn run_gdn_lens(
     let (qkv, gates, params) = (p.qkv(), p.gates(dims.v_heads), p.params());
     match (path, &lens_buf) {
         (Path::Chunk, _) => {
-            let ws = GdnWorkspace::new(rt, &dims).unwrap();
+            let ws = GdnWorkspace::new(rt, &dims).unwrap().with_scan_slice(slice);
             if lens_buf.is_some() {
                 // A workspace is reused across layers, so a ragged call must
                 // not read what an earlier call left there. Fill it with live
@@ -1824,6 +1853,7 @@ fn every_qwen35_kernel_is_in_the_metallib() {
             "qwen35_conv1d_silu",
             "qwen35_gdn_chunk_prep",
             "qwen35_gdn_chunk_scan",
+            "qwen35_gdn_chunk_scan_bv16",
             "qwen35_gdn_recurrent",
             "qwen35_gated_rms_norm_f32",
             "qwen35_gated_rms_norm_bf16",

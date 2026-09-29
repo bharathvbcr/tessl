@@ -500,6 +500,34 @@ def case_prefix_rows(seed, B, P, S, s_cap, Tq, q_pos):
     check(tag + " vs torch", got, ref, 1e-5, 1e-5)
 
 
+def case_prefix_decode(seed, B, P, S, s_cap, q_pos):
+    """Shared-prefix split-KV decode (one query per row) against torch's causal
+    softmax over prefix ‖ suffix. Dead K/V slots are NaN."""
+    g = seeded(seed)
+    H, Hkv, D = 8, 2, 256
+    p_cap = P + 2
+    kp, vp = torch.randn(p_cap, Hkv, D, generator=g), torch.randn(p_cap, Hkv, D, generator=g)
+    ks, vs = torch.randn(B, s_cap, Hkv, D, generator=g), torch.randn(B, s_cap, Hkv, D, generator=g)
+    for t in (kp, vp):
+        t[P:] = float("nan")
+    for t in (ks, vs):
+        t[:, S:] = float("nan")
+    q = torch.randn(B, 1, H, D, generator=g)
+    scale = D ** -0.5
+    got = run("qwen35_attn_prefix_decode", dict(B=B, H=H, Hkv=Hkv, P=P, suffix_cap=s_cap, scale=scale),
+              {"q": q, "kp": kp, "vp": vp, "ks": ks, "vs": vs,
+               "suffix_len": torch.tensor([S], dtype=torch.int32),
+               "q_pos": torch.tensor([q_pos], dtype=torch.int32)},
+              {"o": ("f32", B * H * D)})["o"]
+    n_kv = min(P + S, q_pos + 1)
+    kf = torch.cat([kp[:P].expand(B, P, Hkv, D), ks], dim=1)[:, :n_kv].double()
+    vf = torch.cat([vp[:P].expand(B, P, Hkv, D), vs], dim=1)[:, :n_kv].double()
+    kk, vv = kf.repeat_interleave(H // Hkv, dim=2), vf.repeat_interleave(H // Hkv, dim=2)
+    sc = torch.einsum("bthd,bshd->bhts", q.double(), kk) * scale
+    ref = torch.einsum("bhts,bshd->bthd", sc.softmax(-1), vv)
+    check(f"attn_prefix_decode B{B} P{P} S{S}/{s_cap} q@{q_pos} vs torch", got, ref, 1e-5, 1e-5)
+
+
 def case_qk_rope_slot_base(seed):
     """`slot_base` moves only the cache slot: a suffix cached relative to a
     prefix of P holds, bit for bit, what a cache from position 0 holds at P.."""
@@ -712,7 +740,9 @@ def case_host_contract():
                                 ("REDUCE_MAX_SIMDGROUPS", "REDUCE_MAX_SIMDGROUPS", 1),
                                 ("PREFIX_ATTN_HEAD_DIM", "PREFIX_ATTN_D", 1),
                                 ("PREFIX_ATTN_LANES", "PREFIX_ATTN_R", 1),
-                                ("PREFIX_ATTN_SIMDGROUPS", "PREFIX_ATTN_SGT", 1)]:
+                                ("PREFIX_ATTN_SIMDGROUPS", "PREFIX_ATTN_SGT", 1),
+                                ("PREFIX_DECODE_CHUNK", "PREFIX_DECODE_CHUNK", 1),
+                                ("PREFIX_DECODE_LANES", "PREFIX_DECODE_R", 1)]:
         ok = consts[host] == kc[kernel] * scale
         print(f"  [{'ok  ' if ok else 'FAIL'}] {host} = {consts[host]} vs kernel {kernel} x{scale} = {kc[kernel] * scale}")
         if not ok:
@@ -768,6 +798,11 @@ CASES = [
     # KV heads of 256): no prefix, a one-token prefix, a prefix one past the
     # 64-row query tile with a partial second tile of queries, and queries
     # inside the prefix with no suffix.
+    # Split-KV decode: 128-key chunks, so a prefix inside the first chunk, one
+    # at a chunk edge with the suffix starting a new chunk, and a chunk that
+    # straddles the prefix/suffix boundary.
+    ("prefix_decode", lambda: [case_prefix_decode(40 + i, *c) for i, c in enumerate(
+        [(2, 5, 2, 3, 6), (2, 128, 1, 2, 128), (3, 120, 20, 24, 139)])]),
     ("prefix_rows", lambda: [case_prefix_rows(32 + i, *c) for i, c in enumerate(
         [(2, 0, 3, 4, 3, 0), (3, 1, 2, 2, 2, 1), (2, 65, 66, 66, 66, 65), (2, 30, 0, 1, 2, 28)])]),
     ("attn_gate", lambda: [case_attn_gate(bf, ip, 17) for bf, ip in ((False, False), (True, False), (False, True))]),

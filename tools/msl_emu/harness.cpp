@@ -15,12 +15,14 @@
 #include "qwen35_score.cpp"
 #include "flash_attn_rows.cpp"
 
+#include <algorithm>
 #include <csignal>
 #include <fstream>
 #include <map>
 #include <sstream>
 #include <string>
 #include <unistd.h>
+#include <vector>
 
 using namespace metal;
 using metal::emu::Ids;
@@ -85,10 +87,11 @@ int main(int argc, char **argv) {
         // src/qwen35.rs's copies of them to.
         std::printf("GDN_DK %u\nGDN_C %u\nGDN_BV %u\nGDN_PREP_THREADS %u\nGDN_SCAN_THREADS %u\n"
                     "GDN_PREP_TG_FLOATS %u\nGDN_SCAN_TG_FLOATS %u\nGDN_REC_TG_FLOATS %u\n"
-                    "REDUCE_MAX_SIMDGROUPS %u\nPREFIX_ATTN_D %u\nPREFIX_ATTN_R %u\nPREFIX_ATTN_SGT %u\n",
+                    "REDUCE_MAX_SIMDGROUPS %u\nPREFIX_ATTN_D %u\nPREFIX_ATTN_R %u\nPREFIX_ATTN_SGT %u\n"
+                    "PREFIX_DECODE_CHUNK %u\nPREFIX_DECODE_R %u\n",
                     GDN_DK, GDN_C, GDN_BV, GDN_PREP_THREADS, GDN_SCAN_THREADS, GDN_PREP_TG_FLOATS,
                     GDN_SCAN_TG_FLOATS, GDN_REC_TG_FLOATS, REDUCE_MAX_SIMDGROUPS, PREFIX_ATTN_D, PREFIX_ATTN_R,
-                    PREFIX_ATTN_SGT);
+                    PREFIX_ATTN_SGT, PREFIX_DECODE_CHUNK, PREFIX_DECODE_R);
         return 0;
     }
     // A barrier deadlock is a failure, not a hang.
@@ -258,6 +261,30 @@ int main(int argc, char **argv) {
                                            out_bf16, suffix_cap, uint2(id.tg.x, id.tg.y),
                                            uint2(id.tid_in_tg.x, 0));
                });
+    } else if (kname == "qwen35_attn_prefix_decode") {
+        // qwen35::attn_prefix_decode: the partial pass over
+        // ceil((P + suffix_cap) / CHUNK) x B*H/sgs threadgroups of sgs
+        // simdgroups (the GQA group when it fits), then the reduce over B*H
+        // threadgroups of 256 threads.
+        const uint B = P("B"), H = P("H"), Hkv = P("Hkv"), prefix_len = P("P"), suffix_cap = P("suffix_cap");
+        const float scale = PF("scale");
+        const uint group = H / Hkv;
+        const uint sgs = (group >= 1 && group <= 32 && H % group == 0) ? group : 1;
+        const uint chunks = std::max(cdiv(prefix_len + suffix_cap, PREFIX_DECODE_CHUNK), 1u);
+        float *q = F("q"), *kp = F("kp"), *vp = F("vp"), *ks = F("ks"), *vs = F("vs"), *o = F("o");
+        uint *slen = U("suffix_len"), *qpos = U("q_pos");
+        std::vector<float> scratch(size_t(B) * H * chunks * (PREFIX_ATTN_D + 2));
+        float *part = scratch.data();
+        const uint out_bf16 = 0;
+        launch(uint3(chunks, B * (H / sgs), 1), uint3(sgs * 32, 1, 1), 0, [&](const Ids &id, float *) {
+            qwen35_attn_prefix_decode_partial(q, kp, vp, ks, vs, part, prefix_len, slen, H, Hkv, scale, qpos,
+                                              suffix_cap, uint2(id.tg.x, id.tg.y), uint2(id.tid_in_tg.x, 0),
+                                              uint2(sgs * 32, 1));
+        });
+        launch(uint3(1, B * H, 1), uint3(256, 1, 1), 0, [&](const Ids &id, float *) {
+            qwen35_attn_prefix_decode_reduce(part, o, prefix_len, slen, H, out_bf16, suffix_cap,
+                                             uint2(id.tg.x, id.tg.y), uint2(id.tid_in_tg.x, 0), uint2(256, 1));
+        });
     } else if (kname == "qwen35_score_rows_f32" || kname == "qwen35_score_rows_bf16") {
         const uint rows = P("rows"), hidden = P("hidden"), n_ans = P("n_ans"), vocab = P("vocab"),
                    n_slots = P("n_slots");

@@ -1543,55 +1543,22 @@ pub fn attn_prefix_rows(
     out_bf16: bool,
 ) -> Result<(), String> {
     const WHAT: &str = "qwen35::attn_prefix_rows";
-    const D: u32 = PREFIX_ATTN_HEAD_DIM;
-    if dims.window != 0 {
-        return Err(format!(
-            "{WHAT}: window must be 0 (global causal attention), got {}",
-            dims.window
-        ));
-    }
-    for (name, b) in [
-        ("q", q),
-        ("prefix k", prefix.k),
-        ("prefix v", prefix.v),
-        ("suffix k", suffix_k),
-        ("suffix v", suffix_v),
-        ("o", o),
-    ] {
-        require_runtime(rt, b, &format!("{WHAT} {name}"))?;
-    }
-    // Q/O extents, head grouping, scale, and o against q and the suffix.
-    let suffix_cap = crate::nn::validate_attn_storage(&dims, D, q, suffix_k, suffix_v, o, out_bf16)
-        .map_err(|e| format!("{WHAT}: {e}"))?;
-    let prefix_cap = crate::nn::attn_kv_capacity(prefix.k, prefix.v, 1, dims.heads_kv, D)
-        .map_err(|e| format!("{WHAT}: prefix {e}"))?;
-    if prefix.len > prefix_cap {
-        return Err(format!(
-            "{WHAT}: prefix length {} exceeds the prefix K/V capacity {prefix_cap}",
-            prefix.len
-        ));
-    }
-    if u64::from(prefix.len) + u64::from(suffix_cap) > u64::from(u32::MAX) {
-        return Err(format!(
-            "{WHAT}: prefix length {} plus suffix capacity {suffix_cap} exceeds u32 positions",
-            prefix.len
-        ));
-    }
-    require::<u32>(rt, suffix_len, 1, "attn_prefix_rows suffix_len")?;
-    require::<u32>(rt, q_pos_offset, 1, "attn_prefix_rows q_pos_offset")?;
-    if dims.batch == 0 || dims.tq == 0 || dims.heads == 0 {
-        return Ok(());
-    }
-    require_disjoint_writes(
+    let Some(suffix_cap) = validate_prefix_attn(
+        rt,
         WHAT,
-        &[("o", o)],
-        &[
-            ("prefix k", prefix.k),
-            ("prefix v", prefix.v),
-            ("suffix_len", suffix_len),
-            ("q_pos_offset", q_pos_offset),
-        ],
-    )?;
+        q,
+        prefix,
+        suffix_k,
+        suffix_v,
+        suffix_len,
+        q_pos_offset,
+        o,
+        &dims,
+        out_bf16,
+    )?
+    else {
+        return Ok(());
+    };
     let rows_per_tg = PREFIX_ATTN_SIMDGROUPS * (32 / PREFIX_ATTN_LANES);
     let threads = PREFIX_ATTN_SIMDGROUPS * 32;
     let groups_y = usize_product(&[dims.batch as usize, dims.heads as usize], WHAT)?;
@@ -1620,6 +1587,207 @@ pub fn attn_prefix_rows(
             set_u32(bnd, suffix_cap, 14);
         },
     )
+}
+
+/// Keys per chunk and lanes per key of the shared-prefix decode: the
+/// [`crate::nn::flash_attn_decode`] instantiation nn picks at D = 256
+/// ([`crate::nn::decode_chunk_for`], [`crate::nn::decode_lanes_for`]).
+const PREFIX_DECODE_CHUNK: usize = 128;
+// No host arithmetic depends on it; it exists to be pinned against nn (unit
+// test) and against the kernel's constant (the emulator's host_contract).
+#[allow(dead_code)]
+const PREFIX_DECODE_LANES: usize = 16;
+/// Reduce-pass width: [`crate::nn::DECODE_REDUCE_THREADS`], capped at D as nn
+/// caps it.
+const PREFIX_DECODE_REDUCE_THREADS: usize = 256;
+
+/// [`attn_prefix_rows`] for a single query per row (`dims.tq == 1`), split
+/// over the keys like [`crate::nn::flash_attn_decode`]: one simdgroup per
+/// 128-key chunk per head, then a reduce over the chunks. The rows kernel runs
+/// one simdgroup per (row, head) through all `P + S` keys in series, which is
+/// the shape `flash_attn_decode` exists to avoid.
+///
+/// Same arguments and layouts as [`attn_prefix_rows`]; `o` is `[batch, heads,
+/// 256]`. The result is bit-identical to `nn::flash_attn_decode` over a per-row
+/// cache `prefix ‖ suffix_b` with `window = 0` and `kv_pos_offset = 0`: both
+/// passes are that kernel's D = 256 instantiation with only the key address
+/// (partial) and the live key count (both) changed.
+#[allow(clippy::too_many_arguments)]
+pub fn attn_prefix_decode(
+    rt: &Arc<GpuRuntime>,
+    q: &GpuBuffer,
+    prefix: SharedPrefix<'_>,
+    suffix_k: &GpuBuffer,
+    suffix_v: &GpuBuffer,
+    suffix_len: &GpuBuffer,
+    q_pos_offset: &GpuBuffer,
+    o: &GpuBuffer,
+    dims: crate::nn::AttnDims,
+    out_bf16: bool,
+) -> Result<(), String> {
+    const WHAT: &str = "qwen35::attn_prefix_decode";
+    if dims.tq != 1 {
+        return Err(format!(
+            "{WHAT}: one query per row (tq = 1), got tq = {}; use attn_prefix_rows",
+            dims.tq
+        ));
+    }
+    let Some(suffix_cap) = validate_prefix_attn(
+        rt,
+        WHAT,
+        q,
+        prefix,
+        suffix_k,
+        suffix_v,
+        suffix_len,
+        q_pos_offset,
+        o,
+        &dims,
+        out_bf16,
+    )?
+    else {
+        return Ok(());
+    };
+    // The device suffix length is unknown here, so the grid covers every key
+    // the capacities allow; both passes clamp it and derive the same live
+    // chunk count, so every chunk the reduce reads was written by this
+    // partial pass (flash_attn_decode's invariant, unchanged).
+    let key_cap = prefix.len as usize + suffix_cap as usize;
+    let chunks = key_cap.div_ceil(PREFIX_DECODE_CHUNK).max(1);
+    let heads = dims.heads as usize;
+    let group = (dims.heads / dims.heads_kv) as usize;
+    // The GQA group shares a threadgroup, as nn's D = 256 decode does.
+    let sgs = crate::nn::DecodeHeadBlock::Group
+        .simdgroups(heads, group)
+        .unwrap_or(1);
+    let bh = usize_product(&[dims.batch as usize, heads], WHAT)?;
+    let scratch_bytes = usize_product(
+        &[
+            bh,
+            chunks,
+            PREFIX_ATTN_HEAD_DIM as usize + 2,
+            std::mem::size_of::<f32>(),
+        ],
+        WHAT,
+    )?;
+    // Resolve both pipelines before encoding either: a failure after the
+    // partial pass was encoded would leave a producer with no consumer.
+    let partial = pipeline_for(rt, "qwen35_attn_prefix_decode_partial", sgs * 32, 0)?;
+    let reduce = pipeline_for(
+        rt,
+        "qwen35_attn_prefix_decode_reduce",
+        PREFIX_DECODE_REDUCE_THREADS,
+        0,
+    )?;
+    let scratch = rt.alloc_buffer(scratch_bytes)?;
+    dispatch_groups(
+        rt,
+        &partial,
+        (chunks, dims.batch as usize * (heads / sgs), 1),
+        sgs * 32,
+        0,
+        |bnd| {
+            set_gpu_buf(bnd, q, 0);
+            set_gpu_buf(bnd, prefix.k, 1);
+            set_gpu_buf(bnd, prefix.v, 2);
+            set_gpu_buf(bnd, suffix_k, 3);
+            set_gpu_buf(bnd, suffix_v, 4);
+            set_gpu_buf(bnd, &scratch, 5);
+            set_u32(bnd, prefix.len, 6);
+            set_gpu_buf(bnd, suffix_len, 7);
+            set_u32(bnd, dims.heads, 8);
+            set_u32(bnd, dims.heads_kv, 9);
+            set_f32(bnd, dims.scale, 10);
+            set_gpu_buf(bnd, q_pos_offset, 11);
+            set_u32(bnd, suffix_cap, 12);
+        },
+    )?;
+    // The binder orders this after the partial pass, as for the GDN prep and
+    // scan.
+    dispatch_groups(
+        rt,
+        &reduce,
+        (1, bh, 1),
+        PREFIX_DECODE_REDUCE_THREADS,
+        0,
+        |bnd| {
+            set_gpu_buf(bnd, &scratch, 0);
+            set_gpu_buf(bnd, o, 1);
+            set_u32(bnd, prefix.len, 2);
+            set_gpu_buf(bnd, suffix_len, 3);
+            set_u32(bnd, dims.heads, 4);
+            set_u32(bnd, u32::from(out_bf16), 5);
+            set_u32(bnd, suffix_cap, 6);
+        },
+    )
+}
+
+/// The host checks both shared-prefix entry points make. Returns the suffix
+/// capacity, or `None` when the shape has no work.
+#[allow(clippy::too_many_arguments)]
+fn validate_prefix_attn(
+    rt: &GpuRuntime,
+    what: &str,
+    q: &GpuBuffer,
+    prefix: SharedPrefix<'_>,
+    suffix_k: &GpuBuffer,
+    suffix_v: &GpuBuffer,
+    suffix_len: &GpuBuffer,
+    q_pos_offset: &GpuBuffer,
+    o: &GpuBuffer,
+    dims: &crate::nn::AttnDims,
+    out_bf16: bool,
+) -> Result<Option<u32>, String> {
+    const D: u32 = PREFIX_ATTN_HEAD_DIM;
+    if dims.window != 0 {
+        return Err(format!(
+            "{what}: window must be 0 (global causal attention), got {}",
+            dims.window
+        ));
+    }
+    for (name, b) in [
+        ("q", q),
+        ("prefix k", prefix.k),
+        ("prefix v", prefix.v),
+        ("suffix k", suffix_k),
+        ("suffix v", suffix_v),
+        ("o", o),
+    ] {
+        require_runtime(rt, b, &format!("{what} {name}"))?;
+    }
+    // Q/O extents, head grouping, scale, and o against q and the suffix.
+    let suffix_cap = crate::nn::validate_attn_storage(dims, D, q, suffix_k, suffix_v, o, out_bf16)
+        .map_err(|e| format!("{what}: {e}"))?;
+    let prefix_cap = crate::nn::attn_kv_capacity(prefix.k, prefix.v, 1, dims.heads_kv, D)
+        .map_err(|e| format!("{what}: prefix {e}"))?;
+    if prefix.len > prefix_cap {
+        return Err(format!(
+            "{what}: prefix length {} exceeds the prefix K/V capacity {prefix_cap}",
+            prefix.len
+        ));
+    }
+    if u64::from(prefix.len) + u64::from(suffix_cap) > u64::from(u32::MAX) {
+        return Err(format!(
+            "{what}: prefix length {} plus suffix capacity {suffix_cap} exceeds u32 positions",
+            prefix.len
+        ));
+    }
+    require::<u32>(rt, suffix_len, 1, &format!("{what} suffix_len"))?;
+    require::<u32>(rt, q_pos_offset, 1, &format!("{what} q_pos_offset"))?;
+    if dims.batch == 0 || dims.tq == 0 || dims.heads == 0 {
+        return Ok(None);
+    }
+    require_disjoint_writes(
+        what,
+        &[("o", o)],
+        &[
+            ("prefix k", prefix.k),
+            ("prefix v", prefix.v),
+            ("suffix_len", suffix_len),
+            ("q_pos_offset", q_pos_offset),
+        ],
+    )?;
+    Ok(Some(suffix_cap))
 }
 
 // ----------------------------------------------------------------- scoring ---
@@ -1797,6 +1965,17 @@ mod tests {
         assert_eq!(
             crate::nn::rows_groups_for(d).count(),
             PREFIX_ATTN_SIMDGROUPS
+        );
+        // Likewise the decode passes and flash_attn_decode.
+        assert_eq!(crate::nn::decode_chunk_for(d).keys(), PREFIX_DECODE_CHUNK);
+        assert_eq!(crate::nn::decode_lanes_for(d).width(), PREFIX_DECODE_LANES);
+        assert_eq!(
+            crate::nn::decode_head_block_for(d),
+            crate::nn::DecodeHeadBlock::Group
+        );
+        assert_eq!(
+            crate::nn::DECODE_REDUCE_THREADS.min(d as usize),
+            PREFIX_DECODE_REDUCE_THREADS
         );
     }
 

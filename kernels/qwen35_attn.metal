@@ -409,3 +409,226 @@ kernel void qwen35_attn_prefix_rows(
         }
     }
 }
+
+/// Keys per chunk and lanes per key of `qwen35_attn_prefix_decode_*`: the
+/// `flash_attn_decode` instantiation `nn` picks at D = 256
+/// (`decode_chunk_for` / `decode_lanes_for`). The host mirrors these.
+constant uint PREFIX_DECODE_CHUNK = 128;
+constant uint PREFIX_DECODE_R = 16;
+
+/// Live keys of a shared-prefix row set: the prefix, then the suffix clamped
+/// to its capacity. Both decode passes derive their chunk count from this.
+inline uint prefix_decode_tkv(uint P, device const uint *suffix_len_ptr, uint suffix_cap)
+{
+    return P + min(*suffix_len_ptr, suffix_cap);
+}
+
+/// Single-query attention over a shared prefix plus per-row suffix, split over
+/// the keys: partial pass. The layouts are `qwen35_attn_prefix_rows`' with
+/// Tq = 1, and the body is `flash_attn_decode_partial_h256_c128_r16`'s (window
+/// 0, kv_pos_offset 0) with only the address of key `t` changed, so each
+/// chunk's (m, l, acc) is bit-identical to that kernel's over a copied prefix.
+///
+/// Grid: x = ceil((P + suffix_cap) / CHUNK), y = B * H / sgs; sgs simdgroups,
+/// where sgs query heads share a threadgroup (the host's GQA-group choice).
+kernel void qwen35_attn_prefix_decode_partial(
+    device const float *Q [[buffer(0)]],
+    device const float *Kp [[buffer(1)]],
+    device const float *Vp [[buffer(2)]],
+    device const float *Ks [[buffer(3)]],
+    device const float *Vs [[buffer(4)]],
+    device float *partials [[buffer(5)]],
+    constant uint &P [[buffer(6)]],
+    device const uint *suffix_len_ptr [[buffer(7)]],
+    constant uint &H [[buffer(8)]],
+    constant uint &Hkv [[buffer(9)]],
+    constant float &scale [[buffer(10)]],
+    device const uint *q_pos_offset_ptr [[buffer(11)]],
+    constant uint &suffix_cap [[buffer(12)]],
+    uint2 tgpig [[threadgroup_position_in_grid]],
+    uint2 tpitg [[thread_position_in_threadgroup]],
+    uint2 tptg [[threads_per_threadgroup]])
+{
+    constexpr uint D = PREFIX_ATTN_D;
+    constexpr uint CH = PREFIX_DECODE_CHUNK;
+    constexpr uint R = PREFIX_DECODE_R;
+    constexpr uint DPV = D / (4u * R);
+    constexpr uint KPG = 32u / R;               // keys in flight per simdgroup
+    static_assert(D % (4u * R) == 0u, "float4 lane slices must tile the head");
+    const uint sgs = max(tptg.x / 32u, 1u);
+    const uint sg = tpitg.x / 32u;
+    const uint lane = tpitg.x % 32u;
+    const uint grp = lane / R;
+    const uint dl = lane % R;
+    // Clamp mutable device state before it participates in any address.
+    const uint Tkv = prefix_decode_tkv(P, suffix_len_ptr, suffix_cap);
+    const uint chunk = tgpig.x;
+    const uint blocks = max(H / sgs, 1u);
+    const uint b = tgpig.y / blocks;
+    const uint hb = tgpig.y % blocks;
+    const uint h = hb * sgs + sg;
+    if (h >= H) { return; }
+    const ulong bh = (ulong)b * H + h;
+    const uint t_k0 = chunk * CH;
+    if (t_k0 >= Tkv) { return; }
+    const uint n_k = min(CH, Tkv - t_k0);
+    const uint group = max(H / Hkv, 1u);
+    const uint hkv = h / group;
+    const ulong kv_pos_stride = (ulong)Hkv * D;
+    const ulong prefix_head_base = (ulong)hkv * D;
+    const ulong suffix_head_base = (ulong)b * suffix_cap * kv_pos_stride + (ulong)hkv * D;
+
+    const ulong q_abs = (ulong)(*q_pos_offset_ptr);
+    const ulong q_off = bh * D;
+    device const float4 *Q4 = (device const float4 *)(Q + q_off);
+    float4 q_reg[DPV];
+    for (uint j = 0; j < DPV; ++j) { q_reg[j] = Q4[dl + j * R]; }
+
+    float4 acc[DPV];
+    for (uint j = 0; j < DPV; ++j) { acc[j] = float4(0.0f); }
+    float m_i = -INFINITY;
+    float l_i = 0.0f;
+
+    // Live key sub-range of this chunk: [0, q_abs] is the causal rule.
+    const ulong local_hi = q_abs + 1ul;
+    const ulong lo_i = (ulong)t_k0;
+    const ulong hi_i = min((ulong)t_k0 + n_k, local_hi);
+    const uint stride0 = D + 2u;
+    const uint n_chunks = Tkv / CH + ((Tkv % CH) != 0u ? 1u : 0u);
+    const ulong base0 = (bh * n_chunks + chunk) * stride0;
+    if (lo_i >= hi_i) {
+        // Chunk fully masked; uniform across the simdgroup.
+        if (lane == 0u) {
+            partials[base0] = -INFINITY;
+            partials[base0 + 1u] = 0.0f;
+        }
+        for (uint d = lane; d < D; d += 32u) {
+            partials[base0 + 2u + d] = 0.0f;
+        }
+        return;
+    }
+    const uint live = (uint)(hi_i - lo_i);
+    const uint iters = (live + KPG - 1u) / KPG;
+    for (uint it = 0; it < iters; ++it) {
+        const uint t = it * KPG + grp;
+        const uint tt = min(t, live - 1u);
+        const uint key = (uint)lo_i + tt;
+        // The one change from flash_attn_decode: key is the shared prefix's
+        // below P and this row's suffix from P on.
+        const bool in_prefix = key < P;
+        const ulong kv_base = in_prefix
+            ? prefix_head_base + (ulong)key * kv_pos_stride
+            : suffix_head_base + (ulong)(key - P) * kv_pos_stride;
+        device const float *Kb = in_prefix ? Kp : Ks;
+        device const float *Vb = in_prefix ? Vp : Vs;
+        device const float4 *K4 = (device const float4 *)(Kb + kv_base);
+        float4 dot4 = float4(0.0f);
+        for (uint j = 0; j < DPV; ++j) {
+            dot4 += q_reg[j] * K4[dl + j * R];
+        }
+        float part = dot4.x + dot4.y + dot4.z + dot4.w;
+        for (uint off = R / 2u; off > 0u; off >>= 1) {
+            part += simd_shuffle_xor(part, off);
+        }
+        float s = part * scale;
+        if (t >= live) { s = -INFINITY; }
+        const float m_new = max(m_i, s);
+        const float alpha = (m_i == -INFINITY) ? 0.0f : exp(m_i - m_new);
+        const float p = (s == -INFINITY) ? 0.0f : exp(s - m_new);
+        device const float4 *V4 = (device const float4 *)(Vb + kv_base);
+        for (uint j = 0; j < DPV; ++j) {
+            acc[j] = acc[j] * alpha + p * V4[dl + j * R];
+        }
+        l_i = l_i * alpha + p;
+        m_i = m_new;
+    }
+
+    // Combine the KPG key-groups (lanes R apart share a dim slice).
+    float m_all = m_i;
+    for (uint off = R; off < 32u; off <<= 1) {
+        m_all = max(m_all, simd_shuffle_xor(m_all, off));
+    }
+    const float w = (m_i == -INFINITY || m_all == -INFINITY) ? 0.0f : exp(m_i - m_all);
+    float l_all = l_i * w;
+    for (uint off = R; off < 32u; off <<= 1) {
+        l_all += simd_shuffle_xor(l_all, off);
+    }
+    for (uint j = 0; j < DPV; ++j) {
+        float4 a = acc[j] * w;
+        for (uint off = R; off < 32u; off <<= 1) {
+            a.x += simd_shuffle_xor(a.x, off);
+            a.y += simd_shuffle_xor(a.y, off);
+            a.z += simd_shuffle_xor(a.z, off);
+            a.w += simd_shuffle_xor(a.w, off);
+        }
+        acc[j] = a;
+    }
+    if (grp != 0u) { return; }
+    if (lane == 0u) { partials[base0] = m_all; partials[base0 + 1u] = l_all; }
+    for (uint j = 0; j < DPV; ++j) {
+        const uint d0 = 4u * (dl + j * R);
+        partials[base0 + 2u + d0 + 0u] = acc[j].x;
+        partials[base0 + 2u + d0 + 1u] = acc[j].y;
+        partials[base0 + 2u + d0 + 2u] = acc[j].z;
+        partials[base0 + 2u + d0 + 3u] = acc[j].w;
+    }
+}
+
+/// Reduce pass of the shared-prefix decode: `flash_attn_decode_reduce_h256_c128`
+/// with the live key count `P + min(S, suffix_cap)`, the same one the partial
+/// pass wrote chunks for. Output `[B, H, D]`, f32 or bf16.
+///
+/// Grid: y = B * H; any threadgroup width (the output loop strides by it).
+kernel void qwen35_attn_prefix_decode_reduce(
+    device const float *partials [[buffer(0)]],
+    device float *O [[buffer(1)]],
+    constant uint &P [[buffer(2)]],
+    device const uint *suffix_len_ptr [[buffer(3)]],
+    constant uint &H [[buffer(4)]],
+    constant uint &out_bf16 [[buffer(5)]],
+    constant uint &suffix_cap [[buffer(6)]],
+    uint2 tgpig [[threadgroup_position_in_grid]],
+    uint2 tpitg [[thread_position_in_threadgroup]],
+    uint2 tptg [[threads_per_threadgroup]])
+{
+    constexpr uint D = PREFIX_ATTN_D;
+    constexpr uint CH = PREFIX_DECODE_CHUNK;
+    const uint lid = tpitg.x;
+    const uint width = max(tptg.x, 1u);
+    const uint Tkv = prefix_decode_tkv(P, suffix_len_ptr, suffix_cap);
+    const uint bh = tgpig.y;
+    const uint n_chunks = Tkv / CH + ((Tkv % CH) != 0u ? 1u : 0u);
+    const uint stride = D + 2u;
+    const ulong chunk0 = (ulong)bh * n_chunks;
+
+    float m_all = -INFINITY;
+    for (uint c = 0; c < n_chunks; ++c) {
+        m_all = max(m_all, partials[(chunk0 + c) * stride]);
+    }
+    float l_all = 0.0f;
+    if (m_all != -INFINITY) {
+        for (uint c = 0; c < n_chunks; ++c) {
+            const float m_c = partials[(chunk0 + c) * stride];
+            if (m_c == -INFINITY) { continue; }
+            l_all += partials[(chunk0 + c) * stride + 1u] * exp(m_c - m_all);
+        }
+    }
+    const float inv_l = (l_all > 0.0f) ? (1.0f / l_all) : 0.0f;
+    const ulong o_off = (ulong)bh * D;
+    device bfloat *Ob = (device bfloat *)O;
+    for (uint d = lid; d < D; d += width) {
+        float a = 0.0f;
+        if (m_all != -INFINITY) {
+            for (uint c = 0; c < n_chunks; ++c) {
+                const ulong base = (chunk0 + c) * stride;
+                const float m_c = partials[base];
+                if (m_c == -INFINITY) { continue; }
+                a += partials[base + 2u + d] * exp(m_c - m_all);
+            }
+        }
+        const float o = a * inv_l;
+        if (out_bf16 != 0u) { Ob[o_off + d] = bfloat(o); }
+        else { O[o_off + d] = o; }
+    }
+    (void)H;
+}

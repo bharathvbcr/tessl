@@ -2249,12 +2249,14 @@ fn out_bits(o: &GpuBuffer, n: usize, bf16: bool) -> Vec<u32> {
     }
 }
 
-/// One shared-prefix case against `nn::flash_attn_rows` over the per-row copy
+/// One shared-prefix case against its `nn` counterpart (`flash_attn_rows`,
+/// or `flash_attn_decode` when `decode`) over the per-row copy
 /// `prefix ‖ suffix_b`. Every K/V slot past the live prefix and suffix is NaN,
 /// in both layouts, so a kernel that read one would print NaN into the output.
 #[allow(clippy::too_many_arguments)]
-fn prefix_rows_case(
+fn prefix_case(
     rt: &Arc<GpuRuntime>,
+    decode: bool,
     batch: usize,
     p: usize,
     s: usize,
@@ -2303,24 +2305,45 @@ fn prefix_rows_case(
             v: &pvb,
             len: p as u32,
         };
-        qwen35::attn_prefix_rows(rt, &q, prefix, &skb, &svb, &slen, &qpos, &got, dims, bf16)
+        if decode {
+            qwen35::attn_prefix_decode(rt, &q, prefix, &skb, &svb, &slen, &qpos, &got, dims, bf16)
+                .unwrap();
+            tessl::nn::flash_attn_decode(
+                rt,
+                &q,
+                &fkb,
+                &fvb,
+                &want,
+                &tkv,
+                &qpos,
+                &zero,
+                dims,
+                PFX_D as u32,
+                full_cap,
+                bf16,
+            )
             .unwrap();
-        tessl::nn::flash_attn_rows(
-            rt,
-            &q,
-            &fkb,
-            &fvb,
-            &want,
-            &tkv,
-            &qpos,
-            &zero,
-            dims,
-            PFX_D as u32,
-            bf16,
-        )
-        .unwrap();
+        } else {
+            qwen35::attn_prefix_rows(rt, &q, prefix, &skb, &svb, &slen, &qpos, &got, dims, bf16)
+                .unwrap();
+            tessl::nn::flash_attn_rows(
+                rt,
+                &q,
+                &fkb,
+                &fvb,
+                &want,
+                &tkv,
+                &qpos,
+                &zero,
+                dims,
+                PFX_D as u32,
+                bf16,
+            )
+            .unwrap();
+        }
         rt.synchronize().unwrap();
-        let label = format!("B{batch} P{p} S{s}/{s_cap} Tq{tq} q@{q_pos} bf16={bf16}");
+        let path = if decode { "decode" } else { "rows" };
+        let label = format!("{path} B{batch} P{p} S{s}/{s_cap} Tq{tq} q@{q_pos} bf16={bf16}");
         let (g, w) = (out_bits(&got, n, bf16), out_bits(&want, n, bf16));
         for (i, (&gi, &wi)) in g.iter().zip(&w).enumerate() {
             // A half of SENTINEL can be a real bf16 value, so unwritten
@@ -2371,11 +2394,44 @@ fn attn_prefix_rows_equal_flash_attn_rows_on_a_copied_prefix_bit_for_bit() {
             (9, 2049, 1, 1, 1, 2049),
         ];
         for (i, &(b, p, s, cap, tq, qp)) in cases.iter().enumerate() {
-            prefix_rows_case(rt, b, p, s, cap, tq, qp, 7000 + 10 * i as u64);
+            prefix_case(rt, false, b, p, s, cap, tq, qp, 7000 + 10 * i as u64);
         }
         // Every batch size 1..=16 on one mid-sized shape.
         for b in 1..=16usize {
-            prefix_rows_case(rt, b, 70, 3, 5, 3, 70, 7500 + b as u64);
+            prefix_case(rt, false, b, 70, 3, 5, 3, 70, 7500 + b as u64);
+        }
+    });
+}
+
+#[test]
+fn attn_prefix_decode_equals_flash_attn_decode_on_a_copied_prefix_bit_for_bit() {
+    // The split-KV decode against tessl's own flash_attn_decode on each row's
+    // copied `prefix ‖ suffix`. Its chunks are 128 keys, so the prefix sits
+    // at 0, 1 and either side of one and two chunks, and chunks straddle the
+    // prefix/suffix boundary. Also a long prefix, a step whose query is
+    // inside the prefix (no suffix), and one past every key.
+    with_gpu(|rt| {
+        #[rustfmt::skip]
+        let cases: &[(usize, usize, usize, usize, usize)] = &[
+            // (batch, P, S, S capacity, q position)
+            (1, 0, 1, 4, 0),
+            (3, 1, 1, 1, 1),
+            (2, 127, 1, 2, 127),
+            (4, 128, 1, 1, 128),
+            (5, 129, 3, 130, 131),
+            (16, 255, 2, 2, 256),
+            (7, 256, 1, 1, 256),
+            (2, 257, 200, 256, 456),
+            (3, 300, 0, 1, 250),
+            (2, 40, 3, 4, 60),
+            (16, 2100, 5, 6, 2104),
+            (9, 8200, 1, 1, 8200),
+        ];
+        for (i, &(b, p, s, cap, qp)) in cases.iter().enumerate() {
+            prefix_case(rt, true, b, p, s, cap, 1, qp, 7800 + 10 * i as u64);
+        }
+        for b in 1..=16usize {
+            prefix_case(rt, true, b, 190, 4, 6, 1, 193, 7950 + b as u64);
         }
     });
 }
@@ -2606,6 +2662,19 @@ fn attn_prefix_rows_rejects_bad_shapes_and_aliases() {
         let mut grouped = pfx_dims(b, tq);
         grouped.heads_kv = 3;
         expect_err(run(prefix, &o, grouped), "is not a multiple of heads_kv");
+        // The decode path takes one query per row, and shares every other
+        // check with the rows path.
+        let decode = |prefix: qwen35::SharedPrefix<'_>, dims: tessl::nn::AttnDims| {
+            qwen35::attn_prefix_decode(rt, &q, prefix, &sk, &sv, &slen, &qpos, &o, dims, false)
+        };
+        expect_err(
+            decode(prefix, pfx_dims(b, tq)),
+            "one query per row (tq = 1)",
+        );
+        expect_err(
+            decode(too_long, pfx_dims(b, 1)),
+            "exceeds the prefix K/V capacity",
+        );
         // The suffix writer: positions past the suffix cache, and a position
         // that overflows u32.
         let layout = AttnProjLayout::new(PFX_HQ as u32, PFX_HKV as u32, PFX_D as u32).unwrap();

@@ -340,9 +340,9 @@ def case_chunk_ws(seed):
 # ----------------------------------------------------------------- the norm
 
 
-def case_gated_norm(bf16, seed):
+def case_gated_norm(bf16, seed, H=4, rows=37):
     g = seeded(seed)
-    rows, H, D = 37, 4, 128
+    D = 128
     ld_x, x_off, ld_z, z_off, ld_out, out_off = H * D + 3, 2, H * D + 11, 7, H * D + 5, 1
     x = torch.randn(rows, ld_x, generator=g)
     z = torch.randn(rows, ld_z, generator=g) * 2
@@ -367,9 +367,9 @@ def case_gated_norm(bf16, seed):
 # -------------------------------------------------------- attention extras
 
 
-def case_qk_norm_rope(seed):
+def case_qk_norm_rope(seed, Hq=4, Hkv=2, B=2, T=9):
     g = seeded(seed)
-    B, T, Hq, Hkv, D = 2, 9, 4, 2, 256
+    D = 256
     theta, eps, pos_offset, cap = 1e7, 1e-6, 30000, 30016
     cfg = Qwen3_5TextConfig(head_dim=D, num_attention_heads=Hq, num_key_value_heads=Hkv, hidden_size=Hq * D,
                             rope_parameters={"rope_type": "default", "rope_theta": theta,
@@ -412,6 +412,49 @@ def case_qk_norm_rope(seed):
     if not torch.isnan(untouched).all():
         print(f"  [FAIL] {tag}: wrote cache slots outside [pos, pos+T)")
         FAILURES.append(tag + " cache window")
+
+
+def case_qk_rope_posbuf(seed):
+    """The device-buffer position variant: identical to the scalar one, and
+    positions at or past the capacity are skipped, in 64 bits."""
+    g = seeded(seed)
+    B, T, Hq, Hkv, D, cap = 2, 5, 2, 1, 256, 12
+    ld_p = 2 * Hq * D + 2 * Hkv * D
+    p = torch.randn(B * T, ld_p, generator=g)
+    qw, kw = torch.randn(D, generator=g) * 0.1, torch.randn(D, generator=g) * 0.1
+    base = dict(B=B, T=T, Hq=Hq, Hkv=Hkv, D=D, rotary_dim=64, ld_p=ld_p, q_off=0, k_off=2 * Hq * D,
+                v_off=2 * Hq * D + Hkv * D, kv_capacity=cap, theta=1e7, eps=1e-6)
+    outs = {"q_out": ("f32", B * T * Hq * D), "k_cache": ("f32", B * cap * Hkv * D),
+            "v_cache": ("f32", B * cap * Hkv * D)}
+    inputs = {"p": p, "q_norm_w": qw, "k_norm_w": kw}
+
+    def via_buf(pos):
+        return run("qwen35_attn_qk_norm_rope", dict(base, pos_offset=0, posbuf=1),
+                   dict(inputs, pos_buf=torch.tensor([pos], dtype=torch.int64).to(torch.int32)
+                        if pos < 2 ** 31 else torch.tensor([pos - 2 ** 32], dtype=torch.int32)), outs)
+
+    scalar = run("qwen35_attn_qk_norm_rope", dict(base, pos_offset=4), inputs, outs)
+    buffered = via_buf(4)
+    same = all(torch.equal(scalar[k].view(torch.int32), buffered[k].view(torch.int32)) for k in outs)
+    print(f"  [{'ok  ' if same else 'FAIL'}] qk_norm_rope_posbuf bit-identical to the scalar variant")
+    if not same:
+        FAILURES.append("qk_norm_rope_posbuf vs scalar")
+    # Positions 10..14 with capacity 12: tokens 0 and 1 land, 2..4 are skipped.
+    part = via_buf(10)
+    q = part["q_out"].reshape(B, T, Hq * D)
+    kc = part["k_cache"].reshape(B, cap, Hkv * D)
+    ok = (not torch.isnan(q[:, :2]).any() and torch.isnan(q[:, 2:]).all()
+          and not torch.isnan(kc[:, 10:12]).any() and torch.isnan(kc[:, :10]).all())
+    print(f"  [{'ok  ' if ok else 'FAIL'}] qk_norm_rope_posbuf skips tokens at or past the capacity")
+    if not ok:
+        FAILURES.append("qk_norm_rope_posbuf capacity skip")
+    # An offset near u32::MAX: in 32 bits pos + t wraps to 0..2 and would
+    # overwrite the first cache slots. Everything must be skipped.
+    wrap = via_buf(2 ** 32 - 2)
+    ok = all(torch.isnan(wrap[k]).all() for k in outs)
+    print(f"  [{'ok  ' if ok else 'FAIL'}] qk_norm_rope_posbuf: an offset that would wrap writes nothing")
+    if not ok:
+        FAILURES.append("qk_norm_rope_posbuf wrap")
 
 
 def case_attn_gate(bf16, in_place, seed):
@@ -524,6 +567,11 @@ def _host_binds():
     # the pipelines below, the name is reused, so resolve it by position.
     name_defs = [(m.start(), m.group(1), [m.group(2) + "_f32", m.group(2) + "_bf16"])
                  for m in re.finditer(r'let (\w+) = out_kernel\(\s*"(\w+)"', rs)]
+    # `let name = match .. { A => "kernel_a", B => "kernel_b" };` — one dispatch
+    # site serving several kernels.
+    name_defs += [(m.start(), m.group(1), re.findall(r'"(qwen35_\w+)"', m.group(2)))
+                  for m in re.finditer(r'let (\w+) = match [^{]*\{(.*?)\};', rs, re.S)]
+    name_defs.sort()
     # (position, variable, kernels): a dispatch resolves its pipeline variable
     # to the nearest `let` before it, since most functions reuse the name `p`.
     pipe_defs = []
@@ -568,7 +616,13 @@ def case_host_contract():
     binds, consts = _host_binds()
     for k, sig in sorted(sigs.items()):
         got = sorted(binds.get(k, []))
-        ok = got == sorted(sig)
+        # A site serving several kernels may bind one slot in a `match`, one
+        # kind per arm: the kernel's kind must be among the host's for that
+        # slot, and the slots must be exactly the kernel's.
+        host_kinds = {}
+        for i, kind in got:
+            host_kinds.setdefault(i, set()).add(kind)
+        ok = set(host_kinds) == {i for i, _ in sig} and all(kind in host_kinds[i] for i, kind in sig)
         print(f"  [{'ok  ' if ok else 'FAIL'}] binds {k}: {len(sig)} slots"
               + ("" if ok else f"\n      kernel {sorted(sig)}\n      host   {got}"))
         if not ok:
@@ -604,15 +658,25 @@ CASES = [
     ("chunk_softplus_series", lambda: case_gdn("qwen35_gdn_chunk", 1, 130, 1, 2, 32, 19, dt_shift=-10.0)),
     ("recurrent_softplus_series", lambda: case_gdn("qwen35_gdn_recurrent", 1, 9, 1, 2, 32, 20, dt_shift=-10.0)),
     ("chunk_T1000", lambda: case_gdn("qwen35_gdn_chunk", 1, 1000, 1, 1, 32, 21)),
+    # Long context: 64 chunks carried through one state, against transformers.
+    ("chunk_T4096", lambda: case_gdn("qwen35_gdn_chunk", 1, 4096, 1, 1, 32, 30)),
     ("chunk_T0_passthrough", lambda: case_gdn("qwen35_gdn_chunk", 2, 0, 1, 2, 32, 22, state_mode="batch")),
     ("recurrent_T0_passthrough", lambda: case_gdn("qwen35_gdn_recurrent", 2, 0, 1, 2, 32, 23, state_mode="snapshot")),
     ("conv_T0_passthrough", lambda: case_conv(2, 0, 64, 4, True, True, 24)),
+    # Qwen3.5's own head counts (transformers' Qwen3_5TextConfig defaults): 16
+    # key heads shared by 32 value heads of 128 in the GDN, 16 query heads over
+    # 4 KV heads of 256 in attention. Every other case uses a handful of heads.
+    ("config_chunk", lambda: case_gdn("qwen35_gdn_chunk", 1, 130, 16, 32, 128, 25, state_mode="batch")),
+    ("config_recurrent", lambda: case_gdn("qwen35_gdn_recurrent", 2, 2, 16, 32, 128, 26, state_mode="snapshot")),
+    ("config_gated_norm", lambda: case_gated_norm(False, 27, H=32, rows=9)),
+    ("config_qk_norm_rope", lambda: case_qk_norm_rope(28, Hq=16, Hkv=4, B=1, T=5)),
     ("recurrent_T1_snapshot", lambda: case_gdn("qwen35_gdn_recurrent", 4, 1, 2, 4, 64, 11, state_mode="snapshot")),
     ("recurrent_T7_state", lambda: case_gdn("qwen35_gdn_recurrent", 2, 7, 1, 2, 128, 12, state_mode="batch")),
     ("recurrent_T20", lambda: case_gdn("qwen35_gdn_recurrent", 1, 20, 1, 1, 32, 13)),
     ("recurrent_in_place", lambda: case_recurrent_in_place(14)),
     ("gated_norm", lambda: [case_gated_norm(bf, 15) for bf in (False, True)]),
     ("qk_norm_rope", lambda: case_qk_norm_rope(16)),
+    ("qk_rope_posbuf", lambda: case_qk_rope_posbuf(29)),
     ("attn_gate", lambda: [case_attn_gate(bf, ip, 17) for bf, ip in ((False, False), (True, False), (False, True))]),
     ("score", lambda: [case_score(bf, 18) for bf in (False, True)]),
 ]

@@ -56,6 +56,14 @@ All notable changes to `tessl` are recorded here. The format follows
   restores the full `MAX_ANSWERS = 4096` inside 32 KB of threadgroup memory,
   and a unit test pins it. `attn_qk_norm_rope` accepts `batch = 0`. Softplus
   uses `precise::exp`.
+- `qwen35_attn_qk_norm_rope_posbuf` / `attn_qk_norm_rope_posbuf`: the RoPE
+  position comes from a device buffer, so a decode loop replayed from an ICB,
+  which freezes scalar binds, advances correctly. Both variants form the
+  position in 64 bits before the capacity check. In 32 bits, an offset near
+  `u32::MAX` wrapped to slot 0 and passed the check.
+- `tools/msl_emu/dialect_lint.py` (in CI): every MSL construct the Qwen3.5
+  kernels use that no compiling tessl kernel uses must be on a reviewed list.
+- Emulator cases at Qwen3.5's real head counts and at T=4096.
 - `tests/qwen35_kernels.rs` with transformers-generated goldens in
   `tests/fixtures/qwen35/` (`scripts/gen_qwen35_fixtures.py`). The Qwen3.5
   sources join the widened-index-arithmetic inspection in

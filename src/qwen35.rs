@@ -1193,6 +1193,73 @@ pub fn attn_qk_norm_rope(
     theta: f32,
     eps: f32,
 ) -> Result<(), String> {
+    qk_norm_rope_impl(
+        rt,
+        shape,
+        proj,
+        q_norm_w,
+        k_norm_w,
+        targets,
+        RopePos::Scalar(pos_offset),
+        theta,
+        eps,
+    )
+}
+
+/// [`attn_qk_norm_rope`] with the position offset read from `pos_offset`, a
+/// one-element u32 device buffer, instead of bound as a scalar.
+///
+/// This is the variant for a decode loop replayed from an Indirect Command
+/// Buffer: replay freezes scalar binds, so a scalar position would rotate and
+/// cache every step at the recorded one. Advance the buffer between replays
+/// instead. The host cannot see the value, so it cannot reject a position past
+/// the caches' capacity: the kernel skips any token whose position is at or
+/// past it (computed in 64 bits, so an offset near `u32::MAX` cannot wrap back
+/// into range). Everything else is validated as for [`attn_qk_norm_rope`].
+#[allow(clippy::too_many_arguments)]
+pub fn attn_qk_norm_rope_posbuf(
+    rt: &Arc<GpuRuntime>,
+    shape: &AttnShape,
+    proj: Cols<'_>,
+    q_norm_w: &GpuBuffer,
+    k_norm_w: &GpuBuffer,
+    targets: &AttnTargets<'_>,
+    pos_offset: &GpuBuffer,
+    theta: f32,
+    eps: f32,
+) -> Result<(), String> {
+    qk_norm_rope_impl(
+        rt,
+        shape,
+        proj,
+        q_norm_w,
+        k_norm_w,
+        targets,
+        RopePos::Buffer(pos_offset),
+        theta,
+        eps,
+    )
+}
+
+/// Where the RoPE / cache position comes from.
+#[derive(Clone, Copy)]
+enum RopePos<'a> {
+    Scalar(u32),
+    Buffer(&'a GpuBuffer),
+}
+
+#[allow(clippy::too_many_arguments)]
+fn qk_norm_rope_impl(
+    rt: &Arc<GpuRuntime>,
+    shape: &AttnShape,
+    proj: Cols<'_>,
+    q_norm_w: &GpuBuffer,
+    k_norm_w: &GpuBuffer,
+    targets: &AttnTargets<'_>,
+    pos: RopePos<'_>,
+    theta: f32,
+    eps: f32,
+) -> Result<(), String> {
     const WHAT: &str = "qwen35::attn_qk_norm_rope";
     let s = shape;
     if s.head_dim == 0 || s.q_heads == 0 || s.kv_heads == 0 {
@@ -1220,11 +1287,16 @@ pub fn attn_qk_norm_rope(
         s.kv_heads,
         s.head_dim,
     )?;
-    if u64::from(pos_offset) + u64::from(s.seq) > u64::from(kv_capacity) {
-        return Err(format!(
-            "{WHAT}: positions [{pos_offset}, {pos_offset} + {}) exceed the caches' capacity {kv_capacity}",
-            s.seq
-        ));
+    match pos {
+        RopePos::Scalar(pos_offset) => {
+            if u64::from(pos_offset) + u64::from(s.seq) > u64::from(kv_capacity) {
+                return Err(format!(
+                    "{WHAT}: positions [{pos_offset}, {pos_offset} + {}) exceed the caches' capacity {kv_capacity}",
+                    s.seq
+                ));
+            }
+        }
+        RopePos::Buffer(b) => require::<u32>(rt, b, 1, "attn_qk_norm_rope pos_offset")?,
     }
     let width = u64::from(layout.width());
     let rows = u64::from(s.batch) * u64::from(s.seq);
@@ -1250,6 +1322,14 @@ pub fn attn_qk_norm_rope(
     if rows == 0 {
         return Ok(());
     }
+    let mut reads = vec![
+        ("proj", proj.buf),
+        ("q_norm", q_norm_w),
+        ("k_norm", k_norm_w),
+    ];
+    if let RopePos::Buffer(b) = pos {
+        reads.push(("pos_offset", b));
+    }
     require_disjoint_writes(
         WHAT,
         &[
@@ -1257,17 +1337,17 @@ pub fn attn_qk_norm_rope(
             ("k_cache", targets.k_cache),
             ("v_cache", targets.v_cache),
         ],
-        &[
-            ("proj", proj.buf),
-            ("q_norm", q_norm_w),
-            ("k_norm", k_norm_w),
-        ],
+        &reads,
     )?;
     let units = usize_product(
         &[rows as usize, s.q_heads as usize + 2 * s.kv_heads as usize],
         WHAT,
     )?;
-    let p = pipeline_for(rt, "qwen35_attn_qk_norm_rope", ROWS_PER_TG * 32, 0)?;
+    let name = match pos {
+        RopePos::Scalar(_) => "qwen35_attn_qk_norm_rope",
+        RopePos::Buffer(_) => "qwen35_attn_qk_norm_rope_posbuf",
+    };
+    let p = pipeline_for(rt, name, ROWS_PER_TG * 32, 0)?;
     dispatch_groups(
         rt,
         &p,
@@ -1291,7 +1371,10 @@ pub fn attn_qk_norm_rope(
             set_u32(bnd, proj.off + layout.q_off(), 13);
             set_u32(bnd, proj.off + layout.k_off(), 14);
             set_u32(bnd, proj.off + layout.v_off(), 15);
-            set_u32(bnd, pos_offset, 16);
+            match pos {
+                RopePos::Scalar(v) => set_u32(bnd, v, 16),
+                RopePos::Buffer(b) => set_gpu_buf(bnd, b, 16),
+            }
             set_u32(bnd, kv_capacity, 17);
             set_f32(bnd, theta, 18);
             set_f32(bnd, eps, 19);

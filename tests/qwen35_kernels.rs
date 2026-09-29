@@ -1428,6 +1428,7 @@ fn every_qwen35_kernel_is_in_the_metallib() {
             "qwen35_gated_rms_norm_f32",
             "qwen35_gated_rms_norm_bf16",
             "qwen35_attn_qk_norm_rope",
+            "qwen35_attn_qk_norm_rope_posbuf",
             "qwen35_attn_gate_f32",
             "qwen35_attn_gate_bf16",
             "qwen35_score_rows_f32",
@@ -2134,6 +2135,92 @@ fn attention_layer_through_flash_attn_rows() {
             &want,
             1e-4,
             1e-5,
+        );
+    });
+}
+
+#[test]
+fn attn_qk_norm_rope_posbuf_matches_the_scalar_variant_step_by_step() {
+    // The decode-loop shape the posbuf variant exists for: one call per step,
+    // the position advanced through a device buffer between them (as an ICB
+    // replay would see it), against the scalar variant at the same positions.
+    with_gpu(|rt| {
+        let (b, hq, hkv, d, cap) = (2usize, 2usize, 1usize, 256usize, 8usize);
+        let layout = AttnProjLayout::new(hq as u32, hkv as u32, d as u32).unwrap();
+        let shape = AttnShape {
+            batch: b as u32,
+            seq: 1,
+            q_heads: hq as u32,
+            kv_heads: hkv as u32,
+            head_dim: d as u32,
+            rotary_dim: 64,
+        };
+        let (qw, kw) = (buf(rt, &random_f32(d, 1600)), buf(rt, &random_f32(d, 1601)));
+        let cache = b * cap * hkv * d;
+        let (kc_a, vc_a) = (seeded(rt, cache, SENTINEL), seeded(rt, cache, SENTINEL));
+        let (kc_b, vc_b) = (seeded(rt, cache, SENTINEL), seeded(rt, cache, SENTINEL));
+        let pos_buf = u32_buf(rt, &[0]);
+        for step in 0..4u32 {
+            let p = buf(
+                rt,
+                &random_f32(b * layout.width() as usize, 1610 + u64::from(step)),
+            );
+            let pc = Cols::dense(&p, layout.width());
+            let (qa, qb) = (
+                seeded(rt, b * hq * d, SENTINEL),
+                seeded(rt, b * hq * d, SENTINEL),
+            );
+            let ta = AttnTargets {
+                q_out: &qa,
+                k_cache: &kc_a,
+                v_cache: &vc_a,
+            };
+            let tb = AttnTargets {
+                q_out: &qb,
+                k_cache: &kc_b,
+                v_cache: &vc_b,
+            };
+            pos_buf.write_u32(&[3 + step]);
+            qwen35::attn_qk_norm_rope(rt, &shape, pc, &qw, &kw, &ta, 3 + step, 1e7, 1e-6).unwrap();
+            qwen35::attn_qk_norm_rope_posbuf(rt, &shape, pc, &qw, &kw, &tb, &pos_buf, 1e7, 1e-6)
+                .unwrap();
+            // The host rewrites the position next step: the GPU must be done.
+            rt.synchronize().unwrap();
+            assert_eq!(qa.read_f32(), qb.read_f32(), "q at step {step}");
+        }
+        assert_eq!(kc_a.read_f32(), kc_b.read_f32(), "k cache");
+        assert_eq!(vc_a.read_f32(), vc_b.read_f32(), "v cache");
+        // Past the capacity the posbuf variant writes nothing at all.
+        let before = kc_b.read_f32();
+        pos_buf.write_u32(&[u32::MAX - 1]);
+        let p = buf(rt, &random_f32(b * layout.width() as usize, 1620));
+        let q = seeded(rt, b * hq * d, SENTINEL);
+        let t = AttnTargets {
+            q_out: &q,
+            k_cache: &kc_b,
+            v_cache: &vc_b,
+        };
+        qwen35::attn_qk_norm_rope_posbuf(
+            rt,
+            &shape,
+            Cols::dense(&p, layout.width()),
+            &qw,
+            &kw,
+            &t,
+            &pos_buf,
+            1e7,
+            1e-6,
+        )
+        .unwrap();
+        rt.synchronize().unwrap();
+        assert_eq!(
+            kc_b.read_f32(),
+            before,
+            "an out-of-range position wrote the cache"
+        );
+        assert!(
+            q.read_f32().iter().all(|&x| x == SENTINEL),
+            "an out-of-range position wrote q"
         );
     });
 }

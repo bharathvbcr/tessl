@@ -10,6 +10,7 @@ python3 tools/msl_emu/check_qwen35.py                   # every case, three thre
 python3 tools/msl_emu/check_qwen35.py -k chunk,score    # cases whose name contains any of these
 python3 tools/msl_emu/check_qwen35.py --fast-math       # Metal-like transcendental error, on-device bounds
 python3 tools/msl_emu/check_qwen35_model.py             # a whole Qwen3_5ForCausalLM vs its own logits
+python3 tools/msl_emu/dialect_lint.py                   # MSL constructs no compiling tessl kernel uses
 MSL_EMU_SANITIZE=address MSL_EMU_OUT=/tmp/asan python3 tools/msl_emu/check_qwen35.py
 MSL_EMU_SANITIZE=thread  MSL_EMU_OUT=/tmp/tsan python3 tools/msl_emu/check_qwen35.py -k chunk_T65
 ```
@@ -56,6 +57,12 @@ moves those logits by O(1). Each of those was injected and caught.
 - `check_qwen35.py` generates inputs, runs the harness, and compares against
   transformers' `modeling_qwen3_5` functions and an f64 recurrence. Outputs are
   pre-filled with NaN, so a skipped element fails.
+
+`dialect_lint.py` is the stand-in for the one thing the emulator cannot see,
+the Metal compiler. It lists every function, qualified name, attribute, cast
+and language feature the Qwen3.5 kernels use that no other tessl kernel (all
+of which compile on every release build) uses. It fails unless each one is in
+its reviewed list, with the reason it is standard MSL.
 
 ## What a pass does and does not mean
 

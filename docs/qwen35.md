@@ -42,6 +42,7 @@ that fusion for Metal.
 | 4. Gated RMSNorm | `qwen35_gated_rms_norm_{f32,bf16}` | `gated_rms_norm` | `Qwen3_5RMSNormGated` |
 | 5. Read-only GDN decode | `qwen35_gdn_recurrent` | `gdn_recurrent` | `torch_recurrent_gated_delta_rule` |
 | 6. Attention extras | `qwen35_attn_qk_norm_rope`, `qwen35_attn_gate_{f32,bf16}` | `attn_qk_norm_rope`, `attn_output_gate` | `q_norm`/`k_norm` (`1 + w`), `apply_rotary_pos_emb` (partial), `* sigmoid(gate)` |
+| 6b. Decode loops replayed from an ICB | `qwen35_attn_qk_norm_rope_posbuf` | `attn_qk_norm_rope_posbuf` | the position comes from a device buffer, like `rms_qkv_rope_posbuf` |
 | 7. Score only the answer rows | `qwen35_score_rows_{f32,bf16}` | `score_answer_rows` | final norm + `lm_head`, restricted to the answer tokens |
 | 8. Fused projections | tessl's GEMM | `pack_linear_weights_*`, `fused_projection`, `project_residual` | `in_proj_qkv/z/b/a`, `q/k/v_proj`, `out_proj` + residual |
 
@@ -219,6 +220,13 @@ wrong factor, and the final norm missing its `+1`. So was a wrong query
 position handed to flash attention during decode. Under the fast-math noise
 model, the logits move by less than 4e-5.
 
+**Compile risk, without a compiler.** `tools/msl_emu/dialect_lint.py` lists
+the MSL constructs these kernels use that no other tessl kernel uses (the others
+compile on every release build). There are 13: `static_assert`, `as_type`, a
+`(device uint *)` cast, `fabs`, `log`, `mem_flags::mem_device`, six `precise::`
+functions and `uint3`. Each is standard MSL and on a reviewed list. An
+unreviewed one fails CI.
+
 The `host_contract` case parses `src/qwen35.rs` and the kernel signatures. It
 checks that every `set_*` bind has the kernel's index and kind (buffer, `uint`,
 `float`), and that the host's thread counts and threadgroup-memory sizes equal
@@ -239,6 +247,9 @@ transformers' own fp32 error, both measured against f64:
 | chunk, T=130, `a + dt_bias` in the softplus-series range | 5.4e-8 | 5.8e-8 |
 | chunk, T=200, Dv=128 | 2.8e-8 | 2.7e-8 |
 | chunk, T=1000 | 2.4e-8 | 2.9e-8 |
+| chunk, T=4096 (64 chunks through one state) | 3.3e-8 | 3.1e-8 |
+| chunk at Qwen3.5's head counts (16 key / 32 value heads, Dv=128), per-batch state | 6.5e-8 | — |
+| recurrent at Qwen3.5's head counts, shared snapshot | 8.9e-9 | — |
 | recurrent, T=1, snapshot, B=4 | 5.8e-9 | 8.3e-9 |
 | recurrent, T=7, per-batch state | 5.7e-9 | 6.5e-9 |
 | chunk / recurrent / conv, T=0 with state_out | state copied exactly | — |

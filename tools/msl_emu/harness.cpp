@@ -186,10 +186,20 @@ int main(int argc, char **argv) {
         const uint per_tg = 8;
         float *p = F("p"), *qw = F("q_norm_w"), *kw = F("k_norm_w"), *q = F("q_out"), *kc = F("k_cache"),
               *vc = F("v_cache");
+        // `posbuf 1`: the device-buffer position variant, reading `pos_offset`
+        // from a one-element u32 buffer instead of the scalar.
+        const bool posbuf = params.count("posbuf") != 0;
+        uint *pos_ptr = posbuf ? U("pos_buf") : nullptr;
         launch(uint3(cdiv(B * T * (Hq + 2 * Hkv), per_tg), 1, 1), uint3(per_tg * 32, 1, 1), 0,
                [&](const Ids &id, float *) {
-                   qwen35_attn_qk_norm_rope(p, qw, kw, q, kc, vc, B, T, Hq, Hkv, D, R, ld_p, q_off, k_off, v_off,
-                                            pos, cap, theta, eps, id.tg.x, id.sg, id.lane, id.tptg);
+                   if (posbuf) {
+                       qwen35_attn_qk_norm_rope_posbuf(p, qw, kw, q, kc, vc, B, T, Hq, Hkv, D, R, ld_p, q_off, k_off,
+                                                       v_off, pos_ptr, cap, theta, eps, id.tg.x, id.sg, id.lane,
+                                                       id.tptg);
+                   } else {
+                       qwen35_attn_qk_norm_rope(p, qw, kw, q, kc, vc, B, T, Hq, Hkv, D, R, ld_p, q_off, k_off,
+                                                v_off, pos, cap, theta, eps, id.tg.x, id.sg, id.lane, id.tptg);
+                   }
                });
     } else if (kname == "qwen35_attn_gate_f32" || kname == "qwen35_attn_gate_bf16") {
         const uint rows = P("rows"), Hq = P("Hq"), D = P("D"), ld_p = P("ld_p"), q_off = P("q_off"),

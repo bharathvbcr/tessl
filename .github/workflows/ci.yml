@@ -54,6 +54,10 @@ jobs:
           python-version: "3.11"
           cache: pip
           cache-dependency-path: tools/msl_emu/requirements.txt
+      - name: MSL dialect lint
+        # No Metal compiler on Linux: fail instead on any construct the Qwen3.5
+        # kernels use that no compiling tessl kernel uses and nobody reviewed.
+        run: python3 tools/msl_emu/dialect_lint.py
       - name: Install the oracle
         run: pip install -r tools/msl_emu/requirements.txt --extra-index-url https://download.pytorch.org/whl/cpu
       - name: Emulator vs transformers

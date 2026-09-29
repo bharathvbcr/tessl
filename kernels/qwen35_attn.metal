@@ -68,6 +68,57 @@ inline void qwen35_norm_rope_row(
     }
 }
 
+/// One simdgroup's unit of `qwen35_attn_qk_norm_rope*`: a (token, head) row
+/// over Hq query, Hkv key and Hkv value heads. Shared by the scalar and the
+/// device-buffer position variants so they cannot drift apart.
+///
+/// The position is formed in 64 bits and checked against the capacity before
+/// anything is written: `pos_offset + t` in 32 bits could wrap to a small slot
+/// and pass the check, and in the `_posbuf` variant the offset is device data
+/// the host never sees.
+inline void qk_norm_rope_unit(
+    device const float *p,
+    device const float *q_norm_w,
+    device const float *k_norm_w,
+    device float *q_out,
+    device float *k_cache,
+    device float *v_cache,
+    uint B, uint T, uint Hq, uint Hkv, uint D, uint rotary_dim,
+    uint ld_p, uint q_off, uint k_off, uint v_off,
+    ulong pos_offset, uint kv_capacity, float theta, float eps,
+    uint tg, uint sg, uint lane, uint tptg)
+{
+    const ulong heads = (ulong)Hq + 2ul * Hkv;
+    const ulong unit = (ulong)tg * (tptg / 32u) + sg;
+    // Uniform per simdgroup; no threadgroup barrier follows.
+    if (unit >= (ulong)B * T * heads) return;
+    const ulong r = unit / heads;
+    const uint j = (uint)(unit % heads);
+    const ulong b = r / T;
+    const ulong pos64 = pos_offset + (r % T);
+    if (pos64 >= (ulong)kv_capacity) return;
+    const uint pos = (uint)pos64;
+    device const float *row = p + r * (ulong)ld_p;
+
+    if (j < Hq) {
+        qwen35_norm_rope_row(row + q_off + (ulong)j * 2u * D, q_norm_w,
+                             q_out + (r * Hq + j) * (ulong)D,
+                             D, rotary_dim, pos, theta, eps, lane);
+        return;
+    }
+    const uint h = j < Hq + Hkv ? j - Hq : j - Hq - Hkv;
+    const ulong slot = (((ulong)b * kv_capacity + pos) * Hkv + h) * (ulong)D;
+    if (j < Hq + Hkv) {
+        qwen35_norm_rope_row(row + k_off + (ulong)h * D, k_norm_w, k_cache + slot,
+                             D, rotary_dim, pos, theta, eps, lane);
+    } else {
+        device const float *src = row + v_off + (ulong)h * D;
+        for (uint d = lane; d < D; d += 32u) {
+            v_cache[slot + d] = src[d];
+        }
+    }
+}
+
 /// Q/K norm + partial RoPE, and the K/V cache store, straight from the fused
 /// projection output.
 ///
@@ -79,7 +130,8 @@ inline void qwen35_norm_rope_row(
 /// Writes q to `q_out` [B, T, Hq, D] and k/v to the caches [B, kv_capacity,
 /// Hkv, D] at slot `pos_offset + t` — the layouts `nn::flash_attn_rows` reads.
 /// RoPE position is also `pos_offset + t`. The gate is left where it is, for
-/// `qwen35_attn_gate_*`.
+/// `qwen35_attn_gate_*`. A token whose position is past the capacity is
+/// skipped entirely.
 ///
 /// One simdgroup per (token, head) over Hq query, Hkv key and Hkv value heads.
 kernel void qwen35_attn_qk_norm_rope(
@@ -108,36 +160,46 @@ kernel void qwen35_attn_qk_norm_rope(
     uint lane [[thread_index_in_simdgroup]],
     uint tptg [[threads_per_threadgroup]])
 {
-    const ulong heads = (ulong)Hq + 2ul * Hkv;
-    const ulong unit = (ulong)tg * (tptg / 32u) + sg;
-    // Uniform per simdgroup; no threadgroup barrier follows.
-    if (unit >= (ulong)B * T * heads) return;
-    const ulong r = unit / heads;
-    const uint j = (uint)(unit % heads);
-    const ulong b = r / T;
-    const uint t = (uint)(r % T);
-    const uint pos = pos_offset + t;
-    // The host checks this too; a stale bind must not write past the cache.
-    if (pos >= kv_capacity) return;
-    device const float *row = p + r * (ulong)ld_p;
+    qk_norm_rope_unit(p, q_norm_w, k_norm_w, q_out, k_cache, v_cache, B, T, Hq, Hkv, D,
+                      rotary_dim, ld_p, q_off, k_off, v_off, (ulong)pos_offset, kv_capacity,
+                      theta, eps, tg, sg, lane, tptg);
+}
 
-    if (j < Hq) {
-        qwen35_norm_rope_row(row + q_off + (ulong)j * 2u * D, q_norm_w,
-                             q_out + (r * Hq + j) * (ulong)D,
-                             D, rotary_dim, pos, theta, eps, lane);
-        return;
-    }
-    const uint h = j < Hq + Hkv ? j - Hq : j - Hq - Hkv;
-    const ulong slot = (((ulong)b * kv_capacity + pos) * Hkv + h) * (ulong)D;
-    if (j < Hq + Hkv) {
-        qwen35_norm_rope_row(row + k_off + (ulong)h * D, k_norm_w, k_cache + slot,
-                             D, rotary_dim, pos, theta, eps, lane);
-    } else {
-        device const float *src = row + v_off + (ulong)h * D;
-        for (uint d = lane; d < D; d += 32u) {
-            v_cache[slot + d] = src[d];
-        }
-    }
+/// [`qwen35_attn_qk_norm_rope`] with the position offset read from a device
+/// buffer (`*pos_offset_ptr`) instead of bound as a scalar, like
+/// `rms_qkv_rope_posbuf`. A decode loop replayed from an Indirect Command
+/// Buffer freezes its scalar binds; with the position in a buffer the host
+/// advances between replays, the same recording rotates and caches each step
+/// at its own position.
+kernel void qwen35_attn_qk_norm_rope_posbuf(
+    device const float *p [[buffer(0)]],
+    device const float *q_norm_w [[buffer(1)]],
+    device const float *k_norm_w [[buffer(2)]],
+    device float *q_out [[buffer(3)]],
+    device float *k_cache [[buffer(4)]],
+    device float *v_cache [[buffer(5)]],
+    constant uint &B [[buffer(6)]],
+    constant uint &T [[buffer(7)]],
+    constant uint &Hq [[buffer(8)]],
+    constant uint &Hkv [[buffer(9)]],
+    constant uint &D [[buffer(10)]],
+    constant uint &rotary_dim [[buffer(11)]],
+    constant uint &ld_p [[buffer(12)]],
+    constant uint &q_off [[buffer(13)]],
+    constant uint &k_off [[buffer(14)]],
+    constant uint &v_off [[buffer(15)]],
+    device const uint *pos_offset_ptr [[buffer(16)]],
+    constant uint &kv_capacity [[buffer(17)]],
+    constant float &theta [[buffer(18)]],
+    constant float &eps [[buffer(19)]],
+    uint tg [[threadgroup_position_in_grid]],
+    uint sg [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint tptg [[threads_per_threadgroup]])
+{
+    qk_norm_rope_unit(p, q_norm_w, k_norm_w, q_out, k_cache, v_cache, B, T, Hq, Hkv, D,
+                      rotary_dim, ld_p, q_off, k_off, v_off, (ulong)*pos_offset_ptr, kv_capacity,
+                      theta, eps, tg, sg, lane, tptg);
 }
 
 /// `sigmoid(x)` without forming `e^|x|`, which fast math may assume finite.

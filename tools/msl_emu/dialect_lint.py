@@ -66,6 +66,10 @@ def defined_here(src):
     """Helpers, kernels and macros the new sources define themselves."""
     s = strip(src)
     names = {m.group(1) for m in re.finditer(r"^\s*(?:inline\s+)?[\w<>\s]*?\b(\w+)\s*\([^;{]*\)\s*\{", s, re.M)}
+    # Kernels by name as well: the signature pattern above can start at a
+    # macro instantiation with no trailing semicolon and run on through the
+    # next kernel's parameter list, which then never gets its own match.
+    names |= {m.group(1) for m in re.finditer(r"\bkernel\s+void\s+(\w+)\s*\(", s)}
     names |= {m.group(1) for m in re.finditer(r"^#define\s+(\w+)", s, re.M)}
     names |= {m.group(1) for m in re.finditer(r"^(\w+)\(\w+,", s, re.M)}  # macro instantiations
     names |= {"NAME"}

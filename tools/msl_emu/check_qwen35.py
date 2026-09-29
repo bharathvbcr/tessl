@@ -740,13 +740,23 @@ CASES = [
     ("chunk_T0_passthrough", lambda: case_gdn("qwen35_gdn_chunk", 2, 0, 1, 2, 32, 22, state_mode="batch")),
     ("recurrent_T0_passthrough", lambda: case_gdn("qwen35_gdn_recurrent", 2, 0, 1, 2, 32, 23, state_mode="snapshot")),
     ("conv_T0_passthrough", lambda: case_conv(2, 0, 64, 4, True, True, 24)),
-    # Qwen3.5's own head counts (transformers' Qwen3_5TextConfig defaults): 16
-    # key heads shared by 32 value heads of 128 in the GDN, 16 query heads over
-    # 4 KV heads of 256 in attention. Every other case uses a handful of heads.
+    # transformers' Qwen3_5TextConfig() defaults: 16 key heads shared by 32
+    # value heads of 128 in the GDN, 16 query heads over 4 KV heads of 256 in
+    # attention. These are NOT the 2B's (see config_2b_* below); they are kept
+    # because Hv = 2*Hk exercises grouped value heads. Every other case uses a
+    # handful of heads.
     ("config_chunk", lambda: case_gdn("qwen35_gdn_chunk", 1, 130, 16, 32, 128, 25, state_mode="batch")),
     ("config_recurrent", lambda: case_gdn("qwen35_gdn_recurrent", 2, 2, 16, 32, 128, 26, state_mode="snapshot")),
     ("config_gated_norm", lambda: case_gated_norm(False, 27, H=32, rows=9)),
-    ("config_qk_norm_rope", lambda: case_qk_norm_rope(28, Hq=16, Hkv=4, B=1, T=5)),    ("recurrent_T1_snapshot", lambda: case_gdn("qwen35_gdn_recurrent", 4, 1, 2, 4, 64, 11, state_mode="snapshot")),
+    ("config_qk_norm_rope", lambda: case_qk_norm_rope(28, Hq=16, Hkv=4, B=1, T=5)),
+    # Qwen/Qwen3.5-2B-Base's config.json: linear_num_key_heads 16,
+    # linear_num_value_heads 16 (no value-head grouping), 8 query over 2 KV
+    # attention heads of 256.
+    ("config_2b_chunk", lambda: case_gdn("qwen35_gdn_chunk", 1, 130, 16, 16, 128, 34, state_mode="batch")),
+    ("config_2b_recurrent", lambda: case_gdn("qwen35_gdn_recurrent", 2, 2, 16, 16, 128, 35,
+                                             state_mode="snapshot")),
+    ("config_2b_qk_norm_rope", lambda: case_qk_norm_rope(36, Hq=8, Hkv=2, B=1, T=5)),
+    ("recurrent_T1_snapshot", lambda: case_gdn("qwen35_gdn_recurrent", 4, 1, 2, 4, 64, 11, state_mode="snapshot")),
     ("recurrent_T7_state", lambda: case_gdn("qwen35_gdn_recurrent", 2, 7, 1, 2, 128, 12, state_mode="batch")),
     ("recurrent_T20", lambda: case_gdn("qwen35_gdn_recurrent", 1, 20, 1, 1, 32, 13)),
     ("recurrent_in_place", lambda: case_recurrent_in_place(14)),

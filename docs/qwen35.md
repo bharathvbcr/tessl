@@ -4,19 +4,18 @@
 has no fast Mac path for. Sources: `kernels/qwen35_gdn.metal`,
 `kernels/qwen35_attn.metal`, `kernels/qwen35_score.metal`.
 
-> **Status: compiled by Apple's Metal compiler; not yet run on a GPU.** The
-> `Metal compile` workflow (GitHub-hosted macOS, Xcode 26.6) builds all three
-> sources under `-std=metal4.0 -Wall -Werror`, links them, confirms all thirteen
-> entry points are exported, and builds the crate and every test target with
-> no `metal3.2` fallback. Its first run caught one diagnostic, an unused
-> constant, which was fixed. Every
-> kernel below was compiled as C++ and executed on a CPU emulator of the Metal
+> **Status: run on a GPU (M5 Pro); performance not yet measured.** The full
+> `cargo test --release -- --test-threads=1` passed on the Mac at `86d09fb`
+> (41 test binaries, 0 failures), including every kernel here in
+> `tests/qwen35_kernels.rs`. The `Metal compile` workflow (GitHub-hosted macOS,
+> Xcode 26.6) builds all three sources under `-std=metal4.0 -Wall -Werror`,
+> links them, confirms all thirteen entry points are exported, and builds the
+> crate and every test target with no `metal3.2` fallback. Every kernel below
+> was also compiled as C++ and executed on a CPU emulator of the Metal
 > execution model, then compared against transformers' own Qwen3.5 code (see
 > [Verification](#verification)), including under AddressSanitizer and
 > ThreadSanitizer, in shuffled threadgroup order, and with fast-math-like
-> error injected. Nothing has run on a GPU yet:
-> `cargo test --release --test qwen35_kernels -- --test-threads=1` on a Mac is
-> the first time that happens.
+> error injected.
 
 ## Why
 
@@ -280,8 +279,10 @@ transformers' own fp32 error, both measured against f64:
 | chunk, T=200, Dv=128 | 2.8e-8 | 2.7e-8 |
 | chunk, T=1000 | 2.4e-8 | 2.9e-8 |
 | chunk, T=4096 (64 chunks through one state) | 3.3e-8 | 3.1e-8 |
-| chunk at Qwen3.5's head counts (16 key / 32 value heads, Dv=128), per-batch state | 6.5e-8 | — |
-| recurrent at Qwen3.5's head counts, shared snapshot | 8.9e-9 | — |
+| chunk at 16 key / 32 value heads, Dv=128 (`Qwen3_5TextConfig()` defaults†), per-batch state | 6.5e-8 | — |
+| recurrent at the same head counts, shared snapshot | 8.9e-9 | — |
+| chunk at the 2B's head counts (16 key / 16 value heads, Dv=128), per-batch state | 7.5e-8 | — |
+| recurrent at the 2B's head counts, shared snapshot | 8.1e-9 | 7.3e-9 |
 | recurrent, T=1, snapshot, B=4 | 5.8e-9 | 8.3e-9 |
 | recurrent, T=7, per-batch state | 5.7e-9 | 6.5e-9 |
 | chunk / recurrent / conv, T=0 with state_out | state copied exactly | — |
@@ -293,6 +294,20 @@ transformers' own fp32 error, both measured against f64:
 | scoring f32 / bf16; a bad slot or answer → NaN, the rest intact | 4.8e-7 | — |
 | Q/K norm + RoPE with `slot_base`: absolute RoPE, relative slot | bit-identical to slot_base 0 | — |
 | shared-prefix attention, 8 query / 2 KV heads of 256; P = 0, 1, 30 (no suffix), 65 | bit-identical to `flash_attn_rows` on a copied prefix; ≤ 5.0e-7 vs torch | — |
+
+† These are **not the 2B's** head counts. `Qwen/Qwen3.5-2B-Base`'s `config.json`
+has `linear_num_key_heads` 16 and `linear_num_value_heads` **16** (Hv/Hk = 1),
+and 8 query / 2 KV attention heads. The 16/32 case comes from transformers'
+`Qwen3_5TextConfig()` defaults: hidden 4096, 32 layers, 16 query / 4 KV
+attention heads. The class docstring cites `Qwen/Qwen3.5-27B`, but whether a
+released size uses exactly these defaults hasn't been checked against its
+config. The case is kept because Hv = 2·Hk exercises grouped value heads,
+which the 2B does not.
+
+On macOS the harness needs a GCC toolchain: `CXX=g++-16` (Homebrew). Apple
+clang's libc++ makes the stand-in `exp` ambiguous and the build fails. A whole
+run is long enough that CI's Linux job is the place for it. Locally, `-k`
+selects cases.
 
 **The checks catch defects.** Mutations injected into the GDN kernel were each
 caught: dropping the inter-chunk decay, using the wrong state-update decay,

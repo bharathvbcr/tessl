@@ -4,15 +4,19 @@
 has no fast Mac path for. Sources: `kernels/qwen35_gdn.metal`,
 `kernels/qwen35_attn.metal`, `kernels/qwen35_score.metal`.
 
-> **Status: built and checked off-device, not yet run on Apple silicon.** Every
+> **Status: compiled by Apple's Metal compiler; not yet run on a GPU.** The
+> `Metal compile` workflow (GitHub-hosted macOS, Xcode 26.6) builds all three
+> sources under `-std=metal4.0 -Wall -Werror`, links them, confirms all twelve
+> entry points are exported, and builds the crate and every test target with
+> no `metal3.2` fallback. Its first run caught one diagnostic, an unused
+> constant, which was fixed. Every
 > kernel below was compiled as C++ and executed on a CPU emulator of the Metal
 > execution model, then compared against transformers' own Qwen3.5 code (see
 > [Verification](#verification)), including under AddressSanitizer and
 > ThreadSanitizer, in shuffled threadgroup order, and with fast-math-like
-> error injected. The Rust wrappers type-check and pass clippy for
-> `aarch64-apple-darwin`. Nothing here has been through the Metal compiler or a
-> GPU yet. `cargo test --release --test qwen35_kernels -- --test-threads=1`
-> on a Mac is the first time either happens.
+> error injected. Nothing has run on a GPU yet:
+> `cargo test --release --test qwen35_kernels -- --test-threads=1` on a Mac is
+> the first time that happens.
 
 ## Why
 

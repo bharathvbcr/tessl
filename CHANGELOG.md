@@ -64,6 +64,11 @@ All notable changes to `tessl` are recorded here. The format follows
 - `tools/msl_emu/dialect_lint.py` (in CI): every MSL construct the Qwen3.5
   kernels use that no compiling tessl kernel uses must be on a reviewed list.
 - Emulator cases at Qwen3.5's real head counts and at T=4096.
+- `.github/workflows/metal-compile.yml`: Apple's Metal compiler on GitHub-hosted
+  macOS, never the self-hosted runner. It compiles the Qwen3.5 sources under
+  `-std=metal4.0 -Wall -Werror`, links them, checks every entry point is
+  exported, and builds everything with no `metal3.2` fallback. Its first run
+  found one unused constant; every other line compiled clean.
 - `tests/qwen35_kernels.rs` with transformers-generated goldens in
   `tests/fixtures/qwen35/` (`scripts/gen_qwen35_fixtures.py`). The Qwen3.5
   sources join the widened-index-arithmetic inspection in

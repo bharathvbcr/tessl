@@ -674,3 +674,162 @@ impl Qwen35Model {
         Ok(AttnGrads { w_in, w_out, q_norm, k_norm })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    //! Whether `train_step`'s gradients are the gradients of tessl's own
+    //! forward, where they differ from transformers': central differences of
+    //! the loss along the direction in which the two gradients disagree.
+
+    use std::path::{Path, PathBuf};
+
+    use super::*;
+    use crate::npy::read_npy;
+    use crate::qwen35_model::Qwen35Config;
+    use crate::safetensors::SafeTensors;
+
+    fn npy(path: &Path) -> Vec<f64> {
+        let a = read_npy(path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+        if let Ok(s) = a.f32_slice() {
+            s.iter().map(|&x| f64::from(x)).collect()
+        } else if let Ok(s) = a.f64_slice() {
+            s.to_vec()
+        } else {
+            a.i64_slice().unwrap().iter().map(|&x| x as f64).collect()
+        }
+    }
+
+    /// One parameter tensor to probe: the model's buffer, tessl's gradient,
+    /// transformers' gradient in tessl's layout, and whether the disagreement
+    /// is large enough for finite differences to resolve.
+    struct FdCase<'a> {
+        name: String,
+        param: &'a GpuBuffer,
+        grad: &'a GpuBuffer,
+        n: usize,
+        torch: Vec<f64>,
+        resolved: bool,
+    }
+
+    /// The loss of the inference forward's logits (the training forward's
+    /// to 2e-7), in f64 on the host.
+    fn loss(model: &Qwen35Model, ids: &[u32]) -> f64 {
+        let logits = model.forward(ids, false).unwrap().logits;
+        let v = model.cfg.vocab as usize;
+        let mut ce = 0.0f64;
+        for (t, row) in logits.chunks(v).take(ids.len() - 1).enumerate() {
+            let m = row.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b)) as f64;
+            let z: f64 = row.iter().map(|&x| (f64::from(x) - m).exp()).sum();
+            ce += m + z.ln() - f64::from(row[ids[t + 1] as usize]);
+        }
+        ce / (ids.len() - 1) as f64
+    }
+
+    /// Qwen3.5-2B-Base against `make_train_fixture.py 2b`'s gradients.
+    ///
+    /// tessl's and transformers' f32 forwards differ (logits by 1.9e-6 of
+    /// the largest), so their gradients differ too (up to 4e-3 of a
+    /// parameter's largest, tests/qwen35_train.rs). This decides whose side a
+    /// disagreement is on: along `v = (g_tessl - g_torch) / |d|` the two
+    /// gradients predict slopes `|d|` apart, and a Richardson-extrapolated
+    /// central difference of tessl's own loss must land on tessl's.
+    #[test]
+    #[ignore]
+    fn real_2b_gradients_are_those_of_tessls_forward() {
+        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/qwen35_train_ref");
+        let st = SafeTensors::open(Path::new(&std::env::var("QWEN35_2B_SAFETENSORS").expect("QWEN35_2B_SAFETENSORS"))).unwrap();
+        let rt = GpuRuntime::new().unwrap();
+        let model = Qwen35Model::load(&rt, &st, "model.language_model.", Qwen35Config::qwen35_2b().unwrap(), Precision::F32).unwrap();
+        drop(st);
+        let ids: Vec<u32> = npy(&dir.join("ids.npy")).iter().map(|&x| x as u32).collect();
+        let step = model.train_step(&ids).unwrap();
+        let base = loss(&model, &ids);
+        // (name, the model's f32 buffer, tessl's gradient buffer, length).
+        let mixer = |l: usize| match (&model.layers[l].mixer, &step.grads.layers[l].mixer) {
+            (Mixer::Gdn(w), MixerGrads::Gdn(g)) => (w, g),
+            _ => panic!("layer {l} is not a GDN layer"),
+        };
+        let h = model.cfg.hidden as usize;
+        let cases: Vec<(String, &GpuBuffer, &GpuBuffer, usize)> = vec![
+            ("model.layers.20.linear_attn.conv1d.weight".into(), &mixer(20).0.conv_w, &mixer(20).1.conv_w, 6144 * 4),
+            ("model.layers.23.input_layernorm.weight".into(), &model.layers[23].input_norm, &step.grads.layers[23].input_norm, h),
+            ("model.layers.8.linear_attn.dt_bias".into(), &mixer(8).0.dt_bias, &mixer(8).1.dt_bias, 16),
+            ("model.layers.8.linear_attn.A_log".into(), &mixer(8).0.a_log, &mixer(8).1.a_log, 16),
+            ("model.norm.weight".into(), &model.final_norm, &step.grads.final_norm, h),
+        ];
+        // The matrices, whose disagreement is large in absolute terms and
+        // spread thinly over millions of weights: torch's [out, in]
+        // transposed into the packed [in, out] tessl stores.
+        let i = model.cfg.intermediate as usize;
+        let attn = |l: usize| match (&model.layers[l].mixer, &step.grads.layers[l].mixer) {
+            (Mixer::Attn(w), MixerGrads::Attn(g)) => (w, g),
+            _ => panic!("layer {l} is not an attention layer"),
+        };
+        let qd = (model.cfg.attn.q_heads() * model.cfg.attn.head_dim()) as usize;
+        let matrices: Vec<(String, &GpuBuffer, &GpuBuffer, usize, usize)> = vec![
+            ("model.layers.0.mlp.gate_proj.weight".into(), &model.layers[0].gate.buffer, &step.grads.layers[0].gate.buffer, h, i),
+            ("model.layers.0.mlp.down_proj.weight".into(), &model.layers[0].down.buffer, &step.grads.layers[0].down.buffer, i, h),
+            ("model.layers.3.self_attn.o_proj.weight".into(), &attn(3).0.w_out.buffer, &attn(3).1.w_out.buffer, qd, h),
+        ];
+        // Resolved: the disagreement is large enough in absolute terms (|d| h
+        // well above the loss's f32 rounding, ~1e-6) for central differences
+        // to tell the two gradients apart. The conv and the matrices are; the
+        // 1-D tensors' |d| h is at the rounding level, so they are printed and
+        // not asserted.
+        let mut all_cases: Vec<FdCase<'_>> = cases
+            .into_iter()
+            .map(|(name, param, grad, n)| {
+                let torch = npy(&dir.join(format!("grad.{name}.npy")));
+                let resolved = name.ends_with("conv1d.weight");
+                FdCase { name, param, grad, n, torch, resolved }
+            })
+            .collect();
+        for (name, p, g, rows, cols) in matrices {
+            let t = npy(&dir.join(format!("grad.{name}.npy")));
+            let packed: Vec<f64> = (0..rows).flat_map(|r| (0..cols).map(move |c| (r, c))).map(|(r, c)| t[c * rows + r]).collect();
+            all_cases.push(FdCase { name, param: p, grad: g, n: rows * cols, torch: packed, resolved: true });
+        }
+        for FdCase { name, param, grad, n, torch: g_torch, resolved } in all_cases {
+            let g_tessl: Vec<f64> = grad.read_f32()[..n].iter().map(|&x| f64::from(x)).collect();
+            let d: Vec<f64> = g_tessl.iter().zip(&g_torch).map(|(a, b)| a - b).collect();
+            let dn = d.iter().map(|x| x * x).sum::<f64>().sqrt();
+            let v: Vec<f64> = d.iter().map(|x| x / dn).collect();
+            let dot = |g: &[f64]| g.iter().zip(&v).map(|(a, b)| a * b).sum::<f64>();
+            let (pt, pr) = (dot(&g_tessl), dot(&g_torch));
+            let orig = param.read_f32()[..n].to_vec();
+            let mut line = format!("{name}: |d| {dn:.3e}, tessl.v {pt:.6e}, torch.v {pr:.6e}; FD");
+            let mut fds = Vec::new();
+            for step_h in [1e-2, 5e-3, 2.5e-3, 1.25e-3] {
+                let set = |s: f64| {
+                    let p: Vec<f32> = orig.iter().zip(&v).map(|(&x, &u)| (f64::from(x) + s * u) as f32).collect();
+                    let mut all = param.read_f32();
+                    all[..n].copy_from_slice(&p);
+                    param.write_f32(&all);
+                };
+                set(step_h);
+                let up = loss(&model, &ids);
+                set(-step_h);
+                let down = loss(&model, &ids);
+                let mut all = param.read_f32();
+                all[..n].copy_from_slice(&orig);
+                param.write_f32(&all);
+                let fd = (up - down) / (2.0 * step_h);
+                fds.push(fd);
+                line += &format!(" h={step_h:e}: {fd:.5e}");
+            }
+            // Richardson: the central difference's h^2 term cancels between
+            // h and h/2.
+            let n_fd = fds.len();
+            let extrap = (4.0 * fds[n_fd - 1] - fds[n_fd - 2]) / 3.0;
+            let extrap2 = (4.0 * fds[n_fd - 2] - fds[n_fd - 3]) / 3.0;
+            let fd = (extrap + extrap2) / 2.0;
+            line += &format!("; extrapolated {fd:.5e}: off tessl {:+.2e}, off torch {:+.2e}", fd - pt, fd - pr);
+            eprintln!("{line}");
+            assert_eq!(loss(&model, &ids).to_bits(), base.to_bits(), "{name}: the parameter was not restored");
+            if resolved {
+                assert!((fd - pt).abs() <= 0.3 * dn, "{name}: tessl's loss moves as {fd:.6e} along v, its gradient says {pt:.6e}");
+                assert!((fd - pt).abs() < (fd - pr).abs(), "{name}: the finite difference is closer to transformers' gradient");
+            }
+        }
+    }
+}

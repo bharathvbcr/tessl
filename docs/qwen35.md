@@ -706,8 +706,26 @@ defects (dropped accumulations, swapped gradient windows, a skipped
 embedding add, wrong norm inputs, the loss shift, the layer order) fail it;
 the fifteenth, accumulating the final norm's gradient into the freshly
 zeroed residual gradient, cannot change it.
-`real_2b_step_matches_transformers` (ignored) does the same on
-Qwen3.5-2B-Base against `make_train_fixture.py 2b`.
+On Qwen3.5-2B-Base (`make_train_fixture.py 2b`, then the ignored
+`real_2b_step_matches_transformers`; 128 tokens of the parity prompt, every
+1-D and conv parameter, layers 0 and 3 in full, 149 tensors and the used
+embedding rows): the training loss equals the inference forward's to 1.7e-7
+and transformers' to 4.6e-5, and the gradients agree with transformers' to
+at most 3.9e-3 of a parameter's largest (median about 5e-4). That is well
+above transformers' own run-to-run disagreement (3.7e-5 worst, SDPA against
+eager attention and another thread count, `tools/qwen35_ref/train_noise_floor.py`),
+so it was not waved through as float32 noise. It is the forward's: tessl's
+and transformers' f32 forwards differ (logits by 1.9e-6 of the largest,
+above), and the gradients of two slightly different functions differ by
+more. The unit test `real_2b_gradients_are_those_of_tessls_forward` shows
+which side each disagreement is on: along `v = (g_tessl - g_torch) / |d|`,
+where the two gradients predict slopes `|d|` apart, a Richardson-extrapolated
+central difference of tessl's own loss lands within 0.03-0.21 |d| of tessl's
+gradient (layer 20's conv weight, layer 0's MLP gate and down projections,
+layer 3's attention output projection) and 0.8-0.9 |d| from transformers'.
+The 1-D tensors' disagreements are below what differences of an f32 loss can
+resolve and are not claimed either way. The 2B test's bounds (loss 1e-4,
+gradients 1e-2) were set after that first run, for those reasons.
 
 ## Performance
 

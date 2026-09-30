@@ -60,7 +60,12 @@ All notable changes to `tessl` are recorded here. The format follows
   transformers' autograd on a committed tiny model
   (`tests/fixtures/qwen35_train/`, from
   `tools/qwen35_ref/make_train_fixture.py tiny`), and on the real 2B by an
-  ignored test (`make_train_fixture.py 2b`).
+  ignored test (`make_train_fixture.py 2b`): loss within 4.6e-5, gradients
+  within 3.9e-3 of each parameter's largest, a difference finite differences
+  of tessl's own loss attribute to the two f32 forwards, not the backward
+  (`real_2b_gradients_are_those_of_tessls_forward`);
+  `tools/qwen35_ref/train_noise_floor.py` measures transformers' own
+  run-to-run gradient disagreement for comparison.
 - **Training attention (`tessl::attn_train`)**: `attn_train_forward` is
   `attn_prefill`'s tiled kernel at its default geometry with each row's
   log-sum-exp written out (new entry point

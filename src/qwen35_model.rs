@@ -331,48 +331,48 @@ impl Precision {
     }
 }
 
-struct GdnWeights {
-    w_in: Tensor,
-    w_out: Tensor,
-    conv_w: GpuBuffer,
-    a_log: GpuBuffer,
-    dt_bias: GpuBuffer,
-    norm_w: GpuBuffer,
+pub(crate) struct GdnWeights {
+    pub(crate) w_in: Tensor,
+    pub(crate) w_out: Tensor,
+    pub(crate) conv_w: GpuBuffer,
+    pub(crate) a_log: GpuBuffer,
+    pub(crate) dt_bias: GpuBuffer,
+    pub(crate) norm_w: GpuBuffer,
 }
 
-struct AttnWeights {
-    w_in: Tensor,
-    w_out: Tensor,
-    q_norm: GpuBuffer,
-    k_norm: GpuBuffer,
+pub(crate) struct AttnWeights {
+    pub(crate) w_in: Tensor,
+    pub(crate) w_out: Tensor,
+    pub(crate) q_norm: GpuBuffer,
+    pub(crate) k_norm: GpuBuffer,
 }
 
-enum Mixer {
+pub(crate) enum Mixer {
     Gdn(GdnWeights),
     Attn(AttnWeights),
 }
 
-struct Layer {
-    input_norm: GpuBuffer,
-    post_norm: GpuBuffer,
-    mixer: Mixer,
-    gate: Tensor,
-    up: Tensor,
-    down: Tensor,
+pub(crate) struct Layer {
+    pub(crate) input_norm: GpuBuffer,
+    pub(crate) post_norm: GpuBuffer,
+    pub(crate) mixer: Mixer,
+    pub(crate) gate: Tensor,
+    pub(crate) up: Tensor,
+    pub(crate) down: Tensor,
 }
 
 /// A loaded model: weights on the device in the layouts the kernels read.
 pub struct Qwen35Model {
-    cfg: Qwen35Config,
-    precision: Precision,
-    rt: Arc<GpuRuntime>,
+    pub(crate) cfg: Qwen35Config,
+    pub(crate) precision: Precision,
+    pub(crate) rt: Arc<GpuRuntime>,
     /// `[vocab, hidden]` bf16: the embedding gather's table.
-    embed: GpuBuffer,
+    pub(crate) embed: GpuBuffer,
     /// `[hidden, vocab]` in the forward's precision: the tied LM head, as the
     /// right operand of one GEMM.
-    lm_head: Tensor,
-    final_norm: GpuBuffer,
-    layers: Vec<Layer>,
+    pub(crate) lm_head: Tensor,
+    pub(crate) final_norm: GpuBuffer,
+    pub(crate) layers: Vec<Layer>,
 }
 
 /// What [`Qwen35Model::forward`] returns.

@@ -79,6 +79,7 @@
 //! | [`qwen35_bwd`] | Backward of the Qwen3.5 row-local ops: RMSNorm, gated RMSNorm, SwiGLU, output gate, causal conv + SiLU, GDN gates, Q/K norm + RoPE, embedding |
 //! | [`gdn_train`] | The gated delta rule for training: forward and backward at transformers' op seam |
 //! | [`attn_train`] | Full attention for training: the forward with its log-sum-exp, and the backward |
+//! | [`qwen35_train`] | One training step of the Qwen3.5 text model: loss and every parameter's gradient |
 //! | [`capi`] | The C ABI (`libtessl.dylib`) that `python/tessl_torch` calls through `ctypes` |
 //!
 //! # Encode model
@@ -110,7 +111,9 @@
 //! cross-entropy and its gradients are in [`cross_entropy`], and the gated
 //! delta rule's training forward and backward in [`gdn_train`], and the
 //! backward of the layer's row-local ops in [`qwen35_bwd`], and full
-//! attention's training forward and backward in [`attn_train`].
+//! attention's training forward and backward in [`attn_train`]. A whole
+//! training step (loss and every parameter's gradient) is
+//! [`qwen35_model::Qwen35Model::train_step`], in [`qwen35_train`].
 //!
 //! 44 of these were promoted out of `gemma-metal`, where they were reachable
 //! only as raw pipeline-name strings through an overlay metallib. All 44 now
@@ -222,6 +225,7 @@ pub mod npy;
 pub mod ops;
 pub mod qwen35;
 pub mod qwen35_bwd;
+pub mod qwen35_train;
 pub mod qwen35_model;
 pub mod runtime;
 pub mod safetensors;

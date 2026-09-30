@@ -676,6 +676,39 @@ of fourteen injected defects (masking, scale, `Dr`, head grouping, the
 diagonal start, the log-sum-exp reads and store) fail it. The backward has
 not been timed yet.
 
+### A training step: `Qwen35Model::train_step`
+
+`train_step(ids)` is one sequence through the model with transformers'
+`ForCausalLMLoss` (position t predicts `ids[t + 1]`, mean over `T - 1`
+positions) and every parameter's gradient of it. It runs in f32
+(`Precision::F32`; a bf16-loaded model is refused) and requires GDN value
+heads equal to key heads, as Qwen3.5-2B has. The forward is the inference
+forward's except where a backward needs more: `gdn_gates` + `gdn_train`
+(checkpointed state) for the gated delta rule and `attn_train` (log-sum-exp)
+for attention. Each layer's activations are saved; the backward walks the
+layers in reverse (MLP, post norm, mixer, input norm, the residual stream's
+gradient accumulating through both norms), then adds the embedding's
+gradient onto the tied head's `[vocab, hidden]` gradient that the
+cross-entropy wrote. Every fused projection's gradient is filled by disjoint
+writers (for GDN: the conv's q, k, v columns, the gated norm's z, the gates'
+a and b; for attention: the Q/K backward's q, k, v and the output gate's
+gate columns) and multiplied out once. Gradients are the same bits on every
+run.
+
+`tests/qwen35_train.rs` checks it against transformers' own autograd on a
+committed tiny `Qwen3_5ForCausalLM` of the 2B's shape family (one GDN and one
+attention layer, T = 70 across a GDN chunk and attention blocks; bf16
+weights, f32 arithmetic on both sides): the loss within 4.3e-8 relative,
+and all 27 parameter gradients within 3.1e-6 of each parameter's largest
+magnitude (bound 1e-4). The training forward's loss equals the loss of the
+inference forward's logits. Fourteen of fifteen injected composition
+defects (dropped accumulations, swapped gradient windows, a skipped
+embedding add, wrong norm inputs, the loss shift, the layer order) fail it;
+the fifteenth, accumulating the final norm's gradient into the freshly
+zeroed residual gradient, cannot change it.
+`real_2b_step_matches_transformers` (ignored) does the same on
+Qwen3.5-2B-Base against `make_train_fixture.py 2b`.
+
 ## Performance
 
 `cargo run --release --bin bench_qwen35_layers` builds Qwen3.5-2B's shapes

@@ -50,6 +50,17 @@ All notable changes to `tessl` are recorded here. The format follows
   host checks the ids and groups the rows by id; each id's rows are summed
   in row order without atomics. `EmbedBwdWorkspace` holds the grouping.
   Kernel `qwen35_embed_rows_bwd_f32`.
+- **A Qwen3.5 training step (`Qwen35Model::train_step`, `tessl::qwen35_train`)**:
+  transformers' causal-LM loss for one sequence and every parameter's
+  gradient, in f32, in each weight's own layout (packed fused projections,
+  `[vocab, hidden]` for the tied embedding and head). The forward saves
+  what the backward needs and uses `gdn_train`, `attn_train` and
+  `gdn_gates`; the backward chains the CE, row-local, conv, gate, Q/K,
+  attention and embedding backwards with exact-f32 GEMMs. Checked against
+  transformers' autograd on a committed tiny model
+  (`tests/fixtures/qwen35_train/`, from
+  `tools/qwen35_ref/make_train_fixture.py tiny`), and on the real 2B by an
+  ignored test (`make_train_fixture.py 2b`).
 - **Training attention (`tessl::attn_train`)**: `attn_train_forward` is
   `attn_prefill`'s tiled kernel at its default geometry with each row's
   log-sum-exp written out (new entry point

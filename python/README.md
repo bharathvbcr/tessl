@@ -31,20 +31,26 @@ optimizer.
 model = tessl_torch.Qwen35("model.safetensors", "config.json")  # prefix "model.language_model."
 params = model.parameters()           # an f32 copy on MPS, transformers' names and shapes
 opt = torch.optim.AdamW(params.values(), lr=1e-5)
+grads = None
 for ids in batches:                   # one sequence of token ids per step
-    loss = model.train_step(ids)      # tessl: the loss and every gradient
-    for name, g in model.grads().items():
+    loss = model.train_step(ids, operands="bf16")  # tessl: the loss and every gradient
+    grads = model.grads(into=grads)   # the same tensors every step after the first
+    for name, g in grads.items():
         params[name].grad = g
     opt.step()
     model.load_parameters(params)     # write the update back to tessl
 ```
 
-`train_step(ids, operands="bf16")` (and `operands="bf16"` on `cross_entropy`)
-rounds every GEMM's operands to bf16 and accumulates in f32; the weights,
+`operands="bf16"` (also on `cross_entropy`) rounds every GEMM's operands to bf16 and accumulates in f32; the weights,
 activations and gradients stay f32. The default, `"f32"`, is exact. On the
 2B's cross-entropy at T = 2048 bf16 is 3.15x faster; its gradients differ
-from transformers' f32 ones by up to 2.3e-2 of a parameter's peak on the
-tiny test model (`docs/qwen35.md`, "A training step").
+from transformers' f32 ones by up to 3.6e-2 of a parameter's peak on the 2B
+(the exact step: 3.9e-3; `docs/qwen35.md`, "A training step"). Every
+parity bound this project states is for the exact default.
+
+`grads(into=...)` writes into tensors an earlier `grads()` returned instead
+of allocating another 8 GB copy on the 2B while the previous one is still
+attached to the parameters.
 
 Names are transformers' below the text tower (`layers.3.mlp.gate_proj.weight`),
 and values are the parameters' own (the zero-centred norms as `w`, although

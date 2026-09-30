@@ -129,6 +129,11 @@ All notable changes to `tessl` are recorded here. The format follows
   bounded header, JSON subset, reads through the handle it opened).
 - **`qwen35::residual_add`** (`qwen35_residual_add_f32`), the exact-f32
   residual add for strided windows.
+- **`tessl_torch.Qwen35.grads(into=...)`** writes a step's gradients into
+  tensors an earlier `grads()` returned (the optimizer's `.grad`s), checking
+  them all first, instead of allocating another copy of every gradient (8 GB
+  on the 2B) while the previous one is still alive. The documented training
+  recipe uses it and shows `operands="bf16"`; the default stays exact f32.
 
 ### Changed (breaking)
 

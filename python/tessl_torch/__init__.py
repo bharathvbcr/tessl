@@ -608,8 +608,10 @@ class Qwen35:
         model = tessl_torch.Qwen35(safetensors_path, config_json_path)
         params = model.parameters()            # an f32 copy, on MPS
         opt = torch.optim.AdamW(params.values(), lr=1e-5)
-        loss = model.train_step(ids)           # tessl: loss and every gradient
-        for name, g in model.grads().items():
+        grads = None
+        loss = model.train_step(ids, operands="bf16")  # tessl: loss and every gradient
+        grads = model.grads(into=grads)        # reused after the first step
+        for name, g in grads.items():
             params[name].grad = g
         opt.step()
         model.load_parameters(params)          # write the update back
@@ -620,7 +622,9 @@ class Qwen35:
     ``1 + w``). Linear weights come back as transposed views of ``[in, out]``
     tensors, which is how tessl lays them out; ``load_parameters`` accepts
     any layout. The model runs entirely in f32, the tied embedding included,
-    so ``load_parameters`` is exact.
+    so ``load_parameters`` is exact. ``operands="bf16"`` rounds only the
+    GEMMs' operands; the default ``"f32"`` is exact, and it is the lane
+    every stated parity bound is for.
 
     The handle belongs to the thread that made it, like every tessl call.
     Each call synchronizes torch's MPS stream first and returns after tessl's
@@ -687,13 +691,40 @@ class Qwen35:
         self._copy(_READ_PARAMS, ts)
         return self._views(ts)
 
-    def grads(self, device: str = "mps") -> dict:
-        """The last ``train_step``'s gradients, laid out as ``parameters()``."""
+    def grads(self, device: str = "mps", into: dict | None = None) -> dict:
+        """The last ``train_step``'s gradients, laid out as ``parameters()``.
+
+        With ``into`` (a dict an earlier ``grads()`` or ``parameters()``
+        returned, such as the optimizer's ``.grad`` tensors), the gradients
+        are written into those tensors and ``into`` is returned: no new
+        memory, where a fresh call allocates another copy of every gradient
+        while the previous one is usually still alive. Every tensor is checked
+        before any is written."""
         if not self._has_grads:
             raise TesslError("no gradients yet; call train_step first")
-        ts = self._storage(torch.device(device))
+        if into is None:
+            ts = self._storage(torch.device(device))
+            self._copy(_READ_GRADS, ts)
+            return self._views(ts)
+        names = [name for name, _, _ in self._table]
+        missing = [n for n in names if n not in into]
+        extra = [n for n in into if n not in set(names)]
+        if missing or extra:
+            raise TesslError(f"grads(into=...): missing {missing[:3]}{'...' if len(missing) > 3 else ''}, "
+                             f"unexpected {extra[:3]}{'...' if len(extra) > 3 else ''}")
+        ts = []
+        for name, shape, tr in self._table:
+            t = into[name]
+            if tuple(t.shape) != shape or t.dtype != torch.float32 or t.device.type != "mps":
+                raise TesslError(f"grads(into=...): {name} must be f32 {shape} on mps, "
+                                 f"got {t.dtype} {tuple(t.shape)} on {t.device}")
+            storage = t.t() if tr else t
+            if not storage.is_contiguous():
+                raise TesslError(f"grads(into=...): {name} is not laid out as grads() returns it"
+                                 f"{' (a transposed view of a contiguous [in, out] tensor)' if tr else ''}")
+            ts.append(storage)
         self._copy(_READ_GRADS, ts)
-        return self._views(ts)
+        return into
 
     def load_parameters(self, params) -> None:
         """Set every parameter from ``params`` (name -> tensor of the

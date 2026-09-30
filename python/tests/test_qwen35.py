@@ -101,6 +101,58 @@ class Qwen35Training(unittest.TestCase):
         self.assertLessEqual(worst, 2.0 ** -5)
         self.assertNotEqual(loss, m.train_step(self.ids))
 
+    def test_grads_into_reuses_the_callers_tensors(self):
+        # A second step's gradients written into the first step's tensors:
+        # the same bits as a fresh grads(), in the same storage, with no MPS
+        # memory allocated by the call.
+        m = self.model()
+        m.train_step(self.ids)
+        held = m.grads()
+        first = {n: t.clone() for n, t in held.items()}
+        ptrs = {n: t.data_ptr() for n, t in held.items()}
+        m.train_step(self.ids[: len(self.ids) // 2])
+        torch.mps.synchronize()
+        before = torch.mps.current_allocated_memory()
+        out = m.grads(into=held)
+        torch.mps.synchronize()
+        self.assertEqual(torch.mps.current_allocated_memory(), before)
+        self.assertIs(out, held)
+        fresh = m.grads()
+        for n, t in held.items():
+            self.assertEqual(t.data_ptr(), ptrs[n], n)
+            self.assertTrue(torch.equal(t, fresh[n]), n)
+        # The half-length step's gradients are not the first step's, so the
+        # tensors were written, not left as they were.
+        self.assertTrue(any(not torch.equal(held[n], first[n]) for n in held))
+
+    def test_grads_into_checks_every_tensor_before_writing(self):
+        m = self.model()
+        m.train_step(self.ids)
+        held = m.grads()
+        name, shape, tr = next(e for e in m._table if e[2])
+        bad = dict(held)
+        del bad[name]
+        with self.assertRaisesRegex(TesslError, "missing"):
+            m.grads(into=bad)
+        bad = dict(held)
+        bad[name] = held[name].half()
+        with self.assertRaisesRegex(TesslError, f"{name} must be f32"):
+            m.grads(into=bad)
+        bad = dict(held)
+        bad[name] = held[name].contiguous()  # right shape, wrong layout for a transposed entry
+        with self.assertRaisesRegex(TesslError, f"{name} is not laid out as grads\\(\\) returns it"):
+            m.grads(into=bad)
+        # A refusal writes nothing: the other tensors in the dict are untouched.
+        # Every entry valid (zeroed, in grads()'s layout) except the one.
+        layout = {n: t for n, _, t in m._table}
+        zeros = {n: (torch.zeros_like(t.t()).t() if layout[n] else torch.zeros_like(t)) for n, t in held.items()}
+        zeros[name] = held[name].contiguous()
+        before = {n: z.clone() for n, z in zeros.items()}
+        with self.assertRaises(TesslError):
+            m.grads(into=zeros)
+        for n in zeros:
+            self.assertTrue(torch.equal(zeros[n], before[n]), n)
+
     def test_an_optimizer_step_written_back_is_transformers_after_the_same_step(self):
         m = self.model()
         ref = reference()

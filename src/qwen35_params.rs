@@ -52,7 +52,7 @@ impl ParamInfo {
 
 /// Where a value lives in tessl.
 #[derive(Clone, Copy)]
-enum Src<'a> {
+pub(crate) enum Src<'a> {
     /// A 1-D f32 buffer stored as `1 + w`.
     OnePlus(&'a GpuBuffer),
     /// An f32 buffer holding exactly the value.
@@ -63,10 +63,10 @@ enum Src<'a> {
     Dense(&'a Tensor),
 }
 
-struct Slot<'a> {
-    info: ParamInfo,
-    param: Src<'a>,
-    grad: Option<Src<'a>>,
+pub(crate) struct Slot<'a> {
+    pub(crate) info: ParamInfo,
+    pub(crate) param: Src<'a>,
+    pub(crate) grad: Option<Src<'a>>,
 }
 
 fn info(name: String, shape: &[usize], transposed: bool) -> ParamInfo {
@@ -87,7 +87,7 @@ fn offsets<const N: usize>(widths: [usize; N]) -> [usize; N] {
 }
 
 /// Every parameter in a fixed order, with its gradient in `grads` if given.
-fn slots<'a>(m: &'a Qwen35Model, grads: Option<&'a Qwen35Grads>) -> Result<Vec<Slot<'a>>, String> {
+pub(crate) fn slots<'a>(m: &'a Qwen35Model, grads: Option<&'a Qwen35Grads>) -> Result<Vec<Slot<'a>>, String> {
     let cfg = &m.cfg;
     let (h, inter, vocab) = (cfg.hidden as usize, cfg.intermediate as usize, cfg.vocab as usize);
     if let Some(g) = grads {
@@ -254,7 +254,7 @@ fn check(what: &str, slots: &[Slot<'_>], ts: &[Tensor]) -> Result<(), String> {
 }
 
 impl Qwen35Model {
-    fn require_f32(&self, what: &str) -> Result<(), String> {
+    pub(crate) fn require_f32(&self, what: &str) -> Result<(), String> {
         if self.precision != Precision::F32 {
             return Err(format!(
                 "{what}: the parameter table needs a model loaded with Precision::F32"

@@ -80,6 +80,7 @@
 //! | [`gdn_train`] | The gated delta rule for training: forward and backward at transformers' op seam |
 //! | [`attn_train`] | Full attention for training: the forward with its log-sum-exp, and the backward |
 //! | [`qwen35_train`] | One training step of the Qwen3.5 text model: loss and every parameter's gradient |
+//! | [`qwen35_adamw`] | AdamW over a Qwen3.5 model's own parameters, in place (torch.optim.AdamW's update) |
 //! | [`capi`] | The C ABI (`libtessl.dylib`) that `python/tessl_torch` calls through `ctypes` |
 //!
 //! # Encode model
@@ -99,7 +100,7 @@
 //!
 //! # Kernels
 //!
-//! 29 Metal sources compile to 196 kernel entry points: RMSNorm, gated MLP
+//! 30 Metal sources compile to 197 kernel entry points: RMSNorm, gated MLP
 //! activations, flash attention (sliding-window and global), fused
 //! RMSNorm+QKV+RoPE, MLX-format Q4 GEMV/GEMM, Q8 GEMV, an exact int8 GEMM, KV
 //! cache stores, embedding lookup, row-wise softmax/sum/max, and softcap
@@ -113,7 +114,8 @@
 //! backward of the layer's row-local ops in [`qwen35_bwd`], and full
 //! attention's training forward and backward in [`attn_train`]. A whole
 //! training step (loss and every parameter's gradient) is
-//! [`qwen35_model::Qwen35Model::train_step`], in [`qwen35_train`].
+//! [`qwen35_model::Qwen35Model::train_step`], in [`qwen35_train`], and an AdamW
+//! step over the model's own parameters is [`qwen35_adamw`].
 //!
 //! 44 of these were promoted out of `gemma-metal`, where they were reachable
 //! only as raw pipeline-name strings through an overlay metallib. All 44 now
@@ -224,6 +226,7 @@ pub mod nn;
 pub mod npy;
 pub mod ops;
 pub mod qwen35;
+pub mod qwen35_adamw;
 pub mod qwen35_bwd;
 pub mod qwen35_model;
 pub mod qwen35_params;

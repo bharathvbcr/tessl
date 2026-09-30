@@ -15,14 +15,16 @@ use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_metal::{MTLBuffer, MTLDevice, MTLResourceOptions};
 use tessl::capi::{
-    tessl_abi_version, tessl_cross_entropy_rows, tessl_mtl_buffer_length, tessl_qwen35_copy, tessl_qwen35_free,
-    tessl_qwen35_load, tessl_qwen35_param_count, tessl_qwen35_param_info, tessl_qwen35_train_step, tessl_runtime_free,
-    tessl_runtime_new, tessl_synchronize, TesslCeArgs, TesslParamInfo, TesslQwen35, TesslRuntime, TesslTensorRef,
-    TESSL_ABI_VERSION, TESSL_ERR, TESSL_F32, TESSL_MAX_DIMS, TESSL_OK, TESSL_OPERANDS_BF16, TESSL_OPERANDS_EXACT_F32,
-    TESSL_READ_GRADS, TESSL_READ_PARAMS, TESSL_WRITE_PARAMS,
+    tessl_abi_version, tessl_cross_entropy_rows, tessl_mtl_buffer_length, tessl_qwen35_adamw_free,
+    tessl_qwen35_adamw_init, tessl_qwen35_adamw_step, tessl_qwen35_adamw_step_count, tessl_qwen35_copy,
+    tessl_qwen35_free, tessl_qwen35_load, tessl_qwen35_param_count, tessl_qwen35_param_info, tessl_qwen35_train_step,
+    tessl_runtime_free, tessl_runtime_new, tessl_synchronize, TesslCeArgs, TesslParamInfo, TesslQwen35, TesslRuntime,
+    TesslTensorRef, TESSL_ABI_VERSION, TESSL_ERR, TESSL_F32, TESSL_MAX_DIMS, TESSL_OK, TESSL_OPERANDS_BF16,
+    TESSL_OPERANDS_EXACT_F32, TESSL_READ_GRADS, TESSL_READ_PARAMS, TESSL_WRITE_PARAMS,
 };
 use tessl::cross_entropy::{cross_entropy_rows, CeGrads, CeHidden, CeWorkspace, Reduction};
 use tessl::gemm::GemmOperands;
+use tessl::qwen35_adamw::{excluded_from_weight_decay, AdamW, AdamWHyper};
 use tessl::{DType, GpuRuntime};
 
 const ERR_LEN: usize = 512;
@@ -747,4 +749,164 @@ fn a_model_load_refuses_bad_arguments() {
     );
     assert!(msg(&err).contains("null out"), "{}", msg(&err));
     assert_eq!(unsafe { tessl_qwen35_free(ptr::null_mut()) }, TESSL_OK);
+}
+
+/// AdamW through the ABI is the Rust AdamW: after two steps on the same
+/// gradients every parameter has the same bits; the default decay flags are
+/// the Rust rule; the step count follows; every refusal is a status and a
+/// message, and a refused step moves nothing.
+#[test]
+fn adamw_through_the_abi_is_the_rust_adamw() {
+    let handle = Handle::new();
+    let model = load_model(handle.0);
+    let ids = fixture_ids();
+    let mut err = [0 as c_char; ERR_LEN];
+    with_gpu(|rt| {
+        let st =
+            tessl::safetensors::SafeTensors::open(std::path::Path::new(fixture("model.safetensors").to_str().unwrap()))
+                .unwrap();
+        let cfg = tessl::qwen35_model::Qwen35Config::from_config_file(std::path::Path::new(
+            fixture("config.json").to_str().unwrap(),
+        ))
+        .unwrap();
+        let rust = tessl::qwen35_model::Qwen35Model::load(rt, &st, "model.", cfg, tessl::qwen35_model::Precision::F32)
+            .unwrap();
+        let table = rust.parameter_table().unwrap();
+        let n = table.len() as u64;
+
+        // The decay flags are the Rust rule, and they build the default decays.
+        let mut wd = Vec::new();
+        for (i, p) in table.iter().enumerate() {
+            let mut info: TesslParamInfo = unsafe { std::mem::zeroed() };
+            assert_eq!(
+                unsafe { tessl_qwen35_param_info(model, i as u64, &mut info, err.as_mut_ptr(), ERR_LEN) },
+                TESSL_OK
+            );
+            assert_eq!(
+                info.decay_excluded != 0,
+                excluded_from_weight_decay(&p.name),
+                "{}",
+                p.name
+            );
+            wd.push(if info.decay_excluded != 0 { 0.0f32 } else { 0.1 });
+        }
+        assert_eq!(wd, rust.default_weight_decay(0.1).unwrap());
+
+        // Refusals before there is anything to step.
+        let step = |w: *const f32, n: u64, err: &mut [c_char; ERR_LEN]| unsafe {
+            tessl_qwen35_adamw_step(model, 1e-2, 0.9, 0.999, 1e-8, w, n, err.as_mut_ptr(), ERR_LEN)
+        };
+        assert_eq!(step(wd.as_ptr(), n, &mut err), TESSL_ERR);
+        assert!(msg(&err).contains("no gradients yet"), "{}", msg(&err));
+        let mut count = 0u64;
+        assert_eq!(
+            unsafe { tessl_qwen35_adamw_step_count(model, &mut count, err.as_mut_ptr(), ERR_LEN) },
+            TESSL_ERR
+        );
+        assert!(msg(&err).contains("no AdamW state"), "{}", msg(&err));
+        let mut loss = 0.0f64;
+        let train = |loss: &mut f64, err: &mut [c_char; ERR_LEN]| unsafe {
+            tessl_qwen35_train_step(
+                model,
+                ids.as_ptr(),
+                ids.len() as u64,
+                TESSL_OPERANDS_EXACT_F32,
+                loss,
+                err.as_mut_ptr(),
+                ERR_LEN,
+            )
+        };
+        assert_eq!(train(&mut loss, &mut err), TESSL_OK, "{}", msg(&err));
+        assert_eq!(step(wd.as_ptr(), n, &mut err), TESSL_ERR);
+        assert!(
+            msg(&err).contains("no AdamW state; call tessl_qwen35_adamw_init first"),
+            "{}",
+            msg(&err)
+        );
+        assert_eq!(
+            unsafe { tessl_qwen35_adamw_init(model, err.as_mut_ptr(), ERR_LEN) },
+            TESSL_OK,
+            "{}",
+            msg(&err)
+        );
+        assert_eq!(
+            unsafe { tessl_qwen35_adamw_init(model, err.as_mut_ptr(), ERR_LEN) },
+            TESSL_ERR
+        );
+        assert!(msg(&err).contains("already has AdamW state"), "{}", msg(&err));
+        assert_eq!(step(wd.as_ptr(), n - 1, &mut err), TESSL_ERR);
+        assert!(
+            msg(&err).contains(&format!("{} weight decays for {n} parameters", n - 1)),
+            "{}",
+            msg(&err)
+        );
+        assert_eq!(step(ptr::null(), n, &mut err), TESSL_ERR);
+        assert!(msg(&err).contains("null weight_decay"), "{}", msg(&err));
+        let bad_beta = unsafe {
+            tessl_qwen35_adamw_step(model, 1e-2, 1.0, 0.999, 1e-8, wd.as_ptr(), n, err.as_mut_ptr(), ERR_LEN)
+        };
+        assert_eq!(bad_beta, TESSL_ERR);
+        assert!(msg(&err).contains("beta1 1 must lie in [0, 1)"), "{}", msg(&err));
+        assert_eq!(
+            unsafe { tessl_qwen35_adamw_step_count(model, &mut count, err.as_mut_ptr(), ERR_LEN) },
+            TESSL_OK
+        );
+        assert_eq!(count, 0, "a refused step advanced the count");
+
+        // Two steps each side, on the same gradients: the same bits.
+        let mut state = AdamW::new(&rust).unwrap();
+        let hyper = AdamWHyper {
+            lr: 1e-2,
+            ..AdamWHyper::default()
+        };
+        for k in 1..=2u64 {
+            if k > 1 {
+                assert_eq!(train(&mut loss, &mut err), TESSL_OK, "{}", msg(&err));
+            }
+            assert_eq!(step(wd.as_ptr(), n, &mut err), TESSL_OK, "{}", msg(&err));
+            let s = rust.train_step(&ids, GemmOperands::ExactF32).unwrap();
+            rust.adamw_step(&s.grads, &mut state, &hyper, &wd).unwrap();
+            assert_eq!(
+                unsafe { tessl_qwen35_adamw_step_count(model, &mut count, err.as_mut_ptr(), ERR_LEN) },
+                TESSL_OK
+            );
+            assert_eq!(count, k);
+        }
+        let bufs: Vec<_> = table
+            .iter()
+            .map(|p| shared(rt, &vec![0.0; p.shape.iter().product()]))
+            .collect();
+        let refs: Vec<TesslTensorRef> = table
+            .iter()
+            .zip(&bufs)
+            .map(|(p, b)| tref(b, &p.storage_shape().iter().map(|&d| d as u64).collect::<Vec<_>>()))
+            .collect();
+        assert_eq!(
+            unsafe { tessl_qwen35_copy(model, TESSL_READ_PARAMS, refs.as_ptr(), n, err.as_mut_ptr(), ERR_LEN) },
+            TESSL_OK
+        );
+        let local: Vec<tessl::Tensor> = table
+            .iter()
+            .map(|p| rt.alloc_tensor_f32(&p.storage_shape()).unwrap())
+            .collect();
+        rust.read_parameters(&local).unwrap();
+        for ((p, b), t) in table.iter().zip(&bufs).zip(&local) {
+            let got = read(b, p.shape.iter().product());
+            let want = t.read_f32().unwrap();
+            assert!(
+                got.iter().zip(&want).all(|(a, b)| a.to_bits() == b.to_bits()),
+                "{}",
+                p.name
+            );
+        }
+
+        // Freed state is gone: a step is refused again.
+        assert_eq!(
+            unsafe { tessl_qwen35_adamw_free(model, err.as_mut_ptr(), ERR_LEN) },
+            TESSL_OK
+        );
+        assert_eq!(step(wd.as_ptr(), n, &mut err), TESSL_ERR);
+        assert!(msg(&err).contains("no AdamW state"), "{}", msg(&err));
+    });
+    assert_eq!(unsafe { tessl_qwen35_free(model) }, TESSL_OK);
 }

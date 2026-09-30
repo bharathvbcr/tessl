@@ -101,6 +101,58 @@ class Qwen35Training(unittest.TestCase):
         self.assertLessEqual(worst, 2.0 ** -5)
         self.assertNotEqual(loss, m.train_step(self.ids))
 
+    def test_adamw_in_tessl_is_torch_adamw(self):
+        # torch.optim.AdamW on CPU copies, with the same two groups (Trainer's
+        # exclusions take no decay), fed tessl's gradients each step. Bound
+        # set before the first run: 1e-6 per element (lr 1e-2: a semantic
+        # error is 1e-5 or more), plus 2^-22 for the norms tessl stores as 1 + w.
+        m = self.model()
+        ref = {n: p.cpu().clone().requires_grad_(True) for n, p in m.parameters().items()}
+        excluded = dict(zip((n for n, _, _ in m._table), m._decay_excluded))
+        self.assertTrue(excluded["layers.0.linear_attn.dt_bias"] and excluded["norm.weight"])
+        self.assertFalse(excluded["embed_tokens.weight"] or excluded["layers.0.linear_attn.A_log"])
+        opt = torch.optim.AdamW(
+            [
+                {"params": [p for n, p in ref.items() if not excluded[n]], "weight_decay": 0.1},
+                {"params": [p for n, p in ref.items() if excluded[n]], "weight_decay": 0.0},
+            ],
+            lr=1e-2,
+        )
+        m.adamw_init()
+        losses = []
+        for step in range(1, 4):
+            losses.append(m.train_step(self.ids))
+            grads = m.grads()
+            for n, p in ref.items():
+                p.grad = grads[n].cpu()
+            opt.step()
+            m.adamw_step(1e-2, weight_decay=0.1)
+            self.assertEqual(m.adamw_step_count, step)
+            got = m.parameters()
+            for n, p in ref.items():
+                tol = 1e-6 + (2.0 ** -22 if n.endswith("layernorm.weight") or n == "norm.weight" else 0.0)
+                err = (got[n].cpu() - p.detach()).abs().max().item()
+                self.assertLessEqual(err, tol, f"step {step} {n}: {err:.3e}")
+        # Training on one sequence lowers its loss.
+        self.assertLess(m.train_step(self.ids), losses[0])
+
+    def test_adamw_refusals(self):
+        m = self.model()
+        m.train_step(self.ids)
+        with self.assertRaisesRegex(TesslError, "no AdamW state; call tessl_qwen35_adamw_init first"):
+            m.adamw_step(1e-2)
+        m.adamw_init()
+        with self.assertRaisesRegex(TesslError, "already has AdamW state"):
+            m.adamw_init()
+        with self.assertRaisesRegex(TesslError, "weight_decay is missing \\['embed_tokens.weight'"):
+            m.adamw_step(1e-2, weight_decay={"norm.weight": 0.0})
+        with self.assertRaisesRegex(TesslError, "beta2 1 must lie in"):
+            m.adamw_step(1e-2, betas=(0.9, 1.0))
+        self.assertEqual(m.adamw_step_count, 0)
+        m.adamw_free()
+        with self.assertRaisesRegex(TesslError, "no AdamW state"):
+            m.adamw_step_count
+
     def test_grads_into_reuses_the_callers_tensors(self):
         # A second step's gradients written into the first step's tensors:
         # the same bits as a fresh grads(), in the same storage, with no MPS

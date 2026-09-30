@@ -742,10 +742,24 @@ lower; that is arithmetic, not a re-measurement.
 `src/qwen35_params.rs` exposes the model's parameters and gradients under
 transformers' names and values (norms as `w`, not the stored `1 + w`; each
 linear weight as its `[in, out]` window of the packed projection) and copies
-them between the model and caller tensors on the GPU. The C ABI (version 5)
+them between the model and caller tensors on the GPU. The C ABI (version 7)
 adds a model handle (`tessl_qwen35_load`, `_train_step`, `_param_count`,
-`_param_info`, `_copy`, `_free`), and `tessl_torch.Qwen35` wraps it (see
-`python/README.md`). In `Precision::F32` the tied embedding is one f32
+`_param_info`, `_copy`, `_free`, and `_adamw_init`, `_adamw_step`,
+`_adamw_step_count`, `_adamw_free`), and `tessl_torch.Qwen35` wraps it (see
+`python/README.md`).
+
+`tessl::qwen35_adamw` runs AdamW on the model's own parameters, so a
+training loop needs no torch copy of the parameters or gradients: on the 2B
+that is params 8 + gradients 8 + moments 16 GB plus the step's scratch,
+against about 55 GB with torch's optimizer (estimated, not measured). The
+update is `torch.optim.AdamW`'s single-tensor path in its order, per
+parameter-table entry, with the norms stored as `1 + w` updated as `w`;
+weight decay is per entry, and the default excludes what transformers'
+Trainer excludes (every norm and `linear_attn.dt_bias`). Against an f64
+reference of torch's formula over five steps on the tiny model the worst
+error is 1.3e-7 (bound 2e-6), and against `torch.optim.AdamW` itself over
+three steps it is within 1e-6 (`tests/qwen35_adamw.rs`,
+`python/tests/test_qwen35.py`). In `Precision::F32` the tied embedding is one f32
 `[vocab, hidden]` table: the gather reads it by row
 (`qwen35_embed_rows_f32`), the training step's cross-entropy as its weight,
 and the inference forward's head as the transposed operand of one NT GEMM,

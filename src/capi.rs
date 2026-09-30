@@ -41,6 +41,7 @@ use crate::gdn_train::{
     gdn_train_backward, gdn_train_forward, GdnTrainDims, GdnTrainGrads, GdnTrainInputs, GdnTrainWorkspace,
 };
 use crate::gemm::GemmOperands;
+use crate::qwen35_adamw::{excluded_from_weight_decay, AdamW, AdamWHyper};
 use crate::qwen35_model::{Precision, Qwen35Config, Qwen35Model};
 use crate::qwen35_params::ParamInfo;
 use crate::qwen35_train::Qwen35Grads;
@@ -54,7 +55,7 @@ pub const TESSL_PANIC: i32 = 2;
 
 /// Bumped on any change to a `#[repr(C)]` layout or an entry point's
 /// signature; the Python side refuses a library whose version differs.
-pub const TESSL_ABI_VERSION: u32 = 6;
+pub const TESSL_ABI_VERSION: u32 = 7;
 
 /// Largest tensor rank a [`TesslTensorRef`] carries.
 pub const TESSL_MAX_DIMS: usize = 6;
@@ -667,16 +668,22 @@ pub struct TesslParamInfo {
     /// Non-zero: the tensors a copy takes hold the `[in, out]` transpose of
     /// the 2-D `shape`.
     pub transposed: u32,
+    /// Non-zero: transformers' Trainer excludes this parameter from weight
+    /// decay ([`crate::qwen35_adamw::excluded_from_weight_decay`]), the
+    /// default [`tessl_qwen35_adamw_step`] callers start from.
+    pub decay_excluded: u32,
     /// transformers' shape; the first `ndim` entries are used.
     pub shape: [u64; TESSL_MAX_DIMS],
 }
 
-/// What a [`tessl_qwen35_load`] pointer owns: an f32 model and the
-/// gradients of its last [`tessl_qwen35_train_step`].
+/// What a [`tessl_qwen35_load`] pointer owns: an f32 model, the gradients
+/// of its last [`tessl_qwen35_train_step`], and AdamW state once
+/// [`tessl_qwen35_adamw_init`] made it.
 pub struct TesslQwen35 {
     model: Qwen35Model,
     table: Vec<ParamInfo>,
     grads: Option<Qwen35Grads>,
+    adamw: Option<AdamW>,
     owner: ThreadId,
 }
 
@@ -748,6 +755,7 @@ pub unsafe extern "C" fn tessl_qwen35_load(
                 model,
                 table,
                 grads: None,
+                adamw: None,
                 owner: h.owner,
             }));
             Ok(())
@@ -819,6 +827,7 @@ pub unsafe extern "C" fn tessl_qwen35_param_info(
                 name: [0; TESSL_NAME_LEN],
                 ndim: p.shape.len() as u32,
                 transposed: u32::from(p.transposed),
+                decay_excluded: u32::from(excluded_from_weight_decay(&p.name)),
                 shape: [0; TESSL_MAX_DIMS],
             };
             // Lengths were checked at load.
@@ -923,6 +932,111 @@ pub unsafe extern "C" fn tessl_qwen35_copy(
                     "{WHAT}: direction {d} is not 0 (read params), 1 (read grads) or 2 (write params)"
                 )),
             }
+        })
+    }
+}
+
+/// Make the handle's AdamW state: both moments zeroed, twice the parameters'
+/// memory (16 GB on the 2B), step count 0. Refused if the handle has one.
+///
+/// # Safety
+/// As [`tessl_qwen35_param_count`].
+#[no_mangle]
+pub unsafe extern "C" fn tessl_qwen35_adamw_init(model: *mut TesslQwen35, err: *mut c_char, err_len: usize) -> i32 {
+    // SAFETY: forwarded from this function's contract.
+    unsafe {
+        guarded(model, err, err_len, |h| {
+            if h.adamw.is_some() {
+                return Err("tessl_qwen35_adamw_init: the model already has AdamW state".into());
+            }
+            h.adamw = Some(AdamW::new(&h.model)?);
+            Ok(())
+        })
+    }
+}
+
+/// Drop the handle's AdamW state, if any.
+///
+/// # Safety
+/// As [`tessl_qwen35_param_count`].
+#[no_mangle]
+pub unsafe extern "C" fn tessl_qwen35_adamw_free(model: *mut TesslQwen35, err: *mut c_char, err_len: usize) -> i32 {
+    // SAFETY: forwarded from this function's contract.
+    unsafe {
+        guarded(model, err, err_len, |h| {
+            h.adamw = None;
+            Ok(())
+        })
+    }
+}
+
+/// One AdamW step ([`crate::qwen35_adamw`]) on every parameter from the last
+/// [`tessl_qwen35_train_step`]'s gradients, which stay in the handle, with
+/// `weight_decay[i]` for parameter-table entry `i` (`n` must be the table's
+/// length). Everything is checked before anything moves.
+///
+/// # Safety
+/// As [`tessl_qwen35_param_count`]; `weight_decay` points to `n` readable
+/// `f32`s.
+#[no_mangle]
+pub unsafe extern "C" fn tessl_qwen35_adamw_step(
+    model: *mut TesslQwen35,
+    lr: f64,
+    beta1: f64,
+    beta2: f64,
+    eps: f64,
+    weight_decay: *const f32,
+    n: u64,
+    err: *mut c_char,
+    err_len: usize,
+) -> i32 {
+    // SAFETY: forwarded from this function's contract.
+    unsafe {
+        guarded(model, err, err_len, |h| {
+            const WHAT: &str = "tessl_qwen35_adamw_step";
+            let n = usize::try_from(n).map_err(|_| format!("{WHAT}: n overflows usize"))?;
+            if n != h.table.len() {
+                return Err(format!("{WHAT}: {n} weight decays for {} parameters", h.table.len()));
+            }
+            if weight_decay.is_null() {
+                return Err(format!("{WHAT}: null weight_decay"));
+            }
+            let wd = std::slice::from_raw_parts(weight_decay, n);
+            let grads = h
+                .grads
+                .as_ref()
+                .ok_or_else(|| format!("{WHAT}: no gradients yet; run tessl_qwen35_train_step first"))?;
+            let state = h
+                .adamw
+                .as_mut()
+                .ok_or_else(|| format!("{WHAT}: no AdamW state; call tessl_qwen35_adamw_init first"))?;
+            h.model
+                .adamw_step(grads, state, &AdamWHyper { lr, beta1, beta2, eps }, wd)
+        })
+    }
+}
+
+/// The AdamW steps taken so far, written to `*out`.
+///
+/// # Safety
+/// As [`tessl_qwen35_param_count`]; `out` is writable.
+#[no_mangle]
+pub unsafe extern "C" fn tessl_qwen35_adamw_step_count(
+    model: *mut TesslQwen35,
+    out: *mut u64,
+    err: *mut c_char,
+    err_len: usize,
+) -> i32 {
+    // SAFETY: forwarded from this function's contract.
+    unsafe {
+        guarded(model, err, err_len, |h| {
+            const WHAT: &str = "tessl_qwen35_adamw_step_count";
+            if out.is_null() {
+                return Err(format!("{WHAT}: null out"));
+            }
+            let state = h.adamw.as_ref().ok_or_else(|| format!("{WHAT}: no AdamW state"))?;
+            *out = state.step_count();
+            Ok(())
         })
     }
 }

@@ -24,11 +24,27 @@ other strided layouts are copied contiguous first. An empty mask is an error.
 ## Training a whole Qwen3.5 model
 
 `Qwen35` runs tessl's `Qwen35Model::train_step`: the forward, the causal-LM
-loss and every parameter's gradient happen in tessl, and torch runs the
-optimizer.
+loss and every parameter's gradient happen in tessl. AdamW can run in tessl
+too, on the model's own parameters, which is what fits the 2B on a 64 GB Mac
+(params, gradients and both moments: 32 GB plus the step's scratch):
 
 ```python
 model = tessl_torch.Qwen35("model.safetensors", "config.json")  # prefix "model.language_model."
+model.adamw_init()                    # both moments, inside tessl
+for step, ids in enumerate(batches):  # one sequence of token ids per step
+    loss = model.train_step(ids, operands="bf16")
+    model.adamw_step(lr=schedule(step), weight_decay=0.1)  # Trainer's exclusions take none
+```
+
+`adamw_step` is `torch.optim.AdamW`'s update (checked against it to 1e-6);
+`weight_decay` is a float for every parameter transformers' Trainer decays
+(not the norms or `linear_attn.dt_bias`), or a dict giving each name its own.
+`adamw_step_count` is torch's `state["step"]`.
+
+With torch's own optimizer instead, which holds its own copy of every
+parameter and gradient (about 55 GB on the 2B):
+
+```python
 params = model.parameters()           # an f32 copy on MPS, transformers' names and shapes
 opt = torch.optim.AdamW(params.values(), lr=1e-5)
 grads = None

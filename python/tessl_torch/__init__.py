@@ -43,7 +43,7 @@ __all__ = [
     "library_path",
 ]
 
-_ABI_VERSION = 6
+_ABI_VERSION = 7
 _MAX_DIMS = 6
 _DTYPE_CODE = {torch.float32: 0, torch.bfloat16: 1, torch.float16: 2}
 _ERR_LEN = 1024
@@ -112,6 +112,7 @@ class _ParamInfo(ctypes.Structure):
         ("name", ctypes.c_char * _NAME_LEN),
         ("ndim", ctypes.c_uint32),
         ("transposed", ctypes.c_uint32),
+        ("decay_excluded", ctypes.c_uint32),
         ("shape", ctypes.c_uint64 * _MAX_DIMS),
     ]
 
@@ -181,6 +182,16 @@ def _load():
         lib.tessl_qwen35_copy.argtypes = [
             ctypes.c_void_p, ctypes.c_uint32, ctypes.POINTER(_TensorRef), ctypes.c_uint64,
         ] + err_args
+        for name in ("tessl_qwen35_adamw_init", "tessl_qwen35_adamw_free"):
+            getattr(lib, name).restype = ctypes.c_int32
+            getattr(lib, name).argtypes = [ctypes.c_void_p] + err_args
+        lib.tessl_qwen35_adamw_step.restype = ctypes.c_int32
+        lib.tessl_qwen35_adamw_step.argtypes = [
+            ctypes.c_void_p, ctypes.c_double, ctypes.c_double, ctypes.c_double, ctypes.c_double,
+            ctypes.POINTER(ctypes.c_float), ctypes.c_uint64,
+        ] + err_args
+        lib.tessl_qwen35_adamw_step_count.restype = ctypes.c_int32
+        lib.tessl_qwen35_adamw_step_count.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint64)] + err_args
         _lib = lib
         return lib
 
@@ -646,12 +657,15 @@ class Qwen35:
         count = ctypes.c_uint64()
         self._check(rt.lib.tessl_qwen35_param_count(handle, ctypes.byref(count), err, _ERR_LEN), err)
         table = []
+        decay_excluded = []
         for i in range(count.value):
             info = _ParamInfo()
             self._check(rt.lib.tessl_qwen35_param_info(handle, i, ctypes.byref(info), err, _ERR_LEN), err)
             shape = tuple(info.shape[d] for d in range(info.ndim))
             table.append((info.name.decode(), shape, bool(info.transposed)))
+            decay_excluded.append(bool(info.decay_excluded))
         self._table = table
+        self._decay_excluded = decay_excluded
         self._has_grads = False
 
     @staticmethod
@@ -744,6 +758,55 @@ class Qwen35:
             p = p.detach()
             ts.append((p.t() if tr else p).to(device="mps", dtype=torch.float32).contiguous())
         self._copy(_WRITE_PARAMS, ts)
+
+    def adamw_init(self) -> None:
+        """Make AdamW state inside tessl: both moments zeroed, twice the
+        parameters' memory (16 GB on the 2B), step count 0. With it a training
+        loop needs no torch copy of the parameters or gradients."""
+        err = ctypes.create_string_buffer(_ERR_LEN)
+        self._check(self._rt.lib.tessl_qwen35_adamw_init(self._handle, err, _ERR_LEN), err)
+
+    def adamw_free(self) -> None:
+        """Drop the AdamW state, if any."""
+        err = ctypes.create_string_buffer(_ERR_LEN)
+        self._check(self._rt.lib.tessl_qwen35_adamw_free(self._handle, err, _ERR_LEN), err)
+
+    @property
+    def adamw_step_count(self) -> int:
+        """AdamW steps taken so far (torch's ``state["step"]``)."""
+        count = ctypes.c_uint64()
+        err = ctypes.create_string_buffer(_ERR_LEN)
+        self._check(self._rt.lib.tessl_qwen35_adamw_step_count(self._handle, ctypes.byref(count), err, _ERR_LEN), err)
+        return count.value
+
+    def adamw_step(self, lr: float, betas=(0.9, 0.999), eps: float = 1e-8, weight_decay=0.01) -> None:
+        """One ``torch.optim.AdamW`` step (amsgrad and maximize off) on every
+        parameter, in tessl, from the last ``train_step``'s gradients.
+
+        ``weight_decay`` is a float, applied to every parameter except those
+        transformers' Trainer excludes (every norm and ``linear_attn.dt_bias``),
+        or a dict giving every parameter name its own. Call ``adamw_init()``
+        first."""
+        names = [name for name, _, _ in self._table]
+        if isinstance(weight_decay, dict):
+            missing = [n for n in names if n not in weight_decay]
+            extra = [n for n in weight_decay if n not in set(names)]
+            if missing or extra:
+                raise TesslError(f"adamw_step: weight_decay is missing {missing[:3]}{'...' if len(missing) > 3 else ''}, "
+                                 f"unexpected {extra[:3]}{'...' if len(extra) > 3 else ''}")
+            wd = [float(weight_decay[n]) for n in names]
+        else:
+            wd = [0.0 if ex else float(weight_decay) for ex in self._decay_excluded]
+        beta1, beta2 = betas
+        arr = (ctypes.c_float * len(wd))(*wd)
+        err = ctypes.create_string_buffer(_ERR_LEN)
+        torch.mps.synchronize()
+        self._check(
+            self._rt.lib.tessl_qwen35_adamw_step(
+                self._handle, float(lr), float(beta1), float(beta2), float(eps), arr, len(wd), err, _ERR_LEN,
+            ),
+            err,
+        )
 
     def train_step(self, ids, operands: str = "f32") -> float:
         """One training step on one sequence of token ids (a 1-D tensor or a

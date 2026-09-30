@@ -137,7 +137,7 @@ All notable changes to `tessl` are recorded here. The format follows
 
 ### Changed (breaking)
 
-- **C ABI 6** (was 3; the binding and library refuse each other across
+- **C ABI 7** (was 3; the binding and library refuse each other across
   versions, so rebuild `libtessl.dylib` with the binding). It adds a
   Qwen3.5 model handle: `tessl_qwen35_load`, `_train_step`,
   `_param_count`, `_param_info` (`TesslParamInfo`), `_copy` (read
@@ -146,12 +146,20 @@ All notable changes to `tessl` are recorded here. The format follows
   `parameters()`, `train_step(ids)`, `grads()`, `load_parameters()`, under
   transformers' names and values, for a torch optimizer. Checked against
   transformers' own autograd before and after an AdamW step written back
-  (`python/tests/test_qwen35.py`).
+  (`python/tests/test_qwen35.py`). ABI 7 also runs AdamW inside tessl
+  (`tessl_qwen35_adamw_init`, `_step`, `_step_count`, `_free`, over
+  `qwen35_adamw`), and `TesslParamInfo` gains `decay_excluded`, Trainer's
+  weight-decay exclusion for that entry; `tessl_torch.Qwen35` wraps them
+  as `adamw_init()`, `adamw_step(lr, betas, eps, weight_decay)` (a float
+  for every non-excluded parameter, or a dict by name), `adamw_free()` and
+  `adamw_step_count`, so a loop needs no torch copy of the parameters or
+  gradients. Checked against `torch.optim.AdamW` itself, over three steps
+  within 1e-6, and the ABI against the Rust call bit for bit.
 - **`Qwen35Model::train_step(ids, operands)` and
   `cross_entropy_rows(.., reduction, operands, ws, grads)`** take a
   `gemm::GemmOperands`: `ExactF32` (the previous behaviour) or `Bf16`, bf16
   GEMM operands with f32 accumulation while weights, activations and
-  gradients stay f32. ABI 6 carries it: `TesslCeArgs.operands` and an
+  gradients stay f32. The C ABI carries it: `TesslCeArgs.operands` and an
   `operands` parameter of `tessl_qwen35_train_step` (`TESSL_OPERANDS_EXACT_F32`
   0, `TESSL_OPERANDS_BF16` 1, anything else refused); `tessl_torch` takes
   `operands="f32" | "bf16"` (default `"f32"`) on `Qwen35.train_step`,

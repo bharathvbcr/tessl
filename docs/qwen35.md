@@ -528,6 +528,28 @@ QWEN35_2B_SAFETENSORS=.../model.safetensors-00001-of-00001.safetensors \
   cargo test --release --test qwen35_model -- --ignored --test-threads=1
 ```
 
+## Training memory: where torch's backward spends it
+
+`tools/qwen35_ref/saved_memory.py` attributes every tensor autograd saves
+(parameters excepted, deduplicated by storage) to the op that saved it, for
+Qwen3.5-2B's dims cut to one repeat of the layer pattern (3 GDN + 1
+attention layer, random weights: what a layer saves depends on shapes only),
+bf16 on MPS, torch 2.13, transformers 5.15 with its torch GDN fallback (no
+`fla` on macOS). All of it is linear in T; SDPA saves no `[T, T]` matrix.
+
+| T = 2048 | 4 layers, measured | 24 layers (x6; LM head once) |
+|---|---:|---:|
+| LM head + full-vocabulary loss | 1.95 GB | 1.95 GB |
+| GDN core (`torch_chunk_gated_delta_rule`) | 1.30 GB | 7.8 GB |
+| everything else (norms, MLP, conv, projections, attention) | 1.34 GB | 8.0 GB |
+| MPS driver memory after the forward | 11.5 GB | |
+
+The driver holds about 2.5x the saved bytes: the fallback's per-chunk Python
+loop leaves transients in torch's caching allocator. The GDN core's minimum
+is its inputs plus one state per chunk, about 46 MB per layer at T = 2048
+against the 435 MB it saves, which is why the GDN op is the first backward
+tessl takes on; `tessl::cross_entropy` already removes the LM head's row.
+
 ## Performance
 
 `cargo run --release --bin bench_qwen35_layers` builds Qwen3.5-2B's shapes

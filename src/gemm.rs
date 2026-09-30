@@ -1018,14 +1018,85 @@ pub fn gemm_f32(a: &Tensor, b: &Tensor, c: &Tensor, backend: GemmBackend) -> Res
 /// Falls back to f32 GEMM when TensorOps is absent.
 pub fn gemm_train(a: &Tensor, b: &Tensor, c: &Tensor, backend: GemmBackend) -> Result<(), String> {
     validate_gemm(a, b, c, Layout::NN, true)?;
-    let rt = a.runtime();
-    if use_bf16_gemm(rt, backend) {
-        let a_bf = ensure_bf16(a)?;
-        let b_bf = ensure_bf16(b)?;
-        assert_eq!(c.dtype, DType::F32);
-        return gemm(&a_bf, &b_bf, c, backend);
+    if use_bf16_gemm(a.runtime(), backend) {
+        return gemm_bf16(a, b, c);
     }
     gemm_f32(a, b, c, backend)
+}
+
+/// The operand precision of a caller that chooses per call rather than
+/// through the runtime's [`PrecisionMode`]. Both accumulate in f32 into an f32
+/// C on the TensorOps backend.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GemmOperands {
+    /// f32 operands, exact (not `relaxed_precision`) products.
+    ExactF32,
+    /// Operands rounded to bf16 ([`gemm_bf16`], [`gemm_tn_bf16`], [`gemm_nt_bf16`]).
+    Bf16,
+}
+
+impl GemmOperands {
+    fn exact(rt: &GpuRuntime, what: &str) -> Result<(), String> {
+        if rt.relaxed_precision() {
+            return Err(format!("{what}: exact-f32 operands asked for, but the runtime's relaxed precision is on"));
+        }
+        Ok(())
+    }
+
+    /// `C = A @ B`.
+    pub fn nn(self, a: &Tensor, b: &Tensor, c: &Tensor) -> Result<(), String> {
+        match self {
+            Self::ExactF32 => {
+                Self::exact(a.runtime(), "GemmOperands::nn")?;
+                gemm(a, b, c, GemmBackend::TensorOps)
+            }
+            Self::Bf16 => gemm_bf16(a, b, c),
+        }
+    }
+
+    /// `C = A^T @ B`, A stored `[K, M]`.
+    pub fn tn(self, a_km: &Tensor, b_kn: &Tensor, c: &Tensor) -> Result<(), String> {
+        match self {
+            Self::ExactF32 => {
+                Self::exact(a_km.runtime(), "GemmOperands::tn")?;
+                gemm_tn_f32(a_km, b_kn, c, GemmBackend::TensorOps)
+            }
+            Self::Bf16 => gemm_tn_bf16(a_km, b_kn, c),
+        }
+    }
+
+    /// `C = A @ B^T`, B stored `[N, K]`.
+    pub fn nt(self, a_mk: &Tensor, b_nk: &Tensor, c: &Tensor) -> Result<(), String> {
+        match self {
+            Self::ExactF32 => {
+                Self::exact(a_mk.runtime(), "GemmOperands::nt")?;
+                gemm_nt_f32(a_mk, b_nk, c, GemmBackend::TensorOps)
+            }
+            Self::Bf16 => gemm_nt_bf16(a_mk, b_nk, c),
+        }
+    }
+}
+
+/// The bf16 lane's preconditions: TensorOps, and an f32 destination.
+fn check_bf16_lane(rt: &GpuRuntime, c: &Tensor, what: &str) -> Result<(), String> {
+    if !rt.has_tensorops() {
+        return Err(format!("{what}: bf16 operands need TensorOps, which this device lacks"));
+    }
+    if c.dtype != DType::F32 {
+        return Err(format!("{what}: bf16 operands accumulate into an f32 C, got {:?}", c.dtype));
+    }
+    Ok(())
+}
+
+/// `C[M,N] = A[M,K] @ B[K,N]` with bf16 operands and f32 accumulation,
+/// whatever the runtime's [`PrecisionMode`]: f32 operands are rounded to bf16
+/// first (into temporaries), bf16 ones are used as they are. The lane
+/// [`gemm_train`] takes under `PrecisionMode::Bf16`, for callers that choose
+/// it per call.
+pub fn gemm_bf16(a: &Tensor, b: &Tensor, c: &Tensor) -> Result<(), String> {
+    validate_gemm(a, b, c, Layout::NN, true)?;
+    check_bf16_lane(a.runtime(), c, "gemm_bf16")?;
+    gemm(&ensure_bf16(a)?, &ensure_bf16(b)?, c, GemmBackend::TensorOps)
 }
 
 /// `C[M,N] = A[K,M]^T @ B[K,N]` (TN). A is stored `[K,M]`, B `[K,N]`.
@@ -1067,33 +1138,26 @@ pub fn gemm_tn_train(
         Layout::TN,
         use_bf16_gemm(a_km.runtime(), backend),
     )?;
-    let rt = a_km.runtime();
-    if use_bf16_gemm(rt, backend) {
-        assert_eq!(c.dtype, DType::F32);
-        let a_bf = ensure_bf16(a_km)?;
-        let b_bf = ensure_bf16(b_kn)?;
-        let k = a_bf.shape[0];
-        let m = a_bf.shape[1];
-        let n = b_bf.shape[1];
-        assert_eq!(c.shape, &[m, n]);
-        if prefer_tn_splitk(m, n, k) {
-            return gemm_tn_splitk_bf16(&a_bf, &b_bf, c, k);
-        }
-        // Coop kernel: register accumulator, C written once, no zero pre-pass.
-        let pipeline = rt.pipeline("matmul2d_tensorops_tn_bf16_f32")?;
-        return dispatch_tensorops_nn_coop(
-            rt,
-            &pipeline,
-            &a_bf,
-            &b_bf,
-            c,
-            m,
-            n,
-            k,
-            TILE_COOP_TN_NT,
-        );
+    if use_bf16_gemm(a_km.runtime(), backend) {
+        return gemm_tn_bf16(a_km, b_kn, c);
     }
     gemm_tn_f32(a_km, b_kn, c, backend)
+}
+
+/// `C[M,N] = A[K,M]^T @ B[K,N]` with bf16 operands and f32 accumulation,
+/// whatever the runtime's [`PrecisionMode`] (see [`gemm_bf16`]).
+pub fn gemm_tn_bf16(a_km: &Tensor, b_kn: &Tensor, c: &Tensor) -> Result<(), String> {
+    let (m, n, k) = validate_gemm(a_km, b_kn, c, Layout::TN, true)?;
+    let rt = a_km.runtime();
+    check_bf16_lane(rt, c, "gemm_tn_bf16")?;
+    let a_bf = ensure_bf16(a_km)?;
+    let b_bf = ensure_bf16(b_kn)?;
+    if prefer_tn_splitk(m, n, k) {
+        return gemm_tn_splitk_bf16(&a_bf, &b_bf, c, k);
+    }
+    // Coop kernel: register accumulator, C written once, no zero pre-pass.
+    let pipeline = rt.pipeline("matmul2d_tensorops_tn_bf16_f32")?;
+    dispatch_tensorops_nn_coop(rt, &pipeline, &a_bf, &b_bf, c, m, n, k, TILE_COOP_TN_NT)
 }
 
 fn gemm_tn_splitk_f32(a_km: &Tensor, b_kn: &Tensor, c: &Tensor, k: usize) -> Result<(), String> {
@@ -1256,30 +1320,23 @@ pub fn gemm_nt_train(
         Layout::NT,
         use_bf16_gemm(a_mk.runtime(), backend),
     )?;
-    let rt = a_mk.runtime();
-    if use_bf16_gemm(rt, backend) {
-        assert_eq!(c.dtype, DType::F32);
-        let a_bf = ensure_bf16(a_mk)?;
-        let b_bf = ensure_bf16(b_nk)?;
-        let m = a_bf.shape[0];
-        let k = a_bf.shape[1];
-        let n = b_bf.shape[0];
-        assert_eq!(c.shape, &[m, n]);
-        // Coop kernel: register accumulator, C written once, no zero pre-pass.
-        let pipeline = rt.pipeline("matmul2d_tensorops_nt_bf16_f32")?;
-        return dispatch_tensorops_nn_coop(
-            rt,
-            &pipeline,
-            &a_bf,
-            &b_bf,
-            c,
-            m,
-            n,
-            k,
-            TILE_COOP_TN_NT,
-        );
+    if use_bf16_gemm(a_mk.runtime(), backend) {
+        return gemm_nt_bf16(a_mk, b_nk, c);
     }
     gemm_nt_f32(a_mk, b_nk, c, backend)
+}
+
+/// `C[M,N] = A[M,K] @ B[N,K]^T` with bf16 operands and f32 accumulation,
+/// whatever the runtime's [`PrecisionMode`] (see [`gemm_bf16`]).
+pub fn gemm_nt_bf16(a_mk: &Tensor, b_nk: &Tensor, c: &Tensor) -> Result<(), String> {
+    let (m, n, k) = validate_gemm(a_mk, b_nk, c, Layout::NT, true)?;
+    let rt = a_mk.runtime();
+    check_bf16_lane(rt, c, "gemm_nt_bf16")?;
+    let a_bf = ensure_bf16(a_mk)?;
+    let b_bf = ensure_bf16(b_nk)?;
+    // Coop kernel: register accumulator, C written once, no zero pre-pass.
+    let pipeline = rt.pipeline("matmul2d_tensorops_nt_bf16_f32")?;
+    dispatch_tensorops_nn_coop(rt, &pipeline, &a_bf, &b_bf, c, m, n, k, TILE_COOP_TN_NT)
 }
 
 /// `C += A[K,M]^T @ B[K,N]` (TN accumulate). No C zero — for dW into grad banks

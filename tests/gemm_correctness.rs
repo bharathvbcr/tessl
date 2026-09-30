@@ -12,10 +12,12 @@
 mod common;
 
 use common::{
-    assert_within_bound, random_f32, reference, round_trip_bf16, tensor_bf16, tensor_f32, with_gpu,
+    assert_within_bound, random_f32, reference, round_trip_bf16, tensor_bf16, tensor_f32, tolerance, with_gpu,
     Layout, U_BF16,
 };
-use tessl::gemm::{gemm_nt_f32, gemm_nt_train, gemm_tn_f32, gemm_tn_train};
+use tessl::gemm::{
+    gemm_bf16, gemm_nt_bf16, gemm_nt_f32, gemm_nt_train, gemm_tn_bf16, gemm_tn_f32, gemm_tn_train, GemmOperands,
+};
 use tessl::{gemm, gemm_f32, GemmBackend, GpuRuntime, PrecisionMode};
 
 /// Operand extents for each layout, given the logical (M, N, K).
@@ -148,6 +150,80 @@ fn nt_bf16_matches_cpu_reference() {
         for &(m, n, k) in &[(64, 64, 128), (130, 200, 96)] {
             check_bf16(rt, Layout::Nt, m, n, k);
         }
+    });
+}
+
+/// `gemm_bf16` / `gemm_tn_bf16` / `gemm_nt_bf16`, directly and through
+/// `GemmOperands::Bf16`, round f32 operands to bf16 whatever the runtime's
+/// mode. The runtime stays in `PrecisionMode::F32`, where the `*_train`
+/// functions run exact f32: each result must match the reference on the
+/// bf16-rounded operands within the accumulation bound, and must not be the
+/// exact-f32 result (some element outside that result's own bound). The TN
+/// shape `128 x 384 x 2048` takes the split-K lane.
+#[test]
+fn bf16_entry_points_round_f32_operands_in_any_runtime_mode() {
+    with_gpu(|rt| {
+        assert_eq!(rt.precision(), PrecisionMode::F32);
+        let cases = [
+            (Layout::Nn, 64, 64, 128),
+            (Layout::Nn, 130, 520, 96),
+            (Layout::Tn, 130, 200, 96),
+            (Layout::Tn, 128, 384, 2048),
+            (Layout::Nt, 130, 200, 96),
+        ];
+        for (layout, m, n, k) in cases {
+            let (a_shape, b_shape) = operand_shapes(layout, m, n, k);
+            let a_host = random_f32(m * k, 0x6b1f ^ (m * 7 + k) as u64);
+            let b_host = random_f32(k * n, 0x3c3c ^ (n * 11 + k) as u64);
+            let rounded = reference(layout, &round_trip_bf16(&a_host), &round_trip_bf16(&b_host), m, n, k);
+            let exact = reference(layout, &a_host, &b_host, m, n, k);
+            let a = tensor_f32(rt, &a_shape, &a_host);
+            let b = tensor_f32(rt, &b_shape, &b_host);
+            for via_enum in [false, true] {
+                let c = rt.alloc_tensor_f32(&[m, n]).unwrap();
+                match (layout, via_enum) {
+                    (Layout::Nn, false) => gemm_bf16(&a, &b, &c),
+                    (Layout::Tn, false) => gemm_tn_bf16(&a, &b, &c),
+                    (Layout::Nt, false) => gemm_nt_bf16(&a, &b, &c),
+                    (Layout::Nn, true) => GemmOperands::Bf16.nn(&a, &b, &c),
+                    (Layout::Tn, true) => GemmOperands::Bf16.tn(&a, &b, &c),
+                    (Layout::Nt, true) => GemmOperands::Bf16.nt(&a, &b, &c),
+                }
+                .unwrap();
+                rt.synchronize().unwrap();
+                let got = c.buffer.read_f32();
+                let label = format!("bf16 operands {layout:?} {m}x{n}x{k} enum={via_enum}");
+                assert_within_bound(&label, &got, &rounded, k, 0.0);
+                let off_exact = got
+                    .iter()
+                    .zip(exact.c.iter().zip(&exact.mag))
+                    .any(|(&g, (&w, &mag))| (f64::from(g) - w).abs() > tolerance(k, mag, 0.0));
+                assert!(off_exact, "{label}: equals the exact-f32 product, so nothing was rounded");
+            }
+        }
+    });
+}
+
+/// `GemmOperands::ExactF32` means exact: it refuses a runtime whose
+/// relaxed-precision (tf32-class) GEMMs are on, in every layout, before
+/// dispatching anything.
+#[test]
+fn exact_f32_operands_refuse_relaxed_precision() {
+    with_gpu(|rt| {
+        rt.set_relaxed_precision(true);
+        let a = tensor_f32(rt, &[64, 64], &random_f32(64 * 64, 1));
+        let b = tensor_f32(rt, &[64, 64], &random_f32(64 * 64, 2));
+        let c = rt.alloc_tensor_f32(&[64, 64]).unwrap();
+        rt.take_dispatch_count();
+        for r in [
+            GemmOperands::ExactF32.nn(&a, &b, &c),
+            GemmOperands::ExactF32.tn(&a, &b, &c),
+            GemmOperands::ExactF32.nt(&a, &b, &c),
+        ] {
+            let e = r.expect_err("relaxed precision accepted as exact");
+            assert!(e.contains("relaxed precision is on"), "{e}");
+        }
+        assert_eq!(rt.take_dispatch_count(), 0);
     });
 }
 

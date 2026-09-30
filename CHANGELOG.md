@@ -8,6 +8,38 @@ All notable changes to `tessl` are recorded here. The format follows
 
 ### Added
 
+- **LM-head cross-entropy with gradients (`tessl::cross_entropy`)**:
+  `cross_entropy_rows` over the supervised `(row, target)` pairs only, in
+  vocabulary chunks, never forming `[rows, vocab]` logits. Loss (mean or sum),
+  `dh` for the supplied rows and the full `dW`, exact f32, scratch bounded by
+  a `CeWorkspace` sized by rows and chunk. Kernels `ce_gather_rows_{f32,bf16}`,
+  `ce_lse_update`, `ce_softmax_grad`. `gemm::cast_bf16_to_f32_into` widens
+  into a caller's buffer.
+- **The Qwen3.5 text forward (`tessl::qwen35_model`)**, loaded from the
+  Hugging Face checkpoint, checked end to end against transformers
+  (`tests/qwen35_model.rs`, opt-in): F32 within 2.3e-6 per layer, Bf16 18x
+  closer to fp32 than transformers' own bf16. See `docs/qwen35.md`.
+- **`tessl::safetensors`**, a strict `.safetensors` reader (exact offsets,
+  bounded header, JSON subset, reads through the handle it opened).
+- **`qwen35::residual_add`** (`qwen35_residual_add_f32`), the exact-f32
+  residual add for strided windows.
+
+### Fixed
+
+- `npy`: only versions 1-3, a bounded UTF-8 header, `fortran_order` exactly
+  `True`/`False`, checked element counts, and a payload that must be exactly
+  the rest of the file (checked before allocating).
+- MLX Q4 tiled banks (`Interleaved4`, the blocked layout) must hold their
+  padded last tile; a bank sized for the unpadded rows read past its end.
+- `qwen35::pack_linear_weights` checks its width sum and skips empty output.
+- `attn_qk_norm_rope` rejects a zero-capacity cache and cache positions past
+  `u32`.
+- `GdnWorkspace::check` computes its sizes with checked products.
+- `Tensor::from_mtl_buffer` checks bounds before registering residency, so a
+  rejected wrap leaves no residency entry.
+- `execute_icb` requires the ICB to be in the residency set, as
+  `optimize_icb` already did.
+
 - **Qwen3.5 layer kernels (`tessl::qwen35`)**, the Metal replacement for the
   pure-torch GDN fallback transformers runs on MPS. See `docs/qwen35.md`.
   - Chunked gated delta rule as two dispatches: `qwen35_gdn_chunk_prep`

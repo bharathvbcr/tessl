@@ -369,10 +369,10 @@ model, the logits move by less than 4e-5.
 
 **Compile risk, without a compiler.** `tools/msl_emu/dialect_lint.py` lists
 the MSL constructs these kernels use that no other tessl kernel uses (the others
-compile on every release build). There are 13: `static_assert`, `as_type`, a
-`(device uint *)` cast, `fabs`, `log`, `mem_flags::mem_device`, six `precise::`
-functions and `uint3`. Each is standard MSL and on a reviewed list. An
-unreviewed one fails CI.
+compile on every release build). There are 11: `as_type`, a
+`(device uint *)` cast, `log`, `mem_flags::mem_device`, six `precise::`
+functions and `uint3` (`static_assert` and `fabs` are now used elsewhere too).
+Each is standard MSL and on a reviewed list. An unreviewed one fails CI.
 
 The `host_contract` case parses `src/qwen35.rs` and the kernel signatures. It
 checks that every `set_*` bind has the kernel's index and kind (buffer, `uint`,
@@ -493,6 +493,41 @@ cargo test --release --test qwen35_kernels -- --test-threads=1
 cargo test --release --test shader_index_arithmetic   # includes the qwen35 sources
 ```
 
+### The whole model: `tests/qwen35_model.rs`
+
+`tessl::qwen35_model` composes the kernels into the text model's prefill
+forward, loaded straight from the Hugging Face `.safetensors` checkpoint
+(`tessl::safetensors`, a strict reader; no conversion step). It is the one
+place the layer order, the `1 + w` norm offsets, the weight layouts and the
+tied LM head are written down. `Precision::Bf16` is the production numerics
+(bf16 GEMM inputs, f32 everywhere else); `Precision::F32` keeps every
+activation f32 with exact-f32 GEMMs, which makes it the same computation as
+transformers' fp32 forward up to operation order.
+
+The test runs Qwen3.5-2B-Base on a 155-token prompt (three GDN chunks) against
+transformers' `Qwen3_5ForCausalLM` (`tools/qwen35_ref/make_reference.py`, fp32
+and bf16). Its bounds were fixed before the first run.
+
+| | F32 vs transformers fp32 | Bf16 vs transformers fp32 | transformers bf16 vs fp32 |
+|---|---:|---:|---:|
+| residual stream, worst of 24 layers (relative) | 2.3e-6 | | |
+| logits (relative) | 1.9e-6 | | |
+| top-1 token differs | 0 / 155 | 0 / 155 | 2 / 155 |
+| KL divergence per position, mean (max) | (2.6e-10) | 3.1e-5 (3.5e-4) | 5.7e-4 (2.7e-3) |
+
+So tessl's production path is 18x closer to fp32 than transformers' own bf16
+forward, and this is the measurement any relaxed-precision change (bf16
+attention tiles, say) must now pass before it is adopted. Swapping the GDN
+`a`/`b` gate projections, folding the gated norm's weight to `1 + w`, or RoPE
+theta 1e6 instead of 1e7 each fail the F32 test at the first layer they touch.
+It needs the 4.5 GB checkpoint, so it is opt-in (a missing file fails it):
+
+```sh
+python3 tools/qwen35_ref/make_reference.py
+QWEN35_2B_SAFETENSORS=.../model.safetensors-00001-of-00001.safetensors \
+  cargo test --release --test qwen35_model -- --ignored --test-threads=1
+```
+
 ## Performance
 
 `cargo run --release --bin bench_qwen35_layers` builds Qwen3.5-2B's shapes
@@ -539,9 +574,19 @@ is the largest non-GEMM share: 18 × 1.4 ms.
 
 ## Not done
 
-- **Training.** No backward kernels. Autograd through transformers' loops is
-  what made 2k-token fine-tuning hit 48 GB. That's a Mac-training problem and
-  is out of scope here.
+- **Training, remaining gaps.** The LM-head cross-entropy and its gradients
+  exist (`tessl::cross_entropy`, over the supervised rows only, in vocabulary
+  chunks). The layer kernels have no backward yet, so the rest of a backward
+  pass still runs in torch, whose autograd through transformers' loops is
+  what made 2k-token fine-tuning hit 48 GB.
+- **Fast math.** Metal compiles with fast math on by default. The attention
+  kernels seed their running maxima with `-INFINITY`; nothing measured
+  misbehaves, but under fast math the compiler may assume no infinities.
+  The cross-entropy kernels use `-FLT_MAX` and a `first` flag instead, which
+  is the pattern to move the attention kernels to.
+- **Two compositions of the same model.** `bench_qwen35_layers` (random
+  weights, timing) and `qwen35_model` (real checkpoint, parity) each wire the
+  layers; the bench should run on `Qwen35Model` so a wiring fix lands once.
 - **bf16 inputs.** The kernels read f32 activations, which is what tessl's GEMM
   writes. A bf16-activation variant would halve their read traffic.
 - **Shared-prefix attention, remaining gaps.** Only head_dim 256 is compiled. The rows of

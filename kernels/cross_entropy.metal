@@ -50,8 +50,9 @@ CE_GATHER_KERNEL(ce_gather_rows_bf16, bfloat)
 /// stored in `tlogit[n]`. The per-row loss is `m + log(s) - tlogit`.
 ///
 /// Grid: one threadgroup per row. The identity for the running max is
-/// `-FLT_MAX`, not `-INFINITY`, and `first` replaces an infinite initial `m`,
-/// so no step depends on infinities surviving fast math.
+/// `-FLT_MAX`, not `-INFINITY`, and `first` replaces an infinite initial `m`.
+/// The one infinity left is `reduce_row_max`'s padding of lanes past the last
+/// simdgroup, which every lane's finite value outranks.
 kernel void ce_lse_update(
     device const float *logits [[buffer(0)]],
     device float *m [[buffer(1)]],

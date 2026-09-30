@@ -121,3 +121,38 @@ fn the_absent_list_does_not_name_binaries_that_exist() {
         );
     }
 }
+
+/// The kernel counts the crate docs and README quote are the build's, not a
+/// snapshot: they said 21 sources and 83 entry points long after the Qwen3.5
+/// and cross-entropy kernels had joined the build.
+#[test]
+fn the_kernel_counts_the_docs_quote_are_the_builds() {
+    let sources = std::fs::read_dir(crate_root().join("kernels"))
+        .expect("kernels/")
+        .filter_map(Result::ok)
+        .filter(|e| e.path().extension().is_some_and(|x| x == "metal"))
+        .count();
+    let nm = std::process::Command::new("xcrun")
+        .args(["metal-nm", tessl::metallib_path()])
+        .output()
+        .expect("xcrun metal-nm");
+    assert!(nm.status.success(), "metal-nm failed: {}", String::from_utf8_lossy(&nm.stderr));
+    let entries = String::from_utf8_lossy(&nm.stdout)
+        .lines()
+        .filter(|l| l.split_whitespace().nth(1) == Some("T"))
+        .count();
+    let nn = std::fs::read_to_string(crate_root().join("src/nn.rs")).expect("nn.rs");
+    let nn_fns = nn
+        .lines()
+        .filter(|l| l.starts_with("pub fn ") || l.starts_with("pub unsafe fn "))
+        .count();
+    let lib = std::fs::read_to_string(crate_root().join("src/lib.rs")).expect("lib.rs");
+    let readme = std::fs::read_to_string(crate_root().join("README.md")).expect("README");
+    let lib_claim = format!("{sources} Metal sources compile to {entries} kernel entry points");
+    let nn_claim = format!("through {nn_fns} shape-checked functions");
+    let readme_claim = format!("{sources} Metal source files providing {entries} kernel entry points");
+    let lib_flat = lib.replace("\n//! ", " ");
+    assert!(lib_flat.contains(&lib_claim), "src/lib.rs should say `{lib_claim}`");
+    assert!(lib_flat.contains(&nn_claim), "src/lib.rs should say `{nn_claim}`");
+    assert!(readme.contains(&readme_claim), "README.md should say `{readme_claim}`");
+}

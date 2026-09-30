@@ -1,5 +1,5 @@
 // Backward of the Qwen3.5 row-local ops: RMSNorm, the GDN gated RMSNorm,
-// SwiGLU and the attention output gate.
+// SwiGLU, the attention output gate and the GDN causal conv + SiLU.
 //
 // Every operand keeps the forward's layout, windows included (`ld`, `off`),
 // so a gradient lands where the next GEMM backward reads it: dgate/dup side by
@@ -287,4 +287,126 @@ kernel void qwen35_attn_gate_bwd_f32(
     const float g = dy[(ulong)r * ld_dy + dy_off + col];
     d_attn[(ulong)r * Hq * D + col] = g * s;
     dp[gi] = g * a * s * (1.0f - s);
+}
+
+// ------------------------------------------------------ causal conv + SiLU ---
+
+/// Longest conv kernel the backward takes (`KW`, as the forward's 2..=8).
+constant uint CONV_BWD_MAX_KW = 8;
+
+/// `pre = sum_j w[c, j] * x_ext[t + j]` for row `t` of one batch row, where
+/// `x_ext` is `KW - 1` zeros followed by the row (the training forward: no
+/// carried state). `xc` points at column c of the batch row's first token.
+inline float qwen35_conv_pre(device const float *xc, uint ld_x, device const float *wc, uint KW, uint t)
+{
+    const uint hist = KW - 1u;
+    float acc = 0.0f;
+    for (uint j = 0u; j < KW; ++j) {
+        const uint e = t + j;
+        if (e >= hist) {
+            acc += wc[j] * xc[(ulong)(e - hist) * ld_x];
+        }
+    }
+    return acc;
+}
+
+/// Input gradient of `y = silu(causal_conv1d(x))` from a zero state:
+///
+///   dpre[t] = dy[t] * silu'(pre[t])
+///   dx[s]   = sum_j w[c, j] * dpre[s + KW - 1 - j],  over t in [0, T) of the
+///             same batch row
+///
+/// with `pre` recomputed from `x` (silu is not invertible, so `y` cannot give
+/// it back). `x`, `dy`, `dx` are windows of `C` columns of `[B * T, ld]` rows.
+///
+/// Grid: x = channel in [0, C), y = row in [0, B * T).
+kernel void qwen35_conv1d_silu_bwd_dx_f32(
+    device const float *x [[buffer(0)]],
+    device const float *w [[buffer(1)]],
+    device const float *dy [[buffer(2)]],
+    device float *dx [[buffer(3)]],
+    constant uint &B [[buffer(4)]],
+    constant uint &T [[buffer(5)]],
+    constant uint &C [[buffer(6)]],
+    constant uint &KW [[buffer(7)]],
+    constant uint &ld_x [[buffer(8)]],
+    constant uint &x_off [[buffer(9)]],
+    constant uint &ld_dy [[buffer(10)]],
+    constant uint &dy_off [[buffer(11)]],
+    constant uint &ld_dx [[buffer(12)]],
+    constant uint &dx_off [[buffer(13)]],
+    uint2 gid [[thread_position_in_grid]])
+{
+    const uint c = gid.x;
+    const ulong row = gid.y;
+    if (c >= C || row >= (ulong)B * T) return;
+    const ulong b = row / T;
+    const uint s = (uint)(row % T);
+    const uint hist = KW - 1u;
+    device const float *xc = x + b * T * (ulong)ld_x + x_off + c;
+    device const float *dyc = dy + b * T * (ulong)ld_dy + dy_off + c;
+    device const float *wc = w + (ulong)c * KW;
+    float acc = 0.0f;
+    for (uint j = 0u; j < KW; ++j) {
+        const uint t = s + hist - j;  // s + hist >= j, so no wrap
+        if (t < T) {
+            const float pre = qwen35_conv_pre(xc, ld_x, wc, KW, t);
+            acc += wc[j] * dyc[(ulong)t * ld_dy] * qwen35_silu_grad(pre);
+        }
+    }
+    dx[row * ld_dx + dx_off + c] = acc;
+}
+
+/// Weight gradient of the same conv, `dw[c, j] = sum over rows of dpre[t] *
+/// x_ext[t + j]`, as per-block partials: the thread for (channel c, block)
+/// sums rows `[blk * rows_per_block, ..)` of the flattened `B * T` rows into
+/// `dw_part[blk, c * KW + j]`, so `qwen35_col_sum_blocks_f32` over `C * KW`
+/// columns leaves `dw` in the weight's own `[C, KW]` layout.
+///
+/// Grid: x = channel in [0, C), y = block.
+kernel void qwen35_conv1d_silu_bwd_dw_f32(
+    device const float *x [[buffer(0)]],
+    device const float *w [[buffer(1)]],
+    device const float *dy [[buffer(2)]],
+    device float *dw_part [[buffer(3)]],
+    constant uint &B [[buffer(4)]],
+    constant uint &T [[buffer(5)]],
+    constant uint &C [[buffer(6)]],
+    constant uint &KW [[buffer(7)]],
+    constant uint &ld_x [[buffer(8)]],
+    constant uint &x_off [[buffer(9)]],
+    constant uint &ld_dy [[buffer(10)]],
+    constant uint &dy_off [[buffer(11)]],
+    constant uint &rows_per_block [[buffer(12)]],
+    uint2 gid [[thread_position_in_grid]])
+{
+    const uint c = gid.x;
+    const ulong blk = gid.y;
+    const ulong rows = (ulong)B * T;
+    const ulong r0 = blk * rows_per_block;
+    if (c >= C || r0 >= rows) return;
+    const ulong r1 = min(rows, r0 + rows_per_block);
+    const uint hist = KW - 1u;
+    device const float *wc = w + (ulong)c * KW;
+    float acc[CONV_BWD_MAX_KW];
+    for (uint j = 0u; j < CONV_BWD_MAX_KW; ++j) {
+        acc[j] = 0.0f;
+    }
+    for (ulong row = r0; row < r1; ++row) {
+        const ulong b = row / T;
+        const uint t = (uint)(row % T);
+        device const float *xc = x + b * T * (ulong)ld_x + x_off + c;
+        const float pre = qwen35_conv_pre(xc, ld_x, wc, KW, t);
+        const float dpre = dy[row * ld_dy + dy_off + c] * qwen35_silu_grad(pre);
+        for (uint j = 0u; j < KW; ++j) {
+            const uint e = t + j;
+            if (e >= hist) {
+                acc[j] += dpre * xc[(ulong)(e - hist) * ld_x];
+            }
+        }
+    }
+    device float *out = dw_part + blk * ((ulong)C * KW) + (ulong)c * KW;
+    for (uint j = 0u; j < KW; ++j) {
+        out[j] = acc[j];
+    }
 }

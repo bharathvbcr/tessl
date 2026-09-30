@@ -600,6 +600,20 @@ the 2B's 16 heads x 128 gated layout; overlapping windows, short buffers and
 out-of-range windows are refused. Fourteen of fourteen injected kernel
 defects fail it.
 
+`conv1d_silu_bwd` is the GDN causal conv + SiLU backward from a zero state,
+which is the conv transformers trains (`causal_conv1d_fn`: padding
+`kernel_width - 1`, no bias, sliced to `seq_len`); it takes no carried state
+and no ragged lengths. `silu` is not invertible, so both kernels recompute
+the pre-activation from `x` (at most 8 multiply-adds) instead of saving it.
+`dw` is summed per 256-row block and then in block order. Against its f64
+reference (itself checked against finite differences and against the
+inference forward's reference) it is within 3.1e-7 of the largest magnitude
+from T = 1 (every tap in the padding) and T < KW - 1 across batch rows to
+the 2B's 6144 channels, at kernel widths 2, 4 and 8. Nine of ten injected
+defects fail it; the tenth drops the padding test, which makes the read
+wrap far past the buffer, and this GPU returned zeros there, so no output
+can tell.
+
 ## Performance
 
 `cargo run --release --bin bench_qwen35_layers` builds Qwen3.5-2B's shapes

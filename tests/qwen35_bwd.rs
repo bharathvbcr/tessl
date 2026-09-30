@@ -15,7 +15,7 @@ use common::qwen35::{sigmoid, silu};
 use common::{buf, random_f32, seeded, with_gpu};
 use tessl::qwen35::Cols;
 use tessl::qwen35_bwd::{
-    attn_gate_bwd, gated_rms_norm_bwd, gated_rms_norm_bwd_part_len, rms_norm_bwd, rms_norm_bwd_part_len, swiglu_bwd,
+    attn_gate_bwd, conv1d_silu_bwd, conv1d_silu_bwd_part_len, gated_rms_norm_bwd, gated_rms_norm_bwd_part_len, rms_norm_bwd, rms_norm_bwd_part_len, swiglu_bwd,
 };
 use tessl::tensor::GpuBuffer;
 use tessl::GpuRuntime;
@@ -319,5 +319,152 @@ fn the_backward_entry_points_refuse_bad_layouts() {
         e(gated_rms_norm_bwd(rt, w(&a, 0), w(&a, 32), &b, w(&b, 0), w(&c, 0), w(&a, 32), &buf(rt, &[0.0; 32]), &part, 2, 1, 32, 1e-6), "dz overlaps z");
         e(gated_rms_norm_bwd(rt, w(&a, 0), w(&b, 0), &b, w(&b, 32), w(&c, 0), w(&c, 32), &buf(rt, &[0.0; 1]), &part, 2, 1, 600, 1e-6), "dim in 1..=512");
         e(attn_gate_bwd(rt, &a, Cols { buf: &b, ld: 64, off: 0 }, w(&c, 0), &a, &part, 2, 1, 32), "overlap");
+    });
+}
+
+// ------------------------------------------------------ causal conv + SiLU ---
+
+/// `y [B, T, C]` of the zero-state depthwise causal conv + SiLU, in f64.
+fn conv_fwd(x: &[f64], w: &[f64], b: usize, t: usize, c: usize, kw: usize) -> Vec<f64> {
+    let hist = kw - 1;
+    let mut y = vec![0.0; b * t * c];
+    for bi in 0..b {
+        for ti in 0..t {
+            for ci in 0..c {
+                let pre: f64 = (0..kw)
+                    .filter(|&j| ti + j >= hist)
+                    .map(|j| w[ci * kw + j] * x[(bi * t + ti + j - hist) * c + ci])
+                    .sum();
+                y[(bi * t + ti) * c + ci] = silu(pre);
+            }
+        }
+    }
+    y
+}
+
+/// `(dx [B, T, C], dw [C, KW])` of [`conv_fwd`] for the upstream `dy`, by
+/// scattering each output's `dpre` onto the inputs and taps it read.
+#[allow(clippy::too_many_arguments)]
+fn conv_bwd(x: &[f64], w: &[f64], dy: &[f64], b: usize, t: usize, c: usize, kw: usize) -> (Vec<f64>, Vec<f64>) {
+    let hist = kw - 1;
+    let (mut dx, mut dw) = (vec![0.0; b * t * c], vec![0.0; c * kw]);
+    for bi in 0..b {
+        for ti in 0..t {
+            for ci in 0..c {
+                let taps: Vec<usize> = (0..kw).filter(|&j| ti + j >= hist).collect();
+                let at = |j: usize| (bi * t + ti + j - hist) * c + ci;
+                let pre: f64 = taps.iter().map(|&j| w[ci * kw + j] * x[at(j)]).sum();
+                let dpre = dy[(bi * t + ti) * c + ci] * silu_grad(pre);
+                for &j in &taps {
+                    dx[at(j)] += dpre * w[ci * kw + j];
+                    dw[ci * kw + j] += dpre * x[at(j)];
+                }
+            }
+        }
+    }
+    (dx, dw)
+}
+
+#[test]
+fn conv_reference_backward_is_the_derivative() {
+    // T = 2 < KW - 1 with B = 2: a batch row's gradient must not reach into
+    // its neighbour's tokens.
+    for (b, t, c, kw) in [(2, 2, 2, 4), (2, 5, 3, 4), (1, 4, 2, 2), (2, 3, 1, 8)] {
+        let x = f64s(&random_f32(b * t * c, 41));
+        let w = f64s(&random_f32(c * kw, 42));
+        let dy = f64s(&random_f32(b * t * c, 43));
+        let (dx, dw) = conv_bwd(&x, &w, &dy, b, t, c, kw);
+        let loss = |x: &[f64], w: &[f64]| conv_fwd(x, w, b, t, c, kw).iter().zip(&dy).map(|(a, g)| a * g).sum::<f64>();
+        fd_check("conv dx", &x, &dx, &|v| loss(v, &w));
+        fd_check("conv dw", &w, &dw, &|v| loss(&x, v));
+    }
+    // The forward here is the zero-state forward the inference kernels are
+    // checked against.
+    let (b, t, c, kw) = (2, 6, 3, 4);
+    let (x, w) = (random_f32(b * t * c, 44), random_f32(c * kw, 45));
+    let (want, _) = common::qwen35::conv1d_silu_f64(&x, &w, None, b, t, c, kw);
+    let got = conv_fwd(&f64s(&x), &f64s(&w), b, t, c, kw);
+    assert!(got.iter().zip(&want).all(|(a, b)| (a - b).abs() <= 1e-12), "conv_fwd is not the tested forward");
+}
+
+fn run_conv(rt: &Arc<GpuRuntime>, b: usize, t: usize, c: usize, kw: usize, seed: u64) {
+    // x and dy as windows of wider rows, dx as a window of a fused gradient;
+    // every column outside dx's window must be left alone.
+    let rows = b * t;
+    let (ld_x, x_off, ld_dy, dy_off, ld_dx, dx_off) = (c + 7, 3, c + 2, 2, c + 5, 1);
+    let xs: Vec<f32> = random_f32(rows * ld_x, seed).iter().map(|v| 2.0 * v).collect();
+    let w = random_f32(c * kw, seed + 1);
+    let dys = random_f32(rows * ld_dy, seed + 2);
+    let (xb, wb, dyb) = (buf(rt, &xs), buf(rt, &w), buf(rt, &dys));
+    let dxb = seeded(rt, rows * ld_dx, SENTINEL);
+    let dwb = seeded(rt, c * kw, SENTINEL);
+    let part = seeded(rt, conv1d_silu_bwd_part_len(b as u32, t as u32, c as u32, kw as u32).max(1), SENTINEL);
+    let call = || {
+        conv1d_silu_bwd(rt, win(&xb, ld_x, x_off), &wb, kw as u32, win(&dyb, ld_dy, dy_off), win(&dxb, ld_dx, dx_off), &dwb, &part, b as u32, t as u32, c as u32).unwrap();
+        rt.synchronize().unwrap();
+    };
+    call();
+    let dense = |v: &[f32], ld: usize, off: usize| -> Vec<f64> {
+        (0..rows).flat_map(|r| (0..c).map(move |j| (r, j))).map(|(r, j)| f64::from(v[r * ld + off + j])).collect()
+    };
+    let (want_dx, want_dw) = conv_bwd(&dense(&xs, ld_x, x_off), &f64s(&w), &dense(&dys, ld_dy, dy_off), b, t, c, kw);
+    let label = format!("conv b={b} t={t} c={c} kw={kw}");
+    let dx_all = dxb.read_f32();
+    let got_dx: Vec<f32> = (0..rows).flat_map(|r| (0..c).map(move |j| (r, j))).map(|(r, j)| dx_all[r * ld_dx + dx_off + j]).collect();
+    close(&format!("{label} dx"), &got_dx, &want_dx);
+    let written = dx_all.iter().filter(|&&v| v != SENTINEL).count();
+    assert_eq!(written, rows * c, "{label}: wrote outside dx's window");
+    let first = dwb.read_f32();
+    close(&format!("{label} dw"), &first, &want_dw);
+    call();
+    assert!(dwb.read_f32().iter().zip(&first).all(|(a, b)| a.to_bits() == b.to_bits()), "{label}: dw changed on a rerun");
+}
+
+#[test]
+fn conv_backward_matches_across_batch_rows_blocks_and_widths() {
+    with_gpu(|rt| {
+        for (b, t, c, kw) in [
+            (2, 1, 5, 4),   // every token is inside the zero padding
+            (3, 2, 7, 4),   // T < KW - 1 across batch rows
+            (2, 9, 6, 8),   // widest kernel
+            (1, 5, 4, 2),   // narrowest
+            (1, 256, 8, 4), // exactly one weight-gradient block
+            (1, 257, 8, 4), // one row into the next block
+            (3, 200, 33, 4),
+            (2, 64, 6144, 4), // the 2B's conv width
+        ] {
+            run_conv(rt, b, t, c, kw, (b * 1000 + t * 10 + c) as u64);
+        }
+        // No rows: a zero weight gradient, no input gradient written.
+        let (xb, wb) = (buf(rt, &[0.0; 16]), buf(rt, &[1.0; 16]));
+        let dwb = seeded(rt, 16, SENTINEL);
+        let (dyb, dxb) = (buf(rt, &[0.0; 16]), seeded(rt, 16, SENTINEL));
+        conv1d_silu_bwd(rt, Cols::dense(&xb, 4), &wb, 4, Cols::dense(&dyb, 4), Cols::dense(&dxb, 4), &dwb, &buf(rt, &[0.0; 1]), 2, 0, 4).unwrap();
+        rt.synchronize().unwrap();
+        assert!(dwb.read_f32().iter().all(|&v| v == 0.0), "seq = 0: dw must be zeros");
+        assert!(dxb.read_f32().iter().all(|&v| v == SENTINEL), "seq = 0: dx must be untouched");
+    });
+}
+
+#[test]
+fn conv_backward_refuses_bad_layouts() {
+    with_gpu(|rt| {
+        let (a, b, c) = (buf(rt, &[0.0; 4096]), buf(rt, &[0.0; 4096]), buf(rt, &[0.0; 4096]));
+        let (wb, dwb, part) = (buf(rt, &[0.0; 256]), buf(rt, &[0.0; 256]), buf(rt, &[0.0; 4096]));
+        let e = |r: Result<(), String>, needle: &str| {
+            let m = r.expect_err(needle);
+            assert!(m.contains(needle), "{m:?} lacks {needle:?}");
+        };
+        let w = |bf, off| win(bf, 64, off);
+        let run = |x, kw, dy, dx, dw: &GpuBuffer, part: &GpuBuffer, seq| conv1d_silu_bwd(rt, x, &wb, kw, dy, dx, dw, part, 2, seq, 32);
+        run(w(&a, 0), 4, w(&b, 0), w(&a, 32), &dwb, &part, 8).expect("dx beside x in one buffer");
+        e(run(w(&a, 0), 1, w(&b, 0), w(&c, 0), &dwb, &part, 8), "kernel_width must be 2..=8");
+        e(run(w(&a, 0), 9, w(&b, 0), w(&c, 0), &dwb, &part, 8), "kernel_width must be 2..=8");
+        e(run(w(&a, 0), 4, w(&b, 0), w(&a, 16), &dwb, &part, 8), "dx overlaps x");
+        e(run(w(&a, 0), 4, w(&b, 0), w(&b, 8), &dwb, &part, 8), "dx overlaps dy");
+        e(run(w(&a, 0), 4, w(&b, 0), w(&c, 0), &dwb, &buf(rt, &[0.0; 1]), 8), "part");
+        e(run(w(&a, 0), 4, w(&b, 0), w(&c, 0), &a, &part, 8), "dw");
+        e(run(w(&a, 0), 4, w(&b, 0), w(&c, 0), &dwb, &part, 40), "conv1d_silu_bwd x: buffer holds");
+        e(run(w(&a, 0), 4, w(&b, 0), w(&c, 0), &buf(rt, &[0.0; 8]), &part, 8), "dw");
     });
 }

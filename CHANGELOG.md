@@ -33,6 +33,11 @@ All notable changes to `tessl` are recorded here. The format follows
   Kernels `qwen35_rms_norm_bwd_f32`, `qwen35_col_sum_blocks_f32`,
   `qwen35_gated_rms_norm_bwd_f32`, `qwen35_swiglu_bwd_f32`,
   `qwen35_attn_gate_bwd_f32`.
+- **Causal conv + SiLU backward (`qwen35_bwd::conv1d_silu_bwd`)**: the GDN
+  conv as training runs it (zero state, as transformers' no-cache path),
+  `dx` into a window of the fused projection's gradient and a
+  deterministic `dw [C, KW]`; the pre-activation is recomputed from `x`.
+  Kernels `qwen35_conv1d_silu_bwd_dx_f32`, `qwen35_conv1d_silu_bwd_dw_f32`.
 - **torch binding (`python/tessl_torch`) over a C ABI (`tessl::capi`)**:
   `tessl_torch.cross_entropy(hidden, weight, targets, mask)`, a
   `torch.autograd.Function` over MPS tensors, loaded with `ctypes` (no C++

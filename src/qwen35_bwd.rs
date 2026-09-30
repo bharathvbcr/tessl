@@ -1,5 +1,6 @@
 //! Backward of the Qwen3.5 row-local ops (`kernels/qwen35_bwd.metal`): the
-//! RMSNorm, the GDN gated RMSNorm, SwiGLU and the attention output gate.
+//! RMSNorm, the GDN gated RMSNorm, SwiGLU, the attention output gate and
+//! the GDN causal conv + SiLU.
 //!
 //! Each entry point takes the forward's inputs (f32, as the forward reads
 //! them) and the output's gradient, in the forward's layouts, and writes the
@@ -307,4 +308,102 @@ pub fn attn_gate_bwd(
         set_u32(bnd, dy.ld, 10);
         set_u32(bnd, dy.off, 11);
     })
+}
+
+/// Flattened `batch * seq` rows per weight-gradient block of the conv backward.
+const CONV_ROWS_PER_BLOCK: u32 = 256;
+/// Largest conv kernel width (`CONV_BWD_MAX_KW` in the kernel).
+const CONV_MAX_KW: u32 = 8;
+
+/// f32 elements of scratch [`conv1d_silu_bwd`] needs.
+pub fn conv1d_silu_bwd_part_len(batch: u32, seq: u32, channels: u32, kernel_width: u32) -> usize {
+    let nb = blocks(u64::from(batch) * u64::from(seq), CONV_ROWS_PER_BLOCK);
+    nb as usize * channels as usize * kernel_width as usize
+}
+
+/// Backward of [`crate::qwen35::conv1d_silu`] as training runs it: from a
+/// zero state (transformers' no-cache path, a conv padded with
+/// `kernel_width - 1` zeros), with no carried state, no `state_out` and every
+/// row `seq` long. `x`, `dy` and `dx` are windows of `channels` columns of
+/// `batch * seq` rows (`dx` may be a window of the fused projection's
+/// gradient); `weight` is `[channels, kernel_width]`; `dw`, the same shape,
+/// is overwritten (zeros when there are no rows). `part` holds
+/// [`conv1d_silu_bwd_part_len`] floats.
+#[allow(clippy::too_many_arguments)]
+pub fn conv1d_silu_bwd(
+    rt: &Arc<GpuRuntime>,
+    x: Cols<'_>,
+    weight: &GpuBuffer,
+    kernel_width: u32,
+    dy: Cols<'_>,
+    dx: Cols<'_>,
+    dw: &GpuBuffer,
+    part: &GpuBuffer,
+    batch: u32,
+    seq: u32,
+    channels: u32,
+) -> Result<(), String> {
+    const WHAT: &str = "qwen35_bwd::conv1d_silu_bwd";
+    if !(2..=CONV_MAX_KW).contains(&kernel_width) {
+        return Err(format!("{WHAT}: kernel_width must be 2..={CONV_MAX_KW}, got {kernel_width}"));
+    }
+    let rows = u64::from(batch) * u64::from(seq);
+    let rows32 = u32::try_from(rows).map_err(|_| format!("{WHAT}: batch x seq exceeds u32"))?;
+    let (r, c) = (rows, u64::from(channels));
+    for (w, name) in [(x, "x"), (dy, "dy"), (dx, "dx")] {
+        require_window::<f32>(rt, w, r, c, &format!("{WHAT} {name}"))?;
+    }
+    let taps = channels
+        .checked_mul(kernel_width)
+        .ok_or_else(|| format!("{WHAT}: channels x kernel_width exceeds u32"))?;
+    let wlen = taps as usize;
+    require::<f32>(rt, weight, wlen, &format!("{WHAT} weight"))?;
+    require::<f32>(rt, dw, wlen, &format!("{WHAT} dw"))?;
+    let nb = blocks(rows, CONV_ROWS_PER_BLOCK);
+    require::<f32>(
+        rt,
+        part,
+        conv1d_silu_bwd_part_len(batch, seq, channels, kernel_width),
+        &format!("{WHAT} part"),
+    )?;
+    no_overlap(WHAT, &[("dx", dx, channels)], &[("x", x, channels), ("dy", dy, channels)])?;
+    require_disjoint_writes(
+        WHAT,
+        &[("dw", dw), ("part", part)],
+        &[("x", x.buf), ("weight", weight), ("dy", dy.buf), ("dx", dx.buf)],
+    )?;
+    require_disjoint_writes(WHAT, &[("dx", dx.buf)], &[("weight", weight)])?;
+    if channels == 0 {
+        return Ok(());
+    }
+    let bind = |bnd: &mut crate::dispatch::Binder<'_>| {
+        set_u32(bnd, batch, 4);
+        set_u32(bnd, seq, 5);
+        set_u32(bnd, channels, 6);
+        set_u32(bnd, kernel_width, 7);
+        set_u32(bnd, x.ld, 8);
+        set_u32(bnd, x.off, 9);
+        set_u32(bnd, dy.ld, 10);
+        set_u32(bnd, dy.off, 11);
+    };
+    let p = rt.pipeline("qwen35_conv1d_silu_bwd_dx_f32")?;
+    dispatch_2d(rt, &p, channels as usize, rows32 as usize, |bnd| {
+        set_gpu_buf(bnd, x.buf, 0);
+        set_gpu_buf(bnd, weight, 1);
+        set_gpu_buf(bnd, dy.buf, 2);
+        set_gpu_buf(bnd, dx.buf, 3);
+        bind(bnd);
+        set_u32(bnd, dx.ld, 12);
+        set_u32(bnd, dx.off, 13);
+    })?;
+    let p = rt.pipeline("qwen35_conv1d_silu_bwd_dw_f32")?;
+    dispatch_2d(rt, &p, channels as usize, nb as usize, |bnd| {
+        set_gpu_buf(bnd, x.buf, 0);
+        set_gpu_buf(bnd, weight, 1);
+        set_gpu_buf(bnd, dy.buf, 2);
+        set_gpu_buf(bnd, part, 3);
+        bind(bnd);
+        set_u32(bnd, CONV_ROWS_PER_BLOCK, 12);
+    })?;
+    col_sum_blocks(rt, part, dw, nb, taps)
 }

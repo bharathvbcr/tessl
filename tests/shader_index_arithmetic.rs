@@ -559,6 +559,12 @@ fn qwen35_bwd_offsets_are_widened() {
         ("dup[(ulong)r * ld_dup + dup_off + col] = d * qwen35_silu(g);", "SwiGLU dup window"),
         ("const ulong gi = (ulong)r * ld_p + q_off + (ulong)h * 2u * D + D + d;", "output gate column"),
         ("d_attn[(ulong)r * Hq * D + col] = g * s;", "output gate d_attn row"),
+        ("acc += wc[j] * xc[(ulong)(e - hist) * ld_x];", "conv tap read"),
+        ("device const float *xc = x + b * T * (ulong)ld_x + x_off + c;", "conv x batch row"),
+        ("device const float *dyc = dy + b * T * (ulong)ld_dy + dy_off + c;", "conv dy batch row"),
+        ("dx[row * ld_dx + dx_off + c] = acc;", "conv dx row"),
+        ("const float dpre = dy[row * ld_dy + dy_off + c] * qwen35_silu_grad(pre);", "conv dw dy row"),
+        ("device float *out = dw_part + blk * ((ulong)C * KW) + (ulong)c * KW;", "conv dw partial"),
     ] {
         require(QWEN35_BWD, needle, what);
     }

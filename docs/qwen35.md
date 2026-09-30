@@ -839,8 +839,12 @@ T = 2048 check sets its own bound before it runs); two runs are the same
 bits, and neither is the `ExactF32` step's. At the 2B's shapes and
 T = 2048, the cross-entropy with gradients takes 561 ms on bf16 operands
 against 1768 ms exact (`bench_qwen35_train --bf16`, two runs each, 3.15x);
-the whole 2B step on bf16 operands has not been timed (it needs ~30 GB
-free). Against transformers' float32 2B reference (the ignored
+the whole 2B step takes 5.94 s on bf16 operands against 14.51 s exact
+(2.44x; 345 against 141 tokens/s; peak footprint 25.8 / 25.5 GB), measured
+back to back on battery in low-power mode, which made both about 2x slower
+than the plugged-in 7.2 s above (`bench/results/qwen35_train_step_bf16_m5pro.txt`).
+The weights are still cast to bf16 at every GEMM; a per-step bf16 copy was
+to be built only if the ratio came out below ~1.7x, and it did not. Against transformers' float32 2B reference (the ignored
 `real_2b_step_on_bf16_operands_stays_near_transformers`, the 128 tokens and
 149 tensors of the f32 check) it gives a loss within 1.33e-4 and gradients
 within 2.2e-2 (matrices) and 3.6e-2 (1-D norms, `A_log`) of each

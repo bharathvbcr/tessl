@@ -1,0 +1,91 @@
+# Qwen3.5-2B train_step at T = 2048, exact-f32 against bf16 GEMM operands — M5 Pro, 2026-09-30
+#
+# `QWEN35_2B_SAFETENSORS=... /usr/bin/time -l target/release/bench_qwen35_train [--bf16] --step=2048`,
+# bf16 first, then exact f32, back to back in one session with the GPU idle
+# (confirmed with the peer session). The machine was on battery (80%,
+# discharging) with `pmset -g` reporting `powermode 1`: both runs are about 2x
+# slower than the plugged-in measurements in docs/qwen35.md (exact step 7.2 s,
+# cross-entropy 1768 ms), so compare the two runs here with each other, not
+# with those.
+#
+# Finding: bf16 operands take the step from 14.51 s to 5.94 s (2.44x; 141 to
+# 345 tokens/s) and the cross-entropy with gradients from 4042 to 1114 ms
+# (3.6x); peak footprint 25.5 / 25.8 GB, max RSS 20.0 / 20.1 GB. Every weight
+# is still cast to bf16 per GEMM call (forward, recompute, backward); the
+# estimate that would have made a per-step bf16 weight cache worth building
+# was a ratio below ~1.7x (bf16 ~3.2 s against 7.2 s, +30%), and 2.44x is
+# above it, so the cache stays deferred.
+#
+# ---- bf16 GEMM operands ----
+device: Apple M5 Pro
+T = 2048: gate passed (12 ops wrote finite outputs)
+op                        ms / call
+gdn_train forward             9.037
+gdn_train backward           37.112
+attn_train forward            7.293
+attn_train backward          25.169
+cross-entropy + grads      1113.735
+rms_norm_bwd                  0.934
+gated_rms_norm_bwd            1.179
+swiglu_bwd                    1.074
+conv1d_silu_bwd               6.682
+attn_qk_norm_rope_bwd         1.399
+gdn_gates_bwd                 0.750
+embed_rows_bwd                0.430
+GDN core, forward + backward: 46.15 ms per layer; attention core: 32.46 ms per layer
+train_step, T = 2048: 5.941 s (345 tokens/s), loss 14.2069
+       48.80 real        11.54 user         5.40 sys
+         20129710080  maximum resident set size
+                   0  average shared memory size
+                   0  average unshared data size
+                   0  average unshared stack size
+             2771716  page reclaims
+                   2  page faults
+                   0  swaps
+                   0  block input operations
+                   0  block output operations
+                   0  messages sent
+                   0  messages received
+                   0  signals received
+                 170  voluntary context switches
+               56114  involuntary context switches
+         81720552707  instructions retired
+         47151359624  cycles elapsed
+         25758303920  peak memory footprint
+
+# ---- exact f32 ----
+device: Apple M5 Pro
+T = 2048: gate passed (12 ops wrote finite outputs)
+op                        ms / call
+gdn_train forward            10.021
+gdn_train backward           38.096
+attn_train forward            7.368
+attn_train backward          25.055
+cross-entropy + grads      4041.909
+rms_norm_bwd                  0.860
+gated_rms_norm_bwd            1.209
+swiglu_bwd                    1.134
+conv1d_silu_bwd               6.317
+attn_qk_norm_rope_bwd         1.433
+gdn_gates_bwd                 0.806
+embed_rows_bwd                0.416
+GDN core, forward + backward: 48.12 ms per layer; attention core: 32.42 ms per layer
+train_step, T = 2048: 14.509 s (141 tokens/s), loss 14.2068
+      111.15 real        10.46 user         4.78 sys
+         20003078144  maximum resident set size
+                   0  average shared memory size
+                   0  average unshared data size
+                   0  average unshared stack size
+             2732235  page reclaims
+                   1  page faults
+                   0  swaps
+                   0  block input operations
+                   0  block output operations
+                   0  messages sent
+                   0  messages received
+                   0  signals received
+                   0  voluntary context switches
+               33079  involuntary context switches
+         68335957441  instructions retired
+         42540511882  cycles elapsed
+         25497683584  peak memory footprint

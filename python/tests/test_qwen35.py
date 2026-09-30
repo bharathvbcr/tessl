@@ -140,8 +140,16 @@ class Qwen35Training(unittest.TestCase):
             m.load_parameters(bad)
         with self.assertRaisesRegex(TesslError, "does-not-exist"):
             tessl_torch.Qwen35(FIXTURE / "does-not-exist.safetensors", CONFIG, prefix="model.")
-        # A refused step leaves the gradients unavailable rather than stale.
+        # A refused step after a good one leaves the gradients unavailable,
+        # not the good step's, on both sides of the ABI.
+        m.train_step(self.ids)
+        m.grads()
+        with self.assertRaisesRegex(TesslError, "token id 64 >= vocab 64"):
+            m.train_step([1, 64])
         with self.assertRaisesRegex(TesslError, "no gradients yet"):
+            m.grads()
+        m._has_grads = True
+        with self.assertRaisesRegex(TesslError, "no gradients yet; run tessl_qwen35_train_step"):
             m.grads()
 
 

@@ -717,9 +717,11 @@ Activation recomputation, same machine and T, one mode per process under
 
 Recomputing costs 10% (one more forward of every layer, without its `down`
 projection). The peak drops by 3.7 GB, not the whole 8.2 GiB of
-activations, because the peak is mostly memory both modes hold: the f32
-weights and their packed LM head, plus the f32 gradients, which grow as the
-backward frees activations. Swap did not grow in either run. A first
+activations. Where the peak falls was not profiled; the likely reason is
+that it is mostly memory both modes hold (the f32 weights and their packed
+LM head, and the f32 gradients, which grow as the backward frees
+activations), and `/usr/bin/time`'s footprint also counts the loader's
+transient host buffers. Swap did not grow in either run. A first
 measurement read 40.9 / 43.1 GB because the bench kept its warm-up step's
 gradients alive; it now keeps only the loss.
 

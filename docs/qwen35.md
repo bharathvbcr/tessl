@@ -676,6 +676,19 @@ of fourteen injected defects (masking, scale, `Dr`, head grouping, the
 diagonal start, the log-sum-exp reads and store) fail it. The backward has
 not been timed yet.
 
+### Stress: randomized shapes
+
+`randomized_shapes_stress` in `tests/qwen35_bwd.rs` and `tests/attn_train.rs`
+draws shapes within each backward kernel's contract (rows, widths and heads
+across block edges, batch rows, kernel widths 2-8, rotary widths from 0 to
+the head, repeated and scattered ids, grouped KV heads) and checks each draw
+as the targeted tests do: the f64 reference, writes only inside the output
+window, the same bits on a rerun. CI runs four draws per kernel;
+`TESSL_FUZZ_ITERS` and `TESSL_FUZZ_SEED` scale it, and every draw's shape and
+seed are printed so a failure reproduces. 500 draws per sweep (seed 2026,
+about 16 s) all pass, the worst at 2.7e-5 of the reference's largest
+magnitude (attention dK at T = 3, where the few key gradients nearly cancel).
+
 ### A training step: `Qwen35Model::train_step`
 
 `train_step(ids)` is one sequence through the model with transformers'

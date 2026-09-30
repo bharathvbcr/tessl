@@ -236,3 +236,21 @@ fn training_attention_refuses_bad_calls() {
         e(attn_train_backward(rt, &dm, &q, &k, &v, &o, &lse, &o, &AttnTrainGrads { dv: &buf(rt, &[0.0; 8]), ..grads }, &ws), "dv");
     });
 }
+
+/// The training attention over randomly drawn shapes (batch rows, lengths
+/// across block edges, head grouping), each checked as `run` checks it.
+/// `TESSL_FUZZ_ITERS` / `TESSL_FUZZ_SEED` scale it up.
+#[test]
+fn randomized_shapes_stress() {
+    let (iters, seed) = common::fuzz_plan(4);
+    with_gpu(|rt| {
+        for it in 0..iters {
+            let s = seed.wrapping_mul(1_000_003).wrapping_add(it as u64);
+            let mut r = common::SplitMix::new(s);
+            let (hkv, group) = (r.range(1, 2), r.range(1, 4));
+            let (b, t) = (r.range(1, 2), r.range(1, 140));
+            eprintln!("stress iteration {it} (seed {s}): b={b} t={t} hq={} hkv={hkv}", hkv * group);
+            run(rt, b, t, hkv * group, hkv, s);
+        }
+    });
+}

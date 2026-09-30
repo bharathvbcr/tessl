@@ -871,3 +871,37 @@ fn gdn_gates_refuse_bad_layouts() {
         e(qwen35::gdn_gates(rt, &ok, &params, &z, &dal, 8, 4), "g");
     });
 }
+
+// ------------------------------------------------------------------ stress ---
+
+/// Every backward kernel over randomly drawn shapes within its contract,
+/// each checked as the targeted tests check it (f64 reference, writes only
+/// in its window, bit-identical rerun). `TESSL_FUZZ_ITERS` / `TESSL_FUZZ_SEED`
+/// scale it up (see `common::fuzz_plan`).
+#[test]
+fn randomized_shapes_stress() {
+    let (iters, seed) = common::fuzz_plan(4);
+    with_gpu(|rt| {
+        let ws = EmbedBwdWorkspace::new(rt, 600).unwrap();
+        for it in 0..iters {
+            let s = seed.wrapping_mul(1_000_003).wrapping_add(it as u64);
+            let mut r = common::SplitMix::new(s);
+            eprintln!("stress iteration {it} (seed {s})");
+            let (rows, d) = (r.range(1, 300), r.range(1, 4096));
+            run_rms(rt, rows, d, r.range(0, 1) == 1, s);
+            let (rows, heads, d) = (r.range(1, 150), r.range(1, 16), r.range(1, 512));
+            run_gated(rt, rows, heads, d, s);
+            let (b, t, c, kw) = (r.range(1, 3), r.range(1, 300), r.range(1, 700), r.range(2, 8));
+            run_conv(rt, b, t, c, kw, s);
+            let (hkv, group) = (r.range(1, 2), r.range(1, 4));
+            let d = 2 * r.range(8, 256);
+            let rot = 2 * r.range(0, d / 2);
+            let theta = [1e4f32, 1e6, 1e7][r.range(0, 2)];
+            run_qk(rt, r.range(1, 2), r.range(1, 80), hkv * group, hkv, d, rot, theta, s);
+            run_gates(rt, r.range(1, 600), r.range(1, 16), s);
+            let (n, vocab, hidden) = (r.range(1, 600), r.range(1, 300), r.range(1, 300));
+            let ids: Vec<u32> = (0..n).map(|_| r.range(0, vocab - 1) as u32).collect();
+            run_embed(rt, &ws, &ids, vocab, hidden, s);
+        }
+    });
+}

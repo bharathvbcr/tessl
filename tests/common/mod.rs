@@ -81,11 +81,27 @@ impl SplitMix {
         z ^ (z >> 31)
     }
 
+    /// Uniform in `lo..=hi`, for randomized shapes. (Modulo bias is below
+    /// 2^-40 for any range a test draws.)
+    pub fn range(&mut self, lo: usize, hi: usize) -> usize {
+        assert!(lo <= hi, "empty range {lo}..={hi}");
+        lo + (self.next_u64() % (hi - lo + 1) as u64) as usize
+    }
+
     /// Uniform in [-1, 1). Bounded operands keep the derived error bound
     /// meaningful; unbounded ones would let one outlier product dominate it.
     pub fn unit(&mut self) -> f32 {
         ((self.next_u64() >> 40) as f32) / 8_388_608.0 - 1.0
     }
+}
+
+/// Iterations and base seed of the randomized-shape sweeps:
+/// `TESSL_FUZZ_ITERS` (default `default`) and `TESSL_FUZZ_SEED` (default 1).
+/// Every shape a sweep draws is in its failure message, so a failing draw
+/// reproduces from the printed seed.
+pub fn fuzz_plan(default: usize) -> (usize, u64) {
+    let get = |k: &str| std::env::var(k).ok().map(|v| v.parse::<u64>().unwrap_or_else(|_| panic!("{k}={v} is not a number")));
+    (get("TESSL_FUZZ_ITERS").map_or(default, |n| n as usize), get("TESSL_FUZZ_SEED").unwrap_or(1))
 }
 
 pub fn random_f32(n: usize, seed: u64) -> Vec<f32> {

@@ -87,6 +87,11 @@ All notable changes to `tessl` are recorded here. The format follows
 - **qwen35_gdn.metal compiles under -Wall -Werror again**: the 16-column
   scan's threadgroup-memory constant gets the 32 KB static_assert its
   siblings have (the current compiler rejected it as unused).
+- **Randomized-shape stress for the backward kernels**
+  (`randomized_shapes_stress` in `tests/qwen35_bwd.rs`, `tests/attn_train.rs`):
+  shapes drawn within each kernel's contract, each draw checked like the
+  targeted tests; `TESSL_FUZZ_ITERS` / `TESSL_FUZZ_SEED` scale it (500 draws
+  per sweep pass).
 - **msl_emu host contract**: macro instantiations are expanded by a small
   preprocessor (nested macros, object-like parameter macros), the
   TensorOps backward's signatures and `src/attn_train.rs`'s binds are

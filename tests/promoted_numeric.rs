@@ -101,8 +101,10 @@ fn to_blocked_bank(
     group: usize,
 ) -> (Vec<u8>, Vec<f32>) {
     let gpr = cols / group;
-    let mut nb = vec![0u8; rows * cols];
-    let mut out_sb = vec![0.0f32; rows * gpr * 2];
+    // A partial last block is stored at full height (`nn::Q4MlxBank`).
+    let stored_rows = rows.div_ceil(BLOCKED_BN) * BLOCKED_BN;
+    let mut nb = vec![0u8; stored_rows * cols];
+    let mut out_sb = vec![0.0f32; stored_rows * gpr * 2];
     for b in 0..rows.div_ceil(BLOCKED_BN) {
         for r_local in 0..BLOCKED_BN {
             let r = b * BLOCKED_BN + r_local;
@@ -133,7 +135,8 @@ fn to_blocked_bank(
 #[test]
 fn q4_mlx_blocked_matches_the_dense_reference_in_its_own_layout() {
     with_gpu(|rt| {
-        for &(rows, cols, group) in &[(512usize, 256usize, 32usize), (304, 512, 64)] {
+        // 300 rows: a partial last block of 12, stored padded to 16.
+        for &(rows, cols, group) in &[(512usize, 256usize, 32usize), (304, 512, 64), (300, 256, 64)] {
             // Same nibble stream `q4_mlx_matrix` builds, so `dense` describes
             // these weights.
             let nibbles: Vec<u8> = (0..rows * cols).map(|i| ((i * 5) % 16) as u8).collect();

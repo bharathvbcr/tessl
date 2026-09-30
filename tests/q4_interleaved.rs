@@ -107,9 +107,13 @@ fn simd_i4_matches_the_dense_reference_and_its_row_major_twin() {
     with_gpu(|rt| {
         for &(rows, cols, group) in &[
             (256usize, 256usize, 32usize),
-            // rows not a multiple of the 4 a tile holds, and of the 8 a
-            // threadgroup holds: the tail guard has to hold in both layouts.
+            // rows a multiple of the 4 a tile holds but not of the 8 a
+            // threadgroup holds.
             (100, 512, 64),
+            // rows a multiple of neither: a partial last tile, stored padded
+            // (see `nn::Q4MlxBank`), with the tail guard holding in both
+            // layouts.
+            (102, 512, 64),
         ] {
             let b = banks(rows, cols, group);
             let x = random_f32(cols, 0x9911 + cols as u64);

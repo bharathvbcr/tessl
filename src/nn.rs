@@ -3180,17 +3180,48 @@ impl Q4Bank<'_> {
 /// never read it (`(void)biases_unused` in the source). These wrappers bind
 /// `scales_biases` there rather than making callers carry a buffer that exists
 /// only to fill a slot.
+///
+/// # Storage of a partial last tile
+///
+/// The tiled layouts ([`Q4MlxLayout::Interleaved4`], 4-row tiles, and the
+/// block-interleaved bank [`gemv_q4_mlx_blocked`] reads, 16-row blocks) store
+/// every tile at full height: the kernels address tile `t`'s data as if all
+/// its rows existed and skip only the missing rows' arithmetic. A bank for
+/// `rows` not a multiple of the tile height must therefore hold
+/// `rows.div_ceil(tile) * tile` rows of nibbles and scale/bias pairs (the
+/// padding rows' contents are never used), and the wrappers require exactly
+/// that. Row-major banks need `rows`.
 #[derive(Clone, Copy)]
 pub struct Q4MlxBank<'a> {
-    /// Packed nibbles, `rows * cols / 2` bytes.
+    /// Packed nibbles, `rows * cols / 2` bytes (padded rows for tiled layouts).
     pub packed: &'a GpuBuffer,
-    /// Interleaved `bfloat2` scale/bias pairs, one per group.
+    /// Interleaved `bfloat2` scale/bias pairs, one per group (padded rows for
+    /// tiled layouts).
     pub scales_biases: &'a GpuBuffer,
 }
 
+/// Rows per tile of the block-interleaved bank [`gemv_q4_mlx_blocked`] reads.
+const BLOCKED_TILE_ROWS: u32 = 16;
+
 impl Q4MlxBank<'_> {
-    fn validate(&self, rt: &GpuRuntime, shape: &QuantShape, what: &str) -> Result<(), String> {
+    /// Checks `shape` and that the bank holds `rows` rounded up to
+    /// `tile_rows` (1 for row-major banks; see the type's docs).
+    fn validate(
+        &self,
+        rt: &GpuRuntime,
+        shape: &QuantShape,
+        tile_rows: u32,
+        what: &str,
+    ) -> Result<(), String> {
         shape.validate(what)?;
+        let stored_rows = shape
+            .rows
+            .checked_next_multiple_of(tile_rows)
+            .ok_or_else(|| format!("{what}: rows {} padded to {tile_rows} overflow u32", shape.rows))?;
+        let shape = &QuantShape {
+            rows: stored_rows,
+            ..*shape
+        };
         const SIMD_BLOCK: u32 = 512;
         if shape.group_size % 32 != 0 || SIMD_BLOCK % shape.group_size != 0 {
             return Err(format!(
@@ -3466,7 +3497,7 @@ pub unsafe fn embed_lookup_q4_mlx_with_scalars(
         cols: hidden,
         group_size,
     };
-    bank.validate(rt, &shape, "embed_lookup_q4_mlx")?;
+    bank.validate(rt, &shape, 1, "embed_lookup_q4_mlx")?;
     let total = elems(n_tokens, hidden, "embed_lookup_q4_mlx")?;
     require::<u32>(
         rt,
@@ -3509,8 +3540,19 @@ pub unsafe fn embed_lookup_q4_mlx_with_scalars(
 pub enum Q4MlxLayout {
     /// Plain row-major nibbles.
     RowMajor,
-    /// Interleaved for 4-bit lane gather (`_i4` entry points).
+    /// Interleaved for 4-bit lane gather (`_i4` entry points), in 4-row tiles
+    /// stored at full height (see [`Q4MlxBank`]).
     Interleaved4,
+}
+
+impl Q4MlxLayout {
+    /// Rows per stored tile: `SIMD_ROWS` (4) in the `_i4` kernels.
+    fn tile_rows(self) -> u32 {
+        match self {
+            Q4MlxLayout::RowMajor => 1,
+            Q4MlxLayout::Interleaved4 => 4,
+        }
+    }
 }
 
 /// Output rows a single simdgroup-cooperative threadgroup covers.
@@ -3589,7 +3631,7 @@ pub unsafe fn gemv_q4_mlx_with_scalars(
     scalars: impl FnOnce(&mut Binder<'_>),
 ) -> Result<(), String> {
     let entry = variant.entry();
-    bank.validate(rt, &shape, entry)?;
+    bank.validate(rt, &shape, 1, entry)?;
     require::<f32>(rt, x, shape.cols as usize, &format!("{entry} x"))?;
     require::<f32>(rt, y, shape.rows as usize, &format!("{entry} y"))?;
     if shape.rows == 0 {
@@ -3719,7 +3761,7 @@ pub unsafe fn gemv_q4_mlx_blocked_with_scalars(
     shape: QuantShape,
     scalars: impl FnOnce(&mut Binder<'_>),
 ) -> Result<(), String> {
-    bank.validate(rt, &shape, "gemv_q4_mlx_blocked")?;
+    bank.validate(rt, &shape, BLOCKED_TILE_ROWS, "gemv_q4_mlx_blocked")?;
     require::<f32>(rt, x, shape.cols as usize, "gemv_q4_mlx_blocked x")?;
     require::<f32>(rt, y, shape.rows as usize, "gemv_q4_mlx_blocked y")?;
     if shape.rows == 0 {
@@ -3805,7 +3847,7 @@ pub unsafe fn gemv_q4_mlx_simd_with_scalars(
         (true, Q4MlxLayout::RowMajor) => "gemv_q4_mlx_simd_add",
         (true, Q4MlxLayout::Interleaved4) => "gemv_q4_mlx_simd_add_i4",
     };
-    bank.validate(rt, &shape, entry)?;
+    bank.validate(rt, &shape, layout.tile_rows(), entry)?;
     require::<u16>(rt, x_bf16, shape.cols as usize, &format!("{entry} x_bf16"))?;
     require::<f32>(rt, y, shape.rows as usize, &format!("{entry} y"))?;
     if let Some(r) = resid {
@@ -3919,8 +3961,12 @@ pub unsafe fn gemv_q4_mlx_gate_up_gelu_with_scalars(
             shape.cols
         ));
     }
-    gate.validate(rt, &shape, &format!("{entry} gate"))?;
-    up.validate(rt, &shape, &format!("{entry} up"))?;
+    let tile_rows = match dispatch {
+        GateUpDispatch::Simd(l) => l.tile_rows(),
+        GateUpDispatch::Blocked => BLOCKED_TILE_ROWS,
+    };
+    gate.validate(rt, &shape, tile_rows, &format!("{entry} gate"))?;
+    up.validate(rt, &shape, tile_rows, &format!("{entry} up"))?;
     match dispatch {
         GateUpDispatch::Simd(_) => {
             require::<u16>(rt, x, shape.cols as usize, &format!("{entry} x"))?
@@ -4019,8 +4065,8 @@ pub unsafe fn gemv_q4_mlx_kv_with_scalars(
         Q4MlxLayout::RowMajor => "gemv_q4_mlx_simd_kv",
         Q4MlxLayout::Interleaved4 => "gemv_q4_mlx_simd_kv_i4",
     };
-    k.validate(rt, &shape, &format!("{entry} k"))?;
-    v.validate(rt, &shape, &format!("{entry} v"))?;
+    k.validate(rt, &shape, layout.tile_rows(), &format!("{entry} k"))?;
+    v.validate(rt, &shape, layout.tile_rows(), &format!("{entry} v"))?;
     require::<u16>(rt, x_bf16, shape.cols as usize, &format!("{entry} x_bf16"))?;
     require::<f32>(rt, k_out, shape.rows as usize, &format!("{entry} k_out"))?;
     require::<f32>(rt, v_out, shape.rows as usize, &format!("{entry} v_out"))?;
@@ -4149,9 +4195,9 @@ pub unsafe fn gemv_q4_mlx_qkv_with_scalars(
         cols,
         group_size,
     };
-    q.validate(rt, &q_shape, &format!("{entry} q"))?;
-    k.validate(rt, &kv_shape, &format!("{entry} k"))?;
-    v.validate(rt, &kv_shape, &format!("{entry} v"))?;
+    q.validate(rt, &q_shape, layout.tile_rows(), &format!("{entry} q"))?;
+    k.validate(rt, &kv_shape, layout.tile_rows(), &format!("{entry} k"))?;
+    v.validate(rt, &kv_shape, layout.tile_rows(), &format!("{entry} v"))?;
     require::<u16>(rt, x_bf16, cols as usize, &format!("{entry} x_bf16"))?;
     require::<f32>(rt, out.q_out, rows_q as usize, &format!("{entry} q_out"))?;
     require::<f32>(rt, out.k_out, rows_kv as usize, &format!("{entry} k_out"))?;
@@ -4290,7 +4336,7 @@ pub unsafe fn gemm_q4_mlx_with_scalars(
              left unwritten rather than computed"
         ));
     }
-    bank.validate(rt, &shape, entry)?;
+    bank.validate(rt, &shape, layout.tile_rows(), entry)?;
     let out_elems = elems(m, shape.rows, entry)?;
     require::<u16>(
         rt,

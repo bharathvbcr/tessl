@@ -818,7 +818,9 @@ every non-GEMM kernel; the cross-entropy's four GEMMs take the same choice.
 On the tiny model, `Bf16` gives a loss within 7.3e-5 of transformers' f32 and
 gradients within 1.4e-2 (matrices) and 2.3e-2 (the 1-D norms, `A_log`,
 `dt_bias`, each one sum over every token) of each parameter's largest
-(bounds 2^-8 and 2^-5, set before the first run); two runs are the same
+(bounds 2^-8 and 2^-5, set before the first run for this two-layer, 70-token
+fixture only: the f32 step already drifts with depth, so a 24-layer or
+T = 2048 check sets its own bound before it runs); two runs are the same
 bits, and neither is the `ExactF32` step's. At the 2B's shapes and
 T = 2048, the cross-entropy with gradients takes 561 ms on bf16 operands
 against 1768 ms exact (`bench_qwen35_train --bf16`, two runs each, 3.15x);

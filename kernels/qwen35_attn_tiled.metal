@@ -41,6 +41,7 @@ constant uint TILED_ATTN_D = 256;
 template <int D, int BQ, int BK, int NSG>
 inline void attn_tiled_body(
     device float *Q, device float *K, device float *V, device float *O,
+    device float *lse,
     uint Tq, uint Tkv, uint H, uint Hkv, float scale, ulong q_off,
     ulong kv_off, uint out_bf16, uint kv_capacity, uint2 tgpig, uint tid,
     threadgroup float *S, threadgroup float *m_row, threadgroup float *l_row,
@@ -172,6 +173,13 @@ inline void attn_tiled_body(
             oT[i] *= (l > 0.0f) ? (1.0f / l) : 0.0f;
         }
     }
+    // The training forward also keeps each row's log-sum-exp of the scaled
+    // scores, `[B, H, Tq]`, for the backward to rebuild P from. A row with
+    // nothing unmasked gets +inf, so exp(s - lse) is 0 there.
+    if (lse != nullptr && tid < nq) {
+        const float l = l_row[tid];
+        lse[(ulong)bh * Tq + q0 + tid] = (l > 0.0f) ? m_row[tid] + precise::log(l) : INFINITY;
+    }
     if (out_bf16 != 0u) {
         auto mO = tensor((device bfloat *)O + q_base, dextents<int, 2>{D, (int)Tq},
                          array<int, 2>{1, (int)q_row});
@@ -194,8 +202,11 @@ inline void attn_tiled_body(
 /// The name spells the geometry (`_q{BQ}_k{BK}_sg{NSG}`), and the host builds
 /// its grid from the same numbers, so the name is the contract between them.
 /// Buffer slots are `flash_attn_rows`'; `window` (9) must be 0 and `B` (4)
-/// is unused, as there.
-#define TILED_ATTN_KERNEL(NAME, BQ, BK, NSG)                                   \
+/// is unused, as there. `LSE_DECL` / `LSE_PTR` add the training forward's
+/// log-sum-exp output at slot 15, or nothing.
+#define TILED_ATTN_NO_LSE_DECL
+#define TILED_ATTN_LSE_DECL device float *lse [[buffer(15)]],
+#define TILED_ATTN_KERNEL_IMPL(NAME, BQ, BK, NSG, LSE_DECL, LSE_PTR)          \
 kernel void NAME(                                                             \
     device const float *Q [[buffer(0)]],                                      \
     device const float *K [[buffer(1)]],                                      \
@@ -212,6 +223,7 @@ kernel void NAME(                                                             \
     device const uint *kv_pos_offset_ptr [[buffer(12)]],                      \
     constant uint &out_bf16 [[buffer(13)]],                                   \
     constant uint &kv_capacity [[buffer(14)]],                                \
+    LSE_DECL                                                                  \
     uint2 tgpig [[threadgroup_position_in_grid]],                             \
     uint tid [[thread_index_in_threadgroup]])                                 \
 {                                                                             \
@@ -225,12 +237,14 @@ kernel void NAME(                                                             \
        writes Q, K or V. */                                                   \
     attn_tiled_body<TILED_ATTN_D, BQ, BK, NSG>(                               \
         const_cast<device float *>(Q), const_cast<device float *>(K),         \
-        const_cast<device float *>(V), O, Tq, Tkv, H, Hkv, scale,             \
+        const_cast<device float *>(V), O, LSE_PTR, Tq, Tkv, H, Hkv, scale,    \
         (ulong)(*q_pos_offset_ptr), (ulong)(*kv_pos_offset_ptr), out_bf16,    \
         kv_capacity, tgpig, tid, S, m_row, l_row, a_row);                     \
     (void)B;                                                                  \
     (void)window;                                                             \
 }
+#define TILED_ATTN_KERNEL(NAME, BQ, BK, NSG)                                   \
+    TILED_ATTN_KERNEL_IMPL(NAME, BQ, BK, NSG, TILED_ATTN_NO_LSE_DECL, nullptr)
 
 // Every instantiation keeps the O accumulator at BQ * 256 / (NSG * 32) = 64
 // floats per thread; they differ in K/V reuse (BQ) and in how often the
@@ -239,3 +253,6 @@ TILED_ATTN_KERNEL(qwen35_attn_tiled_h256_q32_k32_sg4, 32, 32, 4)
 TILED_ATTN_KERNEL(qwen35_attn_tiled_h256_q32_k64_sg4, 32, 64, 4)
 TILED_ATTN_KERNEL(qwen35_attn_tiled_h256_q64_k32_sg8, 64, 32, 8)
 TILED_ATTN_KERNEL(qwen35_attn_tiled_h256_q64_k64_sg8, 64, 64, 8)
+
+// The training forward: the default geometry, also writing the log-sum-exp.
+TILED_ATTN_KERNEL_IMPL(qwen35_attn_tiled_lse_h256_q32_k32_sg4, 32, 32, 4, TILED_ATTN_LSE_DECL, lse)

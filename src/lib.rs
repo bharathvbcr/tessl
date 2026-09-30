@@ -78,6 +78,7 @@
 //! | [`cross_entropy`] | LM-head cross-entropy and its gradients over the supervised rows, in vocabulary chunks |
 //! | [`qwen35_bwd`] | Backward of the Qwen3.5 row-local ops: RMSNorm, gated RMSNorm, SwiGLU, output gate, causal conv + SiLU, Q/K norm + RoPE, embedding |
 //! | [`gdn_train`] | The gated delta rule for training: forward and backward at transformers' op seam |
+//! | [`attn_train`] | Full attention for training: the forward with its log-sum-exp, and the backward |
 //! | [`capi`] | The C ABI (`libtessl.dylib`) that `python/tessl_torch` calls through `ctypes` |
 //!
 //! # Encode model
@@ -97,7 +98,7 @@
 //!
 //! # Kernels
 //!
-//! 28 Metal sources compile to 187 kernel entry points: RMSNorm, gated MLP
+//! 29 Metal sources compile to 192 kernel entry points: RMSNorm, gated MLP
 //! activations, flash attention (sliding-window and global), fused
 //! RMSNorm+QKV+RoPE, MLX-format Q4 GEMV/GEMM, Q8 GEMV, an exact int8 GEMM, KV
 //! cache stores, embedding lookup, row-wise softmax/sum/max, and softcap
@@ -108,7 +109,8 @@
 //! Qwen3.5 text forward built from them in [`qwen35_model`]. The LM-head
 //! cross-entropy and its gradients are in [`cross_entropy`], and the gated
 //! delta rule's training forward and backward in [`gdn_train`], and the
-//! backward of the layer's row-local ops in [`qwen35_bwd`].
+//! backward of the layer's row-local ops in [`qwen35_bwd`], and full
+//! attention's training forward and backward in [`attn_train`].
 //!
 //! 44 of these were promoted out of `gemma-metal`, where they were reachable
 //! only as raw pipeline-name strings through an overlay metallib. All 44 now
@@ -207,6 +209,7 @@ pub mod cb_replay;
 pub mod cross_entropy;
 pub mod decode_icb;
 pub mod dispatch;
+pub mod attn_train;
 pub mod gdn_train;
 pub mod gemm;
 pub mod icb_smoke;

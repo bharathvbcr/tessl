@@ -31,6 +31,7 @@ const QWEN35_SCORE: &str = include_str!("../kernels/qwen35_score.metal");
 const CROSS_ENTROPY: &str = include_str!("../kernels/cross_entropy.metal");
 const GDN_TRAIN: &str = include_str!("../kernels/gdn_train.metal");
 const QWEN35_BWD: &str = include_str!("../kernels/qwen35_bwd.metal");
+const QWEN35_ATTN_BWD: &str = include_str!("../kernels/qwen35_attn_bwd.metal");
 
 /// Every `.metal` file this suite inspects.
 ///
@@ -53,6 +54,7 @@ const INSPECTED_KERNELS: &[&str] = &[
     "kv_store.metal",
     "matmul_simdgroup.metal",
     "qwen35_attn.metal",
+    "qwen35_attn_bwd.metal",
     "qwen35_attn_tiled.metal",
     "qwen35_bwd.metal",
     "qwen35_gdn.metal",
@@ -578,6 +580,26 @@ fn qwen35_bwd_offsets_are_widened() {
     ] {
         require(QWEN35_BWD, needle, what);
     }
+}
+
+/// The training attention indexes [B, T, H, 256] rows and [B, H, T]
+/// log-sum-exp rows; at B = 8, T = 8192, H = 8 a row offset is past 2^27
+/// elements times 256. Every row, plane and log-sum-exp offset is formed in
+/// 64 bits (the MPP tensor views take i32 extents within one plane, which the
+/// host bounds).
+#[test]
+fn attn_train_offsets_are_widened() {
+    for (needle, what) in [
+        ("const ulong row = ((b * T + t) * H + h) * (ulong)ATTN_BWD_D;", "dvec row"),
+        ("dvec[(ulong)bh * T + t] = s;", "dvec store"),
+        ("const ulong q_base = (ulong)b * T * q_row + (ulong)h * D;", "query plane"),
+        ("const ulong kv_base = (ulong)b * T * kv_row + (ulong)hkv * D;", "key/value plane"),
+        ("lse_row[tid] = live ? lse[(ulong)bh * T + q0 + tid] : INFINITY;", "dq log-sum-exp read"),
+        ("lse_col[tid] = live ? lse[(ulong)bh * T + qb + tid] : INFINITY;", "dk/dv log-sum-exp read"),
+    ] {
+        require(QWEN35_ATTN_BWD, needle, what);
+    }
+    require(QWEN35_ATTN_TILED, "lse[(ulong)bh * Tq + q0 + tid] =", "forward log-sum-exp store");
 }
 
 #[test]

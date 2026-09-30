@@ -638,6 +638,29 @@ the gradient is deterministic and rows no id reads keep their bits. Within
 5e-7 of the f64 sum across repeated, reversed, single-id and 2048-wide
 cases; eight of eight injected defects (kernel and host grouping) fail it.
 
+### Training attention: `tessl::attn_train`
+
+`attn_train_forward` is `attn_prefill`'s tiled kernel at its default
+geometry (32 queries by 32 keys, 4 simdgroups) instantiated once more with
+each query row's log-sum-exp of the scaled scores written to `[B, H, T]`;
+its O is bit-identical to `attn_prefill`'s. `attn_train_backward` is
+FlashAttention-2's backward on the same `matmul2d` units
+(`kernels/qwen35_attn_bwd.metal`): P is rebuilt per block from the saved
+log-sum-exp, `Dr = rowsum(dO ∘ O)` is one pass, dQ is owned per query block
+(walking keys to the diagonal) and dK, dV per key block of a KV head
+(walking that head's query heads in order, then the queries from the
+diagonal on). Each gradient is written once by its owner, so there are no
+atomics and the gradients are the same bits on every run; dK and dV are
+separate kernels so each keeps the forward's one accumulator.
+
+`tests/attn_train.rs`: the f64 reference's backward equals central finite
+differences (1e-7), and the kernels match it within 4e-6 of the largest
+magnitude (O, lse, dQ, dK, dV) from T = 1 through partial, exact and
+one-row blocks, two batch rows and the 2B's 8 query over 2 KV heads. Fourteen
+of fourteen injected defects (masking, scale, `Dr`, head grouping, the
+diagonal start, the log-sum-exp reads and store) fail it. The backward has
+not been timed yet.
+
 ## Performance
 
 `cargo run --release --bin bench_qwen35_layers` builds Qwen3.5-2B's shapes

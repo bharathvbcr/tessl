@@ -789,39 +789,78 @@ def case_score(bf16, seed):
 ROOT = os.path.dirname(os.path.dirname(HERE))
 
 
+def _expand_macros(src):
+    """The source with every top-level macro instantiation expanded: function-
+    like macros (possibly calling each other) with their arguments substituted,
+    then object-like macros, as the preprocessor would for the kernel
+    signatures. Only what the kernel sources use: one instantiation per line,
+    no nested parentheses in arguments."""
+    import re
+    text = src.replace("\\\n", " ")
+    fn, obj = {}, {}
+    for m in re.finditer(r"^#define (\w+)\(([^)]*)\)(.*)$", text, re.M):
+        fn[m.group(1)] = ([p.strip() for p in m.group(2).split(",")], m.group(3))
+    for m in re.finditer(r"^#define (\w+)(?:[ \t]+(.*))?$", text, re.M):
+        if m.group(1) not in fn:
+            obj[m.group(1)] = (m.group(2) or "").strip()
+
+    def subst(body):
+        for _ in range(8):
+            # Arguments are substituted before object-like macros expand, as
+            # in the preprocessor: an argument naming a macro that expands
+            # to a parameter declaration must not split the call first.
+            new = re.sub(r"\b(\w+)\(([^()]*)\)", call, body)
+            new = re.sub(r"\b(\w+)\b", lambda w: obj.get(w.group(1), w.group(1)), new)
+            if new == body:
+                return body
+            body = new
+        raise AssertionError("macro expansion did not settle")
+
+    def call(m):
+        if m.group(1) not in fn:
+            return m.group(0)
+        params, body = fn[m.group(1)]
+        args = [a.strip() for a in m.group(2).split(",")]
+        if len(args) != len(params):
+            return m.group(0)
+        for p, a in zip(params, args):
+            body = re.sub(rf"\b{p}\b", a, body)
+        return body
+
+    out = []
+    for line in text.splitlines():
+        m = re.match(r"^(\w+)\((.*)\)\s*$", line)
+        out.append(subst(line) if m and m.group(1) in fn else line)
+    return "\n".join(l for l in out if not l.startswith("#define"))
+
+
 def _kernel_signatures():
     """{kernel name: [(buffer index, 'buf'|'u32'|'f32')]} from the .metal sources,
-    expanding the macro-generated kernels through their instantiations."""
+    with the macro-generated kernels expanded through their instantiations."""
     import re
-    sigs, macros = {}, {}
-    # qwen35_attn_tiled runs on the TensorOps units, which the emulator cannot
-    # execute, but its signature is plain source text and is checked here.
-    for f in ("qwen35_gdn", "qwen35_attn", "qwen35_attn_tiled", "qwen35_mlp", "qwen35_score"):
-        src = open(os.path.join(ROOT, "kernels", f + ".metal")).read()
-        for m in re.finditer(r"kernel void (\w+)\((.*?)\)\s*\\?\s*\{", src, re.S):
+    sigs = {}
+    # The TensorOps kernels (qwen35_attn_tiled, qwen35_attn_bwd) run on units
+    # the emulator cannot execute, but their signatures are source text and
+    # are checked here.
+    for f in ("qwen35_gdn", "qwen35_attn", "qwen35_attn_tiled", "qwen35_attn_bwd", "qwen35_mlp", "qwen35_score"):
+        src = _expand_macros(open(os.path.join(ROOT, "kernels", f + ".metal")).read())
+        for m in re.finditer(r"kernel void (\w+)\((.*?)\)\s*\{", src, re.S):
             params = []
             for p in re.finditer(r"([^,()]*?)\b\w+\s*\[\[buffer\((\d+)\)\]\]", m.group(2)):
                 decl = p.group(1)
                 kind = "buf" if "device" in decl else ("f32" if "float" in decl else "u32")
                 params.append((int(p.group(2)), kind))
-            (macros if m.group(1) == "NAME" else sigs)[m.group(1)] = params
-        for m in re.finditer(r"^#define (\w+)\(NAME", src, re.M):
-            body = src[m.start():]
-            body_sig = re.search(r"kernel void NAME\((.*?)\)\s*\\?\s*\{", body, re.S).group(1)
-            params = []
-            for p in re.finditer(r"([^,()]*?)\b\w+\s*\[\[buffer\((\d+)\)\]\]", body_sig):
-                decl = p.group(1)
-                kind = "buf" if "device" in decl else ("f32" if "float" in decl else "u32")
-                params.append((int(p.group(2)), kind))
-            for inst in re.finditer(rf"^{m.group(1)}\((\w+),", src, re.M):
-                sigs[inst.group(1)] = params
+            sigs[m.group(1)] = params
     return sigs
 
 
 def _host_binds():
-    """{kernel name: [(index, kind)]} from src/qwen35.rs's dispatch closures."""
+    """{kernel name: [(index, kind)]} from the dispatch closures of the host
+    files that bind these kernels (src/qwen35.rs, and src/attn_train.rs for
+    the training attention)."""
     import re
-    rs = open(os.path.join(ROOT, "src", "qwen35.rs")).read()
+    qwen35_rs = open(os.path.join(ROOT, "src", "qwen35.rs")).read()
+    rs = qwen35_rs + "\n" + open(os.path.join(ROOT, "src", "attn_train.rs")).read()
     # `let name = out_kernel("base", ..)` picks the _f32 or _bf16 variant; like
     # the pipelines below, the name is reused, so resolve it by position.
     name_defs = [(m.start(), m.group(1), [m.group(2) + "_f32", m.group(2) + "_bf16"])
@@ -834,7 +873,7 @@ def _host_binds():
     # (position, variable, kernels): a dispatch resolves its pipeline variable
     # to the nearest `let` before it, since most functions reuse the name `p`.
     pipe_defs = []
-    for m in re.finditer(r'let (\w+) = (?:pipeline_for\(\s*rt,\s*|rt\.pipeline\(\s*)(&?)("?)(\w+)', rs):
+    for m in re.finditer(r'let (\w+) = (?:pipeline_for\(\s*rt,\s*|rt\.pipeline\(\s*|pipeline\(\s*rt,\s*)(&?)("?)(\w+)', rs):
         var, lit, name = m.group(1), m.group(3), m.group(4)
         if lit:
             kernels = [name]
@@ -846,7 +885,7 @@ def _host_binds():
         pipe_defs.append((m.start(), var, kernels))
     binds = {}
     # Calls only: the helper's own `fn dispatch_groups(` definition is not one.
-    for m in re.finditer(r"(?<!fn )\b(dispatch_groups|dispatch_2d)\(", rs):
+    for m in re.finditer(r"(?<!fn )\b(dispatch_groups|dispatch_2d_tg|dispatch_2d)\(", rs):
         depth, i = 0, m.end() - 1
         while True:
             depth += {"(": 1, ")": -1}.get(rs[i], 0)
@@ -862,10 +901,11 @@ def _host_binds():
         for k in kernels:
             assert k not in binds, f"{k} is dispatched twice; the contract check needs one site"
             binds[k] = b
+    # The constants the kernels must agree with are qwen35.rs's.
     consts = {}
-    for m in re.finditer(r"^const (\w+): usize = ([^;]+);", rs, re.M):
+    for m in re.finditer(r"^const (\w+): usize = ([^;]+);", qwen35_rs, re.M):
         consts[m.group(1)] = eval(m.group(2))
-    for m in re.finditer(r"^pub const (\w+): u32 = ([^;]+);", rs, re.M):
+    for m in re.finditer(r"^pub const (\w+): u32 = ([^;]+);", qwen35_rs, re.M):
         consts[m.group(1)] = eval(m.group(2))
     return binds, consts
 
@@ -886,6 +926,11 @@ def case_host_contract():
               + ("" if ok else f"\n      kernel {sorted(sig)}\n      host   {got}"))
         if not ok:
             FAILURES.append(f"host binds for {k}")
+    # A dispatch of a kernel no inspected source declares is a name the host
+    # binds unchecked (or a typo the GPU would reject at run time).
+    for k in sorted(set(binds) - set(sigs)):
+        print(f"  [FAIL] {k} is bound by the host but declared in no inspected kernel source")
+        FAILURES.append(f"undeclared kernel {k}")
     kc = dict(l.split() for l in subprocess.run([HARNESS, "--constants"], check=True, capture_output=True,
                                                    text=True).stdout.splitlines())
     kc = {k: int(v) for k, v in kc.items()}
@@ -910,7 +955,9 @@ def case_host_contract():
     # host builds its grid from, and must match the arguments it passes.
     import re
     tiled = open(os.path.join(ROOT, "kernels", "qwen35_attn_tiled.metal")).read()
-    insts = re.findall(r"^TILED_ATTN_KERNEL\((\w+), (\d+), (\d+), (\d+)\)", tiled, re.M)
+    insts = re.findall(r"^TILED_ATTN_KERNEL(?:_IMPL)?\((\w+), (\d+), (\d+), (\d+)[,)]", tiled, re.M)
+    bwd = open(os.path.join(ROOT, "kernels", "qwen35_attn_bwd.metal")).read()
+    insts += re.findall(r"^ATTN_BWD_D(?:Q|KV)_KERNEL\((\w+), (\d+), (\d+), (\d+)[,)]", bwd, re.M)
     if not insts:
         FAILURES.append("no TILED_ATTN_KERNEL instantiations found")
     for name, bq, bk, sg in insts:
@@ -918,11 +965,12 @@ def case_host_contract():
         print(f"  [{'ok  ' if ok else 'FAIL'}] {name} spells its geometry ({bq}, {bk}, {sg})")
         if not ok:
             FAILURES.append(f"geometry of {name}")
-    d = re.search(r"^constant uint TILED_ATTN_D = (\d+);", tiled, re.M)
-    ok = d is not None and int(d.group(1)) == consts["PREFIX_ATTN_HEAD_DIM"]
-    print(f"  [{'ok  ' if ok else 'FAIL'}] PREFIX_ATTN_HEAD_DIM = {consts['PREFIX_ATTN_HEAD_DIM']} vs kernel TILED_ATTN_D (source)")
-    if not ok:
-        FAILURES.append("constant TILED_ATTN_D")
+    for src, const in ((tiled, "TILED_ATTN_D"), (bwd, "ATTN_BWD_D")):
+        d = re.search(rf"^constant uint {const} = (\d+);", src, re.M)
+        ok = d is not None and int(d.group(1)) == consts["PREFIX_ATTN_HEAD_DIM"]
+        print(f"  [{'ok  ' if ok else 'FAIL'}] PREFIX_ATTN_HEAD_DIM = {consts['PREFIX_ATTN_HEAD_DIM']} vs kernel {const} (source)")
+        if not ok:
+            FAILURES.append(f"constant {const}")
 
 
 CASES = [

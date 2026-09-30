@@ -50,6 +50,20 @@ All notable changes to `tessl` are recorded here. The format follows
   host checks the ids and groups the rows by id; each id's rows are summed
   in row order without atomics. `EmbedBwdWorkspace` holds the grouping.
   Kernel `qwen35_embed_rows_bwd_f32`.
+- **Training attention (`tessl::attn_train`)**: `attn_train_forward` is
+  `attn_prefill`'s tiled kernel at its default geometry with each row's
+  log-sum-exp written out (new entry point
+  `qwen35_attn_tiled_lse_h256_q32_k32_sg4`; the four existing entry points
+  are unchanged and bind no new slot), and bit-identical O.
+  `attn_train_backward` is FlashAttention-2's backward on the matrix units
+  (`kernels/qwen35_attn_bwd.metal`): dQ per query block, dK and dV per key
+  block walking the KV head's query heads in order, each gradient written
+  once, no atomics. Kernels `qwen35_attn_bwd_dvec_f32`,
+  `qwen35_attn_bwd_{dq,dk,dv}_h256_q32_k32_sg4`.
+- **msl_emu host contract**: macro instantiations are expanded by a small
+  preprocessor (nested macros, object-like parameter macros), the
+  TensorOps backward's signatures and `src/attn_train.rs`'s binds are
+  checked, and a host bind of a kernel no inspected source declares fails.
 - **torch binding (`python/tessl_torch`) over a C ABI (`tessl::capi`)**:
   `tessl_torch.cross_entropy(hidden, weight, targets, mask)`, a
   `torch.autograd.Function` over MPS tensors, loaded with `ctypes` (no C++

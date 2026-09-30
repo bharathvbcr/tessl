@@ -69,7 +69,7 @@ jobs:
           sdk="$(xcrun --sdk macosx --show-sdk-path)"
           mkdir -p "$RUNNER_TEMP/air"
           status=0
-          for src in kernels/qwen35_gdn.metal kernels/qwen35_attn.metal kernels/qwen35_attn_tiled.metal kernels/qwen35_mlp.metal kernels/qwen35_score.metal kernels/cross_entropy.metal kernels/gdn_train.metal kernels/qwen35_bwd.metal; do
+          for src in kernels/qwen35_gdn.metal kernels/qwen35_attn.metal kernels/qwen35_attn_tiled.metal kernels/qwen35_mlp.metal kernels/qwen35_score.metal kernels/cross_entropy.metal kernels/gdn_train.metal kernels/qwen35_bwd.metal kernels/qwen35_attn_bwd.metal; do
             echo "::group::$src"
             if xcrun metal -std=metal4.0 -O2 -isysroot "$sdk" -mmacosx-version-min=26.0 \
                  -Wall -Werror -c "$src" -o "$RUNNER_TEMP/air/$(basename "$src" .metal).air"; then
@@ -101,7 +101,9 @@ jobs:
                     qwen35_rms_norm_bwd_f32 qwen35_col_sum_blocks_f32 qwen35_gated_rms_norm_bwd_f32 \
                     qwen35_swiglu_bwd_f32 qwen35_attn_gate_bwd_f32 \
                     qwen35_conv1d_silu_bwd_dx_f32 qwen35_conv1d_silu_bwd_dw_f32 qwen35_attn_qk_norm_rope_bwd_f32 \
-                    qwen35_embed_rows_bwd_f32; do
+                    qwen35_embed_rows_bwd_f32 qwen35_attn_tiled_lse_h256_q32_k32_sg4 qwen35_attn_bwd_dvec_f32 \
+                    qwen35_attn_bwd_dq_h256_q32_k32_sg4 qwen35_attn_bwd_dk_h256_q32_k32_sg4 \
+                    qwen35_attn_bwd_dv_h256_q32_k32_sg4; do
             if grep -qx "$fn" "$RUNNER_TEMP/symbols.txt"; then
               echo "exported: $fn"
             else

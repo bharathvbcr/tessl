@@ -485,6 +485,11 @@ fn qwen35_swiglu_row_offsets_are_widened() {
         "out[(ulong)r * ld_out + out_off + col]",
         "SwiGLU output address",
     );
+    require(
+        QWEN35_MLP,
+        "resid[(ulong)r * ld_resid + resid_off + col] += y[(ulong)r * ld_y + y_off + col];",
+        "residual add addresses",
+    );
 }
 
 #[test]

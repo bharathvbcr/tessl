@@ -1264,6 +1264,80 @@ fn pack_linear_weights_rejects_overflowing_widths_and_skips_empty_rows() {
 }
 
 #[test]
+fn residual_add_is_the_exact_f32_sum_inside_its_windows() {
+    with_gpu(|rt| {
+        // Windows of wider rows on both sides, a width off every 32-lane edge,
+        // and values whose f32 sum rounds (so an f64 or fused path would show).
+        let (rows, width) = (29usize, 301usize);
+        let (y_ld, y_off) = (width + 7, 5usize);
+        let (r_ld, r_off) = (width + 3, 2usize);
+        let y: Vec<f32> = random_f32(rows * y_ld, 710).iter().map(|v| 1e3 * v).collect();
+        let mut resid: Vec<f32> = random_f32(rows * r_ld, 711)
+            .iter()
+            .map(|v| 1e-3 * v)
+            .collect();
+        // Padding columns carry a sentinel the kernel must not touch.
+        for r in 0..rows {
+            for c in (0..r_off).chain(r_off + width..r_ld) {
+                resid[r * r_ld + c] = SENTINEL;
+            }
+        }
+        let yb = buf(rt, &y);
+        let rb = buf(rt, &resid);
+        let yc = Cols {
+            buf: &yb,
+            ld: y_ld as u32,
+            off: y_off as u32,
+        };
+        let rc = Cols {
+            buf: &rb,
+            ld: r_ld as u32,
+            off: r_off as u32,
+        };
+        qwen35::residual_add(rt, yc, rc, rows as u32, width as u32).unwrap();
+        rt.synchronize().unwrap();
+        let got = rb.read_f32();
+        for r in 0..rows {
+            for c in 0..r_ld {
+                let i = r * r_ld + c;
+                let want = if (r_off..r_off + width).contains(&c) {
+                    resid[i] + y[r * y_ld + y_off + (c - r_off)]
+                } else {
+                    SENTINEL
+                };
+                assert_eq!(got[i].to_bits(), want.to_bits(), "row {r} col {c}");
+            }
+        }
+
+        // Rejections: aliasing, a window past the buffer, and zero work.
+        expect_err(
+            qwen35::residual_add(rt, rc, rc, rows as u32, width as u32),
+            "resid",
+        );
+        // One row too many: `y` is checked first.
+        expect_err(
+            qwen35::residual_add(rt, yc, rc, rows as u32 + 1, width as u32),
+            "residual_add y",
+        );
+        expect_err(
+            qwen35::residual_add(
+                rt,
+                yc,
+                Cols {
+                    off: 4,
+                    ..rc
+                },
+                rows as u32,
+                width as u32,
+            ),
+            "residual_add resid",
+        );
+        qwen35::residual_add(rt, yc, rc, 0, width as u32).unwrap();
+        qwen35::residual_add(rt, yc, rc, rows as u32, 0).unwrap();
+    });
+}
+
+#[test]
 fn swiglu_f32_and_bf16_from_a_fused_gate_up_buffer() {
     with_gpu(|rt| {
         // Gate and up as two windows of one [gate | up] row, as a fused GEMM
@@ -1888,6 +1962,7 @@ fn every_qwen35_kernel_is_in_the_metallib() {
             "qwen35_attn_tiled_h256_q64_k64_sg8",
             "qwen35_swiglu_f32",
             "qwen35_swiglu_bf16",
+            "qwen35_residual_add_f32",
             "qwen35_score_rows_f32",
             "qwen35_score_rows_bf16",
         ] {

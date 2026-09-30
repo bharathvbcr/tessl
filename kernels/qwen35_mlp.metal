@@ -44,3 +44,27 @@ kernel void NAME(                                                               
 
 SWIGLU_KERNEL(qwen35_swiglu_f32, float)
 SWIGLU_KERNEL(qwen35_swiglu_bf16, bfloat)
+
+/// `resid[r, resid_off + c] += y[r, y_off + c]` for `c < width`, `r < rows`:
+/// the residual add after a projection, for the exact-f32 forward. (The bf16
+/// forward folds this into the GEMM epilogue, which exact f32 does not have.)
+/// Each element is read and written by one thread, so `resid` is updated in
+/// place; `y` must be a different buffer.
+///
+/// Grid: x = column in [0, width), y = row in [0, rows).
+kernel void qwen35_residual_add_f32(
+    device const float *y [[buffer(0)]],
+    device float *resid [[buffer(1)]],
+    constant uint &rows [[buffer(2)]],
+    constant uint &width [[buffer(3)]],
+    constant uint &ld_y [[buffer(4)]],
+    constant uint &y_off [[buffer(5)]],
+    constant uint &ld_resid [[buffer(6)]],
+    constant uint &resid_off [[buffer(7)]],
+    uint2 gid [[thread_position_in_grid]])
+{
+    const uint col = gid.x;
+    const uint r = gid.y;
+    if (col >= width || r >= rows) return;
+    resid[(ulong)r * ld_resid + resid_off + col] += y[(ulong)r * ld_y + y_off + col];
+}

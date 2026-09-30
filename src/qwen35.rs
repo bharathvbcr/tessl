@@ -1933,6 +1933,40 @@ pub fn swiglu(
     })
 }
 
+/// `resid += y`, elementwise over `rows x width` column windows, in exact f32:
+/// the residual add after an output projection when the projection is an
+/// exact-f32 GEMM. ([`project_residual`] folds the add into the GEMM epilogue,
+/// which only the bf16 and relaxed-f32 GEMMs have.)
+///
+/// `y` must be a different buffer from `resid`.
+pub fn residual_add(
+    rt: &Arc<GpuRuntime>,
+    y: Cols<'_>,
+    resid: Cols<'_>,
+    rows: u32,
+    width: u32,
+) -> Result<(), String> {
+    const WHAT: &str = "qwen35::residual_add";
+    let (r, w) = (u64::from(rows), u64::from(width));
+    require_window::<f32>(rt, y, r, w, "residual_add y")?;
+    require_window::<f32>(rt, resid, r, w, "residual_add resid")?;
+    if rows == 0 || width == 0 {
+        return Ok(());
+    }
+    require_disjoint_writes(WHAT, &[("resid", resid.buf)], &[("y", y.buf)])?;
+    let p = rt.pipeline("qwen35_residual_add_f32")?;
+    dispatch_2d(rt, &p, width as usize, rows as usize, |bnd| {
+        set_gpu_buf(bnd, y.buf, 0);
+        set_gpu_buf(bnd, resid.buf, 1);
+        set_u32(bnd, rows, 2);
+        set_u32(bnd, width, 3);
+        set_u32(bnd, y.ld, 4);
+        set_u32(bnd, y.off, 5);
+        set_u32(bnd, resid.ld, 6);
+        set_u32(bnd, resid.off, 7);
+    })
+}
+
 // ------------------------------------------------ matrix-unit prefill attention ---
 
 /// Block geometry of [`attn_prefill_with_tile`]: queries per threadgroup (BQ)

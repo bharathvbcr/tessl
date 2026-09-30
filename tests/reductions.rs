@@ -160,8 +160,7 @@ fn row_sum_and_row_max_match_a_f64_reference() {
             let want_max = row.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
             // A tree reduction reassociates against a sequential f64 sum; the
             // bound is the usual n*eps*max|term|.
-            let bound =
-                8.0 * f32::EPSILON * cols as f32 * row.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+            let bound = 8.0 * f32::EPSILON * cols as f32 * row.iter().fold(0.0f32, |m, v| m.max(v.abs()));
             assert!(
                 (gs[r] as f64 - want_sum).abs() <= bound as f64,
                 "row_sum[{r}] = {} want {want_sum} (bound {bound})",

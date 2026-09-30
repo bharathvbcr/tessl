@@ -19,14 +19,12 @@ use objc2::runtime::ProtocolObject;
 use objc2::ClassType;
 use objc2_foundation::{NSData, NSRange, NSString, NSURL};
 use objc2_metal::{
-    MTL4ArgumentTable, MTL4ArgumentTableDescriptor, MTL4CommandAllocator, MTL4CommandBuffer,
-    MTL4CommandEncoder, MTL4CommandQueue, MTL4Compiler, MTL4CompilerDescriptor,
-    MTL4ComputeCommandEncoder, MTL4ComputePipelineDescriptor, MTL4CounterHeap,
-    MTL4CounterHeapDescriptor, MTL4CounterHeapType, MTL4IndirectCommandBufferSupportState,
-    MTL4LibraryFunctionDescriptor, MTL4TimestampHeapEntry, MTL4VisibilityOptions, MTLAllocation,
-    MTLBuffer, MTLComputePipelineState, MTLCreateSystemDefaultDevice, MTLDevice, MTLEvent,
-    MTLLibrary, MTLResidencySet, MTLResidencySetDescriptor, MTLResourceOptions, MTLSharedEvent,
-    MTLSize, MTLStages,
+    MTL4ArgumentTable, MTL4ArgumentTableDescriptor, MTL4CommandAllocator, MTL4CommandBuffer, MTL4CommandEncoder,
+    MTL4CommandQueue, MTL4Compiler, MTL4CompilerDescriptor, MTL4ComputeCommandEncoder, MTL4ComputePipelineDescriptor,
+    MTL4CounterHeap, MTL4CounterHeapDescriptor, MTL4CounterHeapType, MTL4IndirectCommandBufferSupportState,
+    MTL4LibraryFunctionDescriptor, MTL4TimestampHeapEntry, MTL4VisibilityOptions, MTLAllocation, MTLBuffer,
+    MTLComputePipelineState, MTLCreateSystemDefaultDevice, MTLDevice, MTLEvent, MTLLibrary, MTLResidencySet,
+    MTLResidencySetDescriptor, MTLResourceOptions, MTLSharedEvent, MTLSize, MTLStages,
 };
 use std::collections::HashMap;
 use std::path::Path;
@@ -96,9 +94,7 @@ struct PipelineCache {
 
 impl PipelineCache {
     fn new() -> Self {
-        Self {
-            map: HashMap::new(),
-        }
+        Self { map: HashMap::new() }
     }
 
     fn get_or_create(
@@ -109,26 +105,18 @@ impl PipelineCache {
         name: &str,
     ) -> Result<Retained<ProtocolObject<dyn MTLComputePipelineState>>, String> {
         let icb = crate::decode_icb::icb_pipelines_enabled();
-        let key = if icb {
-            format!("icb:{name}")
-        } else {
-            name.to_string()
-        };
+        let key = if icb { format!("icb:{name}") } else { name.to_string() };
         if let Some(p) = self.map.get(&key) {
             return Ok(p.clone());
         }
         let fname = NSString::from_str(name);
-        let containing: &ProtocolObject<dyn MTLLibrary> =
-            if library.newFunctionWithName(&fname).is_some() {
-                library
-            } else if let Some(lib) = overlays
-                .iter()
-                .find(|lib| lib.newFunctionWithName(&fname).is_some())
-            {
-                lib
-            } else {
-                return Err(format!("kernel '{name}' not found in metallib"));
-            };
+        let containing: &ProtocolObject<dyn MTLLibrary> = if library.newFunctionWithName(&fname).is_some() {
+            library
+        } else if let Some(lib) = overlays.iter().find(|lib| lib.newFunctionWithName(&fname).is_some()) {
+            lib
+        } else {
+            return Err(format!("kernel '{name}' not found in metallib"));
+        };
 
         let pipeline = if icb {
             let compiler_desc = MTL4CompilerDescriptor::new();
@@ -140,15 +128,12 @@ impl PipelineCache {
             func_desc.setLibrary(Some(containing));
             let pipe_desc = MTL4ComputePipelineDescriptor::new();
             pipe_desc.setComputeFunctionDescriptor(Some(func_desc.as_super()));
-            pipe_desc
-                .setSupportIndirectCommandBuffers(MTL4IndirectCommandBufferSupportState::Enabled);
+            pipe_desc.setSupportIndirectCommandBuffers(MTL4IndirectCommandBufferSupportState::Enabled);
             let p = compiler
                 .newComputePipelineStateWithDescriptor_compilerTaskOptions_error(&pipe_desc, None)
                 .map_err(|e| format!("ICB pipeline '{name}': {e}"))?;
             if !p.supportIndirectCommandBuffers() {
-                return Err(format!(
-                    "ICB pipeline '{name}' supportIndirectCommandBuffers=false"
-                ));
+                return Err(format!("ICB pipeline '{name}' supportIndirectCommandBuffers=false"));
             }
             p
         } else {
@@ -189,9 +174,7 @@ impl BufferPool {
         nbytes: usize,
     ) -> Result<(Retained<ProtocolObject<dyn MTLBuffer>>, bool), String> {
         if nbytes > isize::MAX as usize || nbytes > device.maxBufferLength() {
-            return Err(format!(
-                "buffer request {nbytes} exceeds host/device allocation limit"
-            ));
+            return Err(format!("buffer request {nbytes} exceeds host/device allocation limit"));
         }
         let key = Self::bucket(nbytes);
         if key < nbytes || key > device.maxBufferLength() {
@@ -384,10 +367,7 @@ impl ParamsBuffer {
             .checked_add(4)
             .ok_or_else(|| "params buffer cursor overflow".to_string())?;
         if next > self.capacity {
-            return Err(format!(
-                "params buffer exhausted (cap {} bytes)",
-                self.capacity
-            ));
+            return Err(format!("params buffer exhausted (cap {} bytes)", self.capacity));
         }
         let mut bytes = self.buffer.try_contents_u8()?;
         bytes[offset..next].copy_from_slice(&v.to_ne_bytes());
@@ -497,9 +477,7 @@ impl GpuRuntime {
         }
         self.access_busy
             .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
-            .map_err(|_| {
-                "runtime busy: another host mapping, encoder, or submit is active".to_string()
-            })?;
+            .map_err(|_| "runtime busy: another host mapping, encoder, or submit is active".to_string())?;
         let access = RuntimeAccess(Arc::clone(&self.access_busy));
         if self.encode_failed.load(Ordering::Acquire) {
             return Err("runtime poisoned by an earlier encoding/submission failure".into());
@@ -538,16 +516,14 @@ impl GpuRuntime {
     }
 
     pub fn from_metallib_path_opts(path: &Path, timestamps: bool) -> Result<Arc<Self>, String> {
-        let device = MTLCreateSystemDefaultDevice()
-            .ok_or_else(|| "MTLCreateSystemDefaultDevice returned nil".to_string())?;
+        let device =
+            MTLCreateSystemDefaultDevice().ok_or_else(|| "MTLCreateSystemDefaultDevice returned nil".to_string())?;
 
         let path_str = path
             .to_str()
             .ok_or_else(|| format!("non-utf8 metallib path: {path:?}"))?;
         if !path.exists() {
-            return Err(format!(
-                "metallib missing at {path_str} (build.rs AOT failed?)"
-            ));
+            return Err(format!("metallib missing at {path_str} (build.rs AOT failed?)"));
         }
         let url = NSURL::fileURLWithPath(&NSString::from_str(path_str));
         let library = device
@@ -555,9 +531,8 @@ impl GpuRuntime {
             .map_err(|e| format!("load metallib: {e}"))?;
 
         // Metal 4 encode package is required (Metal4-only doctrine).
-        let metal4 = try_init_metal4(&device, timestamps).map_err(|err| {
-            format!("Metal 4 encode package unavailable ({err}); metal-runtime requires Metal 4")
-        })?;
+        let metal4 = try_init_metal4(&device, timestamps)
+            .map_err(|err| format!("Metal 4 encode package unavailable ({err}); metal-runtime requires Metal 4"))?;
 
         let has_tensorops = library
             .newFunctionWithName(&NSString::from_str("matmul2d_tensorops_f32"))
@@ -714,11 +689,7 @@ impl GpuRuntime {
     /// Last timeline value this runtime has submitted a signal for (`0` if no
     /// commit has signaled yet). Pair with [`Self::shared_event`] for handoff.
     pub fn last_signaled_value(&self) -> u64 {
-        *self
-            .metal4
-            .event_value
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
+        *self.metal4.event_value.lock().unwrap_or_else(|p| p.into_inner())
     }
 
     /// Register a buffer in the Metal 4 residency set (deferred commit).
@@ -752,11 +723,7 @@ impl GpuRuntime {
     }
 
     /// Called from [`crate::tensor::PooledBuffer`] Drop for cold temps.
-    pub(crate) fn schedule_cold_recycle(
-        &self,
-        buffer: Retained<ProtocolObject<dyn MTLBuffer>>,
-        nbytes: usize,
-    ) {
+    pub(crate) fn schedule_cold_recycle(&self, buffer: Retained<ProtocolObject<dyn MTLBuffer>>, nbytes: usize) {
         if let Ok(mut q) = self.pending_cold_recycle.lock() {
             q.push((buffer, nbytes));
         }
@@ -932,10 +899,7 @@ impl GpuRuntime {
     /// off the returned handle, which is only meaningful if it is that kernel's
     /// own pipeline. A cache hit costs one uncontended lock (and no allocation
     /// off the ICB path) — the same lookup live encode pays per dispatch.
-    pub fn pipeline(
-        &self,
-        name: &str,
-    ) -> Result<Retained<ProtocolObject<dyn MTLComputePipelineState>>, String> {
+    pub fn pipeline(&self, name: &str) -> Result<Retained<ProtocolObject<dyn MTLComputePipelineState>>, String> {
         record_kernel_use(name);
         // Cache hit without holding overlay lock or allocating a key String.
         let icb = crate::decode_icb::icb_pipelines_enabled();
@@ -958,9 +922,7 @@ impl GpuRuntime {
     }
 
     /// Snapshot of overlay metallibs (for ICB pipeline construction).
-    pub fn overlay_libraries_snapshot(
-        &self,
-    ) -> Result<Vec<Retained<ProtocolObject<dyn MTLLibrary>>>, String> {
+    pub fn overlay_libraries_snapshot(&self) -> Result<Vec<Retained<ProtocolObject<dyn MTLLibrary>>>, String> {
         let overlays = self.overlay_libraries.lock().map_err(|e| e.to_string())?;
         Ok(overlays.clone())
     }
@@ -973,11 +935,7 @@ impl GpuRuntime {
         self.alloc_buffer_kind(nbytes, BufferKind::Hot)
     }
 
-    pub fn alloc_buffer_kind(
-        &self,
-        nbytes: usize,
-        kind: BufferKind,
-    ) -> Result<crate::tensor::GpuBuffer, String> {
+    pub fn alloc_buffer_kind(&self, nbytes: usize, kind: BufferKind) -> Result<crate::tensor::GpuBuffer, String> {
         if self.encode_failed.load(Ordering::Acquire) {
             return Err("runtime is poisoned after encode/submit failure; recreate it".into());
         }
@@ -1033,10 +991,7 @@ impl GpuRuntime {
     }
 
     /// Sub-allocate a zeroed f32 tensor from the bump slab (view with byte_offset).
-    pub fn bump_alloc_f32(
-        self: &Arc<Self>,
-        shape: &[usize],
-    ) -> Result<crate::tensor::Tensor, String> {
+    pub fn bump_alloc_f32(self: &Arc<Self>, shape: &[usize]) -> Result<crate::tensor::Tensor, String> {
         let _access = self.acquire_access()?;
         let nbytes = crate::tensor::checked_nbytes(shape, crate::tensor::DType::F32)?;
         let mut bump = self.bump.lock().map_err(|e| e.to_string())?;
@@ -1046,10 +1001,7 @@ impl GpuRuntime {
         // Align to 16 bytes for TensorOps.
         let align = 16;
         let cursor = (state.cursor + align - 1) & !(align - 1);
-        if cursor
-            .checked_add(nbytes)
-            .is_none_or(|end| end > state.capacity)
-        {
+        if cursor.checked_add(nbytes).is_none_or(|end| end > state.capacity) {
             return Err(format!(
                 "bump arena exhausted: need {} more bytes (cursor={cursor}, cap={})",
                 nbytes, state.capacity
@@ -1082,10 +1034,7 @@ impl GpuRuntime {
     /// a fresh slab is allocated when resetting would otherwise alias them.
     pub fn bump_reset(&self) -> Result<(), String> {
         let _access = self.host_access()?;
-        let mut bump = self
-            .bump
-            .lock()
-            .map_err(|_| "bump state poisoned".to_string())?;
+        let mut bump = self.bump.lock().map_err(|_| "bump state poisoned".to_string())?;
         if let Some(b) = bump.as_mut() {
             // Keep the old arena alive until its last outstanding view drops.
             if Arc::strong_count(&b.buffer.inner) == 1 {
@@ -1110,10 +1059,7 @@ impl GpuRuntime {
     /// poisoned one are errors the caller has to see; silently serving them
     /// from the pool used to hand out tensors from a runtime that could no
     /// longer run anything.
-    pub fn alloc_temp_f32(
-        self: &Arc<Self>,
-        shape: &[usize],
-    ) -> Result<crate::tensor::Tensor, String> {
+    pub fn alloc_temp_f32(self: &Arc<Self>, shape: &[usize]) -> Result<crate::tensor::Tensor, String> {
         if self.bump_enabled() {
             match self.bump_alloc_f32(shape) {
                 Ok(t) => return Ok(t),
@@ -1124,18 +1070,12 @@ impl GpuRuntime {
         self.alloc_tensor_f32(shape)
     }
 
-    pub fn alloc_tensor_f32(
-        self: &Arc<Self>,
-        shape: &[usize],
-    ) -> Result<crate::tensor::Tensor, String> {
+    pub fn alloc_tensor_f32(self: &Arc<Self>, shape: &[usize]) -> Result<crate::tensor::Tensor, String> {
         self.alloc_tensor_f32_kind(shape, BufferKind::Cold)
     }
 
     /// Persistent weights / grads / optim / EMA — stay in residency (no cold recycle).
-    pub fn alloc_tensor_f32_hot(
-        self: &Arc<Self>,
-        shape: &[usize],
-    ) -> Result<crate::tensor::Tensor, String> {
+    pub fn alloc_tensor_f32_hot(self: &Arc<Self>, shape: &[usize]) -> Result<crate::tensor::Tensor, String> {
         self.alloc_tensor_f32_kind(shape, BufferKind::Hot)
     }
 
@@ -1161,17 +1101,11 @@ impl GpuRuntime {
     /// Two bytes per element like bf16, but not interchangeable with it: the
     /// bit layouts differ, so a buffer written as one and read as the other is
     /// silently wrong rather than merely imprecise.
-    pub fn alloc_tensor_f16(
-        self: &Arc<Self>,
-        shape: &[usize],
-    ) -> Result<crate::tensor::Tensor, String> {
+    pub fn alloc_tensor_f16(self: &Arc<Self>, shape: &[usize]) -> Result<crate::tensor::Tensor, String> {
         self.alloc_tensor_f16_kind(shape, BufferKind::Cold)
     }
 
-    pub fn alloc_tensor_f16_hot(
-        self: &Arc<Self>,
-        shape: &[usize],
-    ) -> Result<crate::tensor::Tensor, String> {
+    pub fn alloc_tensor_f16_hot(self: &Arc<Self>, shape: &[usize]) -> Result<crate::tensor::Tensor, String> {
         self.alloc_tensor_f16_kind(shape, BufferKind::Hot)
     }
 
@@ -1192,17 +1126,11 @@ impl GpuRuntime {
         })
     }
 
-    pub fn alloc_tensor_bf16(
-        self: &Arc<Self>,
-        shape: &[usize],
-    ) -> Result<crate::tensor::Tensor, String> {
+    pub fn alloc_tensor_bf16(self: &Arc<Self>, shape: &[usize]) -> Result<crate::tensor::Tensor, String> {
         self.alloc_tensor_bf16_kind(shape, BufferKind::Cold)
     }
 
-    pub fn alloc_tensor_bf16_hot(
-        self: &Arc<Self>,
-        shape: &[usize],
-    ) -> Result<crate::tensor::Tensor, String> {
+    pub fn alloc_tensor_bf16_hot(self: &Arc<Self>, shape: &[usize]) -> Result<crate::tensor::Tensor, String> {
         self.alloc_tensor_bf16_kind(shape, BufferKind::Hot)
     }
 
@@ -1284,10 +1212,7 @@ impl GpuRuntime {
                 let mut slots = m4.allocators.lock().map_err(|e| e.to_string())?;
                 // Prefer a free allocator so mid-commit never blocks host encode
                 // while the peer CB is still executing.
-                let free = slots
-                    .iter()
-                    .position(|s| s.in_flight == 0)
-                    .unwrap_or(usize::MAX);
+                let free = slots.iter().position(|s| s.in_flight == 0).unwrap_or(usize::MAX);
                 let i = if free != usize::MAX {
                     free
                 } else {
@@ -1358,9 +1283,7 @@ impl GpuRuntime {
         let (enc, pending_edge) = {
             let mut guard = self.active_m4.lock().map_err(|e| e.to_string())?;
             self.ensure_m4_cb_open(&mut guard)?;
-            let batch = guard
-                .as_mut()
-                .ok_or_else(|| "M4 batch missing".to_string())?;
+            let batch = guard.as_mut().ok_or_else(|| "M4 batch missing".to_string())?;
             if batch.encoder.is_none() {
                 let e = m4
                     .command_buffer
@@ -1418,9 +1341,7 @@ impl GpuRuntime {
         };
         let hit_mid = {
             let mut guard = self.active_m4.lock().map_err(|e| e.to_string())?;
-            let batch = guard
-                .as_mut()
-                .ok_or_else(|| "M4 batch missing".to_string())?;
+            let batch = guard.as_mut().ok_or_else(|| "M4 batch missing".to_string())?;
             batch.hazard_pending = hazard_pending;
             batch.dispatches += 1;
             batch.since_commit += 1;
@@ -1530,11 +1451,9 @@ impl GpuRuntime {
         // it past that.
         unsafe {
             let mut cb =
-                NonNull::new(Retained::as_ptr(&m4.command_buffer)
-                    as *mut ProtocolObject<dyn MTL4CommandBuffer>)
-                .ok_or_else(|| "null MTL4 command buffer".to_string())?;
-            m4.queue
-                .commit_count(NonNull::new_unchecked(&mut cb as *mut _), 1);
+                NonNull::new(Retained::as_ptr(&m4.command_buffer) as *mut ProtocolObject<dyn MTL4CommandBuffer>)
+                    .ok_or_else(|| "null MTL4 command buffer".to_string())?;
+            m4.queue.commit_count(NonNull::new_unchecked(&mut cb as *mut _), 1);
         }
         batch.cb_open = false;
         batch.since_commit = 0;
@@ -1544,10 +1463,8 @@ impl GpuRuntime {
             *v += 1;
             *v
         };
-        m4.queue.signalEvent_value(
-            ProtocolObject::<dyn MTLEvent>::from_ref(&*m4.shared_event),
-            next,
-        );
+        m4.queue
+            .signalEvent_value(ProtocolObject::<dyn MTLEvent>::from_ref(&*m4.shared_event), next);
         // Mark this allocator in-flight; switch active slot for next begin.
         {
             let mut slots = m4.allocators.lock().map_err(|e| e.to_string())?;
@@ -1558,10 +1475,7 @@ impl GpuRuntime {
 
         if wait {
             let t0 = std::time::Instant::now();
-            if !m4
-                .shared_event
-                .waitUntilSignaledValue_timeoutMS(next, 30_000)
-            {
+            if !m4.shared_event.waitUntilSignaledValue_timeoutMS(next, 30_000) {
                 self.encode_failed.store(true, Ordering::Release);
                 return Err("Metal 4 SharedEvent wait timed out".to_string());
             }
@@ -1604,10 +1518,7 @@ impl GpuRuntime {
             return Ok(());
         }
         let t0 = std::time::Instant::now();
-        if !m4
-            .shared_event
-            .waitUntilSignaledValue_timeoutMS(max_v, 30_000)
-        {
+        if !m4.shared_event.waitUntilSignaledValue_timeoutMS(max_v, 30_000) {
             self.encode_failed.store(true, Ordering::Release);
             return Err("Metal 4 SharedEvent wait timed out".to_string());
         }
@@ -1647,10 +1558,7 @@ impl GpuRuntime {
     /// here closes the allocator lifecycle cleanly. Also run at final drop for
     /// a batch the caller never committed.
     fn abort_open_batch(&self) {
-        let mut guard = self
-            .active_m4
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut guard = self.active_m4.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let Some(batch) = guard.as_mut() else {
             return;
         };
@@ -1785,29 +1693,18 @@ fn probe_system_memory_size() -> u64 {
             if !o.status.success() {
                 return None;
             }
-            String::from_utf8(o.stdout)
-                .ok()
-                .and_then(|s| s.trim().parse().ok())
+            String::from_utf8(o.stdout).ok().and_then(|s| s.trim().parse().ok())
         })
         .unwrap_or(0)
 }
 
-fn resolve_two_timestamps(
-    heap: &ProtocolObject<dyn MTL4CounterHeap>,
-) -> Result<(u64, u64), String> {
-    let data: Retained<NSData> = unsafe {
-        heap.resolveCounterRange(NSRange {
-            location: 0,
-            length: 2,
-        })
-    }
-    .ok_or_else(|| "resolveCounterRange returned nil".to_string())?;
+fn resolve_two_timestamps(heap: &ProtocolObject<dyn MTL4CounterHeap>) -> Result<(u64, u64), String> {
+    let data: Retained<NSData> = unsafe { heap.resolveCounterRange(NSRange { location: 0, length: 2 }) }
+        .ok_or_else(|| "resolveCounterRange returned nil".to_string())?;
     let need = 2 * std::mem::size_of::<MTL4TimestampHeapEntry>();
     let bytes = data.length();
     if bytes < need {
-        return Err(format!(
-            "timestamp resolve too small: {bytes} bytes (need {need})"
-        ));
+        return Err(format!("timestamp resolve too small: {bytes} bytes (need {need})"));
     }
     let mut buf = vec![0u8; need];
     // SAFETY: `getBytes:length:` copies `need` bytes into the destination, and
@@ -1845,10 +1742,7 @@ fn decode_two_timestamps(bytes: &[u8]) -> Result<(u64, u64), String> {
     }
 }
 
-fn try_init_metal4(
-    device: &ProtocolObject<dyn MTLDevice>,
-    timestamps: bool,
-) -> Result<Metal4EncodePackage, String> {
+fn try_init_metal4(device: &ProtocolObject<dyn MTLDevice>, timestamps: bool) -> Result<Metal4EncodePackage, String> {
     let queue = device
         .newMTL4CommandQueue()
         .ok_or_else(|| "newMTL4CommandQueue returned nil".to_string())?;
@@ -1894,19 +1788,14 @@ fn try_init_metal4(
 
     // Multi-slot const arena for batched argument-table encode (16 MiB).
     let const_staging = device
-        .newBufferWithLength_options(
-            METAL4_CONST_ARENA_BYTES,
-            MTLResourceOptions::StorageModeShared,
-        )
+        .newBufferWithLength_options(METAL4_CONST_ARENA_BYTES, MTLResourceOptions::StorageModeShared)
         .ok_or_else(|| "const_staging buffer alloc failed".to_string())?;
 
     let residency = device
         .newResidencySetWithDescriptor_error(&res_desc)
         .map_err(|e| format!("newResidencySet: {e}"))?;
     // Const arena is always resident for M4 encode.
-    residency.addAllocation(ProtocolObject::<dyn MTLAllocation>::from_ref(
-        &*const_staging,
-    ));
+    residency.addAllocation(ProtocolObject::<dyn MTLAllocation>::from_ref(&*const_staging));
     residency.commit();
     residency.requestResidency();
 
@@ -1979,8 +1868,7 @@ mod tests {
         })
         .expect("metal4 smoke");
         rt.synchronize().unwrap();
-        let out =
-            unsafe { std::slice::from_raw_parts(dst.metal().contents().as_ptr() as *const f32, n) };
+        let out = unsafe { std::slice::from_raw_parts(dst.metal().contents().as_ptr() as *const f32, n) };
         for (i, &v) in out.iter().enumerate() {
             assert_eq!(v, (i + 1) as f32, "smoke mismatch at {i}");
         }
@@ -2038,12 +1926,8 @@ mod tests {
         .unwrap();
         rt.synchronize().unwrap();
 
-        let mid_out = unsafe {
-            std::slice::from_raw_parts(mid.metal().contents().as_ptr() as *const f32, n1).to_vec()
-        };
-        let dst_out = unsafe {
-            std::slice::from_raw_parts(dst.metal().contents().as_ptr() as *const f32, n2).to_vec()
-        };
+        let mid_out = unsafe { std::slice::from_raw_parts(mid.metal().contents().as_ptr() as *const f32, n1).to_vec() };
+        let dst_out = unsafe { std::slice::from_raw_parts(dst.metal().contents().as_ptr() as *const f32, n2).to_vec() };
         for (i, v) in mid_out.iter().take(n1).enumerate() {
             assert_eq!(*v, (i + 1) as f32, "first copy mismatch at {i}");
         }
@@ -2083,9 +1967,7 @@ mod tests {
         })
         .expect("m4 offset dispatch");
         rt.synchronize().unwrap();
-        let out = unsafe {
-            std::slice::from_raw_parts(dst.metal().contents().as_ptr() as *const f32, n).to_vec()
-        };
+        let out = unsafe { std::slice::from_raw_parts(dst.metal().contents().as_ptr() as *const f32, n).to_vec() };
         for (i, &v) in out.iter().enumerate() {
             let expect = (i + 1) as f32;
             assert!(
@@ -2159,8 +2041,7 @@ mod nop_pipeline_tests {
 
     /// Env marker set on the isolated child process (see below).
     const CHILD_ENV: &str = "TESSL_BINDER_NOP_CHILD";
-    const SELF_NAME: &str =
-        "runtime::nop_pipeline_tests::pipeline_under_binder_nop_resolves_the_named_kernel";
+    const SELF_NAME: &str = "runtime::nop_pipeline_tests::pipeline_under_binder_nop_resolves_the_named_kernel";
 
     /// binder-nop suppresses *encoding*; it must not suppress name resolution.
     ///
@@ -2247,13 +2128,8 @@ mod audit_tests {
     fn callback_failure_poisoning_prevents_partial_submission() {
         let rt = GpuRuntime::new().unwrap();
         rt.set_async_encode(true).unwrap();
-        assert!(rt
-            .with_binder(|_| Err("injected encode failure".into()))
-            .is_err());
-        assert!(
-            rt.synchronize().is_err(),
-            "failed batch was submitted as success"
-        );
+        assert!(rt.with_binder(|_| Err("injected encode failure".into())).is_err());
+        assert!(rt.synchronize().is_err(), "failed batch was submitted as success");
     }
 
     #[test]
@@ -2277,8 +2153,7 @@ mod audit_tests {
     #[test]
     fn oversized_raw_allocations_fail_without_panicking() {
         let rt = GpuRuntime::new().unwrap();
-        let outcome =
-            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| rt.alloc_buffer(usize::MAX)));
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| rt.alloc_buffer(usize::MAX)));
         assert!(outcome.is_ok(), "allocation arithmetic panicked");
         assert!(outcome.unwrap().is_err());
     }

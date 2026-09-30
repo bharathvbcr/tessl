@@ -8,9 +8,8 @@ use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_foundation::NSRange;
 use objc2_metal::{
-    MTL4ArgumentTable, MTL4CommandEncoder, MTL4ComputeCommandEncoder, MTL4VisibilityOptions,
-    MTLAllocation, MTLBuffer, MTLComputePipelineState, MTLIndirectCommandBuffer, MTLResidencySet,
-    MTLResourceID, MTLSize, MTLStages,
+    MTL4ArgumentTable, MTL4CommandEncoder, MTL4ComputeCommandEncoder, MTL4VisibilityOptions, MTLAllocation, MTLBuffer,
+    MTLComputePipelineState, MTLIndirectCommandBuffer, MTLResidencySet, MTLResourceID, MTLSize, MTLStages,
 };
 
 use crate::runtime::{mtl_size, GpuRuntime};
@@ -80,12 +79,7 @@ impl<'a> Binder<'a> {
         }
         // SAFETY: checked the entire destination range before writing.
         unsafe {
-            let dst = self
-                .const_staging
-                .contents()
-                .as_ptr()
-                .cast::<u8>()
-                .add(start);
+            let dst = self.const_staging.contents().as_ptr().cast::<u8>().add(start);
             std::ptr::write_bytes(dst, 0, bytes.len().max(4));
             std::ptr::copy_nonoverlapping(bytes.as_ptr(), dst, bytes.len());
         }
@@ -187,9 +181,7 @@ impl<'a> Binder<'a> {
             // We re-lookup is unavailable here — store a raw retain if possible.
             // SAFETY: pipeline is a live Objective-C object retained by the caller
             // for the duration of with_binder; we retain an extra ref for the tape.
-            let retained = unsafe {
-                Retained::retain(pipeline as *const _ as *mut _).expect("retain pipeline")
-            };
+            let retained = unsafe { Retained::retain(pipeline as *const _ as *mut _).expect("retain pipeline") };
             self.last_pipeline = Some(retained);
             if let Some(ref p) = self.last_pipeline {
                 crate::decode_icb::capture_note_pipeline(p.clone());
@@ -197,12 +189,7 @@ impl<'a> Binder<'a> {
         }
     }
 
-    pub(crate) fn bind_buf(
-        &mut self,
-        buf: &ProtocolObject<dyn MTLBuffer>,
-        offset: usize,
-        index: usize,
-    ) {
+    pub(crate) fn bind_buf(&mut self, buf: &ProtocolObject<dyn MTLBuffer>, offset: usize, index: usize) {
         if !self.valid_index(index) {
             return;
         }
@@ -299,8 +286,7 @@ impl<'a> Binder<'a> {
         // capture that contains one cannot be replayed faithfully.
         crate::decode_icb::capture_note_unrecordable_bind();
         unsafe {
-            self.table
-                .setResource_atBufferIndex(resource_id, index as _);
+            self.table.setResource_atBufferIndex(resource_id, index as _);
         }
     }
 
@@ -341,8 +327,7 @@ impl<'a> Binder<'a> {
         // the device's threadgroup memory limit; and `self.enc` is a live
         // encoder for the duration of the borrow.
         unsafe {
-            self.enc
-                .setThreadgroupMemoryLength_atIndex(length as _, index as _);
+            self.enc.setThreadgroupMemoryLength_atIndex(length as _, index as _);
         }
         if crate::decode_icb::decode_icb_capture_active() {
             crate::decode_icb::capture_note_tg_mem(index, length);
@@ -361,9 +346,7 @@ impl<'a> Binder<'a> {
             .width
             .checked_mul(threads_per_tg.height)
             .and_then(|n| n.checked_mul(threads_per_tg.depth));
-        let valid = lanes
-            .zip(self.max_threads)
-            .is_some_and(|(n, max)| n > 0 && n <= max)
+        let valid = lanes.zip(self.max_threads).is_some_and(|(n, max)| n > 0 && n <= max)
             && [threadgroups.width, threadgroups.height, threadgroups.depth]
                 .iter()
                 .all(|&n| n > 0 && n <= u32::MAX as usize);
@@ -426,12 +409,7 @@ impl<'a> Binder<'a> {
     /// so `inheritBuffers=true` ICB cmds see host binds. Freeze-binds
     /// (`inheritBuffers=false` + classic `setKernelBuffer`) passes false — no
     /// `setArgumentTable` traffic.
-    pub fn execute_icb(
-        &mut self,
-        icb: &ProtocolObject<dyn MTLIndirectCommandBuffer>,
-        start: u64,
-        count: u64,
-    ) {
+    pub fn execute_icb(&mut self, icb: &ProtocolObject<dyn MTLIndirectCommandBuffer>, start: u64, count: u64) {
         self.execute_icb_ex(icb, start, count, true);
     }
 
@@ -465,9 +443,7 @@ impl<'a> Binder<'a> {
         // is refused here as `optimize_icb` refuses it.
         let allocation = ProtocolObject::<dyn MTLAllocation>::from_ref(icb);
         if !self.runtime.metal4.residency.containsAllocation(allocation) {
-            self.fail(
-                "indirect command buffer is not registered with this runtime's residency set",
-            );
+            self.fail("indirect command buffer is not registered with this runtime's residency set");
             return;
         }
         let range = NSRange {
@@ -504,12 +480,7 @@ impl<'a> Binder<'a> {
     }
 
     /// Optimize an ICB range after CPU-side encode (recommended once before reuse).
-    pub fn optimize_icb(
-        &mut self,
-        icb: &ProtocolObject<dyn MTLIndirectCommandBuffer>,
-        start: u64,
-        count: u64,
-    ) {
+    pub fn optimize_icb(&mut self, icb: &ProtocolObject<dyn MTLIndirectCommandBuffer>, start: u64, count: u64) {
         if self.error.is_some() {
             return;
         }
@@ -519,9 +490,7 @@ impl<'a> Binder<'a> {
         }
         let allocation = ProtocolObject::<dyn MTLAllocation>::from_ref(icb);
         if !self.runtime.metal4.residency.containsAllocation(allocation) {
-            self.fail(
-                "indirect command buffer is not registered with this runtime's residency set",
-            );
+            self.fail("indirect command buffer is not registered with this runtime's residency set");
             return;
         }
         let range = NSRange {
@@ -664,9 +633,7 @@ pub(crate) fn validate_dispatch_geometry(
         .width
         .checked_mul(threads_per_tg.height)
         .and_then(|n| n.checked_mul(threads_per_tg.depth));
-    let threads_ok = lanes
-        .zip(max_threads)
-        .is_some_and(|(n, max)| n > 0 && n <= max);
+    let threads_ok = lanes.zip(max_threads).is_some_and(|(n, max)| n > 0 && n <= max);
     if !grid_ok || !threads_ok {
         return Err("invalid dispatch geometry or missing pipeline".into());
     }
@@ -688,10 +655,7 @@ pub fn dispatch_2d_tg(
     rt.with_binder(|bnd| {
         bnd.set_pipeline(pipeline);
         encode_bufs(bnd);
-        bnd.dispatch(
-            mtl_size(groups_x, groups_y, 1),
-            mtl_size(threads_per_tg, 1, 1),
-        );
+        bnd.dispatch(mtl_size(groups_x, groups_y, 1), mtl_size(threads_per_tg, 1, 1));
         Ok(())
     })
 }
@@ -720,8 +684,7 @@ mod tests {
         })
         .unwrap();
         rt.synchronize().unwrap();
-        let out =
-            unsafe { std::slice::from_raw_parts(dst.metal().contents().as_ptr() as *const f32, n) };
+        let out = unsafe { std::slice::from_raw_parts(dst.metal().contents().as_ptr() as *const f32, n) };
         for (i, v) in out.iter().take(n).enumerate() {
             assert_eq!(*v, (i as f32) * 2.0);
         }
@@ -784,13 +747,8 @@ mod audit_tests {
             .is_err());
     }
 
-    fn one_command_icb(
-        rt: &GpuRuntime,
-    ) -> Retained<ProtocolObject<dyn objc2_metal::MTLIndirectCommandBuffer>> {
-        use objc2_metal::{
-            MTLDevice, MTLIndirectCommandBufferDescriptor, MTLIndirectCommandType,
-            MTLResourceOptions,
-        };
+    fn one_command_icb(rt: &GpuRuntime) -> Retained<ProtocolObject<dyn objc2_metal::MTLIndirectCommandBuffer>> {
+        use objc2_metal::{MTLDevice, MTLIndirectCommandBufferDescriptor, MTLIndirectCommandType, MTLResourceOptions};
         let desc = MTLIndirectCommandBufferDescriptor::new();
         desc.setCommandTypes(MTLIndirectCommandType::ConcurrentDispatch);
         desc.setInheritBuffers(true);
@@ -839,10 +797,7 @@ mod audit_tests {
         rt.register_allocation(ProtocolObject::<dyn MTLAllocation>::from_ref(&*icb));
         let weak = objc2::rc::Weak::from_retained(&icb);
         drop(icb);
-        assert!(
-            weak.load().is_some(),
-            "the residency set did not keep the ICB alive"
-        );
+        assert!(weak.load().is_some(), "the residency set did not keep the ICB alive");
     }
 
     /// Moved here with `dispatch_2d`/`dispatch_3d`. The extent check must reject

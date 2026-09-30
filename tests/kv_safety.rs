@@ -51,12 +51,7 @@ fn timestep_store_device_offsets_cannot_cross_logical_capacity() {
         // offset == capacity, offset > capacity, a non-wrapping span that
         // crosses the end, and the u32 wrapping boundary must all be complete
         // no-ops. A per-thread bound would allow a partial store here.
-        for offset in [
-            capacity,
-            capacity + 1,
-            capacity - src.len() as u32 + 1,
-            u32::MAX,
-        ] {
+        for offset in [capacity, capacity + 1, capacity - src.len() as u32 + 1, u32::MAX] {
             let off = u32_buf(rt, offset);
             let dst = seeded(rt, physical, SENTINEL);
             nn::kv_store_timestep(rt, &src_k, &dst, &off, src.len() as u32, capacity).unwrap();
@@ -65,17 +60,7 @@ fn timestep_store_device_offsets_cannot_cross_logical_capacity() {
 
             let dst_k = seeded(rt, physical, SENTINEL);
             let dst_v = seeded(rt, physical, SENTINEL);
-            nn::kv_store_timestep_pair(
-                rt,
-                &src_k,
-                &src_v,
-                &dst_k,
-                &dst_v,
-                &off,
-                src.len() as u32,
-                capacity,
-            )
-            .unwrap();
+            nn::kv_store_timestep_pair(rt, &src_k, &src_v, &dst_k, &dst_v, &off, src.len() as u32, capacity).unwrap();
             rt.synchronize().unwrap();
             assert_all_sentinel(&format!("pair K offset={offset}"), &dst_k, physical);
             assert_all_sentinel(&format!("pair V offset={offset}"), &dst_v, physical);
@@ -87,17 +72,7 @@ fn timestep_store_device_offsets_cannot_cross_logical_capacity() {
         let off = u32_buf(rt, valid_offset);
         let dst_k = seeded(rt, physical, SENTINEL);
         let dst_v = seeded(rt, physical, SENTINEL);
-        nn::kv_store_timestep_pair(
-            rt,
-            &src_k,
-            &src_v,
-            &dst_k,
-            &dst_v,
-            &off,
-            src.len() as u32,
-            capacity,
-        )
-        .unwrap();
+        nn::kv_store_timestep_pair(rt, &src_k, &src_v, &dst_k, &dst_v, &off, src.len() as u32, capacity).unwrap();
         rt.synchronize().unwrap();
 
         let got_k = dst_k.read_f32();
@@ -107,16 +82,8 @@ fn timestep_store_device_offsets_cannot_cross_logical_capacity() {
         assert_eq!(&got_v[start..start + src.len()], &[-1.0, 4.0, 9.0]);
         assert_guard("valid pair K prefix", &got_k, 0..start);
         assert_guard("valid pair V prefix", &got_v, 0..start);
-        assert_guard(
-            "valid pair K slab tail",
-            &got_k,
-            capacity as usize..physical,
-        );
-        assert_guard(
-            "valid pair V slab tail",
-            &got_v,
-            capacity as usize..physical,
-        );
+        assert_guard("valid pair K slab tail", &got_k, capacity as usize..physical);
+        assert_guard("valid pair V slab tail", &got_v, capacity as usize..physical);
     });
 }
 
@@ -174,21 +141,9 @@ fn fused_multi_token_store_is_atomic_at_every_offset_boundary() {
             .unwrap();
             rt.synchronize().unwrap();
 
-            assert_eq!(
-                q.read_f32()[..q_values.len()],
-                q_values,
-                "Q offset={offset}"
-            );
-            assert_eq!(
-                k.read_f32()[..k_values.len()],
-                k_values,
-                "K offset={offset}"
-            );
-            assert_eq!(
-                v.read_f32()[..v_values.len()],
-                v_values,
-                "V offset={offset}"
-            );
+            assert_eq!(q.read_f32()[..q_values.len()], q_values, "Q offset={offset}");
+            assert_eq!(k.read_f32()[..k_values.len()], k_values, "K offset={offset}");
+            assert_eq!(v.read_f32()[..v_values.len()], v_values, "V offset={offset}");
             assert_all_sentinel(&format!("fused K offset={offset}"), &dst_k, physical);
             assert_all_sentinel(&format!("fused V offset={offset}"), &dst_v, physical);
         }
@@ -232,26 +187,12 @@ fn fused_multi_token_store_is_atomic_at_every_offset_boundary() {
         let transformed_k = k.read_f32();
         let transformed_v = v.read_f32();
         let start = offset as usize;
-        assert_eq!(
-            &got_k[start..start + span as usize],
-            &transformed_k[..span as usize]
-        );
-        assert_eq!(
-            &got_v[start..start + span as usize],
-            &transformed_v[..span as usize]
-        );
+        assert_eq!(&got_k[start..start + span as usize], &transformed_k[..span as usize]);
+        assert_eq!(&got_v[start..start + span as usize], &transformed_v[..span as usize]);
         assert_guard("valid fused K prefix", &got_k, 0..start);
         assert_guard("valid fused V prefix", &got_v, 0..start);
-        assert_guard(
-            "valid fused K slab tail",
-            &got_k,
-            capacity as usize..physical,
-        );
-        assert_guard(
-            "valid fused V slab tail",
-            &got_v,
-            capacity as usize..physical,
-        );
+        assert_guard("valid fused K slab tail", &got_k, capacity as usize..physical);
+        assert_guard("valid fused V slab tail", &got_v, capacity as usize..physical);
     });
 }
 
@@ -264,13 +205,12 @@ fn invalid_declared_capacities_fail_before_any_dispatch() {
         let dst_v = seeded(rt, 4, SENTINEL);
         let off = u32_buf(rt, 0);
 
-        let err =
-            nn::kv_store_timestep(rt, &src, &dst, &off, 3, 2).expect_err("capacity smaller than n");
+        let err = nn::kv_store_timestep(rt, &src, &dst, &off, 3, 2).expect_err("capacity smaller than n");
         assert!(err.contains("smaller than n"), "unexpected error: {err}");
         assert_eq!(rt.take_dispatch_count(), 0);
 
-        let err = nn::kv_store_timestep(rt, &src, &dst, &off, 3, 5)
-            .expect_err("declared capacity exceeds physical storage");
+        let err =
+            nn::kv_store_timestep(rt, &src, &dst, &off, 3, 5).expect_err("declared capacity exceeds physical storage");
         assert!(err.contains("buffer holds"), "unexpected error: {err}");
         assert_eq!(rt.take_dispatch_count(), 0);
 
@@ -325,10 +265,7 @@ fn invalid_declared_capacities_fail_before_any_dispatch() {
             false,
         )
         .expect_err("fused capacity smaller than T*Hkv*D");
-        assert!(
-            err.contains("smaller than the K/V span"),
-            "unexpected error: {err}"
-        );
+        assert!(err.contains("smaller than the K/V span"), "unexpected error: {err}");
         assert_eq!(rt.take_dispatch_count(), 0);
 
         let err = nn::rms_qkv_rope(
@@ -356,10 +293,7 @@ fn invalid_declared_capacities_fail_before_any_dispatch() {
         let start = u32_buf(rt, 0);
         let err = nn::kv_ring_densify(rt, &src, &dst, &filled, &start, 2, u32::MAX)
             .expect_err("ring grid larger than Metal uint");
-        assert!(
-            err.contains("exceeds Metal uint"),
-            "unexpected error: {err}"
-        );
+        assert!(err.contains("exceeds Metal uint"), "unexpected error: {err}");
         assert_eq!(rt.take_dispatch_count(), 0);
     });
 }
@@ -556,13 +490,12 @@ fn kv_shader_and_host_capacity_abis_are_locked() {
     );
     assert!(host.contains("pub fn validate_rms_qkv_rope("));
     assert!(
-        fused_host.find("validate_rms_qkv_rope(").unwrap()
-            < fused_host.find("let p = rt.pipeline").unwrap(),
+        fused_host.find("validate_rms_qkv_rope(").unwrap() < fused_host.find("let p = rt.pipeline").unwrap(),
         "the canonical QKV preflight must run before pipeline lookup and scalar callback"
     );
 
-    let gemma_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../MLSystemsLab/Rust_MLKit/gemma-metal/src/kernels.rs");
+    let gemma_path =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../MLSystemsLab/Rust_MLKit/gemma-metal/src/kernels.rs");
     let model_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../MLSystemsLab/Rust_MLKit/gemma-metal/src/gpu_model.rs");
     let (Ok(gemma), Ok(model)) = (

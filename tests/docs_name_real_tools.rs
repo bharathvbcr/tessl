@@ -36,8 +36,7 @@ fn bench_binaries_named_in(text: &str) -> BTreeSet<String> {
     let mut found = BTreeSet::new();
     for chunk in text.split('`').skip(1).step_by(2) {
         let name = chunk.trim();
-        if name.starts_with("bench_") && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
-        {
+        if name.starts_with("bench_") && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
             found.insert(name.to_string());
         }
     }
@@ -45,18 +44,15 @@ fn bench_binaries_named_in(text: &str) -> BTreeSet<String> {
 }
 
 fn check(doc: &Path, label: &str, missing: &mut Vec<String>) {
-    let text = std::fs::read_to_string(doc)
-        .unwrap_or_else(|e| panic!("{label}: could not read {}: {e}", doc.display()));
+    let text =
+        std::fs::read_to_string(doc).unwrap_or_else(|e| panic!("{label}: could not read {}: {e}", doc.display()));
     for name in bench_binaries_named_in(&text) {
         if DELIBERATELY_ABSENT.contains(&name.as_str()) {
             continue;
         }
         let src = crate_root().join("src/bin").join(format!("{name}.rs"));
         if !src.exists() {
-            missing.push(format!(
-                "{label} names `{name}`, but {} does not exist",
-                src.display()
-            ));
+            missing.push(format!("{label} names `{name}`, but {} does not exist", src.display()));
         }
     }
 }
@@ -96,16 +92,12 @@ fn every_bench_script_the_docs_name_exists() {
     let mut missing = Vec::new();
     for chunk in text.split('`').skip(1).step_by(2) {
         let name = chunk.trim();
-        let is_path =
-            (name.starts_with("bench/") || name.starts_with("scripts/")) && name.ends_with(".py");
+        let is_path = (name.starts_with("bench/") || name.starts_with("scripts/")) && name.ends_with(".py");
         if is_path && !crate_root().join(name).exists() {
             missing.push(name.to_string());
         }
     }
-    assert!(
-        missing.is_empty(),
-        "README names missing scripts: {missing:?}"
-    );
+    assert!(missing.is_empty(), "README names missing scripts: {missing:?}");
 }
 
 /// The allowlist must not outlive its justification: an entry naming a binary
@@ -136,7 +128,11 @@ fn the_kernel_counts_the_docs_quote_are_the_builds() {
         .args(["metal-nm", tessl::metallib_path()])
         .output()
         .expect("xcrun metal-nm");
-    assert!(nm.status.success(), "metal-nm failed: {}", String::from_utf8_lossy(&nm.stderr));
+    assert!(
+        nm.status.success(),
+        "metal-nm failed: {}",
+        String::from_utf8_lossy(&nm.stderr)
+    );
     let entries = String::from_utf8_lossy(&nm.stdout)
         .lines()
         .filter(|l| l.split_whitespace().nth(1) == Some("T"))

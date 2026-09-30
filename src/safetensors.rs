@@ -123,18 +123,13 @@ impl SafeTensors {
     pub fn open(path: &Path) -> Result<Self, String> {
         let what = path.display().to_string();
         let mut f = File::open(path).map_err(|e| format!("{what}: {e}"))?;
-        let file_len = f
-            .metadata()
-            .map_err(|e| format!("{what}: {e}"))?
-            .len();
+        let file_len = f.metadata().map_err(|e| format!("{what}: {e}"))?.len();
         let mut len8 = [0u8; 8];
         f.read_exact(&mut len8)
             .map_err(|e| format!("{what}: header length: {e}"))?;
         let n = u64::from_le_bytes(len8);
         if n == 0 || n > MAX_HEADER_BYTES {
-            return Err(format!(
-                "{what}: header length {n} outside 1..={MAX_HEADER_BYTES}"
-            ));
+            return Err(format!("{what}: header length {n} outside 1..={MAX_HEADER_BYTES}"));
         }
         if n > file_len - 8 {
             return Err(format!(
@@ -142,11 +137,9 @@ impl SafeTensors {
             ));
         }
         let mut header = vec![0u8; n as usize];
-        f.read_exact(&mut header)
-            .map_err(|e| format!("{what}: header: {e}"))?;
+        f.read_exact(&mut header).map_err(|e| format!("{what}: header: {e}"))?;
         let data_start = 8 + n;
-        let (tensors, metadata) = parse_header(&header, file_len - data_start)
-            .map_err(|e| format!("{what}: {e}"))?;
+        let (tensors, metadata) = parse_header(&header, file_len - data_start).map_err(|e| format!("{what}: {e}"))?;
         Ok(Self {
             path: path.to_path_buf(),
             file: f,
@@ -173,8 +166,8 @@ impl SafeTensors {
     }
 
     fn read_bytes(&self, name: &str, info: &TensorInfo) -> Result<Vec<u8>, String> {
-        let len = usize::try_from(info.end - info.begin)
-            .map_err(|_| format!("{name}: tensor too large for this host"))?;
+        let len =
+            usize::try_from(info.end - info.begin).map_err(|_| format!("{name}: tensor too large for this host"))?;
         let mut bytes = vec![0u8; len];
         // From the handle `open` validated, never the path again: a file
         // replaced at that path since would be read with this header's
@@ -321,17 +314,16 @@ fn tensor_info(name: &str, v: Json) -> Result<TensorInfo, String> {
                 let dims = a
                     .into_iter()
                     .map(|d| match d {
-                        Json::Num { uint: Some(n), .. } => usize::try_from(n)
-                            .map_err(|_| format!("{name}: dimension {n} overflows usize")),
+                        Json::Num { uint: Some(n), .. } => {
+                            usize::try_from(n).map_err(|_| format!("{name}: dimension {n} overflows usize"))
+                        }
                         _ => Err(format!("{name}: shape holds a non-integer")),
                     })
                     .collect::<Result<Vec<_>, _>>()?;
                 shape = Some(dims);
             }
             ("data_offsets", Json::Array(a)) => match a.as_slice() {
-                [Json::Num { uint: Some(b), .. }, Json::Num { uint: Some(e), .. }] => {
-                    offsets = Some((*b, *e))
-                }
+                [Json::Num { uint: Some(b), .. }, Json::Num { uint: Some(e), .. }] => offsets = Some((*b, *e)),
                 _ => return Err(format!("{name}: data_offsets is not [begin, end]")),
             },
             (k, _) => return Err(format!("{name}: unexpected or mistyped field {k:?}")),

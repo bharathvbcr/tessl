@@ -43,8 +43,7 @@ const DIM_MISMATCH: &str = "GEMM inner dimensions or output shape do not match";
 const CROSS_RUNTIME: &str = "GEMM tensors must belong to the same runtime";
 const BAD_DTYPE: &str = "GEMM operand dtype does not match the selected precision path";
 const OVERLAP: &str = "GEMM output must not overlap either input";
-const MIXED_OPERANDS: &str =
-    "GEMM requires matching operand dtypes; bf16 and f16 require TensorOps";
+const MIXED_OPERANDS: &str = "GEMM requires matching operand dtypes; bf16 and f16 require TensorOps";
 
 #[test]
 fn gemm_rejects_mismatched_dimensions() {
@@ -165,11 +164,7 @@ fn gemm_rejects_dtypes_the_selected_path_cannot_run() {
         let c16 = rt.alloc_tensor_bf16(&[32, 32]).unwrap();
 
         // C is always f32: bf16 GEMMs accumulate in f32 and store f32.
-        expect_err(
-            "bf16 output",
-            gemm(&a16, &b16, &c16, GemmBackend::TensorOps),
-            BAD_DTYPE,
-        );
+        expect_err("bf16 output", gemm(&a16, &b16, &c16, GemmBackend::TensorOps), BAD_DTYPE);
 
         // One bf16 operand and one f32 operand is the classic half-migrated
         // call site, and it must not be silently promoted or demoted.
@@ -217,16 +212,8 @@ fn gemm_rejects_output_aliasing_an_input() {
         let b = rt.alloc_tensor_f32(&[32, 32]).unwrap();
 
         // In-place C = A @ B would read A after the first tile overwrote it.
-        expect_err(
-            "C is A",
-            gemm_f32(&a, &b, &a, GemmBackend::TensorOps),
-            OVERLAP,
-        );
-        expect_err(
-            "C is B",
-            gemm_f32(&a, &b, &b, GemmBackend::TensorOps),
-            OVERLAP,
-        );
+        expect_err("C is A", gemm_f32(&a, &b, &a, GemmBackend::TensorOps), OVERLAP);
+        expect_err("C is B", gemm_f32(&a, &b, &b, GemmBackend::TensorOps), OVERLAP);
 
         // Partial aliasing through views of one allocation is the realistic
         // version: two banks carved from the same buffer that happen to touch.
@@ -322,8 +309,7 @@ fn gpu_copy_rejects_shape_dtype_runtime_and_overlap() {
 
 #[test]
 fn softcap_rejects_inputs_it_cannot_cap() {
-    const SOFTCAP_BAD: &str =
-        "softcap requires f32, matching runtime, uint count, and a finite positive cap";
+    const SOFTCAP_BAD: &str = "softcap requires f32, matching runtime, uint count, and a finite positive cap";
     with_gpu(|rt| {
         rt.take_dispatch_count();
         let t = rt.alloc_tensor_f32(&[16]).unwrap();
@@ -334,11 +320,7 @@ fn softcap_rejects_inputs_it_cannot_cap() {
         }
         let half = rt.alloc_tensor_bf16(&[16]).unwrap();
         expect_err("bf16 input", softcap_f32(rt, &half, 30.0), SOFTCAP_BAD);
-        assert_eq!(
-            rt.take_dispatch_count(),
-            0,
-            "rejected softcap still encoded"
-        );
+        assert_eq!(rt.take_dispatch_count(), 0, "rejected softcap still encoded");
     });
     with_two_gpus(|first, second| {
         let foreign = second.alloc_tensor_f32(&[16]).unwrap();
@@ -368,8 +350,7 @@ fn missing_kernels_and_metallibs_are_named_in_the_error() {
         );
         expect_err_starting(
             "missing metallib at construction",
-            GpuRuntime::from_metallib_path(std::path::Path::new("/nonexistent/base.metallib"))
-                .map(|_| ()),
+            GpuRuntime::from_metallib_path(std::path::Path::new("/nonexistent/base.metallib")).map(|_| ()),
             "metallib missing at /nonexistent/base.metallib",
         );
     });

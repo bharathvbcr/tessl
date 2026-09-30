@@ -16,8 +16,8 @@ use std::sync::Arc;
 
 use common::with_gpu;
 use tessl::nn::{
-    self, AttnDims, AttnHeadDim, Q4Bank, Q4MlxBank, Q4MlxLayout, Q4MlxRowVariant, QkvBuffers,
-    QkvRopeDims, QkvRopeVariant, QuantShape,
+    self, AttnDims, AttnHeadDim, Q4Bank, Q4MlxBank, Q4MlxLayout, Q4MlxRowVariant, QkvBuffers, QkvRopeDims,
+    QkvRopeVariant, QuantShape,
 };
 use tessl::tensor::GpuBuffer;
 use tessl::GpuRuntime;
@@ -41,12 +41,7 @@ macro_rules! refuses {
     ($rt:expr, $what:expr, $call:expr) => {{
         let r = $call;
         assert!(r.is_err(), "{} was accepted; expected a refusal", $what);
-        assert_eq!(
-            $rt.take_dispatch_count(),
-            0,
-            "{} encoded work before refusing",
-            $what
-        );
+        assert_eq!($rt.take_dispatch_count(), 0, "{} encoded work before refusing", $what);
     }};
 }
 
@@ -57,37 +52,21 @@ fn undersized_buffers_are_refused_across_the_whole_surface() {
         let r = roomy(rt);
 
         // Norms and gated activations: `rows * dim` far exceeds `t`.
-        refuses!(
-            rt,
-            "rms_norm_f32",
-            nn::rms_norm_f32(rt, &t, &t, &t, 1024, 1024, 1e-6)
-        );
-        refuses!(
-            rt,
-            "rms_norm_bf16",
-            nn::rms_norm_bf16(rt, &t, &t, &t, 1024, 1024, 1e-6)
-        );
+        refuses!(rt, "rms_norm_f32", nn::rms_norm_f32(rt, &t, &t, &t, 1024, 1024, 1e-6));
+        refuses!(rt, "rms_norm_bf16", nn::rms_norm_bf16(rt, &t, &t, &t, 1024, 1024, 1e-6));
         refuses!(
             rt,
             "rms_norm_residual_add_f32",
             nn::rms_norm_residual_add_f32(rt, &t, &t, &t, 1024, 1024, 1e-6, 1.0)
         );
         refuses!(rt, "mlp_silu", nn::mlp_silu(rt, &t, &t, &t, 1 << 20));
-        refuses!(
-            rt,
-            "mlp_gelu_tanh",
-            nn::mlp_gelu_tanh(rt, &t, &t, &t, 1 << 20)
-        );
+        refuses!(rt, "mlp_gelu_tanh", nn::mlp_gelu_tanh(rt, &t, &t, &t, 1 << 20));
         refuses!(
             rt,
             "mlp_gelu_tanh_bf16",
             nn::mlp_gelu_tanh_bf16(rt, &t, &t, &t, 1 << 20)
         );
-        refuses!(
-            rt,
-            "scale_f32_inplace",
-            nn::scale_f32_inplace(rt, &t, 2.0, 1 << 20)
-        );
+        refuses!(rt, "scale_f32_inplace", nn::scale_f32_inplace(rt, &t, 2.0, 1 << 20));
 
         // Quantized GEMV: the bank extents are derived from the shape.
         let shape = QuantShape {
@@ -95,11 +74,7 @@ fn undersized_buffers_are_refused_across_the_whole_surface() {
             cols: 4096,
             group_size: 32,
         };
-        refuses!(
-            rt,
-            "gemv_q8",
-            nn::gemv_q8(rt, &t, &t, &t, &t, &t, 4096, 4096, 32)
-        );
+        refuses!(rt, "gemv_q8", nn::gemv_q8(rt, &t, &t, &t, &t, &t, 4096, 4096, 32));
         refuses!(
             rt,
             "gemv_q4",
@@ -196,18 +171,10 @@ fn undersized_buffers_are_refused_across_the_whole_surface() {
         );
 
         // Sampling and reductions.
-        refuses!(
-            rt,
-            "softmax_rows_f32",
-            nn::softmax_rows_f32(rt, &t, &t, 1024, 1024)
-        );
+        refuses!(rt, "softmax_rows_f32", nn::softmax_rows_f32(rt, &t, &t, 1024, 1024));
         refuses!(rt, "row_sum_f32", nn::row_sum_f32(rt, &t, &t, 1024, 1024));
         refuses!(rt, "row_max_f32", nn::row_max_f32(rt, &t, &t, 1024, 1024));
-        refuses!(
-            rt,
-            "softcap_logits",
-            nn::softcap_logits(rt, &t, &t, 1 << 20)
-        );
+        refuses!(rt, "softcap_logits", nn::softcap_logits(rt, &t, &t, 1 << 20));
         refuses!(
             rt,
             "argmax_f32_pass",
@@ -265,16 +232,7 @@ fn undersized_buffers_are_refused_across_the_whole_surface() {
         refuses!(
             rt,
             "rms_qkv_rope",
-            nn::rms_qkv_rope(
-                rt,
-                QkvRopeVariant::PosConst,
-                qkv,
-                rope,
-                0,
-                None,
-                None,
-                false
-            )
+            nn::rms_qkv_rope(rt, QkvRopeVariant::PosConst, qkv, rope, 0, None, None, false)
         );
     });
 }
@@ -353,16 +311,7 @@ fn non_finite_scalars_are_refused_rather_than_propagated() {
             refuses!(
                 rt,
                 "rms_qkv_rope theta",
-                nn::rms_qkv_rope(
-                    rt,
-                    QkvRopeVariant::PosConst,
-                    qkv,
-                    rope,
-                    0,
-                    None,
-                    None,
-                    false
-                )
+                nn::rms_qkv_rope(rt, QkvRopeVariant::PosConst, qkv, rope, 0, None, None, false)
             );
         }
     });
@@ -373,11 +322,7 @@ fn rms_norm_refuses_non_positive_or_non_finite_eps() {
     with_gpu(|rt| {
         let r = roomy(rt);
         for bad_eps in [0.0, -1.0, f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
-            refuses!(
-                rt,
-                "rms_norm_f32 eps",
-                nn::rms_norm_f32(rt, &r, &r, &r, 1, 16, bad_eps)
-            );
+            refuses!(rt, "rms_norm_f32 eps", nn::rms_norm_f32(rt, &r, &r, &r, 1, 16, bad_eps));
             refuses!(
                 rt,
                 "rms_norm_bf16 eps",
@@ -404,11 +349,7 @@ fn dimension_products_that_overflow_are_refused_not_wrapped() {
             "rms_norm_f32 huge",
             nn::rms_norm_f32(rt, &r, &r, &r, u32::MAX, u32::MAX, 1e-6)
         );
-        refuses!(
-            rt,
-            "softmax huge",
-            nn::softmax_rows_f32(rt, &r, &r, u32::MAX, u32::MAX)
-        );
+        refuses!(rt, "softmax huge", nn::softmax_rows_f32(rt, &r, &r, u32::MAX, u32::MAX));
         refuses!(
             rt,
             "gemv_q8 huge",

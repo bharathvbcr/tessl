@@ -23,10 +23,9 @@ use objc2::runtime::ProtocolObject;
 use objc2::ClassType;
 use objc2_foundation::NSString;
 use objc2_metal::{
-    MTL4Compiler, MTL4CompilerDescriptor, MTL4ComputePipelineDescriptor,
-    MTL4IndirectCommandBufferSupportState, MTL4LibraryFunctionDescriptor, MTLAllocation, MTLBuffer,
-    MTLComputePipelineState, MTLDevice, MTLIndirectCommandBuffer,
-    MTLIndirectCommandBufferDescriptor, MTLIndirectCommandType, MTLIndirectComputeCommand,
+    MTL4Compiler, MTL4CompilerDescriptor, MTL4ComputePipelineDescriptor, MTL4IndirectCommandBufferSupportState,
+    MTL4LibraryFunctionDescriptor, MTLAllocation, MTLBuffer, MTLComputePipelineState, MTLDevice,
+    MTLIndirectCommandBuffer, MTLIndirectCommandBufferDescriptor, MTLIndirectCommandType, MTLIndirectComputeCommand,
     MTLResourceOptions,
 };
 
@@ -48,12 +47,7 @@ pub fn icb_smoke_enabled() -> bool {
     if v >= 0 {
         return v == 1;
     }
-    let on = env_truthy(&[
-        "TESSL_ICB_SMOKE",
-        "METAL_RUNTIME_ICB_SMOKE",
-        "GEMMA_METAL_ICB_SMOKE",
-    ])
-    .unwrap_or(false);
+    let on = env_truthy(&["TESSL_ICB_SMOKE", "METAL_RUNTIME_ICB_SMOKE", "GEMMA_METAL_ICB_SMOKE"]).unwrap_or(false);
     ICB_SMOKE.store(if on { 1 } else { 0 }, Ordering::Relaxed);
     on
 }
@@ -91,11 +85,7 @@ impl IcbCopySmoke {
         Self::new_with_bridge(rt, n, IcbBindBridge::InheritArgTable)
     }
 
-    pub fn new_with_bridge(
-        rt: &GpuRuntime,
-        n: usize,
-        bridge: IcbBindBridge,
-    ) -> Result<Self, String> {
+    pub fn new_with_bridge(rt: &GpuRuntime, n: usize, bridge: IcbBindBridge) -> Result<Self, String> {
         if n == 0 {
             return Err("icb smoke: n must be > 0".into());
         }
@@ -192,10 +182,7 @@ impl IcbCopySmoke {
         let width = self.pipeline.threadExecutionWidth();
         let tpt = width.min(self.n).max(1);
         let groups = self.n.div_ceil(tpt);
-        cmd.concurrentDispatchThreadgroups_threadsPerThreadgroup(
-            mtl_size(groups, 1, 1),
-            mtl_size(tpt, 1, 1),
-        );
+        cmd.concurrentDispatchThreadgroups_threadsPerThreadgroup(mtl_size(groups, 1, 1), mtl_size(tpt, 1, 1));
         self.src = Some(src.clone());
         self.dst = Some(dst.clone());
         self.encoded = true;
@@ -212,14 +199,8 @@ impl IcbCopySmoke {
         let icb = self.icb.clone();
         let pipe = self.pipeline.clone();
         let bridge = self.bridge;
-        let src = self
-            .src
-            .clone()
-            .ok_or_else(|| "icb smoke: missing src".to_string())?;
-        let dst = self
-            .dst
-            .clone()
-            .ok_or_else(|| "icb smoke: missing dst".to_string())?;
+        let src = self.src.clone().ok_or_else(|| "icb smoke: missing src".to_string())?;
+        let dst = self.dst.clone().ok_or_else(|| "icb smoke: missing dst".to_string())?;
         let n_buf = self.n_buf.clone();
 
         rt.with_binder(|bnd| {
@@ -255,9 +236,7 @@ impl IcbCopySmoke {
     }
 }
 
-fn pipeline_copy_f32_icb(
-    rt: &GpuRuntime,
-) -> Result<Retained<ProtocolObject<dyn MTLComputePipelineState>>, String> {
+fn pipeline_copy_f32_icb(rt: &GpuRuntime) -> Result<Retained<ProtocolObject<dyn MTLComputePipelineState>>, String> {
     // MTL4 encoder + executeCommandsInBuffer needs an MTL4 pipeline with ICB
     // support enabled (classic MTLComputePipelineDescriptor is insufficient).
     let compiler_desc = MTL4CompilerDescriptor::new();
@@ -325,10 +304,7 @@ pub fn run_copy_f32_smoke(rt: &Arc<GpuRuntime>) -> Result<IcbCopySmoke, String> 
     rt.synchronize()?;
     verify_copy(&dst, n, "after second execute")?;
     if smoke.execute_count() != 2 {
-        return Err(format!(
-            "icb smoke expected 2 executes, got {}",
-            smoke.execute_count()
-        ));
+        return Err(format!("icb smoke expected 2 executes, got {}", smoke.execute_count()));
     }
     Ok(smoke)
 }
@@ -352,14 +328,11 @@ fn verify_copy(dst: &GpuBuffer, n: usize, label: &str) -> Result<(), String> {
     // caller synchronizes before verifying; a read racing the GPU would observe
     // a torn value rather than undefined behaviour, and the comparison below
     // would fail rather than the read.
-    let out =
-        unsafe { std::slice::from_raw_parts(dst.metal().contents().as_ptr() as *const f32, n) };
+    let out = unsafe { std::slice::from_raw_parts(dst.metal().contents().as_ptr() as *const f32, n) };
     for (i, &v) in out.iter().enumerate() {
         let expect = (i as f32) + 0.5;
         if v != expect {
-            return Err(format!(
-                "icb smoke mismatch {label} at {i}: got {v} want {expect}"
-            ));
+            return Err(format!("icb smoke mismatch {label} at {i}: got {v} want {expect}"));
         }
     }
     Ok(())

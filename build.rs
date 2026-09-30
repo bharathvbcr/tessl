@@ -83,10 +83,7 @@ fn main() {
             )
         });
         if !prebuilt.is_file() {
-            panic!(
-                "TESSL_PREBUILT_METALLIB={} is not a file",
-                prebuilt.display()
-            );
+            panic!("TESSL_PREBUILT_METALLIB={} is not a file", prebuilt.display());
         }
         println!("cargo:rerun-if-changed={}", prebuilt.display());
         println!("cargo:metallib={}", prebuilt.display());
@@ -111,27 +108,20 @@ fn main() {
     // nothing dispatches at runtime, so it stays opt-in to keep the shipped
     // metallib small. It lives in a subdirectory precisely so the directory
     // glob below cannot pick it up by accident.
-    let want_tune =
-        env::var_os("TESSL_GEMM_TUNE").is_some() || env::var_os("METAL_NATIVE_GEMM_TUNE").is_some();
+    let want_tune = env::var_os("TESSL_GEMM_TUNE").is_some() || env::var_os("METAL_NATIVE_GEMM_TUNE").is_some();
     let mut tensorops_sources: Vec<PathBuf> = vec![kernels_dir.join("matmul_tensorops.metal")];
     if want_tune {
         tensorops_sources.push(kernels_dir.join("tune/matmul_tensorops_tune.metal"));
     }
     for src in &tensorops_sources {
-        let name = src
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("<unnamed>");
+        let name = src.file_name().and_then(|n| n.to_str()).unwrap_or("<unnamed>");
         if !src.exists() {
             panic!(
                 "required TensorOps source missing: {}; Metal 4 / macOS 26 toolchain required",
                 src.display()
             );
         }
-        let air = out_dir.join(format!(
-            "{}.air",
-            src.file_stem().unwrap().to_string_lossy()
-        ));
+        let air = out_dir.join(format!("{}.air", src.file_stem().unwrap().to_string_lossy()));
         let status = Command::new(&metal)
             .args([
                 "-std=metal4.0",
@@ -164,9 +154,7 @@ fn main() {
         .map(|e| e.path())
         .filter(|p| {
             p.extension().and_then(|s| s.to_str()) == Some("metal")
-                && !skip
-                    .iter()
-                    .any(|s| p.file_name().and_then(|n| n.to_str()) == Some(*s))
+                && !skip.iter().any(|s| p.file_name().and_then(|n| n.to_str()) == Some(*s))
         })
         .collect();
     others.sort();
@@ -251,13 +239,7 @@ fn sweep_previous_metallibs(out_dir: &Path) {
 
 /// Compile one kernel under `metal_std`; on failure return the compiler's
 /// diagnostic (or the spawn error) instead of swallowing it.
-fn try_metal_compile(
-    metal: &Path,
-    sdk: &str,
-    src: &Path,
-    air: &Path,
-    metal_std: &str,
-) -> Result<(), String> {
+fn try_metal_compile(metal: &Path, sdk: &str, src: &Path, air: &Path, metal_std: &str) -> Result<(), String> {
     let std_flag = format!("-std={metal_std}");
     let out = Command::new(metal)
         .args([
@@ -316,11 +298,7 @@ fn xcrun_stdout(args: &[&str]) -> String {
         .output()
         .unwrap_or_else(|e| panic!("xcrun {:?} failed to spawn: {e}", args));
     if !out.status.success() {
-        panic!(
-            "xcrun {:?} failed: {}",
-            args,
-            String::from_utf8_lossy(&out.stderr)
-        );
+        panic!("xcrun {:?} failed: {}", args, String::from_utf8_lossy(&out.stderr));
     }
     String::from_utf8_lossy(&out.stdout).trim().to_string()
 }
@@ -335,9 +313,7 @@ fn xcrun_try(args: &[&str]) -> Result<String, ()> {
 }
 
 fn run(cmd: &mut Command, label: &str) {
-    let status = cmd
-        .status()
-        .unwrap_or_else(|e| panic!("{label}: failed to spawn: {e}"));
+    let status = cmd.status().unwrap_or_else(|e| panic!("{label}: failed to spawn: {e}"));
     if !status.success() {
         panic!("{label}: exited with {status}");
     }
@@ -360,10 +336,7 @@ fn track_kernel_sources(dir: &Path) {
         let p = entry.path();
         if p.is_dir() {
             track_kernel_sources(&p);
-        } else if matches!(
-            p.extension().and_then(|s| s.to_str()),
-            Some("metal") | Some("h")
-        ) {
+        } else if matches!(p.extension().and_then(|s| s.to_str()), Some("metal") | Some("h")) {
             // `.h` as well as `.metal`: shared reduction/activation helpers are
             // included by multiple kernels and compiled as neither. Tracking
             // only sources would let a helper edit leave every dependent stale

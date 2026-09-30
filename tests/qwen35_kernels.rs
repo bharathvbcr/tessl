@@ -29,8 +29,8 @@ use std::sync::Arc;
 use common::qwen35::*;
 use common::{buf, buf_u32, random_f32, seeded, with_gpu};
 use tessl::qwen35::{
-    self, AttnProjLayout, AttnShape, AttnTargets, Cols, GdnDims, GdnGateLogits, GdnParams,
-    GdnProjLayout, GdnQkv, GdnScanSlice, GdnWorkspace, LmHead, OutCols, StateIn,
+    self, AttnProjLayout, AttnShape, AttnTargets, Cols, GdnDims, GdnGateLogits, GdnParams, GdnProjLayout, GdnQkv,
+    GdnScanSlice, GdnWorkspace, LmHead, OutCols, StateIn,
 };
 use tessl::tensor::{bf16_bits_to_f32, f32_slice_to_bf16, DType, GpuBuffer};
 use tessl::{GemmBackend, GpuRuntime};
@@ -86,10 +86,7 @@ fn rel_bound(want: &[f64]) -> f64 {
 }
 
 fn read_bf16(b: &GpuBuffer, n: usize) -> Vec<f32> {
-    b.contents_u16()[..n]
-        .iter()
-        .map(|&x| bf16_bits_to_f32(x))
-        .collect()
+    b.contents_u16()[..n].iter().map(|&x| bf16_bits_to_f32(x)).collect()
 }
 
 // ------------------------------------------------ 1. references vs transformers ---
@@ -161,10 +158,7 @@ impl GdnData {
             a: scale(random_f32(s.b * s.t * s.hv, seed + 3), 2.0),
             b: scale(random_f32(s.b * s.t * s.hv, seed + 4), 2.0),
             // A_log in [-2, 1], dt_bias in [-1, 1].
-            a_log: random_f32(s.hv, seed + 5)
-                .into_iter()
-                .map(|x| -0.5 + 1.5 * x)
-                .collect(),
+            a_log: random_f32(s.hv, seed + 5).into_iter().map(|x| -0.5 + 1.5 * x).collect(),
             dt_bias: random_f32(s.hv, seed + 6),
             state0,
             snapshot: state == "snapshot",
@@ -179,25 +173,12 @@ fn gdn_reference_matches_transformers() {
     let (_, y64) = load("gdn_y_f64");
     let (_, st64) = load("gdn_state_f64");
     let (_, yhf) = load("gdn_y_hf");
-    let diff =
-        |a: &[f64], b: &[f64]| max_abs(&a.iter().zip(b).map(|(x, y)| x - y).collect::<Vec<_>>());
+    let diff = |a: &[f64], b: &[f64]| max_abs(&a.iter().zip(b).map(|(x, y)| x - y).collect::<Vec<_>>());
     // Same arithmetic in the same precision: agreement to rounding.
-    assert!(
-        diff(&y, &y64) < 1e-12,
-        "y vs f64 golden: {:e}",
-        diff(&y, &y64)
-    );
-    assert!(
-        diff(&st, &st64) < 1e-12,
-        "state vs f64 golden: {:e}",
-        diff(&st, &st64)
-    );
+    assert!(diff(&y, &y64) < 1e-12, "y vs f64 golden: {:e}", diff(&y, &y64));
+    assert!(diff(&st, &st64) < 1e-12, "state vs f64 golden: {:e}", diff(&st, &st64));
     // transformers' own fp32 chunked run: measured 2.6e-8 at generation.
-    assert!(
-        diff(&y, &yhf) < 1e-6,
-        "y vs transformers fp32: {:e}",
-        diff(&y, &yhf)
-    );
+    assert!(diff(&y, &yhf) < 1e-6, "y vs transformers fp32: {:e}", diff(&y, &yhf));
     // ...and its final state, which transformers returns as output_final_state.
     let (_, sthf) = load("gdn_state_hf");
     assert!(
@@ -256,8 +237,7 @@ impl Packed {
             let row = &mut qkv[r * ld..(r + 1) * ld];
             row[1..1 + key_w].copy_from_slice(&d.q[r * key_w..(r + 1) * key_w]);
             row[1 + key_w..1 + 2 * key_w].copy_from_slice(&d.k[r * key_w..(r + 1) * key_w]);
-            row[1 + 2 * key_w..1 + 2 * key_w + hv * dv]
-                .copy_from_slice(&d.v[r * hv * dv..(r + 1) * hv * dv]);
+            row[1 + 2 * key_w..1 + 2 * key_w + hv * dv].copy_from_slice(&d.v[r * hv * dv..(r + 1) * hv * dv]);
         }
         let g_ld = 1 + 2 * hv + 2;
         let mut gates = vec![SENTINEL; b * t * g_ld];
@@ -334,12 +314,7 @@ enum StateOut {
 
 /// Run one GDN call; returns (y [B*T, Hv*Dv], final state — empty for
 /// [`StateOut::Discard`]).
-fn run_gdn_with(
-    rt: &Arc<GpuRuntime>,
-    d: &GdnData,
-    path: Path,
-    mode: StateOut,
-) -> (Vec<f32>, Vec<f32>) {
+fn run_gdn_with(rt: &Arc<GpuRuntime>, d: &GdnData, path: Path, mode: StateOut) -> (Vec<f32>, Vec<f32>) {
     run_gdn_lens(rt, d, path, mode, None)
 }
 
@@ -358,16 +333,8 @@ fn run_gdn_lens(
     if path == Path::Chunk {
         let narrow = run_gdn_slice(rt, d, path, mode, lens, GdnScanSlice::Cols16);
         let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
-        assert_eq!(
-            bits(&narrow.0),
-            bits(&base.0),
-            "16-column scan output vs 32-column"
-        );
-        assert_eq!(
-            bits(&narrow.1),
-            bits(&base.1),
-            "16-column scan state vs 32-column"
-        );
+        assert_eq!(bits(&narrow.0), bits(&base.0), "16-column scan output vs 32-column");
+        assert_eq!(bits(&narrow.1), bits(&base.1), "16-column scan state vs 32-column");
     }
     base
 }
@@ -397,11 +364,7 @@ fn run_gdn_slice(
     let state_out = match mode {
         StateOut::Separate => Some(&separate),
         StateOut::Discard => None,
-        StateOut::InPlace => Some(
-            state_buf
-                .as_ref()
-                .expect("in place needs a per-batch state"),
-        ),
+        StateOut::InPlace => Some(state_buf.as_ref().expect("in place needs a per-batch state")),
     };
     let out_cols = Cols {
         buf: &out,
@@ -432,9 +395,7 @@ fn run_gdn_slice(
                 .unwrap();
             }
             match &lens_buf {
-                None => qwen35::gdn_chunk_forward(
-                    rt, &dims, &qkv, &gates, &params, state, &ws, out_cols, state_out,
-                ),
+                None => qwen35::gdn_chunk_forward(rt, &dims, &qkv, &gates, &params, state, &ws, out_cols, state_out),
                 Some(l) => qwen35::gdn_chunk_forward_varlen(
                     rt, &dims, &qkv, &gates, &params, state, &ws, out_cols, state_out, l,
                 ),
@@ -442,13 +403,11 @@ fn run_gdn_slice(
             .unwrap();
         }
         (Path::Recurrent, None) => {
-            qwen35::gdn_recurrent(rt, &dims, &qkv, &gates, &params, state, out_cols, state_out)
-                .unwrap()
+            qwen35::gdn_recurrent(rt, &dims, &qkv, &gates, &params, state, out_cols, state_out).unwrap()
         }
-        (Path::Recurrent, Some(l)) => qwen35::gdn_recurrent_varlen(
-            rt, &dims, &qkv, &gates, &params, state, out_cols, state_out, l,
-        )
-        .unwrap(),
+        (Path::Recurrent, Some(l)) => {
+            qwen35::gdn_recurrent_varlen(rt, &dims, &qkv, &gates, &params, state, out_cols, state_out, l).unwrap()
+        }
     }
     rt.synchronize().unwrap();
 
@@ -468,20 +427,14 @@ fn run_gdn_slice(
     }
     if mode != StateOut::InPlace {
         if let (Some(b), Some(s0)) = (&state_buf, &d.state0) {
-            assert_eq!(
-                &b.read_f32()[..s0.len()],
-                &s0[..],
-                "the input state was written"
-            );
+            assert_eq!(&b.read_f32()[..s0.len()], &s0[..], "the input state was written");
         }
     }
     let state = match mode {
         StateOut::Separate => separate.read_f32()[..state_elems].to_vec(),
         StateOut::Discard => {
             assert!(
-                separate.read_f32()[..state_elems]
-                    .iter()
-                    .all(|&x| x == SENTINEL),
+                separate.read_f32()[..state_elems].iter().all(|&x| x == SENTINEL),
                 "a state was written with state_out = None"
             );
             Vec::new()
@@ -507,12 +460,7 @@ fn gdn_chunk_matches_transformers_golden() {
     with_gpu(|rt| {
         let d = GdnData::fixture();
         let (y, st) = run_gdn(rt, &d, Path::Chunk);
-        assert_close(
-            "chunk y",
-            &y,
-            &load("gdn_y_f64").1,
-            rel_bound(&load("gdn_y_f64").1),
-        );
+        assert_close("chunk y", &y, &load("gdn_y_f64").1, rel_bound(&load("gdn_y_f64").1));
         assert_close(
             "chunk state",
             &st,
@@ -527,12 +475,7 @@ fn gdn_recurrent_matches_transformers_golden() {
     with_gpu(|rt| {
         let d = GdnData::fixture();
         let (y, st) = run_gdn(rt, &d, Path::Recurrent);
-        assert_close(
-            "rec y",
-            &y,
-            &load("gdn_y_f64").1,
-            rel_bound(&load("gdn_y_f64").1),
-        );
+        assert_close("rec y", &y, &load("gdn_y_f64").1, rel_bound(&load("gdn_y_f64").1));
         assert_close(
             "rec state",
             &st,
@@ -570,36 +513,16 @@ fn gdn_chunk_phases_in_order_are_gdn_chunk_forward_bit_for_bit() {
                 let cols = Cols::dense(&out, width as u32);
                 let si = StateIn::PerBatch(&state_in);
                 match phase {
-                    None => qwen35::gdn_chunk_forward(
-                        rt,
-                        &dims,
-                        &qkv,
-                        &gates,
-                        &params,
-                        si,
-                        &ws,
-                        cols,
-                        Some(&st),
-                    ),
-                    Some(ph) => qwen35::gdn_chunk_phase(
-                        rt,
-                        &dims,
-                        &qkv,
-                        &gates,
-                        &params,
-                        si,
-                        &ws,
-                        cols,
-                        Some(&st),
-                        *ph,
-                    ),
+                    None => qwen35::gdn_chunk_forward(rt, &dims, &qkv, &gates, &params, si, &ws, cols, Some(&st)),
+                    Some(ph) => {
+                        qwen35::gdn_chunk_phase(rt, &dims, &qkv, &gates, &params, si, &ws, cols, Some(&st), *ph)
+                    }
                 }
                 .unwrap();
             }
             rt.synchronize().unwrap();
-            let bits = |b: &GpuBuffer, n: usize| -> Vec<u32> {
-                b.read_f32()[..n].iter().map(|x| x.to_bits()).collect()
-            };
+            let bits =
+                |b: &GpuBuffer, n: usize| -> Vec<u32> { b.read_f32()[..n].iter().map(|x| x.to_bits()).collect() };
             (bits(&out, s.b * s.t * width), bits(&st, n_state))
         };
         use qwen35::GdnChunkPhase::{Prep, Scan};
@@ -611,11 +534,7 @@ fn gdn_chunk_phases_in_order_are_gdn_chunk_forward_bit_for_bit() {
         assert_eq!(run(&[Some(Prep), Some(Scan)]), whole, "Prep then Scan");
         let prep_only = run(&[Some(Prep)]);
         assert!(
-            prep_only
-                .0
-                .iter()
-                .chain(&prep_only.1)
-                .all(|&x| x == SENTINEL.to_bits()),
+            prep_only.0.iter().chain(&prep_only.1).all(|&x| x == SENTINEL.to_bits()),
             "Prep alone wrote an output or a state"
         );
     });
@@ -838,10 +757,7 @@ fn gdn_varlen_case(rt: &Arc<GpuRuntime>, d: &GdnData, path: Path, lens: &[u32]) 
         );
         let s_mine = &st[bi * per_state..(bi + 1) * per_state];
         assert!(
-            s_mine
-                .iter()
-                .zip(&st1)
-                .all(|(a, w)| a.to_bits() == w.to_bits()),
+            s_mine.iter().zip(&st1).all(|(a, w)| a.to_bits() == w.to_bits()),
             "{label}: final state differs from the row alone"
         );
     }
@@ -960,9 +876,7 @@ fn conv1d_varlen_rows_equal_each_row_alone_bit_for_bit() {
                 );
                 let sm = &soh[bi * c * hist..(bi + 1) * c * hist];
                 assert!(
-                    sm.iter()
-                        .zip(&so1.read_f32())
-                        .all(|(a, w)| a.to_bits() == w.to_bits()),
+                    sm.iter().zip(&so1.read_f32()).all(|(a, w)| a.to_bits() == w.to_bits()),
                     "{label}: state differs from the row alone"
                 );
             }
@@ -1125,12 +1039,7 @@ fn conv1d_prefill_then_decode_continues() {
                 );
             }
         }
-        assert_close(
-            "conv state",
-            &st1.read_f32()[..want_state.len()],
-            &want_state,
-            0.0,
-        );
+        assert_close("conv state", &st1.read_f32()[..want_state.len()], &want_state, 0.0);
     });
 }
 
@@ -1160,17 +1069,8 @@ fn conv1d_snapshot_state_is_shared_and_read_only() {
         .unwrap();
         rt.synchronize().unwrap();
         assert_close_rel("conv y", &y.read_f32()[..want.len()], &want, 1e-5, 1e-6);
-        assert_close(
-            "conv state",
-            &st.read_f32()[..want_state.len()],
-            &want_state,
-            0.0,
-        );
-        assert_eq!(
-            sb.read_f32()[..snap.len()],
-            snap[..],
-            "snapshot was written"
-        );
+        assert_close("conv state", &st.read_f32()[..want_state.len()], &want_state, 0.0);
+        assert_eq!(sb.read_f32()[..snap.len()], snap[..], "snapshot was written");
     });
 }
 
@@ -1183,23 +1083,14 @@ fn gated_rms_norm_f32_and_bf16() {
         let width = h * d;
         let (x_ld, x_off, z_ld, z_off) = (width + 3, 2usize, width + 11, 7usize);
         let x = random_f32(rows * x_ld, 600);
-        let z: Vec<f32> = random_f32(rows * z_ld, 601)
-            .iter()
-            .map(|v| v * 3.0)
-            .collect();
+        let z: Vec<f32> = random_f32(rows * z_ld, 601).iter().map(|v| v * 3.0).collect();
         let w: Vec<f32> = random_f32(d, 602).iter().map(|v| 1.0 + 0.2 * v).collect();
         let dense = |v: &[f32], ld: usize, off: usize| -> Vec<f32> {
             (0..rows)
                 .flat_map(|r| v[r * ld + off..r * ld + off + width].to_vec())
                 .collect()
         };
-        let want = gated_rms_norm_f64(
-            &dense(&x, x_ld, x_off),
-            &dense(&z, z_ld, z_off),
-            &w,
-            d,
-            1e-6,
-        );
+        let want = gated_rms_norm_f64(&dense(&x, x_ld, x_off), &dense(&z, z_ld, z_off), &w, d, 1e-6);
         let (xb, zb, wb) = (buf(rt, &x), buf(rt, &z), buf(rt, &w));
         let xc = Cols {
             buf: &xb,
@@ -1224,13 +1115,7 @@ fn gated_rms_norm_f32_and_bf16() {
         };
         qwen35::gated_rms_norm(rt, xc, zc, &wb, ob, rows as u32, h as u32, d as u32, 1e-6).unwrap();
         rt.synchronize().unwrap();
-        assert_close_rel(
-            "gated norm f32",
-            &out.read_f32()[..want.len()],
-            &want,
-            1e-5,
-            1e-6,
-        );
+        assert_close_rel("gated norm f32", &out.read_f32()[..want.len()], &want, 1e-5, 1e-6);
         let got = read_bf16(&outb, want.len());
         for (i, (&g, &w)) in got.iter().zip(&want).enumerate() {
             // One bf16 rounding of the f32 result: half an ulp of 2^-8, plus slack.
@@ -1272,10 +1157,7 @@ fn residual_add_is_the_exact_f32_sum_inside_its_windows() {
         let (y_ld, y_off) = (width + 7, 5usize);
         let (r_ld, r_off) = (width + 3, 2usize);
         let y: Vec<f32> = random_f32(rows * y_ld, 710).iter().map(|v| 1e3 * v).collect();
-        let mut resid: Vec<f32> = random_f32(rows * r_ld, 711)
-            .iter()
-            .map(|v| 1e-3 * v)
-            .collect();
+        let mut resid: Vec<f32> = random_f32(rows * r_ld, 711).iter().map(|v| 1e-3 * v).collect();
         // Padding columns carry a sentinel the kernel must not touch.
         for r in 0..rows {
             for c in (0..r_off).chain(r_off + width..r_ld) {
@@ -1310,26 +1192,14 @@ fn residual_add_is_the_exact_f32_sum_inside_its_windows() {
         }
 
         // Rejections: aliasing, a window past the buffer, and zero work.
-        expect_err(
-            qwen35::residual_add(rt, rc, rc, rows as u32, width as u32),
-            "resid",
-        );
+        expect_err(qwen35::residual_add(rt, rc, rc, rows as u32, width as u32), "resid");
         // One row too many: `y` is checked first.
         expect_err(
             qwen35::residual_add(rt, yc, rc, rows as u32 + 1, width as u32),
             "residual_add y",
         );
         expect_err(
-            qwen35::residual_add(
-                rt,
-                yc,
-                Cols {
-                    off: 4,
-                    ..rc
-                },
-                rows as u32,
-                width as u32,
-            ),
+            qwen35::residual_add(rt, yc, Cols { off: 4, ..rc }, rows as u32, width as u32),
             "residual_add resid",
         );
         qwen35::residual_add(rt, yc, rc, 0, width as u32).unwrap();
@@ -1354,8 +1224,7 @@ fn swiglu_f32_and_bf16_from_a_fused_gate_up_buffer() {
         let want: Vec<f64> = (0..rows)
             .flat_map(|r| {
                 let f = &fused;
-                (0..width)
-                    .map(move |c| silu(f[r * ld + g_off + c] as f64) * f[r * ld + u_off + c] as f64)
+                (0..width).map(move |c| silu(f[r * ld + g_off + c] as f64) * f[r * ld + u_off + c] as f64)
             })
             .collect();
         let fb = buf(rt, &fused);
@@ -1393,18 +1262,12 @@ fn swiglu_f32_and_bf16_from_a_fused_gate_up_buffer() {
         for r in 0..rows {
             let row = &all[r * o_ld..(r + 1) * o_ld];
             assert!(
-                row[..o_off]
-                    .iter()
-                    .chain(&row[o_off + width..])
-                    .all(|&x| x == SENTINEL),
+                row[..o_off].iter().chain(&row[o_off + width..]).all(|&x| x == SENTINEL),
                 "row {r}: wrote outside the output window"
             );
             got.extend_from_slice(&row[o_off..o_off + width]);
         }
-        assert!(
-            got.iter().all(|x| x.is_finite()),
-            "non-finite swiglu output"
-        );
+        assert!(got.iter().all(|x| x.is_finite()), "non-finite swiglu output");
         assert_close_rel("swiglu f32", &got, &want, 1e-6, 1e-7);
         // The bf16 store is the same f32 value rounded, element for element.
         // (Scoped: the host mapping must be released before the next encode.)
@@ -1455,14 +1318,7 @@ fn swiglu_f32_and_bf16_from_a_fused_gate_up_buffer() {
 
 // ------------------------------------------------------- attention extras ---
 
-fn attn_proj_rows(
-    layout: AttnProjLayout,
-    rows: usize,
-    q: &[f32],
-    k: &[f32],
-    v: &[f32],
-    gate: &[f32],
-) -> Vec<f32> {
+fn attn_proj_rows(layout: AttnProjLayout, rows: usize, q: &[f32], k: &[f32], v: &[f32], gate: &[f32]) -> Vec<f32> {
     let (hq, hkv, d) = (
         layout.q_heads() as usize,
         layout.kv_heads() as usize,
@@ -1572,11 +1428,7 @@ fn attn_qk_norm_rope_matches_transformers_golden() {
         assert_close("q", &qo, &load("rope_q_out").1, 4e-3);
         let kslot = &kc[pos as usize * d..(pos as usize + t) * d];
         assert_close("k", kslot, &load("rope_k_out").1, 4e-3);
-        assert_eq!(
-            &vc[pos as usize * d..(pos as usize + t) * d],
-            &v[..],
-            "v cache"
-        );
+        assert_eq!(&vc[pos as usize * d..(pos as usize + t) * d], &v[..], "v cache");
         assert!(
             kc[..pos as usize * d].iter().all(|&x| x == SENTINEL),
             "k cache written below pos"
@@ -1615,14 +1467,7 @@ fn attn_qk_norm_rope_small_positions_are_tight() {
                 let r = bi * t + ti;
                 let at = u64::from(pos) + ti as u64;
                 for h in 0..hq {
-                    let want = norm_rope_row_f64(
-                        &q[(r * hq + h) * d..(r * hq + h + 1) * d],
-                        &qw,
-                        rot,
-                        at,
-                        1e7,
-                        1e-6,
-                    );
+                    let want = norm_rope_row_f64(&q[(r * hq + h) * d..(r * hq + h + 1) * d], &qw, rot, at, 1e7, 1e-6);
                     assert_close(
                         &format!("q b{bi} t{ti} h{h}"),
                         &qo[(r * hq + h) * d..(r * hq + h + 1) * d],
@@ -1631,25 +1476,10 @@ fn attn_qk_norm_rope_small_positions_are_tight() {
                     );
                 }
                 for h in 0..hkv {
-                    let want = norm_rope_row_f64(
-                        &k[(r * hkv + h) * d..(r * hkv + h + 1) * d],
-                        &kw,
-                        rot,
-                        at,
-                        1e7,
-                        1e-6,
-                    );
+                    let want = norm_rope_row_f64(&k[(r * hkv + h) * d..(r * hkv + h + 1) * d], &kw, rot, at, 1e7, 1e-6);
                     let slot = ((bi * cap as usize + pos as usize + ti) * hkv + h) * d;
-                    assert_close(
-                        &format!("k b{bi} t{ti} h{h}"),
-                        &kc[slot..slot + d],
-                        &want,
-                        2e-5,
-                    );
-                    assert_eq!(
-                        &vc[slot..slot + d],
-                        &v[(r * hkv + h) * d..(r * hkv + h + 1) * d]
-                    );
+                    assert_close(&format!("k b{bi} t{ti} h{h}"), &kc[slot..slot + d], &want, 2e-5);
+                    assert_eq!(&vc[slot..slot + d], &v[(r * hkv + h) * d..(r * hkv + h + 1) * d]);
                 }
             }
         }
@@ -1662,19 +1492,9 @@ fn attn_output_gate_f32_bf16_and_in_place() {
         let (rows, hq, d) = (11usize, 3usize, 64usize);
         let width = hq * d;
         let layout = AttnProjLayout::new(hq as u32, 1, d as u32).unwrap();
-        let gate: Vec<f32> = random_f32(rows * width, 800)
-            .iter()
-            .map(|x| 4.0 * x)
-            .collect();
+        let gate: Vec<f32> = random_f32(rows * width, 800).iter().map(|x| 4.0 * x).collect();
         let zeros = vec![0.0f32; rows * width];
-        let p = attn_proj_rows(
-            layout,
-            rows,
-            &zeros,
-            &zeros[..rows * d],
-            &zeros[..rows * d],
-            &gate,
-        );
+        let p = attn_proj_rows(layout, rows, &zeros, &zeros[..rows * d], &zeros[..rows * d], &gate);
         let attn = random_f32(rows * width, 801);
         let want: Vec<f64> = attn
             .iter()
@@ -1736,13 +1556,7 @@ fn attn_output_gate_f32_bf16_and_in_place() {
         )
         .unwrap();
         rt.synchronize().unwrap();
-        assert_close_rel(
-            "gate in place",
-            &ab.read_f32()[..want.len()],
-            &want,
-            1e-5,
-            1e-7,
-        );
+        assert_close_rel("gate in place", &ab.read_f32()[..want.len()], &want, 1e-5, 1e-7);
     });
 }
 
@@ -1754,10 +1568,7 @@ fn score_answer_rows_f32_and_bf16() {
         let (rows, hidden, vocab) = (20usize, 300usize, 50usize);
         let h = random_f32(rows * hidden, 900);
         let nw: Vec<f32> = random_f32(hidden, 901).iter().map(|x| 0.1 * x).collect();
-        let emb: Vec<f32> = random_f32(vocab * hidden, 902)
-            .iter()
-            .map(|x| 0.05 * x)
-            .collect();
+        let emb: Vec<f32> = random_f32(vocab * hidden, 902).iter().map(|x| 0.05 * x).collect();
         let answers: Vec<u32> = (0..17).map(|i| (i * 7 + 3) % vocab as u32).collect();
         let slots = [3u32, 19, 0, 7];
         let (hb, nwb) = (buf(rt, &h), buf(rt, &nw));
@@ -1768,10 +1579,7 @@ fn score_answer_rows_f32_and_bf16() {
                     let bits = f32_slice_to_bf16(&emb);
                     let b = rt.alloc_buffer(bits.len() * 2).unwrap();
                     b.write_bf16_bits(&bits);
-                    (
-                        b,
-                        bits.into_iter().map(bf16_bits_to_f32).collect::<Vec<_>>(),
-                    )
+                    (b, bits.into_iter().map(bf16_bits_to_f32).collect::<Vec<_>>())
                 }
                 _ => (buf(rt, &emb), emb.clone()),
             };
@@ -1821,13 +1629,7 @@ fn score_answer_rows_f32_and_bf16() {
                     1e-5,
                     1e-5,
                 );
-                assert_close_rel(
-                    &format!("{dtype:?} logprobs slot {slot}"),
-                    &gp[r],
-                    &wp,
-                    1e-5,
-                    1e-5,
-                );
+                assert_close_rel(&format!("{dtype:?} logprobs slot {slot}"), &gp[r], &wp, 1e-5, 1e-5);
             }
         }
     });
@@ -1878,12 +1680,7 @@ fn score_out_of_range_indices_score_nan_and_spare_the_rest() {
         // Slot 1 is valid; its middle answer id is past the vocabulary. That
         // entry is NaN, and the other two are scored as a two-way softmax, not
         // poisoned by it.
-        assert!(
-            l[4].is_nan() && p[4].is_nan(),
-            "bad answer: {} {}",
-            l[4],
-            p[4]
-        );
+        assert!(l[4].is_nan() && p[4].is_nan(), "bad answer: {} {}", l[4], p[4]);
         let rows_e: Vec<&[f32]> = [1usize, 2]
             .iter()
             .map(|&a| &emb[a * hidden..(a + 1) * hidden])
@@ -1926,10 +1723,7 @@ fn fused_projection_equals_the_separate_linears() {
                         .map(|k| f64::from(x[r * hidden + k]) * f64::from(part[j * hidden + k]))
                         .sum();
                     let g = f64::from(got[r * total + col0 + j]);
-                    assert!(
-                        (g - want).abs() < 1e-4,
-                        "part col {j} row {r}: {g} vs {want}"
-                    );
+                    assert!((g - want).abs() < 1e-4, "part col {j} row {r}: {g} vs {want}");
                 }
             }
             col0 += o;
@@ -1985,25 +1779,10 @@ fn gdn_state_out_discarded_and_in_place_on_both_paths() {
         let (want_y, want_s) = gdn_f64(&d.problem());
         for path in [Path::Chunk, Path::Recurrent] {
             let (y, _) = run_gdn_with(rt, &d, path, StateOut::Discard);
-            assert_close(
-                &format!("{path:?} discard y"),
-                &y,
-                &want_y,
-                rel_bound(&want_y),
-            );
+            assert_close(&format!("{path:?} discard y"), &y, &want_y, rel_bound(&want_y));
             let (y, st) = run_gdn_with(rt, &d, path, StateOut::InPlace);
-            assert_close(
-                &format!("{path:?} in-place y"),
-                &y,
-                &want_y,
-                rel_bound(&want_y),
-            );
-            assert_close(
-                &format!("{path:?} in-place state"),
-                &st,
-                &want_s,
-                rel_bound(&want_s),
-            );
+            assert_close(&format!("{path:?} in-place y"), &y, &want_y, rel_bound(&want_y));
+            assert_close(&format!("{path:?} in-place state"), &st, &want_s, rel_bound(&want_s));
         }
     });
 }
@@ -2023,13 +1802,7 @@ fn empty_sequence_copies_the_state_through() {
         let mut d = GdnData::random(GdnShape { t: 1, ..s }, "batch", 1300);
         d.s = s;
         (d.q, d.k, d.v, d.a, d.b) = (vec![], vec![], vec![], vec![], vec![]);
-        let want: Vec<f64> = d
-            .state0
-            .as_ref()
-            .unwrap()
-            .iter()
-            .map(|&x| f64::from(x))
-            .collect();
+        let want: Vec<f64> = d.state0.as_ref().unwrap().iter().map(|&x| f64::from(x)).collect();
         for path in [Path::Chunk, Path::Recurrent] {
             let (y, st) = run_gdn_with(rt, &d, path, StateOut::Separate);
             assert!(y.is_empty());
@@ -2037,15 +1810,8 @@ fn empty_sequence_copies_the_state_through() {
         }
         let (c, kw) = (64usize, 4usize);
         let snap = random_f32(c * (kw - 1), 1301);
-        let (xb, wb, sb) = (
-            seeded(rt, 1, 0.0),
-            buf(rt, &random_f32(c * kw, 1302)),
-            buf(rt, &snap),
-        );
-        let (y, st) = (
-            seeded(rt, 1, SENTINEL),
-            seeded(rt, 3 * c * (kw - 1), SENTINEL),
-        );
+        let (xb, wb, sb) = (seeded(rt, 1, 0.0), buf(rt, &random_f32(c * kw, 1302)), buf(rt, &snap));
+        let (y, st) = (seeded(rt, 1, SENTINEL), seeded(rt, 3 * c * (kw - 1), SENTINEL));
         qwen35::conv1d_silu(
             rt,
             Cols::dense(&xb, c as u32),
@@ -2095,10 +1861,7 @@ fn a_whole_gdn_layer_through_the_layout_helpers() {
         let refs: Vec<&[f32]> = parts.iter().map(|p| p.as_slice()).collect();
         let packed = qwen35::pack_linear_weights_f32(&refs, &widths, hidden).unwrap();
         let x = random_f32(t * hidden, 1410);
-        let conv_w: Vec<f32> = random_f32(conv_dim * kw, 1411)
-            .iter()
-            .map(|v| v * 0.5)
-            .collect();
+        let conv_w: Vec<f32> = random_f32(conv_dim * kw, 1411).iter().map(|v| v * 0.5).collect();
         let a_log = vec![-1.0f32, 0.5];
         let dt_bias = vec![-4.0f32, -2.0];
         let norm_w: Vec<f32> = random_f32(32, 1412).iter().map(|v| 1.0 + 0.1 * v).collect();
@@ -2155,18 +1918,7 @@ fn a_whole_gdn_layer_through_the_layout_helpers() {
             cols: Cols::dense(&y, 64),
             dtype: DType::F32,
         };
-        qwen35::gated_rms_norm(
-            rt,
-            Cols::dense(&o, 64),
-            layout.z(proj),
-            &nwb,
-            yc,
-            t as u32,
-            2,
-            32,
-            1e-6,
-        )
-        .unwrap();
+        qwen35::gated_rms_norm(rt, Cols::dense(&o, 64), layout.z(proj), &nwb, yc, t as u32, 2, 32, 1e-6).unwrap();
         rt.synchronize().unwrap();
 
         // --- f64 ---
@@ -2218,13 +1970,7 @@ fn a_whole_gdn_layer_through_the_layout_helpers() {
         let of: Vec<f32> = o64.iter().map(|&v| v as f32).collect();
         let want = gated_rms_norm_f64(&of, &cols(layout.z_off() as usize, 64), &norm_w, 32, 1e-6);
         let got = y.read_f32();
-        assert_close_rel(
-            "layer output",
-            &got[..want.len()],
-            &want,
-            1e-3,
-            1e-4 * max_abs(&want),
-        );
+        assert_close_rel("layer output", &got[..want.len()], &want, 1e-3, 1e-4 * max_abs(&want));
     });
 }
 
@@ -2233,10 +1979,7 @@ fn a_whole_gdn_layer_through_the_layout_helpers() {
 fn expect_err(r: Result<(), String>, needle: &str) {
     match r {
         Ok(()) => panic!("expected an error containing {needle:?}, got Ok"),
-        Err(e) => assert!(
-            e.contains(needle),
-            "expected an error containing {needle:?}, got {e:?}"
-        ),
+        Err(e) => assert!(e.contains(needle), "expected an error containing {needle:?}, got {e:?}"),
     }
 }
 
@@ -2263,31 +2006,13 @@ fn host_rejects_what_the_kernels_cannot_do() {
                      out: Cols<'_>,
                      so: Option<&GpuBuffer>,
                      ws: &GdnWorkspace| {
-            qwen35::gdn_chunk_forward(
-                rt,
-                &dims,
-                &qkv,
-                &p.gates(2),
-                &p.params(),
-                state,
-                ws,
-                out,
-                so,
-            )
+            qwen35::gdn_chunk_forward(rt, &dims, &qkv, &p.gates(2), &p.params(), state, ws, out, so)
         };
         let o = Cols::dense(&out, 64);
-        chunk(good, p.qkv(), StateIn::PerBatch(&st), o, Some(&st), &ws)
-            .expect("in-place per-batch state is allowed");
+        chunk(good, p.qkv(), StateIn::PerBatch(&st), o, Some(&st), &ws).expect("in-place per-batch state is allowed");
 
         expect_err(
-            chunk(
-                GdnDims { v_dim: 48, ..good },
-                p.qkv(),
-                StateIn::Zero,
-                o,
-                None,
-                &ws,
-            ),
+            chunk(GdnDims { v_dim: 48, ..good }, p.qkv(), StateIn::Zero, o, None, &ws),
             "multiple of 32",
         );
         expect_err(
@@ -2307,14 +2032,7 @@ fn host_rejects_what_the_kernels_cannot_do() {
         );
         let small = GdnWorkspace::new(rt, &GdnDims { seq: 1, ..good }).unwrap();
         expect_err(
-            chunk(
-                GdnDims { seq: 70, ..good },
-                p.qkv(),
-                StateIn::Zero,
-                o,
-                None,
-                &small,
-            ),
+            chunk(GdnDims { seq: 70, ..good }, p.qkv(), StateIn::Zero, o, None, &small),
             "GdnWorkspace k",
         );
         // Dims that pass `GdnDims::validate` but whose workspace size overflows
@@ -2347,39 +2065,19 @@ fn host_rejects_what_the_kernels_cannot_do() {
         );
         let tiny = seeded(rt, 10, 0.0);
         expect_err(
-            chunk(
-                good,
-                p.qkv(),
-                StateIn::Zero,
-                Cols::dense(&tiny, 64),
-                None,
-                &ws,
-            ),
+            chunk(good, p.qkv(), StateIn::Zero, Cols::dense(&tiny, 64), None, &ws),
             "gdn out",
         );
-        let qkv_as_out = GdnQkv {
-            buf: &out,
-            ..p.qkv()
-        };
+        let qkv_as_out = GdnQkv { buf: &out, ..p.qkv() };
         expect_err(
             chunk(good, qkv_as_out, StateIn::Zero, o, None, &ws),
             "out overlaps read-only buffer qkv",
         );
         // In place, the state must still be disjoint from every input.
         let big = buf(rt, &random_f32(2 * DK * 32, 1104));
-        let qkv_in_state = GdnQkv {
-            buf: &big,
-            ..p.qkv()
-        };
+        let qkv_in_state = GdnQkv { buf: &big, ..p.qkv() };
         expect_err(
-            chunk(
-                good,
-                qkv_in_state,
-                StateIn::PerBatch(&big),
-                o,
-                Some(&big),
-                &ws,
-            ),
+            chunk(good, qkv_in_state, StateIn::PerBatch(&big), o, Some(&big), &ws),
             "state (in place) overlaps read-only buffer qkv",
         );
         expect_err(
@@ -2416,18 +2114,7 @@ fn host_rejects_what_the_kernels_cannot_do() {
             "state_out overlaps read-only buffer state_in",
         );
         expect_err(
-            qwen35::conv1d_silu(
-                rt,
-                Cols::dense(&x, 64),
-                &w,
-                9,
-                StateIn::Zero,
-                &y,
-                None,
-                1,
-                3,
-                64,
-            ),
+            qwen35::conv1d_silu(rt, Cols::dense(&x, 64), &w, 9, StateIn::Zero, &y, None, 1, 3, 64),
             "kernel_width must be 2..=8",
         );
 
@@ -2450,17 +2137,7 @@ fn host_rejects_what_the_kernels_cannot_do() {
             v_cache: &vc,
         };
         let rope = |shape: &AttnShape, t: &AttnTargets<'_>, pos: u32| {
-            qwen35::attn_qk_norm_rope(
-                rt,
-                shape,
-                Cols::dense(&pb, 256),
-                &nw,
-                &nw,
-                t,
-                pos,
-                1e4,
-                1e-6,
-            )
+            qwen35::attn_qk_norm_rope(rt, shape, Cols::dense(&pb, 256), &nw, &nw, t, pos, 1e4, 1e-6)
         };
         expect_err(rope(&shape, &targets, 0), "rotary_dim must be even");
         let shape = AttnShape {
@@ -2474,10 +2151,7 @@ fn host_rejects_what_the_kernels_cannot_do() {
             v_cache: &vc3,
             ..targets
         };
-        expect_err(
-            rope(&shape, &uneven, 0),
-            "K and V imply different fixed capacities",
-        );
+        expect_err(rope(&shape, &uneven, 0), "K and V imply different fixed capacities");
 
         expect_err(
             qwen35::gated_rms_norm(
@@ -2521,9 +2195,7 @@ fn host_rejects_what_the_kernels_cannot_do() {
             vocab: 4,
         };
         let score = |rows: u32, head: LmHead<'_>, n_ans: u32| {
-            qwen35::score_answer_rows(
-                rt, &x, rows, 64, &slots, 1, &nw, 1.0, 1e-6, head, &ans, n_ans, &lg, &lp,
-            )
+            qwen35::score_answer_rows(rt, &x, rows, 64, &slots, 1, &nw, 1.0, 1e-6, head, &ans, n_ans, &lg, &lp)
         };
         score(3, head, 2).expect("a valid scoring call");
         expect_err(score(0, head, 2), "rows and vocab must be non-zero");
@@ -2560,10 +2232,7 @@ fn attention_layer_through_flash_attn_rows() {
         let q = random_f32(b * t * hq * d, 1500);
         let k = random_f32(b * t * hkv * d, 1501);
         let v = random_f32(b * t * hkv * d, 1502);
-        let gate: Vec<f32> = random_f32(b * t * hq * d, 1503)
-            .iter()
-            .map(|x| 3.0 * x)
-            .collect();
+        let gate: Vec<f32> = random_f32(b * t * hq * d, 1503).iter().map(|x| 3.0 * x).collect();
         let qw: Vec<f32> = random_f32(d, 1504).iter().map(|x| 0.1 * x).collect();
         let kw: Vec<f32> = random_f32(d, 1505).iter().map(|x| 0.1 * x).collect();
         let p = attn_proj_rows(layout, b * t, &q, &k, &v, &gate);
@@ -2595,18 +2264,7 @@ fn attention_layer_through_flash_attn_rows() {
             rotary_dim: rot as u32,
         };
         let pc = Cols::dense(&pb, layout.width());
-        qwen35::attn_qk_norm_rope(
-            rt,
-            &shape,
-            pc,
-            &qwb,
-            &kwb,
-            &targets,
-            prefix as u32,
-            1e7,
-            1e-6,
-        )
-        .unwrap();
+        qwen35::attn_qk_norm_rope(rt, &shape, pc, &qwb, &kwb, &targets, prefix as u32, 1e7, 1e-6).unwrap();
         let o = seeded(rt, b * t * hq * d, SENTINEL);
         let scale = 1.0 / (d as f32).sqrt();
         let (tkv, qpos, kvpos) = (
@@ -2622,10 +2280,7 @@ fn attention_layer_through_flash_attn_rows() {
             window: 0,
             scale,
         };
-        tessl::nn::flash_attn_rows(
-            rt, &q_out, &kc, &vc, &o, &tkv, &qpos, &kvpos, dims, d as u32, false,
-        )
-        .unwrap();
+        tessl::nn::flash_attn_rows(rt, &q_out, &kc, &vc, &o, &tkv, &qpos, &kvpos, dims, d as u32, false).unwrap();
         let out = seeded(rt, b * t * hq * d, SENTINEL);
         let oc = OutCols {
             cols: Cols::dense(&out, (hq * d) as u32),
@@ -2658,13 +2313,9 @@ fn attention_layer_through_flash_attn_rows() {
                 let at = prefix + ti;
                 for h in 0..hq {
                     let r = (bi * t + ti) * hq + h;
-                    let qv =
-                        norm_rope_row_f64(&q[r * d..(r + 1) * d], &qw, rot, at as u64, 1e7, 1e-6);
+                    let qv = norm_rope_row_f64(&q[r * d..(r + 1) * d], &qw, rot, at as u64, 1e7, 1e-6);
                     let scores: Vec<f64> = (0..=at)
-                        .map(|s| {
-                            key(s).iter().zip(&qv).map(|(a, b)| a * b).sum::<f64>()
-                                * f64::from(scale)
-                        })
+                        .map(|s| key(s).iter().zip(&qv).map(|(a, b)| a * b).sum::<f64>() * f64::from(scale))
                         .collect();
                     let mx = scores.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
                     let w: Vec<f64> = scores.iter().map(|s| (s - mx).exp()).collect();
@@ -2681,13 +2332,7 @@ fn attention_layer_through_flash_attn_rows() {
                 }
             }
         }
-        assert_close_rel(
-            "gated attention",
-            &out.read_f32()[..want.len()],
-            &want,
-            1e-4,
-            1e-5,
-        );
+        assert_close_rel("gated attention", &out.read_f32()[..want.len()], &want, 1e-4, 1e-5);
     });
 }
 
@@ -2713,15 +2358,9 @@ fn attn_qk_norm_rope_posbuf_matches_the_scalar_variant_step_by_step() {
         let (kc_b, vc_b) = (seeded(rt, cache, SENTINEL), seeded(rt, cache, SENTINEL));
         let pos_buf = buf_u32(rt, &[0]);
         for step in 0..4u32 {
-            let p = buf(
-                rt,
-                &random_f32(b * layout.width() as usize, 1610 + u64::from(step)),
-            );
+            let p = buf(rt, &random_f32(b * layout.width() as usize, 1610 + u64::from(step)));
             let pc = Cols::dense(&p, layout.width());
-            let (qa, qb) = (
-                seeded(rt, b * hq * d, SENTINEL),
-                seeded(rt, b * hq * d, SENTINEL),
-            );
+            let (qa, qb) = (seeded(rt, b * hq * d, SENTINEL), seeded(rt, b * hq * d, SENTINEL));
             let ta = AttnTargets {
                 q_out: &qa,
                 k_cache: &kc_a,
@@ -2734,8 +2373,7 @@ fn attn_qk_norm_rope_posbuf_matches_the_scalar_variant_step_by_step() {
             };
             pos_buf.write_u32(&[3 + step]);
             qwen35::attn_qk_norm_rope(rt, &shape, pc, &qw, &kw, &ta, 3 + step, 1e7, 1e-6).unwrap();
-            qwen35::attn_qk_norm_rope_posbuf(rt, &shape, pc, &qw, &kw, &tb, &pos_buf, 1e7, 1e-6)
-                .unwrap();
+            qwen35::attn_qk_norm_rope_posbuf(rt, &shape, pc, &qw, &kw, &tb, &pos_buf, 1e7, 1e-6).unwrap();
             // The host rewrites the position next step: the GPU must be done.
             rt.synchronize().unwrap();
             assert_eq!(qa.read_f32(), qb.read_f32(), "q at step {step}");
@@ -2765,11 +2403,7 @@ fn attn_qk_norm_rope_posbuf_matches_the_scalar_variant_step_by_step() {
         )
         .unwrap();
         rt.synchronize().unwrap();
-        assert_eq!(
-            kc_b.read_f32(),
-            before,
-            "an out-of-range position wrote the cache"
-        );
+        assert_eq!(kc_b.read_f32(), before, "an out-of-range position wrote the cache");
         assert!(
             q.read_f32().iter().all(|&x| x == SENTINEL),
             "an out-of-range position wrote q"
@@ -2798,10 +2432,7 @@ fn pfx_dims(batch: usize, tq: usize) -> tessl::nn::AttnDims {
 /// Output words as bits: `f32` words, or the bf16 halves when `bf16`.
 fn out_bits(o: &GpuBuffer, n: usize, bf16: bool) -> Vec<u32> {
     if bf16 {
-        o.contents_u16()[..n]
-            .iter()
-            .map(|&x| u32::from(x))
-            .collect()
+        o.contents_u16()[..n].iter().map(|&x| u32::from(x)).collect()
     } else {
         o.read_f32()[..n].iter().map(|x| x.to_bits()).collect()
     }
@@ -2864,8 +2495,7 @@ fn prefix_case(
             len: p as u32,
         };
         if decode {
-            qwen35::attn_prefix_decode(rt, &q, prefix, &skb, &svb, &slen, &qpos, &got, dims, bf16)
-                .unwrap();
+            qwen35::attn_prefix_decode(rt, &q, prefix, &skb, &svb, &slen, &qpos, &got, dims, bf16).unwrap();
             tessl::nn::flash_attn_decode(
                 rt,
                 &q,
@@ -2882,22 +2512,9 @@ fn prefix_case(
             )
             .unwrap();
         } else {
-            qwen35::attn_prefix_rows(rt, &q, prefix, &skb, &svb, &slen, &qpos, &got, dims, bf16)
+            qwen35::attn_prefix_rows(rt, &q, prefix, &skb, &svb, &slen, &qpos, &got, dims, bf16).unwrap();
+            tessl::nn::flash_attn_rows(rt, &q, &fkb, &fvb, &want, &tkv, &qpos, &zero, dims, PFX_D as u32, bf16)
                 .unwrap();
-            tessl::nn::flash_attn_rows(
-                rt,
-                &q,
-                &fkb,
-                &fvb,
-                &want,
-                &tkv,
-                &qpos,
-                &zero,
-                dims,
-                PFX_D as u32,
-                bf16,
-            )
-            .unwrap();
         }
         rt.synchronize().unwrap();
         let path = if decode { "decode" } else { "rows" };
@@ -2906,24 +2523,15 @@ fn prefix_case(
         for (i, (&gi, &wi)) in g.iter().zip(&w).enumerate() {
             // A half of SENTINEL can be a real bf16 value, so unwritten
             // elements are checked on the f32 pass, which writes the same set.
-            assert!(
-                bf16 || gi != SENTINEL.to_bits(),
-                "{label}[{i}]: never written"
-            );
-            assert_eq!(
-                gi, wi,
-                "{label}[{i}]: shared prefix {gi:#x} vs copied prefix {wi:#x}"
-            );
+            assert!(bf16 || gi != SENTINEL.to_bits(), "{label}[{i}]: never written");
+            assert_eq!(gi, wi, "{label}[{i}]: shared prefix {gi:#x} vs copied prefix {wi:#x}");
         }
         let finite = if bf16 {
             read_bf16(&got, n).iter().all(|x| x.is_finite())
         } else {
             got.read_f32()[..n].iter().all(|x| x.is_finite())
         };
-        assert!(
-            finite,
-            "{label}: read a poisoned K/V slot past a live length"
-        );
+        assert!(finite, "{label}: read a poisoned K/V slot past a live length");
     }
 }
 
@@ -3072,19 +2680,7 @@ fn attn_prefix_rows_continue_a_prefix_written_by_attn_qk_norm_rope_suffix() {
             v: &pv,
             len: p as u32,
         };
-        qwen35::attn_prefix_rows(
-            rt,
-            &sq,
-            prefix,
-            &sk,
-            &sv,
-            &slen,
-            &qpos,
-            &got,
-            pfx_dims(b, t),
-            false,
-        )
-        .unwrap();
+        qwen35::attn_prefix_rows(rt, &sq, prefix, &sk, &sv, &slen, &qpos, &got, pfx_dims(b, t), false).unwrap();
 
         // Reference: every row's whole sequence through attn_qk_norm_rope.
         let mut full_proj = Vec::with_capacity(b * (p + t) * w);
@@ -3148,22 +2744,13 @@ fn attn_prefix_rows_continue_a_prefix_written_by_attn_qk_norm_rope_suffix() {
         let (g, w) = (got.read_f32(), want.read_f32());
         for i in 0..n {
             assert!(g[i] != SENTINEL, "attention[{i}]: never written");
-            assert_eq!(
-                g[i].to_bits(),
-                w[i].to_bits(),
-                "attention[{i}]: {} vs {}",
-                g[i],
-                w[i]
-            );
+            assert_eq!(g[i].to_bits(), w[i].to_bits(), "attention[{i}]: {} vs {}", g[i], w[i]);
         }
         // The slots past the live suffix were never written.
         let sk_host = sk.read_f32();
         for bi in 0..b {
             let dead = &sk_host[(bi * s_cap + t) * row..(bi + 1) * s_cap * row];
-            assert!(
-                dead.iter().all(|&x| x == SENTINEL),
-                "row {bi} wrote past its suffix"
-            );
+            assert!(dead.iter().all(|&x| x == SENTINEL), "row {bi} wrote past its suffix");
         }
     });
 }
@@ -3210,20 +2797,14 @@ fn attn_qk_norm_rope_suffix_posbuf_matches_the_scalar_suffix_writer_step_by_step
                 k_cache: &sk,
                 v_cache: &sv,
             };
-            qwen35::attn_qk_norm_rope_suffix(
-                rt, &shape, pc, &qwb, &kwb, &scalar, p, step, 1e7, 1e-6,
-            )
-            .unwrap();
+            qwen35::attn_qk_norm_rope_suffix(rt, &shape, pc, &qwb, &kwb, &scalar, p, step, 1e7, 1e-6).unwrap();
             pos.write_u32(&[p + step]);
             let buffered = AttnTargets {
                 q_out: &bq,
                 k_cache: &bk,
                 v_cache: &bv,
             };
-            qwen35::attn_qk_norm_rope_suffix_posbuf(
-                rt, &shape, pc, &qwb, &kwb, &buffered, p, &pos, 1e7, 1e-6,
-            )
-            .unwrap();
+            qwen35::attn_qk_norm_rope_suffix_posbuf(rt, &shape, pc, &qwb, &kwb, &buffered, p, &pos, 1e7, 1e-6).unwrap();
             rt.synchronize().unwrap();
             for (name, x, y) in [("q", &sq, &bq), ("k", &sk, &bk), ("v", &sv, &bv)] {
                 let (x, y) = (x.read_f32(), y.read_f32());
@@ -3319,15 +2900,8 @@ fn prefix_varlen_case(
     let got = got.read_f32();
     for (bi, &(len, q_pos)) in rows.iter().enumerate() {
         let one = |v: &[f32], per: usize| buf(rt, &v[bi * per..(bi + 1) * per]);
-        let (q1, sk1, sv1) = (
-            one(&q_host, per_q),
-            one(&sk, s_cap * row),
-            one(&sv, s_cap * row),
-        );
-        let (l1, p1) = (
-            buf_u32(rt, &[len.min(s_cap) as u32]),
-            buf_u32(rt, &[q_pos as u32]),
-        );
+        let (q1, sk1, sv1) = (one(&q_host, per_q), one(&sk, s_cap * row), one(&sv, s_cap * row));
+        let (l1, p1) = (buf_u32(rt, &[len.min(s_cap) as u32]), buf_u32(rt, &[q_pos as u32]));
         let want = seeded(rt, per_q, SENTINEL);
         let d1 = pfx_dims(1, tq);
         if decode {
@@ -3359,22 +2933,11 @@ fn attn_prefix_varlen_rows_equal_each_row_alone_bit_for_bit() {
     // one past the capacity (clamped).
     with_gpu(|rt| {
         let p = 130;
-        let rows_prefill: Vec<(usize, usize)> = [0usize, 1, 63, 64, 65, 70, 90]
-            .iter()
-            .map(|&l| (l, p))
-            .collect();
+        let rows_prefill: Vec<(usize, usize)> = [0usize, 1, 63, 64, 65, 70, 90].iter().map(|&l| (l, p)).collect();
         prefix_varlen_case(rt, false, p, 70, 66, &rows_prefill, 8000);
         // Queries at different positions in one call (as after a ragged
         // prefill), including one inside the prefix and one past every key.
-        prefix_varlen_case(
-            rt,
-            false,
-            p,
-            8,
-            3,
-            &[(5, 132), (2, 10), (8, 200), (0, 129)],
-            8020,
-        );
+        prefix_varlen_case(rt, false, p, 8, 3, &[(5, 132), (2, 10), (8, 200), (0, 129)], 8020);
         // Decode: each row's one query at its own next position.
         let rows_decode: Vec<(usize, usize)> = [1usize, 2, 126, 127, 128, 129, 200, 250, 300]
             .iter()
@@ -3474,9 +3037,7 @@ fn attn_qk_norm_rope_suffix_rows_equal_each_row_alone_bit_for_bit() {
             ] {
                 let mine = &all[bi * per..(bi + 1) * per];
                 assert!(
-                    mine.iter()
-                        .zip(&alone[..per])
-                        .all(|(a, c)| a.to_bits() == c.to_bits()),
+                    mine.iter().zip(&alone[..per]).all(|(a, c)| a.to_bits() == c.to_bits()),
                     "row {bi} at {at}: {name} differs from the row alone"
                 );
             }
@@ -3487,10 +3048,7 @@ fn attn_qk_norm_rope_suffix_rows_equal_each_row_alone_bit_for_bit() {
         let slot = |bi: usize, s: usize| &kh[(bi * cap + s) * row..(bi * cap + s + 1) * row];
         let written = |bi: usize, s: usize| slot(bi, s).iter().all(|&x| x != SENTINEL);
         let empty = |bi: usize, s: usize| slot(bi, s).iter().all(|&x| x == SENTINEL);
-        assert!(
-            written(3, 0) && (1..cap).all(|s| empty(3, s)),
-            "row 3 slots"
-        );
+        assert!(written(3, 0) && (1..cap).all(|s| empty(3, s)), "row 3 slots");
         assert!((0..cap).all(|s| empty(4, s)), "row 4 slots");
         assert!(
             (0..4).all(|s| empty(2, s)) && written(2, 4) && written(2, 5),
@@ -3506,10 +3064,7 @@ fn attn_prefix_rows_rejects_bad_shapes_and_aliases() {
         let row = PFX_HKV * PFX_D;
         let n = b * tq * PFX_HQ * PFX_D;
         let q = buf(rt, &random_f32(n, 7700));
-        let (pk, pv) = (
-            buf(rt, &random_f32(p * row, 7701)),
-            buf(rt, &random_f32(p * row, 7702)),
-        );
+        let (pk, pv) = (buf(rt, &random_f32(p * row, 7701)), buf(rt, &random_f32(p * row, 7702)));
         let (sk, sv) = (
             buf(rt, &random_f32(b * s_cap * row, 7703)),
             buf(rt, &random_f32(b * s_cap * row, 7704)),
@@ -3531,10 +3086,7 @@ fn attn_prefix_rows_rejects_bad_shapes_and_aliases() {
             len: p as u32 + 1,
             ..prefix
         };
-        expect_err(
-            run(too_long, &o, pfx_dims(b, tq)),
-            "exceeds the prefix K/V capacity",
-        );
+        expect_err(run(too_long, &o, pfx_dims(b, tq)), "exceeds the prefix K/V capacity");
         // Writing the output over the shared prefix would corrupt every row.
         // K and V of one capacity, so only the alias can be what fails.
         let pk_as_o = seeded(rt, n, SENTINEL);
@@ -3556,14 +3108,8 @@ fn attn_prefix_rows_rejects_bad_shapes_and_aliases() {
         let decode = |prefix: qwen35::SharedPrefix<'_>, dims: tessl::nn::AttnDims| {
             qwen35::attn_prefix_decode(rt, &q, prefix, &sk, &sv, &slen, &qpos, &o, dims, false)
         };
-        expect_err(
-            decode(prefix, pfx_dims(b, tq)),
-            "one query per row (tq = 1)",
-        );
-        expect_err(
-            decode(too_long, pfx_dims(b, 1)),
-            "exceeds the prefix K/V capacity",
-        );
+        expect_err(decode(prefix, pfx_dims(b, tq)), "one query per row (tq = 1)");
+        expect_err(decode(too_long, pfx_dims(b, 1)), "exceeds the prefix K/V capacity");
         // The suffix writer: positions past the suffix cache, and a position
         // that overflows u32.
         let layout = AttnProjLayout::new(PFX_HQ as u32, PFX_HKV as u32, PFX_D as u32).unwrap();
@@ -3631,17 +3177,7 @@ fn attn_prefix_rows_rejects_bad_shapes_and_aliases() {
         };
         let pos0 = buf_u32(rt, &[0]);
         expect_err(
-            qwen35::attn_qk_norm_rope_posbuf(
-                rt,
-                &shape,
-                Cols::dense(&proj, w),
-                &qwb,
-                &kwb,
-                &tiny,
-                &pos0,
-                1e7,
-                1e-6,
-            ),
+            qwen35::attn_qk_norm_rope_posbuf(rt, &shape, Cols::dense(&proj, w), &qwb, &kwb, &tiny, &pos0, 1e7, 1e-6),
             "capacity 0",
         );
         suffix(1000, 1).unwrap();
@@ -3677,19 +3213,12 @@ fn embed_rows_equals_the_host_gather_bit_for_bit() {
         for (r, &id) in ids.iter().enumerate() {
             let row = &got[r * hidden..(r + 1) * hidden];
             if bad.contains(&id) {
-                assert!(
-                    row.iter().all(|x| x.is_nan()),
-                    "row {r}: id {id} is not NaN"
-                );
+                assert!(row.iter().all(|x| x.is_nan()), "row {r}: id {id} is not NaN");
                 continue;
             }
             let want = &bits[id as usize * hidden..(id as usize + 1) * hidden];
             for (c, (g, &w)) in row.iter().zip(want).enumerate() {
-                assert_eq!(
-                    g.to_bits(),
-                    bf16_bits_to_f32(w).to_bits(),
-                    "row {r} (id {id}) col {c}"
-                );
+                assert_eq!(g.to_bits(), bf16_bits_to_f32(w).to_bits(), "row {r} (id {id}) col {c}");
             }
         }
         // Nothing to gather is a clean no-op that writes nothing.
@@ -3705,7 +3234,11 @@ fn embed_rows_equals_the_host_gather_bit_for_bit() {
         wide[523 * hidden + 2] = f32::from_bits(1);
         let wide_table = rt.alloc_buffer(wide.len() * 4).unwrap();
         wide_table.write_f32(&wide);
-        let f32_head = LmHead { weight: &wide_table, dtype: DType::F32, vocab: vocab as u32 };
+        let f32_head = LmHead {
+            weight: &wide_table,
+            dtype: DType::F32,
+            vocab: vocab as u32,
+        };
         let out32 = seeded(rt, n * hidden, SENTINEL);
         qwen35::embed_rows(rt, &idb, n as u32, f32_head, hidden as u32, &out32).unwrap();
         rt.synchronize().unwrap();
@@ -3792,11 +3325,7 @@ fn causal_attn_f64(
                     .iter()
                     .map(|&s| {
                         let kr = &k[((b * cap + s) * hkv + g) * d..][..d];
-                        scale
-                            * qr.iter()
-                                .zip(kr)
-                                .map(|(&a, &c)| a as f64 * c as f64)
-                                .sum::<f64>()
+                        scale * qr.iter().zip(kr).map(|(&a, &c)| a as f64 * c as f64).sum::<f64>()
                     })
                     .collect();
                 let m = scores.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
@@ -3899,10 +3428,7 @@ fn attn_prefill_matches_an_f64_reference_as_closely_as_flash_attn_rows() {
             let s = scalar.read_f32();
             let es = max_err(&s[..n], &want);
             for tile in qwen35::AttnTile::ALL {
-                let label = format!(
-                    "{} B{batch} Tq{tq} Tkv{tkv}/{cap} q@{q_off} k@{kv_off}",
-                    tile.label()
-                );
+                let label = format!("{} B{batch} Tq{tq} Tkv{tkv}/{cap} q@{q_off} k@{kv_off}", tile.label());
                 let bufs = (&qb, &kb, &vb);
                 let scalars = (&tkvb, &qpos, &kvpos);
                 let tiled = run_tiled(rt, bufs, scalars, dims, n, false, tile);
@@ -3930,10 +3456,7 @@ fn attn_prefill_matches_an_f64_reference_as_closely_as_flash_attn_rows() {
                 let rounded = f32_slice_to_bf16(t);
                 let got16 = &tiled_bf16.contents_u16()[..n];
                 for (i, (&g, &w)) in got16.iter().zip(&rounded).enumerate() {
-                    assert_eq!(
-                        g, w,
-                        "{label}[{i}]: bf16 output {g:#x} vs rounded f32 {w:#x}"
-                    );
+                    assert_eq!(g, w, "{label}[{i}]: bf16 output {g:#x} vs rounded f32 {w:#x}");
                 }
             }
         }
@@ -3949,38 +3472,14 @@ fn attn_prefill_matches_an_f64_reference_as_closely_as_flash_attn_rows() {
         let (qb, tkv, zero) = (buf(rt, &q), buf_u32(rt, &[t as u32]), buf_u32(rt, &[0]));
         let dims = pfx_dims(batch, t);
         let scalar = seeded(rt, n, SENTINEL);
-        tessl::nn::flash_attn_rows(
-            rt,
-            &qb,
-            &k,
-            &v,
-            &scalar,
-            &tkv,
-            &zero,
-            &zero,
-            dims,
-            PFX_D as u32,
-            false,
-        )
-        .unwrap();
+        tessl::nn::flash_attn_rows(rt, &qb, &k, &v, &scalar, &tkv, &zero, &zero, dims, PFX_D as u32, false).unwrap();
         rt.synchronize().unwrap();
         let want: Vec<f64> = scalar.read_f32()[..n].iter().map(|&x| x as f64).collect();
         for tile in qwen35::AttnTile::ALL {
-            let tiled = run_tiled(
-                rt,
-                (&qb, &k, &v),
-                (&tkv, &zero, &zero),
-                dims,
-                n,
-                false,
-                tile,
-            );
+            let tiled = run_tiled(rt, (&qb, &k, &v), (&tkv, &zero, &zero), dims, n, false, tile);
             rt.synchronize().unwrap();
             let diff = max_err(&tiled.read_f32()[..n], &want);
-            eprintln!(
-                "{} B{batch} T{t}: max |tiled - scalar| {diff:.2e}",
-                tile.label()
-            );
+            eprintln!("{} B{batch} T{t}: max |tiled - scalar| {diff:.2e}", tile.label());
             assert!(
                 diff <= 1e-5,
                 "{} B{batch} T{t}: tiled vs scalar {diff:.2e}",
@@ -4006,17 +3505,8 @@ fn attn_prefix_rows_continuing_attn_prefill_matches_attn_prefill_on_the_whole_ro
         let pv = random_f32(p * row, 9301);
         let sk = random_f32(batch * s * row, 9302);
         let sv = random_f32(batch * s * row, 9303);
-        let q: Vec<f32> = random_f32(batch * s * qrow, 9304)
-            .iter()
-            .map(|x| 4.0 * x)
-            .collect();
-        let (pkb, pvb, skb, svb, qb) = (
-            buf(rt, &pk),
-            buf(rt, &pv),
-            buf(rt, &sk),
-            buf(rt, &sv),
-            buf(rt, &q),
-        );
+        let q: Vec<f32> = random_f32(batch * s * qrow, 9304).iter().map(|x| 4.0 * x).collect();
+        let (pkb, pvb, skb, svb, qb) = (buf(rt, &pk), buf(rt, &pv), buf(rt, &sk), buf(rt, &sv), buf(rt, &q));
         let (slen, qpos) = (buf_u32(rt, &[s as u32]), buf_u32(rt, &[p as u32]));
         let got = seeded(rt, batch * s * qrow, SENTINEL);
         let prefix = qwen35::SharedPrefix {
@@ -4051,24 +3541,9 @@ fn attn_prefix_rows_continuing_attn_prefill_matches_attn_prefill_on_the_whole_ro
             let full = seeded(rt, t * qrow, SENTINEL);
             let (tkv, zero) = (buf_u32(rt, &[t as u32]), buf_u32(rt, &[0]));
             let (fkb, fvb, fqb) = (buf(rt, &fk), buf(rt, &fv), buf(rt, &fq));
-            qwen35::attn_prefill(
-                rt,
-                &fqb,
-                &fkb,
-                &fvb,
-                &full,
-                &tkv,
-                &zero,
-                &zero,
-                pfx_dims(1, t),
-                false,
-            )
-            .unwrap();
+            qwen35::attn_prefill(rt, &fqb, &fkb, &fvb, &full, &tkv, &zero, &zero, pfx_dims(1, t), false).unwrap();
             rt.synchronize().unwrap();
-            let want: Vec<f64> = full.read_f32()[p * qrow..t * qrow]
-                .iter()
-                .map(|&x| x as f64)
-                .collect();
+            let want: Vec<f64> = full.read_f32()[p * qrow..t * qrow].iter().map(|&x| x as f64).collect();
             let mine = &got[b * s * qrow..(b + 1) * s * qrow];
             assert!(mine.iter().all(|x| x.is_finite()), "row {b}: non-finite");
             let diff = max_err(mine, &want);
@@ -4099,18 +3574,7 @@ fn attn_prefill_rejects_a_window_and_bad_storage() {
         );
         let short = seeded(rt, n - 1, SENTINEL);
         expect_err(
-            qwen35::attn_prefill(
-                rt,
-                &q,
-                &k,
-                &v,
-                &short,
-                &tkv,
-                &zero,
-                &zero,
-                pfx_dims(batch, tq),
-                false,
-            ),
+            qwen35::attn_prefill(rt, &q, &k, &v, &short, &tkv, &zero, &zero, pfx_dims(batch, tq), false),
             "qwen35::attn_prefill o: buffer holds",
         );
         // K/V big enough to hold an output, so the alias check is what fires.

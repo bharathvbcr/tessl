@@ -38,9 +38,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "C[0] = {} but every element should be {expected}",
         out[0]
     );
-    println!(
-        "C[0] = {} (expected {expected}) over {m}x{k} @ {k}x{n}",
-        out[0]
-    );
+    println!("C[0] = {} (expected {expected}) over {m}x{k} @ {k}x{n}", out[0]);
     Ok(())
 }

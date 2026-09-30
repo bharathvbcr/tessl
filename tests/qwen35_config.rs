@@ -110,35 +110,102 @@ fn features_the_forward_lacks_are_refused_by_name() {
         "\"rms_norm_eps\": 1e-06,\n        \"tie_word_embeddings\": false",
     )]);
     refused(&untied_text, "untied embeddings");
-    refused(&edited(&[("\"attention_bias\": false", "\"attention_bias\": true")]), "attention_bias");
-    refused(&edited(&[("\"attn_output_gate\": true", "\"attn_output_gate\": false")]), "ungated attention");
-    refused(&edited(&[("\"hidden_act\": \"silu\"", "\"hidden_act\": \"gelu\"")]), "hidden_act \"gelu\"");
-    refused(&edited(&[("\"mlp_only_layers\": []", "\"mlp_only_layers\": [3]")]), "mlp_only_layers");
-    refused(&edited(&[("\"mlp_only_layers\": []", "\"mlp_only_layers\": [], \"num_experts\": 256")]), "mixture-of-experts");
-    refused(&edited(&[("\"rope_type\": \"default\"", "\"rope_type\": \"yarn\"")]), "rope_type");
-    refused(&edited(&[("\"linear_key_head_dim\": 128", "\"linear_key_head_dim\": 64")]), "linear_key_head_dim 64");
-    refused(&edited(&[("\"head_dim\": 256", "\"head_dim\": 128")]), "head_dim 128 is not supported");
-    refused(&edited(&[("\"partial_rotary_factor\": 0.25", "\"partial_rotary_factor\": 0.3")]), "whole number of rotated dims");
-    refused(&edited(&[("\"partial_rotary_factor\": 0.25", "\"partial_rotary_factor\": 0")]), "whole number of rotated dims");
+    refused(
+        &edited(&[("\"attention_bias\": false", "\"attention_bias\": true")]),
+        "attention_bias",
+    );
+    refused(
+        &edited(&[("\"attn_output_gate\": true", "\"attn_output_gate\": false")]),
+        "ungated attention",
+    );
+    refused(
+        &edited(&[("\"hidden_act\": \"silu\"", "\"hidden_act\": \"gelu\"")]),
+        "hidden_act \"gelu\"",
+    );
+    refused(
+        &edited(&[("\"mlp_only_layers\": []", "\"mlp_only_layers\": [3]")]),
+        "mlp_only_layers",
+    );
+    refused(
+        &edited(&[(
+            "\"mlp_only_layers\": []",
+            "\"mlp_only_layers\": [], \"num_experts\": 256",
+        )]),
+        "mixture-of-experts",
+    );
+    refused(
+        &edited(&[("\"rope_type\": \"default\"", "\"rope_type\": \"yarn\"")]),
+        "rope_type",
+    );
+    refused(
+        &edited(&[("\"linear_key_head_dim\": 128", "\"linear_key_head_dim\": 64")]),
+        "linear_key_head_dim 64",
+    );
+    refused(
+        &edited(&[("\"head_dim\": 256", "\"head_dim\": 128")]),
+        "head_dim 128 is not supported",
+    );
+    refused(
+        &edited(&[("\"partial_rotary_factor\": 0.25", "\"partial_rotary_factor\": 0.3")]),
+        "whole number of rotated dims",
+    );
+    refused(
+        &edited(&[("\"partial_rotary_factor\": 0.25", "\"partial_rotary_factor\": 0")]),
+        "whole number of rotated dims",
+    );
 }
 
 #[test]
 fn malformed_configs_are_refused() {
-    refused(&edited(&[("\"num_hidden_layers\": 24", "\"num_hidden_layers\": 23")]), "has 24 entries but num_hidden_layers is 23");
-    refused(&edited(&[("\"head_dim\": 256", "\"head_dim\": \"256\"")]), "head_dim must be a non-negative integer");
-    refused(&edited(&[("\"head_dim\": 256", "\"head_dim\": 256.5")]), "head_dim must be a non-negative integer");
-    refused(&edited(&[("\"head_dim\": 256", "\"head_dim\": -256")]), "head_dim must be a non-negative integer");
-    refused(&edited(&[("\"head_dim\": 256", "\"head_dim\": 4294967296")]), "exceeds u32");
+    refused(
+        &edited(&[("\"num_hidden_layers\": 24", "\"num_hidden_layers\": 23")]),
+        "has 24 entries but num_hidden_layers is 23",
+    );
+    refused(
+        &edited(&[("\"head_dim\": 256", "\"head_dim\": \"256\"")]),
+        "head_dim must be a non-negative integer",
+    );
+    refused(
+        &edited(&[("\"head_dim\": 256", "\"head_dim\": 256.5")]),
+        "head_dim must be a non-negative integer",
+    );
+    refused(
+        &edited(&[("\"head_dim\": 256", "\"head_dim\": -256")]),
+        "head_dim must be a non-negative integer",
+    );
+    refused(
+        &edited(&[("\"head_dim\": 256", "\"head_dim\": 4294967296")]),
+        "exceeds u32",
+    );
     refused(&edited(&[("\"head_dim\": 256,", "")]), "missing \"head_dim\"");
-    refused(&edited(&[("\"rms_norm_eps\": 1e-06", "\"rms_norm_eps\": \"1e-6\"")]), "rms_norm_eps must be a number");
-    refused(&edited(&[("\"rms_norm_eps\": 1e-06", "\"rms_norm_eps\": 0")]), "rms_norm_eps and rope_theta must be positive");
-    refused(&edited(&[("\"attention_bias\": false", "\"attention_bias\": 0")]), "attention_bias must be true or false");
-    refused(&edited(&[("\"vocab_size\": 248320", "\"vocab_size\": 0")]), "must be non-zero");
+    refused(
+        &edited(&[("\"rms_norm_eps\": 1e-06", "\"rms_norm_eps\": \"1e-6\"")]),
+        "rms_norm_eps must be a number",
+    );
+    refused(
+        &edited(&[("\"rms_norm_eps\": 1e-06", "\"rms_norm_eps\": 0")]),
+        "rms_norm_eps and rope_theta must be positive",
+    );
+    refused(
+        &edited(&[("\"attention_bias\": false", "\"attention_bias\": 0")]),
+        "attention_bias must be true or false",
+    );
+    refused(
+        &edited(&[("\"vocab_size\": 248320", "\"vocab_size\": 0")]),
+        "must be non-zero",
+    );
     let first = "\"linear_attention\",";
     let pos = REAL.find(first).unwrap();
     let bad_kind = format!("{}\"sliding_attention\",{}", &REAL[..pos], &REAL[pos + first.len()..]);
     refused(&bad_kind, "layer_types[0]");
     refused("[1, 2]", "the root is not an object");
     refused("{\"text_config\": {}} x", "trailing bytes");
-    refused(&REAL.replacen("\"hidden_size\": 2048", "\"hidden_size\": 2048, \"hidden_size\": 2048", 1), "duplicate key");
+    refused(
+        &REAL.replacen(
+            "\"hidden_size\": 2048",
+            "\"hidden_size\": 2048, \"hidden_size\": 2048",
+            1,
+        ),
+        "duplicate key",
+    );
 }

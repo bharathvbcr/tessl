@@ -38,9 +38,7 @@
 //! smoke test reaches for first.
 
 mod common;
-use common::gdn::{
-    alpha_mamba2_refuted, gates_published, sequential_f64, Dims, GateBias, GateClamp, Problem, Rule,
-};
+use common::gdn::{alpha_mamba2_refuted, gates_published, sequential_f64, Dims, GateBias, GateClamp, Problem, Rule};
 use common::{random_f32, U_F32};
 
 /// `ln(1e-4 / (1 - 1e-4))` — the logit at which `alpha`'s floor starts to bite.
@@ -120,29 +118,14 @@ fn published_gate_is_the_sigmoid_of_the_biased_logit() {
     );
 
     for (i, &x) in logits.iter().enumerate() {
-        assert_close(
-            &format!("alpha[{i}]"),
-            alpha[i],
-            sigmoid_f64(f64::from(x)),
-            0.0,
-        );
-        assert_close(
-            &format!("beta[{i}]"),
-            beta[i],
-            sigmoid_f64(f64::from(-x)),
-            0.0,
-        );
+        assert_close(&format!("alpha[{i}]"), alpha[i], sigmoid_f64(f64::from(x)), 0.0);
+        assert_close(&format!("beta[{i}]"), beta[i], sigmoid_f64(f64::from(-x)), 0.0);
     }
     // Spot-check against values computed outside this file, so the test is not
     // just `sigmoid` compared with itself.
     assert_close("alpha at logit 0", alpha[0], 0.5, 0.0);
     assert_close("alpha at logit 1", alpha[1], 0.731_058_578_630_004_9, 1e-15);
-    assert_close(
-        "alpha at logit -1",
-        alpha[2],
-        0.268_941_421_369_995_1,
-        1e-15,
-    );
+    assert_close("alpha at logit -1", alpha[2], 0.268_941_421_369_995_1, 1e-15);
     assert_close("alpha at logit 2", alpha[3], 0.880_797_077_977_882_3, 1e-15);
 }
 
@@ -334,9 +317,7 @@ fn only_alphas_floor_can_change_a_value() {
     // the other three bounds could alter a value, an unclamped and a clamped
     // sweep would differ somewhere other than at alpha's floor.
     let n = 4001usize;
-    let logits: Vec<f32> = (0..n)
-        .map(|i| -50.0 + 100.0 * (i as f32) / ((n - 1) as f32))
-        .collect();
+    let logits: Vec<f32> = (0..n).map(|i| -50.0 + 100.0 * (i as f32) / ((n - 1) as f32)).collect();
     let d = dims(1, 1, n);
     let bias = GateBias {
         decay: &zeros(1),
@@ -346,8 +327,7 @@ fn only_alphas_floor_can_change_a_value() {
         alpha: (f64::NEG_INFINITY, f64::INFINITY),
         beta: (f64::NEG_INFINITY, f64::INFINITY),
     };
-    let (alpha_clamped, beta_clamped) =
-        gates_published(&logits, &logits, d, bias, GateClamp::PUBLISHED);
+    let (alpha_clamped, beta_clamped) = gates_published(&logits, &logits, d, bias, GateClamp::PUBLISHED);
     let (alpha_raw, beta_raw) = gates_published(&logits, &logits, d, bias, wide);
 
     let mut floor_fired = 0usize;
@@ -499,11 +479,7 @@ fn alpha_saturates_to_exactly_one_later_in_f64_than_in_f32() {
     // In the window between them the two disagree, and the reference is the one
     // that has not saturated.
     let x = 0.5 * (t32 + t64);
-    assert_eq!(
-        sigmoid_f32(x as f32),
-        1.0,
-        "f32 should have saturated at {x}"
-    );
+    assert_eq!(sigmoid_f32(x as f32), 1.0, "f32 should have saturated at {x}");
     assert!(sigmoid_f64(x) < 1.0, "f64 must not have saturated at {x}");
 }
 
@@ -593,10 +569,7 @@ fn the_two_formulas_diverge_once_the_gate_leaves_zero() {
     let (b, h, l) = (1usize, 2usize, 64usize);
     let d = dims(b, h, l);
     // random_f32 is uniform in [-1, 1); scale to a plausible post-training range.
-    let logits: Vec<f32> = random_f32(d.gate_len(), 0x00C0_FFEE)
-        .iter()
-        .map(|x| x * 4.0)
-        .collect();
+    let logits: Vec<f32> = random_f32(d.gate_len(), 0x00C0_FFEE).iter().map(|x| x * 4.0).collect();
     let (published, _) = gates_published(
         &logits,
         &logits,
@@ -642,10 +615,7 @@ fn the_two_formulas_diverge_once_the_gate_leaves_zero() {
             }
         }
     }
-    assert!(
-        compared > 0,
-        "no comparable pairs; the sample is degenerate"
-    );
+    assert!(compared > 0, "no comparable pairs; the sample is degenerate");
     assert_eq!(
         opposed, compared,
         "every pair should be ordered oppositely; {opposed} of {compared} were"
@@ -676,10 +646,7 @@ fn a_nonzero_a_log_scales_the_refuted_decay() {
     }
     // dt_bias shifts the softplus argument, so it also moves the result.
     let shifted = alpha_mamba2_refuted(&logits, d, &[-1.0], &[2.0]);
-    assert!(
-        shifted[0] < slow[0],
-        "a positive dt_bias must increase the decay rate"
-    );
+    assert!(shifted[0] < slow[0], "a positive dt_bias must increase the decay rate");
 }
 
 #[test]
@@ -748,11 +715,7 @@ fn gates_stay_in_bounds_at_the_extremes_of_f32() {
     }
     // The extremes must actually reach the ends, or the sweep is not extreme.
     assert_eq!(alpha[0], 1e-4, "the most negative logit must hit the floor");
-    assert_eq!(
-        alpha[logits.len() - 1],
-        1.0,
-        "the most positive logit must saturate"
-    );
+    assert_eq!(alpha[logits.len() - 1], 1.0, "the most positive logit must saturate");
 }
 
 #[test]
@@ -856,10 +819,7 @@ fn produced_gates_drive_the_recurrence() {
     // observable downstream and is not a free choice.
     let refuted64 = alpha_mamba2_refuted(&a_logits, d, &zeros(h), &zeros(h));
     let refuted: Vec<f32> = refuted64.iter().map(|&x| x as f32).collect();
-    let p_wrong = Problem {
-        alpha: &refuted,
-        ..p
-    };
+    let p_wrong = Problem { alpha: &refuted, ..p };
     let y_wrong = sequential_f64(&p_wrong, Rule::Published, GateClamp::PUBLISHED);
     let worst = y
         .iter()

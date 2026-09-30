@@ -323,11 +323,7 @@ fn pos_buffer_variant_agrees_bit_for_bit_with_the_constant_one() {
             ("v", &outs[0].2, &outs[1].2),
         ] {
             for (i, (x, y)) in a.iter().zip(b.iter()).enumerate() {
-                assert_eq!(
-                    x.to_bits(),
-                    y.to_bits(),
-                    "{name}[{i}]: PosConst {x} vs PosBuffer {y}"
-                );
+                assert_eq!(x.to_bits(), y.to_bits(), "{name}[{i}]: PosConst {x} vs PosBuffer {y}");
             }
         }
     });
@@ -396,10 +392,7 @@ fn kv_store_variant_writes_the_rotated_k_and_v_into_the_cache() {
                 .chain(&got[offset + kv_elems..kv_elems * 3])
                 .filter(|p| **p != UNWRITTEN)
                 .count();
-            assert_eq!(
-                touched, 0,
-                "cache {name}: wrote {touched} elements outside its slot"
-            );
+            assert_eq!(touched, 0, "cache {name}: wrote {touched} elements outside its slot");
         }
     });
 }

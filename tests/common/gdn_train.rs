@@ -158,7 +158,9 @@ pub fn gdn_train_bwd_f64(p: &Inputs<'_>, d_o: &[f64], dfin: Option<&[f64]>) -> G
                 }
                 // S_t = S^ + k^ delta^T
                 let ddelta: Vec<f64> = (0..dv).map(|j| (0..dk).map(|i| ds[i * dv + j] * kh[i]).sum()).collect();
-                let mut dkh: Vec<f64> = (0..dk).map(|i| (0..dv).map(|j| ds[i * dv + j] * delta[j]).sum()).collect();
+                let mut dkh: Vec<f64> = (0..dk)
+                    .map(|i| (0..dv).map(|j| ds[i * dv + j] * delta[j]).sum())
+                    .collect();
                 // delta = beta (v - S^T k^)
                 for (d, dd) in gr.dv[row * dv..(row + 1) * dv].iter_mut().zip(&ddelta) {
                     *d = beta * dd;

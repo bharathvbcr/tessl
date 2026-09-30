@@ -107,8 +107,7 @@ pub fn gdn_f64(p: &GdnProblem<'_>) -> (Vec<f64>, Vec<f64>) {
                 let k = l2norm(&p.k[qk_base..qk_base + DK]);
                 let gi = (bi * t + ti) * hv + h;
                 let beta = sigmoid(f64::from(p.b[gi]));
-                let g = -f64::from(p.a_log[h]).exp()
-                    * softplus(f64::from(p.a[gi]) + f64::from(p.dt_bias[h]));
+                let g = -f64::from(p.a_log[h]).exp() * softplus(f64::from(p.a[gi]) + f64::from(p.dt_bias[h]));
                 let decay = g.exp();
                 let s = &mut state[(bi * hv + h) * per..(bi * hv + h + 1) * per];
                 for x in s.iter_mut() {
@@ -160,9 +159,7 @@ pub fn conv1d_silu_f64(
                 }
             };
             for ti in 0..t {
-                let acc: f64 = (0..kw)
-                    .map(|j| f64::from(w[ci * kw + j]) * ext(ti + j))
-                    .sum();
+                let acc: f64 = (0..kw).map(|j| f64::from(w[ci * kw + j]) * ext(ti + j)).sum();
                 y[(bi * t + ti) * c + ci] = silu(acc);
             }
             for j in 0..hist {
@@ -198,14 +195,7 @@ pub fn gated_rms_norm_f64(x: &[f32], z: &[f32], w: &[f32], d: usize, eps: f64) -
 /// position 20000 the angle itself moves by ~1e-3 rad, and an f64-angle
 /// reference disagrees with transformers by that much — measured 1.4e-3 on the
 /// committed fixture. Matching the model means matching that rounding.
-pub fn norm_rope_row_f64(
-    row: &[f32],
-    w: &[f32],
-    rotary: usize,
-    pos: u64,
-    theta: f64,
-    eps: f64,
-) -> Vec<f64> {
+pub fn norm_rope_row_f64(row: &[f32], w: &[f32], rotary: usize, pos: u64, theta: f64, eps: f64) -> Vec<f64> {
     let d = row.len();
     let ss: f64 = row.iter().map(|&v| f64::from(v) * f64::from(v)).sum();
     let inv = 1.0 / (ss / d as f64 + eps).sqrt();
@@ -228,13 +218,7 @@ pub fn norm_rope_row_f64(
 
 /// Final norm (`* (w + w_offset)`) and the answer-row logits for one hidden row,
 /// with the log-softmax over the answer set.
-pub fn score_row_f64(
-    h: &[f32],
-    norm_w: &[f32],
-    w_offset: f64,
-    eps: f64,
-    emb_rows: &[&[f32]],
-) -> (Vec<f64>, Vec<f64>) {
+pub fn score_row_f64(h: &[f32], norm_w: &[f32], w_offset: f64, eps: f64, emb_rows: &[&[f32]]) -> (Vec<f64>, Vec<f64>) {
     let d = h.len();
     let ss: f64 = h.iter().map(|&v| f64::from(v) * f64::from(v)).sum();
     let inv = 1.0 / (ss / d as f64 + eps).sqrt();
@@ -242,9 +226,7 @@ pub fn score_row_f64(
         .iter()
         .map(|e| {
             (0..d)
-                .map(|i| {
-                    f64::from(h[i]) * inv * (f64::from(norm_w[i]) + w_offset) * f64::from(e[i])
-                })
+                .map(|i| f64::from(h[i]) * inv * (f64::from(norm_w[i]) + w_offset) * f64::from(e[i]))
                 .sum()
         })
         .collect();

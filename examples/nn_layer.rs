@@ -55,13 +55,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // 3. Fused gating: mid = gelu(gate) * up, one dispatch, no intermediate.
     let mid = rt.alloc_tensor_f32(&[rows, ffn])?;
-    tessl::nn::mlp_gelu_tanh(
-        &rt,
-        &gate.buffer,
-        &up.buffer,
-        &mid.buffer,
-        (rows * ffn) as u32,
-    )?;
+    tessl::nn::mlp_gelu_tanh(&rt, &gate.buffer, &up.buffer, &mid.buffer, (rows * ffn) as u32)?;
 
     // 4. Down projection, then fold into the residual with a fused
     //    norm-and-add. `layer_scale` of 1.0 is the plain residual add.

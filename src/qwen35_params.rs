@@ -70,7 +70,11 @@ struct Slot<'a> {
 }
 
 fn info(name: String, shape: &[usize], transposed: bool) -> ParamInfo {
-    ParamInfo { name, shape: shape.to_vec(), transposed }
+    ParamInfo {
+        name,
+        shape: shape.to_vec(),
+        transposed,
+    }
 }
 
 /// Offsets of each part in a packed projection, from its widths.
@@ -88,12 +92,18 @@ fn slots<'a>(m: &'a Qwen35Model, grads: Option<&'a Qwen35Grads>) -> Result<Vec<S
     let (h, inter, vocab) = (cfg.hidden as usize, cfg.intermediate as usize, cfg.vocab as usize);
     if let Some(g) = grads {
         if g.layers.len() != m.layers.len() {
-            return Err(format!("gradients for {} layers, the model has {}", g.layers.len(), m.layers.len()));
+            return Err(format!(
+                "gradients for {} layers, the model has {}",
+                g.layers.len(),
+                m.layers.len()
+            ));
         }
     }
-    let mut out = vec![
-        Slot { info: info("embed_tokens.weight".into(), &[vocab, h], false), param: Src::Dense(&m.embed), grad: grads.map(|g| Src::Dense(&g.embed)) },
-    ];
+    let mut out = vec![Slot {
+        info: info("embed_tokens.weight".into(), &[vocab, h], false),
+        param: Src::Dense(&m.embed),
+        grad: grads.map(|g| Src::Dense(&g.embed)),
+    }];
     for (l, layer) in m.layers.iter().enumerate() {
         let lg = grads.map(|g| &g.layers[l]);
         let p = |s: &str| format!("layers.{l}.{s}");
@@ -107,7 +117,10 @@ fn slots<'a>(m: &'a Qwen35Model, grads: Option<&'a Qwen35Grads>) -> Result<Vec<S
                 let gd = cfg.gdn;
                 let widths = gd.part_widths();
                 let offs = offsets(widths);
-                for (i, part) in ["in_proj_qkv", "in_proj_z", "in_proj_b", "in_proj_a"].iter().enumerate() {
+                for (i, part) in ["in_proj_qkv", "in_proj_z", "in_proj_b", "in_proj_a"]
+                    .iter()
+                    .enumerate()
+                {
                     out.push(Slot {
                         info: info(p(&format!("linear_attn.{part}.weight")), &[widths[i], h], true),
                         param: Src::Packed(&w.w_in, offs[i]),
@@ -125,7 +138,11 @@ fn slots<'a>(m: &'a Qwen35Model, grads: Option<&'a Qwen35Grads>) -> Result<Vec<S
                     param: Src::Raw(&w.conv_w),
                     grad: gg.map(|g| Src::Raw(&g.conv_w)),
                 });
-                out.push(Slot { info: info(p("linear_attn.A_log"), &[vh], false), param: Src::Raw(&w.a_log), grad: gg.map(|g| Src::Raw(&g.a_log)) });
+                out.push(Slot {
+                    info: info(p("linear_attn.A_log"), &[vh], false),
+                    param: Src::Raw(&w.a_log),
+                    grad: gg.map(|g| Src::Raw(&g.a_log)),
+                });
                 out.push(Slot {
                     info: info(p("linear_attn.dt_bias"), &[vh], false),
                     param: Src::Raw(&w.dt_bias),
@@ -159,13 +176,33 @@ fn slots<'a>(m: &'a Qwen35Model, grads: Option<&'a Qwen35Grads>) -> Result<Vec<S
                     param: Src::Packed(&w.w_out, 0),
                     grad: ag.map(|g| Src::Packed(&g.w_out, 0)),
                 });
-                out.push(Slot { info: info(p("self_attn.q_norm.weight"), &[d], false), param: Src::Raw(&w.q_norm), grad: ag.map(|g| Src::Raw(&g.q_norm)) });
-                out.push(Slot { info: info(p("self_attn.k_norm.weight"), &[d], false), param: Src::Raw(&w.k_norm), grad: ag.map(|g| Src::Raw(&g.k_norm)) });
+                out.push(Slot {
+                    info: info(p("self_attn.q_norm.weight"), &[d], false),
+                    param: Src::Raw(&w.q_norm),
+                    grad: ag.map(|g| Src::Raw(&g.q_norm)),
+                });
+                out.push(Slot {
+                    info: info(p("self_attn.k_norm.weight"), &[d], false),
+                    param: Src::Raw(&w.k_norm),
+                    grad: ag.map(|g| Src::Raw(&g.k_norm)),
+                });
             }
         }
-        out.push(Slot { info: info(p("mlp.gate_proj.weight"), &[inter, h], true), param: Src::Packed(&layer.gate, 0), grad: lg.map(|g| Src::Packed(&g.gate, 0)) });
-        out.push(Slot { info: info(p("mlp.up_proj.weight"), &[inter, h], true), param: Src::Packed(&layer.up, 0), grad: lg.map(|g| Src::Packed(&g.up, 0)) });
-        out.push(Slot { info: info(p("mlp.down_proj.weight"), &[h, inter], true), param: Src::Packed(&layer.down, 0), grad: lg.map(|g| Src::Packed(&g.down, 0)) });
+        out.push(Slot {
+            info: info(p("mlp.gate_proj.weight"), &[inter, h], true),
+            param: Src::Packed(&layer.gate, 0),
+            grad: lg.map(|g| Src::Packed(&g.gate, 0)),
+        });
+        out.push(Slot {
+            info: info(p("mlp.up_proj.weight"), &[inter, h], true),
+            param: Src::Packed(&layer.up, 0),
+            grad: lg.map(|g| Src::Packed(&g.up, 0)),
+        });
+        out.push(Slot {
+            info: info(p("mlp.down_proj.weight"), &[h, inter], true),
+            param: Src::Packed(&layer.down, 0),
+            grad: lg.map(|g| Src::Packed(&g.down, 0)),
+        });
         out.push(Slot {
             info: info(p("input_layernorm.weight"), &[h], false),
             param: Src::OnePlus(&layer.input_norm),
@@ -177,7 +214,11 @@ fn slots<'a>(m: &'a Qwen35Model, grads: Option<&'a Qwen35Grads>) -> Result<Vec<S
             grad: lg.map(|g| Src::Raw(&g.post_norm)),
         });
     }
-    out.push(Slot { info: info("norm.weight".into(), &[h], false), param: Src::OnePlus(&m.final_norm), grad: grads.map(|g| Src::Raw(&g.final_norm)) });
+    out.push(Slot {
+        info: info("norm.weight".into(), &[h], false),
+        param: Src::OnePlus(&m.final_norm),
+        grad: grads.map(|g| Src::Raw(&g.final_norm)),
+    });
     Ok(out)
 }
 
@@ -193,11 +234,20 @@ fn check(what: &str, slots: &[Slot<'_>], ts: &[Tensor]) -> Result<(), String> {
     for (s, t) in slots.iter().zip(ts) {
         let want = s.info.storage_shape();
         if t.dtype != DType::F32 || t.shape() != want.as_slice() {
-            return Err(format!("{what}: {} must be f32 {want:?}, got {:?} {:?}", s.info.name, t.dtype, t.shape()));
+            return Err(format!(
+                "{what}: {} must be f32 {want:?}, got {:?} {:?}",
+                s.info.name,
+                t.dtype,
+                t.shape()
+            ));
         }
         t.validate().map_err(|e| format!("{what}: {}: {e}", s.info.name))?;
         if t.byte_offset() % 4 != 0 {
-            return Err(format!("{what}: {}: byte offset {} is not a multiple of 4", s.info.name, t.byte_offset()));
+            return Err(format!(
+                "{what}: {}: byte offset {} is not a multiple of 4",
+                s.info.name,
+                t.byte_offset()
+            ));
         }
     }
     Ok(())
@@ -206,7 +256,9 @@ fn check(what: &str, slots: &[Slot<'_>], ts: &[Tensor]) -> Result<(), String> {
 impl Qwen35Model {
     fn require_f32(&self, what: &str) -> Result<(), String> {
         if self.precision != Precision::F32 {
-            return Err(format!("{what}: the parameter table needs a model loaded with Precision::F32"));
+            return Err(format!(
+                "{what}: the parameter table needs a model loaded with Precision::F32"
+            ));
         }
         Ok(())
     }
@@ -224,7 +276,8 @@ impl Qwen35Model {
         let slots = slots(self, None)?;
         check(WHAT, &slots, dst)?;
         for (s, t) in slots.iter().zip(dst) {
-            self.read_one(s.param, &s.info, t).map_err(|e| format!("{WHAT}: {}: {e}", s.info.name))?;
+            self.read_one(s.param, &s.info, t)
+                .map_err(|e| format!("{WHAT}: {}: {e}", s.info.name))?;
         }
         self.rt.synchronize()
     }
@@ -237,8 +290,11 @@ impl Qwen35Model {
         let slots = slots(self, Some(grads)).map_err(|e| format!("{WHAT}: {e}"))?;
         check(WHAT, &slots, dst)?;
         for (s, t) in slots.iter().zip(dst) {
-            let g = s.grad.ok_or_else(|| format!("{WHAT}: {} has no gradient", s.info.name))?;
-            self.read_one(g, &s.info, t).map_err(|e| format!("{WHAT}: {}: {e}", s.info.name))?;
+            let g = s
+                .grad
+                .ok_or_else(|| format!("{WHAT}: {} has no gradient", s.info.name))?;
+            self.read_one(g, &s.info, t)
+                .map_err(|e| format!("{WHAT}: {}: {e}", s.info.name))?;
         }
         self.rt.synchronize()
     }
@@ -251,7 +307,8 @@ impl Qwen35Model {
         let slots = slots(self, None)?;
         check(WHAT, &slots, src)?;
         for (s, t) in slots.iter().zip(src) {
-            self.write_one(s.param, &s.info, t).map_err(|e| format!("{WHAT}: {}: {e}", s.info.name))?;
+            self.write_one(s.param, &s.info, t)
+                .map_err(|e| format!("{WHAT}: {}: {e}", s.info.name))?;
         }
         self.rt.synchronize()
     }
@@ -261,13 +318,29 @@ impl Qwen35Model {
     /// `copy_cols` windows start at a column, so a caller tensor at a byte
     /// offset goes through a dense temporary and [`gpu_copy`], which honours
     /// offsets.
-    fn packed_copy(&self, t: &Tensor, off: usize, rows: usize, width: usize, dense: &Tensor, read: bool) -> Result<(), String> {
+    fn packed_copy(
+        &self,
+        t: &Tensor,
+        off: usize,
+        rows: usize,
+        width: usize,
+        dense: &Tensor,
+        read: bool,
+    ) -> Result<(), String> {
         let rt = &self.rt;
-        let packed = Cols { buf: &t.buffer, ld: u32_of(t.shape()[1])?, off: u32_of(off)? };
+        let packed = Cols {
+            buf: &t.buffer,
+            ld: u32_of(t.shape()[1])?,
+            off: u32_of(off)?,
+        };
         let (r, w) = (u32_of(rows)?, u32_of(width)?);
         if dense.byte_offset() == 0 {
             let d = Cols::dense(&dense.buffer, w);
-            return if read { copy_cols(rt, packed, d, r, w) } else { copy_cols(rt, d, packed, r, w) };
+            return if read {
+                copy_cols(rt, packed, d, r, w)
+            } else {
+                copy_cols(rt, d, packed, r, w)
+            };
         }
         let tmp = rt.alloc_tensor_f32(&[rows, width])?;
         if read {

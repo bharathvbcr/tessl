@@ -77,19 +77,10 @@ fn buffer_kind_survives_the_round_trip_to_the_holder() {
             rt.alloc_buffer_kind(4096, BufferKind::Hot).unwrap().kind(),
             BufferKind::Hot
         );
-        assert_eq!(
-            rt.alloc_tensor_f32_hot(&[1024]).unwrap().buffer.kind(),
-            BufferKind::Hot
-        );
-        assert_eq!(
-            rt.alloc_tensor_f32(&[1024]).unwrap().buffer.kind(),
-            BufferKind::Cold
-        );
+        assert_eq!(rt.alloc_tensor_f32_hot(&[1024]).unwrap().buffer.kind(), BufferKind::Hot);
+        assert_eq!(rt.alloc_tensor_f32(&[1024]).unwrap().buffer.kind(), BufferKind::Cold);
         rt.ensure_bump(1 << 16).unwrap();
-        assert_eq!(
-            rt.bump_alloc_f32(&[64]).unwrap().buffer.kind(),
-            BufferKind::Bump
-        );
+        assert_eq!(rt.bump_alloc_f32(&[64]).unwrap().buffer.kind(), BufferKind::Bump);
     });
 }
 
@@ -227,9 +218,7 @@ fn bump_arena_hands_out_zeroed_slices_and_reports_exhaustion() {
         let marks: Vec<f32> = views.iter().map(|t| t.read_f32().unwrap()[0]).collect();
         rt.bump_reset().unwrap();
         let after_reset = rt.bump_alloc_f32(&[512]).unwrap();
-        after_reset
-            .write_f32(&vec![-1.0f32; after_reset.numel()])
-            .unwrap();
+        after_reset.write_f32(&vec![-1.0f32; after_reset.numel()]).unwrap();
         for (i, t) in views.iter().enumerate() {
             assert_eq!(
                 t.read_f32().unwrap()[0],
@@ -240,10 +229,7 @@ fn bump_arena_hands_out_zeroed_slices_and_reports_exhaustion() {
 
         // A capacity that cannot be rounded to a power of two is rejected
         // instead of wrapping to a tiny slab.
-        assert_eq!(
-            rt.ensure_bump(usize::MAX).unwrap_err(),
-            "bump capacity overflow"
-        );
+        assert_eq!(rt.ensure_bump(usize::MAX).unwrap_err(), "bump capacity overflow");
     });
 }
 
@@ -324,9 +310,7 @@ fn a_long_unsynchronized_chain_keeps_every_result() {
         let a = tensor_f32(rt, &[m, k], &random_f32(m * k, 31));
         // Distinct operands per slot: identical ones would make a stale or
         // swapped buffer indistinguishable from a correct one.
-        let b_hosts: Vec<Vec<f32>> = (0..VARIANTS)
-            .map(|v| random_f32(k * n, 40 + v as u64))
-            .collect();
+        let b_hosts: Vec<Vec<f32>> = (0..VARIANTS).map(|v| random_f32(k * n, 40 + v as u64)).collect();
         let bs: Vec<Tensor> = b_hosts.iter().map(|h| tensor_f32(rt, &[k, n], h)).collect();
         let a_host = a.buffer.read_f32();
 
@@ -419,11 +403,7 @@ fn externally_allocated_storage_can_back_a_gemm_output() {
         // The operands share the allocation; a kernel writing outside C's
         // window would have corrupted them.
         assert_eq!(&host[..a_elems], &a_host[..], "A was modified");
-        assert_eq!(
-            &host[b_off_elems..b_off_elems + k * n],
-            &b_host[..],
-            "B was modified"
-        );
+        assert_eq!(&host[b_off_elems..b_off_elems + k * n], &b_host[..], "B was modified");
     });
 }
 
@@ -442,24 +422,11 @@ fn deep_copy_and_gpu_copy_reproduce_their_source() {
         assert!(original.iter().any(|&x| x != 0.0), "source was all zero");
         for (i, (&want, (&got_dup, &got_dst))) in original
             .iter()
-            .zip(
-                dup.buffer
-                    .read_f32()
-                    .iter()
-                    .zip(dst.buffer.read_f32().iter()),
-            )
+            .zip(dup.buffer.read_f32().iter().zip(dst.buffer.read_f32().iter()))
             .enumerate()
         {
-            assert_eq!(
-                got_dup.to_bits(),
-                want.to_bits(),
-                "deep_copy differs at [{i}]"
-            );
-            assert_eq!(
-                got_dst.to_bits(),
-                want.to_bits(),
-                "gpu_copy differs at [{i}]"
-            );
+            assert_eq!(got_dup.to_bits(), want.to_bits(), "deep_copy differs at [{i}]");
+            assert_eq!(got_dst.to_bits(), want.to_bits(), "gpu_copy differs at [{i}]");
         }
     });
 }
@@ -493,10 +460,7 @@ fn softcap_matches_its_definition() {
             // any real defect: a missing tanh, a dropped cap, or a reciprocal
             // in place of the divide all move the result by whole percent.
             let tol = 1e-5 * want.abs().max(1.0);
-            assert!(
-                (g - want).abs() <= tol,
-                "softcap[{i}] pre={x}: got {g}, want {want}"
-            );
+            assert!((g - want).abs() <= tol, "softcap[{i}] pre={x}: got {g}, want {want}");
         }
         // The asymptote is the cap itself, in both directions.
         assert!((got[got.len() - 2] - cap).abs() < 1e-4);
@@ -551,11 +515,7 @@ fn a_runtime_that_outlives_its_tensors_still_works() {
             let view = t.view(&[1 << 9], 1 << 9);
             drop(t);
             // The view keeps the storage alive on its own.
-            assert!(view
-                .buffer
-                .read_f32()
-                .iter()
-                .all(|&x| x == generation as f32));
+            assert!(view.buffer.read_f32().iter().all(|&x| x == generation as f32));
             drop(view);
             rt.synchronize().unwrap();
         }
@@ -614,6 +574,10 @@ fn a_params_push_waits_for_encoded_work_reading_the_slot() {
         assert_eq!(next, off, "the reset should reuse the slot");
         rt.synchronize().expect("sync");
         rt.set_async_encode(false).expect("sync encode");
-        assert_eq!(out.read_f32(), vec![7.0], "the encoded dispatch read the next step's value");
+        assert_eq!(
+            out.read_f32(),
+            vec![7.0],
+            "the encoded dispatch read the next step's value"
+        );
     });
 }

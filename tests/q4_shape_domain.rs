@@ -13,9 +13,7 @@
 mod common;
 
 use common::{buf, buf_bf16, empty, with_gpu};
-use tessl::nn::{
-    self, GateUpDispatch, Q4Bank, Q4MlxBank, Q4MlxLayout, Q4MlxRowVariant, QkvOutputs, QuantShape,
-};
+use tessl::nn::{self, GateUpDispatch, Q4Bank, Q4MlxBank, Q4MlxLayout, Q4MlxRowVariant, QkvOutputs, QuantShape};
 
 fn shape(rows: usize, cols: usize, group: usize) -> QuantShape {
     QuantShape {
@@ -45,9 +43,7 @@ fn q4_banks_refuse_group_sizes_the_uint_peel_cannot_address() {
             };
             for tiled in [false, true] {
                 let err = nn::gemv_q4(rt, bank, &x, &y, shape(rows, cols, group), tiled)
-                    .expect_err(&format!(
-                        "group_size {group} (tiled={tiled}) must be refused"
-                    ));
+                    .expect_err(&format!("group_size {group} (tiled={tiled}) must be refused"));
                 assert!(
                     err.contains("group_size") && err.contains(&group.to_string()),
                     "tiled={tiled}: {err}"
@@ -95,10 +91,7 @@ fn mlx_banks_refuse_group_sizes_outside_the_simd_block_domain() {
                     "gemv_q4_mlx",
                     nn::gemv_q4_mlx(rt, bank, &x32, &y, sh, Q4MlxRowVariant::Standard),
                 ),
-                (
-                    "gemv_q4_mlx_blocked",
-                    nn::gemv_q4_mlx_blocked(rt, bank, &x32, &y, sh),
-                ),
+                ("gemv_q4_mlx_blocked", nn::gemv_q4_mlx_blocked(rt, bank, &x32, &y, sh)),
                 (
                     "gemv_q4_mlx_simd",
                     nn::gemv_q4_mlx_simd(rt, bank, &x16, &y, sh, Q4MlxLayout::RowMajor, None),
@@ -109,9 +102,7 @@ fn mlx_banks_refuse_group_sizes_outside_the_simd_block_domain() {
                 ),
             ];
             for (entry, result) in attempts {
-                let err = result.expect_err(&format!(
-                    "{entry}: group_size {group} of {cols} must be refused"
-                ));
+                let err = result.expect_err(&format!("{entry}: group_size {group} of {cols} must be refused"));
                 assert!(
                     err.contains("group_size") && err.contains(&group.to_string()),
                     "{entry}: {err}"
@@ -147,13 +138,15 @@ fn tiled_mlx_banks_must_hold_their_padded_last_tile() {
         // (entry, tile rows, call over one bank used for every matrix operand)
         type Call<'a> = Box<dyn Fn(Q4MlxBank<'_>) -> Result<(), String> + 'a>;
         let entries: Vec<(&str, usize, Call)> = vec![
-            ("gemv_q4_mlx_blocked", 16, Box::new(|b| nn::gemv_q4_mlx_blocked(rt, b, &x32, &y, sh))),
+            (
+                "gemv_q4_mlx_blocked",
+                16,
+                Box::new(|b| nn::gemv_q4_mlx_blocked(rt, b, &x32, &y, sh)),
+            ),
             (
                 "gemv_q4_mlx_blocked_gate_up_gelu",
                 16,
-                Box::new(|b| {
-                    nn::gemv_q4_mlx_gate_up_gelu(rt, b, b, &x32, &y, sh, GateUpDispatch::Blocked, false)
-                }),
+                Box::new(|b| nn::gemv_q4_mlx_gate_up_gelu(rt, b, b, &x32, &y, sh, GateUpDispatch::Blocked, false)),
             ),
             (
                 "gemv_q4_mlx_simd_i4",
@@ -163,9 +156,7 @@ fn tiled_mlx_banks_must_hold_their_padded_last_tile() {
             (
                 "gemv_q4_mlx_simd_add_i4",
                 4,
-                Box::new(|b| {
-                    nn::gemv_q4_mlx_simd(rt, b, &x16, &y, sh, Q4MlxLayout::Interleaved4, Some(&y2))
-                }),
+                Box::new(|b| nn::gemv_q4_mlx_simd(rt, b, &x16, &y, sh, Q4MlxLayout::Interleaved4, Some(&y2))),
             ),
             (
                 "gemv_q4_mlx_simd_gate_up_gelu_i4",

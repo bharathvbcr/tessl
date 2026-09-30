@@ -25,8 +25,7 @@
 mod common;
 
 use common::{
-    buf, buf_bf16, close_rel, dense_gemv, empty, q4_mlx_matrix, random_f32, round_trip_bf16,
-    seeded, with_gpu,
+    buf, buf_bf16, close_rel, dense_gemv, empty, q4_mlx_matrix, random_f32, round_trip_bf16, seeded, with_gpu,
 };
 use tessl::nn::{self, GateUpDispatch, Q4MlxBank, Q4MlxLayout, QkvOutputs, QuantShape};
 
@@ -51,13 +50,7 @@ fn nibbles_for(rows: usize, cols: usize) -> Vec<u8> {
 }
 
 /// Repack row-major nibbles and scale/bias pairs into the Interleaved4 layout.
-fn interleave4(
-    nibbles: &[u8],
-    sb: &[f32],
-    rows: usize,
-    cols: usize,
-    group: usize,
-) -> (Vec<u8>, Vec<f32>) {
+fn interleave4(nibbles: &[u8], sb: &[f32], rows: usize, cols: usize, group: usize) -> (Vec<u8>, Vec<f32>) {
     assert_eq!(cols % I4_PACK_COLS, 0, "Interleaved4 needs cols % 16 == 0");
     let gpr = cols / group;
     let packs = cols / I4_PACK_COLS;
@@ -147,8 +140,7 @@ fn simd_i4_matches_the_dense_reference_and_its_row_major_twin() {
                 ),
             ] {
                 let yb = seeded(rt, rows, UNWRITTEN);
-                nn::gemv_q4_mlx_simd(rt, bank, &xb, &yb, shape(rows, cols, group), layout, None)
-                    .unwrap();
+                nn::gemv_q4_mlx_simd(rt, bank, &xb, &yb, shape(rows, cols, group), layout, None).unwrap();
                 rt.synchronize().unwrap();
                 let y = yb.read_f32()[..rows].to_vec();
                 assert!(
@@ -160,12 +152,7 @@ fn simd_i4_matches_the_dense_reference_and_its_row_major_twin() {
             }
             // Same logical weights, two packings: the layouts must agree with
             // each other, not merely each land inside the tolerance.
-            close_rel(
-                &format!("i4 vs row-major {rows}x{cols}"),
-                &got[1],
-                &got[0],
-                1e-5,
-            );
+            close_rel(&format!("i4 vs row-major {rows}x{cols}"), &got[1], &got[0], 1e-5);
         }
     });
 }
@@ -245,18 +232,10 @@ fn gemm_i4_agrees_with_the_gemv_on_every_row() {
         rt.synchronize().unwrap();
 
         let got = yb.read_f32();
-        assert!(
-            !got[..m * rows].contains(&UNWRITTEN),
-            "gemm_i4: unwritten rows"
-        );
+        assert!(!got[..m * rows].contains(&UNWRITTEN), "gemm_i4: unwritten rows");
         for i in 0..m {
             let want = dense_gemv(&b.dense, &xr[i * cols..(i + 1) * cols], rows, cols);
-            close_rel(
-                &format!("gemm_i4 row {i}"),
-                &got[i * rows..(i + 1) * rows],
-                &want,
-                3e-3,
-            );
+            close_rel(&format!("gemm_i4 row {i}"), &got[i * rows..(i + 1) * rows], &want, 3e-3);
         }
     });
 }
@@ -271,13 +250,7 @@ fn kv_i4_matches_two_separate_gemvs() {
         // A distinct V bank, or the two outputs cannot be told apart.
         let nv = nibbles_for(rows + 4, cols);
         let (_, sv, dv) = q4_mlx_matrix(rows + 4, cols, group);
-        let (ivp, ivs) = interleave4(
-            &nv[..rows * cols],
-            &sv[..rows * (cols / group) * 2],
-            rows,
-            cols,
-            group,
-        );
+        let (ivp, ivs) = interleave4(&nv[..rows * cols], &sv[..rows * (cols / group) * 2], rows, cols, group);
         let dv = dv[..rows * cols].to_vec();
 
         let x = random_f32(cols, 0x9944);
@@ -337,11 +310,7 @@ fn qkv_i4_matches_three_separate_gemvs() {
         // Perturb V's scales so it is not a copy of K.
         let nv = nibbles_for(rows_kv, cols);
         let (_, sv0, _) = q4_mlx_matrix(rows_kv, cols, group);
-        let sv: Vec<f32> = sv0
-            .iter()
-            .enumerate()
-            .map(|(i, v)| v + (i % 3) as f32 * 0.01)
-            .collect();
+        let sv: Vec<f32> = sv0.iter().enumerate().map(|(i, v)| v + (i % 3) as f32 * 0.01).collect();
         let gpr = cols / group;
         let mut dv = vec![0.0f32; rows_kv * cols];
         let svr = round_trip_bf16(&sv);
@@ -546,10 +515,7 @@ fn gemm_add_folds_the_residual_in_both_layouts() {
             .unwrap();
             rt.synchronize().unwrap();
             let got = yb.read_f32();
-            assert!(
-                !got[..m * rows].contains(&UNWRITTEN),
-                "gemm_add {name}: unwritten rows"
-            );
+            assert!(!got[..m * rows].contains(&UNWRITTEN), "gemm_add {name}: unwritten rows");
             for i in 0..m {
                 let base = dense_gemv(&b.dense, &xr[i * cols..(i + 1) * cols], rows, cols);
                 let want: Vec<f32> = base

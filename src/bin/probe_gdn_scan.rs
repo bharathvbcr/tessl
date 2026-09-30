@@ -25,8 +25,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use tessl::qwen35::{
-    self, Cols, GdnChunkPhase, GdnDims, GdnGateLogits, GdnParams, GdnQkv, GdnScanSlice,
-    GdnWorkspace, StateIn,
+    self, Cols, GdnChunkPhase, GdnDims, GdnGateLogits, GdnParams, GdnQkv, GdnScanSlice, GdnWorkspace, StateIn,
 };
 use tessl::GpuRuntime;
 
@@ -45,9 +44,7 @@ fn fill(n: usize, seed: u64, scale: f32, shift: f32) -> Vec<f32> {
     let mut s = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
     (0..n)
         .map(|_| {
-            s = s
-                .wrapping_mul(6364136223846793005)
-                .wrapping_add(1442695040888963407);
+            s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
             let u = ((s >> 32) as u32) as f64 / u32::MAX as f64 * 2.0 - 1.0;
             u as f32 * scale + shift
         })
@@ -79,18 +76,13 @@ fn scan_ms(rt: &Arc<GpuRuntime>, batch: u32, t: u32, slice: GdnScanSlice) -> Res
     let gate_ld = 2 * V_HEADS;
     let out_w = V_HEADS * V_DIM;
     let qkv = rt.alloc_tensor_f32(&[rows, qkv_ld as usize])?;
-    qkv.buffer
-        .write_f32(&fill(rows * qkv_ld as usize, 1, 1.0, 0.0));
+    qkv.buffer.write_f32(&fill(rows * qkv_ld as usize, 1, 1.0, 0.0));
     let gates = rt.alloc_tensor_f32(&[rows, gate_ld as usize])?;
-    gates
-        .buffer
-        .write_f32(&fill(rows * gate_ld as usize, 2, 2.0, 0.0));
+    gates.buffer.write_f32(&fill(rows * gate_ld as usize, 2, 2.0, 0.0));
     let a_log = rt.alloc_tensor_f32(&[V_HEADS as usize])?;
     a_log.buffer.write_f32(&fill(V_HEADS as usize, 3, 0.5, 0.0));
     let dt_bias = rt.alloc_tensor_f32(&[V_HEADS as usize])?;
-    dt_bias
-        .buffer
-        .write_f32(&fill(V_HEADS as usize, 4, 1.0, -3.0));
+    dt_bias.buffer.write_f32(&fill(V_HEADS as usize, 4, 1.0, -3.0));
     let out = rt.alloc_tensor_f32(&[rows, out_w as usize])?;
     let ws = GdnWorkspace::new(rt, &dims)?.with_scan_slice(slice);
     let q = GdnQkv {

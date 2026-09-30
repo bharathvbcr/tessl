@@ -18,9 +18,7 @@ mod common;
 use std::sync::Arc;
 
 use common::{buf, buf_bf16, random_f32, round_trip_bf16, with_gpu};
-use tessl::cross_entropy::{
-    cross_entropy_rows, CeGrads, CeHidden, CeOutput, CeWorkspace, Reduction,
-};
+use tessl::cross_entropy::{cross_entropy_rows, CeGrads, CeHidden, CeOutput, CeWorkspace, Reduction};
 use tessl::gemm::GemmOperands;
 use tessl::tensor::{DType, GpuBuffer, Tensor};
 use tessl::GpuRuntime;
@@ -181,12 +179,21 @@ fn assert_grad(label: &str, got: &[f32], want: &[f64], rel: f64) {
 
 fn assert_loss(label: &str, got: &CeOutput, want: &Reference) {
     let close = |g: f64, w: f64| (g - w).abs() <= 1e-5 + 1e-5 * w.abs();
-    let worst = got.per_row.iter().zip(&want.per_row).fold(0.0f64, |m, (g, w)| m.max((g - w).abs()));
+    let worst = got
+        .per_row
+        .iter()
+        .zip(&want.per_row)
+        .fold(0.0f64, |m, (g, w)| m.max((g - w).abs()));
     eprintln!("{label}: max per-row loss err {worst:.2e}");
     for (i, (&g, &w)) in got.per_row.iter().zip(&want.per_row).enumerate() {
         assert!(close(g, w), "{label}: row {i} loss {g} want {w}");
     }
-    assert!(close(got.loss, want.loss), "{label}: loss {} want {}", got.loss, want.loss);
+    assert!(
+        close(got.loss, want.loss),
+        "{label}: loss {} want {}",
+        got.loss,
+        want.loss
+    );
 }
 
 fn sentinel_tensor(rt: &Arc<GpuRuntime>, shape: &[usize]) -> Tensor {
@@ -241,16 +248,16 @@ fn check(rt: &Arc<GpuRuntime>, c: &Case) -> f64 {
 
     let ht = upload_at(rt, &h, c.h_dtype, &[c.rows_total, c.ld], c.h_base);
     let wt = upload_at(rt, &w, c.w_dtype, &[c.vocab, c.hidden], c.w_base);
-    let hid = CeHidden { rows: &ht, off: c.off as u32 };
+    let hid = CeHidden {
+        rows: &ht,
+        off: c.off as u32,
+    };
     let n = c.rows.len();
     // A workspace larger than the call needs, as a training loop reuses one.
-    let ws = CeWorkspace::new(rt, n as u32 + 3, c.hidden as u32, c.chunk as u32, c.w_dtype)
-        .expect("workspace");
+    let ws = CeWorkspace::new(rt, n as u32 + 3, c.hidden as u32, c.chunk as u32, c.w_dtype).expect("workspace");
 
-    let fwd = cross_entropy_rows(
-        rt, hid, &wt, &c.rows, &c.targets, c.reduction, c.operands, &ws, None,
-    )
-    .unwrap_or_else(|e| panic!("{label}: {e}"));
+    let fwd = cross_entropy_rows(rt, hid, &wt, &c.rows, &c.targets, c.reduction, c.operands, &ws, None)
+        .unwrap_or_else(|e| panic!("{label}: {e}"));
     assert_loss(&format!("{label} (forward only)"), &fwd, &want);
 
     let dh = sentinel_tensor(rt, &[n, c.hidden]);
@@ -264,12 +271,26 @@ fn check(rt: &Arc<GpuRuntime>, c: &Case) -> f64 {
         c.reduction,
         c.operands,
         &ws,
-        Some(CeGrads { dh: &dh, dw: &dw, scale: c.scale }),
+        Some(CeGrads {
+            dh: &dh,
+            dw: &dw,
+            scale: c.scale,
+        }),
     )
     .unwrap_or_else(|e| panic!("{label}: {e}"));
     assert_loss(&label, &out, &want);
-    assert_grad(&format!("{label} dh"), &dh.read_f32().expect("read"), &want.dh, grad_bound);
-    assert_grad(&format!("{label} dW"), &dw.read_f32().expect("read"), &want.dw, grad_bound);
+    assert_grad(
+        &format!("{label} dh"),
+        &dh.read_f32().expect("read"),
+        &want.dh,
+        grad_bound,
+    );
+    assert_grad(
+        &format!("{label} dW"),
+        &dw.read_f32().expect("read"),
+        &want.dw,
+        grad_bound,
+    );
     want.loss
 }
 
@@ -299,18 +320,70 @@ fn matches_the_f64_reference_across_the_chunk_walk() {
             }
         }
         // One row; vocabulary an exact multiple of the chunk; chunk of 1.
-        check(rt, &Case { rows: vec![5], targets: vec![511], vocab: 512, ..Case::small(3) });
-        check(rt, &Case { vocab: 37, chunk: 1, targets: vec![0, 36, 17, 1], ..Case::small(4) });
+        check(
+            rt,
+            &Case {
+                rows: vec![5],
+                targets: vec![511],
+                vocab: 512,
+                ..Case::small(3)
+            },
+        );
+        check(
+            rt,
+            &Case {
+                vocab: 37,
+                chunk: 1,
+                targets: vec![0, 36, 17, 1],
+                ..Case::small(4)
+            },
+        );
         // One chunk covering the whole vocabulary, and a chunk wider than it.
-        check(rt, &Case { chunk: 997, ..Case::small(5) });
-        check(rt, &Case { chunk: 4096, ..Case::small(6) });
+        check(
+            rt,
+            &Case {
+                chunk: 997,
+                ..Case::small(5)
+            },
+        );
+        check(
+            rt,
+            &Case {
+                chunk: 4096,
+                ..Case::small(6)
+            },
+        );
         // The hidden columns a window inside a wider row.
-        check(rt, &Case { ld: 96, off: 24, h_dtype: DType::BF16, ..Case::small(7) });
+        check(
+            rt,
+            &Case {
+                ld: 96,
+                off: 24,
+                h_dtype: DType::BF16,
+                ..Case::small(7)
+            },
+        );
         // Tensors that start inside their buffers (a torch view's storage
         // offset), NaN before them: odd for the gather, 16-byte aligned for
         // the weight's GEMM operands.
-        check(rt, &Case { h_base: 3, w_base: 8, h_dtype: DType::BF16, w_dtype: DType::BF16, ..Case::small(8) });
-        check(rt, &Case { h_base: 5, w_base: 4, ..Case::small(9) });
+        check(
+            rt,
+            &Case {
+                h_base: 3,
+                w_base: 8,
+                h_dtype: DType::BF16,
+                w_dtype: DType::BF16,
+                ..Case::small(8)
+            },
+        );
+        check(
+            rt,
+            &Case {
+                h_base: 5,
+                w_base: 4,
+                ..Case::small(9)
+            },
+        );
     });
 }
 
@@ -318,12 +391,32 @@ fn matches_the_f64_reference_across_the_chunk_walk() {
 fn the_running_log_sum_exp_survives_large_and_late_maxima() {
     with_gpu(|rt| {
         // Logits in the hundreds: exp without the running max overflows f32.
-        check(rt, &Case { h_scale: 12.0, ..Case::small(11) });
+        check(
+            rt,
+            &Case {
+                h_scale: 12.0,
+                ..Case::small(11)
+            },
+        );
         // The dominant logit in the last, partial chunk for row 0 and in the
         // first chunk for row 2: the running max rises late for one and never
         // for the other, and the target of row 0 is not the maximum.
-        check(rt, &Case { h_scale: 3.0, plant: Some((990, 0, 2.0)), ..Case::small(12) });
-        check(rt, &Case { h_scale: 3.0, plant: Some((5, 2, 2.0)), ..Case::small(13) });
+        check(
+            rt,
+            &Case {
+                h_scale: 3.0,
+                plant: Some((990, 0, 2.0)),
+                ..Case::small(12)
+            },
+        );
+        check(
+            rt,
+            &Case {
+                h_scale: 3.0,
+                plant: Some((5, 2, 2.0)),
+                ..Case::small(13)
+            },
+        );
         // The planted maximum is the target itself: the loss approaches 0.
         let loss = check(
             rt,
@@ -336,7 +429,10 @@ fn the_running_log_sum_exp_survives_large_and_late_maxima() {
                 ..Case::small(14)
             },
         );
-        assert!(loss < 1e-3, "a dominant target logit should give a near-zero loss, got {loss}");
+        assert!(
+            loss < 1e-3,
+            "a dominant target logit should give a near-zero loss, got {loss}"
+        );
     });
 }
 
@@ -348,7 +444,10 @@ fn the_running_log_sum_exp_survives_large_and_late_maxima() {
 #[test]
 fn bf16_operands_match_the_reference_on_the_rounded_operands() {
     with_gpu(|rt| {
-        let bf = |c: Case| Case { operands: GemmOperands::Bf16, ..c };
+        let bf = |c: Case| Case {
+            operands: GemmOperands::Bf16,
+            ..c
+        };
         check(rt, &bf(Case::small(31)));
         for (hd, wd) in [
             (DType::BF16, DType::F32),
@@ -357,11 +456,32 @@ fn bf16_operands_match_the_reference_on_the_rounded_operands() {
         ] {
             check(
                 rt,
-                &bf(Case { h_dtype: hd, w_dtype: wd, reduction: Reduction::Sum, scale: 0.7, ..Case::small(32) }),
+                &bf(Case {
+                    h_dtype: hd,
+                    w_dtype: wd,
+                    reduction: Reduction::Sum,
+                    scale: 0.7,
+                    ..Case::small(32)
+                }),
             );
         }
-        check(rt, &bf(Case { vocab: 37, chunk: 1, targets: vec![0, 36, 17, 1], ..Case::small(33) }));
-        check(rt, &bf(Case { h_scale: 3.0, plant: Some((990, 0, 2.0)), ..Case::small(34) }));
+        check(
+            rt,
+            &bf(Case {
+                vocab: 37,
+                chunk: 1,
+                targets: vec![0, 36, 17, 1],
+                ..Case::small(33)
+            }),
+        );
+        check(
+            rt,
+            &bf(Case {
+                h_scale: 3.0,
+                plant: Some((990, 0, 2.0)),
+                ..Case::small(34)
+            }),
+        );
 
         let exact = check(rt, &Case::small(35));
         let rounded = check(rt, &bf(Case::small(35)));
@@ -416,7 +536,10 @@ fn the_workspace_is_bounded_by_rows_and_chunk_not_vocabulary() {
     let b = CeWorkspace::bytes_for(8, 2048, 4096, DType::BF16);
     let want = 4 * (5 * 8 + 2 * 8 * 2048 + 8 * 4096 + 4096 * 2048);
     assert_eq!(b, want);
-    assert_eq!(CeWorkspace::bytes_for(8, 2048, 4096, DType::F32), want - 4 * 4096 * 2048);
+    assert_eq!(
+        CeWorkspace::bytes_for(8, 2048, 4096, DType::F32),
+        want - 4 * 4096 * 2048
+    );
     with_gpu(|rt| {
         let ws = CeWorkspace::new(rt, 8, 2048, 4096, DType::BF16).expect("workspace");
         assert_eq!(ws.bytes(), b);
@@ -440,8 +563,18 @@ fn rejects_what_it_cannot_compute() {
                    targets: &[u32],
                    ws: &CeWorkspace,
                    grads: Option<CeGrads<'_>>| {
-            cross_entropy_rows(rt, hid, wt, rows, targets, Reduction::Mean, GemmOperands::ExactF32, ws, grads)
-                .map(|o| o.loss)
+            cross_entropy_rows(
+                rt,
+                hid,
+                wt,
+                rows,
+                targets,
+                Reduction::Mean,
+                GemmOperands::ExactF32,
+                ws,
+                grads,
+            )
+            .map(|o| o.loss)
         };
         let expect_err = |r: Result<f64, String>, needle: &str| match r {
             Ok(l) => panic!("expected an error containing {needle:?}, got loss {l}"),
@@ -453,7 +586,10 @@ fn rejects_what_it_cannot_compute() {
         expect_err(run(hid, &wt, &[0; 5], &[0; 5], &ws, None), "exceed the workspace");
         expect_err(run(hid, &wt, &[1, 10], &[0, 0], &ws, None), "rows[1] = 10");
         expect_err(run(hid, &wt, &[1, 2], &[996, 997], &ws, None), "targets[1] = 997");
-        expect_err(run(CeHidden { off: 8, ..hid }, &wt, &[1], &[1], &ws, None), "exceeds ld");
+        expect_err(
+            run(CeHidden { off: 8, ..hid }, &wt, &[1], &[1], &ws, None),
+            "exceeds ld",
+        );
         let flat = ht.try_view(&[640], 0).unwrap();
         expect_err(run(CeHidden { rows: &flat, off: 0 }, &wt, &[1], &[1], &ws, None), "2-D");
         let w16 = rt.alloc_tensor_f16(&[997, 64]).unwrap();
@@ -470,7 +606,10 @@ fn rejects_what_it_cannot_compute() {
             "hidden belongs to another runtime",
         );
 
-        expect_err(CeWorkspace::new(rt, 4, 60, 128, DType::F32).map(|_| 0.0), "multiple of 8");
+        expect_err(
+            CeWorkspace::new(rt, 4, 60, 128, DType::F32).map(|_| 0.0),
+            "multiple of 8",
+        );
         expect_err(CeWorkspace::new(rt, 0, 64, 128, DType::F32).map(|_| 0.0), "non-zero");
         expect_err(CeWorkspace::new(rt, 4, 64, 0, DType::F32).map(|_| 0.0), "non-zero");
         expect_err(CeWorkspace::new(rt, 4, 64, 8, DType::F16).map(|_| 0.0), "f32 or bf16");
@@ -479,7 +618,10 @@ fn rejects_what_it_cannot_compute() {
         let dh = rt.alloc_tensor_f32(&[2, 64]).expect("alloc");
         let dw = rt.alloc_tensor_f32(&[997, 64]).expect("alloc");
         let g = |dh, dw, scale| Some(CeGrads { dh, dw, scale });
-        expect_err(run(hid, &wt, &[1], &[1], &ws, g(&dh, &dw, 1.0)), "dh must be f32 [1, 64]");
+        expect_err(
+            run(hid, &wt, &[1], &[1], &ws, g(&dh, &dw, 1.0)),
+            "dh must be f32 [1, 64]",
+        );
         expect_err(run(hid, &wt, &[1, 2], &[1, 2], &ws, g(&dh, &dw, f32::NAN)), "finite");
         let dw_as_dh = dw.try_view(&[2, 64], 0).expect("view");
         expect_err(
@@ -498,8 +640,15 @@ fn rejects_what_it_cannot_compute() {
         // One storage, disjoint windows: hidden rows [0, 4), dh rows [8, 10).
         let h_head = ht.try_view(&[4, 64], 0).expect("view");
         let dh_tail = ht.try_view(&[2, 64], 8 * 64).expect("view");
-        run(CeHidden { rows: &h_head, off: 0 }, &wt, &[1, 2], &[1, 2], &ws, g(&dh_tail, &dw, 1.0))
-            .expect("disjoint windows of one buffer are not an overlap");
+        run(
+            CeHidden { rows: &h_head, off: 0 },
+            &wt,
+            &[1, 2],
+            &[1, 2],
+            &ws,
+            g(&dh_tail, &dw, 1.0),
+        )
+        .expect("disjoint windows of one buffer are not an overlap");
 
         // Non-finite inputs surface as an error, not a NaN loss.
         let mut bad = h.clone();

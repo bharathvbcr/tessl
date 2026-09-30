@@ -207,12 +207,12 @@
 //! the second class: write the comment.
 
 pub mod ab_flags;
+pub mod attn_train;
 pub mod capi;
 pub mod cb_replay;
 pub mod cross_entropy;
 pub mod decode_icb;
 pub mod dispatch;
-pub mod attn_train;
 pub mod gdn_train;
 pub mod gemm;
 pub mod icb_smoke;
@@ -225,37 +225,31 @@ pub mod npy;
 pub mod ops;
 pub mod qwen35;
 pub mod qwen35_bwd;
-pub mod qwen35_train;
 pub mod qwen35_model;
 pub mod qwen35_params;
+pub mod qwen35_train;
 pub mod runtime;
 pub mod safetensors;
 pub mod tensor;
 
 pub use cb_replay::{
-    cb_replay_api_gap_summary, survey_cb_replay_api_gaps, ArgTableSlot, ArgTableSlotPlan,
-    CbReplayApiGap, CbReplayError, CbReplayPhase, CbSlot, IcbCommandTypeHint, IcbReplayStub,
-    IcbStubPhase, PingPongCbReplay,
+    cb_replay_api_gap_summary, survey_cb_replay_api_gaps, ArgTableSlot, ArgTableSlotPlan, CbReplayApiGap,
+    CbReplayError, CbReplayPhase, CbSlot, IcbCommandTypeHint, IcbReplayStub, IcbStubPhase, PingPongCbReplay,
 };
 pub use decode_icb::{
-    begin_decode_icb_capture, binder_encode_nop, decode_icb_capture_active, decode_icb_enabled,
-    end_decode_icb_capture, icb_coarse_ranges_enabled, icb_freeze_binds_enabled,
-    icb_pipelines_enabled, icb_range_batch_enabled, pipeline_icb, set_binder_encode_nop,
-    set_decode_icb, set_icb_coarse_ranges, set_icb_freeze_binds, set_icb_pipelines,
-    set_icb_range_batch, take_decode_icb_capture, BinderEncodeNopGuard, DecodeIcb, DecodeIcbBind,
-    DecodeIcbCapture, DecodeIcbCommand,
+    begin_decode_icb_capture, binder_encode_nop, decode_icb_capture_active, decode_icb_enabled, end_decode_icb_capture,
+    icb_coarse_ranges_enabled, icb_freeze_binds_enabled, icb_pipelines_enabled, icb_range_batch_enabled, pipeline_icb,
+    set_binder_encode_nop, set_decode_icb, set_icb_coarse_ranges, set_icb_freeze_binds, set_icb_pipelines,
+    set_icb_range_batch, take_decode_icb_capture, BinderEncodeNopGuard, DecodeIcb, DecodeIcbBind, DecodeIcbCapture,
+    DecodeIcbCommand,
 };
 pub use gemm::{
-    cast_f16_to_f32, cast_f32_to_f16, gemm, gemm_batched, gemm_epilogue, gemm_f32, Activation,
-    BatchStrides, BatchedGemm, Epilogue, GemmBackend,
+    cast_f16_to_f32, cast_f32_to_f16, gemm, gemm_batched, gemm_epilogue, gemm_f32, Activation, BatchStrides,
+    BatchedGemm, Epilogue, GemmBackend,
 };
-pub use icb_smoke::{
-    icb_smoke_enabled, run_copy_f32_smoke, set_icb_smoke, IcbBindBridge, IcbCopySmoke,
-};
+pub use icb_smoke::{icb_smoke_enabled, run_copy_f32_smoke, set_icb_smoke, IcbBindBridge, IcbCopySmoke};
 #[cfg(feature = "quant-prep")]
-pub use mtl_tensor::{
-    nax_verify_readiness, NaxVerifyReadiness, QuantDType, QUANT_PREFILL_GEMM_WIRED,
-};
+pub use mtl_tensor::{nax_verify_readiness, NaxVerifyReadiness, QuantDType, QUANT_PREFILL_GEMM_WIRED};
 pub use ops::softcap_f32;
 pub use runtime::{BufferKind, DeviceMemoryInfo, GpuRuntime, ParamsBuffer, PrecisionMode};
 pub use tensor::{DType, GpuBuffer, Tensor};

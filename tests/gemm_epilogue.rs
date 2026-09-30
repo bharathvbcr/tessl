@@ -61,8 +61,7 @@ fn reference(
                 Activation::Relu => v.max(0.0),
                 Activation::GeluTanh => {
                     let xc = v.clamp(-20.0, 20.0);
-                    let inner =
-                        0.7978845608028654f64 * (xc as f64 + 0.044715 * (xc as f64).powi(3));
+                    let inner = 0.7978845608028654f64 * (xc as f64 + 0.044715 * (xc as f64).powi(3));
                     (0.5 * xc as f64 * (1.0 + inner.clamp(-10.0, 10.0).tanh())) as f32
                 }
                 Activation::Silu => v / (1.0 + (-v).exp()),
@@ -276,17 +275,12 @@ fn an_identity_epilogue_equals_a_plain_gemm_bit_for_bit() {
         let plain = tensor(rt, &[m, n], &vec![0.0f32; m * n]);
         gemm(&a, &b, &plain, GemmBackend::TensorOps).expect("gemm");
         let fused = tensor(rt, &[m, n], &vec![0.0f32; m * n]);
-        gemm_epilogue(&a, &b, &fused, GemmBackend::TensorOps, Epilogue::default())
-            .expect("gemm_epilogue");
+        gemm_epilogue(&a, &b, &fused, GemmBackend::TensorOps, Epilogue::default()).expect("gemm_epilogue");
         rt.synchronize().unwrap();
 
         let (p, f) = (plain.buffer.read_f32(), fused.buffer.read_f32());
         for i in 0..m * n {
-            assert_eq!(
-                p[i].to_bits(),
-                f[i].to_bits(),
-                "identity epilogue differs at {i}"
-            );
+            assert_eq!(p[i].to_bits(), f[i].to_bits(), "identity epilogue differs at {i}");
         }
     });
 }
@@ -304,14 +298,12 @@ fn the_epilogue_refuses_paths_with_nothing_to_fuse_into() {
         };
 
         // Simdgroup writes C straight from the matmul: no register accumulator.
-        let err = gemm_epilogue(&a, &b, &c, GemmBackend::Simdgroup, epi)
-            .expect_err("simdgroup has nowhere to fuse");
+        let err = gemm_epilogue(&a, &b, &c, GemmBackend::Simdgroup, epi).expect_err("simdgroup has nowhere to fuse");
         assert!(err.contains("cooperative-destination"), "{err}");
 
         // Exact f32 TensorOps likewise.
         rt.set_relaxed_precision(false);
-        let err = gemm_epilogue(&a, &b, &c, GemmBackend::TensorOps, epi)
-            .expect_err("exact f32 has nowhere to fuse");
+        let err = gemm_epilogue(&a, &b, &c, GemmBackend::TensorOps, epi).expect_err("exact f32 has nowhere to fuse");
         assert!(err.contains("cooperative-destination"), "{err}");
     });
 }

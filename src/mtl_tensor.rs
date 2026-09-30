@@ -13,8 +13,8 @@ use objc2::runtime::ProtocolObject;
 use objc2::AnyThread;
 use objc2_foundation::NSInteger;
 use objc2_metal::{
-    MTLBuffer, MTLDevice, MTLResourceID, MTLResourceOptions, MTLSizeAndAlign, MTLTensor,
-    MTLTensorDataType, MTLTensorDescriptor, MTLTensorExtents, MTLTensorUsage,
+    MTLBuffer, MTLDevice, MTLResourceID, MTLResourceOptions, MTLSizeAndAlign, MTLTensor, MTLTensorDataType,
+    MTLTensorDescriptor, MTLTensorExtents, MTLTensorUsage,
 };
 use std::sync::Arc;
 
@@ -38,16 +38,14 @@ impl QuantDType {
     pub fn to_mtl(self) -> Result<MTLTensorDataType, String> {
         match self {
             QuantDType::Int8 => Ok(MTLTensorDataType::Int8),
-            QuantDType::Int4 => Err(
-                "MTLTensorDataType Int4 is not in objc2-metal 0.3 (WWDC26-330), so a \
+            QuantDType::Int4 => Err("MTLTensorDataType Int4 is not in objc2-metal 0.3 (WWDC26-330), so a \
                  host-created Int4 MTLTensor cannot be described. Note this gates only \
                  the host descriptor path: TensorOps itself accepts int4b_format, and \
                  kernels building tensors from device pointers are unaffected."
-                    .into(),
-            ),
-            QuantDType::Fp8E8M0 => Err(
-                "FP8 E8M0 MTLTensor scale planes require newer Metal SDK (macOS 27+ notes)".into(),
-            ),
+                .into()),
+            QuantDType::Fp8E8M0 => {
+                Err("FP8 E8M0 MTLTensor scale planes require newer Metal SDK (macOS 27+ notes)".into())
+            }
         }
     }
 
@@ -169,22 +167,14 @@ pub fn bind_mtl_tensor(bnd: &mut Binder<'_>, t: &GpuTensor, index: usize) -> Res
 ///
 /// **Experimental:** some objc2 / SDK combinations have SIGSEGV'd on this
 /// selector for unsupported layouts — gate behind Phase-2 smoke before use.
-pub fn probe_tensor_support(
-    rt: &GpuRuntime,
-    dtype: QuantDType,
-    dims: &[usize],
-) -> Result<MTLSizeAndAlign, String> {
+pub fn probe_tensor_support(rt: &GpuRuntime, dtype: QuantDType, dims: &[usize]) -> Result<MTLSizeAndAlign, String> {
     let mtl_dtype = dtype.to_mtl()?;
     let desc = make_descriptor(dims, mtl_dtype, MTLTensorUsage::Compute)?;
     Ok(rt.device.tensorSizeAndAlignWithDescriptor(&desc))
 }
 
 /// Allocate a device-backed MTLTensor (no storage shared with [`GpuBuffer`]).
-pub fn alloc_device_tensor(
-    rt: &Arc<GpuRuntime>,
-    dims: &[usize],
-    dtype: QuantDType,
-) -> Result<GpuTensor, String> {
+pub fn alloc_device_tensor(rt: &Arc<GpuRuntime>, dims: &[usize], dtype: QuantDType) -> Result<GpuTensor, String> {
     let mtl_dtype = dtype.to_mtl()?;
     let desc = make_descriptor(dims, mtl_dtype, MTLTensorUsage::Compute)?;
     let tensor = rt
@@ -252,14 +242,9 @@ fn make_descriptor(
 
 fn extents_from_dims(dims: &[usize]) -> Result<Retained<MTLTensorExtents>, String> {
     let values: Vec<NSInteger> = dims.iter().map(|&d| d as NSInteger).collect();
-    let extents = unsafe {
-        MTLTensorExtents::initWithRank_values(
-            MTLTensorExtents::alloc(),
-            values.len() as _,
-            values.as_ptr(),
-        )
-    }
-    .ok_or_else(|| "MTLTensorExtents::initWithRank_values failed".to_string())?;
+    let extents =
+        unsafe { MTLTensorExtents::initWithRank_values(MTLTensorExtents::alloc(), values.len() as _, values.as_ptr()) }
+            .ok_or_else(|| "MTLTensorExtents::initWithRank_values failed".to_string())?;
     Ok(extents)
 }
 
@@ -272,10 +257,7 @@ mod tests {
         assert!(QuantDType::Int8.to_mtl().is_ok());
         let err = QuantDType::Int4.to_mtl().unwrap_err();
         assert!(err.contains("Int4"), "{err}");
-        assert!(
-            err.contains("unbound") || err.contains("not in objc2"),
-            "{err}"
-        );
+        assert!(err.contains("unbound") || err.contains("not in objc2"), "{err}");
         assert!(QuantDType::Fp8E8M0.to_mtl().is_err());
     }
 
@@ -321,8 +303,7 @@ mod tests {
     /// SIGSEGV on some SDK/runtime combos when probing unsupported layouts.
     #[test]
     fn quant_descriptor_builds_for_int8() {
-        let desc = make_descriptor(&[64, 64], MTLTensorDataType::Int8, MTLTensorUsage::Compute)
-            .expect("descriptor");
+        let desc = make_descriptor(&[64, 64], MTLTensorDataType::Int8, MTLTensorUsage::Compute).expect("descriptor");
         assert_eq!(desc.dataType(), MTLTensorDataType::Int8);
         assert_eq!(desc.dimensions().rank(), 2);
     }

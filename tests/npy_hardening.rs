@@ -59,10 +59,18 @@ fn well_formed_files_still_read() {
     assert_eq!(a.shape, vec![2, 3]);
     assert_eq!(a.f32_slice().unwrap(), &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
     // A scalar and an empty array.
-    let p = v1("scalar", "{'descr': '<f4', 'fortran_order': False, 'shape': (), }", &f32_bytes(&[7.0]));
+    let p = v1(
+        "scalar",
+        "{'descr': '<f4', 'fortran_order': False, 'shape': (), }",
+        &f32_bytes(&[7.0]),
+    );
     assert_eq!(read_npy(&p).unwrap().f32_slice().unwrap(), &[7.0]);
     std::fs::remove_file(&p).unwrap();
-    let p = v1("empty", "{'descr': '<f4', 'fortran_order': False, 'shape': (0, 5), }", &[]);
+    let p = v1(
+        "empty",
+        "{'descr': '<f4', 'fortran_order': False, 'shape': (0, 5), }",
+        &[],
+    );
     assert!(read_npy(&p).unwrap().f32_slice().unwrap().is_empty());
     std::fs::remove_file(&p).unwrap();
     // The writer's own output round-trips.
@@ -130,9 +138,13 @@ fn headers_outside_the_supported_format_are_refused() {
 fn transpose_last2_checks_the_data_against_the_shape() {
     let mut shape = [2usize, 3];
     let mut short = vec![0.0f32; 5];
-    assert!(transpose_last2(&mut short, &mut shape).unwrap_err().contains("data has 5"));
+    assert!(transpose_last2(&mut short, &mut shape)
+        .unwrap_err()
+        .contains("data has 5"));
     let mut long = vec![0.0f32; 7];
-    assert!(transpose_last2(&mut long, &mut shape).unwrap_err().contains("data has 7"));
+    assert!(transpose_last2(&mut long, &mut shape)
+        .unwrap_err()
+        .contains("data has 7"));
     let mut ok = vec![1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0];
     transpose_last2(&mut ok, &mut shape).unwrap();
     assert_eq!(shape, [3, 2]);

@@ -58,7 +58,10 @@ impl GdnTrainDims {
             return Err(format!("{what}: batch, seq and heads must be non-zero"));
         }
         if self.v_dim == 0 || self.v_dim % GDN_TRAIN_BV != 0 {
-            return Err(format!("{what}: v_dim must be a non-zero multiple of {GDN_TRAIN_BV}, got {}", self.v_dim));
+            return Err(format!(
+                "{what}: v_dim must be a non-zero multiple of {GDN_TRAIN_BV}, got {}",
+                self.v_dim
+            ));
         }
         // Every buffer and grid below is sized from these; check the largest.
         let rows = u64::from(self.batch) * u64::from(self.seq) * u64::from(self.heads);
@@ -147,7 +150,11 @@ fn want(t: &Tensor, shape: &[usize], name: &str, what: &str, rt: &Arc<GpuRuntime
         return Err(format!("{what}: {name} belongs to another runtime"));
     }
     if t.dtype != DType::F32 || t.shape() != shape {
-        return Err(format!("{what}: {name} must be f32 {shape:?}, got {:?} {:?}", t.dtype, t.shape()));
+        return Err(format!(
+            "{what}: {name} must be f32 {shape:?}, got {:?} {:?}",
+            t.dtype,
+            t.shape()
+        ));
     }
     Ok(())
 }
@@ -196,7 +203,13 @@ pub struct GdnTrainInputs<'a> {
 
 impl GdnTrainInputs<'_> {
     fn check(&self, rt: &Arc<GpuRuntime>, d: &GdnTrainDims, what: &str) -> Result<(), String> {
-        let (b, t, h, dv, dk) = (d.batch as usize, d.seq as usize, d.heads as usize, d.v_dim as usize, GDN_TRAIN_DK as usize);
+        let (b, t, h, dv, dk) = (
+            d.batch as usize,
+            d.seq as usize,
+            d.heads as usize,
+            d.v_dim as usize,
+            GDN_TRAIN_DK as usize,
+        );
         want(self.q, &[b, t, h, dk], "q", what, rt)?;
         want(self.k, &[b, t, h, dk], "k", what, rt)?;
         want(self.v, &[b, t, h, dv], "v", what, rt)?;
@@ -209,7 +222,13 @@ impl GdnTrainInputs<'_> {
     }
 
     fn named(&self) -> Vec<(&'static str, &Tensor)> {
-        let mut v = vec![("q", self.q), ("k", self.k), ("v", self.v), ("g", self.g), ("beta", self.beta)];
+        let mut v = vec![
+            ("q", self.q),
+            ("k", self.k),
+            ("v", self.v),
+            ("g", self.g),
+            ("beta", self.beta),
+        ];
         if let Some(s0) = self.s0 {
             v.push(("s0", s0));
         }
@@ -231,7 +250,13 @@ pub fn gdn_train_forward(
     const WHAT: &str = "gdn_train_forward";
     dims.validate(WHAT)?;
     x.check(rt, &dims, WHAT)?;
-    let (b, t, h, dv, dk) = (dims.batch as usize, dims.seq as usize, dims.heads as usize, dims.v_dim as usize, GDN_TRAIN_DK as usize);
+    let (b, t, h, dv, dk) = (
+        dims.batch as usize,
+        dims.seq as usize,
+        dims.heads as usize,
+        dims.v_dim as usize,
+        GDN_TRAIN_DK as usize,
+    );
     want(o, &[b, t, h, dv], "o", WHAT, rt)?;
     want(ckpt, &dims.checkpoint_shape(), "ckpt", WHAT, rt)?;
     let mut outs = vec![("o", o), ("ckpt", ckpt)];
@@ -289,7 +314,13 @@ pub fn gdn_train_backward(
     const WHAT: &str = "gdn_train_backward";
     dims.validate(WHAT)?;
     x.check(rt, &dims, WHAT)?;
-    let (b, t, h, dv, dk) = (dims.batch as usize, dims.seq as usize, dims.heads as usize, dims.v_dim as usize, GDN_TRAIN_DK as usize);
+    let (b, t, h, dv, dk) = (
+        dims.batch as usize,
+        dims.seq as usize,
+        dims.heads as usize,
+        dims.v_dim as usize,
+        GDN_TRAIN_DK as usize,
+    );
     if ws.dims != dims {
         return Err(format!("{WHAT}: the workspace is for {:?}, not {dims:?}", ws.dims));
     }

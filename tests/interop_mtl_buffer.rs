@@ -36,11 +36,7 @@ fn from_mtl_buffer_gemm_operand_matches_native_tensor() {
         let got = c.buffer.read_f32();
         assert_eq!(want.len(), got.len());
         for (i, (w, g)) in want.iter().zip(got.iter()).enumerate() {
-            assert_eq!(
-                w.to_bits(),
-                g.to_bits(),
-                "external C diverged at [{i}]: {w} vs {g}"
-            );
+            assert_eq!(w.to_bits(), g.to_bits(), "external C diverged at [{i}]: {w} vs {g}");
         }
         assert!(want.iter().any(|&x| x != 0.0));
         // Commit advanced the SharedEvent timeline used for cross-crate handoff.
@@ -57,8 +53,8 @@ fn from_mtl_buffer_rejects_short_buffer_and_bad_offset() {
             .newBufferWithLength_options(16, MTLResourceOptions::StorageModeShared)
             .expect("16-byte buffer");
         // SAFETY (this and the next wrap): a fresh buffer only this runtime touches.
-        let err = unsafe { Tensor::from_mtl_buffer(rt, raw.clone(), &[8], DType::F32, 0) }
-            .expect_err("8 f32 need 32 bytes");
+        let err =
+            unsafe { Tensor::from_mtl_buffer(rt, raw.clone(), &[8], DType::F32, 0) }.expect_err("8 f32 need 32 bytes");
         assert!(
             err.contains("out of bounds") || err.contains("misaligned"),
             "unexpected: {err}"
@@ -75,10 +71,7 @@ fn from_mtl_buffer_rejects_foreign_device_when_available() {
         if devices.count() < 2 {
             return;
         }
-        let Some(foreign) = devices
-            .iter()
-            .find(|d| d.registryID() != rt.device.registryID())
-        else {
+        let Some(foreign) = devices.iter().find(|d| d.registryID() != rt.device.registryID()) else {
             return;
         };
         let raw = foreign
@@ -86,10 +79,7 @@ fn from_mtl_buffer_rejects_foreign_device_when_available() {
             .expect("foreign buffer");
         // SAFETY: a fresh buffer; the wrap is refused before any use.
         let err = unsafe { Tensor::from_mtl_buffer(rt, raw, &[4], DType::F32, 0) }.unwrap_err();
-        assert!(
-            err.contains("registryID"),
-            "expected registryID rejection, got {err}"
-        );
+        assert!(err.contains("registryID"), "expected registryID rejection, got {err}");
     });
 }
 
@@ -107,7 +97,11 @@ fn a_wrapped_private_buffer_refuses_host_access_but_serves_the_gpu() {
         // SAFETY: a fresh buffer only this runtime touches.
         let t = unsafe { Tensor::from_mtl_buffer(rt, raw, &[4, 4], DType::F32, 0) }
             .expect("a private buffer is a valid GPU operand");
-        let err = t.buffer.try_contents_u8().err().expect("host mapping of private storage");
+        let err = t
+            .buffer
+            .try_contents_u8()
+            .err()
+            .expect("host mapping of private storage");
         assert!(err.contains("private"), "{err}");
         assert!(t.read_f32().is_err(), "Tensor::read_f32 of private storage");
         // GPU use: C = A * B into the private buffer, then copied out on the GPU.

@@ -72,10 +72,7 @@ fn numel(shape: &[usize]) -> usize {
 fn worst_abs(got: &[f64], want: &[f64]) -> (f64, f64) {
     assert_eq!(got.len(), want.len());
     let mag = want.iter().fold(0.0f64, |m, x| m.max(x.abs()));
-    let err = got
-        .iter()
-        .zip(want)
-        .fold(0.0f64, |m, (g, w)| m.max((g - w).abs()));
+    let err = got.iter().zip(want).fold(0.0f64, |m, (g, w)| m.max((g - w).abs()));
     (err, mag)
 }
 
@@ -116,10 +113,7 @@ fn the_f64_reference_is_not_silently_narrowed_to_f32() {
     let path = fixture_dir().join(format!("gdn_published_{case}_y_seq_f64.npy"));
     let arr = read_npy(&path).expect("reference loads");
 
-    assert!(
-        arr.data_f32.is_none(),
-        "an <f8 file must not populate data_f32"
-    );
+    assert!(arr.data_f32.is_none(), "an <f8 file must not populate data_f32");
     let err = arr
         .f32_slice()
         .expect_err("f32_slice on an f64 array must be refused, not coerced");
@@ -140,11 +134,7 @@ fn every_case_ships_both_a_chunked_output_and_an_f64_reference() {
             assert!(path.is_file(), "missing {}", path.display());
         }
     }
-    assert_eq!(
-        cases.len(),
-        13,
-        "expected the 13 published cases; found {cases:?}"
-    );
+    assert_eq!(cases.len(), 13, "expected the 13 published cases; found {cases:?}");
 }
 
 /// The corpus is internally consistent: the chunked f32 output agrees with the
@@ -160,9 +150,8 @@ fn the_chunked_output_agrees_with_the_f64_sequential_reference() {
     for case in case_names() {
         let chunked = read_npy(&fixture_dir().join(format!("gdn_published_{case}_y_chunked.npy")))
             .unwrap_or_else(|e| panic!("load {case} chunked: {e}"));
-        let reference =
-            read_npy(&fixture_dir().join(format!("gdn_published_{case}_y_seq_f64.npy")))
-                .unwrap_or_else(|e| panic!("load {case} reference: {e}"));
+        let reference = read_npy(&fixture_dir().join(format!("gdn_published_{case}_y_seq_f64.npy")))
+            .unwrap_or_else(|e| panic!("load {case} reference: {e}"));
 
         assert_eq!(
             chunked.shape, reference.shape,
@@ -177,17 +166,11 @@ fn the_chunked_output_agrees_with_the_f64_sequential_reference() {
         // element: an element near zero cannot be held to a relative bound, and
         // judging it by its own value would demand precision f32 cannot give.
         let mag = want.iter().fold(0.0f64, |m, v| m.max(v.abs()));
-        assert!(
-            mag > 0.0,
-            "{case}: reference is all zeros, nothing is tested"
-        );
+        assert!(mag > 0.0, "{case}: reference is all zeros, nothing is tested");
         let bound = REL_BOUND * mag;
 
         for (i, (g, w)) in got.iter().zip(want).enumerate() {
-            assert!(
-                g.is_finite(),
-                "{case}[{i}]: chunked output is non-finite: {g}"
-            );
+            assert!(g.is_finite(), "{case}[{i}]: chunked output is non-finite: {g}");
             let err = (f64::from(*g) - *w).abs();
             assert!(
                 err <= bound,
@@ -232,8 +215,8 @@ fn published_rule_is_declared_by_every_fixture_and_the_manifest() {
         );
     }
 
-    let manifest = std::fs::read_to_string(fixture_dir().join("gdn_published_MANIFEST.json"))
-        .expect("manifest must exist");
+    let manifest =
+        std::fs::read_to_string(fixture_dir().join("gdn_published_MANIFEST.json")).expect("manifest must exist");
     assert!(
         manifest.contains("\"rule\": \"published\""),
         "rule 9: the manifest must declare rule=published"
@@ -259,10 +242,7 @@ fn f32_and_i64_survive_a_round_trip_through_the_reader() {
     let back = read_npy(&f32_path).expect("read f32");
     assert_eq!(back.shape, vec![2, 3]);
     assert_eq!(back.f32_slice().expect("f32 payload"), values.as_slice());
-    assert!(
-        back.data_f64.is_none(),
-        "an <f4 file must not populate data_f64"
-    );
+    assert!(back.data_f64.is_none(), "an <f4 file must not populate data_f64");
 
     // i64 has no writer in the crate, so build the v1.0 file by hand.
     let i64_path = dir.join("rt_i64.npy");
@@ -273,11 +253,7 @@ fn f32_and_i64_survive_a_round_trip_through_the_reader() {
     );
     let mut bytes = Vec::new();
     bytes.extend_from_slice(b"\x93NUMPY\x01\x00");
-    bytes.extend_from_slice(
-        &u16::try_from(header.len())
-            .expect("header fits")
-            .to_le_bytes(),
-    );
+    bytes.extend_from_slice(&u16::try_from(header.len()).expect("header fits").to_le_bytes());
     bytes.extend_from_slice(header.as_bytes());
     for v in &ints {
         bytes.extend_from_slice(&v.to_le_bytes());
@@ -301,20 +277,13 @@ fn an_unsupported_dtype_is_still_refused_and_named() {
     let header = "{'descr': '<c16', 'fortran_order': False, 'shape': (1,), }\n";
     let mut bytes = Vec::new();
     bytes.extend_from_slice(b"\x93NUMPY\x01\x00");
-    bytes.extend_from_slice(
-        &u16::try_from(header.len())
-            .expect("header fits")
-            .to_le_bytes(),
-    );
+    bytes.extend_from_slice(&u16::try_from(header.len()).expect("header fits").to_le_bytes());
     bytes.extend_from_slice(header.as_bytes());
     bytes.extend_from_slice(&[0u8; 16]);
     std::fs::write(&path, &bytes).expect("write");
 
     let err = read_npy(&path).expect_err("complex128 must be refused");
-    assert!(
-        err.contains("<c16"),
-        "refusal must name the dtype, got: {err}"
-    );
+    assert!(err.contains("<c16"), "refusal must name the dtype, got: {err}");
 
     std::fs::remove_dir_all(&dir).expect("clean temp dir");
 }
@@ -423,11 +392,7 @@ fn every_manifest_declares_the_clamps_the_reference_applies() {
         .map(|e| e.expect("readable dir entry").path())
         .filter(|p| p.to_string_lossy().ends_with("_meta.json"))
         .collect();
-    assert!(
-        !metas.is_empty(),
-        "no per-case manifests found in {}",
-        dir.display()
-    );
+    assert!(!metas.is_empty(), "no per-case manifests found in {}", dir.display());
 
     // Formatted by the generator with this exact indentation; a reformat should
     // fail loudly here rather than let the constant drift unnoticed.
@@ -469,9 +434,7 @@ fn every_manifest_declares_the_clamps_the_reference_applies() {
 fn the_alpha_clamp_changes_the_answer_on_the_case_built_to_probe_it() {
     let c = load_case("L65_tinyalpha");
     assert!(
-        c.alpha
-            .iter()
-            .all(|a| f64::from(*a) < GateClamp::PUBLISHED.alpha.0),
+        c.alpha.iter().all(|a| f64::from(*a) < GateClamp::PUBLISHED.alpha.0),
         "L65_tinyalpha is supposed to store an alpha below the clamp floor"
     );
 
@@ -479,10 +442,7 @@ fn the_alpha_clamp_changes_the_answer_on_the_case_built_to_probe_it() {
         alpha: (0.0, 1.0),
         beta: GateClamp::PUBLISHED.beta,
     };
-    let (err, mag) = worst_abs(
-        &sequential_f64(&c.problem(), Rule::Published, unclamped),
-        &c.golden,
-    );
+    let (err, mag) = worst_abs(&sequential_f64(&c.problem(), Rule::Published, unclamped), &c.golden);
     assert!(
         err / mag > 1e-6,
         "skipping the alpha clamp changed nothing ({:.3e} relative); the corpus no \

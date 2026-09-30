@@ -84,14 +84,8 @@ fn bf16_widening_into_a_view_is_exact_and_checks_its_destination() {
         reject(&big.try_view(&[6], 0).unwrap(), "flattened shape");
         reject(&rt.alloc_tensor_bf16(&[2, 3]).unwrap(), "bf16 destination");
         // The source's own bytes viewed as f32 (12 bytes = 3 floats).
-        let alias = tessl::tensor::Tensor::from_buffer(
-            rt,
-            src.buffer.clone(),
-            &[1, 3],
-            tessl::tensor::DType::F32,
-            0,
-        )
-        .unwrap();
+        let alias =
+            tessl::tensor::Tensor::from_buffer(rt, src.buffer.clone(), &[1, 3], tessl::tensor::DType::F32, 0).unwrap();
         let e = cast_bf16_to_f32_into(&src, &alias).expect_err("aliasing destination");
         assert!(e.contains("cast destination"), "aliasing: {e}");
     });

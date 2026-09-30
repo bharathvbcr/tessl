@@ -17,10 +17,9 @@ use objc2_metal::{MTLBuffer, MTLDevice, MTLResourceOptions};
 use tessl::capi::{
     tessl_abi_version, tessl_cross_entropy_rows, tessl_mtl_buffer_length, tessl_qwen35_copy, tessl_qwen35_free,
     tessl_qwen35_load, tessl_qwen35_param_count, tessl_qwen35_param_info, tessl_qwen35_train_step, tessl_runtime_free,
-    tessl_runtime_new, tessl_synchronize, TesslCeArgs, TesslRuntime, TesslTensorRef, TESSL_ABI_VERSION,
-    TESSL_ERR, TESSL_F32, TESSL_MAX_DIMS, TESSL_OK, TESSL_OPERANDS_BF16, TESSL_OPERANDS_EXACT_F32, TESSL_READ_GRADS,
-    TESSL_READ_PARAMS, TESSL_WRITE_PARAMS,
-    TesslParamInfo, TesslQwen35,
+    tessl_runtime_new, tessl_synchronize, TesslCeArgs, TesslParamInfo, TesslQwen35, TesslRuntime, TesslTensorRef,
+    TESSL_ABI_VERSION, TESSL_ERR, TESSL_F32, TESSL_MAX_DIMS, TESSL_OK, TESSL_OPERANDS_BF16, TESSL_OPERANDS_EXACT_F32,
+    TESSL_READ_GRADS, TESSL_READ_PARAMS, TESSL_WRITE_PARAMS,
 };
 use tessl::cross_entropy::{cross_entropy_rows, CeGrads, CeHidden, CeWorkspace, Reduction};
 use tessl::gemm::GemmOperands;
@@ -127,7 +126,14 @@ fn a_call_through_the_abi_is_the_rust_call() {
         let (mut loss, mut per_row) = (0.0f64, [0.0f64; 3]);
         let mut err = [0 as c_char; ERR_LEN];
         let status = unsafe {
-            tessl_cross_entropy_rows(handle.0, &args, &mut loss, per_row.as_mut_ptr(), err.as_mut_ptr(), ERR_LEN)
+            tessl_cross_entropy_rows(
+                handle.0,
+                &args,
+                &mut loss,
+                per_row.as_mut_ptr(),
+                err.as_mut_ptr(),
+                ERR_LEN,
+            )
         };
         assert_eq!(status, TESSL_OK, "{}", msg(&err));
 
@@ -135,7 +141,10 @@ fn a_call_through_the_abi_is_the_rust_call() {
         ht.write_f32(&hid).unwrap();
         let wt = rt.alloc_tensor_f32(&[v, h]).unwrap();
         wt.write_f32(&w).unwrap();
-        let (dh, dw) = (rt.alloc_tensor_f32(&[n, h]).unwrap(), rt.alloc_tensor_f32(&[v, h]).unwrap());
+        let (dh, dw) = (
+            rt.alloc_tensor_f32(&[n, h]).unwrap(),
+            rt.alloc_tensor_f32(&[v, h]).unwrap(),
+        );
         let ws = CeWorkspace::new(rt, 4, h as u32, 128, DType::F32).unwrap();
         let want = cross_entropy_rows(
             rt,
@@ -146,7 +155,11 @@ fn a_call_through_the_abi_is_the_rust_call() {
             Reduction::Mean,
             GemmOperands::ExactF32,
             &ws,
-            Some(CeGrads { dh: &dh, dw: &dw, scale: 0.5 }),
+            Some(CeGrads {
+                dh: &dh,
+                dw: &dw,
+                scale: 0.5,
+            }),
         )
         .unwrap();
         assert_eq!(loss.to_bits(), want.loss.to_bits());
@@ -157,10 +170,20 @@ fn a_call_through_the_abi_is_the_rust_call() {
 
         // bf16 operands through the ABI are the Rust call's bf16 bits, and not
         // the exact call's.
-        let bf_args = TesslCeArgs { operands: TESSL_OPERANDS_BF16, ..args };
+        let bf_args = TesslCeArgs {
+            operands: TESSL_OPERANDS_BF16,
+            ..args
+        };
         let mut bf_loss = 0.0f64;
         let status = unsafe {
-            tessl_cross_entropy_rows(handle.0, &bf_args, &mut bf_loss, ptr::null_mut(), err.as_mut_ptr(), ERR_LEN)
+            tessl_cross_entropy_rows(
+                handle.0,
+                &bf_args,
+                &mut bf_loss,
+                ptr::null_mut(),
+                err.as_mut_ptr(),
+                ERR_LEN,
+            )
         };
         assert_eq!(status, TESSL_OK, "{}", msg(&err));
         let bf_want = cross_entropy_rows(
@@ -172,15 +195,29 @@ fn a_call_through_the_abi_is_the_rust_call() {
             Reduction::Mean,
             GemmOperands::Bf16,
             &ws,
-            Some(CeGrads { dh: &dh, dw: &dw, scale: 0.5 }),
+            Some(CeGrads {
+                dh: &dh,
+                dw: &dw,
+                scale: 0.5,
+            }),
         )
         .unwrap();
         assert_eq!(bf_loss.to_bits(), bf_want.loss.to_bits());
         assert_eq!(bits(read(&dhb, n * h)), bits(dh.read_f32().unwrap()));
-        assert_ne!(bf_loss.to_bits(), want.loss.to_bits(), "bf16 operands gave the exact loss");
+        assert_ne!(
+            bf_loss.to_bits(),
+            want.loss.to_bits(),
+            "bf16 operands gave the exact loss"
+        );
 
         // The handle's cached workspace serves a second, smaller call.
-        let args1 = TesslCeArgs { n: 1, want_grads: 0, dh: NULL_REF, dw: NULL_REF, ..args };
+        let args1 = TesslCeArgs {
+            n: 1,
+            want_grads: 0,
+            dh: NULL_REF,
+            dw: NULL_REF,
+            ..args
+        };
         let status = unsafe {
             tessl_cross_entropy_rows(handle.0, &args1, &mut loss, ptr::null_mut(), err.as_mut_ptr(), ERR_LEN)
         };
@@ -228,27 +265,82 @@ fn every_refusal_is_a_status_and_a_message() {
         assert_eq!((s, m.as_str()), (TESSL_ERR, "null runtime handle"));
         assert!(call(handle.0, ptr::null()).1.contains("null args"));
         refused(TesslCeArgs { n: 0, ..good }, "no supervised rows");
-        refused(TesslCeArgs { rows: ptr::null(), ..good }, "null rows or targets");
-        refused(TesslCeArgs { reduction: 7, ..good }, "reduction 7");
-        refused(TesslCeArgs { operands: 2, ..good }, "operands code 2 is neither 0 (exact f32) nor 1 (bf16)");
-        refused(TesslCeArgs { hidden: NULL_REF, ..good }, "hidden: null MTLBuffer");
-        refused(TesslCeArgs { hidden: TesslTensorRef { dtype: 9, ..good.hidden }, ..good }, "unknown dtype code 9");
-        refused(TesslCeArgs { hidden: TesslTensorRef { ndim: 7, ..good.hidden }, ..good }, "rank 7");
-        refused(TesslCeArgs { weight: TesslTensorRef { ndim: 1, ..good.weight }, ..good }, "weight must be 2-D");
         refused(
-            TesslCeArgs { hidden: TesslTensorRef { byte_offset: 8, ..good.hidden }, ..good },
+            TesslCeArgs {
+                rows: ptr::null(),
+                ..good
+            },
+            "null rows or targets",
+        );
+        refused(TesslCeArgs { reduction: 7, ..good }, "reduction 7");
+        refused(
+            TesslCeArgs { operands: 2, ..good },
+            "operands code 2 is neither 0 (exact f32) nor 1 (bf16)",
+        );
+        refused(
+            TesslCeArgs {
+                hidden: NULL_REF,
+                ..good
+            },
+            "hidden: null MTLBuffer",
+        );
+        refused(
+            TesslCeArgs {
+                hidden: TesslTensorRef {
+                    dtype: 9,
+                    ..good.hidden
+                },
+                ..good
+            },
+            "unknown dtype code 9",
+        );
+        refused(
+            TesslCeArgs {
+                hidden: TesslTensorRef { ndim: 7, ..good.hidden },
+                ..good
+            },
+            "rank 7",
+        );
+        refused(
+            TesslCeArgs {
+                weight: TesslTensorRef { ndim: 1, ..good.weight },
+                ..good
+            },
+            "weight must be 2-D",
+        );
+        refused(
+            TesslCeArgs {
+                hidden: TesslTensorRef {
+                    byte_offset: 8,
+                    ..good.hidden
+                },
+                ..good
+            },
             "hidden: tensor view is misaligned or out of bounds",
         );
         refused(TesslCeArgs { want_grads: 1, ..good }, "dh: null MTLBuffer");
         let bad_targets = [5u32, 300];
-        refused(TesslCeArgs { targets: bad_targets.as_ptr(), ..good }, "targets[1] = 300");
+        refused(
+            TesslCeArgs {
+                targets: bad_targets.as_ptr(),
+                ..good
+            },
+            "targets[1] = 300",
+        );
 
         // A message longer than the caller's buffer is cut at a character
         // boundary and still NUL-terminated.
         let mut small = [0x7f as c_char; 8];
         let mut loss = 0.0;
         let s = unsafe {
-            tessl_cross_entropy_rows(ptr::null_mut(), &good, &mut loss, ptr::null_mut(), small.as_mut_ptr(), small.len())
+            tessl_cross_entropy_rows(
+                ptr::null_mut(),
+                &good,
+                &mut loss,
+                ptr::null_mut(),
+                small.as_mut_ptr(),
+                small.len(),
+            )
         };
         assert_eq!(s, TESSL_ERR);
         assert_eq!(msg(&small), "null ru");
@@ -263,12 +355,19 @@ fn every_refusal_is_a_status_and_a_message() {
         .join()
         .unwrap();
         assert_eq!(from_thread.0, TESSL_ERR);
-        assert!(from_thread.1.contains("other than the one that created it"), "{}", from_thread.1);
+        assert!(
+            from_thread.1.contains("other than the one that created it"),
+            "{}",
+            from_thread.1
+        );
 
         // After all of that the handle still works.
         assert_eq!(call(handle.0, &good).0, TESSL_OK);
         let mut err = [0 as c_char; ERR_LEN];
-        assert_eq!(unsafe { tessl_synchronize(handle.0, err.as_mut_ptr(), ERR_LEN) }, TESSL_OK);
+        assert_eq!(
+            unsafe { tessl_synchronize(handle.0, err.as_mut_ptr(), ERR_LEN) },
+            TESSL_OK
+        );
     });
 }
 
@@ -300,7 +399,9 @@ fn a_wrap_through_the_abi_leaves_residency_balanced() {
         for i in 0..50 {
             let mut loss = 0.0;
             let mut err = [0 as c_char; ERR_LEN];
-            let s = unsafe { tessl_cross_entropy_rows(handle.0, &args, &mut loss, ptr::null_mut(), err.as_mut_ptr(), ERR_LEN) };
+            let s = unsafe {
+                tessl_cross_entropy_rows(handle.0, &args, &mut loss, ptr::null_mut(), err.as_mut_ptr(), ERR_LEN)
+            };
             assert_eq!(s, TESSL_OK, "{}", msg(&err));
             if i == 0 {
                 first = loss;
@@ -322,27 +423,54 @@ fn a_free_from_another_thread_is_refused_and_leaves_the_handle_usable() {
         .unwrap();
     assert_eq!(status, TESSL_ERR);
     let mut err = [0 as c_char; ERR_LEN];
-    assert_eq!(unsafe { tessl_synchronize(handle.0, err.as_mut_ptr(), ERR_LEN) }, TESSL_OK, "{}", msg(&err));
+    assert_eq!(
+        unsafe { tessl_synchronize(handle.0, err.as_mut_ptr(), ERR_LEN) },
+        TESSL_OK,
+        "{}",
+        msg(&err)
+    );
     drop(handle); // the owner's free succeeds (asserted in Drop)
 }
 
 // ------------------------------------------------------------ Qwen3.5 ---
 
 fn fixture(name: &str) -> std::ffi::CString {
-    let p = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/qwen35_train").join(name);
+    let p = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/qwen35_train")
+        .join(name);
     std::ffi::CString::new(p.to_str().unwrap()).unwrap()
 }
 
 fn fixture_ids() -> Vec<u32> {
     let p = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/qwen35_train/ids.npy");
-    tessl::npy::read_npy(&p).unwrap().i64_slice().unwrap().iter().map(|&x| x as u32).collect()
+    tessl::npy::read_npy(&p)
+        .unwrap()
+        .i64_slice()
+        .unwrap()
+        .iter()
+        .map(|&x| x as u32)
+        .collect()
 }
 
 fn load_model(rt: *mut TesslRuntime) -> *mut TesslQwen35 {
-    let (st, cfg, prefix) = (fixture("model.safetensors"), fixture("config.json"), std::ffi::CString::new("model.").unwrap());
+    let (st, cfg, prefix) = (
+        fixture("model.safetensors"),
+        fixture("config.json"),
+        std::ffi::CString::new("model.").unwrap(),
+    );
     let mut out = ptr::null_mut();
     let mut err = [0 as c_char; ERR_LEN];
-    let s = unsafe { tessl_qwen35_load(rt, st.as_ptr(), cfg.as_ptr(), prefix.as_ptr(), &mut out, err.as_mut_ptr(), ERR_LEN) };
+    let s = unsafe {
+        tessl_qwen35_load(
+            rt,
+            st.as_ptr(),
+            cfg.as_ptr(),
+            prefix.as_ptr(),
+            &mut out,
+            err.as_mut_ptr(),
+            ERR_LEN,
+        )
+    };
     assert_eq!(s, TESSL_OK, "{}", msg(&err));
     assert!(!out.is_null());
     out
@@ -358,27 +486,48 @@ fn the_model_through_the_abi_is_the_rust_model() {
     let ids = fixture_ids();
     let mut err = [0 as c_char; ERR_LEN];
     with_gpu(|rt| {
-        let st = tessl::safetensors::SafeTensors::open(std::path::Path::new(fixture("model.safetensors").to_str().unwrap())).unwrap();
-        let cfg = tessl::qwen35_model::Qwen35Config::from_config_file(std::path::Path::new(fixture("config.json").to_str().unwrap())).unwrap();
-        let rust = tessl::qwen35_model::Qwen35Model::load(rt, &st, "model.", cfg, tessl::qwen35_model::Precision::F32).unwrap();
+        let st =
+            tessl::safetensors::SafeTensors::open(std::path::Path::new(fixture("model.safetensors").to_str().unwrap()))
+                .unwrap();
+        let cfg = tessl::qwen35_model::Qwen35Config::from_config_file(std::path::Path::new(
+            fixture("config.json").to_str().unwrap(),
+        ))
+        .unwrap();
+        let rust = tessl::qwen35_model::Qwen35Model::load(rt, &st, "model.", cfg, tessl::qwen35_model::Precision::F32)
+            .unwrap();
         let table = rust.parameter_table().unwrap();
 
         let mut n = 0u64;
-        assert_eq!(unsafe { tessl_qwen35_param_count(model, &mut n, err.as_mut_ptr(), ERR_LEN) }, TESSL_OK);
+        assert_eq!(
+            unsafe { tessl_qwen35_param_count(model, &mut n, err.as_mut_ptr(), ERR_LEN) },
+            TESSL_OK
+        );
         assert_eq!(n as usize, table.len());
         for (i, p) in table.iter().enumerate() {
             let mut info: TesslParamInfo = unsafe { std::mem::zeroed() };
-            assert_eq!(unsafe { tessl_qwen35_param_info(model, i as u64, &mut info, err.as_mut_ptr(), ERR_LEN) }, TESSL_OK);
+            assert_eq!(
+                unsafe { tessl_qwen35_param_info(model, i as u64, &mut info, err.as_mut_ptr(), ERR_LEN) },
+                TESSL_OK
+            );
             assert_eq!(msg(&info.name), p.name);
-            assert_eq!(&info.shape[..info.ndim as usize], p.shape.iter().map(|&d| d as u64).collect::<Vec<_>>().as_slice());
+            assert_eq!(
+                &info.shape[..info.ndim as usize],
+                p.shape.iter().map(|&d| d as u64).collect::<Vec<_>>().as_slice()
+            );
             assert_eq!(info.transposed != 0, p.transposed);
         }
         let mut info: TesslParamInfo = unsafe { std::mem::zeroed() };
-        assert_eq!(unsafe { tessl_qwen35_param_info(model, n, &mut info, err.as_mut_ptr(), ERR_LEN) }, TESSL_ERR);
+        assert_eq!(
+            unsafe { tessl_qwen35_param_info(model, n, &mut info, err.as_mut_ptr(), ERR_LEN) },
+            TESSL_ERR
+        );
         assert!(msg(&err).contains(&format!("index {n} is outside")), "{}", msg(&err));
 
         // Caller buffers, one per entry, of each entry's storage shape.
-        let bufs: Vec<_> = table.iter().map(|p| shared(rt, &vec![0.0; p.shape.iter().product()])).collect();
+        let bufs: Vec<_> = table
+            .iter()
+            .map(|p| shared(rt, &vec![0.0; p.shape.iter().product()]))
+            .collect();
         let refs: Vec<TesslTensorRef> = table
             .iter()
             .zip(&bufs)
@@ -390,17 +539,34 @@ fn the_model_through_the_abi_is_the_rust_model() {
         assert_eq!(copy(TESSL_READ_GRADS, &refs, &mut err), TESSL_ERR);
         assert!(msg(&err).contains("no gradients yet"), "{}", msg(&err));
         assert_eq!(copy(TESSL_READ_PARAMS, &refs[1..], &mut err), TESSL_ERR);
-        assert!(msg(&err).contains(&format!("{} tensors for {} parameters", n - 1, n)), "{}", msg(&err));
+        assert!(
+            msg(&err).contains(&format!("{} tensors for {} parameters", n - 1, n)),
+            "{}",
+            msg(&err)
+        );
         assert_eq!(copy(7, &refs, &mut err), TESSL_ERR);
         assert!(msg(&err).contains("direction 7"), "{}", msg(&err));
 
         let mut loss = 0.0f64;
-        let s = unsafe { tessl_qwen35_train_step(model, ids.as_ptr(), ids.len() as u64, TESSL_OPERANDS_EXACT_F32, &mut loss, err.as_mut_ptr(), ERR_LEN) };
+        let s = unsafe {
+            tessl_qwen35_train_step(
+                model,
+                ids.as_ptr(),
+                ids.len() as u64,
+                TESSL_OPERANDS_EXACT_F32,
+                &mut loss,
+                err.as_mut_ptr(),
+                ERR_LEN,
+            )
+        };
         assert_eq!(s, TESSL_OK, "{}", msg(&err));
         let want = rust.train_step(&ids, GemmOperands::ExactF32).unwrap();
         assert_eq!(loss.to_bits(), want.loss.to_bits());
 
-        let local: Vec<tessl::Tensor> = table.iter().map(|p| rt.alloc_tensor_f32(&p.storage_shape()).unwrap()).collect();
+        let local: Vec<tessl::Tensor> = table
+            .iter()
+            .map(|p| rt.alloc_tensor_f32(&p.storage_shape()).unwrap())
+            .collect();
         for (dir, fill) in [(TESSL_READ_GRADS, true), (TESSL_READ_PARAMS, false)] {
             assert_eq!(copy(dir, &refs, &mut err), TESSL_OK, "{}", msg(&err));
             if fill {
@@ -411,7 +577,11 @@ fn the_model_through_the_abi_is_the_rust_model() {
             for ((p, b), t) in table.iter().zip(&bufs).zip(&local) {
                 let got = read(b, p.shape.iter().product());
                 let exp = t.read_f32().unwrap();
-                assert!(got.iter().zip(&exp).all(|(a, b)| a.to_bits() == b.to_bits()), "{} (direction {dir})", p.name);
+                assert!(
+                    got.iter().zip(&exp).all(|(a, b)| a.to_bits() == b.to_bits()),
+                    "{} (direction {dir})",
+                    p.name
+                );
             }
         }
 
@@ -419,7 +589,15 @@ fn the_model_through_the_abi_is_the_rust_model() {
         // and gradients bit for bit, and not the exact step's loss.
         let mut bf_loss = 0.0f64;
         let s = unsafe {
-            tessl_qwen35_train_step(model, ids.as_ptr(), ids.len() as u64, TESSL_OPERANDS_BF16, &mut bf_loss, err.as_mut_ptr(), ERR_LEN)
+            tessl_qwen35_train_step(
+                model,
+                ids.as_ptr(),
+                ids.len() as u64,
+                TESSL_OPERANDS_BF16,
+                &mut bf_loss,
+                err.as_mut_ptr(),
+                ERR_LEN,
+            )
         };
         assert_eq!(s, TESSL_OK, "{}", msg(&err));
         let bf_want = rust.train_step(&ids, GemmOperands::Bf16).unwrap();
@@ -430,15 +608,31 @@ fn the_model_through_the_abi_is_the_rust_model() {
         for ((p, b), t) in table.iter().zip(&bufs).zip(&local) {
             let got = read(b, p.shape.iter().product());
             let exp = t.read_f32().unwrap();
-            assert!(got.iter().zip(&exp).all(|(a, b)| a.to_bits() == b.to_bits()), "{} (bf16 gradients)", p.name);
+            assert!(
+                got.iter().zip(&exp).all(|(a, b)| a.to_bits() == b.to_bits()),
+                "{} (bf16 gradients)",
+                p.name
+            );
         }
         // An unknown operands code is refused, and the refused step leaves no
         // gradients behind.
         let s = unsafe {
-            tessl_qwen35_train_step(model, ids.as_ptr(), ids.len() as u64, 2, &mut bf_loss, err.as_mut_ptr(), ERR_LEN)
+            tessl_qwen35_train_step(
+                model,
+                ids.as_ptr(),
+                ids.len() as u64,
+                2,
+                &mut bf_loss,
+                err.as_mut_ptr(),
+                ERR_LEN,
+            )
         };
         assert_eq!(s, TESSL_ERR);
-        assert!(msg(&err).contains("operands code 2 is neither 0 (exact f32) nor 1 (bf16)"), "{}", msg(&err));
+        assert!(
+            msg(&err).contains("operands code 2 is neither 0 (exact f32) nor 1 (bf16)"),
+            "{}",
+            msg(&err)
+        );
         assert_eq!(copy(TESSL_READ_GRADS, &refs, &mut err), TESSL_ERR);
         assert!(msg(&err).contains("no gradients yet"), "{}", msg(&err));
         // Put the buffers back to the parameters for the write below.
@@ -457,20 +651,46 @@ fn the_model_through_the_abi_is_the_rust_model() {
         }
         rust.write_parameters(&local).unwrap();
         let mut moved = 0.0f64;
-        let s = unsafe { tessl_qwen35_train_step(model, ids.as_ptr(), ids.len() as u64, TESSL_OPERANDS_EXACT_F32, &mut moved, err.as_mut_ptr(), ERR_LEN) };
+        let s = unsafe {
+            tessl_qwen35_train_step(
+                model,
+                ids.as_ptr(),
+                ids.len() as u64,
+                TESSL_OPERANDS_EXACT_F32,
+                &mut moved,
+                err.as_mut_ptr(),
+                ERR_LEN,
+            )
+        };
         assert_eq!(s, TESSL_OK, "{}", msg(&err));
         assert_ne!(moved.to_bits(), loss.to_bits());
-        assert_eq!(moved.to_bits(), rust.train_step(&ids, GemmOperands::ExactF32).unwrap().loss.to_bits());
+        assert_eq!(
+            moved.to_bits(),
+            rust.train_step(&ids, GemmOperands::ExactF32).unwrap().loss.to_bits()
+        );
     });
 
     // Refusals: a bad id, a null handle, another thread.
     let bad = [1u32, 64];
     let mut loss = 0.0;
-    let s = unsafe { tessl_qwen35_train_step(model, bad.as_ptr(), 2, TESSL_OPERANDS_EXACT_F32, &mut loss, err.as_mut_ptr(), ERR_LEN) };
+    let s = unsafe {
+        tessl_qwen35_train_step(
+            model,
+            bad.as_ptr(),
+            2,
+            TESSL_OPERANDS_EXACT_F32,
+            &mut loss,
+            err.as_mut_ptr(),
+            ERR_LEN,
+        )
+    };
     assert_eq!(s, TESSL_ERR);
     assert!(msg(&err).contains("token id 64 >= vocab 64"), "{}", msg(&err));
     let mut n = 0u64;
-    assert_eq!(unsafe { tessl_qwen35_param_count(ptr::null_mut(), &mut n, err.as_mut_ptr(), ERR_LEN) }, TESSL_ERR);
+    assert_eq!(
+        unsafe { tessl_qwen35_param_count(ptr::null_mut(), &mut n, err.as_mut_ptr(), ERR_LEN) },
+        TESSL_ERR
+    );
     assert_eq!(msg(&err), "null model handle");
     let raw = model as usize;
     let (s, m, freed) = std::thread::spawn(move || {
@@ -482,7 +702,10 @@ fn the_model_through_the_abi_is_the_rust_model() {
     .join()
     .unwrap();
     assert_eq!((s, freed), (TESSL_ERR, TESSL_ERR));
-    assert!(m.contains("tessl model used from a thread other than the one that created it"), "{m}");
+    assert!(
+        m.contains("tessl model used from a thread other than the one that created it"),
+        "{m}"
+    );
     assert_eq!(unsafe { tessl_qwen35_free(model) }, TESSL_OK);
 }
 
@@ -495,17 +718,33 @@ fn a_model_load_refuses_bad_arguments() {
     let missing = std::ffi::CString::new("/nonexistent/model.safetensors").unwrap();
     let prefix = std::ffi::CString::new("model.").unwrap();
     let wrong_prefix = std::ffi::CString::new("model.language_model.").unwrap();
-    let load = |st: *const c_char, cfg: *const c_char, prefix: *const c_char, out: *mut *mut TesslQwen35, err: &mut [c_char; ERR_LEN]| unsafe {
+    let load = |st: *const c_char,
+                cfg: *const c_char,
+                prefix: *const c_char,
+                out: *mut *mut TesslQwen35,
+                err: &mut [c_char; ERR_LEN]| unsafe {
         tessl_qwen35_load(handle.0, st, cfg, prefix, out, err.as_mut_ptr(), ERR_LEN)
     };
-    assert_eq!(load(ptr::null(), cfg.as_ptr(), prefix.as_ptr(), &mut out, &mut err), TESSL_ERR);
+    assert_eq!(
+        load(ptr::null(), cfg.as_ptr(), prefix.as_ptr(), &mut out, &mut err),
+        TESSL_ERR
+    );
     assert!(msg(&err).contains("null safetensors path"), "{}", msg(&err));
-    assert_eq!(load(missing.as_ptr(), cfg.as_ptr(), prefix.as_ptr(), &mut out, &mut err), TESSL_ERR);
+    assert_eq!(
+        load(missing.as_ptr(), cfg.as_ptr(), prefix.as_ptr(), &mut out, &mut err),
+        TESSL_ERR
+    );
     assert!(msg(&err).contains("/nonexistent/model.safetensors"), "{}", msg(&err));
-    assert_eq!(load(st.as_ptr(), cfg.as_ptr(), wrong_prefix.as_ptr(), &mut out, &mut err), TESSL_ERR);
+    assert_eq!(
+        load(st.as_ptr(), cfg.as_ptr(), wrong_prefix.as_ptr(), &mut out, &mut err),
+        TESSL_ERR
+    );
     assert!(msg(&err).contains("model.language_model."), "{}", msg(&err));
     assert!(out.is_null(), "a failed load leaves *out null");
-    assert_eq!(load(st.as_ptr(), cfg.as_ptr(), prefix.as_ptr(), ptr::null_mut(), &mut err), TESSL_ERR);
+    assert_eq!(
+        load(st.as_ptr(), cfg.as_ptr(), prefix.as_ptr(), ptr::null_mut(), &mut err),
+        TESSL_ERR
+    );
     assert!(msg(&err).contains("null out"), "{}", msg(&err));
     assert_eq!(unsafe { tessl_qwen35_free(ptr::null_mut()) }, TESSL_OK);
 }

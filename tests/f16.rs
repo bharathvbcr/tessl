@@ -38,11 +38,7 @@ fn host_conversion_round_trips_and_matches_known_bit_patterns() {
     ];
     for &(v, bits) in cases {
         assert_eq!(f32_to_f16_bits(v), bits, "encoding {v}");
-        assert_eq!(
-            f16_bits_to_f32(bits).to_bits(),
-            v.to_bits(),
-            "decoding {v:?}"
-        );
+        assert_eq!(f16_bits_to_f32(bits).to_bits(), v.to_bits(), "decoding {v:?}");
     }
 
     // Overflow saturates to infinity. This is the difference from bf16 that
@@ -142,14 +138,8 @@ fn f16_gemm_matches_an_f32_reference_within_f16_resolution() {
 
             // Reference over the *rounded* operands: the kernel never sees the
             // originals, so comparing against them would measure the host cast.
-            let ar: Vec<f32> = a_h
-                .iter()
-                .map(|v| f16_bits_to_f32(f32_to_f16_bits(*v)))
-                .collect();
-            let br: Vec<f32> = b_h
-                .iter()
-                .map(|v| f16_bits_to_f32(f32_to_f16_bits(*v)))
-                .collect();
+            let ar: Vec<f32> = a_h.iter().map(|v| f16_bits_to_f32(f32_to_f16_bits(*v))).collect();
+            let br: Vec<f32> = b_h.iter().map(|v| f16_bits_to_f32(f32_to_f16_bits(*v))).collect();
             let got = c.buffer.read_f32();
             let mut worst = 0.0f32;
             for i in 0..m {

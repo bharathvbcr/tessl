@@ -17,7 +17,10 @@ pub(crate) enum Json {
     Str(String),
     /// A number, with its exact value when it is a non-negative integer that
     /// fits `u64`.
-    Num { value: f64, uint: Option<u64> },
+    Num {
+        value: f64,
+        uint: Option<u64>,
+    },
     Bool(bool),
     Null,
 }
@@ -47,12 +50,19 @@ pub(crate) struct Syntax {
 
 /// Parse `text` as one JSON value under `syntax`.
 pub(crate) fn parse(text: &str, syntax: Syntax) -> Result<Json, String> {
-    let mut p = Parser { s: text.as_bytes(), i: 0, syntax };
+    let mut p = Parser {
+        s: text.as_bytes(),
+        i: 0,
+        syntax,
+    };
     p.ws();
     let root = p.value(0)?;
     p.ws();
     if p.i != p.s.len() {
-        return Err(format!("{}: trailing bytes after the root value at {}", syntax.what, p.i));
+        return Err(format!(
+            "{}: trailing bytes after the root value at {}",
+            syntax.what, p.i
+        ));
     }
     Ok(root)
 }
@@ -90,9 +100,10 @@ impl Parser<'_> {
             "unsupported JSON value"
         };
         match self.s.get(self.i) {
-            Some(b'{') | Some(b'[') if depth >= self.syntax.max_depth => {
-                self.err(&format!("nesting deeper than the format uses ({} levels)", self.syntax.max_depth))
-            }
+            Some(b'{') | Some(b'[') if depth >= self.syntax.max_depth => self.err(&format!(
+                "nesting deeper than the format uses ({} levels)",
+                self.syntax.max_depth
+            )),
             Some(b'{') => self.object(depth),
             Some(b'[') => self.array(depth),
             Some(b'"') => Ok(Json::Str(self.string()?)),
@@ -183,7 +194,9 @@ impl Parser<'_> {
         let int_start = self.i;
         let mut uint: Option<u64> = Some(0);
         while let Some(&c @ b'0'..=b'9') = self.s.get(self.i) {
-            uint = uint.and_then(|v| v.checked_mul(10)).and_then(|v| v.checked_add(u64::from(c - b'0')));
+            uint = uint
+                .and_then(|v| v.checked_mul(10))
+                .and_then(|v| v.checked_add(u64::from(c - b'0')));
             self.i += 1;
         }
         let digits = self.i - int_start;
@@ -230,7 +243,10 @@ impl Parser<'_> {
             .parse()
             .map_err(|_| format!("{}: bad number {lexeme:?} at byte {start}", self.syntax.what))?;
         if !value.is_finite() {
-            return Err(format!("{}: number {lexeme:?} overflows f64 at byte {start}", self.syntax.what));
+            return Err(format!(
+                "{}: number {lexeme:?} overflows f64 at byte {start}",
+                self.syntax.what
+            ));
         }
         let uint = if integral && !negative { uint } else { None };
         Ok(Json::Num { value, uint })
@@ -327,7 +343,12 @@ impl Parser<'_> {
 mod tests {
     use super::*;
 
-    const ANY: Syntax = Syntax { what: "t", max_depth: 8, uints_only: false, literals: true };
+    const ANY: Syntax = Syntax {
+        what: "t",
+        max_depth: 8,
+        uints_only: false,
+        literals: true,
+    };
 
     fn num(text: &str) -> Result<Json, String> {
         parse(text, ANY)
@@ -347,18 +368,28 @@ mod tests {
         ] {
             assert_eq!(num(text).unwrap(), Json::Num { value, uint }, "{text}");
         }
-        for bad in ["01", "1.", ".5", "1e", "1e+", "-", "+1", "--1", "1.e3", "0x10", "NaN", "1e400"] {
+        for bad in [
+            "01", "1.", ".5", "1e", "1e+", "-", "+1", "--1", "1.e3", "0x10", "NaN", "1e400",
+        ] {
             assert!(num(bad).is_err(), "{bad} should be refused");
         }
     }
 
     #[test]
     fn literals_and_depth_are_per_format() {
-        assert_eq!(parse("[true,false,null]", ANY).unwrap(), Json::Array(vec![Json::Bool(true), Json::Bool(false), Json::Null]));
+        assert_eq!(
+            parse("[true,false,null]", ANY).unwrap(),
+            Json::Array(vec![Json::Bool(true), Json::Bool(false), Json::Null])
+        );
         for bad in ["tru", "nul", "True", "falsey"] {
             assert!(parse(bad, ANY).is_err(), "{bad}");
         }
-        let strict = Syntax { what: "h", max_depth: 2, uints_only: true, literals: false };
+        let strict = Syntax {
+            what: "h",
+            max_depth: 2,
+            uints_only: true,
+            literals: false,
+        };
         assert!(parse("true", strict).unwrap_err().contains("unsupported JSON value"));
         assert!(parse("-1", strict).unwrap_err().contains("unsupported JSON value"));
         assert!(parse("1.5", strict).unwrap_err().contains("non-integer"));

@@ -121,16 +121,29 @@ pub fn rms_norm_bwd(
     let n = (rows as usize)
         .checked_mul(dim as usize)
         .ok_or_else(|| format!("{WHAT}: rows x dim overflows"))?;
-    for (b, len, name) in [(x, n, "x"), (dy, n, "dy"), (dx, n, "dx"), (w, dim as usize, "w"), (dw, dim as usize, "dw")] {
+    for (b, len, name) in [
+        (x, n, "x"),
+        (dy, n, "dy"),
+        (dx, n, "dx"),
+        (w, dim as usize, "w"),
+        (dw, dim as usize, "dw"),
+    ] {
         require::<f32>(rt, b, len, &format!("{WHAT} {name}"))?;
     }
     let nb = blocks(u64::from(rows), RMS_ROWS_PER_BLOCK);
     require::<f32>(rt, part, rms_norm_bwd_part_len(rows, dim), &format!("{WHAT} part"))?;
-    require_disjoint_writes(WHAT, &[("dx", dx), ("dw", dw), ("part", part)], &[("x", x), ("w", w), ("dy", dy)])?;
+    require_disjoint_writes(
+        WHAT,
+        &[("dx", dx), ("dw", dw), ("part", part)],
+        &[("x", x), ("w", w), ("dy", dy)],
+    )?;
     let p = rt.pipeline("qwen35_rms_norm_bwd_f32")?;
     let tptg = reduce_tptg(p.maxTotalThreadsPerThreadgroup(), dim as usize);
     if (tptg as u64) * u64::from(MAX_COLS) < u64::from(dim) {
-        return Err(format!("{WHAT}: dim {dim} exceeds {} x {MAX_COLS} columns per threadgroup", tptg));
+        return Err(format!(
+            "{WHAT}: dim {dim} exceeds {} x {MAX_COLS} columns per threadgroup",
+            tptg
+        ));
     }
     dispatch_tg_1d(rt, &p, nb as usize, tptg, None, |bnd| {
         set_gpu_buf(bnd, x, 0);
@@ -169,7 +182,10 @@ pub fn gated_rms_norm_bwd(
 ) -> Result<(), String> {
     const WHAT: &str = "qwen35_bwd::gated_rms_norm_bwd";
     if heads == 0 || dim == 0 || dim > 32 * MAX_COLS {
-        return Err(format!("{WHAT}: heads must be non-zero and dim in 1..={}", 32 * MAX_COLS));
+        return Err(format!(
+            "{WHAT}: heads must be non-zero and dim in 1..={}",
+            32 * MAX_COLS
+        ));
     }
     if !(eps.is_finite() && eps > 0.0) {
         return Err(format!("{WHAT}: eps must be finite and positive"));
@@ -184,7 +200,12 @@ pub fn gated_rms_norm_bwd(
     require::<f32>(rt, w, dim as usize, &format!("{WHAT} w"))?;
     require::<f32>(rt, dw, dim as usize, &format!("{WHAT} dw"))?;
     let nb = blocks(r * u64::from(heads), GATED_UNITS_PER_BLOCK);
-    require::<f32>(rt, part, gated_rms_norm_bwd_part_len(rows, heads, dim), &format!("{WHAT} part"))?;
+    require::<f32>(
+        rt,
+        part,
+        gated_rms_norm_bwd_part_len(rows, heads, dim),
+        &format!("{WHAT} part"),
+    )?;
     no_overlap(
         WHAT,
         &[("dx", dx, width), ("dz", dz, width)],
@@ -194,7 +215,14 @@ pub fn gated_rms_norm_bwd(
     require_disjoint_writes(
         WHAT,
         &[("dw", dw), ("part", part)],
-        &[("x", x.buf), ("z", z.buf), ("dy", dy.buf), ("w", w), buffers_out[0], buffers_out[1]],
+        &[
+            ("x", x.buf),
+            ("z", z.buf),
+            ("dy", dy.buf),
+            ("w", w),
+            buffers_out[0],
+            buffers_out[1],
+        ],
     )?;
     let p = rt.pipeline("qwen35_gated_rms_norm_bwd_f32")?;
     if p.maxTotalThreadsPerThreadgroup() < GATED_THREADS {
@@ -354,7 +382,9 @@ pub fn conv1d_silu_bwd(
 ) -> Result<(), String> {
     const WHAT: &str = "qwen35_bwd::conv1d_silu_bwd";
     if !(2..=CONV_MAX_KW).contains(&kernel_width) {
-        return Err(format!("{WHAT}: kernel_width must be 2..={CONV_MAX_KW}, got {kernel_width}"));
+        return Err(format!(
+            "{WHAT}: kernel_width must be 2..={CONV_MAX_KW}, got {kernel_width}"
+        ));
     }
     let rows = u64::from(batch) * u64::from(seq);
     let rows32 = u32::try_from(rows).map_err(|_| format!("{WHAT}: batch x seq exceeds u32"))?;
@@ -375,7 +405,11 @@ pub fn conv1d_silu_bwd(
         conv1d_silu_bwd_part_len(batch, seq, channels, kernel_width),
         &format!("{WHAT} part"),
     )?;
-    no_overlap(WHAT, &[("dx", dx, channels)], &[("x", x, channels), ("dy", dy, channels)])?;
+    no_overlap(
+        WHAT,
+        &[("dx", dx, channels)],
+        &[("x", x, channels), ("dy", dy, channels)],
+    )?;
     require_disjoint_writes(
         WHAT,
         &[("dw", dw), ("part", part)],
@@ -466,7 +500,11 @@ pub fn attn_qk_norm_rope_bwd(
     let s = shape;
     let layout = AttnProjLayout::new(s.q_heads, s.kv_heads, s.head_dim).map_err(|e| format!("{WHAT}: {e}"))?;
     if s.head_dim > 32 * MAX_COLS {
-        return Err(format!("{WHAT}: head_dim must be at most {}, got {}", 32 * MAX_COLS, s.head_dim));
+        return Err(format!(
+            "{WHAT}: head_dim must be at most {}, got {}",
+            32 * MAX_COLS,
+            s.head_dim
+        ));
     }
     if s.rotary_dim % 2 != 0 || s.rotary_dim > s.head_dim {
         return Err(format!(
@@ -504,7 +542,12 @@ pub fn attn_qk_norm_rope_bwd(
     require::<f32>(rt, part, attn_qk_norm_rope_bwd_part_len(s), &format!("{WHAT} part"))?;
     require_disjoint_writes(
         WHAT,
-        &[("dproj", dproj), ("dq_norm_w", dq_norm_w), ("dk_norm_w", dk_norm_w), ("part", part)],
+        &[
+            ("dproj", dproj),
+            ("dq_norm_w", dq_norm_w),
+            ("dk_norm_w", dk_norm_w),
+            ("part", part),
+        ],
         &[
             ("proj", proj.buf),
             ("q_norm_w", q_norm_w),
@@ -561,7 +604,12 @@ impl EmbedBwdWorkspace {
         }
         let n = max_rows as usize;
         let alloc = |len: usize| rt.alloc_buffer(len * std::mem::size_of::<u32>());
-        Ok(Self { max_rows, pos: alloc(n)?, run_start: alloc(n + 1)?, uniq: alloc(n)? })
+        Ok(Self {
+            max_rows,
+            pos: alloc(n)?,
+            run_start: alloc(n + 1)?,
+            uniq: alloc(n)?,
+        })
     }
 
     pub fn max_rows(&self) -> u32 {
@@ -591,21 +639,34 @@ pub fn embed_rows_bwd(
 ) -> Result<(), String> {
     const WHAT: &str = "qwen35_bwd::embed_rows_bwd";
     if ids.len() > ws.max_rows as usize {
-        return Err(format!("{WHAT}: {} rows exceed the workspace's {}", ids.len(), ws.max_rows));
+        return Err(format!(
+            "{WHAT}: {} rows exceed the workspace's {}",
+            ids.len(),
+            ws.max_rows
+        ));
     }
     if let Some((r, &id)) = ids.iter().enumerate().find(|(_, &id)| id >= vocab) {
         return Err(format!("{WHAT}: ids[{r}] = {id} is not below vocab {vocab}"));
     }
     let rows = ids.len();
     let h = hidden as usize;
-    let n_dh = rows.checked_mul(h).ok_or_else(|| format!("{WHAT}: rows x hidden overflows"))?;
-    let n_dw = (vocab as usize).checked_mul(h).ok_or_else(|| format!("{WHAT}: vocab x hidden overflows"))?;
+    let n_dh = rows
+        .checked_mul(h)
+        .ok_or_else(|| format!("{WHAT}: rows x hidden overflows"))?;
+    let n_dw = (vocab as usize)
+        .checked_mul(h)
+        .ok_or_else(|| format!("{WHAT}: vocab x hidden overflows"))?;
     require::<f32>(rt, dh, n_dh, &format!("{WHAT} dh"))?;
     require::<f32>(rt, dw, n_dw, &format!("{WHAT} dw"))?;
     require_disjoint_writes(
         WHAT,
         &[("dw", dw)],
-        &[("dh", dh), ("pos", &ws.pos), ("run_start", &ws.run_start), ("uniq", &ws.uniq)],
+        &[
+            ("dh", dh),
+            ("pos", &ws.pos),
+            ("run_start", &ws.run_start),
+            ("uniq", &ws.uniq),
+        ],
     )?;
     if rows == 0 || hidden == 0 {
         return Ok(());
@@ -678,7 +739,11 @@ pub fn gdn_gates_bwd(
     let r = u64::from(rows);
     for (buf, name) in [(logits.buf, "logits"), (dproj, "dproj")] {
         for (off, col) in [(logits.a_off, "a"), (logits.b_off, "b")] {
-            let c = Cols { buf, ld: logits.ld, off };
+            let c = Cols {
+                buf,
+                ld: logits.ld,
+                off,
+            };
             require_window::<f32>(rt, c, r, u64::from(heads), &format!("{WHAT} {name} {col}"))?;
         }
     }
@@ -703,8 +768,19 @@ pub fn gdn_gates_bwd(
     require::<f32>(rt, part, gdn_gates_bwd_part_len(rows, heads), &format!("{WHAT} part"))?;
     require_disjoint_writes(
         WHAT,
-        &[("dproj", dproj), ("da_log", da_log), ("ddt_bias", ddt_bias), ("part", part)],
-        &[("logits", logits.buf), ("a_log", params.a_log), ("dt_bias", params.dt_bias), ("dg", dg), ("dbeta", dbeta)],
+        &[
+            ("dproj", dproj),
+            ("da_log", da_log),
+            ("ddt_bias", ddt_bias),
+            ("part", part),
+        ],
+        &[
+            ("logits", logits.buf),
+            ("a_log", params.a_log),
+            ("dt_bias", params.dt_bias),
+            ("dg", dg),
+            ("dbeta", dbeta),
+        ],
     )?;
     if heads == 0 {
         return Ok(());

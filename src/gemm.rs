@@ -46,9 +46,7 @@ fn validate_gemm(
         }
         require_byte_offset_alignment(t, 16, "GEMM")?;
     }
-    if !std::sync::Arc::ptr_eq(a.runtime(), b.runtime())
-        || !std::sync::Arc::ptr_eq(a.runtime(), c.runtime())
-    {
+    if !std::sync::Arc::ptr_eq(a.runtime(), b.runtime()) || !std::sync::Arc::ptr_eq(a.runtime(), c.runtime()) {
         return Err("GEMM tensors must belong to the same runtime".into());
     }
     if c.dtype != DType::F32 || (!allow_bf16 && (a.dtype != DType::F32 || b.dtype != DType::F32)) {
@@ -185,9 +183,7 @@ pub fn cast_f32_to_bf16_into(src: &Tensor, dst: &Tensor) -> Result<(), String> {
         || !std::sync::Arc::ptr_eq(src.runtime(), dst.runtime())
         || src.overlaps(dst)
     {
-        return Err(
-            "cast destination must match shape/runtime, be bf16, and not overlap source".into(),
-        );
+        return Err("cast destination must match shape/runtime, be bf16, and not overlap source".into());
     }
     let rt = src.runtime();
     let p = rt.pipeline("cast_f32_to_bf16")?;
@@ -253,9 +249,7 @@ pub fn cast_bf16_to_f32_into(src: &Tensor, dst: &Tensor) -> Result<(), String> {
         || !std::sync::Arc::ptr_eq(src.runtime(), dst.runtime())
         || src.overlaps(dst)
     {
-        return Err(
-            "cast destination must match shape/runtime, be f32, and not overlap source".into(),
-        );
+        return Err("cast destination must match shape/runtime, be f32, and not overlap source".into());
     }
     let rt = src.runtime();
     let p = rt.pipeline("cast_bf16_to_f32")?;
@@ -315,11 +309,9 @@ fn ensure_bf16(t: &Tensor) -> Result<Tensor, String> {
         // *and* changes the exponent range, so a silent one would degrade the
         // caller's operands to buy a code path they did not ask for. An f16
         // operand belongs on the f16 GEMM.
-        DType::F16 => Err(
-            "bf16 GEMM was asked for f16 operands; convert explicitly, or use \
+        DType::F16 => Err("bf16 GEMM was asked for f16 operands; convert explicitly, or use \
              the f16 kernels, which accumulate in f32 just as bf16 does"
-                .into(),
-        ),
+            .into()),
     }
 }
 
@@ -471,13 +463,7 @@ pub struct BatchedGemm {
 /// rest. Every operand's last element is bounds checked against its buffer,
 /// because an over-long batch reads past the end of device memory rather than
 /// failing.
-pub fn gemm_batched(
-    a: &Tensor,
-    b: &Tensor,
-    c: &Tensor,
-    backend: GemmBackend,
-    spec: BatchedGemm,
-) -> Result<(), String> {
+pub fn gemm_batched(a: &Tensor, b: &Tensor, c: &Tensor, backend: GemmBackend, spec: BatchedGemm) -> Result<(), String> {
     let BatchedGemm {
         m,
         n,
@@ -493,9 +479,7 @@ pub fn gemm_batched(
     }
     for (name, value) in [("m", m), ("n", n), ("k", k), ("batch", batch)] {
         if value > i32::MAX as usize {
-            return Err(format!(
-                "batched GEMM {name} exceeds signed 32-bit kernel indexing"
-            ));
+            return Err(format!("batched GEMM {name} exceeds signed 32-bit kernel indexing"));
         }
     }
     let matrix_a = m
@@ -517,9 +501,7 @@ pub fn gemm_batched(
         // 64-byte offset that those kernels / MTLTensor views expect.
         require_byte_offset_alignment(t, 64, "batched GEMM cooperative path")?;
     }
-    if !std::sync::Arc::ptr_eq(a.runtime(), b.runtime())
-        || !std::sync::Arc::ptr_eq(a.runtime(), c.runtime())
-    {
+    if !std::sync::Arc::ptr_eq(a.runtime(), b.runtime()) || !std::sync::Arc::ptr_eq(a.runtime(), c.runtime()) {
         return Err("batched GEMM tensors must belong to the same runtime".into());
     }
     if a.overlaps(c) || b.overlaps(c) {
@@ -690,10 +672,7 @@ impl Epilogue<'_> {
     /// A caller passing the identity is dispatched to the plain kernel rather
     /// than paying for an epilogue that computes `C = 1.0 * C + 0.0`.
     pub fn is_identity(&self) -> bool {
-        self.alpha == 1.0
-            && self.beta == 0.0
-            && self.bias.is_none()
-            && self.activation == Activation::None
+        self.alpha == 1.0 && self.beta == 0.0 && self.bias.is_none() && self.activation == Activation::None
     }
 }
 
@@ -934,14 +913,7 @@ fn dispatch_tensorops_nn(
         bnd.bind_u32(tiles_n as u32, 6);
         bnd.bind_u32(tiles_m as u32, 7);
         // f32 exact NN/TN/NT read buffer(8); bf16/relaxed ignore extra bind.
-        bnd.bind_u32(
-            if crate::ab_flags::gemm_interior_offsets() {
-                1
-            } else {
-                0
-            },
-            8,
-        );
+        bnd.bind_u32(if crate::ab_flags::gemm_interior_offsets() { 1 } else { 0 }, 8);
         bnd.dispatch(mtl_size(tg, 1, 1), mtl_size(tpt, 1, 1));
         Ok(())
     })
@@ -994,14 +966,7 @@ fn dispatch_tensorops_accum(
         bnd.bind_u32(tiles_n as u32, 6);
         bnd.bind_u32(tiles_m as u32, 7);
         if bind_interior {
-            bnd.bind_u32(
-                if crate::ab_flags::gemm_interior_offsets() {
-                    1
-                } else {
-                    0
-                },
-                8,
-            );
+            bnd.bind_u32(if crate::ab_flags::gemm_interior_offsets() { 1 } else { 0 }, 8);
         }
         bnd.dispatch(mtl_size(tg, 1, 1), mtl_size(tpt, 1, 1));
         Ok(())
@@ -1038,7 +1003,9 @@ pub enum GemmOperands {
 impl GemmOperands {
     fn exact(rt: &GpuRuntime, what: &str) -> Result<(), String> {
         if rt.relaxed_precision() {
-            return Err(format!("{what}: exact-f32 operands asked for, but the runtime's relaxed precision is on"));
+            return Err(format!(
+                "{what}: exact-f32 operands asked for, but the runtime's relaxed precision is on"
+            ));
         }
         Ok(())
     }
@@ -1083,7 +1050,10 @@ fn check_bf16_lane(rt: &GpuRuntime, c: &Tensor, what: &str) -> Result<(), String
         return Err(format!("{what}: bf16 operands need TensorOps, which this device lacks"));
     }
     if c.dtype != DType::F32 {
-        return Err(format!("{what}: bf16 operands accumulate into an f32 C, got {:?}", c.dtype));
+        return Err(format!(
+            "{what}: bf16 operands accumulate into an f32 C, got {:?}",
+            c.dtype
+        ));
     }
     Ok(())
 }
@@ -1100,16 +1070,10 @@ pub fn gemm_bf16(a: &Tensor, b: &Tensor, c: &Tensor) -> Result<(), String> {
 }
 
 /// `C[M,N] = A[K,M]^T @ B[K,N]` (TN). A is stored `[K,M]`, B `[K,N]`.
-pub fn gemm_tn_f32(
-    a_km: &Tensor,
-    b_kn: &Tensor,
-    c: &Tensor,
-    backend: GemmBackend,
-) -> Result<(), String> {
+pub fn gemm_tn_f32(a_km: &Tensor, b_kn: &Tensor, c: &Tensor, backend: GemmBackend) -> Result<(), String> {
     let (m, n, k) = validate_gemm(a_km, b_kn, c, Layout::TN, false)?;
 
-    if USE_TN_NT_DESCRIPTORS && backend == GemmBackend::TensorOps && a_km.runtime().has_tensorops()
-    {
+    if USE_TN_NT_DESCRIPTORS && backend == GemmBackend::TensorOps && a_km.runtime().has_tensorops() {
         if prefer_tn_splitk(m, n, k) {
             return gemm_tn_splitk_f32(a_km, b_kn, c, k);
         }
@@ -1125,19 +1089,8 @@ pub fn gemm_tn_f32(
 }
 
 /// Training TN GEMM — bf16 TensorOps descriptor when `PrecisionMode::Bf16`.
-pub fn gemm_tn_train(
-    a_km: &Tensor,
-    b_kn: &Tensor,
-    c: &Tensor,
-    backend: GemmBackend,
-) -> Result<(), String> {
-    validate_gemm(
-        a_km,
-        b_kn,
-        c,
-        Layout::TN,
-        use_bf16_gemm(a_km.runtime(), backend),
-    )?;
+pub fn gemm_tn_train(a_km: &Tensor, b_kn: &Tensor, c: &Tensor, backend: GemmBackend) -> Result<(), String> {
+    validate_gemm(a_km, b_kn, c, Layout::TN, use_bf16_gemm(a_km.runtime(), backend))?;
     if use_bf16_gemm(a_km.runtime(), backend) {
         return gemm_tn_bf16(a_km, b_kn, c);
     }
@@ -1164,13 +1117,7 @@ fn gemm_tn_splitk_f32(a_km: &Tensor, b_kn: &Tensor, c: &Tensor, k: usize) -> Res
     gemm_tn_splitk_f32_opts(a_km, b_kn, c, k, /*zero_first=*/ true)
 }
 
-fn gemm_tn_splitk_f32_opts(
-    a_km: &Tensor,
-    b_kn: &Tensor,
-    c: &Tensor,
-    k: usize,
-    zero_first: bool,
-) -> Result<(), String> {
+fn gemm_tn_splitk_f32_opts(a_km: &Tensor, b_kn: &Tensor, c: &Tensor, k: usize, zero_first: bool) -> Result<(), String> {
     let m = a_km.shape[1];
     let n = b_kn.shape[1];
     let rt = a_km.runtime();
@@ -1286,16 +1233,10 @@ fn gemm_tn_splitk_bf16_opts(
 }
 
 /// `C[M,N] = A[M,K] @ B[N,K]^T` (NT). B is stored `[N,K]` (e.g. `W[in,out]`).
-pub fn gemm_nt_f32(
-    a_mk: &Tensor,
-    b_nk: &Tensor,
-    c: &Tensor,
-    backend: GemmBackend,
-) -> Result<(), String> {
+pub fn gemm_nt_f32(a_mk: &Tensor, b_nk: &Tensor, c: &Tensor, backend: GemmBackend) -> Result<(), String> {
     let (m, n, k) = validate_gemm(a_mk, b_nk, c, Layout::NT, false)?;
 
-    if USE_TN_NT_DESCRIPTORS && backend == GemmBackend::TensorOps && a_mk.runtime().has_tensorops()
-    {
+    if USE_TN_NT_DESCRIPTORS && backend == GemmBackend::TensorOps && a_mk.runtime().has_tensorops() {
         let rt = a_mk.runtime();
         let pipeline = rt.pipeline("matmul2d_tensorops_nt_f32")?;
         return dispatch_tensorops_tn_nt(rt, &pipeline, a_mk, b_nk, c, m, n, k, TILE_F32);
@@ -1307,19 +1248,8 @@ pub fn gemm_nt_f32(
 }
 
 /// Training NT GEMM — bf16 TensorOps descriptor when `PrecisionMode::Bf16`.
-pub fn gemm_nt_train(
-    a_mk: &Tensor,
-    b_nk: &Tensor,
-    c: &Tensor,
-    backend: GemmBackend,
-) -> Result<(), String> {
-    validate_gemm(
-        a_mk,
-        b_nk,
-        c,
-        Layout::NT,
-        use_bf16_gemm(a_mk.runtime(), backend),
-    )?;
+pub fn gemm_nt_train(a_mk: &Tensor, b_nk: &Tensor, c: &Tensor, backend: GemmBackend) -> Result<(), String> {
+    validate_gemm(a_mk, b_nk, c, Layout::NT, use_bf16_gemm(a_mk.runtime(), backend))?;
     if use_bf16_gemm(a_mk.runtime(), backend) {
         return gemm_nt_bf16(a_mk, b_nk, c);
     }
@@ -1341,19 +1271,8 @@ pub fn gemm_nt_bf16(a_mk: &Tensor, b_nk: &Tensor, c: &Tensor) -> Result<(), Stri
 
 /// `C += A[K,M]^T @ B[K,N]` (TN accumulate). No C zero — for dW into grad banks
 /// and dx accumulate into a pre-zeroed buffer.
-pub fn gemm_tn_accum_train(
-    a_km: &Tensor,
-    b_kn: &Tensor,
-    c: &Tensor,
-    backend: GemmBackend,
-) -> Result<(), String> {
-    let (m, n, k) = validate_gemm(
-        a_km,
-        b_kn,
-        c,
-        Layout::TN,
-        use_bf16_gemm(a_km.runtime(), backend),
-    )?;
+pub fn gemm_tn_accum_train(a_km: &Tensor, b_kn: &Tensor, c: &Tensor, backend: GemmBackend) -> Result<(), String> {
+    let (m, n, k) = validate_gemm(a_km, b_kn, c, Layout::TN, use_bf16_gemm(a_km.runtime(), backend))?;
 
     let rt = a_km.runtime();
     let use_accum = crate::ab_flags::gemm_accum();
@@ -1378,8 +1297,7 @@ pub fn gemm_tn_accum_train(
         );
     }
 
-    if use_accum && USE_TN_NT_DESCRIPTORS && backend == GemmBackend::TensorOps && rt.has_tensorops()
-    {
+    if use_accum && USE_TN_NT_DESCRIPTORS && backend == GemmBackend::TensorOps && rt.has_tensorops() {
         if prefer_tn_splitk(m, n, k) {
             return gemm_tn_splitk_f32_opts(a_km, b_kn, c, k, /*zero_first=*/ false);
         }
@@ -1407,19 +1325,8 @@ pub fn gemm_tn_accum_train(
 /// activation-grad buffers (never weight banks), so this path additionally
 /// honors `METAL_NATIVE_GEMM_ACCUM_DX` — accumulate-mode dX with dW kept on
 /// the safer temp-plus-add path.
-pub fn gemm_nt_accum_train(
-    a_mk: &Tensor,
-    b_nk: &Tensor,
-    c: &Tensor,
-    backend: GemmBackend,
-) -> Result<(), String> {
-    let (m, n, k) = validate_gemm(
-        a_mk,
-        b_nk,
-        c,
-        Layout::NT,
-        use_bf16_gemm(a_mk.runtime(), backend),
-    )?;
+pub fn gemm_nt_accum_train(a_mk: &Tensor, b_nk: &Tensor, c: &Tensor, backend: GemmBackend) -> Result<(), String> {
+    let (m, n, k) = validate_gemm(a_mk, b_nk, c, Layout::NT, use_bf16_gemm(a_mk.runtime(), backend))?;
 
     let rt = a_mk.runtime();
     let use_accum = crate::ab_flags::gemm_accum() || crate::ab_flags::gemm_accum_dx();
@@ -1441,8 +1348,7 @@ pub fn gemm_nt_accum_train(
         );
     }
 
-    if use_accum && USE_TN_NT_DESCRIPTORS && backend == GemmBackend::TensorOps && rt.has_tensorops()
-    {
+    if use_accum && USE_TN_NT_DESCRIPTORS && backend == GemmBackend::TensorOps && rt.has_tensorops() {
         let pipeline = rt.pipeline("matmul2d_tensorops_nt_accum_f32")?;
         return dispatch_tensorops_accum(
             rt, &pipeline, a_mk, b_nk, c, m, n, k, TILE_F32, /*bind_interior=*/ true,
@@ -1534,10 +1440,7 @@ mod tests {
 
     fn max_abs_err(got: &[f32], exp: &[f32]) -> f32 {
         assert_eq!(got.len(), exp.len(), "parity length mismatch");
-        assert!(
-            got.iter().chain(exp).all(|x| x.is_finite()),
-            "nonfinite parity input"
-        );
+        assert!(got.iter().chain(exp).all(|x| x.is_finite()), "nonfinite parity input");
         got.iter()
             .zip(exp.iter())
             .map(|(g, e)| (g - e).abs())
@@ -1584,10 +1487,7 @@ mod tests {
         rt.synchronize().unwrap();
         let got = c.buffer.read_f32();
         let err = max_abs_err(&got, &expected);
-        assert!(
-            err < 1e-4,
-            "GEMM {m}x{k}@{k}x{n} backend={backend:?} max_abs_err={err}"
-        );
+        assert!(err < 1e-4, "GEMM {m}x{k}@{k}x{n} backend={backend:?} max_abs_err={err}");
     }
 
     #[test]
@@ -1604,11 +1504,7 @@ mod tests {
     fn gemm_auto_small() {
         let rt = GpuRuntime::new().expect("GpuRuntime::new");
         let backend = select_backend(&rt);
-        let dim = if backend == GemmBackend::TensorOps {
-            32
-        } else {
-            16
-        };
+        let dim = if backend == GemmBackend::TensorOps { 32 } else { 16 };
         run_case(dim, dim, dim, backend);
     }
 
@@ -1638,10 +1534,8 @@ mod tests {
         let a = rt.alloc_tensor_bf16(&[m, k]).unwrap();
         let b = rt.alloc_tensor_bf16(&[k, n]).unwrap();
         let c = rt.alloc_tensor_f32(&[m, n]).unwrap();
-        a.buffer
-            .write_bf16_bits(&crate::tensor::f32_slice_to_bf16(&a_f));
-        b.buffer
-            .write_bf16_bits(&crate::tensor::f32_slice_to_bf16(&b_f));
+        a.buffer.write_bf16_bits(&crate::tensor::f32_slice_to_bf16(&a_f));
+        b.buffer.write_bf16_bits(&crate::tensor::f32_slice_to_bf16(&b_f));
         gemm(&a, &b, &c, GemmBackend::TensorOps).unwrap();
         rt.synchronize().unwrap();
         let got = c.buffer.read_f32();
@@ -1724,10 +1618,7 @@ mod tests {
         );
         assert!(err_exact < 1e-4, "exact f32 GEMM drifted: {err_exact}");
         // Smoke: relaxed must be finite and within a generous bound (tf32-class).
-        assert!(
-            err_relax < 5e-2,
-            "relaxed GEMM too far from CPU: {err_relax}"
-        );
+        assert!(err_relax < 5e-2, "relaxed GEMM too far from CPU: {err_relax}");
         // Document 1e-5 golden gate: if this fails, keep --tf32 off for parity.
         if err_relax >= 1e-5 {
             eprintln!(
@@ -2052,22 +1943,16 @@ mod contract_tests {
     #[test]
     fn transpose_edges_precision_and_accumulation() {
         let rt = GpuRuntime::new().unwrap();
-        assert!(
-            rt.has_tensorops(),
-            "TensorOps coverage requires the actual metallib"
-        );
+        assert!(rt.has_tensorops(), "TensorOps coverage requires the actual metallib");
         for (m, n, k) in [(1, 3, 1), (17, 31, 9), (33, 65, 129), (17, 31, 2049)] {
             for backend in [GemmBackend::Simdgroup, GemmBackend::TensorOps] {
                 for precision in [PrecisionMode::F32, PrecisionMode::Bf16] {
                     rt.set_precision(precision);
-                    for (tn, accum) in [(true, false), (false, false), (true, true), (false, true)]
-                    {
+                    for (tn, accum) in [(true, false), (false, false), (true, true), (false, true)] {
                         let ashape = if tn { [k, m] } else { [m, k] };
                         let bshape = if tn { [k, n] } else { [n, k] };
-                        let av: Vec<f32> =
-                            (0..m * k).map(|i| (i % 13) as f32 / 16.0 - 0.25).collect();
-                        let bv: Vec<f32> =
-                            (0..n * k).map(|i| (i % 7) as f32 / 16.0 - 0.125).collect();
+                        let av: Vec<f32> = (0..m * k).map(|i| (i % 13) as f32 / 16.0 - 0.25).collect();
+                        let bv: Vec<f32> = (0..n * k).map(|i| (i % 7) as f32 / 16.0 - 0.125).collect();
                         let a = rt.alloc_tensor_f32(&ashape).unwrap();
                         let b = rt.alloc_tensor_f32(&bshape).unwrap();
                         let bank = rt.alloc_tensor_f32(&[m * n + 32]).unwrap();
@@ -2096,8 +1981,10 @@ mod contract_tests {
                                         * bv[if tn { p * n + col } else { col * k + p }];
                                 }
                                 let x = got[16 + row * n + col];
-                                assert!(x.is_finite() && (x-expected).abs()<1e-4,
-                                "{m}x{n}x{k} {backend:?} {precision:?} TN={tn} accum={accum}: {x} vs {expected}");
+                                assert!(
+                                    x.is_finite() && (x - expected).abs() < 1e-4,
+                                    "{m}x{n}x{k} {backend:?} {precision:?} TN={tn} accum={accum}: {x} vs {expected}"
+                                );
                             }
                         }
                     }
@@ -2111,9 +1998,7 @@ mod contract_tests {
         let rt = GpuRuntime::new().unwrap();
         let a = rt.alloc_tensor_f32(&[16, 16]).unwrap();
         let b = rt.alloc_tensor_bf16(&[256]).unwrap();
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            cast_f32_to_bf16_into(&a, &b)
-        }));
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| cast_f32_to_bf16_into(&a, &b)));
         assert!(result.is_ok(), "cast Result API panicked");
         assert!(result.unwrap().is_err());
         assert!(cast_bf16_to_f32(&a).is_err());
@@ -2166,13 +2051,7 @@ mod contract_tests {
     #[test]
     fn simdgroup_edges_and_offset_guards() {
         let rt = GpuRuntime::new().unwrap();
-        for (m, n, k) in [
-            (1, 1, 1),
-            (7, 9, 3),
-            (16, 16, 16),
-            (17, 31, 9),
-            (33, 65, 129),
-        ] {
+        for (m, n, k) in [(1, 1, 1), (7, 9, 3), (16, 16, 16), (17, 31, 9), (33, 65, 129)] {
             let av: Vec<f32> = (0..m * k).map(|i| (i % 13) as f32 / 16.0 - 0.25).collect();
             let bv: Vec<f32> = (0..k * n).map(|i| (i % 7) as f32 / 16.0 - 0.125).collect();
             let a = rt.alloc_tensor_f32(&[m, k]).unwrap();
@@ -2194,10 +2073,7 @@ mod contract_tests {
             assert_eq!(&got[m * n + 4..], &[123.0; 4]);
             let expected = gemm_f32_cpu(&av, &bv, m, n, k);
             for (x, y) in got[4..m * n + 4].iter().zip(expected) {
-                assert!(
-                    x.is_finite() && (x - y).abs() < 1e-4,
-                    "{m}x{n}x{k}: {x} vs {y}"
-                );
+                assert!(x.is_finite() && (x - y).abs() < 1e-4, "{m}x{n}x{k}: {x} vs {y}");
             }
         }
     }
@@ -2266,9 +2142,7 @@ mod stress_tests {
     }
 
     fn round_bf16(v: &[f32]) -> Vec<f32> {
-        v.iter()
-            .map(|&x| bf16_bits_to_f32(f32_to_bf16_bits(x)))
-            .collect()
+        v.iter().map(|&x| bf16_bits_to_f32(f32_to_bf16_bits(x))).collect()
     }
 
     #[derive(Clone, Copy, Debug)]
@@ -2293,13 +2167,7 @@ mod stress_tests {
 
     /// Upload `data` (or its bf16 rounding) into a fresh tensor, optionally as
     /// an offset view into a larger bank (exercises byte_offset binding).
-    fn upload(
-        rt: &std::sync::Arc<GpuRuntime>,
-        rng: &mut Rng,
-        shape: &[usize],
-        data: &[f32],
-        bf16: bool,
-    ) -> Tensor {
+    fn upload(rt: &std::sync::Arc<GpuRuntime>, rng: &mut Rng, shape: &[usize], data: &[f32], bf16: bool) -> Tensor {
         let numel: usize = shape.iter().product();
         // Offset in elements so the resulting byte_offset is 64-byte aligned
         // for both f32 (16 elems) and bf16/f16 (32 elems) coop paths.
@@ -2322,12 +2190,7 @@ mod stress_tests {
 
     /// One randomized case: run the family on GPU, compare against the CPU
     /// reference inside a NaN-poisoned guard bank. Returns observed max error.
-    fn run_case(
-        rt: &std::sync::Arc<GpuRuntime>,
-        rng: &mut Rng,
-        family: Family,
-        seed_note: u64,
-    ) -> f32 {
+    fn run_case(rt: &std::sync::Arc<GpuRuntime>, rng: &mut Rng, family: Family, seed_note: u64) -> f32 {
         let m = sample_dim(rng);
         let n = sample_dim(rng);
         let mut k = sample_k(rng);
@@ -2340,11 +2203,7 @@ mod stress_tests {
             Family::NnSimdgroup => false,
             _ => rng.below(2) == 0,
         };
-        rt.set_precision(if bf16 {
-            PrecisionMode::Bf16
-        } else {
-            PrecisionMode::F32
-        });
+        rt.set_precision(if bf16 { PrecisionMode::Bf16 } else { PrecisionMode::F32 });
 
         let a_host: Vec<f32> = (0..m * k).map(|_| Rng::unit(rng)).collect();
         let b_host: Vec<f32> = (0..n * k).map(|_| Rng::unit(rng)).collect();
@@ -2424,11 +2283,7 @@ mod stress_tests {
         let expected = gemm_f32_cpu(&a_ref, &b_ref, m, n, k);
         // f32 exact tracks the suite's 1e-4 gate; bf16 rounds inputs identically
         // on both sides, so only f32 reassociation remains (grows with K).
-        let atol = if bf16 {
-            2e-3f32
-        } else {
-            1e-4 + 1e-7 * k as f32
-        };
+        let atol = if bf16 { 2e-3f32 } else { 1e-4 + 1e-7 * k as f32 };
         let mut max_err = 0.0f32;
         for (i, (&x, &e)) in got[16..m * n + 16].iter().zip(expected.iter()).enumerate() {
             let want = e + prefill;
@@ -2448,10 +2303,7 @@ mod stress_tests {
             .and_then(|s| s.parse().ok())
             .unwrap_or(0x5EED_2026_0830u64);
         let rt = GpuRuntime::new().expect("GpuRuntime::new");
-        assert!(
-            rt.has_tensorops(),
-            "stress fuzz requires the TensorOps metallib"
-        );
+        assert!(rt.has_tensorops(), "stress fuzz requires the TensorOps metallib");
         let mut rng = Rng::new(seed);
         let mut worst = 0.0f32;
         for i in 0..cases {
@@ -2491,22 +2343,16 @@ mod stress_tests {
             (130, 70, 260),
             (127, 95, 2049),
         ] {
-            let a_f: Vec<f32> = (0..m * k)
-                .map(|i| ((i % 251) as f32) / 256.0 - 0.49)
-                .collect();
-            let b_f: Vec<f32> = (0..k * n)
-                .map(|i| ((i % 241) as f32) / 256.0 - 0.47)
-                .collect();
+            let a_f: Vec<f32> = (0..m * k).map(|i| ((i % 251) as f32) / 256.0 - 0.49).collect();
+            let b_f: Vec<f32> = (0..k * n).map(|i| ((i % 241) as f32) / 256.0 - 0.47).collect();
             let a_r = round_bf16(&a_f);
             let b_r = round_bf16(&b_f);
             let expected = gemm_f32_cpu(&a_r, &b_r, m, n, k);
             let a = rt.alloc_tensor_bf16(&[m, k]).unwrap();
             let b = rt.alloc_tensor_bf16(&[k, n]).unwrap();
             let c = rt.alloc_tensor_f32(&[m, n]).unwrap();
-            a.buffer
-                .write_bf16_bits(&crate::tensor::f32_slice_to_bf16(&a_f));
-            b.buffer
-                .write_bf16_bits(&crate::tensor::f32_slice_to_bf16(&b_f));
+            a.buffer.write_bf16_bits(&crate::tensor::f32_slice_to_bf16(&a_f));
+            b.buffer.write_bf16_bits(&crate::tensor::f32_slice_to_bf16(&b_f));
             gemm(&a, &b, &c, GemmBackend::TensorOps).unwrap();
             rt.synchronize().unwrap();
             let got = c.buffer.read_f32();
@@ -2543,11 +2389,7 @@ mod stress_tests {
                     let a_host: Vec<f32> = (0..m_ * k_).map(|_| Rng::unit(&mut case_rng)).collect();
                     let b_host: Vec<f32> = (0..n_ * k_).map(|_| Rng::unit(&mut case_rng)).collect();
                     let bf16 = matches!(family, Family::NnRawBf16);
-                    rt.set_precision(if bf16 {
-                        PrecisionMode::Bf16
-                    } else {
-                        PrecisionMode::F32
-                    });
+                    rt.set_precision(if bf16 { PrecisionMode::Bf16 } else { PrecisionMode::F32 });
                     let (a_shape, b_shape): (Vec<usize>, Vec<usize>) = match family {
                         Family::Tn => (vec![k_, m_], vec![k_, n_]),
                         Family::NtAccum => (vec![m_, k_], vec![n_, k_]),
@@ -2561,17 +2403,11 @@ mod stress_tests {
                         Family::NnRawBf16 => gemm(&a, &b, &c, GemmBackend::TensorOps).unwrap(),
                         Family::Tn => gemm_tn_train(&a, &b, &c, GemmBackend::TensorOps).unwrap(),
                         Family::Nn => gemm_train(&a, &b, &c, GemmBackend::TensorOps).unwrap(),
-                        Family::NtAccum => {
-                            gemm_nt_accum_train(&a, &b, &c, GemmBackend::TensorOps).unwrap()
-                        }
+                        Family::NtAccum => gemm_nt_accum_train(&a, &b, &c, GemmBackend::TensorOps).unwrap(),
                         _ => unreachable!(),
                     }
                     rt.synchronize().unwrap();
-                    c.buffer
-                        .read_f32()
-                        .iter()
-                        .map(|x| x.to_bits())
-                        .collect::<Vec<u32>>()
+                    c.buffer.read_f32().iter().map(|x| x.to_bits()).collect::<Vec<u32>>()
                 };
                 match &baseline {
                     None => baseline = Some(bits),
@@ -2598,11 +2434,7 @@ mod stress_tests {
             (1024, 1024, 1024, true),
             (1000, 520, 1030, true),
         ] {
-            rt.set_precision(if bf16 {
-                PrecisionMode::Bf16
-            } else {
-                PrecisionMode::F32
-            });
+            rt.set_precision(if bf16 { PrecisionMode::Bf16 } else { PrecisionMode::F32 });
             let a_host: Vec<f32> = (0..m * k).map(|_| Rng::unit(&mut rng)).collect();
             let b_host: Vec<f32> = (0..k * n).map(|_| Rng::unit(&mut rng)).collect();
             let (a_ref, b_ref) = if bf16 {
@@ -2682,11 +2514,7 @@ mod stress_tests {
                     acc += a_ref[i * k + p] as f64 * b_ref[p * n + j] as f64;
                 }
                 let err = (got[i * n + j] as f64 - acc).abs();
-                assert!(
-                    err < 1e-2,
-                    "{m}x{n}x{k} C[{i},{j}] = {} vs f64 {acc}",
-                    got[i * n + j]
-                );
+                assert!(err < 1e-2, "{m}x{n}x{k} C[{i},{j}] = {} vs f64 {acc}", got[i * n + j]);
             }
         }
         rt.set_precision(PrecisionMode::F32);

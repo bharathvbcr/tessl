@@ -45,9 +45,7 @@ fn ref_dir() -> PathBuf {
 
 fn load_ref(name: &str) -> (Vec<usize>, Vec<f64>) {
     let path = ref_dir().join(format!("{name}.npy"));
-    let a = read_npy(&path).unwrap_or_else(|e| {
-        panic!("{e}\n(run python3 tools/qwen35_ref/make_reference.py first)")
-    });
+    let a = read_npy(&path).unwrap_or_else(|e| panic!("{e}\n(run python3 tools/qwen35_ref/make_reference.py first)"));
     let data = if let Ok(s) = a.f32_slice() {
         s.iter().map(|&x| x as f64).collect()
     } else if let Some(i) = &a.data_i64 {
@@ -85,7 +83,10 @@ fn rel(got: &[f32], want: &[f64]) -> f64 {
 fn argmax(row: &[f64]) -> usize {
     row.iter()
         .enumerate()
-        .fold((0, f64::NEG_INFINITY), |(bi, bv), (i, &v)| if v > bv { (i, v) } else { (bi, bv) })
+        .fold(
+            (0, f64::NEG_INFINITY),
+            |(bi, bv), (i, &v)| if v > bv { (i, v) } else { (bi, bv) },
+        )
         .0
 }
 
@@ -110,8 +111,7 @@ fn kl_rows(p_logits: &[f64], q_logits: &[f64], vocab: usize) -> Vec<f64> {
 fn run(precision: Precision) -> (Vec<f32>, Vec<Vec<f32>>) {
     let rt = GpuRuntime::new().unwrap();
     let st = checkpoint();
-    let model = Qwen35Model::load(&rt, &st, PREFIX, Qwen35Config::qwen35_2b().unwrap(), precision)
-        .unwrap();
+    let model = Qwen35Model::load(&rt, &st, PREFIX, Qwen35Config::qwen35_2b().unwrap(), precision).unwrap();
     let out = model.forward(&ids(), true).unwrap();
     assert!(out.logits.iter().all(|x| x.is_finite()), "non-finite logits");
     (out.logits, out.trace)
@@ -192,5 +192,8 @@ fn bf16_forward_is_no_worse_than_transformers_bf16() {
         mean(&kl_tessl) <= mean(&kl_hf),
         "tessl bf16 is further from fp32 than transformers' bf16 forward"
     );
-    assert!(m_t <= m_h, "tessl bf16 misses more top-1 tokens ({m_t}) than transformers bf16 ({m_h})");
+    assert!(
+        m_t <= m_h,
+        "tessl bf16 misses more top-1 tokens ({m_t}) than transformers bf16 ({m_h})"
+    );
 }

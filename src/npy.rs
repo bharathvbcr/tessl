@@ -48,18 +48,13 @@ fn read_le_payload<T: PlainScalar>(f: &mut File, dst: &mut [T], what: &str) -> R
     // the whole call, the length is `size_of_val` of that same allocation so it
     // cannot overrun, and `PlainScalar` guarantees every bit pattern is a valid
     // `T` — the file may hold nonsense numbers but never an invalid value.
-    let bytes = unsafe {
-        std::slice::from_raw_parts_mut(dst.as_mut_ptr().cast::<u8>(), std::mem::size_of_val(dst))
-    };
-    f.read_exact(bytes)
-        .map_err(|e| format!("{what} payload: {e}"))
+    let bytes = unsafe { std::slice::from_raw_parts_mut(dst.as_mut_ptr().cast::<u8>(), std::mem::size_of_val(dst)) };
+    f.read_exact(bytes).map_err(|e| format!("{what} payload: {e}"))
 }
 
 impl NpyArray {
     pub fn f32_slice(&self) -> Result<&[f32], String> {
-        self.data_f32
-            .as_deref()
-            .ok_or_else(|| "expected float32 npy".into())
+        self.data_f32.as_deref().ok_or_else(|| "expected float32 npy".into())
     }
 
     /// The f64 payload. Separate from [`NpyArray::f32_slice`] on purpose: a
@@ -67,15 +62,11 @@ impl NpyArray {
     /// not itself a source of error, and silently narrowing it to f32 on load
     /// would discard the property it exists to provide.
     pub fn f64_slice(&self) -> Result<&[f64], String> {
-        self.data_f64
-            .as_deref()
-            .ok_or_else(|| "expected float64 npy".into())
+        self.data_f64.as_deref().ok_or_else(|| "expected float64 npy".into())
     }
 
     pub fn i64_slice(&self) -> Result<&[i64], String> {
-        self.data_i64
-            .as_deref()
-            .ok_or_else(|| "expected int64 npy".into())
+        self.data_i64.as_deref().ok_or_else(|| "expected int64 npy".into())
     }
 
     pub fn scalar_f32(&self) -> Result<f32, String> {
@@ -95,13 +86,9 @@ pub const MAX_NPY_HEADER_BYTES: usize = 1 << 20;
 pub fn read_npy(path: &Path) -> Result<NpyArray, String> {
     let what = path.display();
     let mut f = File::open(path).map_err(|e| format!("open {what}: {e}"))?;
-    let file_len = f
-        .metadata()
-        .map_err(|e| format!("{what}: {e}"))?
-        .len();
+    let file_len = f.metadata().map_err(|e| format!("{what}: {e}"))?.len();
     let mut magic = [0u8; 6];
-    f.read_exact(&mut magic)
-        .map_err(|e| format!("read magic: {e}"))?;
+    f.read_exact(&mut magic).map_err(|e| format!("read magic: {e}"))?;
     if &magic != b"\x93NUMPY" {
         return Err(format!("not an npy file: {what}"));
     }
@@ -127,10 +114,8 @@ pub fn read_npy(path: &Path) -> Result<NpyArray, String> {
         ));
     }
     let mut header = vec![0u8; header_len];
-    f.read_exact(&mut header)
-        .map_err(|e| format!("header: {e}"))?;
-    let header_str =
-        std::str::from_utf8(&header).map_err(|e| format!("{what}: header is not UTF-8: {e}"))?;
+    f.read_exact(&mut header).map_err(|e| format!("header: {e}"))?;
+    let header_str = std::str::from_utf8(&header).map_err(|e| format!("{what}: header is not UTF-8: {e}"))?;
     let descr = parse_descr(header_str)?;
     if parse_fortran_order(header_str)? {
         return Err("fortran-order npy not supported".into());
@@ -165,8 +150,7 @@ pub fn read_npy(path: &Path) -> Result<NpyArray, String> {
             #[cfg(target_endian = "big")]
             for value in &mut data {
                 let mut bytes = [0u8; 4];
-                f.read_exact(&mut bytes)
-                    .map_err(|e| format!("f32 payload: {e}"))?;
+                f.read_exact(&mut bytes).map_err(|e| format!("f32 payload: {e}"))?;
                 *value = f32::from_le_bytes(bytes);
             }
             Ok(NpyArray {
@@ -183,8 +167,7 @@ pub fn read_npy(path: &Path) -> Result<NpyArray, String> {
             #[cfg(target_endian = "big")]
             for value in &mut data {
                 let mut bytes = [0u8; 8];
-                f.read_exact(&mut bytes)
-                    .map_err(|e| format!("f64 payload: {e}"))?;
+                f.read_exact(&mut bytes).map_err(|e| format!("f64 payload: {e}"))?;
                 *value = f64::from_le_bytes(bytes);
             }
             Ok(NpyArray {
@@ -201,8 +184,7 @@ pub fn read_npy(path: &Path) -> Result<NpyArray, String> {
             #[cfg(target_endian = "big")]
             for value in &mut data {
                 let mut bytes = [0u8; 8];
-                f.read_exact(&mut bytes)
-                    .map_err(|e| format!("i64 payload: {e}"))?;
+                f.read_exact(&mut bytes).map_err(|e| format!("i64 payload: {e}"))?;
                 *value = i64::from_le_bytes(bytes);
             }
             Ok(NpyArray {
@@ -219,24 +201,17 @@ pub fn read_npy(path: &Path) -> Result<NpyArray, String> {
 fn parse_descr(header: &str) -> Result<String, String> {
     // 'descr': '<f4'
     let key = "'descr':";
-    let i = header
-        .find(key)
-        .ok_or_else(|| "missing descr".to_string())?;
+    let i = header.find(key).ok_or_else(|| "missing descr".to_string())?;
     let rest = &header[i + key.len()..];
     let start = rest.find('\'').ok_or_else(|| "descr quote".to_string())? + 1;
-    let end = rest[start..]
-        .find('\'')
-        .ok_or_else(|| "descr end".to_string())?
-        + start;
+    let end = rest[start..].find('\'').ok_or_else(|| "descr end".to_string())? + start;
     Ok(rest[start..end].to_string())
 }
 
 /// The `'fortran_order'` value: exactly `True` or `False`, and required.
 fn parse_fortran_order(header: &str) -> Result<bool, String> {
     let key = "'fortran_order':";
-    let i = header
-        .find(key)
-        .ok_or_else(|| "missing fortran_order".to_string())?;
+    let i = header.find(key).ok_or_else(|| "missing fortran_order".to_string())?;
     let rest = header[i + key.len()..].trim_start();
     if rest.starts_with("False") {
         Ok(false)
@@ -252,15 +227,10 @@ fn parse_fortran_order(header: &str) -> Result<bool, String> {
 
 fn parse_shape(header: &str) -> Result<Vec<usize>, String> {
     let key = "'shape':";
-    let i = header
-        .find(key)
-        .ok_or_else(|| "missing shape".to_string())?;
+    let i = header.find(key).ok_or_else(|| "missing shape".to_string())?;
     let rest = &header[i + key.len()..];
     let start = rest.find('(').ok_or_else(|| "shape (".to_string())?;
-    let end = rest[start..]
-        .find(')')
-        .ok_or_else(|| "shape )".to_string())?
-        + start;
+    let end = rest[start..].find(')').ok_or_else(|| "shape )".to_string())? + start;
     let inner = rest[start + 1..end].trim();
     if inner.is_empty() {
         return Ok(vec![]); // scalar
@@ -271,10 +241,7 @@ fn parse_shape(header: &str) -> Result<Vec<usize>, String> {
         if p.is_empty() {
             continue;
         }
-        shape.push(
-            p.parse::<usize>()
-                .map_err(|e| format!("shape parse {p}: {e}"))?,
-        );
+        shape.push(p.parse::<usize>().map_err(|e| format!("shape parse {p}: {e}"))?);
     }
     Ok(shape)
 }
@@ -338,11 +305,7 @@ pub fn write_npy_f32(path: &Path, shape: &[usize], data: &[f32]) -> Result<(), S
     } else {
         format!(
             "({})",
-            shape
-                .iter()
-                .map(|d| d.to_string())
-                .collect::<Vec<_>>()
-                .join(", ")
+            shape.iter().map(|d| d.to_string()).collect::<Vec<_>>().join(", ")
         )
     };
     let mut header = format!("{{'descr': '<f4', 'fortran_order': False, 'shape': {shape_str}, }}");
@@ -356,15 +319,12 @@ pub fn write_npy_f32(path: &Path, shape: &[usize], data: &[f32]) -> Result<(), S
     debug_assert_eq!(total % 64, 0);
 
     let mut f = File::create(path).map_err(|e| format!("create {}: {e}", path.display()))?;
-    f.write_all(b"\x93NUMPY")
-        .map_err(|e| format!("magic: {e}"))?;
+    f.write_all(b"\x93NUMPY").map_err(|e| format!("magic: {e}"))?;
     f.write_all(&[1u8, 0]).map_err(|e| format!("ver: {e}"))?;
-    let hlen = u16::try_from(header.len())
-        .map_err(|_| format!("write_npy: a {}-byte header needs npy v2", header.len()))?;
-    f.write_all(&hlen.to_le_bytes())
-        .map_err(|e| format!("hlen: {e}"))?;
-    f.write_all(header.as_bytes())
-        .map_err(|e| format!("header: {e}"))?;
+    let hlen =
+        u16::try_from(header.len()).map_err(|_| format!("write_npy: a {}-byte header needs npy v2", header.len()))?;
+    f.write_all(&hlen.to_le_bytes()).map_err(|e| format!("hlen: {e}"))?;
+    f.write_all(header.as_bytes()).map_err(|e| format!("header: {e}"))?;
     // macOS/Apple Silicon is little-endian. Writing one four-byte value per
     // syscall made exact-scale checkpoints take minutes per tensor; expose the
     // already-contiguous slice as bytes and submit one bulk payload instead.
@@ -375,9 +335,7 @@ pub fn write_npy_f32(path: &Path, shape: &[usize], data: &[f32]) -> Result<(), S
         // `size_of_val` of that same slice, and `u8` has no alignment or
         // validity requirement any `f32` allocation could fail. Gated on
         // little-endian, matching the `<f4` descriptor written above.
-        let bytes = unsafe {
-            std::slice::from_raw_parts(data.as_ptr().cast::<u8>(), std::mem::size_of_val(data))
-        };
+        let bytes = unsafe { std::slice::from_raw_parts(data.as_ptr().cast::<u8>(), std::mem::size_of_val(data)) };
         f.write_all(bytes).map_err(|e| format!("payload: {e}"))?;
     }
     #[cfg(target_endian = "big")]

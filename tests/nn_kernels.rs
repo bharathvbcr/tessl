@@ -15,10 +15,7 @@ use tessl::tensor::bf16_bits_to_f32;
 fn close(what: &str, got: &[f32], want: &[f32], tol: f32) {
     assert_eq!(got.len(), want.len(), "{what}: length");
     for (i, (g, w)) in got.iter().zip(want).enumerate() {
-        assert!(
-            (g - w).abs() <= tol,
-            "{what}[{i}]: got {g} want {w} (tol {tol})"
-        );
+        assert!((g - w).abs() <= tol, "{what}[{i}]: got {g} want {w} (tol {tol})");
     }
 }
 
@@ -124,16 +121,11 @@ fn rms_norm_residual_add_folds_the_layer_scale() {
         let wb = buf(rt, &w);
         let rb = buf(rt, &resid);
 
-        nn::rms_norm_residual_add_f32(rt, &xb, &wb, &rb, rows as u32, dim as u32, eps, scale)
-            .unwrap();
+        nn::rms_norm_residual_add_f32(rt, &xb, &wb, &rb, rows as u32, dim as u32, eps, scale).unwrap();
         rt.synchronize().unwrap();
 
         let norm = rms_norm_ref(&x, &w, rows, dim, eps);
-        let want: Vec<f32> = resid
-            .iter()
-            .zip(&norm)
-            .map(|(r, n)| scale * (r + n))
-            .collect();
+        let want: Vec<f32> = resid.iter().zip(&norm).map(|(r, n)| scale * (r + n)).collect();
         let got = rb.read_f32();
         assert!(
             got[..rows * dim].iter().all(|v| v.is_finite()),
@@ -180,10 +172,7 @@ fn rms_norm_sums_rows_wider_than_one_threadgroup() {
             let want = rms_norm_ref_f64(&x, &w, rows, dim, eps);
             for (i, (g, wv)) in got[..rows * dim].iter().zip(&want).enumerate() {
                 let tol = 1e-5 * wv.abs().max(1e-3);
-                assert!(
-                    (g - wv).abs() <= tol,
-                    "rms_norm {rows}x{dim} [{i}]: got {g} want {wv}"
-                );
+                assert!((g - wv).abs() <= tol, "rms_norm {rows}x{dim} [{i}]: got {g} want {wv}");
             }
         }
     });
@@ -218,25 +207,18 @@ fn rms_norm_siblings_handle_rows_wider_than_one_threadgroup() {
             .collect();
         for (i, (g, wv)) in got.iter().zip(&want).enumerate() {
             let tol = 1e-2 * wv.abs().max(1e-3);
-            assert!(
-                (g - wv).abs() <= tol,
-                "rms_norm_bf16 wide [{i}]: {g} vs {wv}"
-            );
+            assert!((g - wv).abs() <= tol, "rms_norm_bf16 wide [{i}]: {g} vs {wv}");
         }
 
         // residual_add with layer_scale = 1: resid += norm.
         let resid = vec![0.0f32; rows * dim];
         let rb = buf(rt, &resid);
-        nn::rms_norm_residual_add_f32(rt, &xb, &wb, &rb, rows as u32, dim as u32, eps, 1.0)
-            .unwrap();
+        nn::rms_norm_residual_add_f32(rt, &xb, &wb, &rb, rows as u32, dim as u32, eps, 1.0).unwrap();
         rt.synchronize().unwrap();
         let got = rb.read_f32();
         for (i, (g, wv)) in got[..rows * dim].iter().zip(&want).enumerate() {
             let tol = 1e-5 * wv.abs().max(1e-3);
-            assert!(
-                (g - wv).abs() <= tol,
-                "rms_norm_residual_add wide [{i}]: {g} vs {wv}"
-            );
+            assert!((g - wv).abs() <= tol, "rms_norm_residual_add wide [{i}]: {g} vs {wv}");
         }
     });
 }
@@ -353,9 +335,7 @@ fn gemv_q8_matches_cpu_dequant_reference() {
     with_gpu(|rt| {
         let (rows, cols, group) = (24usize, 64usize, 16usize);
         let groups = rows * (cols / group);
-        let packed: Vec<i8> = (0..rows * cols)
-            .map(|i| (i as i32 % 251 - 125) as i8)
-            .collect();
+        let packed: Vec<i8> = (0..rows * cols).map(|i| (i as i32 % 251 - 125) as i8).collect();
         let scales: Vec<f32> = (0..groups).map(|i| 0.01 + (i % 7) as f32 * 0.003).collect();
         let zeros: Vec<f32> = (0..groups).map(|i| (i % 5) as f32 - 2.0).collect();
         let x = random_f32(cols, 0x71);
@@ -367,18 +347,7 @@ fn gemv_q8_matches_cpu_dequant_reference() {
         let xb = buf(rt, &x);
         let yb = empty(rt, rows);
 
-        nn::gemv_q8(
-            rt,
-            &pb,
-            &sb,
-            &zb,
-            &xb,
-            &yb,
-            rows as u32,
-            cols as u32,
-            group as u32,
-        )
-        .unwrap();
+        nn::gemv_q8(rt, &pb, &sb, &zb, &xb, &yb, rows as u32, cols as u32, group as u32).unwrap();
         rt.synchronize().unwrap();
 
         let mut want = vec![0.0f32; rows];
@@ -415,8 +384,7 @@ fn gemv_q8_ref(
             for g in 0..gpr {
                 let gi = r * gpr + g;
                 for i in 0..group {
-                    let w = scales[gi] as f64
-                        * (packed[r * cols + g * group + i] as f64 - zeros[gi] as f64);
+                    let w = scales[gi] as f64 * (packed[r * cols + g * group + i] as f64 - zeros[gi] as f64);
                     acc += w * x[g * group + i] as f64;
                 }
             }
@@ -444,9 +412,7 @@ fn gemv_q8_covers_the_row_tail_and_the_scalar_fallback() {
             (13, 120, 15),
             (100, 4096, 64),
         ] {
-            let packed: Vec<i8> = (0..rows * cols)
-                .map(|i| (i as i32 % 251 - 125) as i8)
-                .collect();
+            let packed: Vec<i8> = (0..rows * cols).map(|i| (i as i32 % 251 - 125) as i8).collect();
             let groups = rows * (cols / group);
             let scales: Vec<f32> = (0..groups).map(|i| 0.01 + (i % 7) as f32 * 0.003).collect();
             let zeros: Vec<f32> = (0..groups).map(|i| (i % 5) as f32 - 2.0).collect();
@@ -465,18 +431,7 @@ fn gemv_q8_covers_the_row_tail_and_the_scalar_fallback() {
             const SENTINEL: f32 = -12345.0;
             let yb = buf(rt, &vec![SENTINEL; rows + 16]);
 
-            nn::gemv_q8(
-                rt,
-                &pb,
-                &sb,
-                &zb,
-                &xb,
-                &yb,
-                rows as u32,
-                cols as u32,
-                group as u32,
-            )
-            .unwrap();
+            nn::gemv_q8(rt, &pb, &sb, &zb, &xb, &yb, rows as u32, cols as u32, group as u32).unwrap();
             rt.synchronize().unwrap();
 
             let got = yb.read_f32();
@@ -517,9 +472,7 @@ fn gemv_q4_tiled_writes_every_row_and_agrees_with_the_row_kernel() {
         // rows must exceed the 128 threads the row kernel groups by, or the two
         // grids coincide and the bug is invisible. 512 and a ragged 300 both do.
         for &(rows, cols, group) in &[(512usize, 256usize, 64usize), (300, 128, 32)] {
-            let packed: Vec<u8> = (0..rows * cols / 2)
-                .map(|i| ((i * 7) % 251) as u8)
-                .collect();
+            let packed: Vec<u8> = (0..rows * cols / 2).map(|i| ((i * 7) % 251) as u8).collect();
             let groups = rows * (cols / group);
             let scales: Vec<f32> = (0..groups).map(|i| 0.02 + (i % 5) as f32 * 0.001).collect();
             let zeros: Vec<f32> = (0..groups).map(|i| 7.0 + (i % 3) as f32).collect();
@@ -615,12 +568,9 @@ fn undersized_buffers_are_refused_before_any_dispatch() {
             ("weight", &full, &empty(rt, dim as usize - 1), &full),
             ("out", &full, &w, &short),
         ] {
-            let err = nn::rms_norm_f32(rt, x, weight, out, rows, dim, 1e-6)
-                .expect_err("undersized {name} must be refused");
-            assert!(
-                err.contains("buffer holds"),
-                "{name}: unexpected error {err:?}"
-            );
+            let err =
+                nn::rms_norm_f32(rt, x, weight, out, rows, dim, 1e-6).expect_err("undersized {name} must be refused");
+            assert!(err.contains("buffer holds"), "{name}: unexpected error {err:?}");
         }
         assert_eq!(
             rt.take_dispatch_count(),

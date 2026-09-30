@@ -34,7 +34,10 @@ fn ids() -> Vec<u32> {
 }
 
 fn alloc(rt: &Arc<GpuRuntime>, table: &[ParamInfo]) -> Vec<Tensor> {
-    table.iter().map(|p| rt.alloc_tensor_f32(&p.storage_shape()).unwrap()).collect()
+    table
+        .iter()
+        .map(|p| rt.alloc_tensor_f32(&p.storage_shape()).unwrap())
+        .collect()
 }
 
 /// A caller tensor's values in transformers' layout.
@@ -44,7 +47,10 @@ fn hf(p: &ParamInfo, t: &Tensor) -> Vec<f32> {
         return d;
     }
     let (out, inn) = (p.shape[0], p.shape[1]);
-    (0..out).flat_map(|o| (0..inn).map(move |i| (o, i))).map(|(o, i)| d[i * out + o]).collect()
+    (0..out)
+        .flat_map(|o| (0..inn).map(move |i| (o, i)))
+        .map(|(o, i)| d[i * out + o])
+        .collect()
 }
 
 fn inference_loss(model: &Qwen35Model, ids: &[u32]) -> f64 {
@@ -77,7 +83,11 @@ fn values_are_the_checkpoints_under_transformers_names() {
         let got = hf(p, t);
         // The zero-centred norms are stored as 1 + w: w comes back within
         // f32's rounding at 1. Everything else is the checkpoint's bits.
-        let tol = if p.name.ends_with("layernorm.weight") || p.name == "norm.weight" { 2f32.powi(-23) } else { 0.0 };
+        let tol = if p.name.ends_with("layernorm.weight") || p.name == "norm.weight" {
+            2f32.powi(-23)
+        } else {
+            0.0
+        };
         for (i, (a, b)) in got.iter().zip(&w).enumerate() {
             assert!((a - b).abs() <= tol, "{}[{i}]: {a} vs {b}", p.name);
         }
@@ -117,7 +127,11 @@ fn a_write_round_trips_and_moves_both_forwards_together() {
     // Writing back what was read changes nothing.
     model.write_parameters(&params).unwrap();
     let same = model.train_step(&ids, GemmOperands::ExactF32).unwrap();
-    assert_eq!(same.loss.to_bits(), before.loss.to_bits(), "a write of the read values moved the loss");
+    assert_eq!(
+        same.loss.to_bits(),
+        before.loss.to_bits(),
+        "a write of the read values moved the loss"
+    );
 
     // One SGD step: p - lr * g, written back, then read again.
     let grads = alloc(&rt, &table);
@@ -127,7 +141,13 @@ fn a_write_round_trips_and_moves_both_forwards_together() {
         .iter()
         .zip(&grads)
         .map(|(p, g)| {
-            let v: Vec<f32> = p.read_f32().unwrap().iter().zip(g.read_f32().unwrap()).map(|(a, b)| a - lr * b).collect();
+            let v: Vec<f32> = p
+                .read_f32()
+                .unwrap()
+                .iter()
+                .zip(g.read_f32().unwrap())
+                .map(|(a, b)| a - lr * b)
+                .collect();
             common::tensor_f32(&rt, p.shape(), &v)
         })
         .collect();
@@ -137,7 +157,11 @@ fn a_write_round_trips_and_moves_both_forwards_together() {
     for ((p, s), b) in table.iter().zip(&stepped).zip(&back) {
         let (s, b) = (s.read_f32().unwrap(), b.read_f32().unwrap());
         // Exact, the embedding included: its table is f32.
-        let tol = if p.name.ends_with("layernorm.weight") || p.name == "norm.weight" { 2f32.powi(-22) } else { 0.0 };
+        let tol = if p.name.ends_with("layernorm.weight") || p.name == "norm.weight" {
+            2f32.powi(-22)
+        } else {
+            0.0
+        };
         for (i, (x, y)) in b.iter().zip(&s).enumerate() {
             assert!((x - y).abs() <= tol, "{}[{i}]: read back {x}, wrote {y}", p.name);
         }
@@ -147,7 +171,11 @@ fn a_write_round_trips_and_moves_both_forwards_together() {
     let after = model.train_step(&ids, GemmOperands::ExactF32).unwrap();
     assert!(after.loss < before.loss, "loss {} -> {}", before.loss, after.loss);
     let infer = inference_loss(&model, &ids);
-    assert!((infer - after.loss).abs() <= 1e-5 * after.loss, "inference {infer} vs training {}", after.loss);
+    assert!(
+        (infer - after.loss).abs() <= 1e-5 * after.loss,
+        "inference {infer} vs training {}",
+        after.loss
+    );
 }
 
 #[test]
@@ -170,7 +198,11 @@ fn copies_honour_the_callers_byte_offset() {
     for ((p, a), b) in table.iter().zip(&plain).zip(&offset) {
         let all = b.buffer.read_f32();
         let n: usize = p.shape.iter().product();
-        assert!(all[..3].iter().chain(&all[3 + n..]).all(|x| x.is_nan()), "{}: wrote outside its window", p.name);
+        assert!(
+            all[..3].iter().chain(&all[3 + n..]).all(|x| x.is_nan()),
+            "{}: wrote outside its window",
+            p.name
+        );
         assert_eq!(a.read_f32().unwrap(), b.read_f32().unwrap(), "{}", p.name);
     }
     // And a write from offset tensors is a write of their windows.
@@ -197,16 +229,26 @@ fn refusals_leave_the_model_untouched() {
         let n = t.numel();
         t.buffer.write_f32(&vec![0.25; n]);
     }
-    e(model.write_parameters(&ts[1..]), &format!("{} tensors for {} parameters", ts.len() - 1, ts.len()));
+    e(
+        model.write_parameters(&ts[1..]),
+        &format!("{} tensors for {} parameters", ts.len() - 1, ts.len()),
+    );
     // The last tensor has the wrong shape: nothing before it is written.
     let last = ts.len() - 1;
     ts[last] = rt.alloc_tensor_f32(&[1]).unwrap();
     e(model.write_parameters(&ts), "norm.weight must be f32");
-    let bf = common::tensor_bf16(&rt, &table[0].storage_shape(), &vec![0.0; table[0].shape.iter().product()]);
+    let bf = common::tensor_bf16(
+        &rt,
+        &table[0].storage_shape(),
+        &vec![0.0; table[0].shape.iter().product()],
+    );
     let mut wrong = alloc(&rt, &table);
     wrong[0] = bf;
     e(model.read_parameters(&wrong), "embed_tokens.weight must be f32");
-    assert_eq!(model.train_step(&ids, GemmOperands::ExactF32).unwrap().loss.to_bits(), before.to_bits());
+    assert_eq!(
+        model.train_step(&ids, GemmOperands::ExactF32).unwrap().loss.to_bits(),
+        before.to_bits()
+    );
 
     let (_, bf16, _) = load(Precision::Bf16);
     e(bf16.read_parameters(&alloc(&rt, &table)), "Precision::F32");

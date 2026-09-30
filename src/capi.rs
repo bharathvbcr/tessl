@@ -73,7 +73,9 @@ fn parse_operands(code: u32, what: &str) -> Result<GemmOperands, String> {
     match code {
         TESSL_OPERANDS_EXACT_F32 => Ok(GemmOperands::ExactF32),
         TESSL_OPERANDS_BF16 => Ok(GemmOperands::Bf16),
-        c => Err(format!("{what}: operands code {c} is neither 0 (exact f32) nor 1 (bf16)")),
+        c => Err(format!(
+            "{what}: operands code {c} is neither 0 (exact f32) nor 1 (bf16)"
+        )),
     }
 }
 
@@ -193,11 +195,7 @@ pub unsafe extern "C" fn tessl_runtime_free(handle: *mut TesslRuntime) -> i32 {
 /// # Safety
 /// As [`tessl_cross_entropy_rows`] for `handle`, `err` and `err_len`.
 #[no_mangle]
-pub unsafe extern "C" fn tessl_synchronize(
-    handle: *mut TesslRuntime,
-    err: *mut c_char,
-    err_len: usize,
-) -> i32 {
+pub unsafe extern "C" fn tessl_synchronize(handle: *mut TesslRuntime, err: *mut c_char, err_len: usize) -> i32 {
     // SAFETY: forwarded from this function's contract.
     unsafe { guarded(handle, err, err_len, |h| h.rt.synchronize()) }
 }
@@ -269,7 +267,10 @@ unsafe fn ce(h: &mut TesslRuntime, a: &TesslCeArgs) -> Result<crate::cross_entro
     let n32 = u32::try_from(n).map_err(|_| format!("{WHAT}: {n} rows exceed u32"))?;
     // SAFETY: n readable u32s each, by the contract.
     let (rows, targets) = unsafe {
-        (std::slice::from_raw_parts(a.rows, n), std::slice::from_raw_parts(a.targets, n))
+        (
+            std::slice::from_raw_parts(a.rows, n),
+            std::slice::from_raw_parts(a.targets, n),
+        )
     };
     let reduction = match a.reduction {
         0 => Reduction::Mean,
@@ -302,13 +303,20 @@ unsafe fn ce(h: &mut TesslRuntime, a: &TesslCeArgs) -> Result<crate::cross_entro
         // SAFETY: as above.
         dh = unsafe { wrap(&rt, &a.dh, "dh") }?;
         dw = unsafe { wrap(&rt, &a.dw, "dw") }?;
-        Some(CeGrads { dh: &dh, dw: &dw, scale: a.scale })
+        Some(CeGrads {
+            dh: &dh,
+            dw: &dw,
+            scale: a.scale,
+        })
     } else {
         None
     };
     cross_entropy_rows(
         &rt,
-        CeHidden { rows: &hidden, off: a.col_off },
+        CeHidden {
+            rows: &hidden,
+            off: a.col_off,
+        },
         &weight,
         rows,
         targets,
@@ -340,16 +348,14 @@ unsafe fn wrap(rt: &Arc<GpuRuntime>, t: &TesslTensorRef, name: &str) -> Result<T
         .iter()
         .map(|&d| usize::try_from(d).map_err(|_| format!("{name}: dimension {d} overflows usize")))
         .collect::<Result<Vec<_>, _>>()?;
-    let byte_offset =
-        usize::try_from(t.byte_offset).map_err(|_| format!("{name}: byte offset overflows usize"))?;
+    let byte_offset = usize::try_from(t.byte_offset).map_err(|_| format!("{name}: byte offset overflows usize"))?;
     // SAFETY: a live MTLBuffer by the contract; retained for the wrap's lifetime.
     let buffer: Retained<ProtocolObject<dyn MTLBuffer>> =
         unsafe { Retained::retain(t.buffer as *mut ProtocolObject<dyn MTLBuffer>) }
             .ok_or_else(|| format!("{name}: null MTLBuffer"))?;
     // SAFETY: the cross-queue half of from_mtl_buffer's contract is this
     // module's contract, which the caller upholds.
-    unsafe { Tensor::from_mtl_buffer(rt, buffer, &shape, dtype, byte_offset) }
-        .map_err(|e| format!("{name}: {e}"))
+    unsafe { Tensor::from_mtl_buffer(rt, buffer, &shape, dtype, byte_offset) }.map_err(|e| format!("{name}: {e}"))
 }
 
 /// A thread-affine handle the ABI hands out.
@@ -412,7 +418,10 @@ unsafe fn guarded<H: Handle>(
     // SAFETY: live and unshared by the contract.
     let h = unsafe { &mut *handle };
     if std::thread::current().id() != h.owner() {
-        let msg = format!("tessl {} used from a thread other than the one that created it", H::KIND);
+        let msg = format!(
+            "tessl {} used from a thread other than the one that created it",
+            H::KIND
+        );
         // SAFETY: forwarded.
         unsafe { write_err(err, err_len, &msg) };
         return TESSL_ERR;
@@ -525,7 +534,12 @@ impl GdnWrapped {
         // SAFETY (each wrap): forwarded from this function's contract.
         unsafe {
             Ok(Self {
-                dims: GdnTrainDims { batch: a.batch, seq: a.seq, heads: a.heads, v_dim: a.v_dim },
+                dims: GdnTrainDims {
+                    batch: a.batch,
+                    seq: a.seq,
+                    heads: a.heads,
+                    v_dim: a.v_dim,
+                },
                 q: wrap(rt, &a.q, "q")?,
                 k: wrap(rt, &a.k, "k")?,
                 v: wrap(rt, &a.v, "v")?,
@@ -538,7 +552,14 @@ impl GdnWrapped {
     }
 
     fn inputs(&self) -> GdnTrainInputs<'_> {
-        GdnTrainInputs { q: &self.q, k: &self.k, v: &self.v, g: &self.g, beta: &self.beta, s0: self.s0.as_ref() }
+        GdnTrainInputs {
+            q: &self.q,
+            k: &self.k,
+            v: &self.v,
+            g: &self.g,
+            beta: &self.beta,
+            s0: self.s0.as_ref(),
+        }
     }
 }
 
@@ -592,7 +613,11 @@ pub unsafe extern "C" fn tessl_gdn_train_backward(
             let x = GdnWrapped::new(&rt, a)?;
             let d_o = wrap(&rt, &a.d_o, "d_o")?;
             let d_fin = wrap_opt(&rt, &a.d_fin, "d_fin")?;
-            let (dq, dk, dv) = (wrap(&rt, &a.dq, "dq")?, wrap(&rt, &a.dk, "dk")?, wrap(&rt, &a.dv, "dv")?);
+            let (dq, dk, dv) = (
+                wrap(&rt, &a.dq, "dq")?,
+                wrap(&rt, &a.dk, "dk")?,
+                wrap(&rt, &a.dv, "dv")?,
+            );
             let (dg, dbeta) = (wrap(&rt, &a.dg, "dg")?, wrap(&rt, &a.dbeta, "dbeta")?);
             let ds0 = wrap_opt(&rt, &a.ds0, "ds0")?;
             if h.gdn_ws.as_ref().map(GdnTrainWorkspace::dims) != Some(x.dims) {
@@ -608,7 +633,14 @@ pub unsafe extern "C" fn tessl_gdn_train_backward(
                 &d_o,
                 d_fin.as_ref(),
                 ws,
-                GdnTrainGrads { dq: &dq, dk: &dk, dv: &dv, dg: &dg, dbeta: &dbeta, ds0: ds0.as_ref() },
+                GdnTrainGrads {
+                    dq: &dq,
+                    dk: &dk,
+                    dv: &dv,
+                    dg: &dg,
+                    dbeta: &dbeta,
+                    ds0: ds0.as_ref(),
+                },
             )
         })
     }
@@ -665,7 +697,9 @@ unsafe fn c_str<'a>(s: *const c_char, what: &str) -> Result<&'a str, String> {
         return Err(format!("null {what}"));
     }
     // SAFETY: NUL-terminated by the contract.
-    unsafe { std::ffi::CStr::from_ptr(s) }.to_str().map_err(|_| format!("{what} is not UTF-8"))
+    unsafe { std::ffi::CStr::from_ptr(s) }
+        .to_str()
+        .map_err(|_| format!("{what} is not UTF-8"))
 }
 
 /// Load the text tower of a Qwen3.5 checkpoint in f32 for training, on
@@ -704,10 +738,18 @@ pub unsafe extern "C" fn tessl_qwen35_load(
             let st = SafeTensors::open(std::path::Path::new(path))?;
             let model = Qwen35Model::load(&h.rt, &st, prefix, cfg, Precision::F32)?;
             let table = model.parameter_table()?;
-            if let Some(p) = table.iter().find(|p| p.name.len() >= TESSL_NAME_LEN || p.shape.len() > TESSL_MAX_DIMS) {
+            if let Some(p) = table
+                .iter()
+                .find(|p| p.name.len() >= TESSL_NAME_LEN || p.shape.len() > TESSL_MAX_DIMS)
+            {
                 return Err(format!("{WHAT}: {} does not fit a TesslParamInfo", p.name));
             }
-            *out = Box::into_raw(Box::new(TesslQwen35 { model, table, grads: None, owner: h.owner }));
+            *out = Box::into_raw(Box::new(TesslQwen35 {
+                model,
+                table,
+                grads: None,
+                owner: h.owner,
+            }));
             Ok(())
         })
     }
@@ -870,11 +912,16 @@ pub unsafe extern "C" fn tessl_qwen35_copy(
             match direction {
                 TESSL_READ_PARAMS => h.model.read_parameters(&ts),
                 TESSL_READ_GRADS => {
-                    let g = h.grads.as_ref().ok_or_else(|| format!("{WHAT}: no gradients yet; run tessl_qwen35_train_step first"))?;
+                    let g = h
+                        .grads
+                        .as_ref()
+                        .ok_or_else(|| format!("{WHAT}: no gradients yet; run tessl_qwen35_train_step first"))?;
                     h.model.read_gradients(g, &ts)
                 }
                 TESSL_WRITE_PARAMS => h.model.write_parameters(&ts),
-                d => Err(format!("{WHAT}: direction {d} is not 0 (read params), 1 (read grads) or 2 (write params)")),
+                d => Err(format!(
+                    "{WHAT}: direction {d} is not 0 (read params), 1 (read grads) or 2 (write params)"
+                )),
             }
         })
     }

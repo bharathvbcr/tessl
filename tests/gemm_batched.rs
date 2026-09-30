@@ -121,16 +121,8 @@ fn bf16_and_f16_batch_elements_match_single_gemm_bit_for_bit() {
             for i in 0..batch {
                 let (ai, bi) = match narrow {
                     "bf16" => (
-                        tensor_bf16(
-                            rt,
-                            &[m, k],
-                            &round_trip_bf16(&a_h[i * m * k..(i + 1) * m * k]),
-                        ),
-                        tensor_bf16(
-                            rt,
-                            &[k, n],
-                            &round_trip_bf16(&b_h[i * k * n..(i + 1) * k * n]),
-                        ),
+                        tensor_bf16(rt, &[m, k], &round_trip_bf16(&a_h[i * m * k..(i + 1) * m * k])),
+                        tensor_bf16(rt, &[k, n], &round_trip_bf16(&b_h[i * k * n..(i + 1) * k * n])),
                     ),
                     _ => (
                         tensor_f16(rt, &[m, k], &a_h[i * m * k..(i + 1) * m * k]),
@@ -138,8 +130,7 @@ fn bf16_and_f16_batch_elements_match_single_gemm_bit_for_bit() {
                     ),
                 };
                 let ci = tensor(rt, &[m, n], &vec![0.0f32; m * n]);
-                gemm(&ai, &bi, &ci, GemmBackend::TensorOps)
-                    .unwrap_or_else(|e| panic!("{narrow} gemm: {e}"));
+                gemm(&ai, &bi, &ci, GemmBackend::TensorOps).unwrap_or_else(|e| panic!("{narrow} gemm: {e}"));
                 rt.synchronize().unwrap();
                 let single = ci.buffer.read_f32();
                 for e in 0..m * n {
@@ -232,11 +223,7 @@ fn a_batch_of_one_is_a_plain_gemm() {
 
         let (p, o) = (plain.buffer.read_f32(), one.buffer.read_f32());
         for e in 0..m * n {
-            assert_eq!(
-                p[e].to_bits(),
-                o[e].to_bits(),
-                "batch of one differs at {e}"
-            );
+            assert_eq!(p[e].to_bits(), o[e].to_bits(), "batch of one differs at {e}");
         }
     });
 }

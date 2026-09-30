@@ -160,9 +160,7 @@ fn fill(n: usize, seed: u64) -> Vec<f32> {
     let mut s = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
     (0..n)
         .map(|_| {
-            s = s
-                .wrapping_mul(6364136223846793005)
-                .wrapping_add(1442695040888963407);
+            s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
             ((((s >> 32) as u32) as f64 / u32::MAX as f64) * 2.0 - 1.0) as f32
         })
         .collect()
@@ -256,28 +254,8 @@ fn main() -> Result<(), String> {
         b.buffer.write_f32(&fill(k * n, 2));
         let a_bf = cast_f32_to_bf16(&a)?;
         let b_bf = cast_f32_to_bf16(&b)?;
-        sweep(
-            &rt,
-            "bf16",
-            VARIANTS,
-            &a_bf,
-            &b_bf,
-            (m, n, k),
-            label,
-            warmup,
-            iters,
-        )?;
-        sweep(
-            &rt,
-            "exact f32",
-            F32_VARIANTS,
-            &a,
-            &b,
-            (m, n, k),
-            label,
-            warmup,
-            iters,
-        )?;
+        sweep(&rt, "bf16", VARIANTS, &a_bf, &b_bf, (m, n, k), label, warmup, iters)?;
+        sweep(&rt, "exact f32", F32_VARIANTS, &a, &b, (m, n, k), label, warmup, iters)?;
     }
     Ok(())
 }

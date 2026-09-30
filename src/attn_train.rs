@@ -63,7 +63,10 @@ impl AttnTrainDims {
         // and strides.
         let plane = u64::from(self.seq) * u64::from(self.q_heads) * u64::from(ATTN_TRAIN_HEAD_DIM);
         if plane > i32::MAX as u64 {
-            return Err(format!("{what}: a head's plane exceeds i32 indexing (seq = {})", self.seq));
+            return Err(format!(
+                "{what}: a head's plane exceeds i32 indexing (seq = {})",
+                self.seq
+            ));
         }
         let lse = u64::from(self.batch) * u64::from(self.q_heads) * u64::from(self.seq);
         if lse > u64::from(u32::MAX) {
@@ -124,13 +127,20 @@ impl AttnTrainWorkspace {
 
     fn check(&self, dims: &AttnTrainDims, what: &str) -> Result<(), String> {
         if *dims != self.dims {
-            return Err(format!("{what}: the workspace was made for {:?}, not {dims:?}", self.dims));
+            return Err(format!(
+                "{what}: the workspace was made for {:?}, not {dims:?}",
+                self.dims
+            ));
         }
         Ok(())
     }
 
     fn buffers(&self) -> [(&'static str, &GpuBuffer); 3] {
-        [("workspace tkv", &self.tkv), ("workspace offsets", &self.zero), ("workspace dvec", &self.dvec)]
+        [
+            ("workspace tkv", &self.tkv),
+            ("workspace offsets", &self.zero),
+            ("workspace dvec", &self.dvec),
+        ]
     }
 }
 
@@ -183,24 +193,31 @@ pub fn attn_train_forward(
     }
     let p = pipeline(rt, "qwen35_attn_tiled_lse_h256_q32_k32_sg4", WHAT)?;
     let groups_y = dims.batch as usize * dims.q_heads as usize;
-    dispatch_2d_tg(rt, &p, (dims.seq as usize).div_ceil(BQ as usize), groups_y, THREADS, |bnd| {
-        set_gpu_buf(bnd, q, 0);
-        set_gpu_buf(bnd, k, 1);
-        set_gpu_buf(bnd, v, 2);
-        set_gpu_buf(bnd, o, 3);
-        set_u32(bnd, dims.batch, 4);
-        set_u32(bnd, dims.seq, 5);
-        set_gpu_buf(bnd, &ws.tkv, 6);
-        set_u32(bnd, dims.q_heads, 7);
-        set_u32(bnd, dims.kv_heads, 8);
-        set_u32(bnd, 0, 9);
-        set_f32(bnd, dims.scale, 10);
-        set_gpu_buf(bnd, &ws.zero, 11);
-        set_gpu_buf(bnd, &ws.zero, 12);
-        set_u32(bnd, 0, 13);
-        set_u32(bnd, dims.seq, 14);
-        set_gpu_buf(bnd, lse, 15);
-    })
+    dispatch_2d_tg(
+        rt,
+        &p,
+        (dims.seq as usize).div_ceil(BQ as usize),
+        groups_y,
+        THREADS,
+        |bnd| {
+            set_gpu_buf(bnd, q, 0);
+            set_gpu_buf(bnd, k, 1);
+            set_gpu_buf(bnd, v, 2);
+            set_gpu_buf(bnd, o, 3);
+            set_u32(bnd, dims.batch, 4);
+            set_u32(bnd, dims.seq, 5);
+            set_gpu_buf(bnd, &ws.tkv, 6);
+            set_u32(bnd, dims.q_heads, 7);
+            set_u32(bnd, dims.kv_heads, 8);
+            set_u32(bnd, 0, 9);
+            set_f32(bnd, dims.scale, 10);
+            set_gpu_buf(bnd, &ws.zero, 11);
+            set_gpu_buf(bnd, &ws.zero, 12);
+            set_u32(bnd, 0, 13);
+            set_u32(bnd, dims.seq, 14);
+            set_gpu_buf(bnd, lse, 15);
+        },
+    )
 }
 
 /// The backward's three block kernels.
@@ -252,7 +269,12 @@ pub fn attn_train_backward(
     }
     require_disjoint_writes(
         WHAT,
-        &[("dq", grads.dq), ("dk", grads.dk), ("dv", grads.dv), ("workspace dvec", &ws.dvec)],
+        &[
+            ("dq", grads.dq),
+            ("dk", grads.dk),
+            ("dv", grads.dv),
+            ("workspace dvec", &ws.dvec),
+        ],
         &[("q", q), ("k", k), ("v", v), ("o", o), ("lse", lse), ("d_o", d_o)],
     )?;
     if dims.batch == 0 || dims.seq == 0 {
@@ -284,19 +306,26 @@ pub fn attn_train_backward(
         };
         let p = pipeline(rt, name, WHAT)?;
         let groups_y = dims.batch as usize * heads as usize;
-        dispatch_2d_tg(rt, &p, (dims.seq as usize).div_ceil(rows_per_group as usize), groups_y, THREADS, |bnd| {
-            set_gpu_buf(bnd, q, 0);
-            set_gpu_buf(bnd, k, 1);
-            set_gpu_buf(bnd, v, 2);
-            set_gpu_buf(bnd, d_o, 3);
-            set_gpu_buf(bnd, lse, 4);
-            set_gpu_buf(bnd, &ws.dvec, 5);
-            set_gpu_buf(bnd, out, 6);
-            set_u32(bnd, dims.seq, 7);
-            set_u32(bnd, dims.q_heads, 8);
-            set_u32(bnd, dims.kv_heads, 9);
-            set_f32(bnd, dims.scale, 10);
-        })?;
+        dispatch_2d_tg(
+            rt,
+            &p,
+            (dims.seq as usize).div_ceil(rows_per_group as usize),
+            groups_y,
+            THREADS,
+            |bnd| {
+                set_gpu_buf(bnd, q, 0);
+                set_gpu_buf(bnd, k, 1);
+                set_gpu_buf(bnd, v, 2);
+                set_gpu_buf(bnd, d_o, 3);
+                set_gpu_buf(bnd, lse, 4);
+                set_gpu_buf(bnd, &ws.dvec, 5);
+                set_gpu_buf(bnd, out, 6);
+                set_u32(bnd, dims.seq, 7);
+                set_u32(bnd, dims.q_heads, 8);
+                set_u32(bnd, dims.kv_heads, 9);
+                set_f32(bnd, dims.scale, 10);
+            },
+        )?;
     }
     Ok(())
 }

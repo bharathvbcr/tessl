@@ -100,8 +100,15 @@ impl SplitMix {
 /// Every shape a sweep draws is in its failure message, so a failing draw
 /// reproduces from the printed seed.
 pub fn fuzz_plan(default: usize) -> (usize, u64) {
-    let get = |k: &str| std::env::var(k).ok().map(|v| v.parse::<u64>().unwrap_or_else(|_| panic!("{k}={v} is not a number")));
-    (get("TESSL_FUZZ_ITERS").map_or(default, |n| n as usize), get("TESSL_FUZZ_SEED").unwrap_or(1))
+    let get = |k: &str| {
+        std::env::var(k)
+            .ok()
+            .map(|v| v.parse::<u64>().unwrap_or_else(|_| panic!("{k}={v} is not a number")))
+    };
+    (
+        get("TESSL_FUZZ_ITERS").map_or(default, |n| n as usize),
+        get("TESSL_FUZZ_SEED").unwrap_or(1),
+    )
 }
 
 pub fn random_f32(n: usize, seed: u64) -> Vec<f32> {
@@ -113,10 +120,7 @@ pub fn random_f32(n: usize, seed: u64) -> Vec<f32> {
 /// the GPU will read. Without this the test would be measuring host-side
 /// quantization error, not the kernel.
 pub fn round_trip_bf16(data: &[f32]) -> Vec<f32> {
-    f32_slice_to_bf16(data)
-        .into_iter()
-        .map(bf16_bits_to_f32)
-        .collect()
+    f32_slice_to_bf16(data).into_iter().map(bf16_bits_to_f32).collect()
 }
 
 pub fn tensor_f32(rt: &Arc<GpuRuntime>, shape: &[usize], data: &[f32]) -> Tensor {
@@ -343,8 +347,7 @@ pub fn q4_mlx_matrix(rows: usize, cols: usize, group: usize) -> (Vec<u8>, Vec<f3
     for r in 0..rows {
         for c in 0..cols {
             let gi = r * (cols / group) + c / group;
-            dense[r * cols + c] =
-                sb_round[gi * 2] * nibbles[r * cols + c] as f32 + sb_round[gi * 2 + 1];
+            dense[r * cols + c] = sb_round[gi * 2] * nibbles[r * cols + c] as f32 + sb_round[gi * 2 + 1];
         }
     }
     (pack_nibbles(&nibbles), sb_f32, dense)
@@ -353,11 +356,7 @@ pub fn q4_mlx_matrix(rows: usize, cols: usize, group: usize) -> (Vec<u8>, Vec<f3
 /// `y[r] = sum_c dense[r, c] * x[c]`, in f64.
 pub fn dense_gemv(dense: &[f32], x: &[f32], rows: usize, cols: usize) -> Vec<f32> {
     (0..rows)
-        .map(|r| {
-            (0..cols)
-                .map(|c| dense[r * cols + c] as f64 * x[c] as f64)
-                .sum::<f64>() as f32
-        })
+        .map(|r| (0..cols).map(|c| dense[r * cols + c] as f64 * x[c] as f64).sum::<f64>() as f32)
         .collect()
 }
 

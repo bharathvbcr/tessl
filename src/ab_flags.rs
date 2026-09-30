@@ -80,9 +80,7 @@ fn parse_truthy(value: Option<&str>) -> Option<bool> {
 /// Lazy on purpose: `find_map` stops at the first name that parses, so a later
 /// name is not even looked up.
 fn resolve(names: &[&str], lookup: impl Fn(&str) -> Option<String>) -> Option<bool> {
-    names
-        .iter()
-        .find_map(|name| parse_truthy(lookup(name).as_deref()))
+    names.iter().find_map(|name| parse_truthy(lookup(name).as_deref()))
 }
 
 pub(crate) fn env_truthy(names: &[&str]) -> Option<bool> {
@@ -232,16 +230,10 @@ mod tests {
 
     /// A `resolve` lookup over a fixed table, recording which names it was asked
     /// for so laziness can be asserted.
-    fn table<'a>(
-        entries: &'a [(&'a str, &'a str)],
-        seen: &'a Cell<usize>,
-    ) -> impl Fn(&str) -> Option<String> + 'a {
+    fn table<'a>(entries: &'a [(&'a str, &'a str)], seen: &'a Cell<usize>) -> impl Fn(&str) -> Option<String> + 'a {
         move |name| {
             seen.set(seen.get() + 1);
-            entries
-                .iter()
-                .find(|(k, _)| *k == name)
-                .map(|(_, v)| (*v).to_string())
+            entries.iter().find(|(k, _)| *k == name).map(|(_, v)| (*v).to_string())
         }
     }
 
@@ -315,10 +307,7 @@ mod tests {
         assert_eq!(seen.get(), 1, "later names must not be looked up");
 
         let seen = Cell::new(0);
-        assert_eq!(
-            resolve(NAMES, table(&[("SECOND", "0")], &seen)),
-            Some(false)
-        );
+        assert_eq!(resolve(NAMES, table(&[("SECOND", "0")], &seen)), Some(false));
         assert_eq!(seen.get(), 2, "must stop once SECOND answers");
 
         let seen = Cell::new(0);
@@ -365,10 +354,7 @@ mod tests {
     /// mode is on.
     #[test]
     fn coarse_default_inherits_hazard_and_yields_to_an_explicit_value() {
-        assert!(
-            coarse_default(None, true),
-            "hazard on must coarsen by default"
-        );
+        assert!(coarse_default(None, true), "hazard on must coarsen by default");
         assert!(
             !coarse_default(None, false),
             "with always-on barriers there is nothing to coarsen"
@@ -438,10 +424,7 @@ mod tests {
     fn hazard_barriers_latches_once_and_reports_itself_set() {
         let expected = env_truthy(ENV_HAZARD_BARRIERS).unwrap_or(false);
         let first = hazard_barriers();
-        assert_eq!(
-            first, expected,
-            "hazard_barriers disagrees with its own env name list"
-        );
+        assert_eq!(first, expected, "hazard_barriers disagrees with its own env name list");
         assert!(
             hazard_barriers_explicitly_set(),
             "reading the flag must latch it; GPU init keys off this"
@@ -457,10 +440,7 @@ mod tests {
         let hazard = hazard_barriers();
         let expected = coarse_default(env_truthy(ENV_COARSE_BARRIERS), hazard);
         let first = coarse_barriers();
-        assert_eq!(
-            first, expected,
-            "live coarse_barriers diverged from coarse_default"
-        );
+        assert_eq!(first, expected, "live coarse_barriers diverged from coarse_default");
         assert_eq!(coarse_barriers(), first, "latched value must be stable");
         assert_eq!(
             need_barrier(true),

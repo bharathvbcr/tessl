@@ -45,7 +45,6 @@ use crate::nn::{dispatch_tg_1d, reduce_tptg};
 use crate::runtime::GpuRuntime;
 use crate::tensor::{DType, GpuBuffer, Tensor};
 
-
 /// How the per-row losses combine.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Reduction {

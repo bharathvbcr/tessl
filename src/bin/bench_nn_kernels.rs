@@ -36,9 +36,7 @@ fn fill(n: usize, seed: u64) -> Vec<f32> {
     let mut s = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
     (0..n)
         .map(|_| {
-            s = s
-                .wrapping_mul(6364136223846793005)
-                .wrapping_add(1442695040888963407);
+            s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
             (((s >> 32) as u32) as f64 / (u32::MAX as f64) * 2.0 - 1.0) as f32
         })
         .collect()
@@ -220,9 +218,7 @@ fn main() -> Result<(), String> {
         let o = out_buf(&rt, n);
         let bytes = (3 * n * 4) as f64;
 
-        verify(&rt, "mlp_silu", &o, n, || {
-            nn::mlp_silu(&rt, &g, &u, &o, n as u32)
-        })?;
+        verify(&rt, "mlp_silu", &o, n, || nn::mlp_silu(&rt, &g, &u, &o, n as u32))?;
         rows.push(measure(
             &rt,
             "mlp_silu",
@@ -304,17 +300,7 @@ fn main() -> Result<(), String> {
         let yb = out_buf(&rt, r);
 
         verify(&rt, "gemv_q8", &yb, r, || {
-            nn::gemv_q8(
-                &rt,
-                &pb,
-                &sb,
-                &zb,
-                &xb,
-                &yb,
-                r as u32,
-                c as u32,
-                group as u32,
-            )
+            nn::gemv_q8(&rt, &pb, &sb, &zb, &xb, &yb, r as u32, c as u32, group as u32)
         })?;
         // int8 weights dominate: r*c bytes, plus scales/zeros, x and y in f32
         let bytes = (r * c + 2 * groups * 4 + c * 4 + r * 4) as f64;
@@ -325,19 +311,7 @@ fn main() -> Result<(), String> {
             bytes,
             warmup,
             iters,
-            || {
-                nn::gemv_q8(
-                    &rt,
-                    &pb,
-                    &sb,
-                    &zb,
-                    &xb,
-                    &yb,
-                    r as u32,
-                    c as u32,
-                    group as u32,
-                )
-            },
+            || nn::gemv_q8(&rt, &pb, &sb, &zb, &xb, &yb, r as u32, c as u32, group as u32),
         )?);
     }
 
@@ -370,20 +344,10 @@ fn main() -> Result<(), String> {
             verify(&rt, "gemv_q4", &yb, r, || {
                 nn::gemv_q4(&rt, bank, &xb, &yb, shape, tiled)
             })?;
-            let name = if tiled {
-                "gemv_q4 [tiled]"
-            } else {
-                "gemv_q4 [row]"
-            };
-            rows.push(measure(
-                &rt,
-                name,
-                &format!("{r}x{c}"),
-                bytes,
-                warmup,
-                iters,
-                || nn::gemv_q4(&rt, bank, &xb, &yb, shape, tiled),
-            )?);
+            let name = if tiled { "gemv_q4 [tiled]" } else { "gemv_q4 [row]" };
+            rows.push(measure(&rt, name, &format!("{r}x{c}"), bytes, warmup, iters, || {
+                nn::gemv_q4(&rt, bank, &xb, &yb, shape, tiled)
+            })?);
         }
     }
 

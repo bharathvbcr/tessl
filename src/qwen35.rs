@@ -105,11 +105,7 @@ pub struct Cols<'a> {
 impl<'a> Cols<'a> {
     /// A dense matrix `width` columns wide.
     pub fn dense(buf: &'a GpuBuffer, width: u32) -> Self {
-        Self {
-            buf,
-            ld: width,
-            off: 0,
-        }
+        Self { buf, ld: width, off: 0 }
     }
 }
 
@@ -132,13 +128,7 @@ pub(crate) fn window_elems(rows: u64, ld: u32, off: u32, width: u64, what: &str)
 }
 
 /// Check a window's buffer: right runtime, enough `T`-sized elements.
-pub(crate) fn require_window<T>(
-    rt: &GpuRuntime,
-    c: Cols<'_>,
-    rows: u64,
-    width: u64,
-    what: &str,
-) -> Result<(), String> {
+pub(crate) fn require_window<T>(rt: &GpuRuntime, c: Cols<'_>, rows: u64, width: u64, what: &str) -> Result<(), String> {
     let need = window_elems(rows, c.ld, c.off, width, what)?;
     require::<T>(rt, c.buf, need, what)
 }
@@ -198,10 +188,7 @@ fn dispatch_groups(
         if tg_bytes > 0 {
             bnd.set_threadgroup_memory(0, tg_bytes);
         }
-        bnd.dispatch(
-            mtl_size(groups.0, groups.1, groups.2),
-            mtl_size(threads, 1, 1),
-        );
+        bnd.dispatch(mtl_size(groups.0, groups.1, groups.2), mtl_size(threads, 1, 1));
         Ok(())
     })
 }
@@ -446,12 +433,7 @@ fn pack_linear_weights<T: Copy + Default>(
 /// `proj = x @ packed`: every projection of a layer in one GEMM. `x` is
 /// `[rows, hidden]`, `packed` is [`pack_linear_weights_f32`]'s `[hidden, width]`
 /// (bf16 for the bf16 path), `proj` is `[rows, width]` f32.
-pub fn fused_projection(
-    x: &Tensor,
-    packed: &Tensor,
-    proj: &Tensor,
-    backend: GemmBackend,
-) -> Result<(), String> {
+pub fn fused_projection(x: &Tensor, packed: &Tensor, proj: &Tensor, backend: GemmBackend) -> Result<(), String> {
     gemm(x, packed, proj, backend)
 }
 
@@ -459,12 +441,7 @@ pub fn fused_projection(
 /// residual add folded into the GEMM epilogue (`beta = 1` accumulates into `C`
 /// while the product is still in registers). Needs the epilogue path — bf16
 /// operands, or f32 under `PrecisionMode::Relaxed`, on TensorOps.
-pub fn project_residual(
-    y: &Tensor,
-    w_out: &Tensor,
-    residual: &Tensor,
-    backend: GemmBackend,
-) -> Result<(), String> {
+pub fn project_residual(y: &Tensor, w_out: &Tensor, residual: &Tensor, backend: GemmBackend) -> Result<(), String> {
     gemm_epilogue(
         y,
         w_out,
@@ -599,9 +576,7 @@ fn conv1d_silu_impl(
 ) -> Result<(), String> {
     const WHAT: &str = "qwen35::conv1d_silu";
     if !(2..=8).contains(&kernel_width) {
-        return Err(format!(
-            "{WHAT}: kernel_width must be 2..=8, got {kernel_width}"
-        ));
+        return Err(format!("{WHAT}: kernel_width must be 2..=8, got {kernel_width}"));
     }
     let hist = kernel_width - 1;
     // The kernel's grid (and its `T + KW - 1` bound) is seq + hist positions.
@@ -655,8 +630,7 @@ fn conv1d_silu_impl(
     }
     require_disjoint_writes(WHAT, &writes, &reads)?;
 
-    let flags =
-        in_flag | if state_out.is_some() { 2 } else { 0 } | if seq_lens.is_some() { 4 } else { 0 };
+    let flags = in_flag | if state_out.is_some() { 2 } else { 0 } | if seq_lens.is_some() { 4 } else { 0 };
     let p = pipeline_for(rt, "qwen35_conv1d_silu", CONV_THREADS, 0)?;
     dispatch_groups(
         rt,
@@ -709,7 +683,11 @@ pub fn gdn_gates(
     const WHAT: &str = "qwen35::gdn_gates";
     let r = u64::from(rows);
     for (off, name) in [(logits.a_off, "a"), (logits.b_off, "b")] {
-        let c = Cols { buf: logits.buf, ld: logits.ld, off };
+        let c = Cols {
+            buf: logits.buf,
+            ld: logits.ld,
+            off,
+        };
         require_window::<f32>(rt, c, r, u64::from(heads), &format!("{WHAT} {name}"))?;
     }
     let n = usize_product(&[rows as usize, heads as usize], WHAT)?;
@@ -720,7 +698,11 @@ pub fn gdn_gates(
     require_disjoint_writes(
         WHAT,
         &[("g", g), ("beta", beta)],
-        &[("logits", logits.buf), ("a_log", params.a_log), ("dt_bias", params.dt_bias)],
+        &[
+            ("logits", logits.buf),
+            ("a_log", params.a_log),
+            ("dt_bias", params.dt_bias),
+        ],
     )?;
     if n == 0 {
         return Ok(());
@@ -846,10 +828,7 @@ pub struct GdnWorkspace {
 /// `k`/`q` hold `rows * 128`, `g`/`beta` hold `rows`, and `w`/`aq` hold
 /// `blocks * 64 * 64`.
 fn workspace_extent(dims: &GdnDims) -> Result<(usize, usize), String> {
-    let heads = usize_product(
-        &[dims.batch as usize, dims.v_heads as usize],
-        "GdnWorkspace",
-    )?;
+    let heads = usize_product(&[dims.batch as usize, dims.v_heads as usize], "GdnWorkspace")?;
     let blocks = usize_product(&[heads, dims.chunks() as usize], "GdnWorkspace")?;
     let rows = usize_product(&[blocks, GDN_CHUNK as usize], "GdnWorkspace")?;
     Ok((rows, blocks))
@@ -862,10 +841,7 @@ impl GdnWorkspace {
         let f = std::mem::size_of::<f32>();
         let kq = usize_product(&[rows, GDN_KEY_DIM as usize, f], "GdnWorkspace")?;
         let row_bytes = usize_product(&[rows, f], "GdnWorkspace")?;
-        let blk = usize_product(
-            &[blocks, (GDN_CHUNK * GDN_CHUNK) as usize, f],
-            "GdnWorkspace",
-        )?;
+        let blk = usize_product(&[blocks, (GDN_CHUNK * GDN_CHUNK) as usize, f], "GdnWorkspace")?;
         // A zero-length Metal buffer is not a buffer; keep every slot non-empty.
         let alloc = |n: usize| rt.alloc_buffer(n.max(16));
         Ok(Self {
@@ -889,10 +865,7 @@ impl GdnWorkspace {
     pub fn bytes_for(dims: &GdnDims) -> Result<usize, String> {
         let (rows, blocks) = workspace_extent(dims)?;
         let per_row = usize_product(&[rows, 2 * GDN_KEY_DIM as usize + 2], "GdnWorkspace")?;
-        let per_blk = usize_product(
-            &[blocks, 2 * (GDN_CHUNK * GDN_CHUNK) as usize],
-            "GdnWorkspace",
-        )?;
+        let per_blk = usize_product(&[blocks, 2 * (GDN_CHUNK * GDN_CHUNK) as usize], "GdnWorkspace")?;
         let floats = per_row
             .checked_add(per_blk)
             .ok_or_else(|| "GdnWorkspace: size overflows usize".to_string())?;
@@ -1003,14 +976,7 @@ fn validate_gdn(
         // In place, the state is one buffer that is both read and written; as
         // a write it is still checked against every input below, so it cannot
         // also be, say, the qkv buffer other threadgroups are reading.
-        writes.push((
-            if in_place {
-                "state (in place)"
-            } else {
-                "state_out"
-            },
-            s,
-        ));
+        writes.push((if in_place { "state (in place)" } else { "state_out" }, s));
     }
     let mut reads: Vec<(&str, &GpuBuffer)> = vec![
         ("qkv", qkv.buf),
@@ -1026,8 +992,7 @@ fn validate_gdn(
         reads.push(("seq_lens", l));
     }
     require_disjoint_writes(what, &writes, &reads)?;
-    let flags =
-        in_flag | if state_out.is_some() { 2 } else { 0 } | if seq_lens.is_some() { 4 } else { 0 };
+    let flags = in_flag | if state_out.is_some() { 2 } else { 0 } | if seq_lens.is_some() { 4 } else { 0 };
     Ok((flags, bstride))
 }
 
@@ -1209,11 +1174,7 @@ fn gdn_chunk_forward_impl(
         dispatch_groups(
             rt,
             &prep,
-            (
-                dims.chunks() as usize,
-                dims.v_heads as usize,
-                dims.batch as usize,
-            ),
+            (dims.chunks() as usize, dims.v_heads as usize, dims.batch as usize),
             PREP_THREADS,
             PREP_TG_BYTES,
             |bnd| {
@@ -1323,17 +1284,7 @@ pub fn gdn_recurrent_varlen(
     state_out: Option<&GpuBuffer>,
     seq_lens: &GpuBuffer,
 ) -> Result<(), String> {
-    gdn_recurrent_impl(
-        rt,
-        dims,
-        qkv,
-        gates,
-        params,
-        state,
-        out,
-        state_out,
-        Some(seq_lens),
-    )
+    gdn_recurrent_impl(rt, dims, qkv, gates, params, state, out, state_out, Some(seq_lens))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1349,19 +1300,7 @@ fn gdn_recurrent_impl(
     seq_lens: Option<&GpuBuffer>,
 ) -> Result<(), String> {
     const WHAT: &str = "qwen35::gdn_recurrent";
-    let (flags, bstride) = validate_gdn(
-        rt,
-        WHAT,
-        dims,
-        qkv,
-        gates,
-        params,
-        state,
-        out,
-        state_out,
-        &[],
-        seq_lens,
-    )?;
+    let (flags, bstride) = validate_gdn(rt, WHAT, dims, qkv, gates, params, state, out, state_out, &[], seq_lens)?;
     // seq == 0 with a state_out still dispatches: it copies the start state
     // through, so a caller alternating state buffers never reads a stale one.
     if dims.batch == 0 || (dims.seq == 0 && state_out.is_none()) {
@@ -1423,13 +1362,7 @@ fn out_kernel(base: &str, dtype: DType, what: &str) -> Result<String, String> {
     }
 }
 
-fn require_out_window(
-    rt: &GpuRuntime,
-    out: OutCols<'_>,
-    rows: u64,
-    width: u64,
-    what: &str,
-) -> Result<(), String> {
+fn require_out_window(rt: &GpuRuntime, out: OutCols<'_>, rows: u64, width: u64, what: &str) -> Result<(), String> {
     match out.dtype {
         DType::BF16 => require_window::<u16>(rt, out.cols, rows, width, what),
         _ => require_window::<f32>(rt, out.cols, rows, width, what),
@@ -1746,13 +1679,7 @@ fn qk_norm_rope_impl(
         // capacity, which must not read as "positions past capacity".
         return Ok(());
     }
-    let kv_capacity = crate::nn::attn_kv_capacity(
-        targets.k_cache,
-        targets.v_cache,
-        s.batch,
-        s.kv_heads,
-        s.head_dim,
-    )?;
+    let kv_capacity = crate::nn::attn_kv_capacity(targets.k_cache, targets.v_cache, s.batch, s.kv_heads, s.head_dim)?;
     // Both are known on the host whatever the position mode. With no slots
     // every token would be skipped as out of range, a call that "succeeds"
     // and writes nothing. And a cache whose last slot's absolute position
@@ -1782,22 +1709,14 @@ fn qk_norm_rope_impl(
             }
         }
         RopePos::Buffer(b) => require::<u32>(rt, b, 1, "attn_qk_norm_rope pos_offset")?,
-        RopePos::PerRow(b) => require::<u32>(
-            rt,
-            b,
-            s.batch as usize,
-            "attn_qk_norm_rope per-row pos_offset",
-        )?,
+        RopePos::PerRow(b) => require::<u32>(rt, b, s.batch as usize, "attn_qk_norm_rope per-row pos_offset")?,
     }
     let width = u64::from(layout.width());
     let rows = u64::from(s.batch) * u64::from(s.seq);
     require_window::<f32>(rt, proj, rows, width, "attn_qk_norm_rope proj")?;
     require::<f32>(rt, q_norm_w, s.head_dim as usize, "attn q_norm weight")?;
     require::<f32>(rt, k_norm_w, s.head_dim as usize, "attn k_norm weight")?;
-    let q_elems = usize_product(
-        &[rows as usize, s.q_heads as usize, s.head_dim as usize],
-        WHAT,
-    )?;
+    let q_elems = usize_product(&[rows as usize, s.q_heads as usize, s.head_dim as usize], WHAT)?;
     let cache_elems = usize_product(
         &[
             s.batch as usize,
@@ -1813,11 +1732,7 @@ fn qk_norm_rope_impl(
     if rows == 0 {
         return Ok(());
     }
-    let mut reads = vec![
-        ("proj", proj.buf),
-        ("q_norm", q_norm_w),
-        ("k_norm", k_norm_w),
-    ];
+    let mut reads = vec![("proj", proj.buf), ("q_norm", q_norm_w), ("k_norm", k_norm_w)];
     if let RopePos::Buffer(b) | RopePos::PerRow(b) = pos {
         reads.push(("pos_offset", b));
     }
@@ -1830,10 +1745,7 @@ fn qk_norm_rope_impl(
         ],
         &reads,
     )?;
-    let units = usize_product(
-        &[rows as usize, s.q_heads as usize + 2 * s.kv_heads as usize],
-        WHAT,
-    )?;
+    let units = usize_product(&[rows as usize, s.q_heads as usize + 2 * s.kv_heads as usize], WHAT)?;
     let name = match pos {
         RopePos::Scalar(_) => "qwen35_attn_qk_norm_rope",
         RopePos::Buffer(_) | RopePos::PerRow(_) => "qwen35_attn_qk_norm_rope_posbuf",
@@ -1899,28 +1811,15 @@ pub fn attn_output_gate(
         "attn_output_gate attn",
     )?;
     require_window::<f32>(rt, proj, u64::from(rows), gate_w, "attn_output_gate proj")?;
-    require_out_window(
-        rt,
-        out,
-        u64::from(rows),
-        u64::from(width),
-        "attn_output_gate out",
-    )?;
+    require_out_window(rt, out, u64::from(rows), u64::from(width), "attn_output_gate out")?;
     if rows == 0 || width == 0 {
         return Ok(());
     }
-    let in_place = out.cols.buf.aliases(attn)
-        && out.dtype == DType::F32
-        && out.cols.ld == width
-        && out.cols.off == 0;
+    let in_place = out.cols.buf.aliases(attn) && out.dtype == DType::F32 && out.cols.ld == width && out.cols.off == 0;
     if in_place {
         require_disjoint_writes(WHAT, &[("out", out.cols.buf)], &[("proj", proj.buf)])?;
     } else {
-        require_disjoint_writes(
-            WHAT,
-            &[("out", out.cols.buf)],
-            &[("attn", attn), ("proj", proj.buf)],
-        )?;
+        require_disjoint_writes(WHAT, &[("out", out.cols.buf)], &[("attn", attn), ("proj", proj.buf)])?;
     }
     let p = rt.pipeline(&name)?;
     dispatch_2d(rt, &p, width as usize, rows as usize, |bnd| {
@@ -1961,11 +1860,7 @@ pub fn swiglu(
     if rows == 0 || width == 0 {
         return Ok(());
     }
-    require_disjoint_writes(
-        WHAT,
-        &[("out", out.cols.buf)],
-        &[("gate", gate.buf), ("up", up.buf)],
-    )?;
+    require_disjoint_writes(WHAT, &[("out", out.cols.buf)], &[("gate", gate.buf), ("up", up.buf)])?;
     let p = rt.pipeline(&name)?;
     dispatch_2d(rt, &p, width as usize, rows as usize, |bnd| {
         set_gpu_buf(bnd, gate.buf, 0);
@@ -1988,13 +1883,7 @@ pub fn swiglu(
 /// which only the bf16 and relaxed-f32 GEMMs have.)
 ///
 /// `y` must be a different buffer from `resid`.
-pub fn residual_add(
-    rt: &Arc<GpuRuntime>,
-    y: Cols<'_>,
-    resid: Cols<'_>,
-    rows: u32,
-    width: u32,
-) -> Result<(), String> {
+pub fn residual_add(rt: &Arc<GpuRuntime>, y: Cols<'_>, resid: Cols<'_>, rows: u32, width: u32) -> Result<(), String> {
     const WHAT: &str = "qwen35::residual_add";
     let (r, w) = (u64::from(rows), u64::from(width));
     require_window::<f32>(rt, y, r, w, "residual_add y")?;
@@ -2327,9 +2216,7 @@ fn prefix_rows_impl(
     out_bf16: bool,
 ) -> Result<(), String> {
     const WHAT: &str = "qwen35::attn_prefix_rows";
-    let Some(suffix_cap) = validate_prefix_attn(
-        rt, WHAT, q, prefix, suffix_k, suffix_v, lens, o, &dims, out_bf16,
-    )?
+    let Some(suffix_cap) = validate_prefix_attn(rt, WHAT, q, prefix, suffix_k, suffix_v, lens, o, &dims, out_bf16)?
     else {
         return Ok(());
     };
@@ -2468,9 +2355,7 @@ fn prefix_decode_impl(
             dims.tq
         ));
     }
-    let Some(suffix_cap) = validate_prefix_attn(
-        rt, WHAT, q, prefix, suffix_k, suffix_v, lens, o, &dims, out_bf16,
-    )?
+    let Some(suffix_cap) = validate_prefix_attn(rt, WHAT, q, prefix, suffix_k, suffix_v, lens, o, &dims, out_bf16)?
     else {
         return Ok(());
     };
@@ -2484,9 +2369,7 @@ fn prefix_decode_impl(
     let heads = dims.heads as usize;
     let group = (dims.heads / dims.heads_kv) as usize;
     // The GQA group shares a threadgroup, as nn's D = 256 decode does.
-    let sgs = crate::nn::DecodeHeadBlock::Group
-        .simdgroups(heads, group)
-        .unwrap_or(1);
+    let sgs = crate::nn::DecodeHeadBlock::Group.simdgroups(heads, group).unwrap_or(1);
     let bh = usize_product(&[dims.batch as usize, heads], WHAT)?;
     let scratch_bytes = usize_product(
         &[
@@ -2500,12 +2383,7 @@ fn prefix_decode_impl(
     // Resolve both pipelines before encoding either: a failure after the
     // partial pass was encoded would leave a producer with no consumer.
     let partial = pipeline_for(rt, "qwen35_attn_prefix_decode_partial", sgs * 32, 0)?;
-    let reduce = pipeline_for(
-        rt,
-        "qwen35_attn_prefix_decode_reduce",
-        PREFIX_DECODE_REDUCE_THREADS,
-        0,
-    )?;
+    let reduce = pipeline_for(rt, "qwen35_attn_prefix_decode_reduce", PREFIX_DECODE_REDUCE_THREADS, 0)?;
     let scratch = rt.alloc_buffer(scratch_bytes)?;
     dispatch_groups(
         rt,
@@ -2532,23 +2410,16 @@ fn prefix_decode_impl(
     )?;
     // The binder orders this after the partial pass, as for the GDN prep and
     // scan.
-    dispatch_groups(
-        rt,
-        &reduce,
-        (1, bh, 1),
-        PREFIX_DECODE_REDUCE_THREADS,
-        0,
-        |bnd| {
-            set_gpu_buf(bnd, &scratch, 0);
-            set_gpu_buf(bnd, o, 1);
-            set_u32(bnd, prefix.len, 2);
-            set_gpu_buf(bnd, suffix_len, 3);
-            set_u32(bnd, dims.heads, 4);
-            set_u32(bnd, u32::from(out_bf16), 5);
-            set_u32(bnd, suffix_cap, 6);
-            set_u32(bnd, lens.row_stride(), 7);
-        },
-    )
+    dispatch_groups(rt, &reduce, (1, bh, 1), PREFIX_DECODE_REDUCE_THREADS, 0, |bnd| {
+        set_gpu_buf(bnd, &scratch, 0);
+        set_gpu_buf(bnd, o, 1);
+        set_u32(bnd, prefix.len, 2);
+        set_gpu_buf(bnd, suffix_len, 3);
+        set_u32(bnd, dims.heads, 4);
+        set_u32(bnd, u32::from(out_bf16), 5);
+        set_u32(bnd, suffix_cap, 6);
+        set_u32(bnd, lens.row_stride(), 7);
+    })
 }
 
 /// The host checks both shared-prefix entry points make. Returns the suffix
@@ -2665,11 +2536,7 @@ pub fn score_answer_rows(
     logprobs: &GpuBuffer,
 ) -> Result<(), String> {
     const WHAT: &str = "qwen35::score_answer_rows";
-    let name = out_kernel(
-        "qwen35_score_rows",
-        lm_head.dtype,
-        "qwen35::score_answer_rows lm_head",
-    )?;
+    let name = out_kernel("qwen35_score_rows", lm_head.dtype, "qwen35::score_answer_rows lm_head")?;
     if hidden == 0 || n_answers == 0 || n_answers > MAX_ANSWERS {
         return Err(format!(
             "{WHAT}: hidden must be non-zero and n_answers in 1..={MAX_ANSWERS}"
@@ -2720,28 +2587,21 @@ pub fn score_answer_rows(
     // Reduction partials, then the answers' logits.
     let tg_bytes = score_tg_bytes(n_answers);
     let p = pipeline_for(rt, &name, SCORE_THREADS, tg_bytes)?;
-    dispatch_groups(
-        rt,
-        &p,
-        (n_slots as usize, 1, 1),
-        SCORE_THREADS,
-        tg_bytes,
-        |bnd| {
-            set_gpu_buf(bnd, hidden_states, 0);
-            set_gpu_buf(bnd, slots, 1);
-            set_gpu_buf(bnd, norm_w, 2);
-            set_gpu_buf(bnd, lm_head.weight, 3);
-            set_gpu_buf(bnd, answers, 4);
-            set_gpu_buf(bnd, logits, 5);
-            set_gpu_buf(bnd, logprobs, 6);
-            set_u32(bnd, rows, 7);
-            set_u32(bnd, hidden, 8);
-            set_u32(bnd, n_answers, 9);
-            set_u32(bnd, lm_head.vocab, 10);
-            set_f32(bnd, eps, 11);
-            set_f32(bnd, w_offset, 12);
-        },
-    )
+    dispatch_groups(rt, &p, (n_slots as usize, 1, 1), SCORE_THREADS, tg_bytes, |bnd| {
+        set_gpu_buf(bnd, hidden_states, 0);
+        set_gpu_buf(bnd, slots, 1);
+        set_gpu_buf(bnd, norm_w, 2);
+        set_gpu_buf(bnd, lm_head.weight, 3);
+        set_gpu_buf(bnd, answers, 4);
+        set_gpu_buf(bnd, logits, 5);
+        set_gpu_buf(bnd, logprobs, 6);
+        set_u32(bnd, rows, 7);
+        set_u32(bnd, hidden, 8);
+        set_u32(bnd, n_answers, 9);
+        set_u32(bnd, lm_head.vocab, 10);
+        set_f32(bnd, eps, 11);
+        set_f32(bnd, w_offset, 12);
+    })
 }
 
 // --------------------------------------------------------------- embedding ---
@@ -2789,11 +2649,7 @@ pub fn embed_rows(
     if n == 0 {
         return Ok(());
     }
-    require_disjoint_writes(
-        WHAT,
-        &[("out", out)],
-        &[("ids", ids), ("table", table.weight)],
-    )?;
+    require_disjoint_writes(WHAT, &[("out", out)], &[("ids", ids), ("table", table.weight)])?;
     let p = rt.pipeline(kernel)?;
     dispatch_2d(rt, &p, hidden as usize, n as usize, |bnd| {
         set_gpu_buf(bnd, ids, 0);
@@ -2832,14 +2688,8 @@ mod tests {
             GdnProjLayout::new(16, 24, 128).is_err(),
             "v_heads not a multiple of k_heads"
         );
-        assert!(
-            GdnProjLayout::new(1, 1, 48).is_err(),
-            "v_dim not a multiple of 32"
-        );
-        assert!(
-            AttnProjLayout::new(u32::MAX / 4, 1, 4).is_err(),
-            "width overflow"
-        );
+        assert!(GdnProjLayout::new(1, 1, 48).is_err(), "v_dim not a multiple of 32");
+        assert!(AttnProjLayout::new(u32::MAX / 4, 1, 4).is_err(), "width overflow");
     }
 
     #[test]
@@ -2856,17 +2706,11 @@ mod tests {
         // while nn picks the same ones for D = 256.
         let d = PREFIX_ATTN_HEAD_DIM;
         assert_eq!(crate::nn::rows_lanes_for(d).width(), PREFIX_ATTN_LANES);
-        assert_eq!(
-            crate::nn::rows_groups_for(d).count(),
-            PREFIX_ATTN_SIMDGROUPS
-        );
+        assert_eq!(crate::nn::rows_groups_for(d).count(), PREFIX_ATTN_SIMDGROUPS);
         // Likewise the decode passes and flash_attn_decode.
         assert_eq!(crate::nn::decode_chunk_for(d).keys(), PREFIX_DECODE_CHUNK);
         assert_eq!(crate::nn::decode_lanes_for(d).width(), PREFIX_DECODE_LANES);
-        assert_eq!(
-            crate::nn::decode_head_block_for(d),
-            crate::nn::DecodeHeadBlock::Group
-        );
+        assert_eq!(crate::nn::decode_head_block_for(d), crate::nn::DecodeHeadBlock::Group);
         assert_eq!(
             crate::nn::DECODE_REDUCE_THREADS.min(d as usize),
             PREFIX_DECODE_REDUCE_THREADS

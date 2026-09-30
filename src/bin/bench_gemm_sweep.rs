@@ -34,9 +34,7 @@ fn fill(n: usize, seed: u64) -> Vec<f32> {
     let mut s = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
     let mut out = Vec::with_capacity(n);
     for _ in 0..n {
-        s = s
-            .wrapping_mul(6364136223846793005)
-            .wrapping_add(1442695040888963407);
+        s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
         let u = ((s >> 32) as u32) as f64 / (u32::MAX as f64);
         out.push((u * 2.0 - 1.0) as f32);
     }
@@ -116,10 +114,7 @@ fn main() -> Result<(), String> {
     let owned = shapes_from_env();
     let shapes: Vec<(usize, usize, usize, String)> = match owned {
         Some(v) => v,
-        None => SHAPES
-            .iter()
-            .map(|&(m, n, k, l)| (m, n, k, l.to_string()))
-            .collect(),
+        None => SHAPES.iter().map(|&(m, n, k, l)| (m, n, k, l.to_string())).collect(),
     };
 
     let mut rows: Vec<String> = Vec::new();
@@ -136,12 +131,7 @@ fn main() -> Result<(), String> {
         let flop = 2.0 * m as f64 * n as f64 * k as f64;
         let mut lanes: Vec<(String, GemmBackend, Tensor, Tensor)> = Vec::new();
         for &(bname, backend) in &backends {
-            lanes.push((
-                format!("{bname}-f32"),
-                backend,
-                a.view(&[m, k], 0),
-                b.view(&[k, n], 0),
-            ));
+            lanes.push((format!("{bname}-f32"), backend, a.view(&[m, k], 0), b.view(&[k, n], 0)));
         }
         if rt.has_tensorops() {
             // bf16 operands, f32 accumulate — the path `gemm_train` takes under
@@ -171,9 +161,7 @@ fn main() -> Result<(), String> {
             let med = median(samples.clone());
             let best = samples.iter().cloned().fold(f64::INFINITY, f64::min);
             let gflops = flop / (med * 1e6);
-            eprintln!(
-                "{label:<12} {bname:<10} M={m} N={n} K={k}  {med:8.3} ms  {gflops:8.1} GFLOP/s"
-            );
+            eprintln!("{label:<12} {bname:<10} M={m} N={n} K={k}  {med:8.3} ms  {gflops:8.1} GFLOP/s");
             rows.push(format!(
                 r#"{{"shape":"{label}","backend":"{bname}","runtime":"metal-native","m":{m},"n":{n},"k":{k},"median_ms":{med:.6},"best_ms":{best:.6},"gflops":{gflops:.3}}}"#
             ));

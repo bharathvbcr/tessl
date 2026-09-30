@@ -42,8 +42,8 @@ use crate::gemm::{gemm, gemm_nt_f32, GemmBackend};
 use crate::json::{self, Json, Syntax};
 use crate::nn::{self, AttnDims};
 use crate::qwen35::{
-    self, AttnProjLayout, AttnShape, AttnTargets, Cols, GdnParams, GdnProjLayout, GdnWorkspace,
-    LmHead, OutCols, StateIn,
+    self, AttnProjLayout, AttnShape, AttnTargets, Cols, GdnParams, GdnProjLayout, GdnWorkspace, LmHead, OutCols,
+    StateIn,
 };
 use crate::runtime::GpuRuntime;
 use crate::safetensors::SafeTensors;
@@ -168,7 +168,11 @@ impl Qwen35Config {
                 Json::Bool(false) => {
                     return Err("config.json: untied embeddings (a separate lm_head) are not supported".into())
                 }
-                v => return Err(format!("config.json: tie_word_embeddings must be true or false, got {v:?}")),
+                v => {
+                    return Err(format!(
+                        "config.json: tie_word_embeddings must be true or false, got {v:?}"
+                    ))
+                }
             }
         }
         if ties.iter().all(Option::is_none) {
@@ -176,7 +180,9 @@ impl Qwen35Config {
         }
         for k in ["num_experts", "num_local_experts", "moe_intermediate_size"] {
             if c.get(k).is_some() {
-                return Err(format!("config.json: {k} is set; mixture-of-experts models are not supported"));
+                return Err(format!(
+                    "config.json: {k} is set; mixture-of-experts models are not supported"
+                ));
             }
         }
         if flag("attention_bias")? == Some(true) {
@@ -187,7 +193,9 @@ impl Qwen35Config {
         }
         if let Some(act) = string("hidden_act")? {
             if act != "silu" {
-                return Err(format!("config.json: hidden_act {act:?} is not supported (only \"silu\")"));
+                return Err(format!(
+                    "config.json: hidden_act {act:?} is not supported (only \"silu\")"
+                ));
             }
         }
         match c.get("mlp_only_layers") {
@@ -205,7 +213,9 @@ impl Qwen35Config {
                 .map(|(i, t)| match t {
                     Json::Str(s) if s == "linear_attention" => Ok(LayerKind::LinearAttention),
                     Json::Str(s) if s == "full_attention" => Ok(LayerKind::FullAttention),
-                    t => Err(format!("config.json: layer_types[{i}] = {t:?} is not a known layer type")),
+                    t => Err(format!(
+                        "config.json: layer_types[{i}] = {t:?} is not a known layer type"
+                    )),
                 })
                 .collect::<Result<_, _>>()?,
             Some(v) => return Err(format!("config.json: layer_types must be an array, got {v:?}")),
@@ -215,7 +225,13 @@ impl Qwen35Config {
                     return Err("config.json: full_attention_interval must be non-zero".into());
                 }
                 (0..n_layers)
-                    .map(|l| if (l + 1) % every == 0 { LayerKind::FullAttention } else { LayerKind::LinearAttention })
+                    .map(|l| {
+                        if (l + 1) % every == 0 {
+                            LayerKind::FullAttention
+                        } else {
+                            LayerKind::LinearAttention
+                        }
+                    })
                     .collect()
             }
         };
@@ -246,7 +262,9 @@ impl Qwen35Config {
         let rope = c.get("rope_parameters").unwrap_or(c);
         if let Some(t) = rope.get("rope_type").or_else(|| rope.get("type")) {
             if t != &Json::Str("default".into()) {
-                return Err(format!("config.json: rope_type {t:?} is not supported (only \"default\")"));
+                return Err(format!(
+                    "config.json: rope_type {t:?} is not supported (only \"default\")"
+                ));
             }
         }
         let theta = float(
@@ -425,12 +443,7 @@ impl Loader<'_> {
 
     /// `nn.Linear` weights `[out_i, in]` packed side by side into the right
     /// operand `[in, sum(out_i)]` of one GEMM, in `precision`.
-    fn linear(
-        &self,
-        parts: &[(&str, usize)],
-        in_features: usize,
-        precision: Precision,
-    ) -> Result<Tensor, String> {
+    fn linear(&self, parts: &[(&str, usize)], in_features: usize, precision: Precision) -> Result<Tensor, String> {
         let widths: Vec<usize> = parts.iter().map(|&(_, o)| o).collect();
         let total: usize = widths.iter().sum();
         match precision {

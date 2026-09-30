@@ -210,10 +210,14 @@ impl Qwen35Model {
         const WHAT: &str = "Qwen35Model::train_step";
         let (rt, cfg) = (&self.rt, &self.cfg);
         if self.precision != Precision::F32 {
-            return Err(format!("{WHAT}: training runs in f32; load the model with Precision::F32"));
+            return Err(format!(
+                "{WHAT}: training runs in f32; load the model with Precision::F32"
+            ));
         }
         if rt.relaxed_precision() {
-            return Err(format!("{WHAT}: the step needs exact-f32 GEMMs; switch the runtime's relaxed precision off"));
+            return Err(format!(
+                "{WHAT}: the step needs exact-f32 GEMMs; switch the runtime's relaxed precision off"
+            ));
         }
         if cfg.gdn.k_heads() != cfg.gdn.v_heads() {
             return Err(format!(
@@ -239,7 +243,11 @@ impl Qwen35Model {
             rt,
             &id_buf,
             t,
-            qwen35::LmHead { weight: &self.embed.buffer, dtype: self.embed.dtype, vocab: cfg.vocab },
+            qwen35::LmHead {
+                weight: &self.embed.buffer,
+                dtype: self.embed.dtype,
+                vocab: cfg.vocab,
+            },
             cfg.hidden,
             &resid.buffer,
         )?;
@@ -253,7 +261,15 @@ impl Qwen35Model {
             resid = out;
         }
         let xf = tensor(rt, &[tu, h])?;
-        nn::rms_norm_f32(rt, &resid.buffer, &self.final_norm, &xf.buffer, t, cfg.hidden, cfg.rms_norm_eps)?;
+        nn::rms_norm_f32(
+            rt,
+            &resid.buffer,
+            &self.final_norm,
+            &xf.buffer,
+            t,
+            cfg.hidden,
+            cfg.rms_norm_eps,
+        )?;
 
         // ---- loss and the LM head ------------------------------------------
         let n = tu - 1;
@@ -273,7 +289,11 @@ impl Qwen35Model {
             Reduction::Mean,
             operands,
             &ce_ws,
-            Some(CeGrads { dh: &dxf.view(&[n, h], 0), dw: &d_embed, scale: 1.0 }),
+            Some(CeGrads {
+                dh: &dxf.view(&[n, h], 0),
+                dw: &d_embed,
+                scale: 1.0,
+            }),
         )?;
 
         // ---- backward -------------------------------------------------------
@@ -296,15 +316,32 @@ impl Qwen35Model {
         // Popped from the back: a layer's rebuilt intermediates are released
         // as soon as its backward is encoded.
         for layer in self.layers.iter().rev() {
-            let resid_in = inputs.pop().ok_or("Qwen35Model::train_step: fewer layer inputs than layers")?;
+            let resid_in = inputs
+                .pop()
+                .ok_or("Qwen35Model::train_step: fewer layer inputs than layers")?;
             let s = self.train_layer_forward(layer, resid_in, t, false, operands)?.0;
             layers.push(self.train_layer_backward(layer, &s, &mut sc, operands)?);
         }
         layers.reverse();
         let emb_ws = EmbedBwdWorkspace::new(rt, t)?;
-        embed_rows_bwd(rt, ids, &sc.dresid.buffer, &d_embed.buffer, cfg.vocab, cfg.hidden, &emb_ws)?;
+        embed_rows_bwd(
+            rt,
+            ids,
+            &sc.dresid.buffer,
+            &d_embed.buffer,
+            cfg.vocab,
+            cfg.hidden,
+            &emb_ws,
+        )?;
         rt.synchronize()?;
-        Ok(TrainStep { loss: out.loss, grads: Qwen35Grads { embed: d_embed, final_norm, layers } })
+        Ok(TrainStep {
+            loss: out.loss,
+            grads: Qwen35Grads {
+                embed: d_embed,
+                final_norm,
+                layers,
+            },
+        })
     }
 
     fn scratch(&self, t: u32) -> Result<Scratch, String> {
@@ -314,7 +351,12 @@ impl Qwen35Model {
         let has = |k: crate::qwen35_model::LayerKind| cfg.layers.contains(&k);
         let gdn = if has(crate::qwen35_model::LayerKind::LinearAttention) {
             let (hv, dv) = (g.v_heads() as usize, g.v_dim() as usize);
-            let dims = GdnTrainDims { batch: 1, seq: t, heads: g.v_heads(), v_dim: g.v_dim() };
+            let dims = GdnTrainDims {
+                batch: 1,
+                seq: t,
+                heads: g.v_heads(),
+                v_dim: g.v_dim(),
+            };
             let dk = GDN_TRAIN_DK as usize;
             Some(GdnScratch {
                 dy: tensor(rt, &[tu, hv * dv])?,
@@ -389,7 +431,15 @@ impl Qwen35Model {
 
     /// `out = rms_norm(x) * w`, f32.
     fn norm_f32(&self, x: &Tensor, w: &GpuBuffer, out: &Tensor, t: u32) -> Result<(), String> {
-        nn::rms_norm_f32(&self.rt, &x.buffer, w, &out.buffer, t, self.cfg.hidden, self.cfg.rms_norm_eps)
+        nn::rms_norm_f32(
+            &self.rt,
+            &x.buffer,
+            w,
+            &out.buffer,
+            t,
+            self.cfg.hidden,
+            self.cfg.rms_norm_eps,
+        )
     }
 
     /// A fresh residual stream `resid + y @ w_out`, leaving `resid` as the
@@ -438,12 +488,31 @@ impl Qwen35Model {
             rt,
             Cols::dense(&m_gate.buffer, cfg.intermediate),
             Cols::dense(&m_up.buffer, cfg.intermediate),
-            OutCols { cols: Cols::dense(&m_mid.buffer, cfg.intermediate), dtype: DType::F32 },
+            OutCols {
+                cols: Cols::dense(&m_mid.buffer, cfg.intermediate),
+                dtype: DType::F32,
+            },
             t,
             cfg.intermediate,
         )?;
-        let resid_out = if output { Some(self.residual(&resid_mid, &m_mid, &layer.down, t, mm)?) } else { None };
-        Ok((Saved { resid_in, x1, mixer, resid_mid, x2, m_gate, m_up, m_mid }, resid_out))
+        let resid_out = if output {
+            Some(self.residual(&resid_mid, &m_mid, &layer.down, t, mm)?)
+        } else {
+            None
+        };
+        Ok((
+            Saved {
+                resid_in,
+                x1,
+                mixer,
+                resid_mid,
+                x2,
+                m_gate,
+                m_up,
+                m_mid,
+            },
+            resid_out,
+        ))
     }
 
     fn gdn_forward(&self, w: &GdnWeights, x1: &Tensor, t: u32, mm: GemmOperands) -> Result<SavedGdn, String> {
@@ -466,24 +535,57 @@ impl Qwen35Model {
             g.conv_dim(),
         )?;
         let qkv = g.conv_qkv(&conv);
-        let (q, k, v) = (tensor(rt, &[1, tu, hv, dk])?, tensor(rt, &[1, tu, hv, dk])?, tensor(rt, &[1, tu, hv, dv])?);
-        for (off, dst, width) in [(qkv.q_off, &q, g.key_dim()), (qkv.k_off, &k, g.key_dim()), (qkv.v_off, &v, g.value_dim())] {
-            copy_cols(rt, Cols { buf: &conv, ld: qkv.ld, off }, Cols::dense(&dst.buffer, width), t, width)?;
+        let (q, k, v) = (
+            tensor(rt, &[1, tu, hv, dk])?,
+            tensor(rt, &[1, tu, hv, dk])?,
+            tensor(rt, &[1, tu, hv, dv])?,
+        );
+        for (off, dst, width) in [
+            (qkv.q_off, &q, g.key_dim()),
+            (qkv.k_off, &k, g.key_dim()),
+            (qkv.v_off, &v, g.value_dim()),
+        ] {
+            copy_cols(
+                rt,
+                Cols {
+                    buf: &conv,
+                    ld: qkv.ld,
+                    off,
+                },
+                Cols::dense(&dst.buffer, width),
+                t,
+                width,
+            )?;
         }
         let (gt, beta) = (tensor(rt, &[1, tu, hv])?, tensor(rt, &[1, tu, hv])?);
         qwen35::gdn_gates(
             rt,
             &g.gates(&proj.buffer),
-            &GdnParams { a_log: &w.a_log, dt_bias: &w.dt_bias },
+            &GdnParams {
+                a_log: &w.a_log,
+                dt_bias: &w.dt_bias,
+            },
             &gt.buffer,
             &beta.buffer,
             t,
             g.v_heads(),
         )?;
-        let dims = GdnTrainDims { batch: 1, seq: t, heads: g.v_heads(), v_dim: g.v_dim() };
+        let dims = GdnTrainDims {
+            batch: 1,
+            seq: t,
+            heads: g.v_heads(),
+            v_dim: g.v_dim(),
+        };
         let ckpt = tensor(rt, &dims.checkpoint_shape())?;
         let o = tensor(rt, &[1, tu, hv, dv])?;
-        let inputs = GdnTrainInputs { q: &q, k: &k, v: &v, g: &gt, beta: &beta, s0: None };
+        let inputs = GdnTrainInputs {
+            q: &q,
+            k: &k,
+            v: &v,
+            g: &gt,
+            beta: &beta,
+            s0: None,
+        };
         gdn_train_forward(rt, dims, inputs, &o, None, &ckpt)?;
         let y = tensor(rt, &[tu, hv * dv])?;
         qwen35::gated_rms_norm(
@@ -491,19 +593,35 @@ impl Qwen35Model {
             Cols::dense(&o.buffer, g.value_dim()),
             g.z(&proj.buffer),
             &w.norm_w,
-            OutCols { cols: Cols::dense(&y.buffer, g.value_dim()), dtype: DType::F32 },
+            OutCols {
+                cols: Cols::dense(&y.buffer, g.value_dim()),
+                dtype: DType::F32,
+            },
             t,
             g.v_heads(),
             g.v_dim(),
             self.cfg.rms_norm_eps,
         )?;
-        Ok(SavedGdn { proj, q, k, v, g: gt, beta, ckpt, o, y })
+        Ok(SavedGdn {
+            proj,
+            q,
+            k,
+            v,
+            g: gt,
+            beta,
+            ckpt,
+            o,
+            y,
+        })
     }
 
     fn attn_forward(&self, w: &AttnWeights, x1: &Tensor, t: u32, mm: GemmOperands) -> Result<SavedAttn, String> {
         let (rt, a) = (&self.rt, self.cfg.attn);
         let tu = t as usize;
-        let (qd, kvd) = ((a.q_heads() * a.head_dim()) as usize, (a.kv_heads() * a.head_dim()) as usize);
+        let (qd, kvd) = (
+            (a.q_heads() * a.head_dim()) as usize,
+            (a.kv_heads() * a.head_dim()) as usize,
+        );
         let proj = tensor(rt, &[tu, a.width() as usize])?;
         mm.nn(x1, &w.w_in, &proj)?;
         let (q, k, v) = (f32s(rt, tu * qd)?, f32s(rt, tu * kvd)?, f32s(rt, tu * kvd)?);
@@ -513,7 +631,11 @@ impl Qwen35Model {
             Cols::dense(&proj.buffer, a.width()),
             &w.q_norm,
             &w.k_norm,
-            &AttnTargets { q_out: &q, k_cache: &k, v_cache: &v },
+            &AttnTargets {
+                q_out: &q,
+                k_cache: &k,
+                v_cache: &v,
+            },
             0,
             self.cfg.rope_theta,
             self.cfg.rms_norm_eps,
@@ -527,17 +649,34 @@ impl Qwen35Model {
             rt,
             &o,
             Cols::dense(&proj.buffer, a.width()),
-            OutCols { cols: Cols::dense(&y.buffer, qd as u32), dtype: DType::F32 },
+            OutCols {
+                cols: Cols::dense(&y.buffer, qd as u32),
+                dtype: DType::F32,
+            },
             t,
             a.q_heads(),
             a.head_dim(),
         )?;
-        Ok(SavedAttn { proj, q, k, v, o, lse, y })
+        Ok(SavedAttn {
+            proj,
+            q,
+            k,
+            v,
+            o,
+            lse,
+            y,
+        })
     }
 
     /// One layer's backward. On entry `sc.dresid` is the gradient of the
     /// layer's output; on return, of its input.
-    fn train_layer_backward(&self, layer: &Layer, s: &Saved, sc: &mut Scratch, mm: GemmOperands) -> Result<LayerGrads, String> {
+    fn train_layer_backward(
+        &self,
+        layer: &Layer,
+        s: &Saved,
+        sc: &mut Scratch,
+        mm: GemmOperands,
+    ) -> Result<LayerGrads, String> {
         let (rt, cfg) = (&self.rt, &self.cfg);
         let (t, h, i) = (sc.t, cfg.hidden, cfg.intermediate);
         let (hu, iu) = (h as usize, i as usize);
@@ -562,9 +701,27 @@ impl Qwen35Model {
         mm.tn(&s.x2, &sc.d_up, &up)?;
         mm.nt(&sc.d_gate, &layer.gate, &sc.dx)?;
         mm.nt(&sc.d_up, &layer.up, &sc.tmp_h)?;
-        qwen35::residual_add(rt, Cols::dense(&sc.tmp_h.buffer, h), Cols::dense(&sc.dx.buffer, h), t, h)?;
+        qwen35::residual_add(
+            rt,
+            Cols::dense(&sc.tmp_h.buffer, h),
+            Cols::dense(&sc.dx.buffer, h),
+            t,
+            h,
+        )?;
         let post_norm = f32s(rt, hu)?;
-        rms_norm_bwd(rt, &s.resid_mid.buffer, &layer.post_norm, &sc.dx.buffer, &sc.dresid.buffer, &post_norm, &sc.norm_part, t, h, eps, true)?;
+        rms_norm_bwd(
+            rt,
+            &s.resid_mid.buffer,
+            &layer.post_norm,
+            &sc.dx.buffer,
+            &sc.dresid.buffer,
+            &post_norm,
+            &sc.norm_part,
+            t,
+            h,
+            eps,
+            true,
+        )?;
 
         // Mixer: resid_mid = resid_in + mixer(x1), x1 = norm(resid_in).
         let mixer = match (&layer.mixer, &s.mixer) {
@@ -573,13 +730,39 @@ impl Qwen35Model {
             _ => return Err("Qwen35Model::train_step: a layer's saved state is not its mixer's".into()),
         };
         let input_norm = f32s(rt, hu)?;
-        rms_norm_bwd(rt, &s.resid_in.buffer, &layer.input_norm, &sc.dx.buffer, &sc.dresid.buffer, &input_norm, &sc.norm_part, t, h, eps, true)?;
-        Ok(LayerGrads { input_norm, post_norm, mixer, gate, up, down })
+        rms_norm_bwd(
+            rt,
+            &s.resid_in.buffer,
+            &layer.input_norm,
+            &sc.dx.buffer,
+            &sc.dresid.buffer,
+            &input_norm,
+            &sc.norm_part,
+            t,
+            h,
+            eps,
+            true,
+        )?;
+        Ok(LayerGrads {
+            input_norm,
+            post_norm,
+            mixer,
+            gate,
+            up,
+            down,
+        })
     }
 
     /// The GDN mixer's backward from `sc.dresid`; leaves the gradient of its
     /// input `x1` in `sc.dx`.
-    fn gdn_backward(&self, w: &GdnWeights, s: &SavedGdn, x1: &Tensor, sc: &mut Scratch, mm: GemmOperands) -> Result<GdnGrads, String> {
+    fn gdn_backward(
+        &self,
+        w: &GdnWeights,
+        s: &SavedGdn,
+        x1: &Tensor,
+        sc: &mut Scratch,
+        mm: GemmOperands,
+    ) -> Result<GdnGrads, String> {
         let (rt, cfg, g) = (&self.rt, &self.cfg, self.cfg.gdn);
         let t = sc.t;
         let (hu, vd) = (cfg.hidden as usize, g.value_dim() as usize);
@@ -605,23 +788,45 @@ impl Qwen35Model {
             g.v_dim(),
             cfg.rms_norm_eps,
         )?;
-        let dims = GdnTrainDims { batch: 1, seq: t, heads: g.v_heads(), v_dim: g.v_dim() };
+        let dims = GdnTrainDims {
+            batch: 1,
+            seq: t,
+            heads: g.v_heads(),
+            v_dim: g.v_dim(),
+        };
         gdn_train_backward(
             rt,
             dims,
-            GdnTrainInputs { q: &s.q, k: &s.k, v: &s.v, g: &s.g, beta: &s.beta, s0: None },
+            GdnTrainInputs {
+                q: &s.q,
+                k: &s.k,
+                v: &s.v,
+                g: &s.g,
+                beta: &s.beta,
+                s0: None,
+            },
             &s.ckpt,
             &gs.d_o,
             None,
             &gs.ws,
-            GdnTrainGrads { dq: &gs.dq, dk: &gs.dk, dv: &gs.dv, dg: &gs.dg, dbeta: &gs.dbeta, ds0: None },
+            GdnTrainGrads {
+                dq: &gs.dq,
+                dk: &gs.dk,
+                dv: &gs.dv,
+                dg: &gs.dg,
+                dbeta: &gs.dbeta,
+                ds0: None,
+            },
         )?;
         // The gates' logits (a, b columns) and their parameters.
         let (a_log, dt_bias) = (f32s(rt, g.v_heads() as usize)?, f32s(rt, g.v_heads() as usize)?);
         gdn_gates_bwd(
             rt,
             &g.gates(&s.proj.buffer),
-            &GdnParams { a_log: &w.a_log, dt_bias: &w.dt_bias },
+            &GdnParams {
+                a_log: &w.a_log,
+                dt_bias: &w.dt_bias,
+            },
             &gs.dg.buffer,
             &gs.dbeta.buffer,
             dproj,
@@ -634,8 +839,22 @@ impl Qwen35Model {
         // q, k, v back into the conv output's layout, then the conv into the
         // projection's qkv columns.
         let qkv = g.conv_qkv(&gs.d_conv);
-        for (src, off, width) in [(&gs.dq, qkv.q_off, g.key_dim()), (&gs.dk, qkv.k_off, g.key_dim()), (&gs.dv, qkv.v_off, g.value_dim())] {
-            copy_cols(rt, Cols::dense(&src.buffer, width), Cols { buf: &gs.d_conv, ld: qkv.ld, off }, t, width)?;
+        for (src, off, width) in [
+            (&gs.dq, qkv.q_off, g.key_dim()),
+            (&gs.dk, qkv.k_off, g.key_dim()),
+            (&gs.dv, qkv.v_off, g.value_dim()),
+        ] {
+            copy_cols(
+                rt,
+                Cols::dense(&src.buffer, width),
+                Cols {
+                    buf: &gs.d_conv,
+                    ld: qkv.ld,
+                    off,
+                },
+                t,
+                width,
+            )?;
         }
         let conv_w = f32s(rt, (g.conv_dim() * cfg.conv_kernel) as usize)?;
         conv1d_silu_bwd(
@@ -654,26 +873,68 @@ impl Qwen35Model {
         let w_in = tensor(rt, &[hu, g.width() as usize])?;
         mm.tn(x1, &gs.dproj, &w_in)?;
         mm.nt(&gs.dproj, &w.w_in, &sc.dx)?;
-        Ok(GdnGrads { w_in, w_out, conv_w, a_log, dt_bias, norm_w })
+        Ok(GdnGrads {
+            w_in,
+            w_out,
+            conv_w,
+            a_log,
+            dt_bias,
+            norm_w,
+        })
     }
 
     /// The attention mixer's backward from `sc.dresid`; leaves the gradient
     /// of its input `x1` in `sc.dx`.
-    fn attn_backward(&self, w: &AttnWeights, s: &SavedAttn, x1: &Tensor, sc: &mut Scratch, mm: GemmOperands) -> Result<AttnGrads, String> {
+    fn attn_backward(
+        &self,
+        w: &AttnWeights,
+        s: &SavedAttn,
+        x1: &Tensor,
+        sc: &mut Scratch,
+        mm: GemmOperands,
+    ) -> Result<AttnGrads, String> {
         let (rt, cfg, a) = (&self.rt, &self.cfg, self.cfg.attn);
         let t = sc.t;
         let hu = cfg.hidden as usize;
         let qd = a.q_heads() * a.head_dim();
-        let asc = sc.attn.as_ref().ok_or("Qwen35Model::train_step: no attention scratch")?;
+        let asc = sc
+            .attn
+            .as_ref()
+            .ok_or("Qwen35Model::train_step: no attention scratch")?;
         let w_out = tensor(rt, &[qd as usize, hu])?;
         mm.tn(&s.y, &sc.dresid, &w_out)?;
         mm.nt(&sc.dresid, &w.w_out, &asc.dy)?;
         let proj = Cols::dense(&s.proj.buffer, a.width());
         let dproj = &asc.dproj.buffer;
         // y = o * sigmoid(gate): d_o, and the gate columns of dproj.
-        attn_gate_bwd(rt, &s.o, proj, Cols::dense(&asc.dy.buffer, qd), &asc.d_o, dproj, t, a.q_heads(), a.head_dim())?;
-        let grads = AttnTrainGrads { dq: &asc.dq, dk: &asc.dk, dv: &asc.dv };
-        attn_train_backward(rt, &self.attn_dims(t), &s.q, &s.k, &s.v, &s.o, &s.lse, &asc.d_o, &grads, &asc.ws)?;
+        attn_gate_bwd(
+            rt,
+            &s.o,
+            proj,
+            Cols::dense(&asc.dy.buffer, qd),
+            &asc.d_o,
+            dproj,
+            t,
+            a.q_heads(),
+            a.head_dim(),
+        )?;
+        let grads = AttnTrainGrads {
+            dq: &asc.dq,
+            dk: &asc.dk,
+            dv: &asc.dv,
+        };
+        attn_train_backward(
+            rt,
+            &self.attn_dims(t),
+            &s.q,
+            &s.k,
+            &s.v,
+            &s.o,
+            &s.lse,
+            &asc.d_o,
+            &grads,
+            &asc.ws,
+        )?;
         // q, k, v back through RoPE and the norms into their dproj columns.
         let (q_norm, k_norm) = (f32s(rt, a.head_dim() as usize)?, f32s(rt, a.head_dim() as usize)?);
         attn_qk_norm_rope_bwd(
@@ -682,7 +943,11 @@ impl Qwen35Model {
             proj,
             &w.q_norm,
             &w.k_norm,
-            &AttnQkvGrads { dq: &asc.dq, dk: &asc.dk, dv: &asc.dv },
+            &AttnQkvGrads {
+                dq: &asc.dq,
+                dk: &asc.dk,
+                dv: &asc.dv,
+            },
             dproj,
             &q_norm,
             &k_norm,
@@ -693,7 +958,12 @@ impl Qwen35Model {
         let w_in = tensor(rt, &[hu, a.width() as usize])?;
         mm.tn(x1, &asc.dproj, &w_in)?;
         mm.nt(&asc.dproj, &w.w_in, &sc.dx)?;
-        Ok(AttnGrads { w_in, w_out, q_norm, k_norm })
+        Ok(AttnGrads {
+            w_in,
+            w_out,
+            q_norm,
+            k_norm,
+        })
     }
 }
 
@@ -760,9 +1030,19 @@ mod tests {
     #[ignore]
     fn real_2b_gradients_are_those_of_tessls_forward() {
         let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/qwen35_train_ref");
-        let st = SafeTensors::open(Path::new(&std::env::var("QWEN35_2B_SAFETENSORS").expect("QWEN35_2B_SAFETENSORS"))).unwrap();
+        let st = SafeTensors::open(Path::new(
+            &std::env::var("QWEN35_2B_SAFETENSORS").expect("QWEN35_2B_SAFETENSORS"),
+        ))
+        .unwrap();
         let rt = GpuRuntime::new().unwrap();
-        let model = Qwen35Model::load(&rt, &st, "model.language_model.", Qwen35Config::qwen35_2b().unwrap(), Precision::F32).unwrap();
+        let model = Qwen35Model::load(
+            &rt,
+            &st,
+            "model.language_model.",
+            Qwen35Config::qwen35_2b().unwrap(),
+            Precision::F32,
+        )
+        .unwrap();
         drop(st);
         let ids: Vec<u32> = npy(&dir.join("ids.npy")).iter().map(|&x| x as u32).collect();
         let step = model.train_step(&ids, GemmOperands::ExactF32).unwrap();
@@ -774,15 +1054,55 @@ mod tests {
         };
         let h = model.cfg.hidden as usize;
         let cases: Vec<(String, &GpuBuffer, &GpuBuffer, usize)> = vec![
-            ("model.layers.20.linear_attn.conv1d.weight".into(), &mixer(20).0.conv_w, &mixer(20).1.conv_w, 6144 * 4),
-            ("model.layers.23.input_layernorm.weight".into(), &model.layers[23].input_norm, &step.grads.layers[23].input_norm, h),
-            ("model.layers.8.linear_attn.dt_bias".into(), &mixer(8).0.dt_bias, &mixer(8).1.dt_bias, 16),
-            ("model.layers.8.linear_attn.A_log".into(), &mixer(8).0.a_log, &mixer(8).1.a_log, 16),
+            (
+                "model.layers.20.linear_attn.conv1d.weight".into(),
+                &mixer(20).0.conv_w,
+                &mixer(20).1.conv_w,
+                6144 * 4,
+            ),
+            (
+                "model.layers.23.input_layernorm.weight".into(),
+                &model.layers[23].input_norm,
+                &step.grads.layers[23].input_norm,
+                h,
+            ),
+            (
+                "model.layers.8.linear_attn.dt_bias".into(),
+                &mixer(8).0.dt_bias,
+                &mixer(8).1.dt_bias,
+                16,
+            ),
+            (
+                "model.layers.8.linear_attn.A_log".into(),
+                &mixer(8).0.a_log,
+                &mixer(8).1.a_log,
+                16,
+            ),
             ("model.norm.weight".into(), &model.final_norm, &step.grads.final_norm, h),
-            ("model.layers.22.input_layernorm.weight".into(), &model.layers[22].input_norm, &step.grads.layers[22].input_norm, h),
-            ("model.layers.8.post_attention_layernorm.weight".into(), &model.layers[8].post_norm, &step.grads.layers[8].post_norm, h),
-            ("model.layers.6.input_layernorm.weight".into(), &model.layers[6].input_norm, &step.grads.layers[6].input_norm, h),
-            ("model.layers.20.linear_attn.norm.weight".into(), &mixer(20).0.norm_w, &mixer(20).1.norm_w, 128),
+            (
+                "model.layers.22.input_layernorm.weight".into(),
+                &model.layers[22].input_norm,
+                &step.grads.layers[22].input_norm,
+                h,
+            ),
+            (
+                "model.layers.8.post_attention_layernorm.weight".into(),
+                &model.layers[8].post_norm,
+                &step.grads.layers[8].post_norm,
+                h,
+            ),
+            (
+                "model.layers.6.input_layernorm.weight".into(),
+                &model.layers[6].input_norm,
+                &step.grads.layers[6].input_norm,
+                h,
+            ),
+            (
+                "model.layers.20.linear_attn.norm.weight".into(),
+                &mixer(20).0.norm_w,
+                &mixer(20).1.norm_w,
+                128,
+            ),
         ];
         // The matrices, whose disagreement is large in absolute terms and
         // spread thinly over millions of weights: torch's [out, in]
@@ -794,9 +1114,27 @@ mod tests {
         };
         let qd = (model.cfg.attn.q_heads() * model.cfg.attn.head_dim()) as usize;
         let matrices: Vec<(String, &GpuBuffer, &GpuBuffer, usize, usize)> = vec![
-            ("model.layers.0.mlp.gate_proj.weight".into(), &model.layers[0].gate.buffer, &step.grads.layers[0].gate.buffer, h, i),
-            ("model.layers.0.mlp.down_proj.weight".into(), &model.layers[0].down.buffer, &step.grads.layers[0].down.buffer, i, h),
-            ("model.layers.3.self_attn.o_proj.weight".into(), &attn(3).0.w_out.buffer, &attn(3).1.w_out.buffer, qd, h),
+            (
+                "model.layers.0.mlp.gate_proj.weight".into(),
+                &model.layers[0].gate.buffer,
+                &step.grads.layers[0].gate.buffer,
+                h,
+                i,
+            ),
+            (
+                "model.layers.0.mlp.down_proj.weight".into(),
+                &model.layers[0].down.buffer,
+                &step.grads.layers[0].down.buffer,
+                i,
+                h,
+            ),
+            (
+                "model.layers.3.self_attn.o_proj.weight".into(),
+                &attn(3).0.w_out.buffer,
+                &attn(3).1.w_out.buffer,
+                qd,
+                h,
+            ),
         ];
         // Resolved: the disagreement is large enough in absolute terms (|d| h
         // well above the loss's f32 rounding, ~1e-6) for central differences
@@ -821,15 +1159,43 @@ mod tests {
                 } else {
                     [1e-2, 5e-3, 2.5e-3, 1.25e-3]
                 };
-                FdCase { name, param, grad, n, torch, resolved, steps }
+                FdCase {
+                    name,
+                    param,
+                    grad,
+                    n,
+                    torch,
+                    resolved,
+                    steps,
+                }
             })
             .collect();
         for (name, p, g, rows, cols) in matrices {
             let t = npy(&dir.join(format!("grad.{name}.npy")));
-            let packed: Vec<f64> = (0..rows).flat_map(|r| (0..cols).map(move |c| (r, c))).map(|(r, c)| t[c * rows + r]).collect();
-            all_cases.push(FdCase { name, param: p, grad: g, n: rows * cols, torch: packed, resolved: true, steps: [1e-2, 5e-3, 2.5e-3, 1.25e-3] });
+            let packed: Vec<f64> = (0..rows)
+                .flat_map(|r| (0..cols).map(move |c| (r, c)))
+                .map(|(r, c)| t[c * rows + r])
+                .collect();
+            all_cases.push(FdCase {
+                name,
+                param: p,
+                grad: g,
+                n: rows * cols,
+                torch: packed,
+                resolved: true,
+                steps: [1e-2, 5e-3, 2.5e-3, 1.25e-3],
+            });
         }
-        for FdCase { name, param, grad, n, torch: g_torch, resolved, steps } in all_cases {
+        for FdCase {
+            name,
+            param,
+            grad,
+            n,
+            torch: g_torch,
+            resolved,
+            steps,
+        } in all_cases
+        {
             let g_tessl: Vec<f64> = grad.read_f32()[..n].iter().map(|&x| f64::from(x)).collect();
             let d: Vec<f64> = g_tessl.iter().zip(&g_torch).map(|(a, b)| a - b).collect();
             let dn = d.iter().map(|x| x * x).sum::<f64>().sqrt();
@@ -841,7 +1207,11 @@ mod tests {
             let mut fds = Vec::new();
             for step_h in steps {
                 let set = |s: f64| {
-                    let p: Vec<f32> = orig.iter().zip(&v).map(|(&x, &u)| (f64::from(x) + s * u) as f32).collect();
+                    let p: Vec<f32> = orig
+                        .iter()
+                        .zip(&v)
+                        .map(|(&x, &u)| (f64::from(x) + s * u) as f32)
+                        .collect();
                     let mut all = param.read_f32();
                     all[..n].copy_from_slice(&p);
                     param.write_f32(&all);
@@ -863,12 +1233,26 @@ mod tests {
             let extrap = (4.0 * fds[n_fd - 1] - fds[n_fd - 2]) / 3.0;
             let extrap2 = (4.0 * fds[n_fd - 2] - fds[n_fd - 3]) / 3.0;
             let fd = (extrap + extrap2) / 2.0;
-            line += &format!("; extrapolated {fd:.5e}: off tessl {:+.2e}, off torch {:+.2e}", fd - pt, fd - pr);
+            line += &format!(
+                "; extrapolated {fd:.5e}: off tessl {:+.2e}, off torch {:+.2e}",
+                fd - pt,
+                fd - pr
+            );
             eprintln!("{line}");
-            assert_eq!(loss(&model, &ids).to_bits(), base.to_bits(), "{name}: the parameter was not restored");
+            assert_eq!(
+                loss(&model, &ids).to_bits(),
+                base.to_bits(),
+                "{name}: the parameter was not restored"
+            );
             if resolved {
-                assert!((fd - pt).abs() <= 0.3 * dn, "{name}: tessl's loss moves as {fd:.6e} along v, its gradient says {pt:.6e}");
-                assert!((fd - pt).abs() < (fd - pr).abs(), "{name}: the finite difference is closer to transformers' gradient");
+                assert!(
+                    (fd - pt).abs() <= 0.3 * dn,
+                    "{name}: tessl's loss moves as {fd:.6e} along v, its gradient says {pt:.6e}"
+                );
+                assert!(
+                    (fd - pt).abs() < (fd - pr).abs(),
+                    "{name}: the finite difference is closer to transformers' gradient"
+                );
             }
         }
     }

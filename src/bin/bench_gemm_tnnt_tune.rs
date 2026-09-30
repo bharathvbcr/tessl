@@ -18,9 +18,7 @@ fn fill(n: usize, seed: u64) -> Vec<f32> {
     let mut s = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
     (0..n)
         .map(|_| {
-            s = s
-                .wrapping_mul(6364136223846793005)
-                .wrapping_add(1442695040888963407);
+            s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
             ((((s >> 32) as u32) as f64 / u32::MAX as f64) * 2.0 - 1.0) as f32
         })
         .collect()
@@ -77,11 +75,7 @@ fn dispatch_variant(
     })
 }
 
-fn time_it(
-    mut f: impl FnMut() -> Result<(), String>,
-    warmup: usize,
-    iters: usize,
-) -> Result<f64, String> {
+fn time_it(mut f: impl FnMut() -> Result<(), String>, warmup: usize, iters: usize) -> Result<f64, String> {
     for _ in 0..warmup {
         f()?;
     }
@@ -211,19 +205,97 @@ fn main() -> Result<(), String> {
             nsg: 4,
             binds_tiles_m: false,
         },
-        Variant { kernel: "mm_bf16_nt_coop_64x128_sg4", sm: 64, sn: 128, nsg: 4, binds_tiles_m: false },
-        Variant { kernel: "mm_bf16_nt_coop_128x128_sg4", sm: 128, sn: 128, nsg: 4, binds_tiles_m: false },
-        Variant { kernel: "mm_bf16_nt_coop_128x128_sg8", sm: 128, sn: 128, nsg: 8, binds_tiles_m: false },
-        Variant { kernel: "mm_bf16_nt_coop_256x64_sg8", sm: 256, sn: 64, nsg: 8, binds_tiles_m: false },
-        Variant { kernel: "mm_bf16_nt_coop_64x256_sg8", sm: 64, sn: 256, nsg: 8, binds_tiles_m: false },
-        Variant { kernel: "mm_bf16_nt_coop_128x256_sg8", sm: 128, sn: 256, nsg: 8, binds_tiles_m: false },
-        Variant { kernel: "mm_bf16_nt_coop_256x128_sg8", sm: 256, sn: 128, nsg: 8, binds_tiles_m: false },
-        Variant { kernel: "mm_bf16_nt_coop_256x64_sg4", sm: 256, sn: 64, nsg: 4, binds_tiles_m: false },
-        Variant { kernel: "mm_bf16_nt_coop_256x32_sg8", sm: 256, sn: 32, nsg: 8, binds_tiles_m: false },
-        Variant { kernel: "mm_bf16_nt_coop_512x32_sg8", sm: 512, sn: 32, nsg: 8, binds_tiles_m: false },
-        Variant { kernel: "mm_bf16_nt_coop_512x64_sg8", sm: 512, sn: 64, nsg: 8, binds_tiles_m: false },
-        Variant { kernel: "mm_bf16_nt_coop_512x64_sg16", sm: 512, sn: 64, nsg: 16, binds_tiles_m: false },
-        Variant { kernel: "mm_bf16_nt_coop_1024x32_sg16", sm: 1024, sn: 32, nsg: 16, binds_tiles_m: false },
+        Variant {
+            kernel: "mm_bf16_nt_coop_64x128_sg4",
+            sm: 64,
+            sn: 128,
+            nsg: 4,
+            binds_tiles_m: false,
+        },
+        Variant {
+            kernel: "mm_bf16_nt_coop_128x128_sg4",
+            sm: 128,
+            sn: 128,
+            nsg: 4,
+            binds_tiles_m: false,
+        },
+        Variant {
+            kernel: "mm_bf16_nt_coop_128x128_sg8",
+            sm: 128,
+            sn: 128,
+            nsg: 8,
+            binds_tiles_m: false,
+        },
+        Variant {
+            kernel: "mm_bf16_nt_coop_256x64_sg8",
+            sm: 256,
+            sn: 64,
+            nsg: 8,
+            binds_tiles_m: false,
+        },
+        Variant {
+            kernel: "mm_bf16_nt_coop_64x256_sg8",
+            sm: 64,
+            sn: 256,
+            nsg: 8,
+            binds_tiles_m: false,
+        },
+        Variant {
+            kernel: "mm_bf16_nt_coop_128x256_sg8",
+            sm: 128,
+            sn: 256,
+            nsg: 8,
+            binds_tiles_m: false,
+        },
+        Variant {
+            kernel: "mm_bf16_nt_coop_256x128_sg8",
+            sm: 256,
+            sn: 128,
+            nsg: 8,
+            binds_tiles_m: false,
+        },
+        Variant {
+            kernel: "mm_bf16_nt_coop_256x64_sg4",
+            sm: 256,
+            sn: 64,
+            nsg: 4,
+            binds_tiles_m: false,
+        },
+        Variant {
+            kernel: "mm_bf16_nt_coop_256x32_sg8",
+            sm: 256,
+            sn: 32,
+            nsg: 8,
+            binds_tiles_m: false,
+        },
+        Variant {
+            kernel: "mm_bf16_nt_coop_512x32_sg8",
+            sm: 512,
+            sn: 32,
+            nsg: 8,
+            binds_tiles_m: false,
+        },
+        Variant {
+            kernel: "mm_bf16_nt_coop_512x64_sg8",
+            sm: 512,
+            sn: 64,
+            nsg: 8,
+            binds_tiles_m: false,
+        },
+        Variant {
+            kernel: "mm_bf16_nt_coop_512x64_sg16",
+            sm: 512,
+            sn: 64,
+            nsg: 16,
+            binds_tiles_m: false,
+        },
+        Variant {
+            kernel: "mm_bf16_nt_coop_1024x32_sg16",
+            sm: 1024,
+            sn: 32,
+            nsg: 16,
+            binds_tiles_m: false,
+        },
     ];
     let tnacc_variants = &[
         Variant {
@@ -333,9 +405,7 @@ fn main() -> Result<(), String> {
         };
         let refv = c_ref.buffer.read_f32()[..m * n].to_vec();
         if prod_ms.is_nan() {
-            println!(
-                "\n{label}  M={m} N={n} K={k}   (raw accum kernels; ref = TN product + {prefill})"
-            );
+            println!("\n{label}  M={m} N={n} K={k}   (raw accum kernels; ref = TN product + {prefill})");
         } else {
             println!(
                 "\n{label}  M={m} N={n} K={k}   production {prod_ms:.3} ms  {:.0} GFLOP/s",

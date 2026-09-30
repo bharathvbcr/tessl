@@ -49,8 +49,8 @@ use std::time::Instant;
 
 use tessl::gemm::cast_f32_to_bf16_into;
 use tessl::qwen35::{
-    self, AttnProjLayout, AttnShape, AttnTargets, Cols, GdnChunkPhase, GdnDims, GdnParams,
-    GdnProjLayout, GdnWorkspace, OutCols, StateIn,
+    self, AttnProjLayout, AttnShape, AttnTargets, Cols, GdnChunkPhase, GdnDims, GdnParams, GdnProjLayout, GdnWorkspace,
+    OutCols, StateIn,
 };
 use tessl::tensor::{f32_slice_to_bf16, GpuBuffer};
 use tessl::{gemm, gemm_epilogue, nn, DType, Epilogue, GemmBackend, GpuRuntime, Tensor};
@@ -89,9 +89,7 @@ fn fill(n: usize, seed: u64, scale: f32) -> Vec<f32> {
     let mut s = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
     (0..n)
         .map(|_| {
-            s = s
-                .wrapping_mul(6364136223846793005)
-                .wrapping_add(1442695040888963407);
+            s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
             ((((s >> 32) as u32) as f64 / (u32::MAX as f64) * 2.0 - 1.0) as f32) * scale
         })
         .collect()
@@ -277,8 +275,7 @@ impl Acts {
             g_qkv: rt.alloc_buffer(t * m.gdn.conv_dim() as usize * 4)?,
             g_o: rt.alloc_buffer(t * m.gdn.value_dim() as usize * 4)?,
             g_y: rt.alloc_tensor_bf16(&[t, m.gdn.value_dim() as usize])?,
-            g_ws: GdnWorkspace::new(rt, &g_dims)?
-                .with_scan_slice(*GDN_SCAN.get().expect("set in main")),
+            g_ws: GdnWorkspace::new(rt, &g_dims)?.with_scan_slice(*GDN_SCAN.get().expect("set in main")),
             g_dims,
             a_proj: rt.alloc_tensor_f32(&[t, m.attn.width() as usize])?,
             a_q: rt.alloc_buffer(t * qd * 4)?,
@@ -295,9 +292,7 @@ impl Acts {
         };
         for tensor in [&acts.g_proj, &acts.a_proj] {
             if tensor.byte_offset() != 0 {
-                return Err(
-                    "the qwen35 kernels address the projection from its buffer's start".into(),
-                );
+                return Err("the qwen35 kernels address the projection from its buffer's start".into());
             }
         }
         acts.reset_resid()?;
@@ -317,23 +312,10 @@ impl Acts {
         for b in [&self.xb, &self.g_y, &self.a_y, &self.m_midb] {
             nan_bf16(&b.buffer);
         }
-        for b in [
-            &self.g_proj,
-            &self.a_proj,
-            &self.m_gate,
-            &self.m_up,
-            &self.m_mid,
-        ] {
+        for b in [&self.g_proj, &self.a_proj, &self.m_gate, &self.m_up, &self.m_mid] {
             nan(&b.buffer);
         }
-        for b in [
-            &self.g_qkv,
-            &self.g_o,
-            &self.a_q,
-            &self.a_kc,
-            &self.a_vc,
-            &self.a_o,
-        ] {
+        for b in [&self.g_qkv, &self.g_o, &self.a_q, &self.a_kc, &self.a_vc, &self.a_o] {
             nan(b);
         }
     }
@@ -486,12 +468,10 @@ fn attn_stage(rt: &Arc<GpuRuntime>, m: &Model, w: &AttnWeights, a: &Acts, s: usi
             };
             let (q, k, v, o, pos) = (&a.a_q, &a.a_kc, &a.a_vc, &a.a_o, &a.zero_pos);
             match *ATTN.get().expect("set in main") {
-                AttnChoice::Rows => {
-                    nn::flash_attn_rows(rt, q, k, v, o, &a.tkv, pos, pos, dims, HEAD_DIM, false)
+                AttnChoice::Rows => nn::flash_attn_rows(rt, q, k, v, o, &a.tkv, pos, pos, dims, HEAD_DIM, false),
+                AttnChoice::Tiled(tile) => {
+                    qwen35::attn_prefill_with_tile(rt, q, k, v, o, &a.tkv, pos, pos, dims, false, tile)
                 }
-                AttnChoice::Tiled(tile) => qwen35::attn_prefill_with_tile(
-                    rt, q, k, v, o, &a.tkv, pos, pos, dims, false, tile,
-                ),
             }
         }
         3 => qwen35::attn_output_gate(
@@ -515,13 +495,7 @@ fn attn_stage(rt: &Arc<GpuRuntime>, m: &Model, w: &AttnWeights, a: &Acts, s: usi
 /// `qwen35::swiglu` straight to bf16 for the down GEMM, or with
 /// `--mlp-unfused` the generic `nn::mlp_silu` into f32 plus a cast pass, the
 /// path it replaced; either way it is one row, so the two compare directly.
-const MLP_STAGES: [&str; 5] = [
-    "post-norm",
-    "gate GEMM",
-    "up GEMM",
-    "swiglu -> bf16",
-    "down + resid",
-];
+const MLP_STAGES: [&str; 5] = ["post-norm", "gate GEMM", "up GEMM", "swiglu -> bf16", "down + resid"];
 
 /// `--mlp-unfused`: time `nn::mlp_silu` + cast instead of `qwen35::swiglu`.
 static MLP_UNFUSED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -677,16 +651,8 @@ struct Timed {
 }
 
 fn run_t(rt: &Arc<GpuRuntime>, m: &Model, a: &Acts) -> Res<Timed> {
-    let gdn_l = m
-        .layers
-        .iter()
-        .find(|l| matches!(l.mixer, Mixer::Gdn(_)))
-        .unwrap();
-    let attn_l = m
-        .layers
-        .iter()
-        .find(|l| matches!(l.mixer, Mixer::Attn(_)))
-        .unwrap();
+    let gdn_l = m.layers.iter().find(|l| matches!(l.mixer, Mixer::Gdn(_))).unwrap();
+    let attn_l = m.layers.iter().find(|l| matches!(l.mixer, Mixer::Attn(_))).unwrap();
     let (Mixer::Gdn(gw), Mixer::Attn(aw)) = (&gdn_l.mixer, &attn_l.mixer) else {
         unreachable!()
     };
@@ -769,8 +735,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .into_iter()
                 .find(|t| t.label() == label)
                 .ok_or_else(|| {
-                    let known: Vec<String> =
-                        qwen35::AttnTile::ALL.iter().map(|t| t.label()).collect();
+                    let known: Vec<String> = qwen35::AttnTile::ALL.iter().map(|t| t.label()).collect();
                     format!("unknown --attn-tile {label:?}; one of {}", known.join(", "))
                 })?;
             attn = AttnChoice::Tiled(tile);
@@ -803,13 +768,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let n_attn = (0..LAYERS).filter(|&l| is_full_attention(l)).count();
     let n_gdn = LAYERS - n_attn;
     println!("layers: {n_gdn} GDN + {n_attn} attention, batch 1, bf16 weights distinct per layer");
-    GDN_SCAN
-        .set(gdn_scan)
-        .map_err(|_| "GDN scan slice chosen twice")?;
+    GDN_SCAN.set(gdn_scan).map_err(|_| "GDN scan slice chosen twice")?;
     println!("gdn scan: {gdn_scan:?}");
-    MLP_UNFUSED
-        .set(mlp_unfused)
-        .map_err(|_| "MLP path chosen twice")?;
+    MLP_UNFUSED.set(mlp_unfused).map_err(|_| "MLP path chosen twice")?;
     println!(
         "swiglu: {}",
         if mlp_unfused {
@@ -818,8 +779,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "qwen35::swiglu (bf16 out)"
         }
     );
-    ATTN.set(attn)
-        .map_err(|_| "attention kernel chosen twice")?;
+    ATTN.set(attn).map_err(|_| "attention kernel chosen twice")?;
     match attn {
         AttnChoice::Rows => println!("attention kernel: nn::flash_attn_rows (scalar f32)"),
         AttnChoice::Tiled(tile) => println!(
@@ -837,8 +797,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     rt.set_async_encode(true)?;
     for &t in &ts {
         let acts = Acts::new(&rt, &model, t)?;
-        plausibility_gate(&rt, &model, &acts)
-            .map_err(|e| format!("T={t}: plausibility gate failed: {e}"))?;
+        plausibility_gate(&rt, &model, &acts).map_err(|e| format!("T={t}: plausibility gate failed: {e}"))?;
         println!(
             "T={t}: plausibility gate passed (every stage output finite, residual moved; \
              GDN workspace {:.0} MB)",
@@ -869,8 +828,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "T", "GDN", "attn", "MLP", "sum layers", "forward", "tok/s", "+lm_head*", "launches"
     );
     for r in &results {
-        let summed =
-            n_gdn as f64 * r.gdn_layer + n_attn as f64 * r.attn_layer + LAYERS as f64 * r.mlp;
+        let summed = n_gdn as f64 * r.gdn_layer + n_attn as f64 * r.attn_layer + LAYERS as f64 * r.mlp;
         let lm = lm_row * r.t as f64;
         println!(
             "{:>6} {:>9.3} {:>9.3} {:>9.3} | {:>11.2} {:>11.2} | {:>10.0} {:>12.0} {:>9}",

@@ -26,9 +26,7 @@ fn i8_data(n: usize, seed: u64) -> Vec<i8> {
     let mut x = seed;
     (0..n)
         .map(|i| {
-            x = x
-                .wrapping_mul(6364136223846793005)
-                .wrapping_add(1442695040888963407);
+            x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
             match i % 16 {
                 0 => -128,
                 1 => 127,
@@ -50,8 +48,7 @@ fn the_integer_accumulation_is_exact() {
 
             // a_scale of 1 and no b_scale, so the output *is* the integer sum
             // and any deviation is a real arithmetic error, not rounding.
-            nn::gemm_i8_dequant(rt, &ab, &bb, &cb, m as u32, n as u32, k as u32, 1.0, None)
-                .expect("gemm_i8_dequant");
+            nn::gemm_i8_dequant(rt, &ab, &bb, &cb, m as u32, n as u32, k as u32, 1.0, None).expect("gemm_i8_dequant");
             rt.synchronize().unwrap();
 
             let got = cb.read_f32();
@@ -89,18 +86,7 @@ fn the_per_column_scale_is_applied_per_column() {
         let sb = buf(rt, &scale);
         let cb = buf(rt, &vec![0.0f32; m * n]);
 
-        nn::gemm_i8_dequant(
-            rt,
-            &ab,
-            &bb,
-            &cb,
-            m as u32,
-            n as u32,
-            k as u32,
-            0.5,
-            Some(&sb),
-        )
-        .expect("gemm_i8_dequant");
+        nn::gemm_i8_dequant(rt, &ab, &bb, &cb, m as u32, n as u32, k as u32, 0.5, Some(&sb)).expect("gemm_i8_dequant");
         rt.synchronize().unwrap();
 
         let got = cb.read_f32();
@@ -128,8 +114,7 @@ fn full_range_operands_do_not_overflow_the_accumulator() {
         let bb = i8_buf(rt, &b);
         let cb = buf(rt, &vec![0.0f32; m * n]);
 
-        nn::gemm_i8_dequant(rt, &ab, &bb, &cb, m as u32, n as u32, k as u32, 1.0, None)
-            .expect("gemm_i8_dequant");
+        nn::gemm_i8_dequant(rt, &ab, &bb, &cb, m as u32, n as u32, k as u32, 1.0, None).expect("gemm_i8_dequant");
         rt.synchronize().unwrap();
 
         let want = (k as i64 * 16384) as f32;
@@ -147,15 +132,13 @@ fn a_k_that_could_overflow_int32_is_refused() {
         let c = rt.alloc_buffer(1 << 20).unwrap();
         // Past this k, full-range int8 products can wrap the int32 accumulator
         // silently. Refusing keeps the exactness claim true rather than nearly.
-        let err = nn::gemm_i8_dequant(rt, &b, &b, &c, 8, 8, 200_000, 1.0, None)
-            .expect_err("k past the exact range");
+        let err = nn::gemm_i8_dequant(rt, &b, &b, &c, 8, 8, 200_000, 1.0, None).expect_err("k past the exact range");
         assert!(err.contains("overflow"), "{err}");
 
         let err = nn::gemm_i8_dequant(rt, &b, &b, &c, 0, 8, 8, 1.0, None).expect_err("m = 0");
         assert!(err.contains("non-zero"), "{err}");
 
-        let err = nn::gemm_i8_dequant(rt, &b, &b, &c, 8, 8, 8, f32::NAN, None)
-            .expect_err("non-finite scale");
+        let err = nn::gemm_i8_dequant(rt, &b, &b, &c, 8, 8, 8, f32::NAN, None).expect_err("non-finite scale");
         assert!(err.contains("finite"), "{err}");
     });
 }
@@ -165,12 +148,11 @@ fn undersized_operands_are_refused_before_dispatch() {
     with_gpu(|rt| {
         let small = rt.alloc_buffer(16).unwrap();
         let big = rt.alloc_buffer(1 << 20).unwrap();
-        let err = nn::gemm_i8_dequant(rt, &small, &big, &big, 128, 64, 64, 1.0, None)
-            .expect_err("A too small");
+        let err = nn::gemm_i8_dequant(rt, &small, &big, &big, 128, 64, 64, 1.0, None).expect_err("A too small");
         assert!(err.contains("buffer holds"), "{err}");
         let scale = rt.alloc_buffer(4).unwrap();
-        let err = nn::gemm_i8_dequant(rt, &big, &big, &big, 128, 64, 64, 1.0, Some(&scale))
-            .expect_err("scale too short");
+        let err =
+            nn::gemm_i8_dequant(rt, &big, &big, &big, 128, 64, 64, 1.0, Some(&scale)).expect_err("scale too short");
         assert!(err.contains("buffer holds"), "{err}");
         assert_eq!(rt.take_dispatch_count(), 0);
     });

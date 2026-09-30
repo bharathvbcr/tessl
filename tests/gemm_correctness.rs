@@ -12,8 +12,8 @@
 mod common;
 
 use common::{
-    assert_within_bound, random_f32, reference, round_trip_bf16, tensor_bf16, tensor_f32, tolerance, with_gpu,
-    Layout, U_BF16,
+    assert_within_bound, random_f32, reference, round_trip_bf16, tensor_bf16, tensor_f32, tolerance, with_gpu, Layout,
+    U_BF16,
 };
 use tessl::gemm::{
     gemm_bf16, gemm_nt_bf16, gemm_nt_f32, gemm_nt_train, gemm_tn_bf16, gemm_tn_f32, gemm_tn_train, GemmOperands,
@@ -198,7 +198,10 @@ fn bf16_entry_points_round_f32_operands_in_any_runtime_mode() {
                     .iter()
                     .zip(exact.c.iter().zip(&exact.mag))
                     .any(|(&g, (&w, &mag))| (f64::from(g) - w).abs() > tolerance(k, mag, 0.0));
-                assert!(off_exact, "{label}: equals the exact-f32 product, so nothing was rounded");
+                assert!(
+                    off_exact,
+                    "{label}: equals the exact-f32 product, so nothing was rounded"
+                );
             }
         }
     });

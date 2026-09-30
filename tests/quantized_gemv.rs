@@ -65,9 +65,7 @@ fn gemv_q4_matches_an_f64_reference_at_every_lane_boundary() {
             // Model-shaped.
             (64, 4096, 128),
         ] {
-            let q: Vec<i8> = (0..rows * cols)
-                .map(|i| ((i * 37 + 11) % 16) as i8 - 8)
-                .collect();
+            let q: Vec<i8> = (0..rows * cols).map(|i| ((i * 37 + 11) % 16) as i8 - 8).collect();
             let groups = rows * (cols / group);
             let scales: Vec<f32> = (0..groups).map(|i| 0.01 + (i % 7) as f32 * 0.003).collect();
             let zeros: Vec<f32> = (0..groups).map(|i| -0.5 + (i % 5) as f32 * 0.25).collect();
@@ -139,13 +137,9 @@ fn gemv_q8_matches_an_f64_reference_on_both_load_paths() {
             // Model-shaped.
             (64, 4096, 64),
         ] {
-            let q: Vec<i8> = (0..rows * cols)
-                .map(|i| ((i * 53 + 7) % 251) as i32 as i8)
-                .collect();
+            let q: Vec<i8> = (0..rows * cols).map(|i| ((i * 53 + 7) % 251) as i32 as i8).collect();
             let groups = rows * (cols / group);
-            let scales: Vec<f32> = (0..groups)
-                .map(|i| 0.004 + (i % 9) as f32 * 0.001)
-                .collect();
+            let scales: Vec<f32> = (0..groups).map(|i| 0.004 + (i % 9) as f32 * 0.001).collect();
             let zeros: Vec<f32> = (0..groups).map(|i| -3.0 + (i % 4) as f32).collect();
             let x = random_f32(cols, 0xB8 + cols as u64);
             let want = q8_reference(&q, &scales, &zeros, &x, rows, cols, group);
@@ -156,18 +150,7 @@ fn gemv_q8_matches_an_f64_reference_on_both_load_paths() {
             let zb = buf(rt, &zeros);
             let xb = buf(rt, &x);
             let yb = buf(rt, &vec![f32::NAN; rows]);
-            nn::gemv_q8(
-                rt,
-                &packed,
-                &sb,
-                &zb,
-                &xb,
-                &yb,
-                rows as u32,
-                cols as u32,
-                group as u32,
-            )
-            .unwrap();
+            nn::gemv_q8(rt, &packed, &sb, &zb, &xb, &yb, rows as u32, cols as u32, group as u32).unwrap();
             rt.synchronize().unwrap();
             close_rel(
                 &format!("gemv_q8 {rows}x{cols} g{group}"),

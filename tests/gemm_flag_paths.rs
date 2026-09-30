@@ -19,8 +19,7 @@
 mod common;
 
 use common::{
-    assert_within_bound, random_f32, reference, round_trip_bf16, tensor_bf16, tensor_f32, with_gpu,
-    Layout, Reference,
+    assert_within_bound, random_f32, reference, round_trip_bf16, tensor_bf16, tensor_f32, with_gpu, Layout, Reference,
 };
 use std::sync::Arc;
 use tessl::gemm::{gemm_nt_accum_train, gemm_nt_f32, gemm_tn_accum_train, gemm_tn_f32};
@@ -87,15 +86,9 @@ fn check_accum(rt: &Arc<GpuRuntime>, layout: Layout, bf16: bool, m: usize, n: us
     let expect = with_previous(reference(layout, &a_host, &b_host, m, n, k), &c0);
 
     let (a, b) = if bf16 {
-        (
-            tensor_bf16(rt, &a_shape, &a_host),
-            tensor_bf16(rt, &b_shape, &b_host),
-        )
+        (tensor_bf16(rt, &a_shape, &a_host), tensor_bf16(rt, &b_shape, &b_host))
     } else {
-        (
-            tensor_f32(rt, &a_shape, &a_host),
-            tensor_f32(rt, &b_shape, &b_host),
-        )
+        (tensor_f32(rt, &a_shape, &a_host), tensor_f32(rt, &b_shape, &b_host))
     };
     let c = tensor_f32(rt, &[m, n], &c0);
     match layout {
@@ -106,10 +99,7 @@ fn check_accum(rt: &Arc<GpuRuntime>, layout: Layout, bf16: bool, m: usize, n: us
     .unwrap();
     rt.synchronize().unwrap();
     assert_within_bound(
-        &format!(
-            "{} accum {layout:?} {m}x{n}x{k}",
-            if bf16 { "bf16" } else { "f32" }
-        ),
+        &format!("{} accum {layout:?} {m}x{n}x{k}", if bf16 { "bf16" } else { "f32" }),
         &c.buffer.read_f32(),
         &expect,
         k,

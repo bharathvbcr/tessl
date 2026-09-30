@@ -18,10 +18,7 @@
 
 mod common;
 
-use common::{
-    assert_within_bound, random_f32, reference, round_trip_bf16, tensor_bf16, tensor_f32, with_gpu,
-    Layout,
-};
+use common::{assert_within_bound, random_f32, reference, round_trip_bf16, tensor_bf16, tensor_f32, with_gpu, Layout};
 use tessl::gemm::{gemm_nt_f32, gemm_nt_train, gemm_tn_f32, gemm_tn_train};
 use tessl::{gemm, gemm_f32, GemmBackend, GpuRuntime, PrecisionMode};
 
@@ -219,13 +216,7 @@ fn output_views_at_a_byte_offset_stay_inside_their_window() {
         rt.synchronize().unwrap();
 
         let all = big.buffer.read_f32();
-        assert_within_bound(
-            "f32 NN offset view",
-            &all[off..off + m * n],
-            &expect,
-            k,
-            0.0,
-        );
+        assert_within_bound("f32 NN offset view", &all[off..off + m * n], &expect, k, 0.0);
         assert!(
             all[..off].iter().all(|&x| x == 0.0) && all[off + m * n..].iter().all(|&x| x == 0.0),
             "GEMM wrote outside the destination view's window"

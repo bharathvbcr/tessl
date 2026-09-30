@@ -40,10 +40,7 @@ fn i4(nibble: u8) -> f32 {
 fn close(what: &str, got: &[f32], want: &[f32], tol: f32) {
     assert_eq!(got.len(), want.len(), "{what}: length");
     for (i, (g, w)) in got.iter().zip(want).enumerate() {
-        assert!(
-            (g - w).abs() <= tol,
-            "{what}[{i}]: got {g} want {w} (tol {tol})"
-        );
+        assert!((g - w).abs() <= tol, "{what}[{i}]: got {g} want {w} (tol {tol})");
     }
 }
 
@@ -63,10 +60,7 @@ fn softcap_logits_matches_the_tanh_reference() {
 
         let want: Vec<f32> = logits.iter().map(|v| 30.0 * (v / 30.0).tanh()).collect();
         let got = lb.read_f32();
-        assert!(
-            got[..n].iter().all(|v| v.is_finite()),
-            "softcap produced non-finite"
-        );
+        assert!(got[..n].iter().all(|v| v.is_finite()), "softcap produced non-finite");
         close("softcap_logits", &got[..n], &want, 1e-4);
     });
 }
@@ -205,12 +199,7 @@ fn embed_lookup_q4_gathers_dequantized_rows_and_zeroes_out_of_range_tokens() {
                 want[m * hidden + d] = scales[gi] * (i4(nibbles[idx]) - zeros[gi]);
             }
         }
-        close(
-            "embed_lookup_q4",
-            &out.read_f32()[..want.len()],
-            &want,
-            1e-5,
-        );
+        close("embed_lookup_q4", &out.read_f32()[..want.len()], &want, 1e-5);
     });
 }
 
@@ -289,16 +278,12 @@ fn q4_mlx_matrix(rows: usize, cols: usize, group: usize) -> (Vec<u8>, Vec<f32>, 
         })
         .collect();
     let sb_bits = f32_slice_to_bf16(&sb_f32);
-    let sb_round: Vec<f32> = sb_bits
-        .iter()
-        .map(|b| tessl::tensor::bf16_bits_to_f32(*b))
-        .collect();
+    let sb_round: Vec<f32> = sb_bits.iter().map(|b| tessl::tensor::bf16_bits_to_f32(*b)).collect();
     let mut dense = vec![0.0f32; rows * cols];
     for r in 0..rows {
         for c in 0..cols {
             let gi = r * (cols / group) + c / group;
-            dense[r * cols + c] =
-                sb_round[gi * 2] * nibbles[r * cols + c] as f32 + sb_round[gi * 2 + 1];
+            dense[r * cols + c] = sb_round[gi * 2] * nibbles[r * cols + c] as f32 + sb_round[gi * 2 + 1];
         }
     }
     (pack_nibbles(&nibbles), sb_f32, dense)
@@ -425,12 +410,7 @@ fn gemv_q4_mlx_simd_add_folds_the_residual() {
         rt.synchronize().unwrap();
 
         let want: Vec<f32> = (0..rows)
-            .map(|r| {
-                resid[r]
-                    + (0..cols)
-                        .map(|c| dense[r * cols + c] * x_round[c])
-                        .sum::<f32>()
-            })
+            .map(|r| resid[r] + (0..cols).map(|c| dense[r * cols + c] * x_round[c]).sum::<f32>())
             .collect();
         close("gemv_q4_mlx_simd_add", &yb.read_f32()[..rows], &want, 5e-3);
     });
@@ -536,19 +516,8 @@ fn attention_refuses_head_counts_that_do_not_group() {
             scale: f32::NAN,
             ..dims
         };
-        let err = nn::flash_attn_swa(
-            rt,
-            nn::AttnHeadDim::D128,
-            &b,
-            &b,
-            &b,
-            &b,
-            &u,
-            &u,
-            &u,
-            bad_scale,
-        )
-        .expect_err("non-finite scale");
+        let err = nn::flash_attn_swa(rt, nn::AttnHeadDim::D128, &b, &b, &b, &b, &u, &u, &u, bad_scale)
+            .expect_err("non-finite scale");
         assert!(err.contains("scale must be finite"), "unexpected: {err:?}");
         assert_eq!(rt.take_dispatch_count(), 0);
     });
@@ -579,34 +548,13 @@ fn qkv_rope_refuses_a_variant_operand_mismatch() {
 
         // A PosBuffer variant with no buffer would read a stale position for a
         // whole session if it were quietly accepted.
-        let err = nn::rms_qkv_rope(
-            rt,
-            nn::QkvRopeVariant::PosBuffer,
-            qkv,
-            dims,
-            0,
-            None,
-            None,
-            false,
-        )
-        .expect_err("missing pos buffer");
-        assert!(
-            err.contains("require pos_offset_buf"),
-            "unexpected: {err:?}"
-        );
+        let err = nn::rms_qkv_rope(rt, nn::QkvRopeVariant::PosBuffer, qkv, dims, 0, None, None, false)
+            .expect_err("missing pos buffer");
+        assert!(err.contains("require pos_offset_buf"), "unexpected: {err:?}");
 
         // And the reverse: a constant-offset variant handed a buffer.
-        let err = nn::rms_qkv_rope(
-            rt,
-            nn::QkvRopeVariant::PosConst,
-            qkv,
-            dims,
-            0,
-            Some(&u),
-            None,
-            false,
-        )
-        .expect_err("buffer on the const variant");
+        let err = nn::rms_qkv_rope(rt, nn::QkvRopeVariant::PosConst, qkv, dims, 0, Some(&u), None, false)
+            .expect_err("buffer on the const variant");
         assert!(err.contains("not a buffer"), "unexpected: {err:?}");
 
         // rotary_dim past head_dim rotates off the end of every head.
@@ -614,35 +562,14 @@ fn qkv_rope_refuses_a_variant_operand_mismatch() {
             rotary_dim: 128,
             ..dims
         };
-        let err = nn::rms_qkv_rope(
-            rt,
-            nn::QkvRopeVariant::PosConst,
-            qkv,
-            long_rope,
-            0,
-            None,
-            None,
-            false,
-        )
-        .expect_err("rotary_dim > head_dim");
+        let err = nn::rms_qkv_rope(rt, nn::QkvRopeVariant::PosConst, qkv, long_rope, 0, None, None, false)
+            .expect_err("rotary_dim > head_dim");
         assert!(err.contains("exceeds head_dim"), "unexpected: {err:?}");
 
         // RoPE rotates pairs, so an odd span is always a caller mistake.
-        let odd_rope = nn::QkvRopeDims {
-            rotary_dim: 63,
-            ..dims
-        };
-        let err = nn::rms_qkv_rope(
-            rt,
-            nn::QkvRopeVariant::PosConst,
-            qkv,
-            odd_rope,
-            0,
-            None,
-            None,
-            false,
-        )
-        .expect_err("odd rotary_dim");
+        let odd_rope = nn::QkvRopeDims { rotary_dim: 63, ..dims };
+        let err = nn::rms_qkv_rope(rt, nn::QkvRopeVariant::PosConst, qkv, odd_rope, 0, None, None, false)
+            .expect_err("odd rotary_dim");
         assert!(err.contains("is odd"), "unexpected: {err:?}");
         assert_eq!(rt.take_dispatch_count(), 0);
     });

@@ -19,8 +19,7 @@
 
 mod common;
 use common::gdn::{
-    case_names, load_case, state_update_f64, Case, Dims, GateClamp, Problem, Rule, StateUpdate,
-    SumOrder,
+    case_names, load_case, state_update_f64, Case, Dims, GateClamp, Problem, Rule, StateUpdate, SumOrder,
 };
 use common::U_F32;
 
@@ -57,12 +56,7 @@ fn the_sequential_order_is_bit_identical_to_the_reference_it_replaced() {
     // pinned at its source as well.
     for c in all_cases() {
         let got = run(&c, SumOrder::Sequential);
-        assert_eq!(
-            got.y.len(),
-            c.golden.len(),
-            "{}: length against the golden",
-            c.name
-        );
+        assert_eq!(got.y.len(), c.golden.len(), "{}: length against the golden", c.name);
         let mismatches = got
             .y
             .iter()
@@ -138,12 +132,7 @@ fn a_single_step_matches_its_closed_form_at_odd_and_even_d() {
     // that the tail is carried rather than dropped would be untested. d = 7 and
     // d = 5 reach it; d = 8 keeps the even path covered here too.
     for d in [5usize, 7, 8] {
-        let dims = Dims {
-            b: 1,
-            h: 1,
-            l: 1,
-            d,
-        };
+        let dims = Dims { b: 1, h: 1, l: 1, d };
         let q: Vec<f32> = (0..d).map(|i| 0.5 + i as f32 * 0.25).collect();
         let k: Vec<f32> = (0..d).map(|i| 1.0 - i as f32 * 0.1).collect();
         let v: Vec<f32> = (0..d).map(|i| 0.3 * (i as f32 + 1.0)).collect();
@@ -197,12 +186,7 @@ fn the_second_step_pins_pred_mag_against_its_closed_form() {
     // is what makes this a check on the magnitude and not a second check on
     // `pred`. `k0` and `k1` below are chosen with mixed signs so the two diverge.
     for d in [5usize, 8] {
-        let dims = Dims {
-            b: 1,
-            h: 1,
-            l: 2,
-            d,
-        };
+        let dims = Dims { b: 1, h: 1, l: 2, d };
         // Step 0 operands, then step 1 operands, laid out [B,H,L,D].
         let k0: Vec<f32> = (0..d).map(|i| 1.0 - i as f32 * 0.3).collect();
         // Alternating signs, so the products of `k0` and `k1` largely cancel and
@@ -237,9 +221,7 @@ fn the_second_step_pins_pred_mag_against_its_closed_form() {
 
         let b0 = f64::from(beta[0]);
         let signed: f64 = (0..d).map(|i| f64::from(k0[i]) * f64::from(k1[i])).sum();
-        let absolute: f64 = (0..d)
-            .map(|i| (f64::from(k0[i]) * f64::from(k1[i])).abs())
-            .sum();
+        let absolute: f64 = (0..d).map(|i| (f64::from(k0[i]) * f64::from(k1[i])).abs()).sum();
         assert!(
             absolute > 1.5 * signed.abs(),
             "d={d}: the test is degenerate unless sum|k0 k1| ({absolute}) clearly \
@@ -248,12 +230,7 @@ fn the_second_step_pins_pred_mag_against_its_closed_form() {
             signed.abs()
         );
 
-        let u = state_update_f64(
-            &p,
-            Rule::Published,
-            GateClamp::PUBLISHED,
-            SumOrder::Sequential,
-        );
+        let u = state_update_f64(&p, Rule::Published, GateClamp::PUBLISHED, SumOrder::Sequential);
         for (n, &v0n) in v0.iter().enumerate() {
             let want = (b0 * f64::from(v0n)).abs() * absolute;
             let got = u.pred_mag[d + n]; // t = 1
@@ -263,10 +240,7 @@ fn the_second_step_pins_pred_mag_against_its_closed_form() {
                 "d={d} pred_mag[t=1][{n}]: got {got}, closed form {want}, gap {:.3e}",
                 (got - want).abs()
             );
-            assert!(
-                want > 0.0,
-                "d={d} n={n}: closed form is zero, so the check is vacuous"
-            );
+            assert!(want > 0.0, "d={d} n={n}: closed form is zero, so the check is vacuous");
         }
     }
 }
@@ -299,11 +273,7 @@ fn reassociating_the_dot_products_is_measured_not_assumed() {
             if mag > 0.0 {
                 worst_rel = worst_rel.max(err / mag);
             } else {
-                assert_eq!(
-                    err, 0.0,
-                    "{}: nonzero error at [{i}] with zero magnitude",
-                    c.name
-                );
+                assert_eq!(err, 0.0, "{}: nonzero error at [{i}] with zero magnitude", c.name);
             }
         }
         println!(
@@ -374,10 +344,7 @@ fn reassociation_error_does_not_compound_over_the_sequence() {
         short / U_F64,
         long / U_F64
     );
-    assert!(
-        short > 0.0,
-        "L1 shows no reassociation at all; nothing to compare"
-    );
+    assert!(short > 0.0, "L1 shows no reassociation at all; nothing to compare");
     assert!(
         growth < 10.0,
         "reassociation error grew {growth:.1}x from L=1 to L=8191. If it accumulated \
@@ -465,9 +432,7 @@ fn the_derived_bound_and_the_corpus_global_bound_are_different_quantities() {
     }
     let (worst_name, worst_slack, _) = &slack[0];
     let (floor_name, floor_slack, _) = &slack[slack.len() - 1];
-    println!(
-        "\nmost slack: {worst_slack:.1}x on {worst_name}; least: {floor_slack:.1}x on {floor_name}"
-    );
+    println!("\nmost slack: {worst_slack:.1}x on {worst_name}; least: {floor_slack:.1}x on {floor_name}");
 
     // The finding. A K3 defect confined to low-magnitude elements could be four
     // orders of magnitude worse than f32 arithmetic permits and still pass the

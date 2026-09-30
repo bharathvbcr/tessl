@@ -188,14 +188,7 @@ fn sum_tree(buf: &mut [f64]) -> f64 {
 }
 
 /// `out[n] = sum_p s[p*d + n] * x[p]`, summed in `order`.
-fn dot_state(
-    out: &mut [f64],
-    s: &[f64],
-    x: &[f32],
-    d: usize,
-    order: SumOrder,
-    scratch: &mut [f64],
-) {
+fn dot_state(out: &mut [f64], s: &[f64], x: &[f32], d: usize, order: SumOrder, scratch: &mut [f64]) {
     match order {
         SumOrder::Sequential => {
             out.fill(0.0);
@@ -245,12 +238,7 @@ fn abs_dot_state(out: &mut [f64], s: &[f64], x: &[f32], d: usize) {
 /// # Panics
 ///
 /// If any slice length disagrees with `dims`.
-pub fn state_update_f64(
-    p: &Problem<'_>,
-    rule: Rule,
-    clamp: GateClamp,
-    order: SumOrder,
-) -> StateUpdate {
+pub fn state_update_f64(p: &Problem<'_>, rule: Rule, clamp: GateClamp, order: SumOrder) -> StateUpdate {
     let Dims { b, h, l, d } = p.dims;
     for (name, got) in [("q", p.q.len()), ("k", p.k.len()), ("v", p.v.len())] {
         assert_eq!(
@@ -378,12 +366,7 @@ pub fn load_case(name: &str) -> Case {
 
     let q = load("q");
     // [B, H, L, D] for q/k/v, [B, H, L] for the gates.
-    assert_eq!(
-        q.shape.len(),
-        4,
-        "{name}: q must be rank 4, got {:?}",
-        q.shape
-    );
+    assert_eq!(q.shape.len(), 4, "{name}: q must be rank 4, got {:?}", q.shape);
     let dims = Dims {
         b: q.shape[0],
         h: q.shape[1],
@@ -396,16 +379,8 @@ pub fn load_case(name: &str) -> Case {
     let alpha = load("alpha");
     let beta = load("beta");
     let golden = load("y_seq_f64");
-    assert_eq!(
-        alpha.shape,
-        vec![dims.b, dims.h, dims.l],
-        "{name}: alpha shape"
-    );
-    assert_eq!(
-        beta.shape,
-        vec![dims.b, dims.h, dims.l],
-        "{name}: beta shape"
-    );
+    assert_eq!(alpha.shape, vec![dims.b, dims.h, dims.l], "{name}: alpha shape");
+    assert_eq!(beta.shape, vec![dims.b, dims.h, dims.l], "{name}: beta shape");
     assert_eq!(golden.shape, q.shape, "{name}: golden shape");
 
     Case {
@@ -576,12 +551,7 @@ fn assert_finite(what: &str, xs: &[f64]) {
 ///
 /// Returns `[B, H, L]`, the same layout [`gates_published`] returns, so the two
 /// are directly comparable.
-pub fn alpha_mamba2_refuted(
-    a_gate_bth: &[f32],
-    dims: Dims,
-    a_log: &[f64],
-    dt_bias: &[f64],
-) -> Vec<f64> {
+pub fn alpha_mamba2_refuted(a_gate_bth: &[f32], dims: Dims, a_log: &[f64], dt_bias: &[f64]) -> Vec<f64> {
     let Dims { b, h, l, .. } = dims;
     assert_eq!(a_gate_bth.len(), dims.gate_len(), "a_gate length");
     assert_eq!(a_log.len(), h, "A_log is per-head");
@@ -604,10 +574,7 @@ pub fn alpha_mamba2_refuted(
                 let src = (bi * l + t) * h + hi;
                 let dst = (bi * h + hi) * l + t;
                 let raw = f64::from(a_gate_bth[src]);
-                assert!(
-                    raw.is_finite(),
-                    "non-finite a_gate at [b{bi} t{t} h{hi}]: {raw}"
-                );
+                assert!(raw.is_finite(), "non-finite a_gate at [b{bi} t{t} h{hi}]: {raw}");
                 let dt = softplus(raw + dt_bias[hi]);
                 out[dst] = (-a_log[hi].exp() * dt).exp();
             }

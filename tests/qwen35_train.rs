@@ -86,18 +86,33 @@ fn by_name(cfg: &Qwen35Config, g: &Qwen35Grads, prefix: &str) -> Vec<(String, Ve
                 let gl = cfg.gdn;
                 let (cd, vd, hv) = (gl.conv_dim() as usize, gl.value_dim() as usize, gl.v_heads() as usize);
                 out.push((p("linear_attn.in_proj_qkv.weight"), packed(&m.w_in, 0, cd)));
-                out.push((p("linear_attn.in_proj_z.weight"), packed(&m.w_in, gl.z_off() as usize, vd)));
-                out.push((p("linear_attn.in_proj_b.weight"), packed(&m.w_in, gl.b_off() as usize, hv)));
-                out.push((p("linear_attn.in_proj_a.weight"), packed(&m.w_in, gl.a_off() as usize, hv)));
+                out.push((
+                    p("linear_attn.in_proj_z.weight"),
+                    packed(&m.w_in, gl.z_off() as usize, vd),
+                ));
+                out.push((
+                    p("linear_attn.in_proj_b.weight"),
+                    packed(&m.w_in, gl.b_off() as usize, hv),
+                ));
+                out.push((
+                    p("linear_attn.in_proj_a.weight"),
+                    packed(&m.w_in, gl.a_off() as usize, hv),
+                ));
                 out.push((p("linear_attn.out_proj.weight"), packed(&m.w_out, 0, h)));
-                out.push((p("linear_attn.conv1d.weight"), read(&m.conv_w, cd * cfg.conv_kernel as usize)));
+                out.push((
+                    p("linear_attn.conv1d.weight"),
+                    read(&m.conv_w, cd * cfg.conv_kernel as usize),
+                ));
                 out.push((p("linear_attn.A_log"), read(&m.a_log, hv)));
                 out.push((p("linear_attn.dt_bias"), read(&m.dt_bias, hv)));
                 out.push((p("linear_attn.norm.weight"), read(&m.norm_w, gl.v_dim() as usize)));
             }
             MixerGrads::Attn(m) => {
                 let al = cfg.attn;
-                let (q2, kv) = ((2 * al.q_heads() * al.head_dim()) as usize, (al.kv_heads() * al.head_dim()) as usize);
+                let (q2, kv) = (
+                    (2 * al.q_heads() * al.head_dim()) as usize,
+                    (al.kv_heads() * al.head_dim()) as usize,
+                );
                 out.push((p("self_attn.q_proj.weight"), packed(&m.w_in, 0, q2)));
                 out.push((p("self_attn.k_proj.weight"), packed(&m.w_in, al.k_off() as usize, kv)));
                 out.push((p("self_attn.v_proj.weight"), packed(&m.w_in, al.v_off() as usize, kv)));
@@ -146,7 +161,12 @@ fn compare(dir: &Path, prefix: &str, cfg: &Qwen35Config, step: &TrainStep, loss_
     let (_, want_loss) = npy_f64(&dir.join("loss.npy"));
     let loss_rel = (step.loss - want_loss[0]).abs() / want_loss[0].abs();
     eprintln!("loss {:.8} vs {:.8} (rel {loss_rel:.2e})", step.loss, want_loss[0]);
-    assert!(loss_rel <= loss_bound, "loss {} vs transformers {}", step.loss, want_loss[0]);
+    assert!(
+        loss_rel <= loss_bound,
+        "loss {} vs transformers {}",
+        step.loss,
+        want_loss[0]
+    );
     let mut worst = 0.0f64;
     let mut seen = 0;
     for (name, got) in by_name(cfg, &step.grads, prefix) {
@@ -161,7 +181,10 @@ fn compare(dir: &Path, prefix: &str, cfg: &Qwen35Config, step: &TrainStep, loss_
         worst = worst.max(r);
         seen += 1;
     }
-    let files = std::fs::read_dir(dir).unwrap().filter(|e| e.as_ref().unwrap().file_name().to_string_lossy().starts_with("grad.")).count();
+    let files = std::fs::read_dir(dir)
+        .unwrap()
+        .filter(|e| e.as_ref().unwrap().file_name().to_string_lossy().starts_with("grad."))
+        .count();
     assert_eq!(seen, files, "every reference gradient must be compared");
     worst
 }
@@ -180,13 +203,23 @@ fn tiny_step_matches_transformers_autograd() {
     // The training forward is the inference forward: the same loss from
     // the inference logits.
     let ce = inference_loss(&model, &ids);
-    assert!((ce - step.loss).abs() <= 1e-5 * ce.abs(), "inference loss {ce} vs training loss {}", step.loss);
+    assert!(
+        (ce - step.loss).abs() <= 1e-5 * ce.abs(),
+        "inference loss {ce} vs training loss {}",
+        step.loss
+    );
 
     // A second step gives the same bits.
     let again = model.train_step(&ids, GemmOperands::ExactF32).unwrap();
     assert_eq!(again.loss.to_bits(), step.loss.to_bits(), "loss changed on a rerun");
-    for ((name, a), (_, b)) in by_name(&cfg, &again.grads, "model.").iter().zip(by_name(&cfg, &step.grads, "model.")) {
-        assert!(a.iter().zip(&b).all(|(x, y)| x.to_bits() == y.to_bits()), "{name} changed on a rerun");
+    for ((name, a), (_, b)) in by_name(&cfg, &again.grads, "model.")
+        .iter()
+        .zip(by_name(&cfg, &step.grads, "model."))
+    {
+        assert!(
+            a.iter().zip(&b).all(|(x, y)| x.to_bits() == y.to_bits()),
+            "{name} changed on a rerun"
+        );
     }
 }
 
@@ -213,12 +246,25 @@ fn tiny_step_on_bf16_operands_stays_near_transformers() {
             .iter()
             .zip(by_name(&cfg, &exact.grads, "model."))
             .any(|((_, a), (_, b))| a.iter().zip(&b).any(|(x, y)| x.to_bits() != y.to_bits()));
-    assert!(differs, "the bf16-operand step is the exact-f32 step's bits: nothing was rounded");
+    assert!(
+        differs,
+        "the bf16-operand step is the exact-f32 step's bits: nothing was rounded"
+    );
 
     let again = model.train_step(&ids, GemmOperands::Bf16).unwrap();
-    assert_eq!(again.loss.to_bits(), step.loss.to_bits(), "bf16 loss changed on a rerun");
-    for ((name, a), (_, b)) in by_name(&cfg, &again.grads, "model.").iter().zip(by_name(&cfg, &step.grads, "model.")) {
-        assert!(a.iter().zip(&b).all(|(x, y)| x.to_bits() == y.to_bits()), "{name} changed on a bf16 rerun");
+    assert_eq!(
+        again.loss.to_bits(),
+        step.loss.to_bits(),
+        "bf16 loss changed on a rerun"
+    );
+    for ((name, a), (_, b)) in by_name(&cfg, &again.grads, "model.")
+        .iter()
+        .zip(by_name(&cfg, &step.grads, "model."))
+    {
+        assert!(
+            a.iter().zip(&b).all(|(x, y)| x.to_bits() == y.to_bits()),
+            "{name} changed on a bf16 rerun"
+        );
     }
 }
 
@@ -237,7 +283,12 @@ fn deep_tiny_step_matches_transformers() {
     let model = load(&dir, "model.", cfg.clone(), Precision::F32);
     let step = model.train_step(&ids(&dir), GemmOperands::ExactF32).unwrap();
     let (_, want_loss) = npy_f64(&dir.join("loss.npy"));
-    eprintln!("loss {:.8} vs {:.8} (rel {:.2e})", step.loss, want_loss[0], (step.loss - want_loss[0]).abs() / want_loss[0]);
+    eprintln!(
+        "loss {:.8} vs {:.8} (rel {:.2e})",
+        step.loss,
+        want_loss[0],
+        (step.loss - want_loss[0]).abs() / want_loss[0]
+    );
     let mut per_layer = vec![(0.0f64, 0.0f64); cfg.layers.len()];
     let (mut worst, mut worst_scalar) = (0.0f64, 0.0f64);
     for (name, got) in by_name(&cfg, &step.grads, "model.") {
@@ -247,7 +298,11 @@ fn deep_tiny_step_matches_transformers() {
         } else {
             worst = worst.max(r);
         }
-        if let Some(l) = name.strip_prefix("model.layers.").and_then(|x| x.split('.').next()).and_then(|x| x.parse::<usize>().ok()) {
+        if let Some(l) = name
+            .strip_prefix("model.layers.")
+            .and_then(|x| x.split('.').next())
+            .and_then(|x| x.parse::<usize>().ok())
+        {
             let one_d = got.len() <= cfg.hidden as usize;
             if one_d && r > 5e-5 {
                 let want = npy_f64(&dir.join(format!("grad.{name}.npy"))).1;
@@ -255,13 +310,20 @@ fn deep_tiny_step_matches_transformers() {
                 eprintln!("  {name}: {r:.2e} ({} elements, max|ref| {peak:.3e})", got.len());
             }
             let slot = &mut per_layer[l];
-            if one_d { slot.0 = slot.0.max(r) } else { slot.1 = slot.1.max(r) }
+            if one_d {
+                slot.0 = slot.0.max(r)
+            } else {
+                slot.1 = slot.1.max(r)
+            }
         } else {
             eprintln!("{name}: {r:.2e}");
         }
     }
     for (l, (a, b)) in per_layer.iter().enumerate() {
-        eprintln!("layer {l:2} ({:?}): 1-D worst {a:.2e}, matrices worst {b:.2e}", cfg.layers[l]);
+        eprintln!(
+            "layer {l:2} ({:?}): 1-D worst {a:.2e}, matrices worst {b:.2e}",
+            cfg.layers[l]
+        );
     }
     eprintln!("worst parameter gradient: {worst:.2e} (single-element A_log / dt_bias: {worst_scalar:.2e})");
     // Measured before these bounds were written: tensors of more than one
@@ -272,7 +334,10 @@ fn deep_tiny_step_matches_transformers() {
     // themselves they carry the sum's cancellation, which the larger tensors'
     // max-normalized error does not see.
     assert!(worst <= 1e-4, "worst multi-element parameter gradient {worst:.3e}");
-    assert!(worst_scalar <= 5e-3, "worst single-element parameter gradient {worst_scalar:.3e}");
+    assert!(
+        worst_scalar <= 5e-3,
+        "worst single-element parameter gradient {worst_scalar:.3e}"
+    );
 }
 
 #[test]
@@ -283,10 +348,16 @@ fn train_step_refuses_what_it_does_not_implement() {
         assert!(m.contains(needle), "{m:?} lacks {needle:?}");
     };
     let bf16 = load(&dir, "model.", tiny_config(), Precision::Bf16);
-    e(bf16.train_step(&[1, 2, 3], GemmOperands::ExactF32), "training runs in f32");
+    e(
+        bf16.train_step(&[1, 2, 3], GemmOperands::ExactF32),
+        "training runs in f32",
+    );
     let model = load(&dir, "model.", tiny_config(), Precision::F32);
     e(model.train_step(&[5], GemmOperands::ExactF32), "at least two tokens");
-    e(model.train_step(&[5, 64], GemmOperands::ExactF32), "token id 64 >= vocab 64");
+    e(
+        model.train_step(&[5, 64], GemmOperands::ExactF32),
+        "token id 64 >= vocab 64",
+    );
 }
 
 /// The 2B reference directory (`make_train_fixture.py 2b`), the model loaded
@@ -296,7 +367,8 @@ fn real_2b() -> (PathBuf, Qwen35Config, Qwen35Model) {
         .map(PathBuf::from)
         .unwrap_or_else(|| Path::new(env!("CARGO_MANIFEST_DIR")).join("target/qwen35_train_ref"));
     let st_path = PathBuf::from(
-        std::env::var("QWEN35_2B_SAFETENSORS").expect("set QWEN35_2B_SAFETENSORS to the Qwen3.5-2B-Base .safetensors file"),
+        std::env::var("QWEN35_2B_SAFETENSORS")
+            .expect("set QWEN35_2B_SAFETENSORS to the Qwen3.5-2B-Base .safetensors file"),
     );
     let rt = GpuRuntime::new().unwrap();
     let st = SafeTensors::open(&st_path).unwrap();
@@ -326,10 +398,16 @@ fn real_2b_results(dir: &Path, cfg: &Qwen35Config, step: &TrainStep) -> (Vec<(St
     for (name, r) in &results {
         eprintln!("{name}: {r:.2e}");
     }
-    let files = std::fs::read_dir(dir).unwrap().filter(|e| e.as_ref().unwrap().file_name().to_string_lossy().starts_with("grad.")).count();
+    let files = std::fs::read_dir(dir)
+        .unwrap()
+        .filter(|e| e.as_ref().unwrap().file_name().to_string_lossy().starts_with("grad."))
+        .count();
     assert_eq!(results.len(), files, "every reference gradient must be compared");
     let worst = results.iter().map(|(_, r)| *r).fold(0.0, f64::max);
-    eprintln!("worst parameter gradient: {worst:.2e} over {} parameters", results.len());
+    eprintln!(
+        "worst parameter gradient: {worst:.2e} over {} parameters",
+        results.len()
+    );
     (results, worst)
 }
 
@@ -349,7 +427,10 @@ fn real_2b_step_matches_transformers() {
     let r_train = (step.loss - want_loss).abs() / want_loss;
     let r_infer = (infer - want_loss).abs() / want_loss;
     let r_self = (step.loss - infer).abs() / infer;
-    eprintln!("loss: train {:.8}, inference {infer:.8}, transformers {want_loss:.8}", step.loss);
+    eprintln!(
+        "loss: train {:.8}, inference {infer:.8}, transformers {want_loss:.8}",
+        step.loss
+    );
     eprintln!("      train vs transformers {r_train:.2e}, inference vs transformers {r_infer:.2e}, train vs inference {r_self:.2e}");
     let (results, _) = real_2b_results(&dir, &cfg, &step);
     // These bounds were set after the first run, from what it showed: the
@@ -362,7 +443,11 @@ fn real_2b_step_matches_transformers() {
     // forward's and not the backward's is qwen35_train's unit test
     // `real_2b_gradients_are_those_of_tessls_forward`: finite differences of
     // tessl's own loss land on tessl's gradients, not transformers'.
-    assert!(r_self <= 1e-5, "training loss {} vs the inference forward's {infer}", step.loss);
+    assert!(
+        r_self <= 1e-5,
+        "training loss {} vs the inference forward's {infer}",
+        step.loss
+    );
     assert!(r_train <= 1e-4, "loss {} vs transformers {want_loss}", step.loss);
     for (name, r) in &results {
         assert!(*r <= 1e-2, "{name}: rel err {r:.3e} > 1e-2");
@@ -385,10 +470,20 @@ fn real_2b_step_on_bf16_operands_stays_near_transformers() {
     let (_, want_loss) = npy_f64(&dir.join("loss.npy"));
     let want_loss = want_loss[0];
     let r_loss = (step.loss - want_loss).abs() / want_loss;
-    eprintln!("loss: bf16 operands {:.8}, transformers {want_loss:.8} (rel {r_loss:.2e})", step.loss);
+    eprintln!(
+        "loss: bf16 operands {:.8}, transformers {want_loss:.8} (rel {r_loss:.2e})",
+        step.loss
+    );
     let (results, worst) = real_2b_results(&dir, &cfg, &step);
-    assert!(r_loss <= 2f64.powi(-7), "loss {} vs transformers {want_loss}", step.loss);
+    assert!(
+        r_loss <= 2f64.powi(-7),
+        "loss {} vs transformers {want_loss}",
+        step.loss
+    );
     for (name, r) in &results {
-        assert!(*r <= 2f64.powi(-4), "{name}: rel err {r:.3e} > 2^-4 (worst {worst:.3e})");
+        assert!(
+            *r <= 2f64.powi(-4),
+            "{name}: rel err {r:.3e} > 2^-4 (worst {worst:.3e})"
+        );
     }
 }

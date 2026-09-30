@@ -75,10 +75,7 @@ fn round_trips_f32_bf16_f16_scalars_empty_tensors_and_metadata() {
     );
     let p = file("ok", header, &data);
     let st = SafeTensors::open(&p).unwrap();
-    assert_eq!(
-        st.names().collect::<Vec<_>>(),
-        ["a", "b", "e", "h", "pad", "s"]
-    );
+    assert_eq!(st.names().collect::<Vec<_>>(), ["a", "b", "e", "h", "pad", "s"]);
     assert_eq!(st.metadata()["note"], "q\"\\/\u{e9}\u{1f600}");
     assert_eq!(st.read_f32("a").unwrap(), (vec![2, 2], a.to_vec()));
     assert_eq!(st.read_bf16_bits("b").unwrap(), (vec![3, 1], b_bits.to_vec()));
@@ -137,26 +134,90 @@ fn json_outside_the_formats_subset_is_rejected() {
     let cases: &[(&str, &str, &str)] = &[
         ("not_obj", r#"[1]"#, "not a JSON object"),
         ("trailing", &format!("{ONE_F32}x"), "trailing bytes"),
-        ("float", r#"{"a":{"dtype":"F32","shape":[1.0],"data_offsets":[0,4]}}"#, "non-integer"),
-        ("exp", r#"{"a":{"dtype":"F32","shape":[1e0],"data_offsets":[0,4]}}"#, "non-integer"),
-        ("neg", r#"{"a":{"dtype":"F32","shape":[-1],"data_offsets":[0,4]}}"#, "unsupported JSON value"),
-        ("lead0", r#"{"a":{"dtype":"F32","shape":[01],"data_offsets":[0,4]}}"#, "leading zero"),
+        (
+            "float",
+            r#"{"a":{"dtype":"F32","shape":[1.0],"data_offsets":[0,4]}}"#,
+            "non-integer",
+        ),
+        (
+            "exp",
+            r#"{"a":{"dtype":"F32","shape":[1e0],"data_offsets":[0,4]}}"#,
+            "non-integer",
+        ),
+        (
+            "neg",
+            r#"{"a":{"dtype":"F32","shape":[-1],"data_offsets":[0,4]}}"#,
+            "unsupported JSON value",
+        ),
+        (
+            "lead0",
+            r#"{"a":{"dtype":"F32","shape":[01],"data_offsets":[0,4]}}"#,
+            "leading zero",
+        ),
         ("null", r#"{"a":null}"#, "unsupported JSON value"),
         ("bool", r#"{"a":true}"#, "unsupported JSON value"),
-        ("u64", r#"{"a":{"dtype":"F32","shape":[18446744073709551616],"data_offsets":[0,4]}}"#, "overflows u64"),
-        ("dup", r#"{"a":{"dtype":"F32","shape":[1],"data_offsets":[0,4]},"a":{"dtype":"F32","shape":[1],"data_offsets":[0,4]}}"#, "duplicate key"),
-        ("dup_field", r#"{"a":{"dtype":"F32","dtype":"F32","shape":[1],"data_offsets":[0,4]}}"#, "duplicate key"),
-        ("deep", r#"{"a":{"dtype":"F32","shape":[[1]],"data_offsets":[0,4]}}"#, "nesting deeper"),
+        (
+            "u64",
+            r#"{"a":{"dtype":"F32","shape":[18446744073709551616],"data_offsets":[0,4]}}"#,
+            "overflows u64",
+        ),
+        (
+            "dup",
+            r#"{"a":{"dtype":"F32","shape":[1],"data_offsets":[0,4]},"a":{"dtype":"F32","shape":[1],"data_offsets":[0,4]}}"#,
+            "duplicate key",
+        ),
+        (
+            "dup_field",
+            r#"{"a":{"dtype":"F32","dtype":"F32","shape":[1],"data_offsets":[0,4]}}"#,
+            "duplicate key",
+        ),
+        (
+            "deep",
+            r#"{"a":{"dtype":"F32","shape":[[1]],"data_offsets":[0,4]}}"#,
+            "nesting deeper",
+        ),
         ("unterminated", r#"{"a":{"dtype":"F32"#, "unterminated string"),
-        ("bad_escape", r#"{"a\q":{"dtype":"F32","shape":[1],"data_offsets":[0,4]}}"#, "invalid escape"),
-        ("plus_hex", r#"{"a\u+041":{"dtype":"F32","shape":[1],"data_offsets":[0,4]}}"#, "bad \\u escape"),
-        ("lone_hi", r#"{"a\ud800":{"dtype":"F32","shape":[1],"data_offsets":[0,4]}}"#, "unpaired high surrogate"),
-        ("lone_lo", r#"{"a\udc00":{"dtype":"F32","shape":[1],"data_offsets":[0,4]}}"#, "unpaired low surrogate"),
-        ("hi_then_char", r#"{"a\ud800A":{"dtype":"F32","shape":[1],"data_offsets":[0,4]}}"#, "unpaired high surrogate"),
-        ("ctrl", "{\"a\tb\":{\"dtype\":\"F32\",\"shape\":[1],\"data_offsets\":[0,4]}}", "control character"),
+        (
+            "bad_escape",
+            r#"{"a\q":{"dtype":"F32","shape":[1],"data_offsets":[0,4]}}"#,
+            "invalid escape",
+        ),
+        (
+            "plus_hex",
+            r#"{"a\u+041":{"dtype":"F32","shape":[1],"data_offsets":[0,4]}}"#,
+            "bad \\u escape",
+        ),
+        (
+            "lone_hi",
+            r#"{"a\ud800":{"dtype":"F32","shape":[1],"data_offsets":[0,4]}}"#,
+            "unpaired high surrogate",
+        ),
+        (
+            "lone_lo",
+            r#"{"a\udc00":{"dtype":"F32","shape":[1],"data_offsets":[0,4]}}"#,
+            "unpaired low surrogate",
+        ),
+        (
+            "hi_then_char",
+            r#"{"a\ud800A":{"dtype":"F32","shape":[1],"data_offsets":[0,4]}}"#,
+            "unpaired high surrogate",
+        ),
+        (
+            "ctrl",
+            "{\"a\tb\":{\"dtype\":\"F32\",\"shape\":[1],\"data_offsets\":[0,4]}}",
+            "control character",
+        ),
         ("no_colon", r#"{"a" {"dtype":"F32"}}"#, "expected ':'"),
-        ("no_comma", r#"{"a":{"dtype":"F32" "shape":[1]}}"#, "expected ',' or '}'"),
-        ("arr_comma", r#"{"a":{"dtype":"F32","shape":[1 2],"data_offsets":[0,4]}}"#, "expected ',' or ']'"),
+        (
+            "no_comma",
+            r#"{"a":{"dtype":"F32" "shape":[1]}}"#,
+            "expected ',' or '}'",
+        ),
+        (
+            "arr_comma",
+            r#"{"a":{"dtype":"F32","shape":[1 2],"data_offsets":[0,4]}}"#,
+            "expected ',' or ']'",
+        ),
         ("key", r#"{1:2}"#, "expected a string key"),
     ];
     for (tag, h, needle) in cases {
@@ -165,9 +226,7 @@ fn json_outside_the_formats_subset_is_rejected() {
     // A high surrogate followed by an escape that is not a low surrogate. Built
     // from parts so the second escape stays a six-byte escape in the source.
     let bs = '\\';
-    let bad_lo = format!(
-        "{{\"a{bs}ud800{bs}u0041\":{{\"dtype\":\"F32\",\"shape\":[1],\"data_offsets\":[0,4]}}}}"
-    );
+    let bad_lo = format!("{{\"a{bs}ud800{bs}u0041\":{{\"dtype\":\"F32\",\"shape\":[1],\"data_offsets\":[0,4]}}}}");
     assert!(bad_lo.contains("\\u0041"), "{bad_lo}");
     expect_rejected("bad_lo", &bad_lo, &d, "invalid low surrogate");
     // Invalid UTF-8 in the header.
@@ -179,13 +238,41 @@ fn json_outside_the_formats_subset_is_rejected() {
 fn entries_must_be_exactly_dtype_shape_and_offsets() {
     let d = 1.0f32.to_le_bytes();
     let cases: &[(&str, &str, &str)] = &[
-        ("unknown_field", r#"{"a":{"dtype":"F32","shape":[1],"data_offsets":[0,4],"x":"y"}}"#, "unexpected or mistyped field \"x\""),
-        ("missing", r#"{"a":{"dtype":"F32","shape":[1]}}"#, "needs dtype, shape and data_offsets"),
-        ("dtype_type", r#"{"a":{"dtype":4,"shape":[1],"data_offsets":[0,4]}}"#, "mistyped field \"dtype\""),
-        ("shape_type", r#"{"a":{"dtype":"F32","shape":"1","data_offsets":[0,4]}}"#, "mistyped field \"shape\""),
-        ("shape_str", r#"{"a":{"dtype":"F32","shape":["1"],"data_offsets":[0,4]}}"#, "non-integer"),
-        ("offs3", r#"{"a":{"dtype":"F32","shape":[1],"data_offsets":[0,4,4]}}"#, "not [begin, end]"),
-        ("dtype_name", r#"{"a":{"dtype":"F8","shape":[1],"data_offsets":[0,4]}}"#, "unsupported dtype"),
+        (
+            "unknown_field",
+            r#"{"a":{"dtype":"F32","shape":[1],"data_offsets":[0,4],"x":"y"}}"#,
+            "unexpected or mistyped field \"x\"",
+        ),
+        (
+            "missing",
+            r#"{"a":{"dtype":"F32","shape":[1]}}"#,
+            "needs dtype, shape and data_offsets",
+        ),
+        (
+            "dtype_type",
+            r#"{"a":{"dtype":4,"shape":[1],"data_offsets":[0,4]}}"#,
+            "mistyped field \"dtype\"",
+        ),
+        (
+            "shape_type",
+            r#"{"a":{"dtype":"F32","shape":"1","data_offsets":[0,4]}}"#,
+            "mistyped field \"shape\"",
+        ),
+        (
+            "shape_str",
+            r#"{"a":{"dtype":"F32","shape":["1"],"data_offsets":[0,4]}}"#,
+            "non-integer",
+        ),
+        (
+            "offs3",
+            r#"{"a":{"dtype":"F32","shape":[1],"data_offsets":[0,4,4]}}"#,
+            "not [begin, end]",
+        ),
+        (
+            "dtype_name",
+            r#"{"a":{"dtype":"F8","shape":[1],"data_offsets":[0,4]}}"#,
+            "unsupported dtype",
+        ),
         ("entry_type", r#"{"a":"F32"}"#, "not an object"),
         ("meta_type", r#"{"__metadata__":[1]}"#, "__metadata__ is not an object"),
         ("meta_value", r#"{"__metadata__":{"k":1}}"#, "not a string"),
@@ -199,9 +286,24 @@ fn entries_must_be_exactly_dtype_shape_and_offsets() {
 fn offsets_must_match_the_shape_and_tile_the_data_exactly() {
     let d8 = [0u8; 8];
     let cases: &[(&str, &str, &[u8], &str)] = &[
-        ("reversed", r#"{"a":{"dtype":"F32","shape":[0],"data_offsets":[4,0]}}"#, &d8[..4], "outside"),
-        ("past", r#"{"a":{"dtype":"F32","shape":[2],"data_offsets":[0,8]}}"#, &d8[..4], "outside"),
-        ("size", r#"{"a":{"dtype":"F32","shape":[2],"data_offsets":[0,4]}}"#, &d8[..4], "shape [2] x F32 is 8"),
+        (
+            "reversed",
+            r#"{"a":{"dtype":"F32","shape":[0],"data_offsets":[4,0]}}"#,
+            &d8[..4],
+            "outside",
+        ),
+        (
+            "past",
+            r#"{"a":{"dtype":"F32","shape":[2],"data_offsets":[0,8]}}"#,
+            &d8[..4],
+            "outside",
+        ),
+        (
+            "size",
+            r#"{"a":{"dtype":"F32","shape":[2],"data_offsets":[0,4]}}"#,
+            &d8[..4],
+            "shape [2] x F32 is 8",
+        ),
         (
             "overlap",
             r#"{"a":{"dtype":"F32","shape":[1],"data_offsets":[0,4]},"b":{"dtype":"F32","shape":[1],"data_offsets":[2,6]}}"#,
@@ -280,14 +382,10 @@ fn opens_the_qwen35_2b_checkpoint() {
     let st = SafeTensors::open(std::path::Path::new(&path)).unwrap();
     let n = st.names().count();
     assert_eq!(n, 632, "tensor count");
-    let (shape, bits) = st
-        .read_bf16_bits("model.language_model.norm.weight")
-        .unwrap();
+    let (shape, bits) = st.read_bf16_bits("model.language_model.norm.weight").unwrap();
     assert_eq!(shape, vec![2048]);
     assert!(bits.iter().any(|&b| b != 0));
-    let (shape, a_log) = st
-        .read_f32("model.language_model.layers.0.linear_attn.A_log")
-        .unwrap();
+    let (shape, a_log) = st.read_f32("model.language_model.layers.0.linear_attn.A_log").unwrap();
     assert_eq!(shape, vec![16]);
     assert!(a_log.iter().all(|v| v.is_finite()));
 }

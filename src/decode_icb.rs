@@ -32,10 +32,9 @@ use objc2::ClassType;
 use objc2_foundation::NSString;
 use objc2_metal::{
     MTL4ArgumentTable, MTL4ArgumentTableDescriptor, MTL4Compiler, MTL4CompilerDescriptor,
-    MTL4ComputePipelineDescriptor, MTL4IndirectCommandBufferSupportState,
-    MTL4LibraryFunctionDescriptor, MTLAllocation, MTLBuffer, MTLComputePipelineState, MTLDevice,
-    MTLIndirectCommandBuffer, MTLIndirectCommandBufferDescriptor, MTLIndirectCommandType,
-    MTLIndirectComputeCommand, MTLLibrary, MTLResourceOptions, MTLSize,
+    MTL4ComputePipelineDescriptor, MTL4IndirectCommandBufferSupportState, MTL4LibraryFunctionDescriptor, MTLAllocation,
+    MTLBuffer, MTLComputePipelineState, MTLDevice, MTLIndirectCommandBuffer, MTLIndirectCommandBufferDescriptor,
+    MTLIndirectCommandType, MTLIndirectComputeCommand, MTLLibrary, MTLResourceOptions, MTLSize,
 };
 
 use crate::ab_flags::env_truthy;
@@ -58,12 +57,7 @@ pub fn decode_icb_enabled() -> bool {
     if v >= 0 {
         return v == 1;
     }
-    let on = env_truthy(&[
-        "TESSL_DECODE_ICB",
-        "METAL_RUNTIME_DECODE_ICB",
-        "GEMMA_METAL_DECODE_ICB",
-    ])
-    .unwrap_or(false);
+    let on = env_truthy(&["TESSL_DECODE_ICB", "METAL_RUNTIME_DECODE_ICB", "GEMMA_METAL_DECODE_ICB"]).unwrap_or(false);
     DECODE_ICB.store(if on { 1 } else { 0 }, Ordering::Relaxed);
     on
 }
@@ -321,10 +315,7 @@ fn buf_bind_fingerprint(binds: &[DecodeIcbBind]) -> u64 {
     // FNV-1a 64 — stable, cheap, good enough for capture-time table sharing.
     let mut slots: Vec<(u16, u64)> = Vec::with_capacity(binds.len());
     for b in binds {
-        if let DecodeIcbBind::Buf {
-            index, gpu_addr, ..
-        } = b
-        {
+        if let DecodeIcbBind::Buf { index, gpu_addr, .. } = b {
             if *index < ARG_TABLE_SLOTS {
                 slots.push((*index as u16, *gpu_addr));
             }
@@ -431,9 +422,7 @@ impl DecodeIcb {
         for (i, cmd) in commands.iter().enumerate() {
             for b in &cmd.binds {
                 let index = match b {
-                    DecodeIcbBind::Buf { index, .. } | DecodeIcbBind::Immediate { index, .. } => {
-                        *index
-                    }
+                    DecodeIcbBind::Buf { index, .. } | DecodeIcbBind::Immediate { index, .. } => *index,
                 };
                 if index >= ARG_TABLE_SLOTS {
                     return Err(format!(
@@ -461,11 +450,7 @@ impl DecodeIcb {
         // an unrelated tensor while the tape still logically points at it. Both
         // failures are silent, which is why this refuses instead of warning.
         if freeze_binds {
-            if let Some((i, cmd)) = commands
-                .iter()
-                .enumerate()
-                .find(|(_, c)| c.incomplete_binds > 0)
-            {
+            if let Some((i, cmd)) = commands.iter().enumerate().find(|(_, c)| c.incomplete_binds > 0) {
                 return Err(format!(
                     "DecodeIcb freeze_binds: command {i} has {} bind(s) that could not be \
                      recorded (bound through bind_buf / bind_resource_id, which carry no \
@@ -681,10 +666,7 @@ impl DecodeIcb {
     }
 
     /// Convert Immediate binds into owned Hot `Buf`s (freeze-binds path).
-    fn materialize_immediates(
-        rt: &GpuRuntime,
-        commands: &mut [DecodeIcbCommand],
-    ) -> Result<(), String> {
+    fn materialize_immediates(rt: &GpuRuntime, commands: &mut [DecodeIcbCommand]) -> Result<(), String> {
         for cmd in commands.iter_mut() {
             let mut owned = Vec::new();
             for b in cmd.binds.iter_mut() {
@@ -718,10 +700,7 @@ impl DecodeIcb {
 
     /// Freeze Buf `gpu_addr`s into MTL4 argument tables; dedup by fingerprint
     /// so sticky adopt can skip redundant `setArgumentTable` switches.
-    fn build_prebuilt_tables(
-        rt: &GpuRuntime,
-        commands: &[DecodeIcbCommand],
-    ) -> Result<PrebuiltTables, String> {
+    fn build_prebuilt_tables(rt: &GpuRuntime, commands: &[DecodeIcbCommand]) -> Result<PrebuiltTables, String> {
         let mut unique: Vec<(u64, Retained<ProtocolObject<dyn MTL4ArgumentTable>>)> = Vec::new();
         let mut tables = Vec::with_capacity(commands.len());
         for cmd in commands {
@@ -739,10 +718,7 @@ impl DecodeIcb {
                 .newArgumentTableWithDescriptor_error(&desc)
                 .map_err(|e| format!("DecodeIcb prebuilt newArgumentTable: {e}"))?;
             for b in &cmd.binds {
-                if let DecodeIcbBind::Buf {
-                    index, gpu_addr, ..
-                } = b
-                {
+                if let DecodeIcbBind::Buf { index, gpu_addr, .. } = b {
                     unsafe {
                         table.setAddress_atIndex(*gpu_addr, *index);
                     }
@@ -763,9 +739,7 @@ impl DecodeIcb {
         for cmd in commands {
             for b in &cmd.binds {
                 match b {
-                    DecodeIcbBind::Buf {
-                        index, gpu_addr, ..
-                    } => {
+                    DecodeIcbBind::Buf { index, gpu_addr, .. } => {
                         total = total.saturating_add(1);
                         if *index < ARG_TABLE_SLOTS {
                             let bit = 1u32 << *index;
@@ -807,11 +781,7 @@ impl DecodeIcb {
     }
 
     /// Like [`Self::mini_copy_chain`] with explicit freeze-binds control.
-    pub fn mini_copy_chain_ex(
-        rt: &GpuRuntime,
-        n: usize,
-        freeze_binds: bool,
-    ) -> Result<(Self, GpuBuffer), String> {
+    pub fn mini_copy_chain_ex(rt: &GpuRuntime, n: usize, freeze_binds: bool) -> Result<(Self, GpuBuffer), String> {
         if n == 0 {
             return Err("DecodeIcb::mini_copy_chain: n > 0".into());
         }
@@ -879,10 +849,7 @@ impl DecodeIcb {
     fn encode_cpu(&mut self) -> Result<(), String> {
         // Tape-only / direct-dispatch replay: allow non-ICB pipelines (default path).
         // Freeze-binds requires ICB-capable pipelines + setKernelBuffer encode.
-        let all_icb = self
-            .commands
-            .iter()
-            .all(|c| c.pipeline.supportIndirectCommandBuffers());
+        let all_icb = self.commands.iter().all(|c| c.pipeline.supportIndirectCommandBuffers());
         if !all_icb {
             if self.freeze_binds {
                 return Err(
@@ -922,10 +889,7 @@ impl DecodeIcb {
                     }
                 }
             }
-            icmd.concurrentDispatchThreadgroups_threadsPerThreadgroup(
-                cmd.threadgroups,
-                cmd.threads_per_tg,
-            );
+            icmd.concurrentDispatchThreadgroups_threadsPerThreadgroup(cmd.threadgroups, cmd.threads_per_tg);
         }
         self.encoded = true;
         self.optimized = false;
@@ -1018,10 +982,7 @@ impl DecodeIcb {
 
     /// Last execute: `setArgumentTable` switches + Buf binds elided by prebuilt.
     pub fn last_prebuilt_stats(&self) -> (u64, u64) {
-        (
-            self.last_set_argument_table_calls,
-            self.last_prebuilt_elided,
-        )
+        (self.last_set_argument_table_calls, self.last_prebuilt_elided)
     }
 
     /// Last execute: `executeCommandsInBuffer` call count + cmds covered.
@@ -1092,9 +1053,8 @@ impl DecodeIcb {
         let need_opt = !self.optimized;
         let icb = self.icb.clone();
         let n = self.commands.len() as u64;
-        let use_prebuilt = !freeze
-            && !self.prebuilt_tables.is_empty()
-            && self.prebuilt_tables.len() == self.commands.len();
+        let use_prebuilt =
+            !freeze && !self.prebuilt_tables.is_empty() && self.prebuilt_tables.len() == self.commands.len();
 
         // ICB execution cannot run a command whose pipeline was not built with
         // `supportIndirectCommandBuffers`. On a mixed tape `encode_cpu` returns
@@ -1107,12 +1067,7 @@ impl DecodeIcb {
         // Dropping half a tape is not a degraded mode, it is a wrong answer, so
         // it is refused. `freeze_binds` already rejects the same shape at
         // encode time; this covers the `TESSL_ICB_EXECUTE=1` path that does not.
-        if use_icb_exec
-            && !self
-                .commands
-                .iter()
-                .all(|c| c.pipeline.supportIndirectCommandBuffers())
-        {
+        if use_icb_exec && !self.commands.iter().all(|c| c.pipeline.supportIndirectCommandBuffers()) {
             return Err(format!(
                 "DecodeIcb: ICB execution requested for a tape whose {} command(s) are not \
                  all ICB-capable. Those commands would be silently dropped. Capture with \
@@ -1122,10 +1077,7 @@ impl DecodeIcb {
         }
 
         if use_icb_exec && need_opt {
-            let all_icb = self
-                .commands
-                .iter()
-                .all(|c| c.pipeline.supportIndirectCommandBuffers());
+            let all_icb = self.commands.iter().all(|c| c.pipeline.supportIndirectCommandBuffers());
             if all_icb {
                 rt.with_binder(|bnd| {
                     bnd.optimize_icb(&icb, 0, n);
@@ -1174,10 +1126,8 @@ impl DecodeIcb {
                     execute_icb_cmds = execute_icb_cmds.saturating_add(icb_cmds);
                     sticky.bind_total = sticky.bind_total.saturating_add(s.bind_total);
                     sticky.set_calls = sticky.set_calls.saturating_add(s.set_calls);
-                    sticky.prebuilt_elided =
-                        sticky.prebuilt_elided.saturating_add(s.prebuilt_elided);
-                    sticky.set_table_calls =
-                        sticky.set_table_calls.saturating_add(s.set_table_calls);
+                    sticky.prebuilt_elided = sticky.prebuilt_elided.saturating_add(s.prebuilt_elided);
+                    sticky.set_table_calls = sticky.set_table_calls.saturating_add(s.set_table_calls);
                     Ok(())
                 })?;
                 if let Some((probe, n)) = self.triage_probe.as_ref() {
@@ -1234,11 +1184,7 @@ impl DecodeIcb {
             let tables = &self.prebuilt_tables;
             rt.with_binder_barriers(Some(true), |bnd| {
                 for (i, cmd) in self.commands.iter().enumerate() {
-                    let prebuilt = if use_prebuilt {
-                        Some(tables[i].as_ref())
-                    } else {
-                        None
-                    };
+                    let prebuilt = if use_prebuilt { Some(tables[i].as_ref()) } else { None };
                     let (icb_n, icb_cmds) = Self::encode_cmd(
                         bnd,
                         cmd,
@@ -1325,9 +1271,7 @@ impl DecodeIcb {
             } else {
                 for b in &cmd.binds {
                     match b {
-                        DecodeIcbBind::Buf {
-                            index, gpu_addr, ..
-                        } => {
+                        DecodeIcbBind::Buf { index, gpu_addr, .. } => {
                             sticky.bind_addr(bnd, *gpu_addr, *index);
                         }
                         DecodeIcbBind::Immediate { index, bytes } => {
@@ -1391,9 +1335,7 @@ pub fn pipeline_icb(
         .newComputePipelineStateWithDescriptor_compilerTaskOptions_error(&pipe_desc, None)
         .map_err(|e| format!("ICB MTL4 pipeline '{fn_name}': {e}"))?;
     if !pipe.supportIndirectCommandBuffers() {
-        return Err(format!(
-            "ICB pipeline '{fn_name}' supportIndirectCommandBuffers=false"
-        ));
+        return Err(format!("ICB pipeline '{fn_name}' supportIndirectCommandBuffers=false"));
     }
     Ok(pipe)
 }
@@ -1439,9 +1381,7 @@ impl DecodeIcbCapture {
             gpu_addr: buf_gpu_addr(buf, byte_offset),
         };
         if let Some(slot) = self.current_binds.iter_mut().find(|b| match b {
-            DecodeIcbBind::Buf { index: i, .. } | DecodeIcbBind::Immediate { index: i, .. } => {
-                *i == index
-            }
+            DecodeIcbBind::Buf { index: i, .. } | DecodeIcbBind::Immediate { index: i, .. } => *i == index,
         }) {
             *slot = bind;
         } else {
@@ -1455,9 +1395,7 @@ impl DecodeIcbCapture {
             bytes: bytes.to_vec(),
         };
         if let Some(slot) = self.current_binds.iter_mut().find(|b| match b {
-            DecodeIcbBind::Buf { index: i, .. } | DecodeIcbBind::Immediate { index: i, .. } => {
-                *i == index
-            }
+            DecodeIcbBind::Buf { index: i, .. } | DecodeIcbBind::Immediate { index: i, .. } => *i == index,
         }) {
             *slot = bind;
         } else {
@@ -1732,8 +1670,7 @@ mod tests {
         dec.execute(&rt).unwrap();
         rt.synchronize().unwrap();
         let n = 32usize;
-        let out =
-            unsafe { std::slice::from_raw_parts(c.metal().contents().as_ptr() as *const f32, n) };
+        let out = unsafe { std::slice::from_raw_parts(c.metal().contents().as_ptr() as *const f32, n) };
         for (i, v) in out.iter().take(n).enumerate() {
             assert_eq!(*v, (i as f32) + 1.0, "mismatch at {i}");
         }
@@ -1744,8 +1681,7 @@ mod tests {
         }
         dec.execute(&rt).unwrap();
         rt.synchronize().unwrap();
-        let out2 =
-            unsafe { std::slice::from_raw_parts(c.metal().contents().as_ptr() as *const f32, n) };
+        let out2 = unsafe { std::slice::from_raw_parts(c.metal().contents().as_ptr() as *const f32, n) };
         for (i, v) in out2.iter().take(n).enumerate() {
             assert_eq!(*v, (i as f32) + 1.0);
         }
@@ -1774,15 +1710,13 @@ mod tests {
         // execute() under freeze also reads the range-batch globals, so hold the guard.
         let _flags = IcbFlagsTestGuard::lock();
         let rt = GpuRuntime::new().expect("runtime");
-        let (mut dec, c) =
-            DecodeIcb::mini_copy_chain_ex(&rt, 32, true).expect("mini copy chain freeze");
+        let (mut dec, c) = DecodeIcb::mini_copy_chain_ex(&rt, 32, true).expect("mini copy chain freeze");
         assert!(dec.freeze_binds(), "expected freeze_binds");
         assert_eq!(dec.prebuilt_table_count(), 0);
         dec.execute(&rt).unwrap();
         rt.synchronize().unwrap();
         let n = 32usize;
-        let out =
-            unsafe { std::slice::from_raw_parts(c.metal().contents().as_ptr() as *const f32, n) };
+        let out = unsafe { std::slice::from_raw_parts(c.metal().contents().as_ptr() as *const f32, n) };
         for (i, v) in out.iter().take(n).enumerate() {
             assert_eq!(*v, (i as f32) + 1.0, "freeze mismatch at {i}");
         }
@@ -1791,10 +1725,7 @@ mod tests {
         assert_eq!(set_tables, 0, "freeze must issue 0 setArgumentTable");
         assert_eq!(set_calls, 0);
         assert_eq!(elided, bind_total);
-        eprintln!(
-            "decode_icb_freeze_binds_zero_arg_table: {}",
-            dec.status_line()
-        );
+        eprintln!("decode_icb_freeze_binds_zero_arg_table: {}", dec.status_line());
     }
 
     #[test]
@@ -1859,9 +1790,7 @@ mod tests {
         assert_eq!(covered_b, 3);
         assert_eq!(dec_b.last_prebuilt_stats().0, 0, "still 0 setArgumentTable");
         for (label, buf) in [("a", &a), ("b", &b), ("c", &c)] {
-            let out = unsafe {
-                std::slice::from_raw_parts(buf.metal().contents().as_ptr() as *const f32, n)
-            };
+            let out = unsafe { std::slice::from_raw_parts(buf.metal().contents().as_ptr() as *const f32, n) };
             for (i, v) in out.iter().take(n).enumerate() {
                 assert_eq!(*v, (i as f32) + 1.0, "{label} mismatch at {i}");
             }
@@ -1945,18 +1874,12 @@ mod tests {
         rt.synchronize().unwrap();
         let (calls, covered) = dec.last_execute_icb_stats();
         // Spans: [a→b, c→d] + barrier + [b→e] + barrier → 2 execute_icb
-        assert_eq!(
-            calls, 2,
-            "coarse+range should yield 2 execute_icb, got {calls}"
-        );
+        assert_eq!(calls, 2, "coarse+range should yield 2 execute_icb, got {calls}");
         assert_eq!(covered, 3);
         assert_eq!(dec.barriers_elided(), 1);
-        let out_b =
-            unsafe { std::slice::from_raw_parts(b.metal().contents().as_ptr() as *const f32, n) };
-        let out_d =
-            unsafe { std::slice::from_raw_parts(d.metal().contents().as_ptr() as *const f32, n) };
-        let out_e =
-            unsafe { std::slice::from_raw_parts(e.metal().contents().as_ptr() as *const f32, n) };
+        let out_b = unsafe { std::slice::from_raw_parts(b.metal().contents().as_ptr() as *const f32, n) };
+        let out_d = unsafe { std::slice::from_raw_parts(d.metal().contents().as_ptr() as *const f32, n) };
+        let out_e = unsafe { std::slice::from_raw_parts(e.metal().contents().as_ptr() as *const f32, n) };
         for i in 0..n {
             assert_eq!(out_b[i], (i as f32) + 1.0, "b mismatch");
             assert_eq!(out_d[i], (i as f32) + 10.0, "d mismatch");
@@ -2031,10 +1954,7 @@ mod tests {
         set_binder_encode_nop(false);
 
         result.expect("a suppressed execute stays benign for callers holding the guard");
-        assert!(
-            dec.last_execute_was_nop(),
-            "the suppression must be observable"
-        );
+        assert!(dec.last_execute_was_nop(), "the suppression must be observable");
         assert_eq!(
             dec.execute_count(),
             before,
@@ -2077,10 +1997,7 @@ mod tests {
             1,
             "the first tape's work must survive re-entry, not be discarded"
         );
-        assert_eq!(
-            cap.nested_begins, 1,
-            "re-entry must be recorded so the leak is visible"
-        );
+        assert_eq!(cap.nested_begins, 1, "re-entry must be recorded so the leak is visible");
 
         // And the explicit escape hatch actually clears it.
         begin_decode_icb_capture();

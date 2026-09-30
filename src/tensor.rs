@@ -55,18 +55,9 @@ pub(crate) fn checked_nbytes(shape: &[usize], dtype: DType) -> Result<usize, Str
 
 /// A `shape` x `dtype` view at `byte_offset` must be element-aligned and fit
 /// in `nbytes`.
-fn check_view_bounds(
-    nbytes: usize,
-    shape: &[usize],
-    dtype: DType,
-    byte_offset: usize,
-) -> Result<(), String> {
+fn check_view_bounds(nbytes: usize, shape: &[usize], dtype: DType, byte_offset: usize) -> Result<(), String> {
     let bytes = checked_nbytes(shape, dtype)?;
-    if byte_offset % dtype.size_of() != 0
-        || byte_offset
-            .checked_add(bytes)
-            .is_none_or(|end| end > nbytes)
-    {
+    if byte_offset % dtype.size_of() != 0 || byte_offset.checked_add(bytes).is_none_or(|end| end > nbytes) {
         return Err("tensor view is misaligned or out of bounds".into());
     }
     Ok(())
@@ -225,8 +216,7 @@ impl GpuBuffer {
     }
 
     pub fn contents_f32(&self) -> HostMapping<'_, f32> {
-        self.try_contents_f32()
-            .expect("exclusive host mapping failed")
+        self.try_contents_f32().expect("exclusive host mapping failed")
     }
 
     pub fn try_contents_u16(&self) -> Result<HostMapping<'_, u16>, String> {
@@ -234,8 +224,7 @@ impl GpuBuffer {
     }
 
     pub fn contents_u16(&self) -> HostMapping<'_, u16> {
-        self.try_contents_u16()
-            .expect("exclusive host mapping failed")
+        self.try_contents_u16().expect("exclusive host mapping failed")
     }
 
     pub fn write_f32(&self, data: &[f32]) {
@@ -285,8 +274,7 @@ impl GpuBuffer {
     }
 
     pub fn contents_u8(&self) -> HostMapping<'_, u8> {
-        self.try_contents_u8()
-            .expect("exclusive host mapping failed")
+        self.try_contents_u8().expect("exclusive host mapping failed")
     }
 
     pub fn write_bytes(&self, data: &[u8]) {
@@ -300,8 +288,7 @@ impl GpuBuffer {
     }
 
     pub fn contents_u32(&self) -> HostMapping<'_, u32> {
-        self.try_contents_u32()
-            .expect("exclusive host mapping failed")
+        self.try_contents_u32().expect("exclusive host mapping failed")
     }
 
     pub fn write_u32(&self, data: &[u32]) {
@@ -315,9 +302,7 @@ impl GpuBuffer {
     }
 
     pub fn zero(&self) {
-        self.map_host::<u8>()
-            .expect("exclusive host zero failed")
-            .fill(0);
+        self.map_host::<u8>().expect("exclusive host zero failed").fill(0);
     }
 
     /// # Safety
@@ -328,13 +313,7 @@ impl GpuBuffer {
         // after GPU completion with no live views, so nothing else is reading
         // these bytes. The write is exactly `nbytes()` from the buffer's own
         // base, so it cannot overrun.
-        unsafe {
-            std::ptr::write_bytes(
-                self.metal().contents().as_ptr().cast::<u8>(),
-                0,
-                self.nbytes(),
-            )
-        };
+        unsafe { std::ptr::write_bytes(self.metal().contents().as_ptr().cast::<u8>(), 0, self.nbytes()) };
     }
 }
 
@@ -387,10 +366,7 @@ impl Tensor {
     pub fn write_f32(&self, data: &[f32]) -> Result<(), String> {
         let (start, len) = self.f32_window()?;
         if data.len() != len {
-            return Err(format!(
-                "write_f32: {} elements for a view of {len}",
-                data.len()
-            ));
+            return Err(format!("write_f32: {} elements for a view of {len}", data.len()));
         }
         let mut mapping = self.buffer.try_contents_f32()?;
         mapping[start..start + len].copy_from_slice(data);
@@ -422,8 +398,7 @@ impl Tensor {
     /// public metadata now fails explicitly instead of wrapping silently; code
     /// that accepts untrusted or mutated shapes should call [`Self::try_numel`].
     pub fn numel(&self) -> usize {
-        self.try_numel()
-            .expect("Tensor::numel: tensor element count overflow")
+        self.try_numel().expect("Tensor::numel: tensor element count overflow")
     }
 
     /// Fallible logical byte count, including dtype width and Rust allocation
@@ -590,12 +565,7 @@ impl Tensor {
     /// Validate public metadata before passing a view to a GPU kernel.
     pub(crate) fn validate(&self) -> Result<(), String> {
         check_view_bounds(self.buffer.nbytes(), &self.shape, self.dtype, self.byte_offset)?;
-        if !self
-            .buffer
-            .inner
-            .runtime
-            .ptr_eq(&Arc::downgrade(&self.runtime))
-        {
+        if !self.buffer.inner.runtime.ptr_eq(&Arc::downgrade(&self.runtime)) {
             return Err("tensor buffer belongs to a different runtime".into());
         }
         Ok(())
@@ -624,10 +594,7 @@ impl Tensor {
 pub fn gpu_copy(src: &Tensor, dst: &Tensor) -> Result<(), String> {
     src.validate()?;
     dst.validate()?;
-    if src.numel() != dst.numel()
-        || src.dtype != dst.dtype
-        || !Arc::ptr_eq(src.runtime(), dst.runtime())
-    {
+    if src.numel() != dst.numel() || src.dtype != dst.dtype || !Arc::ptr_eq(src.runtime(), dst.runtime()) {
         return Err("copy requires equal element counts/dtypes and the same runtime".into());
     }
     if src.numel() > u32::MAX as usize {
@@ -790,17 +757,11 @@ mod contract_tests {
         let mut tensor = rt.alloc_tensor_f32(&[1]).unwrap();
         tensor.shape = vec![usize::MAX, 2];
 
-        assert_eq!(
-            tensor.try_numel().unwrap_err(),
-            "tensor element count overflow"
-        );
+        assert_eq!(tensor.try_numel().unwrap_err(), "tensor element count overflow");
 
         tensor.shape = vec![usize::MAX];
         assert_eq!(tensor.try_numel().unwrap(), usize::MAX);
-        assert_eq!(
-            tensor.try_nbytes_logical().unwrap_err(),
-            "tensor byte size overflow"
-        );
+        assert_eq!(tensor.try_nbytes_logical().unwrap_err(), "tensor byte size overflow");
     }
 
     #[test]

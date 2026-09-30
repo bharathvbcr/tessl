@@ -209,6 +209,32 @@ pub fn cast_f32_to_bf16_hot(src: &Tensor) -> Result<Tensor, String> {
     Ok(dst)
 }
 
+/// `dst = src^T` for f32 matrices `[rows, cols]` and `[cols, rows]` (GPU).
+pub fn transpose_f32_into(src: &Tensor, dst: &Tensor) -> Result<(), String> {
+    validate_cast_input(src, DType::F32)?;
+    dst.validate()?;
+    let (s, d) = (src.shape(), dst.shape());
+    if s.len() != 2
+        || d != [s[1], s[0]]
+        || dst.dtype != DType::F32
+        || !std::sync::Arc::ptr_eq(src.runtime(), dst.runtime())
+        || src.overlaps(dst)
+    {
+        return Err(format!(
+            "transpose: destination {d:?} must be f32 [cols, rows] of the 2-D source {s:?}, on its runtime, not overlapping it"
+        ));
+    }
+    let rt = src.runtime();
+    let p = rt.pipeline("transpose2d_f32")?;
+    crate::dispatch::dispatch_1d(rt, &p, src.numel(), |bnd| {
+        crate::dispatch::set_tensor(bnd, src, 0);
+        crate::dispatch::set_tensor(bnd, dst, 1);
+        crate::dispatch::set_u32(bnd, s[0] as u32, 2);
+        crate::dispatch::set_u32(bnd, s[1] as u32, 3);
+    })?;
+    Ok(())
+}
+
 /// Cast bf16 tensor → f32 (GPU).
 pub fn cast_bf16_to_f32(src: &Tensor) -> Result<Tensor, String> {
     validate_cast_input(src, DType::BF16)?;
@@ -1022,18 +1048,8 @@ pub fn gemm_tn_f32(
     }
 
     // Default: explicit transpose + NN (golden-safe).
-    let at = {
-        let rt = a_km.runtime();
-        let out = rt.alloc_temp_f32(&[m, k])?;
-        let p = rt.pipeline("transpose2d_f32")?;
-        crate::dispatch::dispatch_1d(rt, &p, m * k, |bnd| {
-            crate::dispatch::set_tensor(bnd, a_km, 0);
-            crate::dispatch::set_tensor(bnd, &out, 1);
-            crate::dispatch::set_u32(bnd, k as u32, 2);
-            crate::dispatch::set_u32(bnd, m as u32, 3);
-        })?;
-        out
-    };
+    let at = a_km.runtime().alloc_temp_f32(&[m, k])?;
+    transpose_f32_into(a_km, &at)?;
     gemm_f32(&at, b_kn, c, backend)
 }
 
@@ -1221,18 +1237,8 @@ pub fn gemm_nt_f32(
         return dispatch_tensorops_tn_nt(rt, &pipeline, a_mk, b_nk, c, m, n, k, TILE_F32);
     }
 
-    let bt = {
-        let rt = b_nk.runtime();
-        let out = rt.alloc_temp_f32(&[k, n])?;
-        let p = rt.pipeline("transpose2d_f32")?;
-        crate::dispatch::dispatch_1d(rt, &p, n * k, |bnd| {
-            crate::dispatch::set_tensor(bnd, b_nk, 0);
-            crate::dispatch::set_tensor(bnd, &out, 1);
-            crate::dispatch::set_u32(bnd, n as u32, 2);
-            crate::dispatch::set_u32(bnd, k as u32, 3);
-        })?;
-        out
-    };
+    let bt = b_nk.runtime().alloc_temp_f32(&[k, n])?;
+    transpose_f32_into(b_nk, &bt)?;
     gemm_f32(a_mk, &bt, c, backend)
 }
 

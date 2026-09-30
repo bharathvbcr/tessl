@@ -380,7 +380,7 @@ checks that every `set_*` bind has the kernel's index and kind (buffer, `uint`,
 the kernel's constants. Swapping a single bind fails it. The kernels also
 `static_assert` their lane mappings against those constants.
 
-Last run at 3798ca8: all 41 cases, 147 checks passing, 0 failing. GDN rows
+Last run at 3798ca8: all 42 cases, 147 checks passing, 0 failing. GDN rows
 show the kernel's max error next to transformers' own fp32 error, both
 measured against f64:
 

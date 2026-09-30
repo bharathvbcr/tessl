@@ -28,7 +28,8 @@ fn from_mtl_buffer_gemm_operand_matches_native_tensor() {
             .device
             .newBufferWithLength_options(nbytes, MTLResourceOptions::StorageModeShared)
             .expect("alloc raw MTLBuffer");
-        let c = Tensor::from_mtl_buffer(rt, raw, &[m, n], DType::F32, 0).unwrap();
+        // SAFETY: a fresh buffer only this runtime touches.
+        let c = unsafe { Tensor::from_mtl_buffer(rt, raw, &[m, n], DType::F32, 0) }.unwrap();
         assert_eq!(c.buffer.kind(), BufferKind::External);
         gemm_f32(&a, &b, &c, GemmBackend::TensorOps).unwrap();
         rt.synchronize().unwrap();
@@ -55,13 +56,14 @@ fn from_mtl_buffer_rejects_short_buffer_and_bad_offset() {
             .device
             .newBufferWithLength_options(16, MTLResourceOptions::StorageModeShared)
             .expect("16-byte buffer");
-        let err = Tensor::from_mtl_buffer(rt, raw.clone(), &[8], DType::F32, 0)
+        // SAFETY (this and the next wrap): a fresh buffer only this runtime touches.
+        let err = unsafe { Tensor::from_mtl_buffer(rt, raw.clone(), &[8], DType::F32, 0) }
             .expect_err("8 f32 need 32 bytes");
         assert!(
             err.contains("out of bounds") || err.contains("misaligned"),
             "unexpected: {err}"
         );
-        let ok = Tensor::from_mtl_buffer(rt, raw, &[4], DType::F32, 0);
+        let ok = unsafe { Tensor::from_mtl_buffer(rt, raw, &[4], DType::F32, 0) };
         assert!(ok.is_ok());
     });
 }
@@ -82,10 +84,42 @@ fn from_mtl_buffer_rejects_foreign_device_when_available() {
         let raw = foreign
             .newBufferWithLength_options(64, MTLResourceOptions::StorageModeShared)
             .expect("foreign buffer");
-        let err = Tensor::from_mtl_buffer(rt, raw, &[4], DType::F32, 0).unwrap_err();
+        // SAFETY: a fresh buffer; the wrap is refused before any use.
+        let err = unsafe { Tensor::from_mtl_buffer(rt, raw, &[4], DType::F32, 0) }.unwrap_err();
         assert!(
             err.contains("registryID"),
             "expected registryID rejection, got {err}"
         );
+    });
+}
+
+/// A GPU-private buffer has no CPU mapping: `contents()` is nil. tessl's
+/// own pools only hand out shared storage, but a wrapped foreign buffer can be
+/// private, and a host read of it has to fail rather than build a slice over
+/// a null pointer. The same wrap stays usable as a GPU operand.
+#[test]
+fn a_wrapped_private_buffer_refuses_host_access_but_serves_the_gpu() {
+    with_gpu(|rt| {
+        let raw = rt
+            .device
+            .newBufferWithLength_options(64, MTLResourceOptions::StorageModePrivate)
+            .expect("private buffer");
+        // SAFETY: a fresh buffer only this runtime touches.
+        let t = unsafe { Tensor::from_mtl_buffer(rt, raw, &[4, 4], DType::F32, 0) }
+            .expect("a private buffer is a valid GPU operand");
+        let err = t.buffer.try_contents_u8().err().expect("host mapping of private storage");
+        assert!(err.contains("private"), "{err}");
+        assert!(t.read_f32().is_err(), "Tensor::read_f32 of private storage");
+        // GPU use: C = A * B into the private buffer, then copied out on the GPU.
+        let a = tensor_f32(rt, &[4, 4], &random_f32(16, 5));
+        let b = tensor_f32(rt, &[4, 4], &random_f32(16, 6));
+        gemm_f32(&a, &b, &t, GemmBackend::TensorOps).expect("gemm into private");
+        let back = rt.alloc_tensor_f32(&[4, 4]).unwrap();
+        tessl::tensor::gpu_copy(&t, &back).expect("copy out");
+        rt.synchronize().unwrap();
+        let want = rt.alloc_tensor_f32(&[4, 4]).unwrap();
+        gemm_f32(&a, &b, &want, GemmBackend::TensorOps).unwrap();
+        rt.synchronize().unwrap();
+        assert_eq!(back.buffer.read_f32(), want.buffer.read_f32());
     });
 }

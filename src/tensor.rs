@@ -10,7 +10,7 @@
 
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
-use objc2_metal::{MTLBuffer, MTLDevice, MTLResource};
+use objc2_metal::{MTLBuffer, MTLDevice, MTLResource, MTLStorageMode};
 use std::sync::{Arc, Weak};
 
 use crate::runtime::{BufferKind, GpuRuntime};
@@ -169,6 +169,16 @@ impl GpuBuffer {
     }
 
     fn map_host<T>(&self) -> Result<HostMapping<'_, T>, String> {
+        // Checked before `contents()` is called at all: for private or
+        // memoryless storage Metal returns nil from a method the bindings
+        // declare as `NonNull`. Only a wrapped foreign buffer can be one.
+        let mode = self.metal().storageMode();
+        if mode != MTLStorageMode::Shared && mode != MTLStorageMode::Managed {
+            return Err(format!(
+                "host mapping refused: the buffer's storage is GPU-private ({mode:?}); \
+                 copy it into a shared buffer on the GPU first"
+            ));
+        }
         if self.nbytes() % std::mem::size_of::<T>() != 0
             || self.metal().contents().as_ptr() as usize % std::mem::align_of::<T>() != 0
         {
@@ -483,7 +493,35 @@ impl Tensor {
     /// 2. Before sparsl reads that buffer, call sparsl's `wait_shared_event`.
     /// 3. After sparsl completes, `signal_shared_event` (or rely on its own
     ///    completion timeline) so tessl can wait before reuse.
-    pub fn from_mtl_buffer(
+    ///
+    /// The wrap retains the buffer, and a GPU-private one is accepted as a
+    /// GPU operand (its host mappings are refused).
+    ///
+    /// # Safety
+    ///
+    /// tessl orders everything it does to a buffer through its own queue and
+    /// its host-access lease, and neither can see work anywhere else. So while
+    /// the returned tensor, or any clone or view of it, can still be read or
+    /// written by tessl (dispatches encoded before the runtime's next
+    /// `synchronize`, and host mappings), nothing outside this runtime may
+    /// write the bytes it covers, and nothing outside may read bytes tessl may
+    /// be writing: not another command queue (torch's MPS stream, sparsl's
+    /// queue), not another runtime, not the CPU through another pointer. Hand
+    /// off across queues explicitly: finish the other queue's work before
+    /// tessl encodes, and `synchronize` tessl (or wait on
+    /// [`GpuRuntime::shared_event`]) before the other side touches the buffer
+    /// again. A host mapping during a foreign write is a data race on the
+    /// mapped slice.
+    ///
+    /// ```compile_fail,E0133
+    /// # use objc2::rc::Retained;
+    /// # use objc2::runtime::ProtocolObject;
+    /// # use objc2_metal::MTLBuffer;
+    /// fn wrap(rt: &std::sync::Arc<tessl::GpuRuntime>, b: Retained<ProtocolObject<dyn MTLBuffer>>) {
+    ///     let _ = tessl::Tensor::from_mtl_buffer(rt, b, &[4], tessl::DType::F32, 0);
+    /// }
+    /// ```
+    pub unsafe fn from_mtl_buffer(
         runtime: &Arc<GpuRuntime>,
         buffer: Retained<ProtocolObject<dyn MTLBuffer>>,
         shape: &[usize],
@@ -808,9 +846,10 @@ mod audit_tests {
             .device
             .newBufferWithLength_options(16, MTLResourceOptions::StorageModeShared)
             .unwrap();
-        let err = Tensor::from_mtl_buffer(&rt, raw.clone(), &[8], DType::F32, 0).unwrap_err();
+        // SAFETY: a fresh buffer only this test and this runtime touch.
+        let err = unsafe { Tensor::from_mtl_buffer(&rt, raw.clone(), &[8], DType::F32, 0) }.unwrap_err();
         assert!(err.contains("out of bounds"), "{err}");
-        let live = Tensor::from_mtl_buffer(&rt, raw.clone(), &[4], DType::F32, 0).unwrap();
+        let live = unsafe { Tensor::from_mtl_buffer(&rt, raw.clone(), &[4], DType::F32, 0) }.unwrap();
         // Drains retired allocations (a waited commit).
         rt.synchronize().unwrap();
         let alloc = ProtocolObject::<dyn objc2_metal::MTLAllocation>::from_ref(&*raw);

@@ -32,6 +32,8 @@ use std::io::Read;
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 
+use crate::json::{self, Json, Syntax};
+
 /// Largest header accepted. The format's reference implementation caps it at
 /// 100 MB; a 2B checkpoint's header is about 90 KB.
 pub const MAX_HEADER_BYTES: u64 = 100_000_000;
@@ -222,21 +224,21 @@ impl SafeTensors {
     }
 }
 
+/// The JSON subset the format uses: non-negative integers, no literals, and
+/// header -> tensor entry -> `shape` / `data_offsets` array, three levels.
+const HEADER_SYNTAX: Syntax = Syntax {
+    what: "header JSON",
+    max_depth: 3,
+    uints_only: true,
+    literals: false,
+};
+
 type Header = (BTreeMap<String, TensorInfo>, BTreeMap<String, String>);
 
 /// Parse and validate the header against a data buffer of `data_len` bytes.
 fn parse_header(bytes: &[u8], data_len: u64) -> Result<Header, String> {
     let text = std::str::from_utf8(bytes).map_err(|e| format!("header is not UTF-8: {e}"))?;
-    let mut p = Parser {
-        s: text.as_bytes(),
-        i: 0,
-    };
-    p.ws();
-    let root = p.value(0)?;
-    p.ws();
-    if p.i != p.s.len() {
-        return Err(format!("trailing bytes after the header object at {}", p.i));
-    }
+    let root = json::parse(text, HEADER_SYNTAX)?;
     let Json::Object(entries) = root else {
         return Err("header is not a JSON object".into());
     };
@@ -319,7 +321,7 @@ fn tensor_info(name: &str, v: Json) -> Result<TensorInfo, String> {
                 let dims = a
                     .into_iter()
                     .map(|d| match d {
-                        Json::UInt(n) => usize::try_from(n)
+                        Json::Num { uint: Some(n), .. } => usize::try_from(n)
                             .map_err(|_| format!("{name}: dimension {n} overflows usize")),
                         _ => Err(format!("{name}: shape holds a non-integer")),
                     })
@@ -327,7 +329,9 @@ fn tensor_info(name: &str, v: Json) -> Result<TensorInfo, String> {
                 shape = Some(dims);
             }
             ("data_offsets", Json::Array(a)) => match a.as_slice() {
-                [Json::UInt(b), Json::UInt(e)] => offsets = Some((*b, *e)),
+                [Json::Num { uint: Some(b), .. }, Json::Num { uint: Some(e), .. }] => {
+                    offsets = Some((*b, *e))
+                }
                 _ => return Err(format!("{name}: data_offsets is not [begin, end]")),
             },
             (k, _) => return Err(format!("{name}: unexpected or mistyped field {k:?}")),
@@ -342,217 +346,4 @@ fn tensor_info(name: &str, v: Json) -> Result<TensorInfo, String> {
         begin,
         end,
     })
-}
-
-/// The JSON subset the format uses.
-enum Json {
-    Object(Vec<(String, Json)>),
-    Array(Vec<Json>),
-    Str(String),
-    UInt(u64),
-}
-
-/// Header → tensor entry → `shape` / `data_offsets` array: three levels.
-const MAX_DEPTH: usize = 3;
-
-struct Parser<'a> {
-    s: &'a [u8],
-    i: usize,
-}
-
-impl Parser<'_> {
-    fn ws(&mut self) {
-        while let Some(b' ' | b'\t' | b'\n' | b'\r') = self.s.get(self.i) {
-            self.i += 1;
-        }
-    }
-
-    fn err<T>(&self, msg: &str) -> Result<T, String> {
-        Err(format!("header JSON: {msg} at byte {}", self.i))
-    }
-
-    fn eat(&mut self, c: u8) -> Result<(), String> {
-        if self.s.get(self.i) == Some(&c) {
-            self.i += 1;
-            Ok(())
-        } else {
-            self.err(&format!("expected {:?}", c as char))
-        }
-    }
-
-    fn value(&mut self, depth: usize) -> Result<Json, String> {
-        match self.s.get(self.i) {
-            Some(b'{') | Some(b'[') if depth >= MAX_DEPTH => self.err("nesting deeper than the format uses"),
-            Some(b'{') => self.object(depth),
-            Some(b'[') => self.array(depth),
-            Some(b'"') => Ok(Json::Str(self.string()?)),
-            Some(b'0'..=b'9') => Ok(Json::UInt(self.uint()?)),
-            Some(_) => self.err("unsupported JSON value (only objects, arrays, strings and non-negative integers)"),
-            None => self.err("unexpected end"),
-        }
-    }
-
-    fn object(&mut self, depth: usize) -> Result<Json, String> {
-        self.eat(b'{')?;
-        let mut out: Vec<(String, Json)> = Vec::new();
-        let mut seen = std::collections::BTreeSet::new();
-        self.ws();
-        if self.s.get(self.i) == Some(&b'}') {
-            self.i += 1;
-            return Ok(Json::Object(out));
-        }
-        loop {
-            self.ws();
-            if self.s.get(self.i) != Some(&b'"') {
-                return self.err("expected a string key");
-            }
-            let k = self.string()?;
-            if !seen.insert(k.clone()) {
-                return self.err(&format!("duplicate key {k:?}"));
-            }
-            self.ws();
-            self.eat(b':')?;
-            self.ws();
-            let v = self.value(depth + 1)?;
-            out.push((k, v));
-            self.ws();
-            match self.s.get(self.i) {
-                Some(b',') => self.i += 1,
-                Some(b'}') => {
-                    self.i += 1;
-                    return Ok(Json::Object(out));
-                }
-                _ => return self.err("expected ',' or '}'"),
-            }
-        }
-    }
-
-    fn array(&mut self, depth: usize) -> Result<Json, String> {
-        self.eat(b'[')?;
-        let mut out = Vec::new();
-        self.ws();
-        if self.s.get(self.i) == Some(&b']') {
-            self.i += 1;
-            return Ok(Json::Array(out));
-        }
-        loop {
-            self.ws();
-            out.push(self.value(depth + 1)?);
-            self.ws();
-            match self.s.get(self.i) {
-                Some(b',') => self.i += 1,
-                Some(b']') => {
-                    self.i += 1;
-                    return Ok(Json::Array(out));
-                }
-                _ => return self.err("expected ',' or ']'"),
-            }
-        }
-    }
-
-    /// A non-negative integer: no sign, fraction, exponent or leading zero.
-    fn uint(&mut self) -> Result<u64, String> {
-        let start = self.i;
-        let mut v: u64 = 0;
-        while let Some(&c @ b'0'..=b'9') = self.s.get(self.i) {
-            v = v
-                .checked_mul(10)
-                .and_then(|v| v.checked_add(u64::from(c - b'0')))
-                .ok_or_else(|| format!("header JSON: integer overflows u64 at byte {start}"))?;
-            self.i += 1;
-        }
-        if self.i - start > 1 && self.s[start] == b'0' {
-            return self.err("integer with a leading zero");
-        }
-        if let Some(b'.' | b'e' | b'E') = self.s.get(self.i) {
-            return self.err("non-integer number");
-        }
-        Ok(v)
-    }
-
-    fn string(&mut self) -> Result<String, String> {
-        self.eat(b'"')?;
-        let mut out = String::new();
-        loop {
-            let Some(&c) = self.s.get(self.i) else {
-                return self.err("unterminated string");
-            };
-            self.i += 1;
-            match c {
-                b'"' => return Ok(out),
-                b'\\' => {
-                    let Some(&e) = self.s.get(self.i) else {
-                        return self.err("unterminated escape");
-                    };
-                    self.i += 1;
-                    match e {
-                        b'"' => out.push('"'),
-                        b'\\' => out.push('\\'),
-                        b'/' => out.push('/'),
-                        b'b' => out.push('\u{8}'),
-                        b'f' => out.push('\u{c}'),
-                        b'n' => out.push('\n'),
-                        b'r' => out.push('\r'),
-                        b't' => out.push('\t'),
-                        b'u' => {
-                            let hi = self.hex4()?;
-                            let cp = if (0xD800..0xDC00).contains(&hi) {
-                                if self.s.get(self.i..self.i + 2) != Some(b"\\u") {
-                                    return self.err("unpaired high surrogate");
-                                }
-                                self.i += 2;
-                                let lo = self.hex4()?;
-                                if !(0xDC00..0xE000).contains(&lo) {
-                                    return self.err("invalid low surrogate");
-                                }
-                                0x10000 + ((hi - 0xD800) << 10) + (lo - 0xDC00)
-                            } else if (0xDC00..0xE000).contains(&hi) {
-                                return self.err("unpaired low surrogate");
-                            } else {
-                                hi
-                            };
-                            match char::from_u32(cp) {
-                                Some(ch) => out.push(ch),
-                                None => return self.err("invalid code point"),
-                            }
-                        }
-                        _ => return self.err("invalid escape"),
-                    }
-                }
-                0x00..=0x1f => return self.err("control character in string"),
-                _ => {
-                    // Copy the whole UTF-8 sequence; the header was checked to
-                    // be valid UTF-8, so a lead byte is followed by its tail.
-                    let start = self.i - 1;
-                    let len = match c {
-                        0x00..=0x7f => 1,
-                        0xc0..=0xdf => 2,
-                        0xe0..=0xef => 3,
-                        _ => 4,
-                    };
-                    let end = start + len;
-                    let chunk = std::str::from_utf8(&self.s[start..end])
-                        .map_err(|_| format!("header JSON: bad UTF-8 at byte {start}"))?;
-                    out.push_str(chunk);
-                    self.i = end;
-                }
-            }
-        }
-    }
-
-    fn hex4(&mut self) -> Result<u32, String> {
-        let Some(h) = self.s.get(self.i..self.i + 4) else {
-            return self.err("short \\u escape");
-        };
-        // Digits only: `from_str_radix` alone would also take a leading '+'.
-        let mut v = 0u32;
-        for &c in h {
-            let d = (c as char)
-                .to_digit(16)
-                .ok_or_else(|| format!("header JSON: bad \\u escape at byte {}", self.i))?;
-            v = v * 16 + d;
-        }
-        self.i += 4;
-        Ok(v)
-    }
 }

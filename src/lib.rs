@@ -206,6 +206,7 @@ pub mod dispatch;
 pub mod gemm;
 pub mod icb_smoke;
 pub mod infer_trace;
+mod json;
 #[cfg(feature = "quant-prep")]
 pub mod mtl_tensor;
 pub mod nn;

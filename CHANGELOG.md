@@ -15,6 +15,12 @@ All notable changes to `tessl` are recorded here. The format follows
   a `CeWorkspace` sized by rows and chunk. Kernels `ce_gather_rows_{f32,bf16}`,
   `ce_lse_update`, `ce_softmax_grad`. `gemm::cast_bf16_to_f32_into` widens
   into a caller's buffer.
+- **torch binding (`python/tessl_torch`) over a C ABI (`tessl::capi`)**:
+  `tessl_torch.cross_entropy(hidden, weight, targets, mask)`, a
+  `torch.autograd.Function` over MPS tensors, loaded with `ctypes` (no C++
+  extension, no new dependency). The crate now also builds a `cdylib`
+  (`libtessl.dylib`); the ABI is versioned, catches panics at the boundary,
+  and refuses calls from a thread other than the handle's.
 - **The Qwen3.5 text forward (`tessl::qwen35_model`)**, loaded from the
   Hugging Face checkpoint, checked end to end against transformers
   (`tests/qwen35_model.rs`, opt-in): F32 within 2.3e-6 per layer, Bf16 18x
@@ -24,8 +30,27 @@ All notable changes to `tessl` are recorded here. The format follows
 - **`qwen35::residual_add`** (`qwen35_residual_add_f32`), the exact-f32
   residual add for strided windows.
 
+### Changed (breaking)
+
+- `Tensor::from_mtl_buffer` is an `unsafe fn`: tessl cannot see another
+  queue's work on a wrapped buffer, and its `# Safety` section states the
+  cross-queue contract.
+- `GpuRuntime::metal4` and `Metal4EncodePackage` are crate-private;
+  `shared_event()` and `last_signaled_value()` remain the public handoff.
+- `cross_entropy_rows` takes the hidden states and weight as `Tensor`s
+  (`CeHidden { rows, off }`, `&Tensor`), so views at a storage offset work.
+- `ParamsBuffer::push_u32`/`push_f32` take the host-access lease: they wait
+  for encoded work and fail with "runtime busy" inside an encoder closure.
+
 ### Fixed
 
+- Host mappings of a GPU-private buffer are refused instead of building a
+  slice over the null `contents()`.
+- Two wraps of one `MTLBuffer` are one allocation: overlap checks compare the
+  buffer, not the wrapper, and residency is counted per buffer, so dropping
+  one wrap no longer evicts it from under another.
+- A `ParamsBuffer` slot is no longer rewritten under an encoded dispatch that
+  still reads it.
 - `npy`: only versions 1-3, a bounded UTF-8 header, `fortran_order` exactly
   `True`/`False`, checked element counts, and a payload that must be exactly
   the rest of the file (checked before allocating).

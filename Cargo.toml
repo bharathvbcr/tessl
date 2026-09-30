@@ -48,6 +48,11 @@ default = []
 # work yet.
 quant-prep = []
 
+[lib]
+# `cdylib` builds libtessl.dylib, the C ABI in src/capi.rs that
+# python/tessl_torch loads with ctypes; `rlib` is the Rust library as before.
+crate-type = ["rlib", "cdylib"]
+
 [dependencies]
 objc2 = "0.6"
 objc2-foundation = { version = "0.3", features = ["NSString", "NSURL", "NSError", "NSData", "NSValue", "NSRange"] }

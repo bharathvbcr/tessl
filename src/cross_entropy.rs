@@ -160,6 +160,11 @@ impl CeWorkspace {
     pub fn chunk(&self) -> u32 {
         self.chunk
     }
+
+    /// The most rows one call may supply.
+    pub fn max_rows(&self) -> u32 {
+        self.max_rows
+    }
 }
 
 /// See the module docs.

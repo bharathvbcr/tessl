@@ -76,6 +76,7 @@
 //! | [`ab_flags`], [`infer_trace`], [`icb_smoke`], [`npy`] | Tuning switches, tracing, smoke tests, and `.npy` I/O for benchmark parity |
 //! | [`safetensors`] | A strict `.safetensors` reader, to load checkpoints straight from the Hugging Face cache |
 //! | [`cross_entropy`] | LM-head cross-entropy and its gradients over the supervised rows, in vocabulary chunks |
+//! | [`capi`] | The C ABI (`libtessl.dylib`) that `python/tessl_torch` calls through `ctypes` |
 //!
 //! # Encode model
 //!
@@ -197,6 +198,7 @@
 //! the second class: write the comment.
 
 pub mod ab_flags;
+pub mod capi;
 pub mod cb_replay;
 pub mod cross_entropy;
 pub mod decode_icb;

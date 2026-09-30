@@ -560,7 +560,8 @@ is the largest non-GEMM share: 18 × 1.4 ms.
 - **Key head dim other than 128**, and value head dims that aren't multiples of
   32, are rejected on the host.
 - **Redundant work left in.** The normalized-k/q workspace is stored per
-  value head, so it is duplicated `Hv/Hk` times (2× for Qwen3.5). The prep
+  value head, so it is duplicated `Hv/Hk` times: 1× for the 2B (16 key /
+  16 value heads), 2× at `Qwen3_5TextConfig()`'s defaults†. The prep
   products are uneven across simdgroups (triangular). Both are
   performance-only.
 - **Untuned tiles.** GDN's 64-row chunks and 32-column value slices, and the

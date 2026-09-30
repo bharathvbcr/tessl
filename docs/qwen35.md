@@ -746,7 +746,16 @@ f32 `[hidden, vocab]` head, 1 GB more, and a write had to round.) The bf16
 forward keeps its packed `[hidden, vocab]` head beside the table: an NN GEMM
 over it measured 0.035-0.038 ms per row against 0.047 for the NT GEMM over
 the table (`bench_qwen35_layers`, 1024 rows, two runs each), and its logits
-are unchanged (the parity numbers above re-ran identical). `tests/qwen35_params.rs`, `tests/capi.rs` and
+are unchanged (the parity numbers above re-ran identical). A tile sweep of
+the NT kernel at the head's shape (`bench_gemm_tnnt_tune`,
+`bench/results/bf16_nt_lm_head_m5pro.txt`) closed most of the gap but not
+all of it: 256x64 on 8 simdgroups (fewer passes over the 1 GB table) ran at
+35.9 / 37.1 ms against the NN head's 34.2 / 33.4, taller tiles were slower,
+and that tile would halve one of the training backward's NT shapes, so it
+could only be a head-only kernel. Neither that 5-11% nor the 1 GB saved
+matters much here, since nothing in production runs the bf16 full-vocabulary
+head (Lappi scores answer rows through `score_answer_rows`), so the bf16
+model keeps the faster, existing head and no kernel was added. `tests/qwen35_params.rs`, `tests/capi.rs` and
 `python/tests/test_qwen35.py` check that the values are the checkpoint's,
 that the gradients are transformers' autograd's (the Python test computes its
 own oracle), that a byte offset is honoured, that a bad tensor stops a write

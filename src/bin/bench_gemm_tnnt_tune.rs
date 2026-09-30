@@ -144,6 +144,11 @@ fn main() -> Result<(), String> {
         (Lane::Nt, 4096, 128, 128, "nt_dx_attn"),
         (Lane::Nt, 2048, 2048, 2048, "nt_square_2048"),
         (Lane::Nt, 8192, 768, 3072, "nt_wide"),
+        // The tied LM head at 1024 rows: the NN product over the packed
+        // [hidden, vocab] copy, and the NT product over the [vocab, hidden]
+        // table the same logits could come from.
+        (Lane::Nn, 1024, 248320, 2048, "nn_lm_head"),
+        (Lane::Nt, 1024, 248320, 2048, "nt_lm_head"),
         // TN accumulate kernels (raw A/B; production kernel is the
         // GEMM_ACCUM=1 path, default-off in training).
         (Lane::TnAccum, 512, 768, 4096, "tnacc_512x768_k4096"),
@@ -206,6 +211,19 @@ fn main() -> Result<(), String> {
             nsg: 4,
             binds_tiles_m: false,
         },
+        Variant { kernel: "mm_bf16_nt_coop_64x128_sg4", sm: 64, sn: 128, nsg: 4, binds_tiles_m: false },
+        Variant { kernel: "mm_bf16_nt_coop_128x128_sg4", sm: 128, sn: 128, nsg: 4, binds_tiles_m: false },
+        Variant { kernel: "mm_bf16_nt_coop_128x128_sg8", sm: 128, sn: 128, nsg: 8, binds_tiles_m: false },
+        Variant { kernel: "mm_bf16_nt_coop_256x64_sg8", sm: 256, sn: 64, nsg: 8, binds_tiles_m: false },
+        Variant { kernel: "mm_bf16_nt_coop_64x256_sg8", sm: 64, sn: 256, nsg: 8, binds_tiles_m: false },
+        Variant { kernel: "mm_bf16_nt_coop_128x256_sg8", sm: 128, sn: 256, nsg: 8, binds_tiles_m: false },
+        Variant { kernel: "mm_bf16_nt_coop_256x128_sg8", sm: 256, sn: 128, nsg: 8, binds_tiles_m: false },
+        Variant { kernel: "mm_bf16_nt_coop_256x64_sg4", sm: 256, sn: 64, nsg: 4, binds_tiles_m: false },
+        Variant { kernel: "mm_bf16_nt_coop_256x32_sg8", sm: 256, sn: 32, nsg: 8, binds_tiles_m: false },
+        Variant { kernel: "mm_bf16_nt_coop_512x32_sg8", sm: 512, sn: 32, nsg: 8, binds_tiles_m: false },
+        Variant { kernel: "mm_bf16_nt_coop_512x64_sg8", sm: 512, sn: 64, nsg: 8, binds_tiles_m: false },
+        Variant { kernel: "mm_bf16_nt_coop_512x64_sg16", sm: 512, sn: 64, nsg: 16, binds_tiles_m: false },
+        Variant { kernel: "mm_bf16_nt_coop_1024x32_sg16", sm: 1024, sn: 32, nsg: 16, binds_tiles_m: false },
     ];
     let tnacc_variants = &[
         Variant {

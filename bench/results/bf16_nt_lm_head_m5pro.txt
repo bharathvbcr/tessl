@@ -1,0 +1,115 @@
+# The tied LM head as NN vs NT, and an NT tile sweep for it — M5 Pro, 2026-09-30
+#
+# Question: can the bf16 forward drop its packed [hidden, vocab] head and run
+# the head as an NT product over the [vocab, hidden] embedding table (what
+# the f32 model now does), without losing speed? Shape: 1024 rows,
+# N = 248320, K = 2048. `TESSL_GEMM_TUNE=1 cargo build --release --bins`,
+# then `target/release/bench_gemm_tnnt_tune`; two full runs, the second
+# with round-two variants (taller row tiles) added. The NT dx rows below
+# show what each tile does to the training shapes the production NT kernel
+# (128x64 sg4) serves.
+#
+# Finding: the best NT tile (256x64 sg8: each row tile streams the 1 GB
+# table once, so 4 row tiles read it 4 times against 128x64's 8) reaches
+# 35.9 / 37.1 ms against the NN head's 34.2 / 33.4 ms: 5-11% slower. Taller
+# tiles do not help (512x64 sg16 38.2, 1024x32 sg16 39.4; 512x64 sg8 122).
+# 256x64 sg8 would also halve the NT dx_mlp_in shape (0.51x), so it could
+# only be a head-specific kernel. Decision: the bf16 model keeps its packed
+# NN head (see docs/qwen35.md, "From torch").
+
+## Run 1
+nt_dx_mlp_in  M=4096 N=128 K=384   production 0.133 ms  3036 GFLOP/s
+  mm_bf16_nt_coop_64x64_sg4                0.132        3055  1.01×      0.00e0
+  mm_bf16_nt_coop_128x64_sg4               0.128        3144  1.04×      0.00e0
+  mm_bf16_nt_coop_64x128_sg4               0.135        2973  0.98×      0.00e0
+  mm_bf16_nt_coop_128x128_sg4              0.261        1545  0.51×      0.00e0
+  mm_bf16_nt_coop_128x128_sg8              0.249        1614  0.53×      0.00e0
+  mm_bf16_nt_coop_256x64_sg8               0.260        1550  0.51×      0.00e0
+  mm_bf16_nt_coop_64x256_sg8           skip(div)
+  mm_bf16_nt_coop_128x256_sg8          skip(div)
+  mm_bf16_nt_coop_256x128_sg8              0.322        1251  0.41×      0.00e0
+
+nt_dx_mlp_hid  M=4096 N=384 K=128   production 0.149 ms  2694 GFLOP/s
+  mm_bf16_nt_coop_64x64_sg4                0.151        2670  0.99×      0.00e0
+  mm_bf16_nt_coop_128x64_sg4               0.134        3002  1.11×      0.00e0
+  mm_bf16_nt_coop_64x128_sg4               0.132        3040  1.13×      0.00e0
+  mm_bf16_nt_coop_128x128_sg4              0.151        2666  0.99×      0.00e0
+  mm_bf16_nt_coop_128x128_sg8              0.135        2991  1.11×      0.00e0
+  mm_bf16_nt_coop_256x64_sg8               0.139        2906  1.08×      0.00e0
+  mm_bf16_nt_coop_64x256_sg8           skip(div)
+  mm_bf16_nt_coop_128x256_sg8          skip(div)
+  mm_bf16_nt_coop_256x128_sg8              0.182        2209  0.82×      0.00e0
+
+nt_dx_attn  M=4096 N=128 K=128   production 0.136 ms  989 GFLOP/s
+  mm_bf16_nt_coop_64x64_sg4                0.130        1034  1.05×      0.00e0
+  mm_bf16_nt_coop_128x64_sg4               0.129        1037  1.05×      0.00e0
+  mm_bf16_nt_coop_64x128_sg4               0.146         917  0.93×      0.00e0
+  mm_bf16_nt_coop_128x128_sg4              0.141         951  0.96×      0.00e0
+  mm_bf16_nt_coop_128x128_sg8              0.144         931  0.94×      0.00e0
+  mm_bf16_nt_coop_256x64_sg8               0.146         917  0.93×      0.00e0
+  mm_bf16_nt_coop_64x256_sg8           skip(div)
+  mm_bf16_nt_coop_128x256_sg8          skip(div)
+  mm_bf16_nt_coop_256x128_sg8              0.140         960  0.97×      0.00e0
+
+nt_square_2048  M=2048 N=2048 K=2048   production 0.727 ms  23616 GFLOP/s
+  mm_bf16_nt_coop_64x64_sg4                0.724       23732  1.00×      0.00e0
+  mm_bf16_nt_coop_128x64_sg4               0.708       24282  1.03×      0.00e0
+  mm_bf16_nt_coop_64x128_sg4               0.704       24395  1.03×      0.00e0
+  mm_bf16_nt_coop_128x128_sg4              0.849       20242  0.86×      0.00e0
+  mm_bf16_nt_coop_128x128_sg8              0.735       23359  0.99×      0.00e0
+  mm_bf16_nt_coop_256x64_sg8               0.732       23460  0.99×      0.00e0
+  mm_bf16_nt_coop_64x256_sg8               0.722       23780  1.01×      0.00e0
+  mm_bf16_nt_coop_128x256_sg8              0.844       20365  0.86×      0.00e0
+  mm_bf16_nt_coop_256x128_sg8              1.138       15098  0.64×      0.00e0
+
+nt_wide  M=8192 N=768 K=3072   production 1.382 ms  27967 GFLOP/s
+  mm_bf16_nt_coop_64x64_sg4                1.422       27176  0.97×      0.00e0
+  mm_bf16_nt_coop_128x64_sg4               1.351       28604  1.02×      0.00e0
+  mm_bf16_nt_coop_64x128_sg4               1.365       28327  1.01×      0.00e0
+  mm_bf16_nt_coop_128x128_sg4              1.551       24929  0.89×      0.00e0
+  mm_bf16_nt_coop_128x128_sg8              1.422       27177  0.97×      0.00e0
+  mm_bf16_nt_coop_256x64_sg8               1.428       27065  0.97×      0.00e0
+  mm_bf16_nt_coop_64x256_sg8               1.400       27602  0.99×      0.00e0
+  mm_bf16_nt_coop_128x256_sg8              1.545       25022  0.89×      0.00e0
+  mm_bf16_nt_coop_256x128_sg8              2.340       16519  0.59×      0.00e0
+
+nn_lm_head  M=1024 N=248320 K=2048   production 34.219 ms  30437 GFLOP/s
+  mm_bf16_coop_128x64_sg4_swz4            35.208       29582  0.97×      0.00e0
+  mm_bf16_coop_128x64_sg4_swz8            38.029       27387  0.90×      0.00e0
+  mm_bf16_coop_256x64_sg8_swz4            36.334       28665  0.94×      0.00e0
+
+nt_lm_head  M=1024 N=248320 K=2048   production 44.844 ms  23225 GFLOP/s
+  mm_bf16_nt_coop_64x64_sg4               79.688       13070  0.56×      0.00e0
+  mm_bf16_nt_coop_128x64_sg4              44.621       23342  1.01×      0.00e0
+  mm_bf16_nt_coop_64x128_sg4              78.508       13267  0.57×      0.00e0
+  mm_bf16_nt_coop_128x128_sg4             46.172       22558  0.97×      0.00e0
+  mm_bf16_nt_coop_128x128_sg8             46.786       22262  0.96×      0.00e0
+  mm_bf16_nt_coop_256x64_sg8              35.872       29035  1.25×      0.00e0
+  mm_bf16_nt_coop_64x256_sg8              79.177       13154  0.57×      0.00e0
+  mm_bf16_nt_coop_128x256_sg8             45.366       22958  0.99×      0.00e0
+  mm_bf16_nt_coop_256x128_sg8             66.838       15583  0.67×      0.00e0
+
+## Run 2 (round-two variants added; head rows only)
+
+nn_lm_head  M=1024 N=248320 K=2048   production 33.401 ms  31182 GFLOP/s
+  mm_bf16_coop_128x64_sg4_swz4            33.822       30794  0.99×      0.00e0
+  mm_bf16_coop_128x64_sg4_swz8            33.290       31287  1.00×      0.00e0
+  mm_bf16_coop_256x64_sg8_swz4            34.852       29885  0.96×      0.00e0
+
+nt_lm_head  M=1024 N=248320 K=2048   production 43.546 ms  23918 GFLOP/s
+  mm_bf16_nt_coop_64x64_sg4               76.549       13606  0.57×      0.00e0
+  mm_bf16_nt_coop_128x64_sg4              43.362       24020  1.00×      0.00e0
+  mm_bf16_nt_coop_64x128_sg4              79.221       13147  0.55×      0.00e0
+  mm_bf16_nt_coop_128x128_sg4             46.041       22622  0.95×      0.00e0
+  mm_bf16_nt_coop_128x128_sg8             45.305       22989  0.96×      0.00e0
+  mm_bf16_nt_coop_256x64_sg8              37.096       28077  1.17×      0.00e0
+  mm_bf16_nt_coop_64x256_sg8              81.224       12823  0.54×      0.00e0
+  mm_bf16_nt_coop_128x256_sg8             48.202       21608  0.90×      0.00e0
+  mm_bf16_nt_coop_256x128_sg8             78.642       13244  0.55×      0.00e0
+  mm_bf16_nt_coop_256x64_sg4              78.751       13226  0.55×      0.00e0
+  mm_bf16_nt_coop_256x32_sg8              42.136       24718  1.03×      0.00e0
+  mm_bf16_nt_coop_512x32_sg8              40.582       25665  1.07×      0.00e0
+  mm_bf16_nt_coop_512x64_sg8             122.440        8506  0.36×      0.00e0
+  mm_bf16_nt_coop_512x64_sg16             38.150       27301  1.14×      0.00e0
+  mm_bf16_nt_coop_1024x32_sg16            39.365       26458  1.11×      0.00e0
+

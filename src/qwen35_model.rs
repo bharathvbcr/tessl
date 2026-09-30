@@ -371,8 +371,9 @@ pub struct Qwen35Model {
     /// what training reads and writes).
     pub(crate) embed: Tensor,
     /// Bf16 only: the tied head packed `[hidden, vocab]` for an NN GEMM,
-    /// which measured 25% faster than the NT GEMM over `embed` at the 2B's
-    /// head (0.037 against 0.047 ms per row, `bench_qwen35_layers`). The
+    /// which measured faster than the NT GEMM over `embed` at the 2B's
+    /// head, even with the NT tile tuned for it (5-11%,
+    /// `bench/results/bf16_nt_lm_head_m5pro.txt`). The
     /// bf16 model is not trained, so the two copies never diverge.
     pub(crate) lm_head_bf16: Option<Tensor>,
     pub(crate) final_norm: GpuBuffer,

@@ -336,6 +336,23 @@ kernel void mm_bf16_tn_accum_coop_64x64_sg4(
 
 TUNE_TN_COOP(mm_bf16_tn_coop_128x64_sg4, 128, 64, 4)
 TUNE_NT_COOP(mm_bf16_nt_coop_128x64_sg4, 128, 64, 4)
+// The tied LM head as an NT product over the [vocab, hidden] table
+// (M = rows, N = 248320, K = 2048): wider N tiles and more simdgroups.
+TUNE_NT_COOP(mm_bf16_nt_coop_64x128_sg4, 64, 128, 4)
+TUNE_NT_COOP(mm_bf16_nt_coop_128x128_sg4, 128, 128, 4)
+TUNE_NT_COOP(mm_bf16_nt_coop_128x128_sg8, 128, 128, 8)
+TUNE_NT_COOP(mm_bf16_nt_coop_256x64_sg8, 256, 64, 8)
+TUNE_NT_COOP(mm_bf16_nt_coop_64x256_sg8, 64, 256, 8)
+TUNE_NT_COOP(mm_bf16_nt_coop_128x256_sg8, 128, 256, 8)
+TUNE_NT_COOP(mm_bf16_nt_coop_256x128_sg8, 256, 128, 8)
+// Round two: the head's winner was the tallest tile (each row tile streams
+// the whole 1 GB table once), so taller still.
+TUNE_NT_COOP(mm_bf16_nt_coop_256x64_sg4, 256, 64, 4)
+TUNE_NT_COOP(mm_bf16_nt_coop_256x32_sg8, 256, 32, 8)
+TUNE_NT_COOP(mm_bf16_nt_coop_512x32_sg8, 512, 32, 8)
+TUNE_NT_COOP(mm_bf16_nt_coop_512x64_sg8, 512, 64, 8)
+TUNE_NT_COOP(mm_bf16_nt_coop_512x64_sg16, 512, 64, 16)
+TUNE_NT_COOP(mm_bf16_nt_coop_1024x32_sg16, 1024, 32, 16)
 
 /// NN coop with a column-panel grid swizzle (PH tile-rows per band): bounds
 /// B-tile rereads to tiles_m/PH full passes instead of tiles_m, at the cost

@@ -459,6 +459,17 @@ impl<'a> Binder<'a> {
                 return;
             }
         }
+        // MTL4 command buffers do not retain the ICB, and this borrow ends with
+        // the call. Residency is what keeps it valid and alive until the batch
+        // completes (the set holds a strong reference), so an unregistered ICB
+        // is refused here as `optimize_icb` refuses it.
+        let allocation = ProtocolObject::<dyn MTLAllocation>::from_ref(icb);
+        if !self.runtime.metal4.residency.containsAllocation(allocation) {
+            self.fail(
+                "indirect command buffer is not registered with this runtime's residency set",
+            );
+            return;
+        }
         let range = NSRange {
             location: start as _,
             length: count as _,
@@ -771,6 +782,67 @@ mod audit_tests {
                 Ok(())
             })
             .is_err());
+    }
+
+    fn one_command_icb(
+        rt: &GpuRuntime,
+    ) -> Retained<ProtocolObject<dyn objc2_metal::MTLIndirectCommandBuffer>> {
+        use objc2_metal::{
+            MTLDevice, MTLIndirectCommandBufferDescriptor, MTLIndirectCommandType,
+            MTLResourceOptions,
+        };
+        let desc = MTLIndirectCommandBufferDescriptor::new();
+        desc.setCommandTypes(MTLIndirectCommandType::ConcurrentDispatch);
+        desc.setInheritBuffers(true);
+        desc.setInheritPipelineState(false);
+        desc.setMaxKernelBufferBindCount(0);
+        // SAFETY: a valid descriptor and a non-zero command count.
+        unsafe {
+            rt.device
+                .newIndirectCommandBufferWithDescriptor_maxCommandCount_options(
+                    &desc,
+                    1,
+                    MTLResourceOptions::StorageModeShared,
+                )
+        }
+        .expect("newIndirectCommandBuffer")
+    }
+
+    /// `execute_icb` is safe and borrows the ICB only for the call, while MTL4
+    /// command buffers do not retain what they reference. It now requires the
+    /// ICB to be in the runtime's residency set, as `optimize_icb` already did:
+    /// a non-resident ICB is not valid to execute on MTL4, and membership is
+    /// what keeps it alive until the batch completes (next test). Before, an
+    /// unregistered ICB was encoded, and one the caller dropped before
+    /// `synchronize` was a GPU use-after-free.
+    #[test]
+    fn execute_icb_refuses_an_icb_outside_the_residency_set() {
+        let rt = GpuRuntime::new().unwrap();
+        let icb = one_command_icb(&rt);
+        let p = rt.pipeline("copy_f32").unwrap();
+        let err = rt
+            .with_binder(|b| {
+                b.set_pipeline(&p);
+                b.execute_icb(&icb, 0, 1);
+                Ok(())
+            })
+            .unwrap_err();
+        assert!(err.contains("residency"), "{err}");
+    }
+
+    /// The invariant the check above relies on: the residency set holds a
+    /// strong reference, so a registered ICB outlives the caller's handle.
+    #[test]
+    fn the_residency_set_keeps_a_registered_icb_alive() {
+        let rt = GpuRuntime::new().unwrap();
+        let icb = one_command_icb(&rt);
+        rt.register_allocation(ProtocolObject::<dyn MTLAllocation>::from_ref(&*icb));
+        let weak = objc2::rc::Weak::from_retained(&icb);
+        drop(icb);
+        assert!(
+            weak.load().is_some(),
+            "the residency set did not keep the ICB alive"
+        );
     }
 
     /// Moved here with `dispatch_2d`/`dispatch_3d`. The extent check must reject

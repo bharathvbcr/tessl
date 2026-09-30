@@ -331,6 +331,14 @@ int main(int argc, char **argv) {
         launch(uint3(cdiv(hidden, 32), n, 1), uint3(32, 1, 1), 0, [&](const Ids &id, float *) {
             qwen35_embed_rows_bf16(ids, table, out, n, hidden, vocab, uint2(id.gid.x, id.gid.y));
         });
+    } else if (kname == "qwen35_embed_rows_f32") {
+        const uint n = P("n"), hidden = P("hidden"), vocab = P("vocab");
+        uint *ids = U("ids");
+        uint *table = U("table");
+        float *out = F("out");
+        launch(uint3(cdiv(hidden, 32), n, 1), uint3(32, 1, 1), 0, [&](const Ids &id, float *) {
+            qwen35_embed_rows_f32(ids, table, out, n, hidden, vocab, uint2(id.gid.x, id.gid.y));
+        });
     } else if (kname == "qwen35_score_rows_f32" || kname == "qwen35_score_rows_bf16") {
         const uint rows = P("rows"), hidden = P("hidden"), n_ans = P("n_ans"), vocab = P("vocab"),
                    n_slots = P("n_slots");

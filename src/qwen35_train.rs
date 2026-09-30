@@ -238,7 +238,7 @@ impl Qwen35Model {
             rt,
             &id_buf,
             t,
-            qwen35::LmHead { weight: &self.embed, dtype: DType::BF16, vocab: cfg.vocab },
+            qwen35::LmHead { weight: &self.embed.buffer, dtype: self.embed.dtype, vocab: cfg.vocab },
             cfg.hidden,
             &resid.buffer,
         )?;
@@ -258,8 +258,7 @@ impl Qwen35Model {
         let n = tu - 1;
         let rows: Vec<u32> = (0..n as u32).collect();
         let targets = &ids[1..];
-        let embed = Tensor::from_buffer(rt, self.embed.clone(), &[cfg.vocab as usize, h], DType::BF16, 0)?;
-        let ce_ws = CeWorkspace::new(rt, n as u32, cfg.hidden, CE_CHUNK.min(cfg.vocab), DType::BF16)?;
+        let ce_ws = CeWorkspace::new(rt, n as u32, cfg.hidden, CE_CHUNK.min(cfg.vocab), self.embed.dtype)?;
         let d_embed = tensor(rt, &[cfg.vocab as usize, h])?;
         let dxf = tensor(rt, &[tu, h])?;
         // The last position predicts nothing: its gradient row stays zero.
@@ -267,7 +266,7 @@ impl Qwen35Model {
         let out = cross_entropy_rows(
             rt,
             CeHidden { rows: &xf, off: 0 },
-            &embed,
+            &self.embed,
             &rows,
             targets,
             Reduction::Mean,

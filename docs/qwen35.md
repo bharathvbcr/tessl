@@ -50,7 +50,7 @@ that fusion for Metal.
 | 6d. Prefill attention on the matrix units | `qwen35_attn_tiled_h256_*` (4 tiles) | `attn_prefill`, `attn_prefill_with_tile` | causal `sdpa` over the layer's own K/V; `nn::flash_attn_rows` with both products on TensorOps |
 | 6e. MLP activation | `qwen35_swiglu_{f32,bf16}` | `swiglu` | `act_fn(gate_proj(x)) * up_proj(x)` in `Qwen3_5MLP`, stored as bf16 for `down_proj` |
 | 7. Score only the answer rows | `qwen35_score_rows_{f32,bf16}` | `score_answer_rows` | final norm + `lm_head`, restricted to the answer tokens |
-| 7b. Embedding gather | `qwen35_embed_rows_bf16` | `embed_rows` | `embed_tokens(ids)` from the bf16 table, on the device, so a forward needs no host gather |
+| 7b. Embedding gather | `qwen35_embed_rows_{bf16,f32}` | `embed_rows` | `embed_tokens(ids)` from the bf16 (or, in the f32 model, f32) table, on the device, so a forward needs no host gather |
 | 8. Fused projections | tessl's GEMM | `pack_linear_weights_*`, `fused_projection`, `project_residual` | `in_proj_qkv/z/b/a`, `q/k/v_proj`, `out_proj` + residual |
 
 ### Layout: everything reads the fused projection in place
@@ -412,7 +412,7 @@ measured against f64:
 | output gate f32 / bf16 / in place | 1.2e-7 / exact / 1.2e-7 | — |
 | SwiGLU f32 / bf16 (`Qwen3_5MLP.act_fn`), gate and up as windows of one row, gates to ±120 | 1e-6 + 1e-6·\|x\| (max 1.5e-5 at \|x\| ~ 10³) / within one bf16 rounding | — |
 | scoring f32 / bf16; a bad slot or answer → NaN, the rest intact | 6.9e-7 / 5.5e-7 | — |
-| embedding gather, bf16 table; a bad id → NaN row, the rest intact | exact | — |
+| embedding gather, bf16 and f32 tables; a bad id → NaN row, the rest intact | exact (bits) | — |
 | Q/K norm + RoPE with `slot_base`: absolute RoPE, relative slot | bit-identical to slot_base 0 | — |
 | shared-prefix attention, 8 query / 2 KV heads of 256; P = 0, 1, 30 (no suffix), 65 | bit-identical to `flash_attn_rows` on a copied prefix; ≤ 5.0e-7 vs torch | — |
 | shared-prefix decode, P = 5, 128 (chunk edge), 120 with a chunk straddling the suffix | ≤ 3.4e-7 vs torch | — |
@@ -737,10 +737,16 @@ linear weight as its `[in, out]` window of the packed projection) and copies
 them between the model and caller tensors on the GPU. The C ABI (version 5)
 adds a model handle (`tessl_qwen35_load`, `_train_step`, `_param_count`,
 `_param_info`, `_copy`, `_free`), and `tessl_torch.Qwen35` wraps it (see
-`python/README.md`). Writing the tied embedding rounds it to the bf16 table
-and rebuilds the f32 LM head from the rounded table, so the training step
-and the inference forward stay on the same model; torch holds the f32
-master copy. `tests/qwen35_params.rs`, `tests/capi.rs` and
+`python/README.md`). In `Precision::F32` the tied embedding is one f32
+`[vocab, hidden]` table: the gather reads it by row
+(`qwen35_embed_rows_f32`), the training step's cross-entropy as its weight,
+and the inference forward's head as the transposed operand of one NT GEMM,
+so a write is exact and moves all three. (It was a bf16 gather table plus an
+f32 `[hidden, vocab]` head, 1 GB more, and a write had to round.) The bf16
+forward keeps its packed `[hidden, vocab]` head beside the table: an NN GEMM
+over it measured 0.035-0.038 ms per row against 0.047 for the NT GEMM over
+the table (`bench_qwen35_layers`, 1024 rows, two runs each), and its logits
+are unchanged (the parity numbers above re-ran identical). `tests/qwen35_params.rs`, `tests/capi.rs` and
 `python/tests/test_qwen35.py` check that the values are the checkpoint's,
 that the gradients are transformers' autograd's (the Python test computes its
 own oracle), that a byte offset is honoured, that a bad tensor stops a write

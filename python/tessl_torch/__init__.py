@@ -589,7 +589,7 @@ class Qwen35:
     running the optimizer.
 
         model = tessl_torch.Qwen35(safetensors_path, config_json_path)
-        params = model.parameters()            # f32 master copy, on MPS
+        params = model.parameters()            # an f32 copy, on MPS
         opt = torch.optim.AdamW(params.values(), lr=1e-5)
         loss = model.train_step(ids)           # tessl: loss and every gradient
         for name, g in model.grads().items():
@@ -602,10 +602,8 @@ class Qwen35:
     and values (the zero-centred norms as ``w``, not tessl's stored
     ``1 + w``). Linear weights come back as transposed views of ``[in, out]``
     tensors, which is how tessl lays them out; ``load_parameters`` accepts
-    any layout. The model runs in f32, except that the tied embedding is
-    stored as a bf16 table: ``load_parameters`` rounds it, so keep the f32
-    master copy in torch (as above) and write it back after every update, or
-    small embedding updates are lost to that rounding.
+    any layout. The model runs entirely in f32, the tied embedding included,
+    so ``load_parameters`` is exact.
 
     The handle belongs to the thread that made it, like every tessl call.
     Each call synchronizes torch's MPS stream first and returns after tessl's

@@ -3697,14 +3697,47 @@ fn embed_rows_equals_the_host_gather_bit_for_bit() {
         qwen35::embed_rows(rt, &idb, 0, head, hidden as u32, &untouched).unwrap();
         rt.synchronize().unwrap();
         assert!(untouched.read_f32().iter().all(|&x| x == SENTINEL));
+        // An f32 table (the f32 model's) is gathered as bits: every value,
+        // including a NaN payload, -0 and a subnormal, comes back unchanged.
+        let mut wide = random_f32(vocab * hidden, 7901);
+        wide[17 * hidden] = f32::from_bits(0x7fc0_1234);
+        wide[17 * hidden + 1] = -0.0;
+        wide[523 * hidden + 2] = f32::from_bits(1);
+        let wide_table = rt.alloc_buffer(wide.len() * 4).unwrap();
+        wide_table.write_f32(&wide);
+        let f32_head = LmHead { weight: &wide_table, dtype: DType::F32, vocab: vocab as u32 };
+        let out32 = seeded(rt, n * hidden, SENTINEL);
+        qwen35::embed_rows(rt, &idb, n as u32, f32_head, hidden as u32, &out32).unwrap();
+        rt.synchronize().unwrap();
+        let got32 = out32.read_f32();
+        for (r, &id) in ids.iter().enumerate() {
+            let row = &got32[r * hidden..(r + 1) * hidden];
+            if bad.contains(&id) {
+                assert!(row.iter().all(|x| x.is_nan()), "f32 row {r}: id {id} is not NaN");
+                continue;
+            }
+            let want = &wide[id as usize * hidden..(id as usize + 1) * hidden];
+            for (c, (g, w)) in row.iter().zip(want).enumerate() {
+                assert_eq!(g.to_bits(), w.to_bits(), "f32 row {r} (id {id}) col {c}");
+            }
+        }
         // Rejections, each by its own message.
-        let f32_head = LmHead {
+        let f16_head = LmHead {
+            dtype: DType::F16,
+            ..head
+        };
+        expect_err(
+            qwen35::embed_rows(rt, &idb, n as u32, f16_head, hidden as u32, &out),
+            "bf16 and f32 tables are compiled",
+        );
+        // The bf16 table's bytes are half an f32 table's.
+        let f32_over_bf16 = LmHead {
             dtype: DType::F32,
             ..head
         };
         expect_err(
-            qwen35::embed_rows(rt, &idb, n as u32, f32_head, hidden as u32, &out),
-            "only a bf16 table is compiled",
+            qwen35::embed_rows(rt, &idb, n as u32, f32_over_bf16, hidden as u32, &out),
+            "embed_rows table",
         );
         let short = LmHead {
             vocab: vocab as u32 + 1,

@@ -2765,17 +2765,20 @@ pub fn embed_rows(
     out: &GpuBuffer,
 ) -> Result<(), String> {
     const WHAT: &str = "qwen35::embed_rows";
-    if table.dtype != DType::BF16 {
-        return Err(format!(
-            "{WHAT}: only a bf16 table is compiled, got {:?}",
-            table.dtype
-        ));
-    }
+    let kernel = match table.dtype {
+        DType::BF16 => "qwen35_embed_rows_bf16",
+        DType::F32 => "qwen35_embed_rows_f32",
+        d => return Err(format!("{WHAT}: bf16 and f32 tables are compiled, got {d:?}")),
+    };
     if table.vocab == 0 || hidden == 0 {
         return Err(format!("{WHAT}: vocab and hidden must be non-zero"));
     }
     let table_elems = usize_product(&[table.vocab as usize, hidden as usize], WHAT)?;
-    require::<u16>(rt, table.weight, table_elems, "embed_rows table")?;
+    if table.dtype == DType::BF16 {
+        require::<u16>(rt, table.weight, table_elems, "embed_rows table")?;
+    } else {
+        require::<f32>(rt, table.weight, table_elems, "embed_rows table")?;
+    }
     require::<u32>(rt, ids, n as usize, "embed_rows ids")?;
     require::<f32>(
         rt,
@@ -2791,7 +2794,7 @@ pub fn embed_rows(
         &[("out", out)],
         &[("ids", ids), ("table", table.weight)],
     )?;
-    let p = rt.pipeline("qwen35_embed_rows_bf16")?;
+    let p = rt.pipeline(kernel)?;
     dispatch_2d(rt, &p, hidden as usize, n as usize, |bnd| {
         set_gpu_buf(bnd, ids, 0);
         set_gpu_buf(bnd, table.weight, 1);

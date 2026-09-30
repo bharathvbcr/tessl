@@ -100,14 +100,11 @@ class Qwen35Training(unittest.TestCase):
         opt.step()
         m.load_parameters(params)
         loss = m.train_step(self.ids)
-        # transformers with the same values; tessl holds the embedding as
-        # bf16, so the reference gets the rounded table.
+        # transformers with the same values, the embedding included (tessl's
+        # table is f32, so nothing is rounded on the way in).
         with torch.no_grad():
             for name, p in ref.named_parameters():
-                v = params[name[len("model."):]].cpu()
-                if name == "model.embed_tokens.weight":
-                    v = v.to(torch.bfloat16).float()
-                p.copy_(v)
+                p.copy_(params[name[len("model."):]].cpu())
         want_loss, want = torch_step(ref, self.ids)
         self.assertLessEqual(abs(loss - want_loss) / abs(want_loss), 1e-5)
         got = m.grads()
@@ -115,9 +112,8 @@ class Qwen35Training(unittest.TestCase):
         # And the parameters read back are what was written.
         back = m.parameters()
         for name, p in params.items():
-            want_p = p.to(torch.bfloat16).float() if name == "embed_tokens.weight" else p
             tol = 2.0 ** -22 if name.endswith("layernorm.weight") or name == "norm.weight" else 0.0
-            self.assertLessEqual((back[name] - want_p).abs().max().item(), tol, name)
+            self.assertLessEqual((back[name] - p).abs().max().item(), tol, name)
 
     def test_refusals(self):
         m = self.model()

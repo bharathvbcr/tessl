@@ -182,3 +182,23 @@ kernel void qwen35_embed_rows_bf16(
     const uint bits = (uint)table[(ulong)(ok ? id : 0u) * hidden + col] << 16;
     ((device uint *)out)[(ulong)r * hidden + col] = ok ? bits : SCORE_NAN_BITS;
 }
+
+/// The same gather from an f32 table (the f32 model's tied embedding),
+/// copied as bits so fast math has nothing to fold.
+kernel void qwen35_embed_rows_f32(
+    device const uint *ids [[buffer(0)]],
+    device const uint *table [[buffer(1)]],
+    device float *out [[buffer(2)]],
+    constant uint &n [[buffer(3)]],
+    constant uint &hidden [[buffer(4)]],
+    constant uint &vocab [[buffer(5)]],
+    uint2 gid [[thread_position_in_grid]])
+{
+    const uint col = gid.x;
+    const uint r = gid.y;
+    if (col >= hidden || r >= n) return;
+    const uint id = ids[r];
+    const bool ok = id < vocab;
+    const uint bits = table[(ulong)(ok ? id : 0u) * hidden + col];
+    ((device uint *)out)[(ulong)r * hidden + col] = ok ? bits : SCORE_NAN_BITS;
+}

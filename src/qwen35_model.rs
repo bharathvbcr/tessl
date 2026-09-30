@@ -38,7 +38,7 @@
 
 use std::sync::Arc;
 
-use crate::gemm::{gemm, GemmBackend};
+use crate::gemm::{gemm, gemm_nt_f32, GemmBackend};
 use crate::json::{self, Json, Syntax};
 use crate::nn::{self, AttnDims};
 use crate::qwen35::{
@@ -366,11 +366,15 @@ pub struct Qwen35Model {
     pub(crate) cfg: Qwen35Config,
     pub(crate) precision: Precision,
     pub(crate) rt: Arc<GpuRuntime>,
-    /// `[vocab, hidden]` bf16: the embedding gather's table.
-    pub(crate) embed: GpuBuffer,
-    /// `[hidden, vocab]` in the forward's precision: the tied LM head, as the
-    /// right operand of one GEMM.
-    pub(crate) lm_head: Tensor,
+    /// `[vocab, hidden]` in the forward's precision: the tied embedding (the
+    /// gather's table; in f32 also the head GEMM's transposed operand, and
+    /// what training reads and writes).
+    pub(crate) embed: Tensor,
+    /// Bf16 only: the tied head packed `[hidden, vocab]` for an NN GEMM,
+    /// which measured 25% faster than the NT GEMM over `embed` at the 2B's
+    /// head (0.037 against 0.047 ms per row, `bench_qwen35_layers`). The
+    /// bf16 model is not trained, so the two copies never diverge.
+    pub(crate) lm_head_bf16: Option<Tensor>,
     pub(crate) final_norm: GpuBuffer,
     pub(crate) layers: Vec<Layer>,
 }
@@ -475,33 +479,29 @@ impl Qwen35Model {
         let ld = Loader { st, prefix, rt };
         let (h, inter, vocab) = (cfg.hidden as usize, cfg.intermediate as usize, cfg.vocab as usize);
 
-        // Embedding (bf16 table for the gather) and the tied LM head.
-        let name = ld.name("embed_tokens.weight");
-        let (shape, embed_bits) = st.read_bf16_bits(&name)?;
-        if shape != [vocab, h] {
-            return Err(format!("{name}: shape {shape:?}, expected [{vocab}, {h}]"));
-        }
-        let embed = rt.alloc_buffer(embed_bits.len() * 2)?;
-        embed.write_bf16_bits(&embed_bits);
-        let lm_head = match precision {
+        // The tied embedding: one [vocab, hidden] table in the model's
+        // precision, which the gather reads by row and the LM head as the
+        // transposed right operand of one GEMM.
+        let (embed, lm_head_bf16) = match precision {
             Precision::Bf16 => {
-                let packed = qwen35::pack_linear_weights_bf16(&[&embed_bits], &[vocab], h)?;
-                let t = rt.alloc_tensor_bf16(&[h, vocab])?;
-                t.buffer.write_bf16_bits(&packed);
-                t
+                let name = ld.name("embed_tokens.weight");
+                let (shape, bits) = st.read_bf16_bits(&name)?;
+                if shape != [vocab, h] {
+                    return Err(format!("{name}: shape {shape:?}, expected [{vocab}, {h}]"));
+                }
+                let t = rt.alloc_tensor_bf16(&[vocab, h])?;
+                t.buffer.write_bf16_bits(&bits);
+                let packed = qwen35::pack_linear_weights_bf16(&[&bits], &[vocab], h)?;
+                let head = rt.alloc_tensor_bf16(&[h, vocab])?;
+                head.buffer.write_bf16_bits(&packed);
+                (t, Some(head))
             }
             Precision::F32 => {
-                let wide: Vec<f32> = embed_bits
-                    .iter()
-                    .map(|&b| crate::tensor::bf16_bits_to_f32(b))
-                    .collect();
-                let packed = qwen35::pack_linear_weights_f32(&[&wide], &[vocab], h)?;
-                let t = rt.alloc_tensor_f32(&[h, vocab])?;
-                t.buffer.write_f32(&packed);
-                t
+                let t = rt.alloc_tensor_f32(&[vocab, h])?;
+                t.buffer.write_f32(&ld.f32("embed_tokens.weight", &[vocab, h])?);
+                (t, None)
             }
         };
-        drop(embed_bits);
         let final_norm = ld.norm_plus_one("norm.weight", h)?;
 
         let (g, a) = (cfg.gdn, cfg.attn);
@@ -575,7 +575,7 @@ impl Qwen35Model {
             precision,
             rt: Arc::clone(rt),
             embed,
-            lm_head,
+            lm_head_bf16,
             final_norm,
             layers,
         })
@@ -618,8 +618,8 @@ impl Qwen35Model {
             &id_buf,
             t,
             LmHead {
-                weight: &self.embed,
-                dtype: DType::BF16,
+                weight: &self.embed.buffer,
+                dtype: self.embed.dtype,
                 vocab: cfg.vocab,
             },
             cfg.hidden,
@@ -641,7 +641,11 @@ impl Qwen35Model {
             }
         }
         self.norm(&a.resid, &self.final_norm, &a.x)?;
-        gemm(&a.x, &self.lm_head, &a.logits, BACKEND)?;
+        // The tied head: logits = x @ embed^T.
+        match &self.lm_head_bf16 {
+            Some(head) => gemm(&a.x, head, &a.logits, BACKEND)?,
+            None => gemm_nt_f32(&a.x, &self.embed, &a.logits, BACKEND)?,
+        }
         rt.synchronize()?;
         if trace {
             out_trace.push(read_rows(&a.x, self.precision)?);

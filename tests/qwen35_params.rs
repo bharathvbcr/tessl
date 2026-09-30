@@ -135,14 +135,14 @@ fn a_write_round_trips_and_moves_both_forwards_together() {
     model.read_parameters(&back).unwrap();
     for ((p, s), b) in table.iter().zip(&stepped).zip(&back) {
         let (s, b) = (s.read_f32().unwrap(), b.read_f32().unwrap());
-        let want: Vec<f32> = if p.name == "embed_tokens.weight" { common::round_trip_bf16(&s) } else { s };
+        // Exact, the embedding included: its table is f32.
         let tol = if p.name.ends_with("layernorm.weight") || p.name == "norm.weight" { 2f32.powi(-22) } else { 0.0 };
-        for (i, (x, y)) in b.iter().zip(&want).enumerate() {
+        for (i, (x, y)) in b.iter().zip(&s).enumerate() {
             assert!((x - y).abs() <= tol, "{}[{i}]: read back {x}, wrote {y}", p.name);
         }
     }
     // Loss decreases along the negative gradient, and the training step and
-    // the inference forward (which reads the rebuilt LM head) agree.
+    // the inference forward (whose head reads the same table) agree.
     let after = model.train_step(&ids).unwrap();
     assert!(after.loss < before.loss, "loss {} -> {}", before.loss, after.loss);
     let infer = inference_loss(&model, &ids);

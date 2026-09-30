@@ -576,6 +576,17 @@ def case_embed_rows(seed):
     print(f"  [{'ok  ' if ok else 'FAIL'}] embed_rows_bf16: exact gather, bad ids NaN")
     if not ok:
         FAILURES.append("embed_rows_bf16")
+    # The f32 table: the same gather, as bits.
+    wide = torch.randn(vocab, hidden, generator=g)
+    wide[7, 0] = -0.0
+    out = run("qwen35_embed_rows_f32", dict(n=len(ids), hidden=hidden, vocab=vocab),
+              {"ids": ids, "table": wide.view(torch.int32)}, {"out": ("f32", len(ids) * hidden)})["out"]
+    out = out.reshape(len(ids), hidden)
+    want = wide[ids[good].long()]
+    ok = torch.equal(out[good].view(torch.int32), want.view(torch.int32)) and bool(torch.isnan(out[~good]).all())
+    print(f"  [{'ok  ' if ok else 'FAIL'}] embed_rows_f32: exact gather, bad ids NaN")
+    if not ok:
+        FAILURES.append("embed_rows_f32")
 
 
 def case_prefix_varlen(seed, decode):

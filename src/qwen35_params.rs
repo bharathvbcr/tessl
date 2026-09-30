@@ -12,20 +12,15 @@
 //! - The linear layers live packed side by side as `[in, sum(out)]` right
 //!   operands; each reads and writes as its own `[in, out]` window, the
 //!   transpose of transformers' `[out, in]` ([`ParamInfo::transposed`]).
-//! - The tied embedding is a bf16 gather table plus the f32 `[hidden, vocab]`
-//!   LM head. It reads as the table widened to f32; a write rounds to bf16
-//!   and rebuilds the LM head from the rounded table, so the training step
-//!   (which reads the table) and the inference forward (which reads the head)
-//!   keep computing the same model. A caller that trains the embedding keeps
-//!   its f32 master copy and writes it back after each update; updates
-//!   smaller than bf16's resolution then accumulate in the master copy.
+//! - The tied embedding is one f32 `[vocab, hidden]` table, read by the
+//!   gather, the training step's cross-entropy and the inference forward's
+//!   head alike, so a write is exact and moves all three.
 //!
 //! Gradients come in the same layouts (the gradient of `1 + w` is that of
 //! `w`). Every copy is a GPU dispatch, since a caller's buffers may be
 //! GPU-private; only the norms' `1 + w` shift runs on the host, on tessl's
 //! own (shared) buffers.
 
-use crate::gemm::{cast_bf16_to_f32_into, cast_f32_to_bf16_into, transpose_f32_into};
 use crate::qwen35::Cols;
 use crate::qwen35_bwd::copy_cols;
 use crate::qwen35_model::{Mixer, Precision, Qwen35Model};
@@ -58,8 +53,6 @@ impl ParamInfo {
 /// Where a value lives in tessl.
 #[derive(Clone, Copy)]
 enum Src<'a> {
-    /// The bf16 table (with the LM head rebuilt on a write).
-    Embed,
     /// A 1-D f32 buffer stored as `1 + w`.
     OnePlus(&'a GpuBuffer),
     /// An f32 buffer holding exactly the value.
@@ -99,7 +92,7 @@ fn slots<'a>(m: &'a Qwen35Model, grads: Option<&'a Qwen35Grads>) -> Result<Vec<S
         }
     }
     let mut out = vec![
-        Slot { info: info("embed_tokens.weight".into(), &[vocab, h], false), param: Src::Embed, grad: grads.map(|g| Src::Dense(&g.embed)) },
+        Slot { info: info("embed_tokens.weight".into(), &[vocab, h], false), param: Src::Dense(&m.embed), grad: grads.map(|g| Src::Dense(&g.embed)) },
     ];
     for (l, layer) in m.layers.iter().enumerate() {
         let lg = grads.map(|g| &g.layers[l]);
@@ -218,11 +211,6 @@ impl Qwen35Model {
         Ok(())
     }
 
-    fn embed_table(&self) -> Result<Tensor, String> {
-        let (v, h) = (self.cfg.vocab as usize, self.cfg.hidden as usize);
-        Tensor::from_buffer(&self.rt, self.embed.clone(), &[v, h], DType::BF16, 0)
-    }
-
     /// Every parameter, in the order the copies take their tensors.
     pub fn parameter_table(&self) -> Result<Vec<ParamInfo>, String> {
         Ok(slots(self, None)?.into_iter().map(|s| s.info).collect())
@@ -298,7 +286,6 @@ impl Qwen35Model {
 
     fn read_one(&self, from: Src<'_>, info: &ParamInfo, dst: &Tensor) -> Result<(), String> {
         match from {
-            Src::Embed => cast_bf16_to_f32_into(&self.embed_table()?, dst),
             Src::Raw(b) => gpu_copy(&self.as_tensor(b, info)?, dst),
             Src::Dense(t) => gpu_copy(t, dst),
             Src::Packed(t, off) => self.packed_copy(t, off, info.shape[1], info.shape[0], dst, true),
@@ -314,14 +301,7 @@ impl Qwen35Model {
 
     fn write_one(&self, to: Src<'_>, info: &ParamInfo, src: &Tensor) -> Result<(), String> {
         match to {
-            Src::Embed => {
-                let table = self.embed_table()?;
-                cast_f32_to_bf16_into(src, &table)?;
-                // The head is the transpose of the rounded table, not of `src`.
-                let wide = self.rt.alloc_tensor_f32(&info.shape)?;
-                cast_bf16_to_f32_into(&table, &wide)?;
-                transpose_f32_into(&wide, &self.lm_head)
-            }
+            Src::Dense(t) => gpu_copy(src, t),
             Src::Raw(b) => gpu_copy(src, &self.as_tensor(b, info)?),
             Src::Packed(t, off) => self.packed_copy(t, off, info.shape[1], info.shape[0], src, false),
             Src::OnePlus(b) => {
@@ -336,7 +316,6 @@ impl Qwen35Model {
                 b.write_f32(&all);
                 Ok(())
             }
-            Src::Dense(_) => Err("a gradient is not a parameter".into()),
         }
     }
 }

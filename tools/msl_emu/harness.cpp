@@ -10,11 +10,16 @@
 // different program.
 #include <metal_stdlib>
 
+// Inside msl_emu_kernels, so an unqualified `exp` in a kernel is metal's and not
+// also the host library's global one (see the end of metal_stdlib). The kernels'
+// own `#include <metal_stdlib>` is a no-op here, already included above.
+namespace msl_emu_kernels {
 #include "qwen35_attn.cpp"
 #include "qwen35_gdn.cpp"
 #include "qwen35_mlp.cpp"
 #include "qwen35_score.cpp"
 #include "flash_attn_rows.cpp"
+} // namespace msl_emu_kernels
 
 #include <algorithm>
 #include <csignal>
@@ -26,6 +31,7 @@
 #include <vector>
 
 using namespace metal;
+using namespace msl_emu_kernels;
 using metal::emu::Ids;
 using metal::emu::launch;
 

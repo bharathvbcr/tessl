@@ -451,6 +451,40 @@ inline void simdgroup_multiply(simdgroup_matrix<T, 8, 8> &d, const simdgroup_mat
 
 } // namespace metal
 
+// The fast-math `exp`/`log`/`pow`/`sin`/`cos` above are functions of their own,
+// distinct from the host library's, but C++'s <math.h> also declares float
+// overloads of those names in the global namespace — libc++ always does (so on
+// a Mac), glibc with libstdc++ does not (so on Linux). A kernel's `using
+// namespace metal;` makes metal's overloads visible *as if declared globally*,
+// where `exp(float)` then has two exact matches and the call is ambiguous.
+//
+// So the kernel sources are compiled inside `msl_emu_kernels` (harness.cpp
+// includes them there), whose using-declarations are found before global scope
+// and end the lookup: an unqualified `exp` is metal's, as on a GPU, where it is
+// the only one there is.
+//
+// The global declarations are made here on every host, so a libstdc++ build
+// meets the same overload set as a libc++ one and breaks the same way: without
+// them this class of break passes Linux CI and fails only on a Mac.
+using std::cos;
+using std::exp;
+using std::log;
+using std::pow;
+using std::sin;
+
+namespace msl_emu_kernels {
+using metal::cos;
+using metal::exp;
+using metal::log;
+using metal::pow;
+using metal::sin;
+// An ambiguity would not compile; this catches the quiet way out of one, a
+// `using std::exp` in metal, which compiles and drops the MSL_EMU_ULP
+// perturbation --fast-math depends on.
+static_assert(static_cast<float (*)(float)>(exp) != static_cast<float (*)(float)>(std::exp),
+              "a kernel's unqualified exp must be metal's fast-math exp, not the host's");
+} // namespace msl_emu_kernels
+
 using metal::bfloat;
 
 // Address-space and function qualifiers vanish; `[[attributes]]` are stripped

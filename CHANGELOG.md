@@ -181,6 +181,12 @@ All notable changes to `tessl` are recorded here. The format follows
 
 ### Fixed
 
+- `tools/msl_emu` builds on macOS again: since the fast-math `exp`/`log`
+  became the shim's own functions, libc++'s global float overloads made every
+  unqualified kernel call ambiguous (Linux's libstdc++ declares none). Kernels
+  now compile inside a namespace that resolves them to metal's, and the shim
+  declares the global overloads on every host so Linux CI sees this class of
+  break too.
 - Host mappings of a GPU-private buffer are refused instead of building a
   slice over the null `contents()`.
 - Two wraps of one `MTLBuffer` are one allocation: overlap checks compare the

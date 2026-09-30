@@ -74,6 +74,7 @@
 //! | [`ops`] | Elementwise helpers that are not part of a larger kernel family |
 //! | `mtl_tensor` | Quantized `MTLTensor` prep, behind the `quant-prep` feature |
 //! | [`ab_flags`], [`infer_trace`], [`icb_smoke`], [`npy`] | Tuning switches, tracing, smoke tests, and `.npy` I/O for benchmark parity |
+//! | [`safetensors`] | A strict `.safetensors` reader, to load checkpoints straight from the Hugging Face cache |
 //!
 //! # Encode model
 //!
@@ -206,6 +207,7 @@ pub mod npy;
 pub mod ops;
 pub mod qwen35;
 pub mod runtime;
+pub mod safetensors;
 pub mod tensor;
 
 pub use cb_replay::{

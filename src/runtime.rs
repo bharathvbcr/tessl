@@ -66,9 +66,9 @@ pub enum BufferKind {
     /// dropped and the CB that used it has completed.
     Bump,
     /// Caller-owned `MTLBuffer` wrapped via [`crate::Tensor::from_mtl_buffer`].
-    /// Stays resident while the handle lives; on drop, residency is removed
-    /// after in-flight work (same schedule as [`Self::Hot`]) but the buffer is
-    /// never returned to the Cold freelist.
+    /// Stays resident while any wrap of the same `MTLBuffer` lives; after the
+    /// last one drops, residency is removed once in-flight work completes
+    /// (same schedule as [`Self::Hot`]). Never returned to the Cold freelist.
     External,
 }
 
@@ -440,6 +440,12 @@ pub struct GpuRuntime {
     pending_cold_recycle: Mutex<Vec<PendingRecycle>>,
     /// Hot buffers whose last Arc dropped; removed from residency after CB wait.
     pending_retirement: Mutex<Vec<PendingRetirement>>,
+    /// Live [`BufferKind::External`] wraps per `MTLBuffer` (keyed by its
+    /// address). Residency is per buffer and wraps are per call, so the buffer
+    /// joins the set with its first wrap and leaves it after its last.
+    external_wraps: Mutex<HashMap<usize, usize>>,
+    /// External wraps dropped since the last drain; released after CB wait.
+    pending_external_release: Mutex<Vec<PendingRetirement>>,
     /// Bounded Hot params workspace for stable scalar binds (pos-buffer style).
     params: Mutex<Option<ParamsBuffer>>,
     /// Self weak handle so Drop on pooled buffers can schedule recycle.
@@ -596,6 +602,8 @@ impl GpuRuntime {
             residency_dirty: Mutex::new(false),
             pending_cold_recycle: Mutex::new(Vec::new()),
             pending_retirement: Mutex::new(Vec::new()),
+            external_wraps: Mutex::new(HashMap::new()),
+            pending_external_release: Mutex::new(Vec::new()),
             params: Mutex::new(None),
             self_weak: Mutex::new(Weak::new()),
             memory_info: Mutex::new(mem_info),
@@ -758,6 +766,26 @@ impl GpuRuntime {
     ///
     /// Hot storage never enters the freelist, but must leave the residency set
     /// when its final handle drops.
+    /// Count a new wrap of a caller-owned buffer, adding it to the residency
+    /// set if it is the first live one.
+    pub(crate) fn retain_external(&self, buffer: &ProtocolObject<dyn MTLBuffer>) {
+        let key = buffer as *const ProtocolObject<dyn MTLBuffer> as *const () as usize;
+        let mut wraps = self.external_wraps.lock().unwrap_or_else(|p| p.into_inner());
+        let n = wraps.entry(key).or_insert(0);
+        *n += 1;
+        if *n == 1 {
+            self.register_residency(buffer);
+        }
+    }
+
+    /// A wrap of a caller-owned buffer dropped; its count falls after the GPU
+    /// has caught up, and the last one removes it from residency.
+    pub(crate) fn schedule_external_release(&self, buffer: Retained<ProtocolObject<dyn MTLBuffer>>) {
+        if let Ok(mut q) = self.pending_external_release.lock() {
+            q.push(buffer);
+        }
+    }
+
     pub(crate) fn schedule_hot_retirement(&self, buffer: Retained<ProtocolObject<dyn MTLBuffer>>) {
         if let Ok(mut q) = self.pending_retirement.lock() {
             q.push(buffer);
@@ -777,8 +805,29 @@ impl GpuRuntime {
         } else {
             Vec::new()
         };
-        if cold.is_empty() && retired.is_empty() {
+        let released = if let Ok(mut q) = self.pending_external_release.lock() {
+            std::mem::take(&mut *q)
+        } else {
+            Vec::new()
+        };
+        if cold.is_empty() && retired.is_empty() && released.is_empty() {
             return;
+        }
+        {
+            let mut wraps = self.external_wraps.lock().unwrap_or_else(|p| p.into_inner());
+            for buf in &released {
+                let key = &**buf as *const ProtocolObject<dyn MTLBuffer> as *const () as usize;
+                match wraps.get_mut(&key) {
+                    Some(n) if *n > 1 => *n -= 1,
+                    Some(_) => {
+                        wraps.remove(&key);
+                        self.unregister_residency(buf);
+                    }
+                    // Counted at every successful wrap, so a release always
+                    // has an entry; unregistering is still the safe side.
+                    None => self.unregister_residency(buf),
+                }
+            }
         }
         for (buf, _nbytes) in &cold {
             self.unregister_residency(buf);

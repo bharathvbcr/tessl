@@ -91,7 +91,8 @@ impl Drop for PooledBuffer {
         // residency once its final logical owner disappears.
         let buffer = self.buffer.clone();
         match self.kind {
-            BufferKind::Hot | BufferKind::External => rt.schedule_hot_retirement(buffer),
+            BufferKind::Hot => rt.schedule_hot_retirement(buffer),
+            BufferKind::External => rt.schedule_external_release(buffer),
             BufferKind::Cold | BufferKind::Bump => rt.schedule_cold_recycle(buffer, self.nbytes),
         }
     }
@@ -163,9 +164,11 @@ impl GpuBuffer {
     /// Whether two handles name the same Metal allocation.
     ///
     /// `GpuBuffer` has no subrange metadata, so sharing the allocation means
-    /// their complete logical regions overlap.
+    /// their complete logical regions overlap. Identity is the `MTLBuffer`
+    /// object, not the wrapper: two [`Tensor::from_mtl_buffer`] wraps of one
+    /// buffer are two wrappers over the same memory.
     pub(crate) fn aliases(&self, other: &GpuBuffer) -> bool {
-        Arc::ptr_eq(&self.inner, &other.inner)
+        std::ptr::eq(self.metal(), other.metal())
     }
 
     fn map_host<T>(&self) -> Result<HostMapping<'_, T>, String> {
@@ -539,7 +542,7 @@ impl Tensor {
         // at the next drain.
         check_view_bounds(nbytes, shape, dtype, byte_offset)?;
         let weak = runtime.weak_self();
-        runtime.register_residency(&buffer);
+        runtime.retain_external(&buffer);
         #[allow(clippy::arc_with_non_send_sync)]
         let gpu_buf = GpuBuffer {
             inner: Arc::new(PooledBuffer {
@@ -599,7 +602,7 @@ impl Tensor {
     }
 
     pub(crate) fn overlaps(&self, other: &Tensor) -> bool {
-        Arc::ptr_eq(&self.buffer.inner, &other.buffer.inner)
+        self.buffer.aliases(&other.buffer)
             && self.byte_offset < other.byte_offset + other.nbytes_logical()
             && other.byte_offset < self.byte_offset + self.nbytes_logical()
     }
@@ -630,7 +633,7 @@ pub fn gpu_copy(src: &Tensor, dst: &Tensor) -> Result<(), String> {
     if src.numel() > u32::MAX as usize {
         return Err("copy exceeds 32-bit kernel indexing".into());
     }
-    if Arc::ptr_eq(&src.buffer.inner, &dst.buffer.inner) && src.byte_offset == dst.byte_offset {
+    if src.buffer.aliases(&dst.buffer) && src.byte_offset == dst.byte_offset {
         return Ok(());
     }
     if src.overlaps(dst) {
@@ -858,6 +861,36 @@ mod audit_tests {
             "the live wrap's buffer was removed from the residency set"
         );
         drop(live);
+    }
+
+    /// Residency is per `MTLBuffer`, wraps are per call: a binding wraps the
+    /// same torch storage again on every step. Dropping one wrap must not
+    /// evict the buffer from under another that is still live, and dropping
+    /// the last one must evict it.
+    #[test]
+    fn residency_outlives_every_wrap_but_the_last() {
+        use objc2_metal::{MTLDevice, MTLResidencySet, MTLResourceOptions};
+        let rt = GpuRuntime::new().unwrap();
+        let raw = rt
+            .device
+            .newBufferWithLength_options(16, MTLResourceOptions::StorageModeShared)
+            .unwrap();
+        let alloc = ProtocolObject::<dyn objc2_metal::MTLAllocation>::from_ref(&*raw);
+        // SAFETY: a fresh buffer only this test and this runtime touch.
+        let first = unsafe { Tensor::from_mtl_buffer(&rt, raw.clone(), &[4], DType::F32, 0) }.unwrap();
+        let second = unsafe { Tensor::from_mtl_buffer(&rt, raw.clone(), &[2], DType::F32, 8) }.unwrap();
+        drop(first);
+        rt.synchronize().unwrap();
+        assert!(
+            rt.metal4.residency.containsAllocation(alloc),
+            "dropping one wrap evicted the buffer from under a live one"
+        );
+        drop(second);
+        rt.synchronize().unwrap();
+        assert!(
+            !rt.metal4.residency.containsAllocation(alloc),
+            "the last wrap dropped but the buffer stayed resident"
+        );
     }
 
     #[test]

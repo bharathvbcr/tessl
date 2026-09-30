@@ -123,3 +123,31 @@ fn a_wrapped_private_buffer_refuses_host_access_but_serves_the_gpu() {
         assert_eq!(back.buffer.read_f32(), want.buffer.read_f32());
     });
 }
+
+/// Two wraps of one `MTLBuffer` are the same memory. Aliasing checks compared
+/// the wrappers, so separately wrapped views of one torch storage (which is
+/// how a binding sees a tensor and its gradient buffer) passed as disjoint.
+#[test]
+fn separate_wraps_of_one_buffer_are_seen_to_overlap() {
+    with_gpu(|rt| {
+        let raw = rt
+            .device
+            .newBufferWithLength_options(32, MTLResourceOptions::StorageModeShared)
+            .expect("buffer");
+        // SAFETY: a fresh buffer only this runtime touches.
+        let (a, b) = unsafe {
+            (
+                Tensor::from_mtl_buffer(rt, raw.clone(), &[4], DType::F32, 0).unwrap(),
+                Tensor::from_mtl_buffer(rt, raw.clone(), &[4], DType::F32, 8).unwrap(),
+            )
+        };
+        let err = tessl::tensor::gpu_copy(&a, &b).expect_err("[0,16) and [8,24) overlap");
+        assert!(err.contains("overlap"), "{err}");
+        // Disjoint windows of the one buffer still copy.
+        let c = unsafe { Tensor::from_mtl_buffer(rt, raw, &[4], DType::F32, 16) }.unwrap();
+        a.buffer.write_f32(&[1.0, 2.0, 3.0, 4.0, 0.0, 0.0, 0.0, 0.0]);
+        tessl::tensor::gpu_copy(&a, &c).expect("disjoint copy");
+        rt.synchronize().unwrap();
+        assert_eq!(c.read_f32().unwrap(), vec![1.0, 2.0, 3.0, 4.0]);
+    });
+}

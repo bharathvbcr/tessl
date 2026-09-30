@@ -20,9 +20,13 @@
 //!
 //! Scope: one sequence, positions from 0, value heads equal to key heads in
 //! the GDN (Qwen3.5-2B's 16 and 16; `gdn_train` has no head grouping).
-//! Everything the forward produces is saved; at T = 2048 on the 2B that is
-//! the memory `docs/qwen35.md` measures, which a later change can trade for
-//! recomputation without changing the backward's order.
+//!
+//! What the forward keeps for the backward is [`Activations`]: every layer's
+//! intermediates ([`Activations::Saved`]), or only the residual stream into
+//! each layer, with one layer's intermediates rebuilt at a time just before
+//! its backward ([`Activations::Recomputed`]). The kernels are deterministic,
+//! so the rebuilt intermediates are the forward's bits and both modes return
+//! the same loss and gradients bit for bit.
 
 use std::sync::Arc;
 
@@ -97,11 +101,25 @@ pub struct Qwen35Grads {
     pub layers: Vec<LayerGrads>,
 }
 
+/// What [`Qwen35Model::train_step`] keeps from the forward for the backward.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Activations {
+    /// Every layer's intermediates: no recomputation, most memory.
+    Saved,
+    /// The residual stream into each layer (`T x hidden` f32 per layer); each
+    /// layer's forward runs again just before its backward. About one more
+    /// forward's work for a fraction of the memory.
+    Recomputed,
+}
+
 /// What [`Qwen35Model::train_step`] returns.
 pub struct TrainStep {
     /// Mean cross-entropy over the `T - 1` predicted positions.
     pub loss: f64,
     pub grads: Qwen35Grads,
+    /// Bytes of per-layer activations held from the forward until the
+    /// backward, summed over the tensors actually kept (logical sizes).
+    pub activation_bytes: u64,
 }
 
 /// What one GDN layer's forward keeps for its backward.
@@ -133,6 +151,22 @@ enum SavedMixer {
     Attn(SavedAttn),
 }
 
+impl SavedGdn {
+    fn bytes(&self) -> u64 {
+        [&self.proj, &self.q, &self.k, &self.v, &self.g, &self.beta, &self.ckpt, &self.o, &self.y]
+            .iter()
+            .map(|t| t.nbytes_logical() as u64)
+            .sum()
+    }
+}
+
+impl SavedAttn {
+    fn bytes(&self) -> u64 {
+        let bufs: u64 = [&self.q, &self.k, &self.v, &self.o, &self.lse].iter().map(|b| b.nbytes() as u64).sum();
+        bufs + (self.proj.nbytes_logical() + self.y.nbytes_logical()) as u64
+    }
+}
+
 /// What one layer's forward keeps: the residual stream into each norm, each
 /// norm's output (the GEMMs' left operand), the mixer's, and the MLP's.
 struct Saved {
@@ -144,6 +178,27 @@ struct Saved {
     m_gate: Tensor,
     m_up: Tensor,
     m_mid: Tensor,
+}
+
+impl Saved {
+    fn bytes(&self) -> u64 {
+        let own: usize = [&self.resid_in, &self.x1, &self.resid_mid, &self.x2, &self.m_gate, &self.m_up, &self.m_mid]
+            .iter()
+            .map(|t| t.nbytes_logical())
+            .sum();
+        own as u64
+            + match &self.mixer {
+                SavedMixer::Gdn(s) => s.bytes(),
+                SavedMixer::Attn(s) => s.bytes(),
+            }
+    }
+}
+
+/// What the forward hands one layer's backward.
+enum Kept {
+    Saved(Box<Saved>),
+    /// The residual stream into the layer, to rebuild [`Saved`] from.
+    Input(Tensor),
 }
 
 /// The scratch every layer's backward reuses.
@@ -200,8 +255,9 @@ fn tensor(rt: &Arc<GpuRuntime>, shape: &[usize]) -> Result<Tensor, String> {
 impl Qwen35Model {
     /// One training step on `ids` (one sequence, positions from 0): the loss
     /// transformers' `Qwen3_5ForCausalLM(input_ids=ids, labels=ids)` reports
-    /// and every parameter's gradient of it.
-    pub fn train_step(&self, ids: &[u32]) -> Result<TrainStep, String> {
+    /// and every parameter's gradient of it, keeping `activations` from the
+    /// forward for the backward.
+    pub fn train_step(&self, ids: &[u32], activations: Activations) -> Result<TrainStep, String> {
         const WHAT: &str = "Qwen35Model::train_step";
         let (rt, cfg) = (&self.rt, &self.cfg);
         if self.precision != Precision::F32 {
@@ -238,10 +294,23 @@ impl Qwen35Model {
             cfg.hidden,
             &resid.buffer,
         )?;
-        let mut saved = Vec::with_capacity(self.layers.len());
+        let mut kept = Vec::with_capacity(self.layers.len());
+        let mut activation_bytes = 0u64;
         for layer in &self.layers {
-            let (s, out) = self.train_layer_forward(layer, resid, t)?;
-            saved.push(s);
+            let (s, out) = self.train_layer_forward(layer, resid, t, true)?;
+            let out = out.ok_or("Qwen35Model::train_step: a layer's forward returned no output")?;
+            kept.push(match activations {
+                Activations::Saved => {
+                    activation_bytes += s.bytes();
+                    Kept::Saved(Box::new(s))
+                }
+                // Everything but the layer's input is dropped here, back to
+                // the pool for the next layer.
+                Activations::Recomputed => {
+                    activation_bytes += s.resid_in.nbytes_logical() as u64;
+                    Kept::Input(s.resid_in)
+                }
+            });
             resid = out;
         }
         let xf = tensor(rt, &[tu, h])?;
@@ -285,14 +354,20 @@ impl Qwen35Model {
             false,
         )?;
         let mut layers = Vec::with_capacity(self.layers.len());
-        for (layer, s) in self.layers.iter().zip(&saved).rev() {
-            layers.push(self.train_layer_backward(layer, s, &mut sc)?);
+        // Popped from the back, so a layer's kept activations are released
+        // as soon as its backward is encoded.
+        for layer in self.layers.iter().rev() {
+            let s = match kept.pop().ok_or("Qwen35Model::train_step: fewer kept activations than layers")? {
+                Kept::Saved(s) => *s,
+                Kept::Input(resid_in) => self.train_layer_forward(layer, resid_in, t, false)?.0,
+            };
+            layers.push(self.train_layer_backward(layer, &s, &mut sc)?);
         }
         layers.reverse();
         let emb_ws = EmbedBwdWorkspace::new(rt, t)?;
         embed_rows_bwd(rt, ids, &sc.dresid.buffer, &d_embed.buffer, cfg.vocab, cfg.hidden, &emb_ws)?;
         rt.synchronize()?;
-        Ok(TrainStep { loss: out.loss, grads: Qwen35Grads { embed: d_embed, final_norm, layers } })
+        Ok(TrainStep { loss: out.loss, grads: Qwen35Grads { embed: d_embed, final_norm, layers }, activation_bytes })
     }
 
     fn scratch(&self, t: u32) -> Result<Scratch, String> {
@@ -390,7 +465,16 @@ impl Qwen35Model {
         Ok(out)
     }
 
-    fn train_layer_forward(&self, layer: &Layer, resid_in: Tensor, t: u32) -> Result<(Saved, Tensor), String> {
+    /// One layer's forward from `resid_in`, keeping what its backward reads;
+    /// with `output`, also the residual stream out of it (a recomputation
+    /// needs only the former, and skips the `down` projection's product).
+    fn train_layer_forward(
+        &self,
+        layer: &Layer,
+        resid_in: Tensor,
+        t: u32,
+        output: bool,
+    ) -> Result<(Saved, Option<Tensor>), String> {
         let (rt, cfg) = (&self.rt, &self.cfg);
         let (tu, h, i) = (t as usize, cfg.hidden as usize, cfg.intermediate as usize);
         let x1 = tensor(rt, &[tu, h])?;
@@ -420,7 +504,7 @@ impl Qwen35Model {
             t,
             cfg.intermediate,
         )?;
-        let resid_out = self.residual(&resid_mid, &m_mid, &layer.down, t)?;
+        let resid_out = if output { Some(self.residual(&resid_mid, &m_mid, &layer.down, t)?) } else { None };
         Ok((Saved { resid_in, x1, mixer, resid_mid, x2, m_gate, m_up, m_mid }, resid_out))
     }
 
@@ -743,7 +827,7 @@ mod tests {
         let model = Qwen35Model::load(&rt, &st, "model.language_model.", Qwen35Config::qwen35_2b().unwrap(), Precision::F32).unwrap();
         drop(st);
         let ids: Vec<u32> = npy(&dir.join("ids.npy")).iter().map(|&x| x as u32).collect();
-        let step = model.train_step(&ids).unwrap();
+        let step = model.train_step(&ids, Activations::Saved).unwrap();
         let base = loss(&model, &ids);
         // (name, the model's f32 buffer, tessl's gradient buffer, length).
         let mixer = |l: usize| match (&model.layers[l].mixer, &step.grads.layers[l].mixer) {

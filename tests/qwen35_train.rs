@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 
 use tessl::npy::read_npy;
 use tessl::qwen35_model::{LayerKind, Precision, Qwen35Config, Qwen35Model};
-use tessl::qwen35_train::{MixerGrads, Qwen35Grads, TrainStep};
+use tessl::qwen35_train::{Activations, MixerGrads, Qwen35Grads, TrainStep};
 use tessl::safetensors::SafeTensors;
 use tessl::tensor::{GpuBuffer, Tensor};
 use tessl::GpuRuntime;
@@ -172,7 +172,7 @@ fn tiny_step_matches_transformers_autograd() {
     assert_eq!(cfg.layers, [LayerKind::LinearAttention, LayerKind::FullAttention]);
     let model = load(&dir, "model.", cfg.clone(), Precision::F32);
     let ids = ids(&dir);
-    let step = model.train_step(&ids).unwrap();
+    let step = model.train_step(&ids, Activations::Saved).unwrap();
     let worst = compare(&dir, "model.", &cfg, &step, 1e-4);
     eprintln!("worst parameter gradient: {worst:.2e}");
 
@@ -182,11 +182,37 @@ fn tiny_step_matches_transformers_autograd() {
     assert!((ce - step.loss).abs() <= 1e-5 * ce.abs(), "inference loss {ce} vs training loss {}", step.loss);
 
     // A second step gives the same bits.
-    let again = model.train_step(&ids).unwrap();
+    let again = model.train_step(&ids, Activations::Saved).unwrap();
     assert_eq!(again.loss.to_bits(), step.loss.to_bits(), "loss changed on a rerun");
     for ((name, a), (_, b)) in by_name(&cfg, &again.grads, "model.").iter().zip(by_name(&cfg, &step.grads, "model.")) {
         assert!(a.iter().zip(&b).all(|(x, y)| x.to_bits() == y.to_bits()), "{name} changed on a rerun");
     }
+}
+
+/// Recomputing each layer's intermediates gives the saved run's loss and
+/// gradients bit for bit, while keeping only the residual stream into each
+/// layer.
+#[test]
+fn recomputed_activations_are_the_saved_ones() {
+    let dir = fixture();
+    let cfg = tiny_config();
+    let model = load(&dir, "model.", cfg.clone(), Precision::F32);
+    let ids = ids(&dir);
+    let saved = model.train_step(&ids, Activations::Saved).unwrap();
+    let recomputed = model.train_step(&ids, Activations::Recomputed).unwrap();
+    assert_eq!(recomputed.loss.to_bits(), saved.loss.to_bits(), "loss");
+    let (a, b) = (by_name(&cfg, &recomputed.grads, "model."), by_name(&cfg, &saved.grads, "model."));
+    assert_eq!(a.len(), b.len());
+    for ((name, x), (_, y)) in a.iter().zip(&b) {
+        assert!(x.iter().zip(y).all(|(p, q)| p.to_bits() == q.to_bits()), "{name} differs when recomputed");
+    }
+    let per_layer = (ids.len() * cfg.hidden as usize * 4) as u64;
+    assert_eq!(recomputed.activation_bytes, cfg.layers.len() as u64 * per_layer, "recomputation keeps the layer inputs only");
+    eprintln!("activations kept: saved {} B, recomputed {} B", saved.activation_bytes, recomputed.activation_bytes);
+    // Saved keeps, per layer, at least the norms' inputs and outputs and the
+    // MLP's three intermediate-width products.
+    let floor = cfg.layers.len() as u64 * (4 * per_layer + 3 * (ids.len() * cfg.intermediate as usize * 4) as u64);
+    assert!(saved.activation_bytes >= floor, "saved run keeps {} B < {floor} B", saved.activation_bytes);
 }
 
 /// The tiny model 24 layers deep in the 2B's layer pattern
@@ -202,7 +228,7 @@ fn deep_tiny_step_matches_transformers() {
         .unwrap_or_else(|| Path::new(env!("CARGO_MANIFEST_DIR")).join("target/qwen35_train_deep"));
     let cfg = Qwen35Config::from_config_file(&dir.join("config.json")).unwrap();
     let model = load(&dir, "model.", cfg.clone(), Precision::F32);
-    let step = model.train_step(&ids(&dir)).unwrap();
+    let step = model.train_step(&ids(&dir), Activations::Saved).unwrap();
     let (_, want_loss) = npy_f64(&dir.join("loss.npy"));
     eprintln!("loss {:.8} vs {:.8} (rel {:.2e})", step.loss, want_loss[0], (step.loss - want_loss[0]).abs() / want_loss[0]);
     let mut per_layer = vec![(0.0f64, 0.0f64); cfg.layers.len()];
@@ -250,10 +276,10 @@ fn train_step_refuses_what_it_does_not_implement() {
         assert!(m.contains(needle), "{m:?} lacks {needle:?}");
     };
     let bf16 = load(&dir, "model.", tiny_config(), Precision::Bf16);
-    e(bf16.train_step(&[1, 2, 3]), "training runs in f32");
+    e(bf16.train_step(&[1, 2, 3], Activations::Saved), "training runs in f32");
     let model = load(&dir, "model.", tiny_config(), Precision::F32);
-    e(model.train_step(&[5]), "at least two tokens");
-    e(model.train_step(&[5, 64]), "token id 64 >= vocab 64");
+    e(model.train_step(&[5], Activations::Saved), "at least two tokens");
+    e(model.train_step(&[5, 64], Activations::Saved), "token id 64 >= vocab 64");
 }
 
 /// Qwen3.5-2B-Base: `python3 tools/qwen35_ref/make_train_fixture.py 2b`
@@ -275,7 +301,7 @@ fn real_2b_step_matches_transformers() {
     let model = Qwen35Model::load(&rt, &st, "model.language_model.", cfg.clone(), Precision::F32).unwrap();
     drop(st);
     let ids = ids(&dir);
-    let step = model.train_step(&ids).unwrap();
+    let step = model.train_step(&ids, Activations::Recomputed).unwrap();
     let infer = inference_loss(&model, &ids);
     let (_, want_loss) = npy_f64(&dir.join("loss.npy"));
     let want_loss = want_loss[0];

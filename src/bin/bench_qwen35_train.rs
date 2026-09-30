@@ -44,6 +44,7 @@ use tessl::qwen35_bwd::{
     rms_norm_bwd_part_len, swiglu_bwd, AttnQkvGrads, EmbedBwdWorkspace,
 };
 use tessl::qwen35_model::{Precision, Qwen35Config, Qwen35Model};
+use tessl::qwen35_train::Activations;
 use tessl::safetensors::SafeTensors;
 use tessl::tensor::GpuBuffer;
 use tessl::{DType, GpuRuntime, Tensor};
@@ -326,21 +327,31 @@ fn bench_step(rt: &Arc<GpuRuntime>, tokens: usize) -> Res<()> {
     let model = Qwen35Model::load(rt, &st, "model.language_model.", Qwen35Config::qwen35_2b()?, Precision::F32)?;
     drop(st);
     let ids: Vec<u32> = (0..tokens as u32).map(|i| (i * 104_729 + 17) % VOCAB as u32).collect();
-    let first = model.train_step(&ids)?;
+    let first = model.train_step(&ids, Activations::Recomputed)?;
     if !first.loss.is_finite() {
         return Err(format!("train_step: loss {} is not finite", first.loss));
     }
-    let mut samples = Vec::new();
-    for _ in 0..3 {
-        let t0 = Instant::now();
-        let step = model.train_step(&ids)?;
-        samples.push(t0.elapsed().as_secs_f64());
-        if step.loss.to_bits() != first.loss.to_bits() {
-            return Err("train_step: the loss changed between identical steps".into());
+    for mode in [Activations::Recomputed, Activations::Saved] {
+        let mut samples = Vec::new();
+        let mut bytes = 0;
+        for _ in 0..3 {
+            let t0 = Instant::now();
+            let step = model.train_step(&ids, mode)?;
+            samples.push(t0.elapsed().as_secs_f64());
+            if step.loss.to_bits() != first.loss.to_bits() {
+                return Err(format!("train_step ({mode:?}): the loss changed between identical steps"));
+            }
+            bytes = step.activation_bytes;
         }
+        let secs = median(samples);
+        println!(
+            "train_step ({mode:?}), T = {tokens}: {:.3} s ({:.0} tokens/s), loss {:.4}, activations kept {:.2} GiB",
+            secs,
+            tokens as f64 / secs,
+            first.loss,
+            bytes as f64 / f64::from(1u32 << 30)
+        );
     }
-    let secs = median(samples);
-    println!("train_step, T = {tokens}: {:.3} s ({:.0} tokens/s), loss {:.4}", secs, tokens as f64 / secs, first.loss);
     Ok(())
 }
 

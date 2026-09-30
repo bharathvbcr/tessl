@@ -729,8 +729,14 @@ positions) and every parameter's gradient of it. It runs in f32
 heads equal to key heads, as Qwen3.5-2B has. The forward is the inference
 forward's except where a backward needs more: `gdn_gates` + `gdn_train`
 (checkpointed state) for the gated delta rule and `attn_train` (log-sum-exp)
-for attention. Each layer's activations are saved; the backward walks the
-layers in reverse (MLP, post norm, mixer, input norm, the residual stream's
+for attention. `train_step(ids, Activations::Saved)` keeps every layer's
+intermediates for the backward; `Activations::Recomputed` keeps only the
+residual stream into each layer (`T x hidden` f32) and reruns one layer's
+forward just before its backward, skipping that rerun's `down` projection,
+whose output the backward never reads. The kernels are deterministic, so
+both modes return the same loss and gradients bit for bit
+(`recomputed_activations_are_the_saved_ones`), and `TrainStep::activation_bytes`
+reports what was kept. The backward walks the layers in reverse (MLP, post norm, mixer, input norm, the residual stream's
 gradient accumulating through both norms), then adds the embedding's
 gradient onto the tied head's `[vocab, hidden]` gradient that the
 cross-entropy wrote. Every fused projection's gradient is filled by disjoint

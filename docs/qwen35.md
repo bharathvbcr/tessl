@@ -676,6 +676,37 @@ of fourteen injected defects (masking, scale, `Dr`, head grouping, the
 diagonal start, the log-sum-exp reads and store) fail it. The backward has
 not been timed yet.
 
+### Training-path timing
+
+`cargo run --release --bin bench_qwen35_train` times each training op at
+Qwen3.5-2B's shapes (random bounded f32 inputs, one NaN-poisoned run per op
+first: every output must come back finite, and the embedding backward's rows
+must move), and `--step=N` a whole `train_step` on the real checkpoint. On
+the M5 Pro at T = 2048, nothing else of ours on the GPU, display kept awake
+with `caffeinate -d` (ms per call, median of 7):
+
+| op | ms |
+|---|---:|
+| `gdn_train` forward | 6.5 |
+| `gdn_train` backward | 21.0 |
+| `attn_train` forward | 3.0 |
+| `attn_train` backward | 13.9 |
+| cross-entropy + both gradients (vocab 248320) | 1845 |
+| `conv1d_silu_bwd` | 3.2 |
+| `swiglu_bwd` | 1.2 |
+| `attn_qk_norm_rope_bwd` | 0.9 |
+| `gated_rms_norm_bwd` | 0.8 |
+| `rms_norm_bwd`, `gdn_gates_bwd`, `embed_rows_bwd` | 0.2-0.5 each |
+
+The GDN core is 27.5 ms per layer forward and backward (both
+token-sequential), attention's 17 ms. The cross-entropy is four
+`[2047, 2048] x [2048, 248320]` products (two logit walks, then dh and dW),
+about 8.3 TFLOP, so its 1.8 s is 4.5 TFLOP/s against the 6.4 TFLOP/s the
+exact-f32 GEMM reaches. A whole `train_step` at T = 2048 takes 7.2 s (284
+tokens/s, median of 3, allocations included): the projections' forward and
+backward GEMMs are about 25 TFLOP (3.8 s at that rate), the cross-entropy
+1.8 s, the GDN and attention cores 0.6 s.
+
 ### Stress: randomized shapes
 
 `randomized_shapes_stress` in `tests/qwen35_bwd.rs` and `tests/attn_train.rs`

@@ -87,6 +87,9 @@ All notable changes to `tessl` are recorded here. The format follows
 - **qwen35_gdn.metal compiles under -Wall -Werror again**: the 16-column
   scan's threadgroup-memory constant gets the 32 KB static_assert its
   siblings have (the current compiler rejected it as unused).
+- **`bench_qwen35_train`**: every training op at Qwen3.5-2B's shapes behind a
+  NaN-poison gate, and `--step=N` for a whole `train_step` on the checkpoint
+  (7.2 s at T = 2048 on an M5 Pro; per-op numbers in docs/qwen35.md).
 - **Randomized-shape stress for the backward kernels**
   (`randomized_shapes_stress` in `tests/qwen35_bwd.rs`, `tests/attn_train.rs`):
   shapes drawn within each kernel's contract, each draw checked like the

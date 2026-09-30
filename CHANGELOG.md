@@ -15,6 +15,12 @@ All notable changes to `tessl` are recorded here. The format follows
   a `CeWorkspace` sized by rows and chunk. Kernels `ce_gather_rows_{f32,bf16}`,
   `ce_lse_update`, `ce_softmax_grad`. `gemm::cast_bf16_to_f32_into` widens
   into a caller's buffer.
+- **GDN training forward and backward (`tessl::gdn_train`)**: the gated
+  delta rule at transformers' `torch_chunk_gated_delta_rule` seam (`g`,
+  `beta` given, in-kernel q/k l2norm), saving only a state per 64 tokens
+  (32 MiB/layer at the 2B's shapes, T = 2048, vs 435 MiB in torch), with a
+  deterministic chunk-reverse backward. Kernels `gdn_train_fwd`,
+  `gdn_train_bwd`, `gdn_train_bwd_finish`.
 - **torch binding (`python/tessl_torch`) over a C ABI (`tessl::capi`)**:
   `tessl_torch.cross_entropy(hidden, weight, targets, mask)`, a
   `torch.autograd.Function` over MPS tensors, loaded with `ctypes` (no C++

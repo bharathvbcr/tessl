@@ -550,6 +550,29 @@ is its inputs plus one state per chunk, about 46 MB per layer at T = 2048
 against the 435 MB it saves, which is why the GDN op is the first backward
 tessl takes on; `tessl::cross_entropy` already removes the LM head's row.
 
+### The training op: `tessl::gdn_train`
+
+`gdn_train_forward` / `gdn_train_backward` are the gated delta rule at
+transformers' seam (`torch_chunk_gated_delta_rule` with
+`use_qk_l2norm_in_kernel=True`): `g` and `beta` arrive computed, and q/k are
+l2-normalized in the kernel. The forward is a token recurrence per (batch x
+head, 16 value columns) that saves the state every 64 tokens and nothing
+else: 32 MiB per layer at the 2B's shapes and T = 2048, against the 435 MiB
+the torch fallback saves. The backward walks the chunks in reverse,
+recomputes each chunk's states from its checkpoint into a bounded
+`GdnTrainWorkspace`, and runs the reverse-mode recurrence; the value slices'
+partial `dq`, `dk`, `dg`, `dbeta` are summed in a fixed order (no
+atomics), so gradients are deterministic.
+
+`tests/gdn_train.rs`: the f64 reference's forward equals the
+transformers-anchored recurrence to 1e-12, its hand-derived backward equals
+central finite differences to 3e-10 for every input and the initial state,
+and the kernels match it within 3.4e-7 of the largest magnitude (bound 1e-4)
+across chunk edges (T = 1, 63, 64, 65, 130) and at the 2B's 16 heads x 128.
+Eleven of twelve injected kernel defects fail it; the twelfth is equivalent.
+Both directions are token-sequential, so they are slower than the chunked
+inference forward; they have not been timed yet.
+
 ## Performance
 
 `cargo run --release --bin bench_qwen35_layers` builds Qwen3.5-2B's shapes

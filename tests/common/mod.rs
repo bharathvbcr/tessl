@@ -11,6 +11,10 @@
 /// GDN kernels. Pure arithmetic, no GPU, so it runs on any host.
 pub mod gdn;
 
+/// The gated delta rule at transformers' op seam (g and beta given), forward and
+/// backward, in f64: the oracle for the training kernels.
+pub mod gdn_train;
+
 /// f64 references for the Qwen3.5 kernels, anchored to transformers by fixture.
 pub mod qwen35;
 

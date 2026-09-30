@@ -29,6 +29,7 @@ const QWEN35_ATTN_TILED: &str = include_str!("../kernels/qwen35_attn_tiled.metal
 const QWEN35_MLP: &str = include_str!("../kernels/qwen35_mlp.metal");
 const QWEN35_SCORE: &str = include_str!("../kernels/qwen35_score.metal");
 const CROSS_ENTROPY: &str = include_str!("../kernels/cross_entropy.metal");
+const GDN_TRAIN: &str = include_str!("../kernels/gdn_train.metal");
 
 /// Every `.metal` file this suite inspects.
 ///
@@ -43,6 +44,7 @@ const INSPECTED_KERNELS: &[&str] = &[
     "flash_attn_rows.metal",
     "flash_attn_swa_h128.metal",
     "flash_attn_swa_h256.metal",
+    "gdn_train.metal",
     "gemm_q4_mlx.metal",
     "gemv_q4.metal",
     "gemv_q4_mlx.metal",
@@ -515,6 +517,25 @@ fn cross_entropy_row_offsets_are_widened() {
         "const ulong i = (ulong)n * ld + c;",
         "softmax-gradient address",
     );
+}
+
+/// The GDN training kernels index [B, T, H, D] rows and [B, H, NC, 128, Dv]
+/// checkpoints; at B = 8, T = 8192, H = 16 a q row offset is already past
+/// 2^30 elements, and the per-slice partials multiply that by Dv / 16. Every
+/// row, state, checkpoint and partial offset is formed in 64 bits.
+#[test]
+fn gdn_train_offsets_are_widened() {
+    for (needle, what) in [
+        ("const ulong r = ((ulong)b * T + t) * H + h;", "token row"),
+        ("const ulong srow = ((ulong)bh * GDN_TRAIN_DK + i) * Dv + j0;", "state row"),
+        ("const ulong c = ((ulong)bh * nc + t / GDN_TRAIN_CKPT) * GDN_TRAIN_DK + i;", "forward checkpoint"),
+        ("const ulong c = ((ulong)bh * nc + cc) * GDN_TRAIN_DK + i;", "backward checkpoint"),
+        ("scratch + ((ulong)bh * ns + tg.x) * C * GDN_TRAIN_DK * BV;", "scratch slab"),
+        ("const ulong part = (ulong)tg.x * rows + r;", "partial row"),
+        ("dq_part[(ulong)s * rows * GDN_TRAIN_DK + at];", "finish partial read"),
+    ] {
+        require(GDN_TRAIN, needle, what);
+    }
 }
 
 #[test]

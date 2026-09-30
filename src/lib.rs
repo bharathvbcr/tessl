@@ -76,6 +76,7 @@
 //! | [`ab_flags`], [`infer_trace`], [`icb_smoke`], [`npy`] | Tuning switches, tracing, smoke tests, and `.npy` I/O for benchmark parity |
 //! | [`safetensors`] | A strict `.safetensors` reader, to load checkpoints straight from the Hugging Face cache |
 //! | [`cross_entropy`] | LM-head cross-entropy and its gradients over the supervised rows, in vocabulary chunks |
+//! | [`gdn_train`] | The gated delta rule for training: forward and backward at transformers' op seam |
 //! | [`capi`] | The C ABI (`libtessl.dylib`) that `python/tessl_torch` calls through `ctypes` |
 //!
 //! # Encode model
@@ -95,7 +96,7 @@
 //!
 //! # Kernels
 //!
-//! 26 Metal sources compile to 175 kernel entry points: RMSNorm, gated MLP
+//! 27 Metal sources compile to 178 kernel entry points: RMSNorm, gated MLP
 //! activations, flash attention (sliding-window and global), fused
 //! RMSNorm+QKV+RoPE, MLX-format Q4 GEMV/GEMM, Q8 GEMV, an exact int8 GEMM, KV
 //! cache stores, embedding lookup, row-wise softmax/sum/max, and softcap
@@ -104,7 +105,8 @@
 //! snapshot-reading decode), its causal conv and gated norm, the attention
 //! extras, and answer-row scoring — are in [`qwen35`], and the whole
 //! Qwen3.5 text forward built from them in [`qwen35_model`]. The LM-head
-//! cross-entropy and its gradients are in [`cross_entropy`].
+//! cross-entropy and its gradients are in [`cross_entropy`], and the gated
+//! delta rule's training forward and backward in [`gdn_train`].
 //!
 //! 44 of these were promoted out of `gemma-metal`, where they were reachable
 //! only as raw pipeline-name strings through an overlay metallib. All 44 now
@@ -203,6 +205,7 @@ pub mod cb_replay;
 pub mod cross_entropy;
 pub mod decode_icb;
 pub mod dispatch;
+pub mod gdn_train;
 pub mod gemm;
 pub mod icb_smoke;
 pub mod infer_trace;

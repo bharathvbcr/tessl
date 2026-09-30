@@ -268,7 +268,7 @@ class CrossEntropyRefuses(unittest.TestCase):
 
     def test_the_library_reports_its_abi(self):
         lib = tessl_torch._load()
-        self.assertEqual(lib.tessl_abi_version(), 2)
+        self.assertEqual(lib.tessl_abi_version(), 3)
         t = torch.zeros(1000, device=MPS)
         torch.mps.synchronize()
         # The storage pointer is the MTLBuffer (its length is torch's rounded bucket).

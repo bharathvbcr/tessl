@@ -21,6 +21,9 @@ All notable changes to `tessl` are recorded here. The format follows
   (32 MiB/layer at the 2B's shapes, T = 2048, vs 435 MiB in torch), with a
   deterministic chunk-reverse backward. Kernels `gdn_train_fwd`,
   `gdn_train_bwd`, `gdn_train_bwd_finish`.
+  From torch: `tessl_torch.chunk_gated_delta_rule` (transformers'
+  signature) and `patch_transformers_qwen3_5()`; C ABI 3 adds
+  `tessl_gdn_train_forward`/`_backward` and tensors up to rank 6.
 - **torch binding (`python/tessl_torch`) over a C ABI (`tessl::capi`)**:
   `tessl_torch.cross_entropy(hidden, weight, targets, mask)`, a
   `torch.autograd.Function` over MPS tensors, loaded with `ctypes` (no C++

@@ -37,6 +37,9 @@ use objc2::runtime::ProtocolObject;
 use objc2_metal::MTLBuffer;
 
 use crate::cross_entropy::{cross_entropy_rows, CeGrads, CeHidden, CeWorkspace, Reduction};
+use crate::gdn_train::{
+    gdn_train_backward, gdn_train_forward, GdnTrainDims, GdnTrainGrads, GdnTrainInputs, GdnTrainWorkspace,
+};
 use crate::runtime::GpuRuntime;
 use crate::tensor::{DType, Tensor};
 
@@ -46,10 +49,10 @@ pub const TESSL_PANIC: i32 = 2;
 
 /// Bumped on any change to a `#[repr(C)]` layout or an entry point's
 /// signature; the Python side refuses a library whose version differs.
-pub const TESSL_ABI_VERSION: u32 = 2;
+pub const TESSL_ABI_VERSION: u32 = 3;
 
 /// Largest tensor rank a [`TesslTensorRef`] carries.
-pub const TESSL_MAX_DIMS: usize = 4;
+pub const TESSL_MAX_DIMS: usize = 6;
 
 /// `dtype` codes in a [`TesslTensorRef`].
 pub const TESSL_F32: u32 = 0;
@@ -108,6 +111,8 @@ pub struct TesslRuntime {
     /// The last cross-entropy workspace, reused while it fits.
     ce_ws: Option<CeWorkspace>,
     ce_ws_key: (u32, u32, DType),
+    /// The last GDN backward workspace, reused for the same shape.
+    gdn_ws: Option<GdnTrainWorkspace>,
 }
 
 /// The ABI version this library implements ([`TESSL_ABI_VERSION`]).
@@ -130,6 +135,7 @@ pub unsafe extern "C" fn tessl_runtime_new(err: *mut c_char, err_len: usize) -> 
             owner: std::thread::current().id(),
             ce_ws: None,
             ce_ws_key: (0, 0, DType::F32),
+            gdn_ws: None,
         })),
         Ok(Err(e)) => {
             // SAFETY: forwarded from this function's contract.
@@ -403,5 +409,162 @@ unsafe fn write_err(err: *mut c_char, err_len: usize, msg: &str) {
     unsafe {
         std::ptr::copy_nonoverlapping(msg.as_ptr(), err.cast::<u8>(), end);
         *err.add(end) = 0;
+    }
+}
+
+/// Arguments of [`tessl_gdn_train_forward`] and [`tessl_gdn_train_backward`];
+/// see [`crate::gdn_train`]. Every tensor is dense f32. A null `buffer` means
+/// "absent" for `s0`, `s_fin`, `d_fin` and `ds0`.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct TesslGdnArgs {
+    pub batch: u32,
+    pub seq: u32,
+    pub heads: u32,
+    pub v_dim: u32,
+    /// `[B, T, H, 128]`.
+    pub q: TesslTensorRef,
+    pub k: TesslTensorRef,
+    /// `[B, T, H, Dv]`.
+    pub v: TesslTensorRef,
+    /// `[B, T, H]`.
+    pub g: TesslTensorRef,
+    pub beta: TesslTensorRef,
+    /// `[B, H, 128, Dv]`, optional.
+    pub s0: TesslTensorRef,
+    /// `[B, H, NC, 128, Dv]`, NC = ceil(T / 64): written by the forward,
+    /// read by the backward.
+    pub ckpt: TesslTensorRef,
+    /// Forward: `o` `[B, T, H, Dv]` and optionally `s_fin` `[B, H, 128, Dv]`.
+    pub o: TesslTensorRef,
+    pub s_fin: TesslTensorRef,
+    /// Backward: `d_o`, optionally `d_fin`, and the gradients (`ds0` exactly
+    /// when `s0` is given).
+    pub d_o: TesslTensorRef,
+    pub d_fin: TesslTensorRef,
+    pub dq: TesslTensorRef,
+    pub dk: TesslTensorRef,
+    pub dv: TesslTensorRef,
+    pub dg: TesslTensorRef,
+    pub dbeta: TesslTensorRef,
+    pub ds0: TesslTensorRef,
+}
+
+/// # Safety
+/// As [`wrap`] for a non-null `t.buffer`.
+unsafe fn wrap_opt(rt: &Arc<GpuRuntime>, t: &TesslTensorRef, name: &str) -> Result<Option<Tensor>, String> {
+    if t.buffer.is_null() {
+        Ok(None)
+    } else {
+        // SAFETY: forwarded.
+        unsafe { wrap(rt, t, name) }.map(Some)
+    }
+}
+
+/// The inputs both directions read, wrapped.
+struct GdnWrapped {
+    dims: GdnTrainDims,
+    q: Tensor,
+    k: Tensor,
+    v: Tensor,
+    g: Tensor,
+    beta: Tensor,
+    s0: Option<Tensor>,
+    ckpt: Tensor,
+}
+
+impl GdnWrapped {
+    /// # Safety
+    /// `a`'s buffers satisfy the module contract.
+    unsafe fn new(rt: &Arc<GpuRuntime>, a: &TesslGdnArgs) -> Result<Self, String> {
+        // SAFETY (each wrap): forwarded from this function's contract.
+        unsafe {
+            Ok(Self {
+                dims: GdnTrainDims { batch: a.batch, seq: a.seq, heads: a.heads, v_dim: a.v_dim },
+                q: wrap(rt, &a.q, "q")?,
+                k: wrap(rt, &a.k, "k")?,
+                v: wrap(rt, &a.v, "v")?,
+                g: wrap(rt, &a.g, "g")?,
+                beta: wrap(rt, &a.beta, "beta")?,
+                s0: wrap_opt(rt, &a.s0, "s0")?,
+                ckpt: wrap(rt, &a.ckpt, "ckpt")?,
+            })
+        }
+    }
+
+    fn inputs(&self) -> GdnTrainInputs<'_> {
+        GdnTrainInputs { q: &self.q, k: &self.k, v: &self.v, g: &self.g, beta: &self.beta, s0: self.s0.as_ref() }
+    }
+}
+
+/// [`crate::gdn_train::gdn_train_forward`] over caller buffers.
+///
+/// # Safety
+/// As [`tessl_cross_entropy_rows`], with `args` a valid [`TesslGdnArgs`].
+#[no_mangle]
+pub unsafe extern "C" fn tessl_gdn_train_forward(
+    handle: *mut TesslRuntime,
+    args: *const TesslGdnArgs,
+    err: *mut c_char,
+    err_len: usize,
+) -> i32 {
+    // SAFETY: forwarded from this function's contract.
+    unsafe {
+        guarded(handle, err, err_len, |h| {
+            if args.is_null() {
+                return Err("tessl_gdn_train_forward: null args".into());
+            }
+            let a = &*args;
+            let rt = Arc::clone(&h.rt);
+            let x = GdnWrapped::new(&rt, a)?;
+            let o = wrap(&rt, &a.o, "o")?;
+            let s_fin = wrap_opt(&rt, &a.s_fin, "s_fin")?;
+            gdn_train_forward(&rt, x.dims, x.inputs(), &o, s_fin.as_ref(), &x.ckpt)
+        })
+    }
+}
+
+/// [`crate::gdn_train::gdn_train_backward`] over caller buffers. The
+/// backward workspace is cached per handle and per shape.
+///
+/// # Safety
+/// As [`tessl_gdn_train_forward`].
+#[no_mangle]
+pub unsafe extern "C" fn tessl_gdn_train_backward(
+    handle: *mut TesslRuntime,
+    args: *const TesslGdnArgs,
+    err: *mut c_char,
+    err_len: usize,
+) -> i32 {
+    // SAFETY: forwarded from this function's contract.
+    unsafe {
+        guarded(handle, err, err_len, |h| {
+            if args.is_null() {
+                return Err("tessl_gdn_train_backward: null args".into());
+            }
+            let a = &*args;
+            let rt = Arc::clone(&h.rt);
+            let x = GdnWrapped::new(&rt, a)?;
+            let d_o = wrap(&rt, &a.d_o, "d_o")?;
+            let d_fin = wrap_opt(&rt, &a.d_fin, "d_fin")?;
+            let (dq, dk, dv) = (wrap(&rt, &a.dq, "dq")?, wrap(&rt, &a.dk, "dk")?, wrap(&rt, &a.dv, "dv")?);
+            let (dg, dbeta) = (wrap(&rt, &a.dg, "dg")?, wrap(&rt, &a.dbeta, "dbeta")?);
+            let ds0 = wrap_opt(&rt, &a.ds0, "ds0")?;
+            if h.gdn_ws.as_ref().map(GdnTrainWorkspace::dims) != Some(x.dims) {
+                h.gdn_ws = None;
+                h.gdn_ws = Some(GdnTrainWorkspace::new(&rt, x.dims)?);
+            }
+            let ws = h.gdn_ws.as_ref().ok_or("tessl_gdn_train_backward: workspace missing")?;
+            gdn_train_backward(
+                &rt,
+                x.dims,
+                x.inputs(),
+                &x.ckpt,
+                &d_o,
+                d_fin.as_ref(),
+                ws,
+                GdnTrainGrads { dq: &dq, dk: &dk, dv: &dv, dg: &dg, dbeta: &dbeta, ds0: ds0.as_ref() },
+            )
+        })
     }
 }

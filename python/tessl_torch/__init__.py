@@ -29,10 +29,17 @@ from pathlib import Path
 
 import torch
 
-__all__ = ["cross_entropy", "cross_entropy_rows", "TesslError", "library_path"]
+__all__ = [
+    "cross_entropy",
+    "cross_entropy_rows",
+    "chunk_gated_delta_rule",
+    "patch_transformers_qwen3_5",
+    "TesslError",
+    "library_path",
+]
 
-_ABI_VERSION = 2
-_MAX_DIMS = 4
+_ABI_VERSION = 3
+_MAX_DIMS = 6
 _DTYPE_CODE = {torch.float32: 0, torch.bfloat16: 1, torch.float16: 2}
 _ERR_LEN = 1024
 
@@ -65,6 +72,21 @@ class _CeArgs(ctypes.Structure):
         ("scale", ctypes.c_float),
         ("dh", _TensorRef),
         ("dw", _TensorRef),
+    ]
+
+
+class _GdnArgs(ctypes.Structure):
+    _fields_ = [
+        ("batch", ctypes.c_uint32),
+        ("seq", ctypes.c_uint32),
+        ("heads", ctypes.c_uint32),
+        ("v_dim", ctypes.c_uint32),
+    ] + [
+        (name, _TensorRef)
+        for name in (
+            "q", "k", "v", "g", "beta", "s0", "ckpt", "o", "s_fin",
+            "d_o", "d_fin", "dq", "dk", "dv", "dg", "dbeta", "ds0",
+        )
     ]
 
 
@@ -109,6 +131,10 @@ def _load():
             ctypes.c_char_p,
             ctypes.c_size_t,
         ]
+        for name in ("tessl_gdn_train_forward", "tessl_gdn_train_backward"):
+            fn = getattr(lib, name)
+            fn.restype = ctypes.c_int32
+            fn.argtypes = [ctypes.c_void_p, ctypes.POINTER(_GdnArgs), ctypes.c_char_p, ctypes.c_size_t]
         _lib = lib
         return lib
 
@@ -376,3 +402,141 @@ def cross_entropy(
     if mask.dtype != torch.bool:
         raise TesslError(f"mask must be bool, not {mask.dtype}")
     return _CrossEntropy.apply(hidden, weight, targets, mask, reduction, chunk)
+
+
+# ------------------------------------------------------ gated delta rule ---
+
+_GDN_DK = 128
+_GDN_BV = 16
+_GDN_CKPT = 64
+_NULL_REF = _TensorRef()
+
+
+def _f32(t: torch.Tensor) -> torch.Tensor:
+    return t.detach().to(torch.float32).contiguous()
+
+
+def _gdn_args(B, T, H, Dv, **refs) -> _GdnArgs:
+    a = _GdnArgs()
+    a.batch, a.seq, a.heads, a.v_dim = B, T, H, Dv
+    for name, t in refs.items():
+        setattr(a, name, _NULL_REF if t is None else _ref(t, name))
+    return a
+
+
+def _gdn_call(fn_name: str, args: _GdnArgs):
+    rt = _runtime()
+    err = ctypes.create_string_buffer(_ERR_LEN)
+    torch.mps.synchronize()
+    status = getattr(rt.lib, fn_name)(rt.handle, ctypes.byref(args), err, _ERR_LEN)
+    if status != 0:
+        raise TesslError(err.value.decode(errors="replace"))
+
+
+class _GdnChunk(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, q, k, v, g, beta, initial_state):
+        B, T, H, Dk = q.shape
+        Dv = v.shape[-1]
+        qf, kf, vf, gf, bf = (_f32(x) for x in (q, k, v, g, beta))
+        s0 = None if initial_state is None else _f32(initial_state)
+        dev = q.device
+        o = torch.empty((B, T, H, Dv), dtype=torch.float32, device=dev)
+        s_fin = torch.empty((B, H, Dk, Dv), dtype=torch.float32, device=dev)
+        nc = -(-T // _GDN_CKPT)
+        ckpt = torch.empty((B, H, nc, Dk, Dv), dtype=torch.float32, device=dev)
+        _gdn_call(
+            "tessl_gdn_train_forward",
+            _gdn_args(B, T, H, Dv, q=qf, k=kf, v=vf, g=gf, beta=bf, s0=s0, ckpt=ckpt, o=o, s_fin=s_fin),
+        )
+        # The inputs as given (bf16 stays bf16) and one state per 64 tokens:
+        # everything else the backward needs it recomputes.
+        ctx.save_for_backward(q, k, v, g, beta, initial_state if initial_state is not None else torch.empty(0), ckpt)
+        ctx.has_s0 = initial_state is not None
+        ctx.dtypes = (q.dtype, k.dtype, v.dtype, g.dtype, beta.dtype, None if initial_state is None else initial_state.dtype)
+        return o.to(v.dtype), s_fin
+
+    @staticmethod
+    def backward(ctx, d_o, d_fin):
+        q, k, v, g, beta, s0, ckpt = ctx.saved_tensors
+        B, T, H, Dk = q.shape
+        Dv = v.shape[-1]
+        qf, kf, vf, gf, bf = (_f32(x) for x in (q, k, v, g, beta))
+        s0f = _f32(s0) if ctx.has_s0 else None
+        dev = q.device
+        d_of = _f32(d_o) if d_o is not None else torch.zeros((B, T, H, Dv), dtype=torch.float32, device=dev)
+        d_finf = _f32(d_fin) if d_fin is not None else None
+        dq = torch.empty((B, T, H, Dk), dtype=torch.float32, device=dev)
+        dk = torch.empty_like(dq)
+        dv = torch.empty((B, T, H, Dv), dtype=torch.float32, device=dev)
+        dg = torch.empty((B, T, H), dtype=torch.float32, device=dev)
+        dbeta = torch.empty_like(dg)
+        ds0 = torch.empty((B, H, Dk, Dv), dtype=torch.float32, device=dev) if ctx.has_s0 else None
+        _gdn_call(
+            "tessl_gdn_train_backward",
+            _gdn_args(
+                B, T, H, Dv, q=qf, k=kf, v=vf, g=gf, beta=bf, s0=s0f, ckpt=ckpt,
+                d_o=d_of, d_fin=d_finf, dq=dq, dk=dk, dv=dv, dg=dg, dbeta=dbeta, ds0=ds0,
+            ),
+        )
+        tq, tk, tv, tg, tb, ts = ctx.dtypes
+        return (
+            dq.to(tq), dk.to(tk), dv.to(tv), dg.to(tg), dbeta.to(tb),
+            ds0.to(ts) if ds0 is not None else None,
+        )
+
+
+def chunk_gated_delta_rule(
+    query,
+    key,
+    value,
+    g,
+    beta,
+    chunk_size=64,
+    initial_state=None,
+    output_final_state=False,
+    use_qk_l2norm_in_kernel=False,
+    cu_seqlens=None,
+    **kwargs,
+):
+    """transformers' ``torch_chunk_gated_delta_rule``, on tessl's Metal kernels.
+
+    Same arguments and results: ``query``/``key`` ``[B, T, H, 128]``,
+    ``value`` ``[B, T, H, Dv]`` (``Dv`` a multiple of 16), ``g`` (the log
+    decay) and ``beta`` ``[B, T, H]``; returns ``(out [B, T, H, Dv],
+    final_state [B, H, 128, Dv] or None)``, differentiable in every input and
+    the initial state. The forward keeps only its inputs and one state per 64
+    tokens for the backward. ``chunk_size`` does not change the result (the
+    kernels checkpoint every 64 tokens regardless). Only the l2-normalized
+    form Qwen3.5 uses is implemented, and not ragged batches.
+    """
+    if not use_qk_l2norm_in_kernel:
+        raise TesslError("tessl's GDN kernels implement use_qk_l2norm_in_kernel=True only")
+    if cu_seqlens is not None:
+        raise TesslError("ragged batches (cu_seqlens) are not supported")
+    if query.dim() != 4 or query.shape != key.shape or query.shape[-1] != _GDN_DK:
+        raise TesslError(f"query and key must both be [B, T, H, {_GDN_DK}], got {tuple(query.shape)} and {tuple(key.shape)}")
+    B, T, H, _ = query.shape
+    if value.dim() != 4 or tuple(value.shape[:3]) != (B, T, H) or value.shape[-1] % _GDN_BV != 0:
+        raise TesslError(f"value must be [B, T, H, Dv] with Dv a multiple of {_GDN_BV}, got {tuple(value.shape)}")
+    for name, t in (("g", g), ("beta", beta)):
+        if tuple(t.shape) != (B, T, H):
+            raise TesslError(f"{name} must be [B, T, H] = {(B, T, H)}, got {tuple(t.shape)}")
+    if initial_state is not None and tuple(initial_state.shape) != (B, H, _GDN_DK, value.shape[-1]):
+        raise TesslError(f"initial_state must be {(B, H, _GDN_DK, value.shape[-1])}, got {tuple(initial_state.shape)}")
+    out, final = _GdnChunk.apply(query, key, value, g, beta, initial_state)
+    return out, (final if output_final_state else None)
+
+
+def patch_transformers_qwen3_5():
+    """Route transformers' Qwen3.5 chunked GDN through tessl.
+
+    Replaces ``modeling_qwen3_5.torch_chunk_gated_delta_rule`` (the torch
+    fallback transformers uses when ``fla`` is absent, as on macOS), which the
+    layer looks up at call time. Returns the function it replaced.
+    """
+    from transformers.models.qwen3_5 import modeling_qwen3_5 as m
+
+    previous = m.torch_chunk_gated_delta_rule
+    m.torch_chunk_gated_delta_rule = chunk_gated_delta_rule
+    return previous

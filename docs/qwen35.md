@@ -541,6 +541,7 @@ bf16 on MPS, torch 2.13, transformers 5.15 with its torch GDN fallback (no
 |---|---:|---:|
 | LM head + full-vocabulary loss | 1.95 GB | 1.95 GB |
 | GDN core (`torch_chunk_gated_delta_rule`) | 1.30 GB | 7.8 GB |
+| GDN core on tessl (`--tessl`: inputs + a state per 64 tokens) | 0.17 GB | 1.0 GB |
 | everything else (norms, MLP, conv, projections, attention) | 1.34 GB | 8.0 GB |
 | MPS driver memory after the forward | 11.5 GB | |
 
@@ -563,6 +564,13 @@ recomputes each chunk's states from its checkpoint into a bounded
 `GdnTrainWorkspace`, and runs the reverse-mode recurrence; the value slices'
 partial `dq`, `dk`, `dg`, `dbeta` are summed in a fixed order (no
 atomics), so gradients are deterministic.
+
+From torch, `tessl_torch.chunk_gated_delta_rule` has transformers' signature
+and `tessl_torch.patch_transformers_qwen3_5()` swaps it in for the fallback
+(`python/tests/test_gdn.py`: against transformers' own function through
+autograd, every output and gradient within 1.0e-6 relative in f32 and within
+bf16 rounding in bf16; a small Qwen3.5 with grouped GDN heads trains with the
+same loss and parameter gradients, worst 1e-3, patched or not).
 
 `tests/gdn_train.rs`: the f64 reference's forward equals the
 transformers-anchored recurrence to 1e-12, its hand-derived backward equals

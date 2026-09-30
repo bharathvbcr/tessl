@@ -17,7 +17,7 @@ use objc2_metal::{MTLBuffer, MTLDevice, MTLResourceOptions};
 use tessl::capi::{
     tessl_abi_version, tessl_cross_entropy_rows, tessl_mtl_buffer_length, tessl_runtime_free,
     tessl_runtime_new, tessl_synchronize, TesslCeArgs, TesslRuntime, TesslTensorRef, TESSL_ABI_VERSION,
-    TESSL_ERR, TESSL_F32, TESSL_OK,
+    TESSL_ERR, TESSL_F32, TESSL_MAX_DIMS, TESSL_OK,
 };
 use tessl::cross_entropy::{cross_entropy_rows, CeGrads, CeHidden, CeWorkspace, Reduction};
 use tessl::{DType, GpuRuntime};
@@ -61,7 +61,7 @@ fn read(b: &ProtocolObject<dyn MTLBuffer>, n: usize) -> Vec<f32> {
 }
 
 fn tref(b: &ProtocolObject<dyn MTLBuffer>, shape: &[u64]) -> TesslTensorRef {
-    let mut s = [0u64; 4];
+    let mut s = [0u64; TESSL_MAX_DIMS];
     s[..shape.len()].copy_from_slice(shape);
     TesslTensorRef {
         buffer: b as *const _ as *mut c_void,
@@ -77,7 +77,7 @@ const NULL_REF: TesslTensorRef = TesslTensorRef {
     byte_offset: 0,
     dtype: 0,
     ndim: 0,
-    shape: [0; 4],
+    shape: [0; TESSL_MAX_DIMS],
 };
 
 #[test]
@@ -201,7 +201,7 @@ fn every_refusal_is_a_status_and_a_message() {
         refused(TesslCeArgs { reduction: 7, ..good }, "reduction 7");
         refused(TesslCeArgs { hidden: NULL_REF, ..good }, "hidden: null MTLBuffer");
         refused(TesslCeArgs { hidden: TesslTensorRef { dtype: 9, ..good.hidden }, ..good }, "unknown dtype code 9");
-        refused(TesslCeArgs { hidden: TesslTensorRef { ndim: 5, ..good.hidden }, ..good }, "rank 5");
+        refused(TesslCeArgs { hidden: TesslTensorRef { ndim: 7, ..good.hidden }, ..good }, "rank 7");
         refused(TesslCeArgs { weight: TesslTensorRef { ndim: 1, ..good.weight }, ..good }, "weight must be 2-D");
         refused(
             TesslCeArgs { hidden: TesslTensorRef { byte_offset: 8, ..good.hidden }, ..good },

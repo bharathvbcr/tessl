@@ -7,7 +7,7 @@ pattern (3 GDN layers + 1 attention layer) with random weights: what a layer
 saves depends on shapes, not weights, so per-layer numbers scale to 24 layers
 by 6x. The LM head's full-vocabulary loss is measured separately.
 
-    python3 tools/qwen35_ref/saved_memory.py --tokens 512 1024 2048
+    python3 tools/qwen35_ref/saved_memory.py --tokens 512 1024 2048 [--tessl]
 """
 
 import argparse
@@ -88,7 +88,16 @@ def measure(model, tokens, vocab):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--tokens", type=int, nargs="+", default=[512, 1024])
+    ap.add_argument("--tessl", action="store_true", help="run the chunked GDN on tessl (tessl_torch)")
     args = ap.parse_args()
+    if args.tessl:
+        import sys
+        from pathlib import Path
+
+        sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "python"))
+        import tessl_torch
+
+        tessl_torch.patch_transformers_qwen3_5()
     cfg = Qwen3_5TextConfig(
         hidden_size=2048,
         intermediate_size=6144,
@@ -111,7 +120,8 @@ def main():
     model = mq.Qwen3_5TextModel(cfg).to(MPS, torch.bfloat16)
     model.train()
     attach(model)
-    print(f"torch {torch.__version__}; bf16 on MPS; 3 GDN + 1 attention layer, Qwen3.5-2B dims")
+    gdn = "tessl" if args.tessl else "torch fallback"
+    print(f"torch {torch.__version__}; bf16 on MPS; 3 GDN + 1 attention layer, Qwen3.5-2B dims; GDN: {gdn}")
     for t in args.tokens:
         by, peak_fwd, peak_all = measure(model, t, cfg.vocab_size)
         total = sum(by.values())

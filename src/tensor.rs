@@ -53,6 +53,25 @@ pub(crate) fn checked_nbytes(shape: &[usize], dtype: DType) -> Result<usize, Str
         .ok_or_else(|| "tensor byte size overflow".to_string())
 }
 
+/// A `shape` x `dtype` view at `byte_offset` must be element-aligned and fit
+/// in `nbytes`.
+fn check_view_bounds(
+    nbytes: usize,
+    shape: &[usize],
+    dtype: DType,
+    byte_offset: usize,
+) -> Result<(), String> {
+    let bytes = checked_nbytes(shape, dtype)?;
+    if byte_offset % dtype.size_of() != 0
+        || byte_offset
+            .checked_add(bytes)
+            .is_none_or(|end| end > nbytes)
+    {
+        return Err("tensor view is misaligned or out of bounds".into());
+    }
+    Ok(())
+}
+
 /// Shared Metal buffer with recycle / residency policy.
 pub(crate) struct PooledBuffer {
     pub(crate) buffer: Retained<ProtocolObject<dyn MTLBuffer>>,
@@ -475,6 +494,12 @@ impl Tensor {
             return Err("MTLBuffer device registryID does not match GpuRuntime device".into());
         }
         let nbytes = buffer.length();
+        // Checked before any bookkeeping: a rejected wrap must leave no trace.
+        // It used to register residency first and build the wrapper, whose
+        // drop then scheduled a residency *removal* of that MTLBuffer, which
+        // took residency away from a live, successful wrap of the same buffer
+        // at the next drain.
+        check_view_bounds(nbytes, shape, dtype, byte_offset)?;
         let weak = runtime.weak_self();
         runtime.register_residency(&buffer);
         #[allow(clippy::arc_with_non_send_sync)]
@@ -523,15 +548,7 @@ impl Tensor {
 
     /// Validate public metadata before passing a view to a GPU kernel.
     pub(crate) fn validate(&self) -> Result<(), String> {
-        let bytes = checked_nbytes(&self.shape, self.dtype)?;
-        if self.byte_offset % self.dtype.size_of() != 0
-            || self
-                .byte_offset
-                .checked_add(bytes)
-                .is_none_or(|end| end > self.buffer.nbytes())
-        {
-            return Err("tensor view is misaligned or out of bounds".into());
-        }
+        check_view_bounds(self.buffer.nbytes(), &self.shape, self.dtype, self.byte_offset)?;
         if !self
             .buffer
             .inner
@@ -778,6 +795,31 @@ mod contract_tests {
 #[cfg(test)]
 mod audit_tests {
     use super::*;
+
+    /// A rejected wrap must not take residency away from a live wrap of the
+    /// same MTLBuffer. It used to register residency, build the wrapper, then
+    /// fail validation; the wrapper's drop scheduled a residency removal that
+    /// the next drain applied to the buffer the successful wrap still used.
+    #[test]
+    fn a_rejected_wrap_leaves_a_live_wrap_resident() {
+        use objc2_metal::{MTLDevice, MTLResidencySet, MTLResourceOptions};
+        let rt = GpuRuntime::new().unwrap();
+        let raw = rt
+            .device
+            .newBufferWithLength_options(16, MTLResourceOptions::StorageModeShared)
+            .unwrap();
+        let err = Tensor::from_mtl_buffer(&rt, raw.clone(), &[8], DType::F32, 0).unwrap_err();
+        assert!(err.contains("out of bounds"), "{err}");
+        let live = Tensor::from_mtl_buffer(&rt, raw.clone(), &[4], DType::F32, 0).unwrap();
+        // Drains retired allocations (a waited commit).
+        rt.synchronize().unwrap();
+        let alloc = ProtocolObject::<dyn objc2_metal::MTLAllocation>::from_ref(&*raw);
+        assert!(
+            rt.metal4.residency.containsAllocation(alloc),
+            "the live wrap's buffer was removed from the residency set"
+        );
+        drop(live);
+    }
 
     #[test]
     fn stress_mapping_reentry_and_queued_copies() {

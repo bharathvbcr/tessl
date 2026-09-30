@@ -255,7 +255,7 @@ struct AllocatorSlot {
 }
 
 /// Metal 4 encode package (queue / dual allocators / argument table / CounterHeap).
-pub struct Metal4EncodePackage {
+pub(crate) struct Metal4EncodePackage {
     pub queue: Retained<ProtocolObject<dyn MTL4CommandQueue>>,
     /// Dual allocators — GPU runs one CB while host encodes the next.
     allocators: Mutex<[AllocatorSlot; 2]>,
@@ -410,7 +410,7 @@ pub struct GpuRuntime {
     /// Extra metallibs (e.g. gemma-metal overlay) searched after [`Self::library`].
     overlay_libraries: Mutex<Vec<Retained<ProtocolObject<dyn MTLLibrary>>>>,
     /// Metal 4 encode package (required; init fails if unavailable).
-    pub metal4: Metal4EncodePackage,
+    pub(crate) metal4: Metal4EncodePackage,
     pipelines: Mutex<PipelineCache>,
     pool: Mutex<BufferPool>,
     /// Per-step bump arena (single slab). Reset only after GPU work that used
@@ -684,6 +684,18 @@ impl GpuRuntime {
     /// SharedEvent signaled on every Metal 4 commit. Cross-crate callers that
     /// share an `MTLBuffer` (for example sparsl SpMV reading a tessl GEMM
     /// output) wait on this event after tessl work — queues are not merged.
+    ///
+    /// This accessor and [`Self::last_signaled_value`] are the whole public
+    /// view of the Metal 4 package. Its queue, allocators, argument table,
+    /// constant arena and residency set stay inside the crate: a caller
+    /// holding them could encode or reset outside the encoder lease, or
+    /// advance the arena cursor under a command buffer still reading it.
+    ///
+    /// ```compile_fail,E0616
+    /// fn reach_in(rt: &tessl::GpuRuntime) {
+    ///     let _queue = &rt.metal4.queue;
+    /// }
+    /// ```
     pub fn shared_event(&self) -> &ProtocolObject<dyn MTLSharedEvent> {
         &self.metal4.shared_event
     }

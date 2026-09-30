@@ -370,6 +370,13 @@ impl ParamsBuffer {
     }
 
     /// Push a `u32`; returns byte offset into the params buffer.
+    ///
+    /// The write takes the runtime's host-access lease, as every host write
+    /// into a GPU buffer does: pending work is committed and waited for first.
+    /// After a [`Self::reset`] the next push reuses slot 0, which a dispatch
+    /// encoded in the previous step may still be waiting to read; a raw write
+    /// would change the value under it. It fails with "runtime busy" when
+    /// called from inside an encoder closure.
     pub fn push_u32(&self, v: u32) -> Result<usize, String> {
         let mut cursor = self.cursor.lock().map_err(|e| e.to_string())?;
         let offset = *cursor;
@@ -382,12 +389,8 @@ impl ParamsBuffer {
                 self.capacity
             ));
         }
-        // SAFETY: exclusive host write into StorageModeShared Hot buffer; caller
-        // must not race GPU reads of this slot until after the push completes.
-        let ptr = self.buffer.metal().contents().as_ptr() as *mut u8;
-        unsafe {
-            std::ptr::write_unaligned(ptr.add(offset) as *mut u32, v);
-        }
+        let mut bytes = self.buffer.try_contents_u8()?;
+        bytes[offset..next].copy_from_slice(&v.to_ne_bytes());
         *cursor = next;
         Ok(offset)
     }

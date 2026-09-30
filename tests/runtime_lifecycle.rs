@@ -574,3 +574,46 @@ fn a_runtime_that_outlives_its_tensors_still_works() {
         rt.synchronize().unwrap();
     });
 }
+
+/// A params slot is not rewritten under a dispatch that has been encoded but
+/// not yet run. With async encode on, the dispatch below sits in an open
+/// command buffer when the step resets the cursor and pushes the next value
+/// into the same slot; a raw host write lands first and the kernel reads the
+/// new value. The push has to take the host-access lease, which commits and
+/// waits, as every other host write into a GPU buffer does.
+#[test]
+fn a_params_push_waits_for_encoded_work_reading_the_slot() {
+    with_gpu(|rt| {
+        rt.set_async_encode(true).expect("async encode");
+        let out = rt.alloc_buffer(4).expect("alloc");
+        out.write_f32(&[0.0]);
+        let off = rt
+            .with_params(|p| {
+                p.reset();
+                p.push_f32(7.0)
+            })
+            .expect("params")
+            .expect("push 7");
+        let pipe = rt.pipeline("add_inplace_f32").expect("pipeline");
+        rt.with_params(|p| {
+            tessl::dispatch::dispatch_1d(rt, &pipe, 1, |bnd| {
+                tessl::dispatch::set_gpu_buf(bnd, &out, 0);
+                tessl::dispatch::set_gpu_buf_offset(bnd, p.buffer(), off, 1);
+                tessl::dispatch::set_u32(bnd, 1, 2);
+            })
+        })
+        .expect("params")
+        .expect("dispatch");
+        let next = rt
+            .with_params(|p| {
+                p.reset();
+                p.push_f32(9.0)
+            })
+            .expect("params")
+            .expect("push 9");
+        assert_eq!(next, off, "the reset should reuse the slot");
+        rt.synchronize().expect("sync");
+        rt.set_async_encode(false).expect("sync encode");
+        assert_eq!(out.read_f32(), vec![7.0], "the encoded dispatch read the next step's value");
+    });
+}

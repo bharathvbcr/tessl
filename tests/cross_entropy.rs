@@ -19,7 +19,7 @@ use std::sync::Arc;
 
 use common::{buf, buf_bf16, random_f32, round_trip_bf16, with_gpu};
 use tessl::cross_entropy::{
-    cross_entropy_rows, CeGrads, CeHidden, CeOutput, CeWeight, CeWorkspace, Reduction,
+    cross_entropy_rows, CeGrads, CeHidden, CeOutput, CeWorkspace, Reduction,
 };
 use tessl::tensor::{DType, GpuBuffer, Tensor};
 use tessl::GpuRuntime;
@@ -46,6 +46,10 @@ struct Case {
     /// `factor` times the supplied row's hidden vector, planting a dominant
     /// logit in a chosen chunk.
     plant: Option<(usize, usize, f32)>,
+    /// Elements of NaN before the hidden and weight tensors in their buffers,
+    /// so a view read from the buffer's base instead of its offset shows.
+    h_base: usize,
+    w_base: usize,
 }
 
 impl Case {
@@ -66,6 +70,8 @@ impl Case {
             h_scale: 1.0,
             seed,
             plant: None,
+            h_base: 0,
+            w_base: 0,
         }
     }
 }
@@ -83,6 +89,16 @@ fn maybe_round(v: Vec<f32>, dtype: DType) -> Vec<f32> {
     } else {
         v
     }
+}
+
+/// `v` as a `shape` tensor `base` elements into a buffer whose first `base`
+/// elements are NaN.
+fn upload_at(rt: &Arc<GpuRuntime>, v: &[f32], dtype: DType, shape: &[usize], base: usize) -> Tensor {
+    let mut all = vec![f32::NAN; base];
+    all.extend_from_slice(v);
+    let buf = upload(rt, &all, dtype);
+    let size = if dtype == DType::BF16 { 2 } else { 4 };
+    Tensor::from_buffer(rt, buf, shape, dtype, base * size).expect("tensor at offset")
 }
 
 fn upload(rt: &Arc<GpuRuntime>, v: &[f32], dtype: DType) -> GpuBuffer {
@@ -205,23 +221,16 @@ fn check(rt: &Arc<GpuRuntime>, c: &Case) -> f64 {
     let w = maybe_round(w, c.w_dtype);
     let want = reference(c, &h, &w);
 
-    let hb = upload(rt, &h, c.h_dtype);
-    let wb = upload(rt, &w, c.w_dtype);
-    let hid = CeHidden {
-        buf: &hb,
-        dtype: c.h_dtype,
-        rows: c.rows_total as u32,
-        ld: c.ld as u32,
-        off: c.off as u32,
-    };
-    let wt = CeWeight { buf: &wb, dtype: c.w_dtype, vocab: c.vocab as u32 };
+    let ht = upload_at(rt, &h, c.h_dtype, &[c.rows_total, c.ld], c.h_base);
+    let wt = upload_at(rt, &w, c.w_dtype, &[c.vocab, c.hidden], c.w_base);
+    let hid = CeHidden { rows: &ht, off: c.off as u32 };
     let n = c.rows.len();
     // A workspace larger than the call needs, as a training loop reuses one.
     let ws = CeWorkspace::new(rt, n as u32 + 3, c.hidden as u32, c.chunk as u32, c.w_dtype)
         .expect("workspace");
 
     let fwd = cross_entropy_rows(
-        rt, hid, wt, c.hidden as u32, &c.rows, &c.targets, c.reduction, &ws, None,
+        rt, hid, &wt, &c.rows, &c.targets, c.reduction, &ws, None,
     )
     .unwrap_or_else(|e| panic!("{label}: {e}"));
     assert_loss(&format!("{label} (forward only)"), &fwd, &want);
@@ -231,8 +240,7 @@ fn check(rt: &Arc<GpuRuntime>, c: &Case) -> f64 {
     let out = cross_entropy_rows(
         rt,
         hid,
-        wt,
-        c.hidden as u32,
+        &wt,
         &c.rows,
         &c.targets,
         c.reduction,
@@ -279,6 +287,11 @@ fn matches_the_f64_reference_across_the_chunk_walk() {
         check(rt, &Case { chunk: 4096, ..Case::small(6) });
         // The hidden columns a window inside a wider row.
         check(rt, &Case { ld: 96, off: 24, h_dtype: DType::BF16, ..Case::small(7) });
+        // Tensors that start inside their buffers (a torch view's storage
+        // offset), NaN before them: odd for the gather, 16-byte aligned for
+        // the weight's GEMM operands.
+        check(rt, &Case { h_base: 3, w_base: 8, h_dtype: DType::BF16, w_dtype: DType::BF16, ..Case::small(8) });
+        check(rt, &Case { h_base: 5, w_base: 4, ..Case::small(9) });
     });
 }
 
@@ -364,18 +377,17 @@ fn rejects_what_it_cannot_compute() {
         let c = Case::small(31);
         let h = random_f32(c.rows_total * c.ld, 1);
         let w = random_f32(c.vocab * c.hidden, 2);
-        let hb = buf(rt, &h);
-        let wb = buf(rt, &w);
-        let hid = CeHidden { buf: &hb, dtype: DType::F32, rows: 10, ld: 64, off: 0 };
-        let wt = CeWeight { buf: &wb, dtype: DType::F32, vocab: 997 };
+        let ht = tensor_at(rt, &h, &[10, 64]);
+        let wt = tensor_at(rt, &w, &[997, 64]);
+        let hid = CeHidden { rows: &ht, off: 0 };
         let ws = CeWorkspace::new(rt, 4, 64, 128, DType::F32).expect("workspace");
         let run = |hid: CeHidden<'_>,
-                   wt: CeWeight<'_>,
+                   wt: &Tensor,
                    rows: &[u32],
                    targets: &[u32],
                    ws: &CeWorkspace,
                    grads: Option<CeGrads<'_>>| {
-            cross_entropy_rows(rt, hid, wt, 64, rows, targets, Reduction::Mean, ws, grads)
+            cross_entropy_rows(rt, hid, wt, rows, targets, Reduction::Mean, ws, grads)
                 .map(|o| o.loss)
         };
         let expect_err = |r: Result<f64, String>, needle: &str| match r {
@@ -383,68 +395,79 @@ fn rejects_what_it_cannot_compute() {
             Err(e) => assert!(e.contains(needle), "error {e:?} lacks {needle:?}"),
         };
 
-        expect_err(run(hid, wt, &[], &[], &ws, None), "no supervised rows");
-        expect_err(run(hid, wt, &[1, 2], &[1], &ws, None), "2 rows but 1 targets");
-        expect_err(run(hid, wt, &[0; 5], &[0; 5], &ws, None), "exceed the workspace");
-        expect_err(run(hid, wt, &[1, 10], &[0, 0], &ws, None), "rows[1] = 10");
-        expect_err(run(hid, wt, &[1, 2], &[996, 997], &ws, None), "targets[1] = 997");
-        expect_err(
-            run(CeHidden { off: 8, ..hid }, wt, &[1], &[1], &ws, None),
-            "exceeds ld",
-        );
-        expect_err(
-            run(CeHidden { rows: 11, ..hid }, wt, &[1], &[1], &ws, None),
-            "cross_entropy hidden",
-        );
-        expect_err(
-            run(hid, CeWeight { vocab: 998, ..wt }, &[1], &[1], &ws, None),
-            "cross_entropy weight",
-        );
+        expect_err(run(hid, &wt, &[], &[], &ws, None), "no supervised rows");
+        expect_err(run(hid, &wt, &[1, 2], &[1], &ws, None), "2 rows but 1 targets");
+        expect_err(run(hid, &wt, &[0; 5], &[0; 5], &ws, None), "exceed the workspace");
+        expect_err(run(hid, &wt, &[1, 10], &[0, 0], &ws, None), "rows[1] = 10");
+        expect_err(run(hid, &wt, &[1, 2], &[996, 997], &ws, None), "targets[1] = 997");
+        expect_err(run(CeHidden { off: 8, ..hid }, &wt, &[1], &[1], &ws, None), "exceeds ld");
+        let flat = ht.try_view(&[640], 0).unwrap();
+        expect_err(run(CeHidden { rows: &flat, off: 0 }, &wt, &[1], &[1], &ws, None), "2-D");
+        let w16 = rt.alloc_tensor_f16(&[997, 64]).unwrap();
+        expect_err(run(hid, &w16, &[1], &[1], &ws, None), "f32 or bf16");
+        let narrow = wt.try_view(&[997, 32], 0).unwrap();
+        expect_err(run(hid, &narrow, &[1], &[1], &ws, None), "workspace is for hidden 64");
         let ws_bf16 = CeWorkspace::new(rt, 4, 64, 128, DType::BF16).expect("workspace");
-        expect_err(run(hid, wt, &[1], &[1], &ws_bf16, None), "workspace is for");
-
+        expect_err(run(hid, &wt, &[1], &[1], &ws_bf16, None), "workspace is for");
+        // Already inside with_gpu's lock, so the second runtime is made here.
+        let other = GpuRuntime::new().expect("second runtime");
+        let foreign = tensor_at(&other, &h, &[10, 64]);
         expect_err(
-            CeWorkspace::new(rt, 4, 60, 128, DType::F32).map(|_| 0.0),
-            "multiple of 8",
+            run(CeHidden { rows: &foreign, off: 0 }, &wt, &[1], &[1], &ws, None),
+            "hidden belongs to another runtime",
         );
+
+        expect_err(CeWorkspace::new(rt, 4, 60, 128, DType::F32).map(|_| 0.0), "multiple of 8");
         expect_err(CeWorkspace::new(rt, 0, 64, 128, DType::F32).map(|_| 0.0), "non-zero");
         expect_err(CeWorkspace::new(rt, 4, 64, 0, DType::F32).map(|_| 0.0), "non-zero");
         expect_err(CeWorkspace::new(rt, 4, 64, 8, DType::F16).map(|_| 0.0), "f32 or bf16");
 
-        // Gradients: shape, scale, aliasing of each other and of the inputs.
+        // Gradients: shape, scale, and overlap with each other and the inputs.
         let dh = rt.alloc_tensor_f32(&[2, 64]).expect("alloc");
         let dw = rt.alloc_tensor_f32(&[997, 64]).expect("alloc");
         let g = |dh, dw, scale| Some(CeGrads { dh, dw, scale });
-        expect_err(run(hid, wt, &[1], &[1], &ws, g(&dh, &dw, 1.0)), "dh must be f32 [1, 64]");
-        expect_err(run(hid, wt, &[1, 2], &[1, 2], &ws, g(&dh, &dw, f32::NAN)), "finite");
+        expect_err(run(hid, &wt, &[1], &[1], &ws, g(&dh, &dw, 1.0)), "dh must be f32 [1, 64]");
+        expect_err(run(hid, &wt, &[1, 2], &[1, 2], &ws, g(&dh, &dw, f32::NAN)), "finite");
         let dw_as_dh = dw.try_view(&[2, 64], 0).expect("view");
         expect_err(
-            run(hid, wt, &[1, 2], &[1, 2], &ws, g(&dw_as_dh, &dw, 1.0)),
-            "writable buffers dh and dw overlap",
+            run(hid, &wt, &[1, 2], &[1, 2], &ws, g(&dw_as_dh, &dw, 1.0)),
+            "dh and dw overlap",
         );
-        let w_tensor =
-            Tensor::from_buffer(rt, wb.clone(), &[997, 64], DType::F32, 0).expect("wrap");
         expect_err(
-            run(hid, wt, &[1, 2], &[1, 2], &ws, g(&dh, &w_tensor, 1.0)),
-            "writable buffer dw overlaps read-only buffer weight",
+            run(hid, &wt, &[1, 2], &[1, 2], &ws, g(&dh, &wt, 1.0)),
+            "dw overlaps the weight",
         );
+        let dh_in_h = ht.try_view(&[2, 64], 64).expect("view");
+        expect_err(
+            run(hid, &wt, &[1, 2], &[1, 2], &ws, g(&dh_in_h, &dw, 1.0)),
+            "dh overlaps the hidden",
+        );
+        // One storage, disjoint windows: hidden rows [0, 4), dh rows [8, 10).
+        let h_head = ht.try_view(&[4, 64], 0).expect("view");
+        let dh_tail = ht.try_view(&[2, 64], 8 * 64).expect("view");
+        run(CeHidden { rows: &h_head, off: 0 }, &wt, &[1, 2], &[1, 2], &ws, g(&dh_tail, &dw, 1.0))
+            .expect("disjoint windows of one buffer are not an overlap");
 
         // Non-finite inputs surface as an error, not a NaN loss.
         let mut bad = h.clone();
         bad[64 + 3] = f32::NAN;
-        let bad_b = buf(rt, &bad);
+        let bad_t = tensor_at(rt, &bad, &[10, 64]);
         expect_err(
-            run(CeHidden { buf: &bad_b, ..hid }, wt, &[1], &[1], &ws, None),
+            run(CeHidden { rows: &bad_t, off: 0 }, &wt, &[1], &[1], &ws, None),
             "not finite",
         );
 
         // Relaxed-precision GEMMs would silently break the exactness contract.
         rt.set_relaxed_precision(true);
-        let r = run(hid, wt, &[1], &[1], &ws, None);
+        let r = run(hid, &wt, &[1], &[1], &ws, None);
         rt.set_relaxed_precision(false);
         expect_err(r, "relaxed precision");
 
         // After every rejection the entry point still computes.
-        run(hid, wt, &[1, 2], &[3, 4], &ws, g(&dh, &dw, 1.0)).expect("a valid call still runs");
+        run(hid, &wt, &[1, 2], &[3, 4], &ws, g(&dh, &dw, 1.0)).expect("a valid call still runs");
     });
+}
+
+fn tensor_at(rt: &Arc<GpuRuntime>, v: &[f32], shape: &[usize]) -> Tensor {
+    upload_at(rt, v, DType::F32, shape, 0)
 }

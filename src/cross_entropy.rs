@@ -36,9 +36,9 @@ use std::sync::Arc;
 
 use objc2_metal::MTLComputePipelineState;
 
-use crate::dispatch::{dispatch_2d, set_f32, set_gpu_buf, set_u32};
+use crate::dispatch::{dispatch_2d, set_f32, set_gpu_buf, set_tensor, set_u32};
 use crate::gemm::{cast_bf16_to_f32_into, gemm_f32, gemm_nt_f32, gemm_tn_f32, GemmBackend};
-use crate::nn::{dispatch_tg_1d, reduce_tptg, require, require_disjoint_writes};
+use crate::nn::{dispatch_tg_1d, reduce_tptg};
 use crate::runtime::GpuRuntime;
 use crate::tensor::{DType, GpuBuffer, Tensor};
 
@@ -53,23 +53,13 @@ pub enum Reduction {
     Sum,
 }
 
-/// The hidden states: `rows` rows of `ld` elements, the `hidden` columns
-/// starting at `off` in each. f32 or bf16.
+/// The hidden states: `rows` is a `[T, ld]` f32 or bf16 tensor (at any byte
+/// offset, so a view into a larger storage works), and the hidden columns
+/// are `[off, off + hidden)` of each row. `hidden` is the weight's width.
 #[derive(Clone, Copy, Debug)]
 pub struct CeHidden<'a> {
-    pub buf: &'a GpuBuffer,
-    pub dtype: DType,
-    pub rows: u32,
-    pub ld: u32,
+    pub rows: &'a Tensor,
     pub off: u32,
-}
-
-/// The `[vocab, hidden]` weight (the tied embedding), dense, f32 or bf16.
-#[derive(Clone, Copy, Debug)]
-pub struct CeWeight<'a> {
-    pub buf: &'a GpuBuffer,
-    pub dtype: DType,
-    pub vocab: u32,
 }
 
 /// Where the gradients go. `dh` is dense f32 `[n, hidden]`, row `i` the
@@ -177,8 +167,7 @@ impl CeWorkspace {
 pub fn cross_entropy_rows(
     rt: &Arc<GpuRuntime>,
     h: CeHidden<'_>,
-    weight: CeWeight<'_>,
-    hidden: u32,
+    weight: &Tensor,
     rows: &[u32],
     targets: &[u32],
     reduction: Reduction,
@@ -196,49 +185,54 @@ pub fn cross_entropy_rows(
     if n > ws.max_rows as usize {
         return Err(format!("{WHAT}: {n} rows exceed the workspace's {}", ws.max_rows));
     }
-    if hidden != ws.hidden || weight.dtype != ws.weight_dtype {
-        return Err(format!(
-            "{WHAT}: workspace is for hidden {} / {:?} weights, not {hidden} / {:?}",
-            ws.hidden, ws.weight_dtype, weight.dtype
-        ));
-    }
     if rt.relaxed_precision() {
         return Err(format!("{WHAT}: needs exact-f32 GEMMs; switch relaxed precision off"));
     }
-    if let Some((i, &r)) = rows.iter().enumerate().find(|(_, &r)| r >= h.rows) {
-        return Err(format!("{WHAT}: rows[{i}] = {r} is past the {} hidden rows", h.rows));
+    for (name, t) in [("hidden", h.rows), ("weight", weight)] {
+        t.validate().map_err(|e| format!("{WHAT}: {name}: {e}"))?;
+        if !Arc::ptr_eq(t.runtime(), rt) {
+            return Err(format!("{WHAT}: {name} belongs to another runtime"));
+        }
+        if t.shape().len() != 2 || !matches!(t.dtype, DType::F32 | DType::BF16) {
+            return Err(format!(
+                "{WHAT}: {name} must be a 2-D f32 or bf16 tensor, got {:?} {:?}",
+                t.dtype,
+                t.shape()
+            ));
+        }
     }
-    if let Some((i, &t)) = targets.iter().enumerate().find(|(_, &t)| t >= weight.vocab) {
-        return Err(format!("{WHAT}: targets[{i}] = {t} is past the vocabulary {}", weight.vocab));
-    }
-    if weight.vocab == 0 {
+    let (vs, hs) = (weight.shape()[0], weight.shape()[1]);
+    let (t_rows, ld) = (h.rows.shape()[0], h.rows.shape()[1]);
+    if vs == 0 {
         return Err(format!("{WHAT}: empty vocabulary"));
     }
-    let (hs, vs) = (hidden as usize, weight.vocab as usize);
-    // Hidden window and weight extent.
-    if u64::from(h.off) + u64::from(hidden) > u64::from(h.ld) {
-        return Err(format!("{WHAT}: hidden window [{}, +{hidden}) exceeds ld {}", h.off, h.ld));
+    if hs != ws.hidden as usize || weight.dtype != ws.weight_dtype {
+        return Err(format!(
+            "{WHAT}: workspace is for hidden {} / {:?} weights, not {hs} / {:?}",
+            ws.hidden, ws.weight_dtype, weight.dtype
+        ));
     }
-    let h_elems = (h.rows as usize)
-        .checked_mul(h.ld as usize)
-        .ok_or_else(|| format!("{WHAT}: hidden size overflows"))?;
-    match h.dtype {
-        DType::F32 => require::<f32>(rt, h.buf, h_elems, "cross_entropy hidden")?,
-        DType::BF16 => require::<u16>(rt, h.buf, h_elems, "cross_entropy hidden")?,
-        other => return Err(format!("{WHAT}: hidden must be f32 or bf16, got {other:?}")),
+    if vs > u32::MAX as usize || t_rows > u32::MAX as usize || ld > u32::MAX as usize {
+        return Err(format!("{WHAT}: vocabulary, rows and ld must fit u32"));
     }
-    let w_elems = vs
-        .checked_mul(hs)
-        .ok_or_else(|| format!("{WHAT}: weight size overflows"))?;
-    match weight.dtype {
-        DType::F32 => require::<f32>(rt, weight.buf, w_elems, "cross_entropy weight")?,
-        _ => require::<u16>(rt, weight.buf, w_elems, "cross_entropy weight")?,
+    if (h.off as usize).checked_add(hs).is_none_or(|end| end > ld) {
+        return Err(format!("{WHAT}: hidden window [{}, +{hs}) exceeds ld {ld}", h.off));
+    }
+    if let Some((i, &r)) = rows.iter().enumerate().find(|(_, &r)| r as usize >= t_rows) {
+        return Err(format!("{WHAT}: rows[{i}] = {r} is past the {t_rows} hidden rows"));
+    }
+    if let Some((i, &t)) = targets.iter().enumerate().find(|(_, &t)| t as usize >= vs) {
+        return Err(format!("{WHAT}: targets[{i}] = {t} is past the vocabulary {vs}"));
     }
     if let Some(g) = &grads {
         if !g.scale.is_finite() {
             return Err(format!("{WHAT}: scale must be finite"));
         }
         for (name, t, want) in [("dh", g.dh, [n, hs]), ("dw", g.dw, [vs, hs])] {
+            t.validate().map_err(|e| format!("{WHAT}: {name}: {e}"))?;
+            if !Arc::ptr_eq(t.runtime(), rt) {
+                return Err(format!("{WHAT}: {name} belongs to another runtime"));
+            }
             if t.dtype != DType::F32 || t.shape() != want {
                 return Err(format!(
                     "{WHAT}: {name} must be f32 {want:?}, got {:?} {:?}",
@@ -247,34 +241,40 @@ pub fn cross_entropy_rows(
                 ));
             }
         }
-        require_disjoint_writes(
-            WHAT,
-            &[("dh", &g.dh.buffer), ("dw", &g.dw.buffer)],
-            &[("hidden", h.buf), ("weight", weight.buf)],
-        )?;
-        for (name, b) in ws_buffers(ws) {
-            if g.dh.buffer.aliases(b) || g.dw.buffer.aliases(b) {
-                return Err(format!("{WHAT}: a gradient output aliases the workspace's {name}"));
+        if g.dh.overlaps(g.dw) {
+            return Err(format!("{WHAT}: dh and dw overlap"));
+        }
+        for (out, o) in [("dh", g.dh), ("dw", g.dw)] {
+            for (inp, i) in [("hidden", h.rows), ("weight", weight)] {
+                if o.overlaps(i) {
+                    return Err(format!("{WHAT}: {out} overlaps the {inp} it is computed from"));
+                }
+            }
+            for (name, b) in ws_buffers(ws) {
+                if o.buffer.aliases(b) {
+                    return Err(format!("{WHAT}: {out} aliases the workspace's {name}"));
+                }
             }
         }
     }
+    let hidden = hs as u32;
 
     ws.rows.write_u32(&pad(rows, ws.max_rows));
     ws.targets.write_u32(&pad(targets, ws.max_rows));
     let n32 = n as u32;
 
     // 1. Gather the supervised rows into f32.
-    let gather = rt.pipeline(match h.dtype {
+    let gather = rt.pipeline(match h.rows.dtype {
         DType::F32 => "ce_gather_rows_f32",
         _ => "ce_gather_rows_bf16",
     })?;
     dispatch_2d(rt, &gather, hs, n, |bnd| {
-        set_gpu_buf(bnd, h.buf, 0);
+        set_tensor(bnd, h.rows, 0);
         set_gpu_buf(bnd, &ws.rows, 1);
         set_gpu_buf(bnd, &ws.h.buffer, 2);
         set_u32(bnd, n32, 3);
         set_u32(bnd, hidden, 4);
-        set_u32(bnd, h.ld, 5);
+        set_u32(bnd, ld as u32, 5);
         set_u32(bnd, h.off, 6);
     })?;
     let h_rows = ws.h.try_view(&[n, hs], 0)?;
@@ -283,10 +283,10 @@ pub fn cross_entropy_rows(
     let lse = rt.pipeline("ce_lse_update")?;
     // The f32 weight rows [v0, v0 + w) for GEMMs, widening a bf16 chunk first.
     let weight_chunk = |v0: usize, w: usize| -> Result<Tensor, String> {
+        let src = weight.try_view(&[w, hs], v0 * hs)?;
         match weight.dtype {
-            DType::F32 => Tensor::from_buffer(rt, weight.buf.clone(), &[w, hs], DType::F32, v0 * hs * 4),
+            DType::F32 => Ok(src),
             _ => {
-                let src = Tensor::from_buffer(rt, weight.buf.clone(), &[w, hs], DType::BF16, v0 * hs * 2)?;
                 let dst = ws
                     .w32
                     .as_ref()

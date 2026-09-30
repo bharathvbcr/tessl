@@ -913,6 +913,12 @@ is the largest non-GEMM share: 18 × 1.4 ms.
   misbehaves, but under fast math the compiler may assume no infinities.
   The cross-entropy kernels use `-FLT_MAX` and a `first` flag instead, which
   is the pattern to move the attention kernels to.
+- **Exact f32 at the MLP up/gate shape.** Production's exact-f32 NN runs
+  2048 x 6144 x 2048 at 4.1 TFLOP/s against 5.7 at 2048^3, and a
+  register-accumulator 128x64 sg8 tile runs it 1.45x faster with the same
+  bits (`bench/results/f32_exact_coop_m5pro.txt`). Everywhere else that tile
+  is within 0-11%, so exact f32 stays on its 32x32 kernel; why the one shape
+  is slow was not diagnosed.
 - **Two compositions of the same model.** `bench_qwen35_layers` (random
   weights, timing) and `qwen35_model` (real checkpoint, parity) each wire the
   layers; the bench should run on `Qwen35Model` so a wiring fix lands once.

@@ -1,0 +1,266 @@
+# Exact-f32 NN with a register accumulator vs production — M5 Pro, 2026-09-30
+#
+# Question: does a cooperative-destination (register-accumulator) exact-f32
+# NN beat production's exact f32 NN (32x32, one simdgroup, zero pre-pass,
+# TILE_F32)? Qwen35's train_step runs every GEMM on that kernel, about 5.6 s
+# of its 7.2 s step at T = 2048 on the 2B. `TESSL_GEMM_TUNE=1 cargo build
+# --release --bins`, then `target/release/bench_gemm_tile_tune`; one run,
+# GPU idle (confirmed with the peer session). Bar set before the run: >= 1.3x
+# over 6.4 TFLOP/s.
+#
+# Finding: the bar is not met. Exact f32 is compute-bound at about
+# 5.5-6.1 TFLOP/s whether or not the accumulator lives in registers: the
+# variants gain 0-11% on most shapes and lose up to 21% on narrow ones. The
+# exception is the 2B's MLP up/gate shape (2048 x 6144 x 2048), where
+# production runs at 4.1 TFLOP/s against its 5.7 at 2048^3 and the variants
+# reach 5.6-5.9 (1.37-1.45x). Every variant's output is bit-identical to
+# production's (max_rel_err 0). Decision: no exact-f32 coop kernel in the
+# general path; the MLP-up anomaly is open (see docs/qwen35.md, Not done).
+#
+# The "[bf16]" lanes re-run the existing bf16 rig on the same inputs.
+
+kernel                               maxTPTG      tgMem(B)  requested TPTG
+mm_bf16_64x32_bk128_sg4_accf            1024             0             128
+mm_bf16_64x64_bk256_sg4                 1024             0             128
+mm_bf16_128x64_bk256_sg8                1024             0             256
+mm_bf16_128x128_bk256_sg4               1024             0             128
+mm_bf16_coop_64x32_sg4                  1024             0             128
+mm_bf16_coop_64x64_sg4                  1024             0             128
+mm_bf16_coop_128x64_sg4                 1024             0             128
+mm_bf16_coop_128x64_sg8                 1024             0             256
+mm_bf16_coop_128x128_sg8                1024             0             256
+mm_bf16_coop_256x64_sg8                 1024             0             256
+mm_f32_exact_coop_64x64_sg4             1024             0             128
+mm_f32_exact_coop_128x64_sg4            1024             0             128
+mm_f32_exact_coop_128x64_sg8            1024             0             256
+
+square_2048 [bf16]  M=2048 N=2048 K=2048   production 0.935 ms  18367 GFLOP/s
+  variant                                 ms     GFLOP/s  vs prod max_rel_err
+  mm_bf16_64x32_bk128_sg4_accf         1.725        9957    0.54×     8.57e-7
+  mm_bf16_64x64_bk256_sg4              0.992       17314    0.94×     7.22e-7
+  mm_bf16_128x64_bk256_sg8             1.196       14368    0.78×     7.22e-7
+  mm_bf16_128x128_bk256_sg4            1.035       16598    0.90×     7.22e-7
+  mm_bf16_coop_64x32_sg4               0.828       20749    1.13×      0.00e0
+  mm_bf16_coop_64x64_sg4               0.761       22577    1.23×      0.00e0
+  mm_bf16_coop_128x64_sg4              0.788       21798    1.19×      0.00e0
+  mm_bf16_coop_128x64_sg8              0.773       22217    1.21×      0.00e0
+  mm_bf16_coop_128x128_sg8             0.866       19827    1.08×      0.00e0
+  mm_bf16_coop_256x64_sg8              0.799       21489    1.17×      0.00e0
+  production re-measured after: 0.791 ms (21725 GFLOP/s) — drift vs before: -15.5%
+
+square_2048 [exact f32]  M=2048 N=2048 K=2048   production 3.004 ms  5719 GFLOP/s
+  variant                                 ms     GFLOP/s  vs prod max_rel_err
+  mm_f32_exact_coop_64x64_sg4          2.883        5960    1.04×      0.00e0
+  mm_f32_exact_coop_128x64_sg4         2.967        5791    1.01×      0.00e0
+  mm_f32_exact_coop_128x64_sg8         2.891        5944    1.04×      0.00e0
+  production re-measured after: 3.088 ms (5563 GFLOP/s) — drift vs before: +2.8%
+
+q35_mlp_up [bf16]  M=2048 N=6144 K=2048   production 2.315 ms  22268 GFLOP/s
+  variant                                 ms     GFLOP/s  vs prod max_rel_err
+  mm_bf16_64x32_bk128_sg4_accf         5.810        8870    0.40×     7.87e-7
+  mm_bf16_64x64_bk256_sg4              3.597       14330    0.64×     7.87e-7
+  mm_bf16_128x64_bk256_sg8             2.985       17265    0.78×     7.87e-7
+  mm_bf16_128x128_bk256_sg4            3.201       16100    0.72×     7.87e-7
+  mm_bf16_coop_64x32_sg4               4.024       12810    0.58×      0.00e0
+  mm_bf16_coop_64x64_sg4               3.144       16395    0.74×      0.00e0
+  mm_bf16_coop_128x64_sg4              2.352       21916    0.98×      0.00e0
+  mm_bf16_coop_128x64_sg8              2.381       21650    0.97×      0.00e0
+  mm_bf16_coop_128x128_sg8             2.416       21336    0.96×      0.00e0
+  mm_bf16_coop_256x64_sg8              2.304       22373    1.00×      0.00e0
+  production re-measured after: 2.346 ms (21969 GFLOP/s) — drift vs before: +1.4%
+
+q35_mlp_up [exact f32]  M=2048 N=6144 K=2048   production 12.622 ms  4083 GFLOP/s
+  variant                                 ms     GFLOP/s  vs prod max_rel_err
+  mm_f32_exact_coop_64x64_sg4          9.207        5598    1.37×      0.00e0
+  mm_f32_exact_coop_128x64_sg4         8.978        5740    1.41×      0.00e0
+  mm_f32_exact_coop_128x64_sg8         8.682        5936    1.45×      0.00e0
+  production re-measured after: 12.464 ms (4135 GFLOP/s) — drift vs before: -1.3%
+
+q35_mlp_down [bf16]  M=2048 N=2048 K=6144   production 2.105 ms  24488 GFLOP/s
+  variant                                 ms     GFLOP/s  vs prod max_rel_err
+  mm_bf16_64x32_bk128_sg4_accf         5.347        9638    0.39×     1.61e-6
+  mm_bf16_64x64_bk256_sg4              3.040       16952    0.69×     1.66e-6
+  mm_bf16_128x64_bk256_sg8             3.837       13432    0.55×     1.66e-6
+  mm_bf16_128x128_bk256_sg4            2.965       17382    0.71×     1.66e-6
+  mm_bf16_coop_64x32_sg4               3.836       13435    0.55×      0.00e0
+  mm_bf16_coop_64x64_sg4               2.618       19689    0.80×      0.00e0
+  mm_bf16_coop_128x64_sg4              2.142       24062    0.98×      0.00e0
+  mm_bf16_coop_128x64_sg8              3.060       16845    0.69×      0.00e0
+  mm_bf16_coop_128x128_sg8             2.239       23024    0.94×      0.00e0
+  mm_bf16_coop_256x64_sg8              2.297       22439    0.92×      0.00e0
+  production re-measured after: 2.089 ms (24670 GFLOP/s) — drift vs before: -0.7%
+
+q35_mlp_down [exact f32]  M=2048 N=2048 K=6144   production 9.821 ms  5248 GFLOP/s
+  variant                                 ms     GFLOP/s  vs prod max_rel_err
+  mm_f32_exact_coop_64x64_sg4          9.574        5383    1.03×      0.00e0
+  mm_f32_exact_coop_128x64_sg4         9.751        5286    1.01×      0.00e0
+  mm_f32_exact_coop_128x64_sg8         9.502        5424    1.03×      0.00e0
+  production re-measured after: 10.232 ms (5037 GFLOP/s) — drift vs before: +4.2%
+
+square_4096 [bf16]  M=4096 N=4096 K=4096   production 6.145 ms  22367 GFLOP/s
+  variant                                 ms     GFLOP/s  vs prod max_rel_err
+  mm_bf16_64x32_bk128_sg4_accf        15.537        8846    0.40×     1.73e-6
+  mm_bf16_64x64_bk256_sg4              9.861       13937    0.62×     1.73e-6
+  mm_bf16_128x64_bk256_sg8             8.947       15362    0.69×     1.73e-6
+  mm_bf16_128x128_bk256_sg4            8.714       15773    0.71×     1.73e-6
+  mm_bf16_coop_64x32_sg4              11.800       11647    0.52×      0.00e0
+  mm_bf16_coop_64x64_sg4               8.876       15485    0.69×      0.00e0
+  mm_bf16_coop_128x64_sg4              7.053       19486    0.87×      0.00e0
+  mm_bf16_coop_128x64_sg8              7.277       18886    0.84×      0.00e0
+  mm_bf16_coop_128x128_sg8             7.391       18596    0.83×      0.00e0
+  mm_bf16_coop_256x64_sg8              6.766       20312    0.91×      0.00e0
+  production re-measured after: 6.120 ms (22457 GFLOP/s) — drift vs before: -0.4%
+
+square_4096 [exact f32]  M=4096 N=4096 K=4096   production 24.098 ms  5703 GFLOP/s
+  variant                                 ms     GFLOP/s  vs prod max_rel_err
+  mm_f32_exact_coop_64x64_sg4         22.965        5985    1.05×      0.00e0
+  mm_f32_exact_coop_128x64_sg4        25.238        5446    0.95×      0.00e0
+  mm_f32_exact_coop_128x64_sg8        24.469        5617    0.98×      0.00e0
+  production re-measured after: 27.041 ms (5083 GFLOP/s) — drift vs before: +12.2%
+
+mlp_up [bf16]  M=8192 N=3072 K=768   production 1.801 ms  21464 GFLOP/s
+  variant                                 ms     GFLOP/s  vs prod max_rel_err
+  mm_bf16_64x32_bk128_sg4_accf         4.856        7960    0.37×     6.73e-7
+  mm_bf16_64x64_bk256_sg4              1.929       20035    0.93×     5.98e-7
+  mm_bf16_128x64_bk256_sg8             1.902       20326    0.95×     5.98e-7
+  mm_bf16_128x128_bk256_sg4            2.788       13864    0.65×     5.98e-7
+  mm_bf16_coop_64x32_sg4               1.641       23559    1.10×      0.00e0
+  mm_bf16_coop_64x64_sg4               1.804       21433    1.00×      0.00e0
+  mm_bf16_coop_128x64_sg4              1.957       19749    0.92×      0.00e0
+  mm_bf16_coop_128x64_sg8              1.820       21240    0.99×      0.00e0
+  mm_bf16_coop_128x128_sg8             2.081       18577    0.87×      0.00e0
+  mm_bf16_coop_256x64_sg8              2.125       18192    0.85×      0.00e0
+  production re-measured after: 2.102 ms (18394 GFLOP/s) — drift vs before: +16.7%
+
+mlp_up [exact f32]  M=8192 N=3072 K=768   production 8.314 ms  4650 GFLOP/s
+  variant                                 ms     GFLOP/s  vs prod max_rel_err
+  mm_f32_exact_coop_64x64_sg4          7.960        4856    1.04×      0.00e0
+  mm_f32_exact_coop_128x64_sg4         7.651        5052    1.09×      0.00e0
+  mm_f32_exact_coop_128x64_sg8         7.881        4905    1.05×      0.00e0
+  production re-measured after: 8.608 ms (4491 GFLOP/s) — drift vs before: +3.5%
+
+mlp_down [bf16]  M=8192 N=768 K=3072   production 2.092 ms  18480 GFLOP/s
+  variant                                 ms     GFLOP/s  vs prod max_rel_err
+  mm_bf16_64x32_bk128_sg4_accf         4.570        8458    0.46×     1.18e-6
+  mm_bf16_64x64_bk256_sg4              2.784       13883    0.75×     1.10e-6
+  mm_bf16_128x64_bk256_sg8             2.854       13545    0.73×     1.10e-6
+  mm_bf16_128x128_bk256_sg4            2.585       14956    0.81×     1.10e-6
+  mm_bf16_coop_64x32_sg4               2.600       14870    0.80×      0.00e0
+  mm_bf16_coop_64x64_sg4               2.319       16670    0.90×      0.00e0
+  mm_bf16_coop_128x64_sg4              1.850       20899    1.13×      0.00e0
+  mm_bf16_coop_128x64_sg8              1.748       22111    1.20×      0.00e0
+  mm_bf16_coop_128x128_sg8             1.785       21656    1.17×      0.00e0
+  mm_bf16_coop_256x64_sg8              1.760       21966    1.19×      0.00e0
+  production re-measured after: 1.644 ms (23506 GFLOP/s) — drift vs before: -21.4%
+
+mlp_down [exact f32]  M=8192 N=768 K=3072   production 6.957 ms  5556 GFLOP/s
+  variant                                 ms     GFLOP/s  vs prod max_rel_err
+  mm_f32_exact_coop_64x64_sg4          7.044        5488    0.99×      0.00e0
+  mm_f32_exact_coop_128x64_sg4         7.361        5251    0.95×      0.00e0
+  mm_f32_exact_coop_128x64_sg8         6.960        5554    1.00×      0.00e0
+  production re-measured after: 7.270 ms (5317 GFLOP/s) — drift vs before: +4.5%
+
+tall_k1024 [bf16]  M=4096 N=4096 K=1024   production 1.503 ms  22866 GFLOP/s
+  variant                                 ms     GFLOP/s  vs prod max_rel_err
+  mm_bf16_64x32_bk128_sg4_accf         3.623        9485    0.41×     5.82e-7
+  mm_bf16_64x64_bk256_sg4              2.233       15387    0.67×     7.11e-7
+  mm_bf16_128x64_bk256_sg8             1.621       21194    0.93×     7.11e-7
+  mm_bf16_128x128_bk256_sg4            1.808       19010    0.83×     7.11e-7
+  mm_bf16_coop_64x32_sg4               1.451       23676    1.04×      0.00e0
+  mm_bf16_coop_64x64_sg4               1.471       23365    1.02×      0.00e0
+  mm_bf16_coop_128x64_sg4              1.449       23709    1.04×      0.00e0
+  mm_bf16_coop_128x64_sg8              1.515       22684    0.99×      0.00e0
+  mm_bf16_coop_128x128_sg8             1.498       22942    1.00×      0.00e0
+  mm_bf16_coop_256x64_sg8              1.426       24088    1.05×      0.00e0
+  production re-measured after: 1.386 ms (24792 GFLOP/s) — drift vs before: -7.8%
+
+tall_k1024 [exact f32]  M=4096 N=4096 K=1024   production 6.279 ms  5472 GFLOP/s
+  variant                                 ms     GFLOP/s  vs prod max_rel_err
+  mm_f32_exact_coop_64x64_sg4          5.642        6090    1.11×      0.00e0
+  mm_f32_exact_coop_128x64_sg4         5.947        5778    1.06×      0.00e0
+  mm_f32_exact_coop_128x64_sg8         6.361        5401    0.99×      0.00e0
+  production re-measured after: 6.502 ms (5284 GFLOP/s) — drift vs before: +3.6%
+
+square_512 [bf16]  M=512 N=512 K=512   production 0.164 ms  1637 GFLOP/s
+  variant                                 ms     GFLOP/s  vs prod max_rel_err
+  mm_bf16_64x32_bk128_sg4_accf         0.172        1557    0.95×     3.83e-7
+  mm_bf16_64x64_bk256_sg4              0.149        1805    1.10×     3.28e-7
+  mm_bf16_128x64_bk256_sg8             0.150        1794    1.10×     3.28e-7
+  mm_bf16_128x128_bk256_sg4            0.167        1611    0.98×     3.28e-7
+  mm_bf16_coop_64x32_sg4               0.145        1851    1.13×      0.00e0
+  mm_bf16_coop_64x64_sg4               0.145        1847    1.13×      0.00e0
+  mm_bf16_coop_128x64_sg4              0.136        1977    1.21×      0.00e0
+  mm_bf16_coop_128x64_sg8              0.145        1851    1.13×      0.00e0
+  mm_bf16_coop_128x128_sg8             0.171        1572    0.96×      0.00e0
+  mm_bf16_coop_256x64_sg8              0.200        1343    0.82×      0.00e0
+  production re-measured after: 0.163 ms (1644 GFLOP/s) — drift vs before: -0.4%
+
+square_512 [exact f32]  M=512 N=512 K=512   production 0.208 ms  1292 GFLOP/s
+  variant                                 ms     GFLOP/s  vs prod max_rel_err
+  mm_f32_exact_coop_64x64_sg4          0.196        1369    1.06×      0.00e0
+  mm_f32_exact_coop_128x64_sg4         0.219        1227    0.95×      0.00e0
+  mm_f32_exact_coop_128x64_sg8         0.197        1364    1.06×      0.00e0
+  production re-measured after: 0.190 ms (1414 GFLOP/s) — drift vs before: -8.6%
+
+square_1024 [bf16]  M=1024 N=1024 K=1024   production 0.255 ms  8412 GFLOP/s
+  variant                                 ms     GFLOP/s  vs prod max_rel_err
+  mm_bf16_64x32_bk128_sg4_accf         0.374        5749    0.68×     6.60e-7
+  mm_bf16_64x64_bk256_sg4              0.241        8899    1.06×     6.60e-7
+  mm_bf16_128x64_bk256_sg8             0.254        8451    1.00×     6.60e-7
+  mm_bf16_128x128_bk256_sg4            0.245        8768    1.04×     6.60e-7
+  mm_bf16_coop_64x32_sg4               0.199       10783    1.28×      0.00e0
+  mm_bf16_coop_64x64_sg4               0.211       10166    1.21×      0.00e0
+  mm_bf16_coop_128x64_sg4              0.226        9505    1.13×      0.00e0
+  mm_bf16_coop_128x64_sg8              0.212       10153    1.21×      0.00e0
+  mm_bf16_coop_128x128_sg8             0.255        8407    1.00×      0.00e0
+  mm_bf16_coop_256x64_sg8              0.227        9448    1.12×      0.00e0
+  production re-measured after: 0.217 ms (9907 GFLOP/s) — drift vs before: -15.1%
+
+square_1024 [exact f32]  M=1024 N=1024 K=1024   production 0.477 ms  4503 GFLOP/s
+  variant                                 ms     GFLOP/s  vs prod max_rel_err
+  mm_f32_exact_coop_64x64_sg4          0.447        4803    1.07×      0.00e0
+  mm_f32_exact_coop_128x64_sg4         0.529        4058    0.90×      0.00e0
+  mm_f32_exact_coop_128x64_sg8         0.455        4723    1.05×      0.00e0
+  production re-measured after: 0.476 ms (4509 GFLOP/s) — drift vs before: -0.1%
+
+narrow_n128 [bf16]  M=4096 N=128 K=2048   production 0.212 ms  10123 GFLOP/s
+  variant                                 ms     GFLOP/s  vs prod max_rel_err
+  mm_bf16_64x32_bk128_sg4_accf         0.371        5795    0.57×     8.18e-7
+  mm_bf16_64x64_bk256_sg4              0.272        7904    0.78×     7.63e-7
+  mm_bf16_128x64_bk256_sg8             0.256        8385    0.83×     7.63e-7
+  mm_bf16_128x128_bk256_sg4            0.305        7034    0.69×     7.63e-7
+  mm_bf16_coop_64x32_sg4               0.295        7279    0.72×      0.00e0
+  mm_bf16_coop_64x64_sg4               0.266        8087    0.80×      0.00e0
+  mm_bf16_coop_128x64_sg4              0.309        6950    0.69×      0.00e0
+  mm_bf16_coop_128x64_sg8              0.275        7810    0.77×      0.00e0
+  mm_bf16_coop_128x128_sg8             0.247        8686    0.86×      0.00e0
+  mm_bf16_coop_256x64_sg8              0.264        8149    0.81×      0.00e0
+  production re-measured after: 0.265 ms (8119 GFLOP/s) — drift vs before: +24.7%
+
+narrow_n128 [exact f32]  M=4096 N=128 K=2048   production 0.498 ms  4311 GFLOP/s
+  variant                                 ms     GFLOP/s  vs prod max_rel_err
+  mm_f32_exact_coop_64x64_sg4          0.503        4267    0.99×      0.00e0
+  mm_f32_exact_coop_128x64_sg4         0.634        3387    0.79×      0.00e0
+  mm_f32_exact_coop_128x64_sg8         0.555        3867    0.90×      0.00e0
+  production re-measured after: 0.478 ms (4495 GFLOP/s) — drift vs before: -4.1%
+
+narrow_n256 [bf16]  M=1024 N=256 K=1024   production 0.161 ms  3333 GFLOP/s
+  variant                                 ms     GFLOP/s  vs prod max_rel_err
+  mm_bf16_64x32_bk128_sg4_accf         0.193        2775    0.83×     6.14e-7
+  mm_bf16_64x64_bk256_sg4              0.169        3169    0.95×     5.75e-7
+  mm_bf16_128x64_bk256_sg8             0.175        3073    0.92×     5.75e-7
+  mm_bf16_128x128_bk256_sg4            0.190        2819    0.85×     5.75e-7
+  mm_bf16_coop_64x32_sg4               0.167        3218    0.97×      0.00e0
+  mm_bf16_coop_64x64_sg4               0.156        3436    1.03×      0.00e0
+  mm_bf16_coop_128x64_sg4              0.169        3184    0.96×      0.00e0
+  mm_bf16_coop_128x64_sg8              0.165        3248    0.97×      0.00e0
+  mm_bf16_coop_128x128_sg8             0.170        3153    0.95×      0.00e0
+  mm_bf16_coop_256x64_sg8              0.175        3071    0.92×      0.00e0
+  production re-measured after: 0.147 ms (3651 GFLOP/s) — drift vs before: -8.7%
+
+narrow_n256 [exact f32]  M=1024 N=256 K=1024   production 0.236 ms  2278 GFLOP/s
+  variant                                 ms     GFLOP/s  vs prod max_rel_err
+  mm_f32_exact_coop_64x64_sg4          0.249        2159    0.95×      0.00e0
+  mm_f32_exact_coop_128x64_sg4         0.250        2143    0.94×      0.00e0
+  mm_f32_exact_coop_128x64_sg8         0.238        2253    0.99×      0.00e0
+  production re-measured after: 0.252 ms (2128 GFLOP/s) — drift vs before: +7.0%

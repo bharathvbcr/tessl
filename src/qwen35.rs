@@ -37,8 +37,11 @@
 //! was written for, whose `sigmoid` gate and clamp are a different model.
 //!
 //! Every function validates buffer capacities, runtime ownership and aliasing on
-//! the host before encoding, like [`crate::nn`]; the kernels themselves only
-//! guard their grid.
+//! the host before encoding, like [`crate::nn`]. The kernels guard their grid
+//! and whatever only the device can see: they clamp device-side lengths and
+//! positions (`seq_lens`, `tkv`, suffix lengths, position buffers) to the
+//! validated capacities, and turn an out-of-range slot, answer or token id into
+//! a NaN row instead of an out-of-bounds read.
 
 use std::sync::Arc;
 

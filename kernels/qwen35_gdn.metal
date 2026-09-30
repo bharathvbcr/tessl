@@ -717,8 +717,11 @@ inline void gdn_scan_body(
     }
 
     if ((flags & 2u) != 0u) {
-        // With no chunks this reads the initialisation above, which the final
-        // write needs ordered after it: the barrier is uniform (nc is).
+        // With no chunks this reads the initialisation above. The init loop
+        // and this one use the same idx -> (kk, v) mapping, so each thread
+        // reads back only what it wrote and the barrier is not needed today;
+        // it is kept so this loop does not silently depend on the two
+        // mappings staying identical. It is uniform (nc is).
         if (nc == 0u) {
             threadgroup_barrier(mem_flags::mem_threadgroup);
         }

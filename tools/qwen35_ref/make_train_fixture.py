@@ -15,6 +15,11 @@ otherwise hide a weight applied in the wrong order) and rounded to bf16, so
 the checkpoint tessl loads and the float32 model torch differentiates hold the
 same values.
 
+`tiny --layers 24 --out target/qwen35_train_deep` is the same model 24 layers
+deep in the 2B's layer pattern, for tests/qwen35_train.rs's
+`deep_tiny_step_matches_transformers` (how gradient agreement changes with
+depth alone, everything else equal).
+
 `2b` runs Qwen/Qwen3.5-2B-Base from the Hugging Face cache in float32 on the
 CPU (about 17 GB: weights, gradients, activations) over the first `--tokens`
 tokens of make_reference.py's prompt, and writes the loss and a subset of the
@@ -40,12 +45,16 @@ ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 TINY_T = 70  # past one 64-token GDN chunk and two 32-row attention blocks
 
 
-def tiny_config():
+def tiny_config(layers=2):
+    # The 2B's pattern: three GDN layers, then full attention. Two layers
+    # (the committed fixture) are one of each.
+    types = ["linear_attention", "full_attention"] if layers == 2 else [
+        "full_attention" if l % 4 == 3 else "linear_attention" for l in range(layers)]
     return mq.Qwen3_5TextConfig(
         hidden_size=64,
         intermediate_size=128,
-        num_hidden_layers=2,
-        layer_types=["linear_attention", "full_attention"],
+        num_hidden_layers=layers,
+        layer_types=types,
         num_attention_heads=2,
         num_key_value_heads=1,
         head_dim=256,
@@ -97,10 +106,10 @@ def write_common(out, loss, ids):
 
 
 def tiny(args):
-    out = os.path.join(ROOT, "tests", "fixtures", "qwen35_train")
+    out = args.out or os.path.join(ROOT, "tests", "fixtures", "qwen35_train")
     os.makedirs(out, exist_ok=True)
     gen = torch.Generator().manual_seed(20260930)
-    cfg = tiny_config()
+    cfg = tiny_config(args.layers)
     torch.manual_seed(0)
     model = mq.Qwen3_5ForCausalLM(cfg).float()
     reinit(model, gen)
@@ -159,6 +168,10 @@ def main():
     ap.add_argument("which", choices=["tiny", "2b"])
     ap.add_argument("--tokens", type=int, default=128)
     ap.add_argument("--model-dir")
+    ap.add_argument("--layers", type=int, default=2,
+                    help="tiny: depth (the 2B's pattern of three GDN layers then attention); the "
+                         "committed fixture is 2")
+    ap.add_argument("--out", help="tiny: where to write (default: the committed fixture)")
     args = ap.parse_args()
     torch.set_num_threads(max(1, os.cpu_count() // 2))
     (tiny if args.which == "tiny" else two_b)(args)

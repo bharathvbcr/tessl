@@ -189,6 +189,59 @@ fn tiny_step_matches_transformers_autograd() {
     }
 }
 
+/// The tiny model 24 layers deep in the 2B's layer pattern
+/// (`make_train_fixture.py tiny --layers 24 --out target/qwen35_train_deep`):
+/// how gradient agreement with transformers changes with depth alone, both
+/// sides f32 and everything else equal. Prints the worst error per layer, for
+/// the 1-D tensors (norms, A_log, dt_bias) and the matrices apart.
+#[test]
+#[ignore]
+fn deep_tiny_step_matches_transformers() {
+    let dir = std::env::var_os("QWEN35_TRAIN_DEEP_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| Path::new(env!("CARGO_MANIFEST_DIR")).join("target/qwen35_train_deep"));
+    let cfg = Qwen35Config::from_config_file(&dir.join("config.json")).unwrap();
+    let model = load(&dir, "model.", cfg.clone(), Precision::F32);
+    let step = model.train_step(&ids(&dir)).unwrap();
+    let (_, want_loss) = npy_f64(&dir.join("loss.npy"));
+    eprintln!("loss {:.8} vs {:.8} (rel {:.2e})", step.loss, want_loss[0], (step.loss - want_loss[0]).abs() / want_loss[0]);
+    let mut per_layer = vec![(0.0f64, 0.0f64); cfg.layers.len()];
+    let (mut worst, mut worst_scalar) = (0.0f64, 0.0f64);
+    for (name, got) in by_name(&cfg, &step.grads, "model.") {
+        let r = rel(&got, &npy_f64(&dir.join(format!("grad.{name}.npy"))).1);
+        if got.len() == 1 {
+            worst_scalar = worst_scalar.max(r);
+        } else {
+            worst = worst.max(r);
+        }
+        if let Some(l) = name.strip_prefix("model.layers.").and_then(|x| x.split('.').next()).and_then(|x| x.parse::<usize>().ok()) {
+            let one_d = got.len() <= cfg.hidden as usize;
+            if one_d && r > 5e-5 {
+                let want = npy_f64(&dir.join(format!("grad.{name}.npy"))).1;
+                let peak = want.iter().fold(0.0f64, |m, x| m.max(x.abs()));
+                eprintln!("  {name}: {r:.2e} ({} elements, max|ref| {peak:.3e})", got.len());
+            }
+            let slot = &mut per_layer[l];
+            if one_d { slot.0 = slot.0.max(r) } else { slot.1 = slot.1.max(r) }
+        } else {
+            eprintln!("{name}: {r:.2e}");
+        }
+    }
+    for (l, (a, b)) in per_layer.iter().enumerate() {
+        eprintln!("layer {l:2} ({:?}): 1-D worst {a:.2e}, matrices worst {b:.2e}", cfg.layers[l]);
+    }
+    eprintln!("worst parameter gradient: {worst:.2e} (single-element A_log / dt_bias: {worst_scalar:.2e})");
+    // Measured before these bounds were written: tensors of more than one
+    // element 2.7e-5 at worst (up from ~1e-6 at two layers: drift with depth
+    // alone), and the one-head model's single-element A_log / dt_bias
+    // gradients 9.6e-4. Those are each one sum over every token of terms of
+    // both signs (layer 17's A_log gradient is only 5.3e-4), so relative to
+    // themselves they carry the sum's cancellation, which the larger tensors'
+    // max-normalized error does not see.
+    assert!(worst <= 1e-4, "worst multi-element parameter gradient {worst:.3e}");
+    assert!(worst_scalar <= 5e-3, "worst single-element parameter gradient {worst_scalar:.3e}");
+}
+
 #[test]
 fn train_step_refuses_what_it_does_not_implement() {
     let dir = fixture();

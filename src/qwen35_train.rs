@@ -709,6 +709,7 @@ mod tests {
         n: usize,
         torch: Vec<f64>,
         resolved: bool,
+        steps: [f64; 4],
     }
 
     /// The loss of the inference forward's logits (the training forward's
@@ -756,6 +757,10 @@ mod tests {
             ("model.layers.8.linear_attn.dt_bias".into(), &mixer(8).0.dt_bias, &mixer(8).1.dt_bias, 16),
             ("model.layers.8.linear_attn.A_log".into(), &mixer(8).0.a_log, &mixer(8).1.a_log, 16),
             ("model.norm.weight".into(), &model.final_norm, &step.grads.final_norm, h),
+            ("model.layers.22.input_layernorm.weight".into(), &model.layers[22].input_norm, &step.grads.layers[22].input_norm, h),
+            ("model.layers.8.post_attention_layernorm.weight".into(), &model.layers[8].post_norm, &step.grads.layers[8].post_norm, h),
+            ("model.layers.6.input_layernorm.weight".into(), &model.layers[6].input_norm, &step.grads.layers[6].input_norm, h),
+            ("model.layers.20.linear_attn.norm.weight".into(), &mixer(20).0.norm_w, &mixer(20).1.norm_w, 128),
         ];
         // The matrices, whose disagreement is large in absolute terms and
         // spread thinly over millions of weights: torch's [out, in]
@@ -780,16 +785,29 @@ mod tests {
             .into_iter()
             .map(|(name, param, grad, n)| {
                 let torch = npy(&dir.join(format!("grad.{name}.npy")));
-                let resolved = name.ends_with("conv1d.weight");
-                FdCase { name, param, grad, n, torch, resolved }
+                // The hidden-size norms act as (1 + w) around 1, so a step of
+                // 0.05-0.4 along a unit direction moves each of their 2048
+                // entries by at most ~0.01 and stays near-linear, while lifting
+                // |d| h far above the loss's f32 rounding. The GDN gated norm's
+                // 128 weights do not resolve: steps of 0.4-0.05 and 0.2-0.025
+                // extrapolate 4e-5 apart, more than its |d| (3e-5), the first
+                // nearer tessl's gradient and the second nearer transformers'.
+                let norm = name.ends_with("layernorm.weight") || name == "model.norm.weight";
+                let resolved = norm || name.ends_with("conv1d.weight");
+                let steps = if norm || name.ends_with("linear_attn.norm.weight") {
+                    [0.4, 0.2, 0.1, 0.05]
+                } else {
+                    [1e-2, 5e-3, 2.5e-3, 1.25e-3]
+                };
+                FdCase { name, param, grad, n, torch, resolved, steps }
             })
             .collect();
         for (name, p, g, rows, cols) in matrices {
             let t = npy(&dir.join(format!("grad.{name}.npy")));
             let packed: Vec<f64> = (0..rows).flat_map(|r| (0..cols).map(move |c| (r, c))).map(|(r, c)| t[c * rows + r]).collect();
-            all_cases.push(FdCase { name, param: p, grad: g, n: rows * cols, torch: packed, resolved: true });
+            all_cases.push(FdCase { name, param: p, grad: g, n: rows * cols, torch: packed, resolved: true, steps: [1e-2, 5e-3, 2.5e-3, 1.25e-3] });
         }
-        for FdCase { name, param, grad, n, torch: g_torch, resolved } in all_cases {
+        for FdCase { name, param, grad, n, torch: g_torch, resolved, steps } in all_cases {
             let g_tessl: Vec<f64> = grad.read_f32()[..n].iter().map(|&x| f64::from(x)).collect();
             let d: Vec<f64> = g_tessl.iter().zip(&g_torch).map(|(a, b)| a - b).collect();
             let dn = d.iter().map(|x| x * x).sum::<f64>().sqrt();
@@ -799,7 +817,7 @@ mod tests {
             let orig = param.read_f32()[..n].to_vec();
             let mut line = format!("{name}: |d| {dn:.3e}, tessl.v {pt:.6e}, torch.v {pr:.6e}; FD");
             let mut fds = Vec::new();
-            for step_h in [1e-2, 5e-3, 2.5e-3, 1.25e-3] {
+            for step_h in steps {
                 let set = |s: f64| {
                     let p: Vec<f32> = orig.iter().zip(&v).map(|(&x, &u)| (f64::from(x) + s * u) as f32).collect();
                     let mut all = param.read_f32();

@@ -764,12 +764,27 @@ above), and the gradients of two slightly different functions differ by
 more. The unit test `real_2b_gradients_are_those_of_tessls_forward` shows
 which side each disagreement is on: along `v = (g_tessl - g_torch) / |d|`,
 where the two gradients predict slopes `|d|` apart, a Richardson-extrapolated
-central difference of tessl's own loss lands within 0.03-0.21 |d| of tessl's
-gradient (layer 20's conv weight, layer 0's MLP gate and down projections,
-layer 3's attention output projection) and 0.8-0.9 |d| from transformers'.
-The 1-D tensors' disagreements are below what differences of an f32 loss can
-resolve and are not claimed either way. The 2B test's bounds (loss 1e-4,
+central difference of tessl's own loss lands on tessl's gradient for every
+direction it can resolve: within 0.03-0.21 |d| for layer 20's conv weight,
+layer 0's MLP gate and down projections and layer 3's attention output
+projection (0.8-0.9 |d| from transformers'), and within 0.03-0.24 |d| for
+the final norm and four of the worst layer norms (layers 6, 8, 22, 23; 0.9-1
+|d| from transformers'), which take steps of 0.05-0.4 along the unit
+direction since they act as `1 + w` around 1. Three stay unresolved and are
+not claimed either way: `A_log` and `dt_bias` (|d| ~1e-5, at the loss's
+rounding), and the GDN gated norm's 128 weights, whose two step scales
+extrapolate further apart than its |d|. The 2B test's bounds (loss 1e-4,
 gradients 1e-2) were set after that first run, for those reasons.
+
+Depth alone, in a setting with nothing else different
+(`make_train_fixture.py tiny --layers 24`, the ignored
+`deep_tiny_step_matches_transformers`): the tiny model 24 layers deep, in the
+2B's layer pattern, agrees with transformers to 2.7e-5 on every tensor of
+more than one element (up from ~3e-6 at two layers) and to 9.6e-4 on the
+one-head model's single-element `A_log` / `dt_bias` sums. So depth grows
+the disagreement tenfold but not to the 2B's 4e-3, whose remaining factor
+comes with the real model's scale (hidden 2048, trained weights); the finite
+differences above are what place it in the forward.
 
 ## Performance
 

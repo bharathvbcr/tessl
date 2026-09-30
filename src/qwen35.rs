@@ -115,7 +115,7 @@ impl<'a> Cols<'a> {
 
 /// Elements a `rows x width` window at `off` of stride `ld` reaches, or an error
 /// if it does not fit in its row.
-fn window_elems(rows: u64, ld: u32, off: u32, width: u64, what: &str) -> Result<usize, String> {
+pub(crate) fn window_elems(rows: u64, ld: u32, off: u32, width: u64, what: &str) -> Result<usize, String> {
     if u64::from(off) + width > u64::from(ld) {
         return Err(format!(
             "{what}: window [{off}, {off} + {width}) does not fit a row of {ld}"
@@ -132,7 +132,7 @@ fn window_elems(rows: u64, ld: u32, off: u32, width: u64, what: &str) -> Result<
 }
 
 /// Check a window's buffer: right runtime, enough `T`-sized elements.
-fn require_window<T>(
+pub(crate) fn require_window<T>(
     rt: &GpuRuntime,
     c: Cols<'_>,
     rows: u64,

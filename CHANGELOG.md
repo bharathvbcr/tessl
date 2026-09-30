@@ -24,6 +24,15 @@ All notable changes to `tessl` are recorded here. The format follows
   From torch: `tessl_torch.chunk_gated_delta_rule` (transformers'
   signature) and `patch_transformers_qwen3_5()`; C ABI 3 adds
   `tessl_gdn_train_forward`/`_backward` and tensors up to rank 6.
+- **Backward of the Qwen3.5 row-local ops (`tessl::qwen35_bwd`)**:
+  `rms_norm_bwd` (with an accumulate flag for the residual stream),
+  `gated_rms_norm_bwd` (the GDN output norm), `swiglu_bwd` and
+  `attn_gate_bwd`, in the forward's own row windows: `dgate`/`dup` and the
+  output gate's column land in the fused projections' gradient windows.
+  Weight gradients are per-block partials summed in order, no atomics.
+  Kernels `qwen35_rms_norm_bwd_f32`, `qwen35_col_sum_blocks_f32`,
+  `qwen35_gated_rms_norm_bwd_f32`, `qwen35_swiglu_bwd_f32`,
+  `qwen35_attn_gate_bwd_f32`.
 - **torch binding (`python/tessl_torch`) over a C ABI (`tessl::capi`)**:
   `tessl_torch.cross_entropy(hidden, weight, targets, mask)`, a
   `torch.autograd.Function` over MPS tensors, loaded with `ctypes` (no C++

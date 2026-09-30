@@ -581,6 +581,25 @@ Eleven of twelve injected kernel defects fail it; the twelfth is equivalent.
 Both directions are token-sequential, so they are slower than the chunked
 inference forward; they have not been timed yet.
 
+### Row-local backward: `tessl::qwen35_bwd`
+
+The layer's row-local ops have their backward in `tessl::qwen35_bwd`: the
+RMSNorm (`rms_norm_bwd`, which can add `dx` into an existing residual
+gradient), the GDN gated RMSNorm (`gated_rms_norm_bwd`, `dx`, `dz`, `dw`),
+SwiGLU (`swiglu_bwd`) and the attention output gate (`attn_gate_bwd`). Each
+reads and writes the forward's own windows, so `dgate`/`dup` and the gate
+column's gradient are written straight into the fused projection's gradient
+buffer for its GEMM backward. Weight gradients are per-block partials in a
+caller scratch (`*_part_len`) summed over blocks in order, so they are
+deterministic.
+
+`tests/qwen35_bwd.rs`: the f64 references' backward equals central finite
+differences (bound 1e-7), and the kernels match them within 3.6e-7 of the
+largest magnitude (bound 1e-4) across partial blocks, widths up to 5120 and
+the 2B's 16 heads x 128 gated layout; overlapping windows, short buffers and
+out-of-range windows are refused. Fourteen of fourteen injected kernel
+defects fail it.
+
 ## Performance
 
 `cargo run --release --bin bench_qwen35_layers` builds Qwen3.5-2B's shapes

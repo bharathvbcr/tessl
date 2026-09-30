@@ -30,6 +30,7 @@ const QWEN35_MLP: &str = include_str!("../kernels/qwen35_mlp.metal");
 const QWEN35_SCORE: &str = include_str!("../kernels/qwen35_score.metal");
 const CROSS_ENTROPY: &str = include_str!("../kernels/cross_entropy.metal");
 const GDN_TRAIN: &str = include_str!("../kernels/gdn_train.metal");
+const QWEN35_BWD: &str = include_str!("../kernels/qwen35_bwd.metal");
 
 /// Every `.metal` file this suite inspects.
 ///
@@ -53,6 +54,7 @@ const INSPECTED_KERNELS: &[&str] = &[
     "matmul_simdgroup.metal",
     "qwen35_attn.metal",
     "qwen35_attn_tiled.metal",
+    "qwen35_bwd.metal",
     "qwen35_gdn.metal",
     "qwen35_mlp.metal",
     "qwen35_score.metal",
@@ -535,6 +537,30 @@ fn gdn_train_offsets_are_widened() {
         ("dq_part[(ulong)s * rows * GDN_TRAIN_DK + at];", "finish partial read"),
     ] {
         require(GDN_TRAIN, needle, what);
+    }
+}
+
+/// The row-local backward kernels walk [T, ld] rows of the 2B's projections
+/// (ld up to 2 * 16 * 256 for the attention q|gate row) and write per-block
+/// weight-gradient partials; every row, window and partial offset is formed
+/// in 64 bits.
+#[test]
+fn qwen35_bwd_offsets_are_widened() {
+    for (needle, what) in [
+        ("const ulong r0 = (ulong)blk * rows_per_block;", "RMSNorm block rows"),
+        ("for (ulong r = r0; r < r1; ++r) {", "RMSNorm row walk"),
+        ("dw_part[(ulong)blk * D + d] = acc[k];", "RMSNorm dw partial"),
+        ("s += part[(ulong)b * D + d];", "column-sum partial read"),
+        ("const ulong units = (ulong)rows * H;", "gated norm units"),
+        ("const ulong r = u / H, h = u % H;", "gated norm row and head"),
+        ("device const float *xr = x + r * ld_x + x_off + h * D;", "gated norm x window"),
+        ("dw_part[(ulong)blk * D + d] = s;", "gated norm dw partial"),
+        ("const float g = gate[(ulong)r * ld_gate + gate_off + col];", "SwiGLU gate window"),
+        ("dup[(ulong)r * ld_dup + dup_off + col] = d * qwen35_silu(g);", "SwiGLU dup window"),
+        ("const ulong gi = (ulong)r * ld_p + q_off + (ulong)h * 2u * D + D + d;", "output gate column"),
+        ("d_attn[(ulong)r * Hq * D + col] = g * s;", "output gate d_attn row"),
+    ] {
+        require(QWEN35_BWD, needle, what);
     }
 }
 

@@ -406,7 +406,12 @@ fn pack_linear_weights<T: Copy + Default>(
             out_features.len()
         ));
     }
-    let total: usize = out_features.iter().sum();
+    // Checked: with `in_features = 0` every part is empty and passes its length
+    // check whatever its width, so a wrapped sum would reach the loops below.
+    let total = out_features
+        .iter()
+        .try_fold(0usize, |acc, &o| acc.checked_add(o))
+        .ok_or_else(|| "pack_linear_weights: output widths overflow usize".to_string())?;
     for (i, (p, &o)) in parts.iter().zip(out_features).enumerate() {
         let want = usize_product(&[o, in_features], "pack_linear_weights")?;
         if p.len() != want {
@@ -417,6 +422,11 @@ fn pack_linear_weights<T: Copy + Default>(
         }
     }
     let mut out = vec![T::default(); usize_product(&[in_features, total], "pack_linear_weights")?];
+    if out.is_empty() {
+        // Nothing to place; and with `in_features = 0` the row loop below
+        // would still walk every one of `total` (possibly enormous) rows.
+        return Ok(out);
+    }
     let mut col0 = 0;
     for (p, &o) in parts.iter().zip(out_features) {
         for r in 0..o {

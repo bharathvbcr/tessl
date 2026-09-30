@@ -1242,6 +1242,27 @@ fn gated_rms_norm_f32_and_bf16() {
     });
 }
 
+/// Host-only. Widths whose sum overflows used to wrap (release) or panic
+/// (debug); `in_features = 0` with a huge width used to spin through every
+/// empty row. Both now finish at once.
+#[test]
+fn pack_linear_weights_rejects_overflowing_widths_and_skips_empty_rows() {
+    let empty: [&[f32]; 2] = [&[], &[]];
+    let e = qwen35::pack_linear_weights_f32(&empty, &[usize::MAX, 2], 0).unwrap_err();
+    assert!(e.contains("overflow"), "{e}");
+    let e = qwen35::pack_linear_weights_bf16(&[&[], &[]], &[usize::MAX, 2], 0).unwrap_err();
+    assert!(e.contains("overflow"), "{e}");
+    let t0 = std::time::Instant::now();
+    let packed = qwen35::pack_linear_weights_f32(&empty, &[usize::MAX / 2, 3], 0).unwrap();
+    assert!(packed.is_empty());
+    assert!(t0.elapsed().as_secs() < 5, "took {:?}", t0.elapsed());
+    // The ordinary case is unchanged: [out, in] parts side by side, transposed.
+    let a = [1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0]; // [2, 3]
+    let b = [7.0f32, 8.0, 9.0]; // [1, 3]
+    let packed = qwen35::pack_linear_weights_f32(&[&a, &b], &[2, 1], 3).unwrap();
+    assert_eq!(packed, vec![1.0, 4.0, 7.0, 2.0, 5.0, 8.0, 3.0, 6.0, 9.0]);
+}
+
 #[test]
 fn swiglu_f32_and_bf16_from_a_fused_gate_up_buffer() {
     with_gpu(|rt| {

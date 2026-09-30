@@ -75,6 +75,7 @@
 //! | `mtl_tensor` | Quantized `MTLTensor` prep, behind the `quant-prep` feature |
 //! | [`ab_flags`], [`infer_trace`], [`icb_smoke`], [`npy`] | Tuning switches, tracing, smoke tests, and `.npy` I/O for benchmark parity |
 //! | [`safetensors`] | A strict `.safetensors` reader, to load checkpoints straight from the Hugging Face cache |
+//! | [`cross_entropy`] | LM-head cross-entropy and its gradients over the supervised rows, in vocabulary chunks |
 //!
 //! # Encode model
 //!
@@ -195,6 +196,7 @@
 
 pub mod ab_flags;
 pub mod cb_replay;
+pub mod cross_entropy;
 pub mod decode_icb;
 pub mod dispatch;
 pub mod gemm;

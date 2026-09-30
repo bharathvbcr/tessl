@@ -214,14 +214,32 @@ pub fn cast_bf16_to_f32(src: &Tensor) -> Result<Tensor, String> {
     validate_cast_input(src, DType::BF16)?;
     let rt = src.runtime();
     let dst = rt.alloc_tensor_f32(&src.shape)?;
+    cast_bf16_to_f32_into(src, &dst)?;
+    Ok(dst)
+}
+
+/// Widen bf16 into an existing f32 tensor (exact: every bf16 is an f32).
+pub fn cast_bf16_to_f32_into(src: &Tensor, dst: &Tensor) -> Result<(), String> {
+    validate_cast_input(src, DType::BF16)?;
+    dst.validate()?;
+    if dst.dtype != DType::F32
+        || src.shape != dst.shape
+        || !std::sync::Arc::ptr_eq(src.runtime(), dst.runtime())
+        || src.overlaps(dst)
+    {
+        return Err(
+            "cast destination must match shape/runtime, be f32, and not overlap source".into(),
+        );
+    }
+    let rt = src.runtime();
     let p = rt.pipeline("cast_bf16_to_f32")?;
     let n = src.numel();
     crate::dispatch::dispatch_1d(rt, &p, n, |bnd| {
         crate::dispatch::set_tensor(bnd, src, 0);
-        crate::dispatch::set_tensor(bnd, &dst, 1);
+        crate::dispatch::set_tensor(bnd, dst, 1);
         crate::dispatch::set_u32(bnd, n as u32, 2);
     })?;
-    Ok(dst)
+    Ok(())
 }
 
 /// `f32 -> f16`, allocating the destination.

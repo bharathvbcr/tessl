@@ -1053,7 +1053,7 @@ pub unsafe fn kv_ring_densify_with_scalars(
 /// a simdgroup-cooperative GEMV or a threadgroup-wide reduction needs a
 /// specific number of threads per group, and a wrong one silently changes what
 /// the kernel computes rather than failing.
-fn dispatch_tg_1d(
+pub(crate) fn dispatch_tg_1d(
     rt: &Arc<GpuRuntime>,
     pipeline: &ProtocolObject<dyn MTLComputePipelineState>,
     groups: usize,
@@ -4383,7 +4383,7 @@ const REDUCE_MAX_TG: usize = 1024;
 /// Threads per group for a row reduction: a power of two, capped by the
 /// kernel's scratch depth and the pipeline's own limit, and never more than
 /// the row is wide.
-fn reduce_tptg(max_threads: usize, cols: usize) -> usize {
+pub(crate) fn reduce_tptg(max_threads: usize, cols: usize) -> usize {
     reduction_tptg(max_threads, cols.next_power_of_two().max(1), REDUCE_MAX_TG)
 }
 

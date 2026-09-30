@@ -28,6 +28,7 @@ const QWEN35_ATTN: &str = include_str!("../kernels/qwen35_attn.metal");
 const QWEN35_ATTN_TILED: &str = include_str!("../kernels/qwen35_attn_tiled.metal");
 const QWEN35_MLP: &str = include_str!("../kernels/qwen35_mlp.metal");
 const QWEN35_SCORE: &str = include_str!("../kernels/qwen35_score.metal");
+const CROSS_ENTROPY: &str = include_str!("../kernels/cross_entropy.metal");
 
 /// Every `.metal` file this suite inspects.
 ///
@@ -35,6 +36,7 @@ const QWEN35_SCORE: &str = include_str!("../kernels/qwen35_score.metal");
 /// `every_kernel_source_is_inspected_or_explicitly_exempt`, so a new kernel
 /// cannot join the build without someone deciding which list it belongs on.
 const INSPECTED_KERNELS: &[&str] = &[
+    "cross_entropy.metal",
     "embed_lookup.metal",
     "flash_attn_decode.metal",
     "flash_attn_global_h512.metal",
@@ -489,6 +491,29 @@ fn qwen35_swiglu_row_offsets_are_widened() {
         QWEN35_MLP,
         "resid[(ulong)r * ld_resid + resid_off + col] += y[(ulong)r * ld_y + y_off + col];",
         "residual add addresses",
+    );
+}
+
+/// Cross-entropy gathers rows of a `[T, ld]` hidden-state matrix and walks
+/// `[n, chunk]` logits; at T = 8192 and ld = 2048 the gather offset alone is
+/// past 2^24, and a chunk of 2^20 columns times a few hundred rows passes
+/// `u32::MAX`, so each row offset is widened before it is multiplied.
+#[test]
+fn cross_entropy_row_offsets_are_widened() {
+    require(
+        CROSS_ENTROPY,
+        "out[(ulong)n * hidden + c] = float(h[(ulong)rows[n] * ld + off + c]);",
+        "cross-entropy gather addresses",
+    );
+    require(
+        CROSS_ENTROPY,
+        "device const float *row = logits + (ulong)n * ld;",
+        "log-sum-exp row address",
+    );
+    require(
+        CROSS_ENTROPY,
+        "const ulong i = (ulong)n * ld + c;",
+        "softmax-gradient address",
     );
 }
 

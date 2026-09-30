@@ -7,7 +7,7 @@
 mod common;
 
 use common::with_gpu;
-use tessl::gemm::{cast_bf16_to_f32, cast_f32_to_bf16};
+use tessl::gemm::{cast_bf16_to_f32, cast_bf16_to_f32_into, cast_f32_to_bf16};
 use tessl::tensor::{bf16_bits_to_f32, f32_to_bf16_bits};
 
 #[test]
@@ -49,5 +49,50 @@ fn device_bf16_cast_rounds_to_nearest_even_like_the_host() {
                 f32_to_bf16_bits(*g)
             );
         }
+    });
+}
+
+/// The in-place widening writes only its destination view, exactly, and
+/// refuses a destination it cannot fill: wrong dtype, wrong shape, or one
+/// overlapping the source.
+#[test]
+fn bf16_widening_into_a_view_is_exact_and_checks_its_destination() {
+    with_gpu(|rt| {
+        let values = [1.5f32, -0.0, 3.0e38, -7.25, 1.0e-40, 65504.0];
+        let src = rt.alloc_tensor_bf16(&[2, 3]).unwrap();
+        let bits: Vec<u16> = values.iter().map(|v| f32_to_bf16_bits(*v)).collect();
+        src.buffer.write_bf16_bits(&bits);
+
+        // A [2, 3] view at element 4 of a 12-element buffer: 4 before, 2 after.
+        let big = rt.alloc_tensor_f32(&[12]).unwrap();
+        big.write_f32(&[99.0; 12]).unwrap();
+        let dst = big.try_view(&[2, 3], 4).unwrap();
+        cast_bf16_to_f32_into(&src, &dst).unwrap();
+        rt.synchronize().unwrap();
+        let got = big.read_f32().unwrap();
+        assert_eq!(&got[..4], &[99.0; 4], "wrote before the view");
+        assert_eq!(&got[10..], &[99.0; 2], "wrote past the view");
+        for (i, &b) in bits.iter().enumerate() {
+            assert_eq!(got[4 + i].to_bits(), bf16_bits_to_f32(b).to_bits(), "element {i}");
+        }
+
+        let reject = |dst: &tessl::tensor::Tensor, what: &str| {
+            let e = cast_bf16_to_f32_into(&src, dst).expect_err(what);
+            assert!(e.contains("cast destination"), "{what}: {e}");
+        };
+        reject(&big.try_view(&[3, 2], 0).unwrap(), "transposed shape");
+        reject(&big.try_view(&[6], 0).unwrap(), "flattened shape");
+        reject(&rt.alloc_tensor_bf16(&[2, 3]).unwrap(), "bf16 destination");
+        // The source's own bytes viewed as f32 (12 bytes = 3 floats).
+        let alias = tessl::tensor::Tensor::from_buffer(
+            rt,
+            src.buffer.clone(),
+            &[1, 3],
+            tessl::tensor::DType::F32,
+            0,
+        )
+        .unwrap();
+        let e = cast_bf16_to_f32_into(&src, &alias).expect_err("aliasing destination");
+        assert!(e.contains("cast destination"), "aliasing: {e}");
     });
 }

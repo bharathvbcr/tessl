@@ -25,6 +25,12 @@ All notable changes to `tessl` are recorded here. The format follows
   Hugging Face checkpoint, checked end to end against transformers
   (`tests/qwen35_model.rs`, opt-in): F32 within 2.3e-6 per layer, Bf16 18x
   closer to fp32 than transformers' own bf16. See `docs/qwen35.md`.
+- **`Qwen35Config::from_config_json` / `from_config_file`**: any Qwen3.5 text
+  `config.json` (nested `text_config` or text-only), with every feature the
+  forward lacks refused by name. The published 2B config parses to exactly
+  `qwen35_2b()`; other sizes are parsed, not yet run against transformers.
+  The JSON parser is the safetensors one, moved to a crate-private
+  `json` module with per-format syntax limits.
 - **`tessl::safetensors`**, a strict `.safetensors` reader (exact offsets,
   bounded header, JSON subset, reads through the handle it opened).
 - **`qwen35::residual_add`** (`qwen35_residual_add_f32`), the exact-f32

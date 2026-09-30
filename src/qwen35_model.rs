@@ -39,6 +39,7 @@
 use std::sync::Arc;
 
 use crate::gemm::{gemm, GemmBackend};
+use crate::json::{self, Json, Syntax};
 use crate::nn::{self, AttnDims};
 use crate::qwen35::{
     self, AttnProjLayout, AttnShape, AttnTargets, Cols, GdnParams, GdnProjLayout, GdnWorkspace,
@@ -106,6 +107,187 @@ impl Qwen35Config {
         Ok(cfg)
     }
 
+    /// The text model a Hugging Face `config.json` describes: its
+    /// `text_config` (a `Qwen3_5ForConditionalGeneration` checkpoint) or the
+    /// root (a text-only one, `model_type: "qwen3_5_text"`).
+    ///
+    /// Everything the forward depends on is read, and everything it does not
+    /// implement is refused by name rather than ignored: untied embeddings,
+    /// MoE, attention bias, an ungated attention output, an activation other
+    /// than SiLU, `mlp_only_layers`, a RoPE other than the default, and key or
+    /// head dims the kernels are not compiled for.
+    pub fn from_config_json(text: &str) -> Result<Self, String> {
+        const SYNTAX: Syntax = Syntax {
+            what: "config.json",
+            max_depth: 16,
+            uints_only: false,
+            literals: true,
+        };
+        let root = json::parse(text, SYNTAX)?;
+        if !matches!(root, Json::Object(_)) {
+            return Err("config.json: the root is not an object".into());
+        }
+        let c = root.get("text_config").unwrap_or(&root);
+        let field = |k: &str| c.get(k).ok_or_else(|| format!("config.json: missing {k:?}"));
+        let uint = |k: &str| -> Result<u32, String> {
+            match field(k)? {
+                Json::Num { uint: Some(n), .. } => {
+                    u32::try_from(*n).map_err(|_| format!("config.json: {k} = {n} exceeds u32"))
+                }
+                v => Err(format!("config.json: {k} must be a non-negative integer, got {v:?}")),
+            }
+        };
+        let float = |v: &Json, k: &str| -> Result<f64, String> {
+            match v {
+                Json::Num { value, .. } => Ok(*value),
+                v => Err(format!("config.json: {k} must be a number, got {v:?}")),
+            }
+        };
+        let flag = |k: &str| -> Result<Option<bool>, String> {
+            match c.get(k) {
+                None => Ok(None),
+                Some(Json::Bool(b)) => Ok(Some(*b)),
+                Some(v) => Err(format!("config.json: {k} must be true or false, got {v:?}")),
+            }
+        };
+        let string = |k: &str| -> Result<Option<&str>, String> {
+            match c.get(k) {
+                None => Ok(None),
+                Some(Json::Str(s)) => Ok(Some(s.as_str())),
+                Some(v) => Err(format!("config.json: {k} must be a string, got {v:?}")),
+            }
+        };
+
+        // Features the forward does not implement.
+        // Every tie_word_embeddings present (root and text_config) must be
+        // true, and at least one must be.
+        let ties = [root.get("tie_word_embeddings"), c.get("tie_word_embeddings")];
+        for t in ties.iter().flatten() {
+            match t {
+                Json::Bool(true) => {}
+                Json::Bool(false) => {
+                    return Err("config.json: untied embeddings (a separate lm_head) are not supported".into())
+                }
+                v => return Err(format!("config.json: tie_word_embeddings must be true or false, got {v:?}")),
+            }
+        }
+        if ties.iter().all(Option::is_none) {
+            return Err("config.json: tie_word_embeddings is not set; the forward needs a tied LM head".into());
+        }
+        for k in ["num_experts", "num_local_experts", "moe_intermediate_size"] {
+            if c.get(k).is_some() {
+                return Err(format!("config.json: {k} is set; mixture-of-experts models are not supported"));
+            }
+        }
+        if flag("attention_bias")? == Some(true) {
+            return Err("config.json: attention_bias is not supported".into());
+        }
+        if flag("attn_output_gate")? == Some(false) {
+            return Err("config.json: an ungated attention output is not supported".into());
+        }
+        if let Some(act) = string("hidden_act")? {
+            if act != "silu" {
+                return Err(format!("config.json: hidden_act {act:?} is not supported (only \"silu\")"));
+            }
+        }
+        match c.get("mlp_only_layers") {
+            None => {}
+            Some(Json::Array(a)) if a.is_empty() => {}
+            Some(v) => return Err(format!("config.json: mlp_only_layers {v:?} is not supported")),
+        }
+
+        let hidden = uint("hidden_size")?;
+        let n_layers = uint("num_hidden_layers")?;
+        let layers: Vec<LayerKind> = match c.get("layer_types") {
+            Some(Json::Array(a)) => a
+                .iter()
+                .enumerate()
+                .map(|(i, t)| match t {
+                    Json::Str(s) if s == "linear_attention" => Ok(LayerKind::LinearAttention),
+                    Json::Str(s) if s == "full_attention" => Ok(LayerKind::FullAttention),
+                    t => Err(format!("config.json: layer_types[{i}] = {t:?} is not a known layer type")),
+                })
+                .collect::<Result<_, _>>()?,
+            Some(v) => return Err(format!("config.json: layer_types must be an array, got {v:?}")),
+            None => {
+                let every = uint("full_attention_interval")?;
+                if every == 0 {
+                    return Err("config.json: full_attention_interval must be non-zero".into());
+                }
+                (0..n_layers)
+                    .map(|l| if (l + 1) % every == 0 { LayerKind::FullAttention } else { LayerKind::LinearAttention })
+                    .collect()
+            }
+        };
+        if layers.len() != n_layers as usize {
+            return Err(format!(
+                "config.json: layer_types has {} entries but num_hidden_layers is {n_layers}",
+                layers.len()
+            ));
+        }
+
+        let key_dim = uint("linear_key_head_dim")?;
+        if key_dim != qwen35::GDN_KEY_DIM {
+            return Err(format!(
+                "config.json: linear_key_head_dim {key_dim} is not supported (the GDN kernels are \
+                 compiled for {})",
+                qwen35::GDN_KEY_DIM
+            ));
+        }
+        let gdn = GdnProjLayout::new(
+            uint("linear_num_key_heads")?,
+            uint("linear_num_value_heads")?,
+            uint("linear_value_head_dim")?,
+        )?;
+        let head_dim = uint("head_dim")?;
+        let attn = AttnProjLayout::new(uint("num_attention_heads")?, uint("num_key_value_heads")?, head_dim)?;
+
+        // RoPE: rope_parameters (transformers 5) or the older flat fields.
+        let rope = c.get("rope_parameters").unwrap_or(c);
+        if let Some(t) = rope.get("rope_type").or_else(|| rope.get("type")) {
+            if t != &Json::Str("default".into()) {
+                return Err(format!("config.json: rope_type {t:?} is not supported (only \"default\")"));
+            }
+        }
+        let theta = float(
+            rope.get("rope_theta").ok_or("config.json: missing \"rope_theta\"")?,
+            "rope_theta",
+        )?;
+        let factor = match rope.get("partial_rotary_factor") {
+            Some(v) => float(v, "partial_rotary_factor")?,
+            None => 1.0,
+        };
+        let rotary = f64::from(head_dim) * factor;
+        if !(factor > 0.0 && factor <= 1.0) || rotary.fract() != 0.0 {
+            return Err(format!(
+                "config.json: head_dim {head_dim} x partial_rotary_factor {factor} is not a whole \
+                 number of rotated dims"
+            ));
+        }
+        let eps = float(field("rms_norm_eps")?, "rms_norm_eps")?;
+
+        let cfg = Self {
+            hidden,
+            intermediate: uint("intermediate_size")?,
+            vocab: uint("vocab_size")?,
+            layers,
+            gdn,
+            conv_kernel: uint("linear_conv_kernel_dim")?,
+            attn,
+            rotary_dim: rotary as u32,
+            rope_theta: theta as f32,
+            rms_norm_eps: eps as f32,
+        };
+        cfg.validate()?;
+        Ok(cfg)
+    }
+
+    /// [`Self::from_config_json`] on a file.
+    pub fn from_config_file(path: &std::path::Path) -> Result<Self, String> {
+        let text = std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
+        Self::from_config_json(&text).map_err(|e| format!("{}: {e}", path.display()))
+    }
+
     fn validate(&self) -> Result<(), String> {
         if self.hidden == 0 || self.intermediate == 0 || self.vocab == 0 || self.layers.is_empty() {
             return Err("Qwen35Config: hidden, intermediate, vocab and layers must be non-zero".into());
@@ -120,6 +302,14 @@ impl Qwen35Config {
         }
         if self.rotary_dim % 2 != 0 || self.rotary_dim > self.attn.head_dim() {
             return Err("Qwen35Config: rotary_dim must be even and at most head_dim".into());
+        }
+        if self.attn.head_dim() != qwen35::PREFIX_ATTN_HEAD_DIM {
+            return Err(format!(
+                "Qwen35Config: attention head_dim {} is not supported (the prefill attention \
+                 kernels are compiled for {})",
+                self.attn.head_dim(),
+                qwen35::PREFIX_ATTN_HEAD_DIM
+            ));
         }
         Ok(())
     }

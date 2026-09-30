@@ -604,6 +604,15 @@ is the largest non-GEMM share: 18 × 1.4 ms.
   streams are equal and the rotation reduces to plain RoPE.
 - **Key head dim other than 128**, and value head dims that aren't multiples of
   32, are rejected on the host.
+- **Other model sizes are parsed, not validated.**
+  `Qwen35Config::from_config_json` reads any Qwen3.5 text `config.json` and
+  refuses by name what the forward lacks (untied embeddings, MoE, attention
+  bias, an ungated output, non-SiLU activations, `mlp_only_layers`,
+  non-default RoPE, a key head dim other than 128, an attention head dim
+  other than 256). The published 2B config parses to exactly the config
+  `tests/qwen35_model.rs` checks. No other size has been run against
+  transformers with its weights, so for those sizes only parsing is checked,
+  not the forward.
 - **Redundant work left in.** The normalized-k/q workspace is stored per
   value head, so it is duplicated `Hv/Hk` times: 1× for the 2B (16 key /
   16 value heads), 2× at `Qwen3_5TextConfig()`'s defaults†. The prep

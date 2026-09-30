@@ -759,8 +759,11 @@ the NT kernel at the head's shape (`bench_gemm_tnnt_tune`,
 `bench/results/bf16_nt_lm_head_m5pro.txt`) closed most of the gap but not
 all of it: 256x64 on 8 simdgroups (fewer passes over the 1 GB table) ran at
 35.9 / 37.1 ms against the NN head's 34.2 / 33.4, taller tiles were slower,
-and that tile would halve one of the training backward's NT shapes, so it
-could only be a head-only kernel. Neither that 5-11% nor the 1 GB saved
+and that tile runs the bf16 NT dx shape `gemm_nt_train` serves under
+`PrecisionMode::Bf16` (4096 x 128 x 384) at half the production kernel's
+speed (0.260 against 0.133 ms; the sweep's "0.51x" is throughput), so it
+could only be a head-only kernel. `train_step` is not affected either way:
+it runs exact f32 (`gemm_nt_f32`), not a bf16 tile. Neither that 5-11% nor the 1 GB saved
 matters much here, since nothing in production runs the bf16 full-vocabulary
 head (Lappi scores answer rows through `score_answer_rows`), so the bf16
 model keeps the faster, existing head and no kernel was added. `tests/qwen35_params.rs`, `tests/capi.rs` and

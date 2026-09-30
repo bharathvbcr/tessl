@@ -13,8 +13,10 @@
 # table once, so 4 row tiles read it 4 times against 128x64's 8) reaches
 # 35.9 / 37.1 ms against the NN head's 34.2 / 33.4 ms: 5-11% slower. Taller
 # tiles do not help (512x64 sg16 38.2, 1024x32 sg16 39.4; 512x64 sg8 122).
-# 256x64 sg8 would also halve the NT dx_mlp_in shape (0.51x), so it could
-# only be a head-specific kernel. Decision: the bf16 model keeps its packed
+# 256x64 sg8 would also run the bf16 NT dx_mlp_in shape at half speed
+# (0.260 vs 0.133 ms; the ratio column is throughput against production, so
+# 0.51x is slower), so it could only be a head-specific kernel. Qwen35's
+# train_step runs exact f32 (gemm_nt_f32) and uses none of these tiles. Decision: the bf16 model keeps its packed
 # NN head (see docs/qwen35.md, "From torch").
 
 ## Run 1

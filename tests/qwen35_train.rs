@@ -289,13 +289,9 @@ fn train_step_refuses_what_it_does_not_implement() {
     e(model.train_step(&[5, 64], GemmOperands::ExactF32), "token id 64 >= vocab 64");
 }
 
-/// Qwen3.5-2B-Base: `python3 tools/qwen35_ref/make_train_fixture.py 2b`
-/// first (see its docstring for memory), then this. Compares the loss, every
-/// 1-D and conv parameter, layers 0 and 3 in full, and the embedding rows
-/// the reference kept.
-#[test]
-#[ignore]
-fn real_2b_step_matches_transformers() {
+/// The 2B reference directory (`make_train_fixture.py 2b`), the model loaded
+/// in f32 from `QWEN35_2B_SAFETENSORS`, and its config.
+fn real_2b() -> (PathBuf, Qwen35Config, Qwen35Model) {
     let dir = std::env::var_os("QWEN35_TRAIN_REF_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|| Path::new(env!("CARGO_MANIFEST_DIR")).join("target/qwen35_train_ref"));
@@ -306,7 +302,45 @@ fn real_2b_step_matches_transformers() {
     let st = SafeTensors::open(&st_path).unwrap();
     let cfg = Qwen35Config::qwen35_2b().unwrap();
     let model = Qwen35Model::load(&rt, &st, "model.language_model.", cfg.clone(), Precision::F32).unwrap();
-    drop(st);
+    (dir, cfg, model)
+}
+
+/// Every reference gradient in `dir` against `step`'s, each as
+/// [`rel`], printed before anything is asserted; returns them and the worst.
+fn real_2b_results(dir: &Path, cfg: &Qwen35Config, step: &TrainStep) -> (Vec<(String, f64)>, f64) {
+    let mut results = Vec::new();
+    // The embedding: only the rows the reference kept.
+    let (_, rows) = npy_f64(&dir.join("embed_rows.npy"));
+    let (_, want) = npy_f64(&dir.join("grad.model.embed_tokens.weight.rows.npy"));
+    let (_, h, all) = read_t(&step.grads.embed);
+    let got: Vec<f64> = rows.iter().flat_map(|&r| all[r as usize * h..][..h].to_vec()).collect();
+    results.push(("model.embed_tokens.weight (kept rows)".to_string(), rel(&got, &want)));
+    // transformers names the text tower's parameters `model.*`; the
+    // checkpoint stores them under `model.language_model.*`.
+    for (name, got) in by_name(cfg, &step.grads, "model.") {
+        let path = dir.join(format!("grad.{name}.npy"));
+        if path.exists() {
+            results.push((name, rel(&got, &npy_f64(&path).1)));
+        }
+    }
+    for (name, r) in &results {
+        eprintln!("{name}: {r:.2e}");
+    }
+    let files = std::fs::read_dir(dir).unwrap().filter(|e| e.as_ref().unwrap().file_name().to_string_lossy().starts_with("grad.")).count();
+    assert_eq!(results.len(), files, "every reference gradient must be compared");
+    let worst = results.iter().map(|(_, r)| *r).fold(0.0, f64::max);
+    eprintln!("worst parameter gradient: {worst:.2e} over {} parameters", results.len());
+    (results, worst)
+}
+
+/// Qwen3.5-2B-Base: `python3 tools/qwen35_ref/make_train_fixture.py 2b`
+/// first (see its docstring for memory), then this. Compares the loss, every
+/// 1-D and conv parameter, layers 0 and 3 in full, and the embedding rows
+/// the reference kept.
+#[test]
+#[ignore]
+fn real_2b_step_matches_transformers() {
+    let (dir, cfg, model) = real_2b();
     let ids = ids(&dir);
     let step = model.train_step(&ids, GemmOperands::ExactF32).unwrap();
     let infer = inference_loss(&model, &ids);
@@ -317,30 +351,7 @@ fn real_2b_step_matches_transformers() {
     let r_self = (step.loss - infer).abs() / infer;
     eprintln!("loss: train {:.8}, inference {infer:.8}, transformers {want_loss:.8}", step.loss);
     eprintln!("      train vs transformers {r_train:.2e}, inference vs transformers {r_infer:.2e}, train vs inference {r_self:.2e}");
-
-    // Every comparison is printed before any is asserted.
-    let mut results = Vec::new();
-    // The embedding: only the rows the reference kept.
-    let (_, rows) = npy_f64(&dir.join("embed_rows.npy"));
-    let (_, want) = npy_f64(&dir.join("grad.model.embed_tokens.weight.rows.npy"));
-    let (_, h, all) = read_t(&step.grads.embed);
-    let got: Vec<f64> = rows.iter().flat_map(|&r| all[r as usize * h..][..h].to_vec()).collect();
-    results.push(("model.embed_tokens.weight (kept rows)".to_string(), rel(&got, &want)));
-    // transformers names the text tower's parameters `model.*`; the
-    // checkpoint stores them under `model.language_model.*`.
-    for (name, got) in by_name(&cfg, &step.grads, "model.") {
-        let path = dir.join(format!("grad.{name}.npy"));
-        if path.exists() {
-            results.push((name, rel(&got, &npy_f64(&path).1)));
-        }
-    }
-    for (name, r) in &results {
-        eprintln!("{name}: {r:.2e}");
-    }
-    let files = std::fs::read_dir(&dir).unwrap().filter(|e| e.as_ref().unwrap().file_name().to_string_lossy().starts_with("grad.")).count();
-    assert_eq!(results.len(), files, "every reference gradient must be compared");
-    let worst = results.iter().map(|(_, r)| *r).fold(0.0, f64::max);
-    eprintln!("worst parameter gradient: {worst:.2e} over {} parameters", results.len());
+    let (results, _) = real_2b_results(&dir, &cfg, &step);
     // These bounds were set after the first run, from what it showed: the
     // training loss is the inference forward's (1.7e-7), which differs from
     // transformers' fp32 loss by 4.6e-5 because the two f32 forwards differ
@@ -355,5 +366,29 @@ fn real_2b_step_matches_transformers() {
     assert!(r_train <= 1e-4, "loss {} vs transformers {want_loss}", step.loss);
     for (name, r) in &results {
         assert!(*r <= 1e-2, "{name}: rel err {r:.3e} > 1e-2");
+    }
+}
+
+/// The 2B step on bf16 GEMM operands against the same float32 transformers
+/// reference as [`real_2b_step_matches_transformers`] (not transformers under
+/// bf16 autocast, which rounds at other boundaries and so computes another
+/// function). Bounds written before the first run: the loss within 2^-7 and
+/// every compared gradient within 2^-4 of its parameter's largest, twice the
+/// tiny fixture's (2^-8, 2^-5) for 24 layers instead of 2; the exact step's
+/// own gap to transformers (3.9e-3) is inside them.
+#[test]
+#[ignore]
+fn real_2b_step_on_bf16_operands_stays_near_transformers() {
+    let (dir, cfg, model) = real_2b();
+    let ids = ids(&dir);
+    let step = model.train_step(&ids, GemmOperands::Bf16).unwrap();
+    let (_, want_loss) = npy_f64(&dir.join("loss.npy"));
+    let want_loss = want_loss[0];
+    let r_loss = (step.loss - want_loss).abs() / want_loss;
+    eprintln!("loss: bf16 operands {:.8}, transformers {want_loss:.8} (rel {r_loss:.2e})", step.loss);
+    let (results, worst) = real_2b_results(&dir, &cfg, &step);
+    assert!(r_loss <= 2f64.powi(-7), "loss {} vs transformers {want_loss}", step.loss);
+    for (name, r) in &results {
+        assert!(*r <= 2f64.powi(-4), "{name}: rel err {r:.3e} > 2^-4 (worst {worst:.3e})");
     }
 }

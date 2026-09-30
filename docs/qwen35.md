@@ -826,7 +826,13 @@ bits, and neither is the `ExactF32` step's. At the 2B's shapes and
 T = 2048, the cross-entropy with gradients takes 561 ms on bf16 operands
 against 1768 ms exact (`bench_qwen35_train --bf16`, two runs each, 3.15x);
 the whole 2B step on bf16 operands has not been timed (it needs ~30 GB
-free) or compared against transformers.
+free). Against transformers' float32 2B reference (the ignored
+`real_2b_step_on_bf16_operands_stays_near_transformers`, the 128 tokens and
+149 tensors of the f32 check) it gives a loss within 1.33e-4 and gradients
+within 2.2e-2 (matrices) and 3.6e-2 (1-D norms, `A_log`) of each
+parameter's largest, under bounds of 2^-7 and 2^-4 written before the run;
+the exact step's gap there is 3.9e-3. Its process peaked at 22.3 GB
+resident (`/usr/bin/time -l`).
 
 `tests/qwen35_train.rs` checks it against transformers' own autograd on a
 committed tiny `Qwen3_5ForCausalLM` of the 2B's shape family (one GDN and one

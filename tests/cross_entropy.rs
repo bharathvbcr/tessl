@@ -21,6 +21,7 @@ use common::{buf, buf_bf16, random_f32, round_trip_bf16, with_gpu};
 use tessl::cross_entropy::{
     cross_entropy_rows, CeGrads, CeHidden, CeOutput, CeWorkspace, Reduction,
 };
+use tessl::gemm::GemmOperands;
 use tessl::tensor::{DType, GpuBuffer, Tensor};
 use tessl::GpuRuntime;
 
@@ -50,6 +51,10 @@ struct Case {
     /// so a view read from the buffer's base instead of its offset shows.
     h_base: usize,
     w_base: usize,
+    /// The four GEMMs' operands. Under `Bf16` the reference is formed from
+    /// the bf16-rounded hidden rows and weight, which the logit walk reads
+    /// exactly; `dh` and `dW` also round the softmax gradient to bf16.
+    operands: GemmOperands,
 }
 
 impl Case {
@@ -72,6 +77,7 @@ impl Case {
             plant: None,
             h_base: 0,
             w_base: 0,
+            operands: GemmOperands::ExactF32,
         }
     }
 }
@@ -149,10 +155,10 @@ fn reference(c: &Case, h: &[f32], w: &[f32]) -> Reference {
     Reference { per_row, loss, dh, dw }
 }
 
-fn assert_grad(label: &str, got: &[f32], want: &[f64]) {
+fn assert_grad(label: &str, got: &[f32], want: &[f64], rel: f64) {
     assert_eq!(got.len(), want.len(), "{label}: length");
     let peak = want.iter().fold(0.0f64, |m, x| m.max(x.abs()));
-    let bound = 1e-4 * peak + 1e-12;
+    let bound = rel * peak + 1e-12;
     let mut worst = (0.0f64, 0usize);
     for (i, (&g, &w)) in got.iter().zip(want).enumerate() {
         assert!(g != SENTINEL, "{label}[{i}]: never written");
@@ -193,7 +199,7 @@ fn sentinel_tensor(rt: &Arc<GpuRuntime>, shape: &[usize]) -> Tensor {
 /// reference. Returns the reference loss for callers that compare cases.
 fn check(rt: &Arc<GpuRuntime>, c: &Case) -> f64 {
     let label = format!(
-        "V={} H={} chunk={} n={} h={:?} w={:?} {:?} scale={}",
+        "V={} H={} chunk={} n={} h={:?} w={:?} {:?} scale={} {:?}",
         c.vocab,
         c.hidden,
         c.chunk,
@@ -201,7 +207,8 @@ fn check(rt: &Arc<GpuRuntime>, c: &Case) -> f64 {
         c.h_dtype,
         c.w_dtype,
         c.reduction,
-        c.scale
+        c.scale,
+        c.operands
     );
     let h: Vec<f32> = random_f32(c.rows_total * c.ld, c.seed)
         .into_iter()
@@ -219,7 +226,18 @@ fn check(rt: &Arc<GpuRuntime>, c: &Case) -> f64 {
         }
     }
     let w = maybe_round(w, c.w_dtype);
-    let want = reference(c, &h, &w);
+    let want = match c.operands {
+        GemmOperands::ExactF32 => reference(c, &h, &w),
+        GemmOperands::Bf16 => reference(c, &round_trip_bf16(&h), &round_trip_bf16(&w)),
+    };
+    // Exact f32: the measured error sits near 1e-6. bf16 operands: the softmax
+    // gradient is rounded to bf16 (relative 2^-9) before dh and dW, whose sums
+    // cancel (the gradient sums to zero over the vocabulary), so the bound is
+    // 2^-7 of the peak, written before the first run.
+    let grad_bound = match c.operands {
+        GemmOperands::ExactF32 => 1e-4,
+        GemmOperands::Bf16 => 2f64.powi(-7),
+    };
 
     let ht = upload_at(rt, &h, c.h_dtype, &[c.rows_total, c.ld], c.h_base);
     let wt = upload_at(rt, &w, c.w_dtype, &[c.vocab, c.hidden], c.w_base);
@@ -230,7 +248,7 @@ fn check(rt: &Arc<GpuRuntime>, c: &Case) -> f64 {
         .expect("workspace");
 
     let fwd = cross_entropy_rows(
-        rt, hid, &wt, &c.rows, &c.targets, c.reduction, &ws, None,
+        rt, hid, &wt, &c.rows, &c.targets, c.reduction, c.operands, &ws, None,
     )
     .unwrap_or_else(|e| panic!("{label}: {e}"));
     assert_loss(&format!("{label} (forward only)"), &fwd, &want);
@@ -244,13 +262,14 @@ fn check(rt: &Arc<GpuRuntime>, c: &Case) -> f64 {
         &c.rows,
         &c.targets,
         c.reduction,
+        c.operands,
         &ws,
         Some(CeGrads { dh: &dh, dw: &dw, scale: c.scale }),
     )
     .unwrap_or_else(|e| panic!("{label}: {e}"));
     assert_loss(&label, &out, &want);
-    assert_grad(&format!("{label} dh"), &dh.read_f32().expect("read"), &want.dh);
-    assert_grad(&format!("{label} dW"), &dw.read_f32().expect("read"), &want.dw);
+    assert_grad(&format!("{label} dh"), &dh.read_f32().expect("read"), &want.dh, grad_bound);
+    assert_grad(&format!("{label} dW"), &dw.read_f32().expect("read"), &want.dw, grad_bound);
     want.loss
 }
 
@@ -321,6 +340,40 @@ fn the_running_log_sum_exp_survives_large_and_late_maxima() {
     });
 }
 
+/// bf16 GEMM operands, against the f64 reference on the bf16-rounded operands
+/// they read: across the chunk walk, every dtype pairing, a chunk of 1 and a
+/// late dominant logit. Then that the rounding happens at all: on f32 inputs
+/// the exact and bf16 references are further apart than twice the loss bound,
+/// so no one GPU result could pass both.
+#[test]
+fn bf16_operands_match_the_reference_on_the_rounded_operands() {
+    with_gpu(|rt| {
+        let bf = |c: Case| Case { operands: GemmOperands::Bf16, ..c };
+        check(rt, &bf(Case::small(31)));
+        for (hd, wd) in [
+            (DType::BF16, DType::F32),
+            (DType::F32, DType::BF16),
+            (DType::BF16, DType::BF16),
+        ] {
+            check(
+                rt,
+                &bf(Case { h_dtype: hd, w_dtype: wd, reduction: Reduction::Sum, scale: 0.7, ..Case::small(32) }),
+            );
+        }
+        check(rt, &bf(Case { vocab: 37, chunk: 1, targets: vec![0, 36, 17, 1], ..Case::small(33) }));
+        check(rt, &bf(Case { h_scale: 3.0, plant: Some((990, 0, 2.0)), ..Case::small(34) }));
+
+        let exact = check(rt, &Case::small(35));
+        let rounded = check(rt, &bf(Case::small(35)));
+        let bound = 1e-5 + 1e-5 * exact.abs();
+        assert!(
+            (exact - rounded).abs() > 2.0 * bound,
+            "bf16 operands moved the loss by only {:.2e} (bound {bound:.2e}): nothing was rounded",
+            (exact - rounded).abs()
+        );
+    });
+}
+
 #[test]
 fn matches_the_reference_at_the_real_vocabulary_and_hidden_width() {
     with_gpu(|rt| {
@@ -387,7 +440,7 @@ fn rejects_what_it_cannot_compute() {
                    targets: &[u32],
                    ws: &CeWorkspace,
                    grads: Option<CeGrads<'_>>| {
-            cross_entropy_rows(rt, hid, wt, rows, targets, Reduction::Mean, ws, grads)
+            cross_entropy_rows(rt, hid, wt, rows, targets, Reduction::Mean, GemmOperands::ExactF32, ws, grads)
                 .map(|o| o.loss)
         };
         let expect_err = |r: Result<f64, String>, needle: &str| match r {

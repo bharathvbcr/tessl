@@ -808,6 +808,23 @@ a and b; for attention: the Q/K backward's q, k, v and the output gate's
 gate columns) and multiplied out once. Gradients are the same bits on every
 run.
 
+`train_step(ids, operands)` takes the GEMMs' operand precision
+(`gemm::GemmOperands`): `ExactF32`, or `Bf16`, which rounds each GEMM's
+operands to bf16 and accumulates in f32 (the `gemm_bf16` / `gemm_tn_bf16` /
+`gemm_nt_bf16` lane, the one `PrecisionMode::Bf16` selects for the
+`*_train` GEMMs, chosen per call instead of runtime-wide). Everything else
+stays f32: the weights, the activations kept and rebuilt, the gradients, and
+every non-GEMM kernel; the cross-entropy's four GEMMs take the same choice.
+On the tiny model, `Bf16` gives a loss within 7.3e-5 of transformers' f32 and
+gradients within 1.4e-2 (matrices) and 2.3e-2 (the 1-D norms, `A_log`,
+`dt_bias`, each one sum over every token) of each parameter's largest
+(bounds 2^-8 and 2^-5, set before the first run); two runs are the same
+bits, and neither is the `ExactF32` step's. At the 2B's shapes and
+T = 2048, the cross-entropy with gradients takes 561 ms on bf16 operands
+against 1768 ms exact (`bench_qwen35_train --bf16`, two runs each, 3.15x);
+the whole 2B step on bf16 operands has not been timed (it needs ~30 GB
+free) or compared against transformers.
+
 `tests/qwen35_train.rs` checks it against transformers' own autograd on a
 committed tiny `Qwen3_5ForCausalLM` of the 2B's shape family (one GDN and one
 attention layer, T = 70 across a GDN chunk and attention blocks; bf16
@@ -907,7 +924,8 @@ is the largest non-GEMM share: 18 × 1.4 ms.
   forward and backward on the GPU (torch sees it through
   `tessl_torch.Qwen35`). What it does not do yet: more than one sequence per
   step, GDN layers whose value heads outnumber their key heads, and bf16
-  training (it is f32 only).
+  storage: weights, activations and gradients stay f32 (bf16 GEMM operands
+  are an option, see "A training step"), and a bf16-loaded model is refused.
 - **Fast math.** Metal compiles with fast math on by default. The attention
   kernels seed their running maxima with `-INFINITY`; nothing measured
   misbehaves, but under fast math the compiler may assume no infinities.

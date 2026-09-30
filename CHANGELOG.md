@@ -142,6 +142,18 @@ All notable changes to `tessl` are recorded here. The format follows
   transformers' names and values, for a torch optimizer. Checked against
   transformers' own autograd before and after an AdamW step written back
   (`python/tests/test_qwen35.py`).
+- **`Qwen35Model::train_step(ids, operands)` and
+  `cross_entropy_rows(.., reduction, operands, ws, grads)`** take a
+  `gemm::GemmOperands`: `ExactF32` (the previous behaviour) or `Bf16`, bf16
+  GEMM operands with f32 accumulation while weights, activations and
+  gradients stay f32. The C ABI (still 5) passes `ExactF32`. `Bf16` runs the
+  2B's cross-entropy with gradients 3.15x faster at T = 2048 (561 against
+  1768 ms); on the tiny model its gradients are within 2.3e-2 of
+  transformers' f32 (see docs/qwen35.md, "A training step").
+  `gemm_bf16`, `gemm_tn_bf16` and `gemm_nt_bf16` are that lane whatever the
+  runtime's `PrecisionMode` (the `*_train` GEMMs now delegate to them), and
+  `GemmOperands::ExactF32` refuses a runtime with relaxed precision on.
+  `bench_qwen35_train --bf16` times it.
 - `Tensor::from_mtl_buffer` is an `unsafe fn`: tessl cannot see another
   queue's work on a wrapped buffer, and its `# Safety` section states the
   cross-queue contract.

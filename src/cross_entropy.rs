@@ -10,8 +10,8 @@
 //!
 //! 1. gathers the `n` supervised rows into f32 `[n, hidden]` (bf16 widened
 //!    exactly);
-//! 2. walks the vocabulary in chunks: `logits = h @ W[v0..v0+w]ᵀ` (exact f32
-//!    GEMM; a bf16 weight chunk is widened exactly first), folded into a
+//! 2. walks the vocabulary in chunks: `logits = h @ W[v0..v0+w]ᵀ` (the
+//!    caller's [`GemmOperands`]; a bf16 weight chunk is widened exactly first), folded into a
 //!    running log-sum-exp per row, the target's logit picked up on the way;
 //! 3. with gradients requested, walks it again: the recomputed chunk becomes
 //!    `dlogits = (softmax - onehot) * scale`, then `dh += dlogits @ W_c` and
@@ -29,20 +29,22 @@
 //! is the upstream gradient of the loss (1 for a plain `backward()`); `dh` and
 //! `dW` are the gradients of `scale * loss`.
 //!
-//! All arithmetic is exact f32 (softmax exponentials and logs use `precise::`),
-//! so a runtime with relaxed-precision GEMMs switched on is refused.
+//! The four GEMMs (two logit walks, `dh`, `dW`) run on the caller's
+//! [`GemmOperands`]: exact f32, or operands rounded to bf16 with f32
+//! accumulation. Everything else is exact f32 (softmax exponentials and logs
+//! use `precise::`), and a runtime with relaxed-precision GEMMs switched on is
+//! refused either way.
 
 use std::sync::Arc;
 
 use objc2_metal::MTLComputePipelineState;
 
 use crate::dispatch::{dispatch_2d, set_f32, set_gpu_buf, set_tensor, set_u32};
-use crate::gemm::{cast_bf16_to_f32_into, gemm_f32, gemm_nt_f32, gemm_tn_f32, GemmBackend};
+use crate::gemm::{cast_bf16_to_f32_into, GemmOperands};
 use crate::nn::{dispatch_tg_1d, reduce_tptg};
 use crate::runtime::GpuRuntime;
 use crate::tensor::{DType, GpuBuffer, Tensor};
 
-const BACKEND: GemmBackend = GemmBackend::TensorOps;
 
 /// How the per-row losses combine.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -176,6 +178,7 @@ pub fn cross_entropy_rows(
     rows: &[u32],
     targets: &[u32],
     reduction: Reduction,
+    operands: GemmOperands,
     ws: &CeWorkspace,
     grads: Option<CeGrads<'_>>,
 ) -> Result<CeOutput, String> {
@@ -308,7 +311,7 @@ pub fn cross_entropy_rows(
         let w = chunk.min(vs - v0);
         let wc = weight_chunk(v0, w)?;
         let logits = ws.logits.try_view(&[n, w], 0)?;
-        gemm_nt_f32(&h_rows, &wc, &logits, BACKEND)?;
+        operands.nt(&h_rows, &wc, &logits)?;
         let tptg = reduce_tptg(lse.maxTotalThreadsPerThreadgroup(), w);
         dispatch_tg_1d(rt, &lse, n, tptg, None, |bnd| {
             set_gpu_buf(bnd, &logits.buffer, 0);
@@ -335,7 +338,7 @@ pub fn cross_entropy_rows(
             let w = chunk.min(vs - v0);
             let wc = weight_chunk(v0, w)?;
             let logits = ws.logits.try_view(&[n, w], 0)?;
-            gemm_nt_f32(&h_rows, &wc, &logits, BACKEND)?;
+            operands.nt(&h_rows, &wc, &logits)?;
             dispatch_2d(rt, &sgrad, w, n, |bnd| {
                 set_gpu_buf(bnd, &logits.buffer, 0);
                 set_gpu_buf(bnd, &ws.m, 1);
@@ -349,10 +352,10 @@ pub fn cross_entropy_rows(
             })?;
             // dh (+)= dlogits @ W_c: the first chunk writes, the rest add.
             if v0 == 0 {
-                gemm_f32(&logits, &wc, g.dh, BACKEND)?;
+                operands.nn(&logits, &wc, g.dh)?;
             } else {
                 let part = ws.dh_part.try_view(&[n, hs], 0)?;
-                gemm_f32(&logits, &wc, &part, BACKEND)?;
+                operands.nn(&logits, &wc, &part)?;
                 crate::qwen35::residual_add(
                     rt,
                     crate::qwen35::Cols::dense(&part.buffer, hidden),
@@ -363,7 +366,7 @@ pub fn cross_entropy_rows(
             }
             // dW rows [v0, v0 + w) = dlogitsᵀ @ h.
             let dw_rows = g.dw.try_view(&[w, hs], v0 * hs)?;
-            gemm_tn_f32(&logits, &h_rows, &dw_rows, BACKEND)?;
+            operands.tn(&logits, &h_rows, &dw_rows)?;
         }
     }
 

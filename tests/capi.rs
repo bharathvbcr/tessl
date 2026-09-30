@@ -22,6 +22,7 @@ use tessl::capi::{
     TesslParamInfo, TesslQwen35,
 };
 use tessl::cross_entropy::{cross_entropy_rows, CeGrads, CeHidden, CeWorkspace, Reduction};
+use tessl::gemm::GemmOperands;
 use tessl::{DType, GpuRuntime};
 
 const ERR_LEN: usize = 512;
@@ -141,6 +142,7 @@ fn a_call_through_the_abi_is_the_rust_call() {
             &rows,
             &targets,
             Reduction::Mean,
+            GemmOperands::ExactF32,
             &ws,
             Some(CeGrads { dh: &dh, dw: &dw, scale: 0.5 }),
         )
@@ -366,7 +368,7 @@ fn the_model_through_the_abi_is_the_rust_model() {
         let mut loss = 0.0f64;
         let s = unsafe { tessl_qwen35_train_step(model, ids.as_ptr(), ids.len() as u64, &mut loss, err.as_mut_ptr(), ERR_LEN) };
         assert_eq!(s, TESSL_OK, "{}", msg(&err));
-        let want = rust.train_step(&ids).unwrap();
+        let want = rust.train_step(&ids, GemmOperands::ExactF32).unwrap();
         assert_eq!(loss.to_bits(), want.loss.to_bits());
 
         let local: Vec<tessl::Tensor> = table.iter().map(|p| rt.alloc_tensor_f32(&p.storage_shape()).unwrap()).collect();
@@ -400,7 +402,7 @@ fn the_model_through_the_abi_is_the_rust_model() {
         let s = unsafe { tessl_qwen35_train_step(model, ids.as_ptr(), ids.len() as u64, &mut moved, err.as_mut_ptr(), ERR_LEN) };
         assert_eq!(s, TESSL_OK, "{}", msg(&err));
         assert_ne!(moved.to_bits(), loss.to_bits());
-        assert_eq!(moved.to_bits(), rust.train_step(&ids).unwrap().loss.to_bits());
+        assert_eq!(moved.to_bits(), rust.train_step(&ids, GemmOperands::ExactF32).unwrap().loss.to_bits());
     });
 
     // Refusals: a bad id, a null handle, another thread.

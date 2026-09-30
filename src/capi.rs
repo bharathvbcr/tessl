@@ -40,6 +40,7 @@ use crate::cross_entropy::{cross_entropy_rows, CeGrads, CeHidden, CeWorkspace, R
 use crate::gdn_train::{
     gdn_train_backward, gdn_train_forward, GdnTrainDims, GdnTrainGrads, GdnTrainInputs, GdnTrainWorkspace,
 };
+use crate::gemm::GemmOperands;
 use crate::qwen35_model::{Precision, Qwen35Config, Qwen35Model};
 use crate::qwen35_params::ParamInfo;
 use crate::qwen35_train::Qwen35Grads;
@@ -295,6 +296,7 @@ unsafe fn ce(h: &mut TesslRuntime, a: &TesslCeArgs) -> Result<crate::cross_entro
         rows,
         targets,
         reduction,
+        GemmOperands::ExactF32,
         ws,
         grads,
     )
@@ -800,7 +802,7 @@ pub unsafe extern "C" fn tessl_qwen35_train_step(
             let n = usize::try_from(n).map_err(|_| format!("{WHAT}: n overflows usize"))?;
             let ids = std::slice::from_raw_parts(ids, n);
             h.grads = None;
-            let step = h.model.train_step(ids)?;
+            let step = h.model.train_step(ids, GemmOperands::ExactF32)?;
             *loss = step.loss;
             h.grads = Some(step.grads);
             Ok(())

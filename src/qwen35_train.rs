@@ -3,13 +3,15 @@
 //!
 //! The loss is transformers' `ForCausalLMLoss` for one unpadded sequence:
 //! position `t` predicts `ids[t + 1]`, cross-entropy averaged over the
-//! `T - 1` predicted positions. The step runs in f32 ([`Precision::F32`]),
-//! with the training kernels where the inference forward's cannot give a
+//! `T - 1` predicted positions. The step runs in f32 ([`Precision::F32`]:
+//! f32 weights, activations and gradients), its GEMMs on the caller's
+//! [`GemmOperands`]: exact f32, or operands rounded to bf16 with f32
+//! accumulation. It uses the training kernels where the inference forward's cannot give a
 //! backward what it needs: [`crate::gdn_train`] for the gated delta rule
 //! (checkpointed state), [`crate::attn_train`] for attention (log-sum-exp),
 //! and [`crate::qwen35::gdn_gates`] for the gates as values. Everything else
 //! is the inference forward's kernels, and the backward is
-//! [`crate::qwen35_bwd`], [`crate::cross_entropy`] and exact-f32 GEMMs.
+//! [`crate::qwen35_bwd`], [`crate::cross_entropy`] and the GEMMs.
 //!
 //! Every gradient is in the layout of the weight it belongs to: the fused
 //! projections' packed `[in, out]` right operands, the conv weight
@@ -35,7 +37,7 @@ use crate::cross_entropy::{cross_entropy_rows, CeGrads, CeHidden, CeWorkspace, R
 use crate::gdn_train::{
     gdn_train_backward, gdn_train_forward, GdnTrainDims, GdnTrainGrads, GdnTrainInputs, GdnTrainWorkspace, GDN_TRAIN_DK,
 };
-use crate::gemm::{gemm, gemm_nt_f32, gemm_tn_f32, GemmBackend};
+use crate::gemm::GemmOperands;
 use crate::nn;
 use crate::qwen35::{self, AttnShape, AttnTargets, Cols, GdnParams, OutCols, StateIn};
 use crate::qwen35_bwd::{
@@ -47,7 +49,6 @@ use crate::qwen35_model::{AttnWeights, GdnWeights, Layer, Mixer, Precision, Qwen
 use crate::runtime::GpuRuntime;
 use crate::tensor::{DType, GpuBuffer, Tensor};
 
-const BACKEND: GemmBackend = GemmBackend::TensorOps;
 /// Vocabulary columns per cross-entropy chunk.
 const CE_CHUNK: u32 = 8192;
 
@@ -205,7 +206,7 @@ impl Qwen35Model {
     /// One training step on `ids` (one sequence, positions from 0): the loss
     /// transformers' `Qwen3_5ForCausalLM(input_ids=ids, labels=ids)` reports
     /// and every parameter's gradient of it.
-    pub fn train_step(&self, ids: &[u32]) -> Result<TrainStep, String> {
+    pub fn train_step(&self, ids: &[u32], operands: GemmOperands) -> Result<TrainStep, String> {
         const WHAT: &str = "Qwen35Model::train_step";
         let (rt, cfg) = (&self.rt, &self.cfg);
         if self.precision != Precision::F32 {
@@ -246,7 +247,7 @@ impl Qwen35Model {
         // the pool for the next layer.
         let mut inputs = Vec::with_capacity(self.layers.len());
         for layer in &self.layers {
-            let (s, out) = self.train_layer_forward(layer, resid, t, true)?;
+            let (s, out) = self.train_layer_forward(layer, resid, t, true, operands)?;
             let out = out.ok_or("Qwen35Model::train_step: a layer's forward returned no output")?;
             inputs.push(s.resid_in);
             resid = out;
@@ -270,6 +271,7 @@ impl Qwen35Model {
             &rows,
             targets,
             Reduction::Mean,
+            operands,
             &ce_ws,
             Some(CeGrads { dh: &dxf.view(&[n, h], 0), dw: &d_embed, scale: 1.0 }),
         )?;
@@ -295,8 +297,8 @@ impl Qwen35Model {
         // as soon as its backward is encoded.
         for layer in self.layers.iter().rev() {
             let resid_in = inputs.pop().ok_or("Qwen35Model::train_step: fewer layer inputs than layers")?;
-            let s = self.train_layer_forward(layer, resid_in, t, false)?.0;
-            layers.push(self.train_layer_backward(layer, &s, &mut sc)?);
+            let s = self.train_layer_forward(layer, resid_in, t, false, operands)?.0;
+            layers.push(self.train_layer_backward(layer, &s, &mut sc, operands)?);
         }
         layers.reverse();
         let emb_ws = EmbedBwdWorkspace::new(rt, t)?;
@@ -392,10 +394,10 @@ impl Qwen35Model {
 
     /// A fresh residual stream `resid + y @ w_out`, leaving `resid` as the
     /// saved input of the norm that read it.
-    fn residual(&self, resid: &Tensor, y: &Tensor, w_out: &Tensor, t: u32) -> Result<Tensor, String> {
+    fn residual(&self, resid: &Tensor, y: &Tensor, w_out: &Tensor, t: u32, mm: GemmOperands) -> Result<Tensor, String> {
         let (rt, h) = (&self.rt, self.cfg.hidden);
         let out = tensor(rt, &[t as usize, h as usize])?;
-        gemm(y, w_out, &out, BACKEND)?;
+        mm.nn(y, w_out, &out)?;
         qwen35::residual_add(rt, Cols::dense(&resid.buffer, h), Cols::dense(&out.buffer, h), t, h)?;
         Ok(out)
     }
@@ -409,6 +411,7 @@ impl Qwen35Model {
         resid_in: Tensor,
         t: u32,
         output: bool,
+        mm: GemmOperands,
     ) -> Result<(Saved, Option<Tensor>), String> {
         let (rt, cfg) = (&self.rt, &self.cfg);
         let (tu, h, i) = (t as usize, cfg.hidden as usize, cfg.intermediate as usize);
@@ -416,21 +419,21 @@ impl Qwen35Model {
         self.norm_f32(&resid_in, &layer.input_norm, &x1, t)?;
         let (mixer, resid_mid) = match &layer.mixer {
             Mixer::Gdn(w) => {
-                let s = self.gdn_forward(w, &x1, t)?;
-                let r = self.residual(&resid_in, &s.y, &w.w_out, t)?;
+                let s = self.gdn_forward(w, &x1, t, mm)?;
+                let r = self.residual(&resid_in, &s.y, &w.w_out, t, mm)?;
                 (SavedMixer::Gdn(Box::new(s)), r)
             }
             Mixer::Attn(w) => {
-                let s = self.attn_forward(w, &x1, t)?;
-                let r = self.residual(&resid_in, &s.y, &w.w_out, t)?;
+                let s = self.attn_forward(w, &x1, t, mm)?;
+                let r = self.residual(&resid_in, &s.y, &w.w_out, t, mm)?;
                 (SavedMixer::Attn(s), r)
             }
         };
         let x2 = tensor(rt, &[tu, h])?;
         self.norm_f32(&resid_mid, &layer.post_norm, &x2, t)?;
         let (m_gate, m_up, m_mid) = (tensor(rt, &[tu, i])?, tensor(rt, &[tu, i])?, tensor(rt, &[tu, i])?);
-        gemm(&x2, &layer.gate, &m_gate, BACKEND)?;
-        gemm(&x2, &layer.up, &m_up, BACKEND)?;
+        mm.nn(&x2, &layer.gate, &m_gate)?;
+        mm.nn(&x2, &layer.up, &m_up)?;
         qwen35::swiglu(
             rt,
             Cols::dense(&m_gate.buffer, cfg.intermediate),
@@ -439,16 +442,16 @@ impl Qwen35Model {
             t,
             cfg.intermediate,
         )?;
-        let resid_out = if output { Some(self.residual(&resid_mid, &m_mid, &layer.down, t)?) } else { None };
+        let resid_out = if output { Some(self.residual(&resid_mid, &m_mid, &layer.down, t, mm)?) } else { None };
         Ok((Saved { resid_in, x1, mixer, resid_mid, x2, m_gate, m_up, m_mid }, resid_out))
     }
 
-    fn gdn_forward(&self, w: &GdnWeights, x1: &Tensor, t: u32) -> Result<SavedGdn, String> {
+    fn gdn_forward(&self, w: &GdnWeights, x1: &Tensor, t: u32, mm: GemmOperands) -> Result<SavedGdn, String> {
         let (rt, g) = (&self.rt, self.cfg.gdn);
         let (tu, hv, dv) = (t as usize, g.v_heads() as usize, g.v_dim() as usize);
         let dk = GDN_TRAIN_DK as usize;
         let proj = tensor(rt, &[tu, g.width() as usize])?;
-        gemm(x1, &w.w_in, &proj, BACKEND)?;
+        mm.nn(x1, &w.w_in, &proj)?;
         let conv = f32s(rt, tu * g.conv_dim() as usize)?;
         qwen35::conv1d_silu(
             rt,
@@ -497,12 +500,12 @@ impl Qwen35Model {
         Ok(SavedGdn { proj, q, k, v, g: gt, beta, ckpt, o, y })
     }
 
-    fn attn_forward(&self, w: &AttnWeights, x1: &Tensor, t: u32) -> Result<SavedAttn, String> {
+    fn attn_forward(&self, w: &AttnWeights, x1: &Tensor, t: u32, mm: GemmOperands) -> Result<SavedAttn, String> {
         let (rt, a) = (&self.rt, self.cfg.attn);
         let tu = t as usize;
         let (qd, kvd) = ((a.q_heads() * a.head_dim()) as usize, (a.kv_heads() * a.head_dim()) as usize);
         let proj = tensor(rt, &[tu, a.width() as usize])?;
-        gemm(x1, &w.w_in, &proj, BACKEND)?;
+        mm.nn(x1, &w.w_in, &proj)?;
         let (q, k, v) = (f32s(rt, tu * qd)?, f32s(rt, tu * kvd)?, f32s(rt, tu * kvd)?);
         qwen35::attn_qk_norm_rope(
             rt,
@@ -534,7 +537,7 @@ impl Qwen35Model {
 
     /// One layer's backward. On entry `sc.dresid` is the gradient of the
     /// layer's output; on return, of its input.
-    fn train_layer_backward(&self, layer: &Layer, s: &Saved, sc: &mut Scratch) -> Result<LayerGrads, String> {
+    fn train_layer_backward(&self, layer: &Layer, s: &Saved, sc: &mut Scratch, mm: GemmOperands) -> Result<LayerGrads, String> {
         let (rt, cfg) = (&self.rt, &self.cfg);
         let (t, h, i) = (sc.t, cfg.hidden, cfg.intermediate);
         let (hu, iu) = (h as usize, i as usize);
@@ -542,8 +545,8 @@ impl Qwen35Model {
 
         // MLP: resid_out = resid_mid + swiglu(x2 @ gate, x2 @ up) @ down.
         let down = tensor(rt, &[iu, hu])?;
-        gemm_tn_f32(&s.m_mid, &sc.dresid, &down, BACKEND)?;
-        gemm_nt_f32(&sc.dresid, &layer.down, &sc.d_mid, BACKEND)?;
+        mm.tn(&s.m_mid, &sc.dresid, &down)?;
+        mm.nt(&sc.dresid, &layer.down, &sc.d_mid)?;
         swiglu_bwd(
             rt,
             Cols::dense(&s.m_gate.buffer, i),
@@ -555,18 +558,18 @@ impl Qwen35Model {
             i,
         )?;
         let (gate, up) = (tensor(rt, &[hu, iu])?, tensor(rt, &[hu, iu])?);
-        gemm_tn_f32(&s.x2, &sc.d_gate, &gate, BACKEND)?;
-        gemm_tn_f32(&s.x2, &sc.d_up, &up, BACKEND)?;
-        gemm_nt_f32(&sc.d_gate, &layer.gate, &sc.dx, BACKEND)?;
-        gemm_nt_f32(&sc.d_up, &layer.up, &sc.tmp_h, BACKEND)?;
+        mm.tn(&s.x2, &sc.d_gate, &gate)?;
+        mm.tn(&s.x2, &sc.d_up, &up)?;
+        mm.nt(&sc.d_gate, &layer.gate, &sc.dx)?;
+        mm.nt(&sc.d_up, &layer.up, &sc.tmp_h)?;
         qwen35::residual_add(rt, Cols::dense(&sc.tmp_h.buffer, h), Cols::dense(&sc.dx.buffer, h), t, h)?;
         let post_norm = f32s(rt, hu)?;
         rms_norm_bwd(rt, &s.resid_mid.buffer, &layer.post_norm, &sc.dx.buffer, &sc.dresid.buffer, &post_norm, &sc.norm_part, t, h, eps, true)?;
 
         // Mixer: resid_mid = resid_in + mixer(x1), x1 = norm(resid_in).
         let mixer = match (&layer.mixer, &s.mixer) {
-            (Mixer::Gdn(w), SavedMixer::Gdn(sv)) => MixerGrads::Gdn(self.gdn_backward(w, sv, &s.x1, sc)?),
-            (Mixer::Attn(w), SavedMixer::Attn(sv)) => MixerGrads::Attn(self.attn_backward(w, sv, &s.x1, sc)?),
+            (Mixer::Gdn(w), SavedMixer::Gdn(sv)) => MixerGrads::Gdn(self.gdn_backward(w, sv, &s.x1, sc, mm)?),
+            (Mixer::Attn(w), SavedMixer::Attn(sv)) => MixerGrads::Attn(self.attn_backward(w, sv, &s.x1, sc, mm)?),
             _ => return Err("Qwen35Model::train_step: a layer's saved state is not its mixer's".into()),
         };
         let input_norm = f32s(rt, hu)?;
@@ -576,14 +579,14 @@ impl Qwen35Model {
 
     /// The GDN mixer's backward from `sc.dresid`; leaves the gradient of its
     /// input `x1` in `sc.dx`.
-    fn gdn_backward(&self, w: &GdnWeights, s: &SavedGdn, x1: &Tensor, sc: &mut Scratch) -> Result<GdnGrads, String> {
+    fn gdn_backward(&self, w: &GdnWeights, s: &SavedGdn, x1: &Tensor, sc: &mut Scratch, mm: GemmOperands) -> Result<GdnGrads, String> {
         let (rt, cfg, g) = (&self.rt, &self.cfg, self.cfg.gdn);
         let t = sc.t;
         let (hu, vd) = (cfg.hidden as usize, g.value_dim() as usize);
         let gs = sc.gdn.as_ref().ok_or("Qwen35Model::train_step: no GDN scratch")?;
         let w_out = tensor(rt, &[vd, hu])?;
-        gemm_tn_f32(&s.y, &sc.dresid, &w_out, BACKEND)?;
-        gemm_nt_f32(&sc.dresid, &w.w_out, &gs.dy, BACKEND)?;
+        mm.tn(&s.y, &sc.dresid, &w_out)?;
+        mm.nt(&sc.dresid, &w.w_out, &gs.dy)?;
         // y = gated_rms_norm(o, z): d_o, and dz into the projection gradient.
         let norm_w = f32s(rt, g.v_dim() as usize)?;
         let dproj = &gs.dproj.buffer;
@@ -649,22 +652,22 @@ impl Qwen35Model {
             g.conv_dim(),
         )?;
         let w_in = tensor(rt, &[hu, g.width() as usize])?;
-        gemm_tn_f32(x1, &gs.dproj, &w_in, BACKEND)?;
-        gemm_nt_f32(&gs.dproj, &w.w_in, &sc.dx, BACKEND)?;
+        mm.tn(x1, &gs.dproj, &w_in)?;
+        mm.nt(&gs.dproj, &w.w_in, &sc.dx)?;
         Ok(GdnGrads { w_in, w_out, conv_w, a_log, dt_bias, norm_w })
     }
 
     /// The attention mixer's backward from `sc.dresid`; leaves the gradient
     /// of its input `x1` in `sc.dx`.
-    fn attn_backward(&self, w: &AttnWeights, s: &SavedAttn, x1: &Tensor, sc: &mut Scratch) -> Result<AttnGrads, String> {
+    fn attn_backward(&self, w: &AttnWeights, s: &SavedAttn, x1: &Tensor, sc: &mut Scratch, mm: GemmOperands) -> Result<AttnGrads, String> {
         let (rt, cfg, a) = (&self.rt, &self.cfg, self.cfg.attn);
         let t = sc.t;
         let hu = cfg.hidden as usize;
         let qd = a.q_heads() * a.head_dim();
         let asc = sc.attn.as_ref().ok_or("Qwen35Model::train_step: no attention scratch")?;
         let w_out = tensor(rt, &[qd as usize, hu])?;
-        gemm_tn_f32(&s.y, &sc.dresid, &w_out, BACKEND)?;
-        gemm_nt_f32(&sc.dresid, &w.w_out, &asc.dy, BACKEND)?;
+        mm.tn(&s.y, &sc.dresid, &w_out)?;
+        mm.nt(&sc.dresid, &w.w_out, &asc.dy)?;
         let proj = Cols::dense(&s.proj.buffer, a.width());
         let dproj = &asc.dproj.buffer;
         // y = o * sigmoid(gate): d_o, and the gate columns of dproj.
@@ -688,8 +691,8 @@ impl Qwen35Model {
             cfg.rms_norm_eps,
         )?;
         let w_in = tensor(rt, &[hu, a.width() as usize])?;
-        gemm_tn_f32(x1, &asc.dproj, &w_in, BACKEND)?;
-        gemm_nt_f32(&asc.dproj, &w.w_in, &sc.dx, BACKEND)?;
+        mm.tn(x1, &asc.dproj, &w_in)?;
+        mm.nt(&asc.dproj, &w.w_in, &sc.dx)?;
         Ok(AttnGrads { w_in, w_out, q_norm, k_norm })
     }
 }
@@ -762,7 +765,7 @@ mod tests {
         let model = Qwen35Model::load(&rt, &st, "model.language_model.", Qwen35Config::qwen35_2b().unwrap(), Precision::F32).unwrap();
         drop(st);
         let ids: Vec<u32> = npy(&dir.join("ids.npy")).iter().map(|&x| x as u32).collect();
-        let step = model.train_step(&ids).unwrap();
+        let step = model.train_step(&ids, GemmOperands::ExactF32).unwrap();
         let base = loss(&model, &ids);
         // (name, the model's f32 buffer, tessl's gradient buffer, length).
         let mixer = |l: usize| match (&model.layers[l].mixer, &step.grads.layers[l].mixer) {

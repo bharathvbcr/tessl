@@ -6,11 +6,14 @@
 //! cargo run --release --bin bench_qwen35_train -- 1024 4096     # chosen T
 //! cargo run --release --bin bench_qwen35_train -- --check-only  # the gate, no timing
 //! QWEN35_2B_SAFETENSORS=... cargo run --release --bin bench_qwen35_train -- --step=2048
+//! cargo run --release --bin bench_qwen35_train -- --bf16        # bf16 GEMM operands
 //! ```
 //!
 //! Shapes are Qwen3.5-2B's `text_config` (hidden 2048, 16 GDN heads of 128,
 //! 8 query and 2 KV attention heads of 256, rotary 64, MLP 6144, vocab
-//! 248320), batch 1, f32 operands (the training step runs in f32). Inputs are
+//! 248320), batch 1, f32 operands. The GEMMs (the cross-entropy's here, every
+//! one in `--step`) run on exact f32 operands, or on bf16 operands with f32
+//! accumulation under `--bf16`. Inputs are
 //! random and bounded.
 //!
 //! Per op, the time of one call at the given T: the median of 7 runs after 2
@@ -36,6 +39,7 @@ use std::time::Instant;
 
 use tessl::attn_train::{attn_train_backward, attn_train_forward, AttnTrainDims, AttnTrainGrads, AttnTrainWorkspace};
 use tessl::cross_entropy::{cross_entropy_rows, CeGrads, CeHidden, CeWorkspace, Reduction};
+use tessl::gemm::GemmOperands;
 use tessl::gdn_train::{gdn_train_backward, gdn_train_forward, GdnTrainDims, GdnTrainGrads, GdnTrainInputs, GdnTrainWorkspace};
 use tessl::qwen35::{AttnShape, Cols, GdnGateLogits, GdnParams};
 use tessl::qwen35_bwd::{
@@ -148,7 +152,7 @@ fn gate(rt: &Arc<GpuRuntime>, op: &mut Op<'_>) -> Res<()> {
     Ok(())
 }
 
-fn bench_t(rt: &Arc<GpuRuntime>, t: usize, check_only: bool) -> Res<()> {
+fn bench_t(rt: &Arc<GpuRuntime>, t: usize, check_only: bool, operands: GemmOperands) -> Res<()> {
     let t32 = t as u32;
     let (qd, kvd) = (Q_HEADS * HEAD_DIM, KV_HEADS * HEAD_DIM);
     let s = |i: u64| (t as u64) * 1000 + i;
@@ -238,7 +242,7 @@ fn bench_t(rt: &Arc<GpuRuntime>, t: usize, check_only: bool) -> Res<()> {
         Op {
             name: "cross-entropy + grads",
             run: Box::new(|| {
-                cross_entropy_rows(rt, CeHidden { rows: &h, off: 0 }, &emb, &rows, &targets, Reduction::Mean, &ce_ws, Some(CeGrads { dh: &dh, dw: &dw, scale: 1.0 })).map(|_| ())
+                cross_entropy_rows(rt, CeHidden { rows: &h, off: 0 }, &emb, &rows, &targets, Reduction::Mean, operands, &ce_ws, Some(CeGrads { dh: &dh, dw: &dw, scale: 1.0 })).map(|_| ())
             }),
             outputs: vec![("dh", &dh.buffer, (t - 1) * HIDDEN), ("dw (first 1024 rows)", &dw.buffer, 1024 * HIDDEN)],
             reps: 1,
@@ -320,7 +324,7 @@ fn bench_t(rt: &Arc<GpuRuntime>, t: usize, check_only: bool) -> Res<()> {
     Ok(())
 }
 
-fn bench_step(rt: &Arc<GpuRuntime>, tokens: usize) -> Res<()> {
+fn bench_step(rt: &Arc<GpuRuntime>, tokens: usize, operands: GemmOperands) -> Res<()> {
     let path = std::env::var("QWEN35_2B_SAFETENSORS").map_err(|_| "--step needs QWEN35_2B_SAFETENSORS (the Qwen3.5-2B-Base .safetensors)".to_string())?;
     let st = SafeTensors::open(std::path::Path::new(&path))?;
     let model = Qwen35Model::load(rt, &st, "model.language_model.", Qwen35Config::qwen35_2b()?, Precision::F32)?;
@@ -328,14 +332,14 @@ fn bench_step(rt: &Arc<GpuRuntime>, tokens: usize) -> Res<()> {
     let ids: Vec<u32> = (0..tokens as u32).map(|i| (i * 104_729 + 17) % VOCAB as u32).collect();
     // Only the loss is kept: holding the warm-up step would double the
     // gradients resident while timing.
-    let first = model.train_step(&ids)?.loss;
+    let first = model.train_step(&ids, operands)?.loss;
     if !first.is_finite() {
         return Err(format!("train_step: loss {first} is not finite"));
     }
     let mut samples = Vec::new();
     for _ in 0..3 {
         let t0 = Instant::now();
-        let step = model.train_step(&ids)?;
+        let step = model.train_step(&ids, operands)?;
         samples.push(t0.elapsed().as_secs_f64());
         if step.loss.to_bits() != first.to_bits() {
             return Err("train_step: the loss changed between identical steps".into());
@@ -347,14 +351,16 @@ fn bench_step(rt: &Arc<GpuRuntime>, tokens: usize) -> Res<()> {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let (mut check_only, mut step, mut ts) = (false, None, Vec::new());
+    let (mut check_only, mut step, mut ts, mut operands) = (false, None, Vec::new(), GemmOperands::ExactF32);
     for arg in std::env::args().skip(1) {
-        if arg == "--check-only" {
+        if arg == "--bf16" {
+            operands = GemmOperands::Bf16;
+        } else if arg == "--check-only" {
             check_only = true;
         } else if let Some(n) = arg.strip_prefix("--step=") {
             step = Some(n.parse::<usize>().map_err(|_| format!("--step expects a token count, got {n:?}"))?);
         } else {
-            let t: usize = arg.parse().map_err(|_| format!("expected a token count, --check-only or --step=N, got {arg:?}"))?;
+            let t: usize = arg.parse().map_err(|_| format!("expected a token count, --check-only, --bf16 or --step=N, got {arg:?}"))?;
             if t < 2 {
                 return Err("T must be at least 2 (one prediction)".into());
             }
@@ -370,10 +376,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     println!("device: {}", rt.device_name());
     for t in ts {
-        bench_t(&rt, t, check_only)?;
+        bench_t(&rt, t, check_only, operands)?;
     }
     if let (Some(n), false) = (step, check_only) {
-        bench_step(&rt, n)?;
+        bench_step(&rt, n, operands)?;
     }
     Ok(())
 }

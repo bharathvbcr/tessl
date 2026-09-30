@@ -1,6 +1,7 @@
 //! Backward of the Qwen3.5 row-local ops (`kernels/qwen35_bwd.metal`): the
 //! RMSNorm, the GDN gated RMSNorm, SwiGLU, the attention output gate and
-//! the GDN causal conv + SiLU, and the attention Q/K norm + partial RoPE.
+//! the GDN causal conv + SiLU, the attention Q/K norm + partial RoPE, and
+//! the embedding gather.
 //!
 //! Each entry point takes the forward's inputs (f32, as the forward reads
 //! them) and the output's gradient, in the forward's layouts, and writes the
@@ -541,4 +542,104 @@ pub fn attn_qk_norm_rope_bwd(
     })?;
     col_sum_blocks(rt, part, 0, dq_norm_w, nb, s.head_dim)?;
     col_sum_blocks(rt, part, nb as usize * d, dk_norm_w, nb, s.head_dim)
+}
+
+/// Scratch for [`embed_rows_bwd`]: the rows grouped by id, for at most
+/// `max_rows` rows per call.
+pub struct EmbedBwdWorkspace {
+    max_rows: u32,
+    pos: GpuBuffer,
+    run_start: GpuBuffer,
+    uniq: GpuBuffer,
+}
+
+impl EmbedBwdWorkspace {
+    pub fn new(rt: &Arc<GpuRuntime>, max_rows: u32) -> Result<Self, String> {
+        if max_rows == 0 {
+            return Err("EmbedBwdWorkspace: max_rows must be non-zero".into());
+        }
+        let n = max_rows as usize;
+        let alloc = |len: usize| rt.alloc_buffer(len * std::mem::size_of::<u32>());
+        Ok(Self { max_rows, pos: alloc(n)?, run_start: alloc(n + 1)?, uniq: alloc(n)? })
+    }
+
+    pub fn max_rows(&self) -> u32 {
+        self.max_rows
+    }
+}
+
+/// Backward of the embedding gather ([`crate::qwen35::embed_rows`]):
+/// `dw[ids[r], :] += dh[r, :]` for every row, **added** to
+/// what `dw` holds. With a tied LM head, `dw` is the head's weight gradient
+/// ([`crate::cross_entropy::cross_entropy_rows`] overwrites it, so call this
+/// after); for an untied table, zero `dw` first.
+///
+/// `ids` are host-known in training, so they are checked here (`< vocab`,
+/// at most `ws.max_rows()`) and grouped by id on the host; each id's rows
+/// are summed in ascending row order and added once, without atomics, so the
+/// gradient is deterministic. `dh` is dense `[ids.len(), hidden]` f32, `dw`
+/// dense `[vocab, hidden]` f32.
+pub fn embed_rows_bwd(
+    rt: &Arc<GpuRuntime>,
+    ids: &[u32],
+    dh: &GpuBuffer,
+    dw: &GpuBuffer,
+    vocab: u32,
+    hidden: u32,
+    ws: &EmbedBwdWorkspace,
+) -> Result<(), String> {
+    const WHAT: &str = "qwen35_bwd::embed_rows_bwd";
+    if ids.len() > ws.max_rows as usize {
+        return Err(format!("{WHAT}: {} rows exceed the workspace's {}", ids.len(), ws.max_rows));
+    }
+    if let Some((r, &id)) = ids.iter().enumerate().find(|(_, &id)| id >= vocab) {
+        return Err(format!("{WHAT}: ids[{r}] = {id} is not below vocab {vocab}"));
+    }
+    let rows = ids.len();
+    let h = hidden as usize;
+    let n_dh = rows.checked_mul(h).ok_or_else(|| format!("{WHAT}: rows x hidden overflows"))?;
+    let n_dw = (vocab as usize).checked_mul(h).ok_or_else(|| format!("{WHAT}: vocab x hidden overflows"))?;
+    require::<f32>(rt, dh, n_dh, &format!("{WHAT} dh"))?;
+    require::<f32>(rt, dw, n_dw, &format!("{WHAT} dw"))?;
+    require_disjoint_writes(
+        WHAT,
+        &[("dw", dw)],
+        &[("dh", dh), ("pos", &ws.pos), ("run_start", &ws.run_start), ("uniq", &ws.uniq)],
+    )?;
+    if rows == 0 || hidden == 0 {
+        return Ok(());
+    }
+    // Rows sorted by (id, row): each id's rows form one run, in row order.
+    let mut order: Vec<u32> = (0..rows as u32).collect();
+    order.sort_by_key(|&r| (ids[r as usize], r));
+    let mut starts = Vec::with_capacity(rows + 1);
+    let mut uniq = Vec::with_capacity(rows);
+    for (i, &r) in order.iter().enumerate() {
+        let id = ids[r as usize];
+        if uniq.last() != Some(&id) {
+            uniq.push(id);
+            starts.push(i as u32);
+        }
+    }
+    starts.push(rows as u32);
+    let n_runs = uniq.len() as u32;
+    let pad = |v: &[u32], len: usize| {
+        let mut out = v.to_vec();
+        out.resize(len, 0);
+        out
+    };
+    let n = ws.max_rows as usize;
+    ws.pos.write_u32(&pad(&order, n));
+    ws.run_start.write_u32(&pad(&starts, n + 1));
+    ws.uniq.write_u32(&pad(&uniq, n));
+    let p = rt.pipeline("qwen35_embed_rows_bwd_f32")?;
+    dispatch_2d(rt, &p, h, n_runs as usize, |bnd| {
+        set_gpu_buf(bnd, dh, 0);
+        set_gpu_buf(bnd, &ws.pos, 1);
+        set_gpu_buf(bnd, &ws.run_start, 2);
+        set_gpu_buf(bnd, &ws.uniq, 3);
+        set_gpu_buf(bnd, dw, 4);
+        set_u32(bnd, n_runs, 5);
+        set_u32(bnd, hidden, 6);
+    })
 }

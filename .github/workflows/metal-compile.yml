@@ -100,7 +100,8 @@ jobs:
                     qwen35_embed_rows_bf16 ce_gather_rows_f32 ce_gather_rows_bf16 ce_lse_update ce_softmax_grad gdn_train_fwd gdn_train_bwd gdn_train_bwd_finish \
                     qwen35_rms_norm_bwd_f32 qwen35_col_sum_blocks_f32 qwen35_gated_rms_norm_bwd_f32 \
                     qwen35_swiglu_bwd_f32 qwen35_attn_gate_bwd_f32 \
-                    qwen35_conv1d_silu_bwd_dx_f32 qwen35_conv1d_silu_bwd_dw_f32 qwen35_attn_qk_norm_rope_bwd_f32; do
+                    qwen35_conv1d_silu_bwd_dx_f32 qwen35_conv1d_silu_bwd_dw_f32 qwen35_attn_qk_norm_rope_bwd_f32 \
+                    qwen35_embed_rows_bwd_f32; do
             if grep -qx "$fn" "$RUNNER_TEMP/symbols.txt"; then
               echo "exported: $fn"
             else

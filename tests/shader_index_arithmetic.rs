@@ -573,6 +573,8 @@ fn qwen35_bwd_offsets_are_widened() {
         ("dk + (r * Hkv + h) * (ulong)D", "dk row"),
         ("device const float *src = dv + (r * Hkv + h) * (ulong)D;", "dv row"),
         ("part[(nblocks + blk) * D + d] = sk;", "k-norm partial"),
+        ("s += dh[(ulong)pos[i] * hidden + col];", "embedding dh row"),
+        ("dw[(ulong)uniq[u] * hidden + col] += s;", "embedding table row"),
     ] {
         require(QWEN35_BWD, needle, what);
     }

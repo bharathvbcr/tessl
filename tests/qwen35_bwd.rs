@@ -16,7 +16,7 @@ use common::{buf, random_f32, seeded, with_gpu};
 use tessl::qwen35::{AttnShape, Cols};
 use tessl::qwen35_bwd::{
     attn_gate_bwd, attn_qk_norm_rope_bwd, attn_qk_norm_rope_bwd_part_len, conv1d_silu_bwd, conv1d_silu_bwd_part_len, gated_rms_norm_bwd,
-    gated_rms_norm_bwd_part_len, rms_norm_bwd, rms_norm_bwd_part_len, swiglu_bwd, AttnQkvGrads,
+    embed_rows_bwd, gated_rms_norm_bwd_part_len, rms_norm_bwd, rms_norm_bwd_part_len, swiglu_bwd, AttnQkvGrads, EmbedBwdWorkspace,
 };
 use tessl::tensor::GpuBuffer;
 use tessl::GpuRuntime;
@@ -638,5 +638,78 @@ fn qk_norm_rope_backward_refuses_bad_layouts() {
         e(run(&shape, &dp, &buf(rt, &[0.0; 63]), 1e4), "part");
         e(run(&AttnShape { seq: 6, ..shape }, &dp, &buf(rt, &[0.0; 64]), 1e4), "proj");
         e(run(&shape, &dp, &dqw, 1e4), "part");
+    });
+}
+
+// ------------------------------------------------------ embedding gather ---
+
+fn run_embed(rt: &Arc<GpuRuntime>, ws: &EmbedBwdWorkspace, ids: &[u32], vocab: usize, hidden: usize, seed: u64) {
+    let rows = ids.len();
+    let dh = random_f32(rows * hidden, seed);
+    let prior = random_f32(vocab * hidden, seed + 1);
+    let (dhb, dwb) = (buf(rt, &dh), buf(rt, &prior));
+    embed_rows_bwd(rt, ids, &dhb, &dwb, vocab as u32, hidden as u32, ws).unwrap();
+    rt.synchronize().unwrap();
+    let mut want = f64s(&prior);
+    for (r, &id) in ids.iter().enumerate() {
+        for c in 0..hidden {
+            want[id as usize * hidden + c] += f64::from(dh[r * hidden + c]);
+        }
+    }
+    let got = dwb.read_f32();
+    let label = format!("embed rows={rows} vocab={vocab} hidden={hidden}");
+    close(&label, &got, &want);
+    // Rows no id reads keep their bits.
+    for v in 0..vocab {
+        if !ids.contains(&(v as u32)) {
+            let row = v * hidden..(v + 1) * hidden;
+            assert!(got[row.clone()].iter().zip(&prior[row]).all(|(a, b)| a.to_bits() == b.to_bits()), "{label}: row {v} changed");
+        }
+    }
+    // The same call from the same prior gives the same bits.
+    let again = buf(rt, &prior);
+    embed_rows_bwd(rt, ids, &dhb, &again, vocab as u32, hidden as u32, ws).unwrap();
+    rt.synchronize().unwrap();
+    assert!(again.read_f32().iter().zip(&got).all(|(a, b)| a.to_bits() == b.to_bits()), "{label}: changed on a rerun");
+}
+
+#[test]
+fn embedding_backward_adds_each_ids_rows() {
+    with_gpu(|rt| {
+        let ws = EmbedBwdWorkspace::new(rt, 512).unwrap();
+        run_embed(rt, &ws, &[3], 8, 64, 1);
+        run_embed(rt, &ws, &[5, 0, 5, 7, 0, 5, 2, 7, 7, 1], 8, 100, 2); // repeats, out of order, ends of the table
+        run_embed(rt, &ws, &[4; 300], 9, 33, 3); // one id, one long run
+        let distinct: Vec<u32> = (0..257).rev().collect();
+        run_embed(rt, &ws, &distinct, 300, 16, 4);
+        let mixed: Vec<u32> = (0..512u32).map(|r| (r * 37) % 100 + 900).collect(); // ~5 rows per id
+        run_embed(rt, &ws, &mixed, 1000, 2048, 5); // the 2B's hidden size
+        // A shorter call after a longer one: the stale tail of the workspace
+        // must not be read.
+        run_embed(rt, &ws, &[1, 1, 6], 8, 40, 6);
+        // No rows: dw is untouched.
+        let dwb = buf(rt, &[2.5; 64]);
+        embed_rows_bwd(rt, &[], &buf(rt, &[0.0; 1]), &dwb, 4, 16, &ws).unwrap();
+        rt.synchronize().unwrap();
+        assert!(dwb.read_f32().iter().all(|&v| v == 2.5), "no rows: dw must be untouched");
+    });
+}
+
+#[test]
+fn embedding_backward_refuses_bad_ids_and_layouts() {
+    with_gpu(|rt| {
+        let e = |r: Result<(), String>, needle: &str| {
+            let m = r.expect_err(needle);
+            assert!(m.contains(needle), "{m:?} lacks {needle:?}");
+        };
+        assert!(EmbedBwdWorkspace::new(rt, 0).is_err(), "max_rows 0");
+        let ws = EmbedBwdWorkspace::new(rt, 4).unwrap();
+        let (dh, dw) = (buf(rt, &[0.0; 64]), buf(rt, &[0.0; 128]));
+        embed_rows_bwd(rt, &[0, 7, 3], &dh, &dw, 8, 16, &ws).expect("a valid call");
+        e(embed_rows_bwd(rt, &[0, 8, 3], &dh, &dw, 8, 16, &ws), "ids[1] = 8 is not below vocab 8");
+        e(embed_rows_bwd(rt, &[0; 5], &dh, &dw, 8, 16, &ws), "5 rows exceed the workspace's 4");
+        e(embed_rows_bwd(rt, &[0; 4], &buf(rt, &[0.0; 63]), &dw, 8, 16, &ws), "dh");
+        e(embed_rows_bwd(rt, &[0; 2], &dh, &buf(rt, &[0.0; 127]), 8, 16, &ws), "dw");
+        e(embed_rows_bwd(rt, &[0; 2], &dw, &dw, 8, 16, &ws), "dw");
     });
 }

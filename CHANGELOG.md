@@ -45,6 +45,11 @@ All notable changes to `tessl` are recorded here. The format follows
   The RoPE angle is now one helper, `qwen35_rope_angle` in
   `kernels/qwen35_act.h`, shared by the forward and the backward. Kernel
   `qwen35_attn_qk_norm_rope_bwd_f32`.
+- **Embedding backward (`qwen35_bwd::embed_rows_bwd`)**: `dW[id] += dh[r]`,
+  added onto the tied LM head's gradient after `cross_entropy_rows`. The
+  host checks the ids and groups the rows by id; each id's rows are summed
+  in row order without atomics. `EmbedBwdWorkspace` holds the grouping.
+  Kernel `qwen35_embed_rows_bwd_f32`.
 - **torch binding (`python/tessl_torch`) over a C ABI (`tessl::capi`)**:
   `tessl_torch.cross_entropy(hidden, weight, targets, mask)`, a
   `torch.autograd.Function` over MPS tensors, loaded with `ctypes` (no C++

@@ -1,6 +1,6 @@
 // Backward of the Qwen3.5 row-local ops: RMSNorm, the GDN gated RMSNorm,
-// SwiGLU, the attention output gate, the GDN causal conv + SiLU, and the
-// attention Q/K norm + partial RoPE.
+// SwiGLU, the attention output gate, the GDN causal conv + SiLU, the
+// attention Q/K norm + partial RoPE and the embedding gather.
 //
 // Every operand keeps the forward's layout, windows included (`ld`, `off`),
 // so a gradient lands where the next GEMM backward reads it: dgate/dup side by
@@ -575,4 +575,37 @@ kernel void qwen35_attn_qk_norm_rope_bwd_f32(
             part[(nblocks + blk) * D + d] = sk;
         }
     }
+}
+
+// ------------------------------------------------------ embedding gather ---
+
+/// Backward of the embedding gather, added into the table's gradient:
+/// `dw[id, :] += sum of dh[r, :] over the rows r that read id`.
+///
+/// The host groups the rows by id (it knows the ids): run `u` covers
+/// `pos[run_start[u] .. run_start[u + 1])`, rows in ascending order, all
+/// reading id `uniq[u]`. One thread per (run, column) sums its run in that
+/// order and adds the sum once, and no two runs share an id, so there are no
+/// atomics and the result is the same on every run. With a tied LM head this
+/// adds onto the head's weight gradient.
+///
+/// Grid: x = column in [0, hidden), y = run in [0, n_runs).
+kernel void qwen35_embed_rows_bwd_f32(
+    device const float *dh [[buffer(0)]],
+    device const uint *pos [[buffer(1)]],
+    device const uint *run_start [[buffer(2)]],
+    device const uint *uniq [[buffer(3)]],
+    device float *dw [[buffer(4)]],
+    constant uint &n_runs [[buffer(5)]],
+    constant uint &hidden [[buffer(6)]],
+    uint2 gid [[thread_position_in_grid]])
+{
+    const uint col = gid.x;
+    const uint u = gid.y;
+    if (col >= hidden || u >= n_runs) return;
+    float s = 0.0f;
+    for (uint i = run_start[u]; i < run_start[u + 1u]; ++i) {
+        s += dh[(ulong)pos[i] * hidden + col];
+    }
+    dw[(ulong)uniq[u] * hidden + col] += s;
 }

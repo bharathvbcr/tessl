@@ -627,6 +627,17 @@ heads over 300 positions, where one ulp of the f32 angle is 3e-5 rad; the
 cases cover full, partial, lane-splitting and zero rotary widths and blocks
 straddling batch rows. Fourteen of fourteen injected defects fail it.
 
+`embed_rows_bwd` adds `dh[r]` into row `ids[r]` of the table's gradient.
+Qwen3.5-2B ties its embedding to the LM head, and `cross_entropy_rows`
+overwrites the head's `dW`, so the embedding's gradient is added after it
+into the same buffer (an untied table is zeroed first). The ids are known
+on the host in training, so they are checked there (an id `>= vocab` is an
+error, not a NaN row) and the rows are grouped by id: one thread per (id,
+column) sums that id's rows in row order and adds once, without atomics, so
+the gradient is deterministic and rows no id reads keep their bits. Within
+5e-7 of the f64 sum across repeated, reversed, single-id and 2048-wide
+cases; eight of eight injected defects (kernel and host grouping) fail it.
+
 ## Performance
 
 `cargo run --release --bin bench_qwen35_layers` builds Qwen3.5-2B's shapes

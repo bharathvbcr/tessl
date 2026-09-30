@@ -1,16 +1,19 @@
 # Qwen3.5 kernels
 
 `tessl::qwen35` holds the Metal kernels for Qwen3.5's layers that transformers
-has no fast Mac path for. Sources: `kernels/qwen35_gdn.metal`,
-`kernels/qwen35_attn.metal`, `kernels/qwen35_score.metal`.
+has no fast Mac path for, forward and backward. Sources: `kernels/qwen35_*.metal`,
+with the training ops in `kernels/gdn_train.metal` and
+`kernels/cross_entropy.metal`.
 
-> **Status: run on a GPU (M5 Pro); performance not yet measured.** The full
-> `cargo test --release -- --test-threads=1` passed on the Mac at `86d09fb`
-> (41 test binaries, 0 failures), including every kernel here in
-> `tests/qwen35_kernels.rs`. The `Metal compile` workflow (GitHub-hosted macOS,
-> Xcode 26.6) builds all three sources under `-std=metal4.0 -Wall -Werror`,
-> links them, confirms all sixteen entry points are exported, and builds the
-> crate and every test target with no `metal3.2` fallback. Every kernel below
+> **Status: run and timed on a GPU (M5 Pro).** The full
+> `cargo test --release -- --test-threads=1` passed on the Mac at `26213f1`
+> (482 passed, 7 ignored, 0 failures), including every kernel here in
+> `tests/qwen35_kernels.rs`; the timings are in
+> [Performance](#performance) and [Training-path timing](#training-path-timing). The `Metal compile`
+> workflow (GitHub-hosted macOS, Xcode 26.6) builds each of those sources under
+> `-std=metal4.0 -Wall -Werror`, links them, confirms that every entry point on
+> its list is exported, and builds the crate and every test target with no
+> `metal3.2` fallback. Every kernel in [the table below](#the-kernels)
 > was also compiled as C++ and executed on a CPU emulator of the Metal
 > execution model, then compared against transformers' own Qwen3.5 code (see
 > [Verification](#verification)), including under AddressSanitizer and
@@ -729,6 +732,11 @@ transient host buffers. Swap did not grow in either run. A first
 measurement read 40.9 / 43.1 GB because the bench kept its warm-up step's
 gradients alive; it now keeps only the loss.
 
+Both footprints predate `d0fe70e`, which replaced the f32 model's bf16
+gather table and separate f32 `[2048, 248320]` head (1.0 + 2.0 GB) with one
+f32 table (2.0 GB). The recomputing step's peak should now be about 1 GB
+lower; that is arithmetic, not a re-measurement.
+
 ### From torch: `tessl_torch.Qwen35`
 
 `src/qwen35_params.rs` exposes the model's parameters and gradients under
@@ -892,9 +900,11 @@ is the largest non-GEMM share: 18 × 1.4 ms.
 
 - **Training, remaining gaps.** The LM-head cross-entropy and its gradients
   exist (`tessl::cross_entropy`, over the supervised rows only, in vocabulary
-  chunks). The layer kernels have no backward yet, so the rest of a backward
-  pass still runs in torch, whose autograd through transformers' loops is
-  what made 2k-token fine-tuning hit 48 GB.
+  chunks), and every layer has a backward, so `train_step` runs the whole
+  forward and backward on the GPU (torch sees it through
+  `tessl_torch.Qwen35`). What it does not do yet: more than one sequence per
+  step, GDN layers whose value heads outnumber their key heads, and bf16
+  training (it is f32 only).
 - **Fast math.** Metal compiles with fast math on by default. The attention
   kernels seed their running maxima with `-INFINITY`; nothing measured
   misbehaves, but under fast math the compiler may assume no infinities.

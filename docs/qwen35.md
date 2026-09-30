@@ -765,11 +765,11 @@ more. The unit test `real_2b_gradients_are_those_of_tessls_forward` shows
 which side each disagreement is on: along `v = (g_tessl - g_torch) / |d|`,
 where the two gradients predict slopes `|d|` apart, a Richardson-extrapolated
 central difference of tessl's own loss lands on tessl's gradient for every
-direction it can resolve: within 0.03-0.21 |d| for layer 20's conv weight,
+direction it can resolve: within 0.04-0.21 |d| for layer 20's conv weight,
 layer 0's MLP gate and down projections and layer 3's attention output
-projection (0.8-0.9 |d| from transformers'), and within 0.03-0.24 |d| for
-the final norm and four of the worst layer norms (layers 6, 8, 22, 23; 0.9-1
-|d| from transformers'), which take steps of 0.05-0.4 along the unit
+projection (0.79-1.04 |d| from transformers'), and within 0.03-0.24 |d| for
+the final norm and four of the worst layer norms (layers 6, 8, 22, 23;
+0.86-1.2 |d| from transformers'), which take steps of 0.05-0.4 along the unit
 direction since they act as `1 + w` around 1. Three stay unresolved and are
 not claimed either way: `A_log` and `dt_bias` (|d| ~1e-5, at the loss's
 rounding), and the GDN gated norm's 128 weights, whose two step scales

@@ -849,8 +849,8 @@ impl GdnWorkspace {
 
     fn check(&self, rt: &GpuRuntime, dims: &GdnDims) -> Result<(), String> {
         let (rows, blocks) = workspace_extent(dims)?;
-        let kq = rows * GDN_KEY_DIM as usize;
-        let blk = blocks * (GDN_CHUNK * GDN_CHUNK) as usize;
+        let kq = usize_product(&[rows, GDN_KEY_DIM as usize], "GdnWorkspace")?;
+        let blk = usize_product(&[blocks, (GDN_CHUNK * GDN_CHUNK) as usize], "GdnWorkspace")?;
         require::<f32>(rt, &self.k, kq, "GdnWorkspace k (too small for these dims)")?;
         require::<f32>(rt, &self.q, kq, "GdnWorkspace q")?;
         require::<f32>(rt, &self.g, rows, "GdnWorkspace g")?;

@@ -2242,6 +2242,26 @@ fn host_rejects_what_the_kernels_cannot_do() {
             ),
             "GdnWorkspace k",
         );
+        // Dims that pass `GdnDims::validate` but whose workspace size overflows
+        // usize: an error naming the overflow, not a wrapped (release) or
+        // panicking (debug) multiply.
+        expect_err(
+            chunk(
+                GdnDims {
+                    batch: 1 << 31,
+                    seq: 256,
+                    k_heads: 1,
+                    v_heads: 1 << 19,
+                    v_dim: 32,
+                },
+                p.qkv(),
+                StateIn::Zero,
+                o,
+                None,
+                &small,
+            ),
+            "GdnWorkspace: product overflows usize",
+        );
         expect_err(
             chunk(good, p.qkv(), StateIn::Snapshot(&st), o, Some(&st), &ws),
             "state_out overlaps read-only buffer state_in",

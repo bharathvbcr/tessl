@@ -476,6 +476,7 @@ static_assert(GDN_SCAN_TG_FLOATS * 4u <= 32768u, "scan threadgroup memory exceed
 /// The same layout for `qwen35_gdn_chunk_scan_bv16`'s 16-column slices.
 constant uint GDN_SCAN16_TG_FLOATS =
     GDN_DK * (16u + 4u) + GDN_C * (16u + 4u) + (GDN_SCAN_THREADS / 32u) * 2u * 64u + 4u * GDN_C;
+static_assert(GDN_SCAN16_TG_FLOATS * 4u <= 32768u, "16-column scan threadgroup memory exceeds 32 KB");
 
 /// The sequential pass over chunks, for one (batch, value head, 32-column
 /// slice of Dv). Reads what `qwen35_gdn_chunk_prep` wrote, plus V.

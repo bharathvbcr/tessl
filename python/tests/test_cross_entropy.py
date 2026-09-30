@@ -90,6 +90,28 @@ class CrossEntropyMatchesTorch(unittest.TestCase):
         # Gradients come back cast to bf16: one rounding, 2^-8 relative.
         self.check(hidden, weight, targets, mask, "mean", tol=2 ** -8, chunk=256)
 
+    def test_bf16_operands_match_the_reference_on_the_rounded_operands(self):
+        # f32 inputs, bf16 GEMM operands: the reference is formed from the
+        # bf16-rounded hidden states and weight, which the logit walk reads
+        # exactly; dh and dW also round the softmax gradient (bound 2^-7, as
+        # tests/cross_entropy.rs). The loss must be off the exact reference by
+        # more than twice its bound, or nothing was rounded.
+        hidden, weight, targets, mask = problem(4, (2, 9), 64, 997, torch.float32)
+        exact_loss, _, _ = reference(hidden, weight, targets, mask, "mean")
+        want_loss, want_gh, want_gw = reference(
+            hidden.bfloat16().float(), weight.bfloat16().float(), targets, mask, "mean"
+        )
+        h = hidden.detach().clone().requires_grad_(True)
+        w = weight.detach().clone().requires_grad_(True)
+        loss = tessl_torch.cross_entropy(h, w, targets, mask, chunk=128, operands="bf16")
+        loss.backward()
+        torch.mps.synchronize()
+        bound = 1e-5 + 1e-5 * abs(want_loss)
+        self.assertLessEqual(abs(loss.item() - want_loss), bound)
+        self.assertLessEqual(rel_err(h.grad, want_gh), 2 ** -7, "grad hidden")
+        self.assertLessEqual(rel_err(w.grad, want_gw), 2 ** -7, "grad weight")
+        self.assertGreater(abs(exact_loss - want_loss), 2 * bound)
+
     def test_a_shifted_slice_is_read_in_place(self):
         # hidden[:, :-1] of a [B, T, H] tensor: rows b*T + t of the storage.
         full, weight, _, _ = problem(3, (2, 10), 64, 500, torch.float32)
@@ -220,6 +242,12 @@ class CrossEntropyRefuses(unittest.TestCase):
         bad[self.mask] = 300
         self.refuses("targets must lie in [0, 300)", self.hidden, self.weight, bad, self.mask)
 
+    def test_unknown_operands(self):
+        self.refuses(
+            "operands must be 'f32' or 'bf16', not 'tf32'",
+            self.hidden, self.weight, self.targets, self.mask, operands="tf32",
+        )
+
     def test_cpu_tensors(self):
         self.refuses("mps device", self.hidden.cpu(), self.weight, self.targets, self.mask)
 
@@ -268,7 +296,7 @@ class CrossEntropyRefuses(unittest.TestCase):
 
     def test_the_library_reports_its_abi(self):
         lib = tessl_torch._load()
-        self.assertEqual(lib.tessl_abi_version(), 5)
+        self.assertEqual(lib.tessl_abi_version(), 6)
         t = torch.zeros(1000, device=MPS)
         torch.mps.synchronize()
         # The storage pointer is the MTLBuffer (its length is torch's rounded bucket).

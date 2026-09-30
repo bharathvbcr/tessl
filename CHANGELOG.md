@@ -132,7 +132,7 @@ All notable changes to `tessl` are recorded here. The format follows
 
 ### Changed (breaking)
 
-- **C ABI 5** (was 3; the binding and library refuse each other across
+- **C ABI 6** (was 3; the binding and library refuse each other across
   versions, so rebuild `libtessl.dylib` with the binding). It adds a
   Qwen3.5 model handle: `tessl_qwen35_load`, `_train_step`,
   `_param_count`, `_param_info` (`TesslParamInfo`), `_copy` (read
@@ -146,7 +146,11 @@ All notable changes to `tessl` are recorded here. The format follows
   `cross_entropy_rows(.., reduction, operands, ws, grads)`** take a
   `gemm::GemmOperands`: `ExactF32` (the previous behaviour) or `Bf16`, bf16
   GEMM operands with f32 accumulation while weights, activations and
-  gradients stay f32. The C ABI (still 5) passes `ExactF32`. `Bf16` runs the
+  gradients stay f32. ABI 6 carries it: `TesslCeArgs.operands` and an
+  `operands` parameter of `tessl_qwen35_train_step` (`TESSL_OPERANDS_EXACT_F32`
+  0, `TESSL_OPERANDS_BF16` 1, anything else refused); `tessl_torch` takes
+  `operands="f32" | "bf16"` (default `"f32"`) on `Qwen35.train_step`,
+  `cross_entropy` and `cross_entropy_rows`. `Bf16` runs the
   2B's cross-entropy with gradients 3.15x faster at T = 2048 (561 against
   1768 ms); on the tiny model its gradients are within 2.3e-2 of
   transformers' f32 (see docs/qwen35.md, "A training step").

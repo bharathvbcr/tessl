@@ -88,6 +88,19 @@ class Qwen35Training(unittest.TestCase):
         worst = max(rel_err(grads[n], want[n]) for n in want)
         self.assertLessEqual(worst, 1e-4)
 
+    def test_a_bf16_operand_step_stays_near_transformers(self):
+        # The same bounds as tests/qwen35_train.rs (set for this fixture before
+        # its first run): loss within 2^-8, every gradient within 2^-5 of its
+        # own peak. And not the exact step's loss: something was rounded.
+        m = self.model()
+        loss = m.train_step(self.ids, operands="bf16")
+        want_loss, want = torch_step(reference(), self.ids)
+        self.assertLessEqual(abs(loss - want_loss) / abs(want_loss), 2.0 ** -8)
+        grads = m.grads()
+        worst = max(rel_err(grads[n], want[n]) for n in want)
+        self.assertLessEqual(worst, 2.0 ** -5)
+        self.assertNotEqual(loss, m.train_step(self.ids))
+
     def test_an_optimizer_step_written_back_is_transformers_after_the_same_step(self):
         m = self.model()
         ref = reference()
@@ -123,6 +136,8 @@ class Qwen35Training(unittest.TestCase):
             m.train_step([1, 64])
         with self.assertRaisesRegex(TesslError, "one sequence"):
             m.train_step(torch.zeros(2, 3, dtype=torch.long))
+        with self.assertRaisesRegex(TesslError, "operands must be 'f32' or 'bf16', not 'fp8'"):
+            m.train_step(self.ids, operands="fp8")
         params = m.parameters()
         bad = dict(params)
         del bad["norm.weight"]

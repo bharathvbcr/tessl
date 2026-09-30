@@ -43,14 +43,22 @@ __all__ = [
     "library_path",
 ]
 
-_ABI_VERSION = 5
+_ABI_VERSION = 6
 _MAX_DIMS = 6
 _DTYPE_CODE = {torch.float32: 0, torch.bfloat16: 1, torch.float16: 2}
 _ERR_LEN = 1024
+# GEMM operand codes: exact f32, or operands rounded to bf16 with f32 accumulation.
+_OPERANDS_CODE = {"f32": 0, "bf16": 1}
 
 
 class TesslError(RuntimeError):
     """A tessl call refused its arguments or failed on the device."""
+
+
+def _operands_code(operands: str) -> int:
+    if operands not in _OPERANDS_CODE:
+        raise TesslError(f"operands must be 'f32' or 'bf16', not {operands!r}")
+    return _OPERANDS_CODE[operands]
 
 
 class _TensorRef(ctypes.Structure):
@@ -72,6 +80,7 @@ class _CeArgs(ctypes.Structure):
         ("targets", ctypes.POINTER(ctypes.c_uint32)),
         ("n", ctypes.c_uint64),
         ("reduction", ctypes.c_uint32),
+        ("operands", ctypes.c_uint32),
         ("chunk", ctypes.c_uint32),
         ("want_grads", ctypes.c_uint32),
         ("scale", ctypes.c_float),
@@ -165,7 +174,7 @@ def _load():
         lib.tessl_qwen35_param_info.argtypes = [ctypes.c_void_p, ctypes.c_uint64, ctypes.POINTER(_ParamInfo)] + err_args
         lib.tessl_qwen35_train_step.restype = ctypes.c_int32
         lib.tessl_qwen35_train_step.argtypes = [
-            ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint32), ctypes.c_uint64,
+            ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint32), ctypes.c_uint64, ctypes.c_uint32,
             ctypes.POINTER(ctypes.c_double),
         ] + err_args
         lib.tessl_qwen35_copy.restype = ctypes.c_int32
@@ -286,6 +295,7 @@ def cross_entropy_rows(
     chunk: int = 0,
     grads: bool = False,
     scale: float = 1.0,
+    operands: str = "f32",
 ):
     """The raw call: ``hidden`` is a contiguous ``[T, ld]`` MPS tensor whose
     first ``H`` columns are the hidden states, ``weight`` a contiguous
@@ -293,10 +303,12 @@ def cross_entropy_rows(
     indices and token ids. Returns ``(loss, per_row, dh, dw)``: the loss as
     a Python float, per-row losses as a CPU float64 tensor, and with
     ``grads`` the f32 ``[n, H]`` and ``[V, H]`` gradients of ``scale * loss``
-    (``None`` otherwise).
+    (``None`` otherwise). ``operands`` is the GEMMs': ``"f32"`` (exact) or
+    ``"bf16"`` (operands rounded to bf16, f32 accumulation).
     """
     if reduction not in ("mean", "sum"):
         raise TesslError(f"reduction must be 'mean' or 'sum', not {reduction!r}")
+    operands_code = _operands_code(operands)
     if hidden.dim() != 2 or weight.dim() != 2:
         raise TesslError("hidden must be [T, ld] and weight [V, H]")
     n = rows.numel()
@@ -320,6 +332,7 @@ def cross_entropy_rows(
     args.targets = targets_u32.ctypes_ptr
     args.n = n
     args.reduction = 0 if reduction == "mean" else 1
+    args.operands = operands_code
     args.chunk = chunk
     args.want_grads = 1 if grads else 0
     args.scale = scale
@@ -363,7 +376,7 @@ def _u32(v: torch.Tensor, bound: int, name: str) -> _HostU32:
 
 class _CrossEntropy(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, hidden, weight, targets, mask, reduction, chunk):
+    def forward(ctx, hidden, weight, targets, mask, reduction, chunk, operands):
         base, to_rows = _row_view(hidden)
         flat_mask = mask.reshape(-1).to("cpu")
         positions = flat_mask.nonzero().reshape(-1)
@@ -381,7 +394,7 @@ class _CrossEntropy(torch.autograd.Function):
             raise TesslError(f"hidden width {base.shape[1]} is less than the weight's {H}")
         want = ctx.needs_input_grad[0] or ctx.needs_input_grad[1]
         loss, _, dh, dw = cross_entropy_rows(
-            base, weight.contiguous(), rows, tgt, reduction=reduction, chunk=chunk, grads=want
+            base, weight.contiguous(), rows, tgt, reduction=reduction, chunk=chunk, grads=want, operands=operands
         )
         # Gradients of the loss itself (scale 1); backward scales them by the
         # upstream gradient, which is linear, so nothing is recomputed.
@@ -407,7 +420,7 @@ class _CrossEntropy(torch.autograd.Function):
         if ctx.needs_input_grad[1]:
             # dW accumulated in f32 over the whole vocabulary walk, cast once.
             grad_weight = (dw * g).to(ctx.weight_dtype)
-        return grad_hidden, grad_weight, None, None, None, None
+        return grad_hidden, grad_weight, None, None, None, None, None
 
 
 def cross_entropy(
@@ -418,6 +431,7 @@ def cross_entropy(
     *,
     reduction: str = "mean",
     chunk: int = 0,
+    operands: str = "f32",
 ) -> torch.Tensor:
     """``F.cross_entropy(hidden[mask] @ weight.T, targets[mask])`` without
     forming the logits, differentiable in ``hidden`` and ``weight``.
@@ -428,6 +442,8 @@ def cross_entropy(
     ``mask`` a bool tensor of that shape selecting the supervised positions
     (all of them when ``None``). An empty selection is an error. The weight
     gradient is accumulated in f32 and cast to the weight's dtype once.
+    ``operands`` is the GEMMs': ``"f32"`` (exact) or ``"bf16"`` (operands
+    rounded to bf16, f32 accumulation).
     """
     if mask is None:
         mask = torch.ones(hidden.shape[:-1], dtype=torch.bool)
@@ -438,7 +454,8 @@ def cross_entropy(
         )
     if mask.dtype != torch.bool:
         raise TesslError(f"mask must be bool, not {mask.dtype}")
-    return _CrossEntropy.apply(hidden, weight, targets, mask, reduction, chunk)
+    _operands_code(operands)
+    return _CrossEntropy.apply(hidden, weight, targets, mask, reduction, chunk, operands)
 
 
 # ------------------------------------------------------ gated delta rule ---
@@ -697,11 +714,15 @@ class Qwen35:
             ts.append((p.t() if tr else p).to(device="mps", dtype=torch.float32).contiguous())
         self._copy(_WRITE_PARAMS, ts)
 
-    def train_step(self, ids) -> float:
+    def train_step(self, ids, operands: str = "f32") -> float:
         """One training step on one sequence of token ids (a 1-D tensor or a
         sequence of ints): returns transformers' causal-LM loss and keeps
         every parameter's gradient for ``grads()``. The forward keeps only
-        each layer's input; each layer reruns just before its backward."""
+        each layer's input; each layer reruns just before its backward.
+        ``operands`` is the GEMMs': ``"f32"`` (exact) or ``"bf16"`` (operands
+        rounded to bf16, f32 accumulation; weights, activations and
+        gradients stay f32)."""
+        code = _operands_code(operands)
         ids = torch.as_tensor(ids)
         if ids.dim() != 1:
             raise TesslError(f"ids must be 1-D (one sequence), got shape {tuple(ids.shape)}")
@@ -711,7 +732,7 @@ class Qwen35:
         torch.mps.synchronize()
         self._has_grads = False
         status = self._rt.lib.tessl_qwen35_train_step(
-            self._handle, host.ctypes_ptr, ids.numel(), ctypes.byref(loss), err, _ERR_LEN,
+            self._handle, host.ctypes_ptr, ids.numel(), code, ctypes.byref(loss), err, _ERR_LEN,
         )
         del host
         self._check(status, err)

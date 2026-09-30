@@ -762,8 +762,9 @@ all of it: 256x64 on 8 simdgroups (fewer passes over the 1 GB table) ran at
 and that tile runs the bf16 NT dx shape `gemm_nt_train` serves under
 `PrecisionMode::Bf16` (4096 x 128 x 384) at half the production kernel's
 speed (0.260 against 0.133 ms; the sweep's "0.51x" is throughput), so it
-could only be a head-only kernel. `train_step` is not affected either way:
-it runs exact f32 (`gemm_nt_f32`), not a bf16 tile. Neither that 5-11% nor the 1 GB saved
+could only be a head-only kernel. `train_step` on bf16 operands runs that
+production NT kernel (`gemm_nt_bf16`), which the tile would have slowed; on
+exact f32 it runs `gemm_nt_f32`. Neither that 5-11% nor the 1 GB saved
 matters much here, since nothing in production runs the bf16 full-vocabulary
 head (Lappi scores answer rows through `score_answer_rows`), so the bf16
 model keeps the faster, existing head and no kernel was added. `tests/qwen35_params.rs`, `tests/capi.rs` and

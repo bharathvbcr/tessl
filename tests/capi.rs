@@ -18,7 +18,8 @@ use tessl::capi::{
     tessl_abi_version, tessl_cross_entropy_rows, tessl_mtl_buffer_length, tessl_qwen35_copy, tessl_qwen35_free,
     tessl_qwen35_load, tessl_qwen35_param_count, tessl_qwen35_param_info, tessl_qwen35_train_step, tessl_runtime_free,
     tessl_runtime_new, tessl_synchronize, TesslCeArgs, TesslRuntime, TesslTensorRef, TESSL_ABI_VERSION,
-    TESSL_ERR, TESSL_F32, TESSL_MAX_DIMS, TESSL_OK, TESSL_READ_GRADS, TESSL_READ_PARAMS, TESSL_WRITE_PARAMS,
+    TESSL_ERR, TESSL_F32, TESSL_MAX_DIMS, TESSL_OK, TESSL_OPERANDS_BF16, TESSL_OPERANDS_EXACT_F32, TESSL_READ_GRADS,
+    TESSL_READ_PARAMS, TESSL_WRITE_PARAMS,
     TesslParamInfo, TesslQwen35,
 };
 use tessl::cross_entropy::{cross_entropy_rows, CeGrads, CeHidden, CeWorkspace, Reduction};
@@ -116,6 +117,7 @@ fn a_call_through_the_abi_is_the_rust_call() {
             targets: targets.as_ptr(),
             n: n as u64,
             reduction: 0,
+            operands: TESSL_OPERANDS_EXACT_F32,
             chunk: 128,
             want_grads: 1,
             scale: 0.5,
@@ -153,6 +155,30 @@ fn a_call_through_the_abi_is_the_rust_call() {
         assert_eq!(bits(read(&dhb, n * h)), bits(dh.read_f32().unwrap()));
         assert_eq!(bits(read(&dwb, v * h)), bits(dw.read_f32().unwrap()));
 
+        // bf16 operands through the ABI are the Rust call's bf16 bits, and not
+        // the exact call's.
+        let bf_args = TesslCeArgs { operands: TESSL_OPERANDS_BF16, ..args };
+        let mut bf_loss = 0.0f64;
+        let status = unsafe {
+            tessl_cross_entropy_rows(handle.0, &bf_args, &mut bf_loss, ptr::null_mut(), err.as_mut_ptr(), ERR_LEN)
+        };
+        assert_eq!(status, TESSL_OK, "{}", msg(&err));
+        let bf_want = cross_entropy_rows(
+            rt,
+            CeHidden { rows: &ht, off: 0 },
+            &wt,
+            &rows,
+            &targets,
+            Reduction::Mean,
+            GemmOperands::Bf16,
+            &ws,
+            Some(CeGrads { dh: &dh, dw: &dw, scale: 0.5 }),
+        )
+        .unwrap();
+        assert_eq!(bf_loss.to_bits(), bf_want.loss.to_bits());
+        assert_eq!(bits(read(&dhb, n * h)), bits(dh.read_f32().unwrap()));
+        assert_ne!(bf_loss.to_bits(), want.loss.to_bits(), "bf16 operands gave the exact loss");
+
         // The handle's cached workspace serves a second, smaller call.
         let args1 = TesslCeArgs { n: 1, want_grads: 0, dh: NULL_REF, dw: NULL_REF, ..args };
         let status = unsafe {
@@ -178,6 +204,7 @@ fn every_refusal_is_a_status_and_a_message() {
             targets: targets.as_ptr(),
             n: 2,
             reduction: 0,
+            operands: TESSL_OPERANDS_EXACT_F32,
             chunk: 0,
             want_grads: 0,
             scale: 1.0,
@@ -203,6 +230,7 @@ fn every_refusal_is_a_status_and_a_message() {
         refused(TesslCeArgs { n: 0, ..good }, "no supervised rows");
         refused(TesslCeArgs { rows: ptr::null(), ..good }, "null rows or targets");
         refused(TesslCeArgs { reduction: 7, ..good }, "reduction 7");
+        refused(TesslCeArgs { operands: 2, ..good }, "operands code 2 is neither 0 (exact f32) nor 1 (bf16)");
         refused(TesslCeArgs { hidden: NULL_REF, ..good }, "hidden: null MTLBuffer");
         refused(TesslCeArgs { hidden: TesslTensorRef { dtype: 9, ..good.hidden }, ..good }, "unknown dtype code 9");
         refused(TesslCeArgs { hidden: TesslTensorRef { ndim: 7, ..good.hidden }, ..good }, "rank 7");
@@ -261,6 +289,7 @@ fn a_wrap_through_the_abi_leaves_residency_balanced() {
             targets: targets.as_ptr(),
             n: 1,
             reduction: 1,
+            operands: TESSL_OPERANDS_EXACT_F32,
             chunk: 64,
             want_grads: 0,
             scale: 1.0,
@@ -366,7 +395,7 @@ fn the_model_through_the_abi_is_the_rust_model() {
         assert!(msg(&err).contains("direction 7"), "{}", msg(&err));
 
         let mut loss = 0.0f64;
-        let s = unsafe { tessl_qwen35_train_step(model, ids.as_ptr(), ids.len() as u64, &mut loss, err.as_mut_ptr(), ERR_LEN) };
+        let s = unsafe { tessl_qwen35_train_step(model, ids.as_ptr(), ids.len() as u64, TESSL_OPERANDS_EXACT_F32, &mut loss, err.as_mut_ptr(), ERR_LEN) };
         assert_eq!(s, TESSL_OK, "{}", msg(&err));
         let want = rust.train_step(&ids, GemmOperands::ExactF32).unwrap();
         assert_eq!(loss.to_bits(), want.loss.to_bits());
@@ -386,6 +415,35 @@ fn the_model_through_the_abi_is_the_rust_model() {
             }
         }
 
+        // A bf16-operand step through the ABI is the Rust bf16 step: its loss
+        // and gradients bit for bit, and not the exact step's loss.
+        let mut bf_loss = 0.0f64;
+        let s = unsafe {
+            tessl_qwen35_train_step(model, ids.as_ptr(), ids.len() as u64, TESSL_OPERANDS_BF16, &mut bf_loss, err.as_mut_ptr(), ERR_LEN)
+        };
+        assert_eq!(s, TESSL_OK, "{}", msg(&err));
+        let bf_want = rust.train_step(&ids, GemmOperands::Bf16).unwrap();
+        assert_eq!(bf_loss.to_bits(), bf_want.loss.to_bits());
+        assert_ne!(bf_loss.to_bits(), loss.to_bits(), "bf16 operands gave the exact loss");
+        assert_eq!(copy(TESSL_READ_GRADS, &refs, &mut err), TESSL_OK, "{}", msg(&err));
+        rust.read_gradients(&bf_want.grads, &local).unwrap();
+        for ((p, b), t) in table.iter().zip(&bufs).zip(&local) {
+            let got = read(b, p.shape.iter().product());
+            let exp = t.read_f32().unwrap();
+            assert!(got.iter().zip(&exp).all(|(a, b)| a.to_bits() == b.to_bits()), "{} (bf16 gradients)", p.name);
+        }
+        // An unknown operands code is refused, and the refused step leaves no
+        // gradients behind.
+        let s = unsafe {
+            tessl_qwen35_train_step(model, ids.as_ptr(), ids.len() as u64, 2, &mut bf_loss, err.as_mut_ptr(), ERR_LEN)
+        };
+        assert_eq!(s, TESSL_ERR);
+        assert!(msg(&err).contains("operands code 2 is neither 0 (exact f32) nor 1 (bf16)"), "{}", msg(&err));
+        assert_eq!(copy(TESSL_READ_GRADS, &refs, &mut err), TESSL_ERR);
+        assert!(msg(&err).contains("no gradients yet"), "{}", msg(&err));
+        // Put the buffers back to the parameters for the write below.
+        assert_eq!(copy(TESSL_READ_PARAMS, &refs, &mut err), TESSL_OK, "{}", msg(&err));
+
         // Halve every parameter through the ABI: the next loss moves, and is
         // the Rust model's after the same write.
         for (p, b) in table.iter().zip(&bufs) {
@@ -399,7 +457,7 @@ fn the_model_through_the_abi_is_the_rust_model() {
         }
         rust.write_parameters(&local).unwrap();
         let mut moved = 0.0f64;
-        let s = unsafe { tessl_qwen35_train_step(model, ids.as_ptr(), ids.len() as u64, &mut moved, err.as_mut_ptr(), ERR_LEN) };
+        let s = unsafe { tessl_qwen35_train_step(model, ids.as_ptr(), ids.len() as u64, TESSL_OPERANDS_EXACT_F32, &mut moved, err.as_mut_ptr(), ERR_LEN) };
         assert_eq!(s, TESSL_OK, "{}", msg(&err));
         assert_ne!(moved.to_bits(), loss.to_bits());
         assert_eq!(moved.to_bits(), rust.train_step(&ids, GemmOperands::ExactF32).unwrap().loss.to_bits());
@@ -408,7 +466,7 @@ fn the_model_through_the_abi_is_the_rust_model() {
     // Refusals: a bad id, a null handle, another thread.
     let bad = [1u32, 64];
     let mut loss = 0.0;
-    let s = unsafe { tessl_qwen35_train_step(model, bad.as_ptr(), 2, &mut loss, err.as_mut_ptr(), ERR_LEN) };
+    let s = unsafe { tessl_qwen35_train_step(model, bad.as_ptr(), 2, TESSL_OPERANDS_EXACT_F32, &mut loss, err.as_mut_ptr(), ERR_LEN) };
     assert_eq!(s, TESSL_ERR);
     assert!(msg(&err).contains("token id 64 >= vocab 64"), "{}", msg(&err));
     let mut n = 0u64;

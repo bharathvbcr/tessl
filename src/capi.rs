@@ -54,7 +54,7 @@ pub const TESSL_PANIC: i32 = 2;
 
 /// Bumped on any change to a `#[repr(C)]` layout or an entry point's
 /// signature; the Python side refuses a library whose version differs.
-pub const TESSL_ABI_VERSION: u32 = 5;
+pub const TESSL_ABI_VERSION: u32 = 6;
 
 /// Largest tensor rank a [`TesslTensorRef`] carries.
 pub const TESSL_MAX_DIMS: usize = 6;
@@ -63,6 +63,19 @@ pub const TESSL_MAX_DIMS: usize = 6;
 pub const TESSL_F32: u32 = 0;
 pub const TESSL_BF16: u32 = 1;
 pub const TESSL_F16: u32 = 2;
+
+/// GEMM operand codes ([`GemmOperands`]): exact f32, or operands rounded to
+/// bf16 with f32 accumulation. Any other value is refused.
+pub const TESSL_OPERANDS_EXACT_F32: u32 = 0;
+pub const TESSL_OPERANDS_BF16: u32 = 1;
+
+fn parse_operands(code: u32, what: &str) -> Result<GemmOperands, String> {
+    match code {
+        TESSL_OPERANDS_EXACT_F32 => Ok(GemmOperands::ExactF32),
+        TESSL_OPERANDS_BF16 => Ok(GemmOperands::Bf16),
+        c => Err(format!("{what}: operands code {c} is neither 0 (exact f32) nor 1 (bf16)")),
+    }
+}
 
 /// A dense, row-major tensor inside a caller's `MTLBuffer`.
 #[repr(C)]
@@ -95,6 +108,9 @@ pub struct TesslCeArgs {
     pub n: u64,
     /// 0 = mean, 1 = sum.
     pub reduction: u32,
+    /// The GEMMs' operands: [`TESSL_OPERANDS_EXACT_F32`] or
+    /// [`TESSL_OPERANDS_BF16`].
+    pub operands: u32,
     /// Vocabulary columns per step; 0 picks [`DEFAULT_CE_CHUNK`].
     pub chunk: u32,
     /// Non-zero: also write `dh` (`[n, H]` f32) and `dw` (`[V, H]` f32),
@@ -260,6 +276,7 @@ unsafe fn ce(h: &mut TesslRuntime, a: &TesslCeArgs) -> Result<crate::cross_entro
         1 => Reduction::Sum,
         r => return Err(format!("{WHAT}: reduction {r} is neither 0 (mean) nor 1 (sum)")),
     };
+    let operands = parse_operands(a.operands, WHAT)?;
     let rt = Arc::clone(&h.rt);
     // SAFETY (each wrap): live MTLBuffers under the module contract.
     let hidden = unsafe { wrap(&rt, &a.hidden, "hidden") }?;
@@ -296,7 +313,7 @@ unsafe fn ce(h: &mut TesslRuntime, a: &TesslCeArgs) -> Result<crate::cross_entro
         rows,
         targets,
         reduction,
-        GemmOperands::ExactF32,
+        operands,
         ws,
         grads,
     )
@@ -775,10 +792,11 @@ pub unsafe extern "C" fn tessl_qwen35_param_info(
     }
 }
 
-/// One training step on the `n` token ids at `ids` (one sequence): writes
-/// the loss to `*loss` and keeps every parameter's gradient in the handle for
-/// [`tessl_qwen35_copy`], replacing the previous step's (freed before the
-/// step runs).
+/// One training step on the `n` token ids at `ids` (one sequence), its GEMMs
+/// on `operands` ([`TESSL_OPERANDS_EXACT_F32`] or [`TESSL_OPERANDS_BF16`]):
+/// writes the loss to `*loss` and keeps every parameter's gradient in the
+/// handle for [`tessl_qwen35_copy`], replacing the previous step's (freed
+/// before the step runs, so a refused step leaves none).
 ///
 /// # Safety
 /// As [`tessl_qwen35_param_count`]; `ids` points to `n` readable `u32`s and
@@ -788,6 +806,7 @@ pub unsafe extern "C" fn tessl_qwen35_train_step(
     model: *mut TesslQwen35,
     ids: *const u32,
     n: u64,
+    operands: u32,
     loss: *mut f64,
     err: *mut c_char,
     err_len: usize,
@@ -802,7 +821,7 @@ pub unsafe extern "C" fn tessl_qwen35_train_step(
             let n = usize::try_from(n).map_err(|_| format!("{WHAT}: n overflows usize"))?;
             let ids = std::slice::from_raw_parts(ids, n);
             h.grads = None;
-            let step = h.model.train_step(ids, GemmOperands::ExactF32)?;
+            let step = h.model.train_step(ids, parse_operands(operands, WHAT)?)?;
             *loss = step.loss;
             h.grads = Some(step.grads);
             Ok(())

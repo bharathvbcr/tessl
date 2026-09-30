@@ -39,6 +39,13 @@ for ids in batches:                   # one sequence of token ids per step
     model.load_parameters(params)     # write the update back to tessl
 ```
 
+`train_step(ids, operands="bf16")` (and `operands="bf16"` on `cross_entropy`)
+rounds every GEMM's operands to bf16 and accumulates in f32; the weights,
+activations and gradients stay f32. The default, `"f32"`, is exact. On the
+2B's cross-entropy at T = 2048 bf16 is 3.15x faster; its gradients differ
+from transformers' f32 ones by up to 2.3e-2 of a parameter's peak on the
+tiny test model (`docs/qwen35.md`, "A training step").
+
 Names are transformers' below the text tower (`layers.3.mlp.gate_proj.weight`),
 and values are the parameters' own (the zero-centred norms as `w`, although
 tessl stores `1 + w`). Linear weights come back as transposed views, because

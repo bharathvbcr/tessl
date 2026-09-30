@@ -577,6 +577,9 @@ fn qwen35_bwd_offsets_are_widened() {
         ("part[(nblocks + blk) * D + d] = sk;", "k-norm partial"),
         ("s += dh[(ulong)pos[i] * hidden + col];", "embedding dh row"),
         ("dw[(ulong)uniq[u] * hidden + col] += s;", "embedding table row"),
+        ("device float *drow = dp + r * ld;", "gate gradient row"),
+        ("part[(nblocks + blk) * H + h] = acc_dt;", "dt_bias partial"),
+        ("dst[(ulong)r * ld_dst + dst_off + c] = src[(ulong)r * ld_src + src_off + c];", "window copy"),
     ] {
         require(QWEN35_BWD, needle, what);
     }
@@ -600,6 +603,14 @@ fn attn_train_offsets_are_widened() {
         require(QWEN35_ATTN_BWD, needle, what);
     }
     require(QWEN35_ATTN_TILED, "lse[(ulong)bh * Tq + q0 + tid] =", "forward log-sum-exp store");
+}
+
+/// The training gate kernel reads one fused-projection row per token and
+/// writes a dense [rows, H] value; both offsets are formed in 64 bits.
+#[test]
+fn gdn_gate_offsets_are_widened() {
+    require(QWEN35_GDN, "device const float *row = p + (ulong)r * ld;", "gate logits row");
+    require(QWEN35_GDN, "const ulong o = (ulong)r * H + h;", "gate value");
 }
 
 #[test]

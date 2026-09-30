@@ -1,7 +1,8 @@
 //! Backward of the Qwen3.5 row-local ops (`kernels/qwen35_bwd.metal`): the
 //! RMSNorm, the GDN gated RMSNorm, SwiGLU, the attention output gate and
-//! the GDN causal conv + SiLU, the attention Q/K norm + partial RoPE, and
-//! the embedding gather.
+//! the GDN causal conv + SiLU, the GDN gates, the attention Q/K norm +
+//! partial RoPE, and the embedding gather; and [`copy_cols`], which moves a
+//! column window between fused and dense layouts.
 //!
 //! Each entry point takes the forward's inputs (f32, as the forward reads
 //! them) and the output's gradient, in the forward's layouts, and writes the
@@ -19,7 +20,7 @@ use objc2_metal::MTLComputePipelineState;
 
 use crate::dispatch::{dispatch_1d, dispatch_2d, set_f32, set_gpu_buf, set_gpu_buf_offset, set_u32};
 use crate::nn::{dispatch_tg_1d, reduce_tptg, require, require_disjoint_writes};
-use crate::qwen35::{require_window, AttnProjLayout, AttnShape, Cols};
+use crate::qwen35::{require_window, AttnProjLayout, AttnShape, Cols, GdnGateLogits, GdnParams};
 use crate::runtime::GpuRuntime;
 use crate::tensor::GpuBuffer;
 
@@ -641,5 +642,114 @@ pub fn embed_rows_bwd(
         set_gpu_buf(bnd, dw, 4);
         set_u32(bnd, n_runs, 5);
         set_u32(bnd, hidden, 6);
+    })
+}
+
+/// Rows per weight-gradient block of the GDN gates' backward.
+const GATES_ROWS_PER_BLOCK: u32 = 256;
+
+/// f32 elements of scratch [`gdn_gates_bwd`] needs: a dA_log and a ddt_bias
+/// partial per block of rows.
+pub fn gdn_gates_bwd_part_len(rows: u32, heads: u32) -> usize {
+    2 * blocks(u64::from(rows), GATES_ROWS_PER_BLOCK) as usize * heads as usize
+}
+
+/// Backward of [`crate::qwen35::gdn_gates`] from `dg`, `dbeta` (dense
+/// `[rows, heads]`): `da`, `db` into the a and b columns of `dproj` (the
+/// fused projection's gradient, with the logits' row stride; nothing else of
+/// it is touched), and `da_log`, `ddt_bias` (`[heads]`) overwritten, summed
+/// over rows in a fixed order. `part` holds [`gdn_gates_bwd_part_len`]
+/// floats. The softplus derivative is torch's: 1 above 20.
+#[allow(clippy::too_many_arguments)]
+pub fn gdn_gates_bwd(
+    rt: &Arc<GpuRuntime>,
+    logits: &GdnGateLogits<'_>,
+    params: &GdnParams<'_>,
+    dg: &GpuBuffer,
+    dbeta: &GpuBuffer,
+    dproj: &GpuBuffer,
+    da_log: &GpuBuffer,
+    ddt_bias: &GpuBuffer,
+    part: &GpuBuffer,
+    rows: u32,
+    heads: u32,
+) -> Result<(), String> {
+    const WHAT: &str = "qwen35_bwd::gdn_gates_bwd";
+    let r = u64::from(rows);
+    for (buf, name) in [(logits.buf, "logits"), (dproj, "dproj")] {
+        for (off, col) in [(logits.a_off, "a"), (logits.b_off, "b")] {
+            let c = Cols { buf, ld: logits.ld, off };
+            require_window::<f32>(rt, c, r, u64::from(heads), &format!("{WHAT} {name} {col}"))?;
+        }
+    }
+    let (a, b) = (u64::from(logits.a_off), u64::from(logits.b_off));
+    if a < b + u64::from(heads) && b < a + u64::from(heads) {
+        return Err(format!("{WHAT}: the a and b windows overlap"));
+    }
+    let n = (rows as usize)
+        .checked_mul(heads as usize)
+        .ok_or_else(|| format!("{WHAT}: rows x heads overflows"))?;
+    for (buf, len, name) in [
+        (params.a_log, heads as usize, "a_log"),
+        (params.dt_bias, heads as usize, "dt_bias"),
+        (dg, n, "dg"),
+        (dbeta, n, "dbeta"),
+        (da_log, heads as usize, "da_log"),
+        (ddt_bias, heads as usize, "ddt_bias"),
+    ] {
+        require::<f32>(rt, buf, len, &format!("{WHAT} {name}"))?;
+    }
+    let nb = blocks(r, GATES_ROWS_PER_BLOCK);
+    require::<f32>(rt, part, gdn_gates_bwd_part_len(rows, heads), &format!("{WHAT} part"))?;
+    require_disjoint_writes(
+        WHAT,
+        &[("dproj", dproj), ("da_log", da_log), ("ddt_bias", ddt_bias), ("part", part)],
+        &[("logits", logits.buf), ("a_log", params.a_log), ("dt_bias", params.dt_bias), ("dg", dg), ("dbeta", dbeta)],
+    )?;
+    if heads == 0 {
+        return Ok(());
+    }
+    let p = rt.pipeline("qwen35_gdn_gates_bwd_f32")?;
+    dispatch_2d(rt, &p, heads as usize, nb as usize, |bnd| {
+        set_gpu_buf(bnd, logits.buf, 0);
+        set_gpu_buf(bnd, params.a_log, 1);
+        set_gpu_buf(bnd, params.dt_bias, 2);
+        set_gpu_buf(bnd, dg, 3);
+        set_gpu_buf(bnd, dbeta, 4);
+        set_gpu_buf(bnd, dproj, 5);
+        set_gpu_buf(bnd, part, 6);
+        set_u32(bnd, rows, 7);
+        set_u32(bnd, heads, 8);
+        set_u32(bnd, logits.ld, 9);
+        set_u32(bnd, logits.a_off, 10);
+        set_u32(bnd, logits.b_off, 11);
+        set_u32(bnd, GATES_ROWS_PER_BLOCK, 12);
+    })?;
+    col_sum_blocks(rt, part, 0, da_log, nb, heads)?;
+    col_sum_blocks(rt, part, nb as usize * heads as usize, ddt_bias, nb, heads)
+}
+
+/// `dst`'s window `= src`'s window: `rows x width` f32 between two column
+/// windows (the GDN's q, k, v between the conv output and the training op's
+/// dense operands). The windows may share a buffer only when they are
+/// disjoint.
+pub fn copy_cols(rt: &Arc<GpuRuntime>, src: Cols<'_>, dst: Cols<'_>, rows: u32, width: u32) -> Result<(), String> {
+    const WHAT: &str = "qwen35_bwd::copy_cols";
+    require_window::<f32>(rt, src, u64::from(rows), u64::from(width), &format!("{WHAT} src"))?;
+    require_window::<f32>(rt, dst, u64::from(rows), u64::from(width), &format!("{WHAT} dst"))?;
+    no_overlap(WHAT, &[("dst", dst, width)], &[("src", src, width)])?;
+    if rows == 0 || width == 0 {
+        return Ok(());
+    }
+    let p = rt.pipeline("qwen35_copy_cols_f32")?;
+    dispatch_2d(rt, &p, width as usize, rows as usize, |bnd| {
+        set_gpu_buf(bnd, src.buf, 0);
+        set_gpu_buf(bnd, dst.buf, 1);
+        set_u32(bnd, rows, 2);
+        set_u32(bnd, width, 3);
+        set_u32(bnd, src.ld, 4);
+        set_u32(bnd, src.off, 5);
+        set_u32(bnd, dst.ld, 6);
+        set_u32(bnd, dst.off, 7);
     })
 }

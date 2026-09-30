@@ -90,44 +90,6 @@ static_assert(GDN_BV == 32u, "scan and recurrent: one value column per lane, 4 c
 /// transformers' `l2norm` epsilon, added to the sum of squares (not the mean).
 constant float GDN_L2_EPS = 1e-6f;
 
-/// torch's `F.softplus` at its defaults (beta = 1, threshold = 20): linear above
-/// the threshold, `log1p(e^x)` below it.
-///
-/// MSL has no `log1p`, and `log(1 + e)` is not a substitute where it matters:
-/// rounding `1 + e` alone costs `2^-24 / e` relative, and the fast `log` near 1
-/// has an absolute error around 2^-21 — together 1-60% of the result for x in
-/// [-15, -8], which `a + dt_bias` reaches routinely (Qwen's dt_bias sits around
-/// -2 to -7). Below -3 the series `e - e^2/2 + ... - e^8/8` is exact to f32
-/// (the first dropped term is 1e-11 relative); above it `1 + e` loses at most
-/// 1.2e-6 relative, and `precise::log` adds half an ulp.
-inline float gdn_softplus(float x)
-{
-    if (x > 20.0f) return x;
-    // precise: fast `exp` is documented to 3 + floor(2|x|) ulp, ~33 ulp at
-    // x = -15, and below -3 softplus is e^x to within the series. Once per
-    // token per head, so the cost is nothing.
-    const float e = precise::exp(x);
-    if (x < -3.0f) {
-        // log1p(e) by Horner: e * (1 - e/2 + e^2/3 - ... - e^7/8).
-        float p = -1.0f / 8.0f;
-        p = p * e + 1.0f / 7.0f;
-        p = p * e - 1.0f / 6.0f;
-        p = p * e + 1.0f / 5.0f;
-        p = p * e - 1.0f / 4.0f;
-        p = p * e + 1.0f / 3.0f;
-        p = p * e - 1.0f / 2.0f;
-        p = p * e + 1.0f;
-        return e * p;
-    }
-    return precise::log(1.0f + e);
-}
-
-/// `g = -exp(A_log) * softplus(a + dt_bias)`: the log of the per-step decay.
-/// Always <= 0.
-inline float gdn_log_decay(float a, float a_log, float dt_bias)
-{
-    return -exp(a_log) * gdn_softplus(a + dt_bias);
-}
 
 // ------------------------------------------------------------------ conv1d ---
 
@@ -303,7 +265,7 @@ kernel void qwen35_gdn_chunk_prep(
                 device const float *gr = ab + ((ulong)b * T + t) * (ulong)ld_ab;
                 rq[i] = rsqrt(ssq + GDN_L2_EPS) * q_scale;
                 rk[i] = rsqrt(ssk + GDN_L2_EPS);
-                G[i] = gdn_log_decay(gr[a_off + hv], a_log[hv], dt_bias[hv]);
+                G[i] = qwen35_log_decay(gr[a_off + hv], a_log[hv], dt_bias[hv]);
                 beta[i] = qwen35_sigmoid(gr[b_off + hv]);
             } else {
                 rq[i] = 0.0f;
@@ -863,7 +825,7 @@ kernel void qwen35_gdn_recurrent(
         }
         const float rq = rsqrt(simd_sum(ssq) + GDN_L2_EPS) * q_scale;
         const float rk = rsqrt(simd_sum(ssk) + GDN_L2_EPS);
-        const float decay = exp(gdn_log_decay(gr[a_off + hv], a_log[hv], dt_bias[hv]));
+        const float decay = exp(qwen35_log_decay(gr[a_off + hv], a_log[hv], dt_bias[hv]));
         const float beta = qwen35_sigmoid(gr[b_off + hv]);
 
         // kv_mem = (decay * S)^T k
@@ -972,3 +934,33 @@ kernel void NAME(                                                               
 
 GATED_RMS_NORM_KERNEL(qwen35_gated_rms_norm_f32, float)
 GATED_RMS_NORM_KERNEL(qwen35_gated_rms_norm_bf16, bfloat)
+
+// ------------------------------------------------------------ gate values ---
+
+/// The gates as the training op (`tessl::gdn_train`, transformers'
+/// `chunk_gated_delta_rule` seam) takes them, dense `[rows, H]`:
+/// `g = -exp(A_log) * softplus(a + dt_bias)` and `beta = sigmoid(b)`, with the
+/// same helpers the inference kernels fold into their loads.
+///
+/// Grid: x = head in [0, H), y = row.
+kernel void qwen35_gdn_gates_f32(
+    device const float *p [[buffer(0)]],
+    device const float *a_log [[buffer(1)]],
+    device const float *dt_bias [[buffer(2)]],
+    device float *g [[buffer(3)]],
+    device float *beta [[buffer(4)]],
+    constant uint &rows [[buffer(5)]],
+    constant uint &H [[buffer(6)]],
+    constant uint &ld [[buffer(7)]],
+    constant uint &a_off [[buffer(8)]],
+    constant uint &b_off [[buffer(9)]],
+    uint2 gid [[thread_position_in_grid]])
+{
+    const uint h = gid.x;
+    const uint r = gid.y;
+    if (h >= H || r >= rows) return;
+    device const float *row = p + (ulong)r * ld;
+    const ulong o = (ulong)r * H + h;
+    g[o] = qwen35_log_decay(row[a_off + h], a_log[h], dt_bias[h]);
+    beta[o] = qwen35_sigmoid(row[b_off + h]);
+}

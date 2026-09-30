@@ -11,11 +11,12 @@ mod common;
 
 use std::sync::Arc;
 
-use common::qwen35::{sigmoid, silu};
+use common::qwen35::{sigmoid, silu, softplus};
 use common::{buf, random_f32, seeded, with_gpu};
-use tessl::qwen35::{AttnShape, Cols};
+use tessl::qwen35::{self, AttnShape, Cols, GdnGateLogits, GdnParams};
 use tessl::qwen35_bwd::{
-    attn_gate_bwd, attn_qk_norm_rope_bwd, attn_qk_norm_rope_bwd_part_len, conv1d_silu_bwd, conv1d_silu_bwd_part_len, gated_rms_norm_bwd,
+    attn_gate_bwd, attn_qk_norm_rope_bwd, attn_qk_norm_rope_bwd_part_len, conv1d_silu_bwd, conv1d_silu_bwd_part_len, copy_cols,
+    gated_rms_norm_bwd, gdn_gates_bwd, gdn_gates_bwd_part_len,
     embed_rows_bwd, gated_rms_norm_bwd_part_len, rms_norm_bwd, rms_norm_bwd_part_len, swiglu_bwd, AttnQkvGrads, EmbedBwdWorkspace,
 };
 use tessl::tensor::GpuBuffer;
@@ -711,5 +712,162 @@ fn embedding_backward_refuses_bad_ids_and_layouts() {
         e(embed_rows_bwd(rt, &[0; 4], &buf(rt, &[0.0; 63]), &dw, 8, 16, &ws), "dh");
         e(embed_rows_bwd(rt, &[0; 2], &dh, &buf(rt, &[0.0; 127]), 8, 16, &ws), "dw");
         e(embed_rows_bwd(rt, &[0; 2], &dw, &dw, 8, 16, &ws), "dw");
+    });
+}
+
+// --------------------------------------------------------------- GDN gates ---
+
+/// torch's softplus derivative: sigmoid below the threshold, 1 above it.
+fn softplus_grad(x: f64) -> f64 {
+    if x > 20.0 {
+        1.0
+    } else {
+        sigmoid(x)
+    }
+}
+
+#[test]
+fn gate_reference_backward_is_the_derivative() {
+    // Away from the threshold kink, where central differences are exact.
+    let (a_log, dt) = (0.3f64, -2.5f64);
+    for a in [-18.0f64, -4.0, -0.5, 0.0, 2.0, 15.0, 30.0] {
+        let g = |a: f64, al: f64, dt: f64| -al.exp() * softplus(a + dt);
+        let h = 1e-6;
+        let fd = |f: &dyn Fn(f64) -> f64, x: f64| (f(x + h) - f(x - h)) / (2.0 * h);
+        let da = -a_log.exp() * softplus_grad(a + dt);
+        let want = [(fd(&|x| g(x, a_log, dt), a), da), (fd(&|x| g(a, x, dt), a_log), g(a, a_log, dt)), (fd(&|x| g(a, a_log, x), dt), da)];
+        for (i, (f, got)) in want.iter().enumerate() {
+            assert!((f - got).abs() <= 1e-7 * (1.0 + f.abs()), "a = {a}, derivative {i}: {got} vs {f}");
+        }
+    }
+}
+
+fn run_gates(rt: &Arc<GpuRuntime>, rows: usize, heads: usize, seed: u64) {
+    // The fused GDN projection row: [other | b (H) | a (H) | other].
+    let (b_off, a_off) = (5usize, 5 + heads);
+    let ld = a_off + heads + 3;
+    let mut p: Vec<f32> = random_f32(rows * ld, seed).iter().map(|v| 12.0 * v).collect();
+    // Past torch's threshold (x = a + dt_bias > 20) and deep in the series.
+    for r in (0..rows).step_by(3) {
+        p[r * ld + a_off] = 26.0;
+    }
+    for r in (1..rows).step_by(5) {
+        p[r * ld + a_off + heads - 1] = -24.0;
+    }
+    // Where softplus must not form e^x at all (it overflows f32 past 88).
+    p[(rows - 1) * ld + a_off] = 120.0;
+    let a_log: Vec<f32> = random_f32(heads, seed + 1).iter().map(|v| 0.8 * v).collect();
+    let dt: Vec<f32> = random_f32(heads, seed + 2).iter().map(|v| -3.0 + 2.0 * v).collect();
+    let (dg, dbeta) = (random_f32(rows * heads, seed + 3), random_f32(rows * heads, seed + 4));
+    let (pb, alb, dtb) = (buf(rt, &p), buf(rt, &a_log), buf(rt, &dt));
+    let (dgb, dbb) = (buf(rt, &dg), buf(rt, &dbeta));
+    let logits = GdnGateLogits { buf: &pb, ld: ld as u32, a_off: a_off as u32, b_off: b_off as u32 };
+    let params = GdnParams { a_log: &alb, dt_bias: &dtb };
+    let (gb, betab) = (seeded(rt, rows * heads, SENTINEL), seeded(rt, rows * heads, SENTINEL));
+    qwen35::gdn_gates(rt, &logits, &params, &gb, &betab, rows as u32, heads as u32).unwrap();
+    let dpb = seeded(rt, rows * ld, SENTINEL);
+    let (dal, ddt) = (seeded(rt, heads, SENTINEL), seeded(rt, heads, SENTINEL));
+    let part = seeded(rt, gdn_gates_bwd_part_len(rows as u32, heads as u32).max(1), SENTINEL);
+    let bwd = || {
+        gdn_gates_bwd(rt, &logits, &params, &dgb, &dbb, &dpb, &dal, &ddt, &part, rows as u32, heads as u32).unwrap();
+        rt.synchronize().unwrap();
+    };
+    bwd();
+    let (mut wg, mut wbeta, mut wda, mut wdb) = (vec![], vec![], vec![], vec![]);
+    let (mut wdal, mut wddt) = (vec![0.0f64; heads], vec![0.0f64; heads]);
+    let (mut got_da, mut got_db) = (vec![], vec![]);
+    let dp = dpb.read_f32();
+    for r in 0..rows {
+        for h in 0..heads {
+            let (a, b) = (f64::from(p[r * ld + a_off + h]), f64::from(p[r * ld + b_off + h]));
+            let (al, d) = (f64::from(a_log[h]), f64::from(dt[h]));
+            let g = -al.exp() * softplus(a + d);
+            let s = sigmoid(b);
+            let o = r * heads + h;
+            let da = f64::from(dg[o]) * -al.exp() * softplus_grad(a + d);
+            wg.push(g);
+            wbeta.push(s);
+            wda.push(da);
+            wdb.push(f64::from(dbeta[o]) * s * (1.0 - s));
+            wdal[h] += f64::from(dg[o]) * g;
+            wddt[h] += da;
+            got_da.push(dp[r * ld + a_off + h]);
+            got_db.push(dp[r * ld + b_off + h]);
+        }
+    }
+    let label = format!("gates rows={rows} heads={heads}");
+    close(&format!("{label} g"), &gb.read_f32(), &wg);
+    close(&format!("{label} beta"), &betab.read_f32(), &wbeta);
+    close(&format!("{label} da"), &got_da, &wda);
+    close(&format!("{label} db"), &got_db, &wdb);
+    assert_eq!(dp.iter().filter(|&&v| v != SENTINEL).count(), 2 * rows * heads, "{label}: wrote outside the a and b columns");
+    let first = (dal.read_f32(), ddt.read_f32());
+    close(&format!("{label} dA_log"), &first.0, &wdal);
+    close(&format!("{label} ddt_bias"), &first.1, &wddt);
+    bwd();
+    let same = |a: &[f32], b: &[f32]| a.iter().zip(b).all(|(x, y)| x.to_bits() == y.to_bits());
+    assert!(same(&dal.read_f32(), &first.0) && same(&ddt.read_f32(), &first.1), "{label}: changed on a rerun");
+}
+
+#[test]
+fn gdn_gates_forward_and_backward_match() {
+    with_gpu(|rt| {
+        for (rows, heads) in [(1, 1), (255, 3), (256, 4), (257, 2), (600, 16)] {
+            run_gates(rt, rows, heads, rows as u64 * 3 + heads as u64);
+        }
+        // No rows: zero parameter gradients.
+        let z = buf(rt, &[0.0; 64]);
+        let logits = GdnGateLogits { buf: &z, ld: 8, a_off: 4, b_off: 0 };
+        let params = GdnParams { a_log: &z, dt_bias: &z };
+        let (dal, ddt) = (seeded(rt, 4, SENTINEL), seeded(rt, 4, SENTINEL));
+        let dp = seeded(rt, 64, SENTINEL);
+        gdn_gates_bwd(rt, &logits, &params, &z, &z, &dp, &dal, &ddt, &buf(rt, &[0.0; 1]), 0, 4).unwrap();
+        rt.synchronize().unwrap();
+        assert!(dal.read_f32().iter().chain(&ddt.read_f32()).all(|&v| v == 0.0), "rows = 0: gradients must be zeros");
+    });
+}
+
+#[test]
+fn copy_cols_moves_exactly_its_window() {
+    with_gpu(|rt| {
+        let (rows, ld_s, ld_d, w) = (37usize, 50usize, 24usize, 20usize);
+        let src = random_f32(rows * ld_s, 61);
+        let sb = buf(rt, &src);
+        let db = seeded(rt, rows * ld_d, SENTINEL);
+        copy_cols(rt, win(&sb, ld_s, 17), win(&db, ld_d, 3), rows as u32, w as u32).unwrap();
+        rt.synchronize().unwrap();
+        let d = db.read_f32();
+        for r in 0..rows {
+            for c in 0..ld_d {
+                let want = if (3..3 + w).contains(&c) { src[r * ld_s + 17 + c - 3] } else { SENTINEL };
+                assert_eq!(d[r * ld_d + c].to_bits(), want.to_bits(), "row {r} col {c}");
+            }
+        }
+        // Disjoint windows of one buffer are fine; overlapping ones are not.
+        copy_cols(rt, win(&sb, ld_s, 0), win(&sb, ld_s, 25), rows as u32, w as u32).expect("disjoint windows");
+        let m = copy_cols(rt, win(&sb, ld_s, 0), win(&sb, ld_s, 10), rows as u32, w as u32).unwrap_err();
+        assert!(m.contains("dst overlaps src"), "{m}");
+        let m = copy_cols(rt, win(&sb, ld_s, 0), win(&db, ld_d, 10), rows as u32, w as u32).unwrap_err();
+        assert!(m.contains("copy_cols dst"), "{m}");
+    });
+}
+
+#[test]
+fn gdn_gates_refuse_bad_layouts() {
+    with_gpu(|rt| {
+        let z = buf(rt, &[0.0; 256]);
+        let params = GdnParams { a_log: &z, dt_bias: &z };
+        let (dal, ddt, dp, part) = (buf(rt, &[0.0; 4]), buf(rt, &[0.0; 4]), buf(rt, &[0.0; 256]), buf(rt, &[0.0; 8]));
+        let e = |r: Result<(), String>, needle: &str| {
+            let m = r.expect_err(needle);
+            assert!(m.contains(needle), "{m:?} lacks {needle:?}");
+        };
+        let ok = GdnGateLogits { buf: &z, ld: 16, a_off: 4, b_off: 0 };
+        gdn_gates_bwd(rt, &ok, &params, &z, &z, &dp, &dal, &ddt, &part, 8, 4).expect("a valid call");
+        e(gdn_gates_bwd(rt, &GdnGateLogits { a_off: 2, ..ok }, &params, &z, &z, &dp, &dal, &ddt, &part, 8, 4), "the a and b windows overlap");
+        e(gdn_gates_bwd(rt, &ok, &params, &z, &z, &dp, &dal, &ddt, &buf(rt, &[0.0; 7]), 8, 4), "part");
+        e(gdn_gates_bwd(rt, &ok, &params, &z, &z, &z, &dal, &ddt, &part, 8, 4), "dproj");
+        e(gdn_gates_bwd(rt, &GdnGateLogits { ld: 7, ..ok }, &params, &z, &z, &dp, &dal, &ddt, &part, 8, 4), "a");
+        e(qwen35::gdn_gates(rt, &ok, &params, &z, &dal, 8, 4), "g");
     });
 }

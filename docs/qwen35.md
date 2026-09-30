@@ -638,6 +638,21 @@ the gradient is deterministic and rows no id reads keep their bits. Within
 5e-7 of the f64 sum across repeated, reversed, single-id and 2048-wide
 cases; eight of eight injected defects (kernel and host grouping) fail it.
 
+`gdn_gates` writes the GDN gates as values, `g = -exp(A_log) *
+softplus(a + dt_bias)` and `beta = sigmoid(b)`, dense `[rows, heads]` for
+`gdn_train`, with the helpers the inference kernels fold into their loads
+(`qwen35_softplus`, `qwen35_log_decay` in `kernels/qwen35_act.h`).
+`gdn_gates_bwd` writes `da`, `db` into the fused projection's a and b
+gradient columns and sums `dA_log`, `ddt_bias` per block in order. The
+softplus derivative is torch's (1 above 20); in f32 that branch and the
+smooth one agree to the last bit wherever both are finite (`sigmoid(20)`
+rounds to 1), so its test is the forward past 88, where only the threshold
+keeps `e^x` from overflowing. Within 7e-7 of the f64 reference through the
+threshold, the series range and block edges; ten of twelve injected defects
+fail it, the other two (moving or removing the backward's threshold) being
+f32-equivalent. `copy_cols` moves a column window between layouts (q, k, v
+between the conv output and `gdn_train`'s dense operands).
+
 ### Training attention: `tessl::attn_train`
 
 `attn_train_forward` is `attn_prefill`'s tiled kernel at its default

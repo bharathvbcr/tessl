@@ -1,6 +1,7 @@
 // Backward of the Qwen3.5 row-local ops: RMSNorm, the GDN gated RMSNorm,
-// SwiGLU, the attention output gate, the GDN causal conv + SiLU, the
-// attention Q/K norm + partial RoPE and the embedding gather.
+// SwiGLU, the attention output gate, the GDN causal conv + SiLU, the GDN
+// gates, the attention Q/K norm + partial RoPE and the embedding gather; and
+// a column-window copy for moving operands between fused and dense layouts.
 //
 // Every operand keeps the forward's layout, windows included (`ld`, `off`),
 // so a gradient lands where the next GEMM backward reads it: dgate/dup side by
@@ -608,4 +609,85 @@ kernel void qwen35_embed_rows_bwd_f32(
         s += dh[(ulong)pos[i] * hidden + col];
     }
     dw[(ulong)uniq[u] * hidden + col] += s;
+}
+
+// --------------------------------------------------------------- GDN gates ---
+
+/// Backward of `qwen35_gdn_gates_f32` (`g = -exp(A_log) * softplus(a +
+/// dt_bias)`, `beta = sigmoid(b)`), from `dg`, `dbeta` `[rows, H]`:
+///
+///   da       = dg * -exp(A_log) * softplus'(a + dt_bias)
+///   db       = dbeta * beta * (1 - beta)
+///   dA_log  += dg * g           ddt_bias += da        (sums over rows)
+///
+/// with torch's softplus derivative: 1 above the threshold (20), sigmoid
+/// below. `da` and `db` go to the a and b columns of the fused projection's
+/// gradient `dp` (the projection's row stride). The sums are per block of
+/// `rows_per_block` rows: `part[blk, h]` for dA_log, `part[nblocks + blk, h]`
+/// for ddt_bias, summed over blocks in order by `qwen35_col_sum_blocks_f32`.
+///
+/// Grid: x = head in [0, H), y = block.
+kernel void qwen35_gdn_gates_bwd_f32(
+    device const float *p [[buffer(0)]],
+    device const float *a_log [[buffer(1)]],
+    device const float *dt_bias [[buffer(2)]],
+    device const float *dg [[buffer(3)]],
+    device const float *dbeta [[buffer(4)]],
+    device float *dp [[buffer(5)]],
+    device float *part [[buffer(6)]],
+    constant uint &rows [[buffer(7)]],
+    constant uint &H [[buffer(8)]],
+    constant uint &ld [[buffer(9)]],
+    constant uint &a_off [[buffer(10)]],
+    constant uint &b_off [[buffer(11)]],
+    constant uint &rows_per_block [[buffer(12)]],
+    uint2 gid [[thread_position_in_grid]])
+{
+    const uint h = gid.x;
+    const ulong blk = gid.y;
+    const ulong r0 = blk * rows_per_block;
+    if (h >= H || r0 >= rows) return;
+    const ulong r1 = min((ulong)rows, r0 + rows_per_block);
+    const ulong nblocks = ((ulong)rows + rows_per_block - 1) / rows_per_block;
+    const float neg_a = -exp(a_log[h]);
+    float acc_log = 0.0f, acc_dt = 0.0f;
+    for (ulong r = r0; r < r1; ++r) {
+        device const float *row = p + r * ld;
+        device float *drow = dp + r * ld;
+        const ulong o = r * H + h;
+        const float x = row[a_off + h] + dt_bias[h];
+        const float sp_grad = x > 20.0f ? 1.0f : qwen35_sigmoid(x);
+        const float da = dg[o] * neg_a * sp_grad;
+        const float s = qwen35_sigmoid(row[b_off + h]);
+        drow[a_off + h] = da;
+        drow[b_off + h] = dbeta[o] * s * (1.0f - s);
+        acc_log += dg[o] * qwen35_log_decay(row[a_off + h], a_log[h], dt_bias[h]);
+        acc_dt += da;
+    }
+    part[blk * H + h] = acc_log;
+    part[(nblocks + blk) * H + h] = acc_dt;
+}
+
+// ------------------------------------------------------------ window copy ---
+
+/// `dst[r, dst_off + c] = src[r, src_off + c]` for `c < width`: a column
+/// window of one row-major matrix into another's (the GDN's q, k, v between
+/// the conv output and the training op's dense operands, both ways).
+///
+/// Grid: x = column in [0, width), y = row.
+kernel void qwen35_copy_cols_f32(
+    device const float *src [[buffer(0)]],
+    device float *dst [[buffer(1)]],
+    constant uint &rows [[buffer(2)]],
+    constant uint &width [[buffer(3)]],
+    constant uint &ld_src [[buffer(4)]],
+    constant uint &src_off [[buffer(5)]],
+    constant uint &ld_dst [[buffer(6)]],
+    constant uint &dst_off [[buffer(7)]],
+    uint2 gid [[thread_position_in_grid]])
+{
+    const uint c = gid.x;
+    const uint r = gid.y;
+    if (c >= width || r >= rows) return;
+    dst[(ulong)r * ld_dst + dst_off + c] = src[(ulong)r * ld_src + src_off + c];
 }

@@ -60,6 +60,17 @@ All notable changes to `tessl` are recorded here. The format follows
   block walking the KV head's query heads in order, each gradient written
   once, no atomics. Kernels `qwen35_attn_bwd_dvec_f32`,
   `qwen35_attn_bwd_{dq,dk,dv}_h256_q32_k32_sg4`.
+- **GDN gates for training (`qwen35::gdn_gates`, `qwen35_bwd::gdn_gates_bwd`)**:
+  `g = -exp(A_log) * softplus(a + dt_bias)` and `beta = sigmoid(b)` written
+  dense `[rows, heads]` for `gdn_train`, and their backward into the fused
+  projection's a/b gradient columns with deterministic `dA_log`, `ddt_bias`.
+  torch's softplus and the log decay move to `kernels/qwen35_act.h`
+  (`qwen35_softplus`, `qwen35_log_decay`), shared with the inference loads.
+  `qwen35_bwd::copy_cols` moves a column window between layouts. Kernels
+  `qwen35_gdn_gates_f32`, `qwen35_gdn_gates_bwd_f32`, `qwen35_copy_cols_f32`.
+- **qwen35_gdn.metal compiles under -Wall -Werror again**: the 16-column
+  scan's threadgroup-memory constant gets the 32 KB static_assert its
+  siblings have (the current compiler rejected it as unused).
 - **msl_emu host contract**: macro instantiations are expanded by a small
   preprocessor (nested macros, object-like parameter macros), the
   TensorOps backward's signatures and `src/attn_train.rs`'s binds are

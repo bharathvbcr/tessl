@@ -691,6 +691,55 @@ fn conv1d_silu_impl(
 
 // --------------------------------------------------------------------- GDN ---
 
+/// The GDN gates as values, for the training op: `g[r, h] = -exp(A_log[h]) *
+/// softplus(a[r, h] + dt_bias[h])` and `beta[r, h] = sigmoid(b[r, h])`, each
+/// written dense `[rows, heads]` f32, from the raw logits in the fused
+/// projection. The inference kernels compute the same values in their loads,
+/// with the same helpers (`kernels/qwen35_act.h`).
+#[allow(clippy::too_many_arguments)]
+pub fn gdn_gates(
+    rt: &Arc<GpuRuntime>,
+    logits: &GdnGateLogits<'_>,
+    params: &GdnParams<'_>,
+    g: &GpuBuffer,
+    beta: &GpuBuffer,
+    rows: u32,
+    heads: u32,
+) -> Result<(), String> {
+    const WHAT: &str = "qwen35::gdn_gates";
+    let r = u64::from(rows);
+    for (off, name) in [(logits.a_off, "a"), (logits.b_off, "b")] {
+        let c = Cols { buf: logits.buf, ld: logits.ld, off };
+        require_window::<f32>(rt, c, r, u64::from(heads), &format!("{WHAT} {name}"))?;
+    }
+    let n = usize_product(&[rows as usize, heads as usize], WHAT)?;
+    require::<f32>(rt, params.a_log, heads as usize, &format!("{WHAT} a_log"))?;
+    require::<f32>(rt, params.dt_bias, heads as usize, &format!("{WHAT} dt_bias"))?;
+    require::<f32>(rt, g, n, &format!("{WHAT} g"))?;
+    require::<f32>(rt, beta, n, &format!("{WHAT} beta"))?;
+    require_disjoint_writes(
+        WHAT,
+        &[("g", g), ("beta", beta)],
+        &[("logits", logits.buf), ("a_log", params.a_log), ("dt_bias", params.dt_bias)],
+    )?;
+    if n == 0 {
+        return Ok(());
+    }
+    let p = rt.pipeline("qwen35_gdn_gates_f32")?;
+    dispatch_2d(rt, &p, heads as usize, rows as usize, |bnd| {
+        set_gpu_buf(bnd, logits.buf, 0);
+        set_gpu_buf(bnd, params.a_log, 1);
+        set_gpu_buf(bnd, params.dt_bias, 2);
+        set_gpu_buf(bnd, g, 3);
+        set_gpu_buf(bnd, beta, 4);
+        set_u32(bnd, rows, 5);
+        set_u32(bnd, heads, 6);
+        set_u32(bnd, logits.ld, 7);
+        set_u32(bnd, logits.a_off, 8);
+        set_u32(bnd, logits.b_off, 9);
+    })
+}
+
 /// Shape of one GDN call.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct GdnDims {

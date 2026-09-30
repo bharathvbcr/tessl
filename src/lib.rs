@@ -76,7 +76,7 @@
 //! | [`ab_flags`], [`infer_trace`], [`icb_smoke`], [`npy`] | Tuning switches, tracing, smoke tests, and `.npy` I/O for benchmark parity |
 //! | [`safetensors`] | A strict `.safetensors` reader, to load checkpoints straight from the Hugging Face cache |
 //! | [`cross_entropy`] | LM-head cross-entropy and its gradients over the supervised rows, in vocabulary chunks |
-//! | [`qwen35_bwd`] | Backward of the Qwen3.5 row-local ops: RMSNorm, gated RMSNorm, SwiGLU, output gate, causal conv + SiLU, Q/K norm + RoPE, embedding |
+//! | [`qwen35_bwd`] | Backward of the Qwen3.5 row-local ops: RMSNorm, gated RMSNorm, SwiGLU, output gate, causal conv + SiLU, GDN gates, Q/K norm + RoPE, embedding |
 //! | [`gdn_train`] | The gated delta rule for training: forward and backward at transformers' op seam |
 //! | [`attn_train`] | Full attention for training: the forward with its log-sum-exp, and the backward |
 //! | [`capi`] | The C ABI (`libtessl.dylib`) that `python/tessl_torch` calls through `ctypes` |
@@ -98,7 +98,7 @@
 //!
 //! # Kernels
 //!
-//! 29 Metal sources compile to 192 kernel entry points: RMSNorm, gated MLP
+//! 29 Metal sources compile to 195 kernel entry points: RMSNorm, gated MLP
 //! activations, flash attention (sliding-window and global), fused
 //! RMSNorm+QKV+RoPE, MLX-format Q4 GEMV/GEMM, Q8 GEMV, an exact int8 GEMM, KV
 //! cache stores, embedding lookup, row-wise softmax/sum/max, and softcap

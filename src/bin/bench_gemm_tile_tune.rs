@@ -110,8 +110,41 @@ const VARIANTS: &[Variant] = &[
     },
 ];
 
+/// Exact-f32 (non-relaxed) coop variants, measured against production's exact
+/// f32 NN (32x32, one simdgroup, zero pre-pass) on f32 operands. Qwen35's
+/// `train_step` runs every GEMM on that kernel.
+const F32_VARIANTS: &[Variant] = &[
+    Variant {
+        kernel: "mm_f32_exact_coop_64x64_sg4",
+        sm: 64,
+        sn: 64,
+        bk: 1,
+        nsg: 4,
+        needs_zero: false,
+    },
+    Variant {
+        kernel: "mm_f32_exact_coop_128x64_sg4",
+        sm: 128,
+        sn: 64,
+        bk: 1,
+        nsg: 4,
+        needs_zero: false,
+    },
+    Variant {
+        kernel: "mm_f32_exact_coop_128x64_sg8",
+        sm: 128,
+        sn: 64,
+        bk: 1,
+        nsg: 8,
+        needs_zero: false,
+    },
+];
+
 const SHAPES: &[(usize, usize, usize, &str)] = &[
     (2048, 2048, 2048, "square_2048"),
+    // Qwen3.5-2B at T = 2048: MLP up/gate and down.
+    (2048, 6144, 2048, "q35_mlp_up"),
+    (2048, 2048, 6144, "q35_mlp_down"),
     (4096, 4096, 4096, "square_4096"),
     (8192, 3072, 768, "mlp_up"),
     (8192, 768, 3072, "mlp_down"),
@@ -200,7 +233,7 @@ fn main() -> Result<(), String> {
         "{:<32}{:>12}{:>14}{:>16}",
         "kernel", "maxTPTG", "tgMem(B)", "requested TPTG"
     );
-    for v in VARIANTS {
+    for v in VARIANTS.iter().chain(F32_VARIANTS) {
         match rt.pipeline(v.kernel) {
             Ok(p) => {
                 let w = p.threadExecutionWidth();
@@ -223,95 +256,131 @@ fn main() -> Result<(), String> {
         b.buffer.write_f32(&fill(k * n, 2));
         let a_bf = cast_f32_to_bf16(&a)?;
         let b_bf = cast_f32_to_bf16(&b)?;
+        sweep(
+            &rt,
+            "bf16",
+            VARIANTS,
+            &a_bf,
+            &b_bf,
+            (m, n, k),
+            label,
+            warmup,
+            iters,
+        )?;
+        sweep(
+            &rt,
+            "exact f32",
+            F32_VARIANTS,
+            &a,
+            &b,
+            (m, n, k),
+            label,
+            warmup,
+            iters,
+        )?;
+    }
+    Ok(())
+}
 
-        // Production reference.
-        let c_ref = rt.alloc_tensor_f32(&[m, n])?;
-        gemm(&a_bf, &b_bf, &c_ref, GemmBackend::TensorOps)?;
-        rt.synchronize()?;
-        let refv = c_ref.buffer.read_f32()[..m * n].to_vec();
-        let refmax = refv.iter().fold(0f32, |acc, x| acc.max(x.abs())) as f64;
+/// Time production `gemm` on `a`, `b` (bf16 or f32 operands pick the kernel),
+/// then every variant, each checked against production's output first.
+fn sweep(
+    rt: &std::sync::Arc<GpuRuntime>,
+    lane: &str,
+    variants: &[Variant],
+    a: &Tensor,
+    b: &Tensor,
+    (m, n, k): (usize, usize, usize),
+    label: &str,
+    warmup: usize,
+    iters: usize,
+) -> Result<(), String> {
+    let c_ref = rt.alloc_tensor_f32(&[m, n])?;
+    gemm(a, b, &c_ref, GemmBackend::TensorOps)?;
+    rt.synchronize()?;
+    let refv = c_ref.buffer.read_f32()[..m * n].to_vec();
+    let refmax = refv.iter().fold(0f32, |acc, x| acc.max(x.abs())) as f64;
 
-        let flop = 2.0 * m as f64 * n as f64 * k as f64;
-        let prod = {
-            for _ in 0..warmup {
-                gemm(&a_bf, &b_bf, &c_ref, GemmBackend::TensorOps)?;
-                rt.synchronize()?;
-            }
-            let mut s = Vec::new();
-            for _ in 0..iters {
-                let t0 = Instant::now();
-                gemm(&a_bf, &b_bf, &c_ref, GemmBackend::TensorOps)?;
-                rt.synchronize()?;
-                s.push(t0.elapsed().as_secs_f64() * 1000.0);
-            }
-            median(s)
-        };
-        println!(
-            "\n{label}  M={m} N={n} K={k}   production {prod:.3} ms  {:.0} GFLOP/s",
-            flop / (prod * 1e6)
-        );
-        println!(
-            "  {:<32}{:>10}{:>12}{:>9}{:>12}",
-            "variant", "ms", "GFLOP/s", "vs prod", "max_rel_err"
-        );
-
-        for v in VARIANTS {
-            if m % v.sm != 0 || n % v.sn != 0 || k % v.bk != 0 {
-                println!("  {:<32}{:>10}", v.kernel, "skip(div)");
-                continue;
-            }
-            let c = rt.alloc_tensor_f32(&[m, n])?;
-            if run_variant(&rt, v, &a_bf, &b_bf, &c, m, n, k).is_err() {
-                println!("  {:<32}{:>10}", v.kernel, "skip(pipe)");
-                continue;
-            }
+    let flop = 2.0 * m as f64 * n as f64 * k as f64;
+    let prod = {
+        for _ in 0..warmup {
+            gemm(a, b, &c_ref, GemmBackend::TensorOps)?;
             rt.synchronize()?;
-            let got = c.buffer.read_f32()[..m * n].to_vec();
-            let err = got
-                .iter()
-                .zip(&refv)
-                .map(|(x, y)| (*x as f64 - *y as f64).abs())
-                .fold(0.0, f64::max)
-                / refmax;
-
-            for _ in 0..warmup {
-                run_variant(&rt, v, &a_bf, &b_bf, &c, m, n, k)?;
-                rt.synchronize()?;
-            }
-            let mut s = Vec::new();
-            for _ in 0..iters {
-                let t0 = Instant::now();
-                run_variant(&rt, v, &a_bf, &b_bf, &c, m, n, k)?;
-                rt.synchronize()?;
-                s.push(t0.elapsed().as_secs_f64() * 1000.0);
-            }
-            let med = median(s);
-            println!(
-                "  {:<32}{:>10.3}{:>12.0}{:>8.2}×{:>12.2e}",
-                v.kernel,
-                med,
-                flop / (med * 1e6),
-                prod / med,
-                err
-            );
         }
+        let mut s = Vec::new();
+        for _ in 0..iters {
+            let t0 = Instant::now();
+            gemm(a, b, &c_ref, GemmBackend::TensorOps)?;
+            rt.synchronize()?;
+            s.push(t0.elapsed().as_secs_f64() * 1000.0);
+        }
+        median(s)
+    };
+    println!(
+        "\n{label} [{lane}]  M={m} N={n} K={k}   production {prod:.3} ms  {:.0} GFLOP/s",
+        flop / (prod * 1e6)
+    );
+    println!(
+        "  {:<32}{:>10}{:>12}{:>9}{:>12}",
+        "variant", "ms", "GFLOP/s", "vs prod", "max_rel_err"
+    );
 
-        let prod_after = {
-            let mut s = Vec::new();
-            for _ in 0..iters {
-                let t0 = Instant::now();
-                gemm(&a_bf, &b_bf, &c_ref, GemmBackend::TensorOps)?;
-                rt.synchronize()?;
-                s.push(t0.elapsed().as_secs_f64() * 1000.0);
-            }
-            median(s)
-        };
+    for v in variants {
+        if m % v.sm != 0 || n % v.sn != 0 || k % v.bk != 0 {
+            println!("  {:<32}{:>10}", v.kernel, "skip(div)");
+            continue;
+        }
+        let c = rt.alloc_tensor_f32(&[m, n])?;
+        if run_variant(rt, v, a, b, &c, m, n, k).is_err() {
+            println!("  {:<32}{:>10}", v.kernel, "skip(pipe)");
+            continue;
+        }
+        rt.synchronize()?;
+        let got = c.buffer.read_f32()[..m * n].to_vec();
+        let err = got
+            .iter()
+            .zip(&refv)
+            .map(|(x, y)| (*x as f64 - *y as f64).abs())
+            .fold(0.0, f64::max)
+            / refmax;
+
+        for _ in 0..warmup {
+            run_variant(rt, v, a, b, &c, m, n, k)?;
+            rt.synchronize()?;
+        }
+        let mut s = Vec::new();
+        for _ in 0..iters {
+            let t0 = Instant::now();
+            run_variant(rt, v, a, b, &c, m, n, k)?;
+            rt.synchronize()?;
+            s.push(t0.elapsed().as_secs_f64() * 1000.0);
+        }
+        let med = median(s);
         println!(
-            "  production re-measured after: {prod_after:.3} ms ({:.0} GFLOP/s) \
-— drift vs before: {:+.1}%",
-            flop / (prod_after * 1e6),
-            (prod_after / prod - 1.0) * 100.0
+            "  {:<32}{:>10.3}{:>12.0}{:>8.2}×{:>12.2e}",
+            v.kernel,
+            med,
+            flop / (med * 1e6),
+            prod / med,
+            err
         );
     }
+
+    let prod_after = {
+        let mut s = Vec::new();
+        for _ in 0..iters {
+            let t0 = Instant::now();
+            gemm(a, b, &c_ref, GemmBackend::TensorOps)?;
+            rt.synchronize()?;
+            s.push(t0.elapsed().as_secs_f64() * 1000.0);
+        }
+        median(s)
+    };
+    println!(
+        "  production re-measured after: {prod_after:.3} ms ({:.0} GFLOP/s) \
+— drift vs before: {:+.1}%",
+        flop / (prod_after * 1e6),
+        (prod_after / prod - 1.0) * 100.0
+    );
     Ok(())
 }

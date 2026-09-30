@@ -38,7 +38,7 @@ flowchart TD
     PyHarness -->|In-Process Dispatch| MLX
 ```
 
-The A/B rig is 47 measurement-only kernels and is **not** in the default
+The A/B rig is 50 measurement-only kernels and is **not** in the default
 metallib — linking it took the shipped artifact from 0.22 MB to 1.09 MB. Opt in:
 
 ```bash

@@ -116,8 +116,11 @@ TUNE_KERNEL(mm_bf16_256x64_bk256_sg8,   256,  64, 256, 8, false)
 // =============================================================================
 
 // A call with no explicit template arguments is `mm_bf16_coop_64x32_sg4`.
-template <int SM = 64, int SN = 32, int NSG = 4>
-inline void mm_bf16_coop(device bfloat *A, device bfloat *B, device float *C,
+// ElemT = float is the exact-f32 (non-relaxed) descriptor: production's exact
+// f32 NN runs 32x32 on one simdgroup with a zero pre-pass (`TILE_F32`), with
+// no register accumulator; these variants ask whether one pays at f32.
+template <int SM = 64, int SN = 32, int NSG = 4, typename ElemT = bfloat>
+inline void mm_bf16_coop(device ElemT *A, device ElemT *B, device float *C,
                          uint M, uint N, uint K, uint tiles_n, uint tgpig) {
     constexpr auto d = matmul2d_descriptor(
         SM, SN, dynamic_length_v<int>, false, false, false,
@@ -177,6 +180,21 @@ TUNE_COOP_KERNEL(mm_bf16_coop_128x64_sg4,  128,  64, 4)
 TUNE_COOP_KERNEL(mm_bf16_coop_128x64_sg8,  128,  64, 8)
 TUNE_COOP_KERNEL(mm_bf16_coop_128x128_sg8, 128, 128, 8)
 TUNE_COOP_KERNEL(mm_bf16_coop_256x64_sg8,  256,  64, 8)
+
+#define TUNE_COOP_KERNEL_F32(NAME, SM, SN, NSG)                                \
+    kernel void NAME(device float *A [[buffer(0)]],                            \
+                     device float *B [[buffer(1)]],                            \
+                     device float *C [[buffer(2)]],                            \
+                     constant uint &M [[buffer(3)]],                           \
+                     constant uint &N [[buffer(4)]],                           \
+                     constant uint &K [[buffer(5)]],                           \
+                     constant uint &tiles_n [[buffer(6)]],                     \
+                     uint tgpig [[threadgroup_position_in_grid]]) {            \
+        mm_bf16_coop<SM, SN, NSG, float>(A, B, C, M, N, K, tiles_n, tgpig);    \
+    }
+TUNE_COOP_KERNEL_F32(mm_f32_exact_coop_64x64_sg4,   64, 64, 4)
+TUNE_COOP_KERNEL_F32(mm_f32_exact_coop_128x64_sg4, 128, 64, 4)
+TUNE_COOP_KERNEL_F32(mm_f32_exact_coop_128x64_sg8, 128, 64, 8)
 
 // =============================================================================
 // TN / NT / accumulate coop round (training backward lanes), plus a grid

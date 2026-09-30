@@ -107,7 +107,7 @@ fn main() {
 
     // TensorOps kernels — Metal 4 dialect (macOS 26+ / MPP). Hard-fail: NAX GEMM
     // is the hot path; a simdgroup-only metallib is not acceptable.
-    // The GEMM A/B rig (kernels/tune/) is 47 measurement-only kernels that
+    // The GEMM A/B rig (kernels/tune/) is 50 measurement-only kernels that
     // nothing dispatches at runtime, so it stays opt-in to keep the shipped
     // metallib small. It lives in a subdirectory precisely so the directory
     // glob below cannot pick it up by accident.

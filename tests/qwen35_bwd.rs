@@ -13,9 +13,10 @@ use std::sync::Arc;
 
 use common::qwen35::{sigmoid, silu};
 use common::{buf, random_f32, seeded, with_gpu};
-use tessl::qwen35::Cols;
+use tessl::qwen35::{AttnShape, Cols};
 use tessl::qwen35_bwd::{
-    attn_gate_bwd, conv1d_silu_bwd, conv1d_silu_bwd_part_len, gated_rms_norm_bwd, gated_rms_norm_bwd_part_len, rms_norm_bwd, rms_norm_bwd_part_len, swiglu_bwd,
+    attn_gate_bwd, attn_qk_norm_rope_bwd, attn_qk_norm_rope_bwd_part_len, conv1d_silu_bwd, conv1d_silu_bwd_part_len, gated_rms_norm_bwd,
+    gated_rms_norm_bwd_part_len, rms_norm_bwd, rms_norm_bwd_part_len, swiglu_bwd, AttnQkvGrads,
 };
 use tessl::tensor::GpuBuffer;
 use tessl::GpuRuntime;
@@ -466,5 +467,176 @@ fn conv_backward_refuses_bad_layouts() {
         e(run(w(&a, 0), 4, w(&b, 0), w(&c, 0), &a, &part, 8), "dw");
         e(run(w(&a, 0), 4, w(&b, 0), w(&c, 0), &dwb, &part, 40), "conv1d_silu_bwd x: buffer holds");
         e(run(w(&a, 0), 4, w(&b, 0), w(&c, 0), &buf(rt, &[0.0; 8]), &part, 8), "dw");
+    });
+}
+
+// ------------------------------------------------- Q/K norm + partial RoPE ---
+
+/// cos and sin of transformers' angle for pair `p`, the angle formed in f32
+/// as the model forms it (see `common::qwen35::norm_rope_row_f64`).
+fn rope_cs(p: usize, rot: usize, pos: usize, theta: f64) -> (f64, f64) {
+    let inv_freq = 1.0f32 / (theta as f32).powf((2 * p) as f32 / rot as f32);
+    let angle = f64::from(pos as f32 * inv_freq);
+    (angle.cos(), angle.sin())
+}
+
+/// One head row through the `(1 + w)` norm and partial RoPE, in f64.
+fn norm_rope_fwd(x: &[f64], w: &[f64], rot: usize, pos: usize, theta: f64, eps: f64) -> Vec<f64> {
+    let d = x.len();
+    let rstd = 1.0 / (x.iter().map(|v| v * v).sum::<f64>() / d as f64 + eps).sqrt();
+    let mut n: Vec<f64> = x.iter().zip(w).map(|(v, wi)| v * rstd * (1.0 + wi)).collect();
+    let half = rot / 2;
+    for p in 0..half {
+        let (c, s) = rope_cs(p, rot, pos, theta);
+        let (n0, n1) = (n[p], n[p + half]);
+        n[p] = n0 * c - n1 * s;
+        n[p + half] = n1 * c + n0 * s;
+    }
+    n
+}
+
+/// `(dx, dw)` of [`norm_rope_fwd`] for the output gradient `g`.
+fn norm_rope_bwd(x: &[f64], w: &[f64], g: &[f64], rot: usize, pos: usize, theta: f64, eps: f64) -> (Vec<f64>, Vec<f64>) {
+    let d = x.len();
+    let rstd = 1.0 / (x.iter().map(|v| v * v).sum::<f64>() / d as f64 + eps).sqrt();
+    let mut dn = g.to_vec();
+    let half = rot / 2;
+    for p in 0..half {
+        let (c, s) = rope_cs(p, rot, pos, theta);
+        dn[p] = g[p] * c + g[p + half] * s;
+        dn[p + half] = g[p + half] * c - g[p] * s;
+    }
+    let xn: Vec<f64> = x.iter().map(|v| v * rstd).collect();
+    let dxn: Vec<f64> = dn.iter().zip(w).map(|(a, wi)| a * (1.0 + wi)).collect();
+    let m = dxn.iter().zip(&xn).map(|(a, b)| a * b).sum::<f64>() / d as f64;
+    let dx = dxn.iter().zip(&xn).map(|(a, b)| rstd * (a - b * m)).collect();
+    let dw = dn.iter().zip(&xn).map(|(a, b)| a * b).collect();
+    (dx, dw)
+}
+
+#[test]
+fn qk_norm_rope_reference_backward_is_the_derivative() {
+    for (d, rot, pos) in [(8, 8, 3), (10, 4, 7), (6, 0, 1), (12, 6, 40)] {
+        let x = f64s(&random_f32(d, 51));
+        let w = f64s(&random_f32(d, 52));
+        let g = f64s(&random_f32(d, 53));
+        let (dx, dw) = norm_rope_bwd(&x, &w, &g, rot, pos, 1e4, 1e-6);
+        let loss = |x: &[f64], w: &[f64]| norm_rope_fwd(x, w, rot, pos, 1e4, 1e-6).iter().zip(&g).map(|(a, b)| a * b).sum::<f64>();
+        fd_check("qk dx", &x, &dx, &|v| loss(v, &w));
+        fd_check("qk dw", &w, &dw, &|v| loss(&x, v));
+    }
+    // The forward here is the transformers-anchored one the forward kernel
+    // is checked against.
+    let (x, w) = (random_f32(256, 54), random_f32(256, 55));
+    let want = common::qwen35::norm_rope_row_f64(&x, &w, 64, 1234, 1e7, 1e-6);
+    let got = norm_rope_fwd(&f64s(&x), &f64s(&w), 64, 1234, 1e7, 1e-6);
+    assert!(got.iter().zip(&want).all(|(a, b)| (a - b).abs() <= 1e-12), "norm_rope_fwd is not the tested forward");
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_qk(rt: &Arc<GpuRuntime>, b: usize, t: usize, hq: usize, hkv: usize, d: usize, rot: usize, theta: f32, seed: u64) {
+    let eps = 1e-6f32;
+    let rows = b * t;
+    let width = 2 * (hq + hkv) * d;
+    let (ld, off) = (width + 5, 3usize);
+    let shape = AttnShape { batch: b as u32, seq: t as u32, q_heads: hq as u32, kv_heads: hkv as u32, head_dim: d as u32, rotary_dim: rot as u32 };
+    let p: Vec<f32> = random_f32(rows * ld, seed).iter().map(|v| 3.0 * v).collect();
+    let (qw, kw) = (random_f32(d, seed + 1), random_f32(d, seed + 2));
+    let (dq, dk, dv) = (random_f32(rows * hq * d, seed + 3), random_f32(rows * hkv * d, seed + 4), random_f32(rows * hkv * d, seed + 5));
+    let (pb, qwb, kwb) = (buf(rt, &p), buf(rt, &qw), buf(rt, &kw));
+    let (dqb, dkb, dvb) = (buf(rt, &dq), buf(rt, &dk), buf(rt, &dv));
+    let dpb = seeded(rt, rows * ld, SENTINEL);
+    let (dqw, dkw) = (seeded(rt, d, SENTINEL), seeded(rt, d, SENTINEL));
+    let part = seeded(rt, attn_qk_norm_rope_bwd_part_len(&shape).max(1), SENTINEL);
+    let grads = AttnQkvGrads { dq: &dqb, dk: &dkb, dv: &dvb };
+    let call = || {
+        attn_qk_norm_rope_bwd(rt, &shape, win(&pb, ld, off), &qwb, &kwb, &grads, &dpb, &dqw, &dkw, &part, theta, eps).unwrap();
+        rt.synchronize().unwrap();
+    };
+    call();
+    let (qw64, kw64) = (f64s(&qw), f64s(&kw));
+    let (mut want_dp, mut got_dp) = (Vec::new(), Vec::new());
+    let (mut want_dqw, mut want_dkw) = (vec![0.0f64; d], vec![0.0f64; d]);
+    let dp = dpb.read_f32();
+    let mut touched = 0usize;
+    for r in 0..rows {
+        let pos = r % t;
+        let base = r * ld + off;
+        let mut head = |col: usize, w: &[f64], g: &[f32], acc: &mut Vec<f64>| {
+            let x = f64s(&p[base + col..base + col + d]);
+            let (dx, dw) = norm_rope_bwd(&x, w, &f64s(g), rot, pos, f64::from(theta), f64::from(eps));
+            want_dp.extend(dx);
+            got_dp.extend_from_slice(&dp[base + col..base + col + d]);
+            acc.iter_mut().zip(dw).for_each(|(a, v)| *a += v);
+        };
+        for h in 0..hq {
+            head(h * 2 * d, &qw64, &dq[(r * hq + h) * d..][..d], &mut want_dqw);
+        }
+        for h in 0..hkv {
+            head(2 * hq * d + h * d, &kw64, &dk[(r * hkv + h) * d..][..d], &mut want_dkw);
+        }
+        for h in 0..hkv {
+            let col = base + 2 * hq * d + hkv * d + h * d;
+            want_dp.extend(f64s(&dv[(r * hkv + h) * d..][..d]));
+            got_dp.extend_from_slice(&dp[col..col + d]);
+        }
+        touched += (hq + 2 * hkv) * d;
+    }
+    let label = format!("qk b={b} t={t} hq={hq} hkv={hkv} d={d} rot={rot}");
+    close(&format!("{label} dproj"), &got_dp, &want_dp);
+    assert_eq!(dp.iter().filter(|&&v| v != SENTINEL).count(), touched, "{label}: wrote outside the q, k, v columns");
+    let (first_q, first_k) = (dqw.read_f32(), dkw.read_f32());
+    close(&format!("{label} dq_norm_w"), &first_q, &want_dqw);
+    close(&format!("{label} dk_norm_w"), &first_k, &want_dkw);
+    call();
+    let same = |a: &[f32], b: &[f32]| a.iter().zip(b).all(|(x, y)| x.to_bits() == y.to_bits());
+    assert!(same(&dqw.read_f32(), &first_q) && same(&dkw.read_f32(), &first_k), "{label}: norm weight gradients changed on a rerun");
+}
+
+#[test]
+fn qk_norm_rope_backward_matches_across_blocks_and_layouts() {
+    with_gpu(|rt| {
+        run_qk(rt, 1, 1, 1, 1, 64, 64, 1e4, 1); // fully rotary, position 0
+        run_qk(rt, 3, 7, 2, 1, 32, 8, 1e4, 2); // positions restart per batch row
+        run_qk(rt, 1, 16, 2, 2, 64, 16, 1e4, 3); // exactly one block
+        run_qk(rt, 2, 17, 4, 2, 128, 32, 1e6, 4); // blocks straddle batch rows
+        run_qk(rt, 1, 20, 3, 1, 96, 24, 1e4, 5); // pairs split across lanes
+        run_qk(rt, 1, 5, 2, 1, 64, 0, 1e4, 6); // no rotary dims
+        run_qk(rt, 1, 300, 8, 2, 256, 64, 1e7, 7); // the 2B's heads
+        // No tokens: zero norm-weight gradients.
+        let shape = AttnShape { batch: 2, seq: 0, q_heads: 2, kv_heads: 1, head_dim: 32, rotary_dim: 8 };
+        let z = buf(rt, &[0.0; 256]);
+        let (dqw, dkw) = (seeded(rt, 32, SENTINEL), seeded(rt, 32, SENTINEL));
+        let grads = AttnQkvGrads { dq: &z, dk: &z, dv: &z };
+        let dp = seeded(rt, 256, SENTINEL);
+        attn_qk_norm_rope_bwd(rt, &shape, Cols::dense(&z, 192), &z, &z, &grads, &dp, &dqw, &dkw, &buf(rt, &[0.0; 1]), 1e4, 1e-6).unwrap();
+        rt.synchronize().unwrap();
+        assert!(dqw.read_f32().iter().chain(&dkw.read_f32()).all(|&v| v == 0.0), "seq = 0: norm gradients must be zeros");
+    });
+}
+
+#[test]
+fn qk_norm_rope_backward_refuses_bad_layouts() {
+    with_gpu(|rt| {
+        let e = |r: Result<(), String>, needle: &str| {
+            let m = r.expect_err(needle);
+            assert!(m.contains(needle), "{m:?} lacks {needle:?}");
+        };
+        let shape = AttnShape { batch: 1, seq: 4, q_heads: 2, kv_heads: 1, head_dim: 32, rotary_dim: 8 };
+        let (p, g, w) = (buf(rt, &[0.0; 1024]), buf(rt, &[0.0; 512]), buf(rt, &[0.0; 32]));
+        let (dp, dqw, dkw, part) = (buf(rt, &[0.0; 1024]), buf(rt, &[0.0; 32]), buf(rt, &[0.0; 32]), buf(rt, &[0.0; 64]));
+        let grads = AttnQkvGrads { dq: &g, dk: &g, dv: &g };
+        let run = |s: &AttnShape, dp: &GpuBuffer, part: &GpuBuffer, theta: f32| {
+            attn_qk_norm_rope_bwd(rt, s, Cols::dense(&p, 192), &w, &w, &grads, dp, &dqw, &dkw, part, theta, 1e-6)
+        };
+        run(&shape, &dp, &part, 1e4).expect("a valid call");
+        e(run(&AttnShape { rotary_dim: 7, ..shape }, &dp, &part, 1e4), "rotary_dim must be even");
+        e(run(&AttnShape { rotary_dim: 34, ..shape }, &dp, &part, 1e4), "rotary_dim must be even and at most head_dim");
+        e(run(&AttnShape { head_dim: 544, rotary_dim: 8, ..shape }, &dp, &part, 1e4), "head_dim must be at most 512");
+        e(run(&shape, &dp, &part, 0.0), "theta and eps");
+        e(run(&shape, &p, &part, 1e4), "dproj");
+        e(run(&shape, &dp, &buf(rt, &[0.0; 63]), 1e4), "part");
+        e(run(&AttnShape { seq: 6, ..shape }, &dp, &buf(rt, &[0.0; 64]), 1e4), "proj");
+        e(run(&shape, &dp, &dqw, 1e4), "part");
     });
 }

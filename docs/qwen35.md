@@ -614,6 +614,19 @@ defects fail it; the tenth drops the padding test, which makes the read
 wrap far past the buffer, and this GPU returned zeros there, so no output
 can tell.
 
+`attn_qk_norm_rope_bwd` takes the gradients of the rotated q, the rotated k
+and v (dense, as the forward wrote them with positions `0..seq`) back
+through the inverse rotation and the `(1 + w)` norms into the q, k and v
+columns of the fused projection's gradient; `attn_gate_bwd` fills the gate
+columns. The rotation's angle is `qwen35_rope_angle` in
+`kernels/qwen35_act.h`, the forward's own, so the inverse is its exact
+transpose. Against an f64 backward (checked against finite differences, its
+forward against the transformers-anchored `norm_rope_row_f64`) it is within
+2.4e-7 of the largest magnitude at short positions and 7.4e-6 at the 2B's
+heads over 300 positions, where one ulp of the f32 angle is 3e-5 rad; the
+cases cover full, partial, lane-splitting and zero rotary widths and blocks
+straddling batch rows. Fourteen of fourteen injected defects fail it.
+
 ## Performance
 
 `cargo run --release --bin bench_qwen35_layers` builds Qwen3.5-2B's shapes

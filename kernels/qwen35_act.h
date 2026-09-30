@@ -1,4 +1,5 @@
-// Overflow-free sigmoid and SiLU shared by the Qwen3.5 kernels.
+// Overflow-free sigmoid and SiLU, and the partial-RoPE angle, shared by the
+// Qwen3.5 kernels.
 //
 // The GDN gates (`beta = sigmoid(b)`, the conv's and the gated norm's SiLU),
 // the attention output gate and the MLP's SwiGLU all need the same sigmoid,
@@ -24,4 +25,19 @@ inline float qwen35_sigmoid(float x)
 inline float qwen35_silu(float x)
 {
     return x * qwen35_sigmoid(x);
+}
+
+/// transformers' partial-RoPE angle for rotary pair `p` of `rotary_dim` at
+/// position `pos`: `pos * theta^(-2p / rotary_dim)`. The attention forward
+/// and its backward both rotate with this, so the backward's inverse rotation
+/// is exactly the transpose of the forward's.
+///
+/// torch computes inv_freq, the angle and cos/sin in fp32. `precise::`
+/// throughout: the angle reaches tens of thousands of radians, where the fast
+/// approximations lose whole digits.
+inline float qwen35_rope_angle(uint p, uint rotary_dim, uint pos, float theta)
+{
+    const float inv_freq =
+        precise::divide(1.0f, precise::pow(theta, precise::divide((float)(2u * p), (float)rotary_dim)));
+    return (float)pos * inv_freq;
 }

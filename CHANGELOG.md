@@ -38,6 +38,13 @@ All notable changes to `tessl` are recorded here. The format follows
   `dx` into a window of the fused projection's gradient and a
   deterministic `dw [C, KW]`; the pre-activation is recomputed from `x`.
   Kernels `qwen35_conv1d_silu_bwd_dx_f32`, `qwen35_conv1d_silu_bwd_dw_f32`.
+- **Attention Q/K norm + partial RoPE backward
+  (`qwen35_bwd::attn_qk_norm_rope_bwd`)**: from the q/k/v gradients into
+  the fused projection's gradient (q, k, v columns; the gate's are
+  `attn_gate_bwd`'s), with deterministic `(1 + w)` gradients for both norms.
+  The RoPE angle is now one helper, `qwen35_rope_angle` in
+  `kernels/qwen35_act.h`, shared by the forward and the backward. Kernel
+  `qwen35_attn_qk_norm_rope_bwd_f32`.
 - **torch binding (`python/tessl_torch`) over a C ABI (`tessl::capi`)**:
   `tessl_torch.cross_entropy(hidden, weight, targets, mask)`, a
   `torch.autograd.Function` over MPS tensors, loaded with `ctypes` (no C++

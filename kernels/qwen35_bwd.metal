@@ -1,5 +1,6 @@
 // Backward of the Qwen3.5 row-local ops: RMSNorm, the GDN gated RMSNorm,
-// SwiGLU, the attention output gate and the GDN causal conv + SiLU.
+// SwiGLU, the attention output gate, the GDN causal conv + SiLU, and the
+// attention Q/K norm + partial RoPE.
 //
 // Every operand keeps the forward's layout, windows included (`ld`, `off`),
 // so a gradient lands where the next GEMM backward reads it: dgate/dup side by
@@ -408,5 +409,170 @@ kernel void qwen35_conv1d_silu_bwd_dw_f32(
     device float *out = dw_part + blk * ((ulong)C * KW) + (ulong)c * KW;
     for (uint j = 0u; j < KW; ++j) {
         out[j] = acc[j];
+    }
+}
+
+// ------------------------------------------------- Q/K norm + partial RoPE ---
+
+/// Simdgroups per threadgroup of `qwen35_attn_qk_norm_rope_bwd_f32`.
+constant uint QK_BWD_SG = 4;
+
+/// Backward of one head row of `qwen35_norm_rope_row`: `src` the forward's
+/// input row, `g` the gradient of its output. Writes the input's gradient to
+/// `dst` and adds this row's `(1 + w)` gradient to the lane's columns in `acc`.
+///
+///   n    = x * rstd * (1 + w), then RoPE on the first `rotary_dim` dims
+///   dn   = R(pos)^T g on the rotary dims (pair p, p + half), g elsewhere
+///   dx   = rstd * (dn (1 + w) - xn * mean(dn (1 + w) xn)),  xn = x * rstd
+///   dw  += dn * xn
+///
+/// Each lane owns columns `lane + 32k` and rotates them itself, so a pair's
+/// two columns need not share a lane.
+inline void qwen35_norm_rope_row_bwd(
+    device const float *src,
+    device const float *weight,
+    device const float *g,
+    device float *dst,
+    uint D,
+    uint rotary_dim,
+    uint pos,
+    float theta,
+    float eps,
+    uint lane,
+    thread float *acc)
+{
+    float ss = 0.0f;
+    for (uint d = lane; d < D; d += 32u) {
+        ss += src[d] * src[d];
+    }
+    const float rstd = rsqrt(simd_sum(ss) / (float)D + eps);
+    const uint half_rot = rotary_dim / 2u;
+    float dn[BWD_MAX_COLS];
+    float dot = 0.0f;
+    uint k = 0;
+    for (uint d = lane; d < D; d += 32u, ++k) {
+        float v;
+        if (d < rotary_dim) {
+            const uint p = d < half_rot ? d : d - half_rot;
+            const float angle = qwen35_rope_angle(p, rotary_dim, pos, theta);
+            const float c = precise::cos(angle);
+            const float s = precise::sin(angle);
+            // out[p] = n0 c - n1 s, out[p + half] = n1 c + n0 s.
+            v = d < half_rot ? g[p] * c + g[p + half_rot] * s : g[d] * c - g[p] * s;
+        } else {
+            v = g[d];
+        }
+        dn[k] = v;
+        dot += v * (1.0f + weight[d]) * src[d] * rstd;
+    }
+    const float m = simd_sum(dot) / (float)D;
+    k = 0;
+    for (uint d = lane; d < D; d += 32u, ++k) {
+        const float xn = src[d] * rstd;
+        dst[d] = rstd * (dn[k] * (1.0f + weight[d]) - xn * m);
+        acc[k] += dn[k] * xn;
+    }
+}
+
+/// Backward of `qwen35_attn_qk_norm_rope` as training runs it (token t of each
+/// batch row at position t, caches `[B, T, Hkv, D]`), over the fused
+/// projection window `p` the forward read:
+///
+///   * query head h: `dq [B*T, Hq, D]` back through RoPE and the q norm into
+///     columns `q_off + h*2D ..+D` of `dp` (the gate columns after it are
+///     `qwen35_attn_gate_bwd_f32`'s);
+///   * key head h: `dk [B*T, Hkv, D]` likewise into `k_off + h*D`;
+///   * value head h: `dv [B*T, Hkv, D]` copied into `v_off + h*D`.
+///
+/// `dp` has `p`'s row stride. One simdgroup per (token, head) unit, as in the
+/// forward; each threadgroup takes `rows_per_block` tokens' units, and the
+/// (1 + w) gradients are summed per block, simdgroups in order, into
+/// `part[block, :]` (q norm) and `part[nblocks + block, :]` (k norm).
+///
+/// Grid: ceil(B*T / rows_per_block) threadgroups of QK_BWD_SG * 32 threads,
+/// `D <= 32 * BWD_MAX_COLS`.
+kernel void qwen35_attn_qk_norm_rope_bwd_f32(
+    device const float *p [[buffer(0)]],
+    device const float *q_norm_w [[buffer(1)]],
+    device const float *k_norm_w [[buffer(2)]],
+    device const float *dq [[buffer(3)]],
+    device const float *dk [[buffer(4)]],
+    device const float *dv [[buffer(5)]],
+    device float *dp [[buffer(6)]],
+    device float *part [[buffer(7)]],
+    constant uint &B [[buffer(8)]],
+    constant uint &T [[buffer(9)]],
+    constant uint &Hq [[buffer(10)]],
+    constant uint &Hkv [[buffer(11)]],
+    constant uint &D [[buffer(12)]],
+    constant uint &rotary_dim [[buffer(13)]],
+    constant uint &ld_p [[buffer(14)]],
+    constant uint &q_off [[buffer(15)]],
+    constant uint &k_off [[buffer(16)]],
+    constant uint &v_off [[buffer(17)]],
+    constant float &theta [[buffer(18)]],
+    constant float &eps [[buffer(19)]],
+    constant uint &rows_per_block [[buffer(20)]],
+    uint blk [[threadgroup_position_in_grid]],
+    uint sg [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]])
+{
+    threadgroup float sg_acc[2 * QK_BWD_SG * BWD_MAX_COLS * 32];
+    const ulong rows = (ulong)B * T;
+    const ulong nblocks = (rows + rows_per_block - 1) / rows_per_block;
+    const ulong r0 = (ulong)blk * rows_per_block;
+    if (r0 >= rows) return;  // uniform per threadgroup
+    const ulong r1 = min(rows, r0 + rows_per_block);
+    const uint heads = Hq + 2u * Hkv;
+    float acc_q[BWD_MAX_COLS], acc_k[BWD_MAX_COLS];
+    for (uint k = 0; k < BWD_MAX_COLS; ++k) {
+        acc_q[k] = 0.0f;
+        acc_k[k] = 0.0f;
+    }
+    const ulong u0 = r0 * heads, u1 = r1 * heads;
+    for (ulong u = u0 + sg; u < u1; u += QK_BWD_SG) {
+        const ulong r = u / heads;
+        const uint j = (uint)(u % heads);
+        const uint pos = (uint)(r % T);
+        device const float *row = p + r * ld_p;
+        device float *drow = dp + r * ld_p;
+        if (j < Hq) {
+            const ulong col = q_off + (ulong)j * 2u * D;
+            qwen35_norm_rope_row_bwd(row + col, q_norm_w, dq + (r * Hq + j) * (ulong)D, drow + col,
+                                     D, rotary_dim, pos, theta, eps, lane, acc_q);
+        } else if (j < Hq + Hkv) {
+            const uint h = j - Hq;
+            const ulong col = k_off + (ulong)h * D;
+            qwen35_norm_rope_row_bwd(row + col, k_norm_w, dk + (r * Hkv + h) * (ulong)D, drow + col,
+                                     D, rotary_dim, pos, theta, eps, lane, acc_k);
+        } else {
+            const uint h = j - Hq - Hkv;
+            device const float *src = dv + (r * Hkv + h) * (ulong)D;
+            device float *out = drow + v_off + (ulong)h * D;
+            for (uint d = lane; d < D; d += 32u) {
+                out[d] = src[d];
+            }
+        }
+    }
+    // Combine the simdgroups' column sums in simdgroup order.
+    const uint per = (D + 31u) / 32u;
+    const uint half_acc = QK_BWD_SG * BWD_MAX_COLS * 32;
+    for (uint k = 0; k < per; ++k) {
+        sg_acc[(sg * per + k) * 32 + lane] = acc_q[k];
+        sg_acc[half_acc + (sg * per + k) * 32 + lane] = acc_k[k];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (sg == 0) {
+        for (uint k = 0; k < per; ++k) {
+            const uint d = lane + 32u * k;
+            if (d >= D) continue;
+            float sq = 0.0f, sk = 0.0f;
+            for (uint g = 0; g < QK_BWD_SG; ++g) {
+                sq += sg_acc[(g * per + k) * 32 + lane];
+                sk += sg_acc[half_acc + (g * per + k) * 32 + lane];
+            }
+            part[(ulong)blk * D + d] = sq;
+            part[(nblocks + blk) * D + d] = sk;
+        }
     }
 }

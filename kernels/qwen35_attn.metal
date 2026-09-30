@@ -53,12 +53,7 @@ inline void qwen35_norm_rope_row(
     for (uint p = lane; p < half_rot; p += 32u) {
         const float x0 = src[p] * inv * (1.0f + weight[p]);
         const float x1 = src[p + half_rot] * inv * (1.0f + weight[p + half_rot]);
-        // torch computes inv_freq, the angle and cos/sin in fp32. `precise::`
-        // throughout: the angle reaches tens of thousands of radians, where the
-        // fast approximations lose whole digits.
-        const float inv_freq =
-            precise::divide(1.0f, precise::pow(theta, precise::divide((float)(2u * p), (float)rotary_dim)));
-        const float angle = (float)pos * inv_freq;
+        const float angle = qwen35_rope_angle(p, rotary_dim, pos, theta);
         const float c = precise::cos(angle);
         const float s = precise::sin(angle);
         dst[p] = x0 * c - x1 * s;

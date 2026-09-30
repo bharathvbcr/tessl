@@ -1,6 +1,6 @@
 //! Backward of the Qwen3.5 row-local ops (`kernels/qwen35_bwd.metal`): the
 //! RMSNorm, the GDN gated RMSNorm, SwiGLU, the attention output gate and
-//! the GDN causal conv + SiLU.
+//! the GDN causal conv + SiLU, and the attention Q/K norm + partial RoPE.
 //!
 //! Each entry point takes the forward's inputs (f32, as the forward reads
 //! them) and the output's gradient, in the forward's layouts, and writes the
@@ -16,9 +16,9 @@ use std::sync::Arc;
 
 use objc2_metal::MTLComputePipelineState;
 
-use crate::dispatch::{dispatch_1d, dispatch_2d, set_f32, set_gpu_buf, set_u32};
+use crate::dispatch::{dispatch_1d, dispatch_2d, set_f32, set_gpu_buf, set_gpu_buf_offset, set_u32};
 use crate::nn::{dispatch_tg_1d, reduce_tptg, require, require_disjoint_writes};
-use crate::qwen35::{require_window, Cols};
+use crate::qwen35::{require_window, AttnProjLayout, AttnShape, Cols};
 use crate::runtime::GpuRuntime;
 use crate::tensor::GpuBuffer;
 
@@ -72,11 +72,18 @@ pub fn gated_rms_norm_bwd_part_len(rows: u32, heads: u32, dim: u32) -> usize {
     blocks(u64::from(rows) * u64::from(heads), GATED_UNITS_PER_BLOCK) as usize * dim as usize
 }
 
-fn col_sum_blocks(rt: &Arc<GpuRuntime>, part: &GpuBuffer, out: &GpuBuffer, nblocks: u64, dim: u32) -> Result<(), String> {
+fn col_sum_blocks(
+    rt: &Arc<GpuRuntime>,
+    part: &GpuBuffer,
+    part_off: usize,
+    out: &GpuBuffer,
+    nblocks: u64,
+    dim: u32,
+) -> Result<(), String> {
     let nb = u32::try_from(nblocks).map_err(|_| "weight-gradient blocks exceed u32".to_string())?;
     let p = rt.pipeline("qwen35_col_sum_blocks_f32")?;
     dispatch_1d(rt, &p, dim as usize, |bnd| {
-        set_gpu_buf(bnd, part, 0);
+        set_gpu_buf_offset(bnd, part, part_off * std::mem::size_of::<f32>(), 0);
         set_gpu_buf(bnd, out, 1);
         set_u32(bnd, nb, 2);
         set_u32(bnd, dim, 3);
@@ -135,7 +142,7 @@ pub fn rms_norm_bwd(
         set_u32(bnd, RMS_ROWS_PER_BLOCK, 8);
         set_u32(bnd, u32::from(accumulate), 9);
     })?;
-    col_sum_blocks(rt, part, dw, nb, dim)
+    col_sum_blocks(rt, part, 0, dw, nb, dim)
 }
 
 /// Backward of [`crate::qwen35::gated_rms_norm`] (`y = w * rms_norm(x) *
@@ -209,7 +216,7 @@ pub fn gated_rms_norm_bwd(
         set_f32(bnd, eps, 20);
         set_u32(bnd, GATED_UNITS_PER_BLOCK, 21);
     })?;
-    col_sum_blocks(rt, part, dw, nb, dim)
+    col_sum_blocks(rt, part, 0, dw, nb, dim)
 }
 
 /// Backward of [`crate::qwen35::swiglu`]: `dgate = dy * up * silu'(gate)`,
@@ -405,5 +412,133 @@ pub fn conv1d_silu_bwd(
         bind(bnd);
         set_u32(bnd, CONV_ROWS_PER_BLOCK, 12);
     })?;
-    col_sum_blocks(rt, part, dw, nb, taps)
+    col_sum_blocks(rt, part, 0, dw, nb, taps)
+}
+
+/// Tokens per threadgroup of the Q/K norm + RoPE backward.
+const QK_ROWS_PER_BLOCK: u32 = 16;
+/// Its threadgroup size (`QK_BWD_SG` simdgroups).
+const QK_THREADS: usize = 128;
+
+/// f32 elements of scratch [`attn_qk_norm_rope_bwd`] needs: a q-norm and a
+/// k-norm partial per block of tokens.
+pub fn attn_qk_norm_rope_bwd_part_len(shape: &AttnShape) -> usize {
+    let nb = blocks(u64::from(shape.batch) * u64::from(shape.seq), QK_ROWS_PER_BLOCK);
+    2 * nb as usize * shape.head_dim as usize
+}
+
+/// The gradients [`attn_qk_norm_rope_bwd`] starts from: of the rotated
+/// queries and keys and of the values, each dense `[batch * seq, heads,
+/// head_dim]` (the layouts the forward wrote, caches of capacity `seq`).
+#[derive(Clone, Copy, Debug)]
+pub struct AttnQkvGrads<'a> {
+    pub dq: &'a GpuBuffer,
+    pub dk: &'a GpuBuffer,
+    pub dv: &'a GpuBuffer,
+}
+
+/// Backward of [`crate::qwen35::attn_qk_norm_rope`] as training runs it:
+/// token `t` of each batch row at position `t` (`pos_offset` 0), caches of
+/// capacity `seq`. `proj` is the fused projection window the forward read
+/// (laid out as [`AttnProjLayout`] says); the q, k and v gradients are
+/// written to the same columns of `dproj` (same row stride and offset), and
+/// the gate columns are left for [`attn_gate_bwd`]. `dq_norm_w` and
+/// `dk_norm_w` (`[head_dim]`) receive the norm weights' gradients,
+/// overwritten; `part` holds [`attn_qk_norm_rope_bwd_part_len`] floats.
+#[allow(clippy::too_many_arguments)]
+pub fn attn_qk_norm_rope_bwd(
+    rt: &Arc<GpuRuntime>,
+    shape: &AttnShape,
+    proj: Cols<'_>,
+    q_norm_w: &GpuBuffer,
+    k_norm_w: &GpuBuffer,
+    grads: &AttnQkvGrads<'_>,
+    dproj: &GpuBuffer,
+    dq_norm_w: &GpuBuffer,
+    dk_norm_w: &GpuBuffer,
+    part: &GpuBuffer,
+    theta: f32,
+    eps: f32,
+) -> Result<(), String> {
+    const WHAT: &str = "qwen35_bwd::attn_qk_norm_rope_bwd";
+    let s = shape;
+    let layout = AttnProjLayout::new(s.q_heads, s.kv_heads, s.head_dim).map_err(|e| format!("{WHAT}: {e}"))?;
+    if s.head_dim > 32 * MAX_COLS {
+        return Err(format!("{WHAT}: head_dim must be at most {}, got {}", 32 * MAX_COLS, s.head_dim));
+    }
+    if s.rotary_dim % 2 != 0 || s.rotary_dim > s.head_dim {
+        return Err(format!(
+            "{WHAT}: rotary_dim must be even and at most head_dim, got {} of {}",
+            s.rotary_dim, s.head_dim
+        ));
+    }
+    if !theta.is_finite() || theta <= 0.0 || !eps.is_finite() || eps <= 0.0 {
+        return Err(format!("{WHAT}: theta and eps must be positive and finite"));
+    }
+    let rows = u64::from(s.batch) * u64::from(s.seq);
+    let span = 2 * (u64::from(s.q_heads) + u64::from(s.kv_heads)) * u64::from(s.head_dim);
+    require_window::<f32>(rt, proj, rows, span, &format!("{WHAT} proj"))?;
+    require_window::<f32>(rt, Cols { buf: dproj, ..proj }, rows, span, &format!("{WHAT} dproj"))?;
+    let d = s.head_dim as usize;
+    let per = |heads: u32| -> Result<usize, String> {
+        (rows as usize)
+            .checked_mul(heads as usize)
+            .and_then(|n| n.checked_mul(d))
+            .ok_or_else(|| format!("{WHAT}: rows x heads x head_dim overflows"))
+    };
+    let (nq, nkv) = (per(s.q_heads)?, per(s.kv_heads)?);
+    for (b, len, name) in [
+        (grads.dq, nq, "dq"),
+        (grads.dk, nkv, "dk"),
+        (grads.dv, nkv, "dv"),
+        (q_norm_w, d, "q_norm_w"),
+        (k_norm_w, d, "k_norm_w"),
+        (dq_norm_w, d, "dq_norm_w"),
+        (dk_norm_w, d, "dk_norm_w"),
+    ] {
+        require::<f32>(rt, b, len, &format!("{WHAT} {name}"))?;
+    }
+    let nb = blocks(rows, QK_ROWS_PER_BLOCK);
+    require::<f32>(rt, part, attn_qk_norm_rope_bwd_part_len(s), &format!("{WHAT} part"))?;
+    require_disjoint_writes(
+        WHAT,
+        &[("dproj", dproj), ("dq_norm_w", dq_norm_w), ("dk_norm_w", dk_norm_w), ("part", part)],
+        &[
+            ("proj", proj.buf),
+            ("q_norm_w", q_norm_w),
+            ("k_norm_w", k_norm_w),
+            ("dq", grads.dq),
+            ("dk", grads.dk),
+            ("dv", grads.dv),
+        ],
+    )?;
+    let p = rt.pipeline("qwen35_attn_qk_norm_rope_bwd_f32")?;
+    if p.maxTotalThreadsPerThreadgroup() < QK_THREADS {
+        return Err(format!("{WHAT}: the pipeline cannot run {QK_THREADS} threads"));
+    }
+    dispatch_tg_1d(rt, &p, nb as usize, QK_THREADS, None, |bnd| {
+        set_gpu_buf(bnd, proj.buf, 0);
+        set_gpu_buf(bnd, q_norm_w, 1);
+        set_gpu_buf(bnd, k_norm_w, 2);
+        set_gpu_buf(bnd, grads.dq, 3);
+        set_gpu_buf(bnd, grads.dk, 4);
+        set_gpu_buf(bnd, grads.dv, 5);
+        set_gpu_buf(bnd, dproj, 6);
+        set_gpu_buf(bnd, part, 7);
+        set_u32(bnd, s.batch, 8);
+        set_u32(bnd, s.seq, 9);
+        set_u32(bnd, s.q_heads, 10);
+        set_u32(bnd, s.kv_heads, 11);
+        set_u32(bnd, s.head_dim, 12);
+        set_u32(bnd, s.rotary_dim, 13);
+        set_u32(bnd, proj.ld, 14);
+        set_u32(bnd, proj.off + layout.q_off(), 15);
+        set_u32(bnd, proj.off + layout.k_off(), 16);
+        set_u32(bnd, proj.off + layout.v_off(), 17);
+        set_f32(bnd, theta, 18);
+        set_f32(bnd, eps, 19);
+        set_u32(bnd, QK_ROWS_PER_BLOCK, 20);
+    })?;
+    col_sum_blocks(rt, part, 0, dq_norm_w, nb, s.head_dim)?;
+    col_sum_blocks(rt, part, nb as usize * d, dk_norm_w, nb, s.head_dim)
 }

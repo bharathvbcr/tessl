@@ -565,6 +565,14 @@ fn qwen35_bwd_offsets_are_widened() {
         ("dx[row * ld_dx + dx_off + c] = acc;", "conv dx row"),
         ("const float dpre = dy[row * ld_dy + dy_off + c] * qwen35_silu_grad(pre);", "conv dw dy row"),
         ("device float *out = dw_part + blk * ((ulong)C * KW) + (ulong)c * KW;", "conv dw partial"),
+        ("const ulong u0 = r0 * heads, u1 = r1 * heads;", "q/k norm unit range"),
+        ("device const float *row = p + r * ld_p;", "q/k norm projection row"),
+        ("device float *drow = dp + r * ld_p;", "q/k norm gradient row"),
+        ("const ulong col = q_off + (ulong)j * 2u * D;", "q head column"),
+        ("dq + (r * Hq + j) * (ulong)D", "dq row"),
+        ("dk + (r * Hkv + h) * (ulong)D", "dk row"),
+        ("device const float *src = dv + (r * Hkv + h) * (ulong)D;", "dv row"),
+        ("part[(nblocks + blk) * D + d] = sk;", "k-norm partial"),
     ] {
         require(QWEN35_BWD, needle, what);
     }

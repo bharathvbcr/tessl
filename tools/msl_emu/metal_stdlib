@@ -5,7 +5,8 @@
 // What it models:
 //
 //   * a threadgroup is `threads_per_threadgroup` real OS threads, and
-//     `threadgroup_barrier` is a real barrier across them;
+//     `threadgroup_barrier` is a real barrier across them (`emu::Barrier`,
+//     whose synchronisation ThreadSanitizer sees on every platform);
 //   * a simdgroup is 32 consecutive threads, and every `simd_*` collective is a
 //     real exchange through shared slots with a 32-way barrier, so a lane that
 //     skips a collective its siblings reach deadlocks here as surely as it
@@ -25,7 +26,6 @@
 
 #include <algorithm>
 #include <atomic>
-#include <barrier>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -200,10 +200,58 @@ namespace emu {
 
 constexpr uint SIMD = 32;
 
+/// A reusable barrier with `std::barrier`'s arrive_and_wait / arrive_and_drop,
+/// built on acq_rel atomics so ThreadSanitizer sees its happens-before edges.
+/// libc++'s `std::barrier` (macOS) synchronises in a way TSan does not model,
+/// so every write before it and every write after it is reported as a race.
+///
+/// It must add no edge a real barrier lacks, or TSan stops reporting a missing
+/// barrier. A mutex/condition_variable can add one: a waiter that wakes late
+/// re-locks the mutex after a faster thread has already locked it for the
+/// *next* phase, and so acquires that thread's post-barrier writes. Here a
+/// waiter only reads `phase`, which is written once per phase, by the arrival
+/// that completes it, and cannot move again until the waiter arrives too.
+class Barrier {
+  public:
+    explicit Barrier(uint n) : expected_(n), count_(n) {}
+    Barrier(const Barrier &) = delete;
+    Barrier &operator=(const Barrier &) = delete;
+
+    void arrive_and_wait() {
+        // Exact, not stale: the phase cannot advance before this arrival.
+        const uint p = phase_.load(std::memory_order_relaxed);
+        if (arrive()) return;
+        while (phase_.load(std::memory_order_acquire) == p) phase_.wait(p, std::memory_order_acquire);
+    }
+
+    /// Arrive for the current phase and leave every later one.
+    void arrive_and_drop() {
+        // Before the arrival, whose release carries it to the arrival that
+        // completes this phase and resets `count_` from `expected_`.
+        expected_.fetch_sub(1, std::memory_order_relaxed);
+        arrive();
+    }
+
+  private:
+    /// Count this thread in; true if it completed the phase.
+    bool arrive() {
+        // acq_rel: the completing arrival acquires every earlier one's writes.
+        if (count_.fetch_sub(1, std::memory_order_acq_rel) != 1) return false;
+        count_.store(expected_.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        phase_.fetch_add(1, std::memory_order_release);
+        phase_.notify_all();
+        return true;
+    }
+
+    std::atomic<uint> expected_;
+    std::atomic<uint> count_;
+    std::atomic<uint> phase_{0};
+};
+
 /// Shared state of one simdgroup: an exchange slot per lane and a barrier.
 struct Simd {
     explicit Simd(uint lanes) : bar(lanes), n(lanes) {}
-    std::barrier<> bar;
+    Barrier bar;
     uint n;
     float slot[SIMD] = {};
 };
@@ -211,7 +259,7 @@ struct Simd {
 /// Shared state of one threadgroup.
 struct Group {
     explicit Group(uint threads) : bar(threads) {}
-    std::barrier<> bar;
+    Barrier bar;
     std::atomic<uint> exited{0};
     std::atomic<bool> error{false};
     std::vector<std::unique_ptr<Simd>> simds;

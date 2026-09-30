@@ -49,7 +49,13 @@ moves those logits by O(1). Each of those was injected and caught.
   bound, whose error grows with the argument.
 - `MSL_EMU_SANITIZE=address|thread` builds under ASan or TSan. Every device
   buffer and threadgroup allocation is exactly sized, never grown, so an
-  overrun can't hide in spare capacity.
+  overrun can't hide in spare capacity. The barriers are the shim's own, on
+  acq_rel atomics, not `std::barrier`: TSan does not see libc++'s as
+  synchronisation, so on macOS every barrier-separated write pair was a false
+  race. Under TSan, `build.sh` first runs `barrier_probe.cpp`, which must run
+  clean with each barrier and report a race without it, so neither a barrier
+  TSan cannot see nor one that hides a missing barrier gets as far as a kernel.
+  TSan runs on macOS (Apple clang) and Linux (g++).
 - `harness.cpp` launches each kernel with exactly the grid, threadgroup size
   and threadgroup memory that `src/qwen35.rs` uses. `harness --constants`
   prints the kernels' shape constants, and the `host_contract` case holds

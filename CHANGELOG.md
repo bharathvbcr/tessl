@@ -181,6 +181,11 @@ All notable changes to `tessl` are recorded here. The format follows
 
 ### Fixed
 
+- `tools/msl_emu` runs under ThreadSanitizer on macOS: TSan does not see
+  libc++'s `std::barrier` as synchronisation, so every barrier-separated write
+  pair was reported as a race. The shim's barriers are now its own, on acq_rel
+  atomics, and `build.sh` holds them to a probe under TSan: clean with each
+  barrier, a reported race without it.
 - `tools/msl_emu` builds on macOS again: since the fast-math `exp`/`log`
   became the shim's own functions, libc++'s global float overloads made every
   unqualified kernel call ambiguous (Linux's libstdc++ declares none). Kernels

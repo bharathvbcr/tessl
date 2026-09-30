@@ -24,8 +24,28 @@ SAN=()
 if [[ -n "${MSL_EMU_SANITIZE:-}" ]]; then
   SAN=(-fsanitize="$MSL_EMU_SANITIZE" -fno-omit-frame-pointer -O1)
 fi
-"${CXX:-g++}" -std=c++20 -O2 -g -pthread -fno-strict-aliasing -Wall -Wno-unused-variable -Wno-unused-parameter ${SAN[@]+"${SAN[@]}"} \
-  -Wno-unknown-pragmas -Wno-sign-compare \
-  -I "$HERE" -I "$ROOT/kernels" -I "$OUT/gen" \
-  "$HERE/harness.cpp" -o "$OUT/harness"
+CXXFLAGS=(-std=c++20 -O2 -g -pthread -fno-strict-aliasing -Wall -Wno-unused-variable -Wno-unused-parameter
+  ${SAN[@]+"${SAN[@]}"} -Wno-unknown-pragmas -Wno-sign-compare -I "$HERE")
+"${CXX:-g++}" "${CXXFLAGS[@]}" -I "$ROOT/kernels" -I "$OUT/gen" "$HERE/harness.cpp" -o "$OUT/harness"
+# Under TSan, a race report is only evidence if the barriers are visible to it
+# and add nothing a real barrier lacks: barrier_probe.cpp holds them to both
+# before any kernel is judged by them.
+"${CXX:-g++}" "${CXXFLAGS[@]}" "$HERE/barrier_probe.cpp" -o "$OUT/barrier_probe"
+if [[ "${MSL_EMU_SANITIZE:-}" == thread ]]; then
+  for mode in tg tg_missing simd simd_missing drop; do
+    want=0
+    [[ "$mode" == *_missing ]] && want=66
+    got=0
+    # abort_on_error defaults to 1 on macOS, which would exit 134 instead.
+    TSAN_OPTIONS="halt_on_error=0 abort_on_error=0 exitcode=66" "$OUT/barrier_probe" "$mode" 2> "$OUT/barrier_probe.$mode.log" || got=$?
+    if [[ "$got" != "$want" ]]; then
+      cat "$OUT/barrier_probe.$mode.log" >&2
+      echo "msl_emu: barrier_probe $mode exited $got under TSan, expected $want" \
+        "(66 = race reported): TSan's view of the emulator's barriers is wrong" >&2
+      exit 1
+    fi
+  done
+else
+  "$OUT/barrier_probe" drop
+fi
 echo "$OUT/harness"

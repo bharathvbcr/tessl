@@ -3505,6 +3505,50 @@ fn attn_prefix_rows_rejects_bad_shapes_and_aliases() {
         };
         expect_err(suffix(1000, 2), "exceed the caches' capacity");
         expect_err(suffix(u32::MAX, 1), "exceeds u32 positions");
+        // The first position fits u32 but the cache's last slot does not: the
+        // kernel's u32 position would wrap for in-range tokens (rotated at 0,
+        // cached at slot 2). Refused for every position mode, as the reader
+        // (`validate_prefix_attn`) refuses such a cache.
+        expect_err(suffix(u32::MAX - 1, 0), "exceed u32");
+        let pos1 = buf_u32(rt, &[u32::MAX - 1]);
+        expect_err(
+            qwen35::attn_qk_norm_rope_suffix_posbuf(
+                rt,
+                &shape,
+                Cols::dense(&proj, w),
+                &qwb,
+                &kwb,
+                &targets,
+                u32::MAX - 1,
+                &pos1,
+                1e7,
+                1e-6,
+            ),
+            "exceed u32",
+        );
+        // Caches too small for one position: every token would be skipped, a
+        // silent no-op. The host knows the capacity whatever the mode.
+        let (tiny_k, tiny_v) = (buf(rt, &[0.0; 4]), buf(rt, &[0.0; 4]));
+        let tiny = AttnTargets {
+            q_out: &qo,
+            k_cache: &tiny_k,
+            v_cache: &tiny_v,
+        };
+        let pos0 = buf_u32(rt, &[0]);
+        expect_err(
+            qwen35::attn_qk_norm_rope_posbuf(
+                rt,
+                &shape,
+                Cols::dense(&proj, w),
+                &qwb,
+                &kwb,
+                &tiny,
+                &pos0,
+                1e7,
+                1e-6,
+            ),
+            "capacity 0",
+        );
         suffix(1000, 1).unwrap();
         rt.synchronize().unwrap();
     });

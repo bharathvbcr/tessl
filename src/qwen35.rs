@@ -1701,6 +1701,20 @@ fn qk_norm_rope_impl(
         s.kv_heads,
         s.head_dim,
     )?;
+    // Both are known on the host whatever the position mode. With no slots
+    // every token would be skipped as out of range, a call that "succeeds"
+    // and writes nothing. And a cache whose last slot's absolute position
+    // `slot_base + capacity - 1` passes u32 would let the kernel's u32
+    // position wrap for in-range tokens; this is the same bound
+    // `validate_prefix_attn` puts on the reader of these caches.
+    if kv_capacity == 0 {
+        return Err(format!("{WHAT}: the caches hold no positions (capacity 0)"));
+    }
+    if u64::from(slot_base) + u64::from(kv_capacity) > u64::from(u32::MAX) {
+        return Err(format!(
+            "{WHAT}: cache positions [{slot_base}, {slot_base} + {kv_capacity}) exceed u32"
+        ));
+    }
     match pos {
         RopePos::Scalar(pos_offset) => {
             if pos_offset < slot_base {

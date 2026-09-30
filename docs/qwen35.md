@@ -707,6 +707,40 @@ tokens/s, median of 3, allocations included): the projections' forward and
 backward GEMMs are about 25 TFLOP (3.8 s at that rate), the cross-entropy
 1.8 s, the GDN and attention cores 0.6 s.
 
+Activation recomputation, same machine and T, one mode per process under
+`/usr/bin/time -l` (`--step=2048 --activations=...`, median of 3):
+
+| `Activations` | s / step | activations kept | peak footprint |
+|---|---:|---:|---:|
+| `Saved` | 7.23 | 8.54 GiB | 34.4 GB |
+| `Recomputed` | 7.94 | 0.38 GiB | 30.7 GB |
+
+Recomputing costs 10% (one more forward of every layer, without its `down`
+projection). The peak drops by 3.7 GB, not the whole 8.2 GiB of
+activations, because the peak is mostly memory both modes hold: the f32
+weights and their packed LM head, plus the f32 gradients, which grow as the
+backward frees activations. Swap did not grow in either run. A first
+measurement read 40.9 / 43.1 GB because the bench kept its warm-up step's
+gradients alive; it now keeps only the loss.
+
+### From torch: `tessl_torch.Qwen35`
+
+`src/qwen35_params.rs` exposes the model's parameters and gradients under
+transformers' names and values (norms as `w`, not the stored `1 + w`; each
+linear weight as its `[in, out]` window of the packed projection) and copies
+them between the model and caller tensors on the GPU. The C ABI (version 4)
+adds a model handle (`tessl_qwen35_load`, `_train_step`, `_param_count`,
+`_param_info`, `_copy`, `_free`), and `tessl_torch.Qwen35` wraps it (see
+`python/README.md`). Writing the tied embedding rounds it to the bf16 table
+and rebuilds the f32 LM head from the rounded table, so the training step
+and the inference forward stay on the same model; torch holds the f32
+master copy. `tests/qwen35_params.rs`, `tests/capi.rs` and
+`python/tests/test_qwen35.py` check that the values are the checkpoint's,
+that the gradients are transformers' autograd's (the Python test computes its
+own oracle), that a byte offset is honoured, that a bad tensor stops a write
+before anything is written, and that an AdamW step written back gives
+transformers' loss and gradients after the same step.
+
 ### Stress: randomized shapes
 
 `randomized_shapes_stress` in `tests/qwen35_bwd.rs` and `tests/attn_train.rs`

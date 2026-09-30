@@ -40,7 +40,11 @@ use crate::cross_entropy::{cross_entropy_rows, CeGrads, CeHidden, CeWorkspace, R
 use crate::gdn_train::{
     gdn_train_backward, gdn_train_forward, GdnTrainDims, GdnTrainGrads, GdnTrainInputs, GdnTrainWorkspace,
 };
+use crate::qwen35_model::{Precision, Qwen35Config, Qwen35Model};
+use crate::qwen35_params::ParamInfo;
+use crate::qwen35_train::{Activations, Qwen35Grads};
 use crate::runtime::GpuRuntime;
+use crate::safetensors::SafeTensors;
 use crate::tensor::{DType, Tensor};
 
 pub const TESSL_OK: i32 = 0;
@@ -49,7 +53,7 @@ pub const TESSL_PANIC: i32 = 2;
 
 /// Bumped on any change to a `#[repr(C)]` layout or an entry point's
 /// signature; the Python side refuses a library whose version differs.
-pub const TESSL_ABI_VERSION: u32 = 3;
+pub const TESSL_ABI_VERSION: u32 = 4;
 
 /// Largest tensor rank a [`TesslTensorRef`] carries.
 pub const TESSL_MAX_DIMS: usize = 6;
@@ -163,20 +167,8 @@ pub unsafe extern "C" fn tessl_runtime_new(err: *mut c_char, err_len: usize) -> 
 /// been freed, and no other call on it is running.
 #[no_mangle]
 pub unsafe extern "C" fn tessl_runtime_free(handle: *mut TesslRuntime) -> i32 {
-    if handle.is_null() {
-        return TESSL_OK;
-    }
-    // SAFETY: live by the contract; only read here.
-    if unsafe { (*handle).owner } != std::thread::current().id() {
-        return TESSL_ERR;
-    }
-    // SAFETY: by the contract, this is the Box tessl_runtime_new leaked, freed once.
-    let boxed = unsafe { Box::from_raw(handle) };
-    // Dropping sync-waits outstanding work; a panic there must not unwind into C.
-    match catch_unwind(AssertUnwindSafe(move || drop(boxed))) {
-        Ok(()) => TESSL_OK,
-        Err(_) => TESSL_PANIC,
-    }
+    // SAFETY: forwarded from this function's contract.
+    unsafe { free_handle(handle) }
 }
 
 /// Wait for every piece of work the runtime has submitted.
@@ -341,38 +333,72 @@ unsafe fn wrap(rt: &Arc<GpuRuntime>, t: &TesslTensorRef, name: &str) -> Result<T
         .map_err(|e| format!("{name}: {e}"))
 }
 
+/// A thread-affine handle the ABI hands out.
+trait Handle {
+    /// What the handle is, in messages.
+    const KIND: &'static str;
+    fn owner(&self) -> ThreadId;
+    fn runtime(&self) -> &Arc<GpuRuntime>;
+}
+
+impl Handle for TesslRuntime {
+    const KIND: &'static str = "runtime";
+    fn owner(&self) -> ThreadId {
+        self.owner
+    }
+    fn runtime(&self) -> &Arc<GpuRuntime> {
+        &self.rt
+    }
+}
+
+/// Free a boxed handle on its creating thread; see [`tessl_runtime_free`].
+///
+/// # Safety
+/// As [`tessl_runtime_free`], for a handle of type `H`.
+unsafe fn free_handle<H: Handle>(handle: *mut H) -> i32 {
+    if handle.is_null() {
+        return TESSL_OK;
+    }
+    // SAFETY: live by the contract; only read here.
+    if unsafe { (*handle).owner() } != std::thread::current().id() {
+        return TESSL_ERR;
+    }
+    // SAFETY: by the contract, the Box its constructor leaked, freed once.
+    let boxed = unsafe { Box::from_raw(handle) };
+    // Dropping sync-waits outstanding work; a panic there must not unwind into C.
+    match catch_unwind(AssertUnwindSafe(move || drop(boxed))) {
+        Ok(()) => TESSL_OK,
+        Err(_) => TESSL_PANIC,
+    }
+}
+
 /// Run `f` on the handle with every failure turned into a status: a null or
 /// foreign-thread handle, an `Err`, or a panic. A successful call leaves the
 /// runtime synchronized.
 ///
 /// # Safety
-/// `handle` is null or a live handle from [`tessl_runtime_new`] with no other
-/// call on it running; `err` is null or points to `err_len` writable bytes.
-unsafe fn guarded(
-    handle: *mut TesslRuntime,
+/// `handle` is null or a live handle from its constructor with no other call
+/// on it running; `err` is null or points to `err_len` writable bytes.
+unsafe fn guarded<H: Handle>(
+    handle: *mut H,
     err: *mut c_char,
     err_len: usize,
-    f: impl FnOnce(&mut TesslRuntime) -> Result<(), String>,
+    f: impl FnOnce(&mut H) -> Result<(), String>,
 ) -> i32 {
     if handle.is_null() {
         // SAFETY: forwarded.
-        unsafe { write_err(err, err_len, "null runtime handle") };
+        unsafe { write_err(err, err_len, &format!("null {} handle", H::KIND)) };
         return TESSL_ERR;
     }
     // SAFETY: live and unshared by the contract.
     let h = unsafe { &mut *handle };
-    if std::thread::current().id() != h.owner {
+    if std::thread::current().id() != h.owner() {
+        let msg = format!("tessl {} used from a thread other than the one that created it", H::KIND);
         // SAFETY: forwarded.
-        unsafe {
-            write_err(
-                err,
-                err_len,
-                "tessl runtime used from a thread other than the one that created it",
-            )
-        };
+        unsafe { write_err(err, err_len, &msg) };
         return TESSL_ERR;
     }
-    match catch_unwind(AssertUnwindSafe(|| f(h).and_then(|()| h.rt.synchronize()))) {
+    match catch_unwind(AssertUnwindSafe(|| f(h).and_then(|()| h.runtime().synchronize()))) {
         Ok(Ok(())) => TESSL_OK,
         Ok(Err(e)) => {
             // SAFETY: forwarded.
@@ -565,6 +591,273 @@ pub unsafe extern "C" fn tessl_gdn_train_backward(
                 ws,
                 GdnTrainGrads { dq: &dq, dk: &dk, dv: &dv, dg: &dg, dbeta: &dbeta, ds0: ds0.as_ref() },
             )
+        })
+    }
+}
+
+// ------------------------------------------------------------ Qwen3.5 ---
+
+/// Longest parameter name a [`TesslParamInfo`] carries, NUL included.
+pub const TESSL_NAME_LEN: usize = 128;
+
+/// [`tessl_qwen35_copy`] directions.
+pub const TESSL_READ_PARAMS: u32 = 0;
+pub const TESSL_READ_GRADS: u32 = 1;
+pub const TESSL_WRITE_PARAMS: u32 = 2;
+
+/// One entry of a model's parameter table; see
+/// [`crate::qwen35_params::ParamInfo`].
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct TesslParamInfo {
+    /// transformers' name below the text tower, NUL-terminated.
+    pub name: [c_char; TESSL_NAME_LEN],
+    pub ndim: u32,
+    /// Non-zero: the tensors a copy takes hold the `[in, out]` transpose of
+    /// the 2-D `shape`.
+    pub transposed: u32,
+    /// transformers' shape; the first `ndim` entries are used.
+    pub shape: [u64; TESSL_MAX_DIMS],
+}
+
+/// What a [`tessl_qwen35_load`] pointer owns: an f32 model and the
+/// gradients of its last [`tessl_qwen35_train_step`].
+pub struct TesslQwen35 {
+    model: Qwen35Model,
+    table: Vec<ParamInfo>,
+    grads: Option<Qwen35Grads>,
+    owner: ThreadId,
+}
+
+impl Handle for TesslQwen35 {
+    const KIND: &'static str = "model";
+    fn owner(&self) -> ThreadId {
+        self.owner
+    }
+    fn runtime(&self) -> &Arc<GpuRuntime> {
+        &self.model.rt
+    }
+}
+
+/// # Safety
+/// `s` is non-null and NUL-terminated (null is refused).
+unsafe fn c_str<'a>(s: *const c_char, what: &str) -> Result<&'a str, String> {
+    if s.is_null() {
+        return Err(format!("null {what}"));
+    }
+    // SAFETY: NUL-terminated by the contract.
+    unsafe { std::ffi::CStr::from_ptr(s) }.to_str().map_err(|_| format!("{what} is not UTF-8"))
+}
+
+/// Load the text tower of a Qwen3.5 checkpoint in f32 for training, on
+/// `runtime`'s device, into a new handle written to `*out`.
+///
+/// `safetensors` is the `.safetensors` file, `config_json` its `config.json`
+/// (with or without `text_config`), and `prefix` the tensor-name prefix
+/// (`"model.language_model."` in the Qwen3.5 checkpoints). Free the handle
+/// with [`tessl_qwen35_free`], on this thread.
+///
+/// # Safety
+/// As [`tessl_cross_entropy_rows`] for `runtime`, `err` and `err_len`; the
+/// three strings are NUL-terminated (null is refused); `out` is writable.
+#[no_mangle]
+pub unsafe extern "C" fn tessl_qwen35_load(
+    runtime: *mut TesslRuntime,
+    safetensors: *const c_char,
+    config_json: *const c_char,
+    prefix: *const c_char,
+    out: *mut *mut TesslQwen35,
+    err: *mut c_char,
+    err_len: usize,
+) -> i32 {
+    // SAFETY: forwarded from this function's contract.
+    unsafe {
+        guarded(runtime, err, err_len, |h| {
+            const WHAT: &str = "tessl_qwen35_load";
+            if out.is_null() {
+                return Err(format!("{WHAT}: null out"));
+            }
+            *out = std::ptr::null_mut();
+            let path = c_str(safetensors, "safetensors path").map_err(|e| format!("{WHAT}: {e}"))?;
+            let config = c_str(config_json, "config path").map_err(|e| format!("{WHAT}: {e}"))?;
+            let prefix = c_str(prefix, "prefix").map_err(|e| format!("{WHAT}: {e}"))?;
+            let cfg = Qwen35Config::from_config_file(std::path::Path::new(config))?;
+            let st = SafeTensors::open(std::path::Path::new(path))?;
+            let model = Qwen35Model::load(&h.rt, &st, prefix, cfg, Precision::F32)?;
+            let table = model.parameter_table()?;
+            if let Some(p) = table.iter().find(|p| p.name.len() >= TESSL_NAME_LEN || p.shape.len() > TESSL_MAX_DIMS) {
+                return Err(format!("{WHAT}: {} does not fit a TesslParamInfo", p.name));
+            }
+            *out = Box::into_raw(Box::new(TesslQwen35 { model, table, grads: None, owner: h.owner }));
+            Ok(())
+        })
+    }
+}
+
+/// Free a handle from [`tessl_qwen35_load`], as [`tessl_runtime_free`] frees
+/// a runtime (null is ignored; from another thread it is leaked and
+/// [`TESSL_ERR`] returned).
+///
+/// # Safety
+/// As [`tessl_runtime_free`], for a [`tessl_qwen35_load`] handle.
+#[no_mangle]
+pub unsafe extern "C" fn tessl_qwen35_free(model: *mut TesslQwen35) -> i32 {
+    // SAFETY: forwarded from this function's contract.
+    unsafe { free_handle(model) }
+}
+
+/// The number of entries in the model's parameter table.
+///
+/// # Safety
+/// As [`tessl_cross_entropy_rows`], for a [`tessl_qwen35_load`] handle;
+/// `out` is writable.
+#[no_mangle]
+pub unsafe extern "C" fn tessl_qwen35_param_count(
+    model: *mut TesslQwen35,
+    out: *mut u64,
+    err: *mut c_char,
+    err_len: usize,
+) -> i32 {
+    // SAFETY: forwarded from this function's contract.
+    unsafe {
+        guarded(model, err, err_len, |h| {
+            if out.is_null() {
+                return Err("tessl_qwen35_param_count: null out".into());
+            }
+            *out = h.table.len() as u64;
+            Ok(())
+        })
+    }
+}
+
+/// Entry `index` of the model's parameter table.
+///
+/// # Safety
+/// As [`tessl_qwen35_param_count`]; `out` points to a writable
+/// [`TesslParamInfo`].
+#[no_mangle]
+pub unsafe extern "C" fn tessl_qwen35_param_info(
+    model: *mut TesslQwen35,
+    index: u64,
+    out: *mut TesslParamInfo,
+    err: *mut c_char,
+    err_len: usize,
+) -> i32 {
+    // SAFETY: forwarded from this function's contract.
+    unsafe {
+        guarded(model, err, err_len, |h| {
+            const WHAT: &str = "tessl_qwen35_param_info";
+            if out.is_null() {
+                return Err(format!("{WHAT}: null out"));
+            }
+            let p = usize::try_from(index)
+                .ok()
+                .and_then(|i| h.table.get(i))
+                .ok_or_else(|| format!("{WHAT}: index {index} is outside the table's {} entries", h.table.len()))?;
+            let mut info = TesslParamInfo {
+                name: [0; TESSL_NAME_LEN],
+                ndim: p.shape.len() as u32,
+                transposed: u32::from(p.transposed),
+                shape: [0; TESSL_MAX_DIMS],
+            };
+            // Lengths were checked at load.
+            for (d, &b) in info.name.iter_mut().zip(p.name.as_bytes()) {
+                *d = b as c_char;
+            }
+            for (d, &s) in info.shape.iter_mut().zip(&p.shape) {
+                *d = s as u64;
+            }
+            *out = info;
+            Ok(())
+        })
+    }
+}
+
+/// One training step on the `n` token ids at `ids` (one sequence): writes
+/// the loss to `*loss` and keeps every parameter's gradient in the handle for
+/// [`tessl_qwen35_copy`], replacing the previous step's (freed before the
+/// step runs). `recompute` non-zero keeps only each layer's input from the
+/// forward ([`Activations::Recomputed`]); zero keeps everything.
+///
+/// # Safety
+/// As [`tessl_qwen35_param_count`]; `ids` points to `n` readable `u32`s and
+/// `loss` is writable.
+#[no_mangle]
+pub unsafe extern "C" fn tessl_qwen35_train_step(
+    model: *mut TesslQwen35,
+    ids: *const u32,
+    n: u64,
+    recompute: u32,
+    loss: *mut f64,
+    err: *mut c_char,
+    err_len: usize,
+) -> i32 {
+    // SAFETY: forwarded from this function's contract.
+    unsafe {
+        guarded(model, err, err_len, |h| {
+            const WHAT: &str = "tessl_qwen35_train_step";
+            if ids.is_null() || loss.is_null() {
+                return Err(format!("{WHAT}: null ids or loss"));
+            }
+            let n = usize::try_from(n).map_err(|_| format!("{WHAT}: n overflows usize"))?;
+            let ids = std::slice::from_raw_parts(ids, n);
+            h.grads = None;
+            let mode = if recompute != 0 { Activations::Recomputed } else { Activations::Saved };
+            let step = h.model.train_step(ids, mode)?;
+            *loss = step.loss;
+            h.grads = Some(step.grads);
+            Ok(())
+        })
+    }
+}
+
+/// Copy between the model and `n` caller tensors, one per parameter-table
+/// entry in order, each dense f32 of the entry's shape (transposed when the
+/// entry says so): [`TESSL_READ_PARAMS`] and [`TESSL_READ_GRADS`] (the last
+/// step's) fill them, [`TESSL_WRITE_PARAMS`] sets the parameters from them.
+/// Values are transformers' (see [`crate::qwen35_params`] for the norms'
+/// `1 + w` and the bf16 embedding table). Every tensor is checked before
+/// anything is copied.
+///
+/// # Safety
+/// As [`tessl_qwen35_param_count`]; `tensors` points to `n` readable
+/// [`TesslTensorRef`]s whose buffers satisfy the module contract.
+#[no_mangle]
+pub unsafe extern "C" fn tessl_qwen35_copy(
+    model: *mut TesslQwen35,
+    direction: u32,
+    tensors: *const TesslTensorRef,
+    n: u64,
+    err: *mut c_char,
+    err_len: usize,
+) -> i32 {
+    // SAFETY: forwarded from this function's contract.
+    unsafe {
+        guarded(model, err, err_len, |h| {
+            const WHAT: &str = "tessl_qwen35_copy";
+            let n = usize::try_from(n).map_err(|_| format!("{WHAT}: n overflows usize"))?;
+            if n != h.table.len() {
+                return Err(format!("{WHAT}: {n} tensors for {} parameters", h.table.len()));
+            }
+            if tensors.is_null() {
+                return Err(format!("{WHAT}: null tensors"));
+            }
+            let refs = std::slice::from_raw_parts(tensors, n);
+            let rt = Arc::clone(&h.model.rt);
+            let ts = refs
+                .iter()
+                .zip(&h.table)
+                .map(|(r, p)| wrap(&rt, r, &p.name))
+                .collect::<Result<Vec<_>, _>>()?;
+            match direction {
+                TESSL_READ_PARAMS => h.model.read_parameters(&ts),
+                TESSL_READ_GRADS => {
+                    let g = h.grads.as_ref().ok_or_else(|| format!("{WHAT}: no gradients yet; run tessl_qwen35_train_step first"))?;
+                    h.model.read_gradients(g, &ts)
+                }
+                TESSL_WRITE_PARAMS => h.model.write_parameters(&ts),
+                d => Err(format!("{WHAT}: direction {d} is not 0 (read params), 1 (read grads) or 2 (write params)")),
+            }
         })
     }
 }

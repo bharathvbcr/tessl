@@ -4,6 +4,10 @@
     loss = tessl_torch.cross_entropy(hidden, weight, targets, mask)
     loss.backward()
 
+    model = tessl_torch.Qwen35(safetensors_path, config_json_path)
+    loss = model.train_step(ids)          # a whole Qwen3.5 step in tessl
+    grads = model.grads()                 # for a torch optimizer
+
 Only the standard library and torch are needed: the library is loaded with
 ctypes, and MPS tensors are handed over as the MTLBuffer behind their storage
 (``untyped_storage().data_ptr()``, which is what ATen's own
@@ -34,11 +38,12 @@ __all__ = [
     "cross_entropy_rows",
     "chunk_gated_delta_rule",
     "patch_transformers_qwen3_5",
+    "Qwen35",
     "TesslError",
     "library_path",
 ]
 
-_ABI_VERSION = 3
+_ABI_VERSION = 4
 _MAX_DIMS = 6
 _DTYPE_CODE = {torch.float32: 0, torch.bfloat16: 1, torch.float16: 2}
 _ERR_LEN = 1024
@@ -90,6 +95,18 @@ class _GdnArgs(ctypes.Structure):
     ]
 
 
+_NAME_LEN = 128
+
+
+class _ParamInfo(ctypes.Structure):
+    _fields_ = [
+        ("name", ctypes.c_char * _NAME_LEN),
+        ("ndim", ctypes.c_uint32),
+        ("transposed", ctypes.c_uint32),
+        ("shape", ctypes.c_uint64 * _MAX_DIMS),
+    ]
+
+
 def library_path() -> Path:
     """Where the tessl C library is loaded from."""
     env = os.environ.get("TESSL_LIB")
@@ -135,6 +152,26 @@ def _load():
             fn = getattr(lib, name)
             fn.restype = ctypes.c_int32
             fn.argtypes = [ctypes.c_void_p, ctypes.POINTER(_GdnArgs), ctypes.c_char_p, ctypes.c_size_t]
+        err_args = [ctypes.c_char_p, ctypes.c_size_t]
+        lib.tessl_qwen35_load.restype = ctypes.c_int32
+        lib.tessl_qwen35_load.argtypes = [
+            ctypes.c_void_p, ctypes.c_char_p, ctypes.c_char_p, ctypes.c_char_p, ctypes.POINTER(ctypes.c_void_p),
+        ] + err_args
+        lib.tessl_qwen35_free.restype = ctypes.c_int32
+        lib.tessl_qwen35_free.argtypes = [ctypes.c_void_p]
+        lib.tessl_qwen35_param_count.restype = ctypes.c_int32
+        lib.tessl_qwen35_param_count.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint64)] + err_args
+        lib.tessl_qwen35_param_info.restype = ctypes.c_int32
+        lib.tessl_qwen35_param_info.argtypes = [ctypes.c_void_p, ctypes.c_uint64, ctypes.POINTER(_ParamInfo)] + err_args
+        lib.tessl_qwen35_train_step.restype = ctypes.c_int32
+        lib.tessl_qwen35_train_step.argtypes = [
+            ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint32), ctypes.c_uint64, ctypes.c_uint32,
+            ctypes.POINTER(ctypes.c_double),
+        ] + err_args
+        lib.tessl_qwen35_copy.restype = ctypes.c_int32
+        lib.tessl_qwen35_copy.argtypes = [
+            ctypes.c_void_p, ctypes.c_uint32, ctypes.POINTER(_TensorRef), ctypes.c_uint64,
+        ] + err_args
         _lib = lib
         return lib
 
@@ -540,3 +577,146 @@ def patch_transformers_qwen3_5():
     previous = m.torch_chunk_gated_delta_rule
     m.torch_chunk_gated_delta_rule = chunk_gated_delta_rule
     return previous
+
+
+# ------------------------------------------------------ Qwen3.5 training ---
+
+_READ_PARAMS, _READ_GRADS, _WRITE_PARAMS = 0, 1, 2
+
+
+class Qwen35:
+    """A Qwen3.5 text model trained by tessl's ``train_step``, with torch
+    running the optimizer.
+
+        model = tessl_torch.Qwen35(safetensors_path, config_json_path)
+        params = model.parameters()            # f32 master copy, on MPS
+        opt = torch.optim.AdamW(params.values(), lr=1e-5)
+        loss = model.train_step(ids)           # tessl: loss and every gradient
+        for name, g in model.grads().items():
+            params[name].grad = g
+        opt.step()
+        model.load_parameters(params)          # write the update back
+
+    Parameters and gradients are keyed by transformers' names below the text
+    tower (``layers.3.mlp.gate_proj.weight``) and have transformers' shapes
+    and values (the zero-centred norms as ``w``, not tessl's stored
+    ``1 + w``). Linear weights come back as transposed views of ``[in, out]``
+    tensors, which is how tessl lays them out; ``load_parameters`` accepts
+    any layout. The model runs in f32, except that the tied embedding is
+    stored as a bf16 table: ``load_parameters`` rounds it, so keep the f32
+    master copy in torch (as above) and write it back after every update, or
+    small embedding updates are lost to that rounding.
+
+    The handle belongs to the thread that made it, like every tessl call.
+    Each call synchronizes torch's MPS stream first and returns after tessl's
+    queue is idle.
+    """
+
+    def __init__(self, safetensors, config_json, prefix: str = "model.language_model."):
+        rt = _runtime()
+        err = ctypes.create_string_buffer(_ERR_LEN)
+        handle = ctypes.c_void_p()
+        status = rt.lib.tessl_qwen35_load(
+            rt.handle, str(safetensors).encode(), str(config_json).encode(), prefix.encode(),
+            ctypes.byref(handle), err, _ERR_LEN,
+        )
+        if status != 0:
+            raise TesslError(err.value.decode(errors="replace"))
+        self._rt = rt
+        self._handle = handle
+        count = ctypes.c_uint64()
+        self._check(rt.lib.tessl_qwen35_param_count(handle, ctypes.byref(count), err, _ERR_LEN), err)
+        table = []
+        for i in range(count.value):
+            info = _ParamInfo()
+            self._check(rt.lib.tessl_qwen35_param_info(handle, i, ctypes.byref(info), err, _ERR_LEN), err)
+            shape = tuple(info.shape[d] for d in range(info.ndim))
+            table.append((info.name.decode(), shape, bool(info.transposed)))
+        self._table = table
+        self._has_grads = False
+
+    @staticmethod
+    def _check(status: int, err):
+        if status != 0:
+            raise TesslError(err.value.decode(errors="replace"))
+
+    def __del__(self):
+        rt, handle = getattr(self, "_rt", None), getattr(self, "_handle", None)
+        if rt is not None and handle:
+            rt.lib.tessl_qwen35_free(handle)
+
+    @property
+    def shapes(self) -> dict:
+        """Every parameter's transformers shape, in the table's order."""
+        return {name: shape for name, shape, _ in self._table}
+
+    def _storage(self, device) -> list:
+        """One dense f32 tensor per entry, laid out as tessl copies it."""
+        return [
+            torch.empty(tuple(reversed(shape)) if tr else shape, dtype=torch.float32, device=device)
+            for _, shape, tr in self._table
+        ]
+
+    def _copy(self, direction: int, tensors: list):
+        refs = (_TensorRef * len(tensors))(*[_ref(t, name) for t, (name, _, _) in zip(tensors, self._table)])
+        err = ctypes.create_string_buffer(_ERR_LEN)
+        torch.mps.synchronize()
+        self._check(self._rt.lib.tessl_qwen35_copy(self._handle, direction, refs, len(tensors), err, _ERR_LEN), err)
+
+    def _views(self, tensors: list) -> dict:
+        return {name: (t.t() if tr else t) for t, (name, _, tr) in zip(tensors, self._table)}
+
+    def parameters(self, device: str = "mps") -> dict:
+        """A fresh f32 copy of every parameter, keyed by name."""
+        ts = self._storage(torch.device(device))
+        self._copy(_READ_PARAMS, ts)
+        return self._views(ts)
+
+    def grads(self, device: str = "mps") -> dict:
+        """The last ``train_step``'s gradients, laid out as ``parameters()``."""
+        if not self._has_grads:
+            raise TesslError("no gradients yet; call train_step first")
+        ts = self._storage(torch.device(device))
+        self._copy(_READ_GRADS, ts)
+        return self._views(ts)
+
+    def load_parameters(self, params) -> None:
+        """Set every parameter from ``params`` (name -> tensor of the
+        parameter's shape, any dtype, device and layout). All of them are
+        required, and all are checked before any is written."""
+        names = [name for name, _, _ in self._table]
+        missing = [n for n in names if n not in params]
+        extra = [n for n in params if n not in set(names)]
+        if missing or extra:
+            raise TesslError(f"load_parameters: missing {missing[:3]}{'...' if len(missing) > 3 else ''}, "
+                             f"unexpected {extra[:3]}{'...' if len(extra) > 3 else ''}")
+        ts = []
+        for name, shape, tr in self._table:
+            p = params[name]
+            if tuple(p.shape) != shape:
+                raise TesslError(f"load_parameters: {name} must be {shape}, got {tuple(p.shape)}")
+            p = p.detach()
+            ts.append((p.t() if tr else p).to(device="mps", dtype=torch.float32).contiguous())
+        self._copy(_WRITE_PARAMS, ts)
+
+    def train_step(self, ids, *, recompute: bool = True) -> float:
+        """One training step on one sequence of token ids (a 1-D tensor or a
+        sequence of ints): returns transformers' causal-LM loss and keeps
+        every parameter's gradient for ``grads()``. ``recompute`` keeps only
+        each layer's input from the forward and reruns each layer before its
+        backward (same results, far less memory)."""
+        ids = torch.as_tensor(ids)
+        if ids.dim() != 1:
+            raise TesslError(f"ids must be 1-D (one sequence), got shape {tuple(ids.shape)}")
+        host = _u32(ids, 1 << 32, "ids")
+        loss = ctypes.c_double()
+        err = ctypes.create_string_buffer(_ERR_LEN)
+        torch.mps.synchronize()
+        self._has_grads = False
+        status = self._rt.lib.tessl_qwen35_train_step(
+            self._handle, host.ctypes_ptr, ids.numel(), 1 if recompute else 0, ctypes.byref(loss), err, _ERR_LEN,
+        )
+        del host
+        self._check(status, err)
+        self._has_grads = True
+        return loss.value

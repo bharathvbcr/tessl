@@ -380,35 +380,38 @@ checks that every `set_*` bind has the kernel's index and kind (buffer, `uint`,
 the kernel's constants. Swapping a single bind fails it. The kernels also
 `static_assert` their lane mappings against those constants.
 
-Last run, 84 checks passing. GDN rows show the kernel's max error next to
-transformers' own fp32 error, both measured against f64:
+Last run at 3798ca8: all 41 cases, 147 checks passing, 0 failing. GDN rows
+show the kernel's max error next to transformers' own fp32 error, both
+measured against f64:
 
 | Case | kernel err | transformers fp32 err |
 |---|---:|---:|
-| chunk, T=1 | 1.1e-8 | 1.9e-9 |
-| chunk, T=64 | 1.5e-8 | 3.6e-8 |
-| chunk, T=65, grouped heads, B=2 | 5.8e-8 | 6.0e-8 |
-| chunk, T=130, 4 heads, per-batch state | 4.9e-8 | 8.6e-8 |
-| chunk, T=100, Dv=128, shared snapshot, B=3 | 2.9e-8 | 2.9e-8 |
-| chunk, T=150, strong decay | 3.9e-7 | 3.2e-7 |
-| chunk, T=130, `a + dt_bias` in the softplus-series range | 5.4e-8 | 5.8e-8 |
-| chunk, T=200, Dv=128 | 2.8e-8 | 2.7e-8 |
-| chunk, T=1000 | 2.4e-8 | 2.9e-8 |
-| chunk, T=4096 (64 chunks through one state) | 3.3e-8 | 3.1e-8 |
-| chunk at 16 key / 32 value heads, Dv=128 (`Qwen3_5TextConfig()` defaults†), per-batch state | 6.5e-8 | — |
-| recurrent at the same head counts, shared snapshot | 8.9e-9 | — |
-| chunk at the 2B's head counts (16 key / 16 value heads, Dv=128), per-batch state | 7.5e-8 | — |
+| chunk, T=1 | 7.5e-9 | 3.8e-9 |
+| chunk, T=64 | 1.5e-8 | 1.4e-8 |
+| chunk, T=65, grouped heads, B=2 | 5.9e-8 | 5.7e-8 |
+| chunk, T=130, 4 heads, per-batch state | 5.0e-8 | 8.8e-8 |
+| chunk, T=100, Dv=128, shared snapshot, B=3 | 2.9e-8 | 4.5e-8 |
+| chunk, T=150, strong decay | 4.0e-7 | 3.2e-7 |
+| chunk, T=130, `a + dt_bias` in the softplus-series range | 8.4e-8 | 6.1e-8 |
+| recurrent, T=9, `a + dt_bias` in the softplus-series range | 1.1e-8 | 5.1e-9 |
+| chunk, T=200, Dv=128 | 2.3e-8 | 1.8e-8 |
+| chunk, T=1000 | 2.2e-8 | 2.7e-8 |
+| chunk, T=4096 (64 chunks through one state) | 4.2e-8 | 3.9e-8 |
+| chunk at 16 key / 32 value heads, Dv=128 (`Qwen3_5TextConfig()` defaults†), per-batch state | 7.5e-8 | 7.5e-8 |
+| recurrent at the same head counts, shared snapshot | 8.1e-9 | 7.5e-9 |
+| chunk at the 2B's head counts (16 key / 16 value heads, Dv=128), per-batch state | 7.5e-8 | 8.7e-8 |
 | recurrent at the 2B's head counts, shared snapshot | 8.1e-9 | 7.3e-9 |
-| recurrent, T=1, snapshot, B=4 | 5.8e-9 | 8.3e-9 |
-| recurrent, T=7, per-batch state | 5.7e-9 | 6.5e-9 |
+| recurrent, T=1, snapshot, B=4 | 6.3e-9 | 4.6e-9 |
+| recurrent, T=7, per-batch state | 6.7e-9 | 8.1e-9 |
+| recurrent, T=20 | 5.1e-9 | 4.3e-9 |
 | chunk / recurrent / conv, T=0 with state_out | state copied exactly | — |
-| chunk workspace: `W(I+A) = I` | 5.4e-8 | — |
+| chunk workspace: `W(I+A) = I` | 4.0e-8 | — |
 | conv1d (prefill, state, snapshot, T < KW−1) | 4.8e-7 / state exact | — |
-| gated norm f32 / bf16 | 1e-6 / within one bf16 rounding | — |
-| Q/K norm + partial RoPE, D=256, pos 30000 | 9.5e-7 | — |
-| output gate f32 / bf16 / in place | 2.4e-7 / exact / 2.4e-7 | — |
+| gated norm f32 / bf16 | 2.9e-6 / within one bf16 rounding | — |
+| Q/K norm + partial RoPE, D=256, pos 30000 | 7.2e-7 | — |
+| output gate f32 / bf16 / in place | 1.2e-7 / exact / 1.2e-7 | — |
 | SwiGLU f32 / bf16 (`Qwen3_5MLP.act_fn`), gate and up as windows of one row, gates to ±120 | 1e-6 + 1e-6·\|x\| (max 1.5e-5 at \|x\| ~ 10³) / within one bf16 rounding | — |
-| scoring f32 / bf16; a bad slot or answer → NaN, the rest intact | 4.8e-7 | — |
+| scoring f32 / bf16; a bad slot or answer → NaN, the rest intact | 6.9e-7 / 5.5e-7 | — |
 | embedding gather, bf16 table; a bad id → NaN row, the rest intact | exact | — |
 | Q/K norm + RoPE with `slot_base`: absolute RoPE, relative slot | bit-identical to slot_base 0 | — |
 | shared-prefix attention, 8 query / 2 KV heads of 256; P = 0, 1, 30 (no suffix), 65 | bit-identical to `flash_attn_rows` on a copied prefix; ≤ 5.0e-7 vs torch | — |

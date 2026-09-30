@@ -227,6 +227,7 @@ pub mod qwen35;
 pub mod qwen35_bwd;
 pub mod qwen35_train;
 pub mod qwen35_model;
+pub mod qwen35_params;
 pub mod runtime;
 pub mod safetensors;
 pub mod tensor;

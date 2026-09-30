@@ -37,7 +37,7 @@ impl Handle {
 
 impl Drop for Handle {
     fn drop(&mut self) {
-        unsafe { tessl_runtime_free(self.0) };
+        assert_eq!(unsafe { tessl_runtime_free(self.0) }, TESSL_OK);
     }
 }
 
@@ -88,7 +88,7 @@ fn the_abi_reports_its_version_and_probes_buffers() {
         assert_eq!(unsafe { tessl_mtl_buffer_length(&*b as *const _ as *mut c_void) }, 4000);
         assert_eq!(unsafe { tessl_mtl_buffer_length(ptr::null_mut()) }, 0);
     });
-    unsafe { tessl_runtime_free(ptr::null_mut()) };
+    assert_eq!(unsafe { tessl_runtime_free(ptr::null_mut()) }, TESSL_OK);
 }
 
 /// The same problem through the C ABI and through the Rust entry point:
@@ -275,4 +275,20 @@ fn a_wrap_through_the_abi_leaves_residency_balanced() {
             assert_eq!(loss.to_bits(), first.to_bits(), "call {i} changed the answer");
         }
     });
+}
+
+/// A free from a foreign thread (a finalizer at interpreter shutdown) leaks
+/// the handle instead of dropping a thread-affine runtime there; the owner can
+/// still use and free it.
+#[test]
+fn a_free_from_another_thread_is_refused_and_leaves_the_handle_usable() {
+    let handle = Handle::new();
+    let raw = handle.0 as usize;
+    let status = std::thread::spawn(move || unsafe { tessl_runtime_free(raw as *mut TesslRuntime) })
+        .join()
+        .unwrap();
+    assert_eq!(status, TESSL_ERR);
+    let mut err = [0 as c_char; ERR_LEN];
+    assert_eq!(unsafe { tessl_synchronize(handle.0, err.as_mut_ptr(), ERR_LEN) }, TESSL_OK, "{}", msg(&err));
+    drop(handle); // the owner's free succeeds (asserted in Drop)
 }

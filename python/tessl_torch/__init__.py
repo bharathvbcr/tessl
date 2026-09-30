@@ -31,7 +31,7 @@ import torch
 
 __all__ = ["cross_entropy", "cross_entropy_rows", "TesslError", "library_path"]
 
-_ABI_VERSION = 1
+_ABI_VERSION = 2
 _MAX_DIMS = 4
 _DTYPE_CODE = {torch.float32: 0, torch.bfloat16: 1, torch.float16: 2}
 _ERR_LEN = 1024
@@ -96,7 +96,7 @@ def _load():
             raise TesslError(f"{path} implements ABI {version}, this binding expects {_ABI_VERSION}")
         lib.tessl_runtime_new.restype = ctypes.c_void_p
         lib.tessl_runtime_new.argtypes = [ctypes.c_char_p, ctypes.c_size_t]
-        lib.tessl_runtime_free.restype = None
+        lib.tessl_runtime_free.restype = ctypes.c_int32
         lib.tessl_runtime_free.argtypes = [ctypes.c_void_p]
         lib.tessl_mtl_buffer_length.restype = ctypes.c_uint64
         lib.tessl_mtl_buffer_length.argtypes = [ctypes.c_void_p]
@@ -126,6 +126,8 @@ class _Runtime:
         self.handle = ctypes.c_void_p(handle)
 
     def __del__(self):
+        # From a foreign thread (interpreter shutdown) the library refuses and
+        # leaks the runtime rather than drop it on the wrong thread.
         lib, handle = getattr(self, "lib", None), getattr(self, "handle", None)
         if lib is not None and handle:
             lib.tessl_runtime_free(handle)

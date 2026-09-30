@@ -46,7 +46,7 @@ pub const TESSL_PANIC: i32 = 2;
 
 /// Bumped on any change to a `#[repr(C)]` layout or an entry point's
 /// signature; the Python side refuses a library whose version differs.
-pub const TESSL_ABI_VERSION: u32 = 1;
+pub const TESSL_ABI_VERSION: u32 = 2;
 
 /// Largest tensor rank a [`TesslTensorRef`] carries.
 pub const TESSL_MAX_DIMS: usize = 4;
@@ -144,20 +144,33 @@ pub unsafe extern "C" fn tessl_runtime_new(err: *mut c_char, err_len: usize) -> 
     }
 }
 
-/// Free a handle from [`tessl_runtime_new`]. Null is ignored.
+/// Free a handle from [`tessl_runtime_new`]. Null is ignored ([`TESSL_OK`]).
+///
+/// From a thread other than the creator's the handle is leaked, not freed,
+/// and [`TESSL_ERR`] is returned: the runtime is thread-affine, and a
+/// garbage-collected wrapper (Python's thread-local at interpreter shutdown)
+/// can run its finalizer on any thread. A leaked runtime holds its buffers
+/// until the process exits; dropping it on the wrong thread is undefined.
 ///
 /// # Safety
 /// `handle` is null or a pointer [`tessl_runtime_new`] returned that has not
 /// been freed, and no other call on it is running.
 #[no_mangle]
-pub unsafe extern "C" fn tessl_runtime_free(handle: *mut TesslRuntime) {
+pub unsafe extern "C" fn tessl_runtime_free(handle: *mut TesslRuntime) -> i32 {
     if handle.is_null() {
-        return;
+        return TESSL_OK;
+    }
+    // SAFETY: live by the contract; only read here.
+    if unsafe { (*handle).owner } != std::thread::current().id() {
+        return TESSL_ERR;
     }
     // SAFETY: by the contract, this is the Box tessl_runtime_new leaked, freed once.
     let boxed = unsafe { Box::from_raw(handle) };
     // Dropping sync-waits outstanding work; a panic there must not unwind into C.
-    let _ = catch_unwind(AssertUnwindSafe(move || drop(boxed)));
+    match catch_unwind(AssertUnwindSafe(move || drop(boxed))) {
+        Ok(()) => TESSL_OK,
+        Err(_) => TESSL_PANIC,
+    }
 }
 
 /// Wait for every piece of work the runtime has submitted.

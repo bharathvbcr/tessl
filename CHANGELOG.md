@@ -142,14 +142,6 @@ All notable changes to `tessl` are recorded here. The format follows
   transformers' names and values, for a torch optimizer. Checked against
   transformers' own autograd before and after an AdamW step written back
   (`python/tests/test_qwen35.py`).
-- `Qwen35Model` in `Precision::F32` holds the tied embedding as one f32
-  `[vocab, hidden]` table (the gather reads it through the new
-  `qwen35_embed_rows_f32`, training's cross-entropy as its weight, and
-  `forward()`'s head through `gemm_nt_f32`) instead of a bf16 gather table
-  plus an f32 `[hidden, vocab]` head: 1 GB less on the 2B, a parameter write
-  is exact, and gradients are taken at the parameters themselves rather
-  than at a bf16 rounding of the embedding. `qwen35::embed_rows` accepts an
-  f32 table. The bf16 model is unchanged.
 - `Tensor::from_mtl_buffer` is an `unsafe fn`: tessl cannot see another
   queue's work on a wrapped buffer, and its `# Safety` section states the
   cross-queue contract.
@@ -159,6 +151,17 @@ All notable changes to `tessl` are recorded here. The format follows
   (`CeHidden { rows, off }`, `&Tensor`), so views at a storage offset work.
 - `ParamsBuffer::push_u32`/`push_f32` take the host-access lease: they wait
   for encoded work and fail with "runtime busy" inside an encoder closure.
+
+### Changed
+
+- `Qwen35Model` in `Precision::F32` holds the tied embedding as one f32
+  `[vocab, hidden]` table (the gather reads it through the new
+  `qwen35_embed_rows_f32`, training's cross-entropy as its weight, and
+  `forward()`'s head through `gemm_nt_f32`) instead of a bf16 gather table
+  plus an f32 `[hidden, vocab]` head: 1 GB less on the 2B, a parameter write
+  is exact, and gradients are taken at the parameters themselves rather
+  than at a bf16 rounding of the embedding. `qwen35::embed_rows` accepts an
+  f32 table. The bf16 model is unchanged.
 
 ### Fixed
 

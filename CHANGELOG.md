@@ -53,9 +53,11 @@ All notable changes to `tessl` are recorded here. The format follows
 - **A Qwen3.5 training step (`Qwen35Model::train_step`, `tessl::qwen35_train`)**:
   transformers' causal-LM loss for one sequence and every parameter's
   gradient, in f32, in each weight's own layout (packed fused projections,
-  `[vocab, hidden]` for the tied embedding and head). The forward saves
-  what the backward needs and uses `gdn_train`, `attn_train` and
-  `gdn_gates`; the backward chains the CE, row-local, conv, gate, Q/K,
+  `[vocab, hidden]` for the tied embedding and head). The forward keeps
+  only each layer's input and each layer is rebuilt just before its
+  backward (0.38 GiB of activations at T = 2048 on the 2B, against 8.54 GiB
+  saved, for 10% more time); it uses `gdn_train`, `attn_train` and
+  `gdn_gates`, and the backward chains the CE, row-local, conv, gate, Q/K,
   attention and embedding backwards with exact-f32 GEMMs. Checked against
   transformers' autograd on a committed tiny model
   (`tests/fixtures/qwen35_train/`, from
@@ -66,6 +68,14 @@ All notable changes to `tessl` are recorded here. The format follows
   (`real_2b_gradients_are_those_of_tessls_forward`);
   `tools/qwen35_ref/train_noise_floor.py` measures transformers' own
   run-to-run gradient disagreement for comparison.
+- **A Qwen3.5 model's parameters under transformers' names
+  (`tessl::qwen35_params`)**: `parameter_table`, `read_parameters`,
+  `read_gradients` and `write_parameters` copy between the model and caller
+  f32 tensors on the GPU, with transformers' shapes and values (norms as
+  `w`, not the stored `1 + w`; linear weights as `[in, out]` windows of the
+  packed projections), honouring a caller's byte offset and checking every
+  tensor before writing any. `gemm::transpose_f32_into` is the checked GPU
+  transpose (the TN/NT fallbacks now share it).
 - **Training attention (`tessl::attn_train`)**: `attn_train_forward` is
   `attn_prefill`'s tiled kernel at its default geometry with each row's
   log-sum-exp written out (new entry point
@@ -122,6 +132,16 @@ All notable changes to `tessl` are recorded here. The format follows
 
 ### Changed (breaking)
 
+- **C ABI 5** (was 3; the binding and library refuse each other across
+  versions, so rebuild `libtessl.dylib` with the binding). It adds a
+  Qwen3.5 model handle: `tessl_qwen35_load`, `_train_step`,
+  `_param_count`, `_param_info` (`TesslParamInfo`), `_copy` (read
+  parameters, read gradients, write parameters) and `_free`, with the
+  runtime's thread affinity. `tessl_torch.Qwen35` wraps it:
+  `parameters()`, `train_step(ids)`, `grads()`, `load_parameters()`, under
+  transformers' names and values, for a torch optimizer. Checked against
+  transformers' own autograd before and after an AdamW step written back
+  (`python/tests/test_qwen35.py`).
 - `Tensor::from_mtl_buffer` is an `unsafe fn`: tessl cannot see another
   queue's work on a wrapped buffer, and its `# Safety` section states the
   cross-queue contract.

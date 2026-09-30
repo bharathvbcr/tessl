@@ -42,7 +42,7 @@ use crate::gdn_train::{
 };
 use crate::qwen35_model::{Precision, Qwen35Config, Qwen35Model};
 use crate::qwen35_params::ParamInfo;
-use crate::qwen35_train::{Activations, Qwen35Grads};
+use crate::qwen35_train::Qwen35Grads;
 use crate::runtime::GpuRuntime;
 use crate::safetensors::SafeTensors;
 use crate::tensor::{DType, Tensor};
@@ -53,7 +53,7 @@ pub const TESSL_PANIC: i32 = 2;
 
 /// Bumped on any change to a `#[repr(C)]` layout or an entry point's
 /// signature; the Python side refuses a library whose version differs.
-pub const TESSL_ABI_VERSION: u32 = 4;
+pub const TESSL_ABI_VERSION: u32 = 5;
 
 /// Largest tensor rank a [`TesslTensorRef`] carries.
 pub const TESSL_MAX_DIMS: usize = 6;
@@ -776,8 +776,7 @@ pub unsafe extern "C" fn tessl_qwen35_param_info(
 /// One training step on the `n` token ids at `ids` (one sequence): writes
 /// the loss to `*loss` and keeps every parameter's gradient in the handle for
 /// [`tessl_qwen35_copy`], replacing the previous step's (freed before the
-/// step runs). `recompute` non-zero keeps only each layer's input from the
-/// forward ([`Activations::Recomputed`]); zero keeps everything.
+/// step runs).
 ///
 /// # Safety
 /// As [`tessl_qwen35_param_count`]; `ids` points to `n` readable `u32`s and
@@ -787,7 +786,6 @@ pub unsafe extern "C" fn tessl_qwen35_train_step(
     model: *mut TesslQwen35,
     ids: *const u32,
     n: u64,
-    recompute: u32,
     loss: *mut f64,
     err: *mut c_char,
     err_len: usize,
@@ -802,8 +800,7 @@ pub unsafe extern "C" fn tessl_qwen35_train_step(
             let n = usize::try_from(n).map_err(|_| format!("{WHAT}: n overflows usize"))?;
             let ids = std::slice::from_raw_parts(ids, n);
             h.grads = None;
-            let mode = if recompute != 0 { Activations::Recomputed } else { Activations::Saved };
-            let step = h.model.train_step(ids, mode)?;
+            let step = h.model.train_step(ids)?;
             *loss = step.loss;
             h.grads = Some(step.grads);
             Ok(())

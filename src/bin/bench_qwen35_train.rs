@@ -23,10 +23,8 @@
 //!
 //! `--step=N` also loads the real checkpoint (`QWEN35_2B_SAFETENSORS`) and
 //! times `Qwen35Model::train_step` on N tokens end to end (median of 3 after
-//! one warm-up), which includes allocating every saved activation and
-//! gradient per step. Both [`Activations`] modes are timed unless
-//! `--activations=saved` or `--activations=recomputed` picks one (one mode per
-//! process when measuring its memory, e.g. under `/usr/bin/time -l`).
+//! one warm-up), which includes allocating every rebuilt activation and
+//! gradient per step. Run it under `/usr/bin/time -l` for its peak memory.
 //!
 //! Before anything is timed, every op runs once with its outputs pre-filled
 //! with NaN, and every output must come back finite: an op that silently
@@ -46,7 +44,6 @@ use tessl::qwen35_bwd::{
     rms_norm_bwd_part_len, swiglu_bwd, AttnQkvGrads, EmbedBwdWorkspace,
 };
 use tessl::qwen35_model::{Precision, Qwen35Config, Qwen35Model};
-use tessl::qwen35_train::Activations;
 use tessl::safetensors::SafeTensors;
 use tessl::tensor::GpuBuffer;
 use tessl::{DType, GpuRuntime, Tensor};
@@ -323,7 +320,7 @@ fn bench_t(rt: &Arc<GpuRuntime>, t: usize, check_only: bool) -> Res<()> {
     Ok(())
 }
 
-fn bench_step(rt: &Arc<GpuRuntime>, tokens: usize, modes: &[Activations]) -> Res<()> {
+fn bench_step(rt: &Arc<GpuRuntime>, tokens: usize) -> Res<()> {
     let path = std::env::var("QWEN35_2B_SAFETENSORS").map_err(|_| "--step needs QWEN35_2B_SAFETENSORS (the Qwen3.5-2B-Base .safetensors)".to_string())?;
     let st = SafeTensors::open(std::path::Path::new(&path))?;
     let model = Qwen35Model::load(rt, &st, "model.language_model.", Qwen35Config::qwen35_2b()?, Precision::F32)?;
@@ -331,46 +328,29 @@ fn bench_step(rt: &Arc<GpuRuntime>, tokens: usize, modes: &[Activations]) -> Res
     let ids: Vec<u32> = (0..tokens as u32).map(|i| (i * 104_729 + 17) % VOCAB as u32).collect();
     // Only the loss is kept: holding the warm-up step would double the
     // gradients resident while timing.
-    let first = model.train_step(&ids, modes[0])?.loss;
+    let first = model.train_step(&ids)?.loss;
     if !first.is_finite() {
         return Err(format!("train_step: loss {first} is not finite"));
     }
-    for &mode in modes {
-        let mut samples = Vec::new();
-        let mut bytes = 0;
-        for _ in 0..3 {
-            let t0 = Instant::now();
-            let step = model.train_step(&ids, mode)?;
-            samples.push(t0.elapsed().as_secs_f64());
-            if step.loss.to_bits() != first.to_bits() {
-                return Err(format!("train_step ({mode:?}): the loss changed between identical steps"));
-            }
-            bytes = step.activation_bytes;
+    let mut samples = Vec::new();
+    for _ in 0..3 {
+        let t0 = Instant::now();
+        let step = model.train_step(&ids)?;
+        samples.push(t0.elapsed().as_secs_f64());
+        if step.loss.to_bits() != first.to_bits() {
+            return Err("train_step: the loss changed between identical steps".into());
         }
-        let secs = median(samples);
-        println!(
-            "train_step ({mode:?}), T = {tokens}: {:.3} s ({:.0} tokens/s), loss {:.4}, activations kept {:.2} GiB",
-            secs,
-            tokens as f64 / secs,
-            first,
-            bytes as f64 / f64::from(1u32 << 30)
-        );
     }
+    let secs = median(samples);
+    println!("train_step, T = {tokens}: {:.3} s ({:.0} tokens/s), loss {:.4}", secs, tokens as f64 / secs, first);
     Ok(())
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (mut check_only, mut step, mut ts) = (false, None, Vec::new());
-    let mut modes = vec![Activations::Recomputed, Activations::Saved];
     for arg in std::env::args().skip(1) {
         if arg == "--check-only" {
             check_only = true;
-        } else if let Some(m) = arg.strip_prefix("--activations=") {
-            modes = match m {
-                "saved" => vec![Activations::Saved],
-                "recomputed" => vec![Activations::Recomputed],
-                _ => return Err(format!("--activations expects saved or recomputed, got {m:?}").into()),
-            };
         } else if let Some(n) = arg.strip_prefix("--step=") {
             step = Some(n.parse::<usize>().map_err(|_| format!("--step expects a token count, got {n:?}"))?);
         } else {
@@ -393,7 +373,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         bench_t(&rt, t, check_only)?;
     }
     if let (Some(n), false) = (step, check_only) {
-        bench_step(&rt, n, &modes)?;
+        bench_step(&rt, n)?;
     }
     Ok(())
 }

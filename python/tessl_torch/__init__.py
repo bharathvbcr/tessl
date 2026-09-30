@@ -43,7 +43,7 @@ __all__ = [
     "library_path",
 ]
 
-_ABI_VERSION = 4
+_ABI_VERSION = 5
 _MAX_DIMS = 6
 _DTYPE_CODE = {torch.float32: 0, torch.bfloat16: 1, torch.float16: 2}
 _ERR_LEN = 1024
@@ -165,7 +165,7 @@ def _load():
         lib.tessl_qwen35_param_info.argtypes = [ctypes.c_void_p, ctypes.c_uint64, ctypes.POINTER(_ParamInfo)] + err_args
         lib.tessl_qwen35_train_step.restype = ctypes.c_int32
         lib.tessl_qwen35_train_step.argtypes = [
-            ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint32), ctypes.c_uint64, ctypes.c_uint32,
+            ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint32), ctypes.c_uint64,
             ctypes.POINTER(ctypes.c_double),
         ] + err_args
         lib.tessl_qwen35_copy.restype = ctypes.c_int32
@@ -699,12 +699,11 @@ class Qwen35:
             ts.append((p.t() if tr else p).to(device="mps", dtype=torch.float32).contiguous())
         self._copy(_WRITE_PARAMS, ts)
 
-    def train_step(self, ids, *, recompute: bool = True) -> float:
+    def train_step(self, ids) -> float:
         """One training step on one sequence of token ids (a 1-D tensor or a
         sequence of ints): returns transformers' causal-LM loss and keeps
-        every parameter's gradient for ``grads()``. ``recompute`` keeps only
-        each layer's input from the forward and reruns each layer before its
-        backward (same results, far less memory)."""
+        every parameter's gradient for ``grads()``. The forward keeps only
+        each layer's input; each layer reruns just before its backward."""
         ids = torch.as_tensor(ids)
         if ids.dim() != 1:
             raise TesslError(f"ids must be 1-D (one sequence), got shape {tuple(ids.shape)}")
@@ -714,7 +713,7 @@ class Qwen35:
         torch.mps.synchronize()
         self._has_grads = False
         status = self._rt.lib.tessl_qwen35_train_step(
-            self._handle, host.ctypes_ptr, ids.numel(), 1 if recompute else 0, ctypes.byref(loss), err, _ERR_LEN,
+            self._handle, host.ctypes_ptr, ids.numel(), ctypes.byref(loss), err, _ERR_LEN,
         )
         del host
         self._check(status, err)

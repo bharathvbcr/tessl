@@ -707,13 +707,17 @@ tokens/s, median of 3, allocations included): the projections' forward and
 backward GEMMs are about 25 TFLOP (3.8 s at that rate), the cross-entropy
 1.8 s, the GDN and attention cores 0.6 s.
 
-Activation recomputation, same machine and T, one mode per process under
-`/usr/bin/time -l` (`--step=2048 --activations=...`, median of 3):
+Activation recomputation was measured against keeping every layer's
+intermediates, on the same machine and T, one mode per process under
+`/usr/bin/time -l` (median of 3, at 3aa7e97, when both modes existed). The
+saving mode was then removed as a losing branch: its gradients were
+bit-identical, and it bought 10% speed for 22x the activation memory, which
+does not fit at T = 8192 (~34 GiB):
 
-| `Activations` | s / step | activations kept | peak footprint |
+| activations | s / step | activations kept | peak footprint |
 |---|---:|---:|---:|
-| `Saved` | 7.23 | 8.54 GiB | 34.4 GB |
-| `Recomputed` | 7.94 | 0.38 GiB | 30.7 GB |
+| every layer's (removed) | 7.23 | 8.54 GiB | 34.4 GB |
+| layer inputs, recomputed | 7.94 | 0.38 GiB | 30.7 GB |
 
 Recomputing costs 10% (one more forward of every layer, without its `down`
 projection). The peak drops by 3.7 GB, not the whole 8.2 GiB of
@@ -730,7 +734,7 @@ gradients alive; it now keeps only the loss.
 `src/qwen35_params.rs` exposes the model's parameters and gradients under
 transformers' names and values (norms as `w`, not the stored `1 + w`; each
 linear weight as its `[in, out]` window of the packed projection) and copies
-them between the model and caller tensors on the GPU. The C ABI (version 4)
+them between the model and caller tensors on the GPU. The C ABI (version 5)
 adds a model handle (`tessl_qwen35_load`, `_train_step`, `_param_count`,
 `_param_info`, `_copy`, `_free`), and `tessl_torch.Qwen35` wraps it (see
 `python/README.md`). Writing the tied embedding rounds it to the bf16 table
@@ -765,14 +769,11 @@ positions) and every parameter's gradient of it. It runs in f32
 heads equal to key heads, as Qwen3.5-2B has. The forward is the inference
 forward's except where a backward needs more: `gdn_gates` + `gdn_train`
 (checkpointed state) for the gated delta rule and `attn_train` (log-sum-exp)
-for attention. `train_step(ids, Activations::Saved)` keeps every layer's
-intermediates for the backward; `Activations::Recomputed` keeps only the
-residual stream into each layer (`T x hidden` f32) and reruns one layer's
-forward just before its backward, skipping that rerun's `down` projection,
-whose output the backward never reads. The kernels are deterministic, so
-both modes return the same loss and gradients bit for bit
-(`recomputed_activations_are_the_saved_ones`), and `TrainStep::activation_bytes`
-reports what was kept. The backward walks the layers in reverse (MLP, post norm, mixer, input norm, the residual stream's
+for attention. The forward keeps only the residual stream into each layer
+(`T x hidden` f32) and reruns one layer's forward just before its backward,
+skipping that rerun's `down` projection, whose output the backward never
+reads. The kernels are deterministic, so the rebuilt intermediates are the
+forward's bits. The backward walks the layers in reverse (MLP, post norm, mixer, input norm, the residual stream's
 gradient accumulating through both norms), then adds the embedding's
 gradient onto the tied head's `[vocab, hidden]` gradient that the
 cross-entropy wrote. Every fused projection's gradient is filled by disjoint

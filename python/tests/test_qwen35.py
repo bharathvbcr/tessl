@@ -79,16 +79,14 @@ class Qwen35Training(unittest.TestCase):
             self.assertLessEqual((p.cpu() - want).abs().max().item(), tol, name)
 
     def test_step_matches_transformers_autograd(self):
-        for recompute in (True, False):
-            with self.subTest(recompute=recompute):
-                m = self.model()
-                loss = m.train_step(self.ids, recompute=recompute)
-                want_loss, want = torch_step(reference(), self.ids)
-                self.assertLessEqual(abs(loss - want_loss) / abs(want_loss), 1e-5)
-                grads = m.grads()
-                self.assertEqual(sorted(grads), sorted(want))
-                worst = max(rel_err(grads[n], want[n]) for n in want)
-                self.assertLessEqual(worst, 1e-4)
+        m = self.model()
+        loss = m.train_step(self.ids)
+        want_loss, want = torch_step(reference(), self.ids)
+        self.assertLessEqual(abs(loss - want_loss) / abs(want_loss), 1e-5)
+        grads = m.grads()
+        self.assertEqual(sorted(grads), sorted(want))
+        worst = max(rel_err(grads[n], want[n]) for n in want)
+        self.assertLessEqual(worst, 1e-4)
 
     def test_an_optimizer_step_written_back_is_transformers_after_the_same_step(self):
         m = self.model()

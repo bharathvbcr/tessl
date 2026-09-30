@@ -364,9 +364,9 @@ fn the_model_through_the_abi_is_the_rust_model() {
         assert!(msg(&err).contains("direction 7"), "{}", msg(&err));
 
         let mut loss = 0.0f64;
-        let s = unsafe { tessl_qwen35_train_step(model, ids.as_ptr(), ids.len() as u64, 1, &mut loss, err.as_mut_ptr(), ERR_LEN) };
+        let s = unsafe { tessl_qwen35_train_step(model, ids.as_ptr(), ids.len() as u64, &mut loss, err.as_mut_ptr(), ERR_LEN) };
         assert_eq!(s, TESSL_OK, "{}", msg(&err));
-        let want = rust.train_step(&ids, tessl::qwen35_train::Activations::Saved).unwrap();
+        let want = rust.train_step(&ids).unwrap();
         assert_eq!(loss.to_bits(), want.loss.to_bits());
 
         let local: Vec<tessl::Tensor> = table.iter().map(|p| rt.alloc_tensor_f32(&p.storage_shape()).unwrap()).collect();
@@ -397,16 +397,16 @@ fn the_model_through_the_abi_is_the_rust_model() {
         }
         rust.write_parameters(&local).unwrap();
         let mut moved = 0.0f64;
-        let s = unsafe { tessl_qwen35_train_step(model, ids.as_ptr(), ids.len() as u64, 0, &mut moved, err.as_mut_ptr(), ERR_LEN) };
+        let s = unsafe { tessl_qwen35_train_step(model, ids.as_ptr(), ids.len() as u64, &mut moved, err.as_mut_ptr(), ERR_LEN) };
         assert_eq!(s, TESSL_OK, "{}", msg(&err));
         assert_ne!(moved.to_bits(), loss.to_bits());
-        assert_eq!(moved.to_bits(), rust.train_step(&ids, tessl::qwen35_train::Activations::Saved).unwrap().loss.to_bits());
+        assert_eq!(moved.to_bits(), rust.train_step(&ids).unwrap().loss.to_bits());
     });
 
     // Refusals: a bad id, a null handle, another thread.
     let bad = [1u32, 64];
     let mut loss = 0.0;
-    let s = unsafe { tessl_qwen35_train_step(model, bad.as_ptr(), 2, 1, &mut loss, err.as_mut_ptr(), ERR_LEN) };
+    let s = unsafe { tessl_qwen35_train_step(model, bad.as_ptr(), 2, &mut loss, err.as_mut_ptr(), ERR_LEN) };
     assert_eq!(s, TESSL_ERR);
     assert!(msg(&err).contains("token id 64 >= vocab 64"), "{}", msg(&err));
     let mut n = 0u64;

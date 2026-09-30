@@ -12,7 +12,6 @@ use std::sync::Arc;
 use tessl::npy::read_npy;
 use tessl::qwen35_model::{Precision, Qwen35Config, Qwen35Model};
 use tessl::qwen35_params::ParamInfo;
-use tessl::qwen35_train::Activations;
 use tessl::safetensors::SafeTensors;
 use tessl::{GpuRuntime, Tensor};
 
@@ -88,7 +87,7 @@ fn values_are_the_checkpoints_under_transformers_names() {
 fn gradients_are_transformers_autograd_under_its_names() {
     let (rt, model, _st) = load(Precision::F32);
     let table = model.parameter_table().unwrap();
-    let step = model.train_step(&ids(), Activations::Recomputed).unwrap();
+    let step = model.train_step(&ids()).unwrap();
     let dst = alloc(&rt, &table);
     model.read_gradients(&step.grads, &dst).unwrap();
     let mut worst = 0.0f64;
@@ -110,13 +109,13 @@ fn a_write_round_trips_and_moves_both_forwards_together() {
     let (rt, model, _st) = load(Precision::F32);
     let ids = ids();
     let table = model.parameter_table().unwrap();
-    let before = model.train_step(&ids, Activations::Saved).unwrap();
+    let before = model.train_step(&ids).unwrap();
     let params = alloc(&rt, &table);
     model.read_parameters(&params).unwrap();
 
     // Writing back what was read changes nothing.
     model.write_parameters(&params).unwrap();
-    let same = model.train_step(&ids, Activations::Saved).unwrap();
+    let same = model.train_step(&ids).unwrap();
     assert_eq!(same.loss.to_bits(), before.loss.to_bits(), "a write of the read values moved the loss");
 
     // One SGD step: p - lr * g, written back, then read again.
@@ -144,7 +143,7 @@ fn a_write_round_trips_and_moves_both_forwards_together() {
     }
     // Loss decreases along the negative gradient, and the training step and
     // the inference forward (which reads the rebuilt LM head) agree.
-    let after = model.train_step(&ids, Activations::Saved).unwrap();
+    let after = model.train_step(&ids).unwrap();
     assert!(after.loss < before.loss, "loss {} -> {}", before.loss, after.loss);
     let infer = inference_loss(&model, &ids);
     assert!((infer - after.loss).abs() <= 1e-5 * after.loss, "inference {infer} vs training {}", after.loss);
@@ -187,7 +186,7 @@ fn refusals_leave_the_model_untouched() {
     let (rt, model, _st) = load(Precision::F32);
     let ids = ids();
     let table = model.parameter_table().unwrap();
-    let before = model.train_step(&ids, Activations::Saved).unwrap().loss;
+    let before = model.train_step(&ids).unwrap().loss;
     let e = |r: Result<(), String>, needle: &str| {
         let m = r.expect_err(needle);
         assert!(m.contains(needle), "{m:?} lacks {needle:?}");
@@ -206,7 +205,7 @@ fn refusals_leave_the_model_untouched() {
     let mut wrong = alloc(&rt, &table);
     wrong[0] = bf;
     e(model.read_parameters(&wrong), "embed_tokens.weight must be f32");
-    assert_eq!(model.train_step(&ids, Activations::Saved).unwrap().loss.to_bits(), before.to_bits());
+    assert_eq!(model.train_step(&ids).unwrap().loss.to_bits(), before.to_bits());
 
     let (_, bf16, _) = load(Precision::Bf16);
     e(bf16.read_parameters(&alloc(&rt, &table)), "Precision::F32");

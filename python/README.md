@@ -32,7 +32,7 @@ model = tessl_torch.Qwen35("model.safetensors", "config.json")  # prefix "model.
 params = model.parameters()           # f32 master copy on MPS, transformers' names and shapes
 opt = torch.optim.AdamW(params.values(), lr=1e-5)
 for ids in batches:                   # one sequence of token ids per step
-    loss = model.train_step(ids)      # recompute=True: only each layer's input is kept
+    loss = model.train_step(ids)      # tessl: the loss and every gradient
     for name, g in model.grads().items():
         params[name].grad = g
     opt.step()

@@ -206,6 +206,7 @@ pub mod nn;
 pub mod npy;
 pub mod ops;
 pub mod qwen35;
+pub mod qwen35_model;
 pub mod runtime;
 pub mod safetensors;
 pub mod tensor;

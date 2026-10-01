@@ -168,7 +168,7 @@ All notable changes to `tessl` are recorded here. The format follows
   `clip_grad_norm_`'s coefficient. The caller forms it, so gradients
   outside tessl (a head of its own) join the norm. Checked against
   `clip_grad_norm_` then `torch.optim.AdamW` within 1e-6.
-- **`Qwen35Model::train_step_into(ids, operands, bank, accumulate)`**
+- **`Qwen35Model::train_step_into(ids, operands, sup, bank, accumulate)`**
   writes a step's gradients into a bank from `Qwen35Grads::zeros_like`
   (over it, or added to it), so several sequences' gradients sum in place.
   Each layer's gradients go into the bank as soon as its backward is
@@ -176,7 +176,17 @@ All notable changes to `tessl` are recorded here. The format follows
   wait, so a few layers' are held at once on Qwen3.5, not every gradient).
   A copy is `train_step`'s bits and an add is one f32 rounding
   (`tests/qwen35_train.rs`). `Qwen35Grads::zeros_like` also allocates
-  AdamW's moments (it moved from `qwen35_adamw`).
+  AdamW's moments (it moved from `qwen35_adamw`). What the step scores is a
+  `Supervise`: `Causal` (transformers' causal-LM mean, `train_step`'s) or
+  `Rows { positions, targets, scale }`, chosen hidden positions against
+  given tokens, returning the sum of their cross-entropies with the
+  gradients of `scale` times it (so a batch mean over rows spread across
+  steps is `scale = 1 / N` in each); an empty selection is allowed (zero
+  loss). The rows' gradient goes back through
+  `qwen35_bwd::scatter_add_rows` (kernel `qwen35_scatter_add_rows_f32`).
+  Checked against the causal step (every row at `1 / (T - 1)`), additivity
+  over disjoint sets, and causality (a position on the sequence cut just
+  after it).
 - **`Qwen35Model::train_step(ids, operands)` and
   `cross_entropy_rows(.., reduction, operands, ws, grads)`** take a
   `gemm::GemmOperands`: `ExactF32` (the previous behaviour) or `Bf16`, bf16

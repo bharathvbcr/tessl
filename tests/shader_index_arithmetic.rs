@@ -557,6 +557,10 @@ fn qwen35_bwd_offsets_are_widened() {
             "dst[(ulong)r * ld_dst + dst_off + c] = src[(ulong)r * ld_src + src_off + c];",
             "window copy",
         ),
+        (
+            "dst[(ulong)pos[i] * width + c] += src[(ulong)i * width + c];",
+            "row scatter",
+        ),
     ] {
         require(QWEN35_BWD, needle, what);
     }

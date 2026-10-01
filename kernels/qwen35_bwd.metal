@@ -1,7 +1,8 @@
 // Backward of the Qwen3.5 row-local ops: RMSNorm, the GDN gated RMSNorm,
 // SwiGLU, the attention output gate, the GDN causal conv + SiLU, the GDN
 // gates, the attention Q/K norm + partial RoPE and the embedding gather; and
-// a column-window copy for moving operands between fused and dense layouts.
+// a column-window copy for moving operands between fused and dense layouts,
+// and a row scatter for gradients at chosen positions.
 //
 // Every operand keeps the forward's layout, windows included (`ld`, `off`),
 // so a gradient lands where the next GEMM backward reads it: dgate/dup side by
@@ -692,4 +693,25 @@ kernel void qwen35_copy_cols_f32(
     const uint r = gid.y;
     if (c >= width || r >= rows) return;
     dst[(ulong)r * ld_dst + dst_off + c] = src[(ulong)r * ld_src + src_off + c];
+}
+
+/// `dst[pos[i] * width + c] += src[i * width + c]`: the dense `[n, width]`
+/// rows of `src` added into rows `pos` of a dense `[T, width]` `dst` (a
+/// gradient for chosen positions, back into the whole sequence's). The host
+/// checks that `pos` is in range and has no repeats, so no two threads
+/// write one element.
+///
+/// Grid: x = column in [0, width), y = i in [0, n).
+kernel void qwen35_scatter_add_rows_f32(
+    device const float *src [[buffer(0)]],
+    device const uint *pos [[buffer(1)]],
+    device float *dst [[buffer(2)]],
+    constant uint &n [[buffer(3)]],
+    constant uint &width [[buffer(4)]],
+    uint2 gid [[thread_position_in_grid]])
+{
+    const uint c = gid.x;
+    const uint i = gid.y;
+    if (c >= width || i >= n) return;
+    dst[(ulong)pos[i] * width + c] += src[(ulong)i * width + c];
 }

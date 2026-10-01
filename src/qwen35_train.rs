@@ -23,7 +23,8 @@
 //! Scope: one sequence, positions from 0, value heads equal to key heads in
 //! the GDN (Qwen3.5-2B's 16 and 16; `gdn_train` has no head grouping).
 //! Several sequences' gradients sum in a bank through
-//! [`Qwen35Model::train_step_into`], one sequence at a time.
+//! [`Qwen35Model::train_step_into`], one sequence at a time, and a step can
+//! score chosen positions against given tokens instead ([`Supervise::Rows`]).
 //!
 //! The forward keeps only the residual stream into each layer (`T x hidden`
 //! f32); each layer's intermediates are rebuilt from it just before that
@@ -45,7 +46,7 @@ use crate::qwen35::{self, AttnShape, AttnTargets, Cols, GdnParams, OutCols, Stat
 use crate::qwen35_bwd::{
     attn_gate_bwd, attn_qk_norm_rope_bwd, attn_qk_norm_rope_bwd_part_len, conv1d_silu_bwd, conv1d_silu_bwd_part_len,
     copy_cols, embed_rows_bwd, gated_rms_norm_bwd, gated_rms_norm_bwd_part_len, gdn_gates_bwd, gdn_gates_bwd_part_len,
-    rms_norm_bwd, rms_norm_bwd_part_len, swiglu_bwd, AttnQkvGrads, EmbedBwdWorkspace,
+    rms_norm_bwd, rms_norm_bwd_part_len, scatter_add_rows, swiglu_bwd, AttnQkvGrads, EmbedBwdWorkspace,
 };
 use crate::qwen35_model::{AttnWeights, GdnWeights, Layer, Mixer, Precision, Qwen35Model};
 use crate::runtime::GpuRuntime;
@@ -240,6 +241,26 @@ fn deliver(rt: &Arc<GpuRuntime>, src: &[Part<'_>], dst: &[Part<'_>], add: bool) 
     Ok(())
 }
 
+/// What a step scores.
+#[derive(Clone, Copy, Debug)]
+pub enum Supervise<'a> {
+    /// transformers' causal-LM loss: position `t` predicts `ids[t + 1]`, the
+    /// mean over the `T - 1` predicted positions.
+    Causal,
+    /// The hidden state at `positions[i]` scored against token `targets[i]`
+    /// (for a next-token loss, `targets[i] = ids[positions[i] + 1]`). The step
+    /// returns the sum of these cross-entropies and the gradients of
+    /// `scale` times it, so a batch mean over `N` rows spread across several
+    /// steps is `scale = 1 / N` in each. Positions are distinct and below `T`;
+    /// none at all is allowed (the gradients are then those of whatever
+    /// else the step is given, here none).
+    Rows {
+        positions: &'a [u32],
+        targets: &'a [u32],
+        scale: f32,
+    },
+}
+
 /// What [`Qwen35Model::train_step`] returns.
 pub struct TrainStep {
     /// Mean cross-entropy over the `T - 1` predicted positions.
@@ -345,7 +366,7 @@ impl Qwen35Model {
     /// transformers' `Qwen3_5ForCausalLM(input_ids=ids, labels=ids)` reports
     /// and every parameter's gradient of it.
     pub fn train_step(&self, ids: &[u32], operands: GemmOperands) -> Result<TrainStep, String> {
-        let (loss, grads) = self.step(ids, operands, None)?;
+        let (loss, grads) = self.step(ids, operands, Supervise::Causal, None)?;
         let grads = grads.ok_or("Qwen35Model::train_step: the step returned no gradients")?;
         Ok(TrainStep { loss, grads })
     }
@@ -359,16 +380,17 @@ impl Qwen35Model {
     /// layer's on a model with no wait inside the backward), plus the 2 GB
     /// embedding's on the 2B, rather than a second copy of every gradient
     /// held to the end. The bank is checked against the model before anything
-    /// runs. Returns the loss.
+    /// runs. `sup` says what the loss scores; returns that loss.
     pub fn train_step_into(
         &self,
         ids: &[u32],
         operands: GemmOperands,
+        sup: Supervise<'_>,
         bank: &Qwen35Grads,
         accumulate: bool,
     ) -> Result<f64, String> {
         self.check_bank("Qwen35Model::train_step_into", bank)?;
-        Ok(self.step(ids, operands, Some((bank, accumulate)))?.0)
+        Ok(self.step(ids, operands, sup, Some((bank, accumulate)))?.0)
     }
 
     /// `bank` has a buffer of each weight's size for every weight.
@@ -408,6 +430,7 @@ impl Qwen35Model {
         &self,
         ids: &[u32],
         operands: GemmOperands,
+        sup: Supervise<'_>,
         bank: Option<(&Qwen35Grads, bool)>,
     ) -> Result<(f64, Option<Qwen35Grads>), String> {
         const WHAT: &str = "Qwen35Model::train_step";
@@ -429,11 +452,44 @@ impl Qwen35Model {
                 cfg.gdn.k_heads()
             ));
         }
-        if ids.len() < 2 {
-            return Err(format!("{WHAT}: a step needs at least two tokens (one prediction)"));
+        match sup {
+            Supervise::Causal if ids.len() < 2 => {
+                return Err(format!("{WHAT}: a step needs at least two tokens (one prediction)"));
+            }
+            Supervise::Rows { .. } if ids.is_empty() => return Err(format!("{WHAT}: no tokens")),
+            _ => {}
         }
         if let Some(&bad) = ids.iter().find(|&&id| id >= cfg.vocab) {
             return Err(format!("{WHAT}: token id {bad} >= vocab {}", cfg.vocab));
+        }
+        if let Supervise::Rows {
+            positions,
+            targets,
+            scale,
+        } = sup
+        {
+            if positions.len() != targets.len() {
+                return Err(format!(
+                    "{WHAT}: {} positions but {} targets",
+                    positions.len(),
+                    targets.len()
+                ));
+            }
+            if let Some(&bad) = targets.iter().find(|&&id| id >= cfg.vocab) {
+                return Err(format!("{WHAT}: target {bad} >= vocab {}", cfg.vocab));
+            }
+            let mut seen = vec![false; ids.len()];
+            for &p in positions {
+                let slot = seen
+                    .get_mut(p as usize)
+                    .ok_or_else(|| format!("{WHAT}: position {p} >= {} tokens", ids.len()))?;
+                if std::mem::replace(slot, true) {
+                    return Err(format!("{WHAT}: position {p} is supervised twice"));
+                }
+            }
+            if !scale.is_finite() {
+                return Err(format!("{WHAT}: scale {scale} must be finite"));
+            }
         }
         let t = u32::try_from(ids.len()).map_err(|_| format!("{WHAT}: too many tokens"))?;
         let (tu, h) = (t as usize, cfg.hidden as usize);
@@ -467,29 +523,58 @@ impl Qwen35Model {
         self.norm_f32(&resid, &self.final_norm, &xf, t)?;
 
         // ---- loss and the LM head ------------------------------------------
-        let n = tu - 1;
-        let rows: Vec<u32> = (0..n as u32).collect();
-        let targets = &ids[1..];
-        let ce_ws = CeWorkspace::new(rt, n as u32, cfg.hidden, CE_CHUNK.min(cfg.vocab), self.embed.dtype)?;
         let d_embed = tensor(rt, &[cfg.vocab as usize, h])?;
         let dxf = tensor(rt, &[tu, h])?;
-        // The last position predicts nothing: its gradient row stays zero.
+        // Positions nothing scores keep a zero gradient row.
         dxf.buffer.zero();
-        let out = cross_entropy_rows(
-            rt,
-            CeHidden { rows: &xf, off: 0 },
-            &self.embed,
-            &rows,
-            targets,
-            Reduction::Mean,
-            operands,
-            &ce_ws,
-            Some(CeGrads {
-                dh: &dxf.view(&[n, h], 0),
-                dw: &d_embed,
-                scale: 1.0,
-            }),
-        )?;
+        let ce = |rows: &[u32], targets: &[u32], reduction, dh: &Tensor, scale| {
+            let ws = CeWorkspace::new(
+                rt,
+                rows.len() as u32,
+                cfg.hidden,
+                CE_CHUNK.min(cfg.vocab),
+                self.embed.dtype,
+            )?;
+            cross_entropy_rows(
+                rt,
+                CeHidden { rows: &xf, off: 0 },
+                &self.embed,
+                rows,
+                targets,
+                reduction,
+                operands,
+                &ws,
+                Some(CeGrads {
+                    dh,
+                    dw: &d_embed,
+                    scale,
+                }),
+            )
+        };
+        let loss = match sup {
+            Supervise::Causal => {
+                // Rows 0..n are the first n rows of dxf: the gradient lands in place.
+                let n = tu - 1;
+                let rows: Vec<u32> = (0..n as u32).collect();
+                ce(&rows, &ids[1..], Reduction::Mean, &dxf.view(&[n, h], 0), 1.0)?.loss
+            }
+            Supervise::Rows { positions: [], .. } => {
+                // No loss: the head adds nothing, and the embedding's
+                // gradient is the gather's alone.
+                d_embed.buffer.zero();
+                0.0
+            }
+            Supervise::Rows {
+                positions,
+                targets,
+                scale,
+            } => {
+                let dh = tensor(rt, &[positions.len(), h])?;
+                let out = ce(positions, targets, Reduction::Sum, &dh, scale)?;
+                scatter_add_rows(rt, &dh, positions, &dxf)?;
+                out.loss
+            }
+        };
 
         // ---- backward -------------------------------------------------------
         let mut sc = self.scratch(t)?;
@@ -539,11 +624,11 @@ impl Qwen35Model {
         if let Some((b, add)) = bank {
             deliver(rt, &[tensor_part(&d_embed)], &[tensor_part(&b.embed)], add)?;
             rt.synchronize()?;
-            return Ok((out.loss, None));
+            return Ok((loss, None));
         }
         rt.synchronize()?;
         Ok((
-            out.loss,
+            loss,
             Some(Qwen35Grads {
                 embed: d_embed,
                 final_norm,

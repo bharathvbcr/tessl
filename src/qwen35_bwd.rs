@@ -22,7 +22,7 @@ use crate::dispatch::{dispatch_1d, dispatch_2d, set_f32, set_gpu_buf, set_gpu_bu
 use crate::nn::{dispatch_tg_1d, reduce_tptg, require, require_disjoint_writes};
 use crate::qwen35::{require_window, AttnProjLayout, AttnShape, Cols, GdnGateLogits, GdnParams};
 use crate::runtime::GpuRuntime;
-use crate::tensor::GpuBuffer;
+use crate::tensor::{DType, GpuBuffer, Tensor};
 
 /// Columns one thread of a weight-gradient kernel can own
 /// (`BWD_MAX_COLS` in the kernel).
@@ -804,6 +804,57 @@ pub fn gdn_gates_bwd(
     })?;
     col_sum_blocks(rt, part, 0, da_log, nb, heads)?;
     col_sum_blocks(rt, part, nb as usize * heads as usize, ddt_bias, nb, heads)
+}
+
+/// `dst[pos[i], :] += src[i, :]`: the dense f32 `[pos.len(), width]` rows of
+/// `src` added into rows `pos` of the dense f32 `[rows, width]` `dst` (the
+/// gradient of chosen positions back into the whole sequence's). `pos` must
+/// be in range and have no repeats (checked here), so the adds never race;
+/// each element gets one f32 add. `src` and `dst` must not overlap.
+pub fn scatter_add_rows(rt: &Arc<GpuRuntime>, src: &Tensor, pos: &[u32], dst: &Tensor) -> Result<(), String> {
+    const WHAT: &str = "qwen35_bwd::scatter_add_rows";
+    let n = pos.len();
+    let (ds, ss) = (dst.shape(), src.shape());
+    if ds.len() != 2 || ss != [n, ds[1]] {
+        return Err(format!(
+            "{WHAT}: src {ss:?} must be [{n}, width] for dst {ds:?} ([rows, width])"
+        ));
+    }
+    for (name, t) in [("src", src), ("dst", dst)] {
+        if t.dtype != DType::F32 {
+            return Err(format!("{WHAT}: {name} must be f32, got {:?}", t.dtype));
+        }
+    }
+    if src.overlaps(dst) {
+        return Err(format!("{WHAT}: src and dst overlap"));
+    }
+    let (rows, width) = (ds[0], ds[1]);
+    let mut seen = vec![false; rows];
+    for &p in pos {
+        let slot = seen
+            .get_mut(p as usize)
+            .ok_or_else(|| format!("{WHAT}: position {p} >= {rows} rows"))?;
+        if std::mem::replace(slot, true) {
+            return Err(format!("{WHAT}: position {p} appears twice"));
+        }
+    }
+    if n == 0 || width == 0 {
+        return Ok(());
+    }
+    let (n32, w32) = (
+        u32::try_from(n).map_err(|_| format!("{WHAT}: {n} rows exceed u32"))?,
+        u32::try_from(width).map_err(|_| format!("{WHAT}: width {width} exceeds u32"))?,
+    );
+    let pos_buf = rt.alloc_buffer(std::mem::size_of_val(pos))?;
+    pos_buf.write_u32(pos);
+    let p = rt.pipeline("qwen35_scatter_add_rows_f32")?;
+    dispatch_2d(rt, &p, width, n, |bnd| {
+        set_gpu_buf_offset(bnd, &src.buffer, src.byte_offset(), 0);
+        set_gpu_buf(bnd, &pos_buf, 1);
+        set_gpu_buf_offset(bnd, &dst.buffer, dst.byte_offset(), 2);
+        set_u32(bnd, n32, 3);
+        set_u32(bnd, w32, 4);
+    })
 }
 
 /// `dst`'s window `= src`'s window: `rows x width` f32 between two column

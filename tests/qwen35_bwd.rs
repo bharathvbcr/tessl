@@ -17,7 +17,7 @@ use tessl::qwen35::{self, AttnShape, Cols, GdnGateLogits, GdnParams};
 use tessl::qwen35_bwd::{
     attn_gate_bwd, attn_qk_norm_rope_bwd, attn_qk_norm_rope_bwd_part_len, conv1d_silu_bwd, conv1d_silu_bwd_part_len,
     copy_cols, embed_rows_bwd, gated_rms_norm_bwd, gated_rms_norm_bwd_part_len, gdn_gates_bwd, gdn_gates_bwd_part_len,
-    rms_norm_bwd, rms_norm_bwd_part_len, swiglu_bwd, AttnQkvGrads, EmbedBwdWorkspace,
+    rms_norm_bwd, rms_norm_bwd_part_len, scatter_add_rows, swiglu_bwd, AttnQkvGrads, EmbedBwdWorkspace,
 };
 use tessl::tensor::GpuBuffer;
 use tessl::GpuRuntime;
@@ -1465,5 +1465,45 @@ fn randomized_shapes_stress() {
             let ids: Vec<u32> = (0..n).map(|_| r.range(0, vocab - 1) as u32).collect();
             run_embed(rt, &ws, &ids, vocab, hidden, s);
         }
+    });
+}
+
+/// Rows of `src` added into rows `pos` of `dst`, the other rows untouched,
+/// one f32 add each; a repeated or out-of-range position is refused before
+/// anything is written.
+#[test]
+fn scatter_add_rows_adds_each_row_at_its_position() {
+    with_gpu(|rt| {
+        let (rows, width) = (7usize, 37usize);
+        let pos = [5u32, 0, 3];
+        let src_v = random_f32(pos.len() * width, 11);
+        let dst_v = random_f32(rows * width, 12);
+        let src = rt.alloc_tensor_f32(&[pos.len(), width]).unwrap();
+        src.buffer.write_f32(&src_v);
+        let dst = rt.alloc_tensor_f32(&[rows, width]).unwrap();
+        dst.buffer.write_f32(&dst_v);
+        scatter_add_rows(rt, &src, &pos, &dst).unwrap();
+        rt.synchronize().unwrap();
+        let got = dst.read_f32().unwrap();
+        let mut want = dst_v.clone();
+        for (i, &p) in pos.iter().enumerate() {
+            for c in 0..width {
+                want[p as usize * width + c] += src_v[i * width + c];
+            }
+        }
+        let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+        assert_eq!(bits(&got), bits(&want));
+
+        for (bad, needle) in [
+            (&[1u32, 1, 2][..], "position 1 appears twice"),
+            (&[0, 7, 2][..], "position 7 >= 7 rows"),
+        ] {
+            let m = scatter_add_rows(rt, &src, bad, &dst).unwrap_err();
+            assert!(m.contains(needle), "{m:?} lacks {needle:?}");
+        }
+        let m = scatter_add_rows(rt, &src, &pos[..2], &dst).unwrap_err();
+        assert!(m.contains("must be [2, width]"), "{m}");
+        rt.synchronize().unwrap();
+        assert_eq!(bits(&dst.read_f32().unwrap()), bits(&want), "a refusal wrote");
     });
 }

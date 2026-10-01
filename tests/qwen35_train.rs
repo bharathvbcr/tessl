@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 use tessl::gemm::GemmOperands;
 use tessl::npy::read_npy;
 use tessl::qwen35_model::{LayerKind, Precision, Qwen35Config, Qwen35Model};
-use tessl::qwen35_train::{MixerGrads, Qwen35Grads, TrainStep};
+use tessl::qwen35_train::{MixerGrads, Qwen35Grads, Supervise, TrainStep};
 use tessl::safetensors::SafeTensors;
 use tessl::tensor::{GpuBuffer, Tensor};
 use tessl::GpuRuntime;
@@ -387,13 +387,13 @@ fn a_bank_holds_a_steps_gradients_and_accumulates_the_next() {
     let (wa, wb) = (bits(&cfg, &fa.grads), bits(&cfg, &fb.grads));
 
     let bank = Qwen35Grads::zeros_like(&model).unwrap();
-    let la = model.train_step_into(&a, mm, &bank, false).unwrap();
+    let la = model.train_step_into(&a, mm, Supervise::Causal, &bank, false).unwrap();
     assert_eq!(la.to_bits(), fa.loss.to_bits());
     for ((name, got), (_, want)) in bits(&cfg, &bank).iter().zip(&wa) {
         assert_eq!(got, want, "{name}: the bank is not the step's gradient");
     }
 
-    let lb = model.train_step_into(&b, mm, &bank, true).unwrap();
+    let lb = model.train_step_into(&b, mm, Supervise::Causal, &bank, true).unwrap();
     assert_eq!(lb.to_bits(), fb.loss.to_bits());
     let mut moved = 0;
     for (((name, got), (_, x)), (_, y)) in bits(&cfg, &bank).iter().zip(&wa).zip(&wb) {
@@ -405,14 +405,14 @@ fn a_bank_holds_a_steps_gradients_and_accumulates_the_next() {
     }
     assert!(moved > 0, "the second step added nothing");
 
-    model.train_step_into(&b, mm, &bank, false).unwrap();
+    model.train_step_into(&b, mm, Supervise::Causal, &bank, false).unwrap();
     for ((name, got), (_, want)) in bits(&cfg, &bank).iter().zip(&wb) {
         assert_eq!(got, want, "{name}: accumulate = false did not write over the bank");
     }
 
     let e = |bank: &Qwen35Grads, needle: &str| {
         let m = model
-            .train_step_into(&a, mm, bank, true)
+            .train_step_into(&a, mm, Supervise::Causal, bank, true)
             .err()
             .unwrap_or_else(|| panic!("{needle}: accepted"));
         assert!(m.contains(needle), "{m:?} lacks {needle:?}");
@@ -426,6 +426,141 @@ fn a_bank_holds_a_steps_gradients_and_accumulates_the_next() {
         MixerGrads::Attn(g) => g.q_norm.clone(),
     };
     e(&odd, "the bank's final_norm holds");
+}
+
+/// The worst per-parameter `rel` between two sets of gradients, and its name.
+fn worst_rel(cfg: &Qwen35Config, got: &Qwen35Grads, want: &Qwen35Grads) -> (f64, String) {
+    by_name(cfg, got, "")
+        .iter()
+        .zip(by_name(cfg, want, ""))
+        .map(|((n, g), (_, w))| (rel(g, &w), n.clone()))
+        .fold((0.0, String::new()), |a, b| if b.0 > a.0 { b } else { a })
+}
+
+/// A step into a fresh bank, returning the loss and the bank.
+fn into_fresh(model: &Qwen35Model, ids: &[u32], sup: Supervise<'_>) -> (f64, Qwen35Grads) {
+    let bank = Qwen35Grads::zeros_like(model).unwrap();
+    let loss = model
+        .train_step_into(ids, GemmOperands::ExactF32, sup, &bank, false)
+        .unwrap();
+    (loss, bank)
+}
+
+/// Each position in `p` scored against the token after it, at `scale`.
+fn next_token(ids: &[u32], p: &[u32], scale: f32) -> (Vec<u32>, Vec<u32>, f32) {
+    (p.to_vec(), p.iter().map(|&i| ids[i as usize + 1]).collect(), scale)
+}
+
+fn rows_of(sel: &(Vec<u32>, Vec<u32>, f32)) -> Supervise<'_> {
+    Supervise::Rows {
+        positions: &sel.0,
+        targets: &sel.1,
+        scale: sel.2,
+    }
+}
+
+/// `Supervise::Rows` against what is already checked against transformers
+/// (the causal step) and against itself. Bounds set before the first run: a
+/// sum in another order, 1e-5 of each parameter's peak and 1e-6 of the loss.
+/// - Every position, `scale = 1 / (T - 1)`: the causal step's loss (as a sum)
+///   and gradients.
+/// - Two disjoint position sets accumulated in a bank: the union's.
+/// - Causality: one position scored on the whole sequence is the same
+///   position on the sequence cut just after it, loss and gradients. A
+///   gradient scattered onto a later row breaks this (the cut sequence has no
+///   such row), and the neighbouring position's loss differs, so the position
+///   is not off by one.
+/// - No position at all: zero loss and zero gradients everywhere.
+#[test]
+fn supervised_rows_are_the_causal_loss_restricted() {
+    let dir = fixture();
+    let cfg = tiny_config();
+    let model = load(&dir, "model.", cfg.clone(), Precision::F32);
+    let mm = GemmOperands::ExactF32;
+    let ids = ids(&dir);
+    let t = ids.len();
+    let n = t - 1;
+    let all: Vec<u32> = (0..n as u32).collect();
+    let causal = model.train_step(&ids, mm).unwrap();
+
+    let (sum, g) = into_fresh(&model, &ids, rows_of(&next_token(&ids, &all, 1.0 / n as f32)));
+    assert!(
+        (sum / n as f64 - causal.loss).abs() <= 1e-6 * causal.loss.abs(),
+        "{sum} / {n} vs {}",
+        causal.loss
+    );
+    let (w, name) = worst_rel(&cfg, &g, &causal.grads);
+    assert!(w <= 1e-5, "every row at 1/(T-1) vs the causal step: {name} {w:.3e}");
+
+    let (evens, odds): (Vec<u32>, Vec<u32>) = all.iter().partition(|&&p| p % 2 == 0);
+    let bank = Qwen35Grads::zeros_like(&model).unwrap();
+    let le = model
+        .train_step_into(&ids, mm, rows_of(&next_token(&ids, &evens, 0.5)), &bank, false)
+        .unwrap();
+    let lo = model
+        .train_step_into(&ids, mm, rows_of(&next_token(&ids, &odds, 0.5)), &bank, true)
+        .unwrap();
+    let (lu, union) = into_fresh(&model, &ids, rows_of(&next_token(&ids, &all, 0.5)));
+    assert!((le + lo - lu).abs() <= 1e-6 * lu.abs(), "{le} + {lo} vs {lu}");
+    let (w, name) = worst_rel(&cfg, &bank, &union);
+    assert!(w <= 1e-5, "evens + odds vs all: {name} {w:.3e}");
+
+    let p = (t / 2) as u32;
+    let one = next_token(&ids, &[p], 1.0);
+    let (lf, full) = into_fresh(&model, &ids, rows_of(&one));
+    let (lc, cut) = into_fresh(&model, &ids[..p as usize + 1], rows_of(&one));
+    assert!((lf - lc).abs() <= 1e-6 * lf.abs(), "{lf} vs {lc}");
+    let (w, name) = worst_rel(&cfg, &full, &cut);
+    assert!(
+        w <= 1e-5,
+        "position {p} on the whole sequence vs cut after it: {name} {w:.3e}"
+    );
+    let (ln, _) = into_fresh(&model, &ids, rows_of(&next_token(&ids, &[p - 1], 1.0)));
+    assert_ne!(ln.to_bits(), lf.to_bits());
+
+    let (l0, none) = into_fresh(&model, &ids, rows_of(&next_token(&ids, &[], 1.0)));
+    assert_eq!(l0, 0.0);
+    for (name, v) in by_name(&cfg, &none, "") {
+        assert!(
+            v.iter().all(|&x| x == 0.0),
+            "{name}: a step that scores nothing has a gradient"
+        );
+    }
+}
+
+/// `Supervise::Rows` refuses what it cannot score, before anything runs.
+#[test]
+fn supervised_rows_refuse_bad_selections() {
+    let dir = fixture();
+    let model = load(&dir, "model.", tiny_config(), Precision::F32);
+    let bank = Qwen35Grads::zeros_like(&model).unwrap();
+    let ids = [1u32, 2, 3, 4];
+    let e = |positions: &[u32], targets: &[u32], scale: f32, needle: &str| {
+        let sup = Supervise::Rows {
+            positions,
+            targets,
+            scale,
+        };
+        let m = model
+            .train_step_into(&ids, GemmOperands::ExactF32, sup, &bank, false)
+            .err()
+            .unwrap_or_else(|| panic!("{needle}: accepted"));
+        assert!(m.contains(needle), "{m:?} lacks {needle:?}");
+    };
+    e(&[0, 1], &[2], 1.0, "2 positions but 1 targets");
+    e(&[4], &[2], 1.0, "position 4 >= 4 tokens");
+    e(&[1, 1], &[2, 3], 1.0, "position 1 is supervised twice");
+    e(&[1], &[64], 1.0, "target 64 >= vocab 64");
+    e(&[1], &[2], f32::NAN, "scale NaN must be finite");
+    // One token is enough when the target is given.
+    let sup = Supervise::Rows {
+        positions: &[0],
+        targets: &[7],
+        scale: 1.0,
+    };
+    model
+        .train_step_into(&ids[..1], GemmOperands::ExactF32, sup, &bank, false)
+        .unwrap();
 }
 
 /// The 2B reference directory (`make_train_fixture.py 2b`), the model loaded

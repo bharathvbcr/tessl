@@ -24,6 +24,14 @@
 //! training ops are `gdn_train` forward + backward; an attention layer's are
 //! `attn_train` forward + backward; the row-local backwards are listed apart.
 //!
+//! `--batch=ROWS,LEN[,SPAN_ROWS]` (repeatable, with the real checkpoint)
+//! times one optimizer step's gradients for a batch run row by row into one
+//! bank, as a padded batch runs through tessl: letter rows supervise one
+//! position, span rows hand hidden rows to an outside loss and take its
+//! gradient back (span rows need LEN >= 5). Two lengths at one row count
+//! separate the per-row fixed cost from the per-token cost. The warm-up's
+//! gradient norm must be finite and non-zero before it is timed.
+//!
 //! `--step=N` also loads the real checkpoint (`QWEN35_2B_SAFETENSORS`) and
 //! times `Qwen35Model::train_step` on N tokens end to end (median of 3 after
 //! one warm-up), which includes allocating every rebuilt activation and
@@ -587,18 +595,21 @@ fn bench_t(rt: &Arc<GpuRuntime>, t: usize, check_only: bool, operands: GemmOpera
     Ok(())
 }
 
-fn bench_step(rt: &Arc<GpuRuntime>, tokens: usize, operands: GemmOperands) -> Res<()> {
+/// The real 2B checkpoint, in f32.
+fn load_2b(rt: &Arc<GpuRuntime>) -> Res<Qwen35Model> {
     let path = std::env::var("QWEN35_2B_SAFETENSORS")
-        .map_err(|_| "--step needs QWEN35_2B_SAFETENSORS (the Qwen3.5-2B-Base .safetensors)".to_string())?;
+        .map_err(|_| "--step and --batch need QWEN35_2B_SAFETENSORS (the Qwen3.5-2B-Base .safetensors)".to_string())?;
     let st = SafeTensors::open(std::path::Path::new(&path))?;
-    let model = Qwen35Model::load(
+    Qwen35Model::load(
         rt,
         &st,
         "model.language_model.",
         Qwen35Config::qwen35_2b()?,
         Precision::F32,
-    )?;
-    drop(st);
+    )
+}
+
+fn bench_step(model: &Qwen35Model, tokens: usize, operands: GemmOperands) -> Res<()> {
     let ids: Vec<u32> = (0..tokens as u32).map(|i| (i * 104_729 + 17) % VOCAB as u32).collect();
     // Only the loss is kept: holding the warm-up step would double the
     // gradients resident while timing.
@@ -625,28 +636,129 @@ fn bench_step(rt: &Arc<GpuRuntime>, tokens: usize, operands: GemmOperands) -> Re
     Ok(())
 }
 
+/// One `--batch` shape: `rows` sequences of `len` tokens; `span` of them (the
+/// last ones) take a loss outside tessl instead of a supervised position.
+#[derive(Clone, Copy, Debug)]
+struct BatchShape {
+    rows: usize,
+    len: usize,
+    span: usize,
+}
+
+fn parse_batch(v: &str) -> Res<BatchShape> {
+    let bad = || format!("--batch expects ROWS,LEN or ROWS,LEN,SPAN_ROWS, got {v:?}");
+    let parts = v
+        .split(',')
+        .map(|x| x.parse::<usize>().map_err(|_| bad()))
+        .collect::<Res<Vec<_>>>()?;
+    let (rows, len, span) = match parts[..] {
+        [r, l] => (r, l, 0),
+        [r, l, s] => (r, l, s),
+        _ => return Err(bad()),
+    };
+    // A span row hands out 4 distinct positions (0, len/3, len/2, len - 2).
+    if rows == 0 || len < 2 || span > rows || (span > 0 && len < 5) {
+        return Err(format!(
+            "--batch {v:?}: need rows >= 1, len >= 2 (5 with span rows), span rows <= rows"
+        ));
+    }
+    Ok(BatchShape { rows, len, span })
+}
+
+/// One optimizer step's gradients for a batch run row by row, as a padded
+/// batch runs through tessl: each row's forward and backward into one bank,
+/// accumulated. A letter row supervises one position at `1 / letter rows`;
+/// a span row scores nothing in tessl, hands 4 hidden rows out and takes a
+/// fixed gradient back for them. Median of 3 after one warm-up; per row is
+/// the batch time over the rows. The AdamW step itself is not included.
+fn bench_batch(rt: &Arc<GpuRuntime>, model: &Qwen35Model, b: BatchShape, operands: GemmOperands) -> Res<()> {
+    let letters = b.rows - b.span;
+    let rows: Vec<Vec<u32>> = (0..b.rows)
+        .map(|r| {
+            (0..b.len as u32)
+                .map(|i| ((i + 31 * r as u32) * 104_729 + 17) % VOCAB as u32)
+                .collect()
+        })
+        .collect();
+    let at: Vec<u32> = [0, b.len / 3, b.len / 2, b.len - 2].iter().map(|&p| p as u32).collect();
+    let dh = tensor(rt, &[at.len(), HIDDEN], 7, 1e-3)?;
+    let hidden = rt.alloc_tensor_f32(&[at.len(), HIDDEN])?;
+    let bank = tessl::qwen35_train::Qwen35Grads::zeros_like(model)?;
+    let run = || -> Res<()> {
+        for (i, ids) in rows.iter().enumerate() {
+            let accumulate = i > 0;
+            if i < letters {
+                let (pos, tgt) = ([b.len as u32 - 2], [ids[b.len - 1]]);
+                let sup = tessl::qwen35_train::Supervise::Rows {
+                    positions: &pos,
+                    targets: &tgt,
+                    scale: 1.0 / letters as f32,
+                };
+                model.train_step_into(ids, operands, sup, &bank, accumulate)?;
+            } else {
+                let sup = tessl::qwen35_train::Supervise::Rows {
+                    positions: &[],
+                    targets: &[],
+                    scale: 1.0,
+                };
+                let p = model.train_forward(ids, operands, sup)?;
+                p.hidden(&at, &hidden)?;
+                model.train_backward_into(p, Some((&at, &dh)), &bank, accumulate)?;
+            }
+        }
+        rt.synchronize()
+    };
+    run()?;
+    // The warm-up's gradients must be there and finite before anything is timed.
+    let sq = model.grad_sq_norm(&bank)?;
+    if !(sq.is_finite() && sq > 0.0) {
+        return Err(format!("--batch: the warm-up left a gradient norm^2 of {sq}"));
+    }
+    let mut samples = Vec::new();
+    for _ in 0..3 {
+        let t0 = Instant::now();
+        run()?;
+        samples.push(t0.elapsed().as_secs_f64());
+    }
+    let secs = median(samples);
+    println!(
+        "batch {} rows x {} tokens ({} span): {:.3} s per optimizer step, {:.3} s per row ({:.0} tokens/s)",
+        b.rows,
+        b.len,
+        b.span,
+        secs,
+        secs / b.rows as f64,
+        (b.rows * b.len) as f64 / secs
+    );
+    Ok(())
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (mut check_only, mut step, mut ts, mut operands) = (false, None, Vec::new(), GemmOperands::ExactF32);
+    let mut batches = Vec::new();
     for arg in std::env::args().skip(1) {
         if arg == "--bf16" {
             operands = GemmOperands::Bf16;
         } else if arg == "--check-only" {
             check_only = true;
+        } else if let Some(v) = arg.strip_prefix("--batch=") {
+            batches.push(parse_batch(v)?);
         } else if let Some(n) = arg.strip_prefix("--step=") {
             step = Some(
                 n.parse::<usize>()
                     .map_err(|_| format!("--step expects a token count, got {n:?}"))?,
             );
         } else {
-            let t: usize = arg
-                .parse()
-                .map_err(|_| format!("expected a token count, --check-only, --bf16 or --step=N, got {arg:?}"))?;
+            let t: usize = arg.parse().map_err(|_| {
+                format!("expected a token count, --check-only, --bf16, --step=N or --batch=B,L[,S], got {arg:?}")
+            })?;
             if t < 2 {
                 return Err("T must be at least 2 (one prediction)".into());
             }
             ts.push(t);
         }
     }
+    // The per-op gate runs first whatever else is asked: no timing without it.
     if ts.is_empty() {
         ts.push(2048);
     }
@@ -658,8 +770,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     for t in ts {
         bench_t(&rt, t, check_only, operands)?;
     }
-    if let (Some(n), false) = (step, check_only) {
-        bench_step(&rt, n, operands)?;
+    if check_only || (step.is_none() && batches.is_empty()) {
+        if check_only && (step.is_some() || !batches.is_empty()) {
+            println!("--check-only: the per-op gate ran; --step and --batch were not run");
+        }
+        return Ok(());
+    }
+    let model = load_2b(&rt)?;
+    if let Some(n) = step {
+        bench_step(&model, n, operands)?;
+    }
+    for b in batches {
+        bench_batch(&rt, &model, b, operands)?;
     }
     Ok(())
 }

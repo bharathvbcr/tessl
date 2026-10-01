@@ -185,6 +185,11 @@ All notable changes to `tessl` are recorded here. The format follows
   accumulated, the same losses, summed gradients and global norm
   (`python/tests/test_qwen35.py`); the ABI
   against the Rust calls bit for bit (`tests/capi.rs`).
+- **`bench_qwen35_train --batch=ROWS,LEN[,SPAN_ROWS]`** times one optimizer
+  step's gradients for a batch run row by row into one bank (letter rows
+  supervise one position, span rows go through `hidden` and an outside
+  gradient), reporting seconds per optimizer step and per row; two lengths
+  at one row count separate the per-row fixed cost from the per-token cost.
 - **`Qwen35Model::train_step_into(ids, operands, sup, bank, accumulate)`**
   writes a step's gradients into a bank from `Qwen35Grads::zeros_like`
   (over it, or added to it), so several sequences' gradients sum in place.

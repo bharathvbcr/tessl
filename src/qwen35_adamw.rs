@@ -19,9 +19,9 @@
 //! zero-centred norms' `w` included).
 
 use crate::dispatch::{dispatch_2d, dispatch_2d_tg, set_gpu_buf_offset, set_u32};
-use crate::qwen35_model::{Mixer, Qwen35Model};
+use crate::qwen35_model::Qwen35Model;
 use crate::qwen35_params::{slots, Src};
-use crate::qwen35_train::{AttnGrads, GdnGrads, LayerGrads, MixerGrads, Qwen35Grads};
+use crate::qwen35_train::Qwen35Grads;
 use crate::tensor::{GpuBuffer, Tensor};
 
 /// AdamW's hyperparameters other than weight decay, as torch names them,
@@ -61,60 +61,13 @@ pub struct AdamW {
     step: u64,
 }
 
-fn zeros_tensor(t: &Tensor) -> Result<Tensor, String> {
-    // Hot: optimizer state stays resident. Allocations come back zeroed.
-    t.runtime().alloc_tensor_f32_hot(t.shape())
-}
-
-fn zeros_buf(model: &Qwen35Model, b: &GpuBuffer) -> Result<GpuBuffer, String> {
-    let out = model.rt.alloc_buffer_hot(b.nbytes())?;
-    out.zero();
-    Ok(out)
-}
-
-/// Zeroed tensors shaped like every parameter tensor of `model`.
-fn zeros_like(model: &Qwen35Model) -> Result<Qwen35Grads, String> {
-    let mut layers = Vec::with_capacity(model.layers.len());
-    for layer in &model.layers {
-        let mixer = match &layer.mixer {
-            Mixer::Gdn(w) => MixerGrads::Gdn(GdnGrads {
-                w_in: zeros_tensor(&w.w_in)?,
-                w_out: zeros_tensor(&w.w_out)?,
-                conv_w: zeros_buf(model, &w.conv_w)?,
-                a_log: zeros_buf(model, &w.a_log)?,
-                dt_bias: zeros_buf(model, &w.dt_bias)?,
-                norm_w: zeros_buf(model, &w.norm_w)?,
-            }),
-            Mixer::Attn(w) => MixerGrads::Attn(AttnGrads {
-                w_in: zeros_tensor(&w.w_in)?,
-                w_out: zeros_tensor(&w.w_out)?,
-                q_norm: zeros_buf(model, &w.q_norm)?,
-                k_norm: zeros_buf(model, &w.k_norm)?,
-            }),
-        };
-        layers.push(LayerGrads {
-            input_norm: zeros_buf(model, &layer.input_norm)?,
-            post_norm: zeros_buf(model, &layer.post_norm)?,
-            mixer,
-            gate: zeros_tensor(&layer.gate)?,
-            up: zeros_tensor(&layer.up)?,
-            down: zeros_tensor(&layer.down)?,
-        });
-    }
-    Ok(Qwen35Grads {
-        embed: zeros_tensor(&model.embed)?,
-        final_norm: zeros_buf(model, &model.final_norm)?,
-        layers,
-    })
-}
-
 impl AdamW {
     /// Zeroed moments for `model` (twice its parameters' memory).
     pub fn new(model: &Qwen35Model) -> Result<Self, String> {
         model.require_f32("AdamW::new")?;
         Ok(Self {
-            m: zeros_like(model)?,
-            v: zeros_like(model)?,
+            m: Qwen35Grads::zeros_like(model)?,
+            v: Qwen35Grads::zeros_like(model)?,
             step: 0,
         })
     }

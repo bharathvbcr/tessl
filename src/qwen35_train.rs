@@ -22,6 +22,8 @@
 //!
 //! Scope: one sequence, positions from 0, value heads equal to key heads in
 //! the GDN (Qwen3.5-2B's 16 and 16; `gdn_train` has no head grouping).
+//! Several sequences' gradients sum in a bank through
+//! [`Qwen35Model::train_step_into`], one sequence at a time.
 //!
 //! The forward keeps only the residual stream into each layer (`T x hidden`
 //! f32); each layer's intermediates are rebuilt from it just before that
@@ -34,6 +36,7 @@ use std::sync::Arc;
 
 use crate::attn_train::{attn_train_backward, attn_train_forward, AttnTrainDims, AttnTrainGrads, AttnTrainWorkspace};
 use crate::cross_entropy::{cross_entropy_rows, CeGrads, CeHidden, CeWorkspace, Reduction};
+use crate::dispatch::{dispatch_1d, set_gpu_buf_offset, set_u32};
 use crate::gdn_train::{
     gdn_train_backward, gdn_train_forward, GdnTrainDims, GdnTrainGrads, GdnTrainInputs, GdnTrainWorkspace, GDN_TRAIN_DK,
 };
@@ -99,6 +102,142 @@ pub struct Qwen35Grads {
     pub embed: Tensor,
     pub final_norm: GpuBuffer,
     pub layers: Vec<LayerGrads>,
+}
+
+/// One gradient (or weight) buffer: the buffer, the byte offset of its
+/// elements, and how many f32s it holds.
+type Part<'a> = (&'a GpuBuffer, usize, usize);
+
+fn tensor_part(t: &Tensor) -> Part<'_> {
+    (&t.buffer, t.byte_offset(), t.nbytes_logical() / 4)
+}
+
+fn buf_part(b: &GpuBuffer) -> Part<'_> {
+    (b, 0, b.nbytes() / 4)
+}
+
+fn zeros_tensor(t: &Tensor) -> Result<Tensor, String> {
+    // Hot: a bank (optimizer moments, accumulated gradients) stays resident.
+    // Allocations come back zeroed.
+    t.runtime().alloc_tensor_f32_hot(t.shape())
+}
+
+fn zeros_buf(model: &Qwen35Model, b: &GpuBuffer) -> Result<GpuBuffer, String> {
+    let out = model.rt.alloc_buffer_hot(b.nbytes())?;
+    out.zero();
+    Ok(out)
+}
+
+impl LayerGrads {
+    /// Every buffer, in the order [`layer_weight_parts`] walks the weights.
+    fn parts(&self) -> Vec<Part<'_>> {
+        let mut v = vec![buf_part(&self.input_norm), buf_part(&self.post_norm)];
+        match &self.mixer {
+            MixerGrads::Gdn(g) => v.extend([
+                tensor_part(&g.w_in),
+                tensor_part(&g.w_out),
+                buf_part(&g.conv_w),
+                buf_part(&g.a_log),
+                buf_part(&g.dt_bias),
+                buf_part(&g.norm_w),
+            ]),
+            MixerGrads::Attn(g) => v.extend([
+                tensor_part(&g.w_in),
+                tensor_part(&g.w_out),
+                buf_part(&g.q_norm),
+                buf_part(&g.k_norm),
+            ]),
+        }
+        v.extend([tensor_part(&self.gate), tensor_part(&self.up), tensor_part(&self.down)]);
+        v
+    }
+}
+
+/// A layer's weights, in the order [`LayerGrads::parts`] walks its gradients.
+fn layer_weight_parts(layer: &Layer) -> Vec<Part<'_>> {
+    let mut v = vec![buf_part(&layer.input_norm), buf_part(&layer.post_norm)];
+    match &layer.mixer {
+        Mixer::Gdn(w) => v.extend([
+            tensor_part(&w.w_in),
+            tensor_part(&w.w_out),
+            buf_part(&w.conv_w),
+            buf_part(&w.a_log),
+            buf_part(&w.dt_bias),
+            buf_part(&w.norm_w),
+        ]),
+        Mixer::Attn(w) => v.extend([
+            tensor_part(&w.w_in),
+            tensor_part(&w.w_out),
+            buf_part(&w.q_norm),
+            buf_part(&w.k_norm),
+        ]),
+    }
+    v.extend([
+        tensor_part(&layer.gate),
+        tensor_part(&layer.up),
+        tensor_part(&layer.down),
+    ]);
+    v
+}
+
+impl Qwen35Grads {
+    /// Zeroed gradients shaped like every parameter of `model`: a bank for
+    /// [`Qwen35Model::train_step_into`] (and AdamW's moments), resident.
+    pub fn zeros_like(model: &Qwen35Model) -> Result<Self, String> {
+        let mut layers = Vec::with_capacity(model.layers.len());
+        for layer in &model.layers {
+            let mixer = match &layer.mixer {
+                Mixer::Gdn(w) => MixerGrads::Gdn(GdnGrads {
+                    w_in: zeros_tensor(&w.w_in)?,
+                    w_out: zeros_tensor(&w.w_out)?,
+                    conv_w: zeros_buf(model, &w.conv_w)?,
+                    a_log: zeros_buf(model, &w.a_log)?,
+                    dt_bias: zeros_buf(model, &w.dt_bias)?,
+                    norm_w: zeros_buf(model, &w.norm_w)?,
+                }),
+                Mixer::Attn(w) => MixerGrads::Attn(AttnGrads {
+                    w_in: zeros_tensor(&w.w_in)?,
+                    w_out: zeros_tensor(&w.w_out)?,
+                    q_norm: zeros_buf(model, &w.q_norm)?,
+                    k_norm: zeros_buf(model, &w.k_norm)?,
+                }),
+            };
+            layers.push(LayerGrads {
+                input_norm: zeros_buf(model, &layer.input_norm)?,
+                post_norm: zeros_buf(model, &layer.post_norm)?,
+                mixer,
+                gate: zeros_tensor(&layer.gate)?,
+                up: zeros_tensor(&layer.up)?,
+                down: zeros_tensor(&layer.down)?,
+            });
+        }
+        Ok(Self {
+            embed: zeros_tensor(&model.embed)?,
+            final_norm: zeros_buf(model, &model.final_norm)?,
+            layers,
+        })
+    }
+}
+
+/// `dst = src`, or `dst += src` when `add`, for each pair of parts (same
+/// counts, checked by the caller). Elementwise, so exact: a copy is the
+/// source's bits, and one add is one f32 rounding.
+fn deliver(rt: &Arc<GpuRuntime>, src: &[Part<'_>], dst: &[Part<'_>], add: bool) -> Result<(), String> {
+    let p = rt.pipeline(if add { "add_inplace_f32" } else { "copy_f32" })?;
+    for (&(sb, so, n), &(db, doff, _)) in src.iter().zip(dst) {
+        let n32 = u32::try_from(n).map_err(|_| format!("deliver: {n} elements exceed u32"))?;
+        dispatch_1d(rt, &p, n, |bnd| {
+            if add {
+                set_gpu_buf_offset(bnd, db, doff, 0);
+                set_gpu_buf_offset(bnd, sb, so, 1);
+            } else {
+                set_gpu_buf_offset(bnd, sb, so, 0);
+                set_gpu_buf_offset(bnd, db, doff, 1);
+            }
+            set_u32(bnd, n32, 2);
+        })?;
+    }
+    Ok(())
 }
 
 /// What [`Qwen35Model::train_step`] returns.
@@ -206,6 +345,71 @@ impl Qwen35Model {
     /// transformers' `Qwen3_5ForCausalLM(input_ids=ids, labels=ids)` reports
     /// and every parameter's gradient of it.
     pub fn train_step(&self, ids: &[u32], operands: GemmOperands) -> Result<TrainStep, String> {
+        let (loss, grads) = self.step(ids, operands, None)?;
+        let grads = grads.ok_or("Qwen35Model::train_step: the step returned no gradients")?;
+        Ok(TrainStep { loss, grads })
+    }
+
+    /// [`Self::train_step`] with its gradients written into `bank` (from
+    /// [`Qwen35Grads::zeros_like`]) instead of fresh tensors: over what `bank`
+    /// holds, or added to it when `accumulate`, so the gradients of several
+    /// sequences sum in place. Each layer's gradients go into the bank as
+    /// soon as its backward is encoded and is then released: its buffers go
+    /// back to the pool at the next GPU wait (a few layers' on Qwen3.5, every
+    /// layer's on a model with no wait inside the backward), plus the 2 GB
+    /// embedding's on the 2B, rather than a second copy of every gradient
+    /// held to the end. The bank is checked against the model before anything
+    /// runs. Returns the loss.
+    pub fn train_step_into(
+        &self,
+        ids: &[u32],
+        operands: GemmOperands,
+        bank: &Qwen35Grads,
+        accumulate: bool,
+    ) -> Result<f64, String> {
+        self.check_bank("Qwen35Model::train_step_into", bank)?;
+        Ok(self.step(ids, operands, Some((bank, accumulate)))?.0)
+    }
+
+    /// `bank` has a buffer of each weight's size for every weight.
+    fn check_bank(&self, what: &str, bank: &Qwen35Grads) -> Result<(), String> {
+        if bank.layers.len() != self.layers.len() {
+            return Err(format!(
+                "{what}: the bank has {} layers, the model {}",
+                bank.layers.len(),
+                self.layers.len()
+            ));
+        }
+        let top = [
+            ("embed", tensor_part(&bank.embed), tensor_part(&self.embed)),
+            ("final_norm", buf_part(&bank.final_norm), buf_part(&self.final_norm)),
+        ];
+        for (name, (b, _, n), (_, _, want)) in top {
+            if n != want || b.nbytes() == 0 {
+                return Err(format!("{what}: the bank's {name} holds {n} values, the weight {want}"));
+            }
+        }
+        for (i, (g, layer)) in bank.layers.iter().zip(&self.layers).enumerate() {
+            let (have, want) = (g.parts(), layer_weight_parts(layer));
+            if have.len() != want.len() {
+                return Err(format!("{what}: layer {i}'s gradients are not its mixer's"));
+            }
+            for (k, ((_, _, n), (_, _, w))) in have.iter().zip(&want).enumerate() {
+                if n != w {
+                    return Err(format!("{what}: layer {i} buffer {k} holds {n} values, its weight {w}"));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// The step: into fresh gradients (returned) or into `bank`.
+    fn step(
+        &self,
+        ids: &[u32],
+        operands: GemmOperands,
+        bank: Option<(&Qwen35Grads, bool)>,
+    ) -> Result<(f64, Option<Qwen35Grads>), String> {
         const WHAT: &str = "Qwen35Model::train_step";
         let (rt, cfg) = (&self.rt, &self.cfg);
         if self.precision != Precision::F32 {
@@ -303,15 +507,23 @@ impl Qwen35Model {
             cfg.rms_norm_eps,
             false,
         )?;
+        if let Some((b, add)) = bank {
+            deliver(rt, &[buf_part(&final_norm)], &[buf_part(&b.final_norm)], add)?;
+        }
         let mut layers = Vec::with_capacity(self.layers.len());
         // Popped from the back: a layer's rebuilt intermediates are released
-        // as soon as its backward is encoded.
-        for layer in self.layers.iter().rev() {
+        // as soon as its backward is encoded, and its gradients too when they
+        // go into a bank.
+        for (li, layer) in self.layers.iter().enumerate().rev() {
             let resid_in = inputs
                 .pop()
                 .ok_or("Qwen35Model::train_step: fewer layer inputs than layers")?;
             let s = self.train_layer_forward(layer, resid_in, t, false, operands)?.0;
-            layers.push(self.train_layer_backward(layer, &s, &mut sc, operands)?);
+            let g = self.train_layer_backward(layer, &s, &mut sc, operands)?;
+            match bank {
+                Some((b, add)) => deliver(rt, &g.parts(), &b.layers[li].parts(), add)?,
+                None => layers.push(g),
+            }
         }
         layers.reverse();
         let emb_ws = EmbedBwdWorkspace::new(rt, t)?;
@@ -324,15 +536,20 @@ impl Qwen35Model {
             cfg.hidden,
             &emb_ws,
         )?;
+        if let Some((b, add)) = bank {
+            deliver(rt, &[tensor_part(&d_embed)], &[tensor_part(&b.embed)], add)?;
+            rt.synchronize()?;
+            return Ok((out.loss, None));
+        }
         rt.synchronize()?;
-        Ok(TrainStep {
-            loss: out.loss,
-            grads: Qwen35Grads {
+        Ok((
+            out.loss,
+            Some(Qwen35Grads {
                 embed: d_embed,
                 final_norm,
                 layers,
-            },
-        })
+            }),
+        ))
     }
 
     fn scratch(&self, t: u32) -> Result<Scratch, String> {

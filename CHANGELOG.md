@@ -168,6 +168,15 @@ All notable changes to `tessl` are recorded here. The format follows
   `clip_grad_norm_`'s coefficient. The caller forms it, so gradients
   outside tessl (a head of its own) join the norm. Checked against
   `clip_grad_norm_` then `torch.optim.AdamW` within 1e-6.
+- **`Qwen35Model::train_step_into(ids, operands, bank, accumulate)`**
+  writes a step's gradients into a bank from `Qwen35Grads::zeros_like`
+  (over it, or added to it), so several sequences' gradients sum in place.
+  Each layer's gradients go into the bank as soon as its backward is
+  encoded and released (freed buffers return to the pool at the next GPU
+  wait, so a few layers' are held at once on Qwen3.5, not every gradient).
+  A copy is `train_step`'s bits and an add is one f32 rounding
+  (`tests/qwen35_train.rs`). `Qwen35Grads::zeros_like` also allocates
+  AdamW's moments (it moved from `qwen35_adamw`).
 - **`Qwen35Model::train_step(ids, operands)` and
   `cross_entropy_rows(.., reduction, operands, ws, grads)`** take a
   `gemm::GemmOperands`: `ExactF32` (the previous behaviour) or `Bf16`, bf16

@@ -360,6 +360,74 @@ fn train_step_refuses_what_it_does_not_implement() {
     );
 }
 
+/// Every gradient's f32 bits, by name.
+fn bits(cfg: &Qwen35Config, g: &Qwen35Grads) -> Vec<(String, Vec<u32>)> {
+    by_name(cfg, g, "")
+        .into_iter()
+        .map(|(n, v)| (n, v.iter().map(|&x| (x as f32).to_bits()).collect()))
+        .collect()
+}
+
+/// A bank takes a step's gradients as `train_step` returns them (a copy:
+/// the same bits), and with `accumulate` adds the next step's: each value is
+/// the f32 sum of the two steps' own gradients, one rounding. Without it the
+/// next step writes over the bank. A bank not shaped like the model is
+/// refused.
+#[test]
+fn a_bank_holds_a_steps_gradients_and_accumulates_the_next() {
+    let dir = fixture();
+    let cfg = tiny_config();
+    let model = load(&dir, "model.", cfg.clone(), Precision::F32);
+    let a = ids(&dir);
+    // A second, shorter sequence: another length exercises another shape.
+    let b: Vec<u32> = a.iter().rev().take(a.len() - 3).copied().collect();
+    let mm = GemmOperands::ExactF32;
+    let fa = model.train_step(&a, mm).unwrap();
+    let fb = model.train_step(&b, mm).unwrap();
+    let (wa, wb) = (bits(&cfg, &fa.grads), bits(&cfg, &fb.grads));
+
+    let bank = Qwen35Grads::zeros_like(&model).unwrap();
+    let la = model.train_step_into(&a, mm, &bank, false).unwrap();
+    assert_eq!(la.to_bits(), fa.loss.to_bits());
+    for ((name, got), (_, want)) in bits(&cfg, &bank).iter().zip(&wa) {
+        assert_eq!(got, want, "{name}: the bank is not the step's gradient");
+    }
+
+    let lb = model.train_step_into(&b, mm, &bank, true).unwrap();
+    assert_eq!(lb.to_bits(), fb.loss.to_bits());
+    let mut moved = 0;
+    for (((name, got), (_, x)), (_, y)) in bits(&cfg, &bank).iter().zip(&wa).zip(&wb) {
+        for (k, ((&g, &x), &y)) in got.iter().zip(x).zip(y).enumerate() {
+            let want = f32::from_bits(x) + f32::from_bits(y);
+            assert_eq!(g, want.to_bits(), "{name}[{k}]: {} is not {want}", f32::from_bits(g));
+            moved += usize::from(y != 0 && g != x);
+        }
+    }
+    assert!(moved > 0, "the second step added nothing");
+
+    model.train_step_into(&b, mm, &bank, false).unwrap();
+    for ((name, got), (_, want)) in bits(&cfg, &bank).iter().zip(&wb) {
+        assert_eq!(got, want, "{name}: accumulate = false did not write over the bank");
+    }
+
+    let e = |bank: &Qwen35Grads, needle: &str| {
+        let m = model
+            .train_step_into(&a, mm, bank, true)
+            .err()
+            .unwrap_or_else(|| panic!("{needle}: accepted"));
+        assert!(m.contains(needle), "{m:?} lacks {needle:?}");
+    };
+    let mut short = Qwen35Grads::zeros_like(&model).unwrap();
+    short.layers.pop();
+    e(&short, "layers, the model");
+    let mut odd = Qwen35Grads::zeros_like(&model).unwrap();
+    odd.final_norm = match &odd.layers[0].mixer {
+        MixerGrads::Gdn(g) => g.a_log.clone(),
+        MixerGrads::Attn(g) => g.q_norm.clone(),
+    };
+    e(&odd, "the bank's final_norm holds");
+}
+
 /// The 2B reference directory (`make_train_fixture.py 2b`), the model loaded
 /// in f32 from `QWEN35_2B_SAFETENSORS`, and its config.
 fn real_2b() -> (PathBuf, Qwen35Config, Qwen35Model) {

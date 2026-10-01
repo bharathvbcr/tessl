@@ -39,7 +39,10 @@ for step, ids in enumerate(batches):  # one sequence of token ids per step
 `adamw_step` is `torch.optim.AdamW`'s update (checked against it to 1e-6);
 `weight_decay` is a float for every parameter transformers' Trainer decays
 (not the norms or `linear_attn.dt_bias`), or a dict giving each name its own.
-`adamw_step_count` is torch's `state["step"]`.
+`adamw_step_count` is torch's `state["step"]`. `adamw_state()` returns the step
+and both moments by name (torch's `exp_avg` and `exp_avg_sq`); saved with
+`parameters()` and restored with `load_parameters()`, `adamw_init()` and
+`load_adamw_state()`, the run resumes bit for bit.
 
 With torch's own optimizer instead, which holds its own copy of every
 parameter and gradient (about 55 GB on the 2B):

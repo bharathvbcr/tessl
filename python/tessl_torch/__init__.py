@@ -192,6 +192,8 @@ def _load():
         ] + err_args
         lib.tessl_qwen35_adamw_step_count.restype = ctypes.c_int32
         lib.tessl_qwen35_adamw_step_count.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint64)] + err_args
+        lib.tessl_qwen35_adamw_set_step_count.restype = ctypes.c_int32
+        lib.tessl_qwen35_adamw_set_step_count.argtypes = [ctypes.c_void_p, ctypes.c_uint64] + err_args
         _lib = lib
         return lib
 
@@ -610,6 +612,7 @@ def patch_transformers_qwen3_5():
 # ------------------------------------------------------ Qwen3.5 training ---
 
 _READ_PARAMS, _READ_GRADS, _WRITE_PARAMS = 0, 1, 2
+_READ_ADAMW_M, _READ_ADAMW_V, _WRITE_ADAMW_M, _WRITE_ADAMW_V = 3, 4, 5, 6
 
 
 class Qwen35:
@@ -696,6 +699,29 @@ class Qwen35:
         torch.mps.synchronize()
         self._check(self._rt.lib.tessl_qwen35_copy(self._handle, direction, refs, len(tensors), err, _ERR_LEN), err)
 
+    def _check_names(self, what: str, d: dict) -> None:
+        """Refuse ``d`` unless its keys are exactly the parameter names; ``what``
+        leads the message."""
+        names = [name for name, _, _ in self._table]
+        missing = [n for n in names if n not in d]
+        extra = [n for n in d if n not in set(names)]
+        if missing or extra:
+            raise TesslError(f"{what} missing {missing[:3]}{'...' if len(missing) > 3 else ''}, "
+                             f"unexpected {extra[:3]}{'...' if len(extra) > 3 else ''}")
+
+    def _staged(self, what: str, tensors: dict) -> list:
+        """``tensors`` (name -> tensor of the parameter's shape, any dtype,
+        device and layout) as tessl copies them in, all checked first."""
+        self._check_names(f"{what}:", tensors)
+        ts = []
+        for name, shape, tr in self._table:
+            p = tensors[name]
+            if tuple(p.shape) != shape:
+                raise TesslError(f"{what}: {name} must be {shape}, got {tuple(p.shape)}")
+            p = p.detach()
+            ts.append((p.t() if tr else p).to(device="mps", dtype=torch.float32).contiguous())
+        return ts
+
     def _views(self, tensors: list) -> dict:
         return {name: (t.t() if tr else t) for t, (name, _, tr) in zip(tensors, self._table)}
 
@@ -720,12 +746,7 @@ class Qwen35:
             ts = self._storage(torch.device(device))
             self._copy(_READ_GRADS, ts)
             return self._views(ts)
-        names = [name for name, _, _ in self._table]
-        missing = [n for n in names if n not in into]
-        extra = [n for n in into if n not in set(names)]
-        if missing or extra:
-            raise TesslError(f"grads(into=...): missing {missing[:3]}{'...' if len(missing) > 3 else ''}, "
-                             f"unexpected {extra[:3]}{'...' if len(extra) > 3 else ''}")
+        self._check_names("grads(into=...):", into)
         ts = []
         for name, shape, tr in self._table:
             t = into[name]
@@ -744,20 +765,7 @@ class Qwen35:
         """Set every parameter from ``params`` (name -> tensor of the
         parameter's shape, any dtype, device and layout). All of them are
         required, and all are checked before any is written."""
-        names = [name for name, _, _ in self._table]
-        missing = [n for n in names if n not in params]
-        extra = [n for n in params if n not in set(names)]
-        if missing or extra:
-            raise TesslError(f"load_parameters: missing {missing[:3]}{'...' if len(missing) > 3 else ''}, "
-                             f"unexpected {extra[:3]}{'...' if len(extra) > 3 else ''}")
-        ts = []
-        for name, shape, tr in self._table:
-            p = params[name]
-            if tuple(p.shape) != shape:
-                raise TesslError(f"load_parameters: {name} must be {shape}, got {tuple(p.shape)}")
-            p = p.detach()
-            ts.append((p.t() if tr else p).to(device="mps", dtype=torch.float32).contiguous())
-        self._copy(_WRITE_PARAMS, ts)
+        self._copy(_WRITE_PARAMS, self._staged("load_parameters", params))
 
     def adamw_init(self) -> None:
         """Make AdamW state inside tessl: both moments zeroed, twice the
@@ -779,6 +787,37 @@ class Qwen35:
         self._check(self._rt.lib.tessl_qwen35_adamw_step_count(self._handle, ctypes.byref(count), err, _ERR_LEN), err)
         return count.value
 
+    def adamw_state(self, device: str = "mps") -> dict:
+        """A checkpoint of the AdamW state: ``{"step": int, "exp_avg": {name:
+        tensor}, "exp_avg_sq": {name: tensor}}``, the moments laid out as
+        ``parameters()`` and named as torch's AdamW names them. Saved with the
+        parameters, it resumes the run bit for bit through
+        ``load_adamw_state``."""
+        state = {"step": self.adamw_step_count}
+        for key, direction in (("exp_avg", _READ_ADAMW_M), ("exp_avg_sq", _READ_ADAMW_V)):
+            ts = self._storage(torch.device(device))
+            self._copy(direction, ts)
+            state[key] = self._views(ts)
+        return state
+
+    def load_adamw_state(self, state: dict) -> None:
+        """Restore what ``adamw_state`` returned (or torch's AdamW state for
+        the same parameters, rearranged by name) into the AdamW state that
+        ``adamw_init()`` made. Every moment is checked before any is
+        written."""
+        extra = set(state) - {"step", "exp_avg", "exp_avg_sq"}
+        if extra or len(state) != 3:
+            raise TesslError(f"load_adamw_state: want keys step, exp_avg and exp_avg_sq, got {sorted(state)}")
+        step = int(state["step"])
+        if step < 0:
+            raise TesslError(f"load_adamw_state: step {step} is negative")
+        m = self._staged("load_adamw_state: exp_avg", state["exp_avg"])
+        v = self._staged("load_adamw_state: exp_avg_sq", state["exp_avg_sq"])
+        self._copy(_WRITE_ADAMW_M, m)
+        self._copy(_WRITE_ADAMW_V, v)
+        err = ctypes.create_string_buffer(_ERR_LEN)
+        self._check(self._rt.lib.tessl_qwen35_adamw_set_step_count(self._handle, step, err, _ERR_LEN), err)
+
     def adamw_step(self, lr: float, betas=(0.9, 0.999), eps: float = 1e-8, weight_decay=0.01) -> None:
         """One ``torch.optim.AdamW`` step (amsgrad and maximize off) on every
         parameter, in tessl, from the last ``train_step``'s gradients.
@@ -787,14 +826,9 @@ class Qwen35:
         transformers' Trainer excludes (every norm and ``linear_attn.dt_bias``),
         or a dict giving every parameter name its own. Call ``adamw_init()``
         first."""
-        names = [name for name, _, _ in self._table]
         if isinstance(weight_decay, dict):
-            missing = [n for n in names if n not in weight_decay]
-            extra = [n for n in weight_decay if n not in set(names)]
-            if missing or extra:
-                raise TesslError(f"adamw_step: weight_decay is missing {missing[:3]}{'...' if len(missing) > 3 else ''}, "
-                                 f"unexpected {extra[:3]}{'...' if len(extra) > 3 else ''}")
-            wd = [float(weight_decay[n]) for n in names]
+            self._check_names("adamw_step: weight_decay is", weight_decay)
+            wd = [float(weight_decay[name]) for name, _, _ in self._table]
         else:
             wd = [0.0 if ex else float(weight_decay) for ex in self._decay_excluded]
         beta1, beta2 = betas

@@ -147,14 +147,18 @@ All notable changes to `tessl` are recorded here. The format follows
   transformers' names and values, for a torch optimizer. Checked against
   transformers' own autograd before and after an AdamW step written back
   (`python/tests/test_qwen35.py`). ABI 7 also runs AdamW inside tessl
-  (`tessl_qwen35_adamw_init`, `_step`, `_step_count`, `_free`, over
+  (`tessl_qwen35_adamw_init`, `_step`, `_step_count`, `_set_step_count`,
+  `_free`, and `_copy` directions 3-6 reading and writing both moments, over
   `qwen35_adamw`), and `TesslParamInfo` gains `decay_excluded`, Trainer's
   weight-decay exclusion for that entry; `tessl_torch.Qwen35` wraps them
   as `adamw_init()`, `adamw_step(lr, betas, eps, weight_decay)` (a float
   for every non-excluded parameter, or a dict by name), `adamw_free()` and
-  `adamw_step_count`, so a loop needs no torch copy of the parameters or
-  gradients. Checked against `torch.optim.AdamW` itself, over three steps
-  within 1e-6, and the ABI against the Rust call bit for bit.
+  `adamw_step_count`, with `adamw_state()` and `load_adamw_state()` for a
+  checkpoint (step, `exp_avg`, `exp_avg_sq` by name), so a loop needs no
+  torch copy of the parameters or gradients. Checked against `torch.optim.AdamW` itself, over three steps
+  within 1e-6, and the ABI against the Rust call bit for bit; a run restored
+  from a checkpoint takes its next step to the same bits as the run that
+  never stopped (`tests/qwen35_adamw.rs`, `python/tests/test_qwen35.py`).
 - **`Qwen35Model::train_step(ids, operands)` and
   `cross_entropy_rows(.., reduction, operands, ws, grads)`** take a
   `gemm::GemmOperands`: `ExactF32` (the previous behaviour) or `Bf16`, bf16

@@ -745,8 +745,9 @@ linear weight as its `[in, out]` window of the packed projection) and copies
 them between the model and caller tensors on the GPU. The C ABI (version 7)
 adds a model handle (`tessl_qwen35_load`, `_train_step`, `_param_count`,
 `_param_info`, `_copy`, `_free`, and `_adamw_init`, `_adamw_step`,
-`_adamw_step_count`, `_adamw_free`), and `tessl_torch.Qwen35` wraps it (see
-`python/README.md`).
+`_adamw_step_count`, `_adamw_set_step_count`, `_adamw_free`; `_copy`
+directions 3-6 read and write both moments, for checkpoints), and
+`tessl_torch.Qwen35` wraps it (see `python/README.md`).
 
 `tessl::qwen35_adamw` runs AdamW on the model's own parameters, so a
 training loop needs no torch copy of the parameters or gradients: on the 2B

@@ -17,7 +17,7 @@ use std::sync::Arc;
 
 use tessl::gemm::GemmOperands;
 use tessl::npy::read_npy;
-use tessl::qwen35_adamw::{excluded_from_weight_decay, AdamW, AdamWHyper};
+use tessl::qwen35_adamw::{excluded_from_weight_decay, AdamW, AdamWHyper, Moment};
 use tessl::qwen35_model::{Precision, Qwen35Config, Qwen35Model};
 use tessl::qwen35_params::ParamInfo;
 use tessl::safetensors::SafeTensors;
@@ -212,4 +212,92 @@ fn refusals_move_nothing() {
         before,
         "a refused step moved the parameters"
     );
+}
+
+/// A checkpoint of the parameters, both moments and the step count, restored
+/// into a freshly loaded model and fresh state, resumes the run exactly: the
+/// third step gives the uninterrupted run's parameters bit for bit. Without
+/// the moments or the count the resumed step differs (checked too).
+#[test]
+fn a_checkpointed_run_resumes_bit_for_bit() {
+    let ids = ids();
+    let hyper = AdamWHyper {
+        lr: 1e-2,
+        ..AdamWHyper::default()
+    };
+    let (rt, a) = load();
+    let table = a.parameter_table().unwrap();
+    let wd = a.default_weight_decay(0.1).unwrap();
+    let alloc = |rt: &Arc<GpuRuntime>| -> Vec<Tensor> {
+        table
+            .iter()
+            .map(|p| rt.alloc_tensor_f32(&p.storage_shape()).unwrap())
+            .collect()
+    };
+    let mut sa = AdamW::new(&a).unwrap();
+    for _ in 0..2 {
+        let s = a.train_step(&ids, GemmOperands::ExactF32).unwrap();
+        a.adamw_step(&s.grads, &mut sa, &hyper, &wd).unwrap();
+    }
+    let (p2, m2, v2) = (alloc(&rt), alloc(&rt), alloc(&rt));
+    a.read_parameters(&p2).unwrap();
+    a.read_adamw_moment(&sa, Moment::First, &m2).unwrap();
+    a.read_adamw_moment(&sa, Moment::Second, &v2).unwrap();
+    let s = a.train_step(&ids, GemmOperands::ExactF32).unwrap();
+    a.adamw_step(&s.grads, &mut sa, &hyper, &wd).unwrap();
+    let want = host(&rt, &a, &table, None);
+
+    // resume(moments, count): a fresh model and state from the checkpoint.
+    let resume = |moments: bool, count: bool| -> Vec<Vec<f64>> {
+        let (rb, b) = load();
+        let copy = |src: &[Tensor]| -> Vec<Tensor> {
+            src.iter()
+                .map(|t| {
+                    let n = rb.alloc_tensor_f32(t.shape()).unwrap();
+                    n.write_f32(&t.read_f32().unwrap()).unwrap();
+                    n
+                })
+                .collect()
+        };
+        b.write_parameters(&copy(&p2)).unwrap();
+        let mut sb = AdamW::new(&b).unwrap();
+        if moments {
+            b.write_adamw_moment(&mut sb, Moment::First, &copy(&m2)).unwrap();
+            b.write_adamw_moment(&mut sb, Moment::Second, &copy(&v2)).unwrap();
+            let back = alloc(&rb);
+            b.read_adamw_moment(&sb, Moment::Second, &back).unwrap();
+            for (x, y) in back.iter().zip(&v2) {
+                assert_eq!(
+                    x.read_f32().unwrap(),
+                    y.read_f32().unwrap(),
+                    "a moment did not round-trip"
+                );
+            }
+        }
+        if count {
+            sb.set_step_count(2);
+        }
+        let s = b.train_step(&ids, GemmOperands::ExactF32).unwrap();
+        b.adamw_step(&s.grads, &mut sb, &hyper, &wd).unwrap();
+        assert_eq!(sb.step_count(), if count { 3 } else { 1 });
+        host(&rb, &b, &table, None)
+    };
+    let bits =
+        |v: &[Vec<f64>]| -> Vec<Vec<u64>> { v.iter().map(|t| t.iter().map(|x| x.to_bits()).collect()).collect() };
+    assert_eq!(
+        bits(&resume(true, true)),
+        bits(&want),
+        "the resumed step is not the uninterrupted one"
+    );
+    assert_ne!(bits(&resume(false, true)), bits(&want), "moments made no difference");
+    assert_ne!(
+        bits(&resume(true, false)),
+        bits(&want),
+        "the step count made no difference"
+    );
+
+    // A misshapen checkpoint is refused before anything is written.
+    let mut sc = AdamW::new(&a).unwrap();
+    let e = a.write_adamw_moment(&mut sc, Moment::First, &m2[1..]).unwrap_err();
+    assert!(e.contains("tensors for"), "{e}");
 }

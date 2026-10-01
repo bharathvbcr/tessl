@@ -16,15 +16,16 @@ use objc2::runtime::ProtocolObject;
 use objc2_metal::{MTLBuffer, MTLDevice, MTLResourceOptions};
 use tessl::capi::{
     tessl_abi_version, tessl_cross_entropy_rows, tessl_mtl_buffer_length, tessl_qwen35_adamw_free,
-    tessl_qwen35_adamw_init, tessl_qwen35_adamw_step, tessl_qwen35_adamw_step_count, tessl_qwen35_copy,
-    tessl_qwen35_free, tessl_qwen35_load, tessl_qwen35_param_count, tessl_qwen35_param_info, tessl_qwen35_train_step,
-    tessl_runtime_free, tessl_runtime_new, tessl_synchronize, TesslCeArgs, TesslParamInfo, TesslQwen35, TesslRuntime,
-    TesslTensorRef, TESSL_ABI_VERSION, TESSL_ERR, TESSL_F32, TESSL_MAX_DIMS, TESSL_OK, TESSL_OPERANDS_BF16,
-    TESSL_OPERANDS_EXACT_F32, TESSL_READ_GRADS, TESSL_READ_PARAMS, TESSL_WRITE_PARAMS,
+    tessl_qwen35_adamw_init, tessl_qwen35_adamw_set_step_count, tessl_qwen35_adamw_step, tessl_qwen35_adamw_step_count,
+    tessl_qwen35_copy, tessl_qwen35_free, tessl_qwen35_load, tessl_qwen35_param_count, tessl_qwen35_param_info,
+    tessl_qwen35_train_step, tessl_runtime_free, tessl_runtime_new, tessl_synchronize, TesslCeArgs, TesslParamInfo,
+    TesslQwen35, TesslRuntime, TesslTensorRef, TESSL_ABI_VERSION, TESSL_ERR, TESSL_F32, TESSL_MAX_DIMS, TESSL_OK,
+    TESSL_OPERANDS_BF16, TESSL_OPERANDS_EXACT_F32, TESSL_READ_ADAMW_M, TESSL_READ_ADAMW_V, TESSL_READ_GRADS,
+    TESSL_READ_PARAMS, TESSL_WRITE_ADAMW_M, TESSL_WRITE_ADAMW_V, TESSL_WRITE_PARAMS,
 };
 use tessl::cross_entropy::{cross_entropy_rows, CeGrads, CeHidden, CeWorkspace, Reduction};
 use tessl::gemm::GemmOperands;
-use tessl::qwen35_adamw::{excluded_from_weight_decay, AdamW, AdamWHyper};
+use tessl::qwen35_adamw::{excluded_from_weight_decay, AdamW, AdamWHyper, Moment};
 use tessl::{DType, GpuRuntime};
 
 const ERR_LEN: usize = 512;
@@ -900,12 +901,97 @@ fn adamw_through_the_abi_is_the_rust_adamw() {
             );
         }
 
-        // Freed state is gone: a step is refused again.
+        // The moments read through the ABI are the Rust state's, bit for bit.
+        // Each write direction sets its own moment and no other: m written
+        // from the parameters and v from the gradients read back as those
+        // bits. The step count is set, not counted.
+        let copy = |dir: u32, err: &mut [c_char; ERR_LEN]| unsafe {
+            tessl_qwen35_copy(model, dir, refs.as_ptr(), n, err.as_mut_ptr(), ERR_LEN)
+        };
+        let moment_bits = || -> Vec<Vec<u32>> {
+            table
+                .iter()
+                .zip(&bufs)
+                .map(|(p, b)| read(b, p.shape.iter().product()).iter().map(|x| x.to_bits()).collect())
+                .collect()
+        };
+        let mut moments = Vec::new();
+        for (dir, which) in [
+            (TESSL_READ_ADAMW_M, Moment::First),
+            (TESSL_READ_ADAMW_V, Moment::Second),
+        ] {
+            assert_eq!(copy(dir, &mut err), TESSL_OK, "{}", msg(&err));
+            rust.read_adamw_moment(&state, which, &local).unwrap();
+            for ((p, b), t) in table.iter().zip(&bufs).zip(&local) {
+                let got = read(b, p.shape.iter().product());
+                let want = t.read_f32().unwrap();
+                assert!(
+                    got.iter().zip(&want).all(|(a, b)| a.to_bits() == b.to_bits()),
+                    "{} (direction {dir})",
+                    p.name
+                );
+            }
+            moments.push(moment_bits());
+        }
+        assert_ne!(moments[0], moments[1]);
+        let read_bits = |dir: u32, err: &mut [c_char; ERR_LEN]| {
+            assert_eq!(copy(dir, err), TESSL_OK, "{}", msg(err));
+            moment_bits()
+        };
+        let params = read_bits(TESSL_READ_PARAMS, &mut err);
+        assert_eq!(copy(TESSL_WRITE_ADAMW_M, &mut err), TESSL_OK, "{}", msg(&err));
+        assert_eq!(
+            read_bits(TESSL_READ_ADAMW_M, &mut err),
+            params,
+            "m did not take the written values"
+        );
+        assert_eq!(read_bits(TESSL_READ_ADAMW_V, &mut err), moments[1], "writing m moved v");
+        let grads = read_bits(TESSL_READ_GRADS, &mut err);
+        assert_ne!(grads, params);
+        assert_eq!(copy(TESSL_WRITE_ADAMW_V, &mut err), TESSL_OK, "{}", msg(&err));
+        assert_eq!(
+            read_bits(TESSL_READ_ADAMW_V, &mut err),
+            grads,
+            "v did not take the written values"
+        );
+        assert_eq!(read_bits(TESSL_READ_ADAMW_M, &mut err), params, "writing v moved m");
+        assert_eq!(
+            unsafe { tessl_qwen35_adamw_set_step_count(model, 7, err.as_mut_ptr(), ERR_LEN) },
+            TESSL_OK,
+            "{}",
+            msg(&err)
+        );
+        assert_eq!(
+            unsafe { tessl_qwen35_adamw_step_count(model, &mut count, err.as_mut_ptr(), ERR_LEN) },
+            TESSL_OK
+        );
+        assert_eq!(count, 7);
+
+        // Freed state is gone: a step, a moment copy and a set count are
+        // refused again.
         assert_eq!(
             unsafe { tessl_qwen35_adamw_free(model, err.as_mut_ptr(), ERR_LEN) },
             TESSL_OK
         );
         assert_eq!(step(wd.as_ptr(), n, &mut err), TESSL_ERR);
+        assert!(msg(&err).contains("no AdamW state"), "{}", msg(&err));
+        for dir in [
+            TESSL_READ_ADAMW_M,
+            TESSL_READ_ADAMW_V,
+            TESSL_WRITE_ADAMW_M,
+            TESSL_WRITE_ADAMW_V,
+        ] {
+            assert_eq!(copy(dir, &mut err), TESSL_ERR);
+            assert!(
+                msg(&err).contains("no AdamW state; call tessl_qwen35_adamw_init first"),
+                "{}",
+                msg(&err)
+            );
+        }
+        assert_eq!(
+            unsafe { tessl_qwen35_adamw_set_step_count(model, 1, err.as_mut_ptr(), ERR_LEN) },
+            TESSL_ERR
+        );
         assert!(msg(&err).contains("no AdamW state"), "{}", msg(&err));
     });
     assert_eq!(unsafe { tessl_qwen35_free(model) }, TESSL_OK);

@@ -134,6 +134,69 @@ class Qwen35Training(unittest.TestCase):
         # Training on one sequence lowers its loss.
         self.assertLess(m.train_step(self.ids), losses[0])
 
+    def test_an_adamw_checkpoint_resumes_bit_for_bit(self):
+        # Two steps, a checkpoint (parameters plus adamw_state), a third step.
+        # A fresh model restored from the checkpoint takes the same third
+        # step to the same bits; one given the parameters and a fresh AdamW
+        # state does not, so the moments and step count are what carried it.
+        def step(model):
+            model.train_step(self.ids)
+            model.adamw_step(1e-2, weight_decay=0.1)
+
+        m = self.model()
+        m.adamw_init()
+        step(m)
+        step(m)
+        params, state = m.parameters(), m.adamw_state()
+        self.assertEqual(state["step"], 2)
+        self.assertEqual(set(state["exp_avg"]), set(params))
+        step(m)
+        want = m.parameters()
+
+        def resumed(restore):
+            r = self.model()
+            r.load_parameters(params)
+            r.adamw_init()
+            if restore:
+                r.load_adamw_state(state)
+                self.assertEqual(r.adamw_step_count, 2)
+                back = r.adamw_state()
+                for key in ("exp_avg", "exp_avg_sq"):
+                    for n, t in state[key].items():
+                        self.assertTrue(torch.equal(back[key][n], t), f"{key} {n}")
+            step(r)
+            return r.parameters()
+
+        got = resumed(True)
+        for n in want:
+            self.assertTrue(torch.equal(got[n], want[n]), n)
+        cold = resumed(False)
+        self.assertTrue(any(not torch.equal(cold[n], want[n]) for n in want))
+
+    def test_adamw_state_refusals(self):
+        m = self.model()
+        with self.assertRaisesRegex(TesslError, "no AdamW state"):
+            m.adamw_state()
+        m.adamw_init()
+        state = m.adamw_state()
+        m.adamw_free()
+        with self.assertRaisesRegex(TesslError, "no AdamW state; call tessl_qwen35_adamw_init first"):
+            m.load_adamw_state(state)
+        m.adamw_init()
+        with self.assertRaisesRegex(TesslError, "want keys step, exp_avg and exp_avg_sq"):
+            m.load_adamw_state({"step": 1, "exp_avg": state["exp_avg"]})
+        with self.assertRaisesRegex(TesslError, "step -1 is negative"):
+            m.load_adamw_state({**state, "step": -1})
+        bad = dict(state["exp_avg_sq"])
+        bad["norm.weight"] = bad["norm.weight"][:-1]
+        with self.assertRaisesRegex(TesslError, "load_adamw_state: exp_avg_sq: norm.weight must be"):
+            m.load_adamw_state({**state, "exp_avg_sq": bad, "step": 5})
+        # Refused before anything was written: still the fresh state.
+        self.assertEqual(m.adamw_step_count, 0)
+        after = m.adamw_state()
+        for key in ("exp_avg", "exp_avg_sq"):
+            self.assertTrue(all(not t.any() for t in after[key].values()), key)
+
     def test_adamw_refusals(self):
         m = self.model()
         m.train_step(self.ids)

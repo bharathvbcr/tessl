@@ -115,6 +115,26 @@ impl AdamW {
     pub fn step_count(&self) -> u64 {
         self.step
     }
+
+    /// Set the step count, restoring a checkpoint with
+    /// [`Qwen35Model::write_adamw_moment`].
+    pub fn set_step_count(&mut self, step: u64) {
+        self.step = step;
+    }
+
+    fn moment(&self, which: Moment) -> &Qwen35Grads {
+        match which {
+            Moment::First => &self.m,
+            Moment::Second => &self.v,
+        }
+    }
+}
+
+/// One of AdamW's two moments: torch's `exp_avg` and `exp_avg_sq`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Moment {
+    First,
+    Second,
 }
 
 /// transformers' `Trainer.get_decay_parameter_names` exclusions, by name: a
@@ -294,6 +314,22 @@ impl Qwen35Model {
         self.rt.synchronize()?;
         state.step += 1;
         Ok(())
+    }
+
+    /// Copy one of `state`'s moments into `dst`, one dense f32 tensor per
+    /// [`Qwen35Model::parameter_table`] entry laid out as
+    /// [`Qwen35Model::read_parameters`] lays out the values.
+    pub fn read_adamw_moment(&self, state: &AdamW, which: Moment, dst: &[Tensor]) -> Result<(), String> {
+        self.read_gradients(state.moment(which), dst)
+            .map_err(|e| format!("Qwen35Model::read_adamw_moment: {e}"))
+    }
+
+    /// Set one of `state`'s moments from `src`, laid out as
+    /// [`Self::read_adamw_moment`] reads it; with
+    /// [`AdamW::set_step_count`] this restores a checkpoint. Every tensor is
+    /// checked before anything is written.
+    pub fn write_adamw_moment(&self, state: &mut AdamW, which: Moment, src: &[Tensor]) -> Result<(), String> {
+        self.write_gradient_layout("Qwen35Model::write_adamw_moment", state.moment(which), src)
     }
 
     /// Weight decay `wd` for every parameter-table entry except those

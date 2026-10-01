@@ -41,7 +41,7 @@ use crate::gdn_train::{
     gdn_train_backward, gdn_train_forward, GdnTrainDims, GdnTrainGrads, GdnTrainInputs, GdnTrainWorkspace,
 };
 use crate::gemm::GemmOperands;
-use crate::qwen35_adamw::{excluded_from_weight_decay, AdamW, AdamWHyper};
+use crate::qwen35_adamw::{excluded_from_weight_decay, AdamW, AdamWHyper, Moment};
 use crate::qwen35_model::{Precision, Qwen35Config, Qwen35Model};
 use crate::qwen35_params::ParamInfo;
 use crate::qwen35_train::Qwen35Grads;
@@ -656,6 +656,12 @@ pub const TESSL_NAME_LEN: usize = 128;
 pub const TESSL_READ_PARAMS: u32 = 0;
 pub const TESSL_READ_GRADS: u32 = 1;
 pub const TESSL_WRITE_PARAMS: u32 = 2;
+/// AdamW state ([`tessl_qwen35_adamw_init`]): torch's `exp_avg` and
+/// `exp_avg_sq`, read or written in the parameters' layouts.
+pub const TESSL_READ_ADAMW_M: u32 = 3;
+pub const TESSL_READ_ADAMW_V: u32 = 4;
+pub const TESSL_WRITE_ADAMW_M: u32 = 5;
+pub const TESSL_WRITE_ADAMW_V: u32 = 6;
 
 /// One entry of a model's parameter table; see
 /// [`crate::qwen35_params::ParamInfo`].
@@ -883,10 +889,11 @@ pub unsafe extern "C" fn tessl_qwen35_train_step(
 /// Copy between the model and `n` caller tensors, one per parameter-table
 /// entry in order, each dense f32 of the entry's shape (transposed when the
 /// entry says so): [`TESSL_READ_PARAMS`] and [`TESSL_READ_GRADS`] (the last
-/// step's) fill them, [`TESSL_WRITE_PARAMS`] sets the parameters from them.
-/// Values are transformers' (see [`crate::qwen35_params`] for the layouts
-/// tessl keeps them in). Every tensor is checked before
-/// anything is copied.
+/// step's) fill them, [`TESSL_WRITE_PARAMS`] sets the parameters from them,
+/// and [`TESSL_READ_ADAMW_M`] ... [`TESSL_WRITE_ADAMW_V`] read or set the AdamW
+/// moments in the same layouts. Values are transformers' (see
+/// [`crate::qwen35_params`] for the layouts tessl keeps them in). Every
+/// tensor is checked before anything is copied.
 ///
 /// # Safety
 /// As [`tessl_qwen35_param_count`]; `tensors` points to `n` readable
@@ -928,8 +935,25 @@ pub unsafe extern "C" fn tessl_qwen35_copy(
                     h.model.read_gradients(g, &ts)
                 }
                 TESSL_WRITE_PARAMS => h.model.write_parameters(&ts),
+                TESSL_READ_ADAMW_M | TESSL_READ_ADAMW_V | TESSL_WRITE_ADAMW_M | TESSL_WRITE_ADAMW_V => {
+                    let state = h
+                        .adamw
+                        .as_mut()
+                        .ok_or_else(|| format!("{WHAT}: no AdamW state; call tessl_qwen35_adamw_init first"))?;
+                    let which = if matches!(direction, TESSL_READ_ADAMW_M | TESSL_WRITE_ADAMW_M) {
+                        Moment::First
+                    } else {
+                        Moment::Second
+                    };
+                    if direction <= TESSL_READ_ADAMW_V {
+                        h.model.read_adamw_moment(state, which, &ts)
+                    } else {
+                        h.model.write_adamw_moment(state, which, &ts)
+                    }
+                }
                 d => Err(format!(
-                    "{WHAT}: direction {d} is not 0 (read params), 1 (read grads) or 2 (write params)"
+                    "{WHAT}: direction {d} is not 0 (read params), 1 (read grads), 2 (write params), \
+                     3 or 4 (read AdamW m or v) or 5 or 6 (write AdamW m or v)"
                 )),
             }
         })
@@ -1012,6 +1036,31 @@ pub unsafe extern "C" fn tessl_qwen35_adamw_step(
                 .ok_or_else(|| format!("{WHAT}: no AdamW state; call tessl_qwen35_adamw_init first"))?;
             h.model
                 .adamw_step(grads, state, &AdamWHyper { lr, beta1, beta2, eps }, wd)
+        })
+    }
+}
+
+/// Set the AdamW step count, restoring a checkpoint together with the
+/// moments written through [`tessl_qwen35_copy`].
+///
+/// # Safety
+/// As [`tessl_qwen35_param_count`].
+#[no_mangle]
+pub unsafe extern "C" fn tessl_qwen35_adamw_set_step_count(
+    model: *mut TesslQwen35,
+    step: u64,
+    err: *mut c_char,
+    err_len: usize,
+) -> i32 {
+    // SAFETY: forwarded from this function's contract.
+    unsafe {
+        guarded(model, err, err_len, |h| {
+            let state = h
+                .adamw
+                .as_mut()
+                .ok_or("tessl_qwen35_adamw_set_step_count: no AdamW state")?;
+            state.set_step_count(step);
+            Ok(())
         })
     }
 }

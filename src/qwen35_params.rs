@@ -310,6 +310,22 @@ impl Qwen35Model {
         self.rt.synchronize()
     }
 
+    /// Set every tensor of `mirror` (gradient-shaped storage for this model,
+    /// such as an optimizer's moments) from `src`, laid out as
+    /// [`Self::read_gradients`] reads them. Every tensor is checked before
+    /// anything is written.
+    pub(crate) fn write_gradient_layout(&self, what: &str, mirror: &Qwen35Grads, src: &[Tensor]) -> Result<(), String> {
+        self.require_f32(what)?;
+        let slots = slots(self, Some(mirror)).map_err(|e| format!("{what}: {e}"))?;
+        check(what, &slots, src)?;
+        for (s, t) in slots.iter().zip(src) {
+            let g = s.grad.ok_or_else(|| format!("{what}: {} has no slot", s.info.name))?;
+            self.write_one(g, &s.info, t)
+                .map_err(|e| format!("{what}: {}: {e}", s.info.name))?;
+        }
+        self.rt.synchronize()
+    }
+
     /// Columns `[off, off + width)` of the packed `[rows, total]` matrix `t`
     /// as a dense `[rows, width]` window of `dense`, in either direction.
     /// `copy_cols` windows start at a column, so a caller tensor at a byte

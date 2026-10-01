@@ -31,14 +31,17 @@ moves those logits by O(1). Each of those was injected and caught.
 ## How it works
 
 - `build.sh` strips `[[attribute]]` annotations from the `.metal` sources (C++
-  has no meaning for them) and compiles them unmodified otherwise, as C++20,
-  against `metal_stdlib` in this directory instead of Apple's.
+  has no meaning for them), rewrites each kernel-scope `threadgroup T name[N];`
+  into a static the group's threads share (refusing to build if one is left),
+  and compiles them unmodified otherwise, as C++20, against `metal_stdlib` in
+  this directory instead of Apple's.
 - `metal_stdlib` supplies the MSL surface the kernels use. A threadgroup is
   real OS threads. `threadgroup_barrier` is a real barrier. Each `simd_*`
   collective is a real exchange through shared slots behind a 32-lane barrier.
   `simdgroup_float8x8` is held whole by each lane, and a store writes only the
   lane's own two elements, so a missing `simdgroup_barrier` shows up as a race
-  here too. Threadgroup memory starts as NaN, so an unwritten read is visible.
+  here too. Threadgroup memory, bound or declared in the kernel, starts each
+  group as NaN, so an unwritten read is visible.
 - Threadgroups run in grid, reverse or shuffled order (`MSL_EMU_TG_ORDER`), and
   the driver requires all three to agree bit for bit: a GPU promises no order,
   so a kernel whose threadgroups write each other's outputs must not pass on

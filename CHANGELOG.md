@@ -190,9 +190,18 @@ All notable changes to `tessl` are recorded here. The format follows
   (against torch's AdamW formula in f64 on a packed window, with
   `grad_scale`, and nothing outside the window moving), so the
   kernel-emulator CI job checks them without a Mac. The shim gains
-  `precise::sqrt` and `precise::rsqrt`. `qwen35_sq_sum_rows_f32` is not
-  run: it declares a kernel-scope threadgroup array, which the emulator
-  does not share across a group.
+  `precise::sqrt` and `precise::rsqrt`.
+- **msl_emu shares kernel-scope threadgroup arrays across a group**, as a
+  GPU does: `build.sh` rewrites each `threadgroup T name[N];` into a static
+  registered with `metal::emu::tg_static`, which `launch` poisons with NaN
+  before every group, and refuses to build if one is left unrewritten.
+  Before, `threadgroup` was defined away and each thread got a private
+  array. `qwen35_sq_sum_rows_f32` (the rows of `grad_sq_norm`) now runs
+  against f64 on a packed window at four widths, writing nothing outside
+  its rows; without the rewrite three of them fail. `barrier_probe` holds
+  the sharing and the poison to a probe of its own, and CI's
+  ThreadSanitizer step runs `sq_sum_rows`, which reports a race with the
+  kernel's barrier removed.
 - **`bench_qwen35_train --batch=ROWS,LEN[,SPAN_ROWS]`** times one optimizer
   step's gradients for a batch run row by row into one bank (letter rows
   supervise one position, span rows go through `hidden` and an outside

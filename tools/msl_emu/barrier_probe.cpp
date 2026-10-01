@@ -11,6 +11,8 @@
 #include <metal_stdlib>
 
 #include <algorithm>
+#include <atomic>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -65,16 +67,45 @@ void drop() {
         }
 }
 
+// A kernel-scope threadgroup array as build.sh rewrites it: every thread finds
+// its own slot unwritten (NaN) in every group of every launch, and after a
+// barrier reads its neighbour's write. Fails without the poison on first
+// registration (launch 1, group 1 sees zeros), without launch's poison before
+// each group (group 2 sees group 1's writes), and without `static` (each
+// thread's array is private, so the neighbour's slot stays NaN).
+std::atomic<int> tg_static_bad{0};
+
+void tg_static_kernel(uint lid) {
+    static float a[64];
+    metal::emu::tg_static(a);
+    if (!std::isnan(a[lid])) tg_static_bad.fetch_add(1);
+    a[lid] = float(lid + 1);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (a[(lid + 1) % 64] != float((lid + 1) % 64 + 1)) tg_static_bad.fetch_add(1);
+}
+
+void tg_static_probe() {
+    for (int l = 0; l < 2; ++l) {
+        launch(uint3(2, 1, 1), uint3(64, 1, 1), 0, [&](const Ids &id, float *) { tg_static_kernel(id.lid); });
+    }
+    if (tg_static_bad.load() != 0) {
+        std::fprintf(stderr, "barrier_probe: tg_static: %d bad reads of a shared threadgroup array\n",
+                     tg_static_bad.load());
+        std::exit(1);
+    }
+}
+
 } // namespace
 
 int main(int argc, char **argv) {
-    const char *modes[] = {"tg", "tg_missing", "simd", "simd_missing", "drop"};
+    const char *modes[] = {"tg", "tg_missing", "simd", "simd_missing", "drop", "tg_static"};
     if (argc != 2 || std::find_if(std::begin(modes), std::end(modes),
                                   [&](const char *m) { return std::strcmp(m, argv[1]) == 0; }) == std::end(modes)) {
-        std::fprintf(stderr, "usage: barrier_probe tg|tg_missing|simd|simd_missing|drop\n");
+        std::fprintf(stderr, "usage: barrier_probe tg|tg_missing|simd|simd_missing|drop|tg_static\n");
         return 2;
     }
     if (std::strcmp(argv[1], "drop") == 0) drop();
+    else if (std::strcmp(argv[1], "tg_static") == 0) tg_static_probe();
     else run(argv[1]);
     return 0;
 }

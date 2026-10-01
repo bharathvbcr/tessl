@@ -385,6 +385,14 @@ int main(int argc, char **argv) {
         launch(uint3(cdiv(width, tx), rows, 1), uint3(tx, 1, 1), 0, [&](const Ids &id, float *) {
             qwen35_adamw_f32(p, g, m, v, a, rows, width, ld, off, uint2(id.gid.x, id.gid.y));
         });
+    } else if (kname == "qwen35_sq_sum_rows_f32") {
+        // Qwen35Model::grad_sq_norm: dispatch_2d_tg(rows, 1, 256), one window.
+        const uint rows = P("rows"), width = P("width"), ld = P("ld"), off = P("off"), out_off = P("out_off");
+        float *g = F("g"), *out = F("out");
+        launch(uint3(rows, 1, 1), uint3(256, 1, 1), 0, [&](const Ids &id, float *) {
+            qwen35_sq_sum_rows_f32(g, out, width, ld, off, out_off, id.tg.x, id.lid, id.lane, id.sg,
+                                   (id.tptg + emu::SIMD - 1) / emu::SIMD);
+        });
     } else {
         std::fprintf(stderr, "harness: unknown kernel %s\n", kname.c_str());
         return 2;

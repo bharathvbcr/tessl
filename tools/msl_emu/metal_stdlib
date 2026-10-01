@@ -33,6 +33,7 @@
 #include <cstring>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <thread>
 #include <vector>
 // Pulled in here, before the qualifier macros at the bottom of this file, so no
@@ -282,6 +283,35 @@ inline void fail(const char *msg) {
     std::abort();
 }
 
+/// Kernel-scope `threadgroup T name[N];` arrays. The build rewrites each one
+/// to a function-scope static followed by `tg_static(name)` (build.sh), so
+/// the threads of a group share it as on a GPU; groups run one at a time, so
+/// one copy is exactly one group's. `launch` poisons every registered array
+/// before each group, as it does `tgm`.
+struct TgStatics {
+    std::mutex mu;
+    std::vector<std::pair<void *, size_t>> arrays;
+};
+
+inline TgStatics tg_statics;
+
+inline void poison_tg_statics() {
+    std::lock_guard<std::mutex> lock(tg_statics.mu);
+    for (auto &[p, n] : tg_statics.arrays) std::memset(p, 0xff, n);
+}
+
+/// Every thread passes through this at the declaration; the first registers
+/// and poisons the array (it was declared after this group's poisoning), and
+/// the lock orders that before any thread's first use.
+template <class T, size_t N> inline void tg_static(T (&a)[N]) {
+    std::lock_guard<std::mutex> lock(tg_statics.mu);
+    for (auto &[p, n] : tg_statics.arrays) {
+        if (p == static_cast<void *>(a)) return;
+    }
+    tg_statics.arrays.emplace_back(static_cast<void *>(a), sizeof(a));
+    std::memset(a, 0xff, sizeof(a));
+}
+
 /// Builtin coordinates handed to the kernel body of one thread.
 struct Ids {
     uint3 tg;          // threadgroup_position_in_grid
@@ -327,6 +357,7 @@ inline void launch(uint3 grid, uint3 tpg, size_t tg_floats,
                 // Poison rather than zero: a kernel that reads threadgroup
                 // memory it never wrote should produce garbage, not a pass.
                 std::fill(tgm.begin(), tgm.end(), std::nanf(""));
+                poison_tg_statics();
                 Group group(n);
                 for (uint s = 0; s < (n + SIMD - 1) / SIMD; ++s) {
                     group.simds.push_back(std::make_unique<Simd>(std::min(SIMD, n - s * SIMD)));

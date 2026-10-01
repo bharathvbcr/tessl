@@ -80,7 +80,7 @@ jobs:
         run: >-
           MSL_EMU_SANITIZE=thread MSL_EMU_OUT=/tmp/emu-tsan TSAN_OPTIONS=halt_on_error=1
           python3 tools/msl_emu/check_qwen35.py
-          -k chunk_T65,chunk_ws,recurrent_T7,recurrent_in_place,gated_norm,score,conv_short,qk_norm,attn_gate
+          -k chunk_T65,chunk_ws,recurrent_T7,recurrent_in_place,gated_norm,score,conv_short,qk_norm,attn_gate,sq_sum_rows
 
   # ---------------------------------------------------------------------------
   # Everything that compiles, on a runner that can compile shaders.

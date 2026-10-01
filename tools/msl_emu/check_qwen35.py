@@ -874,6 +874,30 @@ def case_adamw(seed):
         FAILURES.append("adamw: grad_scale too weak to test")
 
 
+def case_sq_sum_rows(seed):
+    """qwen35_sq_sum_rows_f32, the rows of Qwen35Model::grad_sq_norm: each
+    row's sum of squares over one window (ld > width, off > 0), from 256
+    threads' f32 partials through a kernel-scope threadgroup array, written at
+    out_off + row and nowhere else. Widths of one simdgroup with idle lanes,
+    not a lane multiple, a second pass over the row with a tail, and 4 full
+    passes; against f64."""
+    g = seeded(seed)
+    for rows, width in ((3, 7), (4, 37), (5, 300), (2, 1024)):
+        ld, off, out_off, n_out = width + 5, 3, 2, rows + 4
+        gr = torch.randn(rows, ld, generator=g)
+        sentinel = torch.full((n_out,), -7.0)
+        out = run("qwen35_sq_sum_rows_f32", dict(rows=rows, width=width, ld=ld, off=off, out_off=out_off),
+                  {"g": gr, "out": sentinel}, {"out": ("f32", n_out)})["out"]
+        want = (gr[:, off:off + width].double() ** 2).sum(1)
+        tag = f"sq_sum_rows {rows}x{width}"
+        check(tag, out[out_off:out_off + rows], want, 0.0, 1e-6)
+        rest = torch.cat([out[:out_off], out[out_off + rows:]])
+        ok = bool((rest == -7.0).all())
+        print(f"  [{'ok  ' if ok else 'FAIL'}] {tag}: nothing written outside out_off + row")
+        if not ok:
+            FAILURES.append(f"{tag} outside its rows")
+
+
 def _expand_macros(src):
     """The source with every top-level macro instantiation expanded: function-
     like macros (possibly calling each other) with their arguments substituted,
@@ -1124,6 +1148,7 @@ CASES = [
     ("score", lambda: [case_score(bf, 18) for bf in (False, True)]),
     ("scatter_add_rows", lambda: case_scatter_add_rows(73)),
     ("adamw", lambda: case_adamw(74)),
+    ("sq_sum_rows", lambda: case_sq_sum_rows(75)),
 ]
 
 

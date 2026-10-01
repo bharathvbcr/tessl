@@ -800,6 +800,80 @@ def case_score(bf16, seed):
 ROOT = os.path.dirname(os.path.dirname(HERE))
 
 
+# ------------------------------------------------------------------ training
+
+
+def case_scatter_add_rows(seed):
+    """qwen35_bwd::scatter_add_rows: rows of src added into rows pos of dst,
+    in any order, every other row untouched; one f32 add per element, so the
+    result is torch's index_add_ bit for bit. A width under the host's 32
+    lanes and one that is not a multiple of them."""
+    g = seeded(seed)
+    for rows, width, pos in ((9, 37, [5, 0, 8, 3]), (4, 7, [2]), (6, 64, [1, 0, 5, 4, 2, 3])):
+        dst = torch.randn(rows, width, generator=g)
+        src = torch.randn(len(pos), width, generator=g)
+        p = torch.tensor(pos, dtype=torch.int32)
+        out = run("qwen35_scatter_add_rows_f32", dict(n=len(pos), width=width),
+                  {"src": src, "pos": p, "dst": dst}, {"dst": ("f32", rows * width)})["dst"].reshape(rows, width)
+        want = dst.clone().index_add_(0, p.long(), src)
+        ok = torch.equal(out.view(torch.int32), want.view(torch.int32))
+        name = f"scatter_add_rows {rows}x{width} at {pos}"
+        print(f"  [{'ok  ' if ok else 'FAIL'}] {name}: index_add_ bit for bit")
+        if not ok:
+            FAILURES.append(name)
+
+
+def case_adamw(seed):
+    """qwen35_adamw_f32 on one window: torch.optim.AdamW's single-tensor
+    update (decoupled decay, the first moment by lerp, the second, then
+    sqrt(v)/sqrt(bc2) + eps) on the gradient scaled in f32 by grad_scale, in
+    f64 from the same f32 inputs. A packed window (ld > width, off > 0) must
+    leave every element outside it as it was. eps is large and grad_scale
+    inexact in binary, so a scale the kernel dropped moves the result well
+    past the bound (checked here, not assumed)."""
+    g = seeded(seed)
+    rows, width, ld, off = 5, 37, 45, 3
+    lr, beta1, beta2, eps, wd, step, scale = 1e-2, 0.9, 0.999, 1e-2, 0.1, 3, 0.3
+    bc1, bc2 = 1 - beta1 ** step, 1 - beta2 ** step
+    scalars = dict(decay_mul=1 - lr * wd, lerp_w=1 - beta1, beta2=beta2, one_minus_beta2=1 - beta2,
+                   step_size=lr / bc1, bc2_sqrt=bc2 ** 0.5, eps=eps, grad_scale=scale)
+    p = torch.randn(rows, ld, generator=g) * 0.5
+    gr = torch.randn(rows, ld, generator=g) * 1e-2
+    m0 = torch.randn(rows, ld, generator=g) * 1e-3
+    v0 = torch.rand(rows, ld, generator=g) * 1e-4
+    out = run("qwen35_adamw_f32", dict(rows=rows, width=width, ld=ld, off=off, **scalars),
+              {"p": p, "g": gr, "m": m0, "v": v0},
+              {"p": ("f32", rows * ld), "m": ("f32", rows * ld), "v": ("f32", rows * ld)})
+    got = {k: t.reshape(rows, ld) for k, t in out.items()}
+    win = (slice(None), slice(off, off + width))
+
+    def update(grad):
+        w = p[win].double() * (1 - lr * wd)
+        m = m0[win].double() + (1 - beta1) * (grad - m0[win].double())
+        v = v0[win].double() * beta2 + (1 - beta2) * grad * grad
+        w = w - lr / bc1 * m / (v.sqrt() / bc2 ** 0.5 + eps)
+        return w, m, v
+
+    scaled = (gr[win] * torch.tensor(scale, dtype=torch.float32)).double()
+    want_p, want_m, want_v = update(scaled)
+    check("adamw p", got["p"][win], want_p, 2e-6)
+    check("adamw m", got["m"][win], want_m, 1e-9, 1e-6)
+    check("adamw v", got["v"][win], want_v, 1e-12, 1e-6)
+    outside = torch.ones(rows, ld, dtype=torch.bool)
+    outside[win] = False
+    for k, before in (("p", p), ("m", m0), ("v", v0)):
+        ok = torch.equal(got[k][outside].view(torch.int32), before[outside].view(torch.int32))
+        print(f"  [{'ok  ' if ok else 'FAIL'}] adamw {k}: untouched outside the window")
+        if not ok:
+            FAILURES.append(f"adamw {k} outside the window")
+    unscaled_p = update(gr[win].double())[0]
+    moved = (unscaled_p - want_p).abs().max().item()
+    ok = moved > 50 * 2e-6
+    print(f"  [{'ok  ' if ok else 'FAIL'}] adamw: grad_scale moves p by {moved:.2e} (> 50x the bound)")
+    if not ok:
+        FAILURES.append("adamw: grad_scale too weak to test")
+
+
 def _expand_macros(src):
     """The source with every top-level macro instantiation expanded: function-
     like macros (possibly calling each other) with their arguments substituted,
@@ -1048,6 +1122,8 @@ CASES = [
     ("attn_gate", lambda: [case_attn_gate(bf, ip, 17) for bf, ip in ((False, False), (True, False), (False, True))]),
     ("embed_rows", lambda: case_embed_rows(50)),
     ("score", lambda: [case_score(bf, 18) for bf in (False, True)]),
+    ("scatter_add_rows", lambda: case_scatter_add_rows(73)),
+    ("adamw", lambda: case_adamw(74)),
 ]
 
 

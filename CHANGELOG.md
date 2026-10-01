@@ -185,6 +185,14 @@ All notable changes to `tessl` are recorded here. The format follows
   accumulated, the same losses, summed gradients and global norm
   (`python/tests/test_qwen35.py`); the ABI
   against the Rust calls bit for bit (`tests/capi.rs`).
+- **msl_emu runs two training kernels**: `qwen35_scatter_add_rows_f32`
+  (against torch's `index_add_`, bit for bit) and `qwen35_adamw_f32`
+  (against torch's AdamW formula in f64 on a packed window, with
+  `grad_scale`, and nothing outside the window moving), so the
+  kernel-emulator CI job checks them without a Mac. The shim gains
+  `precise::sqrt` and `precise::rsqrt`. `qwen35_sq_sum_rows_f32` is not
+  run: it declares a kernel-scope threadgroup array, which the emulator
+  does not share across a group.
 - **`bench_qwen35_train --batch=ROWS,LEN[,SPAN_ROWS]`** times one optimizer
   step's gradients for a batch run row by row into one bank (letter rows
   supervise one position, span rows go through `hidden` and an outside

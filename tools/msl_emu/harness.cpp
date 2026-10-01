@@ -19,6 +19,8 @@ namespace msl_emu_kernels {
 #include "qwen35_mlp.cpp"
 #include "qwen35_score.cpp"
 #include "flash_attn_rows.cpp"
+#include "qwen35_adamw.cpp"
+#include "qwen35_bwd.cpp"
 } // namespace msl_emu_kernels
 
 #include <algorithm>
@@ -364,6 +366,25 @@ int main(int argc, char **argv) {
                                              w_offset, tgm, id.tg.x, id.lid, id.sg, id.lane, id.tptg);
                    }
                });
+    } else if (kname == "qwen35_scatter_add_rows_f32") {
+        // qwen35_bwd::scatter_add_rows: dispatch_2d over (width, n).
+        const uint n = P("n"), width = P("width");
+        float *src = F("src"), *dst = F("dst");
+        uint *pos = U("pos");
+        const uint tx = std::min(32u, width);
+        launch(uint3(cdiv(width, tx), n, 1), uint3(tx, 1, 1), 0, [&](const Ids &id, float *) {
+            qwen35_scatter_add_rows_f32(src, pos, dst, n, width, uint2(id.gid.x, id.gid.y));
+        });
+    } else if (kname == "qwen35_adamw_f32") {
+        // Qwen35Model::adamw_step: dispatch_2d over (width, rows), one window.
+        const uint rows = P("rows"), width = P("width"), ld = P("ld"), off = P("off");
+        const Qwen35AdamW a{PF("decay_mul"), PF("lerp_w"), PF("beta2"), PF("one_minus_beta2"),
+                            PF("step_size"), PF("bc2_sqrt"), PF("eps"), PF("grad_scale")};
+        float *p = F("p"), *g = F("g"), *m = F("m"), *v = F("v");
+        const uint tx = std::min(32u, width);
+        launch(uint3(cdiv(width, tx), rows, 1), uint3(tx, 1, 1), 0, [&](const Ids &id, float *) {
+            qwen35_adamw_f32(p, g, m, v, a, rows, width, ld, off, uint2(id.gid.x, id.gid.y));
+        });
     } else {
         std::fprintf(stderr, "harness: unknown kernel %s\n", kname.c_str());
         return 2;

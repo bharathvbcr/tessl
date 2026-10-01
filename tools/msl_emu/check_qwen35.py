@@ -1003,9 +1003,14 @@ def _host_binds():
             i += 1
         call = rs[m.end():i]
         var = re.search(r"&(\w+)", call).group(1)
-        kinds = {"gpu_buf": "buf", "u32": "u32", "f32": "f32"}
-        b = [(int(x.group(2)), kinds[x.group(1)])
-             for x in re.finditer(r"set_(gpu_buf|u32|f32)\(bnd,[^;]*?, (\d+)\)", call, re.S)]
+        # Every `set_*(bnd, .., slot)` is a bind. A setter missing from `kinds`
+        # stops the check: skipping it would report the kernel's slots unbound
+        # (or worse, pass with them unread).
+        kinds = {"gpu_buf": "buf", "gpu_buf_offset": "buf", "u32": "u32", "f32": "f32"}
+        b = []
+        for x in re.finditer(r"\bset_(\w+)\(bnd,[^;]*?, (\d+)\)", call, re.S):
+            assert x.group(1) in kinds, f"set_{x.group(1)} binds a slot the host contract cannot classify"
+            b.append((int(x.group(2)), kinds[x.group(1)]))
         kernels = [k for pos, v, k in pipe_defs if v == var and pos < m.start()][-1]
         for k in kernels:
             assert k not in binds, f"{k} is dispatched twice; the contract check needs one site"

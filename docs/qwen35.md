@@ -742,11 +742,11 @@ lower; that is arithmetic, not a re-measurement.
 `src/qwen35_params.rs` exposes the model's parameters and gradients under
 transformers' names and values (norms as `w`, which is also what is stored; each
 linear weight as its `[in, out]` window of the packed projection) and copies
-them between the model and caller tensors on the GPU. The C ABI (version 7)
+them between the model and caller tensors on the GPU. The C ABI (version 8)
 adds a model handle (`tessl_qwen35_load`, `_train_step`, `_param_count`,
 `_param_info`, `_copy`, `_free`, and `_adamw_init`, `_adamw_step`,
-`_adamw_step_count`, `_adamw_set_step_count`, `_adamw_free`; `_copy`
-directions 3-6 read and write both moments, for checkpoints), and
+`_adamw_step_count`, `_adamw_set_step_count`, `_adamw_free`, `_grad_sq_norm`;
+`_copy` directions 3-6 read and write both moments, for checkpoints), and
 `tessl_torch.Qwen35` wraps it (see `python/README.md`).
 
 `tessl::qwen35_adamw` runs AdamW on the model's own parameters, so a
@@ -760,7 +760,11 @@ Trainer excludes (every norm and `linear_attn.dt_bias`). Against an f64
 reference of torch's formula over five steps on the tiny model the worst
 error is 1.3e-7 (bound 2e-6), and against `torch.optim.AdamW` itself over
 three steps it is within 1e-6 (`tests/qwen35_adamw.rs`,
-`python/tests/test_qwen35.py`). In `Precision::F32` the tied embedding is one f32
+`python/tests/test_qwen35.py`). Clipping is the caller's: `grad_sq_norm`
+gives the square of the global gradient norm, and `grad_scale` multiplies
+every gradient by `clip_grad_norm_`'s coefficient inside the update, with
+no pass over the gradients and the stored ones left unscaled; the caller
+forms the coefficient so gradients outside tessl join the norm. In `Precision::F32` the tied embedding is one f32
 `[vocab, hidden]` table: the gather reads it by row
 (`qwen35_embed_rows_f32`), the training step's cross-entropy as its weight,
 and the inference forward's head as the transposed operand of one NT GEMM,

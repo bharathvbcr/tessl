@@ -33,7 +33,8 @@ model = tessl_torch.Qwen35("model.safetensors", "config.json")  # prefix "model.
 model.adamw_init()                    # both moments, inside tessl
 for step, ids in enumerate(batches):  # one sequence of token ids per step
     loss = model.train_step(ids, operands="bf16")
-    model.adamw_step(lr=schedule(step), weight_decay=0.1)  # Trainer's exclusions take none
+    coef = tessl_torch.clip_coef(model.grad_sq_norm() ** 0.5, max_norm=1.0)
+    model.adamw_step(lr=schedule(step), weight_decay=0.1, grad_scale=coef)  # Trainer's exclusions take none
 ```
 
 `adamw_step` is `torch.optim.AdamW`'s update (checked against it to 1e-6);
@@ -42,7 +43,10 @@ for step, ids in enumerate(batches):  # one sequence of token ids per step
 `adamw_step_count` is torch's `state["step"]`. `adamw_state()` returns the step
 and both moments by name (torch's `exp_avg` and `exp_avg_sq`); saved with
 `parameters()` and restored with `load_parameters()`, `adamw_init()` and
-`load_adamw_state()`, the run resumes bit for bit.
+`load_adamw_state()`, the run resumes bit for bit. `grad_scale=clip_coef(...)`
+is `clip_grad_norm_` before the step (checked against it); with a head of
+your own, add its gradients' squares to `grad_sq_norm()` and scale them by
+the same coefficient.
 
 With torch's own optimizer instead, which holds its own copy of every
 parameter and gradient (about 55 GB on the 2B):

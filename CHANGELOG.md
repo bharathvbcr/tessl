@@ -137,7 +137,7 @@ All notable changes to `tessl` are recorded here. The format follows
 
 ### Changed (breaking)
 
-- **C ABI 7** (was 3; the binding and library refuse each other across
+- **C ABI 8** (was 3; the binding and library refuse each other across
   versions, so rebuild `libtessl.dylib` with the binding). It adds a
   Qwen3.5 model handle: `tessl_qwen35_load`, `_train_step`,
   `_param_count`, `_param_info` (`TesslParamInfo`), `_copy` (read
@@ -146,7 +146,7 @@ All notable changes to `tessl` are recorded here. The format follows
   `parameters()`, `train_step(ids)`, `grads()`, `load_parameters()`, under
   transformers' names and values, for a torch optimizer. Checked against
   transformers' own autograd before and after an AdamW step written back
-  (`python/tests/test_qwen35.py`). ABI 7 also runs AdamW inside tessl
+  (`python/tests/test_qwen35.py`). ABI 8 also runs AdamW inside tessl
   (`tessl_qwen35_adamw_init`, `_step`, `_step_count`, `_set_step_count`,
   `_free`, and `_copy` directions 3-6 reading and writing both moments, over
   `qwen35_adamw`), and `TesslParamInfo` gains `decay_excluded`, Trainer's
@@ -155,10 +155,19 @@ All notable changes to `tessl` are recorded here. The format follows
   for every non-excluded parameter, or a dict by name), `adamw_free()` and
   `adamw_step_count`, with `adamw_state()` and `load_adamw_state()` for a
   checkpoint (step, `exp_avg`, `exp_avg_sq` by name), so a loop needs no
-  torch copy of the parameters or gradients. Checked against `torch.optim.AdamW` itself, over three steps
-  within 1e-6, and the ABI against the Rust call bit for bit; a run restored
-  from a checkpoint takes its next step to the same bits as the run that
-  never stopped (`tests/qwen35_adamw.rs`, `python/tests/test_qwen35.py`).
+  torch copy of the parameters or gradients. Checked against
+  `torch.optim.AdamW` itself, over three steps within 1e-6, and the ABI
+  against the Rust call bit for bit; a run restored from a checkpoint takes
+  its next step to the same bits as the run that never stopped
+  (`tests/qwen35_adamw.rs`, `python/tests/test_qwen35.py`). Gradient
+  clipping: `tessl_qwen35_grad_sq_norm` (`Qwen35.grad_sq_norm()`,
+  `Qwen35Model::grad_sq_norm`) gives the global norm's square, and
+  `_adamw_step` takes a `grad_scale` (`AdamWHyper::grad_scale`) that
+  multiplies every gradient before the update, leaving the stored gradients
+  as they are; `tessl_torch.clip_coef(norm, max_norm)` is
+  `clip_grad_norm_`'s coefficient. The caller forms it, so gradients
+  outside tessl (a head of its own) join the norm. Checked against
+  `clip_grad_norm_` then `torch.optim.AdamW` within 1e-6.
 - **`Qwen35Model::train_step(ids, operands)` and
   `cross_entropy_rows(.., reduction, operands, ws, grads)`** take a
   `gemm::GemmOperands`: `ExactF32` (the previous behaviour) or `Bf16`, bf16

@@ -562,16 +562,22 @@ fn qwen35_bwd_offsets_are_widened() {
     }
 }
 
-/// AdamW walks every parameter window of the model, the tied embedding's
-/// `[vocab, hidden]` included (5.1e8 elements at the 2B's 248320 x 2048, past
-/// 2^28 and an eighth of u32's range in elements, which a larger vocab or
-/// hidden size crosses); each element offset is formed in 64 bits.
+/// AdamW and the squared norm walk every parameter window of the model, the
+/// tied embedding's `[vocab, hidden]` included (5.1e8 elements at the 2B's
+/// 248320 x 2048, past 2^28 and an eighth of u32's range in elements, which
+/// a larger vocab or hidden size crosses); each element offset and row base
+/// is formed in 64 bits.
 #[test]
 fn qwen35_adamw_offsets_are_widened() {
     require(
         QWEN35_ADAMW,
         "const ulong i = (ulong)r * ld + off + c;",
         "AdamW element",
+    );
+    require(
+        QWEN35_ADAMW,
+        "const ulong base = (ulong)r * ld + off;",
+        "squared-norm row",
     );
 }
 

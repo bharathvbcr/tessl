@@ -55,7 +55,7 @@ pub const TESSL_PANIC: i32 = 2;
 
 /// Bumped on any change to a `#[repr(C)]` layout or an entry point's
 /// signature; the Python side refuses a library whose version differs.
-pub const TESSL_ABI_VERSION: u32 = 7;
+pub const TESSL_ABI_VERSION: u32 = 8;
 
 /// Largest tensor rank a [`TesslTensorRef`] carries.
 pub const TESSL_MAX_DIMS: usize = 6;
@@ -997,7 +997,10 @@ pub unsafe extern "C" fn tessl_qwen35_adamw_free(model: *mut TesslQwen35, err: *
 /// One AdamW step ([`crate::qwen35_adamw`]) on every parameter from the last
 /// [`tessl_qwen35_train_step`]'s gradients, which stay in the handle, with
 /// `weight_decay[i]` for parameter-table entry `i` (`n` must be the table's
-/// length). Everything is checked before anything moves.
+/// length) and every gradient multiplied by `grad_scale` first (1, or the
+/// clip coefficient formed from [`tessl_qwen35_grad_sq_norm`]; the
+/// gradients themselves are left as they are). Everything is checked before
+/// anything moves.
 ///
 /// # Safety
 /// As [`tessl_qwen35_param_count`]; `weight_decay` points to `n` readable
@@ -1009,6 +1012,7 @@ pub unsafe extern "C" fn tessl_qwen35_adamw_step(
     beta1: f64,
     beta2: f64,
     eps: f64,
+    grad_scale: f64,
     weight_decay: *const f32,
     n: u64,
     err: *mut c_char,
@@ -1034,8 +1038,49 @@ pub unsafe extern "C" fn tessl_qwen35_adamw_step(
                 .adamw
                 .as_mut()
                 .ok_or_else(|| format!("{WHAT}: no AdamW state; call tessl_qwen35_adamw_init first"))?;
-            h.model
-                .adamw_step(grads, state, &AdamWHyper { lr, beta1, beta2, eps }, wd)
+            h.model.adamw_step(
+                grads,
+                state,
+                &AdamWHyper {
+                    lr,
+                    beta1,
+                    beta2,
+                    eps,
+                    grad_scale,
+                },
+                wd,
+            )
+        })
+    }
+}
+
+/// The sum of squares of every gradient the last [`tessl_qwen35_train_step`]
+/// left ([`Qwen35Model::grad_sq_norm`]), written to `*out`: the square of
+/// the global norm `clip_grad_norm_` takes, before any gradients outside
+/// the model are added.
+///
+/// # Safety
+/// As [`tessl_qwen35_param_count`]; `out` points to a writable `f64`.
+#[no_mangle]
+pub unsafe extern "C" fn tessl_qwen35_grad_sq_norm(
+    model: *mut TesslQwen35,
+    out: *mut f64,
+    err: *mut c_char,
+    err_len: usize,
+) -> i32 {
+    // SAFETY: forwarded from this function's contract.
+    unsafe {
+        guarded(model, err, err_len, |h| {
+            const WHAT: &str = "tessl_qwen35_grad_sq_norm";
+            if out.is_null() {
+                return Err(format!("{WHAT}: null out"));
+            }
+            let grads = h
+                .grads
+                .as_ref()
+                .ok_or_else(|| format!("{WHAT}: no gradients yet; run tessl_qwen35_train_step first"))?;
+            *out = h.model.grad_sq_norm(grads)?;
+            Ok(())
         })
     }
 }

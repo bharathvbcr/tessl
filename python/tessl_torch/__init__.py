@@ -37,13 +37,14 @@ __all__ = [
     "cross_entropy",
     "cross_entropy_rows",
     "chunk_gated_delta_rule",
+    "clip_coef",
     "patch_transformers_qwen3_5",
     "Qwen35",
     "TesslError",
     "library_path",
 ]
 
-_ABI_VERSION = 7
+_ABI_VERSION = 8
 _MAX_DIMS = 6
 _DTYPE_CODE = {torch.float32: 0, torch.bfloat16: 1, torch.float16: 2}
 _ERR_LEN = 1024
@@ -59,6 +60,15 @@ def _operands_code(operands: str) -> int:
     if operands not in _OPERANDS_CODE:
         raise TesslError(f"operands must be 'f32' or 'bf16', not {operands!r}")
     return _OPERANDS_CODE[operands]
+
+
+def clip_coef(total_norm: float, max_norm: float) -> float:
+    """``torch.nn.utils.clip_grad_norm_``'s coefficient for a global norm,
+    in its f32 arithmetic: ``max_norm / (total_norm + 1e-6)``, at most 1.
+    Pass it as ``Qwen35.adamw_step(grad_scale=...)`` and scale any gradients
+    outside tessl by it too."""
+    norm = torch.tensor(total_norm, dtype=torch.float32)
+    return torch.clamp(max_norm / (norm + 1e-6), max=1.0).item()
 
 
 class _TensorRef(ctypes.Structure):
@@ -188,12 +198,14 @@ def _load():
         lib.tessl_qwen35_adamw_step.restype = ctypes.c_int32
         lib.tessl_qwen35_adamw_step.argtypes = [
             ctypes.c_void_p, ctypes.c_double, ctypes.c_double, ctypes.c_double, ctypes.c_double,
-            ctypes.POINTER(ctypes.c_float), ctypes.c_uint64,
+            ctypes.c_double, ctypes.POINTER(ctypes.c_float), ctypes.c_uint64,
         ] + err_args
         lib.tessl_qwen35_adamw_step_count.restype = ctypes.c_int32
         lib.tessl_qwen35_adamw_step_count.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint64)] + err_args
         lib.tessl_qwen35_adamw_set_step_count.restype = ctypes.c_int32
         lib.tessl_qwen35_adamw_set_step_count.argtypes = [ctypes.c_void_p, ctypes.c_uint64] + err_args
+        lib.tessl_qwen35_grad_sq_norm.restype = ctypes.c_int32
+        lib.tessl_qwen35_grad_sq_norm.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_double)] + err_args
         _lib = lib
         return lib
 
@@ -818,14 +830,29 @@ class Qwen35:
         err = ctypes.create_string_buffer(_ERR_LEN)
         self._check(self._rt.lib.tessl_qwen35_adamw_set_step_count(self._handle, step, err, _ERR_LEN), err)
 
-    def adamw_step(self, lr: float, betas=(0.9, 0.999), eps: float = 1e-8, weight_decay=0.01) -> None:
+    def grad_sq_norm(self) -> float:
+        """The sum of squares of every gradient the last ``train_step`` left:
+        the square of the global norm ``clip_grad_norm_`` takes. Add the
+        squares of any gradients outside tessl (a head of your own) before
+        forming ``clip_coef``."""
+        if not self._has_grads:
+            raise TesslError("no gradients yet; call train_step first")
+        out = ctypes.c_double()
+        err = ctypes.create_string_buffer(_ERR_LEN)
+        self._check(self._rt.lib.tessl_qwen35_grad_sq_norm(self._handle, ctypes.byref(out), err, _ERR_LEN), err)
+        return out.value
+
+    def adamw_step(self, lr: float, betas=(0.9, 0.999), eps: float = 1e-8, weight_decay=0.01,
+                   grad_scale: float = 1.0) -> None:
         """One ``torch.optim.AdamW`` step (amsgrad and maximize off) on every
         parameter, in tessl, from the last ``train_step``'s gradients.
 
         ``weight_decay`` is a float, applied to every parameter except those
         transformers' Trainer excludes (every norm and ``linear_attn.dt_bias``),
-        or a dict giving every parameter name its own. Call ``adamw_init()``
-        first."""
+        or a dict giving every parameter name its own. ``grad_scale``
+        multiplies every gradient before the update, as ``clip_grad_norm_``
+        scales ``.grad``: pass ``clip_coef(norm, max_norm)``. The gradients
+        ``grads()`` reads stay unscaled. Call ``adamw_init()`` first."""
         if isinstance(weight_decay, dict):
             self._check_names("adamw_step: weight_decay is", weight_decay)
             wd = [float(weight_decay[name]) for name, _, _ in self._table]
@@ -837,7 +864,8 @@ class Qwen35:
         torch.mps.synchronize()
         self._check(
             self._rt.lib.tessl_qwen35_adamw_step(
-                self._handle, float(lr), float(beta1), float(beta2), float(eps), arr, len(wd), err, _ERR_LEN,
+                self._handle, float(lr), float(beta1), float(beta2), float(eps), float(grad_scale), arr, len(wd), err,
+                _ERR_LEN,
             ),
             err,
         )

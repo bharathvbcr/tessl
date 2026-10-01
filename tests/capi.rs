@@ -17,11 +17,11 @@ use objc2_metal::{MTLBuffer, MTLDevice, MTLResourceOptions};
 use tessl::capi::{
     tessl_abi_version, tessl_cross_entropy_rows, tessl_mtl_buffer_length, tessl_qwen35_adamw_free,
     tessl_qwen35_adamw_init, tessl_qwen35_adamw_set_step_count, tessl_qwen35_adamw_step, tessl_qwen35_adamw_step_count,
-    tessl_qwen35_copy, tessl_qwen35_free, tessl_qwen35_load, tessl_qwen35_param_count, tessl_qwen35_param_info,
-    tessl_qwen35_train_step, tessl_runtime_free, tessl_runtime_new, tessl_synchronize, TesslCeArgs, TesslParamInfo,
-    TesslQwen35, TesslRuntime, TesslTensorRef, TESSL_ABI_VERSION, TESSL_ERR, TESSL_F32, TESSL_MAX_DIMS, TESSL_OK,
-    TESSL_OPERANDS_BF16, TESSL_OPERANDS_EXACT_F32, TESSL_READ_ADAMW_M, TESSL_READ_ADAMW_V, TESSL_READ_GRADS,
-    TESSL_READ_PARAMS, TESSL_WRITE_ADAMW_M, TESSL_WRITE_ADAMW_V, TESSL_WRITE_PARAMS,
+    tessl_qwen35_copy, tessl_qwen35_free, tessl_qwen35_grad_sq_norm, tessl_qwen35_load, tessl_qwen35_param_count,
+    tessl_qwen35_param_info, tessl_qwen35_train_step, tessl_runtime_free, tessl_runtime_new, tessl_synchronize,
+    TesslCeArgs, TesslParamInfo, TesslQwen35, TesslRuntime, TesslTensorRef, TESSL_ABI_VERSION, TESSL_ERR, TESSL_F32,
+    TESSL_MAX_DIMS, TESSL_OK, TESSL_OPERANDS_BF16, TESSL_OPERANDS_EXACT_F32, TESSL_READ_ADAMW_M, TESSL_READ_ADAMW_V,
+    TESSL_READ_GRADS, TESSL_READ_PARAMS, TESSL_WRITE_ADAMW_M, TESSL_WRITE_ADAMW_V, TESSL_WRITE_PARAMS,
 };
 use tessl::cross_entropy::{cross_entropy_rows, CeGrads, CeHidden, CeWorkspace, Reduction};
 use tessl::gemm::GemmOperands;
@@ -795,7 +795,7 @@ fn adamw_through_the_abi_is_the_rust_adamw() {
 
         // Refusals before there is anything to step.
         let step = |w: *const f32, n: u64, err: &mut [c_char; ERR_LEN]| unsafe {
-            tessl_qwen35_adamw_step(model, 1e-2, 0.9, 0.999, 1e-8, w, n, err.as_mut_ptr(), ERR_LEN)
+            tessl_qwen35_adamw_step(model, 1e-2, 0.9, 0.999, 1e-8, 1.0, w, n, err.as_mut_ptr(), ERR_LEN)
         };
         assert_eq!(step(wd.as_ptr(), n, &mut err), TESSL_ERR);
         assert!(msg(&err).contains("no gradients yet"), "{}", msg(&err));
@@ -844,7 +844,18 @@ fn adamw_through_the_abi_is_the_rust_adamw() {
         assert_eq!(step(ptr::null(), n, &mut err), TESSL_ERR);
         assert!(msg(&err).contains("null weight_decay"), "{}", msg(&err));
         let bad_beta = unsafe {
-            tessl_qwen35_adamw_step(model, 1e-2, 1.0, 0.999, 1e-8, wd.as_ptr(), n, err.as_mut_ptr(), ERR_LEN)
+            tessl_qwen35_adamw_step(
+                model,
+                1e-2,
+                1.0,
+                0.999,
+                1e-8,
+                1.0,
+                wd.as_ptr(),
+                n,
+                err.as_mut_ptr(),
+                ERR_LEN,
+            )
         };
         assert_eq!(bad_beta, TESSL_ERR);
         assert!(msg(&err).contains("beta1 1 must lie in [0, 1)"), "{}", msg(&err));
@@ -854,18 +865,52 @@ fn adamw_through_the_abi_is_the_rust_adamw() {
         );
         assert_eq!(count, 0, "a refused step advanced the count");
 
-        // Two steps each side, on the same gradients: the same bits.
+        // Two steps each side, on the same gradients, the second with its
+        // gradients scaled by 0.3 (a clip coefficient, inexact in binary): the same
+        // gradient norm and the same bits.
         let mut state = AdamW::new(&rust).unwrap();
-        let hyper = AdamWHyper {
+        let mut hyper = AdamWHyper {
             lr: 1e-2,
             ..AdamWHyper::default()
         };
+        let mut sq = 0.0f64;
+        assert_eq!(
+            unsafe { tessl_qwen35_grad_sq_norm(model, ptr::null_mut(), err.as_mut_ptr(), ERR_LEN) },
+            TESSL_ERR
+        );
+        assert!(msg(&err).contains("null out"), "{}", msg(&err));
         for k in 1..=2u64 {
             if k > 1 {
                 assert_eq!(train(&mut loss, &mut err), TESSL_OK, "{}", msg(&err));
             }
-            assert_eq!(step(wd.as_ptr(), n, &mut err), TESSL_OK, "{}", msg(&err));
             let s = rust.train_step(&ids, GemmOperands::ExactF32).unwrap();
+            assert_eq!(
+                unsafe { tessl_qwen35_grad_sq_norm(model, &mut sq, err.as_mut_ptr(), ERR_LEN) },
+                TESSL_OK,
+                "{}",
+                msg(&err)
+            );
+            assert_eq!(sq.to_bits(), rust.grad_sq_norm(&s.grads).unwrap().to_bits());
+            if k == 1 {
+                assert_eq!(step(wd.as_ptr(), n, &mut err), TESSL_OK, "{}", msg(&err));
+            } else {
+                hyper.grad_scale = 0.3;
+                let status = unsafe {
+                    tessl_qwen35_adamw_step(
+                        model,
+                        1e-2,
+                        0.9,
+                        0.999,
+                        1e-8,
+                        hyper.grad_scale,
+                        wd.as_ptr(),
+                        n,
+                        err.as_mut_ptr(),
+                        ERR_LEN,
+                    )
+                };
+                assert_eq!(status, TESSL_OK, "{}", msg(&err));
+            }
             rust.adamw_step(&s.grads, &mut state, &hyper, &wd).unwrap();
             assert_eq!(
                 unsafe { tessl_qwen35_adamw_step_count(model, &mut count, err.as_mut_ptr(), ERR_LEN) },

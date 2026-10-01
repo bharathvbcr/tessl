@@ -18,29 +18,37 @@
 //! parameter is updated as stored, which is transformers' value (the
 //! zero-centred norms' `w` included).
 
-use crate::dispatch::{dispatch_2d, set_gpu_buf_offset, set_u32};
+use crate::dispatch::{dispatch_2d, dispatch_2d_tg, set_gpu_buf_offset, set_u32};
 use crate::qwen35_model::{Mixer, Qwen35Model};
 use crate::qwen35_params::{slots, Src};
 use crate::qwen35_train::{AttnGrads, GdnGrads, LayerGrads, MixerGrads, Qwen35Grads};
 use crate::tensor::{GpuBuffer, Tensor};
 
-/// AdamW's hyperparameters other than weight decay, as torch names them.
+/// AdamW's hyperparameters other than weight decay, as torch names them,
+/// and the step's gradient scale.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct AdamWHyper {
     pub lr: f64,
     pub beta1: f64,
     pub beta2: f64,
     pub eps: f64,
+    /// Every gradient is multiplied by this (as f32) before the update:
+    /// `torch.nn.utils.clip_grad_norm_`'s clip coefficient, formed by the
+    /// caller from [`Qwen35Model::grad_sq_norm`] (and any gradients outside
+    /// the model), or 1. The gradients themselves are left as they are.
+    pub grad_scale: f64,
 }
 
 impl Default for AdamWHyper {
-    /// torch's defaults, with transformers' fine-tuning learning rate.
+    /// torch's defaults, with transformers' fine-tuning learning rate, and
+    /// no clipping.
     fn default() -> Self {
         Self {
             lr: 1e-3,
             beta1: 0.9,
             beta2: 0.999,
             eps: 1e-8,
+            grad_scale: 1.0,
         }
     }
 }
@@ -227,9 +235,20 @@ impl Qwen35Model {
     ) -> Result<(), String> {
         const WHAT: &str = "Qwen35Model::adamw_step";
         self.require_f32(WHAT)?;
-        let AdamWHyper { lr, beta1, beta2, eps } = *hyper;
+        let AdamWHyper {
+            lr,
+            beta1,
+            beta2,
+            eps,
+            grad_scale,
+        } = *hyper;
         if !(lr.is_finite() && lr >= 0.0) {
             return Err(format!("{WHAT}: lr {lr} must be finite and >= 0"));
+        }
+        // torch would carry a non-finite norm's coefficient into every
+        // parameter; refused here instead, before anything moves.
+        if !(grad_scale.is_finite() && grad_scale >= 0.0) {
+            return Err(format!("{WHAT}: grad_scale {grad_scale} must be finite and >= 0"));
         }
         for (name, b) in [("beta1", beta1), ("beta2", beta2)] {
             if !(0.0..1.0).contains(&b) {
@@ -296,6 +315,7 @@ impl Qwen35Model {
                 step_size as f32,
                 bc2_sqrt as f32,
                 eps as f32,
+                grad_scale as f32,
             ];
             let bytes: Vec<u8> = scalars.iter().flat_map(|x| x.to_le_bytes()).collect();
             let [wp, wg, wm, wv] = w;
@@ -314,6 +334,45 @@ impl Qwen35Model {
         self.rt.synchronize()?;
         state.step += 1;
         Ok(())
+    }
+
+    /// The sum of squares of every gradient in `grads` (this model's
+    /// [`Qwen35Model::train_step`]), over the parameters of
+    /// [`Qwen35Model::parameter_table`]: the square of the global L2 norm
+    /// `torch.nn.utils.clip_grad_norm_` takes. Each row of each gradient is
+    /// summed in f32 on the GPU in a fixed order and the rows are added in
+    /// f64, so it is deterministic; torch's own reduction order differs, so
+    /// the two agree to rounding, not bits.
+    pub fn grad_sq_norm(&self, grads: &Qwen35Grads) -> Result<f64, String> {
+        const WHAT: &str = "Qwen35Model::grad_sq_norm";
+        self.require_f32(WHAT)?;
+        let ps = slots(self, Some(grads)).map_err(|e| format!("{WHAT}: {e}"))?;
+        let mut plan = Vec::with_capacity(ps.len());
+        let mut rows = 0usize;
+        for s in &ps {
+            let name = &s.info.name;
+            let g = s.grad.ok_or_else(|| format!("{WHAT}: {name} has no gradient"))?;
+            let w = window(g, &s.info.shape);
+            w.check(&format!("{WHAT}: {name} gradient"))?;
+            let n = w.rows;
+            plan.push((w, rows));
+            rows += n;
+        }
+        u32::try_from(rows).map_err(|_| format!("{WHAT}: {rows} rows exceed u32"))?;
+        let out = self.rt.alloc_tensor_f32(&[rows])?;
+        let p = self.rt.pipeline("qwen35_sq_sum_rows_f32")?;
+        for (w, at) in &plan {
+            dispatch_2d_tg(&self.rt, &p, w.rows, 1, 256, |bnd| {
+                set_gpu_buf_offset(bnd, w.buf, w.byte_off, 0);
+                set_gpu_buf_offset(bnd, &out.buffer, out.byte_offset(), 1);
+                set_u32(bnd, w.width as u32, 2);
+                set_u32(bnd, w.ld as u32, 3);
+                set_u32(bnd, w.off as u32, 4);
+                set_u32(bnd, *at as u32, 5);
+            })?;
+        }
+        self.rt.synchronize()?;
+        Ok(out.read_f32()?.iter().map(|&x| f64::from(x)).sum())
     }
 
     /// Copy one of `state`'s moments into `dst`, one dense f32 tensor per

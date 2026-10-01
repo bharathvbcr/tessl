@@ -134,6 +134,48 @@ class Qwen35Training(unittest.TestCase):
         # Training on one sequence lowers its loss.
         self.assertLess(m.train_step(self.ids), losses[0])
 
+    def test_clipping_is_clip_grad_norm_then_adamw(self):
+        # torch: clip_grad_norm_(max_norm) over every parameter, then AdamW.
+        # tessl: grad_sq_norm() -> clip_coef -> adamw_step(grad_scale=...).
+        # max_norm is below the tiny fixture's gradient norm so it clips; if
+        # it does not, lower max_norm rather than drop the check.
+        # Adam cancels a gradient scale except against eps, so eps is 1e-2
+        # here (the Rust test shows the scale then moves the result by far
+        # more than the bound). Bounds as test_adamw_in_tessl_is_torch_adamw;
+        # the norm to 1e-5 relative (torch reduces in another order).
+        m = self.model()
+        ref = {n: p.cpu().clone().requires_grad_(True) for n, p in m.parameters().items()}
+        opt = torch.optim.AdamW(list(ref.values()), lr=1e-2, eps=1e-2, weight_decay=0.0)
+        m.adamw_init()
+        coefs = []
+        for step in range(1, 3):
+            m.train_step(self.ids)
+            grads = m.grads()
+            for n, p in ref.items():
+                p.grad = grads[n].cpu()
+            max_norm = 0.5
+            want_norm = torch.nn.utils.clip_grad_norm_(list(ref.values()), max_norm).item()
+            got_norm = m.grad_sq_norm() ** 0.5
+            self.assertLessEqual(abs(got_norm - want_norm), 1e-5 * want_norm)
+            # One coefficient for both sides, so a parameter mismatch is the
+            # update's, not the norm's reduction order (checked just above).
+            coef = tessl_torch.clip_coef(want_norm, max_norm)
+            coefs.append(coef)
+            opt.step()
+            m.adamw_step(1e-2, eps=1e-2, weight_decay=0.0, grad_scale=coef)
+            got = m.parameters()
+            for n, p in ref.items():
+                tol = 1e-6 + (2.0 ** -22 if n.endswith("layernorm.weight") or n == "norm.weight" else 0.0)
+                err = (got[n].cpu() - p.detach()).abs().max().item()
+                self.assertLessEqual(err, tol, f"step {step} {n}: {err:.3e}")
+        self.assertTrue(all(c < 1.0 for c in coefs), coefs)
+        # The gradients tessl keeps are not clipped.
+        kept = m.grads()
+        self.assertTrue(all(torch.equal(kept[k], grads[k]) for k in grads))
+        self.assertEqual(tessl_torch.clip_coef(0.1, 1.0), 1.0)
+        with self.assertRaisesRegex(TesslError, "grad_scale NaN must be finite and >= 0"):
+            m.adamw_step(1e-2, grad_scale=float("nan"))
+
     def test_an_adamw_checkpoint_resumes_bit_for_bit(self):
         # Two steps, a checkpoint (parameters plus adamw_state), a third step.
         # A fresh model restored from the checkpoint takes the same third

@@ -68,7 +68,7 @@ fn host(
 
 /// `steps` steps of train_step + adamw_step from a fresh state, each checked
 /// against the f64 reference; returns the worst error seen.
-fn run(hyper: AdamWHyper, wd_all: f32, steps: usize) -> f64 {
+fn run(hyper: AdamWHyper, wd_all: f32, steps: usize) -> (f64, f64) {
     let (rt, model) = load();
     let table = model.parameter_table().unwrap();
     let wd = model.default_weight_decay(wd_all).unwrap();
@@ -76,11 +76,22 @@ fn run(hyper: AdamWHyper, wd_all: f32, steps: usize) -> f64 {
     let ids = ids();
     let mut m: Vec<Vec<f64>> = table.iter().map(|p| vec![0.0; p.shape.iter().product()]).collect();
     let mut v = m.clone();
+    let (mut mu, mut vu) = (m.clone(), m.clone());
+    let mut sensitivity = 0.0f64;
     let mut worst = 0.0f64;
     for step in 1..=steps {
         let s = model.train_step(&ids, GemmOperands::ExactF32).unwrap();
         let p0 = host(&rt, &model, &table, None);
         let g = host(&rt, &model, &table, Some(&s.grads));
+        let sq: f64 = g.iter().flatten().map(|x| x * x).sum();
+        let got = model.grad_sq_norm(&s.grads).unwrap();
+        assert!((got - sq).abs() <= 1e-5 * sq, "step {step}: grad_sq_norm {got} vs {sq}");
+        // torch scales `.grad` in place, in f32, before the step reads it.
+        let scale = hyper.grad_scale as f32;
+        let gs: Vec<Vec<f64>> = g
+            .iter()
+            .map(|t| t.iter().map(|&x| f64::from(x as f32 * scale)).collect())
+            .collect();
         model.adamw_step(&s.grads, &mut state, &hyper, &wd).unwrap();
         assert_eq!(state.step_count(), step as u64);
         let p1 = host(&rt, &model, &table, None);
@@ -90,11 +101,18 @@ fn run(hyper: AdamWHyper, wd_all: f32, steps: usize) -> f64 {
         for (i, info) in table.iter().enumerate() {
             let mut moved = false;
             for k in 0..p0[i].len() {
-                let mut w = p0[i][k] * (1.0 - hyper.lr * f64::from(wd[i]));
-                m[i][k] += (1.0 - hyper.beta1) * (g[i][k] - m[i][k]);
-                v[i][k] = v[i][k] * hyper.beta2 + (1.0 - hyper.beta2) * g[i][k] * g[i][k];
+                let decayed = p0[i][k] * (1.0 - hyper.lr * f64::from(wd[i]));
+                let mut w = decayed;
+                m[i][k] += (1.0 - hyper.beta1) * (gs[i][k] - m[i][k]);
+                v[i][k] = v[i][k] * hyper.beta2 + (1.0 - hyper.beta2) * gs[i][k] * gs[i][k];
                 let denom = v[i][k].sqrt() / bc2.sqrt() + hyper.eps;
                 w -= hyper.lr / bc1 * m[i][k] / denom;
+                // The same update on the unscaled gradient: how far the scale
+                // moves the result, so a test can show it is not lost in the bound.
+                mu[i][k] += (1.0 - hyper.beta1) * (g[i][k] - mu[i][k]);
+                vu[i][k] = vu[i][k] * hyper.beta2 + (1.0 - hyper.beta2) * g[i][k] * g[i][k];
+                let wu = decayed - hyper.lr / bc1 * mu[i][k] / (vu[i][k].sqrt() / bc2.sqrt() + hyper.eps);
+                sensitivity = sensitivity.max((w - wu).abs());
                 let err = (p1[i][k] - w).abs();
                 let bound = 2e-6;
                 assert!(
@@ -109,12 +127,12 @@ fn run(hyper: AdamWHyper, wd_all: f32, steps: usize) -> f64 {
             assert!(moved, "step {step}: {} did not move", info.name);
         }
     }
-    worst
+    (worst, sensitivity)
 }
 
 #[test]
 fn steps_match_torch_adamw_in_f64() {
-    let worst = run(
+    let (worst, _) = run(
         AdamWHyper {
             lr: 1e-2,
             ..AdamWHyper::default()
@@ -129,7 +147,7 @@ fn steps_match_torch_adamw_in_f64() {
 /// `(sqrt(v) + eps) / sqrt(bc2)` at the first steps, where `sqrt(bc2)` is ~0.03.
 #[test]
 fn eps_sits_outside_the_bias_correction() {
-    let worst = run(
+    let (worst, _) = run(
         AdamWHyper {
             lr: 1e-2,
             eps: 1e-2,
@@ -139,6 +157,30 @@ fn eps_sits_outside_the_bias_correction() {
         2,
     );
     eprintln!("eps 1e-2: worst error {worst:.2e}");
+}
+
+/// `grad_scale` is `clip_grad_norm_`'s coefficient applied to `.grad` in f32
+/// before the step, and `grad_sq_norm` (checked inside `run` at every step)
+/// is the norm it comes from. Adam cancels a gradient scale except against
+/// eps, so eps is large here, and the scale must move the reference by 50x
+/// the bound: a step that dropped the scale would fail the reference check.
+#[test]
+fn a_grad_scale_is_clip_grad_norms_coefficient() {
+    let (worst, sensitivity) = run(
+        AdamWHyper {
+            lr: 1e-2,
+            eps: 1e-2,
+            grad_scale: 0.3,
+            ..AdamWHyper::default()
+        },
+        0.1,
+        2,
+    );
+    eprintln!("grad_scale 0.3: worst error {worst:.2e}, the scale moves the reference by {sensitivity:.2e}");
+    assert!(
+        sensitivity > 50.0 * 2e-6,
+        "the scale moves the reference by only {sensitivity:.2e}"
+    );
 }
 
 #[test]
@@ -188,6 +230,12 @@ fn refusals_move_nothing() {
         model.adamw_step(&s.grads, &mut state, &AdamWHyper { beta1: 1.0, ..ok }, &wd),
         "beta1 1 must lie in [0, 1)",
     );
+    for bad in [f64::NAN, f64::INFINITY, -0.5] {
+        e(
+            model.adamw_step(&s.grads, &mut state, &AdamWHyper { grad_scale: bad, ..ok }, &wd),
+            "must be finite and >= 0",
+        );
+    }
     e(
         model.adamw_step(&s.grads, &mut state, &AdamWHyper { beta2: -0.1, ..ok }, &wd),
         "beta2 -0.1",

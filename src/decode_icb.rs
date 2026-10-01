@@ -1564,18 +1564,31 @@ pub fn icb_pipelines_enabled() -> bool {
     on
 }
 
-/// When set, [`crate::runtime::GpuRuntime::with_binder`] is a no-op (no Metal encode).
-///
-/// Used on the DecodeIcb replay path: re-run the Rust layer loop so `IcbScalarPool`
-/// / KV host metadata stay in sync, then [`DecodeIcb::execute`] does GPU work.
-static BINDER_ENCODE_NOP: AtomicI8 = AtomicI8::new(0);
+// When set, `GpuRuntime::with_binder` is a no-op (no Metal encode).
+// A process-global flag let one model's replay suppress encoding on another thread.
+thread_local! {
+    static BINDER_ENCODE_NOP: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
 
-pub fn set_binder_encode_nop(on: bool) {
-    BINDER_ENCODE_NOP.store(if on { 1 } else { 0 }, Ordering::Relaxed);
+/// Arm or disarm binder-nop on this thread.
+///
+/// Crate-private on purpose: while it is armed every encode on this thread
+/// returns `Ok(())` having done nothing. [`BinderEncodeNopGuard`] nests;
+/// [`clear_binder_encode_nop`] is the only public switch, and it can only disarm.
+pub(crate) fn set_binder_encode_nop(on: bool) {
+    BINDER_ENCODE_NOP.with(|flag| flag.set(on));
+}
+
+/// Disarm binder-nop on this thread, whatever armed it.
+///
+/// Safe to call at any time: encoding resumes. A downstream step that must
+/// never start under a stale replay flag calls this first.
+pub fn clear_binder_encode_nop() {
+    set_binder_encode_nop(false);
 }
 
 pub fn binder_encode_nop() -> bool {
-    BINDER_ENCODE_NOP.load(Ordering::Relaxed) == 1
+    BINDER_ENCODE_NOP.with(std::cell::Cell::get)
 }
 
 /// RAII: enable binder encode nop; restore off on drop.
@@ -1610,7 +1623,8 @@ impl Drop for BinderEncodeNopGuard {
 /// visible to every other test mid-flight.
 #[cfg(test)]
 pub(crate) struct IcbFlagsTestGuard {
-    saved: [i8; 6],
+    saved: [i8; 5],
+    saved_binder_encode_nop: bool,
     _lock: std::sync::MutexGuard<'static, ()>,
 }
 
@@ -1628,8 +1642,8 @@ impl IcbFlagsTestGuard {
                 ICB_RANGE_BATCH.load(Ordering::Relaxed),
                 ICB_COARSE_RANGES.load(Ordering::Relaxed),
                 ICB_PIPELINES.load(Ordering::Relaxed),
-                BINDER_ENCODE_NOP.load(Ordering::Relaxed),
             ],
+            saved_binder_encode_nop: binder_encode_nop(),
             _lock: lock,
         }
     }
@@ -1643,7 +1657,7 @@ impl Drop for IcbFlagsTestGuard {
         ICB_RANGE_BATCH.store(self.saved[2], Ordering::Relaxed);
         ICB_COARSE_RANGES.store(self.saved[3], Ordering::Relaxed);
         ICB_PIPELINES.store(self.saved[4], Ordering::Relaxed);
-        BINDER_ENCODE_NOP.store(self.saved[5], Ordering::Relaxed);
+        set_binder_encode_nop(self.saved_binder_encode_nop);
     }
 }
 
@@ -2034,6 +2048,36 @@ mod tests {
         );
         drop(outer);
         assert!(!binder_encode_nop(), "the outer drop restores the original");
+    }
+
+    /// Replay suppression belongs to one host thread. A process-global switch
+    /// made an unrelated model on another thread skip every `with_binder` body
+    /// and return success over stale device memory.
+    ///
+    /// Against the process-global flag the spawned thread observes `true`.
+    #[test]
+    fn binder_encode_nop_does_not_cross_thread_boundaries() {
+        let _flags = IcbFlagsTestGuard::lock();
+        set_binder_encode_nop(false);
+        let outer = BinderEncodeNopGuard::enter();
+        assert!(binder_encode_nop());
+
+        std::thread::spawn(|| {
+            assert!(!binder_encode_nop(), "another thread inherited replay suppression");
+            let local = BinderEncodeNopGuard::enter();
+            assert!(binder_encode_nop());
+            drop(local);
+            assert!(!binder_encode_nop());
+        })
+        .join()
+        .expect("thread-local replay-state probe");
+
+        assert!(
+            binder_encode_nop(),
+            "another thread changed the original thread's guard"
+        );
+        drop(outer);
+        assert!(!binder_encode_nop());
     }
 
     /// A bind the argument table cannot hold must be refused, not dropped.

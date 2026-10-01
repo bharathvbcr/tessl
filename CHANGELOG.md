@@ -137,6 +137,10 @@ All notable changes to `tessl` are recorded here. The format follows
 
 ### Changed (breaking)
 
+- `set_binder_encode_nop` is no longer public: while armed, every encode on
+  its thread returns `Ok(())` having done nothing. `BinderEncodeNopGuard`
+  still arms it for a scope, and the new `clear_binder_encode_nop` can only
+  disarm it.
 - **C ABI 9** (was 3; the binding and library refuse each other across
   versions, so rebuild `libtessl.dylib` with the binding). It adds a
   Qwen3.5 model handle: `tessl_qwen35_load`, `_train_step`,
@@ -293,6 +297,10 @@ All notable changes to `tessl` are recorded here. The format follows
 
 ### Fixed
 
+- Binder-nop replay suppression belongs to the thread that armed it. The
+  flag was process-global, so one model's decode-ICB replay made an
+  unrelated model on another thread skip every `with_binder` encode and
+  report success over stale device memory.
 - `tools/msl_emu` runs under ThreadSanitizer on macOS: TSan does not see
   libc++'s `std::barrier` as synchronisation, so every barrier-separated write
   pair was reported as a race. The shim's barriers are now its own, on acq_rel

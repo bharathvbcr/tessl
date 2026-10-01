@@ -81,15 +81,9 @@ fn values_are_the_checkpoints_under_transformers_names() {
         let (shape, w) = st.read_f32(&format!("model.{}", p.name)).unwrap();
         assert_eq!(shape, p.shape, "{}", p.name);
         let got = hf(p, t);
-        // The zero-centred norms are stored as 1 + w: w comes back within
-        // f32's rounding at 1. Everything else is the checkpoint's bits.
-        let tol = if p.name.ends_with("layernorm.weight") || p.name == "norm.weight" {
-            2f32.powi(-23)
-        } else {
-            0.0
-        };
+        // The checkpoint's bits, the zero-centred norms' w included.
         for (i, (a, b)) in got.iter().zip(&w).enumerate() {
-            assert!((a - b).abs() <= tol, "{}[{i}]: {a} vs {b}", p.name);
+            assert_eq!(a.to_bits(), b.to_bits(), "{}[{i}]: {a} vs {b}", p.name);
         }
     }
 }
@@ -156,14 +150,9 @@ fn a_write_round_trips_and_moves_both_forwards_together() {
     model.read_parameters(&back).unwrap();
     for ((p, s), b) in table.iter().zip(&stepped).zip(&back) {
         let (s, b) = (s.read_f32().unwrap(), b.read_f32().unwrap());
-        // Exact, the embedding included: its table is f32.
-        let tol = if p.name.ends_with("layernorm.weight") || p.name == "norm.weight" {
-            2f32.powi(-22)
-        } else {
-            0.0
-        };
+        // Exact, the embedding (an f32 table) and the norms included.
         for (i, (x, y)) in b.iter().zip(&s).enumerate() {
-            assert!((x - y).abs() <= tol, "{}[{i}]: read back {x}, wrote {y}", p.name);
+            assert_eq!(x.to_bits(), y.to_bits(), "{}[{i}]: read back {x}, wrote {y}", p.name);
         }
     }
     // Loss decreases along the negative gradient, and the training step and
@@ -176,6 +165,52 @@ fn a_write_round_trips_and_moves_both_forwards_together() {
         "inference {infer} vs training {}",
         after.loss
     );
+}
+
+/// Any f32 written reads back with its bits, for every entry: the
+/// zero-centred norms are stored as their `w`, so a `w` below -0.5 (whose
+/// `1 + w` has finer steps than `w` itself) survives a write and a read, as
+/// a checkpoint restored into a fresh model needs.
+#[test]
+fn every_written_value_reads_back_bit_for_bit() {
+    let (rt, model, _st) = load(Precision::F32);
+    let table = model.parameter_table().unwrap();
+    // Values across [-2, 2] with full low bits, and the norm value a resumed
+    // AdamW run lost an ulp of.
+    let values = |n: usize, salt: usize| -> Vec<f32> {
+        (0..n)
+            .map(|i| {
+                if i == 0 {
+                    return -0.659_430_6;
+                }
+                let u = ((i + 7 * salt) as f64 * 0.618_033_988_749_894_9).fract();
+                (u * 4.0 - 2.0) as f32 * (1.0 + 1e-7 * (i % 13) as f32)
+            })
+            .collect()
+    };
+    let src: Vec<Tensor> = table
+        .iter()
+        .enumerate()
+        .map(|(k, p)| {
+            let shape = p.storage_shape();
+            common::tensor_f32(&rt, &shape, &values(shape.iter().product(), k))
+        })
+        .collect();
+    model.write_parameters(&src).unwrap();
+    let back = alloc(&rt, &table);
+    model.read_parameters(&back).unwrap();
+    for ((p, s), b) in table.iter().zip(&src).zip(&back) {
+        let (s, b) = (s.read_f32().unwrap(), b.read_f32().unwrap());
+        let bad: Vec<(usize, f32, f32)> = s
+            .iter()
+            .zip(&b)
+            .enumerate()
+            .filter(|(_, (x, y))| x.to_bits() != y.to_bits())
+            .map(|(i, (x, y))| (i, *x, *y))
+            .take(3)
+            .collect();
+        assert!(bad.is_empty(), "{}: wrote, read back {bad:?}", p.name);
+    }
 }
 
 #[test]

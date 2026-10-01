@@ -1127,6 +1127,87 @@ fn gated_rms_norm_f32_and_bf16() {
     });
 }
 
+// ------------------------------------------------------------ residual norm ---
+
+/// `qwen35::rms_norm` on the zero-centred `w`: the f32 output is tessl's
+/// generic RMSNorm fed `1 + w` folded in f32, bit for bit (the same reduction
+/// and the same `fl(1 + w)`), so storing `w` moved no forward; both outputs
+/// are `x * rstd * (1 + w)` in f64 to their dtype's rounding. Weights reach
+/// below -0.5, where `1 + w` rounds `w`. The 2B's hidden size spans several
+/// simdgroups; 300 is not a power of two.
+#[test]
+fn qwen35_rms_norm_f32_and_bf16() {
+    with_gpu(|rt| {
+        for (rows, dim, seed) in [(37usize, 2048usize, 610u64), (5, 300, 620)] {
+            let eps = 1e-6f32;
+            let x = random_f32(rows * dim, seed);
+            let w: Vec<f32> = random_f32(dim, seed + 1).iter().map(|v| 0.9 * v).collect();
+            assert!(w.iter().any(|&v| v < -0.5), "the weights must reach below -0.5");
+            let want: Vec<f64> = x
+                .chunks(dim)
+                .flat_map(|r| {
+                    let ms = r.iter().map(|&v| f64::from(v) * f64::from(v)).sum::<f64>() / dim as f64;
+                    let rstd = 1.0 / (ms + f64::from(eps)).sqrt();
+                    r.iter()
+                        .zip(&w)
+                        .map(move |(&v, &wv)| f64::from(v) * rstd * (1.0 + f64::from(wv)))
+                        .collect::<Vec<_>>()
+                })
+                .collect();
+            let (xb, wb) = (buf(rt, &x), buf(rt, &w));
+            let folded: Vec<f32> = w.iter().map(|v| 1.0 + v).collect();
+            let fb = buf(rt, &folded);
+            let out = seeded(rt, rows * dim, SENTINEL);
+            let generic = seeded(rt, rows * dim, SENTINEL);
+            let outb = rt.alloc_buffer(rows * dim * 2).unwrap();
+            let (r, d) = (rows as u32, dim as u32);
+            qwen35::rms_norm(rt, &xb, &wb, &out, DType::F32, r, d, eps).unwrap();
+            qwen35::rms_norm(rt, &xb, &wb, &outb, DType::BF16, r, d, eps).unwrap();
+            tessl::nn::rms_norm_f32(rt, &xb, &fb, &generic, r, d, eps).unwrap();
+            rt.synchronize().unwrap();
+            let got = out.read_f32()[..rows * dim].to_vec();
+            let same = got
+                .iter()
+                .zip(&generic.read_f32()[..rows * dim])
+                .all(|(a, b)| a.to_bits() == b.to_bits());
+            assert!(same, "{rows}x{dim}: not the generic RMSNorm on 1 + w bit for bit");
+            assert_close_rel(&format!("qwen35 rms_norm f32 {rows}x{dim}"), &got, &want, 1e-5, 1e-6);
+            for (i, (&g, &wv)) in read_bf16(&outb, want.len()).iter().zip(&want).enumerate() {
+                // One bf16 rounding of the f32 result: half an ulp of 2^-8, plus slack.
+                assert!(
+                    (f64::from(g) - wv).abs() <= wv.abs() * (2f64.powi(-8) + 1e-5) + 1e-6,
+                    "{rows}x{dim} bf16 [{i}] {g} vs {wv}"
+                );
+            }
+        }
+        // Refusals: no width, a non-positive eps, a bf16 output over x, a dtype
+        // with no kernel.
+        let (xb, wb) = (buf(rt, &[1.0; 64]), buf(rt, &[0.0; 64]));
+        let out = seeded(rt, 64, SENTINEL);
+        for (e, want) in [
+            (
+                qwen35::rms_norm(rt, &xb, &wb, &out, DType::F32, 1, 0, 1e-6),
+                "dim must be non-zero",
+            ),
+            (
+                qwen35::rms_norm(rt, &xb, &wb, &out, DType::F32, 1, 64, 0.0),
+                "eps must be finite and positive",
+            ),
+            (
+                qwen35::rms_norm(rt, &xb, &wb, &xb, DType::BF16, 1, 64, 1e-6),
+                "overlaps read-only buffer x",
+            ),
+            (
+                qwen35::rms_norm(rt, &xb, &wb, &wb, DType::F32, 1, 64, 1e-6),
+                "overlaps read-only buffer w",
+            ),
+        ] {
+            let e = e.unwrap_err();
+            assert!(e.contains(want), "{e}");
+        }
+    });
+}
+
 /// Host-only. Widths whose sum overflows used to wrap (release) or panic
 /// (debug); `in_features = 0` with a huge width used to spin through every
 /// empty row. Both now finish at once.

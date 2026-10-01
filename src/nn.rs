@@ -129,7 +129,7 @@ pub(crate) fn require_disjoint_writes(
     Ok(())
 }
 
-fn validate_rms_scalars(dim: u32, eps: f32, what: &str) -> Result<(), String> {
+pub(crate) fn validate_rms_scalars(dim: u32, eps: f32, what: &str) -> Result<(), String> {
     if dim == 0 {
         return Err(format!("{what}: dim must be non-zero"));
     }

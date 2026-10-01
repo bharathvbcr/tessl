@@ -429,6 +429,13 @@ fn qwen35_swiglu_row_offsets_are_widened() {
         "resid[(ulong)r * ld_resid + resid_off + col] += y[(ulong)r * ld_y + y_off + col];",
         "residual add addresses",
     );
+    require(QWEN35_MLP, "x + (ulong)row * dim;", "residual norm input row");
+    require(QWEN35_MLP, "out + (ulong)row * dim;", "residual norm output row");
+    require(
+        QWEN35_MLP,
+        "for (ulong d = lid; d < (ulong)dim; d += tptg)",
+        "residual norm column walk",
+    );
 }
 
 /// Cross-entropy gathers rows of a `[T, ld]` hidden-state matrix and walks

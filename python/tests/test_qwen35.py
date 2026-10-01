@@ -74,9 +74,8 @@ class Qwen35Training(unittest.TestCase):
         for name, p in params.items():
             want = state["model." + name].float()
             self.assertEqual(tuple(p.shape), tuple(want.shape), name)
-            # 1 + w round-trips w within f32's rounding at 1.
-            tol = 2.0 ** -23 if name.endswith("layernorm.weight") or name == "norm.weight" else 0.0
-            self.assertLessEqual((p.cpu() - want).abs().max().item(), tol, name)
+            # The checkpoint's bits, the zero-centred norms' w included.
+            self.assertTrue(torch.equal(p.cpu(), want), name)
 
     def test_step_matches_transformers_autograd(self):
         m = self.model()
@@ -105,7 +104,7 @@ class Qwen35Training(unittest.TestCase):
         # torch.optim.AdamW on CPU copies, with the same two groups (Trainer's
         # exclusions take no decay), fed tessl's gradients each step. Bound
         # set before the first run: 1e-6 per element (lr 1e-2: a semantic
-        # error is 1e-5 or more), plus 2^-22 for the norms tessl stores as 1 + w.
+        # error is 1e-5 or more), every parameter alike.
         m = self.model()
         ref = {n: p.cpu().clone().requires_grad_(True) for n, p in m.parameters().items()}
         excluded = dict(zip((n for n, _, _ in m._table), m._decay_excluded))
@@ -130,9 +129,8 @@ class Qwen35Training(unittest.TestCase):
             self.assertEqual(m.adamw_step_count, step)
             got = m.parameters()
             for n, p in ref.items():
-                tol = 1e-6 + (2.0 ** -22 if n.endswith("layernorm.weight") or n == "norm.weight" else 0.0)
                 err = (got[n].cpu() - p.detach()).abs().max().item()
-                self.assertLessEqual(err, tol, f"step {step} {n}: {err:.3e}")
+                self.assertLessEqual(err, 1e-6, f"step {step} {n}: {err:.3e}")
         # Training on one sequence lowers its loss.
         self.assertLess(m.train_step(self.ids), losses[0])
 
@@ -229,8 +227,7 @@ class Qwen35Training(unittest.TestCase):
         # And the parameters read back are what was written.
         back = m.parameters()
         for name, p in params.items():
-            tol = 2.0 ** -22 if name.endswith("layernorm.weight") or name == "norm.weight" else 0.0
-            self.assertLessEqual((back[name] - p).abs().max().item(), tol, name)
+            self.assertTrue(torch.equal(back[name], p), name)
 
     def test_refusals(self):
         m = self.model()

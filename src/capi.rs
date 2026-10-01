@@ -884,8 +884,8 @@ pub unsafe extern "C" fn tessl_qwen35_train_step(
 /// entry in order, each dense f32 of the entry's shape (transposed when the
 /// entry says so): [`TESSL_READ_PARAMS`] and [`TESSL_READ_GRADS`] (the last
 /// step's) fill them, [`TESSL_WRITE_PARAMS`] sets the parameters from them.
-/// Values are transformers' (see [`crate::qwen35_params`] for the norms'
-/// `1 + w` and the bf16 embedding table). Every tensor is checked before
+/// Values are transformers' (see [`crate::qwen35_params`] for the layouts
+/// tessl keeps them in). Every tensor is checked before
 /// anything is copied.
 ///
 /// # Safety

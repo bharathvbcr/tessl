@@ -50,7 +50,7 @@ use objc2_metal::MTLComputePipelineState;
 
 use crate::dispatch::{dispatch_2d, set_f32, set_gpu_buf, set_u32, Binder};
 use crate::gemm::{gemm, gemm_epilogue, Epilogue, GemmBackend};
-use crate::nn::{require, require_disjoint_writes, require_runtime};
+use crate::nn::{dispatch_tg_1d, reduce_tptg, require, require_disjoint_writes, require_runtime, validate_rms_scalars};
 use crate::runtime::{mtl_size, GpuRuntime};
 use crate::tensor::{DType, GpuBuffer, Tensor};
 
@@ -1902,6 +1902,56 @@ pub fn residual_add(rt: &Arc<GpuRuntime>, y: Cols<'_>, resid: Cols<'_>, rows: u3
         set_u32(bnd, y.off, 5);
         set_u32(bnd, resid.ld, 6);
         set_u32(bnd, resid.off, 7);
+    })
+}
+
+/// Qwen3.5's zero-centred RMSNorm over `rows` dense rows of `dim`:
+/// `out = x * rsqrt(mean(x^2) + eps) * (1 + w)`, with `w` as the checkpoint
+/// holds it (`Qwen3_5RMSNorm`), `1 + w` formed in the kernel. `out` is f32 or
+/// bf16 (`out_dtype`); the scale is reduced as [`crate::nn::rms_norm_f32`]
+/// reduces it. An f32 `out` may be `x` (each element is read and written by
+/// one lane); neither may be `w`, and a bf16 `out` may not overlap `x`.
+#[allow(clippy::too_many_arguments)]
+pub fn rms_norm(
+    rt: &Arc<GpuRuntime>,
+    x: &GpuBuffer,
+    w: &GpuBuffer,
+    out: &GpuBuffer,
+    out_dtype: DType,
+    rows: u32,
+    dim: u32,
+    eps: f32,
+) -> Result<(), String> {
+    const WHAT: &str = "qwen35::rms_norm";
+    let name = out_kernel("qwen35_rms_norm", out_dtype, WHAT)?;
+    validate_rms_scalars(dim, eps, WHAT)?;
+    let n = (rows as usize)
+        .checked_mul(dim as usize)
+        .ok_or_else(|| format!("{WHAT}: rows x dim overflows usize"))?;
+    require::<f32>(rt, x, n, "rms_norm x")?;
+    require::<f32>(rt, w, dim as usize, "rms_norm w")?;
+    if out_dtype == DType::BF16 {
+        require::<u16>(rt, out, n, "rms_norm out")?;
+    } else {
+        require::<f32>(rt, out, n, "rms_norm out")?;
+    }
+    if rows == 0 {
+        return Ok(());
+    }
+    if out_dtype == DType::BF16 {
+        require_disjoint_writes(WHAT, &[("out", out)], &[("x", x), ("w", w)])?;
+    } else {
+        require_disjoint_writes(WHAT, &[("out", out)], &[("w", w)])?;
+    }
+    let p = rt.pipeline(&name)?;
+    let tptg = reduce_tptg(p.maxTotalThreadsPerThreadgroup(), dim as usize);
+    dispatch_tg_1d(rt, &p, rows as usize, tptg, None, |bnd| {
+        set_gpu_buf(bnd, x, 0);
+        set_gpu_buf(bnd, w, 1);
+        set_gpu_buf(bnd, out, 2);
+        set_u32(bnd, rows, 3);
+        set_u32(bnd, dim, 4);
+        set_f32(bnd, eps, 5);
     })
 }
 

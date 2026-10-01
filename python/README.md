@@ -69,8 +69,8 @@ of allocating another 8 GB copy on the 2B while the previous one is still
 attached to the parameters.
 
 Names are transformers' below the text tower (`layers.3.mlp.gate_proj.weight`),
-and values are the parameters' own (the zero-centred norms as `w`, although
-tessl stores `1 + w`). Linear weights come back as transposed views, because
+and values are the parameters' own (the zero-centred norms as `w`, as tessl
+stores them). Linear weights come back as transposed views, because
 tessl keeps them as `[in, out]`. `load_parameters` needs every parameter,
 checks them all before writing any, and accepts any layout, dtype or device.
 The model runs entirely in f32, the tied embedding included, so a write is

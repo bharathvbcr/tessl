@@ -92,8 +92,9 @@ fn col_sum_blocks(
     })
 }
 
-/// Backward of `y = rms_norm(x) * w` (the weight as the forward used it,
-/// so `1 + w` for Qwen3.5's zero-centred norms, whose gradient is the same).
+/// Backward of Qwen3.5's zero-centred `y = rms_norm(x) * (1 + w)`
+/// ([`crate::qwen35::rms_norm`]), with `w` as stored; the kernel forms
+/// `1 + w`, and `dw` is the gradient of `w` (that of `1 + w`).
 /// `x`, `dy`, `dx` are dense `[rows, dim]` f32; `dw` is `[dim]`, overwritten.
 /// With `accumulate`, dx is added to `dx` (the residual stream's gradient)
 /// instead of stored. `part` holds [`rms_norm_bwd_part_len`] floats.

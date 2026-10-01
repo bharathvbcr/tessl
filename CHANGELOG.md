@@ -72,7 +72,7 @@ All notable changes to `tessl` are recorded here. The format follows
   (`tessl::qwen35_params`)**: `parameter_table`, `read_parameters`,
   `read_gradients` and `write_parameters` copy between the model and caller
   f32 tensors on the GPU, with transformers' shapes and values (norms as
-  `w`, not the stored `1 + w`; linear weights as `[in, out]` windows of the
+  `w`; linear weights as `[in, out]` windows of the
   packed projections), honouring a caller's byte offset and checking every
   tensor before writing any. `gemm::transpose_f32_into` is the checked GPU
   transpose (the TN/NT fallbacks now share it).
@@ -191,6 +191,19 @@ All notable changes to `tessl` are recorded here. The format follows
   is exact, and gradients are taken at the parameters themselves rather
   than at a bf16 rounding of the embedding. `qwen35::embed_rows` accepts an
   f32 table. The bf16 model is unchanged.
+- `Qwen35Model` stores the zero-centred norms (`input_layernorm`,
+  `post_attention_layernorm`, the final `norm`) as `w`, as the checkpoint
+  holds them, and their kernels form `1 + w` in f32, as transformers does
+  and as the attention Q/K norms already did: the new
+  `qwen35::rms_norm` (`qwen35_rms_norm_f32`, `_bf16`) for the forward, and
+  `qwen35_rms_norm_bwd_f32` (whose `w` is now the stored `w`). Storing
+  `1 + w` rounded `w` to ulp(1 + w), so a parameter written and read back,
+  or a checkpoint restored into a fresh model, moved by an ulp (a stored
+  0.3405694 came back as 0.34056938), and each AdamW update of a norm was
+  rounded to about 6e-8. Reads and writes are now exact for every entry and
+  AdamW updates the norms as stored; the forward and the gradients are the
+  same bits as before on the tiny model (f32 and bf16), and
+  `qwen35::rms_norm` in f32 is `nn::rms_norm_f32` on `1 + w` bit for bit.
 
 ### Fixed
 

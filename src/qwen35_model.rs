@@ -17,9 +17,10 @@
 //!
 //! and after the last layer `logits = rms_norm(resid) * (1 + norm.w) @ embedᵀ`
 //! (Qwen3.5 ties the LM head to the embedding). Zero-centred norm weights are
-//! folded to `1 + w` in f32 on the host, which is the value transformers
-//! multiplies by; the GDN gated norm's weight is used as stored, and the
-//! attention Q/K norms apply their own `1 + w` in the kernel.
+//! stored as the checkpoint holds them, `w`, and their kernels form `1 + w`
+//! in f32 as transformers does (the residual norms in `qwen35_rms_norm_*`,
+//! the attention Q/K norms in theirs); the GDN gated norm's weight is used
+//! as stored.
 //!
 //! # Precision
 //!
@@ -40,7 +41,7 @@ use std::sync::Arc;
 
 use crate::gemm::{gemm, gemm_nt_f32, GemmBackend};
 use crate::json::{self, Json, Syntax};
-use crate::nn::{self, AttnDims};
+use crate::nn::AttnDims;
 use crate::qwen35::{
     self, AttnProjLayout, AttnShape, AttnTargets, Cols, GdnParams, GdnProjLayout, GdnWorkspace, LmHead, OutCols,
     StateIn,
@@ -435,10 +436,9 @@ impl Loader<'_> {
         Ok(b)
     }
 
-    /// A zero-centred norm weight, folded to `1 + w` in f32.
-    fn norm_plus_one(&self, rest: &str, dim: usize) -> Result<GpuBuffer, String> {
-        let w: Vec<f32> = self.f32(rest, &[dim])?.iter().map(|w| 1.0 + w).collect();
-        self.f32_buf(&w)
+    /// A norm weight as the checkpoint holds it, in f32.
+    fn norm_w(&self, rest: &str, dim: usize) -> Result<GpuBuffer, String> {
+        self.f32_buf(&self.f32(rest, &[dim])?)
     }
 
     /// `nn.Linear` weights `[out_i, in]` packed side by side into the right
@@ -516,7 +516,7 @@ impl Qwen35Model {
                 (t, None)
             }
         };
-        let final_norm = ld.norm_plus_one("norm.weight", h)?;
+        let final_norm = ld.norm_w("norm.weight", h)?;
 
         let (g, a) = (cfg.gdn, cfg.attn);
         let mut layers = Vec::with_capacity(cfg.layers.len());
@@ -575,8 +575,8 @@ impl Qwen35Model {
                 }
             };
             layers.push(Layer {
-                input_norm: ld.norm_plus_one(&p("input_layernorm.weight"), h)?,
-                post_norm: ld.norm_plus_one(&p("post_attention_layernorm.weight"), h)?,
+                input_norm: ld.norm_w(&p("input_layernorm.weight"), h)?,
+                post_norm: ld.norm_w(&p("post_attention_layernorm.weight"), h)?,
                 mixer,
                 gate: ld.linear(&[(&p("mlp.gate_proj.weight"), inter)], h, precision)?,
                 up: ld.linear(&[(&p("mlp.up_proj.weight"), inter)], h, precision)?,
@@ -671,14 +671,23 @@ impl Qwen35Model {
         })
     }
 
-    /// `out = rms_norm(x) * w` in the forward's activation dtype.
+    /// `out = rms_norm(x) * (1 + w)` in the forward's activation dtype.
     fn norm(&self, x: &Tensor, w: &GpuBuffer, out: &Tensor) -> Result<(), String> {
         let (rows, dim) = (x.shape[0] as u32, x.shape[1] as u32);
-        let eps = self.cfg.rms_norm_eps;
-        match self.precision {
-            Precision::Bf16 => nn::rms_norm_bf16(&self.rt, &x.buffer, w, &out.buffer, rows, dim, eps),
-            Precision::F32 => nn::rms_norm_f32(&self.rt, &x.buffer, w, &out.buffer, rows, dim, eps),
-        }
+        let dtype = match self.precision {
+            Precision::Bf16 => DType::BF16,
+            Precision::F32 => DType::F32,
+        };
+        qwen35::rms_norm(
+            &self.rt,
+            &x.buffer,
+            w,
+            &out.buffer,
+            dtype,
+            rows,
+            dim,
+            self.cfg.rms_norm_eps,
+        )
     }
 
     /// `resid += y @ w_out`.

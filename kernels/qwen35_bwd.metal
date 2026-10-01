@@ -33,9 +33,11 @@ inline float qwen35_silu_grad(float g)
     return s * (1.0f + g * (1.0f - s));
 }
 
-/// RMSNorm backward, `y = x * rstd * w`, `rstd = rsqrt(mean(x^2) + eps)`:
+/// RMSNorm backward for Qwen3.5's zero-centred norm, `y = x * rstd * (1 + w)`,
+/// `rstd = rsqrt(mean(x^2) + eps)`, with `w` stored as the checkpoint holds it
+/// and `1 + w` formed here (as `qwen35_rms_norm_f32` forms it):
 ///
-///   dx = rstd * (dy * w) - x * rstd^3 * mean(dy * w * x)
+///   dx = rstd * (dy * (1 + w)) - x * rstd^3 * mean(dy * (1 + w) * x)
 ///   dw = sum over rows of dy * x * rstd
 ///
 /// `x`, `dy`, `dx` are dense `[rows, D]`; with `flags & 1` dx is added to
@@ -77,7 +79,7 @@ kernel void qwen35_rms_norm_bwd_f32(
         for (uint d = lid; d < D; d += tptg) {
             const float xv = xr[d];
             ss += xv * xv;
-            dot += gr[d] * w[d] * xv;
+            dot += gr[d] * (1.0f + w[d]) * xv;
         }
         ss = reduce_row_add(ss, scratch, sgid, lane, tptg);
         // A second scratch region: the first reduction's reads of `scratch`
@@ -88,7 +90,7 @@ kernel void qwen35_rms_norm_bwd_f32(
         device float *xo = dx + r * D;
         uint k = 0;
         for (uint d = lid; d < D; d += tptg, ++k) {
-            const float v = rstd * gr[d] * w[d] - xr[d] * c;
+            const float v = rstd * gr[d] * (1.0f + w[d]) - xr[d] * c;
             xo[d] = (flags & 1u) != 0u ? xo[d] + v : v;
             acc[k] += gr[d] * xr[d] * rstd;
         }

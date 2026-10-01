@@ -5,10 +5,11 @@
 //! Each entry is one `Qwen3_5ForCausalLM` parameter, named as transformers
 //! names it below the text tower (`layers.3.mlp.gate_proj.weight`, without
 //! the checkpoint's `model.language_model.` prefix), and its value is the
-//! parameter's own value, whatever tessl stores:
+//! parameter's own value, whatever layout tessl stores it in:
 //!
 //! - The zero-centred norms (`input_layernorm`, `post_attention_layernorm`,
-//!   the final `norm`) are stored as `1 + w`; they read and write as `w`.
+//!   the final `norm`) are stored as `w`, as transformers holds them; their
+//!   kernels add the 1, so a write and a read are exact.
 //! - The linear layers live packed side by side as `[in, sum(out)]` right
 //!   operands; each reads and writes as its own `[in, out]` window, the
 //!   transpose of transformers' `[out, in]` ([`ParamInfo::transposed`]).
@@ -16,10 +17,8 @@
 //!   gather, the training step's cross-entropy and the inference forward's
 //!   head alike, so a write is exact and moves all three.
 //!
-//! Gradients come in the same layouts (the gradient of `1 + w` is that of
-//! `w`). Every copy is a GPU dispatch, since a caller's buffers may be
-//! GPU-private; only the norms' `1 + w` shift runs on the host, on tessl's
-//! own (shared) buffers.
+//! Gradients come in the same layouts. Every copy is a GPU dispatch, since a
+//! caller's buffers may be GPU-private.
 
 use crate::qwen35::Cols;
 use crate::qwen35_bwd::copy_cols;
@@ -53,8 +52,6 @@ impl ParamInfo {
 /// Where a value lives in tessl.
 #[derive(Clone, Copy)]
 pub(crate) enum Src<'a> {
-    /// A 1-D f32 buffer stored as `1 + w`.
-    OnePlus(&'a GpuBuffer),
     /// An f32 buffer holding exactly the value.
     Raw(&'a GpuBuffer),
     /// Columns `[off, off + width)` of a packed `[in, total]` f32 matrix.
@@ -205,18 +202,18 @@ pub(crate) fn slots<'a>(m: &'a Qwen35Model, grads: Option<&'a Qwen35Grads>) -> R
         });
         out.push(Slot {
             info: info(p("input_layernorm.weight"), &[h], false),
-            param: Src::OnePlus(&layer.input_norm),
+            param: Src::Raw(&layer.input_norm),
             grad: lg.map(|g| Src::Raw(&g.input_norm)),
         });
         out.push(Slot {
             info: info(p("post_attention_layernorm.weight"), &[h], false),
-            param: Src::OnePlus(&layer.post_norm),
+            param: Src::Raw(&layer.post_norm),
             grad: lg.map(|g| Src::Raw(&g.post_norm)),
         });
     }
     out.push(Slot {
         info: info("norm.weight".into(), &[h], false),
-        param: Src::OnePlus(&m.final_norm),
+        param: Src::Raw(&m.final_norm),
         grad: grads.map(|g| Src::Raw(&g.final_norm)),
     });
     Ok(out)
@@ -362,13 +359,6 @@ impl Qwen35Model {
             Src::Raw(b) => gpu_copy(&self.as_tensor(b, info)?, dst),
             Src::Dense(t) => gpu_copy(t, dst),
             Src::Packed(t, off) => self.packed_copy(t, off, info.shape[1], info.shape[0], dst, true),
-            Src::OnePlus(b) => {
-                let n = info.shape.iter().product::<usize>();
-                let w: Vec<f32> = b.read_f32()[..n].iter().map(|x| x - 1.0).collect();
-                let tmp = self.rt.alloc_buffer(n * 4)?;
-                tmp.write_f32(&w);
-                gpu_copy(&self.as_tensor(&tmp, info)?, dst)
-            }
         }
     }
 
@@ -377,18 +367,6 @@ impl Qwen35Model {
             Src::Dense(t) => gpu_copy(src, t),
             Src::Raw(b) => gpu_copy(src, &self.as_tensor(b, info)?),
             Src::Packed(t, off) => self.packed_copy(t, off, info.shape[1], info.shape[0], src, false),
-            Src::OnePlus(b) => {
-                let n = info.shape.iter().product::<usize>();
-                let tmp = self.rt.alloc_buffer(n * 4)?;
-                gpu_copy(src, &self.as_tensor(&tmp, info)?)?;
-                // Host reads wait for the copy.
-                let mut all = b.read_f32();
-                for (dst, w) in all.iter_mut().zip(&tmp.read_f32()[..n]) {
-                    *dst = 1.0 + w;
-                }
-                b.write_f32(&all);
-                Ok(())
-            }
         }
     }
 }

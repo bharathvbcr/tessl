@@ -14,8 +14,9 @@
 //! passed as f32, and the kernel (`kernels/qwen35_adamw.metal`) applies
 //! decoupled weight decay, then the moments (the first through torch's
 //! `lerp`), then `p += -step_size * m / (sqrt(v) / sqrt(bc2) + eps)`. Weight
-//! decay is per parameter-table entry, so parameter groups map onto it; the
-//! norms stored as `1 + w` are updated, decayed included, as `w`.
+//! decay is per parameter-table entry, so parameter groups map onto it. Every
+//! parameter is updated as stored, which is transformers' value (the
+//! zero-centred norms' `w` included).
 
 use crate::dispatch::{dispatch_2d, set_gpu_buf_offset, set_u32};
 use crate::qwen35_model::{Mixer, Qwen35Model};
@@ -141,7 +142,7 @@ struct Window<'a> {
 fn window<'a>(src: Src<'a>, shape: &[usize]) -> Window<'a> {
     let numel = shape.iter().product::<usize>();
     match src {
-        Src::OnePlus(b) | Src::Raw(b) => Window {
+        Src::Raw(b) => Window {
             buf: b,
             byte_off: 0,
             rows: 1,
@@ -256,12 +257,7 @@ impl Qwen35Model {
                     "{WHAT}: {name}: gradient or moments are not laid out as the parameter"
                 ));
             }
-            let shift = if matches!(s.param, Src::OnePlus(_)) {
-                1.0f32
-            } else {
-                0.0
-            };
-            plan.push((w, f64::from(wd), shift));
+            plan.push((w, f64::from(wd)));
         }
 
         // torch: the step count increments, then the scalars are formed in f64.
@@ -271,7 +267,7 @@ impl Qwen35Model {
         let step_size = lr / bc1;
         let bc2_sqrt = bc2.powf(0.5);
         let p = self.rt.pipeline("qwen35_adamw_f32")?;
-        for (w, wd, shift) in &plan {
+        for (w, wd) in &plan {
             let scalars = [
                 (1.0 - lr * wd) as f32,
                 (1.0 - beta1) as f32,
@@ -280,7 +276,6 @@ impl Qwen35Model {
                 step_size as f32,
                 bc2_sqrt as f32,
                 eps as f32,
-                *shift,
             ];
             let bytes: Vec<u8> = scalars.iter().flat_map(|x| x.to_le_bytes()).collect();
             let [wp, wg, wm, wv] = w;

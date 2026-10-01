@@ -96,7 +96,7 @@ jobs:
                     qwen35_attn_prefix_rows qwen35_attn_prefix_decode_partial \
                     qwen35_attn_prefix_decode_reduce qwen35_attn_tiled_h256_q32_k32_sg4 \
                     qwen35_attn_tiled_h256_q32_k64_sg4 qwen35_attn_tiled_h256_q64_k32_sg8 \
-                    qwen35_attn_tiled_h256_q64_k64_sg8 qwen35_swiglu_f32 qwen35_swiglu_bf16 qwen35_residual_add_f32 qwen35_score_rows_f32 qwen35_score_rows_bf16 \
+                    qwen35_attn_tiled_h256_q64_k64_sg8 qwen35_swiglu_f32 qwen35_swiglu_bf16 qwen35_residual_add_f32 qwen35_rms_norm_f32 qwen35_rms_norm_bf16 qwen35_score_rows_f32 qwen35_score_rows_bf16 \
                     qwen35_embed_rows_bf16 qwen35_embed_rows_f32 ce_gather_rows_f32 ce_gather_rows_bf16 ce_lse_update ce_softmax_grad gdn_train_fwd gdn_train_bwd gdn_train_bwd_finish \
                     qwen35_rms_norm_bwd_f32 qwen35_col_sum_blocks_f32 qwen35_gated_rms_norm_bwd_f32 \
                     qwen35_swiglu_bwd_f32 qwen35_attn_gate_bwd_f32 \

@@ -11,9 +11,9 @@
 // `sqrt(v) / sqrt(bc2) + eps`, then `p += -step_size * (m / denom)`. The host
 // forms the per-step scalars in f64 as torch does and passes them as f32.
 //
-// A norm tessl stores as `1 + w` has `shift = 1`: the update runs on
-// `w = p - 1` (exact for the stored range) and stores `1 + w`, so weight
-// decay pulls `w`, not `1 + w`, toward zero.
+// Every parameter is stored as transformers holds it (the zero-centred norms
+// as `w`, their kernels adding the 1), so the update runs on the stored value
+// and weight decay pulls `w` toward zero.
 #include <metal_stdlib>
 using namespace metal;
 
@@ -31,8 +31,6 @@ struct Qwen35AdamW {
     /// `sqrt(1 - beta2^step)`.
     float bc2_sqrt;
     float eps;
-    /// 1 for a parameter stored as `1 + w`, else 0.
-    float shift;
 };
 
 /// Grid: x = column in [0, width), y = row.
@@ -53,8 +51,7 @@ kernel void qwen35_adamw_f32(
     if (c >= width || r >= rows) return;
     const ulong i = (ulong)r * ld + off + c;
 
-    float w = p[i] - a.shift;
-    w = w * a.decay_mul;
+    float w = p[i] * a.decay_mul;
 
     const float gi = g[i];
     float mi = m[i];
@@ -65,7 +62,7 @@ kernel void qwen35_adamw_f32(
     const float denom = precise::divide(precise::sqrt(vi), a.bc2_sqrt) + a.eps;
     w = w + (-a.step_size) * precise::divide(mi, denom);
 
-    p[i] = a.shift + w;
+    p[i] = w;
     m[i] = mi;
     v[i] = vi;
 }

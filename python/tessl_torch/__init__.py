@@ -629,8 +629,8 @@ class Qwen35:
 
     Parameters and gradients are keyed by transformers' names below the text
     tower (``layers.3.mlp.gate_proj.weight``) and have transformers' shapes
-    and values (the zero-centred norms as ``w``, not tessl's stored
-    ``1 + w``). Linear weights come back as transposed views of ``[in, out]``
+    and values (the zero-centred norms as ``w``, as tessl stores them).
+    Linear weights come back as transposed views of ``[in, out]``
     tensors, which is how tessl lays them out; ``load_parameters`` accepts
     any layout. The model runs entirely in f32, the tied embedding included,
     so ``load_parameters`` is exact. ``operands="bf16"`` rounds only the

@@ -501,7 +501,7 @@ cargo test --release --test shader_index_arithmetic   # includes the qwen35 sour
 `tessl::qwen35_model` composes the kernels into the text model's prefill
 forward, loaded straight from the Hugging Face `.safetensors` checkpoint
 (`tessl::safetensors`, a strict reader; no conversion step). It is the one
-place the layer order, the `1 + w` norm offsets, the weight layouts and the
+place the layer order, the norms' `1 + w` (formed in their kernels), the weight layouts and the
 tied LM head are written down. `Precision::Bf16` is the production numerics
 (bf16 GEMM inputs, f32 everywhere else); `Precision::F32` keeps every
 activation f32 with exact-f32 GEMMs, which makes it the same computation as
@@ -740,7 +740,7 @@ lower; that is arithmetic, not a re-measurement.
 ### From torch: `tessl_torch.Qwen35`
 
 `src/qwen35_params.rs` exposes the model's parameters and gradients under
-transformers' names and values (norms as `w`, not the stored `1 + w`; each
+transformers' names and values (norms as `w`, which is also what is stored; each
 linear weight as its `[in, out]` window of the packed projection) and copies
 them between the model and caller tensors on the GPU. The C ABI (version 7)
 adds a model handle (`tessl_qwen35_load`, `_train_step`, `_param_count`,
@@ -753,7 +753,7 @@ training loop needs no torch copy of the parameters or gradients: on the 2B
 that is params 8 + gradients 8 + moments 16 GB plus the step's scratch,
 against about 55 GB with torch's optimizer (estimated, not measured). The
 update is `torch.optim.AdamW`'s single-tensor path in its order, per
-parameter-table entry, with the norms stored as `1 + w` updated as `w`;
+parameter-table entry, every parameter (the norms' `w` included) as stored;
 weight decay is per entry, and the default excludes what transformers'
 Trainer excludes (every norm and `linear_attn.dt_bias`). Against an f64
 reference of torch's formula over five steps on the tiny model the worst

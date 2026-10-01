@@ -82,11 +82,15 @@ fn fd_check(name: &str, x: &[f64], grad: &[f64], f: &dyn Fn(&[f64]) -> f64) {
 
 // ------------------------------------------------------------- RMSNorm ---
 
+/// `Qwen3_5RMSNorm`: `x * rstd * (1 + w)`, the zero-centred `w` as stored.
 fn rms_fwd(x: &[f64], w: &[f64], d: usize, eps: f64) -> Vec<f64> {
     x.chunks(d)
         .flat_map(|r| {
             let rstd = 1.0 / (r.iter().map(|v| v * v).sum::<f64>() / d as f64 + eps).sqrt();
-            r.iter().zip(w).map(move |(v, wv)| v * rstd * wv).collect::<Vec<_>>()
+            r.iter()
+                .zip(w)
+                .map(move |(v, wv)| v * rstd * (1.0 + wv))
+                .collect::<Vec<_>>()
         })
         .collect()
 }
@@ -96,9 +100,9 @@ fn rms_bwd(x: &[f64], w: &[f64], dy: &[f64], d: usize, eps: f64) -> (Vec<f64>, V
     let mut dw = vec![0.0; d];
     for (r, (xr, gr)) in x.chunks(d).zip(dy.chunks(d)).enumerate() {
         let rstd = 1.0 / (xr.iter().map(|v| v * v).sum::<f64>() / d as f64 + eps).sqrt();
-        let dot: f64 = (0..d).map(|j| gr[j] * w[j] * xr[j]).sum();
+        let dot: f64 = (0..d).map(|j| gr[j] * (1.0 + w[j]) * xr[j]).sum();
         for j in 0..d {
-            dx[r * d + j] = rstd * gr[j] * w[j] - xr[j] * rstd.powi(3) * dot / d as f64;
+            dx[r * d + j] = rstd * gr[j] * (1.0 + w[j]) - xr[j] * rstd.powi(3) * dot / d as f64;
             dw[j] += gr[j] * xr[j] * rstd;
         }
     }
@@ -120,7 +124,7 @@ fn rms_norm_reference_backward_is_the_derivative() {
 fn run_rms(rt: &Arc<GpuRuntime>, rows: usize, d: usize, accumulate: bool, seed: u64) {
     let eps = 1e-6f32;
     let x = random_f32(rows * d, seed);
-    let w: Vec<f32> = random_f32(d, seed + 1).iter().map(|v| 1.0 + 0.5 * v).collect();
+    let w: Vec<f32> = random_f32(d, seed + 1).iter().map(|v| 0.5 * v).collect();
     let dy = random_f32(rows * d, seed + 2);
     let prior = random_f32(rows * d, seed + 3);
     let (xb, wb, dyb) = (buf(rt, &x), buf(rt, &w), buf(rt, &dy));

@@ -16,8 +16,8 @@
 //! Every gradient is in the layout of the weight it belongs to: the fused
 //! projections' packed `[in, out]` right operands, the conv weight
 //! `[channels, kernel_width]`, and `[vocab, hidden]` for the tied embedding /
-//! LM head (both uses summed). The zero-centred norms are stored as `1 + w`,
-//! whose gradient is the gradient of `w`. Every reduction runs in a fixed
+//! LM head (both uses summed). The zero-centred norms are stored as `w`, and
+//! their gradient is that of `w` (the same as `1 + w`'s). Every reduction runs in a fixed
 //! order, so a step's gradients are the same bits on every run.
 //!
 //! Scope: one sequence, positions from 0, value heads equal to key heads in
@@ -38,7 +38,6 @@ use crate::gdn_train::{
     gdn_train_backward, gdn_train_forward, GdnTrainDims, GdnTrainGrads, GdnTrainInputs, GdnTrainWorkspace, GDN_TRAIN_DK,
 };
 use crate::gemm::GemmOperands;
-use crate::nn;
 use crate::qwen35::{self, AttnShape, AttnTargets, Cols, GdnParams, OutCols, StateIn};
 use crate::qwen35_bwd::{
     attn_gate_bwd, attn_qk_norm_rope_bwd, attn_qk_norm_rope_bwd_part_len, conv1d_silu_bwd, conv1d_silu_bwd_part_len,
@@ -261,15 +260,7 @@ impl Qwen35Model {
             resid = out;
         }
         let xf = tensor(rt, &[tu, h])?;
-        nn::rms_norm_f32(
-            rt,
-            &resid.buffer,
-            &self.final_norm,
-            &xf.buffer,
-            t,
-            cfg.hidden,
-            cfg.rms_norm_eps,
-        )?;
+        self.norm_f32(&resid, &self.final_norm, &xf, t)?;
 
         // ---- loss and the LM head ------------------------------------------
         let n = tu - 1;
@@ -429,13 +420,14 @@ impl Qwen35Model {
         }
     }
 
-    /// `out = rms_norm(x) * w`, f32.
+    /// `out = rms_norm(x) * (1 + w)`, f32.
     fn norm_f32(&self, x: &Tensor, w: &GpuBuffer, out: &Tensor, t: u32) -> Result<(), String> {
-        nn::rms_norm_f32(
+        qwen35::rms_norm(
             &self.rt,
             &x.buffer,
             w,
             &out.buffer,
+            DType::F32,
             t,
             self.cfg.hidden,
             self.cfg.rms_norm_eps,

@@ -896,7 +896,7 @@ def _host_binds():
         pipe_defs.append((m.start(), var, kernels))
     binds = {}
     # Calls only: the helper's own `fn dispatch_groups(` definition is not one.
-    for m in re.finditer(r"(?<!fn )\b(dispatch_groups|dispatch_2d_tg|dispatch_2d)\(", rs):
+    for m in re.finditer(r"(?<!fn )\b(dispatch_groups|dispatch_2d_tg|dispatch_tg_1d|dispatch_2d)\(", rs):
         depth, i = 0, m.end() - 1
         while True:
             depth += {"(": 1, ")": -1}.get(rs[i], 0)

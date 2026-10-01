@@ -3,12 +3,11 @@
 //! The reference is the single-tensor path of `torch.optim.AdamW` (amsgrad
 //! and maximize off) evaluated on the host in f64, fed each step with the
 //! parameters and gradients tessl itself holds (read through the parameter
-//! table, so the norms stored as `1 + w` are compared as `w`). Its moments
-//! are its own, carried in f64 across steps.
+//! table, the zero-centred norms as their stored `w`). Its moments are its
+//! own, carried in f64 across steps.
 //!
-//! Bound, set before the first run: `2e-6` absolute per element, `2^-22` more
-//! for the `1 + w` norms (storing `1 + w` rounds `w` at ulp(1) = 2^-23 per
-//! write). At lr = 1e-2 an f32 update is good to ~1e-9, the parameter's own
+//! Bound, set before the first run: `2e-6` absolute per element, every entry
+//! alike. At lr = 1e-2 an f32 update is good to ~1e-9, the parameter's own
 //! rounding to ~6e-8 near 1, while a semantic error is 1e-5 or more (decay
 //! after the moments: lr^2 * wd; a missing bias correction at step 1: 0.1 * lr;
 //! eps outside the division by sqrt(bc2) at eps = 1e-2: ~0.3 * lr).
@@ -67,10 +66,6 @@ fn host(
         .collect()
 }
 
-fn is_one_plus(name: &str) -> bool {
-    name.ends_with("layernorm.weight") || name == "norm.weight"
-}
-
 /// `steps` steps of train_step + adamw_step from a fresh state, each checked
 /// against the f64 reference; returns the worst error seen.
 fn run(hyper: AdamWHyper, wd_all: f32, steps: usize) -> f64 {
@@ -101,7 +96,7 @@ fn run(hyper: AdamWHyper, wd_all: f32, steps: usize) -> f64 {
                 let denom = v[i][k].sqrt() / bc2.sqrt() + hyper.eps;
                 w -= hyper.lr / bc1 * m[i][k] / denom;
                 let err = (p1[i][k] - w).abs();
-                let bound = 2e-6 + if is_one_plus(&info.name) { 2f64.powi(-22) } else { 0.0 };
+                let bound = 2e-6;
                 assert!(
                     err <= bound,
                     "step {step} {}[{k}]: {} vs reference {w} (err {err:.3e})",

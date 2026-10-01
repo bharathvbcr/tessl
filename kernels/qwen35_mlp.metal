@@ -13,6 +13,7 @@
 // side can feed this in place.
 #include <metal_stdlib>
 #include "qwen35_act.h"
+#include "reduce_tree.h"
 using namespace metal;
 
 /// `out[r, out_off + c] = silu(gate[r, gate_off + c]) * up[r, up_off + c]`
@@ -68,3 +69,48 @@ kernel void qwen35_residual_add_f32(
     if (col >= width || r >= rows) return;
     resid[(ulong)r * ld_resid + resid_off + col] += y[(ulong)r * ld_y + y_off + col];
 }
+
+/// Qwen3.5's zero-centred residual RMSNorm (`Qwen3_5RMSNorm`):
+/// `out[r, :] = x[r, :] * rsqrt(mean(x[r, :]^2) + eps) * (1 + w[:])`, with
+/// `w` stored as the checkpoint holds it and `1 + w` formed here in f32, as
+/// transformers forms `1.0 + self.weight.float()`. Storing `w` (not `1 + w`)
+/// keeps every write of it exact; `1 + w` rounds `w` to ulp(1 + w).
+///
+/// The sum of squares is `rms_norm.metal`'s, lane for lane: lane `lid` walks
+/// `dim[lid], dim[lid + tptg], ...` and `reduce_row_add` folds the lanes, so
+/// with the host's `reduce_tptg` the rows' scale is the one tessl's generic
+/// RMSNorm computes.
+///
+/// Grid: one threadgroup per row.
+#define QWEN35_RMS_NORM_KERNEL(NAME, OUT_T)                                       \
+kernel void NAME(                                                                 \
+    device const float *x [[buffer(0)]],                                          \
+    device const float *weight [[buffer(1)]],                                     \
+    device OUT_T *out [[buffer(2)]],                                              \
+    constant uint &rows [[buffer(3)]],                                            \
+    constant uint &dim [[buffer(4)]],                                             \
+    constant float &eps [[buffer(5)]],                                            \
+    uint row [[threadgroup_position_in_grid]],                                    \
+    uint lid [[thread_position_in_threadgroup]],                                  \
+    uint sgid [[simdgroup_index_in_threadgroup]],                                 \
+    uint lane [[thread_index_in_simdgroup]],                                      \
+    uint tptg [[threads_per_threadgroup]])                                        \
+{                                                                                 \
+    if (row >= rows) return;                                                      \
+    threadgroup float scratch[REDUCE_MAX_SIMDGROUPS];                             \
+    device const float *xin = x + (ulong)row * dim;                               \
+    device OUT_T *xout = out + (ulong)row * dim;                                  \
+    float ss = 0.0f;                                                              \
+    for (ulong d = lid; d < (ulong)dim; d += tptg) {                              \
+        const float v = xin[d];                                                   \
+        ss += v * v;                                                              \
+    }                                                                             \
+    const float inv = rsqrt(reduce_row_add(ss, scratch, sgid, lane, tptg) / (float)dim + eps); \
+    for (ulong d = lid; d < (ulong)dim; d += tptg) {                              \
+        const float wp = 1.0f + weight[d];                                        \
+        xout[d] = (OUT_T)(xin[d] * inv * wp);                                     \
+    }                                                                             \
+}
+
+QWEN35_RMS_NORM_KERNEL(qwen35_rms_norm_f32, float)
+QWEN35_RMS_NORM_KERNEL(qwen35_rms_norm_bf16, bfloat)

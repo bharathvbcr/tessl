@@ -297,6 +297,10 @@ All notable changes to `tessl` are recorded here. The format follows
 
 ### Fixed
 
+- `Qwen35Model::adamw_step` at a step count of `u64::MAX` returns an error
+  and leaves the count there. Without overflow checks (release builds)
+  `step + 1` wrapped to 0, which zeroes the bias correction and sends the
+  update to infinity.
 - Binder-nop replay suppression belongs to the thread that armed it. The
   flag was process-global, so one model's decode-ICB replay made an
   unrelated model on another thread skip every `with_binder` encode and

@@ -253,7 +253,14 @@ impl Qwen35Model {
         }
 
         // torch: the step count increments, then the scalars are formed in f64.
-        let t = (state.step + 1) as f64;
+        // `u64` wraps only at `u64::MAX`. A release build without overflow
+        // checks used to turn that into t = 0, which zeroes the bias correction
+        // and sends the parameter update to infinity.
+        let next = state
+            .step
+            .checked_add(1)
+            .ok_or_else(|| format!("{WHAT}: step count {} + 1 does not fit in u64", state.step))?;
+        let t = next as f64;
         let bc1 = 1.0 - beta1.powf(t);
         let bc2 = 1.0 - beta2.powf(t);
         let step_size = lr / bc1;
@@ -285,7 +292,7 @@ impl Qwen35Model {
             })?;
         }
         self.rt.synchronize()?;
-        state.step += 1;
+        state.step = next;
         Ok(())
     }
 

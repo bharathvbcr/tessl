@@ -349,3 +349,24 @@ fn a_checkpointed_run_resumes_bit_for_bit() {
     let e = a.write_adamw_moment(&mut sc, Moment::First, &m2[1..]).unwrap_err();
     assert!(e.contains("tensors for"), "{e}");
 }
+
+/// The step counter is a `u64`. One past `u64::MAX` must be an error, and the
+/// counter must stay at `u64::MAX`. In a release build without overflow checks
+/// the pre-fix `step + 1` wraps to 0, the bias correction becomes `1 - beta^0
+/// = 0`, and the parameter update divides by that.
+#[test]
+fn adamw_step_at_u64_max_does_not_wrap_to_zero() {
+    let (_rt, model) = load();
+    let mut state = AdamW::new(&model).unwrap();
+    state.set_step_count(u64::MAX);
+    let grads = tessl::qwen35_train::Qwen35Grads::zeros_like(&model).unwrap();
+    let wd = model.default_weight_decay(0.0).unwrap();
+    let err = model
+        .adamw_step(&grads, &mut state, &AdamWHyper::default(), &wd)
+        .expect_err("u64::MAX + 1 must not become step 0");
+    assert!(
+        err.contains("u64") || err.contains("overflow"),
+        "unexpected refusal: {err}"
+    );
+    assert_eq!(state.step_count(), u64::MAX);
+}

@@ -137,7 +137,7 @@ All notable changes to `tessl` are recorded here. The format follows
 
 ### Changed (breaking)
 
-- **C ABI 8** (was 3; the binding and library refuse each other across
+- **C ABI 9** (was 3; the binding and library refuse each other across
   versions, so rebuild `libtessl.dylib` with the binding). It adds a
   Qwen3.5 model handle: `tessl_qwen35_load`, `_train_step`,
   `_param_count`, `_param_info` (`TesslParamInfo`), `_copy` (read
@@ -146,7 +146,7 @@ All notable changes to `tessl` are recorded here. The format follows
   `parameters()`, `train_step(ids)`, `grads()`, `load_parameters()`, under
   transformers' names and values, for a torch optimizer. Checked against
   transformers' own autograd before and after an AdamW step written back
-  (`python/tests/test_qwen35.py`). ABI 8 also runs AdamW inside tessl
+  (`python/tests/test_qwen35.py`). ABI 9 also runs AdamW inside tessl
   (`tessl_qwen35_adamw_init`, `_step`, `_step_count`, `_set_step_count`,
   `_free`, and `_copy` directions 3-6 reading and writing both moments, over
   `qwen35_adamw`), and `TesslParamInfo` gains `decay_excluded`, Trainer's
@@ -167,7 +167,24 @@ All notable changes to `tessl` are recorded here. The format follows
   as they are; `tessl_torch.clip_coef(norm, max_norm)` is
   `clip_grad_norm_`'s coefficient. The caller forms it, so gradients
   outside tessl (a head of its own) join the norm. Checked against
-  `clip_grad_norm_` then `torch.optim.AdamW` within 1e-6.
+  `clip_grad_norm_` then `torch.optim.AdamW` within 1e-6. The handle's
+  gradients are a bank, allocated by the first step and reused, and a step
+  splits in two: `tessl_qwen35_train_forward` (`TESSL_SUPERVISE_CAUSAL`, or
+  `TESSL_SUPERVISE_ROWS` with positions, targets and a scale),
+  `tessl_qwen35_hidden` (final-norm rows for a loss outside tessl),
+  `tessl_qwen35_train_backward` (that loss's gradient at those rows, and
+  `accumulate` to add into the bank) and `tessl_qwen35_train_discard`.
+  While a step is pending, another step, the gradients and AdamW are
+  refused; accumulating onto a bank a refused or failed step marked is
+  refused. `tessl_torch.Qwen35` wraps them as `train_forward(ids,
+  positions=, targets=, scale=)`, `hidden(positions)`,
+  `train_backward(dh=, positions=, accumulate=)` (summing the rows of a
+  repeated position) and `train_discard()`. Checked against transformers on
+  a right-padded two-row batch with a letter row through the tied head and
+  a span row through a pointer head in torch: run row by row and
+  accumulated, the same losses, summed gradients and global norm
+  (`python/tests/test_qwen35.py`); the ABI
+  against the Rust calls bit for bit (`tests/capi.rs`).
 - **`Qwen35Model::train_step_into(ids, operands, sup, bank, accumulate)`**
   writes a step's gradients into a bank from `Qwen35Grads::zeros_like`
   (over it, or added to it), so several sequences' gradients sum in place.

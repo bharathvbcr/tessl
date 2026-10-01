@@ -134,6 +134,133 @@ class Qwen35Training(unittest.TestCase):
         # Training on one sequence lowers its loss.
         self.assertLess(m.train_step(self.ids), losses[0])
 
+    def test_a_padded_batch_with_an_outside_head_is_row_by_row_steps(self):
+        # The reference: transformers on a right-padded batch of two rows
+        # (attention mask from the lengths), one loss over both. A letter row
+        # supervises one position through the tied head (mean over the
+        # batch's letter rows); a span row feeds a pointer head in torch
+        # (bias-free projection of the query row against candidate rows plus
+        # a learned abstain vector, start and end, mean over the batch's
+        # pointer decisions). tessl: each row trimmed to its length, one
+        # forward/backward per row accumulated in the bank, the span row's
+        # gradient coming back from torch through hidden()/train_backward().
+        # Bounds as test_step_matches_transformers_autograd, set before the
+        # first run; the global norm (tessl's plus the head's) to 1e-5.
+        torch.manual_seed(0)
+        x = self.ids
+        a, b = x[:13], x[4:15]
+        pad = 0
+        width = max(a.numel(), b.numel())
+        batch = torch.full((2, width), pad, dtype=x.dtype)
+        batch[0, : a.numel()], batch[1, : b.numel()] = a, b
+        lengths = torch.tensor([a.numel(), b.numel()])
+        mask = (torch.arange(width)[None] < lengths[:, None]).long()
+        letter_pos = a.numel() - 2  # predicts the last real token
+        query, cands = b.numel() - 2, [0, 3, 6]  # the query repeats as no candidate
+        start_t, end_t = 1, len(cands)  # a candidate, and abstain
+        H = self.model()._hidden
+        proj = torch.nn.Linear(H, H, bias=False)
+        abstain = torch.nn.Parameter(torch.randn(H) * 0.1)
+
+        def span_loss(h_query, h_cands):
+            q = proj(h_query)
+            scores = torch.cat([h_cands @ q, (abstain @ q)[None]])
+            ce = torch.nn.functional.cross_entropy
+            return (ce(scores[None], torch.tensor([start_t])) + ce(scores[None], torch.tensor([end_t]))) / 2
+
+        ref = reference()
+        ref.zero_grad(set_to_none=True)
+        hs = ref.model(input_ids=batch, attention_mask=mask).last_hidden_state
+        letter = torch.nn.functional.cross_entropy(ref.lm_head(hs[0, letter_pos])[None], a[letter_pos + 1][None])
+        span = span_loss(hs[1, query], hs[1, cands])
+        (letter + span).backward()
+        want = {n[len("model."):]: p.grad.detach().clone() for n, p in ref.named_parameters()}
+        head_want = [proj.weight.grad.clone(), abstain.grad.clone()]
+        proj.zero_grad(set_to_none=True)
+        abstain.grad = None
+
+        m = self.model()
+        got_letter = m.train_forward(a, positions=[letter_pos], targets=[int(a[letter_pos + 1])], scale=1.0)
+        m.train_backward()
+        m.train_forward(b, positions=[], targets=[])
+        rows = [query] + cands
+        h = m.hidden(rows).cpu().requires_grad_(True)
+        got_span = span_loss(h[0], h[1:])
+        got_span.backward()
+        m.train_backward(dh=h.grad, positions=rows, accumulate=True)
+
+        self.assertLessEqual(abs(got_letter - letter.item()) / abs(letter.item()), 1e-5)
+        self.assertLessEqual(abs(got_span.item() - span.item()) / abs(span.item()), 1e-5)
+        grads = m.grads()
+        worst = max((rel_err(grads[n], want[n]), n) for n in want)
+        self.assertLessEqual(worst[0], 1e-4, worst)
+        for got, w in zip([proj.weight.grad, abstain.grad], head_want):
+            self.assertLessEqual(rel_err(got, w), 1e-4)
+        # The global norm clip_grad_norm_ takes over the model and the head:
+        # tessl's grad_sq_norm plus the head's squares, against the norm of
+        # the reference's own per-tensor norms (its gradients, both parts).
+        total = (m.grad_sq_norm() + sum(float((g.double() ** 2).sum()) for g in (proj.weight.grad, abstain.grad))) ** 0.5
+        ref_norms = [g.norm() for g in want.values()] + [g.norm() for g in head_want]
+        want_total = torch.linalg.vector_norm(torch.stack(ref_norms)).item()
+        self.assertLessEqual(abs(total - want_total), 1e-5 * want_total)
+
+    def test_two_phase_refusals(self):
+        m = self.model()
+        with self.assertRaisesRegex(TesslError, "no step is pending"):
+            m.hidden([0])
+        with self.assertRaisesRegex(TesslError, "no step is pending"):
+            m.train_backward()
+        m.train_forward(self.ids, positions=[1], targets=[2])
+        with self.assertRaisesRegex(TesslError, "a step is pending"):
+            m.train_step(self.ids)
+        with self.assertRaisesRegex(TesslError, "a step is pending"):
+            m.load_parameters(m.parameters())
+        with self.assertRaisesRegex(TesslError, "dh must be \\[2, "):
+            m.train_backward(dh=torch.zeros(1, m._hidden), positions=[0, 1])
+        with self.assertRaisesRegex(TesslError, "position 70 >= 70"):
+            m.train_backward(dh=torch.zeros(1, m._hidden), positions=[70])
+        # Still pending after the refusals; a discard drops it.
+        m.hidden([0, 0])
+        m.train_discard()
+        with self.assertRaisesRegex(TesslError, "no step is pending"):
+            m.hidden([0])
+        with self.assertRaisesRegex(TesslError, "position 3 is supervised twice"):
+            m.train_forward(self.ids, positions=[3, 3], targets=[1, 2])
+        with self.assertRaisesRegex(TesslError, "give positions and targets together"):
+            m.train_forward(self.ids, positions=[3])
+        with self.assertRaisesRegex(TesslError, "no step is pending"):
+            m.hidden([])
+
+    def test_a_refused_or_discarded_step_keeps_the_gradients(self):
+        # The library's bank decides: a refused forward and a discarded one
+        # leave the last finished step's gradients readable.
+        m = self.model()
+        m.train_step(self.ids)
+        want = m.grads()
+        with self.assertRaisesRegex(TesslError, "position 3 is supervised twice"):
+            m.train_forward(self.ids, positions=[3, 3], targets=[1, 2])
+        got = m.grads()
+        self.assertTrue(all(torch.equal(got[n], want[n]) for n in want))
+        m.train_forward(self.ids, positions=[3], targets=[1])
+        m.train_discard()
+        got = m.grads()
+        self.assertTrue(all(torch.equal(got[n], want[n]) for n in want))
+
+    def test_repeated_positions_in_dh_are_summed(self):
+        # train_backward merges the rows of a repeated position: the same
+        # gradients as one row holding their sum.
+        m = self.model()
+        rows = [5, 9, 5]
+        dh = torch.randn(len(rows), m._hidden) * 1e-2
+        m.train_forward(self.ids, positions=[], targets=[])
+        m.train_backward(dh=dh, positions=rows)
+        got = m.grads()
+        m.train_forward(self.ids, positions=[], targets=[])
+        m.train_backward(dh=torch.stack([dh[0] + dh[2], dh[1]]), positions=[5, 9])
+        want = m.grads()
+        worst = max(rel_err(got[n], want[n]) for n in want)
+        self.assertLessEqual(worst, 1e-6)
+
     def test_clipping_is_clip_grad_norm_then_adamw(self):
         # torch: clip_grad_norm_(max_norm) over every parameter, then AdamW.
         # tessl: grad_sq_norm() -> clip_coef -> adamw_step(grad_scale=...).

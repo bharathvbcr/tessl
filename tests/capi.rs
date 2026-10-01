@@ -9,6 +9,7 @@ mod common;
 
 use std::ffi::{c_char, c_void, CStr};
 use std::ptr;
+use std::sync::Arc;
 
 use common::{random_f32, with_gpu};
 use objc2::rc::Retained;
@@ -17,15 +18,18 @@ use objc2_metal::{MTLBuffer, MTLDevice, MTLResourceOptions};
 use tessl::capi::{
     tessl_abi_version, tessl_cross_entropy_rows, tessl_mtl_buffer_length, tessl_qwen35_adamw_free,
     tessl_qwen35_adamw_init, tessl_qwen35_adamw_set_step_count, tessl_qwen35_adamw_step, tessl_qwen35_adamw_step_count,
-    tessl_qwen35_copy, tessl_qwen35_free, tessl_qwen35_grad_sq_norm, tessl_qwen35_load, tessl_qwen35_param_count,
-    tessl_qwen35_param_info, tessl_qwen35_train_step, tessl_runtime_free, tessl_runtime_new, tessl_synchronize,
+    tessl_qwen35_copy, tessl_qwen35_free, tessl_qwen35_grad_sq_norm, tessl_qwen35_hidden, tessl_qwen35_load,
+    tessl_qwen35_param_count, tessl_qwen35_param_info, tessl_qwen35_train_backward, tessl_qwen35_train_discard,
+    tessl_qwen35_train_forward, tessl_qwen35_train_step, tessl_runtime_free, tessl_runtime_new, tessl_synchronize,
     TesslCeArgs, TesslParamInfo, TesslQwen35, TesslRuntime, TesslTensorRef, TESSL_ABI_VERSION, TESSL_ERR, TESSL_F32,
     TESSL_MAX_DIMS, TESSL_OK, TESSL_OPERANDS_BF16, TESSL_OPERANDS_EXACT_F32, TESSL_READ_ADAMW_M, TESSL_READ_ADAMW_V,
-    TESSL_READ_GRADS, TESSL_READ_PARAMS, TESSL_WRITE_ADAMW_M, TESSL_WRITE_ADAMW_V, TESSL_WRITE_PARAMS,
+    TESSL_READ_GRADS, TESSL_READ_PARAMS, TESSL_SUPERVISE_CAUSAL, TESSL_SUPERVISE_ROWS, TESSL_WRITE_ADAMW_M,
+    TESSL_WRITE_ADAMW_V, TESSL_WRITE_PARAMS,
 };
 use tessl::cross_entropy::{cross_entropy_rows, CeGrads, CeHidden, CeWorkspace, Reduction};
 use tessl::gemm::GemmOperands;
 use tessl::qwen35_adamw::{excluded_from_weight_decay, AdamW, AdamWHyper, Moment};
+use tessl::qwen35_train::{Qwen35Grads, Supervise};
 use tessl::{DType, GpuRuntime};
 
 const ERR_LEN: usize = 512;
@@ -1038,6 +1042,284 @@ fn adamw_through_the_abi_is_the_rust_adamw() {
             TESSL_ERR
         );
         assert!(msg(&err).contains("no AdamW state"), "{}", msg(&err));
+    });
+    assert_eq!(unsafe { tessl_qwen35_free(model) }, TESSL_OK);
+}
+
+/// Every gradient read through the ABI, as bits, one Vec per table entry.
+fn abi_grads(model: *mut TesslQwen35, rt: &GpuRuntime, table: &[tessl::qwen35_params::ParamInfo]) -> Vec<Vec<u32>> {
+    let bufs: Vec<_> = table
+        .iter()
+        .map(|p| shared(rt, &vec![0.0; p.shape.iter().product()]))
+        .collect();
+    let refs: Vec<TesslTensorRef> = table
+        .iter()
+        .zip(&bufs)
+        .map(|(p, b)| tref(b, &p.storage_shape().iter().map(|&d| d as u64).collect::<Vec<_>>()))
+        .collect();
+    let mut err = [0 as c_char; ERR_LEN];
+    let s = unsafe {
+        tessl_qwen35_copy(
+            model,
+            TESSL_READ_GRADS,
+            refs.as_ptr(),
+            refs.len() as u64,
+            err.as_mut_ptr(),
+            ERR_LEN,
+        )
+    };
+    assert_eq!(s, TESSL_OK, "{}", msg(&err));
+    table
+        .iter()
+        .zip(&bufs)
+        .map(|(p, b)| read(b, p.shape.iter().product()).iter().map(|x| x.to_bits()).collect())
+        .collect()
+}
+
+/// A bank's gradients through the Rust API, as bits, laid out as `abi_grads`.
+fn rust_grads(
+    rust: &tessl::qwen35_model::Qwen35Model,
+    bank: &Qwen35Grads,
+    rt: &Arc<GpuRuntime>,
+    table: &[tessl::qwen35_params::ParamInfo],
+) -> Vec<Vec<u32>> {
+    let local: Vec<tessl::Tensor> = table
+        .iter()
+        .map(|p| rt.alloc_tensor_f32(&p.storage_shape()).unwrap())
+        .collect();
+    rust.read_gradients(bank, &local).unwrap();
+    local
+        .iter()
+        .map(|t| t.read_f32().unwrap().iter().map(|x| x.to_bits()).collect())
+        .collect()
+}
+
+/// The two-phase step through the ABI is the Rust one: a rows forward's
+/// loss, the hidden rows, and a backward with an outside gradient, then a
+/// causal step accumulated onto it, each bit for bit. While a step is
+/// pending, another step, the gradients and AdamW are refused; a refused
+/// backward keeps the step pending; a discard drops it; accumulating onto a
+/// bank a refused step marked is refused.
+#[test]
+fn a_two_phase_step_through_the_abi_is_the_rust_one() {
+    let handle = Handle::new();
+    let model = load_model(handle.0);
+    let ids = fixture_ids();
+    let mut err = [0 as c_char; ERR_LEN];
+    with_gpu(|rt| {
+        let st =
+            tessl::safetensors::SafeTensors::open(std::path::Path::new(fixture("model.safetensors").to_str().unwrap()))
+                .unwrap();
+        let cfg = tessl::qwen35_model::Qwen35Config::from_config_file(std::path::Path::new(
+            fixture("config.json").to_str().unwrap(),
+        ))
+        .unwrap();
+        let (h, vocab) = (cfg.hidden as usize, cfg.vocab);
+        let rust = tessl::qwen35_model::Qwen35Model::load(rt, &st, "model.", cfg, tessl::qwen35_model::Precision::F32)
+            .unwrap();
+        let table = rust.parameter_table().unwrap();
+        let mm = GemmOperands::ExactF32;
+        let (positions, targets) = ([1u32, 4], [ids[2], ids[5]]);
+        let forward = |sup: u32, pos: &[u32], tg: &[u32], loss: &mut f64, err: &mut [c_char; ERR_LEN]| unsafe {
+            let (pp, tp) = if pos.is_empty() {
+                (ptr::null(), ptr::null())
+            } else {
+                (pos.as_ptr(), tg.as_ptr())
+            };
+            tessl_qwen35_train_forward(
+                model,
+                ids.as_ptr(),
+                ids.len() as u64,
+                TESSL_OPERANDS_EXACT_F32,
+                sup,
+                pp,
+                tp,
+                pos.len() as u64,
+                0.5,
+                loss,
+                err.as_mut_ptr(),
+                ERR_LEN,
+            )
+        };
+
+        // Nothing pending yet.
+        let out_buf = shared(rt, &vec![0.0; 2 * h]);
+        let out_ref = tref(&out_buf, &[2, h as u64]);
+        let hidden = |pos: &[u32], r: &TesslTensorRef, err: &mut [c_char; ERR_LEN]| unsafe {
+            tessl_qwen35_hidden(model, pos.as_ptr(), pos.len() as u64, r, err.as_mut_ptr(), ERR_LEN)
+        };
+        assert_eq!(hidden(&[2, 0], &out_ref, &mut err), TESSL_ERR);
+        assert!(msg(&err).contains("no step is pending"), "{}", msg(&err));
+
+        let mut loss = 0.0f64;
+        assert_eq!(
+            forward(TESSL_SUPERVISE_ROWS, &positions, &targets, &mut loss, &mut err),
+            TESSL_OK,
+            "{}",
+            msg(&err)
+        );
+        let sup = Supervise::Rows {
+            positions: &positions,
+            targets: &targets,
+            scale: 0.5,
+        };
+        let p = rust.train_forward(&ids, mm, sup).unwrap();
+        assert_eq!(loss.to_bits(), p.loss().to_bits());
+
+        // The hidden rows are the Rust step's.
+        assert_eq!(hidden(&[2, 0], &out_ref, &mut err), TESSL_OK, "{}", msg(&err));
+        let want = rt.alloc_tensor_f32(&[2, h]).unwrap();
+        p.hidden(&[2, 0], &want).unwrap();
+        let bits = |v: Vec<f32>| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+        assert_eq!(bits(read(&out_buf, 2 * h)), bits(want.read_f32().unwrap()));
+
+        // While pending: no second step, no gradients, no AdamW.
+        let mut other = 0.0f64;
+        assert_eq!(
+            forward(TESSL_SUPERVISE_CAUSAL, &[], &[], &mut other, &mut err),
+            TESSL_ERR
+        );
+        assert!(msg(&err).contains("a step is pending"), "{}", msg(&err));
+        let train = |loss: &mut f64, ids: &[u32], err: &mut [c_char; ERR_LEN]| unsafe {
+            tessl_qwen35_train_step(
+                model,
+                ids.as_ptr(),
+                ids.len() as u64,
+                TESSL_OPERANDS_EXACT_F32,
+                loss,
+                err.as_mut_ptr(),
+                ERR_LEN,
+            )
+        };
+        assert_eq!(train(&mut other, &ids, &mut err), TESSL_ERR);
+        assert!(msg(&err).contains("a step is pending"), "{}", msg(&err));
+        let mut sq = 0.0f64;
+        assert_eq!(
+            unsafe { tessl_qwen35_grad_sq_norm(model, &mut sq, err.as_mut_ptr(), ERR_LEN) },
+            TESSL_ERR
+        );
+        assert!(msg(&err).contains("a step is pending"), "{}", msg(&err));
+        // Nor a parameter write: the backward rebuilds each layer with the
+        // weights it finds.
+        let zeros: Vec<_> = table
+            .iter()
+            .map(|p| shared(rt, &vec![0.0; p.shape.iter().product()]))
+            .collect();
+        let zero_refs: Vec<TesslTensorRef> = table
+            .iter()
+            .zip(&zeros)
+            .map(|(p, b)| tref(b, &p.storage_shape().iter().map(|&d| d as u64).collect::<Vec<_>>()))
+            .collect();
+        let s = unsafe {
+            tessl_qwen35_copy(
+                model,
+                TESSL_WRITE_PARAMS,
+                zero_refs.as_ptr(),
+                zero_refs.len() as u64,
+                err.as_mut_ptr(),
+                ERR_LEN,
+            )
+        };
+        assert_eq!(s, TESSL_ERR);
+        assert!(msg(&err).contains("a step is pending"), "{}", msg(&err));
+
+        // An outside gradient at two positions; a refused one keeps the step.
+        let dh_v: Vec<f32> = (0..2 * h).map(|i| ((i % 7) as f32 - 3.0) * 1e-2).collect();
+        let dh_buf = shared(rt, &dh_v);
+        let dh_ref = tref(&dh_buf, &[2, h as u64]);
+        let backward = |pos: &[u32], r: *const TesslTensorRef, acc: u32, err: &mut [c_char; ERR_LEN]| unsafe {
+            let pp = if r.is_null() { ptr::null() } else { pos.as_ptr() };
+            tessl_qwen35_train_backward(model, pp, pos.len() as u64, r, acc, err.as_mut_ptr(), ERR_LEN)
+        };
+        assert_eq!(backward(&[3, 3], &dh_ref, 0, &mut err), TESSL_ERR);
+        assert!(msg(&err).contains("position 3 appears twice"), "{}", msg(&err));
+        assert_eq!(backward(&[3, 0], &dh_ref, 0, &mut err), TESSL_OK, "{}", msg(&err));
+        let dh_t = rt.alloc_tensor_f32(&[2, h]).unwrap();
+        dh_t.buffer.write_f32(&dh_v);
+        let bank = Qwen35Grads::zeros_like(&rust).unwrap();
+        rust.train_backward_into(p, Some((&[3, 0], &dh_t)), &bank, false)
+            .unwrap();
+        assert_eq!(abi_grads(model, rt, &table), rust_grads(&rust, &bank, rt, &table));
+
+        // A causal step accumulated onto it.
+        assert_eq!(
+            forward(TESSL_SUPERVISE_CAUSAL, &[], &[], &mut loss, &mut err),
+            TESSL_OK,
+            "{}",
+            msg(&err)
+        );
+        assert_eq!(backward(&[], ptr::null(), 1, &mut err), TESSL_OK, "{}", msg(&err));
+        let p = rust.train_forward(&ids, mm, Supervise::Causal).unwrap();
+        assert_eq!(loss.to_bits(), p.loss().to_bits());
+        rust.train_backward_into(p, None, &bank, true).unwrap();
+        assert_eq!(abi_grads(model, rt, &table), rust_grads(&rust, &bank, rt, &table));
+
+        // Refusals of the forward's arguments.
+        assert_eq!(forward(7, &[], &[], &mut loss, &mut err), TESSL_ERR);
+        assert!(msg(&err).contains("supervise 7 is not"), "{}", msg(&err));
+        assert_eq!(
+            forward(TESSL_SUPERVISE_CAUSAL, &positions, &targets, &mut loss, &mut err),
+            TESSL_ERR
+        );
+        assert!(msg(&err).contains("takes no positions"), "{}", msg(&err));
+
+        // A discard drops a pending step.
+        assert_eq!(forward(TESSL_SUPERVISE_CAUSAL, &[], &[], &mut loss, &mut err), TESSL_OK);
+        assert_eq!(
+            unsafe { tessl_qwen35_train_discard(model, err.as_mut_ptr(), ERR_LEN) },
+            TESSL_OK
+        );
+        assert_eq!(hidden(&[0], &tref(&out_buf, &[1, h as u64]), &mut err), TESSL_ERR);
+        assert!(msg(&err).contains("no step is pending"), "{}", msg(&err));
+
+        // A refused step marks the bank: no gradients, and no accumulating onto it.
+        assert_eq!(train(&mut loss, &[5, vocab], &mut err), TESSL_ERR);
+        assert_eq!(
+            unsafe { tessl_qwen35_grad_sq_norm(model, &mut sq, err.as_mut_ptr(), ERR_LEN) },
+            TESSL_ERR
+        );
+        assert!(msg(&err).contains("no gradients yet"), "{}", msg(&err));
+        assert_eq!(forward(TESSL_SUPERVISE_CAUSAL, &[], &[], &mut loss, &mut err), TESSL_OK);
+        assert_eq!(backward(&[], ptr::null(), 1, &mut err), TESSL_ERR);
+        assert!(msg(&err).contains("start again with accumulate = 0"), "{}", msg(&err));
+        assert_eq!(backward(&[], ptr::null(), 0, &mut err), TESSL_OK, "{}", msg(&err));
+        assert_eq!(
+            unsafe { tessl_qwen35_grad_sq_norm(model, &mut sq, err.as_mut_ptr(), ERR_LEN) },
+            TESSL_OK
+        );
+
+        // A step refused for its operands code leaves no gradients either.
+        let bad_operands = unsafe {
+            tessl_qwen35_train_step(
+                model,
+                ids.as_ptr(),
+                ids.len() as u64,
+                9,
+                &mut loss,
+                err.as_mut_ptr(),
+                ERR_LEN,
+            )
+        };
+        assert_eq!(bad_operands, TESSL_ERR);
+        assert_eq!(
+            unsafe { tessl_qwen35_grad_sq_norm(model, &mut sq, err.as_mut_ptr(), ERR_LEN) },
+            TESSL_ERR
+        );
+        assert!(msg(&err).contains("no gradients yet"), "{}", msg(&err));
+        // A step refused because one is pending leaves them as they were.
+        assert_eq!(train(&mut loss, &ids, &mut err), TESSL_OK, "{}", msg(&err));
+        assert_eq!(forward(TESSL_SUPERVISE_CAUSAL, &[], &[], &mut loss, &mut err), TESSL_OK);
+        assert_eq!(train(&mut loss, &ids, &mut err), TESSL_ERR);
+        assert_eq!(
+            unsafe { tessl_qwen35_train_discard(model, err.as_mut_ptr(), ERR_LEN) },
+            TESSL_OK
+        );
+        assert_eq!(
+            unsafe { tessl_qwen35_grad_sq_norm(model, &mut sq, err.as_mut_ptr(), ERR_LEN) },
+            TESSL_OK,
+            "{}",
+            msg(&err)
+        );
     });
     assert_eq!(unsafe { tessl_qwen35_free(model) }, TESSL_OK);
 }

@@ -688,6 +688,8 @@ impl Qwen35Model {
     /// tensor, such as torch's for what [`PendingStep::hidden`] gave it. The
     /// step's own loss gradient is already in `p` ([`Supervise::Rows`] with
     /// no positions has none). Everything is checked before anything runs.
+    /// The parameters must be as they were at the forward: each layer is
+    /// rebuilt from its input with the weights it finds.
     pub fn train_backward_into(
         &self,
         p: PendingStep,

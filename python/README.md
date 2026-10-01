@@ -48,6 +48,34 @@ is `clip_grad_norm_` before the step (checked against it); with a head of
 your own, add its gradients' squares to `grad_sq_norm()` and scale them by
 the same coefficient.
 
+A padded batch with a loss on chosen positions, and a head of your own on
+the final hidden states, runs row by row: each row trimmed to its length
+(right padding is never attended, so this is exact), its gradients added
+into tessl's with `accumulate=True`. A batch mean over `N` supervised
+positions is `scale=1/N` on every row:
+
+```python
+n_letter = sum(1 for r in rows if not r.is_span)
+n_span_decisions = 2 * sum(1 for r in rows if r.is_span)  # a start and an end per span row
+for i, r in enumerate(rows):
+    ids = r.tokens[: r.length]
+    if r.is_span:                       # scored by your head, not tessl's
+        model.train_forward(ids, positions=[], targets=[], operands="bf16")
+        at = [r.query] + r.candidates
+        h = model.hidden(at).requires_grad_(True)
+        loss = head_loss(h[0], h[1:]) / n_span_decisions
+        loss.backward()                 # your head's gradients land in torch
+        model.train_backward(dh=h.grad, positions=at, accumulate=i > 0)
+    else:                               # the tied LM head, in tessl
+        model.train_forward(ids, positions=[r.target_index], targets=[r.answer],
+                            scale=1.0 / n_letter, operands="bf16")
+        model.train_backward(accumulate=i > 0)
+```
+
+`train_forward` returns its loss (the sum over its positions, unscaled).
+`train_discard()` drops a step whose backward will not run; while a step is
+pending, another step, the gradients and AdamW are refused.
+
 With torch's own optimizer instead, which holds its own copy of every
 parameter and gradient (about 55 GB on the 2B):
 

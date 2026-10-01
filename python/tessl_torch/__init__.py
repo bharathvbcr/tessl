@@ -44,12 +44,14 @@ __all__ = [
     "library_path",
 ]
 
-_ABI_VERSION = 8
+_ABI_VERSION = 9
 _MAX_DIMS = 6
 _DTYPE_CODE = {torch.float32: 0, torch.bfloat16: 1, torch.float16: 2}
 _ERR_LEN = 1024
 # GEMM operand codes: exact f32, or operands rounded to bf16 with f32 accumulation.
 _OPERANDS_CODE = {"f32": 0, "bf16": 1}
+# What Qwen35.train_forward scores: the causal-LM loss, or chosen rows.
+_SUPERVISE_CAUSAL, _SUPERVISE_ROWS = 0, 1
 
 
 class TesslError(RuntimeError):
@@ -188,6 +190,22 @@ def _load():
             ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint32), ctypes.c_uint64, ctypes.c_uint32,
             ctypes.POINTER(ctypes.c_double),
         ] + err_args
+        u32p = ctypes.POINTER(ctypes.c_uint32)
+        lib.tessl_qwen35_train_forward.restype = ctypes.c_int32
+        lib.tessl_qwen35_train_forward.argtypes = [
+            ctypes.c_void_p, u32p, ctypes.c_uint64, ctypes.c_uint32, ctypes.c_uint32, u32p, u32p, ctypes.c_uint64,
+            ctypes.c_float, ctypes.POINTER(ctypes.c_double),
+        ] + err_args
+        lib.tessl_qwen35_hidden.restype = ctypes.c_int32
+        lib.tessl_qwen35_hidden.argtypes = [
+            ctypes.c_void_p, u32p, ctypes.c_uint64, ctypes.POINTER(_TensorRef),
+        ] + err_args
+        lib.tessl_qwen35_train_backward.restype = ctypes.c_int32
+        lib.tessl_qwen35_train_backward.argtypes = [
+            ctypes.c_void_p, u32p, ctypes.c_uint64, ctypes.POINTER(_TensorRef), ctypes.c_uint32,
+        ] + err_args
+        lib.tessl_qwen35_train_discard.restype = ctypes.c_int32
+        lib.tessl_qwen35_train_discard.argtypes = [ctypes.c_void_p] + err_args
         lib.tessl_qwen35_copy.restype = ctypes.c_int32
         lib.tessl_qwen35_copy.argtypes = [
             ctypes.c_void_p, ctypes.c_uint32, ctypes.POINTER(_TensorRef), ctypes.c_uint64,
@@ -682,6 +700,12 @@ class Qwen35:
         self._table = table
         self._decay_excluded = decay_excluded
         self._has_grads = False
+        # A step between train_forward and train_backward, and whether the
+        # bank held a finished step's gradients before it (a discard leaves
+        # the bank as it was).
+        self._pending = False
+        self._grads_before_pending = False
+        self._hidden = dict((n, s) for n, s, _ in table)["norm.weight"][0]
 
     @staticmethod
     def _check(status: int, err):
@@ -870,6 +894,117 @@ class Qwen35:
             err,
         )
 
+    def _ids(self, ids) -> "_HostU32":
+        ids = torch.as_tensor(ids)
+        if ids.dim() != 1:
+            raise TesslError(f"ids must be 1-D (one sequence), got shape {tuple(ids.shape)}")
+        return _u32(ids, 1 << 32, "ids")
+
+    def train_forward(self, ids, operands: str = "f32", positions=None, targets=None, scale: float = 1.0) -> float:
+        """The forward and loss of one step, kept for ``hidden()`` and
+        ``train_backward()``; returns the loss.
+
+        With ``positions`` and ``targets`` (1-D, equal length, positions
+        distinct; both empty is allowed), the loss is the sum of the
+        cross-entropies of the hidden state at ``positions[i]`` against token
+        ``targets[i]``, and the gradients are those of ``scale`` times it: a
+        batch mean over ``N`` supervised rows split across several sequences
+        is ``scale=1/N`` on each. Without them it is transformers' causal-LM
+        loss, as ``train_step``. In transformers' shifted frame, the position
+        that predicts ``ids[p + 1]`` is ``p``."""
+        code = _operands_code(operands)
+        host = self._ids(ids)
+        n_ids = host.t.numel()
+        if (positions is None) != (targets is None):
+            raise TesslError("train_forward: give positions and targets together")
+        if positions is None:
+            sup, pos, tgt, n = _SUPERVISE_CAUSAL, None, None, 0
+        else:
+            pos = _u32(torch.as_tensor(positions), 1 << 32, "positions")
+            tgt = _u32(torch.as_tensor(targets), 1 << 32, "targets")
+            if pos.t.numel() != tgt.t.numel():
+                raise TesslError(f"train_forward: {pos.t.numel()} positions but {tgt.t.numel()} targets")
+            sup, n = _SUPERVISE_ROWS, pos.t.numel()
+        loss = ctypes.c_double()
+        err = ctypes.create_string_buffer(_ERR_LEN)
+        torch.mps.synchronize()
+        self._check(
+            self._rt.lib.tessl_qwen35_train_forward(
+                self._handle, host.ctypes_ptr, n_ids, code, sup,
+                pos.ctypes_ptr if n else None, tgt.ctypes_ptr if n else None, n, float(scale),
+                ctypes.byref(loss), err, _ERR_LEN,
+            ),
+            err,
+        )
+        self._grads_before_pending, self._has_grads, self._pending = self._has_grads, False, True
+        return loss.value
+
+    def hidden(self, positions) -> torch.Tensor:
+        """Rows ``positions`` of the pending step's final-norm output
+        (transformers' ``last_hidden_state``), a new f32 ``[n, hidden]``
+        tensor on MPS, for a loss outside tessl."""
+        pos = _u32(torch.as_tensor(positions), 1 << 32, "positions")
+        n = pos.t.numel()
+        out = torch.empty((n, self._hidden), dtype=torch.float32, device="mps")
+        if n == 0:
+            if not self._pending:
+                raise TesslError("hidden: no step is pending; call train_forward first")
+            return out
+        err = ctypes.create_string_buffer(_ERR_LEN)
+        torch.mps.synchronize()
+        ref = _ref(out, "out")
+        self._check(
+            self._rt.lib.tessl_qwen35_hidden(self._handle, pos.ctypes_ptr, n, ctypes.byref(ref), err, _ERR_LEN),
+            err,
+        )
+        return out
+
+    def train_backward(self, dh=None, positions=None, accumulate: bool = False) -> None:
+        """The pending step's backward: every parameter's gradient for
+        ``grads()``, over the previous ones or, with ``accumulate``, added to
+        them. ``dh`` (``[n, hidden]``, any dtype and device) is the gradient
+        of a loss outside tessl at rows ``positions`` of what ``hidden()``
+        reads, added to the step's own; rows of a repeated position are
+        summed first. A refused call keeps the step pending
+        (``train_discard()`` drops it)."""
+        if (dh is None) != (positions is None):
+            raise TesslError("train_backward: give dh and positions together")
+        err = ctypes.create_string_buffer(_ERR_LEN)
+        if dh is None:
+            pos_ptr, n, ref = None, 0, None
+        else:
+            positions = torch.as_tensor(positions).reshape(-1).to("cpu", torch.int64)
+            if tuple(dh.shape) != (positions.numel(), self._hidden):
+                raise TesslError(
+                    f"train_backward: dh must be [{positions.numel()}, {self._hidden}], got {tuple(dh.shape)}"
+                )
+            dh32 = dh.detach().to(device="mps", dtype=torch.float32)
+            uniq, inv = torch.unique(positions, return_inverse=True)
+            if uniq.numel() != positions.numel():
+                dh32 = torch.zeros((uniq.numel(), self._hidden), dtype=torch.float32, device="mps").index_add_(
+                    0, inv.to("mps"), dh32
+                )
+                positions = uniq
+            dh32 = dh32.contiguous()
+            pos = _u32(positions, 1 << 32, "positions")
+            n = pos.t.numel()
+            pos_ptr = pos.ctypes_ptr if n else None
+            ref = ctypes.byref(_ref(dh32, "dh")) if n else None
+        torch.mps.synchronize()
+        self._check(
+            self._rt.lib.tessl_qwen35_train_backward(self._handle, pos_ptr, n, ref, int(accumulate), err, _ERR_LEN),
+            err,
+        )
+        self._has_grads, self._pending = True, False
+
+    def train_discard(self) -> None:
+        """Drop the pending step, if any, without its backward; the
+        gradients are then as they were before it."""
+        err = ctypes.create_string_buffer(_ERR_LEN)
+        self._check(self._rt.lib.tessl_qwen35_train_discard(self._handle, err, _ERR_LEN), err)
+        if self._pending:
+            self._has_grads, self._pending = self._grads_before_pending, False
+
     def train_step(self, ids, operands: str = "f32") -> float:
         """One training step on one sequence of token ids (a 1-D tensor or a
         sequence of ints): returns transformers' causal-LM loss and keeps
@@ -879,16 +1014,13 @@ class Qwen35:
         rounded to bf16, f32 accumulation; weights, activations and
         gradients stay f32)."""
         code = _operands_code(operands)
-        ids = torch.as_tensor(ids)
-        if ids.dim() != 1:
-            raise TesslError(f"ids must be 1-D (one sequence), got shape {tuple(ids.shape)}")
-        host = _u32(ids, 1 << 32, "ids")
+        host = self._ids(ids)
         loss = ctypes.c_double()
         err = ctypes.create_string_buffer(_ERR_LEN)
         torch.mps.synchronize()
         self._has_grads = False
         status = self._rt.lib.tessl_qwen35_train_step(
-            self._handle, host.ctypes_ptr, ids.numel(), code, ctypes.byref(loss), err, _ERR_LEN,
+            self._handle, host.ctypes_ptr, host.t.numel(), code, ctypes.byref(loss), err, _ERR_LEN,
         )
         del host
         self._check(status, err)

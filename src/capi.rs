@@ -44,7 +44,7 @@ use crate::gemm::GemmOperands;
 use crate::qwen35_adamw::{excluded_from_weight_decay, AdamW, AdamWHyper, Moment};
 use crate::qwen35_model::{Precision, Qwen35Config, Qwen35Model};
 use crate::qwen35_params::ParamInfo;
-use crate::qwen35_train::Qwen35Grads;
+use crate::qwen35_train::{PendingStep, Qwen35Grads, Supervise};
 use crate::runtime::GpuRuntime;
 use crate::safetensors::SafeTensors;
 use crate::tensor::{DType, Tensor};
@@ -55,7 +55,7 @@ pub const TESSL_PANIC: i32 = 2;
 
 /// Bumped on any change to a `#[repr(C)]` layout or an entry point's
 /// signature; the Python side refuses a library whose version differs.
-pub const TESSL_ABI_VERSION: u32 = 8;
+pub const TESSL_ABI_VERSION: u32 = 9;
 
 /// Largest tensor rank a [`TesslTensorRef`] carries.
 pub const TESSL_MAX_DIMS: usize = 6;
@@ -682,15 +682,68 @@ pub struct TesslParamInfo {
     pub shape: [u64; TESSL_MAX_DIMS],
 }
 
-/// What a [`tessl_qwen35_load`] pointer owns: an f32 model, the gradients
-/// of its last [`tessl_qwen35_train_step`], and AdamW state once
-/// [`tessl_qwen35_adamw_init`] made it.
+/// What the handle's gradient bank holds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BankState {
+    /// Zeros, as allocated: nothing has run into it.
+    Empty,
+    /// A finished step's gradients (or several, accumulated).
+    Ready,
+    /// A step into it was refused or failed part way: neither.
+    Dirty,
+}
+
+/// What a [`tessl_qwen35_load`] pointer owns: an f32 model, its gradient
+/// bank (allocated by the first step and reused by every later one), a step
+/// between [`tessl_qwen35_train_forward`] and [`tessl_qwen35_train_backward`],
+/// and AdamW state once [`tessl_qwen35_adamw_init`] made it.
 pub struct TesslQwen35 {
     model: Qwen35Model,
     table: Vec<ParamInfo>,
     grads: Option<Qwen35Grads>,
+    bank: BankState,
+    pending: Option<PendingStep>,
     adamw: Option<AdamW>,
     owner: ThreadId,
+}
+
+impl TesslQwen35 {
+    /// The bank, allocated (zeroed) on first use.
+    fn bank(&mut self) -> Result<&Qwen35Grads, String> {
+        if self.grads.is_none() {
+            self.grads = Some(Qwen35Grads::zeros_like(&self.model)?);
+            self.bank = BankState::Empty;
+        }
+        self.grads.as_ref().ok_or_else(|| "no gradient bank".to_string())
+    }
+
+    fn no_pending(&self, what: &str) -> Result<(), String> {
+        if self.pending.is_some() {
+            return Err(format!(
+                "{what}: a step is pending; call tessl_qwen35_train_backward or tessl_qwen35_train_discard first"
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// The bank's gradients, when they are a finished step's and no step is
+/// pending.
+fn ready_grads<'a>(
+    what: &str,
+    grads: &'a Option<Qwen35Grads>,
+    bank: BankState,
+    pending: &Option<PendingStep>,
+) -> Result<&'a Qwen35Grads, String> {
+    if pending.is_some() {
+        return Err(format!(
+            "{what}: a step is pending; call tessl_qwen35_train_backward or tessl_qwen35_train_discard first"
+        ));
+    }
+    match (grads, bank) {
+        (Some(g), BankState::Ready) => Ok(g),
+        _ => Err(format!("{what}: no gradients yet; run tessl_qwen35_train_step first")),
+    }
 }
 
 impl Handle for TesslQwen35 {
@@ -761,6 +814,8 @@ pub unsafe extern "C" fn tessl_qwen35_load(
                 model,
                 table,
                 grads: None,
+                bank: BankState::Empty,
+                pending: None,
                 adamw: None,
                 owner: h.owner,
             }));
@@ -851,9 +906,10 @@ pub unsafe extern "C" fn tessl_qwen35_param_info(
 
 /// One training step on the `n` token ids at `ids` (one sequence), its GEMMs
 /// on `operands` ([`TESSL_OPERANDS_EXACT_F32`] or [`TESSL_OPERANDS_BF16`]):
-/// writes the loss to `*loss` and keeps every parameter's gradient in the
-/// handle for [`tessl_qwen35_copy`], replacing the previous step's (freed
-/// before the step runs, so a refused step leaves none).
+/// writes the loss to `*loss` and every parameter's gradient into the
+/// handle's bank for [`tessl_qwen35_copy`], over the previous step's (a
+/// refused or failed step leaves none). Refused while a step is pending,
+/// which leaves the bank as it was.
 ///
 /// # Safety
 /// As [`tessl_qwen35_param_count`]; `ids` points to `n` readable `u32`s and
@@ -877,10 +933,211 @@ pub unsafe extern "C" fn tessl_qwen35_train_step(
             }
             let n = usize::try_from(n).map_err(|_| format!("{WHAT}: n overflows usize"))?;
             let ids = std::slice::from_raw_parts(ids, n);
-            h.grads = None;
-            let step = h.model.train_step(ids, parse_operands(operands, WHAT)?)?;
-            *loss = step.loss;
-            h.grads = Some(step.grads);
+            // A pending step's bank is left alone; any other refusal leaves
+            // no gradients.
+            h.no_pending(WHAT)?;
+            h.bank()?;
+            h.bank = BankState::Dirty;
+            let operands = parse_operands(operands, WHAT)?;
+            let bank = h.grads.as_ref().ok_or("no gradient bank")?;
+            *loss = h.model.train_step_into(ids, operands, Supervise::Causal, bank, false)?;
+            h.bank = BankState::Ready;
+            Ok(())
+        })
+    }
+}
+
+/// [`tessl_qwen35_train_forward`]: transformers' causal-LM loss, the mean
+/// over every next-token prediction ([`Supervise::Causal`]).
+pub const TESSL_SUPERVISE_CAUSAL: u32 = 0;
+/// [`tessl_qwen35_train_forward`]: the hidden state at `positions[i]` scored
+/// against `targets[i]`, the sum, with the gradients of `scale` times it
+/// ([`Supervise::Rows`]; no rows at all is allowed).
+pub const TESSL_SUPERVISE_ROWS: u32 = 1;
+
+/// The forward and loss of one step on the `n` token ids at `ids`, kept in
+/// the handle for [`tessl_qwen35_hidden`] and [`tessl_qwen35_train_backward`]
+/// ([`Qwen35Model::train_forward`]). `supervise` picks the loss:
+/// [`TESSL_SUPERVISE_CAUSAL`] (`positions` and `targets` null, `n_rows` 0) or
+/// [`TESSL_SUPERVISE_ROWS`] (`n_rows` positions and targets; null only when
+/// `n_rows` is 0). The loss goes to `*loss`. Refused while a step is pending.
+///
+/// # Safety
+/// As [`tessl_qwen35_param_count`]; `ids` points to `n` readable `u32`s,
+/// `positions` and `targets` to `n_rows` each, and `loss` is writable.
+#[no_mangle]
+pub unsafe extern "C" fn tessl_qwen35_train_forward(
+    model: *mut TesslQwen35,
+    ids: *const u32,
+    n: u64,
+    operands: u32,
+    supervise: u32,
+    positions: *const u32,
+    targets: *const u32,
+    n_rows: u64,
+    scale: f32,
+    loss: *mut f64,
+    err: *mut c_char,
+    err_len: usize,
+) -> i32 {
+    // SAFETY: forwarded from this function's contract.
+    unsafe {
+        guarded(model, err, err_len, |h| {
+            const WHAT: &str = "tessl_qwen35_train_forward";
+            if ids.is_null() || loss.is_null() {
+                return Err(format!("{WHAT}: null ids or loss"));
+            }
+            let n = usize::try_from(n).map_err(|_| format!("{WHAT}: n overflows usize"))?;
+            let n_rows = usize::try_from(n_rows).map_err(|_| format!("{WHAT}: n_rows overflows usize"))?;
+            let ids = std::slice::from_raw_parts(ids, n);
+            let operands = parse_operands(operands, WHAT)?;
+            let rows = |p: *const u32, name: &str| -> Result<&[u32], String> {
+                match (p.is_null(), n_rows) {
+                    (true, 0) => Ok(&[]),
+                    (true, _) => Err(format!("{WHAT}: null {name} for {n_rows} rows")),
+                    (false, k) => Ok(std::slice::from_raw_parts(p, k)),
+                }
+            };
+            let sup = match supervise {
+                TESSL_SUPERVISE_CAUSAL => {
+                    if n_rows != 0 || !positions.is_null() || !targets.is_null() {
+                        return Err(format!("{WHAT}: the causal loss takes no positions or targets"));
+                    }
+                    Supervise::Causal
+                }
+                TESSL_SUPERVISE_ROWS => Supervise::Rows {
+                    positions: rows(positions, "positions")?,
+                    targets: rows(targets, "targets")?,
+                    scale,
+                },
+                s => {
+                    return Err(format!(
+                    "{WHAT}: supervise {s} is not {TESSL_SUPERVISE_CAUSAL} (causal) or {TESSL_SUPERVISE_ROWS} (rows)"
+                ))
+                }
+            };
+            h.no_pending(WHAT)?;
+            let p = h.model.train_forward(ids, operands, sup)?;
+            *loss = p.loss();
+            h.pending = Some(p);
+            Ok(())
+        })
+    }
+}
+
+/// Rows `positions` of the pending step's final-norm output (transformers'
+/// `last_hidden_state`) into `out`, dense f32 `[n, hidden]`
+/// ([`PendingStep::hidden`]). Positions may repeat.
+///
+/// # Safety
+/// As [`tessl_qwen35_param_count`]; `positions` points to `n` readable
+/// `u32`s (null only when `n` is 0) and `out` to a [`TesslTensorRef`] whose
+/// buffer satisfies the module contract.
+#[no_mangle]
+pub unsafe extern "C" fn tessl_qwen35_hidden(
+    model: *mut TesslQwen35,
+    positions: *const u32,
+    n: u64,
+    out: *const TesslTensorRef,
+    err: *mut c_char,
+    err_len: usize,
+) -> i32 {
+    // SAFETY: forwarded from this function's contract.
+    unsafe {
+        guarded(model, err, err_len, |h| {
+            const WHAT: &str = "tessl_qwen35_hidden";
+            let n = usize::try_from(n).map_err(|_| format!("{WHAT}: n overflows usize"))?;
+            if out.is_null() || (positions.is_null() && n != 0) {
+                return Err(format!("{WHAT}: null positions or out"));
+            }
+            let positions = if n == 0 {
+                &[][..]
+            } else {
+                std::slice::from_raw_parts(positions, n)
+            };
+            let p = h
+                .pending
+                .as_ref()
+                .ok_or_else(|| format!("{WHAT}: no step is pending; call tessl_qwen35_train_forward first"))?;
+            let out = wrap(&h.model.rt, &*out, "out")?;
+            p.hidden(positions, &out)
+        })
+    }
+}
+
+/// The pending step's backward into the handle's bank: over it, or added to
+/// it when `accumulate` is non-zero ([`Qwen35Model::train_backward_into`]).
+/// `dh`, when not null, is the gradient of a loss outside tessl at rows
+/// `positions` (distinct) of the final norm's output, dense f32
+/// `[n, hidden]`; null with `n` 0 adds none. Everything is checked before
+/// anything runs, and a refusal keeps the step pending; once the backward
+/// runs the step is consumed. Accumulating onto a bank a failed step left
+/// part-written is refused. The parameters must not change in between: a
+/// [`TESSL_WRITE_PARAMS`] copy is refused while a step is pending.
+///
+/// # Safety
+/// As [`tessl_qwen35_hidden`], for `positions` and `dh`.
+#[no_mangle]
+pub unsafe extern "C" fn tessl_qwen35_train_backward(
+    model: *mut TesslQwen35,
+    positions: *const u32,
+    n: u64,
+    dh: *const TesslTensorRef,
+    accumulate: u32,
+    err: *mut c_char,
+    err_len: usize,
+) -> i32 {
+    // SAFETY: forwarded from this function's contract.
+    unsafe {
+        guarded(model, err, err_len, |h| {
+            const WHAT: &str = "tessl_qwen35_train_backward";
+            let n = usize::try_from(n).map_err(|_| format!("{WHAT}: n overflows usize"))?;
+            let rt = Arc::clone(&h.model.rt);
+            let dh = match (dh.is_null(), positions.is_null(), n) {
+                (true, true, 0) => None,
+                (false, false, k) => Some((std::slice::from_raw_parts(positions, k), wrap(&rt, &*dh, "dh")?)),
+                (false, true, 0) => Some((&[][..], wrap(&rt, &*dh, "dh")?)),
+                _ => {
+                    return Err(format!(
+                        "{WHAT}: dh and positions must both be given, or both null with n 0"
+                    ))
+                }
+            };
+            let dh = dh.as_ref().map(|(p, t)| (*p, t));
+            let accumulate = accumulate != 0;
+            {
+                let p = h
+                    .pending
+                    .as_ref()
+                    .ok_or_else(|| format!("{WHAT}: no step is pending; call tessl_qwen35_train_forward first"))?;
+                h.model.check_pending(WHAT, p, dh)?;
+            }
+            h.bank()?;
+            if accumulate && h.bank == BankState::Dirty {
+                return Err(format!(
+                    "{WHAT}: the bank holds a failed step's partial gradients; start again with accumulate = 0"
+                ));
+            }
+            let p = h.pending.take().ok_or("no pending step")?;
+            h.bank = BankState::Dirty;
+            let bank = h.grads.as_ref().ok_or("no gradient bank")?;
+            h.model.train_backward_into(p, dh, bank, accumulate)?;
+            h.bank = BankState::Ready;
+            Ok(())
+        })
+    }
+}
+
+/// Drop the pending step, if any, without its backward.
+///
+/// # Safety
+/// As [`tessl_qwen35_param_count`].
+#[no_mangle]
+pub unsafe extern "C" fn tessl_qwen35_train_discard(model: *mut TesslQwen35, err: *mut c_char, err_len: usize) -> i32 {
+    // SAFETY: forwarded from this function's contract.
+    unsafe {
+        guarded(model, err, err_len, |h| {
+            h.pending = None;
             Ok(())
         })
     }
@@ -928,13 +1185,15 @@ pub unsafe extern "C" fn tessl_qwen35_copy(
             match direction {
                 TESSL_READ_PARAMS => h.model.read_parameters(&ts),
                 TESSL_READ_GRADS => {
-                    let g = h
-                        .grads
-                        .as_ref()
-                        .ok_or_else(|| format!("{WHAT}: no gradients yet; run tessl_qwen35_train_step first"))?;
+                    let g = ready_grads(WHAT, &h.grads, h.bank, &h.pending)?;
                     h.model.read_gradients(g, &ts)
                 }
-                TESSL_WRITE_PARAMS => h.model.write_parameters(&ts),
+                TESSL_WRITE_PARAMS => {
+                    // The backward rebuilds each layer from the forward's inputs
+                    // with the weights it finds: they must be the forward's.
+                    h.no_pending(WHAT)?;
+                    h.model.write_parameters(&ts)
+                }
                 TESSL_READ_ADAMW_M | TESSL_READ_ADAMW_V | TESSL_WRITE_ADAMW_M | TESSL_WRITE_ADAMW_V => {
                     let state = h
                         .adamw
@@ -1030,10 +1289,7 @@ pub unsafe extern "C" fn tessl_qwen35_adamw_step(
                 return Err(format!("{WHAT}: null weight_decay"));
             }
             let wd = std::slice::from_raw_parts(weight_decay, n);
-            let grads = h
-                .grads
-                .as_ref()
-                .ok_or_else(|| format!("{WHAT}: no gradients yet; run tessl_qwen35_train_step first"))?;
+            let grads = ready_grads(WHAT, &h.grads, h.bank, &h.pending)?;
             let state = h
                 .adamw
                 .as_mut()
@@ -1075,10 +1331,7 @@ pub unsafe extern "C" fn tessl_qwen35_grad_sq_norm(
             if out.is_null() {
                 return Err(format!("{WHAT}: null out"));
             }
-            let grads = h
-                .grads
-                .as_ref()
-                .ok_or_else(|| format!("{WHAT}: no gradients yet; run tessl_qwen35_train_step first"))?;
+            let grads = ready_grads(WHAT, &h.grads, h.bank, &h.pending)?;
             *out = h.model.grad_sq_norm(grads)?;
             Ok(())
         })

@@ -417,6 +417,17 @@ fn a_bank_holds_a_steps_gradients_and_accumulates_the_next() {
         assert_eq!(got, want, "{name}: accumulate = false did not write over the bank");
     }
 
+    // A new bank from recycled memory starts at zero: accumulating into it
+    // first gives the step's own gradients.
+    drop(bank);
+    let bank = Qwen35Grads::zeros_like(&model).unwrap();
+    model.train_step_into(&a, mm, Supervise::Causal, &bank, true).unwrap();
+    for ((name, got), (_, x)) in bits(&cfg, &bank).iter().zip(&wa) {
+        // One add onto zero: -0.0 comes out as +0.0.
+        let want: Vec<u32> = x.iter().map(|&b| (0.0f32 + f32::from_bits(b)).to_bits()).collect();
+        assert_eq!(got, &want, "{name}: a new bank was not zero");
+    }
+
     let e = |bank: &Qwen35Grads, needle: &str| {
         let m = model
             .train_step_into(&a, mm, Supervise::Causal, bank, true)

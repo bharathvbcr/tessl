@@ -742,11 +742,12 @@ lower; that is arithmetic, not a re-measurement.
 `src/qwen35_params.rs` exposes the model's parameters and gradients under
 transformers' names and values (norms as `w`, which is also what is stored; each
 linear weight as its `[in, out]` window of the packed projection) and copies
-them between the model and caller tensors on the GPU. The C ABI (version 8)
+them between the model and caller tensors on the GPU. The C ABI (version 9)
 adds a model handle (`tessl_qwen35_load`, `_train_step`, `_param_count`,
 `_param_info`, `_copy`, `_free`, and `_adamw_init`, `_adamw_step`,
-`_adamw_step_count`, `_adamw_set_step_count`, `_adamw_free`, `_grad_sq_norm`;
-`_copy` directions 3-6 read and write both moments, for checkpoints), and
+`_adamw_step_count`, `_adamw_set_step_count`, `_adamw_free`, `_grad_sq_norm`,
+`_train_forward`, `_hidden`, `_train_backward`, `_train_discard`; `_copy`
+directions 3-6 read and write both moments, for checkpoints), and
 `tessl_torch.Qwen35` wraps it (see `python/README.md`).
 
 `tessl::qwen35_adamw` runs AdamW on the model's own parameters, so a
@@ -764,7 +765,21 @@ three steps it is within 1e-6 (`tests/qwen35_adamw.rs`,
 gives the square of the global gradient norm, and `grad_scale` multiplies
 every gradient by `clip_grad_norm_`'s coefficient inside the update, with
 no pass over the gradients and the stored ones left unscaled; the caller
-forms the coefficient so gradients outside tessl join the norm. In `Precision::F32` the tied embedding is one f32
+forms the coefficient so gradients outside tessl join the norm.
+
+A step also runs in two halves for a loss outside tessl (a head of the
+caller's own): `train_forward` scores chosen positions against given tokens
+(`Supervise::Rows`: the sum, its gradients scaled by the caller, so a batch
+mean split across rows is `1 / N` on each) or takes the causal-LM loss,
+`PendingStep::hidden` gives the final norm's output at chosen rows, and
+`train_backward_into` adds that loss's gradient there before the backward.
+Gradients accumulate across a batch's rows in a bank
+(`Qwen35Grads::zeros_like`). Against transformers on a right-padded two-row
+batch (a letter row through the tied head, a span row through a pointer head
+in torch), run row by row and accumulated, the losses, the summed gradients
+and the global norm agree (`python/tests/test_qwen35.py`).
+
+In `Precision::F32` the tied embedding is one f32
 `[vocab, hidden]` table: the gather reads it by row
 (`qwen35_embed_rows_f32`), the training step's cross-entropy as its weight,
 and the inference forward's head as the transposed operand of one NT GEMM,
@@ -954,8 +969,12 @@ is the largest non-GEMM share: 18 × 1.4 ms.
   exist (`tessl::cross_entropy`, over the supervised rows only, in vocabulary
   chunks), and every layer has a backward, so `train_step` runs the whole
   forward and backward on the GPU (torch sees it through
-  `tessl_torch.Qwen35`). What it does not do yet: more than one sequence per
-  step, GDN layers whose value heads outnumber their key heads, and bf16
+  `tessl_torch.Qwen35`). A batch runs one sequence at a time: each row
+  trimmed to its length (exact for right padding, which a causal model never
+  attends), its gradients accumulated in a bank, so a batch of `B` rows costs
+  `B` steps rather than one padded one (throughput not measured). What it
+  does not do yet: several sequences in one step, GDN layers whose value
+  heads outnumber their key heads, and bf16
   storage: weights, activations and gradients stay f32 (bf16 GEMM operands
   are an option, see "A training step"), and a bf16-loaded model is refused.
 - **Fast math.** Metal compiles with fast math on by default. The attention

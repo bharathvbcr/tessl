@@ -32,6 +32,7 @@ const CROSS_ENTROPY: &str = include_str!("../kernels/cross_entropy.metal");
 const GDN_TRAIN: &str = include_str!("../kernels/gdn_train.metal");
 const QWEN35_BWD: &str = include_str!("../kernels/qwen35_bwd.metal");
 const QWEN35_ATTN_BWD: &str = include_str!("../kernels/qwen35_attn_bwd.metal");
+const QWEN35_ADAMW: &str = include_str!("../kernels/qwen35_adamw.metal");
 
 /// Every `.metal` file this suite inspects.
 ///
@@ -54,6 +55,7 @@ const INSPECTED_KERNELS: &[&str] = &[
     "kv_store.metal",
     "matmul_simdgroup.metal",
     "qwen35_attn.metal",
+    "qwen35_adamw.metal",
     "qwen35_attn_bwd.metal",
     "qwen35_attn_tiled.metal",
     "qwen35_bwd.metal",
@@ -551,6 +553,19 @@ fn qwen35_bwd_offsets_are_widened() {
     ] {
         require(QWEN35_BWD, needle, what);
     }
+}
+
+/// AdamW walks every parameter window of the model, the tied embedding's
+/// `[vocab, hidden]` included (5.1e8 elements at the 2B's 248320 x 2048, past
+/// 2^28 and an eighth of u32's range in elements, which a larger vocab or
+/// hidden size crosses); each element offset is formed in 64 bits.
+#[test]
+fn qwen35_adamw_offsets_are_widened() {
+    require(
+        QWEN35_ADAMW,
+        "const ulong i = (ulong)r * ld + off + c;",
+        "AdamW element",
+    );
 }
 
 /// The training attention indexes [B, T, H, 256] rows and [B, H, T]

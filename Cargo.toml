@@ -87,7 +87,14 @@ objc2-metal = { version = "0.3", features = [
     "MTL4LibraryFunctionDescriptor",
     # WWDC26-330 prep: native MTLTensor (incl. quantized Int8 today; Int4 when bindings land).
     "MTLTensor",
+    # `MTLDevice::newLibraryWithData_error` takes `dispatch2::DispatchData`.
+    # Verified in objc2-metal 0.3.2 (`newLibraryWithData:error:`, cfg feature
+    # `dispatch2`). `dispatch2` is already in Cargo.lock through this crate.
+    "dispatch2",
 ] }
+# Named so the metallib loader can build a `DispatchData`. Not a new package:
+# objc2-metal 0.3.2 already depends on dispatch2 0.3.1.
+dispatch2 = "0.3"
 libc = "0.2"
 
 [profile.release]

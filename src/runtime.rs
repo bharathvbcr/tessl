@@ -14,10 +14,11 @@
 //! assumed; and nothing zeroes a buffer from the host mid-command-buffer.
 
 use core::ptr::NonNull;
+use dispatch2::DispatchData;
 use objc2::rc::{autoreleasepool, Retained};
 use objc2::runtime::ProtocolObject;
 use objc2::ClassType;
-use objc2_foundation::{NSData, NSRange, NSString, NSURL};
+use objc2_foundation::{NSData, NSRange, NSString};
 use objc2_metal::{
     MTL4ArgumentTable, MTL4ArgumentTableDescriptor, MTL4CommandAllocator, MTL4CommandBuffer, MTL4CommandEncoder,
     MTL4CommandQueue, MTL4Compiler, MTL4CompilerDescriptor, MTL4ComputeCommandEncoder, MTL4ComputePipelineDescriptor,
@@ -470,6 +471,34 @@ pub fn kernel_trace_enabled() -> bool {
     *KERNEL_TRACE_ON.get_or_init(|| std::env::var_os("TESSL_KERNEL_TRACE").is_some())
 }
 
+/// Metallib bytes baked into this binary by `include_bytes!` of the artifact
+/// `build.rs` just wrote. Absent on a docs.rs build, which compiles no shaders.
+fn embedded_metallib() -> &'static [u8] {
+    #[cfg(tessl_embedded_metallib)]
+    {
+        include_bytes!(env!("TESSL_METALLIB"))
+    }
+    #[cfg(not(tessl_embedded_metallib))]
+    {
+        &[]
+    }
+}
+
+/// `MTLDevice::newLibraryWithData:error:`, which takes a `dispatch_data_t`.
+///
+/// Checked against objc2-metal 0.3.2: `newLibraryWithData_error(&DispatchData)`,
+/// compiled only with the crate feature `dispatch2`. Apple copies the bytes
+/// during the call.
+fn library_from_data(
+    device: &ProtocolObject<dyn MTLDevice>,
+    data: &DispatchData,
+    what: &str,
+) -> Result<Retained<ProtocolObject<dyn MTLLibrary>>, String> {
+    device
+        .newLibraryWithData_error(data)
+        .map_err(|e| format!("{what}: {e}"))
+}
+
 impl GpuRuntime {
     fn acquire_access(&self) -> Result<RuntimeAccess, String> {
         if self.encode_failed.load(Ordering::Acquire) {
@@ -503,12 +532,35 @@ impl GpuRuntime {
     }
 
     pub fn new() -> Result<Arc<Self>, String> {
-        Self::from_metallib_path(Path::new(crate::metallib_path()))
+        Self::from_embedded_metallib(/*timestamps*/ true)
     }
 
     /// Inference decode runtime: no CounterHeap timestamps (host encode tax).
     pub fn new_inference() -> Result<Arc<Self>, String> {
-        Self::from_metallib_path_opts(Path::new(crate::metallib_path()), /*timestamps*/ false)
+        Self::from_embedded_metallib(/*timestamps*/ false)
+    }
+
+    /// Shaders compiled by `build.rs`, embedded in this binary.
+    ///
+    /// `TESSL_METALLIB` is still the on-disk artifact (`metallib_path`, and
+    /// `DEP_TESSL_METALLIB` for dependents). Opening a runtime does not read
+    /// it. A docs.rs build has no shaders, so the slice is empty and
+    /// [`Self::new`] fails instead of looking for a file that was never written.
+    fn from_embedded_metallib(timestamps: bool) -> Result<Arc<Self>, String> {
+        let bytes = embedded_metallib();
+        if bytes.is_empty() {
+            return Err(
+                "embedded metallib is empty; this binary was built without shaders (DOCS_RS or a skipped AOT)".into(),
+            );
+        }
+        // `from_static_bytes` borrows the embedded slice. `newLibraryWithData`
+        // copies it (Apple's `MTLDevice` contract), so the `DispatchData` can
+        // drop when this function returns.
+        let data = DispatchData::from_static_bytes(bytes);
+        let device =
+            MTLCreateSystemDefaultDevice().ok_or_else(|| "MTLCreateSystemDefaultDevice returned nil".to_string())?;
+        let library = library_from_data(&device, &data, "load embedded metallib")?;
+        Self::assemble(device, library, timestamps)
     }
 
     pub fn from_metallib_path(path: &Path) -> Result<Arc<Self>, String> {
@@ -525,12 +577,20 @@ impl GpuRuntime {
         if !path.exists() {
             return Err(format!("metallib missing at {path_str} (build.rs AOT failed?)"));
         }
-        let url = NSURL::fileURLWithPath(&NSString::from_str(path_str));
-        let library = device
-            .newLibraryWithURL_error(&url)
-            .map_err(|e| format!("load metallib: {e}"))?;
+        let bytes = std::fs::read(path).map_err(|e| format!("read metallib {path_str}: {e}"))?;
+        if bytes.is_empty() {
+            return Err(format!("load metallib: {path_str} is empty"));
+        }
+        let data = DispatchData::from_bytes(&bytes);
+        let library = library_from_data(&device, &data, "load metallib")?;
+        Self::assemble(device, library, timestamps)
+    }
 
-        // Metal 4 encode package is required (Metal4-only doctrine).
+    fn assemble(
+        device: Retained<ProtocolObject<dyn MTLDevice>>,
+        library: Retained<ProtocolObject<dyn MTLLibrary>>,
+        timestamps: bool,
+    ) -> Result<Arc<Self>, String> {
         let metal4 = try_init_metal4(&device, timestamps)
             .map_err(|err| format!("Metal 4 encode package unavailable ({err}); metal-runtime requires Metal 4"))?;
 
@@ -880,11 +940,22 @@ impl GpuRuntime {
         if !path.exists() {
             return Err(format!("metallib missing at {path_str}"));
         }
-        let url = NSURL::fileURLWithPath(&NSString::from_str(path_str));
-        let library = self
-            .device
-            .newLibraryWithURL_error(&url)
-            .map_err(|e| format!("load overlay metallib: {e}"))?;
+        let bytes = std::fs::read(path).map_err(|e| format!("read overlay metallib {path_str}: {e}"))?;
+        self.add_metallib_bytes(&bytes)
+    }
+
+    /// Register an additional metallib from bytes already in memory.
+    ///
+    /// This is the relocatable form of [`Self::add_metallib`]: an adopter that
+    /// embeds its own overlay (`include_bytes!`) passes the slice here and does
+    /// not need the build directory to still exist. Pipeline names must be
+    /// unique across the primary library and every overlay.
+    pub fn add_metallib_bytes(&self, bytes: &[u8]) -> Result<(), String> {
+        if bytes.is_empty() {
+            return Err("load overlay metallib: metallib is empty".into());
+        }
+        let data = DispatchData::from_bytes(bytes);
+        let library = library_from_data(&self.device, &data, "load overlay metallib")?;
         let mut libs = self.overlay_libraries.lock().map_err(|e| e.to_string())?;
         libs.push(library);
         Ok(())

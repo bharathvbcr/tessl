@@ -21,6 +21,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 fn main() {
+    println!("cargo::rustc-check-cfg=cfg(tessl_embedded_metallib)");
     println!("cargo:rerun-if-env-changed=DEVELOPER_DIR");
     println!("cargo:rerun-if-env-changed=DOCS_RS");
     println!("cargo:rerun-if-env-changed=TESSL_SKIP_AOT");
@@ -86,6 +87,7 @@ fn main() {
             panic!("TESSL_PREBUILT_METALLIB={} is not a file", prebuilt.display());
         }
         println!("cargo:rerun-if-changed={}", prebuilt.display());
+        println!("cargo:rustc-cfg=tessl_embedded_metallib");
         println!("cargo:metallib={}", prebuilt.display());
         println!("cargo:rustc-env=TESSL_METALLIB={}", prebuilt.display());
         return;
@@ -122,15 +124,13 @@ fn main() {
             );
         }
         let air = out_dir.join(format!("{}.air", src.file_stem().unwrap().to_string_lossy()));
-        let status = Command::new(&metal)
-            .args([
-                "-std=metal4.0",
-                "-O2",
-                "-isysroot",
-                &sdk,
-                "-mmacosx-version-min=26.0",
-                "-c",
-            ])
+        let mut compile = Command::new(&metal);
+        compile.args(["-std=metal4.0", "-O2", "-fmetal-math-mode=fast"]);
+        if disable_fp_contract(src) {
+            compile.arg("-ffp-contract=off");
+        }
+        let status = compile
+            .args(["-isysroot", &sdk, "-mmacosx-version-min=26.0", "-c"])
             .arg(src)
             .arg("-o")
             .arg(&air)
@@ -186,8 +186,9 @@ fn main() {
         air_files.push(air);
     }
 
-    // Metal can retain file-backed library data after loading. Never relink a
-    // pathname baked into a prior binary: each build owns an immutable artifact.
+    // Each build owns an immutable artifact. The runtime embeds these bytes
+    // (`include_bytes!` of `TESSL_METALLIB`); the path stays for tooling and
+    // `DEP_TESSL_METALLIB`.
     //
     // Immutable, not eternal: every earlier build's artifact in this OUT_DIR is
     // removed first. A binary that referenced one of them is rebuilt by Cargo
@@ -217,8 +218,21 @@ fn main() {
     // making registry and vendored sources immutable, this isolates concurrent
     // profiles/targets/builds from one another. `links = "tessl"` exposes the
     // same path to direct dependents as `DEP_TESSL_METALLIB`.
+    println!("cargo:rustc-cfg=tessl_embedded_metallib");
     println!("cargo:metallib={}", metallib_out.display());
     println!("cargo:rustc-env=TESSL_METALLIB={}", metallib_out.display());
+}
+
+/// `-ffp-contract=off` where a non-contracted f32 reference disagreed.
+///
+/// `qwen35_adamw.metal`: with contraction on, a step at magnitude ~1e4 missed
+/// the `2e-6` absolute bound by one ulp (`6.104e-5` at element 20 of step 1).
+/// The measured step time is in `bench/results/fp_contract.txt`.
+fn disable_fp_contract(src: &Path) -> bool {
+    const OFF: &[&str] = &["qwen35_adamw.metal"];
+    src.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| OFF.contains(&name))
 }
 
 /// Delete `default-*.metallib` left in `out_dir` by previous builds.
@@ -241,15 +255,20 @@ fn sweep_previous_metallibs(out_dir: &Path) {
 /// diagnostic (or the spawn error) instead of swallowing it.
 fn try_metal_compile(metal: &Path, sdk: &str, src: &Path, air: &Path, metal_std: &str) -> Result<(), String> {
     let std_flag = format!("-std={metal_std}");
-    let out = Command::new(metal)
-        .args([
-            std_flag.as_str(),
-            "-O2",
-            "-isysroot",
-            sdk,
-            "-mmacosx-version-min=26.0",
-            "-c",
-        ])
+    let mut cmd = Command::new(metal);
+    cmd.args([
+        std_flag.as_str(),
+        "-O2",
+        "-fmetal-math-mode=fast",
+        "-isysroot",
+        sdk,
+        "-mmacosx-version-min=26.0",
+    ]);
+    if disable_fp_contract(src) {
+        cmd.arg("-ffp-contract=off");
+    }
+    let out = cmd
+        .arg("-c")
         .arg(src)
         .arg("-o")
         .arg(air)

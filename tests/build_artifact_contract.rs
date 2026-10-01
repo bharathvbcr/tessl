@@ -152,6 +152,18 @@ fn concurrent_builds_never_mutate_dependency_source_and_publish_out_dir_metadata
     fs::create_dir(&tools).expect("create fake tool directory");
     let tool = r#"#!/bin/sh
 set -eu
+write_out() {
+  output=''
+  while [ "$#" -gt 0 ]; do
+    if [ "$1" = "-o" ]; then
+      shift
+      output="$1"
+    fi
+    shift
+  done
+  test -n "$output"
+  printf 'synthetic-%s\n' "$(basename "$0")" > "$output"
+}
 case "$(basename "$0")" in
   xcrun)
     if [ "${1:-}" = "-f" ]; then
@@ -160,17 +172,23 @@ case "$(basename "$0")" in
       printf '/tmp\n'
     fi
     ;;
-  metal|metallib)
-    output=''
-    while [ "$#" -gt 0 ]; do
-      if [ "$1" = "-o" ]; then
-        shift
-        output="$1"
-      fi
-      shift
-    done
-    test -n "$output"
-    printf 'synthetic-%s\n' "$(basename "$0")" > "$output"
+  metal)
+    # The math mode must be an argument, not the compiler's implicit default.
+    # Throughput kernels (this synthetic TensorOps source) keep contraction.
+    case " $* " in
+      *" -fmetal-math-mode=fast "*) ;;
+      *) echo "missing -fmetal-math-mode=fast: $*" >&2; exit 1 ;;
+    esac
+    case " $* " in
+      *" -ffp-contract=off "*)
+        echo "throughput kernel must not disable contraction: $*" >&2
+        exit 1
+        ;;
+    esac
+    write_out "$@"
+    ;;
+  metallib)
+    write_out "$@"
     ;;
 esac
 "#;

@@ -350,6 +350,39 @@ fn a_checkpointed_run_resumes_bit_for_bit() {
     assert!(e.contains("tensors for"), "{e}");
 }
 
+/// One zero-gradient AdamW step over the tiny fixture, fingerprinted before the
+/// generic-kernel refactor. A later edit that retunes the scalar formation or
+/// the dispatch changes this hash.
+#[test]
+fn qwen35_adamw_zero_grad_step_keeps_its_bits() {
+    let (rt, model) = load();
+    let mut state = AdamW::new(&model).unwrap();
+    let grads = tessl::qwen35_train::Qwen35Grads::zeros_like(&model).unwrap();
+    let wd = model.default_weight_decay(0.1).unwrap();
+    let hyper = AdamWHyper {
+        lr: 1e-2,
+        ..AdamWHyper::default()
+    };
+    model.adamw_step(&grads, &mut state, &hyper, &wd).unwrap();
+    let table = model.parameter_table().unwrap();
+    let got = host(&rt, &model, &table, None);
+    let mut hash: u64 = 0;
+    let mut n = 0usize;
+    for tensor in &got {
+        for x in tensor {
+            hash = hash.wrapping_mul(0x9E37_79B9_7F4A_7C15).wrapping_add(x.to_bits());
+            n += 1;
+        }
+    }
+    // Filled from the pre-refactor run. A mismatch names the actual hash.
+    const WANT: u64 = 0xb94c9db440000000;
+    assert_eq!(
+        (hash, n),
+        (WANT, n),
+        "zero-grad adamw fingerprint is {hash:#x} over {n} elements"
+    );
+}
+
 /// The step counter is a `u64`. One past `u64::MAX` must be an error, and the
 /// counter must stay at `u64::MAX`. In a release build without overflow checks
 /// the pre-fix `step + 1` wraps to 0, the bias correction becomes `1 - beta^0

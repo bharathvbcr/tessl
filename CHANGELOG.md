@@ -8,6 +8,35 @@ All notable changes to `tessl` are recorded here. The format follows
 
 ### Added
 
+- **Device AdamW on any f32 tensor (`tessl::qwen35_adamw::adamw_step`)**:
+  one step of `qwen35_adamw_f32` on a parameter, its gradient and both
+  moments. `Qwen35Model::adamw_step` is that function in a loop over the
+  parameter table, including packed windows, so there is no second kernel.
+  A step of 0 is refused (the value `u64::MAX + 1` wraps to, which zeroes
+  the bias correction). The model method still refuses to increment a count
+  that is already `u64::MAX`. Callers synchronize before a host read.
+  `tests/adamw_step.rs` checks a non-contracted f32 reference within the
+  existing `2e-6` absolute bound, mismatched shapes and dtypes, a zero-length
+  view, a byte-offset view, and a gradient that belongs to another runtime.
+- **The metallib is embedded.** `GpuRuntime::new` loads the shader library
+  with `newLibraryWithData` (`MTLDevice::newLibraryWithData:error:`,
+  objc2-metal 0.3.2's `newLibraryWithData_error`, feature `dispatch2`) from
+  bytes included at compile time. Moving or deleting the build-directory
+  `.metallib` no longer stops a binary from opening a runtime.
+  `add_metallib_bytes` is the same load for an adopter overlay.
+  `metallib_path` and `DEP_TESSL_METALLIB` still name the on-disk artifact
+  for tooling.
+- **Metal math mode is explicit.** `build.rs` passes `-fmetal-math-mode=fast`,
+  which is the compiler default, on every shader. `-ffp-contract=off` is
+  applied to `kernels/qwen35_adamw.metal` only: with contraction on, a step
+  at magnitude ~1e4 missed the `2e-6` bound by one ulp (`6.104e-5`); with
+  the flag the same step is bit-identical to a non-contracted f32 reference.
+  A million-element batched step was 0.2336 ms with the flag and 0.2456 ms
+  without (one release run each; the flag was not slower). RMSNorm's gap
+  against a serial f32 sum is `3.576e-7` (inside `1e-5`, and it is the
+  reduction tree) and cross-entropy's exact-f32 `dh` relative error is
+  `1.58e-6` (inside `1e-5`, `precise::exp`/`log` already). Those two were
+  not given the flag. Numbers: `bench/results/fp_contract.txt`.
 - **LM-head cross-entropy with gradients (`tessl::cross_entropy`)**:
   `cross_entropy_rows` over the supervised `(row, target)` pairs only, in
   vocabulary chunks, never forming `[rows, vocab]` logits. Loss (mean or sum),

@@ -1,0 +1,54 @@
+# FP contraction measured 2026-10-01, release, this machine
+
+`-fmetal-math-mode=fast` is passed on every shader. It is the compiler
+default, so it does not change results.
+
+`-ffp-contract=off` is applied per source file, and only where a
+non-contracted f32 reference (separate multiply and add, no `mul_add`)
+missed that file's existing parity bound.
+
+## qwen35_adamw.metal — flag applied
+
+Contraction on, debug, values scaled by about 1e4, 4096 elements:
+
+- step 1, element 20: absolute error `6.104e-5` against the reference
+- that exceeds `ADAMW_ABS_TOL` (`2e-6`)
+
+Contraction off, release, same shape, 3 steps:
+
+- maximum absolute error `0` (bit-identical to the reference)
+
+Step time, release, `1 << 20` elements, 32 steps in one batched submit,
+one run each:
+
+| contraction | ms/step |
+| --- | --- |
+| on | 0.2456 |
+| off (`-ffp-contract=off`) | 0.2336 |
+
+The flagged kernel was not slower in this sample. The two runs are single
+shots, so the 0.012 ms difference is noise, not a speedup to count on.
+
+## rms_norm.metal — flag not applied
+
+Contraction on, release, 8 rows by 256, versus a serial f32 sum of squares:
+
+- maximum absolute error `3.576e-7`
+- the existing bound in `tests/nn_kernels.rs` is `1e-5`
+
+`kernels/rms_norm.metal` documents that the threadgroup reduction
+reassociates adds. That gap is inside the bound, and turning contraction
+off does not restore a serial reduction order, so the flag is not applied.
+The same run's batched time was `0.0422` ms/step (64 steps, one submit).
+
+## cross_entropy.metal — flag not applied
+
+`tests/cross_entropy.rs` `matches_the_f64_reference_across_the_chunk_walk`,
+exact f32, contraction on. Worst relative error seen:
+
+- `dh`: `1.58e-6`
+- `dW`: `1.07e-7`
+
+The test's bound is `1e-5` absolute plus `1e-5` relative. `ce_lse_update`
+and `ce_softmax_grad` already call `precise::exp` and `precise::log`. The
+remaining gap is the f32 GEMM, which is not given this flag.

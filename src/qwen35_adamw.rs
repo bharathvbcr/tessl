@@ -22,7 +22,9 @@ use crate::dispatch::{dispatch_2d, dispatch_2d_tg, set_gpu_buf_offset, set_u32};
 use crate::qwen35_model::Qwen35Model;
 use crate::qwen35_params::{slots, Src};
 use crate::qwen35_train::Qwen35Grads;
-use crate::tensor::{GpuBuffer, Tensor};
+use crate::runtime::GpuRuntime;
+use crate::tensor::{DType, GpuBuffer, Tensor};
+use std::sync::Arc;
 
 /// AdamW's hyperparameters other than weight decay, as torch names them,
 /// and the step's gradient scale.
@@ -174,6 +176,186 @@ impl Window<'_> {
     }
 }
 
+fn dense_window<'a>(t: &'a Tensor) -> Result<Window<'a>, String> {
+    let n = t.try_numel()?;
+    let w = Window {
+        buf: &t.buffer,
+        byte_off: t.byte_offset(),
+        rows: 1,
+        width: n,
+        ld: n,
+        off: 0,
+    };
+    w.check("adamw_step")?;
+    Ok(w)
+}
+
+fn check_hyper(what: &str, hyper: &AdamWHyper) -> Result<(), String> {
+    let AdamWHyper {
+        lr,
+        beta1,
+        beta2,
+        eps,
+        grad_scale,
+    } = *hyper;
+    if !(lr.is_finite() && lr >= 0.0) {
+        return Err(format!("{what}: lr {lr} must be finite and >= 0"));
+    }
+    // torch would carry a non-finite norm's coefficient into every
+    // parameter; refused here instead, before anything moves.
+    if !(grad_scale.is_finite() && grad_scale >= 0.0) {
+        return Err(format!("{what}: grad_scale {grad_scale} must be finite and >= 0"));
+    }
+    for (name, b) in [("beta1", beta1), ("beta2", beta2)] {
+        if !(0.0..1.0).contains(&b) {
+            return Err(format!("{what}: {name} {b} must lie in [0, 1)"));
+        }
+    }
+    if !(eps.is_finite() && eps > 0.0) {
+        return Err(format!("{what}: eps {eps} must be finite and > 0"));
+    }
+    Ok(())
+}
+
+/// Host-side scalars, in the order `kernels/qwen35_adamw.metal` reads them.
+///
+/// `step` is torch's count after it has incremented (1-based). The formation
+/// is f64, then each value is stored as f32. `weight_decay` is one tensor's.
+fn adamw_scalars(hyper: &AdamWHyper, step: u64, weight_decay: f64) -> [f32; 8] {
+    let AdamWHyper {
+        lr,
+        beta1,
+        beta2,
+        eps,
+        grad_scale,
+    } = *hyper;
+    let t = step as f64;
+    let bc1 = 1.0 - beta1.powf(t);
+    let bc2 = 1.0 - beta2.powf(t);
+    let step_size = lr / bc1;
+    let bc2_sqrt = bc2.powf(0.5);
+    [
+        (1.0 - lr * weight_decay) as f32,
+        (1.0 - beta1) as f32,
+        beta2 as f32,
+        (1.0 - beta2) as f32,
+        step_size as f32,
+        bc2_sqrt as f32,
+        eps as f32,
+        grad_scale as f32,
+    ]
+}
+
+fn dispatch_adamw(rt: &GpuRuntime, w: &[Window<'_>; 4], scalars: &[f32; 8]) -> Result<(), String> {
+    let bytes: Vec<u8> = scalars.iter().flat_map(|x| x.to_le_bytes()).collect();
+    let [wp, wg, wm, wv] = w;
+    let p = rt.pipeline("qwen35_adamw_f32")?;
+    dispatch_2d(rt, &p, wp.width, wp.rows, |bnd| {
+        set_gpu_buf_offset(bnd, wp.buf, wp.byte_off, 0);
+        set_gpu_buf_offset(bnd, wg.buf, wg.byte_off, 1);
+        set_gpu_buf_offset(bnd, wm.buf, wm.byte_off, 2);
+        set_gpu_buf_offset(bnd, wv.buf, wv.byte_off, 3);
+        bnd.bind_bytes(&bytes, 4);
+        set_u32(bnd, wp.rows as u32, 5);
+        set_u32(bnd, wp.width as u32, 6);
+        set_u32(bnd, wp.ld as u32, 7);
+        set_u32(bnd, wp.off as u32, 8);
+    })
+}
+
+fn on_runtime(rt: &GpuRuntime, t: &Tensor) -> bool {
+    std::ptr::eq(Arc::as_ptr(t.runtime()), rt)
+}
+
+/// One AdamW step on device-resident f32 tensors, in place.
+///
+/// `param`, `grad`, `m` and `v` must share `rt`, the same shape and
+/// [`DType::F32`]. Storage may be a view: [`Tensor::byte_offset`] is the
+/// start of the window, and the elements are contiguous in that shape. `m`
+/// and `v` are torch's `exp_avg` and `exp_avg_sq`; they start at zero on the
+/// first step. `step` is the 1-based count torch stores after incrementing.
+/// Step 0 is refused: it is what `u64::MAX + 1` wraps to, and it zeroes the
+/// bias correction. The caller increments with `checked_add` and refuses
+/// `u64::MAX` before calling, which is what [`Qwen35Model::adamw_step`] does
+/// for its own counter.
+///
+/// The update is encoded and not waited on. Call [`GpuRuntime::synchronize`]
+/// before reading the tensors on the host. A later kernel on `rt` is ordered
+/// after this one by the runtime's encoder barrier.
+///
+/// # Passing a gradient that already lives on the device
+///
+/// `grad` is not copied. A buffer tessl allocated (`cross_entropy`'s `dW`,
+/// `rt.alloc_tensor_f32`, or [`Tensor::try_view`] into one of those) is passed
+/// as `&grad`. A foreign `MTLBuffer` on the same device is wrapped once with
+/// [`Tensor::from_mtl_buffer`] and then passed the same way. `param`, `m` and
+/// `v` are written through the pointers they already hold.
+#[allow(clippy::too_many_arguments)]
+pub fn adamw_step(
+    rt: &GpuRuntime,
+    param: &mut Tensor,
+    grad: &Tensor,
+    m: &mut Tensor,
+    v: &mut Tensor,
+    hyper: &AdamWHyper,
+    step: u64,
+    weight_decay: f32,
+) -> Result<(), String> {
+    const WHAT: &str = "adamw_step";
+    check_hyper(WHAT, hyper)?;
+    if step == 0 {
+        return Err(format!(
+            "{WHAT}: step 0 is refused; a count of u64::MAX cannot advance, and 0 zeroes the bias correction"
+        ));
+    }
+    if !(weight_decay.is_finite() && weight_decay >= 0.0) {
+        return Err(format!("{WHAT}: weight decay {weight_decay} must be finite and >= 0"));
+    }
+    let tensors = [
+        ("param", param as &Tensor),
+        ("grad", grad),
+        ("m", m as &Tensor),
+        ("v", v as &Tensor),
+    ];
+    for (name, t) in tensors {
+        t.validate().map_err(|e| format!("{WHAT}: {name}: {e}"))?;
+        if t.dtype != DType::F32 {
+            return Err(format!("{WHAT}: {name} is {:?}, not f32", t.dtype));
+        }
+        if !on_runtime(rt, t) {
+            return Err(format!("{WHAT}: {name} belongs to a different runtime"));
+        }
+    }
+    if param.shape() != grad.shape() || param.shape() != m.shape() || param.shape() != v.shape() {
+        return Err(format!(
+            "{WHAT}: shapes differ: param {:?}, grad {:?}, m {:?}, v {:?}",
+            param.shape(),
+            grad.shape(),
+            m.shape(),
+            v.shape()
+        ));
+    }
+    let names = ["param", "grad", "m", "v"];
+    let views = [param as &Tensor, grad, m as &Tensor, v as &Tensor];
+    for i in 0..4 {
+        for j in (i + 1)..4 {
+            if views[i].overlaps(views[j]) {
+                return Err(format!("{WHAT}: {} overlaps {}", names[i], names[j]));
+            }
+        }
+    }
+    if param.try_numel()? == 0 {
+        return Ok(());
+    }
+    let windows = [
+        dense_window(param)?,
+        dense_window(grad)?,
+        dense_window(m)?,
+        dense_window(v)?,
+    ];
+    dispatch_adamw(rt, &windows, &adamw_scalars(hyper, step, f64::from(weight_decay)))
+}
+
 impl Qwen35Model {
     /// One AdamW step on every parameter from `grads` (this model's
     /// [`Qwen35Model::train_step`]), with `weight_decay[i]` for
@@ -188,29 +370,7 @@ impl Qwen35Model {
     ) -> Result<(), String> {
         const WHAT: &str = "Qwen35Model::adamw_step";
         self.require_f32(WHAT)?;
-        let AdamWHyper {
-            lr,
-            beta1,
-            beta2,
-            eps,
-            grad_scale,
-        } = *hyper;
-        if !(lr.is_finite() && lr >= 0.0) {
-            return Err(format!("{WHAT}: lr {lr} must be finite and >= 0"));
-        }
-        // torch would carry a non-finite norm's coefficient into every
-        // parameter; refused here instead, before anything moves.
-        if !(grad_scale.is_finite() && grad_scale >= 0.0) {
-            return Err(format!("{WHAT}: grad_scale {grad_scale} must be finite and >= 0"));
-        }
-        for (name, b) in [("beta1", beta1), ("beta2", beta2)] {
-            if !(0.0..1.0).contains(&b) {
-                return Err(format!("{WHAT}: {name} {b} must lie in [0, 1)"));
-            }
-        }
-        if !(eps.is_finite() && eps > 0.0) {
-            return Err(format!("{WHAT}: eps {eps} must be finite and > 0"));
-        }
+        check_hyper(WHAT, hyper)?;
         let ps = slots(self, Some(grads)).map_err(|e| format!("{WHAT}: {e}"))?;
         let ms = slots(self, Some(&state.m)).map_err(|e| format!("{WHAT}: moments: {e}"))?;
         let vs = slots(self, Some(&state.v)).map_err(|e| format!("{WHAT}: moments: {e}"))?;
@@ -260,36 +420,11 @@ impl Qwen35Model {
             .step
             .checked_add(1)
             .ok_or_else(|| format!("{WHAT}: step count {} + 1 does not fit in u64", state.step))?;
-        let t = next as f64;
-        let bc1 = 1.0 - beta1.powf(t);
-        let bc2 = 1.0 - beta2.powf(t);
-        let step_size = lr / bc1;
-        let bc2_sqrt = bc2.powf(0.5);
-        let p = self.rt.pipeline("qwen35_adamw_f32")?;
+        // Packed projections are a strided window (`ld`, `off`), not a
+        // contiguous `Tensor`, so this loop calls the same encoder as
+        // [`adamw_step`] rather than copying each parameter out and back.
         for (w, wd) in &plan {
-            let scalars = [
-                (1.0 - lr * wd) as f32,
-                (1.0 - beta1) as f32,
-                beta2 as f32,
-                (1.0 - beta2) as f32,
-                step_size as f32,
-                bc2_sqrt as f32,
-                eps as f32,
-                grad_scale as f32,
-            ];
-            let bytes: Vec<u8> = scalars.iter().flat_map(|x| x.to_le_bytes()).collect();
-            let [wp, wg, wm, wv] = w;
-            dispatch_2d(&self.rt, &p, wp.width, wp.rows, |bnd| {
-                set_gpu_buf_offset(bnd, wp.buf, wp.byte_off, 0);
-                set_gpu_buf_offset(bnd, wg.buf, wg.byte_off, 1);
-                set_gpu_buf_offset(bnd, wm.buf, wm.byte_off, 2);
-                set_gpu_buf_offset(bnd, wv.buf, wv.byte_off, 3);
-                bnd.bind_bytes(&bytes, 4);
-                set_u32(bnd, wp.rows as u32, 5);
-                set_u32(bnd, wp.width as u32, 6);
-                set_u32(bnd, wp.ld as u32, 7);
-                set_u32(bnd, wp.off as u32, 8);
-            })?;
+            dispatch_adamw(&self.rt, w, &adamw_scalars(hyper, next, *wd))?;
         }
         self.rt.synchronize()?;
         state.step = next;

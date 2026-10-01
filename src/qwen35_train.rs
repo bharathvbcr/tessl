@@ -37,16 +37,17 @@ use std::sync::Arc;
 
 use crate::attn_train::{attn_train_backward, attn_train_forward, AttnTrainDims, AttnTrainGrads, AttnTrainWorkspace};
 use crate::cross_entropy::{cross_entropy_rows, CeGrads, CeHidden, CeWorkspace, Reduction};
-use crate::dispatch::{dispatch_1d, set_gpu_buf_offset, set_u32};
+use crate::dispatch::{dispatch_1d, dispatch_2d, set_gpu_buf, set_gpu_buf_offset, set_u32};
 use crate::gdn_train::{
     gdn_train_backward, gdn_train_forward, GdnTrainDims, GdnTrainGrads, GdnTrainInputs, GdnTrainWorkspace, GDN_TRAIN_DK,
 };
 use crate::gemm::GemmOperands;
 use crate::qwen35::{self, AttnShape, AttnTargets, Cols, GdnParams, OutCols, StateIn};
 use crate::qwen35_bwd::{
-    attn_gate_bwd, attn_qk_norm_rope_bwd, attn_qk_norm_rope_bwd_part_len, conv1d_silu_bwd, conv1d_silu_bwd_part_len,
-    copy_cols, embed_rows_bwd, gated_rms_norm_bwd, gated_rms_norm_bwd_part_len, gdn_gates_bwd, gdn_gates_bwd_part_len,
-    rms_norm_bwd, rms_norm_bwd_part_len, scatter_add_rows, swiglu_bwd, AttnQkvGrads, EmbedBwdWorkspace,
+    attn_gate_bwd, attn_qk_norm_rope_bwd, attn_qk_norm_rope_bwd_part_len, check_scatter_rows, conv1d_silu_bwd,
+    conv1d_silu_bwd_part_len, copy_cols, embed_rows_bwd, gated_rms_norm_bwd, gated_rms_norm_bwd_part_len,
+    gdn_gates_bwd, gdn_gates_bwd_part_len, rms_norm_bwd, rms_norm_bwd_part_len, scatter_add_rows, swiglu_bwd,
+    AttnQkvGrads, EmbedBwdWorkspace,
 };
 use crate::qwen35_model::{AttnWeights, GdnWeights, Layer, Mixer, Precision, Qwen35Model};
 use crate::runtime::GpuRuntime;
@@ -261,6 +262,82 @@ pub enum Supervise<'a> {
     },
 }
 
+/// A step between its forward and its backward
+/// ([`Qwen35Model::train_forward`], [`Qwen35Model::train_backward_into`]):
+/// the loss, the loss's gradient at the final norm's output, and what the
+/// backward rebuilds each layer from. It holds each layer's input
+/// (`T x hidden` f32 per layer) until the backward consumes it.
+pub struct PendingStep {
+    ids: Vec<u32>,
+    t: u32,
+    operands: GemmOperands,
+    inputs: Vec<Tensor>,
+    resid: Tensor,
+    xf: Tensor,
+    dxf: Tensor,
+    d_embed: Tensor,
+    loss: f64,
+    /// The model's embedding buffer: which model made this step.
+    embed: GpuBuffer,
+}
+
+impl PendingStep {
+    /// The loss the forward computed (as [`Supervise`] defines it).
+    pub fn loss(&self) -> f64 {
+        self.loss
+    }
+
+    /// Tokens in the step's sequence.
+    pub fn len(&self) -> usize {
+        self.ids.len()
+    }
+
+    /// Whether the sequence is empty (never: a step needs a token).
+    pub fn is_empty(&self) -> bool {
+        self.ids.is_empty()
+    }
+
+    /// Rows `positions` of the final norm's output (transformers'
+    /// `last_hidden_state`) into `out`, dense f32 `[positions.len(), hidden]`,
+    /// for a loss outside tessl; its gradient comes back through
+    /// [`Qwen35Model::train_backward_into`]. Positions may repeat. Waits for
+    /// the GPU, so `out` is readable when this returns.
+    pub fn hidden(&self, positions: &[u32], out: &Tensor) -> Result<(), String> {
+        const WHAT: &str = "PendingStep::hidden";
+        let (n, h) = (positions.len(), self.xf.shape()[1]);
+        if out.shape() != [n, h] || out.dtype != DType::F32 {
+            return Err(format!(
+                "{WHAT}: out must be f32 [{n}, {h}], got {:?} {:?}",
+                out.dtype,
+                out.shape()
+            ));
+        }
+        if let Some(&bad) = positions.iter().find(|&&p| p >= self.t) {
+            return Err(format!("{WHAT}: position {bad} >= {} tokens", self.t));
+        }
+        if out.overlaps(&self.xf) {
+            return Err(format!("{WHAT}: out overlaps the step's own storage"));
+        }
+        if n == 0 {
+            return Ok(());
+        }
+        let rt = self.xf.runtime();
+        let pos = rt.alloc_buffer(std::mem::size_of_val(positions))?;
+        pos.write_u32(positions);
+        let p = rt.pipeline("ce_gather_rows_f32")?;
+        dispatch_2d(rt, &p, h, n, |bnd| {
+            set_gpu_buf_offset(bnd, &self.xf.buffer, self.xf.byte_offset(), 0);
+            set_gpu_buf(bnd, &pos, 1);
+            set_gpu_buf_offset(bnd, &out.buffer, out.byte_offset(), 2);
+            set_u32(bnd, n as u32, 3);
+            set_u32(bnd, h as u32, 4);
+            set_u32(bnd, h as u32, 5);
+            set_u32(bnd, 0, 6);
+        })?;
+        rt.synchronize()
+    }
+}
+
 /// What [`Qwen35Model::train_step`] returns.
 pub struct TrainStep {
     /// Mean cross-entropy over the `T - 1` predicted positions.
@@ -433,6 +510,21 @@ impl Qwen35Model {
         sup: Supervise<'_>,
         bank: Option<(&Qwen35Grads, bool)>,
     ) -> Result<(f64, Option<Qwen35Grads>), String> {
+        let p = self.train_forward(ids, operands, sup)?;
+        let loss = p.loss;
+        Ok((loss, self.backward(p, None, bank)?))
+    }
+
+    /// A step's forward and its loss (`sup`), kept for
+    /// [`Self::train_backward_into`]. In between, [`PendingStep::hidden`]
+    /// gives the final norm's output at chosen positions to a loss outside
+    /// tessl, whose gradient the backward adds to the step's own.
+    pub fn train_forward(
+        &self,
+        ids: &[u32],
+        operands: GemmOperands,
+        sup: Supervise<'_>,
+    ) -> Result<PendingStep, String> {
         const WHAT: &str = "Qwen35Model::train_step";
         let (rt, cfg) = (&self.rt, &self.cfg);
         if self.precision != Precision::F32 {
@@ -575,6 +667,82 @@ impl Qwen35Model {
                 out.loss
             }
         };
+        Ok(PendingStep {
+            ids: ids.to_vec(),
+            t,
+            operands,
+            inputs,
+            resid,
+            xf,
+            dxf,
+            d_embed,
+            loss,
+            embed: self.embed.buffer.clone(),
+        })
+    }
+
+    /// The backward of [`Self::train_forward`]'s `p` into `bank` (over it, or
+    /// added to it when `accumulate`, as [`Self::train_step_into`]). `dh`
+    /// adds the gradient of a loss outside tessl at the final norm's output:
+    /// rows `positions` (distinct) of a dense f32 `[positions.len(), hidden]`
+    /// tensor, such as torch's for what [`PendingStep::hidden`] gave it. The
+    /// step's own loss gradient is already in `p` ([`Supervise::Rows`] with
+    /// no positions has none). Everything is checked before anything runs.
+    pub fn train_backward_into(
+        &self,
+        p: PendingStep,
+        dh: Option<(&[u32], &Tensor)>,
+        bank: &Qwen35Grads,
+        accumulate: bool,
+    ) -> Result<(), String> {
+        const WHAT: &str = "Qwen35Model::train_backward_into";
+        self.check_pending(WHAT, &p, dh)?;
+        self.check_bank(WHAT, bank)?;
+        self.backward(p, dh, Some((bank, accumulate))).map(|_| ())
+    }
+
+    /// `p` is this model's, and `dh` fits it.
+    pub(crate) fn check_pending(
+        &self,
+        what: &str,
+        p: &PendingStep,
+        dh: Option<(&[u32], &Tensor)>,
+    ) -> Result<(), String> {
+        if !p.embed.aliases(&self.embed.buffer) || p.inputs.len() != self.layers.len() {
+            return Err(format!("{what}: the pending step is another model's"));
+        }
+        if let Some((pos, g)) = dh {
+            check_scatter_rows(what, g, pos, p.t as usize, self.cfg.hidden as usize)?;
+            if g.overlaps(&p.dxf) {
+                return Err(format!("{what}: dh overlaps the step's own storage"));
+            }
+        }
+        Ok(())
+    }
+
+    /// The backward of `p`, with `dh` added at the final norm's output
+    /// first: into fresh gradients (returned) or into `bank`.
+    fn backward(
+        &self,
+        p: PendingStep,
+        dh: Option<(&[u32], &Tensor)>,
+        bank: Option<(&Qwen35Grads, bool)>,
+    ) -> Result<Option<Qwen35Grads>, String> {
+        let (rt, cfg) = (&self.rt, &self.cfg);
+        let PendingStep {
+            ids,
+            t,
+            operands,
+            mut inputs,
+            resid,
+            dxf,
+            d_embed,
+            ..
+        } = p;
+        let h = cfg.hidden as usize;
+        if let Some((pos, g)) = dh {
+            scatter_add_rows(rt, g, pos, &dxf)?;
+        }
 
         // ---- backward -------------------------------------------------------
         let mut sc = self.scratch(t)?;
@@ -614,7 +782,7 @@ impl Qwen35Model {
         let emb_ws = EmbedBwdWorkspace::new(rt, t)?;
         embed_rows_bwd(
             rt,
-            ids,
+            &ids,
             &sc.dresid.buffer,
             &d_embed.buffer,
             cfg.vocab,
@@ -624,17 +792,14 @@ impl Qwen35Model {
         if let Some((b, add)) = bank {
             deliver(rt, &[tensor_part(&d_embed)], &[tensor_part(&b.embed)], add)?;
             rt.synchronize()?;
-            return Ok((loss, None));
+            return Ok(None);
         }
         rt.synchronize()?;
-        Ok((
-            loss,
-            Some(Qwen35Grads {
-                embed: d_embed,
-                final_norm,
-                layers,
-            }),
-        ))
+        Ok(Some(Qwen35Grads {
+            embed: d_embed,
+            final_norm,
+            layers,
+        }))
     }
 
     fn scratch(&self, t: u32) -> Result<Scratch, String> {

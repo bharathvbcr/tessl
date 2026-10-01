@@ -12,6 +12,7 @@
 //! checkpoint and `make_train_fixture.py 2b`).
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use tessl::gemm::GemmOperands;
 use tessl::npy::read_npy;
@@ -133,9 +134,15 @@ fn rel(got: &[f64], want: &[f64]) -> f64 {
 }
 
 fn load(dir: &Path, prefix: &str, cfg: Qwen35Config, precision: Precision) -> Qwen35Model {
+    load_rt(dir, prefix, cfg, precision).1
+}
+
+/// [`load`], keeping the runtime for tensors the model reads or writes.
+fn load_rt(dir: &Path, prefix: &str, cfg: Qwen35Config, precision: Precision) -> (Arc<GpuRuntime>, Qwen35Model) {
     let rt = GpuRuntime::new().unwrap();
     let st = SafeTensors::open(&dir.join("model.safetensors")).unwrap();
-    Qwen35Model::load(&rt, &st, prefix, cfg, precision).unwrap()
+    let model = Qwen35Model::load(&rt, &st, prefix, cfg, precision).unwrap();
+    (rt, model)
 }
 
 fn tiny_config() -> Qwen35Config {
@@ -526,6 +533,112 @@ fn supervised_rows_are_the_causal_loss_restricted() {
             "{name}: a step that scores nothing has a gradient"
         );
     }
+}
+
+/// The tied embedding `[vocab, hidden]` read back.
+fn embed_weight(rt: &Arc<GpuRuntime>, model: &Qwen35Model) -> Vec<f64> {
+    let table = model.parameter_table().unwrap();
+    let ts: Vec<Tensor> = table
+        .iter()
+        .map(|p| rt.alloc_tensor_f32(&p.storage_shape()).unwrap())
+        .collect();
+    model.read_parameters(&ts).unwrap();
+    let i = table.iter().position(|p| p.name == "embed_tokens.weight").unwrap();
+    ts[i].read_f32().unwrap().iter().map(|&x| f64::from(x)).collect()
+}
+
+/// A loss outside tessl: `PendingStep::hidden` gives it the final norm's
+/// output, and `train_backward_into` takes its gradient there. The outside
+/// loss here is the cross-entropy of the tied head on the host, in f64, so
+/// it must be what `Supervise::Rows` computes inside tessl: the same loss
+/// from the rows `hidden` returned (so they are the right rows), and, with
+/// the host's `dh` fed back on a step that scores nothing plus the host's
+/// head gradient `dlogitsᵀ h` on the embedding, the same gradients. Bounds
+/// set before the first run: 1e-5 of the loss and of each parameter's peak.
+/// A pending step is refused by another model, and a misshapen or repeating
+/// `dh` is refused before anything runs.
+#[test]
+fn a_loss_outside_tessl_flows_back_through_the_hidden_states() {
+    let dir = fixture();
+    let cfg = tiny_config();
+    let (rt, model) = load_rt(&dir, "model.", cfg.clone(), Precision::F32);
+    let mm = GemmOperands::ExactF32;
+    let ids = ids(&dir);
+    let (h, vocab) = (cfg.hidden as usize, cfg.vocab as usize);
+    let sel = next_token(&ids, &[1, 4, (ids.len() - 2) as u32], 0.25);
+    let (want_loss, want) = into_fresh(&model, &ids, rows_of(&sel));
+
+    let p = model
+        .train_forward(&ids, mm, rows_of(&next_token(&ids, &[], 1.0)))
+        .unwrap();
+    assert_eq!(p.loss(), 0.0);
+    let rows = rt.alloc_tensor_f32(&[sel.0.len(), h]).unwrap();
+    p.hidden(&sel.0, &rows).unwrap();
+    let hs: Vec<f64> = rows.read_f32().unwrap().iter().map(|&x| f64::from(x)).collect();
+    let w = embed_weight(&rt, &model);
+
+    // Host cross-entropy of the tied head over the selected rows.
+    let (mut loss, mut dh, mut dw_head) = (0.0f64, vec![0.0f64; sel.0.len() * h], vec![0.0f64; vocab * h]);
+    for (i, &target) in sel.1.iter().enumerate() {
+        let hi = &hs[i * h..(i + 1) * h];
+        let logits: Vec<f64> = (0..vocab).map(|v| (0..h).map(|c| hi[c] * w[v * h + c]).sum()).collect();
+        let m = logits.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+        let z: f64 = logits.iter().map(|l| (l - m).exp()).sum();
+        loss += m + z.ln() - logits[target as usize];
+        for v in 0..vocab {
+            let d = f64::from(sel.2) * ((logits[v] - m).exp() / z - f64::from(u8::from(v == target as usize)));
+            for c in 0..h {
+                dh[i * h + c] += d * w[v * h + c];
+                dw_head[v * h + c] += d * hi[c];
+            }
+        }
+    }
+    assert!(
+        (loss - want_loss).abs() <= 1e-5 * want_loss.abs(),
+        "host {loss} vs tessl {want_loss}"
+    );
+
+    let dh_t = rt.alloc_tensor_f32(&[sel.0.len(), h]).unwrap();
+    dh_t.buffer.write_f32(&dh.iter().map(|&x| x as f32).collect::<Vec<_>>());
+    let bank = Qwen35Grads::zeros_like(&model).unwrap();
+    model
+        .train_backward_into(p, Some((&sel.0, &dh_t)), &bank, false)
+        .unwrap();
+    let got = by_name(&cfg, &bank, "");
+    for ((name, g), (_, wv)) in got.iter().zip(by_name(&cfg, &want, "")) {
+        let g: Vec<f64> = if name == "embed_tokens.weight" {
+            g.iter().zip(&dw_head).map(|(a, b)| a + b).collect()
+        } else {
+            g.clone()
+        };
+        let r = rel(&g, &wv);
+        assert!(r <= 1e-5, "{name}: {r:.3e}");
+    }
+
+    // Refusals, each before the step runs.
+    let other = load(&dir, "model.", cfg.clone(), Precision::F32);
+    let e = |p, dh: Option<(&[u32], &Tensor)>, needle: &str| {
+        let m = model
+            .train_backward_into(p, dh, &bank, false)
+            .err()
+            .unwrap_or_else(|| panic!("{needle}: accepted"));
+        assert!(m.contains(needle), "{m:?} lacks {needle:?}");
+    };
+    let fresh = || model.train_forward(&ids, mm, Supervise::Causal).unwrap();
+    e(
+        other.train_forward(&ids, mm, Supervise::Causal).unwrap(),
+        None,
+        "another model's",
+    );
+    e(fresh(), Some((&[1, 1, 2], &dh_t)), "position 1 appears twice");
+    e(fresh(), Some((&[1, 2], &dh_t)), "src must be f32 [2, ");
+    let bad = rt.alloc_tensor_f32(&[3, h]).unwrap();
+    let t = ids.len() as u32;
+    e(fresh(), Some((&[1, 2, t], &bad)), &format!("position {t} >= {t} rows"));
+    let m = fresh()
+        .hidden(&[t], &rt.alloc_tensor_f32(&[1, h]).unwrap())
+        .unwrap_err();
+    assert!(m.contains(&format!("position {t} >= {t} tokens")), "{m}");
 }
 
 /// `Supervise::Rows` refuses what it cannot score, before anything runs.

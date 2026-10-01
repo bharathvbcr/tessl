@@ -806,6 +806,30 @@ pub fn gdn_gates_bwd(
     col_sum_blocks(rt, part, nb as usize * heads as usize, ddt_bias, nb, heads)
 }
 
+/// What [`scatter_add_rows`] checks of `src` and `pos` for a `[rows, width]`
+/// destination: `src` is dense f32 `[pos.len(), width]`, and `pos` is in
+/// range with no repeats. A caller that must refuse before doing anything
+/// else calls it first.
+pub fn check_scatter_rows(what: &str, src: &Tensor, pos: &[u32], rows: usize, width: usize) -> Result<(), String> {
+    let (n, ss) = (pos.len(), src.shape());
+    if ss != [n, width] || src.dtype != DType::F32 {
+        return Err(format!(
+            "{what}: src must be f32 [{n}, {width}], got {:?} {ss:?}",
+            src.dtype
+        ));
+    }
+    let mut seen = vec![false; rows];
+    for &p in pos {
+        let slot = seen
+            .get_mut(p as usize)
+            .ok_or_else(|| format!("{what}: position {p} >= {rows} rows"))?;
+        if std::mem::replace(slot, true) {
+            return Err(format!("{what}: position {p} appears twice"));
+        }
+    }
+    Ok(())
+}
+
 /// `dst[pos[i], :] += src[i, :]`: the dense f32 `[pos.len(), width]` rows of
 /// `src` added into rows `pos` of the dense f32 `[rows, width]` `dst` (the
 /// gradient of chosen positions back into the whole sequence's). `pos` must
@@ -813,31 +837,18 @@ pub fn gdn_gates_bwd(
 /// each element gets one f32 add. `src` and `dst` must not overlap.
 pub fn scatter_add_rows(rt: &Arc<GpuRuntime>, src: &Tensor, pos: &[u32], dst: &Tensor) -> Result<(), String> {
     const WHAT: &str = "qwen35_bwd::scatter_add_rows";
-    let n = pos.len();
-    let (ds, ss) = (dst.shape(), src.shape());
-    if ds.len() != 2 || ss != [n, ds[1]] {
+    let ds = dst.shape();
+    if ds.len() != 2 || dst.dtype != DType::F32 {
         return Err(format!(
-            "{WHAT}: src {ss:?} must be [{n}, width] for dst {ds:?} ([rows, width])"
+            "{WHAT}: dst must be f32 [rows, width], got {:?} {ds:?}",
+            dst.dtype
         ));
     }
-    for (name, t) in [("src", src), ("dst", dst)] {
-        if t.dtype != DType::F32 {
-            return Err(format!("{WHAT}: {name} must be f32, got {:?}", t.dtype));
-        }
-    }
+    check_scatter_rows(WHAT, src, pos, ds[0], ds[1])?;
     if src.overlaps(dst) {
         return Err(format!("{WHAT}: src and dst overlap"));
     }
-    let (rows, width) = (ds[0], ds[1]);
-    let mut seen = vec![false; rows];
-    for &p in pos {
-        let slot = seen
-            .get_mut(p as usize)
-            .ok_or_else(|| format!("{WHAT}: position {p} >= {rows} rows"))?;
-        if std::mem::replace(slot, true) {
-            return Err(format!("{WHAT}: position {p} appears twice"));
-        }
-    }
+    let (n, width) = (pos.len(), ds[1]);
     if n == 0 || width == 0 {
         return Ok(());
     }

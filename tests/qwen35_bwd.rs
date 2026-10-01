@@ -1502,7 +1502,7 @@ fn scatter_add_rows_adds_each_row_at_its_position() {
             assert!(m.contains(needle), "{m:?} lacks {needle:?}");
         }
         let m = scatter_add_rows(rt, &src, &pos[..2], &dst).unwrap_err();
-        assert!(m.contains("must be [2, width]"), "{m}");
+        assert!(m.contains("src must be f32 [2, 37]"), "{m}");
         rt.synchronize().unwrap();
         assert_eq!(bits(&dst.read_f32().unwrap()), bits(&want), "a refusal wrote");
     });

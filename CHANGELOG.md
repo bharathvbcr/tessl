@@ -186,7 +186,14 @@ All notable changes to `tessl` are recorded here. The format follows
   `qwen35_bwd::scatter_add_rows` (kernel `qwen35_scatter_add_rows_f32`).
   Checked against the causal step (every row at `1 / (T - 1)`), additivity
   over disjoint sets, and causality (a position on the sequence cut just
-  after it).
+  after it). A step also splits in two for a loss outside tessl:
+  `train_forward(ids, operands, sup)` returns a `PendingStep` (its loss, and
+  `hidden(positions, out)`: rows of the final norm's output, transformers'
+  `last_hidden_state`), and `train_backward_into(pending, dh, bank,
+  accumulate)` adds that loss's gradient at those rows to the step's own
+  before the backward. Checked with the tied head's cross-entropy computed
+  on the host from `hidden`'s rows: the same loss and, fed back as `dh`, the
+  same gradients as `Supervise::Rows` inside tessl.
 - **`Qwen35Model::train_step(ids, operands)` and
   `cross_entropy_rows(.., reduction, operands, ws, grads)`** take a
   `gemm::GemmOperands`: `ExactF32` (the previous behaviour) or `Bf16`, bf16

@@ -297,6 +297,10 @@ All notable changes to `tessl` are recorded here. The format follows
 
 ### Fixed
 
+- `cross_entropy_rows` adds every vocabulary chunk after the first into
+  `dh`'s own view. Those chunks' partial `dh` was added at the start of
+  `dh`'s buffer, so in a `dh` view that does not begin at byte 0 they landed
+  shifted back by the view's offset, over whatever precedes it.
 - `Qwen35Model::adamw_step` at a step count of `u64::MAX` returns an error
   and leaves the count there. Without overflow checks (release builds)
   `step + 1` wrapped to 0, which zeroes the bias correction and sends the

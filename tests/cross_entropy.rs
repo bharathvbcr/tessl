@@ -49,6 +49,9 @@ struct Case {
     /// so a view read from the buffer's base instead of its offset shows.
     h_base: usize,
     w_base: usize,
+    /// Sentinel elements before `dh`. Later vocabulary chunks must add into
+    /// this view, not into element 0 of the underlying buffer.
+    dh_base: usize,
     /// The four GEMMs' operands. Under `Bf16` the reference is formed from
     /// the bf16-rounded hidden rows and weight, which the logit walk reads
     /// exactly; `dh` and `dW` also round the softmax gradient to bf16.
@@ -75,6 +78,7 @@ impl Case {
             plant: None,
             h_base: 0,
             w_base: 0,
+            dh_base: 0,
             operands: GemmOperands::ExactF32,
         }
     }
@@ -197,9 +201,17 @@ fn assert_loss(label: &str, got: &CeOutput, want: &Reference) {
 }
 
 fn sentinel_tensor(rt: &Arc<GpuRuntime>, shape: &[usize]) -> Tensor {
-    let t = rt.alloc_tensor_f32(shape).expect("alloc");
-    t.write_f32(&vec![SENTINEL; shape.iter().product()]).expect("write");
-    t
+    sentinel_tensor_at(rt, shape, 0)
+}
+
+/// `shape` sitting `base` f32 elements into a buffer filled with [`SENTINEL`].
+/// `base * 4` is the view's byte offset. 16 is the smallest base that is also
+/// 64-byte aligned, which the cooperative GEMM path requires.
+fn sentinel_tensor_at(rt: &Arc<GpuRuntime>, shape: &[usize], base: usize) -> Tensor {
+    let n: usize = shape.iter().product();
+    let storage = rt.alloc_buffer((base + n) * 4).expect("alloc");
+    storage.write_f32(&vec![SENTINEL; base + n]);
+    Tensor::from_buffer(rt, storage, shape, DType::F32, base * 4).expect("dh view")
 }
 
 /// Run `c` with and without gradients and check everything against the
@@ -260,7 +272,7 @@ fn check(rt: &Arc<GpuRuntime>, c: &Case) -> f64 {
         .unwrap_or_else(|e| panic!("{label}: {e}"));
     assert_loss(&format!("{label} (forward only)"), &fwd, &want);
 
-    let dh = sentinel_tensor(rt, &[n, c.hidden]);
+    let dh = sentinel_tensor_at(rt, &[n, c.hidden], c.dh_base);
     let dw = sentinel_tensor(rt, &[c.vocab, c.hidden]);
     let out = cross_entropy_rows(
         rt,
@@ -285,6 +297,13 @@ fn check(rt: &Arc<GpuRuntime>, c: &Case) -> f64 {
         &want.dh,
         grad_bound,
     );
+    if c.dh_base > 0 {
+        let raw = dh.buffer.read_f32();
+        assert!(
+            raw[..c.dh_base].iter().all(|&x| x == SENTINEL),
+            "{label}: a later vocabulary chunk wrote dh at buffer offset 0"
+        );
+    }
     assert_grad(
         &format!("{label} dW"),
         &dw.read_f32().expect("read"),
@@ -382,6 +401,16 @@ fn matches_the_f64_reference_across_the_chunk_walk() {
                 h_base: 5,
                 w_base: 4,
                 ..Case::small(9)
+            },
+        );
+        // dh itself starts inside its buffer. The first vocabulary chunk
+        // writes through the tensor view; every later chunk must add there
+        // too. 16 f32s is 64 bytes, the cooperative GEMM alignment.
+        check(
+            rt,
+            &Case {
+                dh_base: 16,
+                ..Case::small(10)
             },
         );
     });

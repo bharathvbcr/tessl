@@ -48,7 +48,7 @@ use std::sync::Arc;
 use objc2::runtime::ProtocolObject;
 use objc2_metal::MTLComputePipelineState;
 
-use crate::dispatch::{dispatch_2d, set_f32, set_gpu_buf, set_u32, Binder};
+use crate::dispatch::{dispatch_2d, set_f32, set_gpu_buf, set_gpu_buf_offset, set_u32, Binder};
 use crate::gemm::{gemm, gemm_epilogue, Epilogue, GemmBackend};
 use crate::nn::{dispatch_tg_1d, reduce_tptg, require, require_disjoint_writes, require_runtime, validate_rms_scalars};
 use crate::runtime::{mtl_size, GpuRuntime};
@@ -1884,18 +1884,35 @@ pub fn swiglu(
 ///
 /// `y` must be a different buffer from `resid`.
 pub fn residual_add(rt: &Arc<GpuRuntime>, y: Cols<'_>, resid: Cols<'_>, rows: u32, width: u32) -> Result<(), String> {
+    residual_add_at(rt, y, 0, resid, 0, rows, width)
+}
+
+/// [`residual_add`] with each window's element 0 living `*_byte` bytes into its buffer.
+///
+/// A dense tensor view stores that base as [`crate::tensor::Tensor::byte_offset`],
+/// which [`Cols::dense`] does not carry. Binding the Metal buffer there keeps
+/// `off` as a column offset inside the view.
+pub(crate) fn residual_add_at(
+    rt: &Arc<GpuRuntime>,
+    y: Cols<'_>,
+    y_byte: usize,
+    resid: Cols<'_>,
+    resid_byte: usize,
+    rows: u32,
+    width: u32,
+) -> Result<(), String> {
     const WHAT: &str = "qwen35::residual_add";
     let (r, w) = (u64::from(rows), u64::from(width));
-    require_window::<f32>(rt, y, r, w, "residual_add y")?;
-    require_window::<f32>(rt, resid, r, w, "residual_add resid")?;
+    require_window_at::<f32>(rt, y, y_byte, r, w, "residual_add y")?;
+    require_window_at::<f32>(rt, resid, resid_byte, r, w, "residual_add resid")?;
     if rows == 0 || width == 0 {
         return Ok(());
     }
     require_disjoint_writes(WHAT, &[("resid", resid.buf)], &[("y", y.buf)])?;
     let p = rt.pipeline("qwen35_residual_add_f32")?;
     dispatch_2d(rt, &p, width as usize, rows as usize, |bnd| {
-        set_gpu_buf(bnd, y.buf, 0);
-        set_gpu_buf(bnd, resid.buf, 1);
+        set_gpu_buf_offset(bnd, y.buf, y_byte, 0);
+        set_gpu_buf_offset(bnd, resid.buf, resid_byte, 1);
         set_u32(bnd, rows, 2);
         set_u32(bnd, width, 3);
         set_u32(bnd, y.ld, 4);
@@ -1903,6 +1920,28 @@ pub fn residual_add(rt: &Arc<GpuRuntime>, y: Cols<'_>, resid: Cols<'_>, rows: u3
         set_u32(bnd, resid.ld, 6);
         set_u32(bnd, resid.off, 7);
     })
+}
+
+/// [`require_window`] plus a byte base. The kernel is bound at `byte_off`, so the
+/// window's elements start that many bytes into the allocation.
+fn require_window_at<T>(
+    rt: &GpuRuntime,
+    c: Cols<'_>,
+    byte_off: usize,
+    rows: u64,
+    width: u64,
+    what: &str,
+) -> Result<(), String> {
+    let elem = std::mem::size_of::<T>();
+    if elem == 0 || byte_off % elem != 0 {
+        return Err(format!("{what}: byte offset {byte_off} is not aligned to {elem}"));
+    }
+    let base = byte_off / elem;
+    let span = window_elems(rows, c.ld, c.off, width, what)?;
+    let need = base
+        .checked_add(span)
+        .ok_or_else(|| format!("{what}: extent overflows"))?;
+    require::<T>(rt, c.buf, need, what)
 }
 
 /// Qwen3.5's zero-centred RMSNorm over `rows` dense rows of `dim`:

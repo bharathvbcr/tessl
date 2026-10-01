@@ -355,10 +355,12 @@ pub fn cross_entropy_rows(
             } else {
                 let part = ws.dh_part.try_view(&[n, hs], 0)?;
                 operands.nn(&logits, &wc, &part)?;
-                crate::qwen35::residual_add(
+                crate::qwen35::residual_add_at(
                     rt,
                     crate::qwen35::Cols::dense(&part.buffer, hidden),
+                    part.byte_offset(),
                     crate::qwen35::Cols::dense(&g.dh.buffer, hidden),
+                    g.dh.byte_offset(),
                     n32,
                     hidden,
                 )?;

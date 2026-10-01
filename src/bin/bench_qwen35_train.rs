@@ -684,27 +684,31 @@ fn bench_batch(rt: &Arc<GpuRuntime>, model: &Qwen35Model, b: BatchShape, operand
     let dh = tensor(rt, &[at.len(), HIDDEN], 7, 1e-3)?;
     let hidden = rt.alloc_tensor_f32(&[at.len(), HIDDEN])?;
     let bank = tessl::qwen35_train::Qwen35Grads::zeros_like(model)?;
+    let row = |i: usize| -> Res<()> {
+        let (ids, accumulate) = (&rows[i], i > 0);
+        if i < letters {
+            let (pos, tgt) = ([b.len as u32 - 2], [ids[b.len - 1]]);
+            let sup = tessl::qwen35_train::Supervise::Rows {
+                positions: &pos,
+                targets: &tgt,
+                scale: 1.0 / letters as f32,
+            };
+            model.train_step_into(ids, operands, sup, &bank, accumulate)?;
+        } else {
+            let sup = tessl::qwen35_train::Supervise::Rows {
+                positions: &[],
+                targets: &[],
+                scale: 1.0,
+            };
+            let p = model.train_forward(ids, operands, sup)?;
+            p.hidden(&at, &hidden)?;
+            model.train_backward_into(p, Some((&at, &dh)), &bank, accumulate)?;
+        }
+        Ok(())
+    };
     let run = || -> Res<()> {
-        for (i, ids) in rows.iter().enumerate() {
-            let accumulate = i > 0;
-            if i < letters {
-                let (pos, tgt) = ([b.len as u32 - 2], [ids[b.len - 1]]);
-                let sup = tessl::qwen35_train::Supervise::Rows {
-                    positions: &pos,
-                    targets: &tgt,
-                    scale: 1.0 / letters as f32,
-                };
-                model.train_step_into(ids, operands, sup, &bank, accumulate)?;
-            } else {
-                let sup = tessl::qwen35_train::Supervise::Rows {
-                    positions: &[],
-                    targets: &[],
-                    scale: 1.0,
-                };
-                let p = model.train_forward(ids, operands, sup)?;
-                p.hidden(&at, &hidden)?;
-                model.train_backward_into(p, Some((&at, &dh)), &bank, accumulate)?;
-            }
+        for i in 0..b.rows {
+            row(i)?;
         }
         rt.synchronize()
     };
@@ -730,6 +734,25 @@ fn bench_batch(rt: &Arc<GpuRuntime>, model: &Qwen35Model, b: BatchShape, operand
         secs / b.rows as f64,
         (b.rows * b.len) as f64 / secs
     );
+    // One more run, untimed above, each row waited for and traced: where a
+    // batch's time goes row by row (wall time, time blocked on the GPU,
+    // buffer allocations, pool hits included, and command buffers committed).
+    tessl::infer_trace::set_enabled(true);
+    for i in 0..b.rows {
+        let (t0, s0) = (Instant::now(), tessl::infer_trace::snapshot());
+        row(i)?;
+        rt.synchronize()?;
+        let (secs, s1) = (t0.elapsed().as_secs_f64(), tessl::infer_trace::snapshot());
+        println!(
+            "  row {i} ({}{}): {secs:.3} s, {:.3} s waiting on the GPU, {} allocations, {} commits",
+            if i < letters { "letter" } else { "span" },
+            if i > 0 { ", accumulated" } else { "" },
+            (s1.sync_wait_us - s0.sync_wait_us) as f64 / 1e6,
+            s1.cold_allocs - s0.cold_allocs,
+            s1.commits - s0.commits,
+        );
+    }
+    tessl::infer_trace::set_enabled(false);
     Ok(())
 }
 

@@ -207,6 +207,11 @@ All notable changes to `tessl` are recorded here. The format follows
   supervise one position, span rows go through `hidden` and an outside
   gradient), reporting seconds per optimizer step and per row; two lengths
   at one row count separate the per-row fixed cost from the per-token cost.
+  An extra run after the timed ones prints each row's wall time, time
+  waiting on the GPU, allocations and commits. On an M5 Pro that showed the
+  same 1625-token letter row taking 3.0 to 5.9 s between moments in one
+  process, with accumulated rows no slower than the first, so a batch-versus-
+  single comparison from one run each is within the noise.
 - **`Qwen35Model::train_step_into(ids, operands, sup, bank, accumulate)`**
   writes a step's gradients into a bank from `Qwen35Grads::zeros_like`
   (over it, or added to it), so several sequences' gradients sum in place.

@@ -215,7 +215,10 @@ All notable changes to `tessl` are recorded here. The format follows
   accumulate)` adds that loss's gradient at those rows to the step's own
   before the backward. Checked with the tied head's cross-entropy computed
   on the host from `hidden`'s rows: the same loss and, fed back as `dh`, the
-  same gradients as `Supervise::Rows` inside tessl.
+  same gradients as `Supervise::Rows` inside tessl. A step that scores
+  nothing in tessl (an outside loss only) adds its embedding gradient
+  straight into the bank: no `[vocab, hidden]` tensor (2 GB on the 2B) and
+  no copy per row.
 - **`Qwen35Model::train_step(ids, operands)` and
   `cross_entropy_rows(.., reduction, operands, ws, grads)`** take a
   `gemm::GemmOperands`: `ExactF32` (the previous behaviour) or `Bf16`, bf16

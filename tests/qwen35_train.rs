@@ -652,6 +652,62 @@ fn a_loss_outside_tessl_flows_back_through_the_hidden_states() {
     assert!(m.contains(&format!("position {t} >= {t} tokens")), "{m}");
 }
 
+/// A step that scores nothing in tessl (its embedding gradient goes straight
+/// into the bank): accumulated after a scored step, every gradient is the
+/// f32 sum of the two steps taken apart, the embedding's included (equal as
+/// values: an add onto zero may turn -0.0 into +0.0); without accumulate,
+/// into a bank already holding a step, the embedding is zeroed first. The
+/// values do not show which path ran: the fresh-tensor path gives the same
+/// ones, and the saving is memory, not a number.
+#[test]
+fn a_step_that_scores_nothing_accumulates_like_any_other() {
+    let dir = fixture();
+    let cfg = tiny_config();
+    let (rt, model) = load_rt(&dir, "model.", cfg.clone(), Precision::F32);
+    let mm = GemmOperands::ExactF32;
+    let ids = ids(&dir);
+    let h = cfg.hidden as usize;
+    let at = [2u32, 9, 20];
+    let dh = rt.alloc_tensor_f32(&[at.len(), h]).unwrap();
+    dh.buffer.write_f32(
+        &(0..at.len() * h)
+            .map(|i| ((i % 11) as f32 - 5.0) * 1e-2)
+            .collect::<Vec<_>>(),
+    );
+    let nothing = next_token(&ids, &[], 1.0);
+
+    let (_, first) = into_fresh(&model, &ids, Supervise::Causal);
+    // Into a bank that already holds a step's gradients: without accumulate
+    // its embedding must be zeroed first, not added onto.
+    let second = Qwen35Grads::zeros_like(&model).unwrap();
+    model
+        .train_step_into(&ids, mm, Supervise::Causal, &second, false)
+        .unwrap();
+    let p = model.train_forward(&ids[..30], mm, rows_of(&nothing)).unwrap();
+    model.train_backward_into(p, Some((&at, &dh)), &second, false).unwrap();
+
+    let bank = Qwen35Grads::zeros_like(&model).unwrap();
+    model
+        .train_step_into(&ids, mm, Supervise::Causal, &bank, false)
+        .unwrap();
+    let p = model.train_forward(&ids[..30], mm, rows_of(&nothing)).unwrap();
+    model.train_backward_into(p, Some((&at, &dh)), &bank, true).unwrap();
+
+    let mut moved = false;
+    for (((name, got), (_, x)), (_, y)) in bits(&cfg, &bank)
+        .iter()
+        .zip(bits(&cfg, &first))
+        .zip(bits(&cfg, &second))
+    {
+        for (k, ((&g, &x), &y)) in got.iter().zip(&x).zip(&y).enumerate() {
+            let want = f32::from_bits(x) + f32::from_bits(y);
+            assert_eq!(f32::from_bits(g), want, "{name}[{k}]");
+            moved |= name == "embed_tokens.weight" && y != 0 && g != x;
+        }
+    }
+    assert!(moved, "the second step added nothing to the embedding");
+}
+
 /// `Supervise::Rows` refuses what it cannot score, before anything runs.
 #[test]
 fn supervised_rows_refuse_bad_selections() {

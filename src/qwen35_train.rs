@@ -275,7 +275,9 @@ pub struct PendingStep {
     resid: Tensor,
     xf: Tensor,
     dxf: Tensor,
-    d_embed: Tensor,
+    /// The LM head's weight gradient; none when the step scores nothing in
+    /// tessl, whose embedding gradient is then the gather's alone.
+    d_embed: Option<Tensor>,
     loss: f64,
     /// The model's embedding buffer: which model made this step.
     embed: GpuBuffer,
@@ -336,6 +338,16 @@ impl PendingStep {
         })?;
         rt.synchronize()
     }
+}
+
+/// Zero one part on the GPU, in order with the work around it.
+fn zero_part(rt: &Arc<GpuRuntime>, (b, off, n): Part<'_>) -> Result<(), String> {
+    let n32 = u32::try_from(n).map_err(|_| format!("zero_part: {n} elements exceed u32"))?;
+    let p = rt.pipeline("zero_f32")?;
+    dispatch_1d(rt, &p, n, |bnd| {
+        set_gpu_buf_offset(bnd, b, off, 0);
+        set_u32(bnd, n32, 1);
+    })
 }
 
 /// What [`Qwen35Model::train_step`] returns.
@@ -615,7 +627,12 @@ impl Qwen35Model {
         self.norm_f32(&resid, &self.final_norm, &xf, t)?;
 
         // ---- loss and the LM head ------------------------------------------
-        let d_embed = tensor(rt, &[cfg.vocab as usize, h])?;
+        let scores = !matches!(sup, Supervise::Rows { positions: [], .. });
+        let d_embed = if scores {
+            Some(tensor(rt, &[cfg.vocab as usize, h])?)
+        } else {
+            None
+        };
         let dxf = tensor(rt, &[tu, h])?;
         // Positions nothing scores keep a zero gradient row.
         dxf.buffer.zero();
@@ -638,7 +655,7 @@ impl Qwen35Model {
                 &ws,
                 Some(CeGrads {
                     dh,
-                    dw: &d_embed,
+                    dw: d_embed.as_ref().ok_or("a scored step has a head gradient")?,
                     scale,
                 }),
             )
@@ -650,12 +667,8 @@ impl Qwen35Model {
                 let rows: Vec<u32> = (0..n as u32).collect();
                 ce(&rows, &ids[1..], Reduction::Mean, &dxf.view(&[n, h], 0), 1.0)?.loss
             }
-            Supervise::Rows { positions: [], .. } => {
-                // No loss: the head adds nothing, and the embedding's
-                // gradient is the gather's alone.
-                d_embed.buffer.zero();
-                0.0
-            }
+            // No loss: the head adds nothing.
+            Supervise::Rows { positions: [], .. } => 0.0,
             Supervise::Rows {
                 positions,
                 targets,
@@ -781,24 +794,38 @@ impl Qwen35Model {
             }
         }
         layers.reverse();
+        // The gather's gradient adds onto the head's. With no head gradient
+        // and a bank whose embedding is a whole buffer, it adds straight into
+        // the bank (zeroed first unless accumulating): no 2 GB tensor and no
+        // copy on the 2B.
+        let (dw, direct) = match (d_embed, bank) {
+            (Some(d), _) => (d, false),
+            (None, Some((b, add)))
+                if b.embed.byte_offset() == 0 && tensor_part(&b.embed).2 * 4 == b.embed.buffer.nbytes() =>
+            {
+                if !add {
+                    zero_part(rt, tensor_part(&b.embed))?;
+                }
+                (b.embed.clone(), true)
+            }
+            (None, _) => {
+                let d = tensor(rt, &[cfg.vocab as usize, h])?;
+                zero_part(rt, tensor_part(&d))?;
+                (d, false)
+            }
+        };
         let emb_ws = EmbedBwdWorkspace::new(rt, t)?;
-        embed_rows_bwd(
-            rt,
-            &ids,
-            &sc.dresid.buffer,
-            &d_embed.buffer,
-            cfg.vocab,
-            cfg.hidden,
-            &emb_ws,
-        )?;
+        embed_rows_bwd(rt, &ids, &sc.dresid.buffer, &dw.buffer, cfg.vocab, cfg.hidden, &emb_ws)?;
         if let Some((b, add)) = bank {
-            deliver(rt, &[tensor_part(&d_embed)], &[tensor_part(&b.embed)], add)?;
+            if !direct {
+                deliver(rt, &[tensor_part(&dw)], &[tensor_part(&b.embed)], add)?;
+            }
             rt.synchronize()?;
             return Ok(None);
         }
         rt.synchronize()?;
         Ok(Some(Qwen35Grads {
-            embed: d_embed,
+            embed: dw,
             final_norm,
             layers,
         }))

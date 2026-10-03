@@ -108,6 +108,18 @@ fn softcap_sample_writes_the_argmax_and_rewrites_logits() {
 }
 
 #[test]
+fn softcap_sample_rejects_an_all_nan_row() {
+    with_gpu(|rt| {
+        let n = 8usize;
+        let lb = buf(rt, &[f32::NAN; 8]);
+        let out = buf_u32(rt, &[0]);
+        let cap = buf(rt, &[30.0]);
+        let err = nn::softcap_sample(rt, &lb, &out, &cap, n as u32).expect_err("all-NaN must not sample token 0");
+        assert!(err.contains("finite"), "{err}");
+    });
+}
+
+#[test]
 fn softcap_sample_refuses_more_logits_than_its_threadgroup_reduces() {
     with_gpu(|rt| {
         let n = 4096u32;
@@ -147,6 +159,23 @@ fn argmax_f32_pass_reduces_a_full_vocab_across_two_passes() {
         assert_eq!(g2, 1, "test assumes the second pass collapses to one group");
         assert_eq!(idx2.read_u32()[0] as usize, winner);
         assert!((val2.read_f32()[0] - 77.0).abs() < 1e-4);
+    });
+}
+
+/// A row of non-finite logits writes `0xFFFFFFFF` into `out_idx`. That must
+/// be an error, the same rule `softcap_sample` applies, not a token id.
+#[test]
+fn argmax_f32_pass_refuses_a_nonfinite_row() {
+    with_gpu(|rt| {
+        let n = 4u32;
+        let lb = buf(rt, &[f32::NAN, f32::NAN, f32::NAN, f32::NAN]);
+        let cap = buf(rt, &[0.0]);
+        let groups = nn::argmax_pass_groups(n);
+        let idx = buf_u32(rt, &vec![0u32; groups]);
+        let val = empty(rt, groups);
+        let err = nn::argmax_f32_pass(rt, &lb, &idx, &val, None, &cap, n)
+            .expect_err("non-finite argmax must not return a token");
+        assert!(err.contains("no finite"), "expected the non-finite refusal, got {err}");
     });
 }
 

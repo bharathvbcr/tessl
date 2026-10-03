@@ -1488,6 +1488,54 @@ pub fn attn_qk_norm_rope(
         0,
         theta,
         eps,
+        QkRead::Qwen,
+    )
+}
+
+/// [`attn_qk_norm_rope`] with an explicit query-head stride.
+///
+/// [`attn_qk_norm_rope`] reads query head `j` at column `j * 2 * head_dim`
+/// (Qwen packs `[q, gate]`) and multiplies the RMSNorm by `(1 + w)`. This
+/// entry takes the stride. Pass `head_dim` for nanolab's packed `[T, H, D]`
+/// layout, and `2 * head_dim` to match the Qwen query columns.
+///
+/// Key and value head `h` are column `h * head_dim` of the same window, so
+/// one residual can be Q, K, and V together. `weight_bias` is added to the
+/// RMSNorm weight: `0` is a plain learnable scale (`* w`, nanolab, `eps`
+/// typically `1e-6`), `1` is Qwen's `(1 + w)`.
+///
+/// RoPE is the half-split on `shape.rotary_dim` leading dims:
+/// `x * cos + cat(-x2, x1) * sin`, with `theta^(-2p / rotary_dim)`. Set
+/// `rotary_dim` to `head_dim` to rotate the whole head.
+#[allow(clippy::too_many_arguments)]
+pub fn attn_qk_norm_rope_packed(
+    rt: &Arc<GpuRuntime>,
+    shape: &AttnShape,
+    proj: Cols<'_>,
+    q_head_stride: u32,
+    weight_bias: f32,
+    q_norm_w: &GpuBuffer,
+    k_norm_w: &GpuBuffer,
+    targets: &AttnTargets<'_>,
+    pos_offset: u32,
+    theta: f32,
+    eps: f32,
+) -> Result<(), String> {
+    qk_norm_rope_impl(
+        rt,
+        shape,
+        proj,
+        q_norm_w,
+        k_norm_w,
+        targets,
+        RopePos::Scalar(pos_offset),
+        0,
+        theta,
+        eps,
+        QkRead::Packed {
+            q_head_stride,
+            weight_bias,
+        },
     )
 }
 
@@ -1524,6 +1572,7 @@ pub fn attn_qk_norm_rope_posbuf(
         0,
         theta,
         eps,
+        QkRead::Qwen,
     )
 }
 
@@ -1564,6 +1613,7 @@ pub fn attn_qk_norm_rope_suffix(
         prefix_len,
         theta,
         eps,
+        QkRead::Qwen,
     )
 }
 
@@ -1601,6 +1651,7 @@ pub fn attn_qk_norm_rope_suffix_posbuf(
         prefix_len,
         theta,
         eps,
+        QkRead::Qwen,
     )
 }
 
@@ -1633,7 +1684,20 @@ pub fn attn_qk_norm_rope_suffix_rows(
         prefix_len,
         theta,
         eps,
+        QkRead::Qwen,
     )
+}
+
+/// How query heads are read, and how the RMSNorm weight is applied.
+#[derive(Clone, Copy)]
+enum QkRead {
+    /// Query stride `2 * head_dim`, weight `*(1 + w)`, [`AttnProjLayout`] columns.
+    Qwen,
+    /// Query head `j` at column `j * q_head_stride`. Key and value head `h`
+    /// at column `h * head_dim`. Offsets are relative to `proj.off`.
+    /// `weight_bias` is added to the RMSNorm weight (`0` is `* w`, `1` is
+    /// Qwen's `*(1 + w)`).
+    Packed { q_head_stride: u32, weight_bias: f32 },
 }
 
 /// Where the RoPE / cache position comes from.
@@ -1658,6 +1722,7 @@ fn qk_norm_rope_impl(
     slot_base: u32,
     theta: f32,
     eps: f32,
+    read: QkRead,
 ) -> Result<(), String> {
     const WHAT: &str = "qwen35::attn_qk_norm_rope";
     let s = shape;
@@ -1674,6 +1739,45 @@ fn qk_norm_rope_impl(
         return Err(format!("{WHAT}: theta and eps must be positive and finite"));
     }
     let layout = AttnProjLayout::new(s.q_heads, s.kv_heads, s.head_dim)?;
+    let (q_col, k_col, v_col, row_width, q_head_stride, weight_bias) = match read {
+        QkRead::Qwen => {
+            let stride = s
+                .head_dim
+                .checked_mul(2)
+                .ok_or_else(|| format!("{WHAT}: 2 * head_dim overflows u32"))?;
+            (
+                layout.q_off(),
+                layout.k_off(),
+                layout.v_off(),
+                layout.width(),
+                stride,
+                1.0,
+            )
+        }
+        QkRead::Packed {
+            q_head_stride,
+            weight_bias,
+        } => {
+            if q_head_stride < s.head_dim {
+                return Err(format!(
+                    "{WHAT}: query head stride {q_head_stride} is shorter than head_dim {}",
+                    s.head_dim
+                ));
+            }
+            if !weight_bias.is_finite() {
+                return Err(format!("{WHAT}: weight_bias must be finite"));
+            }
+            let span = |heads: u32, stride: u32| -> Result<u64, String> {
+                u64::from(heads - 1)
+                    .checked_mul(u64::from(stride))
+                    .and_then(|n| n.checked_add(u64::from(s.head_dim)))
+                    .ok_or_else(|| format!("{WHAT}: packed columns overflow"))
+            };
+            let width = span(s.q_heads, q_head_stride)?.max(span(s.kv_heads, s.head_dim)?);
+            let width_u = u32::try_from(width).map_err(|_| format!("{WHAT}: packed width exceeds u32"))?;
+            (0, 0, 0, width_u, q_head_stride, weight_bias)
+        }
+    };
     if s.batch == 0 || s.seq == 0 {
         // Nothing to write; and with no batch rows the caches imply no
         // capacity, which must not read as "positions past capacity".
@@ -1711,7 +1815,7 @@ fn qk_norm_rope_impl(
         RopePos::Buffer(b) => require::<u32>(rt, b, 1, "attn_qk_norm_rope pos_offset")?,
         RopePos::PerRow(b) => require::<u32>(rt, b, s.batch as usize, "attn_qk_norm_rope per-row pos_offset")?,
     }
-    let width = u64::from(layout.width());
+    let width = u64::from(row_width);
     let rows = u64::from(s.batch) * u64::from(s.seq);
     require_window::<f32>(rt, proj, rows, width, "attn_qk_norm_rope proj")?;
     require::<f32>(rt, q_norm_w, s.head_dim as usize, "attn q_norm weight")?;
@@ -1771,9 +1875,9 @@ fn qk_norm_rope_impl(
             set_u32(bnd, s.head_dim, 10);
             set_u32(bnd, s.rotary_dim, 11);
             set_u32(bnd, proj.ld, 12);
-            set_u32(bnd, proj.off + layout.q_off(), 13);
-            set_u32(bnd, proj.off + layout.k_off(), 14);
-            set_u32(bnd, proj.off + layout.v_off(), 15);
+            set_u32(bnd, proj.off + q_col, 13);
+            set_u32(bnd, proj.off + k_col, 14);
+            set_u32(bnd, proj.off + v_col, 15);
             match pos {
                 RopePos::Scalar(v) => set_u32(bnd, v, 16),
                 RopePos::Buffer(b) | RopePos::PerRow(b) => set_gpu_buf(bnd, b, 16),
@@ -1783,6 +1887,8 @@ fn qk_norm_rope_impl(
             set_f32(bnd, eps, 19);
             set_u32(bnd, slot_base, 20);
             set_u32(bnd, u32::from(matches!(pos, RopePos::PerRow(_))), 21);
+            set_u32(bnd, q_head_stride, 22);
+            set_f32(bnd, weight_bias, 23);
         },
     )
 }

@@ -13,6 +13,7 @@
 //! calls rather than opened per dispatch; the working set is probed rather than
 //! assumed; and nothing zeroes a buffer from the host mid-command-buffer.
 
+use block2::RcBlock;
 use core::ptr::NonNull;
 use dispatch2::DispatchData;
 use objc2::rc::{autoreleasepool, Retained};
@@ -21,16 +22,17 @@ use objc2::ClassType;
 use objc2_foundation::{NSData, NSRange, NSString};
 use objc2_metal::{
     MTL4ArgumentTable, MTL4ArgumentTableDescriptor, MTL4CommandAllocator, MTL4CommandBuffer, MTL4CommandEncoder,
-    MTL4CommandQueue, MTL4Compiler, MTL4CompilerDescriptor, MTL4ComputeCommandEncoder, MTL4ComputePipelineDescriptor,
-    MTL4CounterHeap, MTL4CounterHeapDescriptor, MTL4CounterHeapType, MTL4IndirectCommandBufferSupportState,
-    MTL4LibraryFunctionDescriptor, MTL4TimestampHeapEntry, MTL4VisibilityOptions, MTLAllocation, MTLBuffer,
-    MTLComputePipelineState, MTLCreateSystemDefaultDevice, MTLDevice, MTLEvent, MTLLibrary, MTLResidencySet,
-    MTLResidencySetDescriptor, MTLResourceOptions, MTLSharedEvent, MTLSize, MTLStages,
+    MTL4CommandQueue, MTL4CommitFeedback, MTL4CommitOptions, MTL4Compiler, MTL4CompilerDescriptor,
+    MTL4ComputeCommandEncoder, MTL4ComputePipelineDescriptor, MTL4CounterHeap, MTL4CounterHeapDescriptor,
+    MTL4CounterHeapType, MTL4IndirectCommandBufferSupportState, MTL4LibraryFunctionDescriptor, MTL4TimestampHeapEntry,
+    MTL4VisibilityOptions, MTLAllocation, MTLBuffer, MTLComputePipelineState, MTLCreateSystemDefaultDevice, MTLDevice,
+    MTLEvent, MTLLibrary, MTLResidencySet, MTLResidencySetDescriptor, MTLResourceOptions, MTLSharedEvent, MTLSize,
+    MTLStages,
 };
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Condvar, Mutex, PoisonError, Weak};
 
 /// Const arena for Metal 4 scalar binds (distinct offsets; reset after sync).
 // 31B dense decode packs hundreds of binder consts across mid-commits within a
@@ -78,6 +80,11 @@ pub struct DeviceMemoryInfo {
     pub memory_size: u64,
     pub wired_budget: u64,
     pub pool_cache_cap: usize,
+    /// `MTLDevice::hasUnifiedMemory`: the GPU has no dedicated local memory and
+    /// shares system memory with the CPU (Apple silicon, Intel integrated).
+    /// False means a discrete GPU with its own VRAM. A plain `BOOL` property,
+    /// so the read has no failure path.
+    pub has_unified_memory: bool,
 }
 
 /// Precision mode for the training hot path.
@@ -236,6 +243,8 @@ struct AllocatorSlot {
     allocator: Retained<ProtocolObject<dyn MTL4CommandAllocator>>,
     /// SharedEvent value that must land before reset+reuse; 0 = free.
     in_flight: u64,
+    /// Commit-feedback registration for the command buffer this slot last submitted.
+    feedback: Option<FeedbackWatch>,
 }
 
 /// Metal 4 encode package (queue / dual allocators / argument table / CounterHeap).
@@ -258,6 +267,97 @@ pub(crate) struct Metal4EncodePackage {
     event_value: Mutex<u64>,
     /// Allocations registered into `residency` (debug / telemetry).
     pub residency_count: Mutex<usize>,
+}
+
+/// Outcome of one `MTL4CommitFeedback` callback.
+/// Longest a waited commit waits for its commit-feedback callback after the
+/// shared event. A callback that has not run by then stays pending (see
+/// `observe_finished_feedback`).
+const FEEDBACK_WAIT: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// What one commit's feedback callback reported.
+///
+/// `done` is set under `gate` and the waiters are notified after, so a waiter
+/// that checks `done` under `gate` cannot miss the wake. The callback runs on a
+/// Metal thread, where a panic cannot be recovered, so every lock here takes a
+/// poisoned guard as it is instead of unwrapping.
+struct FeedbackState {
+    done: AtomicBool,
+    error: Mutex<Option<String>>,
+    gate: Mutex<()>,
+    wake: Condvar,
+}
+
+impl FeedbackState {
+    fn new() -> Self {
+        Self {
+            done: AtomicBool::new(false),
+            error: Mutex::new(None),
+            gate: Mutex::new(()),
+            wake: Condvar::new(),
+        }
+    }
+
+    fn fail(&self, message: String) {
+        *self.error.lock().unwrap_or_else(PoisonError::into_inner) = Some(message);
+        self.finish();
+    }
+
+    fn succeed(&self) {
+        self.finish();
+    }
+
+    fn finish(&self) {
+        {
+            let _gate = self.gate.lock().unwrap_or_else(PoisonError::into_inner);
+            self.done.store(true, Ordering::Release);
+        }
+        self.wake.notify_all();
+    }
+
+    /// Wait up to `limit` for the callback; true when it has run. The wait
+    /// blocks on the callback's notify, so it returns as soon as the callback
+    /// runs rather than at a poll tick.
+    fn wait_done(&self, limit: std::time::Duration) -> bool {
+        if self.done.load(Ordering::Acquire) {
+            return true;
+        }
+        let deadline = std::time::Instant::now() + limit;
+        let mut gate = self.gate.lock().unwrap_or_else(PoisonError::into_inner);
+        while !self.done.load(Ordering::Acquire) {
+            let now = std::time::Instant::now();
+            if now >= deadline {
+                break;
+            }
+            gate = match self.wake.wait_timeout(gate, deadline - now) {
+                Ok((g, _)) => g,
+                Err(poisoned) => poisoned.into_inner().0,
+            };
+        }
+        self.done.load(Ordering::Acquire)
+    }
+
+    fn message(&self) -> Option<String> {
+        self.error.lock().unwrap_or_else(PoisonError::into_inner).clone()
+    }
+}
+
+/// Keeps the commit-options object and the feedback block alive until Metal
+/// has called the block, or leaks the block if we have to drop earlier.
+struct FeedbackWatch {
+    state: Arc<FeedbackState>,
+    _options: Retained<MTL4CommitOptions>,
+    block: Option<RcBlock<dyn Fn(NonNull<ProtocolObject<dyn MTL4CommitFeedback>>)>>,
+}
+
+impl Drop for FeedbackWatch {
+    fn drop(&mut self) {
+        if !self.state.done.load(Ordering::Acquire) {
+            if let Some(block) = self.block.take() {
+                std::mem::forget(block);
+            }
+        }
+    }
 }
 
 /// Soft mid-token commit threshold (dispatches since last commit).
@@ -388,7 +488,10 @@ impl ParamsBuffer {
 
 pub struct GpuRuntime {
     access_busy: Arc<AtomicBool>,
-    encode_failed: AtomicBool,
+    encode_failed: Arc<AtomicBool>,
+    /// Times `MTL4CommitFeedback` has been delivered. The command buffer
+    /// protocol has no status; this counts the feedback path that does.
+    commit_feedback_reports: Arc<AtomicU64>,
     pub device: Retained<ProtocolObject<dyn MTLDevice>>,
     pub library: Retained<ProtocolObject<dyn MTLLibrary>>,
     /// Extra metallibs (e.g. gemma-metal overlay) searched after [`Self::library`].
@@ -523,10 +626,11 @@ impl GpuRuntime {
         Ok(access)
     }
 
-    /// Test-only: apply the same poison `encode_failed` bit that a SharedEvent
-    /// wait timeout stores before returning. Proves subsequent encode/alloc
-    /// refuse reuse without needing to wedge a real GPU timeline.
-    #[cfg(test)]
+    /// Apply the same poison `encode_failed` bit that a SharedEvent wait timeout
+    /// stores before returning. Subsequent encode and alloc refuse reuse.
+    ///
+    /// This does not hang the GPU. Dependents use it when a real command-buffer
+    /// fault cannot be produced, including ojas-metal's host-weight rebuild.
     pub fn poison_as_shared_event_timeout_for_test(&self) {
         self.encode_failed.store(true, Ordering::Release);
     }
@@ -606,6 +710,7 @@ impl GpuRuntime {
             memory_size,
             wired_budget,
             pool_cache_cap: DEFAULT_POOL_CACHE_BYTES,
+            has_unified_memory: device.hasUnifiedMemory(),
         };
 
         // clippy::arc_with_non_send_sync: `Retained<ProtocolObject<..>>` is not
@@ -618,7 +723,8 @@ impl GpuRuntime {
         #[allow(clippy::arc_with_non_send_sync)]
         let rt = Arc::new(Self {
             access_busy: Arc::new(AtomicBool::new(false)),
-            encode_failed: AtomicBool::new(false),
+            encode_failed: Arc::new(AtomicBool::new(false)),
+            commit_feedback_reports: Arc::new(AtomicU64::new(0)),
             device,
             library,
             overlay_libraries: Mutex::new(Vec::new()),
@@ -697,6 +803,24 @@ impl GpuRuntime {
 
     pub fn memory_info(&self) -> DeviceMemoryInfo {
         *self.memory_info.lock().unwrap()
+    }
+
+    /// Whether an encode, submit, or GPU fault has latched this runtime permanently.
+    ///
+    /// Callers read this instead of matching the poison string. The bit is the
+    /// same one [`Self::poison_as_shared_event_timeout_for_test`] sets, and the
+    /// same one a `MTL4CommitFeedback` error sets.
+    pub fn is_poisoned(&self) -> bool {
+        self.encode_failed.load(Ordering::Acquire)
+    }
+
+    /// Bytes this `MTLDevice` currently has allocated, from
+    /// `MTLDevice::currentAllocatedSize` (objc2-metal 0.3.2, a safe method).
+    ///
+    /// This is the live figure. [`Self::memory_info`] stays the startup snapshot
+    /// of the working set, wired budget, and pool-cache cap.
+    pub fn current_allocated_bytes(&self) -> u64 {
+        self.device.currentAllocatedSize() as u64
     }
 
     /// Cap freelist cache bytes (CLI `--pool-cache-mb`).
@@ -1475,6 +1599,7 @@ impl GpuRuntime {
             if wait {
                 // Still wait for any in-flight mid-commits.
                 self.wait_all_allocators()?;
+                self.observe_finished_feedback()?;
                 // Reset the const arena, exactly as the cb_open path below does
                 // after its own GPU catch-up.
                 //
@@ -1515,17 +1640,7 @@ impl GpuRuntime {
             }
         }
         m4.command_buffer.endCommandBuffer();
-        // SAFETY: `Retained::as_ptr` yields a pointer to an object this struct
-        // owns and keeps alive across the call, so the `NonNull` cannot dangle.
-        // `NonNull::new` rejects null rather than assuming it. The commit takes
-        // the pointer by value for the duration of the send and does not retain
-        // it past that.
-        unsafe {
-            let mut cb =
-                NonNull::new(Retained::as_ptr(&m4.command_buffer) as *mut ProtocolObject<dyn MTL4CommandBuffer>)
-                    .ok_or_else(|| "null MTL4 command buffer".to_string())?;
-            m4.queue.commit_count(NonNull::new_unchecked(&mut cb as *mut _), 1);
-        }
+        let watch = self.commit_with_feedback()?;
         batch.cb_open = false;
         batch.since_commit = 0;
 
@@ -1540,6 +1655,7 @@ impl GpuRuntime {
         {
             let mut slots = m4.allocators.lock().map_err(|e| e.to_string())?;
             slots[batch.alloc_idx].in_flight = next;
+            slots[batch.alloc_idx].feedback = Some(watch);
             let mut idx = m4.active_alloc.lock().map_err(|e| e.to_string())?;
             *idx = 1 - batch.alloc_idx;
         }
@@ -1569,10 +1685,112 @@ impl GpuRuntime {
             drop(guard);
             // Safe to removeAllocation + freelist now that CB completed.
             self.drain_cold_recycles();
+            self.observe_finished_feedback()?;
         } else {
             // Keep const_cursor; do not reuse offsets until a waiting commit.
             // Next encode opens on the other allocator.
             batch.cb_open = false;
+        }
+        Ok(())
+    }
+
+    /// Commit one Metal 4 command buffer and register commit feedback.
+    ///
+    /// `MTL4CommandBuffer` (Apple header and objc2-metal 0.3.2) has begin, end,
+    /// and encoders, and no `status` or `error`. A GPU fault is reported later
+    /// on `MTL4CommitFeedback::error`, which this registers through
+    /// `MTL4CommandQueue::commit:count:options:`.
+    fn commit_with_feedback(&self) -> Result<FeedbackWatch, String> {
+        let state = Arc::new(FeedbackState::new());
+        let state_cb = Arc::clone(&state);
+        let failed = Arc::clone(&self.encode_failed);
+        let reports = Arc::clone(&self.commit_feedback_reports);
+        let block = RcBlock::new(move |feedback: NonNull<ProtocolObject<dyn MTL4CommitFeedback>>| {
+            reports.fetch_add(1, Ordering::Release);
+            // SAFETY: Metal invokes the block with a live feedback object and
+            // does not use it after the block returns.
+            let message = unsafe { feedback.as_ref() }
+                .error()
+                .map(|err| err.localizedDescription().to_string());
+            if let Some(message) = message {
+                state_cb.fail(message);
+                failed.store(true, Ordering::Release);
+            } else {
+                state_cb.succeed();
+            }
+        });
+        let options = MTL4CommitOptions::new();
+        // `into_raw` keeps the +1 this RcBlock owns. `addFeedbackHandler`
+        // copies the block into the options object (Apple: the options instance
+        // references the handler). `from_raw` takes the original +1 back so the
+        // block stays alive until this watch is dropped after the callback.
+        let raw = RcBlock::into_raw(block);
+        unsafe {
+            options.addFeedbackHandler(raw);
+        }
+        let block = unsafe { RcBlock::from_raw(raw) }.ok_or_else(|| "commit feedback block was null".to_string())?;
+        // SAFETY: `Retained::as_ptr` points at the command buffer this runtime
+        // keeps in `metal4` for the duration of the send. The queue does not
+        // retain the pointer past the call.
+        unsafe {
+            let mut cb = NonNull::new(
+                Retained::as_ptr(&self.metal4.command_buffer) as *mut ProtocolObject<dyn MTL4CommandBuffer>
+            )
+            .ok_or_else(|| "null MTL4 command buffer".to_string())?;
+            self.metal4
+                .queue
+                .commit_count_options(NonNull::new_unchecked(&mut cb as *mut _), 1, &options);
+        }
+        Ok(FeedbackWatch {
+            state,
+            _options: options,
+            block: Some(block),
+        })
+    }
+
+    /// After a GPU wait, fold commit-feedback errors into the poison latch.
+    ///
+    /// Silence is not a fault: the feedback block is documented as "when
+    /// available", and a missing callback must not poison a runtime whose
+    /// shared event already landed. An error that does arrive poisons it, so a
+    /// later `Ok` cannot hide the fault.
+    fn observe_finished_feedback(&self) -> Result<(), String> {
+        let watches = {
+            let mut slots = self.metal4.allocators.lock().map_err(|e| e.to_string())?;
+            let mut out = Vec::new();
+            for slot in slots.iter_mut() {
+                if let Some(watch) = slot.feedback.take() {
+                    out.push(watch);
+                }
+            }
+            out
+        };
+        let mut pending = Vec::new();
+        let mut fault = None;
+        for watch in watches {
+            if !watch.state.wait_done(FEEDBACK_WAIT) {
+                pending.push(watch);
+                continue;
+            }
+            if let Some(message) = watch.state.message() {
+                self.encode_failed.store(true, Ordering::Release);
+                fault = Some(message);
+            }
+        }
+        if !pending.is_empty() {
+            if let Ok(mut slots) = self.metal4.allocators.lock() {
+                for watch in pending {
+                    if let Some(slot) = slots.iter_mut().find(|slot| slot.feedback.is_none()) {
+                        slot.feedback = Some(watch);
+                    }
+                }
+            }
+        }
+        if let Some(message) = fault {
+            return Err(format!("Metal 4 command buffer fault: {message}"));
+        }
+        if self.encode_failed.load(Ordering::Acquire) {
+            return Err("runtime is poisoned after encode/submit failure; recreate it".into());
         }
         Ok(())
     }
@@ -1877,10 +2095,12 @@ fn try_init_metal4(device: &ProtocolObject<dyn MTLDevice>, timestamps: bool) -> 
             AllocatorSlot {
                 allocator: allocator_a,
                 in_flight: 0,
+                feedback: None,
             },
             AllocatorSlot {
                 allocator: allocator_b,
                 in_flight: 0,
+                feedback: None,
             },
         ]),
         active_alloc: Mutex::new(0),
@@ -1910,6 +2130,73 @@ pub fn mtl_size(w: usize, h: usize, d: usize) -> MTLSize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn feedback_wait_returns_at_once_when_the_callback_already_ran() {
+        let state = FeedbackState::new();
+        state.succeed();
+        let t0 = std::time::Instant::now();
+        assert!(state.wait_done(std::time::Duration::from_secs(10)));
+        assert!(t0.elapsed() < std::time::Duration::from_secs(1));
+    }
+
+    #[test]
+    fn feedback_wait_without_a_callback_gives_up_at_the_limit() {
+        let state = FeedbackState::new();
+        let limit = std::time::Duration::from_millis(30);
+        let t0 = std::time::Instant::now();
+        assert!(!state.wait_done(limit));
+        assert!(t0.elapsed() >= limit, "returned before the limit: {:?}", t0.elapsed());
+    }
+
+    #[test]
+    fn feedback_wait_sees_a_failure_reported_from_another_thread() {
+        let state = Arc::new(FeedbackState::new());
+        let cb = Arc::clone(&state);
+        let t = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            cb.fail("page fault".to_string());
+        });
+        assert!(state.wait_done(std::time::Duration::from_secs(10)));
+        assert_eq!(state.message().as_deref(), Some("page fault"));
+        t.join().unwrap();
+    }
+
+    /// The waiter must wake on the callback itself, not on a poll tick. A
+    /// 1 ms sleep poll wakes 0–1.4 ms after the callback (median about
+    /// 0.6 ms); it put every small op's `synchronize` in a +1.25 ms mode on
+    /// about half of all runs. 60 trials with the callback 0–3 ms after the
+    /// wait starts, so it cannot line up with a poll boundary. This is a
+    /// timing assertion: the median wake must be under 300 µs. Against the
+    /// poll it failed with a 762 µs median; with the condvar it passed 6 of 6
+    /// runs, at host load averages of 22–45 on an M5 Pro.
+    #[test]
+    fn feedback_wait_wakes_on_the_callback_not_on_a_poll_tick() {
+        let mut lat = Vec::with_capacity(60);
+        for i in 0..60u64 {
+            let state = Arc::new(FeedbackState::new());
+            let cb = Arc::clone(&state);
+            let delay = std::time::Duration::from_micros(i * 50);
+            let (tx, rx) = std::sync::mpsc::channel();
+            let t = std::thread::spawn(move || {
+                std::thread::sleep(delay);
+                let signalled = std::time::Instant::now();
+                cb.succeed();
+                tx.send(signalled).unwrap();
+            });
+            assert!(state.wait_done(std::time::Duration::from_secs(10)));
+            let woke = std::time::Instant::now();
+            let signalled = rx.recv().unwrap();
+            lat.push(woke.saturating_duration_since(signalled));
+            t.join().unwrap();
+        }
+        lat.sort();
+        let median = lat[lat.len() / 2];
+        assert!(
+            median < std::time::Duration::from_micros(300),
+            "median wake {median:?} after the callback; sorted {lat:?}"
+        );
+    }
 
     #[test]
     fn metal4_encode_smoke_copy() {
@@ -2218,6 +2505,39 @@ mod audit_tests {
         assert!(
             alloc_err.contains("poison"),
             "expected alloc refusal after SharedEvent-timeout latch, got {alloc_err}"
+        );
+        assert!(rt.is_poisoned());
+    }
+
+    #[test]
+    fn try_write_u32_reports_a_length_mismatch_and_write_u32_panics_on_it() {
+        let rt = GpuRuntime::new().unwrap();
+        let buf = rt.alloc_buffer(4).unwrap();
+        let err = buf.try_write_u32(&[1, 2]).unwrap_err();
+        assert!(err.contains("write_u32"), "{err}");
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| buf.write_u32(&[1, 2])));
+        assert!(panicked.is_err(), "write_u32 swallowed the length mismatch");
+        buf.try_write_u32(&[7]).unwrap();
+        assert_eq!(buf.read_u32(), vec![7]);
+    }
+
+    #[test]
+    fn live_allocation_and_commit_feedback_do_not_poison_a_clean_dispatch() {
+        let rt = GpuRuntime::new().unwrap();
+        assert!(!rt.is_poisoned());
+        let before = rt.current_allocated_bytes();
+        assert!(before > 0, "currentAllocatedSize was 0");
+        let _kept = rt.alloc_buffer(1 << 20).unwrap();
+        let after = rt.current_allocated_bytes();
+        assert!(
+            after > before,
+            "currentAllocatedSize did not grow: before {before} after {after}"
+        );
+        rt.with_binder(|_| Ok(())).unwrap();
+        assert!(!rt.is_poisoned(), "a clean commit was treated as a GPU fault");
+        assert!(
+            rt.commit_feedback_reports.load(Ordering::Acquire) > 0,
+            "MTL4CommitFeedback was not delivered; MTL4CommandBuffer has no status of its own"
         );
     }
 

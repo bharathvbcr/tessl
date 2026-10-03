@@ -24,6 +24,7 @@ flowchart TD
     BackendCheck -- SimdGroup --> SimdGroupKernel["matmul_simdgroup / edges<br/>• Portable SIMDgroup Fallback<br/>• 16x16 / 32x32 tiles, device store"]
     BackendCheck -- TensorOps --> LayoutCheck{"Layout Resolution"}
 
+    LayoutCheck -- "TN exact f32, C under 128 tiles, K of 2+ partitions" --> ParTN["matmul2d_tensorops_tn_splitk_par_f32<br/>+ reduce_partitions_f32<br/>(all K partitions in one dispatch)"]
     LayoutCheck -- "TN / NT Layout" --> SplitKCheck{"prefer_tn_splitk?<br/>(K &gt;= 2048, M,N &lt;= 384,<br/>min(M,N) &lt;= 128)"}
     SplitKCheck -- Yes --> SplitKKernel["matmul2d_tensorops_tn/nt_splitk_*<br/>(Split-K partial reductions)"]
     SplitKCheck -- No --> CoopTN["matmul2d_tensorops_tn/nt_*_f32<br/>• 128x64 sg4 Cooperative Destination<br/>• Single store, zero host pre-zeroing"]
@@ -105,7 +106,9 @@ In Round 2 optimization, cooperative destination registers were extended across 
 | **TN bf16 Descriptor** | $128 \times 64$, 4 sg | `matmul2d_tensorops_tn_bf16_f32` | 1.52–1.98× over dynamic-$K$ multiply |
 | **NT bf16 ($dX$ Backward)** | $128 \times 64$, 4 sg | `matmul2d_tensorops_nt_bf16_f32` | 2.00–2.03× speedup at scale |
 | **Accumulate Paths** | $64 \times 64$, 4 sg | Zero $\to$ Run $\to$ Load-Add-Store (`TILE_COOP_ACCUM`) | 1.38–1.49× over `multiply_accumulate` |
-| **Split-K $dW$** | $64 \times 32$, 4 sg | `matmul2d_tensorops_tn_splitk_*` | Preserved for tall-$K$ / small-$MN$ |
+| **Split-K $dW$** | $64 \times 32$, 4 sg | `matmul2d_tensorops_tn_splitk_*` | Tall-$K$ / small-$MN$ (`prefer_tn_splitk`): bf16, and exact f32 into `C +=` |
+| **Parallel split-K TN, exact f32** | $32 \times 32$, 1 sg | `matmul2d_tensorops_tn_splitk_par_f32` + `reduce_partitions_f32` | Every TN whose C has under 128 tiles over a K of ≥ 2 partitions (`tn_par_k_tile`): all partitions in one dispatch into a scratch, added in order. Gate $dW$ (12×768×4096): 225 → 45 µs; attention $dW$ (128×128×4096): 186 µs sequential → 31 µs on M5 Pro |
+| **Split-K NN, exact f32** | $32 \times 32$, 1 sg | `matmul2d_tensorops_nn_splitk_f32` | Long $K$ with $K \times N \ge 2^{23}$: partitions of $2^{21}/N$ rows of B keep each slice of B in cache. LM-head $dX$ (4096×768×50304): 99.8 → 45.4 ms on M5 Pro |
 
 ### Column-Panel Grid Swizzling
 
@@ -125,18 +128,25 @@ flowchart TD
 ```
 
 ```metal
-if (tiles_n * tiles_m >= 2048u) {
-    constexpr uint PH = 8;
-    uint band = tgpig / (PH * tiles_n);
-    uint rem = tgpig - band * PH * tiles_n;
-    uint local_h = min(PH, tiles_m - band * PH);
-    tile = uint2(rem / local_h, band * PH + rem % local_h);
-} else {
-    tile = tile_from_linear(tgpig, tiles_n, tiles_m);
+inline uint2 tile_from_linear_panel(uint linear, uint tiles_n, uint tiles_m, uint ph) {
+    if (linear >= tiles_n * tiles_m) return uint2(tiles_n, tiles_m);
+    uint band = linear / (ph * tiles_n);
+    uint rem = linear - band * ph * tiles_n;
+    uint local_h = min(ph, tiles_m - band * ph);
+    return uint2(rem / local_h, band * ph + rem % local_h);
 }
+// coop NN: tiles_n * tiles_m >= 2048 → tile_from_linear_panel(..., 8)
 ```
 
 This bounds operand $B$ rereads to $\text{tiles}_m / 8$ passes, boosting large square throughput ($4096^3$) from 24.9 TFLOP/s to 29.0 TFLOP/s on Apple M5 Pro.
+
+The exact-f32 kernels (`matmul2d_tensorops_f32`, `_tn_f32`, `_nt_f32`, `_tn_accum_f32`, `_nt_accum_f32`; 32×32 tiles, one simdgroup) take the same walk in 16-tile-row bands through `tile_walk_f32`, gated on $N \times K \ge 2^{23}$ elements rather than on the grid. Under row-major order, the threadgroups running at one time share an A tile and each read a different B tile, so all of $B$ is re-read once per 32-row tile row. A 32-row tile does 16 flop per byte of B. Once B no longer fits in cache, each pass runs at DRAM speed: a 50304×768 LM-head weight ran at ~2.3 TFLOP/s at any row count, against ~6.5 at $N \le 2304$. Interleaved A/B on M5 Pro, min of 4 runs, time relative to row-major:
+
+| Shape | B size | Panel time |
+|---|---:|---:|
+| NT, $N \ge 16384$, $K = 768$ | 50 MB and up | 0.39–0.47× |
+| TN, $N = 2048$, $K = 4096$ | 32 MB | 0.77× |
+| TN, $N = 768$, $K = 4096$ | 12.6 MB | ~1.08× (reason for the size gate) |
 
 ---
 
@@ -144,7 +154,9 @@ This bounds operand $B$ rereads to $\text{tiles}_m / 8$ passes, boosting large s
 
 The 18 Metal sources of the `nn` library compile to 72 kernel entry points (the
 Qwen3.5 kernels in `tessl::qwen35` add three sources and eleven more — see
-[qwen35.md](qwen35.md)). The `nn` ones arrived here by
+[qwen35.md](qwen35.md)). Counted over the whole crate on 2026-10-02 there are
+30 Metal sources and 205 entry points: the difference is the Qwen3.5 forward,
+backward and AdamW kernels. The `nn` ones arrived here by
 promotion out of `gemma-metal`, where they were reachable only as raw pipeline
 name strings through an overlay metallib — meaning a typo in a name was a
 runtime failure, and nothing checked that a buffer was large enough for the grid

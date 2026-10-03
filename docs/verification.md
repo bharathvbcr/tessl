@@ -453,6 +453,10 @@ log.
 
 ## Current state
 
+> The figures below are the 2026-09-19 run. A `#[test]` count on 2026-10-02 finds
+> 530 test functions across `tests/` and `src/`; the GPU suite has not been
+> re-run for this document, so the pass counts below are not yet updated.
+
 Re-measured 2026-09-19 with `cargo test --release -- --test-threads=1`, which is
 mandatory rather than tuning: GPU tests share default command encoders across
 threads.

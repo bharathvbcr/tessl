@@ -376,6 +376,10 @@ fn every_rows_kernel_the_host_can_ask_for_exists() {
             }
         }
     }
+    assert!(
+        src.contains("ROWS_KERNEL(flash_attn_rows_h64_r8_g8, 64, 8, 8)"),
+        "flash_attn_rows.metal is missing the D=64 R=8 SGT=8 instantiation"
+    );
     assert_eq!(n, 27, "the (D, R, SGT) grid changed shape");
     // A threadgroup is SGT simdgroups of 32 threads and Metal caps that at
     // 1024, so the largest value in the enum is also the largest that can be

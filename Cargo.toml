@@ -71,6 +71,10 @@ objc2-metal = { version = "0.3", features = [
     "MTLResidencySet",
     "MTL4CommandQueue",
     "MTL4CommandBuffer",
+    # MTL4CommandBuffer has no status. GPU faults are reported on
+    # MTL4CommitFeedback::error, registered through MTL4CommitOptions.
+    "MTL4CommitFeedback",
+    "block2",
     "MTL4CommandAllocator",
     "MTL4CommandEncoder",
     "MTL4ComputeCommandEncoder",
@@ -95,6 +99,8 @@ objc2-metal = { version = "0.3", features = [
 # Named so the metallib loader can build a `DispatchData`. Not a new package:
 # objc2-metal 0.3.2 already depends on dispatch2 0.3.1.
 dispatch2 = "0.3"
+# Already the block crate objc2-metal uses for MTL4CommitFeedbackHandler.
+block2 = "0.6"
 libc = "0.2"
 
 [profile.release]

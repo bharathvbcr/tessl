@@ -192,6 +192,81 @@ pub fn reference(layout: Layout, a: &[f32], b: &[f32], m: usize, n: usize, k: us
     Reference { c, mag }
 }
 
+/// Shapes that take the exact-f32 kernels' column-panel walk, which needs B
+/// (N×K) to hold at least `F32_PANEL_MIN_B_ELEMS` = 2^23 elements
+/// (`kernels/matmul_tensorops.metal`). The first has 18 tile rows (one full
+/// 16-row band and a partial one) and a ragged last tile column; the second
+/// has 2 tile rows, so its only band is short.
+pub const F32_PANEL_SHAPES: &[(usize, usize, usize)] = &[(545, 8200, 1024), (33, 8193, 1024)];
+
+/// Operands in `layout`'s storage order where only `p = 0` contributes: A's
+/// `p = 0` entries are random and the rest of A is zero, B is random. Every
+/// other term adds an exact zero, so the reference is the outer product of
+/// A's first column and B's first row, O(M·N) at any K. A tile the kernel
+/// never writes stays at zero and fails the comparison.
+pub fn rank_one_case(layout: Layout, m: usize, n: usize, k: usize, seed: u64) -> (Vec<f32>, Vec<f32>, Reference) {
+    let a0 = random_f32(m, seed);
+    let mut a = vec![0.0f32; m * k];
+    for (i, &v) in a0.iter().enumerate() {
+        match layout {
+            Layout::Nn | Layout::Nt => a[i * k] = v,
+            Layout::Tn => a[i] = v,
+        }
+    }
+    let b = random_f32(k * n, seed ^ 0x5eed);
+    let b0 = |j: usize| -> f64 {
+        match layout {
+            Layout::Nn | Layout::Tn => b[j] as f64,
+            Layout::Nt => b[j * k] as f64,
+        }
+    };
+    let mut c = vec![0.0f64; m * n];
+    let mut mag = vec![0.0f64; m * n];
+    for i in 0..m {
+        for j in 0..n {
+            let term = a0[i] as f64 * b0(j);
+            c[i * n + j] = term;
+            mag[i * n + j] = term.abs();
+        }
+    }
+    (a, b, Reference { c, mag })
+}
+
+/// NN operands with a random A[M,K] and a rank-one B[K,N] = u ⊗ v, so every
+/// term of K contributes (a K partition the kernel skips changes the answer)
+/// while the reference stays O(M·K + M·N). `v` holds signed powers of two, so
+/// each `u_k·v_j` is exact in f32 and the factorisation holds for the values
+/// the GPU reads: `C[i,j] = (Σ_k A[i,k] u_k) v_j`, with budget magnitude
+/// `(Σ_k |A[i,k] u_k|) |v_j|`.
+pub fn rank_one_b_case(m: usize, n: usize, k: usize, seed: u64) -> (Vec<f32>, Vec<f32>, Reference) {
+    let a = random_f32(m * k, seed);
+    let u = random_f32(k, seed ^ 0x0b0e);
+    let v: Vec<f32> = random_f32(n, seed ^ 0x0b0f)
+        .iter()
+        .map(|&r| {
+            // r in [-1, 1): sign from r, magnitude 2^-2 .. 2^1.
+            let exp = ((r.abs() * 4.0) as i32).min(3) - 2;
+            2f32.powi(exp).copysign(r)
+        })
+        .collect();
+    let b: Vec<f32> = (0..k * n).map(|idx| u[idx / n] * v[idx % n]).collect();
+    let mut c = vec![0.0f64; m * n];
+    let mut mag = vec![0.0f64; m * n];
+    for i in 0..m {
+        let (mut dot, mut abs) = (0.0f64, 0.0f64);
+        for p in 0..k {
+            let term = a[i * k + p] as f64 * u[p] as f64;
+            dot += term;
+            abs += term.abs();
+        }
+        for j in 0..n {
+            c[i * n + j] = dot * v[j] as f64;
+            mag[i * n + j] = abs * (v[j] as f64).abs();
+        }
+    }
+    (a, b, Reference { c, mag })
+}
+
 /// f32 unit roundoff, 2^-24.
 pub const U_F32: f64 = 5.960_464_477_539_063e-8;
 /// bf16 unit roundoff, 2^-8. Also a safe upper bound for tf32-class formats

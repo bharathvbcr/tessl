@@ -37,6 +37,36 @@ inline uint2 tile_from_linear(uint linear, uint tiles_n, uint tiles_m) {
     return uint2(linear % tiles_n, linear / tiles_n);
 }
 
+/// Decode linear TG id → (x, y) tile by column panels: bands of `ph` tile
+/// rows, each walked down a column before moving right. Threadgroups that run
+/// together then share B tiles, so B is read once per band instead of once
+/// per tile row. An id past the grid decodes to (tiles_n, tiles_m), which
+/// every caller's bounds check rejects.
+inline uint2 tile_from_linear_panel(uint linear, uint tiles_n, uint tiles_m, uint ph) {
+    if (linear >= tiles_n * tiles_m) return uint2(tiles_n, tiles_m);
+    uint band = linear / (ph * tiles_n);
+    uint rem = linear - band * ph * tiles_n;
+    uint local_h = min(ph, tiles_m - band * ph);
+    return uint2(rem / local_h, band * ph + rem % local_h);
+}
+
+/// Tile walk of the exact-f32 kernels. Row-major order re-reads all of B
+/// (the N×K operand) once per 32-row tile row. That is free while B stays in
+/// cache and DRAM-bound once it does not: the LM head's 50304×768 weight ran
+/// at ~2.3 TFLOP/s against ~6.5 at N ≤ 2304. So the walk is chosen by B's
+/// size, not the grid's. M5 Pro, interleaved A/B, min of 4 (ojas
+/// bench/results/2026-10-02-gemm): column panels ran 0.39–0.47× the time of
+/// row-major for nt with B ≥ 50 MB and 0.77× for TN at B = 32 MB, but ~1.08×
+/// for TN at B = 12.6 MB; 25 MB was within run-to-run noise either way.
+constexpr constant ulong F32_PANEL_MIN_B_ELEMS = 1ul << 23; // 32 MiB of f32
+constexpr constant uint F32_PANEL_ROWS = 16u;
+inline uint2 tile_walk_f32(uint linear, uint tiles_n, uint tiles_m, uint N, uint K) {
+    if ((ulong)N * (ulong)K >= F32_PANEL_MIN_B_ELEMS) {
+        return tile_from_linear_panel(linear, tiles_n, tiles_m, F32_PANEL_ROWS);
+    }
+    return tile_from_linear(linear, tiles_n, tiles_m);
+}
+
 // =============================================================================
 // f32 exact — execution_simdgroup, SM=SN=32 (golden-safe)
 // =============================================================================
@@ -60,7 +90,7 @@ kernel void matmul2d_tensorops_f32(
                             matmul2d_descriptor::mode::multiply);
     matmul2d<desc, execution_simdgroup> op;
 
-    uint2 tile = tile_from_linear(tgpig, tiles_n, tiles_m);
+    uint2 tile = tile_walk_f32(tgpig, tiles_n, tiles_m, N, K);
     if (tile.x >= tiles_n || tile.y >= tiles_m) return;
     int tx = (int)tile.x * SN;
     int ty = (int)tile.y * SM;
@@ -109,7 +139,7 @@ kernel void matmul2d_tensorops_tn_f32(
                             matmul2d_descriptor::mode::multiply);
     matmul2d<desc, execution_simdgroup> op;
 
-    uint2 tile = tile_from_linear(tgpig, tiles_n, tiles_m);
+    uint2 tile = tile_walk_f32(tgpig, tiles_n, tiles_m, N, K);
     if (tile.x >= tiles_n || tile.y >= tiles_m) return;
     int tx = (int)tile.x * SN;
     int ty = (int)tile.y * SM;
@@ -156,7 +186,7 @@ kernel void matmul2d_tensorops_nt_f32(
                             matmul2d_descriptor::mode::multiply);
     matmul2d<desc, execution_simdgroup> op;
 
-    uint2 tile = tile_from_linear(tgpig, tiles_n, tiles_m);
+    uint2 tile = tile_walk_f32(tgpig, tiles_n, tiles_m, N, K);
     if (tile.x >= tiles_n || tile.y >= tiles_m) return;
     int tx = (int)tile.x * SN;
     int ty = (int)tile.y * SM;
@@ -202,7 +232,7 @@ kernel void matmul2d_tensorops_tn_accum_f32(
                             matmul2d_descriptor::mode::multiply_accumulate);
     matmul2d<desc, execution_simdgroup> op;
 
-    uint2 tile = tile_from_linear(tgpig, tiles_n, tiles_m);
+    uint2 tile = tile_walk_f32(tgpig, tiles_n, tiles_m, N, K);
     if (tile.x >= tiles_n || tile.y >= tiles_m) return;
     int tx = (int)tile.x * SN;
     int ty = (int)tile.y * SM;
@@ -247,7 +277,7 @@ kernel void matmul2d_tensorops_nt_accum_f32(
                             matmul2d_descriptor::mode::multiply_accumulate);
     matmul2d<desc, execution_simdgroup> op;
 
-    uint2 tile = tile_from_linear(tgpig, tiles_n, tiles_m);
+    uint2 tile = tile_walk_f32(tgpig, tiles_n, tiles_m, N, K);
     if (tile.x >= tiles_n || tile.y >= tiles_m) return;
     int tx = (int)tile.x * SN;
     int ty = (int)tile.y * SM;
@@ -304,6 +334,104 @@ kernel void matmul2d_tensorops_tn_splitk_f32(
     auto mC = tensor(C, dextents<int, 2>{(int)N, (int)M}, array<int, 2>{1, (int)N});
 
     auto tA = mA.slice(ty, 0);
+    auto tB = mB.slice(tx, 0);
+    auto tC = mC.slice(tx, ty);
+    op.run(tA, tB, tC);
+}
+
+/// Split-K TN with every K-partition in one dispatch, for a C of few tiles
+/// over a long K: a weight gradient of a handful of rows, such as
+/// `d_pre^T · x` at [12, 768] over 4096 rows (24 tiles). One dispatch over
+/// all of K gives such a C only `tiles_n · tiles_m` threadgroups, each
+/// walking the whole of K, and the sequential split-K above keeps that count
+/// per partition. Here threadgroup `p · tiles + t` computes tile `t` of
+/// partition `p` (K from `p · k_tile`) into slice `p` of a zeroed scratch
+/// `S` of `partitions` slices `slice` floats apart (M·N rounded up to a
+/// multiple of 4, so every slice starts 16-byte aligned, as each partition's
+/// start in A and B does with `k_tile` a multiple of 4);
+/// `reduce_partitions_f32` then adds the slices into C in partition order.
+kernel void matmul2d_tensorops_tn_splitk_par_f32(
+    device float *A [[buffer(0)]],
+    device float *B [[buffer(1)]],
+    device float *S [[buffer(2)]],
+    constant uint &M [[buffer(3)]],
+    constant uint &N [[buffer(4)]],
+    constant uint &K [[buffer(5)]],
+    constant uint &k_tile [[buffer(6)]],
+    constant uint &tiles_n [[buffer(7)]],
+    constant uint &tiles_m [[buffer(8)]],
+    constant uint &partitions [[buffer(9)]],
+    constant uint &slice [[buffer(10)]],
+    uint tgpig [[threadgroup_position_in_grid]])
+{
+    constexpr int SM = 32;
+    constexpr int SN = 32;
+    constexpr auto desc =
+        matmul2d_descriptor(SM, SN, dynamic_length_v<int>, true, false, false,
+                            matmul2d_descriptor::mode::multiply);
+    matmul2d<desc, execution_simdgroup> op;
+
+    const uint tiles = tiles_n * tiles_m;
+    if (tiles == 0u) return;
+    const uint p = tgpig / tiles;
+    if (p >= partitions) return;
+    uint2 tile = tile_from_linear(tgpig - p * tiles, tiles_n, tiles_m);
+    if (tile.x >= tiles_n || tile.y >= tiles_m) return;
+    const ulong k0 = (ulong)p * k_tile;
+    if (k0 >= K) return;
+    int tx = (int)tile.x * SN;
+    int ty = (int)tile.y * SM;
+
+    uint k_len = (uint)min((ulong)k_tile, (ulong)K - k0);
+    auto mA = tensor(A + k0 * M, dextents<int, 2>{(int)M, (int)k_len}, array<int, 2>{1, (int)M});
+    auto mB = tensor(B + k0 * N, dextents<int, 2>{(int)N, (int)k_len}, array<int, 2>{1, (int)N});
+    auto mS = tensor(S + (ulong)p * slice, dextents<int, 2>{(int)N, (int)M}, array<int, 2>{1, (int)N});
+
+    auto tA = mA.slice(ty, 0);
+    auto tB = mB.slice(tx, 0);
+    auto tS = mS.slice(tx, ty);
+    op.run(tA, tB, tS);
+}
+
+/// Split-K NN accumulate for one K-partition: C[M,N] += A[M, k0:k0+len] @
+/// B[k0:k0+len, N], with C zeroed by the host first. For a long K the host
+/// cuts K into partitions whose slice of B fits in cache. One dispatch over
+/// the whole K re-reads all of B for every 32-row tile row, the same B-bound
+/// walk as the LM head's NT, and a column-panel walk does not help when each
+/// tile's A slab is K long as well.
+kernel void matmul2d_tensorops_nn_splitk_f32(
+    device float *A [[buffer(0)]],
+    device float *B [[buffer(1)]],
+    device float *C [[buffer(2)]],
+    constant uint &M [[buffer(3)]],
+    constant uint &N [[buffer(4)]],
+    constant uint &K [[buffer(5)]],
+    constant uint &k0 [[buffer(6)]],
+    constant uint &k_tile [[buffer(7)]],
+    constant uint &tiles_n [[buffer(8)]],
+    constant uint &tiles_m [[buffer(9)]],
+    uint tgpig [[threadgroup_position_in_grid]])
+{
+    constexpr int SM = 32;
+    constexpr int SN = 32;
+    constexpr auto mmul_mode = matmul2d_descriptor::mode::multiply_accumulate;
+    constexpr auto desc =
+        matmul2d_descriptor(SM, SN, dynamic_length_v<int>, false, false, false, mmul_mode);
+    matmul2d<desc, execution_simdgroup> op;
+
+    uint2 tile = tile_from_linear(tgpig, tiles_n, tiles_m);
+    if (tile.x >= tiles_n || tile.y >= tiles_m) return;
+    int tx = (int)tile.x * SN;
+    int ty = (int)tile.y * SM;
+
+    // A[M,K] row-major: the partition is columns k0.. of each row (row stride
+    // K). B[K,N] row-major: the partition is rows k0.. (contiguous).
+    uint k_len = min(k_tile, K - k0);
+    auto mA = tensor(A + k0, dextents<int, 2>{(int)k_len, (int)M}, array<int, 2>{1, (int)K});
+    auto mB = tensor(B + k0 * N, dextents<int, 2>{(int)N, (int)k_len}, array<int, 2>{1, (int)N});
+    auto mC = tensor(C, dextents<int, 2>{(int)N, (int)M}, array<int, 2>{1, (int)N});
+
+    auto tA = mA.slice(0, ty);
     auto tB = mB.slice(tx, 0);
     auto tC = mC.slice(tx, ty);
     op.run(tA, tB, tC);
@@ -420,11 +548,7 @@ inline void mm_nn_coop_f32acc(device ElemT *A, device ElemT *B, device float *C,
     // tall_k1024/mlp_up, gated off where it measured -3% (square_2048).
     uint2 tile;
     if (tiles_n * tiles_m >= 2048u) {
-        constexpr uint PH = 8;
-        uint band = tgpig / (PH * tiles_n);
-        uint rem = tgpig - band * PH * tiles_n;
-        uint local_h = min(PH, tiles_m - band * PH);
-        tile = uint2(rem / local_h, band * PH + rem % local_h);
+        tile = tile_from_linear_panel(tgpig, tiles_n, tiles_m, 8u);
     } else {
         tile = tile_from_linear(tgpig, tiles_n, tiles_m);
     }

@@ -292,9 +292,25 @@ impl GpuBuffer {
     }
 
     pub fn write_u32(&self, data: &[u32]) {
-        let mut dst = self.contents_u32();
-        assert_eq!(dst.len(), data.len());
+        self.try_write_u32(data).expect("write_u32");
+    }
+
+    /// [`Self::write_u32`] without panicking.
+    ///
+    /// A poisoned or busy runtime, and a length that is not the buffer's
+    /// logical `u32` count, are `Err`. [`Self::write_u32`] still panics on
+    /// those same failures.
+    pub fn try_write_u32(&self, data: &[u32]) -> Result<(), String> {
+        let mut dst = self.try_contents_u32()?;
+        if dst.len() != data.len() {
+            return Err(format!(
+                "write_u32: {} elements for a buffer of {}",
+                data.len(),
+                dst.len()
+            ));
+        }
         dst.copy_from_slice(data);
+        Ok(())
     }
 
     pub fn read_u32(&self) -> Vec<u32> {

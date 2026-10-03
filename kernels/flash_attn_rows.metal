@@ -229,3 +229,7 @@ ROWS_KERNEL(flash_attn_rows_h512_r16_g32, 512, 16, 32)
 ROWS_KERNEL(flash_attn_rows_h512_r8_g8, 512, 8, 8)
 ROWS_KERNEL(flash_attn_rows_h512_r8_g16, 512, 8, 16)
 ROWS_KERNEL(flash_attn_rows_h512_r8_g32, 512, 8, 32)
+// D=64 needs D % (4*R) == 0 so the float4 lane map covers the head.
+// R=8 gives 64 % 32 == 0 and two float4s per lane. R=32 would be a zero
+// trip count (DPV = 0). One instantiation: the host default is R=8, SGT=8.
+ROWS_KERNEL(flash_attn_rows_h64_r8_g8, 64, 8, 8)

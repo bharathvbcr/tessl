@@ -100,11 +100,11 @@
 //!
 //! # Kernels
 //!
-//! 30 Metal sources compile to 201 kernel entry points: RMSNorm, gated MLP
+//! 30 Metal sources compile to 205 kernel entry points: RMSNorm, gated MLP
 //! activations, flash attention (sliding-window and global), fused
 //! RMSNorm+QKV+RoPE, MLX-format Q4 GEMV/GEMM, Q8 GEMV, an exact int8 GEMM, KV
 //! cache stores, embedding lookup, row-wise softmax/sum/max, and softcap
-//! sampling. [`nn`] exposes them through 78 shape-checked functions. The
+//! sampling. [`nn`] exposes them through 84 shape-checked functions. The
 //! Qwen3.5 layer kernels — the gated delta net (chunked prefill and
 //! snapshot-reading decode), its causal conv and gated norm, the attention
 //! extras, and answer-row scoring — are in [`qwen35`], and the whole
@@ -257,7 +257,12 @@ pub use ops::softcap_f32;
 pub use runtime::{BufferKind, DeviceMemoryInfo, GpuRuntime, ParamsBuffer, PrecisionMode};
 pub use tensor::{DType, GpuBuffer, Tensor};
 
-/// Metallib produced by `build.rs` (absolute path baked at compile time).
+/// Metallib produced by `build.rs`.
+///
+/// The path is the on-disk artifact (`DEP_TESSL_METALLIB` publishes the same
+/// string). [`GpuRuntime::new`] does not open it: the bytes are embedded with
+/// `include_bytes!` and loaded through `newLibraryWithData`. Tooling that
+/// inspects the shader binary, such as `metal-nm`, still reads this path.
 pub fn metallib_path() -> &'static str {
     env!("TESSL_METALLIB")
 }

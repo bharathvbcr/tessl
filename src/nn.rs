@@ -92,6 +92,33 @@ pub(crate) fn require_runtime(rt: &GpuRuntime, buf: &GpuBuffer, what: &str) -> R
     Ok(())
 }
 
+fn checked_buffer_byte_range(nbytes: usize, byte_offset: usize, byte_len: usize, what: &str) -> Result<(), String> {
+    let end = byte_offset
+        .checked_add(byte_len)
+        .ok_or_else(|| format!("{what}: byte range overflows usize"))?;
+    if end > nbytes {
+        return Err(format!(
+            "{what}: byte range {byte_offset}..{end} exceeds buffer capacity {nbytes}"
+        ));
+    }
+    Ok(())
+}
+
+/// Validate an owned raw buffer range without allocating, staging scalars, or
+/// opening an encoder.
+///
+/// A zero-length range is valid when its offset is at most `buf.nbytes()`.
+pub fn validate_buffer_byte_range(
+    rt: &GpuRuntime,
+    buf: &GpuBuffer,
+    byte_offset: usize,
+    byte_len: usize,
+    what: &str,
+) -> Result<(), String> {
+    require_runtime(rt, buf, what)?;
+    checked_buffer_byte_range(buf.nbytes(), byte_offset, byte_len, what)
+}
+
 fn require_capacity<T>(buf: &GpuBuffer, need: usize, what: &str) -> Result<(), String> {
     let have = capacity_of::<T>(buf);
     if have < need {
@@ -1523,6 +1550,8 @@ pub fn rows_lanes_for(d: u32) -> RowsLanes {
     match d {
         512 => ROWS_LANES_D512,
         256 => ROWS_LANES_D256,
+        // D=64 is compiled only at R=8. That is this arm (`ROWS_LANES_D128`),
+        // and `rows_entry` refuses every other lane count at D=64.
         _ => ROWS_LANES_D128,
     }
 }
@@ -1574,12 +1603,19 @@ pub fn rows_groups_for(d: u32) -> RowsGroups {
     match d {
         512 => ROWS_GROUPS_D512,
         256 => ROWS_GROUPS_D256,
+        // D=64 is compiled only at SGT=8, which is this arm.
         _ => ROWS_GROUPS_D128,
     }
 }
 
 fn rows_entry(d: u32, r: RowsLanes, g: RowsGroups) -> Option<String> {
-    if !matches!(d, 128 | 256 | 512) {
+    let compiled = match d {
+        128 | 256 | 512 => true,
+        // One lane count. R=32 does not divide the float4 map (D % (4R) != 0).
+        64 => r == RowsLanes::R8 && g == RowsGroups::G8,
+        _ => false,
+    };
+    if !compiled {
         return None;
     }
     Some(format!("flash_attn_rows_h{d}_r{}_g{}", r.width(), g.count()))
@@ -1644,8 +1680,13 @@ pub fn flash_attn_rows_with_lanes(
     groups: RowsGroups,
     out_bf16: bool,
 ) -> Result<(), String> {
-    let entry = rows_entry(head_dim, lanes, groups)
-        .ok_or_else(|| format!("flash_attn_rows: head dim {head_dim} has no kernel (128, 256 or 512)"))?;
+    let entry = rows_entry(head_dim, lanes, groups).ok_or_else(|| {
+        if head_dim == 64 {
+            "flash_attn_rows: head dim 64 is instantiated only as flash_attn_rows_h64_r8_g8".to_string()
+        } else {
+            format!("flash_attn_rows: head dim {head_dim} has no kernel (128, 256 or 512)")
+        }
+    })?;
     let kv_capacity = validate_rows_attn_call(
         rt,
         q,
@@ -2755,7 +2796,8 @@ pub unsafe fn argmax_f32_pass_with_scalars(
         scalars(bnd);
         set_gpu_buf(bnd, idx_buf, 4);
         set_gpu_buf(bnd, softcap, 6);
-    })
+    })?;
+    refuse_sentinel_indices(rt, out_idx, groups, "argmax_f32_pass")
 }
 
 /// Softcap `logits` in place and write the argmax index to `out_token`.
@@ -2815,7 +2857,8 @@ pub unsafe fn softcap_sample_with_scalars(
         set_gpu_buf(bnd, out_token, 1);
         set_gpu_buf(bnd, softcap, 2);
         scalars(bnd);
-    })
+    })?;
+    refuse_nonfinite_argmax(rt, out_token, "softcap_sample")
 }
 
 /// Softcap-and-argmax over an arbitrarily large `logits`, in one dispatch.
@@ -2869,7 +2912,28 @@ pub unsafe fn softcap_argmax_one_pass_with_scalars(
         set_gpu_buf(bnd, out_token, 1);
         set_gpu_buf(bnd, softcap, 2);
         scalars(bnd);
-    })
+    })?;
+    refuse_nonfinite_argmax(rt, out_token, "softcap_argmax_one_pass")
+}
+
+fn refuse_nonfinite_argmax(rt: &GpuRuntime, out_token: &GpuBuffer, what: &str) -> Result<(), String> {
+    rt.synchronize()?;
+    let idx = out_token.try_contents_u32()?;
+    if idx.first() == Some(&u32::MAX) {
+        return Err(format!("{what}: logit row has no finite value"));
+    }
+    Ok(())
+}
+
+/// `argmax_f32` writes `0xFFFFFFFF` for a group whose maximum is not finite.
+/// That value is a sentinel, not a token id.
+fn refuse_sentinel_indices(rt: &GpuRuntime, out_idx: &GpuBuffer, groups: usize, what: &str) -> Result<(), String> {
+    rt.synchronize()?;
+    let idx = out_idx.try_contents_u32()?;
+    if idx.iter().take(groups).any(|v| *v == u32::MAX) {
+        return Err(format!("{what}: logit row has no finite value"));
+    }
+    Ok(())
 }
 
 // ------------------------------------------------- Quantized weight banks ---
@@ -3051,6 +3115,37 @@ pub fn gemv_q4(
     }
 }
 
+/// Validate every host-side invariant for [`gemv_q4`] without encoding work.
+///
+/// Adapters that bind dimensions from a stable scalar pool call this before
+/// reserving slots, so a malformed input cannot consume them.
+pub fn validate_gemv_q4(
+    rt: &GpuRuntime,
+    bank: Q4Bank<'_>,
+    x: &GpuBuffer,
+    y: &GpuBuffer,
+    shape: QuantShape,
+    tiled: bool,
+) -> Result<(), String> {
+    let entry = if tiled { "gemv_q4_tiled" } else { "gemv_q4" };
+    bank.validate(rt, &shape, entry)?;
+    require::<f32>(rt, x, shape.cols as usize, &format!("{entry} x"))?;
+    require::<f32>(rt, y, shape.rows as usize, &format!("{entry} y"))?;
+    if shape.rows == 0 {
+        return Ok(());
+    }
+    require_disjoint_writes(
+        "gemv_q4",
+        &[("y", y)],
+        &[
+            ("packed", bank.packed),
+            ("scales", bank.scales),
+            ("zeros", bank.zeros),
+            ("x", x),
+        ],
+    )
+}
+
 /// [`gemv_q4`] with caller-supplied scalar binds.
 /// # Safety
 /// Caller must uphold the same buffer aliasing and lifetime contracts as the
@@ -3066,23 +3161,10 @@ pub unsafe fn gemv_q4_with_scalars(
     scalars: impl FnOnce(&mut Binder<'_>),
 ) -> Result<(), String> {
     let entry = if tiled { "gemv_q4_tiled" } else { "gemv_q4" };
-    bank.validate(rt, &shape, entry)?;
-    require::<f32>(rt, x, shape.cols as usize, &format!("{entry} x"))?;
-    require::<f32>(rt, y, shape.rows as usize, &format!("{entry} y"))?;
+    validate_gemv_q4(rt, bank, x, y, shape, tiled)?;
     if shape.rows == 0 {
         return Ok(());
     }
-
-    require_disjoint_writes(
-        "gemv_q4",
-        &[("y", y)],
-        &[
-            ("packed", bank.packed),
-            ("scales", bank.scales),
-            ("zeros", bank.zeros),
-            ("x", x),
-        ],
-    )?;
     let p = rt.pipeline(entry)?;
     // `gemv_q4` is one simdgroup per `SIMD_ROWS_PER_TG / 2` output rows with
     // lanes striding K. `gemv_q4_tiled` indexes its output row by
@@ -3356,6 +3438,67 @@ pub fn gemv_q4_mlx(
     }
 }
 
+/// Validate [`gemv_q4_mlx`] without encoding work, including the row-kernel
+/// threadgroup-memory ceiling. [`validate_gemv_q4_mlx_inputs`] is the same
+/// check without that ceiling, for adapters that still have to pick a kernel.
+pub fn validate_gemv_q4_mlx(
+    rt: &GpuRuntime,
+    bank: Q4MlxBank<'_>,
+    x: &GpuBuffer,
+    y: &GpuBuffer,
+    shape: QuantShape,
+    variant: Q4MlxRowVariant,
+) -> Result<(), String> {
+    let entry = variant.entry();
+    validate_gemv_q4_mlx_f32_inputs(rt, bank, x, y, shape, entry)?;
+    if shape.rows == 0 || variant == Q4MlxRowVariant::Tiled {
+        return Ok(());
+    }
+    let bytes = (shape.cols as usize).saturating_mul(4);
+    let limit = rt.max_threadgroup_memory();
+    if bytes > limit {
+        return Err(format!(
+            "{entry}: caching x needs {bytes} bytes of threadgroup memory but this \
+             device allows {limit}; cols {} is too large for this kernel",
+            shape.cols
+        ));
+    }
+    Ok(())
+}
+
+/// Validate the common f32 MLX Q4 GEMV contract before an adapter picks a
+/// row, tiled, or bf16-SIMD kernel. Does not impose a threadgroup-memory ceiling.
+pub fn validate_gemv_q4_mlx_inputs(
+    rt: &GpuRuntime,
+    bank: Q4MlxBank<'_>,
+    x: &GpuBuffer,
+    y: &GpuBuffer,
+    shape: QuantShape,
+) -> Result<(), String> {
+    validate_gemv_q4_mlx_f32_inputs(rt, bank, x, y, shape, "gemv_q4_mlx")
+}
+
+fn validate_gemv_q4_mlx_f32_inputs(
+    rt: &GpuRuntime,
+    bank: Q4MlxBank<'_>,
+    x: &GpuBuffer,
+    y: &GpuBuffer,
+    shape: QuantShape,
+    entry: &str,
+) -> Result<(), String> {
+    bank.validate(rt, &shape, 1, entry)?;
+    require::<f32>(rt, x, shape.cols as usize, &format!("{entry} x"))?;
+    require::<f32>(rt, y, shape.rows as usize, &format!("{entry} y"))?;
+    if shape.rows == 0 {
+        return Ok(());
+    }
+    require_disjoint_writes(
+        entry,
+        &[("y", y)],
+        &[("packed", bank.packed), ("scales_biases", bank.scales_biases), ("x", x)],
+    )
+}
+
 /// [`gemv_q4_mlx`] with caller-supplied scalar binds.
 /// # Safety
 /// Caller must uphold the same buffer aliasing and lifetime contracts as the
@@ -3371,18 +3514,10 @@ pub unsafe fn gemv_q4_mlx_with_scalars(
     scalars: impl FnOnce(&mut Binder<'_>),
 ) -> Result<(), String> {
     let entry = variant.entry();
-    bank.validate(rt, &shape, 1, entry)?;
-    require::<f32>(rt, x, shape.cols as usize, &format!("{entry} x"))?;
-    require::<f32>(rt, y, shape.rows as usize, &format!("{entry} y"))?;
+    validate_gemv_q4_mlx(rt, bank, x, y, shape, variant)?;
     if shape.rows == 0 {
         return Ok(());
     }
-
-    require_disjoint_writes(
-        "gemv_q4_mlx",
-        &[("y", y)],
-        &[("packed", bank.packed), ("scales_biases", bank.scales_biases), ("x", x)],
-    )?;
     let p = rt.pipeline(entry)?;
     // `Tiled` takes a different grid from `Standard` and `Wide`, and until
     // 2026-08-31 all three got the one-thread-per-row geometry below.
@@ -3402,14 +3537,6 @@ pub unsafe fn gemv_q4_mlx_with_scalars(
         (shape.rows as usize, GEMV_TILED_TPTG, None)
     } else {
         let bytes = (shape.cols as usize).saturating_mul(4);
-        let limit = rt.max_threadgroup_memory();
-        if bytes > limit {
-            return Err(format!(
-                "{entry}: caching x needs {bytes} bytes of threadgroup memory but this \
-                 device allows {limit}; cols {} is too large for this kernel",
-                shape.cols
-            ));
-        }
         let t = reduction_tptg(p.maxTotalThreadsPerThreadgroup(), GEMV_ROW_TPTG, GEMV_ROW_TPTG)
             .min(shape.rows as usize)
             .max(1);
@@ -3480,6 +3607,30 @@ pub fn gemv_q4_mlx_blocked(
     }
 }
 
+/// Validate every host-side invariant for [`gemv_q4_mlx_blocked`] without encoding.
+///
+/// The bank must hold rows padded to `BLOCKED_TILE_ROWS`, which is what the
+/// block-interleaved kernel reads.
+pub fn validate_gemv_q4_mlx_blocked(
+    rt: &GpuRuntime,
+    bank: Q4MlxBank<'_>,
+    x: &GpuBuffer,
+    y: &GpuBuffer,
+    shape: QuantShape,
+) -> Result<(), String> {
+    bank.validate(rt, &shape, BLOCKED_TILE_ROWS, "gemv_q4_mlx_blocked")?;
+    require::<f32>(rt, x, shape.cols as usize, "gemv_q4_mlx_blocked x")?;
+    require::<f32>(rt, y, shape.rows as usize, "gemv_q4_mlx_blocked y")?;
+    if shape.rows == 0 {
+        return Ok(());
+    }
+    require_disjoint_writes(
+        "gemv_q4_mlx_blocked",
+        &[("y", y)],
+        &[("packed", bank.packed), ("scales_biases", bank.scales_biases), ("x", x)],
+    )
+}
+
 /// [`gemv_q4_mlx_blocked`] with caller-supplied scalar binds.
 /// # Safety
 /// Caller must uphold the same buffer aliasing and lifetime contracts as the
@@ -3493,18 +3644,10 @@ pub unsafe fn gemv_q4_mlx_blocked_with_scalars(
     shape: QuantShape,
     scalars: impl FnOnce(&mut Binder<'_>),
 ) -> Result<(), String> {
-    bank.validate(rt, &shape, BLOCKED_TILE_ROWS, "gemv_q4_mlx_blocked")?;
-    require::<f32>(rt, x, shape.cols as usize, "gemv_q4_mlx_blocked x")?;
-    require::<f32>(rt, y, shape.rows as usize, "gemv_q4_mlx_blocked y")?;
+    validate_gemv_q4_mlx_blocked(rt, bank, x, y, shape)?;
     if shape.rows == 0 {
         return Ok(());
     }
-
-    require_disjoint_writes(
-        "gemv_q4_mlx_blocked",
-        &[("y", y)],
-        &[("packed", bank.packed), ("scales_biases", bank.scales_biases), ("x", x)],
-    )?;
     let p = rt.pipeline("gemv_q4_mlx_blocked")?;
     let groups = (shape.rows as usize).div_ceil(GEMV_BN);
     let tg_mem = (shape.cols as usize).min(GEMV_X_TILE) * 4;
@@ -3546,6 +3689,43 @@ pub fn gemv_q4_mlx_simd(
     }
 }
 
+/// Validate every host-side invariant for [`gemv_q4_mlx_simd`] without encoding.
+/// `y == resid` is the one intentional writable alias.
+pub fn validate_gemv_q4_mlx_simd(
+    rt: &GpuRuntime,
+    bank: Q4MlxBank<'_>,
+    x_bf16: &GpuBuffer,
+    y: &GpuBuffer,
+    shape: QuantShape,
+    layout: Q4MlxLayout,
+    resid: Option<&GpuBuffer>,
+) -> Result<(), String> {
+    let entry = match (resid.is_some(), layout) {
+        (false, Q4MlxLayout::RowMajor) => "gemv_q4_mlx_simd",
+        (false, Q4MlxLayout::Interleaved4) => "gemv_q4_mlx_simd_i4",
+        (true, Q4MlxLayout::RowMajor) => "gemv_q4_mlx_simd_add",
+        (true, Q4MlxLayout::Interleaved4) => "gemv_q4_mlx_simd_add_i4",
+    };
+    bank.validate(rt, &shape, layout.tile_rows(), entry)?;
+    require::<u16>(rt, x_bf16, shape.cols as usize, &format!("{entry} x_bf16"))?;
+    require::<f32>(rt, y, shape.rows as usize, &format!("{entry} y"))?;
+    if let Some(r) = resid {
+        require::<f32>(rt, r, shape.rows as usize, &format!("{entry} resid"))?;
+    }
+    if shape.rows == 0 {
+        return Ok(());
+    }
+    require_disjoint_writes(
+        entry,
+        &[("y", y)],
+        &[
+            ("packed", bank.packed),
+            ("scales_biases", bank.scales_biases),
+            ("x_bf16", x_bf16),
+        ],
+    )
+}
+
 /// [`gemv_q4_mlx_simd`] with caller-supplied scalar binds.
 /// # Safety
 /// Caller must uphold the same buffer aliasing and lifetime contracts as the
@@ -3568,25 +3748,10 @@ pub unsafe fn gemv_q4_mlx_simd_with_scalars(
         (true, Q4MlxLayout::RowMajor) => "gemv_q4_mlx_simd_add",
         (true, Q4MlxLayout::Interleaved4) => "gemv_q4_mlx_simd_add_i4",
     };
-    bank.validate(rt, &shape, layout.tile_rows(), entry)?;
-    require::<u16>(rt, x_bf16, shape.cols as usize, &format!("{entry} x_bf16"))?;
-    require::<f32>(rt, y, shape.rows as usize, &format!("{entry} y"))?;
-    if let Some(r) = resid {
-        require::<f32>(rt, r, shape.rows as usize, &format!("{entry} resid"))?;
-    }
+    validate_gemv_q4_mlx_simd(rt, bank, x_bf16, y, shape, layout, resid)?;
     if shape.rows == 0 {
         return Ok(());
     }
-
-    require_disjoint_writes(
-        "gemv_q4_mlx_simd",
-        &[("y", y)],
-        &[
-            ("packed", bank.packed),
-            ("scales_biases", bank.scales_biases),
-            ("x_bf16", x_bf16),
-        ],
-    )?;
     let p = rt.pipeline(entry)?;
     let groups = simd_gemv_threadgroups(shape.rows);
     dispatch_tg_1d(rt, &p, groups, SIMD_TPTG, None, |bnd| {

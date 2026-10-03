@@ -6,8 +6,128 @@ All notable changes to `tessl` are recorded here. The format follows
 
 ## [Unreleased]
 
+### Changed
+
+- **Exact-f32 TN with a small C runs all its K partitions in one dispatch.**
+  A TN whose C has fewer than 128 32×32 tiles gave the single dispatch only a
+  few threadgroups, each walking all of K: the per-head gate weight gradient
+  (12 × 768 over 4096 rows, 24 tiles) ran at ~0.33 TFLOP/s. Such a TN, over a
+  K at least two partitions long, now computes every partition at once into a
+  scratch (`matmul2d_tensorops_tn_splitk_par_f32`) and adds them in partition
+  order (`reduce_partitions_f32`). The width (`tn_par_k_tile` in
+  `src/gemm.rs`) aims at ~768 threadgroups in multiples of 256, and the
+  scratch is capped at 2^22 floats. `gemm_tn_splitk_par_f32` is public, taking
+  the width, so a bench can sweep it.
+  - **Replaces the sequential split-K for overwriting f32 TN.** The shapes
+    `prefer_tn_splitk` picks (K ≥ 2048, small M·N) took one dispatch per
+    256-row partition, adding into C; that was slower than the single dispatch
+    there. The sequential kernel stays for bf16 and for `C +=`
+    (`gemm_tn_accum_train`), which must add into C.
+  - **Speed:** M5 Pro, `metal_bench tn`, min of 20 GPU spans in one quiet run
+    (the per-shape table is in ojas
+    `bench/results/2026-10-02-gate/tn-sweep/tn-sweep-2.md`): gate dW 225 → 45 µs;
+    attention dW (128 × 128 × 4096) 186 µs sequential → 31 µs; MLP dW
+    (128 × 384 × 4096) 192 → 74 µs; 64 × 64 × 4096 186 → 19 µs. Shapes of 128
+    tiles or more are unchanged. In ojas's gate backward (interleaved A/B,
+    4 rounds per side, under outside load), `gw` went from 227–234 to
+    43–46 µs and the whole backward from 790–806 to 602–638 µs.
+  - **Numerics:** deterministic (fixed partition order), not bit-identical to
+    one dispatch over all of K, inside the same f32 bound.
+  - **Tests:** `few_tile_long_k_tn_takes_parallel_partitions` (routing, and
+    the scratch cap over the old sequential domain);
+    `parallel_tn_partitions_cover_all_of_k`,
+    `parallel_tn_refuses_bad_widths_and_an_oversized_scratch` and
+    `parallel_tn_is_bit_identical_across_100_calls_in_flight` (GPU). The GPU
+    coverage test fails with A's partition offset dropped or the last
+    partition left out of the sum. Packing the scratch slices unpadded
+    survives the tests: the M5 Pro computes correctly from a slice that is
+    only 4-byte aligned. The padding is kept for tessl's 16-byte rule on GEMM
+    operands, not because a test observes it.
+
+- **Exact-f32 NN with a long K runs as K partitions.** An NN whose B (K×N)
+  holds ≥ 2^23 elements, with more than one 32-row tile row and K at least four
+  partitions long, now zeroes C and accumulates one dispatch per partition of
+  `2^21 / N` rows of B (a multiple of 256; 2560 at N = 768), in order, through
+  the new `matmul2d_tensorops_nn_splitk_f32` (`nn_splitk_k_tile` in
+  `src/gemm.rs`). The single dispatch re-read all of B for every 32-row tile
+  row, and the column-panel walk cannot help there because each tile's A slab
+  is K long too. The LM head's input gradient (4096 × 768 × 50304) ran at
+  ~3 TFLOP/s.
+  - **Speed:** M5 Pro, interleaved A/B, min of 4 per side: that GEMM went from
+    99.8 to 45.4 ms (~7 TFLOP/s; per-run ranges 100–113 vs 45–50 ms). K = 16384
+    went from 21.0 to 14.6 ms. Shapes that do not route are unchanged.
+  - **Numerics:** results are deterministic, since the partitions run in a
+    fixed order. They are not bit-identical to the single dispatch, because C
+    is rounded once per partition, but they stay inside the same f32 bound.
+  - **Shared dispatcher:** the TN split-K lanes (f32 and bf16) now share the
+    partition dispatcher, `dispatch_k_partitions`, with their 256-wide
+    partitions unchanged. It refuses a K·max(M, N) that the kernels' u32
+    offsets cannot hold.
+  - **Tests:** `long_k_nn_with_a_large_b_takes_k_partitions` (routing) and
+    `long_k_nn_partitions_cover_all_of_k` (GPU, rank-one B so every k
+    contributes, short last partition, ragged M and N). The GPU test fails
+    with A's partition offset dropped or a partition skipped.
+
+- **Exact-f32 GEMMs walk large B operands in column panels.** The five
+  exact-f32 TensorOps kernels (`matmul2d_tensorops_f32`, `_tn_f32`, `_nt_f32`,
+  `_tn_accum_f32`, `_nt_accum_f32`) walked tiles row-major. That order re-reads
+  all of B once per 32-row tile row, so an LM head (`[4096,768] · [50304,768]^T`)
+  ran at ~2.3 TFLOP/s against ~6.5 for transformer-width GEMMs. Once
+  `N·K ≥ 2^23` elements they now take 16-tile-row column panels through
+  `tile_from_linear_panel`. The bf16 coop NN kernel's 8-row swizzle now calls
+  the same helper, which also guards an id past the grid (the current
+  dispatch never issues one). Each tile's arithmetic is unchanged; only the
+  order threadgroups run in moves. On M5 Pro, interleaved A/B, min of 4:
+  NT with B ≥ 50 MB takes 0.39–0.47× the time (LM head 135–138 → 64 ms), and
+  TN with a 32 MB B takes 0.77×. Smaller B keeps row-major order: a 12.6 MB B
+  measured ~1.08× slower in panels. The threshold was fitted on M5 Pro only;
+  25 MB was within noise. Tests: `exact_f32_column_panels_cover_every_tile`
+  (`tests/gemm_ragged_shapes.rs`), plus panel shapes in the accumulate and
+  interior-branch tests of `tests/gemm_flag_paths.rs`. They guard the tile
+  mapping, and all three fail when the partial-band clamp is removed. The
+  speed-up itself rests on the A/B; no test pins it.
+
+### Fixed
+
+- **Accumulate GEMM tests budget for the previous C.** `with_previous` in
+  `tests/gemm_flag_paths.rs` added `C0` to the expected value but not to the
+  magnitude the f32 error budget scales with. A small-K accumulate onto a
+  large `C0` was therefore held to the rounding of `a·b` alone, and failed on
+  the final f32 add (1 ulp at K = 3).
+
 ### Added
 
+- **GPU faults are read from commit feedback.** `MTL4CommandBuffer` has no
+  `status` or `error`, so a fault was invisible after a wait. Each commit now
+  registers an `MTL4CommitFeedback` handler through `MTL4CommitOptions`
+  (features `MTL4CommitFeedback`, `block2`; `block2` is the block crate
+  objc2-metal already uses). After a GPU wait, a reported error latches the
+  runtime the same way a shared-event timeout does: later encodes and
+  allocations refuse reuse, and `GpuRuntime::is_poisoned` lets
+  callers read the latch instead of matching the poison string. The wait on the
+  callback is bounded and returns on the callback's notify rather than a poll
+  tick; a callback that has not run stays pending. Also adds `GpuRuntime::current_allocated_bytes`, a live
+  `currentAllocatedSize` reading alongside the startup `memory_info` snapshot.
+- **Causal flash attention at head dimension 64 (`tessl::nn::flash_attn_rows`)**:
+  new kernel instantiation `flash_attn_rows_h64_r8_g8` at R=8, SGT=8,
+  satisfying `D % (4*R) == 0` for float4 lane coverage. Tested in
+  `tests/flash_attn_rows_h64.rs`.
+- **Packed QK RMSNorm and half-split RoPE (`tessl::qwen35::attn_qk_norm_rope_packed`)**:
+  adds support for explicit query-head stride (`head_dim` for packed
+  `[T, H, D]`, or `2 * head_dim` for Qwen's query-gate layout) and
+  configurable RMSNorm `weight_bias` (`0.0` for learnable scale `* w`,
+  `1.0` for Qwen's `*(1 + w)`). Tested in `tests/qk_norm_half_rope.rs`.
+- **Non-finite protection in argmax and softcap sampling**:
+  `argmax_f32`, `softcap_sample`, and `softcap_argmax_one_pass` guard against
+  NaNs and non-finite inputs, writing `0xFFFFFFFF` / returning error instead
+  of sampling token 0.
+- **Stand-alone host validators for MLX Q4 GEMV**:
+  `tessl::nn::validate_gemv_q4_mlx_inputs`, `validate_gemv_q4_mlx_blocked`,
+  and `validate_gemv_q4_mlx_simd` expose host-side buffer shape, bank bounds,
+  and disjointness validation without encoding.
+- **Fallible u32 buffer writing (`GpuBuffer::try_write_u32`)**:
+  reports buffer length mismatches and poisoned runtime states via `Result`
+  instead of unconditionally panicking.
 - **Device AdamW on any f32 tensor (`tessl::qwen35_adamw::adamw_step`)**:
   one step of `qwen35_adamw_f32` on a parameter, its gradient and both
   moments. `Qwen35Model::adamw_step` is that function in a loop over the

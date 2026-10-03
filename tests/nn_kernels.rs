@@ -285,17 +285,14 @@ fn mlp_gelu_tanh_stays_finite_where_fast_tanh_would_nan() {
             "mlp_gelu_tanh produced a non-finite value on |x| up to 64"
         );
 
-        // Match the kernel's clamp so this is a comparison, not a restatement.
+        // The cubic is clamped; the outer factor is the original x, matching gelu.h.
         let want: Vec<f32> = gate
             .iter()
             .zip(&up)
             .map(|(x, u)| {
-                // f64 reference: the kernel works in f32, so computing the
-                // expected value at the same precision would hide a real f32
-                // ordering bug behind matching rounding.
                 let xc = (*x as f64).clamp(-20.0, 20.0);
                 let inner = 0.7978845608028654 * (xc + 0.044715 * xc * xc * xc);
-                (0.5 * xc * (1.0 + inner.clamp(-10.0, 10.0).tanh()) * (*u as f64)) as f32
+                (0.5 * (*x as f64) * (1.0 + inner.clamp(-10.0, 10.0).tanh()) * (*u as f64)) as f32
             })
             .collect();
         close("mlp_gelu_tanh", &got[..n], &want, 1e-4);

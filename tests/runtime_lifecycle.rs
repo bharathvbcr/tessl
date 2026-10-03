@@ -64,6 +64,20 @@ fn runtime_reports_a_usable_device_and_budget() {
     });
 }
 
+/// Apple silicon GPUs share system memory with the CPU, so a consumer that
+/// budgets GPU memory as a separate pool double-counts it. Only the `true`
+/// side is reachable on this hardware.
+#[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+#[test]
+fn apple_silicon_reports_unified_memory() {
+    with_gpu(|rt| {
+        assert!(
+            rt.memory_info().has_unified_memory,
+            "MTLDevice.hasUnifiedMemory read false on Apple silicon"
+        );
+    });
+}
+
 #[test]
 fn buffer_kind_survives_the_round_trip_to_the_holder() {
     with_gpu(|rt| {

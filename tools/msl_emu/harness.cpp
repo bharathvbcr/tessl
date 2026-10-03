@@ -213,6 +213,8 @@ int main(int argc, char **argv) {
                    slot_base = params.count("slot_base") ? P("slot_base") : 0u,
                    pos_stride = params.count("pos_stride") ? P("pos_stride") : 0u;
         const float theta = PF("theta"), eps = PF("eps");
+        const uint q_head_stride = params.count("q_head_stride") ? P("q_head_stride") : 2u * D;
+        const float weight_bias = params.count("weight_bias") ? PF("weight_bias") : 1.0f;
         const uint per_tg = 8;
         float *p = F("p"), *qw = F("q_norm_w"), *kw = F("k_norm_w"), *q = F("q_out"), *kc = F("k_cache"),
               *vc = F("v_cache");
@@ -224,13 +226,12 @@ int main(int argc, char **argv) {
                [&](const Ids &id, float *) {
                    if (posbuf) {
                        qwen35_attn_qk_norm_rope_posbuf(p, qw, kw, q, kc, vc, B, T, Hq, Hkv, D, R, ld_p, q_off, k_off,
-                                                       v_off, pos_ptr, cap, theta, eps, slot_base, pos_stride, id.tg.x, id.sg,
-                                                       id.lane,
-                                                       id.tptg);
+                                                       v_off, pos_ptr, cap, theta, eps, slot_base, pos_stride, q_head_stride,
+                                                       weight_bias, id.tg.x, id.sg, id.lane, id.tptg);
                    } else {
                        qwen35_attn_qk_norm_rope(p, qw, kw, q, kc, vc, B, T, Hq, Hkv, D, R, ld_p, q_off, k_off,
-                                                v_off, pos, cap, theta, eps, slot_base, pos_stride, id.tg.x, id.sg,
-                                                id.lane, id.tptg);
+                                                v_off, pos, cap, theta, eps, slot_base, pos_stride, q_head_stride,
+                                                weight_bias, id.tg.x, id.sg, id.lane, id.tptg);
                    }
                });
     } else if (kname == "qwen35_attn_gate_f32" || kname == "qwen35_attn_gate_bf16") {

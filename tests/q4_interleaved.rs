@@ -420,7 +420,7 @@ fn gate_up_gelu_i4_matches_two_gemvs_and_a_gelu() {
             .map(|(g, u)| {
                 let xc = (*g as f64).clamp(-20.0, 20.0);
                 let inner = 0.797_884_560_802_865_4 * (xc + 0.044715 * xc * xc * xc);
-                (0.5 * xc * (1.0 + inner.clamp(-10.0, 10.0).tanh()) * (*u as f64)) as f32
+                (0.5 * (*g as f64) * (1.0 + inner.clamp(-10.0, 10.0).tanh()) * (*u as f64)) as f32
             })
             .collect();
 

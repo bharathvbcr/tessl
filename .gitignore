@@ -1,4 +1,5 @@
 /target/
+/target-*/
 
 # Build artefacts from the Metal AOT step in build.rs. `default.metallib` is
 # the compiled output and `*.air` the intermediate; both are regenerated on

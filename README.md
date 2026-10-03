@@ -37,7 +37,7 @@ The name is short for *tessellation* — the design centers around how matrix op
 | --- | --- |
 | **Status** | [`0.2.0`](https://crates.io/crates/tessl) — Metal 4 / MPP TensorOps verified on M5 Pro |
 | **API docs** | [docs.rs/tessl](https://docs.rs/tessl) — built on `aarch64-apple-darwin` with all features |
-| **Tests** | 228 passing, including doc tests (`cargo test --release -- --test-threads=1`) |
+| **Tests** | 530 `#[test]` functions across 50 integration files and the library, plus doc tests (`cargo test --release -- --test-threads=1`; the GPU suite needs an M-series Mac) |
 | **Kernel coverage** | All 44 promoted kernels have a numeric test, not only a name check |
 | **Platform** | Apple silicon, macOS 26+, Xcode 26 Metal Toolchain |
 | **License** | MIT OR Apache-2.0 |
@@ -51,8 +51,13 @@ The name is short for *tessellation* — the design centers around how matrix op
 - **Cooperative Register Accumulators:** High-throughput cooperative destination kernels (`get_destination_cooperative_tensor`) holding `f32` accumulators in GPU registers across the entire $K$-reduction, eliminating device memory round-trips for NN, TN, NT, and accumulating paths.
 - **In-Kernel Grid Swizzling & Bounds Checking:** Column-panel tile swizzling for large grids ($\ge 2048$ tiles) bounding operand rereads, combined with origin-shifted slice bounds checking for ragged edges.
 - **Zero-Wait Execution Pipeline:** Packed command encoding with bump-allocated constant arenas (16 MiB) and `MTLSharedEvent` synchronization—host threads never block mid-step.
-- **Neural-Network Kernel Library:** 30 Metal source files providing 201 kernel entry points — RMSNorm, gated MLP activations (SiLU / GELU-tanh), flash attention (sliding-window $h{=}128/256$, global $h{=}512$), fused RMSNorm+QKV+RoPE, MLX-format Q4 GEMV/GEMM, Q8 GEMV, KV-cache stores, embedding lookup, row-wise softmax/sum/max, and softcap sampling. All reachable through 62 shape-checked entry points in `tessl::nn`, not as raw pipeline-name strings.
+- **Neural-Network Kernel Library:** 30 Metal source files providing 205 kernel entry points — RMSNorm, gated MLP activations (SiLU / GELU-tanh), flash attention (sliding-window $h{=}128/256$, global $h{=}512$), fused RMSNorm+QKV+RoPE, MLX-format Q4 GEMV/GEMM, Q8 GEMV, KV-cache stores, embedding lookup, row-wise softmax/sum/max, and softcap sampling. All reachable through 62 shape-checked entry points in `tessl::nn`, not as raw pipeline-name strings.
 - **Qwen3.5 Layer Kernels (`tessl::qwen35`):** the gated delta net as two fused dispatches (a parallel per-chunk prep with the 64×64 triangular solve in threadgroup memory, then a sequential `simdgroup_matrix` scan), a snapshot-reading recurrent decode, shared-prefix attention (one KV prefix at batch stride 0 for many questions), causal conv+SiLU, gated RMSNorm, Qwen's partial RoPE and output gate, and scoring of only the answer rows — see [docs/qwen35.md](docs/qwen35.md). Checked against transformers' own Qwen3.5 code on a CPU emulator of the kernels and compiled by Apple's Metal compiler in CI (`-std=metal4.0 -Werror`), and tested on the M5 Pro GPU (`tests/qwen35_kernels.rs`); per-kernel, forward and `train_step` timings on the M5 Pro are in the same document.
+- **Qwen3.5 Training on the GPU (`tessl::qwen35_train`, `qwen35_bwd`, `gdn_train`, `attn_train`, `cross_entropy`):** one full training step of the Qwen3.5 text model — forward with per-layer recompute, causal-LM loss, and every parameter's gradient — without leaving Metal. The gated delta rule saves one state per 64 tokens (32 MiB/layer at the 2B's shapes, T = 2048, versus 435 MiB in torch); the LM-head cross-entropy runs in vocabulary chunks and never forms `[rows, vocab]` logits; every weight gradient is a per-block partial summed in order, so a step is deterministic with no atomics. A step can also be split in two halves for a loss computed outside tessl, accumulated into a gradient bank, and scored only at chosen positions. Measured against transformers' own f32 reference in [docs/qwen35.md](docs/qwen35.md).
+- **Device AdamW (`tessl::qwen35_adamw`):** `adamw_step` on any f32 tensor, and `Qwen35Model::adamw_step` over the model's own parameters in place — packed windows included — with `clip_grad_norm_`-style clipping and checkpoint/restore of the moments and step count. Params, gradients and both moments for the 2B come to 32 GB, which is what lets it fit a 64 GB Mac.
+- **bf16 Operands per Call (`GemmOperands`):** `gemm_bf16`, `gemm_tn_bf16`, `gemm_nt_bf16` and `qwen35_train` / `cross_entropy` options choose bf16 operands (f32 accumulate) for one call without changing the model's f32 storage; the 2B `train_step` on bf16 operands measures 2.44× the exact step at T = 2048.
+- **C ABI and torch binding (`src/capi.rs`, `python/tessl_torch`):** `libtessl.dylib` exposes the training path at ABI version 9 — cross-entropy, `chunk_gated_delta_rule` at transformers' own seam (`patch_transformers_qwen3_5()`), `Qwen35.train_step`, the two-phase step, the gradient bank and AdamW — so a torch loop can call into tessl. See [python/README.md](python/README.md).
+- **Embedded Metallib:** `GpuRuntime::new` loads the shader library from bytes included at compile time (`newLibraryWithData`), so a binary no longer depends on the build directory's `.metallib` still existing. `add_metallib_bytes` is the same load for an overlay.
 - **Fused GEMM Epilogue:** `C = activation(alpha * A@B + beta * C_prev + bias)` in a single dispatch, applied while the accumulator is still in registers — measured 1.6–2.4× cheaper than the same work as a separate pass over $C$.
 - **Mixed Precision & Quantization:** `f32`, `bf16`, `tf32-relaxed`, IEEE `binary16` (`DType::F16`), and an exact `int8 x int8 -> int32` GEMM with fused per-column dequantization (`nn::gemm_i8_dequant`).
 - **Strided Batched GEMM:** `gemm_batched` with explicit per-operand batch strides, so a batch dimension is expressed rather than inferred from a rank-2 shape.
@@ -104,7 +109,7 @@ flowchart TD
     subgraph MetallibShaders["Compiled Metallib Shader Kernels"]
         TensorOps["matmul_tensorops.metal<br/>(MPP TensorOps matmul2d · Register Accumulation)"]
         SimdFallback["matmul_simdgroup.metal<br/>(Portable SIMDgroup Matrix Fallback)"]
-        NnKernels["21 NN Kernel Sources (83 Entry Points)<br/>RMSNorm · FlashAttn SWA/Global · MLX Q4/Q8 · RoPE"]
+        NnKernels["30 Kernel Sources (202 Entry Points)<br/>RMSNorm · FlashAttn SWA/Global · MLX Q4/Q8 · RoPE · Qwen3.5 fwd/bwd · AdamW"]
     end
 
     Downstream -->|Typed API Calls| TesslAPI
@@ -223,6 +228,7 @@ flowchart TD
     BackendCheck -- SimdGroup --> SimdGroupKernel["matmul_simdgroup / edges<br/>• Portable fallback (16x16 / 32x32)<br/>• Direct write to device memory C"]
     BackendCheck -- TensorOps --> LayoutCheck{"Layout Resolution"}
 
+    LayoutCheck -- "TN exact f32, C under 128 tiles, K of 2+ partitions" --> ParTN["matmul2d_tensorops_tn_splitk_par_f32<br/>+ reduce_partitions_f32<br/>(all K partitions in one dispatch)"]
     LayoutCheck -- "TN / NT Layout" --> SplitKCheck{"prefer_tn_splitk?<br/>(K &gt;= 2048, M,N &lt;= 384,<br/>min(M,N) &lt;= 128)"}
     SplitKCheck -- Yes --> SplitKKernel["matmul2d_tensorops_tn/nt_splitk_*<br/>(Split-K partial reductions)"]
     SplitKCheck -- No --> CoopTN["matmul2d_tensorops_tn/nt_*_f32<br/>• 128x64 sg4 Cooperative Destination<br/>• Single store, zero host pre-zeroing"]
@@ -244,7 +250,7 @@ flowchart TD
 2. **Zero Pre-Zero Overhead:** Register accumulators are initialized via `.set(i, 0.0f)` in shader code. The host-side `zero_f32(C)` pre-pass is completely eliminated.
 3. **Single Store to Memory:** Device memory $C$ is written **exactly once** (`cT.store(tC)`) at threadgroup termination.
 4. **Ragged Edge Handling:** Boundary tiles use origin-shifted full-extent tensor slices (`mA.slice(...)`, `mB.slice(...)`, `mC.slice(...)`), executing the same cooperative register accumulation without dropping tail elements.
-5. **Column-Panel Grid Swizzling:** For large dispatch grids ($\text{tiles}_n \times \text{tiles}_m \ge 2048$), threadgroups are swizzled into 8-tile-row bands to bound operand $B$ cache rereads, delivering $+11\%$ throughput at $4096^3$.
+5. **Column-Panel Grid Swizzling:** For large dispatch grids ($\text{tiles}_n \times \text{tiles}_m \ge 2048$), threadgroups are swizzled into 8-tile-row bands to bound operand $B$ cache rereads, delivering $+11\%$ throughput at $4096^3$. The exact-f32 kernels (NN, TN, NT and their accumulate forms) use the same walk (`tile_from_linear_panel`) in 16-tile-row bands, chosen by the size of $B$ rather than the grid: once $N \times K \ge 2^{23}$ elements (32 MiB), at which point row-major order re-reads all of $B$ from DRAM for every 32-row tile row. On M5 Pro that took a 4096×50304×768 LM-head NT from 135–138 ms to 64 ms.
 
 ---
 
@@ -329,6 +335,10 @@ let matmul_shader = tessl_kernels.join("matmul_tensorops.metal");
 // ... compile matmul_shader into your own metallib
 ```
 
+`GpuRuntime::new()` needs no file on disk: tessl's own metallib is embedded in
+the binary at build time. `metallib_path()` and `DEP_TESSL_METALLIB` still name
+the on-disk artifact for tooling that wants it.
+
 To overlay a custom metallib at runtime:
 
 ```rust
@@ -341,6 +351,9 @@ let rt = GpuRuntime::from_metallib_path(Path::new("/path/to/custom.metallib"))?;
 // first, so a duplicate name in an overlay is silently unreachable.
 let rt = GpuRuntime::new()?;
 rt.add_metallib(Path::new("/path/to/custom_overlay.metallib"))?;
+
+// Or overlay from bytes already in memory (for example include_bytes!).
+rt.add_metallib_bytes(include_bytes!("custom_overlay.metallib"))?;
 ```
 
 ---
@@ -472,6 +485,9 @@ TESSL_GEMM_TUNE=1 cargo build --release --bins
 | `bench_gemm_tnnt_tune` | TN/NT tile sweep; the paired, round-interleaved A/B comparison lane. |
 | `bench_gemm_sweep` | Cross-runtime sweep (`f32`, `tf32`, `bf16`) with JSON telemetry output. |
 | `bench_nn_kernels` | Throughput of the `nn` library, timed both batched and solo so the dispatch floor is visible rather than hidden. |
+| `bench_qwen35_layers` | Per-kernel and forward timings of the Qwen3.5 layer kernels at the 2B's shapes. |
+| `bench_qwen35_train` | The training step's time at Qwen3.5-2B's shapes, each activation mode alone; `--batch` times a batch run row by row. |
+| `probe_gdn_scan` | Probe of the gated-delta-net scan. |
 | `probe_gemm_parity` | Bit-exact verification probe comparing TensorOps against the reference SIMD path. |
 | `bench/paired_cross_runtime.py` | Python harness driving paired `tessl` vs. PyTorch MPS / MLX evaluation. |
 
@@ -494,7 +510,16 @@ All runtime configuration uses the canonical `TESSL_*` prefix. Legacy
 | `TESSL_DECODE_ICB` | `0` | Enables the Indirect Command Buffer capture and execution path. |
 | `TESSL_ICB_FREEZE_BINDS` | `0` | Freezes argument table buffer bindings directly into ICB commands. |
 | `TESSL_ICB_RANGE_BATCH` | `0` | Coalesces contiguous ICB command ranges into single execution dispatches. |
-| `TESSL_SKIP_AOT` | `0` | Bypasses the `build.rs` AOT shader compile and reuses an existing `default.metallib`. Panics if that file is absent rather than baking a path that fails at every `GpuRuntime::new()`. |
+| `TESSL_SKIP_AOT` | unset | Offline escape hatch: skips the `build.rs` shader compile. Requires `TESSL_PREBUILT_METALLIB`; the build panics if that is missing, not absolute, or not a file. The prebuilt library is embedded the same way a freshly built one is. |
+| `TESSL_PREBUILT_METALLIB` | unset | Absolute path of an existing metallib to embed when `TESSL_SKIP_AOT` is set. Ignored otherwise. |
+| `TESSL_ICB_EXECUTE` | `0` | Executes captured decode commands through the ICB. Implied by `TESSL_ICB_FREEZE_BINDS`. |
+| `TESSL_ICB_PIPELINES` | `0` | Builds ICB-capable pipelines. Needed for ICB execute; replay refuses without it rather than running a path that cannot execute. |
+| `TESSL_ICB_PREBUILT_TABLES` | `1` (on) | Freezes buffer binds into per-command argument tables, shared by fingerprint. `0` opts out. |
+| `TESSL_ICB_COARSE_RANGES` | follows `TESSL_ICB_RANGE_BATCH` | Elides non-interfering barriers before range batching. `0` keeps every captured barrier. |
+| `TESSL_ICB_TRIAGE` | `0` | Decode-ICB triage mode for diagnosing a replay regression. |
+| `TESSL_ICB_SMOKE` | `0` | Opt-in ICB smoke wiring. |
+| `TESSL_ATTN_TILED` | unset | Set (any value) to force the original tiled attention kernels instead of the default. Read once per process, for A/B runs. |
+| `TESSL_KERNEL_TRACE` | unset | Set (any value) to record which kernels a process used. |
 
 ---
 
@@ -513,6 +538,8 @@ All runtime configuration uses the canonical `TESSL_*` prefix. Legacy
 | [**API reference**](https://docs.rs/tessl) | Every public type, entry point and feature flag on docs.rs, rendered from the source of the released version. Start at the crate root for the platform requirements, the two quickstarts and the module map. |
 | [**Architecture**](docs/architecture.md) | Deep dive into kernel selection, cooperative destination register mechanics, $K$-reduction bandwidth analysis, and TN/NT layout optimizations. |
 | [**Benchmarking**](docs/benchmarking.md) | The paired measurement protocol, GPU thermal and frequency scaling mitigation, and five measurement pitfalls. |
+| [**Qwen3.5**](docs/qwen35.md) | The Qwen3.5 kernels, the training step and its backward, training-memory attribution against torch, AdamW, numerics and measured timings. |
+| [**torch binding**](python/README.md) | `tessl_torch`: calling the cross-entropy, GDN seam and whole-model `train_step` / AdamW from a PyTorch loop. |
 | [**Verification**](docs/verification.md) | Static tile geometry audit, randomized shape fuzzing, and fault injection test suites. |
 | [**Tuning log**](bench/results/bf16_tile_tune_FINDINGS.md) | Empirical $BK$ ladder benchmarks, root causes, and the landed M5 Pro speedups. |
 | [**Changelog**](CHANGELOG.md) | Release history. |

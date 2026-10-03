@@ -92,6 +92,7 @@ dependencies = [
 name = "tessl"
 version = "0.2.0"
 dependencies = [
+ "block2",
  "dispatch2",
  "libc",
  "objc2",

@@ -19,7 +19,8 @@
 mod common;
 
 use common::{
-    assert_within_bound, random_f32, reference, round_trip_bf16, tensor_bf16, tensor_f32, with_gpu, Layout, Reference,
+    assert_within_bound, random_f32, rank_one_case, reference, round_trip_bf16, tensor_bf16, tensor_f32, with_gpu,
+    Layout, Reference, F32_PANEL_SHAPES,
 };
 use std::sync::Arc;
 use tessl::gemm::{gemm_nt_accum_train, gemm_nt_f32, gemm_tn_accum_train, gemm_tn_f32};
@@ -65,10 +66,14 @@ fn operand_shapes(layout: Layout, m: usize, n: usize, k: usize) -> ([usize; 2], 
     }
 }
 
-/// `expect += c0` for an accumulate: the previous C is part of the answer.
+/// `expect += c0` for an accumulate: the previous C is part of the answer,
+/// and one more term of the sum, so `|c0|` joins the magnitude the error
+/// budget scales with. Without it a small-K accumulate onto a large C0 is
+/// held to the rounding of `a.b` alone and fails on the final f32 add.
 fn with_previous(mut r: Reference, c0: &[f32]) -> Reference {
-    for (want, prev) in r.c.iter_mut().zip(c0) {
+    for ((want, mag), prev) in r.c.iter_mut().zip(r.mag.iter_mut()).zip(c0) {
         *want += *prev as f64;
+        *mag += (*prev as f64).abs();
     }
     r
 }
@@ -107,6 +112,31 @@ fn check_accum(rt: &Arc<GpuRuntime>, layout: Layout, bf16: bool, m: usize, n: us
     );
 }
 
+/// An f32 accumulate on a column-panel shape, with rank-one operands so the
+/// reference stays O(M·N) (see `common::rank_one_case`).
+fn check_accum_panel(rt: &Arc<GpuRuntime>, layout: Layout, m: usize, n: usize, k: usize) {
+    let (a_shape, b_shape) = operand_shapes(layout, m, n, k);
+    let (a_host, b_host, r) = rank_one_case(layout, m, n, k, 0xacc3 ^ (m * n) as u64);
+    let c0 = random_f32(m * n, 0xacc4 ^ (m * n) as u64);
+    let expect = with_previous(r, &c0);
+    let (a, b) = (tensor_f32(rt, &a_shape, &a_host), tensor_f32(rt, &b_shape, &b_host));
+    let c = tensor_f32(rt, &[m, n], &c0);
+    match layout {
+        Layout::Tn => gemm_tn_accum_train(&a, &b, &c, GemmBackend::TensorOps),
+        Layout::Nt => gemm_nt_accum_train(&a, &b, &c, GemmBackend::TensorOps),
+        Layout::Nn => unreachable!("no NN accumulate entry point"),
+    }
+    .unwrap();
+    rt.synchronize().unwrap();
+    assert_within_bound(
+        &format!("f32 accum {layout:?} panel walk {m}x{n}x{k}"),
+        &c.buffer.read_f32(),
+        &expect,
+        k,
+        0.0,
+    );
+}
+
 fn assert_traced(kernel: &str) {
     let traced = traced_kernels();
     assert!(
@@ -135,7 +165,9 @@ fn accumulate_kernels_add_into_c_under_the_accum_flag() {
                 if !rt.has_tensorops() {
                     return;
                 }
-                for &(m, n, k) in &[(128usize, 128usize, 256usize), (96, 48, 64), (200, 72, 96)] {
+                // K = 3 keeps a·b small against C0, so the final f32 add's
+                // rounding has to be in the budget (`with_previous`).
+                for &(m, n, k) in &[(128usize, 128usize, 256usize), (96, 48, 64), (200, 72, 96), (96, 48, 3)] {
                     rt.set_precision(PrecisionMode::F32);
                     check_accum(rt, Layout::Tn, false, m, n, k);
                     check_accum(rt, Layout::Nt, false, m, n, k);
@@ -144,6 +176,10 @@ fn accumulate_kernels_add_into_c_under_the_accum_flag() {
                     check_accum(rt, Layout::Nt, true, m, n, k);
                 }
                 rt.set_precision(PrecisionMode::F32);
+                for &(m, n, k) in F32_PANEL_SHAPES {
+                    check_accum_panel(rt, Layout::Tn, m, n, k);
+                    check_accum_panel(rt, Layout::Nt, m, n, k);
+                }
                 for kernel in [
                     "matmul2d_tensorops_tn_accum_f32",
                     "matmul2d_tensorops_nt_accum_f32",
@@ -231,6 +267,32 @@ fn exact_f32_kernels_agree_with_the_reference_on_the_interior_branch() {
                     }
                     check_accum(rt, Layout::Tn, false, m, n, k);
                     check_accum(rt, Layout::Nt, false, m, n, k);
+                }
+                // The interior branch under the column-panel walk.
+                for &(m, n, k) in F32_PANEL_SHAPES {
+                    for layout in [Layout::Nn, Layout::Tn, Layout::Nt] {
+                        let (a_shape, b_shape) = operand_shapes(layout, m, n, k);
+                        let (a_host, b_host, expect) = rank_one_case(layout, m, n, k, 0x3ed ^ (m + n) as u64);
+                        let a = tensor_f32(rt, &a_shape, &a_host);
+                        let b = tensor_f32(rt, &b_shape, &b_host);
+                        let c = rt.alloc_tensor_f32(&[m, n]).unwrap();
+                        match layout {
+                            Layout::Nn => gemm_f32(&a, &b, &c, GemmBackend::TensorOps),
+                            Layout::Tn => gemm_tn_f32(&a, &b, &c, GemmBackend::TensorOps),
+                            Layout::Nt => gemm_nt_f32(&a, &b, &c, GemmBackend::TensorOps),
+                        }
+                        .unwrap();
+                        rt.synchronize().unwrap();
+                        assert_within_bound(
+                            &format!("interior f32 {layout:?} panel walk {m}x{n}x{k}"),
+                            &c.buffer.read_f32(),
+                            &expect,
+                            k,
+                            0.0,
+                        );
+                    }
+                    check_accum_panel(rt, Layout::Tn, m, n, k);
+                    check_accum_panel(rt, Layout::Nt, m, n, k);
                 }
                 assert_traced("matmul2d_tensorops_f32");
                 assert_traced("matmul2d_tensorops_tn_accum_f32");

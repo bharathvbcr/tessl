@@ -41,6 +41,7 @@ inline void qwen35_norm_rope_row(
     uint pos,
     float theta,
     float eps,
+    float weight_bias,
     uint lane)
 {
     float ss = 0.0f;
@@ -51,16 +52,19 @@ inline void qwen35_norm_rope_row(
 
     const uint half_rot = rotary_dim / 2u;
     for (uint p = lane; p < half_rot; p += 32u) {
-        const float x0 = src[p] * inv * (1.0f + weight[p]);
-        const float x1 = src[p + half_rot] * inv * (1.0f + weight[p + half_rot]);
+        // `weight_bias` 1 is Qwen's *(1 + w). `weight_bias` 0 is a plain
+        // learnable scale, nanolab's F.rms_norm weight.
+        const float x0 = src[p] * inv * (weight_bias + weight[p]);
+        const float x1 = src[p + half_rot] * inv * (weight_bias + weight[p + half_rot]);
         const float angle = qwen35_rope_angle(p, rotary_dim, pos, theta);
         const float c = precise::cos(angle);
         const float s = precise::sin(angle);
+        // Half-split: x * cos + cat(-x2, x1) * sin on the rotary slice.
         dst[p] = x0 * c - x1 * s;
         dst[p + half_rot] = x1 * c + x0 * s;
     }
     for (uint d = rotary_dim + lane; d < D; d += 32u) {
-        dst[d] = src[d] * inv * (1.0f + weight[d]);
+        dst[d] = src[d] * inv * (weight_bias + weight[d]);
     }
 }
 
@@ -87,6 +91,7 @@ inline void qk_norm_rope_unit(
     uint ld_p, uint q_off, uint k_off, uint v_off,
     device const uint *pos_ptr, uint pos_stride, ulong pos_scalar,
     uint slot_base, uint kv_capacity, float theta, float eps,
+    uint q_head_stride, float weight_bias,
     uint tg, uint sg, uint lane, uint tptg)
 {
     const ulong heads = (ulong)Hq + 2ul * Hkv;
@@ -107,16 +112,16 @@ inline void qk_norm_rope_unit(
     device const float *row = p + r * (ulong)ld_p;
 
     if (j < Hq) {
-        qwen35_norm_rope_row(row + q_off + (ulong)j * 2u * D, q_norm_w,
+        qwen35_norm_rope_row(row + q_off + (ulong)j * (ulong)q_head_stride, q_norm_w,
                              q_out + (r * Hq + j) * (ulong)D,
-                             D, rotary_dim, pos, theta, eps, lane);
+                             D, rotary_dim, pos, theta, eps, weight_bias, lane);
         return;
     }
     const uint h = j < Hq + Hkv ? j - Hq : j - Hq - Hkv;
     const ulong slot = (((ulong)b * kv_capacity + cache_pos) * Hkv + h) * (ulong)D;
     if (j < Hq + Hkv) {
         qwen35_norm_rope_row(row + k_off + (ulong)h * D, k_norm_w, k_cache + slot,
-                             D, rotary_dim, pos, theta, eps, lane);
+                             D, rotary_dim, pos, theta, eps, weight_bias, lane);
     } else {
         device const float *src = row + v_off + (ulong)h * D;
         for (uint d = lane; d < D; d += 32u) {
@@ -129,7 +134,9 @@ inline void qk_norm_rope_unit(
 /// projection output.
 ///
 /// Row `r = b*T + t` of `p` holds, at column offsets:
-///   `q_off + h*2D`        query head h (D), followed by its gate (D)
+///   `q_off + h*q_head_stride` query head h (D). Qwen's fused projection uses
+///                         stride `2D` (D query, then D gate). A packed
+///                         `[T, H, D]` query uses stride `D`.
 ///   `k_off + h*D`         key head h
 ///   `v_off + h*D`         value head h
 ///
@@ -165,6 +172,8 @@ kernel void qwen35_attn_qk_norm_rope(
     constant float &eps [[buffer(19)]],
     constant uint &slot_base [[buffer(20)]],
     constant uint &pos_stride [[buffer(21)]],
+    constant uint &q_head_stride [[buffer(22)]],
+    constant float &weight_bias [[buffer(23)]],
     uint tg [[threadgroup_position_in_grid]],
     uint sg [[simdgroup_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]],
@@ -173,7 +182,7 @@ kernel void qwen35_attn_qk_norm_rope(
     qk_norm_rope_unit(p, q_norm_w, k_norm_w, q_out, k_cache, v_cache, B, T, Hq, Hkv, D,
                       rotary_dim, ld_p, q_off, k_off, v_off, nullptr, pos_stride, (ulong)pos_offset,
                       slot_base, kv_capacity,
-                      theta, eps, tg, sg, lane, tptg);
+                      theta, eps, q_head_stride, weight_bias, tg, sg, lane, tptg);
 }
 
 /// [`qwen35_attn_qk_norm_rope`] with the position offset read from a device
@@ -205,6 +214,8 @@ kernel void qwen35_attn_qk_norm_rope_posbuf(
     constant float &eps [[buffer(19)]],
     constant uint &slot_base [[buffer(20)]],
     constant uint &pos_stride [[buffer(21)]],
+    constant uint &q_head_stride [[buffer(22)]],
+    constant float &weight_bias [[buffer(23)]],
     uint tg [[threadgroup_position_in_grid]],
     uint sg [[simdgroup_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]],
@@ -213,7 +224,7 @@ kernel void qwen35_attn_qk_norm_rope_posbuf(
     qk_norm_rope_unit(p, q_norm_w, k_norm_w, q_out, k_cache, v_cache, B, T, Hq, Hkv, D,
                       rotary_dim, ld_p, q_off, k_off, v_off, pos_offset_ptr, pos_stride, 0ul,
                       slot_base, kv_capacity,
-                      theta, eps, tg, sg, lane, tptg);
+                      theta, eps, q_head_stride, weight_bias, tg, sg, lane, tptg);
 }
 
 /// `out = attn * sigmoid(gate)`, with the gate read in place from the fused

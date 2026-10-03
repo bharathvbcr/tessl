@@ -46,9 +46,14 @@ kernel void argmax_f32(
     float v = -INFINITY;
     uint idx = 0u;
     if (i < n) {
-        v = logits[i];
-        if (has_idx_in == 0u && softcap > 0.0f) {
-            v = tessl_apply_softcap(v, softcap);
+        float raw = logits[i];
+        if (!isfinite(raw)) {
+            v = NAN;
+        } else {
+            v = raw;
+            if (has_idx_in == 0u && softcap > 0.0f) {
+                v = tessl_apply_softcap(v, softcap);
+            }
         }
         idx = (has_idx_in != 0u) ? idx_in[i] : i;
     }
@@ -60,7 +65,9 @@ kernel void argmax_f32(
         if (lid < stride) {
             float a = tg_val[lid];
             float b = tg_val[lid + stride];
-            if (b > a || (b == a && tg_idx[lid + stride] < tg_idx[lid])) {
+            bool finite_b = isfinite(b);
+            bool finite_a = isfinite(a);
+            if (finite_b && (!finite_a || b > a || (b == a && tg_idx[lid + stride] < tg_idx[lid]))) {
                 tg_val[lid] = b;
                 tg_idx[lid] = tg_idx[lid + stride];
             }
@@ -69,7 +76,7 @@ kernel void argmax_f32(
     }
 
     if (lid == 0) {
-        out_idx[tgpig] = tg_idx[0];
+        out_idx[tgpig] = isfinite(tg_val[0]) ? tg_idx[0] : 0xFFFFFFFFu;
         out_val[tgpig] = tg_val[0];
     }
 }
@@ -89,10 +96,16 @@ kernel void softcap_sample(
     const float softcap = *softcap_ptr;
 
     if (lid < n) {
-        float sc = tessl_apply_softcap(logits[lid], softcap);
-        logits[lid] = sc;
-        tg_val[lid] = sc;
-        tg_idx[lid] = lid;
+        float raw = logits[lid];
+        if (!isfinite(raw)) {
+            tg_val[lid] = NAN;
+            tg_idx[lid] = lid;
+        } else {
+            float sc = tessl_apply_softcap(raw, softcap);
+            logits[lid] = sc;
+            tg_val[lid] = sc;
+            tg_idx[lid] = lid;
+        }
     } else {
         tg_val[lid] = -INFINITY;
         tg_idx[lid] = 0u;
@@ -103,7 +116,9 @@ kernel void softcap_sample(
         if (lid < stride) {
             float a = tg_val[lid];
             float b = tg_val[lid + stride];
-            if (b > a || (b == a && tg_idx[lid + stride] < tg_idx[lid])) {
+            bool finite_b = isfinite(b);
+            bool finite_a = isfinite(a);
+            if (finite_b && (!finite_a || b > a || (b == a && tg_idx[lid + stride] < tg_idx[lid]))) {
                 tg_val[lid] = b;
                 tg_idx[lid] = tg_idx[lid + stride];
             }
@@ -111,7 +126,7 @@ kernel void softcap_sample(
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
     if (lid == 0) {
-        out_token[0] = tg_idx[0];
+        out_token[0] = isfinite(tg_val[0]) ? tg_idx[0] : 0xFFFFFFFFu;
     }
 }
 
@@ -134,11 +149,14 @@ kernel void softcap_argmax_one_pass(
     float best = -INFINITY;
     uint best_i = 0u;
     for (ulong i = lid; i < (ulong)n; i += tptg) {
-        float v = logits[i];
+        float raw = logits[i];
+        if (!isfinite(raw)) continue;
+        float v = raw;
         if (softcap > 0.0f) {
             v = tessl_apply_softcap(v, softcap);
         }
-        if (v > best || (v == best && i < (ulong)best_i)) {
+        if (!isfinite(v)) continue;
+        if (!isfinite(best) || v > best || (v == best && i < (ulong)best_i)) {
             best = v;
             best_i = (uint)i;
         }
@@ -151,7 +169,9 @@ kernel void softcap_argmax_one_pass(
         if (lid < stride) {
             float a = tg_val[lid];
             float b = tg_val[lid + stride];
-            if (b > a || (b == a && tg_idx[lid + stride] < tg_idx[lid])) {
+            bool finite_b = isfinite(b);
+            bool finite_a = isfinite(a);
+            if (finite_b && (!finite_a || b > a || (b == a && tg_idx[lid + stride] < tg_idx[lid]))) {
                 tg_val[lid] = b;
                 tg_idx[lid] = tg_idx[lid + stride];
             }
@@ -159,6 +179,6 @@ kernel void softcap_argmax_one_pass(
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
     if (lid == 0) {
-        out_token[0] = tg_idx[0];
+        out_token[0] = isfinite(tg_val[0]) ? tg_idx[0] : 0xFFFFFFFFu;
     }
 }

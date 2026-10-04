@@ -1,5 +1,9 @@
+# Build targets (Cargo)
+target/
 /target/
 /target-*/
+target-*/
+**/target/
 
 # Build artefacts from the Metal AOT step in build.rs. `default.metallib` is
 # the compiled output and `*.air` the intermediate; both are regenerated on
@@ -9,9 +13,50 @@ default.metallib
 *.metallib
 *.air
 
-.DS_Store
+# Python artifacts & virtual environments
 __pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.venv/
+venv/
+env/
+dist/
+build/
+*.egg-info/
+
+# Native binaries, debug symbols & profiling
+*.dSYM/
+*.profraw
+*.profdata
+perf.data
+perf.data.old
+
+# Secrets & environment configurations
+.env
+.env.*
+*.pem
+*.key
+credentials.json
+
+# OS metadata
+.DS_Store
+**/.DS_Store
+Thumbs.db
+
+# Editor & IDE configurations
+.idea/
+.vscode/
 .cursor/
+*.swp
+*.swo
+*~
+
+# Local development, agents & tooling caches
+.claude/
+.gemini/
 
 # devmap's code-index cache. Regenerated on demand from the source tree, so it
 # is derived state, not repo state.

@@ -8,6 +8,47 @@ All notable changes to `tessl` are recorded here. The format follows
 
 ### Changed
 
+- **Bf16 operands whose M does not fill a 128-row tile use the 64×64 tile.**
+  An NN GEMM with bf16 operands whose $M < 128$ now dispatches
+  `matmul2d_tensorops_bf16_f32_64x64_sg4` even when $N > 512$, passing $N$ as
+  a runtime extent. Operands with $M \ge 128$ keep the previous rule: 64×64
+  only when $N \le 512$. Fused epilogues (`gemm_epilogue`) follow the same
+  rule for bf16: shapes with $M < 128$ dispatch the 64×64 instantiation
+  `matmul2d_tensorops_bf16_f32_epi_64x64_sg4`, while other shapes remain on
+  128×64.
+  - **Explicit tile control:** Added `gemm_tiled` and `gemm_epilogue_tiled`
+    with the `EpiTile` enum (`Narrow` = 64×64, `Wide` = 128×64) so benchmarks
+    and numerical tests can compare both tile geometries on identical buffers.
+    Tile overrides require cooperative-destination backends, and an explicit
+    tile on an identity epilogue is refused before dispatch.
+  - **Speed:** M5 Pro, paired interleaved rounds (`bench_gemm_coop_tile` and
+    `bench_gemm_epi_tile`) at the Qwen3.5-2B GDN fused in-projection
+    ($K=2048$, $N=8224$): at $M=61$, 64×64 was faster with non-overlapping
+    ranges; at $M=200$, 128×64 was faster.
+  - **Qwen3.5 GDN chunk scan default switched to 16-column slices:**
+    `GdnScanSlice` now defaults to `Cols16` (`qwen35_gdn_chunk_scan_bv16`).
+    Paired timing on an M5 Pro (`probe_gdn_scan --paired`) showed `Cols16`
+    outperforming `Cols32` at batch 1 ($T=200$ and $T=8192$) and batch 2
+    ($T=61$ median 0.0781 vs 0.1005 ms, $T=200$ median 0.3210 vs 0.3839 ms)
+    with 0 mismatches in output or final recurrent state. Added
+    `GdnWorkspace::set_scan_slice` to retarget scans on an existing workspace.
+  - **Prefill attention dispatches tiled kernel at all lengths:**
+    `attn_prefill_by_length` and `prefill_attn_kernel` select
+    `PrefillAttnKernel::Tiled` (`ATTN_PREFILL_TILE`) across all $t_q$ values
+    without a length cutoff. Paired A/B timing (`bench_qwen35_layers --paired-attn`)
+    showed `attn_prefill` consistently faster than `flash_attn_rows` at both
+    $T=200$ (0.116 vs 0.232 ms) and $T=8192$ (55.3 vs 176.2 ms) with
+    non-overlapping ranges.
+  - **Audit:** `scripts/audit_gemm_tiles.py` now parses `NN_COOP_EPI_KERNEL`
+    macros, verifying 19 pipeline geometries (20 checks) with 0 mismatches.
+  - **Tests:** `short_m_bf16_plain_gemm_matches_the_wide_tile`,
+    `narrow_bf16_epilogue_matches_wide_within_unfused_tolerance`,
+    `short_m_bf16_ragged_extents_match_the_other_tile_and_the_reference`,
+    `f16_and_f32_at_a_short_m_shape_are_not_the_bf16_kernel`,
+    `overlapping_short_m_output_is_rejected_before_dispatch`,
+    `short_m_epilogue_ragged_bias_keeps_its_guard_and_refuses_the_wrong_tile`,
+    `short_m_epilogue_refuses_a_bias_that_aliases_the_output_before_dispatch`.
+
 - **Exact-f32 TN with a small C runs all its K partitions in one dispatch.**
   A TN whose C has fewer than 128 32×32 tiles gave the single dispatch only a
   few threadgroups, each walking all of K: the per-head gate weight gradient

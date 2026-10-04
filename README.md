@@ -91,7 +91,7 @@ flowchart TD
 
     subgraph CoreEngine["tessl Core Runtime Engine"]
         RuntimeMod["runtime.rs<br/>• MTL4 Buffers, FreeList Pools, Bump Arena<br/>• 16 MiB Constant Arena (Scalar Binds)<br/>• Deferred Recycle on MTLSharedEvent"]
-        GemmMod["gemm.rs<br/>• Rank-2 Extent &amp; Alignment Validation<br/>• Layout Resolution (NN, TN, NT, Batched)<br/>• Coop Destination (128x64 &amp; 64x64 sg4)"]
+        GemmMod["gemm.rs<br/>• Rank-2 Extent &amp; Alignment Validation<br/>• Layout Resolution (NN, TN, NT, Batched)<br/>• Coop Destination (128x64 &amp; 64x64 sg4)<br/>• Short-M bf16 &amp; Epilogue Tile Specialization"]
         DispatchMod["dispatch.rs<br/>• Binder &amp; 31-slot MTL4ArgumentTable<br/>• Threadgroup Grid Geometry Helpers"]
         NnMod["nn.rs<br/>• Checked elems() &amp; require::&lt;T&gt; Bounds<br/>• _with_scalars Binding Seam"]
         IcbMod["decode_icb.rs &amp; cb_replay.rs<br/>• Capture Tape, Freeze-Binds &amp; Range-Batching<br/>• Dual-Slot Ping-Pong State Machine"]
@@ -217,12 +217,12 @@ flowchart TD
 
 ```mermaid
 flowchart TD
-    Start["gemm(a, b, c, backend) / gemm_epilogue() / gemm_batched()"] --> Validate{"validate_gemm()<br/>• Rank-2, Non-empty, Bounds &lt;= 2^31<br/>• 16-byte (or 64-byte coop) alignment<br/>• Same runtime, No In/Out overlap"}
+    Start["gemm() / gemm_tiled() / gemm_epilogue() / gemm_epilogue_tiled() / gemm_batched()"] --> Validate{"validate_gemm()<br/>• Rank-2, Non-empty, Bounds &lt;= 2^31<br/>• 16-byte (or 64-byte coop) alignment<br/>• Same runtime, No In/Out overlap"}
     Validate -- Fail --> Err["Return Err(String)"]
     Validate -- Pass --> EpilogueCheck{"Epilogue / Batched?"}
 
     EpilogueCheck -- "Batched GEMM" --> BatchedDispatch["gemm_batched()<br/>• BatchStrides (A, B, C strides)<br/>• Stride-B = 0 broadcasts weight B<br/>• Coop-destination 64-byte alignment"]
-    EpilogueCheck -- "Fused Epilogue" --> EpilogueDispatch["gemm_epilogue()<br/>• Requires Coop Path (BF16, F16, TF32)<br/>• Evaluates alpha*A@B + beta*C + bias<br/>• Row-stride-0 column bias broadcast<br/>• In-register clamped activation"]
+    EpilogueCheck -- "Fused Epilogue" --> EpilogueDispatch["gemm_epilogue() / gemm_epilogue_tiled()<br/>• Requires Coop Path (BF16, F16, TF32)<br/>• Evaluates alpha*A@B + beta*C + bias<br/>• Row-stride-0 column bias broadcast<br/>• In-register clamped activation<br/>• 64x64 tile specialization for short-M bf16"]
     EpilogueCheck -- "Standard GEMM" --> BackendCheck{"Backend?"}
 
     BackendCheck -- SimdGroup --> SimdGroupKernel["matmul_simdgroup / edges<br/>• Portable fallback (16x16 / 32x32)<br/>• Direct write to device memory C"]
@@ -237,11 +237,11 @@ flowchart TD
     
     PrecisionCheck -- "f32 exact" --> F32Exact["matmul2d_tensorops_f32<br/>• Tile: 32x32, 1 simdgroup<br/>• Packed C-zero + matmul binder"]
     
-    PrecisionCheck -- "bf16 / f16 / tf32-relaxed" --> NNTable{"nn_coop_kernel()<br/>N &lt;= 512?"}
+    PrecisionCheck -- "bf16 / f16 / tf32-relaxed" --> NNTable{"nn_coop_kernel()<br/>(bf16 and M &lt; 128) or N &lt;= 512?"}
     
-    NNTable -- "N &lt;= 512 (Narrow)" --> NNNarrow["matmul2d_tensorops_*_64x64_sg4<br/>• TILE_COOP_NARROW (64x64, 4 simdgroups)<br/>• Register accumulator, cT.store<br/>• Origin-shifted edge-checked slices"]
+    NNTable -- "Yes (Narrow 64x64)" --> NNNarrow["matmul2d_tensorops_*_64x64_sg4<br/>• TILE_COOP_NARROW (64x64, 4 simdgroups)<br/>• Register accumulator, cT.store<br/>• Origin-shifted edge-checked slices"]
     
-    NNTable -- "N &gt; 512 (Default)" --> NNDefault["matmul2d_tensorops_*<br/>• TILE_COOP_DEFAULT (128x64, 4 simdgroups)<br/>• 8-tile-row column swizzle if grid &gt;= 2048<br/>• Register accumulator, cT.store<br/>• Origin-shifted edge-checked slices"]
+    NNTable -- "No (Default 128x64)" --> NNDefault["matmul2d_tensorops_*<br/>• TILE_COOP_DEFAULT (128x64, 4 simdgroups)<br/>• 8-tile-row column swizzle if grid &gt;= 2048<br/>• Register accumulator, cT.store<br/>• Origin-shifted edge-checked slices"]
 ```
 
 ### Cooperative Destination Advantages
@@ -483,11 +483,13 @@ TESSL_GEMM_TUNE=1 cargo build --release --bins
 |---|---|
 | `bench_gemm_tile_tune` | Exhaustive tile geometry ($SM \times SN$) and $BK$ ladder benchmark. |
 | `bench_gemm_tnnt_tune` | TN/NT tile sweep; the paired, round-interleaved A/B comparison lane. |
+| `bench_gemm_coop_tile` | Paired, interleaved A/B benchmark for cooperative GEMM tile geometries (128×64 vs 64×64). |
+| `bench_gemm_epi_tile` | Paired, interleaved A/B benchmark for fused epilogue tile geometries (128×64 vs 64×64). |
 | `bench_gemm_sweep` | Cross-runtime sweep (`f32`, `tf32`, `bf16`) with JSON telemetry output. |
 | `bench_nn_kernels` | Throughput of the `nn` library, timed both batched and solo so the dispatch floor is visible rather than hidden. |
-| `bench_qwen35_layers` | Per-kernel and forward timings of the Qwen3.5 layer kernels at the 2B's shapes. |
+| `bench_qwen35_layers` | Per-kernel and forward timings of the Qwen3.5 layer kernels at the 2B's shapes; `--paired-attn` times paired prefill attention. |
 | `bench_qwen35_train` | The training step's time at Qwen3.5-2B's shapes, each activation mode alone; `--batch` times a batch run row by row. |
-| `probe_gdn_scan` | Probe of the gated-delta-net scan. |
+| `probe_gdn_scan` | Probe of the gated-delta-net scan; `--paired` times paired 32- vs 16-column slice widths. |
 | `probe_gemm_parity` | Bit-exact verification probe comparing TensorOps against the reference SIMD path. |
 | `bench/paired_cross_runtime.py` | Python harness driving paired `tessl` vs. PyTorch MPS / MLX evaluation. |
 

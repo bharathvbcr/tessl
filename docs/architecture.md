@@ -15,11 +15,11 @@ flowchart TD
     Validate -- Pass --> ModeCheck{"Call Variant?"}
 
     ModeCheck -- "gemm_batched()" --> Batched["gemm_batched()<br/>• Explicit BatchStrides<br/>• Stride-B=0 broadcasts weight<br/>• Strict 64-byte alignment"]
-    ModeCheck -- "gemm_epilogue()" --> EpiCheck{"Epilogue Requirements<br/>• BF16, F16 or Relaxed F32<br/>• TensorOps backend"}
+    ModeCheck -- "gemm_epilogue() / gemm_epilogue_tiled()" --> EpiCheck{"Epilogue Requirements<br/>• BF16, F16 or Relaxed F32<br/>• TensorOps backend"}
     EpiCheck -- No --> EpiErr["Return Err(Epilogue needs coop path)"]
-    EpiCheck -- Yes --> EpiDispatch["matmul2d_tensorops_*_epi<br/>• Accumulator in registers<br/>• In-register alpha*A@B + beta*C + bias<br/>• Row-stride-0 column bias broadcast<br/>• Clamped precise::tanh / SiLU"]
+    EpiCheck -- Yes --> EpiDispatch["matmul2d_tensorops_*_epi<br/>• Accumulator in registers<br/>• In-register alpha*A@B + beta*C + bias<br/>• Row-stride-0 column bias broadcast<br/>• Clamped precise::tanh / SiLU<br/>• 64x64 tile for bf16 M &lt; 128"]
     
-    ModeCheck -- "gemm()" --> BackendCheck{"Backend?"}
+    ModeCheck -- "gemm() / gemm_tiled()" --> BackendCheck{"Backend?"}
 
     BackendCheck -- SimdGroup --> SimdGroupKernel["matmul_simdgroup / edges<br/>• Portable SIMDgroup Fallback<br/>• 16x16 / 32x32 tiles, device store"]
     BackendCheck -- TensorOps --> LayoutCheck{"Layout Resolution"}
@@ -33,11 +33,11 @@ flowchart TD
     
     PrecisionCheck -- "f32 exact" --> F32Exact["matmul2d_tensorops_f32<br/>• Tile: 32x32, 1 simdgroup<br/>• Packed C-zero + matmul binder"]
     
-    PrecisionCheck -- "bf16 / f16 / tf32-relaxed" --> NNTable{"nn_coop_kernel()<br/>N &lt;= 512?"}
+    PrecisionCheck -- "bf16 / f16 / tf32-relaxed" --> NNTable{"nn_coop_kernel()<br/>(bf16 and M &lt; 128) or N &lt;= 512?"}
     
-    NNTable -- "N &lt;= 512 (Narrow)" --> NNNarrow["matmul2d_tensorops_*_64x64_sg4<br/>• TILE_COOP_NARROW (64x64, 4 simdgroups)<br/>• Register accumulator, cT.store<br/>• Edge bounds-checked slices"]
+    NNTable -- "Yes (Narrow 64x64)" --> NNNarrow["matmul2d_tensorops_*_64x64_sg4<br/>• TILE_COOP_NARROW (64x64, 4 simdgroups)<br/>• Register accumulator, cT.store<br/>• Edge bounds-checked slices"]
     
-    NNTable -- "N &gt; 512 (Default)" --> NNDefault["matmul2d_tensorops_*<br/>• TILE_COOP_DEFAULT (128x64, 4 simdgroups)<br/>• 8-tile-row column swizzle if grid &gt;= 2048 tiles<br/>• Register accumulator, cT.store<br/>• Edge bounds-checked slices"]
+    NNTable -- "No (Default 128x64)" --> NNDefault["matmul2d_tensorops_*<br/>• TILE_COOP_DEFAULT (128x64, 4 simdgroups)<br/>• 8-tile-row column swizzle if grid &gt;= 2048 tiles<br/>• Register accumulator, cT.store<br/>• Edge bounds-checked slices"]
 ```
 
 ---
@@ -102,7 +102,8 @@ In Round 2 optimization, cooperative destination registers were extended across 
 | Layout / Path | Geometry | Implementation | Performance Impact |
 |---|---|---|---|
 | **NN Default** | $128 \times 64$, 4 sg | `matmul2d_tensorops_bf16_f32` + swizzle | **26,642 GFLOP/s** at $4096^3$ (+11% via swizzle) |
-| **NN Narrow ($N \le 512$)** | $64 \times 64$, 4 sg | `matmul2d_tensorops_bf16_f32_64x64_sg4` | +6% on narrow-$N$ shapes |
+| **NN Narrow ($N \le 512$ or bf16 $M < 128$)** | $64 \times 64$, 4 sg | `matmul2d_tensorops_bf16_f32_64x64_sg4` | +6% on narrow-$N$; outruns 128×64 on short-$M$ bf16 (e.g. M=61 GDN in-proj) |
+| **Fused Epilogue Narrow (bf16 $M < 128$)** | $64 \times 64$, 4 sg | `matmul2d_tensorops_bf16_f32_epi_64x64_sg4` | Specialization for short-$M$ bf16 operands; wide ($128 \times 64$) on $M \ge 128$ |
 | **TN bf16 Descriptor** | $128 \times 64$, 4 sg | `matmul2d_tensorops_tn_bf16_f32` | 1.52–1.98× over dynamic-$K$ multiply |
 | **NT bf16 ($dX$ Backward)** | $128 \times 64$, 4 sg | `matmul2d_tensorops_nt_bf16_f32` | 2.00–2.03× speedup at scale |
 | **Accumulate Paths** | $64 \times 64$, 4 sg | Zero $\to$ Run $\to$ Load-Add-Store (`TILE_COOP_ACCUM`) | 1.38–1.49× over `multiply_accumulate` |

@@ -11,13 +11,19 @@ you changed in the kernel.**
 | --- | --- |
 | `bench_gemm_tnnt_tune` | Paired, interleaved TN/NT kernel A/B. Use this for kernel comparisons. |
 | `bench_gemm_tile_tune` | Broad tile/BK ladder. Blocked-style timing — see pitfall 1. |
+| `bench_gemm_coop_tile` | Paired, interleaved cooperative GEMM tile A/B (128×64 vs 64×64). |
+| `bench_gemm_epi_tile` | Paired, interleaved fused epilogue tile A/B (128×64 vs 64×64). |
 | `bench_gemm_sweep` | Cross-runtime lane (f32 exact / tf32 / bf16), JSON out. |
+| `bench_qwen35_layers` | Layer kernel benchmarks; `--paired-attn` times paired prefill attention. |
+| `probe_gdn_scan` | Gated delta net chunk scan probe; `--paired` times paired 32- vs 16-col widths. |
 | `bench/paired_cross_runtime.py` | Alternates the tessl and PyTorch/MLX lanes round by round. |
 
 ```mermaid
 flowchart TD
     subgraph Suite["tessl Benchmarking Suite"]
         Sweep["bench_gemm_sweep<br/>(f32, tf32, bf16 sweep · JSON telemetry)"]
+        TileAB["bench_gemm_coop_tile &amp; bench_gemm_epi_tile<br/>(Paired 128x64 vs 64x64 coop &amp; epilogue A/B)"]
+        QwenBench["bench_qwen35_layers &amp; probe_gdn_scan<br/>(Layer benchmarks &amp; paired attention / GDN sweeps)"]
         NnBench["bench_nn_kernels<br/>(62 nn entry points · batched vs solo)"]
         Parity["probe_gemm_parity<br/>(Bit-exact TensorOps vs SIMD verification)"]
         

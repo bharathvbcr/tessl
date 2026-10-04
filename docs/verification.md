@@ -42,7 +42,7 @@ flowchart LR
 
     RustLand --> Extractor
     MetalLand --> Extractor
-    Extractor --> Pass["15 Pipelines Verified<br/>0 Mismatches"]
+    Extractor --> Pass["19 Pipelines Verified<br/>0 Mismatches"]
 ```
 
 Intended to cross-check, mechanically, the two relationships Rust's type system
@@ -60,8 +60,8 @@ from inside an extracted `.crate`. Verified against three injected faults: a
 tile drift, a BKC drift, and an unpinned kernel.
 
 > **Only the first of those two checks still runs, and the script reports `PASS`
-> either way.** Measured 2026-09-19: the audit prints `COOP_BKC = None` and then
-> `PASS: 0 mismatch(es)` over 15 kernels, having examined zero BKC relationships.
+> either way.** Measured 2026-10-04: the audit prints `COOP_BKC = None` and then
+> `PASS: 0 mismatch(es)` over 19 kernels (20 checks), having examined zero BKC relationships.
 > Three independent reasons, each sufficient on its own:
 >
 > 1. `COOP_BKC` appears nowhere in `src/` (`rg 'COOP_BKC' src/` is empty), so
@@ -469,7 +469,7 @@ total          349 passing, 0 failing, 1 ignored
 ```
 
 ```
-audit          PASS, 0 mismatches over 15 kernels -- tile geometry only,
+audit          PASS, 0 mismatches over 19 kernels -- tile geometry only,
                see the note in section 1; the BKC half did not run
 GDN mutations  19 of 19 caught (section 6, re-run this pass)
 fault tests    NOT RE-RUN this pass. Last recorded: 6 of 6 caught

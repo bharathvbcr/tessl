@@ -50,7 +50,7 @@ that fusion for Metal.
 | 6. Attention extras | `qwen35_attn_qk_norm_rope`, `qwen35_attn_gate_{f32,bf16}` | `attn_qk_norm_rope`, `attn_output_gate` | `q_norm`/`k_norm` (`1 + w`), `apply_rotary_pos_emb` (partial), `* sigmoid(gate)` |
 | 6b. Decode loops replayed from an ICB | `qwen35_attn_qk_norm_rope_posbuf` | `attn_qk_norm_rope_posbuf` | the position comes from a device buffer, like `rms_qkv_rope_posbuf` |
 | 6c. Shared-prefix attention | `qwen35_attn_prefix_rows`, `qwen35_attn_prefix_decode_{partial,reduce}` (+ `slot_base` in 6/6b) | `attn_prefix_rows`, `attn_prefix_decode`, `attn_qk_norm_rope_suffix{,_posbuf}` | attention over a per-row copy of a shared KV prefix, without the copy |
-| 6d. Prefill attention on the matrix units | `qwen35_attn_tiled_h256_*` (4 tiles) | `attn_prefill`, `attn_prefill_with_tile` | causal `sdpa` over the layer's own K/V; `nn::flash_attn_rows` with both products on TensorOps |
+| 6d. Prefill attention on the matrix units | `qwen35_attn_tiled_h256_*` (4 tiles) | `attn_prefill`, `attn_prefill_by_length`, `attn_prefill_with_tile` | causal `sdpa` over the layer's own K/V; `nn::flash_attn_rows` with both products on TensorOps |
 | 6e. MLP activation | `qwen35_swiglu_{f32,bf16}` | `swiglu` | `act_fn(gate_proj(x)) * up_proj(x)` in `Qwen3_5MLP`, stored as bf16 for `down_proj` |
 | 7. Score only the answer rows | `qwen35_score_rows_{f32,bf16}` | `score_answer_rows` | final norm + `lm_head`, restricted to the answer tokens |
 | 7b. Embedding gather | `qwen35_embed_rows_{bf16,f32}` | `embed_rows` | `embed_tokens(ids)` from the bf16 (or, in the f32 model, f32) table, on the device, so a forward needs no host gather |
@@ -268,6 +268,16 @@ matrix units sum in a different order, so the two agree to f32 rounding
 rather than bit for bit. On random inputs with softmax scores of a few units,
 each is ~1e-6 from an f64 reference (details under Verification).
 `dims.window` must be 0.
+
+`attn_prefill_by_length` selects `attn_prefill` (`ATTN_PREFILL_TILE`) across
+every query length $t_q$ (`prefill_attn_kernel` returns
+`PrefillAttnKernel::Tiled` with no length cutoff). Paired and interleaved in
+one process on an M5 Pro (`bench_qwen35_layers --paired-attn`, same Q/K/V,
+ABBA, 9 rounds), `attn_prefill` beat `nn::flash_attn_rows` at both lengths with
+non-overlapping sample ranges (per launch, median / min: $T = 200$,
+0.116 / 0.098 ms vs 0.232 / 0.221 ms; $T = 8192$, 55.3 / 53.4 ms vs
+176.2 / 173.7 ms). A cutoff that kept the scalar row kernel below 8192 was
+the slower kernel at $T = 200$.
 
 The shared-prefix kernels (6c) are still the scalar `flash_attn_rows`
 instantiation. They serve the questions, a few tokens each over the prefix,

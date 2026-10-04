@@ -52,6 +52,10 @@ def kernel_tiles(metal):
         name = m.group(1)
         out[name] = (int(m.group(3)), int(m.group(4)), int(m.group(5)), None)
 
+    for m in re.finditer(r'NN_COOP_EPI_KERNEL\(\s*(\w+)\s*,\s*(\w+)\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*(\w+)\s*\)', src):
+        name = m.group(1)
+        out[name] = (int(m.group(3)), int(m.group(4)), int(m.group(5)), None)
+
     for m in re.finditer(r'TN_NT_COOP_KERNEL\(\s*(\w+)\s*,\s*(\w+)\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*(\w+)\s*\)', src):
         name = m.group(1)
         out[name] = (int(m.group(3)), int(m.group(4)), int(m.group(5)), None)
@@ -99,6 +103,10 @@ NN_PAIRS = [
     ("matmul2d_tensorops_nt_bf16_f32", "TILE_COOP_TN_NT"),
     ("matmul2d_tensorops_tn_accum_bf16_f32", "TILE_COOP_ACCUM"),
     ("matmul2d_tensorops_nt_accum_bf16_f32", "TILE_COOP_ACCUM"),
+    ("matmul2d_tensorops_bf16_f32_epi", "TILE_COOP_DEFAULT"),
+    ("matmul2d_tensorops_bf16_f32_epi_64x64_sg4", "TILE_COOP_NARROW"),
+    ("matmul2d_tensorops_f16_f32_epi", "TILE_COOP_DEFAULT"),
+    ("matmul2d_tensorops_f32_relaxed_epi", "TILE_COOP_DEFAULT"),
 ]
 
 bad = 0

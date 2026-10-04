@@ -5,6 +5,7 @@
 //! cargo run --release --bin bench_qwen35_layers -- 1024 4096    # chosen T
 //! cargo run --release --bin bench_qwen35_layers -- --check-only # plausibility gate, no timing
 //! cargo run --release --bin bench_qwen35_layers -- --attn-rows  # scalar nn::flash_attn_rows
+//! cargo run --release --bin bench_qwen35_layers -- --paired-attn 200 8192
 //! cargo run --release --bin bench_qwen35_layers -- --attn-tile=q64_k64_sg8
 //! cargo run --release --bin bench_qwen35_layers -- --mlp-unfused # mlp_silu + cast
 //! cargo run --release --bin bench_qwen35_layers -- --gdn-scan16  # 16-column GDN scan
@@ -14,6 +15,9 @@
 //! default tile. `--attn-tile=LABEL` picks another `qwen35::AttnTile`, and
 //! `--attn-rows` selects `nn::flash_attn_rows`, the kernel it replaced. So
 //! the choices can be compared in one binary on one machine state.
+//! `--paired-attn` times only the prefill attention kernels, both of them,
+//! in this process: same Q/K/V, ABBA order (which kernel goes first rotates
+//! each round). It does not build the 24-layer model.
 //!
 //! Shapes are Qwen3.5-2B's `text_config` (hidden 2048, 16 key and 16 value GDN
 //! heads of 128, 8 query and 2 KV attention heads of 256, rotary 64, MLP 6144,
@@ -713,10 +717,177 @@ fn lm_head_ms_per_row(rt: &Arc<GpuRuntime>) -> Res<f64> {
     Ok(time_ms(rt, 1, || gemm(&x, &w, &logits, BACKEND))? / LM_ROWS as f64)
 }
 
+// ------------------------------------------------------- paired attention ---
+
+/// Dispatches per command buffer. T = 200 is ~0.16 GFLOP, under the ~0.25 ms
+/// submit floor if timed one launch at a time (`docs/benchmarking.md`). The
+/// count keeps that buffer well above the floor. T = 8192 is ~275 GFLOP, so
+/// a handful of launches is enough and the slow kernel stays a short sample.
+fn paired_reps(t: usize) -> usize {
+    if t <= 512 {
+        128
+    } else if t <= 2048 {
+        16
+    } else {
+        4
+    }
+}
+
+#[derive(Clone, Copy)]
+enum PairKernel {
+    Rows,
+    Tiled,
+}
+
+impl PairKernel {
+    fn name(self) -> &'static str {
+        match self {
+            PairKernel::Rows => "flash_attn_rows",
+            PairKernel::Tiled => "attn_prefill",
+        }
+    }
+}
+
+fn dispatch_pair(
+    rt: &Arc<GpuRuntime>,
+    kernel: PairKernel,
+    q: &GpuBuffer,
+    k: &GpuBuffer,
+    v: &GpuBuffer,
+    o: &GpuBuffer,
+    tkv: &GpuBuffer,
+    pos: &GpuBuffer,
+    t: usize,
+) -> Res<()> {
+    let dims = nn::AttnDims {
+        batch: 1,
+        tq: t as u32,
+        heads: Q_HEADS,
+        heads_kv: KV_HEADS,
+        window: 0,
+        scale: 1.0 / (HEAD_DIM as f32).sqrt(),
+    };
+    match kernel {
+        PairKernel::Rows => nn::flash_attn_rows(rt, q, k, v, o, tkv, pos, pos, dims, HEAD_DIM, false),
+        PairKernel::Tiled => qwen35::attn_prefill(rt, q, k, v, o, tkv, pos, pos, dims, false),
+    }
+}
+
+/// One attention layer at Qwen3.5-2B's head geometry, both prefill kernels,
+/// same buffers, ABBA. Prints median and min milliseconds per kernel per T.
+fn run_paired_attn(rt: &Arc<GpuRuntime>, ts: &[usize]) -> Res<()> {
+    use std::io::Write;
+
+    const WARMUP_ROUNDS: usize = 3;
+    const ROUNDS: usize = 9;
+    println!(
+        "paired prefill attention: nn::flash_attn_rows vs qwen35::attn_prefill \
+         (tile {})",
+        qwen35::ATTN_PREFILL_TILE.label()
+    );
+    println!(
+        "one process, one attention layer, batch 1, heads {Q_HEADS}q/{KV_HEADS}kv x {HEAD_DIM}, \
+         same Q/K/V, ABBA (first kernel rotates each round)"
+    );
+    println!("warmup rounds {WARMUP_ROUNDS}, timed rounds {ROUNDS} (one sample per kernel per round)");
+
+    for &t in ts {
+        if t > u32::MAX as usize {
+            return Err(format!("T={t} does not fit the kernel's u32 length"));
+        }
+        let reps = paired_reps(t);
+        let qd = t * (Q_HEADS * HEAD_DIM) as usize;
+        let kv = t * (KV_HEADS * HEAD_DIM) as usize;
+        let scale = 1.0 / (HEAD_DIM as f32).sqrt();
+        let q = buf(rt, &fill(qd, 11, scale))?;
+        let k = buf(rt, &fill(kv, 12, scale))?;
+        let v = buf(rt, &fill(kv, 13, scale))?;
+        let o = rt.alloc_buffer(qd * 4)?;
+        let tkv = buf_u32(rt, &[t as u32])?;
+        let pos = buf_u32(rt, &[0])?;
+
+        let mut checksums = Vec::new();
+        for kernel in [PairKernel::Rows, PairKernel::Tiled] {
+            o.write_f32(&vec![f32::NAN; qd]);
+            dispatch_pair(rt, kernel, &q, &k, &v, &o, &tkv, &pos, t)?;
+            rt.synchronize()?;
+            let out = o.read_f32();
+            if let Some(i) = out[..qd].iter().position(|x| !x.is_finite()) {
+                return Err(format!("T={t} {}: element {i} of {qd} is non-finite", kernel.name()));
+            }
+            let sum: f64 = out[..qd].iter().map(|x| x.abs() as f64).sum();
+            if sum == 0.0 {
+                return Err(format!("T={t} {}: output is all zeros", kernel.name()));
+            }
+            checksums.push((kernel.name(), sum));
+        }
+        let rel = (checksums[0].1 - checksums[1].1).abs() / checksums[0].1;
+        println!(
+            "T={t}: wrote finite output, |checksum rows-tiled|/rows = {rel:.3e} \
+             (rows {:.6e}, tiled {:.6e})",
+            checksums[0].1, checksums[1].1
+        );
+        if rel > 1e-3 {
+            return Err(format!(
+                "T={t}: kernels disagree by {rel:.3e} on the abs checksum, above 1e-3"
+            ));
+        }
+
+        let mut rows = Vec::with_capacity(ROUNDS);
+        let mut tiled = Vec::with_capacity(ROUNDS);
+        for round in 0..(WARMUP_ROUNDS + ROUNDS) {
+            let record = round >= WARMUP_ROUNDS;
+            let order = if round % 2 == 0 {
+                [PairKernel::Rows, PairKernel::Tiled]
+            } else {
+                [PairKernel::Tiled, PairKernel::Rows]
+            };
+            for kernel in order {
+                rt.synchronize()?;
+                let t0 = Instant::now();
+                for _ in 0..reps {
+                    dispatch_pair(rt, kernel, &q, &k, &v, &o, &tkv, &pos, t)?;
+                }
+                rt.synchronize()?;
+                let ms = t0.elapsed().as_secs_f64() * 1e3 / reps as f64;
+                if record {
+                    let which = if round % 2 == 0 { "rows-first" } else { "tiled-first" };
+                    println!(
+                        "sample T={t} round={} {which} {} {ms:.4} ms (buffer {:.2} ms, {reps} launches)",
+                        round - WARMUP_ROUNDS,
+                        kernel.name(),
+                        ms * reps as f64
+                    );
+                    let _ = std::io::stdout().flush();
+                    match kernel {
+                        PairKernel::Rows => rows.push(ms),
+                        PairKernel::Tiled => tiled.push(ms),
+                    }
+                }
+            }
+        }
+
+        for (name, samples) in [("flash_attn_rows", &rows), ("attn_prefill", &tiled)] {
+            let med = median(samples.clone());
+            let lo = samples.iter().copied().fold(f64::INFINITY, f64::min);
+            let hi = samples.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+            println!(
+                "PAIRED t={t} kernel={name} n={} reps={reps} median_ms={med:.4} min_ms={lo:.4} max_ms={hi:.4} buffer_median_ms={:.2}",
+                samples.len(),
+                med * reps as f64
+            );
+        }
+        let ratio = median(tiled.clone()) / median(rows.clone());
+        println!("PAIRED t={t} ratio_tiled_over_rows={ratio:.4}");
+    }
+    Ok(())
+}
+
 // --------------------------------------------------------------------- main ---
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut check_only = false;
+    let mut paired_attn = false;
     let mut attn = AttnChoice::Tiled(qwen35::ATTN_PREFILL_TILE);
     let mut mlp_unfused = false;
     let mut gdn_scan = qwen35::GdnScanSlice::Cols32;
@@ -724,6 +895,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     for arg in std::env::args().skip(1) {
         if arg == "--check-only" {
             check_only = true;
+        } else if arg == "--paired-attn" {
+            paired_attn = true;
         } else if arg == "--gdn-scan16" {
             gdn_scan = qwen35::GdnScanSlice::Cols16;
         } else if arg == "--mlp-unfused" {
@@ -742,7 +915,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         } else {
             let t: usize = arg.parse().map_err(|_| {
                 format!(
-                    "expected a token count, --check-only, --attn-rows, --attn-tile=LABEL, \
+                    "expected a token count, --check-only, --paired-attn, --attn-rows, --attn-tile=LABEL, \
                      --mlp-unfused or --gdn-scan16, got {arg:?}"
                 )
             })?;
@@ -752,8 +925,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             ts.push(t);
         }
     }
+    if paired_attn && check_only {
+        return Err("--paired-attn times both kernels; it does not combine with --check-only".into());
+    }
     if ts.is_empty() {
-        ts = DEFAULT_T.to_vec();
+        ts = if paired_attn {
+            vec![200, 8192]
+        } else {
+            DEFAULT_T.to_vec()
+        };
     }
 
     let rt = GpuRuntime::new()?;
@@ -761,6 +941,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Err("bf16 GEMMs need the TensorOps backend, which this device lacks".into());
     }
     println!("device: {}", rt.device_name());
+    if paired_attn {
+        rt.set_async_encode(true)?;
+        run_paired_attn(&rt, &ts)?;
+        rt.set_async_encode(false)?;
+        return Ok(());
+    }
     println!(
         "Qwen3.5-2B shapes: hidden {HIDDEN}, GDN {GDN_K_HEADS}k/{GDN_V_HEADS}v heads x {GDN_V_DIM}, \
          attn {Q_HEADS}q/{KV_HEADS}kv x {HEAD_DIM} (rotary {ROTARY_DIM}), MLP {INTER}, vocab {VOCAB}"

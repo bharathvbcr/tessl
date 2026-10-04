@@ -330,13 +330,39 @@ fn use_relaxed_f32(rt: &GpuRuntime, backend: GemmBackend) -> bool {
 ///
 /// - f32×f32→f32 always supported (exact or relaxed via runtime flag)
 /// - bf16×bf16→f32 accum (C must be f32) via TensorOps when available
+///
+/// Bf16 operands whose M does not fill a 128-row tile dispatch
+/// `matmul2d_tensorops_bf16_f32_64x64_sg4` even when N > 512. That
+/// instantiation is the same cooperative helper as the 128×64 kernel and
+/// takes N as a runtime extent. M ≥ 128 keeps the previous rule: 64×64 only
+/// when N ≤ 512.
 pub fn gemm(a: &Tensor, b: &Tensor, c: &Tensor, backend: GemmBackend) -> Result<(), String> {
+    gemm_dispatch(a, b, c, backend, None)
+}
+
+/// [`gemm`] on an explicit cooperative tile.
+///
+/// [`gemm`] picks the tile. This forces one so a numeric check or a paired
+/// timing can run both geometries on the same buffers. Exact f32 and the
+/// simdgroup backend have no cooperative tile and are refused. The call
+/// validates with the same checks as [`gemm`] before a kernel is chosen.
+pub fn gemm_tiled(a: &Tensor, b: &Tensor, c: &Tensor, backend: GemmBackend, tile: EpiTile) -> Result<(), String> {
+    gemm_dispatch(a, b, c, backend, Some(tile))
+}
+
+fn gemm_dispatch(
+    a: &Tensor,
+    b: &Tensor,
+    c: &Tensor,
+    backend: GemmBackend,
+    tile: Option<EpiTile>,
+) -> Result<(), String> {
     let (m, n, k) = validate_gemm(a, b, c, Layout::NN, true)?;
 
     let use_bf16 = a.dtype == DType::BF16 && b.dtype == DType::BF16;
     let use_f16 = a.dtype == DType::F16 && b.dtype == DType::F16;
-    let narrow = use_bf16 || use_f16;
-    if a.dtype != b.dtype || (narrow && backend != GemmBackend::TensorOps) {
+    let narrow_dtype = use_bf16 || use_f16;
+    if a.dtype != b.dtype || (narrow_dtype && backend != GemmBackend::TensorOps) {
         return Err("GEMM requires matching operand dtypes; bf16 and f16 require TensorOps".into());
     }
 
@@ -348,13 +374,24 @@ pub fn gemm(a: &Tensor, b: &Tensor, c: &Tensor, backend: GemmBackend) -> Result<
     } else {
         CoopElem::RelaxedF32
     };
+    let coop = narrow_dtype || use_relaxed_f32(rt, backend);
+    if tile.is_some() && !(backend == GemmBackend::TensorOps && coop) {
+        return Err(
+            "GEMM tile override needs the cooperative-destination path: bf16 or f16 operands, \
+             or f32 with relaxed precision, on the TensorOps backend"
+                .into(),
+        );
+    }
     match backend {
         // Cooperative-destination NN kernels (bf16, f16 and relaxed f32):
         // register accumulator, C written exactly once — no zero pre-pass.
-        GemmBackend::TensorOps if narrow || use_relaxed_f32(rt, backend) => {
-            let (kernel, tile) = nn_coop_kernel(m, n, k, elem);
+        GemmBackend::TensorOps if coop => {
+            let (kernel, geom) = match tile {
+                Some(forced) => nn_coop_kernel_for(elem, forced),
+                None => nn_coop_kernel(m, n, k, elem),
+            };
             let pipeline = rt.pipeline(kernel)?;
-            dispatch_tensorops_nn_coop(rt, &pipeline, a, b, c, m, n, k, tile)?;
+            dispatch_tensorops_nn_coop(rt, &pipeline, a, b, c, m, n, k, geom)?;
         }
         GemmBackend::TensorOps => match nn_splitk_k_tile(m, n, k) {
             Some(k_tile) => gemm_nn_splitk_f32(a, b, c, (m, n, k), k_tile)?,
@@ -691,6 +728,9 @@ impl Epilogue<'_> {
 /// would make the call quietly slower than the unfused code it replaced.
 ///
 /// An identity epilogue dispatches to the plain [`gemm`].
+///
+/// Bf16 operands whose M does not fill a 128-row tile use the 64×64 epilogue
+/// instantiation. Every other shape stays on 128×64.
 pub fn gemm_epilogue(
     a: &Tensor,
     b: &Tensor,
@@ -698,7 +738,51 @@ pub fn gemm_epilogue(
     backend: GemmBackend,
     epi: Epilogue<'_>,
 ) -> Result<(), String> {
+    run_gemm_epilogue(a, b, c, backend, epi, None)
+}
+
+/// Cooperative epilogue geometry.
+///
+/// [`gemm_epilogue`] picks [`EpiTile::Narrow`] for bf16 only when M does not
+/// fill a 128-row tile. [`gemm_epilogue_tiled`] forces a geometry so a numeric
+/// check or a paired timing can run both on the same shape.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EpiTile {
+    /// 128×64 simdgroup-4. Instantiated for bf16, f16, and relaxed f32.
+    Wide,
+    /// 64×64 simdgroup-4. Instantiated for bf16 only.
+    Narrow,
+}
+
+/// [`gemm_epilogue`] on an explicit tile.
+///
+/// An identity epilogue is refused. That path is the plain GEMM, which selects
+/// its own tile from N and would ignore `tile`.
+pub fn gemm_epilogue_tiled(
+    a: &Tensor,
+    b: &Tensor,
+    c: &Tensor,
+    backend: GemmBackend,
+    epi: Epilogue<'_>,
+    tile: EpiTile,
+) -> Result<(), String> {
+    run_gemm_epilogue(a, b, c, backend, epi, Some(tile))
+}
+
+fn run_gemm_epilogue(
+    a: &Tensor,
+    b: &Tensor,
+    c: &Tensor,
+    backend: GemmBackend,
+    epi: Epilogue<'_>,
+    tile: Option<EpiTile>,
+) -> Result<(), String> {
     if epi.is_identity() {
+        if tile.is_some() {
+            return Err("GEMM epilogue: an explicit tile needs a non-identity epilogue; \
+                 the identity path is the plain GEMM, which picks its own tile"
+                .into());
+        }
         return gemm(a, b, c, backend);
     }
     let (m, n, k) = validate_gemm(a, b, c, Layout::NN, true)?;
@@ -739,21 +823,24 @@ pub fn gemm_epilogue(
                 bias.numel()
             ));
         }
+        // Bias is loaded while C is stored. Separate tile rows are separate
+        // threadgroups, so a bias that aliases C races. M = 127 on the 64-row
+        // tile is two rows; the 128-row tile is one.
+        if bias.overlaps(c) {
+            return Err("GEMM epilogue: bias must not overlap the output".into());
+        }
     }
 
-    let kernel = if use_bf16 {
-        "matmul2d_tensorops_bf16_f32_epi"
+    let elem = if use_bf16 {
+        CoopElem::Bf16
     } else if use_f16 {
-        "matmul2d_tensorops_f16_f32_epi"
+        CoopElem::F16
     } else {
-        "matmul2d_tensorops_f32_relaxed_epi"
+        CoopElem::RelaxedF32
     };
+    let chosen = tile.unwrap_or_else(|| epi_tile_auto(m, elem));
+    let (kernel, tile) = epi_kernel(elem, chosen)?;
     let pipeline = rt.pipeline(kernel)?;
-    // Only the 128x64 sg4 geometry has an epilogue instantiation. The narrow
-    // 64x64 variant exists for shapes the tile tune found it better on; adding
-    // an epilogue copy of it is a tuning question, not a correctness one, and
-    // is deliberately left until measured.
-    let tile = TILE_COOP_DEFAULT;
     let tiles_n = n.div_ceil(tile.sn);
     let tiles_m = m.div_ceil(tile.sm);
     let tg = morton_tg_count(tiles_n, tiles_m);
@@ -797,11 +884,6 @@ const TILE_COOP_NARROW: TileGeom = TileGeom {
     simdgroups: 4,
 };
 
-/// Shape → coop NN kernel, from the 2026-08-30 M5 Pro tile tunes
-/// (bench/results/bf16_tile_tune_m5pro_coop.txt, bf16_tnnt_coop_m5pro.txt):
-/// 64×64 sg4 wins narrow-N shapes by ~6%; 128×64 sg4 everything else. The
-/// in-kernel column-panel swizzle covers the huge-square case (+11% at
-/// 4096³), which retired the earlier 256×64 sg8 wide entry it outran.
 /// Operand element type for the cooperative-destination NN kernels.
 ///
 /// A three-way choice rather than the boolean this used to be: f16 and bf16
@@ -814,8 +896,46 @@ enum CoopElem {
     F16,
 }
 
-fn nn_coop_kernel(_m: usize, n: usize, _k: usize, elem: CoopElem) -> (&'static str, TileGeom) {
-    if n <= 512 {
+/// 64×64 epilogue only when a 128-row tile would not be filled, and only for
+/// bf16, which is the dtype that instantiation exists for.
+fn epi_tile_auto(m: usize, elem: CoopElem) -> EpiTile {
+    if elem == CoopElem::Bf16 && m < TILE_COOP_DEFAULT.sm {
+        EpiTile::Narrow
+    } else {
+        EpiTile::Wide
+    }
+}
+
+fn epi_kernel(elem: CoopElem, tile: EpiTile) -> Result<(&'static str, TileGeom), String> {
+    match (elem, tile) {
+        (CoopElem::Bf16, EpiTile::Narrow) => Ok(("matmul2d_tensorops_bf16_f32_epi_64x64_sg4", TILE_COOP_NARROW)),
+        (CoopElem::Bf16, EpiTile::Wide) => Ok(("matmul2d_tensorops_bf16_f32_epi", TILE_COOP_DEFAULT)),
+        (CoopElem::F16, EpiTile::Wide) => Ok(("matmul2d_tensorops_f16_f32_epi", TILE_COOP_DEFAULT)),
+        (CoopElem::RelaxedF32, EpiTile::Wide) => Ok(("matmul2d_tensorops_f32_relaxed_epi", TILE_COOP_DEFAULT)),
+        (_, EpiTile::Narrow) => Err("GEMM epilogue: the 64x64 tile is instantiated for bf16 operands only".into()),
+    }
+}
+
+/// Shape → coop NN kernel.
+///
+/// N ≤ 512 uses 64×64 from the 2026-08-30 M5 Pro tile tunes. Bf16 with
+/// M < 128 also uses `matmul2d_tensorops_bf16_f32_64x64_sg4`, whose N is a
+/// runtime extent. M ≥ 128 with N > 512 stays on 128×64: paired timing at
+/// the GDN in-projection (K=2048, N=8224) had non-overlapping ranges, with
+/// 64×64 faster at M=61 and 128×64 faster at M=200.
+fn nn_coop_kernel(m: usize, n: usize, _k: usize, elem: CoopElem) -> (&'static str, TileGeom) {
+    // N ≤ 512 is the 2026-08-30 tune. The short-M clause is bf16 only: f16
+    // and relaxed f32 keep the N rule. M ≥ 128 with N > 512 stays on 128×64.
+    let short_m = elem == CoopElem::Bf16 && m < TILE_COOP_DEFAULT.sm;
+    coop_kernel(elem, short_m || n <= 512)
+}
+
+fn nn_coop_kernel_for(elem: CoopElem, tile: EpiTile) -> (&'static str, TileGeom) {
+    coop_kernel(elem, tile == EpiTile::Narrow)
+}
+
+fn coop_kernel(elem: CoopElem, narrow: bool) -> (&'static str, TileGeom) {
+    if narrow {
         (
             match elem {
                 CoopElem::Bf16 => "matmul2d_tensorops_bf16_f32_64x64_sg4",
@@ -2787,5 +2907,102 @@ mod stress_tests {
         for h in handles {
             h.join().expect("stress thread panicked");
         }
+    }
+}
+
+#[cfg(test)]
+mod epi_tile_select {
+    use super::*;
+
+    #[test]
+    fn narrow_only_when_bf16_m_does_not_fill_a_128_row_tile() {
+        assert_eq!(epi_tile_auto(1, CoopElem::Bf16), EpiTile::Narrow);
+        assert_eq!(epi_tile_auto(61, CoopElem::Bf16), EpiTile::Narrow);
+        assert_eq!(epi_tile_auto(127, CoopElem::Bf16), EpiTile::Narrow);
+        assert_eq!(epi_tile_auto(128, CoopElem::Bf16), EpiTile::Wide);
+        assert_eq!(epi_tile_auto(200, CoopElem::Bf16), EpiTile::Wide);
+        assert_eq!(epi_tile_auto(61, CoopElem::F16), EpiTile::Wide);
+        assert_eq!(epi_tile_auto(61, CoopElem::RelaxedF32), EpiTile::Wide);
+    }
+}
+
+#[cfg(test)]
+mod coop_tile_select {
+    use super::*;
+
+    #[test]
+    fn bf16_short_m_uses_the_existing_64x64_kernel_when_n_exceeds_512() {
+        let narrow = "matmul2d_tensorops_bf16_f32_64x64_sg4";
+        let wide = "matmul2d_tensorops_bf16_f32";
+        for m in [1usize, 61, 127] {
+            let (name, tile) = nn_coop_kernel(m, 8224, 2048, CoopElem::Bf16);
+            assert_eq!(name, narrow, "M={m}");
+            assert_eq!((tile.sm, tile.sn, tile.simdgroups), (64, 64, 4));
+        }
+        for m in [128usize, 200] {
+            let (name, tile) = nn_coop_kernel(m, 8224, 2048, CoopElem::Bf16);
+            assert_eq!(name, wide, "M={m}");
+            assert_eq!((tile.sm, tile.sn, tile.simdgroups), (128, 64, 4));
+        }
+        // N ≤ 512 is unchanged, including when M fills a 128-row tile.
+        let (name, _) = nn_coop_kernel(200, 512, 2048, CoopElem::Bf16);
+        assert_eq!(name, narrow);
+        // f16 and relaxed f32 do not take the short-M exception.
+        assert_eq!(
+            nn_coop_kernel(61, 8224, 2048, CoopElem::F16).0,
+            "matmul2d_tensorops_f16_f32"
+        );
+        assert_eq!(
+            nn_coop_kernel(61, 8224, 2048, CoopElem::RelaxedF32).0,
+            "matmul2d_tensorops_f32_relaxed"
+        );
+        assert_eq!(
+            nn_coop_kernel(61, 512, 64, CoopElem::F16).0,
+            "matmul2d_tensorops_f16_f32_64x64_sg4"
+        );
+    }
+
+    /// Ragged K and N must not move the tile. `nn_coop_kernel` ignores K, and
+    /// N enters only as `n <= 512`. N = 520 is past that cut and not a multiple
+    /// of 64; K = 7 is not a multiple of 8. f16 and relaxed f32 stay on their
+    /// own 128×64 kernels, never the bf16 64×64 name.
+    #[test]
+    fn ragged_k_and_n_do_not_hand_f16_or_f32_the_bf16_short_m_kernel() {
+        let n = 520usize;
+        let k = 7usize;
+        assert!(
+            n > 512 && n % 64 != 0,
+            "attack shape must keep a partial N tile past the 512 cut"
+        );
+        assert_ne!(k % 8, 0, "attack shape must keep a partial K");
+        let bf16_narrow = "matmul2d_tensorops_bf16_f32_64x64_sg4";
+        let bf16_wide = "matmul2d_tensorops_bf16_f32";
+        for m in [1usize, 127] {
+            let (name, tile) = nn_coop_kernel(m, n, k, CoopElem::Bf16);
+            assert_eq!(name, bf16_narrow, "M={m}");
+            assert_eq!((tile.sm, tile.sn, tile.simdgroups), (64, 64, 4));
+            assert_eq!(epi_tile_auto(m, CoopElem::Bf16), EpiTile::Narrow, "M={m}");
+            for elem in [CoopElem::F16, CoopElem::RelaxedF32] {
+                let (other, wide) = nn_coop_kernel(m, n, k, elem);
+                assert_ne!(other, bf16_narrow, "{elem:?} M={m} took the bf16 short-M kernel");
+                assert_ne!(other, bf16_wide, "{elem:?} M={m} took the bf16 wide kernel");
+                assert_eq!((wide.sm, wide.sn), (128, 64), "{elem:?} M={m}");
+                assert_eq!(epi_tile_auto(m, elem), EpiTile::Wide, "{elem:?} M={m}");
+                let err = match epi_kernel(elem, EpiTile::Narrow) {
+                    Err(err) => err,
+                    Ok((name, _)) => panic!("{elem:?}: narrow epilogue was accepted as {name}"),
+                };
+                assert!(err.contains("bf16"), "{elem:?}: {err}");
+            }
+        }
+        let (name, tile) = nn_coop_kernel(128, n, k, CoopElem::Bf16);
+        assert_eq!(name, bf16_wide);
+        assert_eq!((tile.sm, tile.sn), (128, 64));
+        assert_eq!(epi_tile_auto(128, CoopElem::Bf16), EpiTile::Wide);
+        // K is not an input. Branching on K % 8 later would split these.
+        assert_eq!(
+            nn_coop_kernel(127, n, k, CoopElem::Bf16).0,
+            nn_coop_kernel(127, n, k + 1, CoopElem::Bf16).0
+        );
     }
 }

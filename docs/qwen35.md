@@ -130,16 +130,28 @@ is separable by column: every per-chunk product maps value column c only to
 column c. So the slice width sets the parallelism without changing any
 element's arithmetic. `GdnScanSlice::Cols16` (`qwen35_gdn_chunk_scan_bv16`,
 18 KB of threadgroup memory against 30 KB) launches twice the threadgroups of
-the default `Cols32`, bit for bit the same result. At Qwen3.5-2B's shapes
+`Cols32`, bit for bit the same result. At Qwen3.5-2B's shapes
 the 32-column scan is only 64 threadgroups at batch 1. `probe_gdn_scan`
 measured the scan at 1.37–1.55× its batch-1 time at batch 2, and 2.8× at
 batch 4, so batch 1 leaves the GPU partly idle. It is a same-session ratio
 under UI load. A first A/B at aae935f, also under UI load (GPU 51–59% busy),
 put the 16-column scan at 0.82× the 32-column scan at T = 8192, batch 1
 (6.79 vs 8.27 ms), but 1.10× at batch 2 and 1.30× at batch 4. At T = 1024 the
-batch-1 comparison was inside the noise. So the narrow slice helps a long
-batch-1 prefill and hurts larger batches. The default stays `Cols32`; a
-batch-dependent choice waits for a clean measurement.
+batch-1 comparison was inside the noise. `probe_gdn_scan --paired` then timed
+both widths on one workspace at batch 1 (Apple M5 Pro): Cols16 was faster at
+T = 200 and T = 8192 and matched Cols32 bit for bit, so `GdnScanSlice`
+defaults to `Cols16`. A later paired run on this Apple M5 Pro, one GDN scan
+layer, batch 2, ABBA, 9 rounds, found the opposite of the older probe's
+batch-2 result, with bit-identical outputs. At T = 61, Cols32 median
+0.1005 ms (min 0.0990, max 0.1247) and Cols16 median 0.0781 ms (min 0.0736,
+max 0.1966), Cols16 faster on 7 of 9 rounds (ratio 0.777); the ranges overlap
+because of two slow Cols16 rounds. At T = 200, Cols32 median 0.3839 ms
+(min 0.3676, max 0.4377) and Cols16 median 0.3210 ms (min 0.2631, max 0.4132),
+Cols16 faster on 8 of 9 rounds (ratio 0.836); the ranges overlap on one slow
+Cols16 round. Output and final state had 0 mismatches at both lengths. That
+1.10× batch-2 figure is the older probe and is not grounds to revert the
+`Cols16` default. Batch 4 was not remeasured; the older probe's 1.30× at
+batch 4 stays unrechecked.
 
 ### Many questions from one prefilled snapshot
 

@@ -16,9 +16,12 @@ use common::{
     U_BF16,
 };
 use tessl::gemm::{
-    gemm_bf16, gemm_nt_bf16, gemm_nt_f32, gemm_nt_train, gemm_tn_bf16, gemm_tn_f32, gemm_tn_train, GemmOperands,
+    gemm_bf16, gemm_nt_bf16, gemm_nt_f32, gemm_nt_train, gemm_tiled, gemm_tn_bf16, gemm_tn_f32, gemm_tn_train, EpiTile,
+    GemmOperands,
 };
-use tessl::{gemm, gemm_f32, GemmBackend, GpuRuntime, PrecisionMode};
+use tessl::qwen35::GdnProjLayout;
+use tessl::tensor::f32_slice_to_f16;
+use tessl::{gemm, gemm_f32, GemmBackend, GpuRuntime, PrecisionMode, Tensor};
 
 /// Operand extents for each layout, given the logical (M, N, K).
 fn operand_shapes(layout: Layout, m: usize, n: usize, k: usize) -> ([usize; 2], [usize; 2]) {
@@ -120,9 +123,8 @@ fn nt_f32_matches_cpu_reference() {
 #[test]
 fn nn_bf16_matches_cpu_reference() {
     with_gpu(|rt| {
-        // N=512 and N=520 straddle the `nn_coop_kernel` switch: at or below 512
-        // the 64x64 narrow tile is selected, above it the 128x64 default. Both
-        // sides of that decision have to be right, and only N moves it.
+        // N=512 still selects 64×64. N=520 with M=96 is the short-M bf16
+        // exception (64×64 even though N > 512). M=129, N=520 stays on 128×64.
         for &(m, n, k) in &[(64, 64, 128), (96, 512, 64), (96, 520, 64), (129, 520, 130)] {
             check_bf16(rt, Layout::Nn, m, n, k);
         }
@@ -321,5 +323,170 @@ fn bf16_gemm_beats_the_relaxed_bound_it_is_allowed() {
         gemm(&a, &b, &c, GemmBackend::TensorOps).unwrap();
         rt.synchronize().unwrap();
         assert_within_bound("bf16 f32-accumulate", &c.buffer.read_f32(), &expect, k, 0.0);
+    });
+}
+
+fn f16_tensor(rt: &std::sync::Arc<GpuRuntime>, shape: &[usize], data: &[f32]) -> Tensor {
+    let t = rt.alloc_tensor_f16(shape).expect("alloc_tensor_f16");
+    t.buffer.write_f16_bits(&f32_slice_to_f16(data));
+    t
+}
+
+/// `|narrow - wide|` against [`tolerance`] with `operand_u = 0`, the bound
+/// [`assert_within_bound`] uses for bf16 GEMM. Bit-identical tiles never
+/// consult a magnitude: the difference is zero, which is inside that bound.
+fn assert_tiles_within_bf16_bound(
+    label: &str,
+    narrow: &[f32],
+    wide: &[f32],
+    a: &[f32],
+    b: &[f32],
+    m: usize,
+    n: usize,
+    k: usize,
+) {
+    assert_eq!(narrow.len(), m * n, "{label}");
+    assert_eq!(wide.len(), m * n, "{label}");
+    let mut worst = 0.0f32;
+    let mut bits_differ = 0usize;
+    let mut worst_scaled = 0.0f64;
+    let mut worst_at = 0usize;
+    for i in 0..m {
+        for j in 0..n {
+            let idx = i * n + j;
+            let (g, w) = (narrow[idx], wide[idx]);
+            assert!(g.is_finite() && w.is_finite(), "{label}: non-finite at {idx}");
+            let err = (g - w).abs();
+            if err > worst {
+                worst = err;
+                worst_at = idx;
+            }
+            if g.to_bits() == w.to_bits() {
+                continue;
+            }
+            bits_differ += 1;
+            let mut mag = 0.0f64;
+            for p in 0..k {
+                mag += (a[i * k + p] as f64).abs() * (b[p * n + j] as f64).abs();
+            }
+            let tol = tolerance(k, mag, 0.0);
+            let scaled = if tol > 0.0 {
+                err as f64 / tol
+            } else if err == 0.0 {
+                0.0
+            } else {
+                f64::INFINITY
+            };
+            worst_scaled = worst_scaled.max(scaled);
+        }
+    }
+    println!(
+        "{label}: worst |64x64-128x64| = {worst:.6e} at {worst_at} bits_differ {bits_differ}/{} scaled {worst_scaled:.3} (bf16 GEMM tolerance, operand_u=0)",
+        m * n
+    );
+    assert!(
+        worst_scaled <= 1.0,
+        "{label}: element {worst_at} is {worst_scaled:.3}x the bf16 GEMM tolerance"
+    );
+}
+
+fn same_bits(label: &str, got: &[f32], want: &[f32]) {
+    assert_eq!(got.len(), want.len(), "{label}");
+    for (i, (g, w)) in got.iter().zip(want).enumerate() {
+        assert_eq!(g.to_bits(), w.to_bits(), "{label}: diverged at {i} ({g} vs {w})");
+    }
+}
+
+/// Qwen3.5-2B GDN fused in-projection: `gemm` of `[M, hidden]` by
+/// `[hidden, GdnProjLayout::width]`. N is not a multiple of 64, so the last
+/// tile is partial on both geometries.
+#[test]
+fn short_m_bf16_plain_gemm_matches_the_wide_tile() {
+    with_gpu(|rt| {
+        let n = GdnProjLayout::new(16, 16, 128).unwrap().width() as usize;
+        let k = 2048usize;
+        assert_eq!(n, 8224, "Qwen3.5-2B GDN fused in-proj width");
+        assert!(n > 512);
+        assert_ne!(n % 64, 0, "the shape must keep a partial N tile");
+
+        let b_h = round_trip_bf16(&random_f32(k * n, 0xB164));
+        let b16 = tensor_bf16(rt, &[k, n], &b_h);
+        let b_f16 = f16_tensor(rt, &[k, n], &random_f32(k * n, 0xF164));
+
+        for (case, &m) in [1usize, 127, 128, 200].iter().enumerate() {
+            let a_h = round_trip_bf16(&random_f32(m * k, 0xA164 + case as u64));
+            let a16 = tensor_bf16(rt, &[m, k], &a_h);
+            let wide = rt.alloc_tensor_f32(&[m, n]).unwrap();
+            let narrow = rt.alloc_tensor_f32(&[m, n]).unwrap();
+            let auto = rt.alloc_tensor_f32(&[m, n]).unwrap();
+            for c in [&wide, &narrow, &auto] {
+                c.buffer.write_f32(&vec![f32::NAN; m * n]);
+            }
+            gemm_tiled(&a16, &b16, &wide, GemmBackend::TensorOps, EpiTile::Wide).expect("wide bf16");
+            gemm_tiled(&a16, &b16, &narrow, GemmBackend::TensorOps, EpiTile::Narrow).expect("narrow bf16");
+            gemm(&a16, &b16, &auto, GemmBackend::TensorOps).expect("auto bf16");
+            rt.synchronize().unwrap();
+            let wide_out = wide.buffer.read_f32();
+            let narrow_out = narrow.buffer.read_f32();
+            let auto_out = auto.buffer.read_f32();
+            assert!(
+                wide_out[..m * n].iter().any(|v| v.abs() > 1e-3),
+                "M={m} wide bf16 wrote nothing"
+            );
+            assert_tiles_within_bf16_bound(
+                &format!("bf16 M={m} {m}x{n}x{k}"),
+                &narrow_out[..m * n],
+                &wide_out[..m * n],
+                &a_h,
+                &b_h,
+                m,
+                n,
+                k,
+            );
+            let followed = if m < 128 { &narrow_out } else { &wide_out };
+            same_bits(&format!("bf16 auto M={m}"), &auto_out[..m * n], &followed[..m * n]);
+
+            // f16 keeps the N rule: N > 512 stays on 128×64 for every M here.
+            let a_f = f16_tensor(rt, &[m, k], &random_f32(m * k, 0xF16A + case as u64));
+            let f_wide = rt.alloc_tensor_f32(&[m, n]).unwrap();
+            let f_auto = rt.alloc_tensor_f32(&[m, n]).unwrap();
+            for c in [&f_wide, &f_auto] {
+                c.buffer.write_f32(&vec![f32::NAN; m * n]);
+            }
+            gemm_tiled(&a_f, &b_f16, &f_wide, GemmBackend::TensorOps, EpiTile::Wide).expect("wide f16");
+            gemm(&a_f, &b_f16, &f_auto, GemmBackend::TensorOps).expect("auto f16");
+            rt.synchronize().unwrap();
+            let f_wide_out = f_wide.buffer.read_f32();
+            let f_auto_out = f_auto.buffer.read_f32();
+            assert!(
+                f_wide_out[..m * n].iter().all(|v| v.is_finite()),
+                "M={m} f16 wide non-finite"
+            );
+            assert!(
+                f_wide_out[..m * n].iter().any(|v| v.abs() > 1e-3),
+                "M={m} f16 wide wrote nothing"
+            );
+            same_bits(
+                &format!("f16 auto stays on 128x64 M={m}"),
+                &f_auto_out[..m * n],
+                &f_wide_out[..m * n],
+            );
+
+            // Exact f32 does not use the cooperative selector. K is short so
+            // the reference stays cheap; N is still past 512.
+            check_f32(rt, Layout::Nn, m, n, 8);
+        }
+
+        rt.take_dispatch_count();
+        let a = tensor_bf16(rt, &[1, 64], &vec![1.0f32; 64]);
+        let b_bad = tensor_bf16(rt, &[32, 128], &vec![1.0f32; 32 * 128]);
+        let c = rt.alloc_tensor_f32(&[1, 128]).unwrap();
+        let err = gemm(&a, &b_bad, &c, GemmBackend::TensorOps).expect_err("mismatched K");
+        assert_eq!(err, "GEMM inner dimensions or output shape do not match");
+        let empty = a.view(&[0, 64], 0);
+        let b = tensor_bf16(rt, &[64, 128], &vec![1.0f32; 64 * 128]);
+        let err = gemm(&empty, &b, &c, GemmBackend::TensorOps).expect_err("empty M");
+        assert_eq!(err, "GEMM requires nonempty rank-2 tensors");
+        assert_eq!(rt.take_dispatch_count(), 0, "rejected GEMM still encoded");
     });
 }

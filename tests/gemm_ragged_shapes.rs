@@ -11,8 +11,8 @@
 //!
 //! Boundaries covered (from README "GEMM Pipeline & Kernel Selection"):
 //!   32x32   TILE_F32          -- f32 exact NN / TN / NT
-//!   64x64   TILE_COOP_NARROW  -- bf16 and relaxed NN with N <= 512
-//!   128x64  TILE_COOP_DEFAULT -- bf16 and relaxed NN with N > 512
+//!   64x64   TILE_COOP_NARROW  -- NN with N <= 512; bf16 also when M < 128
+//!   128x64  TILE_COOP_DEFAULT -- N > 512, except bf16 with M < 128
 //!   128x64  TILE_COOP_TN_NT   -- bf16 TN / NT descriptors
 //!   tiles_n * tiles_m >= 2048 -- column-panel swizzle (coop NN, 8-row bands)
 //!   N * K >= 2^23             -- column-panel walk (exact f32, 16-row bands)
@@ -144,9 +144,9 @@ fn tn_nt_bf16_handle_ragged_extents() {
 #[test]
 fn nn_bf16_straddles_the_narrow_wide_kernel_boundary() {
     with_gpu(|rt| {
-        // `nn_coop_kernel` switches tile geometry on N alone, at exactly 512.
-        // A ragged M on both sides makes sure the boundary is not merely
-        // "reachable" but correct with a partial trailing M tile in each.
+        // N = 511 and 512 select 64×64. N = 513 with M = 67 is the short-M
+        // bf16 path (64×64 despite N > 512). M = 193, N = 576 fills a 128-row
+        // tile and stays on 128×64. Each row keeps a partial trailing M tile.
         for &(m, n, k) in &[(67, 511, 33), (67, 512, 33), (67, 513, 33), (193, 576, 65)] {
             let a_host = round_trip_bf16(&random_f32(m * k, 0x4242 ^ n as u64));
             let b_host = round_trip_bf16(&random_f32(k * n, 0x2424 ^ n as u64));

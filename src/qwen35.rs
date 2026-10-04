@@ -805,9 +805,13 @@ pub struct GdnParams<'a> {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum GdnScanSlice {
     /// `qwen35_gdn_chunk_scan`: `v_dim / 32` threadgroups per head.
-    #[default]
     Cols32,
     /// `qwen35_gdn_chunk_scan_bv16`: `v_dim / 16` threadgroups per head.
+    ///
+    /// Default. A paired batch-1 measurement (`probe_gdn_scan --paired`) had
+    /// this faster than [`Self::Cols32`] at T = 200 and T = 8192, with the
+    /// same bits.
+    #[default]
     Cols16,
 }
 
@@ -859,6 +863,14 @@ impl GdnWorkspace {
     pub fn with_scan_slice(mut self, slice: GdnScanSlice) -> Self {
         self.scan = slice;
         self
+    }
+
+    /// Point later scans on this workspace at `slice`.
+    ///
+    /// The scratch buffers stay put. Prep does not read the slice, so one prep
+    /// can feed both widths.
+    pub fn set_scan_slice(&mut self, slice: GdnScanSlice) {
+        self.scan = slice;
     }
 
     /// Bytes this workspace needs for `dims`.
@@ -2141,6 +2153,27 @@ impl AttnTile {
 /// The tile [`attn_prefill`] uses.
 pub const ATTN_PREFILL_TILE: AttnTile = AttnTile::Q32K32Sg4;
 
+/// Which kernel [`attn_prefill_by_length`] dispatches for a query length.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PrefillAttnKernel {
+    /// [`attn_prefill`] ([`ATTN_PREFILL_TILE`]).
+    Tiled,
+}
+
+/// [`PrefillAttnKernel::Tiled`] at every `tq`. There is no length cutoff.
+///
+/// Paired and interleaved in one process on an M5 Pro (2026-10-03,
+/// `bench_qwen35_layers --paired-attn`, same Q/K/V, ABBA, 9 rounds).
+/// `attn_prefill` beat `nn::flash_attn_rows` at both lengths, and the
+/// sample ranges did not overlap. Per launch, median / min:
+/// T = 200, 0.116 / 0.098 ms vs 0.232 / 0.221 ms; T = 8192, 55.3 / 53.4 ms
+/// vs 176.2 / 173.7 ms. A cutoff that kept the scalar kernel below 8192
+/// was the slower kernel at T = 200.
+pub fn prefill_attn_kernel(tq: u32) -> PrefillAttnKernel {
+    let _ = tq;
+    PrefillAttnKernel::Tiled
+}
+
 /// [`crate::nn::flash_attn_rows`] at head_dim 256 and `window = 0`, with both
 /// products on the TensorOps matrix units: `S = Q·Kᵀ` and `P·V` are
 /// `matmul2d` over query-by-key blocks ([`ATTN_PREFILL_TILE`]), with an f32 online softmax
@@ -2148,6 +2181,10 @@ pub const ATTN_PREFILL_TILE: AttnTile = AttnTile::Q32K32Sg4;
 /// `flash_attn_rows` (`q`/`o` `[batch, tq, heads, 256]`, `k`/`v`
 /// `[batch, capacity, kv_heads, 256]`, live `min(*tkv, capacity)`, query `t`
 /// at `*q_pos_offset + t`, key `t` at `*kv_pos_offset + t`, causal).
+///
+/// Always this tile. [`attn_prefill_by_length`] calls this at every query
+/// length ([`prefill_attn_kernel`]). Callers that pin these bits — training
+/// attention, the tile sweep — keep calling this function.
 ///
 /// The matrix units sum in a different order from the scalar kernel, so the
 /// two agree to f32 rounding, not bit for bit.
@@ -2177,6 +2214,38 @@ pub fn attn_prefill(
         out_bf16,
         ATTN_PREFILL_TILE,
     )
+}
+
+/// Prefill attention. [`prefill_attn_kernel`] selects [`attn_prefill`] at
+/// every `dims.tq`.
+///
+/// Same buffers, causal mask (`window` must be 0), f32 accumulate and
+/// `out_bf16` as [`attn_prefill`]. [`attn_prefill`] and
+/// [`attn_prefill_with_tile`] stay the TensorOps tile.
+/// [`crate::nn::flash_attn_rows`] stays the scalar row kernel.
+#[allow(clippy::too_many_arguments)]
+pub fn attn_prefill_by_length(
+    rt: &Arc<GpuRuntime>,
+    q: &GpuBuffer,
+    k: &GpuBuffer,
+    v: &GpuBuffer,
+    o: &GpuBuffer,
+    tkv: &GpuBuffer,
+    q_pos_offset: &GpuBuffer,
+    kv_pos_offset: &GpuBuffer,
+    dims: crate::nn::AttnDims,
+    out_bf16: bool,
+) -> Result<(), String> {
+    const WHAT: &str = "qwen35::attn_prefill_by_length";
+    if dims.window != 0 {
+        return Err(format!(
+            "{WHAT}: window must be 0 (Qwen3.5's full attention is global), got {}",
+            dims.window
+        ));
+    }
+    match prefill_attn_kernel(dims.tq) {
+        PrefillAttnKernel::Tiled => attn_prefill(rt, q, k, v, o, tkv, q_pos_offset, kv_pos_offset, dims, out_bf16),
+    }
 }
 
 /// [`attn_prefill`] at an explicit block geometry, for the tuning sweep.
@@ -2892,6 +2961,16 @@ mod tests {
         assert_eq!(window_elems(3, 10, 2, 5, "t").unwrap(), 2 * 10 + 7);
         assert!(window_elems(3, 10, 6, 5, "t").is_err());
         assert_eq!(window_elems(0, 10, 0, 5, "t").unwrap(), 0);
+    }
+
+    #[test]
+    fn prefill_attn_is_tiled_at_every_length() {
+        // Paired kernel times (see `prefill_attn_kernel`) had the tile faster
+        // at T = 200 and at T = 8192. A length cutoff is the bug that test
+        // used to pin.
+        for t in [0, 200, 2048, 8191, 8192, 8193] {
+            assert_eq!(prefill_attn_kernel(t), PrefillAttnKernel::Tiled, "tq={t}");
+        }
     }
 
     #[test]

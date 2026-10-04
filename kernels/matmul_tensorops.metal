@@ -853,8 +853,12 @@ NN_COOP_KERNEL(matmul2d_tensorops_f16_f32,             half, 128, 64, 4, false)
 NN_COOP_KERNEL(matmul2d_tensorops_f16_f32_64x64_sg4,   half,  64, 64, 4, false)
 NN_COOP_EPI_KERNEL(matmul2d_tensorops_f16_f32_epi,     half, 128, 64, 4, false)
 
-NN_COOP_EPI_KERNEL(matmul2d_tensorops_bf16_f32_epi,    bfloat, 128, 64, 4, false)
-NN_COOP_EPI_KERNEL(matmul2d_tensorops_f32_relaxed_epi,  float, 128, 64, 4, true)
+NN_COOP_EPI_KERNEL(matmul2d_tensorops_bf16_f32_epi,           bfloat, 128, 64, 4, false)
+// Same epilogue, 64×64 sg4. The non-epilogue NN kernel already instantiates
+// this geometry; this is that instantiation with EPILOGUE=true. Host selects
+// it only when M does not fill a 128-row tile.
+NN_COOP_EPI_KERNEL(matmul2d_tensorops_bf16_f32_epi_64x64_sg4, bfloat,  64, 64, 4, false)
+NN_COOP_EPI_KERNEL(matmul2d_tensorops_f32_relaxed_epi,         float, 128, 64, 4, true)
 
 /// TN / NT bf16 GEMMs — cooperative destination tensor (2026-08-30 round 2,
 /// bench/results/bf16_tnnt_coop_m5pro.txt): register accumulator, C touched

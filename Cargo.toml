@@ -41,11 +41,12 @@ rustdoc-args = ["--cfg", "docsrs"]
 
 [features]
 default = []
-# Quantized MTLTensor prep (WWDC26-330). Off by default because it is exactly
-# that — prep. `try_quant_tensorops_prefill_gemm` returns
-# Err("not wired yet"), and nothing in this workspace calls the module. It is
-# kept compiling behind a flag rather than shipped as public API that does not
-# work yet.
+# Host-side MTLTensor helpers (`mtl_tensor`, WWDC26-330): size, allocate, wrap
+# a buffer as, and bind an Int8 MTLTensor. Off by default because nothing in
+# this workspace calls them and no quantized GEMM is built on them
+# (`QUANT_PREFILL_GEMM_WIRED` is false). Quantized TensorOps does not need this
+# module: `nn::gemm_i8_dequant` ships without it. The module's tests run in the
+# CI `gpu` job with this feature on.
 quant-prep = []
 
 [lib]

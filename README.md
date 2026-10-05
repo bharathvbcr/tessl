@@ -529,7 +529,7 @@ All runtime configuration uses the canonical `TESSL_*` prefix. Legacy
 
 | Feature | Default | Description |
 |---|---|---|
-| `quant-prep` | **Disabled** | Compiles `mtl_tensor` for native quantized `MTLTensor` bindings (WWDC26-330). Off by default because it is exactly that — prep: `try_quant_tensorops_prefill_gemm` returns an error and nothing calls it. Kept compiling behind a flag rather than shipped as public API that does not work. |
+| `quant-prep` | **Disabled** | Compiles `mtl_tensor`'s host-side `MTLTensor` helpers (WWDC26-330): size, allocate, wrap a buffer as, and bind an Int8 tensor. Off by default because nothing calls them and no quantized GEMM is built on them. Quantized TensorOps does not need this feature: `nn::gemm_i8_dequant` is in the default build. Its tests run with `cargo test --release --features quant-prep --lib mtl_tensor:: -- --test-threads=1`. |
 
 ---
 

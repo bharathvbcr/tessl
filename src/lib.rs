@@ -129,7 +129,7 @@
 //!
 //! | Feature | Default | |
 //! |---|---|---|
-//! | `quant-prep` | off | Compiles `mtl_tensor`'s quantized `MTLTensor` path. Prep only: the prefill entry point returns an error and nothing dispatches it. Kept compiling behind a flag rather than shipped as public API that does not work. |
+//! | `quant-prep` | off | Compiles `mtl_tensor`'s host-side `MTLTensor` helpers (size, allocate, wrap a buffer, bind; Int8 only). Nothing in tessl calls them and no quantized GEMM uses them, so they stay behind a flag. Quantized TensorOps does not need them: `nn::gemm_i8_dequant` is in the default build. |
 //!
 //! # Performance
 //!

@@ -223,6 +223,20 @@ jobs:
         # suppress them, and the `Doc-tests tessl` section is part of the 199.
         run: cargo test --release -- --test-threads=1
 
+      - name: mtl_tensor tests (quant-prep)
+        # `mtl_tensor` is compiled only with `quant-prep`, so the full suite
+        # above builds none of its tests, and the MSRV job only `cargo check`s
+        # it. Its device tests call straight into the Metal driver — a
+        # stride-less descriptor once segfaulted there on every call — so they
+        # need this runner, not just a compile.
+        #
+        # The filter is checked to have matched: a filter that selects nothing
+        # also exits 0, and that must not read as a pass.
+        run: |
+          out=$(cargo test --release --features quant-prep --lib mtl_tensor:: -- --test-threads=1 2>&1) || { echo "$out"; exit 1; }
+          echo "$out"
+          grep -Eq 'test result: ok\. [1-9][0-9]* passed' <<<"$out" || { echo "mtl_tensor filter matched no tests"; exit 1; }
+
       - name: Examples run, since the README says they do
         # The quickstart claims these "are compiled and run as examples, so they
         # cannot drift from the API". That claim is only true if something runs

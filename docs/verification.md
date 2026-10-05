@@ -461,6 +461,19 @@ Re-measured 2026-09-19 with `cargo test --release -- --test-threads=1`, which is
 mandatory rather than tuning: GPU tests share default command encoders across
 threads.
 
+That command does not cover `mtl_tensor`: the module compiles only with the
+`quant-prep` feature, so the default suite builds none of its tests. Run them
+separately (the CI `gpu` job and `scripts/ci_local.sh` both do, and fail if the
+filter matches nothing):
+
+```bash
+cargo test --release --features quant-prep --lib mtl_tensor:: -- --test-threads=1
+```
+
+On 2026-10-05 (M5 Pro, macOS 27.0.1) this ran 9 tests, 9 passing. Before
+`7ffef42`, two of them were killed by SIGSEGV: `probe_tensor_support` and
+`tensor_from_buffer` faulted on every call.
+
 ```
 lib tests      95 (94 passing, 1 #[ignore]d deep soak)
 integration    251 across 33 files

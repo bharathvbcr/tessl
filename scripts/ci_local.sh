@@ -25,6 +25,11 @@ python3 scripts/audit_gemm_tiles.py
 echo "==> test (release, serialized)"
 cargo test --release -- --test-threads=1
 
+echo "==> test mtl_tensor (quant-prep; the default suite does not compile it)"
+mtl_out=$(cargo test --release --features quant-prep --lib mtl_tensor:: -- --test-threads=1 2>&1) || { echo "$mtl_out"; exit 1; }
+echo "$mtl_out"
+grep -Eq 'test result: ok\. [1-9][0-9]* passed' <<<"$mtl_out" || { echo "mtl_tensor filter matched no tests"; exit 1; }
+
 echo "==> examples"
 cargo run --release --example gemm
 cargo run --release --example nn_layer

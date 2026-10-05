@@ -559,8 +559,11 @@ QWEN35_2B_SAFETENSORS=.../model.safetensors-00001-of-00001.safetensors \
 (parameters excepted, deduplicated by storage) to the op that saved it, for
 Qwen3.5-2B's dims cut to one repeat of the layer pattern (3 GDN + 1
 attention layer, random weights: what a layer saves depends on shapes only),
-bf16 on MPS, torch 2.13, transformers 5.15 with its torch GDN fallback (no
-`fla` on macOS). All of it is linear in T; SDPA saves no `[T, T]` matrix.
+bf16 on MPS, torch 2.13, transformers 5.15 with its torch GDN fallback.
+flash-linear-attention 0.5.2 is installed in the ML venv, and transformers on
+this Mac still does not import it because is_flash_linear_attention_available
+requires CUDA, and the kernels need Triton, which is not installed. All of it
+is linear in T; SDPA saves no `[T, T]` matrix.
 
 | T = 2048 | 4 layers, measured | 24 layers (x6; LM head once) |
 |---|---:|---:|

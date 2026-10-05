@@ -147,8 +147,10 @@ fn the_kernel_counts_the_docs_quote_are_the_builds() {
     let lib_claim = format!("{sources} Metal sources compile to {entries} kernel entry points");
     let nn_claim = format!("through {nn_fns} shape-checked functions");
     let readme_claim = format!("{sources} Metal source files providing {entries} kernel entry points");
+    let readme_nn_claim = format!("through {nn_fns} shape-checked entry points in `tessl::nn`");
     let lib_flat = lib.replace("\n//! ", " ");
     assert!(lib_flat.contains(&lib_claim), "src/lib.rs should say `{lib_claim}`");
     assert!(lib_flat.contains(&nn_claim), "src/lib.rs should say `{nn_claim}`");
     assert!(readme.contains(&readme_claim), "README.md should say `{readme_claim}`");
+    assert!(readme.contains(&readme_nn_claim), "README.md should say `{readme_nn_claim}`");
 }

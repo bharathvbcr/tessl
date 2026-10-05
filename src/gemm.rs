@@ -658,9 +658,9 @@ pub enum Activation {
     None = 0,
     /// `max(x, 0)`.
     Relu = 1,
-    /// `gelu_pytorch_tanh`, in the same clamped `precise::tanh` formulation as
-    /// `nn::mlp_gelu_tanh`. Deliberately not a second derivation: at `-O2` MSL
-    /// lowers plain `tanh` to `air.fast_tanh`, which NaNs past roughly |10|.
+    /// `gelu_pytorch_tanh`, computed by `kernels/gelu.h` — the same function
+    /// `nn::mlp_gelu_tanh` calls, not a second derivation. At `-O2` MSL lowers
+    /// plain `tanh` to `air.fast_tanh`, which NaNs past roughly |10|.
     GeluTanh = 2,
     /// `x * sigmoid(x)`, matching `nn::mlp_silu`.
     Silu = 3,

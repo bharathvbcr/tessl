@@ -15,7 +15,7 @@ mod common;
 
 use std::sync::Arc;
 
-use common::{random_f32, tensor_bf16, with_gpu};
+use common::{close_rel, gelu_pytorch_tanh, random_f32, tensor_bf16, with_gpu};
 use tessl::gemm::{gemm, gemm_epilogue, gemm_epilogue_tiled, Activation, EpiTile, Epilogue, GemmBackend};
 use tessl::tensor::Tensor;
 use tessl::GpuRuntime;
@@ -59,11 +59,7 @@ fn reference(
             out[i * n + j] = match act {
                 Activation::None => v,
                 Activation::Relu => v.max(0.0),
-                Activation::GeluTanh => {
-                    let xc = v.clamp(-20.0, 20.0);
-                    let inner = 0.7978845608028654f64 * (xc as f64 + 0.044715 * (xc as f64).powi(3));
-                    (0.5 * xc as f64 * (1.0 + inner.clamp(-10.0, 10.0).tanh())) as f32
-                }
+                Activation::GeluTanh => gelu_pytorch_tanh(v as f64) as f32,
                 Activation::Silu => v / (1.0 + (-v).exp()),
             };
         }
@@ -170,6 +166,57 @@ fn fused_epilogue_matches_the_unfused_sequence() {
                     &c.buffer.read_f32()[..m * n],
                     &want,
                     tol(k),
+                );
+            }
+        }
+    });
+}
+
+/// GELU past the cubic's clamp must keep growing with its input.
+///
+/// `gelu.h` clamps `x` to ±20 before cubing so `x^3` cannot overflow, but the
+/// outer factor is the original `x`. A copy that multiplied by the clamped value
+/// instead returned exactly 20 for every input above 20, which no random-operand
+/// test reaches. `A = B = 0` and `beta = 1` make the pre-activation `C_prev`
+/// verbatim, so the probes arrive unrounded by the tf32-class product.
+#[test]
+fn gelu_epilogue_tracks_x_past_the_cubic_clamp() {
+    const PROBES: &[f32] = &[20.5, 25.0, 50.0, 1.0e4, -25.0, -1.0e4, 3.0, -3.0, 0.0];
+    with_gpu(|rt| {
+        rt.set_relaxed_precision(true);
+        // Interior-only and edge-only shapes; f32 and both bf16 tile geometries.
+        for &(m, n, k) in &[(128usize, 64usize, 64usize), (37, 45, 64)] {
+            let c_h: Vec<f32> = (0..m * n).map(|i| PROBES[i % PROBES.len()]).collect();
+            let want: Vec<f32> = c_h.iter().map(|&v| gelu_pytorch_tanh(v as f64) as f32).collect();
+            let epi = Epilogue {
+                beta: 1.0,
+                activation: Activation::GeluTanh,
+                ..Epilogue::default()
+            };
+
+            let a = tensor(rt, &[m, k], &vec![0.0f32; m * k]);
+            let b = tensor(rt, &[k, n], &vec![0.0f32; k * n]);
+            let c = tensor(rt, &[m, n], &c_h);
+            gemm_epilogue(&a, &b, &c, GemmBackend::TensorOps, epi).expect("f32 gelu epilogue");
+            rt.synchronize().unwrap();
+            close_rel(
+                &format!("f32 {m}x{n}x{k} gelu"),
+                &c.buffer.read_f32()[..m * n],
+                &want,
+                1e-4,
+            );
+
+            let a16 = tensor_bf16(rt, &[m, k], &vec![0.0f32; m * k]);
+            let b16 = tensor_bf16(rt, &[k, n], &vec![0.0f32; k * n]);
+            for tile in [EpiTile::Wide, EpiTile::Narrow] {
+                let c = tensor(rt, &[m, n], &c_h);
+                gemm_epilogue_tiled(&a16, &b16, &c, GemmBackend::TensorOps, epi, tile).expect("bf16 gelu epilogue");
+                rt.synchronize().unwrap();
+                close_rel(
+                    &format!("bf16 {tile:?} {m}x{n}x{k} gelu"),
+                    &c.buffer.read_f32()[..m * n],
+                    &want,
+                    1e-4,
                 );
             }
         }

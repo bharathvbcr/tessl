@@ -25,7 +25,8 @@
 mod common;
 
 use common::{
-    buf, buf_bf16, close_rel, dense_gemv, empty, q4_mlx_matrix, random_f32, round_trip_bf16, seeded, with_gpu,
+    buf, buf_bf16, close_rel, dense_gemv, empty, gelu_pytorch_tanh, q4_mlx_matrix, random_f32, round_trip_bf16, seeded,
+    with_gpu,
 };
 use tessl::nn::{self, GateUpDispatch, Q4MlxBank, Q4MlxLayout, QkvOutputs, QuantShape};
 
@@ -413,15 +414,11 @@ fn gate_up_gelu_i4_matches_two_gemvs_and_a_gelu() {
         let xr = round_trip_bf16(&x);
         let gate = dense_gemv(&bg.dense, &xr, rows, cols);
         let up = dense_gemv(&du, &xr, rows, cols);
-        // The kernel's GELU: clamp, tanh formulation, as `nn::mlp_gelu_tanh`.
+        // The kernel's GELU (gelu.h), as `nn::mlp_gelu_tanh`.
         let want: Vec<f32> = gate
             .iter()
             .zip(&up)
-            .map(|(g, u)| {
-                let xc = (*g as f64).clamp(-20.0, 20.0);
-                let inner = 0.797_884_560_802_865_4 * (xc + 0.044715 * xc * xc * xc);
-                (0.5 * (*g as f64) * (1.0 + inner.clamp(-10.0, 10.0).tanh()) * (*u as f64)) as f32
-            })
+            .map(|(g, u)| (gelu_pytorch_tanh(*g as f64) * (*u as f64)) as f32)
             .collect();
 
         let gp = rt.alloc_buffer(bg.i4_packed.len()).unwrap();

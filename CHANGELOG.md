@@ -130,6 +130,16 @@ All notable changes to `tessl` are recorded here. The format follows
 
 ### Fixed
 
+- **Fused GEMM + GELU no longer clips at 20.** `Activation::GeluTanh` in
+  `gemm_epilogue` ran a private copy of the GELU that multiplied by the
+  clamped input, so every pre-activation above 20 came out as exactly 20
+  instead of ~x. The epilogue now calls `tessl_gelu_pytorch_tanh` from
+  `kernels/gelu.h`, the GELU `mlp_gelu_tanh` and the q4 gate/up GEMVs already
+  use, and the copy is gone. The test reference in `tests/gemm_epilogue.rs` had
+  the same defect, which is why its GELU case stayed green; the three CPU GELU
+  references in `tests/` are now one `common::gelu_pytorch_tanh`, and
+  `gelu_epilogue_tracks_x_past_the_cubic_clamp` drives values past the clamp
+  through the f32 and both bf16 tile geometries.
 - **Accumulate GEMM tests budget for the previous C.** `with_previous` in
   `tests/gemm_flag_paths.rs` added `C0` to the expected value but not to the
   magnitude the f32 error budget scales with. A small-K accumulate onto a

@@ -260,10 +260,13 @@ register accumulator, so there is nothing to fuse into. Those are **refused**
 rather than silently falling back to separate dispatches, which would make the
 call quietly slower than the unfused code it replaced.
 
-`Activation::GeluTanh` uses the same clamped `precise::tanh` formulation as
-`nn::mlp_gelu_tanh`, deliberately copied rather than re-derived: at `-O2` MSL
-lowers a plain `tanh` to `air.fast_tanh`, which returns NaN past roughly |10|.
-A crate with two different GELUs would be a worse defect than a slow one.
+`Activation::GeluTanh` calls `tessl_gelu_pytorch_tanh` from `kernels/gelu.h`,
+the same function `nn::mlp_gelu_tanh` and the q4 gate/up GEMVs include: a
+clamped `precise::tanh`, because at `-O2` MSL lowers a plain `tanh` to
+`air.fast_tanh`, which returns NaN past roughly |10|. It used to be a copy, and
+the copy drifted — it multiplied by the clamped `x`, so every pre-activation
+above 20 came out as exactly 20. A crate with two different GELUs is a worse
+defect than a slow one, so there is now one.
 
 ---
 

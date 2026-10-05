@@ -7,7 +7,7 @@
 
 mod common;
 
-use common::{buf, empty, random_f32, with_gpu};
+use common::{buf, empty, gelu_pytorch_tanh, random_f32, with_gpu};
 use tessl::nn;
 use tessl::tensor::bf16_bits_to_f32;
 
@@ -289,11 +289,7 @@ fn mlp_gelu_tanh_stays_finite_where_fast_tanh_would_nan() {
         let want: Vec<f32> = gate
             .iter()
             .zip(&up)
-            .map(|(x, u)| {
-                let xc = (*x as f64).clamp(-20.0, 20.0);
-                let inner = 0.7978845608028654 * (xc + 0.044715 * xc * xc * xc);
-                (0.5 * (*x as f64) * (1.0 + inner.clamp(-10.0, 10.0).tanh()) * (*u as f64)) as f32
-            })
+            .map(|(x, u)| (gelu_pytorch_tanh(*x as f64) * (*u as f64)) as f32)
             .collect();
         close("mlp_gelu_tanh", &got[..n], &want, 1e-4);
     });

@@ -435,6 +435,18 @@ pub fn dense_gemv(dense: &[f32], x: &[f32], rows: usize, cols: usize) -> Vec<f32
         .collect()
 }
 
+/// CPU `gelu_pytorch_tanh` in f64, the oracle for every GELU kernel test.
+///
+/// Mirrors `kernels/gelu.h`: only the cubic's input is clamped, and the outer
+/// factor is the original `x`, so large positive inputs come out as ~`x`. One
+/// oracle, because a test copy that multiplied by the clamped value agreed with
+/// a kernel that did the same and kept a broken GEMM epilogue green.
+pub fn gelu_pytorch_tanh(x: f64) -> f64 {
+    let xc = x.clamp(-20.0, 20.0);
+    let inner = 0.7978845608028654 * (xc + 0.044715 * xc * xc * xc);
+    0.5 * x * (1.0 + inner.clamp(-10.0, 10.0).tanh())
+}
+
 /// Assert `got ~= want` elementwise with a relative-plus-absolute tolerance.
 pub fn close_rel(what: &str, got: &[f32], want: &[f32], rel: f32) {
     assert_eq!(got.len(), want.len(), "{what}: length");

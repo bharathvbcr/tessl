@@ -13,6 +13,7 @@
 
 #include <metal_stdlib>
 #include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>
+#include "gelu.h"
 
 using namespace metal;
 using namespace mpp::tensor_ops;
@@ -504,25 +505,12 @@ enum GemmActivation : uint {
     GEMM_ACT_SILU = 3u,
 };
 
-/// `gelu_pytorch_tanh`, in the *same* formulation as `mlp_gelu_tanh.metal`.
-///
-/// Deliberately a copy of that kernel's math rather than a fresh derivation:
-/// the clamp before cubing and `precise::tanh` are both load-bearing. At `-O2`
-/// MSL lowers plain `tanh` to `air.fast_tanh`, which returns NaN past roughly
-/// |10|, and the inner term reaches ~301 at |x| = 20. A crate with two
-/// different GELUs would be a worse defect than a slow one.
-static inline float gemm_gelu_tanh(float x) {
-    float xc = clamp(x, -20.0f, 20.0f);
-    float x3 = xc * xc * xc;
-    float inner = 0.7978845608028654f * (xc + 0.044715f * x3);
-    float t = precise::tanh(clamp(inner, -10.0f, 10.0f));
-    return 0.5f * xc * (1.0f + t);
-}
-
 static inline float gemm_apply_activation(float v, GemmActivation act) {
     switch (act) {
         case GEMM_ACT_RELU: return fmax(v, 0.0f);
-        case GEMM_ACT_GELU_TANH: return gemm_gelu_tanh(v);
+        // The crate's one GELU (gelu.h), shared with mlp_gelu_tanh and the q4
+        // gate/up GEMVs. A local copy here once clipped the output at 20.
+        case GEMM_ACT_GELU_TANH: return tessl_gelu_pytorch_tanh(v);
         // silu(x) = x * sigmoid(x), matching `mlp_silu.metal`.
         case GEMM_ACT_SILU: return v / (1.0f + exp(-v));
         default: return v;

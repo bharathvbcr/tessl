@@ -315,9 +315,9 @@ builds tensors from raw device pointers.
 The Rust `TileGeom` constants (`TILE_COOP_DEFAULT`, `TILE_COOP_NARROW`, `TILE_COOP_TN_NT`, `TILE_COOP_ACCUM`, `TILE_F32`, `TILE_V2`) must strictly equal the `SM`/`SN` compiled into shader kernels.
 
 Because Rust's type system cannot verify shader constants at compile time, [`scripts/audit_gemm_tiles.py`](../scripts/audit_gemm_tiles.py) verifies:
-1. Every Rust `TileGeom` matches the `constexpr int SM/SN` or macro arguments in Metal shaders.
-2. Every cooperative kernel is pinned in `NN_PAIRS` so no variable-dispatched pipeline escapes examination.
-3. 100% of all 15 compiled GEMM pipelines pass verification with 0 mismatches.
+1. Every Rust `TileGeom` matches the `constexpr int SM/SN`, macro arguments, or helper template defaults in Metal shaders.
+2. Every kernel entry point in `matmul_tensorops.metal` is checked or exempted by name with a reason, so no variable-dispatched pipeline escapes examination.
+3. It fails, rather than passing, when it parsed no kernels or checked no dispatch pairs; its `PASS` line states the counts. `tests/audit_gemm_tiles.rs` injects faults to prove it can fail ([verification.md §1](verification.md#1-static-audit)).
 
 ---
 

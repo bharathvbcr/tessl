@@ -2,8 +2,8 @@
 
 Three layers (§1-3), each of which was shown to **fail** on an injected fault. A
 check that has never failed is not known to work — and a check that *can no
-longer* fail has stopped working while still printing a pass, which is what §1's
-note now records for half of the static audit.
+longer* fail has stopped working while still printing a pass, which is what §1
+records about the static audit's retired `BKC` half.
 
 ```mermaid
 flowchart TD
@@ -33,7 +33,7 @@ flowchart LR
     end
 
     subgraph Script["scripts/audit_gemm_tiles.py"]
-        Extractor["AST Regex Matcher<br/>Cross-checks SM &amp; SN values"]
+        Extractor["Regex Matcher<br/>Cross-checks SM, SN &amp; simdgroups"]
     end
 
     subgraph MetalLand["Metal Shader Side (kernels/matmul_tensorops.metal)"]
@@ -42,48 +42,72 @@ flowchart LR
 
     RustLand --> Extractor
     MetalLand --> Extractor
-    Extractor --> Pass["19 Pipelines Verified<br/>0 Mismatches"]
+    Extractor --> Pass["Every entry point checked or exempt<br/>Fails if it examined nothing"]
 ```
 
-Intended to cross-check, mechanically, the two relationships Rust's type system
-cannot express:
+Cross-checks, mechanically, the relationship Rust's type system cannot express:
+every Rust `TileGeom` against the `SM`/`SN` and simdgroup count compiled into the
+kernel it dispatches. A mismatch means the host launches the wrong threadgroup
+count and leaves output tiles unwritten. The kernel side is read from
+`constexpr int SM`/`SN`, from the arguments of each `*_KERNEL(...)` macro
+instantiation, or from a helper's template defaults when a kernel calls it with
+no template argument list — `matmul2d_tensorops_bf16_f32`, the production NN
+kernel, is that last case and takes its 128×64/sg4 from `mm_nn_coop_f32acc`.
 
-- every Rust `TileGeom` against the `constexpr int SM`/`SN` compiled into the
-  kernel it dispatches — a mismatch means the host launches the wrong
-  threadgroup count and leaves output tiles unwritten;
-- each cooperative kernel's `constexpr int BKC` against Rust's `COOP_BKC` — a
-  drift there lets the host admit K values whose tail the kernel's
-  `k + BKC <= K` loop silently drops.
+It fails closed rather than skipping:
+
+- every entry point in `matmul_tensorops.metal` must be checked or named in the
+  script's `EXEMPT` with a reason. One is exempt: `matmul2d_tensorops_i8_f32`,
+  which `src/nn.rs` dispatches with local `SM`/`SN` constants, not a `TileGeom`;
+- a `*_KERNEL(` invocation it cannot parse, a pin naming a kernel that no longer
+  exists, and a pinned kernel whose geometry it cannot see each fail the audit;
+- an audit that parsed no kernels, or checked no Rust dispatch pairs, fails.
+
+Its `PASS` line names what it checked. On 2026-10-06:
+
+```
+PASS: tile geometry: 26 kernels, 30 Rust dispatch pairs; 1 exempt (matmul2d_tensorops_i8_f32)
+```
 
 Paths resolve from the script's own location, so it runs from any directory and
-from inside an extracted `.crate`. Verified against three injected faults: a
-tile drift, a BKC drift, and an unpinned kernel.
+from inside an extracted `.crate`. `tests/audit_gemm_tiles.rs` runs a copy of the
+script against injected faults under `cargo test`: a tile drift, a drifted
+template default, an unaccounted kernel, an unparseable kernel macro, an empty
+kernel file, and an empty `gemm.rs`. Against the script as it stood at `52c091c`,
+the tile drift failed, the empty `gemm.rs` crashed with a `KeyError`, and the
+other four printed `PASS`.
 
-> **Only the first of those two checks still runs, and the script reports `PASS`
-> either way.** Measured 2026-10-04: the audit prints `COOP_BKC = None` and then
-> `PASS: 0 mismatch(es)` over 19 kernels (20 checks), having examined zero BKC relationships.
-> Three independent reasons, each sufficient on its own:
->
-> 1. `COOP_BKC` appears nowhere in `src/` (`rg 'COOP_BKC' src/` is empty), so
->    `rust_coop_bkc` returns `None`;
-> 2. `BKC` appears nowhere in `kernels/`, so every kernel's `kbkc` is `None`;
-> 3. the mismatch branch (`audit_gemm_tiles.py:126`) requires *both* to be
->    non-`None`, and both fallback guards — the unpinned-kernel check at line 117
->    and the missing-BKC check at line 130 — key on a `_coop` name suffix that no
->    kernel in `matmul_tensorops.metal` carries. None of the three can fire.
->
-> So the sentence above about failing on an unpinned `*_coop` kernel is also no
-> longer true: there are no `*_coop` kernels left to pin. Whether `BKC` and the
-> `_coop` naming were deliberately retired or lost in a rename is not established
-> here, and the answer decides whether the script should be repaired or its second
-> half deleted. Until then this layer verifies tile geometry only, and the `PASS`
-> it prints must be read as that narrower claim.
->
-> **Open: `GAP-TESSL-AUDIT-BKC-CHECK-DEAD`.** tessl carries no gap ledger of its
-> own; `GAP-TESSL-*` records live in the consuming project's, at
-> `~/Code/research/qwen-decision/gaps.jsonl`, which is also where
-> `GAP-TESSL-NPY-READER-REFUSES-F64-REFERENCE` (cited from `gdn_fixtures.rs`) is
-> recorded. A record's current state is its last line under that id.
+### The retired `BKC` check (`GAP-TESSL-AUDIT-BKC-CHECK-DEAD`, closed)
+
+The script used to claim a second relationship — each cooperative kernel's
+`constexpr int BKC` against a Rust `COOP_BKC` — and printed `COOP_BKC = None`
+followed by `PASS: 0 mismatch(es)` having examined none of it. Its fallback
+guards keyed on a `_coop` entry-point suffix, so they could not fire either.
+
+git history settles why, and the answer is neither a deliberate retirement nor
+a rename: the check never applied to tessl. Across every commit, `COOP_BKC`
+appears in no file under `src/`, `constexpr int BKC` in no file under
+`kernels/`, and no entry point carries a `_coop` suffix (`git log -S` and
+`git grep` over all 169 revisions, 2026-10-06). `COOP_BKC` appears only in docs from `84a52a1`, which predates tessl's
+kernel sources, and in this script from `d4e4f2d`, where it arrived already
+dead. Both describe the blocked kernels of the code tessl was extracted from,
+whose `for k; k + BKC <= K` loop could drop a K tail. Every tessl kernel passes
+K to `matmul2d_descriptor` as `dynamic_length_v<int>` and reduces all of it
+inside `op.run()`, so there is no host-side K block for a gate to disagree with.
+
+So the `BKC` half was deleted, not repaired. The `_coop`-suffix unpinned-kernel
+guard was replaced by the every-entry-point rule above. Under the old script, 17
+of the 27 entry points were checked; the other ten passed unexamined:
+`matmul2d_tensorops_bf16_f32` (skipped as "no compile-time SM/SN"), the two
+f16 NN kernels and three `*_batched` kernels (selected through a variable, never
+pinned), the three split-K kernels (tile argument past the 8-line pairing
+window, now 12), and `matmul2d_tensorops_i8_f32` (now exempt, above).
+
+tessl carries no gap ledger of its own; `GAP-TESSL-*` records live in the
+consuming project's, at `~/Code/research/Lappi-decision/gaps.jsonl`, which is
+also where `GAP-TESSL-NPY-READER-REFUSES-F64-REFERENCE` (cited from
+`gdn_fixtures.rs`) is recorded. A record's current state is its last line under
+that id.
 
 ## 2. Adversarial shape sweep
 
@@ -445,6 +469,12 @@ into the cooperative kernels, six caught:
 | every other K block skipped | reference check |
 | column offset off by one | sentinel check |
 
+This table predates tessl's own kernel sources: it is already present, unchanged,
+in `84a52a1`, which commits no file under `kernels/`. Its `BKC` and K-block rows
+describe the blocked-K kernels of the code tessl was extracted from; tessl's
+kernels have no K block to mutate (§1, the retired `BKC` check). The table has
+not been re-run against tessl's kernels.
+
 Two earlier "faults" were caught by nothing — and both were bad injections, not
 gaps: one was a no-op (`if (K != 99999u)` is always true) and one perturbed the
 result by less than the declared tolerance. They are recorded here because
@@ -482,8 +512,8 @@ total          349 passing, 0 failing, 1 ignored
 ```
 
 ```
-audit          PASS, 0 mismatches over 19 kernels -- tile geometry only,
-               see the note in section 1; the BKC half did not run
+audit          PASS (2026-10-06): tile geometry, 26 kernels, 30 Rust dispatch
+               pairs; 1 exempt. Tile geometry is all it checks (section 1)
 GDN mutations  19 of 19 caught (section 6, re-run this pass)
 fault tests    NOT RE-RUN this pass. Last recorded: 6 of 6 caught
 ```

@@ -489,6 +489,31 @@ impl Qwen35Model {
         cfg: Qwen35Config,
         precision: Precision,
     ) -> Result<Self, String> {
+        Self::load_impl(rt, st, prefix, cfg, precision, true)
+    }
+
+    /// [`Self::load`] without the LM head: for a model that is read through
+    /// [`Self::begin`] (hidden states, never logits). At bf16 this skips the
+    /// `[hidden, vocab]` packed head copy of the embedding (1.27 GB at the
+    /// 4B's shapes); [`Self::forward`] on such a model is refused.
+    pub fn load_tower(
+        rt: &Arc<GpuRuntime>,
+        st: &SafeTensors,
+        prefix: &str,
+        cfg: Qwen35Config,
+        precision: Precision,
+    ) -> Result<Self, String> {
+        Self::load_impl(rt, st, prefix, cfg, precision, false)
+    }
+
+    fn load_impl(
+        rt: &Arc<GpuRuntime>,
+        st: &SafeTensors,
+        prefix: &str,
+        cfg: Qwen35Config,
+        precision: Precision,
+        with_head: bool,
+    ) -> Result<Self, String> {
         cfg.validate()?;
         let ld = Loader { st, prefix, rt };
         let (h, inter, vocab) = (cfg.hidden as usize, cfg.intermediate as usize, cfg.vocab as usize);
@@ -505,10 +530,15 @@ impl Qwen35Model {
                 }
                 let t = rt.alloc_tensor_bf16(&[vocab, h])?;
                 t.buffer.write_bf16_bits(&bits);
-                let packed = qwen35::pack_linear_weights_bf16(&[&bits], &[vocab], h)?;
-                let head = rt.alloc_tensor_bf16(&[h, vocab])?;
-                head.buffer.write_bf16_bits(&packed);
-                (t, Some(head))
+                let head = if with_head {
+                    let packed = qwen35::pack_linear_weights_bf16(&[&bits], &[vocab], h)?;
+                    let head = rt.alloc_tensor_bf16(&[h, vocab])?;
+                    head.buffer.write_bf16_bits(&packed);
+                    Some(head)
+                } else {
+                    None
+                };
+                (t, head)
             }
             Precision::F32 => {
                 let t = rt.alloc_tensor_f32(&[vocab, h])?;
@@ -607,6 +637,47 @@ impl Qwen35Model {
     /// position's logits; with `trace`, also the residual stream after each
     /// layer and the final norm's output (one host read per layer, so slower).
     pub fn forward(&self, ids: &[u32], trace: bool) -> Result<ForwardOutput, String> {
+        if self.precision == Precision::Bf16 && self.lm_head_bf16.is_none() {
+            return Err(
+                "Qwen35Model::forward: this model was loaded with load_tower (no LM head); \
+                 use begin / advance_to / final_norm_f32"
+                    .into(),
+            );
+        }
+        let cfg = &self.cfg;
+        let mut s = self.begin_impl(ids, trace, true)?;
+        s.advance_to(self.layers.len())?;
+        let (rt, a, t) = (&self.rt, &s.a, s.a.t);
+        let logits_t = a.logits.as_ref().ok_or("Qwen35Model::forward: logits were not allocated")?;
+        self.norm(&a.resid, &self.final_norm, &a.x)?;
+        // The tied head: logits = x @ embed^T.
+        match &self.lm_head_bf16 {
+            Some(head) => gemm(&a.x, head, logits_t, BACKEND)?,
+            None => gemm_nt_f32(&a.x, &self.embed, logits_t, BACKEND)?,
+        }
+        rt.synchronize()?;
+        let mut out_trace = s.trace.take().unwrap_or_default();
+        if trace {
+            out_trace.push(read_rows(&a.x, self.precision)?);
+        }
+        let logits = logits_t.buffer.read_f32()[..t as usize * cfg.vocab as usize].to_vec();
+        Ok(ForwardOutput {
+            logits,
+            trace: out_trace,
+        })
+    }
+
+    /// Start a prefill of `ids` (one sequence, positions from 0) that runs
+    /// only as many layers as asked: [`Staged::advance_to`] continues it,
+    /// [`Staged::final_norm_f32`] reads the final norm of the residual stream
+    /// at the layer reached. Nothing of the LM head is touched or allocated,
+    /// so this works on a [`Self::load_tower`] model and at sequence lengths
+    /// whose `[tokens, vocab]` logits would not fit.
+    pub fn begin(&self, ids: &[u32]) -> Result<Staged<'_>, String> {
+        self.begin_impl(ids, false, false)
+    }
+
+    fn begin_impl(&self, ids: &[u32], trace: bool, logits: bool) -> Result<Staged<'_>, String> {
         let rt = &self.rt;
         let cfg = &self.cfg;
         if ids.is_empty() {
@@ -623,7 +694,7 @@ impl Qwen35Model {
             );
         }
         let t = u32::try_from(ids.len()).map_err(|_| "Qwen35Model::forward: too many tokens")?;
-        let a = Acts::new(rt, cfg, self.precision, t)?;
+        let a = Acts::new(rt, cfg, self.precision, t, logits)?;
 
         let id_buf = rt.alloc_buffer(ids.len() * 4)?;
         id_buf.write_u32(ids);
@@ -639,35 +710,11 @@ impl Qwen35Model {
             cfg.hidden,
             &a.resid.buffer,
         )?;
-
-        let mut out_trace = Vec::new();
-        for layer in &self.layers {
-            self.norm(&a.resid, &layer.input_norm, &a.x)?;
-            match &layer.mixer {
-                Mixer::Gdn(w) => self.gdn(w, &a)?,
-                Mixer::Attn(w) => self.attention(w, &a)?,
-            }
-            self.norm(&a.resid, &layer.post_norm, &a.x)?;
-            self.mlp(layer, &a)?;
-            if trace {
-                rt.synchronize()?;
-                out_trace.push(a.resid.buffer.read_f32()[..(t * cfg.hidden) as usize].to_vec());
-            }
-        }
-        self.norm(&a.resid, &self.final_norm, &a.x)?;
-        // The tied head: logits = x @ embed^T.
-        match &self.lm_head_bf16 {
-            Some(head) => gemm(&a.x, head, &a.logits, BACKEND)?,
-            None => gemm_nt_f32(&a.x, &self.embed, &a.logits, BACKEND)?,
-        }
-        rt.synchronize()?;
-        if trace {
-            out_trace.push(read_rows(&a.x, self.precision)?);
-        }
-        let logits = a.logits.buffer.read_f32()[..t as usize * cfg.vocab as usize].to_vec();
-        Ok(ForwardOutput {
-            logits,
-            trace: out_trace,
+        Ok(Staged {
+            model: self,
+            a,
+            next: 0,
+            trace: trace.then(Vec::new),
         })
     }
 
@@ -835,6 +882,88 @@ impl Qwen35Model {
     }
 }
 
+/// A prefill stopped between layers, from [`Qwen35Model::begin`].
+///
+/// The residual stream after the last layer run stays on the device; run more
+/// layers with [`Self::advance_to`] or read the final norm of it with
+/// [`Self::final_norm_f32`]. Advancing in steps computes exactly what one
+/// [`Qwen35Model::forward`] computes: the same dispatches in the same order
+/// on the same buffers, only with reads in between.
+pub struct Staged<'m> {
+    model: &'m Qwen35Model,
+    a: Acts,
+    next: usize,
+    trace: Option<Vec<Vec<f32>>>,
+}
+
+impl Staged<'_> {
+    /// Tokens in the prefill.
+    pub fn tokens(&self) -> u32 {
+        self.a.t
+    }
+
+    /// Decoder layers run so far: the residual stream is the output of layer
+    /// `layers_done() - 1` (transformers' `hidden_states[layers_done()]`).
+    pub fn layers_done(&self) -> usize {
+        self.next
+    }
+
+    /// Run layers `layers_done()..layer`. `layer` may equal `layers_done()`
+    /// (nothing to run) but not go back, or past the model's layer count.
+    pub fn advance_to(&mut self, layer: usize) -> Result<(), String> {
+        let m = self.model;
+        if layer < self.next || layer > m.layers.len() {
+            return Err(format!(
+                "Staged::advance_to({layer}): already at layer {}, the model has {}",
+                self.next,
+                m.layers.len()
+            ));
+        }
+        let a = &self.a;
+        for l in &m.layers[self.next..layer] {
+            m.norm(&a.resid, &l.input_norm, &a.x)?;
+            match &l.mixer {
+                Mixer::Gdn(w) => m.gdn(w, a)?,
+                Mixer::Attn(w) => m.attention(w, a)?,
+            }
+            m.norm(&a.resid, &l.post_norm, &a.x)?;
+            m.mlp(l, a)?;
+            if let Some(trace) = self.trace.as_mut() {
+                m.rt.synchronize()?;
+                trace.push(a.resid.buffer.read_f32()[..(a.t * m.cfg.hidden) as usize].to_vec());
+            }
+        }
+        self.next = layer;
+        Ok(())
+    }
+
+    /// `out = rms_norm(resid) * (1 + norm.w)` in f32, `[tokens, hidden]`: the
+    /// model's final norm applied to the residual stream at the layer reached
+    /// (transformers' last `hidden_states` entry when every layer has run).
+    /// Encoded, not waited for: read `out` after a synchronize.
+    pub fn final_norm_f32(&self, out: &Tensor) -> Result<(), String> {
+        let (m, t) = (self.model, self.a.t);
+        if out.dtype != DType::F32 || out.shape() != [t as usize, m.cfg.hidden as usize] {
+            return Err(format!(
+                "Staged::final_norm_f32: out must be f32 [{t}, {}], got {:?} {:?}",
+                m.cfg.hidden,
+                out.dtype,
+                out.shape()
+            ));
+        }
+        qwen35::rms_norm(
+            &m.rt,
+            &self.a.resid.buffer,
+            &m.final_norm,
+            &out.buffer,
+            DType::F32,
+            t,
+            m.cfg.hidden,
+            m.cfg.rms_norm_eps,
+        )
+    }
+}
+
 /// A `[rows, cols]` activation read back as f32 (bf16 widened exactly).
 fn read_rows(x: &Tensor, precision: Precision) -> Result<Vec<f32>, String> {
     let n = x.shape.iter().product::<usize>();
@@ -872,11 +1001,12 @@ struct Acts {
     m_gate: Tensor,
     m_up: Tensor,
     m_mid: Tensor,
-    logits: Tensor,
+    /// `[tokens, vocab]` f32, only for [`Qwen35Model::forward`].
+    logits: Option<Tensor>,
 }
 
 impl Acts {
-    fn new(rt: &Arc<GpuRuntime>, cfg: &Qwen35Config, p: Precision, t: u32) -> Result<Self, String> {
+    fn new(rt: &Arc<GpuRuntime>, cfg: &Qwen35Config, p: Precision, t: u32, logits: bool) -> Result<Self, String> {
         let tu = t as usize;
         let (g, l) = (cfg.gdn, cfg.attn);
         let act = |cols: usize| match p {
@@ -912,7 +1042,11 @@ impl Acts {
             m_gate: rt.alloc_tensor_f32(&[tu, cfg.intermediate as usize])?,
             m_up: rt.alloc_tensor_f32(&[tu, cfg.intermediate as usize])?,
             m_mid: act(cfg.intermediate as usize)?,
-            logits: rt.alloc_tensor_f32(&[tu, cfg.vocab as usize])?,
+            logits: if logits {
+                Some(rt.alloc_tensor_f32(&[tu, cfg.vocab as usize])?)
+            } else {
+                None
+            },
         })
     }
 }

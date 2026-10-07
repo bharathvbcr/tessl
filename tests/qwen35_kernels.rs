@@ -612,6 +612,26 @@ fn gdn_chunk_edges_of_the_chunk_and_head_grouping() {
     });
 }
 
+/// Qwen3.5-4B's gated delta net heads: 16 key heads over 32 value heads of
+/// 128 (two value heads per key head), through the chunked prefill (past two
+/// chunk edges) and the recurrent decode, against the f64 reference that
+/// `gdn_reference_matches_transformers` holds to transformers.
+#[test]
+fn gdn_at_the_4b_head_counts() {
+    with_gpu(|rt| {
+        let s = GdnShape {
+            b: 1,
+            t: 130,
+            hk: 16,
+            hv: 32,
+            dv: 128,
+        };
+        check_gdn("chunk 4B heads", rt, &GdnData::random(s, "batch", 4400), Path::Chunk);
+        let s = GdnShape { t: 3, ..s };
+        check_gdn("recurrent 4B heads", rt, &GdnData::random(s, "batch", 4410), Path::Recurrent);
+    });
+}
+
 #[test]
 fn gdn_recurrent_decode_shapes() {
     with_gpu(|rt| {
@@ -3376,13 +3396,15 @@ fn embed_rows_equals_the_host_gather_bit_for_bit() {
 // ------------------------------------------------ matrix-unit prefill attention ---
 
 /// Causal attention in f64 over `[batch, tq, heads, 256]` queries and
-/// `[batch, cap, kv_heads, 256]` keys/values, live `tkv`, query `t` at
-/// `q_off + t` and key `t` at `kv_off + t`. A row that sees no key is zeros.
+/// `[batch, cap, kv_heads, 256]` keys/values, `(heads, kv_heads)` given,
+/// live `tkv`, query `t` at `q_off + t` and key `t` at `kv_off + t`. A row
+/// that sees no key is zeros.
 #[allow(clippy::too_many_arguments)]
 fn causal_attn_f64(
     q: &[f32],
     k: &[f32],
     v: &[f32],
+    (h, hkv): (usize, usize),
     batch: usize,
     tq: usize,
     tkv: usize,
@@ -3390,7 +3412,7 @@ fn causal_attn_f64(
     q_off: usize,
     kv_off: usize,
 ) -> Vec<f64> {
-    let (h, hkv, d) = (PFX_HQ, PFX_HKV, PFX_D);
+    let d = PFX_D;
     let scale = 1.0 / (d as f64).sqrt();
     let mut out = vec![0.0f64; batch * tq * h * d];
     for b in 0..batch {
@@ -3448,6 +3470,48 @@ fn run_tiled(
     o
 }
 
+/// Qwen3.5-4B's full-attention heads (16 query over 4 KV heads of 256, the
+/// shape rsi-jev-v6.0-vl-4b serves): the matrix-unit prefill at the default
+/// tile against the f64 reference, held to the scalar kernel's own error as
+/// the 2B-shaped test below holds it, across block edges and a ragged length.
+#[test]
+fn attn_prefill_at_the_4b_head_counts() {
+    let (hq, hkv) = (16usize, 4usize);
+    with_gpu(|rt| {
+        for (ci, &(batch, tq)) in [(1usize, 1usize), (1, 65), (2, 300)].iter().enumerate() {
+            let seed = 9700 + 10 * ci as u64;
+            let (row, n) = (hkv * PFX_D, batch * tq * hq * PFX_D);
+            let q: Vec<f32> = random_f32(n, seed).iter().map(|x| 4.0 * x).collect();
+            let k = random_f32(batch * tq * row, seed + 1);
+            let v = random_f32(batch * tq * row, seed + 2);
+            let want = causal_attn_f64(&q, &k, &v, (hq, hkv), batch, tq, tq, tq, 0, 0);
+            let (qb, kb, vb) = (buf(rt, &q), buf(rt, &k), buf(rt, &v));
+            let tkvb = buf_u32(rt, &[tq as u32]);
+            let zero = buf_u32(rt, &[0]);
+            let dims = tessl::nn::AttnDims {
+                batch: batch as u32,
+                tq: tq as u32,
+                heads: hq as u32,
+                heads_kv: hkv as u32,
+                window: 0,
+                scale: 1.0 / (PFX_D as f32).sqrt(),
+            };
+            let scalar = seeded(rt, n, SENTINEL);
+            tessl::nn::flash_attn_rows(rt, &qb, &kb, &vb, &scalar, &tkvb, &zero, &zero, dims, PFX_D as u32, false)
+                .unwrap();
+            let tiled = seeded(rt, n, SENTINEL);
+            qwen35::attn_prefill(rt, &qb, &kb, &vb, &tiled, &tkvb, &zero, &zero, dims, false).unwrap();
+            rt.synchronize().unwrap();
+            let (s, t) = (scalar.read_f32(), tiled.read_f32());
+            let (es, et) = (max_err(&s[..n], &want), max_err(&t[..n], &want));
+            eprintln!("4B heads B{batch} Tq{tq}: max |err| scalar {es:.2e}, tiled {et:.2e}");
+            assert!(t[..n].iter().all(|x| x.is_finite()), "B{batch} Tq{tq}: non-finite (unwritten?)");
+            assert!(es <= 1e-5, "B{batch} Tq{tq}: scalar kernel error {es:.2e}");
+            assert!(et <= 4.0 * es.max(1e-7), "B{batch} Tq{tq}: tiled {et:.2e} > 4x scalar {es:.2e}");
+        }
+    });
+}
+
 #[test]
 fn attn_prefill_matches_an_f64_reference_as_closely_as_flash_attn_rows() {
     // (batch, tq, live tkv, capacity, q_pos_offset, kv_pos_offset), run at
@@ -3484,7 +3548,7 @@ fn attn_prefill_matches_an_f64_reference_as_closely_as_flash_attn_rows() {
                 k[dead.clone()].fill(f32::NAN);
                 v[dead].fill(f32::NAN);
             }
-            let want = causal_attn_f64(&q, &k, &v, batch, tq, tkv, cap, q_off, kv_off);
+            let want = causal_attn_f64(&q, &k, &v, (PFX_HQ, PFX_HKV), batch, tq, tkv, cap, q_off, kv_off);
             let (qb, kb, vb) = (buf(rt, &q), buf(rt, &k), buf(rt, &v));
             let tkvb = buf_u32(rt, &[tkv as u32]);
             let qpos = buf_u32(rt, &[q_off as u32]);

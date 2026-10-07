@@ -42,7 +42,7 @@ use objc2_metal::MTLComputePipelineState;
 use crate::dispatch::{dispatch_2d, set_f32, set_gpu_buf, set_tensor, set_u32};
 use crate::gemm::{cast_bf16_to_f32_into, GemmOperands};
 use crate::nn::{dispatch_tg_1d, reduce_tptg};
-use crate::runtime::GpuRuntime;
+use crate::runtime::{BufferKind, GpuRuntime};
 use crate::tensor::{DType, GpuBuffer, Tensor};
 
 /// How the per-row losses combine.
@@ -153,9 +153,26 @@ impl CeWorkspace {
 
     /// [`Self::bytes`] before allocating.
     pub fn bytes_for(max_rows: u32, hidden: u32, chunk: u32, weight_dtype: DType) -> usize {
+        4 * Self::lens(max_rows, hidden, chunk, weight_dtype).iter().sum::<usize>()
+    }
+
+    /// [`Self::bytes_for`] as the device charges it: each buffer at the
+    /// size the pool makes it ([`GpuRuntime::allocated_bytes_for`]).
+    pub fn allocated_bytes_for(max_rows: u32, hidden: u32, chunk: u32, weight_dtype: DType) -> u64 {
+        Self::lens(max_rows, hidden, chunk, weight_dtype)
+            .iter()
+            .filter(|&&n| n > 0)
+            .map(|&n| GpuRuntime::allocated_bytes_for(n * 4, BufferKind::Cold))
+            .fold(0, u64::saturating_add)
+    }
+
+    /// f32 elements of each buffer [`Self::new`] allocates (`w32` is 0 for an
+    /// f32 weight, which has none): `rows`, `targets`, `m`, `s`, `tlogit`,
+    /// `h`, `dh_part`, `logits`, `w32`.
+    fn lens(max_rows: u32, hidden: u32, chunk: u32, weight_dtype: DType) -> [usize; 9] {
         let (n, h, c) = (max_rows as usize, hidden as usize, chunk as usize);
         let widened = if weight_dtype == DType::BF16 { c * h } else { 0 };
-        4 * (5 * n + 2 * n * h + n * c + widened)
+        [n, n, n, n, n, n * h, n * h, n * c, widened]
     }
 
     pub fn chunk(&self) -> u32 {

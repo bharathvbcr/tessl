@@ -26,7 +26,7 @@ use objc2_metal::MTLComputePipelineState;
 use crate::dispatch::{dispatch_2d, dispatch_2d_tg, set_f32, set_gpu_buf, set_u32};
 use crate::nn::{require, require_disjoint_writes};
 use crate::qwen35::PREFIX_ATTN_HEAD_DIM;
-use crate::runtime::GpuRuntime;
+use crate::runtime::{BufferKind, GpuRuntime};
 use crate::tensor::GpuBuffer;
 
 /// Head dim the training kernels are compiled for (Qwen3.5's at every size).
@@ -123,6 +123,14 @@ impl AttnTrainWorkspace {
 
     pub fn dims(&self) -> AttnTrainDims {
         self.dims
+    }
+
+    /// Device bytes [`Self::new`] allocates for `dims`, each buffer at the
+    /// size the pool makes it ([`GpuRuntime::allocated_bytes_for`]).
+    pub fn allocated_bytes_for(dims: AttnTrainDims) -> u64 {
+        let u32_slot = GpuRuntime::allocated_bytes_for(std::mem::size_of::<u32>(), BufferKind::Cold);
+        let dvec = dims.lse_len().max(1) * std::mem::size_of::<f32>();
+        2 * u32_slot + GpuRuntime::allocated_bytes_for(dvec, BufferKind::Cold)
     }
 
     fn check(&self, dims: &AttnTrainDims, what: &str) -> Result<(), String> {

@@ -762,6 +762,78 @@ gather table and separate f32 `[2048, 248320]` head (1.0 + 2.0 GB) with one
 f32 table (2.0 GB). The recomputing step's peak should now be about 1 GB
 lower; that is arithmetic, not a re-measurement.
 
+### Device memory: tables at their size, and a step that cannot fit refused
+
+The buffer pool used to round every request up to a power of two, Hot
+buffers included, which never return to the freelist. The 2.03 GB embedding
+took 4.29 GB, and each f32 table of the 2B (weights, a gradient bank, each
+AdamW moment) 10.20 GB for 7.53 GB of values. Hot buffers, and Cold ones over
+1 MiB, are now made at their size rounded to Metal's 16 KiB allocation
+granule; small temporaries keep power-of-two buckets
+(`runtime::audit_tests::persistent_and_large_buffers_are_page_rounded_not_power_of_two`).
+`MTLDevice::currentAllocatedSize` on the 2B in f32, M5 Pro 64 GB (recommended
+working set 51.54 GB), `probe_train_memory`:
+
+| after | before the change | now |
+|---|---:|---:|
+| `Qwen35Model::load` | 10.22 GB | 7.55 GB |
+| `Qwen35Grads::zeros_like` (bank) | 20.42 GB | 15.07 GB |
+| `AdamW::new` (both moments) | 40.83 GB | 30.13 GB |
+| one exact-f32 step at T = 128 into the bank | 43.59 GB | 32.61 GB |
+| its waited commit (freed buffers recycled) | 41.44 GB | 30.58 GB |
+| one f32 table staged for a gradient read-back | 50.20 GB | 37.94 GB |
+
+That is the "~11.3 GB unattributed" beyond weights, bank and moments in
+ojas-qwen35's read-back: 2.67 GB of rounding per table. The "before" column
+up to the recycle is this probe on the old pool, and matches ojas-qwen35's
+README to the hundredth; its 50.20 GB staging is ojas-qwen35's measurement,
+not re-run on the old pool (it left 1.34 GB of headroom). The same staging
+now leaves 13.60 GB.
+
+`Qwen35Model::train_step_bytes(t, operands)` bounds what one step allocates
+on top of what is allocated when it starts, and `train_forward` (so
+`train_step` and `train_step_into`) refuses a step, before any GPU work, when
+that bound plus the device's current allocation exceeds the recommended
+working set. The bound is what the step holds throughout (each layer's
+input, the final norm's output and gradient, the `[vocab, hidden]` head
+gradient, the backward's scratch with `GdnTrainWorkspace`'s split-K parts),
+plus the most it allocates between two waited commits (a freed buffer is
+only recycled at one), plus the freelist cap. Every buffer counts at its
+pool size (`GpuRuntime::allocated_bytes_for`), and each workspace and GEMM
+gives its own (`allocated_bytes_for` on `GdnTrainWorkspace`, `CeWorkspace`,
+`AttnTrainWorkspace` and `EmbedBwdWorkspace`; `GemmOperands` for its bf16
+operand copies and split-K scratch). Without async encode every dispatch waits, so
+two adjacent layers bound a window; with it, a step waits only at each
+attention layer, and the window is every layer from one attention layer to
+the next. Against the measured peak (`GpuRuntime::peak_allocated_bytes`,
+sampled at every buffer the pool creates) from an empty freelist, bank
+resident, no moments:
+
+| T | operands | encode | peak over start | bound | bound − peak |
+|---:|---|---|---:|---:|---:|
+| 128 | exact f32 | per dispatch | 2.49 GB | 4.85 GB | 2.36 GB |
+| 2048 | exact f32 | per dispatch | 4.11 GB | 6.82 GB | 2.71 GB |
+| 8192 | exact f32 | per dispatch | 9.31 GB | 13.13 GB | 3.82 GB |
+| 128 | exact f32 | async | 3.20 GB | 5.57 GB | 2.37 GB |
+| 2048 | exact f32 | async | 6.01 GB | 8.52 GB | 2.51 GB |
+| 8192 | exact f32 | async | 14.72 GB | 17.95 GB | 3.23 GB |
+| 2048 | bf16 | per dispatch | 4.41 GB | 7.83 GB | 3.42 GB |
+
+The bound never fell below the peak, and exceeded it by at most the
+freelist cap (2.15 GB) plus 30% of the peak. Every peak was in the
+backward. `tests/qwen35_train.rs`
+(`a_step_over_the_working_set_is_refused_before_it_runs`) holds the
+refusal (it fails with the check removed: the step runs) and the bound
+against the tiny model's measured peak at three lengths.
+
+`ps` RSS is not a device-memory cap. It counts a Metal shared buffer's pages
+only while they are resident and uncompressed: zeroing the 7.53 GB bank on
+the host raised it by 7.53 GB, but the 15.05 GB of moments by 6.9 GB, and
+after a step it read 7.84 GB with 15.07 GB allocated. A cap on RSS (Lappi's
+`tools/mac_heavy.sh` 32 GiB) therefore lets the device allocate well past
+it; `currentAllocatedSize` is the figure the working set is measured
+against.
+
 ### From torch: `tessl_torch.Qwen35`
 
 `src/qwen35_params.rs` exposes the model's parameters and gradients under

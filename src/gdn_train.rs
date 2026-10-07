@@ -32,7 +32,7 @@ use objc2_metal::MTLComputePipelineState;
 
 use crate::dispatch::{dispatch_2d_tg, set_gpu_buf, set_tensor, set_u32};
 use crate::nn::dispatch_tg_1d;
-use crate::runtime::GpuRuntime;
+use crate::runtime::{BufferKind, GpuRuntime};
 use crate::tensor::{DType, Tensor};
 
 /// Key head dim the kernels are compiled for.
@@ -112,31 +112,47 @@ pub struct GdnTrainWorkspace {
 impl GdnTrainWorkspace {
     pub fn new(rt: &Arc<GpuRuntime>, dims: GdnTrainDims) -> Result<Self, String> {
         dims.validate("GdnTrainWorkspace")?;
+        let [scratch, dq_part, dk_part, dg_part, dbeta_part] = Self::lens(dims);
+        Ok(Self {
+            dims,
+            scratch: rt.alloc_tensor_f32(&[scratch])?,
+            dq_part: rt.alloc_tensor_f32(&[dq_part])?,
+            dk_part: rt.alloc_tensor_f32(&[dk_part])?,
+            dg_part: rt.alloc_tensor_f32(&[dg_part])?,
+            dbeta_part: rt.alloc_tensor_f32(&[dbeta_part])?,
+        })
+    }
+
+    /// Elements of `scratch`, `dq_part`, `dk_part`, `dg_part`, `dbeta_part`.
+    fn lens(dims: GdnTrainDims) -> [usize; 5] {
         let (bh, ns, rows) = (
             dims.batch as usize * dims.heads as usize,
-            dims.slices() as usize,
+            (dims.v_dim / GDN_TRAIN_BV) as usize,
             dims.rows(),
         );
         let dk = GDN_TRAIN_DK as usize;
-        Ok(Self {
-            dims,
-            scratch: rt.alloc_tensor_f32(&[bh * ns * GDN_TRAIN_CKPT as usize * dk * GDN_TRAIN_BV as usize])?,
-            dq_part: rt.alloc_tensor_f32(&[ns * rows * dk])?,
-            dk_part: rt.alloc_tensor_f32(&[ns * rows * dk])?,
-            dg_part: rt.alloc_tensor_f32(&[ns * rows])?,
-            dbeta_part: rt.alloc_tensor_f32(&[ns * rows])?,
-        })
+        let part = ns * rows * dk;
+        [
+            bh * ns * GDN_TRAIN_CKPT as usize * dk * GDN_TRAIN_BV as usize,
+            part,
+            part,
+            ns * rows,
+            ns * rows,
+        ]
     }
 
     /// Device bytes the workspace holds for `dims`.
     pub fn bytes_for(dims: GdnTrainDims) -> usize {
-        let (bh, ns, rows) = (
-            dims.batch as usize * dims.heads as usize,
-            (dims.v_dim / GDN_TRAIN_BV) as usize,
-            dims.batch as usize * dims.seq as usize * dims.heads as usize,
-        );
-        let dk = GDN_TRAIN_DK as usize;
-        4 * (bh * ns * GDN_TRAIN_CKPT as usize * dk * GDN_TRAIN_BV as usize + 2 * ns * rows * dk + 2 * ns * rows)
+        4 * Self::lens(dims).iter().sum::<usize>()
+    }
+
+    /// [`Self::bytes_for`] as the device charges it: each buffer at the
+    /// size the pool makes it ([`GpuRuntime::allocated_bytes_for`]).
+    pub fn allocated_bytes_for(dims: GdnTrainDims) -> u64 {
+        Self::lens(dims)
+            .iter()
+            .map(|&n| GpuRuntime::allocated_bytes_for(n * 4, BufferKind::Cold))
+            .fold(0, u64::saturating_add)
     }
 
     pub fn dims(&self) -> GdnTrainDims {

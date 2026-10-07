@@ -21,7 +21,7 @@ use objc2_metal::MTLComputePipelineState;
 use crate::dispatch::{dispatch_1d, dispatch_2d, set_f32, set_gpu_buf, set_gpu_buf_offset, set_u32};
 use crate::nn::{dispatch_tg_1d, reduce_tptg, require, require_disjoint_writes};
 use crate::qwen35::{require_window, AttnProjLayout, AttnShape, Cols, GdnGateLogits, GdnParams};
-use crate::runtime::GpuRuntime;
+use crate::runtime::{BufferKind, GpuRuntime};
 use crate::tensor::{DType, GpuBuffer, Tensor};
 
 /// Columns one thread of a weight-gradient kernel can own
@@ -615,6 +615,16 @@ impl EmbedBwdWorkspace {
 
     pub fn max_rows(&self) -> u32 {
         self.max_rows
+    }
+
+    /// Device bytes [`Self::new`] allocates for `max_rows`, each buffer at
+    /// the size the pool makes it ([`GpuRuntime::allocated_bytes_for`]).
+    pub fn allocated_bytes_for(max_rows: u32) -> u64 {
+        let n = max_rows as usize;
+        [n, n + 1, n]
+            .iter()
+            .map(|&len| GpuRuntime::allocated_bytes_for(len * std::mem::size_of::<u32>(), BufferKind::Cold))
+            .fold(0, u64::saturating_add)
     }
 }
 

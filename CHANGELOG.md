@@ -130,6 +130,24 @@ All notable changes to `tessl` are recorded here. The format follows
 
 ### Fixed
 
+- **Persistent buffers are no longer rounded to a power of two.** The buffer
+  pool bucketed every request to its next power of two, Hot weights,
+  gradient banks and AdamW moments included, though they never return to the
+  freelist: each f32 table of Qwen3.5-2B took 10.20 GB for 7.53 GB of values.
+  Hot buffers and Cold ones over 1 MiB are now made at their size rounded to
+  Metal's 16 KiB allocation granule (small temporaries keep power-of-two
+  buckets). The 2B's weights, bank and moments went from 40.83 to 30.13 GB
+  allocated, and ojas-qwen35's gradient read-back from 50.20 to 37.94 GB
+  against a 51.54 GB working set (`docs/qwen35.md`). A recycled large Cold
+  buffer now serves only a request of its own rounded size.
+- **A Qwen3.5 training step that cannot fit is refused before it runs.**
+  `Qwen35Model::train_forward` (so `train_step` and `train_step_into`)
+  returns an error, before any GPU work and without poisoning the runtime,
+  when `Qwen35Model::train_step_bytes` plus the device's current allocation
+  exceeds its recommended working set. Past it, Metal pages the resident set
+  and command buffers time out, or the system runs out of memory. The bound
+  was never below the measured peak on the 2B at T = 128, 2048 and 8192, and
+  exceeded it by at most the freelist cap plus 30%.
 - **Fused GEMM + GELU no longer clips at 20.** `Activation::GeluTanh` in
   `gemm_epilogue` ran a private copy of the GELU that multiplied by the
   clamped input, so every pre-activation above 20 came out as exactly 20
@@ -148,6 +166,14 @@ All notable changes to `tessl` are recorded here. The format follows
 
 ### Added
 
+- **Device memory accounting.** `GpuRuntime::peak_allocated_bytes` and
+  `reset_peak_allocated_bytes` (the high-water mark of `currentAllocatedSize`,
+  sampled at every buffer the pool creates), `GpuRuntime::allocated_bytes_for`
+  (what a pool allocation of a given size and kind costs),
+  `allocated_bytes_for` on `GdnTrainWorkspace`, `CeWorkspace`,
+  `AttnTrainWorkspace` and `EmbedBwdWorkspace`, `Qwen35Model::train_step_bytes`,
+  `GpuRuntime::set_recommended_working_set_for_test`, and the
+  `probe_train_memory` binary that measures the 2B's tables and steps.
 - **GPU faults are read from commit feedback.** `MTL4CommandBuffer` has no
   `status` or `error`, so a fault was invisible after a wait. Each commit now
   registers an `MTL4CommitFeedback` handler through `MTL4CommitOptions`

@@ -50,7 +50,7 @@ use crate::qwen35_bwd::{
     AttnQkvGrads, EmbedBwdWorkspace,
 };
 use crate::qwen35_model::{AttnWeights, GdnWeights, Layer, Mixer, Precision, Qwen35Model};
-use crate::runtime::GpuRuntime;
+use crate::runtime::{BufferKind, GpuRuntime};
 use crate::tensor::{DType, GpuBuffer, Tensor};
 
 /// Vocabulary columns per cross-entropy chunk.
@@ -522,7 +522,7 @@ impl Qwen35Model {
         sup: Supervise<'_>,
         bank: Option<(&Qwen35Grads, bool)>,
     ) -> Result<(f64, Option<Qwen35Grads>), String> {
-        let p = self.train_forward(ids, operands, sup)?;
+        let p = self.step_forward(ids, operands, sup, bank.is_none())?;
         let loss = p.loss;
         Ok((loss, self.backward(p, None, bank)?))
     }
@@ -531,11 +531,30 @@ impl Qwen35Model {
     /// [`Self::train_backward_into`]. In between, [`PendingStep::hidden`]
     /// gives the final norm's output at chosen positions to a loss outside
     /// tessl, whose gradient the backward adds to the step's own.
+    ///
+    /// Refused before any GPU work when the device's current allocation
+    /// plus [`Self::train_step_bytes`] exceeds its recommended working set:
+    /// past that, Metal pages the resident set and the step's command
+    /// buffers time out (poisoning the runtime), or the system runs out of
+    /// memory, rather than failing where the caller can see it.
     pub fn train_forward(
         &self,
         ids: &[u32],
         operands: GemmOperands,
         sup: Supervise<'_>,
+    ) -> Result<PendingStep, String> {
+        self.step_forward(ids, operands, sup, false)
+    }
+
+    /// [`Self::train_forward`]; `fresh` when the backward will return fresh
+    /// gradients rather than deliver them into a bank, which the pre-flight
+    /// then counts too.
+    fn step_forward(
+        &self,
+        ids: &[u32],
+        operands: GemmOperands,
+        sup: Supervise<'_>,
+        fresh: bool,
     ) -> Result<PendingStep, String> {
         const WHAT: &str = "Qwen35Model::train_step";
         let (rt, cfg) = (&self.rt, &self.cfg);
@@ -600,7 +619,18 @@ impl Qwen35Model {
 
         // ---- forward --------------------------------------------------------
         let id_buf = rt.alloc_buffer(tu * std::mem::size_of::<u32>())?;
-        id_buf.write_u32(ids);
+        // A waited commit: what earlier work freed is recycled, so the
+        // allocation read next is what the step really starts from.
+        id_buf.try_write_u32(ids)?;
+        let (have, need) = (rt.current_allocated_bytes(), self.step_bytes(t, operands, fresh));
+        let limit = rt.memory_info().recommended_working_set;
+        if have.saturating_add(need) > limit {
+            return Err(format!(
+                "{WHAT}: a step on {t} tokens may allocate {need} B on top of the {have} B allocated, \
+                 over the device's recommended working set of {limit} B; refused before any GPU work \
+                 (shorten the sequence, or free device memory)"
+            ));
+        }
         let mut resid = tensor(rt, &[tu, h])?;
         qwen35::embed_rows(
             rt,
@@ -891,6 +921,299 @@ impl Qwen35Model {
             gdn,
             attn,
         })
+    }
+
+    /// A bound on the device bytes one step on `t` tokens allocates on top
+    /// of what is allocated when it starts: a step into a bank
+    /// ([`Self::train_step_into`], or [`Self::train_forward`] then
+    /// [`Self::train_backward_into`]) that scores its rows, so it holds the
+    /// `[vocab, hidden]` head gradient. Every buffer counts at the size the
+    /// pool makes it ([`GpuRuntime::allocated_bytes_for`]).
+    ///
+    /// A freed buffer stays allocated until the next waited commit. Without
+    /// async encode (the default) every dispatch is one, so a layer's
+    /// buffers are recycled once the next layer's first kernel has run;
+    /// with it ([`GpuRuntime::set_async_encode`]) a step waits only at each
+    /// attention layer (its workspace's host writes), at the cross-entropy,
+    /// and at its start and end. So the bound is what the step holds
+    /// throughout (each layer's input, the final norm's output and its
+    /// gradient, the head gradient, the backward's scratch), plus the most
+    /// it allocates between two waits (two adjacent layers' intermediates,
+    /// gradients and GEMM temporaries, or under async encode every layer's
+    /// from one attention layer to the next, both counted whole; or the
+    /// cross-entropy's workspace and GEMM temporaries), plus the freelist's
+    /// cap (`pool_cache_cap`), which is how far recycled buffers can grow
+    /// the pool past the step's own. It reads the runtime's encode mode and
+    /// cap when called. [`Self::train_forward`] refuses a step whose bound
+    /// and the device's current allocation exceed its recommended working
+    /// set.
+    pub fn train_step_bytes(&self, t: u32, operands: GemmOperands) -> u64 {
+        self.step_bytes(t, operands, false)
+    }
+
+    /// [`Self::train_step_bytes`]; `fresh` adds every layer's gradients held
+    /// to the end, as [`Self::train_step`] returns them instead of
+    /// delivering each into a bank.
+    fn step_bytes(&self, t: u32, mm: GemmOperands, fresh: bool) -> u64 {
+        let (cfg, tu) = (&self.cfg, t as usize);
+        let (h, v) = (cfg.hidden as usize, cfg.vocab as usize);
+        let f = |n: usize| GpuRuntime::allocated_bytes_for(n.saturating_mul(4), BufferKind::Cold);
+        let sum = |parts: &[u64]| parts.iter().fold(0u64, |a, &b| a.saturating_add(b));
+        let th = f(tu * h);
+        let layers = self.layers.len() as u64;
+        // The ids, each layer's input and the stream out of the last, the
+        // final norm's output and its gradient, the head gradient.
+        let held = sum(&[f(tu), th.saturating_mul(layers + 3), f(v * h)]);
+        let fwd: Vec<u64> = self
+            .layers
+            .iter()
+            .map(|l| self.layer_fwd_bytes(l, t, mm, true))
+            .collect();
+        let bwd: Vec<(u64, u64)> = self
+            .layers
+            .iter()
+            .map(|l| {
+                let (grads, temps) = self.layer_bwd_bytes(l, t, mm);
+                (grads, sum(&[self.layer_fwd_bytes(l, t, mm, false), grads, temps]))
+            })
+            .collect();
+        let fresh_grads = if fresh {
+            bwd.iter().fold(f(h), |a, &(g, _)| a.saturating_add(g))
+        } else {
+            0
+        };
+        let between_waits = |bytes: &mut dyn Iterator<Item = (bool, u64)>| {
+            let (mut most, mut run) = (0u64, 0u64);
+            for (waits, b) in bytes {
+                run = run.saturating_add(b);
+                if waits {
+                    most = most.max(run);
+                    run = b;
+                }
+            }
+            most.max(run)
+        };
+        // Without async encode every dispatch is a waited commit, so a
+        // layer's buffers are recycled once the next layer's first kernel
+        // runs; with it, only at an attention layer's workspace.
+        let batched = self.rt.async_encode_enabled();
+        let is_attn = |l: &Layer| !batched || matches!(l.mixer, Mixer::Attn(_));
+        let fwd_most = between_waits(&mut self.layers.iter().map(is_attn).zip(fwd.iter().copied()));
+        let bwd_most = between_waits(
+            &mut self
+                .layers
+                .iter()
+                .rev()
+                .map(is_attn)
+                .zip(bwd.iter().rev().map(|&(_, b)| b)),
+        );
+        let ce = self.ce_bytes(t, mm, batched);
+        let backward_held = sum(&[
+            self.scratch_bytes(t),
+            f(h),
+            EmbedBwdWorkspace::allocated_bytes_for(t),
+            fresh_grads,
+        ]);
+        let pool = self.rt.memory_info().pool_cache_cap as u64;
+        sum(&[held, fwd_most.max(ce).max(backward_held.saturating_add(bwd_most)), pool])
+    }
+
+    /// One layer's forward intermediates, with its GEMMs' temporaries;
+    /// `output` adds the `down` projection's product (its stream out is the
+    /// next layer's input, which [`Self::step_bytes`] holds).
+    fn layer_fwd_bytes(&self, layer: &Layer, t: u32, mm: GemmOperands, output: bool) -> u64 {
+        let (cfg, tu) = (&self.cfg, t as usize);
+        let (h, i) = (cfg.hidden as usize, cfg.intermediate as usize);
+        let f = |n: usize| GpuRuntime::allocated_bytes_for(n.saturating_mul(4), BufferKind::Cold);
+        let mut b = vec![
+            f(tu * h), // x1
+            f(tu * h), // resid_mid
+            f(tu * h), // x2
+            f(tu * i),
+            f(tu * i),
+            f(tu * i), // m_gate, m_up, m_mid
+            2 * mm.nn_scratch_bytes(tu, i, h),
+        ];
+        if output {
+            b.push(mm.nn_scratch_bytes(tu, h, i));
+        }
+        match &layer.mixer {
+            Mixer::Gdn(_) => {
+                let g = cfg.gdn;
+                let (hv, dv, dk) = (g.v_heads() as usize, g.v_dim() as usize, GDN_TRAIN_DK as usize);
+                let ckpt = GdnTrainDims {
+                    batch: 1,
+                    seq: t,
+                    heads: g.v_heads(),
+                    v_dim: g.v_dim(),
+                }
+                .checkpoint_shape();
+                b.extend([
+                    f(tu * g.width() as usize), // proj
+                    mm.nn_scratch_bytes(tu, g.width() as usize, h),
+                    f(tu * g.conv_dim() as usize),
+                    f(tu * hv * dk),
+                    f(tu * hv * dk),
+                    f(tu * hv * dv), // q, k, v
+                    f(tu * hv),
+                    f(tu * hv), // g, beta
+                    f(ckpt.iter().product()),
+                    f(tu * hv * dv), // o
+                    f(tu * hv * dv), // y
+                    mm.nn_scratch_bytes(tu, h, hv * dv),
+                ]);
+            }
+            Mixer::Attn(_) => {
+                let a = cfg.attn;
+                let (qd, kvd) = (
+                    (a.q_heads() * a.head_dim()) as usize,
+                    (a.kv_heads() * a.head_dim()) as usize,
+                );
+                let dims = self.attn_dims(t);
+                b.extend([
+                    f(tu * a.width() as usize), // proj
+                    mm.nn_scratch_bytes(tu, a.width() as usize, h),
+                    f(tu * qd),
+                    f(tu * kvd),
+                    f(tu * kvd), // q, k, v
+                    AttnTrainWorkspace::allocated_bytes_for(dims),
+                    f(tu * qd),        // o
+                    f(dims.lse_len()), // lse
+                    f(tu * qd),        // y
+                    mm.nn_scratch_bytes(tu, h, qd),
+                ]);
+            }
+        }
+        b.iter().fold(0, |a, &x| a.saturating_add(x))
+    }
+
+    /// One layer's backward: its gradients, and its GEMMs' temporaries.
+    fn layer_bwd_bytes(&self, layer: &Layer, t: u32, mm: GemmOperands) -> (u64, u64) {
+        let (cfg, tu) = (&self.cfg, t as usize);
+        let (h, i) = (cfg.hidden as usize, cfg.intermediate as usize);
+        let tc = self.rt.has_tensorops();
+        let f = |n: usize| GpuRuntime::allocated_bytes_for(n.saturating_mul(4), BufferKind::Cold);
+        // down, gate, up, post_norm, input_norm.
+        let mut grads = vec![f(i * h), f(h * i), f(h * i), f(h), f(h)];
+        let mut temps = vec![
+            mm.tn_scratch_bytes(tc, i, h, tu),
+            mm.nt_scratch_bytes(tc, tu, i, h),
+            2 * mm.tn_scratch_bytes(tc, h, i, tu),
+            2 * mm.nt_scratch_bytes(tc, tu, h, i),
+        ];
+        let (width, y_cols) = match &layer.mixer {
+            Mixer::Gdn(_) => {
+                let g = cfg.gdn;
+                let (hv, vd) = (g.v_heads() as usize, g.value_dim() as usize);
+                grads.extend([
+                    f(g.v_dim() as usize), // norm_w
+                    f(hv),
+                    f(hv), // a_log, dt_bias
+                    f((g.conv_dim() * cfg.conv_kernel) as usize),
+                ]);
+                (g.width() as usize, vd)
+            }
+            Mixer::Attn(_) => {
+                let a = cfg.attn;
+                grads.extend([f(a.head_dim() as usize), f(a.head_dim() as usize)]);
+                (a.width() as usize, (a.q_heads() * a.head_dim()) as usize)
+            }
+        };
+        // w_out [y_cols, h] and w_in [h, width], and their GEMMs.
+        grads.extend([f(y_cols * h), f(h * width)]);
+        temps.extend([
+            mm.tn_scratch_bytes(tc, y_cols, h, tu),
+            mm.nt_scratch_bytes(tc, tu, y_cols, h),
+            mm.tn_scratch_bytes(tc, h, width, tu),
+            mm.nt_scratch_bytes(tc, tu, h, width),
+        ]);
+        let total = |v: &[u64]| v.iter().fold(0u64, |a, &b| a.saturating_add(b));
+        (total(&grads), total(&temps))
+    }
+
+    /// The backward's scratch ([`Self::scratch`]).
+    fn scratch_bytes(&self, t: u32) -> u64 {
+        let (cfg, tu) = (&self.cfg, t as usize);
+        let (h, i) = (cfg.hidden as usize, cfg.intermediate as usize);
+        let f = |n: usize| GpuRuntime::allocated_bytes_for(n.max(1).saturating_mul(4), BufferKind::Cold);
+        let has = |k: crate::qwen35_model::LayerKind| cfg.layers.contains(&k);
+        let mut b = vec![
+            3 * f(tu * h), // dresid, dx, tmp_h
+            3 * f(tu * i), // d_mid, d_gate, d_up
+            f(rms_norm_bwd_part_len(t, cfg.hidden)),
+        ];
+        if has(crate::qwen35_model::LayerKind::LinearAttention) {
+            let g = cfg.gdn;
+            let (hv, dv, dk) = (g.v_heads() as usize, g.v_dim() as usize, GDN_TRAIN_DK as usize);
+            b.extend([
+                2 * f(tu * hv * dv), // dy, d_o
+                f(tu * g.width() as usize),
+                f(tu * g.conv_dim() as usize),
+                2 * f(tu * hv * dk), // dq, dk
+                f(tu * hv * dv),     // dv
+                2 * f(tu * hv),      // dg, dbeta
+                GdnTrainWorkspace::allocated_bytes_for(GdnTrainDims {
+                    batch: 1,
+                    seq: t,
+                    heads: g.v_heads(),
+                    v_dim: g.v_dim(),
+                }),
+                f(gated_rms_norm_bwd_part_len(t, g.v_heads(), g.v_dim())),
+                f(gdn_gates_bwd_part_len(t, g.v_heads())),
+                f(conv1d_silu_bwd_part_len(1, t, g.conv_dim(), cfg.conv_kernel)),
+            ]);
+        }
+        if has(crate::qwen35_model::LayerKind::FullAttention) {
+            let a = cfg.attn;
+            let (qd, kvd) = (
+                (a.q_heads() * a.head_dim()) as usize,
+                (a.kv_heads() * a.head_dim()) as usize,
+            );
+            b.extend([
+                3 * f(tu * qd),             // dy, d_o, dq
+                f(tu * a.width() as usize), // dproj
+                2 * f(tu * kvd),            // dk, dv
+                AttnTrainWorkspace::allocated_bytes_for(self.attn_dims(t)),
+                f(attn_qk_norm_rope_bwd_part_len(&self.attn_shape(t))),
+            ]);
+        }
+        b.iter().fold(0, |a, &x| a.saturating_add(x))
+    }
+
+    /// The cross-entropy over `t` rows: its workspace, its GEMMs'
+    /// temporaries, and a [`Supervise::Rows`] step's `dh`. `batched` (async
+    /// encode) holds every vocabulary chunk's temporaries to the one wait
+    /// at its end; otherwise each dispatch waits, and one chunk's four
+    /// GEMMs bound them.
+    fn ce_bytes(&self, t: u32, mm: GemmOperands, batched: bool) -> u64 {
+        let cfg = &self.cfg;
+        let (n, h) = (t as usize, cfg.hidden as usize);
+        let chunk = CE_CHUNK.min(cfg.vocab);
+        let tc = self.rt.has_tensorops();
+        let per_chunk = |w: usize| {
+            [
+                2 * mm.nt_scratch_bytes(tc, n, w, h),
+                mm.nn_scratch_bytes(n, h, w),
+                mm.tn_scratch_bytes(tc, w, h, n),
+            ]
+            .iter()
+            .fold(0u64, |a, &b| a.saturating_add(b))
+        };
+        let (full, rest) = ((cfg.vocab / chunk) as u64, (cfg.vocab % chunk) as usize);
+        let gemms = if batched {
+            per_chunk(chunk as usize)
+                .saturating_mul(full)
+                .saturating_add(if rest > 0 { per_chunk(rest) } else { 0 })
+        } else {
+            per_chunk(chunk as usize)
+        };
+        [
+            CeWorkspace::allocated_bytes_for(t, cfg.hidden, chunk, self.embed.dtype),
+            gemms,
+            GpuRuntime::allocated_bytes_for(n * h * 4, BufferKind::Cold),
+        ]
+        .iter()
+        .fold(0, |a, &b| a.saturating_add(b))
     }
 
     fn attn_shape(&self, t: u32) -> AttnShape {

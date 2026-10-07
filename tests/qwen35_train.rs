@@ -367,6 +367,75 @@ fn train_step_refuses_what_it_does_not_implement() {
     );
 }
 
+/// A step whose bound ([`Qwen35Model::train_step_bytes`]) does not fit
+/// beside what the device has allocated is refused before any GPU work: the
+/// runtime is not poisoned, the bank is untouched, and the same step runs
+/// once the working set allows it. That bound covers the step's measured
+/// peak at several lengths.
+#[test]
+fn a_step_over_the_working_set_is_refused_before_it_runs() {
+    let dir = fixture();
+    let (rt, model) = load_rt(&dir, "model.", tiny_config(), Precision::F32);
+    let probed = rt.memory_info().recommended_working_set;
+    let pool = rt.memory_info().pool_cache_cap as u64;
+    let ids = ids(&dir);
+    let t = ids.len() as u32;
+    let mm = GemmOperands::ExactF32;
+    let bank = Qwen35Grads::zeros_like(&model).unwrap();
+    rt.synchronize().unwrap();
+    let need = model.train_step_bytes(t, mm);
+    let have = rt.current_allocated_bytes();
+    assert!(
+        need > pool,
+        "the bound {need} B has nothing but the freelist cap {pool} B"
+    );
+
+    rt.set_recommended_working_set_for_test(have + need / 2);
+    let refused = |r: Result<(), String>, what: &str| {
+        let m = r.err().unwrap_or_else(|| panic!("{what}: an over-budget step ran"));
+        assert!(
+            m.contains("recommended working set") && m.contains("refused"),
+            "{what}: {m}"
+        );
+        assert!(!rt.is_poisoned(), "{what}: the refusal poisoned the runtime");
+    };
+    refused(
+        model
+            .train_step_into(&ids, mm, Supervise::Causal, &bank, false)
+            .map(|_| ()),
+        "train_step_into",
+    );
+    refused(
+        model.train_forward(&ids, mm, Supervise::Causal).map(|_| ()),
+        "train_forward",
+    );
+    refused(model.train_step(&ids, mm).map(|_| ()), "train_step");
+    let untouched = bank.final_norm.read_f32();
+    assert!(untouched.iter().all(|&x| x == 0.0), "a refused step wrote the bank");
+
+    rt.set_recommended_working_set_for_test(probed);
+    for t in [2, ids.len(), 300] {
+        let seq: Vec<u32> = (0..t as u32).map(|i| (i * 37 + 5) % 64).collect();
+        rt.set_pool_cache_cap_bytes(0);
+        rt.set_pool_cache_cap_bytes(pool as usize);
+        rt.synchronize().unwrap();
+        let before = rt.current_allocated_bytes();
+        let need = model.train_step_bytes(t as u32, mm);
+        rt.reset_peak_allocated_bytes();
+        let loss = model
+            .train_step_into(&seq, mm, Supervise::Causal, &bank, false)
+            .unwrap_or_else(|e| panic!("T = {t}: {e}"));
+        rt.synchronize().unwrap();
+        assert!(loss.is_finite(), "T = {t}: loss {loss}");
+        let grew = rt.peak_allocated_bytes() - before;
+        assert!(grew > 0, "T = {t}: the step allocated nothing");
+        assert!(
+            grew <= need,
+            "T = {t}: the step grew the device by {grew} B, over its bound {need} B"
+        );
+    }
+}
+
 /// Every gradient's f32 bits, by name.
 fn bits(cfg: &Qwen35Config, g: &Qwen35Grads) -> Vec<(String, Vec<u32>)> {
     by_name(cfg, g, "")

@@ -43,6 +43,22 @@ const METAL4_CONST_ARENA_BYTES: usize = 16 * 1024 * 1024;
 /// Default pool freelist cap (~2 GiB of cached slabs).
 const DEFAULT_POOL_CACHE_BYTES: usize = 2 * 1024 * 1024 * 1024;
 
+/// The granule Metal allocates a shared buffer in on Apple silicon: a buffer
+/// of 16 KiB or more takes its length rounded up to this (`allocatedSize`
+/// 32768 for 16385 bytes, 3014656 for 3000000; smaller ones share a slab),
+/// so a pool size rounded to it costs no more than the request itself.
+const ALLOC_PAGE_BYTES: usize = 16 * 1024;
+
+/// Largest Cold request still bucketed to a power of two.
+///
+/// A power-of-two bucket lets a freed temporary serve any request up to its
+/// size, at a worst case of nearly half the bucket unused. Below this that is
+/// under 512 KiB per buffer. Above it, and for every Hot buffer (weights,
+/// gradient banks, optimizer moments, which never return to the freelist),
+/// the waste was the whole difference: a 2.03 GB embedding took 4.29 GB, and
+/// each f32 table of the 2B 10.20 GB for 7.53 GB of values.
+const POW2_BUCKET_MAX_BYTES: usize = 1024 * 1024;
+
 /// Buffer slots in the Metal 4 argument table.
 ///
 /// Every argument table this crate builds is created with this bind count, so a
@@ -172,22 +188,33 @@ impl BufferPool {
         }
     }
 
-    fn bucket(nbytes: usize) -> usize {
-        nbytes.next_power_of_two().max(256)
+    /// The length a request of `nbytes` is allocated at: a power of two for a
+    /// small temporary (and for anything under a page, which Metal packs into
+    /// a shared slab), otherwise `nbytes` rounded up to [`ALLOC_PAGE_BYTES`].
+    /// `None` when the rounding overflows. Every pooled buffer is created at
+    /// its bucket, so `bucket(length) == length` and the freelist is keyed
+    /// by the buffer's own length.
+    fn bucket(nbytes: usize, kind: BufferKind) -> Option<usize> {
+        let small_temp = matches!(kind, BufferKind::Cold | BufferKind::Bump) && nbytes <= POW2_BUCKET_MAX_BYTES;
+        if small_temp || nbytes < ALLOC_PAGE_BYTES {
+            nbytes.checked_next_power_of_two().map(|n| n.max(256))
+        } else {
+            nbytes.checked_next_multiple_of(ALLOC_PAGE_BYTES)
+        }
     }
 
     fn alloc(
         &mut self,
         device: &ProtocolObject<dyn MTLDevice>,
         nbytes: usize,
+        kind: BufferKind,
     ) -> Result<(Retained<ProtocolObject<dyn MTLBuffer>>, bool), String> {
         if nbytes > isize::MAX as usize || nbytes > device.maxBufferLength() {
             return Err(format!("buffer request {nbytes} exceeds host/device allocation limit"));
         }
-        let key = Self::bucket(nbytes);
-        if key < nbytes || key > device.maxBufferLength() {
-            return Err("rounded buffer size exceeds device limit".into());
-        }
+        let key = Self::bucket(nbytes, kind)
+            .filter(|&key| key <= device.maxBufferLength())
+            .ok_or("rounded buffer size exceeds device limit")?;
         if let Some(v) = self.freelist.get_mut(&key) {
             if let Some(b) = v.pop() {
                 self.cached_bytes = self.cached_bytes.saturating_sub(key);
@@ -202,7 +229,8 @@ impl BufferPool {
     }
 
     fn recycle(&mut self, buffer: Retained<ProtocolObject<dyn MTLBuffer>>) {
-        let key = Self::bucket(buffer.length());
+        // Created at its bucket by `alloc`, so its length is its key.
+        let key = buffer.length();
         if key > self.max_cache_bytes.saturating_sub(self.cached_bytes) {
             // Drop buffer (let ARC release) — over cache cap.
             return;
@@ -536,6 +564,9 @@ pub struct GpuRuntime {
     self_weak: Mutex<Weak<GpuRuntime>>,
     /// Probed working-set / wired budget (P0b).
     memory_info: Mutex<DeviceMemoryInfo>,
+    /// Highest [`Self::current_allocated_bytes`] seen at a fresh pool
+    /// allocation since creation or [`Self::reset_peak_allocated_bytes`].
+    peak_allocated: AtomicU64,
 }
 
 /// Kernel-use trace, gated on `TESSL_KERNEL_TRACE=1`.
@@ -748,6 +779,7 @@ impl GpuRuntime {
             params: Mutex::new(None),
             self_weak: Mutex::new(Weak::new()),
             memory_info: Mutex::new(mem_info),
+            peak_allocated: AtomicU64::new(0),
         });
         if let Ok(mut w) = rt.self_weak.lock() {
             *w = Arc::downgrade(&rt);
@@ -821,6 +853,46 @@ impl GpuRuntime {
     /// of the working set, wired budget, and pool-cache cap.
     pub fn current_allocated_bytes(&self) -> u64 {
         self.device.currentAllocatedSize() as u64
+    }
+
+    /// The highest [`Self::current_allocated_bytes`] since this runtime was
+    /// made or [`Self::reset_peak_allocated_bytes`] last ran.
+    ///
+    /// Sampled at every buffer the pool creates (a freelist hit allocates
+    /// nothing), which is the only point the figure rises for this crate's
+    /// allocations, so it is the exact peak of what the pool held. Memory
+    /// Metal allocates outside the pool (pipelines, argument tables) is
+    /// counted when the next pool buffer is made.
+    pub fn peak_allocated_bytes(&self) -> u64 {
+        self.peak_allocated
+            .load(Ordering::Acquire)
+            .max(self.current_allocated_bytes())
+    }
+
+    /// Restart [`Self::peak_allocated_bytes`] from what is allocated now.
+    pub fn reset_peak_allocated_bytes(&self) {
+        self.peak_allocated
+            .store(self.current_allocated_bytes(), Ordering::Release);
+    }
+
+    /// Device bytes a pool allocation of `nbytes` takes: the length the
+    /// buffer is made at, which is what `currentAllocatedSize` charges for
+    /// it from 16 KiB up. A Cold request of up to 1 MiB, and anything under
+    /// 16 KiB, rounds to a power of two (at least 256); everything else to
+    /// a multiple of 16 KiB. Saturates at `u64::MAX` where the rounding
+    /// overflows (an allocation that would be refused).
+    pub fn allocated_bytes_for(nbytes: usize, kind: BufferKind) -> u64 {
+        BufferPool::bucket(nbytes, kind).map_or(u64::MAX, |n| n as u64)
+    }
+
+    /// Replace the probed `recommendedMaxWorkingSetSize` in
+    /// [`Self::memory_info`], which the training step's pre-flight compares
+    /// against, so a test can make a step that fits not fit. Like
+    /// [`Self::poison_as_shared_event_timeout_for_test`], for tests only.
+    pub fn set_recommended_working_set_for_test(&self, bytes: u64) {
+        if let Ok(mut info) = self.memory_info.lock() {
+            info.recommended_working_set = bytes;
+        }
     }
 
     /// Cap freelist cache bytes (CLI `--pool-cache-mb`).
@@ -1138,7 +1210,13 @@ impl GpuRuntime {
             crate::infer_trace::on_cold_alloc();
         }
         let mut pool = self.pool.lock().map_err(|e| e.to_string())?;
-        let (buffer, _from_pool) = BufferPool::alloc(&mut pool, &self.device, nbytes)?;
+        let (buffer, from_pool) = BufferPool::alloc(&mut pool, &self.device, nbytes, kind)?;
+        if !from_pool {
+            // The device's figure only rises at a fresh buffer, so sampling
+            // here sees every high-water mark.
+            self.peak_allocated
+                .fetch_max(self.current_allocated_bytes(), Ordering::AcqRel);
+        }
         // Always (re)register — freelist buffers were removed on recycle.
         self.register_residency(&buffer);
         let weak = self.self_weak.lock().map(|g| g.clone()).unwrap_or_default();
@@ -2539,6 +2617,88 @@ mod audit_tests {
             rt.commit_feedback_reports.load(Ordering::Acquire) > 0,
             "MTL4CommitFeedback was not delivered; MTL4CommandBuffer has no status of its own"
         );
+    }
+
+    /// Hot buffers and large Cold ones are made at their size rounded to a
+    /// 16 KiB page, and that is what Metal charges for them; small Cold
+    /// temporaries keep power-of-two buckets. Before, every request took its
+    /// next power of two: a 2.03 GB embedding 4.29 GB.
+    #[test]
+    fn persistent_and_large_buffers_are_page_rounded_not_power_of_two() {
+        use objc2_metal::MTLResource;
+        let rt = GpuRuntime::new().unwrap();
+        let cases = [
+            (100, BufferKind::Hot, 256),
+            (8192, BufferKind::Hot, 8192),
+            (16_385, BufferKind::Hot, 32_768),
+            (3_000_000, BufferKind::Hot, 3_014_656),
+            (100_000, BufferKind::Cold, 131_072),
+            (1 << 20, BufferKind::Cold, 1 << 20),
+            ((1 << 20) + 1, BufferKind::Cold, (1 << 20) + 16_384),
+            (3_000_000, BufferKind::Cold, 3_014_656),
+            // The 2B's embedding, [248320, 2048] f32.
+            (2_034_237_440, BufferKind::Hot, 2_034_237_440),
+        ];
+        for (n, kind, want) in cases {
+            assert_eq!(GpuRuntime::allocated_bytes_for(n, kind), want as u64, "{n} {kind:?}");
+            let b = rt.alloc_buffer_kind(n, kind).unwrap();
+            let m = b.metal();
+            assert_eq!(m.length(), want, "{n} {kind:?}: made at the wrong length");
+            if want >= ALLOC_PAGE_BYTES {
+                assert_eq!(
+                    MTLResource::allocatedSize(m),
+                    want,
+                    "{n} {kind:?}: Metal charged another size"
+                );
+            }
+        }
+        assert_eq!(GpuRuntime::allocated_bytes_for(usize::MAX, BufferKind::Hot), u64::MAX);
+        assert_eq!(GpuRuntime::allocated_bytes_for(usize::MAX, BufferKind::Cold), u64::MAX);
+    }
+
+    /// A recycled page-rounded Cold buffer serves the next request of the
+    /// same size, and only that size.
+    #[test]
+    fn a_page_rounded_cold_buffer_is_reused_at_its_own_size() {
+        let rt = GpuRuntime::new().unwrap();
+        let n = 3_000_000;
+        let first = rt.alloc_buffer(n).unwrap();
+        let addr = first.metal().contents().as_ptr() as usize;
+        drop(first);
+        rt.synchronize().unwrap();
+        let bigger = rt.alloc_buffer(n + ALLOC_PAGE_BYTES).unwrap();
+        assert_ne!(
+            bigger.metal().contents().as_ptr() as usize,
+            addr,
+            "a smaller buffer served a larger request"
+        );
+        let again = rt.alloc_buffer(n - 1).unwrap();
+        assert_eq!(
+            again.metal().contents().as_ptr() as usize,
+            addr,
+            "the freed buffer was not reused"
+        );
+    }
+
+    /// The peak is the highest allocation since the reset, not the current one.
+    #[test]
+    fn peak_allocated_bytes_keeps_the_high_water_mark() {
+        let rt = GpuRuntime::new().unwrap();
+        rt.synchronize().unwrap();
+        rt.reset_peak_allocated_bytes();
+        let base = rt.current_allocated_bytes();
+        let big = rt.alloc_buffer_hot(64 << 20).unwrap();
+        let held = rt.current_allocated_bytes();
+        assert!(held >= base + (64 << 20), "base {base} held {held}");
+        drop(big);
+        rt.synchronize().unwrap();
+        assert!(
+            rt.current_allocated_bytes() < held,
+            "a dropped Hot buffer was not released"
+        );
+        assert!(rt.peak_allocated_bytes() >= held, "the peak forgot the 64 MiB buffer");
+        rt.reset_peak_allocated_bytes();
+        assert!(rt.peak_allocated_bytes() < held, "reset kept the old peak");
     }
 
     #[test]

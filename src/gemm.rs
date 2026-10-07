@@ -17,7 +17,7 @@
 use objc2::runtime::ProtocolObject;
 use objc2_metal::MTLComputePipelineState;
 
-use crate::runtime::{mtl_size, GpuRuntime, PrecisionMode};
+use crate::runtime::{mtl_size, BufferKind, GpuRuntime, PrecisionMode};
 use crate::tensor::{DType, Tensor};
 
 #[derive(Clone, Copy)]
@@ -1165,6 +1165,58 @@ impl GemmOperands {
             Self::Bf16 => gemm_nt_bf16(a_mk, b_nk, c),
         }
     }
+
+    /// Device bytes [`Self::nn`] allocates for itself on f32 operands
+    /// `[m, k]` and `[k, n]`, at allocated sizes
+    /// ([`GpuRuntime::allocated_bytes_for`]): a bf16 copy of each under
+    /// [`Self::Bf16`], nothing under [`Self::ExactF32`]. Like every
+    /// temporary, they stay allocated until the next waited commit.
+    pub(crate) fn nn_scratch_bytes(self, m: usize, n: usize, k: usize) -> u64 {
+        match self {
+            Self::ExactF32 => 0,
+            Self::Bf16 => bf16_copies(m.saturating_mul(k), k.saturating_mul(n)),
+        }
+    }
+
+    /// As [`Self::nn_scratch_bytes`], for [`Self::tn`] (`C [m, n]`, shared
+    /// dimension `k`): under [`Self::ExactF32`], the parallel split-K's
+    /// partition scratch ([`tn_par_k_tile`]), or the transposed `A` a device
+    /// without TensorOps takes.
+    pub(crate) fn tn_scratch_bytes(self, has_tensorops: bool, m: usize, n: usize, k: usize) -> u64 {
+        match self {
+            Self::Bf16 => bf16_copies(k.saturating_mul(m), k.saturating_mul(n)),
+            Self::ExactF32 if !(USE_TN_NT_DESCRIPTORS && has_tensorops) => f32_temp(m.saturating_mul(k)),
+            Self::ExactF32 => tn_par_k_tile(m, n, k).map_or(0, |k_tile| {
+                // Each partition's slice is padded to 16 bytes.
+                let slice = m.saturating_mul(n).div_ceil(4).saturating_mul(4);
+                f32_temp(slice.saturating_mul(k.div_ceil(k_tile)))
+            }),
+        }
+    }
+
+    /// As [`Self::nn_scratch_bytes`], for [`Self::nt`] (`C [m, n]`, shared
+    /// dimension `k`): under [`Self::ExactF32`], the transposed `B` a device
+    /// without TensorOps takes.
+    pub(crate) fn nt_scratch_bytes(self, has_tensorops: bool, m: usize, n: usize, k: usize) -> u64 {
+        match self {
+            Self::Bf16 => bf16_copies(m.saturating_mul(k), n.saturating_mul(k)),
+            Self::ExactF32 if !(USE_TN_NT_DESCRIPTORS && has_tensorops) => f32_temp(k.saturating_mul(n)),
+            Self::ExactF32 => 0,
+        }
+    }
+}
+
+/// Allocated bytes of the two bf16 operand copies [`ensure_bf16`] makes.
+fn bf16_copies(a: usize, b: usize) -> u64 {
+    [a, b]
+        .iter()
+        .map(|&n| GpuRuntime::allocated_bytes_for(n.saturating_mul(2), BufferKind::Cold))
+        .fold(0, u64::saturating_add)
+}
+
+/// Allocated bytes of one f32 temporary (`alloc_temp_f32`, from the pool).
+fn f32_temp(n: usize) -> u64 {
+    GpuRuntime::allocated_bytes_for(n.saturating_mul(4), BufferKind::Cold)
 }
 
 /// The bf16 lane's preconditions: TensorOps, and an f32 destination.

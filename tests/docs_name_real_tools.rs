@@ -114,6 +114,39 @@ fn the_absent_list_does_not_name_binaries_that_exist() {
     }
 }
 
+/// The README may not say "no stubs" while the public API ships one.
+///
+/// `tessl::IcbReplayStub` is a host-side scaffold: its `try_allocate` fails
+/// with `NotWired` for the full decode graph. The Known Gaps section said
+/// "there are no stubs" regardless, and a reader who trusts that goes looking
+/// for a full-graph ICB replay that does not exist. So the claim is pinned to
+/// the behaviour: while the stub still refuses, Known Gaps must name it.
+#[test]
+fn known_gaps_names_the_icb_scaffold_the_crate_still_exports() {
+    let mut stub = tessl::IcbReplayStub::new();
+    assert_eq!(
+        stub.try_allocate(),
+        Err(tessl::CbReplayError::NotWired),
+        "full-graph ICB allocate is wired now — retire the Known Gaps row and this test"
+    );
+
+    let readme = std::fs::read_to_string(crate_root().join("README.md")).expect("README");
+    assert!(
+        !readme.to_ascii_lowercase().contains("no stubs"),
+        "README claims there are no stubs, but `tessl::IcbReplayStub` is a NotWired scaffold"
+    );
+    let gaps = readme
+        .split("## Known Gaps")
+        .nth(1)
+        .expect("README has a Known Gaps section")
+        .split("\n---")
+        .next()
+        .expect("Known Gaps section is delimited");
+    for needle in ["IcbReplayStub", "IcbStubPhase", "NotWired"] {
+        assert!(gaps.contains(needle), "Known Gaps must name `{needle}`");
+    }
+}
+
 /// The kernel counts the crate docs and README quote are the build's, not a
 /// snapshot: they said 21 sources and 83 entry points long after the Qwen3.5
 /// and cross-entropy kernels had joined the build.

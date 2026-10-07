@@ -8,6 +8,12 @@ All notable changes to `tessl` are recorded here. The format follows
 
 ### Changed
 
+- **README Known Gaps no longer claims "no stubs".** `IcbReplayStub`,
+  `IcbStubPhase` and `CbReplayError::NotWired` (`tessl::cb_replay`) are public
+  and unchanged — no API or semver impact — and full decode-graph ICB replay is
+  now listed as a gap. The `IcbStubPhase::Allocated` docs said it was
+  unreachable; it is set by a mini `DecodeIcb` attach or execute, and now says
+  so.
 - **Bf16 operands whose M does not fill a 128-row tile use the 64×64 tile.**
   An NN GEMM with bf16 operands whose $M < 128$ now dispatches
   `matmul2d_tensorops_bf16_f32_64x64_sg4` even when $N > 512$, passing $N$ as

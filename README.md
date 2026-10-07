@@ -550,14 +550,15 @@ All runtime configuration uses the canonical `TESSL_*` prefix. Legacy
 
 ## Known Gaps
 
-Recorded rather than implied. Every kernel is wired to a typed Rust API, the
-suite is warning-free, and there are no stubs; these are capabilities the crate
-does not have.
+Recorded rather than implied. Every kernel is wired to a typed Rust API and the
+suite is warning-free. One public scaffold ships unwired and is the first row
+below; the rest are capabilities the crate does not have.
 
 | Gap | Why it matters | Why not yet |
 |---|---|---|
 | **Int4 TensorOps GEMM** | Half the weight bandwidth of int8. | TensorOps itself accepts `int4b_format` — the block is the shader-side tensor constructor for a sub-byte element type, not the objc2 binding this table used to blame. `nn::gemm_i8_dequant` ships the int8 case. |
 | **No CPU fallback** | Without a Metal 4 device, nothing runs. | Deliberate. This is an Apple-silicon runtime, and a silent CPU path would make every "GPU" benchmark here meaningless. |
+| **Full decode-graph ICB replay** | Replaying a whole decode step from an indirect command buffer would skip the per-token host encode. | `IcbReplayStub` and `IcbStubPhase` (`tessl::cb_replay`) are a host-side scaffold: `try_allocate` always returns `CbReplayError::NotWired`, and `try_execute` does too until a mini `DecodeIcb` has marked the stub `Allocated`, which says nothing about the full graph. Mini and layer-level `DecodeIcb` replay is real (`PingPongCbReplay::try_replay_icb`, opt-in) but the full decode graph is not migrated: `MTL4CommandBuffer` has no replay-prior-encoding API. `cb_replay_api_gap_summary()` lists the surveyed gaps, including the opt-in ICB bind paths the module records as parked behind direct dispatch with prebuilt argument tables. |
 | **GPU CI on hosted runners** | Whether the suite runs unattended, or only on hardware I own. | Measured, not assumed: it does not. On `macos-26` the Metal Toolchain installs and every source under `kernels/` compiles and lints — the `check` job's `cargo build` does exactly that every push — but the device probe fails, so the shaders build there and cannot execute. The suite therefore runs on a gated self-hosted M5 runner. CI covers build, clippy, rustdoc and the static tile audit on every push; the tests do not run unattended. |
 | **Benchmark numbers in CI** | The GFLOP/s figures above are reproducible only by hand. | Hosted runners are virtualised and shared, so a timing from one describes the runner. The `bench` job runs the sweep on bare-metal Apple silicon and is gated behind a repository variable until such a runner is registered. |
 

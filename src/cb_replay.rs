@@ -203,15 +203,21 @@ pub enum IcbStubPhase {
     Planned,
     /// Mini smoke proved API; decode-graph allocate still deferred.
     SmokeProven,
-    /// Would hold a live decode-graph ICB — unreachable until migration lands.
+    /// A mini/layer-level [`crate::decode_icb::DecodeIcb`] is attached
+    /// ([`PingPongCbReplay::attach_decode_icb`]) or executed successfully
+    /// ([`IcbReplayStub::mark_mini_execute_ok`]). Reached today; it does **not**
+    /// mean the full decode graph has an ICB — [`IcbReplayStub::try_allocate`]
+    /// never sets it.
     Allocated,
 }
 
 /// Next-step scaffold toward compute ICB replay of the decode graph.
 ///
 /// Does not own Metal ICB objects (see [`crate::icb_smoke::IcbCopySmoke`] for the
-/// one-kernel proof). [`Self::try_allocate`] / [`Self::try_execute`] stay
-/// [`CbReplayError::NotWired`] for the full decode path.
+/// one-kernel proof). [`Self::try_allocate`] always returns
+/// [`CbReplayError::NotWired`]; [`Self::try_execute`] returns it until a mini
+/// `DecodeIcb` has moved the stub to [`IcbStubPhase::Allocated`], and even then
+/// reports only that mini path — full-graph ICB replay is not wired.
 #[derive(Clone, Debug)]
 pub struct IcbReplayStub {
     pub phase: IcbStubPhase,
@@ -262,9 +268,11 @@ impl IcbReplayStub {
         Err(CbReplayError::NotWired)
     }
 
-    /// Honest execute for **full decode graph**: fails with [`CbReplayError::NotWired`]
-    /// unless a mini [`crate::DecodeIcb`] path already marked success via
-    /// [`Self::mark_mini_execute_ok`].
+    /// Honest execute for the **full decode graph**: fails with
+    /// [`CbReplayError::NotWired`]. `Ok` only means a mini [`crate::DecodeIcb`]
+    /// already put the stub in [`IcbStubPhase::Allocated`] (via
+    /// [`Self::mark_mini_execute_ok`] or [`PingPongCbReplay::attach_decode_icb`]);
+    /// it does not run anything.
     pub fn try_execute(&mut self) -> Result<(), CbReplayError> {
         self.execute_attempts = self.execute_attempts.saturating_add(1);
         if self.phase == IcbStubPhase::Allocated {
@@ -807,6 +815,23 @@ mod tests {
         assert_eq!(stub.allocate_attempts, 1);
         assert_eq!(stub.plan.stable_count(), 5);
         assert!(stub.plan.ephemeral_count() >= 1);
+    }
+
+    /// `Allocated` is reachable (mini DecodeIcb success), yet that must not
+    /// make the full-graph allocate work: the two are different claims.
+    #[test]
+    fn allocated_phase_comes_from_mini_execute_not_from_try_allocate() {
+        let mut stub = IcbReplayStub::new();
+        assert_eq!(stub.try_execute(), Err(CbReplayError::NotWired));
+        stub.mark_mini_execute_ok();
+        assert_eq!(stub.phase, IcbStubPhase::Allocated);
+        assert_eq!(stub.try_execute(), Ok(()));
+        assert_eq!(stub.try_allocate(), Err(CbReplayError::NotWired));
+        assert_eq!(
+            stub.phase,
+            IcbStubPhase::Allocated,
+            "try_allocate must not move or reset the phase"
+        );
     }
 
     #[test]

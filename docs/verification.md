@@ -28,7 +28,7 @@ python3 scripts/audit_gemm_tiles.py
 
 ```mermaid
 flowchart LR
-    subgraph RustLand["Rust Host Side (src/gemm.rs)"]
+    subgraph RustLand["Rust Host Side (TileGeom in src/gemm.rs, dispatch sites in src/)"]
         TileDef["TileGeom Constants<br/>• TILE_COOP_DEFAULT (128x64)<br/>• TILE_COOP_NARROW (64x64)<br/>• TILE_COOP_TN_NT (128x64)<br/>• TILE_F32 (32x32)"]
     end
 
@@ -57,23 +57,29 @@ kernel, is that last case and takes its 128×64/sg4 from `mm_nn_coop_f32acc`.
 It fails closed rather than skipping:
 
 - every entry point in `matmul_tensorops.metal` must be checked or named in the
-  script's `EXEMPT` with a reason. One is exempt: `matmul2d_tensorops_i8_f32`,
-  which `src/nn.rs` dispatches with local `SM`/`SN` constants, not a `TileGeom`;
+  script's `EXEMPT` with a reason. None is exempt: `matmul2d_tensorops_i8_f32`
+  was, while `src/nn.rs` dispatched it with local `SM`/`SN` constants; it now
+  takes `TILE_COOP_DEFAULT`, and a kernel both checked and exempt fails;
+- literal `pipeline("matmul2d_tensorops_...")` calls are read from every file
+  under `src/`, not only `gemm.rs`, and one with no `TILE_*` within 12 lines
+  fails, even when its kernel is checked through another site;
 - a `*_KERNEL(` invocation it cannot parse, a pin naming a kernel that no longer
   exists, and a pinned kernel whose geometry it cannot see each fail the audit;
 - an audit that parsed no kernels, or checked no Rust dispatch pairs, fails.
 
-Its `PASS` line names what it checked. On 2026-10-06:
+Its `PASS` line names what it checked. On 2026-10-07:
 
 ```
-PASS: tile geometry: 26 kernels, 30 Rust dispatch pairs; 1 exempt (matmul2d_tensorops_i8_f32)
+PASS: tile geometry: 27 kernels, 31 Rust dispatch pairs; 0 exempt (none)
 ```
 
 Paths resolve from the script's own location, so it runs from any directory and
 from inside an extracted `.crate`. `tests/audit_gemm_tiles.rs` runs a copy of the
 script against injected faults under `cargo test`: a tile drift, a drifted
 template default, an unaccounted kernel, an unparseable kernel macro, an empty
-kernel file, and an empty `gemm.rs`. Against the script as it stood at `52c091c`,
+kernel file, an empty `gemm.rs`, a wrong tile at the `src/nn.rs` i8 dispatch,
+and that dispatch with no `TileGeom` at all. The script as it stood at
+`dade8e2` printed `PASS` on the wrong i8 tile. Against the script as it stood at `52c091c`,
 the tile drift failed, the empty `gemm.rs` crashed with a `KeyError`, and the
 other four printed `PASS`.
 
@@ -101,7 +107,7 @@ of the 27 entry points were checked; the other ten passed unexamined:
 `matmul2d_tensorops_bf16_f32` (skipped as "no compile-time SM/SN"), the two
 f16 NN kernels and three `*_batched` kernels (selected through a variable, never
 pinned), the three split-K kernels (tile argument past the 8-line pairing
-window, now 12), and `matmul2d_tensorops_i8_f32` (now exempt, above).
+window, now 12), and `matmul2d_tensorops_i8_f32` (exempt, then checked; above).
 
 tessl carries no gap ledger of its own; `GAP-TESSL-*` records live in the
 consuming project's, at `~/Code/research/Lappi-decision/gaps.jsonl`, which is

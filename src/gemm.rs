@@ -86,12 +86,16 @@ fn prefer_tn_splitk(m: usize, n: usize, k: usize) -> bool {
 }
 
 /// Tile sizes for TensorOps kernels (must match matmul_tensorops.metal).
+///
+/// `scripts/audit_gemm_tiles.py` checks each `TILE_*` against the kernel whose
+/// `pipeline("...")` call it follows, in any file under `src/`, so a dispatch
+/// outside this module takes its geometry from here, not from local constants.
 #[derive(Clone, Copy)]
-struct TileGeom {
-    sm: usize,
-    sn: usize,
+pub(crate) struct TileGeom {
+    pub(crate) sm: usize,
+    pub(crate) sn: usize,
     /// Simdgroups per TG (`execution_simdgroups<N>`). Exact f32 uses 1.
-    simdgroups: usize,
+    pub(crate) simdgroups: usize,
 }
 
 const TILE_F32: TileGeom = TileGeom {
@@ -873,7 +877,7 @@ fn run_gemm_epilogue(
 
 /// Cooperative-destination NN tile geometries (must match the NN_COOP_KERNEL
 /// instantiations in matmul_tensorops.metal).
-const TILE_COOP_DEFAULT: TileGeom = TileGeom {
+pub(crate) const TILE_COOP_DEFAULT: TileGeom = TileGeom {
     sm: 128,
     sn: 64,
     simdgroups: 4,
@@ -1716,7 +1720,7 @@ pub fn gemm_auto(a: &Tensor, b: &Tensor, c: &Tensor, backend: GemmBackend) -> Re
     gemm_train(a, b, c, backend)
 }
 
-fn threads_per_tg(pipeline: &ProtocolObject<dyn MTLComputePipelineState>, tile: TileGeom) -> usize {
+pub(crate) fn threads_per_tg(pipeline: &ProtocolObject<dyn MTLComputePipelineState>, tile: TileGeom) -> usize {
     let width = pipeline.threadExecutionWidth();
     width * tile.simdgroups
 }

@@ -1,5 +1,6 @@
 //! `scripts/audit_gemm_tiles.py` is only worth its `PASS` if it can print
-//! `FAIL`. Each case copies the script and the two files it reads into a fresh
+//! `FAIL`. Each case copies the script, the kernel source, and the two Rust
+//! files that dispatch its kernels (`gemm.rs`, `nn.rs`) into a fresh
 //! crate-shaped directory, injects one fault, and runs the copy — the script
 //! resolves its inputs from its own location, so the copy audits the faulty
 //! files, never this checkout's.
@@ -15,13 +16,14 @@ use std::process::Command;
 const SCRIPT: &str = include_str!("../scripts/audit_gemm_tiles.py");
 const METAL: &str = include_str!("../kernels/matmul_tensorops.metal");
 const GEMM_RS: &str = include_str!("../src/gemm.rs");
+const NN_RS: &str = include_str!("../src/nn.rs");
 
 struct Run {
     ok: bool,
     stdout: String,
 }
 
-fn audit(case: &str, metal: &str, gemm_rs: &str) -> Run {
+fn audit(case: &str, metal: &str, gemm_rs: &str, nn_rs: &str) -> Run {
     let root: PathBuf = Path::new(env!("CARGO_TARGET_TMPDIR"))
         .join("audit_gemm_tiles")
         .join(case);
@@ -32,6 +34,7 @@ fn audit(case: &str, metal: &str, gemm_rs: &str) -> Run {
         ("scripts/audit_gemm_tiles.py", SCRIPT),
         ("kernels/matmul_tensorops.metal", metal),
         ("src/gemm.rs", gemm_rs),
+        ("src/nn.rs", nn_rs),
     ] {
         let path = root.join(rel);
         fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -59,7 +62,7 @@ fn inject(src: &str, from: &str, to: &str) -> String {
 
 #[test]
 fn clean_tree_passes_and_names_what_it_checked() {
-    let run = audit("clean", METAL, GEMM_RS);
+    let run = audit("clean", METAL, GEMM_RS, NN_RS);
     assert!(run.ok, "the audit fails on the unmodified tree");
     let last = run.stdout.lines().rev().find(|l| !l.is_empty()).unwrap();
     assert!(
@@ -76,7 +79,7 @@ fn tile_drift_fails() {
         "const TILE_COOP_NARROW: TileGeom = TileGeom {\n    sm: 64,",
         "const TILE_COOP_NARROW: TileGeom = TileGeom {\n    sm: 32,",
     );
-    let run = audit("tile_drift", METAL, &gemm);
+    let run = audit("tile_drift", METAL, &gemm, NN_RS);
     assert!(!run.ok);
     assert!(run.stdout.contains("MISMATCH"));
 }
@@ -92,7 +95,7 @@ fn template_default_drift_fails() {
         "template <typename ElemT, int SM = 128, int SN = 64, int NSG = 4,",
         "template <typename ElemT, int SM = 256, int SN = 64, int NSG = 4,",
     );
-    let run = audit("template_default_drift", &metal, GEMM_RS);
+    let run = audit("template_default_drift", &metal, GEMM_RS, NN_RS);
     assert!(!run.ok);
     assert!(run.stdout.contains("matmul2d_tensorops_bf16_f32 "));
 }
@@ -103,7 +106,7 @@ fn template_default_drift_fails() {
 #[test]
 fn unaccounted_kernel_fails() {
     let metal = format!("{METAL}\nNN_COOP_KERNEL(matmul2d_tensorops_audit_probe, bfloat, 64, 64, 4, false)\n");
-    let run = audit("unaccounted_kernel", &metal, GEMM_RS);
+    let run = audit("unaccounted_kernel", &metal, GEMM_RS, NN_RS);
     assert!(!run.ok);
     assert!(run.stdout.contains("matmul2d_tensorops_audit_probe"));
 }
@@ -113,7 +116,7 @@ fn unaccounted_kernel_fails() {
 #[test]
 fn unparsed_kernel_macro_fails() {
     let metal = format!("{METAL}\nNN_COOP_SPLIT_KERNEL(matmul2d_tensorops_audit_probe, bfloat, 64, 64)\n");
-    let run = audit("unparsed_kernel_macro", &metal, GEMM_RS);
+    let run = audit("unparsed_kernel_macro", &metal, GEMM_RS, NN_RS);
     assert!(!run.ok);
     assert!(run.stdout.contains("NN_COOP_SPLIT_KERNEL"));
 }
@@ -121,14 +124,44 @@ fn unparsed_kernel_macro_fails() {
 /// Nothing to examine is a failure, never `PASS: 0 mismatch(es)`.
 #[test]
 fn no_kernels_fails() {
-    let run = audit("no_kernels", "", GEMM_RS);
+    let run = audit("no_kernels", "", GEMM_RS, NN_RS);
     assert!(!run.ok);
     assert!(run.stdout.contains("examined nothing"));
 }
 
 #[test]
 fn no_rust_dispatch_fails() {
-    let run = audit("no_rust_dispatch", METAL, "");
+    let run = audit("no_rust_dispatch", METAL, "", "");
     assert!(!run.ok);
     assert!(run.stdout.contains("examined nothing"));
+}
+
+/// `nn::gemm_i8_dequant` dispatches from src/nn.rs, which the audit once never
+/// read: the kernel sat in `EXEMPT` and its geometry was local constants. A
+/// wrong tile at that site has to be a `MISMATCH` like one in gemm.rs.
+#[test]
+fn tile_drift_outside_gemm_rs_fails() {
+    let nn = inject(
+        NN_RS,
+        "let tile = crate::gemm::TILE_COOP_DEFAULT;",
+        "let tile = crate::gemm::TILE_COOP_NARROW;",
+    );
+    let run = audit("tile_drift_outside_gemm_rs", METAL, GEMM_RS, &nn);
+    assert!(!run.ok);
+    assert!(run.stdout.contains("MISMATCH  matmul2d_tensorops_i8_f32"));
+}
+
+/// A literal dispatch with no TileGeom near it launches a geometry the audit
+/// cannot see, so the site fails even though nothing mismatched.
+#[test]
+fn dispatch_without_a_tile_geom_fails() {
+    let nn = inject(
+        NN_RS,
+        "let tile = crate::gemm::TILE_COOP_DEFAULT;",
+        "let tile = local_geometry();",
+    );
+    let run = audit("dispatch_without_a_tile_geom", METAL, GEMM_RS, &nn);
+    assert!(!run.ok);
+    assert!(run.stdout.contains("no TILE_* within"));
+    assert!(run.stdout.contains("src/nn.rs:"));
 }

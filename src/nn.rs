@@ -4375,13 +4375,13 @@ pub fn gemm_i8_dequant(
         None => require_disjoint_writes("gemm_i8_dequant", &[("c", c)], &[("a", a), ("b", b)])?,
     }
     let p = rt.pipeline("matmul2d_tensorops_i8_f32")?;
-    // Geometry must match the I8_DEQUANT_KERNEL instantiation.
-    const SM: usize = 128;
-    const SN: usize = 64;
-    let tiles_n = (n as usize).div_ceil(SN);
-    let tiles_m = (m as usize).div_ceil(SM);
+    // 128×64 sg4, `mm_i8_dequant_coop`'s template defaults. The tile audit
+    // pairs this `pipeline` call with the TileGeom on the next line.
+    let tile = crate::gemm::TILE_COOP_DEFAULT;
+    let tiles_n = (n as usize).div_ceil(tile.sn);
+    let tiles_m = (m as usize).div_ceil(tile.sm);
     let groups = tiles_n * tiles_m;
-    let tptg = 32 * 4; // NSG = 4 simdgroups
+    let tptg = crate::gemm::threads_per_tg(&p, tile);
     let has_scale = u32::from(b_scale.is_some());
     // Buffer 8 is declared, so it must be bound even when unread: Metal faults
     // on a declared-but-unbound buffer. `has_scale` gates the dereference.

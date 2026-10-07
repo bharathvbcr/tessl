@@ -40,10 +40,15 @@ if _stale.exists():
 
 METAL = CRATE / "kernels/matmul_tensorops.metal"
 GEMM_RS = CRATE / "src/gemm.rs"
+# Every Rust source is scanned for literal `pipeline("matmul2d_tensorops_...")`
+# dispatches, not only gemm.rs: `nn::gemm_i8_dequant` dispatches one from
+# src/nn.rs, and a site this audit did not scan is a site it did not check.
+SRC = CRATE / "src"
 
 # How far below a `pipeline("name")` line to look for the TileGeom it is
 # dispatched with. 12 reaches the split-K and accumulate call sites, whose tile
-# argument sits 8-10 lines down; every literal site pairs with its dispatch tile.
+# argument sits 8-10 lines down; every literal site pairs with its dispatch tile,
+# and one that pairs with none fails the audit.
 PAIR_WINDOW = 12
 
 # NN and coop paths select their kernel through helper functions / expressions,
@@ -73,11 +78,7 @@ NN_PAIRS = [
 # Kernels this audit deliberately does not check, each with the reason. An
 # entry whose kernel no longer exists fails the audit, so this cannot rot into
 # a list of names that once meant something.
-EXEMPT = {
-    "matmul2d_tensorops_i8_f32":
-        "dispatched from src/nn.rs (gemm_i8_dequant) with local SM/SN "
-        "constants, not a TileGeom",
-}
+EXEMPT = {}
 
 def strip_comments(src):
     """Comments carry example geometries that would otherwise match as code."""
@@ -150,34 +151,46 @@ def kernel_tiles(metal):
                               m.group(1))
     return out, unparsed
 
-def rust_tiles(rs):
-    src = strip_comments(pathlib.Path(rs).read_text())
+def rust_tiles(gemm_rs, src_dir):
+    """TileGeom constants from gemm.rs, the (kernel, TILE_*, site) pairs from
+    every literal `pipeline("matmul2d_tensorops_...")` under `src_dir`, and the
+    literal sites with no TILE_* within PAIR_WINDOW lines."""
     consts = {}
+    src = strip_comments(gemm_rs.read_text())
     for m in re.finditer(r'const (TILE_\w+): TileGeom = TileGeom \{\s*sm: (\d+),\s*sn: (\d+),\s*simdgroups: (\d+),?\s*\}', src):
         consts[m.group(1)] = (int(m.group(2)), int(m.group(3)), int(m.group(4)))
-    # pipeline("name") ... TILE_X within PAIR_WINDOW lines
-    pairs = []
-    lines = src.split('\n')
-    for i, line in enumerate(lines):
-        km = re.search(r'pipeline\("(matmul2d_tensorops_[a-z0-9_]+)"\)', line)
-        if not km:
-            continue
-        for j in range(i, min(i + PAIR_WINDOW, len(lines))):
-            tm = re.search(r'\b(TILE_\w+)\b', lines[j])
-            if tm:
-                pairs.append((km.group(1), tm.group(1), j + 1))
-                break
-    return consts, pairs
+    pairs, unpaired = [], []
+    for rs in sorted(src_dir.rglob('*.rs')):
+        rel = rs.relative_to(CRATE)
+        lines = strip_comments(rs.read_text()).split('\n')
+        for i, line in enumerate(lines):
+            km = re.search(r'pipeline\("(matmul2d_tensorops_[a-z0-9_]+)"\)', line)
+            if not km:
+                continue
+            for j in range(i, min(i + PAIR_WINDOW, len(lines))):
+                tm = re.search(r'\b(TILE_\w+)\b', lines[j])
+                if tm:
+                    pairs.append((km.group(1), tm.group(1), f"{rel}:{j + 1}"))
+                    break
+            else:
+                unpaired.append((km.group(1), f"{rel}:{i + 1}"))
+    return consts, pairs, unpaired
 
 bad = 0
 kt, unparsed = kernel_tiles(METAL)
-consts, pairs = rust_tiles(GEMM_RS)
+consts, pairs, unpaired = rust_tiles(GEMM_RS, SRC)
 print(f"\n=== {CRATE}")
 print(f"    tile constants: {consts}")
 print(f"    kernels in matmul_tensorops.metal: {len(kt)}")
 
 for u in unparsed:
     print(f"  FAIL  unparsed kernel macro {u}")
+    bad += 1
+# A literal dispatch with no TileGeom beside it launches a geometry this audit
+# cannot see. Its kernel may still be checked through another site, which is
+# exactly why the site itself has to fail.
+for kern, site in unpaired:
+    print(f"  FAIL  {kern:<44} no TILE_* within {PAIR_WINDOW} lines of pipeline() ({site})")
     bad += 1
 
 pairs = [(k, t, "pinned") for k, t in NN_PAIRS] + pairs

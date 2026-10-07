@@ -72,6 +72,54 @@ fn the_integer_accumulation_is_exact() {
     });
 }
 
+/// Once B (K×N) reaches the shader's `PANEL_MIN_B_ELEMS` = 2^23 elements on a
+/// grid that is not square with a power-of-two side, the kernel walks its
+/// 128x64 tiles in column panels of 4 tile rows (`tile_walk` in
+/// `kernels/matmul_tensorops.metal`). M = 545 is 5 tile rows (a full band
+/// and a partial one) and M = 33 one short band; both Ns leave a ragged last
+/// tile column. A is zero past its first column, so the exact answer is
+/// A[:, 0] times B[0, :], O(M·N) to check at any K. C starts as NaN, so a
+/// tile the walk skips or misplaces shows.
+#[test]
+fn column_panels_cover_every_tile_exactly() {
+    assert!(
+        include_str!("../kernels/matmul_tensorops.metal")
+            .contains("constexpr constant ulong PANEL_MIN_B_ELEMS = 1ul << 23;"),
+        "the shader's panel gate moved; update these shapes"
+    );
+    with_gpu(|rt| {
+        for &(m, n, k) in &[(545usize, 8200usize, 1024usize), (33, 8193, 1024)] {
+            assert!(n * k >= 1 << 23, "panel walk not engaged at N={n} K={k}");
+            let col = i8_data(m, 0x3_8000 + m as u64);
+            let mut a = vec![0i8; m * k];
+            for (i, &v) in col.iter().enumerate() {
+                a[i * k] = v;
+            }
+            let b = i8_data(k * n, 0x4_8000 + n as u64);
+            let ab = i8_buf(rt, &a);
+            let bb = i8_buf(rt, &b);
+            let cb = buf(rt, &vec![f32::NAN; m * n]);
+
+            nn::gemm_i8_dequant(rt, &ab, &bb, &cb, m as u32, n as u32, k as u32, 1.0, None).expect("gemm_i8_dequant");
+            rt.synchronize().unwrap();
+
+            let got = cb.read_f32();
+            let mut bad = 0usize;
+            let mut first = None;
+            for i in 0..m {
+                for j in 0..n {
+                    let want = (col[i] as i32 * b[j] as i32) as f32;
+                    if got[i * n + j] != want {
+                        bad += 1;
+                        first.get_or_insert((i, j, got[i * n + j], want));
+                    }
+                }
+            }
+            assert_eq!(bad, 0, "{m}x{n}x{k}: {bad} outputs wrong, first {first:?}");
+        }
+    });
+}
+
 #[test]
 fn the_per_column_scale_is_applied_per_column() {
     with_gpu(|rt| {

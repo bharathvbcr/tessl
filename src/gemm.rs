@@ -2944,6 +2944,215 @@ mod stress_tests {
         rt.set_precision(PrecisionMode::F32);
     }
 
+    /// Which production kernel a [`panel_walk_matches_row_major_chunks_bit_for_bit`]
+    /// case runs, with the operand element it reads.
+    #[derive(Clone, Copy, Debug)]
+    enum PanelLane {
+        NtBf16,
+        TnBf16,
+        NtAccumBf16,
+        TnAccumBf16,
+        NnF32,
+        NtF32,
+        TnF32,
+        NtAccumF32,
+        TnAccumF32,
+    }
+
+    impl PanelLane {
+        fn bf16(self) -> bool {
+            matches!(
+                self,
+                Self::NtBf16 | Self::TnBf16 | Self::NtAccumBf16 | Self::TnAccumBf16
+            )
+        }
+
+        fn accum(self) -> bool {
+            matches!(
+                self,
+                Self::NtAccumBf16 | Self::TnAccumBf16 | Self::NtAccumF32 | Self::TnAccumF32
+            )
+        }
+
+        fn layout(self) -> Layout {
+            match self {
+                Self::NnF32 => Layout::NN,
+                Self::TnBf16 | Self::TnAccumBf16 | Self::TnF32 | Self::TnAccumF32 => Layout::TN,
+                _ => Layout::NT,
+            }
+        }
+
+        /// Whether `run` at this shape is the one tiled kernel, rather than a
+        /// split-K route that would sum K in a different order.
+        fn single_dispatch(self, m: usize, n: usize, k: usize) -> bool {
+            match self {
+                Self::TnBf16 => !prefer_tn_splitk(m, n, k),
+                Self::NnF32 => nn_splitk_k_tile(m, n, k).is_none(),
+                Self::TnF32 => tn_par_k_tile(m, n, k).is_none(),
+                _ => true,
+            }
+        }
+
+        fn tile(self) -> TileGeom {
+            match self {
+                Self::NtBf16 | Self::TnBf16 => TILE_COOP_TN_NT,
+                Self::NtAccumBf16 | Self::TnAccumBf16 => TILE_COOP_ACCUM,
+                _ => TILE_F32,
+            }
+        }
+
+        /// `C (+)= op(A) op(B)` through the production entry point, or the
+        /// production accumulate pipeline (reachable from the public API only
+        /// under an A/B flag).
+        fn run(self, rt: &std::sync::Arc<GpuRuntime>, a: &Tensor, b: &Tensor, c: &Tensor) {
+            let (m, n) = (c.shape[0], c.shape[1]);
+            let k = match self.layout() {
+                Layout::TN => a.shape[0],
+                _ => a.shape[1],
+            };
+            let accum = |kernel: &str, interior: bool| {
+                let p = rt.pipeline(kernel).unwrap();
+                dispatch_tensorops_accum(rt, &p, a, b, c, m, n, k, self.tile(), interior).unwrap();
+            };
+            match self {
+                Self::NtBf16 => gemm_nt_bf16(a, b, c).unwrap(),
+                Self::TnBf16 => gemm_tn_bf16(a, b, c).unwrap(),
+                Self::NtAccumBf16 => accum("matmul2d_tensorops_nt_accum_bf16_f32", false),
+                Self::TnAccumBf16 => accum("matmul2d_tensorops_tn_accum_bf16_f32", false),
+                Self::NnF32 => gemm_f32(a, b, c, GemmBackend::TensorOps).unwrap(),
+                Self::NtF32 => gemm_nt_f32(a, b, c, GemmBackend::TensorOps).unwrap(),
+                Self::TnF32 => gemm_tn_f32(a, b, c, GemmBackend::TensorOps).unwrap(),
+                Self::NtAccumF32 => accum("matmul2d_tensorops_nt_accum_f32", true),
+                Self::TnAccumF32 => accum("matmul2d_tensorops_tn_accum_f32", true),
+            }
+        }
+    }
+
+    /// The shader's gate for the column-panel walk, in elements of B; held to
+    /// the source so the shapes below keep straddling it.
+    const PANEL_MIN_B_ELEMS: usize = 1 << 23;
+
+    /// The column-panel walk changes only the order threadgroups run in, so a
+    /// product that takes it has the bits of the same product cut into
+    /// column chunks small enough to keep the row-major walk. Every kernel
+    /// that walks by B's size is run past the gate, with ragged M and N (a
+    /// partial last band, tile row and tile column), and its chunks under it.
+    /// Two more cases are square power-of-two grids past the gate, which keep
+    /// Morton order. Plain kernels start from NaN, so a skipped tile shows;
+    /// accumulate kernels start from the same finite C, so a skipped or
+    /// doubled tile shows.
+    #[test]
+    fn panel_walk_matches_row_major_chunks_bit_for_bit() {
+        assert!(
+            include_str!("../kernels/matmul_tensorops.metal")
+                .contains("constexpr constant ulong PANEL_MIN_B_ELEMS = 1ul << 23;"),
+            "the shader's panel gate moved; update PANEL_MIN_B_ELEMS and these shapes"
+        );
+        let rt = GpuRuntime::new().expect("GpuRuntime::new");
+        assert!(rt.has_tensorops(), "requires TensorOps metallib");
+        rt.set_precision(PrecisionMode::F32);
+        let mut rng = Rng::new(0x9A2E_2026u64);
+        let lanes = [
+            PanelLane::NtBf16,
+            PanelLane::TnBf16,
+            PanelLane::NtAccumBf16,
+            PanelLane::TnAccumBf16,
+            PanelLane::NnF32,
+            PanelLane::NtF32,
+            PanelLane::TnF32,
+            PanelLane::NtAccumF32,
+            PanelLane::TnAccumF32,
+        ];
+        // (lane, m, n, k, chunk, morton). M = 2348 is 19 tile rows of 128
+        // (bands of 4: the last holds 3), 37 of 64 (bands of 8: 5) and 74 of
+        // 32 (bands of 16: 10). N leaves a partial tile column, and a last
+        // chunk wide enough (48) that f32 TN keeps its tiled kernel.
+        let mut cases: Vec<(PanelLane, usize, usize, usize, usize, bool)> = lanes
+            .iter()
+            .map(|&lane| {
+                let n = if lane.bf16() { 16432 } else { 8240 };
+                (lane, 2348, n, 1056, 2048, false)
+            })
+            .collect();
+        cases.push((PanelLane::NtBf16, 4096, 2048, 4096, 1024, true));
+        cases.push((PanelLane::NtF32, 2048, 2048, 4096, 1024, true));
+        for (lane, m, n, k, chunk, morton) in cases {
+            let t = lane.tile();
+            let (tiles_n, tiles_m) = (n.div_ceil(t.sn), m.div_ceil(t.sm));
+            assert_eq!(
+                tiles_n == tiles_m && tiles_n.is_power_of_two(),
+                morton,
+                "{lane:?} {m}x{n}"
+            );
+            assert!(n * k >= PANEL_MIN_B_ELEMS && chunk * k < PANEL_MIN_B_ELEMS);
+            for w in [n, chunk, n % chunk].into_iter().filter(|&w| w > 0) {
+                assert!(lane.single_dispatch(m, w, k), "{lane:?} {m}x{w}x{k} takes split-K");
+            }
+            let a_host: Vec<f32> = (0..m * k).map(|_| Rng::unit(&mut rng)).collect();
+            let b_host: Vec<f32> = (0..k * n).map(|_| Rng::unit(&mut rng)).collect();
+            // Stored layouts: A [M,K] or [K,M]; B [K,N] (NN, TN) or [N,K] (NT).
+            let a_shape = match lane.layout() {
+                Layout::TN => [k, m],
+                _ => [m, k],
+            };
+            let b_rows_are_n = matches!(lane.layout(), Layout::NT);
+            let b_cols = |j0: usize, w: usize| -> (Vec<f32>, [usize; 2]) {
+                if b_rows_are_n {
+                    (b_host[j0 * k..(j0 + w) * k].to_vec(), [w, k])
+                } else {
+                    let mut out = Vec::with_capacity(k * w);
+                    for p in 0..k {
+                        out.extend_from_slice(&b_host[p * n + j0..p * n + j0 + w]);
+                    }
+                    (out, [k, w])
+                }
+            };
+            let start = |i: usize, j: usize| -> f32 {
+                if lane.accum() {
+                    0.25 + ((i * 31 + j * 7) % 13) as f32 * 0.125
+                } else {
+                    f32::NAN
+                }
+            };
+            let a = upload(&rt, &mut rng, &a_shape, &a_host, lane.bf16());
+            let (b_all, b_shape) = b_cols(0, n);
+            let b = upload(&rt, &mut rng, &b_shape, &b_all, lane.bf16());
+            let c = rt.alloc_tensor_f32(&[m, n]).unwrap();
+            let c0: Vec<f32> = (0..m * n).map(|x| start(x / n, x % n)).collect();
+            c.buffer.write_f32(&c0);
+            lane.run(&rt, &a, &b, &c);
+            rt.synchronize().unwrap();
+            let whole = c.buffer.read_f32();
+            let mut mismatches = 0usize;
+            let mut first = None;
+            for j0 in (0..n).step_by(chunk) {
+                let w = chunk.min(n - j0);
+                let (b_part, b_part_shape) = b_cols(j0, w);
+                let bp = upload(&rt, &mut rng, &b_part_shape, &b_part, lane.bf16());
+                let cp = rt.alloc_tensor_f32(&[m, w]).unwrap();
+                let cp0: Vec<f32> = (0..m * w).map(|x| start(x / w, j0 + x % w)).collect();
+                cp.buffer.write_f32(&cp0);
+                lane.run(&rt, &a, &bp, &cp);
+                rt.synchronize().unwrap();
+                let part = cp.buffer.read_f32();
+                for i in 0..m {
+                    for j in 0..w {
+                        let (got, want) = (whole[i * n + j0 + j], part[i * w + j]);
+                        if got.to_bits() != want.to_bits() || !got.is_finite() {
+                            mismatches += 1;
+                            first.get_or_insert((i, j0 + j, got, want));
+                        }
+                    }
+                }
+            }
+            assert_eq!(
+                mismatches, 0,
+                "{lane:?} {m}x{n}x{k}: {mismatches} outputs differ from the row-major chunks, first {first:?}"
+            );
+        }
+        rt.set_precision(PrecisionMode::F32);
+    }
+
     /// Separate runtimes on separate threads must not corrupt each other
     /// (buffer pools, dispatch counters, pipeline caches are per-runtime).
     #[test]

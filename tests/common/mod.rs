@@ -193,10 +193,11 @@ pub fn reference(layout: Layout, a: &[f32], b: &[f32], m: usize, n: usize, k: us
 }
 
 /// Shapes that take the exact-f32 kernels' column-panel walk, which needs B
-/// (N×K) to hold at least `F32_PANEL_MIN_B_ELEMS` = 2^23 elements
-/// (`kernels/matmul_tensorops.metal`). The first has 18 tile rows (one full
-/// 16-row band and a partial one) and a ragged last tile column; the second
-/// has 2 tile rows, so its only band is short.
+/// (N×K) to hold at least `PANEL_MIN_B_ELEMS` = 2^23 elements on a tile grid
+/// that is not square with a power-of-two side (that keeps Morton order;
+/// `tile_walk` in `kernels/matmul_tensorops.metal`). The first has 18 tile
+/// rows (one full 16-row band and a partial one) and a ragged last tile
+/// column; the second has 2 tile rows, so its only band is short.
 pub const F32_PANEL_SHAPES: &[(usize, usize, usize)] = &[(545, 8200, 1024), (33, 8193, 1024)];
 
 /// Operands in `layout`'s storage order where only `p = 0` contributes: A's

@@ -128,6 +128,36 @@ All notable changes to `tessl` are recorded here. The format follows
   mapping, and all three fail when the partial-band clamp is removed. The
   speed-up itself rests on the A/B; no test pins it.
 
+- **Bf16 TN/NT and int8 GEMMs walk large B operands in column panels too.**
+  The bf16 TN/NT coop kernels (`matmul2d_tensorops_tn_bf16_f32`,
+  `_nt_bf16_f32`, `_tn_accum_bf16_f32`, `_nt_accum_bf16_f32`) and the int8
+  dequant kernel (`matmul2d_tensorops_i8_f32`, behind `nn::gemm_i8_dequant`)
+  walked tiles in Morton order on square power-of-two grids and row-major
+  otherwise, so they re-read a large B once per tile row, as the exact-f32
+  kernels did. All three families now share one walk, `tile_walk<SM>`. Once
+  `N·K ≥ 2^23` elements it takes column panels of 512 rows of C (16 tile
+  rows of 32, 4 of 128, 8 of 64), unless `tile_from_linear` walks the grid
+  in Morton order. That exception changes exact f32 too: past the gate on a
+  square power-of-two grid it took panels before and now keeps Morton. Each
+  tile's arithmetic is unchanged.
+  - **Speed:** M5 Pro, production A/B of back-to-back pairs, median of 6
+    rounds. The four controls over 2 ms read 0.99–1.00×, the three under it
+    1.04–1.06×. bf16: TN accumulate 768×50304×4096
+    took 0.60× the time, NT accumulate 4096×32768×768 0.50× and NT
+    1024×248320×2048 0.72×. int8: 0.73–0.77× with B ≥ 24 MiB, 0.91× at
+    16 MiB and 0.99–1.00× at 8–12 MiB. Exact f32 on square grids, Morton
+    against panels: 0.99–1.02×. The band and the gate come from an
+    in-process sweep against bands of 1024 and 2048 rows. The data is in
+    ojas `bench/results/2026-10-06-gemm-bf16`.
+  - **Tests:** `panel_walk_matches_row_major_chunks_bit_for_bit`
+    (`src/gemm.rs`) runs each bf16 TN/NT and exact-f32 lane past the gate. It
+    compares the result bit for bit against the same GEMM done in column
+    chunks small enough to stay under the gate. It covers ragged edges, a
+    partial band and the Morton grids. `column_panels_cover_every_tile_exactly`
+    (`tests/gemm_i8.rs`) checks int8 exactly with a rank-one A. Both fail,
+    as does `exact_f32_column_panels_cover_every_tile`, when the partial-band
+    clamp is removed. The speed-up rests on the A/B; no test pins it.
+
 ### Fixed
 
 - **Persistent buffers are no longer rounded to a power of two.** The buffer

@@ -141,13 +141,29 @@ inline uint2 tile_from_linear_panel(uint linear, uint tiles_n, uint tiles_m, uin
 
 This bounds operand $B$ rereads to $\text{tiles}_m / 8$ passes, boosting large square throughput ($4096^3$) from 24.9 TFLOP/s to 29.0 TFLOP/s on Apple M5 Pro.
 
-The exact-f32 kernels (`matmul2d_tensorops_f32`, `_tn_f32`, `_nt_f32`, `_tn_accum_f32`, `_nt_accum_f32`; 32×32 tiles, one simdgroup) take the same walk in 16-tile-row bands through `tile_walk_f32`, gated on $N \times K \ge 2^{23}$ elements rather than on the grid. Under row-major order, the threadgroups running at one time share an A tile and each read a different B tile, so all of $B$ is re-read once per 32-row tile row. A 32-row tile does 16 flop per byte of B. Once B no longer fits in cache, each pass runs at DRAM speed: a 50304×768 LM-head weight ran at ~2.3 TFLOP/s at any row count, against ~6.5 at $N \le 2304$. Interleaved A/B on M5 Pro, min of 4 runs, time relative to row-major:
+Three more kernel families take the same walk through `tile_walk<SM>`, in bands of 512 rows of C, gated on $N \times K \ge 2^{23}$ elements of B rather than on the grid:
 
-| Shape | B size | Panel time |
-|---|---:|---:|
-| NT, $N \ge 16384$, $K = 768$ | 50 MB and up | 0.39–0.47× |
-| TN, $N = 2048$, $K = 4096$ | 32 MB | 0.77× |
-| TN, $N = 768$, $K = 4096$ | 12.6 MB | ~1.08× (reason for the size gate) |
+- the exact-f32 kernels (`matmul2d_tensorops_f32`, `_tn_f32`, `_nt_f32`, `_tn_accum_f32`, `_nt_accum_f32`; 32×32 tiles, one simdgroup), in 16-tile-row bands;
+- the bf16 TN/NT coop kernels (`matmul2d_tensorops_tn_bf16_f32` and `_nt_bf16_f32`, 128×64, 4-tile-row bands; `_tn_accum_bf16_f32` and `_nt_accum_bf16_f32`, 64×64, 8-tile-row bands);
+- the int8 dequant kernel (`matmul2d_tensorops_i8_f32`, 128×64), in 4-tile-row bands.
+
+A grid that `tile_from_linear` walks in Morton order (square, with a power-of-two side) keeps Morton. On those grids, bf16 panels measured 0.98–1.04× of Morton, and exact-f32 Morton 0.99–1.02× of panels. The coop NN kernel keeps its own grid-gated 8-row walk above, and the split-K kernels walk their partitions.
+
+Under row-major order, the threadgroups running at one time share an A tile and each read a different B tile, so all of $B$ is re-read once per tile row. A 32-row tile does 16 flop per byte of B. Once B no longer fits in cache, each pass runs at DRAM speed: a 50304×768 f32 LM-head weight ran at ~2.3 TFLOP/s at any row count, against ~6.5 at $N \le 2304$. On M5 Pro, time relative to the walk each kernel had before (data in ojas `bench/results/2026-10-02-gemm` and `2026-10-06-gemm-bf16`):
+
+| Kernels | Shape | B size | Panel time |
+|---|---|---:|---:|
+| exact f32 | NT, $N \ge 16384$, $K = 768$ | 50 MB and up | 0.39–0.47× |
+| exact f32 | TN, $N = 2048$, $K = 4096$ | 32 MB | 0.77× |
+| exact f32 | TN, $N = 768$, $K = 4096$ | 12.6 MB | ~1.08× (reason for the size gate) |
+| bf16 coop | NT and TN, plain and accumulate | 24 MiB and up | 0.45–0.95× |
+| bf16 coop | NT and TN, plain and accumulate | 20 MiB | 0.73–1.01× |
+| bf16 coop | NT and TN, plain and accumulate | 16 MiB (the gate) | 0.87–1.02× |
+| int8 dequant | NN | 24 MiB and up | 0.73–0.77× |
+| int8 dequant | NN | 16 MiB | 0.91× |
+| int8 dequant | NN | 8–12 MiB (8 MiB is the gate) | 0.99–1.00× |
+
+The exact-f32 rows are interleaved A/B, min of 4 runs. The bf16 rows are an in-process sweep, the median of per-round ratios over 3–6 rounds. The int8 rows are a production A/B, the median of 6 rounds of back-to-back pairs. In that same production A/B, the bf16 LM-head shapes took 0.72× (NT, 1024×248320×2048), 0.50× (NT accumulate, 4096×32768×768) and 0.60× (TN accumulate, 768×50304×4096).
 
 ---
 

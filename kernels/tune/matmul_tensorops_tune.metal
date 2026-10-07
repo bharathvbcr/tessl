@@ -489,3 +489,123 @@ kernel void mm_bf16_nt_accum_coop_64x64_sg4(
     uint tgpig [[threadgroup_position_in_grid]]) {
     mm_bf16_nt_accum_coop(A, B, C, M, N, K, tiles_n, tgpig);
 }
+
+// =============================================================================
+// TN / NT coop over a column-panel walk: PH tile rows per band, each band
+// walked down a column before moving right, so threadgroups that run together
+// share B tiles and a B too large for the cache is read once per band rather
+// than once per tile row. The rig for the production TN/NT coop walk; the
+// row-major baselines are the mm_bf16_{tn,nt}[_accum]_coop kernels above.
+// =============================================================================
+
+inline uint2 tune_tile_from_panel(uint linear, uint tiles_n, uint tiles_m, uint ph) {
+    uint band = linear / (ph * tiles_n);
+    uint rem = linear - band * ph * tiles_n;
+    uint local_h = min(ph, tiles_m - band * ph);
+    return uint2(rem / local_h, band * ph + rem % local_h);
+}
+
+/// C[M,N] (+)= A[M,K] @ B_stored[N,K]^T over the panel walk.
+template <int SM, int SN, int NSG, int PH, bool ACCUM>
+inline void mm_bf16_nt_coop_panel(device bfloat *A, device bfloat *B,
+                                  device float *C, uint M, uint N, uint K,
+                                  uint tiles_n, uint tiles_m, uint tgpig) {
+    constexpr auto d = matmul2d_descriptor(
+        SM, SN, dynamic_length_v<int>, false, true, false,
+        matmul2d_descriptor::mode::multiply);
+    matmul2d<d, execution_simdgroups<NSG>> op;
+    if (tgpig >= tiles_n * tiles_m) return;
+    uint2 tile = tune_tile_from_panel(tgpig, tiles_n, tiles_m, (uint)PH);
+    int tx = (int)tile.x * SN;
+    int ty = (int)tile.y * SM;
+    if (tx + SN > (int)N || ty + SM > (int)M) return;
+    auto tA = tensor(A + ty * (int)K, dextents<int, 2>{(int)K, SM},
+                     array<int, 2>{1, (int)K});
+    auto tB = tensor(B + tx * (int)K, dextents<int, 2>{(int)K, SN},
+                     array<int, 2>{1, (int)K});
+    auto tC = tensor(C + ty * (int)N + tx, dextents<int, 2>{SN, SM},
+                     array<int, 2>{1, (int)N});
+    auto cT = op.template get_destination_cooperative_tensor<
+        metal::remove_addrspace_t<decltype(tA)>,
+        metal::remove_addrspace_t<decltype(tB)>, float>();
+#pragma clang loop unroll(full)
+    for (uint16_t i = 0; i < cT.get_capacity(); ++i)
+        cT.set(i, 0.0f);
+    op.run(tA, tB, cT);
+    if (ACCUM) {
+        auto prevT = op.template get_destination_cooperative_tensor<
+            metal::remove_addrspace_t<decltype(tA)>,
+            metal::remove_addrspace_t<decltype(tB)>, float>();
+        prevT.load(tC);
+#pragma clang loop unroll(full)
+        for (uint16_t i = 0; i < cT.get_capacity(); ++i) {
+            if (cT.is_valid_element(i))
+                cT[i] += prevT[i];
+        }
+    }
+    cT.store(tC);
+}
+
+/// C[M,N] (+)= A_stored[K,M]^T @ B[K,N] over the panel walk.
+template <int SM, int SN, int NSG, int PH, bool ACCUM>
+inline void mm_bf16_tn_coop_panel(device bfloat *A, device bfloat *B,
+                                  device float *C, uint M, uint N, uint K,
+                                  uint tiles_n, uint tiles_m, uint tgpig) {
+    constexpr auto d = matmul2d_descriptor(
+        SM, SN, dynamic_length_v<int>, true, false, false,
+        matmul2d_descriptor::mode::multiply);
+    matmul2d<d, execution_simdgroups<NSG>> op;
+    if (tgpig >= tiles_n * tiles_m) return;
+    uint2 tile = tune_tile_from_panel(tgpig, tiles_n, tiles_m, (uint)PH);
+    int tx = (int)tile.x * SN;
+    int ty = (int)tile.y * SM;
+    if (tx + SN > (int)N || ty + SM > (int)M) return;
+    auto tA = tensor(A + ty, dextents<int, 2>{SM, (int)K}, array<int, 2>{1, (int)M});
+    auto tB = tensor(B + tx, dextents<int, 2>{SN, (int)K}, array<int, 2>{1, (int)N});
+    auto tC = tensor(C + ty * (int)N + tx, dextents<int, 2>{SN, SM},
+                     array<int, 2>{1, (int)N});
+    auto cT = op.template get_destination_cooperative_tensor<
+        metal::remove_addrspace_t<decltype(tA)>,
+        metal::remove_addrspace_t<decltype(tB)>, float>();
+#pragma clang loop unroll(full)
+    for (uint16_t i = 0; i < cT.get_capacity(); ++i)
+        cT.set(i, 0.0f);
+    op.run(tA, tB, cT);
+    if (ACCUM) {
+        auto prevT = op.template get_destination_cooperative_tensor<
+            metal::remove_addrspace_t<decltype(tA)>,
+            metal::remove_addrspace_t<decltype(tB)>, float>();
+        prevT.load(tC);
+#pragma clang loop unroll(full)
+        for (uint16_t i = 0; i < cT.get_capacity(); ++i) {
+            if (cT.is_valid_element(i))
+                cT[i] += prevT[i];
+        }
+    }
+    cT.store(tC);
+}
+
+#define TUNE_PANEL_KERNEL(NAME, IMPL, SM, SN, NSG, PH, ACCUM)                 \
+    kernel void NAME(device bfloat *A [[buffer(0)]],                           \
+                     device bfloat *B [[buffer(1)]],                           \
+                     device float *C [[buffer(2)]],                            \
+                     constant uint &M [[buffer(3)]],                           \
+                     constant uint &N [[buffer(4)]],                           \
+                     constant uint &K [[buffer(5)]],                           \
+                     constant uint &tiles_n [[buffer(6)]],                     \
+                     constant uint &tiles_m [[buffer(7)]],                     \
+                     uint tgpig [[threadgroup_position_in_grid]]) {            \
+        IMPL<SM, SN, NSG, PH, ACCUM>(A, B, C, M, N, K, tiles_n, tiles_m,       \
+                                     tgpig);                                   \
+    }
+
+TUNE_PANEL_KERNEL(mm_bf16_nt_coop_128x64_sg4_ph4,  mm_bf16_nt_coop_panel, 128, 64, 4,  4, false)
+TUNE_PANEL_KERNEL(mm_bf16_nt_coop_128x64_sg4_ph8,  mm_bf16_nt_coop_panel, 128, 64, 4,  8, false)
+TUNE_PANEL_KERNEL(mm_bf16_nt_coop_128x64_sg4_ph16, mm_bf16_nt_coop_panel, 128, 64, 4, 16, false)
+TUNE_PANEL_KERNEL(mm_bf16_tn_coop_128x64_sg4_ph4,  mm_bf16_tn_coop_panel, 128, 64, 4,  4, false)
+TUNE_PANEL_KERNEL(mm_bf16_tn_coop_128x64_sg4_ph8,  mm_bf16_tn_coop_panel, 128, 64, 4,  8, false)
+TUNE_PANEL_KERNEL(mm_bf16_tn_coop_128x64_sg4_ph16, mm_bf16_tn_coop_panel, 128, 64, 4, 16, false)
+TUNE_PANEL_KERNEL(mm_bf16_nt_accum_coop_64x64_sg4_ph8,  mm_bf16_nt_coop_panel, 64, 64, 4,  8, true)
+TUNE_PANEL_KERNEL(mm_bf16_nt_accum_coop_64x64_sg4_ph16, mm_bf16_nt_coop_panel, 64, 64, 4, 16, true)
+TUNE_PANEL_KERNEL(mm_bf16_tn_accum_coop_64x64_sg4_ph8,  mm_bf16_tn_coop_panel, 64, 64, 4,  8, true)
+TUNE_PANEL_KERNEL(mm_bf16_tn_accum_coop_64x64_sg4_ph16, mm_bf16_tn_coop_panel, 64, 64, 4, 16, true)

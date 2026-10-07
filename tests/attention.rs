@@ -21,6 +21,7 @@ mod common;
 use common::{buf, empty, random_f32, seeded, with_gpu};
 use std::sync::Arc;
 use tessl::nn::{self, AttnDims, AttnHeadDim};
+use tessl::qwen35;
 use tessl::tensor::GpuBuffer;
 use tessl::GpuRuntime;
 
@@ -1735,4 +1736,193 @@ fn swa_d256_wrapper_owns_the_output_format_slot() {
             &want,
         );
     });
+}
+
+/// Assert every output row the mask leaves empty is exactly zero.
+///
+/// `check` against the reference already demands near-zero there; this is
+/// the stricter rule the kernels promise (`inv_l = 0` on an empty row), and
+/// a NaN from `exp(m - m_new)` on a row that has seen nothing fails it.
+#[track_caller]
+fn assert_empty_rows_zero(label: &str, got: &[f32], s: Shape, empty: impl Fn(usize) -> bool) {
+    for bi in 0..s.b {
+        for t_q in (0..s.tq).filter(|&t| empty(t)) {
+            for hi in 0..s.h {
+                let at = ((bi * s.tq + t_q) * s.h + hi) * s.d;
+                let row = &got[at..][..s.d];
+                assert!(
+                    row.iter().all(|&x| x == 0.0),
+                    "{label}: b={bi} t_q={t_q} h={hi} has no key, want zeros, got {:?}",
+                    &row[..4]
+                );
+            }
+        }
+    }
+}
+
+/// Rows with no key beside rows with keys, in every attention kernel.
+///
+/// The kernels compile with fast math, which may assume no value is infinite,
+/// so a running max seeded with `-INFINITY` and compared against it is not a
+/// guard the compiler has to keep. The case that guard existed for is a row
+/// that has seen nothing yet when a key block arrives: its rescale is
+/// `exp(m_old - m_new)` with nothing to scale. Whole-output masking (every row
+/// empty) is covered above; this puts empty and live rows in the same tile,
+/// simdgroup and key block, so each kernel's block loop, key-group combine and
+/// chunk reduce meets an empty state beside a live one:
+///
+/// * rows, SWA (h128, h256), global h512: keys start at position 5, so query
+///   rows 0..5 of a tile see nothing while rows 5.. see keys.
+/// * decode (every chunk, lane and reduce width `run_decode` sweeps): three
+///   live keys among 600, so most chunks and most key groups are empty.
+/// * Qwen3.5's tiled prefill (every tile): keys at 5.., 40 rows, a padded tail.
+/// * Qwen3.5's shared-prefix rows and decode: a query at position 2 over a
+///   320-key cache (masked keys after live ones, empty chunks, a dead row in
+///   the rows kernel's last simdgroup), and an empty cache (no key anywhere).
+#[test]
+fn rows_with_no_key_beside_rows_with_keys_are_zero_in_every_kernel() {
+    const KV_OFF: u32 = 5;
+    let empty_row = |t: usize| t < KV_OFF as usize;
+    with_gpu(|rt| {
+        for (d, window) in [(128usize, Some(6usize)), (256, Some(6)), (512, None)] {
+            let s = Shape {
+                b: 2,
+                tq: 12,
+                tkv: 12,
+                h: 4,
+                hkv: 2,
+                d,
+            };
+            for lanes in [nn::RowsLanes::R8, nn::RowsLanes::R16, nn::RowsLanes::R32] {
+                for groups in [nn::RowsGroups::G8, nn::RowsGroups::G16, nn::RowsGroups::G32] {
+                    let (rows, tiled, want) = run_rows(rt, s, window, 0, KV_OFF, 0.125, 0x7100, lanes, groups);
+                    let label = format!("d={d} r={} g={}", lanes.width(), groups.count());
+                    check(&format!("rows {label}"), &rows, &want);
+                    check(&format!("tiled {label}"), &tiled, &want);
+                    assert_empty_rows_zero(&format!("rows {label}"), &rows, s, empty_row);
+                    assert_empty_rows_zero(&format!("tiled {label}"), &tiled, s, empty_row);
+                }
+            }
+        }
+
+        for (d, window, q_off) in [(128usize, Some(3usize), 300u32), (256, Some(3), 300), (512, None, 2)] {
+            let s = Shape {
+                b: 1,
+                tq: 1,
+                tkv: 600,
+                h: 4,
+                hkv: 2,
+                d,
+            };
+            let (dec, gen, want) = run_decode(rt, s, window, q_off, 0, 0.125, 0x7200);
+            check(&format!("decode d={d} three live keys"), &dec, &want);
+            check(&format!("general d={d} three live keys"), &gen, &want);
+        }
+
+        let s = Shape {
+            b: 1,
+            tq: 40,
+            tkv: 40,
+            h: 4,
+            hkv: 2,
+            d: 256,
+        };
+        let q = random_f32(s.b * s.tq * s.h * s.d, 0x7300);
+        let k = random_f32(s.b * s.tkv * s.hkv * s.d, 0x7301);
+        let v = random_f32(s.b * s.tkv * s.hkv * s.d, 0x7302);
+        let (qb, kb, vb) = (buf(rt, &q), buf(rt, &k), buf(rt, &v));
+        let (tkv, zero, ko) = (u32_buf(rt, s.tkv as u32), u32_buf(rt, 0), u32_buf(rt, KV_OFF));
+        let dims = AttnDims {
+            batch: s.b as u32,
+            tq: s.tq as u32,
+            heads: s.h as u32,
+            heads_kv: s.hkv as u32,
+            window: 0,
+            scale: 0.125,
+        };
+        let want = reference(&q, &k, &v, s, None, 0, KV_OFF as usize, 0.125);
+        for tile in qwen35::AttnTile::ALL {
+            let ob = seeded(rt, s.b * s.tq * s.h * s.d, UNWRITTEN);
+            qwen35::attn_prefill_with_tile(rt, &qb, &kb, &vb, &ob, &tkv, &zero, &ko, dims, false, tile).unwrap();
+            rt.synchronize().unwrap();
+            let got = ob.read_f32();
+            check(&format!("qwen35 tiled {tile:?}"), &got, &want);
+            assert_empty_rows_zero(&format!("qwen35 tiled {tile:?}"), &got, s, empty_row);
+        }
+
+        prefix_attention_with_masked_keys(rt, 300, 20, 2);
+        prefix_attention_with_masked_keys(rt, 0, 0, 0);
+    });
+}
+
+/// Qwen3.5's shared-prefix rows and decode kernels with a prefix of `p` keys,
+/// `suffix_len` live suffix keys per row and queries from `q_pos`, against the
+/// f64 reference over each row's concatenated cache `prefix ‖ suffix_b`.
+fn prefix_attention_with_masked_keys(rt: &Arc<GpuRuntime>, p: usize, suffix_len: usize, q_pos: u32) {
+    const D: usize = 256;
+    const SUFFIX_CAP: usize = 24;
+    let (b, h, hkv) = (2usize, 4usize, 2usize);
+    let p_cap = p.max(1);
+    let tkv = p + suffix_len;
+    let pk = random_f32(p_cap * hkv * D, 0x7400 + p as u64);
+    let pv = random_f32(p_cap * hkv * D, 0x7401 + p as u64);
+    let sk = random_f32(b * SUFFIX_CAP * hkv * D, 0x7402);
+    let sv = random_f32(b * SUFFIX_CAP * hkv * D, 0x7403);
+    let concat = |prefix: &[f32], suffix: &[f32]| {
+        let mut out = Vec::with_capacity(b * tkv * hkv * D);
+        for bi in 0..b {
+            out.extend_from_slice(&prefix[..p * hkv * D]);
+            out.extend_from_slice(&suffix[bi * SUFFIX_CAP * hkv * D..][..suffix_len * hkv * D]);
+        }
+        out
+    };
+    let (kc, vc) = (concat(&pk, &sk), concat(&pv, &sv));
+    let (pkb, pvb, skb, svb) = (buf(rt, &pk), buf(rt, &pv), buf(rt, &sk), buf(rt, &sv));
+    let prefix = qwen35::SharedPrefix {
+        k: &pkb,
+        v: &pvb,
+        len: p as u32,
+    };
+    let (slen, qo) = (u32_buf(rt, suffix_len as u32), u32_buf(rt, q_pos));
+    for tq in [3usize, 1] {
+        let s = Shape {
+            b,
+            tq,
+            tkv,
+            h,
+            hkv,
+            d: D,
+        };
+        let q = random_f32(b * tq * h * D, 0x7404 + tq as u64);
+        let qb = buf(rt, &q);
+        let dims = AttnDims {
+            batch: b as u32,
+            tq: tq as u32,
+            heads: h as u32,
+            heads_kv: hkv as u32,
+            window: 0,
+            scale: 0.125,
+        };
+        let want = reference(&q, &kc, &vc, s, None, q_pos as usize, 0, 0.125);
+        let ob = seeded(rt, b * tq * h * D, UNWRITTEN);
+        qwen35::attn_prefix_rows(rt, &qb, prefix, &skb, &svb, &slen, &qo, &ob, dims, false).unwrap();
+        rt.synchronize().unwrap();
+        let label = format!("prefix rows P={p} S={suffix_len} q={q_pos} tq={tq}");
+        let got = ob.read_f32();
+        check(&label, &got, &want);
+        if tkv == 0 {
+            assert_empty_rows_zero(&label, &got, s, |_| true);
+        }
+        if tq == 1 {
+            let ob = seeded(rt, b * h * D, UNWRITTEN);
+            qwen35::attn_prefix_decode(rt, &qb, prefix, &skb, &svb, &slen, &qo, &ob, dims, false).unwrap();
+            rt.synchronize().unwrap();
+            let label = format!("prefix decode P={p} S={suffix_len} q={q_pos}");
+            let got = ob.read_f32();
+            check(&label, &got, &want);
+            if tkv == 0 {
+                assert_empty_rows_zero(&label, &got, s, |_| true);
+            }
+        }
+    }
 }

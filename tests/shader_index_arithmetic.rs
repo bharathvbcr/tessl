@@ -611,11 +611,11 @@ fn attn_train_offsets_are_widened() {
             "key/value plane",
         ),
         (
-            "lse_row[tid] = live ? lse[(ulong)bh * T + q0 + tid] : INFINITY;",
+            "lse_row[tid] = live ? lse[(ulong)bh * T + q0 + tid] : FLT_MAX;",
             "dq log-sum-exp read",
         ),
         (
-            "lse_col[tid] = live ? lse[(ulong)bh * T + qb + tid] : INFINITY;",
+            "lse_col[tid] = live ? lse[(ulong)bh * T + qb + tid] : FLT_MAX;",
             "dk/dv log-sum-exp read",
         ),
     ] {

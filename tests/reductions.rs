@@ -171,6 +171,50 @@ fn row_sum_and_row_max_match_a_f64_reference() {
     });
 }
 
+/// The max reductions seed from the row's own data, not from an infinity.
+///
+/// Kernels compile with fast math, which may assume no value is infinite, so
+/// the lane seed and the padding of lanes past the last simdgroup must not be
+/// `-INFINITY`. Neither may they be `-FLT_MAX`: a row of only `-inf` would
+/// then report `-FLT_MAX`. Widths around one simdgroup (lanes with no element,
+/// a partial last simdgroup) and past one threadgroup, rows of all `-inf`, and
+/// rows whose one finite entry is `-FLT_MAX` itself.
+#[test]
+fn row_max_and_softmax_of_masked_rows_never_invent_a_value() {
+    with_gpu(|rt| {
+        for cols in [1usize, 31, 33, 100, 1000, 5000] {
+            let rows = 3usize;
+            let mut x = vec![f32::NEG_INFINITY; rows * cols];
+            x[cols + cols / 2] = f32::MIN;
+            x[2 * cols + cols - 1] = -2.5;
+            let xb = buf(rt, &x);
+            let maxes = empty(rt, rows);
+            let soft = empty(rt, rows * cols);
+            nn::row_max_f32(rt, &xb, &maxes, rows as u32, cols as u32).unwrap();
+            nn::softmax_rows_f32(rt, &xb, &soft, rows as u32, cols as u32).unwrap();
+            rt.synchronize().unwrap();
+            let gm = maxes.read_f32();
+            assert_eq!(gm[0], f32::NEG_INFINITY, "cols={cols}: max of an all -inf row");
+            assert_eq!(gm[1], f32::MIN, "cols={cols}: max whose only finite entry is f32::MIN");
+            assert_eq!(gm[2], -2.5, "cols={cols}: max whose only finite entry is -2.5");
+            let got = soft.read_f32();
+            let uniform = 1.0 / cols as f32;
+            for (c, g) in got[..cols].iter().enumerate() {
+                assert!(
+                    (g - uniform).abs() <= 1e-6 * uniform.max(1.0),
+                    "cols={cols}: masked row [{c}] = {g}, want {uniform}"
+                );
+            }
+            for r in 1..rows {
+                let want = softmax_ref(&x[r * cols..(r + 1) * cols]);
+                for (c, (g, w)) in got[r * cols..(r + 1) * cols].iter().zip(&want).enumerate() {
+                    assert!((g - w).abs() <= 1e-6, "cols={cols} row {r} [{c}] = {g}, want {w}");
+                }
+            }
+        }
+    });
+}
+
 #[test]
 fn reductions_reject_empty_and_undersized_operands() {
     with_gpu(|rt| {

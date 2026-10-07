@@ -179,6 +179,42 @@ fn argmax_f32_pass_refuses_a_nonfinite_row() {
     });
 }
 
+/// The argmax kernels' unused lanes never win, whatever the real logits are.
+///
+/// A row shorter than the threadgroup leaves lanes with no logit, and they
+/// used to be padded with `-INFINITY`, which fast math may assume never
+/// occurs. Here the one finite logit is `f32::MIN` (twice, so the lower index
+/// must win the tie) among NaN and ±inf, so a pad value of `-FLT_MAX` that
+/// competed would tie with it, and an index carried from a pad lane would be
+/// returned instead of 1.
+#[test]
+fn argmax_padding_lanes_never_beat_the_lowest_finite_logit() {
+    with_gpu(|rt| {
+        let logits = [f32::NAN, f32::MIN, f32::INFINITY, f32::MIN, f32::NEG_INFINITY];
+        let n = logits.len() as u32;
+        let uncapped = buf(rt, &[0.0]);
+
+        let lb = buf(rt, &logits);
+        let groups = nn::argmax_pass_groups(n);
+        let idx = buf_u32(rt, &vec![0u32; groups]);
+        let val = empty(rt, groups);
+        nn::argmax_f32_pass(rt, &lb, &idx, &val, None, &uncapped, n).unwrap();
+        rt.synchronize().unwrap();
+        assert_eq!(idx.read_u32()[0], 1, "argmax_f32_pass");
+        assert_eq!(val.read_f32()[0], f32::MIN, "argmax_f32_pass value");
+
+        let out = buf_u32(rt, &[7]);
+        nn::softcap_argmax_one_pass(rt, &lb, &out, &uncapped, n).unwrap();
+        rt.synchronize().unwrap();
+        assert_eq!(out.read_u32()[0], 1, "softcap_argmax_one_pass");
+
+        let out = buf_u32(rt, &[7]);
+        nn::softcap_sample(rt, &lb, &out, &buf(rt, &[30.0]), n).unwrap();
+        rt.synchronize().unwrap();
+        assert_eq!(out.read_u32()[0], 1, "softcap_sample");
+    });
+}
+
 // ---------------------------------------------------- Embedding lookup ---
 
 #[test]

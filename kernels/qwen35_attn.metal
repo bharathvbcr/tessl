@@ -358,7 +358,9 @@ kernel void qwen35_attn_prefix_rows(
     float4 q_reg[DPV];
     float4 acc[DPV];
     for (uint j = 0; j < DPV; ++j) { acc[j] = float4(0.0f); }
-    float m_i = -INFINITY;
+    // -FLT_MAX and `l_i > 0` as the seen flag, as in flash_attn_rows: fast
+    // math may assume no value is infinite.
+    float m_i = -FLT_MAX;
     float l_i = 0.0f;
 
     if (0ul < t_end) {
@@ -385,19 +387,17 @@ kernel void qwen35_attn_prefix_rows(
             for (uint off = R / 2u; off > 0u; off >>= 1) {
                 part += simd_shuffle_xor(part, off);
             }
-            float s = part * scale;
-            if (!row_live || (ulong)t > q_abs) {
-                s = -INFINITY;
-            }
+            const bool live = row_live && (ulong)t <= q_abs;
+            const float s = live ? part * scale : -FLT_MAX;
             const float m_new = max(m_i, s);
-            const float alpha = (m_i == -INFINITY) ? 0.0f : exp(m_i - m_new);
-            const float p = (s == -INFINITY) ? 0.0f : exp(s - m_new);
+            const float alpha = (l_i > 0.0f) ? exp(m_i - m_new) : 0.0f;
+            const float p = live ? exp(s - m_new) : 0.0f;
             device const float4 *V4 = (device const float4 *)(Vb + kv_base);
             for (uint j = 0; j < DPV; ++j) {
                 acc[j] = acc[j] * alpha + p * V4[dl + j * R];
             }
             l_i = l_i * alpha + p;
-            m_i = (m_new == -INFINITY) ? -INFINITY : m_new;
+            m_i = m_new;
         }
     }
 
@@ -508,7 +508,7 @@ kernel void qwen35_attn_prefix_decode_partial(
 
     float4 acc[DPV];
     for (uint j = 0; j < DPV; ++j) { acc[j] = float4(0.0f); }
-    float m_i = -INFINITY;
+    float m_i = -FLT_MAX;
     float l_i = 0.0f;
 
     // Live key sub-range of this chunk: [0, q_abs] is the causal rule.
@@ -518,9 +518,10 @@ kernel void qwen35_attn_prefix_decode_partial(
     const uint stride0 = D + 2u;
     const ulong base0 = (bh * prefix_decode_chunk_stride(P, suffix_cap) + chunk) * stride0;
     if (lo_i >= hi_i) {
-        // Chunk fully masked; uniform across the simdgroup.
+        // Chunk fully masked; uniform across the simdgroup. `l = 0` is what
+        // marks it empty to the reduce.
         if (lane == 0u) {
-            partials[base0] = -INFINITY;
+            partials[base0] = -FLT_MAX;
             partials[base0 + 1u] = 0.0f;
         }
         for (uint d = lane; d < D; d += 32u) {
@@ -551,11 +552,11 @@ kernel void qwen35_attn_prefix_decode_partial(
         for (uint off = R / 2u; off > 0u; off >>= 1) {
             part += simd_shuffle_xor(part, off);
         }
-        float s = part * scale;
-        if (t >= live) { s = -INFINITY; }
+        const bool key_live = t < live;
+        const float s = key_live ? part * scale : -FLT_MAX;
         const float m_new = max(m_i, s);
-        const float alpha = (m_i == -INFINITY) ? 0.0f : exp(m_i - m_new);
-        const float p = (s == -INFINITY) ? 0.0f : exp(s - m_new);
+        const float alpha = (l_i > 0.0f) ? exp(m_i - m_new) : 0.0f;
+        const float p = key_live ? exp(s - m_new) : 0.0f;
         device const float4 *V4 = (device const float4 *)(Vb + kv_base);
         for (uint j = 0; j < DPV; ++j) {
             acc[j] = acc[j] * alpha + p * V4[dl + j * R];
@@ -569,7 +570,9 @@ kernel void qwen35_attn_prefix_decode_partial(
     for (uint off = R; off < 32u; off <<= 1) {
         m_all = max(m_all, simd_shuffle_xor(m_all, off));
     }
-    const float w = (m_i == -INFINITY || m_all == -INFINITY) ? 0.0f : exp(m_i - m_all);
+    // A key group that saw nothing (l_i == 0) has nothing to weight. At
+    // least one group saw a key (the chunk is not empty), so m_all is real.
+    const float w = (l_i > 0.0f) ? exp(m_i - m_all) : 0.0f;
     float l_all = l_i * w;
     for (uint off = R; off < 32u; off <<= 1) {
         l_all += simd_shuffle_xor(l_all, off);
@@ -623,16 +626,20 @@ kernel void qwen35_attn_prefix_decode_reduce(
     const uint stride = D + 2u;
     const ulong chunk0 = (ulong)bh * prefix_decode_chunk_stride(P, suffix_cap);
 
-    float m_all = -INFINITY;
+    // A chunk with `l == 0` saw no key (the partial pass's empty marker);
+    // only the others enter the max and the sums. No such chunk at all means
+    // the row is empty and the output is zeros.
+    float m_all = -FLT_MAX;
     for (uint c = 0; c < n_chunks; ++c) {
-        m_all = max(m_all, partials[(chunk0 + c) * stride]);
+        if (partials[(chunk0 + c) * stride + 1u] > 0.0f) {
+            m_all = max(m_all, partials[(chunk0 + c) * stride]);
+        }
     }
     float l_all = 0.0f;
-    if (m_all != -INFINITY) {
-        for (uint c = 0; c < n_chunks; ++c) {
-            const float m_c = partials[(chunk0 + c) * stride];
-            if (m_c == -INFINITY) { continue; }
-            l_all += partials[(chunk0 + c) * stride + 1u] * exp(m_c - m_all);
+    for (uint c = 0; c < n_chunks; ++c) {
+        const float l_c = partials[(chunk0 + c) * stride + 1u];
+        if (l_c > 0.0f) {
+            l_all += l_c * exp(partials[(chunk0 + c) * stride] - m_all);
         }
     }
     const float inv_l = (l_all > 0.0f) ? (1.0f / l_all) : 0.0f;
@@ -640,12 +647,10 @@ kernel void qwen35_attn_prefix_decode_reduce(
     device bfloat *Ob = (device bfloat *)O;
     for (uint d = lid; d < D; d += width) {
         float a = 0.0f;
-        if (m_all != -INFINITY) {
-            for (uint c = 0; c < n_chunks; ++c) {
-                const ulong base = (chunk0 + c) * stride;
-                const float m_c = partials[base];
-                if (m_c == -INFINITY) { continue; }
-                a += partials[base + 2u + d] * exp(m_c - m_all);
+        for (uint c = 0; c < n_chunks; ++c) {
+            const ulong base = (chunk0 + c) * stride;
+            if (partials[base + 1u] > 0.0f) {
+                a += partials[base + 2u + d] * exp(partials[base] - m_all);
             }
         }
         const float o = a * inv_l;

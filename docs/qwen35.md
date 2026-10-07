@@ -339,7 +339,14 @@ float `select`, may be optimised away.
   `1 + e^x` plus the fast `log` near 1 is off by 1–60% for `x` in [−15, −8],
   and `a + dt_bias` lands there routinely (Qwen's `dt_bias` sits around −2 to
   −7). Below −3 the kernel uses the 8-term `log1p` series, and above that
-  `precise::log`.
+  `precise::log`. No kernel spells `INFINITY` in code either, since `build.rs`
+  passes `-fmetal-math-mode=fast` and the compiler may fold a compare against
+  it. Running maxima start at `-FLT_MAX`. Whether a row has seen a key is
+  `l > 0` (the attention kernels) or a `first` flag (cross-entropy), and a
+  masked score's weight is zeroed by its mask, not by its value. A row with
+  no key saves `FLT_MAX` as its log-sum-exp, and the backward gives that row
+  no probability. Plain max reductions seed from the row's own data.
+  `tests/kernel_fast_math.rs` fails on any `INFINITY` left in kernel code.
 - **Chunk-local cumulative decay** is summed in fp32, as transformers sums it.
   After a step with a large decay, later small differences `G_i − G_j` lose
   relative precision, in both implementations alike. The token-by-token decode
@@ -1074,11 +1081,6 @@ is the largest non-GEMM share: 18 × 1.4 ms.
   heads outnumber their key heads, and bf16
   storage: weights, activations and gradients stay f32 (bf16 GEMM operands
   are an option, see "A training step"), and a bf16-loaded model is refused.
-- **Fast math.** Metal compiles with fast math on by default. The attention
-  kernels seed their running maxima with `-INFINITY`; nothing measured
-  misbehaves, but under fast math the compiler may assume no infinities.
-  The cross-entropy kernels use `-FLT_MAX` and a `first` flag instead, which
-  is the pattern to move the attention kernels to.
 - **Exact f32 at the MLP up/gate shape.** Production's exact-f32 NN runs
   2048 x 6144 x 2048 at 4.1 TFLOP/s against 5.7 at 2048^3, and a
   register-accumulator 128x64 sg8 tile runs it 1.45x faster with the same

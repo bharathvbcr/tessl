@@ -92,7 +92,9 @@ kernel void flash_attn_global_h512(
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    float m_i = -INFINITY;
+    // -FLT_MAX and `l_i > 0` as the seen flag, as in flash_attn_swa_h128:
+    // fast math may assume no value is infinite.
+    float m_i = -FLT_MAX;
     float l_i = 0.0f;
 
     const ulong q_abs = q_pos_offset + (ulong)t_q;
@@ -137,34 +139,25 @@ kernel void flash_attn_global_h512(
         }
 
         if (row_valid) {
-            float m_block = -INFINITY;
+            float m_block = -FLT_MAX;
             for (uint tk = 0; tk < n_k; ++tk) {
                 const ulong k_abs = kv_pos_offset + (ulong)t_k0 + tk;
-                float score = scores[lid * BC + tk] * scale;
-                if (k_abs > q_abs) {
-                    score = -INFINITY;
-                }
+                const bool live = k_abs <= q_abs;
+                const float score = live ? scores[lid * BC + tk] * scale : -FLT_MAX;
                 scores[lid * BC + tk] = score;
                 m_block = max(m_block, score);
             }
             const float m_new = max(m_i, m_block);
-            // `exp(m_i - m_new)` is `exp(-inf - -inf)` = `exp(NaN)` = NaN when
-            // this row has seen nothing yet and this block is entirely masked
-            // for it. That happens whenever the block-level skip admits a block
-            // on behalf of another row in the same BR tile — the union window
-            // is computed over the whole tile, so a block needed by the last
-            // row can be fully masked for the first. The NaN then propagated
-            // through `Oacc *= alpha` and `l_i` and poisoned the row.
-            //
-            // `m_i == -inf` means the accumulator is still zero, so scaling it
-            // by zero is exactly right, and it also covers the ordinary
-            // first-real-block case where `exp(-inf - finite)` is already 0.
-            const float alpha = (m_i == -INFINITY) ? 0.0f : exp(m_i - m_new);
+            // A row with nothing seen yet can meet a block that is fully
+            // masked for it, here when keys start past its position; see
+            // flash_attn_swa_h128. `l_i == 0` means the accumulator is still
+            // zero, so its rescale is exactly zero.
+            const float alpha = (l_i > 0.0f) ? exp(m_i - m_new) : 0.0f;
             float l_block = 0.0f;
             for (uint tk = 0; tk < n_k; ++tk) {
-                float p = (scores[lid * BC + tk] > -INFINITY)
-                    ? exp(scores[lid * BC + tk] - m_new)
-                    : 0.0f;
+                const ulong k_abs = kv_pos_offset + (ulong)t_k0 + tk;
+                const bool live = k_abs <= q_abs;
+                const float p = live ? exp(scores[lid * BC + tk] - m_new) : 0.0f;
                 scores[lid * BC + tk] = p;
                 l_block += p;
             }

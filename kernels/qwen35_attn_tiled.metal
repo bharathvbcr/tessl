@@ -94,8 +94,13 @@ inline void attn_tiled_body(
 #pragma clang loop unroll(full)
     for (uint16_t i = 0; i < oT.get_capacity(); ++i) { oT[i] = 0.0f; }
 
+    // -FLT_MAX, not -INFINITY: kernels compile with fast math, which may
+    // assume no value is infinite. `l_row > 0` is a row's "has seen a key"
+    // flag (the block maximum contributes exp(0) = 1, and l never drops below
+    // 1 after that), and a masked score's weight is zeroed by its mask, never
+    // by comparing the score against a sentinel.
     if (tid < (uint)BQ) {
-        m_row[tid] = -INFINITY;
+        m_row[tid] = -FLT_MAX;
         l_row[tid] = 0.0f;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -117,28 +122,26 @@ inline void attn_tiled_body(
         // of a row are adjacent lanes of one simdgroup, so the row max and sum
         // are xor-butterflies over them.
         float s_loc[CPT];
-        float mx = -INFINITY;
+        bool live[CPT];
+        float mx = -FLT_MAX;
         for (int j = 0; j < CPT; ++j) {
             const uint c = part * (uint)CPT + (uint)j;
             const uint t = kb + c;
-            float s = S[r * (uint)BK + c] * scale;
-            if (!row_live || t >= t_end || kv_off + (ulong)t > q_abs) {
-                s = -INFINITY;
-            }
-            s_loc[j] = s;
-            mx = max(mx, s);
+            live[j] = row_live && t < t_end && kv_off + (ulong)t <= q_abs;
+            s_loc[j] = live[j] ? S[r * (uint)BK + c] * scale : -FLT_MAX;
+            mx = max(mx, s_loc[j]);
         }
         for (uint off = (uint)TPR / 2u; off > 0u; off >>= 1) {
             mx = max(mx, simd_shuffle_xor(mx, (ushort)off));
         }
         const float m_old = m_row[r];
         const float m_new = max(m_old, mx);
-        // exp(-inf - -inf) is NaN; a row that has seen nothing has a zero
-        // accumulator, so its rescale is exactly zero.
-        const float alpha = (m_old == -INFINITY) ? 0.0f : exp(m_old - m_new);
+        // A row that has seen nothing has a zero accumulator, so its rescale
+        // is exactly zero.
+        const float alpha = (l_row[r] > 0.0f) ? exp(m_old - m_new) : 0.0f;
         float sum = 0.0f;
         for (int j = 0; j < CPT; ++j) {
-            const float p = (s_loc[j] == -INFINITY) ? 0.0f : exp(s_loc[j] - m_new);
+            const float p = live[j] ? exp(s_loc[j] - m_new) : 0.0f;
             S[r * (uint)BK + part * (uint)CPT + (uint)j] = p;
             sum += p;
         }
@@ -175,10 +178,11 @@ inline void attn_tiled_body(
     }
     // The training forward also keeps each row's log-sum-exp of the scaled
     // scores, `[B, H, Tq]`, for the backward to rebuild P from. A row with
-    // nothing unmasked gets +inf, so exp(s - lse) is 0 there.
+    // nothing unmasked gets FLT_MAX, the finite stand-in for +inf, which the
+    // backward treats as "no probability anywhere in this row".
     if (lse != nullptr && tid < nq) {
         const float l = l_row[tid];
-        lse[(ulong)bh * Tq + q0 + tid] = (l > 0.0f) ? m_row[tid] + precise::log(l) : INFINITY;
+        lse[(ulong)bh * Tq + q0 + tid] = (l > 0.0f) ? m_row[tid] + precise::log(l) : FLT_MAX;
     }
     if (out_bf16 != 0u) {
         auto mO = tensor((device bfloat *)O + q_base, dextents<int, 2>{D, (int)Tq},

@@ -61,6 +61,11 @@ inline float reduce_row_add(
 
 /// Maximum of `v` across the threadgroup, returned in every lane. Same
 /// structure and scratch contract as [`reduce_row_add`].
+///
+/// Lanes past the last simdgroup take simdgroup 0's partial rather than an
+/// identity: max is idempotent, so a duplicate changes nothing, and it keeps
+/// an infinity out of the code (fast math may assume none occurs) without
+/// inventing `-FLT_MAX` for a row whose every value is `-inf`.
 inline float reduce_row_max(
     float v,
     threadgroup float *scratch,
@@ -73,6 +78,6 @@ inline float reduce_row_max(
     if (n_sg == 1u) return v;
     if (lane == 0u) scratch[sgid] = v;
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    const float partial = lane < n_sg ? scratch[lane] : -INFINITY;
+    const float partial = scratch[lane < n_sg ? lane : 0u];
     return simd_max(partial);
 }

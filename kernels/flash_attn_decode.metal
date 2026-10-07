@@ -142,7 +142,9 @@ kernel void NAME(                                                             \
                                                                               \
     float4 acc[DPV];                                                          \
     for (uint j = 0; j < DPV; ++j) { acc[j] = float4(0.0f); }                 \
-    float m_i = -INFINITY;                                                    \
+    /* -FLT_MAX and `l_i > 0` as the seen flag, as in flash_attn_rows: fast   \
+       math may assume no value is infinite. */                               \
+    float m_i = -FLT_MAX;                                                     \
     float l_i = 0.0f;                                                         \
                                                                               \
     /* Live key sub-range of this chunk, in local indices. Tq == 1, so the    \
@@ -167,9 +169,10 @@ kernel void NAME(                                                             \
     const ulong base0 = (bh * n_chunks + chunk) * stride0;                    \
     if (lo_i >= hi_i) {                                                       \
         /* Chunk fully masked. Uniform across the simdgroup, so returning     \
-           here cannot strand a butterfly mid-flight. */                      \
+           here cannot strand a butterfly mid-flight. `l = 0` is what marks   \
+           it empty to the reduce. */                                         \
         if (lane == 0u) {                                                     \
-            partials[base0] = -INFINITY;                                      \
+            partials[base0] = -FLT_MAX;                                       \
             partials[base0 + 1u] = 0.0f;                                      \
         }                                                                     \
         for (uint d = lane; d < (D); d += SIMD_W) {                           \
@@ -197,11 +200,11 @@ kernel void NAME(                                                             \
         for (uint off = (R) / 2u; off > 0u; off >>= 1) {                      \
             part += simd_shuffle_xor(part, off);                              \
         }                                                                     \
-        float s = part * scale;                                               \
-        if (t >= live) { s = -INFINITY; }                                     \
+        const bool key_live = t < live;                                       \
+        const float s = key_live ? part * scale : -FLT_MAX;                   \
         const float m_new = max(m_i, s);                                      \
-        const float alpha = (m_i == -INFINITY) ? 0.0f : exp(m_i - m_new);     \
-        const float p = (s == -INFINITY) ? 0.0f : exp(s - m_new);             \
+        const float alpha = (l_i > 0.0f) ? exp(m_i - m_new) : 0.0f;           \
+        const float p = key_live ? exp(s - m_new) : 0.0f;                     \
         device const float4 *V4 = (device const float4 *)(V + kv_base);       \
         for (uint j = 0; j < DPV; ++j) {                                      \
             acc[j] = acc[j] * alpha + p * V4[dl + j * (R)];                   \
@@ -218,11 +221,9 @@ kernel void NAME(                                                             \
     for (uint off = (R); off < SIMD_W; off <<= 1) {                           \
         m_all = max(m_all, simd_shuffle_xor(m_all, off));                     \
     }                                                                         \
-    /* Both -inf means this group contributed nothing; exp(-inf - -inf) would \
-       be NaN and the weight is exactly zero. */                              \
-    const float w = (m_i == -INFINITY || m_all == -INFINITY)                  \
-        ? 0.0f                                                                \
-        : exp(m_i - m_all);                                                   \
+    /* A group that saw no key (l_i == 0) contributes nothing. At least one   \
+       group saw a key (the chunk is not empty), so m_all is a real score. */ \
+    const float w = (l_i > 0.0f) ? exp(m_i - m_all) : 0.0f;                   \
     float l_all = l_i * w;                                                    \
     for (uint off = (R); off < SIMD_W; off <<= 1) {                           \
         l_all += simd_shuffle_xor(l_all, off);                                \
@@ -291,19 +292,20 @@ kernel void NAME(                                                             \
     const uint stride = D + 2u;                                              \
     const ulong chunk0 = (ulong)bh * n_chunks;                                \
                                                                               \
-    float m_all = -INFINITY;                                                  \
+    /* A chunk with l == 0 saw no key (the partial pass's empty marker), and  \
+       only the others enter the max and the sums. Every chunk empty leaves   \
+       l_all = 0 and zeros out, which is what the general kernels emit. */    \
+    float m_all = -FLT_MAX;                                                   \
     for (uint c = 0; c < n_chunks; ++c) {                                     \
-        m_all = max(m_all, partials[(chunk0 + c) * stride]);                  \
+        if (partials[(chunk0 + c) * stride + 1u] > 0.0f) {                    \
+            m_all = max(m_all, partials[(chunk0 + c) * stride]);              \
+        }                                                                     \
     }                                                                         \
-    /* Every chunk masked: the general kernels emit zeros rather than NaN,    \
-       and exp(-inf - -inf) below would be NaN, so this is both the matching  \
-       behaviour and the safe one. */                                         \
     float l_all = 0.0f;                                                       \
-    if (m_all != -INFINITY) {                                                 \
-        for (uint c = 0; c < n_chunks; ++c) {                                 \
-            const float m_c = partials[(chunk0 + c) * stride];                \
-            if (m_c == -INFINITY) { continue; }                               \
-            l_all += partials[(chunk0 + c) * stride + 1u] * exp(m_c - m_all); \
+    for (uint c = 0; c < n_chunks; ++c) {                                     \
+        const float l_c = partials[(chunk0 + c) * stride + 1u];               \
+        if (l_c > 0.0f) {                                                     \
+            l_all += l_c * exp(partials[(chunk0 + c) * stride] - m_all);      \
         }                                                                     \
     }                                                                         \
     const float inv_l = (l_all > 0.0f) ? (1.0f / l_all) : 0.0f;               \
@@ -311,12 +313,10 @@ kernel void NAME(                                                             \
     device bfloat *Ob = (device bfloat *)O;                                   \
     for (uint d = lid; d < (D); d += width) {                                 \
         float a = 0.0f;                                                       \
-        if (m_all != -INFINITY) {                                             \
-            for (uint c = 0; c < n_chunks; ++c) {                             \
-                const ulong base = (chunk0 + c) * stride;                     \
-                const float m_c = partials[base];                             \
-                if (m_c == -INFINITY) { continue; }                           \
-                a += partials[base + 2u + d] * exp(m_c - m_all);              \
+        for (uint c = 0; c < n_chunks; ++c) {                                 \
+            const ulong base = (chunk0 + c) * stride;                         \
+            if (partials[base + 1u] > 0.0f) {                                 \
+                a += partials[base + 2u + d] * exp(partials[base] - m_all);   \
             }                                                                 \
         }                                                                     \
         const float o = a * inv_l;                                            \

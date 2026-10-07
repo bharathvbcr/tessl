@@ -16,6 +16,7 @@ use common::{buf, buf_u32, random_f32, seeded, with_gpu};
 use tessl::attn_train::{
     attn_train_backward, attn_train_forward, AttnTrainDims, AttnTrainGrads, AttnTrainWorkspace, ATTN_TRAIN_HEAD_DIM,
 };
+use tessl::dispatch::{dispatch_2d_tg, set_f32, set_gpu_buf, set_u32};
 use tessl::nn::AttnDims;
 use tessl::qwen35;
 use tessl::GpuRuntime;
@@ -50,6 +51,13 @@ fn dot(a: &[f64], b: &[f64]) -> f64 {
 
 /// `(o, lse)` of causal grouped attention, in f64.
 fn attn_fwd(s: &Shape, q: &[f64], k: &[f64], v: &[f64]) -> (Vec<f64>, Vec<f64>) {
+    attn_fwd_kv_off(s, q, k, v, 0)
+}
+
+/// [`attn_fwd`] with key `j` at position `kv_off + j`: row `t` sees keys
+/// `j <= t - kv_off`. A row that sees none keeps `o = 0` and gets `lse = NaN`,
+/// which no kernel value equals, so a caller must check those rows itself.
+fn attn_fwd_kv_off(s: &Shape, q: &[f64], k: &[f64], v: &[f64], kv_off: usize) -> (Vec<f64>, Vec<f64>) {
     let d = s.d;
     let mut o = vec![0.0; q.len()];
     let mut lse = vec![0.0; s.b * s.hq * s.t];
@@ -57,8 +65,14 @@ fn attn_fwd(s: &Shape, q: &[f64], k: &[f64], v: &[f64]) -> (Vec<f64>, Vec<f64>) 
         for h in 0..s.hq {
             let g = s.kv_head(h);
             for t in 0..s.t {
+                if t < kv_off {
+                    lse[(b * s.hq + h) * s.t + t] = f64::NAN;
+                    continue;
+                }
                 let qr = &q[s.qi(b, t, h)..][..d];
-                let sc: Vec<f64> = (0..=t).map(|j| s.scale * dot(qr, &k[s.ki(b, j, g)..][..d])).collect();
+                let sc: Vec<f64> = (0..=t - kv_off)
+                    .map(|j| s.scale * dot(qr, &k[s.ki(b, j, g)..][..d]))
+                    .collect();
                 let m = sc.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
                 let z: f64 = sc.iter().map(|x| (x - m).exp()).sum();
                 lse[(b * s.hq + h) * s.t + t] = m + z.ln();
@@ -262,6 +276,185 @@ fn training_attention_matches_the_reference() {
         run(rt, 2, 33, 4, 2, 13); // a one-row block, two batch rows, grouped heads
         run(rt, 1, 100, 8, 2, 14); // the 2B's heads
         run(rt, 2, 130, 2, 1, 15);
+    });
+}
+
+/// The log-sum-exp the forward saves for a row with no key: `f32::MAX`, not
+/// `+inf`, because the kernels compile with fast math, which may assume no
+/// value is infinite (`qwen35_attn_tiled.metal`).
+const EMPTY_ROW_LSE: f32 = f32::MAX;
+
+/// Keys of [`EmptyRowCase`] start at this position, so query rows `0..5`
+/// have no key.
+const EMPTY_KV_OFF: usize = 5;
+
+/// One batch row, T = 40 (one full query block and a 24-row padded tail),
+/// two query heads on one KV head, scores of a few units.
+struct EmptyRowCase {
+    s: Shape,
+    dm: AttnTrainDims,
+    q: Vec<f32>,
+    k: Vec<f32>,
+    v: Vec<f32>,
+    qb: tessl::GpuBuffer,
+    kb: tessl::GpuBuffer,
+    vb: tessl::GpuBuffer,
+}
+
+impl EmptyRowCase {
+    fn new(rt: &Arc<GpuRuntime>) -> Self {
+        let (b, t, hq, hkv) = (1usize, 40usize, 2usize, 1usize);
+        let dm = dims(b, t, hq, hkv);
+        let s = Shape {
+            b,
+            t,
+            hq,
+            hkv,
+            d: D,
+            scale: f64::from(dm.scale),
+        };
+        let q: Vec<f32> = random_f32(b * t * hq * D, 70).iter().map(|x| 3.0 * x).collect();
+        let k: Vec<f32> = random_f32(b * t * hkv * D, 71).iter().map(|x| 3.0 * x).collect();
+        let v = random_f32(b * t * hkv * D, 72);
+        let (qb, kb, vb) = (buf(rt, &q), buf(rt, &k), buf(rt, &v));
+        Self {
+            s,
+            dm,
+            q,
+            k,
+            v,
+            qb,
+            kb,
+            vb,
+        }
+    }
+
+    /// The training forward's kernel with keys from [`EMPTY_KV_OFF`]:
+    /// `(o, lse)`. `attn_train_forward` always passes zero offsets, under
+    /// which every causal row sees key 0, so a direct dispatch is the only
+    /// way to make its empty-row log-sum-exp reachable.
+    fn forward_kv_off(&self, rt: &Arc<GpuRuntime>) -> (Vec<f32>, Vec<f32>) {
+        let Shape { b, t, hq, hkv, .. } = self.s;
+        let ob = seeded(rt, self.q.len(), SENTINEL);
+        let lseb = seeded(rt, self.dm.lse_len(), SENTINEL);
+        let (tkv, zero, kv_off) = (
+            buf_u32(rt, &[t as u32]),
+            buf_u32(rt, &[0]),
+            buf_u32(rt, &[EMPTY_KV_OFF as u32]),
+        );
+        let p = rt.pipeline("qwen35_attn_tiled_lse_h256_q32_k32_sg4").unwrap();
+        dispatch_2d_tg(rt, &p, t.div_ceil(32), b * hq, 4 * 32, |bnd| {
+            set_gpu_buf(bnd, &self.qb, 0);
+            set_gpu_buf(bnd, &self.kb, 1);
+            set_gpu_buf(bnd, &self.vb, 2);
+            set_gpu_buf(bnd, &ob, 3);
+            set_u32(bnd, b as u32, 4);
+            set_u32(bnd, t as u32, 5);
+            set_gpu_buf(bnd, &tkv, 6);
+            set_u32(bnd, hq as u32, 7);
+            set_u32(bnd, hkv as u32, 8);
+            set_u32(bnd, 0, 9);
+            set_f32(bnd, self.dm.scale, 10);
+            set_gpu_buf(bnd, &zero, 11);
+            set_gpu_buf(bnd, &kv_off, 12);
+            set_u32(bnd, 0, 13);
+            set_u32(bnd, t as u32, 14);
+            set_gpu_buf(bnd, &lseb, 15);
+        })
+        .unwrap();
+        rt.synchronize().unwrap();
+        (ob.read_f32(), lseb.read_f32())
+    }
+}
+
+/// The training forward on rows with no key: exact zeros out and
+/// [`EMPTY_ROW_LSE`] saved, beside rows with keys and a padded tail that
+/// match the f64 reference.
+#[test]
+fn training_forward_saves_a_finite_lse_for_a_row_with_no_key() {
+    with_gpu(|rt| {
+        let c = EmptyRowCase::new(rt);
+        let (s, t) = (&c.s, c.s.t);
+        let (o, lse) = c.forward_kv_off(rt);
+        let (want_o, want_lse) = attn_fwd_kv_off(s, &f64s(&c.q), &f64s(&c.k), &f64s(&c.v), EMPTY_KV_OFF);
+        for h in 0..s.hq {
+            for row in 0..EMPTY_KV_OFF {
+                let at = s.qi(0, row, h);
+                assert!(
+                    o[at..][..D].iter().all(|&x| x.to_bits() == 0),
+                    "head {h} row {row} has no key: o must be +0.0, got {:?}",
+                    &o[at..][..4]
+                );
+                let l = lse[h * t + row];
+                assert_eq!(
+                    l.to_bits(),
+                    EMPTY_ROW_LSE.to_bits(),
+                    "head {h} row {row} has no key: lse must be f32::MAX, got {l}"
+                );
+            }
+        }
+        close("kv_off=5 o", &o, &want_o);
+        let (live_lse, live_want): (Vec<f32>, Vec<f64>) = lse
+            .iter()
+            .zip(&want_lse)
+            .filter(|(_, w)| !w.is_nan())
+            .map(|(&g, &w)| (g, w))
+            .unzip();
+        close("kv_off=5 lse", &live_lse, &live_want);
+    });
+}
+
+/// The training backward on a padded tail and a row saved as empty.
+///
+/// T = 40, so the backward's dead tail rows (`tid >= nq`) take part in every
+/// block walk. One live row's saved log-sum-exp is replaced by the value the
+/// forward writes for a row with no key (read back from the kernel, not
+/// assumed). That row must then contribute nothing — dq exactly zero there,
+/// dk and dv equal to the reference with that row's upstream gradient zeroed —
+/// and no gradient may be non-finite.
+#[test]
+fn training_backward_gives_a_row_saved_as_empty_no_gradient() {
+    with_gpu(|rt| {
+        let c = EmptyRowCase::new(rt);
+        let (s, dm, t) = (&c.s, c.dm, c.s.t);
+        let (nq, nkv) = (c.q.len(), c.k.len());
+        let empty_lse = c.forward_kv_off(rt).1[0];
+        let ws = AttnTrainWorkspace::new(rt, dm).unwrap();
+        let (ob, lseb) = (seeded(rt, nq, SENTINEL), seeded(rt, dm.lse_len(), SENTINEL));
+        attn_train_forward(rt, &dm, &c.qb, &c.kb, &c.vb, &ob, &lseb, &ws).unwrap();
+        rt.synchronize().unwrap();
+        let (dead_h, dead_t) = (1usize, 7usize);
+        let mut saved = lseb.read_f32();
+        saved[dead_h * t + dead_t] = empty_lse;
+        lseb.write_f32(&saved);
+        let mut d_o = random_f32(nq, 73);
+        let dob = buf(rt, &d_o);
+        let (dqb, dkb, dvb) = (
+            seeded(rt, nq, SENTINEL),
+            seeded(rt, nkv, SENTINEL),
+            seeded(rt, nkv, SENTINEL),
+        );
+        let grads = AttnTrainGrads {
+            dq: &dqb,
+            dk: &dkb,
+            dv: &dvb,
+        };
+        attn_train_backward(rt, &dm, &c.qb, &c.kb, &c.vb, &ob, &lseb, &dob, &grads, &ws).unwrap();
+        rt.synchronize().unwrap();
+        let dq = dqb.read_f32();
+        let at = s.qi(0, dead_t, dead_h);
+        assert!(
+            dq[at..][..D].iter().all(|&x| x == 0.0),
+            "a row saved as empty must get no dq, got {:?}",
+            &dq[at..][..4]
+        );
+        // The reference for "row contributes nothing" is that row's upstream
+        // gradient set to zero: its P·(dP - D) and Pᵀ dO terms both vanish.
+        d_o[at..][..D].fill(0.0);
+        let (want_dq, want_dk, want_dv) = attn_bwd(s, &f64s(&c.q), &f64s(&c.k), &f64s(&c.v), &f64s(&d_o));
+        close("empty-row dq", &dq, &want_dq);
+        close("empty-row dk", &dkb.read_f32(), &want_dk);
+        close("empty-row dv", &dvb.read_f32(), &want_dv);
     });
 }
 

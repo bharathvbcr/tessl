@@ -99,9 +99,14 @@ inline void attn_bwd_dq_body(
 #pragma clang loop unroll(full)
     for (uint16_t i = 0; i < dq.get_capacity(); ++i) { dq[i] = 0.0f; }
 
+    // A padded row (past nq) and a row the forward saved as empty (lse ==
+    // FLT_MAX, the finite stand-in for +inf: fast math may assume no value is
+    // infinite) both get FLT_MAX here, and `live` below gives them no
+    // probability by testing it, not by relying on exp(s - FLT_MAX) to
+    // underflow.
     if (tid < (uint)BQ) {
         const bool live = tid < nq;
-        lse_row[tid] = live ? lse[(ulong)bh * T + q0 + tid] : INFINITY;
+        lse_row[tid] = live ? lse[(ulong)bh * T + q0 + tid] : FLT_MAX;
         d_row[tid] = live ? dvec[(ulong)bh * T + q0 + tid] : 0.0f;
     }
 
@@ -120,7 +125,7 @@ inline void attn_bwd_dq_body(
         for (uint i = tid; i < (uint)(BQ * BK); i += THREADS) {
             const uint r = i / (uint)BK, c = i % (uint)BK;
             const uint t = kb + c;
-            const bool live = r < nq && t < t_end && t <= q0 + r;
+            const bool live = r < nq && t < t_end && t <= q0 + r && lse_row[r] < FLT_MAX;
             const float p = live ? exp(S[i] * scale - lse_row[r]) : 0.0f;
             S[i] = p * (dP[i] - d_row[r]) * scale;
         }
@@ -182,9 +187,11 @@ inline void attn_bwd_dkv_body(
         auto mdO = tensor(dO + q_base, dextents<int, 2>{D, (int)T}, array<int, 2>{1, (int)q_row});
         for (uint qb = (k0 / (uint)BQ) * (uint)BQ; qb < T; qb += (uint)BQ) {
             const uint nq = min((uint)BQ, T - qb);
+            // Padded and empty rows: FLT_MAX, gated by `live` below, as in
+            // attn_bwd_dq_body.
             if (tid < (uint)BQ) {
                 const bool live = tid < nq;
-                lse_col[tid] = live ? lse[(ulong)bh * T + qb + tid] : INFINITY;
+                lse_col[tid] = live ? lse[(ulong)bh * T + qb + tid] : FLT_MAX;
                 d_col[tid] = live ? dvec[(ulong)bh * T + qb + tid] : 0.0f;
             }
             auto tQ = mQ.slice(0, (int)qb);
@@ -202,7 +209,7 @@ inline void attn_bwd_dkv_body(
             threadgroup_barrier(mem_flags::mem_threadgroup);
             for (uint i = tid; i < (uint)(BK * BQ); i += THREADS) {
                 const uint c = i / (uint)BQ, r = i % (uint)BQ;
-                const bool live = c < nk && r < nq && k0 + c <= qb + r;
+                const bool live = c < nk && r < nq && k0 + c <= qb + r && lse_col[r] < FLT_MAX;
                 const float p = live ? exp(St[i] * scale - lse_col[r]) : 0.0f;
                 St[i] = DK ? p * (dPt[i] - d_col[r]) * scale : p;
             }

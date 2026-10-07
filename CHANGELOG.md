@@ -166,6 +166,34 @@ All notable changes to `tessl` are recorded here. The format follows
 
 ### Fixed
 
+- **No kernel relies on an infinity under fast math.** `build.rs` compiles
+  every kernel with `-fmetal-math-mode=fast`, whose IR marks float compares
+  `fast` (including `ninf`), so `m == -INFINITY` was a compare the GPU
+  compiler may fold. Nothing measured had misbehaved. The attention kernels
+  (`flash_attn_rows`, `flash_attn_decode`, the SWA h128/h256 and global h512
+  tiles, and Qwen3.5's tiled, shared-prefix rows and shared-prefix decode
+  kernels) now seed running maxima with `-FLT_MAX`, use `l > 0` as the "has
+  seen a key" flag, and zero a masked key's weight by its mask. A split-K
+  chunk with no key is marked by `l = 0`. Every existing attention parity
+  test still passes; performance was not re-measured.
+  The max reductions (`row_max_f32`, `softmax_rows_f32`, `reduce_row_max`)
+  seed from the row's own data, so a row of only `-inf` still reports `-inf`.
+  - **Contract change, training attention:** a query row with no key now
+    saves `lse = f32::MAX` (was `+inf`). The backward gives such a row no
+    probability by testing for it rather than by `exp` underflowing.
+  - **Contract change, argmax:** `argmax_f32`, `softcap_sample` and
+    `softcap_argmax_one_pass` mark a lane with no finite logit by the index
+    `0xFFFFFFFF` (which the host already refuses), not by a NaN or `-inf`
+    value. A group with no finite logit writes `out_val = -FLT_MAX` (was NaN
+    or `-inf`).
+  - **Tests:** `no_kernel_spells_an_infinity_in_code` (fails on any
+    `INFINITY` left in kernel code),
+    `rows_with_no_key_beside_rows_with_keys_are_zero_in_every_kernel`,
+    `training_forward_saves_a_finite_lse_for_a_row_with_no_key`,
+    `training_backward_gives_a_row_saved_as_empty_no_gradient`,
+    `row_max_and_softmax_of_masked_rows_never_invent_a_value`,
+    `argmax_padding_lanes_never_beat_the_lowest_finite_logit`.
+
 - **Persistent buffers are no longer rounded to a power of two.** The buffer
   pool bucketed every request to its next power of two, Hot weights,
   gradient banks and AdamW moments included, though they never return to the

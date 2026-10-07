@@ -144,3 +144,7 @@ path = "src/bin/bench_gemm_coop_tile.rs"
 [[bin]]
 name = "probe_gdn_scan"
 path = "src/bin/probe_gdn_scan.rs"
+
+[[bin]]
+name = "bench_embedgemma2"
+path = "src/bin/bench_embedgemma2.rs"

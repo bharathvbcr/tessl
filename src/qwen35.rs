@@ -1546,6 +1546,59 @@ pub fn attn_qk_norm_rope_packed(
         eps,
         QkRead::Packed {
             q_head_stride,
+            k_col: 0,
+            v_col: 0,
+            weight_bias,
+        },
+    )
+}
+
+/// Where Q, K and V sit in one projection row, for
+/// [`attn_qk_norm_rope_columns`]. Columns are relative to `proj.off`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct QkvColumns {
+    /// Query head `j` starts at column `j * q_head_stride` (`head_dim` when
+    /// the heads are dense, `2 * head_dim` for Qwen's `[q, gate]`).
+    pub q_head_stride: u32,
+    /// Key head `h` starts at column `k_col + h * head_dim`.
+    pub k_col: u32,
+    /// Value head `h` starts at column `v_col + h * head_dim`.
+    pub v_col: u32,
+}
+
+/// [`attn_qk_norm_rope_packed`] for a projection whose K and V are separate
+/// column blocks, as one GEMM over `[q_proj | k_proj | v_proj]` writes them
+/// (Gemma's layout: `k_col = q_heads * head_dim`, `v_col = k_col + kv_heads *
+/// head_dim`). Same norm (`* (w + weight_bias)`), RoPE and cache store.
+#[allow(clippy::too_many_arguments)]
+pub fn attn_qk_norm_rope_columns(
+    rt: &Arc<GpuRuntime>,
+    shape: &AttnShape,
+    proj: Cols<'_>,
+    columns: QkvColumns,
+    weight_bias: f32,
+    q_norm_w: &GpuBuffer,
+    k_norm_w: &GpuBuffer,
+    targets: &AttnTargets<'_>,
+    pos_offset: u32,
+    theta: f32,
+    eps: f32,
+) -> Result<(), String> {
+    qk_norm_rope_impl(
+        rt,
+        shape,
+        proj,
+        q_norm_w,
+        k_norm_w,
+        targets,
+        RopePos::Scalar(pos_offset),
+        0,
+        theta,
+        eps,
+        QkRead::Packed {
+            q_head_stride: columns.q_head_stride,
+            k_col: columns.k_col,
+            v_col: columns.v_col,
             weight_bias,
         },
     )
@@ -1705,11 +1758,16 @@ pub fn attn_qk_norm_rope_suffix_rows(
 enum QkRead {
     /// Query stride `2 * head_dim`, weight `*(1 + w)`, [`AttnProjLayout`] columns.
     Qwen,
-    /// Query head `j` at column `j * q_head_stride`. Key and value head `h`
-    /// at column `h * head_dim`. Offsets are relative to `proj.off`.
-    /// `weight_bias` is added to the RMSNorm weight (`0` is `* w`, `1` is
-    /// Qwen's `*(1 + w)`).
-    Packed { q_head_stride: u32, weight_bias: f32 },
+    /// Query head `j` at column `j * q_head_stride`. Key head `h` at column
+    /// `k_col + h * head_dim`, value head `h` at `v_col + h * head_dim`.
+    /// Offsets are relative to `proj.off`. `weight_bias` is added to the
+    /// RMSNorm weight (`0` is `* w`, `1` is Qwen's `*(1 + w)`).
+    Packed {
+        q_head_stride: u32,
+        k_col: u32,
+        v_col: u32,
+        weight_bias: f32,
+    },
 }
 
 /// Where the RoPE / cache position comes from.
@@ -1768,6 +1826,8 @@ fn qk_norm_rope_impl(
         }
         QkRead::Packed {
             q_head_stride,
+            k_col,
+            v_col,
             weight_bias,
         } => {
             if q_head_stride < s.head_dim {
@@ -1785,9 +1845,12 @@ fn qk_norm_rope_impl(
                     .and_then(|n| n.checked_add(u64::from(s.head_dim)))
                     .ok_or_else(|| format!("{WHAT}: packed columns overflow"))
             };
-            let width = span(s.q_heads, q_head_stride)?.max(span(s.kv_heads, s.head_dim)?);
+            let kv_span = span(s.kv_heads, s.head_dim)?;
+            let width = span(s.q_heads, q_head_stride)?
+                .max(u64::from(k_col) + kv_span)
+                .max(u64::from(v_col) + kv_span);
             let width_u = u32::try_from(width).map_err(|_| format!("{WHAT}: packed width exceeds u32"))?;
-            (0, 0, 0, width_u, q_head_stride, weight_bias)
+            (0, k_col, v_col, width_u, q_head_stride, weight_bias)
         }
     };
     if s.batch == 0 || s.seq == 0 {

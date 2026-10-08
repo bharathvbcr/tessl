@@ -551,6 +551,44 @@ fn encode_reuses_unzeroed_activations() {
     });
 }
 
+/// The per-layer inputs formed a run of layers per GEMM: every layer in one
+/// (the default at these sizes), or runs of 2 and 1 layers under a small
+/// `ple_run_bytes`, which read row-offset slices of the projection and column
+/// windows past a run's first layer. The embeddings agree within GEMM
+/// rounding, and each is the f64 forward's.
+#[test]
+fn per_layer_input_runs_agree() {
+    let cfg = EmbedGemma2Config::from_config_json(CONFIG).unwrap();
+    let w = random_weights(&cfg, 11);
+    let st = open("runs", safetensors_bytes(&w, &[]));
+    let seqs = sequences(cfg.vocab);
+    let refs: Vec<&[u32]> = seqs.iter().map(Vec::as_slice).collect();
+    let rows = seqs.len() * seqs.iter().map(Vec::len).max().unwrap();
+    let per_layer = rows * cfg.ple_dim as usize * 4;
+    let dim = cfg.embedding_dim as usize;
+    with_gpu(|rt| {
+        let mut model = EmbedGemma2Model::load(rt, &st, PREFIX, cfg.clone()).unwrap();
+        let all = model.encode(&refs, None, false).unwrap().embeddings;
+        assert!(model.set_ple_run_bytes(0).is_err());
+        for layers_per_run in [2usize, 1] {
+            model.set_ple_run_bytes(layers_per_run * per_layer).unwrap();
+            let got = model.encode(&refs, None, false).unwrap().embeddings;
+            let drift = got.iter().zip(&all).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+            eprintln!("runs of {layers_per_run}: vs one run {drift:.3e}");
+            assert!(f64::from(drift) <= BATCH_ABS, "runs of {layers_per_run}: {drift:.3e}");
+            for (n, ids) in seqs.iter().enumerate() {
+                let (_, want) = host_forward(&cfg, &w, ids);
+                let e = &got[n * dim..(n + 1) * dim];
+                let (err, cos) = (max_abs(e, &want), cosine(e, &want));
+                assert!(
+                    err <= EMB_ABS && cos >= EMB_COS,
+                    "runs of {layers_per_run}, sequence {n}: max abs {err:.3e}, cosine {cos:.9}"
+                );
+            }
+        }
+    });
+}
+
 /// Weights are long-lived (`BufferKind::Hot`): dropping the model hands their
 /// memory back to the device. Allocated as mid-step temporaries (`Cold`) they
 /// would park in the runtime's freelist instead, and the device would still

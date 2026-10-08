@@ -53,14 +53,14 @@ use std::sync::Arc;
 use objc2_metal::MTLComputePipelineState;
 
 use crate::dispatch::{dispatch_1d, dispatch_2d_tg, set_gpu_buf, set_u32};
-use crate::gemm::{gemm, GemmBackend};
+use crate::gemm::{gemm, gemm_nt_f32, GemmBackend};
 use crate::json::{self, Json, Syntax};
 use crate::loader::Loader;
 use crate::nn::{
     dispatch_tg_1d, mlp_gelu_tanh, reduce_tptg, require, require_disjoint_writes, rms_norm_f32,
     rms_norm_residual_add_f32, scale_f32_inplace,
 };
-use crate::qwen35::{self, AttnShape, AttnTargets, Cols, LmHead, QkvColumns};
+use crate::qwen35::{self, AttnShape, AttnTargets, Cols, GatedAct, LmHead, OutCols, QkvColumns};
 use crate::qwen35_model::Precision;
 use crate::runtime::GpuRuntime;
 use crate::safetensors::SafeTensors;
@@ -533,8 +533,6 @@ struct Layer {
     gate: Tensor,
     up: Tensor,
     down: Tensor,
-    /// This layer's slice of the per-layer-input projection, `[hidden, ple_dim]`.
-    ple_in: Tensor,
     ple_gate: Tensor,
     ple_out: Tensor,
     post_ple_norm: GpuBuffer,
@@ -547,12 +545,19 @@ pub struct EmbedGemma2Model {
     rt: Arc<GpuRuntime>,
     /// `[vocab, hidden]` bf16, as the checkpoint holds it.
     embed: Tensor,
+    /// The per-layer-input projection as the checkpoint holds it,
+    /// `[n_layers * ple_dim, hidden]`: layer `i`'s rows are `[i * ple_dim,
+    /// (i + 1) * ple_dim)`, so a run of layers is a run of rows, the right
+    /// operand of one NT GEMM.
+    ple_w: Tensor,
     ple_norm: GpuBuffer,
     final_norm: GpuBuffer,
     /// `[hidden, embedding_dim]`.
     projection: Tensor,
     layers: Vec<Layer>,
     max_tokens: u32,
+    /// See [`EmbedGemma2Model::set_ple_run_bytes`].
+    ple_run_bytes: usize,
 }
 
 /// What [`EmbedGemma2Model::encode`] returns.
@@ -565,6 +570,13 @@ pub struct EncodeOutput {
     /// How many forwards the batch was split into (see [`MAX_BATCH_TOKENS`]).
     pub forwards: u32,
 }
+
+/// Bytes of per-layer inputs one GEMM forms: every layer's at once would be
+/// `rows * n_layers * ple_dim` floats, 1.5 GiB at [`MAX_BATCH_TOKENS`] with
+/// the checkpoint's 24 layers of 512. Under this bound a forward of up to
+/// 5461 rows forms all 24 in one GEMM; at 32768 rows it takes 6 (4 layers
+/// each), against 24 one-layer GEMMs before.
+pub const PLE_RUN_BYTES: usize = 256 << 20;
 
 /// A forward's fixed cost in padded rows, for [`pack_forwards`]: each forward
 /// re-reads every weight (~0.6 GB of f32 outside the embedding table), about
@@ -651,6 +663,8 @@ struct Acts {
     /// The gate projection, then `gelu_tanh(gate) * up` in place.
     gate: Tensor,
     up: Tensor,
+    /// The normed per-layer inputs of a run of layers, `[rows, run * ple_dim]`
+    /// (see [`PLE_RUN_BYTES`]).
     ple: Tensor,
     ple_gate: Tensor,
     ple_mid: Tensor,
@@ -678,26 +692,15 @@ impl EmbedGemma2Model {
         // Read straight into the device table: no host copy.
         let embed = rt.alloc_tensor_bf16_hot(&[vocab, h])?;
         ld.bf16_into("embed_tokens.weight", &[vocab, h], &embed)?;
-        // `[n_layers * ple, hidden]`: layer `i`'s projection is rows
-        // `[i * ple, (i + 1) * ple)`. Every slice is placed into its layer's
-        // `[hidden, ple]` operand here, and the host copy dropped, before any
-        // other tensor is read.
-        let ple_in = {
-            let w = ld.f32("ple.per_layer_model_projection.weight", &[n_layers * ple, h])?;
-            w.chunks_exact(ple * h)
-                .map(|slice| {
-                    let t = rt.alloc_tensor_f32_hot(&[h, ple])?;
-                    qwen35::place_linear_part(&mut t.buffer.try_contents_f32()?, ple, 0, slice, ple, h)?;
-                    Ok(t)
-                })
-                .collect::<Result<Vec<_>, String>>()?
-        };
+        // Widened straight into the device tensor, in the checkpoint's layout.
+        let ple_w = rt.alloc_tensor_f32_hot(&[n_layers * ple, h])?;
+        ld.f32_into("ple.per_layer_model_projection.weight", &[n_layers * ple, h], &ple_w)?;
         let ple_norm = ld.norm("ple.per_layer_projection_norm.weight", ple)?;
         let final_norm = ld.norm("norm.weight", h)?;
         let projection = ld.linear(&[("embedding_projection.weight", cfg.embedding_dim as usize)], h, f32)?;
 
         let mut layers = Vec::with_capacity(n_layers);
-        for ((i, &spec), ple_in) in cfg.layers.iter().enumerate().zip(ple_in) {
+        for (i, &spec) in cfg.layers.iter().enumerate() {
             let p = |s: &str| format!("layers.{i}.{s}");
             let (d, q, kv) = (spec.head_dim as usize, cfg.q_heads as usize, spec.kv_heads as usize);
             layers.push(Layer {
@@ -721,7 +724,6 @@ impl EmbedGemma2Model {
                 gate: ld.linear(&[(&p("mlp.gate_proj.weight"), inter)], h, f32)?,
                 up: ld.linear(&[(&p("mlp.up_proj.weight"), inter)], h, f32)?,
                 down: ld.linear(&[(&p("mlp.down_proj.weight"), h)], inter, f32)?,
-                ple_in,
                 ple_gate: ld.linear(&[(&p("ple_block.per_layer_input_gate.weight"), ple)], h, f32)?,
                 ple_out: ld.linear(&[(&p("ple_block.per_layer_projection.weight"), h)], ple, f32)?,
                 post_ple_norm: ld.norm(&p("ple_block.post_per_layer_input_norm.weight"), h)?,
@@ -734,11 +736,13 @@ impl EmbedGemma2Model {
             cfg,
             rt: Arc::clone(rt),
             embed,
+            ple_w,
             ple_norm,
             final_norm,
             projection,
             layers,
             max_tokens: DEFAULT_MAX_TOKENS,
+            ple_run_bytes: PLE_RUN_BYTES,
         })
     }
 
@@ -759,6 +763,18 @@ impl EmbedGemma2Model {
             ));
         }
         self.max_tokens = max_tokens;
+        Ok(())
+    }
+
+    /// Bound the per-layer-input buffer (default [`PLE_RUN_BYTES`]): each
+    /// forward forms the per-layer inputs of as many layers per GEMM as fit
+    /// in it (at least one). Smaller saves memory at more GEMMs; the
+    /// embeddings agree to GEMM rounding whatever the size.
+    pub fn set_ple_run_bytes(&mut self, bytes: usize) -> Result<(), String> {
+        if bytes == 0 {
+            return Err("ple_run_bytes must be positive".into());
+        }
+        self.ple_run_bytes = bytes;
         Ok(())
     }
 
@@ -898,7 +914,12 @@ impl EmbedGemma2Model {
         let at = |t: &Tensor, cols: u32| view(t, rows_u, cols);
         let (embeds, resid, x, y) = (at(&a.embeds, h)?, at(&a.resid, h)?, at(&a.x, h)?, at(&a.y, h)?);
         let (gate, up) = (at(&a.gate, cfg.intermediate)?, at(&a.up, cfg.intermediate)?);
-        let (ple, ple_gate) = (at(&a.ple, cfg.ple_dim)?, at(&a.ple_gate, cfg.ple_dim)?);
+        let (ple_gate, ple_mid) = (at(&a.ple_gate, cfg.ple_dim)?, at(&a.ple_mid, cfg.ple_dim)?);
+        let (n_layers, pd) = (self.layers.len(), cfg.ple_dim as usize);
+        // Layers whose per-layer inputs one GEMM forms: as many as `a.ple`
+        // holds at this forward's rows.
+        let run = (a.ple.numel() / (rows * pd)).clamp(1, n_layers);
+        let mut ple_ld = 0u32;
         // transformers multiplies by `embed_scale.to(weight.dtype)`: sqrt(512)
         // as an f32 in the fp32 forward this mirrors, here inside the gather.
         qwen35::embed_rows_scaled(
@@ -918,7 +939,7 @@ impl EmbedGemma2Model {
 
         let mut out_trace = Vec::new();
         let ple_scale = (h as f32).powf(-0.5);
-        for layer in &self.layers {
+        for (i, layer) in self.layers.iter().enumerate() {
             let s = layer.spec;
             // Attention.
             rms_norm_f32(rt, &resid.buffer, &layer.input_norm, &x.buffer, rows_u, h, eps)?;
@@ -985,27 +1006,45 @@ impl EmbedGemma2Model {
             gemm(&gate, &layer.down, &y, BACKEND)?;
             rms_norm_residual_add_f32(rt, &y.buffer, &layer.post_ffn_norm, &resid.buffer, rows_u, h, eps, 1.0)?;
 
-            // Per-layer input, then its block and the layer scalar.
-            gemm(&embeds, &layer.ple_in, &ple, BACKEND)?;
-            scale_f32_inplace(rt, &ple.buffer, ple_scale, rows_u * cfg.ple_dim)?;
-            rms_norm_f32(
+            // Per-layer input: at the first layer of each run, one GEMM over
+            // the embeddings for the whole run, `rms_norm(embeds @ Wpleᵀ *
+            // hidden^-0.5) * ple_norm.w` in place; then this layer's block
+            // reads its column window.
+            if i % run == 0 {
+                let k = run.min(n_layers - i);
+                ple_ld = (k * pd) as u32;
+                let w = self.ple_w.try_view(&[k * pd, h as usize], i * pd * h as usize)?;
+                let out = at(&a.ple, ple_ld)?;
+                gemm_nt_f32(&embeds, &w, &out, BACKEND)?;
+                scale_f32_inplace(rt, &out.buffer, ple_scale, rows_u * ple_ld)?;
+                rms_norm_f32(
+                    rt,
+                    &out.buffer,
+                    &self.ple_norm,
+                    &out.buffer,
+                    rows_u * k as u32,
+                    cfg.ple_dim,
+                    eps,
+                )?;
+            }
+            gemm(&resid, &layer.ple_gate, &ple_gate, BACKEND)?;
+            qwen35::gated_act(
                 rt,
-                &ple.buffer,
-                &self.ple_norm,
-                &a.ple_mid.buffer,
+                GatedAct::GeluTanh,
+                Cols::dense(&ple_gate.buffer, cfg.ple_dim),
+                Cols {
+                    buf: &a.ple.buffer,
+                    ld: ple_ld,
+                    off: ((i % run) * pd) as u32,
+                },
+                OutCols {
+                    cols: Cols::dense(&ple_mid.buffer, cfg.ple_dim),
+                    dtype: DType::F32,
+                },
                 rows_u,
                 cfg.ple_dim,
-                eps,
             )?;
-            gemm(&resid, &layer.ple_gate, &ple_gate, BACKEND)?;
-            mlp_gelu_tanh(
-                rt,
-                &ple_gate.buffer,
-                &a.ple_mid.buffer,
-                &ple.buffer,
-                rows_u * cfg.ple_dim,
-            )?;
-            gemm(&ple, &layer.ple_out, &y, BACKEND)?;
+            gemm(&ple_mid, &layer.ple_out, &y, BACKEND)?;
             rms_norm_residual_add_f32(
                 rt,
                 &y.buffer,
@@ -1078,7 +1117,9 @@ impl EmbedGemma2Model {
             y: f32s(&[r, h])?,
             gate: f32s(&[r, inter])?,
             up: f32s(&[r, inter])?,
-            ple: f32s(&[r, ple])?,
+            // A run of per-layer inputs: within `ple_run_bytes`, or one layer's
+            // when even that is larger, and never more than every layer's.
+            ple: f32s(&[(self.ple_run_bytes / 4).max(r * ple).min(r * ple * cfg.layers.len())])?,
             ple_gate: f32s(&[r, ple])?,
             ple_mid: f32s(&[r, ple])?,
             pooled: f32s(&[nb, h])?,

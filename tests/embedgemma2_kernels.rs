@@ -22,12 +22,13 @@ mod common;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use common::embedgemma2::{attn_ref, gelu_tanh, l2_normalize, lin, pool_reference, rms, rope, Attn};
 use common::{tensor_f32, with_gpu, SplitMix};
 use tessl::embedgemma2::{
-    encoder_attn, l2_normalize_rows, segment_mean_rows, truncate_renormalize, upload_segments, EmbedGemma2Config, EncoderAttnDims,
+    encoder_attn, l2_normalize_rows, segment_mean_rows, upload_segments, EmbedGemma2Config, EncoderAttnDims,
 };
 use tessl::gemm::{gemm, GemmBackend};
-use tessl::nn::{mlp_gelu_tanh, rms_norm_f32, rms_norm_residual_add_f32, scale_f32_inplace};
+use tessl::nn::{self, mlp_gelu_tanh, rms_norm_f32, rms_norm_residual_add_f32, scale_f32_inplace};
 use tessl::npy::read_npy;
 use tessl::qwen35::{self, AttnShape, AttnTargets, Cols, QkvColumns};
 use tessl::tensor::GpuBuffer;
@@ -35,7 +36,6 @@ use tessl::GpuRuntime;
 
 const KERNEL_REL: f64 = 2e-5;
 const FIXTURE_REL: f64 = 1e-5;
-const EPS: f64 = 1e-6;
 
 fn fixture_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/embedgemma2")
@@ -87,88 +87,6 @@ fn assert_close(what: &str, got: &[f64], want: &[f64], idx: &[usize], rel: f64) 
         got[at],
         want[at]
     );
-}
-
-// ---------------------------------------------------------------------------
-// f64 references
-// ---------------------------------------------------------------------------
-
-struct Attn {
-    b: usize,
-    t: usize,
-    h: usize,
-    hkv: usize,
-    d: usize,
-    window: usize,
-    lens: Vec<usize>,
-}
-
-/// Bidirectional attention, scale 1.0, transformers' masking: key j is visible
-/// to query i of row b iff j < lens[b] and (window == 0 or |i - j| <= window).
-/// Queries at or past lens[b] are reported as zeros (the kernel's contract;
-/// transformers computes them over padding and nothing reads them).
-fn attn_ref(a: &Attn, q: &[f64], k: &[f64], v: &[f64], rows: Option<&[usize]>) -> Vec<f64> {
-    let mut out = vec![0.0; a.b * a.t * a.h * a.d];
-    let group = a.h / a.hkv;
-    let all: Vec<usize> = (0..a.t).collect();
-    let rows = rows.unwrap_or(&all);
-    for b in 0..a.b {
-        let len = a.lens[b].min(a.t);
-        for &i in rows {
-            if i >= len {
-                continue;
-            }
-            let lo = if a.window == 0 { 0 } else { i.saturating_sub(a.window) };
-            let hi = if a.window == 0 { len } else { len.min(i + a.window + 1) };
-            for h in 0..a.h {
-                let hk = h / group;
-                let qo = ((b * a.t + i) * a.h + h) * a.d;
-                let scores: Vec<f64> = (lo..hi)
-                    .map(|j| {
-                        let ko = ((b * a.t + j) * a.hkv + hk) * a.d;
-                        (0..a.d).map(|x| q[qo + x] * k[ko + x]).sum::<f64>()
-                    })
-                    .collect();
-                let m = scores.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
-                let w: Vec<f64> = scores.iter().map(|s| (s - m).exp()).collect();
-                let z: f64 = w.iter().sum();
-                for (n, j) in (lo..hi).enumerate() {
-                    let vo = ((b * a.t + j) * a.hkv + hk) * a.d;
-                    for x in 0..a.d {
-                        out[qo + x] += w[n] / z * v[vo + x];
-                    }
-                }
-            }
-        }
-    }
-    out
-}
-
-fn rms(x: &[f64], w: Option<&[f64]>) -> Vec<f64> {
-    let ms = x.iter().map(|v| v * v).sum::<f64>() / x.len() as f64;
-    let inv = 1.0 / (ms + EPS).sqrt();
-    x.iter()
-        .enumerate()
-        .map(|(i, v)| v * inv * w.map_or(1.0, |w| w[i]))
-        .collect()
-}
-
-/// Full-width rotate_half RoPE at `pos`, `inv_freq = theta^(-2p/d)`.
-fn rope(x: &[f64], pos: f64, theta: f64) -> Vec<f64> {
-    let d = x.len();
-    let half = d / 2;
-    let mut out = vec![0.0; d];
-    for p in 0..half {
-        let f = pos / theta.powf(2.0 * p as f64 / d as f64);
-        let (s, c) = f.sin_cos();
-        out[p] = x[p] * c - x[p + half] * s;
-        out[p + half] = x[p + half] * c + x[p] * s;
-    }
-    out
-}
-
-fn gelu_tanh(x: f64) -> f64 {
-    0.5 * x * (1.0 + ((2.0 / std::f64::consts::PI).sqrt() * (x + 0.044715 * x * x * x)).tanh())
 }
 
 // ---------------------------------------------------------------------------
@@ -234,7 +152,11 @@ fn qkv_norm_rope_reference_matches_transformers() {
                 for hh in 0..heads {
                     let o = (ti * heads + hh) * d;
                     let n = rms(&x[o..o + d], w);
-                    out.extend(if rotate { rope(&n, pos0[0] + ti as f64, theta) } else { n });
+                    out.extend(if rotate {
+                        rope(&n, pos0[0] + ti as f64, theta)
+                    } else {
+                        n
+                    });
                 }
             }
             out
@@ -264,16 +186,14 @@ fn ple_reference() -> (Vec<f64>, Vec<f64>) {
     let (rows, h) = (es[0] * es[1], es[2]);
     let n_layers = pws[0] / h;
     let li = layer[0] as usize;
-    let lin = |w: &[f64], x: &[f64], out_f: usize, in_f: usize| -> Vec<f64> {
-        (0..out_f)
-            .map(|o| (0..in_f).map(|i| w[o * in_f + i] * x[i]).sum())
-            .collect()
-    };
     let mut per_layer = Vec::with_capacity(rows * n_layers * h);
     let mut block = Vec::with_capacity(rows * h);
     for r in 0..rows {
         let e = &embeds[r * h..(r + 1) * h];
-        let p: Vec<f64> = lin(&proj_w, e, n_layers * h, h).iter().map(|v| v * (h as f64).powf(-0.5)).collect();
+        let p: Vec<f64> = lin(&proj_w, e, n_layers * h, h)
+            .iter()
+            .map(|v| v * (h as f64).powf(-0.5))
+            .collect();
         let mut mine = Vec::new();
         for l in 0..n_layers {
             let n = rms(&p[l * h..(l + 1) * h], Some(&proj_norm_w));
@@ -283,7 +203,11 @@ fn ple_reference() -> (Vec<f64>, Vec<f64>) {
             per_layer.extend(n);
         }
         let x = &hidden[r * h..(r + 1) * h];
-        let g: Vec<f64> = lin(&gate_w, x, h, h).iter().zip(&mine).map(|(g, m)| gelu_tanh(*g) * m).collect();
+        let g: Vec<f64> = lin(&gate_w, x, h, h)
+            .iter()
+            .zip(&mine)
+            .map(|(g, m)| gelu_tanh(*g) * m)
+            .collect();
         let y = rms(&lin(&out_w, &g, h, h), Some(&post_w));
         block.extend(x.iter().zip(&y).map(|(a, b)| a + b));
     }
@@ -295,24 +219,20 @@ fn ple_reference_matches_transformers() {
     let (per_layer, block) = ple_reference();
     let want_pl = load("ple_per_layer").1;
     let want_block = load("ple_block_out").1;
-    assert_close("per_layer", &per_layer, &want_pl, &(0..want_pl.len()).collect::<Vec<_>>(), 5e-6);
-    assert_close("block", &block, &want_block, &(0..want_block.len()).collect::<Vec<_>>(), 5e-6);
-}
-
-fn pool_reference(x: &[f64], lens: &[usize], t: usize, d: usize) -> Vec<f64> {
-    let mut out = Vec::new();
-    for (b, &len) in lens.iter().enumerate() {
-        let mut mean = vec![0.0; d];
-        for ti in 0..len {
-            for (j, m) in mean.iter_mut().enumerate() {
-                *m += x[(b * t + ti) * d + j];
-            }
-        }
-        let mean: Vec<f64> = mean.iter().map(|v| v / len as f64).collect();
-        let norm = mean.iter().map(|v| v * v).sum::<f64>().sqrt().max(1e-12);
-        out.extend(mean.iter().map(|v| v / norm));
-    }
-    out
+    assert_close(
+        "per_layer",
+        &per_layer,
+        &want_pl,
+        &(0..want_pl.len()).collect::<Vec<_>>(),
+        5e-6,
+    );
+    assert_close(
+        "block",
+        &block,
+        &want_block,
+        &(0..want_block.len()).collect::<Vec<_>>(),
+        5e-6,
+    );
 }
 
 #[test]
@@ -363,7 +283,10 @@ fn padding_is_zero(what: &str, a: &Attn, got: &[f64]) {
         for t in a.lens[b].min(a.t)..a.t {
             let base = (b * a.t + t) * a.h * a.d;
             for (i, &g) in got[base..base + a.h * a.d].iter().enumerate() {
-                assert!(g == 0.0 && g.is_sign_positive(), "{what}: padding row b={b} t={t} elem {i} is {g}, not +0");
+                assert!(
+                    g == 0.0 && g.is_sign_positive(),
+                    "{what}: padding row b={b} t={t} elem {i} is {g}, not +0"
+                );
             }
         }
     }
@@ -391,7 +314,14 @@ fn random(n: usize, seed: u64, scale: f64) -> Vec<f64> {
 fn probe_rows(t: usize, window: usize) -> Vec<usize> {
     let mut rows: Vec<usize> = vec![0, 1, 2, t / 2, t - 2, t - 1];
     if window > 0 {
-        for c in [window - 1, window, window + 1, 2 * window, 2 * window + 1, t.saturating_sub(window + 1)] {
+        for c in [
+            window - 1,
+            window,
+            window + 1,
+            2 * window,
+            2 * window + 1,
+            t.saturating_sub(window + 1),
+        ] {
             rows.push(c);
         }
     }
@@ -639,18 +569,34 @@ fn encoder_attn_refuses_what_it_cannot_run() {
         encoder_attn(rt, &q, &k, &v, &o, &lens, ok, false).expect("the baseline call");
         let cases: Vec<(&str, EncoderAttnDims)> = vec![
             ("head dim 128", EncoderAttnDims { head_dim: 128, ..ok }),
-            ("heads not a multiple", EncoderAttnDims { heads: 3, heads_kv: 2, ..ok }),
+            (
+                "heads not a multiple",
+                EncoderAttnDims {
+                    heads: 3,
+                    heads_kv: 2,
+                    ..ok
+                },
+            ),
             ("zero kv heads", EncoderAttnDims { heads_kv: 0, ..ok }),
             ("nan scale", EncoderAttnDims { scale: f32::NAN, ..ok }),
             ("seq past the buffers", EncoderAttnDims { seq: 9, ..ok }),
             ("batch past lens", EncoderAttnDims { batch: 5, seq: 6, ..ok }),
         ];
         for (what, dims) in cases {
-            assert!(encoder_attn(rt, &q, &k, &v, &o, &lens, dims, false).is_err(), "{what}: accepted");
+            assert!(
+                encoder_attn(rt, &q, &k, &v, &o, &lens, dims, false).is_err(),
+                "{what}: accepted"
+            );
         }
-        assert!(encoder_attn(rt, &q, &k, &v, &q, &lens, ok, false).is_err(), "o aliasing q: accepted");
+        assert!(
+            encoder_attn(rt, &q, &k, &v, &q, &lens, ok, false).is_err(),
+            "o aliasing q: accepted"
+        );
         let short_lens = buf_u32(rt, &[8]);
-        assert!(encoder_attn(rt, &q, &k, &v, &o, &short_lens, ok, false).is_err(), "short lens: accepted");
+        assert!(
+            encoder_attn(rt, &q, &k, &v, &o, &short_lens, ok, false).is_err(),
+            "short lens: accepted"
+        );
     });
 }
 
@@ -714,7 +660,10 @@ fn check_qkv(rt: &Arc<GpuRuntime>, name: &str, rel: f64) {
     rms_norm_f32(rt, &vo, &ones, &vn, (cap * hkv) as u32, d as u32, 1e-6).unwrap();
     rt.synchronize().unwrap();
     let slots = |b: &GpuBuffer| -> Vec<f64> {
-        b.read_f32()[pos0 * hkv * d..cap * hkv * d].iter().map(|&x| f64::from(x)).collect()
+        b.read_f32()[pos0 * hkv * d..cap * hkv * d]
+            .iter()
+            .map(|&x| f64::from(x))
+            .collect()
     };
     let got_q: Vec<f64> = qo.read_f32()[..t * hq * d].iter().map(|&x| f64::from(x)).collect();
     for (what, got, want) in [
@@ -722,7 +671,13 @@ fn check_qkv(rt: &Arc<GpuRuntime>, name: &str, rel: f64) {
         ("k", slots(&ko), load(&format!("{name}_k_out")).1),
         ("v", slots(&vn), load(&format!("{name}_v_out")).1),
     ] {
-        assert_close(&format!("{name} {what}"), &got, &want, &(0..want.len()).collect::<Vec<_>>(), rel);
+        assert_close(
+            &format!("{name} {what}"),
+            &got,
+            &want,
+            &(0..want.len()).collect::<Vec<_>>(),
+            rel,
+        );
     }
 }
 
@@ -734,13 +689,46 @@ fn qkv_columns_norm_rope_matches_the_fixtures() {
     });
 }
 
-/// At position 8000 both sides form the angle in f32: transformers as
-/// `pos * inv_freq` in fp32, the kernel likewise, each within ~pos * 2^-24
-/// rad of exact (4.8e-4), on vectors of RMS ~1. Held to 2e-3 of the largest
-/// element; a wrong frequency or pairing would be off by O(1).
+/// `nn::rope_inv_freq` against the model's own rotary buffers: every
+/// entry within one ulp. Where they differ at all it is torch's f32 `pow`
+/// that is not correctly rounded (1 of 128 pairs at 256, 3 of 256 at 512).
+#[test]
+fn rope_inv_freq_matches_the_models_tables() {
+    for (d, theta) in [(256u32, 1e4f32), (512, 1e6)] {
+        let want = load(&format!("inv_freq_{d}")).1;
+        let got = nn::rope_inv_freq(d / 2, d, theta);
+        assert_eq!(got.len(), want.len(), "d={d}");
+        let mut differ = 0;
+        for (p, (&g, &w)) in got.iter().zip(&want).enumerate() {
+            let w = w as f32;
+            let ulps = (g.to_bits() as i64 - w.to_bits() as i64).abs();
+            assert!(ulps <= 1, "d={d} pair {p}: {g:e} vs torch {w:e} ({ulps} ulps)");
+            differ += usize::from(ulps != 0);
+        }
+        assert!(differ <= want.len() / 32, "d={d}: {differ} of {} pairs differ from torch", want.len());
+    }
+}
+
+/// At position 8000, against transformers (`pos * inv_freq` in f32, then
+/// cos/sin). The kernel forms the same f32 angle from the same table, so the
+/// bound is the kernel's own f32 error (`KERNEL_REL`) plus the largest angle
+/// the table can differ from torch's by: `(pos0 + T) * max_p |ours - torch|`
+/// radians, derived from the model's buffers rather than tuned. That term is
+/// ~2e-7 at d=256 and ~1.2e-4 at d=512 (torch's own pow rounding at three
+/// pairs). The device-side `pow` this replaced was an ulp off at most pairs:
+/// ~5e-4 here, past both bounds.
 #[test]
 fn qkv_columns_norm_rope_far_positions() {
-    with_gpu(|rt| check_qkv(rt, "qkv256_far", 2e-3));
+    with_gpu(|rt| {
+        for (name, d, theta) in [("qkv256_far", 256u32, 1e4f32), ("qkv512_far", 512, 1e6)] {
+            let torch = load(&format!("inv_freq_{d}")).1;
+            let ours = nn::rope_inv_freq(d / 2, d, theta);
+            let gap = ours.iter().zip(&torch).map(|(&o, &t)| (f64::from(o) - t).abs()).fold(0.0, f64::max);
+            let (qs, _) = load(&format!("{name}_q_in"));
+            let last = load(&format!("{name}_meta")).1[0] + qs[1] as f64;
+            check_qkv(rt, name, KERNEL_REL + last * gap);
+        }
+    });
 }
 
 #[test]
@@ -770,12 +758,21 @@ fn ple_composition_matches_the_fixtures() {
         scale_f32_inplace(rt, &ple.buffer, (h as f32).powf(-0.5), (rows * h) as u32).unwrap();
         rms_norm_f32(rt, &ple.buffer, &norm_w, &ple_n.buffer, rows as u32, h as u32, 1e-6).unwrap();
         rt.synchronize().unwrap();
-        let got_pl: Vec<f64> = ple_n.buffer.read_f32()[..rows * h].iter().map(|&x| f64::from(x)).collect();
+        let got_pl: Vec<f64> = ple_n.buffer.read_f32()[..rows * h]
+            .iter()
+            .map(|&x| f64::from(x))
+            .collect();
         let want_all = load("ple_per_layer").1;
         let want_pl: Vec<f64> = (0..rows)
             .flat_map(|r| want_all[(r * n_layers + li) * h..(r * n_layers + li + 1) * h].to_vec())
             .collect();
-        assert_close("per_layer slice", &got_pl, &want_pl, &(0..want_pl.len()).collect::<Vec<_>>(), 5e-5);
+        assert_close(
+            "per_layer slice",
+            &got_pl,
+            &want_pl,
+            &(0..want_pl.len()).collect::<Vec<_>>(),
+            5e-5,
+        );
 
         gemm(&resid, &pack(&load("ple_gate_w").1, h, h), &g, GemmBackend::TensorOps).unwrap();
         mlp_gelu_tanh(rt, &g.buffer, &ple_n.buffer, &ple.buffer, (rows * h) as u32).unwrap();
@@ -783,7 +780,10 @@ fn ple_composition_matches_the_fixtures() {
         let post_w = buf_f32(rt, &f32s(&load("ple_post_norm_w").1));
         rms_norm_residual_add_f32(rt, &y.buffer, &post_w, &resid.buffer, rows as u32, h as u32, 1e-6, 1.0).unwrap();
         rt.synchronize().unwrap();
-        let got: Vec<f64> = resid.buffer.read_f32()[..rows * h].iter().map(|&x| f64::from(x)).collect();
+        let got: Vec<f64> = resid.buffer.read_f32()[..rows * h]
+            .iter()
+            .map(|&x| f64::from(x))
+            .collect();
         let want = load("ple_block_out").1;
         assert_close("ple block", &got, &want, &(0..want.len()).collect::<Vec<_>>(), 5e-5);
     });
@@ -797,7 +797,11 @@ fn pool_and_normalize_match_the_fixtures() {
         let lens: Vec<u32> = load("pool_lens").1.iter().map(|&l| l as u32).collect();
         let xb = buf_f32(rt, &f32s(&x));
         // Sequence b's live rows of the flattened [b * t, d] input.
-        let segs: Vec<(u32, u32)> = lens.iter().enumerate().map(|(i, &l)| ((i * t) as u32, (i * t) as u32 + l)).collect();
+        let segs: Vec<(u32, u32)> = lens
+            .iter()
+            .enumerate()
+            .map(|(i, &l)| ((i * t) as u32, (i * t) as u32 + l))
+            .collect();
         let sb = upload_segments(rt, &segs, (b * t) as u32).unwrap();
         let out = rt.alloc_buffer(b * d * 4).unwrap();
         segment_mean_rows(rt, &xb, &sb, &out, b as u32, (b * t) as u32, d as u32).unwrap();
@@ -807,18 +811,37 @@ fn pool_and_normalize_match_the_fixtures() {
         let want = load("pool_out").1;
         assert_close("pool", &got, &want, &(0..want.len()).collect::<Vec<_>>(), 5e-6);
 
-        // Matryoshka: normalizing a 128-wide prefix in place equals the host
-        // truncate-and-renormalize, and leaves the columns past it alone.
+        // Matryoshka: normalizing a prefix in place equals the f64 normalize
+        // of that prefix (sentence-transformers' truncate_dim with
+        // normalize_embeddings; the generator's pool_out_trunc{d}), and
+        // leaves the columns past it alone.
         let before = out.read_f32()[..b * d].to_vec();
-        l2_normalize_rows(rt, &out, b as u32, 128, d as u32).unwrap();
-        rt.synchronize().unwrap();
-        let after = out.read_f32()[..b * d].to_vec();
-        let host = truncate_renormalize(&before, d, 128).unwrap();
-        for r in 0..b {
-            for j in 0..d {
-                let (g, w) = (after[r * d + j], if j < 128 { host[r * 128 + j] } else { before[r * d + j] });
-                assert!((g - w).abs() <= 1e-6, "row {r} col {j}: {g} vs {w}");
+        for p in [512usize, 256, 128] {
+            let want = load(&format!("pool_out_trunc{p}")).1;
+            let xb = buf_f32(rt, &before);
+            l2_normalize_rows(rt, &xb, b as u32, p as u32, d as u32).unwrap();
+            rt.synchronize().unwrap();
+            let after = xb.read_f32()[..b * d].to_vec();
+            let mut got = Vec::with_capacity(b * p);
+            for r in 0..b {
+                let row: Vec<f64> = before[r * d..r * d + p].iter().map(|&v| f64::from(v)).collect();
+                let host = l2_normalize(&row);
+                for j in 0..d {
+                    let (g, w) = (
+                        f64::from(after[r * d + j]),
+                        if j < p { host[j] } else { f64::from(before[r * d + j]) },
+                    );
+                    assert!((g - w).abs() <= 1e-6, "prefix {p} row {r} col {j}: {g} vs {w}");
+                }
+                got.extend(after[r * d..r * d + p].iter().map(|&v| f64::from(v)));
             }
+            assert_close(
+                &format!("pool prefix {p}"),
+                &got,
+                &want,
+                &(0..want.len()).collect::<Vec<_>>(),
+                5e-6,
+            );
         }
     });
 }
@@ -830,9 +853,15 @@ fn pool_and_normalize_refuse_bad_shapes() {
         let segs = buf_u32(rt, &[0, 4, 4, 8]);
         let out = rt.alloc_buffer(2 * 8 * 4).unwrap();
         assert!(segment_mean_rows(rt, &x, &segs, &out, 2, 9, 8).is_err(), "x too small");
-        assert!(segment_mean_rows(rt, &x, &segs, &out, 3, 8, 8).is_err(), "segments too small");
+        assert!(
+            segment_mean_rows(rt, &x, &segs, &out, 3, 8, 8).is_err(),
+            "segments too small"
+        );
         assert!(segment_mean_rows(rt, &x, &segs, &x, 2, 8, 8).is_err(), "out aliasing x");
-        assert!(segment_mean_rows(rt, &x, &segs, &segs, 2, 8, 8).is_err(), "out aliasing segments");
+        assert!(
+            segment_mean_rows(rt, &x, &segs, &segs, 2, 8, 8).is_err(),
+            "out aliasing segments"
+        );
         assert!(upload_segments(rt, &[(0, 4), (4, 9)], 8).is_err(), "end past rows");
         assert!(upload_segments(rt, &[(3, 3)], 8).is_err(), "empty range");
         assert!(upload_segments(rt, &[(5, 2)], 8).is_err(), "reversed range");
@@ -857,7 +886,16 @@ fn segment_means_take_any_device_ranges() {
         let (rows, d) = (37usize, 33usize);
         let x: Vec<f32> = (0..rows * d).map(|i| ((i * 7919) % 1013) as f32 / 97.0 - 5.0).collect();
         let xb = buf_f32(rt, &x);
-        let ranges: [(u32, u32); 8] = [(0, 37), (30, 31), (5, 20), (10, 15), (36, 1000), (12, 12), (20, 3), (u32::MAX, u32::MAX)];
+        let ranges: [(u32, u32); 8] = [
+            (0, 37),
+            (30, 31),
+            (5, 20),
+            (10, 15),
+            (36, 1000),
+            (12, 12),
+            (20, 3),
+            (u32::MAX, u32::MAX),
+        ];
         let flat: Vec<u32> = ranges.iter().flat_map(|&(a, b)| [a, b]).collect();
         let sb = buf_u32(rt, &flat);
         let out = rt.alloc_buffer(ranges.len() * d * 4).unwrap();
@@ -874,7 +912,10 @@ fn segment_means_take_any_device_ranges() {
                     continue;
                 }
                 let want = (start..end).map(|r| f64::from(x[r * d + j])).sum::<f64>() / (end - start) as f64;
-                assert!((f64::from(g) - want).abs() <= 1e-5 * want.abs().max(1.0), "segment {s} col {j}: {g} vs {want}");
+                assert!(
+                    (f64::from(g) - want).abs() <= 1e-5 * want.abs().max(1.0),
+                    "segment {s} col {j}: {g} vs {want}"
+                );
             }
         }
     });
@@ -901,12 +942,19 @@ const REAL_TEXT_CONFIG: &str = r#"{"architectures":["EmbeddingGemma2Model"],"mod
 #[test]
 fn config_reads_the_checkpoint() {
     let c = EmbedGemma2Config::from_config_json(REAL_TEXT_CONFIG).unwrap();
-    assert_eq!((c.hidden, c.ple_dim, c.intermediate, c.vocab, c.embedding_dim), (512, 512, 2048, 262144, 768));
+    assert_eq!(
+        (c.hidden, c.ple_dim, c.intermediate, c.vocab, c.embedding_dim),
+        (512, 512, 2048, 262144, 768)
+    );
     assert_eq!((c.q_heads, c.sliding_window, c.layers.len()), (4, 512, 24));
     for (i, l) in c.layers.iter().enumerate() {
         let full = i % 6 == 5;
         assert_eq!(l.sliding, !full, "layer {i}");
-        assert_eq!((l.head_dim, l.kv_heads), if full { (512, 1) } else { (256, 2) }, "layer {i}");
+        assert_eq!(
+            (l.head_dim, l.kv_heads),
+            if full { (512, 1) } else { (256, 2) },
+            "layer {i}"
+        );
         assert_eq!(l.rope_theta, if full { 1e6 } else { 1e4 }, "layer {i}");
     }
 }
@@ -916,18 +964,30 @@ fn config_refuses_what_the_forward_does_not_implement() {
     let cases = [
         ("\"gelu_pytorch_tanh\"", "\"silu\""),
         ("\"head_dim\":256", "\"head_dim\":128"),
-        ("\"05\":{\"head_dim\":512,", "\"05\":{\"sliding_window\":3,\"head_dim\":512,"),
+        (
+            "\"05\":{\"head_dim\":512,",
+            "\"05\":{\"sliding_window\":3,\"head_dim\":512,",
+        ),
         ("\"05\":{", "\"99\":{"),
         ("\"num_key_value_heads\":2", "\"num_key_value_heads\":3"),
         ("\"attention_bias\":false", "\"attention_bias\":true"),
-        ("\"rope_theta\":10000.0,\"rope_type\":\"default\"", "\"rope_theta\":10000.0,\"rope_type\":\"yarn\""),
+        (
+            "\"rope_theta\":10000.0,\"rope_type\":\"default\"",
+            "\"rope_theta\":10000.0,\"rope_type\":\"yarn\"",
+        ),
         ("\"num_hidden_layers\":24", "\"num_hidden_layers\":23"),
         ("\"sliding_window\":512", "\"sliding_window\":0"),
-        ("\"model_type\":\"embedding_gemma2_text\"", "\"model_type\":\"gemma4_text\""),
+        (
+            "\"model_type\":\"embedding_gemma2_text\"",
+            "\"model_type\":\"gemma4_text\"",
+        ),
     ];
     for (from, to) in cases {
         assert!(REAL_TEXT_CONFIG.contains(from), "test bug: {from} not in the config");
         let text = REAL_TEXT_CONFIG.replacen(from, to, 1);
-        assert!(EmbedGemma2Config::from_config_json(&text).is_err(), "{from} -> {to}: accepted");
+        assert!(
+            EmbedGemma2Config::from_config_json(&text).is_err(),
+            "{from} -> {to}: accepted"
+        );
     }
 }

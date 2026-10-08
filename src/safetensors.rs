@@ -30,7 +30,7 @@ use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::Read;
 use std::os::unix::fs::FileExt;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use crate::json::{self, Json, Syntax};
 use crate::plain::{self, PlainScalar};
@@ -137,15 +137,41 @@ impl TensorInfo {
     }
 }
 
-/// An open `.safetensors` file: its parsed header and where its data starts.
+/// Where a [`SafeTensors`]' bytes live.
+#[derive(Debug)]
+enum Source {
+    /// The handle whose header was validated; every read goes through it.
+    File(File),
+    /// The whole serialized form, header included.
+    Bytes(Vec<u8>),
+}
+
+/// An open `.safetensors` file (or its bytes): its parsed header and where its
+/// data starts.
 #[derive(Debug)]
 pub struct SafeTensors {
-    path: PathBuf,
-    /// The handle whose header was validated; every read goes through it.
-    file: File,
+    /// The path, or the label [`SafeTensors::from_bytes`] was given: what
+    /// errors name.
+    what: String,
+    source: Source,
     data_start: u64,
     tensors: BTreeMap<String, TensorInfo>,
     metadata: BTreeMap<String, String>,
+}
+
+/// The header length an 8-byte prefix declares, checked against the total
+/// length of a file or buffer.
+fn header_len(what: &str, len8: [u8; 8], total: u64) -> Result<u64, String> {
+    let n = u64::from_le_bytes(len8);
+    if n == 0 || n > MAX_HEADER_BYTES {
+        return Err(format!("{what}: header length {n} outside 1..={MAX_HEADER_BYTES}"));
+    }
+    if n > total - 8 {
+        return Err(format!(
+            "{what}: header length {n} runs past the end of a {total}-byte file"
+        ));
+    }
+    Ok(n)
 }
 
 impl SafeTensors {
@@ -157,22 +183,39 @@ impl SafeTensors {
         let mut len8 = [0u8; 8];
         f.read_exact(&mut len8)
             .map_err(|e| format!("{what}: header length: {e}"))?;
-        let n = u64::from_le_bytes(len8);
-        if n == 0 || n > MAX_HEADER_BYTES {
-            return Err(format!("{what}: header length {n} outside 1..={MAX_HEADER_BYTES}"));
-        }
-        if n > file_len - 8 {
-            return Err(format!(
-                "{what}: header length {n} runs past the end of a {file_len}-byte file"
-            ));
-        }
+        let n = header_len(&what, len8, file_len)?;
         let mut header = vec![0u8; n as usize];
         f.read_exact(&mut header).map_err(|e| format!("{what}: header: {e}"))?;
         let data_start = 8 + n;
         let (tensors, metadata) = parse_header(&header, file_len - data_start).map_err(|e| format!("{what}: {e}"))?;
         Ok(Self {
-            path: path.to_path_buf(),
-            file: f,
+            what,
+            source: Source::File(f),
+            data_start,
+            tensors,
+            metadata,
+        })
+    }
+
+    /// Validate `bytes`, a whole `.safetensors` serialization held in memory,
+    /// exactly as [`Self::open`] validates a file; errors name `what`. For
+    /// checkpoints built on the host (tests, conversions) that never need to
+    /// touch the file system.
+    pub fn from_bytes(what: &str, bytes: Vec<u8>) -> Result<Self, String> {
+        let mut len8 = [0u8; 8];
+        len8.copy_from_slice(
+            bytes
+                .get(..8)
+                .ok_or_else(|| format!("{what}: header length: {} bytes, need at least 8", bytes.len()))?,
+        );
+        let total = bytes.len() as u64;
+        let n = header_len(what, len8, total)?;
+        let data_start = 8 + n;
+        let (tensors, metadata) =
+            parse_header(&bytes[8..data_start as usize], total - data_start).map_err(|e| format!("{what}: {e}"))?;
+        Ok(Self {
+            what: what.to_string(),
+            source: Source::Bytes(bytes),
             data_start,
             tensors,
             metadata,
@@ -192,7 +235,7 @@ impl SafeTensors {
     pub fn info(&self, name: &str) -> Result<&TensorInfo, String> {
         self.tensors
             .get(name)
-            .ok_or_else(|| format!("{}: no tensor {name:?}", self.path.display()))
+            .ok_or_else(|| format!("{}: no tensor {name:?}", self.what))
     }
 
     /// Fill `dst` with `info`'s bytes from one positioned read into `dst`'s
@@ -206,12 +249,24 @@ impl SafeTensors {
                 info.end - info.begin
             ));
         }
-        // From the handle `open` validated, never the path again: a file
-        // replaced at that path since would be read with this header's
-        // offsets. A truncation of this same file fails here, not as short data.
-        self.file
-            .read_exact_at(bytes, self.data_start + info.begin)
-            .map_err(|e| format!("{name}: data: {e}"))?;
+        let start = self.data_start + info.begin;
+        match &self.source {
+            // From the handle `open` validated, never the path again: a file
+            // replaced at that path since would be read with this header's
+            // offsets. A truncation of this same file fails here, not as
+            // short data.
+            Source::File(f) => f
+                .read_exact_at(bytes, start)
+                .map_err(|e| format!("{name}: data: {e}"))?,
+            // `from_bytes` checked that every tensor lies inside the buffer.
+            Source::Bytes(b) => {
+                let src = usize::try_from(start)
+                    .ok()
+                    .and_then(|s| b.get(s..s.checked_add(bytes.len())?))
+                    .ok_or_else(|| format!("{name}: data: range past the {}-byte buffer", b.len()))?;
+                bytes.copy_from_slice(src);
+            }
+        }
         plain::le_to_native(dst);
         Ok(())
     }

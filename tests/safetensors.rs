@@ -28,18 +28,47 @@ fn file(tag: &str, header: &str, data: &[u8]) -> PathBuf {
     raw(tag, header.len() as u64, header.as_bytes(), data)
 }
 
+/// `open`'s error for `p`. The same bytes through `from_bytes` (under the same
+/// label) must be refused too, with the same message: the two share one
+/// validation. A file shorter than the length field is refused by each
+/// reader in its own words.
 fn open_err(p: PathBuf) -> String {
     let r = SafeTensors::open(&p);
+    let bytes = std::fs::read(&p).unwrap();
     let _ = std::fs::remove_file(&p);
-    match r {
-        Ok(_) => panic!("{} opened, expected an error", p.display()),
+    let label = p.display().to_string();
+    let e = match r {
+        Ok(_) => panic!("{label} opened, expected an error"),
         Err(e) => e,
+    };
+    match SafeTensors::from_bytes(&label, bytes.clone()) {
+        Ok(_) => panic!("{label}: from_bytes accepted what open refused ({e})"),
+        Err(b) if bytes.len() >= 8 => assert_eq!(b, e, "{label}: from_bytes and open disagree"),
+        Err(b) => assert!(b.contains("header length"), "{label}: {b}"),
     }
+    e
 }
 
 fn expect_rejected(tag: &str, header: &str, data: &[u8], needle: &str) {
     let e = open_err(file(tag, header, data));
     assert!(e.contains(needle), "{tag}: error {e:?} does not mention {needle:?}");
+}
+
+/// `from_bytes` on a file's bytes reads back every tensor exactly as `open`
+/// does, raw and typed.
+#[test]
+fn from_bytes_reads_what_open_reads() {
+    let (p, tensors) = integer_fixture();
+    let opened = SafeTensors::open(&p).unwrap();
+    let held = SafeTensors::from_bytes("in memory", std::fs::read(&p).unwrap()).unwrap();
+    std::fs::remove_file(&p).unwrap();
+    assert_eq!(held.names().collect::<Vec<_>>(), opened.names().collect::<Vec<_>>());
+    for (name, dtype, shape, bytes) in &tensors {
+        let (info, raw) = held.read_raw(name).unwrap();
+        assert_eq!((info.dtype, &info.shape, &raw), (*dtype, shape, bytes), "{name}");
+        assert_eq!(opened.read_raw(name).unwrap(), (info, raw), "{name}");
+    }
+    assert!(held.info("missing").unwrap_err().starts_with("in memory: "));
 }
 
 const ONE_F32: &str = r#"{"a":{"dtype":"F32","shape":[1],"data_offsets":[0,4]}}"#;

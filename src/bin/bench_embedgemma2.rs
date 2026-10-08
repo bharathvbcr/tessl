@@ -54,7 +54,10 @@ fn env_usize(name: &str, default: usize) -> Result<usize, String> {
 fn parse_workloads(spec: &str) -> Result<Vec<(usize, usize)>, String> {
     spec.split(',')
         .map(|w| {
-            let (b, t) = w.trim().split_once('x').ok_or_else(|| format!("workload {w:?}: expected BxT"))?;
+            let (b, t) = w
+                .trim()
+                .split_once('x')
+                .ok_or_else(|| format!("workload {w:?}: expected BxT"))?;
             let (b, t): (usize, usize) = (
                 b.parse().map_err(|e| format!("workload {w:?}: {e}"))?,
                 t.parse().map_err(|e| format!("workload {w:?}: {e}"))?,
@@ -88,21 +91,23 @@ fn main() -> Result<(), String> {
         let seqs: Vec<Vec<u32>> = (0..b).map(|s| ids(s, t)).collect();
         let batch: Vec<&[u32]> = seqs.iter().map(Vec::as_slice).collect();
 
-        let out = model.encode(&batch, false)?;
+        let out = model.encode(&batch, None, false)?;
         for (s, e) in out.embeddings.chunks(dim).enumerate() {
             let norm = e.iter().map(|&v| f64::from(v) * f64::from(v)).sum::<f64>().sqrt();
             if !e.iter().all(|v| v.is_finite()) || (norm - 1.0).abs() > 1e-4 {
-                return Err(format!("{b}x{t}: sequence {s} embedding is not a finite unit vector (norm {norm})"));
+                return Err(format!(
+                    "{b}x{t}: sequence {s} embedding is not a finite unit vector (norm {norm})"
+                ));
             }
         }
 
         for _ in 0..warmup {
-            model.encode(&batch, false)?;
+            model.encode(&batch, None, false)?;
         }
         let mut ms = Vec::with_capacity(iters);
         for _ in 0..iters {
             let t0 = Instant::now();
-            model.encode(&batch, false)?;
+            model.encode(&batch, None, false)?;
             ms.push(t0.elapsed().as_secs_f64() * 1e3);
         }
         ms.sort_by(f64::total_cmp);

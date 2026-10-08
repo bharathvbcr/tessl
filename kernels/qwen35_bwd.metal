@@ -440,7 +440,7 @@ inline void qwen35_norm_rope_row_bwd(
     uint D,
     uint rotary_dim,
     uint pos,
-    float theta,
+    constant float *inv_freq,
     float eps,
     uint lane,
     thread float *acc)
@@ -458,7 +458,7 @@ inline void qwen35_norm_rope_row_bwd(
         float v;
         if (d < rotary_dim) {
             const uint p = d < half_rot ? d : d - half_rot;
-            const float angle = qwen35_rope_angle(p, rotary_dim, pos, theta);
+            const float angle = qwen35_rope_angle(inv_freq, p, pos);
             const float c = precise::cos(angle);
             const float s = precise::sin(angle);
             // out[p] = n0 c - n1 s, out[p + half] = n1 c + n0 s.
@@ -493,6 +493,9 @@ inline void qwen35_norm_rope_row_bwd(
 /// (1 + w) gradients are summed per block, simdgroups in order, into
 /// `part[block, :]` (q norm) and `part[nblocks + block, :]` (k norm).
 ///
+/// `inv_freq` is the forward's `rotary_dim / 2` frequency table
+/// (`nn::rope_inv_freq`), so the inverse rotation is its exact transpose.
+///
 /// Grid: ceil(B*T / rows_per_block) threadgroups of QK_BWD_SG * 32 threads,
 /// `D <= 32 * BWD_MAX_COLS`.
 kernel void qwen35_attn_qk_norm_rope_bwd_f32(
@@ -514,7 +517,7 @@ kernel void qwen35_attn_qk_norm_rope_bwd_f32(
     constant uint &q_off [[buffer(15)]],
     constant uint &k_off [[buffer(16)]],
     constant uint &v_off [[buffer(17)]],
-    constant float &theta [[buffer(18)]],
+    constant float *inv_freq [[buffer(18)]],
     constant float &eps [[buffer(19)]],
     constant uint &rows_per_block [[buffer(20)]],
     uint blk [[threadgroup_position_in_grid]],
@@ -543,12 +546,12 @@ kernel void qwen35_attn_qk_norm_rope_bwd_f32(
         if (j < Hq) {
             const ulong col = q_off + (ulong)j * 2u * D;
             qwen35_norm_rope_row_bwd(row + col, q_norm_w, dq + (r * Hq + j) * (ulong)D, drow + col,
-                                     D, rotary_dim, pos, theta, eps, lane, acc_q);
+                                     D, rotary_dim, pos, inv_freq, eps, lane, acc_q);
         } else if (j < Hq + Hkv) {
             const uint h = j - Hq;
             const ulong col = k_off + (ulong)h * D;
             qwen35_norm_rope_row_bwd(row + col, k_norm_w, dk + (r * Hkv + h) * (ulong)D, drow + col,
-                                     D, rotary_dim, pos, theta, eps, lane, acc_k);
+                                     D, rotary_dim, pos, inv_freq, eps, lane, acc_k);
         } else {
             const uint h = j - Hq - Hkv;
             device const float *src = dv + (r * Hkv + h) * (ulong)D;

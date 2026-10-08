@@ -206,6 +206,44 @@ All notable changes to `tessl` are recorded here. The format follows
 
 ### Fixed
 
+- **RoPE drifted from transformers with position.** `qwen35_attn_qk_norm_rope`
+  (Qwen3.5 and EmbedGemma2), its backward and `rms_qkv_rope` computed
+  `inv_freq` on the device. That is about an ulp off torch's host-computed
+  table at most pairs, and the angle `pos * inv_freq` multiplies it by the
+  position. `rms_qkv_rope` also used fast `pow`/`cos`/`sin`.
+  - Before: q/k were `1.2e-4` relative off transformers at position 1600,
+    and `rms_qkv_rope` was `4e-4` off at 8000 and `1.5e-3` at 32000.
+    EmbedGemma2's 1658-token trace reached `1.8e-4`.
+  - Now: every RoPE kernel reads `nn::rope_inv_freq` from the host, bound as
+    constant data in the dispatch's arena (no allocation, no host mapping,
+    captured as an immediate for ICB replay), and `rms_qkv_rope` uses
+    `precise::` cos/sin. The 1658-token trace is within `4.9e-5`, and
+    `rms_qkv_rope` holds `3e-5` at position 32000.
+  - Tests that fail on the old kernels: `qkv_columns_norm_rope_far_positions`
+    (d=256 and d=512 at position 8000 against transformers, with a derived
+    bound) and `rms_qkv_rope_holds_at_far_positions`.
+  - Kernel ABI: `qwen35_attn_qk_norm_rope{,_posbuf}` and
+    `qwen35_attn_qk_norm_rope_bwd_f32` take the table at buffer 18 where
+    `theta` was. `rms_qkv_rope*` keep `theta` at 12 (gemma-metal binds it
+    from its scalar pool) and take the table at 18, which
+    `rms_qkv_rope_with_scalars` binds itself after the callback.
+- **Model weights were allocated as mid-step temporaries.** `EmbedGemma2Model`
+  and `Qwen35Model` loaded their weights `BufferKind::Cold`, so dropping a
+  model parked them in the pool's freelist instead of releasing them (2.2 MB
+  and 1.2 MB of the tiny test checkpoints stayed allocated). They are `Hot`
+  now, as the runtime documents for weights; activations stay `Cold`.
+- **The CPU kernel emulator did not build** after the `-FLT_MAX` change:
+  `tools/msl_emu/metal_stdlib` never included `<cfloat>`, whose limits MSL
+  predefines. The emulator's Qwen3.5 RoPE checks now pass transformers' own
+  `inv_freq` and hold q/k to `2e-5` at position 30000 (was `2e-4`).
+- **EmbedGemma2 read the wrong K/V rows at batch > 1 when layers differ in
+  `kv_heads * head_dim`.** One K/V buffer was sized for the widest layer. The
+  writer derives its per-sequence stride from the buffer's size, while the
+  attention and value norm read at stride `seq`, so in narrower layers every
+  sequence after the first was misread (cosine `0.27` in the tiny test).
+  Each width now gets exactly sized buffers. The released checkpoint has
+  width 512 in every layer and was not affected. A missing value-norm buffer
+  is now an error instead of a library `.expect`.
 - **No kernel relies on an infinity under fast math.** `build.rs` compiles
   every kernel with `-fmetal-math-mode=fast`, whose IR marks float compares
   `fast` (including `ninf`), so `m == -INFINITY` was a compare the GPU
@@ -270,6 +308,27 @@ All notable changes to `tessl` are recorded here. The format follows
 
 ### Added
 
+- **EmbeddingGemma 2 text encoder (`tessl::embedgemma2`).** It loads
+  `google/embeddinggemma-2`'s text path from its own `model.safetensors` and
+  embeds ragged batches: the `encoder_attn` bidirectional sliding-window
+  kernel, `segment_mean_rows`, `l2_normalize_rows`, and length-sorted forward
+  packing. It was first run on the GPU on an M5 Pro against
+  sentence-transformers 6.1 (fp32 eager): every embedding up to 6147 tokens
+  is within `2.5e-7` max abs, every Matryoshka prefix within `3.9e-7`, and
+  the per-layer residual stream of a 1658-token text within `4.9e-5` of its
+  largest magnitude. `docs/embedgemma2.md` has the bounds and observed
+  errors.
+  - `tests/embedgemma2_tiny.rs` runs the whole forward on a random tiny
+    checkpoint, built in memory, against an f64 host forward, in the plain
+    GPU suite.
+  - The reference and fixture generators record `provenance.json`: library
+    versions and the generator commit.
+- **`SafeTensors::from_bytes`** validates and reads a `.safetensors`
+  serialization held in memory, through the same header checks as
+  `SafeTensors::open`. Every malformed-file test now runs through both.
+- **`nn::rope_inv_freq`**: transformers' RoPE frequency table (`1.0 /
+  (theta ** ((2p).float() / dim))` in f32), the one every RoPE kernel now
+  reads.
 - **Device memory accounting.** `GpuRuntime::peak_allocated_bytes` and
   `reset_peak_allocated_bytes` (the high-water mark of `currentAllocatedSize`,
   sampled at every buffer the pool creates), `GpuRuntime::allocated_bytes_for`
@@ -467,6 +526,18 @@ All notable changes to `tessl` are recorded here. The format follows
 
 ### Changed (breaking)
 
+- **`EmbedGemma2Model::encode` takes `truncate_dim: Option<u32>`** between
+  the batch and `trace`. `Some(d)` returns `[batch, d]` Matryoshka prefixes,
+  normalized on the GPU over the prefix, as sentence-transformers'
+  `encode(truncate_dim=d, normalize_embeddings=True)` does. `None` keeps the
+  full `embedding_dim`.
+- **`embedgemma2::truncate_renormalize` is removed.** It was a host copy of
+  what `l2_normalize_rows` does on the GPU; pass `truncate_dim` to `encode`
+  instead.
+- **`EmbedGemma2Model::load` refuses tensors under the prefix that the
+  forward does not read** (a bias, an extra norm), naming them, where it
+  ignored them before. Tensors outside the prefix (the vision and audio
+  towers) are still not read.
 - `set_binder_encode_nop` is no longer public: while armed, every encode on
   its thread returns `Ok(())` having done nothing. `BinderEncodeNopGuard`
   still arms it for a scope, and the new `clear_binder_encode_nop` can only

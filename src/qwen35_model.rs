@@ -431,7 +431,7 @@ impl Loader<'_> {
     }
 
     fn f32_buf(&self, data: &[f32]) -> Result<GpuBuffer, String> {
-        let b = self.rt.alloc_buffer(data.len().max(1) * 4)?;
+        let b = self.rt.alloc_buffer_hot(data.len().max(1) * 4)?;
         b.write_f32(data);
         Ok(b)
     }
@@ -463,7 +463,7 @@ impl Loader<'_> {
         let mut col0 = 0;
         match precision {
             Precision::Bf16 => {
-                let t = self.rt.alloc_tensor_bf16(&[in_features, total])?;
+                let t = self.rt.alloc_tensor_bf16_hot(&[in_features, total])?;
                 for &(rest, out) in parts {
                     let part = self.bf16(rest, &[out, in_features])?;
                     qwen35::place_linear_part(&mut t.buffer.try_contents_u16()?, total, col0, &part, out, in_features)?;
@@ -472,7 +472,7 @@ impl Loader<'_> {
                 Ok(t)
             }
             Precision::F32 => {
-                let t = self.rt.alloc_tensor_f32(&[in_features, total])?;
+                let t = self.rt.alloc_tensor_f32_hot(&[in_features, total])?;
                 for &(rest, out) in parts {
                     let part = self.f32(rest, &[out, in_features])?;
                     qwen35::place_linear_part(&mut t.buffer.try_contents_f32()?, total, col0, &part, out, in_features)?;
@@ -529,13 +529,13 @@ impl Qwen35Model {
         // transposed right operand of one GEMM.
         let (embed, lm_head_bf16) = match precision {
             Precision::Bf16 => {
-                let t = rt.alloc_tensor_bf16(&[vocab, h])?;
+                let t = rt.alloc_tensor_bf16_hot(&[vocab, h])?;
                 let head = if with_head {
                     // One host copy of the table, placed into both device
                     // tensors and dropped; never a second, packed host copy.
                     let bits = ld.bf16("embed_tokens.weight", &[vocab, h])?;
                     t.buffer.write_bf16_bits(&bits);
-                    let head = rt.alloc_tensor_bf16(&[h, vocab])?;
+                    let head = rt.alloc_tensor_bf16_hot(&[h, vocab])?;
                     qwen35::place_linear_part(&mut head.buffer.try_contents_u16()?, vocab, 0, &bits, vocab, h)?;
                     Some(head)
                 } else {
@@ -548,7 +548,7 @@ impl Qwen35Model {
             }
             Precision::F32 => {
                 // Widened straight into the table: no host copy at all.
-                let t = rt.alloc_tensor_f32(&[vocab, h])?;
+                let t = rt.alloc_tensor_f32_hot(&[vocab, h])?;
                 let name = ld.name("embed_tokens.weight");
                 st.read_f32_into(&name, &[vocab, h], &mut t.buffer.try_contents_f32()?)?;
                 (t, None)

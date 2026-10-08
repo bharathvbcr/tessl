@@ -1,0 +1,12 @@
+{
+ "generator": "scripts/gen_embedgemma2_fixtures.py",
+ "commit": "4e5faac188b2087cbec2b25920ca5988b53ed103",
+ "worktree_dirty": true,
+ "python": "3.14.8",
+ "versions": {
+  "torch": "2.12.1",
+  "numpy": "2.5.0",
+  "transformers": "5.19.0",
+  "sentence-transformers": "6.1.0"
+ }
+}

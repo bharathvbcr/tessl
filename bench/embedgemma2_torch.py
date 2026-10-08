@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """The PyTorch lane for bench/paired_embedgemma2.py.
 
-sentence-transformers' google/embeddinggemma-2 (Transformer -> mean Pooling ->
-Dense -> Normalize) on MPS, fed the same token ids as bench_embedgemma2 (no
-tokenization in either lane). Prints one JSON array like the Rust lane's.
+sentence-transformers' google/embeddinggemma-2 (modules.json: Transformer ->
+mean Pooling -> Normalize; there is no Dense module, the 512 -> 768
+embedding_projection is inside the Transformer) on MPS, fed the same token ids
+as bench_embedgemma2 (no tokenization in either lane). Prints one JSON array like the Rust lane's.
 
     ~/.venvs/ml/bin/python bench/embedgemma2_torch.py --dtype f32
 

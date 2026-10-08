@@ -2313,6 +2313,69 @@ pub struct KvStoreTarget<'a> {
     pub capacity: u32,
 }
 
+/// RoPE frequencies for `pairs` rotary pairs at `theta`, as transformers
+/// computes them: `inv_freq[p] = 1.0 / (theta ** ((2p).float() / dim))` in
+/// f32. `dim` is the exponent's denominator: the rotary width for
+/// transformers' (partial) RoPE (`qwen35`, `embedgemma2`), the full head dim
+/// for Gemma's proportional RoPE ([`rms_qkv_rope`]). The exponent is the f32
+/// quotient, the power is the correctly rounded f32 of the exact power (the
+/// f64 power, rounded once), and the reciprocal is an f32 division.
+///
+/// Every RoPE kernel reads this table instead of computing `pow` on the
+/// device. A device `pow` lands about an ulp away from torch's at most pairs,
+/// and the angle `pos * inv_freq` multiplies that by the position: 1.2e-4
+/// relative on q/k at position 1600, 4e-4 at 8000. This table matches
+/// torch's bit for bit except where torch's own f32 `pow` is not correctly
+/// rounded: 1 of 128 pairs at `(256, 1e4)` and 3 of 256 at `(512, 1e6)`,
+/// each one ulp.
+pub fn rope_inv_freq(pairs: u32, dim: u32, theta: f32) -> Vec<f32> {
+    (0..pairs)
+        .map(|p| {
+            let e = (2 * p) as f32 / dim as f32;
+            1.0f32 / (f64::from(theta).powf(f64::from(e)) as f32)
+        })
+        .collect()
+}
+
+/// Bind [`rope_inv_freq`] at `index` as constant data (a `constant float *`
+/// in the kernel). It goes into the dispatch's constant arena like a scalar,
+/// so binding needs no allocation and no host mapping (which would wait for
+/// the GPU), and an ICB capture records it as an immediate. The encoded bytes
+/// are cached per thread for the last few `(pairs, dim, theta)`, so a decode
+/// loop does not recompute the powers per token.
+pub(crate) fn bind_rope_inv_freq(bnd: &mut Binder<'_>, pairs: u32, dim: u32, theta: f32, index: usize) {
+    /// A model has one or two RoPE configurations; a few more is generous.
+    const CACHED: usize = 8;
+    type Entry = ((u32, u32, u32), Vec<u8>);
+    thread_local! {
+        static CACHE: std::cell::RefCell<Vec<Entry>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+    let key = (pairs, dim, theta.to_bits());
+    CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        let at = match cache.iter().position(|(k, _)| *k == key) {
+            Some(at) => at,
+            None => {
+                let mut bytes: Vec<u8> = rope_inv_freq(pairs, dim, theta)
+                    .iter()
+                    .flat_map(|v| v.to_ne_bytes())
+                    .collect();
+                // Zero pairs rotate nothing and read no entry, but the arena
+                // refuses an empty payload.
+                if bytes.is_empty() {
+                    bytes.extend_from_slice(&0f32.to_ne_bytes());
+                }
+                if cache.len() == CACHED {
+                    cache.remove(0);
+                }
+                cache.push((key, bytes));
+                cache.len() - 1
+            }
+        };
+        bnd.bind_bytes(&cache[at].1, index);
+    });
+}
+
 /// Fused per-head RMSNorm, QKV projection scaling, and rotary embedding.
 ///
 /// `q`, `k` and `v` are read and written in place: they arrive holding the raw
@@ -2332,7 +2395,8 @@ pub struct KvStoreTarget<'a> {
 /// 9 = `D`, 10 = `rotary_dim`, 11 = `pos_offset` (`PosConst` only),
 /// 12 = `theta` (f32), 13 = `eps` (f32), and for
 /// [`QkvRopeVariant::PosBufferKvStore`] 17 = the callback's validated cache
-/// capacity.
+/// capacity. Slot 18, the frequency table [`rope_inv_freq`], is bound by the
+/// wrapper, not the callback.
 #[allow(clippy::too_many_arguments)]
 pub fn rms_qkv_rope(
     rt: &Arc<GpuRuntime>,
@@ -2554,6 +2618,11 @@ pub fn validate_rms_qkv_rope(
 /// let the padding simdgroups run the K/V branches over Q storage. The
 /// callback may still bind slot 8 as documented; the override is this
 /// wrapper's responsibility, not the adapter's.
+///
+/// Slot 18, the RoPE frequency table ([`rope_inv_freq`]`(rotary_dim / 2,
+/// head_dim, theta)`), is also bound by this wrapper after `scalars` returns,
+/// from the validated `dims.theta`; the callback must not bind it. Slot 12
+/// (`theta`) stays in the callback's contract.
 #[allow(clippy::too_many_arguments)]
 pub unsafe fn rms_qkv_rope_with_scalars(
     rt: &Arc<GpuRuntime>,
@@ -2603,6 +2672,10 @@ pub unsafe fn rms_qkv_rope_with_scalars(
         // The unsafe stable-scalar seam runs last so a fused-cache adapter may
         // replace slot 16 with a validated byte-offset view of `dst_offset`.
         scalars(bnd, kv_capacity);
+        // The RoPE frequencies are derived here from the validated `theta`,
+        // not left to the callback: a stable scalar pool holds scalars, and
+        // the table is `rotary_dim / 2` floats of constant data.
+        bind_rope_inv_freq(bnd, dims.rotary_dim / 2, dims.head_dim, dims.theta, 18);
         if q_only {
             // The grid is `T * Hq` rows rounded up to whole threadgroups and
             // the kernel's guard is `T*Hq + 2*T*Hkv`: with the real `Hkv`

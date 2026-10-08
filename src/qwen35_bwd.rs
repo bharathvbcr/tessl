@@ -581,7 +581,7 @@ pub fn attn_qk_norm_rope_bwd(
         set_u32(bnd, proj.off + layout.q_off(), 15);
         set_u32(bnd, proj.off + layout.k_off(), 16);
         set_u32(bnd, proj.off + layout.v_off(), 17);
-        set_f32(bnd, theta, 18);
+        crate::nn::bind_rope_inv_freq(bnd, s.rotary_dim / 2, s.rotary_dim, theta, 18);
         set_f32(bnd, eps, 19);
         set_u32(bnd, QK_ROWS_PER_BLOCK, 20);
     })?;

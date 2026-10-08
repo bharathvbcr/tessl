@@ -12,8 +12,8 @@ use std::sync::Arc;
 
 use common::{empty, with_gpu, with_two_gpus};
 use tessl::nn::{
-    self, AttnDims, GateUpDispatch, KvStoreTarget, Q4Bank, Q4MlxBank, QkvBuffers, QkvRopeDims, QkvRopeVariant,
-    QuantShape,
+    self, AttnDims, GateUpDispatch, KvStoreTarget, Q4Bank, Q4MlxBank, QkvBuffers, QkvRopeDims,
+    QkvRopeVariant, QuantShape,
 };
 use tessl::{GpuBuffer, GpuRuntime};
 
@@ -77,7 +77,9 @@ fn every_nn_buffer_family_rejects_foreign_runtime_storage_before_encode() {
             primary,
             foreign_rt,
             "quantized bank",
-            nn::gemv_q8(primary, &foreign, &local, &local_2, &local_3, &local, 1, 32, 32),
+            nn::gemv_q8(
+                primary, &foreign, &local, &local_2, &local_3, &local, 1, 32, 32,
+            ),
         );
         assert_foreign_rejected(
             primary,
@@ -89,7 +91,9 @@ fn every_nn_buffer_family_rejects_foreign_runtime_storage_before_encode() {
             primary,
             foreign_rt,
             "KV pair destination",
-            nn::kv_store_timestep_pair(primary, &local, &local_2, &local_3, &foreign, &scalar, 4, 16),
+            nn::kv_store_timestep_pair(
+                primary, &local, &local_2, &local_3, &foreign, &scalar, 4, 16,
+            ),
         );
         assert_foreign_rejected(
             primary,
@@ -110,17 +114,9 @@ fn every_nn_buffer_family_rejects_foreign_runtime_storage_before_encode() {
             primary,
             foreign_rt,
             "attention K",
-            nn::flash_attn_swa(
-                primary,
-                tessl::nn::AttnHeadDim::D128,
-                &local,
-                &foreign,
-                &local_2,
-                &local_3,
-                &scalar,
-                &scalar,
-                &scalar,
-                attn_dims,
+            nn::flash_attn_rows(
+                primary, &local, &foreign, &local_2, &local_3, &scalar, &scalar, &scalar,
+                attn_dims, 128, false,
             ),
         );
 
@@ -303,7 +299,8 @@ fn q_only_never_binds_inactive_foreign_buffers_and_rejects_cache_store_cleanly()
             "unexpected error: {err}"
         );
         assert_eq!(primary.take_dispatch_count(), 0);
-        nn::scale_f32_inplace(primary, &q, 1.0, 4).expect("early q_only rejection must not poison the runtime");
+        nn::scale_f32_inplace(primary, &q, 1.0, 4)
+            .expect("early q_only rejection must not poison the runtime");
         primary.synchronize().expect("post-rejection completion");
         assert!(primary.take_dispatch_count() > 0);
         assert_eq!(foreign_rt.take_dispatch_count(), 0);

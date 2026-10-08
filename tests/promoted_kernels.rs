@@ -153,7 +153,10 @@ fn kernels_left_behind_do_not_resolve_from_tessl() {
     // resolved *every* string — or a metallib that had silently absorbed all of
     // gemma's kernels — would look identical to a correct promotion.
     common::with_gpu(|rt| {
-        let leaked: Vec<_> = NOT_PROMOTED.iter().filter(|name| rt.pipeline(name).is_ok()).collect();
+        let leaked: Vec<_> = NOT_PROMOTED
+            .iter()
+            .filter(|name| rt.pipeline(name).is_ok())
+            .collect();
         assert!(
             leaked.is_empty(),
             "Gemma-specific kernels reached tessl's metallib: {leaked:?}"

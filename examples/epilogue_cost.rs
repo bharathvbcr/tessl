@@ -33,7 +33,8 @@ fn ms(total: Duration, iters: usize) -> f64 {
 
 fn filled(rt: &std::sync::Arc<GpuRuntime>, shape: &[usize], v: f32) -> Tensor {
     let t = rt.alloc_tensor_f32(shape).expect("alloc");
-    t.buffer.write_f32(&vec![v; shape.iter().product::<usize>()]);
+    t.buffer
+        .write_f32(&vec![v; shape.iter().product::<usize>()]);
     t
 }
 

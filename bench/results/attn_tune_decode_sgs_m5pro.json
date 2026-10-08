@@ -1,0 +1,46 @@
+{
+  "knob": "decode-sgs",
+  "env": "BENCH_ATTN_DECODE_SGS",
+  "values": [
+    "one",
+    "group",
+    "all"
+  ],
+  "rounds": 5,
+  "iters": 20,
+  "batched": 32,
+  "median_ms": {
+    "one": {
+      "swa128_decode_1k": 0.037251,
+      "swa128_decode_4k": 0.045998,
+      "swa128_decode_b8_4k": 0.439458,
+      "swa256_decode_4k": 0.056788,
+      "global512_decode_4k": 0.192561,
+      "global512_decode_4k_mha": 0.610031
+    },
+    "group": {
+      "swa128_decode_1k": 0.035064,
+      "swa128_decode_4k": 0.041365,
+      "swa128_decode_b8_4k": 0.33917,
+      "swa256_decode_4k": 0.053948,
+      "global512_decode_4k": 0.16985,
+      "global512_decode_4k_mha": 0.585426
+    },
+    "all": {
+      "swa128_decode_1k": 0.057732,
+      "swa128_decode_4k": 0.061581,
+      "swa128_decode_b8_4k": 0.340286,
+      "swa256_decode_4k": 0.080174,
+      "global512_decode_4k": 0.167629,
+      "global512_decode_4k_mha": 0.578135
+    }
+  },
+  "winner": {
+    "swa128_decode_1k": "group",
+    "swa128_decode_4k": "group",
+    "swa128_decode_b8_4k": "group",
+    "swa256_decode_4k": "group",
+    "global512_decode_4k": "all",
+    "global512_decode_4k_mha": "all"
+  }
+}

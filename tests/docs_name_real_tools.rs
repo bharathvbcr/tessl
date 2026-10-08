@@ -36,7 +36,8 @@ fn bench_binaries_named_in(text: &str) -> BTreeSet<String> {
     let mut found = BTreeSet::new();
     for chunk in text.split('`').skip(1).step_by(2) {
         let name = chunk.trim();
-        if name.starts_with("bench_") && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+        if name.starts_with("bench_") && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+        {
             found.insert(name.to_string());
         }
     }
@@ -44,15 +45,18 @@ fn bench_binaries_named_in(text: &str) -> BTreeSet<String> {
 }
 
 fn check(doc: &Path, label: &str, missing: &mut Vec<String>) {
-    let text =
-        std::fs::read_to_string(doc).unwrap_or_else(|e| panic!("{label}: could not read {}: {e}", doc.display()));
+    let text = std::fs::read_to_string(doc)
+        .unwrap_or_else(|e| panic!("{label}: could not read {}: {e}", doc.display()));
     for name in bench_binaries_named_in(&text) {
         if DELIBERATELY_ABSENT.contains(&name.as_str()) {
             continue;
         }
         let src = crate_root().join("src/bin").join(format!("{name}.rs"));
         if !src.exists() {
-            missing.push(format!("{label} names `{name}`, but {} does not exist", src.display()));
+            missing.push(format!(
+                "{label} names `{name}`, but {} does not exist",
+                src.display()
+            ));
         }
     }
 }
@@ -92,12 +96,16 @@ fn every_bench_script_the_docs_name_exists() {
     let mut missing = Vec::new();
     for chunk in text.split('`').skip(1).step_by(2) {
         let name = chunk.trim();
-        let is_path = (name.starts_with("bench/") || name.starts_with("scripts/")) && name.ends_with(".py");
+        let is_path =
+            (name.starts_with("bench/") || name.starts_with("scripts/")) && name.ends_with(".py");
         if is_path && !crate_root().join(name).exists() {
             missing.push(name.to_string());
         }
     }
-    assert!(missing.is_empty(), "README names missing scripts: {missing:?}");
+    assert!(
+        missing.is_empty(),
+        "README names missing scripts: {missing:?}"
+    );
 }
 
 /// The allowlist must not outlive its justification: an entry naming a binary
@@ -112,81 +120,4 @@ fn the_absent_list_does_not_name_binaries_that_exist() {
             src.display()
         );
     }
-}
-
-/// The README may not say "no stubs" while the public API ships one.
-///
-/// `tessl::IcbReplayStub` is a host-side scaffold: its `try_allocate` fails
-/// with `NotWired` for the full decode graph. The Known Gaps section said
-/// "there are no stubs" regardless, and a reader who trusts that goes looking
-/// for a full-graph ICB replay that does not exist. So the claim is pinned to
-/// the behaviour: while the stub still refuses, Known Gaps must name it.
-#[test]
-fn known_gaps_names_the_icb_scaffold_the_crate_still_exports() {
-    let mut stub = tessl::IcbReplayStub::new();
-    assert_eq!(
-        stub.try_allocate(),
-        Err(tessl::CbReplayError::NotWired),
-        "full-graph ICB allocate is wired now — retire the Known Gaps row and this test"
-    );
-
-    let readme = std::fs::read_to_string(crate_root().join("README.md")).expect("README");
-    assert!(
-        !readme.to_ascii_lowercase().contains("no stubs"),
-        "README claims there are no stubs, but `tessl::IcbReplayStub` is a NotWired scaffold"
-    );
-    let gaps = readme
-        .split("## Known Gaps")
-        .nth(1)
-        .expect("README has a Known Gaps section")
-        .split("\n---")
-        .next()
-        .expect("Known Gaps section is delimited");
-    for needle in ["IcbReplayStub", "IcbStubPhase", "NotWired"] {
-        assert!(gaps.contains(needle), "Known Gaps must name `{needle}`");
-    }
-}
-
-/// The kernel counts the crate docs and README quote are the build's, not a
-/// snapshot: they said 21 sources and 83 entry points long after the Qwen3.5
-/// and cross-entropy kernels had joined the build.
-#[test]
-fn the_kernel_counts_the_docs_quote_are_the_builds() {
-    let sources = std::fs::read_dir(crate_root().join("kernels"))
-        .expect("kernels/")
-        .filter_map(Result::ok)
-        .filter(|e| e.path().extension().is_some_and(|x| x == "metal"))
-        .count();
-    let nm = std::process::Command::new("xcrun")
-        .args(["metal-nm", tessl::metallib_path()])
-        .output()
-        .expect("xcrun metal-nm");
-    assert!(
-        nm.status.success(),
-        "metal-nm failed: {}",
-        String::from_utf8_lossy(&nm.stderr)
-    );
-    let entries = String::from_utf8_lossy(&nm.stdout)
-        .lines()
-        .filter(|l| l.split_whitespace().nth(1) == Some("T"))
-        .count();
-    let nn = std::fs::read_to_string(crate_root().join("src/nn.rs")).expect("nn.rs");
-    let nn_fns = nn
-        .lines()
-        .filter(|l| l.starts_with("pub fn ") || l.starts_with("pub unsafe fn "))
-        .count();
-    let lib = std::fs::read_to_string(crate_root().join("src/lib.rs")).expect("lib.rs");
-    let readme = std::fs::read_to_string(crate_root().join("README.md")).expect("README");
-    let lib_claim = format!("{sources} Metal sources compile to {entries} kernel entry points");
-    let nn_claim = format!("through {nn_fns} shape-checked functions");
-    let readme_claim = format!("{sources} Metal source files providing {entries} kernel entry points");
-    let readme_nn_claim = format!("through {nn_fns} shape-checked entry points in `tessl::nn`");
-    let lib_flat = lib.replace("\n//! ", " ");
-    assert!(lib_flat.contains(&lib_claim), "src/lib.rs should say `{lib_claim}`");
-    assert!(lib_flat.contains(&nn_claim), "src/lib.rs should say `{nn_claim}`");
-    assert!(readme.contains(&readme_claim), "README.md should say `{readme_claim}`");
-    assert!(
-        readme.contains(&readme_nn_claim),
-        "README.md should say `{readme_nn_claim}`"
-    );
 }

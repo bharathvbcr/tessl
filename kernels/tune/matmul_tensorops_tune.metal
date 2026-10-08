@@ -18,10 +18,7 @@ inline uint2 tune_tile_from_linear(uint linear, uint tiles_n) {
 
 /// ACCUM_FIRST=true reproduces production (all blocks accumulate; C must be
 /// pre-zeroed). ACCUM_FIRST=false makes block 0 `multiply`, retiring the zero.
-// A call with no explicit template arguments is the control kernel
-// `mm_bf16_64x32_bk128_sg4_accf` (64×32, BK 128, sg4, accumulate-first).
-template <int SM = 64, int SN = 32, int BK = 128, int NSG = 4,
-          bool ACCUM_FIRST = true>
+template <int SM, int SN, int BK, int NSG, bool ACCUM_FIRST>
 inline void mm_bf16_tune(device bfloat *A, device bfloat *B, device float *C,
                          uint M, uint N, uint K, uint tiles_n, uint tgpig) {
     constexpr auto d_mul = matmul2d_descriptor(
@@ -65,17 +62,7 @@ inline void mm_bf16_tune(device bfloat *A, device bfloat *B, device float *C,
     }
 
 // Control: production geometry + production accumulate-first behaviour.
-kernel void mm_bf16_64x32_bk128_sg4_accf(
-    device bfloat *A [[buffer(0)]],
-    device bfloat *B [[buffer(1)]],
-    device float *C [[buffer(2)]],
-    constant uint &M [[buffer(3)]],
-    constant uint &N [[buffer(4)]],
-    constant uint &K [[buffer(5)]],
-    constant uint &tiles_n [[buffer(6)]],
-    uint tgpig [[threadgroup_position_in_grid]]) {
-    mm_bf16_tune(A, B, C, M, N, K, tiles_n, tgpig);
-}
+TUNE_KERNEL(mm_bf16_64x32_bk128_sg4_accf,  64,  32, 128, 4, true)
 // Same geometry, zero pre-pass retired.
 TUNE_KERNEL(mm_bf16_64x32_bk128_sg4,       64,  32, 128, 4, false)
 // Arithmetic-intensity ladder.
@@ -115,12 +102,8 @@ TUNE_KERNEL(mm_bf16_256x64_bk256_sg8,   256,  64, 256, 8, false)
 // SM*SN*4 / (32*NSG) bytes per thread, which is why big tiles pair with sg8.
 // =============================================================================
 
-// A call with no explicit template arguments is `mm_bf16_coop_64x32_sg4`.
-// ElemT = float is the exact-f32 (non-relaxed) descriptor: production's exact
-// f32 NN runs 32x32 on one simdgroup with a zero pre-pass (`TILE_F32`), with
-// no register accumulator; these variants ask whether one pays at f32.
-template <int SM = 64, int SN = 32, int NSG = 4, typename ElemT = bfloat>
-inline void mm_bf16_coop(device ElemT *A, device ElemT *B, device float *C,
+template <int SM, int SN, int NSG>
+inline void mm_bf16_coop(device bfloat *A, device bfloat *B, device float *C,
                          uint M, uint N, uint K, uint tiles_n, uint tgpig) {
     constexpr auto d = matmul2d_descriptor(
         SM, SN, dynamic_length_v<int>, false, false, false,
@@ -164,37 +147,12 @@ inline void mm_bf16_coop(device ElemT *A, device ElemT *B, device float *C,
         mm_bf16_coop<SM, SN, NSG>(A, B, C, M, N, K, tiles_n, tgpig);           \
     }
 
-kernel void mm_bf16_coop_64x32_sg4(
-    device bfloat *A [[buffer(0)]],
-    device bfloat *B [[buffer(1)]],
-    device float *C [[buffer(2)]],
-    constant uint &M [[buffer(3)]],
-    constant uint &N [[buffer(4)]],
-    constant uint &K [[buffer(5)]],
-    constant uint &tiles_n [[buffer(6)]],
-    uint tgpig [[threadgroup_position_in_grid]]) {
-    mm_bf16_coop(A, B, C, M, N, K, tiles_n, tgpig);
-}
+TUNE_COOP_KERNEL(mm_bf16_coop_64x32_sg4,    64,  32, 4)
 TUNE_COOP_KERNEL(mm_bf16_coop_64x64_sg4,    64,  64, 4)
 TUNE_COOP_KERNEL(mm_bf16_coop_128x64_sg4,  128,  64, 4)
 TUNE_COOP_KERNEL(mm_bf16_coop_128x64_sg8,  128,  64, 8)
 TUNE_COOP_KERNEL(mm_bf16_coop_128x128_sg8, 128, 128, 8)
 TUNE_COOP_KERNEL(mm_bf16_coop_256x64_sg8,  256,  64, 8)
-
-#define TUNE_COOP_KERNEL_F32(NAME, SM, SN, NSG)                                \
-    kernel void NAME(device float *A [[buffer(0)]],                            \
-                     device float *B [[buffer(1)]],                            \
-                     device float *C [[buffer(2)]],                            \
-                     constant uint &M [[buffer(3)]],                           \
-                     constant uint &N [[buffer(4)]],                           \
-                     constant uint &K [[buffer(5)]],                           \
-                     constant uint &tiles_n [[buffer(6)]],                     \
-                     uint tgpig [[threadgroup_position_in_grid]]) {            \
-        mm_bf16_coop<SM, SN, NSG, float>(A, B, C, M, N, K, tiles_n, tgpig);    \
-    }
-TUNE_COOP_KERNEL_F32(mm_f32_exact_coop_64x64_sg4,   64, 64, 4)
-TUNE_COOP_KERNEL_F32(mm_f32_exact_coop_128x64_sg4, 128, 64, 4)
-TUNE_COOP_KERNEL_F32(mm_f32_exact_coop_128x64_sg8, 128, 64, 8)
 
 // =============================================================================
 // TN / NT / accumulate coop round (training backward lanes), plus a grid
@@ -202,8 +160,7 @@ TUNE_COOP_KERNEL_F32(mm_f32_exact_coop_128x64_sg8, 128, 64, 8)
 // =============================================================================
 
 /// C[M,N] = A_stored[K,M]^T @ B[K,N] — coop destination, interior-only rig.
-// A call with no explicit template arguments is `mm_bf16_tn_coop_64x64_sg4`.
-template <int SM = 64, int SN = 64, int NSG = 4>
+template <int SM, int SN, int NSG>
 inline void mm_bf16_tn_coop(device bfloat *A, device bfloat *B, device float *C,
                             uint M, uint N, uint K, uint tiles_n, uint tgpig) {
     constexpr auto d = matmul2d_descriptor(
@@ -229,8 +186,7 @@ inline void mm_bf16_tn_coop(device bfloat *A, device bfloat *B, device float *C,
 }
 
 /// C[M,N] = A[M,K] @ B_stored[N,K]^T — coop destination, interior-only rig.
-// A call with no explicit template arguments is `mm_bf16_nt_coop_64x64_sg4`.
-template <int SM = 64, int SN = 64, int NSG = 4>
+template <int SM, int SN, int NSG>
 inline void mm_bf16_nt_coop(device bfloat *A, device bfloat *B, device float *C,
                             uint M, uint N, uint K, uint tiles_n, uint tgpig) {
     constexpr auto d = matmul2d_descriptor(
@@ -260,8 +216,7 @@ inline void mm_bf16_nt_coop(device bfloat *A, device bfloat *B, device float *C,
 /// C[M,N] += A_stored[K,M]^T @ B[K,N] — coop zero→run, then load-add-store of
 /// the prior C (the MPPTensorOpsMatMul2d.h bias pattern): one C read + one
 /// C write total, versus multiply_accumulate's internal round-trips.
-// A call with no explicit template arguments is `mm_bf16_tn_accum_coop_64x64_sg4`.
-template <int SM = 64, int SN = 64, int NSG = 4>
+template <int SM, int SN, int NSG>
 inline void mm_bf16_tn_accum_coop(device bfloat *A, device bfloat *B,
                                   device float *C, uint M, uint N, uint K,
                                   uint tiles_n, uint tgpig) {
@@ -318,65 +273,28 @@ inline void mm_bf16_tn_accum_coop(device bfloat *A, device bfloat *B,
                      uint tgpig [[threadgroup_position_in_grid]]) {            \
         mm_bf16_nt_coop<SM, SN, NSG>(A, B, C, M, N, K, tiles_n, tgpig);        \
     }
-kernel void mm_bf16_tn_coop_64x64_sg4(
-    device bfloat *A [[buffer(0)]],
-    device bfloat *B [[buffer(1)]],
-    device float *C [[buffer(2)]],
-    constant uint &M [[buffer(3)]],
-    constant uint &N [[buffer(4)]],
-    constant uint &K [[buffer(5)]],
-    constant uint &tiles_n [[buffer(6)]],
-    uint tgpig [[threadgroup_position_in_grid]]) {
-    mm_bf16_tn_coop(A, B, C, M, N, K, tiles_n, tgpig);
-}
-kernel void mm_bf16_nt_coop_64x64_sg4(
-    device bfloat *A [[buffer(0)]],
-    device bfloat *B [[buffer(1)]],
-    device float *C [[buffer(2)]],
-    constant uint &M [[buffer(3)]],
-    constant uint &N [[buffer(4)]],
-    constant uint &K [[buffer(5)]],
-    constant uint &tiles_n [[buffer(6)]],
-    uint tgpig [[threadgroup_position_in_grid]]) {
-    mm_bf16_nt_coop(A, B, C, M, N, K, tiles_n, tgpig);
-}
-kernel void mm_bf16_tn_accum_coop_64x64_sg4(
-    device bfloat *A [[buffer(0)]],
-    device bfloat *B [[buffer(1)]],
-    device float *C [[buffer(2)]],
-    constant uint &M [[buffer(3)]],
-    constant uint &N [[buffer(4)]],
-    constant uint &K [[buffer(5)]],
-    constant uint &tiles_n [[buffer(6)]],
-    uint tgpig [[threadgroup_position_in_grid]]) {
-    mm_bf16_tn_accum_coop(A, B, C, M, N, K, tiles_n, tgpig);
-}
+#define TUNE_TN_ACCUM_COOP(NAME, SM, SN, NSG)                                  \
+    kernel void NAME(device bfloat *A [[buffer(0)]],                           \
+                     device bfloat *B [[buffer(1)]],                           \
+                     device float *C [[buffer(2)]],                            \
+                     constant uint &M [[buffer(3)]],                           \
+                     constant uint &N [[buffer(4)]],                           \
+                     constant uint &K [[buffer(5)]],                           \
+                     constant uint &tiles_n [[buffer(6)]],                     \
+                     uint tgpig [[threadgroup_position_in_grid]]) {            \
+        mm_bf16_tn_accum_coop<SM, SN, NSG>(A, B, C, M, N, K, tiles_n, tgpig);  \
+    }
 
+TUNE_TN_COOP(mm_bf16_tn_coop_64x64_sg4,   64, 64, 4)
 TUNE_TN_COOP(mm_bf16_tn_coop_128x64_sg4, 128, 64, 4)
+TUNE_NT_COOP(mm_bf16_nt_coop_64x64_sg4,   64, 64, 4)
 TUNE_NT_COOP(mm_bf16_nt_coop_128x64_sg4, 128, 64, 4)
-// The tied LM head as an NT product over the [vocab, hidden] table
-// (M = rows, N = 248320, K = 2048): wider N tiles and more simdgroups.
-TUNE_NT_COOP(mm_bf16_nt_coop_64x128_sg4, 64, 128, 4)
-TUNE_NT_COOP(mm_bf16_nt_coop_128x128_sg4, 128, 128, 4)
-TUNE_NT_COOP(mm_bf16_nt_coop_128x128_sg8, 128, 128, 8)
-TUNE_NT_COOP(mm_bf16_nt_coop_256x64_sg8, 256, 64, 8)
-TUNE_NT_COOP(mm_bf16_nt_coop_64x256_sg8, 64, 256, 8)
-TUNE_NT_COOP(mm_bf16_nt_coop_128x256_sg8, 128, 256, 8)
-TUNE_NT_COOP(mm_bf16_nt_coop_256x128_sg8, 256, 128, 8)
-// Round two: the head's winner was the tallest tile (each row tile streams
-// the whole 1 GB table once), so taller still.
-TUNE_NT_COOP(mm_bf16_nt_coop_256x64_sg4, 256, 64, 4)
-TUNE_NT_COOP(mm_bf16_nt_coop_256x32_sg8, 256, 32, 8)
-TUNE_NT_COOP(mm_bf16_nt_coop_512x32_sg8, 512, 32, 8)
-TUNE_NT_COOP(mm_bf16_nt_coop_512x64_sg8, 512, 64, 8)
-TUNE_NT_COOP(mm_bf16_nt_coop_512x64_sg16, 512, 64, 16)
-TUNE_NT_COOP(mm_bf16_nt_coop_1024x32_sg16, 1024, 32, 16)
+TUNE_TN_ACCUM_COOP(mm_bf16_tn_accum_coop_64x64_sg4, 64, 64, 4)
 
 /// NN coop with a column-panel grid swizzle (PH tile-rows per band): bounds
 /// B-tile rereads to tiles_m/PH full passes instead of tiles_m, at the cost
 /// of A-panel locality. Tests the square_4096 operand-reread hypothesis.
-// A call with no explicit template arguments is `mm_bf16_coop_128x64_sg4_swz4`.
-template <int SM = 128, int SN = 64, int NSG = 4, int PH = 4>
+template <int SM, int SN, int NSG, int PH>
 inline void mm_bf16_coop_swz(device bfloat *A, device bfloat *B, device float *C,
                              uint M, uint N, uint K, uint tiles_n, uint tiles_m,
                              uint tgpig) {
@@ -424,24 +342,12 @@ inline void mm_bf16_coop_swz(device bfloat *A, device bfloat *B, device float *C
                                           tgpig);                              \
     }
 
-kernel void mm_bf16_coop_128x64_sg4_swz4(
-    device bfloat *A [[buffer(0)]],
-    device bfloat *B [[buffer(1)]],
-    device float *C [[buffer(2)]],
-    constant uint &M [[buffer(3)]],
-    constant uint &N [[buffer(4)]],
-    constant uint &K [[buffer(5)]],
-    constant uint &tiles_n [[buffer(6)]],
-    constant uint &tiles_m [[buffer(7)]],
-    uint tgpig [[threadgroup_position_in_grid]]) {
-    mm_bf16_coop_swz(A, B, C, M, N, K, tiles_n, tiles_m, tgpig);
-}
+TUNE_SWZ_KERNEL(mm_bf16_coop_128x64_sg4_swz4,  128, 64, 4, 4)
 TUNE_SWZ_KERNEL(mm_bf16_coop_128x64_sg4_swz8,  128, 64, 4, 8)
 TUNE_SWZ_KERNEL(mm_bf16_coop_256x64_sg8_swz4,  256, 64, 8, 4)
 
 /// C[M,N] += A[M,K] @ B_stored[N,K]^T — coop zero→run→load-add-store.
-// A call with no explicit template arguments is `mm_bf16_nt_accum_coop_64x64_sg4`.
-template <int SM = 64, int SN = 64, int NSG = 4>
+template <int SM, int SN, int NSG>
 inline void mm_bf16_nt_accum_coop(device bfloat *A, device bfloat *B,
                                   device float *C, uint M, uint N, uint K,
                                   uint tiles_n, uint tgpig) {
@@ -478,114 +384,7 @@ inline void mm_bf16_nt_accum_coop(device bfloat *A, device bfloat *B,
     cT.store(tC);
 }
 
-kernel void mm_bf16_nt_accum_coop_64x64_sg4(
-    device bfloat *A [[buffer(0)]],
-    device bfloat *B [[buffer(1)]],
-    device float *C [[buffer(2)]],
-    constant uint &M [[buffer(3)]],
-    constant uint &N [[buffer(4)]],
-    constant uint &K [[buffer(5)]],
-    constant uint &tiles_n [[buffer(6)]],
-    uint tgpig [[threadgroup_position_in_grid]]) {
-    mm_bf16_nt_accum_coop(A, B, C, M, N, K, tiles_n, tgpig);
-}
-
-// =============================================================================
-// TN / NT coop over a column-panel walk: PH tile rows per band, each band
-// walked down a column before moving right, so threadgroups that run together
-// share B tiles and a B too large for the cache is read once per band rather
-// than once per tile row. The rig for the production TN/NT coop walk; the
-// row-major baselines are the mm_bf16_{tn,nt}[_accum]_coop kernels above.
-// =============================================================================
-
-inline uint2 tune_tile_from_panel(uint linear, uint tiles_n, uint tiles_m, uint ph) {
-    uint band = linear / (ph * tiles_n);
-    uint rem = linear - band * ph * tiles_n;
-    uint local_h = min(ph, tiles_m - band * ph);
-    return uint2(rem / local_h, band * ph + rem % local_h);
-}
-
-/// C[M,N] (+)= A[M,K] @ B_stored[N,K]^T over the panel walk.
-template <int SM, int SN, int NSG, int PH, bool ACCUM>
-inline void mm_bf16_nt_coop_panel(device bfloat *A, device bfloat *B,
-                                  device float *C, uint M, uint N, uint K,
-                                  uint tiles_n, uint tiles_m, uint tgpig) {
-    constexpr auto d = matmul2d_descriptor(
-        SM, SN, dynamic_length_v<int>, false, true, false,
-        matmul2d_descriptor::mode::multiply);
-    matmul2d<d, execution_simdgroups<NSG>> op;
-    if (tgpig >= tiles_n * tiles_m) return;
-    uint2 tile = tune_tile_from_panel(tgpig, tiles_n, tiles_m, (uint)PH);
-    int tx = (int)tile.x * SN;
-    int ty = (int)tile.y * SM;
-    if (tx + SN > (int)N || ty + SM > (int)M) return;
-    auto tA = tensor(A + ty * (int)K, dextents<int, 2>{(int)K, SM},
-                     array<int, 2>{1, (int)K});
-    auto tB = tensor(B + tx * (int)K, dextents<int, 2>{(int)K, SN},
-                     array<int, 2>{1, (int)K});
-    auto tC = tensor(C + ty * (int)N + tx, dextents<int, 2>{SN, SM},
-                     array<int, 2>{1, (int)N});
-    auto cT = op.template get_destination_cooperative_tensor<
-        metal::remove_addrspace_t<decltype(tA)>,
-        metal::remove_addrspace_t<decltype(tB)>, float>();
-#pragma clang loop unroll(full)
-    for (uint16_t i = 0; i < cT.get_capacity(); ++i)
-        cT.set(i, 0.0f);
-    op.run(tA, tB, cT);
-    if (ACCUM) {
-        auto prevT = op.template get_destination_cooperative_tensor<
-            metal::remove_addrspace_t<decltype(tA)>,
-            metal::remove_addrspace_t<decltype(tB)>, float>();
-        prevT.load(tC);
-#pragma clang loop unroll(full)
-        for (uint16_t i = 0; i < cT.get_capacity(); ++i) {
-            if (cT.is_valid_element(i))
-                cT[i] += prevT[i];
-        }
-    }
-    cT.store(tC);
-}
-
-/// C[M,N] (+)= A_stored[K,M]^T @ B[K,N] over the panel walk.
-template <int SM, int SN, int NSG, int PH, bool ACCUM>
-inline void mm_bf16_tn_coop_panel(device bfloat *A, device bfloat *B,
-                                  device float *C, uint M, uint N, uint K,
-                                  uint tiles_n, uint tiles_m, uint tgpig) {
-    constexpr auto d = matmul2d_descriptor(
-        SM, SN, dynamic_length_v<int>, true, false, false,
-        matmul2d_descriptor::mode::multiply);
-    matmul2d<d, execution_simdgroups<NSG>> op;
-    if (tgpig >= tiles_n * tiles_m) return;
-    uint2 tile = tune_tile_from_panel(tgpig, tiles_n, tiles_m, (uint)PH);
-    int tx = (int)tile.x * SN;
-    int ty = (int)tile.y * SM;
-    if (tx + SN > (int)N || ty + SM > (int)M) return;
-    auto tA = tensor(A + ty, dextents<int, 2>{SM, (int)K}, array<int, 2>{1, (int)M});
-    auto tB = tensor(B + tx, dextents<int, 2>{SN, (int)K}, array<int, 2>{1, (int)N});
-    auto tC = tensor(C + ty * (int)N + tx, dextents<int, 2>{SN, SM},
-                     array<int, 2>{1, (int)N});
-    auto cT = op.template get_destination_cooperative_tensor<
-        metal::remove_addrspace_t<decltype(tA)>,
-        metal::remove_addrspace_t<decltype(tB)>, float>();
-#pragma clang loop unroll(full)
-    for (uint16_t i = 0; i < cT.get_capacity(); ++i)
-        cT.set(i, 0.0f);
-    op.run(tA, tB, cT);
-    if (ACCUM) {
-        auto prevT = op.template get_destination_cooperative_tensor<
-            metal::remove_addrspace_t<decltype(tA)>,
-            metal::remove_addrspace_t<decltype(tB)>, float>();
-        prevT.load(tC);
-#pragma clang loop unroll(full)
-        for (uint16_t i = 0; i < cT.get_capacity(); ++i) {
-            if (cT.is_valid_element(i))
-                cT[i] += prevT[i];
-        }
-    }
-    cT.store(tC);
-}
-
-#define TUNE_PANEL_KERNEL(NAME, IMPL, SM, SN, NSG, PH, ACCUM)                 \
+#define TUNE_NT_ACCUM_COOP(NAME, SM, SN, NSG)                                  \
     kernel void NAME(device bfloat *A [[buffer(0)]],                           \
                      device bfloat *B [[buffer(1)]],                           \
                      device float *C [[buffer(2)]],                            \
@@ -593,19 +392,8 @@ inline void mm_bf16_tn_coop_panel(device bfloat *A, device bfloat *B,
                      constant uint &N [[buffer(4)]],                           \
                      constant uint &K [[buffer(5)]],                           \
                      constant uint &tiles_n [[buffer(6)]],                     \
-                     constant uint &tiles_m [[buffer(7)]],                     \
                      uint tgpig [[threadgroup_position_in_grid]]) {            \
-        IMPL<SM, SN, NSG, PH, ACCUM>(A, B, C, M, N, K, tiles_n, tiles_m,       \
-                                     tgpig);                                   \
+        mm_bf16_nt_accum_coop<SM, SN, NSG>(A, B, C, M, N, K, tiles_n, tgpig);  \
     }
 
-TUNE_PANEL_KERNEL(mm_bf16_nt_coop_128x64_sg4_ph4,  mm_bf16_nt_coop_panel, 128, 64, 4,  4, false)
-TUNE_PANEL_KERNEL(mm_bf16_nt_coop_128x64_sg4_ph8,  mm_bf16_nt_coop_panel, 128, 64, 4,  8, false)
-TUNE_PANEL_KERNEL(mm_bf16_nt_coop_128x64_sg4_ph16, mm_bf16_nt_coop_panel, 128, 64, 4, 16, false)
-TUNE_PANEL_KERNEL(mm_bf16_tn_coop_128x64_sg4_ph4,  mm_bf16_tn_coop_panel, 128, 64, 4,  4, false)
-TUNE_PANEL_KERNEL(mm_bf16_tn_coop_128x64_sg4_ph8,  mm_bf16_tn_coop_panel, 128, 64, 4,  8, false)
-TUNE_PANEL_KERNEL(mm_bf16_tn_coop_128x64_sg4_ph16, mm_bf16_tn_coop_panel, 128, 64, 4, 16, false)
-TUNE_PANEL_KERNEL(mm_bf16_nt_accum_coop_64x64_sg4_ph8,  mm_bf16_nt_coop_panel, 64, 64, 4,  8, true)
-TUNE_PANEL_KERNEL(mm_bf16_nt_accum_coop_64x64_sg4_ph16, mm_bf16_nt_coop_panel, 64, 64, 4, 16, true)
-TUNE_PANEL_KERNEL(mm_bf16_tn_accum_coop_64x64_sg4_ph8,  mm_bf16_tn_coop_panel, 64, 64, 4,  8, true)
-TUNE_PANEL_KERNEL(mm_bf16_tn_accum_coop_64x64_sg4_ph16, mm_bf16_tn_coop_panel, 64, 64, 4, 16, true)
+TUNE_NT_ACCUM_COOP(mm_bf16_nt_accum_coop_64x64_sg4, 64, 64, 4)

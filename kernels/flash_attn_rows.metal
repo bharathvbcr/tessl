@@ -138,11 +138,7 @@ kernel void NAME(                                                             \
     float4 q_reg[DPV];                                                        \
     float4 acc[DPV];                                                          \
     for (uint j = 0; j < DPV; ++j) { acc[j] = float4(0.0f); }                 \
-    /* -FLT_MAX, not -INFINITY: kernels compile with fast math, which may     \
-       assume no value is infinite. l_i > 0 is the "has seen a key" flag: the \
-       first live key contributes exp(0) = 1, and l_i never shrinks below 1   \
-       after that, because each new maximum adds 1 again. */                  \
-    float m_i = -FLT_MAX;                                                     \
+    float m_i = -INFINITY;                                                    \
     float l_i = 0.0f;                                                         \
                                                                               \
     if (t_start < t_end) {                                                    \
@@ -166,20 +162,22 @@ kernel void NAME(                                                             \
                 part += simd_shuffle_xor(part, off);                          \
             }                                                                 \
             const ulong k_abs = kv_off + (ulong)t;                            \
-            const bool live = row_live && k_abs <= q_abs && k_abs >= my_lo;   \
-            const float s = live ? part * scale : -FLT_MAX;                   \
+            float s = part * scale;                                           \
+            if (!row_live || k_abs > q_abs || k_abs < my_lo) {                \
+                s = -INFINITY;                                                \
+            }                                                                 \
             const float m_new = max(m_i, s);                                  \
-            /* A row that has seen nothing has a zero accumulator, so its     \
-               rescale is exactly zero; and a masked key's weight is zero by  \
-               the mask, not by its score, since -FLT_MAX - -FLT_MAX is 0. */ \
-            const float alpha = (l_i > 0.0f) ? exp(m_i - m_new) : 0.0f;       \
-            const float p = live ? exp(s - m_new) : 0.0f;                     \
+            /* Both -inf when this row has seen nothing and this key is       \
+               masked for it: exp(-inf - -inf) is NaN, and the accumulator is \
+               zero anyway, so the rescale is exactly zero. */                \
+            const float alpha = (m_i == -INFINITY) ? 0.0f : exp(m_i - m_new); \
+            const float p = (s == -INFINITY) ? 0.0f : exp(s - m_new);         \
             device const float4 *V4 = (device const float4 *)(V + kv_base);   \
             for (uint j = 0; j < DPV; ++j) {                                  \
                 acc[j] = acc[j] * alpha + p * V4[dl + j * (R)];               \
             }                                                                 \
             l_i = l_i * alpha + p;                                            \
-            m_i = m_new;                                                      \
+            m_i = (m_new == -INFINITY) ? -INFINITY : m_new;                   \
         }                                                                     \
     }                                                                         \
                                                                               \
@@ -231,7 +229,3 @@ ROWS_KERNEL(flash_attn_rows_h512_r16_g32, 512, 16, 32)
 ROWS_KERNEL(flash_attn_rows_h512_r8_g8, 512, 8, 8)
 ROWS_KERNEL(flash_attn_rows_h512_r8_g16, 512, 8, 16)
 ROWS_KERNEL(flash_attn_rows_h512_r8_g32, 512, 8, 32)
-// D=64 needs D % (4*R) == 0 so the float4 lane map covers the head.
-// R=8 gives 64 % 32 == 0 and two float4s per lane. R=32 would be a zero
-// trip count (DPV = 0). One instantiation: the host default is R=8, SGT=8.
-ROWS_KERNEL(flash_attn_rows_h64_r8_g8, 64, 8, 8)

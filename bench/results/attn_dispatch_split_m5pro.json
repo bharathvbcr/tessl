@@ -1,0 +1,41 @@
+{
+  "knob": "batched",
+  "env": "BENCH_ATTN_BATCHED",
+  "values": [
+    "1",
+    "32"
+  ],
+  "rounds": 3,
+  "iters": 20,
+  "batched": 1,
+  "median_ms": {
+    "1": {
+      "swa128_decode_1k": 0.515562,
+      "swa128_decode_4k": 0.455896,
+      "swa256_decode_4k": 0.436312,
+      "global512_decode_4k": 0.570271,
+      "swa128_prefill_2048": 14.214063,
+      "swa256_prefill_2048": 14.3955,
+      "global512_prefill_1024": 5.905041
+    },
+    "32": {
+      "swa128_decode_1k": 0.046059,
+      "swa128_decode_4k": 0.047806,
+      "swa256_decode_4k": 0.06487,
+      "global512_decode_4k": 0.230892,
+      "swa128_prefill_2048": 16.934405,
+      "swa256_prefill_2048": 19.888118,
+      "global512_prefill_1024": 8.639247
+    }
+  },
+  "winner": null,
+  "kernel_share": {
+    "swa128_decode_1k": 0.08933746086794606,
+    "swa128_decode_4k": 0.10486163510976187,
+    "swa256_decode_4k": 0.1486780102312107,
+    "global512_decode_4k": 0.4048811880667262,
+    "swa128_prefill_2048": 1.1913838428885535,
+    "swa256_prefill_2048": 1.3815510402556352,
+    "global512_prefill_1024": 1.4630291305344028
+  }
+}

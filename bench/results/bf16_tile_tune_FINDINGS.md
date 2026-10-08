@@ -1,5 +1,13 @@
 # bf16 GEMM: why metal-native was ~2× off PyTorch MPS
 
+> **Historical tuning record, not current performance evidence.** The timings in
+> this file predate tessl's current revision/hash/load provenance and paired
+> spread gates. A later full-ladder result corrected the bf16 headline to parity
+> with, or slightly behind, torch MPS (`0.979×` in rep B); see the canonical
+> [performance evidence summary](../../README.md#latest-checked-in-result-snapshot).
+> Keep this file for its root-cause and kernel-selection history, not as a speed
+> claim for the current tree.
+
 > **Landed 2026-08-30.** `get_destination_cooperative_tensor` (the "Not yet
 > done" item below) beat every BK/tile variant and shipped as the production
 > kernel for every bf16 and relaxed-f32 lane except split-K (NN, then TN/NT
@@ -136,3 +144,16 @@ The follow-ups measured and landed (`bench_gemm_tnnt_tune`, results in
 
 Split-K kernels keep the 64×32 sg4 geometry (`TILE_V2`); everything else
 bf16/relaxed now runs cooperative-destination.
+
+### 2026-09-04 addendum: `M` below 512
+
+Every NN shape above has `M >= 512`, and `nn_coop_kernel` ignored `M`. A paired
+A/B at `M ∈ {16 … 1024}` through the public `gemm` (twenty GEMMs per command
+buffer, six order-balanced rounds; `bf16_smallm_coop_m5pro.txt`) found the
+64×64 tile 1.35–1.74× faster at `M <= 64` for every `N`/`K` tried — a 128-row
+tile is at least half padding there — and 1.14–1.59× faster wherever fewer
+than 64 default tiles cover C (`M = 128` at `N <= 3072`, `M <= 512` at
+`N = 768`), while the default is ahead from 64 tiles up (0.82× for the narrow
+tile at `M >= 256`, `N = K = 4096`). The selection is now
+`n <= 512 || m <= 64 || ceil(m/128) * ceil(n/64) < 64`; nothing measured on
+this page changes, since all of it sits at 96 default tiles or more.

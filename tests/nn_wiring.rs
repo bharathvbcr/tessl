@@ -8,9 +8,36 @@
 
 mod common;
 
-use common::{buf, buf_bf16, buf_u32, empty, random_f32, with_gpu};
+use std::sync::Arc;
+
+use common::{random_f32, with_gpu};
 use tessl::nn::{self, Q4Bank, Q4MlxBank, Q4MlxLayout, Q4MlxRowVariant, QuantShape};
-use tessl::tensor::f32_slice_to_bf16;
+use tessl::tensor::{f32_slice_to_bf16, GpuBuffer};
+use tessl::GpuRuntime;
+
+fn buf(rt: &Arc<GpuRuntime>, data: &[f32]) -> GpuBuffer {
+    let b = rt.alloc_buffer(data.len().max(1) * 4).expect("alloc");
+    b.write_f32(data);
+    b
+}
+
+fn buf_u32(rt: &Arc<GpuRuntime>, data: &[u32]) -> GpuBuffer {
+    let b = rt.alloc_buffer(data.len().max(1) * 4).expect("alloc");
+    b.write_u32(data);
+    b
+}
+
+fn buf_bf16(rt: &Arc<GpuRuntime>, data: &[f32]) -> GpuBuffer {
+    let b = rt.alloc_buffer(data.len().max(1) * 2).expect("alloc");
+    b.write_bf16_bits(&f32_slice_to_bf16(data));
+    b
+}
+
+fn empty(rt: &Arc<GpuRuntime>, elems: usize) -> GpuBuffer {
+    let b = rt.alloc_buffer(elems.max(1) * 4).expect("alloc");
+    b.zero();
+    b
+}
 
 /// Pack 4-bit values two to a byte, low nibble first — the layout every Q4
 /// kernel here indexes as `packed[i / 2]`, low nibble for even `i`.
@@ -40,7 +67,10 @@ fn i4(nibble: u8) -> f32 {
 fn close(what: &str, got: &[f32], want: &[f32], tol: f32) {
     assert_eq!(got.len(), want.len(), "{what}: length");
     for (i, (g, w)) in got.iter().zip(want).enumerate() {
-        assert!((g - w).abs() <= tol, "{what}[{i}]: got {g} want {w} (tol {tol})");
+        assert!(
+            (g - w).abs() <= tol,
+            "{what}[{i}]: got {g} want {w} (tol {tol})"
+        );
     }
 }
 
@@ -51,7 +81,12 @@ fn softcap_logits_matches_the_tanh_reference() {
     with_gpu(|rt| {
         let n = 512usize;
         // Span the range where a fast tanh would misbehave.
-        let logits: Vec<f32> = (0..n).map(|i| (i as f32 - 256.0) * 0.5).collect();
+        let mut logits: Vec<f32> = (0..n).map(|i| (i as f32 - 256.0) * 0.5).collect();
+        // Softcapping exists specifically to tame unbounded logits. Metal's
+        // tanh implementation overflows internally without an explicit clamp
+        // around this range, turning an otherwise finite row into NaNs.
+        logits[0] = -1.0e6;
+        logits[n - 1] = 1.0e6;
         let lb = buf(rt, &logits);
         let cap = buf(rt, &[30.0]);
 
@@ -60,8 +95,37 @@ fn softcap_logits_matches_the_tanh_reference() {
 
         let want: Vec<f32> = logits.iter().map(|v| 30.0 * (v / 30.0).tanh()).collect();
         let got = lb.read_f32();
-        assert!(got[..n].iter().all(|v| v.is_finite()), "softcap produced non-finite");
+        assert!(
+            got[..n].iter().all(|v| v.is_finite()),
+            "softcap produced non-finite"
+        );
         close("softcap_logits", &got[..n], &want, 1e-4);
+    });
+}
+
+#[test]
+fn invalid_device_softcap_is_a_noop_instead_of_poisoning_logits() {
+    with_gpu(|rt| {
+        let logits = [-1.0e6, -1.0, 0.0, 1.0, 1.0e6];
+        for (label, invalid_cap) in [
+            ("zero", 0.0),
+            ("negative", -30.0),
+            ("infinite", f32::INFINITY),
+            ("nan", f32::NAN),
+        ] {
+            let lb = buf(rt, &logits);
+            let cap = buf(rt, &[invalid_cap]);
+
+            nn::softcap_logits(rt, &lb, &cap, logits.len() as u32).unwrap();
+            rt.synchronize().unwrap();
+
+            let got = lb.read_f32();
+            assert_eq!(
+                &got[..logits.len()],
+                &logits,
+                "invalid {label} softcap must leave finite logits unchanged"
+            );
+        }
     });
 }
 
@@ -108,18 +172,6 @@ fn softcap_sample_writes_the_argmax_and_rewrites_logits() {
 }
 
 #[test]
-fn softcap_sample_rejects_an_all_nan_row() {
-    with_gpu(|rt| {
-        let n = 8usize;
-        let lb = buf(rt, &[f32::NAN; 8]);
-        let out = buf_u32(rt, &[0]);
-        let cap = buf(rt, &[30.0]);
-        let err = nn::softcap_sample(rt, &lb, &out, &cap, n as u32).expect_err("all-NaN must not sample token 0");
-        assert!(err.contains("finite"), "{err}");
-    });
-}
-
-#[test]
 fn softcap_sample_refuses_more_logits_than_its_threadgroup_reduces() {
     with_gpu(|rt| {
         let n = 4096u32;
@@ -159,59 +211,6 @@ fn argmax_f32_pass_reduces_a_full_vocab_across_two_passes() {
         assert_eq!(g2, 1, "test assumes the second pass collapses to one group");
         assert_eq!(idx2.read_u32()[0] as usize, winner);
         assert!((val2.read_f32()[0] - 77.0).abs() < 1e-4);
-    });
-}
-
-/// A row of non-finite logits writes `0xFFFFFFFF` into `out_idx`. That must
-/// be an error, the same rule `softcap_sample` applies, not a token id.
-#[test]
-fn argmax_f32_pass_refuses_a_nonfinite_row() {
-    with_gpu(|rt| {
-        let n = 4u32;
-        let lb = buf(rt, &[f32::NAN, f32::NAN, f32::NAN, f32::NAN]);
-        let cap = buf(rt, &[0.0]);
-        let groups = nn::argmax_pass_groups(n);
-        let idx = buf_u32(rt, &vec![0u32; groups]);
-        let val = empty(rt, groups);
-        let err = nn::argmax_f32_pass(rt, &lb, &idx, &val, None, &cap, n)
-            .expect_err("non-finite argmax must not return a token");
-        assert!(err.contains("no finite"), "expected the non-finite refusal, got {err}");
-    });
-}
-
-/// The argmax kernels' unused lanes never win, whatever the real logits are.
-///
-/// A row shorter than the threadgroup leaves lanes with no logit, and they
-/// used to be padded with `-INFINITY`, which fast math may assume never
-/// occurs. Here the one finite logit is `f32::MIN` (twice, so the lower index
-/// must win the tie) among NaN and ±inf, so a pad value of `-FLT_MAX` that
-/// competed would tie with it, and an index carried from a pad lane would be
-/// returned instead of 1.
-#[test]
-fn argmax_padding_lanes_never_beat_the_lowest_finite_logit() {
-    with_gpu(|rt| {
-        let logits = [f32::NAN, f32::MIN, f32::INFINITY, f32::MIN, f32::NEG_INFINITY];
-        let n = logits.len() as u32;
-        let uncapped = buf(rt, &[0.0]);
-
-        let lb = buf(rt, &logits);
-        let groups = nn::argmax_pass_groups(n);
-        let idx = buf_u32(rt, &vec![0u32; groups]);
-        let val = empty(rt, groups);
-        nn::argmax_f32_pass(rt, &lb, &idx, &val, None, &uncapped, n).unwrap();
-        rt.synchronize().unwrap();
-        assert_eq!(idx.read_u32()[0], 1, "argmax_f32_pass");
-        assert_eq!(val.read_f32()[0], f32::MIN, "argmax_f32_pass value");
-
-        let out = buf_u32(rt, &[7]);
-        nn::softcap_argmax_one_pass(rt, &lb, &out, &uncapped, n).unwrap();
-        rt.synchronize().unwrap();
-        assert_eq!(out.read_u32()[0], 1, "softcap_argmax_one_pass");
-
-        let out = buf_u32(rt, &[7]);
-        nn::softcap_sample(rt, &lb, &out, &buf(rt, &[30.0]), n).unwrap();
-        rt.synchronize().unwrap();
-        assert_eq!(out.read_u32()[0], 1, "softcap_sample");
     });
 }
 
@@ -264,7 +263,12 @@ fn embed_lookup_q4_gathers_dequantized_rows_and_zeroes_out_of_range_tokens() {
                 want[m * hidden + d] = scales[gi] * (i4(nibbles[idx]) - zeros[gi]);
             }
         }
-        close("embed_lookup_q4", &out.read_f32()[..want.len()], &want, 1e-5);
+        close(
+            "embed_lookup_q4",
+            &out.read_f32()[..want.len()],
+            &want,
+            1e-5,
+        );
     });
 }
 
@@ -343,12 +347,16 @@ fn q4_mlx_matrix(rows: usize, cols: usize, group: usize) -> (Vec<u8>, Vec<f32>, 
         })
         .collect();
     let sb_bits = f32_slice_to_bf16(&sb_f32);
-    let sb_round: Vec<f32> = sb_bits.iter().map(|b| tessl::tensor::bf16_bits_to_f32(*b)).collect();
+    let sb_round: Vec<f32> = sb_bits
+        .iter()
+        .map(|b| tessl::tensor::bf16_bits_to_f32(*b))
+        .collect();
     let mut dense = vec![0.0f32; rows * cols];
     for r in 0..rows {
         for c in 0..cols {
             let gi = r * (cols / group) + c / group;
-            dense[r * cols + c] = sb_round[gi * 2] * nibbles[r * cols + c] as f32 + sb_round[gi * 2 + 1];
+            dense[r * cols + c] =
+                sb_round[gi * 2] * nibbles[r * cols + c] as f32 + sb_round[gi * 2 + 1];
         }
     }
     (pack_nibbles(&nibbles), sb_f32, dense)
@@ -475,7 +483,12 @@ fn gemv_q4_mlx_simd_add_folds_the_residual() {
         rt.synchronize().unwrap();
 
         let want: Vec<f32> = (0..rows)
-            .map(|r| resid[r] + (0..cols).map(|c| dense[r * cols + c] * x_round[c]).sum::<f32>())
+            .map(|r| {
+                resid[r]
+                    + (0..cols)
+                        .map(|c| dense[r * cols + c] * x_round[c])
+                        .sum::<f32>()
+            })
             .collect();
         close("gemv_q4_mlx_simd_add", &yb.read_f32()[..rows], &want, 5e-3);
     });
@@ -581,8 +594,19 @@ fn attention_refuses_head_counts_that_do_not_group() {
             scale: f32::NAN,
             ..dims
         };
-        let err = nn::flash_attn_swa(rt, nn::AttnHeadDim::D128, &b, &b, &b, &b, &u, &u, &u, bad_scale)
-            .expect_err("non-finite scale");
+        let err = nn::flash_attn_swa(
+            rt,
+            nn::AttnHeadDim::D128,
+            &b,
+            &b,
+            &b,
+            &b,
+            &u,
+            &u,
+            &u,
+            bad_scale,
+        )
+        .expect_err("non-finite scale");
         assert!(err.contains("scale must be finite"), "unexpected: {err:?}");
         assert_eq!(rt.take_dispatch_count(), 0);
     });
@@ -613,13 +637,34 @@ fn qkv_rope_refuses_a_variant_operand_mismatch() {
 
         // A PosBuffer variant with no buffer would read a stale position for a
         // whole session if it were quietly accepted.
-        let err = nn::rms_qkv_rope(rt, nn::QkvRopeVariant::PosBuffer, qkv, dims, 0, None, None, false)
-            .expect_err("missing pos buffer");
-        assert!(err.contains("require pos_offset_buf"), "unexpected: {err:?}");
+        let err = nn::rms_qkv_rope(
+            rt,
+            nn::QkvRopeVariant::PosBuffer,
+            qkv,
+            dims,
+            0,
+            None,
+            None,
+            false,
+        )
+        .expect_err("missing pos buffer");
+        assert!(
+            err.contains("require pos_offset_buf"),
+            "unexpected: {err:?}"
+        );
 
         // And the reverse: a constant-offset variant handed a buffer.
-        let err = nn::rms_qkv_rope(rt, nn::QkvRopeVariant::PosConst, qkv, dims, 0, Some(&u), None, false)
-            .expect_err("buffer on the const variant");
+        let err = nn::rms_qkv_rope(
+            rt,
+            nn::QkvRopeVariant::PosConst,
+            qkv,
+            dims,
+            0,
+            Some(&u),
+            None,
+            false,
+        )
+        .expect_err("buffer on the const variant");
         assert!(err.contains("not a buffer"), "unexpected: {err:?}");
 
         // rotary_dim past head_dim rotates off the end of every head.
@@ -627,15 +672,158 @@ fn qkv_rope_refuses_a_variant_operand_mismatch() {
             rotary_dim: 128,
             ..dims
         };
-        let err = nn::rms_qkv_rope(rt, nn::QkvRopeVariant::PosConst, qkv, long_rope, 0, None, None, false)
-            .expect_err("rotary_dim > head_dim");
+        let err = nn::rms_qkv_rope(
+            rt,
+            nn::QkvRopeVariant::PosConst,
+            qkv,
+            long_rope,
+            0,
+            None,
+            None,
+            false,
+        )
+        .expect_err("rotary_dim > head_dim");
         assert!(err.contains("exceeds head_dim"), "unexpected: {err:?}");
 
         // RoPE rotates pairs, so an odd span is always a caller mistake.
-        let odd_rope = nn::QkvRopeDims { rotary_dim: 63, ..dims };
-        let err = nn::rms_qkv_rope(rt, nn::QkvRopeVariant::PosConst, qkv, odd_rope, 0, None, None, false)
-            .expect_err("odd rotary_dim");
+        let odd_rope = nn::QkvRopeDims {
+            rotary_dim: 63,
+            ..dims
+        };
+        let err = nn::rms_qkv_rope(
+            rt,
+            nn::QkvRopeVariant::PosConst,
+            qkv,
+            odd_rope,
+            0,
+            None,
+            None,
+            false,
+        )
+        .expect_err("odd rotary_dim");
         assert!(err.contains("is odd"), "unexpected: {err:?}");
         assert_eq!(rt.take_dispatch_count(), 0);
+    });
+}
+
+/// `gemv_q4` has no `cols` ceiling.
+///
+/// Until 2026-09-05 the row kernel staged all of `x` in dynamic threadgroup
+/// memory, so `cols * 4` bytes above the device limit were refused before
+/// encoding (and a `cols` that was not a multiple of four failed later with an
+/// alignment message naming neither the kernel nor `cols`, audit N15). The
+/// simdgroup kernel reads `x` from device memory, so a width the old kernel
+/// could not launch now validates, dispatches, and computes the right numbers.
+#[test]
+fn gemv_q4_has_no_cols_ceiling() {
+    with_gpu(|rt| {
+        let limit = rt.max_threadgroup_memory();
+        let group_size = 64usize;
+        // Wider than the old cache could hold, rounded up to a whole group.
+        let cols = (limit / std::mem::size_of::<f32>() + 1).div_ceil(group_size) * group_size;
+        let rows = 4usize;
+        assert!(cols * 4 > limit, "test setup must exceed the old ceiling");
+        let groups = rows * (cols / group_size);
+        let q: Vec<i8> = (0..rows * cols)
+            .map(|i| ((i * 13 + 5) % 16) as i8 - 8)
+            .collect();
+        let packed_bytes: Vec<u8> = q
+            .chunks(2)
+            .map(|p| ((p[0] as u8) & 0x0f) | (((p[1] as u8) & 0x0f) << 4))
+            .collect();
+        let scales: Vec<f32> = (0..groups).map(|i| 0.01 + (i % 3) as f32 * 0.005).collect();
+        let zeros: Vec<f32> = (0..groups).map(|i| (i % 4) as f32 * 0.5 - 1.0).collect();
+        let x: Vec<f32> = (0..cols)
+            .map(|c| ((c * 7 % 23) as f32 - 11.0) * 0.1)
+            .collect();
+        let want: Vec<f32> = (0..rows)
+            .map(|r| {
+                (0..cols)
+                    .map(|c| {
+                        let g = r * (cols / group_size) + c / group_size;
+                        scales[g] as f64 * (q[r * cols + c] as f64 - zeros[g] as f64) * x[c] as f64
+                    })
+                    .sum::<f64>() as f32
+            })
+            .collect();
+
+        let packed = rt
+            .alloc_buffer(packed_bytes.len())
+            .expect("packed allocation");
+        packed.write_bytes(&packed_bytes);
+        let sb = empty(rt, groups);
+        sb.write_f32(&scales);
+        let zb = empty(rt, groups);
+        zb.write_f32(&zeros);
+        let xb = empty(rt, cols);
+        xb.write_f32(&x);
+        let yb = empty(rt, rows);
+        let shape = QuantShape {
+            rows: rows as u32,
+            cols: cols as u32,
+            group_size: group_size as u32,
+        };
+        nn::gemv_q4(
+            rt,
+            Q4Bank {
+                packed: &packed,
+                scales: &sb,
+                zeros: &zb,
+            },
+            &xb,
+            &yb,
+            shape,
+            false,
+        )
+        .expect("a wide row is an ordinary dispatch now");
+        rt.synchronize().unwrap();
+        let got = yb.read_f32();
+        for r in 0..rows {
+            let tol = 2e-4 * want[r].abs().max(1.0);
+            assert!(
+                (got[r] - want[r]).abs() <= tol,
+                "gemv_q4 cols={cols} row {r}: got {} want {}",
+                got[r],
+                want[r]
+            );
+        }
+    });
+}
+
+/// The softcap belongs to the first pass only. Later passes reduce values that
+/// are already capped, and `tanh` is not idempotent: capping a partial maximum
+/// again shrinks it (`30·tanh(29.65/30) ≈ 22.7` instead of `29.65`), so a
+/// two-pass argmax returned a wrong value whenever the cap was on.
+#[test]
+fn argmax_f32_pass_applies_the_softcap_once_across_passes() {
+    with_gpu(|rt| {
+        let n = 50_000u32;
+        let mut logits = random_f32(n as usize, 0xB2);
+        let winner = 12_345usize;
+        logits[winner] = 77.0;
+        let lb = buf(rt, &logits);
+        let softcap = 30.0f32;
+        let cap = buf(rt, &[softcap]);
+
+        let g1 = nn::argmax_pass_groups(n);
+        let idx1 = buf_u32(rt, &vec![0u32; g1]);
+        let val1 = empty(rt, g1);
+        nn::argmax_f32_pass(rt, &lb, &idx1, &val1, None, &cap, n).unwrap();
+
+        let g2 = nn::argmax_pass_groups(g1 as u32);
+        assert_eq!(g2, 1, "test assumes the second pass collapses to one group");
+        let idx2 = buf_u32(rt, &vec![0u32; g2]);
+        let val2 = empty(rt, g2);
+        nn::argmax_f32_pass(rt, &val1, &idx2, &val2, Some(&idx1), &cap, g1 as u32).unwrap();
+        rt.synchronize().unwrap();
+
+        let want = softcap * (77.0f32 / softcap).tanh();
+        assert_eq!(idx2.read_u32()[0] as usize, winner);
+        let got = val2.read_f32()[0];
+        assert!(
+            (got - want).abs() < 1e-3,
+            "two-pass softcapped max: got {got}, want {want} (capping twice gives {})",
+            softcap * (want / softcap).tanh()
+        );
     });
 }

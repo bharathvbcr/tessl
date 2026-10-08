@@ -17,7 +17,7 @@
 use objc2::runtime::ProtocolObject;
 use objc2_metal::MTLComputePipelineState;
 
-use crate::runtime::{mtl_size, BufferKind, GpuRuntime, PrecisionMode};
+use crate::runtime::{mtl_size, GpuRuntime, PrecisionMode};
 use crate::tensor::{DType, Tensor};
 
 #[derive(Clone, Copy)]
@@ -27,37 +27,28 @@ enum Layout {
     NT,
 }
 
-/// MPP uses signed 32-bit extents/offset arithmetic, and the TensorOps kernels
-/// cast their extents to `int`. Every public GEMM operand — tensor or raw
-/// buffer — passes this before encoding, which also keeps every logical element
-/// address below `u32::MAX` for the kernels' `uint` tile arithmetic.
-pub(crate) fn require_i32_extent(numel: usize, what: &str) -> Result<(), String> {
-    if numel > i32::MAX as usize {
-        return Err(format!("{what} exceeds signed 32-bit kernel indexing"));
-    }
-    Ok(())
-}
-
 /// All public GEMM paths validate before casting, allocating scratch, or encoding.
 /// MPP uses signed 32-bit extents/offset arithmetic; reject larger matrices.
-/// `entry` is the public function, named in the alignment error.
 fn validate_gemm(
     a: &Tensor,
     b: &Tensor,
     c: &Tensor,
     layout: Layout,
     allow_bf16: bool,
-    entry: &str,
 ) -> Result<(usize, usize, usize), String> {
-    for (t, operand) in [(a, "A"), (b, "B"), (c, "C")] {
+    for t in [a, b, c] {
         t.validate()?;
         if t.shape.len() != 2 || t.shape.contains(&0) {
             return Err("GEMM requires nonempty rank-2 tensors".into());
         }
-        require_i32_extent(t.numel(), "GEMM")?;
-        require_view_alignment(t, entry, operand)?;
+        if t.numel() > i32::MAX as usize {
+            return Err("GEMM exceeds signed 32-bit kernel indexing".into());
+        }
+        require_byte_offset_alignment(t, 16, "GEMM")?;
     }
-    if !std::sync::Arc::ptr_eq(a.runtime(), b.runtime()) || !std::sync::Arc::ptr_eq(a.runtime(), c.runtime()) {
+    if !std::sync::Arc::ptr_eq(a.runtime(), b.runtime())
+        || !std::sync::Arc::ptr_eq(a.runtime(), c.runtime())
+    {
         return Err("GEMM tensors must belong to the same runtime".into());
     }
     if c.dtype != DType::F32 || (!allow_bf16 && (a.dtype != DType::F32 || b.dtype != DType::F32)) {
@@ -77,60 +68,99 @@ fn validate_gemm(
     Ok((m, n, k))
 }
 
-/// Byte alignment every GEMM operand view must start on — one rule for every
-/// kernel family:
-///
-/// | family | kernels | rule |
-/// |---|---|---|
-/// | plain | exact f32 NN/TN/NT, split-K, simdgroup | 16 B |
-/// | exact accumulate | `tn_accum_f32`, `nt_accum_f32` | 16 B |
-/// | cooperative | bf16/f16/relaxed-f32 NN, bf16 TN/NT | 16 B |
-/// | cooperative accumulate | `tn_accum_bf16_f32`, `nt_accum_bf16_f32` | 16 B |
-/// | epilogue | `*_epi*` | 16 B |
-/// | batched | `*_batched`, at every batch's start | 16 B |
-///
-/// Every kernel builds inline `tensor(ptr, extents, strides)` views over a
-/// raw device pointer — not `MTLTensor` objects, whose alignment
-/// `crate::mtl_tensor` checks separately — and each interior tile already
-/// rebases that pointer to an arbitrary element (`A + ty * K`). The 64-byte
-/// rule the cooperative, accumulate, epilogue and batched entries used to
-/// enforce was not a hardware requirement. On the M5 Pro every family is
-/// bit-identical to its 0-offset run at 4, 8, 16, 32 and 48 bytes, under Metal
-/// API and shader validation (`bench/results/gemm_align_probe_m5pro.txt`, from
-/// `alignment_probe::alignment_probe_report`). 16 bytes is the documented
-/// contract, not a measured floor; nothing below it is relied on.
-pub(crate) const GEMM_VIEW_ALIGN: usize = 16;
-
-/// Refuse an operand view that does not start on [`GEMM_VIEW_ALIGN`]. The
-/// error names the public entry point and the operand.
-fn require_view_alignment(t: &Tensor, entry: &str, operand: &str) -> Result<(), String> {
-    if t.byte_offset % GEMM_VIEW_ALIGN != 0 {
+/// TensorOps / simdgroup buffer offsets must be dtype-aligned already via
+/// [`Tensor::validate`]; GEMM additionally requires 16-byte alignment so float4
+/// / half8 device loads cannot fault on an otherwise in-bounds view.
+fn require_byte_offset_alignment(t: &Tensor, align: usize, what: &str) -> Result<(), String> {
+    if align == 0 || t.byte_offset % align != 0 {
         return Err(format!(
-            "{entry}: operand {operand} byte_offset {} is not {GEMM_VIEW_ALIGN}-byte aligned \
-             (every GEMM operand view must start on a {GEMM_VIEW_ALIGN}-byte boundary)",
+            "{what}: byte_offset {} is not {align}-byte aligned",
             t.byte_offset
         ));
     }
     Ok(())
 }
 
-/// Tall-K / small-MN → split-K accumulate.
+/// Tall-K / small-MN → split-K accumulate, f32 exact lane.
 /// Attn dW: M=N=128, K=BT=4096. MLP dW: one side = mlp_dim=384.
+///
+/// The f32 threshold is the historical one: that lane is the golden-parity
+/// path and its split-K-versus-descriptor crossover has not been measured.
+/// The bf16 coop lanes have, and take [`prefer_tn_splitk_bf16`].
 fn prefer_tn_splitk(m: usize, n: usize, k: usize) -> bool {
-    k >= 2048 && m <= 384 && n <= 384 && m.min(n) <= 128
+    k >= 2048 && splitk_shape(m, n)
+}
+
+/// Smallest `K` at which split-K beats the single-dispatch coop bf16 TN
+/// kernel on the small-`M`/`N` dW shapes.
+///
+/// Paired A/B through `gemm_tn_train` at bf16, twenty GEMMs per command
+/// buffer, six order-balanced rounds on an M5 Pro (2026-09-05,
+/// bench/results/splitk_gate_m5pro.txt), split-K time ÷ coop time: at
+/// `K = 4096` the coop kernel won 1.06–1.23x (128x128, 128x384, 384x128) and
+/// still 1.09x at 8192; split-K first won at 12288 (0.91x) and pulled away
+/// with depth (0.70–0.83x at 16384–32768, where the coop kernel's six
+/// threadgroups walk `K` alone). The gate used to sit at 2048 on a
+/// sync-per-iteration measurement that could not resolve the difference.
+const SPLITK_MIN_K_BF16: usize = 12288;
+
+/// [`prefer_tn_splitk`] for the bf16 coop TN lanes (train and accumulate).
+///
+/// The accumulate lane is gated by the train measurement: its coop
+/// alternative is the 64x64 accumulate kernel, which fills the grid at least
+/// as well as the 128x64 train kernel measured, so its crossover is no
+/// shallower — inferred, not measured, and that lane is opt-in.
+fn prefer_tn_splitk_bf16(m: usize, n: usize, k: usize) -> bool {
+    k >= SPLITK_MIN_K_BF16 && splitk_shape(m, n)
+}
+
+/// The dW shapes split-K exists for: both extents small and one at most 128.
+fn splitk_shape(m: usize, n: usize) -> bool {
+    m <= 384 && n <= 384 && m.min(n) <= 128
+}
+
+/// K columns per split-K partition below the partition cap.
+const SPLITK_K_TILE: usize = 256;
+/// Most partitions one split-K GEMM encodes. Each partition is a dispatch and
+/// a barrier inside the packed encoder, so an unbounded count would serialize
+/// thousands of tiny dispatches for a legal but very deep reduction.
+const MAX_SPLITK_PARTITIONS: usize = 32;
+
+/// `(k_tile, partition starts)` for a split-K reduction over `k`.
+///
+/// Up to `MAX_SPLITK_PARTITIONS * SPLITK_K_TILE` the historical 256-wide
+/// partitions are unchanged; past that the partition grows (to a multiple of
+/// the 32-wide K step) so the count stays at the cap.
+fn splitk_plan(k: usize) -> (u32, Vec<u32>) {
+    let parts = k.div_ceil(SPLITK_K_TILE).clamp(1, MAX_SPLITK_PARTITIONS);
+    let k_tile = (k.div_ceil(parts).div_ceil(32) * 32).max(SPLITK_K_TILE);
+    let starts = (0..k).step_by(k_tile).map(|k0| k0 as u32).collect();
+    (k_tile as u32, starts)
+}
+
+/// Every TensorOps kernel here is written for 32-wide simdgroups
+/// (`execution_simdgroups<N>` tiles, `tile_a[4][64]` in the simdgroup edge
+/// kernel), so a device reporting another width cannot be launched correctly.
+const TENSOROPS_SIMD_WIDTH: usize = 32;
+
+fn simd_width(pipeline: &ProtocolObject<dyn MTLComputePipelineState>) -> Result<usize, String> {
+    let width = pipeline.threadExecutionWidth();
+    if width != TENSOROPS_SIMD_WIDTH {
+        return Err(format!(
+            "GEMM kernels are compiled for {TENSOROPS_SIMD_WIDTH}-wide simdgroups; this \
+             device reports a thread execution width of {width}"
+        ));
+    }
+    Ok(width)
 }
 
 /// Tile sizes for TensorOps kernels (must match matmul_tensorops.metal).
-///
-/// `scripts/audit_gemm_tiles.py` checks each `TILE_*` against the kernel whose
-/// `pipeline("...")` call it follows, in any file under `src/`, so a dispatch
-/// outside this module takes its geometry from here, not from local constants.
 #[derive(Clone, Copy)]
-pub(crate) struct TileGeom {
-    pub(crate) sm: usize,
-    pub(crate) sn: usize,
+struct TileGeom {
+    sm: usize,
+    sn: usize,
     /// Simdgroups per TG (`execution_simdgroups<N>`). Exact f32 uses 1.
-    pub(crate) simdgroups: usize,
+    simdgroups: usize,
 }
 
 const TILE_F32: TileGeom = TileGeom {
@@ -208,7 +238,8 @@ fn validate_cast_input(src: &Tensor, dtype: DType) -> Result<(), String> {
 pub fn cast_f32_to_bf16(src: &Tensor) -> Result<Tensor, String> {
     validate_cast_input(src, DType::F32)?;
     let rt = src.runtime();
-    let dst = rt.alloc_tensor_bf16(&src.shape)?;
+    // Every element is written by the cast below before any read.
+    let dst = rt.alloc_tensor_bf16_uninit(&src.shape)?;
     cast_f32_to_bf16_into(src, &dst)?;
     Ok(dst)
 }
@@ -222,7 +253,9 @@ pub fn cast_f32_to_bf16_into(src: &Tensor, dst: &Tensor) -> Result<(), String> {
         || !std::sync::Arc::ptr_eq(src.runtime(), dst.runtime())
         || src.overlaps(dst)
     {
-        return Err("cast destination must match shape/runtime, be bf16, and not overlap source".into());
+        return Err(
+            "cast destination must match shape/runtime, be bf16, and not overlap source".into(),
+        );
     }
     let rt = src.runtime();
     let p = rt.pipeline("cast_f32_to_bf16")?;
@@ -244,61 +277,20 @@ pub fn cast_f32_to_bf16_hot(src: &Tensor) -> Result<Tensor, String> {
     Ok(dst)
 }
 
-/// `dst = src^T` for f32 matrices `[rows, cols]` and `[cols, rows]` (GPU).
-pub fn transpose_f32_into(src: &Tensor, dst: &Tensor) -> Result<(), String> {
-    validate_cast_input(src, DType::F32)?;
-    dst.validate()?;
-    let (s, d) = (src.shape(), dst.shape());
-    if s.len() != 2
-        || d != [s[1], s[0]]
-        || dst.dtype != DType::F32
-        || !std::sync::Arc::ptr_eq(src.runtime(), dst.runtime())
-        || src.overlaps(dst)
-    {
-        return Err(format!(
-            "transpose: destination {d:?} must be f32 [cols, rows] of the 2-D source {s:?}, on its runtime, not overlapping it"
-        ));
-    }
-    let rt = src.runtime();
-    let p = rt.pipeline("transpose2d_f32")?;
-    crate::dispatch::dispatch_1d(rt, &p, src.numel(), |bnd| {
-        crate::dispatch::set_tensor(bnd, src, 0);
-        crate::dispatch::set_tensor(bnd, dst, 1);
-        crate::dispatch::set_u32(bnd, s[0] as u32, 2);
-        crate::dispatch::set_u32(bnd, s[1] as u32, 3);
-    })?;
-    Ok(())
-}
-
 /// Cast bf16 tensor → f32 (GPU).
 pub fn cast_bf16_to_f32(src: &Tensor) -> Result<Tensor, String> {
     validate_cast_input(src, DType::BF16)?;
     let rt = src.runtime();
-    let dst = rt.alloc_tensor_f32(&src.shape)?;
-    cast_bf16_to_f32_into(src, &dst)?;
-    Ok(dst)
-}
-
-/// Widen bf16 into an existing f32 tensor (exact: every bf16 is an f32).
-pub fn cast_bf16_to_f32_into(src: &Tensor, dst: &Tensor) -> Result<(), String> {
-    validate_cast_input(src, DType::BF16)?;
-    dst.validate()?;
-    if dst.dtype != DType::F32
-        || src.shape != dst.shape
-        || !std::sync::Arc::ptr_eq(src.runtime(), dst.runtime())
-        || src.overlaps(dst)
-    {
-        return Err("cast destination must match shape/runtime, be f32, and not overlap source".into());
-    }
-    let rt = src.runtime();
+    // Every element is written by the cast below before any read.
+    let dst = rt.alloc_tensor_f32_uninit(&src.shape)?;
     let p = rt.pipeline("cast_bf16_to_f32")?;
     let n = src.numel();
     crate::dispatch::dispatch_1d(rt, &p, n, |bnd| {
         crate::dispatch::set_tensor(bnd, src, 0);
-        crate::dispatch::set_tensor(bnd, dst, 1);
+        crate::dispatch::set_tensor(bnd, &dst, 1);
         crate::dispatch::set_u32(bnd, n as u32, 2);
     })?;
-    Ok(())
+    Ok(dst)
 }
 
 /// `f32 -> f16`, allocating the destination.
@@ -348,9 +340,11 @@ fn ensure_bf16(t: &Tensor) -> Result<Tensor, String> {
         // *and* changes the exponent range, so a silent one would degrade the
         // caller's operands to buy a code path they did not ask for. An f16
         // operand belongs on the f16 GEMM.
-        DType::F16 => Err("bf16 GEMM was asked for f16 operands; convert explicitly, or use \
+        DType::F16 => Err(
+            "bf16 GEMM was asked for f16 operands; convert explicitly, or use \
              the f16 kernels, which accumulate in f32 just as bf16 does"
-            .into()),
+                .into(),
+        ),
     }
 }
 
@@ -369,46 +363,13 @@ fn use_relaxed_f32(rt: &GpuRuntime, backend: GemmBackend) -> bool {
 ///
 /// - f32×f32→f32 always supported (exact or relaxed via runtime flag)
 /// - bf16×bf16→f32 accum (C must be f32) via TensorOps when available
-///
-/// Bf16 operands whose M does not fill a 128-row tile dispatch
-/// `matmul2d_tensorops_bf16_f32_64x64_sg4` even when N > 512. That
-/// instantiation is the same cooperative helper as the 128×64 kernel and
-/// takes N as a runtime extent. M ≥ 128 keeps the previous rule: 64×64 only
-/// when N ≤ 512.
 pub fn gemm(a: &Tensor, b: &Tensor, c: &Tensor, backend: GemmBackend) -> Result<(), String> {
-    gemm_dispatch(a, b, c, backend, None)
-}
-
-/// [`gemm`] on an explicit cooperative tile.
-///
-/// [`gemm`] picks the tile. This forces one so a numeric check or a paired
-/// timing can run both geometries on the same buffers. Exact f32 and the
-/// simdgroup backend have no cooperative tile and are refused. The call
-/// validates with the same checks as [`gemm`] before a kernel is chosen.
-pub fn gemm_tiled(a: &Tensor, b: &Tensor, c: &Tensor, backend: GemmBackend, tile: EpiTile) -> Result<(), String> {
-    gemm_dispatch(a, b, c, backend, Some(tile))
-}
-
-fn gemm_dispatch(
-    a: &Tensor,
-    b: &Tensor,
-    c: &Tensor,
-    backend: GemmBackend,
-    tile: Option<EpiTile>,
-) -> Result<(), String> {
-    let (m, n, k) = validate_gemm(
-        a,
-        b,
-        c,
-        Layout::NN,
-        true,
-        if tile.is_some() { "gemm_tiled" } else { "gemm" },
-    )?;
+    let (m, n, k) = validate_gemm(a, b, c, Layout::NN, true)?;
 
     let use_bf16 = a.dtype == DType::BF16 && b.dtype == DType::BF16;
     let use_f16 = a.dtype == DType::F16 && b.dtype == DType::F16;
-    let narrow_dtype = use_bf16 || use_f16;
-    if a.dtype != b.dtype || (narrow_dtype && backend != GemmBackend::TensorOps) {
+    let narrow = use_bf16 || use_f16;
+    if a.dtype != b.dtype || (narrow && backend != GemmBackend::TensorOps) {
         return Err("GEMM requires matching operand dtypes; bf16 and f16 require TensorOps".into());
     }
 
@@ -420,70 +381,47 @@ fn gemm_dispatch(
     } else {
         CoopElem::RelaxedF32
     };
-    let coop = narrow_dtype || use_relaxed_f32(rt, backend);
-    if tile.is_some() && !(backend == GemmBackend::TensorOps && coop) {
-        return Err(
-            "GEMM tile override needs the cooperative-destination path: bf16 or f16 operands, \
-             or f32 with relaxed precision, on the TensorOps backend"
-                .into(),
-        );
-    }
     match backend {
         // Cooperative-destination NN kernels (bf16, f16 and relaxed f32):
         // register accumulator, C written exactly once — no zero pre-pass.
-        GemmBackend::TensorOps if coop => {
-            let (kernel, geom) = match tile {
-                Some(forced) => nn_coop_kernel_for(elem, forced),
-                None => nn_coop_kernel(m, n, k, elem),
+        GemmBackend::TensorOps if narrow || use_relaxed_f32(rt, backend) => {
+            let (kernel, tile) = nn_coop_kernel(m, n, k, elem);
+            let pipeline = rt.pipeline(kernel)?;
+            dispatch_tensorops_nn_coop(rt, &pipeline, a, b, c, m, n, k, tile)?;
+        }
+        GemmBackend::TensorOps => {
+            let pipeline = rt.pipeline(backend.kernel_name_f32())?;
+            // Zero-tax: pack C-zero + matmul into one binder (~−1 binder/GEMM).
+            dispatch_tensorops_nn(rt, &pipeline, a, b, c, m, n, k, TILE_F32)?;
+        }
+        GemmBackend::Simdgroup => {
+            let kernel = if m % 16 != 0 || n % 16 != 0 || k % 8 != 0 {
+                "matmul_simdgroup_edges_f32"
+            } else {
+                backend.kernel_name_f32()
             };
             let pipeline = rt.pipeline(kernel)?;
-            dispatch_tensorops_nn_coop(rt, &pipeline, a, b, c, m, n, k, geom)?;
+            // Both simdgroup kernels overwrite every logical output element.
+            // No pre-zero dispatch or barrier is needed (including offset views).
+            let m_u = m as u32;
+            let n_u = n as u32;
+            let k_u = k as u32;
+            let (tg_w, tg_h, tpt) = threadgroup_geometry_simdgroup(&pipeline, m, n)?;
+            rt.with_binder(|bnd| {
+                bnd.set_pipeline(&pipeline);
+                bnd.bind_tensor(a, 0);
+                bnd.bind_tensor(b, 1);
+                bnd.bind_tensor(c, 2);
+                bnd.bind_u32(m_u, 3);
+                bnd.bind_u32(n_u, 4);
+                bnd.bind_u32(k_u, 5);
+                bnd.dispatch(mtl_size(tg_w, tg_h, 1), mtl_size(tpt, 1, 1));
+                Ok(())
+            })?;
         }
-        GemmBackend::TensorOps => match nn_splitk_k_tile(m, n, k) {
-            Some(k_tile) => gemm_nn_splitk_f32(a, b, c, (m, n, k), k_tile)?,
-            None => {
-                let pipeline = rt.pipeline(backend.kernel_name_f32())?;
-                // Zero-tax: pack C-zero + matmul into one binder (~−1 binder/GEMM).
-                dispatch_tensorops_nn(rt, &pipeline, a, b, c, m, n, k, TILE_F32)?;
-            }
-        },
-        GemmBackend::Simdgroup => dispatch_simdgroup(rt, a, b, c, m, n, k)?,
     }
 
     Ok(())
-}
-
-/// Encode one simdgroup-backend f32 NN GEMM. Validation, alignment included,
-/// is the caller's.
-fn dispatch_simdgroup(
-    rt: &GpuRuntime,
-    a: &Tensor,
-    b: &Tensor,
-    c: &Tensor,
-    m: usize,
-    n: usize,
-    k: usize,
-) -> Result<(), String> {
-    let kernel = if m % 16 != 0 || n % 16 != 0 || k % 8 != 0 {
-        "matmul_simdgroup_edges_f32"
-    } else {
-        GemmBackend::Simdgroup.kernel_name_f32()
-    };
-    let pipeline = rt.pipeline(kernel)?;
-    // Both simdgroup kernels overwrite every logical output element.
-    // No pre-zero dispatch or barrier is needed (including offset views).
-    let (tg_w, tg_h, tpt) = threadgroup_geometry_simdgroup(&pipeline, m, n);
-    rt.with_binder(|bnd| {
-        bnd.set_pipeline(&pipeline);
-        bnd.bind_tensor(a, 0);
-        bnd.bind_tensor(b, 1);
-        bnd.bind_tensor(c, 2);
-        bnd.bind_u32(m as u32, 3);
-        bnd.bind_u32(n as u32, 4);
-        bnd.bind_u32(k as u32, 5);
-        bnd.dispatch(mtl_size(tg_w, tg_h, 1), mtl_size(tpt, 1, 1));
-        Ok(())
-    })
 }
 
 /// Element strides between consecutive batch elements.
@@ -506,6 +444,10 @@ impl BatchStrides {
     /// Contiguous batches of all three operands.
     pub fn contiguous(m: usize, n: usize, k: usize) -> Self {
         Self {
+            // A constructor returning `Self` cannot report arithmetic failure.
+            // Saturating preserves the invalidity so `gemm_batched` rejects the
+            // stride, instead of panicking in debug or wrapping to a plausible
+            // small stride in release.
             a: m.saturating_mul(k),
             b: k.saturating_mul(n),
             c: m.saturating_mul(n),
@@ -547,9 +489,12 @@ pub struct BatchedGemm {
 /// `C[i] = A[i] @ B[i]` for `spec.batch` matrices, in one dispatch.
 ///
 /// The batch is the grid's second dimension, so batching costs a pointer offset
-/// per threadgroup and nothing else — the tile geometry, the register
-/// accumulator and the swizzle are the single-matrix path's, and each element
-/// is bit-identical to the [`gemm`] that would have produced it.
+/// per threadgroup and nothing else. Each element is bit-identical to the
+/// [`gemm`] that would have produced it: both run the cooperative-destination
+/// kernels, whose per-element K reduction order does not depend on the tile
+/// extents. The batched kernels are instantiated at 128×64 only while [`gemm`]
+/// picks 64×64 for `N <= 512`, and `tests/gemm_batched.rs` pins the identity
+/// across that difference as well as at a matching geometry.
 ///
 /// Requires the cooperative-destination path (bf16, f16, or f32 with relaxed
 /// precision on TensorOps), for the same reason [`gemm_epilogue`] does.
@@ -558,10 +503,13 @@ pub struct BatchedGemm {
 /// rest. Every operand's last element is bounds checked against its buffer,
 /// because an over-long batch reads past the end of device memory rather than
 /// failing.
-///
-/// Every batch's view must start on a 16-byte boundary, as every GEMM operand
-/// view must: each base, and each nonzero stride times the element size.
-pub fn gemm_batched(a: &Tensor, b: &Tensor, c: &Tensor, backend: GemmBackend, spec: BatchedGemm) -> Result<(), String> {
+pub fn gemm_batched(
+    a: &Tensor,
+    b: &Tensor,
+    c: &Tensor,
+    backend: GemmBackend,
+    spec: BatchedGemm,
+) -> Result<(), String> {
     let BatchedGemm {
         m,
         n,
@@ -577,7 +525,9 @@ pub fn gemm_batched(a: &Tensor, b: &Tensor, c: &Tensor, backend: GemmBackend, sp
     }
     for (name, value) in [("m", m), ("n", n), ("k", k), ("batch", batch)] {
         if value > i32::MAX as usize {
-            return Err(format!("batched GEMM {name} exceeds signed 32-bit kernel indexing"));
+            return Err(format!(
+                "batched GEMM {name} exceeds signed 32-bit kernel indexing"
+            ));
         }
     }
     let matrix_a = m
@@ -589,12 +539,17 @@ pub fn gemm_batched(a: &Tensor, b: &Tensor, c: &Tensor, backend: GemmBackend, sp
     let matrix_c = m
         .checked_mul(n)
         .ok_or_else(|| "batched GEMM: C matrix extent overflows usize".to_string())?;
-    for (t, operand) in [(a, "A"), (b, "B"), (c, "C")] {
+    for t in [a, b, c] {
         t.validate()?;
-        require_i32_extent(t.numel(), "batched GEMM")?;
-        require_view_alignment(t, "gemm_batched", operand)?;
+        if t.numel() > i32::MAX as usize {
+            return Err("batched GEMM exceeds signed 32-bit kernel indexing".into());
+        }
+        require_byte_offset_alignment(t, 16, "batched GEMM")?;
+        require_byte_offset_alignment(t, 64, "batched GEMM cooperative path")?;
     }
-    if !std::sync::Arc::ptr_eq(a.runtime(), b.runtime()) || !std::sync::Arc::ptr_eq(a.runtime(), c.runtime()) {
+    if !std::sync::Arc::ptr_eq(a.runtime(), b.runtime())
+        || !std::sync::Arc::ptr_eq(a.runtime(), c.runtime())
+    {
         return Err("batched GEMM tensors must belong to the same runtime".into());
     }
     if a.overlaps(c) || b.overlaps(c) {
@@ -646,18 +601,6 @@ pub fn gemm_batched(a: &Tensor, b: &Tensor, c: &Tensor, backend: GemmBackend, sp
         if stride > u32::MAX as usize {
             return Err(format!("batched GEMM: {what} stride exceeds uint indexing"));
         }
-        // The kernel starts batch `i` at `base + i * stride`, so the alignment
-        // rule binds every batch, not only the first. The base is aligned
-        // above; an aligned stride in bytes keeps every later start aligned.
-        let stride_bytes = stride * t.dtype.size_of();
-        if batch > 1 && stride_bytes % GEMM_VIEW_ALIGN != 0 {
-            return Err(format!(
-                "gemm_batched: operand {what} stride {stride} elements ({stride_bytes} bytes) puts batch 1 at \
-                 byte_offset {}, not {GEMM_VIEW_ALIGN}-byte aligned (every batch's operand view must start on a \
-                 {GEMM_VIEW_ALIGN}-byte boundary)",
-                t.byte_offset + stride_bytes
-            ));
-        }
     }
 
     if batch == 1 {
@@ -675,35 +618,15 @@ pub fn gemm_batched(a: &Tensor, b: &Tensor, c: &Tensor, backend: GemmBackend, sp
         CoopElem::RelaxedF32 => "matmul2d_tensorops_f32_relaxed_batched",
     };
     let pipeline = rt.pipeline(kernel)?;
-    dispatch_tensorops_batched(rt, &pipeline, a, b, c, spec)
-}
-
-/// Encode one batched cooperative GEMM. Validation, alignment included, is
-/// the caller's.
-fn dispatch_tensorops_batched(
-    rt: &GpuRuntime,
-    pipeline: &ProtocolObject<dyn MTLComputePipelineState>,
-    a: &Tensor,
-    b: &Tensor,
-    c: &Tensor,
-    spec: BatchedGemm,
-) -> Result<(), String> {
-    let BatchedGemm {
-        m,
-        n,
-        k,
-        batch,
-        strides,
-    } = spec;
     // Only the 128x64 geometry is instantiated batched; a narrow variant is a
     // tuning question left until measured, as for the epilogue.
     let tile = TILE_COOP_DEFAULT;
     let tiles_n = n.div_ceil(tile.sn);
     let tiles_m = m.div_ceil(tile.sm);
     let tg = morton_tg_count(tiles_n, tiles_m);
-    let tpt = threads_per_tg(pipeline, tile);
+    let tpt = threads_per_tg(&pipeline, tile)?;
     rt.with_binder(|bnd| {
-        bnd.set_pipeline(pipeline);
+        bnd.set_pipeline(&pipeline);
         bnd.bind_tensor(a, 0);
         bnd.bind_tensor(b, 1);
         bnd.bind_tensor(c, 2);
@@ -743,9 +666,9 @@ pub enum Activation {
     None = 0,
     /// `max(x, 0)`.
     Relu = 1,
-    /// `gelu_pytorch_tanh`, computed by `kernels/gelu.h` — the same function
-    /// `nn::mlp_gelu_tanh` calls, not a second derivation. At `-O2` MSL lowers
-    /// plain `tanh` to `air.fast_tanh`, which NaNs past roughly |10|.
+    /// `gelu_pytorch_tanh`, in the same clamped `precise::tanh` formulation as
+    /// `nn::mlp_gelu_tanh`. Deliberately not a second derivation: at `-O2` MSL
+    /// lowers plain `tanh` to `air.fast_tanh`, which NaNs past roughly |10|.
     GeluTanh = 2,
     /// `x * sigmoid(x)`, matching `nn::mlp_silu`.
     Silu = 3,
@@ -797,7 +720,10 @@ impl Epilogue<'_> {
     /// A caller passing the identity is dispatched to the plain kernel rather
     /// than paying for an epilogue that computes `C = 1.0 * C + 0.0`.
     pub fn is_identity(&self) -> bool {
-        self.alpha == 1.0 && self.beta == 0.0 && self.bias.is_none() && self.activation == Activation::None
+        self.alpha == 1.0
+            && self.beta == 0.0
+            && self.bias.is_none()
+            && self.activation == Activation::None
     }
 }
 
@@ -813,9 +739,6 @@ impl Epilogue<'_> {
 /// would make the call quietly slower than the unfused code it replaced.
 ///
 /// An identity epilogue dispatches to the plain [`gemm`].
-///
-/// Bf16 operands whose M does not fill a 128-row tile use the 64×64 epilogue
-/// instantiation. Every other shape stays on 128×64.
 pub fn gemm_epilogue(
     a: &Tensor,
     b: &Tensor,
@@ -823,61 +746,13 @@ pub fn gemm_epilogue(
     backend: GemmBackend,
     epi: Epilogue<'_>,
 ) -> Result<(), String> {
-    run_gemm_epilogue(a, b, c, backend, epi, None)
-}
-
-/// Cooperative epilogue geometry.
-///
-/// [`gemm_epilogue`] picks [`EpiTile::Narrow`] for bf16 only when M does not
-/// fill a 128-row tile. [`gemm_epilogue_tiled`] forces a geometry so a numeric
-/// check or a paired timing can run both on the same shape.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum EpiTile {
-    /// 128×64 simdgroup-4. Instantiated for bf16, f16, and relaxed f32.
-    Wide,
-    /// 64×64 simdgroup-4. Instantiated for bf16 only.
-    Narrow,
-}
-
-/// [`gemm_epilogue`] on an explicit tile.
-///
-/// An identity epilogue is refused. That path is the plain GEMM, which selects
-/// its own tile from N and would ignore `tile`.
-pub fn gemm_epilogue_tiled(
-    a: &Tensor,
-    b: &Tensor,
-    c: &Tensor,
-    backend: GemmBackend,
-    epi: Epilogue<'_>,
-    tile: EpiTile,
-) -> Result<(), String> {
-    run_gemm_epilogue(a, b, c, backend, epi, Some(tile))
-}
-
-fn run_gemm_epilogue(
-    a: &Tensor,
-    b: &Tensor,
-    c: &Tensor,
-    backend: GemmBackend,
-    epi: Epilogue<'_>,
-    tile: Option<EpiTile>,
-) -> Result<(), String> {
     if epi.is_identity() {
-        if tile.is_some() {
-            return Err("GEMM epilogue: an explicit tile needs a non-identity epilogue; \
-                 the identity path is the plain GEMM, which picks its own tile"
-                .into());
-        }
-        // Validated here too, so a refusal names this entry, not `gemm`.
-        validate_gemm(a, b, c, Layout::NN, true, "gemm_epilogue")?;
         return gemm(a, b, c, backend);
     }
-    let entry = if tile.is_some() {
-        "gemm_epilogue_tiled"
-    } else {
-        "gemm_epilogue"
-    };
-    let (m, n, k) = validate_gemm(a, b, c, Layout::NN, true, entry)?;
+    let (m, n, k) = validate_gemm(a, b, c, Layout::NN, true)?;
+    for t in [a, b, c] {
+        require_byte_offset_alignment(t, 64, "GEMM epilogue cooperative path")?;
+    }
     if !epi.alpha.is_finite() || !epi.beta.is_finite() {
         return Err(format!(
             "GEMM epilogue: alpha and beta must be finite, got alpha={} beta={}",
@@ -912,45 +787,28 @@ fn run_gemm_epilogue(
                 bias.numel()
             ));
         }
-        // Bias is loaded while C is stored. Separate tile rows are separate
-        // threadgroups, so a bias that aliases C races. M = 127 on the 64-row
-        // tile is two rows; the 128-row tile is one.
         if bias.overlaps(c) {
-            return Err("GEMM epilogue: bias must not overlap the output".into());
+            return Err("GEMM epilogue: bias overlaps output".into());
         }
     }
 
-    let elem = if use_bf16 {
-        CoopElem::Bf16
+    let kernel = if use_bf16 {
+        "matmul2d_tensorops_bf16_f32_epi"
     } else if use_f16 {
-        CoopElem::F16
+        "matmul2d_tensorops_f16_f32_epi"
     } else {
-        CoopElem::RelaxedF32
+        "matmul2d_tensorops_f32_relaxed_epi"
     };
-    let chosen = tile.unwrap_or_else(|| epi_tile_auto(m, elem));
-    let (kernel, tile) = epi_kernel(elem, chosen)?;
     let pipeline = rt.pipeline(kernel)?;
-    dispatch_tensorops_epi(rt, &pipeline, a, b, c, m, n, k, tile, epi)
-}
-
-/// Encode one cooperative epilogue GEMM. Validation, alignment included, is
-/// the caller's.
-fn dispatch_tensorops_epi(
-    rt: &GpuRuntime,
-    pipeline: &ProtocolObject<dyn MTLComputePipelineState>,
-    a: &Tensor,
-    b: &Tensor,
-    c: &Tensor,
-    m: usize,
-    n: usize,
-    k: usize,
-    tile: TileGeom,
-    epi: Epilogue<'_>,
-) -> Result<(), String> {
+    // Only the 128x64 sg4 geometry has an epilogue instantiation. The narrow
+    // 64x64 variant exists for shapes the tile tune found it better on; adding
+    // an epilogue copy of it is a tuning question, not a correctness one, and
+    // is deliberately left until measured.
+    let tile = TILE_COOP_DEFAULT;
     let tiles_n = n.div_ceil(tile.sn);
     let tiles_m = m.div_ceil(tile.sm);
     let tg = morton_tg_count(tiles_n, tiles_m);
-    let tpt = threads_per_tg(pipeline, tile);
+    let tpt = threads_per_tg(&pipeline, tile)?;
     let (alpha, beta, act) = (epi.alpha, epi.beta, epi.activation as u32);
     let has_bias = u32::from(epi.bias.is_some());
     // Buffer 8 is read unconditionally by the kernel binding, so it must be
@@ -958,7 +816,7 @@ fn dispatch_tensorops_epi(
     // `has_bias` is what decides whether it is dereferenced.
     let bias_buf = epi.bias.unwrap_or(c);
     rt.with_binder(|bnd| {
-        bnd.set_pipeline(pipeline);
+        bnd.set_pipeline(&pipeline);
         bnd.bind_tensor(a, 0);
         bnd.bind_tensor(b, 1);
         bnd.bind_tensor(c, 2);
@@ -979,7 +837,7 @@ fn dispatch_tensorops_epi(
 
 /// Cooperative-destination NN tile geometries (must match the NN_COOP_KERNEL
 /// instantiations in matmul_tensorops.metal).
-pub(crate) const TILE_COOP_DEFAULT: TileGeom = TileGeom {
+const TILE_COOP_DEFAULT: TileGeom = TileGeom {
     sm: 128,
     sn: 64,
     simdgroups: 4,
@@ -989,7 +847,39 @@ const TILE_COOP_NARROW: TileGeom = TileGeom {
     sn: 64,
     simdgroups: 4,
 };
+/// `M` at or below which a 128-row tile is at least half padding.
+const NARROW_TILE_MAX_ROWS: usize = 64;
+/// Fewer default (128×64) tiles than this leaves the M5 Pro's cores starved;
+/// see [`nn_coop_kernel`] for the measurement.
+const NARROW_TILE_MIN_GRID: usize = 64;
 
+/// Shape → coop NN kernel.
+///
+/// From the 2026-08-30 M5 Pro tile tunes (bench/results/bf16_tile_tune_m5pro_coop.txt,
+/// bf16_tnnt_coop_m5pro.txt): 64×64 sg4 wins narrow-N shapes by ~6%; 128×64
+/// sg4 everything else at `M >= 512`. The in-kernel column-panel swizzle
+/// covers the huge-square case (+11% at 4096³), which retired the earlier
+/// 256×64 sg8 wide entry it outran.
+///
+/// `M` below 512 had never been measured, and the selection ignored it. The
+/// 2026-09-04 paired A/B (bench/results/bf16_smallm_coop_m5pro.txt: bf16
+/// through `gemm`, twenty GEMMs per command buffer, six order-balanced rounds
+/// of eight calls, 128×64 time ÷ 64×64 time) found two more regimes where
+/// the 64×64 tile wins:
+///
+/// * `M <= 64`: a 128-row tile is at least half padding, so the default does
+///   double the MMA work for the same output. 1.35–1.74× at every N and K
+///   tried (768…4096).
+/// * A starved grid: when fewer than 64 of the 128×64 tiles cover C, the
+///   64×64 tile's twice-as-many threadgroups fill the GPU better than the
+///   bigger tile's arithmetic intensity pays back. 1.14–1.59× (`M = 128` at
+///   `N <= 3072`, `M <= 512` at `N = 768`); the default is within 5% or
+///   ahead from 64 tiles up (0.82× for the narrow tile at `M >= 256`,
+///   `N = K = 4096`), so the threshold sits at the first point the default
+///   wins, not the last point the narrow tile does.
+///
+/// `K` does not enter the choice: it stretches every threadgroup's inner
+/// loop equally.
 /// Operand element type for the cooperative-destination NN kernels.
 ///
 /// A three-way choice rather than the boolean this used to be: f16 and bf16
@@ -1002,45 +892,9 @@ enum CoopElem {
     F16,
 }
 
-/// 64×64 epilogue only when a 128-row tile would not be filled, and only for
-/// bf16, which is the dtype that instantiation exists for.
-fn epi_tile_auto(m: usize, elem: CoopElem) -> EpiTile {
-    if elem == CoopElem::Bf16 && m < TILE_COOP_DEFAULT.sm {
-        EpiTile::Narrow
-    } else {
-        EpiTile::Wide
-    }
-}
-
-fn epi_kernel(elem: CoopElem, tile: EpiTile) -> Result<(&'static str, TileGeom), String> {
-    match (elem, tile) {
-        (CoopElem::Bf16, EpiTile::Narrow) => Ok(("matmul2d_tensorops_bf16_f32_epi_64x64_sg4", TILE_COOP_NARROW)),
-        (CoopElem::Bf16, EpiTile::Wide) => Ok(("matmul2d_tensorops_bf16_f32_epi", TILE_COOP_DEFAULT)),
-        (CoopElem::F16, EpiTile::Wide) => Ok(("matmul2d_tensorops_f16_f32_epi", TILE_COOP_DEFAULT)),
-        (CoopElem::RelaxedF32, EpiTile::Wide) => Ok(("matmul2d_tensorops_f32_relaxed_epi", TILE_COOP_DEFAULT)),
-        (_, EpiTile::Narrow) => Err("GEMM epilogue: the 64x64 tile is instantiated for bf16 operands only".into()),
-    }
-}
-
-/// Shape → coop NN kernel.
-///
-/// N ≤ 512 uses 64×64 from the 2026-08-30 M5 Pro tile tunes. Bf16 with
-/// M < 128 also uses `matmul2d_tensorops_bf16_f32_64x64_sg4`, whose N is a
-/// runtime extent. M ≥ 128 with N > 512 stays on 128×64: paired timing at
-/// the GDN in-projection (K=2048, N=8224) had non-overlapping ranges, with
-/// 64×64 faster at M=61 and 128×64 faster at M=200.
 fn nn_coop_kernel(m: usize, n: usize, _k: usize, elem: CoopElem) -> (&'static str, TileGeom) {
-    // N ≤ 512 is the 2026-08-30 tune. The short-M clause is bf16 only: f16
-    // and relaxed f32 keep the N rule. M ≥ 128 with N > 512 stays on 128×64.
-    let short_m = elem == CoopElem::Bf16 && m < TILE_COOP_DEFAULT.sm;
-    coop_kernel(elem, short_m || n <= 512)
-}
-
-fn nn_coop_kernel_for(elem: CoopElem, tile: EpiTile) -> (&'static str, TileGeom) {
-    coop_kernel(elem, tile == EpiTile::Narrow)
-}
-
-fn coop_kernel(elem: CoopElem, narrow: bool) -> (&'static str, TileGeom) {
+    let default_tiles = m.div_ceil(TILE_COOP_DEFAULT.sm) * n.div_ceil(TILE_COOP_DEFAULT.sn);
+    let narrow = n <= 512 || m <= NARROW_TILE_MAX_ROWS || default_tiles < NARROW_TILE_MIN_GRID;
     if narrow {
         (
             match elem {
@@ -1076,10 +930,13 @@ fn dispatch_tensorops_nn_coop(
     k: usize,
     tile: TileGeom,
 ) -> Result<(), String> {
+    for t in [a, b, c] {
+        require_byte_offset_alignment(t, 64, "GEMM cooperative path")?;
+    }
     let tiles_n = n.div_ceil(tile.sn);
     let tiles_m = m.div_ceil(tile.sm);
     let tg = morton_tg_count(tiles_n, tiles_m);
-    let tpt = threads_per_tg(pipeline, tile);
+    let tpt = threads_per_tg(pipeline, tile)?;
     rt.with_binder(|bnd| {
         bnd.set_pipeline(pipeline);
         bnd.bind_tensor(a, 0);
@@ -1112,7 +969,7 @@ fn dispatch_tensorops_nn(
     let tiles_n = n.div_ceil(tile.sn);
     let tiles_m = m.div_ceil(tile.sm);
     let tg = morton_tg_count(tiles_n, tiles_m);
-    let tpt = threads_per_tg(pipeline, tile);
+    let tpt = threads_per_tg(pipeline, tile)?;
     let z_width = zero_p.threadExecutionWidth();
     let z_tpt = z_width.min(numel).max(1);
     let z_groups = numel.div_ceil(z_tpt);
@@ -1139,7 +996,14 @@ fn dispatch_tensorops_nn(
         bnd.bind_u32(tiles_n as u32, 6);
         bnd.bind_u32(tiles_m as u32, 7);
         // f32 exact NN/TN/NT read buffer(8); bf16/relaxed ignore extra bind.
-        bnd.bind_u32(if crate::ab_flags::gemm_interior_offsets() { 1 } else { 0 }, 8);
+        bnd.bind_u32(
+            if crate::ab_flags::gemm_interior_offsets() {
+                1
+            } else {
+                0
+            },
+            8,
+        );
         bnd.dispatch(mtl_size(tg, 1, 1), mtl_size(tpt, 1, 1));
         Ok(())
     })
@@ -1173,10 +1037,13 @@ fn dispatch_tensorops_accum(
     tile: TileGeom,
     bind_interior: bool,
 ) -> Result<(), String> {
+    for t in [a, b, c] {
+        require_byte_offset_alignment(t, 64, "GEMM cooperative path")?;
+    }
     let tiles_n = n.div_ceil(tile.sn);
     let tiles_m = m.div_ceil(tile.sm);
     let tg = morton_tg_count(tiles_n, tiles_m);
-    let tpt = threads_per_tg(pipeline, tile);
+    let tpt = threads_per_tg(pipeline, tile)?;
 
     rt.with_binder(|bnd| {
         bnd.set_pipeline(pipeline);
@@ -1189,7 +1056,14 @@ fn dispatch_tensorops_accum(
         bnd.bind_u32(tiles_n as u32, 6);
         bnd.bind_u32(tiles_m as u32, 7);
         if bind_interior {
-            bnd.bind_u32(if crate::ab_flags::gemm_interior_offsets() { 1 } else { 0 }, 8);
+            bnd.bind_u32(
+                if crate::ab_flags::gemm_interior_offsets() {
+                    1
+                } else {
+                    0
+                },
+                8,
+            );
         }
         bnd.dispatch(mtl_size(tg, 1, 1), mtl_size(tpt, 1, 1));
         Ok(())
@@ -1205,164 +1079,30 @@ pub fn gemm_f32(a: &Tensor, b: &Tensor, c: &Tensor, backend: GemmBackend) -> Res
 /// `c`). Already-bf16 operands skip cast (persistent bf16 activations/weights).
 /// Falls back to f32 GEMM when TensorOps is absent.
 pub fn gemm_train(a: &Tensor, b: &Tensor, c: &Tensor, backend: GemmBackend) -> Result<(), String> {
-    validate_gemm(a, b, c, Layout::NN, true, "gemm_train")?;
-    if use_bf16_gemm(a.runtime(), backend) {
-        return gemm_bf16(a, b, c);
+    validate_gemm(a, b, c, Layout::NN, true)?;
+    let rt = a.runtime();
+    if use_bf16_gemm(rt, backend) {
+        let a_bf = ensure_bf16(a)?;
+        let b_bf = ensure_bf16(b)?;
+        assert_eq!(c.dtype, DType::F32);
+        return gemm(&a_bf, &b_bf, c, backend);
     }
     gemm_f32(a, b, c, backend)
 }
 
-/// The operand precision of a caller that chooses per call rather than
-/// through the runtime's [`PrecisionMode`]. Both accumulate in f32 into an f32
-/// C on the TensorOps backend.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum GemmOperands {
-    /// f32 operands, exact (not `relaxed_precision`) products.
-    ExactF32,
-    /// Operands rounded to bf16 ([`gemm_bf16`], [`gemm_tn_bf16`], [`gemm_nt_bf16`]).
-    Bf16,
-}
-
-impl GemmOperands {
-    fn exact(rt: &GpuRuntime, what: &str) -> Result<(), String> {
-        if rt.relaxed_precision() {
-            return Err(format!(
-                "{what}: exact-f32 operands asked for, but the runtime's relaxed precision is on"
-            ));
-        }
-        Ok(())
-    }
-
-    /// `C = A @ B`.
-    pub fn nn(self, a: &Tensor, b: &Tensor, c: &Tensor) -> Result<(), String> {
-        match self {
-            Self::ExactF32 => {
-                Self::exact(a.runtime(), "GemmOperands::nn")?;
-                gemm(a, b, c, GemmBackend::TensorOps)
-            }
-            Self::Bf16 => gemm_bf16(a, b, c),
-        }
-    }
-
-    /// `C = A^T @ B`, A stored `[K, M]`.
-    pub fn tn(self, a_km: &Tensor, b_kn: &Tensor, c: &Tensor) -> Result<(), String> {
-        match self {
-            Self::ExactF32 => {
-                Self::exact(a_km.runtime(), "GemmOperands::tn")?;
-                gemm_tn_f32(a_km, b_kn, c, GemmBackend::TensorOps)
-            }
-            Self::Bf16 => gemm_tn_bf16(a_km, b_kn, c),
-        }
-    }
-
-    /// `C = A @ B^T`, B stored `[N, K]`.
-    pub fn nt(self, a_mk: &Tensor, b_nk: &Tensor, c: &Tensor) -> Result<(), String> {
-        match self {
-            Self::ExactF32 => {
-                Self::exact(a_mk.runtime(), "GemmOperands::nt")?;
-                gemm_nt_f32(a_mk, b_nk, c, GemmBackend::TensorOps)
-            }
-            Self::Bf16 => gemm_nt_bf16(a_mk, b_nk, c),
-        }
-    }
-
-    /// Device bytes [`Self::nn`] allocates for itself on an f32 `A [m, k]`
-    /// and a `B [k, n]` of dtype `b`, at allocated sizes
-    /// ([`GpuRuntime::allocated_bytes_for`]): a bf16 copy of each f32 operand
-    /// under [`Self::Bf16`] (a bf16 `B`, such as a bf16-stored weight, is
-    /// used as it is), nothing under [`Self::ExactF32`]. Like every
-    /// temporary, they stay allocated until the next waited commit.
-    pub(crate) fn nn_scratch_bytes(self, m: usize, n: usize, k: usize, b: DType) -> u64 {
-        match self {
-            Self::ExactF32 => 0,
-            Self::Bf16 => bf16_copies(m.saturating_mul(k), narrowed(k.saturating_mul(n), b)),
-        }
-    }
-
-    /// As [`Self::nn_scratch_bytes`], for [`Self::tn`] (`C [m, n]`, shared
-    /// dimension `k`): under [`Self::ExactF32`], the parallel split-K's
-    /// partition scratch ([`tn_par_k_tile`]), or the transposed `A` a device
-    /// without TensorOps takes.
-    pub(crate) fn tn_scratch_bytes(self, has_tensorops: bool, m: usize, n: usize, k: usize) -> u64 {
-        match self {
-            Self::Bf16 => bf16_copies(k.saturating_mul(m), k.saturating_mul(n)),
-            Self::ExactF32 if !(USE_TN_NT_DESCRIPTORS && has_tensorops) => f32_temp(m.saturating_mul(k)),
-            Self::ExactF32 => tn_par_k_tile(m, n, k).map_or(0, |k_tile| {
-                // Each partition's slice is padded to 16 bytes.
-                let slice = m.saturating_mul(n).div_ceil(4).saturating_mul(4);
-                f32_temp(slice.saturating_mul(k.div_ceil(k_tile)))
-            }),
-        }
-    }
-
-    /// As [`Self::nn_scratch_bytes`], for [`Self::nt`] (`C [m, n]`, shared
-    /// dimension `k`, `B` of dtype `b`): under [`Self::ExactF32`], the
-    /// transposed `B` a device without TensorOps takes.
-    pub(crate) fn nt_scratch_bytes(self, has_tensorops: bool, m: usize, n: usize, k: usize, b: DType) -> u64 {
-        match self {
-            Self::Bf16 => bf16_copies(m.saturating_mul(k), narrowed(n.saturating_mul(k), b)),
-            Self::ExactF32 if !(USE_TN_NT_DESCRIPTORS && has_tensorops) => f32_temp(k.saturating_mul(n)),
-            Self::ExactF32 => 0,
-        }
-    }
-}
-
-/// Allocated bytes of the bf16 operand copies [`ensure_bf16`] makes, of
-/// `a` and `b` elements (0: the operand is already bf16, no copy).
-fn bf16_copies(a: usize, b: usize) -> u64 {
-    [a, b]
-        .iter()
-        .filter(|&&n| n > 0)
-        .map(|&n| GpuRuntime::allocated_bytes_for(n.saturating_mul(2), BufferKind::Cold))
-        .fold(0, u64::saturating_add)
-}
-
-/// Elements [`ensure_bf16`] copies for an operand of `n` elements of `dtype`.
-fn narrowed(n: usize, dtype: DType) -> usize {
-    if dtype == DType::BF16 {
-        0
-    } else {
-        n
-    }
-}
-
-/// Allocated bytes of one f32 temporary (`alloc_temp_f32`, from the pool).
-fn f32_temp(n: usize) -> u64 {
-    GpuRuntime::allocated_bytes_for(n.saturating_mul(4), BufferKind::Cold)
-}
-
-/// The bf16 lane's preconditions: TensorOps, and an f32 destination.
-fn check_bf16_lane(rt: &GpuRuntime, c: &Tensor, what: &str) -> Result<(), String> {
-    if !rt.has_tensorops() {
-        return Err(format!("{what}: bf16 operands need TensorOps, which this device lacks"));
-    }
-    if c.dtype != DType::F32 {
-        return Err(format!(
-            "{what}: bf16 operands accumulate into an f32 C, got {:?}",
-            c.dtype
-        ));
-    }
-    Ok(())
-}
-
-/// `C[M,N] = A[M,K] @ B[K,N]` with bf16 operands and f32 accumulation,
-/// whatever the runtime's [`PrecisionMode`]: f32 operands are rounded to bf16
-/// first (into temporaries), bf16 ones are used as they are. The lane
-/// [`gemm_train`] takes under `PrecisionMode::Bf16`, for callers that choose
-/// it per call.
-pub fn gemm_bf16(a: &Tensor, b: &Tensor, c: &Tensor) -> Result<(), String> {
-    validate_gemm(a, b, c, Layout::NN, true, "gemm_bf16")?;
-    check_bf16_lane(a.runtime(), c, "gemm_bf16")?;
-    gemm(&ensure_bf16(a)?, &ensure_bf16(b)?, c, GemmBackend::TensorOps)
-}
-
 /// `C[M,N] = A[K,M]^T @ B[K,N]` (TN). A is stored `[K,M]`, B `[K,N]`.
-pub fn gemm_tn_f32(a_km: &Tensor, b_kn: &Tensor, c: &Tensor, backend: GemmBackend) -> Result<(), String> {
-    let (m, n, k) = validate_gemm(a_km, b_kn, c, Layout::TN, false, "gemm_tn_f32")?;
+pub fn gemm_tn_f32(
+    a_km: &Tensor,
+    b_kn: &Tensor,
+    c: &Tensor,
+    backend: GemmBackend,
+) -> Result<(), String> {
+    let (m, n, k) = validate_gemm(a_km, b_kn, c, Layout::TN, false)?;
 
-    if USE_TN_NT_DESCRIPTORS && backend == GemmBackend::TensorOps && a_km.runtime().has_tensorops() {
-        if let Some(k_tile) = tn_par_k_tile(m, n, k) {
-            return gemm_tn_splitk_par_f32(a_km, b_kn, c, k_tile);
+    if USE_TN_NT_DESCRIPTORS && backend == GemmBackend::TensorOps && a_km.runtime().has_tensorops()
+    {
+        if prefer_tn_splitk(m, n, k) {
+            return gemm_tn_splitk_f32(a_km, b_kn, c, k);
         }
         let rt = a_km.runtime();
         let pipeline = rt.pipeline("matmul2d_tensorops_tn_f32")?;
@@ -1370,269 +1110,91 @@ pub fn gemm_tn_f32(a_km: &Tensor, b_kn: &Tensor, c: &Tensor, backend: GemmBacken
     }
 
     // Default: explicit transpose + NN (golden-safe).
-    let at = a_km.runtime().alloc_temp_f32(&[m, k])?;
-    transpose_f32_into(a_km, &at)?;
+    let at = {
+        let rt = a_km.runtime();
+        // Fully written by the transpose before the GEMM reads it.
+        let out = rt.alloc_temp_f32_uninit(&[m, k])?;
+        let p = rt.pipeline("transpose2d_f32")?;
+        crate::dispatch::dispatch_1d(rt, &p, m * k, |bnd| {
+            crate::dispatch::set_tensor(bnd, a_km, 0);
+            crate::dispatch::set_tensor(bnd, &out, 1);
+            crate::dispatch::set_u32(bnd, k as u32, 2);
+            crate::dispatch::set_u32(bnd, m as u32, 3);
+        })?;
+        out
+    };
     gemm_f32(&at, b_kn, c, backend)
 }
 
 /// Training TN GEMM — bf16 TensorOps descriptor when `PrecisionMode::Bf16`.
-pub fn gemm_tn_train(a_km: &Tensor, b_kn: &Tensor, c: &Tensor, backend: GemmBackend) -> Result<(), String> {
+pub fn gemm_tn_train(
+    a_km: &Tensor,
+    b_kn: &Tensor,
+    c: &Tensor,
+    backend: GemmBackend,
+) -> Result<(), String> {
     validate_gemm(
         a_km,
         b_kn,
         c,
         Layout::TN,
         use_bf16_gemm(a_km.runtime(), backend),
-        "gemm_tn_train",
     )?;
-    if use_bf16_gemm(a_km.runtime(), backend) {
-        return gemm_tn_bf16(a_km, b_kn, c);
+    let rt = a_km.runtime();
+    if use_bf16_gemm(rt, backend) {
+        assert_eq!(c.dtype, DType::F32);
+        let a_bf = ensure_bf16(a_km)?;
+        let b_bf = ensure_bf16(b_kn)?;
+        let k = a_bf.shape[0];
+        let m = a_bf.shape[1];
+        let n = b_bf.shape[1];
+        assert_eq!(c.shape, &[m, n]);
+        if prefer_tn_splitk_bf16(m, n, k) {
+            return gemm_tn_splitk_bf16(&a_bf, &b_bf, c, k);
+        }
+        // Coop kernel: register accumulator, C written once, no zero pre-pass.
+        let pipeline = rt.pipeline("matmul2d_tensorops_tn_bf16_f32")?;
+        return dispatch_tensorops_nn_coop(
+            rt,
+            &pipeline,
+            &a_bf,
+            &b_bf,
+            c,
+            m,
+            n,
+            k,
+            TILE_COOP_TN_NT,
+        );
     }
     gemm_tn_f32(a_km, b_kn, c, backend)
 }
 
-/// `C[M,N] = A[K,M]^T @ B[K,N]` with bf16 operands and f32 accumulation,
-/// whatever the runtime's [`PrecisionMode`] (see [`gemm_bf16`]).
-pub fn gemm_tn_bf16(a_km: &Tensor, b_kn: &Tensor, c: &Tensor) -> Result<(), String> {
-    let (m, n, k) = validate_gemm(a_km, b_kn, c, Layout::TN, true, "gemm_tn_bf16")?;
-    let rt = a_km.runtime();
-    check_bf16_lane(rt, c, "gemm_tn_bf16")?;
-    let a_bf = ensure_bf16(a_km)?;
-    let b_bf = ensure_bf16(b_kn)?;
-    if prefer_tn_splitk(m, n, k) {
-        return gemm_tn_splitk_bf16(&a_bf, &b_bf, c, k);
-    }
-    // Coop kernel: register accumulator, C written once, no zero pre-pass.
-    let pipeline = rt.pipeline("matmul2d_tensorops_tn_bf16_f32")?;
-    dispatch_tensorops_nn_coop(rt, &pipeline, &a_bf, &b_bf, c, m, n, k, TILE_COOP_TN_NT)
+fn gemm_tn_splitk_f32(a_km: &Tensor, b_kn: &Tensor, c: &Tensor, k: usize) -> Result<(), String> {
+    gemm_tn_splitk_f32_opts(a_km, b_kn, c, k, /*zero_first=*/ true)
 }
 
-/// K-partition width of the TN split-K lanes (small M·N, tall K).
-const TN_SPLITK_K_TILE: usize = 256;
-
-/// The sequential exact-f32 TN split-K, now only for `C +=`
-/// ([`gemm_tn_accum_train`]): its partitions add into C one after another.
-/// An overwriting TN takes the parallel lane ([`tn_par_k_tile`]) instead.
-fn gemm_tn_splitk_f32_opts(a_km: &Tensor, b_kn: &Tensor, c: &Tensor, k: usize, zero_first: bool) -> Result<(), String> {
-    let (m, n) = (a_km.shape[1], b_kn.shape[1]);
-    let rt = a_km.runtime();
-    let pipeline = rt.pipeline("matmul2d_tensorops_tn_splitk_f32")?;
-    dispatch_k_partitions(
-        rt,
-        &pipeline,
-        a_km,
-        b_kn,
-        c,
-        (m, n, k),
-        TILE_F32,
-        TN_SPLITK_K_TILE,
-        zero_first,
-    )
-}
-
-/// Exact-f32 NN with a long K whose B does not fit in cache: the K-partition
-/// width, or `None` for the single-dispatch kernel.
-///
-/// One dispatch re-reads all of B (K×N) for every 32-row tile row, and since
-/// each tile's A slab is K long too, a column-panel walk cannot keep either
-/// operand resident. Partitions of `NN_SPLITK_B_ELEMS / N` rows of B (a
-/// multiple of 256) keep each partition's slice of B in cache; C is read and
-/// written once per partition, so they are only worth it when K is many
-/// partitions long and there is more than one tile row to share them.
-/// The LM head's input gradient (M 4096, N 768, K 50304) is the shape this
-/// is for.
-fn nn_splitk_k_tile(m: usize, n: usize, k: usize) -> Option<usize> {
-    const NN_SPLITK_B_ELEMS: usize = 1 << 21; // 8 MiB of f32 per partition
-    const MIN_PARTITIONS: usize = 4;
-    if m <= TILE_F32.sm || n == 0 || k.checked_mul(n)? < (1 << 23) {
-        return None;
-    }
-    let k_tile = (NN_SPLITK_B_ELEMS / n) / 256 * 256;
-    (k_tile >= 256 && k >= MIN_PARTITIONS * k_tile).then_some(k_tile)
-}
-
-/// Largest scratch [`gemm_tn_splitk_par_f32`] allocates, in f32 elements
-/// (16 MiB); a width that would need more is refused.
-const TN_PAR_MAX_SCRATCH: usize = 1 << 22;
-
-/// K-partition width for the parallel TN split-K, or `None` when the shape
-/// is not one it is for: an exact-f32 TN whose C has fewer than
-/// `TN_PAR_MAX_TILES` tiles over a K at least two partitions long. Such a C
-/// gives one dispatch only a few threadgroups, each walking all of K: the
-/// gate weight gradient `d_pre^T · x` (12 × 768 over 4096 rows) is 24 tiles
-/// and ran at ~0.4 TFLOP/s. The width gives about `TN_PAR_TARGET_TGS`
-/// threadgroups in all, in multiples of 256 (M5 Pro sweep, `metal_bench tn`:
-/// within ~10% of the best width at every routed shape but 12 × 768 over
-/// 1024, where a width of 128 was ~15% faster at the median).
-/// It also takes the shapes [`prefer_tn_splitk`] picks, where the sequential
-/// split-K ran 2.6–9.6× slower than this lane and slower than one dispatch
-/// (attention dW, 128 × 128 over 4096: 186 µs sequential, 31 µs here).
-/// The scratch stays under `TN_PAR_MAX_SCRATCH` by construction: at most
-/// `TN_PAR_TARGET_TGS / tiles` partitions of `tiles · 1024` floats each.
-fn tn_par_k_tile(m: usize, n: usize, k: usize) -> Option<usize> {
-    const TN_PAR_MAX_TILES: usize = 128;
-    const TN_PAR_TARGET_TGS: usize = 768;
-    const STEP: usize = 256;
-    if m == 0 || n == 0 {
-        return None;
-    }
-    let tiles = m.div_ceil(TILE_F32.sm) * n.div_ceil(TILE_F32.sn);
-    if tiles >= TN_PAR_MAX_TILES {
-        return None;
-    }
-    let want = (TN_PAR_TARGET_TGS / tiles).max(2);
-    let k_tile = k.div_ceil(want).div_ceil(STEP).max(1) * STEP;
-    (k.div_ceil(k_tile) >= 2).then_some(k_tile)
-}
-
-/// `C [M, N] = A^T · B` for `A [K, M]` and `B [K, N]`, exact f32, as
-/// `ceil(K / k_tile)` K-partitions computed in one dispatch into a scratch
-/// and added in partition order (`matmul2d_tensorops_tn_splitk_par_f32`,
-/// then `reduce_partitions_f32`). Deterministic. The rounding differs from
-/// one dispatch over all of K, within the same f32 bound. [`gemm_tn_f32`]
-/// routes here by [`tn_par_k_tile`]; this entry takes the width, so a bench
-/// can sweep it.
-pub fn gemm_tn_splitk_par_f32(a_km: &Tensor, b_kn: &Tensor, c: &Tensor, k_tile: usize) -> Result<(), String> {
-    let (m, n, k) = validate_gemm(a_km, b_kn, c, Layout::TN, false, "gemm_tn_splitk_par_f32")?;
-    let rt = a_km.runtime();
-    if !rt.has_tensorops() {
-        return Err("gemm_tn_splitk_par_f32: TensorOps is unavailable on this device".into());
-    }
-    // A multiple of 4 keeps every partition's start in A and B 16-byte
-    // aligned, as the scratch slices are.
-    if k_tile == 0 || k_tile % 4 != 0 {
-        return Err(format!(
-            "gemm_tn_splitk_par_f32: a K partition of {k_tile}, not a positive multiple of 4"
-        ));
-    }
-    let partitions = k.div_ceil(k_tile);
-    let as_u32 = |v: usize, what: &str| -> Result<u32, String> {
-        u32::try_from(v).map_err(|_| format!("gemm_tn_splitk_par_f32: {what} {v} does not fit the kernel's u32"))
-    };
-    let tiles_n = n.div_ceil(TILE_F32.sn);
-    let tiles_m = m.div_ceil(TILE_F32.sm);
-    let groups = tiles_n
-        .checked_mul(tiles_m)
-        .and_then(|t| t.checked_mul(partitions))
-        .ok_or("gemm_tn_splitk_par_f32: threadgroup count overflows")?;
-    let numel = m.checked_mul(n).ok_or("gemm_tn_splitk_par_f32: M·N overflows")?;
-    // Each slice starts 16-byte aligned, as tessl asks of every GEMM operand.
-    // The M5 Pro also computes correctly from 4-byte-aligned slices, so no
-    // test observes this padding.
-    let slice = numel.div_ceil(4) * 4;
-    let scratch_len = slice
-        .checked_mul(partitions)
-        .ok_or("gemm_tn_splitk_par_f32: scratch length overflows")?;
-    if scratch_len > TN_PAR_MAX_SCRATCH {
-        return Err(format!(
-            "gemm_tn_splitk_par_f32: {partitions} partitions of {m}x{n} need {scratch_len} scratch floats, over the cap of {TN_PAR_MAX_SCRATCH}"
-        ));
-    }
-    as_u32(groups, "threadgroup count")?;
-    // The kernel offsets A and B by k0·M and k0·N.
-    as_u32(k.saturating_mul(m.max(n)), "K·max(M, N)")?;
-    let (m_u, n_u, k_u) = (as_u32(m, "M")?, as_u32(n, "N")?, as_u32(k, "K")?);
-    let (k_tile_u, parts_u) = (as_u32(k_tile, "k_tile")?, as_u32(partitions, "partitions")?);
-    let (numel_u, slice_u) = (as_u32(numel, "M·N")?, as_u32(slice, "slice")?);
-    // Zeroed by allocation (bump and pool both), as `mode::multiply` needs.
-    let scratch = rt.alloc_temp_f32(&[scratch_len])?;
-    let gemm_p = rt.pipeline("matmul2d_tensorops_tn_splitk_par_f32")?;
-    let reduce_p = rt.pipeline("reduce_partitions_f32")?;
-    let tpt = threads_per_tg(&gemm_p, TILE_F32);
-    let r_tpt = reduce_p.threadExecutionWidth().min(numel).max(1);
-    let r_groups = numel.div_ceil(r_tpt);
-    rt.with_binder(|bnd| {
-        let need_explicit = bnd.needs_explicit_barriers();
-        bnd.set_pipeline(&gemm_p);
-        bnd.bind_tensor(a_km, 0);
-        bnd.bind_tensor(b_kn, 1);
-        bnd.bind_tensor(&scratch, 2);
-        bnd.bind_u32(m_u, 3);
-        bnd.bind_u32(n_u, 4);
-        bnd.bind_u32(k_u, 5);
-        bnd.bind_u32(k_tile_u, 6);
-        bnd.bind_u32(tiles_n as u32, 7);
-        bnd.bind_u32(tiles_m as u32, 8);
-        bnd.bind_u32(parts_u, 9);
-        bnd.bind_u32(slice_u, 10);
-        bnd.dispatch(mtl_size(groups, 1, 1), mtl_size(tpt, 1, 1));
-        if need_explicit {
-            bnd.barrier();
-        }
-        bnd.set_pipeline(&reduce_p);
-        bnd.bind_tensor(&scratch, 0);
-        bnd.bind_tensor(c, 1);
-        bnd.bind_u32(numel_u, 2);
-        bnd.bind_u32(parts_u, 3);
-        bnd.bind_u32(slice_u, 4);
-        bnd.dispatch(mtl_size(r_groups, 1, 1), mtl_size(r_tpt, 1, 1));
-        Ok(())
-    })
-}
-
-fn gemm_nn_splitk_f32(
-    a: &Tensor,
-    b: &Tensor,
+fn gemm_tn_splitk_f32_opts(
+    a_km: &Tensor,
+    b_kn: &Tensor,
     c: &Tensor,
-    (m, n, k): (usize, usize, usize),
-    k_tile: usize,
-) -> Result<(), String> {
-    let rt = a.runtime();
-    let pipeline = rt.pipeline("matmul2d_tensorops_nn_splitk_f32")?;
-    dispatch_k_partitions(
-        rt,
-        &pipeline,
-        a,
-        b,
-        c,
-        (m, n, k),
-        TILE_F32,
-        k_tile,
-        /*zero_first=*/ true,
-    )
-}
-
-/// The split-K lanes' binder: zero C (when asked), then one dispatch of
-/// `pipeline` per `k_tile`-wide partition of K, in order, each accumulating
-/// into C. The partitions write the same C, so each runs after the last; the
-/// order is fixed, so the result is deterministic.
-#[allow(clippy::too_many_arguments)]
-fn dispatch_k_partitions(
-    rt: &GpuRuntime,
-    pipeline: &ProtocolObject<dyn MTLComputePipelineState>,
-    a: &Tensor,
-    b: &Tensor,
-    c: &Tensor,
-    (m, n, k): (usize, usize, usize),
-    tile: TileGeom,
-    k_tile: usize,
+    k: usize,
     zero_first: bool,
 ) -> Result<(), String> {
-    let as_u32 = |v: usize, what: &str| -> Result<u32, String> {
-        u32::try_from(v).map_err(|_| format!("split-K GEMM: {what} {v} does not fit the kernel's u32"))
-    };
-    if k_tile == 0 {
-        return Err("split-K GEMM: a K partition of 0".into());
-    }
-    let (m_u, n_u, k_u, k_tile_u) = (
-        as_u32(m, "M")?,
-        as_u32(n, "N")?,
-        as_u32(k, "K")?,
-        as_u32(k_tile, "k_tile")?,
-    );
-    // The kernels offset B by k0·N (NN) or A and B by k0·M and k0·N (TN) in u32.
-    as_u32(k.saturating_mul(m.max(n)), "K·max(M, N)")?;
+    let m = a_km.shape[1];
+    let n = b_kn.shape[1];
+    let rt = a_km.runtime();
+    let pipeline = rt.pipeline("matmul2d_tensorops_tn_splitk_f32")?;
     let zero_p = rt.pipeline("zero_f32")?;
+    let tile = TILE_F32;
     let tiles_n = n.div_ceil(tile.sn);
     let tiles_m = m.div_ceil(tile.sm);
     let tg = morton_tg_count(tiles_n, tiles_m);
-    let tpt = threads_per_tg(pipeline, tile);
+    let tpt = threads_per_tg(&pipeline, tile)?;
     let numel = c.numel();
     let z_width = zero_p.threadExecutionWidth();
     let z_tpt = z_width.min(numel).max(1);
     let z_groups = numel.div_ceil(z_tpt);
-    let partitions: Vec<u32> = (0..k_u).step_by(k_tile).collect();
-    let (m, n, k, k_tile) = (m_u, n_u, k_u, k_tile_u);
+    let (k_tile, partitions) = splitk_plan(k);
 
     // Zero once (optional) + all K-partitions in one binder.
     rt.with_binder(|bnd| {
@@ -1647,17 +1209,17 @@ fn dispatch_k_partitions(
             }
         }
 
-        bnd.set_pipeline(pipeline);
+        bnd.set_pipeline(&pipeline);
         for (pi, &k0) in partitions.iter().enumerate() {
             if pi > 0 && need_explicit {
                 bnd.barrier();
             }
-            bnd.bind_tensor(a, 0);
-            bnd.bind_tensor(b, 1);
+            bnd.bind_tensor(a_km, 0);
+            bnd.bind_tensor(b_kn, 1);
             bnd.bind_tensor(c, 2);
-            bnd.bind_u32(m, 3);
-            bnd.bind_u32(n, 4);
-            bnd.bind_u32(k, 5);
+            bnd.bind_u32(m as u32, 3);
+            bnd.bind_u32(n as u32, 4);
+            bnd.bind_u32(k as u32, 5);
             bnd.bind_u32(k0, 6);
             bnd.bind_u32(k_tile, 7);
             bnd.bind_u32(tiles_n as u32, 8);
@@ -1680,76 +1242,142 @@ fn gemm_tn_splitk_bf16_opts(
     k: usize,
     zero_first: bool,
 ) -> Result<(), String> {
-    let (m, n) = (a_km.shape[1], b_kn.shape[1]);
+    let m = a_km.shape[1];
+    let n = b_kn.shape[1];
     let rt = a_km.runtime();
     let pipeline = rt.pipeline("matmul2d_tensorops_tn_splitk_bf16_f32")?;
-    dispatch_k_partitions(
-        rt,
-        &pipeline,
-        a_km,
-        b_kn,
-        c,
-        (m, n, k),
-        TILE_V2,
-        TN_SPLITK_K_TILE,
-        zero_first,
-    )
+    let zero_p = rt.pipeline("zero_f32")?;
+    let tile = TILE_V2;
+    let tiles_n = n.div_ceil(tile.sn);
+    let tiles_m = m.div_ceil(tile.sm);
+    let tg = morton_tg_count(tiles_n, tiles_m);
+    let tpt = threads_per_tg(&pipeline, tile)?;
+    let numel = c.numel();
+    let z_width = zero_p.threadExecutionWidth();
+    let z_tpt = z_width.min(numel).max(1);
+    let z_groups = numel.div_ceil(z_tpt);
+    let (k_tile, partitions) = splitk_plan(k);
+
+    rt.with_binder(|bnd| {
+        let need_explicit = bnd.needs_explicit_barriers();
+        if zero_first {
+            bnd.set_pipeline(&zero_p);
+            bnd.bind_tensor(c, 0);
+            bnd.bind_u32(numel as u32, 1);
+            bnd.dispatch(mtl_size(z_groups, 1, 1), mtl_size(z_tpt, 1, 1));
+            if need_explicit {
+                bnd.barrier();
+            }
+        }
+
+        bnd.set_pipeline(&pipeline);
+        for (pi, &k0) in partitions.iter().enumerate() {
+            if pi > 0 && need_explicit {
+                bnd.barrier();
+            }
+            bnd.bind_tensor(a_km, 0);
+            bnd.bind_tensor(b_kn, 1);
+            bnd.bind_tensor(c, 2);
+            bnd.bind_u32(m as u32, 3);
+            bnd.bind_u32(n as u32, 4);
+            bnd.bind_u32(k as u32, 5);
+            bnd.bind_u32(k0, 6);
+            bnd.bind_u32(k_tile, 7);
+            bnd.bind_u32(tiles_n as u32, 8);
+            bnd.bind_u32(tiles_m as u32, 9);
+            bnd.dispatch(mtl_size(tg, 1, 1), mtl_size(tpt, 1, 1));
+        }
+        Ok(())
+    })?;
+    Ok(())
 }
 
 /// `C[M,N] = A[M,K] @ B[N,K]^T` (NT). B is stored `[N,K]` (e.g. `W[in,out]`).
-pub fn gemm_nt_f32(a_mk: &Tensor, b_nk: &Tensor, c: &Tensor, backend: GemmBackend) -> Result<(), String> {
-    let (m, n, k) = validate_gemm(a_mk, b_nk, c, Layout::NT, false, "gemm_nt_f32")?;
+pub fn gemm_nt_f32(
+    a_mk: &Tensor,
+    b_nk: &Tensor,
+    c: &Tensor,
+    backend: GemmBackend,
+) -> Result<(), String> {
+    let (m, n, k) = validate_gemm(a_mk, b_nk, c, Layout::NT, false)?;
 
-    if USE_TN_NT_DESCRIPTORS && backend == GemmBackend::TensorOps && a_mk.runtime().has_tensorops() {
+    if USE_TN_NT_DESCRIPTORS && backend == GemmBackend::TensorOps && a_mk.runtime().has_tensorops()
+    {
         let rt = a_mk.runtime();
         let pipeline = rt.pipeline("matmul2d_tensorops_nt_f32")?;
         return dispatch_tensorops_tn_nt(rt, &pipeline, a_mk, b_nk, c, m, n, k, TILE_F32);
     }
 
-    let bt = b_nk.runtime().alloc_temp_f32(&[k, n])?;
-    transpose_f32_into(b_nk, &bt)?;
+    let bt = {
+        let rt = b_nk.runtime();
+        // Fully written by the transpose before the GEMM reads it.
+        let out = rt.alloc_temp_f32_uninit(&[k, n])?;
+        let p = rt.pipeline("transpose2d_f32")?;
+        crate::dispatch::dispatch_1d(rt, &p, n * k, |bnd| {
+            crate::dispatch::set_tensor(bnd, b_nk, 0);
+            crate::dispatch::set_tensor(bnd, &out, 1);
+            crate::dispatch::set_u32(bnd, n as u32, 2);
+            crate::dispatch::set_u32(bnd, k as u32, 3);
+        })?;
+        out
+    };
     gemm_f32(a_mk, &bt, c, backend)
 }
 
 /// Training NT GEMM — bf16 TensorOps descriptor when `PrecisionMode::Bf16`.
-pub fn gemm_nt_train(a_mk: &Tensor, b_nk: &Tensor, c: &Tensor, backend: GemmBackend) -> Result<(), String> {
+pub fn gemm_nt_train(
+    a_mk: &Tensor,
+    b_nk: &Tensor,
+    c: &Tensor,
+    backend: GemmBackend,
+) -> Result<(), String> {
     validate_gemm(
         a_mk,
         b_nk,
         c,
         Layout::NT,
         use_bf16_gemm(a_mk.runtime(), backend),
-        "gemm_nt_train",
     )?;
-    if use_bf16_gemm(a_mk.runtime(), backend) {
-        return gemm_nt_bf16(a_mk, b_nk, c);
+    let rt = a_mk.runtime();
+    if use_bf16_gemm(rt, backend) {
+        assert_eq!(c.dtype, DType::F32);
+        let a_bf = ensure_bf16(a_mk)?;
+        let b_bf = ensure_bf16(b_nk)?;
+        let m = a_bf.shape[0];
+        let k = a_bf.shape[1];
+        let n = b_bf.shape[0];
+        assert_eq!(c.shape, &[m, n]);
+        // Coop kernel: register accumulator, C written once, no zero pre-pass.
+        let pipeline = rt.pipeline("matmul2d_tensorops_nt_bf16_f32")?;
+        return dispatch_tensorops_nn_coop(
+            rt,
+            &pipeline,
+            &a_bf,
+            &b_bf,
+            c,
+            m,
+            n,
+            k,
+            TILE_COOP_TN_NT,
+        );
     }
     gemm_nt_f32(a_mk, b_nk, c, backend)
 }
 
-/// `C[M,N] = A[M,K] @ B[N,K]^T` with bf16 operands and f32 accumulation,
-/// whatever the runtime's [`PrecisionMode`] (see [`gemm_bf16`]).
-pub fn gemm_nt_bf16(a_mk: &Tensor, b_nk: &Tensor, c: &Tensor) -> Result<(), String> {
-    let (m, n, k) = validate_gemm(a_mk, b_nk, c, Layout::NT, true, "gemm_nt_bf16")?;
-    let rt = a_mk.runtime();
-    check_bf16_lane(rt, c, "gemm_nt_bf16")?;
-    let a_bf = ensure_bf16(a_mk)?;
-    let b_bf = ensure_bf16(b_nk)?;
-    // Coop kernel: register accumulator, C written once, no zero pre-pass.
-    let pipeline = rt.pipeline("matmul2d_tensorops_nt_bf16_f32")?;
-    dispatch_tensorops_nn_coop(rt, &pipeline, &a_bf, &b_bf, c, m, n, k, TILE_COOP_TN_NT)
-}
-
 /// `C += A[K,M]^T @ B[K,N]` (TN accumulate). No C zero — for dW into grad banks
 /// and dx accumulate into a pre-zeroed buffer.
-pub fn gemm_tn_accum_train(a_km: &Tensor, b_kn: &Tensor, c: &Tensor, backend: GemmBackend) -> Result<(), String> {
+pub fn gemm_tn_accum_train(
+    a_km: &Tensor,
+    b_kn: &Tensor,
+    c: &Tensor,
+    backend: GemmBackend,
+) -> Result<(), String> {
     let (m, n, k) = validate_gemm(
         a_km,
         b_kn,
         c,
         Layout::TN,
         use_bf16_gemm(a_km.runtime(), backend),
-        "gemm_tn_accum_train",
     )?;
 
     let rt = a_km.runtime();
@@ -1757,7 +1385,7 @@ pub fn gemm_tn_accum_train(a_km: &Tensor, b_kn: &Tensor, c: &Tensor, backend: Ge
     if use_accum && use_bf16_gemm(rt, backend) {
         let a_bf = ensure_bf16(a_km)?;
         let b_bf = ensure_bf16(b_kn)?;
-        if prefer_tn_splitk(m, n, k) {
+        if prefer_tn_splitk_bf16(m, n, k) {
             return gemm_tn_splitk_bf16_opts(&a_bf, &b_bf, c, k, /*zero_first=*/ false);
         }
         let pipeline = rt.pipeline("matmul2d_tensorops_tn_accum_bf16_f32")?;
@@ -1775,7 +1403,8 @@ pub fn gemm_tn_accum_train(a_km: &Tensor, b_kn: &Tensor, c: &Tensor, backend: Ge
         );
     }
 
-    if use_accum && USE_TN_NT_DESCRIPTORS && backend == GemmBackend::TensorOps && rt.has_tensorops() {
+    if use_accum && USE_TN_NT_DESCRIPTORS && backend == GemmBackend::TensorOps && rt.has_tensorops()
+    {
         if prefer_tn_splitk(m, n, k) {
             return gemm_tn_splitk_f32_opts(a_km, b_kn, c, k, /*zero_first=*/ false);
         }
@@ -1786,7 +1415,8 @@ pub fn gemm_tn_accum_train(a_km: &Tensor, b_kn: &Tensor, c: &Tensor, backend: Ge
     }
 
     // Fallback / Soft-bisect: temp + add (pre–Audit 6 P1a/P1a2 numerics).
-    let tmp = rt.alloc_temp_f32(&[m, n])?;
+    // Every element is written by the GEMM before `add_inplace` reads it.
+    let tmp = rt.alloc_temp_f32_uninit(&[m, n])?;
     gemm_tn_train(a_km, b_kn, &tmp, backend)?;
     let p = rt.pipeline("add_inplace_f32")?;
     crate::dispatch::dispatch_1d(rt, &p, c.numel(), |bnd| {
@@ -1802,15 +1432,19 @@ pub fn gemm_tn_accum_train(a_km: &Tensor, b_kn: &Tensor, c: &Tensor, backend: Ge
 /// All call sites are **dX-class** accumulations into fresh pre-zeroed
 /// activation-grad buffers (never weight banks), so this path additionally
 /// honors `METAL_NATIVE_GEMM_ACCUM_DX` — accumulate-mode dX with dW kept on
-/// the safer temp-plus-add path.
-pub fn gemm_nt_accum_train(a_mk: &Tensor, b_nk: &Tensor, c: &Tensor, backend: GemmBackend) -> Result<(), String> {
+/// the Soft-safe temp+add path (Audit 7).
+pub fn gemm_nt_accum_train(
+    a_mk: &Tensor,
+    b_nk: &Tensor,
+    c: &Tensor,
+    backend: GemmBackend,
+) -> Result<(), String> {
     let (m, n, k) = validate_gemm(
         a_mk,
         b_nk,
         c,
         Layout::NT,
         use_bf16_gemm(a_mk.runtime(), backend),
-        "gemm_nt_accum_train",
     )?;
 
     let rt = a_mk.runtime();
@@ -1833,14 +1467,16 @@ pub fn gemm_nt_accum_train(a_mk: &Tensor, b_nk: &Tensor, c: &Tensor, backend: Ge
         );
     }
 
-    if use_accum && USE_TN_NT_DESCRIPTORS && backend == GemmBackend::TensorOps && rt.has_tensorops() {
+    if use_accum && USE_TN_NT_DESCRIPTORS && backend == GemmBackend::TensorOps && rt.has_tensorops()
+    {
         let pipeline = rt.pipeline("matmul2d_tensorops_nt_accum_f32")?;
         return dispatch_tensorops_accum(
             rt, &pipeline, a_mk, b_nk, c, m, n, k, TILE_F32, /*bind_interior=*/ true,
         );
     }
 
-    let tmp = rt.alloc_temp_f32(&[m, n])?;
+    // Every element is written by the GEMM before `add_inplace` reads it.
+    let tmp = rt.alloc_temp_f32_uninit(&[m, n])?;
     gemm_nt_train(a_mk, b_nk, &tmp, backend)?;
     let p = rt.pipeline("add_inplace_f32")?;
     crate::dispatch::dispatch_1d(rt, &p, c.numel(), |bnd| {
@@ -1856,20 +1492,22 @@ pub fn gemm_auto(a: &Tensor, b: &Tensor, c: &Tensor, backend: GemmBackend) -> Re
     gemm_train(a, b, c, backend)
 }
 
-pub(crate) fn threads_per_tg(pipeline: &ProtocolObject<dyn MTLComputePipelineState>, tile: TileGeom) -> usize {
-    let width = pipeline.threadExecutionWidth();
-    width * tile.simdgroups
+fn threads_per_tg(
+    pipeline: &ProtocolObject<dyn MTLComputePipelineState>,
+    tile: TileGeom,
+) -> Result<usize, String> {
+    Ok(simd_width(pipeline)? * tile.simdgroups)
 }
 
 fn threadgroup_geometry_simdgroup(
     pipeline: &ProtocolObject<dyn MTLComputePipelineState>,
     m: usize,
     n: usize,
-) -> (usize, usize, usize) {
-    let width = pipeline.threadExecutionWidth();
+) -> Result<(usize, usize, usize), String> {
+    let width = simd_width(pipeline)?;
     let tg_w = n.div_ceil(16);
     let tg_h = m.div_ceil(16);
-    (tg_w, tg_h, width * 4)
+    Ok((tg_w, tg_h, width * 4))
 }
 
 /// CPU reference GEMM for tests.
@@ -1925,86 +1563,14 @@ mod tests {
 
     fn max_abs_err(got: &[f32], exp: &[f32]) -> f32 {
         assert_eq!(got.len(), exp.len(), "parity length mismatch");
-        assert!(got.iter().chain(exp).all(|x| x.is_finite()), "nonfinite parity input");
+        assert!(
+            got.iter().chain(exp).all(|x| x.is_finite()),
+            "nonfinite parity input"
+        );
         got.iter()
             .zip(exp.iter())
             .map(|(g, e)| (g - e).abs())
             .fold(0.0f32, f32::max)
-    }
-
-    /// Which exact-f32 NN shapes take K partitions. The two shapes
-    /// `tests/gemm_ragged_shapes.rs` checks on the GPU must route here, or that
-    /// test covers the single-dispatch kernel instead.
-    #[test]
-    fn long_k_nn_with_a_large_b_takes_k_partitions() {
-        // LM-head input gradient at nanolab and at Lappi's vocabulary.
-        assert_eq!(nn_splitk_k_tile(4096, 768, 50_304), Some(2560));
-        assert_eq!(nn_splitk_k_tile(4096, 768, 248_320), Some(2560));
-        // The GPU test's shapes: a short last partition each.
-        assert_eq!(nn_splitk_k_tile(40, 520, 16_200), Some(3840));
-        assert_eq!(nn_splitk_k_tile(33, 768, 11_008), Some(2560));
-        // Transformer widths, a B that fits in cache, one tile row, or K
-        // shorter than four partitions keep the single dispatch.
-        for (m, n, k) in [
-            (4096, 768, 2048),
-            (4096, 2304, 768),
-            (4096, 768, 8192),
-            (32, 768, 50_304),
-            (4096, 768, 10_239),
-            (4096, 0, 50_304),
-            (4096, 1 << 22, 4),
-        ] {
-            assert_eq!(nn_splitk_k_tile(m, n, k), None, "{m}x{n}x{k}");
-        }
-    }
-
-    /// A TN whose C has few tiles over a long K takes the parallel
-    /// K-partitions; the shapes `tests/gemm_ragged_shapes.rs` checks on the
-    /// GPU through the router must route here.
-    #[test]
-    fn few_tile_long_k_tn_takes_parallel_partitions() {
-        // The per-head gate weight gradient (12 heads, d 768, 4096 rows), at
-        // shorter and longer K, and the swept shapes up to 96 tiles.
-        assert_eq!(tn_par_k_tile(12, 768, 4096), Some(256));
-        assert_eq!(tn_par_k_tile(12, 768, 1024), Some(256));
-        assert_eq!(tn_par_k_tile(12, 768, 16_384), Some(512));
-        assert_eq!(tn_par_k_tile(40, 520, 9000), Some(512));
-        assert_eq!(tn_par_k_tile(64, 1024, 4096), Some(512));
-        assert_eq!(tn_par_k_tile(128, 768, 4096), Some(512));
-        // The GPU test's ragged shape: 12 partitions, the last 184 long.
-        assert_eq!(tn_par_k_tile(13, 520, 3000), Some(256));
-        // Two partitions is the least that routes.
-        assert_eq!(tn_par_k_tile(12, 768, 257), Some(256));
-        // Shapes the sequential split-K took before (`prefer_tn_splitk`):
-        // attention dW, MLP dW, and the shorter K.
-        assert_eq!(tn_par_k_tile(128, 128, 4096), Some(256));
-        assert_eq!(tn_par_k_tile(128, 384, 4096), Some(256));
-        assert_eq!(tn_par_k_tile(64, 64, 4096), Some(256));
-        assert_eq!(tn_par_k_tile(128, 128, 2048), Some(256));
-        // Every routed width keeps the scratch under the cap, including
-        // all of the sequential lane's old domain.
-        for m in (1..=384).step_by(31) {
-            for n in (1..=384).step_by(29) {
-                for k in [2, 257, 2048, 4096, 50_304, 1 << 20] {
-                    if let Some(k_tile) = tn_par_k_tile(m, n, k) {
-                        let scratch = k.div_ceil(k_tile) * (m * n).div_ceil(4) * 4;
-                        assert!(scratch <= TN_PAR_MAX_SCRATCH, "({m}, {n}, {k}) at {k_tile}: {scratch}");
-                    }
-                }
-            }
-        }
-        for (m, n, k) in [
-            // 128 tiles or more keep the single dispatch.
-            (96, 2048, 4096),
-            (128, 1024, 4096),
-            // One partition.
-            (12, 768, 256),
-            // Empty.
-            (0, 768, 4096),
-            (12, 0, 4096),
-        ] {
-            assert_eq!(tn_par_k_tile(m, n, k), None, "{m}x{n}x{k}");
-        }
     }
 
     #[test]
@@ -2047,7 +1613,10 @@ mod tests {
         rt.synchronize().unwrap();
         let got = c.buffer.read_f32();
         let err = max_abs_err(&got, &expected);
-        assert!(err < 1e-4, "GEMM {m}x{k}@{k}x{n} backend={backend:?} max_abs_err={err}");
+        assert!(
+            err < 1e-4,
+            "GEMM {m}x{k}@{k}x{n} backend={backend:?} max_abs_err={err}"
+        );
     }
 
     #[test]
@@ -2064,7 +1633,11 @@ mod tests {
     fn gemm_auto_small() {
         let rt = GpuRuntime::new().expect("GpuRuntime::new");
         let backend = select_backend(&rt);
-        let dim = if backend == GemmBackend::TensorOps { 32 } else { 16 };
+        let dim = if backend == GemmBackend::TensorOps {
+            32
+        } else {
+            16
+        };
         run_case(dim, dim, dim, backend);
     }
 
@@ -2094,8 +1667,10 @@ mod tests {
         let a = rt.alloc_tensor_bf16(&[m, k]).unwrap();
         let b = rt.alloc_tensor_bf16(&[k, n]).unwrap();
         let c = rt.alloc_tensor_f32(&[m, n]).unwrap();
-        a.buffer.write_bf16_bits(&crate::tensor::f32_slice_to_bf16(&a_f));
-        b.buffer.write_bf16_bits(&crate::tensor::f32_slice_to_bf16(&b_f));
+        a.buffer
+            .write_bf16_bits(&crate::tensor::f32_slice_to_bf16(&a_f));
+        b.buffer
+            .write_bf16_bits(&crate::tensor::f32_slice_to_bf16(&b_f));
         gemm(&a, &b, &c, GemmBackend::TensorOps).unwrap();
         rt.synchronize().unwrap();
         let got = c.buffer.read_f32();
@@ -2178,7 +1753,10 @@ mod tests {
         );
         assert!(err_exact < 1e-4, "exact f32 GEMM drifted: {err_exact}");
         // Smoke: relaxed must be finite and within a generous bound (tf32-class).
-        assert!(err_relax < 5e-2, "relaxed GEMM too far from CPU: {err_relax}");
+        assert!(
+            err_relax < 5e-2,
+            "relaxed GEMM too far from CPU: {err_relax}"
+        );
         // Document 1e-5 golden gate: if this fails, keep --tf32 off for parity.
         if err_relax >= 1e-5 {
             eprintln!(
@@ -2350,6 +1928,89 @@ mod tests {
         }
     }
 
+    /// The NN coop tile is chosen by grid fill, not by `N` alone. A 128-row
+    /// tile over `M <= 64` rows is at least half padding, and a grid of fewer
+    /// than 64 of the default tiles leaves most of the GPU idle; both were
+    /// measured to favour the 64x64 tile (bench/results/bf16_smallm_coop_m5pro.txt).
+    /// The bf16 split-K gate opens at the measured crossover, not at every
+    /// tall K; the f32 lane keeps its historical gate.
+    #[test]
+    fn splitk_gate_opens_at_the_measured_depth() {
+        // Below the crossover the coop kernel is faster at every dW shape tried.
+        assert!(!prefer_tn_splitk_bf16(128, 128, 4096));
+        assert!(!prefer_tn_splitk_bf16(128, 384, 8192));
+        assert!(!prefer_tn_splitk_bf16(64, 64, 8192));
+        // From the crossover on, split-K wins and pulls away with depth.
+        assert!(prefer_tn_splitk_bf16(128, 384, 12288));
+        assert!(prefer_tn_splitk_bf16(128, 128, 16384));
+        assert!(prefer_tn_splitk_bf16(64, 64, 32768));
+        // Shape conditions are shared: only small-M/N dW shapes split.
+        assert!(!prefer_tn_splitk_bf16(384, 384, 32768));
+        assert!(!prefer_tn_splitk_bf16(512, 128, 32768));
+        assert!(prefer_tn_splitk(128, 128, 4096));
+        assert!(!prefer_tn_splitk(128, 128, 1024));
+    }
+
+    #[test]
+    fn nn_coop_kernel_selects_the_narrow_tile_by_grid_fill() {
+        let sm = |m, n, k| nn_coop_kernel(m, n, k, CoopElem::Bf16).1.sm;
+        // Narrow N, as before.
+        assert_eq!(sm(4096, 256, 1024), 64);
+        assert_eq!(sm(4096, 512, 1024), 64);
+        // Few rows: the 128-row tile would be mostly padding at any N.
+        assert_eq!(sm(16, 3072, 768), 64);
+        assert_eq!(sm(64, 4096, 4096), 64);
+        assert_eq!(sm(64, 8192, 4096), 64);
+        // Full tiles but a starved grid: 4 x 12 = 48 default tiles.
+        assert_eq!(sm(512, 768, 3072), 64);
+        assert_eq!(sm(128, 2048, 2048), 64);
+        // Enough default tiles to fill the GPU: 8 x 12 = 96, 1 x 64, 16 x 32.
+        assert_eq!(sm(1024, 768, 3072), 128);
+        assert_eq!(sm(128, 4096, 4096), 128);
+        assert_eq!(sm(2048, 2048, 2048), 128);
+        assert_eq!(sm(8192, 3072, 768), 128);
+        // The element type never changes the geometry.
+        for elem in [CoopElem::F16, CoopElem::RelaxedF32] {
+            assert_eq!(nn_coop_kernel(64, 3072, 768, elem).1.sm, 64);
+            assert_eq!(nn_coop_kernel(1024, 3072, 768, elem).1.sm, 128);
+        }
+    }
+
+    #[test]
+    fn splitk_plan_is_bounded_and_covers_k() {
+        for &k in &[2048usize, 4096, 8192, 8193, 65_536, 1 << 20, 3 * 65_536 + 7] {
+            let (k_tile, starts) = splitk_plan(k);
+            let k_tile = k_tile as usize;
+            assert!(
+                starts.len() <= MAX_SPLITK_PARTITIONS,
+                "k={k}: {} partitions",
+                starts.len()
+            );
+            assert_eq!(
+                k_tile % 32,
+                0,
+                "k={k}: tile {k_tile} is not a K-step multiple"
+            );
+            assert_eq!(starts[0], 0);
+            for pair in starts.windows(2) {
+                assert_eq!(
+                    (pair[1] - pair[0]) as usize,
+                    k_tile,
+                    "k={k}: gap or overlap"
+                );
+            }
+            let last = *starts.last().unwrap() as usize;
+            assert!(
+                last < k && last + k_tile >= k,
+                "k={k}: partitions do not cover K"
+            );
+        }
+        // Below the cap the historical 256-wide partitions are unchanged.
+        let (k_tile, starts) = splitk_plan(4096);
+        assert_eq!(k_tile, 256);
+        assert_eq!(starts, (0..4096u32).step_by(256).collect::<Vec<_>>());
+    }
+
     #[test]
     fn gemm_tn_splitk_tall_dw_shape() {
         let rt = tensorops_runtime();
@@ -2466,8 +2127,6 @@ mod contract_tests {
         let rt = GpuRuntime::new().unwrap();
         let a = rt.alloc_tensor_f32(&[16, 16]).unwrap();
         let b = rt.alloc_tensor_f32(&[16, 16]).unwrap();
-        // One f32 of headroom so elem_offset=1 stays inside the bank — this is
-        // an alignment probe, not the OOB case already covered above.
         let bank = rt.alloc_tensor_f32(&[16 * 16 + 1]).unwrap();
         let c = bank.view(&[16, 16], 1);
         assert_eq!(c.byte_offset, 4);
@@ -2480,7 +2139,7 @@ mod contract_tests {
     }
 
     #[test]
-    fn disjoint_bank_views_work_and_overlap_is_rejected() {
+        fn disjoint_bank_views_work_and_overlap_is_rejected() {
         let rt = GpuRuntime::new().unwrap();
         let bank = rt.alloc_tensor_f32(&[3 * 256]).unwrap();
         bank.buffer.write_f32(&vec![1.0; 3 * 256]);
@@ -2503,24 +2162,30 @@ mod contract_tests {
     #[test]
     fn transpose_edges_precision_and_accumulation() {
         let rt = GpuRuntime::new().unwrap();
-        assert!(rt.has_tensorops(), "TensorOps coverage requires the actual metallib");
+        assert!(
+            rt.has_tensorops(),
+            "TensorOps coverage requires the actual metallib"
+        );
         for (m, n, k) in [(1, 3, 1), (17, 31, 9), (33, 65, 129), (17, 31, 2049)] {
             for backend in [GemmBackend::Simdgroup, GemmBackend::TensorOps] {
                 for precision in [PrecisionMode::F32, PrecisionMode::Bf16] {
                     rt.set_precision(precision);
-                    for (tn, accum) in [(true, false), (false, false), (true, true), (false, true)] {
+                    for (tn, accum) in [(true, false), (false, false), (true, true), (false, true)]
+                    {
                         let ashape = if tn { [k, m] } else { [m, k] };
                         let bshape = if tn { [k, n] } else { [n, k] };
-                        let av: Vec<f32> = (0..m * k).map(|i| (i % 13) as f32 / 16.0 - 0.25).collect();
-                        let bv: Vec<f32> = (0..n * k).map(|i| (i % 7) as f32 / 16.0 - 0.125).collect();
+                        let av: Vec<f32> =
+                            (0..m * k).map(|i| (i % 13) as f32 / 16.0 - 0.25).collect();
+                        let bv: Vec<f32> =
+                            (0..n * k).map(|i| (i % 7) as f32 / 16.0 - 0.125).collect();
                         let a = rt.alloc_tensor_f32(&ashape).unwrap();
                         let b = rt.alloc_tensor_f32(&bshape).unwrap();
                         let bank = rt.alloc_tensor_f32(&[m * n + 32]).unwrap();
                         a.buffer.write_f32(&av);
                         b.buffer.write_f32(&bv);
                         bank.buffer.write_f32(&vec![2.0; m * n + 32]);
-                        // 16 elems = 64 bytes, a multiple of the 16-byte
-                        // rule every GEMM family shares.
+                        // 16 elems = 64 bytes: valid for both simdgroup (16B)
+                        // and cooperative TensorOps (64B) paths.
                         let c = bank.view(&[m, n], 16);
                         let launch: Launch = match (tn, accum) {
                             (true, false) => gemm_tn_train,
@@ -2541,10 +2206,8 @@ mod contract_tests {
                                         * bv[if tn { p * n + col } else { col * k + p }];
                                 }
                                 let x = got[16 + row * n + col];
-                                assert!(
-                                    x.is_finite() && (x - expected).abs() < 1e-4,
-                                    "{m}x{n}x{k} {backend:?} {precision:?} TN={tn} accum={accum}: {x} vs {expected}"
-                                );
+                                assert!(x.is_finite() && (x-expected).abs()<1e-4,
+                                "{m}x{n}x{k} {backend:?} {precision:?} TN={tn} accum={accum}: {x} vs {expected}");
                             }
                         }
                     }
@@ -2558,7 +2221,9 @@ mod contract_tests {
         let rt = GpuRuntime::new().unwrap();
         let a = rt.alloc_tensor_f32(&[16, 16]).unwrap();
         let b = rt.alloc_tensor_bf16(&[256]).unwrap();
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| cast_f32_to_bf16_into(&a, &b)));
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            cast_f32_to_bf16_into(&a, &b)
+        }));
         assert!(result.is_ok(), "cast Result API panicked");
         assert!(result.unwrap().is_err());
         assert!(cast_bf16_to_f32(&a).is_err());
@@ -2611,7 +2276,13 @@ mod contract_tests {
     #[test]
     fn simdgroup_edges_and_offset_guards() {
         let rt = GpuRuntime::new().unwrap();
-        for (m, n, k) in [(1, 1, 1), (7, 9, 3), (16, 16, 16), (17, 31, 9), (33, 65, 129)] {
+        for (m, n, k) in [
+            (1, 1, 1),
+            (7, 9, 3),
+            (16, 16, 16),
+            (17, 31, 9),
+            (33, 65, 129),
+        ] {
             let av: Vec<f32> = (0..m * k).map(|i| (i % 13) as f32 / 16.0 - 0.25).collect();
             let bv: Vec<f32> = (0..k * n).map(|i| (i % 7) as f32 / 16.0 - 0.125).collect();
             let a = rt.alloc_tensor_f32(&[m, k]).unwrap();
@@ -2623,8 +2294,6 @@ mod contract_tests {
             poisoned[..4].fill(123.0);
             poisoned[m * n + 4..].fill(123.0);
             bank.buffer.write_f32(&poisoned);
-            // 4 elems = 16 bytes: the smallest offset the one GEMM
-            // alignment rule accepts, for every family.
             let c = bank.view(&[m, n], 4);
             gemm(&a, &b, &c, GemmBackend::Simdgroup).unwrap();
             rt.synchronize().unwrap();
@@ -2633,7 +2302,10 @@ mod contract_tests {
             assert_eq!(&got[m * n + 4..], &[123.0; 4]);
             let expected = gemm_f32_cpu(&av, &bv, m, n, k);
             for (x, y) in got[4..m * n + 4].iter().zip(expected) {
-                assert!(x.is_finite() && (x - y).abs() < 1e-4, "{m}x{n}x{k}: {x} vs {y}");
+                assert!(
+                    x.is_finite() && (x - y).abs() < 1e-4,
+                    "{m}x{n}x{k}: {x} vs {y}"
+                );
             }
         }
     }
@@ -2646,12 +2318,43 @@ mod stress_tests {
     //! bitwise determinism, sampled large-shape parity, and concurrent runtimes.
     //!
     //! Fast versions run in the default suite; `cargo test -- --ignored` runs
-    //! the deep fuzz. `STRESS_SEED=<u64>` reruns a failing seed.
+    //! the deep fuzz. `STRESS_SEED=<decimal-or-0x-u64>` reruns a failing seed.
 
     use super::*;
     use crate::runtime::PrecisionMode;
     use crate::tensor::{bf16_bits_to_f32, f32_to_bf16_bits};
     use crate::GpuRuntime;
+
+    const DEFAULT_STRESS_SEED: u64 = 0x5EED_2026_0830;
+
+    fn parse_stress_seed(raw: &str) -> Result<u64, String> {
+        let trimmed = raw.trim();
+        let (digits, radix) = trimmed
+            .strip_prefix("0x")
+            .or_else(|| trimmed.strip_prefix("0X"))
+            .map_or((trimmed, 10), |digits| (digits, 16));
+        if digits.is_empty() {
+            return Err(format!(
+                "STRESS_SEED={raw:?} is not a decimal or 0x-prefixed u64"
+            ));
+        }
+        let seed = u64::from_str_radix(digits, radix)
+            .map_err(|_| format!("STRESS_SEED={raw:?} is not a decimal or 0x-prefixed u64"))?;
+        if seed == 0 {
+            return Err(String::from(
+                "STRESS_SEED must be non-zero (xorshift64* has an all-zero lockup state)",
+            ));
+        }
+        Ok(seed)
+    }
+
+    fn stress_seed_from_env() -> Result<u64, String> {
+        match std::env::var("STRESS_SEED") {
+            Ok(raw) => parse_stress_seed(&raw),
+            Err(std::env::VarError::NotPresent) => Ok(DEFAULT_STRESS_SEED),
+            Err(e) => Err(format!("STRESS_SEED: {e}")),
+        }
+    }
 
     /// xorshift64* — deterministic, dependency-free.
     struct Rng(u64);
@@ -2702,7 +2405,9 @@ mod stress_tests {
     }
 
     fn round_bf16(v: &[f32]) -> Vec<f32> {
-        v.iter().map(|&x| bf16_bits_to_f32(f32_to_bf16_bits(x))).collect()
+        v.iter()
+            .map(|&x| bf16_bits_to_f32(f32_to_bf16_bits(x)))
+            .collect()
     }
 
     #[derive(Clone, Copy, Debug)]
@@ -2727,11 +2432,17 @@ mod stress_tests {
 
     /// Upload `data` (or its bf16 rounding) into a fresh tensor, optionally as
     /// an offset view into a larger bank (exercises byte_offset binding).
-    fn upload(rt: &std::sync::Arc<GpuRuntime>, rng: &mut Rng, shape: &[usize], data: &[f32], bf16: bool) -> Tensor {
+    fn upload(
+        rt: &std::sync::Arc<GpuRuntime>,
+        rng: &mut Rng,
+        shape: &[usize],
+        data: &[f32],
+        bf16: bool,
+    ) -> Tensor {
         let numel: usize = shape.iter().product();
-        // Offset in elements so the resulting byte_offset sits on the
-        // GEMM_VIEW_ALIGN boundary and no further, for f32 and bf16/f16.
-        let align_elems = GEMM_VIEW_ALIGN / if bf16 { 2 } else { 4 };
+        // Offset in elements so the resulting byte_offset is 64-byte aligned
+        // for both f32 (16 elems) and bf16/f16 (32 elems) coop paths.
+        let align_elems = 64 / if bf16 { 2 } else { 4 };
         let off = if rng.below(3) == 0 { align_elems } else { 0 };
         if bf16 {
             let bank = rt.alloc_tensor_bf16(&[numel + off]).unwrap();
@@ -2750,7 +2461,12 @@ mod stress_tests {
 
     /// One randomized case: run the family on GPU, compare against the CPU
     /// reference inside a NaN-poisoned guard bank. Returns observed max error.
-    fn run_case(rt: &std::sync::Arc<GpuRuntime>, rng: &mut Rng, family: Family, seed_note: u64) -> f32 {
+    fn run_case(
+        rt: &std::sync::Arc<GpuRuntime>,
+        rng: &mut Rng,
+        family: Family,
+        seed_note: u64,
+    ) -> f32 {
         let m = sample_dim(rng);
         let n = sample_dim(rng);
         let mut k = sample_k(rng);
@@ -2763,10 +2479,14 @@ mod stress_tests {
             Family::NnSimdgroup => false,
             _ => rng.below(2) == 0,
         };
-        rt.set_precision(if bf16 { PrecisionMode::Bf16 } else { PrecisionMode::F32 });
+        rt.set_precision(if bf16 {
+            PrecisionMode::Bf16
+        } else {
+            PrecisionMode::F32
+        });
 
-        let a_host: Vec<f32> = (0..m * k).map(|_| Rng::unit(rng)).collect();
-        let b_host: Vec<f32> = (0..n * k).map(|_| Rng::unit(rng)).collect();
+        let a_host: Vec<f32> = (0..m * k).map(|_| rng.unit()).collect();
+        let b_host: Vec<f32> = (0..n * k).map(|_| rng.unit()).collect();
         // bf16 paths: reference on the same RNE-rounded values the GPU consumes,
         // so the only remaining divergence is f32 accumulation order.
         let (a_ref, b_ref) = if bf16 {
@@ -2843,7 +2563,11 @@ mod stress_tests {
         let expected = gemm_f32_cpu(&a_ref, &b_ref, m, n, k);
         // f32 exact tracks the suite's 1e-4 gate; bf16 rounds inputs identically
         // on both sides, so only f32 reassociation remains (grows with K).
-        let atol = if bf16 { 2e-3f32 } else { 1e-4 + 1e-7 * k as f32 };
+        let atol = if bf16 {
+            2e-3f32
+        } else {
+            1e-4 + 1e-7 * k as f32
+        };
         let mut max_err = 0.0f32;
         for (i, (&x, &e)) in got[16..m * n + 16].iter().zip(expected.iter()).enumerate() {
             let want = e + prefill;
@@ -2858,12 +2582,12 @@ mod stress_tests {
     }
 
     fn fuzz(cases: usize) {
-        let seed = std::env::var("STRESS_SEED")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(0x5EED_2026_0830u64);
+        let seed = stress_seed_from_env().unwrap_or_else(|e| panic!("{e}"));
         let rt = GpuRuntime::new().expect("GpuRuntime::new");
-        assert!(rt.has_tensorops(), "stress fuzz requires the TensorOps metallib");
+        assert!(
+            rt.has_tensorops(),
+            "stress fuzz requires the TensorOps metallib"
+        );
         let mut rng = Rng::new(seed);
         let mut worst = 0.0f32;
         for i in 0..cases {
@@ -2881,6 +2605,22 @@ mod stress_tests {
     #[test]
     fn gemm_fuzz_quick() {
         fuzz(160);
+    }
+
+    #[test]
+    fn stress_seed_parser_accepts_decimal_and_prefixed_hex() {
+        assert_eq!(parse_stress_seed("3735928559").unwrap(), 0xDEAD_BEEF);
+        assert_eq!(parse_stress_seed("0xdeadbeef").unwrap(), 0xDEAD_BEEF);
+        assert_eq!(parse_stress_seed("0XDEADBEEF").unwrap(), 0xDEAD_BEEF);
+        assert_eq!(parse_stress_seed(" 42 ").unwrap(), 42);
+    }
+
+    #[test]
+    fn stress_seed_parser_rejects_malformed_zero_and_overflow() {
+        for raw in ["", "0x", "not-a-seed", "-1", "18446744073709551616"] {
+            assert!(parse_stress_seed(raw).is_err(), "accepted {raw:?}");
+        }
+        assert!(parse_stress_seed("0").unwrap_err().contains("non-zero"));
     }
 
     /// Deep soak — `cargo test --release -- --ignored gemm_fuzz_deep`.
@@ -2903,16 +2643,22 @@ mod stress_tests {
             (130, 70, 260),
             (127, 95, 2049),
         ] {
-            let a_f: Vec<f32> = (0..m * k).map(|i| ((i % 251) as f32) / 256.0 - 0.49).collect();
-            let b_f: Vec<f32> = (0..k * n).map(|i| ((i % 241) as f32) / 256.0 - 0.47).collect();
+            let a_f: Vec<f32> = (0..m * k)
+                .map(|i| ((i % 251) as f32) / 256.0 - 0.49)
+                .collect();
+            let b_f: Vec<f32> = (0..k * n)
+                .map(|i| ((i % 241) as f32) / 256.0 - 0.47)
+                .collect();
             let a_r = round_bf16(&a_f);
             let b_r = round_bf16(&b_f);
             let expected = gemm_f32_cpu(&a_r, &b_r, m, n, k);
             let a = rt.alloc_tensor_bf16(&[m, k]).unwrap();
             let b = rt.alloc_tensor_bf16(&[k, n]).unwrap();
             let c = rt.alloc_tensor_f32(&[m, n]).unwrap();
-            a.buffer.write_bf16_bits(&crate::tensor::f32_slice_to_bf16(&a_f));
-            b.buffer.write_bf16_bits(&crate::tensor::f32_slice_to_bf16(&b_f));
+            a.buffer
+                .write_bf16_bits(&crate::tensor::f32_slice_to_bf16(&a_f));
+            b.buffer
+                .write_bf16_bits(&crate::tensor::f32_slice_to_bf16(&b_f));
             gemm(&a, &b, &c, GemmBackend::TensorOps).unwrap();
             rt.synchronize().unwrap();
             let got = c.buffer.read_f32();
@@ -2946,10 +2692,14 @@ mod stress_tests {
                     let m_ = m;
                     let n_ = n;
                     let k_ = k;
-                    let a_host: Vec<f32> = (0..m_ * k_).map(|_| Rng::unit(&mut case_rng)).collect();
-                    let b_host: Vec<f32> = (0..n_ * k_).map(|_| Rng::unit(&mut case_rng)).collect();
+                    let a_host: Vec<f32> = (0..m_ * k_).map(|_| case_rng.unit()).collect();
+                    let b_host: Vec<f32> = (0..n_ * k_).map(|_| case_rng.unit()).collect();
                     let bf16 = matches!(family, Family::NnRawBf16);
-                    rt.set_precision(if bf16 { PrecisionMode::Bf16 } else { PrecisionMode::F32 });
+                    rt.set_precision(if bf16 {
+                        PrecisionMode::Bf16
+                    } else {
+                        PrecisionMode::F32
+                    });
                     let (a_shape, b_shape): (Vec<usize>, Vec<usize>) = match family {
                         Family::Tn => (vec![k_, m_], vec![k_, n_]),
                         Family::NtAccum => (vec![m_, k_], vec![n_, k_]),
@@ -2963,11 +2713,17 @@ mod stress_tests {
                         Family::NnRawBf16 => gemm(&a, &b, &c, GemmBackend::TensorOps).unwrap(),
                         Family::Tn => gemm_tn_train(&a, &b, &c, GemmBackend::TensorOps).unwrap(),
                         Family::Nn => gemm_train(&a, &b, &c, GemmBackend::TensorOps).unwrap(),
-                        Family::NtAccum => gemm_nt_accum_train(&a, &b, &c, GemmBackend::TensorOps).unwrap(),
+                        Family::NtAccum => {
+                            gemm_nt_accum_train(&a, &b, &c, GemmBackend::TensorOps).unwrap()
+                        }
                         _ => unreachable!(),
                     }
                     rt.synchronize().unwrap();
-                    c.buffer.read_f32().iter().map(|x| x.to_bits()).collect::<Vec<u32>>()
+                    c.buffer
+                        .read_f32()
+                        .iter()
+                        .map(|x| x.to_bits())
+                        .collect::<Vec<u32>>()
                 };
                 match &baseline {
                     None => baseline = Some(bits),
@@ -2994,9 +2750,13 @@ mod stress_tests {
             (1024, 1024, 1024, true),
             (1000, 520, 1030, true),
         ] {
-            rt.set_precision(if bf16 { PrecisionMode::Bf16 } else { PrecisionMode::F32 });
-            let a_host: Vec<f32> = (0..m * k).map(|_| Rng::unit(&mut rng)).collect();
-            let b_host: Vec<f32> = (0..k * n).map(|_| Rng::unit(&mut rng)).collect();
+            rt.set_precision(if bf16 {
+                PrecisionMode::Bf16
+            } else {
+                PrecisionMode::F32
+            });
+            let a_host: Vec<f32> = (0..m * k).map(|_| rng.unit()).collect();
+            let b_host: Vec<f32> = (0..k * n).map(|_| rng.unit()).collect();
             let (a_ref, b_ref) = if bf16 {
                 (round_bf16(&a_host), round_bf16(&b_host))
             } else {
@@ -3051,8 +2811,8 @@ mod stress_tests {
         // 4096x4096 with 128x64 tiles = 64*32 = 2048 tiles: swizzle ON.
         // The ragged twin keeps the same grid with edge tiles in play.
         for (m, n, k) in [(4096usize, 4096usize, 64usize), (4095, 4033, 65)] {
-            let a_host: Vec<f32> = (0..m * k).map(|_| Rng::unit(&mut rng)).collect();
-            let b_host: Vec<f32> = (0..k * n).map(|_| Rng::unit(&mut rng)).collect();
+            let a_host: Vec<f32> = (0..m * k).map(|_| rng.unit()).collect();
+            let b_host: Vec<f32> = (0..k * n).map(|_| rng.unit()).collect();
             let a_ref = round_bf16(&a_host);
             let b_ref = round_bf16(&b_host);
             let a = upload(&rt, &mut rng, &[m, k], &a_host, true);
@@ -3074,217 +2834,12 @@ mod stress_tests {
                     acc += a_ref[i * k + p] as f64 * b_ref[p * n + j] as f64;
                 }
                 let err = (got[i * n + j] as f64 - acc).abs();
-                assert!(err < 1e-2, "{m}x{n}x{k} C[{i},{j}] = {} vs f64 {acc}", got[i * n + j]);
+                assert!(
+                    err < 1e-2,
+                    "{m}x{n}x{k} C[{i},{j}] = {} vs f64 {acc}",
+                    got[i * n + j]
+                );
             }
-        }
-        rt.set_precision(PrecisionMode::F32);
-    }
-
-    /// Which production kernel a [`panel_walk_matches_row_major_chunks_bit_for_bit`]
-    /// case runs, with the operand element it reads.
-    #[derive(Clone, Copy, Debug)]
-    enum PanelLane {
-        NtBf16,
-        TnBf16,
-        NtAccumBf16,
-        TnAccumBf16,
-        NnF32,
-        NtF32,
-        TnF32,
-        NtAccumF32,
-        TnAccumF32,
-    }
-
-    impl PanelLane {
-        fn bf16(self) -> bool {
-            matches!(
-                self,
-                Self::NtBf16 | Self::TnBf16 | Self::NtAccumBf16 | Self::TnAccumBf16
-            )
-        }
-
-        fn accum(self) -> bool {
-            matches!(
-                self,
-                Self::NtAccumBf16 | Self::TnAccumBf16 | Self::NtAccumF32 | Self::TnAccumF32
-            )
-        }
-
-        fn layout(self) -> Layout {
-            match self {
-                Self::NnF32 => Layout::NN,
-                Self::TnBf16 | Self::TnAccumBf16 | Self::TnF32 | Self::TnAccumF32 => Layout::TN,
-                _ => Layout::NT,
-            }
-        }
-
-        /// Whether `run` at this shape is the one tiled kernel, rather than a
-        /// split-K route that would sum K in a different order.
-        fn single_dispatch(self, m: usize, n: usize, k: usize) -> bool {
-            match self {
-                Self::TnBf16 => !prefer_tn_splitk(m, n, k),
-                Self::NnF32 => nn_splitk_k_tile(m, n, k).is_none(),
-                Self::TnF32 => tn_par_k_tile(m, n, k).is_none(),
-                _ => true,
-            }
-        }
-
-        fn tile(self) -> TileGeom {
-            match self {
-                Self::NtBf16 | Self::TnBf16 => TILE_COOP_TN_NT,
-                Self::NtAccumBf16 | Self::TnAccumBf16 => TILE_COOP_ACCUM,
-                _ => TILE_F32,
-            }
-        }
-
-        /// `C (+)= op(A) op(B)` through the production entry point, or the
-        /// production accumulate pipeline (reachable from the public API only
-        /// under an A/B flag).
-        fn run(self, rt: &std::sync::Arc<GpuRuntime>, a: &Tensor, b: &Tensor, c: &Tensor) {
-            let (m, n) = (c.shape[0], c.shape[1]);
-            let k = match self.layout() {
-                Layout::TN => a.shape[0],
-                _ => a.shape[1],
-            };
-            let accum = |kernel: &str, interior: bool| {
-                let p = rt.pipeline(kernel).unwrap();
-                dispatch_tensorops_accum(rt, &p, a, b, c, m, n, k, self.tile(), interior).unwrap();
-            };
-            match self {
-                Self::NtBf16 => gemm_nt_bf16(a, b, c).unwrap(),
-                Self::TnBf16 => gemm_tn_bf16(a, b, c).unwrap(),
-                Self::NtAccumBf16 => accum("matmul2d_tensorops_nt_accum_bf16_f32", false),
-                Self::TnAccumBf16 => accum("matmul2d_tensorops_tn_accum_bf16_f32", false),
-                Self::NnF32 => gemm_f32(a, b, c, GemmBackend::TensorOps).unwrap(),
-                Self::NtF32 => gemm_nt_f32(a, b, c, GemmBackend::TensorOps).unwrap(),
-                Self::TnF32 => gemm_tn_f32(a, b, c, GemmBackend::TensorOps).unwrap(),
-                Self::NtAccumF32 => accum("matmul2d_tensorops_nt_accum_f32", true),
-                Self::TnAccumF32 => accum("matmul2d_tensorops_tn_accum_f32", true),
-            }
-        }
-    }
-
-    /// The shader's gate for the column-panel walk, in elements of B; held to
-    /// the source so the shapes below keep straddling it.
-    const PANEL_MIN_B_ELEMS: usize = 1 << 23;
-
-    /// The column-panel walk changes only the order threadgroups run in, so a
-    /// product that takes it has the bits of the same product cut into
-    /// column chunks small enough to keep the row-major walk. Every kernel
-    /// that walks by B's size is run past the gate, with ragged M and N (a
-    /// partial last band, tile row and tile column), and its chunks under it.
-    /// Two more cases are square power-of-two grids past the gate, which keep
-    /// Morton order. Plain kernels start from NaN, so a skipped tile shows;
-    /// accumulate kernels start from the same finite C, so a skipped or
-    /// doubled tile shows.
-    #[test]
-    fn panel_walk_matches_row_major_chunks_bit_for_bit() {
-        assert!(
-            include_str!("../kernels/matmul_tensorops.metal")
-                .contains("constexpr constant ulong PANEL_MIN_B_ELEMS = 1ul << 23;"),
-            "the shader's panel gate moved; update PANEL_MIN_B_ELEMS and these shapes"
-        );
-        let rt = GpuRuntime::new().expect("GpuRuntime::new");
-        assert!(rt.has_tensorops(), "requires TensorOps metallib");
-        rt.set_precision(PrecisionMode::F32);
-        let mut rng = Rng::new(0x9A2E_2026u64);
-        let lanes = [
-            PanelLane::NtBf16,
-            PanelLane::TnBf16,
-            PanelLane::NtAccumBf16,
-            PanelLane::TnAccumBf16,
-            PanelLane::NnF32,
-            PanelLane::NtF32,
-            PanelLane::TnF32,
-            PanelLane::NtAccumF32,
-            PanelLane::TnAccumF32,
-        ];
-        // (lane, m, n, k, chunk, morton). M = 2348 is 19 tile rows of 128
-        // (bands of 4: the last holds 3), 37 of 64 (bands of 8: 5) and 74 of
-        // 32 (bands of 16: 10). N leaves a partial tile column, and a last
-        // chunk wide enough (48) that f32 TN keeps its tiled kernel.
-        let mut cases: Vec<(PanelLane, usize, usize, usize, usize, bool)> = lanes
-            .iter()
-            .map(|&lane| {
-                let n = if lane.bf16() { 16432 } else { 8240 };
-                (lane, 2348, n, 1056, 2048, false)
-            })
-            .collect();
-        cases.push((PanelLane::NtBf16, 4096, 2048, 4096, 1024, true));
-        cases.push((PanelLane::NtF32, 2048, 2048, 4096, 1024, true));
-        for (lane, m, n, k, chunk, morton) in cases {
-            let t = lane.tile();
-            let (tiles_n, tiles_m) = (n.div_ceil(t.sn), m.div_ceil(t.sm));
-            assert_eq!(
-                tiles_n == tiles_m && tiles_n.is_power_of_two(),
-                morton,
-                "{lane:?} {m}x{n}"
-            );
-            assert!(n * k >= PANEL_MIN_B_ELEMS && chunk * k < PANEL_MIN_B_ELEMS);
-            for w in [n, chunk, n % chunk].into_iter().filter(|&w| w > 0) {
-                assert!(lane.single_dispatch(m, w, k), "{lane:?} {m}x{w}x{k} takes split-K");
-            }
-            let a_host: Vec<f32> = (0..m * k).map(|_| Rng::unit(&mut rng)).collect();
-            let b_host: Vec<f32> = (0..k * n).map(|_| Rng::unit(&mut rng)).collect();
-            // Stored layouts: A [M,K] or [K,M]; B [K,N] (NN, TN) or [N,K] (NT).
-            let a_shape = match lane.layout() {
-                Layout::TN => [k, m],
-                _ => [m, k],
-            };
-            let b_rows_are_n = matches!(lane.layout(), Layout::NT);
-            let b_cols = |j0: usize, w: usize| -> (Vec<f32>, [usize; 2]) {
-                if b_rows_are_n {
-                    (b_host[j0 * k..(j0 + w) * k].to_vec(), [w, k])
-                } else {
-                    let mut out = Vec::with_capacity(k * w);
-                    for p in 0..k {
-                        out.extend_from_slice(&b_host[p * n + j0..p * n + j0 + w]);
-                    }
-                    (out, [k, w])
-                }
-            };
-            let start = |i: usize, j: usize| -> f32 {
-                if lane.accum() {
-                    0.25 + ((i * 31 + j * 7) % 13) as f32 * 0.125
-                } else {
-                    f32::NAN
-                }
-            };
-            let a = upload(&rt, &mut rng, &a_shape, &a_host, lane.bf16());
-            let (b_all, b_shape) = b_cols(0, n);
-            let b = upload(&rt, &mut rng, &b_shape, &b_all, lane.bf16());
-            let c = rt.alloc_tensor_f32(&[m, n]).unwrap();
-            let c0: Vec<f32> = (0..m * n).map(|x| start(x / n, x % n)).collect();
-            c.buffer.write_f32(&c0);
-            lane.run(&rt, &a, &b, &c);
-            rt.synchronize().unwrap();
-            let whole = c.buffer.read_f32();
-            let mut mismatches = 0usize;
-            let mut first = None;
-            for j0 in (0..n).step_by(chunk) {
-                let w = chunk.min(n - j0);
-                let (b_part, b_part_shape) = b_cols(j0, w);
-                let bp = upload(&rt, &mut rng, &b_part_shape, &b_part, lane.bf16());
-                let cp = rt.alloc_tensor_f32(&[m, w]).unwrap();
-                let cp0: Vec<f32> = (0..m * w).map(|x| start(x / w, j0 + x % w)).collect();
-                cp.buffer.write_f32(&cp0);
-                lane.run(&rt, &a, &bp, &cp);
-                rt.synchronize().unwrap();
-                let part = cp.buffer.read_f32();
-                for i in 0..m {
-                    for j in 0..w {
-                        let (got, want) = (whole[i * n + j0 + j], part[i * w + j]);
-                        if got.to_bits() != want.to_bits() || !got.is_finite() {
-                            mismatches += 1;
-                            first.get_or_insert((i, j0 + j, got, want));
-                        }
-                    }
-                }
-            }
-            assert_eq!(
-                mismatches, 0,
-                "{lane:?} {m}x{n}x{k}: {mismatches} outputs differ from the row-major chunks, first {first:?}"
-            );
         }
         rt.set_precision(PrecisionMode::F32);
     }
@@ -3308,539 +2863,5 @@ mod stress_tests {
         for h in handles {
             h.join().expect("stress thread panicked");
         }
-    }
-}
-
-#[cfg(test)]
-mod epi_tile_select {
-    use super::*;
-
-    #[test]
-    fn narrow_only_when_bf16_m_does_not_fill_a_128_row_tile() {
-        assert_eq!(epi_tile_auto(1, CoopElem::Bf16), EpiTile::Narrow);
-        assert_eq!(epi_tile_auto(61, CoopElem::Bf16), EpiTile::Narrow);
-        assert_eq!(epi_tile_auto(127, CoopElem::Bf16), EpiTile::Narrow);
-        assert_eq!(epi_tile_auto(128, CoopElem::Bf16), EpiTile::Wide);
-        assert_eq!(epi_tile_auto(200, CoopElem::Bf16), EpiTile::Wide);
-        assert_eq!(epi_tile_auto(61, CoopElem::F16), EpiTile::Wide);
-        assert_eq!(epi_tile_auto(61, CoopElem::RelaxedF32), EpiTile::Wide);
-    }
-}
-
-#[cfg(test)]
-mod coop_tile_select {
-    use super::*;
-
-    #[test]
-    fn bf16_short_m_uses_the_existing_64x64_kernel_when_n_exceeds_512() {
-        let narrow = "matmul2d_tensorops_bf16_f32_64x64_sg4";
-        let wide = "matmul2d_tensorops_bf16_f32";
-        for m in [1usize, 61, 127] {
-            let (name, tile) = nn_coop_kernel(m, 8224, 2048, CoopElem::Bf16);
-            assert_eq!(name, narrow, "M={m}");
-            assert_eq!((tile.sm, tile.sn, tile.simdgroups), (64, 64, 4));
-        }
-        for m in [128usize, 200] {
-            let (name, tile) = nn_coop_kernel(m, 8224, 2048, CoopElem::Bf16);
-            assert_eq!(name, wide, "M={m}");
-            assert_eq!((tile.sm, tile.sn, tile.simdgroups), (128, 64, 4));
-        }
-        // N ≤ 512 is unchanged, including when M fills a 128-row tile.
-        let (name, _) = nn_coop_kernel(200, 512, 2048, CoopElem::Bf16);
-        assert_eq!(name, narrow);
-        // f16 and relaxed f32 do not take the short-M exception.
-        assert_eq!(
-            nn_coop_kernel(61, 8224, 2048, CoopElem::F16).0,
-            "matmul2d_tensorops_f16_f32"
-        );
-        assert_eq!(
-            nn_coop_kernel(61, 8224, 2048, CoopElem::RelaxedF32).0,
-            "matmul2d_tensorops_f32_relaxed"
-        );
-        assert_eq!(
-            nn_coop_kernel(61, 512, 64, CoopElem::F16).0,
-            "matmul2d_tensorops_f16_f32_64x64_sg4"
-        );
-    }
-
-    /// Ragged K and N must not move the tile. `nn_coop_kernel` ignores K, and
-    /// N enters only as `n <= 512`. N = 520 is past that cut and not a multiple
-    /// of 64; K = 7 is not a multiple of 8. f16 and relaxed f32 stay on their
-    /// own 128×64 kernels, never the bf16 64×64 name.
-    #[test]
-    fn ragged_k_and_n_do_not_hand_f16_or_f32_the_bf16_short_m_kernel() {
-        let n = 520usize;
-        let k = 7usize;
-        assert!(
-            n > 512 && n % 64 != 0,
-            "attack shape must keep a partial N tile past the 512 cut"
-        );
-        assert_ne!(k % 8, 0, "attack shape must keep a partial K");
-        let bf16_narrow = "matmul2d_tensorops_bf16_f32_64x64_sg4";
-        let bf16_wide = "matmul2d_tensorops_bf16_f32";
-        for m in [1usize, 127] {
-            let (name, tile) = nn_coop_kernel(m, n, k, CoopElem::Bf16);
-            assert_eq!(name, bf16_narrow, "M={m}");
-            assert_eq!((tile.sm, tile.sn, tile.simdgroups), (64, 64, 4));
-            assert_eq!(epi_tile_auto(m, CoopElem::Bf16), EpiTile::Narrow, "M={m}");
-            for elem in [CoopElem::F16, CoopElem::RelaxedF32] {
-                let (other, wide) = nn_coop_kernel(m, n, k, elem);
-                assert_ne!(other, bf16_narrow, "{elem:?} M={m} took the bf16 short-M kernel");
-                assert_ne!(other, bf16_wide, "{elem:?} M={m} took the bf16 wide kernel");
-                assert_eq!((wide.sm, wide.sn), (128, 64), "{elem:?} M={m}");
-                assert_eq!(epi_tile_auto(m, elem), EpiTile::Wide, "{elem:?} M={m}");
-                let err = match epi_kernel(elem, EpiTile::Narrow) {
-                    Err(err) => err,
-                    Ok((name, _)) => panic!("{elem:?}: narrow epilogue was accepted as {name}"),
-                };
-                assert!(err.contains("bf16"), "{elem:?}: {err}");
-            }
-        }
-        let (name, tile) = nn_coop_kernel(128, n, k, CoopElem::Bf16);
-        assert_eq!(name, bf16_wide);
-        assert_eq!((tile.sm, tile.sn), (128, 64));
-        assert_eq!(epi_tile_auto(128, CoopElem::Bf16), EpiTile::Wide);
-        // K is not an input. Branching on K % 8 later would split these.
-        assert_eq!(
-            nn_coop_kernel(127, n, k, CoopElem::Bf16).0,
-            nn_coop_kernel(127, n, k + 1, CoopElem::Bf16).0
-        );
-    }
-}
-
-/// What the hardware does with an operand view that starts off a 64-byte
-/// boundary. Every kernel family is encoded through its raw dispatch helper —
-/// below the host's alignment gate — on views at each byte offset, and the
-/// output is compared bit for bit with the same kernel on 0-offset views. A
-/// kernel that needs an alignment it is not given faults, writes nothing (C
-/// starts as NaN), or computes from the wrong addresses; all three show as a
-/// mismatch.
-///
-/// `alignment_probe_report` prints the table recorded in
-/// `bench/results/gemm_align_probe_m5pro.txt`. `every_rule_offset_matches_the_aligned_run`
-/// asserts the part of it that [`GEMM_VIEW_ALIGN`] relies on.
-#[cfg(test)]
-mod alignment_probe {
-    use super::*;
-    use crate::tensor::{bf16_bits_to_f32, f16_bits_to_f32, f32_to_bf16_bits, f32_to_f16_bits};
-    use std::sync::Arc;
-
-    /// Byte offsets probed. 0 is the reference run; 4 and 8 sit below the
-    /// 16-byte floor and are recorded, not relied on.
-    const OFFSETS: [usize; 7] = [0, 4, 8, 16, 32, 48, 64];
-
-    /// One shape with 64-byte row strides and one with odd strides, both
-    /// ragged against every tile so edge and interior tiles both run.
-    const SHAPES: [(usize, usize, usize); 2] = [(144, 96, 80), (130, 97, 70)];
-
-    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-    enum Probe {
-        ExactNn,
-        ExactTn,
-        ExactNt,
-        ExactTnAccum,
-        ExactNtAccum,
-        Simdgroup,
-        CoopNn(CoopElem, EpiTile),
-        CoopTnBf16,
-        CoopNtBf16,
-        CoopTnAccumBf16,
-        CoopNtAccumBf16,
-        Epilogue(CoopElem),
-        Batched(CoopElem),
-    }
-
-    const PROBES: &[Probe] = &[
-        Probe::ExactNn,
-        Probe::ExactTn,
-        Probe::ExactNt,
-        Probe::ExactTnAccum,
-        Probe::ExactNtAccum,
-        Probe::Simdgroup,
-        Probe::CoopNn(CoopElem::RelaxedF32, EpiTile::Wide),
-        Probe::CoopNn(CoopElem::RelaxedF32, EpiTile::Narrow),
-        Probe::CoopNn(CoopElem::Bf16, EpiTile::Wide),
-        Probe::CoopNn(CoopElem::Bf16, EpiTile::Narrow),
-        Probe::CoopNn(CoopElem::F16, EpiTile::Wide),
-        Probe::CoopNn(CoopElem::F16, EpiTile::Narrow),
-        Probe::CoopTnBf16,
-        Probe::CoopNtBf16,
-        Probe::CoopTnAccumBf16,
-        Probe::CoopNtAccumBf16,
-        Probe::Epilogue(CoopElem::RelaxedF32),
-        Probe::Epilogue(CoopElem::Bf16),
-        Probe::Epilogue(CoopElem::F16),
-        Probe::Batched(CoopElem::RelaxedF32),
-        Probe::Batched(CoopElem::Bf16),
-        Probe::Batched(CoopElem::F16),
-    ];
-
-    impl Probe {
-        fn elem(self) -> DType {
-            match self {
-                Self::CoopNn(e, _) | Self::Epilogue(e) | Self::Batched(e) => match e {
-                    CoopElem::RelaxedF32 => DType::F32,
-                    CoopElem::Bf16 => DType::BF16,
-                    CoopElem::F16 => DType::F16,
-                },
-                Self::CoopTnBf16 | Self::CoopNtBf16 | Self::CoopTnAccumBf16 | Self::CoopNtAccumBf16 => DType::BF16,
-                _ => DType::F32,
-            }
-        }
-
-        fn layout(self) -> Layout {
-            match self {
-                Self::ExactTn | Self::ExactTnAccum | Self::CoopTnBf16 | Self::CoopTnAccumBf16 => Layout::TN,
-                Self::ExactNt | Self::ExactNtAccum | Self::CoopNtBf16 | Self::CoopNtAccumBf16 => Layout::NT,
-                _ => Layout::NN,
-            }
-        }
-
-        fn accumulates(self) -> bool {
-            matches!(
-                self,
-                Self::ExactTnAccum
-                    | Self::ExactNtAccum
-                    | Self::CoopTnAccumBf16
-                    | Self::CoopNtAccumBf16
-                    | Self::Epilogue(_)
-            )
-        }
-
-        fn kernel(self) -> &'static str {
-            match self {
-                Self::ExactNn => "matmul2d_tensorops_f32",
-                Self::ExactTn => "matmul2d_tensorops_tn_f32",
-                Self::ExactNt => "matmul2d_tensorops_nt_f32",
-                Self::ExactTnAccum => "matmul2d_tensorops_tn_accum_f32",
-                Self::ExactNtAccum => "matmul2d_tensorops_nt_accum_f32",
-                Self::Simdgroup => "matmul_simdgroup_edges_f32",
-                Self::CoopNn(e, t) => nn_coop_kernel_for(e, t).0,
-                Self::CoopTnBf16 => "matmul2d_tensorops_tn_bf16_f32",
-                Self::CoopNtBf16 => "matmul2d_tensorops_nt_bf16_f32",
-                Self::CoopTnAccumBf16 => "matmul2d_tensorops_tn_accum_bf16_f32",
-                Self::CoopNtAccumBf16 => "matmul2d_tensorops_nt_accum_bf16_f32",
-                Self::Epilogue(CoopElem::Bf16) => "matmul2d_tensorops_bf16_f32_epi",
-                Self::Epilogue(CoopElem::F16) => "matmul2d_tensorops_f16_f32_epi",
-                Self::Epilogue(CoopElem::RelaxedF32) => "matmul2d_tensorops_f32_relaxed_epi",
-                Self::Batched(CoopElem::Bf16) => "matmul2d_tensorops_bf16_f32_batched",
-                Self::Batched(CoopElem::F16) => "matmul2d_tensorops_f16_f32_batched",
-                Self::Batched(CoopElem::RelaxedF32) => "matmul2d_tensorops_f32_relaxed_batched",
-            }
-        }
-    }
-
-    fn seq(n: usize, seed: u64) -> Vec<f32> {
-        let mut s = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-        (0..n)
-            .map(|_| {
-                s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-                ((s >> 40) as f32 / (1u64 << 24) as f32) * 2.0 - 1.0
-            })
-            .collect()
-    }
-
-    /// A buffer holding `pad_elems` of zeros and then `host` in `dtype`,
-    /// viewed at the start of `host`.
-    fn upload(rt: &Arc<GpuRuntime>, dtype: DType, shape: &[usize], host: &[f32], pad_elems: usize) -> Tensor {
-        let total = pad_elems + host.len();
-        let bank = match dtype {
-            DType::F32 => rt.alloc_tensor_f32(&[total]),
-            DType::BF16 => rt.alloc_tensor_bf16(&[total]),
-            DType::F16 => rt.alloc_tensor_f16(&[total]),
-        }
-        .expect("probe alloc");
-        let mut full = vec![0.0f32; pad_elems];
-        full.extend_from_slice(host);
-        match dtype {
-            DType::F32 => bank.buffer.write_f32(&full),
-            DType::BF16 => bank
-                .buffer
-                .write_bf16_bits(&full.iter().map(|&x| f32_to_bf16_bits(x)).collect::<Vec<_>>()),
-            DType::F16 => bank
-                .buffer
-                .write_f16_bits(&full.iter().map(|&x| f32_to_f16_bits(x)).collect::<Vec<_>>()),
-        }
-        bank.view(shape, pad_elems)
-    }
-
-    /// Elements between consecutive batch matrices: the matrix rounded up to
-    /// 64 bytes, plus `off` bytes, so batch `i` starts `i * off` bytes off a
-    /// 64-byte boundary while batch 0 stays aligned.
-    fn batch_stride(matrix: usize, elem: usize, off: usize) -> usize {
-        (matrix * elem).div_ceil(64) * 64 / elem + off / elem
-    }
-
-    /// `batch` matrices of `matrix` elements, `stride` apart, zeros between.
-    /// Matrix `i` is the same whatever the stride, so runs at different
-    /// strides compare bit for bit.
-    fn batch_bank(matrix: usize, stride: usize, batch: usize, seed: u64) -> Vec<f32> {
-        let mut bank = vec![0.0f32; stride * (batch - 1) + matrix];
-        for i in 0..batch {
-            bank[i * stride..i * stride + matrix].copy_from_slice(&seq(matrix, seed * 16 + i as u64));
-        }
-        bank
-    }
-
-    enum Outcome {
-        /// Bit-identical to the 0-offset run.
-        Match,
-        /// `count` of `total` output elements differ from the 0-offset run.
-        Mismatch { count: usize, total: usize },
-        /// The dispatch or the read-back failed.
-        Error(String),
-    }
-
-    /// Run `probe` on `(m, n, k)` with every operand view starting `off`
-    /// bytes past a 64-byte boundary (for batched, every batch past the first).
-    fn run(
-        rt: &Arc<GpuRuntime>,
-        probe: Probe,
-        (m, n, k): (usize, usize, usize),
-        off: usize,
-    ) -> Result<Vec<f32>, String> {
-        let dt = probe.elem();
-        let es = dt.size_of();
-        let (a_shape, b_shape) = match probe.layout() {
-            Layout::NN => ([m, k], [k, n]),
-            Layout::TN => ([k, m], [k, n]),
-            Layout::NT => ([m, k], [n, k]),
-        };
-        let c0 = seq(m * n, 3);
-        if let Probe::Batched(_) = probe {
-            const BATCH: usize = 3;
-            let strides = BatchStrides {
-                a: batch_stride(m * k, es, off),
-                b: batch_stride(k * n, es, off),
-                c: batch_stride(m * n, 4, off),
-            };
-            let a_host = batch_bank(m * k, strides.a, BATCH, 1);
-            let b_host = batch_bank(k * n, strides.b, BATCH, 2);
-            let a = upload(rt, dt, &[a_host.len()], &a_host, 0);
-            let b = upload(rt, dt, &[b_host.len()], &b_host, 0);
-            let c_len = strides.c * (BATCH - 1) + m * n;
-            let c = upload(rt, DType::F32, &[c_len], &vec![f32::NAN; c_len], 0);
-            let p = rt.pipeline(probe.kernel())?;
-            let spec = BatchedGemm {
-                m,
-                n,
-                k,
-                batch: BATCH,
-                strides,
-            };
-            dispatch_tensorops_batched(rt, &p, &a, &b, &c, spec)?;
-            rt.synchronize()?;
-            let all = c.read_f32()?;
-            return Ok((0..BATCH)
-                .flat_map(|i| all[i * strides.c..i * strides.c + m * n].to_vec())
-                .collect());
-        }
-
-        let pad = off / es;
-        let a = upload(rt, dt, &a_shape, &seq(m * k, 1), pad);
-        let b = upload(rt, dt, &b_shape, &seq(k * n, 2), pad);
-        let c_init = if probe.accumulates() { c0 } else { vec![f32::NAN; m * n] };
-        let c = upload(rt, DType::F32, &[m, n], &c_init, off / 4);
-        let bias = upload(rt, DType::F32, &[n], &seq(n, 4), off / 4);
-        let p = rt.pipeline(probe.kernel())?;
-        match probe {
-            Probe::ExactNn => dispatch_tensorops_nn(rt, &p, &a, &b, &c, m, n, k, TILE_F32)?,
-            Probe::ExactTn | Probe::ExactNt => dispatch_tensorops_tn_nt(rt, &p, &a, &b, &c, m, n, k, TILE_F32)?,
-            Probe::ExactTnAccum | Probe::ExactNtAccum => {
-                dispatch_tensorops_accum(rt, &p, &a, &b, &c, m, n, k, TILE_F32, true)?
-            }
-            Probe::Simdgroup => dispatch_simdgroup(rt, &a, &b, &c, m, n, k)?,
-            Probe::CoopNn(e, t) => dispatch_tensorops_nn_coop(rt, &p, &a, &b, &c, m, n, k, nn_coop_kernel_for(e, t).1)?,
-            Probe::CoopTnBf16 | Probe::CoopNtBf16 => {
-                dispatch_tensorops_nn_coop(rt, &p, &a, &b, &c, m, n, k, TILE_COOP_TN_NT)?
-            }
-            Probe::CoopTnAccumBf16 | Probe::CoopNtAccumBf16 => {
-                dispatch_tensorops_accum(rt, &p, &a, &b, &c, m, n, k, TILE_COOP_ACCUM, false)?
-            }
-            Probe::Epilogue(_) => {
-                let epi = Epilogue {
-                    alpha: 0.5,
-                    beta: 0.25,
-                    bias: Some(&bias),
-                    activation: Activation::None,
-                };
-                dispatch_tensorops_epi(rt, &p, &a, &b, &c, m, n, k, TILE_COOP_DEFAULT, epi)?
-            }
-            Probe::Batched(_) => unreachable!("handled above"),
-        }
-        rt.synchronize()?;
-        c.read_f32()
-    }
-
-    /// The CPU value the 0-offset run must approximate, so a bit-identical
-    /// but wrong baseline cannot pass.
-    fn reference(probe: Probe, (m, n, k): (usize, usize, usize)) -> Vec<f32> {
-        let round = |v: Vec<f32>| -> Vec<f32> {
-            match probe.elem() {
-                DType::F32 => v,
-                DType::BF16 => v.into_iter().map(|x| bf16_bits_to_f32(f32_to_bf16_bits(x))).collect(),
-                DType::F16 => v.into_iter().map(|x| f16_bits_to_f32(f32_to_f16_bits(x))).collect(),
-            }
-        };
-        let product = |a: &[f32], b: &[f32]| -> Vec<f32> {
-            let mut out = vec![0.0f32; m * n];
-            for i in 0..m {
-                for j in 0..n {
-                    let mut acc = 0.0f64;
-                    for kk in 0..k {
-                        let av = match probe.layout() {
-                            Layout::TN => a[kk * m + i],
-                            _ => a[i * k + kk],
-                        };
-                        let bv = match probe.layout() {
-                            Layout::NT => b[j * k + kk],
-                            _ => b[kk * n + j],
-                        };
-                        acc += av as f64 * bv as f64;
-                    }
-                    out[i * n + j] = acc as f32;
-                }
-            }
-            out
-        };
-        let es = probe.elem().size_of();
-        if let Probe::Batched(_) = probe {
-            let sa = batch_stride(m * k, es, 0);
-            let sb = batch_stride(k * n, es, 0);
-            let a = round(batch_bank(m * k, sa, 3, 1));
-            let b = round(batch_bank(k * n, sb, 3, 2));
-            return (0..3)
-                .flat_map(|i| product(&a[i * sa..i * sa + m * k], &b[i * sb..i * sb + k * n]))
-                .collect();
-        }
-        let prod = product(&round(seq(m * k, 1)), &round(seq(k * n, 2)));
-        let c0 = seq(m * n, 3);
-        let bias = seq(n, 4);
-        match probe {
-            Probe::Epilogue(_) => (0..m * n).map(|e| 0.5 * prod[e] + 0.25 * c0[e] + bias[e % n]).collect(),
-            p if p.accumulates() => prod.iter().zip(&c0).map(|(x, y)| x + y).collect(),
-            _ => prod,
-        }
-    }
-
-    /// One probe run: a kernel family on a shape at a byte offset.
-    struct Row {
-        probe: Probe,
-        shape: (usize, usize, usize),
-        off: usize,
-        outcome: Outcome,
-    }
-
-    /// Every probe at every offset on every shape, with the 0-offset run
-    /// checked against the CPU first.
-    fn sweep(rt: &Arc<GpuRuntime>) -> Vec<Row> {
-        let mut rows = Vec::new();
-        for &probe in PROBES {
-            for &shape in &SHAPES {
-                let base = run(rt, probe, shape, 0).expect("0-offset probe run");
-                let expect = reference(probe, shape);
-                let scale = expect.iter().fold(1.0f32, |m, x| m.max(x.abs()));
-                let worst = base
-                    .iter()
-                    .zip(&expect)
-                    .map(|(g, e)| if g.is_finite() { (g - e).abs() } else { f32::INFINITY })
-                    .fold(0.0f32, f32::max);
-                // bf16 operands are rounded identically on both sides, so the
-                // remaining gap is f32-vs-f64 accumulation (and tf32-class
-                // products on the relaxed kernels).
-                assert!(
-                    worst <= 2e-2 * scale,
-                    "{probe:?} {shape:?}: the aligned run is off the CPU reference by {worst} (scale {scale})"
-                );
-                for &off in &OFFSETS[1..] {
-                    let outcome = match run(rt, probe, shape, off) {
-                        Ok(got) => {
-                            let count = got
-                                .iter()
-                                .zip(&base)
-                                .filter(|(g, b)| g.to_bits() != b.to_bits())
-                                .count();
-                            if count == 0 {
-                                Outcome::Match
-                            } else {
-                                Outcome::Mismatch {
-                                    count,
-                                    total: got.len(),
-                                }
-                            }
-                        }
-                        Err(e) => Outcome::Error(e),
-                    };
-                    rows.push(Row {
-                        probe,
-                        shape,
-                        off,
-                        outcome,
-                    });
-                }
-            }
-        }
-        rows
-    }
-
-    fn tensorops_runtime() -> Option<Arc<GpuRuntime>> {
-        let rt = GpuRuntime::new().expect("GpuRuntime::new");
-        rt.has_tensorops().then_some(rt)
-    }
-
-    /// Every offset the documented rule accepts produces the aligned bits, for
-    /// every kernel family the rule covers.
-    #[test]
-    fn every_rule_offset_matches_the_aligned_run() {
-        let Some(rt) = tensorops_runtime() else {
-            panic!("requires the TensorOps metallib");
-        };
-        for Row {
-            probe,
-            shape,
-            off,
-            outcome,
-        } in sweep(&rt)
-        {
-            if off % GEMM_VIEW_ALIGN != 0 {
-                continue;
-            }
-            match outcome {
-                Outcome::Match => {}
-                Outcome::Mismatch { count, total } => panic!(
-                    "{probe:?} {shape:?} at a {off}-byte offset, which the {GEMM_VIEW_ALIGN}-byte rule accepts: \
-                     {count}/{total} elements differ from the aligned run"
-                ),
-                Outcome::Error(e) => panic!("{probe:?} {shape:?} at a {off}-byte offset: {e}"),
-            }
-        }
-    }
-
-    /// The table in `bench/results/gemm_align_probe_m5pro.txt`:
-    /// `cargo test --release --lib alignment_probe_report -- --ignored --nocapture`
-    #[test]
-    #[ignore = "prints the probe table; run by hand to refresh the committed result"]
-    fn alignment_probe_report() {
-        let Some(rt) = tensorops_runtime() else {
-            panic!("requires the TensorOps metallib");
-        };
-        let rows = sweep(&rt);
-        println!("probe\tshape(m,n,k)\toffset_bytes\toutcome");
-        for Row {
-            probe,
-            shape,
-            off,
-            outcome,
-        } in &rows
-        {
-            let text = match outcome {
-                Outcome::Match => "bit-identical".to_string(),
-                Outcome::Mismatch { count, total } => format!("MISMATCH {count}/{total}"),
-                Outcome::Error(e) => format!("ERROR {e}"),
-            };
-            println!("{probe:?}\t{shape:?}\t{off}\t{text}");
-        }
-        let bad = rows.iter().filter(|r| !matches!(r.outcome, Outcome::Match)).count();
-        println!("summary: {} runs, {} not bit-identical", rows.len(), bad);
     }
 }

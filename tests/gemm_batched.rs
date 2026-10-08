@@ -34,7 +34,14 @@ fn tensor_f16(rt: &Arc<GpuRuntime>, shape: &[usize], data: &[f32]) -> Tensor {
 fn every_batch_element_equals_a_single_gemm_bit_for_bit() {
     with_gpu(|rt| {
         rt.set_relaxed_precision(true);
-        for &(m, n, k, batch) in &[(128usize, 64usize, 64usize, 4usize), (96, 80, 128, 3)] {
+        // The third shape has N > 512, so `gemm` picks the 128x64 geometry the
+        // batched kernel is instantiated at; the first two run 64x64 on the
+        // single-matrix side and pin that the reduction order is tile-independent.
+        for &(m, n, k, batch) in &[
+            (128usize, 64usize, 64usize, 4usize),
+            (96, 80, 128, 3),
+            (64, 640, 96, 2),
+        ] {
             let a_h = random_f32(m * k * batch, 0xBA7 + k as u64);
             let b_h = random_f32(k * n * batch, 0xC4E + n as u64);
             let a = tensor(rt, &[batch * m, k], &a_h);
@@ -121,8 +128,16 @@ fn bf16_and_f16_batch_elements_match_single_gemm_bit_for_bit() {
             for i in 0..batch {
                 let (ai, bi) = match narrow {
                     "bf16" => (
-                        tensor_bf16(rt, &[m, k], &round_trip_bf16(&a_h[i * m * k..(i + 1) * m * k])),
-                        tensor_bf16(rt, &[k, n], &round_trip_bf16(&b_h[i * k * n..(i + 1) * k * n])),
+                        tensor_bf16(
+                            rt,
+                            &[m, k],
+                            &round_trip_bf16(&a_h[i * m * k..(i + 1) * m * k]),
+                        ),
+                        tensor_bf16(
+                            rt,
+                            &[k, n],
+                            &round_trip_bf16(&b_h[i * k * n..(i + 1) * k * n]),
+                        ),
                     ),
                     _ => (
                         tensor_f16(rt, &[m, k], &a_h[i * m * k..(i + 1) * m * k]),
@@ -130,7 +145,8 @@ fn bf16_and_f16_batch_elements_match_single_gemm_bit_for_bit() {
                     ),
                 };
                 let ci = tensor(rt, &[m, n], &vec![0.0f32; m * n]);
-                gemm(&ai, &bi, &ci, GemmBackend::TensorOps).unwrap_or_else(|e| panic!("{narrow} gemm: {e}"));
+                gemm(&ai, &bi, &ci, GemmBackend::TensorOps)
+                    .unwrap_or_else(|e| panic!("{narrow} gemm: {e}"));
                 rt.synchronize().unwrap();
                 let single = ci.buffer.read_f32();
                 for e in 0..m * n {
@@ -223,7 +239,11 @@ fn a_batch_of_one_is_a_plain_gemm() {
 
         let (p, o) = (plain.buffer.read_f32(), one.buffer.read_f32());
         for e in 0..m * n {
-            assert_eq!(p[e].to_bits(), o[e].to_bits(), "batch of one differs at {e}");
+            assert_eq!(
+                p[e].to_bits(),
+                o[e].to_bits(),
+                "batch of one differs at {e}"
+            );
         }
     });
 }
@@ -299,7 +319,7 @@ fn batched_refuses_paths_without_a_register_accumulator() {
 }
 
 #[test]
-fn overlapping_output_batches_are_refused() {
+fn overlapping_output_batches_are_refused_before_encoding() {
     with_gpu(|rt| {
         rt.set_relaxed_precision(true);
         let a = tensor(rt, &[2, 1], &[2.0, 3.0]);

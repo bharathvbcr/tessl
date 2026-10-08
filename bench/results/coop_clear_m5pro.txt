@@ -1,0 +1,21 @@
+Cooperative-tensor accumulator clear — M5 Pro, 2026-09-05
+=========================================================
+
+Question (audit G12): every cooperative GEMM kernel zeroed its destination
+cooperative tensor (`cT.set(i, 0.0f)` over the capacity) before `op.run`
+under `matmul2d_descriptor::mode::multiply`, where `run` assigns every valid
+element — a redundant, fully unrolled register clear in eight kernels.
+
+Method: the bf16 NN 128x64 coop kernel with and without the clear, through
+`gemm`, twenty GEMMs per command buffer, six order-balanced rounds.
+ratio = clear time / no-clear time.
+
+  M=4096 N=4096 K=4096   5617.9 / 5646.2 us   0.995
+  M=8192 N=3072 K=768    1586.4 / 1563.7 us   1.015
+  M=2048 N=2048 K=2048    718.9 /  729.4 us   0.986
+  M=1024 N=4096 K=1024    381.5 /  374.3 us   1.019
+
+Within noise either way: the compiler already elides the clear, or it costs
+nothing against the K loop. Removed from all eight sites as dead code under
+`mode::multiply` (the accumulate and epilogue kernels load the previous C
+after `run`, so none needed a defined starting value); not a speedup.

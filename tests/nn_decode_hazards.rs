@@ -4,7 +4,7 @@ mod common;
 
 use std::sync::Arc;
 
-use common::{buf, empty, with_gpu};
+use common::{empty, with_gpu};
 use tessl::nn::{self, AttnDims};
 use tessl::{GpuBuffer, GpuRuntime};
 
@@ -48,7 +48,9 @@ fn decode_partial_is_barriered_before_reduce_when_auto_barriers_are_skipped() {
         };
 
         tessl::begin_decode_icb_capture();
-        let result = nn::flash_attn_decode(rt, &q, &k, &v, &out, &tkv, &zero, &zero, dims, D as u32, 1, false);
+        let result = nn::flash_attn_decode(
+            rt, &q, &k, &v, &out, &tkv, &zero, &zero, dims, D as u32, 1, false,
+        );
         let capture = tessl::take_decode_icb_capture().expect("decode capture");
         result.expect("encode decode partial and reduction");
 
@@ -62,6 +64,14 @@ fn decode_partial_is_barriered_before_reduce_when_auto_barriers_are_skipped() {
             "skip-auto mode should not invent an unrelated trailing barrier"
         );
     });
+}
+
+fn f32_buf(rt: &Arc<GpuRuntime>, data: &[f32]) -> GpuBuffer {
+    let buffer = rt
+        .alloc_buffer(data.len() * 4)
+        .expect("allocate f32 buffer");
+    buffer.write_f32(data);
+    buffer
 }
 
 /// Consecutive `with_binder` scopes share one Metal 4 encoder in async mode,
@@ -78,8 +88,8 @@ fn hazard_mode_barriers_the_edge_between_consecutive_scopes() {
         tessl::ab_flags::set_hazard_barriers(true);
         rt.set_async_encode(true).unwrap();
 
-        let logits = buf(rt, &[1.0, 2.0, 3.0, 4.0]);
-        let cap = buf(rt, &[30.0]);
+        let logits = f32_buf(rt, &[1.0, 2.0, 3.0, 4.0]);
+        let cap = f32_buf(rt, &[30.0]);
         tessl::begin_decode_icb_capture();
         // Two single-dispatch ops, each its own scope, both rewriting `logits`.
         let first = nn::softcap_logits(rt, &logits, &cap, 4);
@@ -113,8 +123,8 @@ fn an_explicit_barrier_scope_satisfies_the_pending_edge() {
         tessl::ab_flags::set_hazard_barriers(true);
         rt.set_async_encode(true).unwrap();
 
-        let logits = buf(rt, &[1.0, 2.0, 3.0, 4.0]);
-        let cap = buf(rt, &[30.0]);
+        let logits = f32_buf(rt, &[1.0, 2.0, 3.0, 4.0]);
+        let cap = f32_buf(rt, &[30.0]);
         tessl::infer_trace::set_enabled(true);
         // Opens the shared encoder and leaves an unbarriered dispatch behind.
         nn::softcap_logits(rt, &logits, &cap, 4).unwrap();

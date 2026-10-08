@@ -14,15 +14,6 @@
 #include "reduce_tree.h"
 using namespace metal;
 
-/// The starting value of lane `lid`'s running max over a row of `cols >= 1`:
-/// the lane's first element, or the row's first for a lane with none. Max is
-/// idempotent, so a duplicate changes nothing; an identity would have to be
-/// `-INFINITY`, which fast math may assume never occurs, or `-FLT_MAX`, which
-/// would report a row of only `-inf` as `-FLT_MAX`.
-inline float max_seed(device const float* xr, uint lid, uint cols) {
-    return xr[lid < cols ? lid : 0u];
-}
-
 /// `out[r, :] = softmax(x[r, :])`, numerically stable.
 ///
 /// Subtracts the row maximum before exponentiating. Without that, a row
@@ -54,7 +45,7 @@ kernel void softmax_rows_f32(
     device const float* xr = x + (ulong)row * cols;
     device float* outr = out + (ulong)row * cols;
 
-    float m = max_seed(xr, lid, cols);
+    float m = -INFINITY;
     for (ulong c = lid; c < (ulong)cols; c += tptg) { m = fmax(m, xr[c]); }
     const float row_max = reduce_row_max(m, scratch, sgid, lane, tptg);
 
@@ -88,8 +79,7 @@ kernel void row_sum_f32(
     if (lid == 0u) { out[row] = total; }
 }
 
-/// `out[r] = max(x[r, :])`. The host refuses `cols == 0`, so every row has an
-/// element to seed from (`max_seed`).
+/// `out[r] = max(x[r, :])`. An empty row yields -INFINITY, the identity.
 kernel void row_max_f32(
     device const float* x    [[buffer(0)]],
     device float*       out  [[buffer(1)]],
@@ -102,7 +92,7 @@ kernel void row_max_f32(
 ) {
     threadgroup float scratch[REDUCE_MAX_SIMDGROUPS];
     device const float* xr = x + (ulong)row * cols;
-    float m = max_seed(xr, lid, cols);
+    float m = -INFINITY;
     for (ulong c = lid; c < (ulong)cols; c += tptg) { m = fmax(m, xr[c]); }
     const float best = reduce_row_max(m, scratch, sgid, lane, tptg);
     if (lid == 0u) { out[row] = best; }

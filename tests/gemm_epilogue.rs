@@ -15,8 +15,8 @@ mod common;
 
 use std::sync::Arc;
 
-use common::{close_rel, gelu_pytorch_tanh, random_f32, tensor_bf16, with_gpu};
-use tessl::gemm::{gemm, gemm_epilogue, gemm_epilogue_tiled, Activation, EpiTile, Epilogue, GemmBackend};
+use common::{random_f32, with_gpu};
+use tessl::gemm::{gemm, gemm_epilogue, Activation, Epilogue, GemmBackend};
 use tessl::tensor::Tensor;
 use tessl::GpuRuntime;
 
@@ -59,7 +59,12 @@ fn reference(
             out[i * n + j] = match act {
                 Activation::None => v,
                 Activation::Relu => v.max(0.0),
-                Activation::GeluTanh => gelu_pytorch_tanh(v as f64) as f32,
+                Activation::GeluTanh => {
+                    let xc = v.clamp(-20.0, 20.0);
+                    let inner =
+                        0.7978845608028654f64 * (xc as f64 + 0.044715 * (xc as f64).powi(3));
+                    (0.5 * v as f64 * (1.0 + inner.clamp(-10.0, 10.0).tanh())) as f32
+                }
                 Activation::Silu => v / (1.0 + (-v).exp()),
             };
         }
@@ -76,26 +81,19 @@ fn tol(k: usize) -> f32 {
     2e-2 * (k as f32).sqrt()
 }
 
-fn residual_or_silu<'a>(full: bool, bias: &'a Tensor) -> Epilogue<'a> {
-    if full {
-        Epilogue {
-            alpha: 0.75,
-            beta: 0.5,
-            bias: Some(bias),
-            activation: Activation::Silu,
-        }
-    } else {
-        Epilogue {
-            beta: 1.0,
-            ..Epilogue::default()
-        }
-    }
-}
-
 fn close(what: &str, got: &[f32], want: &[f32], tol: f32) {
+    assert!(
+        tol.is_finite() && tol >= 0.0,
+        "{what}: tolerance must be finite and non-negative, got {tol}"
+    );
+    assert_eq!(got.len(), want.len(), "{what}: length mismatch");
     let mut worst = 0.0f32;
     let mut at = 0usize;
     for (i, (g, w)) in got.iter().zip(want).enumerate() {
+        assert!(
+            g.is_finite() && w.is_finite(),
+            "{what}[{i}]: comparison requires finite values, got {g}, want {w}"
+        );
         let d = (g - w).abs();
         if d > worst {
             worst = d;
@@ -108,6 +106,21 @@ fn close(what: &str, got: &[f32], want: &[f32], tol: f32) {
         got[at],
         want[at]
     );
+}
+
+#[test]
+fn comparison_rejects_one_sided_nan_and_length_mismatch() {
+    for (name, got, want) in [
+        ("NaN result", vec![f32::NAN], vec![1.0]),
+        ("NaN reference", vec![1.0], vec![f32::NAN]),
+        ("short result", vec![1.0], vec![1.0, 2.0]),
+        ("long result", vec![1.0, 2.0], vec![1.0]),
+    ] {
+        assert!(
+            std::panic::catch_unwind(|| close(name, &got, &want, 0.0)).is_err(),
+            "{name} must be rejected rather than aggregated into a passing worst error"
+        );
+    }
 }
 
 const SHAPES: &[(usize, usize, usize)] = &[
@@ -172,54 +185,39 @@ fn fused_epilogue_matches_the_unfused_sequence() {
     });
 }
 
-/// GELU past the cubic's clamp must keep growing with its input.
-///
-/// `gelu.h` clamps `x` to ±20 before cubing so `x^3` cannot overflow, but the
-/// outer factor is the original `x`. A copy that multiplied by the clamped value
-/// instead returned exactly 20 for every input above 20, which no random-operand
-/// test reaches. `A = B = 0` and `beta = 1` make the pre-activation `C_prev`
-/// verbatim, so the probes arrive unrounded by the tf32-class product.
 #[test]
-fn gelu_epilogue_tracks_x_past_the_cubic_clamp() {
-    const PROBES: &[f32] = &[20.5, 25.0, 50.0, 1.0e4, -25.0, -1.0e4, 3.0, -3.0, 0.0];
+fn gelu_epilogue_above_twenty_approaches_the_unclamped_input() {
+    // GELU(x) approaches x for large positive x. The tanh polynomial's input
+    // may be clamped for stability, but clamping the outer 0.5*x factor turns
+    // every x > 20 into 20 and is observably wrong.
     with_gpu(|rt| {
         rt.set_relaxed_precision(true);
-        // Interior-only and edge-only shapes; f32 and both bf16 tile geometries.
-        for &(m, n, k) in &[(128usize, 64usize, 64usize), (37, 45, 64)] {
-            let c_h: Vec<f32> = (0..m * n).map(|i| PROBES[i % PROBES.len()]).collect();
-            let want: Vec<f32> = c_h.iter().map(|&v| gelu_pytorch_tanh(v as f64) as f32).collect();
-            let epi = Epilogue {
-                beta: 1.0,
+        let (m, n, k) = (128usize, 64usize, 64usize);
+        let input = 20.5f32;
+        let a = tensor(rt, &[m, k], &vec![1.0; m * k]);
+        // 0.3203125 is exact in binary; 64 equal products sum to 20.5.
+        let b = tensor(rt, &[k, n], &vec![0.3203125; k * n]);
+        let c = tensor(rt, &[m, n], &vec![0.0; m * n]);
+
+        gemm_epilogue(
+            &a,
+            &b,
+            &c,
+            GemmBackend::TensorOps,
+            Epilogue {
                 activation: Activation::GeluTanh,
-                ..Epilogue::default()
-            };
+                ..Default::default()
+            },
+        )
+        .expect("GELU epilogue");
+        rt.synchronize().expect("synchronize");
 
-            let a = tensor(rt, &[m, k], &vec![0.0f32; m * k]);
-            let b = tensor(rt, &[k, n], &vec![0.0f32; k * n]);
-            let c = tensor(rt, &[m, n], &c_h);
-            gemm_epilogue(&a, &b, &c, GemmBackend::TensorOps, epi).expect("f32 gelu epilogue");
-            rt.synchronize().unwrap();
-            close_rel(
-                &format!("f32 {m}x{n}x{k} gelu"),
-                &c.buffer.read_f32()[..m * n],
-                &want,
-                1e-4,
-            );
-
-            let a16 = tensor_bf16(rt, &[m, k], &vec![0.0f32; m * k]);
-            let b16 = tensor_bf16(rt, &[k, n], &vec![0.0f32; k * n]);
-            for tile in [EpiTile::Wide, EpiTile::Narrow] {
-                let c = tensor(rt, &[m, n], &c_h);
-                gemm_epilogue_tiled(&a16, &b16, &c, GemmBackend::TensorOps, epi, tile).expect("bf16 gelu epilogue");
-                rt.synchronize().unwrap();
-                close_rel(
-                    &format!("bf16 {tile:?} {m}x{n}x{k} gelu"),
-                    &c.buffer.read_f32()[..m * n],
-                    &want,
-                    1e-4,
-                );
-            }
-        }
+        close(
+            "GELU asymptotic identity above 20",
+            &c.buffer.read_f32()[..m * n],
+            &vec![input; m * n],
+            tol(k),
+        );
     });
 }
 
@@ -338,12 +336,17 @@ fn an_identity_epilogue_equals_a_plain_gemm_bit_for_bit() {
         let plain = tensor(rt, &[m, n], &vec![0.0f32; m * n]);
         gemm(&a, &b, &plain, GemmBackend::TensorOps).expect("gemm");
         let fused = tensor(rt, &[m, n], &vec![0.0f32; m * n]);
-        gemm_epilogue(&a, &b, &fused, GemmBackend::TensorOps, Epilogue::default()).expect("gemm_epilogue");
+        gemm_epilogue(&a, &b, &fused, GemmBackend::TensorOps, Epilogue::default())
+            .expect("gemm_epilogue");
         rt.synchronize().unwrap();
 
         let (p, f) = (plain.buffer.read_f32(), fused.buffer.read_f32());
         for i in 0..m * n {
-            assert_eq!(p[i].to_bits(), f[i].to_bits(), "identity epilogue differs at {i}");
+            assert_eq!(
+                p[i].to_bits(),
+                f[i].to_bits(),
+                "identity epilogue differs at {i}"
+            );
         }
     });
 }
@@ -361,12 +364,14 @@ fn the_epilogue_refuses_paths_with_nothing_to_fuse_into() {
         };
 
         // Simdgroup writes C straight from the matmul: no register accumulator.
-        let err = gemm_epilogue(&a, &b, &c, GemmBackend::Simdgroup, epi).expect_err("simdgroup has nowhere to fuse");
+        let err = gemm_epilogue(&a, &b, &c, GemmBackend::Simdgroup, epi)
+            .expect_err("simdgroup has nowhere to fuse");
         assert!(err.contains("cooperative-destination"), "{err}");
 
         // Exact f32 TensorOps likewise.
         rt.set_relaxed_precision(false);
-        let err = gemm_epilogue(&a, &b, &c, GemmBackend::TensorOps, epi).expect_err("exact f32 has nowhere to fuse");
+        let err = gemm_epilogue(&a, &b, &c, GemmBackend::TensorOps, epi)
+            .expect_err("exact f32 has nowhere to fuse");
         assert!(err.contains("cooperative-destination"), "{err}");
     });
 }
@@ -410,110 +415,26 @@ fn a_short_bias_is_refused() {
     });
 }
 
-/// The 64×64 bf16 epilogue against the 128×64 epilogue, on the same operands.
-///
-/// Bound is [`tol`], the same one [`fused_epilogue_matches_the_unfused_sequence`]
-/// uses against the unfused sequence. Qwen3.5-2B's output projection is
-/// K = 8×256 and N = 2048; M = 61 does not fill a 128-row tile and M = 200 does.
 #[test]
-fn narrow_bf16_epilogue_matches_wide_within_unfused_tolerance() {
+fn a_bias_view_overlapping_the_output_is_refused() {
     with_gpu(|rt| {
-        // (m, n, k, full epilogue). The residual-add cases are `project_residual`
-        // (beta = 1). The last case is not a tile multiple, so both geometries
-        // take the bounds-checked edge path, and it runs bias plus SiLU.
-        let cases = [
-            (61usize, 2048usize, 2048usize, false),
-            (200, 2048, 2048, false),
-            (37, 70, 96, true),
-        ];
-        for (i, &(m, n, k, full)) in cases.iter().enumerate() {
-            let a_h = random_f32(m * k, 0xE100 + i as u64);
-            let b_h = random_f32(k * n, 0xE200 + i as u64);
-            let c_h = random_f32(m * n, 0xE300 + i as u64);
-            let bias_h = random_f32(n, 0xE400 + i as u64);
-            let a = tensor_bf16(rt, &[m, k], &a_h);
-            let b = tensor_bf16(rt, &[k, n], &b_h);
-            let bias = tensor(rt, &[n], &bias_h);
-            let wide = tensor(rt, &[m, n], &c_h);
-            let narrow = tensor(rt, &[m, n], &c_h);
-            gemm_epilogue_tiled(
-                &a,
-                &b,
-                &wide,
-                GemmBackend::TensorOps,
-                residual_or_silu(full, &bias),
-                EpiTile::Wide,
-            )
-            .expect("wide epilogue");
-            gemm_epilogue_tiled(
-                &a,
-                &b,
-                &narrow,
-                GemmBackend::TensorOps,
-                residual_or_silu(full, &bias),
-                EpiTile::Narrow,
-            )
-            .expect("narrow epilogue");
-            rt.synchronize().unwrap();
-
-            let wide_out = wide.buffer.read_f32();
-            let narrow_out = narrow.buffer.read_f32();
-            assert!(
-                wide_out[..m * n].iter().any(|v| v.abs() > 1e-3),
-                "{m}x{n}x{k}: wide epilogue wrote nothing"
-            );
-            let mut worst = 0.0f32;
-            let mut bits_differ = 0usize;
-            for (g, w) in narrow_out[..m * n].iter().zip(wide_out[..m * n].iter()) {
-                worst = worst.max((g - w).abs());
-                if g.to_bits() != w.to_bits() {
-                    bits_differ += 1;
-                }
-            }
-            println!(
-                "{m}x{n}x{k}: worst |narrow-wide| = {worst:.6e} tol {:.6e} bits_differ {bits_differ}/{}",
-                tol(k),
-                m * n
-            );
-            close(
-                &format!("64x64 vs 128x64 {m}x{n}x{k}"),
-                &narrow_out[..m * n],
-                &wide_out[..m * n],
-                tol(k),
-            );
-
-            // The automatic selector must launch the tile this test just compared.
-            let auto = tensor(rt, &[m, n], &c_h);
-            gemm_epilogue(&a, &b, &auto, GemmBackend::TensorOps, residual_or_silu(full, &bias)).expect("auto epilogue");
-            rt.synchronize().unwrap();
-            let auto_out = auto.buffer.read_f32();
-            let followed = if m < 128 { &narrow_out } else { &wide_out };
-            for (j, (got, want)) in auto_out[..m * n].iter().zip(followed[..m * n].iter()).enumerate() {
-                assert_eq!(
-                    got.to_bits(),
-                    want.to_bits(),
-                    "{m}x{n}x{k}: auto epilogue diverged from the selected tile at {j}"
-                );
-            }
-        }
-
         rt.set_relaxed_precision(true);
-        let (m, n, k) = (32usize, 32usize, 32usize);
-        let a = tensor(rt, &[m, k], &vec![1.0f32; m * k]);
-        let b = tensor(rt, &[k, n], &vec![1.0f32; k * n]);
-        let c = tensor(rt, &[m, n], &vec![0.0f32; m * n]);
-        let err = gemm_epilogue_tiled(
+        let a = tensor(rt, &[1, 1], &[2.0]);
+        let b = tensor(rt, &[1, 1], &[3.0]);
+        let c_and_bias = tensor(rt, &[1, 1], &[4.0]);
+        let err = gemm_epilogue(
             &a,
             &b,
-            &c,
+            &c_and_bias,
             GemmBackend::TensorOps,
             Epilogue {
-                beta: 1.0,
-                ..Epilogue::default()
+                alpha: 1.0,
+                beta: 0.0,
+                bias: Some(&c_and_bias),
+                activation: Activation::None,
             },
-            EpiTile::Narrow,
         )
-        .expect_err("f32 has no 64x64 epilogue");
-        assert!(err.contains("bf16"), "{err}");
+        .expect_err("bias must not alias the output");
+        assert!(err.contains("bias overlaps output"), "{err}");
     });
 }

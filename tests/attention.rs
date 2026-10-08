@@ -21,7 +21,6 @@ mod common;
 use common::{buf, empty, random_f32, seeded, with_gpu};
 use std::sync::Arc;
 use tessl::nn::{self, AttnDims, AttnHeadDim};
-use tessl::qwen35;
 use tessl::tensor::GpuBuffer;
 use tessl::GpuRuntime;
 
@@ -49,7 +48,14 @@ fn reference(
     kv_off: usize,
     scale: f32,
 ) -> Vec<f32> {
-    let Shape { b, tq, tkv, h, hkv, d } = s;
+    let Shape {
+        b,
+        tq,
+        tkv,
+        h,
+        hkv,
+        d,
+    } = s;
     let group = (h / hkv).max(1);
     let mut out = vec![0.0f32; b * tq * h * d];
     for bi in 0..b {
@@ -70,7 +76,9 @@ fn reference(
                         continue;
                     }
                     let k_base = ((bi * tkv + t_k) * hkv + hk) * d;
-                    let dot: f64 = (0..d).map(|x| q[q_base + x] as f64 * k[k_base + x] as f64).sum();
+                    let dot: f64 = (0..d)
+                        .map(|x| q[q_base + x] as f64 * k[k_base + x] as f64)
+                        .sum();
                     *sc = dot * scale as f64;
                 }
 
@@ -144,7 +152,8 @@ fn exact_comparison_rejects_one_sided_nan_and_length_mismatch() {
         "a one-sided NaN must not compare equal"
     );
     assert!(
-        std::panic::catch_unwind(|| assert_same_finite_bits("length", &[1.0, 2.0], &[1.0])).is_err(),
+        std::panic::catch_unwind(|| assert_same_finite_bits("length", &[1.0, 2.0], &[1.0]))
+            .is_err(),
         "a trailing output must not be ignored"
     );
 }
@@ -191,7 +200,16 @@ fn run_swa(
     .unwrap();
     rt.synchronize().unwrap();
 
-    let want = reference(&q, &k, &v, s, Some(window), q_off as usize, kv_off as usize, scale);
+    let want = reference(
+        &q,
+        &k,
+        &v,
+        s,
+        Some(window),
+        q_off as usize,
+        kv_off as usize,
+        scale,
+    );
     (ob.read_f32()[..want.len()].to_vec(), want)
 }
 
@@ -237,7 +255,11 @@ fn run_decode(
     // output dim and how many chunks each folds, and 32 (one simdgroup, the
     // old fixed width) has to keep working alongside the wide default.
     for lanes in [nn::RowsLanes::R8, nn::RowsLanes::R16, nn::RowsLanes::R32] {
-        for chunk in [nn::DecodeChunk::C64, nn::DecodeChunk::C128, nn::DecodeChunk::C256] {
+        for chunk in [
+            nn::DecodeChunk::C64,
+            nn::DecodeChunk::C128,
+            nn::DecodeChunk::C256,
+        ] {
             for reduce_w in [None, Some(32), Some(64), Some(1024)] {
                 // Head-block width is a dispatch parameter too, and it decides
                 // which query head each simdgroup owns and how grid.y decodes
@@ -252,12 +274,21 @@ fn run_decode(
                 ] {
                     let probe = seeded(rt, s.b * s.tq * s.h * s.d, UNWRITTEN);
                     nn::flash_attn_decode_with_chunk(
-                        rt, &qb, &kb, &vb, &probe, &tkv, &qo, &ko, dims, s.d as u32, s.tkv, chunk, lanes, reduce_w,
-                        sgs, false,
+                        rt, &qb, &kb, &vb, &probe, &tkv, &qo, &ko, dims, s.d as u32, s.tkv, chunk,
+                        lanes, reduce_w, sgs, false,
                     )
                     .unwrap();
                     rt.synchronize().unwrap();
-                    let want = reference(&q, &k, &v, s, window, q_off as usize, kv_off as usize, scale);
+                    let want = reference(
+                        &q,
+                        &k,
+                        &v,
+                        s,
+                        window,
+                        q_off as usize,
+                        kv_off as usize,
+                        scale,
+                    );
                     let got = probe.read_f32()[..want.len()].to_vec();
                     check(
                         &format!(
@@ -286,14 +317,30 @@ fn run_decode(
             nn::flash_attn_swa_tiled(rt, hd, &qb, &kb, &vb, &o_gen, &tkv, &qo, &ko, dims).unwrap();
         }
         None => {
-            nn::flash_attn_global_h512_tiled(rt, &qb, &kb, &vb, &o_gen, &tkv, &qo, &ko, dims, false).unwrap();
+            nn::flash_attn_global_h512_tiled(
+                rt, &qb, &kb, &vb, &o_gen, &tkv, &qo, &ko, dims, false,
+            )
+            .unwrap();
         }
     }
     rt.synchronize().unwrap();
 
-    let want = reference(&q, &k, &v, s, window, q_off as usize, kv_off as usize, scale);
+    let want = reference(
+        &q,
+        &k,
+        &v,
+        s,
+        window,
+        q_off as usize,
+        kv_off as usize,
+        scale,
+    );
     let n = want.len();
-    (o_dec.read_f32()[..n].to_vec(), o_gen.read_f32()[..n].to_vec(), want)
+    (
+        o_dec.read_f32()[..n].to_vec(),
+        o_gen.read_f32()[..n].to_vec(),
+        want,
+    )
 }
 
 /// Run the row-parallel path and the tiled kernel on identical inputs.
@@ -341,14 +388,30 @@ fn run_rows(
             nn::flash_attn_swa_tiled(rt, hd, &qb, &kb, &vb, &o_gen, &tkv, &qo, &ko, dims).unwrap();
         }
         None => {
-            nn::flash_attn_global_h512_tiled(rt, &qb, &kb, &vb, &o_gen, &tkv, &qo, &ko, dims, false).unwrap();
+            nn::flash_attn_global_h512_tiled(
+                rt, &qb, &kb, &vb, &o_gen, &tkv, &qo, &ko, dims, false,
+            )
+            .unwrap();
         }
     }
     rt.synchronize().unwrap();
 
-    let want = reference(&q, &k, &v, s, window, q_off as usize, kv_off as usize, scale);
+    let want = reference(
+        &q,
+        &k,
+        &v,
+        s,
+        window,
+        q_off as usize,
+        kv_off as usize,
+        scale,
+    );
     let n = want.len();
-    (o_rows.read_f32()[..n].to_vec(), o_gen.read_f32()[..n].to_vec(), want)
+    (
+        o_rows.read_f32()[..n].to_vec(),
+        o_gen.read_f32()[..n].to_vec(),
+        want,
+    )
 }
 
 /// Every (D, R, SGT) the host can ask for must be instantiated in the shader.
@@ -372,15 +435,14 @@ fn every_rows_kernel_the_host_can_ask_for_exists() {
                     lanes.width(),
                     groups.count()
                 );
-                assert!(src.contains(&want), "flash_attn_rows.metal is missing {want}");
+                assert!(
+                    src.contains(&want),
+                    "flash_attn_rows.metal is missing {want}"
+                );
                 n += 1;
             }
         }
     }
-    assert!(
-        src.contains("ROWS_KERNEL(flash_attn_rows_h64_r8_g8, 64, 8, 8)"),
-        "flash_attn_rows.metal is missing the D=64 R=8 SGT=8 instantiation"
-    );
     assert_eq!(n, 27, "the (D, R, SGT) grid changed shape");
     // A threadgroup is SGT simdgroups of 32 threads and Metal caps that at
     // 1024, so the largest value in the enum is also the largest that can be
@@ -519,7 +581,8 @@ fn rows_matches_the_reference_and_the_tiled_kernel() {
         for lanes in [nn::RowsLanes::R8, nn::RowsLanes::R16, nn::RowsLanes::R32] {
             for groups in [nn::RowsGroups::G8, nn::RowsGroups::G16, nn::RowsGroups::G32] {
                 for (i, &(s, window)) in cases.iter().enumerate() {
-                    let (rows, gen, want) = run_rows(rt, s, window, 0, 0, 0.125, 0x4000 + i as u64, lanes, groups);
+                    let (rows, gen, want) =
+                        run_rows(rt, s, window, 0, 0, 0.125, 0x4000 + i as u64, lanes, groups);
                     check(
                         &format!(
                             "rows[{i}] r={} g={} Tq={} d={} w={window:?}",
@@ -531,7 +594,11 @@ fn rows_matches_the_reference_and_the_tiled_kernel() {
                         &rows,
                         &want,
                     );
-                    check(&format!("tiled[{i}] Tq={} d={} w={window:?}", s.tq, s.d), &gen, &want);
+                    check(
+                        &format!("tiled[{i}] Tq={} d={} w={window:?}", s.tq, s.d),
+                        &gen,
+                        &want,
+                    );
                 }
             }
         }
@@ -553,7 +620,8 @@ fn rows_honours_position_offsets_and_masks_to_zero() {
         };
         for lanes in [nn::RowsLanes::R8, nn::RowsLanes::R16, nn::RowsLanes::R32] {
             for groups in [nn::RowsGroups::G8, nn::RowsGroups::G16, nn::RowsGroups::G32] {
-                let (rows, gen, want) = run_rows(rt, s, Some(8), 36, 0, 0.125, 0x5001, lanes, groups);
+                let (rows, gen, want) =
+                    run_rows(rt, s, Some(8), 36, 0, 0.125, 0x5001, lanes, groups);
                 check(
                     &format!("rows offset r={} g={}", lanes.width(), groups.count()),
                     &rows,
@@ -562,7 +630,8 @@ fn rows_honours_position_offsets_and_masks_to_zero() {
                 check("tiled offset", &gen, &want);
 
                 // Every key past the query position: the whole output is zeros.
-                let (rows, _, _) = run_rows(rt, s, Some(1024), 0, 5000, 0.125, 0x5002, lanes, groups);
+                let (rows, _, _) =
+                    run_rows(rt, s, Some(1024), 0, 5000, 0.125, 0x5002, lanes, groups);
                 for (i, v) in rows.iter().enumerate() {
                     assert!(v.is_finite(), "rows[{i}] r={} is {v}", lanes.width());
                     assert_eq!(*v, 0.0, "rows[{i}] r={} = {v}, want 0", lanes.width());
@@ -622,19 +691,46 @@ fn zero_live_kv_overwrites_every_tiled_and_routed_output() {
             );
             // Call that routed implementation explicitly so a benchmark's
             // process-wide TESSL_ATTN_TILED override cannot change this test.
-            nn::flash_attn_rows(rt, &q, &k, &v, &rows, &tkv, &q_off, &kv_off, dims, d as u32, false).unwrap();
+            nn::flash_attn_rows(
+                rt, &q, &k, &v, &rows, &tkv, &q_off, &kv_off, dims, d as u32, false,
+            )
+            .unwrap();
             match d {
                 128 => {
-                    nn::flash_attn_swa_tiled(rt, AttnHeadDim::D128, &q, &k, &v, &tiled, &tkv, &q_off, &kv_off, dims)
-                        .unwrap();
+                    nn::flash_attn_swa_tiled(
+                        rt,
+                        AttnHeadDim::D128,
+                        &q,
+                        &k,
+                        &v,
+                        &tiled,
+                        &tkv,
+                        &q_off,
+                        &kv_off,
+                        dims,
+                    )
+                    .unwrap();
                 }
                 256 => {
-                    nn::flash_attn_swa_tiled(rt, AttnHeadDim::D256, &q, &k, &v, &tiled, &tkv, &q_off, &kv_off, dims)
-                        .unwrap();
+                    nn::flash_attn_swa_tiled(
+                        rt,
+                        AttnHeadDim::D256,
+                        &q,
+                        &k,
+                        &v,
+                        &tiled,
+                        &tkv,
+                        &q_off,
+                        &kv_off,
+                        dims,
+                    )
+                    .unwrap();
                 }
                 512 => {
-                    nn::flash_attn_global_h512_tiled(rt, &q, &k, &v, &tiled, &tkv, &q_off, &kv_off, dims, false)
-                        .unwrap();
+                    nn::flash_attn_global_h512_tiled(
+                        rt, &q, &k, &v, &tiled, &tkv, &q_off, &kv_off, dims, false,
+                    )
+                    .unwrap();
                     nn::flash_attn_global_h512_tiled(
                         rt,
                         &q,
@@ -697,7 +793,10 @@ fn fast_paths_survive_extreme_score_magnitudes() {
                     hkv: 2,
                     d,
                 };
-                let q: Vec<f32> = random_f32(s.b * s.h * d, 0x9001).iter().map(|x| x * qs).collect();
+                let q: Vec<f32> = random_f32(s.b * s.h * d, 0x9001)
+                    .iter()
+                    .map(|x| x * qs)
+                    .collect();
                 let k: Vec<f32> = random_f32(s.b * tkv * s.hkv * d, 0x9002)
                     .iter()
                     .map(|x| x.abs() * ks)
@@ -717,8 +816,14 @@ fn fast_paths_survive_extreme_score_magnitudes() {
                     window: 0,
                     scale,
                 };
-                nn::flash_attn_decode(rt, &qb, &kb, &vb, &o_dec, &tkvb, &qo, &ko, dims, d as u32, tkv, false).unwrap();
-                nn::flash_attn_rows(rt, &qb, &kb, &vb, &o_rows, &tkvb, &qo, &ko, dims, d as u32, false).unwrap();
+                nn::flash_attn_decode(
+                    rt, &qb, &kb, &vb, &o_dec, &tkvb, &qo, &ko, dims, d as u32, tkv, false,
+                )
+                .unwrap();
+                nn::flash_attn_rows(
+                    rt, &qb, &kb, &vb, &o_rows, &tkvb, &qo, &ko, dims, d as u32, false,
+                )
+                .unwrap();
                 rt.synchronize().unwrap();
                 let want = reference(&q, &k, &v, s, None, tkv - 1, 0, scale);
                 let got_d = o_dec.read_f32()[..want.len()].to_vec();
@@ -778,11 +883,18 @@ fn decode_is_immune_to_a_recycled_scratch() {
                     window: 0,
                     scale: 0.125,
                 };
-                nn::flash_attn_decode(rt, &qb, &kb, &vb, &ob, &tkvb, &qo, &ko, dims, d as u32, tkv, false).unwrap();
+                nn::flash_attn_decode(
+                    rt, &qb, &kb, &vb, &ob, &tkvb, &qo, &ko, dims, d as u32, tkv, false,
+                )
+                .unwrap();
                 rt.synchronize().unwrap();
                 let want = reference(&q, &k, &v, s, None, tkv - 1, 0, 0.125);
                 let got = ob.read_f32()[..want.len()].to_vec();
-                check(&format!("recycled scratch pass={pass} tkv={tkv}"), &got, &want);
+                check(
+                    &format!("recycled scratch pass={pass} tkv={tkv}"),
+                    &got,
+                    &want,
+                );
                 if tkv == 257 {
                     if let Some(p) = &prev {
                         assert_eq!(p, &got, "same inputs gave different results across passes");
@@ -825,9 +937,15 @@ fn fast_paths_write_bf16_output_within_bf16_resolution() {
                 scale: 0.125,
             };
             if tq == 1 {
-                nn::flash_attn_decode(rt, &qb, &kb, &vb, &o_bf, &tkvb, &qo, &ko, dims, d as u32, tkv, true).unwrap();
+                nn::flash_attn_decode(
+                    rt, &qb, &kb, &vb, &o_bf, &tkvb, &qo, &ko, dims, d as u32, tkv, true,
+                )
+                .unwrap();
             } else {
-                nn::flash_attn_rows(rt, &qb, &kb, &vb, &o_bf, &tkvb, &qo, &ko, dims, d as u32, true).unwrap();
+                nn::flash_attn_rows(
+                    rt, &qb, &kb, &vb, &o_bf, &tkvb, &qo, &ko, dims, d as u32, true,
+                )
+                .unwrap();
             }
             rt.synchronize().unwrap();
             let want = reference(&q, &k, &v, s, None, 0, 0, 0.125);
@@ -845,7 +963,10 @@ fn fast_paths_write_bf16_output_within_bf16_resolution() {
                 assert!(got.is_finite(), "bf16 d={d}[{i}] non-finite");
                 // bf16 carries 8 significand bits.
                 let tol = 8e-3 * w.abs().max(1e-2);
-                assert!((got - w).abs() <= tol, "bf16 d={d}[{i}]: got {got} want {w}");
+                assert!(
+                    (got - w).abs() <= tol,
+                    "bf16 d={d}[{i}]: got {got} want {w}"
+                );
             }
         }
     });
@@ -961,43 +1082,6 @@ fn every_attention_shader_binds_and_applies_the_fixed_kv_capacity() {
     }
 }
 
-#[test]
-fn flash_attn_refuses_output_aliased_with_live_scalars() {
-    with_gpu(|rt| {
-        let q = empty(rt, 128);
-        let k = empty(rt, 128);
-        let v = empty(rt, 128);
-        let o = empty(rt, 128);
-        let dims = AttnDims {
-            batch: 1,
-            tq: 1,
-            heads: 1,
-            heads_kv: 1,
-            window: 16,
-            scale: 0.125,
-        };
-        let scalar = u32_buf(rt, 0);
-        assert!(nn::validate_attn_output_scalar_aliases(&dims, &o, &[("tkv", &scalar)]).is_ok());
-        let alias_err = nn::validate_attn_output_scalar_aliases(&dims, &o, &[("tkv", &o)])
-            .expect_err("aliased output/scalar must be refused");
-        assert!(alias_err.contains("output must not alias live"), "{alias_err}");
-
-        let err = nn::flash_attn_swa(rt, AttnHeadDim::D128, &q, &k, &v, &o, &o, &scalar, &scalar, dims)
-            .expect_err("flash_attn_swa must refuse o/tkv alias");
-        assert!(
-            err.contains("output must not alias live"),
-            "expected live-scalar refusal, got {err}"
-        );
-        assert_eq!(rt.take_dispatch_count(), 0);
-
-        let no_work = AttnDims { tq: 0, ..dims };
-        assert!(
-            nn::validate_attn_output_scalar_aliases(&no_work, &o, &[("tkv", &o)]).is_ok(),
-            "zero-work attention must accept placeholder scalar aliases"
-        );
-    });
-}
-
 /// Storage/alias validation is host-only: no pipeline lookup or dispatch is
 /// needed to prove the f32 in-place exception and reject unsafe writers.
 #[test]
@@ -1016,7 +1100,10 @@ fn attention_storage_validation_rejects_unsafe_aliases_without_dispatch() {
             scale: 1.0,
         };
 
-        assert_eq!(nn::validate_attn_storage(&dims, 128, &q, &k, &v, &o, false).unwrap(), 1);
+        assert_eq!(
+            nn::validate_attn_storage(&dims, 128, &q, &k, &v, &o, false).unwrap(),
+            1
+        );
         assert!(
             nn::validate_attn_storage(&dims, 128, &q, &k, &v, &q, false).is_ok(),
             "f32 Q/O in-place is safe after each kernel retains its query row"
@@ -1037,7 +1124,10 @@ fn attention_storage_validation_rejects_unsafe_aliases_without_dispatch() {
         let k_wider = empty(rt, 2 * 128);
         let mismatch = nn::validate_attn_storage(&dims, 128, &q, &k_wider, &v, &o, false)
             .expect_err("K/V with different fixed strides must be rejected");
-        assert!(mismatch.contains("different fixed capacities"), "{mismatch}");
+        assert!(
+            mismatch.contains("different fixed capacities"),
+            "{mismatch}"
+        );
 
         let scalar_alias = nn::flash_attn_rows(rt, &q, &k, &v, &o, &o, &o, &o, dims, 128, false)
             .expect_err("output/live-scalar alias must fail before pipeline dispatch");
@@ -1053,9 +1143,14 @@ fn attention_storage_validation_rejects_unsafe_aliases_without_dispatch() {
         let v2 = empty(rt, 2 * 128);
         let tkv = u32_buf(rt, 1);
         let zero = u32_buf(rt, 0);
-        let declared = nn::flash_attn_decode(rt, &q, &k2, &v2, &o, &tkv, &zero, &zero, dims, 128, 1, false)
-            .expect_err("a caller-provided live length must not redefine the fixed batch stride");
-        assert!(declared.contains("does not match the fixed K/V layout"), "{declared}");
+        let declared = nn::flash_attn_decode(
+            rt, &q, &k2, &v2, &o, &tkv, &zero, &zero, dims, 128, 1, false,
+        )
+        .expect_err("a caller-provided live length must not redefine the fixed batch stride");
+        assert!(
+            declared.contains("does not match the fixed K/V layout"),
+            "{declared}"
+        );
     });
 }
 
@@ -1395,7 +1490,8 @@ fn global_h512_bf16_output_matches_the_f32_one_within_bf16_resolution() {
         };
 
         let f32_out = empty(rt, n);
-        nn::flash_attn_global_h512(rt, &qb, &kb, &vb, &f32_out, &tkv, &zero, &zero, dims, false).unwrap();
+        nn::flash_attn_global_h512(rt, &qb, &kb, &vb, &f32_out, &tkv, &zero, &zero, dims, false)
+            .unwrap();
         let bf = rt.alloc_buffer(n * 2).unwrap();
         bf.zero();
         nn::flash_attn_global_h512(rt, &qb, &kb, &vb, &bf, &tkv, &zero, &zero, dims, true).unwrap();
@@ -1492,16 +1588,45 @@ fn kv_batch_stride_is_independent_of_live_tkv() {
         .unwrap();
 
         let rows = empty(rt, B * D);
-        nn::flash_attn_rows(rt, &qb, &kb, &vb, &rows, &tkv, &zero, &zero, dims, D as u32, false).unwrap();
+        nn::flash_attn_rows(
+            rt, &qb, &kb, &vb, &rows, &tkv, &zero, &zero, dims, D as u32, false,
+        )
+        .unwrap();
 
         let tiled = empty(rt, B * D);
-        nn::flash_attn_swa_tiled(rt, AttnHeadDim::D128, &qb, &kb, &vb, &tiled, &tkv, &zero, &zero, dims).unwrap();
+        nn::flash_attn_swa_tiled(
+            rt,
+            AttnHeadDim::D128,
+            &qb,
+            &kb,
+            &vb,
+            &tiled,
+            &tkv,
+            &zero,
+            &zero,
+            dims,
+        )
+        .unwrap();
         rt.synchronize().unwrap();
 
-        let expected: Vec<f32> = std::iter::repeat_n(2.0, D).chain(std::iter::repeat_n(7.0, D)).collect();
-        assert_same_finite_bits("split fixed-capacity batch stride", &split.read_f32(), &expected);
-        assert_same_finite_bits("rows fixed-capacity batch stride", &rows.read_f32(), &expected);
-        assert_same_finite_bits("tiled fixed-capacity batch stride", &tiled.read_f32(), &expected);
+        let expected: Vec<f32> = std::iter::repeat_n(2.0, D)
+            .chain(std::iter::repeat_n(7.0, D))
+            .collect();
+        assert_same_finite_bits(
+            "split fixed-capacity batch stride",
+            &split.read_f32(),
+            &expected,
+        );
+        assert_same_finite_bits(
+            "rows fixed-capacity batch stride",
+            &rows.read_f32(),
+            &expected,
+        );
+        assert_same_finite_bits(
+            "tiled fixed-capacity batch stride",
+            &tiled.read_f32(),
+            &expected,
+        );
     });
 }
 
@@ -1529,7 +1654,10 @@ fn absolute_position_math_widens_before_adding_the_query_row() {
         };
 
         let rows = empty(rt, TQ * D);
-        nn::flash_attn_rows(rt, &q, &k, &v, &rows, &tkv, &max_pos, &max_pos, dims, D as u32, false).unwrap();
+        nn::flash_attn_rows(
+            rt, &q, &k, &v, &rows, &tkv, &max_pos, &max_pos, dims, D as u32, false,
+        )
+        .unwrap();
 
         let tiled = empty(rt, TQ * D);
         nn::flash_attn_swa_tiled(
@@ -1592,7 +1720,19 @@ fn the_routed_path_matches_a_direct_kv_split_dispatch() {
             let qoff = u32_buf(rt, q_off);
 
             let routed = empty(rt, b * h * d);
-            nn::flash_attn_swa(rt, AttnHeadDim::D128, &qb, &kb, &vb, &routed, &tkvb, &qoff, &zero, dims).unwrap();
+            nn::flash_attn_swa(
+                rt,
+                AttnHeadDim::D128,
+                &qb,
+                &kb,
+                &vb,
+                &routed,
+                &tkvb,
+                &qoff,
+                &zero,
+                dims,
+            )
+            .unwrap();
 
             let direct = empty(rt, b * h * d);
             nn::flash_attn_decode_with_chunk(
@@ -1650,7 +1790,11 @@ fn the_head_block_width_always_divides_the_head_count() {
     // Every head of a batch item, up to the 1024-thread threadgroup cap.
     assert_eq!(AllHeads.simdgroups(8, 4), Some(8));
     assert_eq!(AllHeads.simdgroups(32, 4), Some(32));
-    assert_eq!(AllHeads.simdgroups(64, 4), None, "64 simdgroups is 2048 threads");
+    assert_eq!(
+        AllHeads.simdgroups(64, 4),
+        None,
+        "64 simdgroups is 2048 threads"
+    );
 
     // The dispatcher's fallback chain must always terminate: whatever the
     // shape, some policy in [want, Group, One] yields a width.
@@ -1661,7 +1805,10 @@ fn the_head_block_width_always_divides_the_head_count() {
                 .into_iter()
                 .find_map(|p| p.simdgroups(h, group))
                 .expect("the One policy must always divide");
-            assert!((1..=32).contains(&n) && h % n == 0, "H={h} Hkv={hkv} gave sgs={n}");
+            assert!(
+                (1..=32).contains(&n) && h % n == 0,
+                "H={h} Hkv={hkv} gave sgs={n}"
+            );
         }
     }
 }
@@ -1736,193 +1883,4 @@ fn swa_d256_wrapper_owns_the_output_format_slot() {
             &want,
         );
     });
-}
-
-/// Assert every output row the mask leaves empty is exactly zero.
-///
-/// `check` against the reference already demands near-zero there; this is
-/// the stricter rule the kernels promise (`inv_l = 0` on an empty row), and
-/// a NaN from `exp(m - m_new)` on a row that has seen nothing fails it.
-#[track_caller]
-fn assert_empty_rows_zero(label: &str, got: &[f32], s: Shape, empty: impl Fn(usize) -> bool) {
-    for bi in 0..s.b {
-        for t_q in (0..s.tq).filter(|&t| empty(t)) {
-            for hi in 0..s.h {
-                let at = ((bi * s.tq + t_q) * s.h + hi) * s.d;
-                let row = &got[at..][..s.d];
-                assert!(
-                    row.iter().all(|&x| x == 0.0),
-                    "{label}: b={bi} t_q={t_q} h={hi} has no key, want zeros, got {:?}",
-                    &row[..4]
-                );
-            }
-        }
-    }
-}
-
-/// Rows with no key beside rows with keys, in every attention kernel.
-///
-/// The kernels compile with fast math, which may assume no value is infinite,
-/// so a running max seeded with `-INFINITY` and compared against it is not a
-/// guard the compiler has to keep. The case that guard existed for is a row
-/// that has seen nothing yet when a key block arrives: its rescale is
-/// `exp(m_old - m_new)` with nothing to scale. Whole-output masking (every row
-/// empty) is covered above; this puts empty and live rows in the same tile,
-/// simdgroup and key block, so each kernel's block loop, key-group combine and
-/// chunk reduce meets an empty state beside a live one:
-///
-/// * rows, SWA (h128, h256), global h512: keys start at position 5, so query
-///   rows 0..5 of a tile see nothing while rows 5.. see keys.
-/// * decode (every chunk, lane and reduce width `run_decode` sweeps): three
-///   live keys among 600, so most chunks and most key groups are empty.
-/// * Qwen3.5's tiled prefill (every tile): keys at 5.., 40 rows, a padded tail.
-/// * Qwen3.5's shared-prefix rows and decode: a query at position 2 over a
-///   320-key cache (masked keys after live ones, empty chunks, a dead row in
-///   the rows kernel's last simdgroup), and an empty cache (no key anywhere).
-#[test]
-fn rows_with_no_key_beside_rows_with_keys_are_zero_in_every_kernel() {
-    const KV_OFF: u32 = 5;
-    let empty_row = |t: usize| t < KV_OFF as usize;
-    with_gpu(|rt| {
-        for (d, window) in [(128usize, Some(6usize)), (256, Some(6)), (512, None)] {
-            let s = Shape {
-                b: 2,
-                tq: 12,
-                tkv: 12,
-                h: 4,
-                hkv: 2,
-                d,
-            };
-            for lanes in [nn::RowsLanes::R8, nn::RowsLanes::R16, nn::RowsLanes::R32] {
-                for groups in [nn::RowsGroups::G8, nn::RowsGroups::G16, nn::RowsGroups::G32] {
-                    let (rows, tiled, want) = run_rows(rt, s, window, 0, KV_OFF, 0.125, 0x7100, lanes, groups);
-                    let label = format!("d={d} r={} g={}", lanes.width(), groups.count());
-                    check(&format!("rows {label}"), &rows, &want);
-                    check(&format!("tiled {label}"), &tiled, &want);
-                    assert_empty_rows_zero(&format!("rows {label}"), &rows, s, empty_row);
-                    assert_empty_rows_zero(&format!("tiled {label}"), &tiled, s, empty_row);
-                }
-            }
-        }
-
-        for (d, window, q_off) in [(128usize, Some(3usize), 300u32), (256, Some(3), 300), (512, None, 2)] {
-            let s = Shape {
-                b: 1,
-                tq: 1,
-                tkv: 600,
-                h: 4,
-                hkv: 2,
-                d,
-            };
-            let (dec, gen, want) = run_decode(rt, s, window, q_off, 0, 0.125, 0x7200);
-            check(&format!("decode d={d} three live keys"), &dec, &want);
-            check(&format!("general d={d} three live keys"), &gen, &want);
-        }
-
-        let s = Shape {
-            b: 1,
-            tq: 40,
-            tkv: 40,
-            h: 4,
-            hkv: 2,
-            d: 256,
-        };
-        let q = random_f32(s.b * s.tq * s.h * s.d, 0x7300);
-        let k = random_f32(s.b * s.tkv * s.hkv * s.d, 0x7301);
-        let v = random_f32(s.b * s.tkv * s.hkv * s.d, 0x7302);
-        let (qb, kb, vb) = (buf(rt, &q), buf(rt, &k), buf(rt, &v));
-        let (tkv, zero, ko) = (u32_buf(rt, s.tkv as u32), u32_buf(rt, 0), u32_buf(rt, KV_OFF));
-        let dims = AttnDims {
-            batch: s.b as u32,
-            tq: s.tq as u32,
-            heads: s.h as u32,
-            heads_kv: s.hkv as u32,
-            window: 0,
-            scale: 0.125,
-        };
-        let want = reference(&q, &k, &v, s, None, 0, KV_OFF as usize, 0.125);
-        for tile in qwen35::AttnTile::ALL {
-            let ob = seeded(rt, s.b * s.tq * s.h * s.d, UNWRITTEN);
-            qwen35::attn_prefill_with_tile(rt, &qb, &kb, &vb, &ob, &tkv, &zero, &ko, dims, false, tile).unwrap();
-            rt.synchronize().unwrap();
-            let got = ob.read_f32();
-            check(&format!("qwen35 tiled {tile:?}"), &got, &want);
-            assert_empty_rows_zero(&format!("qwen35 tiled {tile:?}"), &got, s, empty_row);
-        }
-
-        prefix_attention_with_masked_keys(rt, 300, 20, 2);
-        prefix_attention_with_masked_keys(rt, 0, 0, 0);
-    });
-}
-
-/// Qwen3.5's shared-prefix rows and decode kernels with a prefix of `p` keys,
-/// `suffix_len` live suffix keys per row and queries from `q_pos`, against the
-/// f64 reference over each row's concatenated cache `prefix ‖ suffix_b`.
-fn prefix_attention_with_masked_keys(rt: &Arc<GpuRuntime>, p: usize, suffix_len: usize, q_pos: u32) {
-    const D: usize = 256;
-    const SUFFIX_CAP: usize = 24;
-    let (b, h, hkv) = (2usize, 4usize, 2usize);
-    let p_cap = p.max(1);
-    let tkv = p + suffix_len;
-    let pk = random_f32(p_cap * hkv * D, 0x7400 + p as u64);
-    let pv = random_f32(p_cap * hkv * D, 0x7401 + p as u64);
-    let sk = random_f32(b * SUFFIX_CAP * hkv * D, 0x7402);
-    let sv = random_f32(b * SUFFIX_CAP * hkv * D, 0x7403);
-    let concat = |prefix: &[f32], suffix: &[f32]| {
-        let mut out = Vec::with_capacity(b * tkv * hkv * D);
-        for bi in 0..b {
-            out.extend_from_slice(&prefix[..p * hkv * D]);
-            out.extend_from_slice(&suffix[bi * SUFFIX_CAP * hkv * D..][..suffix_len * hkv * D]);
-        }
-        out
-    };
-    let (kc, vc) = (concat(&pk, &sk), concat(&pv, &sv));
-    let (pkb, pvb, skb, svb) = (buf(rt, &pk), buf(rt, &pv), buf(rt, &sk), buf(rt, &sv));
-    let prefix = qwen35::SharedPrefix {
-        k: &pkb,
-        v: &pvb,
-        len: p as u32,
-    };
-    let (slen, qo) = (u32_buf(rt, suffix_len as u32), u32_buf(rt, q_pos));
-    for tq in [3usize, 1] {
-        let s = Shape {
-            b,
-            tq,
-            tkv,
-            h,
-            hkv,
-            d: D,
-        };
-        let q = random_f32(b * tq * h * D, 0x7404 + tq as u64);
-        let qb = buf(rt, &q);
-        let dims = AttnDims {
-            batch: b as u32,
-            tq: tq as u32,
-            heads: h as u32,
-            heads_kv: hkv as u32,
-            window: 0,
-            scale: 0.125,
-        };
-        let want = reference(&q, &kc, &vc, s, None, q_pos as usize, 0, 0.125);
-        let ob = seeded(rt, b * tq * h * D, UNWRITTEN);
-        qwen35::attn_prefix_rows(rt, &qb, prefix, &skb, &svb, &slen, &qo, &ob, dims, false).unwrap();
-        rt.synchronize().unwrap();
-        let label = format!("prefix rows P={p} S={suffix_len} q={q_pos} tq={tq}");
-        let got = ob.read_f32();
-        check(&label, &got, &want);
-        if tkv == 0 {
-            assert_empty_rows_zero(&label, &got, s, |_| true);
-        }
-        if tq == 1 {
-            let ob = seeded(rt, b * h * D, UNWRITTEN);
-            qwen35::attn_prefix_decode(rt, &qb, prefix, &skb, &svb, &slen, &qo, &ob, dims, false).unwrap();
-            rt.synchronize().unwrap();
-            let label = format!("prefix decode P={p} S={suffix_len} q={q_pos}");
-            let got = ob.read_f32();
-            check(&label, &got, &want);
-            if tkv == 0 {
-                assert_empty_rows_zero(&label, &got, s, |_| true);
-            }
-        }
-    }
 }

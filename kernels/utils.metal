@@ -52,25 +52,6 @@ kernel void zero_f32(
     x[gid] = 0.0f;
 }
 
-/// out[i] = ((S[0][i] + S[1][i]) + S[2][i]) + ... over `partitions` slices
-/// of `n` floats, `slice` floats apart (`slice >= n`), in slice order, so
-/// the sum does not depend on how the slices were produced or scheduled.
-kernel void reduce_partitions_f32(
-    device const float *S [[buffer(0)]],
-    device float *out [[buffer(1)]],
-    constant uint &n [[buffer(2)]],
-    constant uint &partitions [[buffer(3)]],
-    constant uint &slice [[buffer(4)]],
-    uint gid [[thread_position_in_grid]])
-{
-    if (gid >= n || partitions == 0u || slice < n) return;
-    float s = S[gid];
-    for (uint p = 1; p < partitions; p++) {
-        s += S[(ulong)p * slice + gid];
-    }
-    out[gid] = s;
-}
-
 kernel void add_inplace_f32(
     device float *dst [[buffer(0)]],
     device const float *src [[buffer(1)]],

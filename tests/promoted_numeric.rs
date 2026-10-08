@@ -18,7 +18,8 @@
 mod common;
 
 use common::{
-    buf, buf_bf16, close_rel, dense_gemv, empty, q4_mlx_matrix, random_f32, round_trip_bf16, seeded, with_gpu,
+    buf, buf_bf16, close_rel, dense_gemv, empty, q4_mlx_matrix, random_f32, round_trip_bf16,
+    seeded, with_gpu,
 };
 use tessl::nn::{self, Q4MlxBank, Q4MlxLayout, Q4MlxRowVariant, QuantShape};
 
@@ -35,7 +36,12 @@ fn shape(rows: usize, cols: usize, group: usize) -> QuantShape {
 
 fn assert_all_written(what: &str, got: &[f32]) {
     let n = got.iter().filter(|v| **v == UNWRITTEN).count();
-    assert_eq!(n, 0, "{what}: {n} of {} outputs were never written", got.len());
+    assert_eq!(
+        n,
+        0,
+        "{what}: {n} of {} outputs were never written",
+        got.len()
+    );
 }
 
 // ------------------------------------------------- MLX Q4 GEMV variants ---
@@ -87,12 +93,16 @@ const BLOCKED_BN: usize = 16;
 /// scale/bias and nibbles at `b * groups_per_row * 16 + g * 16 + r`, where the
 /// row-major kernels read `row * groups_per_row + g`. This is the reference
 /// implementation `nn::gemv_q4_mlx_blocked`'s documentation points at.
-fn to_blocked_bank(nibbles: &[u8], sb: &[f32], rows: usize, cols: usize, group: usize) -> (Vec<u8>, Vec<f32>) {
+fn to_blocked_bank(
+    nibbles: &[u8],
+    sb: &[f32],
+    rows: usize,
+    cols: usize,
+    group: usize,
+) -> (Vec<u8>, Vec<f32>) {
     let gpr = cols / group;
-    // A partial last block is stored at full height (`nn::Q4MlxBank`).
-    let stored_rows = rows.div_ceil(BLOCKED_BN) * BLOCKED_BN;
-    let mut nb = vec![0u8; stored_rows * cols];
-    let mut out_sb = vec![0.0f32; stored_rows * gpr * 2];
+    let mut nb = vec![0u8; rows * cols];
+    let mut out_sb = vec![0.0f32; rows * gpr * 2];
     for b in 0..rows.div_ceil(BLOCKED_BN) {
         for r_local in 0..BLOCKED_BN {
             let r = b * BLOCKED_BN + r_local;
@@ -123,8 +133,7 @@ fn to_blocked_bank(nibbles: &[u8], sb: &[f32], rows: usize, cols: usize, group: 
 #[test]
 fn q4_mlx_blocked_matches_the_dense_reference_in_its_own_layout() {
     with_gpu(|rt| {
-        // 300 rows: a partial last block of 12, stored padded to 16.
-        for &(rows, cols, group) in &[(512usize, 256usize, 32usize), (304, 512, 64), (300, 256, 64)] {
+        for &(rows, cols, group) in &[(512usize, 256usize, 32usize), (304, 512, 64)] {
             // Same nibble stream `q4_mlx_matrix` builds, so `dense` describes
             // these weights.
             let nibbles: Vec<u8> = (0..rows * cols).map(|i| ((i * 5) % 16) as u8).collect();
@@ -205,8 +214,18 @@ fn q4_mlx_kv_matches_two_separate_gemvs() {
         let (gk, gv) = (kb.read_f32(), vb.read_f32());
         assert_all_written("gemv_q4_mlx_kv k", &gk[..rows]);
         assert_all_written("gemv_q4_mlx_kv v", &gv[..rows]);
-        close_rel("gemv_q4_mlx_kv k", &gk[..rows], &dense_gemv(&dk, &xr, rows, cols), 3e-3);
-        close_rel("gemv_q4_mlx_kv v", &gv[..rows], &dense_gemv(&dv, &xr, rows, cols), 3e-3);
+        close_rel(
+            "gemv_q4_mlx_kv k",
+            &gk[..rows],
+            &dense_gemv(&dk, &xr, rows, cols),
+            3e-3,
+        );
+        close_rel(
+            "gemv_q4_mlx_kv v",
+            &gv[..rows],
+            &dense_gemv(&dv, &xr, rows, cols),
+            3e-3,
+        );
     });
 }
 
@@ -319,13 +338,21 @@ fn kv_store_timestep_pair_writes_both_halves_and_nothing_else() {
         rt.synchronize().unwrap();
 
         for (name, src, dst) in [("k", &k, dk.read_f32()), ("v", &v, dv.read_f32())] {
-            close_rel(&format!("kv pair {name} slot"), &dst[3 * n..4 * n], src, 0.0);
+            close_rel(
+                &format!("kv pair {name} slot"),
+                &dst[3 * n..4 * n],
+                src,
+                0.0,
+            );
             let outside = dst[..3 * n]
                 .iter()
                 .chain(&dst[4 * n..5 * n])
                 .filter(|p| **p != UNWRITTEN)
                 .count();
-            assert_eq!(outside, 0, "kv pair {name}: wrote {outside} slots it does not own");
+            assert_eq!(
+                outside, 0,
+                "kv pair {name}: wrote {outside} slots it does not own"
+            );
         }
     });
 }

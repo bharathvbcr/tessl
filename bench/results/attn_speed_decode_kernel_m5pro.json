@@ -1,0 +1,192 @@
+{
+  "rounds": 5,
+  "iters": 20,
+  "warmup": 5,
+  "batched": 32,
+  "cfgs": [
+    "swa128_decode_1k",
+    "swa128_decode_4k",
+    "swa128_decode_b8_4k",
+    "swa128_decode_b32_1k",
+    "swa128_decode_b64_1k",
+    "swa256_decode_4k",
+    "global512_decode_4k",
+    "global512_decode_4k_mha",
+    "global512_decode_4k_mqa"
+  ],
+  "lanes": [
+    "torch-mps",
+    "mlx"
+  ],
+  "tessl_impl": "tessl",
+  "comparisons": [
+    {
+      "lane": "torch-mps",
+      "tessl_impl": "tessl",
+      "geomean_tessl_over_other": 0.2152766503798675,
+      "configs_covered": 9,
+      "configs_requested": 9,
+      "worst_config": "global512_decode_4k_mha",
+      "worst_median": 0.8412308912608416,
+      "best_median": 0.036351083626376866,
+      "per_config": [
+        {
+          "cfg": "swa128_decode_1k",
+          "median": 0.41769735821895315,
+          "min": 0.3059070650121094,
+          "max": 0.5423295842581775,
+          "tessl_median_ms": 0.0406,
+          "other_median_ms": 0.09524153131224011
+        },
+        {
+          "cfg": "swa128_decode_4k",
+          "median": 0.15194092485294117,
+          "min": 0.13276093699478558,
+          "max": 0.15709113426890786,
+          "tessl_median_ms": 0.040772,
+          "other_median_ms": 0.28997459367019474
+        },
+        {
+          "cfg": "swa128_decode_b8_4k",
+          "median": 0.20953370584529804,
+          "min": 0.19989268872298485,
+          "max": 0.22461083057645131,
+          "tessl_median_ms": 0.389602,
+          "other_median_ms": 1.9365390623988787
+        },
+        {
+          "cfg": "swa128_decode_b32_1k",
+          "median": 0.542029191823846,
+          "min": 0.5018455682293439,
+          "max": 0.6158625253571185,
+          "tessl_median_ms": 1.36359,
+          "other_median_ms": 2.5004335936955613
+        },
+        {
+          "cfg": "swa128_decode_b64_1k",
+          "median": 0.5786869041469938,
+          "min": 0.4322165397132729,
+          "max": 0.6218344750953941,
+          "tessl_median_ms": 2.686761,
+          "other_median_ms": 4.6078112030727425
+        },
+        {
+          "cfg": "swa256_decode_4k",
+          "median": 0.15103942136196824,
+          "min": 0.1276348915922998,
+          "max": 0.1778437305961241,
+          "tessl_median_ms": 0.062868,
+          "other_median_ms": 0.3643684999588004
+        },
+        {
+          "cfg": "global512_decode_4k",
+          "median": 0.05154573537843825,
+          "min": 0.046222235602064975,
+          "max": 0.06477250371418339,
+          "tessl_median_ms": 0.228421,
+          "other_median_ms": 4.279990234294928
+        },
+        {
+          "cfg": "global512_decode_4k_mha",
+          "median": 0.8412308912608416,
+          "min": 0.7536072649039538,
+          "max": 0.9148207248373432,
+          "tessl_median_ms": 0.753281,
+          "other_median_ms": 0.8887675780897553
+        },
+        {
+          "cfg": "global512_decode_4k_mqa",
+          "median": 0.036351083626376866,
+          "min": 0.03491863419439197,
+          "max": 0.04440391381076119,
+          "tessl_median_ms": 0.104118,
+          "other_median_ms": 2.864233734271693
+        }
+      ]
+    },
+    {
+      "lane": "mlx",
+      "tessl_impl": "tessl",
+      "geomean_tessl_over_other": 0.9084441037233618,
+      "configs_covered": 9,
+      "configs_requested": 9,
+      "worst_config": "global512_decode_4k_mha",
+      "worst_median": 1.1578901435761222,
+      "best_median": 0.7834493168355343,
+      "per_config": [
+        {
+          "cfg": "swa128_decode_1k",
+          "median": 1.0196675021869062,
+          "min": 0.8152802301343414,
+          "max": 1.2387382581001718,
+          "tessl_median_ms": 0.0406,
+          "other_median_ms": 0.04057226567510952
+        },
+        {
+          "cfg": "swa128_decode_4k",
+          "median": 0.7834493168355343,
+          "min": 0.4895503964349783,
+          "max": 0.8206902358889152,
+          "tessl_median_ms": 0.040772,
+          "other_median_ms": 0.05475975001445477
+        },
+        {
+          "cfg": "swa128_decode_b8_4k",
+          "median": 0.8451245243160204,
+          "min": 0.8197810349681304,
+          "max": 0.9784821624668095,
+          "tessl_median_ms": 0.389602,
+          "other_median_ms": 0.45819465628937905
+        },
+        {
+          "cfg": "swa128_decode_b32_1k",
+          "median": 0.8567373745554413,
+          "min": 0.7716281029803043,
+          "max": 0.9748460677487002,
+          "tessl_median_ms": 1.36359,
+          "other_median_ms": 1.664496078205957
+        },
+        {
+          "cfg": "swa128_decode_b64_1k",
+          "median": 0.8016994654215649,
+          "min": 0.7066855648537274,
+          "max": 0.8743724931244178,
+          "tessl_median_ms": 2.686761,
+          "other_median_ms": 3.268857406283132
+        },
+        {
+          "cfg": "swa256_decode_4k",
+          "median": 0.8997543744911366,
+          "min": 0.8443880846358208,
+          "max": 1.0736987876245982,
+          "tessl_median_ms": 0.062868,
+          "other_median_ms": 0.060796875004598405
+        },
+        {
+          "cfg": "global512_decode_4k",
+          "median": 1.0495190269054933,
+          "min": 0.974899590181884,
+          "max": 1.300923527892762,
+          "tessl_median_ms": 0.228421,
+          "other_median_ms": 0.20024609375468572
+        },
+        {
+          "cfg": "global512_decode_4k_mha",
+          "median": 1.1578901435761222,
+          "min": 1.096735909534531,
+          "max": 1.2663325489698434,
+          "tessl_median_ms": 0.753281,
+          "other_median_ms": 0.6448919218655647
+        },
+        {
+          "cfg": "global512_decode_4k_mqa",
+          "median": 0.831098996638812,
+          "min": 0.6430551884625129,
+          "max": 1.1513767237482315,
+          "tessl_median_ms": 0.104118,
+          "other_median_ms": 0.11976431255789066
+        }
+      ]
+    }
+  ]
+}

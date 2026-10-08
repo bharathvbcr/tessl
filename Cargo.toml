@@ -1,19 +1,19 @@
 [package]
+# Canonical tessl is /Users/bharath/Code/research/tessl. This directory is a vendored copy.
 name = "tessl"
 version = "0.2.0"
 edition = "2021"
 rust-version = "1.82"
 description = "Metal 4 GEMM and encode runtime for Apple silicon, built on Metal Performance Primitives TensorOps"
 repository = "https://github.com/bharathvbcr/tessl"
-documentation = "https://docs.rs/tessl"
-homepage = "https://tessl.vbcr.dev"
 readme = "README.md"
 keywords = ["metal", "gemm", "gpu", "apple-silicon", "bf16"]
 categories = ["science", "hardware-support", "api-bindings"]
 license = "MIT OR Apache-2.0"
-# Exposes `DEP_TESSL_KERNELS` to dependents' build scripts (see build.rs), so a
-# crate that compiles its own metallib can pull tessl's canonical GEMM kernel
-# sources instead of keeping a copy that silently drifts.
+# Exposes `DEP_TESSL_KERNELS` and `DEP_TESSL_METALLIB` to dependents' build
+# scripts (see build.rs). A crate compiling its own metallib can pull tessl's
+# canonical kernel sources instead of keeping a copy that silently drifts;
+# consumers needing tessl's compiled artifact get its immutable OUT_DIR path.
 links = "tessl"
 
 # The repo keeps the full logo exploration — four concepts x three palettes x
@@ -41,18 +41,11 @@ rustdoc-args = ["--cfg", "docsrs"]
 
 [features]
 default = []
-# Host-side MTLTensor helpers (`mtl_tensor`, WWDC26-330): size, allocate, wrap
-# a buffer as, and bind an Int8 MTLTensor. Off by default because nothing in
-# this workspace calls them and no quantized GEMM is built on them
-# (`QUANT_PREFILL_GEMM_WIRED` is false). Quantized TensorOps does not need this
-# module: `nn::gemm_i8_dequant` ships without it. The module's tests run in the
-# CI `gpu` job with this feature on.
+# Quantized MTLTensor prep (WWDC26-330): checked device-tensor allocation,
+# binding, and an explicit readiness report. Off by default because no
+# production host-side quantized prefill path consumes these tensors yet; the
+# old always-error entry point was removed instead of shipping a callable stub.
 quant-prep = []
-
-[lib]
-# `cdylib` builds libtessl.dylib, the C ABI in src/capi.rs that
-# python/tessl_torch loads with ctypes; `rlib` is the Rust library as before.
-crate-type = ["rlib", "cdylib"]
 
 [dependencies]
 objc2 = "0.6"
@@ -72,10 +65,6 @@ objc2-metal = { version = "0.3", features = [
     "MTLResidencySet",
     "MTL4CommandQueue",
     "MTL4CommandBuffer",
-    # MTL4CommandBuffer has no status. GPU faults are reported on
-    # MTL4CommitFeedback::error, registered through MTL4CommitOptions.
-    "MTL4CommitFeedback",
-    "block2",
     "MTL4CommandAllocator",
     "MTL4CommandEncoder",
     "MTL4ComputeCommandEncoder",
@@ -92,16 +81,7 @@ objc2-metal = { version = "0.3", features = [
     "MTL4LibraryFunctionDescriptor",
     # WWDC26-330 prep: native MTLTensor (incl. quantized Int8 today; Int4 when bindings land).
     "MTLTensor",
-    # `MTLDevice::newLibraryWithData_error` takes `dispatch2::DispatchData`.
-    # Verified in objc2-metal 0.3.2 (`newLibraryWithData:error:`, cfg feature
-    # `dispatch2`). `dispatch2` is already in Cargo.lock through this crate.
-    "dispatch2",
 ] }
-# Named so the metallib loader can build a `DispatchData`. Not a new package:
-# objc2-metal 0.3.2 already depends on dispatch2 0.3.1.
-dispatch2 = "0.3"
-# Already the block crate objc2-metal uses for MTL4CommitFeedbackHandler.
-block2 = "0.6"
 libc = "0.2"
 
 [profile.release]
@@ -128,23 +108,3 @@ path = "src/bin/probe_gemm_parity.rs"
 [[bin]]
 name = "bench_nn_kernels"
 path = "src/bin/bench_nn_kernels.rs"
-
-[[bin]]
-name = "bench_qwen35_layers"
-path = "src/bin/bench_qwen35_layers.rs"
-
-[[bin]]
-name = "bench_gemm_epi_tile"
-path = "src/bin/bench_gemm_epi_tile.rs"
-
-[[bin]]
-name = "bench_gemm_coop_tile"
-path = "src/bin/bench_gemm_coop_tile.rs"
-
-[[bin]]
-name = "probe_gdn_scan"
-path = "src/bin/probe_gdn_scan.rs"
-
-[[bin]]
-name = "bench_embedgemma2"
-path = "src/bin/bench_embedgemma2.rs"

@@ -21,7 +21,6 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 fn main() {
-    println!("cargo::rustc-check-cfg=cfg(tessl_embedded_metallib)");
     println!("cargo:rerun-if-env-changed=DEVELOPER_DIR");
     println!("cargo:rerun-if-env-changed=DOCS_RS");
     println!("cargo:rerun-if-env-changed=TESSL_SKIP_AOT");
@@ -84,10 +83,12 @@ fn main() {
             )
         });
         if !prebuilt.is_file() {
-            panic!("TESSL_PREBUILT_METALLIB={} is not a file", prebuilt.display());
+            panic!(
+                "TESSL_PREBUILT_METALLIB={} is not a file",
+                prebuilt.display()
+            );
         }
         println!("cargo:rerun-if-changed={}", prebuilt.display());
-        println!("cargo:rustc-cfg=tessl_embedded_metallib");
         println!("cargo:metallib={}", prebuilt.display());
         println!("cargo:rustc-env=TESSL_METALLIB={}", prebuilt.display());
         return;
@@ -106,31 +107,40 @@ fn main() {
 
     // TensorOps kernels — Metal 4 dialect (macOS 26+ / MPP). Hard-fail: NAX GEMM
     // is the hot path; a simdgroup-only metallib is not acceptable.
-    // The GEMM A/B rig (kernels/tune/) is 50 measurement-only kernels that
+    // The GEMM A/B rig (kernels/tune/) is 34 measurement-only kernels that
     // nothing dispatches at runtime, so it stays opt-in to keep the shipped
     // metallib small. It lives in a subdirectory precisely so the directory
     // glob below cannot pick it up by accident.
-    let want_tune = env::var_os("TESSL_GEMM_TUNE").is_some() || env::var_os("METAL_NATIVE_GEMM_TUNE").is_some();
+    let want_tune =
+        env::var_os("TESSL_GEMM_TUNE").is_some() || env::var_os("METAL_NATIVE_GEMM_TUNE").is_some();
     let mut tensorops_sources: Vec<PathBuf> = vec![kernels_dir.join("matmul_tensorops.metal")];
     if want_tune {
         tensorops_sources.push(kernels_dir.join("tune/matmul_tensorops_tune.metal"));
     }
     for src in &tensorops_sources {
-        let name = src.file_name().and_then(|n| n.to_str()).unwrap_or("<unnamed>");
+        let name = src
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("<unnamed>");
         if !src.exists() {
             panic!(
                 "required TensorOps source missing: {}; Metal 4 / macOS 26 toolchain required",
                 src.display()
             );
         }
-        let air = out_dir.join(format!("{}.air", src.file_stem().unwrap().to_string_lossy()));
-        let mut compile = Command::new(&metal);
-        compile.args(["-std=metal4.0", "-O2", "-fmetal-math-mode=fast"]);
-        if disable_fp_contract(src) {
-            compile.arg("-ffp-contract=off");
-        }
-        let status = compile
-            .args(["-isysroot", &sdk, "-mmacosx-version-min=26.0", "-c"])
+        let air = out_dir.join(format!(
+            "{}.air",
+            src.file_stem().unwrap().to_string_lossy()
+        ));
+        let status = Command::new(&metal)
+            .args([
+                "-std=metal4.0",
+                "-O2",
+                "-isysroot",
+                &sdk,
+                "-mmacosx-version-min=26.0",
+                "-c",
+            ])
             .arg(src)
             .arg("-o")
             .arg(&air)
@@ -154,7 +164,9 @@ fn main() {
         .map(|e| e.path())
         .filter(|p| {
             p.extension().and_then(|s| s.to_str()) == Some("metal")
-                && !skip.iter().any(|s| p.file_name().and_then(|n| n.to_str()) == Some(*s))
+                && !skip
+                    .iter()
+                    .any(|s| p.file_name().and_then(|n| n.to_str()) == Some(*s))
         })
         .collect();
     others.sort();
@@ -186,9 +198,8 @@ fn main() {
         air_files.push(air);
     }
 
-    // Each build owns an immutable artifact. The runtime embeds these bytes
-    // (`include_bytes!` of `TESSL_METALLIB`); the path stays for tooling and
-    // `DEP_TESSL_METALLIB`.
+    // Metal can retain file-backed library data after loading. Never relink a
+    // pathname baked into a prior binary: each build owns an immutable artifact.
     //
     // Immutable, not eternal: every earlier build's artifact in this OUT_DIR is
     // removed first. A binary that referenced one of them is rebuilt by Cargo
@@ -218,21 +229,8 @@ fn main() {
     // making registry and vendored sources immutable, this isolates concurrent
     // profiles/targets/builds from one another. `links = "tessl"` exposes the
     // same path to direct dependents as `DEP_TESSL_METALLIB`.
-    println!("cargo:rustc-cfg=tessl_embedded_metallib");
     println!("cargo:metallib={}", metallib_out.display());
     println!("cargo:rustc-env=TESSL_METALLIB={}", metallib_out.display());
-}
-
-/// `-ffp-contract=off` where a non-contracted f32 reference disagreed.
-///
-/// `qwen35_adamw.metal`: with contraction on, a step at magnitude ~1e4 missed
-/// the `2e-6` absolute bound by one ulp (`6.104e-5` at element 20 of step 1).
-/// The measured step time is in `bench/results/fp_contract.txt`.
-fn disable_fp_contract(src: &Path) -> bool {
-    const OFF: &[&str] = &["qwen35_adamw.metal"];
-    src.file_name()
-        .and_then(|name| name.to_str())
-        .is_some_and(|name| OFF.contains(&name))
 }
 
 /// Delete `default-*.metallib` left in `out_dir` by previous builds.
@@ -253,22 +251,23 @@ fn sweep_previous_metallibs(out_dir: &Path) {
 
 /// Compile one kernel under `metal_std`; on failure return the compiler's
 /// diagnostic (or the spawn error) instead of swallowing it.
-fn try_metal_compile(metal: &Path, sdk: &str, src: &Path, air: &Path, metal_std: &str) -> Result<(), String> {
+fn try_metal_compile(
+    metal: &Path,
+    sdk: &str,
+    src: &Path,
+    air: &Path,
+    metal_std: &str,
+) -> Result<(), String> {
     let std_flag = format!("-std={metal_std}");
-    let mut cmd = Command::new(metal);
-    cmd.args([
-        std_flag.as_str(),
-        "-O2",
-        "-fmetal-math-mode=fast",
-        "-isysroot",
-        sdk,
-        "-mmacosx-version-min=26.0",
-    ]);
-    if disable_fp_contract(src) {
-        cmd.arg("-ffp-contract=off");
-    }
-    let out = cmd
-        .arg("-c")
+    let out = Command::new(metal)
+        .args([
+            std_flag.as_str(),
+            "-O2",
+            "-isysroot",
+            sdk,
+            "-mmacosx-version-min=26.0",
+            "-c",
+        ])
         .arg(src)
         .arg("-o")
         .arg(air)
@@ -317,7 +316,11 @@ fn xcrun_stdout(args: &[&str]) -> String {
         .output()
         .unwrap_or_else(|e| panic!("xcrun {:?} failed to spawn: {e}", args));
     if !out.status.success() {
-        panic!("xcrun {:?} failed: {}", args, String::from_utf8_lossy(&out.stderr));
+        panic!(
+            "xcrun {:?} failed: {}",
+            args,
+            String::from_utf8_lossy(&out.stderr)
+        );
     }
     String::from_utf8_lossy(&out.stdout).trim().to_string()
 }
@@ -332,7 +335,9 @@ fn xcrun_try(args: &[&str]) -> Result<String, ()> {
 }
 
 fn run(cmd: &mut Command, label: &str) {
-    let status = cmd.status().unwrap_or_else(|e| panic!("{label}: failed to spawn: {e}"));
+    let status = cmd
+        .status()
+        .unwrap_or_else(|e| panic!("{label}: failed to spawn: {e}"));
     if !status.success() {
         panic!("{label}: exited with {status}");
     }
@@ -355,7 +360,10 @@ fn track_kernel_sources(dir: &Path) {
         let p = entry.path();
         if p.is_dir() {
             track_kernel_sources(&p);
-        } else if matches!(p.extension().and_then(|s| s.to_str()), Some("metal") | Some("h")) {
+        } else if matches!(
+            p.extension().and_then(|s| s.to_str()),
+            Some("metal") | Some("h")
+        ) {
             // `.h` as well as `.metal`: shared reduction/activation helpers are
             // included by multiple kernels and compiled as neither. Tracking
             // only sources would let a helper edit leave every dependent stale

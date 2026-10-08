@@ -85,12 +85,7 @@ kernel void flash_attn_swa_h128(
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    // -FLT_MAX, not -INFINITY: kernels compile with fast math, which may
-    // assume no value is infinite. `l_i > 0` is the "has seen a key" flag
-    // (the block maximum contributes exp(0) = 1, and l_i never drops below 1
-    // after that), and a masked score's weight is zeroed by recomputing the
-    // mask, never by comparing the score against a sentinel.
-    float m_i = -FLT_MAX;
+    float m_i = -INFINITY;
     float l_i = 0.0f;
 
     const ulong q_abs = q_pos_offset + (ulong)t_q;
@@ -154,33 +149,35 @@ kernel void flash_attn_swa_h128(
             threadgroup_barrier(mem_flags::mem_threadgroup);
         }
 
-        float m_block = -FLT_MAX;
+        float m_block = -INFINITY;
         if (row_valid) {
             for (uint tk = 0; tk < n_k; ++tk) {
                 const ulong k_abs = kv_pos_offset + (ulong)t_k0 + tk;
-                const bool live = k_abs >= k_lo && k_abs <= k_hi;
-                const float score = live ? scores[lid * BC + tk] * scale : -FLT_MAX;
+                float score = scores[lid * BC + tk] * scale;
+                if (k_abs < k_lo || k_abs > k_hi) {
+                    score = -INFINITY;
+                }
                 scores[lid * BC + tk] = score;
                 m_block = max(m_block, score);
             }
             const float m_new = max(m_i, m_block);
-            // A row can reach a block having seen nothing yet with every key
-            // in it masked: the block-level skip admits a block on behalf of
-            // another row in the same BR tile — the union window is computed
-            // over the whole tile, so a block needed by the last row can be
-            // fully masked for the first. With an infinite seed that was
-            // `exp(-inf - -inf)` = NaN, which propagated through
-            // `Oacc *= alpha` and `l_i` and poisoned the row.
+            // `exp(m_i - m_new)` is `exp(-inf - -inf)` = `exp(NaN)` = NaN when
+            // this row has seen nothing yet and this block is entirely masked
+            // for it. That happens whenever the block-level skip admits a block
+            // on behalf of another row in the same BR tile — the union window
+            // is computed over the whole tile, so a block needed by the last
+            // row can be fully masked for the first. The NaN then propagated
+            // through `Oacc *= alpha` and `l_i` and poisoned the row.
             //
-            // `l_i == 0` means the accumulator is still zero, so scaling it
+            // `m_i == -inf` means the accumulator is still zero, so scaling it
             // by zero is exactly right, and it also covers the ordinary
-            // first-live-block case.
-            const float alpha = (l_i > 0.0f) ? exp(m_i - m_new) : 0.0f;
+            // first-real-block case where `exp(-inf - finite)` is already 0.
+            const float alpha = (m_i == -INFINITY) ? 0.0f : exp(m_i - m_new);
             float l_block = 0.0f;
             for (uint tk = 0; tk < n_k; ++tk) {
-                const ulong k_abs = kv_pos_offset + (ulong)t_k0 + tk;
-                const bool live = k_abs >= k_lo && k_abs <= k_hi;
-                const float p = live ? exp(scores[lid * BC + tk] - m_new) : 0.0f;
+                float p = (scores[lid * BC + tk] > -INFINITY)
+                    ? exp(scores[lid * BC + tk] - m_new)
+                    : 0.0f;
                 scores[lid * BC + tk] = p;
                 l_block += p;
             }

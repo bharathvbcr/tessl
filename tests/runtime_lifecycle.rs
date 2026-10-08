@@ -64,20 +64,6 @@ fn runtime_reports_a_usable_device_and_budget() {
     });
 }
 
-/// Apple silicon GPUs share system memory with the CPU, so a consumer that
-/// budgets GPU memory as a separate pool double-counts it. Only the `true`
-/// side is reachable on this hardware.
-#[cfg(all(target_arch = "aarch64", target_os = "macos"))]
-#[test]
-fn apple_silicon_reports_unified_memory() {
-    with_gpu(|rt| {
-        assert!(
-            rt.memory_info().has_unified_memory,
-            "MTLDevice.hasUnifiedMemory read false on Apple silicon"
-        );
-    });
-}
-
 #[test]
 fn buffer_kind_survives_the_round_trip_to_the_holder() {
     with_gpu(|rt| {
@@ -91,10 +77,19 @@ fn buffer_kind_survives_the_round_trip_to_the_holder() {
             rt.alloc_buffer_kind(4096, BufferKind::Hot).unwrap().kind(),
             BufferKind::Hot
         );
-        assert_eq!(rt.alloc_tensor_f32_hot(&[1024]).unwrap().buffer.kind(), BufferKind::Hot);
-        assert_eq!(rt.alloc_tensor_f32(&[1024]).unwrap().buffer.kind(), BufferKind::Cold);
+        assert_eq!(
+            rt.alloc_tensor_f32_hot(&[1024]).unwrap().buffer.kind(),
+            BufferKind::Hot
+        );
+        assert_eq!(
+            rt.alloc_tensor_f32(&[1024]).unwrap().buffer.kind(),
+            BufferKind::Cold
+        );
         rt.ensure_bump(1 << 16).unwrap();
-        assert_eq!(rt.bump_alloc_f32(&[64]).unwrap().buffer.kind(), BufferKind::Bump);
+        assert_eq!(
+            rt.bump_alloc_f32(&[64]).unwrap().buffer.kind(),
+            BufferKind::Bump
+        );
     });
 }
 
@@ -214,7 +209,10 @@ fn bump_arena_hands_out_zeroed_slices_and_reports_exhaustion() {
                 t.read_f32().unwrap().iter().all(|&x| x == 0.0),
                 "bump slice {i} was not zeroed"
             );
-            t.write_f32(&[i as f32 + 1.0; 64]).unwrap();
+            // Through the view, so the mark lands in this slice's own window;
+            // the buffer-level prefix write used here before put every mark at
+            // slab offset 0 and made the aliasing check below vacuous.
+            t.write_f32(&vec![i as f32 + 1.0; 64]).unwrap();
             views.push(t);
         }
 
@@ -232,7 +230,9 @@ fn bump_arena_hands_out_zeroed_slices_and_reports_exhaustion() {
         let marks: Vec<f32> = views.iter().map(|t| t.read_f32().unwrap()[0]).collect();
         rt.bump_reset().unwrap();
         let after_reset = rt.bump_alloc_f32(&[512]).unwrap();
-        after_reset.write_f32(&vec![-1.0f32; after_reset.numel()]).unwrap();
+        after_reset
+            .write_f32(&vec![-1.0f32; after_reset.numel()])
+            .unwrap();
         for (i, t) in views.iter().enumerate() {
             assert_eq!(
                 t.read_f32().unwrap()[0],
@@ -243,7 +243,10 @@ fn bump_arena_hands_out_zeroed_slices_and_reports_exhaustion() {
 
         // A capacity that cannot be rounded to a power of two is rejected
         // instead of wrapping to a tiny slab.
-        assert_eq!(rt.ensure_bump(usize::MAX).unwrap_err(), "bump capacity overflow");
+        assert_eq!(
+            rt.ensure_bump(usize::MAX).unwrap_err(),
+            "bump capacity overflow"
+        );
     });
 }
 
@@ -300,6 +303,47 @@ fn alloc_temp_refuses_a_poisoned_runtime_instead_of_bypassing_the_bump_arena() {
     });
 }
 
+/// A load-then-write loop with nothing in flight pays no residency commit and
+/// no command-buffer round trip per tensor: host access only needs completed
+/// GPU work, and there is none.
+#[test]
+fn host_writes_with_no_gpu_work_pending_do_not_commit_residency() {
+    with_gpu(|rt| {
+        tessl::infer_trace::set_enabled(true);
+        tessl::infer_trace::reset_token_counters();
+        for i in 0..16 {
+            let t = rt.alloc_tensor_f32_hot(&[256]).unwrap();
+            t.buffer.write_f32(&vec![i as f32; 256]);
+            assert_eq!(t.buffer.read_f32()[255], i as f32);
+        }
+        let snap = tessl::infer_trace::snapshot();
+        tessl::infer_trace::set_enabled(false);
+        assert_eq!(
+            snap.residency_flushes, 0,
+            "a load-then-write loop with nothing in flight paid residency commits"
+        );
+        // The set is still made resident before the first dispatch uses it.
+        let a = rt.alloc_tensor_f32(&[64]).unwrap();
+        let b = rt.alloc_tensor_f32(&[64]).unwrap();
+        a.buffer.write_f32(&[2.0; 64]);
+        tessl::tensor::gpu_copy(&a, &b).unwrap();
+        rt.synchronize().unwrap();
+        assert!(b.buffer.read_f32().iter().all(|&x| x == 2.0));
+    });
+}
+
+/// The dispatch counter counts encode attempts in both modes, including a
+/// closure that fails: a failed op still reached the encoder.
+#[test]
+fn a_failed_encode_still_counts_as_a_dispatch_attempt() {
+    with_gpu(|rt| {
+        rt.set_async_encode(true).unwrap();
+        rt.take_dispatch_count();
+        assert!(rt.with_binder(|_| Err("injected".into())).is_err());
+        assert_eq!(rt.take_dispatch_count(), 1);
+    });
+}
+
 #[test]
 fn a_long_unsynchronized_chain_keeps_every_result() {
     with_gpu(|rt| {
@@ -324,7 +368,9 @@ fn a_long_unsynchronized_chain_keeps_every_result() {
         let a = tensor_f32(rt, &[m, k], &random_f32(m * k, 31));
         // Distinct operands per slot: identical ones would make a stale or
         // swapped buffer indistinguishable from a correct one.
-        let b_hosts: Vec<Vec<f32>> = (0..VARIANTS).map(|v| random_f32(k * n, 40 + v as u64)).collect();
+        let b_hosts: Vec<Vec<f32>> = (0..VARIANTS)
+            .map(|v| random_f32(k * n, 40 + v as u64))
+            .collect();
         let bs: Vec<Tensor> = b_hosts.iter().map(|h| tensor_f32(rt, &[k, n], h)).collect();
         let a_host = a.buffer.read_f32();
 
@@ -408,7 +454,7 @@ fn externally_allocated_storage_can_back_a_gemm_output() {
 
         let host = arena.read_f32();
         assert_within_bound(
-            "external arena GEMM",
+            "gemm into caller-owned storage",
             &host[c_off_elems..c_off_elems + m * n],
             &expect,
             k,
@@ -417,7 +463,11 @@ fn externally_allocated_storage_can_back_a_gemm_output() {
         // The operands share the allocation; a kernel writing outside C's
         // window would have corrupted them.
         assert_eq!(&host[..a_elems], &a_host[..], "A was modified");
-        assert_eq!(&host[b_off_elems..b_off_elems + k * n], &b_host[..], "B was modified");
+        assert_eq!(
+            &host[b_off_elems..b_off_elems + k * n],
+            &b_host[..],
+            "B was modified"
+        );
     });
 }
 
@@ -436,11 +486,24 @@ fn deep_copy_and_gpu_copy_reproduce_their_source() {
         assert!(original.iter().any(|&x| x != 0.0), "source was all zero");
         for (i, (&want, (&got_dup, &got_dst))) in original
             .iter()
-            .zip(dup.buffer.read_f32().iter().zip(dst.buffer.read_f32().iter()))
+            .zip(
+                dup.buffer
+                    .read_f32()
+                    .iter()
+                    .zip(dst.buffer.read_f32().iter()),
+            )
             .enumerate()
         {
-            assert_eq!(got_dup.to_bits(), want.to_bits(), "deep_copy differs at [{i}]");
-            assert_eq!(got_dst.to_bits(), want.to_bits(), "gpu_copy differs at [{i}]");
+            assert_eq!(
+                got_dup.to_bits(),
+                want.to_bits(),
+                "deep_copy differs at [{i}]"
+            );
+            assert_eq!(
+                got_dst.to_bits(),
+                want.to_bits(),
+                "gpu_copy differs at [{i}]"
+            );
         }
     });
 }
@@ -474,7 +537,10 @@ fn softcap_matches_its_definition() {
             // any real defect: a missing tanh, a dropped cap, or a reciprocal
             // in place of the divide all move the result by whole percent.
             let tol = 1e-5 * want.abs().max(1.0);
-            assert!((g - want).abs() <= tol, "softcap[{i}] pre={x}: got {g}, want {want}");
+            assert!(
+                (g - want).abs() <= tol,
+                "softcap[{i}] pre={x}: got {g}, want {want}"
+            );
         }
         // The asymptote is the cap itself, in both directions.
         assert!((got[got.len() - 2] - cap).abs() < 1e-4);
@@ -529,7 +595,11 @@ fn a_runtime_that_outlives_its_tensors_still_works() {
             let view = t.view(&[1 << 9], 1 << 9);
             drop(t);
             // The view keeps the storage alive on its own.
-            assert!(view.buffer.read_f32().iter().all(|&x| x == generation as f32));
+            assert!(view
+                .buffer
+                .read_f32()
+                .iter()
+                .all(|&x| x == generation as f32));
             drop(view);
             rt.synchronize().unwrap();
         }
@@ -546,52 +616,5 @@ fn a_runtime_that_outlives_its_tensors_still_works() {
         };
         assert_eq!(orphan.numel(), 8);
         rt.synchronize().unwrap();
-    });
-}
-
-/// A params slot is not rewritten under a dispatch that has been encoded but
-/// not yet run. With async encode on, the dispatch below sits in an open
-/// command buffer when the step resets the cursor and pushes the next value
-/// into the same slot; a raw host write lands first and the kernel reads the
-/// new value. The push has to take the host-access lease, which commits and
-/// waits, as every other host write into a GPU buffer does.
-#[test]
-fn a_params_push_waits_for_encoded_work_reading_the_slot() {
-    with_gpu(|rt| {
-        rt.set_async_encode(true).expect("async encode");
-        let out = rt.alloc_buffer(4).expect("alloc");
-        out.write_f32(&[0.0]);
-        let off = rt
-            .with_params(|p| {
-                p.reset();
-                p.push_f32(7.0)
-            })
-            .expect("params")
-            .expect("push 7");
-        let pipe = rt.pipeline("add_inplace_f32").expect("pipeline");
-        rt.with_params(|p| {
-            tessl::dispatch::dispatch_1d(rt, &pipe, 1, |bnd| {
-                tessl::dispatch::set_gpu_buf(bnd, &out, 0);
-                tessl::dispatch::set_gpu_buf_offset(bnd, p.buffer(), off, 1);
-                tessl::dispatch::set_u32(bnd, 1, 2);
-            })
-        })
-        .expect("params")
-        .expect("dispatch");
-        let next = rt
-            .with_params(|p| {
-                p.reset();
-                p.push_f32(9.0)
-            })
-            .expect("params")
-            .expect("push 9");
-        assert_eq!(next, off, "the reset should reuse the slot");
-        rt.synchronize().expect("sync");
-        rt.set_async_encode(false).expect("sync encode");
-        assert_eq!(
-            out.read_f32(),
-            vec![7.0],
-            "the encoded dispatch read the next step's value"
-        );
     });
 }

@@ -20,7 +20,10 @@ struct Scratch(PathBuf);
 impl Scratch {
     fn new() -> Self {
         let id = NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed);
-        let path = std::env::temp_dir().join(format!("tessl-build-artifact-contract-{}-{id}", std::process::id()));
+        let path = std::env::temp_dir().join(format!(
+            "tessl-build-artifact-contract-{}-{id}",
+            std::process::id()
+        ));
         let _ = fs::remove_dir_all(&path);
         fs::create_dir(&path).expect("create scratch directory");
         Self(path)
@@ -48,7 +51,9 @@ fn source_snapshot(root: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
                 visit(base, &path, out);
             } else {
                 out.insert(
-                    path.strip_prefix(base).expect("source-relative path").into(),
+                    path.strip_prefix(base)
+                        .expect("source-relative path")
+                        .into(),
                     fs::read(&path).expect("read source file"),
                 );
             }
@@ -152,18 +157,6 @@ fn concurrent_builds_never_mutate_dependency_source_and_publish_out_dir_metadata
     fs::create_dir(&tools).expect("create fake tool directory");
     let tool = r#"#!/bin/sh
 set -eu
-write_out() {
-  output=''
-  while [ "$#" -gt 0 ]; do
-    if [ "$1" = "-o" ]; then
-      shift
-      output="$1"
-    fi
-    shift
-  done
-  test -n "$output"
-  printf 'synthetic-%s\n' "$(basename "$0")" > "$output"
-}
 case "$(basename "$0")" in
   xcrun)
     if [ "${1:-}" = "-f" ]; then
@@ -172,23 +165,17 @@ case "$(basename "$0")" in
       printf '/tmp\n'
     fi
     ;;
-  metal)
-    # The math mode must be an argument, not the compiler's implicit default.
-    # Throughput kernels (this synthetic TensorOps source) keep contraction.
-    case " $* " in
-      *" -fmetal-math-mode=fast "*) ;;
-      *) echo "missing -fmetal-math-mode=fast: $*" >&2; exit 1 ;;
-    esac
-    case " $* " in
-      *" -ffp-contract=off "*)
-        echo "throughput kernel must not disable contraction: $*" >&2
-        exit 1
-        ;;
-    esac
-    write_out "$@"
-    ;;
-  metallib)
-    write_out "$@"
+  metal|metallib)
+    output=''
+    while [ "$#" -gt 0 ]; do
+      if [ "$1" = "-o" ]; then
+        shift
+        output="$1"
+      fi
+      shift
+    done
+    test -n "$output"
+    printf 'synthetic-%s\n' "$(basename "$0")" > "$output"
     ;;
 esac
 "#;
@@ -248,7 +235,9 @@ esac
     let skip_stdout = stdout(&skip);
     assert_eq!(
         PathBuf::from(metadata_value(&skip_stdout, "cargo:metallib=")),
-        first_metallib.canonicalize().expect("canonical prebuilt path")
+        first_metallib
+            .canonicalize()
+            .expect("canonical prebuilt path")
     );
     assert_eq!(source_snapshot(&manifest), before);
 

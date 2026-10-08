@@ -203,21 +203,15 @@ pub enum IcbStubPhase {
     Planned,
     /// Mini smoke proved API; decode-graph allocate still deferred.
     SmokeProven,
-    /// A mini/layer-level [`crate::decode_icb::DecodeIcb`] is attached
-    /// ([`PingPongCbReplay::attach_decode_icb`]) or executed successfully
-    /// ([`IcbReplayStub::mark_mini_execute_ok`]). Reached today; it does **not**
-    /// mean the full decode graph has an ICB — [`IcbReplayStub::try_allocate`]
-    /// never sets it.
+    /// Would hold a live decode-graph ICB — unreachable until migration lands.
     Allocated,
 }
 
 /// Next-step scaffold toward compute ICB replay of the decode graph.
 ///
 /// Does not own Metal ICB objects (see [`crate::icb_smoke::IcbCopySmoke`] for the
-/// one-kernel proof). [`Self::try_allocate`] always returns
-/// [`CbReplayError::NotWired`]; [`Self::try_execute`] returns it until a mini
-/// `DecodeIcb` has moved the stub to [`IcbStubPhase::Allocated`], and even then
-/// reports only that mini path — full-graph ICB replay is not wired.
+/// one-kernel proof). [`Self::try_allocate`] / [`Self::try_execute`] stay
+/// [`CbReplayError::NotWired`] for the full decode path.
 #[derive(Clone, Debug)]
 pub struct IcbReplayStub {
     pub phase: IcbStubPhase,
@@ -268,11 +262,9 @@ impl IcbReplayStub {
         Err(CbReplayError::NotWired)
     }
 
-    /// Honest execute for the **full decode graph**: fails with
-    /// [`CbReplayError::NotWired`]. `Ok` only means a mini [`crate::DecodeIcb`]
-    /// already put the stub in [`IcbStubPhase::Allocated`] (via
-    /// [`Self::mark_mini_execute_ok`] or [`PingPongCbReplay::attach_decode_icb`]);
-    /// it does not run anything.
+    /// Honest execute for **full decode graph**: fails with [`CbReplayError::NotWired`]
+    /// unless a mini [`crate::DecodeIcb`] path already marked success via
+    /// [`Self::mark_mini_execute_ok`].
     pub fn try_execute(&mut self) -> Result<(), CbReplayError> {
         self.execute_attempts = self.execute_attempts.saturating_add(1);
         if self.phase == IcbStubPhase::Allocated {
@@ -468,12 +460,18 @@ impl PingPongCbReplay {
     }
 
     pub fn decode_icb_wired(&self) -> bool {
-        self.decode_icb.as_ref().map(|d| d.encoded()).unwrap_or(false)
+        self.decode_icb
+            .as_ref()
+            .map(|d| d.encoded())
+            .unwrap_or(false)
     }
 
     /// True when attached DecodeIcb is a Binder-captured mini layer/head graph.
     pub fn decode_icb_layer_graph(&self) -> bool {
-        self.decode_icb.as_ref().map(|d| d.is_layer_graph()).unwrap_or(false)
+        self.decode_icb
+            .as_ref()
+            .map(|d| d.is_layer_graph())
+            .unwrap_or(false)
     }
 
     pub fn decode_icb(&self) -> Option<&crate::decode_icb::DecodeIcb> {
@@ -508,7 +506,11 @@ impl PingPongCbReplay {
     ///
     /// Requires [`crate::decode_icb_enabled`] + attached encoded DecodeIcb.
     /// This is the first `try_replay` → `execute_icb` bridge (not full decode).
-    pub fn try_replay_icb(&mut self, slot: CbSlot, rt: &crate::runtime::GpuRuntime) -> Result<(), CbReplayError> {
+    pub fn try_replay_icb(
+        &mut self,
+        slot: CbSlot,
+        rt: &crate::runtime::GpuRuntime,
+    ) -> Result<(), CbReplayError> {
         if self.slots[slot.index()].phase != CbReplayPhase::Ready {
             return Err(CbReplayError::NotReady);
         }
@@ -530,7 +532,10 @@ impl PingPongCbReplay {
     }
 
     /// Before a live encode: try Ready-slot mini ICB replay when enabled.
-    pub fn try_replay_ready_icb(&mut self, rt: &crate::runtime::GpuRuntime) -> Result<CbSlot, CbReplayError> {
+    pub fn try_replay_ready_icb(
+        &mut self,
+        rt: &crate::runtime::GpuRuntime,
+    ) -> Result<CbSlot, CbReplayError> {
         for slot in [CbSlot::A, CbSlot::B] {
             if self.slots[slot.index()].phase == CbReplayPhase::Ready {
                 self.try_replay_icb(slot, rt)?;
@@ -562,13 +567,20 @@ impl PingPongCbReplay {
     /// Deliberately does **not** touch `icb_replays` or the stub's execute
     /// telemetry: no tape ran, and counting it as one made "did a tape replay
     /// actually happen?" unanswerable from the metrics.
-    pub fn note_layer_live_replay(&mut self, label: impl Into<String>) -> Result<(), CbReplayError> {
+    pub fn note_layer_live_replay(
+        &mut self,
+        label: impl Into<String>,
+    ) -> Result<(), CbReplayError> {
         self.mark_replay_step(label)?;
         self.layer_live_replays = self.layer_live_replays.saturating_add(1);
         Ok(())
     }
 
-    fn mark_step_inner(&mut self, label: impl Into<String>, count_live: bool) -> Result<(), CbReplayError> {
+    fn mark_step_inner(
+        &mut self,
+        label: impl Into<String>,
+        count_live: bool,
+    ) -> Result<(), CbReplayError> {
         let slot = self.active;
         match self.slots[slot.index()].phase {
             // Recover from a partial record if a prior step erred mid-encode.
@@ -615,7 +627,11 @@ impl PingPongCbReplay {
     }
 
     /// Begin recording into `slot` (must be Idle or Ready after GPU wait).
-    pub fn begin_record(&mut self, slot: CbSlot, label: impl Into<String>) -> Result<(), CbReplayError> {
+    pub fn begin_record(
+        &mut self,
+        slot: CbSlot,
+        label: impl Into<String>,
+    ) -> Result<(), CbReplayError> {
         let s = &mut self.slots[slot.index()];
         match s.phase {
             CbReplayPhase::Idle | CbReplayPhase::Ready => {}
@@ -817,23 +833,6 @@ mod tests {
         assert!(stub.plan.ephemeral_count() >= 1);
     }
 
-    /// `Allocated` is reachable (mini DecodeIcb success), yet that must not
-    /// make the full-graph allocate work: the two are different claims.
-    #[test]
-    fn allocated_phase_comes_from_mini_execute_not_from_try_allocate() {
-        let mut stub = IcbReplayStub::new();
-        assert_eq!(stub.try_execute(), Err(CbReplayError::NotWired));
-        stub.mark_mini_execute_ok();
-        assert_eq!(stub.phase, IcbStubPhase::Allocated);
-        assert_eq!(stub.try_execute(), Ok(()));
-        assert_eq!(stub.try_allocate(), Err(CbReplayError::NotWired));
-        assert_eq!(
-            stub.phase,
-            IcbStubPhase::Allocated,
-            "try_allocate must not move or reset the phase"
-        );
-    }
-
     #[test]
     fn try_replay_ready_not_wired_after_live() {
         let mut pp = PingPongCbReplay::new();
@@ -870,7 +869,8 @@ mod tests {
         assert_eq!(pp.not_wired_hits(), 0);
         assert_eq!(pp.icb_execute_failures(), 0);
         let n = 32usize;
-        let got = unsafe { std::slice::from_raw_parts(out.metal().contents().as_ptr() as *const f32, n) };
+        let got =
+            unsafe { std::slice::from_raw_parts(out.metal().contents().as_ptr() as *const f32, n) };
         for (i, v) in got.iter().take(n).enumerate() {
             assert_eq!(*v, (i as f32) + 1.0, "mismatch at {i}");
         }
@@ -882,9 +882,11 @@ mod tests {
             let q = out.metal().contents().as_ptr() as *mut u8;
             std::ptr::write_bytes(q, 0xFF, n * 4);
         }
-        pp.try_replay_icb(CbSlot::A, &rt).expect("second try_replay_icb");
+        pp.try_replay_icb(CbSlot::A, &rt)
+            .expect("second try_replay_icb");
         rt.synchronize().unwrap();
-        let got2 = unsafe { std::slice::from_raw_parts(out.metal().contents().as_ptr() as *const f32, n) };
+        let got2 =
+            unsafe { std::slice::from_raw_parts(out.metal().contents().as_ptr() as *const f32, n) };
         for (i, v) in got2.iter().take(n).enumerate() {
             assert_eq!(*v, (i as f32) + 1.0);
         }
@@ -928,7 +930,8 @@ mod tests {
         pp.mark_live_step("s1").unwrap();
         assert_eq!(pp.active_slot(), CbSlot::A);
         // A full step ran on B since A was claimed — A must be reusable.
-        pp.mark_live_step("s2").expect("in-flight slot must recycle");
+        pp.mark_live_step("s2")
+            .expect("in-flight slot must recycle");
         pp.mark_live_step("s3").unwrap();
         assert_eq!(pp.live_encodes(), 4);
         assert_eq!(pp.slot(CbSlot::A).phase, CbReplayPhase::Ready);
@@ -955,7 +958,8 @@ mod tests {
     #[test]
     fn note_layer_live_replay_is_not_counted_as_a_tape_replay() {
         let mut pp = PingPongCbReplay::new();
-        pp.note_layer_live_replay("live_layer_replay pos=0").unwrap();
+        pp.note_layer_live_replay("live_layer_replay pos=0")
+            .unwrap();
         assert_eq!(pp.layer_live_replays(), 1);
         assert_eq!(pp.icb_replays(), 0, "no DecodeIcb tape ran");
         assert_eq!(pp.live_encodes(), 0, "mark_replay_step must not count live");
@@ -969,7 +973,10 @@ mod tests {
     fn not_wired_message_names_every_surveyed_gap() {
         let msg = CbReplayError::NotWired.to_string();
         for gap in survey_cb_replay_api_gaps() {
-            assert!(msg.contains(gap.as_str()), "NotWired message omits {gap:?}: {msg}");
+            assert!(
+                msg.contains(gap.as_str()),
+                "NotWired message omits {gap:?}: {msg}"
+            );
         }
     }
 }

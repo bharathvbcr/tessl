@@ -7,21 +7,6 @@
 
 #![allow(dead_code)]
 
-/// The gated delta rule as an f64 sequential reference — the CPU oracle for the
-/// GDN kernels. Pure arithmetic, no GPU, so it runs on any host.
-pub mod gdn;
-
-/// The gated delta rule at transformers' op seam (g and beta given), forward and
-/// backward, in f64: the oracle for the training kernels.
-pub mod gdn_train;
-
-/// f64 references for the Qwen3.5 kernels, anchored to transformers by fixture.
-pub mod qwen35;
-
-/// f64 references for EmbeddingGemma 2's pieces, anchored to transformers by
-/// fixture, and composable into a whole forward.
-pub mod embedgemma2;
-
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use tessl::tensor::{bf16_bits_to_f32, f32_slice_to_bf16, GpuBuffer};
@@ -66,15 +51,11 @@ pub fn with_two_gpus<R>(f: impl FnOnce(&Arc<GpuRuntime>, &Arc<GpuRuntime>) -> R)
 }
 
 /// splitmix64 — a deterministic stream so a failure reproduces exactly.
-///
-/// Named apart from the stress-test `Rng` in `src/gemm.rs`. Those two
-/// generators are different functions; sharing the type name left both
-/// `new` and `unit` unbound.
-pub struct SplitMix(u64);
+pub struct Rng(u64);
 
-impl SplitMix {
+impl Rng {
     pub fn new(seed: u64) -> Self {
-        SplitMix(seed ^ 0x9e37_79b9_7f4a_7c15)
+        Rng(seed ^ 0x9e37_79b9_7f4a_7c15)
     }
 
     fn next_u64(&mut self) -> u64 {
@@ -85,13 +66,6 @@ impl SplitMix {
         z ^ (z >> 31)
     }
 
-    /// Uniform in `lo..=hi`, for randomized shapes. (Modulo bias is below
-    /// 2^-40 for any range a test draws.)
-    pub fn range(&mut self, lo: usize, hi: usize) -> usize {
-        assert!(lo <= hi, "empty range {lo}..={hi}");
-        lo + (self.next_u64() % (hi - lo + 1) as u64) as usize
-    }
-
     /// Uniform in [-1, 1). Bounded operands keep the derived error bound
     /// meaningful; unbounded ones would let one outlier product dominate it.
     pub fn unit(&mut self) -> f32 {
@@ -99,32 +73,19 @@ impl SplitMix {
     }
 }
 
-/// Iterations and base seed of the randomized-shape sweeps:
-/// `TESSL_FUZZ_ITERS` (default `default`) and `TESSL_FUZZ_SEED` (default 1).
-/// Every shape a sweep draws is in its failure message, so a failing draw
-/// reproduces from the printed seed.
-pub fn fuzz_plan(default: usize) -> (usize, u64) {
-    let get = |k: &str| {
-        std::env::var(k)
-            .ok()
-            .map(|v| v.parse::<u64>().unwrap_or_else(|_| panic!("{k}={v} is not a number")))
-    };
-    (
-        get("TESSL_FUZZ_ITERS").map_or(default, |n| n as usize),
-        get("TESSL_FUZZ_SEED").unwrap_or(1),
-    )
-}
-
 pub fn random_f32(n: usize, seed: u64) -> Vec<f32> {
-    let mut rng = SplitMix::new(seed);
-    (0..n).map(|_| SplitMix::unit(&mut rng)).collect()
+    let mut rng = Rng::new(seed);
+    (0..n).map(|_| rng.unit()).collect()
 }
 
 /// Round through bf16 and back, so the CPU reference sees exactly the operands
 /// the GPU will read. Without this the test would be measuring host-side
 /// quantization error, not the kernel.
 pub fn round_trip_bf16(data: &[f32]) -> Vec<f32> {
-    f32_slice_to_bf16(data).into_iter().map(bf16_bits_to_f32).collect()
+    f32_slice_to_bf16(data)
+        .into_iter()
+        .map(bf16_bits_to_f32)
+        .collect()
 }
 
 pub fn tensor_f32(rt: &Arc<GpuRuntime>, shape: &[usize], data: &[f32]) -> Tensor {
@@ -137,29 +98,6 @@ pub fn tensor_bf16(rt: &Arc<GpuRuntime>, shape: &[usize], data: &[f32]) -> Tenso
     let t = rt.alloc_tensor_bf16(shape).expect("alloc_tensor_bf16");
     t.buffer.write_bf16_bits(&f32_slice_to_bf16(data));
     t
-}
-
-/// `data` as an f32 view starting `pad_bytes` into a fresh buffer whose
-/// leading bytes are zero: a bank slice at that offset.
-pub fn tensor_f32_at(rt: &Arc<GpuRuntime>, shape: &[usize], data: &[f32], pad_bytes: usize) -> Tensor {
-    assert_eq!(pad_bytes % 4, 0, "an f32 view starts on a 4-byte boundary");
-    let pad = pad_bytes / 4;
-    let bank = rt.alloc_tensor_f32(&[pad + data.len()]).expect("alloc_tensor_f32");
-    let mut host = vec![0.0f32; pad];
-    host.extend_from_slice(data);
-    bank.buffer.write_f32(&host);
-    bank.view(shape, pad)
-}
-
-/// [`tensor_f32_at`] for bf16 storage.
-pub fn tensor_bf16_at(rt: &Arc<GpuRuntime>, shape: &[usize], data: &[f32], pad_bytes: usize) -> Tensor {
-    assert_eq!(pad_bytes % 2, 0, "a bf16 view starts on a 2-byte boundary");
-    let pad = pad_bytes / 2;
-    let bank = rt.alloc_tensor_bf16(&[pad + data.len()]).expect("alloc_tensor_bf16");
-    let mut host = vec![0.0f32; pad];
-    host.extend_from_slice(data);
-    bank.buffer.write_bf16_bits(&f32_slice_to_bf16(&host));
-    bank.view(shape, pad)
 }
 
 /// Operand storage order, i.e. which GEMM entry point produced the result.
@@ -217,82 +155,6 @@ pub fn reference(layout: Layout, a: &[f32], b: &[f32], m: usize, n: usize, k: us
         }
     }
     Reference { c, mag }
-}
-
-/// Shapes that take the exact-f32 kernels' column-panel walk, which needs B
-/// (N×K) to hold at least `PANEL_MIN_B_ELEMS` = 2^23 elements on a tile grid
-/// that is not square with a power-of-two side (that keeps Morton order;
-/// `tile_walk` in `kernels/matmul_tensorops.metal`). The first has 18 tile
-/// rows (one full 16-row band and a partial one) and a ragged last tile
-/// column; the second has 2 tile rows, so its only band is short.
-pub const F32_PANEL_SHAPES: &[(usize, usize, usize)] = &[(545, 8200, 1024), (33, 8193, 1024)];
-
-/// Operands in `layout`'s storage order where only `p = 0` contributes: A's
-/// `p = 0` entries are random and the rest of A is zero, B is random. Every
-/// other term adds an exact zero, so the reference is the outer product of
-/// A's first column and B's first row, O(M·N) at any K. A tile the kernel
-/// never writes stays at zero and fails the comparison.
-pub fn rank_one_case(layout: Layout, m: usize, n: usize, k: usize, seed: u64) -> (Vec<f32>, Vec<f32>, Reference) {
-    let a0 = random_f32(m, seed);
-    let mut a = vec![0.0f32; m * k];
-    for (i, &v) in a0.iter().enumerate() {
-        match layout {
-            Layout::Nn | Layout::Nt => a[i * k] = v,
-            Layout::Tn => a[i] = v,
-        }
-    }
-    let b = random_f32(k * n, seed ^ 0x5eed);
-    let b0 = |j: usize| -> f64 {
-        match layout {
-            Layout::Nn | Layout::Tn => b[j] as f64,
-            Layout::Nt => b[j * k] as f64,
-        }
-    };
-    let mut c = vec![0.0f64; m * n];
-    let mut mag = vec![0.0f64; m * n];
-    for i in 0..m {
-        for j in 0..n {
-            let term = a0[i] as f64 * b0(j);
-            c[i * n + j] = term;
-            mag[i * n + j] = term.abs();
-        }
-    }
-    (a, b, Reference { c, mag })
-}
-
-/// NN operands with a random A[M,K] and a rank-one B[K,N] = u ⊗ v, so every
-/// term of K contributes (a K partition the kernel skips changes the answer)
-/// while the reference stays O(M·K + M·N). `v` holds signed powers of two, so
-/// each `u_k·v_j` is exact in f32 and the factorisation holds for the values
-/// the GPU reads: `C[i,j] = (Σ_k A[i,k] u_k) v_j`, with budget magnitude
-/// `(Σ_k |A[i,k] u_k|) |v_j|`.
-pub fn rank_one_b_case(m: usize, n: usize, k: usize, seed: u64) -> (Vec<f32>, Vec<f32>, Reference) {
-    let a = random_f32(m * k, seed);
-    let u = random_f32(k, seed ^ 0x0b0e);
-    let v: Vec<f32> = random_f32(n, seed ^ 0x0b0f)
-        .iter()
-        .map(|&r| {
-            // r in [-1, 1): sign from r, magnitude 2^-2 .. 2^1.
-            let exp = ((r.abs() * 4.0) as i32).min(3) - 2;
-            2f32.powi(exp).copysign(r)
-        })
-        .collect();
-    let b: Vec<f32> = (0..k * n).map(|idx| u[idx / n] * v[idx % n]).collect();
-    let mut c = vec![0.0f64; m * n];
-    let mut mag = vec![0.0f64; m * n];
-    for i in 0..m {
-        let (mut dot, mut abs) = (0.0f64, 0.0f64);
-        for p in 0..k {
-            let term = a[i * k + p] as f64 * u[p] as f64;
-            dot += term;
-            abs += term.abs();
-        }
-        for j in 0..n {
-            c[i * n + j] = dot * v[j] as f64;
-            mag[i * n + j] = abs * (v[j] as f64).abs();
-        }
-    }
-    (a, b, Reference { c, mag })
 }
 
 /// f32 unit roundoff, 2^-24.
@@ -373,31 +235,10 @@ pub fn assert_within_bound(label: &str, got: &[f32], r: &Reference, k: usize, op
 
 // --------------------------------------------------- Buffers and Q4 banks ---
 
-/// The slice actually uploaded for `data`.
-///
-/// Metal cannot allocate a zero-byte buffer, so every helper here rounds an
-/// empty request up to one element — and the `write_*` calls check the length
-/// exactly, so the upload has to be rounded up the same way. The stand-in is
-/// zero, not whatever the pool last left in that element.
-fn padded<T: Copy + Default>(data: &[T]) -> std::borrow::Cow<'_, [T]> {
-    if data.is_empty() {
-        std::borrow::Cow::Owned(vec![T::default()])
-    } else {
-        std::borrow::Cow::Borrowed(data)
-    }
-}
-
-/// f32 buffer holding `data` (one zero element when `data` is empty).
+/// f32 buffer holding `data`.
 pub fn buf(rt: &Arc<GpuRuntime>, data: &[f32]) -> GpuBuffer {
     let b = rt.alloc_buffer(data.len().max(1) * 4).expect("alloc");
-    b.write_f32(&padded(data));
-    b
-}
-
-/// u32 buffer holding `data` (one zero element when `data` is empty).
-pub fn buf_u32(rt: &Arc<GpuRuntime>, data: &[u32]) -> GpuBuffer {
-    let b = rt.alloc_buffer(data.len().max(1) * 4).expect("alloc");
-    b.write_u32(&padded(data));
+    b.write_f32(data);
     b
 }
 
@@ -408,10 +249,10 @@ pub fn empty(rt: &Arc<GpuRuntime>, elems: usize) -> GpuBuffer {
     b
 }
 
-/// bf16 buffer holding `data` rounded to bf16 (one zero element when empty).
+/// bf16 buffer holding `data` rounded to bf16.
 pub fn buf_bf16(rt: &Arc<GpuRuntime>, data: &[f32]) -> GpuBuffer {
     let b = rt.alloc_buffer(data.len().max(1) * 2).expect("alloc");
-    b.write_bf16_bits(&f32_slice_to_bf16(&padded(data)));
+    b.write_bf16_bits(&f32_slice_to_bf16(data));
     b
 }
 
@@ -450,7 +291,8 @@ pub fn q4_mlx_matrix(rows: usize, cols: usize, group: usize) -> (Vec<u8>, Vec<f3
     for r in 0..rows {
         for c in 0..cols {
             let gi = r * (cols / group) + c / group;
-            dense[r * cols + c] = sb_round[gi * 2] * nibbles[r * cols + c] as f32 + sb_round[gi * 2 + 1];
+            dense[r * cols + c] =
+                sb_round[gi * 2] * nibbles[r * cols + c] as f32 + sb_round[gi * 2 + 1];
         }
     }
     (pack_nibbles(&nibbles), sb_f32, dense)
@@ -459,20 +301,12 @@ pub fn q4_mlx_matrix(rows: usize, cols: usize, group: usize) -> (Vec<u8>, Vec<f3
 /// `y[r] = sum_c dense[r, c] * x[c]`, in f64.
 pub fn dense_gemv(dense: &[f32], x: &[f32], rows: usize, cols: usize) -> Vec<f32> {
     (0..rows)
-        .map(|r| (0..cols).map(|c| dense[r * cols + c] as f64 * x[c] as f64).sum::<f64>() as f32)
+        .map(|r| {
+            (0..cols)
+                .map(|c| dense[r * cols + c] as f64 * x[c] as f64)
+                .sum::<f64>() as f32
+        })
         .collect()
-}
-
-/// CPU `gelu_pytorch_tanh` in f64, the oracle for every GELU kernel test.
-///
-/// Mirrors `kernels/gelu.h`: only the cubic's input is clamped, and the outer
-/// factor is the original `x`, so large positive inputs come out as ~`x`. One
-/// oracle, because a test copy that multiplied by the clamped value agreed with
-/// a kernel that did the same and kept a broken GEMM epilogue green.
-pub fn gelu_pytorch_tanh(x: f64) -> f64 {
-    let xc = x.clamp(-20.0, 20.0);
-    let inner = 0.7978845608028654 * (xc + 0.044715 * xc * xc * xc);
-    0.5 * x * (1.0 + inner.clamp(-10.0, 10.0).tanh())
 }
 
 /// Assert `got ~= want` elementwise with a relative-plus-absolute tolerance.

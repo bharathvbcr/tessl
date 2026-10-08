@@ -12,8 +12,8 @@ use std::sync::Arc;
 
 use common::with_gpu;
 use tessl::nn::{
-    self, GateUpDispatch, KvStoreTarget, Q4Bank, Q4MlxBank, Q4MlxLayout, Q4MlxRowVariant, QkvBuffers, QkvOutputs,
-    QkvRopeDims, QkvRopeVariant, QuantShape,
+    self, GateUpDispatch, KvStoreTarget, Q4Bank, Q4MlxBank, Q4MlxLayout, Q4MlxRowVariant,
+    QkvBuffers, QkvOutputs, QkvRopeDims, QkvRopeVariant, QuantShape,
 };
 use tessl::{GpuBuffer, GpuRuntime};
 
@@ -45,7 +45,10 @@ fn assert_alias_refused(rt: &GpuRuntime, label: &str, result: Result<(), String>
 fn assert_close(label: &str, got: &[f32], want: &[f32], tol: f32) {
     assert_eq!(got.len(), want.len(), "{label}: length mismatch");
     for (i, (&got, &want)) in got.iter().zip(want).enumerate() {
-        assert!((got - want).abs() <= tol, "{label}[{i}]: got {got}, want {want}");
+        assert!(
+            (got - want).abs() <= tol,
+            "{label}[{i}]: got {got}, want {want}"
+        );
     }
 }
 
@@ -87,11 +90,16 @@ fn documented_f32_in_place_norm_and_activation_paths_remain_correct() {
         let eps = 1e-6f32;
         let mean_square = input.iter().map(|x| x * x).sum::<f32>() / input.len() as f32;
         let inv = (mean_square + eps).sqrt().recip();
-        let norm: Vec<_> = input.iter().zip(weight).map(|(&x, w)| x * inv * w).collect();
+        let norm: Vec<_> = input
+            .iter()
+            .zip(weight)
+            .map(|(&x, w)| x * inv * w)
+            .collect();
 
         let x = f32_buffer(rt, &input);
         let w = f32_buffer(rt, &weight);
-        nn::rms_norm_f32(rt, &x, &w, &x, 1, input.len() as u32, eps).expect("rms_norm_f32 supports out == x");
+        nn::rms_norm_f32(rt, &x, &w, &x, 1, input.len() as u32, eps)
+            .expect("rms_norm_f32 supports out == x");
         rt.synchronize().unwrap();
         assert_close("rms_norm_f32 in place", &x.read_f32(), &norm, 2e-5);
 
@@ -116,7 +124,8 @@ fn documented_f32_in_place_norm_and_activation_paths_remain_correct() {
             .collect();
         let gate = f32_buffer(rt, &gate_values);
         let up = f32_buffer(rt, &up_values);
-        nn::mlp_silu(rt, &gate, &up, &gate, gate_values.len() as u32).expect("mlp_silu supports out == gate");
+        nn::mlp_silu(rt, &gate, &up, &gate, gate_values.len() as u32)
+            .expect("mlp_silu supports out == gate");
         rt.synchronize().unwrap();
         assert_close("mlp_silu in place", &gate.read_f32(), &want_silu, 2e-5);
 
@@ -132,7 +141,8 @@ fn documented_f32_in_place_norm_and_activation_paths_remain_correct() {
             .collect();
         let gate = f32_buffer(rt, &gate_values);
         let up = f32_buffer(rt, &up_values);
-        nn::mlp_gelu_tanh(rt, &gate, &up, &up, gate_values.len() as u32).expect("mlp_gelu_tanh supports out == up");
+        nn::mlp_gelu_tanh(rt, &gate, &up, &up, gate_values.len() as u32)
+            .expect("mlp_gelu_tanh supports out == up");
         rt.synchronize().unwrap();
         assert_close("mlp_gelu_tanh in place", &up.read_f32(), &want_gelu, 2e-5);
     });
@@ -215,8 +225,16 @@ fn quantized_projections_and_embeddings_reject_output_aliases() {
             scales_biases: &b,
         };
 
-        assert_alias_refused(rt, "gemv_q8 y/x", nn::gemv_q8(rt, &a, &b, &b, &c, &c, 8, 32, 32));
-        assert_alias_refused(rt, "gemv_q4 y/packed", nn::gemv_q4(rt, q4, &c, &a, shape, false));
+        assert_alias_refused(
+            rt,
+            "gemv_q8 y/x",
+            nn::gemv_q8(rt, &a, &b, &b, &c, &c, 8, 32, 32),
+        );
+        assert_alias_refused(
+            rt,
+            "gemv_q4 y/packed",
+            nn::gemv_q4(rt, q4, &c, &a, shape, false),
+        );
         assert_alias_refused(
             rt,
             "embed_lookup_q4 out/token_ids",
@@ -245,7 +263,16 @@ fn quantized_projections_and_embeddings_reject_output_aliases() {
         assert_alias_refused(
             rt,
             "gemv_q4_mlx_gate_up_gelu mid/x",
-            nn::gemv_q4_mlx_gate_up_gelu(rt, mlx, mlx, &c, &c, shape, GateUpDispatch::Blocked, false),
+            nn::gemv_q4_mlx_gate_up_gelu(
+                rt,
+                mlx,
+                mlx,
+                &c,
+                &c,
+                shape,
+                GateUpDispatch::Blocked,
+                false,
+            ),
         );
         assert_alias_refused(
             rt,
@@ -307,7 +334,12 @@ fn fused_q4_residual_paths_preserve_the_supported_in_place_operation() {
         nn::gemv_q4_mlx_simd(rt, bank, &x, &y, shape, Q4MlxLayout::RowMajor, Some(&y))
             .expect("simd GEMV supports y == resid");
         rt.synchronize().unwrap();
-        assert_close("gemv_q4_mlx_simd in-place resid", &y.read_f32(), &residual, 0.0);
+        assert_close(
+            "gemv_q4_mlx_simd in-place resid",
+            &y.read_f32(),
+            &residual,
+            0.0,
+        );
 
         let m = 2u32;
         let x = empty(rt, m as usize * shape.cols as usize * 2);

@@ -1,0 +1,52 @@
+bf16 NN coop tile A/B at small M — M5 Pro, 2026-09-04
+=====================================================
+
+Question: `nn_coop_kernel` chose the 64x64 sg4 tile only for N <= 512 and
+ignored M; no NN shape below M = 512 had ever been measured (audit item G4).
+
+Method: paired, order-balanced, in-process A/B through the public `gemm`
+(bf16 operands from `cast_f32_to_bf16`, f32 output, GemmBackend::TensorOps)
+with a temporary env override selecting the tile. Twenty GEMMs per command
+buffer (async encode, auto barriers) so the clock sees the kernel, eight
+calls per arm per round (per-call median), six rounds alternating arm order,
+median of rounds. Machine idle otherwise. Absolute times swing with thermal
+load; only the paired ratio is the finding.
+
+ratio = 128x64 time / 64x64 time (> 1: the 64x64 tile is faster)
+
+M=16    N=3072  K=768   narrow      26.7 us ( 2826.7 GF/s)  default      41.8 us  default/narrow 1.56
+M=32    N=3072  K=768   narrow      33.5 us ( 4512.1 GF/s)  default      48.5 us  default/narrow 1.45
+M=64    N=3072  K=768   narrow      27.8 us (10879.2 GF/s)  default      38.7 us  default/narrow 1.39
+M=128   N=3072  K=768   narrow      36.3 us (16617.6 GF/s)  default      41.3 us  default/narrow 1.14
+M=256   N=3072  K=768   narrow      55.2 us (21902.3 GF/s)  default      55.2 us  default/narrow 1.00
+M=512   N=3072  K=768   narrow     125.4 us (19259.0 GF/s)  default     119.3 us  default/narrow 0.95
+M=1024  N=3072  K=768   narrow     281.1 us (17188.8 GF/s)  default     296.7 us  default/narrow 1.06
+M=16    N=768   K=3072  narrow      72.2 us ( 1045.9 GF/s)  default     113.2 us  default/narrow 1.57
+M=32    N=768   K=3072  narrow      74.2 us ( 2035.6 GF/s)  default     104.1 us  default/narrow 1.40
+M=64    N=768   K=3072  narrow      67.1 us ( 4497.4 GF/s)  default     101.9 us  default/narrow 1.52
+M=128   N=768   K=3072  narrow      74.4 us ( 8122.8 GF/s)  default     103.9 us  default/narrow 1.40
+M=256   N=768   K=3072  narrow      72.2 us (16720.6 GF/s)  default     114.6 us  default/narrow 1.59
+M=512   N=768   K=3072  narrow     118.4 us (20404.7 GF/s)  default     158.5 us  default/narrow 1.34
+M=1024  N=768   K=3072  narrow     352.3 us (13714.1 GF/s)  default     336.2 us  default/narrow 0.95
+M=16    N=4096  K=4096  narrow     234.8 us ( 2286.2 GF/s)  default     339.3 us  default/narrow 1.45
+M=32    N=4096  K=4096  narrow     194.0 us ( 5534.6 GF/s)  default     337.4 us  default/narrow 1.74
+M=64    N=4096  K=4096  narrow     248.6 us ( 8638.9 GF/s)  default     336.4 us  default/narrow 1.35
+M=128   N=4096  K=4096  narrow     349.4 us (12293.7 GF/s)  default     323.2 us  default/narrow 0.93
+M=256   N=4096  K=4096  narrow     735.6 us (11677.0 GF/s)  default     602.2 us  default/narrow 0.82
+M=512   N=4096  K=4096  narrow    1432.3 us (11994.3 GF/s)  default    1190.1 us  default/narrow 0.83
+M=1024  N=4096  K=4096  narrow    2718.7 us (12638.5 GF/s)  default    2221.5 us  default/narrow 0.82
+M=16    N=2048  K=2048  narrow      61.8 us ( 2170.9 GF/s)  default      87.2 us  default/narrow 1.41
+M=32    N=2048  K=2048  narrow      53.0 us ( 5068.8 GF/s)  default      82.4 us  default/narrow 1.56
+M=64    N=2048  K=2048  narrow      49.1 us (10937.0 GF/s)  default      77.3 us  default/narrow 1.57
+M=128   N=2048  K=2048  narrow      66.5 us (16147.0 GF/s)  default      80.3 us  default/narrow 1.21
+M=256   N=2048  K=2048  narrow     112.0 us (19177.2 GF/s)  default     117.6 us  default/narrow 1.05
+M=512   N=2048  K=2048  narrow     283.6 us (15144.5 GF/s)  default     279.4 us  default/narrow 0.99
+M=1024  N=2048  K=2048  narrow     485.4 us (17697.7 GF/s)  default     475.2 us  default/narrow 0.98
+
+Reading: at M <= 64 the 64x64 tile wins at every N and K (1.35-1.74x): a
+128-row tile is at least half padding there. With full tiles the outcome
+follows grid fill: the 64x64 tile wins while fewer than 64 default tiles
+cover C (M = 128 at N <= 3072; M <= 512 at N = 768) and loses from 64 tiles
+up (0.82x at M >= 256, N = K = 4096). Selection landed as
+`n <= 512 || m <= 64 || ceil(m/128) * ceil(n/64) < 64`, pinned by
+`nn_coop_kernel_selects_the_narrow_tile_by_grid_fill` in src/gemm.rs.

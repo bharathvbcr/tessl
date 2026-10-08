@@ -29,71 +29,13 @@ inline uint2 morton_decode_2d(uint c) {
     return uint2(x, y);
 }
 
-/// True for the grids `tile_from_linear` walks in Morton order: square, with
-/// a power-of-two side.
-inline bool tile_grid_is_morton(uint tiles_n, uint tiles_m) {
-    return tiles_n == tiles_m && tiles_n != 0u && (tiles_n & (tiles_n - 1u)) == 0u;
-}
-
 /// Decode linear TG id → (x, y) tile. Uses Morton when the grid is square and
 /// power-of-two (cache-friendly); otherwise compact row-major (avoids pad tax).
 inline uint2 tile_from_linear(uint linear, uint tiles_n, uint tiles_m) {
-    if (tile_grid_is_morton(tiles_n, tiles_m)) {
+    if (tiles_n == tiles_m && tiles_n != 0u && (tiles_n & (tiles_n - 1u)) == 0u) {
         return morton_decode_2d(linear);
     }
     return uint2(linear % tiles_n, linear / tiles_n);
-}
-
-/// Decode linear TG id → (x, y) tile by column panels: bands of `ph` tile
-/// rows, each walked down a column before moving right. Threadgroups that run
-/// together then share B tiles, so B is read once per band instead of once
-/// per tile row. An id past the grid decodes to (tiles_n, tiles_m), which
-/// every caller's bounds check rejects.
-inline uint2 tile_from_linear_panel(uint linear, uint tiles_n, uint tiles_m, uint ph) {
-    if (linear >= tiles_n * tiles_m) return uint2(tiles_n, tiles_m);
-    uint band = linear / (ph * tiles_n);
-    uint rem = linear - band * ph * tiles_n;
-    uint local_h = min(ph, tiles_m - band * ph);
-    return uint2(rem / local_h, band * ph + rem % local_h);
-}
-
-/// Tile walk of the exact-f32, the bf16 TN/NT coop and the int8 dequant
-/// kernels, `SM` rows per tile. Every tile row reads all of B (the N×K
-/// operand), so row-major order re-reads B once per tile row. That is free
-/// while B stays in cache and DRAM-bound once it does not: the LM head's
-/// 50304×768 f32 weight ran at ~2.3 TFLOP/s against ~6.5 at N ≤ 2304. Column
-/// panels of `PANEL_BAND_ROWS` rows of C read B once per band instead, so the
-/// walk is chosen by B's size, not the grid's; a grid `tile_from_linear`
-/// walks in Morton order keeps Morton.
-///
-/// M5 Pro, panel time over the walk it replaces:
-/// - exact f32 (ojas bench/results/2026-10-02-gemm, interleaved A/B, min of
-///   4): 0.39–0.47× for NT with B ≥ 50 MB and 0.77× for TN at 32 MB, but
-///   ~1.08× for TN at 12.6 MB; 25 MB was within run-to-run noise.
-/// - bf16 coop, 512-row bands (ojas bench/results/2026-10-06-gemm-bf16,
-///   in-process sweep, median of per-round ratios over 3–6 rounds):
-///   0.45–0.95× with B ≥ 24 MiB (0.45–0.73× at K = 768), 0.73–1.01× at
-///   20 MiB, 0.87–1.02× at 16 MiB and 0.91–1.00× at 12 MiB. Against Morton
-///   on square power-of-two grids, 0.98–1.04×.
-/// - int8 dequant (same directory, production A/B, median of 6 paired
-///   rounds): 0.73–0.77× with B ≥ 24 MiB, 0.91× at 16 MiB and 0.99–1.00× at
-///   8–12 MiB. The same A/B put Morton at 0.99–1.02× of panels for exact f32
-///   on square power-of-two grids, so those keep Morton too.
-///
-/// So the gate counts B's elements: 2^23 is the 32 MiB of f32 the exact
-/// kernels' A/B chose, 16 MiB of bf16, where the coop kernels stop losing,
-/// and 8 MiB of int8, where panels neither win nor lose. Bands of 512 rows
-/// (16 tile rows of 32, 4 of 128, 8 of 64) were best or within noise of 1024
-/// and 2048 everywhere but bf16 NT at K = 768 (0.64× against 0.61×), and
-/// 1024 lost up to 10% on bf16 TN accumulate.
-constexpr constant ulong PANEL_MIN_B_ELEMS = 1ul << 23;
-constexpr constant uint PANEL_BAND_ROWS = 512u;
-template <int SM>
-inline uint2 tile_walk(uint linear, uint tiles_n, uint tiles_m, uint N, uint K) {
-    if ((ulong)N * (ulong)K >= PANEL_MIN_B_ELEMS && !tile_grid_is_morton(tiles_n, tiles_m)) {
-        return tile_from_linear_panel(linear, tiles_n, tiles_m, PANEL_BAND_ROWS / (uint)SM);
-    }
-    return tile_from_linear(linear, tiles_n, tiles_m);
 }
 
 // =============================================================================
@@ -119,7 +61,7 @@ kernel void matmul2d_tensorops_f32(
                             matmul2d_descriptor::mode::multiply);
     matmul2d<desc, execution_simdgroup> op;
 
-    uint2 tile = tile_walk<SM>(tgpig, tiles_n, tiles_m, N, K);
+    uint2 tile = tile_from_linear(tgpig, tiles_n, tiles_m);
     if (tile.x >= tiles_n || tile.y >= tiles_m) return;
     int tx = (int)tile.x * SN;
     int ty = (int)tile.y * SM;
@@ -168,7 +110,7 @@ kernel void matmul2d_tensorops_tn_f32(
                             matmul2d_descriptor::mode::multiply);
     matmul2d<desc, execution_simdgroup> op;
 
-    uint2 tile = tile_walk<SM>(tgpig, tiles_n, tiles_m, N, K);
+    uint2 tile = tile_from_linear(tgpig, tiles_n, tiles_m);
     if (tile.x >= tiles_n || tile.y >= tiles_m) return;
     int tx = (int)tile.x * SN;
     int ty = (int)tile.y * SM;
@@ -215,7 +157,7 @@ kernel void matmul2d_tensorops_nt_f32(
                             matmul2d_descriptor::mode::multiply);
     matmul2d<desc, execution_simdgroup> op;
 
-    uint2 tile = tile_walk<SM>(tgpig, tiles_n, tiles_m, N, K);
+    uint2 tile = tile_from_linear(tgpig, tiles_n, tiles_m);
     if (tile.x >= tiles_n || tile.y >= tiles_m) return;
     int tx = (int)tile.x * SN;
     int ty = (int)tile.y * SM;
@@ -261,7 +203,7 @@ kernel void matmul2d_tensorops_tn_accum_f32(
                             matmul2d_descriptor::mode::multiply_accumulate);
     matmul2d<desc, execution_simdgroup> op;
 
-    uint2 tile = tile_walk<SM>(tgpig, tiles_n, tiles_m, N, K);
+    uint2 tile = tile_from_linear(tgpig, tiles_n, tiles_m);
     if (tile.x >= tiles_n || tile.y >= tiles_m) return;
     int tx = (int)tile.x * SN;
     int ty = (int)tile.y * SM;
@@ -306,7 +248,7 @@ kernel void matmul2d_tensorops_nt_accum_f32(
                             matmul2d_descriptor::mode::multiply_accumulate);
     matmul2d<desc, execution_simdgroup> op;
 
-    uint2 tile = tile_walk<SM>(tgpig, tiles_n, tiles_m, N, K);
+    uint2 tile = tile_from_linear(tgpig, tiles_n, tiles_m);
     if (tile.x >= tiles_n || tile.y >= tiles_m) return;
     int tx = (int)tile.x * SN;
     int ty = (int)tile.y * SM;
@@ -363,104 +305,6 @@ kernel void matmul2d_tensorops_tn_splitk_f32(
     auto mC = tensor(C, dextents<int, 2>{(int)N, (int)M}, array<int, 2>{1, (int)N});
 
     auto tA = mA.slice(ty, 0);
-    auto tB = mB.slice(tx, 0);
-    auto tC = mC.slice(tx, ty);
-    op.run(tA, tB, tC);
-}
-
-/// Split-K TN with every K-partition in one dispatch, for a C of few tiles
-/// over a long K: a weight gradient of a handful of rows, such as
-/// `d_pre^T · x` at [12, 768] over 4096 rows (24 tiles). One dispatch over
-/// all of K gives such a C only `tiles_n · tiles_m` threadgroups, each
-/// walking the whole of K, and the sequential split-K above keeps that count
-/// per partition. Here threadgroup `p · tiles + t` computes tile `t` of
-/// partition `p` (K from `p · k_tile`) into slice `p` of a zeroed scratch
-/// `S` of `partitions` slices `slice` floats apart (M·N rounded up to a
-/// multiple of 4, so every slice starts 16-byte aligned, as each partition's
-/// start in A and B does with `k_tile` a multiple of 4);
-/// `reduce_partitions_f32` then adds the slices into C in partition order.
-kernel void matmul2d_tensorops_tn_splitk_par_f32(
-    device float *A [[buffer(0)]],
-    device float *B [[buffer(1)]],
-    device float *S [[buffer(2)]],
-    constant uint &M [[buffer(3)]],
-    constant uint &N [[buffer(4)]],
-    constant uint &K [[buffer(5)]],
-    constant uint &k_tile [[buffer(6)]],
-    constant uint &tiles_n [[buffer(7)]],
-    constant uint &tiles_m [[buffer(8)]],
-    constant uint &partitions [[buffer(9)]],
-    constant uint &slice [[buffer(10)]],
-    uint tgpig [[threadgroup_position_in_grid]])
-{
-    constexpr int SM = 32;
-    constexpr int SN = 32;
-    constexpr auto desc =
-        matmul2d_descriptor(SM, SN, dynamic_length_v<int>, true, false, false,
-                            matmul2d_descriptor::mode::multiply);
-    matmul2d<desc, execution_simdgroup> op;
-
-    const uint tiles = tiles_n * tiles_m;
-    if (tiles == 0u) return;
-    const uint p = tgpig / tiles;
-    if (p >= partitions) return;
-    uint2 tile = tile_from_linear(tgpig - p * tiles, tiles_n, tiles_m);
-    if (tile.x >= tiles_n || tile.y >= tiles_m) return;
-    const ulong k0 = (ulong)p * k_tile;
-    if (k0 >= K) return;
-    int tx = (int)tile.x * SN;
-    int ty = (int)tile.y * SM;
-
-    uint k_len = (uint)min((ulong)k_tile, (ulong)K - k0);
-    auto mA = tensor(A + k0 * M, dextents<int, 2>{(int)M, (int)k_len}, array<int, 2>{1, (int)M});
-    auto mB = tensor(B + k0 * N, dextents<int, 2>{(int)N, (int)k_len}, array<int, 2>{1, (int)N});
-    auto mS = tensor(S + (ulong)p * slice, dextents<int, 2>{(int)N, (int)M}, array<int, 2>{1, (int)N});
-
-    auto tA = mA.slice(ty, 0);
-    auto tB = mB.slice(tx, 0);
-    auto tS = mS.slice(tx, ty);
-    op.run(tA, tB, tS);
-}
-
-/// Split-K NN accumulate for one K-partition: C[M,N] += A[M, k0:k0+len] @
-/// B[k0:k0+len, N], with C zeroed by the host first. For a long K the host
-/// cuts K into partitions whose slice of B fits in cache. One dispatch over
-/// the whole K re-reads all of B for every 32-row tile row, the same B-bound
-/// walk as the LM head's NT, and a column-panel walk does not help when each
-/// tile's A slab is K long as well.
-kernel void matmul2d_tensorops_nn_splitk_f32(
-    device float *A [[buffer(0)]],
-    device float *B [[buffer(1)]],
-    device float *C [[buffer(2)]],
-    constant uint &M [[buffer(3)]],
-    constant uint &N [[buffer(4)]],
-    constant uint &K [[buffer(5)]],
-    constant uint &k0 [[buffer(6)]],
-    constant uint &k_tile [[buffer(7)]],
-    constant uint &tiles_n [[buffer(8)]],
-    constant uint &tiles_m [[buffer(9)]],
-    uint tgpig [[threadgroup_position_in_grid]])
-{
-    constexpr int SM = 32;
-    constexpr int SN = 32;
-    constexpr auto mmul_mode = matmul2d_descriptor::mode::multiply_accumulate;
-    constexpr auto desc =
-        matmul2d_descriptor(SM, SN, dynamic_length_v<int>, false, false, false, mmul_mode);
-    matmul2d<desc, execution_simdgroup> op;
-
-    uint2 tile = tile_from_linear(tgpig, tiles_n, tiles_m);
-    if (tile.x >= tiles_n || tile.y >= tiles_m) return;
-    int tx = (int)tile.x * SN;
-    int ty = (int)tile.y * SM;
-
-    // A[M,K] row-major: the partition is columns k0.. of each row (row stride
-    // K). B[K,N] row-major: the partition is rows k0.. (contiguous).
-    uint k_len = min(k_tile, K - k0);
-    auto mA = tensor(A + k0, dextents<int, 2>{(int)k_len, (int)M}, array<int, 2>{1, (int)K});
-    auto mB = tensor(B + k0 * N, dextents<int, 2>{(int)N, (int)k_len}, array<int, 2>{1, (int)N});
-    auto mC = tensor(C, dextents<int, 2>{(int)N, (int)M}, array<int, 2>{1, (int)N});
-
-    auto tA = mA.slice(0, ty);
     auto tB = mB.slice(tx, 0);
     auto tC = mC.slice(tx, ty);
     op.run(tA, tB, tC);
@@ -533,11 +377,9 @@ enum GemmActivation : uint {
     GEMM_ACT_SILU = 3u,
 };
 
-static inline float gemm_apply_activation(float v, GemmActivation act) {
+static inline float gemm_apply_activation(float v, uint act) {
     switch (act) {
         case GEMM_ACT_RELU: return fmax(v, 0.0f);
-        // The crate's one GELU (gelu.h), shared with mlp_gelu_tanh and the q4
-        // gate/up GEMVs. A local copy here once clipped the output at 20.
         case GEMM_ACT_GELU_TANH: return tessl_gelu_pytorch_tanh(v);
         // silu(x) = x * sigmoid(x), matching `mlp_silu.metal`.
         case GEMM_ACT_SILU: return v / (1.0f + exp(-v));
@@ -545,10 +387,7 @@ static inline float gemm_apply_activation(float v, GemmActivation act) {
     }
 }
 
-// A call with no explicit template arguments is the production geometry:
-// 128×64, sg4, strict, no epilogue (`matmul2d_tensorops_bf16_f32`).
-template <typename ElemT, int SM = 128, int SN = 64, int NSG = 4,
-          bool RELAXED = false, bool EPILOGUE = false>
+template <typename ElemT, int SM, int SN, int NSG, bool RELAXED, bool EPILOGUE>
 inline void mm_nn_coop_f32acc(device ElemT *A, device ElemT *B, device float *C,
                               uint M, uint N, uint K, uint tiles_n,
                               uint tiles_m, uint tgpig,
@@ -564,7 +403,11 @@ inline void mm_nn_coop_f32acc(device ElemT *A, device ElemT *B, device float *C,
     // tall_k1024/mlp_up, gated off where it measured -3% (square_2048).
     uint2 tile;
     if (tiles_n * tiles_m >= 2048u) {
-        tile = tile_from_linear_panel(tgpig, tiles_n, tiles_m, 8u);
+        constexpr uint PH = 8;
+        uint band = tgpig / (PH * tiles_n);
+        uint rem = tgpig - band * PH * tiles_n;
+        uint local_h = min(PH, tiles_m - band * PH);
+        tile = uint2(rem / local_h, band * PH + rem % local_h);
     } else {
         tile = tile_from_linear(tgpig, tiles_n, tiles_m);
     }
@@ -583,10 +426,6 @@ inline void mm_nn_coop_f32acc(device ElemT *A, device ElemT *B, device float *C,
         auto cT = op.template get_destination_cooperative_tensor<
             metal::remove_addrspace_t<decltype(tA)>,
             metal::remove_addrspace_t<decltype(tB)>, float>();
-        // set() wraps the is_valid_element mask check.
-#pragma clang loop unroll(full)
-        for (uint16_t i = 0; i < cT.get_capacity(); ++i)
-            cT.set(i, 0.0f);
         op.run(tA, tB, cT);
         if (EPILOGUE) {
             // `beta * C_prev` reuses the accumulate path's trick: a second
@@ -622,7 +461,7 @@ inline void mm_nn_coop_f32acc(device ElemT *A, device ElemT *B, device float *C,
             if (act != GEMM_ACT_NONE) {
 #pragma clang loop unroll(full)
                 for (uint16_t i = 0; i < cT.get_capacity(); ++i)
-                    if (cT.is_valid_element(i)) cT[i] = gemm_apply_activation(cT[i], (GemmActivation)act);
+                    if (cT.is_valid_element(i)) cT[i] = gemm_apply_activation(cT[i], act);
             }
         }
         cT.store(tC);
@@ -636,9 +475,6 @@ inline void mm_nn_coop_f32acc(device ElemT *A, device ElemT *B, device float *C,
         auto cT = op.template get_destination_cooperative_tensor<
             metal::remove_addrspace_t<decltype(tA)>,
             metal::remove_addrspace_t<decltype(tB)>, float>();
-#pragma clang loop unroll(full)
-        for (uint16_t i = 0; i < cT.get_capacity(); ++i)
-            cT.set(i, 0.0f);
         op.run(tA, tB, cT);
         if (EPILOGUE) {
             if (beta != 0.0f) {
@@ -671,7 +507,7 @@ inline void mm_nn_coop_f32acc(device ElemT *A, device ElemT *B, device float *C,
             if (act != GEMM_ACT_NONE) {
 #pragma clang loop unroll(full)
                 for (uint16_t i = 0; i < cT.get_capacity(); ++i)
-                    if (cT.is_valid_element(i)) cT[i] = gemm_apply_activation(cT[i], (GemmActivation)act);
+                    if (cT.is_valid_element(i)) cT[i] = gemm_apply_activation(cT[i], act);
             }
         }
         cT.store(tC);
@@ -692,21 +528,7 @@ inline void mm_nn_coop_f32acc(device ElemT *A, device ElemT *B, device float *C,
             A, B, C, M, N, K, tiles_n, tiles_m, tgpig, nullptr, 1.0f, 0.0f, 0u);\
     }
 
-// Written out, rather than stamped by NN_COOP_KERNEL, so the helper is called
-// with no template argument list. The defaults above are this kernel.
-kernel void matmul2d_tensorops_bf16_f32(
-    device bfloat *A [[buffer(0)]],
-    device bfloat *B [[buffer(1)]],
-    device float *C [[buffer(2)]],
-    constant uint &M [[buffer(3)]],
-    constant uint &N [[buffer(4)]],
-    constant uint &K [[buffer(5)]],
-    constant uint &tiles_n [[buffer(6)]],
-    constant uint &tiles_m [[buffer(7)]],
-    uint tgpig [[threadgroup_position_in_grid]]) {
-    mm_nn_coop_f32acc(A, B, C, M, N, K, tiles_n, tiles_m, tgpig, nullptr, 1.0f,
-                      0.0f, 0u);
-}
+NN_COOP_KERNEL(matmul2d_tensorops_bf16_f32,            bfloat, 128, 64, 4, false)
 NN_COOP_KERNEL(matmul2d_tensorops_bf16_f32_64x64_sg4,  bfloat,  64, 64, 4, false)
 NN_COOP_KERNEL(matmul2d_tensorops_f32_relaxed,            float, 128, 64, 4, true)
 NN_COOP_KERNEL(matmul2d_tensorops_f32_relaxed_64x64_sg4,  float,  64, 64, 4, true)
@@ -727,7 +549,9 @@ NN_COOP_KERNEL(matmul2d_tensorops_f32_relaxed_64x64_sg4,  float,  64, 64, 4, tru
 /// header's own diagnostic lists the supported cooperative source types as
 /// `uint8_t/int8_t/uint4b_format/int4b_format/float/half/bfloat`. The products
 /// are exact in int32 for any K below 2^17 at full int8 range, so the
-/// accumulation carries no rounding at all, unlike the f32 paths.
+/// accumulation is exact in int32; the one rounding is the int32 -> f32
+/// conversion at the store, which is exact within 2^24 and correctly rounded
+/// past it (see `nn::gemm_i8_dequant`).
 ///
 /// The dequantization happens in registers between the accumulate and the
 /// store, for the same reason the epilogue does: applied afterwards it would be
@@ -735,9 +559,7 @@ NN_COOP_KERNEL(matmul2d_tensorops_f32_relaxed_64x64_sg4,  float,  64, 64, 4, tru
 ///
 /// `b_scale` is per output column, which is where a per-channel weight scale
 /// lives. It is read through the row-stride-0 broadcast the epilogue uses.
-// A call with no explicit template arguments is 128×64 sg4
-// (`matmul2d_tensorops_i8_f32`).
-template <int SM = 128, int SN = 64, int NSG = 4>
+template <int SM, int SN, int NSG>
 inline void mm_i8_dequant_coop(device int8_t *A, device int8_t *B, device float *C,
                                device const float *b_scale, float a_scale,
                                uint M, uint N, uint K, uint tiles_n,
@@ -747,7 +569,7 @@ inline void mm_i8_dequant_coop(device int8_t *A, device int8_t *B, device float 
         matmul2d_descriptor::mode::multiply);
     matmul2d<d, execution_simdgroups<NSG>> op;
 
-    uint2 tile = tile_walk<SM>(tgpig, tiles_n, tiles_m, N, K);
+    uint2 tile = tile_from_linear(tgpig, tiles_n, tiles_m);
     if (tile.x >= tiles_n || tile.y >= tiles_m) return;
     int tx = (int)tile.x * SN;
     int ty = (int)tile.y * SM;
@@ -789,22 +611,25 @@ inline void mm_i8_dequant_coop(device int8_t *A, device int8_t *B, device float 
     outT.store(tC);
 }
 
-kernel void matmul2d_tensorops_i8_f32(
-    device int8_t *A [[buffer(0)]],
-    device int8_t *B [[buffer(1)]],
-    device float *C [[buffer(2)]],
-    constant uint &M [[buffer(3)]],
-    constant uint &N [[buffer(4)]],
-    constant uint &K [[buffer(5)]],
-    constant uint &tiles_n [[buffer(6)]],
-    constant uint &tiles_m [[buffer(7)]],
-    device const float *b_scale [[buffer(8)]],
-    constant float &a_scale [[buffer(9)]],
-    constant uint &has_scale [[buffer(10)]],
-    uint tgpig [[threadgroup_position_in_grid]]) {
-    mm_i8_dequant_coop(A, B, C, has_scale ? b_scale : nullptr, a_scale, M, N, K,
-                       tiles_n, tiles_m, tgpig);
-}
+#define I8_DEQUANT_KERNEL(NAME, SM, SN, NSG)                                   \
+    kernel void NAME(device int8_t *A [[buffer(0)]],                           \
+                     device int8_t *B [[buffer(1)]],                           \
+                     device float *C [[buffer(2)]],                            \
+                     constant uint &M [[buffer(3)]],                           \
+                     constant uint &N [[buffer(4)]],                           \
+                     constant uint &K [[buffer(5)]],                           \
+                     constant uint &tiles_n [[buffer(6)]],                     \
+                     constant uint &tiles_m [[buffer(7)]],                     \
+                     device const float *b_scale [[buffer(8)]],                \
+                     constant float &a_scale [[buffer(9)]],                    \
+                     constant uint &has_scale [[buffer(10)]],                  \
+                     uint tgpig [[threadgroup_position_in_grid]]) {            \
+        mm_i8_dequant_coop<SM, SN, NSG>(A, B, C, has_scale ? b_scale : nullptr,\
+                                        a_scale, M, N, K, tiles_n, tiles_m,    \
+                                        tgpig);                                \
+    }
+
+I8_DEQUANT_KERNEL(matmul2d_tensorops_i8_f32, 128, 64, 4)
 
 /// Strided batched NN GEMM.
 ///
@@ -869,12 +694,8 @@ NN_COOP_KERNEL(matmul2d_tensorops_f16_f32,             half, 128, 64, 4, false)
 NN_COOP_KERNEL(matmul2d_tensorops_f16_f32_64x64_sg4,   half,  64, 64, 4, false)
 NN_COOP_EPI_KERNEL(matmul2d_tensorops_f16_f32_epi,     half, 128, 64, 4, false)
 
-NN_COOP_EPI_KERNEL(matmul2d_tensorops_bf16_f32_epi,           bfloat, 128, 64, 4, false)
-// Same epilogue, 64×64 sg4. The non-epilogue NN kernel already instantiates
-// this geometry; this is that instantiation with EPILOGUE=true. Host selects
-// it only when M does not fill a 128-row tile.
-NN_COOP_EPI_KERNEL(matmul2d_tensorops_bf16_f32_epi_64x64_sg4, bfloat,  64, 64, 4, false)
-NN_COOP_EPI_KERNEL(matmul2d_tensorops_f32_relaxed_epi,         float, 128, 64, 4, true)
+NN_COOP_EPI_KERNEL(matmul2d_tensorops_bf16_f32_epi,    bfloat, 128, 64, 4, false)
+NN_COOP_EPI_KERNEL(matmul2d_tensorops_f32_relaxed_epi,  float, 128, 64, 4, true)
 
 /// TN / NT bf16 GEMMs — cooperative destination tensor (2026-08-30 round 2,
 /// bench/results/bf16_tnnt_coop_m5pro.txt): register accumulator, C touched
@@ -892,7 +713,7 @@ inline void mm_tn_coop_bf16(device bfloat *A, device bfloat *B, device float *C,
         matmul2d_descriptor::mode::multiply);
     matmul2d<d, execution_simdgroups<NSG>> op;
 
-    uint2 tile = tile_walk<SM>(tgpig, tiles_n, tiles_m, N, K);
+    uint2 tile = tile_from_linear(tgpig, tiles_n, tiles_m);
     if (tile.x >= tiles_n || tile.y >= tiles_m) return;
     int tx = (int)tile.x * SN;
     int ty = (int)tile.y * SM;
@@ -908,9 +729,6 @@ inline void mm_tn_coop_bf16(device bfloat *A, device bfloat *B, device float *C,
         auto cT = op.template get_destination_cooperative_tensor<
             metal::remove_addrspace_t<decltype(tA)>,
             metal::remove_addrspace_t<decltype(tB)>, float>();
-#pragma clang loop unroll(full)
-        for (uint16_t i = 0; i < cT.get_capacity(); ++i)
-            cT.set(i, 0.0f);
         op.run(tA, tB, cT);
         if (ACCUM) {
             auto prevT = op.template get_destination_cooperative_tensor<
@@ -934,9 +752,6 @@ inline void mm_tn_coop_bf16(device bfloat *A, device bfloat *B, device float *C,
         auto cT = op.template get_destination_cooperative_tensor<
             metal::remove_addrspace_t<decltype(tA)>,
             metal::remove_addrspace_t<decltype(tB)>, float>();
-#pragma clang loop unroll(full)
-        for (uint16_t i = 0; i < cT.get_capacity(); ++i)
-            cT.set(i, 0.0f);
         op.run(tA, tB, cT);
         if (ACCUM) {
             auto prevT = op.template get_destination_cooperative_tensor<
@@ -962,7 +777,7 @@ inline void mm_nt_coop_bf16(device bfloat *A, device bfloat *B, device float *C,
         matmul2d_descriptor::mode::multiply);
     matmul2d<d, execution_simdgroups<NSG>> op;
 
-    uint2 tile = tile_walk<SM>(tgpig, tiles_n, tiles_m, N, K);
+    uint2 tile = tile_from_linear(tgpig, tiles_n, tiles_m);
     if (tile.x >= tiles_n || tile.y >= tiles_m) return;
     int tx = (int)tile.x * SN;
     int ty = (int)tile.y * SM;
@@ -978,9 +793,6 @@ inline void mm_nt_coop_bf16(device bfloat *A, device bfloat *B, device float *C,
         auto cT = op.template get_destination_cooperative_tensor<
             metal::remove_addrspace_t<decltype(tA)>,
             metal::remove_addrspace_t<decltype(tB)>, float>();
-#pragma clang loop unroll(full)
-        for (uint16_t i = 0; i < cT.get_capacity(); ++i)
-            cT.set(i, 0.0f);
         op.run(tA, tB, cT);
         if (ACCUM) {
             auto prevT = op.template get_destination_cooperative_tensor<
@@ -1004,9 +816,6 @@ inline void mm_nt_coop_bf16(device bfloat *A, device bfloat *B, device float *C,
         auto cT = op.template get_destination_cooperative_tensor<
             metal::remove_addrspace_t<decltype(tA)>,
             metal::remove_addrspace_t<decltype(tB)>, float>();
-#pragma clang loop unroll(full)
-        for (uint16_t i = 0; i < cT.get_capacity(); ++i)
-            cT.set(i, 0.0f);
         op.run(tA, tB, cT);
         if (ACCUM) {
             auto prevT = op.template get_destination_cooperative_tensor<

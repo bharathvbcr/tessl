@@ -7,15 +7,32 @@
 
 mod common;
 
-use common::{buf, empty, gelu_pytorch_tanh, random_f32, with_gpu};
+use common::{random_f32, with_gpu};
+use std::sync::Arc;
 use tessl::nn;
 use tessl::tensor::bf16_bits_to_f32;
+use tessl::GpuRuntime;
+
+fn buf(rt: &Arc<GpuRuntime>, data: &[f32]) -> tessl::tensor::GpuBuffer {
+    let b = rt.alloc_buffer(data.len().max(1) * 4).expect("alloc");
+    b.write_f32(data);
+    b
+}
+
+fn empty(rt: &Arc<GpuRuntime>, elems: usize) -> tessl::tensor::GpuBuffer {
+    let b = rt.alloc_buffer(elems.max(1) * 4).expect("alloc");
+    b.zero();
+    b
+}
 
 /// Assert `got ≈ want` with an absolute tolerance scaled to the accumulation.
 fn close(what: &str, got: &[f32], want: &[f32], tol: f32) {
     assert_eq!(got.len(), want.len(), "{what}: length");
     for (i, (g, w)) in got.iter().zip(want).enumerate() {
-        assert!((g - w).abs() <= tol, "{what}[{i}]: got {g} want {w} (tol {tol})");
+        assert!(
+            (g - w).abs() <= tol,
+            "{what}[{i}]: got {g} want {w} (tol {tol})"
+        );
     }
 }
 
@@ -121,11 +138,16 @@ fn rms_norm_residual_add_folds_the_layer_scale() {
         let wb = buf(rt, &w);
         let rb = buf(rt, &resid);
 
-        nn::rms_norm_residual_add_f32(rt, &xb, &wb, &rb, rows as u32, dim as u32, eps, scale).unwrap();
+        nn::rms_norm_residual_add_f32(rt, &xb, &wb, &rb, rows as u32, dim as u32, eps, scale)
+            .unwrap();
         rt.synchronize().unwrap();
 
         let norm = rms_norm_ref(&x, &w, rows, dim, eps);
-        let want: Vec<f32> = resid.iter().zip(&norm).map(|(r, n)| scale * (r + n)).collect();
+        let want: Vec<f32> = resid
+            .iter()
+            .zip(&norm)
+            .map(|(r, n)| scale * (r + n))
+            .collect();
         let got = rb.read_f32();
         assert!(
             got[..rows * dim].iter().all(|v| v.is_finite()),
@@ -172,7 +194,10 @@ fn rms_norm_sums_rows_wider_than_one_threadgroup() {
             let want = rms_norm_ref_f64(&x, &w, rows, dim, eps);
             for (i, (g, wv)) in got[..rows * dim].iter().zip(&want).enumerate() {
                 let tol = 1e-5 * wv.abs().max(1e-3);
-                assert!((g - wv).abs() <= tol, "rms_norm {rows}x{dim} [{i}]: got {g} want {wv}");
+                assert!(
+                    (g - wv).abs() <= tol,
+                    "rms_norm {rows}x{dim} [{i}]: got {g} want {wv}"
+                );
             }
         }
     });
@@ -207,18 +232,25 @@ fn rms_norm_siblings_handle_rows_wider_than_one_threadgroup() {
             .collect();
         for (i, (g, wv)) in got.iter().zip(&want).enumerate() {
             let tol = 1e-2 * wv.abs().max(1e-3);
-            assert!((g - wv).abs() <= tol, "rms_norm_bf16 wide [{i}]: {g} vs {wv}");
+            assert!(
+                (g - wv).abs() <= tol,
+                "rms_norm_bf16 wide [{i}]: {g} vs {wv}"
+            );
         }
 
         // residual_add with layer_scale = 1: resid += norm.
         let resid = vec![0.0f32; rows * dim];
         let rb = buf(rt, &resid);
-        nn::rms_norm_residual_add_f32(rt, &xb, &wb, &rb, rows as u32, dim as u32, eps, 1.0).unwrap();
+        nn::rms_norm_residual_add_f32(rt, &xb, &wb, &rb, rows as u32, dim as u32, eps, 1.0)
+            .unwrap();
         rt.synchronize().unwrap();
         let got = rb.read_f32();
         for (i, (g, wv)) in got[..rows * dim].iter().zip(&want).enumerate() {
             let tol = 1e-5 * wv.abs().max(1e-3);
-            assert!((g - wv).abs() <= tol, "rms_norm_residual_add wide [{i}]: {g} vs {wv}");
+            assert!(
+                (g - wv).abs() <= tol,
+                "rms_norm_residual_add wide [{i}]: {g} vs {wv}"
+            );
         }
     });
 }
@@ -285,11 +317,20 @@ fn mlp_gelu_tanh_stays_finite_where_fast_tanh_would_nan() {
             "mlp_gelu_tanh produced a non-finite value on |x| up to 64"
         );
 
-        // The cubic is clamped; the outer factor is the original x, matching gelu.h.
+        // Clamp only the cubic argument. GELU itself is asymptotically the
+        // identity for large positive x; clamping the final multiplier turns
+        // every x > 20 into approximately 20 and is a silent activation clip.
         let want: Vec<f32> = gate
             .iter()
             .zip(&up)
-            .map(|(x, u)| (gelu_pytorch_tanh(*x as f64) * (*u as f64)) as f32)
+            .map(|(x, u)| {
+                // f64 reference: the kernel works in f32, so computing the
+                // expected value at the same precision would hide a real f32
+                // ordering bug behind matching rounding.
+                let xc = (*x as f64).clamp(-20.0, 20.0);
+                let inner = 0.7978845608028654 * (xc + 0.044715 * xc * xc * xc);
+                (0.5 * (*x as f64) * (1.0 + inner.clamp(-10.0, 10.0).tanh()) * (*u as f64)) as f32
+            })
             .collect();
         close("mlp_gelu_tanh", &got[..n], &want, 1e-4);
     });
@@ -328,7 +369,9 @@ fn gemv_q8_matches_cpu_dequant_reference() {
     with_gpu(|rt| {
         let (rows, cols, group) = (24usize, 64usize, 16usize);
         let groups = rows * (cols / group);
-        let packed: Vec<i8> = (0..rows * cols).map(|i| (i as i32 % 251 - 125) as i8).collect();
+        let packed: Vec<i8> = (0..rows * cols)
+            .map(|i| (i as i32 % 251 - 125) as i8)
+            .collect();
         let scales: Vec<f32> = (0..groups).map(|i| 0.01 + (i % 7) as f32 * 0.003).collect();
         let zeros: Vec<f32> = (0..groups).map(|i| (i % 5) as f32 - 2.0).collect();
         let x = random_f32(cols, 0x71);
@@ -340,7 +383,18 @@ fn gemv_q8_matches_cpu_dequant_reference() {
         let xb = buf(rt, &x);
         let yb = empty(rt, rows);
 
-        nn::gemv_q8(rt, &pb, &sb, &zb, &xb, &yb, rows as u32, cols as u32, group as u32).unwrap();
+        nn::gemv_q8(
+            rt,
+            &pb,
+            &sb,
+            &zb,
+            &xb,
+            &yb,
+            rows as u32,
+            cols as u32,
+            group as u32,
+        )
+        .unwrap();
         rt.synchronize().unwrap();
 
         let mut want = vec![0.0f32; rows];
@@ -377,7 +431,8 @@ fn gemv_q8_ref(
             for g in 0..gpr {
                 let gi = r * gpr + g;
                 for i in 0..group {
-                    let w = scales[gi] as f64 * (packed[r * cols + g * group + i] as f64 - zeros[gi] as f64);
+                    let w = scales[gi] as f64
+                        * (packed[r * cols + g * group + i] as f64 - zeros[gi] as f64);
                     acc += w * x[g * group + i] as f64;
                 }
             }
@@ -405,7 +460,9 @@ fn gemv_q8_covers_the_row_tail_and_the_scalar_fallback() {
             (13, 120, 15),
             (100, 4096, 64),
         ] {
-            let packed: Vec<i8> = (0..rows * cols).map(|i| (i as i32 % 251 - 125) as i8).collect();
+            let packed: Vec<i8> = (0..rows * cols)
+                .map(|i| (i as i32 % 251 - 125) as i8)
+                .collect();
             let groups = rows * (cols / group);
             let scales: Vec<f32> = (0..groups).map(|i| 0.01 + (i % 7) as f32 * 0.003).collect();
             let zeros: Vec<f32> = (0..groups).map(|i| (i % 5) as f32 - 2.0).collect();
@@ -424,7 +481,18 @@ fn gemv_q8_covers_the_row_tail_and_the_scalar_fallback() {
             const SENTINEL: f32 = -12345.0;
             let yb = buf(rt, &vec![SENTINEL; rows + 16]);
 
-            nn::gemv_q8(rt, &pb, &sb, &zb, &xb, &yb, rows as u32, cols as u32, group as u32).unwrap();
+            nn::gemv_q8(
+                rt,
+                &pb,
+                &sb,
+                &zb,
+                &xb,
+                &yb,
+                rows as u32,
+                cols as u32,
+                group as u32,
+            )
+            .unwrap();
             rt.synchronize().unwrap();
 
             let got = yb.read_f32();
@@ -465,7 +533,9 @@ fn gemv_q4_tiled_writes_every_row_and_agrees_with_the_row_kernel() {
         // rows must exceed the 128 threads the row kernel groups by, or the two
         // grids coincide and the bug is invisible. 512 and a ragged 300 both do.
         for &(rows, cols, group) in &[(512usize, 256usize, 64usize), (300, 128, 32)] {
-            let packed: Vec<u8> = (0..rows * cols / 2).map(|i| ((i * 7) % 251) as u8).collect();
+            let packed: Vec<u8> = (0..rows * cols / 2)
+                .map(|i| ((i * 7) % 251) as u8)
+                .collect();
             let groups = rows * (cols / group);
             let scales: Vec<f32> = (0..groups).map(|i| 0.02 + (i % 5) as f32 * 0.001).collect();
             let zeros: Vec<f32> = (0..groups).map(|i| 7.0 + (i % 3) as f32).collect();
@@ -561,9 +631,12 @@ fn undersized_buffers_are_refused_before_any_dispatch() {
             ("weight", &full, &empty(rt, dim as usize - 1), &full),
             ("out", &full, &w, &short),
         ] {
-            let err =
-                nn::rms_norm_f32(rt, x, weight, out, rows, dim, 1e-6).expect_err("undersized {name} must be refused");
-            assert!(err.contains("buffer holds"), "{name}: unexpected error {err:?}");
+            let err = nn::rms_norm_f32(rt, x, weight, out, rows, dim, 1e-6)
+                .expect_err("undersized {name} must be refused");
+            assert!(
+                err.contains("buffer holds"),
+                "{name}: unexpected error {err:?}"
+            );
         }
         assert_eq!(
             rt.take_dispatch_count(),
@@ -596,5 +669,35 @@ fn kv_ring_densify_refuses_zero_capacity() {
         let u = rt.alloc_buffer(4).unwrap();
         let err = nn::kv_ring_densify(rt, &b, &b, &u, &u, 8, 0).expect_err("zero capacity");
         assert!(err.contains("non-zero"), "unexpected error: {err:?}");
+    });
+}
+
+/// RMSNorm at every lane boundary of the simdgroup-first reduction: one lane
+/// short of, exactly at, and one past a simdgroup and the 256-lane launch cap,
+/// plus a single element and rows wider than the cap.
+#[test]
+fn rms_norm_agrees_with_the_reference_at_every_lane_boundary() {
+    with_gpu(|rt| {
+        let rows = 5usize;
+        for &dim in &[1usize, 31, 32, 33, 255, 256, 257, 511, 512, 513, 2560, 4097] {
+            let x = random_f32(rows * dim, 0xE0 + dim as u64);
+            let w: Vec<f32> = random_f32(dim, 0xE1 + dim as u64)
+                .iter()
+                .map(|v| 1.0 + 0.5 * v)
+                .collect();
+            let eps = 1e-6;
+            let want = rms_norm_ref(&x, &w, rows, dim, eps);
+            let xb = buf(rt, &x);
+            let wb = buf(rt, &w);
+            let ob = empty(rt, rows * dim);
+            nn::rms_norm_f32(rt, &xb, &wb, &ob, rows as u32, dim as u32, eps).unwrap();
+            rt.synchronize().unwrap();
+            close(
+                &format!("rms_norm dim={dim}"),
+                &ob.read_f32()[..rows * dim],
+                &want,
+                1e-4,
+            );
+        }
     });
 }

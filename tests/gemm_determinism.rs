@@ -26,7 +26,11 @@ const REPEATS: usize = 48;
 
 #[track_caller]
 fn assert_same_bits(label: &str, run: usize, first: &[f32], got: &[f32]) {
-    assert_eq!(first.len(), got.len(), "{label}: length changed on run {run}");
+    assert_eq!(
+        first.len(),
+        got.len(),
+        "{label}: length changed on run {run}"
+    );
     if let Some((i, (a, b))) = first
         .iter()
         .zip(got.iter())
@@ -60,7 +64,10 @@ fn f32_nn_repeats_bit_identically() {
             }
         }
         // A GEMM that never wrote anything would also be perfectly stable.
-        assert!(first.unwrap().iter().any(|&x| x != 0.0), "output stayed zero");
+        assert!(
+            first.unwrap().iter().any(|&x| x != 0.0),
+            "output stayed zero"
+        );
     });
 }
 
@@ -84,7 +91,10 @@ fn bf16_nn_repeats_bit_identically() {
                 Some(f) => assert_same_bits("bf16 NN", run, f, &got),
             }
         }
-        assert!(first.unwrap().iter().any(|&x| x != 0.0), "output stayed zero");
+        assert!(
+            first.unwrap().iter().any(|&x| x != 0.0),
+            "output stayed zero"
+        );
     });
 }
 
@@ -121,8 +131,14 @@ fn tn_nt_and_splitk_repeat_bit_identically() {
                 Some(f) => assert_same_bits("f32 NT", run, f, &got),
             }
         }
-        assert!(tn.unwrap().iter().any(|&x| x != 0.0), "TN output stayed zero");
-        assert!(nt.unwrap().iter().any(|&x| x != 0.0), "NT output stayed zero");
+        assert!(
+            tn.unwrap().iter().any(|&x| x != 0.0),
+            "TN output stayed zero"
+        );
+        assert!(
+            nt.unwrap().iter().any(|&x| x != 0.0),
+            "NT output stayed zero"
+        );
     });
 }
 
@@ -145,7 +161,10 @@ fn bf16_tn_splitk_repeats_bit_identically() {
                 Some(f) => assert_same_bits("bf16 TN split-K", run, f, &got),
             }
         }
-        assert!(first.unwrap().iter().any(|&x| x != 0.0), "output stayed zero");
+        assert!(
+            first.unwrap().iter().any(|&x| x != 0.0),
+            "output stayed zero"
+        );
     });
 }
 
@@ -177,7 +196,10 @@ fn results_do_not_depend_on_which_recycled_buffer_backs_the_output() {
             // later runs really are reusing storage a previous run wrote.
             drop(c);
         }
-        assert!(first.unwrap().iter().any(|&x| x != 0.0), "output stayed zero");
+        assert!(
+            first.unwrap().iter().any(|&x| x != 0.0),
+            "output stayed zero"
+        );
     });
 }
 
@@ -214,7 +236,10 @@ fn results_do_not_depend_on_neighbouring_work_in_the_command_buffer() {
                 Some(f) => assert_same_bits("bf16 NN amid other work", run, f, &got),
             }
         }
-        assert!(first.unwrap().iter().any(|&x| x != 0.0), "output stayed zero");
+        assert!(
+            first.unwrap().iter().any(|&x| x != 0.0),
+            "output stayed zero"
+        );
     });
 }
 
@@ -233,7 +258,6 @@ fn an_offset_output_view_matches_the_same_gemm_at_offset_zero() {
         let baseline = flat.buffer.read_f32();
 
         let backing = rt.alloc_tensor_f32(&[4 * m * n + 16]).unwrap();
-        // Stride between slots must keep every view 16-byte aligned.
         let stride = (m * n).div_ceil(4) * 4;
         for slot in 0..4 {
             let view: Tensor = backing.view(&[m, n], slot * stride);
@@ -254,11 +278,6 @@ fn an_offset_output_view_matches_the_same_gemm_at_offset_zero() {
 #[test]
 fn splitk_under_hazard_skip_auto_stays_bit_identical_amid_neighbours() {
     with_gpu(|rt| {
-        // Plan 2.3: under HAZARD_BARRIERS skip-auto the per-dispatch auto
-        // barrier is gone; split-K still places explicit barriers between
-        // partitions. Pack neighbouring GEMMs around a split-K shape under
-        // async encode — if partition serialization ever races, bits drift.
-        // Scratch tree reduction is *not* added unless this fails.
         tessl::ab_flags::set_hazard_barriers(true);
         rt.set_async_encode(true).unwrap();
 
@@ -287,7 +306,10 @@ fn splitk_under_hazard_skip_auto_stays_bit_identical_amid_neighbours() {
                 Some(f) => assert_same_bits("f32 TN split-K hazard skip-auto", run, f, &got),
             }
         }
-        assert!(first.unwrap().iter().any(|&x| x != 0.0), "split-K output stayed zero");
+        assert!(
+            first.unwrap().iter().any(|&x| x != 0.0),
+            "split-K output stayed zero"
+        );
         tessl::ab_flags::set_hazard_barriers(false);
     });
 }

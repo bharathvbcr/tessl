@@ -1,0 +1,28 @@
+Quantized GEMV kernels — M5 Pro, 2026-09-05
+===========================================
+
+Method as in row_reduction_simd_m5pro.txt: paired, order-balanced,
+in-process A/B, twenty dispatches per command buffer, six rounds.
+
+gemv_q4 (signed nibble, Q4Bank): one thread per row with x staged in
+threadgroup memory (before) vs one simdgroup per four rows, lanes striding K
+eight nibbles at a time (after). ratio = before / after.
+  4096x4096  g64     93.5 us ->  55.9 us  (188 GB/s)  1.67x
+  11008x4096 g64    247.4 us -> 149.2 us  (189 GB/s)  1.66x
+  4096x4096  g32    104.9 us ->  57.4 us  (220 GB/s)  1.83x
+  4096x4096  g128    90.6 us ->  54.5 us  (174 GB/s)  1.66x
+  4096x4096  g8     191.7 us -> 119.8 us  (210 GB/s)  1.60x
+  256x4096   g64     75.3 us ->  22.4 us              3.36x
+  4096x768   g64     25.8 us ->  19.4 us              1.33x
+The x cache, its 16 KiB threadgroup budget at cols = 4096, and the `cols`
+ceiling the host enforced for it are gone.
+
+gemv_q8: four scalar x loads vs one float4 in the vec4 path. Neutral, kept as
+an instruction-count reduction.
+  4096x4096 g64 1.04x   11008x4096 g64 1.00x   4096x4096 g128 1.01x   g32 1.01x
+
+gemv_q4_mlx_simd (row-major): four ushort loads vs one uint2 in qdot16.
+Neutral — the kernel already runs at the memory roof (235–249 GB/s).
+  4096x4096 g64 0.99x   11008x4096 g64 1.07x   4096x4096 g128 0.99x
+qdot16 and load_x16_qdot now have one owner, kernels/q4_mlx_dot.h, instead of
+a copy in each of gemv_q4_mlx.metal and gemm_q4_mlx.metal.

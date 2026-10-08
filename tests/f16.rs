@@ -21,6 +21,48 @@ fn f16_tensor(rt: &Arc<GpuRuntime>, shape: &[usize], data: &[f32]) -> Tensor {
     t
 }
 
+#[track_caller]
+fn max_gemm_error(got: &[f32], a: &[f32], b: &[f32], m: usize, n: usize, k: usize) -> f32 {
+    assert_eq!(got.len(), m * n, "result length mismatch");
+    assert_eq!(a.len(), m * k, "left operand length mismatch");
+    assert_eq!(b.len(), k * n, "right operand length mismatch");
+    let mut worst = 0.0f32;
+    for i in 0..m {
+        for j in 0..n {
+            let g = got[i * n + j];
+            assert!(g.is_finite(), "result[{i},{j}] is non-finite: {g}");
+            let mut acc = 0.0f64;
+            for p in 0..k {
+                let av = a[i * k + p];
+                let bv = b[p * n + j];
+                assert!(
+                    av.is_finite() && bv.is_finite(),
+                    "reference operand for [{i},{j}] is non-finite at k={p}: {av} * {bv}"
+                );
+                acc += av as f64 * bv as f64;
+            }
+            worst = worst.max((g as f64 - acc).abs() as f32);
+        }
+    }
+    worst
+}
+
+#[test]
+fn gemm_error_comparison_rejects_one_sided_nan_and_length_mismatch() {
+    assert!(
+        std::panic::catch_unwind(|| max_gemm_error(&[f32::NAN], &[1.0], &[1.0], 1, 1, 1)).is_err(),
+        "a NaN result must not disappear from the maximum-error reduction"
+    );
+    assert!(
+        std::panic::catch_unwind(|| max_gemm_error(&[1.0, 2.0], &[1.0], &[1.0], 1, 1, 1)).is_err(),
+        "a trailing result must not be ignored"
+    );
+    assert!(
+        std::panic::catch_unwind(|| max_gemm_error(&[1.0], &[1.0, 2.0], &[1.0], 1, 1, 1)).is_err(),
+        "a left-operand length mismatch must not be ignored"
+    );
+}
+
 #[test]
 fn host_conversion_round_trips_and_matches_known_bit_patterns() {
     // Anchors from IEEE 754 binary16, so this checks the encoding rather than
@@ -38,7 +80,11 @@ fn host_conversion_round_trips_and_matches_known_bit_patterns() {
     ];
     for &(v, bits) in cases {
         assert_eq!(f32_to_f16_bits(v), bits, "encoding {v}");
-        assert_eq!(f16_bits_to_f32(bits).to_bits(), v.to_bits(), "decoding {v:?}");
+        assert_eq!(
+            f16_bits_to_f32(bits).to_bits(),
+            v.to_bits(),
+            "decoding {v:?}"
+        );
     }
 
     // Overflow saturates to infinity. This is the difference from bf16 that
@@ -138,19 +184,16 @@ fn f16_gemm_matches_an_f32_reference_within_f16_resolution() {
 
             // Reference over the *rounded* operands: the kernel never sees the
             // originals, so comparing against them would measure the host cast.
-            let ar: Vec<f32> = a_h.iter().map(|v| f16_bits_to_f32(f32_to_f16_bits(*v))).collect();
-            let br: Vec<f32> = b_h.iter().map(|v| f16_bits_to_f32(f32_to_f16_bits(*v))).collect();
+            let ar: Vec<f32> = a_h
+                .iter()
+                .map(|v| f16_bits_to_f32(f32_to_f16_bits(*v)))
+                .collect();
+            let br: Vec<f32> = b_h
+                .iter()
+                .map(|v| f16_bits_to_f32(f32_to_f16_bits(*v)))
+                .collect();
             let got = c.buffer.read_f32();
-            let mut worst = 0.0f32;
-            for i in 0..m {
-                for j in 0..n {
-                    let mut acc = 0.0f64;
-                    for p in 0..k {
-                        acc += ar[i * k + p] as f64 * br[p * n + j] as f64;
-                    }
-                    worst = worst.max((got[i * n + j] as f64 - acc).abs() as f32);
-                }
-            }
+            let worst = max_gemm_error(&got[..m * n], &ar, &br, m, n, k);
             // f16 has 10 mantissa bits; the products are exact in the f32
             // accumulator, so the error is the accumulation order only.
             let bound = 8.0 * f32::EPSILON * k as f32;

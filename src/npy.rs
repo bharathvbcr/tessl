@@ -1,56 +1,33 @@
-//! Minimal NumPy `.npy` reader and writer (read v1.0 / v2.0 / v3.0, write
-//! v1.0; C-order, `<f4`, `<f8` and `<i8`).
-//!
-//! This exists for benchmark parity, not as a general-purpose format library.
-//! The cross-runtime benchmarks compare this crate against PyTorch and MLX on
-//! the same operands, and "the same operands" has to mean the same bytes: a
-//! lane that generated its own random matrix would be comparing two different
-//! problems and calling the difference a speedup. `bench_gemm_sweep` dumps its
-//! operands here and the Python lanes read them back.
-//!
-//! Scope is deliberately narrow. C-order only, no structured dtypes, no
-//! Fortran order, no object arrays. An unsupported header is an error rather
-//! than a best-effort parse, because a benchmark that silently transposed its
-//! input would produce a plausible number for the wrong problem.
+//! Minimal NumPy `.npy` reader (v1.0 / v2.0, C-order, f32 / i64).
 
 use std::fs::File;
-use std::io::{Read, Write};
+use std::io::{Read, Seek, Write};
 use std::path::Path;
 
-use crate::plain::{self, PlainScalar};
+/// Defensive ceiling for caller-controlled metadata. A normal NPY header is a
+/// few hundred bytes; 16 MiB still permits millions of dimensions while
+/// preventing a four-byte v2 length field from turning a tiny hostile file
+/// into a multi-gigabyte allocation attempt.
+const MAX_HEADER_BYTES: usize = 16 * 1024 * 1024;
 
 #[derive(Debug, Clone)]
 pub struct NpyArray {
     pub shape: Vec<usize>,
     pub data_f32: Option<Vec<f32>>,
     pub data_i64: Option<Vec<i64>>,
-    pub data_f64: Option<Vec<f64>>,
-}
-
-/// Fills `dst` from the reader with the little-endian payload as it sits on
-/// disk, straight into `dst`'s storage.
-fn read_le_payload<T: PlainScalar>(f: &mut File, dst: &mut [T], what: &str) -> Result<(), String> {
-    f.read_exact(plain::bytes_mut(dst))
-        .map_err(|e| format!("{what} payload: {e}"))?;
-    plain::le_to_native(dst);
-    Ok(())
 }
 
 impl NpyArray {
     pub fn f32_slice(&self) -> Result<&[f32], String> {
-        self.data_f32.as_deref().ok_or_else(|| "expected float32 npy".into())
-    }
-
-    /// The f64 payload. Separate from [`NpyArray::f32_slice`] on purpose: a
-    /// published GDN golden is generated in f64 precisely so the reference is
-    /// not itself a source of error, and silently narrowing it to f32 on load
-    /// would discard the property it exists to provide.
-    pub fn f64_slice(&self) -> Result<&[f64], String> {
-        self.data_f64.as_deref().ok_or_else(|| "expected float64 npy".into())
+        self.data_f32
+            .as_deref()
+            .ok_or_else(|| "expected float32 npy".into())
     }
 
     pub fn i64_slice(&self) -> Result<&[i64], String> {
-        self.data_i64.as_deref().ok_or_else(|| "expected int64 npy".into())
+        self.data_i64
+            .as_deref()
+            .ok_or_else(|| "expected int64 npy".into())
     }
 
     pub fn scalar_f32(&self) -> Result<f32, String> {
@@ -62,99 +39,183 @@ impl NpyArray {
     }
 }
 
-/// Largest header accepted. NumPy's own reader refuses headers over 10 000
-/// bytes by default; this is looser, and still keeps a hostile length field
-/// from allocating gigabytes before anything is checked.
-pub const MAX_NPY_HEADER_BYTES: usize = 1 << 20;
+fn checked_shape_numel(shape: &[usize], operation: &str) -> Result<usize, String> {
+    shape
+        .iter()
+        .try_fold(1usize, |count, &dim| count.checked_mul(dim))
+        .ok_or_else(|| format!("{operation}: shape element count overflow"))
+}
+
+fn checked_payload_nbytes(
+    numel: usize,
+    element_size: usize,
+    operation: &str,
+) -> Result<usize, String> {
+    numel
+        .checked_mul(element_size)
+        .filter(|&bytes| bytes <= isize::MAX as usize)
+        .ok_or_else(|| format!("{operation}: payload byte size overflow"))
+}
+
+fn zeroed_payload<T: Clone + Default>(numel: usize, operation: &str) -> Result<Vec<T>, String> {
+    let mut data = Vec::new();
+    data.try_reserve_exact(numel)
+        .map_err(|e| format!("{operation}: payload allocation failed: {e}"))?;
+    data.resize(numel, T::default());
+    Ok(data)
+}
+
+fn ensure_bytes_available(
+    file: &File,
+    start: u64,
+    expected_bytes: usize,
+    what: &str,
+) -> Result<(), String> {
+    let file_len = file
+        .metadata()
+        .map_err(|e| format!("read_npy: {what} metadata: {e}"))?
+        .len();
+    let remaining = file_len
+        .checked_sub(start)
+        .ok_or_else(|| format!("read_npy: {what} offset exceeds file length"))?;
+    let expected = u64::try_from(expected_bytes)
+        .map_err(|_| format!("read_npy: {what} byte size does not fit the file format"))?;
+    if remaining < expected {
+        return Err(format!(
+            "read_npy: {what} needs {expected} bytes, but only {remaining} remain"
+        ));
+    }
+    Ok(())
+}
 
 pub fn read_npy(path: &Path) -> Result<NpyArray, String> {
-    let what = path.display();
-    let mut f = File::open(path).map_err(|e| format!("open {what}: {e}"))?;
-    let file_len = f.metadata().map_err(|e| format!("{what}: {e}"))?.len();
+    let mut f = File::open(path).map_err(|e| format!("open {}: {e}", path.display()))?;
     let mut magic = [0u8; 6];
-    f.read_exact(&mut magic).map_err(|e| format!("read magic: {e}"))?;
+    f.read_exact(&mut magic)
+        .map_err(|e| format!("read magic: {e}"))?;
     if &magic != b"\x93NUMPY" {
-        return Err(format!("not an npy file: {what}"));
+        return Err(format!("not an npy file: {}", path.display()));
     }
     let mut ver = [0u8; 2];
     f.read_exact(&mut ver).map_err(|e| format!("ver: {e}"))?;
-    // 1.0: u16 header length; 2.0 and 3.0 (UTF-8 header): u32.
-    let (header_len, prefix) = match ver[0] {
-        1 => {
+    let header_len: usize = match ver {
+        [1, 0] => {
             let mut hl = [0u8; 2];
             f.read_exact(&mut hl).map_err(|e| format!("hlen: {e}"))?;
-            (u16::from_le_bytes(hl) as usize, 10u64)
+            usize::from(u16::from_le_bytes(hl))
         }
-        2 | 3 => {
+        [2, 0] => {
             let mut hl = [0u8; 4];
             f.read_exact(&mut hl).map_err(|e| format!("hlen: {e}"))?;
-            (u32::from_le_bytes(hl) as usize, 12u64)
+            usize::try_from(u32::from_le_bytes(hl))
+                .map_err(|_| "read_npy: v2 header length does not fit usize".to_string())?
         }
-        v => return Err(format!("{what}: unsupported npy format version {v}.{}", ver[1])),
+        [major, minor] => {
+            return Err(format!(
+                "unsupported npy version {major}.{minor}; expected 1.0 or 2.0"
+            ))
+        }
     };
-    if header_len > MAX_NPY_HEADER_BYTES || header_len as u64 > file_len.saturating_sub(prefix) {
+    if header_len > MAX_HEADER_BYTES {
         return Err(format!(
-            "{what}: header length {header_len} exceeds the cap {MAX_NPY_HEADER_BYTES} or the file"
+            "read_npy: header length {header_len} exceeds {MAX_HEADER_BYTES}-byte safety bound"
         ));
     }
-    let mut header = vec![0u8; header_len];
-    f.read_exact(&mut header).map_err(|e| format!("header: {e}"))?;
-    let header_str = std::str::from_utf8(&header).map_err(|e| format!("{what}: header is not UTF-8: {e}"))?;
+    let header_start = f
+        .stream_position()
+        .map_err(|e| format!("read_npy: header position: {e}"))?;
+    ensure_bytes_available(&f, header_start, header_len, "header")?;
+    let mut header = zeroed_payload::<u8>(header_len, "read_npy header")?;
+    f.read_exact(&mut header)
+        .map_err(|e| format!("header: {e}"))?;
+    if !header.ends_with(b"\n") {
+        return Err("read_npy: header must end with a newline".into());
+    }
+    if !header.is_ascii() {
+        return Err("read_npy: v1/v2 header must be ASCII".into());
+    }
+    let header_str = std::str::from_utf8(&header)
+        .map_err(|e| format!("read_npy: v1/v2 header is not ASCII: {e}"))?;
     let descr = parse_descr(header_str)?;
     if parse_fortran_order(header_str)? {
         return Err("fortran-order npy not supported".into());
     }
     let shape = parse_shape(header_str)?;
-    let numel = shape
-        .iter()
-        .try_fold(1usize, |acc, &d| acc.checked_mul(d))
-        .ok_or_else(|| format!("{what}: shape {shape:?} overflows usize"))?;
-    let elem_size: u64 = match descr.as_str() {
-        "<f4" | "|f4" => 4,
-        "<f8" | "|f8" | "<i8" | "|i8" => 8,
-        other => return Err(format!("unsupported dtype {other} in {what}")),
-    };
-    // The payload must be exactly the rest of the file: checked before the
-    // allocation, so a tiny file declaring a huge shape is an error rather than
-    // an abort, and a truncated or padded file is not read as a smaller array.
-    let payload = (numel as u64)
-        .checked_mul(elem_size)
-        .ok_or_else(|| format!("{what}: payload size overflows"))?;
-    let rest = file_len - prefix - header_len as u64;
-    if payload != rest {
-        return Err(format!(
-            "{what}: shape {shape:?} x {elem_size} bytes is {payload} bytes, but {rest} follow the header"
-        ));
-    }
+    let numel = checked_shape_numel(&shape, "read_npy")?;
+    let payload_start = f
+        .stream_position()
+        .map_err(|e| format!("read_npy: payload position: {e}"))?;
     match descr.as_str() {
         "<f4" | "|f4" => {
-            let mut data = vec![0.0f32; numel];
-            read_le_payload(&mut f, &mut data, "f32")?;
+            let payload_bytes =
+                checked_payload_nbytes(numel, std::mem::size_of::<f32>(), "read_npy")?;
+            ensure_bytes_available(&f, payload_start, payload_bytes, "payload")?;
+            let mut data = zeroed_payload::<f32>(numel, "read_npy")?;
+            #[cfg(target_endian = "little")]
+            {
+                // SAFETY: reinterprets an owned, freshly allocated `Vec`'s
+                // storage as the byte slice `read_exact` fills. The pointer is
+                // valid and uniquely owned for the whole block, the length is
+                // `size_of_val` of that same allocation so it cannot overrun,
+                // and every bit pattern is a valid `f32`/`i64` — the file may
+                // hold nonsense numbers but never an invalid value. Gated on
+                // little-endian, where the on-disk layout matches memory.
+                let bytes = unsafe {
+                    std::slice::from_raw_parts_mut(
+                        data.as_mut_ptr().cast::<u8>(),
+                        std::mem::size_of_val(data.as_slice()),
+                    )
+                };
+                f.read_exact(bytes)
+                    .map_err(|e| format!("f32 payload: {e}"))?;
+            }
+            #[cfg(target_endian = "big")]
+            for value in &mut data {
+                let mut bytes = [0u8; 4];
+                f.read_exact(&mut bytes)
+                    .map_err(|e| format!("f32 payload: {e}"))?;
+                *value = f32::from_le_bytes(bytes);
+            }
             Ok(NpyArray {
                 shape,
                 data_f32: Some(data),
                 data_i64: None,
-                data_f64: None,
-            })
-        }
-        "<f8" | "|f8" => {
-            let mut data = vec![0.0f64; numel];
-            read_le_payload(&mut f, &mut data, "f64")?;
-            Ok(NpyArray {
-                shape,
-                data_f32: None,
-                data_i64: None,
-                data_f64: Some(data),
             })
         }
         "<i8" | "|i8" => {
-            let mut data = vec![0i64; numel];
-            read_le_payload(&mut f, &mut data, "i64")?;
+            let payload_bytes =
+                checked_payload_nbytes(numel, std::mem::size_of::<i64>(), "read_npy")?;
+            ensure_bytes_available(&f, payload_start, payload_bytes, "payload")?;
+            let mut data = zeroed_payload::<i64>(numel, "read_npy")?;
+            #[cfg(target_endian = "little")]
+            {
+                // SAFETY: reinterprets an owned, freshly allocated `Vec`'s
+                // storage as the byte slice `read_exact` fills. The pointer is
+                // valid and uniquely owned for the whole block, the length is
+                // `size_of_val` of that same allocation so it cannot overrun,
+                // and every bit pattern is a valid `f32`/`i64` — the file may
+                // hold nonsense numbers but never an invalid value. Gated on
+                // little-endian, where the on-disk layout matches memory.
+                let bytes = unsafe {
+                    std::slice::from_raw_parts_mut(
+                        data.as_mut_ptr().cast::<u8>(),
+                        std::mem::size_of_val(data.as_slice()),
+                    )
+                };
+                f.read_exact(bytes)
+                    .map_err(|e| format!("i64 payload: {e}"))?;
+            }
+            #[cfg(target_endian = "big")]
+            for value in &mut data {
+                let mut bytes = [0u8; 8];
+                f.read_exact(&mut bytes)
+                    .map_err(|e| format!("i64 payload: {e}"))?;
+                *value = i64::from_le_bytes(bytes);
+            }
             Ok(NpyArray {
                 shape,
                 data_f32: None,
                 data_i64: Some(data),
-                data_f64: None,
             })
         }
         other => Err(format!("unsupported dtype {other} in {}", path.display())),
@@ -164,47 +225,63 @@ pub fn read_npy(path: &Path) -> Result<NpyArray, String> {
 fn parse_descr(header: &str) -> Result<String, String> {
     // 'descr': '<f4'
     let key = "'descr':";
-    let i = header.find(key).ok_or_else(|| "missing descr".to_string())?;
+    let i = header
+        .find(key)
+        .ok_or_else(|| "missing descr".to_string())?;
     let rest = &header[i + key.len()..];
     let start = rest.find('\'').ok_or_else(|| "descr quote".to_string())? + 1;
-    let end = rest[start..].find('\'').ok_or_else(|| "descr end".to_string())? + start;
+    let end = rest[start..]
+        .find('\'')
+        .ok_or_else(|| "descr end".to_string())?
+        + start;
     Ok(rest[start..end].to_string())
 }
 
-/// The `'fortran_order'` value: exactly `True` or `False`, and required.
 fn parse_fortran_order(header: &str) -> Result<bool, String> {
     let key = "'fortran_order':";
-    let i = header.find(key).ok_or_else(|| "missing fortran_order".to_string())?;
-    let rest = header[i + key.len()..].trim_start();
-    if rest.starts_with("False") {
-        Ok(false)
-    } else if rest.starts_with("True") {
-        Ok(true)
-    } else {
-        Err(format!(
-            "fortran_order is neither True nor False: {:?}",
-            &rest[..rest.len().min(16)]
-        ))
+    let i = header
+        .find(key)
+        .ok_or_else(|| "missing fortran_order".to_string())?;
+    let value = header[i + key.len()..].trim_start();
+    let end = value
+        .find([',', '}'])
+        .ok_or_else(|| "unterminated fortran_order value".to_string())?;
+    match value[..end].trim() {
+        "True" => Ok(true),
+        "False" => Ok(false),
+        _ => Err("invalid fortran_order value".into()),
     }
 }
 
 fn parse_shape(header: &str) -> Result<Vec<usize>, String> {
     let key = "'shape':";
-    let i = header.find(key).ok_or_else(|| "missing shape".to_string())?;
+    let i = header
+        .find(key)
+        .ok_or_else(|| "missing shape".to_string())?;
     let rest = &header[i + key.len()..];
     let start = rest.find('(').ok_or_else(|| "shape (".to_string())?;
-    let end = rest[start..].find(')').ok_or_else(|| "shape )".to_string())? + start;
+    let end = rest[start..]
+        .find(')')
+        .ok_or_else(|| "shape )".to_string())?
+        + start;
     let inner = rest[start + 1..end].trim();
     if inner.is_empty() {
         return Ok(vec![]); // scalar
     }
     let mut shape = Vec::new();
-    for part in inner.split(',') {
+    let parts: Vec<_> = inner.split(',').collect();
+    for (index, part) in parts.iter().enumerate() {
         let p = part.trim();
         if p.is_empty() {
-            continue;
+            if index + 1 == parts.len() && parts.len() > 1 {
+                continue; // Python's required singleton-tuple trailing comma.
+            }
+            return Err("shape contains an empty dimension".into());
         }
-        shape.push(p.parse::<usize>().map_err(|e| format!("shape parse {p}: {e}"))?);
+        shape.push(
+            p.parse::<usize>()
+                .map_err(|e| format!("shape parse {p}: {e}"))?,
+        );
     }
     Ok(shape)
 }
@@ -217,21 +294,27 @@ pub fn transpose_last2(data: &mut [f32], shape: &mut [usize]) -> Result<(), Stri
     let r = shape.len();
     let rows = shape[r - 2];
     let cols = shape[r - 1];
-    let numel = shape
-        .iter()
-        .try_fold(1usize, |acc, &d| acc.checked_mul(d))
-        .ok_or_else(|| format!("transpose_last2: shape {shape:?} overflows usize"))?;
-    if numel != data.len() {
+    let numel = checked_shape_numel(shape, "transpose_last2")?;
+    if data.len() != numel {
         return Err(format!(
-            "transpose_last2: shape {shape:?} holds {numel} elements, data has {}",
+            "transpose_last2: shape expects {numel} elements, got {}",
             data.len()
         ));
     }
-    let batch: usize = shape[..r - 2].iter().product();
-    let mut tmp = vec![0.0f32; data.len()];
+    if numel == 0 {
+        shape.swap(r - 2, r - 1);
+        return Ok(());
+    }
+    let matrix = rows
+        .checked_mul(cols)
+        .ok_or_else(|| "transpose_last2: matrix element count overflow".to_string())?;
+    let batch = numel / matrix;
+    let mut tmp = zeroed_payload::<f32>(data.len(), "transpose_last2")?;
     for b in 0..batch {
-        let src = &data[b * rows * cols..(b + 1) * rows * cols];
-        let dst = &mut tmp[b * rows * cols..(b + 1) * rows * cols];
+        let start = b * matrix;
+        let end = start + matrix;
+        let src = &data[start..end];
+        let dst = &mut tmp[start..end];
         for i in 0..rows {
             for j in 0..cols {
                 dst[j * rows + i] = src[i * cols + j];
@@ -239,17 +322,14 @@ pub fn transpose_last2(data: &mut [f32], shape: &mut [usize]) -> Result<(), Stri
         }
     }
     data.copy_from_slice(&tmp);
-    shape[r - 2] = cols;
-    shape[r - 1] = rows;
+    shape.swap(r - 2, r - 1);
     Ok(())
 }
 
 /// Write a C-order float32 `.npy` (v1.0).
 pub fn write_npy_f32(path: &Path, shape: &[usize], data: &[f32]) -> Result<(), String> {
-    let numel = shape
-        .iter()
-        .try_fold(1usize, |acc, &d| acc.checked_mul(d))
-        .ok_or_else(|| format!("write_npy shape {shape:?} overflows usize"))?;
+    let numel = checked_shape_numel(shape, "write_npy")?;
+    checked_payload_nbytes(numel, std::mem::size_of::<f32>(), "write_npy")?;
     if data.len() != numel {
         return Err(format!(
             "write_npy shape {:?} expects {} elems, got {}",
@@ -268,7 +348,11 @@ pub fn write_npy_f32(path: &Path, shape: &[usize], data: &[f32]) -> Result<(), S
     } else {
         format!(
             "({})",
-            shape.iter().map(|d| d.to_string()).collect::<Vec<_>>().join(", ")
+            shape
+                .iter()
+                .map(|d| d.to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
         )
     };
     let mut header = format!("{{'descr': '<f4', 'fortran_order': False, 'shape': {shape_str}, }}");
@@ -280,14 +364,17 @@ pub fn write_npy_f32(path: &Path, shape: &[usize], data: &[f32]) -> Result<(), S
     header.push('\n');
     total = 10 + header.len();
     debug_assert_eq!(total % 64, 0);
+    let hlen = u16::try_from(header.len())
+        .map_err(|_| "write_npy: v1 header length exceeds u16".to_string())?;
 
     let mut f = File::create(path).map_err(|e| format!("create {}: {e}", path.display()))?;
-    f.write_all(b"\x93NUMPY").map_err(|e| format!("magic: {e}"))?;
+    f.write_all(b"\x93NUMPY")
+        .map_err(|e| format!("magic: {e}"))?;
     f.write_all(&[1u8, 0]).map_err(|e| format!("ver: {e}"))?;
-    let hlen =
-        u16::try_from(header.len()).map_err(|_| format!("write_npy: a {}-byte header needs npy v2", header.len()))?;
-    f.write_all(&hlen.to_le_bytes()).map_err(|e| format!("hlen: {e}"))?;
-    f.write_all(header.as_bytes()).map_err(|e| format!("header: {e}"))?;
+    f.write_all(&hlen.to_le_bytes())
+        .map_err(|e| format!("hlen: {e}"))?;
+    f.write_all(header.as_bytes())
+        .map_err(|e| format!("header: {e}"))?;
     // macOS/Apple Silicon is little-endian. Writing one four-byte value per
     // syscall made exact-scale checkpoints take minutes per tensor; expose the
     // already-contiguous slice as bytes and submit one bulk payload instead.
@@ -298,7 +385,9 @@ pub fn write_npy_f32(path: &Path, shape: &[usize], data: &[f32]) -> Result<(), S
         // `size_of_val` of that same slice, and `u8` has no alignment or
         // validity requirement any `f32` allocation could fail. Gated on
         // little-endian, matching the `<f4` descriptor written above.
-        let bytes = unsafe { std::slice::from_raw_parts(data.as_ptr().cast::<u8>(), std::mem::size_of_val(data)) };
+        let bytes = unsafe {
+            std::slice::from_raw_parts(data.as_ptr().cast::<u8>(), std::mem::size_of_val(data))
+        };
         f.write_all(bytes).map_err(|e| format!("payload: {e}"))?;
     }
     #[cfg(target_endian = "big")]
@@ -312,5 +401,160 @@ pub fn write_npy_f32(path: &Path, shape: &[usize], data: &[f32]) -> Result<(), S
     Ok(())
 }
 
-#[allow(dead_code)]
-pub fn seek_noop() {}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    struct TempNpy(PathBuf);
+
+    impl TempNpy {
+        fn new(label: &str) -> Self {
+            static NEXT: AtomicU64 = AtomicU64::new(0);
+            let id = NEXT.fetch_add(1, Ordering::Relaxed);
+            Self(
+                std::env::temp_dir()
+                    .join(format!("tessl-npy-{label}-{}-{id}.npy", std::process::id())),
+            )
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TempNpy {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
+    fn write_header_only(path: &Path, shape: &str) {
+        let mut header = format!("{{'descr': '<f4', 'fortran_order': False, 'shape': {shape}, }}");
+        let pad = (64 - ((10 + header.len() + 1) % 64)) % 64;
+        header.push_str(&" ".repeat(pad));
+        header.push('\n');
+        let hlen = u16::try_from(header.len()).expect("small test header");
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"\x93NUMPY");
+        bytes.extend_from_slice(&[1, 0]);
+        bytes.extend_from_slice(&hlen.to_le_bytes());
+        bytes.extend_from_slice(header.as_bytes());
+        std::fs::write(path, bytes).expect("write adversarial npy header");
+    }
+
+    #[test]
+    fn read_rejects_unknown_versions_and_hostile_header_lengths_before_allocation() {
+        let unknown = TempNpy::new("unknown-version");
+        std::fs::write(unknown.path(), b"\x93NUMPY\x03\x00")
+            .expect("write unknown-version preamble");
+        let err = read_npy(unknown.path()).expect_err("v3 is outside this reader's contract");
+        assert!(err.contains("unsupported npy version 3.0"), "{err}");
+
+        let oversized = TempNpy::new("oversized-header");
+        let mut bytes = b"\x93NUMPY\x02\x00".to_vec();
+        bytes.extend_from_slice(
+            &u32::try_from(MAX_HEADER_BYTES + 1)
+                .expect("test ceiling fits u32")
+                .to_le_bytes(),
+        );
+        std::fs::write(oversized.path(), bytes).expect("write oversized-header preamble");
+        let err = read_npy(oversized.path()).expect_err("oversized header must be bounded");
+        assert!(err.contains("header length"), "{err}");
+        assert!(err.contains("safety bound"), "{err}");
+
+        let truncated = TempNpy::new("truncated-header");
+        let mut bytes = b"\x93NUMPY\x01\x00".to_vec();
+        bytes.extend_from_slice(&64u16.to_le_bytes());
+        bytes.extend_from_slice(b"too short");
+        std::fs::write(truncated.path(), bytes).expect("write truncated-header preamble");
+        let err = read_npy(truncated.path()).expect_err("truncated header must be rejected");
+        assert!(err.contains("header needs 64 bytes"), "{err}");
+    }
+
+    #[test]
+    fn read_rejects_non_ascii_and_malformed_shape_tokens() {
+        let non_ascii = TempNpy::new("non-ascii-header");
+        let mut bytes = b"\x93NUMPY\x01\x00".to_vec();
+        let header = b"{'descr': '<f4', 'fortran_order': False, 'shape': (), } \xc3\xa9\n";
+        bytes.extend_from_slice(&(header.len() as u16).to_le_bytes());
+        bytes.extend_from_slice(header);
+        std::fs::write(non_ascii.path(), bytes).expect("write non-ASCII header");
+        let err = read_npy(non_ascii.path()).expect_err("NPY v1/v2 headers are ASCII");
+        assert!(err.contains("must be ASCII"), "{err}");
+
+        for (label, shape) in [("leading-empty", "(, 2)"), ("middle-empty", "(2, , 3)")] {
+            let file = TempNpy::new(label);
+            write_header_only(file.path(), shape);
+            let err = read_npy(file.path()).expect_err("empty shape token must be rejected");
+            assert!(err.contains("empty dimension"), "{shape}: {err}");
+        }
+    }
+
+    #[test]
+    fn read_rejects_shape_product_overflow_without_panicking() {
+        let file = TempNpy::new("read-overflow");
+        write_header_only(file.path(), &format!("({}, 2)", usize::MAX));
+
+        let outcome = std::panic::catch_unwind(|| read_npy(file.path()));
+        let err = outcome
+            .expect("read_npy must return Err, not panic")
+            .expect_err("overflowing shape must be rejected");
+        assert!(err.contains("shape element count overflow"), "{err}");
+    }
+
+    #[test]
+    fn write_rejects_shape_product_overflow_without_touching_the_path() {
+        let file = TempNpy::new("write-overflow");
+        let outcome =
+            std::panic::catch_unwind(|| write_npy_f32(file.path(), &[usize::MAX, 2], &[]));
+        let err = outcome
+            .expect("write_npy_f32 must return Err, not panic")
+            .expect_err("overflowing shape must be rejected");
+        assert!(err.contains("shape element count overflow"), "{err}");
+        assert!(
+            !file.path().exists(),
+            "shape validation must happen before the destination is created"
+        );
+    }
+
+    #[test]
+    fn transpose_rejects_overflow_and_shape_data_mismatch_without_panicking() {
+        let mut empty = Vec::new();
+        let mut overflowing = vec![usize::MAX, 2, 1, 1];
+        let overflow = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            transpose_last2(&mut empty, &mut overflowing)
+        }));
+        let err = overflow
+            .expect("transpose_last2 must return Err, not panic")
+            .expect_err("overflowing shape must be rejected");
+        assert!(err.contains("shape element count overflow"), "{err}");
+
+        let mut short = vec![0.0; 3];
+        let mut shape = vec![2, 2];
+        let mismatch = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            transpose_last2(&mut short, &mut shape)
+        }));
+        let err = mismatch
+            .expect("transpose_last2 must return Err, not panic")
+            .expect_err("shape/data mismatch must be rejected");
+        assert!(err.contains("expects 4 elements, got 3"), "{err}");
+    }
+
+    #[test]
+    fn checked_paths_preserve_roundtrip_and_transpose_behavior() {
+        let file = TempNpy::new("roundtrip");
+        let data = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
+        write_npy_f32(file.path(), &[2, 3], &data).expect("write matrix");
+        let loaded = read_npy(file.path()).expect("read matrix");
+        assert_eq!(loaded.shape, vec![2, 3]);
+        assert_eq!(loaded.f32_slice().unwrap(), data);
+
+        let mut transposed = data;
+        let mut shape = vec![2, 3];
+        transpose_last2(&mut transposed, &mut shape).expect("transpose matrix");
+        assert_eq!(shape, vec![3, 2]);
+        assert_eq!(transposed, vec![1.0, 4.0, 2.0, 5.0, 3.0, 6.0]);
+    }
+}

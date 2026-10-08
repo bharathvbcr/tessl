@@ -6,7 +6,6 @@
 
 const DISPATCH_RS: &str = include_str!("../src/dispatch.rs");
 const GEMM_RS: &str = include_str!("../src/gemm.rs");
-const NN_RS: &str = include_str!("../src/nn.rs");
 const EMBED: &str = include_str!("../kernels/embed_lookup.metal");
 const GEMV_Q4: &str = include_str!("../kernels/gemv_q4.metal");
 const GEMV_Q4_MLX: &str = include_str!("../kernels/gemv_q4_mlx.metal");
@@ -24,21 +23,6 @@ const ATTN_ROWS: &str = include_str!("../kernels/flash_attn_rows.metal");
 const ATTN_SWA_128: &str = include_str!("../kernels/flash_attn_swa_h128.metal");
 const ATTN_SWA_256: &str = include_str!("../kernels/flash_attn_swa_h256.metal");
 const ATTN_GLOBAL: &str = include_str!("../kernels/flash_attn_global_h512.metal");
-const QWEN35_GDN: &str = include_str!("../kernels/qwen35_gdn.metal");
-const QWEN35_ATTN: &str = include_str!("../kernels/qwen35_attn.metal");
-const QWEN35_ATTN_TILED: &str = include_str!("../kernels/qwen35_attn_tiled.metal");
-const QWEN35_MLP: &str = include_str!("../kernels/qwen35_mlp.metal");
-const QWEN35_SCORE: &str = include_str!("../kernels/qwen35_score.metal");
-const CROSS_ENTROPY: &str = include_str!("../kernels/cross_entropy.metal");
-const GDN_TRAIN: &str = include_str!("../kernels/gdn_train.metal");
-const QWEN35_BWD: &str = include_str!("../kernels/qwen35_bwd.metal");
-const QWEN35_ATTN_BWD: &str = include_str!("../kernels/qwen35_attn_bwd.metal");
-const QWEN35_ADAMW: &str = include_str!("../kernels/qwen35_adamw.metal");
-const ENCODER_ATTN: &str = include_str!("../kernels/encoder_attn.metal");
-const EMBED_POOL: &str = include_str!("../kernels/embed_pool.metal");
-const MTL_TENSOR: &str = include_str!("../kernels/mtl_tensor.metal");
-const BERT: &str = include_str!("../kernels/bert.metal");
-const QWEN35_TRAIN_STORAGE: &str = include_str!("../kernels/qwen35_train_storage.metal");
 
 /// Every `.metal` file this suite inspects.
 ///
@@ -46,33 +30,18 @@ const QWEN35_TRAIN_STORAGE: &str = include_str!("../kernels/qwen35_train_storage
 /// `every_kernel_source_is_inspected_or_explicitly_exempt`, so a new kernel
 /// cannot join the build without someone deciding which list it belongs on.
 const INSPECTED_KERNELS: &[&str] = &[
-    "bert.metal",
-    "cross_entropy.metal",
     "embed_lookup.metal",
-    "embed_pool.metal",
-    "encoder_attn.metal",
     "flash_attn_decode.metal",
     "flash_attn_global_h512.metal",
     "flash_attn_rows.metal",
     "flash_attn_swa_h128.metal",
     "flash_attn_swa_h256.metal",
-    "gdn_train.metal",
     "gemm_q4_mlx.metal",
     "gemv_q4.metal",
     "gemv_q4_mlx.metal",
     "gemv_q8.metal",
     "kv_store.metal",
     "matmul_simdgroup.metal",
-    "mtl_tensor.metal",
-    "qwen35_attn.metal",
-    "qwen35_adamw.metal",
-    "qwen35_attn_bwd.metal",
-    "qwen35_attn_tiled.metal",
-    "qwen35_bwd.metal",
-    "qwen35_gdn.metal",
-    "qwen35_mlp.metal",
-    "qwen35_score.metal",
-    "qwen35_train_storage.metal",
     "reduce.metal",
     "rms_norm.metal",
     "rms_qkv_rope.metal",
@@ -87,10 +56,7 @@ const EXEMPT_KERNELS: &[(&str, &str)] = &[
         "TensorOps addresses through MTLTensor descriptors and `uint` tile \
          arithmetic. That is bounded by the host contract asserted in \
          `utility_and_simdgroup_pointer_math_is_explicitly_wide`: every public \
-         entry point into this file — the Tensor GEMMs through \
-         `validate_gemm`, `gemm_batched`, and the raw-buffer \
-         `nn::gemm_i8_dequant` — refuses an operand over `i32::MAX` elements \
-         through `gemm::require_i32_extent`, and `i32::MAX` is below \
+         GEMM operand stays under `i32::MAX` elements, which is below \
          `u32::MAX`. The only raw pointer maths is the batch stride, which is \
          widened.",
     ),
@@ -105,7 +71,10 @@ const EXEMPT_KERNELS: &[(&str, &str)] = &[
         "Elementwise over a 1D grid: the only index is the thread id, whose \
          representability is the `dispatch.rs` guard already required below.",
     ),
-    ("mlp_silu.metal", "Elementwise over a 1D grid, as mlp_gelu_tanh.metal."),
+    (
+        "mlp_silu.metal",
+        "Elementwise over a 1D grid, as mlp_gelu_tanh.metal.",
+    ),
 ];
 
 fn require(source: &str, fragment: &str, label: &str) {
@@ -129,7 +98,11 @@ fn row_major_quantized_offsets_cross_u32_without_wrapping() {
     assert_eq!(row.wrapping_mul(stride), 0);
     assert_eq!(u64::from(row) * u64::from(stride), 1u64 << 32);
 
-    require(GEMV_Q4, "const ulong row_base = (ulong)row * cols;", "Q4 GEMV");
+    require(
+        GEMV_Q4,
+        "const ulong row_base = (ulong)row * cols;",
+        "Q4 GEMV",
+    );
     require(
         GEMV_Q4_MLX,
         "const ulong scale_base = (ulong)row * groups_per_row;",
@@ -140,7 +113,11 @@ fn row_major_quantized_offsets_cross_u32_without_wrapping() {
         "const ulong gi = (ulong)row * groups_per_row + g;",
         "Q8 GEMV scale table",
     );
-    require(GEMM_Q4_MLX, "sb[(ulong)row * gpr + g]", "MLX Q4 GEMM scale table");
+    require(
+        GEMM_Q4_MLX,
+        "sb[(ulong)row * gpr + g]",
+        "MLX Q4 GEMM scale table",
+    );
     forbid(GEMV_Q4, "const uint row_base = row * cols;", "Q4 GEMV");
     forbid(
         GEMV_Q4_MLX,
@@ -167,7 +144,11 @@ fn embedding_table_offsets_are_widened_before_multiplication() {
         "const ulong total = (ulong)n_tokens * hidden;",
         "embed grid guard",
     );
-    require(EMBED, "const ulong idx = (ulong)tid * hidden + d;", "embed packed row");
+    require(
+        EMBED,
+        "const ulong idx = (ulong)tid * hidden + d;",
+        "embed packed row",
+    );
     require(
         EMBED,
         "const ulong scale_i = (ulong)tid * groups_per_row + g;",
@@ -178,8 +159,16 @@ fn embedding_table_offsets_are_widened_before_multiplication() {
         "if n > u32::MAX as usize",
         "1D grid representability guard",
     );
-    forbid(EMBED, "const uint total = n_tokens * hidden;", "embed grid guard");
-    forbid(EMBED, "const uint idx = tid * hidden + d;", "embed packed row");
+    forbid(
+        EMBED,
+        "const uint total = n_tokens * hidden;",
+        "embed grid guard",
+    );
+    forbid(
+        EMBED,
+        "const uint idx = tid * hidden + d;",
+        "embed packed row",
+    );
     forbid(
         EMBED,
         "const uint scale_i = tid * groups_per_row + g;",
@@ -200,7 +189,11 @@ fn strided_shader_scans_cannot_roll_over_to_zero() {
             REDUCE,
             "for (ulong c = lid; c < (ulong)cols; c += tptg)",
         ),
-        ("RMSNorm", RMS_NORM, "for (ulong d = lid; d < (ulong)dim; d += tptg)"),
+        (
+            "RMSNorm",
+            RMS_NORM,
+            "for (ulong d = lid; d < (ulong)dim; d += tptg)",
+        ),
         (
             "one-pass argmax",
             SOFTCAP_SAMPLE,
@@ -230,8 +223,16 @@ fn strided_shader_scans_cannot_roll_over_to_zero() {
         "Q8 scalar group scan",
     );
     for (label, source, narrow) in [
-        ("row reductions", REDUCE, "for (uint c = lid; c < cols; c += tptg)"),
-        ("RMSNorm", RMS_NORM, "for (uint d = lid; d < dim; d += tptg)"),
+        (
+            "row reductions",
+            REDUCE,
+            "for (uint c = lid; c < cols; c += tptg)",
+        ),
+        (
+            "RMSNorm",
+            RMS_NORM,
+            "for (uint d = lid; d < dim; d += tptg)",
+        ),
         (
             "one-pass argmax",
             SOFTCAP_SAMPLE,
@@ -260,64 +261,6 @@ fn strided_shader_scans_cannot_roll_over_to_zero() {
         "for (uint i = lane; i < group_size; i += Q8_SIMD_SIZE)",
         "Q8 scalar group scan",
     );
-}
-
-/// The Qwen3.5 kernels read the fused projection in place, so their row stride
-/// is the projection's full width — about 12.5k columns for a GDN layer at
-/// Qwen3.5's small sizes — and a row offset is `row * ld`. At an 8k-token
-/// prefill that is 1e8 elements per sequence, so a batch of 43 crosses
-/// `u32::MAX`, and a wrapped offset reads another sequence's activations
-/// without faulting. Every row offset widens before it multiplies.
-#[test]
-fn qwen35_row_offsets_are_widened_before_multiplication() {
-    let rows = 43u32 * 8192;
-    let ld = 12_544u32;
-    assert!(rows.checked_mul(ld).is_none());
-
-    for (label, source, widened) in [
-        ("GDN conv input", QWEN35_GDN, "(ulong)b * T * (ulong)ld_x"),
-        ("GDN q/k/v rows", QWEN35_GDN, "((ulong)b * T + t) * (ulong)ld_qkv"),
-        ("GDN chunk output", QWEN35_GDN, "((ulong)b * T + t) * (ulong)ld_out"),
-        ("GDN recurrent row", QWEN35_GDN, "const ulong row = (ulong)b * T + t;"),
-        (
-            "GDN workspace row",
-            QWEN35_GDN,
-            "const ulong row_base = head * tp + t0;",
-        ),
-        ("gated norm x", QWEN35_GDN, "r * (ulong)ld_x"),
-        ("gated norm z", QWEN35_GDN, "r * (ulong)ld_z"),
-        ("attention projection", QWEN35_ATTN, "p + r * (ulong)ld_p"),
-        ("attention gate", QWEN35_ATTN, "(ulong)r * ld_p"),
-        (
-            "attention cache slot",
-            QWEN35_ATTN,
-            "(((ulong)b * kv_capacity + cache_pos) * Hkv + h) * (ulong)D",
-        ),
-        (
-            "shared-prefix suffix row",
-            QWEN35_ATTN,
-            "(ulong)b * suffix_cap * kv_pos_stride",
-        ),
-        ("shared-prefix query row", QWEN35_ATTN, "(ulong)b * Tq * q_pos_stride"),
-        ("scoring row", QWEN35_SCORE, "(ulong)(row_ok ? row : 0u) * hidden"),
-        (
-            "scoring LM head row",
-            QWEN35_SCORE,
-            "(ulong)(ok ? answers[a] : 0u) * hidden",
-        ),
-        ("embedding table row", QWEN35_SCORE, "(ulong)(ok ? id : 0u) * hidden"),
-        ("embedding output row", QWEN35_SCORE, "(ulong)r * hidden + col"),
-    ] {
-        require(source, widened, label);
-    }
-    for (label, source, narrow) in [
-        ("GDN q/k/v rows", QWEN35_GDN, "(b * T + t) * ld_qkv"),
-        ("GDN chunk output", QWEN35_GDN, "(b * T + t) * ld_out"),
-        ("attention gate", QWEN35_ATTN, "p[r * ld_p"),
-        ("scoring row", QWEN35_SCORE, "row * hidden"),
-    ] {
-        forbid(source, narrow, label);
-    }
 }
 
 /// The KV cache is where a `u32` product is actually reachable.
@@ -389,7 +332,11 @@ fn attention_and_kv_cache_offsets_are_widened_before_multiplication() {
         "q + ((t * (ulong)Hq + h) * (ulong)D)",
         "QKV RoPE query row address",
     );
-    forbid(QKV_ROPE, "const uint total_q = T * Hq;", "QKV RoPE query extent");
+    forbid(
+        QKV_ROPE,
+        "const uint total_q = T * Hq;",
+        "QKV RoPE query extent",
+    );
 }
 
 /// No kernel may join the build without a decision about this suite.
@@ -400,389 +347,6 @@ fn attention_and_kv_cache_offsets_are_widened_before_multiplication() {
 /// were unlisted, so "shader index arithmetic is pinned" was true of half the
 /// shaders and unexamined for the rest. A file must now be on one list or the
 /// other, and the exempt list carries the reason.
-/// The TensorOps prefill attention addresses one (batch, head) plane by a
-/// 64-bit base pointer offset; MPP then indexes inside the plane with i32
-/// extents and strides, which the host bounds (`qwen35::attn_prefill`).
-#[test]
-fn qwen35_tiled_attention_plane_bases_are_widened() {
-    require(
-        QWEN35_ATTN_TILED,
-        "const ulong q_base = (ulong)b * Tq * q_row + (ulong)h * D;",
-        "tiled attention query plane base",
-    );
-    require(
-        QWEN35_ATTN_TILED,
-        "const ulong kv_base = (ulong)b * kv_capacity * kv_row + (ulong)hkv * D;",
-        "tiled attention K/V plane base",
-    );
-    require(
-        QWEN35_ATTN_TILED,
-        "const uint Tkv = min(*Tkv_ptr, kv_capacity);",
-        "tiled attention live length clamp",
-    );
-}
-
-/// SwiGLU reads two windows and writes a third of `rows x ld` matrices; at
-/// T = 8192 a fused `[gate | up]` row is 12288 wide, so the row offset is
-/// widened before it is multiplied.
-#[test]
-fn qwen35_swiglu_row_offsets_are_widened() {
-    require(
-        QWEN35_MLP,
-        "gate[(ulong)r * ld_gate + gate_off + col]",
-        "SwiGLU gate address",
-    );
-    require(QWEN35_MLP, "up[(ulong)r * ld_up + up_off + col]", "SwiGLU up address");
-    require(
-        QWEN35_MLP,
-        "out[(ulong)r * ld_out + out_off + col]",
-        "SwiGLU output address",
-    );
-    require(
-        QWEN35_MLP,
-        "resid[(ulong)r * ld_resid + resid_off + col] += y[(ulong)r * ld_y + y_off + col];",
-        "residual add addresses",
-    );
-    require(QWEN35_MLP, "x + (ulong)row * dim;", "residual norm input row");
-    require(QWEN35_MLP, "out + (ulong)row * dim;", "residual norm output row");
-    require(
-        QWEN35_MLP,
-        "for (ulong d = lid; d < (ulong)dim; d += tptg)",
-        "residual norm column walk",
-    );
-}
-
-/// Cross-entropy gathers rows of a `[T, ld]` hidden-state matrix and walks
-/// `[n, chunk]` logits; at T = 8192 and ld = 2048 the gather offset alone is
-/// past 2^24, and a chunk of 2^20 columns times a few hundred rows passes
-/// `u32::MAX`, so each row offset is widened before it is multiplied.
-#[test]
-fn cross_entropy_row_offsets_are_widened() {
-    require(
-        CROSS_ENTROPY,
-        "out[(ulong)n * hidden + c] = float(h[(ulong)rows[n] * ld + off + c]);",
-        "cross-entropy gather addresses",
-    );
-    require(
-        CROSS_ENTROPY,
-        "device const float *row = logits + (ulong)n * ld;",
-        "log-sum-exp row address",
-    );
-    require(
-        CROSS_ENTROPY,
-        "const ulong i = (ulong)n * ld + c;",
-        "softmax-gradient address",
-    );
-}
-
-/// The GDN training kernels index [B, T, H, D] rows and [B, H, NC, 128, Dv]
-/// checkpoints; at B = 8, T = 8192, H = 16 a q row offset is already past
-/// 2^30 elements, and the per-slice partials multiply that by Dv / 16. Every
-/// row, state, checkpoint and partial offset is formed in 64 bits.
-#[test]
-fn gdn_train_offsets_are_widened() {
-    for (needle, what) in [
-        ("const ulong r = ((ulong)b * T + t) * H + h;", "token row"),
-        (
-            "const ulong srow = ((ulong)bh * GDN_TRAIN_DK + i) * Dv + j0;",
-            "state row",
-        ),
-        (
-            "const ulong c = ((ulong)bh * nc + t / GDN_TRAIN_CKPT) * GDN_TRAIN_DK + i;",
-            "forward checkpoint",
-        ),
-        (
-            "const ulong c = ((ulong)bh * nc + cc) * GDN_TRAIN_DK + i;",
-            "backward checkpoint",
-        ),
-        (
-            "scratch + ((ulong)bh * ns + tg.x) * C * GDN_TRAIN_DK * BV;",
-            "scratch slab",
-        ),
-        ("const ulong part = (ulong)tg.x * rows + r;", "partial row"),
-        ("dq_part[(ulong)s * rows * GDN_TRAIN_DK + at];", "finish partial read"),
-    ] {
-        require(GDN_TRAIN, needle, what);
-    }
-}
-
-/// The row-local backward kernels walk [T, ld] rows of the 2B's projections
-/// (ld up to 2 * 16 * 256 for the attention q|gate row) and write per-block
-/// weight-gradient partials; every row, window and partial offset is formed
-/// in 64 bits.
-#[test]
-fn qwen35_bwd_offsets_are_widened() {
-    for (needle, what) in [
-        ("const ulong r0 = (ulong)blk * rows_per_block;", "RMSNorm block rows"),
-        ("for (ulong r = r0; r < r1; ++r) {", "RMSNorm row walk"),
-        ("dw_part[(ulong)blk * D + d] = acc[k];", "RMSNorm dw partial"),
-        ("s += part[(ulong)b * D + d];", "column-sum partial read"),
-        ("const ulong units = (ulong)rows * H;", "gated norm units"),
-        ("const ulong r = u / H, h = u % H;", "gated norm row and head"),
-        (
-            "device const float *xr = x + r * ld_x + x_off + h * D;",
-            "gated norm x window",
-        ),
-        ("dw_part[(ulong)blk * D + d] = s;", "gated norm dw partial"),
-        (
-            "const float g = gate[(ulong)r * ld_gate + gate_off + col];",
-            "SwiGLU gate window",
-        ),
-        (
-            "dup[(ulong)r * ld_dup + dup_off + col] = d * qwen35_silu(g);",
-            "SwiGLU dup window",
-        ),
-        (
-            "const ulong gi = (ulong)r * ld_p + q_off + (ulong)h * 2u * D + D + d;",
-            "output gate column",
-        ),
-        ("d_attn[(ulong)r * Hq * D + col] = g * s;", "output gate d_attn row"),
-        ("acc += wc[j] * xc[(ulong)(e - hist) * ld_x];", "conv tap read"),
-        (
-            "device const float *xc = x + b * T * (ulong)ld_x + x_off + c;",
-            "conv x batch row",
-        ),
-        (
-            "device const float *dyc = dy + b * T * (ulong)ld_dy + dy_off + c;",
-            "conv dy batch row",
-        ),
-        ("dx[row * ld_dx + dx_off + c] = acc;", "conv dx row"),
-        (
-            "const float dpre = dy[row * ld_dy + dy_off + c] * qwen35_silu_grad(pre);",
-            "conv dw dy row",
-        ),
-        (
-            "device float *out = dw_part + blk * ((ulong)C * KW) + (ulong)c * KW;",
-            "conv dw partial",
-        ),
-        ("const ulong u0 = r0 * heads, u1 = r1 * heads;", "q/k norm unit range"),
-        ("device const float *row = p + r * ld_p;", "q/k norm projection row"),
-        ("device float *drow = dp + r * ld_p;", "q/k norm gradient row"),
-        ("const ulong col = q_off + (ulong)j * 2u * D;", "q head column"),
-        ("dq + (r * Hq + j) * (ulong)D", "dq row"),
-        ("dk + (r * Hkv + h) * (ulong)D", "dk row"),
-        ("device const float *src = dv + (r * Hkv + h) * (ulong)D;", "dv row"),
-        ("part[(nblocks + blk) * D + d] = sk;", "k-norm partial"),
-        ("s += dh[(ulong)pos[i] * hidden + col];", "embedding dh row"),
-        ("dw[(ulong)uniq[u] * hidden + col] += s;", "embedding table row"),
-        ("device float *drow = dp + r * ld;", "gate gradient row"),
-        ("part[(nblocks + blk) * H + h] = acc_dt;", "dt_bias partial"),
-        (
-            "dst[(ulong)r * ld_dst + dst_off + c] = src[(ulong)r * ld_src + src_off + c];",
-            "window copy",
-        ),
-        (
-            "dst[(ulong)pos[i] * width + c] += src[(ulong)i * width + c];",
-            "row scatter",
-        ),
-    ] {
-        require(QWEN35_BWD, needle, what);
-    }
-}
-
-/// AdamW and the squared norm walk every parameter window of the model, the
-/// tied embedding's `[vocab, hidden]` included (5.1e8 elements at the 2B's
-/// 248320 x 2048, past 2^28 and an eighth of u32's range in elements, which
-/// a larger vocab or hidden size crosses); each element offset and row base
-/// is formed in 64 bits.
-#[test]
-fn qwen35_adamw_offsets_are_widened() {
-    require(
-        QWEN35_ADAMW,
-        "const ulong i = (ulong)r * ld + off + c;",
-        "AdamW element",
-    );
-    require(
-        QWEN35_ADAMW,
-        "const ulong base = (ulong)r * ld + off;",
-        "squared-norm row",
-    );
-}
-
-/// The training attention indexes [B, T, H, 256] rows and [B, H, T]
-/// log-sum-exp rows; at B = 8, T = 8192, H = 8 a row offset is past 2^27
-/// elements times 256. Every row, plane and log-sum-exp offset is formed in
-/// 64 bits (the MPP tensor views take i32 extents within one plane, which the
-/// host bounds).
-#[test]
-fn attn_train_offsets_are_widened() {
-    for (needle, what) in [
-        (
-            "const ulong row = ((b * T + t) * H + h) * (ulong)ATTN_BWD_D;",
-            "dvec row",
-        ),
-        ("dvec[(ulong)bh * T + t] = s;", "dvec store"),
-        (
-            "const ulong q_base = (ulong)b * T * q_row + (ulong)h * D;",
-            "query plane",
-        ),
-        (
-            "const ulong kv_base = (ulong)b * T * kv_row + (ulong)hkv * D;",
-            "key/value plane",
-        ),
-        (
-            "lse_row[tid] = live ? lse[(ulong)bh * T + q0 + tid] : FLT_MAX;",
-            "dq log-sum-exp read",
-        ),
-        (
-            "lse_col[tid] = live ? lse[(ulong)bh * T + qb + tid] : FLT_MAX;",
-            "dk/dv log-sum-exp read",
-        ),
-    ] {
-        require(QWEN35_ATTN_BWD, needle, what);
-    }
-    require(
-        QWEN35_ATTN_TILED,
-        "lse[(ulong)bh * Tq + q0 + tid] =",
-        "forward log-sum-exp store",
-    );
-}
-
-/// The training gate kernel reads one fused-projection row per token and
-/// writes a dense [rows, H] value; both offsets are formed in 64 bits.
-#[test]
-fn gdn_gate_offsets_are_widened() {
-    require(
-        QWEN35_GDN,
-        "device const float *row = p + (ulong)r * ld;",
-        "gate logits row",
-    );
-    require(QWEN35_GDN, "const ulong o = (ulong)r * H + h;", "gate value");
-}
-
-/// The encoder attention indexes [B, T, H, D] queries and [B, T, Hkv, D]
-/// keys/values at D = 512; a batch of 256 sequences of 8192 tokens puts a
-/// query row past 2^32 elements. Every row, plane, window bound and output
-/// offset is formed in 64 bits, and the device length is clamped first.
-#[test]
-fn encoder_attn_offsets_are_widened() {
-    for (needle, what) in [
-        (
-            "const ulong base_row = (ulong)tgpig.x * RPT + sg * RPS;",
-            "query row block",
-        ),
-        ("const ulong len = (ulong)min(lens[b], T);", "clamped device length"),
-        (
-            "const ulong kv_pos_stride = (ulong)Hkv * (D);",
-            "key/value position stride",
-        ),
-        (
-            "const ulong kv_head_base = (ulong)b * T * kv_pos_stride + (ulong)hkv * (D);",
-            "key/value plane",
-        ),
-        (
-            "const ulong q_head_base = (ulong)b * T * q_pos_stride + (ulong)h * (D);",
-            "query plane",
-        ),
-        (
-            "const ulong my_hi = (w == 0ul) ? len : min(len, (ulong)t_q + w + 1ul);",
-            "window end",
-        ),
-        (
-            "const ulong o_off = q_head_base + (ulong)t_q * q_pos_stride;",
-            "output row",
-        ),
-        (
-            "const ulong kv_base = kv_head_base + t * kv_pos_stride;",
-            "key/value row",
-        ),
-        ("const ulong d0 = o_off + 4u * (dl + j * (R));", "output column"),
-    ] {
-        require(ENCODER_ATTN, needle, what);
-    }
-}
-
-/// Segment means read [rows, D] and write [S, D]; normalize walks rows spaced
-/// `ld` apart. Every element and row offset is formed in 64 bits, and the
-/// device ranges are clamped to `rows` before any address is formed.
-#[test]
-fn embed_pool_offsets_are_widened() {
-    for (needle, what) in [
-        ("const ulong n = (ulong)S * D;", "grid extent"),
-        (
-            "const uint end = min(segments[2u * s + 1u], rows);",
-            "clamped segment end",
-        ),
-        ("acc += x[(ulong)r * D + d];", "segment row read"),
-        ("out[(ulong)s * D + d] =", "segment mean store"),
-        ("device float *r = x + (ulong)row * ld;", "normalize row"),
-    ] {
-        require(EMBED_POOL, needle, what);
-    }
-}
-
-/// The bound-tensor probes index the tensor only inside its own extents, and
-/// widen the one raw buffer offset they form.
-#[test]
-fn mtl_tensor_probe_offsets_are_widened() {
-    for (needle, what) in [
-        ("if (c >= cols || r >= rows) { return; }", "extent guard"),
-        ("out[(ulong)r * (ulong)cols + (ulong)c] =", "read-out store"),
-    ] {
-        require(MTL_TENSOR, needle, what);
-    }
-}
-
-/// The BERT row kernels address `[rows, dim]` rows and the `[vocab, dim]`
-/// embedding tables, and the sparse max reads `[rows, V]` logits: every row
-/// base is formed in 64 bits. The bias kernels' flat `gid` and the sparse
-/// max's `S * V` grid are bounded to `u32` on the host (`bert::bias_add` /
-/// `bias_gelu_erf` refuse more elements, and `dispatch_1d` refuses a larger
-/// grid).
-#[test]
-fn bert_offsets_are_widened() {
-    for (needle, what) in [
-        (
-            "device const float *wr = word + (ulong)(bad ? 0u : id) * dim;",
-            "word embedding row",
-        ),
-        (
-            "device const float *pr = pos + (ulong)(row % seq) * dim;",
-            "position embedding row",
-        ),
-        ("device float *o = out + (ulong)row * dim;", "output row"),
-        ("device const float *yr = y + (ulong)row * dim;", "residual input row"),
-        ("device float *rr = resid + (ulong)row * dim;", "residual row"),
-        ("device const float *xr = x + (ulong)row * dim;", "layer-norm input row"),
-        ("if ((ulong)gid >= (ulong)S * V) return;", "sparse max grid guard"),
-        (
-            "const uint end = min(segments[2u * s + 1u], rows);",
-            "clamped segment end",
-        ),
-        ("m = max(m, logits[(ulong)r * V + v]);", "logits row"),
-        ("device float *p = pooled + (ulong)s * V + v;", "pooled store"),
-    ] {
-        require(BERT, needle, what);
-    }
-}
-
-/// The stored-precision AdamW and the window casts address packed `[in,
-/// total]` projections through `(row, ld, off)`: every window element is
-/// formed in 64 bits, and the squared-norm loop strides in 64 bits so a width
-/// near `u32::MAX` cannot wrap it into a hang. Dense state indices are `uint`, bounded on the host by
-/// `Window::check` (every count fits `u32`), so a grid of 256-thread blocks
-/// over them ends at thread `2^32 - 1` at most.
-#[test]
-fn qwen35_train_storage_offsets_are_widened() {
-    for (needle, what) in [
-        (
-            "const ulong wi = (ulong)r * ld + off + (live ? i - r * width : 0u);",
-            "AdamW window element",
-        ),
-        (
-            "dst[(ulong)gid.y * dst_ld + dst_off + gid.x] = D(float(src[(ulong)gid.y * src_ld + src_off + gid.x]));",
-            "window cast element",
-        ),
-        ("const ulong base = (ulong)r * ld + off;", "squared-norm row"),
-        (
-            "for (ulong c = t; c < (ulong)width; c += 256ul) {",
-            "squared-norm strided loop",
-        ),
-    ] {
-        require(QWEN35_TRAIN_STORAGE, needle, what);
-    }
-}
-
 #[test]
 fn every_kernel_source_is_inspected_or_explicitly_exempt() {
     let root = concat!(env!("CARGO_MANIFEST_DIR"), "/kernels");
@@ -845,9 +409,17 @@ fn utility_and_simdgroup_pointer_math_is_explicitly_wide() {
         "if ((ulong)gid >= (ulong)rows * cols) return;",
         "transpose extent guard",
     );
-    require(SIMD_GEMM, "A + (ulong)row0 * K + k0", "simdgroup A tile address");
+    require(
+        SIMD_GEMM,
+        "A + (ulong)row0 * K + k0",
+        "simdgroup A tile address",
+    );
     require(SIMD_GEMM, "C[(ulong)r*N+c]", "simdgroup edge store address");
-    forbid(UTILS, "if (gid >= rows * cols) return;", "transpose extent guard");
+    forbid(
+        UTILS,
+        "if (gid >= rows * cols) return;",
+        "transpose extent guard",
+    );
     forbid(SIMD_GEMM, "A + row0 * K + k0", "simdgroup A tile address");
     forbid(SIMD_GEMM, "C[r*N+c]", "simdgroup edge store address");
 
@@ -856,34 +428,8 @@ fn utility_and_simdgroup_pointer_math_is_explicitly_wide() {
     // contract, which also puts every logical element address below `u32::MAX`.
     require(
         GEMM_RS,
-        "if numel > i32::MAX as usize",
+        "if t.numel() > i32::MAX as usize",
         "TensorOps host addressability contract",
-    );
-    for (source, call, label) in [
-        (
-            GEMM_RS,
-            "require_i32_extent(t.numel(), \"GEMM\")?",
-            "validate_gemm extent guard",
-        ),
-        (
-            GEMM_RS,
-            "require_i32_extent(t.numel(), \"batched GEMM\")?",
-            "gemm_batched extent guard",
-        ),
-        (
-            NN_RS,
-            "crate::gemm::require_i32_extent(numel, what)?",
-            "gemm_i8_dequant extent guard",
-        ),
-    ] {
-        require(source, call, label);
-    }
-    // Every TensorOps pipeline the crate looks up outside gemm.rs must be one
-    // whose entry point is listed above.
-    assert_eq!(
-        NN_RS.matches("pipeline(\"matmul2d_tensorops").count(),
-        1,
-        "a new TensorOps entry point in nn.rs must pass require_i32_extent"
     );
     assert!((i32::MAX as u64) < u64::from(u32::MAX));
 }

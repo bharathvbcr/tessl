@@ -1,9 +1,11 @@
 // Fused gate×up with gelu_pytorch_tanh (NOT SiLU / swish).
 // gelu(x) = 0.5 * x * (1 + tanh(√(2/π) * (x + 0.044715 * x³)))
 //
-// The cubic is clamped so x³ cannot overflow, and precise::tanh's argument is
-// clamped because -O2 lowers tanh to fast_tanh, which NaNs past saturation.
-// The outer factor stays the original x (see gelu.h).
+// Root cause of prior NaNs: with -O2, MSL `tanh` lowers to `air.fast_tanh`,
+// which NaNs for |arg| ≳ ~10. Host/PyTorch use a saturating precise tanh.
+// The gelu inner term at |x|≈20 is ~301 → fast_tanh → NaN mid even when
+// gate/up are finite. Fix: clamp x (x³ overflow) + precise::tanh on a
+// clamped inner (tanh already saturates by |z|≳8).
 #include <metal_stdlib>
 #include "gelu.h"
 using namespace metal;

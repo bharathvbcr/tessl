@@ -25,8 +25,8 @@
 mod common;
 
 use common::{
-    buf, buf_bf16, close_rel, dense_gemv, empty, gelu_pytorch_tanh, q4_mlx_matrix, random_f32, round_trip_bf16, seeded,
-    with_gpu,
+    buf, buf_bf16, close_rel, dense_gemv, empty, q4_mlx_matrix, random_f32, round_trip_bf16,
+    seeded, with_gpu,
 };
 use tessl::nn::{self, GateUpDispatch, Q4MlxBank, Q4MlxLayout, QkvOutputs, QuantShape};
 
@@ -51,7 +51,13 @@ fn nibbles_for(rows: usize, cols: usize) -> Vec<u8> {
 }
 
 /// Repack row-major nibbles and scale/bias pairs into the Interleaved4 layout.
-fn interleave4(nibbles: &[u8], sb: &[f32], rows: usize, cols: usize, group: usize) -> (Vec<u8>, Vec<f32>) {
+fn interleave4(
+    nibbles: &[u8],
+    sb: &[f32],
+    rows: usize,
+    cols: usize,
+    group: usize,
+) -> (Vec<u8>, Vec<f32>) {
     assert_eq!(cols % I4_PACK_COLS, 0, "Interleaved4 needs cols % 16 == 0");
     let gpr = cols / group;
     let packs = cols / I4_PACK_COLS;
@@ -101,13 +107,9 @@ fn simd_i4_matches_the_dense_reference_and_its_row_major_twin() {
     with_gpu(|rt| {
         for &(rows, cols, group) in &[
             (256usize, 256usize, 32usize),
-            // rows a multiple of the 4 a tile holds but not of the 8 a
-            // threadgroup holds.
+            // rows not a multiple of the 4 a tile holds, and of the 8 a
+            // threadgroup holds: the tail guard has to hold in both layouts.
             (100, 512, 64),
-            // rows a multiple of neither: a partial last tile, stored padded
-            // (see `nn::Q4MlxBank`), with the tail guard holding in both
-            // layouts.
-            (102, 512, 64),
         ] {
             let b = banks(rows, cols, group);
             let x = random_f32(cols, 0x9911 + cols as u64);
@@ -141,7 +143,8 @@ fn simd_i4_matches_the_dense_reference_and_its_row_major_twin() {
                 ),
             ] {
                 let yb = seeded(rt, rows, UNWRITTEN);
-                nn::gemv_q4_mlx_simd(rt, bank, &xb, &yb, shape(rows, cols, group), layout, None).unwrap();
+                nn::gemv_q4_mlx_simd(rt, bank, &xb, &yb, shape(rows, cols, group), layout, None)
+                    .unwrap();
                 rt.synchronize().unwrap();
                 let y = yb.read_f32()[..rows].to_vec();
                 assert!(
@@ -153,7 +156,12 @@ fn simd_i4_matches_the_dense_reference_and_its_row_major_twin() {
             }
             // Same logical weights, two packings: the layouts must agree with
             // each other, not merely each land inside the tolerance.
-            close_rel(&format!("i4 vs row-major {rows}x{cols}"), &got[1], &got[0], 1e-5);
+            close_rel(
+                &format!("i4 vs row-major {rows}x{cols}"),
+                &got[1],
+                &got[0],
+                1e-5,
+            );
         }
     });
 }
@@ -233,10 +241,18 @@ fn gemm_i4_agrees_with_the_gemv_on_every_row() {
         rt.synchronize().unwrap();
 
         let got = yb.read_f32();
-        assert!(!got[..m * rows].contains(&UNWRITTEN), "gemm_i4: unwritten rows");
+        assert!(
+            !got[..m * rows].contains(&UNWRITTEN),
+            "gemm_i4: unwritten rows"
+        );
         for i in 0..m {
             let want = dense_gemv(&b.dense, &xr[i * cols..(i + 1) * cols], rows, cols);
-            close_rel(&format!("gemm_i4 row {i}"), &got[i * rows..(i + 1) * rows], &want, 3e-3);
+            close_rel(
+                &format!("gemm_i4 row {i}"),
+                &got[i * rows..(i + 1) * rows],
+                &want,
+                3e-3,
+            );
         }
     });
 }
@@ -251,7 +267,13 @@ fn kv_i4_matches_two_separate_gemvs() {
         // A distinct V bank, or the two outputs cannot be told apart.
         let nv = nibbles_for(rows + 4, cols);
         let (_, sv, dv) = q4_mlx_matrix(rows + 4, cols, group);
-        let (ivp, ivs) = interleave4(&nv[..rows * cols], &sv[..rows * (cols / group) * 2], rows, cols, group);
+        let (ivp, ivs) = interleave4(
+            &nv[..rows * cols],
+            &sv[..rows * (cols / group) * 2],
+            rows,
+            cols,
+            group,
+        );
         let dv = dv[..rows * cols].to_vec();
 
         let x = random_f32(cols, 0x9944);
@@ -311,7 +333,11 @@ fn qkv_i4_matches_three_separate_gemvs() {
         // Perturb V's scales so it is not a copy of K.
         let nv = nibbles_for(rows_kv, cols);
         let (_, sv0, _) = q4_mlx_matrix(rows_kv, cols, group);
-        let sv: Vec<f32> = sv0.iter().enumerate().map(|(i, v)| v + (i % 3) as f32 * 0.01).collect();
+        let sv: Vec<f32> = sv0
+            .iter()
+            .enumerate()
+            .map(|(i, v)| v + (i % 3) as f32 * 0.01)
+            .collect();
         let gpr = cols / group;
         let mut dv = vec![0.0f32; rows_kv * cols];
         let svr = round_trip_bf16(&sv);
@@ -414,11 +440,16 @@ fn gate_up_gelu_i4_matches_two_gemvs_and_a_gelu() {
         let xr = round_trip_bf16(&x);
         let gate = dense_gemv(&bg.dense, &xr, rows, cols);
         let up = dense_gemv(&du, &xr, rows, cols);
-        // The kernel's GELU (gelu.h), as `nn::mlp_gelu_tanh`.
+        // The kernel's GELU: clamp the cubic input, but retain the original
+        // projection in the outer factor so large values are not clipped.
         let want: Vec<f32> = gate
             .iter()
             .zip(&up)
-            .map(|(g, u)| (gelu_pytorch_tanh(*g as f64) * (*u as f64)) as f32)
+            .map(|(g, u)| {
+                let xc = (*g as f64).clamp(-20.0, 20.0);
+                let inner = 0.797_884_560_802_865_4 * (xc + 0.044715 * xc * xc * xc);
+                (0.5 * (*g as f64) * (1.0 + inner.clamp(-10.0, 10.0).tanh()) * (*u as f64)) as f32
+            })
             .collect();
 
         let gp = rt.alloc_buffer(bg.i4_packed.len()).unwrap();
@@ -449,6 +480,48 @@ fn gate_up_gelu_i4_matches_two_gemvs_and_a_gelu() {
         .unwrap();
         rt.synchronize().unwrap();
         close_rel("gate_up_gelu_i4", &mid.read_f32()[..rows], &want, 5e-3);
+    });
+}
+
+#[test]
+fn fused_q4_gelu_preserves_large_positive_activations() {
+    with_gpu(|rt| {
+        // One affine group per row. Zero scale + unit bias makes every decoded
+        // weight exactly one, so an all-one x produces gate=up=64. The old
+        // helper clamped GELU's outer factor and returned about 20*64 instead
+        // of the asymptotically correct 64*64.
+        let (rows, cols, group) = (16usize, 64usize, 64usize);
+        let packed = vec![0u8; rows * cols / 2];
+        let scale_bias: Vec<f32> = (0..rows).flat_map(|_| [0.0f32, 1.0f32]).collect();
+        let packed_buf = rt.alloc_buffer(packed.len()).unwrap();
+        packed_buf.write_bytes(&packed);
+        let sb = buf_bf16(rt, &scale_bias);
+        let x = buf(rt, &vec![1.0f32; cols]);
+        let mid = empty(rt, rows);
+        let bank = Q4MlxBank {
+            packed: &packed_buf,
+            scales_biases: &sb,
+        };
+
+        nn::gemv_q4_mlx_gate_up_gelu(
+            rt,
+            bank,
+            bank,
+            &x,
+            &mid,
+            shape(rows, cols, group),
+            nn::GateUpDispatch::Blocked,
+            false,
+        )
+        .unwrap();
+        rt.synchronize().unwrap();
+
+        for (i, got) in mid.read_f32()[..rows].iter().copied().enumerate() {
+            assert!(
+                (got - 4096.0).abs() <= 1e-2,
+                "fused Q4 GELU row {i}: got {got}, want 4096"
+            );
+        }
     });
 }
 
@@ -512,7 +585,10 @@ fn gemm_add_folds_the_residual_in_both_layouts() {
             .unwrap();
             rt.synchronize().unwrap();
             let got = yb.read_f32();
-            assert!(!got[..m * rows].contains(&UNWRITTEN), "gemm_add {name}: unwritten rows");
+            assert!(
+                !got[..m * rows].contains(&UNWRITTEN),
+                "gemm_add {name}: unwritten rows"
+            );
             for i in 0..m {
                 let base = dense_gemv(&b.dense, &xr[i * cols..(i + 1) * cols], rows, cols);
                 let want: Vec<f32> = base
@@ -528,5 +604,74 @@ fn gemm_add_folds_the_residual_in_both_layouts() {
                 );
             }
         }
+    });
+}
+
+/// Interleaved4 stores rows in tiles of four, so a bank whose row count is
+/// not a multiple of four is *larger* than its row-major twin: the packer pads
+/// to `rows.div_ceil(4) * 4` rows, and the kernels read the padding rows'
+/// nibbles and scale pairs before the `row < rows` guard discards those
+/// lanes. A validator that only checks the row-major extent accepts a buffer
+/// the kernel reads past the end of.
+#[test]
+fn interleaved4_banks_are_validated_at_their_tile_padded_extent() {
+    with_gpu(|rt| {
+        let (rows, cols, group) = (6usize, 64usize, 32usize);
+        let b = banks(rows, cols, group);
+        let padded_rows = rows.div_ceil(I4_ROWS) * I4_ROWS;
+        assert_eq!(b.i4_packed.len(), padded_rows * cols / 2);
+        assert_eq!(b.i4_sb.len(), padded_rows * (cols / group) * 2);
+        let x = random_f32(cols, 0x6);
+        let xb = buf_bf16(rt, &x);
+        let sh = shape(rows, cols, group);
+
+        // Sized for `rows` row-major rows: exactly what a layout-blind
+        // validator accepts, and less than the interleaved kernel reads.
+        let short_packed = rt.alloc_buffer(rows * cols / 2).unwrap();
+        short_packed.write_bytes(&b.i4_packed[..rows * cols / 2]);
+        let short_sb = buf_bf16(rt, &b.i4_sb[..rows * (cols / group) * 2]);
+        let full_packed = rt.alloc_buffer(b.i4_packed.len()).unwrap();
+        full_packed.write_bytes(&b.i4_packed);
+        let full_sb = buf_bf16(rt, &b.i4_sb);
+        let yb = seeded(rt, rows, UNWRITTEN);
+
+        for (what, packed, sb) in [
+            ("packed", &short_packed, &full_sb),
+            ("scales_biases", &full_packed, &short_sb),
+        ] {
+            let bank = Q4MlxBank {
+                packed,
+                scales_biases: sb,
+            };
+            let err = nn::gemv_q4_mlx_simd(rt, bank, &xb, &yb, sh, Q4MlxLayout::Interleaved4, None)
+                .expect_err(&format!(
+                    "{what} sized for {rows} row-major rows must be refused for Interleaved4"
+                ));
+            assert!(
+                err.contains(what) && err.contains("Interleaved4"),
+                "gemv_q4_mlx_simd: {err}"
+            );
+            let err = nn::gemm_q4_mlx(rt, bank, &xb, &yb, sh, 1, Q4MlxLayout::Interleaved4, None)
+                .expect_err("the GEMM reads the same padded bank");
+            assert!(err.contains(what), "gemm_q4_mlx: {err}");
+        }
+
+        // The padded buffers are accepted and the six real rows come out right.
+        nn::gemv_q4_mlx_simd(
+            rt,
+            Q4MlxBank {
+                packed: &full_packed,
+                scales_biases: &full_sb,
+            },
+            &xb,
+            &yb,
+            sh,
+            Q4MlxLayout::Interleaved4,
+            None,
+        )
+        .unwrap();
+        rt.synchronize().unwrap();
+        let want = dense_gemv(&b.dense, &round_trip_bf16(&x), rows, cols);
+        close_rel("padded i4 6x64", &yb.read_f32()[..rows], &want, 3e-3);
     });
 }

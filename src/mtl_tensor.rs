@@ -13,8 +13,8 @@ use objc2::runtime::ProtocolObject;
 use objc2::AnyThread;
 use objc2_foundation::NSInteger;
 use objc2_metal::{
-    MTLAllocation, MTLBuffer, MTLDevice, MTLResourceID, MTLResourceOptions, MTLSizeAndAlign, MTLTensor,
-    MTLTensorDataType, MTLTensorDescriptor, MTLTensorExtents, MTLTensorUsage,
+    MTLAllocation, MTLBuffer, MTLDevice, MTLResourceID, MTLResourceOptions, MTLSizeAndAlign,
+    MTLTensor, MTLTensorDataType, MTLTensorDescriptor, MTLTensorExtents, MTLTensorUsage,
 };
 use std::sync::Arc;
 
@@ -38,14 +38,16 @@ impl QuantDType {
     pub fn to_mtl(self) -> Result<MTLTensorDataType, String> {
         match self {
             QuantDType::Int8 => Ok(MTLTensorDataType::Int8),
-            QuantDType::Int4 => Err("MTLTensorDataType Int4 is not in objc2-metal 0.3 (WWDC26-330), so a \
+            QuantDType::Int4 => Err(
+                "MTLTensorDataType Int4 is not in objc2-metal 0.3 (WWDC26-330), so a \
                  host-created Int4 MTLTensor cannot be described. Note this gates only \
                  the host descriptor path: TensorOps itself accepts int4b_format, and \
                  kernels building tensors from device pointers are unaffected."
-                .into()),
-            QuantDType::Fp8E8M0 => {
-                Err("FP8 E8M0 MTLTensor scale planes require newer Metal SDK (macOS 27+ notes)".into())
-            }
+                    .into(),
+            ),
+            QuantDType::Fp8E8M0 => Err(
+                "FP8 E8M0 MTLTensor scale planes require newer Metal SDK (macOS 27+ notes)".into(),
+            ),
         }
     }
 
@@ -60,9 +62,11 @@ impl QuantDType {
 
 /// Snapshot of TensorOps / NAX readiness for verify(M) / prefill planning.
 ///
-/// Int4 is **unbound** in objc2-metal 0.3 — verify(M) remains on hand simdgroup Q4
-/// GEMM (`gemm_q4_mlx_simd*`). DDTree stays parked until verify(M) flattens (it will
-/// not with current simdgroup Q4 alone).
+/// Verify(M) remains on hand-written simdgroup Q4 GEMM
+/// (`gemm_q4_mlx_simd*`) because tessl does not yet ship the shader-side
+/// sub-byte TensorOps constructor and wired host dispatch that raw-address Q4
+/// needs. The missing Int4 host descriptor binding in objc2-metal 0.3 is
+/// reported separately; it does not block that raw-address kernel design.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NaxVerifyReadiness {
     pub int8_tensorops_dtype: bool,
@@ -82,7 +86,7 @@ pub fn nax_verify_readiness() -> NaxVerifyReadiness {
         // `.is_ok()` off it. There is one fact here — quantized TensorOps
         // prefill GEMM does not exist — and it is stated once.
         quant_prefill_gemm_wired: QUANT_PREFILL_GEMM_WIRED,
-        note: "Int4 unbound in objc2-metal 0.3; verify(M) = hand simdgroup Q4; TensorOps Q4 not shipped",
+        note: "TensorOps Q4 is not shipped: raw-address kernels lack a shader-side sub-byte tensor constructor and wired host dispatch; the missing Int4 host descriptor binding is separate",
     }
 }
 
@@ -111,37 +115,60 @@ pub const QUANT_PREFILL_GEMM_WIRED: bool = false;
 
 /// Owned MTLTensor handle (device-allocated or buffer-backed).
 ///
-/// A device-owned tensor is in its runtime's residency set from allocation.
-/// Dropping the handle does not free the `MTLTensor` at once: Metal 4 command
-/// buffers do not retain what they bind, so the runtime holds it until the
-/// work already submitted has completed, and only then takes a device-owned
-/// one out of the residency set.
+/// The native handle is deliberately read-only through the safe API. Replacing
+/// it would detach the object from the storage, runtime, and residency policy
+/// recorded alongside it, so callers receive only a borrowed handle via
+/// [`Self::metal`].
+///
+/// ```compile_fail,E0616
+/// use tessl::mtl_tensor::GpuTensor;
+/// fn cannot_replace_the_native_handle(tensor: &mut GpuTensor) {
+///     let _replacement_slot = &mut tensor.tensor;
+/// }
+/// ```
 pub struct GpuTensor {
-    pub tensor: Retained<ProtocolObject<dyn MTLTensor>>,
+    tensor: Retained<ProtocolObject<dyn MTLTensor>>,
     pub dtype: MTLTensorDataType,
     pub dims: Vec<usize>,
-    /// A buffer-backed tensor's storage: the MTLTensor above borrows it, and
-    /// its residency is the buffer's own. `None` for a device-owned tensor,
-    /// which is registered for residency itself.
+    // Lifetime anchors, never read: the MTLTensor above borrows this storage,
+    // and the runtime owns the allocator that storage came from. Dropping
+    // either while `tensor` is live is a use-after-free, so they are held, not
+    // used. Scoped `allow` rather than a crate-level one, which would hide the
+    // next genuinely dead field.
+    #[allow(dead_code)]
     pub(crate) storage: Option<GpuBuffer>,
-    /// The runtime whose residency set and argument table this tensor is for.
+    #[allow(dead_code)]
     pub(crate) runtime: Arc<GpuRuntime>,
-}
-
-impl Drop for GpuTensor {
-    fn drop(&mut self) {
-        let alloc = ProtocolObject::<dyn MTLAllocation>::from_retained(self.tensor.clone());
-        self.runtime.schedule_release(alloc, self.storage.is_none());
-    }
+    /// Device-created tensors own a distinct `MTLAllocation` and therefore a
+    /// distinct residency registration. Buffer-backed tensor views borrow the
+    /// registration held by `storage` and must not double-register it.
+    residency_registered: bool,
 }
 
 impl GpuTensor {
+    /// Borrow the native tensor without allowing its ownership metadata to be
+    /// separated from it.
+    pub fn metal(&self) -> &ProtocolObject<dyn MTLTensor> {
+        &self.tensor
+    }
+
     pub fn gpu_resource_id(&self) -> MTLResourceID {
         self.tensor.gpuResourceID()
     }
 
     pub fn data_type(&self) -> MTLTensorDataType {
         self.tensor.dataType()
+    }
+}
+
+impl Drop for GpuTensor {
+    fn drop(&mut self) {
+        if self.residency_registered {
+            // The runtime retains this allocation until every command that
+            // could reference it has completed, then removes it from the
+            // residency set without putting it into the buffer freelist.
+            self.runtime.schedule_tensor_retirement(self.tensor.clone());
+        }
     }
 }
 
@@ -153,15 +180,9 @@ impl GpuTensor {
 /// does not range-check `setResource:atBufferIndex:`: an out-of-range slot
 /// writes past the table (a large one segfaults outright), which is why this
 /// safe wrapper rejects it instead of passing it through.
-///
-/// A tensor from another runtime is refused (and fails the binder, so the
-/// dispatch is not encoded even if the `Err` is ignored): it is outside this
-/// runtime's residency set.
 pub fn bind_mtl_tensor(bnd: &mut Binder<'_>, t: &GpuTensor, index: usize) -> Result<(), String> {
-    if !std::ptr::eq(Arc::as_ptr(&t.runtime), bnd.runtime()) {
-        let msg = "MTLTensor belongs to another runtime".to_string();
-        bnd.fail(msg.clone());
-        return Err(msg);
+    if !bnd.belongs_to_runtime(t.runtime.as_ref()) {
+        return Err("MTLTensor belongs to another runtime".into());
     }
     if index >= ARGUMENT_TABLE_MAX_BUFFERS {
         return Err(format!(
@@ -170,49 +191,41 @@ pub fn bind_mtl_tensor(bnd: &mut Binder<'_>, t: &GpuTensor, index: usize) -> Res
             ARGUMENT_TABLE_MAX_BUFFERS - 1
         ));
     }
-    // SAFETY: `bind_resource_id` requires `index` to be within the argument
-    // table's buffer bind count; the check above establishes that against the
-    // same constant `runtime::try_init_metal4` builds the table with (the
-    // DecodeIcb tape table is built with the same width). The resource id is
-    // read from `t`, which owns its MTLTensor — and, for a buffer-backed
-    // tensor, the storage behind it — for at least as long as this call.
-    unsafe {
-        bnd.bind_resource_id(t.gpu_resource_id(), index);
-    }
+    // The Binder takes its own +1 retain on the MTLTensor object before writing
+    // the resource ID. Metal 4 command buffers use unretained resources, so the
+    // caller may drop `t` (including a buffer-backed view) as soon as this
+    // closure returns without invalidating the encoded ID. The anchor transfers
+    // to the allocator slot on submission and releases only after completion.
+    bnd.bind_mtl_tensor_resource(&t.tensor, index);
     Ok(())
 }
 
-/// Size and alignment of a dense `dtype` tensor of shape `dims` laid out in a
-/// buffer — what [`tensor_from_buffer`] needs the storage and offset to satisfy.
+/// Probe whether the device can size an MTLTensor with the given dtype/shape.
 ///
-/// `dims` are in `MTLTensorExtents` order, innermost first: `dims[0]` is the
-/// contiguous dimension (stride 1).
-///
-/// This used to fault on every call (EXC_BAD_ACCESS inside
-/// `-[AGXG17XFamilyDevice tensorSizeAndAlignWithDescriptor:]`, M5 Pro, macOS
-/// 27.0.1). The cause was not objc2 or an unsupported layout: the descriptor
-/// left `strides` nil, and this selector sizes a tensor *in a buffer*, which
-/// needs strides. The driver does not validate that — only `MTL_DEBUG_LAYER=1`
-/// turns it into the assertion "strides should not be nil" — so it is the
-/// descriptor layout, chosen in `make_descriptor`, that prevents it.
-pub fn probe_tensor_support(rt: &GpuRuntime, dtype: QuantDType, dims: &[usize]) -> Result<MTLSizeAndAlign, String> {
+/// **Experimental:** some objc2 / SDK combinations have SIGSEGV'd on this
+/// selector for unsupported layouts — gate behind Phase-2 smoke before use.
+pub fn probe_tensor_support(
+    rt: &GpuRuntime,
+    dtype: QuantDType,
+    dims: &[usize],
+) -> Result<MTLSizeAndAlign, String> {
     let mtl_dtype = dtype.to_mtl()?;
-    let desc = make_descriptor(dims, mtl_dtype, MTLTensorUsage::Compute, TensorLayout::DenseInBuffer)?;
+    let desc = make_descriptor(dims, mtl_dtype, MTLTensorUsage::Compute)?;
     Ok(rt.device.tensorSizeAndAlignWithDescriptor(&desc))
 }
 
 /// Allocate a device-backed MTLTensor (no storage shared with [`GpuBuffer`]).
-///
-/// Metal picks the layout, so the tensor reports nil `strides`.
-pub fn alloc_device_tensor(rt: &Arc<GpuRuntime>, dims: &[usize], dtype: QuantDType) -> Result<GpuTensor, String> {
+pub fn alloc_device_tensor(
+    rt: &Arc<GpuRuntime>,
+    dims: &[usize],
+    dtype: QuantDType,
+) -> Result<GpuTensor, String> {
     let mtl_dtype = dtype.to_mtl()?;
-    let desc = make_descriptor(dims, mtl_dtype, MTLTensorUsage::Compute, TensorLayout::DeviceOwned)?;
+    let desc = make_descriptor(dims, mtl_dtype, MTLTensorUsage::Compute)?;
     let tensor = rt
         .device
         .newTensorWithDescriptor_error(&desc)
         .map_err(|e| format!("newTensorWithDescriptor: {e}"))?;
-    // Metal 4 binds by resource ID and makes nothing resident on its own: a
-    // kernel reading a tensor outside the residency set faults.
     rt.register_allocation(ProtocolObject::<dyn MTLAllocation>::from_ref(&*tensor));
     Ok(GpuTensor {
         tensor,
@@ -220,21 +233,16 @@ pub fn alloc_device_tensor(rt: &Arc<GpuRuntime>, dims: &[usize], dtype: QuantDTy
         dims: dims.to_vec(),
         storage: None,
         runtime: Arc::clone(rt),
+        residency_registered: true,
     })
 }
 
-/// Wrap an existing shared buffer as a dense MTLTensor view starting at
-/// `byte_offset` (offset must satisfy align).
-///
-/// `dims` are in `MTLTensorExtents` order, innermost first, and the view is
-/// packed: strides `[1, dims[0], dims[0] * dims[1], …]` elements.
+/// Wrap an existing shared buffer as an MTLTensor view (offset must satisfy align).
 ///
 /// # Safety
-/// No remaining caller obligation is known. What this section used to ask of
-/// the caller — `byte_offset` aligned per `tensorSizeAndAlignWithDescriptor` —
-/// is checked here, as are the window fitting inside `buf` and `buf` belonging
-/// to `rt`; each failure is an `Err`. It stays an `unsafe fn` so that making it
-/// safe is a deliberate API change, not a side effect of fixing its layout.
+/// The caller must ensure no incompatible live tensor view aliases the requested
+/// buffer range. Alignment, bounds, size arithmetic, and runtime ownership are
+/// validated here before the Metal selector is called.
 pub unsafe fn tensor_from_buffer(
     rt: &Arc<GpuRuntime>,
     buf: &GpuBuffer,
@@ -242,35 +250,13 @@ pub unsafe fn tensor_from_buffer(
     dims: &[usize],
     dtype: QuantDType,
 ) -> Result<GpuTensor, String> {
-    // Same check as `Tensor::validate`: a buffer from another runtime is not in
-    // this runtime's residency set, so binding it is a fault, not an error.
-    if !buf.inner.runtime.ptr_eq(&Arc::downgrade(rt)) {
-        return Err("tensor buffer belongs to a different runtime".into());
+    if !buf.belongs_to(rt) {
+        return Err("MTLTensor buffer belongs to another runtime".into());
     }
     let mtl_dtype = dtype.to_mtl()?;
-    let desc = make_descriptor(dims, mtl_dtype, MTLTensorUsage::Compute, TensorLayout::DenseInBuffer)?;
+    let desc = make_descriptor(dims, mtl_dtype, MTLTensorUsage::Compute)?;
     let align = rt.device.tensorSizeAndAlignWithDescriptor(&desc);
-    if align.align == 0 {
-        return Err("tensorSizeAndAlignWithDescriptor reported zero alignment".into());
-    }
-    if byte_offset % align.align != 0 {
-        return Err(format!(
-            "tensor buffer offset {byte_offset} not aligned to {}",
-            align.align
-        ));
-    }
-    // Metal does not catch this one: on M5 Pro / macOS 27.0.1 it accepted a
-    // window ending past `nbytes`. The pool rounds the MTLBuffer up to a power
-    // of two (`BufferPool::bucket`), so it is longer than `nbytes`, and
-    // whatever Metal checks does not protect the logical size.
-    let end = byte_offset.checked_add(align.size);
-    if end.is_none_or(|end| end > buf.nbytes()) {
-        return Err(format!(
-            "tensor view [{byte_offset}, +{}) runs past the end of a {}-byte buffer",
-            align.size,
-            buf.nbytes()
-        ));
-    }
+    validate_tensor_buffer_range(buf.nbytes(), byte_offset, align.size, align.align)?;
     let tensor = buf
         .metal()
         .newTensorWithDescriptor_offset_error(&desc, byte_offset as _)
@@ -281,319 +267,93 @@ pub unsafe fn tensor_from_buffer(
         dims: dims.to_vec(),
         storage: Some(buf.clone()),
         runtime: Arc::clone(rt),
+        residency_registered: false,
     })
 }
 
-/// Which creation path a descriptor is for. Metal demands opposite things of
-/// `strides` on the two, and neither failure is gentle, so the choice is
-/// explicit at every call site rather than defaulted.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum TensorLayout {
-    /// Metal allocates the storage and picks the layout
-    /// (`-[MTLDevice newTensorWithDescriptor:error:]`). Strides stay nil: that
-    /// selector rejects a descriptor that sets them (MTLTensorDomain code 2,
-    /// "Strides should be nil when using newTensorWithDescriptor:error:").
-    DeviceOwned,
-    /// Dense layout over caller storage, for `tensorSizeAndAlignWithDescriptor:`
-    /// and `-[MTLBuffer newTensorWithDescriptor:offset:error:]`. Strides are set:
-    /// MTLTensor.h says to set them when creating tensors from a buffer, and
-    /// the sizing selector faults in the driver when they are nil.
-    ///
-    /// Strides are in elements and follow MTLTensor.h's index order: index 0 is
-    /// the innermost dimension and its stride is exactly 1, and each later
-    /// stride is `strides[i - 1] * dims[i - 1]` — packed, no padding.
-    DenseInBuffer,
-}
-
-/// `dims` are in `MTLTensorExtents` order — index 0 is the innermost
-/// (contiguous) dimension — and are passed through unreordered.
 fn make_descriptor(
     dims: &[usize],
     dtype: MTLTensorDataType,
     usage: MTLTensorUsage,
-    layout: TensorLayout,
 ) -> Result<Retained<MTLTensorDescriptor>, String> {
     if dims.is_empty() || dims.len() > 16 {
         return Err(format!("MTLTensor rank {} out of range 1..=16", dims.len()));
     }
+    if let Some(&extent) = dims.iter().find(|&&d| d > NSInteger::MAX as usize) {
+        return Err(format!("MTLTensor extent {extent} does not fit NSInteger"));
+    }
     let desc = MTLTensorDescriptor::new();
     let extents = extents_from_dims(dims)?;
     desc.setDimensions(&extents);
-    match layout {
-        TensorLayout::DeviceOwned => desc.setStrides(None),
-        TensorLayout::DenseInBuffer => {
-            let strides = extents_from_dims(&dense_strides(dims)?)?;
-            desc.setStrides(Some(&strides));
-        }
-    }
     desc.setDataType(dtype);
     desc.setUsage(usage);
     desc.setResourceOptions(MTLResourceOptions::StorageModeShared);
     Ok(desc)
 }
 
-/// Packed strides, in elements, innermost first: `[1, d0, d0*d1, …]`.
-fn dense_strides(dims: &[usize]) -> Result<Vec<usize>, String> {
-    let mut strides = Vec::with_capacity(dims.len());
-    let mut stride = 1usize;
-    for (i, &d) in dims.iter().enumerate() {
-        strides.push(stride);
-        if i + 1 < dims.len() {
-            stride = stride
-                .checked_mul(d)
-                .ok_or_else(|| format!("MTLTensor stride overflows usize at dimension {}", i + 1))?;
-        }
+fn validate_tensor_buffer_range(
+    buffer_bytes: usize,
+    byte_offset: usize,
+    tensor_bytes: usize,
+    alignment: usize,
+) -> Result<(), String> {
+    if alignment == 0 {
+        return Err("MTLTensor reported zero buffer alignment".into());
     }
-    Ok(strides)
+    if byte_offset % alignment != 0 {
+        return Err(format!(
+            "tensor buffer offset {byte_offset} not aligned to {alignment}"
+        ));
+    }
+    if byte_offset
+        .checked_add(tensor_bytes)
+        .is_none_or(|end| end > buffer_bytes)
+    {
+        return Err(format!(
+            "tensor buffer range offset={byte_offset} size={tensor_bytes} exceeds {buffer_bytes} bytes"
+        ));
+    }
+    Ok(())
 }
 
 fn extents_from_dims(dims: &[usize]) -> Result<Retained<MTLTensorExtents>, String> {
-    let values = dims
-        .iter()
-        .map(|&d| NSInteger::try_from(d).map_err(|_| format!("MTLTensor extent {d} exceeds NSInteger")))
-        .collect::<Result<Vec<NSInteger>, String>>()?;
-    let extents =
-        unsafe { MTLTensorExtents::initWithRank_values(MTLTensorExtents::alloc(), values.len() as _, values.as_ptr()) }
-            .ok_or_else(|| "MTLTensorExtents::initWithRank_values failed".to_string())?;
+    let values: Vec<NSInteger> = dims.iter().map(|&d| d as NSInteger).collect();
+    let extents = unsafe {
+        MTLTensorExtents::initWithRank_values(
+            MTLTensorExtents::alloc(),
+            values.len() as _,
+            values.as_ptr(),
+        )
+    }
+    .ok_or_else(|| "MTLTensorExtents::initWithRank_values failed".to_string())?;
     Ok(extents)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::os::unix::process::ExitStatusExt;
-
-    /// Env marker set on the isolated child process (see [`in_child`]).
-    const CHILD_ENV: &str = "TESSL_MTL_TENSOR_CHILD";
-
-    /// Run `body` in a child copy of this test binary, filtered to `test_name`.
-    ///
-    /// The calls under test go straight into the Metal driver, and a malformed
-    /// descriptor there is not an `Err`: a stride-less descriptor handed to
-    /// `tensorSizeAndAlignWithDescriptor:` faults inside the AGX driver
-    /// (EXC_BAD_ACCESS). In-process, that SIGSEGV takes the whole harness down
-    /// and every other test's result with it. In a child it is one failed test
-    /// that names the signal.
-    fn in_child(test_name: &str, body: impl FnOnce()) {
-        if std::env::var_os(CHILD_ENV).is_some() {
-            body();
-            return;
-        }
-        let exe = std::env::current_exe().expect("test binary path");
-        let out = std::process::Command::new(exe)
-            .args(["--exact", "--test-threads=1", test_name])
-            .env(CHILD_ENV, "1")
-            .output()
-            .expect("spawn isolated child test");
-        let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
-        let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
-        assert!(
-            out.status.success(),
-            "isolated child {test_name} failed ({}):\n{stdout}\n{stderr}",
-            match out.status.signal() {
-                Some(sig) => format!("killed by signal {sig}"),
-                None => format!("exit status {:?}", out.status.code()),
-            }
-        );
-        // A filter that matched nothing also exits 0 — make that loud.
-        assert!(
-            stdout.contains("1 passed"),
-            "child ran no test (filter out of sync with {test_name}?):\n{stdout}"
-        );
-    }
-
-    fn extent_values(e: &MTLTensorExtents) -> Vec<NSInteger> {
-        // SAFETY: every index is below `rank()`, the bound Metal documents.
-        (0..e.rank()).map(|i| unsafe { e.extentAtDimensionIndex(i) }).collect()
-    }
-
-    /// `tensorSizeAndAlignWithDescriptor:` sizes a tensor *in a buffer*, so it
-    /// needs the buffer layout spelled out. Before `make_descriptor` took a
-    /// [`TensorLayout`], this safe function faulted on every call.
-    #[test]
-    fn probe_tensor_support_sizes_int8() {
-        in_child("mtl_tensor::tests::probe_tensor_support_sizes_int8", || {
-            let rt = GpuRuntime::new().expect("runtime");
-            let sa = probe_tensor_support(&rt, QuantDType::Int8, &[64, 64]).expect("int8 [64, 64] probe");
-            assert!(
-                sa.size >= 64 * 64,
-                "int8 [64, 64] needs at least 4096 bytes, got {}",
-                sa.size
-            );
-            assert!(sa.align > 0, "alignment must be non-zero");
-        });
-    }
-
-    /// A buffer-backed tensor carries dense strides over the caller's storage,
-    /// innermost (index 0) first, and a window the alignment rules forbid is an
-    /// `Err` — not a fault.
-    #[test]
-    fn tensor_from_buffer_wraps_shared_storage() {
-        in_child("mtl_tensor::tests::tensor_from_buffer_wraps_shared_storage", || {
-            let rt = GpuRuntime::new().expect("runtime");
-            let dims = [64usize, 32];
-            let sa = probe_tensor_support(&rt, QuantDType::Int8, &dims).expect("probe");
-            let align = sa.align;
-            let buf = rt.alloc_buffer(sa.size + 2 * align).expect("buffer");
-
-            // SAFETY: offset 0 and `align` are both multiples of the alignment
-            // the device reported for this descriptor, and the buffer holds the
-            // reported size past either offset.
-            let t = unsafe { tensor_from_buffer(&rt, &buf, 0, &dims, QuantDType::Int8) }.expect("offset 0");
-            let strides = t.tensor.strides().expect("buffer-backed tensor reports strides");
-            assert_eq!(extent_values(&strides), [1, 64], "innermost stride 1, then dims[0]");
-            assert_eq!(t.tensor.bufferOffset(), 0);
-
-            let shifted =
-                unsafe { tensor_from_buffer(&rt, &buf, align, &dims, QuantDType::Int8) }.expect("aligned offset");
-            assert_eq!(shifted.tensor.bufferOffset(), align);
-
-            // Aligned, but the tensor would run `align` bytes past the storage.
-            let past_end = 3 * align;
-            let err = unsafe { tensor_from_buffer(&rt, &buf, past_end, &dims, QuantDType::Int8) }
-                .err()
-                .expect("a view past the end of the buffer must be rejected");
-            assert!(err.contains("past the end"), "{err}");
-
-            let other = GpuRuntime::new().expect("second runtime");
-            let err = unsafe { tensor_from_buffer(&other, &buf, 0, &dims, QuantDType::Int8) }
-                .err()
-                .expect("a buffer from another runtime must be rejected");
-            assert!(err.contains("different runtime"), "{err}");
-
-            if align > 1 {
-                let err = unsafe { tensor_from_buffer(&rt, &buf, 1, &dims, QuantDType::Int8) }
-                    .err()
-                    .expect("misaligned offset must be rejected");
-                assert!(err.contains("not aligned"), "{err}");
-            }
-        });
-    }
-
-    /// `newTensorWithDescriptor:error:` rejects a descriptor that sets strides
-    /// (MTLTensorDomain code 2), so the device-owned layout must keep them nil.
-    #[test]
-    fn alloc_device_tensor_has_no_strides() {
-        let rt = GpuRuntime::new().expect("runtime");
-        let t = alloc_device_tensor(&rt, &[16, 16], QuantDType::Int8).expect("int8 tensor");
-        assert!(
-            t.tensor.strides().is_none(),
-            "device-owned tensor must not carry strides"
-        );
-        assert_eq!(t.tensor.bufferOffset(), 0);
-
-        // The other half of the contract: hand the device path the buffer
-        // layout and Metal refuses it. If this ever starts succeeding, the
-        // split in `TensorLayout` is no longer needed.
-        let dense = make_descriptor(
-            &[16, 16],
-            MTLTensorDataType::Int8,
-            MTLTensorUsage::Compute,
-            TensorLayout::DenseInBuffer,
-        )
-        .expect("buffer descriptor");
-        let err = rt
-            .device
-            .newTensorWithDescriptor_error(&dense)
-            .expect_err("newTensorWithDescriptor:error: must reject a strided descriptor");
-        assert!(
-            err.localizedDescription().to_string().contains("Strides should be nil"),
-            "{err}"
-        );
-    }
-
-    /// A kernel writes a device-owned tensor and another reads it back. Both
-    /// dispatches are encoded and the handle dropped *before* the commit: the
-    /// tensor must be resident from allocation and outlive the handle until
-    /// the work completes, then leave the residency set. Isolated, because a
-    /// tensor outside the set, or freed under the GPU, is a fault.
-    #[test]
-    fn a_kernel_reads_a_device_owned_tensor_dropped_before_commit() {
-        in_child(
-            "mtl_tensor::tests::a_kernel_reads_a_device_owned_tensor_dropped_before_commit",
-            || {
-                use crate::dispatch::{dispatch_2d, set_gpu_buf};
-                use objc2_metal::MTLResidencySet;
-
-                let rt = GpuRuntime::new().expect("runtime");
-                let (cols, rows) = (40usize, 7usize);
-                let t = alloc_device_tensor(&rt, &[cols, rows], QuantDType::Int8).expect("int8 tensor");
-                let watch = t.tensor.clone();
-                let alloc = || ProtocolObject::<dyn MTLAllocation>::from_ref(&*watch);
-                assert!(
-                    rt.metal4.residency.containsAllocation(alloc()),
-                    "a device-owned tensor must be resident from allocation"
-                );
-                let out = rt.alloc_buffer(cols * rows * 4).expect("out");
-                let fill = rt.pipeline("mtl_tensor_fill_i8").expect("fill pipeline");
-                let read = rt.pipeline("mtl_tensor_read_i8").expect("read pipeline");
-
-                rt.set_async_encode(true).expect("async encode");
-                let mut binds = Vec::new();
-                dispatch_2d(&rt, &fill, cols, rows, |bnd| binds.push(bind_mtl_tensor(bnd, &t, 0))).expect("fill");
-                dispatch_2d(&rt, &read, cols, rows, |bnd| {
-                    binds.push(bind_mtl_tensor(bnd, &t, 0));
-                    set_gpu_buf(bnd, &out, 1);
-                })
-                .expect("read");
-                drop(t);
-                assert!(
-                    rt.metal4.residency.containsAllocation(alloc()),
-                    "a dropped tensor left residency while its work was still uncommitted"
-                );
-                rt.synchronize().expect("synchronize");
-                rt.set_async_encode(false).expect("sync encode");
-                for b in binds {
-                    b.expect("bind");
-                }
-
-                let want: Vec<f32> = (0..cols * rows).map(|i| ((i % 127) as i32 - 63) as f32).collect();
-                assert_eq!(out.read_f32()[..cols * rows], want[..]);
-                assert!(
-                    !rt.metal4.residency.containsAllocation(alloc()),
-                    "a dropped tensor stayed resident after its work completed"
-                );
-            },
-        );
-    }
-
-    /// A tensor allocated on one runtime is outside another's residency set:
-    /// binding it there is refused, and the binder fails so nothing encodes.
-    #[test]
-    fn bind_mtl_tensor_refuses_a_foreign_runtime() {
-        let rt = GpuRuntime::new().expect("runtime");
-        let other = GpuRuntime::new().expect("second runtime");
-        let t = alloc_device_tensor(&other, &[16, 16], QuantDType::Int8).expect("int8 tensor");
-        let mut outcome = None;
-        let scope = rt.with_binder(|bnd| {
-            outcome = Some(bind_mtl_tensor(bnd, &t, 0));
-            Ok(())
-        });
-        let err = outcome
-            .expect("binder body ran")
-            .expect_err("a foreign tensor must not bind");
-        assert!(err.contains("another runtime"), "{err}");
-        let err = scope.expect_err("the binder must fail with the bind");
-        assert!(err.contains("another runtime"), "{err}");
-    }
 
     #[test]
     fn quant_dtype_int8_maps() {
         assert!(QuantDType::Int8.to_mtl().is_ok());
         let err = QuantDType::Int4.to_mtl().unwrap_err();
         assert!(err.contains("Int4"), "{err}");
-        assert!(err.contains("unbound") || err.contains("not in objc2"), "{err}");
+        assert!(
+            err.contains("unbound") || err.contains("not in objc2"),
+            "{err}"
+        );
         assert!(QuantDType::Fp8E8M0.to_mtl().is_err());
     }
 
     #[test]
-    fn nax_verify_readiness_int4_unbound() {
+    fn nax_verify_readiness_names_the_actual_q4_gap() {
         let r = nax_verify_readiness();
         assert!(r.int8_tensorops_dtype);
         assert!(!r.int4_tensorops_dtype);
         assert!(!r.fp8_e8m0_tensorops_dtype);
         assert!(!r.quant_prefill_gemm_wired);
-        assert!(r.note.contains("Int4 unbound"));
+        assert!(r.note.contains("shader-side sub-byte tensor constructor"));
+        assert!(r.note.contains("host descriptor binding is separate"));
     }
 
     /// The argument table has 31 buffer slots, so 30 is the last valid index
@@ -623,73 +383,79 @@ mod tests {
         huge.expect_err("usize::MAX must never reach setResource:atBufferIndex:");
     }
 
-    /// Descriptor construction only (no device call); the device paths are
-    /// exercised by the child-process tests above. The two layouts must differ
-    /// in exactly the property Metal checks: nil strides for device-owned
-    /// tensors, dense strides for buffer-backed ones and sizing. Getting it
-    /// backwards is a driver fault on one side and MTLTensorDomain code 2 on
-    /// the other.
+    #[test]
+    fn bind_mtl_tensor_rejects_foreign_runtime_before_mutation() {
+        let owner = GpuRuntime::new().expect("owner runtime");
+        let encoder = GpuRuntime::new().expect("encoder runtime");
+        let foreign =
+            alloc_device_tensor(&owner, &[16, 16], QuantDType::Int8).expect("foreign tensor");
+        let local =
+            alloc_device_tensor(&encoder, &[16, 16], QuantDType::Int8).expect("local tensor");
+
+        let mut outcome = None;
+        encoder
+            .with_binder(|bnd| {
+                let rejected = bind_mtl_tensor(bnd, &foreign, 0);
+                // A rejected foreign resource must not poison or partially
+                // mutate the binder. A valid local bind in the same slot and
+                // scope must still succeed.
+                let local_after_rejection = bind_mtl_tensor(bnd, &local, 0);
+                outcome = Some((rejected, local_after_rejection));
+                Ok(())
+            })
+            .expect("binder remains usable after a rejected foreign tensor");
+        let (foreign_result, local_result) = outcome.expect("binder body ran");
+        let err = foreign_result.expect_err("foreign runtime must be rejected");
+        assert!(err.contains("another runtime"), "unexpected error: {err}");
+        local_result.expect("local tensor must still bind");
+    }
+
+    #[test]
+    fn device_tensor_residency_retires_after_completed_work() {
+        let rt = GpuRuntime::new().expect("runtime");
+        let baseline = *rt.metal4.residency_count.lock().unwrap();
+        for _ in 0..32 {
+            drop(alloc_device_tensor(&rt, &[16, 16], QuantDType::Int8).expect("device tensor"));
+        }
+        assert_eq!(
+            *rt.metal4.residency_count.lock().unwrap(),
+            baseline + 32,
+            "final drop must retain residency until the completion drain"
+        );
+
+        rt.synchronize().expect("completed-work drain");
+        assert_eq!(*rt.metal4.residency_count.lock().unwrap(), baseline);
+    }
+
+    /// Descriptor construction only (no device call). Full
+    /// `tensorSizeAndAlign` / `newTensor` A/B is Phase 2 — objc2 bindings can
+    /// SIGSEGV on some SDK/runtime combos when probing unsupported layouts.
     #[test]
     fn quant_descriptor_builds_for_int8() {
-        let owned = make_descriptor(
-            &[64, 32],
-            MTLTensorDataType::Int8,
-            MTLTensorUsage::Compute,
-            TensorLayout::DeviceOwned,
-        )
-        .expect("device-owned descriptor");
-        assert_eq!(owned.dataType(), MTLTensorDataType::Int8);
-        assert_eq!(owned.dimensions().rank(), 2);
-        assert!(
-            owned.strides().is_none(),
-            "device-owned descriptor must leave strides nil"
-        );
-
-        let dense = make_descriptor(
-            &[64, 32],
-            MTLTensorDataType::Int8,
-            MTLTensorUsage::Compute,
-            TensorLayout::DenseInBuffer,
-        )
-        .expect("buffer descriptor");
-        assert_eq!(extent_values(&dense.dimensions()), [64, 32]);
-        assert_eq!(
-            extent_values(&dense.strides().expect("buffer descriptor sets strides")),
-            [1, 64]
-        );
+        let desc = make_descriptor(&[64, 64], MTLTensorDataType::Int8, MTLTensorUsage::Compute)
+            .expect("descriptor");
+        assert_eq!(desc.dataType(), MTLTensorDataType::Int8);
+        assert_eq!(desc.dimensions().rank(), 2);
     }
 
     #[test]
-    fn dense_strides_are_packed_innermost_first() {
-        assert_eq!(dense_strides(&[7]).unwrap(), [1]);
-        assert_eq!(dense_strides(&[64, 64]).unwrap(), [1, 64]);
-        assert_eq!(dense_strides(&[3, 5, 7]).unwrap(), [1, 3, 15]);
-        // The outermost extent never multiplies into a stride, so it cannot
-        // overflow one; an inner extent that does is an error, not a wrap.
-        assert_eq!(dense_strides(&[2, usize::MAX]).unwrap(), [1, 2]);
-        let err = dense_strides(&[usize::MAX, 2, 2]).unwrap_err();
-        assert!(err.contains("overflow"), "{err}");
-    }
-
-    /// An extent above `NSInteger::MAX` used to wrap negative through `as`.
-    #[test]
-    fn extents_reject_values_beyond_nsinteger() {
+    fn descriptor_rejects_extent_that_does_not_fit_nsinteger() {
         let err = make_descriptor(
             &[usize::MAX],
             MTLTensorDataType::Int8,
             MTLTensorUsage::Compute,
-            TensorLayout::DeviceOwned,
         )
-        .expect_err("extent past NSInteger::MAX");
-        assert!(err.contains("exceeds NSInteger"), "{err}");
-        // Every extent fits, but the outer stride is 2^31 * 2^32 = 2^63.
-        let err = make_descriptor(
-            &[1 << 31, 1 << 32, 2],
-            MTLTensorDataType::Int8,
-            MTLTensorUsage::Compute,
-            TensorLayout::DenseInBuffer,
-        )
-        .expect_err("stride past NSInteger::MAX");
-        assert!(err.contains("exceeds NSInteger"), "{err}");
+        .map(|_| ())
+        .expect_err("usize::MAX would narrow to a negative NSInteger extent");
+        assert!(err.contains("NSInteger"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn tensor_buffer_range_checks_overflow_alignment_and_capacity() {
+        validate_tensor_buffer_range(64, 16, 32, 16).expect("valid range");
+        assert!(validate_tensor_buffer_range(64, 1, 32, 16).is_err());
+        assert!(validate_tensor_buffer_range(64, 0, 65, 16).is_err());
+        assert!(validate_tensor_buffer_range(usize::MAX, usize::MAX - 7, 16, 1).is_err());
+        assert!(validate_tensor_buffer_range(64, 0, 1, 0).is_err());
     }
 }

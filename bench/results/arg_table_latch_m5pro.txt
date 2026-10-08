@@ -1,0 +1,34 @@
+Argument-table latch carried across scopes — M5 Pro, 2026-09-05
+================================================================
+
+Question (audit R10c): `Binder::new` started every `with_binder` scope with
+`arg_table_latched: false`, so `latch_argument_table` issued one
+`setArgumentTable` per scope although the Metal 4 compute encoder is reused
+across scopes and already held the runtime's persistent table.
+
+Change: the open batch carries the latch from one scope to the next on the
+same encoder and clears it when the encoder is created; the binder reports
+whether it left the encoder holding the persistent table (false after a
+tape-path adopt of another table or an indirect execute).
+
+Method: host wall time per scope for a one-dispatch `copy_f32` scope (two
+buffer binds, one u32), async encode, no synchronize inside an arm, 80,000
+scopes per arm, one warm-up pair, seven rounds ordered A B B A.
+A = latch carried, B = latch reset every scope (temporary arm, deleted after
+the measurement). ratio = B / A, each arm the mean of its two runs.
+
+  round 0   716 / 442 ns   0.618
+  round 1   375 / 384 ns   1.026
+  round 2   370 / 360 ns   0.973
+  round 3   365 / 393 ns   1.076
+  round 4   373 / 356 ns   0.952
+  round 5   344 / 357 ns   1.041
+  round 6   374 / 423 ns   1.130
+
+  median B/A 1.026 over the seven rounds, min 0.618, max 1.130
+
+Reading: one Objective-C send saved per scope is a few percent of a ~370 ns
+host cost, inside the round-to-round spread. Kept because once per encoder is
+what the reused encoder implies and
+`argument_table_is_set_once_per_encoder_not_once_per_scope` pins it; not a
+measured speedup.

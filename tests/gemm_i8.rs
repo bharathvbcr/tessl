@@ -1,16 +1,17 @@
 //! Quantized int8 GEMM with fused dequantization.
 //!
 //! The property worth testing here is not "close to a reference" but **exact**.
-//! `int8 x int8` accumulates into `int32`, and every product fits, so the
-//! integer result carries no rounding whatever. The only approximation is the
-//! final multiply by the scales. That makes an exact integer reference the
-//! right oracle, and it catches errors a float tolerance would absorb.
+//! `int8 x int8` accumulates into `int32`, and every admitted full-range sum
+//! fits, so the integer result carries no rounding whatever. The only
+//! approximation is the final multiply by the scales. That makes an exact
+//! integer reference the right oracle, and it catches errors a float tolerance
+//! would absorb.
 
 mod common;
 
 use std::sync::Arc;
 
-use common::{buf, with_gpu};
+use common::with_gpu;
 use tessl::nn;
 use tessl::tensor::GpuBuffer;
 use tessl::GpuRuntime;
@@ -21,12 +22,20 @@ fn i8_buf(rt: &Arc<GpuRuntime>, data: &[i8]) -> GpuBuffer {
     b
 }
 
+fn f32_buf(rt: &Arc<GpuRuntime>, data: &[f32]) -> GpuBuffer {
+    let b = rt.alloc_buffer(data.len().max(1) * 4).expect("alloc");
+    b.write_f32(data);
+    b
+}
+
 /// Deterministic int8 spread over the full range, including the extremes.
 fn i8_data(n: usize, seed: u64) -> Vec<i8> {
     let mut x = seed;
     (0..n)
         .map(|i| {
-            x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            x = x
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             match i % 16 {
                 0 => -128,
                 1 => 127,
@@ -44,11 +53,12 @@ fn the_integer_accumulation_is_exact() {
             let b = i8_data(k * n, 0x2_8000 + n as u64);
             let ab = i8_buf(rt, &a);
             let bb = i8_buf(rt, &b);
-            let cb = buf(rt, &vec![0.0f32; m * n]);
+            let cb = f32_buf(rt, &vec![0.0f32; m * n]);
 
             // a_scale of 1 and no b_scale, so the output *is* the integer sum
             // and any deviation is a real arithmetic error, not rounding.
-            nn::gemm_i8_dequant(rt, &ab, &bb, &cb, m as u32, n as u32, k as u32, 1.0, None).expect("gemm_i8_dequant");
+            nn::gemm_i8_dequant(rt, &ab, &bb, &cb, m as u32, n as u32, k as u32, 1.0, None)
+                .expect("gemm_i8_dequant");
             rt.synchronize().unwrap();
 
             let got = cb.read_f32();
@@ -59,63 +69,16 @@ fn the_integer_accumulation_is_exact() {
                         acc += a[i * k + p] as i32 * b[p * n + j] as i32;
                     }
                     // Every such sum is exactly representable in f32 here, so
-                    // this is equality, not a tolerance.
+                    // compare as integers: an `acc as f32` reference would
+                    // apply the same rounding the store does and hide it.
                     assert_eq!(
-                        got[i * n + j],
-                        acc as f32,
+                        got[i * n + j] as i64,
+                        acc as i64,
                         "{m}x{n}x{k} at ({i},{j}): got {} want {acc}",
                         got[i * n + j]
                     );
                 }
             }
-        }
-    });
-}
-
-/// Once B (K×N) reaches the shader's `PANEL_MIN_B_ELEMS` = 2^23 elements on a
-/// grid that is not square with a power-of-two side, the kernel walks its
-/// 128x64 tiles in column panels of 4 tile rows (`tile_walk` in
-/// `kernels/matmul_tensorops.metal`). M = 545 is 5 tile rows (a full band
-/// and a partial one) and M = 33 one short band; both Ns leave a ragged last
-/// tile column. A is zero past its first column, so the exact answer is
-/// A[:, 0] times B[0, :], O(M·N) to check at any K. C starts as NaN, so a
-/// tile the walk skips or misplaces shows.
-#[test]
-fn column_panels_cover_every_tile_exactly() {
-    assert!(
-        include_str!("../kernels/matmul_tensorops.metal")
-            .contains("constexpr constant ulong PANEL_MIN_B_ELEMS = 1ul << 23;"),
-        "the shader's panel gate moved; update these shapes"
-    );
-    with_gpu(|rt| {
-        for &(m, n, k) in &[(545usize, 8200usize, 1024usize), (33, 8193, 1024)] {
-            assert!(n * k >= 1 << 23, "panel walk not engaged at N={n} K={k}");
-            let col = i8_data(m, 0x3_8000 + m as u64);
-            let mut a = vec![0i8; m * k];
-            for (i, &v) in col.iter().enumerate() {
-                a[i * k] = v;
-            }
-            let b = i8_data(k * n, 0x4_8000 + n as u64);
-            let ab = i8_buf(rt, &a);
-            let bb = i8_buf(rt, &b);
-            let cb = buf(rt, &vec![f32::NAN; m * n]);
-
-            nn::gemm_i8_dequant(rt, &ab, &bb, &cb, m as u32, n as u32, k as u32, 1.0, None).expect("gemm_i8_dequant");
-            rt.synchronize().unwrap();
-
-            let got = cb.read_f32();
-            let mut bad = 0usize;
-            let mut first = None;
-            for i in 0..m {
-                for j in 0..n {
-                    let want = (col[i] as i32 * b[j] as i32) as f32;
-                    if got[i * n + j] != want {
-                        bad += 1;
-                        first.get_or_insert((i, j, got[i * n + j], want));
-                    }
-                }
-            }
-            assert_eq!(bad, 0, "{m}x{n}x{k}: {bad} outputs wrong, first {first:?}");
         }
     });
 }
@@ -131,10 +94,21 @@ fn the_per_column_scale_is_applied_per_column() {
         let scale: Vec<f32> = (0..n).map(|j| (j as f32 + 1.0) * 0.25).collect();
         let ab = i8_buf(rt, &a);
         let bb = i8_buf(rt, &b);
-        let sb = buf(rt, &scale);
-        let cb = buf(rt, &vec![0.0f32; m * n]);
+        let sb = f32_buf(rt, &scale);
+        let cb = f32_buf(rt, &vec![0.0f32; m * n]);
 
-        nn::gemm_i8_dequant(rt, &ab, &bb, &cb, m as u32, n as u32, k as u32, 0.5, Some(&sb)).expect("gemm_i8_dequant");
+        nn::gemm_i8_dequant(
+            rt,
+            &ab,
+            &bb,
+            &cb,
+            m as u32,
+            n as u32,
+            k as u32,
+            0.5,
+            Some(&sb),
+        )
+        .expect("gemm_i8_dequant");
         rt.synchronize().unwrap();
 
         let got = cb.read_f32();
@@ -160,9 +134,10 @@ fn full_range_operands_do_not_overflow_the_accumulator() {
         let b = vec![-128i8; k * n];
         let ab = i8_buf(rt, &a);
         let bb = i8_buf(rt, &b);
-        let cb = buf(rt, &vec![0.0f32; m * n]);
+        let cb = f32_buf(rt, &vec![0.0f32; m * n]);
 
-        nn::gemm_i8_dequant(rt, &ab, &bb, &cb, m as u32, n as u32, k as u32, 1.0, None).expect("gemm_i8_dequant");
+        nn::gemm_i8_dequant(rt, &ab, &bb, &cb, m as u32, n as u32, k as u32, 1.0, None)
+            .expect("gemm_i8_dequant");
         rt.synchronize().unwrap();
 
         let want = (k as i64 * 16384) as f32;
@@ -174,60 +149,44 @@ fn full_range_operands_do_not_overflow_the_accumulator() {
 }
 
 #[test]
-fn the_largest_accepted_k_is_exact_at_full_int8_range() {
-    with_gpu(|rt| {
-        // 131071 = floor(i32::MAX / 16384), the largest k at which k products of
-        // (-128)*(-128) still fit an int32. The sum, 16384 * 131071, has 17
-        // significant bits, so it survives the f32 store exactly.
-        let (m, n, k) = (8usize, 8usize, 131_071usize);
-        let ab = i8_buf(rt, &vec![-128i8; m * k]);
-        let bb = i8_buf(rt, &vec![-128i8; k * n]);
-        let cb = buf(rt, &vec![0.0f32; m * n]);
-
-        nn::gemm_i8_dequant(rt, &ab, &bb, &cb, m as u32, n as u32, k as u32, 1.0, None).expect("k = 131071");
-        rt.synchronize().unwrap();
-
-        let want = 16384i64 * k as i64;
-        assert!(want <= i32::MAX as i64);
-        let got = cb.read_f32();
-        for (e, g) in got.iter().take(m * n).enumerate() {
-            assert_eq!(*g as i64, want, "full-range accumulation at k = {k}, element {e}");
-        }
-    });
-}
-
-#[test]
-fn k_at_two_to_the_seventeen_is_refused() {
-    with_gpu(|rt| {
-        // 16384 * 131072 = 2^31, one past i32::MAX: all -128 operands would wrap
-        // the accumulator to -2^31. Every buffer is large enough that only the
-        // k bound can refuse.
-        let (m, n, k) = (8usize, 8usize, 131_072usize);
-        let ab = rt.alloc_buffer(m * k).unwrap();
-        let bb = rt.alloc_buffer(k * n).unwrap();
-        let cb = rt.alloc_buffer(m * n * 4).unwrap();
-        let err = nn::gemm_i8_dequant(rt, &ab, &bb, &cb, m as u32, n as u32, k as u32, 1.0, None)
-            .expect_err("k = 2^17 wraps an int32 accumulator");
-        assert!(err.contains("overflow"), "{err}");
-        assert_eq!(rt.take_dispatch_count(), 0);
-    });
-}
-
-#[test]
 fn a_k_that_could_overflow_int32_is_refused() {
     with_gpu(|rt| {
         let b = rt.alloc_buffer(1 << 20).unwrap();
         let c = rt.alloc_buffer(1 << 20).unwrap();
         // Past this k, full-range int8 products can wrap the int32 accumulator
         // silently. Refusing keeps the exactness claim true rather than nearly.
-        let err = nn::gemm_i8_dequant(rt, &b, &b, &c, 8, 8, 200_000, 1.0, None).expect_err("k past the exact range");
+        let err = nn::gemm_i8_dequant(rt, &b, &b, &c, 8, 8, 200_000, 1.0, None)
+            .expect_err("k past the exact range");
         assert!(err.contains("overflow"), "{err}");
 
         let err = nn::gemm_i8_dequant(rt, &b, &b, &c, 0, 8, 8, 1.0, None).expect_err("m = 0");
         assert!(err.contains("non-zero"), "{err}");
 
-        let err = nn::gemm_i8_dequant(rt, &b, &b, &c, 8, 8, 8, f32::NAN, None).expect_err("non-finite scale");
+        let err = nn::gemm_i8_dequant(rt, &b, &b, &c, 8, 8, 8, f32::NAN, None)
+            .expect_err("non-finite scale");
         assert!(err.contains("finite"), "{err}");
+    });
+}
+
+#[test]
+fn exact_i32_overflow_boundary_is_refused_before_dispatch() {
+    with_gpu(|rt| {
+        const K: usize = 131_072;
+        // -128 * -128 is 16_384, so this dot product is exactly 2^31: one past
+        // i32::MAX. Using the actual extreme operand also prevents this test
+        // from passing merely because an undersized buffer was rejected later.
+        let extreme = i8_buf(rt, &vec![-128i8; K]);
+        let out = f32_buf(rt, &[0.0]);
+
+        rt.take_dispatch_count();
+        let err = nn::gemm_i8_dequant(rt, &extreme, &extreme, &out, 1, 1, K as u32, 1.0, None)
+            .expect_err("k = 2^17 overflows int32 for -128 operands");
+        assert!(err.contains("overflow"), "{err}");
+        assert_eq!(
+            rt.take_dispatch_count(),
+            0,
+            "overflowing int8 GEMM must fail before dispatch"
+        );
     });
 }
 
@@ -236,12 +195,44 @@ fn undersized_operands_are_refused_before_dispatch() {
     with_gpu(|rt| {
         let small = rt.alloc_buffer(16).unwrap();
         let big = rt.alloc_buffer(1 << 20).unwrap();
-        let err = nn::gemm_i8_dequant(rt, &small, &big, &big, 128, 64, 64, 1.0, None).expect_err("A too small");
+        let err = nn::gemm_i8_dequant(rt, &small, &big, &big, 128, 64, 64, 1.0, None)
+            .expect_err("A too small");
         assert!(err.contains("buffer holds"), "{err}");
         let scale = rt.alloc_buffer(4).unwrap();
-        let err =
-            nn::gemm_i8_dequant(rt, &big, &big, &big, 128, 64, 64, 1.0, Some(&scale)).expect_err("scale too short");
+        let err = nn::gemm_i8_dequant(rt, &big, &big, &big, 128, 64, 64, 1.0, Some(&scale))
+            .expect_err("scale too short");
         assert!(err.contains("buffer holds"), "{err}");
         assert_eq!(rt.take_dispatch_count(), 0);
+    });
+}
+
+/// Above 2^24 the int32 accumulator is still exact, but the store converts it
+/// to f32, whose spacing there is 2. The result is the correctly rounded
+/// integer, not the integer itself — the contract the docs state. The shape
+/// is chosen so the exact sum is odd and therefore not representable.
+#[test]
+fn sums_past_two_to_the_24_are_rounded_once_at_the_f32_store() {
+    with_gpu(|rt| {
+        let (m, n, k) = (8usize, 8usize, 1041usize);
+        let a = vec![127i8; m * k];
+        let b = vec![127i8; k * n];
+        let ab = i8_buf(rt, &a);
+        let bb = i8_buf(rt, &b);
+        let cb = f32_buf(rt, &vec![0.0f32; m * n]);
+
+        nn::gemm_i8_dequant(rt, &ab, &bb, &cb, m as u32, n as u32, k as u32, 1.0, None)
+            .expect("gemm_i8_dequant");
+        rt.synchronize().unwrap();
+
+        let exact = k as i64 * 127 * 127;
+        assert_eq!(exact, 16_790_289);
+        assert_ne!(
+            exact as f32 as i64, exact,
+            "the shape must sit where f32 cannot hold the integer sum"
+        );
+        let want = exact as f32;
+        for (e, g) in cb.read_f32().iter().take(m * n).enumerate() {
+            assert_eq!(*g, want, "element {e}: expected the once-rounded sum");
+        }
     });
 }

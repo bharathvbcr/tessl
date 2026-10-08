@@ -494,16 +494,22 @@ fn kv_shader_and_host_capacity_abis_are_locked() {
         "the canonical QKV preflight must run before pipeline lookup and scalar callback"
     );
 
-    let gemma_path =
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../MLSystemsLab/Rust_MLKit/gemma-metal/src/kernels.rs");
-    let model_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../MLSystemsLab/Rust_MLKit/gemma-metal/src/gpu_model.rs");
-    let (Ok(gemma), Ok(model)) = (
-        std::fs::read_to_string(&gemma_path),
-        std::fs::read_to_string(&model_path),
-    ) else {
+    // gemma-metal moved from MLSystemsLab/Rust_MLKit to ojas on 2026-10-08; try the new
+    // home first so the check keeps running on either side of that move.
+    let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let Some(gemma_src) = ["../ojas/gemma-metal/src", "../MLSystemsLab/Rust_MLKit/gemma-metal/src"]
+        .iter()
+        .map(|dir| manifest.join(dir))
+        .find(|dir| dir.join("kernels.rs").is_file())
+    else {
         // Sibling tree absent on crates.io package verify and GitHub Actions.
         return;
+    };
+    let (Ok(gemma), Ok(model)) = (
+        std::fs::read_to_string(gemma_src.join("kernels.rs")),
+        std::fs::read_to_string(gemma_src.join("gpu_model.rs")),
+    ) else {
+        panic!("gemma-metal sources at {} are unreadable", gemma_src.display());
     };
 
     assert!(gemma.contains("bind_u32(bnd, capacity_off, 4)"));

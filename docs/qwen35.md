@@ -813,7 +813,8 @@ on top of what is allocated when it starts, and `train_forward` (so
 that bound plus the device's current allocation exceeds the recommended
 working set. The bound is what the step holds throughout (each layer's
 input, the final norm's output and gradient, the `[vocab, hidden]` head
-gradient, the backward's scratch with `GdnTrainWorkspace`'s split-K parts),
+gradient, the step's one `AttnTrainWorkspace`, the backward's scratch with
+`GdnTrainWorkspace`'s split-K parts),
 plus the most it allocates between two waited commits (a freed buffer is
 only recycled at one), plus the freelist cap. Every buffer counts at its
 pool size (`GpuRuntime::allocated_bytes_for`), and each workspace and GEMM
@@ -822,7 +823,11 @@ gives its own (`allocated_bytes_for` on `GdnTrainWorkspace`, `CeWorkspace`,
 operand copies and split-K scratch). Without async encode every dispatch waits, so
 two adjacent layers bound a window; with it, a step waits only at each
 attention layer, and the window is every layer from one attention layer to
-the next. Against the measured peak (`GpuRuntime::peak_allocated_bytes`,
+the next (a deliberate wait there, where a fresh workspace's host writes
+used to drain). `train_step_into` into an f32 bank writes the head gradient
+into the bank's embedding instead of holding it, and its pre-flight leaves
+it out; `train_step_bytes`, which also bounds `train_forward` followed by
+`train_backward_into`, still counts it. Against the measured peak (`GpuRuntime::peak_allocated_bytes`,
 sampled at every buffer the pool creates) from an empty freelist, bank
 resident, no moments:
 

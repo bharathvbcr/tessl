@@ -580,7 +580,7 @@ fn host_path(rt: &Arc<GpuRuntime>, warmup: usize, iters: usize) -> Result<(), St
     Ok(())
 }
 
-/// The token a sampler wrote.
+/// The token a sampler wrote, with its no-finite-logit refusal.
 fn read_token(out: &GpuBuffer) -> Result<u32, String> {
-    Ok(out.try_contents_u32()?[0])
+    nn::check_argmax_result(out)
 }

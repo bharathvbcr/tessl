@@ -1219,14 +1219,36 @@ pub fn decode_chunk_for(d: u32) -> DecodeChunk {
 }
 
 /// Head dimensions the FlashDecoding path is compiled for.
-fn decode_entries(d: u32, c: DecodeChunk, r: RowsLanes) -> Option<(String, String)> {
-    if !matches!(d, 128 | 256 | 512) {
-        return None;
+/// The partial and reduce entry points of the decode instantiation, as
+/// static names: `flash_attn_decode_partial_h{d}_c{chunk}_r{lanes}` and
+/// `flash_attn_decode_reduce_h{d}_c{chunk}`. Static so a decode step looks
+/// its pipelines up without building a key.
+fn decode_entries(d: u32, c: DecodeChunk, r: RowsLanes) -> Option<(&'static str, &'static str)> {
+    macro_rules! at {
+        ($d:literal, $c:literal) => {
+            (
+                match r {
+                    RowsLanes::R8 => concat!("flash_attn_decode_partial_h", $d, "_c", $c, "_r8"),
+                    RowsLanes::R16 => concat!("flash_attn_decode_partial_h", $d, "_c", $c, "_r16"),
+                    RowsLanes::R32 => concat!("flash_attn_decode_partial_h", $d, "_c", $c, "_r32"),
+                },
+                concat!("flash_attn_decode_reduce_h", $d, "_c", $c),
+            )
+        };
     }
-    Some((
-        format!("flash_attn_decode_partial_h{d}_c{}_r{}", c.keys(), r.width()),
-        format!("flash_attn_decode_reduce_h{d}_c{}", c.keys()),
-    ))
+    use DecodeChunk::{C128, C256, C64};
+    Some(match (d, c) {
+        (128, C64) => at!(128, 64),
+        (128, C128) => at!(128, 128),
+        (128, C256) => at!(128, 256),
+        (256, C64) => at!(256, 64),
+        (256, C128) => at!(256, 128),
+        (256, C256) => at!(256, 256),
+        (512, C64) => at!(512, 64),
+        (512, C128) => at!(512, 128),
+        (512, C256) => at!(512, 256),
+        _ => return None,
+    })
 }
 
 /// Lanes per key in the decode partial pass, per head dimension.
@@ -1412,8 +1434,8 @@ pub fn flash_attn_decode_with_chunk(
     let partial_y = (dims.batch as usize)
         .checked_mul(heads / partial_sgs)
         .ok_or("flash_attn_decode: partial grid height overflows")?;
-    let p = rt.pipeline(&partial_entry)?;
-    let r = rt.pipeline(&reduce_entry)?;
+    let p = rt.pipeline(partial_entry)?;
+    let r = rt.pipeline(reduce_entry)?;
     // The reduce pass is a serial tail: one threadgroup per (batch, head), so
     // at B*H = 8 the whole GPU folds partials on 8 threadgroups. Its width is a
     // dispatch parameter rather than a compiled-in one -- the kernel strides
@@ -1608,17 +1630,32 @@ pub fn rows_groups_for(d: u32) -> RowsGroups {
     }
 }
 
-fn rows_entry(d: u32, r: RowsLanes, g: RowsGroups) -> Option<String> {
-    let compiled = match d {
-        128 | 256 | 512 => true,
-        // One lane count. R=32 does not divide the float4 map (D % (4R) != 0).
-        64 => r == RowsLanes::R8 && g == RowsGroups::G8,
-        _ => false,
-    };
-    if !compiled {
-        return None;
+/// `flash_attn_rows_h{d}_r{lanes}_g{groups}` as a static name, for the
+/// instantiations that are compiled.
+fn rows_entry(d: u32, r: RowsLanes, g: RowsGroups) -> Option<&'static str> {
+    macro_rules! at {
+        ($d:literal) => {
+            match (r, g) {
+                (RowsLanes::R8, RowsGroups::G8) => concat!("flash_attn_rows_h", $d, "_r8_g8"),
+                (RowsLanes::R8, RowsGroups::G16) => concat!("flash_attn_rows_h", $d, "_r8_g16"),
+                (RowsLanes::R8, RowsGroups::G32) => concat!("flash_attn_rows_h", $d, "_r8_g32"),
+                (RowsLanes::R16, RowsGroups::G8) => concat!("flash_attn_rows_h", $d, "_r16_g8"),
+                (RowsLanes::R16, RowsGroups::G16) => concat!("flash_attn_rows_h", $d, "_r16_g16"),
+                (RowsLanes::R16, RowsGroups::G32) => concat!("flash_attn_rows_h", $d, "_r16_g32"),
+                (RowsLanes::R32, RowsGroups::G8) => concat!("flash_attn_rows_h", $d, "_r32_g8"),
+                (RowsLanes::R32, RowsGroups::G16) => concat!("flash_attn_rows_h", $d, "_r32_g16"),
+                (RowsLanes::R32, RowsGroups::G32) => concat!("flash_attn_rows_h", $d, "_r32_g32"),
+            }
+        };
     }
-    Some(format!("flash_attn_rows_h{d}_r{}_g{}", r.width(), g.count()))
+    Some(match d {
+        128 => at!(128),
+        256 => at!(256),
+        512 => at!(512),
+        // One lane count. R=32 does not divide the float4 map (D % (4R) != 0).
+        64 if r == RowsLanes::R8 && g == RowsGroups::G8 => "flash_attn_rows_h64_r8_g8",
+        _ => return None,
+    })
 }
 
 /// Row-parallel flash attention: one simdgroup per query row.
@@ -1707,7 +1744,7 @@ pub fn flash_attn_rows_with_lanes(
     let rows_per_tg = groups.count() * (32 / lanes.width());
     let groups_x = (dims.tq as usize).div_ceil(rows_per_tg);
     let groups_y = elems_product(&[dims.batch, dims.heads], "flash_attn_rows grid")?;
-    let p = rt.pipeline(&entry)?;
+    let p = rt.pipeline(entry)?;
     dispatch_2d_tg(rt, &p, groups_x, groups_y, groups.count() * 32, |bnd| {
         set_gpu_buf(bnd, q, 0);
         set_gpu_buf(bnd, k, 1);
@@ -2778,6 +2815,8 @@ pub unsafe fn softcap_logits_with_scalars(
 /// indices propagate rather than being re-derived from partial offsets.
 ///
 /// `out_idx` and `out_val` must each hold [`argmax_pass_groups`] elements.
+/// The pass only encodes; read the final pass's index with
+/// [`check_argmax_result`], which refuses a row with no finite logit.
 ///
 /// Scalar indices for `_with_scalars`: 3 = `n`, 5 = `has_idx_in`.
 /// Buffers 4 (`idx_in`) and 6 (`softcap`) are bound here.
@@ -2853,15 +2892,10 @@ pub unsafe fn argmax_f32_pass_with_scalars(
     let p = rt.pipeline("argmax_f32")?;
     // Buffer 4 must be bound even on the first pass: the kernel reads the
     // binding unconditionally and gates on `has_idx_in`, so leaving the slot
-    // empty is an unbound-buffer fault, not a no-op.
-    let placeholder;
-    let idx_buf = match idx_in {
-        Some(b) => b,
-        None => {
-            placeholder = rt.alloc_buffer(4)?;
-            &placeholder
-        }
-    };
+    // empty is an unbound-buffer fault, not a no-op. `logits` fills it, as
+    // `gemm_i8_dequant` binds an operand for its unused slot: a fresh
+    // placeholder would re-dirty residency for the next encode to commit.
+    let idx_buf = idx_in.unwrap_or(logits);
     dispatch_tg_1d(rt, &p, groups, ARGMAX_TG, None, |bnd| {
         set_gpu_buf(bnd, logits, 0);
         set_gpu_buf(bnd, out_idx, 1);
@@ -2869,8 +2903,7 @@ pub unsafe fn argmax_f32_pass_with_scalars(
         scalars(bnd);
         set_gpu_buf(bnd, idx_buf, 4);
         set_gpu_buf(bnd, softcap, 6);
-    })?;
-    refuse_sentinel_indices(rt, out_idx, groups, "argmax_f32_pass")
+    })
 }
 
 /// Softcap `logits` in place and write the argmax index to `out_token`.
@@ -2878,6 +2911,8 @@ pub unsafe fn argmax_f32_pass_with_scalars(
 /// Single threadgroup, so `n` may not exceed the threadgroup size — the kernel
 /// stages `logits[lid]` one per lane and never strides. For a full vocabulary
 /// use [`softcap_argmax_one_pass`], which does stride.
+///
+/// Only encodes; read the token with [`check_argmax_result`].
 ///
 /// Scalar index for `_with_scalars`: 3 = `n`. Buffer 2 is `softcap`.
 pub fn softcap_sample(
@@ -2930,8 +2965,7 @@ pub unsafe fn softcap_sample_with_scalars(
         set_gpu_buf(bnd, out_token, 1);
         set_gpu_buf(bnd, softcap, 2);
         scalars(bnd);
-    })?;
-    refuse_nonfinite_argmax(rt, out_token, "softcap_sample")
+    })
 }
 
 /// Softcap-and-argmax over an arbitrarily large `logits`, in one dispatch.
@@ -2939,6 +2973,8 @@ pub unsafe fn softcap_sample_with_scalars(
 /// One threadgroup whose lanes each scan a strided slice, then reduce. Unlike
 /// [`softcap_sample`] it does **not** rewrite `logits`: decode only needs the
 /// index, and skipping the write avoids restating a full vocabulary.
+///
+/// Only encodes; read the token with [`check_argmax_result`].
 ///
 /// Scalar index for `_with_scalars`: 3 = `n`. Buffer 2 is `softcap`.
 pub fn softcap_argmax_one_pass(
@@ -2985,29 +3021,35 @@ pub unsafe fn softcap_argmax_one_pass_with_scalars(
         set_gpu_buf(bnd, out_token, 1);
         set_gpu_buf(bnd, softcap, 2);
         scalars(bnd);
-    })?;
-    refuse_nonfinite_argmax(rt, out_token, "softcap_argmax_one_pass")
+    })
 }
 
-fn refuse_nonfinite_argmax(rt: &GpuRuntime, out_token: &GpuBuffer, what: &str) -> Result<(), String> {
-    rt.synchronize()?;
-    let idx = out_token.try_contents_u32()?;
-    if idx.first() == Some(&u32::MAX) {
-        return Err(format!("{what}: logit row has no finite value"));
+/// The token index a sampler wrote at `out[0]`, or an error when it is the
+/// no-finite-logit sentinel.
+///
+/// [`softcap_sample`], [`softcap_argmax_one_pass`] and [`argmax_f32_pass`] only
+/// encode, so a decode loop can queue the sampler behind the step that
+/// produced the logits and keep going. The index is not a token until it has
+/// been checked here: every argmax kernel writes `0xFFFFFFFF` for a row with
+/// no finite logit (all NaN or ±inf), which is a sentinel, not a vocabulary
+/// id. For a multi-pass [`argmax_f32_pass`], pass the final pass's `out_idx`
+/// (one group); an earlier pass may hold sentinels for groups that had no
+/// finite logit while the row as a whole does, and the next pass skips them.
+///
+/// This is a host read, so it commits and waits for queued work: call it once
+/// per token, where the token is needed.
+pub fn check_argmax_result(out: &GpuBuffer) -> Result<u32, String> {
+    let idx = out.try_contents_u32()?;
+    match idx.first() {
+        None => Err("check_argmax_result: buffer holds no index".into()),
+        Some(&ARGMAX_NONE) => Err("argmax: logit row has no finite value".into()),
+        Some(&token) => Ok(token),
     }
-    Ok(())
 }
 
-/// `argmax_f32` writes `0xFFFFFFFF` for a group whose maximum is not finite.
-/// That value is a sentinel, not a token id.
-fn refuse_sentinel_indices(rt: &GpuRuntime, out_idx: &GpuBuffer, groups: usize, what: &str) -> Result<(), String> {
-    rt.synchronize()?;
-    let idx = out_idx.try_contents_u32()?;
-    if idx.iter().take(groups).any(|v| *v == u32::MAX) {
-        return Err(format!("{what}: logit row has no finite value"));
-    }
-    Ok(())
-}
+/// `ARGMAX_NONE` in `kernels/softcap_sample.metal`: the index an argmax writes
+/// for a row, or a group, with no finite logit.
+const ARGMAX_NONE: u32 = u32::MAX;
 
 // ------------------------------------------------- Quantized weight banks ---
 
@@ -4510,4 +4552,38 @@ pub fn gemm_i8_dequant(
         set_f32(bnd, a_scale, 9);
         set_u32(bnd, has_scale, 10);
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The static entry-point tables name exactly the kernels the formatted
+    /// names they replaced did, for every instantiation.
+    #[test]
+    fn static_attention_entry_names_match_the_kernel_naming_scheme() {
+        let lanes = [RowsLanes::R8, RowsLanes::R16, RowsLanes::R32];
+        let chunks = [DecodeChunk::C64, DecodeChunk::C128, DecodeChunk::C256];
+        let groups = [RowsGroups::G8, RowsGroups::G16, RowsGroups::G32];
+        for d in [64u32, 96, 128, 256, 512] {
+            for r in lanes {
+                for c in chunks {
+                    let want = matches!(d, 128 | 256 | 512).then(|| {
+                        (
+                            format!("flash_attn_decode_partial_h{d}_c{}_r{}", c.keys(), r.width()),
+                            format!("flash_attn_decode_reduce_h{d}_c{}", c.keys()),
+                        )
+                    });
+                    let got = decode_entries(d, c, r).map(|(p, q)| (p.to_string(), q.to_string()));
+                    assert_eq!(got, want, "decode d={d} c={} r={}", c.keys(), r.width());
+                }
+                for g in groups {
+                    let compiled =
+                        matches!(d, 128 | 256 | 512) || (d == 64 && r == RowsLanes::R8 && g == RowsGroups::G8);
+                    let want = compiled.then(|| format!("flash_attn_rows_h{d}_r{}_g{}", r.width(), g.count()));
+                    assert_eq!(rows_entry(d, r, g).map(str::to_string), want, "rows d={d}");
+                }
+            }
+        }
+    }
 }

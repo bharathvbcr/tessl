@@ -1403,12 +1403,16 @@ pub struct OutCols<'a> {
     pub dtype: DType,
 }
 
-fn out_kernel(base: &str, dtype: DType, what: &str) -> Result<String, String> {
-    match dtype {
-        DType::F32 => Ok(format!("{base}_f32")),
-        DType::BF16 => Ok(format!("{base}_bf16")),
-        other => Err(format!("{what}: dtype must be F32 or BF16, got {other:?}")),
-    }
+/// The `{base}_f32` or `{base}_bf16` entry point for `dtype`, as a static
+/// name so the call looks its pipeline up without building a key.
+macro_rules! out_kernel {
+    ($base:literal, $dtype:expr, $what:expr) => {
+        match $dtype {
+            DType::F32 => Ok(concat!($base, "_f32")),
+            DType::BF16 => Ok(concat!($base, "_bf16")),
+            other => Err(format!("{}: dtype must be F32 or BF16, got {other:?}", $what)),
+        }
+    };
 }
 
 fn require_out_window(rt: &GpuRuntime, out: OutCols<'_>, rows: u64, width: u64, what: &str) -> Result<(), String> {
@@ -1433,7 +1437,7 @@ pub fn gated_rms_norm(
     eps: f32,
 ) -> Result<(), String> {
     const WHAT: &str = "qwen35::gated_rms_norm";
-    let name = out_kernel("qwen35_gated_rms_norm", out.dtype, WHAT)?;
+    let name = out_kernel!("qwen35_gated_rms_norm", out.dtype, WHAT)?;
     if dim == 0 || !eps.is_finite() || eps <= 0.0 {
         return Err(format!("{WHAT}: dim must be non-zero and eps positive"));
     }
@@ -1451,7 +1455,7 @@ pub fn gated_rms_norm(
         &[("out", out.cols.buf)],
         &[("x", x.buf), ("z", z.buf), ("weight", weight)],
     )?;
-    let p = pipeline_for(rt, &name, ROWS_PER_TG * 32, 0)?;
+    let p = pipeline_for(rt, name, ROWS_PER_TG * 32, 0)?;
     dispatch_groups(
         rt,
         &p,
@@ -2019,7 +2023,7 @@ pub fn attn_output_gate(
     head_dim: u32,
 ) -> Result<(), String> {
     const WHAT: &str = "qwen35::attn_output_gate";
-    let name = out_kernel("qwen35_attn_gate", out.dtype, WHAT)?;
+    let name = out_kernel!("qwen35_attn_gate", out.dtype, WHAT)?;
     let width = u32_product(&[q_heads, head_dim], WHAT)?;
     let gate_w = u64::from(u32_product(&[width, 2], WHAT)?);
     require::<f32>(
@@ -2039,7 +2043,7 @@ pub fn attn_output_gate(
     } else {
         require_disjoint_writes(WHAT, &[("out", out.cols.buf)], &[("attn", attn), ("proj", proj.buf)])?;
     }
-    let p = rt.pipeline(&name)?;
+    let p = rt.pipeline(name)?;
     dispatch_2d(rt, &p, width as usize, rows as usize, |bnd| {
         set_gpu_buf(bnd, attn, 0);
         set_gpu_buf(bnd, proj.buf, 1);
@@ -2070,7 +2074,7 @@ pub fn swiglu(
     width: u32,
 ) -> Result<(), String> {
     const WHAT: &str = "qwen35::swiglu";
-    let name = out_kernel("qwen35_swiglu", out.dtype, WHAT)?;
+    let name = out_kernel!("qwen35_swiglu", out.dtype, WHAT)?;
     let (r, w) = (u64::from(rows), u64::from(width));
     require_window::<f32>(rt, gate, r, w, "swiglu gate")?;
     require_window::<f32>(rt, up, r, w, "swiglu up")?;
@@ -2079,7 +2083,7 @@ pub fn swiglu(
         return Ok(());
     }
     require_disjoint_writes(WHAT, &[("out", out.cols.buf)], &[("gate", gate.buf), ("up", up.buf)])?;
-    let p = rt.pipeline(&name)?;
+    let p = rt.pipeline(name)?;
     dispatch_2d(rt, &p, width as usize, rows as usize, |bnd| {
         set_gpu_buf(bnd, gate.buf, 0);
         set_gpu_buf(bnd, up.buf, 1);
@@ -2180,7 +2184,7 @@ pub fn rms_norm(
     eps: f32,
 ) -> Result<(), String> {
     const WHAT: &str = "qwen35::rms_norm";
-    let name = out_kernel("qwen35_rms_norm", out_dtype, WHAT)?;
+    let name = out_kernel!("qwen35_rms_norm", out_dtype, WHAT)?;
     validate_rms_scalars(dim, eps, WHAT)?;
     let n = (rows as usize)
         .checked_mul(dim as usize)
@@ -2200,7 +2204,7 @@ pub fn rms_norm(
     } else {
         require_disjoint_writes(WHAT, &[("out", out)], &[("w", w)])?;
     }
-    let p = rt.pipeline(&name)?;
+    let p = rt.pipeline(name)?;
     let tptg = reduce_tptg(p.maxTotalThreadsPerThreadgroup(), dim as usize);
     dispatch_tg_1d(rt, &p, rows as usize, tptg, None, |bnd| {
         set_gpu_buf(bnd, x, 0);
@@ -2900,7 +2904,7 @@ pub fn score_answer_rows(
     logprobs: &GpuBuffer,
 ) -> Result<(), String> {
     const WHAT: &str = "qwen35::score_answer_rows";
-    let name = out_kernel("qwen35_score_rows", lm_head.dtype, "qwen35::score_answer_rows lm_head")?;
+    let name = out_kernel!("qwen35_score_rows", lm_head.dtype, "qwen35::score_answer_rows lm_head")?;
     if hidden == 0 || n_answers == 0 || n_answers > MAX_ANSWERS {
         return Err(format!(
             "{WHAT}: hidden must be non-zero and n_answers in 1..={MAX_ANSWERS}"
@@ -2950,7 +2954,7 @@ pub fn score_answer_rows(
     )?;
     // Reduction partials, then the answers' logits.
     let tg_bytes = score_tg_bytes(n_answers);
-    let p = pipeline_for(rt, &name, SCORE_THREADS, tg_bytes)?;
+    let p = pipeline_for(rt, name, SCORE_THREADS, tg_bytes)?;
     dispatch_groups(rt, &p, (n_slots as usize, 1, 1), SCORE_THREADS, tg_bytes, |bnd| {
         set_gpu_buf(bnd, hidden_states, 0);
         set_gpu_buf(bnd, slots, 1);

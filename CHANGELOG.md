@@ -55,6 +55,27 @@ All notable changes to `tessl` are recorded here. The format follows
 
 ### Changed
 
+- **Samplers only encode; `nn::check_argmax_result` reads and refuses the
+  token.** `softcap_sample`, `softcap_argmax_one_pass` and `argmax_f32_pass`
+  (and their `_with_scalars` forms) no longer synchronize and read their output
+  back to refuse a row with no finite logit, so a decode loop can queue the
+  sampler behind the step and a multi-pass argmax no longer drains after every
+  pass. Read the token with `check_argmax_result(out)`, which returns it or
+  the same "no finite value" error; for a multi-pass argmax, pass the final
+  pass's `out_idx`. This also fixes a refusal that was wrong: the per-pass
+  check rejected a row in which only one 256-logit group had no finite value
+  (a masked block of the vocabulary), although the next pass skips such a
+  group. A caller that relied on the sampler's own `Err` must now call
+  `check_argmax_result`. The first `argmax_f32_pass` binds `logits` in its
+  unused `idx_in` slot instead of allocating a 4-byte placeholder.
+- **Pipeline cache hits allocate nothing.** `GpuRuntime::pipeline` keeps
+  plain and ICB-capable pipelines in separate maps, so the ICB mode no longer
+  formats an `icb:{name}` key per call; a miss looks the function up once per
+  library instead of twice; and the decode/rows attention, `out`-dtype
+  Qwen3.5 kernels resolve static entry-point names. `decode_icb::pipeline_icb`
+  now returns the cached ICB pipeline instead of compiling a new one per call.
+  Pooled-buffer allocation no longer locks a mutex to read the runtime's weak
+  self-handle.
 - **C ABI 10: `tessl_qwen35_load` takes a precision and
   `tessl_qwen35_adamw_init` an optimizer configuration.** `tessl_qwen35_load`
   gains `precision` (`TESSL_F32` or `TESSL_BF16`) before `out`;

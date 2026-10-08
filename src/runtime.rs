@@ -112,13 +112,37 @@ pub enum PrecisionMode {
     Bf16,
 }
 
+/// Compiled pipelines by kernel name. Plain and ICB-capable pipelines of one
+/// kernel are different objects, so each has its own map: a lookup is one
+/// `&str` hash in either mode, with no key built per call.
 struct PipelineCache {
-    map: HashMap<String, Retained<ProtocolObject<dyn MTLComputePipelineState>>>,
+    plain: HashMap<String, Retained<ProtocolObject<dyn MTLComputePipelineState>>>,
+    /// Compiled with `supportIndirectCommandBuffers` for DecodeIcb.
+    icb: HashMap<String, Retained<ProtocolObject<dyn MTLComputePipelineState>>>,
 }
 
 impl PipelineCache {
     fn new() -> Self {
-        Self { map: HashMap::new() }
+        Self {
+            plain: HashMap::new(),
+            icb: HashMap::new(),
+        }
+    }
+
+    fn map(&self, icb: bool) -> &HashMap<String, Retained<ProtocolObject<dyn MTLComputePipelineState>>> {
+        if icb {
+            &self.icb
+        } else {
+            &self.plain
+        }
+    }
+
+    fn get(&self, name: &str, icb: bool) -> Option<Retained<ProtocolObject<dyn MTLComputePipelineState>>> {
+        self.map(icb).get(name).cloned()
+    }
+
+    fn all(&self) -> impl Iterator<Item = &Retained<ProtocolObject<dyn MTLComputePipelineState>>> {
+        self.plain.values().chain(self.icb.values())
     }
 
     fn get_or_create(
@@ -127,20 +151,18 @@ impl PipelineCache {
         library: &ProtocolObject<dyn MTLLibrary>,
         overlays: &[Retained<ProtocolObject<dyn MTLLibrary>>],
         name: &str,
+        icb: bool,
     ) -> Result<Retained<ProtocolObject<dyn MTLComputePipelineState>>, String> {
-        let icb = crate::decode_icb::icb_pipelines_enabled();
-        let key = if icb { format!("icb:{name}") } else { name.to_string() };
-        if let Some(p) = self.map.get(&key) {
-            return Ok(p.clone());
+        if let Some(p) = self.get(name, icb) {
+            return Ok(p);
         }
+        // One `newFunctionWithName` per library searched: the function found
+        // is the one the plain pipeline is built from.
         let fname = NSString::from_str(name);
-        let containing: &ProtocolObject<dyn MTLLibrary> = if library.newFunctionWithName(&fname).is_some() {
-            library
-        } else if let Some(lib) = overlays.iter().find(|lib| lib.newFunctionWithName(&fname).is_some()) {
-            lib
-        } else {
-            return Err(format!("kernel '{name}' not found in metallib"));
-        };
+        let (containing, func) = std::iter::once(library)
+            .chain(overlays.iter().map(|lib| &**lib))
+            .find_map(|lib| lib.newFunctionWithName(&fname).map(|func| (lib, func)))
+            .ok_or_else(|| format!("kernel '{name}' not found in metallib"))?;
 
         let pipeline = if icb {
             let compiler_desc = MTL4CompilerDescriptor::new();
@@ -161,14 +183,12 @@ impl PipelineCache {
             }
             p
         } else {
-            let func = containing
-                .newFunctionWithName(&fname)
-                .ok_or_else(|| format!("kernel '{name}' not found in metallib"))?;
             device
                 .newComputePipelineStateWithFunction_error(&func)
                 .map_err(|e| format!("pipeline '{name}': {e}"))?
         };
-        self.map.insert(key, pipeline.clone());
+        let map = if icb { &mut self.icb } else { &mut self.plain };
+        map.insert(name.to_string(), pipeline.clone());
         Ok(pipeline)
     }
 }
@@ -572,8 +592,9 @@ pub struct GpuRuntime {
     pending_release: Mutex<Vec<PendingRelease>>,
     /// Bounded Hot params workspace for stable scalar binds (pos-buffer style).
     params: Mutex<Option<ParamsBuffer>>,
-    /// Self weak handle so Drop on pooled buffers can schedule recycle.
-    self_weak: Mutex<Weak<GpuRuntime>>,
+    /// Self weak handle so Drop on pooled buffers can schedule recycle. Set
+    /// once at construction ([`Arc::new_cyclic`]), so reading it takes no lock.
+    self_weak: Weak<GpuRuntime>,
     /// Probed working-set / wired budget (P0b).
     memory_info: Mutex<DeviceMemoryInfo>,
     /// Highest [`Self::current_allocated_bytes`] seen at a fresh pool
@@ -767,7 +788,7 @@ impl GpuRuntime {
         // be an unsafe assertion about Metal's threading that this crate has not
         // established, so the Arc stays and the lint is silenced here.
         #[allow(clippy::arc_with_non_send_sync)]
-        let rt = Arc::new(Self {
+        let rt = Arc::new_cyclic(|self_weak| Self {
             access_busy: Arc::new(AtomicBool::new(false)),
             encode_failed: Arc::new(AtomicBool::new(false)),
             commit_feedback_reports: Arc::new(AtomicU64::new(0)),
@@ -793,14 +814,11 @@ impl GpuRuntime {
             pending_external_release: Mutex::new(Vec::new()),
             pending_release: Mutex::new(Vec::new()),
             params: Mutex::new(None),
-            self_weak: Mutex::new(Weak::new()),
+            self_weak: self_weak.clone(),
             memory_info: Mutex::new(mem_info),
             peak_allocated: AtomicU64::new(0),
             poison_unzeroed: AtomicBool::new(false),
         });
-        if let Ok(mut w) = rt.self_weak.lock() {
-            *w = Arc::downgrade(&rt);
-        }
         Ok(rt)
     }
 
@@ -940,7 +958,7 @@ impl GpuRuntime {
     }
 
     pub(crate) fn weak_self(&self) -> Weak<GpuRuntime> {
-        self.self_weak.lock().map(|g| g.clone()).unwrap_or_default()
+        self.self_weak.clone()
     }
 
     /// SharedEvent signaled on every Metal 4 commit. Cross-crate callers that
@@ -1205,28 +1223,30 @@ impl GpuRuntime {
     /// must fail here on a replay step exactly as it does on a live one, and
     /// callers read `threadExecutionWidth` / `maxTotalThreadsPerThreadgroup`
     /// off the returned handle, which is only meaningful if it is that kernel's
-    /// own pipeline. A cache hit costs one uncontended lock (and no allocation
-    /// off the ICB path) — the same lookup live encode pays per dispatch.
+    /// own pipeline. A cache hit costs one uncontended lock and one `&str`
+    /// hash, with no allocation in either cache mode — the same lookup live
+    /// encode pays per dispatch.
+    ///
+    /// The pipeline is ICB-capable when [`crate::decode_icb::icb_pipelines_enabled`].
     pub fn pipeline(&self, name: &str) -> Result<Retained<ProtocolObject<dyn MTLComputePipelineState>>, String> {
+        self.pipeline_for_mode(name, crate::decode_icb::icb_pipelines_enabled())
+    }
+
+    /// [`Self::pipeline`] in a chosen cache mode: `icb` builds the kernel with
+    /// `supportIndirectCommandBuffers`, whatever the process-wide flag says.
+    pub(crate) fn pipeline_for_mode(
+        &self,
+        name: &str,
+        icb: bool,
+    ) -> Result<Retained<ProtocolObject<dyn MTLComputePipelineState>>, String> {
         record_kernel_use(name);
-        // Cache hit without holding overlay lock or allocating a key String.
-        let icb = crate::decode_icb::icb_pipelines_enabled();
-        {
-            let cache = self.pipelines.lock().map_err(|e| e.to_string())?;
-            if !icb {
-                if let Some(p) = cache.map.get(name) {
-                    return Ok(p.clone());
-                }
-            } else {
-                let key = format!("icb:{name}");
-                if let Some(p) = cache.map.get(&key) {
-                    return Ok(p.clone());
-                }
-            }
+        // Cache hit without holding the overlay lock.
+        if let Some(p) = self.pipelines.lock().map_err(|e| e.to_string())?.get(name, icb) {
+            return Ok(p);
         }
         let overlays = self.overlay_libraries.lock().map_err(|e| e.to_string())?;
         let mut cache = self.pipelines.lock().map_err(|e| e.to_string())?;
-        PipelineCache::get_or_create(&mut cache, &self.device, &self.library, &overlays, name)
+        cache.get_or_create(&self.device, &self.library, &overlays, name, icb)
     }
 
     /// Snapshot of overlay metallibs (for ICB pipeline construction).
@@ -1299,7 +1319,7 @@ impl GpuRuntime {
         }
         // Always (re)register — freelist buffers were removed on recycle.
         self.register_residency(&buffer);
-        let weak = self.self_weak.lock().map(|g| g.clone()).unwrap_or_default();
+        let weak = self.self_weak.clone();
         // Same reason as the runtime Arc above: the pooled buffer holds a
         // `Retained<ProtocolObject<dyn MTLBuffer>>`, and `GpuBuffer` is cloned
         // into every `Tensor` view that borrows it.
@@ -2035,7 +2055,7 @@ impl GpuRuntime {
         for library in mutex_value_mut(&mut self.overlay_libraries).iter() {
             std::mem::forget(library.clone());
         }
-        for pipeline in mutex_value_mut(&mut self.pipelines).map.values() {
+        for pipeline in mutex_value_mut(&mut self.pipelines).all() {
             std::mem::forget(pipeline.clone());
         }
 

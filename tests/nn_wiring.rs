@@ -114,8 +114,101 @@ fn softcap_sample_rejects_an_all_nan_row() {
         let lb = buf(rt, &[f32::NAN; 8]);
         let out = buf_u32(rt, &[0]);
         let cap = buf(rt, &[30.0]);
-        let err = nn::softcap_sample(rt, &lb, &out, &cap, n as u32).expect_err("all-NaN must not sample token 0");
+        nn::softcap_sample(rt, &lb, &out, &cap, n as u32).unwrap();
+        let err = nn::check_argmax_result(&out).expect_err("all-NaN must not sample token 0");
         assert!(err.contains("finite"), "{err}");
+    });
+}
+
+/// -inf and NaN mixed is as tokenless as all NaN, for every sampler.
+#[test]
+fn every_sampler_refuses_a_row_of_nan_and_negative_infinity() {
+    with_gpu(|rt| {
+        let row = [f32::NEG_INFINITY, f32::NAN, f32::NEG_INFINITY, f32::INFINITY, f32::NAN];
+        let n = row.len() as u32;
+        let lb = buf(rt, &row);
+        let cap = buf(rt, &[30.0]);
+
+        let out = buf_u32(rt, &[0]);
+        nn::softcap_argmax_one_pass(rt, &lb, &out, &cap, n).unwrap();
+        let err = nn::check_argmax_result(&out).expect_err("one-pass must not return a token");
+        assert!(err.contains("no finite"), "softcap_argmax_one_pass: {err}");
+
+        let out = buf_u32(rt, &[0]);
+        nn::softcap_sample(rt, &buf(rt, &row), &out, &cap, n).unwrap();
+        let err = nn::check_argmax_result(&out).expect_err("softcap_sample must not return a token");
+        assert!(err.contains("no finite"), "softcap_sample: {err}");
+
+        let idx = buf_u32(rt, &[0]);
+        let val = empty(rt, 1);
+        nn::argmax_f32_pass(rt, &lb, &idx, &val, None, &cap, n).unwrap();
+        let err = nn::check_argmax_result(&idx).expect_err("argmax_f32_pass must not return a token");
+        assert!(err.contains("no finite"), "argmax_f32_pass: {err}");
+    });
+}
+
+/// The samplers only encode. With async encode on, a decode loop queues the
+/// sampler behind the step that produced the logits; the one wait is where
+/// the token is read, not one per sampler call (or per argmax pass).
+#[test]
+fn samplers_encode_without_waiting_and_the_token_read_waits_once() {
+    with_gpu(|rt| {
+        let n = 50_000u32;
+        let mut logits = random_f32(n as usize, 0xC1);
+        logits[12_345] = 88.0;
+        let lb = buf(rt, &logits);
+        let small = buf(rt, &logits[12_300..12_400]);
+        let cap = buf(rt, &[30.0]);
+        let one = buf_u32(rt, &[0]);
+        let sample = buf_u32(rt, &[0]);
+        let g1 = nn::argmax_pass_groups(n);
+        let (idx1, val1) = (buf_u32(rt, &vec![0u32; g1]), empty(rt, g1));
+        let (idx2, val2) = (buf_u32(rt, &[0]), empty(rt, 1));
+        rt.synchronize().unwrap();
+
+        rt.set_async_encode(true).unwrap();
+        let committed = rt.last_signaled_value();
+        nn::softcap_argmax_one_pass(rt, &lb, &one, &cap, n).unwrap();
+        nn::softcap_sample(rt, &small, &sample, &cap, 100).unwrap();
+        nn::argmax_f32_pass(rt, &lb, &idx1, &val1, None, &cap, n).unwrap();
+        nn::argmax_f32_pass(rt, &val1, &idx2, &val2, Some(&idx1), &cap, g1 as u32).unwrap();
+        assert_eq!(
+            rt.last_signaled_value(),
+            committed,
+            "a sampler committed (and so waited) before its token was read"
+        );
+
+        assert_eq!(nn::check_argmax_result(&one).unwrap(), 12_345);
+        assert!(
+            rt.last_signaled_value() > committed,
+            "reading the token must commit the queued work"
+        );
+        assert_eq!(nn::check_argmax_result(&sample).unwrap(), 45);
+        assert_eq!(nn::check_argmax_result(&idx2).unwrap(), 12_345);
+        rt.set_async_encode(false).unwrap();
+    });
+}
+
+/// A first pass binds one of its own operands in the unused `idx_in` slot
+/// rather than allocating a placeholder: an allocation re-dirties residency,
+/// which the next encode then pays to commit.
+#[test]
+fn argmax_f32_first_pass_allocates_nothing() {
+    with_gpu(|rt| {
+        let n = 1024u32;
+        let lb = buf(rt, &random_f32(n as usize, 0xC2));
+        let cap = buf(rt, &[0.0]);
+        let g = nn::argmax_pass_groups(n);
+        let (idx, val) = (buf_u32(rt, &vec![0u32; g]), empty(rt, g));
+        rt.synchronize().unwrap();
+
+        tessl::infer_trace::set_enabled(true);
+        tessl::infer_trace::reset_token_counters();
+        let result = nn::argmax_f32_pass(rt, &lb, &idx, &val, None, &cap, n);
+        let allocs = tessl::infer_trace::snapshot().cold_allocs;
+        tessl::infer_trace::set_enabled(false);
+        result.unwrap();
+        assert_eq!(allocs, 0, "the first pass allocated a placeholder buffer");
     });
 }
 
@@ -173,9 +266,34 @@ fn argmax_f32_pass_refuses_a_nonfinite_row() {
         let groups = nn::argmax_pass_groups(n);
         let idx = buf_u32(rt, &vec![0u32; groups]);
         let val = empty(rt, groups);
-        let err = nn::argmax_f32_pass(rt, &lb, &idx, &val, None, &cap, n)
-            .expect_err("non-finite argmax must not return a token");
+        nn::argmax_f32_pass(rt, &lb, &idx, &val, None, &cap, n).unwrap();
+        assert_eq!(idx.read_u32()[0], u32::MAX, "the kernel's no-finite-value sentinel");
+        let err = nn::check_argmax_result(&idx).expect_err("non-finite argmax must not return a token");
         assert!(err.contains("no finite"), "expected the non-finite refusal, got {err}");
+    });
+}
+
+/// A first-pass group with no finite logit is not a row with none. Its
+/// sentinel is a lane the next pass skips, so a vocabulary whose first 256
+/// logits are masked to -inf (or NaN) still has a token.
+#[test]
+fn multi_pass_argmax_skips_a_group_with_no_finite_logit() {
+    with_gpu(|rt| {
+        let n = 1024u32;
+        let mut logits = random_f32(n as usize, 0xB2);
+        for (i, v) in logits[..256].iter_mut().enumerate() {
+            *v = if i % 2 == 0 { f32::NEG_INFINITY } else { f32::NAN };
+        }
+        logits[700] = 9.0;
+        let lb = buf(rt, &logits);
+        let cap = buf(rt, &[0.0]);
+        let g1 = nn::argmax_pass_groups(n);
+        let (idx1, val1) = (buf_u32(rt, &vec![0u32; g1]), empty(rt, g1));
+        let (idx2, val2) = (buf_u32(rt, &[0]), empty(rt, 1));
+        nn::argmax_f32_pass(rt, &lb, &idx1, &val1, None, &cap, n).expect("a masked group is not a masked row");
+        nn::argmax_f32_pass(rt, &val1, &idx2, &val2, Some(&idx1), &cap, g1 as u32).unwrap();
+        assert_eq!(idx1.read_u32()[0], u32::MAX, "group 0 holds no finite logit");
+        assert_eq!(nn::check_argmax_result(&idx2).unwrap(), 700);
     });
 }
 

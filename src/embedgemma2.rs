@@ -41,27 +41,31 @@
 //!
 //! # Kernels
 //!
-//! New for this model: [`encoder_attn`] (`kernels/encoder_attn.metal`),
-//! [`segment_mean_rows`] and [`l2_normalize_rows`] (`kernels/embed_pool.metal`).
-//! The rest are tessl's: exact-f32 GEMM, `nn::rms_norm_f32`,
-//! `nn::rms_norm_residual_add_f32` (the post-norms and the layer scalar),
-//! `nn::mlp_gelu_tanh`, `nn::scale_f32_inplace`, `qwen35::embed_rows` and
-//! `qwen35::attn_qk_norm_rope_columns` (`* w` norms, full-width RoPE).
+//! New for this model: [`encoder_attn`] (`kernels/encoder_attn.metal`: the
+//! TensorOps tiled kernel of `kernels/attn_tiled.h` at head dims 256 and 512,
+//! or one simdgroup per query row), [`segment_mean_rows`] and
+//! [`l2_normalize_rows`] (`kernels/embed_pool.metal`). The rest are tessl's:
+//! exact-f32 GEMMs (NN, and NT for the per-layer-input projection),
+//! `nn::rms_norm_f32`, `nn::rms_norm_residual_add_f32` (the post-norms and the
+//! layer scalar), `nn::scale_f32_inplace`, `qwen35::embed_rows_scaled` (the
+//! gather and the `sqrt(hidden)` scale), `qwen35::gated_act` (GELU-tanh over
+//! column windows) and `qwen35::attn_qk_norm_rope_columns` (`* w` norms,
+//! full-width RoPE, and the weightless V norm).
 
-use std::cell::RefCell;
-use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use objc2_metal::MTLComputePipelineState;
 
 use crate::dispatch::{dispatch_1d, dispatch_2d_tg, set_gpu_buf, set_u32};
-use crate::gemm::{gemm, GemmBackend};
+use crate::gemm::{gemm, gemm_nt_f32, GemmBackend};
 use crate::json::{self, Json, Syntax};
+use crate::loader::Loader;
 use crate::nn::{
-    dispatch_tg_1d, mlp_gelu_tanh, reduce_tptg, require, require_disjoint_writes, rms_norm_f32,
-    rms_norm_residual_add_f32, scale_f32_inplace,
+    dispatch_tg_1d, reduce_tptg, require, require_disjoint_writes, rms_norm_f32, rms_norm_residual_add_f32,
+    scale_f32_inplace,
 };
-use crate::qwen35::{self, AttnShape, AttnTargets, Cols, LmHead, QkvColumns};
+use crate::qwen35::{self, AttnShape, AttnTargets, Cols, GatedAct, LmHead, OutCols, QkvColumns};
+use crate::qwen35_model::Precision;
 use crate::runtime::GpuRuntime;
 use crate::safetensors::SafeTensors;
 use crate::tensor::{gpu_copy, DType, GpuBuffer, Tensor};
@@ -74,7 +78,8 @@ pub const DEFAULT_MAX_TOKENS: u32 = 8192;
 /// Sequences per [`EmbedGemma2Model::encode`] call.
 pub const MAX_BATCH: usize = 256;
 /// Padded tokens (`sequences * longest`) per forward. Bounds the activations:
-/// at this size the largest buffer, a full layer's queries, is 256 MiB.
+/// at this size the largest buffer, the q|k|v projection of a 512-wide full
+/// layer (`(4 + 2) * 512` columns), is 384 MiB, and all of them about 2 GiB.
 /// [`EmbedGemma2Model::encode`] splits a batch into as many forwards as
 /// this needs, so it bounds memory, not what a caller may pass.
 pub const MAX_BATCH_TOKENS: usize = 32_768;
@@ -111,10 +116,45 @@ fn encoder_attn_entry(head_dim: u32) -> Option<(&'static str, usize, usize)> {
     }
 }
 
-/// Bidirectional attention over right-padded sequences.
+/// Which kernel runs [`encoder_attn`]'s contract.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EncoderAttnKernel {
+    /// One simdgroup per query row, scalar f32 (`encoder_attn_rows_*`): every
+    /// head dim.
+    Rows,
+    /// FlashAttention-2 on the TensorOps matrix units
+    /// (`encoder_attn_tiled_*`, `kernels/qwen35_attn_tiled.metal`'s body):
+    /// head dims 256 and 512, on a device with TensorOps.
+    Tiled,
+}
+
+/// The kernel [`encoder_attn`] picks: [`EncoderAttnKernel::Tiled`] where it
+/// is compiled and the device has the matrix units, else the rows kernel.
+pub fn encoder_attn_kernel(rt: &GpuRuntime, head_dim: u32) -> EncoderAttnKernel {
+    if rt.has_tensorops() && encoder_attn_tiled_entry(head_dim).is_some() {
+        EncoderAttnKernel::Tiled
+    } else {
+        EncoderAttnKernel::Rows
+    }
+}
+
+/// (entry, queries per threadgroup, simdgroups per threadgroup) as compiled;
+/// the entry spells its geometry.
+fn encoder_attn_tiled_entry(head_dim: u32) -> Option<(&'static str, usize, usize)> {
+    match head_dim {
+        256 => Some(("encoder_attn_tiled_h256_q32_k32_sg4", 32, 4)),
+        512 => Some(("encoder_attn_tiled_h512_q32_k32_sg8", 32, 8)),
+        _ => None,
+    }
+}
+
+/// Bidirectional attention over right-padded sequences, on the kernel
+/// [`encoder_attn_kernel`] picks ([`encoder_attn_with`] names one).
 ///
-/// `q`/`o`: `[batch, seq, heads, head_dim]`; `k`/`v`: `[batch, seq, heads_kv,
-/// head_dim]`, all f32 (`o` bf16 when `out_bf16`). `lens`: `[batch]` u32,
+/// `q`/`o`: `[batch, seq, heads, head_dim]`; `k`/`v`: `[batch, capacity,
+/// heads_kv, head_dim]` with `capacity >= seq` derived from their size
+/// ([`crate::nn::attn_kv_capacity`], as the K/V writer derives it), all f32
+/// (`o` bf16 when `out_bf16`). `lens`: `[batch]` u32,
 /// each sequence's live length. Keys at or past a row's length are masked,
 /// and every query at or past it is written as zeros. The lengths are device
 /// values the host cannot see; the kernel clamps each to `seq`, and a length
@@ -131,6 +171,24 @@ pub fn encoder_attn(
     dims: EncoderAttnDims,
     out_bf16: bool,
 ) -> Result<(), String> {
+    let kernel = encoder_attn_kernel(rt, dims.head_dim);
+    encoder_attn_with(rt, q, k, v, o, lens, dims, out_bf16, kernel)
+}
+
+/// [`encoder_attn`] on a named kernel (for the tests and the paired
+/// benchmark that compare the two). The contract and the checks are the same.
+#[allow(clippy::too_many_arguments)]
+pub fn encoder_attn_with(
+    rt: &Arc<GpuRuntime>,
+    q: &GpuBuffer,
+    k: &GpuBuffer,
+    v: &GpuBuffer,
+    o: &GpuBuffer,
+    lens: &GpuBuffer,
+    dims: EncoderAttnDims,
+    out_bf16: bool,
+    kernel: EncoderAttnKernel,
+) -> Result<(), String> {
     const WHAT: &str = "embedgemma2::encoder_attn";
     let (entry, lanes, groups) = encoder_attn_entry(dims.head_dim)
         .ok_or_else(|| format!("{WHAT}: head dim {} has no kernel (32, 64, 256 or 512)", dims.head_dim))?;
@@ -144,10 +202,7 @@ pub fn encoder_attn(
         return Err(format!("{WHAT}: scale must be finite"));
     }
     let q_elems = elems(&[dims.batch, dims.seq, dims.heads, dims.head_dim], WHAT)?;
-    let kv_elems = elems(&[dims.batch, dims.seq, dims.heads_kv, dims.head_dim], WHAT)?;
     require::<f32>(rt, q, q_elems, "encoder_attn q")?;
-    require::<f32>(rt, k, kv_elems, "encoder_attn k")?;
-    require::<f32>(rt, v, kv_elems, "encoder_attn v")?;
     if out_bf16 {
         require::<u16>(rt, o, q_elems, "encoder_attn o")?;
     } else {
@@ -157,7 +212,60 @@ pub fn encoder_attn(
     if q_elems == 0 {
         return Ok(());
     }
+    let kv_capacity = crate::nn::attn_kv_capacity(k, v, dims.batch, dims.heads_kv, dims.head_dim)?;
+    if kv_capacity < dims.seq {
+        return Err(format!(
+            "{WHAT}: K/V hold {kv_capacity} positions per sequence; need at least seq = {}",
+            dims.seq
+        ));
+    }
     require_disjoint_writes(WHAT, &[("o", o)], &[("q", q), ("k", k), ("v", v), ("lens", lens)])?;
+    if kernel == EncoderAttnKernel::Tiled {
+        let (entry, bq, sg) = encoder_attn_tiled_entry(dims.head_dim).ok_or_else(|| {
+            format!(
+                "{WHAT}: the tiled kernel is compiled for head dims 256 and 512, not {}",
+                dims.head_dim
+            )
+        })?;
+        if !rt.has_tensorops() {
+            return Err(format!(
+                "{WHAT}: the tiled kernel needs TensorOps, which this device lacks"
+            ));
+        }
+        // MPP tensor views index one (batch, head) plane with i32 extents
+        // and strides, so a plane's last element must be addressable in i32.
+        let q_plane = u64::from(dims.seq) * u64::from(dims.heads) * u64::from(dims.head_dim);
+        let kv_plane = u64::from(kv_capacity) * u64::from(dims.heads_kv) * u64::from(dims.head_dim);
+        if q_plane > i32::MAX as u64 || kv_plane > i32::MAX as u64 {
+            return Err(format!(
+                "{WHAT}: a head's plane exceeds i32 indexing (seq = {}, kv capacity = {kv_capacity})",
+                dims.seq
+            ));
+        }
+        let threads = sg * 32;
+        let p = rt.pipeline(entry)?;
+        let max = p.maxTotalThreadsPerThreadgroup();
+        if max < threads {
+            return Err(format!(
+                "{WHAT}: {entry} needs {threads} threads per threadgroup, the pipeline allows {max}"
+            ));
+        }
+        let groups_y = elems(&[dims.batch, dims.heads], WHAT)?;
+        return dispatch_2d_tg(rt, &p, (dims.seq as usize).div_ceil(bq), groups_y, threads, |bnd| {
+            set_gpu_buf(bnd, q, 0);
+            set_gpu_buf(bnd, k, 1);
+            set_gpu_buf(bnd, v, 2);
+            set_gpu_buf(bnd, o, 3);
+            set_u32(bnd, dims.seq, 4);
+            set_gpu_buf(bnd, lens, 5);
+            set_u32(bnd, dims.heads, 6);
+            set_u32(bnd, dims.heads_kv, 7);
+            set_u32(bnd, dims.window, 8);
+            crate::dispatch::set_f32(bnd, dims.scale, 9);
+            set_u32(bnd, u32::from(out_bf16), 10);
+            set_u32(bnd, kv_capacity, 11);
+        });
+    }
     let rows_per_tg = groups * (32 / lanes);
     let groups_x = (dims.seq as usize).div_ceil(rows_per_tg);
     let groups_y = elems(&[dims.batch, dims.heads], WHAT)?;
@@ -174,6 +282,7 @@ pub fn encoder_attn(
         set_u32(bnd, dims.window, 8);
         crate::dispatch::set_f32(bnd, dims.scale, 9);
         set_u32(bnd, u32::from(out_bf16), 10);
+        set_u32(bnd, kv_capacity, 11);
     })
 }
 
@@ -522,14 +631,9 @@ struct Layer {
     w_o: Tensor,
     q_norm: GpuBuffer,
     k_norm: GpuBuffer,
-    /// All-ones `[head_dim]` weight for the weightless value norm, shared by
-    /// every layer of this head dim.
-    v_norm_ones: GpuBuffer,
-    gate: Tensor,
-    up: Tensor,
+    /// `[hidden, 2 * intermediate]`: `gate | up`.
+    gate_up: Tensor,
     down: Tensor,
-    /// This layer's slice of the per-layer-input projection, `[hidden, ple_dim]`.
-    ple_in: Tensor,
     ple_gate: Tensor,
     ple_out: Tensor,
     post_ple_norm: GpuBuffer,
@@ -542,12 +646,19 @@ pub struct EmbedGemma2Model {
     rt: Arc<GpuRuntime>,
     /// `[vocab, hidden]` bf16, as the checkpoint holds it.
     embed: Tensor,
+    /// The per-layer-input projection as the checkpoint holds it,
+    /// `[n_layers * ple_dim, hidden]`: layer `i`'s rows are `[i * ple_dim,
+    /// (i + 1) * ple_dim)`, so a run of layers is a run of rows, the right
+    /// operand of one NT GEMM.
+    ple_w: Tensor,
     ple_norm: GpuBuffer,
     final_norm: GpuBuffer,
     /// `[hidden, embedding_dim]`.
     projection: Tensor,
     layers: Vec<Layer>,
     max_tokens: u32,
+    /// See [`EmbedGemma2Model::set_ple_run_bytes`].
+    ple_run_bytes: usize,
 }
 
 /// What [`EmbedGemma2Model::encode`] returns.
@@ -561,108 +672,12 @@ pub struct EncodeOutput {
     pub forwards: u32,
 }
 
-struct Loader<'a> {
-    st: &'a SafeTensors,
-    prefix: &'a str,
-    rt: &'a Arc<GpuRuntime>,
-    /// Every tensor name read so far, for [`Self::refuse_unread`].
-    read: RefCell<BTreeSet<String>>,
-}
-
-impl Loader<'_> {
-    fn name(&self, rest: &str) -> String {
-        format!("{}{rest}", self.prefix)
-    }
-
-    /// `rest`'s full name, recorded as read.
-    fn take(&self, rest: &str) -> String {
-        let name = self.name(rest);
-        self.read.borrow_mut().insert(name.clone());
-        name
-    }
-
-    fn f32(&self, rest: &str, shape: &[usize]) -> Result<Vec<f32>, String> {
-        let name = self.take(rest);
-        let (got, data) = self.st.read_f32(&name)?;
-        if got != shape {
-            return Err(format!("{name}: shape {got:?}, expected {shape:?}"));
-        }
-        Ok(data)
-    }
-
-    fn bf16_bits(&self, rest: &str, shape: &[usize]) -> Result<Vec<u16>, String> {
-        let name = self.take(rest);
-        let (got, bits) = self.st.read_bf16_bits(&name)?;
-        if got != shape {
-            return Err(format!("{name}: shape {got:?}, expected {shape:?}"));
-        }
-        Ok(bits)
-    }
-
-    /// One finite value (a `[1]` or scalar tensor).
-    fn scalar(&self, rest: &str) -> Result<f32, String> {
-        let name = self.take(rest);
-        let (_, data) = self.st.read_f32(&name)?;
-        match data.as_slice() {
-            [s] if s.is_finite() => Ok(*s),
-            other => Err(format!("{name}: expected one finite value, got {other:?}")),
-        }
-    }
-
-    /// A tensor under the prefix that the forward never read would be a
-    /// parameter it silently ignores (a bias, an extra norm): refuse it.
-    fn refuse_unread(&self) -> Result<(), String> {
-        let read = self.read.borrow();
-        let unread: Vec<&str> = self
-            .st
-            .names()
-            .filter(|n| n.starts_with(self.prefix) && !read.contains(*n))
-            .collect();
-        if unread.is_empty() {
-            return Ok(());
-        }
-        let shown: Vec<&str> = unread.iter().copied().take(8).collect();
-        Err(format!(
-            "{} tensor(s) under {:?} are not part of the text encoder this loader implements: {shown:?}{}",
-            unread.len(),
-            self.prefix,
-            if unread.len() > shown.len() { " ..." } else { "" }
-        ))
-    }
-
-    fn buf(&self, data: &[f32]) -> Result<GpuBuffer, String> {
-        let b = self.rt.alloc_buffer_hot(data.len().max(1) * 4)?;
-        b.write_f32(data);
-        Ok(b)
-    }
-
-    fn norm(&self, rest: &str, dim: u32) -> Result<GpuBuffer, String> {
-        self.buf(&self.f32(rest, &[dim as usize])?)
-    }
-
-    /// `nn.Linear` weights `[out_i, in]` packed into the right operand
-    /// `[in, sum(out_i)]` of one exact-f32 GEMM.
-    fn linear(&self, parts: &[(&str, u32)], in_features: u32) -> Result<Tensor, String> {
-        let mut data = Vec::with_capacity(parts.len());
-        for &(rest, out) in parts {
-            data.push(self.f32(rest, &[out as usize, in_features as usize])?);
-        }
-        self.pack(
-            &data.iter().map(Vec::as_slice).collect::<Vec<_>>(),
-            parts.iter().map(|p| p.1).collect(),
-            in_features,
-        )
-    }
-
-    fn pack(&self, parts: &[&[f32]], widths: Vec<u32>, in_features: u32) -> Result<Tensor, String> {
-        let widths: Vec<usize> = widths.into_iter().map(|w| w as usize).collect();
-        let total: usize = widths.iter().sum();
-        let packed = qwen35::pack_linear_weights_f32(parts, &widths, in_features as usize)?;
-        let t = self.rt.alloc_tensor_f32_hot(&[in_features as usize, total])?;
-        t.buffer.write_f32(&packed);
-        Ok(t)
-    }
-}
+/// Bytes of per-layer inputs one GEMM forms: every layer's at once would be
+/// `rows * n_layers * ple_dim` floats, 1.5 GiB at [`MAX_BATCH_TOKENS`] with
+/// the checkpoint's 24 layers of 512. Under this bound a forward of up to
+/// 5461 rows forms all 24 in one GEMM; at 32768 rows it takes 6 (4 layers
+/// each), against 24 one-layer GEMMs before.
+pub const PLE_RUN_BYTES: usize = 256 << 20;
 
 /// A forward's fixed cost in padded rows, for [`pack_forwards`]: each forward
 /// re-reads every weight (~0.6 GB of f32 outside the embedding table), about
@@ -712,24 +727,20 @@ fn pack_forwards(batch: &[&[u32]], max_rows: usize) -> Vec<Vec<usize>> {
     runs
 }
 
-/// A layer's K, V and normed V, `[batch, seq, kv_heads, head_dim]` each and
-/// exactly that size. The K/V writer derives its per-sequence stride from the
-/// buffer's size (`capacity / (batch * kv_heads * head_dim)` positions) while
-/// [`encoder_attn`] and the value norm read at stride `seq`; the two agree
-/// only when the buffer holds exactly `seq` positions per sequence. A buffer
-/// shared by layers of different widths would hold more for the narrower
-/// ones, and every sequence after the first would be read from the wrong rows.
-struct KvBufs {
-    /// `kv_heads * head_dim`.
-    width: u32,
-    k: GpuBuffer,
-    v: GpuBuffer,
-    v_normed: GpuBuffer,
-}
-
-/// Every activation of one forward, sized for `rows = batch * seq`.
+/// Every activation of an encode's forwards, allocated once per
+/// [`EmbedGemma2Model::encode`] for its largest forward (`rows` padded rows,
+/// `nb` sequences) and reused by each. A forward over fewer rows works on a
+/// prefix of every buffer (`[rows, cols]` views).
+///
+/// Nothing here is zeroed on the host ([`GpuRuntime::alloc_tensor_unzeroed`]):
+/// every element a forward reads, an earlier kernel of the same forward wrote
+/// (the gather, a GEMM, a norm, the K/V writer for positions `< seq`, the
+/// attention for every query row, padding included), and attention reads no
+/// key at or past its sequence's length. `tests/embedgemma2_tiny.rs` runs the
+/// forward with every unzeroed allocation poisoned to NaN.
 struct Acts {
-    rows: u32,
+    rows: usize,
+    nb: usize,
     ids: GpuBuffer,
     lens: GpuBuffer,
     /// `[batch, 2]`: each sequence's live rows, `[b * seq, b * seq + len)`.
@@ -739,14 +750,23 @@ struct Acts {
     resid: Tensor,
     x: Tensor,
     qkv: Tensor,
-    q: GpuBuffer,
-    /// One K/V set per distinct `kv_heads * head_dim` among the layers.
-    kv: Vec<KvBufs>,
+    q: Tensor,
+    /// K and normed V, `[batch, capacity, kv_heads, head_dim]`, sized for
+    /// the widest layer. The K/V writer and [`encoder_attn`] both derive the
+    /// per-sequence capacity from the buffer's size
+    /// ([`crate::nn::attn_kv_capacity`]), so every layer and every forward
+    /// gets a consistent stride whatever its width and shape; it is at least
+    /// `seq`, and the positions past `seq` are never written or read.
+    k: Tensor,
+    v: Tensor,
+    /// The attention output; then, once the output projection has read it,
+    /// the MLP's `gelu_tanh(gate) * up` (sized for the wider of the two).
     attn: Tensor,
     y: Tensor,
-    gate: Tensor,
-    up: Tensor,
-    mid: Tensor,
+    /// The MLP's `gate | up`, `[rows, 2 * intermediate]`, from one GEMM.
+    gate_up: Tensor,
+    /// The normed per-layer inputs of a run of layers, `[rows, run * ple_dim]`
+    /// (see [`PLE_RUN_BYTES`]).
     ple: Tensor,
     ple_gate: Tensor,
     ple_mid: Tensor,
@@ -761,43 +781,30 @@ impl EmbedGemma2Model {
     /// error, and so is any tensor under `prefix` the forward does not read
     /// (with an empty prefix, any tensor in the file).
     pub fn load(rt: &Arc<GpuRuntime>, st: &SafeTensors, prefix: &str, cfg: EmbedGemma2Config) -> Result<Self, String> {
-        let ld = Loader {
-            st,
-            prefix,
-            rt,
-            read: RefCell::new(BTreeSet::new()),
-        };
-        let (h, ple, inter, vocab) = (cfg.hidden, cfg.ple_dim, cfg.intermediate, cfg.vocab);
-        let n_layers = cfg.layers.len() as u32;
+        let ld = Loader::new(rt, st, prefix);
+        let (h, ple, inter, vocab) = (
+            cfg.hidden as usize,
+            cfg.ple_dim as usize,
+            cfg.intermediate as usize,
+            cfg.vocab as usize,
+        );
+        let n_layers = cfg.layers.len();
+        let f32 = Precision::F32;
 
-        let embed = {
-            let bits = ld.bf16_bits("embed_tokens.weight", &[vocab as usize, h as usize])?;
-            let t = rt.alloc_tensor_bf16_hot(&[vocab as usize, h as usize])?;
-            t.buffer.write_bf16_bits(&bits);
-            t
-        };
-        let ple_w = ld.f32(
-            "ple.per_layer_model_projection.weight",
-            &[(n_layers * ple) as usize, h as usize],
-        )?;
+        // Read straight into the device table: no host copy.
+        let embed = rt.alloc_tensor_bf16_hot(&[vocab, h])?;
+        ld.bf16_into("embed_tokens.weight", &[vocab, h], &embed)?;
+        // Widened straight into the device tensor, in the checkpoint's layout.
+        let ple_w = rt.alloc_tensor_f32_hot(&[n_layers * ple, h])?;
+        ld.f32_into("ple.per_layer_model_projection.weight", &[n_layers * ple, h], &ple_w)?;
         let ple_norm = ld.norm("ple.per_layer_projection_norm.weight", ple)?;
         let final_norm = ld.norm("norm.weight", h)?;
-        let projection = ld.linear(&[("embedding_projection.weight", cfg.embedding_dim)], h)?;
+        let projection = ld.linear(&[("embedding_projection.weight", cfg.embedding_dim as usize)], h, f32)?;
 
-        let mut ones: Vec<(u32, GpuBuffer)> = Vec::new();
-        let mut layers = Vec::with_capacity(cfg.layers.len());
-        let slice = (ple * h) as usize;
+        let mut layers = Vec::with_capacity(n_layers);
         for (i, &spec) in cfg.layers.iter().enumerate() {
             let p = |s: &str| format!("layers.{i}.{s}");
-            let (d, q, kv) = (spec.head_dim, cfg.q_heads, spec.kv_heads);
-            let v_norm_ones = match ones.iter().find(|(od, _)| *od == d) {
-                Some((_, b)) => b.clone(),
-                None => {
-                    let b = ld.buf(&vec![1.0f32; d as usize])?;
-                    ones.push((d, b.clone()));
-                    b
-                }
-            };
+            let (d, q, kv) = (spec.head_dim as usize, cfg.q_heads as usize, spec.kv_heads as usize);
             layers.push(Layer {
                 spec,
                 input_norm: ld.norm(&p("input_layernorm.weight"), h)?,
@@ -811,17 +818,19 @@ impl EmbedGemma2Model {
                         (&p("self_attn.v_proj.weight"), kv * d),
                     ],
                     h,
+                    f32,
                 )?,
-                w_o: ld.linear(&[(&p("self_attn.o_proj.weight"), h)], q * d)?,
+                w_o: ld.linear(&[(&p("self_attn.o_proj.weight"), h)], q * d, f32)?,
                 q_norm: ld.norm(&p("self_attn.q_norm.weight"), d)?,
                 k_norm: ld.norm(&p("self_attn.k_norm.weight"), d)?,
-                v_norm_ones,
-                gate: ld.linear(&[(&p("mlp.gate_proj.weight"), inter)], h)?,
-                up: ld.linear(&[(&p("mlp.up_proj.weight"), inter)], h)?,
-                down: ld.linear(&[(&p("mlp.down_proj.weight"), h)], inter)?,
-                ple_in: ld.pack(&[&ple_w[i * slice..(i + 1) * slice]], vec![ple], h)?,
-                ple_gate: ld.linear(&[(&p("ple_block.per_layer_input_gate.weight"), ple)], h)?,
-                ple_out: ld.linear(&[(&p("ple_block.per_layer_projection.weight"), h)], ple)?,
+                gate_up: ld.linear(
+                    &[(&p("mlp.gate_proj.weight"), inter), (&p("mlp.up_proj.weight"), inter)],
+                    h,
+                    f32,
+                )?,
+                down: ld.linear(&[(&p("mlp.down_proj.weight"), h)], inter, f32)?,
+                ple_gate: ld.linear(&[(&p("ple_block.per_layer_input_gate.weight"), ple)], h, f32)?,
+                ple_out: ld.linear(&[(&p("ple_block.per_layer_projection.weight"), h)], ple, f32)?,
                 post_ple_norm: ld.norm(&p("ple_block.post_per_layer_input_norm.weight"), h)?,
                 layer_scalar: ld.scalar(&p("layer_scalar"))?,
             });
@@ -832,11 +841,13 @@ impl EmbedGemma2Model {
             cfg,
             rt: Arc::clone(rt),
             embed,
+            ple_w,
             ple_norm,
             final_norm,
             projection,
             layers,
             max_tokens: DEFAULT_MAX_TOKENS,
+            ple_run_bytes: PLE_RUN_BYTES,
         })
     }
 
@@ -857,6 +868,18 @@ impl EmbedGemma2Model {
             ));
         }
         self.max_tokens = max_tokens;
+        Ok(())
+    }
+
+    /// Bound the per-layer-input buffer (default [`PLE_RUN_BYTES`]): each
+    /// forward forms the per-layer inputs of as many layers per GEMM as fit
+    /// in it (at least one). Smaller saves memory at more GEMMs; the
+    /// embeddings agree to GEMM rounding whatever the size.
+    pub fn set_ple_run_bytes(&mut self, bytes: usize) -> Result<(), String> {
+        if bytes == 0 {
+            return Err("ple_run_bytes must be positive".into());
+        }
+        self.ple_run_bytes = bytes;
         Ok(())
     }
 
@@ -925,9 +948,16 @@ impl EmbedGemma2Model {
         let mut embeddings = vec![0.0f32; batch.len() * dim];
         let mut out_trace = Vec::new();
         let mut forwards = 0u32;
-        for chunk in pack_forwards(batch, MAX_BATCH_TOKENS) {
+        let chunks = pack_forwards(batch, MAX_BATCH_TOKENS);
+        // One set of activations for every forward: the most padded rows and
+        // the most sequences any of them has (a chunk is padded to its first,
+        // longest sequence).
+        let rows = chunks.iter().map(|c| c.len() * batch[c[0]].len()).max().unwrap_or(0);
+        let nb = chunks.iter().map(Vec::len).max().unwrap_or(0);
+        let acts = self.acts(nb, rows)?;
+        for chunk in chunks {
             let seqs: Vec<&[u32]> = chunk.iter().map(|&i| batch[i]).collect();
-            let (e, t) = self.forward(&seqs, dim_out, trace)?;
+            let (e, t) = self.forward(&acts, &seqs, dim_out, trace)?;
             for (n, &i) in chunk.iter().enumerate() {
                 embeddings[i * dim..(i + 1) * dim].copy_from_slice(&e[n * dim..(n + 1) * dim]);
             }
@@ -942,9 +972,16 @@ impl EmbedGemma2Model {
     }
 
     /// One forward over `batch` padded to its longest sequence (validated by
-    /// [`Self::encode`]; `batch.len() * longest <= MAX_BATCH_TOKENS`), returning
-    /// `[batch, dim_out]` embeddings.
-    fn forward(&self, batch: &[&[u32]], dim_out: u32, trace: bool) -> Result<(Vec<f32>, Vec<Vec<f32>>), String> {
+    /// [`Self::encode`]; `batch.len() * longest <= MAX_BATCH_TOKENS`) in `a`,
+    /// returning `[batch, dim_out]` embeddings.
+    fn forward(
+        &self,
+        a: &Acts,
+        batch: &[&[u32]],
+        dim_out: u32,
+        trace: bool,
+    ) -> Result<(Vec<f32>, Vec<Vec<f32>>), String> {
+        const WHAT: &str = "EmbedGemma2Model::forward";
         let rt = &self.rt;
         let cfg = &self.cfg;
         let seq = batch.iter().map(|ids| ids.len() as u32).max().unwrap_or(0);
@@ -952,27 +989,46 @@ impl EmbedGemma2Model {
         let rows = nb as usize * seq as usize;
         if seq == 0 || rows > MAX_BATCH_TOKENS {
             return Err(format!(
-                "EmbedGemma2Model::forward: {nb} sequences padded to {seq} tokens is {rows} rows; need 1..={MAX_BATCH_TOKENS}"
+                "{WHAT}: {nb} sequences padded to {seq} tokens is {rows} rows; need 1..={MAX_BATCH_TOKENS}"
             ));
         }
-        let a = self.acts(nb, seq)?;
+        if rows > a.rows || batch.len() > a.nb {
+            return Err(format!(
+                "{WHAT}: {rows} rows of {nb} sequences exceed the activations' {} rows of {}",
+                a.rows, a.nb
+            ));
+        }
+        // The host buffers are rewritten in prefix; the previous forward
+        // waited for the GPU before reading its embeddings back.
         let mut padded = vec![0u32; rows];
         for (b, ids) in batch.iter().enumerate() {
             padded[b * seq as usize..b * seq as usize + ids.len()].copy_from_slice(ids);
         }
-        a.ids.write_u32(&padded);
-        a.lens
-            .write_u32(&batch.iter().map(|ids| ids.len() as u32).collect::<Vec<_>>());
+        a.ids.try_contents_u32()?[..rows].copy_from_slice(&padded);
+        let lens: Vec<u32> = batch.iter().map(|ids| ids.len() as u32).collect();
+        a.lens.try_contents_u32()?[..lens.len()].copy_from_slice(&lens);
         let segs: Vec<u32> = batch
             .iter()
             .enumerate()
             .flat_map(|(b, ids)| [b as u32 * seq, b as u32 * seq + ids.len() as u32])
             .collect();
-        a.segments.write_u32(&segs);
+        a.segments.try_contents_u32()?[..segs.len()].copy_from_slice(&segs);
 
-        let (h, rows_u) = (cfg.hidden, a.rows);
+        let (h, rows_u) = (cfg.hidden, rows as u32);
         let eps = cfg.rms_norm_eps;
-        qwen35::embed_rows(
+        let at = |t: &Tensor, cols: u32| view(t, rows_u, cols);
+        let (embeds, resid, x, y) = (at(&a.embeds, h)?, at(&a.resid, h)?, at(&a.x, h)?, at(&a.y, h)?);
+        let inter = cfg.intermediate;
+        let (gate_up, mid) = (at(&a.gate_up, 2 * inter)?, at(&a.attn, inter)?);
+        let (ple_gate, ple_mid) = (at(&a.ple_gate, cfg.ple_dim)?, at(&a.ple_mid, cfg.ple_dim)?);
+        let (n_layers, pd) = (self.layers.len(), cfg.ple_dim as usize);
+        // Layers whose per-layer inputs one GEMM forms: as many as `a.ple`
+        // holds at this forward's rows.
+        let run = (a.ple.numel() / (rows * pd)).clamp(1, n_layers);
+        let mut ple_ld = 0u32;
+        // transformers multiplies by `embed_scale.to(weight.dtype)`: sqrt(512)
+        // as an f32 in the fp32 forward this mirrors, here inside the gather.
+        qwen35::embed_rows_scaled(
             rt,
             &a.ids,
             rows_u,
@@ -982,31 +1038,20 @@ impl EmbedGemma2Model {
                 vocab: cfg.vocab,
             },
             h,
-            &a.embeds.buffer,
+            (h as f32).sqrt(),
+            &embeds.buffer,
         )?;
-        // transformers multiplies by `embed_scale.to(weight.dtype)`: sqrt(512)
-        // as an f32 in the fp32 forward this mirrors.
-        scale_f32_inplace(rt, &a.embeds.buffer, (h as f32).sqrt(), rows_u * h)?;
-        gpu_copy(&a.embeds, &a.resid)?;
+        gpu_copy(&embeds, &resid)?;
 
         let mut out_trace = Vec::new();
         let ple_scale = (h as f32).powf(-0.5);
-        for layer in &self.layers {
+        for (i, layer) in self.layers.iter().enumerate() {
             let s = layer.spec;
             // Attention.
-            rms_norm_f32(rt, &a.resid.buffer, &layer.input_norm, &a.x.buffer, rows_u, h, eps)?;
+            rms_norm_f32(rt, &resid.buffer, &layer.input_norm, &x.buffer, rows_u, h, eps)?;
             let qkv_width = (cfg.q_heads + 2 * s.kv_heads) * s.head_dim;
-            let qkv = view(&a.qkv, rows_u, qkv_width)?;
-            let kv =
-                a.kv.iter()
-                    .find(|b| b.width == s.kv_heads * s.head_dim)
-                    .ok_or_else(|| {
-                        format!(
-                            "EmbedGemma2Model::forward: no K/V buffers of width {}",
-                            s.kv_heads * s.head_dim
-                        )
-                    })?;
-            gemm(&a.x, &layer.w_qkv, &qkv, BACKEND)?;
+            let qkv = at(&a.qkv, qkv_width)?;
+            gemm(&x, &layer.w_qkv, &qkv, BACKEND)?;
             qwen35::attn_qk_norm_rope_columns(
                 rt,
                 &AttnShape {
@@ -1022,33 +1067,25 @@ impl EmbedGemma2Model {
                     q_head_stride: s.head_dim,
                     k_col: cfg.q_heads * s.head_dim,
                     v_col: (cfg.q_heads + s.kv_heads) * s.head_dim,
+                    v_norm: true,
                 },
                 0.0,
                 &layer.q_norm,
                 &layer.k_norm,
                 &AttnTargets {
-                    q_out: &a.q,
-                    k_cache: &kv.k,
-                    v_cache: &kv.v,
+                    q_out: &a.q.buffer,
+                    k_cache: &a.k.buffer,
+                    v_cache: &a.v.buffer,
                 },
                 0,
                 s.rope_theta,
                 eps,
             )?;
-            rms_norm_f32(
-                rt,
-                &kv.v,
-                &layer.v_norm_ones,
-                &kv.v_normed,
-                rows_u * s.kv_heads,
-                s.head_dim,
-                eps,
-            )?;
             encoder_attn(
                 rt,
-                &a.q,
-                &kv.k,
-                &kv.v_normed,
+                &a.q.buffer,
+                &a.k.buffer,
+                &a.v.buffer,
                 &a.attn.buffer,
                 &a.lens,
                 EncoderAttnDims {
@@ -1062,68 +1099,77 @@ impl EmbedGemma2Model {
                 },
                 false,
             )?;
-            let attn = view(&a.attn, rows_u, cfg.q_heads * s.head_dim)?;
-            gemm(&attn, &layer.w_o, &a.y, BACKEND)?;
-            rms_norm_residual_add_f32(
-                rt,
-                &a.y.buffer,
-                &layer.post_attn_norm,
-                &a.resid.buffer,
-                rows_u,
-                h,
-                eps,
-                1.0,
-            )?;
+            let attn = at(&a.attn, cfg.q_heads * s.head_dim)?;
+            gemm(&attn, &layer.w_o, &y, BACKEND)?;
+            rms_norm_residual_add_f32(rt, &y.buffer, &layer.post_attn_norm, &resid.buffer, rows_u, h, eps, 1.0)?;
 
             // MLP.
-            rms_norm_f32(rt, &a.resid.buffer, &layer.pre_ffn_norm, &a.x.buffer, rows_u, h, eps)?;
-            gemm(&a.x, &layer.gate, &a.gate, BACKEND)?;
-            gemm(&a.x, &layer.up, &a.up, BACKEND)?;
-            mlp_gelu_tanh(
+            rms_norm_f32(rt, &resid.buffer, &layer.pre_ffn_norm, &x.buffer, rows_u, h, eps)?;
+            gemm(&x, &layer.gate_up, &gate_up, BACKEND)?;
+            let window = |off: u32| Cols {
+                buf: &gate_up.buffer,
+                ld: 2 * inter,
+                off,
+            };
+            qwen35::gated_act(
                 rt,
-                &a.gate.buffer,
-                &a.up.buffer,
-                &a.mid.buffer,
-                rows_u * cfg.intermediate,
-            )?;
-            gemm(&a.mid, &layer.down, &a.y, BACKEND)?;
-            rms_norm_residual_add_f32(
-                rt,
-                &a.y.buffer,
-                &layer.post_ffn_norm,
-                &a.resid.buffer,
+                GatedAct::GeluTanh,
+                window(0),
+                window(inter),
+                OutCols {
+                    cols: Cols::dense(&mid.buffer, inter),
+                    dtype: DType::F32,
+                },
                 rows_u,
-                h,
-                eps,
-                1.0,
+                inter,
             )?;
+            gemm(&mid, &layer.down, &y, BACKEND)?;
+            rms_norm_residual_add_f32(rt, &y.buffer, &layer.post_ffn_norm, &resid.buffer, rows_u, h, eps, 1.0)?;
 
-            // Per-layer input, then its block and the layer scalar.
-            gemm(&a.embeds, &layer.ple_in, &a.ple, BACKEND)?;
-            scale_f32_inplace(rt, &a.ple.buffer, ple_scale, rows_u * cfg.ple_dim)?;
-            rms_norm_f32(
+            // Per-layer input: at the first layer of each run, one GEMM over
+            // the embeddings for the whole run, `rms_norm(embeds @ Wpleᵀ *
+            // hidden^-0.5) * ple_norm.w` in place; then this layer's block
+            // reads its column window.
+            if i % run == 0 {
+                let k = run.min(n_layers - i);
+                ple_ld = (k * pd) as u32;
+                let w = self.ple_w.try_view(&[k * pd, h as usize], i * pd * h as usize)?;
+                let out = at(&a.ple, ple_ld)?;
+                gemm_nt_f32(&embeds, &w, &out, BACKEND)?;
+                scale_f32_inplace(rt, &out.buffer, ple_scale, rows_u * ple_ld)?;
+                rms_norm_f32(
+                    rt,
+                    &out.buffer,
+                    &self.ple_norm,
+                    &out.buffer,
+                    rows_u * k as u32,
+                    cfg.ple_dim,
+                    eps,
+                )?;
+            }
+            gemm(&resid, &layer.ple_gate, &ple_gate, BACKEND)?;
+            qwen35::gated_act(
                 rt,
-                &a.ple.buffer,
-                &self.ple_norm,
-                &a.ple_mid.buffer,
+                GatedAct::GeluTanh,
+                Cols::dense(&ple_gate.buffer, cfg.ple_dim),
+                Cols {
+                    buf: &a.ple.buffer,
+                    ld: ple_ld,
+                    off: ((i % run) * pd) as u32,
+                },
+                OutCols {
+                    cols: Cols::dense(&ple_mid.buffer, cfg.ple_dim),
+                    dtype: DType::F32,
+                },
                 rows_u,
                 cfg.ple_dim,
-                eps,
             )?;
-            gemm(&a.resid, &layer.ple_gate, &a.ple_gate, BACKEND)?;
-            mlp_gelu_tanh(
-                rt,
-                &a.ple_gate.buffer,
-                &a.ple_mid.buffer,
-                &a.ple.buffer,
-                rows_u * cfg.ple_dim,
-            )?;
-            gemm(&a.ple, &layer.ple_out, &a.y, BACKEND)?;
+            gemm(&ple_mid, &layer.ple_out, &y, BACKEND)?;
             rms_norm_residual_add_f32(
                 rt,
-                &a.y.buffer,
+                &y.buffer,
                 &layer.post_ple_norm,
-                &a.resid.buffer,
+                &resid.buffer,
                 rows_u,
                 h,
                 eps,
@@ -1131,21 +1177,22 @@ impl EmbedGemma2Model {
             )?;
             if trace {
                 rt.synchronize()?;
-                out_trace.push(a.resid.buffer.read_f32()[..rows_u as usize * h as usize].to_vec());
+                out_trace.push(resid.buffer.read_f32()[..rows * h as usize].to_vec());
             }
         }
 
-        rms_norm_f32(rt, &a.resid.buffer, &self.final_norm, &a.x.buffer, rows_u, h, eps)?;
-        segment_mean_rows(rt, &a.x.buffer, &a.segments, &a.pooled.buffer, nb, rows_u, h)?;
-        gemm(&a.pooled, &self.projection, &a.out, BACKEND)?;
+        let (pooled, out) = (view(&a.pooled, nb, h)?, view(&a.out, nb, cfg.embedding_dim)?);
+        rms_norm_f32(rt, &resid.buffer, &self.final_norm, &x.buffer, rows_u, h, eps)?;
+        segment_mean_rows(rt, &x.buffer, &a.segments, &pooled.buffer, nb, rows_u, h)?;
+        gemm(&pooled, &self.projection, &out, BACKEND)?;
         // A Matryoshka prefix normalizes its own columns; the rest are not read.
-        l2_normalize_rows(rt, &a.out.buffer, nb, dim_out, cfg.embedding_dim)?;
+        l2_normalize_rows(rt, &out.buffer, nb, dim_out, cfg.embedding_dim)?;
         rt.synchronize()?;
         if trace {
-            out_trace.push(a.x.buffer.read_f32()[..rows_u as usize * h as usize].to_vec());
+            out_trace.push(x.buffer.read_f32()[..rows * h as usize].to_vec());
         }
         let (full, dim) = (cfg.embedding_dim as usize, dim_out as usize);
-        let out = a.out.buffer.read_f32();
+        let out = out.buffer.read_f32();
         let rows = out[..nb as usize * full]
             .chunks_exact(full)
             .flat_map(|row| &row[..dim])
@@ -1154,59 +1201,48 @@ impl EmbedGemma2Model {
         Ok((rows, out_trace))
     }
 
-    fn acts(&self, nb: u32, seq: u32) -> Result<Acts, String> {
+    /// [`Acts`] for forwards of up to `rows` padded rows over up to `nb`
+    /// sequences.
+    fn acts(&self, nb: usize, rows: usize) -> Result<Acts, String> {
         let rt = &self.rt;
         let cfg = &self.cfg;
-        let rows = nb * seq;
-        let r = rows as usize;
+        let r = rows.max(1);
+        let nb = nb.max(1);
         let (h, ple, inter) = (cfg.hidden as usize, cfg.ple_dim as usize, cfg.intermediate as usize);
-        // Widest attention layer: the q|k|v row and the query/output buffers,
-        // which layers read through a prefix view. K/V get exact-size buffers
-        // per width instead (see `KvBufs`).
-        let (mut qkv_w, mut q_w) = (0usize, 0usize);
-        let mut kv_widths: Vec<u32> = Vec::new();
+        // Widest attention layer: the q|k|v row, the query/output buffers and
+        // K/V, which narrower layers read through a prefix.
+        let (mut qkv_w, mut q_w, mut kv_w) = (0usize, 0usize, 0usize);
         for s in &cfg.layers {
             let (q, kv, d) = (cfg.q_heads as usize, s.kv_heads as usize, s.head_dim as usize);
             qkv_w = qkv_w.max((q + 2 * kv) * d);
             q_w = q_w.max(q * d);
-            if !kv_widths.contains(&(s.kv_heads * s.head_dim)) {
-                kv_widths.push(s.kv_heads * s.head_dim);
-            }
+            kv_w = kv_w.max(kv * d);
         }
-        let f32s = |n: usize| rt.alloc_buffer(n.max(1) * 4);
-        let kv = kv_widths
-            .into_iter()
-            .map(|width| {
-                let n = r * width as usize;
-                Ok(KvBufs {
-                    width,
-                    k: f32s(n)?,
-                    v: f32s(n)?,
-                    v_normed: f32s(n)?,
-                })
-            })
-            .collect::<Result<Vec<_>, String>>()?;
+        let f32s = |shape: &[usize]| rt.alloc_tensor_unzeroed(shape, DType::F32);
+        let u32s = |n: usize| rt.alloc_buffer(n * 4);
         Ok(Acts {
-            rows,
-            ids: rt.alloc_buffer(r.max(1) * 4)?,
-            lens: rt.alloc_buffer(nb.max(1) as usize * 4)?,
-            segments: rt.alloc_buffer(nb.max(1) as usize * 8)?,
-            embeds: rt.alloc_tensor_f32(&[r, h])?,
-            resid: rt.alloc_tensor_f32(&[r, h])?,
-            x: rt.alloc_tensor_f32(&[r, h])?,
-            qkv: rt.alloc_tensor_f32(&[r, qkv_w])?,
-            q: f32s(r * q_w)?,
-            kv,
-            attn: rt.alloc_tensor_f32(&[r, q_w])?,
-            y: rt.alloc_tensor_f32(&[r, h])?,
-            gate: rt.alloc_tensor_f32(&[r, inter])?,
-            up: rt.alloc_tensor_f32(&[r, inter])?,
-            mid: rt.alloc_tensor_f32(&[r, inter])?,
-            ple: rt.alloc_tensor_f32(&[r, ple])?,
-            ple_gate: rt.alloc_tensor_f32(&[r, ple])?,
-            ple_mid: rt.alloc_tensor_f32(&[r, ple])?,
-            pooled: rt.alloc_tensor_f32(&[nb as usize, h])?,
-            out: rt.alloc_tensor_f32(&[nb as usize, cfg.embedding_dim as usize])?,
+            rows: r,
+            nb,
+            ids: u32s(r)?,
+            lens: u32s(nb)?,
+            segments: u32s(2 * nb)?,
+            embeds: f32s(&[r, h])?,
+            resid: f32s(&[r, h])?,
+            x: f32s(&[r, h])?,
+            qkv: f32s(&[r, qkv_w])?,
+            q: f32s(&[r, q_w])?,
+            k: f32s(&[r, kv_w])?,
+            v: f32s(&[r, kv_w])?,
+            attn: f32s(&[r, q_w.max(inter)])?,
+            y: f32s(&[r, h])?,
+            gate_up: f32s(&[r, 2 * inter])?,
+            // A run of per-layer inputs: within `ple_run_bytes`, or one layer's
+            // when even that is larger, and never more than every layer's.
+            ple: f32s(&[(self.ple_run_bytes / 4).max(r * ple).min(r * ple * cfg.layers.len())])?,
+            ple_gate: f32s(&[r, ple])?,
+            ple_mid: f32s(&[r, ple])?,
+            pooled: f32s(&[nb, h])?,
+            out: f32s(&[nb, cfg.embedding_dim as usize])?,
         })
     }
 }
@@ -1219,7 +1255,22 @@ fn view(t: &Tensor, rows: u32, cols: u32) -> Result<Tensor, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{pack_forwards, MAX_BATCH};
+    use super::{encoder_attn_tiled_entry, pack_forwards, MAX_BATCH};
+
+    /// Each tiled entry's name spells the geometry the host builds its grid
+    /// from (`_q{BQ}_k{BK}_sg{NSG}`), and the source instantiates it with
+    /// those numbers: the rule `tools/msl_emu/check_qwen35.py` holds the
+    /// Qwen3.5 instantiations to.
+    #[test]
+    fn tiled_entries_spell_their_geometry() {
+        let src = include_str!("../kernels/encoder_attn.metal");
+        for d in [256u32, 512] {
+            let (entry, bq, sg) = encoder_attn_tiled_entry(d).unwrap();
+            assert!(entry.ends_with(&format!("_h{d}_q{bq}_k32_sg{sg}")), "{entry}");
+            let inst = format!("ENCODER_TILED_KERNEL({entry}, {d}, {bq}, 32, {sg})");
+            assert!(src.contains(&inst), "missing {inst}");
+        }
+    }
 
     /// Every index exactly once; each forward within the row budget and the
     /// sequence cap; each forward padded to its first (longest) sequence.

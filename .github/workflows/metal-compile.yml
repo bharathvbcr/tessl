@@ -105,6 +105,8 @@ jobs:
                     qwen35_attn_bwd_dq_h256_q32_k32_sg4 qwen35_attn_bwd_dk_h256_q32_k32_sg4 \
                     qwen35_attn_bwd_dv_h256_q32_k32_sg4 qwen35_gdn_gates_f32 qwen35_gdn_gates_bwd_f32 \
                     qwen35_copy_cols_f32 qwen35_scatter_add_rows_f32 qwen35_adamw_f32 qwen35_sq_sum_rows_f32 \
+                    qwen35_gelu_tanh_glu_f32 qwen35_gelu_tanh_glu_bf16 qwen35_embed_rows_bf16_scaled \
+                    encoder_attn_tiled_h256_q32_k32_sg4 encoder_attn_tiled_h512_q32_k32_sg8 \
                     encoder_attn_rows_h256_r16_g32 encoder_attn_rows_h512_r32_g32 segment_mean_rows_f32 l2_normalize_rows_f32; do
             if grep -qx "$fn" "$RUNNER_TEMP/symbols.txt"; then
               echo "exported: $fn"

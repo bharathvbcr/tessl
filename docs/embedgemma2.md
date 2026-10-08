@@ -48,28 +48,47 @@ forwards ran. The per-forward cost (256 rows) is an estimate that only steers
 the split: a sequence's embedding does not depend on its batch beyond GEMM
 tiling, which the model test bounds at `1e-5`.
 
-Layers whose `kv_heads * head_dim` differ get separate, exactly sized K/V
-buffers. The K/V writer derives its per-sequence stride from the buffer's
-size, while the attention and the value norm read at stride `seq`, so a
-shared buffer sized for the widest layer misplaces every sequence after the
-first in the narrower layers. The checkpoint's layers all have width 512, so
-it never showed this; `tests/embedgemma2_tiny.rs` mixes 512 and 256.
+The activations are allocated once per `encode`, for its largest forward,
+and every forward works on a prefix of them. None is zeroed on the host:
+every element a forward reads, an earlier kernel of that forward wrote, which
+`tests/embedgemma2_tiny.rs` checks by poisoning every unzeroed allocation with
+NaN (and by asserting an encode zeroes no host bytes and allocates the same
+whether it runs one forward or two).
+
+One K/V pair, sized for the widest layer, serves every layer and forward. The
+K/V writer and the attention both derive the per-sequence capacity from the
+buffers' size, so they agree on the stride whatever the layer's width or the
+forward's shape. When the attention read at stride `seq` instead, a buffer
+holding more positions than `seq` (a narrower layer's, or now a smaller
+forward's) misplaced every sequence after the first: sequence 1 of a batch
+came out at cosine `0.27`. `tests/embedgemma2_tiny.rs` mixes K/V widths 512
+and 256 and runs a 30-token forward in buffers sized for a 4000-token one.
 
 ## Kernels
 
 | Kernel | File | New? |
 |---|---|---|
-| `encoder_attn_rows_h256_r16_g32`, `encoder_attn_rows_h512_r32_g32` | `kernels/encoder_attn.metal` | new: bidirectional rows attention, symmetric window, per-row lengths, scale as a parameter |
+| `encoder_attn_tiled_h256_q32_k32_sg4`, `encoder_attn_tiled_h512_q32_k32_sg8` | `kernels/encoder_attn.metal` over `kernels/attn_tiled.h` | new: bidirectional attention with a symmetric window and per-row lengths on the TensorOps matrix units, the FlashAttention-2 body Qwen3.5's prefill uses (`ENCODER` mode). What `encoder_attn` runs on a device with TensorOps |
+| `encoder_attn_rows_h{256,512,32,64}_*` | `kernels/encoder_attn.metal` over `kernels/attn_rows.h` | new: the same contract, one simdgroup per query row, scalar f32. Head dims 32/64 (BERT), and 256/512 on a device without TensorOps. `encoder_attn_with` names either kernel; every attention test runs on both |
 | `segment_mean_rows_f32`, `l2_normalize_rows_f32` | `kernels/embed_pool.metal` | new: row-range means (the pool here, the option pool in rsi-jev) and the (Matryoshka-prefix) normalize |
-| q/k norm + full RoPE + K/V store | `qwen35_attn_qk_norm_rope` via `qwen35::attn_qk_norm_rope_columns` | reused; the host entry is new (separate K and V column blocks). The frequencies are the host table `nn::rope_inv_freq` (torch's formula), not a device `pow` |
-| RMSNorm, post-norm residual add with layer scale, GELU-tanh gate, scale | `nn::rms_norm_f32`, `nn::rms_norm_residual_add_f32`, `nn::mlp_gelu_tanh`, `nn::scale_f32_inplace` | reused |
-| embedding gather (bf16 table) | `qwen35_embed_rows_bf16` | reused |
-| GEMM | exact f32, TensorOps | reused |
+| q/k norm + full RoPE + K/V store, with the weightless V norm | `qwen35_attn_qk_norm_rope` via `qwen35::attn_qk_norm_rope_columns` (`QkvColumns::v_norm`) | reused; the host entry is new (separate K and V column blocks), and so is the V norm inside it. The frequencies are the host table `nn::rope_inv_freq` (torch's formula), not a device `pow` |
+| embedding gather times `sqrt(hidden)` (bf16 table) | `qwen35_embed_rows_bf16_scaled` via `qwen35::embed_rows_scaled` | new: the gather and the scale in one pass |
+| GELU-tanh gate over column windows (`gate \| up` from one GEMM; each layer's slice of the per-layer inputs) | `qwen35_gelu_tanh_glu_f32` via `qwen35::gated_act` | new: `qwen35_swiglu`'s kernel with the activation as a parameter |
+| RMSNorm, post-norm residual add with layer scale, scale | `nn::rms_norm_f32`, `nn::rms_norm_residual_add_f32`, `nn::scale_f32_inplace` | reused |
+| GEMM | exact f32, TensorOps (NN, and NT for the per-layer-input projection) | reused |
 
-The encoder attention is its own kernel rather than a mode of
+The rows encoder attention is its own kernel rather than a mode of
 `flash_attn_rows`: there the causal rule is the loop bound (keys above the
 query are never visited) and the live length is one device scalar for every
-row, and that body is the tuned prefill path of gemma-metal and Qwen3.5.
+row, and that body is the tuned prefill path of gemma-metal and Qwen3.5. The
+per-key work (the dot, the online-softmax step, the store) is shared code,
+`kernels/attn_rows.h`.
+
+The per-layer inputs do not depend on the layer, so one NT GEMM forms a run
+of layers' at once, straight from the checkpoint's `[24 * 512, 512]`
+projection, followed by one scale and one in-place norm; each layer's gate
+reads its column window. A run is as many layers as fit in `PLE_RUN_BYTES`
+(256 MiB): all 24 up to 5461 rows, 6 runs of 4 at 32,768 rows.
 
 ## Bounds and observed errors
 

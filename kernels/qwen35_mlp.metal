@@ -12,15 +12,18 @@
 // Qwen3.5 kernel's inputs, so a single GEMM that writes `[gate | up]` side by
 // side can feed this in place.
 #include <metal_stdlib>
+#include "gelu.h"
 #include "qwen35_act.h"
 #include "reduce_tree.h"
 using namespace metal;
 
-/// `out[r, out_off + c] = silu(gate[r, gate_off + c]) * up[r, up_off + c]`
-/// for `c < width`, `r < rows`; rows are `ld_*` elements apart.
+/// `out[r, out_off + c] = ACT(gate[r, gate_off + c]) * up[r, up_off + c]`
+/// for `c < width`, `r < rows`; rows are `ld_*` elements apart. `ACT` is SiLU
+/// (`qwen35_swiglu_*`, Qwen3.5) or GELU-tanh (`qwen35_gelu_tanh_glu_*`,
+/// EmbeddingGemma 2: the same `tessl_gelu_pytorch_tanh` as `mlp_gelu_tanh`).
 ///
 /// Grid: x = column in [0, width), y = row in [0, rows).
-#define SWIGLU_KERNEL(NAME, OUT_T)                                                \
+#define GATED_KERNEL(NAME, OUT_T, ACT)                                            \
 kernel void NAME(                                                                 \
     device const float *gate [[buffer(0)]],                                       \
     device const float *up [[buffer(1)]],                                         \
@@ -40,11 +43,13 @@ kernel void NAME(                                                               
     if (col >= width || r >= rows) return;                                        \
     const float g = gate[(ulong)r * ld_gate + gate_off + col];                    \
     const float u = up[(ulong)r * ld_up + up_off + col];                          \
-    out[(ulong)r * ld_out + out_off + col] = (OUT_T)(qwen35_silu(g) * u);    \
+    out[(ulong)r * ld_out + out_off + col] = (OUT_T)(ACT(g) * u);             \
 }
 
-SWIGLU_KERNEL(qwen35_swiglu_f32, float)
-SWIGLU_KERNEL(qwen35_swiglu_bf16, bfloat)
+GATED_KERNEL(qwen35_swiglu_f32, float, qwen35_silu)
+GATED_KERNEL(qwen35_swiglu_bf16, bfloat, qwen35_silu)
+GATED_KERNEL(qwen35_gelu_tanh_glu_f32, float, tessl_gelu_pytorch_tanh)
+GATED_KERNEL(qwen35_gelu_tanh_glu_bf16, bfloat, tessl_gelu_pytorch_tanh)
 
 /// `resid[r, resid_off + c] += y[r, y_off + c]` for `c < width`, `r < rows`:
 /// the residual add after a projection, for the exact-f32 forward. (The bf16

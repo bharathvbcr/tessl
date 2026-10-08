@@ -174,6 +174,7 @@ inline float cos(float x) { return std::cos(x); }
 inline float sin(float x) { return std::sin(x); }
 inline float exp(float x) { return std::exp(x); }
 inline float log(float x) { return std::log(x); }
+inline float tanh(float x) { return std::tanh(x); }
 inline float sqrt(float x) { return std::sqrt(x); }
 // Correctly rounded, as Metal's precise::rsqrt: the reciprocal formed in double.
 inline float rsqrt(float x) { return float(1.0 / std::sqrt(double(x))); }

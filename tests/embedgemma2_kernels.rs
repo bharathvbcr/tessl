@@ -25,7 +25,8 @@ use std::sync::Arc;
 use common::embedgemma2::{attn_ref, gelu_tanh, l2_normalize, lin, pool_reference, rms, rope, Attn};
 use common::{tensor_f32, with_gpu, SplitMix};
 use tessl::embedgemma2::{
-    encoder_attn, l2_normalize_rows, segment_mean_rows, upload_segments, EmbedGemma2Config, EncoderAttnDims,
+    encoder_attn, encoder_attn_with, l2_normalize_rows, segment_mean_rows, upload_segments, EmbedGemma2Config,
+    EncoderAttnDims, EncoderAttnKernel,
 };
 use tessl::gemm::{gemm, GemmBackend};
 use tessl::nn::{self, mlp_gelu_tanh, rms_norm_f32, rms_norm_residual_add_f32, scale_f32_inplace};
@@ -249,13 +250,24 @@ fn pool_reference_matches_transformers() {
 // 2. The kernels
 // ---------------------------------------------------------------------------
 
-fn run_attn(rt: &Arc<GpuRuntime>, a: &Attn, q: &[f32], k: &[f32], v: &[f32], lens: &[u32]) -> Vec<f64> {
+/// Both kernels hold the same contract; every attention test runs on each.
+const KERNELS: [EncoderAttnKernel; 2] = [EncoderAttnKernel::Rows, EncoderAttnKernel::Tiled];
+
+fn run_attn(
+    rt: &Arc<GpuRuntime>,
+    kernel: EncoderAttnKernel,
+    a: &Attn,
+    q: &[f32],
+    k: &[f32],
+    v: &[f32],
+    lens: &[u32],
+) -> Vec<f64> {
     let (qb, kb, vb) = (buf_f32(rt, q), buf_f32(rt, k), buf_f32(rt, v));
     let o = rt.alloc_buffer(q.len().max(1) * 4).unwrap();
     // Poison the output so an unwritten element cannot pass as zero.
     o.write_f32(&vec![f32::NAN; q.len()]);
     let lb = buf_u32(rt, lens);
-    encoder_attn(
+    encoder_attn_with(
         rt,
         &qb,
         &kb,
@@ -272,8 +284,9 @@ fn run_attn(rt: &Arc<GpuRuntime>, a: &Attn, q: &[f32], k: &[f32], v: &[f32], len
             scale: 1.0,
         },
         false,
+        kernel,
     )
-    .unwrap();
+    .unwrap_or_else(|e| panic!("{kernel:?}: {e}"));
     rt.synchronize().unwrap();
     o.read_f32()[..q.len()].iter().map(|&x| f64::from(x)).collect()
 }
@@ -295,12 +308,15 @@ fn padding_is_zero(what: &str, a: &Attn, got: &[f64]) {
 #[test]
 fn encoder_attn_matches_the_fixtures() {
     with_gpu(|rt| {
-        for name in ["swa", "global", "swa_tiny"] {
-            let (a, q, k, v, want) = attn_fixture(name);
-            let lens: Vec<u32> = a.lens.iter().map(|&l| l as u32).collect();
-            let got = run_attn(rt, &a, &f32s(&q), &f32s(&k), &f32s(&v), &lens);
-            assert_close(name, &got, &want, &valid_rows(&a), KERNEL_REL);
-            padding_is_zero(name, &a, &got);
+        for kernel in KERNELS {
+            for name in ["swa", "global", "swa_tiny"] {
+                let (a, q, k, v, want) = attn_fixture(name);
+                let lens: Vec<u32> = a.lens.iter().map(|&l| l as u32).collect();
+                let got = run_attn(rt, kernel, &a, &f32s(&q), &f32s(&k), &f32s(&v), &lens);
+                let what = format!("{kernel:?} {name}");
+                assert_close(&what, &got, &want, &valid_rows(&a), KERNEL_REL);
+                padding_is_zero(&what, &a, &got);
+            }
         }
     });
 }
@@ -331,12 +347,12 @@ fn probe_rows(t: usize, window: usize) -> Vec<usize> {
     rows
 }
 
-fn check_random(rt: &Arc<GpuRuntime>, a: &Attn, seed: u64) {
+fn check_random(rt: &Arc<GpuRuntime>, kernel: EncoderAttnKernel, a: &Attn, seed: u64) {
     let q = random(a.b * a.t * a.h * a.d, seed, 0.25);
     let k = random(a.b * a.t * a.hkv * a.d, seed + 1, 0.25);
     let v = random(a.b * a.t * a.hkv * a.d, seed + 2, 1.0);
     let lens: Vec<u32> = a.lens.iter().map(|&l| l as u32).collect();
-    let got = run_attn(rt, a, &f32s(&q), &f32s(&k), &f32s(&v), &lens);
+    let got = run_attn(rt, kernel, a, &f32s(&q), &f32s(&k), &f32s(&v), &lens);
     let rows = probe_rows(a.t, a.window);
     let want = attn_ref(a, &q, &k, &v, Some(&rows));
     let mut idx = Vec::new();
@@ -349,7 +365,7 @@ fn check_random(rt: &Arc<GpuRuntime>, a: &Attn, seed: u64) {
         }
     }
     assert_close(
-        &format!("random D={} window={} lens={:?}", a.d, a.window, a.lens),
+        &format!("{kernel:?} random D={} window={} lens={:?}", a.d, a.window, a.lens),
         &got,
         &want,
         &idx,
@@ -361,111 +377,124 @@ fn check_random(rt: &Arc<GpuRuntime>, a: &Attn, seed: u64) {
 #[test]
 fn encoder_attn_matches_the_reference_at_the_real_window() {
     with_gpu(|rt| {
-        // Sliding layers: D=256, 4 query heads over 2 KV heads, window 512,
-        // one sequence longer than the window on both sides, ragged others.
-        check_random(
-            rt,
-            &Attn {
-                b: 4,
-                t: 1100,
-                h: 4,
-                hkv: 2,
-                d: 256,
-                window: 512,
-                lens: vec![1100, 513, 1, 600],
-            },
-            11,
-        );
-        // Full layers: D=512, MQA, every key.
-        check_random(
-            rt,
-            &Attn {
-                b: 2,
-                t: 700,
-                h: 4,
-                hkv: 1,
-                d: 512,
-                window: 0,
-                lens: vec![700, 1],
-            },
-            12,
-        );
-        // A window wider than every sequence is the global rule.
-        check_random(
-            rt,
-            &Attn {
-                b: 2,
-                t: 90,
-                h: 4,
-                hkv: 2,
-                d: 256,
-                window: 512,
-                lens: vec![90, 37],
-            },
-            13,
-        );
-        // The narrowest window: each query sees itself and one neighbour each side.
-        check_random(
-            rt,
-            &Attn {
-                b: 1,
-                t: 70,
-                h: 2,
-                hkv: 1,
-                d: 256,
-                window: 1,
-                lens: vec![70],
-            },
-            14,
-        );
+        for kernel in KERNELS {
+            // Sliding layers: D=256, 4 query heads over 2 KV heads, window 512,
+            // one sequence longer than the window on both sides, ragged others.
+            check_random(
+                rt,
+                kernel,
+                &Attn {
+                    b: 4,
+                    t: 1100,
+                    h: 4,
+                    hkv: 2,
+                    d: 256,
+                    window: 512,
+                    lens: vec![1100, 513, 1, 600],
+                },
+                11,
+            );
+            // Full layers: D=512, MQA, every key.
+            check_random(
+                rt,
+                kernel,
+                &Attn {
+                    b: 2,
+                    t: 700,
+                    h: 4,
+                    hkv: 1,
+                    d: 512,
+                    window: 0,
+                    lens: vec![700, 1],
+                },
+                12,
+            );
+            // A window wider than every sequence is the global rule.
+            check_random(
+                rt,
+                kernel,
+                &Attn {
+                    b: 2,
+                    t: 90,
+                    h: 4,
+                    hkv: 2,
+                    d: 256,
+                    window: 512,
+                    lens: vec![90, 37],
+                },
+                13,
+            );
+            // The narrowest window: each query sees itself and one neighbour each side.
+            check_random(
+                rt,
+                kernel,
+                &Attn {
+                    b: 1,
+                    t: 70,
+                    h: 2,
+                    hkv: 1,
+                    d: 256,
+                    window: 1,
+                    lens: vec![70],
+                },
+                14,
+            );
+        }
     });
 }
 
 #[test]
 fn encoder_attn_row_matches_the_same_sequence_alone_bit_for_bit() {
     with_gpu(|rt| {
-        let (h, hkv, d, window) = (4usize, 2usize, 256usize, 512usize);
-        let (t_long, len) = (900usize, 333usize);
-        let q = f32s(&random(t_long * h * d, 21, 0.25));
-        let k = f32s(&random(t_long * hkv * d, 22, 0.25));
-        let v = f32s(&random(t_long * hkv * d, 23, 1.0));
-        let batched_attn = Attn {
-            b: 2,
-            t: t_long,
-            h,
-            hkv,
-            d,
-            window,
-            lens: vec![t_long, len],
-        };
-        // Row 1 is a copy of row 0's first `len` tokens, then padding garbage.
-        let mut qb = q.clone();
-        qb.extend_from_slice(&q);
-        let mut kb = k.clone();
-        kb.extend_from_slice(&k);
-        let mut vb = v.clone();
-        vb.extend_from_slice(&v);
-        let batched = run_attn(rt, &batched_attn, &qb, &kb, &vb, &[t_long as u32, len as u32]);
-        let alone_attn = Attn {
-            b: 1,
-            t: len,
-            h,
-            hkv,
-            d,
-            window,
-            lens: vec![len],
-        };
-        let alone = run_attn(
-            rt,
-            &alone_attn,
-            &q[..len * h * d],
-            &k[..len * hkv * d],
-            &v[..len * hkv * d],
-            &[len as u32],
-        );
-        let row1 = &batched[t_long * h * d..t_long * h * d + len * h * d];
-        for (i, (x, y)) in row1.iter().zip(&alone).enumerate() {
-            assert_eq!(x.to_bits(), y.to_bits(), "element {i}: batched {x} vs alone {y}");
+        for kernel in KERNELS {
+            let (h, hkv, d, window) = (4usize, 2usize, 256usize, 512usize);
+            let (t_long, len) = (900usize, 333usize);
+            let q = f32s(&random(t_long * h * d, 21, 0.25));
+            let k = f32s(&random(t_long * hkv * d, 22, 0.25));
+            let v = f32s(&random(t_long * hkv * d, 23, 1.0));
+            let batched_attn = Attn {
+                b: 2,
+                t: t_long,
+                h,
+                hkv,
+                d,
+                window,
+                lens: vec![t_long, len],
+            };
+            // Row 1 is a copy of row 0's first `len` tokens, then padding garbage.
+            let mut qb = q.clone();
+            qb.extend_from_slice(&q);
+            let mut kb = k.clone();
+            kb.extend_from_slice(&k);
+            let mut vb = v.clone();
+            vb.extend_from_slice(&v);
+            let batched = run_attn(rt, kernel, &batched_attn, &qb, &kb, &vb, &[t_long as u32, len as u32]);
+            let alone_attn = Attn {
+                b: 1,
+                t: len,
+                h,
+                hkv,
+                d,
+                window,
+                lens: vec![len],
+            };
+            let alone = run_attn(
+                rt,
+                kernel,
+                &alone_attn,
+                &q[..len * h * d],
+                &k[..len * hkv * d],
+                &v[..len * hkv * d],
+                &[len as u32],
+            );
+            let row1 = &batched[t_long * h * d..t_long * h * d + len * h * d];
+            for (i, (x, y)) in row1.iter().zip(&alone).enumerate() {
+                assert_eq!(
+                    x.to_bits(),
+                    y.to_bits(),
+                    "{kernel:?} element {i}: batched {x} vs alone {y}"
+                );
+            }
         }
     });
 }
@@ -473,21 +502,26 @@ fn encoder_attn_row_matches_the_same_sequence_alone_bit_for_bit() {
 #[test]
 fn encoder_attn_is_bitwise_repeatable() {
     with_gpu(|rt| {
-        let a = Attn {
-            b: 2,
-            t: 300,
-            h: 4,
-            hkv: 1,
-            d: 512,
-            window: 0,
-            lens: vec![300, 120],
-        };
-        let q = f32s(&random(a.b * a.t * a.h * a.d, 31, 0.25));
-        let k = f32s(&random(a.b * a.t * a.hkv * a.d, 32, 0.25));
-        let v = f32s(&random(a.b * a.t * a.hkv * a.d, 33, 1.0));
-        let first = run_attn(rt, &a, &q, &k, &v, &[300, 120]);
-        let second = run_attn(rt, &a, &q, &k, &v, &[300, 120]);
-        assert!(first.iter().zip(&second).all(|(x, y)| x.to_bits() == y.to_bits()));
+        for kernel in KERNELS {
+            let a = Attn {
+                b: 2,
+                t: 300,
+                h: 4,
+                hkv: 1,
+                d: 512,
+                window: 0,
+                lens: vec![300, 120],
+            };
+            let q = f32s(&random(a.b * a.t * a.h * a.d, 31, 0.25));
+            let k = f32s(&random(a.b * a.t * a.hkv * a.d, 32, 0.25));
+            let v = f32s(&random(a.b * a.t * a.hkv * a.d, 33, 1.0));
+            let first = run_attn(rt, kernel, &a, &q, &k, &v, &[300, 120]);
+            let second = run_attn(rt, kernel, &a, &q, &k, &v, &[300, 120]);
+            assert!(
+                first.iter().zip(&second).all(|(x, y)| x.to_bits() == y.to_bits()),
+                "{kernel:?}: two runs differ"
+            );
+        }
     });
 }
 
@@ -496,22 +530,24 @@ fn encoder_attn_clamps_device_lengths() {
     // The host cannot see a device length: 0 gives an all-zero row, and one
     // past the padded length behaves as the padded length.
     with_gpu(|rt| {
-        let a = Attn {
-            b: 2,
-            t: 40,
-            h: 2,
-            hkv: 1,
-            d: 256,
-            window: 7,
-            lens: vec![40, 0],
-        };
-        let q = random(a.b * a.t * a.h * a.d, 41, 0.25);
-        let k = random(a.b * a.t * a.hkv * a.d, 42, 0.25);
-        let v = random(a.b * a.t * a.hkv * a.d, 43, 1.0);
-        let got = run_attn(rt, &a, &f32s(&q), &f32s(&k), &f32s(&v), &[u32::MAX, 0]);
-        let want = attn_ref(&Attn { lens: vec![40, 0], ..a }, &q, &k, &v, None);
-        let idx: Vec<usize> = (0..got.len()).collect();
-        assert_close("clamped", &got, &want, &idx, KERNEL_REL);
+        for kernel in KERNELS {
+            let a = Attn {
+                b: 2,
+                t: 40,
+                h: 2,
+                hkv: 1,
+                d: 256,
+                window: 7,
+                lens: vec![40, 0],
+            };
+            let q = random(a.b * a.t * a.h * a.d, 41, 0.25);
+            let k = random(a.b * a.t * a.hkv * a.d, 42, 0.25);
+            let v = random(a.b * a.t * a.hkv * a.d, 43, 1.0);
+            let got = run_attn(rt, kernel, &a, &f32s(&q), &f32s(&k), &f32s(&v), &[u32::MAX, 0]);
+            let want = attn_ref(&Attn { lens: vec![40, 0], ..a }, &q, &k, &v, None);
+            let idx: Vec<usize> = (0..got.len()).collect();
+            assert_close(&format!("{kernel:?} clamped"), &got, &want, &idx, KERNEL_REL);
+        }
     });
 }
 
@@ -525,26 +561,28 @@ fn encoder_attn_fully_masked_rows_are_zeros_beside_live_rows() {
     // which is the case a fast-math-folded infinity compare would turn into
     // NaN. Length 0 skips the loop entirely and is checked alongside.
     with_gpu(|rt| {
-        for (scale, window) in [(0.25, 0usize), (4.0, 0), (0.25, 3), (4.0, 3)] {
-            let a = Attn {
-                b: 4,
-                t: 12,
-                h: 2,
-                hkv: 1,
-                d: 256,
-                window,
-                lens: vec![5, 0, 12, 1],
-            };
-            let q = random(a.b * a.t * a.h * a.d, 51, scale);
-            let k = random(a.b * a.t * a.hkv * a.d, 52, scale);
-            let v = random(a.b * a.t * a.hkv * a.d, 53, 1.0);
-            let lens: Vec<u32> = a.lens.iter().map(|&l| l as u32).collect();
-            let got = run_attn(rt, &a, &f32s(&q), &f32s(&k), &f32s(&v), &lens);
-            let what = format!("scale={scale} window={window}");
-            assert!(got.iter().all(|x| x.is_finite()), "{what}: non-finite output");
-            padding_is_zero(&what, &a, &got);
-            let want = attn_ref(&a, &q, &k, &v, None);
-            assert_close(&what, &got, &want, &valid_rows(&a), KERNEL_REL);
+        for kernel in KERNELS {
+            for (scale, window) in [(0.25, 0usize), (4.0, 0), (0.25, 3), (4.0, 3)] {
+                let a = Attn {
+                    b: 4,
+                    t: 12,
+                    h: 2,
+                    hkv: 1,
+                    d: 256,
+                    window,
+                    lens: vec![5, 0, 12, 1],
+                };
+                let q = random(a.b * a.t * a.h * a.d, 51, scale);
+                let k = random(a.b * a.t * a.hkv * a.d, 52, scale);
+                let v = random(a.b * a.t * a.hkv * a.d, 53, 1.0);
+                let lens: Vec<u32> = a.lens.iter().map(|&l| l as u32).collect();
+                let got = run_attn(rt, kernel, &a, &f32s(&q), &f32s(&k), &f32s(&v), &lens);
+                let what = format!("{kernel:?} scale={scale} window={window}");
+                assert!(got.iter().all(|x| x.is_finite()), "{what}: non-finite output");
+                padding_is_zero(&what, &a, &got);
+                let want = attn_ref(&a, &q, &k, &v, None);
+                assert_close(&what, &got, &want, &valid_rows(&a), KERNEL_REL);
+            }
         }
     });
 }
@@ -592,6 +630,45 @@ fn encoder_attn_refuses_what_it_cannot_run() {
             encoder_attn(rt, &q, &k, &v, &q, &lens, ok, false).is_err(),
             "o aliasing q: accepted"
         );
+        // K/V capacity is derived from their size: fewer than `seq` positions
+        // per sequence, or K and V of different capacities, are refused; more
+        // positions than `seq` are a wider stride, not an error.
+        let kv = |positions: usize| rt.alloc_buffer(4 * positions * 256 * 4).unwrap();
+        let (short_k, short_v, long_k, long_v) = (kv(7), kv(7), kv(10), kv(10));
+        assert!(
+            encoder_attn(rt, &q, &short_k, &short_v, &o, &lens, ok, false).is_err(),
+            "K/V of 7 positions for seq 8: accepted"
+        );
+        assert!(
+            encoder_attn(rt, &q, &k, &long_v, &o, &lens, ok, false).is_err(),
+            "K and V of different capacities: accepted"
+        );
+        encoder_attn(rt, &q, &long_k, &long_v, &o, &lens, ok, false).expect("K/V of 10 positions for seq 8");
+        // The tiled kernel is compiled for head dims 256 and 512 only.
+        let small = EncoderAttnDims { head_dim: 64, ..ok };
+        let (q64, k64, v64, o64) = (
+            rt.alloc_buffer(4 * 8 * 2 * 64 * 4).unwrap(),
+            rt.alloc_buffer(4 * 8 * 64 * 4).unwrap(),
+            rt.alloc_buffer(4 * 8 * 64 * 4).unwrap(),
+            rt.alloc_buffer(4 * 8 * 2 * 64 * 4).unwrap(),
+        );
+        encoder_attn_with(rt, &q64, &k64, &v64, &o64, &lens, small, false, EncoderAttnKernel::Rows)
+            .expect("the rows kernel at head dim 64");
+        assert!(
+            encoder_attn_with(
+                rt,
+                &q64,
+                &k64,
+                &v64,
+                &o64,
+                &lens,
+                small,
+                false,
+                EncoderAttnKernel::Tiled
+            )
+            .is_err(),
+            "the tiled kernel at head dim 64: accepted"
+        );
         let short_lens = buf_u32(rt, &[8]);
         assert!(
             encoder_attn(rt, &q, &k, &v, &o, &short_lens, ok, false).is_err(),
@@ -626,7 +703,6 @@ fn check_qkv(rt: &Arc<GpuRuntime>, name: &str, rel: f64) {
     let qo = rt.alloc_buffer(t * hq * d * 4).unwrap();
     let ko = rt.alloc_buffer(cap * hkv * d * 4).unwrap();
     let vo = rt.alloc_buffer(cap * hkv * d * 4).unwrap();
-    let vn = rt.alloc_buffer(cap * hkv * d * 4).unwrap();
     qwen35::attn_qk_norm_rope_columns(
         rt,
         &AttnShape {
@@ -642,6 +718,7 @@ fn check_qkv(rt: &Arc<GpuRuntime>, name: &str, rel: f64) {
             q_head_stride: d as u32,
             k_col: (hq * d) as u32,
             v_col: ((hq + hkv) * d) as u32,
+            v_norm: true,
         },
         0.0,
         &qw,
@@ -656,8 +733,6 @@ fn check_qkv(rt: &Arc<GpuRuntime>, name: &str, rel: f64) {
         1e-6,
     )
     .unwrap_or_else(|e| panic!("{name}: {e}"));
-    let ones = buf_f32(rt, &vec![1.0; d]);
-    rms_norm_f32(rt, &vo, &ones, &vn, (cap * hkv) as u32, d as u32, 1e-6).unwrap();
     rt.synchronize().unwrap();
     let slots = |b: &GpuBuffer| -> Vec<f64> {
         b.read_f32()[pos0 * hkv * d..cap * hkv * d]
@@ -669,7 +744,7 @@ fn check_qkv(rt: &Arc<GpuRuntime>, name: &str, rel: f64) {
     for (what, got, want) in [
         ("q", got_q, load(&format!("{name}_q_out")).1),
         ("k", slots(&ko), load(&format!("{name}_k_out")).1),
-        ("v", slots(&vn), load(&format!("{name}_v_out")).1),
+        ("v", slots(&vo), load(&format!("{name}_v_out")).1),
     ] {
         assert_close(
             &format!("{name} {what}"),

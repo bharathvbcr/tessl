@@ -27,6 +27,8 @@ const ATTN_GLOBAL: &str = include_str!("../kernels/flash_attn_global_h512.metal"
 const QWEN35_GDN: &str = include_str!("../kernels/qwen35_gdn.metal");
 const QWEN35_ATTN: &str = include_str!("../kernels/qwen35_attn.metal");
 const QWEN35_ATTN_TILED: &str = include_str!("../kernels/qwen35_attn_tiled.metal");
+/// The tiled body both `qwen35_attn_tiled.metal` and `encoder_attn.metal` use.
+const ATTN_TILED_H: &str = include_str!("../kernels/attn_tiled.h");
 const QWEN35_MLP: &str = include_str!("../kernels/qwen35_mlp.metal");
 const QWEN35_SCORE: &str = include_str!("../kernels/qwen35_score.metal");
 const CROSS_ENTROPY: &str = include_str!("../kernels/cross_entropy.metal");
@@ -35,6 +37,7 @@ const QWEN35_BWD: &str = include_str!("../kernels/qwen35_bwd.metal");
 const QWEN35_ATTN_BWD: &str = include_str!("../kernels/qwen35_attn_bwd.metal");
 const QWEN35_ADAMW: &str = include_str!("../kernels/qwen35_adamw.metal");
 const ENCODER_ATTN: &str = include_str!("../kernels/encoder_attn.metal");
+const ATTN_ROWS_H: &str = include_str!("../kernels/attn_rows.h");
 const EMBED_POOL: &str = include_str!("../kernels/embed_pool.metal");
 const MTL_TENSOR: &str = include_str!("../kernels/mtl_tensor.metal");
 const BERT: &str = include_str!("../kernels/bert.metal");
@@ -406,12 +409,12 @@ fn attention_and_kv_cache_offsets_are_widened_before_multiplication() {
 #[test]
 fn qwen35_tiled_attention_plane_bases_are_widened() {
     require(
-        QWEN35_ATTN_TILED,
+        ATTN_TILED_H,
         "const ulong q_base = (ulong)b * Tq * q_row + (ulong)h * D;",
         "tiled attention query plane base",
     );
     require(
-        QWEN35_ATTN_TILED,
+        ATTN_TILED_H,
         "const ulong kv_base = (ulong)b * kv_capacity * kv_row + (ulong)hkv * D;",
         "tiled attention K/V plane base",
     );
@@ -632,7 +635,7 @@ fn attn_train_offsets_are_widened() {
         require(QWEN35_ATTN_BWD, needle, what);
     }
     require(
-        QWEN35_ATTN_TILED,
+        ATTN_TILED_H,
         "lse[(ulong)bh * Tq + q0 + tid] =",
         "forward log-sum-exp store",
     );
@@ -667,7 +670,7 @@ fn encoder_attn_offsets_are_widened() {
             "key/value position stride",
         ),
         (
-            "const ulong kv_head_base = (ulong)b * T * kv_pos_stride + (ulong)hkv * (D);",
+            "const ulong kv_head_base = (ulong)b * kv_capacity * kv_pos_stride + (ulong)hkv * (D);",
             "key/value plane",
         ),
         (
@@ -686,10 +689,21 @@ fn encoder_attn_offsets_are_widened() {
             "const ulong kv_base = kv_head_base + t * kv_pos_stride;",
             "key/value row",
         ),
-        ("const ulong d0 = o_off + 4u * (dl + j * (R));", "output column"),
     ] {
         require(ENCODER_ATTN, needle, what);
     }
+    // The tiled entries clamp the device length before it bounds an extent.
+    require(
+        ENCODER_ATTN,
+        "const uint len = min(lens[tgpig.y / H], T);",
+        "tiled encoder live length clamp",
+    );
+    // The store is `attn_rows.h`'s, shared with `flash_attn_rows`.
+    require(
+        ATTN_ROWS_H,
+        "const ulong d0 = o_off + 4u * (dl + j * R);",
+        "output column (attn_rows.h)",
+    );
 }
 
 /// Segment means read [rows, D] and write [S, D]; normalize walks rows spaced

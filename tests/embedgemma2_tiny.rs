@@ -25,6 +25,7 @@ mod common;
 use common::embedgemma2::{attn_ref, gelu_tanh, l2_normalize, lin, rms, rope, Attn};
 use common::{with_gpu, SplitMix};
 use tessl::embedgemma2::{EmbedGemma2Config, EmbedGemma2Model};
+use tessl::infer_trace;
 use tessl::safetensors::SafeTensors;
 use tessl::tensor::{bf16_bits_to_f32, f32_slice_to_bf16};
 
@@ -463,6 +464,128 @@ fn tiny_checkpoint_matches_the_f64_forward() {
             model.encode(&refs, Some(cfg.embedding_dim + 1), false).is_err(),
             "truncate_dim past embedding_dim"
         );
+    });
+}
+
+/// What `f` counted.
+fn traced<T>(f: impl FnOnce() -> T) -> (T, infer_trace::Snapshot) {
+    infer_trace::set_enabled(true);
+    let s0 = infer_trace::snapshot();
+    let out = f();
+    let s1 = infer_trace::snapshot();
+    infer_trace::set_enabled(false);
+    (out, s1.since(&s0))
+}
+
+/// An encode's forwards share one set of activations, none of it zeroed on
+/// the host, and poisoning every unzeroed allocation with NaN changes no bit
+/// of any embedding: no kernel reads an element its forward did not write.
+/// Before the activations were reused, each forward allocated its own (the
+/// two-forward encode made twice the one-forward encode's allocations) and
+/// zeroed them on the host.
+#[test]
+fn encode_reuses_unzeroed_activations() {
+    let cfg = EmbedGemma2Config::from_config_json(CONFIG).unwrap();
+    let w = random_weights(&cfg, 7);
+    let st = open("reuse", safetensors_bytes(&w, &[]));
+    // A long sequence beside short ones: `encode` runs the long one alone and
+    // the short ones together in a second, smaller forward.
+    let long: Vec<u32> = (0..4000u32).map(|i| (i * 7 + 3) % cfg.vocab).collect();
+    let short: Vec<Vec<u32>> = (0..7u32)
+        .map(|s| (0..30u32).map(|i| (i * 5 + s) % cfg.vocab).collect())
+        .collect();
+    let mut batch: Vec<&[u32]> = vec![&long];
+    batch.extend(short.iter().map(Vec::as_slice));
+    with_gpu(|rt| {
+        let model = EmbedGemma2Model::load(rt, &st, PREFIX, cfg.clone()).unwrap();
+        let (one, t1) = traced(|| model.encode(&batch[1..2], None, false).unwrap());
+        let (two, t2) = traced(|| model.encode(&batch, None, false).unwrap());
+        assert_eq!((one.forwards, two.forwards), (1, 2), "test bug: the split changed");
+        assert_eq!(
+            t1.host_zero_bytes, 0,
+            "one forward zeroed {} bytes on the host",
+            t1.host_zero_bytes
+        );
+        assert_eq!(
+            t2.host_zero_bytes, 0,
+            "two forwards zeroed {} bytes on the host",
+            t2.host_zero_bytes
+        );
+        assert_eq!(
+            t2.cold_allocs, t1.cold_allocs,
+            "two forwards made {} allocations, one made {}: the activations are not shared",
+            t2.cold_allocs, t1.cold_allocs
+        );
+
+        rt.set_poison_unzeroed(true);
+        let poisoned = model.encode(&batch, None, false);
+        rt.set_poison_unzeroed(false);
+        let poisoned = poisoned.unwrap();
+        let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+        assert_eq!(
+            bits(&poisoned.embeddings),
+            bits(&two.embeddings),
+            "an unzeroed activation was read before it was written"
+        );
+        assert!(two.embeddings.iter().all(|v| v.is_finite()));
+
+        // The second forward runs in buffers sized for the first: its K/V
+        // stride is 4000 / 7 = 571 positions (1142 in the 256-wide layer),
+        // not its own 30. Each sequence must still match itself
+        // run alone in exactly sized buffers.
+        let dim = cfg.embedding_dim as usize;
+        for (n, ids) in batch.iter().enumerate() {
+            let alone = model.encode(&[ids], None, false).unwrap().embeddings;
+            let got = &two.embeddings[n * dim..(n + 1) * dim];
+            let drift = got
+                .iter()
+                .zip(&alone)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0f32, f32::max);
+            assert!(
+                f64::from(drift) <= BATCH_ABS,
+                "sequence {n} ({} tokens) in the two-forward batch vs alone: {drift:.3e}",
+                ids.len()
+            );
+        }
+    });
+}
+
+/// The per-layer inputs formed a run of layers per GEMM: every layer in one
+/// (the default at these sizes), or runs of 2 and 1 layers under a small
+/// `ple_run_bytes`, which read row-offset slices of the projection and column
+/// windows past a run's first layer. The embeddings agree within GEMM
+/// rounding, and each is the f64 forward's.
+#[test]
+fn per_layer_input_runs_agree() {
+    let cfg = EmbedGemma2Config::from_config_json(CONFIG).unwrap();
+    let w = random_weights(&cfg, 11);
+    let st = open("runs", safetensors_bytes(&w, &[]));
+    let seqs = sequences(cfg.vocab);
+    let refs: Vec<&[u32]> = seqs.iter().map(Vec::as_slice).collect();
+    let rows = seqs.len() * seqs.iter().map(Vec::len).max().unwrap();
+    let per_layer = rows * cfg.ple_dim as usize * 4;
+    let dim = cfg.embedding_dim as usize;
+    with_gpu(|rt| {
+        let mut model = EmbedGemma2Model::load(rt, &st, PREFIX, cfg.clone()).unwrap();
+        let all = model.encode(&refs, None, false).unwrap().embeddings;
+        assert!(model.set_ple_run_bytes(0).is_err());
+        for layers_per_run in [2usize, 1] {
+            model.set_ple_run_bytes(layers_per_run * per_layer).unwrap();
+            let got = model.encode(&refs, None, false).unwrap().embeddings;
+            let drift = got.iter().zip(&all).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+            eprintln!("runs of {layers_per_run}: vs one run {drift:.3e}");
+            assert!(f64::from(drift) <= BATCH_ABS, "runs of {layers_per_run}: {drift:.3e}");
+            for (n, ids) in seqs.iter().enumerate() {
+                let (_, want) = host_forward(&cfg, &w, ids);
+                let e = &got[n * dim..(n + 1) * dim];
+                let (err, cos) = (max_abs(e, &want), cosine(e, &want));
+                assert!(
+                    err <= EMB_ABS && cos >= EMB_COS,
+                    "runs of {layers_per_run}, sequence {n}: max abs {err:.3e}, cosine {cos:.9}"
+                );
+            }
+        }
     });
 }
 

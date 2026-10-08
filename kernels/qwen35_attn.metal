@@ -91,7 +91,7 @@ inline void qk_norm_rope_unit(
     uint ld_p, uint q_off, uint k_off, uint v_off,
     device const uint *pos_ptr, uint pos_stride, ulong pos_scalar,
     uint slot_base, uint kv_capacity, constant float *inv_freq, float eps,
-    uint q_head_stride, float weight_bias,
+    uint q_head_stride, float weight_bias, uint v_norm,
     uint tg, uint sg, uint lane, uint tptg)
 {
     const ulong heads = (ulong)Hq + 2ul * Hkv;
@@ -124,8 +124,18 @@ inline void qk_norm_rope_unit(
                              D, rotary_dim, pos, inv_freq, eps, weight_bias, lane);
     } else {
         device const float *src = row + v_off + (ulong)h * D;
+        // `v_norm`: the weightless RMSNorm Gemma-4-style encoders put on each
+        // value head (EmbeddingGemma 2), `eps` as for q and k.
+        float inv = 1.0f;
+        if (v_norm != 0u) {
+            float ss = 0.0f;
+            for (uint d = lane; d < D; d += 32u) {
+                ss += src[d] * src[d];
+            }
+            inv = rsqrt(simd_sum(ss) / (float)D + eps);
+        }
         for (uint d = lane; d < D; d += 32u) {
-            v_cache[slot + d] = src[d];
+            v_cache[slot + d] = src[d] * inv;   // `* 1` is exact when not normed
         }
     }
 }
@@ -138,7 +148,8 @@ inline void qk_norm_rope_unit(
 ///                         stride `2D` (D query, then D gate). A packed
 ///                         `[T, H, D]` query uses stride `D`.
 ///   `k_off + h*D`         key head h
-///   `v_off + h*D`         value head h
+///   `v_off + h*D`         value head h, stored as is, or RMS-normalized with
+///                         no weight when `v_norm` is set
 ///
 /// Writes q to `q_out` [B, T, Hq, D] and k/v to the caches [B, kv_capacity,
 /// Hkv, D] at slot `pos_offset + t - slot_base` — the layouts
@@ -177,6 +188,7 @@ kernel void qwen35_attn_qk_norm_rope(
     constant uint &pos_stride [[buffer(21)]],
     constant uint &q_head_stride [[buffer(22)]],
     constant float &weight_bias [[buffer(23)]],
+    constant uint &v_norm [[buffer(24)]],
     uint tg [[threadgroup_position_in_grid]],
     uint sg [[simdgroup_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]],
@@ -185,7 +197,7 @@ kernel void qwen35_attn_qk_norm_rope(
     qk_norm_rope_unit(p, q_norm_w, k_norm_w, q_out, k_cache, v_cache, B, T, Hq, Hkv, D,
                       rotary_dim, ld_p, q_off, k_off, v_off, nullptr, pos_stride, (ulong)pos_offset,
                       slot_base, kv_capacity,
-                      inv_freq, eps, q_head_stride, weight_bias, tg, sg, lane, tptg);
+                      inv_freq, eps, q_head_stride, weight_bias, v_norm, tg, sg, lane, tptg);
 }
 
 /// [`qwen35_attn_qk_norm_rope`] with the position offset read from a device
@@ -219,6 +231,7 @@ kernel void qwen35_attn_qk_norm_rope_posbuf(
     constant uint &pos_stride [[buffer(21)]],
     constant uint &q_head_stride [[buffer(22)]],
     constant float &weight_bias [[buffer(23)]],
+    constant uint &v_norm [[buffer(24)]],
     uint tg [[threadgroup_position_in_grid]],
     uint sg [[simdgroup_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]],
@@ -227,7 +240,7 @@ kernel void qwen35_attn_qk_norm_rope_posbuf(
     qk_norm_rope_unit(p, q_norm_w, k_norm_w, q_out, k_cache, v_cache, B, T, Hq, Hkv, D,
                       rotary_dim, ld_p, q_off, k_off, v_off, pos_offset_ptr, pos_stride, 0ul,
                       slot_base, kv_capacity,
-                      inv_freq, eps, q_head_stride, weight_bias, tg, sg, lane, tptg);
+                      inv_freq, eps, q_head_stride, weight_bias, v_norm, tg, sg, lane, tptg);
 }
 
 /// `out = attn * sigmoid(gate)`, with the gate read in place from the fused

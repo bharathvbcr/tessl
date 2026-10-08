@@ -42,6 +42,7 @@ use std::sync::Arc;
 
 use crate::gemm::{gemm, gemm_nt_f32, GemmBackend};
 use crate::json::{self, Json, Syntax};
+use crate::loader::Loader;
 use crate::nn::AttnDims;
 use crate::qwen35::{
     self, AttnProjLayout, AttnShape, AttnTargets, Cols, GdnParams, GdnProjLayout, GdnWorkspace, LmHead, OutCols,
@@ -427,82 +428,6 @@ pub struct ForwardOutput {
     pub trace: Vec<Vec<f32>>,
 }
 
-/// Host-side loader state: one checkpoint, one tensor-name prefix.
-struct Loader<'a> {
-    st: &'a SafeTensors,
-    prefix: &'a str,
-    rt: &'a Arc<GpuRuntime>,
-}
-
-impl Loader<'_> {
-    fn name(&self, rest: &str) -> String {
-        format!("{}{rest}", self.prefix)
-    }
-
-    /// A tensor widened to f32, with its shape checked.
-    fn f32(&self, rest: &str, shape: &[usize]) -> Result<Vec<f32>, String> {
-        let name = self.name(rest);
-        let (got, data) = self.st.read_f32(&name)?;
-        if got != shape {
-            return Err(format!("{name}: shape {got:?}, expected {shape:?}"));
-        }
-        Ok(data)
-    }
-
-    fn f32_buf(&self, data: &[f32]) -> Result<GpuBuffer, String> {
-        let b = self.rt.alloc_buffer_hot(data.len().max(1) * 4)?;
-        b.write_f32(data);
-        Ok(b)
-    }
-
-    /// A norm weight as the checkpoint holds it, in f32.
-    fn norm_w(&self, rest: &str, dim: usize) -> Result<GpuBuffer, String> {
-        self.f32_buf(&self.f32(rest, &[dim])?)
-    }
-
-    /// A bf16 tensor's bit patterns, with its shape checked.
-    fn bf16(&self, rest: &str, shape: &[usize]) -> Result<Vec<u16>, String> {
-        let name = self.name(rest);
-        let (got, bits) = self.st.read_bf16_bits(&name)?;
-        if got != shape {
-            return Err(format!("{name}: shape {got:?}, expected {shape:?}"));
-        }
-        Ok(bits)
-    }
-
-    /// `nn.Linear` weights `[out_i, in]` packed side by side into the right
-    /// operand `[in, sum(out_i)]` of one GEMM, in `precision`. Each part is
-    /// placed straight into the tensor's shared storage as it is read and
-    /// dropped before the next is read, so the host holds one part at a time.
-    fn linear(&self, parts: &[(&str, usize)], in_features: usize, precision: Precision) -> Result<Tensor, String> {
-        let total = parts
-            .iter()
-            .try_fold(0usize, |acc, &(_, o)| acc.checked_add(o))
-            .ok_or("linear: output widths overflow usize")?;
-        let mut col0 = 0;
-        match precision {
-            Precision::Bf16 => {
-                let t = self.rt.alloc_tensor_bf16_hot(&[in_features, total])?;
-                for &(rest, out) in parts {
-                    let part = self.bf16(rest, &[out, in_features])?;
-                    qwen35::place_linear_part(&mut t.buffer.try_contents_u16()?, total, col0, &part, out, in_features)?;
-                    col0 += out;
-                }
-                Ok(t)
-            }
-            Precision::F32 => {
-                let t = self.rt.alloc_tensor_f32_hot(&[in_features, total])?;
-                for &(rest, out) in parts {
-                    let part = self.f32(rest, &[out, in_features])?;
-                    qwen35::place_linear_part(&mut t.buffer.try_contents_f32()?, total, col0, &part, out, in_features)?;
-                    col0 += out;
-                }
-                Ok(t)
-            }
-        }
-    }
-}
-
 impl Qwen35Model {
     /// Load the text tower from `st`, whose tensors are named `{prefix}...`
     /// (`"model.language_model."` in the Qwen3.5 checkpoints). Every tensor's
@@ -540,7 +465,7 @@ impl Qwen35Model {
         with_head: bool,
     ) -> Result<Self, String> {
         cfg.validate()?;
-        let ld = Loader { st, prefix, rt };
+        let ld = Loader::new(rt, st, prefix);
         let (h, inter, vocab) = (cfg.hidden as usize, cfg.intermediate as usize, cfg.vocab as usize);
 
         // The tied embedding: one [vocab, hidden] table in the model's
@@ -559,8 +484,7 @@ impl Qwen35Model {
                     Some(head)
                 } else {
                     // No head to transpose into: read straight into the table.
-                    let name = ld.name("embed_tokens.weight");
-                    st.read_bf16_bits_into(&name, &[vocab, h], &mut t.buffer.try_contents_u16()?)?;
+                    ld.bf16_into("embed_tokens.weight", &[vocab, h], &t)?;
                     None
                 };
                 (t, head)
@@ -568,12 +492,11 @@ impl Qwen35Model {
             Precision::F32 => {
                 // Widened straight into the table: no host copy at all.
                 let t = rt.alloc_tensor_f32_hot(&[vocab, h])?;
-                let name = ld.name("embed_tokens.weight");
-                st.read_f32_into(&name, &[vocab, h], &mut t.buffer.try_contents_f32()?)?;
+                ld.f32_into("embed_tokens.weight", &[vocab, h], &t)?;
                 (t, None)
             }
         };
-        let final_norm = ld.norm_w("norm.weight", h)?;
+        let final_norm = ld.norm("norm.weight", h)?;
 
         let (g, a) = (cfg.gdn, cfg.attn);
         let mut layers = Vec::with_capacity(cfg.layers.len());
@@ -601,10 +524,10 @@ impl Qwen35Model {
                             g.value_dim() as usize,
                             precision,
                         )?,
-                        conv_w: ld.f32_buf(&ld.f32(&p("linear_attn.conv1d.weight"), &[conv_dim, 1, kw])?)?,
-                        a_log: ld.f32_buf(&ld.f32(&p("linear_attn.A_log"), &[vh])?)?,
-                        dt_bias: ld.f32_buf(&ld.f32(&p("linear_attn.dt_bias"), &[vh])?)?,
-                        norm_w: ld.f32_buf(&ld.f32(&p("linear_attn.norm.weight"), &[g.v_dim() as usize])?)?,
+                        conv_w: ld.buf(&ld.f32(&p("linear_attn.conv1d.weight"), &[conv_dim, 1, kw])?)?,
+                        a_log: ld.buf(&ld.f32(&p("linear_attn.A_log"), &[vh])?)?,
+                        dt_bias: ld.buf(&ld.f32(&p("linear_attn.dt_bias"), &[vh])?)?,
+                        norm_w: ld.buf(&ld.f32(&p("linear_attn.norm.weight"), &[g.v_dim() as usize])?)?,
                     })
                 }
                 LayerKind::FullAttention => {
@@ -626,14 +549,14 @@ impl Qwen35Model {
                             precision,
                         )?,
                         // The kernel applies (1 + w) itself.
-                        q_norm: ld.f32_buf(&ld.f32(&p("self_attn.q_norm.weight"), &[d])?)?,
-                        k_norm: ld.f32_buf(&ld.f32(&p("self_attn.k_norm.weight"), &[d])?)?,
+                        q_norm: ld.buf(&ld.f32(&p("self_attn.q_norm.weight"), &[d])?)?,
+                        k_norm: ld.buf(&ld.f32(&p("self_attn.k_norm.weight"), &[d])?)?,
                     })
                 }
             };
             layers.push(Layer {
-                input_norm: ld.norm_w(&p("input_layernorm.weight"), h)?,
-                post_norm: ld.norm_w(&p("post_attention_layernorm.weight"), h)?,
+                input_norm: ld.norm(&p("input_layernorm.weight"), h)?,
+                post_norm: ld.norm(&p("post_attention_layernorm.weight"), h)?,
                 mixer,
                 gate: ld.linear(&[(&p("mlp.gate_proj.weight"), inter)], h, precision)?,
                 up: ld.linear(&[(&p("mlp.up_proj.weight"), inter)], h, precision)?,

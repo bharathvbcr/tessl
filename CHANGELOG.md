@@ -38,6 +38,15 @@ All notable changes to `tessl` are recorded here. The format follows
   `GDN_RECURRENT_SLICE = Cols32`: a paired batch-1 sweep
   (`bench_qwen35_layers --paired-gdn-recurrent`) found no difference outside
   its noise, so the 16-column kernel is not promoted.
+- **`bench_paired`, a Rust round-robin runner for benchmark lanes.** It
+  replaces `bench/paired_embedgemma2.py`: lanes are `NAME=COMMAND`s printing
+  `bench_embedgemma2`'s JSON, alternated round by round, reported as the
+  median of per-round min-of-N with per-round ratios against the first lane.
+  Two builds of `bench_embedgemma2` make a before/after A/B.
+  `bench_embedgemma2` gains ragged workloads (`BxLO-HI` terms joined by `+`,
+  which `bench/embedgemma2_torch.py` reads too), the device's peak allocation
+  per workload and the process's peak physical footprint;
+  `probe_load_memory --embedgemma2` measures an EmbeddingGemma 2 load.
 - **Qwen3.5 training on bf16 storage.** A `Precision::Bf16` model (loaded
   with `load_tower`) trains on `GemmOperands::Bf16` with its matrices kept in
   bf16; arithmetic stays f32. `AdamWConfig` picks an `UpdateRule` for
@@ -135,6 +144,29 @@ All notable changes to `tessl` are recorded here. The format follows
   now returns the cached ICB pipeline instead of compiling a new one per call.
   Pooled-buffer allocation no longer locks a mutex to read the runtime's weak
   self-handle.
+- **EmbeddingGemma 2's forward: fewer passes, no host zeroing, matrix-unit
+  attention.** One set of activations per `encode`, allocated with
+  `alloc_tensor_unzeroed` for its largest forward and reused by each (the
+  activations were reallocated and memset on the host every forward, about
+  1.8 GiB at 32,768 rows). One K/V pair serves every layer: `encoder_attn`
+  derives the K/V capacity from the buffers' size, as the K/V writer does.
+  The weightless V norm runs inside the qk-norm-RoPE kernel
+  (`QkvColumns::v_norm`), the `sqrt(hidden)` embedding scale inside the
+  gather (`qwen35::embed_rows_scaled`), `gate | up` is one GEMM read by a
+  column-window GELU-tanh (`qwen35::gated_act`), and the per-layer inputs of
+  a run of layers come from one NT GEMM (all 24 layers up to 5,461 rows;
+  `PLE_RUN_BYTES`, `EmbedGemma2Model::set_ple_run_bytes`). On a device with
+  TensorOps, `encoder_attn` runs the FlashAttention-2 tiled body
+  (`kernels/attn_tiled.h`, shared with Qwen3.5's prefill) at head dims 256
+  and 512; `encoder_attn_with` names the kernel. The flash and encoder row
+  kernels share their online-softmax body (`kernels/attn_rows.h`).
+- **One checkpoint loader for EmbeddingGemma 2 and Qwen3.5**
+  (`src/loader.rs`). EmbeddingGemma 2's projections are placed into their
+  packed device tensors part by part as they are read, and its embedding and
+  per-layer-input projection are read straight into device tensors, with no
+  host copy.
+- **`qwen35::swiglu` is `qwen35::gated_act` with `GatedAct::Silu`**; the
+  kernel takes its activation as a parameter (`qwen35_gelu_tanh_glu_*`).
 - **C ABI 10: `tessl_qwen35_load` takes a precision and
   `tessl_qwen35_adamw_init` an optimizer configuration.** `tessl_qwen35_load`
   gains `precision` (`TESSL_F32` or `TESSL_BF16`) before `out`;

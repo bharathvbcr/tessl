@@ -399,6 +399,12 @@ def case_swiglu(bf16, seed, rows=37, width=300):
 # -------------------------------------------------------- attention extras
 
 
+def rope_inv_freq(rotary_dim, theta):
+    """transformers' RoPE frequencies (`compute_default_rope_parameters`),
+    verbatim: the table the host binds for `qwen35_attn_qk_norm_rope*`."""
+    return 1.0 / (theta ** (torch.arange(0, rotary_dim, 2, dtype=torch.float) / rotary_dim))
+
+
 def case_qk_norm_rope(seed, Hq=4, Hkv=2, B=2, T=9):
     g = seeded(seed)
     D = 256
@@ -430,15 +436,17 @@ def case_qk_norm_rope(seed, Hq=4, Hkv=2, B=2, T=9):
     v = p[:, v_off:v_off + Hkv * D].reshape(B, T, Hkv, D)
     out = run("qwen35_attn_qk_norm_rope",
               dict(B=B, T=T, Hq=Hq, Hkv=Hkv, D=D, rotary_dim=R, ld_p=ld_p, q_off=q_off, k_off=k_off, v_off=v_off,
-                   pos_offset=pos_offset, kv_capacity=cap, theta=theta, eps=eps),
-              {"p": p, "q_norm_w": qw, "k_norm_w": kw},
+                   pos_offset=pos_offset, kv_capacity=cap, eps=eps),
+              {"p": p, "q_norm_w": qw, "k_norm_w": kw, "inv_freq": rot.inv_freq},
               {"q_out": ("f32", B * T * Hq * D), "k_cache": ("f32", B * cap * Hkv * D),
                "v_cache": ("f32", B * cap * Hkv * D)})
     tag = f"attn_qk_norm_rope D{D} R{R} pos{pos_offset}"
-    check(tag + " q", out["q_out"], q.transpose(1, 2).reshape(-1), 2e-4)
+    # The kernel reads transformers' own inv_freq, so both sides form the same
+    # f32 angle; what is left is f32 norm and cos/sin rounding.
+    check(tag + " q", out["q_out"], q.transpose(1, 2).reshape(-1), 2e-5)
     kc = out["k_cache"].reshape(B, cap, Hkv, D)
     vc = out["v_cache"].reshape(B, cap, Hkv, D)
-    check(tag + " k", kc[:, pos_offset:pos_offset + T], k.transpose(1, 2), 2e-4)
+    check(tag + " k", kc[:, pos_offset:pos_offset + T], k.transpose(1, 2), 2e-5)
     check(tag + " v", vc[:, pos_offset:pos_offset + T], v, 0.0)
     untouched = torch.cat([kc[:, :pos_offset].flatten(), kc[:, pos_offset + T:].flatten()])
     if not torch.isnan(untouched).all():
@@ -455,10 +463,10 @@ def case_qk_rope_posbuf(seed):
     p = torch.randn(B * T, ld_p, generator=g)
     qw, kw = torch.randn(D, generator=g) * 0.1, torch.randn(D, generator=g) * 0.1
     base = dict(B=B, T=T, Hq=Hq, Hkv=Hkv, D=D, rotary_dim=64, ld_p=ld_p, q_off=0, k_off=2 * Hq * D,
-                v_off=2 * Hq * D + Hkv * D, kv_capacity=cap, theta=1e7, eps=1e-6)
+                v_off=2 * Hq * D + Hkv * D, kv_capacity=cap, eps=1e-6)
     outs = {"q_out": ("f32", B * T * Hq * D), "k_cache": ("f32", B * cap * Hkv * D),
             "v_cache": ("f32", B * cap * Hkv * D)}
-    inputs = {"p": p, "q_norm_w": qw, "k_norm_w": kw}
+    inputs = {"p": p, "q_norm_w": qw, "k_norm_w": kw, "inv_freq": rope_inv_freq(64, 1e7)}
 
     def via_buf(pos):
         return run("qwen35_attn_qk_norm_rope", dict(base, pos_offset=0, posbuf=1),
@@ -703,8 +711,8 @@ def case_qk_rope_slot_base(seed):
     p = torch.randn(B * T, ld_p, generator=g)
     qw, kw = torch.randn(D, generator=g) * 0.1, torch.randn(D, generator=g) * 0.1
     base = dict(B=B, T=T, Hq=Hq, Hkv=Hkv, D=D, rotary_dim=64, ld_p=ld_p, q_off=0, k_off=2 * Hq * D,
-                v_off=2 * Hq * D + Hkv * D, theta=1e7, eps=1e-6)
-    inputs = {"p": p, "q_norm_w": qw, "k_norm_w": kw}
+                v_off=2 * Hq * D + Hkv * D, eps=1e-6)
+    inputs = {"p": p, "q_norm_w": qw, "k_norm_w": kw, "inv_freq": rope_inv_freq(64, 1e7)}
 
     def outs(c):
         return {"q_out": ("f32", B * T * Hq * D), "k_cache": ("f32", B * c * Hkv * D),
@@ -944,7 +952,7 @@ def _expand_macros(src):
 
 
 def _kernel_signatures():
-    """{kernel name: [(buffer index, 'buf'|'u32'|'f32')]} from the .metal sources,
+    """{kernel name: [(buffer index, 'buf'|'table'|'u32'|'f32')]} from the .metal sources,
     with the macro-generated kernels expanded through their instantiations."""
     import re
     sigs = {}
@@ -957,7 +965,14 @@ def _kernel_signatures():
             params = []
             for p in re.finditer(r"([^,()]*?)\b\w+\s*\[\[buffer\((\d+)\)\]\]", m.group(2)):
                 decl = p.group(1)
-                kind = "buf" if "device" in decl else ("f32" if "float" in decl else "u32")
+                # A `constant T *` is a host-written table bound by bytes,
+                # distinct from a `constant T &` scalar.
+                if "device" in decl:
+                    kind = "buf"
+                elif "*" in decl:
+                    kind = "table"
+                else:
+                    kind = "f32" if "float" in decl else "u32"
                 params.append((int(p.group(2)), kind))
             sigs[m.group(1)] = params
     return sigs
@@ -1011,6 +1026,10 @@ def _host_binds():
         for x in re.finditer(r"\bset_(\w+)\(bnd,[^;]*?, (\d+)\)", call, re.S):
             assert x.group(1) in kinds, f"set_{x.group(1)} binds a slot the host contract cannot classify"
             b.append((int(x.group(2)), kinds[x.group(1)]))
+        # The RoPE frequency table (`nn::bind_rope_inv_freq`) is the one
+        # host-written table these kernels read.
+        for x in re.finditer(r"\bbind_rope_inv_freq\(bnd,[^;]*?, (\d+)\)", call, re.S):
+            b.append((int(x.group(1)), "table"))
         kernels = [k for pos, v, k in pipe_defs if v == var and pos < m.start()][-1]
         for k in kernels:
             assert k not in binds, f"{k} is dispatched twice; the contract check needs one site"

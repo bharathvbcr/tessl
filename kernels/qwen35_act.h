@@ -27,19 +27,20 @@ inline float qwen35_silu(float x)
     return x * qwen35_sigmoid(x);
 }
 
-/// transformers' partial-RoPE angle for rotary pair `p` of `rotary_dim` at
-/// position `pos`: `pos * theta^(-2p / rotary_dim)`. The attention forward
-/// and its backward both rotate with this, so the backward's inverse rotation
-/// is exactly the transpose of the forward's.
+/// transformers' RoPE angle for rotary pair `p` at position `pos`:
+/// `pos * inv_freq[p]`, one f32 multiply, as torch forms it. The attention
+/// forward and its backward both rotate with this, so the backward's inverse
+/// rotation is exactly the transpose of the forward's.
 ///
-/// torch computes inv_freq, the angle and cos/sin in fp32. `precise::`
-/// throughout: the angle reaches tens of thousands of radians, where the fast
-/// approximations lose whole digits.
-inline float qwen35_rope_angle(uint p, uint rotary_dim, uint pos, float theta)
+/// `inv_freq` (`rotary_dim / 2` floats) comes from the host
+/// (`nn::rope_inv_freq`), not from a device `pow`: torch computes it once
+/// on the CPU, and a device `pow` lands about an ulp away at most pairs, which
+/// the angle multiplies by the position (1.2e-4 relative at position 1600).
+/// The caller's cos/sin are `precise::`: the angle reaches tens of thousands
+/// of radians, where the fast approximations lose whole digits.
+inline float qwen35_rope_angle(constant float *inv_freq, uint p, uint pos)
 {
-    const float inv_freq =
-        precise::divide(1.0f, precise::pow(theta, precise::divide((float)(2u * p), (float)rotary_dim)));
-    return (float)pos * inv_freq;
+    return (float)pos * inv_freq[p];
 }
 
 /// torch's `F.softplus` at its defaults (beta = 1, threshold = 20): linear above

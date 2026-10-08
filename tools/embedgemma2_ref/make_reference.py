@@ -14,15 +14,26 @@ target/embedgemma2_ref/ (override with EMBEDGEMMA2_REF_DIR):
                        eager attention: the oracle the f32 forward is held to
   emb_bf16.npy         [N, 768] the same in bf16 (the checkpoint's dtype), so
                        the test can report how far bf16 itself moves
+  emb_f32_trunc{d}.npy [N, d] for d in 512, 256, 128: sentence-transformers'
+                       Matryoshka prefixes, encode(truncate_dim=d,
+                       normalize_embeddings=True) on the fp32 model (it
+                       slices after the Normalize module, then renormalizes)
   trace_l{i}.npy       text 0's residual stream after layer i, [T, 512]
   trace_final.npy      text 0 after the final norm, [T, 512]
+  trace_long_l{i}.npy, trace_long_final.npy
+                       the same for text 6 (TRACE_LONG), longer than twice
+                       the window, so the sliding and full layers differ
+  provenance.json      library versions, the snapshot and this repo's commit
 
 Needs torch, numpy, transformers >= 5.19 and sentence-transformers >= 6.1.
 """
 
 import glob
+import importlib.metadata
 import json
 import os
+import platform
+import subprocess
 import sys
 
 import numpy as np
@@ -31,6 +42,24 @@ from sentence_transformers import SentenceTransformer
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 OUT = os.environ.get("EMBEDGEMMA2_REF_DIR", os.path.join(HERE, "..", "..", "target", "embedgemma2_ref"))
+MATRYOSHKA = (512, 256, 128)
+WINDOW = 512
+
+
+def git(*args):
+    return subprocess.run(["git", *args], cwd=HERE, capture_output=True, text=True, check=True).stdout.strip()
+
+
+def provenance(snapshot_dir):
+    return {
+        "generator": os.path.relpath(os.path.abspath(__file__), git("rev-parse", "--show-toplevel")),
+        "commit": git("rev-parse", "HEAD"),
+        "worktree_dirty": bool(git("status", "--porcelain")),
+        "snapshot": snapshot_dir,
+        "python": platform.python_version(),
+        "versions": {p: importlib.metadata.version(p)
+                     for p in ("torch", "numpy", "transformers", "sentence-transformers", "safetensors")},
+    }
 
 
 def snapshot():
@@ -61,6 +90,9 @@ TEXTS = [
     ("document", long_text(700)),     # past one window on both sides
     ("document", long_text(2600)),    # several windows; the global layers span it all
 ]
+# The traced long text: longer than 2 * WINDOW, so some query has keys on
+# both sides that a sliding layer masks and a full layer does not.
+TRACE_LONG = 6
 
 
 def main():
@@ -93,27 +125,39 @@ def main():
 
     with torch.no_grad():
         np.save(os.path.join(OUT, "emb_f32.npy"), embed(m32).astype(np.float32))
+        for d in MATRYOSHKA:
+            rows = [m32.encode([t], prompt_name=p, convert_to_tensor=True, batch_size=1,
+                               truncate_dim=d, normalize_embeddings=True)[0].float().cpu() for p, t in TEXTS]
+            np.save(os.path.join(OUT, f"emb_f32_trunc{d}.npy"), torch.stack(rows).numpy().astype(np.float32))
 
         lm = [mod for mod in m32.modules() if mod.__class__.__name__ == "EmbeddingGemma2TextModel"][0]
-        trace = []
-        hooks = [layer.register_forward_hook(lambda _m, _i, out: trace.append(
-            (out[0] if isinstance(out, tuple) else out)[0].float().cpu().numpy()))
-            for layer in lm.layers]
-        final = []
-        hooks.append(lm.norm.register_forward_hook(lambda _m, _i, out: final.append(out[0].float().cpu().numpy())))
-        x = torch.tensor([ids[offsets[0]:offsets[1]]])
-        lm(input_ids=x, attention_mask=torch.ones_like(x))
-        for h in hooks:
-            h.remove()
-        assert len(trace) == len(lm.layers) and len(final) == 1, (len(trace), len(final))
-        for i, t in enumerate(trace):
-            np.save(os.path.join(OUT, f"trace_l{i}.npy"), t.astype(np.float32))
-        np.save(os.path.join(OUT, "trace_final.npy"), final[0].astype(np.float32))
+
+        def trace(n, prefix):
+            layers, final = [], []
+            hooks = [layer.register_forward_hook(lambda _m, _i, out: layers.append(
+                (out[0] if isinstance(out, tuple) else out)[0].float().cpu().numpy()))
+                for layer in lm.layers]
+            hooks.append(lm.norm.register_forward_hook(lambda _m, _i, out: final.append(out[0].float().cpu().numpy())))
+            x = torch.tensor([ids[offsets[n]:offsets[n + 1]]])
+            lm(input_ids=x, attention_mask=torch.ones_like(x))
+            for h in hooks:
+                h.remove()
+            assert len(layers) == len(lm.layers) and len(final) == 1, (len(layers), len(final))
+            for i, t in enumerate(layers):
+                np.save(os.path.join(OUT, f"{prefix}_l{i}.npy"), t.astype(np.float32))
+            np.save(os.path.join(OUT, f"{prefix}_final.npy"), final[0].astype(np.float32))
+
+        trace(0, "trace")
+        assert offsets[TRACE_LONG + 1] - offsets[TRACE_LONG] > 2 * WINDOW, "the long trace must exceed 2 * window"
+        trace(TRACE_LONG, "trace_long")
 
     del m32
     m16 = SentenceTransformer(path, device="cpu", model_kwargs={"attn_implementation": "eager"})
     with torch.no_grad():
         np.save(os.path.join(OUT, "emb_bf16.npy"), embed(m16).astype(np.float32))
+    with open(os.path.join(OUT, "provenance.json"), "w") as f:
+        json.dump({**provenance(path), "trace_long_text": TRACE_LONG, "matryoshka": MATRYOSHKA}, f, indent=1)
+        f.write("\n")
     print("wrote", OUT, "tokens per text:", [offsets[i + 1] - offsets[i] for i in range(len(TEXTS))])
 
 

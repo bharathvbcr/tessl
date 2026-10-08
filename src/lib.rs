@@ -104,7 +104,7 @@
 //! activations, flash attention (sliding-window and global), fused
 //! RMSNorm+QKV+RoPE, MLX-format Q4 GEMV/GEMM, Q8 GEMV, an exact int8 GEMM, KV
 //! cache stores, embedding lookup, row-wise softmax/sum/max, and softcap
-//! sampling. [`nn`] exposes them through 84 shape-checked functions. The
+//! sampling. [`nn`] exposes them through 85 shape-checked functions. The
 //! Qwen3.5 layer kernels — the gated delta net (chunked prefill and
 //! snapshot-reading decode), its causal conv and gated norm, the attention
 //! extras, and answer-row scoring — are in [`qwen35`], and the whole

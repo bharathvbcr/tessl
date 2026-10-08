@@ -45,12 +45,18 @@ fn rms_norm(row: &mut [f32], weight: &[f32], eps: f32) {
     }
 }
 
+/// transformers' convention: `inv_freq = 1.0 / (theta ** ((2i).float() / D))`
+/// in f32 and the angle `pos * inv_freq` as one f32 product, then exact
+/// cos/sin. Every implementation forms these in f32, so this, not the
+/// infinitely precise angle, is what a kernel can match at far positions
+/// (they differ by up to ~`2 * pos * 2^-24` radians).
 fn rope(row: &mut [f32], rotary_dim: usize, pos: usize, theta: f32) {
     let d = row.len();
     let half = d / 2;
     for i in 0..rotary_dim / 2 {
-        let inv_freq = 1.0 / (theta as f64).powf(2.0 * i as f64 / d as f64);
-        let angle = pos as f64 * inv_freq;
+        let e = (2 * i) as f32 / d as f32;
+        let inv_freq = 1.0f32 / (f64::from(theta).powf(f64::from(e)) as f32);
+        let angle = f64::from(pos as f32 * inv_freq);
         let (c, s) = (angle.cos(), angle.sin());
         let (x0, x1) = (row[i] as f64, row[i + half] as f64);
         row[i] = (x0 * c - x1 * s) as f32;
@@ -199,6 +205,58 @@ fn rms_qkv_rope_matches_an_f64_reference() {
             close(&format!("q {label}"), &qb.read_f32()[..wq.len()], &wq);
             close(&format!("k {label}"), &kb.read_f32()[..wk.len()], &wk);
             close(&format!("v {label}"), &vb.read_f32()[..wv.len()], &wv);
+        }
+    });
+}
+
+/// Far positions, where the angle is thousands of radians: the kernel forms
+/// it from the host's frequency table and rotates with precise cos/sin, so it
+/// holds the same `3e-5` there as at position 7. Computing `pow`, `cos` and
+/// `sin` on the device in fast math (what this kernel did) is 4e-4 off at
+/// position 8000 and 1.5e-3 at 32000.
+#[test]
+fn rms_qkv_rope_holds_at_far_positions() {
+    with_gpu(|rt| {
+        // Gemma 3's sliding (full NeoX) and global (proportional, partial)
+        // shapes.
+        for &(d, rotary, theta) in &[(256usize, 256usize, 10_000.0f32), (256, 64, 1_000_000.0)] {
+            for pos in [1000usize, 8000, 32_000] {
+                let dm = Dims {
+                    t: 2,
+                    hq: 2,
+                    hkv: 1,
+                    d,
+                    rotary,
+                    theta,
+                    eps: 1e-6,
+                };
+                let f = fixture(dm, 0x51 + pos as u64);
+                let (qb, kb, vb) = f.upload(rt);
+                let (qwb, kwb, vwb) = (buf(rt, &f.qw), buf(rt, &f.kw), buf(rt, &f.vw));
+                nn::rms_qkv_rope(
+                    rt,
+                    QkvRopeVariant::PosConst,
+                    QkvBuffers {
+                        q: &qb,
+                        k: &kb,
+                        v: &vb,
+                        q_weight: &qwb,
+                        k_weight: &kwb,
+                        v_weight: &vwb,
+                    },
+                    f.dims(),
+                    pos as u32,
+                    None,
+                    None,
+                    false,
+                )
+                .unwrap();
+                rt.synchronize().unwrap();
+                let (wq, wk, _) = reference(&f.q, &f.k, &f.v, &f.qw, &f.kw, &f.vw, dm, pos);
+                let label = format!("d={d} rotary={rotary} pos={pos}");
+                close(&format!("q {label}"), &qb.read_f32()[..wq.len()], &wq);
+                close(&format!("k {label}"), &kb.read_f32()[..wk.len()], &wk);
+            }
         }
     });
 }

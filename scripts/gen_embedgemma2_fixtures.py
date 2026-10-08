@@ -3,8 +3,10 @@
 
     ~/.venvs/ml/bin/python scripts/gen_embedgemma2_fixtures.py
 
-Needs torch, numpy and a transformers that ships `models.embedding_gemma2`
-(5.19.0 or later). The goldens come from the model code itself —
+Needs torch, numpy, a transformers that ships `models.embedding_gemma2`
+(5.19.0 or later) and sentence-transformers (6.1 or later, for the
+Matryoshka prefixes). Also writes `provenance.json`: the library versions and
+this repo's commit. The goldens come from the model code itself —
 `EmbeddingGemma2Attention`'s pieces (`eager_attention_forward`,
 `create_bidirectional_sliding_window_mask`, `create_bidirectional_mask`),
 `EmbeddingGemma2RMSNorm`, `EmbeddingGemma2RotaryEmbedding`,
@@ -19,16 +21,22 @@ shrunk to 7 so that T = 24 crosses it in both directions; the Rust reference,
 once held to these files, checks the kernels at the real window of 512.
 """
 
+import importlib.metadata
+import json
 import os
+import platform
+import subprocess
 
 import numpy as np
 import torch
+from sentence_transformers.util import truncate_embeddings
 from transformers import masking_utils
 from transformers.models.embedding_gemma2 import modeling_embedding_gemma2 as m
 from transformers.models.embedding_gemma2.configuration_embedding_gemma2 import EmbeddingGemma2TextConfig
 
 OUT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "tests", "fixtures", "embedgemma2")
 EPS = 1e-6
+MATRYOSHKA = (512, 256, 128)
 
 
 def save(name, t):
@@ -151,6 +159,16 @@ def rope_matches_model():
         assert torch.allclose(cos[0], emb.cos(), atol=1e-6) and torch.allclose(sin[0], emb.sin(), atol=1e-6), layer_type
 
 
+def inv_freq():
+    """The model's own RoPE frequency tables (its rotary module's buffers), per
+    layer type: what `nn::rope_inv_freq` is held to."""
+    rot = m.EmbeddingGemma2RotaryEmbedding(text_config())
+    for layer_type, d in (("sliding_attention", 256), ("full_attention", 512)):
+        t = getattr(rot, f"{layer_type}_inv_freq")
+        assert t.dtype == torch.float32 and t.numel() == d // 2, (layer_type, t.dtype, t.shape)
+        save(f"inv_freq_{d}", t)
+
+
 def ple(seed):
     """Projection-only per-layer inputs and one PLE block, at the model's widths.
 
@@ -188,7 +206,10 @@ def ple(seed):
 
 def pool(seed):
     """Masked mean over valid tokens, then L2 normalize (sentence-transformers
-    Pooling(mean, include_prompt) + Normalize), and the Matryoshka prefixes."""
+    Pooling(mean, include_prompt) + Normalize), and the Matryoshka prefixes as
+    sentence-transformers' encode(truncate_dim=d, normalize_embeddings=True)
+    forms them: its own truncate_embeddings on the normalized output, then a
+    second normalize."""
     g = torch.Generator().manual_seed(seed)
     lens = [9, 4, 1]
     B, T, D = len(lens), max(lens), 768
@@ -202,6 +223,29 @@ def pool(seed):
     save("pool_x", x)
     save("pool_lens", torch.tensor(lens))
     save("pool_out", out)
+    for d in MATRYOSHKA:
+        save(f"pool_out_trunc{d}", torch.nn.functional.normalize(truncate_embeddings(out, d), p=2, dim=1))
+
+
+def git(*args):
+    return subprocess.run(["git", *args], cwd=os.path.dirname(os.path.abspath(__file__)),
+                          capture_output=True, text=True, check=True).stdout.strip()
+
+
+def write_provenance():
+    """What produced the files beside it: versions and this repo's commit
+    (worktree_dirty: the generator ran with uncommitted changes)."""
+    info = {
+        "generator": "scripts/gen_embedgemma2_fixtures.py",
+        "commit": git("rev-parse", "HEAD"),
+        "worktree_dirty": bool(git("status", "--porcelain")),
+        "python": platform.python_version(),
+        "versions": {p: importlib.metadata.version(p)
+                     for p in ("torch", "numpy", "transformers", "sentence-transformers")},
+    }
+    with open(os.path.join(OUT, "provenance.json"), "w") as f:
+        json.dump(info, f, indent=1)
+        f.write("\n")
 
 
 if __name__ == "__main__":
@@ -216,6 +260,9 @@ if __name__ == "__main__":
     # Far from 0, transformers' own f32 angles (pos * inv_freq in f32) carry
     # ~pos * 2^-24 rad of rounding, so this one is held to that, not to f64.
     qkv_norm_rope("qkv256_far", hq=2, hkv=1, d=256, theta=1e4, pos0=8000, seed=208)
+    qkv_norm_rope("qkv512_far", hq=2, hkv=1, d=512, theta=1e6, pos0=8000, seed=209)
+    inv_freq()
     ple(seed=206)
     pool(seed=207)
+    write_provenance()
     print("wrote", sorted(os.listdir(OUT)))

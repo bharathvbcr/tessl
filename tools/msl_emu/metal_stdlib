@@ -26,6 +26,9 @@
 
 #include <algorithm>
 #include <atomic>
+// MSL predefines <float.h>'s limits (FLT_MAX, FLT_MIN, ...); the kernels seed
+// running maxima with -FLT_MAX rather than -INFINITY under fast math.
+#include <cfloat>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>

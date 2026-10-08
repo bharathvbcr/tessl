@@ -5,6 +5,12 @@
 // RoPE: proportional NeoX (MLX traditional=False); p-RoPE rotates first
 // rotary_dim/2 pairs across dim/2 (inv-freq denom = full head_dim).
 //
+// The frequencies are read from `inv_freq` (buffer 18, `rotary_dim / 2`
+// floats), which `nn::rms_qkv_rope_with_scalars` binds itself from the
+// validated `theta`. `theta` (buffer 12) is still part of the scalar contract
+// that callers binding from a persistent pool (gemma-metal) fill, but the
+// kernel no longer derives anything from it.
+//
 // One simdgroup per head row. Lane `l` owns the elements `p` and `p + D/2`
 // for every `p ≡ l (mod 32)` below `D/2`, which is exactly one RoPE pair, so
 // the rotation never needs a value another lane produced; lane 0 also owns
@@ -41,7 +47,7 @@ inline void norm_rope_row(
     uint D,
     uint rotary_dim,
     ulong pos,
-    float theta,
+    constant float *inv_freq,
     float eps,
     bool rotate,
     uint lane,
@@ -62,17 +68,20 @@ inline void norm_rope_row(
     // When rotary_dim == D (sliding), this is full NeoX over the head.
     // When rotary_dim < D (global p-RoPE), only the first rotary_dim/2
     // pairs rotate; the rest of the D/2 pairs stay unrotated (inf freq).
-    // inv_freq denom uses full head `D`.
+    // inv_freq denom uses full head `D`. The `rotary_dim / 2` frequencies
+    // come from the host (`nn::rope_inv_freq(rotary_dim / 2, D, theta)`):
+    // a device `pow` is about an ulp off, and the angle multiplies that by
+    // the position. cos/sin are `precise::` for the same reason: the angle
+    // reaches thousands of radians, where the fast forms lose digits.
     const uint half_dim = D / 2;
     const uint n_pairs = rotate ? rotary_dim / 2 : 0u;
     for (uint p = lane; p < half_dim; p += ROPE_SIMD_WIDTH) {
         float x0 = row[p] * inv * weight[p];
         float x1 = row[p + half_dim] * inv * weight[p + half_dim];
         if (p < n_pairs) {
-            const float inv_freq = 1.0f / pow(theta, (2.0f * (float)p) / (float)D);
-            const float angle = (float)pos * inv_freq;
-            const float c = cos(angle);
-            const float s = sin(angle);
+            const float angle = (float)pos * inv_freq[p];
+            const float c = precise::cos(angle);
+            const float s = precise::sin(angle);
             const float r0 = x0 * c - x1 * s;
             const float r1 = x0 * s + x1 * c;
             x0 = r0;
@@ -119,6 +128,7 @@ kernel void rms_qkv_rope(
     constant uint &pos_offset [[buffer(11)]],
     constant float &theta [[buffer(12)]],
     constant float &eps [[buffer(13)]],
+    constant float *inv_freq [[buffer(18)]],
     uint tg [[threadgroup_position_in_grid]],
     uint sg [[simdgroup_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]],
@@ -134,7 +144,7 @@ kernel void rms_qkv_rope(
         const ulong h = gid64 % (ulong)Hq;
         device float *row = q + ((t * (ulong)Hq + h) * (ulong)D);
         norm_rope_row(row, q_weight, row, D, rotary_dim,
-                             (ulong)pos_offset + t, theta, eps, true, lane, false);
+                             (ulong)pos_offset + t, inv_freq, eps, true, lane, false);
         return;
     }
     ulong g2 = gid64 - total_q;
@@ -143,7 +153,7 @@ kernel void rms_qkv_rope(
         const ulong h = g2 % (ulong)Hkv;
         device float *row = k + ((t * (ulong)Hkv + h) * (ulong)D);
         norm_rope_row(row, k_weight, row, D, rotary_dim,
-                             (ulong)pos_offset + t, theta, eps, true, lane, false);
+                             (ulong)pos_offset + t, inv_freq, eps, true, lane, false);
         return;
     }
     g2 -= total_kv;
@@ -153,7 +163,7 @@ kernel void rms_qkv_rope(
         device float *row = v + ((t * (ulong)Hkv + h) * (ulong)D);
         // V-norm: weight RMS only, no RoPE, no attn scale.
         norm_rope_row(row, v_weight, row, D, rotary_dim,
-                             0ul, theta, eps, false, lane, false);
+                             0ul, inv_freq, eps, false, lane, false);
     }
 }
 
@@ -175,6 +185,7 @@ kernel void rms_qkv_rope_posbuf(
     device const uint *pos_offset_ptr [[buffer(11)]],
     constant float &theta [[buffer(12)]],
     constant float &eps [[buffer(13)]],
+    constant float *inv_freq [[buffer(18)]],
     uint tg [[threadgroup_position_in_grid]],
     uint sg [[simdgroup_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]],
@@ -191,7 +202,7 @@ kernel void rms_qkv_rope_posbuf(
         const ulong h = gid64 % (ulong)Hq;
         device float *row = q + ((t * (ulong)Hq + h) * (ulong)D);
         norm_rope_row(row, q_weight, row, D, rotary_dim,
-                             pos_offset + t, theta, eps, true, lane, false);
+                             pos_offset + t, inv_freq, eps, true, lane, false);
         return;
     }
     ulong g2 = gid64 - total_q;
@@ -200,7 +211,7 @@ kernel void rms_qkv_rope_posbuf(
         const ulong h = g2 % (ulong)Hkv;
         device float *row = k + ((t * (ulong)Hkv + h) * (ulong)D);
         norm_rope_row(row, k_weight, row, D, rotary_dim,
-                             pos_offset + t, theta, eps, true, lane, false);
+                             pos_offset + t, inv_freq, eps, true, lane, false);
         return;
     }
     g2 -= total_kv;
@@ -209,7 +220,7 @@ kernel void rms_qkv_rope_posbuf(
         const ulong h = g2 % (ulong)Hkv;
         device float *row = v + ((t * (ulong)Hkv + h) * (ulong)D);
         norm_rope_row(row, v_weight, row, D, rotary_dim,
-                             0ul, theta, eps, false, lane, false);
+                             0ul, inv_freq, eps, false, lane, false);
     }
 }
 
@@ -237,6 +248,7 @@ kernel void rms_qkv_rope_kv_store(
     device float *dst_v [[buffer(15)]],
     device const uint *kv_dst_offset_ptr [[buffer(16)]],
     constant uint &kv_capacity [[buffer(17)]],
+    constant float *inv_freq [[buffer(18)]],
     uint tg [[threadgroup_position_in_grid]],
     uint sg [[simdgroup_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]],
@@ -261,7 +273,7 @@ kernel void rms_qkv_rope_kv_store(
         const ulong h = gid64 % (ulong)Hq;
         device float *row = q + ((t * (ulong)Hq + h) * (ulong)D);
         norm_rope_row(row, q_weight, row, D, rotary_dim,
-                             pos_offset + t, theta, eps, true, lane, false);
+                             pos_offset + t, inv_freq, eps, true, lane, false);
         return;
     }
     ulong g2 = gid64 - total_q;
@@ -271,7 +283,7 @@ kernel void rms_qkv_rope_kv_store(
         device float *row = k + ((t * (ulong)Hkv + h) * (ulong)D);
         device float *dst = dst_k + (kv_dst_offset + (t * (ulong)Hkv + h) * (ulong)D);
         norm_rope_row(row, k_weight, dst, D, rotary_dim,
-                            pos_offset + t, theta, eps, true, lane, true);
+                            pos_offset + t, inv_freq, eps, true, lane, true);
         return;
     }
     g2 -= total_kv;
@@ -281,6 +293,6 @@ kernel void rms_qkv_rope_kv_store(
         device float *row = v + ((t * (ulong)Hkv + h) * (ulong)D);
         device float *dst = dst_v + (kv_dst_offset + (t * (ulong)Hkv + h) * (ulong)D);
         norm_rope_row(row, v_weight, dst, D, rotary_dim,
-                            0ul, theta, eps, false, lane, true);
+                            0ul, inv_freq, eps, false, lane, true);
     }
 }

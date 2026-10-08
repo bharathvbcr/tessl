@@ -16,16 +16,22 @@
 //! `EMBEDGEMMA2_REF_DIR` overrides `target/embedgemma2_ref`. A missing
 //! variable or file fails the test rather than skipping it.
 //!
-//! Bounds, fixed before any run (the forward is transformers' fp32 forward up
-//! to operation order, with exact-f32 GEMMs):
+//! Bounds, fixed before the first run (the forward is transformers' fp32
+//! forward up to operation order, with exact-f32 GEMMs); the observed errors
+//! are recorded in `docs/embedgemma2.md`:
 //!
-//! * text 0's residual stream after every layer within `1e-4` of that layer's
-//!   largest magnitude, and the final norm's output likewise;
+//! * the residual stream after every layer within `1e-4` of that layer's
+//!   largest magnitude, and the final norm's output likewise, for text 0 and
+//!   for the 1658-token text (past twice the window, so the sliding and full
+//!   layers see different keys, and far enough that RoPE's frequency table
+//!   matters: `nn::rope_inv_freq`);
 //! * every text's embedding within `1e-4` (max abs, on unit vectors) of the
 //!   fp32 reference, cosine at least `0.99999`;
 //! * every text embedded alone and inside one ragged batch agree within
 //!   `1e-5` (padding is masked, so only GEMM tiling can move them); the
-//!   batch needs more than one forward, so the split is checked too.
+//!   batch needs more than one forward, so the split is checked too;
+//! * the Matryoshka prefixes (512, 256, 128) within the embedding bounds of
+//!   sentence-transformers' `encode(truncate_dim=d, normalize_embeddings=True)`.
 //!
 //! The bf16 reference is reported, not gated: it is how far the checkpoint's
 //! own dtype moves the embedding, the scale against which `1e-4` is small.
@@ -44,6 +50,8 @@ const LAYER_REL: f64 = 1e-4;
 const EMB_ABS: f64 = 1e-4;
 const EMB_COS: f64 = 0.99999;
 const BATCH_ABS: f64 = 1e-5;
+/// `make_reference.py`'s TRACE_LONG: the 1658-token text.
+const TRACE_LONG: usize = 6;
 
 fn ref_dir() -> PathBuf {
     std::env::var_os("EMBEDGEMMA2_REF_DIR")
@@ -60,7 +68,8 @@ fn snapshot() -> PathBuf {
 
 fn npy_f32(name: &str) -> (Vec<usize>, Vec<f32>) {
     let p = ref_dir().join(name);
-    let a = read_npy(&p).unwrap_or_else(|e| panic!("{}: {e} (run tools/embedgemma2_ref/make_reference.py)", p.display()));
+    let a =
+        read_npy(&p).unwrap_or_else(|e| panic!("{}: {e} (run tools/embedgemma2_ref/make_reference.py)", p.display()));
     (a.shape.clone(), a.f32_slice().expect("f32 reference").to_vec())
 }
 
@@ -74,7 +83,12 @@ fn texts() -> Vec<Vec<u32>> {
     let ids = npy_i64("ids.npy");
     let off = npy_i64("offsets.npy");
     off.windows(2)
-        .map(|w| ids[w[0] as usize..w[1] as usize].iter().map(|&i| u32::try_from(i).unwrap()).collect())
+        .map(|w| {
+            ids[w[0] as usize..w[1] as usize]
+                .iter()
+                .map(|&i| u32::try_from(i).unwrap())
+                .collect()
+        })
         .collect()
 }
 
@@ -86,7 +100,10 @@ fn cosine(a: &[f32], b: &[f32]) -> f64 {
 }
 
 fn max_abs(a: &[f32], b: &[f32]) -> f64 {
-    a.iter().zip(b).map(|(x, y)| (f64::from(*x) - f64::from(*y)).abs()).fold(0.0, f64::max)
+    a.iter()
+        .zip(b)
+        .map(|(x, y)| (f64::from(*x) - f64::from(*y)).abs())
+        .fold(0.0, f64::max)
 }
 
 #[test]
@@ -103,30 +120,54 @@ fn embedgemma2_matches_sentence_transformers() {
 
     with_gpu(|rt| {
         let model = EmbedGemma2Model::load(rt, &st, PREFIX, cfg.clone()).unwrap();
+        // Every numeric bound is checked and reported before the test fails,
+        // so one run shows the whole picture.
+        let mut failures: Vec<String> = Vec::new();
 
-        // 1. Layer by layer, text 0.
-        let out = model.encode(&[&texts[0]], true).unwrap();
+        // 1. Layer by layer: text 0, then the long text, which spans more
+        //    than two windows, so its sliding and full layers differ.
         let h = cfg.hidden as usize;
-        let t = texts[0].len();
-        assert_eq!(out.trace.len(), cfg.layers.len() + 1);
-        for (i, got) in out.trace.iter().enumerate() {
-            let name = if i < cfg.layers.len() { format!("trace_l{i}.npy") } else { "trace_final.npy".into() };
-            let (shape, want_l) = npy_f32(&name);
-            assert_eq!(shape, [t, h], "{name}");
-            let scale = want_l.iter().map(|v| f64::from(v.abs())).fold(0.0, f64::max);
-            let err = max_abs(&got[..t * h], &want_l);
-            assert!(err <= LAYER_REL * scale, "{name}: max abs {err:.3e} > {LAYER_REL:.0e} * {scale:.3e}");
+        for (n, prefix) in [(0usize, "trace"), (TRACE_LONG, "trace_long")] {
+            let t = texts[n].len();
+            if prefix == "trace_long" {
+                assert!(t > 2 * cfg.sliding_window as usize, "the long trace has {t} tokens");
+            }
+            let out = model.encode(&[&texts[n]], None, true).unwrap();
+            assert_eq!(out.trace.len(), cfg.layers.len() + 1);
+            for (i, got) in out.trace.iter().enumerate() {
+                let name = if i < cfg.layers.len() {
+                    format!("{prefix}_l{i}.npy")
+                } else {
+                    format!("{prefix}_final.npy")
+                };
+                let (shape, want_l) = npy_f32(&name);
+                assert_eq!(shape, [t, h], "{name}");
+                let scale = want_l.iter().map(|v| f64::from(v.abs())).fold(0.0, f64::max);
+                let err = max_abs(&got[..t * h], &want_l);
+                eprintln!(
+                    "{name}: {t} tokens, max abs {err:.3e} = {:.3e} of max |ref| {scale:.3e}",
+                    err / scale
+                );
+                if err > LAYER_REL * scale {
+                    failures.push(format!("{name}: max abs {err:.3e} > {LAYER_REL:.0e} * {scale:.3e}"));
+                }
+            }
         }
 
         // 2. Every text alone, against fp32 (gated) and bf16 (reported).
         let mut alone = Vec::new();
         for (n, ids) in texts.iter().enumerate() {
-            let e = model.encode(&[ids], false).unwrap().embeddings;
+            let e = model.encode(&[ids], None, false).unwrap().embeddings;
             let w = &want[n * dim..(n + 1) * dim];
             let (err, cos) = (max_abs(&e, w), cosine(&e, w));
             let cos16 = cosine(w, &bf16[n * dim..(n + 1) * dim]);
-            eprintln!("text {n}: {} tokens, max abs {err:.2e}, cosine {cos:.8}; bf16 ref vs fp32 ref cosine {cos16:.6}", ids.len());
-            assert!(err <= EMB_ABS && cos >= EMB_COS, "text {n}: max abs {err:.3e}, cosine {cos:.8}");
+            eprintln!(
+                "text {n}: {} tokens, max abs {err:.2e}, cosine {cos:.8}; bf16 ref vs fp32 ref cosine {cos16:.6}",
+                ids.len()
+            );
+            if !(err <= EMB_ABS && cos >= EMB_COS) {
+                failures.push(format!("text {n}: max abs {err:.3e}, cosine {cos:.8}"));
+            }
             let norm = e.iter().map(|v| f64::from(*v).powi(2)).sum::<f64>().sqrt();
             assert!((norm - 1.0).abs() < 1e-5, "text {n}: norm {norm}");
             alone.push(e);
@@ -136,20 +177,57 @@ fn embedgemma2_matches_sentence_transformers() {
         // The long document cannot share a forward with the rest under
         // MAX_BATCH_TOKENS, so this also checks the split and the reordering.
         let refs: Vec<&[u32]> = texts.iter().map(Vec::as_slice).collect();
-        let out = model.encode(&refs, false).unwrap();
-        assert!(out.forwards >= 2, "expected a split batch, got {} forward(s)", out.forwards);
+        let out = model.encode(&refs, None, false).unwrap();
+        assert!(
+            out.forwards >= 2,
+            "expected a split batch, got {} forward(s)",
+            out.forwards
+        );
         let batched = out.embeddings;
         for (n, e) in alone.iter().enumerate() {
             let err = max_abs(e, &batched[n * dim..(n + 1) * dim]);
-            assert!(err <= BATCH_ABS, "text {n}: alone vs batched max abs {err:.3e}");
+            eprintln!("text {n}: alone vs batched max abs {err:.2e}");
+            if err > BATCH_ABS {
+                failures.push(format!("text {n}: alone vs batched max abs {err:.3e}"));
+            }
         }
 
-        // 4. The refusals the API promises.
-        assert!(model.encode(&[], false).is_err(), "empty batch");
-        assert!(model.encode(&[&[]], false).is_err(), "empty sequence");
-        assert!(model.encode(&[&[cfg.vocab]], false).is_err(), "id past vocab");
-        assert!(model.encode(&[&texts[0], &texts[1]], true).is_err(), "trace takes one sequence");
+        // 4. Matryoshka prefixes, batched, against sentence-transformers'
+        //    encode(truncate_dim=d, normalize_embeddings=True).
+        for d in [512usize, 256, 128] {
+            let (shape, want) = npy_f32(&format!("emb_f32_trunc{d}.npy"));
+            assert_eq!(shape, [texts.len(), d]);
+            let got = model.encode(&refs, Some(d as u32), false).unwrap().embeddings;
+            for n in 0..texts.len() {
+                let (g, w) = (&got[n * d..(n + 1) * d], &want[n * d..(n + 1) * d]);
+                let (err, cos) = (max_abs(g, w), cosine(g, w));
+                eprintln!("prefix {d}, text {n}: max abs {err:.2e}, cosine {cos:.8}");
+                if !(err <= EMB_ABS && cos >= EMB_COS) {
+                    failures.push(format!("prefix {d}, text {n}: max abs {err:.3e}, cosine {cos:.8}"));
+                }
+            }
+        }
+
+        // 5. The refusals the API promises.
+        assert!(model.encode(&[], None, false).is_err(), "empty batch");
+        assert!(model.encode(&[&[]], None, false).is_err(), "empty sequence");
+        assert!(model.encode(&[&[cfg.vocab]], None, false).is_err(), "id past vocab");
+        assert!(
+            model.encode(&[&texts[0], &texts[1]], None, true).is_err(),
+            "trace takes one sequence"
+        );
         let too_long = vec![2u32; model.max_tokens() as usize + 1];
-        assert!(model.encode(&[&too_long], false).is_err(), "past max_tokens");
+        assert!(model.encode(&[&too_long], None, false).is_err(), "past max_tokens");
+        assert!(
+            model.encode(&[&texts[0]], Some(769), false).is_err(),
+            "truncate_dim past 768"
+        );
+
+        assert!(
+            failures.is_empty(),
+            "{} bound(s) exceeded:\n{}",
+            failures.len(),
+            failures.join("\n")
+        );
     });
 }

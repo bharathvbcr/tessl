@@ -50,7 +50,9 @@ use objc2_metal::MTLComputePipelineState;
 
 use crate::dispatch::{dispatch_2d, set_f32, set_gpu_buf, set_gpu_buf_offset, set_u32, Binder};
 use crate::gemm::{gemm, gemm_epilogue, Epilogue, GemmBackend};
-use crate::nn::{dispatch_tg_1d, reduce_tptg, require, require_disjoint_writes, require_runtime, validate_rms_scalars};
+use crate::nn::{
+    bind_rope_inv_freq, dispatch_tg_1d, reduce_tptg, require, require_disjoint_writes, require_runtime, validate_rms_scalars,
+};
 use crate::runtime::{mtl_size, GpuRuntime};
 use crate::tensor::{DType, GpuBuffer, Tensor};
 
@@ -1992,7 +1994,7 @@ fn qk_norm_rope_impl(
                 RopePos::Buffer(b) | RopePos::PerRow(b) => set_gpu_buf(bnd, b, 16),
             }
             set_u32(bnd, kv_capacity, 17);
-            set_f32(bnd, theta, 18);
+            bind_rope_inv_freq(bnd, s.rotary_dim / 2, s.rotary_dim, theta, 18);
             set_f32(bnd, eps, 19);
             set_u32(bnd, slot_base, 20);
             set_u32(bnd, u32::from(matches!(pos, RopePos::PerRow(_))), 21);

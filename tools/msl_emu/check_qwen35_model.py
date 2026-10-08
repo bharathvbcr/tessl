@@ -147,7 +147,7 @@ def gdn_layer(attn, h, B, T, conv_state=None, gdn_state=None, snapshot=False, pa
     return out.reshape(B, T, HIDDEN), c["state_out"], o["state_out"]
 
 
-def attn_layer(sa, h, B, T, pos, k_cache, v_cache, prefix=None, rows=None):
+def attn_layer(sa, inv_freq, h, B, T, pos, k_cache, v_cache, prefix=None, rows=None):
     """One Qwen3_5Attention on the kernels, appending to `[B, cap, Hkv, D]` caches.
 
     With `prefix = (kp, vp, P)` the caches are suffix caches (slot s is position
@@ -165,9 +165,9 @@ def attn_layer(sa, h, B, T, pos, k_cache, v_cache, prefix=None, rows=None):
     proj = (h.reshape(B * T, HIDDEN) @ pack(sa.q_proj, sa.k_proj, sa.v_proj)).contiguous()
     rope_params = dict(B=B, T=T, Hq=HQ, Hkv=HKV, D=D, rotary_dim=D // 4, ld_p=L.attn_width, q_off=0,
                        k_off=L.attn_k_off, v_off=L.attn_v_off, pos_offset=pos, kv_capacity=cap,
-                       theta=1e7, eps=EPS, slot_base=P)
+                       eps=EPS, slot_base=P)
     rope_in = {"p": proj, "q_norm_w": sa.q_norm.weight.detach(), "k_norm_w": sa.k_norm.weight.detach(),
-               "k_cache": k_cache, "v_cache": v_cache}
+               "k_cache": k_cache, "v_cache": v_cache, "inv_freq": inv_freq}
     if rows is not None:
         rope_params.update(pos_offset=0, posbuf=1, pos_stride=1)
         rope_in["pos_buf"] = torch.tensor(rows["pos"], dtype=torch.int32)
@@ -274,7 +274,7 @@ def forward(model, ids, pos=0, state=None, cap=None, snapshot=False, paths=None,
             else:
                 kc = torch.full((B, shared["cap"], HKV, D), float("nan"))
                 vc = torch.full((B, shared["cap"], HKV, D), float("nan"))
-            out, st.k[i], st.v[i] = attn_layer(layer.self_attn, h, B, T, pos, kc, vc,
+            out, st.k[i], st.v[i] = attn_layer(layer.self_attn, model.model.rotary_emb.inv_freq, h, B, T, pos, kc, vc,
                                                prefix=(kp, vp, shared["P"]), rows=rows)
         else:
             if st_in is None:
@@ -287,7 +287,7 @@ def forward(model, ids, pos=0, state=None, cap=None, snapshot=False, paths=None,
                 vc = torch.full((B, cap, HKV, D), float("nan"))
                 kc[:, :pos] = st_in.k[i][:, :pos]
                 vc[:, :pos] = st_in.v[i][:, :pos]
-            out, st.k[i], st.v[i] = attn_layer(layer.self_attn, h, B, T, pos, kc, vc)
+            out, st.k[i], st.v[i] = attn_layer(layer.self_attn, model.model.rotary_emb.inv_freq, h, B, T, pos, kc, vc)
         x = x + out
         with torch.no_grad():
             x = x + layer.mlp(layer.post_attention_layernorm(x))

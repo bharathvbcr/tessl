@@ -18,6 +18,10 @@ pub mod gdn_train;
 /// f64 references for the Qwen3.5 kernels, anchored to transformers by fixture.
 pub mod qwen35;
 
+/// f64 references for EmbeddingGemma 2's pieces, anchored to transformers by
+/// fixture, and composable into a whole forward.
+pub mod embedgemma2;
+
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use tessl::tensor::{bf16_bits_to_f32, f32_slice_to_bf16, GpuBuffer};

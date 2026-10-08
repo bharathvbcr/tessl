@@ -37,6 +37,8 @@ const QWEN35_ADAMW: &str = include_str!("../kernels/qwen35_adamw.metal");
 const ENCODER_ATTN: &str = include_str!("../kernels/encoder_attn.metal");
 const EMBED_POOL: &str = include_str!("../kernels/embed_pool.metal");
 const MTL_TENSOR: &str = include_str!("../kernels/mtl_tensor.metal");
+const BERT: &str = include_str!("../kernels/bert.metal");
+const QWEN35_TRAIN_STORAGE: &str = include_str!("../kernels/qwen35_train_storage.metal");
 
 /// Every `.metal` file this suite inspects.
 ///
@@ -44,6 +46,7 @@ const MTL_TENSOR: &str = include_str!("../kernels/mtl_tensor.metal");
 /// `every_kernel_source_is_inspected_or_explicitly_exempt`, so a new kernel
 /// cannot join the build without someone deciding which list it belongs on.
 const INSPECTED_KERNELS: &[&str] = &[
+    "bert.metal",
     "cross_entropy.metal",
     "embed_lookup.metal",
     "embed_pool.metal",
@@ -69,6 +72,7 @@ const INSPECTED_KERNELS: &[&str] = &[
     "qwen35_gdn.metal",
     "qwen35_mlp.metal",
     "qwen35_score.metal",
+    "qwen35_train_storage.metal",
     "reduce.metal",
     "rms_norm.metal",
     "rms_qkv_rope.metal",
@@ -716,6 +720,66 @@ fn mtl_tensor_probe_offsets_are_widened() {
         ("out[(ulong)r * (ulong)cols + (ulong)c] =", "read-out store"),
     ] {
         require(MTL_TENSOR, needle, what);
+    }
+}
+
+/// The BERT row kernels address `[rows, dim]` rows and the `[vocab, dim]`
+/// embedding tables, and the sparse max reads `[rows, V]` logits: every row
+/// base is formed in 64 bits. The bias kernels' flat `gid` and the sparse
+/// max's `S * V` grid are bounded to `u32` on the host (`bert::bias_add` /
+/// `bias_gelu_erf` refuse more elements, and `dispatch_1d` refuses a larger
+/// grid).
+#[test]
+fn bert_offsets_are_widened() {
+    for (needle, what) in [
+        (
+            "device const float *wr = word + (ulong)(bad ? 0u : id) * dim;",
+            "word embedding row",
+        ),
+        (
+            "device const float *pr = pos + (ulong)(row % seq) * dim;",
+            "position embedding row",
+        ),
+        ("device float *o = out + (ulong)row * dim;", "output row"),
+        ("device const float *yr = y + (ulong)row * dim;", "residual input row"),
+        ("device float *rr = resid + (ulong)row * dim;", "residual row"),
+        ("device const float *xr = x + (ulong)row * dim;", "layer-norm input row"),
+        ("if ((ulong)gid >= (ulong)S * V) return;", "sparse max grid guard"),
+        (
+            "const uint end = min(segments[2u * s + 1u], rows);",
+            "clamped segment end",
+        ),
+        ("m = max(m, logits[(ulong)r * V + v]);", "logits row"),
+        ("device float *p = pooled + (ulong)s * V + v;", "pooled store"),
+    ] {
+        require(BERT, needle, what);
+    }
+}
+
+/// The stored-precision AdamW and the window casts address packed `[in,
+/// total]` projections through `(row, ld, off)`: every window element is
+/// formed in 64 bits, and the squared-norm loop strides in 64 bits so a width
+/// near `u32::MAX` cannot wrap it into a hang. Dense state indices are `uint`, bounded on the host by
+/// `Window::check` (every count fits `u32`), so a grid of 256-thread blocks
+/// over them ends at thread `2^32 - 1` at most.
+#[test]
+fn qwen35_train_storage_offsets_are_widened() {
+    for (needle, what) in [
+        (
+            "const ulong wi = (ulong)r * ld + off + (live ? i - r * width : 0u);",
+            "AdamW window element",
+        ),
+        (
+            "dst[(ulong)gid.y * dst_ld + dst_off + gid.x] = D(float(src[(ulong)gid.y * src_ld + src_off + gid.x]));",
+            "window cast element",
+        ),
+        ("const ulong base = (ulong)r * ld + off;", "squared-norm row"),
+        (
+            "for (ulong c = t; c < (ulong)width; c += 256ul) {",
+            "squared-norm strided loop",
+        ),
+    ] {
+        require(QWEN35_TRAIN_STORAGE, needle, what);
     }
 }
 

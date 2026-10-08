@@ -347,7 +347,7 @@ kernel void qwen35_sq_sum_rows_bf16(
     threadgroup float part[32];
     const ulong base = (ulong)r * ld + off;
     float s = 0.0f;
-    for (uint c = t; c < width; c += 256) {
+    for (ulong c = t; c < (ulong)width; c += 256ul) {
         const float x = float(g[base + c]);
         s = fma(x, x, s);
     }

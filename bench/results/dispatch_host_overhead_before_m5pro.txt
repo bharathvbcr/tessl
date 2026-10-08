@@ -1,0 +1,433 @@
+# bench_nn_kernels BEFORE the dispatch host-overhead changes — M5 Pro, 2026-10-08
+#
+# Binary: bench_nn_kernels built at e91121e (the harness commit: host-us column, host
+# path section, decode-style sample loops, --decode; no library change),
+# frozen and run through
+#
+#   BENCH_BINS="before=<frozen e91121e binary>" bench/paired_bins.sh 5 OUT (no arguments: kernel table + host path)
+#
+# One process per round; each process reports medians; the summary is the
+# min (max) of those over 5 rounds. host_us = batched-arm encode per dispatch
+# (64 per command buffer, before its synchronize). sample_* = one token per
+# loop: final-norm-sized rms_norm + sampler over vocab 248320, async encode
+# on, token read back. decode_* = batch-1 Qwen3.5-2B-shaped decode through
+# 24 layers after a 4096-token prefix (random bf16 weights), encode and
+# commit+wait timed apart; LM head and sampler excluded.
+#
+# Conditions: the machine was shared. Other sessions ran cargo test suites
+# (GitPulse, Lappi-decision mac_heavy lanes) on the CPU throughout, and a
+# peer tessl session's qwen35_train test was on the GPU shortly before. The
+# max column shows that load. Compare against the interleaved before/after
+# run (*_after_m5pro.txt), not against these alone.
+#
+# ---- round 0, before: /private/tmp/claude-501/-Users-bharath-Code-research-tessl/0bc74f4b-1227-426e-b4b6-22f33db83c11/scratchpad/before/bench_nn_kernels  ----
+device: Apple M5 Pro
+batched = 64 dispatches per command buffer; solo = 1 dispatch + synchronize; host = batched encode before its synchronize
+
+kernel                                            shape   batched us    host us      solo us       GB/s
+rms_norm_f32                                     1x4096       12.267      0.815      262.105        4.0
+rms_norm_f32                                   512x4096       66.243      1.023      253.479      253.5
+rms_norm_f32                                  2048x4096      382.608      1.048      626.292      175.4
+mlp_silu                                         n=4096       15.171      0.771      208.250        3.2
+mlp_gelu_tanh                                    n=4096        5.678      0.635      230.625        8.7
+mlp_silu                                      n=1048576       32.419      0.925      265.729      388.1
+mlp_gelu_tanh                                 n=1048576       33.000      0.997      190.729      381.3
+mlp_silu                                      n=8388608      634.412      0.990      776.292      158.7
+mlp_gelu_tanh                                 n=8388608      597.236      1.017      654.208      168.5
+softmax_rows_f32                                32x1024        6.460      0.689      162.625       40.6
+row_sum_f32                                     32x1024        5.193      0.627      206.708       25.3
+row_max_f32                                     32x1024        5.424      0.764      204.646       24.2
+softmax_rows_f32                               512x4096       87.243      1.260      298.646      192.3
+row_sum_f32                                    512x4096       40.796      1.127      404.188      205.7
+row_max_f32                                    512x4096       29.211      1.211      252.875      287.2
+softmax_rows_f32                              2048x8192      770.539      1.307     1154.188      174.2
+row_sum_f32                                   2048x8192      377.154      1.310      538.645      178.0
+row_max_f32                                   2048x8192      376.880      1.269      535.979      178.1
+gemv_q8                                       4096x4096      161.680      1.176      426.708      116.9
+gemv_q8                                      11008x4096      410.511      1.264      657.958      123.7
+gemv_q4 [row]                                 4096x4096       58.493      1.605      250.084      179.8
+gemv_q4 [tiled]                               4096x4096      255.430      1.688      398.438       41.2
+gemv_q4 [row]                                11008x4096      202.058      1.436      438.250      139.8
+gemv_q4 [tiled]                              11008x4096      607.910      1.611      756.146       46.5
+gemm_i8_dequant [10464 GFLOP/s]             512x512x512       25.653      1.210      234.041       61.3
+gemm_i8_dequant [35386 GFLOP/s]          2048x2048x2048      485.500      1.289      888.813       51.8
+
+Median host encode per batched dispatch: 1.15 us.
+METRIC host_us/rms_norm_f32/1x4096 0.8148
+METRIC host_us/rms_norm_f32/512x4096 1.0231
+METRIC host_us/rms_norm_f32/2048x4096 1.0485
+METRIC host_us/mlp_silu/n=4096 0.7715
+METRIC host_us/mlp_gelu_tanh/n=4096 0.6354
+METRIC host_us/mlp_silu/n=1048576 0.9248
+METRIC host_us/mlp_gelu_tanh/n=1048576 0.9974
+METRIC host_us/mlp_silu/n=8388608 0.9899
+METRIC host_us/mlp_gelu_tanh/n=8388608 1.0166
+METRIC host_us/softmax_rows_f32/32x1024 0.6891
+METRIC host_us/row_sum_f32/32x1024 0.6266
+METRIC host_us/row_max_f32/32x1024 0.7637
+METRIC host_us/softmax_rows_f32/512x4096 1.2601
+METRIC host_us/row_sum_f32/512x4096 1.1266
+METRIC host_us/row_max_f32/512x4096 1.2109
+METRIC host_us/softmax_rows_f32/2048x8192 1.3073
+METRIC host_us/row_sum_f32/2048x8192 1.3096
+METRIC host_us/row_max_f32/2048x8192 1.2689
+METRIC host_us/gemv_q8/4096x4096 1.1758
+METRIC host_us/gemv_q8/11008x4096 1.2637
+METRIC host_us/gemv_q4row/4096x4096 1.6048
+METRIC host_us/gemv_q4tiled/4096x4096 1.6875
+METRIC host_us/gemv_q4row/11008x4096 1.4362
+METRIC host_us/gemv_q4tiled/11008x4096 1.6110
+METRIC host_us/gemm_i8_dequant/512x512x512 1.2096
+METRIC host_us/gemm_i8_dequant/2048x2048x2048 1.2894
+METRIC host_us/median 1.1512
+
+Median solo dispatch: 348.5 us. Every kernel whose batched time is below that is
+entirely inside the submit-and-wait floor when issued alone.
+
+-- host path --
+pipeline hit:               24.0 ns
+pipeline hit (ICB):         90.3 ns
+METRIC pipeline_hit_ns 24.019
+METRIC pipeline_hit_icb_ns 90.252
+softcap_argmax_one_pass token loop: encode   539.61 us, wall   539.78 us per token (token 117223)
+METRIC sample_one_pass_encode_us 539.6061
+METRIC sample_one_pass_wall_us 539.7793
+argmax_f32_pass x3 token loop:  encode  2455.97 us, wall  2456.13 us per token (token 117223)
+METRIC sample_multi_pass_encode_us 2455.9688
+METRIC sample_multi_pass_wall_us 2456.1303
+# ---- round 1, before: /private/tmp/claude-501/-Users-bharath-Code-research-tessl/0bc74f4b-1227-426e-b4b6-22f33db83c11/scratchpad/before/bench_nn_kernels  ----
+device: Apple M5 Pro
+batched = 64 dispatches per command buffer; solo = 1 dispatch + synchronize; host = batched encode before its synchronize
+
+kernel                                            shape   batched us    host us      solo us       GB/s
+rms_norm_f32                                     1x4096       10.067      0.852      334.312        4.9
+rms_norm_f32                                   512x4096       73.644      1.002      293.271      228.0
+rms_norm_f32                                  2048x4096      390.334      1.034      539.688      172.0
+mlp_silu                                         n=4096        5.299      0.658      214.979        9.3
+mlp_gelu_tanh                                    n=4096        7.410      0.746      181.979        6.6
+mlp_silu                                      n=1048576       33.647      0.958      207.459      374.0
+mlp_gelu_tanh                                 n=1048576       60.451      0.997      248.437      208.2
+mlp_silu                                      n=8388608      643.551      1.035      722.562      156.4
+mlp_gelu_tanh                                 n=8388608      605.982      1.026      729.667      166.1
+softmax_rows_f32                                32x1024        6.311      0.827      170.875       41.5
+row_sum_f32                                     32x1024        6.028      0.828      210.292       21.8
+row_max_f32                                     32x1024        5.170      0.800      145.000       25.4
+softmax_rows_f32                               512x4096       89.240      1.229      463.604      188.0
+row_sum_f32                                    512x4096       41.398      1.222      269.625      202.7
+row_max_f32                                    512x4096       31.808      1.165      236.605      263.8
+softmax_rows_f32                              2048x8192      773.785      1.303      865.980      173.5
+row_sum_f32                                   2048x8192      382.359      1.296      562.875      175.5
+row_max_f32                                   2048x8192      381.414      1.252      577.583      176.0
+gemv_q8                                       4096x4096      163.198      1.279      748.750      115.9
+gemv_q8                                      11008x4096      403.684      1.805      664.354      125.8
+gemv_q4 [row]                                 4096x4096       74.895      1.609      403.021      140.4
+gemv_q4 [tiled]                               4096x4096      252.491      1.729     1426.979       41.7
+gemv_q4 [row]                                11008x4096      174.922      1.942      505.521      161.4
+gemv_q4 [tiled]                              11008x4096      593.023      1.721     1075.250       47.6
+gemm_i8_dequant [7105 GFLOP/s]              512x512x512       37.779      1.738      437.188       41.6
+gemm_i8_dequant [36408 GFLOP/s]          2048x2048x2048      471.876      1.577      719.730       53.3
+
+Median host encode per batched dispatch: 1.19 us.
+METRIC host_us/rms_norm_f32/1x4096 0.8516
+METRIC host_us/rms_norm_f32/512x4096 1.0023
+METRIC host_us/rms_norm_f32/2048x4096 1.0335
+METRIC host_us/mlp_silu/n=4096 0.6582
+METRIC host_us/mlp_gelu_tanh/n=4096 0.7461
+METRIC host_us/mlp_silu/n=1048576 0.9577
+METRIC host_us/mlp_gelu_tanh/n=1048576 0.9974
+METRIC host_us/mlp_silu/n=8388608 1.0348
+METRIC host_us/mlp_gelu_tanh/n=8388608 1.0264
+METRIC host_us/softmax_rows_f32/32x1024 0.8275
+METRIC host_us/row_sum_f32/32x1024 0.8281
+METRIC host_us/row_max_f32/32x1024 0.7998
+METRIC host_us/softmax_rows_f32/512x4096 1.2295
+METRIC host_us/row_sum_f32/512x4096 1.2220
+METRIC host_us/row_max_f32/512x4096 1.1647
+METRIC host_us/softmax_rows_f32/2048x8192 1.3034
+METRIC host_us/row_sum_f32/2048x8192 1.2962
+METRIC host_us/row_max_f32/2048x8192 1.2519
+METRIC host_us/gemv_q8/4096x4096 1.2790
+METRIC host_us/gemv_q8/11008x4096 1.8047
+METRIC host_us/gemv_q4row/4096x4096 1.6087
+METRIC host_us/gemv_q4tiled/4096x4096 1.7295
+METRIC host_us/gemv_q4row/11008x4096 1.9421
+METRIC host_us/gemv_q4tiled/11008x4096 1.7210
+METRIC host_us/gemm_i8_dequant/512x512x512 1.7383
+METRIC host_us/gemm_i8_dequant/2048x2048x2048 1.5768
+METRIC host_us/median 1.1934
+
+Median solo dispatch: 450.4 us. Every kernel whose batched time is below that is
+entirely inside the submit-and-wait floor when issued alone.
+
+-- host path --
+pipeline hit:               27.3 ns
+pipeline hit (ICB):         96.2 ns
+METRIC pipeline_hit_ns 27.311
+METRIC pipeline_hit_icb_ns 96.230
+softcap_argmax_one_pass token loop: encode   427.17 us, wall   427.35 us per token (token 117223)
+METRIC sample_one_pass_encode_us 427.1705
+METRIC sample_one_pass_wall_us 427.3534
+argmax_f32_pass x3 token loop:  encode  1872.77 us, wall  1872.94 us per token (token 117223)
+METRIC sample_multi_pass_encode_us 1872.7695
+METRIC sample_multi_pass_wall_us 1872.9421
+# ---- round 2, before: /private/tmp/claude-501/-Users-bharath-Code-research-tessl/0bc74f4b-1227-426e-b4b6-22f33db83c11/scratchpad/before/bench_nn_kernels  ----
+device: Apple M5 Pro
+batched = 64 dispatches per command buffer; solo = 1 dispatch + synchronize; host = batched encode before its synchronize
+
+kernel                                            shape   batched us    host us      solo us       GB/s
+rms_norm_f32                                     1x4096       14.996      0.987      282.354        3.3
+rms_norm_f32                                   512x4096       72.271      1.704      345.292      232.4
+rms_norm_f32                                  2048x4096      381.623      1.624      667.729      175.9
+mlp_silu                                         n=4096       27.679      0.944      313.291        1.8
+mlp_gelu_tanh                                    n=4096       11.898      0.710      443.771        4.1
+mlp_silu                                      n=1048576       32.776      0.918      271.791      383.9
+mlp_gelu_tanh                                 n=1048576       55.187      1.098      295.604      228.0
+mlp_silu                                      n=8388608      632.623      1.212      658.333      159.1
+mlp_gelu_tanh                                 n=8388608      553.206      1.031      702.125      182.0
+softmax_rows_f32                                32x1024        7.819      1.062      211.959       33.5
+row_sum_f32                                     32x1024        5.828      0.931      228.771       22.5
+row_max_f32                                     32x1024        8.369      1.063      156.146       15.7
+softmax_rows_f32                               512x4096       91.973      1.224      221.750      182.4
+row_sum_f32                                    512x4096       28.455      1.274      285.541      294.9
+row_max_f32                                    512x4096       27.600      1.149      296.854      304.0
+softmax_rows_f32                              2048x8192      737.345      1.298     1034.271      182.0
+row_sum_f32                                   2048x8192      364.574      1.311      533.938      184.1
+row_max_f32                                   2048x8192      367.582      1.297      706.208      182.6
+gemv_q8                                       4096x4096      168.615      1.852      428.459      112.1
+gemv_q8                                      11008x4096      426.176      1.334      874.167      119.2
+gemv_q4 [row]                                 4096x4096       74.598      1.569      675.896      141.0
+gemv_q4 [tiled]                               4096x4096      247.543      1.573      560.604       42.5
+gemv_q4 [row]                                11008x4096      197.143      1.349      896.667      143.3
+gemv_q4 [tiled]                              11008x4096      647.387      2.082      954.854       43.6
+gemm_i8_dequant [11141 GFLOP/s]             512x512x512       24.094      1.353      283.480       65.3
+gemm_i8_dequant [35359 GFLOP/s]          2048x2048x2048      485.875      1.382      719.167       51.8
+
+Median host encode per batched dispatch: 1.29 us.
+METRIC host_us/rms_norm_f32/1x4096 0.9873
+METRIC host_us/rms_norm_f32/512x4096 1.7038
+METRIC host_us/rms_norm_f32/2048x4096 1.6237
+METRIC host_us/mlp_silu/n=4096 0.9437
+METRIC host_us/mlp_gelu_tanh/n=4096 0.7103
+METRIC host_us/mlp_silu/n=1048576 0.9180
+METRIC host_us/mlp_gelu_tanh/n=1048576 1.0977
+METRIC host_us/mlp_silu/n=8388608 1.2116
+METRIC host_us/mlp_gelu_tanh/n=8388608 1.0309
+METRIC host_us/softmax_rows_f32/32x1024 1.0625
+METRIC host_us/row_sum_f32/32x1024 0.9313
+METRIC host_us/row_max_f32/32x1024 1.0628
+METRIC host_us/softmax_rows_f32/512x4096 1.2240
+METRIC host_us/row_sum_f32/512x4096 1.2741
+METRIC host_us/row_max_f32/512x4096 1.1491
+METRIC host_us/softmax_rows_f32/2048x8192 1.2985
+METRIC host_us/row_sum_f32/2048x8192 1.3109
+METRIC host_us/row_max_f32/2048x8192 1.2969
+METRIC host_us/gemv_q8/4096x4096 1.8519
+METRIC host_us/gemv_q8/11008x4096 1.3340
+METRIC host_us/gemv_q4row/4096x4096 1.5687
+METRIC host_us/gemv_q4tiled/4096x4096 1.5729
+METRIC host_us/gemv_q4row/11008x4096 1.3486
+METRIC host_us/gemv_q4tiled/11008x4096 2.0817
+METRIC host_us/gemm_i8_dequant/512x512x512 1.3532
+METRIC host_us/gemm_i8_dequant/2048x2048x2048 1.3825
+METRIC host_us/median 1.2855
+
+Median solo dispatch: 436.1 us. Every kernel whose batched time is below that is
+entirely inside the submit-and-wait floor when issued alone.
+
+-- host path --
+pipeline hit:               23.9 ns
+pipeline hit (ICB):         80.9 ns
+METRIC pipeline_hit_ns 23.936
+METRIC pipeline_hit_icb_ns 80.875
+softcap_argmax_one_pass token loop: encode   451.32 us, wall   451.51 us per token (token 117223)
+METRIC sample_one_pass_encode_us 451.3165
+METRIC sample_one_pass_wall_us 451.5052
+argmax_f32_pass x3 token loop:  encode  1598.60 us, wall  1599.30 us per token (token 117223)
+METRIC sample_multi_pass_encode_us 1598.5977
+METRIC sample_multi_pass_wall_us 1599.2989
+# ---- round 3, before: /private/tmp/claude-501/-Users-bharath-Code-research-tessl/0bc74f4b-1227-426e-b4b6-22f33db83c11/scratchpad/before/bench_nn_kernels  ----
+device: Apple M5 Pro
+batched = 64 dispatches per command buffer; solo = 1 dispatch + synchronize; host = batched encode before its synchronize
+
+kernel                                            shape   batched us    host us      solo us       GB/s
+rms_norm_f32                                     1x4096       10.001      0.878      317.896        4.9
+rms_norm_f32                                   512x4096       49.202      0.991      229.188      341.3
+rms_norm_f32                                  2048x4096      384.632      1.065      702.167      174.5
+mlp_silu                                         n=4096        5.176      0.616      224.937        9.5
+mlp_gelu_tanh                                    n=4096        4.908      0.664      177.791       10.0
+mlp_silu                                      n=1048576       33.452      1.045      274.708      376.2
+mlp_gelu_tanh                                 n=1048576       34.465      1.035      278.562      365.1
+mlp_silu                                      n=8388608      631.130      1.074      753.271      159.5
+mlp_gelu_tanh                                 n=8388608      578.959      0.986      721.500      173.9
+softmax_rows_f32                                32x1024        5.784      0.732      153.812       45.3
+row_sum_f32                                     32x1024        5.073      0.729      174.812       25.9
+row_max_f32                                     32x1024        5.517      0.856      182.396       23.8
+softmax_rows_f32                               512x4096       88.252      1.255      287.062      190.1
+row_sum_f32                                    512x4096       27.829      1.154      181.813      301.5
+row_max_f32                                    512x4096       30.666      1.141      222.875      273.6
+softmax_rows_f32                              2048x8192      764.713      1.272      877.833      175.5
+row_sum_f32                                   2048x8192      367.647      1.309      676.521      182.6
+row_max_f32                                   2048x8192      373.064      1.240      838.854      179.9
+gemv_q8                                       4096x4096      169.749      1.160      359.917      111.4
+gemv_q8                                      11008x4096      401.353      1.641      638.750      126.5
+gemv_q4 [row]                                 4096x4096       65.647      1.585      276.333      160.2
+gemv_q4 [tiled]                               4096x4096      260.091      1.670      468.834       40.4
+gemv_q4 [row]                                11008x4096      192.206      1.368      306.625      146.9
+gemv_q4 [tiled]                              11008x4096      613.189      1.639      709.376       46.1
+gemm_i8_dequant [12029 GFLOP/s]             512x512x512       22.316      1.139      178.375       70.5
+gemm_i8_dequant [35494 GFLOP/s]          2048x2048x2048      484.018      1.352      936.812       52.0
+
+Median host encode per batched dispatch: 1.14 us.
+METRIC host_us/rms_norm_f32/1x4096 0.8783
+METRIC host_us/rms_norm_f32/512x4096 0.9912
+METRIC host_us/rms_norm_f32/2048x4096 1.0651
+METRIC host_us/mlp_silu/n=4096 0.6159
+METRIC host_us/mlp_gelu_tanh/n=4096 0.6641
+METRIC host_us/mlp_silu/n=1048576 1.0446
+METRIC host_us/mlp_gelu_tanh/n=1048576 1.0355
+METRIC host_us/mlp_silu/n=8388608 1.0736
+METRIC host_us/mlp_gelu_tanh/n=8388608 0.9860
+METRIC host_us/softmax_rows_f32/32x1024 0.7318
+METRIC host_us/row_sum_f32/32x1024 0.7285
+METRIC host_us/row_max_f32/32x1024 0.8561
+METRIC host_us/softmax_rows_f32/512x4096 1.2549
+METRIC host_us/row_sum_f32/512x4096 1.1536
+METRIC host_us/row_max_f32/512x4096 1.1413
+METRIC host_us/softmax_rows_f32/2048x8192 1.2725
+METRIC host_us/row_sum_f32/2048x8192 1.3092
+METRIC host_us/row_max_f32/2048x8192 1.2396
+METRIC host_us/gemv_q8/4096x4096 1.1595
+METRIC host_us/gemv_q8/11008x4096 1.6409
+METRIC host_us/gemv_q4row/4096x4096 1.5846
+METRIC host_us/gemv_q4tiled/4096x4096 1.6696
+METRIC host_us/gemv_q4row/11008x4096 1.3682
+METRIC host_us/gemv_q4tiled/11008x4096 1.6387
+METRIC host_us/gemm_i8_dequant/512x512x512 1.1393
+METRIC host_us/gemm_i8_dequant/2048x2048x2048 1.3516
+METRIC host_us/median 1.1403
+
+Median solo dispatch: 296.8 us. Every kernel whose batched time is below that is
+entirely inside the submit-and-wait floor when issued alone.
+
+-- host path --
+pipeline hit:               25.8 ns
+pipeline hit (ICB):         90.3 ns
+METRIC pipeline_hit_ns 25.786
+METRIC pipeline_hit_icb_ns 90.273
+softcap_argmax_one_pass token loop: encode   301.70 us, wall   301.85 us per token (token 117223)
+METRIC sample_one_pass_encode_us 301.6973
+METRIC sample_one_pass_wall_us 301.8516
+argmax_f32_pass x3 token loop:  encode  1059.85 us, wall  1059.99 us per token (token 117223)
+METRIC sample_multi_pass_encode_us 1059.8523
+METRIC sample_multi_pass_wall_us 1059.9864
+# ---- round 4, before: /private/tmp/claude-501/-Users-bharath-Code-research-tessl/0bc74f4b-1227-426e-b4b6-22f33db83c11/scratchpad/before/bench_nn_kernels  ----
+device: Apple M5 Pro
+batched = 64 dispatches per command buffer; solo = 1 dispatch + synchronize; host = batched encode before its synchronize
+
+kernel                                            shape   batched us    host us      solo us       GB/s
+rms_norm_f32                                     1x4096        8.259      0.719      148.125        6.0
+rms_norm_f32                                   512x4096       48.146      0.987      192.541      348.8
+rms_norm_f32                                  2048x4096      386.062      1.035      497.375      173.9
+mlp_silu                                         n=4096        3.837      0.499      163.688       12.8
+mlp_gelu_tanh                                    n=4096        4.113      0.465      167.730       11.9
+mlp_silu                                      n=1048576       33.063      0.954      225.667      380.6
+mlp_gelu_tanh                                 n=1048576       34.204      0.977      250.583      367.9
+mlp_silu                                      n=8388608      642.402      1.042      699.542      156.7
+mlp_gelu_tanh                                 n=8388608      601.781      0.972      665.875      167.3
+softmax_rows_f32                                32x1024        5.448      0.652      164.146       48.1
+row_sum_f32                                     32x1024        4.830      0.715      149.645       27.2
+row_max_f32                                     32x1024        4.131      0.565      163.438       31.8
+softmax_rows_f32                               512x4096       85.513      1.043      238.604      196.2
+row_sum_f32                                    512x4096       25.353      1.010      187.875      331.0
+row_max_f32                                    512x4096       24.953      0.998      152.895      336.3
+softmax_rows_f32                              2048x8192      778.104      1.300      860.083      172.5
+row_sum_f32                                   2048x8192      385.693      1.326      859.146      174.0
+row_max_f32                                   2048x8192      395.065      1.279      767.875      169.9
+gemv_q8                                       4096x4096      172.360      1.187      713.583      109.7
+gemv_q8                                      11008x4096      416.989      1.258      836.417      121.8
+gemv_q4 [row]                                 4096x4096       62.901      1.534      355.062      167.2
+gemv_q4 [tiled]                               4096x4096      251.668      1.581      395.083       41.8
+gemv_q4 [row]                                11008x4096      192.884      1.431      425.250      146.4
+gemv_q4 [tiled]                              11008x4096      606.778      1.615      706.146       46.5
+gemm_i8_dequant [12595 GFLOP/s]             512x512x512       21.313      1.015      171.041       73.8
+gemm_i8_dequant [36061 GFLOP/s]          2048x2048x2048      476.413      1.240      732.667       52.8
+
+Median host encode per batched dispatch: 1.02 us.
+METRIC host_us/rms_norm_f32/1x4096 0.7194
+METRIC host_us/rms_norm_f32/512x4096 0.9870
+METRIC host_us/rms_norm_f32/2048x4096 1.0345
+METRIC host_us/mlp_silu/n=4096 0.4990
+METRIC host_us/mlp_gelu_tanh/n=4096 0.4649
+METRIC host_us/mlp_silu/n=1048576 0.9544
+METRIC host_us/mlp_gelu_tanh/n=1048576 0.9769
+METRIC host_us/mlp_silu/n=8388608 1.0420
+METRIC host_us/mlp_gelu_tanh/n=8388608 0.9717
+METRIC host_us/softmax_rows_f32/32x1024 0.6520
+METRIC host_us/row_sum_f32/32x1024 0.7148
+METRIC host_us/row_max_f32/32x1024 0.5651
+METRIC host_us/softmax_rows_f32/512x4096 1.0433
+METRIC host_us/row_sum_f32/512x4096 1.0098
+METRIC host_us/row_max_f32/512x4096 0.9977
+METRIC host_us/softmax_rows_f32/2048x8192 1.3005
+METRIC host_us/row_sum_f32/2048x8192 1.3258
+METRIC host_us/row_max_f32/2048x8192 1.2786
+METRIC host_us/gemv_q8/4096x4096 1.1865
+METRIC host_us/gemv_q8/11008x4096 1.2581
+METRIC host_us/gemv_q4row/4096x4096 1.5335
+METRIC host_us/gemv_q4tiled/4096x4096 1.5814
+METRIC host_us/gemv_q4row/11008x4096 1.4310
+METRIC host_us/gemv_q4tiled/11008x4096 1.6149
+METRIC host_us/gemm_i8_dequant/512x512x512 1.0153
+METRIC host_us/gemm_i8_dequant/2048x2048x2048 1.2402
+METRIC host_us/median 1.0249
+
+Median solo dispatch: 302.8 us. Every kernel whose batched time is below that is
+entirely inside the submit-and-wait floor when issued alone.
+
+-- host path --
+pipeline hit:               24.0 ns
+pipeline hit (ICB):         79.5 ns
+METRIC pipeline_hit_ns 24.043
+METRIC pipeline_hit_icb_ns 79.483
+softcap_argmax_one_pass token loop: encode   266.04 us, wall   266.16 us per token (token 117223)
+METRIC sample_one_pass_encode_us 266.0397
+METRIC sample_one_pass_wall_us 266.1641
+argmax_f32_pass x3 token loop:  encode   773.59 us, wall   773.73 us per token (token 117223)
+METRIC sample_multi_pass_encode_us 773.5866
+METRIC sample_multi_pass_wall_us 773.7252
+
+# ---- summary: 5 rounds; min (max) over rounds of each process's median ----
+metric                                             before min (max)
+host_us/rms_norm_f32/1x4096                       0.719 (    0.987)
+host_us/rms_norm_f32/512x4096                     0.987 (    1.704)
+host_us/rms_norm_f32/2048x4096                    1.034 (    1.624)
+host_us/mlp_silu/n=4096                           0.499 (    0.944)
+host_us/mlp_gelu_tanh/n=4096                      0.465 (    0.746)
+host_us/mlp_silu/n=1048576                        0.918 (    1.045)
+host_us/mlp_gelu_tanh/n=1048576                   0.977 (    1.098)
+host_us/mlp_silu/n=8388608                        0.990 (    1.212)
+host_us/mlp_gelu_tanh/n=8388608                   0.972 (    1.031)
+host_us/softmax_rows_f32/32x1024                  0.652 (    1.062)
+host_us/row_sum_f32/32x1024                       0.627 (    0.931)
+host_us/row_max_f32/32x1024                       0.565 (    1.063)
+host_us/softmax_rows_f32/512x4096                 1.043 (    1.260)
+host_us/row_sum_f32/512x4096                      1.010 (    1.274)
+host_us/row_max_f32/512x4096                      0.998 (    1.211)
+host_us/softmax_rows_f32/2048x8192                1.272 (    1.307)
+host_us/row_sum_f32/2048x8192                     1.296 (    1.326)
+host_us/row_max_f32/2048x8192                     1.240 (    1.297)
+host_us/gemv_q8/4096x4096                         1.159 (    1.852)
+host_us/gemv_q8/11008x4096                        1.258 (    1.805)
+host_us/gemv_q4row/4096x4096                      1.534 (    1.609)
+host_us/gemv_q4tiled/4096x4096                    1.573 (    1.730)
+host_us/gemv_q4row/11008x4096                     1.349 (    1.942)
+host_us/gemv_q4tiled/11008x4096                   1.611 (    2.082)
+host_us/gemm_i8_dequant/512x512x512               1.015 (    1.738)
+host_us/gemm_i8_dequant/2048x2048x2048            1.240 (    1.577)
+host_us/median                                    1.025 (    1.286)
+pipeline_hit_ns                                  23.936 (   27.311)
+pipeline_hit_icb_ns                              79.483 (   96.230)
+sample_one_pass_encode_us                       266.040 (  539.606)
+sample_one_pass_wall_us                         266.164 (  539.779)
+sample_multi_pass_encode_us                     773.587 ( 2455.969)
+sample_multi_pass_wall_us                       773.725 ( 2456.130)

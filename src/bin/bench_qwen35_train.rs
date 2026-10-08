@@ -7,6 +7,8 @@
 //! cargo run --release --bin bench_qwen35_train -- --check-only  # the gate, no timing
 //! QWEN35_2B_SAFETENSORS=... cargo run --release --bin bench_qwen35_train -- --step=2048
 //! cargo run --release --bin bench_qwen35_train -- --bf16        # bf16 GEMM operands
+//! QWEN35_2B_SAFETENSORS=... cargo run --release --bin bench_qwen35_train -- 2048 --step-only --step=2048 --async
+//! QWEN35_2B_SAFETENSORS=... cargo run --release --bin bench_qwen35_train -- 256 --step-only --clip=256
 //! ```
 //!
 //! Shapes are Qwen3.5-2B's `text_config` (hidden 2048, 16 GDN heads of 128,
@@ -36,6 +38,22 @@
 //! times `Qwen35Model::train_step` on N tokens end to end (median of 3 after
 //! one warm-up), which includes allocating every rebuilt activation and
 //! gradient per step. Run it under `/usr/bin/time -l` for its peak memory.
+//! It also prints the device's peak allocation over the steps
+//! ([`GpuRuntime::peak_allocated_bytes`], reset after loading), and one more
+//! untimed step's host waits on the GPU, commits, dispatches and fresh
+//! buffer allocations ([`tessl::infer_trace`]).
+//!
+//! `--async` runs the step under [`GpuRuntime::set_async_encode`] (one command
+//! buffer between the waits the step itself makes); without it every
+//! dispatch is a waited commit, as on a runtime nobody switched (ojas-qwen35's
+//! `Qwen35Step`). `--step-only` runs the per-op gate without timing the ops.
+//!
+//! `--clip=N` times one clipped optimizer step on N tokens as a trainer runs
+//! it: `train_step_into` a bank, `grad_sq_norm` of the bank, then
+//! `Qwen35Model::adamw_step` with the clip coefficient, each phase's wall time
+//! and host waits counted (median of 3 after one warm-up). It holds the bank
+//! and f32 AdamW moments beside the model (4 parameter copies, ~30 GB on the
+//! 2B).
 //!
 //! Before anything is timed, every op runs once with its outputs pre-filled
 //! with NaN, and every output must come back finite: an op that silently
@@ -52,12 +70,14 @@ use tessl::gdn_train::{
 };
 use tessl::gemm::GemmOperands;
 use tessl::qwen35::{AttnShape, Cols, GdnGateLogits, GdnParams};
+use tessl::qwen35_adamw::{AdamW, AdamWHyper};
 use tessl::qwen35_bwd::{
     attn_qk_norm_rope_bwd, attn_qk_norm_rope_bwd_part_len, conv1d_silu_bwd, conv1d_silu_bwd_part_len, embed_rows_bwd,
     gated_rms_norm_bwd, gated_rms_norm_bwd_part_len, gdn_gates_bwd, gdn_gates_bwd_part_len, rms_norm_bwd,
     rms_norm_bwd_part_len, swiglu_bwd, AttnQkvGrads, EmbedBwdWorkspace,
 };
 use tessl::qwen35_model::{Precision, Qwen35Config, Qwen35Model};
+use tessl::qwen35_train::Qwen35Grads;
 use tessl::safetensors::SafeTensors;
 use tessl::tensor::GpuBuffer;
 use tessl::{DType, GpuRuntime, Tensor};
@@ -609,8 +629,40 @@ fn load_2b(rt: &Arc<GpuRuntime>) -> Res<Qwen35Model> {
     )
 }
 
-fn bench_step(model: &Qwen35Model, tokens: usize, operands: GemmOperands) -> Res<()> {
+/// Host waits, commits, dispatches and fresh allocations `f` made, and its
+/// wall time.
+fn traced<T>(f: impl FnOnce() -> Res<T>) -> Res<(T, tessl::infer_trace::Snapshot, f64)> {
+    tessl::infer_trace::set_enabled(true);
+    let (t0, s0) = (Instant::now(), tessl::infer_trace::snapshot());
+    let out = f();
+    let (secs, s1) = (t0.elapsed().as_secs_f64(), tessl::infer_trace::snapshot());
+    tessl::infer_trace::set_enabled(false);
+    let d = s1.since(&s0);
+    Ok((out?, d, secs))
+}
+
+fn trace_line(s: &tessl::infer_trace::Snapshot) -> String {
+    format!(
+        "{} waits ({:.3} s blocked), {} commits, {} dispatches, {} cold allocations, \
+         {} host-zeroed ({:.2} GB)",
+        s.sync_waits,
+        s.sync_wait_us as f64 / 1e6,
+        s.commits,
+        s.dispatches,
+        s.cold_allocs,
+        s.host_zeros,
+        s.host_zero_bytes as f64 / 1e9
+    )
+}
+
+fn gib(b: u64) -> f64 {
+    b as f64 / (1u64 << 30) as f64
+}
+
+fn bench_step(rt: &Arc<GpuRuntime>, model: &Qwen35Model, tokens: usize, operands: GemmOperands) -> Res<()> {
     let ids: Vec<u32> = (0..tokens as u32).map(|i| (i * 104_729 + 17) % VOCAB as u32).collect();
+    let base = rt.current_allocated_bytes();
+    rt.reset_peak_allocated_bytes();
     // Only the loss is kept: holding the warm-up step would double the
     // gradients resident while timing.
     let first = model.train_step(&ids, operands)?.loss;
@@ -633,6 +685,61 @@ fn bench_step(model: &Qwen35Model, tokens: usize, operands: GemmOperands) -> Res
         tokens as f64 / secs,
         first
     );
+    let peak = rt.peak_allocated_bytes();
+    println!(
+        "  device peak over the steps: {:.2} GiB ({:.2} GiB above the loaded model)",
+        gib(peak),
+        gib(peak.saturating_sub(base))
+    );
+    let (step, trace, secs) = traced(|| model.train_step(&ids, operands))?;
+    if step.loss.to_bits() != first.to_bits() {
+        return Err("train_step: the traced step's loss differs".into());
+    }
+    drop(step);
+    println!("  one traced step: {secs:.3} s, {}", trace_line(&trace));
+    Ok(())
+}
+
+/// One clipped optimizer step as a trainer runs it: the step's gradients
+/// into a bank, the bank's norm, then AdamW with the clip coefficient.
+fn bench_clip(model: &Qwen35Model, tokens: usize, operands: GemmOperands) -> Res<()> {
+    let ids: Vec<u32> = (0..tokens as u32).map(|i| (i * 104_729 + 17) % VOCAB as u32).collect();
+    let bank = Qwen35Grads::zeros_like(model)?;
+    let mut state = AdamW::new(model)?;
+    let wd = model.default_weight_decay(0.01)?;
+    let mut clip = || -> Res<[(f64, tessl::infer_trace::Snapshot); 3]> {
+        let (loss, a, ta) =
+            traced(|| model.train_step_into(&ids, operands, tessl::qwen35_train::Supervise::Causal, &bank, false))?;
+        if !loss.is_finite() {
+            return Err(format!("--clip: loss {loss} is not finite"));
+        }
+        let (sq, b, tb) = traced(|| model.grad_sq_norm(&bank))?;
+        if !(sq.is_finite() && sq > 0.0) {
+            return Err(format!("--clip: gradient norm^2 {sq}"));
+        }
+        let hyper = AdamWHyper {
+            lr: 1e-9,
+            beta1: 0.9,
+            beta2: 0.999,
+            eps: 1e-8,
+            grad_scale: (1.0 / sq.sqrt().max(1.0)) as f32 as f64,
+        };
+        let ((), c, tc) = traced(|| model.adamw_step(&bank, &mut state, &hyper, &wd))?;
+        Ok([(ta, a), (tb, b), (tc, c)])
+    };
+    clip()?;
+    let mut runs = Vec::new();
+    for _ in 0..3 {
+        runs.push(clip()?);
+    }
+    println!("clipped optimizer step, T = {tokens} (median of 3; waits from the last run):");
+    for (i, name) in ["train_step_into", "grad_sq_norm", "adamw_step"].iter().enumerate() {
+        let ms = median(runs.iter().map(|r| r[i].0 * 1e3).collect());
+        println!("  {name:<16} {ms:>10.1} ms, {}", trace_line(&runs[2][i].1));
+    }
+    let total = median(runs.iter().map(|r| r.iter().map(|x| x.0).sum::<f64>()).collect());
+    let waits: u64 = runs[2].iter().map(|x| x.1.sync_waits).sum();
+    println!("  total            {:>10.1} ms, {waits} waits", total * 1e3);
     Ok(())
 }
 
@@ -758,12 +865,21 @@ fn bench_batch(rt: &Arc<GpuRuntime>, model: &Qwen35Model, b: BatchShape, operand
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (mut check_only, mut step, mut ts, mut operands) = (false, None, Vec::new(), GemmOperands::ExactF32);
-    let mut batches = Vec::new();
+    let (mut batches, mut step_only, mut async_encode, mut clip) = (Vec::new(), false, false, None);
     for arg in std::env::args().skip(1) {
         if arg == "--bf16" {
             operands = GemmOperands::Bf16;
         } else if arg == "--check-only" {
             check_only = true;
+        } else if arg == "--step-only" {
+            step_only = true;
+        } else if arg == "--async" {
+            async_encode = true;
+        } else if let Some(n) = arg.strip_prefix("--clip=") {
+            clip = Some(
+                n.parse::<usize>()
+                    .map_err(|_| format!("--clip expects a token count, got {n:?}"))?,
+            );
         } else if let Some(v) = arg.strip_prefix("--batch=") {
             batches.push(parse_batch(v)?);
         } else if let Some(n) = arg.strip_prefix("--step=") {
@@ -773,7 +889,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             );
         } else {
             let t: usize = arg.parse().map_err(|_| {
-                format!("expected a token count, --check-only, --bf16, --step=N or --batch=B,L[,S], got {arg:?}")
+                format!(
+                    "expected a token count, --check-only, --step-only, --bf16, --async, --step=N, --clip=N \
+                     or --batch=B,L[,S], got {arg:?}"
+                )
             })?;
             if t < 2 {
                 return Err("T must be at least 2 (one prediction)".into());
@@ -791,17 +910,31 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     println!("device: {}", rt.device_name());
     for t in ts {
-        bench_t(&rt, t, check_only, operands)?;
+        bench_t(&rt, t, check_only || step_only, operands)?;
     }
-    if check_only || (step.is_none() && batches.is_empty()) {
-        if check_only && (step.is_some() || !batches.is_empty()) {
-            println!("--check-only: the per-op gate ran; --step and --batch were not run");
+    let model_runs = step.is_some() || clip.is_some() || !batches.is_empty();
+    if check_only || !model_runs {
+        if check_only && model_runs {
+            println!("--check-only: the per-op gate ran; --step, --clip and --batch were not run");
         }
         return Ok(());
     }
     let model = load_2b(&rt)?;
+    rt.set_async_encode(async_encode)?;
+    println!(
+        "encode: {}; TESSL_MID_COMMIT={}",
+        if async_encode {
+            "async (--async)"
+        } else {
+            "every dispatch waited"
+        },
+        std::env::var("TESSL_MID_COMMIT").unwrap_or_else(|_| "unset".into())
+    );
     if let Some(n) = step {
-        bench_step(&model, n, operands)?;
+        bench_step(&rt, &model, n, operands)?;
+    }
+    if let Some(n) = clip {
+        bench_clip(&model, n, operands)?;
     }
     for b in batches {
         bench_batch(&rt, &model, b, operands)?;

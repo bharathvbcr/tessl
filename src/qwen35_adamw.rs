@@ -42,7 +42,9 @@
 use std::fmt;
 use std::sync::Arc;
 
-use crate::dispatch::{dispatch_2d, dispatch_2d_tg, set_gpu_buf_offset, set_u32};
+use objc2_metal::MTLBuffer;
+
+use crate::dispatch::{dispatch_2d, dispatch_2d_tg, set_gpu_buf, set_gpu_buf_offset, set_u32};
 use crate::nn::require_runtime;
 use crate::qwen35_model::{Precision, Qwen35Model};
 use crate::qwen35_params::{check, slots, window_copy, Window};
@@ -107,6 +109,11 @@ pub enum MomentStorage {
 
 /// Elements per 8-bit moment block (one threadgroup of the step kernel).
 pub const MOMENT_BLOCK: usize = 256;
+
+/// Bytes of one entry of a step kernel's slot table (`Qwen35AdamWSlot` in
+/// `kernels/qwen35_train_storage.metal`, which asserts the same size): seven
+/// GPU addresses, six `u32`s, the eight scalars, the five-word key and a pad.
+const SLOT_BYTES: usize = 136;
 
 /// An [`AdamW`]'s stored precision.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -175,7 +182,14 @@ pub struct AdamW {
     /// The precision of the model it was made for.
     precision: Precision,
     slots: Vec<SlotState>,
+    /// Steps encoded so far: [`Qwen35Model::adamw_step_unwaited`] advances it
+    /// before the GPU has run the step.
     step: u64,
+    /// Steps a wait of this state's has seen complete: what
+    /// [`Self::step_count`] reports once the runtime is poisoned.
+    confirmed: std::cell::Cell<u64>,
+    /// The runtime the state lives on.
+    rt: Arc<GpuRuntime>,
     /// Bound to the kernel's unused buffer slots.
     dummy: GpuBuffer,
 }
@@ -283,6 +297,8 @@ impl AdamW {
             precision: model.precision(),
             slots: out,
             step: 0,
+            confirmed: std::cell::Cell::new(0),
+            rt: Arc::clone(rt),
             dummy: zeroed(rt, 32)?,
         })
     }
@@ -337,15 +353,25 @@ impl AdamW {
             .sum()
     }
 
-    /// Steps taken so far (torch's `state["step"]`).
+    /// Steps taken so far (torch's `state["step"]`). A step
+    /// [`Qwen35Model::adamw_step_unwaited`] encoded counts at once; if the
+    /// runtime has since been poisoned (a GPU fault, which leaves the moments
+    /// unknown), the count rolls back to the last one a wait of this state's
+    /// saw complete ([`Qwen35Model::adamw_step`], or a moment or auxiliary
+    /// read or write).
     pub fn step_count(&self) -> u64 {
-        self.step
+        if self.rt.is_poisoned() {
+            self.confirmed.get()
+        } else {
+            self.step
+        }
     }
 
     /// Set the step count, restoring a checkpoint with
     /// [`Qwen35Model::write_adamw_moment`].
     pub fn set_step_count(&mut self, step: u64) {
         self.step = step;
+        self.confirmed.set(step);
     }
 
     fn moment(&self, s: &SlotState, which: Moment) -> (GpuBuffer, Option<GpuBuffer>) {
@@ -654,7 +680,26 @@ impl Qwen35Model {
         hyper: &AdamWHyper,
         weight_decay: &[f32],
     ) -> Result<(), String> {
-        self.adamw_step_inner("Qwen35Model::adamw_step", grads, state, hyper, weight_decay, None)
+        self.encode_adamw("Qwen35Model::adamw_step", grads, state, hyper, weight_decay, None)?;
+        self.rt.synchronize()?;
+        state.confirmed.set(state.step);
+        Ok(())
+    }
+
+    /// [`Self::adamw_step`] encoded and not waited for: the next wait (the
+    /// next step's, or [`GpuRuntime::synchronize`]) runs it. The step count
+    /// advances now; if the GPU then fails, the runtime is poisoned and
+    /// [`AdamW::step_count`] rolls back to the count before every step this
+    /// state has not waited for. A clipped iteration's waits are then the
+    /// step's own and `grad_sq_norm`'s.
+    pub fn adamw_step_unwaited(
+        &self,
+        grads: &Qwen35Grads,
+        state: &mut AdamW,
+        hyper: &AdamWHyper,
+        weight_decay: &[f32],
+    ) -> Result<(), String> {
+        self.encode_adamw("Qwen35Model::adamw_step_unwaited", grads, state, hyper, weight_decay, None)
     }
 
     /// [`Qwen35Model::adamw_step`] with entry `i` at learning rate
@@ -673,20 +718,27 @@ impl Qwen35Model {
         weight_decay: &[f32],
         lr_scale: &[f64],
     ) -> Result<(), String> {
-        self.adamw_step_inner(
+        self.encode_adamw(
             "Qwen35Model::adamw_step_scaled",
             grads,
             state,
             hyper,
             weight_decay,
             Some(lr_scale),
-        )
+        )?;
+        self.rt.synchronize()?;
+        state.confirmed.set(state.step);
+        Ok(())
     }
 
-    /// The one body of both steps: `lr_scale` `None` is every entry at 1.
-    fn adamw_step_inner(
+    /// Check everything, then encode the step: one table-driven dispatch per
+    /// step kernel the parameters need (one on an f32 model; a bf16 model's
+    /// f32 vectors take their own), where a dispatch per parameter (~300 on
+    /// the 2B) used to be. `lr_scale` `None` is every entry at 1. Advances
+    /// `state.step`.
+    fn encode_adamw(
         &self,
-        what: &'static str,
+        what: &str,
         grads: &Qwen35Grads,
         state: &mut AdamW,
         hyper: &AdamWHyper,
@@ -753,47 +805,76 @@ impl Qwen35Model {
             .step
             .checked_add(1)
             .ok_or_else(|| format!("{what}: step count {} + 1 does not fit in u64", state.step))?;
-        self.bump_param_generation();
         let seed = match state.config.update {
             UpdateRule::Bf16Stochastic { seed } => seed,
             _ => 0,
         };
+        // The slot tables, one per kernel, each entry's salt its
+        // parameter-table index (as the stochastic rounding keys it).
+        let mut tables: Vec<(&str, Vec<u32>, u32, u32)> = Vec::new();
         for (salt, (pw, gw, st, kernel, entry_hyper, wd)) in plan.iter().enumerate() {
-            let scalars = le_bytes(adamw_scalars(entry_hyper, next, *wd), f32::to_le_bytes);
-            let key = le_bytes(
-                [
-                    seed as u32,
-                    (seed >> 32) as u32,
-                    next as u32,
-                    (next >> 32) as u32,
-                    salt as u32,
-                ],
-                u32::to_le_bytes,
-            );
-            let p = self.rt.pipeline(kernel)?;
+            let at = match tables.iter().position(|(k, ..)| k == kernel) {
+                Some(at) => at,
+                None => {
+                    tables.push((kernel.as_str(), Vec::new(), 0, 0));
+                    tables.len() - 1
+                }
+            };
+            let (_, words, n_slots, blocks) = &mut tables[at];
+            let addr = |b: &GpuBuffer, off: usize| b.metal().gpuAddress().wrapping_add(off as u64);
             let dummy = &state.dummy;
             let (ms, vs) = match &st.scales {
                 Some((a, b)) => (a, b),
                 None => (dummy, dummy),
             };
             let aux = st.aux.as_ref().unwrap_or(dummy);
-            dispatch_2d_tg(&self.rt, &p, st.n.div_ceil(MOMENT_BLOCK), 1, MOMENT_BLOCK, |bnd| {
-                set_gpu_buf_offset(bnd, pw.buf, pw.byte_off, 0);
-                set_gpu_buf_offset(bnd, gw.buf, gw.byte_off, 1);
-                set_gpu_buf_offset(bnd, &st.m, 0, 2);
-                set_gpu_buf_offset(bnd, &st.v, 0, 3);
-                bnd.bind_bytes(&scalars, 4);
-                set_u32(bnd, st.n as u32, 5);
-                set_u32(bnd, pw.width as u32, 6);
-                set_u32(bnd, pw.ld as u32, 7);
-                set_u32(bnd, pw.off as u32, 8);
-                set_gpu_buf_offset(bnd, aux, 0, 9);
-                set_gpu_buf_offset(bnd, ms, 0, 10);
-                set_gpu_buf_offset(bnd, vs, 0, 11);
-                bnd.bind_bytes(&key, 12);
+            let n = u32::try_from(st.n).map_err(|_| format!("{what}: {} elements exceed u32", st.n))?;
+            let slot_blocks =
+                u32::try_from(st.n.div_ceil(MOMENT_BLOCK)).map_err(|_| format!("{what}: too many blocks"))?;
+            for a in [
+                addr(pw.buf, pw.byte_off),
+                addr(gw.buf, gw.byte_off),
+                addr(&st.m, 0),
+                addr(&st.v, 0),
+                addr(aux, 0),
+                addr(ms, 0),
+                addr(vs, 0),
+            ] {
+                words.extend([a as u32, (a >> 32) as u32]);
+            }
+            words.extend([n, pw.width as u32, pw.ld as u32, pw.off as u32, *blocks, 0]);
+            words.extend(adamw_scalars(entry_hyper, next, *wd).map(f32::to_bits));
+            words.extend([
+                seed as u32,
+                (seed >> 32) as u32,
+                next as u32,
+                (next >> 32) as u32,
+                salt as u32,
+                0,
+            ]);
+            debug_assert_eq!(words.len() % (SLOT_BYTES / 4), 0);
+            *n_slots += 1;
+            *blocks = blocks
+                .checked_add(slot_blocks)
+                .ok_or_else(|| format!("{what}: the step's threadgroups exceed u32"))?;
+        }
+        let mut encoded = Vec::with_capacity(tables.len());
+        for (kernel, words, n_slots, blocks) in &tables {
+            // Fresh, so written without waiting for the GPU.
+            encoded.push((
+                self.rt.pipeline(kernel)?,
+                self.rt.alloc_buffer_from_u32(words)?,
+                *n_slots,
+                *blocks,
+            ));
+        }
+        self.bump_param_generation();
+        for (p, table, n_slots, blocks) in &encoded {
+            dispatch_2d_tg(&self.rt, p, *blocks as usize, 1, MOMENT_BLOCK, |bnd| {
+                set_gpu_buf(bnd, table, 0);
+                set_u32(bnd, *n_slots, 1);
             })?;
         }
-        self.rt.synchronize()?;
         state.step = next;
         Ok(())
     }
@@ -886,7 +967,9 @@ impl Qwen35Model {
                 }
             }
         }
-        self.rt.synchronize()
+        self.rt.synchronize()?;
+        state.confirmed.set(state.step);
+        Ok(())
     }
 
     /// Copy `state`'s auxiliary state into `dst` (one dense f32 tensor per
@@ -943,7 +1026,9 @@ impl Qwen35Model {
                 }
             }
         }
-        self.rt.synchronize()
+        self.rt.synchronize()?;
+        state.confirmed.set(state.step);
+        Ok(())
     }
 
     /// Weight decay `wd` for every parameter-table entry except those

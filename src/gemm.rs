@@ -208,7 +208,8 @@ fn validate_cast_input(src: &Tensor, dtype: DType) -> Result<(), String> {
 pub fn cast_f32_to_bf16(src: &Tensor) -> Result<Tensor, String> {
     validate_cast_input(src, DType::F32)?;
     let rt = src.runtime();
-    let dst = rt.alloc_tensor_bf16(&src.shape)?;
+    // The cast writes every element.
+    let dst = rt.alloc_tensor_unzeroed(&src.shape, DType::BF16)?;
     cast_f32_to_bf16_into(src, &dst)?;
     Ok(dst)
 }
@@ -274,7 +275,8 @@ pub fn transpose_f32_into(src: &Tensor, dst: &Tensor) -> Result<(), String> {
 pub fn cast_bf16_to_f32(src: &Tensor) -> Result<Tensor, String> {
     validate_cast_input(src, DType::BF16)?;
     let rt = src.runtime();
-    let dst = rt.alloc_tensor_f32(&src.shape)?;
+    // The cast writes every element.
+    let dst = rt.alloc_tensor_unzeroed(&src.shape, DType::F32)?;
     cast_bf16_to_f32_into(src, &dst)?;
     Ok(dst)
 }
@@ -308,7 +310,8 @@ pub fn cast_f32_to_f16(src: &Tensor) -> Result<Tensor, String> {
         return Err("cast_f32_to_f16 expects an f32 source".into());
     }
     let rt = src.runtime();
-    let dst = rt.alloc_tensor_f16(&src.shape)?;
+    // The cast writes every element.
+    let dst = rt.alloc_tensor_unzeroed(&src.shape, DType::F16)?;
     cast_between(src, &dst, "cast_f32_to_f16")?;
     Ok(dst)
 }
@@ -320,7 +323,8 @@ pub fn cast_f16_to_f32(src: &Tensor) -> Result<Tensor, String> {
         return Err("cast_f16_to_f32 expects an f16 source".into());
     }
     let rt = src.runtime();
-    let dst = rt.alloc_tensor_f32(&src.shape)?;
+    // The cast writes every element.
+    let dst = rt.alloc_tensor_unzeroed(&src.shape, DType::F32)?;
     cast_between(src, &dst, "cast_f16_to_f32")?;
     Ok(dst)
 }
@@ -1266,6 +1270,51 @@ impl GemmOperands {
         }
     }
 
+    /// `C += A @ B`: [`Self::nn`] adding into what `C` holds instead of
+    /// overwriting it, in the GEMM itself (no temporary, no second pass).
+    /// Exact f32 accumulates the products into `C` as it goes, so the sum is
+    /// rounded in a different order from `C + (A @ B)` and the bits differ;
+    /// bf16 operands add the f32 product to `C` once, as `C + (A @ B)` does.
+    pub fn nn_acc(self, a: &Tensor, b: &Tensor, c: &Tensor) -> Result<(), String> {
+        const WHAT: &str = "GemmOperands::nn_acc";
+        let dims = validate_gemm(a, b, c, Layout::NN, self == Self::Bf16, WHAT)?;
+        self.accum_lane(a, c, WHAT)?;
+        nn_accum(a, b, c, dims, self == Self::Bf16)
+    }
+
+    /// `C += A^T @ B`, A stored `[K, M]`: [`Self::tn`] adding into `C`, as
+    /// [`Self::nn_acc`] does.
+    pub fn tn_acc(self, a_km: &Tensor, b_kn: &Tensor, c: &Tensor) -> Result<(), String> {
+        const WHAT: &str = "GemmOperands::tn_acc";
+        let dims = validate_gemm(a_km, b_kn, c, Layout::TN, self == Self::Bf16, WHAT)?;
+        self.accum_lane(a_km, c, WHAT)?;
+        tn_accum(a_km, b_kn, c, dims, self == Self::Bf16)
+    }
+
+    /// `C += A @ B^T`, B stored `[N, K]`: [`Self::nt`] adding into `C`, as
+    /// [`Self::nn_acc`] does.
+    pub fn nt_acc(self, a_mk: &Tensor, b_nk: &Tensor, c: &Tensor) -> Result<(), String> {
+        const WHAT: &str = "GemmOperands::nt_acc";
+        let dims = validate_gemm(a_mk, b_nk, c, Layout::NT, self == Self::Bf16, WHAT)?;
+        self.accum_lane(a_mk, c, WHAT)?;
+        nt_accum(a_mk, b_nk, c, dims, self == Self::Bf16)
+    }
+
+    /// The accumulate kernels are TensorOps kernels on either lane.
+    fn accum_lane(self, a: &Tensor, c: &Tensor, what: &str) -> Result<(), String> {
+        let rt = a.runtime();
+        match self {
+            Self::ExactF32 => {
+                Self::exact(rt, what)?;
+                if !rt.has_tensorops() {
+                    return Err(format!("{what}: the accumulate kernels need TensorOps"));
+                }
+                Ok(())
+            }
+            Self::Bf16 => check_bf16_lane(rt, c, what),
+        }
+    }
+
     /// Device bytes [`Self::nn`] allocates for itself on an f32 `A [m, k]`
     /// and a `B [k, n]` of dtype `b`, at allocated sizes
     /// ([`GpuRuntime::allocated_bytes_for`]): a bf16 copy of each f32 operand
@@ -1740,10 +1789,112 @@ pub fn gemm_nt_bf16(a_mk: &Tensor, b_nk: &Tensor, c: &Tensor) -> Result<(), Stri
     dispatch_tensorops_nn_coop(rt, &pipeline, &a_bf, &b_bf, c, m, n, k, TILE_COOP_TN_NT)
 }
 
+/// `C += A[K,M]^T @ B[K,N]` on the accumulate kernels, C not zeroed: bf16
+/// operands (f32 ones rounded first) or exact f32. Validation is the
+/// caller's. Tall-K, small-MN shapes take the sequential split-K, whose
+/// partitions add into C in order.
+fn tn_accum(
+    a_km: &Tensor,
+    b_kn: &Tensor,
+    c: &Tensor,
+    (m, n, k): (usize, usize, usize),
+    bf16: bool,
+) -> Result<(), String> {
+    let rt = a_km.runtime();
+    if bf16 {
+        let (a, b) = (ensure_bf16(a_km)?, ensure_bf16(b_kn)?);
+        if prefer_tn_splitk(m, n, k) {
+            return gemm_tn_splitk_bf16_opts(&a, &b, c, k, /*zero_first=*/ false);
+        }
+        let pipeline = rt.pipeline("matmul2d_tensorops_tn_accum_bf16_f32")?;
+        return dispatch_tensorops_accum(
+            rt,
+            &pipeline,
+            &a,
+            &b,
+            c,
+            m,
+            n,
+            k,
+            TILE_COOP_ACCUM,
+            /*bind_interior=*/ false,
+        );
+    }
+    if prefer_tn_splitk(m, n, k) {
+        return gemm_tn_splitk_f32_opts(a_km, b_kn, c, k, /*zero_first=*/ false);
+    }
+    let pipeline = rt.pipeline("matmul2d_tensorops_tn_accum_f32")?;
+    dispatch_tensorops_accum(
+        rt, &pipeline, a_km, b_kn, c, m, n, k, TILE_F32, /*bind_interior=*/ true,
+    )
+}
+
+/// `C += A[M,K] @ B[N,K]^T` on the accumulate kernels, as [`tn_accum`].
+fn nt_accum(
+    a_mk: &Tensor,
+    b_nk: &Tensor,
+    c: &Tensor,
+    (m, n, k): (usize, usize, usize),
+    bf16: bool,
+) -> Result<(), String> {
+    let rt = a_mk.runtime();
+    if bf16 {
+        let (a, b) = (ensure_bf16(a_mk)?, ensure_bf16(b_nk)?);
+        let pipeline = rt.pipeline("matmul2d_tensorops_nt_accum_bf16_f32")?;
+        return dispatch_tensorops_accum(
+            rt,
+            &pipeline,
+            &a,
+            &b,
+            c,
+            m,
+            n,
+            k,
+            TILE_COOP_ACCUM,
+            /*bind_interior=*/ false,
+        );
+    }
+    let pipeline = rt.pipeline("matmul2d_tensorops_nt_accum_f32")?;
+    dispatch_tensorops_accum(
+        rt, &pipeline, a_mk, b_nk, c, m, n, k, TILE_F32, /*bind_interior=*/ true,
+    )
+}
+
+/// `C += A[M,K] @ B[K,N]`, C not zeroed: exact f32 on the NN accumulate
+/// kernel (or the NN split-K's partitions without their zero, on the shapes
+/// [`gemm`] splits), bf16 on the cooperative epilogue with `beta = 1`, which
+/// adds the f32 product to C once. Validation is the caller's.
+fn nn_accum(a: &Tensor, b: &Tensor, c: &Tensor, (m, n, k): (usize, usize, usize), bf16: bool) -> Result<(), String> {
+    let rt = a.runtime();
+    if bf16 {
+        let epi = Epilogue {
+            beta: 1.0,
+            ..Epilogue::default()
+        };
+        return run_gemm_epilogue(&ensure_bf16(a)?, &ensure_bf16(b)?, c, GemmBackend::TensorOps, epi, None);
+    }
+    if let Some(k_tile) = nn_splitk_k_tile(m, n, k) {
+        let pipeline = rt.pipeline("matmul2d_tensorops_nn_splitk_f32")?;
+        return dispatch_k_partitions(
+            rt,
+            &pipeline,
+            a,
+            b,
+            c,
+            (m, n, k),
+            TILE_F32,
+            k_tile,
+            /*zero_first=*/ false,
+        );
+    }
+    let pipeline = rt.pipeline("matmul2d_tensorops_nn_accum_f32")?;
+    dispatch_tensorops_accum(rt, &pipeline, a, b, c, m, n, k, TILE_F32, /*bind_interior=*/ true)
+}
+
 /// `C += A[K,M]^T @ B[K,N]` (TN accumulate). No C zero — for dW into grad banks
 /// and dx accumulate into a pre-zeroed buffer.
 pub fn gemm_tn_accum_train(a_km: &Tensor, b_kn: &Tensor, c: &Tensor, backend: GemmBackend) -> Result<(), String> {
-    let (m, n, k) = validate_gemm(
+    let dims = validate_gemm(
         a_km,
         b_kn,
         c,
@@ -1755,37 +1906,14 @@ pub fn gemm_tn_accum_train(a_km: &Tensor, b_kn: &Tensor, c: &Tensor, backend: Ge
     let rt = a_km.runtime();
     let use_accum = crate::ab_flags::gemm_accum();
     if use_accum && use_bf16_gemm(rt, backend) {
-        let a_bf = ensure_bf16(a_km)?;
-        let b_bf = ensure_bf16(b_kn)?;
-        if prefer_tn_splitk(m, n, k) {
-            return gemm_tn_splitk_bf16_opts(&a_bf, &b_bf, c, k, /*zero_first=*/ false);
-        }
-        let pipeline = rt.pipeline("matmul2d_tensorops_tn_accum_bf16_f32")?;
-        return dispatch_tensorops_accum(
-            rt,
-            &pipeline,
-            &a_bf,
-            &b_bf,
-            c,
-            m,
-            n,
-            k,
-            TILE_COOP_ACCUM,
-            /*bind_interior=*/ false,
-        );
+        return tn_accum(a_km, b_kn, c, dims, true);
     }
-
     if use_accum && USE_TN_NT_DESCRIPTORS && backend == GemmBackend::TensorOps && rt.has_tensorops() {
-        if prefer_tn_splitk(m, n, k) {
-            return gemm_tn_splitk_f32_opts(a_km, b_kn, c, k, /*zero_first=*/ false);
-        }
-        let pipeline = rt.pipeline("matmul2d_tensorops_tn_accum_f32")?;
-        return dispatch_tensorops_accum(
-            rt, &pipeline, a_km, b_kn, c, m, n, k, TILE_F32, /*bind_interior=*/ true,
-        );
+        return tn_accum(a_km, b_kn, c, dims, false);
     }
 
     // Fallback / Soft-bisect: temp + add (pre–Audit 6 P1a/P1a2 numerics).
+    let (m, n, _) = dims;
     let tmp = rt.alloc_temp_f32(&[m, n])?;
     gemm_tn_train(a_km, b_kn, &tmp, backend)?;
     let p = rt.pipeline("add_inplace_f32")?;
@@ -1804,7 +1932,7 @@ pub fn gemm_tn_accum_train(a_km: &Tensor, b_kn: &Tensor, c: &Tensor, backend: Ge
 /// honors `METAL_NATIVE_GEMM_ACCUM_DX` — accumulate-mode dX with dW kept on
 /// the safer temp-plus-add path.
 pub fn gemm_nt_accum_train(a_mk: &Tensor, b_nk: &Tensor, c: &Tensor, backend: GemmBackend) -> Result<(), String> {
-    let (m, n, k) = validate_gemm(
+    let dims = validate_gemm(
         a_mk,
         b_nk,
         c,
@@ -1816,30 +1944,13 @@ pub fn gemm_nt_accum_train(a_mk: &Tensor, b_nk: &Tensor, c: &Tensor, backend: Ge
     let rt = a_mk.runtime();
     let use_accum = crate::ab_flags::gemm_accum() || crate::ab_flags::gemm_accum_dx();
     if use_accum && use_bf16_gemm(rt, backend) {
-        let a_bf = ensure_bf16(a_mk)?;
-        let b_bf = ensure_bf16(b_nk)?;
-        let pipeline = rt.pipeline("matmul2d_tensorops_nt_accum_bf16_f32")?;
-        return dispatch_tensorops_accum(
-            rt,
-            &pipeline,
-            &a_bf,
-            &b_bf,
-            c,
-            m,
-            n,
-            k,
-            TILE_COOP_ACCUM,
-            /*bind_interior=*/ false,
-        );
+        return nt_accum(a_mk, b_nk, c, dims, true);
     }
-
     if use_accum && USE_TN_NT_DESCRIPTORS && backend == GemmBackend::TensorOps && rt.has_tensorops() {
-        let pipeline = rt.pipeline("matmul2d_tensorops_nt_accum_f32")?;
-        return dispatch_tensorops_accum(
-            rt, &pipeline, a_mk, b_nk, c, m, n, k, TILE_F32, /*bind_interior=*/ true,
-        );
+        return nt_accum(a_mk, b_nk, c, dims, false);
     }
 
+    let (m, n, _) = dims;
     let tmp = rt.alloc_temp_f32(&[m, n])?;
     gemm_nt_train(a_mk, b_nk, &tmp, backend)?;
     let p = rt.pipeline("add_inplace_f32")?;

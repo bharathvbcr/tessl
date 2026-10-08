@@ -343,6 +343,32 @@ impl GpuBuffer {
         // base, so it cannot overrun.
         unsafe { std::ptr::write_bytes(self.metal().contents().as_ptr().cast::<u8>(), 0, self.nbytes()) };
     }
+
+    /// Copy `data` to the start of the buffer on the host.
+    ///
+    /// # Safety
+    /// As [`Self::zero_unsubmitted`]; `data` must fit in the buffer.
+    pub(crate) unsafe fn write_u32_unsubmitted(&self, data: &[u32]) {
+        debug_assert!(std::mem::size_of_val(data) <= self.nbytes());
+        // SAFETY: no command uses the storage (the caller's contract) and
+        // `data` fits it.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                data.as_ptr(),
+                self.metal().contents().as_ptr().cast::<u32>(),
+                data.len(),
+            )
+        };
+    }
+
+    /// [`Self::zero_unsubmitted`] with `byte` in every byte.
+    ///
+    /// # Safety
+    /// As [`Self::zero_unsubmitted`].
+    pub(crate) unsafe fn fill_unsubmitted(&self, byte: u8) {
+        // SAFETY: as in `zero_unsubmitted`, whose contract this shares.
+        unsafe { std::ptr::write_bytes(self.metal().contents().as_ptr().cast::<u8>(), byte, self.nbytes()) };
+    }
 }
 
 /// Logical tensor: shape + dtype over a GpuBuffer (row-major, contiguous view).

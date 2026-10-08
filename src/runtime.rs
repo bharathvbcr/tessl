@@ -579,6 +579,9 @@ pub struct GpuRuntime {
     /// Highest [`Self::current_allocated_bytes`] seen at a fresh pool
     /// allocation since creation or [`Self::reset_peak_allocated_bytes`].
     peak_allocated: AtomicU64,
+    /// [`Self::set_poison_unzeroed`]: fill [`Self::alloc_tensor_unzeroed`]
+    /// allocations with NaN bits instead of leaving what the pool last held.
+    poison_unzeroed: AtomicBool,
 }
 
 /// Kernel-use trace, gated on `TESSL_KERNEL_TRACE=1`.
@@ -793,6 +796,7 @@ impl GpuRuntime {
             self_weak: Mutex::new(Weak::new()),
             memory_info: Mutex::new(mem_info),
             peak_allocated: AtomicU64::new(0),
+            poison_unzeroed: AtomicBool::new(false),
         });
         if let Ok(mut w) = rt.self_weak.lock() {
             *w = Arc::downgrade(&rt);
@@ -1235,6 +1239,45 @@ impl GpuRuntime {
         self.alloc_buffer_kind(nbytes, BufferKind::Cold)
     }
 
+    /// A fresh buffer holding `data`, written on the host without waiting
+    /// for the GPU: no command can be using a buffer that has just come
+    /// from the pool (fresh, or retired after the GPU finished with it).
+    /// [`crate::tensor::GpuBuffer::try_write_u32`] into a buffer that is
+    /// already bound waits for every queued command first.
+    /// Like a host write, it is refused on a busy or poisoned runtime.
+    pub fn alloc_buffer_from_u32(&self, data: &[u32]) -> Result<crate::tensor::GpuBuffer, String> {
+        // Exclusive access, as every host write takes it, but no wait.
+        let _access = self.acquire_access()?;
+        let buf = self.alloc_buffer(std::mem::size_of_val(data).max(4))?;
+        // SAFETY: just allocated and not yet bound to any command (the
+        // contract of `write_unsubmitted`), and `data` fits it.
+        unsafe { buf.write_u32_unsubmitted(data) };
+        Ok(buf)
+    }
+
+    /// `dst = data` in order with the work queued around it, without waiting
+    /// for the GPU: `data` goes into a fresh buffer on the host
+    /// ([`Self::alloc_buffer_from_u32`]) and a kernel copies it into `dst`
+    /// after every command already encoded. `data` must be `dst`'s whole
+    /// `u32` length, as [`crate::tensor::GpuBuffer::try_write_u32`] asks.
+    pub fn upload_u32(&self, dst: &crate::tensor::GpuBuffer, data: &[u32]) -> Result<(), String> {
+        let n = dst.nbytes() / std::mem::size_of::<u32>();
+        if data.len() != n {
+            return Err(format!("upload_u32: {} elements for a buffer of {n}", data.len()));
+        }
+        if n == 0 {
+            return Ok(());
+        }
+        let n32 = u32::try_from(n).map_err(|_| format!("upload_u32: {n} elements exceed u32"))?;
+        let staged = self.alloc_buffer_from_u32(data)?;
+        let p = self.pipeline("copy_u32")?;
+        crate::dispatch::dispatch_1d(self, &p, n, |bnd| {
+            crate::dispatch::set_gpu_buf(bnd, &staged, 0);
+            crate::dispatch::set_gpu_buf(bnd, dst, 1);
+            crate::dispatch::set_u32(bnd, n32, 2);
+        })
+    }
+
     pub fn alloc_buffer_hot(&self, nbytes: usize) -> Result<crate::tensor::GpuBuffer, String> {
         self.alloc_buffer_kind(nbytes, BufferKind::Hot)
     }
@@ -1381,29 +1424,12 @@ impl GpuRuntime {
     }
 
     pub fn alloc_tensor_f32(self: &Arc<Self>, shape: &[usize]) -> Result<crate::tensor::Tensor, String> {
-        self.alloc_tensor_f32_kind(shape, BufferKind::Cold)
+        self.alloc_tensor_kind(shape, crate::tensor::DType::F32, BufferKind::Cold, true)
     }
 
     /// Persistent weights / grads / optim / EMA — stay in residency (no cold recycle).
     pub fn alloc_tensor_f32_hot(self: &Arc<Self>, shape: &[usize]) -> Result<crate::tensor::Tensor, String> {
-        self.alloc_tensor_f32_kind(shape, BufferKind::Hot)
-    }
-
-    fn alloc_tensor_f32_kind(
-        self: &Arc<Self>,
-        shape: &[usize],
-        kind: BufferKind,
-    ) -> Result<crate::tensor::Tensor, String> {
-        let nbytes = crate::tensor::checked_nbytes(shape, crate::tensor::DType::F32)?;
-        let buf = self.alloc_buffer_kind(nbytes, kind)?;
-        unsafe { buf.zero_unsubmitted() };
-        Ok(crate::tensor::Tensor {
-            buffer: buf,
-            shape: shape.to_vec(),
-            dtype: crate::tensor::DType::F32,
-            byte_offset: 0,
-            runtime: Arc::clone(self),
-        })
+        self.alloc_tensor_kind(shape, crate::tensor::DType::F32, BufferKind::Hot, true)
     }
 
     /// Allocate an IEEE binary16 tensor.
@@ -1412,50 +1438,66 @@ impl GpuRuntime {
     /// bit layouts differ, so a buffer written as one and read as the other is
     /// silently wrong rather than merely imprecise.
     pub fn alloc_tensor_f16(self: &Arc<Self>, shape: &[usize]) -> Result<crate::tensor::Tensor, String> {
-        self.alloc_tensor_f16_kind(shape, BufferKind::Cold)
+        self.alloc_tensor_kind(shape, crate::tensor::DType::F16, BufferKind::Cold, true)
     }
 
     pub fn alloc_tensor_f16_hot(self: &Arc<Self>, shape: &[usize]) -> Result<crate::tensor::Tensor, String> {
-        self.alloc_tensor_f16_kind(shape, BufferKind::Hot)
-    }
-
-    fn alloc_tensor_f16_kind(
-        self: &Arc<Self>,
-        shape: &[usize],
-        kind: BufferKind,
-    ) -> Result<crate::tensor::Tensor, String> {
-        let nbytes = crate::tensor::checked_nbytes(shape, crate::tensor::DType::F16)?;
-        let buf = self.alloc_buffer_kind(nbytes, kind)?;
-        unsafe { buf.zero_unsubmitted() };
-        Ok(crate::tensor::Tensor {
-            buffer: buf,
-            shape: shape.to_vec(),
-            dtype: crate::tensor::DType::F16,
-            byte_offset: 0,
-            runtime: Arc::clone(self),
-        })
+        self.alloc_tensor_kind(shape, crate::tensor::DType::F16, BufferKind::Hot, true)
     }
 
     pub fn alloc_tensor_bf16(self: &Arc<Self>, shape: &[usize]) -> Result<crate::tensor::Tensor, String> {
-        self.alloc_tensor_bf16_kind(shape, BufferKind::Cold)
+        self.alloc_tensor_kind(shape, crate::tensor::DType::BF16, BufferKind::Cold, true)
     }
 
     pub fn alloc_tensor_bf16_hot(self: &Arc<Self>, shape: &[usize]) -> Result<crate::tensor::Tensor, String> {
-        self.alloc_tensor_bf16_kind(shape, BufferKind::Hot)
+        self.alloc_tensor_kind(shape, crate::tensor::DType::BF16, BufferKind::Hot, true)
     }
 
-    fn alloc_tensor_bf16_kind(
+    /// A tensor whose every element a kernel writes before anything reads
+    /// it: not zeroed on the host, so it holds whatever its pooled buffer
+    /// last held (NaN under [`Self::set_poison_unzeroed`]). The zeroing
+    /// allocators cost a CPU pass over the bytes per allocation, with the
+    /// GPU idle meanwhile; a training step's outputs and temporaries are
+    /// tens of GB of them.
+    pub fn alloc_tensor_unzeroed(
         self: &Arc<Self>,
         shape: &[usize],
-        kind: BufferKind,
+        dtype: crate::tensor::DType,
     ) -> Result<crate::tensor::Tensor, String> {
-        let nbytes = crate::tensor::checked_nbytes(shape, crate::tensor::DType::BF16)?;
+        self.alloc_tensor_kind(shape, dtype, BufferKind::Cold, false)
+    }
+
+    /// Fill every later [`Self::alloc_tensor_unzeroed`] allocation with NaN
+    /// bits (`0xFF` bytes: NaN in f32, bf16 and f16) instead of leaving it
+    /// as the pool returned it. A test aid: an unzeroed allocation that is
+    /// read before it is written then shows up as NaN in what reads it,
+    /// rather than passing on a pool that happened to hand back zeros.
+    pub fn set_poison_unzeroed(&self, on: bool) {
+        self.poison_unzeroed.store(on, Ordering::Release);
+    }
+
+    fn alloc_tensor_kind(
+        self: &Arc<Self>,
+        shape: &[usize],
+        dtype: crate::tensor::DType,
+        kind: BufferKind,
+        zeroed: bool,
+    ) -> Result<crate::tensor::Tensor, String> {
+        let nbytes = crate::tensor::checked_nbytes(shape, dtype)?;
         let buf = self.alloc_buffer_kind(nbytes, kind)?;
-        unsafe { buf.zero_unsubmitted() };
+        if zeroed {
+            crate::infer_trace::on_host_zero(buf.nbytes());
+            // SAFETY: `buf` was just allocated (fresh, or retired by the pool
+            // after the GPU finished with it) and no view of it exists yet.
+            unsafe { buf.zero_unsubmitted() };
+        } else if self.poison_unzeroed.load(Ordering::Acquire) {
+            // SAFETY: as above.
+            unsafe { buf.fill_unsubmitted(0xFF) };
+        }
         Ok(crate::tensor::Tensor {
             buffer: buf,
             shape: shape.to_vec(),
-            dtype: crate::tensor::DType::BF16,
+            dtype,
             byte_offset: 0,
             runtime: Arc::clone(self),
         })
@@ -2634,6 +2676,34 @@ mod audit_tests {
         assert!(panicked.is_err(), "write_u32 swallowed the length mismatch");
         buf.try_write_u32(&[7]).unwrap();
         assert_eq!(buf.read_u32(), vec![7]);
+    }
+
+    /// `upload_u32` lands between the commands encoded before and after it,
+    /// with neither waited for: a kernel queued before it reads the old
+    /// values, one queued after reads the new.
+    #[test]
+    fn upload_u32_is_ordered_with_queued_work() {
+        let rt = GpuRuntime::new().unwrap();
+        let src = rt.alloc_buffer_from_u32(&[1, 2, 3]).unwrap();
+        let (before, after) = (rt.alloc_buffer(12).unwrap(), rt.alloc_buffer(12).unwrap());
+        let copy = |from: &crate::tensor::GpuBuffer, to: &crate::tensor::GpuBuffer| {
+            let p = rt.pipeline("copy_u32").unwrap();
+            crate::dispatch::dispatch_1d(&rt, &p, 3, |bnd| {
+                crate::dispatch::set_gpu_buf(bnd, from, 0);
+                crate::dispatch::set_gpu_buf(bnd, to, 1);
+                crate::dispatch::set_u32(bnd, 3, 2);
+            })
+            .unwrap();
+        };
+        rt.set_async_encode(true).unwrap();
+        copy(&src, &before);
+        rt.upload_u32(&src, &[7, 0x0000_0001, 0x7fc0_0001]).unwrap();
+        copy(&src, &after);
+        assert!(rt.upload_u32(&src, &[1]).unwrap_err().contains("upload_u32"));
+        rt.set_async_encode(false).unwrap();
+        assert_eq!(before.read_u32(), vec![1, 2, 3]);
+        // Bitwise: a denormal's and a signalling NaN's bits survive.
+        assert_eq!(after.read_u32(), vec![7, 0x0000_0001, 0x7fc0_0001]);
     }
 
     #[test]

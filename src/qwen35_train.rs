@@ -40,7 +40,9 @@
 use std::sync::Arc;
 
 use crate::attn_train::{attn_train_backward, attn_train_forward, AttnTrainDims, AttnTrainGrads, AttnTrainWorkspace};
-use crate::cross_entropy::{cross_entropy_rows, CeGrads, CeHidden, CeWorkspace, Reduction};
+use crate::cross_entropy::{
+    cross_entropy_rows, cross_entropy_rows_accumulating, CeGrads, CeHidden, CeWorkspace, Reduction,
+};
 use crate::dispatch::{dispatch_1d, dispatch_2d, set_gpu_buf, set_gpu_buf_offset, set_u32};
 use crate::gdn_train::{
     gdn_train_backward, gdn_train_forward, GdnTrainDims, GdnTrainGrads, GdnTrainInputs, GdnTrainWorkspace, GDN_TRAIN_DK,
@@ -245,6 +247,10 @@ fn deliver(rt: &Arc<GpuRuntime>, src: &[Part<'_>], dst: &[Part<'_>], add: bool) 
         if st != DType::F32 {
             return Err(format!("deliver: a {st:?} gradient; the step makes f32 ones"));
         }
+        // Written in place by its GEMM ([`Qwen35Model::weight_grad`]).
+        if dt == DType::F32 && sb.aliases(db) && so == doff {
+            continue;
+        }
         match dt {
             DType::F32 => {
                 let p = rt.pipeline(if add { "add_inplace_f32" } else { "copy_f32" })?;
@@ -308,9 +314,16 @@ pub struct PendingStep {
     xf: Tensor,
     dxf: Tensor,
     /// The LM head's weight gradient; none when the step scores nothing in
-    /// tessl, whose embedding gradient is then the gather's alone.
+    /// tessl, whose embedding gradient is then the gather's alone, or when
+    /// the head went straight into the bank (`head_in_bank`).
     d_embed: Option<Tensor>,
+    /// The cross-entropy wrote (or added) the head gradient into the bank's
+    /// f32 embedding itself, which the gather then adds onto.
+    head_in_bank: bool,
     loss: f64,
+    /// The step's one attention workspace (a model with attention layers):
+    /// every attention layer's forward, rebuild and backward use it.
+    attn_ws: Option<AttnTrainWorkspace>,
     /// The model's embedding buffer: which model made this step.
     embed: GpuBuffer,
     /// The model's parameter generation when the forward began: the backward
@@ -361,8 +374,7 @@ impl PendingStep {
         if n == 0 {
             return Ok(());
         }
-        let pos = rt.alloc_buffer(std::mem::size_of_val(positions))?;
-        pos.try_write_u32(positions)?;
+        let pos = rt.alloc_buffer_from_u32(positions)?;
         let p = rt.pipeline("ce_gather_rows_f32")?;
         dispatch_2d(rt, &p, h, n, |bnd| {
             set_gpu_buf_offset(bnd, &self.xf.buffer, self.xf.byte_offset(), 0);
@@ -388,6 +400,13 @@ fn zero_part(rt: &Arc<GpuRuntime>, (b, off, n, dtype): Part<'_>) -> Result<(), S
         set_gpu_buf_offset(bnd, b, off, 0);
         set_u32(bnd, n32, 1);
     })
+}
+
+/// Whether a bank's embedding gradient takes the head's and the gather's
+/// gradients in place: f32 (a GEMM accumulates into it) and a whole buffer
+/// (the gather's kernel addresses the buffer from its start).
+fn embed_in_place(t: &Tensor) -> bool {
+    t.dtype == DType::F32 && t.byte_offset() == 0 && t.nbytes_logical() == t.buffer.nbytes()
 }
 
 /// What [`Qwen35Model::train_step`] returns.
@@ -446,7 +465,6 @@ struct Scratch {
     dresid: Tensor,
     /// A norm input's gradient before it joins `dresid`.
     dx: Tensor,
-    tmp_h: Tensor,
     d_mid: Tensor,
     d_gate: Tensor,
     d_up: Tensor,
@@ -488,8 +506,12 @@ fn f32s(rt: &Arc<GpuRuntime>, n: usize) -> Result<GpuBuffer, String> {
     rt.alloc_buffer(n.max(1) * std::mem::size_of::<f32>())
 }
 
+/// An f32 tensor a kernel writes in full before anything reads it: every
+/// one the step allocates. Not zeroed on the host
+/// ([`GpuRuntime::alloc_tensor_unzeroed`]); what must start at zero is
+/// zeroed on the GPU in order with the work around it ([`zero_part`]).
 fn tensor(rt: &Arc<GpuRuntime>, shape: &[usize]) -> Result<Tensor, String> {
-    rt.alloc_tensor_f32(shape)
+    rt.alloc_tensor_unzeroed(shape, DType::F32)
 }
 
 /// `t * k_heads`: the rows of a `[t, k_heads, 128]` operand taken one head
@@ -654,7 +676,10 @@ impl Qwen35Model {
         sup: Supervise<'_>,
         bank: Option<(&Qwen35Grads, bool)>,
     ) -> Result<(f64, Option<Qwen35Grads>), String> {
-        let p = self.step_forward(ids, operands, sup, bank.is_none())?;
+        let head = bank
+            .filter(|(b, _)| embed_in_place(&b.embed))
+            .map(|(b, add)| (&b.embed, add));
+        let p = self.step_forward(ids, operands, sup, bank.is_none(), head)?;
         let loss = p.loss;
         Ok((loss, self.backward(p, None, bank)?))
     }
@@ -675,18 +700,21 @@ impl Qwen35Model {
         operands: GemmOperands,
         sup: Supervise<'_>,
     ) -> Result<PendingStep, String> {
-        self.step_forward(ids, operands, sup, false)
+        self.step_forward(ids, operands, sup, false, None)
     }
 
     /// [`Self::train_forward`]; `fresh` when the backward will return fresh
     /// gradients rather than deliver them into a bank, which the pre-flight
-    /// then counts too.
+    /// then counts too. `head` is the bank's f32 embedding (and whether to
+    /// add into it) when the head gradient goes straight there: no
+    /// `[vocab, hidden]` tensor and no copy of it (2 GB on the 2B).
     fn step_forward(
         &self,
         ids: &[u32],
         operands: GemmOperands,
         sup: Supervise<'_>,
         fresh: bool,
+        head: Option<(&Tensor, bool)>,
     ) -> Result<PendingStep, String> {
         const WHAT: &str = "Qwen35Model::train_step";
         // Read before any weight is: a write that lands during the forward
@@ -751,7 +779,10 @@ impl Qwen35Model {
         // A waited commit: what earlier work freed is recycled, so the
         // allocation read next is what the step really starts from.
         id_buf.try_write_u32(ids)?;
-        let (have, need) = (rt.current_allocated_bytes(), self.step_bytes(t, operands, fresh));
+        let (have, need) = (
+            rt.current_allocated_bytes(),
+            self.step_bytes(t, operands, fresh, head.is_none()),
+        );
         let limit = rt.memory_info().recommended_working_set;
         if have.saturating_add(need) > limit {
             return Err(format!(
@@ -784,15 +815,16 @@ impl Qwen35Model {
         // it put layer 0's `dt_bias` gradient 1.1e-1 from the f32 step's,
         // against 2.7e-2 this way.
         let mut inputs = Vec::with_capacity(self.layers.len());
+        let attn_ws = self.attn_workspace(t)?;
         for layer in &self.layers {
             let kept = if self.precision == Precision::Bf16 {
-                let b = rt.alloc_tensor_bf16(&[tu, h])?;
+                let b = rt.alloc_tensor_unzeroed(&[tu, h], DType::BF16)?;
                 cast_f32_to_bf16_into(&resid, &b)?;
                 Some(b)
             } else {
                 None
             };
-            let (s, out) = self.train_layer_forward(layer, resid, t, true, operands)?;
+            let (s, out) = self.train_layer_forward(layer, resid, t, true, operands, attn_ws.as_ref())?;
             let out = out.ok_or("Qwen35Model::train_step: a layer's forward returned no output")?;
             inputs.push(kept.unwrap_or(s.resid_in));
             resid = out;
@@ -802,14 +834,15 @@ impl Qwen35Model {
 
         // ---- loss and the LM head ------------------------------------------
         let scores = !matches!(sup, Supervise::Rows { positions: [], .. });
-        let d_embed = if scores {
+        let d_embed = if scores && head.is_none() {
             Some(tensor(rt, &[cfg.vocab as usize, h])?)
         } else {
             None
         };
         let dxf = tensor(rt, &[tu, h])?;
-        // Positions nothing scores keep a zero gradient row.
-        dxf.buffer.try_zero()?;
+        // Positions nothing scores keep a zero gradient row. Zeroed on the
+        // GPU: a host zero would wait for the whole forward first.
+        zero_part(rt, tensor_part(&dxf))?;
         let ce = |rows: &[u32], targets: &[u32], reduction, dh: &Tensor, scale| {
             let ws = CeWorkspace::new(
                 rt,
@@ -818,21 +851,28 @@ impl Qwen35Model {
                 CE_CHUNK.min(cfg.vocab),
                 self.embed.dtype,
             )?;
-            cross_entropy_rows(
-                rt,
-                CeHidden { rows: &xf, off: 0 },
-                &self.embed,
-                rows,
-                targets,
-                reduction,
-                operands,
-                &ws,
-                Some(CeGrads {
-                    dh,
-                    dw: d_embed.as_ref().ok_or("a scored step has a head gradient")?,
-                    scale,
-                }),
-            )
+            let hidden = CeHidden { rows: &xf, off: 0 };
+            let (dw, add) = match (head, &d_embed) {
+                (Some((bank, add)), _) => (bank, add),
+                (None, Some(d)) => (d, false),
+                (None, None) => return Err("a scored step has a head gradient".to_string()),
+            };
+            let grads = CeGrads { dh, dw, scale };
+            if add {
+                cross_entropy_rows_accumulating(rt, hidden, &self.embed, rows, targets, reduction, operands, &ws, grads)
+            } else {
+                cross_entropy_rows(
+                    rt,
+                    hidden,
+                    &self.embed,
+                    rows,
+                    targets,
+                    reduction,
+                    operands,
+                    &ws,
+                    Some(grads),
+                )
+            }
         };
         let loss = match sup {
             Supervise::Causal => {
@@ -863,7 +903,9 @@ impl Qwen35Model {
             xf,
             dxf,
             d_embed,
+            head_in_bank: scores && head.is_some(),
             loss,
+            attn_ws,
             embed: self.embed.buffer.clone(),
             param_generation,
         })
@@ -937,6 +979,8 @@ impl Qwen35Model {
             resid,
             dxf,
             d_embed,
+            head_in_bank,
+            attn_ws,
             ..
         } = p;
         let h = cfg.hidden as usize;
@@ -945,7 +989,7 @@ impl Qwen35Model {
         }
 
         // ---- backward -------------------------------------------------------
-        let mut sc = self.scratch(t)?;
+        let mut sc = self.scratch(t, attn_ws)?;
         let final_norm = f32s(rt, h)?;
         rms_norm_bwd(
             rt,
@@ -978,27 +1022,26 @@ impl Qwen35Model {
             } else {
                 kept
             };
-            let s = self.train_layer_forward(layer, resid_in, t, false, operands)?.0;
-            let g = self.train_layer_backward(layer, &s, &mut sc, operands)?;
+            let ws = sc.attn.as_ref().map(|a| &a.ws);
+            let s = self.train_layer_forward(layer, resid_in, t, false, operands, ws)?.0;
+            let into = bank.map(|(b, add)| (&b.layers[li], add));
+            let g = self.train_layer_backward(layer, &s, &mut sc, operands, into)?;
             match bank {
                 Some((b, add)) => deliver(rt, &g.parts(), &b.layers[li].parts(), add)?,
                 None => layers.push(g),
             }
         }
         layers.reverse();
-        // The gather's gradient adds onto the head's. With no head gradient
-        // and an f32 bank whose embedding is a whole buffer, it adds straight
-        // into the bank (zeroed first unless accumulating): no 2 GB tensor
-        // and no copy on the 2B. A bf16 bank takes it through an f32 tensor,
-        // rounded once on delivery.
+        // The gather's gradient adds onto the head's. Into an f32 bank whose
+        // embedding is a whole buffer it adds straight into the bank: onto
+        // the head gradient the cross-entropy already wrote there, or, with
+        // no head gradient, onto the bank zeroed first unless accumulating.
+        // No 2 GB tensor and no copy on the 2B. A bf16 bank takes it through
+        // an f32 tensor, rounded once on delivery.
         let (dw, direct) = match (d_embed, bank) {
             (Some(d), _) => (d, false),
-            (None, Some((b, add)))
-                if b.embed.dtype == DType::F32
-                    && b.embed.byte_offset() == 0
-                    && b.embed.nbytes_logical() == b.embed.buffer.nbytes() =>
-            {
-                if !add {
+            (None, Some((b, add))) if embed_in_place(&b.embed) => {
+                if !add && !head_in_bank {
                     zero_part(rt, tensor_part(&b.embed))?;
                 }
                 (b.embed.clone(), true)
@@ -1026,7 +1069,18 @@ impl Qwen35Model {
         }))
     }
 
-    fn scratch(&self, t: u32) -> Result<Scratch, String> {
+    /// The step's attention workspace: one per step, made before the
+    /// forward encodes anything (none for a model without attention).
+    fn attn_workspace(&self, t: u32) -> Result<Option<AttnTrainWorkspace>, String> {
+        if self.cfg.layers.contains(&crate::qwen35_model::LayerKind::FullAttention) {
+            Ok(Some(AttnTrainWorkspace::new(&self.rt, self.attn_dims(t))?))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// The backward's scratch, holding the step's attention workspace.
+    fn scratch(&self, t: u32, attn_ws: Option<AttnTrainWorkspace>) -> Result<Scratch, String> {
         let (rt, cfg) = (&self.rt, &self.cfg);
         let (tu, h, i) = (t as usize, cfg.hidden as usize, cfg.intermediate as usize);
         let (g, a) = (cfg.gdn, cfg.attn);
@@ -1073,7 +1127,7 @@ impl Qwen35Model {
                 dq: f32s(rt, tu * qd)?,
                 dk: f32s(rt, tu * kvd)?,
                 dv: f32s(rt, tu * kvd)?,
-                ws: AttnTrainWorkspace::new(rt, self.attn_dims(t))?,
+                ws: attn_ws.ok_or("Qwen35Model::train_step: the step has no attention workspace")?,
                 part: f32s(rt, attn_qk_norm_rope_bwd_part_len(&self.attn_shape(t)))?,
             })
         } else {
@@ -1083,7 +1137,6 @@ impl Qwen35Model {
             t,
             dresid: tensor(rt, &[tu, h])?,
             dx: tensor(rt, &[tu, h])?,
-            tmp_h: tensor(rt, &[tu, h])?,
             d_mid: tensor(rt, &[tu, i])?,
             d_gate: tensor(rt, &[tu, i])?,
             d_up: tensor(rt, &[tu, i])?,
@@ -1104,8 +1157,8 @@ impl Qwen35Model {
     /// async encode (the default) every dispatch is one, so a layer's
     /// buffers are recycled once the next layer's first kernel has run;
     /// with it ([`GpuRuntime::set_async_encode`]) a step waits only at each
-    /// attention layer (its workspace's host writes), at the cross-entropy,
-    /// and at its start and end. So the bound is what the step holds
+    /// attention layer (a deliberate wait, forward and rebuild), at the
+    /// cross-entropy's loss, and at its start and end. So the bound is what the step holds
     /// throughout (each layer's input, the final norm's output and its
     /// gradient, the head gradient, the backward's scratch), plus the most
     /// it allocates between two waits (two adjacent layers' intermediates,
@@ -1118,13 +1171,15 @@ impl Qwen35Model {
     /// and the device's current allocation exceed its recommended working
     /// set.
     pub fn train_step_bytes(&self, t: u32, operands: GemmOperands) -> u64 {
-        self.step_bytes(t, operands, false)
+        self.step_bytes(t, operands, false, true)
     }
 
     /// [`Self::train_step_bytes`]; `fresh` adds every layer's gradients held
     /// to the end, as [`Self::train_step`] returns them instead of
-    /// delivering each into a bank.
-    fn step_bytes(&self, t: u32, mm: GemmOperands, fresh: bool) -> u64 {
+    /// delivering each into a bank, and `head` the `[vocab, hidden]` head
+    /// gradient, which [`Self::train_step_into`] writes straight into an f32
+    /// bank instead.
+    fn step_bytes(&self, t: u32, mm: GemmOperands, fresh: bool, head: bool) -> u64 {
         let (cfg, tu) = (&self.cfg, t as usize);
         let (h, v) = (cfg.hidden as usize, cfg.vocab as usize);
         let f = |n: usize| GpuRuntime::allocated_bytes_for(n.saturating_mul(4), BufferKind::Cold);
@@ -1140,8 +1195,20 @@ impl Qwen35Model {
             (th, 0)
         };
         // The ids, each layer's input and the stream out of the last, the
-        // final norm's output and its gradient, the head gradient.
-        let held = sum(&[f(tu), kept.saturating_mul(layers), th.saturating_mul(3), f(v * h)]);
+        // final norm's output and its gradient, the head gradient, and the
+        // step's attention workspace.
+        let attn_ws = if cfg.layers.contains(&crate::qwen35_model::LayerKind::FullAttention) {
+            AttnTrainWorkspace::allocated_bytes_for(self.attn_dims(t))
+        } else {
+            0
+        };
+        let held = sum(&[
+            f(tu),
+            kept.saturating_mul(layers),
+            th.saturating_mul(3),
+            if head { f(v * h) } else { 0 },
+            attn_ws,
+        ]);
         let fwd: Vec<u64> = self
             .layers
             .iter()
@@ -1176,7 +1243,7 @@ impl Qwen35Model {
         };
         // Without async encode every dispatch is a waited commit, so a
         // layer's buffers are recycled once the next layer's first kernel
-        // runs; with it, only at an attention layer's workspace.
+        // runs; with it, only at an attention layer's deliberate wait.
         let batched = self.rt.async_encode_enabled();
         let is_attn = |l: &Layer| !batched || matches!(l.mixer, Mixer::Attn(_));
         let fwd_most = between_waits(&mut self.layers.iter().map(is_attn).zip(fwd.iter().copied()));
@@ -1260,8 +1327,7 @@ impl Qwen35Model {
                     mm.nn_scratch_bytes(tu, a.width() as usize, h, wd),
                     f(tu * qd),
                     f(tu * kvd),
-                    f(tu * kvd), // q, k, v
-                    AttnTrainWorkspace::allocated_bytes_for(dims),
+                    f(tu * kvd),       // q, k, v
                     f(tu * qd),        // o
                     f(dims.lse_len()), // lse
                     f(tu * qd),        // y
@@ -1324,7 +1390,7 @@ impl Qwen35Model {
         let f = |n: usize| GpuRuntime::allocated_bytes_for(n.max(1).saturating_mul(4), BufferKind::Cold);
         let has = |k: crate::qwen35_model::LayerKind| cfg.layers.contains(&k);
         let mut b = vec![
-            3 * f(tu * h), // dresid, dx, tmp_h
+            2 * f(tu * h), // dresid, dx
             3 * f(tu * i), // d_mid, d_gate, d_up
             f(rms_norm_bwd_part_len(t, cfg.hidden)),
         ];
@@ -1362,7 +1428,6 @@ impl Qwen35Model {
                 3 * f(tu * qd),             // dy, d_o, dq
                 f(tu * a.width() as usize), // dproj
                 2 * f(tu * kvd),            // dk, dv
-                AttnTrainWorkspace::allocated_bytes_for(self.attn_dims(t)),
                 f(attn_qk_norm_rope_bwd_part_len(&self.attn_shape(t))),
             ]);
         }
@@ -1443,18 +1508,21 @@ impl Qwen35Model {
     }
 
     /// A fresh residual stream `resid + y @ w_out`, leaving `resid` as the
-    /// saved input of the norm that read it.
+    /// saved input of the norm that read it: `resid` copied out, then the
+    /// product added in its GEMM (no product tensor, no read-modify-write
+    /// pass over the stream).
     fn residual(&self, resid: &Tensor, y: &Tensor, w_out: &Tensor, t: u32, mm: GemmOperands) -> Result<Tensor, String> {
         let (rt, h) = (&self.rt, self.cfg.hidden);
         let out = tensor(rt, &[t as usize, h as usize])?;
-        mm.nn(y, w_out, &out)?;
-        qwen35::residual_add(rt, Cols::dense(&resid.buffer, h), Cols::dense(&out.buffer, h), t, h)?;
+        deliver(rt, &[tensor_part(resid)], &[tensor_part(&out)], false)?;
+        mm.nn_acc(y, w_out, &out)?;
         Ok(out)
     }
 
     /// One layer's forward from `resid_in`, keeping what its backward reads;
     /// with `output`, also the residual stream out of it (a recomputation
     /// needs only the former, and skips the `down` projection's product).
+    /// `attn_ws` is the step's attention workspace (an attention layer needs it).
     fn train_layer_forward(
         &self,
         layer: &Layer,
@@ -1462,6 +1530,7 @@ impl Qwen35Model {
         t: u32,
         output: bool,
         mm: GemmOperands,
+        attn_ws: Option<&AttnTrainWorkspace>,
     ) -> Result<(Saved, Option<Tensor>), String> {
         let (rt, cfg) = (&self.rt, &self.cfg);
         let (tu, h, i) = (t as usize, cfg.hidden as usize, cfg.intermediate as usize);
@@ -1474,7 +1543,8 @@ impl Qwen35Model {
                 (SavedMixer::Gdn(Box::new(s)), r)
             }
             Mixer::Attn(w) => {
-                let s = self.attn_forward(w, &x1, t, mm)?;
+                let ws = attn_ws.ok_or("Qwen35Model::train_step: an attention layer without the step's workspace")?;
+                let s = self.attn_forward(w, &x1, t, mm, ws)?;
                 let r = self.residual(&resid_in, &s.y, &w.w_out, t, mm)?;
                 (SavedMixer::Attn(s), r)
             }
@@ -1629,7 +1699,14 @@ impl Qwen35Model {
         })
     }
 
-    fn attn_forward(&self, w: &AttnWeights, x1: &Tensor, t: u32, mm: GemmOperands) -> Result<SavedAttn, String> {
+    fn attn_forward(
+        &self,
+        w: &AttnWeights,
+        x1: &Tensor,
+        t: u32,
+        mm: GemmOperands,
+        ws: &AttnTrainWorkspace,
+    ) -> Result<SavedAttn, String> {
         let (rt, a) = (&self.rt, self.cfg.attn);
         let tu = t as usize;
         let (qd, kvd) = (
@@ -1655,9 +1732,15 @@ impl Qwen35Model {
             self.cfg.rms_norm_eps,
         )?;
         let dims = self.attn_dims(t);
-        let ws = AttnTrainWorkspace::new(rt, dims)?;
+        // The step's one deliberate wait per attention layer (forward and
+        // rebuild). Under async encode the pool recycles what earlier layers
+        // freed only at a wait, and [`Self::step_bytes`] bounds the step's
+        // memory by the work between two of them; without async encode every
+        // dispatch has already waited and this costs nothing. (It used to be
+        // the drain of a fresh workspace's host writes, made here per layer.)
+        rt.synchronize()?;
         let (o, lse) = (f32s(rt, tu * qd)?, f32s(rt, dims.lse_len())?);
-        attn_train_forward(rt, &dims, &q, &k, &v, &o, &lse, &ws)?;
+        attn_train_forward(rt, &dims, &q, &k, &v, &o, &lse, ws)?;
         let y = tensor(rt, &[tu, qd])?;
         qwen35::attn_output_gate(
             rt,
@@ -1682,23 +1765,54 @@ impl Qwen35Model {
         })
     }
 
+    /// A weight's gradient `A^T B`: straight into its bank tensor when that
+    /// is f32 (over it, or added to it in the GEMM), else into a fresh
+    /// tensor delivered after the layer. Returns the tensor it is in, the
+    /// bank's own when it went there ([`deliver`] then skips it).
+    fn weight_grad(
+        &self,
+        mm: GemmOperands,
+        a_km: &Tensor,
+        b_kn: &Tensor,
+        bank: Option<(&Tensor, bool)>,
+    ) -> Result<Tensor, String> {
+        match bank {
+            Some((dst, add)) if dst.dtype == DType::F32 => {
+                if add {
+                    mm.tn_acc(a_km, b_kn, dst)?;
+                } else {
+                    mm.tn(a_km, b_kn, dst)?;
+                }
+                Ok(dst.clone())
+            }
+            _ => {
+                let g = tensor(&self.rt, &[a_km.shape()[1], b_kn.shape()[1]])?;
+                mm.tn(a_km, b_kn, &g)?;
+                Ok(g)
+            }
+        }
+    }
+
     /// One layer's backward. On entry `sc.dresid` is the gradient of the
-    /// layer's output; on return, of its input.
+    /// layer's output; on return, of its input. `bank` is the layer's
+    /// gradients in a bank (and whether to add into them): its f32 weight
+    /// matrices take their gradients in place ([`Self::weight_grad`]).
     fn train_layer_backward(
         &self,
         layer: &Layer,
         s: &Saved,
         sc: &mut Scratch,
         mm: GemmOperands,
+        bank: Option<(&LayerGrads, bool)>,
     ) -> Result<LayerGrads, String> {
         let (rt, cfg) = (&self.rt, &self.cfg);
         let (t, h, i) = (sc.t, cfg.hidden, cfg.intermediate);
-        let (hu, iu) = (h as usize, i as usize);
+        let hu = h as usize;
         let eps = cfg.rms_norm_eps;
 
         // MLP: resid_out = resid_mid + swiglu(x2 @ gate, x2 @ up) @ down.
-        let down = tensor(rt, &[iu, hu])?;
-        mm.tn(&s.m_mid, &sc.dresid, &down)?;
+        let into = |pick: fn(&LayerGrads) -> &Tensor| bank.map(|(b, add)| (pick(b), add));
+        let down = self.weight_grad(mm, &s.m_mid, &sc.dresid, into(|b| &b.down))?;
         mm.nt(&sc.dresid, &layer.down, &sc.d_mid)?;
         swiglu_bwd(
             rt,
@@ -1710,18 +1824,11 @@ impl Qwen35Model {
             t,
             i,
         )?;
-        let (gate, up) = (tensor(rt, &[hu, iu])?, tensor(rt, &[hu, iu])?);
-        mm.tn(&s.x2, &sc.d_gate, &gate)?;
-        mm.tn(&s.x2, &sc.d_up, &up)?;
+        let gate = self.weight_grad(mm, &s.x2, &sc.d_gate, into(|b| &b.gate))?;
+        let up = self.weight_grad(mm, &s.x2, &sc.d_up, into(|b| &b.up))?;
+        // dx = d_gate @ gate^T + d_up @ up^T, the second added in its GEMM.
         mm.nt(&sc.d_gate, &layer.gate, &sc.dx)?;
-        mm.nt(&sc.d_up, &layer.up, &sc.tmp_h)?;
-        qwen35::residual_add(
-            rt,
-            Cols::dense(&sc.tmp_h.buffer, h),
-            Cols::dense(&sc.dx.buffer, h),
-            t,
-            h,
-        )?;
+        mm.nt_acc(&sc.d_up, &layer.up, &sc.dx)?;
         let post_norm = f32s(rt, hu)?;
         rms_norm_bwd(
             rt,
@@ -1738,10 +1845,25 @@ impl Qwen35Model {
         )?;
 
         // Mixer: resid_mid = resid_in + mixer(x1), x1 = norm(resid_in).
-        let mixer = match (&layer.mixer, &s.mixer) {
-            (Mixer::Gdn(w), SavedMixer::Gdn(sv)) => MixerGrads::Gdn(self.gdn_backward(w, sv, &s.x1, sc, mm)?),
-            (Mixer::Attn(w), SavedMixer::Attn(sv)) => MixerGrads::Attn(self.attn_backward(w, sv, &s.x1, sc, mm)?),
-            _ => return Err("Qwen35Model::train_step: a layer's saved state is not its mixer's".into()),
+        const MISMATCH: &str = "Qwen35Model::train_step: a layer's saved state or bank is not its mixer's";
+        let mixer = match (&layer.mixer, &s.mixer, bank.map(|(b, add)| (&b.mixer, add))) {
+            (Mixer::Gdn(w), SavedMixer::Gdn(sv), into) => {
+                let into = match into {
+                    Some((MixerGrads::Gdn(g), add)) => Some((&g.w_in, &g.w_out, add)),
+                    Some(_) => return Err(MISMATCH.into()),
+                    None => None,
+                };
+                MixerGrads::Gdn(self.gdn_backward(w, sv, &s.x1, sc, mm, into)?)
+            }
+            (Mixer::Attn(w), SavedMixer::Attn(sv), into) => {
+                let into = match into {
+                    Some((MixerGrads::Attn(g), add)) => Some((&g.w_in, &g.w_out, add)),
+                    Some(_) => return Err(MISMATCH.into()),
+                    None => None,
+                };
+                MixerGrads::Attn(self.attn_backward(w, sv, &s.x1, sc, mm, into)?)
+            }
+            _ => return Err(MISMATCH.into()),
         };
         let input_norm = f32s(rt, hu)?;
         rms_norm_bwd(
@@ -1769,6 +1891,8 @@ impl Qwen35Model {
 
     /// The GDN mixer's backward from `sc.dresid`; leaves the gradient of its
     /// input `x1` in `sc.dx`.
+    /// `bank` is the layer's `(w_in, w_out)` bank gradients (and whether to
+    /// add into them), as [`Self::train_layer_backward`] takes them.
     fn gdn_backward(
         &self,
         w: &GdnWeights,
@@ -1776,13 +1900,12 @@ impl Qwen35Model {
         x1: &Tensor,
         sc: &mut Scratch,
         mm: GemmOperands,
+        bank: Option<(&Tensor, &Tensor, bool)>,
     ) -> Result<GdnGrads, String> {
         let (rt, cfg, g) = (&self.rt, &self.cfg, self.cfg.gdn);
         let t = sc.t;
-        let (hu, vd) = (cfg.hidden as usize, g.value_dim() as usize);
         let gs = sc.gdn.as_ref().ok_or("Qwen35Model::train_step: no GDN scratch")?;
-        let w_out = tensor(rt, &[vd, hu])?;
-        mm.tn(&s.y, &sc.dresid, &w_out)?;
+        let w_out = self.weight_grad(mm, &s.y, &sc.dresid, bank.map(|(_, o, add)| (o, add)))?;
         mm.nt(&sc.dresid, &w.w_out, &gs.dy)?;
         // y = gated_rms_norm(o, z): d_o, and dz into the projection gradient.
         let norm_w = f32s(rt, g.v_dim() as usize)?;
@@ -1893,8 +2016,7 @@ impl Qwen35Model {
             t,
             g.conv_dim(),
         )?;
-        let w_in = tensor(rt, &[hu, g.width() as usize])?;
-        mm.tn(x1, &gs.dproj, &w_in)?;
+        let w_in = self.weight_grad(mm, x1, &gs.dproj, bank.map(|(i, _, add)| (i, add)))?;
         mm.nt(&gs.dproj, &w.w_in, &sc.dx)?;
         Ok(GdnGrads {
             w_in,
@@ -1908,6 +2030,7 @@ impl Qwen35Model {
 
     /// The attention mixer's backward from `sc.dresid`; leaves the gradient
     /// of its input `x1` in `sc.dx`.
+    /// `bank` as [`Self::gdn_backward`] takes it.
     fn attn_backward(
         &self,
         w: &AttnWeights,
@@ -1915,17 +2038,16 @@ impl Qwen35Model {
         x1: &Tensor,
         sc: &mut Scratch,
         mm: GemmOperands,
+        bank: Option<(&Tensor, &Tensor, bool)>,
     ) -> Result<AttnGrads, String> {
         let (rt, cfg, a) = (&self.rt, &self.cfg, self.cfg.attn);
         let t = sc.t;
-        let hu = cfg.hidden as usize;
         let qd = a.q_heads() * a.head_dim();
         let asc = sc
             .attn
             .as_ref()
             .ok_or("Qwen35Model::train_step: no attention scratch")?;
-        let w_out = tensor(rt, &[qd as usize, hu])?;
-        mm.tn(&s.y, &sc.dresid, &w_out)?;
+        let w_out = self.weight_grad(mm, &s.y, &sc.dresid, bank.map(|(_, o, add)| (o, add)))?;
         mm.nt(&sc.dresid, &w.w_out, &asc.dy)?;
         let proj = Cols::dense(&s.proj.buffer, a.width());
         let dproj = &asc.dproj.buffer;
@@ -1978,8 +2100,7 @@ impl Qwen35Model {
             cfg.rope_theta,
             cfg.rms_norm_eps,
         )?;
-        let w_in = tensor(rt, &[hu, a.width() as usize])?;
-        mm.tn(x1, &asc.dproj, &w_in)?;
+        let w_in = self.weight_grad(mm, x1, &asc.dproj, bank.map(|(i, _, add)| (i, add)))?;
         mm.nt(&asc.dproj, &w.w_in, &sc.dx)?;
         Ok(AttnGrads {
             w_in,

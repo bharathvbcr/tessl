@@ -689,6 +689,18 @@ fn a_step_over_the_working_set_is_refused_before_it_runs() {
     }
 }
 
+/// f32's unit roundoff.
+const U: f64 = f32::EPSILON as f64 / 2.0;
+
+/// How far an accumulated bank's in-place gradient (a weight matrix or the
+/// embedding, `x + y` summed by the GEMMs and the gather in their own order)
+/// may sit from the f32 sum of the two steps' gradients, in units of
+/// rounding ([`U`]) of the tensor's largest `|x| + |y|`. Measured on this
+/// fixture: 0.8 u exact f32, 1.6 u on bf16 operands, all in the embedding,
+/// where the head's and the gather's gradients now meet the bank's one at a
+/// time (`(bank + head) + gather` rather than `bank + (head + gather)`).
+const ACCUMULATE_BOUND: f64 = 8.0;
+
 /// Every gradient's f32 bits, by name.
 fn bits(cfg: &Qwen35Config, g: &Qwen35Grads) -> Vec<(String, Vec<u32>)> {
     by_name(cfg, g, "")
@@ -697,9 +709,13 @@ fn bits(cfg: &Qwen35Config, g: &Qwen35Grads) -> Vec<(String, Vec<u32>)> {
         .collect()
 }
 
-/// A bank takes a step's gradients as `train_step` returns them (a copy:
-/// the same bits), and with `accumulate` adds the next step's: each value is
-/// the f32 sum of the two steps' own gradients, one rounding. Without it the
+/// A bank takes a step's gradients as `train_step` returns them (the same
+/// bits), and with `accumulate` adds the next step's. The vectors (norms,
+/// conv, gates) are delivered by an add: the f32 sum of the two steps' own
+/// gradients, one rounding. The weight matrices and the embedding take their
+/// gradients in place, the GEMMs (and the gather) adding into the bank, so
+/// the sum is rounded in another order: within [`ACCUMULATE_BOUND`] units of
+/// rounding of the tensor's largest `|x| + |y|`. Without `accumulate` the
 /// next step writes over the bank. A bank not shaped like the model is
 /// refused.
 #[test]
@@ -726,9 +742,24 @@ fn a_bank_holds_a_steps_gradients_and_accumulates_the_next() {
     assert_eq!(lb.to_bits(), fb.loss.to_bits());
     let mut moved = 0;
     for (((name, got), (_, x)), (_, y)) in bits(&cfg, &bank).iter().zip(&wa).zip(&wb) {
+        let in_place = name.contains("proj") || name.contains("embed_tokens");
+        let scale = x
+            .iter()
+            .zip(y)
+            .map(|(&p, &q)| f64::from(f32::from_bits(p).abs() + f32::from_bits(q).abs()))
+            .fold(0.0, f64::max);
         for (k, ((&g, &x), &y)) in got.iter().zip(x).zip(y).enumerate() {
             let want = f32::from_bits(x) + f32::from_bits(y);
-            assert_eq!(g, want.to_bits(), "{name}[{k}]: {} is not {want}", f32::from_bits(g));
+            if in_place {
+                let err = (f64::from(f32::from_bits(g)) - f64::from(want)).abs();
+                assert!(
+                    err <= ACCUMULATE_BOUND * U * scale,
+                    "{name}[{k}]: {} is {err:.3e} from {want}, over {ACCUMULATE_BOUND} u of {scale:.3e}",
+                    f32::from_bits(g)
+                );
+            } else {
+                assert_eq!(g, want.to_bits(), "{name}[{k}]: {} is not {want}", f32::from_bits(g));
+            }
             moved += usize::from(y != 0 && g != x);
         }
     }
@@ -1649,4 +1680,48 @@ fn real_2b_step_on_bf16_operands_stays_near_transformers() {
             "{name}: rel err {r:.3e} > 2^-4 (worst {worst:.3e})"
         );
     }
+}
+
+/// [`ACCUMULATE_BOUND`] at the 2B's sizes: two sequences of 256 and 200
+/// tokens into an f32 bank, against the f32 sum of their fresh gradients,
+/// one weight matrix at a time (the embedding's sum spans 248320 rows and
+/// the cross-entropy's vocabulary chunks). Needs `QWEN35_2B_SAFETENSORS` and
+/// ~30 GB of device memory (the model, two fresh steps' gradients, a bank).
+#[test]
+#[ignore]
+fn real_2b_bank_accumulates_within_the_bound() {
+    let (_, _, model) = real_2b();
+    let vocab = model.config().vocab;
+    let a: Vec<u32> = (0..256u32).map(|i| (i * 104_729 + 17) % vocab).collect();
+    let b: Vec<u32> = (0..200u32).map(|i| (i * 7_919 + 3) % vocab).collect();
+    let mm = GemmOperands::ExactF32;
+    let fa = model.train_step(&a, mm).unwrap();
+    let fb = model.train_step(&b, mm).unwrap();
+    let bank = Qwen35Grads::zeros_like(&model).unwrap();
+    model.train_step_into(&a, mm, Supervise::Causal, &bank, false).unwrap();
+    model.train_step_into(&b, mm, Supervise::Causal, &bank, true).unwrap();
+    let mut worst = 0.0f64;
+    for ((name, got, x), (_, _, y)) in bank_pairs(&bank, &fa.grads)
+        .into_iter()
+        .zip(bank_pairs(&bank, &fb.grads))
+    {
+        let (got, x, y) = (widened(got), widened(x), widened(y));
+        let scale = x
+            .iter()
+            .zip(&y)
+            .map(|(p, q)| f64::from(p.abs() + q.abs()))
+            .fold(0.0, f64::max);
+        for (k, ((&g, &p), &q)) in got.iter().zip(&x).zip(&y).enumerate() {
+            let err = (f64::from(g) - f64::from(p + q)).abs();
+            assert!(
+                err <= ACCUMULATE_BOUND * U * scale,
+                "{name}[{k}]: {g} is {err:.3e} from {}, over {ACCUMULATE_BOUND} u of {scale:.3e}",
+                p + q
+            );
+            if scale > 0.0 {
+                worst = worst.max(err / (U * scale));
+            }
+        }
+    }
+    eprintln!("worst accumulated deviation: {worst:.2} u of the tensor's largest |x| + |y|");
 }

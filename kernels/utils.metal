@@ -13,6 +13,18 @@ kernel void copy_f32(
     out[gid] = in[gid];
 }
 
+// Bitwise: indices and other integer data, which a float copy could alter
+// (small integers are f32 denormals).
+kernel void copy_u32(
+    device const uint *in [[buffer(0)]],
+    device uint *out [[buffer(1)]],
+    constant uint &n [[buffer(2)]],
+    uint gid [[thread_position_in_grid]])
+{
+    if (gid >= n) return;
+    out[gid] = in[gid];
+}
+
 kernel void copy_bf16(
     device const bfloat *in [[buffer(0)]],
     device bfloat *out [[buffer(1)]],

@@ -1,0 +1,293 @@
+# Qwen3.5-2B train_step BEFORE the step-waste changes — M5 Pro, 2026-10-08
+#
+# Binary: bench_qwen35_train built at 850bf1b (the harness commit: --async,
+# --step-only, --clip, waits and device peak per step; no library change),
+# frozen and run through
+#
+#   QWEN35_2B_SAFETENSORS=.../model.safetensors-00001-of-00001.safetensors \
+#   BENCH_BIN=<frozen 850bf1b binary> bench/paired_qwen35_step.sh 3 OUT \
+#     256:-:sync 256:128:sync 256:-:async 256:128:async \
+#     2048:-:sync 2048:128:sync 2048:-:async 2048:128:async
+#
+# Exact-f32 GEMM operands, train_step (fresh gradients), ids
+# (i * 104729 + 17) % 248320. Each configuration is one process per round
+# (TESSL_MID_COMMIT is read once per process), order reversed on odd rounds;
+# each process times the median of 3 steps after one warm-up. "sync" is a
+# default runtime (every dispatch a waited commit, as ojas-qwen35's
+# Qwen35Step runs); "async" is set_async_encode(true). AC power.
+#
+# Conditions: the machine was shared. Other sessions ran Lappi-decision
+# stress tests (CPU) throughout, and a peer tessl session's real-2B test
+# (tessl-gdn-grouped) overlapped round 2, which is 25-40% slower at T = 2048
+# in every configuration; one round-1 run (256:-:async, 3.889 s) is an
+# unexplained outlier. Rounds 0 and 1 agree within ~3%. Min-of-3 is the
+# figure to compare: contention only slows a run.
+#
+# Findings:
+# - TESSL_MID_COMMIT=128 against unset: no measurable gain. T = 2048:
+#   8.171 -> 8.440 s async, 8.250 -> 8.353 s sync. T = 256 async
+#   1.235 -> 1.175 s (inside the rounds' spread). Under sync encode it cannot
+#   act: every dispatch already waits.
+# - Async encode against sync: T = 256 1.518 -> 1.235 s (-19%); T = 2048
+#   8.250 -> 8.171 s (-1%). One traced step: 1608 waits sync, 16 async, at
+#   either T (3274 dispatches, 1095 cold allocations).
+# - Device peak over the steps (GpuRuntime::peak_allocated_bytes, reset after
+#   loading the 9.0 GiB f32 model): T = 2048 16.38 GiB sync, 17.51 GiB async
+#   (+1.13 GiB: fewer waits recycle later); T = 256 14.30 / 14.45 GiB. Peak
+#   footprint (/usr/bin/time -l): 20.86 / 22.07 GB at T = 2048.
+# - Host zeroing (same step, counted with this branch's infer_trace counter
+#   on library code still identical to 850bf1b): 808 allocations, 25.86 GB
+#   per step at T = 2048.
+#
+# ---- summary: 3 rounds, each a median of 3 steps; min (max) over rounds ----
+config                            min s      max s   peak footprint     device peak
+256:-:sync                        1.518      1.670         18.58 GB       14.30 GiB
+256:128:sync                      1.550      2.239         18.58 GB       14.30 GiB
+256:-:async                       1.235      3.889         18.74 GB       14.45 GiB
+256:128:async                     1.175      1.272         18.74 GB       14.45 GiB
+2048:-:sync                       8.250     11.442         20.86 GB       16.38 GiB
+2048:128:sync                     8.353     10.531         20.86 GB       16.38 GiB
+2048:-:async                      8.171     10.329         22.07 GB       17.51 GiB
+2048:128:async                    8.440     10.052         22.07 GB       17.51 GiB
+
+# ---- every run ----
+# ---- round 0, config 256:-:sync: 256 --step-only --step=256 (TESSL_MID_COMMIT=-) ----
+device: Apple M5 Pro
+T = 256: gate passed (12 ops wrote finite outputs)
+encode: every dispatch waited; TESSL_MID_COMMIT=unset
+train_step, T = 256: 1.653 s (155 tokens/s), loss 14.8647
+  device peak over the steps: 14.30 GiB (5.28 GiB above the loaded model)
+  one traced step: 1.773 s, 1608 waits (1.206 s blocked), 1608 commits, 3274 dispatches, 1095 cold allocations
+       21.48 real         9.05 user         4.29 sys
+         18496356352  maximum resident set size
+         18584843896  peak memory footprint
+# ---- round 0, config 256:128:sync: 256 --step-only --step=256 (TESSL_MID_COMMIT=128) ----
+device: Apple M5 Pro
+T = 256: gate passed (12 ops wrote finite outputs)
+encode: every dispatch waited; TESSL_MID_COMMIT=128
+train_step, T = 256: 1.710 s (150 tokens/s), loss 14.8647
+  device peak over the steps: 14.30 GiB (5.28 GiB above the loaded model)
+  one traced step: 2.179 s, 1608 waits (1.404 s blocked), 1608 commits, 3274 dispatches, 1095 cold allocations
+       19.75 real         9.00 user         4.17 sys
+         18494701568  maximum resident set size
+         18583189112  peak memory footprint
+# ---- round 0, config 256:-:async: 256 --step-only --step=256 --async (TESSL_MID_COMMIT=-) ----
+device: Apple M5 Pro
+T = 256: gate passed (12 ops wrote finite outputs)
+encode: async (--async); TESSL_MID_COMMIT=unset
+train_step, T = 256: 1.235 s (207 tokens/s), loss 14.8647
+  device peak over the steps: 14.45 GiB (5.42 GiB above the loaded model)
+  one traced step: 1.178 s, 16 waits (0.764 s blocked), 16 commits, 3274 dispatches, 1095 cold allocations
+       16.46 real         8.53 user         3.23 sys
+         18646958080  maximum resident set size
+         18742769416  peak memory footprint
+# ---- round 0, config 256:128:async: 256 --step-only --step=256 --async (TESSL_MID_COMMIT=128) ----
+device: Apple M5 Pro
+T = 256: gate passed (12 ops wrote finite outputs)
+encode: async (--async); TESSL_MID_COMMIT=128
+train_step, T = 256: 1.235 s (207 tokens/s), loss 14.8647
+  device peak over the steps: 14.45 GiB (5.42 GiB above the loaded model)
+  one traced step: 1.336 s, 16 waits (0.819 s blocked), 23 commits, 3274 dispatches, 1095 cold allocations
+       17.07 real         8.82 user         3.63 sys
+         18647121920  maximum resident set size
+         18743391984  peak memory footprint
+# ---- round 0, config 2048:-:sync: 2048 --step-only --step=2048 (TESSL_MID_COMMIT=-) ----
+device: Apple M5 Pro
+T = 2048: gate passed (12 ops wrote finite outputs)
+encode: every dispatch waited; TESSL_MID_COMMIT=unset
+train_step, T = 2048: 8.250 s (248 tokens/s), loss 14.5117
+  device peak over the steps: 16.38 GiB (8.17 GiB above the loaded model)
+  one traced step: 8.416 s, 1608 waits (7.405 s blocked), 1608 commits, 3274 dispatches, 1095 cold allocations
+       53.89 real        10.36 user         5.95 sys
+         18848890880  maximum resident set size
+         20855110920  peak memory footprint
+# ---- round 0, config 2048:128:sync: 2048 --step-only --step=2048 (TESSL_MID_COMMIT=128) ----
+device: Apple M5 Pro
+T = 2048: gate passed (12 ops wrote finite outputs)
+encode: every dispatch waited; TESSL_MID_COMMIT=128
+train_step, T = 2048: 8.598 s (238 tokens/s), loss 14.5117
+  device peak over the steps: 16.38 GiB (8.17 GiB above the loaded model)
+  one traced step: 9.245 s, 1608 waits (7.578 s blocked), 1608 commits, 3274 dispatches, 1095 cold allocations
+       55.59 real        10.40 user         6.41 sys
+         20729708544  maximum resident set size
+         20855373040  peak memory footprint
+# ---- round 0, config 2048:-:async: 2048 --step-only --step=2048 --async (TESSL_MID_COMMIT=-) ----
+device: Apple M5 Pro
+T = 2048: gate passed (12 ops wrote finite outputs)
+encode: async (--async); TESSL_MID_COMMIT=unset
+train_step, T = 2048: 8.231 s (249 tokens/s), loss 14.5117
+  device peak over the steps: 17.51 GiB (9.30 GiB above the loaded model)
+  one traced step: 8.512 s, 16 waits (6.953 s blocked), 16 commits, 3274 dispatches, 1095 cold allocations
+       58.51 real        10.35 user         6.77 sys
+         21857828864  maximum resident set size
+         22073622632  peak memory footprint
+# ---- round 0, config 2048:128:async: 2048 --step-only --step=2048 --async (TESSL_MID_COMMIT=128) ----
+device: Apple M5 Pro
+T = 2048: gate passed (12 ops wrote finite outputs)
+encode: async (--async); TESSL_MID_COMMIT=128
+train_step, T = 2048: 8.440 s (243 tokens/s), loss 14.5117
+  device peak over the steps: 17.51 GiB (9.30 GiB above the loaded model)
+  one traced step: 8.249 s, 16 waits (6.593 s blocked), 23 commits, 3274 dispatches, 1095 cold allocations
+       55.57 real        10.54 user         8.79 sys
+         20348485632  maximum resident set size
+         22073688192  peak memory footprint
+# ---- round 1, config 2048:128:async: 2048 --step-only --step=2048 --async (TESSL_MID_COMMIT=128) ----
+device: Apple M5 Pro
+T = 2048: gate passed (12 ops wrote finite outputs)
+encode: async (--async); TESSL_MID_COMMIT=128
+train_step, T = 2048: 8.553 s (239 tokens/s), loss 14.5117
+  device peak over the steps: 17.51 GiB (9.30 GiB above the loaded model)
+  one traced step: 8.163 s, 16 waits (6.558 s blocked), 23 commits, 3274 dispatches, 1095 cold allocations
+       56.30 real        10.61 user         8.58 sys
+         21857746944  maximum resident set size
+         22074015824  peak memory footprint
+# ---- round 1, config 2048:-:async: 2048 --step-only --step=2048 --async (TESSL_MID_COMMIT=-) ----
+device: Apple M5 Pro
+T = 2048: gate passed (12 ops wrote finite outputs)
+encode: async (--async); TESSL_MID_COMMIT=unset
+train_step, T = 2048: 8.171 s (251 tokens/s), loss 14.5117
+  device peak over the steps: 17.51 GiB (9.30 GiB above the loaded model)
+  one traced step: 8.442 s, 16 waits (6.637 s blocked), 16 commits, 3274 dispatches, 1095 cold allocations
+       52.13 real         9.93 user         6.93 sys
+         21857124352  maximum resident set size
+         22072967344  peak memory footprint
+# ---- round 1, config 2048:128:sync: 2048 --step-only --step=2048 (TESSL_MID_COMMIT=128) ----
+device: Apple M5 Pro
+T = 2048: gate passed (12 ops wrote finite outputs)
+encode: every dispatch waited; TESSL_MID_COMMIT=128
+train_step, T = 2048: 8.353 s (245 tokens/s), loss 14.5117
+  device peak over the steps: 16.38 GiB (8.17 GiB above the loaded model)
+  one traced step: 7.889 s, 1608 waits (7.038 s blocked), 1608 commits, 3274 dispatches, 1095 cold allocations
+       55.96 real        10.56 user         5.83 sys
+         20730839040  maximum resident set size
+         20855618800  peak memory footprint
+# ---- round 1, config 2048:-:sync: 2048 --step-only --step=2048 (TESSL_MID_COMMIT=-) ----
+device: Apple M5 Pro
+T = 2048: gate passed (12 ops wrote finite outputs)
+encode: every dispatch waited; TESSL_MID_COMMIT=unset
+train_step, T = 2048: 8.256 s (248 tokens/s), loss 14.5117
+  device peak over the steps: 16.38 GiB (8.17 GiB above the loaded model)
+  one traced step: 7.822 s, 1608 waits (6.850 s blocked), 1608 commits, 3274 dispatches, 1095 cold allocations
+       51.62 real        10.09 user         4.96 sys
+         20730527744  maximum resident set size
+         20854750448  peak memory footprint
+# ---- round 1, config 256:128:async: 256 --step-only --step=256 --async (TESSL_MID_COMMIT=128) ----
+device: Apple M5 Pro
+T = 256: gate passed (12 ops wrote finite outputs)
+encode: async (--async); TESSL_MID_COMMIT=128
+train_step, T = 256: 1.175 s (218 tokens/s), loss 14.8647
+  device peak over the steps: 14.45 GiB (5.42 GiB above the loaded model)
+  one traced step: 1.190 s, 16 waits (0.828 s blocked), 23 commits, 3274 dispatches, 1095 cold allocations
+       16.80 real         8.64 user         2.99 sys
+         18647056384  maximum resident set size
+         18743326448  peak memory footprint
+# ---- round 1, config 256:-:async: 256 --step-only --step=256 --async (TESSL_MID_COMMIT=-) ----
+device: Apple M5 Pro
+T = 256: gate passed (12 ops wrote finite outputs)
+encode: async (--async); TESSL_MID_COMMIT=unset
+train_step, T = 256: 3.889 s (66 tokens/s), loss 14.8647
+  device peak over the steps: 14.45 GiB (5.42 GiB above the loaded model)
+  one traced step: 4.080 s, 16 waits (3.648 s blocked), 16 commits, 3274 dispatches, 1095 cold allocations
+       29.10 real         8.26 user         2.92 sys
+         18644844544  maximum resident set size
+         18740639472  peak memory footprint
+# ---- round 1, config 256:128:sync: 256 --step-only --step=256 (TESSL_MID_COMMIT=128) ----
+device: Apple M5 Pro
+T = 256: gate passed (12 ops wrote finite outputs)
+encode: every dispatch waited; TESSL_MID_COMMIT=128
+train_step, T = 256: 1.550 s (165 tokens/s), loss 14.8647
+  device peak over the steps: 14.30 GiB (5.28 GiB above the loaded model)
+  one traced step: 1.482 s, 1608 waits (1.108 s blocked), 1608 commits, 3274 dispatches, 1095 cold allocations
+       19.92 real         8.60 user         3.36 sys
+         18494521344  maximum resident set size
+         18583025296  peak memory footprint
+# ---- round 1, config 256:-:sync: 256 --step-only --step=256 (TESSL_MID_COMMIT=-) ----
+device: Apple M5 Pro
+T = 256: gate passed (12 ops wrote finite outputs)
+encode: every dispatch waited; TESSL_MID_COMMIT=unset
+train_step, T = 256: 1.518 s (169 tokens/s), loss 14.8647
+  device peak over the steps: 14.30 GiB (5.28 GiB above the loaded model)
+  one traced step: 1.522 s, 1608 waits (1.118 s blocked), 1608 commits, 3274 dispatches, 1095 cold allocations
+       16.60 real         7.92 user         3.10 sys
+         18492112896  maximum resident set size
+         18580436576  peak memory footprint
+# ---- round 2, config 256:-:sync: 256 --step-only --step=256 (TESSL_MID_COMMIT=-) ----
+device: Apple M5 Pro
+T = 256: gate passed (12 ops wrote finite outputs)
+encode: every dispatch waited; TESSL_MID_COMMIT=unset
+train_step, T = 256: 1.670 s (153 tokens/s), loss 14.8647
+  device peak over the steps: 14.30 GiB (5.28 GiB above the loaded model)
+  one traced step: 2.530 s, 1608 waits (1.692 s blocked), 1608 commits, 3274 dispatches, 1095 cold allocations
+       18.65 real         8.38 user         3.59 sys
+         18494685184  maximum resident set size
+         18583107192  peak memory footprint
+# ---- round 2, config 256:128:sync: 256 --step-only --step=256 (TESSL_MID_COMMIT=128) ----
+device: Apple M5 Pro
+T = 256: gate passed (12 ops wrote finite outputs)
+encode: every dispatch waited; TESSL_MID_COMMIT=128
+train_step, T = 256: 2.239 s (114 tokens/s), loss 14.8647
+  device peak over the steps: 14.30 GiB (5.28 GiB above the loaded model)
+  one traced step: 2.237 s, 1608 waits (1.315 s blocked), 1608 commits, 3274 dispatches, 1095 cold allocations
+       37.61 real         9.80 user         4.85 sys
+         15445082112  maximum resident set size
+         15527538208  peak memory footprint
+# ---- round 2, config 256:-:async: 256 --step-only --step=256 --async (TESSL_MID_COMMIT=-) ----
+device: Apple M5 Pro
+T = 256: gate passed (12 ops wrote finite outputs)
+encode: async (--async); TESSL_MID_COMMIT=unset
+train_step, T = 256: 1.765 s (145 tokens/s), loss 14.8647
+  device peak over the steps: 14.45 GiB (5.42 GiB above the loaded model)
+  one traced step: 2.730 s, 16 waits (0.971 s blocked), 16 commits, 3274 dispatches, 1095 cold allocations
+       29.97 real         9.37 user         4.28 sys
+         18646941696  maximum resident set size
+         18742736624  peak memory footprint
+# ---- round 2, config 256:128:async: 256 --step-only --step=256 --async (TESSL_MID_COMMIT=128) ----
+device: Apple M5 Pro
+T = 256: gate passed (12 ops wrote finite outputs)
+encode: async (--async); TESSL_MID_COMMIT=128
+train_step, T = 256: 1.272 s (201 tokens/s), loss 14.8647
+  device peak over the steps: 14.45 GiB (5.42 GiB above the loaded model)
+  one traced step: 1.241 s, 16 waits (0.835 s blocked), 23 commits, 3274 dispatches, 1095 cold allocations
+       35.31 real         9.18 user         3.58 sys
+         15595683840  maximum resident set size
+         15685987944  peak memory footprint
+# ---- round 2, config 2048:-:sync: 2048 --step-only --step=2048 (TESSL_MID_COMMIT=-) ----
+device: Apple M5 Pro
+T = 2048: gate passed (12 ops wrote finite outputs)
+encode: every dispatch waited; TESSL_MID_COMMIT=unset
+train_step, T = 2048: 11.442 s (179 tokens/s), loss 14.5117
+  device peak over the steps: 16.38 GiB (8.17 GiB above the loaded model)
+  one traced step: 10.806 s, 1608 waits (8.681 s blocked), 1608 commits, 3274 dispatches, 1095 cold allocations
+       69.49 real        10.50 user         8.29 sys
+         17896816640  maximum resident set size
+         20854570200  peak memory footprint
+# ---- round 2, config 2048:128:sync: 2048 --step-only --step=2048 (TESSL_MID_COMMIT=128) ----
+device: Apple M5 Pro
+T = 2048: gate passed (12 ops wrote finite outputs)
+encode: every dispatch waited; TESSL_MID_COMMIT=128
+train_step, T = 2048: 10.531 s (194 tokens/s), loss 14.5117
+  device peak over the steps: 16.38 GiB (8.17 GiB above the loaded model)
+  one traced step: 10.265 s, 1608 waits (8.342 s blocked), 1608 commits, 3274 dispatches, 1095 cold allocations
+       68.95 real        11.57 user         9.16 sys
+         11052285952  maximum resident set size
+         20855553264  peak memory footprint
+# ---- round 2, config 2048:-:async: 2048 --step-only --step=2048 --async (TESSL_MID_COMMIT=-) ----
+device: Apple M5 Pro
+T = 2048: gate passed (12 ops wrote finite outputs)
+encode: async (--async); TESSL_MID_COMMIT=unset
+train_step, T = 2048: 10.329 s (198 tokens/s), loss 14.5117
+  device peak over the steps: 17.51 GiB (9.30 GiB above the loaded model)
+  one traced step: 12.443 s, 16 waits (7.445 s blocked), 16 commits, 3274 dispatches, 1095 cold allocations
+       71.35 real        11.48 user        10.99 sys
+         16281927680  maximum resident set size
+         22073229416  peak memory footprint
+# ---- round 2, config 2048:128:async: 2048 --step-only --step=2048 --async (TESSL_MID_COMMIT=128) ----
+device: Apple M5 Pro
+T = 2048: gate passed (12 ops wrote finite outputs)
+encode: async (--async); TESSL_MID_COMMIT=128
+train_step, T = 2048: 10.052 s (204 tokens/s), loss 14.5117
+  device peak over the steps: 17.51 GiB (9.30 GiB above the loaded model)
+  one traced step: 9.729 s, 16 waits (6.715 s blocked), 23 commits, 3274 dispatches, 1095 cold allocations
+       67.18 real        10.50 user        12.37 sys
+         12528173056  maximum resident set size
+         20451457952  peak memory footprint

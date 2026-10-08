@@ -23,7 +23,7 @@ use tessl::qwen35_adamw::{AdamW, AdamWHyper};
 use tessl::qwen35_model::{LayerKind, Precision, Qwen35Config, Qwen35Model};
 use tessl::qwen35_train::{MixerGrads, Qwen35Grads, Supervise, TrainStep};
 use tessl::safetensors::SafeTensors;
-use tessl::tensor::{DType, GpuBuffer, Tensor};
+use tessl::tensor::{bf16_bits_to_f32, f32_to_bf16_bits, DType, GpuBuffer, Tensor};
 use tessl::GpuRuntime;
 
 fn fixture() -> PathBuf {
@@ -55,7 +55,7 @@ fn read(b: &GpuBuffer, n: usize) -> Vec<f64> {
 
 fn read_t(t: &Tensor) -> (usize, usize, Vec<f64>) {
     let s = t.shape();
-    (s[0], s[1], read(&t.buffer, s[0] * s[1]))
+    (s[0], s[1], widened(t).iter().map(|&x| f64::from(x)).collect())
 }
 
 /// Columns `[off, off + width)` of a packed `[in, out]` gradient, transposed
@@ -74,12 +74,22 @@ fn packed(t: &Tensor, off: usize, width: usize) -> Vec<f64> {
 /// Every tessl gradient under its torch parameter name (with `prefix`), in
 /// torch's layout.
 fn by_name(cfg: &Qwen35Config, g: &Qwen35Grads, prefix: &str) -> Vec<(String, Vec<f64>)> {
+    named(cfg, g, prefix, None)
+}
+
+/// [`by_name`] for one part only: `Some(l)` is layer `l`'s gradients alone,
+/// `Some(usize::MAX)` the embedding and final norm alone; `None` everything.
+fn named(cfg: &Qwen35Config, g: &Qwen35Grads, prefix: &str, part: Option<usize>) -> Vec<(String, Vec<f64>)> {
     let (h, i) = (cfg.hidden as usize, cfg.intermediate as usize);
-    let mut out = vec![
-        (format!("{prefix}embed_tokens.weight"), read_t(&g.embed).2),
-        (format!("{prefix}norm.weight"), read(&g.final_norm, h)),
-    ];
+    let mut out = Vec::new();
+    if part.is_none() || part == Some(usize::MAX) {
+        out.push((format!("{prefix}embed_tokens.weight"), read_t(&g.embed).2));
+        out.push((format!("{prefix}norm.weight"), read(&g.final_norm, h)));
+    }
     for (l, lg) in g.layers.iter().enumerate() {
+        if part.is_some_and(|p| p != l) {
+            continue;
+        }
         let p = |s: &str| format!("{prefix}layers.{l}.{s}");
         out.push((p("input_layernorm.weight"), read(&lg.input_norm, h)));
         out.push((p("post_attention_layernorm.weight"), read(&lg.post_norm, h)));
@@ -146,6 +156,15 @@ fn load_rt(dir: &Path, prefix: &str, cfg: Qwen35Config, precision: Precision) ->
     let rt = GpuRuntime::new().unwrap();
     let st = SafeTensors::open(&dir.join("model.safetensors")).unwrap();
     let model = Qwen35Model::load(&rt, &st, prefix, cfg, precision).unwrap();
+    (rt, model)
+}
+
+/// The fixture as [`Qwen35Model::load_tower`] loads it (no packed LM head):
+/// how a bf16 model is trained.
+fn load_tower(dir: &Path, cfg: Qwen35Config, precision: Precision) -> (Arc<GpuRuntime>, Qwen35Model) {
+    let rt = GpuRuntime::new().unwrap();
+    let st = SafeTensors::open(&dir.join("model.safetensors")).unwrap();
+    let model = Qwen35Model::load_tower(&rt, &st, "model.", cfg, precision).unwrap();
     (rt, model)
 }
 
@@ -279,6 +298,183 @@ fn tiny_step_on_bf16_operands_stays_near_transformers() {
     }
 }
 
+/// The step on a bf16-stored model (bf16 matrices, bf16 layer inputs kept
+/// for the backward, f32 accumulation and f32 GDN state, softmax and LSE)
+/// against the same float32 transformers reference. The fixture is bf16 on
+/// disk, so the weights are the f32 model's values exactly; what this adds
+/// over bf16 operands is the residual stream rounded at each layer boundary.
+/// Bounds set before the first run: the loss within 2^-7 relative and every
+/// gradient within 2^-4 of its own peak (the bf16-operand bounds, doubled for
+/// the boundary rounding of up to 2^-9 relative per layer); against the f32
+/// model's bf16-operand step, every gradient within 2^-5 of its peak. It must
+/// not be that step's bits (the stream was rounded), and two steps must be
+/// the same bits.
+#[test]
+fn tiny_step_on_bf16_storage_stays_near_transformers() {
+    let dir = fixture();
+    let cfg = tiny_config();
+    let (_, model) = load_tower(&dir, cfg.clone(), Precision::Bf16);
+    let ids = ids(&dir);
+    let step = model.train_step(&ids, GemmOperands::Bf16).unwrap();
+    let worst = compare(&dir, "model.", &cfg, &step, 2f64.powi(-7), 2f64.powi(-4));
+    eprintln!("bf16 storage, worst parameter gradient: {worst:.2e}");
+
+    let f32_model = load(&dir, "model.", cfg.clone(), Precision::F32);
+    let operands = f32_model.train_step(&ids, GemmOperands::Bf16).unwrap();
+    let (gap, name) = worst_rel(&cfg, &step.grads, &operands.grads);
+    eprintln!("bf16 storage vs bf16 operands: worst {gap:.2e} ({name})");
+    assert!(gap <= 2f64.powi(-5), "{name}: {gap:.3e} from the bf16-operand step");
+    let differs = step.loss.to_bits() != operands.loss.to_bits()
+        || by_name(&cfg, &step.grads, "model.")
+            .iter()
+            .zip(by_name(&cfg, &operands.grads, "model."))
+            .any(|((_, a), (_, b))| a.iter().zip(&b).any(|(x, y)| x.to_bits() != y.to_bits()));
+    assert!(differs, "bf16 storage gave the bf16-operand step's bits: the stream was not rounded");
+
+    let again = model.train_step(&ids, GemmOperands::Bf16).unwrap();
+    assert_eq!(again.loss.to_bits(), step.loss.to_bits(), "loss changed on a rerun");
+    assert_eq!(
+        bits(&cfg, &again.grads),
+        bits(&cfg, &step.grads),
+        "gradients changed on a rerun"
+    );
+}
+
+/// The f32 values of a bf16 bank tensor, or an f32 one's.
+fn widened(t: &Tensor) -> Vec<f32> {
+    let n = t.numel();
+    match t.dtype {
+        DType::BF16 => t.buffer.contents_u16()[..n]
+            .iter()
+            .map(|&b| bf16_bits_to_f32(b))
+            .collect(),
+        _ => t.buffer.read_f32()[..n].to_vec(),
+    }
+}
+
+/// Every bank tensor of `g` and the f32 gradient it should hold, by name.
+fn bank_pairs<'a>(bank: &'a Qwen35Grads, fresh: &'a Qwen35Grads) -> Vec<(String, &'a Tensor, &'a Tensor)> {
+    let mut out = vec![("embed".to_string(), &bank.embed, &fresh.embed)];
+    for (l, (b, f)) in bank.layers.iter().zip(&fresh.layers).enumerate() {
+        for (n, x, y) in [("gate", &b.gate, &f.gate), ("up", &b.up, &f.up), ("down", &b.down, &f.down)] {
+            out.push((format!("layers.{l}.{n}"), x, y));
+        }
+        match (&b.mixer, &f.mixer) {
+            (MixerGrads::Gdn(x), MixerGrads::Gdn(y)) => {
+                out.push((format!("layers.{l}.w_in"), &x.w_in, &y.w_in));
+                out.push((format!("layers.{l}.w_out"), &x.w_out, &y.w_out));
+            }
+            (MixerGrads::Attn(x), MixerGrads::Attn(y)) => {
+                out.push((format!("layers.{l}.w_in"), &x.w_in, &y.w_in));
+                out.push((format!("layers.{l}.w_out"), &x.w_out, &y.w_out));
+            }
+            _ => panic!("layer {l}: mixers differ"),
+        }
+    }
+    out
+}
+
+/// A bf16 model's bank holds its matrices' gradients in bf16 and its other
+/// gradients in f32. Each delivery rounds once: a step into the bank is the
+/// fresh step's f32 gradients rounded to nearest, bit for bit, and a second
+/// step accumulated is `bf16(bank + g)` with the add in f32, bit for bit;
+/// the f32 parts are the fresh bits, then their f32 sum. `grad_sq_norm` and
+/// `read_gradients` read the bank widened.
+#[test]
+fn a_bf16_bank_rounds_each_delivery_once() {
+    let dir = fixture();
+    let cfg = tiny_config();
+    let (rt, model) = load_tower(&dir, cfg.clone(), Precision::Bf16);
+    let ids = ids(&dir);
+    let other: Vec<u32> = ids.iter().rev().copied().collect();
+    let bank = Qwen35Grads::zeros_like(&model).unwrap();
+    for (name, b, _) in bank_pairs(&bank, &bank) {
+        assert_eq!(b.dtype, DType::BF16, "{name} banks in {:?}", b.dtype);
+    }
+    let a = model.train_step(&ids, GemmOperands::Bf16).unwrap();
+    let b = model.train_step(&other, GemmOperands::Bf16).unwrap();
+    model
+        .train_step_into(&ids, GemmOperands::Bf16, Supervise::Causal, &bank, false)
+        .unwrap();
+    for (name, got, want) in bank_pairs(&bank, &a.grads) {
+        let want: Vec<u16> = widened(want).iter().map(|&x| f32_to_bf16_bits(x)).collect();
+        let got: Vec<u16> = got.buffer.contents_u16()[..got.numel()].to_vec();
+        assert!(got == want, "{name}: the bank is not the step's gradient rounded once");
+    }
+    let sq: f64 = by_name(&cfg, &bank, "")
+        .iter()
+        .flat_map(|(_, v)| v.iter().map(|x| x * x))
+        .sum();
+    let got_sq = model.grad_sq_norm(&bank).unwrap();
+    assert!((got_sq - sq).abs() <= 1e-5 * sq, "grad_sq_norm {got_sq} vs {sq}");
+
+    model
+        .train_step_into(&other, GemmOperands::Bf16, Supervise::Causal, &bank, true)
+        .unwrap();
+    // The f32 parts: the f32 sum of the two fresh steps, bit for bit.
+    let (fa, fb, fbank) = (bits(&cfg, &a.grads), bits(&cfg, &b.grads), bits(&cfg, &bank));
+    for (((name, x), (_, y)), (_, z)) in fa.iter().zip(&fb).zip(&fbank) {
+        if name.contains("norm") || name.contains("conv1d") || name.contains("A_log") || name.contains("dt_bias") {
+            let want: Vec<u32> = x
+                .iter()
+                .zip(y)
+                .map(|(&p, &q)| (f32::from_bits(p) + f32::from_bits(q)).to_bits())
+                .collect();
+            assert_eq!(z, &want, "{name}: the f32 bank part is not the f32 sum");
+        }
+    }
+    let first: Vec<Vec<u16>> = bank_pairs(&bank, &a.grads)
+        .iter()
+        .map(|(_, _, f)| widened(f).iter().map(|&x| f32_to_bf16_bits(x)).collect())
+        .collect();
+    for ((name, got, g2), r1) in bank_pairs(&bank, &b.grads).into_iter().zip(first) {
+        let want: Vec<u16> = r1
+            .iter()
+            .zip(widened(g2))
+            .map(|(&r, g)| f32_to_bf16_bits(bf16_bits_to_f32(r) + g))
+            .collect();
+        let got: Vec<u16> = got.buffer.contents_u16()[..got.numel()].to_vec();
+        assert!(got == want, "{name}: the accumulated bank is not bf16(bank + g)");
+    }
+
+    // read_gradients widens the bank exactly.
+    let table = model.parameter_table().unwrap();
+    let ts: Vec<Tensor> = table
+        .iter()
+        .map(|p| rt.alloc_tensor_f32(&p.storage_shape()).unwrap())
+        .collect();
+    model.read_gradients(&bank, &ts).unwrap();
+    let embed_read = ts[0].read_f32().unwrap();
+    assert_eq!(embed_read, widened(&bank.embed), "read_gradients did not widen the bank's embedding");
+}
+
+/// A step on a bf16-stored model holds less than the f32 model's at the same
+/// length (each layer's kept input is half the bytes), and its measured peak
+/// stays under its own bound, which the pre-flight gate trusts.
+#[test]
+fn a_bf16_step_peaks_under_its_bound_and_below_the_f32_steps() {
+    let dir = fixture();
+    let cfg = tiny_config();
+    let (rt, model) = load_tower(&dir, cfg.clone(), Precision::Bf16);
+    let f32_model = load(&dir, "model.", cfg.clone(), Precision::F32);
+    let bank = Qwen35Grads::zeros_like(&model).unwrap();
+    for t in [8u32, 64, 512] {
+        let bound = model.train_step_bytes(t, GemmOperands::Bf16);
+        let f32_bound = f32_model.train_step_bytes(t, GemmOperands::Bf16);
+        assert!(bound < f32_bound, "T={t}: bf16 bound {bound} not below f32's {f32_bound}");
+        let ids: Vec<u32> = (0..t).map(|i| (i * 7 + 3) % cfg.vocab).collect();
+        rt.synchronize().unwrap();
+        let before = rt.current_allocated_bytes();
+        rt.reset_peak_allocated_bytes();
+        model
+            .train_step_into(&ids, GemmOperands::Bf16, Supervise::Causal, &bank, false)
+            .unwrap();
+        let peak = rt.peak_allocated_bytes().saturating_sub(before);
+        eprintln!("T={t}: peak {peak} B, bound {bound} B (f32 model's bound {f32_bound} B)");
+        assert!(peak <= bound, "T={t}: peak {peak} over the bound {bound}");
+    }
+}
+
 /// The tiny model 24 layers deep in the 2B's layer pattern
 /// (`make_train_fixture.py tiny --layers 24 --out target/qwen35_train_deep`):
 /// how gradient agreement with transformers changes with depth alone, both
@@ -358,10 +554,14 @@ fn train_step_refuses_what_it_does_not_implement() {
         let m = r.err().unwrap_or_else(|| panic!("{needle}: accepted"));
         assert!(m.contains(needle), "{m:?} lacks {needle:?}");
     };
+    // A bf16 model trains only as a tower (no packed head copy to go stale),
+    // and only on bf16 operands (its weights are them).
     let bf16 = load(&dir, "model.", tiny_config(), Precision::Bf16);
+    e(bf16.train_step(&[1, 2, 3], GemmOperands::Bf16), "load_tower");
+    let tower = load_tower(&dir, tiny_config(), Precision::Bf16).1;
     e(
-        bf16.train_step(&[1, 2, 3], GemmOperands::ExactF32),
-        "training runs in f32",
+        tower.train_step(&[1, 2, 3], GemmOperands::ExactF32),
+        "trains on GemmOperands::Bf16",
     );
     let model = load(&dir, "model.", tiny_config(), Precision::F32);
     e(model.train_step(&[5], GemmOperands::ExactF32), "at least two tokens");
@@ -981,6 +1181,7 @@ fn a_busy_or_poisoned_runtime_is_an_error_from_every_training_entry_point() {
             assert_eq!(rt.is_poisoned(), state == "poisoned", "{what} on a {state} runtime");
         };
         refused("Qwen35Grads::zeros_like", Qwen35Grads::zeros_like(&model).map(drop));
+        refused("AdamW::new", AdamW::new(&model).map(drop));
         refused("train_step", model.train_step(&ids, mm).map(drop));
         refused(
             "train_step_into",
@@ -1119,6 +1320,183 @@ fn real_2b_step_matches_transformers() {
     assert!(r_train <= 1e-4, "loss {} vs transformers {want_loss}", step.loss);
     for (name, r) in &results {
         assert!(*r <= 1e-2, "{name}: rel err {r:.3e} > 1e-2");
+    }
+}
+
+/// The real 2B checkpoint, in `precision` as `load_tower` loads it (bf16 is
+/// how a bf16 model trains).
+fn real_2b_tower(rt: &Arc<GpuRuntime>, precision: Precision) -> Qwen35Model {
+    let path = std::env::var("QWEN35_2B_SAFETENSORS").expect("set QWEN35_2B_SAFETENSORS to a Qwen3.5-2B .safetensors file");
+    let st = SafeTensors::open(Path::new(&path)).unwrap();
+    Qwen35Model::load_tower(rt, &st, "model.language_model.", Qwen35Config::qwen35_2b().unwrap(), precision).unwrap()
+}
+
+/// 512 natural-text ids (`tools/qwen35_ref/make_text_ids.py`).
+fn text_ids() -> Vec<u32> {
+    npy_f64(&Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/qwen35_text_ids.npy"))
+        .1
+        .iter()
+        .map(|&x| x as u32)
+        .collect()
+}
+
+/// [`rel`] for every parameter of `got` against `want`, one layer (or the
+/// embedding) at a time: the 2B's gradients do not fit on the host twice
+/// in f64.
+fn streamed_rel(cfg: &Qwen35Config, got: &Qwen35Grads, want: &Qwen35Grads) -> Vec<(String, f64)> {
+    let mut out = Vec::new();
+    for part in std::iter::once(usize::MAX).chain(0..got.layers.len()) {
+        for ((name, a), (_, b)) in named(cfg, got, "", Some(part))
+            .into_iter()
+            .zip(named(cfg, want, "", Some(part)))
+        {
+            out.push((name, rel(&a, &b)));
+        }
+    }
+    out
+}
+
+/// The 2B step on a bf16-stored model (bf16 weights and layer inputs, f32
+/// accumulation) against tessl's exact-f32 step on the same checkpoint,
+/// which `real_2b_step_matches_transformers` holds to transformers' fp32
+/// autograd. Bounds written before the first run: the 2B bf16-operand
+/// test's, the loss within 2^-7 and every gradient within 2^-4 of its
+/// parameter's largest. The ids are natural text
+/// (`tests/fixtures/qwen35_text_ids.npy`, `tools/qwen35_ref/make_text_ids.py`),
+/// as the bound's own fixture is. On uniform random ids (loss 13.4) the
+/// first run failed it: layer 0's `in_proj_a` 1.17e-1, `A_log` 8.3e-2,
+/// `dt_bias` 7.1e-2, where bf16 operands alone, with f32 storage, already
+/// gave 7.4e-2, 1.01e-1 and 4.2e-2: the bound does not hold for random ids
+/// on either lane. On these ids (2026-10-08, M5 Pro) it fails on one of 320
+/// parameters, kept failing rather than loosened: the loss is 7.1e-5 off and
+/// 319 gradients are within 2^-4, but `layers.0.linear_attn.dt_bias` is
+/// 1.04e-1 off (bf16 operands alone: 3.3e-2). Layer 0's own input is the
+/// bf16 embedding, so that error arrives through the gradient from the 23
+/// rounded layer boundaries above it, onto a 16-element gradient summed
+/// over 512 tokens. Needs `QWEN35_2B_SAFETENSORS`.
+#[test]
+#[ignore]
+fn real_2b_step_on_bf16_storage_stays_near_the_f32_step() {
+    let rt = GpuRuntime::new().unwrap();
+    let ids = text_ids();
+    let f32_model = real_2b_tower(&rt, Precision::F32);
+    let exact = f32_model.train_step(&ids, GemmOperands::ExactF32).unwrap();
+    let bf16_model = real_2b_tower(&rt, Precision::Bf16);
+    let step = bf16_model.train_step(&ids, GemmOperands::Bf16).unwrap();
+    let r_loss = (step.loss - exact.loss).abs() / exact.loss;
+    eprintln!(
+        "loss: bf16 storage {:.6}, f32 {:.6} (rel {r_loss:.2e})",
+        step.loss, exact.loss
+    );
+    // Both gradient sets are f32 tensors of the same layouts. The f32
+    // model's bf16-operand step is printed beside each: how much of the gap
+    // operand rounding alone makes on these ids.
+    let operands = f32_model.train_step(&ids, GemmOperands::Bf16).unwrap();
+    let cfg = f32_model.config();
+    let results = streamed_rel(cfg, &step.grads, &exact.grads);
+    let op = streamed_rel(cfg, &operands.grads, &exact.grads);
+    drop(operands);
+    let worst = results.iter().map(|r| r.1).fold(0.0, f64::max);
+    for ((name, r), (_, o)) in results.iter().zip(&op) {
+        eprintln!("{name}: storage {r:.2e}, operands alone {o:.2e}");
+    }
+    eprintln!("worst {worst:.3e}");
+    assert!(r_loss <= 2f64.powi(-7), "loss {} vs f32 {}", step.loss, exact.loss);
+    for (name, r) in &results {
+        assert!(*r <= 2f64.powi(-4), "{name}: rel err {r:.3e} > 2^-4");
+    }
+}
+
+/// A quick loss curve (one seed; quick until it is run over several
+/// seeds): the 2B trained `STEPS` AdamW steps on four fixed natural-text
+/// sequences of 128 tokens in turn, at f32 and at each stored precision, every step's
+/// loss printed as CSV. Bounds written before the first run: at every step
+/// each stored precision's loss is within 2% of the f32 run's, and its total
+/// drop over the run is within 25% of the f32 run's drop (which must be at
+/// least 0.1 nats, or the curve shows nothing). Needs
+/// `QWEN35_2B_SAFETENSORS`; each run holds at most ~30 GB and is dropped
+/// before the next.
+#[test]
+#[ignore]
+fn real_2b_loss_curve_tracks_the_f32_step() {
+    use tessl::qwen35_adamw::{AdamW, AdamWConfig, AdamWHyper, MomentStorage, UpdateRule};
+    const STEPS: usize = 30;
+    let text = text_ids();
+    let seqs: Vec<Vec<u32>> = text.chunks(128).map(<[u32]>::to_vec).collect();
+    let hyper = AdamWHyper {
+        lr: 2e-5,
+        ..AdamWHyper::default()
+    };
+    let curve = |precision: Precision, config: AdamWConfig| -> Vec<f64> {
+        let rt = GpuRuntime::new().unwrap();
+        let model = real_2b_tower(&rt, precision);
+        let operands = if precision == Precision::F32 {
+            GemmOperands::ExactF32
+        } else {
+            GemmOperands::Bf16
+        };
+        let bank = Qwen35Grads::zeros_like(&model).unwrap();
+        let mut state = AdamW::with_config(&model, config).unwrap();
+        let wd = model.default_weight_decay(0.0).unwrap();
+        let mut losses = Vec::with_capacity(STEPS);
+        for step in 0..STEPS {
+            let ids = &seqs[step % seqs.len()];
+            let loss = model
+                .train_step_into(ids, operands, Supervise::Causal, &bank, false)
+                .unwrap();
+            model.adamw_step(&bank, &mut state, &hyper, &wd).unwrap();
+            losses.push(loss);
+        }
+        eprintln!("{}: {}", state.describe(), model.describe());
+        losses
+    };
+    let base = curve(Precision::F32, AdamWConfig::F32);
+    let configs = [
+        AdamWConfig {
+            update: UpdateRule::F32Master,
+            moments: MomentStorage::F32,
+        },
+        AdamWConfig {
+            update: UpdateRule::Bf16Kahan,
+            moments: MomentStorage::Bf16,
+        },
+        AdamWConfig {
+            update: UpdateRule::Bf16Kahan,
+            moments: MomentStorage::Block8,
+        },
+        AdamWConfig {
+            update: UpdateRule::Bf16Stochastic { seed: 1 },
+            moments: MomentStorage::Block8,
+        },
+    ];
+    let runs: Vec<Vec<f64>> = configs.iter().map(|&c| curve(Precision::Bf16, c)).collect();
+    println!("quick (single seed, natural-text ids)");
+    println!(
+        "step,f32,{}",
+        configs.iter().map(|c| c.to_string()).collect::<Vec<_>>().join(",")
+    );
+    for s in 0..STEPS {
+        let row: Vec<String> = runs.iter().map(|r| format!("{:.5}", r[s])).collect();
+        println!("{s},{:.5},{}", base[s], row.join(","));
+    }
+    // Over the last pass through the four sequences, against the first.
+    let drop = |r: &[f64]| r[..4].iter().sum::<f64>() / 4.0 - r[STEPS - 4..].iter().sum::<f64>() / 4.0;
+    let base_drop = drop(&base);
+    assert!(base_drop >= 0.1, "the f32 run's loss fell only {base_drop:.4}");
+    for (c, r) in configs.iter().zip(&runs) {
+        for s in 0..STEPS {
+            assert!(
+                (r[s] - base[s]).abs() <= 0.02 * base[s],
+                "{c} step {s}: loss {} vs f32 {}",
+                r[s],
+                base[s]
+            );
+        }
+        let d = drop(r);
+        assert!(
+            (d - base_drop).abs() <= 0.25 * base_drop,
+            "{c}: the loss fell {d:.4}, the f32 run's {base_drop:.4}"
+        );
     }
 }
 

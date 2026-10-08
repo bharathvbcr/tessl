@@ -41,7 +41,7 @@ use crate::dispatch::{dispatch_1d, dispatch_2d, set_gpu_buf, set_gpu_buf_offset,
 use crate::gdn_train::{
     gdn_train_backward, gdn_train_forward, GdnTrainDims, GdnTrainGrads, GdnTrainInputs, GdnTrainWorkspace, GDN_TRAIN_DK,
 };
-use crate::gemm::GemmOperands;
+use crate::gemm::{cast_bf16_to_f32_into, cast_f32_to_bf16_into, GemmOperands};
 use crate::nn::require_runtime;
 use crate::qwen35::{self, AttnShape, AttnTargets, Cols, GdnParams, OutCols, StateIn};
 use crate::qwen35_bwd::{
@@ -108,21 +108,28 @@ pub struct Qwen35Grads {
 }
 
 /// One gradient (or weight) buffer: the buffer, the byte offset of its
-/// elements, and how many f32s it holds.
-type Part<'a> = (&'a GpuBuffer, usize, usize);
+/// elements, how many elements it holds, and their type (a matrix is f32 or
+/// bf16; a [`GpuBuffer`] part is always f32).
+type Part<'a> = (&'a GpuBuffer, usize, usize, DType);
 
 fn tensor_part(t: &Tensor) -> Part<'_> {
-    (&t.buffer, t.byte_offset(), t.nbytes_logical() / 4)
+    (&t.buffer, t.byte_offset(), t.numel(), t.dtype)
 }
 
 fn buf_part(b: &GpuBuffer) -> Part<'_> {
-    (b, 0, b.nbytes() / 4)
+    (b, 0, b.nbytes() / 4, DType::F32)
 }
 
+/// A bank tensor for weight `t`, in `t`'s dtype: a bf16 model's matrices
+/// bank their gradients in bf16.
 fn zeros_tensor(t: &Tensor) -> Result<Tensor, String> {
-    // Hot: a bank (optimizer moments, accumulated gradients) stays resident.
-    // Allocations come back zeroed.
-    t.runtime().alloc_tensor_f32_hot(t.shape())
+    // Hot: a bank (accumulated gradients) stays resident. Allocations come
+    // back zeroed.
+    let rt = t.runtime();
+    match t.dtype {
+        DType::BF16 => rt.alloc_tensor_bf16_hot(t.shape()),
+        _ => rt.alloc_tensor_f32_hot(t.shape()),
+    }
 }
 
 fn zeros_buf(model: &Qwen35Model, b: &GpuBuffer) -> Result<GpuBuffer, String> {
@@ -184,8 +191,9 @@ fn layer_weight_parts(layer: &Layer) -> Vec<Part<'_>> {
 }
 
 impl Qwen35Grads {
-    /// Zeroed gradients shaped like every parameter of `model`: a bank for
-    /// [`Qwen35Model::train_step_into`] (and AdamW's moments), resident.
+    /// Zeroed gradients shaped like every parameter of `model`, each in its
+    /// weight's dtype (bf16 matrices on a bf16 model): a bank for
+    /// [`Qwen35Model::train_step_into`], resident.
     pub fn zeros_like(model: &Qwen35Model) -> Result<Self, String> {
         let mut layers = Vec::with_capacity(model.layers.len());
         for layer in &model.layers {
@@ -223,22 +231,41 @@ impl Qwen35Grads {
 }
 
 /// `dst = src`, or `dst += src` when `add`, for each pair of parts (same
-/// counts, checked by the caller). Elementwise, so exact: a copy is the
-/// source's bits, and one add is one f32 rounding.
+/// counts, checked by the caller). `src` is f32 (a step's gradients, from
+/// f32-accumulating GEMMs and kernels). Elementwise, so exact into f32: a
+/// copy is the source's bits, and one add is one f32 rounding. Into a bf16
+/// part, the copy or the f32 sum is rounded to nearest once.
 fn deliver(rt: &Arc<GpuRuntime>, src: &[Part<'_>], dst: &[Part<'_>], add: bool) -> Result<(), String> {
-    let p = rt.pipeline(if add { "add_inplace_f32" } else { "copy_f32" })?;
-    for (&(sb, so, n), &(db, doff, _)) in src.iter().zip(dst) {
+    for (&(sb, so, n, st), &(db, doff, _, dt)) in src.iter().zip(dst) {
         let n32 = u32::try_from(n).map_err(|_| format!("deliver: {n} elements exceed u32"))?;
-        dispatch_1d(rt, &p, n, |bnd| {
-            if add {
-                set_gpu_buf_offset(bnd, db, doff, 0);
-                set_gpu_buf_offset(bnd, sb, so, 1);
-            } else {
-                set_gpu_buf_offset(bnd, sb, so, 0);
-                set_gpu_buf_offset(bnd, db, doff, 1);
+        if st != DType::F32 {
+            return Err(format!("deliver: a {st:?} gradient; the step makes f32 ones"));
+        }
+        match dt {
+            DType::F32 => {
+                let p = rt.pipeline(if add { "add_inplace_f32" } else { "copy_f32" })?;
+                dispatch_1d(rt, &p, n, |bnd| {
+                    if add {
+                        set_gpu_buf_offset(bnd, db, doff, 0);
+                        set_gpu_buf_offset(bnd, sb, so, 1);
+                    } else {
+                        set_gpu_buf_offset(bnd, sb, so, 0);
+                        set_gpu_buf_offset(bnd, db, doff, 1);
+                    }
+                    set_u32(bnd, n32, 2);
+                })?;
             }
-            set_u32(bnd, n32, 2);
-        })?;
+            DType::BF16 => {
+                let p = rt.pipeline("qwen35_deliver_f32_to_bf16")?;
+                dispatch_1d(rt, &p, n, |bnd| {
+                    set_gpu_buf_offset(bnd, sb, so, 0);
+                    set_gpu_buf_offset(bnd, db, doff, 1);
+                    set_u32(bnd, n32, 2);
+                    set_u32(bnd, u32::from(add), 3);
+                })?;
+            }
+            DType::F16 => return Err("deliver: an f16 bank is not supported".into()),
+        }
     }
     Ok(())
 }
@@ -347,7 +374,10 @@ impl PendingStep {
 }
 
 /// Zero one part on the GPU, in order with the work around it.
-fn zero_part(rt: &Arc<GpuRuntime>, (b, off, n): Part<'_>) -> Result<(), String> {
+fn zero_part(rt: &Arc<GpuRuntime>, (b, off, n, dtype): Part<'_>) -> Result<(), String> {
+    if dtype != DType::F32 {
+        return Err(format!("zero_part: a {dtype:?} part; only f32 parts are zeroed here"));
+    }
     let n32 = u32::try_from(n).map_err(|_| format!("zero_part: {n} elements exceed u32"))?;
     let p = rt.pipeline("zero_f32")?;
     dispatch_1d(rt, &p, n, |bnd| {
@@ -501,10 +531,13 @@ impl Qwen35Model {
             ("embed", tensor_part(&bank.embed), tensor_part(&self.embed)),
             ("final_norm", buf_part(&bank.final_norm), buf_part(&self.final_norm)),
         ];
-        for (name, (b, _, n), (_, _, want)) in top {
+        let dtype_ok = |d: DType| matches!(d, DType::F32 | DType::BF16);
+        for (name, (b, _, n, d), (_, _, want, _)) in top {
             require_runtime(&self.rt, b, &format!("{what}: the bank's {name}"))?;
-            if n != want || b.nbytes() == 0 {
-                return Err(format!("{what}: the bank's {name} holds {n} values, the weight {want}"));
+            if n != want || b.nbytes() == 0 || !dtype_ok(d) {
+                return Err(format!(
+                    "{what}: the bank's {name} holds {n} {d:?} values, the weight {want} (f32 or bf16)"
+                ));
             }
         }
         for (i, (g, layer)) in bank.layers.iter().zip(&self.layers).enumerate() {
@@ -512,10 +545,12 @@ impl Qwen35Model {
             if have.len() != want.len() {
                 return Err(format!("{what}: layer {i}'s gradients are not its mixer's"));
             }
-            for (k, ((b, _, n), (_, _, w))) in have.iter().zip(&want).enumerate() {
+            for (k, ((b, _, n, d), (_, _, w, _))) in have.iter().zip(&want).enumerate() {
                 require_runtime(&self.rt, b, &format!("{what}: layer {i} buffer {k}"))?;
-                if n != w {
-                    return Err(format!("{what}: layer {i} buffer {k} holds {n} values, its weight {w}"));
+                if n != w || !dtype_ok(*d) {
+                    return Err(format!(
+                        "{what}: layer {i} buffer {k} holds {n} {d:?} values, its weight {w} (f32 or bf16)"
+                    ));
                 }
             }
         }
@@ -569,9 +604,10 @@ impl Qwen35Model {
         // then invalidates the step too.
         let param_generation = self.param_generation();
         let (rt, cfg) = (&self.rt, &self.cfg);
-        if self.precision != Precision::F32 {
+        self.require_trainable(WHAT)?;
+        if self.precision == Precision::Bf16 && operands != GemmOperands::Bf16 {
             return Err(format!(
-                "{WHAT}: training runs in f32; load the model with Precision::F32"
+                "{WHAT}: a model stored in bf16 trains on GemmOperands::Bf16 (its weights are the bf16 operands)"
             ));
         }
         if rt.relaxed_precision() {
@@ -656,12 +692,23 @@ impl Qwen35Model {
             &resid.buffer,
         )?;
         // Each layer's input; everything else its forward made goes back to
-        // the pool for the next layer.
+        // the pool for the next layer. A bf16 model keeps the inputs in bf16:
+        // the stream is rounded at each layer boundary and the layer runs on
+        // the rounded value widened back, so the backward's rebuild from the
+        // kept input is the forward's computation, bit for bit.
         let mut inputs = Vec::with_capacity(self.layers.len());
         for layer in &self.layers {
+            let kept = if self.precision == Precision::Bf16 {
+                let b = rt.alloc_tensor_bf16(&[tu, h])?;
+                cast_f32_to_bf16_into(&resid, &b)?;
+                cast_bf16_to_f32_into(&b, &resid)?;
+                Some(b)
+            } else {
+                None
+            };
             let (s, out) = self.train_layer_forward(layer, resid, t, true, operands)?;
             let out = out.ok_or("Qwen35Model::train_step: a layer's forward returned no output")?;
-            inputs.push(s.resid_in);
+            inputs.push(kept.unwrap_or(s.resid_in));
             resid = out;
         }
         let xf = tensor(rt, &[tu, h])?;
@@ -835,9 +882,16 @@ impl Qwen35Model {
         // as soon as its backward is encoded, and its gradients too when they
         // go into a bank.
         for (li, layer) in self.layers.iter().enumerate().rev() {
-            let resid_in = inputs
+            let kept = inputs
                 .pop()
                 .ok_or("Qwen35Model::train_step: fewer layer inputs than layers")?;
+            let resid_in = if kept.dtype == DType::BF16 {
+                let f = tensor(rt, kept.shape())?;
+                cast_bf16_to_f32_into(&kept, &f)?;
+                f
+            } else {
+                kept
+            };
             let s = self.train_layer_forward(layer, resid_in, t, false, operands)?.0;
             let g = self.train_layer_backward(layer, &s, &mut sc, operands)?;
             match bank {
@@ -847,13 +901,16 @@ impl Qwen35Model {
         }
         layers.reverse();
         // The gather's gradient adds onto the head's. With no head gradient
-        // and a bank whose embedding is a whole buffer, it adds straight into
-        // the bank (zeroed first unless accumulating): no 2 GB tensor and no
-        // copy on the 2B.
+        // and an f32 bank whose embedding is a whole buffer, it adds straight
+        // into the bank (zeroed first unless accumulating): no 2 GB tensor
+        // and no copy on the 2B. A bf16 bank takes it through an f32 tensor,
+        // rounded once on delivery.
         let (dw, direct) = match (d_embed, bank) {
             (Some(d), _) => (d, false),
             (None, Some((b, add)))
-                if b.embed.byte_offset() == 0 && tensor_part(&b.embed).2 * 4 == b.embed.buffer.nbytes() =>
+                if b.embed.dtype == DType::F32
+                    && b.embed.byte_offset() == 0
+                    && b.embed.nbytes_logical() == b.embed.buffer.nbytes() =>
             {
                 if !add {
                     zero_part(rt, tensor_part(&b.embed))?;
@@ -983,9 +1040,17 @@ impl Qwen35Model {
         let sum = |parts: &[u64]| parts.iter().fold(0u64, |a, &b| a.saturating_add(b));
         let th = f(tu * h);
         let layers = self.layers.len() as u64;
+        // Each layer's kept input: bf16 on a bf16 model, which the backward
+        // widens into an f32 tensor for the layer it rebuilds.
+        let bf16 = self.precision == Precision::Bf16;
+        let (kept, widened) = if bf16 {
+            (GpuRuntime::allocated_bytes_for(tu * h * 2, BufferKind::Cold), th)
+        } else {
+            (th, 0)
+        };
         // The ids, each layer's input and the stream out of the last, the
         // final norm's output and its gradient, the head gradient.
-        let held = sum(&[f(tu), th.saturating_mul(layers + 3), f(v * h)]);
+        let held = sum(&[f(tu), kept.saturating_mul(layers), th.saturating_mul(3), f(v * h)]);
         let fwd: Vec<u64> = self
             .layers
             .iter()
@@ -996,7 +1061,7 @@ impl Qwen35Model {
             .iter()
             .map(|l| {
                 let (grads, temps) = self.layer_bwd_bytes(l, t, mm);
-                (grads, sum(&[self.layer_fwd_bytes(l, t, mm, false), grads, temps]))
+                (grads, sum(&[self.layer_fwd_bytes(l, t, mm, false), grads, temps, widened]))
             })
             .collect();
         let fresh_grads = if fresh {
@@ -1046,6 +1111,7 @@ impl Qwen35Model {
     fn layer_fwd_bytes(&self, layer: &Layer, t: u32, mm: GemmOperands, output: bool) -> u64 {
         let (cfg, tu) = (&self.cfg, t as usize);
         let (h, i) = (cfg.hidden as usize, cfg.intermediate as usize);
+        let wd = self.embed.dtype;
         let f = |n: usize| GpuRuntime::allocated_bytes_for(n.saturating_mul(4), BufferKind::Cold);
         let mut b = vec![
             f(tu * h), // x1
@@ -1054,10 +1120,10 @@ impl Qwen35Model {
             f(tu * i),
             f(tu * i),
             f(tu * i), // m_gate, m_up, m_mid
-            2 * mm.nn_scratch_bytes(tu, i, h),
+            2 * mm.nn_scratch_bytes(tu, i, h, wd),
         ];
         if output {
-            b.push(mm.nn_scratch_bytes(tu, h, i));
+            b.push(mm.nn_scratch_bytes(tu, h, i, wd));
         }
         match &layer.mixer {
             Mixer::Gdn(_) => {
@@ -1072,7 +1138,7 @@ impl Qwen35Model {
                 .checkpoint_shape();
                 b.extend([
                     f(tu * g.width() as usize), // proj
-                    mm.nn_scratch_bytes(tu, g.width() as usize, h),
+                    mm.nn_scratch_bytes(tu, g.width() as usize, h, wd),
                     f(tu * g.conv_dim() as usize),
                     f(tu * hv * dk),
                     f(tu * hv * dk),
@@ -1082,7 +1148,7 @@ impl Qwen35Model {
                     f(ckpt.iter().product()),
                     f(tu * hv * dv), // o
                     f(tu * hv * dv), // y
-                    mm.nn_scratch_bytes(tu, h, hv * dv),
+                    mm.nn_scratch_bytes(tu, h, hv * dv, wd),
                 ]);
             }
             Mixer::Attn(_) => {
@@ -1094,7 +1160,7 @@ impl Qwen35Model {
                 let dims = self.attn_dims(t);
                 b.extend([
                     f(tu * a.width() as usize), // proj
-                    mm.nn_scratch_bytes(tu, a.width() as usize, h),
+                    mm.nn_scratch_bytes(tu, a.width() as usize, h, wd),
                     f(tu * qd),
                     f(tu * kvd),
                     f(tu * kvd), // q, k, v
@@ -1102,7 +1168,7 @@ impl Qwen35Model {
                     f(tu * qd),        // o
                     f(dims.lse_len()), // lse
                     f(tu * qd),        // y
-                    mm.nn_scratch_bytes(tu, h, qd),
+                    mm.nn_scratch_bytes(tu, h, qd, wd),
                 ]);
             }
         }
@@ -1114,14 +1180,15 @@ impl Qwen35Model {
         let (cfg, tu) = (&self.cfg, t as usize);
         let (h, i) = (cfg.hidden as usize, cfg.intermediate as usize);
         let tc = self.rt.has_tensorops();
+        let wd = self.embed.dtype;
         let f = |n: usize| GpuRuntime::allocated_bytes_for(n.saturating_mul(4), BufferKind::Cold);
         // down, gate, up, post_norm, input_norm.
         let mut grads = vec![f(i * h), f(h * i), f(h * i), f(h), f(h)];
         let mut temps = vec![
             mm.tn_scratch_bytes(tc, i, h, tu),
-            mm.nt_scratch_bytes(tc, tu, i, h),
+            mm.nt_scratch_bytes(tc, tu, i, h, wd),
             2 * mm.tn_scratch_bytes(tc, h, i, tu),
-            2 * mm.nt_scratch_bytes(tc, tu, h, i),
+            2 * mm.nt_scratch_bytes(tc, tu, h, i, wd),
         ];
         let (width, y_cols) = match &layer.mixer {
             Mixer::Gdn(_) => {
@@ -1145,9 +1212,9 @@ impl Qwen35Model {
         grads.extend([f(y_cols * h), f(h * width)]);
         temps.extend([
             mm.tn_scratch_bytes(tc, y_cols, h, tu),
-            mm.nt_scratch_bytes(tc, tu, y_cols, h),
+            mm.nt_scratch_bytes(tc, tu, y_cols, h, wd),
             mm.tn_scratch_bytes(tc, h, width, tu),
-            mm.nt_scratch_bytes(tc, tu, h, width),
+            mm.nt_scratch_bytes(tc, tu, h, width, wd),
         ]);
         let total = |v: &[u64]| v.iter().fold(0u64, |a, &b| a.saturating_add(b));
         (total(&grads), total(&temps))
@@ -1214,8 +1281,8 @@ impl Qwen35Model {
         let tc = self.rt.has_tensorops();
         let per_chunk = |w: usize| {
             [
-                2 * mm.nt_scratch_bytes(tc, n, w, h),
-                mm.nn_scratch_bytes(n, h, w),
+                2 * mm.nt_scratch_bytes(tc, n, w, h, DType::F32),
+                mm.nn_scratch_bytes(n, h, w, DType::F32),
                 mm.tn_scratch_bytes(tc, w, h, n),
             ]
             .iter()

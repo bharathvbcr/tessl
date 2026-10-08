@@ -8,6 +8,22 @@ All notable changes to `tessl` are recorded here. The format follows
 
 ### Added
 
+- **Qwen3.5 training on bf16 storage.** A `Precision::Bf16` model (loaded
+  with `load_tower`) trains on `GemmOperands::Bf16` with its matrices kept in
+  bf16; arithmetic stays f32. `AdamWConfig` picks an `UpdateRule` for
+  bf16-stored weights (`F32Master`, `Bf16Kahan`, `Bf16Stochastic { seed }`)
+  and a `MomentStorage` (`F32`, `Bf16`, or `Block8`: 8-bit codes with one f32
+  scale per 256 elements). Gradient banks take their weight's dtype, and
+  `read_adamw_aux` / `write_adamw_aux` checkpoint the master or compensation
+  so a run resumes bit for bit. `Qwen35Model::random_tower` and
+  `probe_storage_memory` measure what each variant holds at a config's
+  shapes.
+- **`tessl::bert`: BERT / DistilBERT learned sparse document encoders.**
+  `BertForMaskedLM` and `DistilBertForMaskedLM` checkpoints produce
+  `max_t log1p(relu(logits))` term weights, in exact f32. New kernels are in
+  `kernels/bert.metal`, and `embedgemma2::encoder_attn` gains head dims 32
+  and 64.
+
 - **`tessl::safetensors` reads integer and fp8 tensors.** `read_raw` returns
   any tensor's header entry and its stored bytes. `read_u8`, `read_i8` and
   `read_u32` return typed int8 and MLX-packed Q4 weights. `Dtype` gains

@@ -241,6 +241,52 @@ kernel void matmul2d_tensorops_nt_f32(
     }
 }
 
+/// C[M,N] += A[M,K] @ B[K,N] (NN accumulate; no C zero): `matmul2d_tensorops_f32`
+/// in `multiply_accumulate` mode.
+kernel void matmul2d_tensorops_nn_accum_f32(
+    device float *A [[buffer(0)]],
+    device float *B [[buffer(1)]],
+    device float *C [[buffer(2)]],
+    constant uint &M [[buffer(3)]],
+    constant uint &N [[buffer(4)]],
+    constant uint &K [[buffer(5)]],
+    constant uint &tiles_n [[buffer(6)]],
+    constant uint &tiles_m [[buffer(7)]],
+    constant uint &use_interior [[buffer(8)]],
+    uint tgpig [[threadgroup_position_in_grid]])
+{
+    constexpr int SM = 32;
+    constexpr int SN = 32;
+    constexpr auto desc =
+        matmul2d_descriptor(SM, SN, dynamic_length_v<int>, false, false, false,
+                            matmul2d_descriptor::mode::multiply_accumulate);
+    matmul2d<desc, execution_simdgroup> op;
+
+    uint2 tile = tile_walk<SM>(tgpig, tiles_n, tiles_m, N, K);
+    if (tile.x >= tiles_n || tile.y >= tiles_m) return;
+    int tx = (int)tile.x * SN;
+    int ty = (int)tile.y * SM;
+
+    bool interior = use_interior && (tx + SN <= (int)N) && (ty + SM <= (int)M);
+    if (interior) {
+        auto tA = tensor(A + ty * (int)K, dextents<int, 2>{(int)K, SM},
+                         array<int, 2>{1, (int)K});
+        auto tB = tensor(B + tx, dextents<int, 2>{SN, (int)K},
+                         array<int, 2>{1, (int)N});
+        auto tC = tensor(C + ty * (int)N + tx, dextents<int, 2>{SN, SM},
+                         array<int, 2>{1, (int)N});
+        op.run(tA, tB, tC);
+    } else {
+        auto mA = tensor(A, dextents<int, 2>{(int)K, (int)M}, array<int, 2>{1, (int)K});
+        auto mB = tensor(B, dextents<int, 2>{(int)N, (int)K}, array<int, 2>{1, (int)N});
+        auto mC = tensor(C, dextents<int, 2>{(int)N, (int)M}, array<int, 2>{1, (int)N});
+        auto tA = mA.slice(0, ty);
+        auto tB = mB.slice(tx, 0);
+        auto tC = mC.slice(tx, ty);
+        op.run(tA, tB, tC);
+    }
+}
+
 /// C[M,N] += A_stored[K,M]^T @ B[K,N] (TN accumulate; no C zero).
 kernel void matmul2d_tensorops_tn_accum_f32(
     device float *A [[buffer(0)]],

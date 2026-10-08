@@ -18,7 +18,9 @@ mod common;
 use std::sync::Arc;
 
 use common::{buf, buf_bf16, random_f32, round_trip_bf16, with_gpu};
-use tessl::cross_entropy::{cross_entropy_rows, CeGrads, CeHidden, CeOutput, CeWorkspace, Reduction};
+use tessl::cross_entropy::{
+    cross_entropy_rows, cross_entropy_rows_accumulating, CeGrads, CeHidden, CeOutput, CeWorkspace, Reduction,
+};
 use tessl::gemm::GemmOperands;
 use tessl::tensor::{DType, GpuBuffer, Tensor};
 use tessl::GpuRuntime;
@@ -563,7 +565,9 @@ fn matches_the_reference_at_the_real_vocabulary_and_hidden_width() {
 fn the_workspace_is_bounded_by_rows_and_chunk_not_vocabulary() {
     // The whole point: scratch does not grow with the vocabulary.
     let b = CeWorkspace::bytes_for(8, 2048, 4096, DType::BF16);
-    let want = 4 * (5 * 8 + 2 * 8 * 2048 + 8 * 4096 + 4096 * 2048);
+    // rows, targets, m, s, tlogit; the gathered rows; one logit chunk; the
+    // widened weight chunk. (dh accumulates in its GEMM: no `dh_part`.)
+    let want = 4 * (5 * 8 + 8 * 2048 + 8 * 4096 + 4096 * 2048);
     assert_eq!(b, want);
     assert_eq!(
         CeWorkspace::bytes_for(8, 2048, 4096, DType::F32),
@@ -701,4 +705,57 @@ fn rejects_what_it_cannot_compute() {
 
 fn tensor_at(rt: &Arc<GpuRuntime>, v: &[f32], shape: &[usize]) -> Tensor {
     upload_at(rt, v, DType::F32, shape, 0)
+}
+
+/// `cross_entropy_rows_accumulating` adds the weight gradient into what `dW`
+/// holds: within 8 units of f32 rounding (of the tensor's largest
+/// `|C0| + |dW|`) of `C0 + dW` from the overwriting call, whose dh and loss
+/// it reproduces bit for bit. Several vocabulary chunks, both operand lanes.
+#[test]
+fn the_accumulating_call_adds_dw_into_what_it_holds() {
+    with_gpu(|rt| {
+        let (n, hidden, vocab, chunk) = (6usize, 64usize, 200usize, 48u32);
+        let h = random_f32(n * hidden, 0xce01);
+        let w = random_f32(vocab * hidden, 0xce02);
+        let c0 = random_f32(vocab * hidden, 0xce03);
+        let rows: Vec<u32> = (0..n as u32).collect();
+        let targets: Vec<u32> = (0..n as u32).map(|i| (i * 37 + 5) % vocab as u32).collect();
+        let hid = upload_at(rt, &h, DType::F32, &[n, hidden], 0);
+        let wt = upload_at(rt, &w, DType::F32, &[vocab, hidden], 0);
+        let ws = CeWorkspace::new(rt, n as u32, hidden as u32, chunk, DType::F32).unwrap();
+        for op in [GemmOperands::ExactF32, GemmOperands::Bf16] {
+            let run = |dw: &Tensor, dh: &Tensor, add: bool| {
+                let grads = CeGrads { dh, dw, scale: 0.5 };
+                let hidden = CeHidden { rows: &hid, off: 0 };
+                let out = if add {
+                    cross_entropy_rows_accumulating(rt, hidden, &wt, &rows, &targets, Reduction::Mean, op, &ws, grads)
+                } else {
+                    cross_entropy_rows(rt, hidden, &wt, &rows, &targets, Reduction::Mean, op, &ws, Some(grads))
+                };
+                out.unwrap()
+            };
+            let (dw1, dh1) = (sentinel_tensor(rt, &[vocab, hidden]), sentinel_tensor(rt, &[n, hidden]));
+            let l1 = run(&dw1, &dh1, false);
+            let dw2 = upload_at(rt, &c0, DType::F32, &[vocab, hidden], 0);
+            let dh2 = sentinel_tensor(rt, &[n, hidden]);
+            let l2 = run(&dw2, &dh2, true);
+            assert_eq!(l1.loss.to_bits(), l2.loss.to_bits(), "{op:?}: the loss differs");
+            assert!(
+                dh1.read_f32().unwrap() == dh2.read_f32().unwrap(),
+                "{op:?}: dh differs between the overwriting and accumulating calls"
+            );
+            let (g1, g2) = (dw1.read_f32().unwrap(), dw2.read_f32().unwrap());
+            let scale = c0
+                .iter()
+                .zip(&g1)
+                .map(|(a, b)| f64::from(a.abs() + b.abs()))
+                .fold(0.0, f64::max);
+            let u = f64::from(f32::EPSILON) / 2.0;
+            for (k, ((&prev, &fresh), &got)) in c0.iter().zip(&g1).zip(&g2).enumerate() {
+                let want = f64::from(prev) + f64::from(fresh);
+                let err = (f64::from(got) - want).abs();
+                assert!(err <= 8.0 * u * scale, "{op:?}: dW[{k}] = {got}, want {want} (err {err:.3e})");
+            }
+        }
+    });
 }

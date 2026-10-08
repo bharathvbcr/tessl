@@ -57,6 +57,7 @@ run_one() {
   local log="$tmp/$(echo "$name" | tr ':/' '__').$round"
   {
     echo "# ---- round $round, config $name: ${args[*]} (TESSL_MID_COMMIT=$mid) ----"
+    echo "# $(date +%H:%M:%S), load average $(sysctl -n vm.loadavg)"
     if [[ $mid == - ]]; then
       env -u TESSL_MID_COMMIT -u METAL_RUNTIME_MID_COMMIT /usr/bin/time -l "$bin" "${args[@]}" 2>&1
     else

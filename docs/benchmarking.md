@@ -19,6 +19,8 @@ you changed in the kernel.**
 | `bench/paired_cross_runtime.py` | Alternates the tessl and PyTorch/MLX lanes round by round. |
 | `bench_embedgemma2` | EmbeddingGemma 2 `encode` latency on the real checkpoint, JSON out. |
 | `bench/paired_embedgemma2.py` | Alternates `bench_embedgemma2` and `bench/embedgemma2_torch.py` (sentence-transformers on MPS) round by round. |
+| `bench_qwen35_train` | Qwen3.5-2B training ops, and with the checkpoint one whole `train_step` (`--step`, `--async`), a clipped optimizer step (`--clip`), or a row-by-row batch (`--batch`), each with its host waits and device peak. |
+| `bench/paired_qwen35_step.sh` | Interleaves `bench_qwen35_train --step` configurations (T, `TESSL_MID_COMMIT`, encode mode) one process each, and with `BENCH_BINS` a before and an after binary, round by round; min-of-N with peak memory. |
 
 ```mermaid
 flowchart TD

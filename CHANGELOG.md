@@ -8,6 +8,26 @@ All notable changes to `tessl` are recorded here. The format follows
 
 ### Added
 
+- **Accumulate GEMM operands.** `GemmOperands::{nn_acc, tn_acc, nt_acc}`
+  compute `C += op(A) op(B)` in the GEMM itself on both lanes: the TN/NT
+  accumulate kernels, a new exact-f32 `matmul2d_tensorops_nn_accum_f32`
+  (and the NN split-K without its zero), and for bf16 operands the
+  cooperative epilogue with `beta = 1`. `cross_entropy_rows_accumulating`
+  adds the weight gradient into `dW` instead of overwriting it.
+- **Allocation and upload primitives.** `GpuRuntime::alloc_tensor_unzeroed`
+  for tensors a kernel writes in full, `set_poison_unzeroed` (a test aid
+  that fills them with NaN), `alloc_buffer_from_u32` (a fresh buffer filled
+  without a GPU wait) and `upload_u32` (a write ordered with the queued
+  work, through a bitwise `copy_u32` kernel).
+- **`Qwen35Model::adamw_step_unwaited`.** The AdamW step encoded without its
+  closing wait; `AdamW::step_count` reports the last count its own waits
+  confirmed once the runtime is poisoned.
+- **Counters and bench modes.** `infer_trace` counts host waits
+  (`sync_waits`) and host-zeroed allocations and bytes, and
+  `Snapshot::since` differences two snapshots. `bench_qwen35_train` gains
+  `--async`, `--step-only` and `--clip`, and prints each step's waits and
+  device peak; `bench/paired_qwen35_step.sh` interleaves configurations and
+  a before/after pair of binaries.
 - **Qwen3.5 training on bf16 storage.** A `Precision::Bf16` model (loaded
   with `load_tower`) trains on `GemmOperands::Bf16` with its matrices kept in
   bf16; arithmetic stays f32. `AdamWConfig` picks an `UpdateRule` for
@@ -54,6 +74,20 @@ All notable changes to `tessl` are recorded here. The format follows
   external `match` on it.
 
 ### Changed
+
+- **Qwen3.5 training step traffic.** Allocations a kernel writes in full
+  are no longer zeroed on the host (808 allocations, 25.86 GB per 2B step at
+  T = 2048); the step makes one attention workspace and uploads its indices
+  without draining the GPU (dxf is zeroed on the GPU); a step into an f32
+  bank writes every weight matrix's and the head's gradient in place (no
+  `[vocab, hidden]` head tensor); the residual, MLP-backward and
+  cross-entropy dh sums form in their GEMMs (`CeWorkspace` loses `dh_part`).
+  Gradients change by rounding: an accumulated f32 bank sits within 8 u of
+  the tensor's largest `|x| + |y|` of `f32(x + y)`. AdamW is one
+  table-driven dispatch per step kernel, bit-identical. Paired against the
+  previous build: -14% / -17% per step sync and -32% / -4% async at
+  T = 256 / 2048, peak memory not above before
+  (`bench/results/qwen35_train_step_{before,after}_m5pro.txt`).
 
 - **C ABI 10: `tessl_qwen35_load` takes a precision and
   `tessl_qwen35_adamw_init` an optimizer configuration.** `tessl_qwen35_load`

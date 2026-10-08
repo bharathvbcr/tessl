@@ -1,0 +1,42 @@
+{
+  "knob": "rows",
+  "env": "BENCH_ATTN_ROWS_R",
+  "values": [
+    "8",
+    "16",
+    "32"
+  ],
+  "rounds": 5,
+  "iters": 20,
+  "batched": 1,
+  "median_ms": {
+    "8": {
+      "swa128_prefill_512": 1.095979,
+      "swa128_prefill_2048": 11.493292,
+      "swa128_prefill_4096": 27.290896,
+      "swa256_prefill_2048": 22.972521,
+      "global512_prefill_1024": 21.8975
+    },
+    "16": {
+      "swa128_prefill_512": 1.28325,
+      "swa128_prefill_2048": 17.061854,
+      "swa128_prefill_4096": 44.1905,
+      "swa256_prefill_2048": 14.891355,
+      "global512_prefill_1024": 8.207646
+    },
+    "32": {
+      "swa128_prefill_512": 1.671875,
+      "swa128_prefill_2048": 21.063604,
+      "swa128_prefill_4096": 52.045396,
+      "swa256_prefill_2048": 16.666562,
+      "global512_prefill_1024": 5.194853
+    }
+  },
+  "winner": {
+    "swa128_prefill_512": "8",
+    "swa128_prefill_2048": "8",
+    "swa128_prefill_4096": "8",
+    "swa256_prefill_2048": "16",
+    "global512_prefill_1024": "32"
+  }
+}

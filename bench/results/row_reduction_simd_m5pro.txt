@@ -1,0 +1,58 @@
+Row reductions, simdgroup-first — M5 Pro, 2026-09-05
+=====================================================
+
+Kernels: softmax_rows_f32, row_sum_f32, row_max_f32 (reduce.metal) and the
+rms_norm family (rms_norm.metal), all one threadgroup per row. Before: the
+per-row reduction was a threadgroup-memory tree with a barrier per round
+(REDUCE_TREE, ten rounds at 1024 lanes). After: `reduce_row_add` /
+`reduce_row_max` in reduce_tree.h — simd_sum/simd_max across each simdgroup,
+one lane per simdgroup publishes its partial, one barrier, then every
+simdgroup folds the partials with a second shuffle. Rows are launched with at
+most 256 lanes (REDUCE_ROW_MAX_LANES, was 1024).
+
+Method: paired, order-balanced, in-process A/B with the previous kernels
+kept under temporary names; twenty dispatches per command buffer, eight
+calls per arm per round (per-call median), six rounds alternating order,
+median of rounds. Only the paired ratios are the finding.
+
+Two intermediate results that shaped the design (rows = 4096):
+
+1. A first cut folded the simdgroup partials with a serial loop per thread.
+   It won below 256 columns and LOST from 1024 up (softmax 0.51x, row_sum
+   0.69x, rms 0.74–0.94x): 32 dependent threadgroup-memory loads per thread
+   cost more than the tree's ten barriers. The second-level shuffle removed
+   the loop.
+2. A register-resident single-pass softmax (rows up to 8 * tptg read once)
+   never beat the three-pass streaming form (0.51–1.05x): the re-reads are
+   cache hits; the cost was the reduction, not row traffic. Dropped.
+
+Final kernels (two-level simd) vs the tree, ratio = tree time / new time:
+
+softmax_rows_f32, rows=4096
+  cols=64      legacy     35.8 us  new     29.1 us   1.23x
+  cols=256     legacy    188.6 us  new    114.2 us   1.65x
+  cols=1024    legacy    529.5 us  new    227.9 us   2.32x
+  cols=4096    legacy    812.9 us  new    718.3 us   1.13x
+  cols=8192    legacy   1437.3 us  new   1469.4 us   0.98x  (bandwidth bound, ~183 GB/s)
+  cols=16384   legacy   2776.5 us  new   2687.9 us   1.03x
+
+row_sum_f32 / row_max_f32, rows=4096
+  cols=64      sum 1.45x   max 1.41x
+  cols=256     sum 1.98x   max 1.88x
+  cols=1024    sum 4.35x   max 4.35x
+  cols=4096    sum 1.05x   max 0.98x
+
+rms_norm_f32
+  rows=1     dim=2560   1.21x      rows=512   dim=2560   1.47x
+  rows=1     dim=4096   1.07x      rows=4096  dim=2560   1.03x
+  rows=8     dim=4096   1.02x      rows=4096  dim=4096   1.16x
+  rows=64    dim=2560   1.21x      rows=4096  dim=256    1.72x
+
+Lanes per row, 1024 (old cap) vs 256, new kernels, ratio = 1024-lane time /
+256-lane time:
+  rows=4096 cols=1024   softmax 1.18   rms 1.03   row_sum 1.90
+  rows=4096 cols=2560   softmax 0.96   rms 1.02   row_sum 0.99
+  rows=4096 cols=4096   softmax 0.99   rms 0.95   row_sum 1.00
+  rows=4096 cols=8192   softmax 0.96   rms 0.99   row_sum 0.98
+  rows=1    cols=2560   rms 1.01;  rows=8 cols=4096  rms 0.97;  rows=64 cols=2560  rms 1.27
+The cap moved to 256: a large win where it matters and noise elsewhere.

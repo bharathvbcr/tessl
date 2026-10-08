@@ -1,0 +1,168 @@
+{
+  "rounds": 5,
+  "iters": 20,
+  "warmup": 5,
+  "cfgs": [
+    "swa128_prefill_512",
+    "swa128_prefill_2048",
+    "swa128_prefill_4096",
+    "swa128_decode_1k",
+    "swa128_decode_4k",
+    "swa128_decode_b8_4k",
+    "swa256_prefill_2048",
+    "swa256_decode_4k",
+    "global512_prefill_1024",
+    "global512_decode_4k"
+  ],
+  "lanes": [
+    "torch-mps",
+    "mlx"
+  ],
+  "tessl_impl": "tessl-rows",
+  "comparisons": [
+    {
+      "lane": "torch-mps",
+      "tessl_impl": "tessl-rows",
+      "geomean_tessl_over_other": 0.941670689441088,
+      "configs_covered": 10,
+      "configs_requested": 10,
+      "worst_config": "swa128_prefill_2048",
+      "worst_median": 2.05393940882845,
+      "best_median": 0.2754346807731818,
+      "per_config": [
+        {
+          "cfg": "swa128_prefill_512",
+          "median": 0.9446831685645318,
+          "min": 0.629811400588227,
+          "max": 1.2105351822246915
+        },
+        {
+          "cfg": "swa128_prefill_2048",
+          "median": 2.05393940882845,
+          "min": 1.9692969448014015,
+          "max": 2.1461371943187495
+        },
+        {
+          "cfg": "swa128_prefill_4096",
+          "median": 0.9377949189547529,
+          "min": 0.9237606151319447,
+          "max": 1.0408423812164485
+        },
+        {
+          "cfg": "swa128_decode_1k",
+          "median": 1.3750302308221531,
+          "min": 0.6531142328628993,
+          "max": 2.0255514049466403
+        },
+        {
+          "cfg": "swa128_decode_4k",
+          "median": 1.0754247999723998,
+          "min": 0.5561307433069378,
+          "max": 1.310605721967189
+        },
+        {
+          "cfg": "swa128_decode_b8_4k",
+          "median": 0.2754346807731818,
+          "min": 0.22469796241970189,
+          "max": 0.35932247993695593
+        },
+        {
+          "cfg": "swa256_prefill_2048",
+          "median": 0.9403814588475247,
+          "min": 0.8839639955559404,
+          "max": 0.9795031632843115
+        },
+        {
+          "cfg": "swa256_decode_4k",
+          "median": 0.7585873628883638,
+          "min": 0.48277952159526116,
+          "max": 2.3276879195874765
+        },
+        {
+          "cfg": "global512_prefill_1024",
+          "median": 1.8400170882194637,
+          "min": 1.594492678770986,
+          "max": 1.910532951029311
+        },
+        {
+          "cfg": "global512_decode_4k",
+          "median": 0.5635940667229328,
+          "min": 0.49553152946383977,
+          "max": 0.7327389486962266
+        }
+      ]
+    },
+    {
+      "lane": "mlx",
+      "tessl_impl": "tessl-rows",
+      "geomean_tessl_over_other": 1.8092522638805373,
+      "configs_covered": 10,
+      "configs_requested": 10,
+      "worst_config": "global512_decode_4k",
+      "worst_median": 4.570023948578183,
+      "best_median": 0.7203980848856157,
+      "per_config": [
+        {
+          "cfg": "swa128_prefill_512",
+          "median": 1.3926330531417084,
+          "min": 0.9513624446779643,
+          "max": 1.5363524867616183
+        },
+        {
+          "cfg": "swa128_prefill_2048",
+          "median": 2.0189907748055065,
+          "min": 1.9904439509267329,
+          "max": 2.173475017774595
+        },
+        {
+          "cfg": "swa128_prefill_4096",
+          "median": 0.9465033281963359,
+          "min": 0.8902234618331863,
+          "max": 0.9631610102568334
+        },
+        {
+          "cfg": "swa128_decode_1k",
+          "median": 2.0980193644889833,
+          "min": 0.2086502001464701,
+          "max": 3.520368785868742
+        },
+        {
+          "cfg": "swa128_decode_4k",
+          "median": 1.9952098476231057,
+          "min": 1.7082705105789369,
+          "max": 2.614193581940196
+        },
+        {
+          "cfg": "swa128_decode_b8_4k",
+          "median": 0.7203980848856157,
+          "min": 0.2228105148485774,
+          "max": 1.0354047617099356
+        },
+        {
+          "cfg": "swa256_prefill_2048",
+          "median": 1.7973556142240819,
+          "min": 1.7306897578898053,
+          "max": 1.832537151475246
+        },
+        {
+          "cfg": "swa256_decode_4k",
+          "median": 2.0717898609807244,
+          "min": 1.3445812168944984,
+          "max": 5.7194281619043625
+        },
+        {
+          "cfg": "global512_prefill_1024",
+          "median": 2.7518784996132335,
+          "min": 2.3445894825770157,
+          "max": 2.9160505789366296
+        },
+        {
+          "cfg": "global512_decode_4k",
+          "median": 4.570023948578183,
+          "min": 3.789673039895745,
+          "max": 7.32887873133133
+        }
+      ]
+    }
+  ]
+}

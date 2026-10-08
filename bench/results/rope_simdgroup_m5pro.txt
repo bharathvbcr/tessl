@@ -1,0 +1,29 @@
+rms_qkv_rope one-simdgroup-per-row A/B — M5 Pro, 2026-09-04
+===========================================================
+
+Kernel: `rms_qkv_rope` (PosConst; the posbuf and kv_store variants share the
+row routine). Previous: one thread per (token, head) row, three serial
+passes. New: one 32-lane simdgroup per row, lane l owns the pair
+(p, p + D/2) for p ≡ l (mod 32), `simd_sum` for the sum of squares.
+
+Method: paired, order-balanced, in-process A/B with the previous kernel kept
+under a temporary name. Twenty dispatches per command buffer (async encode,
+auto barriers), ten calls per arm per round (per-call median), six rounds
+alternating arm order, median of rounds. rotary_dim = D, theta 1e4.
+
+ratio = previous time / new time (> 1: the simdgroup kernel is faster)
+
+T=1     Hq=8   Hkv=4  D=256  rows=16     legacy    117.24 us  new     17.00 us  legacy/new 6.90
+T=1     Hq=16  Hkv=8  D=256  rows=32     legacy    175.91 us  new     15.35 us  legacy/new 11.46
+T=1     Hq=32  Hkv=8  D=128  rows=48     legacy     48.57 us  new     14.15 us  legacy/new 3.43
+T=8     Hq=16  Hkv=8  D=256  rows=256    legacy     48.11 us  new     13.23 us  legacy/new 3.64
+T=64    Hq=16  Hkv=8  D=256  rows=2048   legacy     80.28 us  new     24.12 us  legacy/new 3.33
+T=256   Hq=32  Hkv=8  D=128  rows=12288  legacy     75.43 us  new     59.75 us  legacy/new 1.26
+T=1024  Hq=16  Hkv=8  D=256  rows=32768  legacy    645.80 us  new    377.47 us  legacy/new 1.71
+
+Reading: decode and small-T shapes are latency bound on the old kernel (a
+single thread walking 256 elements three times); the simdgroup kernel is
+3.4-11.5x faster there and 1.3-1.7x at long prefill, where the old grid
+already had thousands of threads but uncoalesced rows. Numerics: the
+reduction reassociates (low bits); tests/qkv_rope.rs compares against an f64
+reference and pins that a row is bit-identical wherever it sits in the grid.

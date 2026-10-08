@@ -1,0 +1,39 @@
+Split-K gate on the bf16 TN dW shapes — M5 Pro, 2026-09-05
+==========================================================
+
+Question (audit G8): `prefer_tn_splitk` sent K >= 2048 with M, N <= 384 and
+min(M, N) <= 128 to the 64x32 split-K kernel (one zero pass plus up to 32
+partition dispatches behind barriers) on a sync-per-iteration measurement
+that the findings file itself said could not resolve the difference.
+
+Method: gemm_tn_train at PrecisionMode::Bf16 through the public API, split-K
+gate on (current) vs forced off (single coop 128x64 TN dispatch); twenty
+GEMMs per command buffer so the packed encoder is what is timed; eight calls
+per arm per round, six order-balanced rounds. ratio = split-K time / coop
+time (> 1: the coop kernel is faster). (384,384,4096) is a control: it is
+not gated, both arms run the same kernel, and its 0.95 shows the noise.
+
+  M=128 N=128 K=4096     98.3 /  93.0 us   1.06
+  M=128 N=384 K=4096    131.0 / 106.4 us   1.23
+  M=384 N=128 K=4096    116.8 / 103.1 us   1.13
+  M=64  N=64  K=8192    209.4 / 183.9 us   1.14
+  M=128 N=128 K=2048     52.6 /  50.3 us   1.05
+  M=128 N=384 K=16384   460.4 / 533.7 us   0.86
+  M=384 N=384 K=4096    109.2 / 114.7 us   0.95  (control)
+
+K sweep at the gated shapes:
+  M=128 N=384 K=8192    293.4 / 268.2 us   1.09
+  M=128 N=384 K=12288   365.9 / 402.4 us   0.91
+  M=128 N=384 K=16384   440.5 / 531.8 us   0.83
+  M=128 N=384 K=32768   812.6 /1109.4 us   0.73
+  M=128 N=128 K=8192    236.1 / 216.4 us   1.09
+  M=128 N=128 K=16384   382.2 / 469.5 us   0.81
+  M=128 N=128 K=32768   781.2 /1108.9 us   0.70
+  M=64  N=64  K=16384   366.1 / 379.4 us   0.97
+  M=64  N=64  K=32768   716.8 / 958.8 us   0.75
+  M=384 N=128 K=16384   463.0 / 546.8 us   0.85
+
+Reading: below K = 12288 the coop kernel wins by 5–23%; from 12288 the
+split-K partitions win and pull away with depth, because the coop kernel's
+handful of threadgroups walk K alone. Landed as SPLITK_MIN_K = 12288 with
+the shape conditions unchanged, pinned by `splitk_gate_opens_at_the_measured_depth`.

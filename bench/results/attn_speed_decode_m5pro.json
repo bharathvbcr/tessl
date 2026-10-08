@@ -1,0 +1,103 @@
+{
+  "rounds": 5,
+  "iters": 20,
+  "warmup": 5,
+  "cfgs": [
+    "swa128_decode_1k",
+    "swa128_decode_4k",
+    "swa128_decode_b8_4k",
+    "swa256_decode_4k",
+    "global512_decode_4k"
+  ],
+  "lanes": [
+    "torch-mps",
+    "mlx"
+  ],
+  "tessl_impl": "tessl-decode",
+  "comparisons": [
+    {
+      "lane": "torch-mps",
+      "tessl_impl": "tessl-decode",
+      "geomean_tessl_over_other": 0.5659692730211426,
+      "configs_covered": 5,
+      "configs_requested": 5,
+      "worst_config": "swa128_decode_1k",
+      "worst_median": 0.9919982176204205,
+      "best_median": 0.1950660554404626,
+      "per_config": [
+        {
+          "cfg": "swa128_decode_1k",
+          "median": 0.9919982176204205,
+          "min": 0.8125009517003469,
+          "max": 1.1199617273398965
+        },
+        {
+          "cfg": "swa128_decode_4k",
+          "median": 0.576430749437425,
+          "min": 0.5096799921057266,
+          "max": 0.8083235268612565
+        },
+        {
+          "cfg": "swa128_decode_b8_4k",
+          "median": 0.5326166214334052,
+          "min": 0.5129456585911844,
+          "max": 0.5572061690579786
+        },
+        {
+          "cfg": "swa256_decode_4k",
+          "median": 0.9774843634269226,
+          "min": 0.8792028188563195,
+          "max": 1.1683780781087507
+        },
+        {
+          "cfg": "global512_decode_4k",
+          "median": 0.1950660554404626,
+          "min": 0.17751605812546675,
+          "max": 0.19726422752313183
+        }
+      ]
+    },
+    {
+      "lane": "mlx",
+      "tessl_impl": "tessl-decode",
+      "geomean_tessl_over_other": 1.7407208464605082,
+      "configs_covered": 5,
+      "configs_requested": 5,
+      "worst_config": "swa256_decode_4k",
+      "worst_median": 2.0639517589773626,
+      "best_median": 1.4632074260225543,
+      "per_config": [
+        {
+          "cfg": "swa128_decode_1k",
+          "median": 1.4632074260225543,
+          "min": 1.2800260367342597,
+          "max": 1.7852619610586986
+        },
+        {
+          "cfg": "swa128_decode_4k",
+          "median": 1.8806710831040472,
+          "min": 1.7902135699486497,
+          "max": 1.948835697584242
+        },
+        {
+          "cfg": "swa128_decode_b8_4k",
+          "median": 1.6647345779777938,
+          "min": 1.5181508352616153,
+          "max": 1.893267105961561
+        },
+        {
+          "cfg": "swa256_decode_4k",
+          "median": 2.0639517589773626,
+          "min": 2.0144391875019916,
+          "max": 2.100684701054503
+        },
+        {
+          "cfg": "global512_decode_4k",
+          "median": 1.6903722934903764,
+          "min": 1.3952497917706568,
+          "max": 1.8146114230785804
+        }
+      ]
+    }
+  ]
+}

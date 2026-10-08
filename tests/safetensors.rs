@@ -93,6 +93,144 @@ fn round_trips_f32_bf16_f16_scalars_empty_tensors_and_metadata() {
     std::fs::remove_file(&p).unwrap();
 }
 
+/// One file holding every integer dtype; returns its path and each tensor's
+/// little-endian bytes, keyed by name.
+fn integer_fixture() -> (PathBuf, Vec<(&'static str, Dtype, Vec<usize>, Vec<u8>)>) {
+    let le = |vs: &[u64], w: usize| {
+        vs.iter()
+            .flat_map(|v| v.to_le_bytes()[..w].to_vec())
+            .collect::<Vec<u8>>()
+    };
+    let tensors = vec![
+        ("bool", Dtype::Bool, vec![3], vec![1, 0, 1]),
+        ("u8", Dtype::U8, vec![2, 2], vec![0, 1, 0x7f, 0xff]),
+        ("i8", Dtype::I8, vec![3], vec![0x80, 0xff, 0x7f]), // -128, -1, 127
+        ("i16", Dtype::I16, vec![2], le(&[0x8000, 0x1234], 2)),
+        ("u16", Dtype::U16, vec![1], le(&[0xbeef], 2)),
+        ("i32", Dtype::I32, vec![1], le(&[0xffff_fffe], 4)), // -2
+        // Eight 4-bit codes per word, as MLX packs Q4 weights.
+        (
+            "u32",
+            Dtype::U32,
+            vec![2, 2],
+            le(&[0x7654_3210, 0xfedc_ba98, 0, u32::MAX as u64], 4),
+        ),
+        ("i64", Dtype::I64, vec![1], le(&[i64::MIN as u64], 8)),
+        ("u64", Dtype::U64, vec![2], le(&[u64::MAX, 0x0102_0304_0506_0708], 8)),
+    ];
+    let (mut header, mut data) = (String::from("{"), Vec::new());
+    for (name, dtype, shape, bytes) in &tensors {
+        // The format's tag is the variant's name in capitals for every
+        // integer type ("BOOL", "U8", ..).
+        let tag = format!("{dtype:?}").to_uppercase();
+        let dims = shape.iter().map(usize::to_string).collect::<Vec<_>>().join(",");
+        let (b, e) = (data.len(), data.len() + bytes.len());
+        header.push_str(&format!(
+            r#""{name}":{{"dtype":"{tag}","shape":[{dims}],"data_offsets":[{b},{e}]}},"#
+        ));
+        data.extend_from_slice(bytes);
+    }
+    header.pop();
+    header.push('}');
+    (file("ints", &header, &data), tensors)
+}
+
+#[test]
+fn integer_tensors_read_back_typed_and_raw() {
+    let (p, tensors) = integer_fixture();
+    let st = SafeTensors::open(&p).unwrap();
+    std::fs::remove_file(&p).unwrap();
+    for (name, dtype, shape, bytes) in &tensors {
+        let (info, raw) = st.read_raw(name).unwrap();
+        assert_eq!((info.dtype, &info.shape, &raw), (*dtype, shape, bytes), "{name}");
+    }
+    assert_eq!(st.read_u8("u8").unwrap(), (vec![2, 2], vec![0, 1, 0x7f, 0xff]));
+    assert_eq!(st.read_i8("i8").unwrap(), (vec![3], vec![-128, -1, 127]));
+    assert_eq!(
+        st.read_u32("u32").unwrap(),
+        (vec![2, 2], vec![0x7654_3210, 0xfedc_ba98, 0, u32::MAX])
+    );
+    // A typed read never reinterprets another dtype's bytes.
+    assert!(st.read_u8("i8").unwrap_err().contains("expected U8, found I8"));
+    assert!(st.read_i8("u8").unwrap_err().contains("expected I8, found U8"));
+    assert!(st.read_u32("i32").unwrap_err().contains("expected U32, found I32"));
+    assert!(st.read_f32("u32").unwrap_err().contains("cannot read U32"));
+    assert!(st.read_raw("missing").unwrap_err().contains("no tensor"));
+}
+
+#[test]
+fn fp8_and_complex_tensors_open_and_read_raw() {
+    let header = concat!(
+        r#"{"e4m3":{"dtype":"F8_E4M3","shape":[2],"data_offsets":[0,2]},"#,
+        r#""e4m3fnuz":{"dtype":"F8_E4M3FNUZ","shape":[1],"data_offsets":[2,3]},"#,
+        r#""e5m2":{"dtype":"F8_E5M2","shape":[3],"data_offsets":[3,6]},"#,
+        r#""e5m2fnuz":{"dtype":"F8_E5M2FNUZ","shape":[1],"data_offsets":[6,7]},"#,
+        r#""e8m0":{"dtype":"F8_E8M0","shape":[1],"data_offsets":[7,8]},"#,
+        r#""c64":{"dtype":"C64","shape":[1],"data_offsets":[8,16]}}"#
+    );
+    let mut data = vec![0x38, 0xb8, 0x80, 0x3c, 0x7b, 0xfc, 0x01, 0x7f];
+    data.extend_from_slice(&1.0f32.to_le_bytes());
+    data.extend_from_slice(&(-2.0f32).to_le_bytes());
+    let p = file("fp8", header, &data);
+    let st = SafeTensors::open(&p).unwrap();
+    std::fs::remove_file(&p).unwrap();
+    let want: &[(&str, Dtype, &[u8])] = &[
+        ("e4m3", Dtype::F8E4M3, &data[0..2]),
+        ("e4m3fnuz", Dtype::F8E4M3Fnuz, &data[2..3]),
+        ("e5m2", Dtype::F8E5M2, &data[3..6]),
+        ("e5m2fnuz", Dtype::F8E5M2Fnuz, &data[6..7]),
+        ("e8m0", Dtype::F8E8M0, &data[7..8]),
+        ("c64", Dtype::C64, &data[8..16]),
+    ];
+    for &(name, dtype, bytes) in want {
+        let (info, raw) = st.read_raw(name).unwrap();
+        assert_eq!((info.dtype, raw.as_slice()), (dtype, bytes), "{name}");
+        assert_eq!(info.dtype.size() * info.numel() as u64, bytes.len() as u64, "{name}");
+    }
+    // Not widened by a reader that does not know the format.
+    assert!(st.read_f32("e4m3").unwrap_err().contains("cannot read F8E4M3"));
+    // The sub-byte types stay refused: their sizes are not whole bytes.
+    for tag in ["F4", "F6_E2M3", "F6_E3M2"] {
+        let h = format!(r#"{{"a":{{"dtype":"{tag}","shape":[2],"data_offsets":[0,1]}}}}"#);
+        expect_rejected(tag, &h, &[0], "unsupported dtype");
+    }
+}
+
+/// `read_f32` widens a 16-bit tensor inside its own result; a long tensor of
+/// every bit pattern checks that no widened value overwrote an unread one.
+#[test]
+fn sixteen_bit_tensors_widen_exactly_across_every_bit_pattern() {
+    let n = 1 << 16;
+    let mut data = Vec::with_capacity(4 * n);
+    for bits in 0..=u16::MAX {
+        data.extend_from_slice(&bits.to_le_bytes());
+    }
+    for bits in (0..=u16::MAX).rev() {
+        data.extend_from_slice(&bits.to_le_bytes());
+    }
+    let header = format!(
+        r#"{{"b":{{"dtype":"BF16","shape":[{n}],"data_offsets":[0,{}]}},"h":{{"dtype":"F16","shape":[256,256],"data_offsets":[{},{}]}}}}"#,
+        2 * n,
+        2 * n,
+        4 * n
+    );
+    let p = file("widen", &header, &data);
+    let st = SafeTensors::open(&p).unwrap();
+    std::fs::remove_file(&p).unwrap();
+    let (shape, b) = st.read_f32("b").unwrap();
+    assert_eq!(shape, vec![n]);
+    let (shape, h) = st.read_f32("h").unwrap();
+    assert_eq!(shape, vec![256, 256]);
+    for (i, bits) in (0..=u16::MAX).enumerate() {
+        let want = tessl::tensor::bf16_bits_to_f32(bits);
+        assert_eq!(b[i].to_bits(), want.to_bits(), "bf16 {bits:#06x}");
+        let rbits = u16::MAX - bits;
+        let want = tessl::tensor::f16_bits_to_f32(rbits);
+        assert_eq!(h[i].to_bits(), want.to_bits(), "f16 {rbits:#06x}");
+    }
+    assert_eq!(st.read_bf16_bits("b").unwrap().1, (0..=u16::MAX).collect::<Vec<_>>());
+}
+
 #[test]
 fn unicode_escapes_and_surrogate_pairs_decode() {
     // Built from parts so each escape stays an escape in the file.

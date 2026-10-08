@@ -88,6 +88,25 @@ fn values_are_the_checkpoints_under_transformers_names() {
     }
 }
 
+/// The bf16 load places every projection part and the transposed LM head
+/// from the same checkpoint values the f32 load reads (the fixture's weights
+/// are bf16, so both hold them exactly): the two forwards differ only by bf16
+/// GEMM inputs. A part placed in the wrong columns, or a head that is not the
+/// embedding's transpose, moves the logits by their own size, not by that.
+#[test]
+fn a_bf16_load_holds_the_same_weights_as_the_f32_load() {
+    let (_, f32_model, _) = load(Precision::F32);
+    let (_, bf16_model, _) = load(Precision::Bf16);
+    let ids = ids();
+    let want = f32_model.forward(&ids, false).unwrap().logits;
+    let got = bf16_model.forward(&ids, false).unwrap().logits;
+    assert_eq!(got.len(), want.len());
+    let scale = want.iter().fold(0.0f32, |m, &w| m.max(w.abs()));
+    let worst = got.iter().zip(&want).fold(0.0f32, |m, (g, w)| m.max((g - w).abs()));
+    assert!(scale > 0.0 && worst.is_finite());
+    assert!(worst / scale < 2e-2, "bf16 logits off by {worst} at scale {scale}");
+}
+
 #[test]
 fn gradients_are_transformers_autograd_under_its_names() {
     let (rt, model, _st) = load(Precision::F32);

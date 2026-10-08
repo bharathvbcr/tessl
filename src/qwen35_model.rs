@@ -441,37 +441,43 @@ impl Loader<'_> {
         self.f32_buf(&self.f32(rest, &[dim])?)
     }
 
+    /// A bf16 tensor's bit patterns, with its shape checked.
+    fn bf16(&self, rest: &str, shape: &[usize]) -> Result<Vec<u16>, String> {
+        let name = self.name(rest);
+        let (got, bits) = self.st.read_bf16_bits(&name)?;
+        if got != shape {
+            return Err(format!("{name}: shape {got:?}, expected {shape:?}"));
+        }
+        Ok(bits)
+    }
+
     /// `nn.Linear` weights `[out_i, in]` packed side by side into the right
-    /// operand `[in, sum(out_i)]` of one GEMM, in `precision`.
+    /// operand `[in, sum(out_i)]` of one GEMM, in `precision`. Each part is
+    /// placed straight into the tensor's shared storage as it is read and
+    /// dropped before the next is read, so the host holds one part at a time.
     fn linear(&self, parts: &[(&str, usize)], in_features: usize, precision: Precision) -> Result<Tensor, String> {
-        let widths: Vec<usize> = parts.iter().map(|&(_, o)| o).collect();
-        let total: usize = widths.iter().sum();
+        let total = parts
+            .iter()
+            .try_fold(0usize, |acc, &(_, o)| acc.checked_add(o))
+            .ok_or("linear: output widths overflow usize")?;
+        let mut col0 = 0;
         match precision {
             Precision::Bf16 => {
-                let mut bits = Vec::with_capacity(parts.len());
-                for &(rest, out) in parts {
-                    let name = self.name(rest);
-                    let (shape, b) = self.st.read_bf16_bits(&name)?;
-                    if shape != [out, in_features] {
-                        return Err(format!("{name}: shape {shape:?}, expected [{out}, {in_features}]"));
-                    }
-                    bits.push(b);
-                }
-                let refs: Vec<&[u16]> = bits.iter().map(Vec::as_slice).collect();
-                let packed = qwen35::pack_linear_weights_bf16(&refs, &widths, in_features)?;
                 let t = self.rt.alloc_tensor_bf16(&[in_features, total])?;
-                t.buffer.write_bf16_bits(&packed);
+                for &(rest, out) in parts {
+                    let part = self.bf16(rest, &[out, in_features])?;
+                    qwen35::place_linear_part(&mut t.buffer.try_contents_u16()?, total, col0, &part, out, in_features)?;
+                    col0 += out;
+                }
                 Ok(t)
             }
             Precision::F32 => {
-                let mut data = Vec::with_capacity(parts.len());
-                for &(rest, out) in parts {
-                    data.push(self.f32(rest, &[out, in_features])?);
-                }
-                let refs: Vec<&[f32]> = data.iter().map(Vec::as_slice).collect();
-                let packed = qwen35::pack_linear_weights_f32(&refs, &widths, in_features)?;
                 let t = self.rt.alloc_tensor_f32(&[in_features, total])?;
-                t.buffer.write_f32(&packed);
+                for &(rest, out) in parts {
+                    let part = self.f32(rest, &[out, in_features])?;
+                    qwen35::place_linear_part(&mut t.buffer.try_contents_f32()?, total, col0, &part, out, in_features)?;
+                    col0 += out;
+                }
                 Ok(t)
             }
         }
@@ -523,26 +529,28 @@ impl Qwen35Model {
         // transposed right operand of one GEMM.
         let (embed, lm_head_bf16) = match precision {
             Precision::Bf16 => {
-                let name = ld.name("embed_tokens.weight");
-                let (shape, bits) = st.read_bf16_bits(&name)?;
-                if shape != [vocab, h] {
-                    return Err(format!("{name}: shape {shape:?}, expected [{vocab}, {h}]"));
-                }
                 let t = rt.alloc_tensor_bf16(&[vocab, h])?;
-                t.buffer.write_bf16_bits(&bits);
                 let head = if with_head {
-                    let packed = qwen35::pack_linear_weights_bf16(&[&bits], &[vocab], h)?;
+                    // One host copy of the table, placed into both device
+                    // tensors and dropped; never a second, packed host copy.
+                    let bits = ld.bf16("embed_tokens.weight", &[vocab, h])?;
+                    t.buffer.write_bf16_bits(&bits);
                     let head = rt.alloc_tensor_bf16(&[h, vocab])?;
-                    head.buffer.write_bf16_bits(&packed);
+                    qwen35::place_linear_part(&mut head.buffer.try_contents_u16()?, vocab, 0, &bits, vocab, h)?;
                     Some(head)
                 } else {
+                    // No head to transpose into: read straight into the table.
+                    let name = ld.name("embed_tokens.weight");
+                    st.read_bf16_bits_into(&name, &[vocab, h], &mut t.buffer.try_contents_u16()?)?;
                     None
                 };
                 (t, head)
             }
             Precision::F32 => {
+                // Widened straight into the table: no host copy at all.
                 let t = rt.alloc_tensor_f32(&[vocab, h])?;
-                t.buffer.write_f32(&ld.f32("embed_tokens.weight", &[vocab, h])?);
+                let name = ld.name("embed_tokens.weight");
+                st.read_f32_into(&name, &[vocab, h], &mut t.buffer.try_contents_f32()?)?;
                 (t, None)
             }
         };

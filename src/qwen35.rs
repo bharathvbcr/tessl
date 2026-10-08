@@ -412,22 +412,56 @@ fn pack_linear_weights<T: Copy + Default>(
         }
     }
     let mut out = vec![T::default(); usize_product(&[in_features, total], "pack_linear_weights")?];
-    if out.is_empty() {
-        // Nothing to place; and with `in_features = 0` the row loop below
-        // would still walk every one of `total` (possibly enormous) rows.
-        return Ok(out);
-    }
     let mut col0 = 0;
     for (p, &o) in parts.iter().zip(out_features) {
-        for r in 0..o {
-            let src = &p[r * in_features..(r + 1) * in_features];
-            for (k, &v) in src.iter().enumerate() {
-                out[k * total + col0 + r] = v;
-            }
-        }
+        place_linear_part(&mut out, total, col0, p, o, in_features)?;
         col0 += o;
     }
     Ok(out)
+}
+
+/// Place one `nn.Linear` weight `part` (`[out, in_features]` row-major) into
+/// columns `[col0, col0 + out)` of `dst`, a packed `[in_features, total]`
+/// operand as [`pack_linear_weights_f32`] lays it out. A loader that places
+/// each part as it reads it holds one part at a time, not all of them.
+pub(crate) fn place_linear_part<T: Copy>(
+    dst: &mut [T],
+    total: usize,
+    col0: usize,
+    part: &[T],
+    out: usize,
+    in_features: usize,
+) -> Result<(), String> {
+    let what = "place_linear_part";
+    if part.len() != usize_product(&[out, in_features], what)? {
+        return Err(format!(
+            "{what}: part has {} elements, expected {out} x {in_features}",
+            part.len()
+        ));
+    }
+    if col0.checked_add(out).is_none_or(|end| end > total) {
+        return Err(format!(
+            "{what}: columns {col0} + {out} run past the packed width {total}"
+        ));
+    }
+    if dst.len() != usize_product(&[in_features, total], what)? {
+        return Err(format!(
+            "{what}: {} packed elements, expected {in_features} x {total}",
+            dst.len()
+        ));
+    }
+    if dst.is_empty() {
+        // Nothing to place; and with `in_features = 0` the row loop below
+        // would still walk every one of `out` (possibly enormous) rows.
+        return Ok(());
+    }
+    for r in 0..out {
+        let src = &part[r * in_features..(r + 1) * in_features];
+        for (k, &v) in src.iter().enumerate() {
+            dst[k * total + col0 + r] = v;
+        }
+    }
+    Ok(())
 }
 
 /// `proj = x @ packed`: every projection of a layer in one GEMM. `x` is

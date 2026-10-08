@@ -6,7 +6,29 @@ All notable changes to `tessl` are recorded here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- **`tessl::safetensors` reads integer and fp8 tensors.** `read_raw` returns
+  any tensor's header entry and its stored bytes. `read_u8`, `read_i8` and
+  `read_u32` return typed int8 and MLX-packed Q4 weights. `Dtype` gains
+  `F8E4M3`, `F8E4M3Fnuz`, `F8E5M2`, `F8E5M2Fnuz`, `F8E8M0` and `C64`
+  (`F8_E4M3`, `F8_E4M3FNUZ`, `F8_E5M2`, `F8_E5M2FNUZ`, `F8_E8M0`, `C64` on
+  disk), so files holding them now open. The sub-byte `F4` and `F6_*` types
+  are still refused. Adding variants to the exhaustive `Dtype` enum breaks an
+  external `match` on it.
+
 ### Changed
+
+- **Checkpoint reads fill their destination directly.** `read_bf16_bits` and
+  `read_f32` no longer stage the raw bytes and then copy them. A 16-bit tensor
+  read as f32 is widened in place inside its own result. `npy` and
+  `safetensors` share the one unsafe byte view that does this (`src/plain.rs`).
+- **`Qwen35Model::load` streams its weights.** Each projection part is placed
+  into its packed tensor as it is read, and the embedding is read straight
+  into its device tensor where no transposed head needs a host copy. At 2B the
+  peak memory footprint falls from 6.95 to 5.86 GB (bf16), from 5.93 to
+  3.83 GB (bf16 `load_tower`) and from 10.79 to 7.63 GB (f32). See
+  `bench/results/qwen35_load_rss_m5pro.txt`.
 
 - **README Known Gaps no longer claims "no stubs".** `IcbReplayStub`,
   `IcbStubPhase` and `CbReplayError::NotWired` (`tessl::cb_replay`) are public

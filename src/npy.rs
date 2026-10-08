@@ -17,6 +17,8 @@ use std::fs::File;
 use std::io::{Read, Write};
 use std::path::Path;
 
+use crate::plain::{self, PlainScalar};
+
 #[derive(Debug, Clone)]
 pub struct NpyArray {
     pub shape: Vec<usize>,
@@ -25,31 +27,13 @@ pub struct NpyArray {
     pub data_f64: Option<Vec<f64>>,
 }
 
-/// Scalar types for which every bit pattern is a valid value, so filling one
-/// from raw file bytes cannot produce an invalid inhabitant.
-///
-/// # Safety
-///
-/// Implementors must have no invalid bit patterns. `bool` and `char` must never
-/// implement this; the integer and IEEE-754 float types may.
-unsafe trait PlainScalar: Copy {}
-unsafe impl PlainScalar for f32 {}
-unsafe impl PlainScalar for f64 {}
-unsafe impl PlainScalar for i64 {}
-
-/// Fills `dst` from the reader with the payload as it sits on disk.
-///
-/// Only compiled on little-endian, where the on-disk layout already matches
-/// memory; big-endian hosts convert element by element at the call site.
-#[cfg(target_endian = "little")]
+/// Fills `dst` from the reader with the little-endian payload as it sits on
+/// disk, straight into `dst`'s storage.
 fn read_le_payload<T: PlainScalar>(f: &mut File, dst: &mut [T], what: &str) -> Result<(), String> {
-    // SAFETY: reinterprets an owned, freshly allocated `Vec`'s storage as the
-    // byte slice `read_exact` fills. The pointer is valid and uniquely owned for
-    // the whole call, the length is `size_of_val` of that same allocation so it
-    // cannot overrun, and `PlainScalar` guarantees every bit pattern is a valid
-    // `T` — the file may hold nonsense numbers but never an invalid value.
-    let bytes = unsafe { std::slice::from_raw_parts_mut(dst.as_mut_ptr().cast::<u8>(), std::mem::size_of_val(dst)) };
-    f.read_exact(bytes).map_err(|e| format!("{what} payload: {e}"))
+    f.read_exact(plain::bytes_mut(dst))
+        .map_err(|e| format!("{what} payload: {e}"))?;
+    plain::le_to_native(dst);
+    Ok(())
 }
 
 impl NpyArray {
@@ -145,14 +129,7 @@ pub fn read_npy(path: &Path) -> Result<NpyArray, String> {
     match descr.as_str() {
         "<f4" | "|f4" => {
             let mut data = vec![0.0f32; numel];
-            #[cfg(target_endian = "little")]
             read_le_payload(&mut f, &mut data, "f32")?;
-            #[cfg(target_endian = "big")]
-            for value in &mut data {
-                let mut bytes = [0u8; 4];
-                f.read_exact(&mut bytes).map_err(|e| format!("f32 payload: {e}"))?;
-                *value = f32::from_le_bytes(bytes);
-            }
             Ok(NpyArray {
                 shape,
                 data_f32: Some(data),
@@ -162,14 +139,7 @@ pub fn read_npy(path: &Path) -> Result<NpyArray, String> {
         }
         "<f8" | "|f8" => {
             let mut data = vec![0.0f64; numel];
-            #[cfg(target_endian = "little")]
             read_le_payload(&mut f, &mut data, "f64")?;
-            #[cfg(target_endian = "big")]
-            for value in &mut data {
-                let mut bytes = [0u8; 8];
-                f.read_exact(&mut bytes).map_err(|e| format!("f64 payload: {e}"))?;
-                *value = f64::from_le_bytes(bytes);
-            }
             Ok(NpyArray {
                 shape,
                 data_f32: None,
@@ -179,14 +149,7 @@ pub fn read_npy(path: &Path) -> Result<NpyArray, String> {
         }
         "<i8" | "|i8" => {
             let mut data = vec![0i64; numel];
-            #[cfg(target_endian = "little")]
             read_le_payload(&mut f, &mut data, "i64")?;
-            #[cfg(target_endian = "big")]
-            for value in &mut data {
-                let mut bytes = [0u8; 8];
-                f.read_exact(&mut bytes).map_err(|e| format!("i64 payload: {e}"))?;
-                *value = i64::from_le_bytes(bytes);
-            }
             Ok(NpyArray {
                 shape,
                 data_f32: None,

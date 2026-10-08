@@ -33,19 +33,34 @@ use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 
 use crate::json::{self, Json, Syntax};
+use crate::plain::{self, PlainScalar};
 
 /// Largest header accepted. The format's reference implementation caps it at
 /// 100 MB; a 2B checkpoint's header is about 90 KB.
 pub const MAX_HEADER_BYTES: u64 = 100_000_000;
 
-/// Element types the format defines. Only [`Dtype::F32`], [`Dtype::F16`] and
-/// [`Dtype::BF16`] can be read back as numbers here; the rest are parsed so a
-/// file holding them still opens and their byte ranges are still checked.
+/// Element types the format defines in whole bytes. [`Dtype::F32`],
+/// [`Dtype::F16`] and [`Dtype::BF16`] read back as f32
+/// ([`SafeTensors::read_f32`]); [`Dtype::U8`], [`Dtype::I8`] and
+/// [`Dtype::U32`] (int8 and MLX-packed Q4 weights) as integers; every dtype,
+/// fp8 included, as its raw bytes ([`SafeTensors::read_raw`]). The format's
+/// sub-byte types (`F4`, `F6_E2M3`, `F6_E3M2`) are refused: their sizes are
+/// not whole bytes, so the byte-range check below cannot be stated for them.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Dtype {
     Bool,
     U8,
     I8,
+    /// `F8_E4M3`: fp8, 4 exponent bits, 3 mantissa bits (`float8_e4m3fn`).
+    F8E4M3,
+    /// `F8_E4M3FNUZ`: as [`Dtype::F8E4M3`] with no negative zero.
+    F8E4M3Fnuz,
+    /// `F8_E5M2`: fp8, 5 exponent bits, 2 mantissa bits.
+    F8E5M2,
+    /// `F8_E5M2FNUZ`: as [`Dtype::F8E5M2`] with no negative zero.
+    F8E5M2Fnuz,
+    /// `F8_E8M0`: an 8-bit power-of-two scale (the MX formats' block scale).
+    F8E8M0,
     I16,
     U16,
     F16,
@@ -56,6 +71,8 @@ pub enum Dtype {
     F64,
     I64,
     U64,
+    /// Complex64: two f32s.
+    C64,
 }
 
 impl Dtype {
@@ -64,6 +81,11 @@ impl Dtype {
             "BOOL" => Dtype::Bool,
             "U8" => Dtype::U8,
             "I8" => Dtype::I8,
+            "F8_E4M3" => Dtype::F8E4M3,
+            "F8_E4M3FNUZ" => Dtype::F8E4M3Fnuz,
+            "F8_E5M2" => Dtype::F8E5M2,
+            "F8_E5M2FNUZ" => Dtype::F8E5M2Fnuz,
+            "F8_E8M0" => Dtype::F8E8M0,
             "I16" => Dtype::I16,
             "U16" => Dtype::U16,
             "F16" => Dtype::F16,
@@ -74,6 +96,7 @@ impl Dtype {
             "F64" => Dtype::F64,
             "I64" => Dtype::I64,
             "U64" => Dtype::U64,
+            "C64" => Dtype::C64,
             other => return Err(format!("unsupported dtype {other:?}")),
         })
     }
@@ -81,10 +104,17 @@ impl Dtype {
     /// Bytes per element.
     pub fn size(self) -> u64 {
         match self {
-            Dtype::Bool | Dtype::U8 | Dtype::I8 => 1,
+            Dtype::Bool
+            | Dtype::U8
+            | Dtype::I8
+            | Dtype::F8E4M3
+            | Dtype::F8E4M3Fnuz
+            | Dtype::F8E5M2
+            | Dtype::F8E5M2Fnuz
+            | Dtype::F8E8M0 => 1,
             Dtype::I16 | Dtype::U16 | Dtype::F16 | Dtype::BF16 => 2,
             Dtype::I32 | Dtype::U32 | Dtype::F32 => 4,
-            Dtype::F64 | Dtype::I64 | Dtype::U64 => 8,
+            Dtype::F64 | Dtype::I64 | Dtype::U64 | Dtype::C64 => 8,
         }
     }
 }
@@ -165,55 +195,126 @@ impl SafeTensors {
             .ok_or_else(|| format!("{}: no tensor {name:?}", self.path.display()))
     }
 
-    fn read_bytes(&self, name: &str, info: &TensorInfo) -> Result<Vec<u8>, String> {
-        let len =
-            usize::try_from(info.end - info.begin).map_err(|_| format!("{name}: tensor too large for this host"))?;
-        let mut bytes = vec![0u8; len];
+    /// Fill `dst` with `info`'s bytes from one positioned read into `dst`'s
+    /// own storage: no staging copy, whatever the tensor's size.
+    fn read_into<T: PlainScalar>(&self, name: &str, info: &TensorInfo, dst: &mut [T]) -> Result<(), String> {
+        let bytes = plain::bytes_mut(dst);
+        if bytes.len() as u64 != info.end - info.begin {
+            return Err(format!(
+                "{name}: {} destination bytes for a {}-byte tensor",
+                bytes.len(),
+                info.end - info.begin
+            ));
+        }
         // From the handle `open` validated, never the path again: a file
         // replaced at that path since would be read with this header's
         // offsets. A truncation of this same file fails here, not as short data.
         self.file
-            .read_exact_at(&mut bytes, self.data_start + info.begin)
+            .read_exact_at(bytes, self.data_start + info.begin)
             .map_err(|e| format!("{name}: data: {e}"))?;
-        Ok(bytes)
+        plain::le_to_native(dst);
+        Ok(())
+    }
+
+    /// `name`'s elements as `T`, refusing any dtype but `want`.
+    fn read_typed<T: PlainScalar + Default>(&self, name: &str, want: Dtype) -> Result<(Vec<usize>, Vec<T>), String> {
+        let info = self.info(name)?;
+        if info.dtype != want {
+            return Err(format!("{name}: expected {want:?}, found {:?}", info.dtype));
+        }
+        let mut data = vec![T::default(); info.numel()];
+        self.read_into(name, info, &mut data)?;
+        Ok((info.shape.clone(), data))
+    }
+
+    /// A tensor's header entry and its bytes exactly as stored (little-endian
+    /// elements), whatever its dtype: the way to read fp8, or any type this
+    /// module has no typed reader for.
+    pub fn read_raw(&self, name: &str) -> Result<(TensorInfo, Vec<u8>), String> {
+        let info = self.info(name)?;
+        let len =
+            usize::try_from(info.end - info.begin).map_err(|_| format!("{name}: tensor too large for this host"))?;
+        let mut bytes = vec![0u8; len];
+        self.read_into(name, info, &mut bytes)?;
+        Ok((info.clone(), bytes))
+    }
+
+    /// A U8 tensor and its shape. Any other dtype is an error.
+    pub fn read_u8(&self, name: &str) -> Result<(Vec<usize>, Vec<u8>), String> {
+        self.read_typed(name, Dtype::U8)
+    }
+
+    /// An I8 tensor (int8 weights) and its shape. Any other dtype is an error.
+    pub fn read_i8(&self, name: &str) -> Result<(Vec<usize>, Vec<i8>), String> {
+        self.read_typed(name, Dtype::I8)
+    }
+
+    /// A U32 tensor (MLX packs eight 4-bit weights per element) and its shape.
+    /// Any other dtype is an error.
+    pub fn read_u32(&self, name: &str) -> Result<(Vec<usize>, Vec<u32>), String> {
+        self.read_typed(name, Dtype::U32)
     }
 
     /// A bf16 tensor's raw bit patterns and shape. Any other dtype is an error:
     /// narrowing is the caller's decision, not the loader's.
     pub fn read_bf16_bits(&self, name: &str) -> Result<(Vec<usize>, Vec<u16>), String> {
+        self.read_typed(name, Dtype::BF16)
+    }
+
+    /// [`Self::read_bf16_bits`] into `dst` (a device tensor's shared storage,
+    /// say) instead of a new `Vec`, after checking the dtype and `shape`.
+    pub(crate) fn read_bf16_bits_into(&self, name: &str, shape: &[usize], dst: &mut [u16]) -> Result<(), String> {
         let info = self.info(name)?;
         if info.dtype != Dtype::BF16 {
             return Err(format!("{name}: expected BF16, found {:?}", info.dtype));
         }
-        let bytes = self.read_bytes(name, info)?;
-        let bits = bytes
-            .chunks_exact(2)
-            .map(|c| u16::from_le_bytes([c[0], c[1]]))
-            .collect();
-        Ok((info.shape.clone(), bits))
+        if info.shape != shape {
+            return Err(format!("{name}: shape {:?}, expected {shape:?}", info.shape));
+        }
+        self.read_into(name, info, dst)
     }
 
     /// A floating tensor widened exactly to f32 (F32, BF16 or F16; every value
     /// of the narrower types is representable in f32).
+    ///
+    /// The result is the only allocation: a 16-bit tensor is read into the
+    /// upper half of its own f32 storage and widened in place, front to back.
+    /// Element `i` widens into bytes `[4i, 4i + 4)` while the unread elements
+    /// `j > i` sit at `[2n + 2j, ..)`, at or past `2n + 2i + 2 >= 4i + 4` for
+    /// every `i < n`, so no write lands on a value not yet read.
     pub fn read_f32(&self, name: &str) -> Result<(Vec<usize>, Vec<f32>), String> {
         let info = self.info(name)?;
-        let bytes = self.read_bytes(name, info)?;
-        let data = match info.dtype {
-            Dtype::F32 => bytes
-                .chunks_exact(4)
-                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-                .collect(),
-            Dtype::BF16 => bytes
-                .chunks_exact(2)
-                .map(|c| crate::tensor::bf16_bits_to_f32(u16::from_le_bytes([c[0], c[1]])))
-                .collect(),
-            Dtype::F16 => bytes
-                .chunks_exact(2)
-                .map(|c| crate::tensor::f16_bits_to_f32(u16::from_le_bytes([c[0], c[1]])))
-                .collect(),
+        let mut data = vec![0f32; info.numel()];
+        self.read_f32_into(name, &info.shape, &mut data)?;
+        Ok((info.shape.clone(), data))
+    }
+
+    /// [`Self::read_f32`] into `dst` (a device tensor's shared storage, say)
+    /// instead of a new `Vec`, after checking the dtype and `shape`; a 16-bit
+    /// tensor is widened in place inside `dst` as described there.
+    pub(crate) fn read_f32_into(&self, name: &str, shape: &[usize], dst: &mut [f32]) -> Result<(), String> {
+        let info = self.info(name)?;
+        let widen: Option<fn(u16) -> f32> = match info.dtype {
+            Dtype::F32 => None,
+            Dtype::BF16 => Some(crate::tensor::bf16_bits_to_f32),
+            Dtype::F16 => Some(crate::tensor::f16_bits_to_f32),
             other => return Err(format!("{name}: cannot read {other:?} as f32")),
         };
-        Ok((info.shape.clone(), data))
+        if info.shape != shape {
+            return Err(format!("{name}: shape {:?}, expected {shape:?}", info.shape));
+        }
+        let Some(widen) = widen else {
+            return self.read_into(name, info, dst);
+        };
+        let n = dst.len();
+        let bytes = plain::bytes_mut(dst);
+        let (_, upper) = bytes.split_at_mut(2 * n);
+        self.read_into(name, info, upper)?;
+        for i in 0..n {
+            let bits = u16::from_le_bytes([bytes[2 * n + 2 * i], bytes[2 * n + 2 * i + 1]]);
+            bytes[4 * i..4 * i + 4].copy_from_slice(&widen(bits).to_ne_bytes());
+        }
+        Ok(())
     }
 }
 

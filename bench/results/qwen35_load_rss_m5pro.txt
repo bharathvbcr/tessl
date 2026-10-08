@@ -1,0 +1,54 @@
+# Qwen3.5-2B load, peak host memory before and after streaming the loader — M5 Pro, 2026-10-08
+#
+# `QWEN35_2B_SAFETENSORS=... /usr/bin/time -l target/release/probe_load_memory --bf16|--bf16 --tower|--f32`
+# "before" is the same probe built against 4e5faac (the loader as it was:
+# raw bytes plus a typed copy per tensor, every projection part held while a
+# third, packed copy was built, the embedding read as a Vec before it reached
+# the device). Three rounds, OLD/NEW order swapped each round, one load per
+# process. The column is `peak memory footprint`; `maximum resident set size`
+# is not used because macOS reclaims and compresses pages under pressure: one
+# OLD --f32 run read 8.07 GB maxrss against a 10.79 GB footprint.
+#
+# The device bytes (MTLDevice::currentAllocatedSize after the load) are the
+# same either way and are resident in the footprint, so the floor is the
+# device column. The 4B was not measured: its snapshot in the HF cache holds
+# only model.safetensors.index.json and no shards (sharded loading is
+# ft-b7376d2).
+#
+#                  device     before (min / max)   after (min / max)   change
+# bf16             4.78 GB    6.95 / 6.96 GB       5.86 / 5.86 GB      -1.09 GB
+# bf16 --tower     3.77 GB    5.93 / 5.95 GB       3.83 / 3.83 GB      -2.10 GB
+# f32              7.53 GB   10.79 / 10.79 GB      7.63 / 7.63 GB      -3.16 GB
+#
+# What is left above the device bytes: bf16 with the LM head keeps one host
+# copy of the [vocab, hidden] embedding (1.02 GB at 2B) while it is written to
+# the table and transposed into the head, because the runtime grants one host
+# mapping at a time. The tower and f32 paths read the embedding straight into
+# the device tensor, and every projection part is placed into its packed
+# tensor as it is read and dropped before the next one.
+#
+# Wall time (same runs, includes runtime start-up; not a benchmark): bf16
+# 6.4-9.7 s before, 6.4-6.8 s after; tower 5.4-5.5 s before, 5.1-5.2 s after;
+# f32 7.5-7.6 s before, 7.9-8.1 s after. The f32 load is ~0.4 s slower: the
+# bf16 embedding is widened to f32 in place with a byte-indexed loop instead
+# of an iterator into a separate Vec.
+#
+# ---- raw, round / build / flags ----
+r1 OLD --bf16 | device +4.78 GB | maxrss 6.35 GB | footprint 6.96 GB | wall 9.71 real
+r1 NEW --bf16 | device +4.78 GB | maxrss 5.85 GB | footprint 5.86 GB | wall 6.82 real
+r1 OLD --bf16 --tower | device +3.77 GB | maxrss 5.92 GB | footprint 5.93 GB | wall 5.48 real
+r1 NEW --bf16 --tower | device +3.77 GB | maxrss 3.82 GB | footprint 3.83 GB | wall 5.23 real
+r1 OLD --f32 | device +7.53 GB | maxrss 10.78 GB | footprint 10.79 GB | wall 7.64 real
+r1 NEW --f32 | device +7.53 GB | maxrss 7.61 GB | footprint 7.63 GB | wall 7.92 real
+r2 NEW --bf16 | device +4.78 GB | maxrss 5.85 GB | footprint 5.86 GB | wall 6.48 real
+r2 OLD --bf16 | device +4.78 GB | maxrss 6.94 GB | footprint 6.95 GB | wall 6.76 real
+r2 NEW --bf16 --tower | device +3.77 GB | maxrss 3.82 GB | footprint 3.83 GB | wall 5.09 real
+r2 OLD --bf16 --tower | device +3.77 GB | maxrss 5.92 GB | footprint 5.93 GB | wall 5.44 real
+r2 NEW --f32 | device +7.53 GB | maxrss 7.61 GB | footprint 7.63 GB | wall 8.08 real
+r2 OLD --f32 | device +7.53 GB | maxrss 10.77 GB | footprint 10.79 GB | wall 7.52 real
+r3 OLD --bf16 | device +4.78 GB | maxrss 6.94 GB | footprint 6.95 GB | wall 6.65 real
+r3 NEW --bf16 | device +4.78 GB | maxrss 5.85 GB | footprint 5.86 GB | wall 6.39 real
+r3 OLD --bf16 --tower | device +3.77 GB | maxrss 5.92 GB | footprint 5.93 GB | wall 5.38 real
+r3 NEW --bf16 --tower | device +3.77 GB | maxrss 3.82 GB | footprint 3.83 GB | wall 5.16 real
+r3 OLD --f32 | device +7.53 GB | maxrss 10.78 GB | footprint 10.79 GB | wall 7.48 real
+r3 NEW --f32 | device +7.53 GB | maxrss 7.61 GB | footprint 7.63 GB | wall 7.92 real

@@ -560,6 +560,16 @@ QWEN35_2B_SAFETENSORS=.../model.safetensors-00001-of-00001.safetensors \
   cargo test --release --test qwen35_model -- --ignored --test-threads=1
 ```
 
+Loading holds little beyond the device weights. Each projection part is
+placed into its packed GEMM operand as it is read and then dropped, and the
+embedding goes straight into its device tensor, except for the one host copy
+that the bf16 transposed LM head needs. At 2B the peak memory footprint is
+5.86 GB for bf16 (4.78 GB on the device), 3.83 GB for a bf16 `load_tower`
+(3.77 GB) and 7.63 GB for f32 (7.53 GB). Before this change the same loads
+peaked at 6.95, 5.93 and 10.79 GB.
+`src/bin/probe_load_memory.rs` measures this, and
+`bench/results/qwen35_load_rss_m5pro.txt` holds the runs.
+
 ## Training memory: where torch's backward spends it
 
 `tools/qwen35_ref/saved_memory.py` attributes every tensor autograd saves

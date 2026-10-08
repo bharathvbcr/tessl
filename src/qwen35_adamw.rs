@@ -3,28 +3,51 @@
 //! A training loop that runs [`Qwen35Model::train_step`] and this keeps one
 //! copy of each parameter and gradient: torch's optimizer would need its own
 //! copy of both (16 GB more on the 2B, which does not fit beside tessl's on a
-//! 64 GB Mac). [`AdamW`] holds the two moments as mirrors of the parameters'
-//! own tensors (packed projections, `[vocab, hidden]` embedding, the norms'
-//! buffers), so one window addresses a parameter, its gradient and both
-//! moments.
+//! 64 GB Mac). [`AdamW`] holds its state per [`Qwen35Model::parameter_table`]
+//! entry, dense in the order [`Qwen35Model::read_parameters`] writes that
+//! entry, so a moment reads out as a plain copy.
 //!
 //! The update is `torch.optim.AdamW`'s single-tensor path with `amsgrad` and
 //! `maximize` off: the step count increments first, the bias corrections and
 //! step size are formed in f64 (`lr / (1 - beta1^t)`, `(1 - beta2^t)^0.5`) and
-//! passed as f32, and the kernel (`kernels/qwen35_adamw.metal`) applies
+//! passed as f32, and the kernel (`kernels/qwen35_adamw_math.h`) applies
 //! decoupled weight decay, then the moments (the first through torch's
 //! `lerp`), then `p += -step_size * m / (sqrt(v) / sqrt(bc2) + eps)`. Weight
 //! decay is per parameter-table entry, so parameter groups map onto it. Every
 //! parameter is updated as stored, which is transformers' value (the
 //! zero-centred norms' `w` included).
+//!
+//! # Stored precision ([`AdamWConfig`])
+//!
+//! The arithmetic is f32 whatever is stored; what a configuration chooses is
+//! what each value is rounded to between steps, and so the memory it holds.
+//!
+//! - [`UpdateRule`]: how a bf16-stored parameter (a [`Precision::Bf16`]
+//!   model's matrices) takes its update. An update far below a bf16 ulp
+//!   rounds away to nothing if the weight is simply rounded to nearest, so
+//!   the rules are an f32 master copy ([`UpdateRule::F32Master`], 4 bytes per
+//!   weight more), a bf16 Kahan compensation ([`UpdateRule::Bf16Kahan`], 2
+//!   bytes), or stochastic rounding ([`UpdateRule::Bf16Stochastic`],
+//!   nothing). Parameters stored in f32 (an f32 model's, and a bf16 model's
+//!   norms, conv, `A_log` and `dt_bias`) are updated in f32 under any rule.
+//! - [`MomentStorage`]: both moments in f32 (8 bytes per weight), bf16 (4),
+//!   or 8-bit codes in blocks of [`MOMENT_BLOCK`] with one f32 scale each
+//!   (about 2.03): `kernels/qwen35_train_storage.metal` documents the codes.
+//!
+//! [`AdamW::config`] and [`AdamW::describe`] record the choice with the
+//! state, and the auxiliary state (master or compensation) reads and writes
+//! with [`Qwen35Model::read_adamw_aux`] / [`Qwen35Model::write_adamw_aux`], so
+//! a checkpoint restores the run bit for bit.
+
+use std::fmt;
+use std::sync::Arc;
 
 use crate::dispatch::{dispatch_2d, dispatch_2d_tg, set_gpu_buf_offset, set_u32};
-use crate::qwen35_model::Qwen35Model;
-use crate::qwen35_params::{slots, Src};
+use crate::qwen35_model::{Precision, Qwen35Model};
+use crate::qwen35_params::{check, slots, window_copy, Window};
 use crate::qwen35_train::Qwen35Grads;
 use crate::runtime::GpuRuntime;
 use crate::tensor::{DType, GpuBuffer, Tensor};
-use std::sync::Arc;
 
 /// AdamW's hyperparameters other than weight decay, as torch names them,
 /// and the step's gradient scale.
@@ -55,23 +78,262 @@ impl Default for AdamWHyper {
     }
 }
 
-/// The optimizer's state: both moments, zero until the first step, and the
-/// step count.
+/// How a parameter takes its update (see the module docs).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UpdateRule {
+    /// An f32 model: every parameter updated in f32, torch's bits.
+    F32,
+    /// A bf16 model: an f32 master of each bf16 weight is updated, and the
+    /// weight is the master rounded to nearest.
+    F32Master,
+    /// A bf16 model: each bf16 weight keeps a bf16 compensation of what its
+    /// rounding dropped, added back into the next update.
+    Bf16Kahan,
+    /// A bf16 model: each new weight is rounded up or down with probability
+    /// equal to the distance, from bits hashed from `seed`, the step count,
+    /// the parameter-table index and the element, so a run is reproducible.
+    Bf16Stochastic { seed: u64 },
+}
+
+/// What both moments are stored as (see the module docs).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MomentStorage {
+    F32,
+    Bf16,
+    /// 8-bit codes, one f32 scale per [`MOMENT_BLOCK`] elements.
+    Block8,
+}
+
+/// Elements per 8-bit moment block (one threadgroup of the step kernel).
+pub const MOMENT_BLOCK: usize = 256;
+
+/// An [`AdamW`]'s stored precision.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AdamWConfig {
+    pub update: UpdateRule,
+    pub moments: MomentStorage,
+}
+
+impl AdamWConfig {
+    /// torch's AdamW in f32: what [`AdamW::new`] makes.
+    pub const F32: Self = Self {
+        update: UpdateRule::F32,
+        moments: MomentStorage::F32,
+    };
+
+    fn rule_name(self) -> &'static str {
+        match self.update {
+            UpdateRule::F32 => "f32",
+            UpdateRule::F32Master => "f32-master",
+            UpdateRule::Bf16Kahan => "bf16-kahan",
+            UpdateRule::Bf16Stochastic { .. } => "bf16-stochastic",
+        }
+    }
+
+    fn moments_name(self) -> &'static str {
+        match self.moments {
+            MomentStorage::F32 => "f32",
+            MomentStorage::Bf16 => "bf16",
+            MomentStorage::Block8 => "block8",
+        }
+    }
+}
+
+impl fmt::Display for AdamWConfig {
+    /// `update=bf16-kahan moments=block8/256`, with the seed of a stochastic
+    /// rule.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "update={}", self.rule_name())?;
+        if let UpdateRule::Bf16Stochastic { seed } = self.update {
+            write!(f, "(seed={seed})")?;
+        }
+        write!(f, " moments={}", self.moments_name())?;
+        if self.moments == MomentStorage::Block8 {
+            write!(f, "/{MOMENT_BLOCK}")?;
+        }
+        Ok(())
+    }
+}
+
+/// One parameter-table entry's state, dense in its read order.
+struct SlotState {
+    n: usize,
+    m: GpuBuffer,
+    v: GpuBuffer,
+    /// Block8: the first and second moments' per-block scales.
+    scales: Option<(GpuBuffer, GpuBuffer)>,
+    /// A bf16 parameter's f32 master (F32Master) or bf16 compensation
+    /// (Bf16Kahan).
+    aux: Option<GpuBuffer>,
+}
+
+/// The optimizer's state: both moments, zero until the first step, any
+/// auxiliary state, the step count, and the configuration it was made with.
 pub struct AdamW {
-    m: Qwen35Grads,
-    v: Qwen35Grads,
+    config: AdamWConfig,
+    /// The precision of the model it was made for.
+    precision: Precision,
+    slots: Vec<SlotState>,
     step: u64,
+    /// Bound to the kernel's unused buffer slots.
+    dummy: GpuBuffer,
+}
+
+/// One parameter-table entry's state buffers, in bytes, for `n` elements
+/// stored as `dtype` under `config`: each moment, each moment's block
+/// scales (0: none), the auxiliary state (0: none).
+fn slot_bytes(n: usize, dtype: DType, config: AdamWConfig) -> (usize, usize, usize) {
+    let moment = n * match config.moments {
+        MomentStorage::F32 => 4,
+        MomentStorage::Bf16 => 2,
+        MomentStorage::Block8 => 1,
+    };
+    let scales = if config.moments == MomentStorage::Block8 {
+        n.div_ceil(MOMENT_BLOCK) * 4
+    } else {
+        0
+    };
+    let aux = match (dtype, config.update) {
+        (DType::BF16, UpdateRule::F32Master) => n * 4,
+        (DType::BF16, UpdateRule::Bf16Kahan) => n * 2,
+        _ => 0,
+    };
+    (moment, scales, aux)
+}
+
+fn zeroed(rt: &GpuRuntime, nbytes: usize) -> Result<GpuBuffer, String> {
+    // Hot: optimizer state stays resident.
+    let b = rt.alloc_buffer_hot(nbytes.max(4))?;
+    b.zero();
+    Ok(b)
 }
 
 impl AdamW {
-    /// Zeroed moments for `model` (twice its parameters' memory).
+    /// torch's AdamW in f32 ([`AdamWConfig::F32`]) for an f32 `model`:
+    /// zeroed moments, twice its parameters' memory. A bf16 model chooses
+    /// its stored precision with [`Self::with_config`].
     pub fn new(model: &Qwen35Model) -> Result<Self, String> {
-        model.require_f32("AdamW::new")?;
+        if model.precision() != Precision::F32 {
+            return Err(
+                "AdamW::new: the model is stored in bf16; choose an update rule and moment storage with \
+                 AdamW::with_config"
+                    .into(),
+            );
+        }
+        Self::with_config(model, AdamWConfig::F32)
+    }
+
+    /// Zeroed state for `model` in `config`'s stored precision. An f32
+    /// model takes [`UpdateRule::F32`] and a bf16 model one of the bf16
+    /// rules; any [`MomentStorage`] goes with either. An f32 master starts
+    /// as the model's current weights.
+    pub fn with_config(model: &Qwen35Model, config: AdamWConfig) -> Result<Self, String> {
+        const WHAT: &str = "AdamW::with_config";
+        model.require_trainable(WHAT)?;
+        match (model.precision(), config.update) {
+            (Precision::F32, UpdateRule::F32) => {}
+            (Precision::Bf16, UpdateRule::F32Master | UpdateRule::Bf16Kahan | UpdateRule::Bf16Stochastic { .. }) => {}
+            (p, u) => {
+                return Err(format!(
+                    "{WHAT}: update rule {u:?} does not apply to a {p:?} model (f32 models take UpdateRule::F32, \
+                     bf16 models F32Master, Bf16Kahan or Bf16Stochastic)"
+                ))
+            }
+        }
+        let rt = &model.rt;
+        let mut out = Vec::new();
+        for s in slots(model, None)? {
+            let pw = s.param_window();
+            pw.check(&format!("{WHAT}: {}", s.info.name))?;
+            let n = pw.numel();
+            let (moment, scale_bytes, aux_bytes) = slot_bytes(n, pw.dtype, config);
+            let scales = if scale_bytes > 0 {
+                Some((zeroed(rt, scale_bytes)?, zeroed(rt, scale_bytes)?))
+            } else {
+                None
+            };
+            let aux = match (pw.dtype, config.update) {
+                (DType::BF16, UpdateRule::F32Master) => {
+                    let b = zeroed(rt, aux_bytes)?;
+                    let dense = Window {
+                        rows: pw.rows,
+                        width: pw.width,
+                        ld: pw.width,
+                        off: 0,
+                        ..Window::dense(&b, 0, DType::F32, n)
+                    };
+                    window_copy(rt, &pw, &dense)?;
+                    Some(b)
+                }
+                (DType::BF16, UpdateRule::Bf16Kahan) => Some(zeroed(rt, aux_bytes)?),
+                _ => None,
+            };
+            out.push(SlotState {
+                n,
+                m: zeroed(rt, moment)?,
+                v: zeroed(rt, moment)?,
+                scales,
+                aux,
+            });
+        }
+        rt.synchronize()?;
         Ok(Self {
-            m: Qwen35Grads::zeros_like(model)?,
-            v: Qwen35Grads::zeros_like(model)?,
+            config,
+            precision: model.precision(),
+            slots: out,
             step: 0,
+            dummy: zeroed(rt, 32)?,
         })
+    }
+
+    /// The stored precision this state was made with.
+    pub fn config(&self) -> AdamWConfig {
+        self.config
+    }
+
+    /// `AdamW update=... moments=... step=N`: the configuration and the
+    /// step count, for a run's log or checkpoint metadata.
+    pub fn describe(&self) -> String {
+        format!("AdamW {} step={}", self.config, self.step)
+    }
+
+    /// Device bytes [`Self::with_config`] would allocate for `model` under
+    /// `config`, at the sizes the allocator makes resident buffers
+    /// ([`GpuRuntime::allocated_bytes_for`]), without allocating: what a
+    /// configuration costs at shapes that do not fit.
+    pub fn allocated_bytes_for(model: &Qwen35Model, config: AdamWConfig) -> Result<u64, String> {
+        let hot = |b: usize| {
+            if b == 0 {
+                0
+            } else {
+                GpuRuntime::allocated_bytes_for(b.max(4), crate::runtime::BufferKind::Hot)
+            }
+        };
+        let mut total = hot(32);
+        for s in slots(model, None)? {
+            let pw = s.param_window();
+            let (moment, scales, aux) = slot_bytes(pw.numel(), pw.dtype, config);
+            total += 2 * hot(moment) + 2 * hot(scales) + hot(aux);
+        }
+        Ok(total)
+    }
+
+    /// Device bytes the state holds (logical, before the allocator's
+    /// rounding).
+    pub fn state_bytes(&self) -> u64 {
+        self.slots
+            .iter()
+            .map(|s| {
+                let mut b = s.m.nbytes() + s.v.nbytes();
+                if let Some((a, c)) = &s.scales {
+                    b += a.nbytes() + c.nbytes();
+                }
+                if let Some(a) = &s.aux {
+                    b += a.nbytes();
+                }
+                b as u64
+            })
+            .sum()
     }
 
     /// Steps taken so far (torch's `state["step"]`).
@@ -85,11 +347,23 @@ impl AdamW {
         self.step = step;
     }
 
-    fn moment(&self, which: Moment) -> &Qwen35Grads {
-        match which {
-            Moment::First => &self.m,
-            Moment::Second => &self.v,
+    fn moment(&self, s: &SlotState, which: Moment) -> (GpuBuffer, Option<GpuBuffer>) {
+        let first = which == Moment::First;
+        let buf = if first { &s.m } else { &s.v };
+        let scale = s.scales.as_ref().map(|(a, b)| if first { a } else { b }).cloned();
+        (buf.clone(), scale)
+    }
+
+    /// State for `model`: one entry per parameter of the same size.
+    fn check_model(&self, what: &str, model: &Qwen35Model) -> Result<(), String> {
+        let ps = slots(model, None)?;
+        if model.precision() != self.precision
+            || ps.len() != self.slots.len()
+            || ps.iter().zip(&self.slots).any(|(p, s)| p.param_window().numel() != s.n)
+        {
+            return Err(format!("{what}: the AdamW state was made for another model"));
         }
+        Ok(())
     }
 }
 
@@ -109,85 +383,6 @@ pub fn excluded_from_weight_decay(name: &str) -> bool {
         return true;
     }
     name.split('.').any(|seg| seg == "norm" || seg.ends_with("_norm"))
-}
-
-/// One window: a buffer, the byte offset of its tensor, and `rows` x `width`
-/// at leading dimension `ld` from element `off`.
-struct Window<'a> {
-    buf: &'a GpuBuffer,
-    byte_off: usize,
-    rows: usize,
-    width: usize,
-    ld: usize,
-    off: usize,
-}
-
-fn window<'a>(src: Src<'a>, shape: &[usize]) -> Window<'a> {
-    let numel = shape.iter().product::<usize>();
-    match src {
-        Src::Raw(b) => Window {
-            buf: b,
-            byte_off: 0,
-            rows: 1,
-            width: numel,
-            ld: numel,
-            off: 0,
-        },
-        Src::Dense(t) => {
-            let s = t.shape();
-            Window {
-                buf: &t.buffer,
-                byte_off: t.byte_offset(),
-                rows: s[0],
-                width: s[1],
-                ld: s[1],
-                off: 0,
-            }
-        }
-        // transformers' [out, in]: `in` rows of `out` columns in the packed [in, total].
-        Src::Packed(t, off) => Window {
-            buf: &t.buffer,
-            byte_off: t.byte_offset(),
-            rows: shape[1],
-            width: shape[0],
-            ld: t.shape()[1],
-            off,
-        },
-    }
-}
-
-impl Window<'_> {
-    /// The window lies inside its buffer.
-    fn check(&self, what: &str) -> Result<(), String> {
-        let last = (self.rows - 1)
-            .checked_mul(self.ld)
-            .and_then(|x| x.checked_add(self.off + self.width))
-            .ok_or_else(|| format!("{what}: window overflows"))?;
-        let have = self.buf.nbytes().saturating_sub(self.byte_off) / 4;
-        if self.byte_off % 4 != 0 || last > have || self.width > self.ld {
-            return Err(format!(
-                "{what}: window of {last} elements does not fit its buffer's {have}"
-            ));
-        }
-        for n in [self.rows, self.width, self.ld, self.off] {
-            u32::try_from(n).map_err(|_| format!("{what}: {n} exceeds u32"))?;
-        }
-        Ok(())
-    }
-}
-
-fn dense_window<'a>(t: &'a Tensor) -> Result<Window<'a>, String> {
-    let n = t.try_numel()?;
-    let w = Window {
-        buf: &t.buffer,
-        byte_off: t.byte_offset(),
-        rows: 1,
-        width: n,
-        ld: n,
-        off: 0,
-    };
-    w.check("adamw_step")?;
-    Ok(w)
 }
 
 fn check_hyper(what: &str, hyper: &AdamWHyper) -> Result<(), String> {
@@ -217,7 +412,7 @@ fn check_hyper(what: &str, hyper: &AdamWHyper) -> Result<(), String> {
     Ok(())
 }
 
-/// Host-side scalars, in the order `kernels/qwen35_adamw.metal` reads them.
+/// Host-side scalars, in the order `kernels/qwen35_adamw_math.h` reads them.
 ///
 /// `step` is torch's count after it has incremented (1-based). The formation
 /// is f64, then each value is stored as f32. `weight_decay` is one tensor's.
@@ -246,21 +441,8 @@ fn adamw_scalars(hyper: &AdamWHyper, step: u64, weight_decay: f64) -> [f32; 8] {
     ]
 }
 
-fn dispatch_adamw(rt: &GpuRuntime, w: &[Window<'_>; 4], scalars: &[f32; 8]) -> Result<(), String> {
-    let bytes: Vec<u8> = scalars.iter().flat_map(|x| x.to_le_bytes()).collect();
-    let [wp, wg, wm, wv] = w;
-    let p = rt.pipeline("qwen35_adamw_f32")?;
-    dispatch_2d(rt, &p, wp.width, wp.rows, |bnd| {
-        set_gpu_buf_offset(bnd, wp.buf, wp.byte_off, 0);
-        set_gpu_buf_offset(bnd, wg.buf, wg.byte_off, 1);
-        set_gpu_buf_offset(bnd, wm.buf, wm.byte_off, 2);
-        set_gpu_buf_offset(bnd, wv.buf, wv.byte_off, 3);
-        bnd.bind_bytes(&bytes, 4);
-        set_u32(bnd, wp.rows as u32, 5);
-        set_u32(bnd, wp.width as u32, 6);
-        set_u32(bnd, wp.ld as u32, 7);
-        set_u32(bnd, wp.off as u32, 8);
-    })
+fn le_bytes<const N: usize, T: Copy>(xs: [T; N], f: impl Fn(T) -> [u8; 4]) -> Vec<u8> {
+    xs.iter().flat_map(|&x| f(x)).collect()
 }
 
 fn on_runtime(rt: &GpuRuntime, t: &Tensor) -> bool {
@@ -344,23 +526,108 @@ pub fn adamw_step(
             }
         }
     }
-    if param.try_numel()? == 0 {
+    let n = param.try_numel()?;
+    if n == 0 {
         return Ok(());
     }
-    let windows = [
-        dense_window(param)?,
-        dense_window(grad)?,
-        dense_window(m)?,
-        dense_window(v)?,
-    ];
-    dispatch_adamw(rt, &windows, &adamw_scalars(hyper, step, f64::from(weight_decay)))
+    let w: Vec<Window<'_>> = views
+        .iter()
+        .map(|t| Window::dense(&t.buffer, t.byte_offset(), DType::F32, n))
+        .collect();
+    for (x, name) in w.iter().zip(names) {
+        x.check(&format!("{WHAT}: {name}"))?;
+    }
+    let bytes = le_bytes(adamw_scalars(hyper, step, f64::from(weight_decay)), f32::to_le_bytes);
+    let p = rt.pipeline("qwen35_adamw_f32")?;
+    dispatch_2d(rt, &p, n, 1, |bnd| {
+        for (i, x) in w.iter().enumerate() {
+            set_gpu_buf_offset(bnd, x.buf, x.byte_off, i);
+        }
+        bnd.bind_bytes(&bytes, 4);
+        set_u32(bnd, 1, 5);
+        set_u32(bnd, n as u32, 6);
+        set_u32(bnd, n as u32, 7);
+        set_u32(bnd, 0, 8);
+    })
+}
+
+/// The stored-precision step kernel for a parameter window of `p`, its
+/// gradient's dtype `g`, and `config`.
+fn step_kernel(p: DType, g: DType, config: AdamWConfig) -> Result<String, String> {
+    let mom = match config.moments {
+        MomentStorage::F32 => "f32",
+        MomentStorage::Bf16 => "bf16",
+        MomentStorage::Block8 => "q8",
+    };
+    let gname = match g {
+        DType::F32 => "f32",
+        DType::BF16 => "bf16",
+        d => return Err(format!("a {d:?} gradient")),
+    };
+    match p {
+        DType::F32 if g == DType::F32 => Ok(format!("qwen35_adamw_f32_plain_gf32_m{mom}")),
+        DType::F32 => Err("an f32 parameter with a bf16 gradient".into()),
+        DType::BF16 => {
+            let rule = match config.update {
+                UpdateRule::F32Master => "master",
+                UpdateRule::Bf16Kahan => "kahan",
+                UpdateRule::Bf16Stochastic { .. } => "sr",
+                UpdateRule::F32 => return Err("a bf16 parameter under UpdateRule::F32".into()),
+            };
+            Ok(format!("qwen35_adamw_bf16_{rule}_g{gname}_m{mom}"))
+        }
+        d => Err(format!("a {d:?} parameter")),
+    }
+}
+
+/// Encode one 8-bit moment block kernel (`qwen35_moment_q8_encode` /
+/// `_decode`) over `n` dense elements.
+fn dispatch_q8(
+    rt: &GpuRuntime,
+    encode: bool,
+    q: &GpuBuffer,
+    scale: &GpuBuffer,
+    x: &Tensor,
+    n: usize,
+    first: bool,
+) -> Result<(), String> {
+    let p = rt.pipeline(if encode {
+        "qwen35_moment_q8_encode"
+    } else {
+        "qwen35_moment_q8_decode"
+    })?;
+    dispatch_2d_tg(rt, &p, n.div_ceil(MOMENT_BLOCK), 1, MOMENT_BLOCK, |bnd| {
+        if encode {
+            set_gpu_buf_offset(bnd, &x.buffer, x.byte_offset(), 0);
+            set_gpu_buf_offset(bnd, q, 0, 1);
+            set_gpu_buf_offset(bnd, scale, 0, 2);
+        } else {
+            set_gpu_buf_offset(bnd, q, 0, 0);
+            set_gpu_buf_offset(bnd, scale, 0, 1);
+            set_gpu_buf_offset(bnd, &x.buffer, x.byte_offset(), 2);
+        }
+        set_u32(bnd, n as u32, 3);
+        set_u32(bnd, u32::from(first), 4);
+    })
+}
+
+/// A slot's dense state buffer as a window shaped like the parameter's.
+fn state_window<'a>(buf: &'a GpuBuffer, dtype: DType, like: &Window<'_>) -> Window<'a> {
+    Window {
+        rows: like.rows,
+        width: like.width,
+        ld: like.width,
+        off: 0,
+        ..Window::dense(buf, 0, dtype, like.numel())
+    }
 }
 
 impl Qwen35Model {
     /// One AdamW step on every parameter from `grads` (this model's
-    /// [`Qwen35Model::train_step`]), with `weight_decay[i]` for
-    /// [`Qwen35Model::parameter_table`] entry `i`. Everything is checked before
-    /// anything moves; the step count advances only when the step runs.
+    /// [`Qwen35Model::train_step`] or a bank), with `weight_decay[i]` for
+    /// [`Qwen35Model::parameter_table`] entry `i`, stored as `state`'s
+    /// [`AdamWConfig`] says. Everything is checked before anything moves; the
+    /// step count advances only when the step runs.
     pub fn adamw_step(
         &self,
         grads: &Qwen35Grads,
@@ -369,11 +636,10 @@ impl Qwen35Model {
         weight_decay: &[f32],
     ) -> Result<(), String> {
         const WHAT: &str = "Qwen35Model::adamw_step";
-        self.require_f32(WHAT)?;
+        self.require_trainable(WHAT)?;
         check_hyper(WHAT, hyper)?;
+        state.check_model(WHAT, self)?;
         let ps = slots(self, Some(grads)).map_err(|e| format!("{WHAT}: {e}"))?;
-        let ms = slots(self, Some(&state.m)).map_err(|e| format!("{WHAT}: moments: {e}"))?;
-        let vs = slots(self, Some(&state.v)).map_err(|e| format!("{WHAT}: moments: {e}"))?;
         if weight_decay.len() != ps.len() {
             return Err(format!(
                 "{WHAT}: {} weight decays for {} parameters",
@@ -382,34 +648,22 @@ impl Qwen35Model {
             ));
         }
         let mut plan = Vec::with_capacity(ps.len());
-        for (((s, m), v), &wd) in ps.iter().zip(&ms).zip(&vs).zip(weight_decay) {
+        for ((s, st), &wd) in ps.iter().zip(&state.slots).zip(weight_decay) {
             let name = &s.info.name;
             if !(wd.is_finite() && wd >= 0.0) {
                 return Err(format!("{WHAT}: {name}: weight decay {wd} must be finite and >= 0"));
             }
-            let (g, mm, vv) = match (s.grad, m.grad, v.grad) {
-                (Some(g), Some(mm), Some(vv)) => (g, mm, vv),
-                _ => return Err(format!("{WHAT}: {name} has no gradient")),
-            };
-            let shape = &s.info.shape;
-            let w = [
-                window(s.param, shape),
-                window(g, shape),
-                window(mm, shape),
-                window(vv, shape),
-            ];
-            for (x, part) in w.iter().zip(["parameter", "gradient", "first moment", "second moment"]) {
-                x.check(&format!("{WHAT}: {name} {part}"))?;
+            let pw = s.param_window();
+            let gw = s
+                .grad_window()
+                .ok_or_else(|| format!("{WHAT}: {name} has no gradient"))?;
+            pw.check(&format!("{WHAT}: {name} parameter"))?;
+            gw.check(&format!("{WHAT}: {name} gradient"))?;
+            if !gw.same_layout(&pw) {
+                return Err(format!("{WHAT}: {name}: the gradient is not laid out as the parameter"));
             }
-            if w[1..]
-                .iter()
-                .any(|x| (x.rows, x.width, x.ld, x.off) != (w[0].rows, w[0].width, w[0].ld, w[0].off))
-            {
-                return Err(format!(
-                    "{WHAT}: {name}: gradient or moments are not laid out as the parameter"
-                ));
-            }
-            plan.push((w, f64::from(wd)));
+            let kernel = step_kernel(pw.dtype, gw.dtype, state.config).map_err(|e| format!("{WHAT}: {name}: {e}"))?;
+            plan.push((pw, gw, st, kernel, f64::from(wd)));
         }
 
         // torch: the step count increments, then the scalars are formed in f64.
@@ -420,11 +674,38 @@ impl Qwen35Model {
             .step
             .checked_add(1)
             .ok_or_else(|| format!("{WHAT}: step count {} + 1 does not fit in u64", state.step))?;
-        // Packed projections are a strided window (`ld`, `off`), not a
-        // contiguous `Tensor`, so this loop calls the same encoder as
-        // [`adamw_step`] rather than copying each parameter out and back.
-        for (w, wd) in &plan {
-            dispatch_adamw(&self.rt, w, &adamw_scalars(hyper, next, *wd))?;
+        let seed = match state.config.update {
+            UpdateRule::Bf16Stochastic { seed } => seed,
+            _ => 0,
+        };
+        for (salt, (pw, gw, st, kernel, wd)) in plan.iter().enumerate() {
+            let scalars = le_bytes(adamw_scalars(hyper, next, *wd), f32::to_le_bytes);
+            let key = le_bytes(
+                [seed as u32, (seed >> 32) as u32, next as u32, (next >> 32) as u32, salt as u32],
+                u32::to_le_bytes,
+            );
+            let p = self.rt.pipeline(kernel)?;
+            let dummy = &state.dummy;
+            let (ms, vs) = match &st.scales {
+                Some((a, b)) => (a, b),
+                None => (dummy, dummy),
+            };
+            let aux = st.aux.as_ref().unwrap_or(dummy);
+            dispatch_2d_tg(&self.rt, &p, st.n.div_ceil(MOMENT_BLOCK), 1, MOMENT_BLOCK, |bnd| {
+                set_gpu_buf_offset(bnd, pw.buf, pw.byte_off, 0);
+                set_gpu_buf_offset(bnd, gw.buf, gw.byte_off, 1);
+                set_gpu_buf_offset(bnd, &st.m, 0, 2);
+                set_gpu_buf_offset(bnd, &st.v, 0, 3);
+                bnd.bind_bytes(&scalars, 4);
+                set_u32(bnd, st.n as u32, 5);
+                set_u32(bnd, pw.width as u32, 6);
+                set_u32(bnd, pw.ld as u32, 7);
+                set_u32(bnd, pw.off as u32, 8);
+                set_gpu_buf_offset(bnd, aux, 0, 9);
+                set_gpu_buf_offset(bnd, ms, 0, 10);
+                set_gpu_buf_offset(bnd, vs, 0, 11);
+                bnd.bind_bytes(&key, 12);
+            })?;
         }
         self.rt.synchronize()?;
         state.step = next;
@@ -432,22 +713,22 @@ impl Qwen35Model {
     }
 
     /// The sum of squares of every gradient in `grads` (this model's
-    /// [`Qwen35Model::train_step`]), over the parameters of
-    /// [`Qwen35Model::parameter_table`]: the square of the global L2 norm
-    /// `torch.nn.utils.clip_grad_norm_` takes. Each row of each gradient is
-    /// summed in f32 on the GPU in a fixed order and the rows are added in
-    /// f64, so it is deterministic; torch's own reduction order differs, so
-    /// the two agree to rounding, not bits.
+    /// [`Qwen35Model::train_step`], or a bank, f32 or bf16), over the
+    /// parameters of [`Qwen35Model::parameter_table`]: the square of the
+    /// global L2 norm `torch.nn.utils.clip_grad_norm_` takes. Each row of
+    /// each gradient is summed in f32 on the GPU in a fixed order and the
+    /// rows are added in f64, so it is deterministic; torch's own reduction
+    /// order differs, so the two agree to rounding, not bits.
     pub fn grad_sq_norm(&self, grads: &Qwen35Grads) -> Result<f64, String> {
         const WHAT: &str = "Qwen35Model::grad_sq_norm";
-        self.require_f32(WHAT)?;
         let ps = slots(self, Some(grads)).map_err(|e| format!("{WHAT}: {e}"))?;
         let mut plan = Vec::with_capacity(ps.len());
         let mut rows = 0usize;
         for s in &ps {
             let name = &s.info.name;
-            let g = s.grad.ok_or_else(|| format!("{WHAT}: {name} has no gradient"))?;
-            let w = window(g, &s.info.shape);
+            let w = s
+                .grad_window()
+                .ok_or_else(|| format!("{WHAT}: {name} has no gradient"))?;
             w.check(&format!("{WHAT}: {name} gradient"))?;
             let n = w.rows;
             plan.push((w, rows));
@@ -455,8 +736,12 @@ impl Qwen35Model {
         }
         u32::try_from(rows).map_err(|_| format!("{WHAT}: {rows} rows exceed u32"))?;
         let out = self.rt.alloc_tensor_f32(&[rows])?;
-        let p = self.rt.pipeline("qwen35_sq_sum_rows_f32")?;
         for (w, at) in &plan {
+            let p = self.rt.pipeline(if w.dtype == DType::BF16 {
+                "qwen35_sq_sum_rows_bf16"
+            } else {
+                "qwen35_sq_sum_rows_f32"
+            })?;
             dispatch_2d_tg(&self.rt, &p, w.rows, 1, 256, |bnd| {
                 set_gpu_buf_offset(bnd, w.buf, w.byte_off, 0);
                 set_gpu_buf_offset(bnd, &out.buffer, out.byte_offset(), 1);
@@ -472,18 +757,105 @@ impl Qwen35Model {
 
     /// Copy one of `state`'s moments into `dst`, one dense f32 tensor per
     /// [`Qwen35Model::parameter_table`] entry laid out as
-    /// [`Qwen35Model::read_parameters`] lays out the values.
+    /// [`Qwen35Model::read_parameters`] lays out the values: bf16 moments
+    /// widened, 8-bit ones decoded.
     pub fn read_adamw_moment(&self, state: &AdamW, which: Moment, dst: &[Tensor]) -> Result<(), String> {
-        self.read_gradients(state.moment(which), dst)
-            .map_err(|e| format!("Qwen35Model::read_adamw_moment: {e}"))
+        const WHAT: &str = "Qwen35Model::read_adamw_moment";
+        self.moment_copy(WHAT, state, which, dst, false)
     }
 
     /// Set one of `state`'s moments from `src`, laid out as
-    /// [`Self::read_adamw_moment`] reads it; with
-    /// [`AdamW::set_step_count`] this restores a checkpoint. Every tensor is
-    /// checked before anything is written.
+    /// [`Self::read_adamw_moment`] reads it; with [`AdamW::set_step_count`]
+    /// and [`Self::write_adamw_aux`] this restores a checkpoint. bf16 moments
+    /// round to nearest and 8-bit ones encode per block, so a write of what a
+    /// read gave is the same state. Every tensor is checked before anything
+    /// is written.
     pub fn write_adamw_moment(&self, state: &mut AdamW, which: Moment, src: &[Tensor]) -> Result<(), String> {
-        self.write_gradient_layout("Qwen35Model::write_adamw_moment", state.moment(which), src)
+        const WHAT: &str = "Qwen35Model::write_adamw_moment";
+        self.moment_copy(WHAT, state, which, src, true)
+    }
+
+    fn moment_copy(&self, what: &str, state: &AdamW, which: Moment, ts: &[Tensor], write: bool) -> Result<(), String> {
+        state.check_model(what, self)?;
+        let ps = slots(self, None)?;
+        check(what, &self.rt, &ps, ts)?;
+        let dtype = match state.config.moments {
+            MomentStorage::F32 => DType::F32,
+            MomentStorage::Bf16 => DType::BF16,
+            MomentStorage::Block8 => DType::F32,
+        };
+        for ((s, st), t) in ps.iter().zip(&state.slots).zip(ts) {
+            let pw = s.param_window();
+            let (buf, scale) = state.moment(st, which);
+            let e = |e: String| format!("{what}: {}: {e}", s.info.name);
+            match scale {
+                Some(scale) => dispatch_q8(&self.rt, write, &buf, &scale, t, st.n, which == Moment::First).map_err(e)?,
+                None => {
+                    let mine = state_window(&buf, dtype, &pw);
+                    let theirs = Window::tensor_as(t, &pw).map_err(e)?;
+                    let (from, to) = if write { (theirs, mine) } else { (mine, theirs) };
+                    window_copy(&self.rt, &from, &to).map_err(e)?;
+                }
+            }
+        }
+        self.rt.synchronize()
+    }
+
+    /// Copy `state`'s auxiliary state into `dst` (one dense f32 tensor per
+    /// [`Qwen35Model::parameter_table`] entry, as
+    /// [`Qwen35Model::read_parameters`] lays them out): under
+    /// [`UpdateRule::F32Master`] the f32 masters, under
+    /// [`UpdateRule::Bf16Kahan`] the compensations, widened. An entry stored
+    /// in f32 has none, and reads as its parameter's value (master) or zero
+    /// (Kahan). Other rules keep no auxiliary state and are refused.
+    pub fn read_adamw_aux(&self, state: &AdamW, dst: &[Tensor]) -> Result<(), String> {
+        self.aux_copy("Qwen35Model::read_adamw_aux", state, dst, false)
+    }
+
+    /// Set `state`'s auxiliary state from `src`, laid out as
+    /// [`Self::read_adamw_aux`] reads it (a compensation rounds to nearest).
+    /// Entries stored in f32 have none and are skipped. Every tensor is
+    /// checked before anything is written.
+    pub fn write_adamw_aux(&self, state: &mut AdamW, src: &[Tensor]) -> Result<(), String> {
+        self.aux_copy("Qwen35Model::write_adamw_aux", state, src, true)
+    }
+
+    fn aux_copy(&self, what: &str, state: &AdamW, ts: &[Tensor], write: bool) -> Result<(), String> {
+        let dtype = match state.config.update {
+            UpdateRule::F32Master => DType::F32,
+            UpdateRule::Bf16Kahan => DType::BF16,
+            _ => {
+                return Err(format!(
+                    "{what}: update rule {} keeps no auxiliary state",
+                    state.config.rule_name()
+                ))
+            }
+        };
+        state.check_model(what, self)?;
+        let ps = slots(self, None)?;
+        check(what, &self.rt, &ps, ts)?;
+        for ((s, st), t) in ps.iter().zip(&state.slots).zip(ts) {
+            let pw = s.param_window();
+            let e = |e: String| format!("{what}: {}: {e}", s.info.name);
+            let theirs = Window::tensor_as(t, &pw).map_err(e)?;
+            match (&st.aux, write) {
+                (Some(aux), _) => {
+                    let mine = state_window(aux, dtype, &pw);
+                    let (from, to) = if write { (theirs, mine) } else { (mine, theirs) };
+                    window_copy(&self.rt, &from, &to).map_err(e)?;
+                }
+                (None, true) => {}
+                (None, false) if dtype == DType::F32 => window_copy(&self.rt, &pw, &theirs).map_err(e)?,
+                (None, false) => {
+                    let p = self.rt.pipeline("zero_f32")?;
+                    crate::dispatch::dispatch_1d(&self.rt, &p, st.n, |bnd| {
+                        set_gpu_buf_offset(bnd, &t.buffer, t.byte_offset(), 0);
+                        set_u32(bnd, st.n as u32, 1);
+                    })?;
+                }
+            }
+        }
+        self.rt.synchronize()
     }
 
     /// Weight decay `wd` for every parameter-table entry except those

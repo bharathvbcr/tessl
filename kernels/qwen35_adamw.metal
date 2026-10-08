@@ -5,37 +5,18 @@
 // parameters' tensors, and the gradients already come in the weights'
 // layouts. Elementwise, so a step is deterministic.
 //
-// The arithmetic is torch.optim.AdamW's single-tensor path (amsgrad and
-// maximize off), in its order, on the gradient times `grad_scale` (what
-// clip_grad_norm_ leaves in `.grad`): decoupled weight decay, the first moment by
-// torch's `lerp` (whose form switches at weight 0.5), the second moment,
-// `sqrt(v) / sqrt(bc2) + eps`, then `p += -step_size * (m / denom)`. The host
-// forms the per-step scalars in f64 as torch does and passes them as f32.
+// The arithmetic is torch.optim.AdamW's single-tensor path
+// (`qwen35_adamw_math.h`, shared with the stored-precision family in
+// `qwen35_train_storage.metal`) on the gradient times `grad_scale` (what
+// clip_grad_norm_ leaves in `.grad`). The host forms the per-step scalars in
+// f64 as torch does and passes them as f32.
 //
 // Every parameter is stored as transformers holds it (the zero-centred norms
 // as `w`, their kernels adding the 1), so the update runs on the stored value
 // and weight decay pulls `w` toward zero.
 #include <metal_stdlib>
+#include "qwen35_adamw_math.h"
 using namespace metal;
-
-/// Per-step, per-tensor scalars.
-struct Qwen35AdamW {
-    /// `1 - lr * weight_decay`.
-    float decay_mul;
-    /// `1 - beta1`: the lerp weight.
-    float lerp_w;
-    float beta2;
-    /// `1 - beta2`.
-    float one_minus_beta2;
-    /// `lr / (1 - beta1^step)`.
-    float step_size;
-    /// `sqrt(1 - beta2^step)`.
-    float bc2_sqrt;
-    float eps;
-    /// Multiplies the gradient before anything reads it: `clip_grad_norm_`'s
-    /// clip coefficient (torch scales `.grad` in place, in f32), or 1.
-    float grad_scale;
-};
 
 /// Grid: x = column in [0, width), y = row.
 kernel void qwen35_adamw_f32(
@@ -55,16 +36,9 @@ kernel void qwen35_adamw_f32(
     if (c >= width || r >= rows) return;
     const ulong i = (ulong)r * ld + off + c;
 
-    float w = p[i] * a.decay_mul;
-
-    const float gi = g[i] * a.grad_scale;
     float mi = m[i];
-    const float diff = gi - mi;
-    mi = a.lerp_w < 0.5f ? mi + a.lerp_w * diff : gi - diff * (1.0f - a.lerp_w);
-    const float vi = v[i] * a.beta2 + (a.one_minus_beta2 * gi) * gi;
-
-    const float denom = precise::divide(precise::sqrt(vi), a.bc2_sqrt) + a.eps;
-    w = w + (-a.step_size) * precise::divide(mi, denom);
+    float vi = v[i];
+    const float w = qwen35_adamw_update(a, p[i], g[i], mi, vi);
 
     p[i] = w;
     m[i] = mi;

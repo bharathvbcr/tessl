@@ -1170,15 +1170,16 @@ impl GemmOperands {
         }
     }
 
-    /// Device bytes [`Self::nn`] allocates for itself on f32 operands
-    /// `[m, k]` and `[k, n]`, at allocated sizes
-    /// ([`GpuRuntime::allocated_bytes_for`]): a bf16 copy of each under
-    /// [`Self::Bf16`], nothing under [`Self::ExactF32`]. Like every
+    /// Device bytes [`Self::nn`] allocates for itself on an f32 `A [m, k]`
+    /// and a `B [k, n]` of dtype `b`, at allocated sizes
+    /// ([`GpuRuntime::allocated_bytes_for`]): a bf16 copy of each f32 operand
+    /// under [`Self::Bf16`] (a bf16 `B`, such as a bf16-stored weight, is
+    /// used as it is), nothing under [`Self::ExactF32`]. Like every
     /// temporary, they stay allocated until the next waited commit.
-    pub(crate) fn nn_scratch_bytes(self, m: usize, n: usize, k: usize) -> u64 {
+    pub(crate) fn nn_scratch_bytes(self, m: usize, n: usize, k: usize, b: DType) -> u64 {
         match self {
             Self::ExactF32 => 0,
-            Self::Bf16 => bf16_copies(m.saturating_mul(k), k.saturating_mul(n)),
+            Self::Bf16 => bf16_copies(m.saturating_mul(k), narrowed(k.saturating_mul(n), b)),
         }
     }
 
@@ -1199,23 +1200,34 @@ impl GemmOperands {
     }
 
     /// As [`Self::nn_scratch_bytes`], for [`Self::nt`] (`C [m, n]`, shared
-    /// dimension `k`): under [`Self::ExactF32`], the transposed `B` a device
-    /// without TensorOps takes.
-    pub(crate) fn nt_scratch_bytes(self, has_tensorops: bool, m: usize, n: usize, k: usize) -> u64 {
+    /// dimension `k`, `B` of dtype `b`): under [`Self::ExactF32`], the
+    /// transposed `B` a device without TensorOps takes.
+    pub(crate) fn nt_scratch_bytes(self, has_tensorops: bool, m: usize, n: usize, k: usize, b: DType) -> u64 {
         match self {
-            Self::Bf16 => bf16_copies(m.saturating_mul(k), n.saturating_mul(k)),
+            Self::Bf16 => bf16_copies(m.saturating_mul(k), narrowed(n.saturating_mul(k), b)),
             Self::ExactF32 if !(USE_TN_NT_DESCRIPTORS && has_tensorops) => f32_temp(k.saturating_mul(n)),
             Self::ExactF32 => 0,
         }
     }
 }
 
-/// Allocated bytes of the two bf16 operand copies [`ensure_bf16`] makes.
+/// Allocated bytes of the bf16 operand copies [`ensure_bf16`] makes, of
+/// `a` and `b` elements (0: the operand is already bf16, no copy).
 fn bf16_copies(a: usize, b: usize) -> u64 {
     [a, b]
         .iter()
+        .filter(|&&n| n > 0)
         .map(|&n| GpuRuntime::allocated_bytes_for(n.saturating_mul(2), BufferKind::Cold))
         .fold(0, u64::saturating_add)
+}
+
+/// Elements [`ensure_bf16`] copies for an operand of `n` elements of `dtype`.
+fn narrowed(n: usize, dtype: DType) -> usize {
+    if dtype == DType::BF16 {
+        0
+    } else {
+        n
+    }
 }
 
 /// Allocated bytes of one f32 temporary (`alloc_temp_f32`, from the pool).

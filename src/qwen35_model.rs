@@ -625,12 +625,128 @@ impl Qwen35Model {
         })
     }
 
+    /// A model of `cfg`'s shapes with seeded random weights and no checkpoint,
+    /// loaded as [`Self::load_tower`] loads (no packed LM head): for memory
+    /// probes and tests at shapes with no local checkpoint. Every matrix and
+    /// the conv weights are uniform with standard deviation 0.02
+    /// (transformers' `initializer_range`), the norms' `w`, `A_log` and
+    /// `dt_bias` zero. Not a trained model.
+    pub fn random_tower(rt: &Arc<GpuRuntime>, cfg: Qwen35Config, precision: Precision, seed: u64) -> Result<Self, String> {
+        cfg.validate()?;
+        let mut state = seed ^ 0x9e37_79b9_7f4a_7c15;
+        // splitmix64, then a uniform in [-a, a) with variance 0.02^2.
+        let half = 0.02f32 * 3f32.sqrt();
+        let mut uniform = move |n: usize| -> Vec<f32> {
+            (0..n)
+                .map(|_| {
+                    state = state.wrapping_add(0x9e37_79b9_7f4a_7c15);
+                    let mut z = state;
+                    z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+                    z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+                    z ^= z >> 31;
+                    ((z >> 40) as f32 / (1u64 << 24) as f32 * 2.0 - 1.0) * half
+                })
+                .collect()
+        };
+        let mut tensor = |shape: &[usize], p: Precision| -> Result<Tensor, String> {
+            let data = uniform(shape.iter().product());
+            match p {
+                Precision::Bf16 => {
+                    let t = rt.alloc_tensor_bf16_hot(shape)?;
+                    t.buffer.write_bf16_bits(&crate::tensor::f32_slice_to_bf16(&data));
+                    Ok(t)
+                }
+                Precision::F32 => {
+                    let t = rt.alloc_tensor_f32_hot(shape)?;
+                    t.buffer.write_f32(&data);
+                    Ok(t)
+                }
+            }
+        };
+        let zeros = |n: usize| -> Result<GpuBuffer, String> {
+            let b = rt.alloc_buffer_hot(n.max(1) * 4)?;
+            b.zero();
+            Ok(b)
+        };
+        let (h, inter, vocab) = (cfg.hidden as usize, cfg.intermediate as usize, cfg.vocab as usize);
+        let (g, a) = (cfg.gdn, cfg.attn);
+        let embed = tensor(&[vocab, h], precision)?;
+        let mut layers = Vec::with_capacity(cfg.layers.len());
+        for kind in &cfg.layers {
+            let mixer = match kind {
+                LayerKind::LinearAttention => {
+                    let conv_w = tensor(&[(g.conv_dim() * cfg.conv_kernel) as usize], Precision::F32)?.buffer;
+                    Mixer::Gdn(GdnWeights {
+                        w_in: tensor(&[h, g.width() as usize], precision)?,
+                        w_out: tensor(&[g.value_dim() as usize, h], precision)?,
+                        conv_w,
+                        a_log: zeros(g.v_heads() as usize)?,
+                        dt_bias: zeros(g.v_heads() as usize)?,
+                        norm_w: zeros(g.v_dim() as usize)?,
+                    })
+                }
+                LayerKind::FullAttention => Mixer::Attn(AttnWeights {
+                    w_in: tensor(&[h, a.width() as usize], precision)?,
+                    w_out: tensor(&[(a.q_heads() * a.head_dim()) as usize, h], precision)?,
+                    q_norm: zeros(a.head_dim() as usize)?,
+                    k_norm: zeros(a.head_dim() as usize)?,
+                }),
+            };
+            layers.push(Layer {
+                input_norm: zeros(h)?,
+                post_norm: zeros(h)?,
+                mixer,
+                gate: tensor(&[h, inter], precision)?,
+                up: tensor(&[h, inter], precision)?,
+                down: tensor(&[inter, h], precision)?,
+            });
+        }
+        let final_norm = zeros(h)?;
+        rt.synchronize()?;
+        Ok(Self {
+            cfg,
+            precision,
+            rt: Arc::clone(rt),
+            embed,
+            lm_head_bf16: None,
+            final_norm,
+            layers,
+        })
+    }
+
     pub fn config(&self) -> &Qwen35Config {
         &self.cfg
     }
 
     pub fn precision(&self) -> Precision {
         self.precision
+    }
+
+    /// What the model is and how it stores itself, in one line: its shape,
+    /// the matrices' dtype (the embedding and the packed projections) and the
+    /// rest's (always f32), and whether it carries the inference forward's
+    /// packed LM head.
+    pub fn describe(&self) -> String {
+        let c = &self.cfg;
+        let attn = c.layers.iter().filter(|&&k| k == LayerKind::FullAttention).count();
+        let matrices = match self.precision {
+            Precision::Bf16 => "bf16",
+            Precision::F32 => "f32",
+        };
+        format!(
+            "Qwen3.5 text: hidden {}, intermediate {}, vocab {}, {} layers ({} GDN, {attn} attention); \
+             matrices {matrices}, norms/conv/gates f32; LM head {}",
+            c.hidden,
+            c.intermediate,
+            c.vocab,
+            c.layers.len(),
+            c.layers.len() - attn,
+            if self.lm_head_bf16.is_some() {
+                "packed bf16 copy"
+            } else {
+                "tied to the embedding"
+            }
+        )
     }
 
     /// Prefill `ids` (one sequence, positions from 0) and return every

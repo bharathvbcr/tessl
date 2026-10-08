@@ -17,7 +17,9 @@ use std::sync::Arc;
 
 use tessl::gemm::GemmOperands;
 use tessl::npy::read_npy;
-use tessl::qwen35_adamw::{excluded_from_weight_decay, AdamW, AdamWHyper, Moment};
+use tessl::qwen35_adamw::{
+    excluded_from_weight_decay, AdamW, AdamWConfig, AdamWHyper, Moment, MomentStorage, UpdateRule, MOMENT_BLOCK,
+};
 use tessl::qwen35_model::{Precision, Qwen35Config, Qwen35Model};
 use tessl::qwen35_params::ParamInfo;
 use tessl::safetensors::SafeTensors;
@@ -402,4 +404,490 @@ fn adamw_step_at_u64_max_does_not_wrap_to_zero() {
         "unexpected refusal: {err}"
     );
     assert_eq!(state.step_count(), u64::MAX);
+}
+
+// ---- stored precision ------------------------------------------------------
+//
+// The fixture as a bf16 tower (its weights are bf16 on disk, so the values are
+// the f32 model's), stepped on bf16 GEMM operands. Each test checks one step
+// at a time against the f64 reference started from tessl's own state before
+// that step, so a bound is one step's rounding, not a drifted trajectory.
+
+fn load_bf16() -> (Arc<GpuRuntime>, Qwen35Model) {
+    let dir = fixture();
+    let rt = GpuRuntime::new().unwrap();
+    let st = SafeTensors::open(&dir.join("model.safetensors")).unwrap();
+    let cfg = Qwen35Config::from_config_file(&dir.join("config.json")).unwrap();
+    let model = Qwen35Model::load_tower(&rt, &st, "model.", cfg, Precision::Bf16).unwrap();
+    (rt, model)
+}
+
+fn alloc_table(rt: &Arc<GpuRuntime>, table: &[ParamInfo]) -> Vec<Tensor> {
+    table
+        .iter()
+        .map(|p| rt.alloc_tensor_f32(&p.storage_shape()).unwrap())
+        .collect()
+}
+
+fn to_host(ts: &[Tensor]) -> Vec<Vec<f64>> {
+    ts.iter()
+        .map(|t| t.read_f32().unwrap().iter().map(|&x| f64::from(x)).collect())
+        .collect()
+}
+
+fn moments(rt: &Arc<GpuRuntime>, model: &Qwen35Model, table: &[ParamInfo], s: &AdamW) -> (Vec<Vec<f64>>, Vec<Vec<f64>>) {
+    let (m, v) = (alloc_table(rt, table), alloc_table(rt, table));
+    model.read_adamw_moment(s, Moment::First, &m).unwrap();
+    model.read_adamw_moment(s, Moment::Second, &v).unwrap();
+    (to_host(&m), to_host(&v))
+}
+
+fn aux(rt: &Arc<GpuRuntime>, model: &Qwen35Model, table: &[ParamInfo], s: &AdamW) -> Vec<Vec<f64>> {
+    let a = alloc_table(rt, table);
+    model.read_adamw_aux(s, &a).unwrap();
+    to_host(&a)
+}
+
+/// torch's AdamW on one element in f64 from `w` and the moments `m`, `v`
+/// (updated in place): the new value.
+fn reference(h: &AdamWHyper, step: u64, wd: f32, w: f64, g: f64, m: &mut f64, v: &mut f64) -> f64 {
+    let t = step as f64;
+    let (bc1, bc2) = (1.0 - h.beta1.powf(t), 1.0 - h.beta2.powf(t));
+    let g = f64::from(g as f32 * h.grad_scale as f32);
+    *m += (1.0 - h.beta1) * (g - *m);
+    *v = *v * h.beta2 + (1.0 - h.beta2) * g * g;
+    w * (1.0 - h.lr * f64::from(wd)) - h.lr / bc1 * *m / (v.sqrt() / bc2.sqrt() + h.eps)
+}
+
+fn bf16(x: f64) -> f64 {
+    f64::from(tessl::tensor::bf16_bits_to_f32(tessl::tensor::f32_to_bf16_bits(x as f32)))
+}
+
+/// One bf16 ulp at `x` (the spacing of bf16 values around it).
+fn bf16_ulp(x: f64) -> f64 {
+    let e = (x.abs().max(f64::from(f32::MIN_POSITIVE))).log2().floor();
+    2f64.powf(e - 7.0)
+}
+
+const LR: f64 = 1e-2;
+
+fn hyper() -> AdamWHyper {
+    AdamWHyper {
+        lr: LR,
+        ..AdamWHyper::default()
+    }
+}
+
+/// [`UpdateRule::F32Master`] with f32 moments: the master takes torch's
+/// update (the f32 bound of `run`, 2e-6, set before the first run), every
+/// bf16 weight is its master rounded to nearest bit for bit, and the f32
+/// entries are their masters. With bf16 moments, each moment reads back as a
+/// bf16 value, and the master's error to the f64 reference (started from
+/// tessl's widened moments) is within 2e-6 + lr * 2^-7: the stored moments
+/// are the reference's own start, so only the new moments' single rounding
+/// (2^-9 relative each, under 2^-8 in `m / sqrt(v)`) moves the update.
+#[test]
+fn an_f32_master_takes_torchs_update_and_rounds_the_weights() {
+    for moments_kind in [MomentStorage::F32, MomentStorage::Bf16] {
+        let (rt, model) = load_bf16();
+        let table = model.parameter_table().unwrap();
+        let wd = model.default_weight_decay(0.1).unwrap();
+        let config = AdamWConfig {
+            update: UpdateRule::F32Master,
+            moments: moments_kind,
+        };
+        let mut state = AdamW::with_config(&model, config).unwrap();
+        assert_eq!(state.config(), config);
+        assert!(state.describe().contains("update=f32-master"), "{}", state.describe());
+        let bound = match moments_kind {
+            MomentStorage::F32 => 2e-6,
+            _ => 2e-6 + LR * 2f64.powi(-7),
+        };
+        let mut worst = 0.0f64;
+        for step in 1..=4u64 {
+            let s = model.train_step(&ids(), GemmOperands::Bf16).unwrap();
+            let g = host(&rt, &model, &table, Some(&s.grads));
+            let master0 = aux(&rt, &model, &table, &state);
+            let (mut m, mut v) = moments(&rt, &model, &table, &state);
+            model.adamw_step(&s.grads, &mut state, &hyper(), &wd).unwrap();
+            let master1 = aux(&rt, &model, &table, &state);
+            let p1 = host(&rt, &model, &table, None);
+            let (m1, v1) = moments(&rt, &model, &table, &state);
+            for (i, info) in table.iter().enumerate() {
+                for k in 0..g[i].len() {
+                    let want = reference(&hyper(), step, wd[i], master0[i][k], g[i][k], &mut m[i][k], &mut v[i][k]);
+                    let err = (master1[i][k] - want).abs();
+                    worst = worst.max(err);
+                    assert!(
+                        err <= bound,
+                        "{moments_kind:?} step {step} {}[{k}]: master {} vs {want} (err {err:.3e})",
+                        info.name,
+                        master1[i][k]
+                    );
+                    assert_eq!(
+                        p1[i][k].to_bits(),
+                        bf16_or_f32(&info.name, master1[i][k]).to_bits(),
+                        "{} [{k}]: the weight is not its master rounded to nearest",
+                        info.name
+                    );
+                    if moments_kind == MomentStorage::Bf16 {
+                        assert_eq!(m1[i][k], bf16(m1[i][k]), "{}: a bf16 moment is not bf16", info.name);
+                        assert_eq!(v1[i][k], bf16(v1[i][k]), "{}: a bf16 moment is not bf16", info.name);
+                    }
+                }
+            }
+        }
+        eprintln!("{config}: worst master error {worst:.2e} (bound {bound:.2e})");
+    }
+}
+
+/// The fixture's bf16-stored entries are the matrices; the rest are f32.
+fn stored_bf16(name: &str) -> bool {
+    name.ends_with("proj.weight") || name == "embed_tokens.weight" || name.contains("proj_")
+}
+
+fn bf16_or_f32(name: &str, x: f64) -> f64 {
+    if stored_bf16(name) {
+        bf16(x)
+    } else {
+        x
+    }
+}
+
+/// [`UpdateRule::Bf16Kahan`]: one step from the effective value `p + c`
+/// lands on torch's update of it, to within one rounding of the new
+/// compensation (half a bf16 ulp of `c`, which is itself under half an ulp
+/// of `p`) plus the f32 bound: `|p1 + c1 - ref| <= 2^-9 |c1| + 2^-17 |ref|
+/// + 2e-6`. Set before the first run. At lr = 1e-4 most updates are below
+/// half an ulp of their weight, which plain rounding to nearest would drop:
+/// after the steps the bf16 weights with their compensation are much nearer
+/// the uninterrupted reference than the bf16 weights alone (checked, 4x).
+#[test]
+fn kahan_compensation_keeps_what_bf16_rounding_drops() {
+    let (rt, model) = load_bf16();
+    let table = model.parameter_table().unwrap();
+    let wd = model.default_weight_decay(0.0).unwrap();
+    let mut state = AdamW::with_config(
+        &model,
+        AdamWConfig {
+            update: UpdateRule::Bf16Kahan,
+            moments: MomentStorage::F32,
+        },
+    )
+    .unwrap();
+    let h = AdamWHyper {
+        lr: 1e-4,
+        ..AdamWHyper::default()
+    };
+    // The uninterrupted reference, in f64 from the loaded weights.
+    let mut ref_w = host(&rt, &model, &table, None);
+    let (mut rm, mut rv) = moments(&rt, &model, &table, &state);
+    let mut worst = 0.0f64;
+    for step in 1..=8u64 {
+        let s = model.train_step(&ids(), GemmOperands::Bf16).unwrap();
+        let g = host(&rt, &model, &table, Some(&s.grads));
+        let p0 = host(&rt, &model, &table, None);
+        let c0 = aux(&rt, &model, &table, &state);
+        let (mut m, mut v) = moments(&rt, &model, &table, &state);
+        model.adamw_step(&s.grads, &mut state, &h, &wd).unwrap();
+        let p1 = host(&rt, &model, &table, None);
+        let c1 = aux(&rt, &model, &table, &state);
+        for (i, info) in table.iter().enumerate() {
+            for k in 0..g[i].len() {
+                let want = reference(&h, step, wd[i], p0[i][k] + c0[i][k], g[i][k], &mut m[i][k], &mut v[i][k]);
+                let got = p1[i][k] + c1[i][k];
+                let err = (got - want).abs();
+                let bound = 2f64.powi(-9) * c1[i][k].abs() + 2f64.powi(-17) * want.abs() + 2e-6;
+                worst = worst.max(err);
+                assert!(
+                    err <= bound,
+                    "step {step} {}[{k}]: p + c = {got} vs {want} (err {err:.3e} > {bound:.3e})",
+                    info.name
+                );
+                ref_w[i][k] = reference(&h, step, wd[i], ref_w[i][k], g[i][k], &mut rm[i][k], &mut rv[i][k]);
+            }
+        }
+    }
+    let p = host(&rt, &model, &table, None);
+    let c = aux(&rt, &model, &table, &state);
+    let (mut with_c, mut without) = (0.0f64, 0.0f64);
+    for (i, info) in table.iter().enumerate() {
+        if !stored_bf16(&info.name) {
+            continue;
+        }
+        for k in 0..p[i].len() {
+            with_c += (p[i][k] + c[i][k] - ref_w[i][k]).abs();
+            without += (p[i][k] - ref_w[i][k]).abs();
+        }
+    }
+    eprintln!("kahan: worst one-step error {worst:.2e}; drift from the reference with c {with_c:.3e}, without {without:.3e}");
+    assert!(
+        without > 4.0 * with_c,
+        "the compensation does not hold what rounding dropped: {with_c:.3e} with, {without:.3e} without"
+    );
+}
+
+/// [`UpdateRule::Bf16Stochastic`]: every bf16 weight after a step is one of
+/// the two bf16 values around torch's update of it (within one ulp), the
+/// rounding is unbiased (over the embedding's elements, the mean of
+/// `(p1 - ref) / ulp` is within 4 standard errors of 0, each term's spread
+/// being at most 1/2), the same seed gives the same bits, and another seed
+/// different ones. Bounds set before the first run.
+#[test]
+fn stochastic_rounding_is_unbiased_and_reproducible() {
+    let run = |seed: u64| -> (Vec<Vec<f64>>, Vec<Vec<f64>>, Vec<ParamInfo>) {
+        let (rt, model) = load_bf16();
+        let table = model.parameter_table().unwrap();
+        let wd = model.default_weight_decay(0.1).unwrap();
+        let mut state = AdamW::with_config(
+            &model,
+            AdamWConfig {
+                update: UpdateRule::Bf16Stochastic { seed },
+                moments: MomentStorage::F32,
+            },
+        )
+        .unwrap();
+        assert!(state.describe().contains(&format!("seed={seed}")), "{}", state.describe());
+        let s = model.train_step(&ids(), GemmOperands::Bf16).unwrap();
+        let g = host(&rt, &model, &table, Some(&s.grads));
+        let p0 = host(&rt, &model, &table, None);
+        model.adamw_step(&s.grads, &mut state, &hyper(), &wd).unwrap();
+        let p1 = host(&rt, &model, &table, None);
+        let mut want = Vec::new();
+        for (i, _) in table.iter().enumerate() {
+            want.push(
+                (0..g[i].len())
+                    .map(|k| reference(&hyper(), 1, wd[i], p0[i][k], g[i][k], &mut 0.0, &mut 0.0))
+                    .collect::<Vec<f64>>(),
+            );
+        }
+        (p1, want, table)
+    };
+    let (p1, want, table) = run(7);
+    let (mut sum, mut n) = (0.0f64, 0usize);
+    for (i, info) in table.iter().enumerate() {
+        for k in 0..p1[i].len() {
+            let (got, w) = (p1[i][k], want[i][k]);
+            if stored_bf16(&info.name) {
+                let ulp = bf16_ulp(w);
+                assert!(
+                    (got - w).abs() <= ulp * (1.0 + 1e-3) + 2e-6,
+                    "{}[{k}]: {got} is not a bf16 neighbour of {w}",
+                    info.name
+                );
+                if info.name == "embed_tokens.weight" {
+                    sum += (got - w) / ulp;
+                    n += 1;
+                }
+            } else {
+                assert!((got - w).abs() <= 2e-6, "{}[{k}]: f32 entry {got} vs {w}", info.name);
+            }
+        }
+    }
+    let mean = sum / n as f64;
+    let limit = 4.0 * 0.5 / (n as f64).sqrt();
+    eprintln!("stochastic rounding: mean (p - ref) / ulp over {n} elements {mean:.4} (limit {limit:.4})");
+    assert!(mean.abs() <= limit, "biased: mean {mean} over {n}, limit {limit}");
+    let bits = |v: &[Vec<f64>]| -> Vec<u64> { v.iter().flatten().map(|x| x.to_bits()).collect() };
+    assert_eq!(bits(&run(7).0), bits(&p1), "the same seed gave different bits");
+    assert_ne!(bits(&run(8).0), bits(&p1), "another seed gave the same bits");
+}
+
+/// 8-bit block moments: after each step the decoded moments are torch's
+/// moments (from tessl's decoded moments before the step) to within half a
+/// code step of their block: `|m - ref| <= 0.0080 max_block |ref m|` and
+/// `|sqrt v - sqrt ref| <= 0.0040 max_block sqrt(ref v)`, plus 1e-12 (the
+/// companded codes' widest step is at the top, `(2q + 1) / (2 * 127^2)` and
+/// `/ (2 * 255^2)` of the scale). A non-zero v never decodes to zero. A
+/// read written back reads back the same bits. Bounds set before the first
+/// run.
+#[test]
+fn block8_moments_stay_within_half_a_code_of_torchs() {
+    for update in [UpdateRule::F32Master, UpdateRule::Bf16Kahan] {
+        let (rt, model) = load_bf16();
+        let table = model.parameter_table().unwrap();
+        let wd = model.default_weight_decay(0.1).unwrap();
+        let mut state = AdamW::with_config(
+            &model,
+            AdamWConfig {
+                update,
+                moments: MomentStorage::Block8,
+            },
+        )
+        .unwrap();
+        assert!(state.describe().contains("moments=block8/256"), "{}", state.describe());
+        for step in 1..=3u64 {
+            let s = model.train_step(&ids(), GemmOperands::Bf16).unwrap();
+            let g = host(&rt, &model, &table, Some(&s.grads));
+            let (mut m, mut v) = moments(&rt, &model, &table, &state);
+            model.adamw_step(&s.grads, &mut state, &hyper(), &wd).unwrap();
+            let (m1, v1) = moments(&rt, &model, &table, &state);
+            for (i, info) in table.iter().enumerate() {
+                for k in 0..g[i].len() {
+                    reference(&hyper(), step, wd[i], 0.0, g[i][k], &mut m[i][k], &mut v[i][k]);
+                }
+                for (b, chunk) in (0..g[i].len()).collect::<Vec<_>>().chunks(MOMENT_BLOCK).enumerate() {
+                    let sm = chunk.iter().map(|&k| m[i][k].abs()).fold(0.0, f64::max);
+                    let sv = chunk.iter().map(|&k| v[i][k].sqrt()).fold(0.0, f64::max);
+                    for &k in chunk {
+                        let em = (m1[i][k] - m[i][k]).abs();
+                        let ev = (v1[i][k].sqrt() - v[i][k].sqrt()).abs();
+                        assert!(
+                            em <= 0.0080 * sm + 1e-12,
+                            "{update:?} step {step} {} block {b} [{k}]: m {} vs {} (scale {sm:.3e})",
+                            info.name,
+                            m1[i][k],
+                            m[i][k]
+                        );
+                        assert!(
+                            ev <= 0.0040 * sv + 1e-12,
+                            "{update:?} step {step} {} block {b} [{k}]: v {} vs {} (scale {sv:.3e})",
+                            info.name,
+                            v1[i][k],
+                            v[i][k]
+                        );
+                        assert!(
+                            v[i][k] == 0.0 || v1[i][k] > 0.0,
+                            "{} [{k}]: a non-zero v decoded to zero",
+                            info.name
+                        );
+                    }
+                }
+            }
+        }
+        // Idempotent: what a read gives, written back, reads back the same.
+        let (m, v) = (alloc_table(&rt, &table), alloc_table(&rt, &table));
+        model.read_adamw_moment(&state, Moment::First, &m).unwrap();
+        model.read_adamw_moment(&state, Moment::Second, &v).unwrap();
+        model.write_adamw_moment(&mut state, Moment::First, &m).unwrap();
+        model.write_adamw_moment(&mut state, Moment::Second, &v).unwrap();
+        let (m2, v2) = moments(&rt, &model, &table, &state);
+        assert_eq!(to_host(&m), m2, "{update:?}: a first moment did not round-trip");
+        assert_eq!(to_host(&v), v2, "{update:?}: a second moment did not round-trip");
+    }
+}
+
+/// Every configuration resumes from a checkpoint (parameters, both moments,
+/// any auxiliary state, the step count) bit for bit: the third step of a
+/// fresh model and state restored after two steps is the uninterrupted
+/// run's third step.
+#[test]
+fn every_stored_precision_resumes_bit_for_bit() {
+    let configs = [
+        AdamWConfig {
+            update: UpdateRule::F32Master,
+            moments: MomentStorage::Bf16,
+        },
+        AdamWConfig {
+            update: UpdateRule::Bf16Kahan,
+            moments: MomentStorage::Block8,
+        },
+        AdamWConfig {
+            update: UpdateRule::Bf16Stochastic { seed: 11 },
+            moments: MomentStorage::Block8,
+        },
+        AdamWConfig {
+            update: UpdateRule::Bf16Stochastic { seed: 11 },
+            moments: MomentStorage::F32,
+        },
+    ];
+    let ids = ids();
+    for config in configs {
+        let (rt, a) = load_bf16();
+        let table = a.parameter_table().unwrap();
+        let wd = a.default_weight_decay(0.1).unwrap();
+        let mut sa = AdamW::with_config(&a, config).unwrap();
+        for _ in 0..2 {
+            let s = a.train_step(&ids, GemmOperands::Bf16).unwrap();
+            a.adamw_step(&s.grads, &mut sa, &hyper(), &wd).unwrap();
+        }
+        let (p2, m2, v2, x2) = (
+            alloc_table(&rt, &table),
+            alloc_table(&rt, &table),
+            alloc_table(&rt, &table),
+            alloc_table(&rt, &table),
+        );
+        a.read_parameters(&p2).unwrap();
+        a.read_adamw_moment(&sa, Moment::First, &m2).unwrap();
+        a.read_adamw_moment(&sa, Moment::Second, &v2).unwrap();
+        let has_aux = a.read_adamw_aux(&sa, &x2).is_ok();
+        let s = a.train_step(&ids, GemmOperands::Bf16).unwrap();
+        a.adamw_step(&s.grads, &mut sa, &hyper(), &wd).unwrap();
+        let want = host(&rt, &a, &table, None);
+
+        let (rb, b) = load_bf16();
+        let copy = |src: &[Tensor]| -> Vec<Tensor> {
+            src.iter()
+                .map(|t| {
+                    let n = rb.alloc_tensor_f32(t.shape()).unwrap();
+                    n.write_f32(&t.read_f32().unwrap()).unwrap();
+                    n
+                })
+                .collect()
+        };
+        b.write_parameters(&copy(&p2)).unwrap();
+        let mut sb = AdamW::with_config(&b, config).unwrap();
+        b.write_adamw_moment(&mut sb, Moment::First, &copy(&m2)).unwrap();
+        b.write_adamw_moment(&mut sb, Moment::Second, &copy(&v2)).unwrap();
+        if has_aux {
+            b.write_adamw_aux(&mut sb, &copy(&x2)).unwrap();
+        }
+        sb.set_step_count(2);
+        let s = b.train_step(&ids, GemmOperands::Bf16).unwrap();
+        b.adamw_step(&s.grads, &mut sb, &hyper(), &wd).unwrap();
+        let got = host(&rb, &b, &table, None);
+        assert!(got == want, "{config}: the resumed step is not the uninterrupted one");
+    }
+}
+
+/// What a configuration does not cover is refused before any state exists or
+/// anything moves.
+#[test]
+fn stored_precision_refusals() {
+    let (_, f32_model) = load();
+    let (rt, bf16_model) = load_bf16();
+    let e = |r: Result<AdamW, String>, needle: &str| {
+        let m = r.err().unwrap_or_else(|| panic!("{needle}: accepted"));
+        assert!(m.contains(needle), "{m:?} lacks {needle:?}");
+    };
+    e(AdamW::new(&bf16_model), "AdamW::with_config");
+    e(AdamW::with_config(&bf16_model, AdamWConfig::F32), "does not apply");
+    e(
+        AdamW::with_config(
+            &f32_model,
+            AdamWConfig {
+                update: UpdateRule::Bf16Kahan,
+                moments: MomentStorage::Bf16,
+            },
+        ),
+        "does not apply",
+    );
+    // An f32 model takes any moment storage.
+    AdamW::with_config(
+        &f32_model,
+        AdamWConfig {
+            update: UpdateRule::F32,
+            moments: MomentStorage::Block8,
+        },
+    )
+    .unwrap();
+    let mut sr = AdamW::with_config(
+        &bf16_model,
+        AdamWConfig {
+            update: UpdateRule::Bf16Stochastic { seed: 1 },
+            moments: MomentStorage::F32,
+        },
+    )
+    .unwrap();
+    let table = bf16_model.parameter_table().unwrap();
+    let err = bf16_model.read_adamw_aux(&sr, &alloc_table(&rt, &table)).unwrap_err();
+    assert!(err.contains("keeps no auxiliary state"), "{err}");
+    // State made for another model is refused.
+    let g = tessl::qwen35_train::Qwen35Grads::zeros_like(&f32_model).unwrap();
+    let wd = bf16_model.default_weight_decay(0.0).unwrap();
+    let err = f32_model
+        .adamw_step(&g, &mut sr, &AdamWHyper::default(), &wd)
+        .unwrap_err();
+    assert!(err.contains("another model"), "{err}");
+    assert_eq!(sr.step_count(), 0);
 }

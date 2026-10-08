@@ -19,7 +19,7 @@ use std::sync::Arc;
 use objc2_metal::MTLComputePipelineState;
 
 use crate::dispatch::{dispatch_1d, dispatch_2d, set_f32, set_gpu_buf, set_gpu_buf_offset, set_u32};
-use crate::nn::{dispatch_tg_1d, reduce_tptg, require, require_disjoint_writes};
+use crate::nn::{dispatch_tg_1d, reduce_tptg, require, require_disjoint_writes, require_runtime};
 use crate::qwen35::{require_window, AttnProjLayout, AttnShape, Cols, GdnGateLogits, GdnParams};
 use crate::runtime::{BufferKind, GpuRuntime};
 use crate::tensor::{DType, GpuBuffer, Tensor};
@@ -844,9 +844,12 @@ pub fn check_scatter_rows(what: &str, src: &Tensor, pos: &[u32], rows: usize, wi
 /// `src` added into rows `pos` of the dense f32 `[rows, width]` `dst` (the
 /// gradient of chosen positions back into the whole sequence's). `pos` must
 /// be in range and have no repeats (checked here), so the adds never race;
-/// each element gets one f32 add. `src` and `dst` must not overlap.
+/// each element gets one f32 add. `src` and `dst` must not overlap, and both
+/// must be `rt`'s.
 pub fn scatter_add_rows(rt: &Arc<GpuRuntime>, src: &Tensor, pos: &[u32], dst: &Tensor) -> Result<(), String> {
     const WHAT: &str = "qwen35_bwd::scatter_add_rows";
+    require_runtime(rt, &src.buffer, &format!("{WHAT}: src"))?;
+    require_runtime(rt, &dst.buffer, &format!("{WHAT}: dst"))?;
     let ds = dst.shape();
     if ds.len() != 2 || dst.dtype != DType::F32 {
         return Err(format!(

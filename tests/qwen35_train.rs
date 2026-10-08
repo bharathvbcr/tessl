@@ -16,6 +16,7 @@ use std::sync::Arc;
 
 use tessl::gemm::GemmOperands;
 use tessl::npy::read_npy;
+use tessl::qwen35_adamw::{AdamW, AdamWHyper};
 use tessl::qwen35_model::{LayerKind, Precision, Qwen35Config, Qwen35Model};
 use tessl::qwen35_train::{MixerGrads, Qwen35Grads, Supervise, TrainStep};
 use tessl::safetensors::SafeTensors;
@@ -719,6 +720,130 @@ fn a_loss_outside_tessl_flows_back_through_the_hidden_states() {
         .hidden(&[t], &rt.alloc_tensor_f32(&[1, h]).unwrap())
         .unwrap_err();
     assert!(m.contains(&format!("position {t} >= {t} tokens")), "{m}");
+}
+
+/// The backward rebuilds each layer from the weights it finds, so weights
+/// written after the forward would give gradients of a function the forward
+/// never evaluated. Both writers are refused, even one that writes the
+/// values already there; a forward taken after the write still runs.
+#[test]
+fn weights_written_between_forward_and_backward_are_refused() {
+    let dir = fixture();
+    let cfg = tiny_config();
+    let (rt, model) = load_rt(&dir, "model.", cfg, Precision::F32);
+    let mm = GemmOperands::ExactF32;
+    let ids = ids(&dir);
+    let bank = Qwen35Grads::zeros_like(&model).unwrap();
+    let refused = |p, writer: &str| {
+        let m = model
+            .train_backward_into(p, None, &bank, false)
+            .err()
+            .unwrap_or_else(|| panic!("a backward after {writer} was accepted"));
+        assert!(
+            m.contains("parameters were written after the step's forward"),
+            "{writer}: {m}"
+        );
+    };
+
+    let p = model.train_forward(&ids, mm, Supervise::Causal).unwrap();
+    let table = model.parameter_table().unwrap();
+    let values: Vec<Tensor> = table
+        .iter()
+        .map(|i| rt.alloc_tensor_f32(&i.storage_shape()).unwrap())
+        .collect();
+    model.read_parameters(&values).unwrap();
+    model.write_parameters(&values).unwrap();
+    refused(p, "write_parameters");
+
+    let p = model.train_forward(&ids, mm, Supervise::Causal).unwrap();
+    let step = model.train_step(&ids, mm).unwrap();
+    let mut state = AdamW::new(&model).unwrap();
+    let wd = model.default_weight_decay(0.0).unwrap();
+    model
+        .adamw_step(&step.grads, &mut state, &AdamWHyper::default(), &wd)
+        .unwrap();
+    refused(p, "adamw_step");
+
+    let p = model.train_forward(&ids, mm, Supervise::Causal).unwrap();
+    model
+        .train_backward_into(p, None, &bank, false)
+        .expect("a forward after the write sees the new weights");
+}
+
+/// A bank buffer allocated on another runtime is not in this one's residency
+/// set: binding it is a fault, not an error, so both bank entry points refuse
+/// it before anything runs.
+#[test]
+fn check_bank_refuses_a_foreign_runtime() {
+    let dir = fixture();
+    let cfg = tiny_config();
+    let (rt, model) = load_rt(&dir, "model.", cfg, Precision::F32);
+    let other = GpuRuntime::new().unwrap();
+    let mm = GemmOperands::ExactF32;
+    let ids = ids(&dir);
+    let refused = |r: Result<(), String>, what: &str| {
+        let m = r.err().unwrap_or_else(|| panic!("{what}: a foreign bank was accepted"));
+        assert!(m.contains("another runtime"), "{what}: {m}");
+        assert_eq!(rt.take_dispatch_count(), 0, "{what} encoded work before refusing");
+    };
+
+    let mut top = Qwen35Grads::zeros_like(&model).unwrap();
+    top.final_norm = other.alloc_buffer(top.final_norm.nbytes()).unwrap();
+    let mut layer = Qwen35Grads::zeros_like(&model).unwrap();
+    let l = &mut layer.layers[0];
+    l.down = other.alloc_tensor_f32(l.down.shape()).unwrap();
+    for bank in [&top, &layer] {
+        let _ = rt.take_dispatch_count();
+        refused(
+            model
+                .train_step_into(&ids, mm, Supervise::Causal, bank, false)
+                .map(|_| ()),
+            "train_step_into",
+        );
+        let p = model.train_forward(&ids, mm, Supervise::Causal).unwrap();
+        let _ = rt.take_dispatch_count();
+        refused(model.train_backward_into(p, None, bank, false), "train_backward_into");
+    }
+}
+
+/// `PendingStep::hidden`'s `out` is written by a kernel on the step's runtime.
+#[test]
+fn pending_hidden_refuses_a_foreign_runtime() {
+    let dir = fixture();
+    let cfg = tiny_config();
+    let (rt, model) = load_rt(&dir, "model.", cfg.clone(), Precision::F32);
+    let other = GpuRuntime::new().unwrap();
+    let ids = ids(&dir);
+    let p = model
+        .train_forward(&ids, GemmOperands::ExactF32, Supervise::Causal)
+        .unwrap();
+    let out = other.alloc_tensor_f32(&[1, cfg.hidden as usize]).unwrap();
+    let _ = rt.take_dispatch_count();
+    let m = p.hidden(&[0], &out).unwrap_err();
+    assert!(m.contains("another runtime"), "{m}");
+    assert_eq!(rt.take_dispatch_count(), 0, "hidden encoded work before refusing");
+}
+
+/// A foreign `dh` is refused by the backward's checks, before the step is
+/// consumed by anything that runs.
+#[test]
+fn backward_dh_refuses_a_foreign_runtime() {
+    let dir = fixture();
+    let cfg = tiny_config();
+    let (rt, model) = load_rt(&dir, "model.", cfg.clone(), Precision::F32);
+    let other = GpuRuntime::new().unwrap();
+    let ids = ids(&dir);
+    let bank = Qwen35Grads::zeros_like(&model).unwrap();
+    let p = model
+        .train_forward(&ids, GemmOperands::ExactF32, Supervise::Causal)
+        .unwrap();
+    let dh = other.alloc_tensor_f32(&[2, cfg.hidden as usize]).unwrap();
+    let _ = rt.take_dispatch_count();
+    let m = model
+        .train_backward_into(p, Some((&[0, 1], &dh)), &bank, false)
+        .unwrap_err();
+    assert!(m.contains("dh: buffer belongs to another runtime"), "{m}");
+    assert_eq!(rt.take_dispatch_count(), 0, "the backward encoded work before refusing");
 }
 
 /// A step that scores nothing in tessl (its embedding gradient goes straight

@@ -450,6 +450,11 @@ type PendingRecycle = (Retained<ProtocolObject<dyn MTLBuffer>>, usize);
 /// Hot allocations whose last owner dropped while GPU work may still reference them.
 type PendingRetirement = Retained<ProtocolObject<dyn MTLBuffer>>;
 
+/// An allocation other than a pooled buffer (a `mtl_tensor::GpuTensor`'s
+/// `MTLTensor`) whose owner dropped, held until the GPU has caught up, and
+/// whether it is in the residency set and must leave it then.
+type PendingRelease = (Retained<ProtocolObject<dyn MTLAllocation>>, bool);
+
 /// Persistent Hot scalar workspace (pos-buffer style). Bounded bump arena for
 /// stable GPU addresses across encodes — not a full decode ICB scalar graph.
 pub struct ParamsBuffer {
@@ -558,6 +563,10 @@ pub struct GpuRuntime {
     external_wraps: Mutex<HashMap<usize, usize>>,
     /// External wraps dropped since the last drain; released after CB wait.
     pending_external_release: Mutex<Vec<PendingRetirement>>,
+    /// Non-buffer allocations dropped since the last drain. Metal 4 command
+    /// buffers do not retain what they bind, so this queue is what keeps a
+    /// bound one alive until the work that reads it has completed.
+    pending_release: Mutex<Vec<PendingRelease>>,
     /// Bounded Hot params workspace for stable scalar binds (pos-buffer style).
     params: Mutex<Option<ParamsBuffer>>,
     /// Self weak handle so Drop on pooled buffers can schedule recycle.
@@ -776,6 +785,7 @@ impl GpuRuntime {
             pending_retirement: Mutex::new(Vec::new()),
             external_wraps: Mutex::new(HashMap::new()),
             pending_external_release: Mutex::new(Vec::new()),
+            pending_release: Mutex::new(Vec::new()),
             params: Mutex::new(None),
             self_weak: Mutex::new(Weak::new()),
             memory_info: Mutex::new(mem_info),
@@ -967,9 +977,13 @@ impl GpuRuntime {
 
     /// Mark allocation for removal on next residency commit (after CB complete).
     pub fn unregister_residency(&self, buf: &ProtocolObject<dyn MTLBuffer>) {
+        self.unregister_allocation(ProtocolObject::<dyn MTLAllocation>::from_ref(buf));
+    }
+
+    /// [`Self::unregister_residency`] for any [`MTLAllocation`].
+    fn unregister_allocation(&self, alloc: &ProtocolObject<dyn MTLAllocation>) {
         let m4 = &self.metal4;
-        m4.residency
-            .removeAllocation(ProtocolObject::<dyn MTLAllocation>::from_ref(buf));
+        m4.residency.removeAllocation(alloc);
         if let Ok(mut c) = m4.residency_count.lock() {
             *c = c.saturating_sub(1);
         }
@@ -1015,6 +1029,18 @@ impl GpuRuntime {
         }
     }
 
+    /// Hold `alloc` until submitted work has completed, then release it,
+    /// removing it from the residency set first when `resident`.
+    #[cfg(feature = "quant-prep")]
+    pub(crate) fn schedule_release(&self, alloc: Retained<ProtocolObject<dyn MTLAllocation>>, resident: bool) {
+        // A poisoned lock still holds the queue; dropping `alloc` here instead
+        // would free it under in-flight work.
+        self.pending_release
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .push((alloc, resident));
+    }
+
     /// After GPU catch-up: remove cold allocs from residency and return to
     /// freelist; remove retired Hot allocs from residency without recycling.
     fn drain_cold_recycles(&self) {
@@ -1033,8 +1059,12 @@ impl GpuRuntime {
         } else {
             Vec::new()
         };
-        if cold.is_empty() && retired.is_empty() && released.is_empty() {
+        let other = std::mem::take(&mut *self.pending_release.lock().unwrap_or_else(|p| p.into_inner()));
+        if cold.is_empty() && retired.is_empty() && released.is_empty() && other.is_empty() {
             return;
+        }
+        for (alloc, _) in other.iter().filter(|(_, resident)| *resident) {
+            self.unregister_allocation(alloc);
         }
         {
             let mut wraps = self.external_wraps.lock().unwrap_or_else(|p| p.into_inner());
@@ -1065,6 +1095,7 @@ impl GpuRuntime {
             }
         }
         drop(retired);
+        drop(other);
     }
 
     /// Lazily create and return the persistent params workspace.

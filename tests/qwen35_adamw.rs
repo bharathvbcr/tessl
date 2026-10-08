@@ -262,6 +262,57 @@ fn refusals_move_nothing() {
     );
 }
 
+/// Gradients or moments on another runtime (a bank built field by field, or
+/// an `AdamW` made for a model loaded there) are refused by `adamw_step`
+/// and `grad_sq_norm` — the two callers of the window check — and by the
+/// gradient-layout copies, before anything moves.
+#[test]
+fn adamw_and_grad_sq_norm_refuse_a_foreign_runtime() {
+    let (rt, model) = load();
+    let (_, elsewhere) = load();
+    let table = model.parameter_table().unwrap();
+    let wd = model.default_weight_decay(0.1).unwrap();
+    let ok = AdamWHyper::default();
+    let s = model.train_step(&ids(), GemmOperands::ExactF32).unwrap();
+    let before = host(&rt, &model, &table, None);
+    let e = |r: Result<(), String>, what: &str| {
+        let m = r.err().unwrap_or_else(|| panic!("{what}: accepted"));
+        assert!(m.contains("belongs to another runtime"), "{what}: {m}");
+    };
+
+    let mut foreign = elsewhere.train_step(&ids(), GemmOperands::ExactF32).unwrap().grads;
+    // The first slot is this model's, so the check must reach past it.
+    foreign.embed = s.grads.embed.clone();
+    let mut state = AdamW::new(&model).unwrap();
+    let _ = rt.take_dispatch_count();
+    e(model.adamw_step(&foreign, &mut state, &ok, &wd), "adamw_step gradients");
+    e(model.grad_sq_norm(&foreign).map(|_| ()), "grad_sq_norm");
+    let dst: Vec<Tensor> = table
+        .iter()
+        .map(|p| rt.alloc_tensor_f32(&p.storage_shape()).unwrap())
+        .collect();
+    e(model.read_gradients(&foreign, &dst), "read_gradients");
+    assert_eq!(rt.take_dispatch_count(), 0, "a refusal encoded work");
+
+    let mut their_state = AdamW::new(&elsewhere).unwrap();
+    e(
+        model.adamw_step(&s.grads, &mut their_state, &ok, &wd),
+        "adamw_step moments",
+    );
+    e(
+        model.write_adamw_moment(&mut their_state, Moment::First, &dst),
+        "write_adamw_moment",
+    );
+    assert_eq!(rt.take_dispatch_count(), 0, "a refusal encoded work");
+    assert_eq!(state.step_count(), 0);
+    assert_eq!(their_state.step_count(), 0);
+    assert_eq!(
+        host(&rt, &model, &table, None),
+        before,
+        "a refused step moved the parameters"
+    );
+}
+
 /// A checkpoint of the parameters, both moments and the step count, restored
 /// into a freshly loaded model and fresh state, resumes the run exactly: the
 /// third step gives the uninterrupted run's parameters bit for bit. Without

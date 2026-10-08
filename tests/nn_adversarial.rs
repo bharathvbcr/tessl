@@ -338,6 +338,30 @@ fn rms_norm_refuses_non_positive_or_non_finite_eps() {
 }
 
 #[test]
+fn scalar_row_reductions_refuse_out_aliasing_x_but_softmax_runs_in_place() {
+    with_gpu(|rt| {
+        // Big enough for every extent check, so only the overlap can refuse.
+        let r = roomy(rt);
+        refuses!(rt, "row_sum_f32 out == x", nn::row_sum_f32(rt, &r, &r, 64, 64));
+        refuses!(rt, "row_max_f32 out == x", nn::row_max_f32(rt, &r, &r, 64, 64));
+        let e = nn::row_sum_f32(rt, &r, &r, 64, 64).expect_err("row_sum_f32 out == x");
+        assert!(e.contains("overlaps read-only buffer x"), "{e}");
+
+        // Disjoint buffers still reduce, and softmax keeps its documented
+        // in-place contract.
+        let (rows, cols) = (4usize, 64usize);
+        let x = rt.alloc_buffer(rows * cols * 4).unwrap();
+        x.write_f32(&(0..rows * cols).map(|i| (i % cols) as f32).collect::<Vec<_>>());
+        let out = rt.alloc_buffer(rows * 4).unwrap();
+        nn::row_sum_f32(rt, &x, &out, rows as u32, cols as u32).expect("disjoint row_sum");
+        nn::softmax_rows_f32(rt, &x, &x, rows as u32, cols as u32).expect("in-place softmax");
+        rt.synchronize().expect("synchronize");
+        let want = (cols * (cols - 1) / 2) as f32;
+        assert!(out.read_f32()[..rows].iter().all(|&v| v == want));
+    });
+}
+
+#[test]
 fn dimension_products_that_overflow_are_refused_not_wrapped() {
     with_gpu(|rt| {
         let r = roomy(rt);

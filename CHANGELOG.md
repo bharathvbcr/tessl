@@ -166,6 +166,30 @@ All notable changes to `tessl` are recorded here. The format follows
 
 ### Fixed
 
+- **Four public boundaries now refuse inputs the rest of the API already
+  refused.**
+  - `nn::row_sum_f32` / `nn::row_max_f32` refuse `out` aliasing `x`.
+    Threadgroup `r` writes `out[r]`, which is an element of a row another
+    threadgroup may still be reading. `softmax_rows_f32` still runs in place.
+  - `Qwen35Model::train_backward_into` refuses a `PendingStep` whose forward
+    preceded `write_parameters` or `adamw_step`. The model now carries a
+    parameter generation that every weight writer bumps. Before this, the
+    backward rebuilt each layer with the new weights and returned gradients of
+    a function the forward never evaluated.
+  - Tensors from another `GpuRuntime` are refused before anything runs. This
+    covers gradient banks (`train_step_into`, `train_backward_into`), gradients
+    and AdamW moments (`adamw_step`, `grad_sq_norm`, `read_gradients`,
+    `write_adamw_moment`), `write_parameters` / `read_parameters` tensors,
+    `PendingStep::hidden`'s `out`, the backward's `dh`, and
+    `qwen35_bwd::scatter_add_rows`. Some of these used to be refused only once
+    GPU work was encoded, or after the pending step had been consumed.
+  - `quant-prep`: `mtl_tensor::alloc_device_tensor` registers the tensor for
+    residency. Dropping a `GpuTensor` now holds its `MTLTensor` until submitted
+    work completes, since Metal 4 command buffers do not retain bound
+    resources; only then does it leave the residency set.
+    `bind_mtl_tensor` refuses a tensor from another runtime. New probe kernels
+    (`kernels/mtl_tensor.metal`) test a dispatch that writes and then reads a
+    device-owned tensor.
 - **No kernel relies on an infinity under fast math.** `build.rs` compiles
   every kernel with `-fmetal-math-mode=fast`, whose IR marks float compares
   `fast` (including `ninf`), so `m == -INFINITY` was a compare the GPU

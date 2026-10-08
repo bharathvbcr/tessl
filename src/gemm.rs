@@ -27,6 +27,17 @@ enum Layout {
     NT,
 }
 
+/// MPP uses signed 32-bit extents/offset arithmetic, and the TensorOps kernels
+/// cast their extents to `int`. Every public GEMM operand — tensor or raw
+/// buffer — passes this before encoding, which also keeps every logical element
+/// address below `u32::MAX` for the kernels' `uint` tile arithmetic.
+pub(crate) fn require_i32_extent(numel: usize, what: &str) -> Result<(), String> {
+    if numel > i32::MAX as usize {
+        return Err(format!("{what} exceeds signed 32-bit kernel indexing"));
+    }
+    Ok(())
+}
+
 /// All public GEMM paths validate before casting, allocating scratch, or encoding.
 /// MPP uses signed 32-bit extents/offset arithmetic; reject larger matrices.
 fn validate_gemm(
@@ -41,9 +52,7 @@ fn validate_gemm(
         if t.shape.len() != 2 || t.shape.contains(&0) {
             return Err("GEMM requires nonempty rank-2 tensors".into());
         }
-        if t.numel() > i32::MAX as usize {
-            return Err("GEMM exceeds signed 32-bit kernel indexing".into());
-        }
+        require_i32_extent(t.numel(), "GEMM")?;
         require_byte_offset_alignment(t, 16, "GEMM")?;
     }
     if !std::sync::Arc::ptr_eq(a.runtime(), b.runtime()) || !std::sync::Arc::ptr_eq(a.runtime(), c.runtime()) {
@@ -537,9 +546,7 @@ pub fn gemm_batched(a: &Tensor, b: &Tensor, c: &Tensor, backend: GemmBackend, sp
         .ok_or_else(|| "batched GEMM: C matrix extent overflows usize".to_string())?;
     for t in [a, b, c] {
         t.validate()?;
-        if t.numel() > i32::MAX as usize {
-            return Err("batched GEMM exceeds signed 32-bit kernel indexing".into());
-        }
+        require_i32_extent(t.numel(), "batched GEMM")?;
         require_byte_offset_alignment(t, 16, "batched GEMM")?;
         // Batched GEMM is cooperative-destination only; require the stricter
         // 64-byte offset that those kernels / MTLTensor views expect.

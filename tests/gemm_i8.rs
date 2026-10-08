@@ -174,6 +174,46 @@ fn full_range_operands_do_not_overflow_the_accumulator() {
 }
 
 #[test]
+fn the_largest_accepted_k_is_exact_at_full_int8_range() {
+    with_gpu(|rt| {
+        // 131071 = floor(i32::MAX / 16384), the largest k at which k products of
+        // (-128)*(-128) still fit an int32. The sum, 16384 * 131071, has 17
+        // significant bits, so it survives the f32 store exactly.
+        let (m, n, k) = (8usize, 8usize, 131_071usize);
+        let ab = i8_buf(rt, &vec![-128i8; m * k]);
+        let bb = i8_buf(rt, &vec![-128i8; k * n]);
+        let cb = buf(rt, &vec![0.0f32; m * n]);
+
+        nn::gemm_i8_dequant(rt, &ab, &bb, &cb, m as u32, n as u32, k as u32, 1.0, None).expect("k = 131071");
+        rt.synchronize().unwrap();
+
+        let want = 16384i64 * k as i64;
+        assert!(want <= i32::MAX as i64);
+        let got = cb.read_f32();
+        for (e, g) in got.iter().take(m * n).enumerate() {
+            assert_eq!(*g as i64, want, "full-range accumulation at k = {k}, element {e}");
+        }
+    });
+}
+
+#[test]
+fn k_at_two_to_the_seventeen_is_refused() {
+    with_gpu(|rt| {
+        // 16384 * 131072 = 2^31, one past i32::MAX: all -128 operands would wrap
+        // the accumulator to -2^31. Every buffer is large enough that only the
+        // k bound can refuse.
+        let (m, n, k) = (8usize, 8usize, 131_072usize);
+        let ab = rt.alloc_buffer(m * k).unwrap();
+        let bb = rt.alloc_buffer(k * n).unwrap();
+        let cb = rt.alloc_buffer(m * n * 4).unwrap();
+        let err = nn::gemm_i8_dequant(rt, &ab, &bb, &cb, m as u32, n as u32, k as u32, 1.0, None)
+            .expect_err("k = 2^17 wraps an int32 accumulator");
+        assert!(err.contains("overflow"), "{err}");
+        assert_eq!(rt.take_dispatch_count(), 0);
+    });
+}
+
+#[test]
 fn a_k_that_could_overflow_int32_is_refused() {
     with_gpu(|rt| {
         let b = rt.alloc_buffer(1 << 20).unwrap();

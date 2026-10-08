@@ -4351,11 +4351,13 @@ pub fn gemm_i8_dequant(
     if !a_scale.is_finite() {
         return Err(format!("gemm_i8_dequant: a_scale must be finite, got {a_scale}"));
     }
-    // int32 accumulation is exact only while the running sum fits. Full-range
-    // int8 products reach 127*127 = 16129, so k above 2^31/16129 could
-    // overflow; refusing well below that keeps the "no rounding" claim true
-    // rather than nearly true.
-    const MAX_K_EXACT: u32 = 131_072;
+    // int32 accumulation is exact only while every partial sum fits. The
+    // largest int8 product in magnitude is (-128)*(-128) = 16384 (the most
+    // negative, -128*127, is smaller), so k such products stay within int32
+    // exactly when 16384*k <= i32::MAX, i.e. k <= 131071. At k = 2^17 all-(-128)
+    // operands sum to 2^31 and wrap to -2^31 silently.
+    const MAX_INT8_PRODUCT: u32 = 128 * 128;
+    const MAX_K_EXACT: u32 = i32::MAX as u32 / MAX_INT8_PRODUCT;
     if k > MAX_K_EXACT {
         return Err(format!(
             "gemm_i8_dequant: k = {k} exceeds {MAX_K_EXACT}, past which an int32 \
@@ -4363,9 +4365,23 @@ pub fn gemm_i8_dequant(
              silently rather than saturating"
         ));
     }
-    require::<i8>(rt, a, elems(m, k, "gemm_i8_dequant")?, "gemm_i8_dequant a")?;
-    require::<i8>(rt, b, elems(k, n, "gemm_i8_dequant")?, "gemm_i8_dequant b")?;
-    require::<f32>(rt, c, elems(m, n, "gemm_i8_dequant")?, "gemm_i8_dequant c")?;
+    let (a_elems, b_elems, c_elems) = (
+        elems(m, k, "gemm_i8_dequant")?,
+        elems(k, n, "gemm_i8_dequant")?,
+        elems(m, n, "gemm_i8_dequant")?,
+    );
+    // The kernel casts M, N and K to `int` for its TensorOps extents; the same
+    // guard every Tensor GEMM passes in `validate_gemm`.
+    for (numel, what) in [
+        (a_elems, "gemm_i8_dequant a"),
+        (b_elems, "gemm_i8_dequant b"),
+        (c_elems, "gemm_i8_dequant c"),
+    ] {
+        crate::gemm::require_i32_extent(numel, what)?;
+    }
+    require::<i8>(rt, a, a_elems, "gemm_i8_dequant a")?;
+    require::<i8>(rt, b, b_elems, "gemm_i8_dequant b")?;
+    require::<f32>(rt, c, c_elems, "gemm_i8_dequant c")?;
     if let Some(sc) = b_scale {
         require::<f32>(rt, sc, n as usize, "gemm_i8_dequant b_scale")?;
     }

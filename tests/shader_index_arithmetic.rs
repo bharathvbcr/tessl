@@ -6,6 +6,7 @@
 
 const DISPATCH_RS: &str = include_str!("../src/dispatch.rs");
 const GEMM_RS: &str = include_str!("../src/gemm.rs");
+const NN_RS: &str = include_str!("../src/nn.rs");
 const EMBED: &str = include_str!("../kernels/embed_lookup.metal");
 const GEMV_Q4: &str = include_str!("../kernels/gemv_q4.metal");
 const GEMV_Q4_MLX: &str = include_str!("../kernels/gemv_q4_mlx.metal");
@@ -80,7 +81,10 @@ const EXEMPT_KERNELS: &[(&str, &str)] = &[
         "TensorOps addresses through MTLTensor descriptors and `uint` tile \
          arithmetic. That is bounded by the host contract asserted in \
          `utility_and_simdgroup_pointer_math_is_explicitly_wide`: every public \
-         GEMM operand stays under `i32::MAX` elements, which is below \
+         entry point into this file — the Tensor GEMMs through \
+         `validate_gemm`, `gemm_batched`, and the raw-buffer \
+         `nn::gemm_i8_dequant` — refuses an operand over `i32::MAX` elements \
+         through `gemm::require_i32_extent`, and `i32::MAX` is below \
          `u32::MAX`. The only raw pointer maths is the batch stride, which is \
          widened.",
     ),
@@ -750,8 +754,34 @@ fn utility_and_simdgroup_pointer_math_is_explicitly_wide() {
     // contract, which also puts every logical element address below `u32::MAX`.
     require(
         GEMM_RS,
-        "if t.numel() > i32::MAX as usize",
+        "if numel > i32::MAX as usize",
         "TensorOps host addressability contract",
+    );
+    for (source, call, label) in [
+        (
+            GEMM_RS,
+            "require_i32_extent(t.numel(), \"GEMM\")?",
+            "validate_gemm extent guard",
+        ),
+        (
+            GEMM_RS,
+            "require_i32_extent(t.numel(), \"batched GEMM\")?",
+            "gemm_batched extent guard",
+        ),
+        (
+            NN_RS,
+            "crate::gemm::require_i32_extent(numel, what)?",
+            "gemm_i8_dequant extent guard",
+        ),
+    ] {
+        require(source, call, label);
+    }
+    // Every TensorOps pipeline the crate looks up outside gemm.rs must be one
+    // whose entry point is listed above.
+    assert_eq!(
+        NN_RS.matches("pipeline(\"matmul2d_tensorops").count(),
+        1,
+        "a new TensorOps entry point in nn.rs must pass require_i32_extent"
     );
     assert!((i32::MAX as u64) < u64::from(u32::MAX));
 }

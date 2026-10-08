@@ -338,6 +338,29 @@ fn rms_norm_refuses_non_positive_or_non_finite_eps() {
 }
 
 #[test]
+fn an_int8_gemm_operand_past_i32_max_elements_is_refused_with_room_in_its_buffer() {
+    with_gpu(|rt| {
+        // TensorOps takes signed 32-bit extents, and the int8 kernel casts M, N
+        // and K to `int`. A here really holds m * k = 16385 * 131071 elements,
+        // i32::MAX + 114689, so neither the buffer-size check nor the k bound
+        // can refuse; only the extent guard can.
+        let (m, k) = (16_385u32, 131_071u32);
+        let a_elems = m as usize * k as usize;
+        assert!(a_elems > i32::MAX as usize);
+        let a = rt.alloc_buffer(a_elems).expect("alloc A past i32::MAX bytes");
+        let b = rt.alloc_buffer(k as usize).expect("alloc B");
+        let c = rt.alloc_buffer(m as usize * 4).expect("alloc C");
+        let err = nn::gemm_i8_dequant(rt, &a, &b, &c, m, 1, k, 1.0, None).expect_err("A past i32::MAX elements");
+        assert!(err.contains("signed 32-bit"), "{err}");
+        assert_eq!(
+            rt.take_dispatch_count(),
+            0,
+            "gemm_i8_dequant encoded work before refusing"
+        );
+    });
+}
+
+#[test]
 fn dimension_products_that_overflow_are_refused_not_wrapped() {
     with_gpu(|rt| {
         let r = roomy(rt);

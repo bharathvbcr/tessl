@@ -21,6 +21,7 @@ static BARRIERS: AtomicU64 = AtomicU64::new(0);
 static COMMITS: AtomicU64 = AtomicU64::new(0);
 static COLD_ALLOCS: AtomicU64 = AtomicU64::new(0);
 static SYNC_WAIT_US: AtomicU64 = AtomicU64::new(0);
+static SYNC_WAITS: AtomicU64 = AtomicU64::new(0);
 static RESIDENCY_FLUSHES: AtomicU64 = AtomicU64::new(0);
 
 pub fn set_enabled(on: bool) {
@@ -37,6 +38,7 @@ pub fn reset_token_counters() {
     COMMITS.store(0, Ordering::Relaxed);
     COLD_ALLOCS.store(0, Ordering::Relaxed);
     SYNC_WAIT_US.store(0, Ordering::Relaxed);
+    SYNC_WAITS.store(0, Ordering::Relaxed);
     RESIDENCY_FLUSHES.store(0, Ordering::Relaxed);
 }
 
@@ -47,6 +49,8 @@ pub struct Snapshot {
     pub commits: u64,
     pub cold_allocs: u64,
     pub sync_wait_us: u64,
+    /// Host waits on the GPU (waited commits and allocator catch-ups).
+    pub sync_waits: u64,
     pub residency_flushes: u64,
 }
 
@@ -57,6 +61,7 @@ pub fn snapshot() -> Snapshot {
         commits: COMMITS.load(Ordering::Relaxed),
         cold_allocs: COLD_ALLOCS.load(Ordering::Relaxed),
         sync_wait_us: SYNC_WAIT_US.load(Ordering::Relaxed),
+        sync_waits: SYNC_WAITS.load(Ordering::Relaxed),
         residency_flushes: RESIDENCY_FLUSHES.load(Ordering::Relaxed),
     }
 }
@@ -96,9 +101,10 @@ pub fn on_residency_flush() {
     }
 }
 
-/// Accumulate SharedEvent / synchronize wall time.
+/// Accumulate SharedEvent / synchronize wall time, and count the wait.
 pub fn record_sync_wait(t0: Instant) {
     if enabled() {
+        SYNC_WAITS.fetch_add(1, Ordering::Relaxed);
         SYNC_WAIT_US.fetch_add(t0.elapsed().as_micros() as u64, Ordering::Relaxed);
     }
 }

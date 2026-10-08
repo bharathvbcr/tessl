@@ -46,7 +46,7 @@ that fusion for Metal.
 | 2. Gates, l2norm, q scale folded into the loads | (inside 1 and 5) | — | `beta = b.sigmoid()`, `g = -A_log.exp() * softplus(a + dt_bias)`, `l2norm`, `q * Dk^-0.5` |
 | 3. Causal conv + SiLU | `qwen35_conv1d_silu` | `conv1d_silu` | `causal_conv1d_fn` / `causal_conv1d_update` |
 | 4. Gated RMSNorm | `qwen35_gated_rms_norm_{f32,bf16}` | `gated_rms_norm` | `Qwen3_5RMSNormGated` |
-| 5. Read-only GDN decode | `qwen35_gdn_recurrent` | `gdn_recurrent` | `torch_recurrent_gated_delta_rule` |
+| 5. Read-only GDN decode | `qwen35_gdn_recurrent`, `qwen35_gdn_recurrent_bv16` | `gdn_recurrent`, `gdn_recurrent_with_slice` | `torch_recurrent_gated_delta_rule` |
 | 6. Attention extras | `qwen35_attn_qk_norm_rope`, `qwen35_attn_gate_{f32,bf16}` | `attn_qk_norm_rope`, `attn_output_gate` | `q_norm`/`k_norm` (`1 + w`), `apply_rotary_pos_emb` (partial), `* sigmoid(gate)` |
 | 6b. Decode loops replayed from an ICB | `qwen35_attn_qk_norm_rope_posbuf` | `attn_qk_norm_rope_posbuf` | the position comes from a device buffer, like `rms_qkv_rope_posbuf` |
 | 6c. Shared-prefix attention | `qwen35_attn_prefix_rows`, `qwen35_attn_prefix_decode_{partial,reduce}` (+ `slot_base` in 6/6b) | `attn_prefix_rows`, `attn_prefix_decode`, `attn_qk_norm_rope_suffix{,_posbuf}` | attention over a per-row copy of a shared KV prefix, without the copy |
@@ -152,6 +152,18 @@ Cols16 round. Output and final state had 0 mismatches at both lengths. That
 1.10× batch-2 figure is the older probe and is not grounds to revert the
 `Cols16` default. Batch 4 was not remeasured; the older probe's 1.30× at
 batch 4 stays unrechecked.
+
+The decode recurrence has the same option. `qwen35_gdn_recurrent_bv16`
+(`gdn_recurrent_with_slice(.., GdnScanSlice::Cols16)`) gives each of two
+simdgroups two 32-row key blocks of the same 16 columns, so every sum runs in
+the 32-column kernel's order and the results are bit-identical, with twice the
+threadgroups. A paired sweep (`bench_qwen35_layers --paired-gdn-recurrent 1 2
+4`, ABBA, 256 launches per command buffer, 5 processes, M5 Pro under load)
+found no consistent difference: per-process median ratios 16/32 of 0.94–1.09
+at batch 1 and 1.00–1.06 at batch 4, minimum times within ~3%
+(`bench/results/qwen35_decode_token_after_m5pro.txt`). At about 8 µs per
+launch back to back, a batch-1 decode step is not limited by the 64
+threadgroups, so `GDN_RECURRENT_SLICE` stays `Cols32`.
 
 ### Many questions from one prefilled snapshot
 

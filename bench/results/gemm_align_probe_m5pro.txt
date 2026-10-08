@@ -1,0 +1,292 @@
+# GEMM operand-view alignment probe
+#
+# Machine: Apple M5 Pro, macOS 27.0.1. Base commit 4e5faac plus the probe.
+# Command:
+#   MTL_DEBUG_LAYER=1 MTL_SHADER_VALIDATION=1 \
+#     cargo test --release --lib alignment_probe_report -- --ignored --nocapture
+# The run printed "Metal API Validation Enabled" and "Metal GPU Validation
+# Enabled", and reported no validation errors.
+#
+# Method (src/gemm.rs, mod alignment_probe): each kernel family is encoded
+# through its raw dispatch helper, below the host's alignment gate. A, B, C
+# (and the epilogue bias) are views starting `offset_bytes` into their own
+# buffers. For batched runs the base is 0 and every stride is a whole matrix
+# rounded to 64 bytes plus `offset_bytes`, so batch i starts i*offset bytes
+# off a 64-byte boundary. Non-accumulating outputs start as NaN. Accumulating
+# outputs start from one fixed finite C. Each run is compared bit for bit
+# with the same kernel at offset 0, which is first checked against an f64
+# CPU reference. Shapes: (144, 96, 80) has 64-byte row strides;
+# (130, 97, 70) has odd row strides. Both are ragged against every tile.
+#
+# Result: all 264 runs are bit-identical to their aligned run, including the
+# 4- and 8-byte offsets. On this machine, 64 bytes is not a requirement of
+# any family: cooperative, accumulate, epilogue or batched. The rule in
+# src/gemm.rs (GEMM_VIEW_ALIGN) is 16 bytes for every family. Offsets below
+# 16 are recorded here but not relied on.
+#
+probe	shape(m,n,k)	offset_bytes	outcome
+ExactNn	(144, 96, 80)	4	bit-identical
+ExactNn	(144, 96, 80)	8	bit-identical
+ExactNn	(144, 96, 80)	16	bit-identical
+ExactNn	(144, 96, 80)	32	bit-identical
+ExactNn	(144, 96, 80)	48	bit-identical
+ExactNn	(144, 96, 80)	64	bit-identical
+ExactNn	(130, 97, 70)	4	bit-identical
+ExactNn	(130, 97, 70)	8	bit-identical
+ExactNn	(130, 97, 70)	16	bit-identical
+ExactNn	(130, 97, 70)	32	bit-identical
+ExactNn	(130, 97, 70)	48	bit-identical
+ExactNn	(130, 97, 70)	64	bit-identical
+ExactTn	(144, 96, 80)	4	bit-identical
+ExactTn	(144, 96, 80)	8	bit-identical
+ExactTn	(144, 96, 80)	16	bit-identical
+ExactTn	(144, 96, 80)	32	bit-identical
+ExactTn	(144, 96, 80)	48	bit-identical
+ExactTn	(144, 96, 80)	64	bit-identical
+ExactTn	(130, 97, 70)	4	bit-identical
+ExactTn	(130, 97, 70)	8	bit-identical
+ExactTn	(130, 97, 70)	16	bit-identical
+ExactTn	(130, 97, 70)	32	bit-identical
+ExactTn	(130, 97, 70)	48	bit-identical
+ExactTn	(130, 97, 70)	64	bit-identical
+ExactNt	(144, 96, 80)	4	bit-identical
+ExactNt	(144, 96, 80)	8	bit-identical
+ExactNt	(144, 96, 80)	16	bit-identical
+ExactNt	(144, 96, 80)	32	bit-identical
+ExactNt	(144, 96, 80)	48	bit-identical
+ExactNt	(144, 96, 80)	64	bit-identical
+ExactNt	(130, 97, 70)	4	bit-identical
+ExactNt	(130, 97, 70)	8	bit-identical
+ExactNt	(130, 97, 70)	16	bit-identical
+ExactNt	(130, 97, 70)	32	bit-identical
+ExactNt	(130, 97, 70)	48	bit-identical
+ExactNt	(130, 97, 70)	64	bit-identical
+ExactTnAccum	(144, 96, 80)	4	bit-identical
+ExactTnAccum	(144, 96, 80)	8	bit-identical
+ExactTnAccum	(144, 96, 80)	16	bit-identical
+ExactTnAccum	(144, 96, 80)	32	bit-identical
+ExactTnAccum	(144, 96, 80)	48	bit-identical
+ExactTnAccum	(144, 96, 80)	64	bit-identical
+ExactTnAccum	(130, 97, 70)	4	bit-identical
+ExactTnAccum	(130, 97, 70)	8	bit-identical
+ExactTnAccum	(130, 97, 70)	16	bit-identical
+ExactTnAccum	(130, 97, 70)	32	bit-identical
+ExactTnAccum	(130, 97, 70)	48	bit-identical
+ExactTnAccum	(130, 97, 70)	64	bit-identical
+ExactNtAccum	(144, 96, 80)	4	bit-identical
+ExactNtAccum	(144, 96, 80)	8	bit-identical
+ExactNtAccum	(144, 96, 80)	16	bit-identical
+ExactNtAccum	(144, 96, 80)	32	bit-identical
+ExactNtAccum	(144, 96, 80)	48	bit-identical
+ExactNtAccum	(144, 96, 80)	64	bit-identical
+ExactNtAccum	(130, 97, 70)	4	bit-identical
+ExactNtAccum	(130, 97, 70)	8	bit-identical
+ExactNtAccum	(130, 97, 70)	16	bit-identical
+ExactNtAccum	(130, 97, 70)	32	bit-identical
+ExactNtAccum	(130, 97, 70)	48	bit-identical
+ExactNtAccum	(130, 97, 70)	64	bit-identical
+Simdgroup	(144, 96, 80)	4	bit-identical
+Simdgroup	(144, 96, 80)	8	bit-identical
+Simdgroup	(144, 96, 80)	16	bit-identical
+Simdgroup	(144, 96, 80)	32	bit-identical
+Simdgroup	(144, 96, 80)	48	bit-identical
+Simdgroup	(144, 96, 80)	64	bit-identical
+Simdgroup	(130, 97, 70)	4	bit-identical
+Simdgroup	(130, 97, 70)	8	bit-identical
+Simdgroup	(130, 97, 70)	16	bit-identical
+Simdgroup	(130, 97, 70)	32	bit-identical
+Simdgroup	(130, 97, 70)	48	bit-identical
+Simdgroup	(130, 97, 70)	64	bit-identical
+CoopNn(RelaxedF32, Wide)	(144, 96, 80)	4	bit-identical
+CoopNn(RelaxedF32, Wide)	(144, 96, 80)	8	bit-identical
+CoopNn(RelaxedF32, Wide)	(144, 96, 80)	16	bit-identical
+CoopNn(RelaxedF32, Wide)	(144, 96, 80)	32	bit-identical
+CoopNn(RelaxedF32, Wide)	(144, 96, 80)	48	bit-identical
+CoopNn(RelaxedF32, Wide)	(144, 96, 80)	64	bit-identical
+CoopNn(RelaxedF32, Wide)	(130, 97, 70)	4	bit-identical
+CoopNn(RelaxedF32, Wide)	(130, 97, 70)	8	bit-identical
+CoopNn(RelaxedF32, Wide)	(130, 97, 70)	16	bit-identical
+CoopNn(RelaxedF32, Wide)	(130, 97, 70)	32	bit-identical
+CoopNn(RelaxedF32, Wide)	(130, 97, 70)	48	bit-identical
+CoopNn(RelaxedF32, Wide)	(130, 97, 70)	64	bit-identical
+CoopNn(RelaxedF32, Narrow)	(144, 96, 80)	4	bit-identical
+CoopNn(RelaxedF32, Narrow)	(144, 96, 80)	8	bit-identical
+CoopNn(RelaxedF32, Narrow)	(144, 96, 80)	16	bit-identical
+CoopNn(RelaxedF32, Narrow)	(144, 96, 80)	32	bit-identical
+CoopNn(RelaxedF32, Narrow)	(144, 96, 80)	48	bit-identical
+CoopNn(RelaxedF32, Narrow)	(144, 96, 80)	64	bit-identical
+CoopNn(RelaxedF32, Narrow)	(130, 97, 70)	4	bit-identical
+CoopNn(RelaxedF32, Narrow)	(130, 97, 70)	8	bit-identical
+CoopNn(RelaxedF32, Narrow)	(130, 97, 70)	16	bit-identical
+CoopNn(RelaxedF32, Narrow)	(130, 97, 70)	32	bit-identical
+CoopNn(RelaxedF32, Narrow)	(130, 97, 70)	48	bit-identical
+CoopNn(RelaxedF32, Narrow)	(130, 97, 70)	64	bit-identical
+CoopNn(Bf16, Wide)	(144, 96, 80)	4	bit-identical
+CoopNn(Bf16, Wide)	(144, 96, 80)	8	bit-identical
+CoopNn(Bf16, Wide)	(144, 96, 80)	16	bit-identical
+CoopNn(Bf16, Wide)	(144, 96, 80)	32	bit-identical
+CoopNn(Bf16, Wide)	(144, 96, 80)	48	bit-identical
+CoopNn(Bf16, Wide)	(144, 96, 80)	64	bit-identical
+CoopNn(Bf16, Wide)	(130, 97, 70)	4	bit-identical
+CoopNn(Bf16, Wide)	(130, 97, 70)	8	bit-identical
+CoopNn(Bf16, Wide)	(130, 97, 70)	16	bit-identical
+CoopNn(Bf16, Wide)	(130, 97, 70)	32	bit-identical
+CoopNn(Bf16, Wide)	(130, 97, 70)	48	bit-identical
+CoopNn(Bf16, Wide)	(130, 97, 70)	64	bit-identical
+CoopNn(Bf16, Narrow)	(144, 96, 80)	4	bit-identical
+CoopNn(Bf16, Narrow)	(144, 96, 80)	8	bit-identical
+CoopNn(Bf16, Narrow)	(144, 96, 80)	16	bit-identical
+CoopNn(Bf16, Narrow)	(144, 96, 80)	32	bit-identical
+CoopNn(Bf16, Narrow)	(144, 96, 80)	48	bit-identical
+CoopNn(Bf16, Narrow)	(144, 96, 80)	64	bit-identical
+CoopNn(Bf16, Narrow)	(130, 97, 70)	4	bit-identical
+CoopNn(Bf16, Narrow)	(130, 97, 70)	8	bit-identical
+CoopNn(Bf16, Narrow)	(130, 97, 70)	16	bit-identical
+CoopNn(Bf16, Narrow)	(130, 97, 70)	32	bit-identical
+CoopNn(Bf16, Narrow)	(130, 97, 70)	48	bit-identical
+CoopNn(Bf16, Narrow)	(130, 97, 70)	64	bit-identical
+CoopNn(F16, Wide)	(144, 96, 80)	4	bit-identical
+CoopNn(F16, Wide)	(144, 96, 80)	8	bit-identical
+CoopNn(F16, Wide)	(144, 96, 80)	16	bit-identical
+CoopNn(F16, Wide)	(144, 96, 80)	32	bit-identical
+CoopNn(F16, Wide)	(144, 96, 80)	48	bit-identical
+CoopNn(F16, Wide)	(144, 96, 80)	64	bit-identical
+CoopNn(F16, Wide)	(130, 97, 70)	4	bit-identical
+CoopNn(F16, Wide)	(130, 97, 70)	8	bit-identical
+CoopNn(F16, Wide)	(130, 97, 70)	16	bit-identical
+CoopNn(F16, Wide)	(130, 97, 70)	32	bit-identical
+CoopNn(F16, Wide)	(130, 97, 70)	48	bit-identical
+CoopNn(F16, Wide)	(130, 97, 70)	64	bit-identical
+CoopNn(F16, Narrow)	(144, 96, 80)	4	bit-identical
+CoopNn(F16, Narrow)	(144, 96, 80)	8	bit-identical
+CoopNn(F16, Narrow)	(144, 96, 80)	16	bit-identical
+CoopNn(F16, Narrow)	(144, 96, 80)	32	bit-identical
+CoopNn(F16, Narrow)	(144, 96, 80)	48	bit-identical
+CoopNn(F16, Narrow)	(144, 96, 80)	64	bit-identical
+CoopNn(F16, Narrow)	(130, 97, 70)	4	bit-identical
+CoopNn(F16, Narrow)	(130, 97, 70)	8	bit-identical
+CoopNn(F16, Narrow)	(130, 97, 70)	16	bit-identical
+CoopNn(F16, Narrow)	(130, 97, 70)	32	bit-identical
+CoopNn(F16, Narrow)	(130, 97, 70)	48	bit-identical
+CoopNn(F16, Narrow)	(130, 97, 70)	64	bit-identical
+CoopTnBf16	(144, 96, 80)	4	bit-identical
+CoopTnBf16	(144, 96, 80)	8	bit-identical
+CoopTnBf16	(144, 96, 80)	16	bit-identical
+CoopTnBf16	(144, 96, 80)	32	bit-identical
+CoopTnBf16	(144, 96, 80)	48	bit-identical
+CoopTnBf16	(144, 96, 80)	64	bit-identical
+CoopTnBf16	(130, 97, 70)	4	bit-identical
+CoopTnBf16	(130, 97, 70)	8	bit-identical
+CoopTnBf16	(130, 97, 70)	16	bit-identical
+CoopTnBf16	(130, 97, 70)	32	bit-identical
+CoopTnBf16	(130, 97, 70)	48	bit-identical
+CoopTnBf16	(130, 97, 70)	64	bit-identical
+CoopNtBf16	(144, 96, 80)	4	bit-identical
+CoopNtBf16	(144, 96, 80)	8	bit-identical
+CoopNtBf16	(144, 96, 80)	16	bit-identical
+CoopNtBf16	(144, 96, 80)	32	bit-identical
+CoopNtBf16	(144, 96, 80)	48	bit-identical
+CoopNtBf16	(144, 96, 80)	64	bit-identical
+CoopNtBf16	(130, 97, 70)	4	bit-identical
+CoopNtBf16	(130, 97, 70)	8	bit-identical
+CoopNtBf16	(130, 97, 70)	16	bit-identical
+CoopNtBf16	(130, 97, 70)	32	bit-identical
+CoopNtBf16	(130, 97, 70)	48	bit-identical
+CoopNtBf16	(130, 97, 70)	64	bit-identical
+CoopTnAccumBf16	(144, 96, 80)	4	bit-identical
+CoopTnAccumBf16	(144, 96, 80)	8	bit-identical
+CoopTnAccumBf16	(144, 96, 80)	16	bit-identical
+CoopTnAccumBf16	(144, 96, 80)	32	bit-identical
+CoopTnAccumBf16	(144, 96, 80)	48	bit-identical
+CoopTnAccumBf16	(144, 96, 80)	64	bit-identical
+CoopTnAccumBf16	(130, 97, 70)	4	bit-identical
+CoopTnAccumBf16	(130, 97, 70)	8	bit-identical
+CoopTnAccumBf16	(130, 97, 70)	16	bit-identical
+CoopTnAccumBf16	(130, 97, 70)	32	bit-identical
+CoopTnAccumBf16	(130, 97, 70)	48	bit-identical
+CoopTnAccumBf16	(130, 97, 70)	64	bit-identical
+CoopNtAccumBf16	(144, 96, 80)	4	bit-identical
+CoopNtAccumBf16	(144, 96, 80)	8	bit-identical
+CoopNtAccumBf16	(144, 96, 80)	16	bit-identical
+CoopNtAccumBf16	(144, 96, 80)	32	bit-identical
+CoopNtAccumBf16	(144, 96, 80)	48	bit-identical
+CoopNtAccumBf16	(144, 96, 80)	64	bit-identical
+CoopNtAccumBf16	(130, 97, 70)	4	bit-identical
+CoopNtAccumBf16	(130, 97, 70)	8	bit-identical
+CoopNtAccumBf16	(130, 97, 70)	16	bit-identical
+CoopNtAccumBf16	(130, 97, 70)	32	bit-identical
+CoopNtAccumBf16	(130, 97, 70)	48	bit-identical
+CoopNtAccumBf16	(130, 97, 70)	64	bit-identical
+Epilogue(RelaxedF32)	(144, 96, 80)	4	bit-identical
+Epilogue(RelaxedF32)	(144, 96, 80)	8	bit-identical
+Epilogue(RelaxedF32)	(144, 96, 80)	16	bit-identical
+Epilogue(RelaxedF32)	(144, 96, 80)	32	bit-identical
+Epilogue(RelaxedF32)	(144, 96, 80)	48	bit-identical
+Epilogue(RelaxedF32)	(144, 96, 80)	64	bit-identical
+Epilogue(RelaxedF32)	(130, 97, 70)	4	bit-identical
+Epilogue(RelaxedF32)	(130, 97, 70)	8	bit-identical
+Epilogue(RelaxedF32)	(130, 97, 70)	16	bit-identical
+Epilogue(RelaxedF32)	(130, 97, 70)	32	bit-identical
+Epilogue(RelaxedF32)	(130, 97, 70)	48	bit-identical
+Epilogue(RelaxedF32)	(130, 97, 70)	64	bit-identical
+Epilogue(Bf16)	(144, 96, 80)	4	bit-identical
+Epilogue(Bf16)	(144, 96, 80)	8	bit-identical
+Epilogue(Bf16)	(144, 96, 80)	16	bit-identical
+Epilogue(Bf16)	(144, 96, 80)	32	bit-identical
+Epilogue(Bf16)	(144, 96, 80)	48	bit-identical
+Epilogue(Bf16)	(144, 96, 80)	64	bit-identical
+Epilogue(Bf16)	(130, 97, 70)	4	bit-identical
+Epilogue(Bf16)	(130, 97, 70)	8	bit-identical
+Epilogue(Bf16)	(130, 97, 70)	16	bit-identical
+Epilogue(Bf16)	(130, 97, 70)	32	bit-identical
+Epilogue(Bf16)	(130, 97, 70)	48	bit-identical
+Epilogue(Bf16)	(130, 97, 70)	64	bit-identical
+Epilogue(F16)	(144, 96, 80)	4	bit-identical
+Epilogue(F16)	(144, 96, 80)	8	bit-identical
+Epilogue(F16)	(144, 96, 80)	16	bit-identical
+Epilogue(F16)	(144, 96, 80)	32	bit-identical
+Epilogue(F16)	(144, 96, 80)	48	bit-identical
+Epilogue(F16)	(144, 96, 80)	64	bit-identical
+Epilogue(F16)	(130, 97, 70)	4	bit-identical
+Epilogue(F16)	(130, 97, 70)	8	bit-identical
+Epilogue(F16)	(130, 97, 70)	16	bit-identical
+Epilogue(F16)	(130, 97, 70)	32	bit-identical
+Epilogue(F16)	(130, 97, 70)	48	bit-identical
+Epilogue(F16)	(130, 97, 70)	64	bit-identical
+Batched(RelaxedF32)	(144, 96, 80)	4	bit-identical
+Batched(RelaxedF32)	(144, 96, 80)	8	bit-identical
+Batched(RelaxedF32)	(144, 96, 80)	16	bit-identical
+Batched(RelaxedF32)	(144, 96, 80)	32	bit-identical
+Batched(RelaxedF32)	(144, 96, 80)	48	bit-identical
+Batched(RelaxedF32)	(144, 96, 80)	64	bit-identical
+Batched(RelaxedF32)	(130, 97, 70)	4	bit-identical
+Batched(RelaxedF32)	(130, 97, 70)	8	bit-identical
+Batched(RelaxedF32)	(130, 97, 70)	16	bit-identical
+Batched(RelaxedF32)	(130, 97, 70)	32	bit-identical
+Batched(RelaxedF32)	(130, 97, 70)	48	bit-identical
+Batched(RelaxedF32)	(130, 97, 70)	64	bit-identical
+Batched(Bf16)	(144, 96, 80)	4	bit-identical
+Batched(Bf16)	(144, 96, 80)	8	bit-identical
+Batched(Bf16)	(144, 96, 80)	16	bit-identical
+Batched(Bf16)	(144, 96, 80)	32	bit-identical
+Batched(Bf16)	(144, 96, 80)	48	bit-identical
+Batched(Bf16)	(144, 96, 80)	64	bit-identical
+Batched(Bf16)	(130, 97, 70)	4	bit-identical
+Batched(Bf16)	(130, 97, 70)	8	bit-identical
+Batched(Bf16)	(130, 97, 70)	16	bit-identical
+Batched(Bf16)	(130, 97, 70)	32	bit-identical
+Batched(Bf16)	(130, 97, 70)	48	bit-identical
+Batched(Bf16)	(130, 97, 70)	64	bit-identical
+Batched(F16)	(144, 96, 80)	4	bit-identical
+Batched(F16)	(144, 96, 80)	8	bit-identical
+Batched(F16)	(144, 96, 80)	16	bit-identical
+Batched(F16)	(144, 96, 80)	32	bit-identical
+Batched(F16)	(144, 96, 80)	48	bit-identical
+Batched(F16)	(144, 96, 80)	64	bit-identical
+Batched(F16)	(130, 97, 70)	4	bit-identical
+Batched(F16)	(130, 97, 70)	8	bit-identical
+Batched(F16)	(130, 97, 70)	16	bit-identical
+Batched(F16)	(130, 97, 70)	32	bit-identical
+Batched(F16)	(130, 97, 70)	48	bit-identical
+Batched(F16)	(130, 97, 70)	64	bit-identical
+summary: 264 runs, 0 not bit-identical

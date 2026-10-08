@@ -218,11 +218,11 @@ flowchart TD
 
 ```mermaid
 flowchart TD
-    Start["gemm() / gemm_tiled() / gemm_epilogue() / gemm_epilogue_tiled() / gemm_batched()"] --> Validate{"validate_gemm()<br/>• Rank-2, Non-empty, Bounds &lt;= 2^31<br/>• 16-byte (or 64-byte coop) alignment<br/>• Same runtime, No In/Out overlap"}
+    Start["gemm() / gemm_tiled() / gemm_epilogue() / gemm_epilogue_tiled() / gemm_batched()"] --> Validate{"validate_gemm()<br/>• Rank-2, Non-empty, Bounds &lt;= 2^31<br/>• 16-byte operand alignment, every family<br/>• Same runtime, No In/Out overlap"}
     Validate -- Fail --> Err["Return Err(String)"]
     Validate -- Pass --> EpilogueCheck{"Epilogue / Batched?"}
 
-    EpilogueCheck -- "Batched GEMM" --> BatchedDispatch["gemm_batched()<br/>• BatchStrides (A, B, C strides)<br/>• Stride-B = 0 broadcasts weight B<br/>• Coop-destination 64-byte alignment"]
+    EpilogueCheck -- "Batched GEMM" --> BatchedDispatch["gemm_batched()<br/>• BatchStrides (A, B, C strides)<br/>• Stride-B = 0 broadcasts weight B<br/>• 16-byte alignment at every batch start"]
     EpilogueCheck -- "Fused Epilogue" --> EpilogueDispatch["gemm_epilogue() / gemm_epilogue_tiled()<br/>• Requires Coop Path (BF16, F16, TF32)<br/>• Evaluates alpha*A@B + beta*C + bias<br/>• Row-stride-0 column bias broadcast<br/>• In-register clamped activation<br/>• 64x64 tile specialization for short-M bf16"]
     EpilogueCheck -- "Standard GEMM" --> BackendCheck{"Backend?"}
 

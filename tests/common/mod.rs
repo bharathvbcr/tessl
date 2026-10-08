@@ -135,6 +135,29 @@ pub fn tensor_bf16(rt: &Arc<GpuRuntime>, shape: &[usize], data: &[f32]) -> Tenso
     t
 }
 
+/// `data` as an f32 view starting `pad_bytes` into a fresh buffer whose
+/// leading bytes are zero: a bank slice at that offset.
+pub fn tensor_f32_at(rt: &Arc<GpuRuntime>, shape: &[usize], data: &[f32], pad_bytes: usize) -> Tensor {
+    assert_eq!(pad_bytes % 4, 0, "an f32 view starts on a 4-byte boundary");
+    let pad = pad_bytes / 4;
+    let bank = rt.alloc_tensor_f32(&[pad + data.len()]).expect("alloc_tensor_f32");
+    let mut host = vec![0.0f32; pad];
+    host.extend_from_slice(data);
+    bank.buffer.write_f32(&host);
+    bank.view(shape, pad)
+}
+
+/// [`tensor_f32_at`] for bf16 storage.
+pub fn tensor_bf16_at(rt: &Arc<GpuRuntime>, shape: &[usize], data: &[f32], pad_bytes: usize) -> Tensor {
+    assert_eq!(pad_bytes % 2, 0, "a bf16 view starts on a 2-byte boundary");
+    let pad = pad_bytes / 2;
+    let bank = rt.alloc_tensor_bf16(&[pad + data.len()]).expect("alloc_tensor_bf16");
+    let mut host = vec![0.0f32; pad];
+    host.extend_from_slice(data);
+    bank.buffer.write_bf16_bits(&f32_slice_to_bf16(&host));
+    bank.view(shape, pad)
+}
+
 /// Operand storage order, i.e. which GEMM entry point produced the result.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Layout {

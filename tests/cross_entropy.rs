@@ -205,8 +205,8 @@ fn sentinel_tensor(rt: &Arc<GpuRuntime>, shape: &[usize]) -> Tensor {
 }
 
 /// `shape` sitting `base` f32 elements into a buffer filled with [`SENTINEL`].
-/// `base * 4` is the view's byte offset. 16 is the smallest base that is also
-/// 64-byte aligned, which the cooperative GEMM path requires.
+/// `base * 4` is the view's byte offset, which must be a multiple of the
+/// 16-byte rule every GEMM operand view follows.
 fn sentinel_tensor_at(rt: &Arc<GpuRuntime>, shape: &[usize], base: usize) -> Tensor {
     let n: usize = shape.iter().product();
     let storage = rt.alloc_buffer((base + n) * 4).expect("alloc");
@@ -405,7 +405,7 @@ fn matches_the_f64_reference_across_the_chunk_walk() {
         );
         // dh itself starts inside its buffer. The first vocabulary chunk
         // writes through the tensor view; every later chunk must add there
-        // too. 16 f32s is 64 bytes, the cooperative GEMM alignment.
+        // too. 16 f32s is 64 bytes, a multiple of the 16-byte GEMM rule.
         check(
             rt,
             &Case {

@@ -817,6 +817,9 @@ impl GpuRuntime {
 
     /// Opt into TensorOps f32 `relaxed_precision` (tf32-class) GEMMs. Ignored when
     /// [`PrecisionMode::Bf16`] (bf16 path takes precedence) or TensorOps is absent.
+    ///
+    /// The cooperative kernels this selects take the same operand views as
+    /// exact f32: any view starting on a 16-byte boundary.
     pub fn set_relaxed_precision(&self, on: bool) {
         *self.relaxed_precision.lock().unwrap() = on;
     }

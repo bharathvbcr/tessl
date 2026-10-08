@@ -653,14 +653,35 @@ fn gdn_gate_offsets_are_widened() {
 #[test]
 fn encoder_attn_offsets_are_widened() {
     for (needle, what) in [
-        ("const ulong base_row = (ulong)tgpig.x * RPT + sg * RPS;", "query row block"),
+        (
+            "const ulong base_row = (ulong)tgpig.x * RPT + sg * RPS;",
+            "query row block",
+        ),
         ("const ulong len = (ulong)min(lens[b], T);", "clamped device length"),
-        ("const ulong kv_pos_stride = (ulong)Hkv * (D);", "key/value position stride"),
-        ("const ulong kv_head_base = (ulong)b * T * kv_pos_stride + (ulong)hkv * (D);", "key/value plane"),
-        ("const ulong q_head_base = (ulong)b * T * q_pos_stride + (ulong)h * (D);", "query plane"),
-        ("const ulong my_hi = (w == 0ul) ? len : min(len, (ulong)t_q + w + 1ul);", "window end"),
-        ("const ulong o_off = q_head_base + (ulong)t_q * q_pos_stride;", "output row"),
-        ("const ulong kv_base = kv_head_base + t * kv_pos_stride;", "key/value row"),
+        (
+            "const ulong kv_pos_stride = (ulong)Hkv * (D);",
+            "key/value position stride",
+        ),
+        (
+            "const ulong kv_head_base = (ulong)b * T * kv_pos_stride + (ulong)hkv * (D);",
+            "key/value plane",
+        ),
+        (
+            "const ulong q_head_base = (ulong)b * T * q_pos_stride + (ulong)h * (D);",
+            "query plane",
+        ),
+        (
+            "const ulong my_hi = (w == 0ul) ? len : min(len, (ulong)t_q + w + 1ul);",
+            "window end",
+        ),
+        (
+            "const ulong o_off = q_head_base + (ulong)t_q * q_pos_stride;",
+            "output row",
+        ),
+        (
+            "const ulong kv_base = kv_head_base + t * kv_pos_stride;",
+            "key/value row",
+        ),
         ("const ulong d0 = o_off + 4u * (dl + j * (R));", "output column"),
     ] {
         require(ENCODER_ATTN, needle, what);
@@ -674,7 +695,10 @@ fn encoder_attn_offsets_are_widened() {
 fn embed_pool_offsets_are_widened() {
     for (needle, what) in [
         ("const ulong n = (ulong)S * D;", "grid extent"),
-        ("const uint end = min(segments[2u * s + 1u], rows);", "clamped segment end"),
+        (
+            "const uint end = min(segments[2u * s + 1u], rows);",
+            "clamped segment end",
+        ),
         ("acc += x[(ulong)r * D + d];", "segment row read"),
         ("out[(ulong)s * D + d] =", "segment mean store"),
         ("device float *r = x + (ulong)row * ld;", "normalize row"),

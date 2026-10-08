@@ -700,7 +700,13 @@ impl Qwen35Model {
         for (salt, (pw, gw, st, kernel, wd)) in plan.iter().enumerate() {
             let scalars = le_bytes(adamw_scalars(hyper, next, *wd), f32::to_le_bytes);
             let key = le_bytes(
-                [seed as u32, (seed >> 32) as u32, next as u32, (next >> 32) as u32, salt as u32],
+                [
+                    seed as u32,
+                    (seed >> 32) as u32,
+                    next as u32,
+                    (next >> 32) as u32,
+                    salt as u32,
+                ],
                 u32::to_le_bytes,
             );
             let p = self.rt.pipeline(kernel)?;
@@ -808,7 +814,9 @@ impl Qwen35Model {
             let (buf, scale) = state.moment(st, which);
             let e = |e: String| format!("{what}: {}: {e}", s.info.name);
             match scale {
-                Some(scale) => dispatch_q8(&self.rt, write, &buf, &scale, t, st.n, which == Moment::First).map_err(e)?,
+                Some(scale) => {
+                    dispatch_q8(&self.rt, write, &buf, &scale, t, st.n, which == Moment::First).map_err(e)?
+                }
                 None => {
                     let mine = state_window(&buf, dtype, &pw);
                     let theirs = Window::tensor_as(t, &pw).map_err(e)?;

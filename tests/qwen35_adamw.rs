@@ -486,7 +486,12 @@ fn to_host(ts: &[Tensor]) -> Vec<Vec<f64>> {
         .collect()
 }
 
-fn moments(rt: &Arc<GpuRuntime>, model: &Qwen35Model, table: &[ParamInfo], s: &AdamW) -> (Vec<Vec<f64>>, Vec<Vec<f64>>) {
+fn moments(
+    rt: &Arc<GpuRuntime>,
+    model: &Qwen35Model,
+    table: &[ParamInfo],
+    s: &AdamW,
+) -> (Vec<Vec<f64>>, Vec<Vec<f64>>) {
     let (m, v) = (alloc_table(rt, table), alloc_table(rt, table));
     model.read_adamw_moment(s, Moment::First, &m).unwrap();
     model.read_adamw_moment(s, Moment::Second, &v).unwrap();
@@ -511,7 +516,9 @@ fn reference(h: &AdamWHyper, step: u64, wd: f32, w: f64, g: f64, m: &mut f64, v:
 }
 
 fn bf16(x: f64) -> f64 {
-    f64::from(tessl::tensor::bf16_bits_to_f32(tessl::tensor::f32_to_bf16_bits(x as f32)))
+    f64::from(tessl::tensor::bf16_bits_to_f32(tessl::tensor::f32_to_bf16_bits(
+        x as f32,
+    )))
 }
 
 /// One bf16 ulp at `x` (the spacing of bf16 values around it).
@@ -566,7 +573,15 @@ fn an_f32_master_takes_torchs_update_and_rounds_the_weights() {
             let (m1, v1) = moments(&rt, &model, &table, &state);
             for (i, info) in table.iter().enumerate() {
                 for k in 0..g[i].len() {
-                    let want = reference(&hyper(), step, wd[i], master0[i][k], g[i][k], &mut m[i][k], &mut v[i][k]);
+                    let want = reference(
+                        &hyper(),
+                        step,
+                        wd[i],
+                        master0[i][k],
+                        g[i][k],
+                        &mut m[i][k],
+                        &mut v[i][k],
+                    );
                     let err = (master1[i][k] - want).abs();
                     worst = worst.max(err);
                     assert!(
@@ -645,7 +660,15 @@ fn kahan_compensation_keeps_what_bf16_rounding_drops() {
         let c1 = aux(&rt, &model, &table, &state);
         for (i, info) in table.iter().enumerate() {
             for k in 0..g[i].len() {
-                let want = reference(&h, step, wd[i], p0[i][k] + c0[i][k], g[i][k], &mut m[i][k], &mut v[i][k]);
+                let want = reference(
+                    &h,
+                    step,
+                    wd[i],
+                    p0[i][k] + c0[i][k],
+                    g[i][k],
+                    &mut m[i][k],
+                    &mut v[i][k],
+                );
                 let got = p1[i][k] + c1[i][k];
                 let err = (got - want).abs();
                 let bound = 2f64.powi(-9) * c1[i][k].abs() + 2f64.powi(-17) * want.abs() + 2e-6;
@@ -671,7 +694,9 @@ fn kahan_compensation_keeps_what_bf16_rounding_drops() {
             without += (p[i][k] - ref_w[i][k]).abs();
         }
     }
-    eprintln!("kahan: worst one-step error {worst:.2e}; drift from the reference with c {with_c:.3e}, without {without:.3e}");
+    eprintln!(
+        "kahan: worst one-step error {worst:.2e}; drift from the reference with c {with_c:.3e}, without {without:.3e}"
+    );
     assert!(
         without > 4.0 * with_c,
         "the compensation does not hold what rounding dropped: {with_c:.3e} with, {without:.3e} without"
@@ -698,7 +723,11 @@ fn stochastic_rounding_is_unbiased_and_reproducible() {
             },
         )
         .unwrap();
-        assert!(state.describe().contains(&format!("seed={seed}")), "{}", state.describe());
+        assert!(
+            state.describe().contains(&format!("seed={seed}")),
+            "{}",
+            state.describe()
+        );
         let s = model.train_step(&ids(), GemmOperands::Bf16).unwrap();
         let g = host(&rt, &model, &table, Some(&s.grads));
         let p0 = host(&rt, &model, &table, None);

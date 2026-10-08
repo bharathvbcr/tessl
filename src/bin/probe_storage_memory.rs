@@ -127,10 +127,16 @@ fn main() -> Res<()> {
             config_path = Some(std::path::PathBuf::from(v));
         } else if let Some(v) = arg.strip_prefix("--steps=") {
             for t in v.split(',') {
-                steps.push(t.parse::<u32>().map_err(|_| format!("--steps expects token counts, got {v:?}"))?);
+                steps.push(
+                    t.parse::<u32>()
+                        .map_err(|_| format!("--steps expects token counts, got {v:?}"))?,
+                );
             }
         } else if let Some(v) = arg.strip_prefix("--proxy-step=") {
-            proxy = Some(v.parse::<u32>().map_err(|_| format!("--proxy-step expects a token count, got {v:?}"))?);
+            proxy = Some(
+                v.parse::<u32>()
+                    .map_err(|_| format!("--proxy-step expects a token count, got {v:?}"))?,
+            );
         } else {
             return Err(format!(
                 "expected --config=PATH, --steps=T,... or --proxy-step=T, got {arg:?}"
@@ -200,7 +206,11 @@ fn main() -> Res<()> {
             let got = rt.current_allocated_bytes() - before;
             drop(state);
             rt.synchronize()?;
-            format!("measured optimizer {}, device total {}", gib(got), gib(before - base + got))
+            format!(
+                "measured optimizer {}, device total {}",
+                gib(got),
+                gib(before - base + got)
+            )
         } else if precision == Precision::Bf16 {
             "computed only (not allocated: over the working set)".to_string()
         } else {

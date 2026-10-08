@@ -306,7 +306,10 @@ fn refusals_leave_the_model_untouched() {
 
     // Another runtime's tensors are refused before anything is copied.
     let (brt, bf16, _) = load(Precision::Bf16);
-    e(bf16.read_parameters(&alloc(&rt, &table)), "belongs to a different runtime");
+    e(
+        bf16.read_parameters(&alloc(&rt, &table)),
+        "belongs to a different runtime",
+    );
     // A bf16 model carrying the inference head's packed copy of the
     // embedding reads (widened) but refuses a write, which would leave that
     // copy stale.

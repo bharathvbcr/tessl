@@ -185,5 +185,8 @@ fn the_kernel_counts_the_docs_quote_are_the_builds() {
     assert!(lib_flat.contains(&lib_claim), "src/lib.rs should say `{lib_claim}`");
     assert!(lib_flat.contains(&nn_claim), "src/lib.rs should say `{nn_claim}`");
     assert!(readme.contains(&readme_claim), "README.md should say `{readme_claim}`");
-    assert!(readme.contains(&readme_nn_claim), "README.md should say `{readme_nn_claim}`");
+    assert!(
+        readme.contains(&readme_nn_claim),
+        "README.md should say `{readme_nn_claim}`"
+    );
 }

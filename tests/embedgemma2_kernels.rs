@@ -705,7 +705,11 @@ fn rope_inv_freq_matches_the_models_tables() {
             assert!(ulps <= 1, "d={d} pair {p}: {g:e} vs torch {w:e} ({ulps} ulps)");
             differ += usize::from(ulps != 0);
         }
-        assert!(differ <= want.len() / 32, "d={d}: {differ} of {} pairs differ from torch", want.len());
+        assert!(
+            differ <= want.len() / 32,
+            "d={d}: {differ} of {} pairs differ from torch",
+            want.len()
+        );
     }
 }
 
@@ -723,7 +727,11 @@ fn qkv_columns_norm_rope_far_positions() {
         for (name, d, theta) in [("qkv256_far", 256u32, 1e4f32), ("qkv512_far", 512, 1e6)] {
             let torch = load(&format!("inv_freq_{d}")).1;
             let ours = nn::rope_inv_freq(d / 2, d, theta);
-            let gap = ours.iter().zip(&torch).map(|(&o, &t)| (f64::from(o) - t).abs()).fold(0.0, f64::max);
+            let gap = ours
+                .iter()
+                .zip(&torch)
+                .map(|(&o, &t)| (f64::from(o) - t).abs())
+                .fold(0.0, f64::max);
             let (qs, _) = load(&format!("{name}_q_in"));
             let last = load(&format!("{name}_meta")).1[0] + qs[1] as f64;
             check_qkv(rt, name, KERNEL_REL + last * gap);

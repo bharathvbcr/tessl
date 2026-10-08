@@ -659,7 +659,12 @@ impl Qwen35Model {
     /// the conv weights are uniform with standard deviation 0.02
     /// (transformers' `initializer_range`), the norms' `w`, `A_log` and
     /// `dt_bias` zero. Not a trained model.
-    pub fn random_tower(rt: &Arc<GpuRuntime>, cfg: Qwen35Config, precision: Precision, seed: u64) -> Result<Self, String> {
+    pub fn random_tower(
+        rt: &Arc<GpuRuntime>,
+        cfg: Qwen35Config,
+        precision: Precision,
+        seed: u64,
+    ) -> Result<Self, String> {
         cfg.validate()?;
         let mut state = seed ^ 0x9e37_79b9_7f4a_7c15;
         // splitmix64, then a uniform in [-a, a) with variance 0.02^2.
@@ -793,7 +798,10 @@ impl Qwen35Model {
         let mut s = self.begin_impl(ids, trace, true)?;
         s.advance_to(self.layers.len())?;
         let (rt, a, t) = (&self.rt, &s.a, s.a.t);
-        let logits_t = a.logits.as_ref().ok_or("Qwen35Model::forward: logits were not allocated")?;
+        let logits_t = a
+            .logits
+            .as_ref()
+            .ok_or("Qwen35Model::forward: logits were not allocated")?;
         self.norm(&a.resid, &self.final_norm, &a.x)?;
         // The tied head: logits = x @ embed^T.
         match &self.lm_head_bf16 {

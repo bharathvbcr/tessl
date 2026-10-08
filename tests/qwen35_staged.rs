@@ -62,7 +62,10 @@ fn staged_final_norm_matches_forward_at_every_layer() {
                             .map(|(a, b)| (f64::from(*a) - b).abs())
                             .fold(0.0, f64::max);
                         let peak = host.iter().fold(0.0f64, |m, x| m.max(x.abs()));
-                        assert!(err <= 2e-6 * peak.max(1.0), "{precision:?} t={t} layer {layer}: {err:.3e}");
+                        assert!(
+                            err <= 2e-6 * peak.max(1.0),
+                            "{precision:?} t={t} layer {layer}: {err:.3e}"
+                        );
                         if layer == cfg.layers.len() && precision == Precision::F32 {
                             assert_eq!(bits(&normed), bits(&want[layer]), "t={t}: final norm vs forward's");
                         }
@@ -71,7 +74,10 @@ fn staged_final_norm_matches_forward_at_every_layer() {
             }
             // Advancing in one step and in several gives the same bits.
             let ids = ids(33);
-            let (one, many) = (rt.alloc_tensor_f32(&[33, h]).unwrap(), rt.alloc_tensor_f32(&[33, h]).unwrap());
+            let (one, many) = (
+                rt.alloc_tensor_f32(&[33, h]).unwrap(),
+                rt.alloc_tensor_f32(&[33, h]).unwrap(),
+            );
             let mut a = tower.begin(&ids).unwrap();
             a.advance_to(cfg.layers.len()).unwrap();
             a.final_norm_f32(&one).unwrap();
@@ -81,7 +87,10 @@ fn staged_final_norm_matches_forward_at_every_layer() {
             }
             b.final_norm_f32(&many).unwrap();
             rt.synchronize().unwrap();
-            assert_eq!(bits(&one.buffer.read_f32()[..33 * h]), bits(&many.buffer.read_f32()[..33 * h]));
+            assert_eq!(
+                bits(&one.buffer.read_f32()[..33 * h]),
+                bits(&many.buffer.read_f32()[..33 * h])
+            );
         }
     });
 }
@@ -93,7 +102,10 @@ fn staged_refusals() {
     let n = cfg.layers.len();
     with_gpu(|rt| {
         let tower = Qwen35Model::load_tower(rt, &st, "model.", cfg.clone(), Precision::Bf16).unwrap();
-        assert!(tower.forward(&ids(4), false).is_err(), "forward on a bf16 tower has no head");
+        assert!(
+            tower.forward(&ids(4), false).is_err(),
+            "forward on a bf16 tower has no head"
+        );
         // F32 keeps the embedding as its head, so a tower still runs forward.
         let f32_tower = Qwen35Model::load_tower(rt, &st, "model.", cfg.clone(), Precision::F32).unwrap();
         assert!(f32_tower.forward(&ids(4), false).is_ok());
@@ -123,7 +135,11 @@ fn host_norm(x: &[f32], w: &[f32], t: usize, h: usize, eps: f32) -> Vec<f64> {
         let row = &x[r * h..(r + 1) * h];
         let ms = row.iter().map(|v| f64::from(*v).powi(2)).sum::<f64>() / h as f64;
         let inv = 1.0 / (ms + f64::from(eps)).sqrt();
-        out.extend(row.iter().zip(w).map(|(v, w)| f64::from(*v) * inv * (1.0 + f64::from(*w))));
+        out.extend(
+            row.iter()
+                .zip(w)
+                .map(|(v, w)| f64::from(*v) * inv * (1.0 + f64::from(*w))),
+        );
     }
     out
 }

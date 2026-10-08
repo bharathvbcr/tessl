@@ -480,14 +480,25 @@ fn dropping_the_model_releases_its_weights() {
         let before = rt.current_allocated_bytes();
         let model = EmbedGemma2Model::load(rt, &st, PREFIX, cfg.clone()).unwrap();
         let loaded = rt.current_allocated_bytes();
-        let weights: u64 = w.0.iter().map(|t| t.data.len() as u64 * if t.bf16 { 2 } else { 4 }).sum();
+        let weights: u64 =
+            w.0.iter()
+                .map(|t| t.data.len() as u64 * if t.bf16 { 2 } else { 4 })
+                .sum();
         // Buffers under 16 KiB (the norms) are not charged one by one, so the
         // load is held to half its bytes: enough to show the weights are seen.
-        assert!(loaded >= before + weights / 2, "loading added {} bytes for {weights} of weights", loaded - before);
+        assert!(
+            loaded >= before + weights / 2,
+            "loading added {} bytes for {weights} of weights",
+            loaded - before
+        );
         drop(model);
         rt.synchronize().unwrap();
         let after = rt.current_allocated_bytes();
-        assert!(after <= before, "{} bytes still allocated after the model dropped", after.saturating_sub(before));
+        assert!(
+            after <= before,
+            "{} bytes still allocated after the model dropped",
+            after.saturating_sub(before)
+        );
     });
 }
 

@@ -131,11 +131,23 @@ pub fn embed_layer_norm(
         ));
     }
     if rows % seq != 0 {
-        return Err(format!("{WHAT}: rows {rows} is not a whole number of {seq}-position sequences"));
+        return Err(format!(
+            "{WHAT}: rows {rows} is not a whole number of {seq}-position sequences"
+        ));
     }
     require::<u32>(rt, ids, rows as usize, "embed_layer_norm ids")?;
-    require::<f32>(rt, tables.word, elems(&[tables.vocab, dim], WHAT)?, "embed_layer_norm word")?;
-    require::<f32>(rt, tables.pos, elems(&[tables.positions, dim], WHAT)?, "embed_layer_norm pos")?;
+    require::<f32>(
+        rt,
+        tables.word,
+        elems(&[tables.vocab, dim], WHAT)?,
+        "embed_layer_norm word",
+    )?;
+    require::<f32>(
+        rt,
+        tables.pos,
+        elems(&[tables.positions, dim], WHAT)?,
+        "embed_layer_norm pos",
+    )?;
     require::<f32>(rt, tables.type_row, dim as usize, "embed_layer_norm type_row")?;
     require::<f32>(rt, tables.ln_w, dim as usize, "embed_layer_norm ln_w")?;
     require::<f32>(rt, tables.ln_b, dim as usize, "embed_layer_norm ln_b")?;
@@ -202,7 +214,11 @@ pub fn bias_residual_layer_norm(
     if rows == 0 {
         return Ok(());
     }
-    require_disjoint_writes(WHAT, &[("resid", resid)], &[("y", y), ("bias", bias), ("w", w), ("b", b)])?;
+    require_disjoint_writes(
+        WHAT,
+        &[("resid", resid)],
+        &[("y", y), ("bias", bias), ("w", w), ("b", b)],
+    )?;
     let p = rt.pipeline("bert_bias_residual_layer_norm_f32")?;
     let tptg = reduce_tptg(p.maxTotalThreadsPerThreadgroup(), dim as usize);
     dispatch_tg_1d(rt, &p, rows as usize, tptg, None, |bnd| {
@@ -295,7 +311,13 @@ pub fn bias_add(rt: &Arc<GpuRuntime>, x: &GpuBuffer, bias: &GpuBuffer, rows: u32
 
 /// In place, `x[r, c] = gelu(x[r, c] + bias[c])` with torch's exact (erf)
 /// GELU, not the tanh approximation `nn::mlp_gelu_tanh` computes.
-pub fn bias_gelu_erf(rt: &Arc<GpuRuntime>, x: &GpuBuffer, bias: &GpuBuffer, rows: u32, cols: u32) -> Result<(), String> {
+pub fn bias_gelu_erf(
+    rt: &Arc<GpuRuntime>,
+    x: &GpuBuffer,
+    bias: &GpuBuffer,
+    rows: u32,
+    cols: u32,
+) -> Result<(), String> {
     bias_elementwise(rt, "bert_bias_gelu_erf_f32", "bert::bias_gelu_erf", x, bias, rows, cols)
 }
 
@@ -340,7 +362,12 @@ pub fn segment_sparse_max(
     }
     require::<f32>(rt, logits, elems(&[rows, vocab], WHAT)?, "segment_sparse_max logits")?;
     require::<f32>(rt, bias, vocab as usize, "segment_sparse_max bias")?;
-    require::<u32>(rt, segments, elems(&[n_segments, 2], WHAT)?, "segment_sparse_max segments")?;
+    require::<u32>(
+        rt,
+        segments,
+        elems(&[n_segments, 2], WHAT)?,
+        "segment_sparse_max segments",
+    )?;
     let n = elems(&[n_segments, vocab], WHAT)?;
     require::<f32>(rt, pooled, n, "segment_sparse_max pooled")?;
     if n == 0 {
@@ -431,22 +458,38 @@ impl BertConfig {
         let family = match string("model_type")? {
             Some("bert") => BertFamily::Bert,
             Some("distilbert") => BertFamily::DistilBert,
-            other => return Err(format!("config.json: model_type must be bert or distilbert, got {other:?}")),
+            other => {
+                return Err(format!(
+                    "config.json: model_type must be bert or distilbert, got {other:?}"
+                ))
+            }
         };
         let (act_key, hidden_k, layers_k, heads_k, inter_k) = match family {
-            BertFamily::Bert => ("hidden_act", "hidden_size", "num_hidden_layers", "num_attention_heads", "intermediate_size"),
+            BertFamily::Bert => (
+                "hidden_act",
+                "hidden_size",
+                "num_hidden_layers",
+                "num_attention_heads",
+                "intermediate_size",
+            ),
             BertFamily::DistilBert => ("activation", "dim", "n_layers", "n_heads", "hidden_dim"),
         };
         match string(act_key)? {
             Some("gelu") => {}
-            other => return Err(format!("config.json: {act_key} must be gelu (the erf form), got {other:?}")),
+            other => {
+                return Err(format!(
+                    "config.json: {act_key} must be gelu (the erf form), got {other:?}"
+                ))
+            }
         }
         let (type_vocab, layer_norm_eps) = match family {
             BertFamily::Bert => {
                 match string("position_embedding_type")? {
                     None | Some("absolute") => {}
                     other => {
-                        return Err(format!("config.json: position_embedding_type must be absolute, got {other:?}"))
+                        return Err(format!(
+                            "config.json: position_embedding_type must be absolute, got {other:?}"
+                        ))
                     }
                 }
                 let eps = match c.get("layer_norm_eps") {
@@ -491,7 +534,9 @@ impl BertConfig {
             return Err("config.json: type_vocab_size is zero".into());
         }
         if !(layer_norm_eps > 0.0 && layer_norm_eps.is_finite() && cfg.layer_norm_eps > 0.0) {
-            return Err(format!("config.json: layer_norm_eps must be positive, got {layer_norm_eps}"));
+            return Err(format!(
+                "config.json: layer_norm_eps must be positive, got {layer_norm_eps}"
+            ));
         }
         if cfg.hidden % cfg.heads != 0 {
             return Err(format!(
@@ -629,9 +674,14 @@ impl Loader<'_> {
 
     /// `nn.Linear(in, out)`: weight `[out, in]` transposed to `[in, out]`.
     fn dense(&self, prefix: &str, in_features: u32, out_features: u32) -> Result<Dense, String> {
-        let w = self.f32(&format!("{prefix}.weight"), &[out_features as usize, in_features as usize])?;
+        let w = self.f32(
+            &format!("{prefix}.weight"),
+            &[out_features as usize, in_features as usize],
+        )?;
         let packed = qwen35::pack_linear_weights_f32(&[&w], &[out_features as usize], in_features as usize)?;
-        let t = self.rt.alloc_tensor_f32(&[in_features as usize, out_features as usize])?;
+        let t = self
+            .rt
+            .alloc_tensor_f32(&[in_features as usize, out_features as usize])?;
         t.buffer.write_f32(&packed);
         Ok(Dense {
             w: t,
@@ -713,10 +763,16 @@ impl BertSparseModel {
             }
             Err(_) => None,
         };
-        let pos = ld.buf(&ld.f32(&e("position_embeddings.weight"), &[cfg.max_positions as usize, h as usize])?)?;
+        let pos = ld.buf(&ld.f32(
+            &e("position_embeddings.weight"),
+            &[cfg.max_positions as usize, h as usize],
+        )?)?;
         let type_row = match cfg.family {
             BertFamily::Bert => {
-                let t = ld.f32(&e("token_type_embeddings.weight"), &[cfg.type_vocab as usize, h as usize])?;
+                let t = ld.f32(
+                    &e("token_type_embeddings.weight"),
+                    &[cfg.type_vocab as usize, h as usize],
+                )?;
                 ld.buf(&t[..h as usize])?
             }
             BertFamily::DistilBert => ld.buf(&vec![0.0f32; h as usize])?,
@@ -776,7 +832,10 @@ impl BertSparseModel {
             return Err(format!("{WHAT}: empty batch"));
         }
         if batch.len() > MAX_BATCH {
-            return Err(format!("{WHAT}: {} sequences exceeds the batch limit {MAX_BATCH}", batch.len()));
+            return Err(format!(
+                "{WHAT}: {} sequences exceeds the batch limit {MAX_BATCH}",
+                batch.len()
+            ));
         }
         if trace && batch.len() != 1 {
             return Err(format!("{WHAT}: trace takes one sequence, got {}", batch.len()));
@@ -848,7 +907,8 @@ impl BertSparseModel {
             padded[b * seq as usize..b * seq as usize + ids.len()].copy_from_slice(ids);
         }
         a.ids.write_u32(&padded);
-        a.lens.write_u32(&batch.iter().map(|ids| ids.len() as u32).collect::<Vec<_>>());
+        a.lens
+            .write_u32(&batch.iter().map(|ids| ids.len() as u32).collect::<Vec<_>>());
 
         let mut out_trace = Vec::new();
         let snap = |t: &Tensor, out: &mut Vec<Vec<f32>>| -> Result<(), String> {
@@ -892,7 +952,16 @@ impl BertSparseModel {
                 gemm(&a.resid, &dense.w, out, BACKEND)?;
                 bias_add(rt, &out.buffer, &dense.b, rows, h)?;
             }
-            encoder_attn(rt, &a.q.buffer, &a.k.buffer, &a.v.buffer, &a.attn.buffer, &a.lens, dims, false)?;
+            encoder_attn(
+                rt,
+                &a.q.buffer,
+                &a.k.buffer,
+                &a.v.buffer,
+                &a.attn.buffer,
+                &a.lens,
+                dims,
+                false,
+            )?;
             gemm(&a.attn, &layer.o.w, &a.y, BACKEND)?;
             let n = &layer.attn_norm;
             bias_residual_layer_norm(rt, &a.y.buffer, &layer.o.b, &a.resid.buffer, &n.w, &n.b, rows, h, eps)?;
@@ -919,7 +988,8 @@ impl BertSparseModel {
         while b0 < batch.len() {
             let b1 = (b0 + per_block).min(batch.len());
             let block_rows = ((b1 - b0) * seq as usize) as u32;
-            let x = a.x.try_view(&[block_rows as usize, h as usize], b0 * seq as usize * h as usize)?;
+            let x =
+                a.x.try_view(&[block_rows as usize, h as usize], b0 * seq as usize * h as usize)?;
             let logits = a.logits.try_view(&[block_rows as usize, vocab as usize], 0)?;
             gemm_nt_f32(&x, decoder, &logits, BACKEND)?;
             let segs: Vec<(u32, u32)> = (b0..b1)

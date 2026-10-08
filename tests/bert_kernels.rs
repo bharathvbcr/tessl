@@ -93,7 +93,11 @@ fn layer_norm_ref(x: &[f64], w: &[f32], b: &[f32], eps: f64) -> Vec<f64> {
         let mean = row.iter().sum::<f64>() / d as f64;
         let var = row.iter().map(|v| (v - mean) * (v - mean)).sum::<f64>() / d as f64;
         let inv = 1.0 / (var + eps).sqrt();
-        out.extend(row.iter().enumerate().map(|(i, v)| (v - mean) * inv * f64::from(w[i]) + f64::from(b[i])));
+        out.extend(
+            row.iter()
+                .enumerate()
+                .map(|(i, v)| (v - mean) * inv * f64::from(w[i]) + f64::from(b[i])),
+        );
     }
     out
 }
@@ -187,7 +191,10 @@ fn the_erfc_reference_matches_known_values() {
         (-1.0, 1.842_700_792_949_715),
     ] {
         let got = erfc_f64(x);
-        assert!(((got - want) / want).abs() < 1e-12, "erfc({x}) = {got:e}, want {want:e}");
+        assert!(
+            ((got - want) / want).abs() < 1e-12,
+            "erfc({x}) = {got:e}, want {want:e}"
+        );
     }
 }
 
@@ -222,12 +229,26 @@ fn layer_norm_matches_f64_including_adversarial_rows() {
             // under a mean f32 resolves to ~1e-3, so 5e-3 is two-pass f32's
             // floor there, while a one-pass E[x^2] - E[x]^2 (ulp 8 at 1e8)
             // returns noise or NaN.
-            assert_abs(&format!("layer_norm dim {dim} rows 2.."), &got[2 * dim..], &want[2 * dim..], 1e-5);
-            assert_eq!(&got[..dim], &b[..], "dim {dim}: a zero-variance row is exactly the bias");
+            assert_abs(
+                &format!("layer_norm dim {dim} rows 2.."),
+                &got[2 * dim..],
+                &want[2 * dim..],
+                1e-5,
+            );
+            assert_eq!(
+                &got[..dim],
+                &b[..],
+                "dim {dim}: a zero-variance row is exactly the bias"
+            );
             if dim > 1 {
                 let x32: Vec<f64> = x[dim..2 * dim].iter().map(|&v| f64::from(v)).collect();
                 let want1 = layer_norm_ref(&x32, &w, &b, 1e-12);
-                assert_abs(&format!("layer_norm dim {dim} huge-mean row"), &got[dim..2 * dim], &want1, 5e-3);
+                assert_abs(
+                    &format!("layer_norm dim {dim} huge-mean row"),
+                    &got[dim..2 * dim],
+                    &want1,
+                    5e-3,
+                );
             }
         }
     });
@@ -250,7 +271,12 @@ fn the_fused_bias_residual_layer_norm_matches_f64_in_place() {
             let sum: Vec<f64> = (0..rows * dim)
                 .map(|i| f64::from(y[i]) + f64::from(bias[i % dim]) + f64::from(resid[i]))
                 .collect();
-            assert_abs(&format!("fused LN {rows}x{dim}"), &got, &layer_norm_ref(&sum, &w, &b, 1e-12), 1e-5);
+            assert_abs(
+                &format!("fused LN {rows}x{dim}"),
+                &got,
+                &layer_norm_ref(&sum, &w, &b, 1e-12),
+                1e-5,
+            );
         }
     });
 }
@@ -268,7 +294,13 @@ fn the_embedding_sum_matches_f64_and_a_bad_id_poisons_only_its_row() {
         let rows = batch * seq;
         let mut ids: Vec<u32> = (0..rows).map(|_| rng.range(0, vocab - 1) as u32).collect();
         ids[45] = vocab as u32 + 7;
-        let bufs = (buf_f32(rt, &word), buf_f32(rt, &pos), buf_f32(rt, &ty), buf_f32(rt, &w), buf_f32(rt, &b));
+        let bufs = (
+            buf_f32(rt, &word),
+            buf_f32(rt, &pos),
+            buf_f32(rt, &ty),
+            buf_f32(rt, &w),
+            buf_f32(rt, &b),
+        );
         let tables = EmbedTables {
             word: &bufs.0,
             vocab: vocab as u32,
@@ -282,22 +314,42 @@ fn the_embedding_sum_matches_f64_and_a_bad_id_poisons_only_its_row() {
         let out = rt.alloc_buffer(rows * dim * 4).unwrap();
         embed_layer_norm(rt, &idb, tables, &out, rows as u32, dim as u32, seq as u32, 1e-12).unwrap();
         let got = read(rt, &out, rows * dim);
-        assert!(got[45 * dim..46 * dim].iter().all(|v| v.is_nan()), "an id past the vocabulary is NaN");
+        assert!(
+            got[45 * dim..46 * dim].iter().all(|v| v.is_nan()),
+            "an id past the vocabulary is NaN"
+        );
         let mut sum = Vec::with_capacity(rows * dim);
         for (r, &id) in ids.iter().enumerate() {
             let id = (id as usize).min(vocab - 1);
             let t = r % seq;
-            sum.extend((0..dim).map(|d| f64::from(word[id * dim + d]) + f64::from(pos[t * dim + d]) + f64::from(ty[d])));
+            sum.extend(
+                (0..dim).map(|d| f64::from(word[id * dim + d]) + f64::from(pos[t * dim + d]) + f64::from(ty[d])),
+            );
         }
         let want = layer_norm_ref(&sum, &w, &b, 1e-12);
         let keep: Vec<usize> = (0..rows).filter(|&r| r != 45).collect();
-        let g: Vec<f32> = keep.iter().flat_map(|&r| got[r * dim..(r + 1) * dim].to_vec()).collect();
-        let wv: Vec<f64> = keep.iter().flat_map(|&r| want[r * dim..(r + 1) * dim].to_vec()).collect();
+        let g: Vec<f32> = keep
+            .iter()
+            .flat_map(|&r| got[r * dim..(r + 1) * dim].to_vec())
+            .collect();
+        let wv: Vec<f64> = keep
+            .iter()
+            .flat_map(|&r| want[r * dim..(r + 1) * dim].to_vec())
+            .collect();
         assert_abs("embedding sum", &g, &wv, 1e-5);
 
         // Refusals: a sequence past the position table, rows not a whole
         // number of sequences, a bad eps, a short buffer.
-        let e = embed_layer_norm(rt, &idb, tables, &out, rows as u32, dim as u32, positions as u32 + 1, 1e-12);
+        let e = embed_layer_norm(
+            rt,
+            &idb,
+            tables,
+            &out,
+            rows as u32,
+            dim as u32,
+            positions as u32 + 1,
+            1e-12,
+        );
         assert!(e.unwrap_err().contains("position table"));
         let e = embed_layer_norm(rt, &idb, tables, &out, rows as u32 - 1, dim as u32, seq as u32, 1e-12);
         assert!(e.unwrap_err().contains("whole number"));
@@ -325,8 +377,14 @@ fn bias_add_is_exact() {
         for (i, &g) in got.iter().enumerate() {
             assert_eq!(g, x[i] + bias[i % cols], "element {i}");
         }
-        assert!(bias_add(rt, &xb, &buf_f32(rt, &bias), rows as u32, 0).is_err(), "cols 0 is refused");
-        assert!(bias_add(rt, &xb, &xb, rows as u32, cols as u32).is_err(), "x aliasing bias is refused");
+        assert!(
+            bias_add(rt, &xb, &buf_f32(rt, &bias), rows as u32, 0).is_err(),
+            "cols 0 is refused"
+        );
+        assert!(
+            bias_add(rt, &xb, &xb, rows as u32, cols as u32).is_err(),
+            "x aliasing bias is refused"
+        );
     });
 }
 
@@ -336,7 +394,9 @@ fn the_erf_gelu_matches_f64_and_the_tanh_form_does_not() {
         // A dense sweep of the range where the two forms differ, both tails,
         // zero, and values past where either saturates.
         let mut x: Vec<f32> = (-4000..=4000).map(|i| i as f32 * 0.003).collect();
-        x.extend([-30.0, -15.0, -12.0, -9.5, -8.0, 0.0, 1e-30, -1e-30, 8.0, 12.0, 50.0, 1e6, -1e6]);
+        x.extend([
+            -30.0, -15.0, -12.0, -9.5, -8.0, 0.0, 1e-30, -1e-30, 8.0, 12.0, 50.0, 1e6, -1e6,
+        ]);
         let n = x.len();
         let bias = vec![0.0f32; 1];
         let xb = buf_f32(rt, &x);
@@ -344,7 +404,10 @@ fn the_erf_gelu_matches_f64_and_the_tanh_form_does_not() {
         let got = read(rt, &xb, n);
         let want: Vec<f64> = x.iter().map(|&v| gelu_erf_ref(f64::from(v))).collect();
         if let Some((i, ratio)) = worst_relative(&x, &got, &want, 1e-6) {
-            panic!("gelu_erf({}) = {}, want {:e} ({ratio:.1}x the bound)", x[i], got[i], want[i]);
+            panic!(
+                "gelu_erf({}) = {}, want {:e} ({ratio:.1}x the bound)",
+                x[i], got[i], want[i]
+            );
         }
 
         // The same bound must reject the tanh approximation, or this test
@@ -427,8 +490,14 @@ fn the_segment_sparse_max_matches_f64_and_ignores_rows_outside_segments() {
         }
         // Segment 2's logits are <= -1 and the bias is within +-0.5, so every
         // biased logit is negative and the whole vector is exactly 0.
-        assert!(got[2 * v..].iter().all(|&g| g == 0.0), "all-negative logits pool to exactly 0");
-        assert!(got.iter().all(|&g| g < 20.0), "a padding row's 1e6 logit leaked into a segment");
+        assert!(
+            got[2 * v..].iter().all(|&g| g == 0.0),
+            "all-negative logits pool to exactly 0"
+        );
+        assert!(
+            got.iter().all(|&g| g < 20.0),
+            "a padding row's 1e6 logit leaked into a segment"
+        );
 
         // It accumulates: pooling segment 0 in two halves equals pooling it once.
         let halves = upload_segments(rt, &[(0, 2)], rows as u32).unwrap();
@@ -440,10 +509,22 @@ fn the_segment_sparse_max_matches_f64_and_ignores_rows_outside_segments() {
         assert_eq!(read(rt, &acc, v), got[..v].to_vec(), "two passes equal one");
 
         // Refusals.
-        assert!(upload_segments(rt, &[(3, 3)], rows as u32).is_err(), "an empty segment is refused");
-        assert!(upload_segments(rt, &[(0, 21)], rows as u32).is_err(), "a segment past the rows is refused");
-        assert!(segment_sparse_max(rt, &lb, &bb, &sb, &lb, 3, rows as u32, v as u32).is_err(), "pooled aliasing logits");
-        assert!(segment_sparse_max(rt, &lb, &bb, &sb, &pooled, 3, rows as u32, 0).is_err(), "vocab 0");
+        assert!(
+            upload_segments(rt, &[(3, 3)], rows as u32).is_err(),
+            "an empty segment is refused"
+        );
+        assert!(
+            upload_segments(rt, &[(0, 21)], rows as u32).is_err(),
+            "a segment past the rows is refused"
+        );
+        assert!(
+            segment_sparse_max(rt, &lb, &bb, &sb, &lb, 3, rows as u32, v as u32).is_err(),
+            "pooled aliasing logits"
+        );
+        assert!(
+            segment_sparse_max(rt, &lb, &bb, &sb, &pooled, 3, rows as u32, 0).is_err(),
+            "vocab 0"
+        );
     });
 }
 
@@ -460,13 +541,21 @@ fn attn_ref(b: usize, t: usize, h: usize, d: usize, lens: &[usize], q: &[f32], k
         for hh in 0..h {
             for i in 0..lens[bb] {
                 let s: Vec<f64> = (0..lens[bb])
-                    .map(|j| (0..d).map(|x| f64::from(q[at(bb, i, hh) + x]) * f64::from(k[at(bb, j, hh) + x])).sum::<f64>() * scale)
+                    .map(|j| {
+                        (0..d)
+                            .map(|x| f64::from(q[at(bb, i, hh) + x]) * f64::from(k[at(bb, j, hh) + x]))
+                            .sum::<f64>()
+                            * scale
+                    })
                     .collect();
                 let m = s.iter().cloned().fold(f64::MIN, f64::max);
                 let e: Vec<f64> = s.iter().map(|x| (x - m).exp()).collect();
                 let z: f64 = e.iter().sum();
                 for x in 0..d {
-                    out[at(bb, i, hh) + x] = (0..lens[bb]).map(|j| e[j] * f64::from(v[at(bb, j, hh) + x])).sum::<f64>() / z;
+                    out[at(bb, i, hh) + x] = (0..lens[bb])
+                        .map(|j| e[j] * f64::from(v[at(bb, j, hh) + x]))
+                        .sum::<f64>()
+                        / z;
                 }
             }
         }
@@ -479,7 +568,11 @@ fn encoder_attention_at_head_dims_32_and_64_matches_f64() {
     with_gpu(|rt| {
         let mut rng = SplitMix::new(17);
         for &(d, h) in &[(32usize, 12usize), (64, 12)] {
-            for &(b, t, ref lens) in &[(1usize, 1usize, vec![1usize]), (3, 130, vec![130, 1, 77]), (2, 512, vec![512, 300])] {
+            for &(b, t, ref lens) in &[
+                (1usize, 1usize, vec![1usize]),
+                (3, 130, vec![130, 1, 77]),
+                (2, 512, vec![512, 300]),
+            ] {
                 let n = b * t * h * d;
                 let q = rand_vec(&mut rng, n, 2.0);
                 let mut k = rand_vec(&mut rng, n, 2.0);
@@ -536,18 +629,36 @@ const DISTIL: &str = r#"{"activation":"gelu","architectures":["DistilBertForMask
 #[test]
 fn the_config_parser_reads_both_families_and_refuses_what_it_cannot_run() {
     let c = BertConfig::from_config_json(MINI).unwrap();
-    assert_eq!((c.family, c.hidden, c.layers, c.heads, c.head_dim()), (BertFamily::Bert, 384, 6, 12, 32));
-    assert_eq!((c.intermediate, c.vocab, c.max_positions, c.type_vocab), (1536, 30522, 512, 2));
+    assert_eq!(
+        (c.family, c.hidden, c.layers, c.heads, c.head_dim()),
+        (BertFamily::Bert, 384, 6, 12, 32)
+    );
+    assert_eq!(
+        (c.intermediate, c.vocab, c.max_positions, c.type_vocab),
+        (1536, 30522, 512, 2)
+    );
     assert_eq!(c.layer_norm_eps, 1e-12);
     let c = BertConfig::from_config_json(DISTIL).unwrap();
-    assert_eq!((c.family, c.hidden, c.head_dim(), c.intermediate, c.type_vocab), (BertFamily::DistilBert, 768, 64, 3072, 0));
+    assert_eq!(
+        (c.family, c.hidden, c.head_dim(), c.intermediate, c.type_vocab),
+        (BertFamily::DistilBert, 768, 64, 3072, 0)
+    );
     assert_eq!(c.layer_norm_eps, 1e-12);
 
     for (edit, needle) in [
         ((r#""hidden_act":"gelu""#, r#""hidden_act":"gelu_new""#), "gelu"),
-        ((r#""position_embedding_type":"absolute""#, r#""position_embedding_type":"relative_key""#), "absolute"),
+        (
+            (
+                r#""position_embedding_type":"absolute""#,
+                r#""position_embedding_type":"relative_key""#,
+            ),
+            "absolute",
+        ),
         ((r#""model_type":"bert""#, r#""model_type":"roberta""#), "model_type"),
-        ((r#""num_attention_heads":12"#, r#""num_attention_heads":5"#), "multiple"),
+        (
+            (r#""num_attention_heads":12"#, r#""num_attention_heads":5"#),
+            "multiple",
+        ),
         ((r#""hidden_size":384"#, r#""hidden_size":0"#), "zero"),
         ((r#""layer_norm_eps":1e-12"#, r#""layer_norm_eps":0"#), "layer_norm_eps"),
         ((r#""vocab_size":30522"#, r#""vocab_size":-1"#), "vocab_size"),

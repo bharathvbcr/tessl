@@ -628,7 +628,12 @@ fn gdn_at_the_4b_head_counts() {
         };
         check_gdn("chunk 4B heads", rt, &GdnData::random(s, "batch", 4400), Path::Chunk);
         let s = GdnShape { t: 3, ..s };
-        check_gdn("recurrent 4B heads", rt, &GdnData::random(s, "batch", 4410), Path::Recurrent);
+        check_gdn(
+            "recurrent 4B heads",
+            rt,
+            &GdnData::random(s, "batch", 4410),
+            Path::Recurrent,
+        );
     });
 }
 
@@ -3497,17 +3502,35 @@ fn attn_prefill_at_the_4b_head_counts() {
                 scale: 1.0 / (PFX_D as f32).sqrt(),
             };
             let scalar = seeded(rt, n, SENTINEL);
-            tessl::nn::flash_attn_rows(rt, &qb, &kb, &vb, &scalar, &tkvb, &zero, &zero, dims, PFX_D as u32, false)
-                .unwrap();
+            tessl::nn::flash_attn_rows(
+                rt,
+                &qb,
+                &kb,
+                &vb,
+                &scalar,
+                &tkvb,
+                &zero,
+                &zero,
+                dims,
+                PFX_D as u32,
+                false,
+            )
+            .unwrap();
             let tiled = seeded(rt, n, SENTINEL);
             qwen35::attn_prefill(rt, &qb, &kb, &vb, &tiled, &tkvb, &zero, &zero, dims, false).unwrap();
             rt.synchronize().unwrap();
             let (s, t) = (scalar.read_f32(), tiled.read_f32());
             let (es, et) = (max_err(&s[..n], &want), max_err(&t[..n], &want));
             eprintln!("4B heads B{batch} Tq{tq}: max |err| scalar {es:.2e}, tiled {et:.2e}");
-            assert!(t[..n].iter().all(|x| x.is_finite()), "B{batch} Tq{tq}: non-finite (unwritten?)");
+            assert!(
+                t[..n].iter().all(|x| x.is_finite()),
+                "B{batch} Tq{tq}: non-finite (unwritten?)"
+            );
             assert!(es <= 1e-5, "B{batch} Tq{tq}: scalar kernel error {es:.2e}");
-            assert!(et <= 4.0 * es.max(1e-7), "B{batch} Tq{tq}: tiled {et:.2e} > 4x scalar {es:.2e}");
+            assert!(
+                et <= 4.0 * es.max(1e-7),
+                "B{batch} Tq{tq}: tiled {et:.2e} > 4x scalar {es:.2e}"
+            );
         }
     });
 }

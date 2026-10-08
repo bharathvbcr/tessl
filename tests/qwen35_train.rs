@@ -18,8 +18,8 @@ use tessl::attn_train::{AttnTrainDims, AttnTrainWorkspace};
 use tessl::cross_entropy::{cross_entropy_rows, CeHidden, CeWorkspace, Reduction};
 use tessl::gemm::GemmOperands;
 use tessl::npy::read_npy;
-use tessl::qwen35_bwd::{embed_rows_bwd, scatter_add_rows, EmbedBwdWorkspace};
 use tessl::qwen35_adamw::{AdamW, AdamWHyper};
+use tessl::qwen35_bwd::{embed_rows_bwd, scatter_add_rows, EmbedBwdWorkspace};
 use tessl::qwen35_model::{LayerKind, Precision, Qwen35Config, Qwen35Model};
 use tessl::qwen35_train::{MixerGrads, Qwen35Grads, Supervise, TrainStep};
 use tessl::safetensors::SafeTensors;
@@ -329,7 +329,10 @@ fn tiny_step_on_bf16_storage_stays_near_transformers() {
             .iter()
             .zip(by_name(&cfg, &operands.grads, "model."))
             .any(|((_, a), (_, b))| a.iter().zip(&b).any(|(x, y)| x.to_bits() != y.to_bits()));
-    assert!(differs, "bf16 storage gave the bf16-operand step's bits: the stream was not rounded");
+    assert!(
+        differs,
+        "bf16 storage gave the bf16-operand step's bits: the stream was not rounded"
+    );
 
     let again = model.train_step(&ids, GemmOperands::Bf16).unwrap();
     assert_eq!(again.loss.to_bits(), step.loss.to_bits(), "loss changed on a rerun");
@@ -356,7 +359,11 @@ fn widened(t: &Tensor) -> Vec<f32> {
 fn bank_pairs<'a>(bank: &'a Qwen35Grads, fresh: &'a Qwen35Grads) -> Vec<(String, &'a Tensor, &'a Tensor)> {
     let mut out = vec![("embed".to_string(), &bank.embed, &fresh.embed)];
     for (l, (b, f)) in bank.layers.iter().zip(&fresh.layers).enumerate() {
-        for (n, x, y) in [("gate", &b.gate, &f.gate), ("up", &b.up, &f.up), ("down", &b.down, &f.down)] {
+        for (n, x, y) in [
+            ("gate", &b.gate, &f.gate),
+            ("up", &b.up, &f.up),
+            ("down", &b.down, &f.down),
+        ] {
             out.push((format!("layers.{l}.{n}"), x, y));
         }
         match (&b.mixer, &f.mixer) {
@@ -445,7 +452,11 @@ fn a_bf16_bank_rounds_each_delivery_once() {
         .collect();
     model.read_gradients(&bank, &ts).unwrap();
     let embed_read = ts[0].read_f32().unwrap();
-    assert_eq!(embed_read, widened(&bank.embed), "read_gradients did not widen the bank's embedding");
+    assert_eq!(
+        embed_read,
+        widened(&bank.embed),
+        "read_gradients did not widen the bank's embedding"
+    );
 }
 
 /// A step on a bf16-stored model holds less than the f32 model's at the same
@@ -461,7 +472,10 @@ fn a_bf16_step_peaks_under_its_bound_and_below_the_f32_steps() {
     for t in [8u32, 64, 512] {
         let bound = model.train_step_bytes(t, GemmOperands::Bf16);
         let f32_bound = f32_model.train_step_bytes(t, GemmOperands::Bf16);
-        assert!(bound < f32_bound, "T={t}: bf16 bound {bound} not below f32's {f32_bound}");
+        assert!(
+            bound < f32_bound,
+            "T={t}: bf16 bound {bound} not below f32's {f32_bound}"
+        );
         let ids: Vec<u32> = (0..t).map(|i| (i * 7 + 3) % cfg.vocab).collect();
         rt.synchronize().unwrap();
         let before = rt.current_allocated_bytes();
@@ -1326,9 +1340,17 @@ fn real_2b_step_matches_transformers() {
 /// The real 2B checkpoint, in `precision` as `load_tower` loads it (bf16 is
 /// how a bf16 model trains).
 fn real_2b_tower(rt: &Arc<GpuRuntime>, precision: Precision) -> Qwen35Model {
-    let path = std::env::var("QWEN35_2B_SAFETENSORS").expect("set QWEN35_2B_SAFETENSORS to a Qwen3.5-2B .safetensors file");
+    let path =
+        std::env::var("QWEN35_2B_SAFETENSORS").expect("set QWEN35_2B_SAFETENSORS to a Qwen3.5-2B .safetensors file");
     let st = SafeTensors::open(Path::new(&path)).unwrap();
-    Qwen35Model::load_tower(rt, &st, "model.language_model.", Qwen35Config::qwen35_2b().unwrap(), precision).unwrap()
+    Qwen35Model::load_tower(
+        rt,
+        &st,
+        "model.language_model.",
+        Qwen35Config::qwen35_2b().unwrap(),
+        precision,
+    )
+    .unwrap()
 }
 
 /// 512 natural-text ids (`tools/qwen35_ref/make_text_ids.py`).

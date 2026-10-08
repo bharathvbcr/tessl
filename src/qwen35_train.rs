@@ -1061,7 +1061,10 @@ impl Qwen35Model {
             .iter()
             .map(|l| {
                 let (grads, temps) = self.layer_bwd_bytes(l, t, mm);
-                (grads, sum(&[self.layer_fwd_bytes(l, t, mm, false), grads, temps, widened]))
+                (
+                    grads,
+                    sum(&[self.layer_fwd_bytes(l, t, mm, false), grads, temps, widened]),
+                )
             })
             .collect();
         let fresh_grads = if fresh {

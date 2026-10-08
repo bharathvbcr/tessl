@@ -33,7 +33,10 @@ fn dropping_the_model_releases_its_weights() {
                     Qwen35Model::load(rt, &st, "model.", cfg.clone(), precision)
                 }
                 .unwrap();
-                assert!(rt.current_allocated_bytes() > before, "{what}: loading allocated nothing the device charges");
+                assert!(
+                    rt.current_allocated_bytes() > before,
+                    "{what}: loading allocated nothing the device charges"
+                );
                 drop(model);
                 rt.synchronize().unwrap();
                 let after = rt.current_allocated_bytes();

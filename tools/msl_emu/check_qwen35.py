@@ -263,12 +263,14 @@ def case_gdn(kernel, B, T, Hk, Hv, Dv, seed, state_mode="none", **layout_kw):
     out = run(kernel, params, inputs, outs)
     # The 16-column-slice scan runs each element's arithmetic unchanged, so it
     # must match bit for bit (bounded to T <= 1000 to keep the run's length).
-    if kernel == "qwen35_gdn_chunk" and T <= 1000:
-        out16 = run(kernel, dict(params, scan_bv16=1), inputs, outs)
+    # So does the 16-column recurrent.
+    if T <= 1000:
+        flag = "scan_bv16" if kernel == "qwen35_gdn_chunk" else "rec_bv16"
+        out16 = run(kernel, dict(params, **{flag: 1}), inputs, outs)
         for name in outs:
             if not torch.equal(out[name].view(torch.int32), out16[name].view(torch.int32)):
-                print(f"  [FAIL] B{B} T{T} Hv{Hv} Dv{Dv}: scan_bv16 {name} differs from the 32-column scan")
-                FAILURES.append(f"scan_bv16 {name} B{B} T{T}")
+                print(f"  [FAIL] B{B} T{T} Hv{Hv} Dv{Dv}: {flag} {name} differs from the 32-column kernel")
+                FAILURES.append(f"{flag} {name} B{B} T{T}")
 
     got = out["out"].reshape(B * T, ld_out)
     got_heads = got[:, out_off:out_off + Hv * Dv]
@@ -985,10 +987,10 @@ def _host_binds():
     import re
     qwen35_rs = open(os.path.join(ROOT, "src", "qwen35.rs")).read()
     rs = qwen35_rs + "\n" + open(os.path.join(ROOT, "src", "attn_train.rs")).read()
-    # `let name = out_kernel("base", ..)` picks the _f32 or _bf16 variant; like
+    # `let name = out_kernel!("base", ..)` picks the _f32 or _bf16 variant; like
     # the pipelines below, the name is reused, so resolve it by position.
     name_defs = [(m.start(), m.group(1), [m.group(2) + "_f32", m.group(2) + "_bf16"])
-                 for m in re.finditer(r'let (\w+) = out_kernel\(\s*"(\w+)"', rs)]
+                 for m in re.finditer(r'let (\w+) = out_kernel!?\(\s*"(\w+)"', rs)]
     # `let name = match .. { A => "kernel_a", B => "kernel_b" };` — one dispatch
     # site serving several kernels.
     name_defs += [(m.start(), m.group(1), re.findall(r'"(qwen35_\w+)"', m.group(2)))

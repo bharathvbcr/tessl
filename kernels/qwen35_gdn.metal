@@ -86,7 +86,7 @@ static_assert(GDN_PREP_THREADS == 4u * GDN_C, "prep: one quad of lanes per solve
 static_assert(GDN_PREP_THREADS / 32u * 8u == GDN_C, "prep: one simdgroup per 8-row block");
 static_assert(GDN_SCAN_THREADS / 32u * 16u == GDN_C, "scan: two 8-row blocks per simdgroup");
 static_assert(GDN_SCAN_THREADS == GDN_DK, "recurrent: 32 key rows per simdgroup");
-static_assert(GDN_BV == 32u, "scan and recurrent: one value column per lane, 4 column tiles");
+static_assert(GDN_BV == 32u, "scan and recurrent: at most one value column per lane, 4 column tiles");
 /// transformers' `l2norm` epsilon, added to the sum of squares (not the mean).
 constant float GDN_L2_EPS = 1e-6f;
 
@@ -738,8 +738,9 @@ GDN_SCAN_KERNEL(qwen35_gdn_chunk_scan_bv16, 16u)
 
 // --------------------------------------------------------------- recurrent ---
 
-/// Threadgroup memory for `qwen35_gdn_recurrent`, in floats: two cross-simdgroup
-/// partial-sum arrays of 4 x 32.
+/// Threadgroup memory for `qwen35_gdn_recurrent`, in floats: two cross-block
+/// partial-sum arrays of 4 key blocks x 32 columns. The 16-column kernel uses
+/// the first half of each.
 constant uint GDN_REC_TG_FLOATS = 2u * (GDN_SCAN_THREADS / 32u) * 32u;
 static_assert(GDN_REC_TG_FLOATS * 4u <= 32768u, "recurrent threadgroup memory exceeds 32 KB");
 
@@ -755,49 +756,62 @@ static_assert(GDN_REC_TG_FLOATS * 4u <= 32768u, "recurrent threadgroup memory ex
 /// also safe. Without `flags & 1` the start state is zero. With `flags & 4`
 /// row b runs `min(seq_lens[b], T)` steps and its later rows are not written.
 ///
-/// Mapping: lane = value column `v0 + lane`, simdgroup = 32 key rows. Each lane
-/// keeps its 32 x 1 piece of S in registers for all T steps; the two per-token
-/// reductions over the key dim cross simdgroups through threadgroup memory.
+/// Mapping: a threadgroup owns `BV` value columns. Thread `sg * 32 + lane`
+/// owns column `(sg * 32 + lane) % BV` for the 32 key rows of block
+/// `(sg * 32 + lane) / BV`, and keeps that 32 x 1 piece of S in registers for
+/// all T steps; the two per-token reductions over the key dim cross the four
+/// blocks through threadgroup memory. At `BV = 32` that is lane = column and
+/// simdgroup = key block (128 threads, 4 simdgroups); at `BV = 16` each of 2
+/// simdgroups holds two key blocks of the same 16 columns (64 threads), so
+/// there are twice the threadgroups for the same work. Every sum runs in the
+/// same order at either width: each simdgroup is whole for the norms, a
+/// thread folds its block's 32 rows in order, and the blocks add 0 + 1 + 2 + 3.
+/// So the two agree bit for bit.
 ///
-/// 128 threads = 4 simdgroups. Grid: x = Dv / 32, y = value head, z = batch.
-kernel void qwen35_gdn_recurrent(
-    device const float *qkv [[buffer(0)]],
-    device const float *ab [[buffer(1)]],
-    device const float *a_log [[buffer(2)]],
-    device const float *dt_bias [[buffer(3)]],
-    device const float *state_in [[buffer(4)]],
-    device float *out [[buffer(5)]],
-    device float *state_out [[buffer(6)]],
-    constant uint &T [[buffer(7)]],
-    constant uint &Hk [[buffer(8)]],
-    constant uint &Hv [[buffer(9)]],
-    constant uint &Dv [[buffer(10)]],
-    constant uint &ld_qkv [[buffer(11)]],
-    constant uint &q_off [[buffer(12)]],
-    constant uint &k_off [[buffer(13)]],
-    constant uint &v_off [[buffer(14)]],
-    constant uint &ld_ab [[buffer(15)]],
-    constant uint &a_off [[buffer(16)]],
-    constant uint &b_off [[buffer(17)]],
-    constant uint &ld_out [[buffer(18)]],
-    constant uint &out_off [[buffer(19)]],
-    constant uint &state_bstride [[buffer(20)]],
-    constant uint &flags [[buffer(21)]],
-    device const uint *seq_lens [[buffer(22)]],
-    threadgroup float *tgm [[threadgroup(0)]],
-    uint3 tg [[threadgroup_position_in_grid]],
-    uint sg [[simdgroup_index_in_threadgroup]],
-    uint lane [[thread_index_in_simdgroup]])
+/// Grid: x = Dv / BV, y = value head, z = batch.
+template <uint BV>
+inline void gdn_recurrent_body(
+    device const float *qkv,
+    device const float *ab,
+    device const float *a_log,
+    device const float *dt_bias,
+    device const float *state_in,
+    device float *out,
+    device float *state_out,
+    uint T,
+    uint Hk,
+    uint Hv,
+    uint Dv,
+    uint ld_qkv,
+    uint q_off,
+    uint k_off,
+    uint v_off,
+    uint ld_ab,
+    uint a_off,
+    uint b_off,
+    uint ld_out,
+    uint out_off,
+    uint state_bstride,
+    uint flags,
+    device const uint *seq_lens,
+    threadgroup float *tgm,
+    uint3 tg,
+    uint sg,
+    uint lane)
 {
+    static_assert(BV == 32u || BV == 16u, "whole simdgroups of 4 key blocks");
     const uint vs = tg.x;
     const uint hv = tg.y;
     const uint b = tg.z;
     const uint hk = hv / max(Hv / Hk, 1u);
-    const uint v = vs * GDN_BV + lane;
-    const uint k0 = sg * 32u;
+    const uint tid = sg * 32u + lane;
+    const uint col = tid % BV;
+    const uint kb = tid / BV;
+    const uint v = vs * BV + col;
+    const uint k0 = kb * 32u;
     const float q_scale = rsqrt((float)GDN_DK);
-    threadgroup float *red_kv = tgm;          // [4][32]
-    threadgroup float *red_y = tgm + GDN_REC_TG_FLOATS / 2u; // [4][32]
+    threadgroup float *red_kv = tgm;                         // [4][BV]
+    threadgroup float *red_y = tgm + GDN_REC_TG_FLOATS / 2u; // [4][BV]
 
     float s[32];
     const ulong state_head = (ulong)hv * GDN_DK * Dv;
@@ -834,9 +848,9 @@ kernel void qwen35_gdn_recurrent(
             s[j] *= decay;
             kv += s[j] * (kp[k0 + j] * rk);
         }
-        red_kv[sg * 32u + lane] = kv;
+        red_kv[kb * BV + col] = kv;
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        const float kv_mem = red_kv[lane] + red_kv[32u + lane] + red_kv[64u + lane] + red_kv[96u + lane];
+        const float kv_mem = red_kv[col] + red_kv[BV + col] + red_kv[2u * BV + col] + red_kv[3u * BV + col];
         const float delta = beta * (qkv[row * (ulong)ld_qkv + v_off + (ulong)hv * Dv + v] - kv_mem);
 
         // S += k delta^T; y = S^T q
@@ -845,15 +859,15 @@ kernel void qwen35_gdn_recurrent(
             s[j] += (kp[k0 + j] * rk) * delta;
             y += s[j] * (qp[k0 + j] * rq);
         }
-        red_y[sg * 32u + lane] = y;
+        red_y[kb * BV + col] = y;
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        if (sg == 0u) {
+        if (kb == 0u) {
             out[row * (ulong)ld_out + out_off + (ulong)hv * Dv + v] =
-                red_y[lane] + red_y[32u + lane] + red_y[64u + lane] + red_y[96u + lane];
+                red_y[col] + red_y[BV + col] + red_y[2u * BV + col] + red_y[3u * BV + col];
         }
         // red_kv is next written after this token's second barrier, by which
         // point every read of it has happened; red_y is next written after the
-        // next token's first barrier, which simdgroup 0 reaches only after its
+        // next token's first barrier, which block 0 reaches only after its
         // read above. Two barriers a token are therefore enough.
     }
 
@@ -864,6 +878,49 @@ kernel void qwen35_gdn_recurrent(
         }
     }
 }
+
+#define GDN_RECURRENT_KERNEL(NAME, BV)                                             \
+kernel void NAME(                                                                  \
+    device const float *qkv [[buffer(0)]],                                         \
+    device const float *ab [[buffer(1)]],                                          \
+    device const float *a_log [[buffer(2)]],                                       \
+    device const float *dt_bias [[buffer(3)]],                                     \
+    device const float *state_in [[buffer(4)]],                                    \
+    device float *out [[buffer(5)]],                                               \
+    device float *state_out [[buffer(6)]],                                         \
+    constant uint &T [[buffer(7)]],                                                \
+    constant uint &Hk [[buffer(8)]],                                               \
+    constant uint &Hv [[buffer(9)]],                                               \
+    constant uint &Dv [[buffer(10)]],                                              \
+    constant uint &ld_qkv [[buffer(11)]],                                          \
+    constant uint &q_off [[buffer(12)]],                                           \
+    constant uint &k_off [[buffer(13)]],                                           \
+    constant uint &v_off [[buffer(14)]],                                           \
+    constant uint &ld_ab [[buffer(15)]],                                           \
+    constant uint &a_off [[buffer(16)]],                                           \
+    constant uint &b_off [[buffer(17)]],                                           \
+    constant uint &ld_out [[buffer(18)]],                                          \
+    constant uint &out_off [[buffer(19)]],                                         \
+    constant uint &state_bstride [[buffer(20)]],                                   \
+    constant uint &flags [[buffer(21)]],                                           \
+    device const uint *seq_lens [[buffer(22)]],                                    \
+    threadgroup float *tgm [[threadgroup(0)]],                                     \
+    uint3 tg [[threadgroup_position_in_grid]],                                     \
+    uint sg [[simdgroup_index_in_threadgroup]],                                    \
+    uint lane [[thread_index_in_simdgroup]])                                       \
+{                                                                                  \
+    gdn_recurrent_body<BV>(qkv, ab, a_log, dt_bias, state_in, out, state_out, T,   \
+                           Hk, Hv, Dv, ld_qkv, q_off, k_off, v_off, ld_ab, a_off,  \
+                           b_off, ld_out, out_off, state_bstride, flags, seq_lens, \
+                           tgm, tg, sg, lane);                                     \
+}
+
+/// `qwen35_gdn_recurrent`: 32-column slices, 128 threads, Dv / 32
+/// threadgroups per head.
+GDN_RECURRENT_KERNEL(qwen35_gdn_recurrent, 32u)
+/// 16-column slices, 64 threads: twice the threadgroups at batch 1, where the
+/// 32-column grid is `Dv / 32 x Hv` groups. Bit-identical to the 32-column one.
+GDN_RECURRENT_KERNEL(qwen35_gdn_recurrent_bv16, 16u)
 
 // --------------------------------------------------------- gated RMSNorm ---
 

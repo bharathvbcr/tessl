@@ -181,10 +181,20 @@ int main(int argc, char **argv) {
         float *qkv = F("qkv"), *ab = F("ab"), *alog = F("a_log"), *dtb = F("dt_bias"), *out = F("out");
         float *si = Fopt("state_in"), *so = params.count("in_place") ? si : Fopt("state_out");
         uint *lens = reinterpret_cast<uint *>(Fopt("seq_lens"));
-        launch(uint3(Dv / GDN_BV, Hv, B), uint3(GDN_SCAN_THREADS, 1, 1), GDN_REC_TG_FLOATS, [&](const Ids &id, float *tgm) {
-            qwen35_gdn_recurrent(qkv, ab, alog, dtb, si, out, so, T, Hk, Hv, Dv, ld_qkv, q_off, k_off, v_off,
-                                 ld_ab, a_off, b_off, ld_out, out_off, sb, flags, lens, tgm, id.tg, id.sg,
-                                 id.lane);
+        // `rec_bv16`: the 16-column-slice recurrent (qwen35_gdn_recurrent_bv16),
+        // 64 threads a group.
+        const bool bv16 = params.count("rec_bv16") != 0;
+        launch(uint3(Dv / (bv16 ? 16u : GDN_BV), Hv, B), uint3(bv16 ? 64u : GDN_SCAN_THREADS, 1, 1),
+               GDN_REC_TG_FLOATS, [&](const Ids &id, float *tgm) {
+            if (bv16) {
+                qwen35_gdn_recurrent_bv16(qkv, ab, alog, dtb, si, out, so, T, Hk, Hv, Dv, ld_qkv, q_off, k_off,
+                                          v_off, ld_ab, a_off, b_off, ld_out, out_off, sb, flags, lens, tgm,
+                                          id.tg, id.sg, id.lane);
+            } else {
+                qwen35_gdn_recurrent(qkv, ab, alog, dtb, si, out, so, T, Hk, Hv, Dv, ld_qkv, q_off, k_off, v_off,
+                                     ld_ab, a_off, b_off, ld_out, out_off, sb, flags, lens, tgm, id.tg, id.sg,
+                                     id.lane);
+            }
         });
     } else if (kname == "qwen35_gated_rms_norm_f32" || kname == "qwen35_gated_rms_norm_bf16") {
         const uint rows = P("rows"), H = P("H"), D = P("D"), ld_x = P("ld_x"), x_off = P("x_off"),

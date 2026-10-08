@@ -73,6 +73,8 @@ const SCAN16_TG_BYTES: usize = 4 * (128 * 20 + 64 * 20 + 4 * 128 + 4 * 64);
 const REC_TG_BYTES: usize = 4 * (2 * 4 * 32);
 const PREP_THREADS: usize = 256;
 const SCAN_THREADS: usize = 128;
+/// Threads of `qwen35_gdn_recurrent_bv16`: 4 key blocks x 16 columns.
+const REC16_THREADS: usize = 64;
 /// Simdgroups per threadgroup for the one-simdgroup-per-row kernels.
 const ROWS_PER_TG: usize = 8;
 /// `REDUCE_MAX_SIMDGROUPS` in kernels/reduce_tree.h.
@@ -840,10 +842,12 @@ pub struct GdnParams<'a> {
     pub dt_bias: &'a GpuBuffer,
 }
 
-/// How many value columns one threadgroup of the chunked rule's sequential scan
-/// owns. Each output element runs the same arithmetic either way, so the
-/// results are bit-identical; `Cols16` launches twice the threadgroups, which
-/// pays when a small batch leaves the GPU underfilled (`probe_gdn_scan`).
+/// How many value columns one threadgroup of the chunked rule's sequential scan,
+/// or of the recurrent rule, owns. Each output element runs the same
+/// arithmetic either way, so the results are bit-identical; `Cols16` launches
+/// twice the threadgroups, which pays when a small batch leaves the GPU
+/// underfilled (`probe_gdn_scan`). The [`Default`] is the scan's;
+/// [`GDN_RECURRENT_SLICE`] is the recurrent rule's.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum GdnScanSlice {
     /// `qwen35_gdn_chunk_scan`: `v_dim / 32` threadgroups per head.
@@ -1324,7 +1328,43 @@ pub fn gdn_recurrent(
     out: Cols<'_>,
     state_out: Option<&GpuBuffer>,
 ) -> Result<(), String> {
-    gdn_recurrent_impl(rt, dims, qkv, gates, params, state, out, state_out, None)
+    gdn_recurrent_impl(
+        rt,
+        dims,
+        qkv,
+        gates,
+        params,
+        state,
+        out,
+        state_out,
+        None,
+        GDN_RECURRENT_SLICE,
+    )
+}
+
+/// The value-column slice [`gdn_recurrent`] and [`gdn_recurrent_varlen`] run in.
+///
+/// `Cols32`. `Cols16` (`qwen35_gdn_recurrent_bv16`) is bit-identical and
+/// launches twice the threadgroups, which at batch 1 is what the 32-column
+/// grid (`v_dim / 32 x v_heads`, 64 groups at the 2B's shapes) leaves idle;
+/// it becomes the default only if a paired batch-1 sweep
+/// (`bench_qwen35_layers --paired-gdn-recurrent`) has it faster.
+pub const GDN_RECURRENT_SLICE: GdnScanSlice = GdnScanSlice::Cols32;
+
+/// [`gdn_recurrent`] in a chosen value-column slice.
+#[allow(clippy::too_many_arguments)]
+pub fn gdn_recurrent_with_slice(
+    rt: &Arc<GpuRuntime>,
+    dims: &GdnDims,
+    qkv: &GdnQkv<'_>,
+    gates: &GdnGateLogits<'_>,
+    params: &GdnParams<'_>,
+    state: StateIn<'_>,
+    out: Cols<'_>,
+    state_out: Option<&GpuBuffer>,
+    slice: GdnScanSlice,
+) -> Result<(), String> {
+    gdn_recurrent_impl(rt, dims, qkv, gates, params, state, out, state_out, None, slice)
 }
 
 /// [`gdn_recurrent`] with a length per row.
@@ -1346,7 +1386,18 @@ pub fn gdn_recurrent_varlen(
     state_out: Option<&GpuBuffer>,
     seq_lens: &GpuBuffer,
 ) -> Result<(), String> {
-    gdn_recurrent_impl(rt, dims, qkv, gates, params, state, out, state_out, Some(seq_lens))
+    gdn_recurrent_impl(
+        rt,
+        dims,
+        qkv,
+        gates,
+        params,
+        state,
+        out,
+        state_out,
+        Some(seq_lens),
+        GDN_RECURRENT_SLICE,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1360,6 +1411,7 @@ fn gdn_recurrent_impl(
     out: Cols<'_>,
     state_out: Option<&GpuBuffer>,
     seq_lens: Option<&GpuBuffer>,
+    slice: GdnScanSlice,
 ) -> Result<(), String> {
     const WHAT: &str = "qwen35::gdn_recurrent";
     let (flags, bstride) = validate_gdn(
@@ -1370,16 +1422,26 @@ fn gdn_recurrent_impl(
     if dims.batch == 0 || (dims.seq == 0 && state_out.is_none()) {
         return Ok(());
     }
-    let p = pipeline_for(rt, "qwen35_gdn_recurrent", SCAN_THREADS, REC_TG_BYTES)?;
+    // Literal names, so the emulator's host-contract check sees both kernels
+    // this site binds.
+    let rec_name = match slice {
+        GdnScanSlice::Cols32 => "qwen35_gdn_recurrent",
+        GdnScanSlice::Cols16 => "qwen35_gdn_recurrent_bv16",
+    };
+    let (rec_cols, rec_threads) = match slice {
+        GdnScanSlice::Cols32 => (GDN_VALUE_BLOCK, SCAN_THREADS),
+        GdnScanSlice::Cols16 => (16, REC16_THREADS),
+    };
+    let p = pipeline_for(rt, rec_name, rec_threads, REC_TG_BYTES)?;
     dispatch_groups(
         rt,
         &p,
         (
-            (dims.v_dim / GDN_VALUE_BLOCK) as usize,
+            (dims.v_dim / rec_cols) as usize,
             dims.v_heads as usize,
             dims.batch as usize,
         ),
-        SCAN_THREADS,
+        rec_threads,
         REC_TG_BYTES,
         |bnd| {
             set_gpu_buf(bnd, qkv.buf, 0);

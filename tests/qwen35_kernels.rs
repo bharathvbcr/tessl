@@ -321,7 +321,9 @@ fn run_gdn_with(rt: &Arc<GpuRuntime>, d: &GdnData, path: Path, mode: StateOut) -
 /// [`run_gdn_with`], through the `_varlen` entry points when `lens` is given.
 ///
 /// The chunked path runs with both scan slices (`GdnScanSlice`), which must
-/// agree bit for bit, so every chunked test holds both kernels.
+/// agree bit for bit, so every chunked test holds both kernels; so does the
+/// recurrent path, whose 16-column kernel `gdn_recurrent_with_slice` reaches
+/// (the `_varlen` form runs the default slice only).
 fn run_gdn_lens(
     rt: &Arc<GpuRuntime>,
     d: &GdnData,
@@ -330,11 +332,15 @@ fn run_gdn_lens(
     lens: Option<&[u32]>,
 ) -> (Vec<f32>, Vec<f32>) {
     let base = run_gdn_slice(rt, d, path, mode, lens, GdnScanSlice::Cols32);
-    if path == Path::Chunk {
+    if path == Path::Chunk || lens.is_none() {
         let narrow = run_gdn_slice(rt, d, path, mode, lens, GdnScanSlice::Cols16);
         let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
-        assert_eq!(bits(&narrow.0), bits(&base.0), "16-column scan output vs 32-column");
-        assert_eq!(bits(&narrow.1), bits(&base.1), "16-column scan state vs 32-column");
+        assert_eq!(
+            bits(&narrow.0),
+            bits(&base.0),
+            "{path:?}: 16-column output vs 32-column"
+        );
+        assert_eq!(bits(&narrow.1), bits(&base.1), "{path:?}: 16-column state vs 32-column");
     }
     base
 }
@@ -403,7 +409,8 @@ fn run_gdn_slice(
             .unwrap();
         }
         (Path::Recurrent, None) => {
-            qwen35::gdn_recurrent(rt, &dims, &qkv, &gates, &params, state, out_cols, state_out).unwrap()
+            qwen35::gdn_recurrent_with_slice(rt, &dims, &qkv, &gates, &params, state, out_cols, state_out, slice)
+                .unwrap()
         }
         (Path::Recurrent, Some(l)) => {
             qwen35::gdn_recurrent_varlen(rt, &dims, &qkv, &gates, &params, state, out_cols, state_out, l).unwrap()
@@ -1850,6 +1857,7 @@ fn every_qwen35_kernel_is_in_the_metallib() {
             "qwen35_gdn_chunk_scan",
             "qwen35_gdn_chunk_scan_bv16",
             "qwen35_gdn_recurrent",
+            "qwen35_gdn_recurrent_bv16",
             "qwen35_gated_rms_norm_f32",
             "qwen35_gated_rms_norm_bf16",
             "qwen35_attn_qk_norm_rope",

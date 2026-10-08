@@ -10,6 +10,7 @@
 //! cargo run --release --bin bench_qwen35_layers -- --mlp-unfused # mlp_silu + cast
 //! cargo run --release --bin bench_qwen35_layers -- --gdn-scan16  # 16-column GDN scan
 //! cargo run --release --bin bench_qwen35_layers -- --decode=4096  # per-token decode
+//! cargo run --release --bin bench_qwen35_layers -- --paired-gdn-recurrent 1 4
 //! ```
 //!
 //! Attention runs on `qwen35::attn_prefill` (the TensorOps kernel) at its
@@ -1154,6 +1155,137 @@ fn run_paired_attn(rt: &Arc<GpuRuntime>, ts: &[usize]) -> Res<()> {
     Ok(())
 }
 
+// ----------------------------------------------------- paired GDN recurrent ---
+
+/// `qwen35::gdn_recurrent` launches per command buffer in `--paired-gdn-recurrent`:
+/// one decode token is a few microseconds, so a buffer of these is well over
+/// the submit floor.
+const PAIRED_REC_REPS: usize = 256;
+
+fn dispatch_rec(rt: &Arc<GpuRuntime>, m: &PairRec, slice: qwen35::GdnScanSlice) -> Res<()> {
+    qwen35::gdn_recurrent_with_slice(
+        rt,
+        &m.dims,
+        &m.gdn.conv_qkv(&m.qkv),
+        &m.gdn.gates(&m.proj),
+        &GdnParams {
+            a_log: &m.a_log,
+            dt_bias: &m.dt_bias,
+        },
+        StateIn::Snapshot(&m.state),
+        Cols::dense(&m.out, m.gdn.value_dim()),
+        Some(&m.state_out),
+        slice,
+    )
+}
+
+/// One GDN layer's decode operands at 2B shapes: a read-only snapshot state,
+/// so every launch computes the same thing.
+struct PairRec {
+    gdn: GdnProjLayout,
+    dims: GdnDims,
+    proj: GpuBuffer,
+    qkv: GpuBuffer,
+    a_log: GpuBuffer,
+    dt_bias: GpuBuffer,
+    state: GpuBuffer,
+    out: GpuBuffer,
+    state_out: GpuBuffer,
+}
+
+/// `gdn_recurrent` in 32- and 16-column slices at decode (T = 1), same
+/// operands, ABBA, per batch size. Checks the two agree bit for bit first.
+fn run_paired_gdn_recurrent(rt: &Arc<GpuRuntime>, batches: &[usize]) -> Res<()> {
+    use qwen35::GdnScanSlice::{Cols16, Cols32};
+    const WARMUP_ROUNDS: usize = 3;
+    const ROUNDS: usize = 15;
+    let gdn = GdnProjLayout::new(GDN_K_HEADS, GDN_V_HEADS, GDN_V_DIM)?;
+    println!(
+        "paired gdn_recurrent: 32- vs 16-column slices, T = 1, GDN {GDN_K_HEADS}k/{GDN_V_HEADS}v heads x \
+         {GDN_V_DIM}, snapshot state; ABBA, {PAIRED_REC_REPS} launches per command buffer, \
+         {WARMUP_ROUNDS} warmup + {ROUNDS} timed rounds"
+    );
+    for &b in batches {
+        let dims = gdn.dims(b as u32, 1);
+        let vh = GDN_V_HEADS as usize;
+        let m = PairRec {
+            gdn,
+            dims,
+            proj: buf(rt, &fill(b * gdn.width() as usize, 31, 1.0))?,
+            qkv: buf(rt, &fill(b * gdn.conv_dim() as usize, 32, 1.0))?,
+            a_log: buf(rt, &fill(vh, 33, 1.0).iter().map(|v| 1.4 + 1.3 * v).collect::<Vec<_>>())?,
+            dt_bias: buf(
+                rt,
+                &fill(vh, 34, 1.0).iter().map(|v| -4.5 + 2.5 * v).collect::<Vec<_>>(),
+            )?,
+            state: buf(rt, &fill(dims.state_elems_per_row(), 35, 0.05))?,
+            out: rt.alloc_buffer(b * gdn.value_dim() as usize * 4)?,
+            state_out: rt.alloc_buffer(b * dims.state_elems_per_row() * 4)?,
+        };
+        let mut bits = Vec::new();
+        for slice in [Cols32, Cols16] {
+            m.out.write_f32(&vec![f32::NAN; m.out.nbytes() / 4]);
+            m.state_out.write_f32(&vec![f32::NAN; m.state_out.nbytes() / 4]);
+            dispatch_rec(rt, &m, slice)?;
+            rt.synchronize()?;
+            finite_f32("gdn_recurrent out", &m.out, m.out.nbytes() / 4)?;
+            let mut v = m.out.read_u32();
+            v.extend(m.state_out.read_u32());
+            bits.push(v);
+        }
+        if bits[0] != bits[1] {
+            return Err(format!(
+                "B={b}: the 16-column gdn_recurrent differs from the 32-column one"
+            ));
+        }
+        println!("B={b}: 16- and 32-column outputs and states are bit-identical");
+
+        let (mut t32, mut t16, mut ratios) = (Vec::new(), Vec::new(), Vec::new());
+        for round in 0..(WARMUP_ROUNDS + ROUNDS) {
+            let order = if round % 2 == 0 {
+                [Cols32, Cols16]
+            } else {
+                [Cols16, Cols32]
+            };
+            let mut pair = [0.0f64; 2];
+            for slice in order {
+                rt.synchronize()?;
+                let t0 = Instant::now();
+                for _ in 0..PAIRED_REC_REPS {
+                    dispatch_rec(rt, &m, slice)?;
+                }
+                rt.synchronize()?;
+                pair[usize::from(slice == Cols16)] = t0.elapsed().as_secs_f64() * 1e6 / PAIRED_REC_REPS as f64;
+            }
+            if round >= WARMUP_ROUNDS {
+                t32.push(pair[0]);
+                t16.push(pair[1]);
+                ratios.push(pair[1] / pair[0]);
+            }
+        }
+        let lo = |v: &[f64]| v.iter().copied().fold(f64::INFINITY, f64::min);
+        let hi = |v: &[f64]| v.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+        for (name, v) in [("cols32", &t32), ("cols16", &t16)] {
+            println!(
+                "PAIRED b={b} slice={name} median_us={:.3} min_us={:.3} max_us={:.3}",
+                median(v.clone()),
+                lo(v),
+                hi(v)
+            );
+        }
+        println!(
+            "PAIRED b={b} ratio_cols16_over_cols32 median={:.4} min={:.4} max={:.4}",
+            median(ratios.clone()),
+            lo(&ratios),
+            hi(&ratios)
+        );
+        println!("METRIC gdn_rec_b{b}_cols32_us {:.4}", median(t32));
+        println!("METRIC gdn_rec_b{b}_cols16_us {:.4}", median(t16));
+        println!("METRIC gdn_rec_b{b}_ratio_16_over_32 {:.4}", median(ratios));
+    }
+    Ok(())
+}
+
 // --------------------------------------------------------------------- main ---
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -1163,9 +1295,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut mlp_unfused = false;
     let mut gdn_scan = qwen35::GdnScanSlice::Cols32;
     let mut decode: Option<usize> = None;
+    let mut paired_rec = false;
     let mut ts = Vec::new();
     for arg in std::env::args().skip(1) {
-        if arg == "--decode" {
+        if arg == "--paired-gdn-recurrent" {
+            paired_rec = true;
+        } else if arg == "--decode" {
             decode = Some(4096);
         } else if let Some(p) = arg.strip_prefix("--decode=") {
             let p: usize = p
@@ -1210,8 +1345,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if paired_attn && check_only {
         return Err("--paired-attn times both kernels; it does not combine with --check-only".into());
     }
-    if decode.is_some() && (check_only || paired_attn || !ts.is_empty()) {
-        return Err("--decode times decode only; it takes no T, --check-only or --paired-attn".into());
+    if decode.is_some() && (check_only || paired_attn || paired_rec || !ts.is_empty()) {
+        return Err("--decode times decode only; it takes no T, --check-only or --paired-*".into());
+    }
+    if paired_rec && (check_only || paired_attn) {
+        return Err("--paired-gdn-recurrent takes batch sizes only".into());
+    }
+    if paired_rec {
+        let rt = GpuRuntime::new()?;
+        println!("device: {}", rt.device_name());
+        rt.set_async_encode(true)?;
+        run_paired_gdn_recurrent(&rt, if ts.is_empty() { &[1] } else { &ts })?;
+        rt.set_async_encode(false)?;
+        return Ok(());
     }
     if ts.is_empty() {
         ts = if paired_attn {

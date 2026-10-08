@@ -626,7 +626,6 @@ fn check_qkv(rt: &Arc<GpuRuntime>, name: &str, rel: f64) {
     let qo = rt.alloc_buffer(t * hq * d * 4).unwrap();
     let ko = rt.alloc_buffer(cap * hkv * d * 4).unwrap();
     let vo = rt.alloc_buffer(cap * hkv * d * 4).unwrap();
-    let vn = rt.alloc_buffer(cap * hkv * d * 4).unwrap();
     qwen35::attn_qk_norm_rope_columns(
         rt,
         &AttnShape {
@@ -642,6 +641,7 @@ fn check_qkv(rt: &Arc<GpuRuntime>, name: &str, rel: f64) {
             q_head_stride: d as u32,
             k_col: (hq * d) as u32,
             v_col: ((hq + hkv) * d) as u32,
+            v_norm: true,
         },
         0.0,
         &qw,
@@ -656,8 +656,6 @@ fn check_qkv(rt: &Arc<GpuRuntime>, name: &str, rel: f64) {
         1e-6,
     )
     .unwrap_or_else(|e| panic!("{name}: {e}"));
-    let ones = buf_f32(rt, &vec![1.0; d]);
-    rms_norm_f32(rt, &vo, &ones, &vn, (cap * hkv) as u32, d as u32, 1e-6).unwrap();
     rt.synchronize().unwrap();
     let slots = |b: &GpuBuffer| -> Vec<f64> {
         b.read_f32()[pos0 * hkv * d..cap * hkv * d]
@@ -669,7 +667,7 @@ fn check_qkv(rt: &Arc<GpuRuntime>, name: &str, rel: f64) {
     for (what, got, want) in [
         ("q", got_q, load(&format!("{name}_q_out")).1),
         ("k", slots(&ko), load(&format!("{name}_k_out")).1),
-        ("v", slots(&vn), load(&format!("{name}_v_out")).1),
+        ("v", slots(&vo), load(&format!("{name}_v_out")).1),
     ] {
         assert_close(
             &format!("{name} {what}"),

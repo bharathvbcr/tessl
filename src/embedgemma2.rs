@@ -522,9 +522,6 @@ struct Layer {
     w_o: Tensor,
     q_norm: GpuBuffer,
     k_norm: GpuBuffer,
-    /// All-ones `[head_dim]` weight for the weightless value norm, shared by
-    /// every layer of this head dim.
-    v_norm_ones: GpuBuffer,
     gate: Tensor,
     up: Tensor,
     down: Tensor,
@@ -609,10 +606,10 @@ fn pack_forwards(batch: &[&[u32]], max_rows: usize) -> Vec<Vec<usize>> {
     runs
 }
 
-/// A layer's K, V and normed V, `[batch, seq, kv_heads, head_dim]` each and
+/// A layer's K and normed V, `[batch, seq, kv_heads, head_dim]` each and
 /// exactly that size. The K/V writer derives its per-sequence stride from the
 /// buffer's size (`capacity / (batch * kv_heads * head_dim)` positions) while
-/// [`encoder_attn`] and the value norm read at stride `seq`; the two agree
+/// [`encoder_attn`] reads at stride `seq`; the two agree
 /// only when the buffer holds exactly `seq` positions per sequence. A buffer
 /// shared by layers of different widths would hold more for the narrower
 /// ones, and every sequence after the first would be read from the wrong rows.
@@ -620,8 +617,8 @@ struct KvBufs {
     /// `kv_heads * head_dim`.
     width: u32,
     k: GpuBuffer,
+    /// RMS-normalized on the way in (`QkvColumns::v_norm`).
     v: GpuBuffer,
-    v_normed: GpuBuffer,
 }
 
 /// Every activation of one forward, sized for `rows = batch * seq`.
@@ -689,19 +686,10 @@ impl EmbedGemma2Model {
         let final_norm = ld.norm("norm.weight", h)?;
         let projection = ld.linear(&[("embedding_projection.weight", cfg.embedding_dim as usize)], h, f32)?;
 
-        let mut ones: Vec<(u32, GpuBuffer)> = Vec::new();
         let mut layers = Vec::with_capacity(n_layers);
         for ((i, &spec), ple_in) in cfg.layers.iter().enumerate().zip(ple_in) {
             let p = |s: &str| format!("layers.{i}.{s}");
             let (d, q, kv) = (spec.head_dim as usize, cfg.q_heads as usize, spec.kv_heads as usize);
-            let v_norm_ones = match ones.iter().find(|(od, _)| *od == spec.head_dim) {
-                Some((_, b)) => b.clone(),
-                None => {
-                    let b = ld.buf(&vec![1.0f32; d])?;
-                    ones.push((spec.head_dim, b.clone()));
-                    b
-                }
-            };
             layers.push(Layer {
                 spec,
                 input_norm: ld.norm(&p("input_layernorm.weight"), h)?,
@@ -720,7 +708,6 @@ impl EmbedGemma2Model {
                 w_o: ld.linear(&[(&p("self_attn.o_proj.weight"), h)], q * d, f32)?,
                 q_norm: ld.norm(&p("self_attn.q_norm.weight"), d)?,
                 k_norm: ld.norm(&p("self_attn.k_norm.weight"), d)?,
-                v_norm_ones,
                 gate: ld.linear(&[(&p("mlp.gate_proj.weight"), inter)], h, f32)?,
                 up: ld.linear(&[(&p("mlp.up_proj.weight"), inter)], h, f32)?,
                 down: ld.linear(&[(&p("mlp.down_proj.weight"), h)], inter, f32)?,
@@ -927,6 +914,7 @@ impl EmbedGemma2Model {
                     q_head_stride: s.head_dim,
                     k_col: cfg.q_heads * s.head_dim,
                     v_col: (cfg.q_heads + s.kv_heads) * s.head_dim,
+                    v_norm: true,
                 },
                 0.0,
                 &layer.q_norm,
@@ -940,20 +928,11 @@ impl EmbedGemma2Model {
                 s.rope_theta,
                 eps,
             )?;
-            rms_norm_f32(
-                rt,
-                &kv.v,
-                &layer.v_norm_ones,
-                &kv.v_normed,
-                rows_u * s.kv_heads,
-                s.head_dim,
-                eps,
-            )?;
             encoder_attn(
                 rt,
                 &a.q,
                 &kv.k,
-                &kv.v_normed,
+                &kv.v,
                 &a.attn.buffer,
                 &a.lens,
                 EncoderAttnDims {
@@ -1087,7 +1066,6 @@ impl EmbedGemma2Model {
                     width,
                     k: f32s(n)?,
                     v: f32s(n)?,
-                    v_normed: f32s(n)?,
                 })
             })
             .collect::<Result<Vec<_>, String>>()?;

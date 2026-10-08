@@ -1586,6 +1586,7 @@ pub fn attn_qk_norm_rope_packed(
             k_col: 0,
             v_col: 0,
             weight_bias,
+            v_norm: false,
         },
     )
 }
@@ -1601,6 +1602,10 @@ pub struct QkvColumns {
     pub k_col: u32,
     /// Value head `h` starts at column `v_col + h * head_dim`.
     pub v_col: u32,
+    /// RMS-normalize each value head with no weight (and the same `eps`) on
+    /// its way to the cache, as EmbeddingGemma 2's `v_norm` does; `false`
+    /// stores it as is.
+    pub v_norm: bool,
 }
 
 /// [`attn_qk_norm_rope_packed`] for a projection whose K and V are separate
@@ -1637,6 +1642,7 @@ pub fn attn_qk_norm_rope_columns(
             k_col: columns.k_col,
             v_col: columns.v_col,
             weight_bias,
+            v_norm: columns.v_norm,
         },
     )
 }
@@ -1798,12 +1804,14 @@ enum QkRead {
     /// Query head `j` at column `j * q_head_stride`. Key head `h` at column
     /// `k_col + h * head_dim`, value head `h` at `v_col + h * head_dim`.
     /// Offsets are relative to `proj.off`. `weight_bias` is added to the
-    /// RMSNorm weight (`0` is `* w`, `1` is Qwen's `*(1 + w)`).
+    /// RMSNorm weight (`0` is `* w`, `1` is Qwen's `*(1 + w)`). `v_norm`:
+    /// [`QkvColumns::v_norm`].
     Packed {
         q_head_stride: u32,
         k_col: u32,
         v_col: u32,
         weight_bias: f32,
+        v_norm: bool,
     },
 }
 
@@ -1846,7 +1854,7 @@ fn qk_norm_rope_impl(
         return Err(format!("{WHAT}: theta and eps must be positive and finite"));
     }
     let layout = AttnProjLayout::new(s.q_heads, s.kv_heads, s.head_dim)?;
-    let (q_col, k_col, v_col, row_width, q_head_stride, weight_bias) = match read {
+    let (q_col, k_col, v_col, row_width, q_head_stride, weight_bias, v_norm) = match read {
         QkRead::Qwen => {
             let stride = s
                 .head_dim
@@ -1859,6 +1867,7 @@ fn qk_norm_rope_impl(
                 layout.width(),
                 stride,
                 1.0,
+                false,
             )
         }
         QkRead::Packed {
@@ -1866,6 +1875,7 @@ fn qk_norm_rope_impl(
             k_col,
             v_col,
             weight_bias,
+            v_norm,
         } => {
             if q_head_stride < s.head_dim {
                 return Err(format!(
@@ -1887,7 +1897,7 @@ fn qk_norm_rope_impl(
                 .max(u64::from(k_col) + kv_span)
                 .max(u64::from(v_col) + kv_span);
             let width_u = u32::try_from(width).map_err(|_| format!("{WHAT}: packed width exceeds u32"))?;
-            (0, k_col, v_col, width_u, q_head_stride, weight_bias)
+            (0, k_col, v_col, width_u, q_head_stride, weight_bias, v_norm)
         }
     };
     if s.batch == 0 || s.seq == 0 {
@@ -2001,6 +2011,7 @@ fn qk_norm_rope_impl(
             set_u32(bnd, u32::from(matches!(pos, RopePos::PerRow(_))), 21);
             set_u32(bnd, q_head_stride, 22);
             set_f32(bnd, weight_bias, 23);
+            set_u32(bnd, u32::from(v_norm), 24);
         },
     )
 }

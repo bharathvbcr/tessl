@@ -29,14 +29,16 @@ enum Layout {
 
 /// All public GEMM paths validate before casting, allocating scratch, or encoding.
 /// MPP uses signed 32-bit extents/offset arithmetic; reject larger matrices.
+/// `entry` is the public function, named in the alignment error.
 fn validate_gemm(
     a: &Tensor,
     b: &Tensor,
     c: &Tensor,
     layout: Layout,
     allow_bf16: bool,
+    entry: &str,
 ) -> Result<(usize, usize, usize), String> {
-    for t in [a, b, c] {
+    for (t, operand) in [(a, "A"), (b, "B"), (c, "C")] {
         t.validate()?;
         if t.shape.len() != 2 || t.shape.contains(&0) {
             return Err("GEMM requires nonempty rank-2 tensors".into());
@@ -44,7 +46,7 @@ fn validate_gemm(
         if t.numel() > i32::MAX as usize {
             return Err("GEMM exceeds signed 32-bit kernel indexing".into());
         }
-        require_byte_offset_alignment(t, 16, "GEMM")?;
+        require_view_alignment(t, entry, operand)?;
     }
     if !std::sync::Arc::ptr_eq(a.runtime(), b.runtime()) || !std::sync::Arc::ptr_eq(a.runtime(), c.runtime()) {
         return Err("GEMM tensors must belong to the same runtime".into());
@@ -66,13 +68,37 @@ fn validate_gemm(
     Ok((m, n, k))
 }
 
-/// TensorOps / simdgroup buffer offsets must be dtype-aligned already via
-/// [`Tensor::validate`]; GEMM additionally requires 16-byte alignment so float4
-/// / half8 device loads cannot fault on an otherwise in-bounds view.
-fn require_byte_offset_alignment(t: &Tensor, align: usize, what: &str) -> Result<(), String> {
-    if align == 0 || t.byte_offset % align != 0 {
+/// Byte alignment every GEMM operand view must start on — one rule for every
+/// kernel family:
+///
+/// | family | kernels | rule |
+/// |---|---|---|
+/// | plain | exact f32 NN/TN/NT, split-K, simdgroup | 16 B |
+/// | exact accumulate | `tn_accum_f32`, `nt_accum_f32` | 16 B |
+/// | cooperative | bf16/f16/relaxed-f32 NN, bf16 TN/NT | 16 B |
+/// | cooperative accumulate | `tn_accum_bf16_f32`, `nt_accum_bf16_f32` | 16 B |
+/// | epilogue | `*_epi*` | 16 B |
+/// | batched | `*_batched`, at every batch's start | 16 B |
+///
+/// Every kernel builds inline `tensor(ptr, extents, strides)` views over a
+/// raw device pointer — not `MTLTensor` objects, whose alignment
+/// `crate::mtl_tensor` checks separately — and each interior tile already
+/// rebases that pointer to an arbitrary element (`A + ty * K`). The 64-byte
+/// rule the cooperative, accumulate, epilogue and batched entries used to
+/// enforce was not a hardware requirement. On the M5 Pro every family is
+/// bit-identical to its 0-offset run at 4, 8, 16, 32 and 48 bytes, under Metal
+/// API and shader validation (`bench/results/gemm_align_probe_m5pro.txt`, from
+/// `alignment_probe::alignment_probe_report`). 16 bytes is the documented
+/// contract, not a measured floor; nothing below it is relied on.
+pub(crate) const GEMM_VIEW_ALIGN: usize = 16;
+
+/// Refuse an operand view that does not start on [`GEMM_VIEW_ALIGN`]. The
+/// error names the public entry point and the operand.
+fn require_view_alignment(t: &Tensor, entry: &str, operand: &str) -> Result<(), String> {
+    if t.byte_offset % GEMM_VIEW_ALIGN != 0 {
         return Err(format!(
-            "{what}: byte_offset {} is not {align}-byte aligned",
+            "{entry}: operand {operand} byte_offset {} is not {GEMM_VIEW_ALIGN}-byte aligned \
+             (every GEMM operand view must start on a {GEMM_VIEW_ALIGN}-byte boundary)",
             t.byte_offset
         ));
     }
@@ -361,7 +387,14 @@ fn gemm_dispatch(
     backend: GemmBackend,
     tile: Option<EpiTile>,
 ) -> Result<(), String> {
-    let (m, n, k) = validate_gemm(a, b, c, Layout::NN, true)?;
+    let (m, n, k) = validate_gemm(
+        a,
+        b,
+        c,
+        Layout::NN,
+        true,
+        if tile.is_some() { "gemm_tiled" } else { "gemm" },
+    )?;
 
     let use_bf16 = a.dtype == DType::BF16 && b.dtype == DType::BF16;
     let use_f16 = a.dtype == DType::F16 && b.dtype == DType::F16;
@@ -405,34 +438,43 @@ fn gemm_dispatch(
                 dispatch_tensorops_nn(rt, &pipeline, a, b, c, m, n, k, TILE_F32)?;
             }
         },
-        GemmBackend::Simdgroup => {
-            let kernel = if m % 16 != 0 || n % 16 != 0 || k % 8 != 0 {
-                "matmul_simdgroup_edges_f32"
-            } else {
-                backend.kernel_name_f32()
-            };
-            let pipeline = rt.pipeline(kernel)?;
-            // Both simdgroup kernels overwrite every logical output element.
-            // No pre-zero dispatch or barrier is needed (including offset views).
-            let m_u = m as u32;
-            let n_u = n as u32;
-            let k_u = k as u32;
-            let (tg_w, tg_h, tpt) = threadgroup_geometry_simdgroup(&pipeline, m, n);
-            rt.with_binder(|bnd| {
-                bnd.set_pipeline(&pipeline);
-                bnd.bind_tensor(a, 0);
-                bnd.bind_tensor(b, 1);
-                bnd.bind_tensor(c, 2);
-                bnd.bind_u32(m_u, 3);
-                bnd.bind_u32(n_u, 4);
-                bnd.bind_u32(k_u, 5);
-                bnd.dispatch(mtl_size(tg_w, tg_h, 1), mtl_size(tpt, 1, 1));
-                Ok(())
-            })?;
-        }
+        GemmBackend::Simdgroup => dispatch_simdgroup(rt, a, b, c, m, n, k)?,
     }
 
     Ok(())
+}
+
+/// Encode one simdgroup-backend f32 NN GEMM. Validation, alignment included,
+/// is the caller's.
+fn dispatch_simdgroup(
+    rt: &GpuRuntime,
+    a: &Tensor,
+    b: &Tensor,
+    c: &Tensor,
+    m: usize,
+    n: usize,
+    k: usize,
+) -> Result<(), String> {
+    let kernel = if m % 16 != 0 || n % 16 != 0 || k % 8 != 0 {
+        "matmul_simdgroup_edges_f32"
+    } else {
+        GemmBackend::Simdgroup.kernel_name_f32()
+    };
+    let pipeline = rt.pipeline(kernel)?;
+    // Both simdgroup kernels overwrite every logical output element.
+    // No pre-zero dispatch or barrier is needed (including offset views).
+    let (tg_w, tg_h, tpt) = threadgroup_geometry_simdgroup(&pipeline, m, n);
+    rt.with_binder(|bnd| {
+        bnd.set_pipeline(&pipeline);
+        bnd.bind_tensor(a, 0);
+        bnd.bind_tensor(b, 1);
+        bnd.bind_tensor(c, 2);
+        bnd.bind_u32(m as u32, 3);
+        bnd.bind_u32(n as u32, 4);
+        bnd.bind_u32(k as u32, 5);
+        bnd.dispatch(mtl_size(tg_w, tg_h, 1), mtl_size(tpt, 1, 1));
+        Ok(())
+    })
 }
 
 /// Element strides between consecutive batch elements.
@@ -507,6 +549,9 @@ pub struct BatchedGemm {
 /// rest. Every operand's last element is bounds checked against its buffer,
 /// because an over-long batch reads past the end of device memory rather than
 /// failing.
+///
+/// Every batch's view must start on a 16-byte boundary, as every GEMM operand
+/// view must: each base, and each nonzero stride times the element size.
 pub fn gemm_batched(a: &Tensor, b: &Tensor, c: &Tensor, backend: GemmBackend, spec: BatchedGemm) -> Result<(), String> {
     let BatchedGemm {
         m,
@@ -535,15 +580,12 @@ pub fn gemm_batched(a: &Tensor, b: &Tensor, c: &Tensor, backend: GemmBackend, sp
     let matrix_c = m
         .checked_mul(n)
         .ok_or_else(|| "batched GEMM: C matrix extent overflows usize".to_string())?;
-    for t in [a, b, c] {
+    for (t, operand) in [(a, "A"), (b, "B"), (c, "C")] {
         t.validate()?;
         if t.numel() > i32::MAX as usize {
             return Err("batched GEMM exceeds signed 32-bit kernel indexing".into());
         }
-        require_byte_offset_alignment(t, 16, "batched GEMM")?;
-        // Batched GEMM is cooperative-destination only; require the stricter
-        // 64-byte offset that those kernels / MTLTensor views expect.
-        require_byte_offset_alignment(t, 64, "batched GEMM cooperative path")?;
+        require_view_alignment(t, "gemm_batched", operand)?;
     }
     if !std::sync::Arc::ptr_eq(a.runtime(), b.runtime()) || !std::sync::Arc::ptr_eq(a.runtime(), c.runtime()) {
         return Err("batched GEMM tensors must belong to the same runtime".into());
@@ -597,6 +639,18 @@ pub fn gemm_batched(a: &Tensor, b: &Tensor, c: &Tensor, backend: GemmBackend, sp
         if stride > u32::MAX as usize {
             return Err(format!("batched GEMM: {what} stride exceeds uint indexing"));
         }
+        // The kernel starts batch `i` at `base + i * stride`, so the alignment
+        // rule binds every batch, not only the first. The base is aligned
+        // above; an aligned stride in bytes keeps every later start aligned.
+        let stride_bytes = stride * t.dtype.size_of();
+        if batch > 1 && stride_bytes % GEMM_VIEW_ALIGN != 0 {
+            return Err(format!(
+                "gemm_batched: operand {what} stride {stride} elements ({stride_bytes} bytes) puts batch 1 at \
+                 byte_offset {}, not {GEMM_VIEW_ALIGN}-byte aligned (every batch's operand view must start on a \
+                 {GEMM_VIEW_ALIGN}-byte boundary)",
+                t.byte_offset + stride_bytes
+            ));
+        }
     }
 
     if batch == 1 {
@@ -614,15 +668,35 @@ pub fn gemm_batched(a: &Tensor, b: &Tensor, c: &Tensor, backend: GemmBackend, sp
         CoopElem::RelaxedF32 => "matmul2d_tensorops_f32_relaxed_batched",
     };
     let pipeline = rt.pipeline(kernel)?;
+    dispatch_tensorops_batched(rt, &pipeline, a, b, c, spec)
+}
+
+/// Encode one batched cooperative GEMM. Validation, alignment included, is
+/// the caller's.
+fn dispatch_tensorops_batched(
+    rt: &GpuRuntime,
+    pipeline: &ProtocolObject<dyn MTLComputePipelineState>,
+    a: &Tensor,
+    b: &Tensor,
+    c: &Tensor,
+    spec: BatchedGemm,
+) -> Result<(), String> {
+    let BatchedGemm {
+        m,
+        n,
+        k,
+        batch,
+        strides,
+    } = spec;
     // Only the 128x64 geometry is instantiated batched; a narrow variant is a
     // tuning question left until measured, as for the epilogue.
     let tile = TILE_COOP_DEFAULT;
     let tiles_n = n.div_ceil(tile.sn);
     let tiles_m = m.div_ceil(tile.sm);
     let tg = morton_tg_count(tiles_n, tiles_m);
-    let tpt = threads_per_tg(&pipeline, tile);
+    let tpt = threads_per_tg(pipeline, tile);
     rt.with_binder(|bnd| {
-        bnd.set_pipeline(&pipeline);
+        bnd.set_pipeline(pipeline);
         bnd.bind_tensor(a, 0);
         bnd.bind_tensor(b, 1);
         bnd.bind_tensor(c, 2);
@@ -787,12 +861,16 @@ fn run_gemm_epilogue(
                  the identity path is the plain GEMM, which picks its own tile"
                 .into());
         }
+        // Validated here too, so a refusal names this entry, not `gemm`.
+        validate_gemm(a, b, c, Layout::NN, true, "gemm_epilogue")?;
         return gemm(a, b, c, backend);
     }
-    let (m, n, k) = validate_gemm(a, b, c, Layout::NN, true)?;
-    for t in [a, b, c] {
-        require_byte_offset_alignment(t, 64, "GEMM epilogue cooperative path")?;
-    }
+    let entry = if tile.is_some() {
+        "gemm_epilogue_tiled"
+    } else {
+        "gemm_epilogue"
+    };
+    let (m, n, k) = validate_gemm(a, b, c, Layout::NN, true, entry)?;
     if !epi.alpha.is_finite() || !epi.beta.is_finite() {
         return Err(format!(
             "GEMM epilogue: alpha and beta must be finite, got alpha={} beta={}",
@@ -845,10 +923,27 @@ fn run_gemm_epilogue(
     let chosen = tile.unwrap_or_else(|| epi_tile_auto(m, elem));
     let (kernel, tile) = epi_kernel(elem, chosen)?;
     let pipeline = rt.pipeline(kernel)?;
+    dispatch_tensorops_epi(rt, &pipeline, a, b, c, m, n, k, tile, epi)
+}
+
+/// Encode one cooperative epilogue GEMM. Validation, alignment included, is
+/// the caller's.
+fn dispatch_tensorops_epi(
+    rt: &GpuRuntime,
+    pipeline: &ProtocolObject<dyn MTLComputePipelineState>,
+    a: &Tensor,
+    b: &Tensor,
+    c: &Tensor,
+    m: usize,
+    n: usize,
+    k: usize,
+    tile: TileGeom,
+    epi: Epilogue<'_>,
+) -> Result<(), String> {
     let tiles_n = n.div_ceil(tile.sn);
     let tiles_m = m.div_ceil(tile.sm);
     let tg = morton_tg_count(tiles_n, tiles_m);
-    let tpt = threads_per_tg(&pipeline, tile);
+    let tpt = threads_per_tg(pipeline, tile);
     let (alpha, beta, act) = (epi.alpha, epi.beta, epi.activation as u32);
     let has_bias = u32::from(epi.bias.is_some());
     // Buffer 8 is read unconditionally by the kernel binding, so it must be
@@ -856,7 +951,7 @@ fn run_gemm_epilogue(
     // `has_bias` is what decides whether it is dereferenced.
     let bias_buf = epi.bias.unwrap_or(c);
     rt.with_binder(|bnd| {
-        bnd.set_pipeline(&pipeline);
+        bnd.set_pipeline(pipeline);
         bnd.bind_tensor(a, 0);
         bnd.bind_tensor(b, 1);
         bnd.bind_tensor(c, 2);
@@ -974,9 +1069,6 @@ fn dispatch_tensorops_nn_coop(
     k: usize,
     tile: TileGeom,
 ) -> Result<(), String> {
-    for t in [a, b, c] {
-        require_byte_offset_alignment(t, 64, "GEMM cooperative path")?;
-    }
     let tiles_n = n.div_ceil(tile.sn);
     let tiles_m = m.div_ceil(tile.sm);
     let tg = morton_tg_count(tiles_n, tiles_m);
@@ -1074,9 +1166,6 @@ fn dispatch_tensorops_accum(
     tile: TileGeom,
     bind_interior: bool,
 ) -> Result<(), String> {
-    for t in [a, b, c] {
-        require_byte_offset_alignment(t, 64, "GEMM cooperative path")?;
-    }
     let tiles_n = n.div_ceil(tile.sn);
     let tiles_m = m.div_ceil(tile.sm);
     let tg = morton_tg_count(tiles_n, tiles_m);
@@ -1109,7 +1198,7 @@ pub fn gemm_f32(a: &Tensor, b: &Tensor, c: &Tensor, backend: GemmBackend) -> Res
 /// `c`). Already-bf16 operands skip cast (persistent bf16 activations/weights).
 /// Falls back to f32 GEMM when TensorOps is absent.
 pub fn gemm_train(a: &Tensor, b: &Tensor, c: &Tensor, backend: GemmBackend) -> Result<(), String> {
-    validate_gemm(a, b, c, Layout::NN, true)?;
+    validate_gemm(a, b, c, Layout::NN, true, "gemm_train")?;
     if use_bf16_gemm(a.runtime(), backend) {
         return gemm_bf16(a, b, c);
     }
@@ -1243,14 +1332,14 @@ fn check_bf16_lane(rt: &GpuRuntime, c: &Tensor, what: &str) -> Result<(), String
 /// [`gemm_train`] takes under `PrecisionMode::Bf16`, for callers that choose
 /// it per call.
 pub fn gemm_bf16(a: &Tensor, b: &Tensor, c: &Tensor) -> Result<(), String> {
-    validate_gemm(a, b, c, Layout::NN, true)?;
+    validate_gemm(a, b, c, Layout::NN, true, "gemm_bf16")?;
     check_bf16_lane(a.runtime(), c, "gemm_bf16")?;
     gemm(&ensure_bf16(a)?, &ensure_bf16(b)?, c, GemmBackend::TensorOps)
 }
 
 /// `C[M,N] = A[K,M]^T @ B[K,N]` (TN). A is stored `[K,M]`, B `[K,N]`.
 pub fn gemm_tn_f32(a_km: &Tensor, b_kn: &Tensor, c: &Tensor, backend: GemmBackend) -> Result<(), String> {
-    let (m, n, k) = validate_gemm(a_km, b_kn, c, Layout::TN, false)?;
+    let (m, n, k) = validate_gemm(a_km, b_kn, c, Layout::TN, false, "gemm_tn_f32")?;
 
     if USE_TN_NT_DESCRIPTORS && backend == GemmBackend::TensorOps && a_km.runtime().has_tensorops() {
         if let Some(k_tile) = tn_par_k_tile(m, n, k) {
@@ -1269,7 +1358,14 @@ pub fn gemm_tn_f32(a_km: &Tensor, b_kn: &Tensor, c: &Tensor, backend: GemmBacken
 
 /// Training TN GEMM — bf16 TensorOps descriptor when `PrecisionMode::Bf16`.
 pub fn gemm_tn_train(a_km: &Tensor, b_kn: &Tensor, c: &Tensor, backend: GemmBackend) -> Result<(), String> {
-    validate_gemm(a_km, b_kn, c, Layout::TN, use_bf16_gemm(a_km.runtime(), backend))?;
+    validate_gemm(
+        a_km,
+        b_kn,
+        c,
+        Layout::TN,
+        use_bf16_gemm(a_km.runtime(), backend),
+        "gemm_tn_train",
+    )?;
     if use_bf16_gemm(a_km.runtime(), backend) {
         return gemm_tn_bf16(a_km, b_kn, c);
     }
@@ -1279,7 +1375,7 @@ pub fn gemm_tn_train(a_km: &Tensor, b_kn: &Tensor, c: &Tensor, backend: GemmBack
 /// `C[M,N] = A[K,M]^T @ B[K,N]` with bf16 operands and f32 accumulation,
 /// whatever the runtime's [`PrecisionMode`] (see [`gemm_bf16`]).
 pub fn gemm_tn_bf16(a_km: &Tensor, b_kn: &Tensor, c: &Tensor) -> Result<(), String> {
-    let (m, n, k) = validate_gemm(a_km, b_kn, c, Layout::TN, true)?;
+    let (m, n, k) = validate_gemm(a_km, b_kn, c, Layout::TN, true, "gemm_tn_bf16")?;
     let rt = a_km.runtime();
     check_bf16_lane(rt, c, "gemm_tn_bf16")?;
     let a_bf = ensure_bf16(a_km)?;
@@ -1378,7 +1474,7 @@ fn tn_par_k_tile(m: usize, n: usize, k: usize) -> Option<usize> {
 /// routes here by [`tn_par_k_tile`]; this entry takes the width, so a bench
 /// can sweep it.
 pub fn gemm_tn_splitk_par_f32(a_km: &Tensor, b_kn: &Tensor, c: &Tensor, k_tile: usize) -> Result<(), String> {
-    let (m, n, k) = validate_gemm(a_km, b_kn, c, Layout::TN, false)?;
+    let (m, n, k) = validate_gemm(a_km, b_kn, c, Layout::TN, false, "gemm_tn_splitk_par_f32")?;
     let rt = a_km.runtime();
     if !rt.has_tensorops() {
         return Err("gemm_tn_splitk_par_f32: TensorOps is unavailable on this device".into());
@@ -1583,7 +1679,7 @@ fn gemm_tn_splitk_bf16_opts(
 
 /// `C[M,N] = A[M,K] @ B[N,K]^T` (NT). B is stored `[N,K]` (e.g. `W[in,out]`).
 pub fn gemm_nt_f32(a_mk: &Tensor, b_nk: &Tensor, c: &Tensor, backend: GemmBackend) -> Result<(), String> {
-    let (m, n, k) = validate_gemm(a_mk, b_nk, c, Layout::NT, false)?;
+    let (m, n, k) = validate_gemm(a_mk, b_nk, c, Layout::NT, false, "gemm_nt_f32")?;
 
     if USE_TN_NT_DESCRIPTORS && backend == GemmBackend::TensorOps && a_mk.runtime().has_tensorops() {
         let rt = a_mk.runtime();
@@ -1598,7 +1694,14 @@ pub fn gemm_nt_f32(a_mk: &Tensor, b_nk: &Tensor, c: &Tensor, backend: GemmBacken
 
 /// Training NT GEMM — bf16 TensorOps descriptor when `PrecisionMode::Bf16`.
 pub fn gemm_nt_train(a_mk: &Tensor, b_nk: &Tensor, c: &Tensor, backend: GemmBackend) -> Result<(), String> {
-    validate_gemm(a_mk, b_nk, c, Layout::NT, use_bf16_gemm(a_mk.runtime(), backend))?;
+    validate_gemm(
+        a_mk,
+        b_nk,
+        c,
+        Layout::NT,
+        use_bf16_gemm(a_mk.runtime(), backend),
+        "gemm_nt_train",
+    )?;
     if use_bf16_gemm(a_mk.runtime(), backend) {
         return gemm_nt_bf16(a_mk, b_nk, c);
     }
@@ -1608,7 +1711,7 @@ pub fn gemm_nt_train(a_mk: &Tensor, b_nk: &Tensor, c: &Tensor, backend: GemmBack
 /// `C[M,N] = A[M,K] @ B[N,K]^T` with bf16 operands and f32 accumulation,
 /// whatever the runtime's [`PrecisionMode`] (see [`gemm_bf16`]).
 pub fn gemm_nt_bf16(a_mk: &Tensor, b_nk: &Tensor, c: &Tensor) -> Result<(), String> {
-    let (m, n, k) = validate_gemm(a_mk, b_nk, c, Layout::NT, true)?;
+    let (m, n, k) = validate_gemm(a_mk, b_nk, c, Layout::NT, true, "gemm_nt_bf16")?;
     let rt = a_mk.runtime();
     check_bf16_lane(rt, c, "gemm_nt_bf16")?;
     let a_bf = ensure_bf16(a_mk)?;
@@ -1621,7 +1724,14 @@ pub fn gemm_nt_bf16(a_mk: &Tensor, b_nk: &Tensor, c: &Tensor) -> Result<(), Stri
 /// `C += A[K,M]^T @ B[K,N]` (TN accumulate). No C zero — for dW into grad banks
 /// and dx accumulate into a pre-zeroed buffer.
 pub fn gemm_tn_accum_train(a_km: &Tensor, b_kn: &Tensor, c: &Tensor, backend: GemmBackend) -> Result<(), String> {
-    let (m, n, k) = validate_gemm(a_km, b_kn, c, Layout::TN, use_bf16_gemm(a_km.runtime(), backend))?;
+    let (m, n, k) = validate_gemm(
+        a_km,
+        b_kn,
+        c,
+        Layout::TN,
+        use_bf16_gemm(a_km.runtime(), backend),
+        "gemm_tn_accum_train",
+    )?;
 
     let rt = a_km.runtime();
     let use_accum = crate::ab_flags::gemm_accum();
@@ -1675,7 +1785,14 @@ pub fn gemm_tn_accum_train(a_km: &Tensor, b_kn: &Tensor, c: &Tensor, backend: Ge
 /// honors `METAL_NATIVE_GEMM_ACCUM_DX` — accumulate-mode dX with dW kept on
 /// the safer temp-plus-add path.
 pub fn gemm_nt_accum_train(a_mk: &Tensor, b_nk: &Tensor, c: &Tensor, backend: GemmBackend) -> Result<(), String> {
-    let (m, n, k) = validate_gemm(a_mk, b_nk, c, Layout::NT, use_bf16_gemm(a_mk.runtime(), backend))?;
+    let (m, n, k) = validate_gemm(
+        a_mk,
+        b_nk,
+        c,
+        Layout::NT,
+        use_bf16_gemm(a_mk.runtime(), backend),
+        "gemm_nt_accum_train",
+    )?;
 
     let rt = a_mk.runtime();
     let use_accum = crate::ab_flags::gemm_accum() || crate::ab_flags::gemm_accum_dx();
@@ -2383,8 +2500,8 @@ mod contract_tests {
                         a.buffer.write_f32(&av);
                         b.buffer.write_f32(&bv);
                         bank.buffer.write_f32(&vec![2.0; m * n + 32]);
-                        // 16 elems = 64 bytes: valid for both simdgroup (16B)
-                        // and cooperative TensorOps (64B) paths.
+                        // 16 elems = 64 bytes, a multiple of the 16-byte
+                        // rule every GEMM family shares.
                         let c = bank.view(&[m, n], 16);
                         let launch: Launch = match (tn, accum) {
                             (true, false) => gemm_tn_train,
@@ -2487,8 +2604,8 @@ mod contract_tests {
             poisoned[..4].fill(123.0);
             poisoned[m * n + 4..].fill(123.0);
             bank.buffer.write_f32(&poisoned);
-            // 4 elems = 16 bytes: simdgroup-legal, deliberately not 64-byte
-            // (cooperative TensorOps would refuse this offset).
+            // 4 elems = 16 bytes: the smallest offset the one GEMM
+            // alignment rule accepts, for every family.
             let c = bank.view(&[m, n], 4);
             gemm(&a, &b, &c, GemmBackend::Simdgroup).unwrap();
             rt.synchronize().unwrap();
@@ -2593,9 +2710,9 @@ mod stress_tests {
     /// an offset view into a larger bank (exercises byte_offset binding).
     fn upload(rt: &std::sync::Arc<GpuRuntime>, rng: &mut Rng, shape: &[usize], data: &[f32], bf16: bool) -> Tensor {
         let numel: usize = shape.iter().product();
-        // Offset in elements so the resulting byte_offset is 64-byte aligned
-        // for both f32 (16 elems) and bf16/f16 (32 elems) coop paths.
-        let align_elems = 64 / if bf16 { 2 } else { 4 };
+        // Offset in elements so the resulting byte_offset sits on the
+        // GEMM_VIEW_ALIGN boundary and no further, for f32 and bf16/f16.
+        let align_elems = GEMM_VIEW_ALIGN / if bf16 { 2 } else { 4 };
         let off = if rng.below(3) == 0 { align_elems } else { 0 };
         if bf16 {
             let bank = rt.alloc_tensor_bf16(&[numel + off]).unwrap();
@@ -3269,5 +3386,442 @@ mod coop_tile_select {
             nn_coop_kernel(127, n, k, CoopElem::Bf16).0,
             nn_coop_kernel(127, n, k + 1, CoopElem::Bf16).0
         );
+    }
+}
+
+/// What the hardware does with an operand view that starts off a 64-byte
+/// boundary. Every kernel family is encoded through its raw dispatch helper —
+/// below the host's alignment gate — on views at each byte offset, and the
+/// output is compared bit for bit with the same kernel on 0-offset views. A
+/// kernel that needs an alignment it is not given faults, writes nothing (C
+/// starts as NaN), or computes from the wrong addresses; all three show as a
+/// mismatch.
+///
+/// `alignment_probe_report` prints the table recorded in
+/// `bench/results/gemm_align_probe_m5pro.txt`. `every_rule_offset_matches_the_aligned_run`
+/// asserts the part of it that [`GEMM_VIEW_ALIGN`] relies on.
+#[cfg(test)]
+mod alignment_probe {
+    use super::*;
+    use crate::tensor::{bf16_bits_to_f32, f16_bits_to_f32, f32_to_bf16_bits, f32_to_f16_bits};
+    use std::sync::Arc;
+
+    /// Byte offsets probed. 0 is the reference run; 4 and 8 sit below the
+    /// 16-byte floor and are recorded, not relied on.
+    const OFFSETS: [usize; 7] = [0, 4, 8, 16, 32, 48, 64];
+
+    /// One shape with 64-byte row strides and one with odd strides, both
+    /// ragged against every tile so edge and interior tiles both run.
+    const SHAPES: [(usize, usize, usize); 2] = [(144, 96, 80), (130, 97, 70)];
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum Probe {
+        ExactNn,
+        ExactTn,
+        ExactNt,
+        ExactTnAccum,
+        ExactNtAccum,
+        Simdgroup,
+        CoopNn(CoopElem, EpiTile),
+        CoopTnBf16,
+        CoopNtBf16,
+        CoopTnAccumBf16,
+        CoopNtAccumBf16,
+        Epilogue(CoopElem),
+        Batched(CoopElem),
+    }
+
+    const PROBES: &[Probe] = &[
+        Probe::ExactNn,
+        Probe::ExactTn,
+        Probe::ExactNt,
+        Probe::ExactTnAccum,
+        Probe::ExactNtAccum,
+        Probe::Simdgroup,
+        Probe::CoopNn(CoopElem::RelaxedF32, EpiTile::Wide),
+        Probe::CoopNn(CoopElem::RelaxedF32, EpiTile::Narrow),
+        Probe::CoopNn(CoopElem::Bf16, EpiTile::Wide),
+        Probe::CoopNn(CoopElem::Bf16, EpiTile::Narrow),
+        Probe::CoopNn(CoopElem::F16, EpiTile::Wide),
+        Probe::CoopNn(CoopElem::F16, EpiTile::Narrow),
+        Probe::CoopTnBf16,
+        Probe::CoopNtBf16,
+        Probe::CoopTnAccumBf16,
+        Probe::CoopNtAccumBf16,
+        Probe::Epilogue(CoopElem::RelaxedF32),
+        Probe::Epilogue(CoopElem::Bf16),
+        Probe::Epilogue(CoopElem::F16),
+        Probe::Batched(CoopElem::RelaxedF32),
+        Probe::Batched(CoopElem::Bf16),
+        Probe::Batched(CoopElem::F16),
+    ];
+
+    impl Probe {
+        fn elem(self) -> DType {
+            match self {
+                Self::CoopNn(e, _) | Self::Epilogue(e) | Self::Batched(e) => match e {
+                    CoopElem::RelaxedF32 => DType::F32,
+                    CoopElem::Bf16 => DType::BF16,
+                    CoopElem::F16 => DType::F16,
+                },
+                Self::CoopTnBf16 | Self::CoopNtBf16 | Self::CoopTnAccumBf16 | Self::CoopNtAccumBf16 => DType::BF16,
+                _ => DType::F32,
+            }
+        }
+
+        fn layout(self) -> Layout {
+            match self {
+                Self::ExactTn | Self::ExactTnAccum | Self::CoopTnBf16 | Self::CoopTnAccumBf16 => Layout::TN,
+                Self::ExactNt | Self::ExactNtAccum | Self::CoopNtBf16 | Self::CoopNtAccumBf16 => Layout::NT,
+                _ => Layout::NN,
+            }
+        }
+
+        fn accumulates(self) -> bool {
+            matches!(
+                self,
+                Self::ExactTnAccum
+                    | Self::ExactNtAccum
+                    | Self::CoopTnAccumBf16
+                    | Self::CoopNtAccumBf16
+                    | Self::Epilogue(_)
+            )
+        }
+
+        fn kernel(self) -> &'static str {
+            match self {
+                Self::ExactNn => "matmul2d_tensorops_f32",
+                Self::ExactTn => "matmul2d_tensorops_tn_f32",
+                Self::ExactNt => "matmul2d_tensorops_nt_f32",
+                Self::ExactTnAccum => "matmul2d_tensorops_tn_accum_f32",
+                Self::ExactNtAccum => "matmul2d_tensorops_nt_accum_f32",
+                Self::Simdgroup => "matmul_simdgroup_edges_f32",
+                Self::CoopNn(e, t) => nn_coop_kernel_for(e, t).0,
+                Self::CoopTnBf16 => "matmul2d_tensorops_tn_bf16_f32",
+                Self::CoopNtBf16 => "matmul2d_tensorops_nt_bf16_f32",
+                Self::CoopTnAccumBf16 => "matmul2d_tensorops_tn_accum_bf16_f32",
+                Self::CoopNtAccumBf16 => "matmul2d_tensorops_nt_accum_bf16_f32",
+                Self::Epilogue(CoopElem::Bf16) => "matmul2d_tensorops_bf16_f32_epi",
+                Self::Epilogue(CoopElem::F16) => "matmul2d_tensorops_f16_f32_epi",
+                Self::Epilogue(CoopElem::RelaxedF32) => "matmul2d_tensorops_f32_relaxed_epi",
+                Self::Batched(CoopElem::Bf16) => "matmul2d_tensorops_bf16_f32_batched",
+                Self::Batched(CoopElem::F16) => "matmul2d_tensorops_f16_f32_batched",
+                Self::Batched(CoopElem::RelaxedF32) => "matmul2d_tensorops_f32_relaxed_batched",
+            }
+        }
+    }
+
+    fn seq(n: usize, seed: u64) -> Vec<f32> {
+        let mut s = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        (0..n)
+            .map(|_| {
+                s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                ((s >> 40) as f32 / (1u64 << 24) as f32) * 2.0 - 1.0
+            })
+            .collect()
+    }
+
+    /// A buffer holding `pad_elems` of zeros and then `host` in `dtype`,
+    /// viewed at the start of `host`.
+    fn upload(rt: &Arc<GpuRuntime>, dtype: DType, shape: &[usize], host: &[f32], pad_elems: usize) -> Tensor {
+        let total = pad_elems + host.len();
+        let bank = match dtype {
+            DType::F32 => rt.alloc_tensor_f32(&[total]),
+            DType::BF16 => rt.alloc_tensor_bf16(&[total]),
+            DType::F16 => rt.alloc_tensor_f16(&[total]),
+        }
+        .expect("probe alloc");
+        let mut full = vec![0.0f32; pad_elems];
+        full.extend_from_slice(host);
+        match dtype {
+            DType::F32 => bank.buffer.write_f32(&full),
+            DType::BF16 => bank
+                .buffer
+                .write_bf16_bits(&full.iter().map(|&x| f32_to_bf16_bits(x)).collect::<Vec<_>>()),
+            DType::F16 => bank
+                .buffer
+                .write_f16_bits(&full.iter().map(|&x| f32_to_f16_bits(x)).collect::<Vec<_>>()),
+        }
+        bank.view(shape, pad_elems)
+    }
+
+    /// Elements between consecutive batch matrices: the matrix rounded up to
+    /// 64 bytes, plus `off` bytes, so batch `i` starts `i * off` bytes off a
+    /// 64-byte boundary while batch 0 stays aligned.
+    fn batch_stride(matrix: usize, elem: usize, off: usize) -> usize {
+        (matrix * elem).div_ceil(64) * 64 / elem + off / elem
+    }
+
+    /// `batch` matrices of `matrix` elements, `stride` apart, zeros between.
+    /// Matrix `i` is the same whatever the stride, so runs at different
+    /// strides compare bit for bit.
+    fn batch_bank(matrix: usize, stride: usize, batch: usize, seed: u64) -> Vec<f32> {
+        let mut bank = vec![0.0f32; stride * (batch - 1) + matrix];
+        for i in 0..batch {
+            bank[i * stride..i * stride + matrix].copy_from_slice(&seq(matrix, seed * 16 + i as u64));
+        }
+        bank
+    }
+
+    enum Outcome {
+        /// Bit-identical to the 0-offset run.
+        Match,
+        /// `count` of `total` output elements differ from the 0-offset run.
+        Mismatch { count: usize, total: usize },
+        /// The dispatch or the read-back failed.
+        Error(String),
+    }
+
+    /// Run `probe` on `(m, n, k)` with every operand view starting `off`
+    /// bytes past a 64-byte boundary (for batched, every batch past the first).
+    fn run(
+        rt: &Arc<GpuRuntime>,
+        probe: Probe,
+        (m, n, k): (usize, usize, usize),
+        off: usize,
+    ) -> Result<Vec<f32>, String> {
+        let dt = probe.elem();
+        let es = dt.size_of();
+        let (a_shape, b_shape) = match probe.layout() {
+            Layout::NN => ([m, k], [k, n]),
+            Layout::TN => ([k, m], [k, n]),
+            Layout::NT => ([m, k], [n, k]),
+        };
+        let c0 = seq(m * n, 3);
+        if let Probe::Batched(_) = probe {
+            const BATCH: usize = 3;
+            let strides = BatchStrides {
+                a: batch_stride(m * k, es, off),
+                b: batch_stride(k * n, es, off),
+                c: batch_stride(m * n, 4, off),
+            };
+            let a_host = batch_bank(m * k, strides.a, BATCH, 1);
+            let b_host = batch_bank(k * n, strides.b, BATCH, 2);
+            let a = upload(rt, dt, &[a_host.len()], &a_host, 0);
+            let b = upload(rt, dt, &[b_host.len()], &b_host, 0);
+            let c_len = strides.c * (BATCH - 1) + m * n;
+            let c = upload(rt, DType::F32, &[c_len], &vec![f32::NAN; c_len], 0);
+            let p = rt.pipeline(probe.kernel())?;
+            let spec = BatchedGemm {
+                m,
+                n,
+                k,
+                batch: BATCH,
+                strides,
+            };
+            dispatch_tensorops_batched(rt, &p, &a, &b, &c, spec)?;
+            rt.synchronize()?;
+            let all = c.read_f32()?;
+            return Ok((0..BATCH)
+                .flat_map(|i| all[i * strides.c..i * strides.c + m * n].to_vec())
+                .collect());
+        }
+
+        let pad = off / es;
+        let a = upload(rt, dt, &a_shape, &seq(m * k, 1), pad);
+        let b = upload(rt, dt, &b_shape, &seq(k * n, 2), pad);
+        let c_init = if probe.accumulates() { c0 } else { vec![f32::NAN; m * n] };
+        let c = upload(rt, DType::F32, &[m, n], &c_init, off / 4);
+        let bias = upload(rt, DType::F32, &[n], &seq(n, 4), off / 4);
+        let p = rt.pipeline(probe.kernel())?;
+        match probe {
+            Probe::ExactNn => dispatch_tensorops_nn(rt, &p, &a, &b, &c, m, n, k, TILE_F32)?,
+            Probe::ExactTn | Probe::ExactNt => dispatch_tensorops_tn_nt(rt, &p, &a, &b, &c, m, n, k, TILE_F32)?,
+            Probe::ExactTnAccum | Probe::ExactNtAccum => {
+                dispatch_tensorops_accum(rt, &p, &a, &b, &c, m, n, k, TILE_F32, true)?
+            }
+            Probe::Simdgroup => dispatch_simdgroup(rt, &a, &b, &c, m, n, k)?,
+            Probe::CoopNn(e, t) => dispatch_tensorops_nn_coop(rt, &p, &a, &b, &c, m, n, k, nn_coop_kernel_for(e, t).1)?,
+            Probe::CoopTnBf16 | Probe::CoopNtBf16 => {
+                dispatch_tensorops_nn_coop(rt, &p, &a, &b, &c, m, n, k, TILE_COOP_TN_NT)?
+            }
+            Probe::CoopTnAccumBf16 | Probe::CoopNtAccumBf16 => {
+                dispatch_tensorops_accum(rt, &p, &a, &b, &c, m, n, k, TILE_COOP_ACCUM, false)?
+            }
+            Probe::Epilogue(_) => {
+                let epi = Epilogue {
+                    alpha: 0.5,
+                    beta: 0.25,
+                    bias: Some(&bias),
+                    activation: Activation::None,
+                };
+                dispatch_tensorops_epi(rt, &p, &a, &b, &c, m, n, k, TILE_COOP_DEFAULT, epi)?
+            }
+            Probe::Batched(_) => unreachable!("handled above"),
+        }
+        rt.synchronize()?;
+        c.read_f32()
+    }
+
+    /// The CPU value the 0-offset run must approximate, so a bit-identical
+    /// but wrong baseline cannot pass.
+    fn reference(probe: Probe, (m, n, k): (usize, usize, usize)) -> Vec<f32> {
+        let round = |v: Vec<f32>| -> Vec<f32> {
+            match probe.elem() {
+                DType::F32 => v,
+                DType::BF16 => v.into_iter().map(|x| bf16_bits_to_f32(f32_to_bf16_bits(x))).collect(),
+                DType::F16 => v.into_iter().map(|x| f16_bits_to_f32(f32_to_f16_bits(x))).collect(),
+            }
+        };
+        let product = |a: &[f32], b: &[f32]| -> Vec<f32> {
+            let mut out = vec![0.0f32; m * n];
+            for i in 0..m {
+                for j in 0..n {
+                    let mut acc = 0.0f64;
+                    for kk in 0..k {
+                        let av = match probe.layout() {
+                            Layout::TN => a[kk * m + i],
+                            _ => a[i * k + kk],
+                        };
+                        let bv = match probe.layout() {
+                            Layout::NT => b[j * k + kk],
+                            _ => b[kk * n + j],
+                        };
+                        acc += av as f64 * bv as f64;
+                    }
+                    out[i * n + j] = acc as f32;
+                }
+            }
+            out
+        };
+        let es = probe.elem().size_of();
+        if let Probe::Batched(_) = probe {
+            let sa = batch_stride(m * k, es, 0);
+            let sb = batch_stride(k * n, es, 0);
+            let a = round(batch_bank(m * k, sa, 3, 1));
+            let b = round(batch_bank(k * n, sb, 3, 2));
+            return (0..3)
+                .flat_map(|i| product(&a[i * sa..i * sa + m * k], &b[i * sb..i * sb + k * n]))
+                .collect();
+        }
+        let prod = product(&round(seq(m * k, 1)), &round(seq(k * n, 2)));
+        let c0 = seq(m * n, 3);
+        let bias = seq(n, 4);
+        match probe {
+            Probe::Epilogue(_) => (0..m * n).map(|e| 0.5 * prod[e] + 0.25 * c0[e] + bias[e % n]).collect(),
+            p if p.accumulates() => prod.iter().zip(&c0).map(|(x, y)| x + y).collect(),
+            _ => prod,
+        }
+    }
+
+    /// One probe run: a kernel family on a shape at a byte offset.
+    struct Row {
+        probe: Probe,
+        shape: (usize, usize, usize),
+        off: usize,
+        outcome: Outcome,
+    }
+
+    /// Every probe at every offset on every shape, with the 0-offset run
+    /// checked against the CPU first.
+    fn sweep(rt: &Arc<GpuRuntime>) -> Vec<Row> {
+        let mut rows = Vec::new();
+        for &probe in PROBES {
+            for &shape in &SHAPES {
+                let base = run(rt, probe, shape, 0).expect("0-offset probe run");
+                let expect = reference(probe, shape);
+                let scale = expect.iter().fold(1.0f32, |m, x| m.max(x.abs()));
+                let worst = base
+                    .iter()
+                    .zip(&expect)
+                    .map(|(g, e)| if g.is_finite() { (g - e).abs() } else { f32::INFINITY })
+                    .fold(0.0f32, f32::max);
+                // bf16 operands are rounded identically on both sides, so the
+                // remaining gap is f32-vs-f64 accumulation (and tf32-class
+                // products on the relaxed kernels).
+                assert!(
+                    worst <= 2e-2 * scale,
+                    "{probe:?} {shape:?}: the aligned run is off the CPU reference by {worst} (scale {scale})"
+                );
+                for &off in &OFFSETS[1..] {
+                    let outcome = match run(rt, probe, shape, off) {
+                        Ok(got) => {
+                            let count = got
+                                .iter()
+                                .zip(&base)
+                                .filter(|(g, b)| g.to_bits() != b.to_bits())
+                                .count();
+                            if count == 0 {
+                                Outcome::Match
+                            } else {
+                                Outcome::Mismatch {
+                                    count,
+                                    total: got.len(),
+                                }
+                            }
+                        }
+                        Err(e) => Outcome::Error(e),
+                    };
+                    rows.push(Row {
+                        probe,
+                        shape,
+                        off,
+                        outcome,
+                    });
+                }
+            }
+        }
+        rows
+    }
+
+    fn tensorops_runtime() -> Option<Arc<GpuRuntime>> {
+        let rt = GpuRuntime::new().expect("GpuRuntime::new");
+        rt.has_tensorops().then_some(rt)
+    }
+
+    /// Every offset the documented rule accepts produces the aligned bits, for
+    /// every kernel family the rule covers.
+    #[test]
+    fn every_rule_offset_matches_the_aligned_run() {
+        let Some(rt) = tensorops_runtime() else {
+            panic!("requires the TensorOps metallib");
+        };
+        for Row {
+            probe,
+            shape,
+            off,
+            outcome,
+        } in sweep(&rt)
+        {
+            if off % GEMM_VIEW_ALIGN != 0 {
+                continue;
+            }
+            match outcome {
+                Outcome::Match => {}
+                Outcome::Mismatch { count, total } => panic!(
+                    "{probe:?} {shape:?} at a {off}-byte offset, which the {GEMM_VIEW_ALIGN}-byte rule accepts: \
+                     {count}/{total} elements differ from the aligned run"
+                ),
+                Outcome::Error(e) => panic!("{probe:?} {shape:?} at a {off}-byte offset: {e}"),
+            }
+        }
+    }
+
+    /// The table in `bench/results/gemm_align_probe_m5pro.txt`:
+    /// `cargo test --release --lib alignment_probe_report -- --ignored --nocapture`
+    #[test]
+    #[ignore = "prints the probe table; run by hand to refresh the committed result"]
+    fn alignment_probe_report() {
+        let Some(rt) = tensorops_runtime() else {
+            panic!("requires the TensorOps metallib");
+        };
+        let rows = sweep(&rt);
+        println!("probe\tshape(m,n,k)\toffset_bytes\toutcome");
+        for Row {
+            probe,
+            shape,
+            off,
+            outcome,
+        } in &rows
+        {
+            let text = match outcome {
+                Outcome::Match => "bit-identical".to_string(),
+                Outcome::Mismatch { count, total } => format!("MISMATCH {count}/{total}"),
+                Outcome::Error(e) => format!("ERROR {e}"),
+            };
+            println!("{probe:?}\t{shape:?}\t{off}\t{text}");
+        }
+        let bad = rows.iter().filter(|r| !matches!(r.outcome, Outcome::Match)).count();
+        println!("summary: {} runs, {} not bit-identical", rows.len(), bad);
     }
 }

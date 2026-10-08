@@ -10,11 +10,11 @@ Every GEMM invocation validates tensors, resolves layout orientations (NN, TN, N
 
 ```mermaid
 flowchart TD
-    Start["gemm(a, b, c, backend) / gemm_epilogue() / gemm_batched()"] --> Validate{"validate_gemm()<br/>• Rank-2, Non-empty, Bounds &lt;= 2^31<br/>• 16-byte (or 64-byte coop) alignment<br/>• Same runtime, No In/Out overlap"}
+    Start["gemm(a, b, c, backend) / gemm_epilogue() / gemm_batched()"] --> Validate{"validate_gemm()<br/>• Rank-2, Non-empty, Bounds &lt;= 2^31<br/>• 16-byte operand alignment, every family<br/>• Same runtime, No In/Out overlap"}
     Validate -- Fail --> Err["Return Err(String)"]
     Validate -- Pass --> ModeCheck{"Call Variant?"}
 
-    ModeCheck -- "gemm_batched()" --> Batched["gemm_batched()<br/>• Explicit BatchStrides<br/>• Stride-B=0 broadcasts weight<br/>• Strict 64-byte alignment"]
+    ModeCheck -- "gemm_batched()" --> Batched["gemm_batched()<br/>• Explicit BatchStrides<br/>• Stride-B=0 broadcasts weight<br/>• 16-byte alignment at every batch start"]
     ModeCheck -- "gemm_epilogue() / gemm_epilogue_tiled()" --> EpiCheck{"Epilogue Requirements<br/>• BF16, F16 or Relaxed F32<br/>• TensorOps backend"}
     EpiCheck -- No --> EpiErr["Return Err(Epilogue needs coop path)"]
     EpiCheck -- Yes --> EpiDispatch["matmul2d_tensorops_*_epi<br/>• Accumulator in registers<br/>• In-register alpha*A@B + beta*C + bias<br/>• Row-stride-0 column bias broadcast<br/>• Clamped precise::tanh / SiLU<br/>• 64x64 tile for bf16 M &lt; 128"]

@@ -8,6 +8,25 @@ All notable changes to `tessl` are recorded here. The format follows
 
 ### Changed
 
+- **One 16-byte operand-alignment rule for every GEMM family.** The
+  cooperative (bf16/f16/relaxed-f32), accumulate, epilogue and batched entries
+  used to require 64-byte operand views while exact f32 required 16, so
+  `gemm_tn_f32` took a view `gemm_tn_accum_train` refused, and
+  `set_relaxed_precision(true)` made previously valid views fail. A probe
+  (`bench/results/gemm_align_probe_m5pro.txt`) ran every kernel family below
+  the host gate on views 4–64 bytes into their buffers, under Metal API and
+  shader validation. Every run was bit-identical to its 0-offset run, so 64
+  bytes was not a hardware requirement on M5 Pro. Every entry now accepts any
+  16-byte-aligned view.
+  - **`gemm_batched` checks every batch start, not just the base.** A stride
+    whose byte size is not a multiple of 16 is refused, because it puts a later
+    batch off the boundary. Contiguous strides on matrices whose byte size is
+    not a multiple of 16 (for example bf16 `m * k` odd in 8-element units) are
+    now refused. They were accepted before.
+  - **Alignment errors name the entry point and operand.** For example,
+    `gemm_tn_accum_train: operand A byte_offset 4 is not 16-byte aligned`
+    replaces `GEMM cooperative path: byte_offset 4 is not 64-byte aligned`.
+
 - **README Known Gaps no longer claims "no stubs".** `IcbReplayStub`,
   `IcbStubPhase` and `CbReplayError::NotWired` (`tessl::cb_replay`) are public
   and unchanged — no API or semver impact — and full decode-graph ICB replay is

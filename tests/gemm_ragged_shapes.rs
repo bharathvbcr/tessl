@@ -21,10 +21,13 @@ mod common;
 
 use common::{
     assert_within_bound, random_f32, rank_one_b_case, rank_one_case, reference, round_trip_bf16, tensor_bf16,
-    tensor_f32, with_gpu, Layout, F32_PANEL_SHAPES,
+    tensor_bf16_at, tensor_f32, tensor_f32_at, with_gpu, Layout, F32_PANEL_SHAPES,
 };
-use tessl::gemm::{gemm_nt_f32, gemm_nt_train, gemm_tn_f32, gemm_tn_splitk_par_f32, gemm_tn_train};
-use tessl::{gemm, gemm_f32, GemmBackend, GpuRuntime, PrecisionMode};
+use tessl::gemm::{
+    gemm_batched, gemm_epilogue, gemm_nt_bf16, gemm_nt_f32, gemm_nt_train, gemm_tn_accum_train, gemm_tn_bf16,
+    gemm_tn_f32, gemm_tn_splitk_par_f32, gemm_tn_train, Activation, BatchStrides, BatchedGemm, Epilogue,
+};
+use tessl::{gemm, gemm_f32, GemmBackend, GpuRuntime, PrecisionMode, Tensor};
 
 /// Degenerate and boundary-straddling (M, N, K).
 ///
@@ -387,5 +390,229 @@ fn output_views_at_a_byte_offset_stay_inside_their_window() {
             all[..off].iter().all(|&x| x == 0.0) && all[off + m * n..].iter().all(|&x| x == 0.0),
             "GEMM wrote outside the destination view's window"
         );
+    });
+}
+
+/// One rule for every kernel family: an operand view on any 16-byte boundary
+/// runs (`GEMM_VIEW_ALIGN` in `src/gemm.rs`, from the probe in
+/// `bench/results/gemm_align_probe_m5pro.txt`). The cooperative entries used
+/// to refuse anything off a 64-byte boundary, so turning relaxed precision on
+/// made a view that plain f32 accepted fail. Each entry here runs on views
+/// 16, 32 and 48 bytes into their buffers and must reproduce its 0-offset
+/// bits exactly.
+#[test]
+fn cooperative_entries_accept_views_on_any_16_byte_boundary() {
+    with_gpu(|rt| {
+        assert!(rt.has_tensorops(), "requires the TensorOps metallib");
+        // Ragged against every tile; K = 70 also puts each row of A off a
+        // 16-byte boundary, as interior tiles already address it.
+        let (m, n, k) = (130usize, 97usize, 70usize);
+        let a_host = round_trip_bf16(&random_f32(m * k, 0xa1));
+        let b_host = round_trip_bf16(&random_f32(k * n, 0xb1));
+        let c0 = random_f32(m * n, 0xc1);
+        let bias_host = random_f32(n, 0xd1);
+
+        type Entry = fn(&Tensor, &Tensor, &Tensor, &Tensor) -> Result<(), String>;
+        let entries: [(&str, bool, Entry); 5] = [
+            ("gemm relaxed f32", false, |a, b, c, _| {
+                gemm(a, b, c, GemmBackend::TensorOps)
+            }),
+            ("gemm bf16", true, |a, b, c, _| gemm(a, b, c, GemmBackend::TensorOps)),
+            ("gemm_tn_bf16", true, |a, b, c, _| gemm_tn_bf16(a, b, c)),
+            ("gemm_nt_bf16", true, |a, b, c, _| gemm_nt_bf16(a, b, c)),
+            ("gemm_epilogue bf16", true, |a, b, c, bias| {
+                let epi = Epilogue {
+                    alpha: 0.5,
+                    beta: 0.25,
+                    bias: Some(bias),
+                    activation: Activation::None,
+                };
+                gemm_epilogue(a, b, c, GemmBackend::TensorOps, epi)
+            }),
+        ];
+        rt.set_relaxed_precision(true);
+        for (name, bf16, entry) in entries {
+            let (a_shape, b_shape) = match name {
+                "gemm_tn_bf16" => ([k, m], [k, n]),
+                "gemm_nt_bf16" => ([m, k], [n, k]),
+                _ => ([m, k], [k, n]),
+            };
+            let run = |pad: usize| -> Vec<u32> {
+                let (a, b) = if bf16 {
+                    (
+                        tensor_bf16_at(rt, &a_shape, &a_host, pad),
+                        tensor_bf16_at(rt, &b_shape, &b_host, pad),
+                    )
+                } else {
+                    (
+                        tensor_f32_at(rt, &a_shape, &a_host, pad),
+                        tensor_f32_at(rt, &b_shape, &b_host, pad),
+                    )
+                };
+                let c = tensor_f32_at(rt, &[m, n], &c0, pad);
+                let bias = tensor_f32_at(rt, &[n], &bias_host, pad);
+                entry(&a, &b, &c, &bias).unwrap_or_else(|e| panic!("{name} at a {pad}-byte offset: {e}"));
+                rt.synchronize().unwrap();
+                c.read_f32().unwrap().iter().map(|v| v.to_bits()).collect()
+            };
+            let aligned = run(0);
+            for pad in [16, 32, 48] {
+                assert_eq!(run(pad), aligned, "{name}: a {pad}-byte offset changed the result");
+            }
+        }
+    });
+}
+
+/// Three contiguous batches whose matrices are whole 16-byte units in bf16
+/// and f32, so only the offset under test moves a batch start.
+const BATCHED: BatchedGemm = BatchedGemm {
+    m: 144,
+    n: 96,
+    k: 80,
+    batch: 3,
+    strides: BatchStrides {
+        a: 144 * 80,
+        b: 80 * 96,
+        c: 144 * 96,
+    },
+};
+
+/// `gemm_batched` starts batch `i` at `base + i * stride`. With a 16-byte base
+/// it must run, bit-identical to the aligned base; with an aligned base and a
+/// stride that is not a whole number of 16-byte units, batch 1 is misaligned
+/// and the call is refused (next test).
+#[test]
+fn batched_accepts_a_base_on_any_16_byte_boundary() {
+    with_gpu(|rt| {
+        assert!(rt.has_tensorops(), "requires the TensorOps metallib");
+        let (spec, batch) = (BATCHED, BATCHED.batch);
+        let (m, n, k) = (spec.m, spec.n, spec.k);
+        let a_host = round_trip_bf16(&random_f32(batch * m * k, 0xa2));
+        let b_host = round_trip_bf16(&random_f32(batch * k * n, 0xb2));
+        let run = |pad: usize| -> Vec<u32> {
+            let a = tensor_bf16_at(rt, &[batch * m, k], &a_host, pad);
+            let b = tensor_bf16_at(rt, &[batch * k, n], &b_host, pad);
+            let c = tensor_f32_at(rt, &[batch * m, n], &vec![f32::NAN; batch * m * n], pad);
+            gemm_batched(&a, &b, &c, GemmBackend::TensorOps, spec)
+                .unwrap_or_else(|e| panic!("batched at a {pad}-byte base: {e}"));
+            rt.synchronize().unwrap();
+            c.read_f32().unwrap().iter().map(|v| v.to_bits()).collect()
+        };
+        let aligned = run(0);
+        for pad in [16, 32, 48] {
+            assert_eq!(run(pad), aligned, "a {pad}-byte batched base changed the result");
+        }
+    });
+}
+
+/// Aligned bases; one stride per operand two elements past a whole matrix, so
+/// batch 1 of that operand sits 4 (bf16) or 8 (f32) bytes off a 16-byte
+/// boundary. Each is refused before encoding, naming the entry and operand.
+#[test]
+fn batched_refuses_a_stride_that_misaligns_a_later_batch() {
+    with_gpu(|rt| {
+        assert!(rt.has_tensorops(), "requires the TensorOps metallib");
+        rt.set_relaxed_precision(true);
+        let (spec, batch) = (BATCHED, BATCHED.batch);
+        let (m, n, k) = (spec.m, spec.n, spec.k);
+        for (operand, strides) in [
+            (
+                "A",
+                BatchStrides {
+                    a: m * k + 2,
+                    ..spec.strides
+                },
+            ),
+            (
+                "B",
+                BatchStrides {
+                    b: k * n + 2,
+                    ..spec.strides
+                },
+            ),
+            (
+                "C",
+                BatchStrides {
+                    c: m * n + 2,
+                    ..spec.strides
+                },
+            ),
+        ] {
+            let pad_elems = 2 * batch;
+            let a = tensor_bf16_at(
+                rt,
+                &[batch * m * k + pad_elems],
+                &vec![0.0; batch * m * k + pad_elems],
+                0,
+            );
+            let b = tensor_bf16_at(
+                rt,
+                &[batch * k * n + pad_elems],
+                &vec![0.0; batch * k * n + pad_elems],
+                0,
+            );
+            let c = tensor_f32_at(
+                rt,
+                &[batch * m * n + pad_elems],
+                &vec![0.0; batch * m * n + pad_elems],
+                0,
+            );
+            rt.take_dispatch_count();
+            let err = gemm_batched(&a, &b, &c, GemmBackend::TensorOps, BatchedGemm { strides, ..spec })
+                .expect_err("a misaligned batch stride must be refused");
+            assert!(
+                err.contains("gemm_batched")
+                    && err.contains(&format!("operand {operand} stride"))
+                    && err.contains("16-byte"),
+                "error must name the entry, the operand and the rule: {err}"
+            );
+            assert_eq!(rt.take_dispatch_count(), 0, "refused before encoding");
+        }
+    });
+}
+
+/// A misaligned view's error names the public entry point, the operand and
+/// the 16-byte rule, not an internal path.
+#[test]
+fn misaligned_views_name_the_entry_and_the_rule() {
+    with_gpu(|rt| {
+        assert!(rt.has_tensorops(), "requires the TensorOps metallib");
+        rt.set_relaxed_precision(true);
+        let (m, n, k) = (64usize, 64usize, 64usize);
+        let a = tensor_f32(rt, &[m, k], &random_f32(m * k, 1));
+        let b = tensor_f32(rt, &[k, n], &random_f32(k * n, 2));
+        let b_off = tensor_f32_at(rt, &[k, n], &random_f32(k * n, 2), 8);
+        let c = tensor_f32(rt, &[m, n], &vec![0.0; m * n]);
+        let a_km = tensor_f32_at(rt, &[k, m], &random_f32(m * k, 3), 4);
+        let epi = Epilogue {
+            alpha: 2.0,
+            ..Epilogue::default()
+        };
+        for (entry, operand, result) in [
+            ("gemm", "B", gemm(&a, &b_off, &c, GemmBackend::TensorOps)),
+            (
+                "gemm_epilogue",
+                "B",
+                gemm_epilogue(&a, &b_off, &c, GemmBackend::TensorOps, epi),
+            ),
+            // The identity epilogue runs the plain GEMM; the refusal still
+            // names the entry the caller used.
+            (
+                "gemm_epilogue",
+                "B",
+                gemm_epilogue(&a, &b_off, &c, GemmBackend::TensorOps, Epilogue::default()),
+            ),
+            (
+                "gemm_tn_accum_train",
+                "A",
+                gemm_tn_accum_train(&a_km, &b, &c, GemmBackend::TensorOps),
+            ),
+        ] {
+            let err = result.expect_err("an 8- or 4-byte offset is under the 16-byte rule");
+            assert!(
+                err.starts_with(&format!("{entry}: operand {operand} byte_offset")) && err.contains("16-byte"),
+                "{entry}: {err}"
+            );
+        }
     });
 }

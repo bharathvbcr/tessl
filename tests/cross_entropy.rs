@@ -754,7 +754,10 @@ fn the_accumulating_call_adds_dw_into_what_it_holds() {
             for (k, ((&prev, &fresh), &got)) in c0.iter().zip(&g1).zip(&g2).enumerate() {
                 let want = f64::from(prev) + f64::from(fresh);
                 let err = (f64::from(got) - want).abs();
-                assert!(err <= 8.0 * u * scale, "{op:?}: dW[{k}] = {got}, want {want} (err {err:.3e})");
+                assert!(
+                    err <= 8.0 * u * scale,
+                    "{op:?}: dW[{k}] = {got}, want {want} (err {err:.3e})"
+                );
             }
         }
     });

@@ -1499,43 +1499,72 @@ fn real_2b_step_on_bf16_storage_stays_near_the_f32_step() {
     }
 }
 
+/// 4352 natural-text ids for the loss curve: 34 chunks of 128
+/// (`tests/fixtures/qwen35_curve_ids.npy`, `tools/qwen35_ref/make_text_ids.py`).
+fn curve_ids() -> Vec<u32> {
+    npy_f64(&Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/qwen35_curve_ids.npy"))
+        .1
+        .iter()
+        .map(|&x| x as u32)
+        .collect()
+}
+
 /// The 2B's loss curves at f32 and at each stored precision, over three
-/// seeds: each seed orders three of the four 128-token natural-text chunks
-/// for `STEPS` AdamW steps (lr 2e-5) and seeds the stochastic rule, and the
-/// fourth chunk, never trained on, is scored after every step. Bounds
-/// written before the first run: at every step each stored precision's
-/// held-out loss is within 2% of the same seed's f32 run, and its mean over
-/// the last 10 steps within 1%; its training loss falls by within 25% of the
-/// f32 run's fall (which must be at least 0.1 nats). Every step's losses are
-/// printed as CSV. Needs `QWEN35_2B_SAFETENSORS`; each run holds at most
-/// ~30 GB and is dropped before the next.
+/// seeds, on data it never sees twice: 30 AdamW steps (lr 2e-5), each on its
+/// own 128-token chunk of natural text in an order drawn from the seed
+/// (which also seeds the stochastic rule), with four more chunks held out
+/// and scored before training and after every fifth step. Each training
+/// chunk is scored before the update it drives, so it is held out too.
+/// Bounds written before the first run: at every step each stored
+/// precision's training loss is within 2% of the same seed's f32 run, and
+/// its held-out mean within 1% at every scoring; the f32 run's held-out mean
+/// falls by at least 0.05 nats over the run, and each stored precision's
+/// fall is within 25% of it. Every step's losses are printed as CSV. Needs
+/// `QWEN35_2B_SAFETENSORS`; each run holds at most ~33 GB and is dropped
+/// before the next.
 ///
-/// It replaces a single-seed curve that bounded the training loss at every
-/// step within 2% of f32's. That bound failed (2026-10-08, M5 Pro, twice)
-/// for a reason it could not separate from a defect: the four chunks it
-/// trained on were memorised to a loss near 1e-3, where a relative bound
-/// measures noise. Its run showed the round-to-nearest rules deferring the
-/// first lr 2e-5 updates (under half a bf16 ulp) into the master or
-/// compensation (step 1: 3.8926 against f32's 3.9548, stochastic rounding
-/// 3.9552), which the held-out loss now measures without memorisation.
+/// Two earlier curves repeated their data and were replaced (2026-10-08,
+/// M5 Pro). The first trained four chunks in turn and bounded the training
+/// loss at every step within 2% of f32's: the chunks were memorised to a
+/// loss near 1e-3, where the bound measures noise. The second trained three
+/// chunks for 30 steps and bounded a fourth, held out, within 2%: the run
+/// overfit (f32's held-out loss climbed from 3.50 to 5.2), and each stored
+/// precision overfit by a different amount (on seed 1 the round-to-nearest
+/// rules ended 4.87–4.92 against f32's 5.18, stochastic rounding 5.37). A
+/// per-parameter check found no defect in the update there: after 12 steps
+/// each f32-master update had cosine >= 0.9966 with the f32 model's
+/// bf16-operand update and 0.99–1.00 of its norm.
+///
+/// First run of this one (2026-10-08, M5 Pro): fails, kept failing rather
+/// than loosened. The held-out bound holds everywhere: every stored precision
+/// is within 1% of f32 at all 21 scorings (worst 0.98%, f32 master; mean
+/// 0.43%), stochastic rounding within 0.08%. Stochastic rounding also keeps
+/// every training loss within 0.74%. The round-to-nearest rules (f32 master,
+/// Kahan with bf16 or 8-bit moments) exceed 2% on 15–16 of 90 steps (worst
+/// 4.6%, mean 1.1%), from step 1: their forward runs on weights rounded to
+/// nearest, which hold back an update under half a bf16 ulp, as an f32
+/// model on bf16 operands does (f32 master tracked that model's held-out
+/// loss to 1e-3 over five steps). The fall bound fails because the f32 run
+/// itself does not learn consistently here: its held-out mean falls 0.080
+/// and 0.155 on seeds 1 and 3, and rises 0.033 on seed 2.
 #[test]
 #[ignore]
 fn real_2b_loss_curve_tracks_the_f32_step() {
     use tessl::qwen35_adamw::{AdamW, AdamWConfig, AdamWHyper, MomentStorage, UpdateRule};
     const STEPS: usize = 30;
+    const EVERY: usize = 5;
     const SEEDS: [u64; 3] = [1, 2, 3];
-    let text = text_ids();
-    let chunks: Vec<Vec<u32>> = text.chunks(128).map(<[u32]>::to_vec).collect();
-    assert_eq!(chunks.len(), 4);
-    let (train, held_out) = (&chunks[..3], &chunks[3]);
+    let ids = curve_ids();
+    let chunks: Vec<Vec<u32>> = ids.chunks(128).map(<[u32]>::to_vec).collect();
+    assert_eq!(chunks.len(), STEPS + 4);
+    let (train, held_out) = chunks.split_at(STEPS);
     let hyper = AdamWHyper {
         lr: 2e-5,
         ..AdamWHyper::default()
     };
-    // The training chunk at each step: a fixed permutation of the three per
-    // seed, repeated.
+    // The order the seed draws (Fisher-Yates on an xorshift stream).
     let order = |seed: u64| -> Vec<usize> {
-        let mut o = [0usize, 1, 2];
+        let mut o: Vec<usize> = (0..STEPS).collect();
         let mut x = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
         for i in (1..o.len()).rev() {
             x ^= x << 13;
@@ -1543,10 +1572,11 @@ fn real_2b_loss_curve_tracks_the_f32_step() {
             x ^= x << 17;
             o.swap(i, (x % (i as u64 + 1)) as usize);
         }
-        (0..STEPS).map(|s| o[s % 3]).collect()
+        o
     };
-    // (training loss, held-out loss after the step) per step.
-    let curve = |precision: Precision, config: AdamWConfig, seed: u64| -> Vec<(f64, f64)> {
+    // Each step's training loss, and the held-out mean before training and
+    // after every EVERY steps.
+    let curve = |precision: Precision, config: AdamWConfig, seed: u64| -> (Vec<f64>, Vec<f64>) {
         let rt = GpuRuntime::new().unwrap();
         let model = real_2b_tower(&rt, precision);
         let operands = if precision == Precision::F32 {
@@ -1554,23 +1584,30 @@ fn real_2b_loss_curve_tracks_the_f32_step() {
         } else {
             GemmOperands::Bf16
         };
+        let held = || {
+            held_out
+                .iter()
+                .map(|c| model.train_forward(c, operands, Supervise::Causal).unwrap().loss())
+                .sum::<f64>()
+                / held_out.len() as f64
+        };
         let bank = Qwen35Grads::zeros_like(&model).unwrap();
         let mut state = AdamW::with_config(&model, config).unwrap();
         let wd = model.default_weight_decay(0.0).unwrap();
-        let mut out = Vec::with_capacity(STEPS);
-        for &c in &order(seed) {
-            let loss = model
-                .train_step_into(&train[c], operands, Supervise::Causal, &bank, false)
-                .unwrap();
+        let (mut losses, mut helds) = (Vec::with_capacity(STEPS), vec![held()]);
+        for (s, &c) in order(seed).iter().enumerate() {
+            losses.push(
+                model
+                    .train_step_into(&train[c], operands, Supervise::Causal, &bank, false)
+                    .unwrap(),
+            );
             model.adamw_step(&bank, &mut state, &hyper, &wd).unwrap();
-            let held = model
-                .train_forward(held_out, operands, Supervise::Causal)
-                .unwrap()
-                .loss();
-            out.push((loss, held));
+            if (s + 1) % EVERY == 0 {
+                helds.push(held());
+            }
         }
         eprintln!("seed {seed}: {}: {}", state.describe(), model.describe());
-        out
+        (losses, helds)
     };
     let configs = |seed: u64| {
         [
@@ -1592,50 +1629,53 @@ fn real_2b_loss_curve_tracks_the_f32_step() {
             },
         ]
     };
-    let drop = |r: &[(f64, f64)]| {
-        r[..3].iter().map(|x| x.0).sum::<f64>() / 3.0 - r[STEPS - 3..].iter().map(|x| x.0).sum::<f64>() / 3.0
-    };
-    let tail = |r: &[(f64, f64)]| r[STEPS - 10..].iter().map(|x| x.1).sum::<f64>() / 10.0;
+    let fall = |h: &[f64]| h[0] - h[h.len() - 1];
     let mut failures = Vec::new();
     for seed in SEEDS {
-        let base = curve(Precision::F32, AdamWConfig::F32, seed);
+        let (base, base_held) = curve(Precision::F32, AdamWConfig::F32, seed);
         let cs = configs(seed);
-        let runs: Vec<Vec<(f64, f64)>> = cs.iter().map(|&c| curve(Precision::Bf16, c, seed)).collect();
-        println!("seed {seed} (order {:?})", &order(seed)[..3]);
+        let runs: Vec<(Vec<f64>, Vec<f64>)> = cs.iter().map(|&c| curve(Precision::Bf16, c, seed)).collect();
+        println!("seed {seed}");
         println!(
-            "step,f32 train,f32 held-out,{}",
-            cs.iter()
-                .map(|c| format!("{c} train,{c} held-out"))
-                .collect::<Vec<_>>()
-                .join(",")
+            "step,f32,{}",
+            cs.iter().map(|c| c.to_string()).collect::<Vec<_>>().join(",")
         );
-        for s in 0..STEPS {
-            let row: Vec<String> = runs.iter().map(|r| format!("{:.5},{:.5}", r[s].0, r[s].1)).collect();
-            println!("{s},{:.5},{:.5},{}", base[s].0, base[s].1, row.join(","));
+        for (s, b) in base.iter().enumerate() {
+            let row: Vec<String> = runs.iter().map(|r| format!("{:.5}", r.0[s])).collect();
+            println!("{s},{b:.5},{}", row.join(","));
         }
-        let base_drop = drop(&base);
-        if base_drop < 0.1 {
+        println!("held-out after step,f32,...");
+        for (k, h) in base_held.iter().enumerate() {
+            let row: Vec<String> = runs.iter().map(|r| format!("{:.5}", r.1[k])).collect();
+            println!("{},{h:.5},{}", k * EVERY, row.join(","));
+        }
+        let base_fall = fall(&base_held);
+        if base_fall < 0.05 {
             failures.push(format!(
-                "seed {seed}: the f32 run's training loss fell only {base_drop:.4}"
+                "seed {seed}: the f32 run's held-out mean fell only {base_fall:.4}"
             ));
         }
-        for (c, r) in cs.iter().zip(&runs) {
+        for (c, (losses, helds)) in cs.iter().zip(&runs) {
             for s in 0..STEPS {
-                if (r[s].1 - base[s].1).abs() > 0.02 * base[s].1 {
+                if (losses[s] - base[s]).abs() > 0.02 * base[s] {
                     failures.push(format!(
-                        "seed {seed} {c} step {s}: held-out {} vs f32 {}",
-                        r[s].1, base[s].1
+                        "seed {seed} {c} step {s}: loss {} vs f32 {}",
+                        losses[s], base[s]
                     ));
                 }
             }
-            let (t, bt) = (tail(r), tail(&base));
-            if (t - bt).abs() > 0.01 * bt {
-                failures.push(format!("seed {seed} {c}: last-10 held-out mean {t:.5} vs f32 {bt:.5}"));
+            for (k, (h, b)) in helds.iter().zip(&base_held).enumerate() {
+                if (h - b).abs() > 0.01 * b {
+                    failures.push(format!(
+                        "seed {seed} {c} after step {}: held-out {h:.5} vs f32 {b:.5}",
+                        k * EVERY
+                    ));
+                }
             }
-            let d = drop(r);
-            if (d - base_drop).abs() > 0.25 * base_drop {
+            let f = fall(helds);
+            if (f - base_fall).abs() > 0.25 * base_fall {
                 failures.push(format!(
-                    "seed {seed} {c}: training loss fell {d:.4}, the f32 run's {base_drop:.4}"
+                    "seed {seed} {c}: held-out fell {f:.4}, the f32 run's {base_fall:.4}"
                 ));
             }
         }

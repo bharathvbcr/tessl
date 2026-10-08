@@ -370,10 +370,7 @@ impl Tuning {
             batch: batch_size()?,
             include_all_impls: include_all_impls()?,
             decode_lanes: optional_tuning("BENCH_ATTN_DECODE_R", nn::RowsLanes::parse)?,
-            decode_head_block: optional_tuning(
-                "BENCH_ATTN_DECODE_SGS",
-                nn::DecodeHeadBlock::parse,
-            )?,
+            decode_head_block: optional_tuning("BENCH_ATTN_DECODE_SGS", nn::DecodeHeadBlock::parse)?,
             reduce_width: optional_tuning("BENCH_ATTN_REDUCE_W", parse_reduce_width)?,
             rows_groups: optional_tuning("BENCH_ATTN_ROWS_SGT", nn::RowsGroups::parse)?,
             decode_chunk: optional_tuning("BENCH_ATTN_DECODE_CHUNK", nn::DecodeChunk::parse)?,
@@ -382,34 +379,25 @@ impl Tuning {
     }
 
     fn decode_lanes(self, c: &Cfg) -> nn::RowsLanes {
-        self.decode_lanes
-            .unwrap_or_else(|| nn::decode_lanes_for(c.d as u32))
+        self.decode_lanes.unwrap_or_else(|| nn::decode_lanes_for(c.d as u32))
     }
 
     fn decode_chunk(self, c: &Cfg) -> nn::DecodeChunk {
-        self.decode_chunk
-            .unwrap_or_else(|| nn::decode_chunk_for(c.d as u32))
+        self.decode_chunk.unwrap_or_else(|| nn::decode_chunk_for(c.d as u32))
     }
 
     fn rows_lanes(self, c: &Cfg) -> nn::RowsLanes {
-        self.rows_lanes
-            .unwrap_or_else(|| nn::rows_lanes_for(c.d as u32))
+        self.rows_lanes.unwrap_or_else(|| nn::rows_lanes_for(c.d as u32))
     }
 
     fn rows_groups(self, c: &Cfg) -> nn::RowsGroups {
-        self.rows_groups
-            .unwrap_or_else(|| nn::rows_groups_for(c.d as u32))
+        self.rows_groups.unwrap_or_else(|| nn::rows_groups_for(c.d as u32))
     }
 }
 
-fn optional_tuning<T>(
-    name: &str,
-    parse: impl FnOnce(&str) -> Result<T, String>,
-) -> Result<Option<T>, String> {
+fn optional_tuning<T>(name: &str, parse: impl FnOnce(&str) -> Result<T, String>) -> Result<Option<T>, String> {
     match std::env::var(name) {
-        Ok(value) => parse(value.trim())
-            .map(Some)
-            .map_err(|e| format!("{name}: {e}")),
+        Ok(value) => parse(value.trim()).map(Some).map_err(|e| format!("{name}: {e}")),
         Err(std::env::VarError::NotPresent) => Ok(None),
         Err(e) => Err(format!("{name}: {e}")),
     }
@@ -418,9 +406,7 @@ fn optional_tuning<T>(
 fn parse_reduce_width(value: &str) -> Result<usize, String> {
     match value.parse::<usize>() {
         Ok(n) if (32..=1024).contains(&n) && n % 32 == 0 => Ok(n),
-        _ => Err(format!(
-            "must be a multiple of 32 in [32, 1024], got {value:?}"
-        )),
+        _ => Err(format!("must be a multiple of 32 in [32, 1024], got {value:?}")),
     }
 }
 
@@ -439,13 +425,7 @@ fn kernel_name(imp: Impl, c: &Cfg) -> Result<&'static str, String> {
     })
 }
 
-fn launch_impl(
-    rt: &Arc<GpuRuntime>,
-    c: &Cfg,
-    b: &Bufs,
-    imp: Impl,
-    tuning: Tuning,
-) -> Result<(), String> {
+fn launch_impl(rt: &Arc<GpuRuntime>, c: &Cfg, b: &Bufs, imp: Impl, tuning: Tuning) -> Result<(), String> {
     if imp == Impl::Decode {
         return nn::flash_attn_decode_with_chunk(
             rt,
@@ -469,30 +449,8 @@ fn launch_impl(
     if imp == Impl::Routed {
         // The public entry points, exactly as a caller reaches them.
         return match c.window {
-            Some(_) => nn::flash_attn_swa(
-                rt,
-                c.head_dim()?,
-                b.q,
-                b.k,
-                b.v,
-                b.o,
-                b.tkv,
-                b.qo,
-                b.ko,
-                c.dims(),
-            ),
-            None => nn::flash_attn_global_h512(
-                rt,
-                b.q,
-                b.k,
-                b.v,
-                b.o,
-                b.tkv,
-                b.qo,
-                b.ko,
-                c.dims(),
-                false,
-            ),
+            Some(_) => nn::flash_attn_swa(rt, c.head_dim()?, b.q, b.k, b.v, b.o, b.tkv, b.qo, b.ko, c.dims()),
+            None => nn::flash_attn_global_h512(rt, b.q, b.k, b.v, b.o, b.tkv, b.qo, b.ko, c.dims(), false),
         };
     }
     if imp == Impl::Rows {
@@ -517,30 +475,8 @@ fn launch_impl(
 
 fn launch(rt: &Arc<GpuRuntime>, c: &Cfg, b: &Bufs) -> Result<(), String> {
     match c.window {
-        Some(_) => nn::flash_attn_swa_tiled(
-            rt,
-            c.head_dim()?,
-            b.q,
-            b.k,
-            b.v,
-            b.o,
-            b.tkv,
-            b.qo,
-            b.ko,
-            c.dims(),
-        ),
-        None => nn::flash_attn_global_h512_tiled(
-            rt,
-            b.q,
-            b.k,
-            b.v,
-            b.o,
-            b.tkv,
-            b.qo,
-            b.ko,
-            c.dims(),
-            false,
-        ),
+        Some(_) => nn::flash_attn_swa_tiled(rt, c.head_dim()?, b.q, b.k, b.v, b.o, b.tkv, b.qo, b.ko, c.dims()),
+        None => nn::flash_attn_global_h512_tiled(rt, b.q, b.k, b.v, b.o, b.tkv, b.qo, b.ko, c.dims(), false),
     }
 }
 
@@ -637,10 +573,7 @@ const UNWRITTEN: f32 = -6.5e28;
 /// tracing is off, so normal runs are unchanged.
 fn emit_kernel_trace() {
     if tessl::runtime::kernel_trace_enabled() {
-        eprintln!(
-            "KERNEL_TRACE {}",
-            tessl::runtime::traced_kernels().join(",")
-        );
+        eprintln!("KERNEL_TRACE {}", tessl::runtime::traced_kernels().join(","));
     }
 }
 
@@ -706,9 +639,7 @@ fn run() -> Result<(), String> {
                     ));
                 }
             }
-            CFGS.iter()
-                .filter(|c| want.contains(&c.label.to_string()))
-                .collect()
+            CFGS.iter().filter(|c| want.contains(&c.label.to_string())).collect()
         }
     };
 
@@ -819,11 +750,7 @@ fn run() -> Result<(), String> {
                         out[i]
                     ));
                 }
-                write_npy_f32(
-                    &d.join(format!("o_{}.npy", imp.tag())),
-                    &[c.b, c.tq, c.h, c.d],
-                    &out,
-                )?;
+                write_npy_f32(&d.join(format!("o_{}.npy", imp.tag())), &[c.b, c.tq, c.h, c.d], &out)?;
                 lanes.push(format!(
                     r#"{{"lane":"{}","kernel":"{}"}}"#,
                     imp.tag(),
@@ -844,11 +771,7 @@ fn run() -> Result<(), String> {
     if let Some(dir) = &dump_dir {
         std::fs::write(
             Path::new(dir).join("attn_manifest.json"),
-            format!(
-                r#"{{"dist":"{}","configs":[{}]}}"#,
-                dist.name(),
-                dumped.join(",")
-            ),
+            format!(r#"{{"dist":"{}","configs":[{}]}}"#, dist.name(), dumped.join(",")),
         )
         .map_err(|e| format!("write manifest: {e}"))?;
         eprintln!("attention parity dump complete: {} configs", dumped.len());
@@ -881,10 +804,7 @@ mod tests {
     #[test]
     fn configuration_selection_rejects_an_empty_override() {
         assert!(parse_requested_configs(None).unwrap().is_none());
-        assert_eq!(
-            parse_requested_configs(Some("a, b")).unwrap().unwrap(),
-            ["a", "b"]
-        );
+        assert_eq!(parse_requested_configs(Some("a, b")).unwrap().unwrap(), ["a", "b"]);
         assert!(parse_requested_configs(Some(" , ")).is_err());
     }
 

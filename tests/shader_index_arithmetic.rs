@@ -35,6 +35,7 @@ const QWEN35_BWD: &str = include_str!("../kernels/qwen35_bwd.metal");
 const QWEN35_ATTN_BWD: &str = include_str!("../kernels/qwen35_attn_bwd.metal");
 const QWEN35_ADAMW: &str = include_str!("../kernels/qwen35_adamw.metal");
 const ENCODER_ATTN: &str = include_str!("../kernels/encoder_attn.metal");
+const ATTN_ROWS_H: &str = include_str!("../kernels/attn_rows.h");
 const EMBED_POOL: &str = include_str!("../kernels/embed_pool.metal");
 const MTL_TENSOR: &str = include_str!("../kernels/mtl_tensor.metal");
 const BERT: &str = include_str!("../kernels/bert.metal");
@@ -686,10 +687,15 @@ fn encoder_attn_offsets_are_widened() {
             "const ulong kv_base = kv_head_base + t * kv_pos_stride;",
             "key/value row",
         ),
-        ("const ulong d0 = o_off + 4u * (dl + j * (R));", "output column"),
     ] {
         require(ENCODER_ATTN, needle, what);
     }
+    // The store is `attn_rows.h`'s, shared with `flash_attn_rows`.
+    require(
+        ATTN_ROWS_H,
+        "const ulong d0 = o_off + 4u * (dl + j * R);",
+        "output column (attn_rows.h)",
+    );
 }
 
 /// Segment means read [rows, D] and write [S, D]; normalize walks rows spaced

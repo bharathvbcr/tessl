@@ -1,8 +1,10 @@
 // Bidirectional (encoder) attention: one simdgroup per query row.
 //
-// The row mapping, lane layout, float4 dim slicing and online softmax are
-// `flash_attn_rows.metal`'s (read that file's header for why they are fast);
-// what differs is the masking contract, which is an encoder's, not a decoder's:
+// The row mapping, lane layout and float4 dim slicing are
+// `flash_attn_rows.metal`'s (read that file's header for why they are fast),
+// and the per-key online softmax and the store are the same code
+// (`attn_rows.h`); what differs is the masking contract, which is an
+// encoder's, not a decoder's:
 //
 //   * no causal rule: a query sees keys on both sides;
 //   * the sliding window is symmetric and inclusive, |t_k - t_q| <= window
@@ -26,6 +28,7 @@
 // checks lens[b] in 1..=T for every row; the kernel still clamps to T before
 // any address is formed, since the buffer is device-writable.
 #include <metal_stdlib>
+#include "attn_rows.h"
 using namespace metal;
 
 constant uint ENC_SG_W = 32;
@@ -90,10 +93,7 @@ kernel void NAME(                                                             \
     float4 q_reg[DPV];                                                        \
     float4 acc[DPV];                                                          \
     for (uint j = 0; j < DPV; ++j) { acc[j] = float4(0.0f); }                 \
-    /* -FLT_MAX, not -INFINITY: kernels compile with fast math, which may     \
-       assume no value is infinite. l_i > 0 is the "has seen a key" flag: the \
-       first live key contributes exp(0) = 1, and l_i never shrinks below 1   \
-       after that, because each new maximum adds 1 again. */                  \
+    /* The seeds and the "has seen a key" flag: see attn_rows_step. */      \
     float m_i = -FLT_MAX;                                                     \
     float l_i = 0.0f;                                                         \
                                                                               \
@@ -104,51 +104,18 @@ kernel void NAME(                                                             \
         }                                                                     \
         for (ulong t = t_start; t < t_end; ++t) {                             \
             const ulong kv_base = kv_head_base + t * kv_pos_stride;          \
-            device const float4 *K4 = (device const float4 *)(K + kv_base);   \
-            float4 dot4 = float4(0.0f);                                       \
-            for (uint j = 0; j < DPV; ++j) {                                  \
-                dot4 += q_reg[j] * K4[dl + j * (R)];                          \
-            }                                                                 \
-            float part = dot4.x + dot4.y + dot4.z + dot4.w;                   \
-            for (uint off = (R) / 2u; off > 0u; off >>= 1) {                  \
-                part += simd_shuffle_xor(part, off);                          \
-            }                                                                 \
+            const float part = attn_rows_dot<DPV, (R)>(                       \
+                q_reg, (device const float4 *)(K + kv_base), dl);             \
             const bool live = q_valid && t >= my_lo && t < my_hi;             \
-            const float s = live ? part * scale : -FLT_MAX;                   \
-            const float m_new = max(m_i, s);                                  \
-            /* A row that has seen nothing has a zero accumulator, so its     \
-               rescale is exactly zero; and a masked key's weight is zero by  \
-               the mask, not by its score, since -FLT_MAX - -FLT_MAX is 0. */ \
-            const float alpha = (l_i > 0.0f) ? exp(m_i - m_new) : 0.0f;       \
-            const float p = live ? exp(s - m_new) : 0.0f;                     \
-            device const float4 *V4 = (device const float4 *)(V + kv_base);   \
-            for (uint j = 0; j < DPV; ++j) {                                  \
-                acc[j] = acc[j] * alpha + p * V4[dl + j * (R)];               \
-            }                                                                 \
-            l_i = l_i * alpha + p;                                            \
-            m_i = m_new;                                                      \
+            attn_rows_step<DPV, (R)>(part, live, scale,                       \
+                (device const float4 *)(V + kv_base), dl, acc, m_i, l_i);     \
         }                                                                     \
     }                                                                         \
                                                                               \
     if (!row_live) { return; }                                                \
     /* A padding query (or, defensively, a row that saw no key) is zeros. */  \
     const float inv_l = (q_valid && l_i > 0.0f) ? (1.0f / l_i) : 0.0f;        \
-    if (out_bf16 != 0u) {                                                     \
-        device bfloat *Ob = (device bfloat *)O;                               \
-        for (uint j = 0; j < DPV; ++j) {                                      \
-            const ulong d0 = o_off + 4u * (dl + j * (R));                     \
-            const float4 o4 = acc[j] * inv_l;                                 \
-            Ob[d0 + 0u] = bfloat(o4.x);                                       \
-            Ob[d0 + 1u] = bfloat(o4.y);                                       \
-            Ob[d0 + 2u] = bfloat(o4.z);                                       \
-            Ob[d0 + 3u] = bfloat(o4.w);                                       \
-        }                                                                     \
-    } else {                                                                  \
-        device float4 *O4 = (device float4 *)(O + o_off);                     \
-        for (uint j = 0; j < DPV; ++j) {                                      \
-            O4[dl + j * (R)] = acc[j] * inv_l;                                \
-        }                                                                     \
-    }                                                                         \
+    attn_rows_store<DPV, (R)>(O, o_off, dl, acc, inv_l, out_bf16);           \
 }
 
 // The lane counts and simdgroups per threadgroup are `flash_attn_rows`'

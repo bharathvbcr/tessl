@@ -24,8 +24,11 @@
 //! gives the median over rounds of `ms_min`; per lane after the first (the
 //! base) it gives the median of the per-round ratios `ms_min(lane) /
 //! ms_min(base)` with the lowest and highest round as the spread. Below 1 the
-//! lane is faster. A spread that straddles 1.0 is not a result. A workload a
-//! lane did not report in some round is an error, not a gap.
+//! lane is faster. A spread that straddles 1.0 is not a result. With three or
+//! more lanes it also gives each lane against the one before it (`vs_prev`),
+//! so a chain of builds, one change each, benches every change separately in
+//! one interleaved run. A workload a lane did not report in some round is an
+//! error, not a gap.
 
 mod common;
 
@@ -209,6 +212,16 @@ fn main() -> Res<()> {
         }
     };
 
+    let chain = lanes.len() > 2;
+    // (median, lowest, highest) of the per-round ratios a / b.
+    let ratio = |a: &[f64], b: &[f64]| -> Res<(f64, f64, f64)> {
+        let r: Vec<f64> = a.iter().zip(b).map(|(x, y)| x / y).collect();
+        let (lo, hi) = (
+            r.iter().copied().fold(f64::MAX, f64::min),
+            r.iter().copied().fold(f64::MIN, f64::max),
+        );
+        Ok((median(r)?, lo, hi))
+    };
     let mut summary = Vec::new();
     let mut table = vec![format!(
         "{:>24} {}",
@@ -216,10 +229,16 @@ fn main() -> Res<()> {
         lanes
             .iter()
             .enumerate()
-            .map(|(i, l)| if i == 0 {
-                format!("{:>22}", format!("{} ms", l.name))
-            } else {
-                format!("{:>22} {:>22}", format!("{} ms", l.name), "vs base [lo, hi]")
+            .map(|(i, l)| match i {
+                0 => format!("{:>22}", format!("{} ms", l.name)),
+                1 => format!("{:>22} {:>22}", format!("{} ms", l.name), "vs base [lo, hi]"),
+                _ if chain => format!(
+                    "{:>22} {:>22} {:>22}",
+                    format!("{} ms", l.name),
+                    "vs base [lo, hi]",
+                    "vs prev [lo, hi]"
+                ),
+                _ => format!("{:>22} {:>22}", format!("{} ms", l.name), "vs base [lo, hi]"),
             })
             .collect::<Vec<_>>()
             .join(" ")
@@ -227,18 +246,19 @@ fn main() -> Res<()> {
     for w in &base_order {
         let mut obj = vec![format!("\"workload\":{}", json_str(w))];
         let mut line = format!("{w:>24}");
-        let base_mins: Vec<f64> = (0..rounds)
-            .map(|r| get(r, 0, w, "ms_min").map(|v| v.expect("checked in run_lane")))
+        let lane_mins: Vec<Vec<f64>> = (0..lanes.len())
+            .map(|l| {
+                (0..rounds)
+                    .map(|r| get(r, l, w, "ms_min").map(|v| v.expect("checked in run_lane")))
+                    .collect::<Res<Vec<f64>>>()
+            })
             .collect::<Res<_>>()?;
         for (l, lane) in lanes.iter().enumerate() {
-            let mins: Vec<f64> = (0..rounds)
-                .map(|r| get(r, l, w, "ms_min").map(|v| v.expect("checked in run_lane")))
-                .collect::<Res<_>>()?;
-            let all = mins.clone();
-            let med = median(mins)?;
+            let all = &lane_mins[l];
+            let med = median(all.clone())?;
             let mut fields = vec![
                 format!("\"ms_min_median\":{med}"),
-                format!("\"ms_min_all\":{}", json_nums(&all)),
+                format!("\"ms_min_all\":{}", json_nums(all)),
             ];
             for extra in ["device_peak_mib", "peak_footprint_mib", "forwards"] {
                 let vals: Vec<f64> = (0..rounds)
@@ -254,17 +274,16 @@ fn main() -> Res<()> {
                     ));
                 }
             }
-            if l == 0 {
-                line += &format!(" {med:>22.3}");
-            } else {
-                let ratios: Vec<f64> = all.iter().zip(&base_mins).map(|(a, b)| a / b).collect();
-                let (lo, hi) = (
-                    ratios.iter().copied().fold(f64::MAX, f64::min),
-                    ratios.iter().copied().fold(f64::MIN, f64::max),
-                );
-                let rmed = median(ratios.clone())?;
+            line += &format!(" {med:>22.3}");
+            if l > 0 {
+                let (rmed, lo, hi) = ratio(all, &lane_mins[0])?;
                 fields.push(format!("\"vs_base\":{{\"median\":{rmed},\"lo\":{lo},\"hi\":{hi}}}"));
-                line += &format!(" {med:>22.3} {:>22}", format!("{rmed:.3}x [{lo:.3}, {hi:.3}]"));
+                line += &format!(" {:>22}", format!("{rmed:.3}x [{lo:.3}, {hi:.3}]"));
+            }
+            if chain && l > 1 {
+                let (rmed, lo, hi) = ratio(all, &lane_mins[l - 1])?;
+                fields.push(format!("\"vs_prev\":{{\"median\":{rmed},\"lo\":{lo},\"hi\":{hi}}}"));
+                line += &format!(" {:>22}", format!("{rmed:.3}x [{lo:.3}, {hi:.3}]"));
             }
             obj.push(format!("{}:{{{}}}", json_str(&lane.name), fields.join(",")));
         }

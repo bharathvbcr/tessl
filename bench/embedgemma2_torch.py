@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""The PyTorch lane for bench/paired_embedgemma2.py.
+"""The PyTorch lane that `bench_paired` alternates with `bench_embedgemma2`.
 
 sentence-transformers' google/embeddinggemma-2 (modules.json: Transformer ->
 mean Pooling -> Normalize; there is no Dense module, the 512 -> 768
@@ -30,6 +30,18 @@ def ids(seq, length):
             for i in range(length)]
 
 
+def lengths(workload):
+    # bench_embedgemma2's grammar: `+`-joined terms, each BxT or BxLO-HI, the
+    # i-th sequence of a BxLO-HI term LO + (i * 2654435761) % (HI - LO + 1) long.
+    lens = []
+    for term in workload.strip().split("+"):
+        b, t = term.split("x")
+        lo, _, hi = t.partition("-")
+        lo, hi = int(lo), int(hi or lo)
+        lens += [lo + (i * 2654435761) % (hi - lo + 1) for i in range(int(b))]
+    return lens
+
+
 def snapshot():
     if os.environ.get("EMBEDGEMMA2_SNAPSHOT"):
         return os.environ["EMBEDGEMMA2_SNAPSHOT"]
@@ -44,7 +56,8 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--dtype", choices=["f32", "bf16"], default="f32")
     ap.add_argument("--attn", default=None)
-    ap.add_argument("--workloads", default=os.environ.get("BENCH_WORKLOADS", "1x16,64x32,32x256,8x1024,2x4096"))
+    ap.add_argument("--workloads", default=os.environ.get(
+        "BENCH_WORKLOADS", "1x16,64x32,32x256,8x1024,2x4096,128x8-512,1x4096+63x32,1x6147+1x1658+6x10-42"))
     ap.add_argument("--iters", type=int, default=int(os.environ.get("BENCH_ITERS", "10")))
     ap.add_argument("--warmup", type=int, default=int(os.environ.get("BENCH_WARMUP", "3")))
     args = ap.parse_args()
@@ -58,9 +71,13 @@ def main():
 
     rows = []
     for w in args.workloads.split(","):
-        b, t = (int(x) for x in w.strip().split("x"))
-        x = torch.tensor([ids(s, t) for s in range(b)], dtype=torch.long, device="mps")
-        feats = {"input_ids": x, "attention_mask": torch.ones_like(x)}
+        lens = lengths(w)
+        longest = max(lens)
+        # Right-padded to the longest, as sentence-transformers' tokenizer pads.
+        x = torch.tensor([ids(s, t) + [0] * (longest - t) for s, t in enumerate(lens)],
+                         dtype=torch.long, device="mps")
+        mask = torch.tensor([[1] * t + [0] * (longest - t) for t in lens], dtype=torch.long, device="mps")
+        feats = {"input_ids": x, "attention_mask": mask}
 
         def run():
             with torch.no_grad():
@@ -80,7 +97,7 @@ def main():
             run()
             ms.append((time.perf_counter() - t0) * 1e3)
         ms.sort()
-        rows.append({"workload": f"{b}x{t}", "backend": f"torch-mps-{args.dtype}",
+        rows.append({"workload": w.strip(), "backend": f"torch-mps-{args.dtype}",
                      "ms_min": round(ms[0], 4), "ms_median": round(statistics.median(ms), 4),
                      "iters": args.iters})
     print(json.dumps(rows))

@@ -17,8 +17,8 @@ you changed in the kernel.**
 | `bench_qwen35_layers` | Layer kernel benchmarks; `--paired-attn` times paired prefill attention. |
 | `probe_gdn_scan` | Gated delta net chunk scan probe; `--paired` times paired 32- vs 16-col widths. |
 | `bench/paired_cross_runtime.py` | Alternates the tessl and PyTorch/MLX lanes round by round. |
-| `bench_embedgemma2` | EmbeddingGemma 2 `encode` latency on the real checkpoint, JSON out. |
-| `bench/paired_embedgemma2.py` | Alternates `bench_embedgemma2` and `bench/embedgemma2_torch.py` (sentence-transformers on MPS) round by round. |
+| `bench_embedgemma2` | EmbeddingGemma 2 `encode` latency and device/process peak memory on the real checkpoint, uniform and ragged batches, JSON out. |
+| `bench_paired` | Alternates any lanes that print `bench_embedgemma2`'s JSON round by round: tessl against `bench/embedgemma2_torch.py` (sentence-transformers on MPS), or two builds of `bench_embedgemma2` for a before/after A/B. |
 
 ```mermaid
 flowchart TD

@@ -8,6 +8,15 @@ All notable changes to `tessl` are recorded here. The format follows
 
 ### Added
 
+- **`bench_paired`, a Rust round-robin runner for benchmark lanes.** It
+  replaces `bench/paired_embedgemma2.py`: lanes are `NAME=COMMAND`s printing
+  `bench_embedgemma2`'s JSON, alternated round by round, reported as the
+  median of per-round min-of-N with per-round ratios against the first lane.
+  Two builds of `bench_embedgemma2` make a before/after A/B.
+  `bench_embedgemma2` gains ragged workloads (`BxLO-HI` terms joined by `+`,
+  which `bench/embedgemma2_torch.py` reads too), the device's peak allocation
+  per workload and the process's peak physical footprint;
+  `probe_load_memory --embedgemma2` measures an EmbeddingGemma 2 load.
 - **Qwen3.5 training on bf16 storage.** A `Precision::Bf16` model (loaded
   with `load_tower`) trains on `GemmOperands::Bf16` with its matrices kept in
   bf16; arithmetic stays f32. `AdamWConfig` picks an `UpdateRule` for

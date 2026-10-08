@@ -1,0 +1,273 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 800 1320" role="img"><title>Attention per-config speedup, M5 Pro</title><style>
+text{font-family:-apple-system,Helvetica,Arial,sans-serif;font-size:11px;fill:#52514e}
+.t{font-size:13px;font-weight:600;fill:#0b0b0b}.st{font-size:11px;fill:#52514e}.g{stroke:#e1e0d9;stroke-width:1}
+.ref{stroke:#0b0b0b;stroke-width:1.2;stroke-dasharray:4 3}.lim{stroke:#d03b3b;stroke-width:1.2;stroke-dasharray:4 3}
+.v{fill:#0b0b0b;font-size:10px}.k0{fill:#898781}.k1{fill:#2a78d6}.k2{fill:#eb6834}.k3{fill:#6250d6}.k4{fill:#1baf7a}.k5{fill:#e87ba4}
+.fast{fill:#2a78d6}.slow{fill:#e34948}.bg{fill:#fff}
+@media (prefers-color-scheme:dark){.bg{fill:#1a1a19}text{fill:#c3c2b7}.t,.v{fill:#f0efec}.g{stroke:#2c2c2a}.ref{stroke:#f0efec}
+.k1{fill:#3987e5}.k2{fill:#d95926}.k3{fill:#9085e9}.k4{fill:#199e70}.k5{fill:#d55181}.fast{fill:#3987e5}.slow{fill:#e66767}}
+</style>
+<rect class="bg" width="100%" height="100%"/>
+<text class="t" x="20" y="26">Attention — per-config speedup over PyTorch MPS and MLX</text>
+<text class="st" x="20" y="44">Median over 5 paired rounds. Blue = tessl faster. Latest run of each kernel family.</text>
+<text class="t" x="20" y="66">Rows kernel (prefill and decode configs)</text>
+<line class="g" x1="457.8641225355353" x2="457.8641225355353" y1="72" y2="354"/><text x="457.8641225355353" y="365" text-anchor="middle">0.5×</text>
+<line class="g" x1="496.1650765847096" x2="496.1650765847096" y1="72" y2="354"/><text x="496.1650765847096" y="365" text-anchor="middle">1×</text>
+<line class="g" x1="534.4660306338839" x2="534.4660306338839" y1="72" y2="354"/><text x="534.4660306338839" y="365" text-anchor="middle">2×</text>
+<line class="g" x1="572.7669846830581" x2="572.7669846830581" y1="72" y2="354"/><text x="572.7669846830581" y="365" text-anchor="middle">4×</text>
+<line class="g" x1="611.0679387322324" x2="611.0679387322324" y1="72" y2="354"/><text x="611.0679387322324" y="365" text-anchor="middle">8×</text>
+<line class="g" x1="649.3688927814067" x2="649.3688927814067" y1="72" y2="354"/><text x="649.3688927814067" y="365" text-anchor="middle">16×</text>
+<text x="274" y="84" text-anchor="end">swa128_prefill_512 · torch</text>
+<rect class="fast" x="496.1650765847096" y="75" width="3.1444141448182563" height="11" rx="2"/>
+<text class="v" x="503.30949072952785" y="84" text-anchor="start">1.06×</text>
+<text x="274" y="98" text-anchor="end">swa128_prefill_2048 · torch</text>
+<rect class="slow" x="456.3936101525485" y="89" width="39.771466432161105" height="11" rx="2"/>
+<text class="v" x="452.3936101525485" y="98" text-anchor="end">0.49×</text>
+<text x="274" y="112" text-anchor="end">swa128_prefill_4096 · torch</text>
+<rect class="fast" x="496.1650765847096" y="103" width="3.548799120501826" height="11" rx="2"/>
+<text class="v" x="503.7138757052114" y="112" text-anchor="start">1.07×</text>
+<text x="274" y="126" text-anchor="end">swa128_decode_1k · torch</text>
+<rect class="slow" x="478.56719240947007" y="117" width="17.59788417523953" height="11" rx="2"/>
+<text class="v" x="474.56719240947007" y="126" text-anchor="end">0.73×</text>
+<text x="274" y="140" text-anchor="end">swa128_decode_4k · torch</text>
+<rect class="slow" x="492.1470519351773" y="131" width="4.018024649532322" height="11" rx="2"/>
+<text class="v" x="488.1470519351773" y="140" text-anchor="end">0.93×</text>
+<text x="274" y="154" text-anchor="end">swa128_decode_b8_4k · torch</text>
+<rect class="fast" x="496.1650765847096" y="145" width="71.24811916390354" height="11" rx="2"/>
+<text class="v" x="571.4131957486131" y="154" text-anchor="start">3.63×</text>
+<text x="274" y="168" text-anchor="end">swa256_prefill_2048 · torch</text>
+<rect class="fast" x="496.1650765847096" y="159" width="3.3966052337648875" height="11" rx="2"/>
+<text class="v" x="503.5616818184745" y="168" text-anchor="start">1.06×</text>
+<text x="274" y="182" text-anchor="end">swa256_decode_4k · torch</text>
+<rect class="fast" x="496.1650765847096" y="173" width="15.267248871668585" height="11" rx="2"/>
+<text class="v" x="515.4323254563782" y="182" text-anchor="start">1.32×</text>
+<text x="274" y="196" text-anchor="end">global512_prefill_1024 · torch</text>
+<rect class="slow" x="462.4709932837213" y="187" width="33.69408330098827" height="11" rx="2"/>
+<text class="v" x="458.4709932837213" y="196" text-anchor="end">0.54×</text>
+<text x="274" y="210" text-anchor="end">global512_decode_4k · torch</text>
+<rect class="fast" x="496.1650765847096" y="201" width="31.68529426618045" height="11" rx="2"/>
+<text class="v" x="531.85037085089" y="210" text-anchor="start">1.77×</text>
+<text x="274" y="224" text-anchor="end">swa128_prefill_512 · mlx</text>
+<rect class="slow" x="477.86429970498716" y="215" width="18.300776879722434" height="11" rx="2"/>
+<text class="v" x="473.86429970498716" y="224" text-anchor="end">0.72×</text>
+<text x="274" y="238" text-anchor="end">swa128_prefill_2048 · mlx</text>
+<rect class="slow" x="457.34191512125983" y="229" width="38.823161463449765" height="11" rx="2"/>
+<text class="v" x="453.34191512125983" y="238" text-anchor="end">0.50×</text>
+<text x="274" y="252" text-anchor="end">swa128_prefill_4096 · mlx</text>
+<rect class="fast" x="496.1650765847096" y="243" width="3.0380514381167245" height="11" rx="2"/>
+<text class="v" x="503.2031280228263" y="252" text-anchor="start">1.06×</text>
+<text x="274" y="266" text-anchor="end">swa128_decode_1k · mlx</text>
+<rect class="slow" x="455.22028451329936" y="257" width="40.944792071410234" height="11" rx="2"/>
+<text class="v" x="451.22028451329936" y="266" text-anchor="end">0.48×</text>
+<text x="274" y="280" text-anchor="end">swa128_decode_4k · mlx</text>
+<rect class="slow" x="457.99662503419677" y="271" width="38.16845155051283" height="11" rx="2"/>
+<text class="v" x="453.99662503419677" y="280" text-anchor="end">0.50×</text>
+<text x="274" y="294" text-anchor="end">swa128_decode_b8_4k · mlx</text>
+<rect class="fast" x="496.1650765847096" y="285" width="18.121473976300194" height="11" rx="2"/>
+<text class="v" x="518.2865505610098" y="294" text-anchor="start">1.39×</text>
+<text x="274" y="308" text-anchor="end">swa256_prefill_2048 · mlx</text>
+<rect class="slow" x="463.76722336372086" y="299" width="32.397853220988736" height="11" rx="2"/>
+<text class="v" x="459.76722336372086" y="308" text-anchor="end">0.56×</text>
+<text x="274" y="322" text-anchor="end">swa256_decode_4k · mlx</text>
+<rect class="slow" x="455.9154588626086" y="313" width="40.24961772210099" height="11" rx="2"/>
+<text class="v" x="451.9154588626086" y="322" text-anchor="end">0.48×</text>
+<text x="274" y="336" text-anchor="end">global512_prefill_1024 · mlx</text>
+<rect class="slow" x="440.22972083628247" y="327" width="55.93535574842713" height="11" rx="2"/>
+<text class="v" x="436.22972083628247" y="336" text-anchor="end">0.36×</text>
+<text x="274" y="350" text-anchor="end">global512_decode_4k · mlx</text>
+<rect class="slow" x="412.20165902801716" y="341" width="83.96341755669243" height="11" rx="2"/>
+<text class="v" x="408.20165902801716" y="350" text-anchor="end">0.22×</text>
+<line class="ref" x1="496.1650765847096" x2="496.1650765847096" y1="72" y2="354"/>
+<text class="t" x="20" y="394">Routed (prefill + decode), batched 1, run c</text>
+<line class="g" x1="457.8641225355353" x2="457.8641225355353" y1="400" y2="794"/><text x="457.8641225355353" y="805" text-anchor="middle">0.5×</text>
+<line class="g" x1="496.1650765847096" x2="496.1650765847096" y1="400" y2="794"/><text x="496.1650765847096" y="805" text-anchor="middle">1×</text>
+<line class="g" x1="534.4660306338839" x2="534.4660306338839" y1="400" y2="794"/><text x="534.4660306338839" y="805" text-anchor="middle">2×</text>
+<line class="g" x1="572.7669846830581" x2="572.7669846830581" y1="400" y2="794"/><text x="572.7669846830581" y="805" text-anchor="middle">4×</text>
+<line class="g" x1="611.0679387322324" x2="611.0679387322324" y1="400" y2="794"/><text x="611.0679387322324" y="805" text-anchor="middle">8×</text>
+<line class="g" x1="649.3688927814067" x2="649.3688927814067" y1="400" y2="794"/><text x="649.3688927814067" y="805" text-anchor="middle">16×</text>
+<text x="274" y="412" text-anchor="end">swa128_prefill_512 · torch</text>
+<rect class="fast" x="496.1650765847096" y="403" width="1.8081811418106781" height="11" rx="2"/>
+<text class="v" x="501.9732577265203" y="412" text-anchor="start">1.03×</text>
+<text x="274" y="426" text-anchor="end">swa128_prefill_2048 · torch</text>
+<rect class="fast" x="496.1650765847096" y="417" width="12.479897108755267" height="11" rx="2"/>
+<text class="v" x="512.6449736934649" y="426" text-anchor="start">1.25×</text>
+<text x="274" y="440" text-anchor="end">swa128_prefill_4096 · torch</text>
+<rect class="fast" x="496.1650765847096" y="431" width="41.87755838058706" height="11" rx="2"/>
+<text class="v" x="542.0426349652967" y="440" text-anchor="start">2.13×</text>
+<text x="274" y="454" text-anchor="end">swa128_decode_1k · torch</text>
+<rect class="slow" x="469.4670781283" y="445" width="26.697998456409607" height="11" rx="2"/>
+<text class="v" x="465.4670781283" y="454" text-anchor="end">0.62×</text>
+<text x="274" y="468" text-anchor="end">swa128_decode_4k · torch</text>
+<rect class="slow" x="495.82290791903796" y="459" width="1.5" height="11" rx="2"/>
+<text class="v" x="491.82290791903796" y="468" text-anchor="end">0.99×</text>
+<text x="274" y="482" text-anchor="end">swa128_decode_b8_4k · torch</text>
+<rect class="fast" x="496.1650765847096" y="473" width="55.65451376228907" height="11" rx="2"/>
+<text class="v" x="555.8195903469987" y="482" text-anchor="start">2.74×</text>
+<text x="274" y="496" text-anchor="end">swa128_decode_b32_1k · torch</text>
+<rect class="fast" x="496.1650765847096" y="487" width="24.729763336196015" height="11" rx="2"/>
+<text class="v" x="524.8948399209056" y="496" text-anchor="start">1.56×</text>
+<text x="274" y="510" text-anchor="end">swa128_decode_b64_1k · torch</text>
+<rect class="fast" x="496.1650765847096" y="501" width="24.136357883260303" height="11" rx="2"/>
+<text class="v" x="524.3014344679699" y="510" text-anchor="start">1.55×</text>
+<text x="274" y="524" text-anchor="end">swa256_prefill_2048 · torch</text>
+<rect class="fast" x="496.1650765847096" y="515" width="44.05968490033683" height="11" rx="2"/>
+<text class="v" x="544.2247614850464" y="524" text-anchor="start">2.22×</text>
+<text x="274" y="538" text-anchor="end">swa256_decode_4k · torch</text>
+<rect class="fast" x="496.1650765847096" y="529" width="4.336838412729719" height="11" rx="2"/>
+<text class="v" x="504.5019149974393" y="538" text-anchor="start">1.08×</text>
+<text x="274" y="552" text-anchor="end">global512_prefill_1024 · torch</text>
+<rect class="slow" x="492.6950715027701" y="543" width="3.4700050819395187" height="11" rx="2"/>
+<text class="v" x="488.6950715027701" y="552" text-anchor="end">0.94×</text>
+<text x="274" y="566" text-anchor="end">global512_decode_4k · torch</text>
+<rect class="fast" x="496.1650765847096" y="557" width="98.97931206311227" height="11" rx="2"/>
+<text class="v" x="599.1443886478219" y="566" text-anchor="start">6.00×</text>
+<text x="274" y="580" text-anchor="end">global512_decode_4k_mha · torch</text>
+<rect class="fast" x="496.1650765847096" y="571" width="1.5" height="11" rx="2"/>
+<text class="v" x="500.4732606172086" y="580" text-anchor="start">1.01×</text>
+<text x="274" y="594" text-anchor="end">global512_decode_4k_mqa · torch</text>
+<rect class="fast" x="496.1650765847096" y="585" width="87.3687819513359" height="11" rx="2"/>
+<text class="v" x="587.5338585360455" y="594" text-anchor="start">4.86×</text>
+<text x="274" y="608" text-anchor="end">swa128_prefill_512 · mlx</text>
+<rect class="slow" x="491.02967667520284" y="599" width="5.135399909506759" height="11" rx="2"/>
+<text class="v" x="487.02967667520284" y="608" text-anchor="end">0.91×</text>
+<text x="274" y="622" text-anchor="end">swa128_prefill_2048 · mlx</text>
+<rect class="fast" x="496.1650765847096" y="613" width="8.6882677829459" height="11" rx="2"/>
+<text class="v" x="508.8533443676555" y="622" text-anchor="start">1.17×</text>
+<text x="274" y="636" text-anchor="end">swa128_prefill_4096 · mlx</text>
+<rect class="fast" x="496.1650765847096" y="627" width="42.3546494246591" height="11" rx="2"/>
+<text class="v" x="542.5197260093687" y="636" text-anchor="start">2.15×</text>
+<text x="274" y="650" text-anchor="end">swa128_decode_1k · mlx</text>
+<rect class="slow" x="462.1957912356528" y="641" width="33.969285349056804" height="11" rx="2"/>
+<text class="v" x="458.1957912356528" y="650" text-anchor="end">0.54×</text>
+<text x="274" y="664" text-anchor="end">swa128_decode_4k · mlx</text>
+<rect class="slow" x="474.07225402604604" y="655" width="22.092822558663556" height="11" rx="2"/>
+<text class="v" x="470.07225402604604" y="664" text-anchor="end">0.67×</text>
+<text x="274" y="678" text-anchor="end">swa128_decode_b8_4k · mlx</text>
+<rect class="slow" x="486.4100085883699" y="669" width="9.755067996339676" height="11" rx="2"/>
+<text class="v" x="482.4100085883699" y="678" text-anchor="end">0.84×</text>
+<text x="274" y="692" text-anchor="end">swa128_decode_b32_1k · mlx</text>
+<rect class="fast" x="496.1650765847096" y="683" width="7.6099371919885925" height="11" rx="2"/>
+<text class="v" x="507.7750137766982" y="692" text-anchor="start">1.15×</text>
+<text x="274" y="706" text-anchor="end">swa128_decode_b64_1k · mlx</text>
+<rect class="fast" x="496.1650765847096" y="697" width="10.89589850802156" height="11" rx="2"/>
+<text class="v" x="511.06097509273116" y="706" text-anchor="start">1.22×</text>
+<text x="274" y="720" text-anchor="end">swa256_prefill_2048 · mlx</text>
+<rect class="fast" x="496.1650765847096" y="711" width="9.875671109965594" height="11" rx="2"/>
+<text class="v" x="510.0407476946752" y="720" text-anchor="start">1.20×</text>
+<text x="274" y="734" text-anchor="end">swa256_decode_4k · mlx</text>
+<rect class="slow" x="470.1529125352079" y="725" width="26.012164049501678" height="11" rx="2"/>
+<text class="v" x="466.1529125352079" y="734" text-anchor="end">0.62×</text>
+<text x="274" y="748" text-anchor="end">global512_prefill_1024 · mlx</text>
+<rect class="slow" x="471.59159211855115" y="739" width="24.573484466158448" height="11" rx="2"/>
+<text class="v" x="467.59159211855115" y="748" text-anchor="end">0.64×</text>
+<text x="274" y="762" text-anchor="end">global512_decode_4k · mlx</text>
+<rect class="slow" x="472.5422196849926" y="753" width="23.62285689971702" height="11" rx="2"/>
+<text class="v" x="468.5422196849926" y="762" text-anchor="end">0.65×</text>
+<text x="274" y="776" text-anchor="end">global512_decode_4k_mha · mlx</text>
+<rect class="slow" x="484.0265975928338" y="767" width="12.138478991875786" height="11" rx="2"/>
+<text class="v" x="480.0265975928338" y="776" text-anchor="end">0.80×</text>
+<text x="274" y="790" text-anchor="end">global512_decode_4k_mqa · mlx</text>
+<rect class="slow" x="465.92368494896755" y="781" width="30.241391635742048" height="11" rx="2"/>
+<text class="v" x="461.92368494896755" y="790" text-anchor="end">0.58×</text>
+<line class="ref" x1="496.1650765847096" x2="496.1650765847096" y1="400" y2="794"/>
+<text class="t" x="20" y="834">Decode kernel v1</text>
+<line class="g" x1="457.8641225355353" x2="457.8641225355353" y1="840" y2="982"/><text x="457.8641225355353" y="993" text-anchor="middle">0.5×</text>
+<line class="g" x1="496.1650765847096" x2="496.1650765847096" y1="840" y2="982"/><text x="496.1650765847096" y="993" text-anchor="middle">1×</text>
+<line class="g" x1="534.4660306338839" x2="534.4660306338839" y1="840" y2="982"/><text x="534.4660306338839" y="993" text-anchor="middle">2×</text>
+<line class="g" x1="572.7669846830581" x2="572.7669846830581" y1="840" y2="982"/><text x="572.7669846830581" y="993" text-anchor="middle">4×</text>
+<line class="g" x1="611.0679387322324" x2="611.0679387322324" y1="840" y2="982"/><text x="611.0679387322324" y="993" text-anchor="middle">8×</text>
+<line class="g" x1="649.3688927814067" x2="649.3688927814067" y1="840" y2="982"/><text x="649.3688927814067" y="993" text-anchor="middle">16×</text>
+<text x="274" y="852" text-anchor="end">swa128_decode_1k · torch</text>
+<rect class="fast" x="496.1650765847096" y="843" width="1.5" height="11" rx="2"/>
+<text class="v" x="500.6090063375258" y="852" text-anchor="start">1.01×</text>
+<text x="274" y="866" text-anchor="end">swa128_decode_4k · torch</text>
+<rect class="fast" x="496.1650765847096" y="857" width="30.440862800688592" height="11" rx="2"/>
+<text class="v" x="530.6059393853982" y="866" text-anchor="start">1.73×</text>
+<text x="274" y="880" text-anchor="end">swa128_decode_b8_4k · torch</text>
+<rect class="fast" x="496.1650765847096" y="871" width="34.80908070644398" height="11" rx="2"/>
+<text class="v" x="534.9741572911536" y="880" text-anchor="start">1.88×</text>
+<text x="274" y="894" text-anchor="end">swa256_decode_4k · torch</text>
+<rect class="fast" x="496.1650765847096" y="885" width="1.5" height="11" rx="2"/>
+<text class="v" x="501.42343415786735" y="894" text-anchor="start">1.02×</text>
+<text x="274" y="908" text-anchor="end">global512_decode_4k · torch</text>
+<rect class="fast" x="496.1650765847096" y="899" width="90.31232239395104" height="11" rx="2"/>
+<text class="v" x="590.4773989786606" y="908" text-anchor="start">5.13×</text>
+<text x="274" y="922" text-anchor="end">swa128_decode_1k · mlx</text>
+<rect class="slow" x="475.1327089117497" y="913" width="21.03236767295988" height="11" rx="2"/>
+<text class="v" x="471.1327089117497" y="922" text-anchor="end">0.68×</text>
+<text x="274" y="936" text-anchor="end">swa128_decode_4k · mlx</text>
+<rect class="slow" x="461.26342592481046" y="927" width="34.90165065989913" height="11" rx="2"/>
+<text class="v" x="457.26342592481046" y="936" text-anchor="end">0.53×</text>
+<text x="274" y="950" text-anchor="end">swa128_decode_b8_4k · mlx</text>
+<rect class="slow" x="468.00268477124587" y="941" width="28.162391813463728" height="11" rx="2"/>
+<text class="v" x="464.00268477124587" y="950" text-anchor="end">0.60×</text>
+<text x="274" y="964" text-anchor="end">swa256_decode_4k · mlx</text>
+<rect class="slow" x="456.1249049053373" y="955" width="40.04017167937229" height="11" rx="2"/>
+<text class="v" x="452.1249049053373" y="964" text-anchor="end">0.48×</text>
+<text x="274" y="978" text-anchor="end">global512_decode_4k · mlx</text>
+<rect class="slow" x="467.158192760147" y="969" width="29.00688382456258" height="11" rx="2"/>
+<text class="v" x="463.158192760147" y="978" text-anchor="end">0.59×</text>
+<line class="ref" x1="496.1650765847096" x2="496.1650765847096" y1="840" y2="982"/>
+<text class="t" x="20" y="1022">Decode kernel, batched 32, run c</text>
+<line class="g" x1="457.8641225355353" x2="457.8641225355353" y1="1028" y2="1282"/><text x="457.8641225355353" y="1293" text-anchor="middle">0.5×</text>
+<line class="g" x1="496.1650765847096" x2="496.1650765847096" y1="1028" y2="1282"/><text x="496.1650765847096" y="1293" text-anchor="middle">1×</text>
+<line class="g" x1="534.4660306338839" x2="534.4660306338839" y1="1028" y2="1282"/><text x="534.4660306338839" y="1293" text-anchor="middle">2×</text>
+<line class="g" x1="572.7669846830581" x2="572.7669846830581" y1="1028" y2="1282"/><text x="572.7669846830581" y="1293" text-anchor="middle">4×</text>
+<line class="g" x1="611.0679387322324" x2="611.0679387322324" y1="1028" y2="1282"/><text x="611.0679387322324" y="1293" text-anchor="middle">8×</text>
+<line class="g" x1="649.3688927814067" x2="649.3688927814067" y1="1028" y2="1282"/><text x="649.3688927814067" y="1293" text-anchor="middle">16×</text>
+<text x="274" y="1040" text-anchor="end">swa128_decode_1k · torch</text>
+<rect class="fast" x="496.1650765847096" y="1031" width="48.097540270662535" height="11" rx="2"/>
+<text class="v" x="548.2626168553721" y="1040" text-anchor="start">2.39×</text>
+<text x="274" y="1054" text-anchor="end">swa128_decode_4k · torch</text>
+<rect class="fast" x="496.1650765847096" y="1045" width="106.63398481845218" height="11" rx="2"/>
+<text class="v" x="606.7990614031618" y="1054" text-anchor="start">6.89×</text>
+<text x="274" y="1068" text-anchor="end">swa128_decode_b8_4k · torch</text>
+<rect class="fast" x="496.1650765847096" y="1059" width="88.02057350981818" height="11" rx="2"/>
+<text class="v" x="588.1856500945278" y="1068" text-anchor="start">4.92×</text>
+<text x="274" y="1082" text-anchor="end">swa128_decode_b32_1k · torch</text>
+<rect class="fast" x="496.1650765847096" y="1073" width="28.972267533619288" height="11" rx="2"/>
+<text class="v" x="529.1373441183289" y="1082" text-anchor="start">1.69×</text>
+<text x="274" y="1096" text-anchor="end">swa128_decode_b64_1k · torch</text>
+<rect class="fast" x="496.1650765847096" y="1087" width="29.042771088967243" height="11" rx="2"/>
+<text class="v" x="529.2078476736768" y="1096" text-anchor="start">1.69×</text>
+<text x="274" y="1110" text-anchor="end">swa256_decode_4k · torch</text>
+<rect class="fast" x="496.1650765847096" y="1101" width="101.83348090311347" height="11" rx="2"/>
+<text class="v" x="601.9985574878231" y="1110" text-anchor="start">6.31×</text>
+<text x="274" y="1124" text-anchor="end">global512_decode_4k · torch</text>
+<rect class="fast" x="496.1650765847096" y="1115" width="163.92373140075642" height="11" rx="2"/>
+<text class="v" x="664.088807985466" y="1124" text-anchor="start">19.43×</text>
+<text x="274" y="1138" text-anchor="end">global512_decode_4k_mha · torch</text>
+<rect class="fast" x="496.1650765847096" y="1129" width="8.582171472794471" height="11" rx="2"/>
+<text class="v" x="508.74724805750407" y="1138" text-anchor="start">1.17×</text>
+<text x="274" y="1152" text-anchor="end">global512_decode_4k_mqa · torch</text>
+<rect class="fast" x="496.1650765847096" y="1143" width="173.51111261126425" height="11" rx="2"/>
+<text class="v" x="673.6761891959738" y="1152" text-anchor="start">23.11×</text>
+<text x="274" y="1166" text-anchor="end">swa128_decode_1k · mlx</text>
+<rect class="fast" x="496.1650765847096" y="1157" width="1.5" height="11" rx="2"/>
+<text class="v" x="500.98029706816254" y="1166" text-anchor="start">1.01×</text>
+<text x="274" y="1180" text-anchor="end">swa128_decode_4k · mlx</text>
+<rect class="fast" x="496.1650765847096" y="1171" width="13.554374159699364" height="11" rx="2"/>
+<text class="v" x="513.719450744409" y="1180" text-anchor="start">1.28×</text>
+<text x="274" y="1194" text-anchor="end">swa128_decode_b8_4k · mlx</text>
+<rect class="fast" x="496.1650765847096" y="1185" width="4.805926924139442" height="11" rx="2"/>
+<text class="v" x="504.97100350884904" y="1194" text-anchor="start">1.09×</text>
+<text x="274" y="1208" text-anchor="end">swa128_decode_b32_1k · mlx</text>
+<rect class="fast" x="496.1650765847096" y="1199" width="7.308958849395481" height="11" rx="2"/>
+<text class="v" x="507.4740354341051" y="1208" text-anchor="start">1.14×</text>
+<text x="274" y="1222" text-anchor="end">swa128_decode_b64_1k · mlx</text>
+<rect class="fast" x="496.1650765847096" y="1213" width="9.484512106633474" height="11" rx="2"/>
+<text class="v" x="509.64958869134307" y="1222" text-anchor="start">1.19×</text>
+<text x="274" y="1236" text-anchor="end">swa256_decode_4k · mlx</text>
+<rect class="slow" x="494.91947074609186" y="1227" width="1.5" height="11" rx="2"/>
+<text class="v" x="490.91947074609186" y="1236" text-anchor="end">0.98×</text>
+<text x="274" y="1250" text-anchor="end">global512_decode_4k · mlx</text>
+<rect class="slow" x="485.8723034800453" y="1241" width="10.29277310466432" height="11" rx="2"/>
+<text class="v" x="481.8723034800453" y="1250" text-anchor="end">0.83×</text>
+<text x="274" y="1264" text-anchor="end">global512_decode_4k_mha · mlx</text>
+<rect class="slow" x="490.25003344319794" y="1255" width="5.91504314151166" height="11" rx="2"/>
+<text class="v" x="486.25003344319794" y="1264" text-anchor="end">0.90×</text>
+<text x="274" y="1278" text-anchor="end">global512_decode_4k_mqa · mlx</text>
+<rect class="slow" x="494.97302567321424" y="1269" width="1.5" height="11" rx="2"/>
+<text class="v" x="490.97302567321424" y="1278" text-anchor="end">0.98×</text>
+<line class="ref" x1="496.1650765847096" x2="496.1650765847096" y1="1028" y2="1282"/>
+</svg>

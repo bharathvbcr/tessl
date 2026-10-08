@@ -1,0 +1,190 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 918 1424" role="img"><title>Attention tuning knob sweeps, M5 Pro</title><style>
+text{font-family:-apple-system,Helvetica,Arial,sans-serif;font-size:11px;fill:#52514e}
+.t{font-size:13px;font-weight:600;fill:#0b0b0b}.st{font-size:11px;fill:#52514e}.g{stroke:#e1e0d9;stroke-width:1}
+.ref{stroke:#0b0b0b;stroke-width:1.2;stroke-dasharray:4 3}.lim{stroke:#d03b3b;stroke-width:1.2;stroke-dasharray:4 3}
+.v{fill:#0b0b0b;font-size:10px}.k0{fill:#898781}.k1{fill:#2a78d6}.k2{fill:#eb6834}.k3{fill:#6250d6}.k4{fill:#1baf7a}.k5{fill:#e87ba4}
+.fast{fill:#2a78d6}.slow{fill:#e34948}.bg{fill:#fff}
+@media (prefers-color-scheme:dark){.bg{fill:#1a1a19}text{fill:#c3c2b7}.t,.v{fill:#f0efec}.g{stroke:#2c2c2a}.ref{stroke:#f0efec}
+.k1{fill:#3987e5}.k2{fill:#d95926}.k3{fill:#9085e9}.k4{fill:#199e70}.k5{fill:#d55181}.fast{fill:#3987e5}.slow{fill:#e66767}}
+</style>
+<rect class="bg" width="100%" height="100%"/>
+<text class="t" x="20" y="26">Attention tuning knobs — speed relative to the best value</text>
+<text class="st" x="20" y="44">Cell = best median time / this value’s median time; 1.00 is the winner, lower is slower. Median ms over 5 rounds.</text>
+<text class="t" x="20" y="66">rows  (BENCH_ATTN_ROWS_R)</text>
+<text x="209.0" y="186" text-anchor="start" transform="rotate(-35 209.0 186)">swa128_prefill_512</text>
+<text x="327.0" y="186" text-anchor="start" transform="rotate(-35 327.0 186)">swa128_prefill_2048</text>
+<text x="445.0" y="186" text-anchor="start" transform="rotate(-35 445.0 186)">swa128_prefill_4096</text>
+<text x="563.0" y="186" text-anchor="start" transform="rotate(-35 563.0 186)">swa256_prefill_2048</text>
+<text x="681.0" y="186" text-anchor="start" transform="rotate(-35 681.0 186)">global512_prefill_1024</text>
+<text x="144" y="205" text-anchor="end">rows = 8</text>
+<rect x="150" y="192" width="116" height="16" rx="2" fill="#f0efec"/><text x="208.0" y="204" text-anchor="middle" style="fill:#0b0b0b;font-size:10px">1.00</text>
+<rect x="268" y="192" width="116" height="16" rx="2" fill="#f0efec"/><text x="326.0" y="204" text-anchor="middle" style="fill:#0b0b0b;font-size:10px">1.00</text>
+<rect x="386" y="192" width="116" height="16" rx="2" fill="#f0efec"/><text x="444.0" y="204" text-anchor="middle" style="fill:#0b0b0b;font-size:10px">1.00</text>
+<rect x="504" y="192" width="116" height="16" rx="2" fill="#e88785"/><text x="562.0" y="204" text-anchor="middle" style="fill:#ffffff;font-size:10px">0.65</text>
+<rect x="622" y="192" width="116" height="16" rx="2" fill="#e34948"/><text x="680.0" y="204" text-anchor="middle" style="fill:#ffffff;font-size:10px">0.24</text>
+<text x="144" y="223" text-anchor="end">rows = 16</text>
+<rect x="150" y="210" width="116" height="16" rx="2" fill="#edc9c7"/><text x="208.0" y="222" text-anchor="middle" style="fill:#0b0b0b;font-size:10px">0.85</text>
+<rect x="268" y="210" width="116" height="16" rx="2" fill="#e9908f"/><text x="326.0" y="222" text-anchor="middle" style="fill:#0b0b0b;font-size:10px">0.67</text>
+<rect x="386" y="210" width="116" height="16" rx="2" fill="#e77c7a"/><text x="444.0" y="222" text-anchor="middle" style="fill:#ffffff;font-size:10px">0.62</text>
+<rect x="504" y="210" width="116" height="16" rx="2" fill="#f0efec"/><text x="562.0" y="222" text-anchor="middle" style="fill:#0b0b0b;font-size:10px">1.00</text>
+<rect x="622" y="210" width="116" height="16" rx="2" fill="#e78180"/><text x="680.0" y="222" text-anchor="middle" style="fill:#ffffff;font-size:10px">0.63</text>
+<text x="144" y="241" text-anchor="end">rows = 32</text>
+<rect x="150" y="228" width="116" height="16" rx="2" fill="#e88a88"/><text x="208.0" y="240" text-anchor="middle" style="fill:#0b0b0b;font-size:10px">0.66</text>
+<rect x="268" y="228" width="116" height="16" rx="2" fill="#e55e5d"/><text x="326.0" y="240" text-anchor="middle" style="fill:#ffffff;font-size:10px">0.55</text>
+<rect x="386" y="228" width="116" height="16" rx="2" fill="#e45453"/><text x="444.0" y="240" text-anchor="middle" style="fill:#ffffff;font-size:10px">0.52</text>
+<rect x="504" y="228" width="116" height="16" rx="2" fill="#eed4d1"/><text x="562.0" y="240" text-anchor="middle" style="fill:#0b0b0b;font-size:10px">0.89</text>
+<rect x="622" y="228" width="116" height="16" rx="2" fill="#f0efec"/><text x="680.0" y="240" text-anchor="middle" style="fill:#0b0b0b;font-size:10px">1.00</text>
+<text class="t" x="20" y="274">rows-g  (BENCH_ATTN_ROWS_SGT)</text>
+<text x="209.0" y="394" text-anchor="start" transform="rotate(-35 209.0 394)">swa128_prefill_512</text>
+<text x="327.0" y="394" text-anchor="start" transform="rotate(-35 327.0 394)">swa128_prefill_2048</text>
+<text x="445.0" y="394" text-anchor="start" transform="rotate(-35 445.0 394)">swa128_prefill_4096</text>
+<text x="563.0" y="394" text-anchor="start" transform="rotate(-35 563.0 394)">swa256_prefill_2048</text>
+<text x="681.0" y="394" text-anchor="start" transform="rotate(-35 681.0 394)">global512_prefill_1024</text>
+<text x="144" y="413" text-anchor="end">rows-g = 8</text>
+<rect x="150" y="400" width="116" height="16" rx="2" fill="#f0efec"/><text x="208.0" y="412" text-anchor="middle" style="fill:#0b0b0b;font-size:10px">1.00</text>
+<rect x="268" y="400" width="116" height="16" rx="2" fill="#f0efec"/><text x="326.0" y="412" text-anchor="middle" style="fill:#0b0b0b;font-size:10px">1.00</text>
+<rect x="386" y="400" width="116" height="16" rx="2" fill="#f0efec"/><text x="444.0" y="412" text-anchor="middle" style="fill:#0b0b0b;font-size:10px">1.00</text>
+<rect x="504" y="400" width="116" height="16" rx="2" fill="#efe1de"/><text x="562.0" y="412" text-anchor="middle" style="fill:#0b0b0b;font-size:10px">0.94</text>
+<rect x="622" y="400" width="116" height="16" rx="2" fill="#ecc0bd"/><text x="680.0" y="412" text-anchor="middle" style="fill:#0b0b0b;font-size:10px">0.82</text>
+<text x="144" y="431" text-anchor="end">rows-g = 16</text>
+<rect x="150" y="418" width="116" height="16" rx="2" fill="#efe0dd"/><text x="208.0" y="430" text-anchor="middle" style="fill:#0b0b0b;font-size:10px">0.94</text>
+<rect x="268" y="418" width="116" height="16" rx="2" fill="#eed4d1"/><text x="326.0" y="430" text-anchor="middle" style="fill:#0b0b0b;font-size:10px">0.89</text>
+<rect x="386" y="418" width="116" height="16" rx="2" fill="#ecbbb9"/><text x="444.0" y="430" text-anchor="middle" style="fill:#0b0b0b;font-size:10px">0.81</text>
+<rect x="504" y="418" width="116" height="16" rx="2" fill="#edcac7"/><text x="562.0" y="430" text-anchor="middle" style="fill:#0b0b0b;font-size:10px">0.86</text>
+<rect x="622" y="418" width="116" height="16" rx="2" fill="#ecc2bf"/><text x="680.0" y="430" text-anchor="middle" style="fill:#0b0b0b;font-size:10px">0.83</text>
+<text x="144" y="449" text-anchor="end">rows-g = 32</text>
+<rect x="150" y="436" width="116" height="16" rx="2" fill="#eed0cd"/><text x="208.0" y="448" text-anchor="middle" style="fill:#0b0b0b;font-size:10px">0.88</text>
+<rect x="268" y="436" width="116" height="16" rx="2" fill="#efe2e0"/><text x="326.0" y="448" text-anchor="middle" style="fill:#0b0b0b;font-size:10px">0.95</text>
+<rect x="386" y="436" width="116" height="16" rx="2" fill="#efdfdc"/><text x="444.0" y="448" text-anchor="middle" style="fill:#0b0b0b;font-size:10px">0.94</text>
+<rect x="504" y="436" width="116" height="16" rx="2" fill="#f0efec"/><text x="562.0" y="448" text-anchor="middle" style="fill:#0b0b0b;font-size:10px">1.00</text>
+<rect x="622" y="436" width="116" height="16" rx="2" fill="#f0efec"/><text x="680.0" y="448" text-anchor="middle" style="fill:#0b0b0b;font-size:10px">1.00</text>
+<text class="t" x="20" y="482">decode  (BENCH_ATTN_DECODE_CHUNK)</text>
+<text x="209.0" y="589" text-anchor="start" transform="rotate(-35 209.0 589)">swa128_decode_1k</text>
+<text x="327.0" y="589" text-anchor="start" transform="rotate(-35 327.0 589)">swa128_decode_4k</text>
+<text x="445.0" y="589" text-anchor="start" transform="rotate(-35 445.0 589)">swa128_decode_b8_4k</text>
+<text x="563.0" y="589" text-anchor="start" transform="rotate(-35 563.0 589)">swa256_decode_4k</text>
+<text x="681.0" y="589" text-anchor="start" transform="rotate(-35 681.0 589)">global512_decode_4k</text>
+<text x="144" y="608" text-anchor="end">decode = 64</text>
+<rect x="150" y="595" width="116" height="16" rx="2" fill="#edcdca"/><text x="208.0" y="607" text-anchor="middle" style="fill:#0b0b0b;font-size:10px">0.87</text>
+<rect x="268" y="595" width="116" height="16" rx="2" fill="#e99795"/><text x="326.0" y="607" text-anchor="middle" style="fill:#0b0b0b;font-size:10px">0.69</text>
+<rect x="386" y="595" width="116" height="16" rx="2" fill="#edc7c4"/><text x="444.0" y="607" text-anchor="middle" style="fill:#0b0b0b;font-size:10px">0.85</text>
+<rect x="504" y="595" width="116" height="16" rx="2" fill="#ecc1bf"/><text x="562.0" y="607" text-anchor="middle" style="fill:#0b0b0b;font-size:10px">0.83</text>
+<rect x="622" y="595" width="116" height="16" rx="2" fill="#edc6c3"/><text x="680.0" y="607" text-anchor="middle" style="fill:#0b0b0b;font-size:10px">0.84</text>
+<text x="144" y="626" text-anchor="end">decode = 128</text>
+<rect x="150" y="613" width="116" height="16" rx="2" fill="#f0efec"/><text x="208.0" y="625" text-anchor="middle" style="fill:#0b0b0b;font-size:10px">1.00</text>
+<rect x="268" y="613" width="116" height="16" rx="2" fill="#efdedb"/><text x="326.0" y="625" text-anchor="middle" style="fill:#0b0b0b;font-size:10px">0.93</text>
+<rect x="386" y="613" width="116" height="16" rx="2" fill="#efe6e4"/><text x="444.0" y="625" text-anchor="middle" style="fill:#0b0b0b;font-size:10px">0.96</text>
+<rect x="504" y="613" width="116" height="16" rx="2" fill="#f0efec"/><text x="562.0" y="625" text-anchor="middle" style="fill:#0b0b0b;font-size:10px">1.00</text>
+<rect x="622" y="613" width="116" height="16" rx="2" fill="#f0efec"/><text x="680.0" y="625" text-anchor="middle" style="fill:#0b0b0b;font-size:10px">1.00</text>
+<text x="144" y="644" text-anchor="end">decode = 256</text>
+<rect x="150" y="631" width="116" height="16" rx="2" fill="#efe0dd"/><text x="208.0" y="643" text-anchor="middle" style="fill:#0b0b0b;font-size:10px">0.94</text>
+<rect x="268" y="631" width="116" height="16" rx="2" fill="#f0efec"/><text x="326.0" y="643" text-anchor="middle" style="fill:#0b0b0b;font-size:10px">1.00</text>
+<rect x="386" y="631" width="116" height="16" rx="2" fill="#f0efec"/><text x="444.0" y="643" text-anchor="middle" style="fill:#0b0b0b;font-size:10px">1.00</text>
+<rect x="504" y="631" width="116" height="16" rx="2" fill="#ecb6b3"/><text x="562.0" y="643" text-anchor="middle" style="fill:#0b0b0b;font-size:10px">0.79</text>
+<rect x="622" y="631" width="116" height="16" rx="2" fill="#efe5e2"/><text x="680.0" y="643" text-anchor="middle" style="fill:#0b0b0b;font-size:10px">0.96</text>
+<text class="t" x="20" y="677">decode-r  (BENCH_ATTN_DECODE_R)</text>
+<text x="209.0" y="784" text-anchor="start" transform="rotate(-35 209.0 784)">swa128_decode_1k</text>
+<text x="327.0" y="784" text-anchor="start" transform="rotate(-35 327.0 784)">swa128_decode_4k</text>
+<text x="445.0" y="784" text-anchor="start" transform="rotate(-35 445.0 784)">swa128_decode_b8_4k</text>
+<text x="563.0" y="784" text-anchor="start" transform="rotate(-35 563.0 784)">swa256_decode_4k</text>
+<text x="681.0" y="784" text-anchor="start" transform="rotate(-35 681.0 784)">global512_decode_4k</text>
+<text x="144" y="803" text-anchor="end">decode-r = 8</text>
+<rect x="150" y="790" width="116" height="16" rx="2" fill="#f0efec"/><text x="208.0" y="802" text-anchor="middle" style="fill:#0b0b0b;font-size:10px">1.00</text>
+<rect x="268" y="790" width="116" height="16" rx="2" fill="#f0efec"/><text x="326.0" y="802" text-anchor="middle" style="fill:#0b0b0b;font-size:10px">1.00</text>
+<rect x="386" y="790" width="116" height="16" rx="2" fill="#f0efec"/><text x="444.0" y="802" text-anchor="middle" style="fill:#0b0b0b;font-size:10px">1.00</text>
+<rect x="504" y="790" width="116" height="16" rx="2" fill="#e34948"/><text x="562.0" y="802" text-anchor="middle" style="fill:#ffffff;font-size:10px">0.43</text>
+<rect x="622" y="790" width="116" height="16" rx="2" fill="#e34948"/><text x="680.0" y="802" text-anchor="middle" style="fill:#ffffff;font-size:10px">0.45</text>
+<text x="144" y="821" text-anchor="end">decode-r = 16</text>
+<rect x="150" y="808" width="116" height="16" rx="2" fill="#e99795"/><text x="208.0" y="820" text-anchor="middle" style="fill:#0b0b0b;font-size:10px">0.69</text>
+<rect x="268" y="808" width="116" height="16" rx="2" fill="#eaa3a1"/><text x="326.0" y="820" text-anchor="middle" style="fill:#0b0b0b;font-size:10px">0.73</text>
+<rect x="386" y="808" width="116" height="16" rx="2" fill="#f0e9e6"/><text x="444.0" y="820" text-anchor="middle" style="fill:#0b0b0b;font-size:10px">0.98</text>
+<rect x="504" y="808" width="116" height="16" rx="2" fill="#f0efec"/><text x="562.0" y="820" text-anchor="middle" style="fill:#0b0b0b;font-size:10px">1.00</text>
+<rect x="622" y="808" width="116" height="16" rx="2" fill="#e66a68"/><text x="680.0" y="820" text-anchor="middle" style="fill:#ffffff;font-size:10px">0.57</text>
+<text x="144" y="839" text-anchor="end">decode-r = 32</text>
+<rect x="150" y="826" width="116" height="16" rx="2" fill="#e34948"/><text x="208.0" y="838" text-anchor="middle" style="fill:#ffffff;font-size:10px">0.43</text>
+<rect x="268" y="826" width="116" height="16" rx="2" fill="#e34948"/><text x="326.0" y="838" text-anchor="middle" style="fill:#ffffff;font-size:10px">0.47</text>
+<rect x="386" y="826" width="116" height="16" rx="2" fill="#eed3d0"/><text x="444.0" y="838" text-anchor="middle" style="fill:#0b0b0b;font-size:10px">0.89</text>
+<rect x="504" y="826" width="116" height="16" rx="2" fill="#ebb0ae"/><text x="562.0" y="838" text-anchor="middle" style="fill:#0b0b0b;font-size:10px">0.77</text>
+<rect x="622" y="826" width="116" height="16" rx="2" fill="#f0efec"/><text x="680.0" y="838" text-anchor="middle" style="fill:#0b0b0b;font-size:10px">1.00</text>
+<text class="t" x="20" y="872">decode-sgs  (BENCH_ATTN_DECODE_SGS)</text>
+<text x="209.0" y="997" text-anchor="start" transform="rotate(-35 209.0 997)">swa128_decode_1k</text>
+<text x="327.0" y="997" text-anchor="start" transform="rotate(-35 327.0 997)">swa128_decode_4k</text>
+<text x="445.0" y="997" text-anchor="start" transform="rotate(-35 445.0 997)">swa128_decode_b8_4k</text>
+<text x="563.0" y="997" text-anchor="start" transform="rotate(-35 563.0 997)">swa256_decode_4k</text>
+<text x="681.0" y="997" text-anchor="start" transform="rotate(-35 681.0 997)">global512_decode_4k</text>
+<text x="799.0" y="997" text-anchor="start" transform="rotate(-35 799.0 997)">global512_decode_4k_mha</text>
+<text x="144" y="1016" text-anchor="end">decode-sgs = one</text>
+<rect x="150" y="1003" width="116" height="16" rx="2" fill="#efe1de"/><text x="208.0" y="1015" text-anchor="middle" style="fill:#0b0b0b;font-size:10px">0.94</text>
+<rect x="268" y="1003" width="116" height="16" rx="2" fill="#eed6d3"/><text x="326.0" y="1015" text-anchor="middle" style="fill:#0b0b0b;font-size:10px">0.90</text>
+<rect x="386" y="1003" width="116" height="16" rx="2" fill="#ebb1af"/><text x="444.0" y="1015" text-anchor="middle" style="fill:#0b0b0b;font-size:10px">0.77</text>
+<rect x="504" y="1003" width="116" height="16" rx="2" fill="#efe3e0"/><text x="562.0" y="1015" text-anchor="middle" style="fill:#0b0b0b;font-size:10px">0.95</text>
+<rect x="622" y="1003" width="116" height="16" rx="2" fill="#edcecb"/><text x="680.0" y="1015" text-anchor="middle" style="fill:#0b0b0b;font-size:10px">0.87</text>
+<rect x="740" y="1003" width="116" height="16" rx="2" fill="#efe2df"/><text x="798.0" y="1015" text-anchor="middle" style="fill:#0b0b0b;font-size:10px">0.95</text>
+<text x="144" y="1034" text-anchor="end">decode-sgs = group</text>
+<rect x="150" y="1021" width="116" height="16" rx="2" fill="#f0efec"/><text x="208.0" y="1033" text-anchor="middle" style="fill:#0b0b0b;font-size:10px">1.00</text>
+<rect x="268" y="1021" width="116" height="16" rx="2" fill="#f0efec"/><text x="326.0" y="1033" text-anchor="middle" style="fill:#0b0b0b;font-size:10px">1.00</text>
+<rect x="386" y="1021" width="116" height="16" rx="2" fill="#f0efec"/><text x="444.0" y="1033" text-anchor="middle" style="fill:#0b0b0b;font-size:10px">1.00</text>
+<rect x="504" y="1021" width="116" height="16" rx="2" fill="#f0efec"/><text x="562.0" y="1033" text-anchor="middle" style="fill:#0b0b0b;font-size:10px">1.00</text>
+<rect x="622" y="1021" width="116" height="16" rx="2" fill="#f0ece9"/><text x="680.0" y="1033" text-anchor="middle" style="fill:#0b0b0b;font-size:10px">0.99</text>
+<rect x="740" y="1021" width="116" height="16" rx="2" fill="#f0ece9"/><text x="798.0" y="1033" text-anchor="middle" style="fill:#0b0b0b;font-size:10px">0.99</text>
+<text x="144" y="1052" text-anchor="end">decode-sgs = all</text>
+<rect x="150" y="1039" width="116" height="16" rx="2" fill="#e77876"/><text x="208.0" y="1051" text-anchor="middle" style="fill:#ffffff;font-size:10px">0.61</text>
+<rect x="268" y="1039" width="116" height="16" rx="2" fill="#e9908e"/><text x="326.0" y="1051" text-anchor="middle" style="fill:#0b0b0b;font-size:10px">0.67</text>
+<rect x="386" y="1039" width="116" height="16" rx="2" fill="#f0eeeb"/><text x="444.0" y="1051" text-anchor="middle" style="fill:#0b0b0b;font-size:10px">1.00</text>
+<rect x="504" y="1039" width="116" height="16" rx="2" fill="#e9908e"/><text x="562.0" y="1051" text-anchor="middle" style="fill:#0b0b0b;font-size:10px">0.67</text>
+<rect x="622" y="1039" width="116" height="16" rx="2" fill="#f0efec"/><text x="680.0" y="1051" text-anchor="middle" style="fill:#0b0b0b;font-size:10px">1.00</text>
+<rect x="740" y="1039" width="116" height="16" rx="2" fill="#f0efec"/><text x="798.0" y="1051" text-anchor="middle" style="fill:#0b0b0b;font-size:10px">1.00</text>
+<text class="t" x="20" y="1085">reduce-w  (BENCH_ATTN_REDUCE_W)</text>
+<text x="209.0" y="1192" text-anchor="start" transform="rotate(-35 209.0 1192)">swa128_decode_1k</text>
+<text x="327.0" y="1192" text-anchor="start" transform="rotate(-35 327.0 1192)">swa128_decode_4k</text>
+<text x="445.0" y="1192" text-anchor="start" transform="rotate(-35 445.0 1192)">swa128_decode_b8_4k</text>
+<text x="563.0" y="1192" text-anchor="start" transform="rotate(-35 563.0 1192)">swa256_decode_4k</text>
+<text x="681.0" y="1192" text-anchor="start" transform="rotate(-35 681.0 1192)">global512_decode_4k</text>
+<text x="144" y="1211" text-anchor="end">reduce-w = 32</text>
+<rect x="150" y="1198" width="116" height="16" rx="2" fill="#efdedc"/><text x="208.0" y="1210" text-anchor="middle" style="fill:#0b0b0b;font-size:10px">0.93</text>
+<rect x="268" y="1198" width="116" height="16" rx="2" fill="#eed5d3"/><text x="326.0" y="1210" text-anchor="middle" style="fill:#0b0b0b;font-size:10px">0.90</text>
+<rect x="386" y="1198" width="116" height="16" rx="2" fill="#f0eeeb"/><text x="444.0" y="1210" text-anchor="middle" style="fill:#0b0b0b;font-size:10px">0.99</text>
+<rect x="504" y="1198" width="116" height="16" rx="2" fill="#e99391"/><text x="562.0" y="1210" text-anchor="middle" style="fill:#0b0b0b;font-size:10px">0.68</text>
+<rect x="622" y="1198" width="116" height="16" rx="2" fill="#e99290"/><text x="680.0" y="1210" text-anchor="middle" style="fill:#0b0b0b;font-size:10px">0.68</text>
+<text x="144" y="1229" text-anchor="end">reduce-w = 128</text>
+<rect x="150" y="1216" width="116" height="16" rx="2" fill="#efe6e4"/><text x="208.0" y="1228" text-anchor="middle" style="fill:#0b0b0b;font-size:10px">0.96</text>
+<rect x="268" y="1216" width="116" height="16" rx="2" fill="#efe4e1"/><text x="326.0" y="1228" text-anchor="middle" style="fill:#0b0b0b;font-size:10px">0.95</text>
+<rect x="386" y="1216" width="116" height="16" rx="2" fill="#f0eeeb"/><text x="444.0" y="1228" text-anchor="middle" style="fill:#0b0b0b;font-size:10px">0.99</text>
+<rect x="504" y="1216" width="116" height="16" rx="2" fill="#efe8e5"/><text x="562.0" y="1228" text-anchor="middle" style="fill:#0b0b0b;font-size:10px">0.97</text>
+<rect x="622" y="1216" width="116" height="16" rx="2" fill="#efe7e5"/><text x="680.0" y="1228" text-anchor="middle" style="fill:#0b0b0b;font-size:10px">0.97</text>
+<text x="144" y="1247" text-anchor="end">reduce-w = 256</text>
+<rect x="150" y="1234" width="116" height="16" rx="2" fill="#f0efec"/><text x="208.0" y="1246" text-anchor="middle" style="fill:#0b0b0b;font-size:10px">1.00</text>
+<rect x="268" y="1234" width="116" height="16" rx="2" fill="#f0efec"/><text x="326.0" y="1246" text-anchor="middle" style="fill:#0b0b0b;font-size:10px">1.00</text>
+<rect x="386" y="1234" width="116" height="16" rx="2" fill="#f0efec"/><text x="444.0" y="1246" text-anchor="middle" style="fill:#0b0b0b;font-size:10px">1.00</text>
+<rect x="504" y="1234" width="116" height="16" rx="2" fill="#f0efec"/><text x="562.0" y="1246" text-anchor="middle" style="fill:#0b0b0b;font-size:10px">1.00</text>
+<rect x="622" y="1234" width="116" height="16" rx="2" fill="#f0efec"/><text x="680.0" y="1246" text-anchor="middle" style="fill:#0b0b0b;font-size:10px">1.00</text>
+<text class="t" x="20" y="1280">Dispatch split: per-call time at batched = 1 / at batched = 32 (blue: batching 32 is faster per call)</text>
+<line class="g" x1="328.1472629363386" x2="328.1472629363386" y1="1286" y2="1386"/><text x="328.1472629363386" y="1397" text-anchor="middle">0.5×</text>
+<line class="g" x1="384.51781034907094" x2="384.51781034907094" y1="1286" y2="1386"/><text x="384.51781034907094" y="1397" text-anchor="middle">1×</text>
+<line class="g" x1="440.88835776180315" x2="440.88835776180315" y1="1286" y2="1386"/><text x="440.88835776180315" y="1397" text-anchor="middle">2×</text>
+<line class="g" x1="497.25890517453547" x2="497.25890517453547" y1="1286" y2="1386"/><text x="497.25890517453547" y="1397" text-anchor="middle">4×</text>
+<line class="g" x1="553.6294525872677" x2="553.6294525872677" y1="1286" y2="1386"/><text x="553.6294525872677" y="1397" text-anchor="middle">8×</text>
+<line class="g" x1="610" x2="610" y1="1286" y2="1386"/><text x="610" y="1397" text-anchor="middle">16×</text>
+<text x="304" y="1298" text-anchor="end">swa128_decode_1k (kernel share 0.09)</text>
+<rect class="fast" x="384.51781034907094" y="1289" width="196.4282987155441" height="11" rx="2"/>
+<text class="v" x="584.946109064615" y="1298" text-anchor="start">11.19×</text>
+<text x="304" y="1312" text-anchor="end">swa128_decode_4k (kernel share 0.10)</text>
+<rect class="fast" x="384.51781034907094" y="1303" width="183.3982584748942" height="11" rx="2"/>
+<text class="v" x="571.9160688239651" y="1312" text-anchor="start">9.54×</text>
+<text x="304" y="1326" text-anchor="end">swa256_decode_4k (kernel share 0.15)</text>
+<rect class="fast" x="384.51781034907094" y="1317" width="155.00416917216808" height="11" rx="2"/>
+<text class="v" x="543.521979521239" y="1326" text-anchor="start">6.73×</text>
+<text x="304" y="1340" text-anchor="end">global512_decode_4k (kernel share 0.40)</text>
+<rect class="fast" x="384.51781034907094" y="1331" width="73.53140396372203" height="11" rx="2"/>
+<text class="v" x="462.04921431279297" y="1340" text-anchor="start">2.47×</text>
+<text x="304" y="1354" text-anchor="end">swa128_prefill_2048 (kernel share 1.19)</text>
+<rect class="slow" x="370.2764511356163" y="1345" width="14.241359213454643" height="11" rx="2"/>
+<text class="v" x="366.2764511356163" y="1354" text-anchor="end">0.84×</text>
+<text x="304" y="1368" text-anchor="end">swa256_prefill_2048 (kernel share 1.38)</text>
+<rect class="slow" x="358.23285192848203" y="1359" width="26.284958420588907" height="11" rx="2"/>
+<text class="v" x="354.23285192848203" y="1368" text-anchor="end">0.72×</text>
+<text x="304" y="1382" text-anchor="end">global512_prefill_1024 (kernel share 1.46)</text>
+<rect class="slow" x="353.5727194552356" y="1373" width="30.945090893835356" height="11" rx="2"/>
+<text class="v" x="349.5727194552356" y="1382" text-anchor="end">0.68×</text>
+<line class="ref" x1="384.51781034907094" x2="384.51781034907094" y1="1286" y2="1386"/>
+</svg>

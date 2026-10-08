@@ -1,0 +1,159 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 540" role="img"><title>GEMM sweep, GFLOP/s by runtime (single unpaired run, M5 Pro)</title><style>
+text{font-family:-apple-system,Helvetica,Arial,sans-serif;font-size:11px;fill:#52514e}
+.t{font-size:13px;font-weight:600;fill:#0b0b0b}.st{font-size:11px;fill:#52514e}.g{stroke:#e1e0d9;stroke-width:1}
+.ref{stroke:#0b0b0b;stroke-width:1.2;stroke-dasharray:4 3}.lim{stroke:#d03b3b;stroke-width:1.2;stroke-dasharray:4 3}
+.v{fill:#0b0b0b;font-size:10px}.k0{fill:#898781}.k1{fill:#2a78d6}.k2{fill:#eb6834}.k3{fill:#6250d6}.k4{fill:#1baf7a}.k5{fill:#e87ba4}
+.fast{fill:#2a78d6}.slow{fill:#e34948}.bg{fill:#fff}
+@media (prefers-color-scheme:dark){.bg{fill:#1a1a19}text{fill:#c3c2b7}.t,.v{fill:#f0efec}.g{stroke:#2c2c2a}.ref{stroke:#f0efec}
+.k1{fill:#3987e5}.k2{fill:#d95926}.k3{fill:#9085e9}.k4{fill:#199e70}.k5{fill:#d55181}.fast{fill:#3987e5}.slow{fill:#e66767}}
+</style>
+<rect class="bg" width="100%" height="100%"/>
+<text class="t" x="20" y="26">GEMM sweep — GFLOP/s, higher is better</text>
+<text class="st" x="20" y="44">One run per lane, not paired, so not a tessl-vs-PyTorch claim (see the paired figure).</text>
+<text class="st" x="20" y="58">Inferred to predate the cooperative-destination bf16 kernel: the file is undated, tessl bf16 here is ~11k GFLOP/s,</text>
+<text class="st" x="20" y="72">matching the pre-landing 8–12k baseline in bf16_tile_tune_FINDINGS.md, not the ~26k of the landed kernel.</text>
+<rect class="k1" x="20" y="82" width="10" height="10" rx="2"/><text x="34" y="91">tessl tensorops</text>
+<rect class="k0" x="157" y="82" width="10" height="10" rx="2"/><text x="171" y="91">tessl simdgroup</text>
+<rect class="k2" x="294" y="82" width="10" height="10" rx="2"/><text x="308" y="91">PyTorch MPS</text>
+<rect class="k3" x="403" y="82" width="10" height="10" rx="2"/><text x="417" y="91">MLX</text>
+<text class="t" x="60" y="114">f32</text>
+<line class="g" x1="60" x2="720" y1="286.0" y2="286.0"/><text x="54" y="290.0" text-anchor="end">0</text>
+<line class="g" x1="60" x2="720" y1="248.5" y2="248.5"/><text x="54" y="252.5" text-anchor="end">2000</text>
+<line class="g" x1="60" x2="720" y1="211.0" y2="211.0"/><text x="54" y="215.0" text-anchor="end">4000</text>
+<line class="g" x1="60" x2="720" y1="173.5" y2="173.5"/><text x="54" y="177.5" text-anchor="end">6000</text>
+<line class="g" x1="60" x2="720" y1="136.0" y2="136.0"/><text x="54" y="140.0" text-anchor="end">8000</text>
+<text x="101.25" y="300" text-anchor="middle">square_512</text>
+<rect class="k1" x="61.0" y="273.2112625" width="19.125" height="12.788737500000002" rx="2"/>
+<text class="v" x="70.5625" y="270.2112625" text-anchor="middle">0.7k</text>
+<rect class="k0" x="81.125" y="278.51899375" width="19.125" height="7.48100625" rx="2"/>
+<text class="v" x="90.6875" y="275.51899375" text-anchor="middle">0.4k</text>
+<rect class="k2" x="101.25" y="274.7616075776794" width="19.125" height="11.238392422320626" rx="2"/>
+<text class="v" x="110.8125" y="271.7616075776794" text-anchor="middle">0.6k</text>
+<rect class="k3" x="121.375" y="274.1427241701517" width="19.125" height="11.85727582984827" rx="2"/>
+<text class="v" x="130.9375" y="271.1427241701517" text-anchor="middle">0.6k</text>
+<text x="183.75" y="300" text-anchor="middle">square_1024</text>
+<rect class="k1" x="143.5" y="211.62968125" width="19.125" height="74.37031875" rx="2"/>
+<text class="v" x="153.0625" y="208.62968125" text-anchor="middle">4.0k</text>
+<rect class="k0" x="163.625" y="249.360475" width="19.125" height="36.639525" rx="2"/>
+<text class="v" x="173.1875" y="246.360475" text-anchor="middle">2.0k</text>
+<rect class="k2" x="183.75" y="211.50929110727262" width="19.125" height="74.49070889272738" rx="2"/>
+<text class="v" x="193.3125" y="208.50929110727262" text-anchor="middle">4.0k</text>
+<rect class="k3" x="203.875" y="209.15177571542887" width="19.125" height="76.84822428457112" rx="2"/>
+<text class="v" x="213.4375" y="206.15177571542887" text-anchor="middle">4.1k</text>
+<text x="266.25" y="300" text-anchor="middle">square_2048</text>
+<rect class="k1" x="226.0" y="162.14044375" width="19.125" height="123.85955625" rx="2"/>
+<text class="v" x="235.5625" y="159.14044375" text-anchor="middle">6.6k</text>
+<rect class="k0" x="246.125" y="236.54873125" width="19.125" height="49.45126875" rx="2"/>
+<text class="v" x="255.6875" y="233.54873125" text-anchor="middle">2.6k</text>
+<rect class="k2" x="266.25" y="166.713753350943" width="19.125" height="119.286246649057" rx="2"/>
+<text class="v" x="275.8125" y="163.713753350943" text-anchor="middle">6.4k</text>
+<rect class="k3" x="286.375" y="162.19102221975083" width="19.125" height="123.80897778024917" rx="2"/>
+<text class="v" x="295.9375" y="159.19102221975083" text-anchor="middle">6.6k</text>
+<text x="348.75" y="300" text-anchor="middle">square_4096</text>
+<rect class="k1" x="308.5" y="167.66876875" width="19.125" height="118.33123125" rx="2"/>
+<text class="v" x="318.0625" y="164.66876875" text-anchor="middle">6.3k</text>
+<rect class="k0" x="328.625" y="241.3476625" width="19.125" height="44.6523375" rx="2"/>
+<text class="v" x="338.1875" y="238.3476625" text-anchor="middle">2.4k</text>
+<rect class="k2" x="348.75" y="158.55342537470597" width="19.125" height="127.44657462529405" rx="2"/>
+<text class="v" x="358.3125" y="155.55342537470597" text-anchor="middle">6.8k</text>
+<rect class="k3" x="368.875" y="162.0736962861986" width="19.125" height="123.92630371380139" rx="2"/>
+<text class="v" x="378.4375" y="159.0736962861986" text-anchor="middle">6.6k</text>
+<text x="431.25" y="300" text-anchor="middle">qkv_proj</text>
+<rect class="k1" x="391.0" y="202.384975" width="19.125" height="83.61502499999999" rx="2"/>
+<text class="v" x="400.5625" y="199.384975" text-anchor="middle">4.5k</text>
+<rect class="k0" x="411.125" y="248.5167625" width="19.125" height="37.4832375" rx="2"/>
+<text class="v" x="420.6875" y="245.5167625" text-anchor="middle">2.0k</text>
+<rect class="k2" x="431.25" y="200.57814954969055" width="19.125" height="85.42185045030945" rx="2"/>
+<text class="v" x="440.8125" y="197.57814954969055" text-anchor="middle">4.6k</text>
+<rect class="k3" x="451.375" y="198.9154168631669" width="19.125" height="87.08458313683309" rx="2"/>
+<text class="v" x="460.9375" y="195.9154168631669" text-anchor="middle">4.6k</text>
+<text x="513.75" y="300" text-anchor="middle">mlp_up</text>
+<rect class="k1" x="473.5" y="170.36813124999998" width="19.125" height="115.63186875000001" rx="2"/>
+<text class="v" x="483.0625" y="167.36813124999998" text-anchor="middle">6.2k</text>
+<rect class="k0" x="493.625" y="236.97443125" width="19.125" height="49.025568750000005" rx="2"/>
+<text class="v" x="503.1875" y="233.97443125" text-anchor="middle">2.6k</text>
+<rect class="k2" x="513.75" y="162.3568203191424" width="19.125" height="123.64317968085761" rx="2"/>
+<text class="v" x="523.3125" y="159.3568203191424" text-anchor="middle">6.6k</text>
+<rect class="k3" x="533.875" y="158.21397894434136" width="19.125" height="127.78602105565862" rx="2"/>
+<text class="v" x="543.4375" y="155.21397894434136" text-anchor="middle">6.8k</text>
+<text x="596.25" y="300" text-anchor="middle">mlp_down</text>
+<rect class="k1" x="556.0" y="162.29747500000002" width="19.125" height="123.702525" rx="2"/>
+<text class="v" x="565.5625" y="159.29747500000002" text-anchor="middle">6.6k</text>
+<rect class="k0" x="576.125" y="240.0664" width="19.125" height="45.9336" rx="2"/>
+<text class="v" x="585.6875" y="237.0664" text-anchor="middle">2.4k</text>
+<rect class="k2" x="596.25" y="164.86715460656802" width="19.125" height="121.13284539343199" rx="2"/>
+<text class="v" x="605.8125" y="161.86715460656802" text-anchor="middle">6.5k</text>
+<rect class="k3" x="616.375" y="164.66138868494062" width="19.125" height="121.33861131505937" rx="2"/>
+<text class="v" x="625.9375" y="161.66138868494062" text-anchor="middle">6.5k</text>
+<text x="678.75" y="300" text-anchor="middle">tall_k1024</text>
+<rect class="k1" x="638.5" y="166.4897125" width="19.125" height="119.51028749999999" rx="2"/>
+<text class="v" x="648.0625" y="163.4897125" text-anchor="middle">6.4k</text>
+<rect class="k0" x="658.625" y="235.61258125" width="19.125" height="50.38741875" rx="2"/>
+<text class="v" x="668.1875" y="232.61258125" text-anchor="middle">2.7k</text>
+<rect class="k2" x="678.75" y="160.40238964195214" width="19.125" height="125.59761035804787" rx="2"/>
+<text class="v" x="688.3125" y="157.40238964195214" text-anchor="middle">6.7k</text>
+<rect class="k3" x="698.875" y="160.59949510277585" width="19.125" height="125.40050489722415" rx="2"/>
+<text class="v" x="708.4375" y="157.59949510277585" text-anchor="middle">6.7k</text>
+<text class="t" x="60" y="328">bf16</text>
+<line class="g" x1="60" x2="720" y1="500.0" y2="500.0"/><text x="54" y="504.0" text-anchor="end">0</text>
+<line class="g" x1="60" x2="720" y1="462.5" y2="462.5"/><text x="54" y="466.5" text-anchor="end">7500</text>
+<line class="g" x1="60" x2="720" y1="425.0" y2="425.0"/><text x="54" y="429.0" text-anchor="end">15000</text>
+<line class="g" x1="60" x2="720" y1="387.5" y2="387.5"/><text x="54" y="391.5" text-anchor="end">22500</text>
+<line class="g" x1="60" x2="720" y1="350.0" y2="350.0"/><text x="54" y="354.0" text-anchor="end">30000</text>
+<text x="101.25" y="514" text-anchor="middle">square_512</text>
+<rect class="k1" x="66.75" y="494.826995" width="22" height="5.173005000000001" rx="2"/>
+<text class="v" x="77.75" y="491.826995" text-anchor="middle">1k</text>
+<rect class="k2" x="89.75" y="492.8417223466665" width="22" height="7.158277653333525" rx="2"/>
+<text class="v" x="100.75" y="489.8417223466665" text-anchor="middle">1k</text>
+<rect class="k3" x="112.75" y="494.76903226584903" width="22" height="5.2309677341509575" rx="2"/>
+<text class="v" x="123.75" y="491.76903226584903" text-anchor="middle">1k</text>
+<text x="183.75" y="514" text-anchor="middle">square_1024</text>
+<rect class="k1" x="149.25" y="470.48473" width="22" height="29.515269999999997" rx="2"/>
+<text class="v" x="160.25" y="467.48473" text-anchor="middle">6k</text>
+<rect class="k2" x="172.25" y="457.86496392716333" width="22" height="42.1350360728367" rx="2"/>
+<text class="v" x="183.25" y="454.86496392716333" text-anchor="middle">8k</text>
+<rect class="k3" x="195.25" y="478.3283190971552" width="22" height="21.671680902844802" rx="2"/>
+<text class="v" x="206.25" y="475.3283190971552" text-anchor="middle">4k</text>
+<text x="266.25" y="514" text-anchor="middle">square_2048</text>
+<rect class="k1" x="231.75" y="444.736305" width="22" height="55.263695" rx="2"/>
+<text class="v" x="242.75" y="441.736305" text-anchor="middle">11k</text>
+<rect class="k2" x="254.75" y="389.67227398426365" width="22" height="110.32772601573636" rx="2"/>
+<text class="v" x="265.75" y="386.67227398426365" text-anchor="middle">22k</text>
+<rect class="k3" x="277.75" y="466.2306580411326" width="22" height="33.7693419588674" rx="2"/>
+<text class="v" x="288.75" y="463.2306580411326" text-anchor="middle">7k</text>
+<text x="348.75" y="514" text-anchor="middle">square_4096</text>
+<rect class="k1" x="314.25" y="447.350895" width="22" height="52.649105" rx="2"/>
+<text class="v" x="325.25" y="444.350895" text-anchor="middle">11k</text>
+<rect class="k2" x="337.25" y="372.82904538892296" width="22" height="127.17095461107706" rx="2"/>
+<text class="v" x="348.25" y="369.82904538892296" text-anchor="middle">25k</text>
+<rect class="k3" x="360.25" y="465.05293241117045" width="22" height="34.947067588829555" rx="2"/>
+<text class="v" x="371.25" y="462.05293241117045" text-anchor="middle">7k</text>
+<text x="431.25" y="514" text-anchor="middle">qkv_proj</text>
+<rect class="k1" x="396.75" y="468.875405" width="22" height="31.124595" rx="2"/>
+<text class="v" x="407.75" y="465.875405" text-anchor="middle">6k</text>
+<rect class="k2" x="419.75" y="452.56318947997966" width="22" height="47.436810520020344" rx="2"/>
+<text class="v" x="430.75" y="449.56318947997966" text-anchor="middle">9k</text>
+<rect class="k3" x="442.75" y="476.4262155480304" width="22" height="23.573784451969598" rx="2"/>
+<text class="v" x="453.75" y="473.4262155480304" text-anchor="middle">5k</text>
+<text x="513.75" y="514" text-anchor="middle">mlp_up</text>
+<rect class="k1" x="479.25" y="444.1601" width="22" height="55.8399" rx="2"/>
+<text class="v" x="490.25" y="441.1601" text-anchor="middle">11k</text>
+<rect class="k2" x="502.25" y="366.849463842458" width="22" height="133.150536157542" rx="2"/>
+<text class="v" x="513.25" y="363.849463842458" text-anchor="middle">27k</text>
+<rect class="k3" x="525.25" y="465.51791297111754" width="22" height="34.48208702888245" rx="2"/>
+<text class="v" x="536.25" y="462.51791297111754" text-anchor="middle">7k</text>
+<text x="596.25" y="514" text-anchor="middle">mlp_down</text>
+<rect class="k1" x="561.75" y="440.5438" width="22" height="59.4562" rx="2"/>
+<text class="v" x="572.75" y="437.5438" text-anchor="middle">12k</text>
+<rect class="k2" x="584.75" y="383.9909073043157" width="22" height="116.00909269568426" rx="2"/>
+<text class="v" x="595.75" y="380.9909073043157" text-anchor="middle">23k</text>
+<rect class="k3" x="607.75" y="466.86503024802977" width="22" height="33.13496975197025" rx="2"/>
+<text class="v" x="618.75" y="463.86503024802977" text-anchor="middle">7k</text>
+<text x="678.75" y="514" text-anchor="middle">tall_k1024</text>
+<rect class="k1" x="644.25" y="443.785845" width="22" height="56.214155" rx="2"/>
+<text class="v" x="655.25" y="440.785845" text-anchor="middle">11k</text>
+<rect class="k2" x="667.25" y="369.2925324833046" width="22" height="130.7074675166954" rx="2"/>
+<text class="v" x="678.25" y="366.2925324833046" text-anchor="middle">26k</text>
+<rect class="k3" x="690.25" y="465.0726963845691" width="22" height="34.927303615430894" rx="2"/>
+<text class="v" x="701.25" y="462.0726963845691" text-anchor="middle">7k</text>
+</svg>

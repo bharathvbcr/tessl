@@ -1,0 +1,76 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 800 378" role="img"><title>Attention speed against PyTorch MPS and MLX, M5 Pro</title><style>
+text{font-family:-apple-system,Helvetica,Arial,sans-serif;font-size:11px;fill:#52514e}
+.t{font-size:13px;font-weight:600;fill:#0b0b0b}.st{font-size:11px;fill:#52514e}.g{stroke:#e1e0d9;stroke-width:1}
+.ref{stroke:#0b0b0b;stroke-width:1.2;stroke-dasharray:4 3}.lim{stroke:#d03b3b;stroke-width:1.2;stroke-dasharray:4 3}
+.v{fill:#0b0b0b;font-size:10px}.k0{fill:#898781}.k1{fill:#2a78d6}.k2{fill:#eb6834}.k3{fill:#6250d6}.k4{fill:#1baf7a}.k5{fill:#e87ba4}
+.fast{fill:#2a78d6}.slow{fill:#e34948}.bg{fill:#fff}
+@media (prefers-color-scheme:dark){.bg{fill:#1a1a19}text{fill:#c3c2b7}.t,.v{fill:#f0efec}.g{stroke:#2c2c2a}.ref{stroke:#f0efec}
+.k1{fill:#3987e5}.k2{fill:#d95926}.k3{fill:#9085e9}.k4{fill:#199e70}.k5{fill:#d55181}.fast{fill:#3987e5}.slow{fill:#e66767}}
+</style>
+<rect class="bg" width="100%" height="100%"/>
+<text class="t" x="20" y="26">Attention — tessl speedup over PyTorch MPS and MLX</text>
+<text class="st" x="20" y="44">The files store tessl_ms / other_ms (bench/attn_paired.py:130), so speedup = its inverse; blue = tessl faster, red = slower.</text>
+<text class="st" x="20" y="58">Geometric mean over each file’s configs. The files time different tessl implementations, so the rows are a history, not repeats.</text>
+<text class="t" x="20" y="80">Geomean speedup per result file</text>
+<line class="g" x1="463.2437008665245" x2="463.2437008665245" y1="86" y2="340"/><text x="463.2437008665245" y="351" text-anchor="middle">0.5×</text>
+<line class="g" x1="502.703084055437" x2="502.703084055437" y1="86" y2="340"/><text x="502.703084055437" y="351" text-anchor="middle">1×</text>
+<line class="g" x1="542.1624672443497" x2="542.1624672443497" y1="86" y2="340"/><text x="542.1624672443497" y="351" text-anchor="middle">2×</text>
+<line class="g" x1="581.6218504332621" x2="581.6218504332621" y1="86" y2="340"/><text x="581.6218504332621" y="351" text-anchor="middle">4×</text>
+<line class="g" x1="621.0812336221748" x2="621.0812336221748" y1="86" y2="340"/><text x="621.0812336221748" y="351" text-anchor="middle">8×</text>
+<line class="g" x1="660.5406168110874" x2="660.5406168110874" y1="86" y2="340"/><text x="660.5406168110874" y="351" text-anchor="middle">16×</text>
+<text x="274" y="98" text-anchor="end">first run, impl not recorded · vs torch</text>
+<rect class="slow" x="366.0402301750025" y="89" width="136.6628538804345" height="11" rx="2"/>
+<text class="v" x="362.0402301750025" y="98" text-anchor="end">0.09×</text>
+<text x="274" y="112" text-anchor="end">first run, impl not recorded · vs mlx</text>
+<rect class="slow" x="330.6319118915537" y="103" width="172.07117216388326" height="11" rx="2"/>
+<text class="v" x="326.6319118915537" y="112" text-anchor="end">0.05×</text>
+<text x="274" y="126" text-anchor="end">rows kernel · vs torch</text>
+<rect class="fast" x="502.703084055437" y="117" width="3.421344367375184" height="11" rx="2"/>
+<text class="v" x="510.1244284228122" y="126" text-anchor="start">1.06×</text>
+<text x="274" y="140" text-anchor="end">rows kernel · vs mlx</text>
+<rect class="slow" x="468.9497811302106" y="131" width="33.753302925226365" height="11" rx="2"/>
+<text class="v" x="464.9497811302106" y="140" text-anchor="end">0.55×</text>
+<text x="274" y="154" text-anchor="end">decode kernel v1 · vs torch</text>
+<rect class="fast" x="502.703084055437" y="145" width="32.404217711404044" height="11" rx="2"/>
+<text class="v" x="539.107301766841" y="154" text-anchor="start">1.77×</text>
+<text x="274" y="168" text-anchor="end">decode kernel v1 · vs mlx</text>
+<rect class="slow" x="471.1480126793398" y="159" width="31.555071376097203" height="11" rx="2"/>
+<text class="v" x="467.1480126793398" y="168" text-anchor="end">0.57×</text>
+<text x="274" y="182" text-anchor="end">routed, run a · vs torch</text>
+<rect class="fast" x="502.703084055437" y="173" width="24.957394297806445" height="11" rx="2"/>
+<text class="v" x="531.6604783532434" y="182" text-anchor="start">1.55×</text>
+<text x="274" y="196" text-anchor="end">routed, run a · vs mlx</text>
+<rect class="slow" x="489.7187799107837" y="187" width="12.984304144653265" height="11" rx="2"/>
+<text class="v" x="485.7187799107837" y="196" text-anchor="end">0.80×</text>
+<text x="274" y="210" text-anchor="end">routed, run b · vs torch</text>
+<rect class="fast" x="502.703084055437" y="201" width="26.404385152055966" height="11" rx="2"/>
+<text class="v" x="533.107469207493" y="210" text-anchor="start">1.59×</text>
+<text x="274" y="224" text-anchor="end">routed, run b · vs mlx</text>
+<rect class="slow" x="493.1924295659274" y="215" width="9.51065448950959" height="11" rx="2"/>
+<text class="v" x="489.1924295659274" y="224" text-anchor="end">0.85×</text>
+<text x="274" y="238" text-anchor="end">routed, run c · vs torch</text>
+<rect class="fast" x="502.703084055437" y="229" width="26.876814923278403" height="11" rx="2"/>
+<text class="v" x="533.5798989787154" y="238" text-anchor="start">1.60×</text>
+<text x="274" y="252" text-anchor="end">routed, run c · vs mlx</text>
+<rect class="slow" x="494.74690122664583" y="243" width="7.956182828791157" height="11" rx="2"/>
+<text class="v" x="490.74690122664583" y="252" text-anchor="end">0.87×</text>
+<text x="274" y="266" text-anchor="end">decode kernel, run a · vs torch</text>
+<rect class="fast" x="502.703084055437" y="257" width="87.43158559186554" height="11" rx="2"/>
+<text class="v" x="594.1346696473025" y="266" text-anchor="start">4.65×</text>
+<text x="274" y="280" text-anchor="end">decode kernel, run a · vs mlx</text>
+<rect class="fast" x="502.703084055437" y="271" width="5.466322016521531" height="11" rx="2"/>
+<text class="v" x="512.1694060719585" y="280" text-anchor="start">1.10×</text>
+<text x="274" y="294" text-anchor="end">decode kernel, run b · vs torch</text>
+<rect class="fast" x="502.703084055437" y="285" width="85.01081942127973" height="11" rx="2"/>
+<text class="v" x="591.7139034767167" y="294" text-anchor="start">4.45×</text>
+<text x="274" y="308" text-anchor="end">decode kernel, run b · vs mlx</text>
+<rect class="fast" x="502.703084055437" y="299" width="1.9033086021386225" height="11" rx="2"/>
+<text class="v" x="508.6063926575756" y="308" text-anchor="start">1.03×</text>
+<text x="274" y="322" text-anchor="end">decode kernel, run c · vs torch</text>
+<rect class="fast" x="502.703084055437" y="313" width="85.69554466695547" height="11" rx="2"/>
+<text class="v" x="592.3986287223925" y="322" text-anchor="start">4.51×</text>
+<text x="274" y="336" text-anchor="end">decode kernel, run c · vs mlx</text>
+<rect class="fast" x="502.703084055437" y="327" width="1.983052996307265" height="11" rx="2"/>
+<text class="v" x="508.68613705174425" y="336" text-anchor="start">1.04×</text>
+<line class="ref" x1="502.703084055437" x2="502.703084055437" y1="86" y2="340"/>
+</svg>

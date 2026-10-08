@@ -1,0 +1,82 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 780 538" role="img"><title>Numerical accuracy of GEMM and attention lanes, M5 Pro</title><style>
+text{font-family:-apple-system,Helvetica,Arial,sans-serif;font-size:11px;fill:#52514e}
+.t{font-size:13px;font-weight:600;fill:#0b0b0b}.st{font-size:11px;fill:#52514e}.g{stroke:#e1e0d9;stroke-width:1}
+.ref{stroke:#0b0b0b;stroke-width:1.2;stroke-dasharray:4 3}.lim{stroke:#d03b3b;stroke-width:1.2;stroke-dasharray:4 3}
+.v{fill:#0b0b0b;font-size:10px}.k0{fill:#898781}.k1{fill:#2a78d6}.k2{fill:#eb6834}.k3{fill:#6250d6}.k4{fill:#1baf7a}.k5{fill:#e87ba4}
+.fast{fill:#2a78d6}.slow{fill:#e34948}.bg{fill:#fff}
+@media (prefers-color-scheme:dark){.bg{fill:#1a1a19}text{fill:#c3c2b7}.t,.v{fill:#f0efec}.g{stroke:#2c2c2a}.ref{stroke:#f0efec}
+.k1{fill:#3987e5}.k2{fill:#d95926}.k3{fill:#9085e9}.k4{fill:#199e70}.k5{fill:#d55181}.fast{fill:#3987e5}.slow{fill:#e66767}}
+</style>
+<rect class="bg" width="100%" height="100%"/>
+<text class="t" x="20" y="26">Accuracy — worst-case relative error, log axis</text>
+<text class="st" x="20" y="44">Not speed benchmarks: parity of each lane against a reference. Lower is better.</text>
+<text class="t" x="20" y="66">GEMM parity grid, worst cell (40 cells × 4 seeds per lane)</text>
+<line class="g" x1="270" x2="270" y1="72" y2="194"/><text x="270" y="205" text-anchor="middle">1e-7</text>
+<line class="g" x1="325.0" x2="325.0" y1="72" y2="194"/><text x="325.0" y="205" text-anchor="middle">1e-6</text>
+<line class="g" x1="380.0" x2="380.0" y1="72" y2="194"/><text x="380.0" y="205" text-anchor="middle">1e-5</text>
+<line class="g" x1="435.0" x2="435.0" y1="72" y2="194"/><text x="435.0" y="205" text-anchor="middle">1e-4</text>
+<line class="g" x1="490.0" x2="490.0" y1="72" y2="194"/><text x="490.0" y="205" text-anchor="middle">1e-3</text>
+<line class="g" x1="545.0" x2="545.0" y1="72" y2="194"/><text x="545.0" y="205" text-anchor="middle">1e-2</text>
+<line class="g" x1="600" x2="600" y1="72" y2="194"/><text x="600" y="205" text-anchor="middle">1e-1</text>
+<text x="264" y="85" text-anchor="end">tensorops-f32 → f32</text>
+<rect class="k1" x="270" y="75" width="93.95814092150363" height="12" rx="2"/><text class="v" x="367.9581409215036" y="85">5.11e-06</text>
+<text x="264" y="100" text-anchor="end">simdgroup-f32 → f32</text>
+<rect class="k1" x="270" y="90" width="93.95814092150363" height="12" rx="2"/><text class="v" x="367.9581409215036" y="100">5.11e-06</text>
+<text x="264" y="115" text-anchor="end">tensorops-bf16 → f32</text>
+<rect class="k1" x="270" y="105" width="260.58623585112343" height="12" rx="2"/><text class="v" x="534.5862358511234" y="115">5.47e-03</text>
+<text x="264" y="130" text-anchor="end">tensorops-tf32 → f32</text>
+<rect class="k1" x="270" y="120" width="229.95168104248313" height="12" rx="2"/><text class="v" x="503.95168104248313" y="130">1.52e-03</text>
+<text x="264" y="145" text-anchor="end">mlx-f32 → f32</text>
+<rect class="k1" x="270" y="135" width="93.95814092150363" height="12" rx="2"/><text class="v" x="367.9581409215036" y="145">5.11e-06</text>
+<text x="264" y="160" text-anchor="end">mlx-bf16 → bf16</text>
+<rect class="k1" x="270" y="150" width="266.96961361924673" height="12" rx="2"/><text class="v" x="540.9696136192467" y="160">7.14e-03</text>
+<text x="264" y="175" text-anchor="end">torch-mps-f32 → f32</text>
+<rect class="k1" x="270" y="165" width="93.95814092150363" height="12" rx="2"/><text class="v" x="367.9581409215036" y="175">5.11e-06</text>
+<text x="264" y="190" text-anchor="end">torch-mps-bf16 → bf16</text>
+<rect class="k1" x="270" y="180" width="266.96961361924673" height="12" rx="2"/><text class="v" x="540.9696136192467" y="190">7.14e-03</text>
+<text class="t" x="20" y="234">GEMM parity grid, median cell</text>
+<line class="g" x1="270" x2="270" y1="240" y2="362"/><text x="270" y="373" text-anchor="middle">1e-7</text>
+<line class="g" x1="325.0" x2="325.0" y1="240" y2="362"/><text x="325.0" y="373" text-anchor="middle">1e-6</text>
+<line class="g" x1="380.0" x2="380.0" y1="240" y2="362"/><text x="380.0" y="373" text-anchor="middle">1e-5</text>
+<line class="g" x1="435.0" x2="435.0" y1="240" y2="362"/><text x="435.0" y="373" text-anchor="middle">1e-4</text>
+<line class="g" x1="490.0" x2="490.0" y1="240" y2="362"/><text x="490.0" y="373" text-anchor="middle">1e-3</text>
+<line class="g" x1="545.0" x2="545.0" y1="240" y2="362"/><text x="545.0" y="373" text-anchor="middle">1e-2</text>
+<line class="g" x1="600" x2="600" y1="240" y2="362"/><text x="600" y="373" text-anchor="middle">1e-1</text>
+<text x="264" y="253" text-anchor="end">tensorops-f32 → f32</text>
+<rect class="k3" x="270" y="243" width="67.92976103649852" height="12" rx="2"/><text class="v" x="341.9297610364985" y="253">1.72e-06</text>
+<text x="264" y="268" text-anchor="end">simdgroup-f32 → f32</text>
+<rect class="k3" x="270" y="258" width="67.92976103649852" height="12" rx="2"/><text class="v" x="341.9297610364985" y="268">1.72e-06</text>
+<text x="264" y="283" text-anchor="end">tensorops-bf16 → f32</text>
+<rect class="k3" x="270" y="273" width="241.89529168634715" height="12" rx="2"/><text class="v" x="515.8952916863472" y="283">2.50e-03</text>
+<text x="264" y="298" text-anchor="end">tensorops-tf32 → f32</text>
+<rect class="k3" x="270" y="288" width="213.46130927174698" height="12" rx="2"/><text class="v" x="487.461309271747" y="298">7.61e-04</text>
+<text x="264" y="313" text-anchor="end">mlx-f32 → f32</text>
+<rect class="k3" x="270" y="303" width="67.92976103649852" height="12" rx="2"/><text class="v" x="341.9297610364985" y="313">1.72e-06</text>
+<text x="264" y="328" text-anchor="end">mlx-bf16 → bf16</text>
+<rect class="k3" x="270" y="318" width="252.53931624649204" height="12" rx="2"/><text class="v" x="526.539316246492" y="328">3.91e-03</text>
+<text x="264" y="343" text-anchor="end">torch-mps-f32 → f32</text>
+<rect class="k3" x="270" y="333" width="67.92976103649852" height="12" rx="2"/><text class="v" x="341.9297610364985" y="343">1.72e-06</text>
+<text x="264" y="358" text-anchor="end">torch-mps-bf16 → bf16</text>
+<rect class="k3" x="270" y="348" width="252.53931624649204" height="12" rx="2"/><text class="v" x="526.539316246492" y="358">3.91e-03</text>
+<text class="t" x="20" y="402">Attention parity, worst of 14 configs per lane (max relative error)</text>
+<line class="g" x1="270" x2="270" y1="408" y2="500"/><text x="270" y="511" text-anchor="middle">1e-8</text>
+<line class="g" x1="317.14285714285717" x2="317.14285714285717" y1="408" y2="500"/><text x="317.14285714285717" y="511" text-anchor="middle">1e-7</text>
+<line class="g" x1="364.2857142857143" x2="364.2857142857143" y1="408" y2="500"/><text x="364.2857142857143" y="511" text-anchor="middle">1e-6</text>
+<line class="g" x1="411.42857142857144" x2="411.42857142857144" y1="408" y2="500"/><text x="411.42857142857144" y="511" text-anchor="middle">1e-5</text>
+<line class="g" x1="458.57142857142856" x2="458.57142857142856" y1="408" y2="500"/><text x="458.57142857142856" y="511" text-anchor="middle">1e-4</text>
+<line class="g" x1="505.7142857142857" x2="505.7142857142857" y1="408" y2="500"/><text x="505.7142857142857" y="511" text-anchor="middle">1e-3</text>
+<line class="g" x1="552.8571428571429" x2="552.8571428571429" y1="408" y2="500"/><text x="552.8571428571429" y="511" text-anchor="middle">1e-2</text>
+<line class="g" x1="600" x2="600" y1="408" y2="500"/><text x="600" y="511" text-anchor="middle">1e-1</text>
+<text x="264" y="421" text-anchor="end">tessl-tiled</text>
+<rect class="k2" x="270" y="411" width="116.7464771195136" height="12" rx="2"/><text class="v" x="390.7464771195136" y="421">3.00e-06</text>
+<text x="264" y="436" text-anchor="end">tessl</text>
+<rect class="k2" x="270" y="426" width="72.58793638170653" height="12" rx="2"/><text class="v" x="346.5879363817065" y="436">3.47e-07</text>
+<text x="264" y="451" text-anchor="end">tessl-rows</text>
+<rect class="k2" x="270" y="441" width="115.43351712860351" height="12" rx="2"/><text class="v" x="389.4335171286035" y="451">2.81e-06</text>
+<text x="264" y="466" text-anchor="end">torch-mps</text>
+<rect class="k2" x="270" y="456" width="72.1228894587872" height="12" rx="2"/><text class="v" x="346.1228894587872" y="466">3.39e-07</text>
+<text x="264" y="481" text-anchor="end">mlx</text>
+<rect class="k2" x="270" y="471" width="86.15513793228888" height="12" rx="2"/><text class="v" x="360.1551379322889" y="481">6.72e-07</text>
+<text x="264" y="496" text-anchor="end">tessl-decode</text>
+<rect class="k2" x="270" y="486" width="72.58793638170653" height="12" rx="2"/><text class="v" x="346.5879363817065" y="496">3.47e-07</text>
+</svg>

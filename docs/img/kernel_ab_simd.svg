@@ -1,0 +1,153 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 780 760" role="img"><title>Kernel A/B ratios: SIMD-group rewrites, M5 Pro</title><style>
+text{font-family:-apple-system,Helvetica,Arial,sans-serif;font-size:11px;fill:#52514e}
+.t{font-size:13px;font-weight:600;fill:#0b0b0b}.st{font-size:11px;fill:#52514e}.g{stroke:#e1e0d9;stroke-width:1}
+.ref{stroke:#0b0b0b;stroke-width:1.2;stroke-dasharray:4 3}.lim{stroke:#d03b3b;stroke-width:1.2;stroke-dasharray:4 3}
+.v{fill:#0b0b0b;font-size:10px}.k0{fill:#898781}.k1{fill:#2a78d6}.k2{fill:#eb6834}.k3{fill:#6250d6}.k4{fill:#1baf7a}.k5{fill:#e87ba4}
+.fast{fill:#2a78d6}.slow{fill:#e34948}.bg{fill:#fff}
+@media (prefers-color-scheme:dark){.bg{fill:#1a1a19}text{fill:#c3c2b7}.t,.v{fill:#f0efec}.g{stroke:#2c2c2a}.ref{stroke:#f0efec}
+.k1{fill:#3987e5}.k2{fill:#d95926}.k3{fill:#9085e9}.k4{fill:#199e70}.k5{fill:#d55181}.fast{fill:#3987e5}.slow{fill:#e66767}}
+</style>
+<rect class="bg" width="100%" height="100%"/>
+<text class="t" x="20" y="26">SIMD-group rewrites — old time / new time</text>
+<text class="st" x="20" y="44">Paired in-process A/B, 6 order-balanced rounds, median. Blue = the new kernel is faster. Log axis; bars start at 1×.</text>
+<text class="t" x="20" y="66">rms_qkv_rope: one simdgroup per row</text>
+<line class="g" x1="288.1472629363386" x2="288.1472629363386" y1="72" y2="172"/><text x="288.1472629363386" y="183" text-anchor="middle">0.5×</text>
+<line class="g" x1="344.51781034907094" x2="344.51781034907094" y1="72" y2="172"/><text x="344.51781034907094" y="183" text-anchor="middle">1×</text>
+<line class="g" x1="400.88835776180315" x2="400.88835776180315" y1="72" y2="172"/><text x="400.88835776180315" y="183" text-anchor="middle">2×</text>
+<line class="g" x1="457.25890517453547" x2="457.25890517453547" y1="72" y2="172"/><text x="457.25890517453547" y="183" text-anchor="middle">4×</text>
+<line class="g" x1="513.6294525872677" x2="513.6294525872677" y1="72" y2="172"/><text x="513.6294525872677" y="183" text-anchor="middle">8×</text>
+<line class="g" x1="570" x2="570" y1="72" y2="172"/><text x="570" y="183" text-anchor="middle">16×</text>
+<text x="264" y="84" text-anchor="end">T=1 Hq=8 D=256</text>
+<rect class="fast" x="344.51781034907094" y="75" width="157.08196233811293" height="11" rx="2"/>
+<text class="v" x="505.5997726871839" y="84" text-anchor="start">6.90×</text>
+<text x="264" y="98" text-anchor="end">T=1 Hq=16 D=256</text>
+<rect class="fast" x="344.51781034907094" y="89" width="198.34175187535948" height="11" rx="2"/>
+<text class="v" x="546.8595622244304" y="98" text-anchor="start">11.46×</text>
+<text x="264" y="112" text-anchor="end">T=1 Hq=32 D=128</text>
+<rect class="fast" x="344.51781034907094" y="103" width="100.23859086557553" height="11" rx="2"/>
+<text class="v" x="448.7564012146465" y="112" text-anchor="start">3.43×</text>
+<text x="264" y="126" text-anchor="end">T=8 Hq=16 D=256</text>
+<rect class="fast" x="344.51781034907094" y="117" width="105.07123079403914" height="11" rx="2"/>
+<text class="v" x="453.5890411431101" y="126" text-anchor="start">3.64×</text>
+<text x="264" y="140" text-anchor="end">T=64 Hq=16 D=256</text>
+<rect class="fast" x="344.51781034907094" y="131" width="97.83233518114275" height="11" rx="2"/>
+<text class="v" x="446.3501455302137" y="140" text-anchor="start">3.33×</text>
+<text x="264" y="154" text-anchor="end">T=256 Hq=32 D=128</text>
+<rect class="fast" x="344.51781034907094" y="145" width="18.795278390486146" height="11" rx="2"/>
+<text class="v" x="367.3130887395571" y="154" text-anchor="start">1.26×</text>
+<text x="264" y="168" text-anchor="end">T=1024 Hq=16 D=256</text>
+<rect class="fast" x="344.51781034907094" y="159" width="43.6305965419599" height="11" rx="2"/>
+<text class="v" x="392.14840689103085" y="168" text-anchor="start">1.71×</text>
+<line class="ref" x1="344.51781034907094" x2="344.51781034907094" y1="72" y2="172"/>
+<text class="t" x="20" y="212">Softmax / row_sum / row_max (rows = 4096)</text>
+<line class="g" x1="288.1472629363386" x2="288.1472629363386" y1="218" y2="416"/><text x="288.1472629363386" y="427" text-anchor="middle">0.5×</text>
+<line class="g" x1="344.51781034907094" x2="344.51781034907094" y1="218" y2="416"/><text x="344.51781034907094" y="427" text-anchor="middle">1×</text>
+<line class="g" x1="400.88835776180315" x2="400.88835776180315" y1="218" y2="416"/><text x="400.88835776180315" y="427" text-anchor="middle">2×</text>
+<line class="g" x1="457.25890517453547" x2="457.25890517453547" y1="218" y2="416"/><text x="457.25890517453547" y="427" text-anchor="middle">4×</text>
+<line class="g" x1="513.6294525872677" x2="513.6294525872677" y1="218" y2="416"/><text x="513.6294525872677" y="427" text-anchor="middle">8×</text>
+<line class="g" x1="570" x2="570" y1="218" y2="416"/><text x="570" y="427" text-anchor="middle">16×</text>
+<text x="264" y="230" text-anchor="end">softmax cols=64</text>
+<rect class="fast" x="344.51781034907094" y="221" width="16.83553273773623" height="11" rx="2"/>
+<text class="v" x="365.3533430868072" y="230" text-anchor="start">1.23×</text>
+<text x="264" y="244" text-anchor="end">softmax cols=256</text>
+<rect class="fast" x="344.51781034907094" y="235" width="40.725805286535774" height="11" rx="2"/>
+<text class="v" x="389.2436156356067" y="244" text-anchor="start">1.65×</text>
+<text x="264" y="258" text-anchor="end">softmax cols=1024</text>
+<rect class="fast" x="344.51781034907094" y="249" width="68.44087990511696" height="11" rx="2"/>
+<text class="v" x="416.9586902541879" y="258" text-anchor="start">2.32×</text>
+<text x="264" y="272" text-anchor="end">softmax cols=4096</text>
+<rect class="fast" x="344.51781034907094" y="263" width="9.93941121507362" height="11" rx="2"/>
+<text class="v" x="358.45722156414456" y="272" text-anchor="start">1.13×</text>
+<text x="264" y="286" text-anchor="end">softmax cols=8192</text>
+<rect class="slow" x="342.87481488916325" y="277" width="1.642995459907695" height="11" rx="2"/>
+<text class="v" x="338.87481488916325" y="286" text-anchor="end">0.98×</text>
+<text x="264" y="300" text-anchor="end">softmax cols=16384</text>
+<rect class="fast" x="344.51781034907094" y="291" width="2.4038846437699704" height="11" rx="2"/>
+<text class="v" x="350.9216949928409" y="300" text-anchor="start">1.03×</text>
+<text x="264" y="314" text-anchor="end">row_sum cols=64</text>
+<rect class="fast" x="344.51781034907094" y="305" width="30.21759542872337" height="11" rx="2"/>
+<text class="v" x="378.7354057777943" y="314" text-anchor="start">1.45×</text>
+<text x="264" y="328" text-anchor="end">row_sum cols=256</text>
+<rect class="fast" x="344.51781034907094" y="319" width="55.5531987317695" height="11" rx="2"/>
+<text class="v" x="404.07100908084044" y="328" text-anchor="start">1.98×</text>
+<text x="264" y="342" text-anchor="end">row_sum cols=1024</text>
+<rect class="fast" x="344.51781034907094" y="333" width="119.56279922302792" height="11" rx="2"/>
+<text class="v" x="468.08060957209887" y="342" text-anchor="start">4.35×</text>
+<text x="264" y="356" text-anchor="end">row_sum cols=4096</text>
+<rect class="fast" x="344.51781034907094" y="347" width="3.967884945252365" height="11" rx="2"/>
+<text class="v" x="352.4856952943233" y="356" text-anchor="start">1.05×</text>
+<text x="264" y="370" text-anchor="end">row_max cols=64</text>
+<rect class="fast" x="344.51781034907094" y="361" width="27.942607666962033" height="11" rx="2"/>
+<text class="v" x="376.460418016033" y="370" text-anchor="start">1.41×</text>
+<text x="264" y="384" text-anchor="end">row_max cols=256</text>
+<rect class="fast" x="344.51781034907094" y="375" width="51.33849869812195" height="11" rx="2"/>
+<text class="v" x="399.8563090471929" y="384" text-anchor="start">1.88×</text>
+<text x="264" y="398" text-anchor="end">row_max cols=1024</text>
+<rect class="fast" x="344.51781034907094" y="389" width="119.56279922302792" height="11" rx="2"/>
+<text class="v" x="468.08060957209887" y="398" text-anchor="start">4.35×</text>
+<text x="264" y="412" text-anchor="end">row_max cols=4096</text>
+<rect class="slow" x="342.87481488916325" y="403" width="1.642995459907695" height="11" rx="2"/>
+<text class="v" x="338.87481488916325" y="412" text-anchor="end">0.98×</text>
+<line class="ref" x1="344.51781034907094" x2="344.51781034907094" y1="218" y2="416"/>
+<text class="t" x="20" y="456">rms_norm_f32</text>
+<line class="g" x1="288.1472629363386" x2="288.1472629363386" y1="462" y2="576"/><text x="288.1472629363386" y="587" text-anchor="middle">0.5×</text>
+<line class="g" x1="344.51781034907094" x2="344.51781034907094" y1="462" y2="576"/><text x="344.51781034907094" y="587" text-anchor="middle">1×</text>
+<line class="g" x1="400.88835776180315" x2="400.88835776180315" y1="462" y2="576"/><text x="400.88835776180315" y="587" text-anchor="middle">2×</text>
+<line class="g" x1="457.25890517453547" x2="457.25890517453547" y1="462" y2="576"/><text x="457.25890517453547" y="587" text-anchor="middle">4×</text>
+<line class="g" x1="513.6294525872677" x2="513.6294525872677" y1="462" y2="576"/><text x="513.6294525872677" y="587" text-anchor="middle">8×</text>
+<line class="g" x1="570" x2="570" y1="462" y2="576"/><text x="570" y="587" text-anchor="middle">16×</text>
+<text x="264" y="474" text-anchor="end">rms_norm rows=1 dim=2560</text>
+<rect class="fast" x="344.51781034907094" y="465" width="15.502297809926858" height="11" rx="2"/>
+<text class="v" x="364.0201081589978" y="474" text-anchor="start">1.21×</text>
+<text x="264" y="488" text-anchor="end">rms_norm rows=512 dim=2560</text>
+<rect class="fast" x="344.51781034907094" y="479" width="31.331660921664707" height="11" rx="2"/>
+<text class="v" x="379.84947127073565" y="488" text-anchor="start">1.47×</text>
+<text x="264" y="502" text-anchor="end">rms_norm rows=1 dim=4096</text>
+<rect class="fast" x="344.51781034907094" y="493" width="5.502374039224264" height="11" rx="2"/>
+<text class="v" x="354.0201843882952" y="502" text-anchor="start">1.07×</text>
+<text x="264" y="516" text-anchor="end">rms_norm rows=4096 dim=2560</text>
+<rect class="fast" x="344.51781034907094" y="507" width="2.4038846437699704" height="11" rx="2"/>
+<text class="v" x="350.9216949928409" y="516" text-anchor="start">1.03×</text>
+<text x="264" y="530" text-anchor="end">rms_norm rows=8 dim=4096</text>
+<rect class="fast" x="344.51781034907094" y="521" width="1.6104587484496165" height="11" rx="2"/>
+<text class="v" x="350.12826909752056" y="530" text-anchor="start">1.02×</text>
+<text x="264" y="544" text-anchor="end">rms_norm rows=4096 dim=4096</text>
+<rect class="fast" x="344.51781034907094" y="535" width="12.070332492384694" height="11" rx="2"/>
+<text class="v" x="360.58814284145564" y="544" text-anchor="start">1.16×</text>
+<text x="264" y="558" text-anchor="end">rms_norm rows=64 dim=2560</text>
+<rect class="fast" x="344.51781034907094" y="549" width="15.502297809926858" height="11" rx="2"/>
+<text class="v" x="364.0201081589978" y="558" text-anchor="start">1.21×</text>
+<text x="264" y="572" text-anchor="end">rms_norm rows=4096 dim=256</text>
+<rect class="fast" x="344.51781034907094" y="563" width="44.10479910536628" height="11" rx="2"/>
+<text class="v" x="392.6226094544372" y="572" text-anchor="start">1.72×</text>
+<line class="ref" x1="344.51781034907094" x2="344.51781034907094" y1="462" y2="576"/>
+<text class="t" x="20" y="616">gemv_q4: one simdgroup per four rows</text>
+<line class="g" x1="288.1472629363386" x2="288.1472629363386" y1="622" y2="722"/><text x="288.1472629363386" y="733" text-anchor="middle">0.5×</text>
+<line class="g" x1="344.51781034907094" x2="344.51781034907094" y1="622" y2="722"/><text x="344.51781034907094" y="733" text-anchor="middle">1×</text>
+<line class="g" x1="400.88835776180315" x2="400.88835776180315" y1="622" y2="722"/><text x="400.88835776180315" y="733" text-anchor="middle">2×</text>
+<line class="g" x1="457.25890517453547" x2="457.25890517453547" y1="622" y2="722"/><text x="457.25890517453547" y="733" text-anchor="middle">4×</text>
+<line class="g" x1="513.6294525872677" x2="513.6294525872677" y1="622" y2="722"/><text x="513.6294525872677" y="733" text-anchor="middle">8×</text>
+<line class="g" x1="570" x2="570" y1="622" y2="722"/><text x="570" y="733" text-anchor="middle">16×</text>
+<text x="264" y="634" text-anchor="end">gemv_q4 4096x4096 g64</text>
+<rect class="fast" x="344.51781034907094" y="625" width="41.70564255143245" height="11" rx="2"/>
+<text class="v" x="390.2234529005034" y="634" text-anchor="start">1.67×</text>
+<text x="264" y="648" text-anchor="end">gemv_q4 11008x4096 g64</text>
+<rect class="fast" x="344.51781034907094" y="639" width="41.21719958644093" height="11" rx="2"/>
+<text class="v" x="389.73500993551187" y="648" text-anchor="start">1.66×</text>
+<text x="264" y="662" text-anchor="end">gemv_q4 4096x4096 g32</text>
+<rect class="fast" x="344.51781034907094" y="653" width="49.146303724783934" height="11" rx="2"/>
+<text class="v" x="397.6641140738549" y="662" text-anchor="start">1.83×</text>
+<text x="264" y="676" text-anchor="end">gemv_q4 4096x4096 g128</text>
+<rect class="fast" x="344.51781034907094" y="667" width="41.21719958644093" height="11" rx="2"/>
+<text class="v" x="389.73500993551187" y="676" text-anchor="start">1.66×</text>
+<text x="264" y="690" text-anchor="end">gemv_q4 4096x4096 g8</text>
+<rect class="fast" x="344.51781034907094" y="681" width="38.22328447639359" height="11" rx="2"/>
+<text class="v" x="386.74109482546453" y="690" text-anchor="start">1.60×</text>
+<text x="264" y="704" text-anchor="end">gemv_q4 256x4096 g64</text>
+<rect class="fast" x="344.51781034907094" y="695" width="98.56171683437827" height="11" rx="2"/>
+<text class="v" x="447.0795271834492" y="704" text-anchor="start">3.36×</text>
+<text x="264" y="718" text-anchor="end">gemv_q4 4096x768 g64</text>
+<rect class="fast" x="344.51781034907094" y="709" width="23.19232269156612" height="11" rx="2"/>
+<text class="v" x="371.71013304063706" y="718" text-anchor="start">1.33×</text>
+<line class="ref" x1="344.51781034907094" x2="344.51781034907094" y1="622" y2="722"/>
+</svg>

@@ -1,0 +1,170 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 780 822" role="img"><title>Kernel A/B ratios: GEMM gating and micro-latches, M5 Pro</title><style>
+text{font-family:-apple-system,Helvetica,Arial,sans-serif;font-size:11px;fill:#52514e}
+.t{font-size:13px;font-weight:600;fill:#0b0b0b}.st{font-size:11px;fill:#52514e}.g{stroke:#e1e0d9;stroke-width:1}
+.ref{stroke:#0b0b0b;stroke-width:1.2;stroke-dasharray:4 3}.lim{stroke:#d03b3b;stroke-width:1.2;stroke-dasharray:4 3}
+.v{fill:#0b0b0b;font-size:10px}.k0{fill:#898781}.k1{fill:#2a78d6}.k2{fill:#eb6834}.k3{fill:#6250d6}.k4{fill:#1baf7a}.k5{fill:#e87ba4}
+.fast{fill:#2a78d6}.slow{fill:#e34948}.bg{fill:#fff}
+@media (prefers-color-scheme:dark){.bg{fill:#1a1a19}text{fill:#c3c2b7}.t,.v{fill:#f0efec}.g{stroke:#2c2c2a}.ref{stroke:#f0efec}
+.k1{fill:#3987e5}.k2{fill:#d95926}.k3{fill:#9085e9}.k4{fill:#199e70}.k5{fill:#d55181}.fast{fill:#3987e5}.slow{fill:#e66767}}
+</style>
+<rect class="bg" width="100%" height="100%"/>
+<text class="t" x="20" y="26">GEMM gating decisions and host micro-latches</text>
+<text class="t" x="20" y="52">bf16 NN at small M: 128×64 default tile time / 64×64 narrow tile time</text>
+<text class="st" x="20" y="70">Blue = the narrow 64×64 tile is faster. Selection landed as m ≤ 64 || n ≤ 512 || fewer than 64 default tiles.</text>
+<text x="169.0" y="118" text-anchor="start" transform="rotate(-35 169.0 118)">M=16</text>
+<text x="227.0" y="118" text-anchor="start" transform="rotate(-35 227.0 118)">M=32</text>
+<text x="285.0" y="118" text-anchor="start" transform="rotate(-35 285.0 118)">M=64</text>
+<text x="343.0" y="118" text-anchor="start" transform="rotate(-35 343.0 118)">M=128</text>
+<text x="401.0" y="118" text-anchor="start" transform="rotate(-35 401.0 118)">M=256</text>
+<text x="459.0" y="118" text-anchor="start" transform="rotate(-35 459.0 118)">M=512</text>
+<text x="517.0" y="118" text-anchor="start" transform="rotate(-35 517.0 118)">M=1024</text>
+<text x="134" y="137" text-anchor="end">N=3072 K=768</text>
+<rect x="140" y="124" width="56" height="16" rx="2" fill="#86afe0"/><text x="168.0" y="136" text-anchor="middle" style="fill:#0b0b0b;font-size:10px">1.56</text>
+<rect x="198" y="124" width="56" height="16" rx="2" fill="#98bae2"/><text x="226.0" y="136" text-anchor="middle" style="fill:#0b0b0b;font-size:10px">1.45</text>
+<rect x="256" y="124" width="56" height="16" rx="2" fill="#a2c0e3"/><text x="284.0" y="136" text-anchor="middle" style="fill:#0b0b0b;font-size:10px">1.39</text>
+<rect x="314" y="124" width="56" height="16" rx="2" fill="#d1dce9"/><text x="342.0" y="136" text-anchor="middle" style="fill:#0b0b0b;font-size:10px">1.14</text>
+<rect x="372" y="124" width="56" height="16" rx="2" fill="#f0efec"/><text x="400.0" y="136" text-anchor="middle" style="fill:#0b0b0b;font-size:10px">1.00</text>
+<rect x="430" y="124" width="56" height="16" rx="2" fill="#efe3e0"/><text x="458.0" y="136" text-anchor="middle" style="fill:#0b0b0b;font-size:10px">0.95</text>
+<rect x="488" y="124" width="56" height="16" rx="2" fill="#e2e7ea"/><text x="516.0" y="136" text-anchor="middle" style="fill:#0b0b0b;font-size:10px">1.06</text>
+<text x="134" y="155" text-anchor="end">N=768 K=3072</text>
+<rect x="140" y="142" width="56" height="16" rx="2" fill="#85aee0"/><text x="168.0" y="154" text-anchor="middle" style="fill:#0b0b0b;font-size:10px">1.57</text>
+<rect x="198" y="142" width="56" height="16" rx="2" fill="#a0bfe3"/><text x="226.0" y="154" text-anchor="middle" style="fill:#0b0b0b;font-size:10px">1.40</text>
+<rect x="256" y="142" width="56" height="16" rx="2" fill="#8cb3e1"/><text x="284.0" y="154" text-anchor="middle" style="fill:#0b0b0b;font-size:10px">1.52</text>
+<rect x="314" y="142" width="56" height="16" rx="2" fill="#a0bfe3"/><text x="342.0" y="154" text-anchor="middle" style="fill:#0b0b0b;font-size:10px">1.40</text>
+<rect x="372" y="142" width="56" height="16" rx="2" fill="#82ade0"/><text x="400.0" y="154" text-anchor="middle" style="fill:#0b0b0b;font-size:10px">1.59</text>
+<rect x="430" y="142" width="56" height="16" rx="2" fill="#aac5e4"/><text x="458.0" y="154" text-anchor="middle" style="fill:#0b0b0b;font-size:10px">1.34</text>
+<rect x="488" y="142" width="56" height="16" rx="2" fill="#efe3e0"/><text x="516.0" y="154" text-anchor="middle" style="fill:#0b0b0b;font-size:10px">0.95</text>
+<text x="134" y="173" text-anchor="end">N=4096 K=4096</text>
+<rect x="140" y="160" width="56" height="16" rx="2" fill="#98bae2"/><text x="168.0" y="172" text-anchor="middle" style="fill:#0b0b0b;font-size:10px">1.45</text>
+<rect x="198" y="160" width="56" height="16" rx="2" fill="#6ca0dd"/><text x="226.0" y="172" text-anchor="middle" style="fill:#ffffff;font-size:10px">1.74</text>
+<rect x="256" y="160" width="56" height="16" rx="2" fill="#a9c4e4"/><text x="284.0" y="172" text-anchor="middle" style="fill:#0b0b0b;font-size:10px">1.35</text>
+<rect x="314" y="160" width="56" height="16" rx="2" fill="#efdedb"/><text x="342.0" y="172" text-anchor="middle" style="fill:#0b0b0b;font-size:10px">0.93</text>
+<rect x="372" y="160" width="56" height="16" rx="2" fill="#ecbfbd"/><text x="400.0" y="172" text-anchor="middle" style="fill:#0b0b0b;font-size:10px">0.82</text>
+<rect x="430" y="160" width="56" height="16" rx="2" fill="#edc2c0"/><text x="458.0" y="172" text-anchor="middle" style="fill:#0b0b0b;font-size:10px">0.83</text>
+<rect x="488" y="160" width="56" height="16" rx="2" fill="#ecbfbd"/><text x="516.0" y="172" text-anchor="middle" style="fill:#0b0b0b;font-size:10px">0.82</text>
+<text x="134" y="191" text-anchor="end">N=2048 K=2048</text>
+<rect x="140" y="178" width="56" height="16" rx="2" fill="#9ebee3"/><text x="168.0" y="190" text-anchor="middle" style="fill:#0b0b0b;font-size:10px">1.41</text>
+<rect x="198" y="178" width="56" height="16" rx="2" fill="#86afe0"/><text x="226.0" y="190" text-anchor="middle" style="fill:#0b0b0b;font-size:10px">1.56</text>
+<rect x="256" y="178" width="56" height="16" rx="2" fill="#85aee0"/><text x="284.0" y="190" text-anchor="middle" style="fill:#0b0b0b;font-size:10px">1.57</text>
+<rect x="314" y="178" width="56" height="16" rx="2" fill="#c3d4e7"/><text x="342.0" y="190" text-anchor="middle" style="fill:#0b0b0b;font-size:10px">1.21</text>
+<rect x="372" y="178" width="56" height="16" rx="2" fill="#e4e8eb"/><text x="400.0" y="190" text-anchor="middle" style="fill:#0b0b0b;font-size:10px">1.05</text>
+<rect x="430" y="178" width="56" height="16" rx="2" fill="#f0edea"/><text x="458.0" y="190" text-anchor="middle" style="fill:#0b0b0b;font-size:10px">0.99</text>
+<rect x="488" y="178" width="56" height="16" rx="2" fill="#f0eae7"/><text x="516.0" y="190" text-anchor="middle" style="fill:#0b0b0b;font-size:10px">0.98</text>
+<text class="t" x="20" y="224">bf16 TN dW: split-K time / coop time (blue: coop kernel faster)</text>
+<line class="g" x1="288.1472629363386" x2="288.1472629363386" y1="230" y2="330"/><text x="288.1472629363386" y="341" text-anchor="middle">0.5×</text>
+<line class="g" x1="344.51781034907094" x2="344.51781034907094" y1="230" y2="330"/><text x="344.51781034907094" y="341" text-anchor="middle">1×</text>
+<line class="g" x1="400.88835776180315" x2="400.88835776180315" y1="230" y2="330"/><text x="400.88835776180315" y="341" text-anchor="middle">2×</text>
+<line class="g" x1="457.25890517453547" x2="457.25890517453547" y1="230" y2="330"/><text x="457.25890517453547" y="341" text-anchor="middle">4×</text>
+<line class="g" x1="513.6294525872677" x2="513.6294525872677" y1="230" y2="330"/><text x="513.6294525872677" y="341" text-anchor="middle">8×</text>
+<line class="g" x1="570" x2="570" y1="230" y2="330"/><text x="570" y="341" text-anchor="middle">16×</text>
+<text x="264" y="242" text-anchor="end">M=128 N=128 K=4096</text>
+<rect class="fast" x="344.51781034907094" y="233" width="4.738748623975141" height="11" rx="2"/>
+<text class="v" x="353.2565589730461" y="242" text-anchor="start">1.06×</text>
+<text x="264" y="256" text-anchor="end">M=128 N=384 K=4096</text>
+<rect class="fast" x="344.51781034907094" y="247" width="16.83553273773623" height="11" rx="2"/>
+<text class="v" x="365.3533430868072" y="256" text-anchor="start">1.23×</text>
+<text x="264" y="270" text-anchor="end">M=384 N=128 K=4096</text>
+<rect class="fast" x="344.51781034907094" y="261" width="9.93941121507362" height="11" rx="2"/>
+<text class="v" x="358.45722156414456" y="270" text-anchor="start">1.13×</text>
+<text x="264" y="284" text-anchor="end">M=64 N=64 K=8192</text>
+<rect class="fast" x="344.51781034907094" y="275" width="10.655940160387502" height="11" rx="2"/>
+<text class="v" x="359.17375050945844" y="284" text-anchor="start">1.14×</text>
+<text x="264" y="298" text-anchor="end">M=128 N=128 K=2048</text>
+<rect class="fast" x="344.51781034907094" y="289" width="3.967884945252365" height="11" rx="2"/>
+<text class="v" x="352.4856952943233" y="298" text-anchor="start">1.05×</text>
+<text x="264" y="312" text-anchor="end">M=128 N=384 K=16384</text>
+<rect class="slow" x="332.25206204170496" y="303" width="12.265748307365982" height="11" rx="2"/>
+<text class="v" x="328.25206204170496" y="312" text-anchor="end">0.86×</text>
+<text x="264" y="326" text-anchor="end">M=384 N=384 K=4096 (control)</text>
+<rect class="slow" x="340.3463570642247" y="317" width="4.171453284846223" height="11" rx="2"/>
+<text class="v" x="336.3463570642247" y="326" text-anchor="end">0.95×</text>
+<line class="ref" x1="344.51781034907094" x2="344.51781034907094" y1="230" y2="330"/>
+<text class="t" x="20" y="370">Same, K sweep at the gated shapes (split-K wins from K = 12288)</text>
+<line class="g" x1="288.1472629363386" x2="288.1472629363386" y1="376" y2="518"/><text x="288.1472629363386" y="529" text-anchor="middle">0.5×</text>
+<line class="g" x1="344.51781034907094" x2="344.51781034907094" y1="376" y2="518"/><text x="344.51781034907094" y="529" text-anchor="middle">1×</text>
+<line class="g" x1="400.88835776180315" x2="400.88835776180315" y1="376" y2="518"/><text x="400.88835776180315" y="529" text-anchor="middle">2×</text>
+<line class="g" x1="457.25890517453547" x2="457.25890517453547" y1="376" y2="518"/><text x="457.25890517453547" y="529" text-anchor="middle">4×</text>
+<line class="g" x1="513.6294525872677" x2="513.6294525872677" y1="376" y2="518"/><text x="513.6294525872677" y="529" text-anchor="middle">8×</text>
+<line class="g" x1="570" x2="570" y1="376" y2="518"/><text x="570" y="529" text-anchor="middle">16×</text>
+<text x="264" y="388" text-anchor="end">M=128 N=384 K=8192</text>
+<rect class="fast" x="344.51781034907094" y="379" width="7.008445028878157" height="11" rx="2"/>
+<text class="v" x="355.5262553779491" y="388" text-anchor="start">1.09×</text>
+<text x="264" y="402" text-anchor="end">M=128 N=384 K=12288</text>
+<rect class="slow" x="336.84794631764555" y="393" width="7.669864031425391" height="11" rx="2"/>
+<text class="v" x="332.84794631764555" y="402" text-anchor="end">0.91×</text>
+<text x="264" y="416" text-anchor="end">M=128 N=384 K=16384</text>
+<rect class="slow" x="329.3644625227796" y="407" width="15.153347826291338" height="11" rx="2"/>
+<text class="v" x="325.3644625227796" y="416" text-anchor="end">0.83×</text>
+<text x="264" y="430" text-anchor="end">M=128 N=384 K=32768</text>
+<rect class="slow" x="318.92379877284066" y="421" width="25.594011576230287" height="11" rx="2"/>
+<text class="v" x="314.92379877284066" y="430" text-anchor="end">0.73×</text>
+<text x="264" y="444" text-anchor="end">M=128 N=128 K=8192</text>
+<rect class="fast" x="344.51781034907094" y="435" width="7.008445028878157" height="11" rx="2"/>
+<text class="v" x="355.5262553779491" y="444" text-anchor="start">1.09×</text>
+<text x="264" y="458" text-anchor="end">M=128 N=128 K=16384</text>
+<rect class="slow" x="327.38081517721855" y="449" width="17.13699517185239" height="11" rx="2"/>
+<text class="v" x="323.38081517721855" y="458" text-anchor="end">0.81×</text>
+<text x="264" y="472" text-anchor="end">M=128 N=128 K=32768</text>
+<rect class="slow" x="315.5110389127509" y="463" width="29.006771436320037" height="11" rx="2"/>
+<text class="v" x="311.5110389127509" y="472" text-anchor="end">0.70×</text>
+<text x="264" y="486" text-anchor="end">M=64 N=64 K=16384</text>
+<rect class="slow" x="342.0406997904101" y="477" width="2.477110558660854" height="11" rx="2"/>
+<text class="v" x="338.0406997904101" y="486" text-anchor="end">0.97×</text>
+<text x="264" y="500" text-anchor="end">M=64 N=64 K=32768</text>
+<rect class="slow" x="321.121919317911" y="491" width="23.39589103115992" height="11" rx="2"/>
+<text class="v" x="317.121919317911" y="500" text-anchor="end">0.75×</text>
+<text x="264" y="514" text-anchor="end">M=384 N=128 K=16384</text>
+<rect class="slow" x="331.30087565228683" y="505" width="13.216934696784108" height="11" rx="2"/>
+<text class="v" x="327.30087565228683" y="514" text-anchor="end">0.85×</text>
+<line class="ref" x1="344.51781034907094" x2="344.51781034907094" y1="376" y2="518"/>
+<text class="t" x="20" y="558">Argument-table latch: time with the latch reset every scope / carried (blue: carrying is faster; round 0 was the 0.62 outlier)</text>
+<line class="g" x1="288.1472629363386" x2="288.1472629363386" y1="564" y2="664"/><text x="288.1472629363386" y="675" text-anchor="middle">0.5×</text>
+<line class="g" x1="344.51781034907094" x2="344.51781034907094" y1="564" y2="664"/><text x="344.51781034907094" y="675" text-anchor="middle">1×</text>
+<line class="g" x1="400.88835776180315" x2="400.88835776180315" y1="564" y2="664"/><text x="400.88835776180315" y="675" text-anchor="middle">2×</text>
+<line class="g" x1="457.25890517453547" x2="457.25890517453547" y1="564" y2="664"/><text x="457.25890517453547" y="675" text-anchor="middle">4×</text>
+<line class="g" x1="513.6294525872677" x2="513.6294525872677" y1="564" y2="664"/><text x="513.6294525872677" y="675" text-anchor="middle">8×</text>
+<line class="g" x1="570" x2="570" y1="564" y2="664"/><text x="570" y="675" text-anchor="middle">16×</text>
+<text x="264" y="576" text-anchor="end">round 0</text>
+<rect class="slow" x="305.37854102534243" y="567" width="39.13926932372851" height="11" rx="2"/>
+<text class="v" x="301.37854102534243" y="576" text-anchor="end">0.62×</text>
+<text x="264" y="590" text-anchor="end">round 1</text>
+<rect class="fast" x="344.51781034907094" y="581" width="2.087442574461363" height="11" rx="2"/>
+<text class="v" x="350.6052529235323" y="590" text-anchor="start">1.03×</text>
+<text x="264" y="604" text-anchor="end">round 2</text>
+<rect class="slow" x="342.29183383208766" y="595" width="2.2259765169832804" height="11" rx="2"/>
+<text class="v" x="338.29183383208766" y="604" text-anchor="end">0.97×</text>
+<text x="264" y="618" text-anchor="end">round 3</text>
+<rect class="fast" x="344.51781034907094" y="609" width="5.957131100440392" height="11" rx="2"/>
+<text class="v" x="354.47494144951133" y="618" text-anchor="start">1.08×</text>
+<text x="264" y="632" text-anchor="end">round 4</text>
+<rect class="slow" x="340.5173886923605" y="623" width="4.000421656710444" height="11" rx="2"/>
+<text class="v" x="336.5173886923605" y="632" text-anchor="end">0.95×</text>
+<text x="264" y="646" text-anchor="end">round 5</text>
+<rect class="fast" x="344.51781034907094" y="637" width="3.267804502639933" height="11" rx="2"/>
+<text class="v" x="351.7856148517109" y="646" text-anchor="start">1.04×</text>
+<text x="264" y="660" text-anchor="end">round 6</text>
+<rect class="fast" x="344.51781034907094" y="651" width="9.93941121507362" height="11" rx="2"/>
+<text class="v" x="358.45722156414456" y="660" text-anchor="start">1.13×</text>
+<line class="ref" x1="344.51781034907094" x2="344.51781034907094" y1="564" y2="664"/>
+<text class="t" x="20" y="704">Cooperative accumulator clear: time with the clear / without (blue: removing it is faster)</text>
+<line class="g" x1="288.1472629363386" x2="288.1472629363386" y1="710" y2="768"/><text x="288.1472629363386" y="779" text-anchor="middle">0.5×</text>
+<line class="g" x1="344.51781034907094" x2="344.51781034907094" y1="710" y2="768"/><text x="344.51781034907094" y="779" text-anchor="middle">1×</text>
+<line class="g" x1="400.88835776180315" x2="400.88835776180315" y1="710" y2="768"/><text x="400.88835776180315" y="779" text-anchor="middle">2×</text>
+<line class="g" x1="457.25890517453547" x2="457.25890517453547" y1="710" y2="768"/><text x="457.25890517453547" y="779" text-anchor="middle">4×</text>
+<line class="g" x1="513.6294525872677" x2="513.6294525872677" y1="710" y2="768"/><text x="513.6294525872677" y="779" text-anchor="middle">8×</text>
+<line class="g" x1="570" x2="570" y1="710" y2="768"/><text x="570" y="779" text-anchor="middle">16×</text>
+<text x="264" y="722" text-anchor="end">4096×4096×4096</text>
+<rect class="slow" x="344.1101628328621" y="713" width="1.5" height="11" rx="2"/>
+<text class="v" x="340.1101628328621" y="722" text-anchor="end">0.99×</text>
+<text x="264" y="736" text-anchor="end">8192×3072×768</text>
+<rect class="fast" x="344.51781034907094" y="727" width="1.5" height="11" rx="2"/>
+<text class="v" x="349.72863434147433" y="736" text-anchor="start">1.01×</text>
+<text x="264" y="750" text-anchor="end">2048×2048×2048</text>
+<rect class="slow" x="343.3712081446715" y="741" width="1.5" height="11" rx="2"/>
+<text class="v" x="339.3712081446715" y="750" text-anchor="end">0.99×</text>
+<text x="264" y="764" text-anchor="end">1024×4096×1024</text>
+<rect class="fast" x="344.51781034907094" y="755" width="1.5306887477385658" height="11" rx="2"/>
+<text class="v" x="350.0484990968095" y="764" text-anchor="start">1.02×</text>
+<line class="ref" x1="344.51781034907094" x2="344.51781034907094" y1="710" y2="768"/>
+<text class="st" x="20" y="796">Both are inside the noise; the notes keep them as structural cleanups, not speedups.</text>
+</svg>

@@ -1,0 +1,193 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 780 980" role="img"><title>Dispatch host overhead and decode, M5 Pro</title><style>
+text{font-family:-apple-system,Helvetica,Arial,sans-serif;font-size:11px;fill:#52514e}
+.t{font-size:13px;font-weight:600;fill:#0b0b0b}.st{font-size:11px;fill:#52514e}.g{stroke:#e1e0d9;stroke-width:1}
+.ref{stroke:#0b0b0b;stroke-width:1.2;stroke-dasharray:4 3}.lim{stroke:#d03b3b;stroke-width:1.2;stroke-dasharray:4 3}
+.v{fill:#0b0b0b;font-size:10px}.k0{fill:#898781}.k1{fill:#2a78d6}.k2{fill:#eb6834}.k3{fill:#6250d6}.k4{fill:#1baf7a}.k5{fill:#e87ba4}
+.fast{fill:#2a78d6}.slow{fill:#e34948}.bg{fill:#fff}
+@media (prefers-color-scheme:dark){.bg{fill:#1a1a19}text{fill:#c3c2b7}.t,.v{fill:#f0efec}.g{stroke:#2c2c2a}.ref{stroke:#f0efec}
+.k1{fill:#3987e5}.k2{fill:#d95926}.k3{fill:#9085e9}.k4{fill:#199e70}.k5{fill:#d55181}.fast{fill:#3987e5}.slow{fill:#e66767}}
+</style>
+<rect class="bg" width="100%" height="100%"/>
+<text class="t" x="20" y="26">Dispatch kernels and per-token decode — before / after</text>
+<text class="t" x="20" y="52">Batched dispatch time per kernel: min over rounds, before / after (blue: faster after)</text>
+<line class="g" x1="310" x2="310" y1="58" y2="424"/><text x="310" y="435" text-anchor="middle">0.5×</text>
+<line class="g" x1="460.0" x2="460.0" y1="58" y2="424"/><text x="460.0" y="435" text-anchor="middle">1×</text>
+<line class="g" x1="610" x2="610" y1="58" y2="424"/><text x="610" y="435" text-anchor="middle">2×</text>
+<text x="304" y="70" text-anchor="end">rms_norm_f32 1x4096</text>
+<rect class="slow" x="455.99416558549296" y="61" width="4.005834414507035" height="11" rx="2"/>
+<text class="v" x="451.99416558549296" y="70" text-anchor="end">0.98×</text>
+<text x="304" y="84" text-anchor="end">rms_norm_f32 512x4096</text>
+<rect class="fast" x="460.0" y="75" width="1.6350945593569577" height="11" rx="2"/>
+<text class="v" x="465.63509455935696" y="84" text-anchor="start">1.01×</text>
+<text x="304" y="98" text-anchor="end">rms_norm_f32 2048x4096</text>
+<rect class="fast" x="460.0" y="89" width="7.958786432587033" height="11" rx="2"/>
+<text class="v" x="471.95878643258703" y="98" text-anchor="start">1.04×</text>
+<text x="304" y="112" text-anchor="end">mlp_silu n=4096</text>
+<rect class="slow" x="449.7330455833228" y="103" width="10.266954416677208" height="11" rx="2"/>
+<text class="v" x="445.7330455833228" y="112" text-anchor="end">0.95×</text>
+<text x="304" y="126" text-anchor="end">mlp_gelu_tanh n=4096</text>
+<rect class="slow" x="443.9241328329561" y="117" width="16.075867167043896" height="11" rx="2"/>
+<text class="v" x="439.9241328329561" y="126" text-anchor="end">0.93×</text>
+<text x="304" y="140" text-anchor="end">mlp_silu n=1048576</text>
+<rect class="slow" x="459.9927362840932" y="131" width="1.5" height="11" rx="2"/>
+<text class="v" x="455.9927362840932" y="140" text-anchor="end">1.00×</text>
+<text x="304" y="154" text-anchor="end">mlp_gelu_tanh n=1048576</text>
+<rect class="slow" x="457.84302266596046" y="145" width="2.1569773340395386" height="11" rx="2"/>
+<text class="v" x="453.84302266596046" y="154" text-anchor="end">0.99×</text>
+<text x="304" y="168" text-anchor="end">mlp_silu n=8388608</text>
+<rect class="fast" x="460.0" y="159" width="12.534262917767023" height="11" rx="2"/>
+<text class="v" x="476.534262917767" y="168" text-anchor="start">1.06×</text>
+<text x="304" y="182" text-anchor="end">mlp_gelu_tanh n=8388608</text>
+<rect class="slow" x="442.7272607769257" y="173" width="17.272739223074325" height="11" rx="2"/>
+<text class="v" x="438.7272607769257" y="182" text-anchor="end">0.92×</text>
+<text x="304" y="196" text-anchor="end">softmax_rows_f32 32x1024</text>
+<rect class="slow" x="451.4540991749192" y="187" width="8.545900825080821" height="11" rx="2"/>
+<text class="v" x="447.4540991749192" y="196" text-anchor="end">0.96×</text>
+<text x="304" y="210" text-anchor="end">row_sum_f32 32x1024</text>
+<rect class="slow" x="456.9201910525497" y="201" width="3.079808947450317" height="11" rx="2"/>
+<text class="v" x="452.9201910525497" y="210" text-anchor="end">0.99×</text>
+<text x="304" y="224" text-anchor="end">row_max_f32 32x1024</text>
+<rect class="slow" x="458.49606761994727" y="215" width="1.5039323800527313" height="11" rx="2"/>
+<text class="v" x="454.49606761994727" y="224" text-anchor="end">0.99×</text>
+<text x="304" y="238" text-anchor="end">softmax_rows_f32 512x4096</text>
+<rect class="slow" x="459.2608532266296" y="229" width="1.5" height="11" rx="2"/>
+<text class="v" x="455.2608532266296" y="238" text-anchor="end">1.00×</text>
+<text x="304" y="252" text-anchor="end">row_sum_f32 512x4096</text>
+<rect class="fast" x="460.0" y="243" width="2.788958958010994" height="11" rx="2"/>
+<text class="v" x="466.788958958011" y="252" text-anchor="start">1.01×</text>
+<text x="304" y="266" text-anchor="end">row_max_f32 512x4096</text>
+<rect class="fast" x="460.0" y="257" width="4.497652494270824" height="11" rx="2"/>
+<text class="v" x="468.4976524942708" y="266" text-anchor="start">1.02×</text>
+<text x="304" y="280" text-anchor="end">softmax_rows_f32 2048x8192</text>
+<rect class="slow" x="454.8510775146773" y="271" width="5.148922485322714" height="11" rx="2"/>
+<text class="v" x="450.8510775146773" y="280" text-anchor="end">0.98×</text>
+<text x="304" y="294" text-anchor="end">row_sum_f32 2048x8192</text>
+<rect class="slow" x="446.77126916769697" y="285" width="13.228730832303029" height="11" rx="2"/>
+<text class="v" x="442.77126916769697" y="294" text-anchor="end">0.94×</text>
+<text x="304" y="308" text-anchor="end">row_max_f32 2048x8192</text>
+<rect class="slow" x="455.75573101861244" y="299" width="4.244268981387563" height="11" rx="2"/>
+<text class="v" x="451.75573101861244" y="308" text-anchor="end">0.98×</text>
+<text x="304" y="322" text-anchor="end">gemv_q8 4096x4096</text>
+<rect class="fast" x="460.0" y="313" width="1.5" height="11" rx="2"/>
+<text class="v" x="465.4277981191892" y="322" text-anchor="start">1.01×</text>
+<text x="304" y="336" text-anchor="end">gemv_q8 11008x4096</text>
+<rect class="slow" x="452.2787504605485" y="327" width="7.721249539451492" height="11" rx="2"/>
+<text class="v" x="448.2787504605485" y="336" text-anchor="end">0.96×</text>
+<text x="304" y="350" text-anchor="end">gemv_q4 [row] 4096x4096</text>
+<rect class="slow" x="444.4710070508266" y="341" width="15.528992949173414" height="11" rx="2"/>
+<text class="v" x="440.4710070508266" y="350" text-anchor="end">0.93×</text>
+<text x="304" y="364" text-anchor="end">gemv_q4 [tiled] 4096x4096</text>
+<rect class="slow" x="459.28949660344176" y="355" width="1.5" height="11" rx="2"/>
+<text class="v" x="455.28949660344176" y="364" text-anchor="end">1.00×</text>
+<text x="304" y="378" text-anchor="end">gemv_q4 [row] 11008x4096</text>
+<rect class="fast" x="460.0" y="369" width="1.5" height="11" rx="2"/>
+<text class="v" x="464.1306154604115" y="378" text-anchor="start">1.00×</text>
+<text x="304" y="392" text-anchor="end">gemv_q4 [tiled] 11008x4096</text>
+<rect class="slow" x="456.7410644974573" y="383" width="3.2589355025427267" height="11" rx="2"/>
+<text class="v" x="452.7410644974573" y="392" text-anchor="end">0.99×</text>
+<text x="304" y="406" text-anchor="end">gemm_i8_dequant 512x512x512</text>
+<rect class="slow" x="459.1974965217389" y="397" width="1.5" height="11" rx="2"/>
+<text class="v" x="455.1974965217389" y="406" text-anchor="end">1.00×</text>
+<text x="304" y="420" text-anchor="end">gemm_i8_dequant 2048x2048x2048</text>
+<rect class="fast" x="460.0" y="411" width="6.002173656278842" height="11" rx="2"/>
+<text class="v" x="470.00217365627884" y="420" text-anchor="start">1.03×</text>
+<line class="ref" x1="460.0" x2="460.0" y1="58" y2="424"/>
+<text class="st" x="20" y="452">These differences are small and the file notes the machine was loaded; only large, repeatable gaps count.</text>
+<text class="t" x="20" y="480">Batch-1 Qwen3.5-2B decode token, 7 rounds: before / after (min of round medians)</text>
+<line class="g" x1="346.5293803950955" x2="346.5293803950955" y1="486" y2="558"/><text x="346.5293803950955" y="569" text-anchor="middle">0.5×</text>
+<line class="g" x1="460.0" x2="460.0" y1="486" y2="558"/><text x="460.0" y="569" text-anchor="middle">1×</text>
+<line class="g" x1="573.4706196049044" x2="573.4706196049044" y1="486" y2="558"/><text x="573.4706196049044" y="569" text-anchor="middle">2×</text>
+<text x="304" y="498" text-anchor="end">decode_encode_us  (190 → 176 µs)</text>
+<rect class="fast" x="460.0" y="489" width="11.97304374763064" height="11" rx="2"/>
+<text class="v" x="475.97304374763064" y="498" text-anchor="start">1.08×</text>
+<text x="304" y="512" text-anchor="end">decode_wait_us  (15636 → 15659 µs)</text>
+<rect class="slow" x="459.75684721146496" y="503" width="1.5" height="11" rx="2"/>
+<text class="v" x="455.75684721146496" y="512" text-anchor="end">1.00×</text>
+<text x="304" y="526" text-anchor="end">decode_wall_us  (15929 → 15896 µs)</text>
+<rect class="fast" x="460.0" y="517" width="1.5" height="11" rx="2"/>
+<text class="v" x="464.3469246323765" y="526" text-anchor="start">1.00×</text>
+<text x="304" y="540" text-anchor="end">decode_gdn_recurrent_us  (25 → 31 µs)</text>
+<rect class="slow" x="425.2059120288912" y="531" width="34.79408797110881" height="11" rx="2"/>
+<text class="v" x="421.2059120288912" y="540" text-anchor="end">0.81×</text>
+<text x="304" y="554" text-anchor="end">decode_attn_prefix_decode_us  (82 → 80 µs)</text>
+<rect class="fast" x="460.0" y="545" width="3.921738374508209" height="11" rx="2"/>
+<text class="v" x="467.9217383745082" y="554" text-anchor="start">1.02×</text>
+<line class="ref" x1="460.0" x2="460.0" y1="486" y2="558"/>
+<text class="t" x="20" y="598">gdn_recurrent: 32-column time / 16-column time, one row per process (blue: 16-column faster; no consistent winner)</text>
+<line class="g" x1="346.5293803950955" x2="346.5293803950955" y1="604" y2="942"/><text x="346.5293803950955" y="953" text-anchor="middle">0.5×</text>
+<line class="g" x1="460.0" x2="460.0" y1="604" y2="942"/><text x="460.0" y="953" text-anchor="middle">1×</text>
+<line class="g" x1="573.4706196049044" x2="573.4706196049044" y1="604" y2="942"/><text x="573.4706196049044" y="953" text-anchor="middle">2×</text>
+<text x="304" y="616" text-anchor="end">batch 1, earlier sweep, process 1</text>
+<rect class="slow" x="450.87868836525627" y="607" width="9.121311634743734" height="11" rx="2"/>
+<text class="v" x="446.87868836525627" y="616" text-anchor="end">0.95×</text>
+<text x="304" y="630" text-anchor="end">batch 1, earlier sweep, process 2</text>
+<rect class="fast" x="460.0" y="621" width="2.1918649812647004" height="11" rx="2"/>
+<text class="v" x="466.1918649812647" y="630" text-anchor="start">1.01×</text>
+<text x="304" y="644" text-anchor="end">batch 1, earlier sweep, process 3</text>
+<rect class="fast" x="460.0" y="635" width="2.2250503655645844" height="11" rx="2"/>
+<text class="v" x="466.2250503655646" y="644" text-anchor="start">1.01×</text>
+<text x="304" y="658" text-anchor="end">batch 1, process 1</text>
+<rect class="slow" x="446.3285313291883" y="649" width="13.671468670811691" height="11" rx="2"/>
+<text class="v" x="442.3285313291883" y="658" text-anchor="end">0.92×</text>
+<text x="304" y="672" text-anchor="end">batch 1, process 2</text>
+<rect class="fast" x="460.0" y="663" width="9.850812784004233" height="11" rx="2"/>
+<text class="v" x="473.85081278400423" y="672" text-anchor="start">1.06×</text>
+<text x="304" y="686" text-anchor="end">batch 1, process 3</text>
+<rect class="fast" x="460.0" y="677" width="6.4611715262531675" height="11" rx="2"/>
+<text class="v" x="470.46117152625317" y="686" text-anchor="start">1.04×</text>
+<text x="304" y="700" text-anchor="end">batch 1, process 4</text>
+<rect class="fast" x="460.0" y="691" width="2.6071665896397462" height="11" rx="2"/>
+<text class="v" x="466.60716658963975" y="700" text-anchor="start">1.02×</text>
+<text x="304" y="714" text-anchor="end">batch 1, process 5</text>
+<rect class="fast" x="460.0" y="705" width="2.2084568325119562" height="11" rx="2"/>
+<text class="v" x="466.20845683251196" y="714" text-anchor="start">1.01×</text>
+<text x="304" y="728" text-anchor="end">batch 2, earlier sweep, process 1</text>
+<rect class="fast" x="460.0" y="719" width="5.900164122616388" height="11" rx="2"/>
+<text class="v" x="469.9001641226164" y="728" text-anchor="start">1.04×</text>
+<text x="304" y="742" text-anchor="end">batch 2, earlier sweep, process 2</text>
+<rect class="fast" x="460.0" y="733" width="6.154929179260023" height="11" rx="2"/>
+<text class="v" x="470.15492917926" y="742" text-anchor="start">1.04×</text>
+<text x="304" y="756" text-anchor="end">batch 2, earlier sweep, process 3</text>
+<rect class="slow" x="455.8619344867923" y="747" width="4.138065513207721" height="11" rx="2"/>
+<text class="v" x="451.8619344867923" y="756" text-anchor="end">0.98×</text>
+<text x="304" y="770" text-anchor="end">batch 2, process 1</text>
+<rect class="fast" x="460.0" y="761" width="36.141045547453245" height="11" rx="2"/>
+<text class="v" x="500.14104554745325" y="770" text-anchor="start">1.25×</text>
+<text x="304" y="784" text-anchor="end">batch 2, process 2</text>
+<rect class="slow" x="430.07149169865534" y="775" width="29.928508301344664" height="11" rx="2"/>
+<text class="v" x="426.07149169865534" y="784" text-anchor="end">0.83×</text>
+<text x="304" y="798" text-anchor="end">batch 2, process 3</text>
+<rect class="fast" x="460.0" y="789" width="6.035989478004808" height="11" rx="2"/>
+<text class="v" x="470.0359894780048" y="798" text-anchor="start">1.04×</text>
+<text x="304" y="812" text-anchor="end">batch 2, process 4</text>
+<rect class="fast" x="460.0" y="803" width="74.9626104763679" height="11" rx="2"/>
+<text class="v" x="538.9626104763679" y="812" text-anchor="start">1.58×</text>
+<text x="304" y="826" text-anchor="end">batch 2, process 5</text>
+<rect class="fast" x="460.0" y="817" width="6.0869530544628105" height="11" rx="2"/>
+<text class="v" x="470.0869530544628" y="826" text-anchor="start">1.04×</text>
+<text x="304" y="840" text-anchor="end">batch 4, earlier sweep, process 1</text>
+<rect class="fast" x="460.0" y="831" width="3.6584235035638812" height="11" rx="2"/>
+<text class="v" x="467.6584235035639" y="840" text-anchor="start">1.02×</text>
+<text x="304" y="854" text-anchor="end">batch 4, earlier sweep, process 2</text>
+<rect class="slow" x="459.5749232601172" y="845" width="1.5" height="11" rx="2"/>
+<text class="v" x="455.5749232601172" y="854" text-anchor="end">1.00×</text>
+<text x="304" y="868" text-anchor="end">batch 4, earlier sweep, process 3</text>
+<rect class="fast" x="460.0" y="859" width="1.5" height="11" rx="2"/>
+<text class="v" x="465.4139387906932" y="868" text-anchor="start">1.01×</text>
+<text x="304" y="882" text-anchor="end">batch 4, process 1</text>
+<rect class="slow" x="458.7443112697652" y="873" width="1.5" height="11" rx="2"/>
+<text class="v" x="454.7443112697652" y="882" text-anchor="end">0.99×</text>
+<text x="304" y="896" text-anchor="end">batch 4, process 2</text>
+<rect class="fast" x="460.0" y="887" width="1.5" height="11" rx="2"/>
+<text class="v" x="464.40977117813884" y="896" text-anchor="start">1.00×</text>
+<text x="304" y="910" text-anchor="end">batch 4, process 3</text>
+<rect class="fast" x="460.0" y="901" width="1.5" height="11" rx="2"/>
+<text class="v" x="464.32773484458005" y="910" text-anchor="start">1.00×</text>
+<text x="304" y="924" text-anchor="end">batch 4, process 4</text>
+<rect class="slow" x="449.9061436111094" y="915" width="10.093856388890572" height="11" rx="2"/>
+<text class="v" x="445.9061436111094" y="924" text-anchor="end">0.94×</text>
+<text x="304" y="938" text-anchor="end">batch 4, process 5</text>
+<rect class="slow" x="457.2082406861827" y="929" width="2.7917593138172947" height="11" rx="2"/>
+<text class="v" x="453.2082406861827" y="938" text-anchor="end">0.98×</text>
+<line class="ref" x1="460.0" x2="460.0" y1="604" y2="942"/>
+</svg>

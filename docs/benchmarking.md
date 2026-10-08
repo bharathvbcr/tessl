@@ -484,6 +484,160 @@ per call rather than per allocation matters: the two `gemv_q4` arms share one
 `y`, and a buffer seeded once would be filled by the first arm before the second
 was checked.
 
+## Measured — tessl against PyTorch MPS, M5 Pro
+
+`bench/paired_cross_runtime.py --rounds 5 --lanes torch,mlx`, alternating the
+lanes round by round per the protocol above. Raw data:
+`bench/results/gemm_speed_ladder_m5pro.json` (run 1, top panel),
+`gemm_speed_ladder_m5pro_b.json` (run 2) and
+`gemm_speed_bf16_confirm_m5pro.json` (9 rounds, bf16 only).
+
+![GEMM speed ratio, tessl over PyTorch MPS](img/gemm_tessl_vs_pytorch.svg)
+
+- **bf16 is at parity with PyTorch** — geomean 0.98–1.03× across three
+  independent runs, with per-shape medians between 0.86× and 1.34×.
+- **Exact f32 is within noise of parity** (1.04–1.07× geomean). The 512³ and
+  1024³ bars sit above 1× but their ranges reach below it: that size is inside
+  the dispatch floor, so it measures submit latency, not the kernel.
+- **tf32-relaxed is ~2.1× PyTorch's f32**, but the numerics differ. PyTorch's
+  f32 lane is full precision; this lane trades mantissa bits, so it is not a
+  like-for-like win.
+
+The attention comparisons are plotted separately below: their files store a
+time ratio (`tessl_ms / other_ms`, `bench/attn_paired.py:130`), the inverse of
+this axis.
+
+## Measured — step-waste and dispatch host-overhead, M5 Pro, 2026-10-08
+
+Paired before/after runs, one process per binary per round with order reversed
+on odd rounds. Both ran on a shared machine (load average 10–33), so only the
+min-of-N figures are comparable. Raw output and conditions:
+`bench/results/qwen35_train_step_{before,after}_m5pro.txt` and
+`bench/results/dispatch_host_overhead_{before,after}_m5pro.txt`.
+
+![Qwen3.5-2B train_step, before vs after](img/qwen35_train_step_before_after.svg)
+
+Min of 3 rounds, each a median of 3 steps. `mc128` is `TESSL_MID_COMMIT=128`.
+`2048:128:sync` is the one config that is slower after (7.746 s against
+7.244 s); its rounds span 7.2–8.4 s before and 7.7–9.3 s after, inside the
+noise at this load. Peak device memory is equal or lower everywhere.
+
+![Dispatch host-overhead, after/before ratio](img/dispatch_host_overhead_ratios.svg)
+
+Two back-to-back runs. The sampler no longer synchronizes (encode ~0.02x) and
+multi-pass sampling drains once per token instead of once per pass. The
+one-pass sampler is GPU-bound and unchanged. Per-token decode is GPU-bound too
+(wall 0.998x), so no decode speedup is claimed; the change there is structural.
+The sampler encode ratio is plotted at the file's "~0.02", not a per-run
+measurement.
+
+## Every recorded result, plotted
+
+One figure per family of files in `bench/results/`. Blue always means the new
+or tessl side is faster; red means slower; bars on a log axis start at 1×.
+Ratios from the A/B notes are the notes' own paired, order-balanced medians.
+
+### GEMM
+
+![GEMM sweep by runtime](img/gemm_sweep_runtimes.svg)
+
+`gemm_sweep_m5pro_f32_bf16.json`. One unpaired run per lane. The file is
+undated; its tessl bf16 is ~11k GFLOP/s at 4096³ against PyTorch's ~25k, which
+matches the pre-landing baseline in `bf16_tile_tune_FINDINGS.md` and not the
+26.6k of the landed cooperative-destination kernel in the table above. Treat
+the bf16 panel as history (inferred, not stated in the file). The paired
+figure above is the current comparison.
+
+![GEMM tile tuning grids](img/gemm_tile_tuning.svg)
+
+`bf16_tile_tune_m5pro.txt`, `bf16_tile_tune_m5pro_coop.txt`,
+`bf16_tnnt_coop_m5pro.txt`, `bf16_nt_lm_head_m5pro.txt` and
+`f32_exact_coop_m5pro.txt`. Before the cooperative kernel the best tiles beat
+production by up to 2.4×; after it, the best variant for each shape is 0.99–1.06×
+production and 94% of the non-cooperative variants are below 1× (0.43–1.05×),
+so the selection table already picks the winner. Where a file measures the same
+shape twice (`bf16_tnnt_coop`, `bf16_nt_lm_head`), the grid shows the later
+measurement; repeats differ by up to 0.13. The exact-f32 register
+accumulator misses its ≥ 1.3× bar except on the 2B's MLP-up shape
+(1.37–1.45×), and the NT head variants are 5–11% slower than the NN head, so
+neither shipped.
+
+![GEMM gating decisions and host micro-latches](img/kernel_ab_gemm_gating.svg)
+
+`bf16_smallm_coop_m5pro.txt`, `splitk_gate_m5pro.txt`,
+`arg_table_latch_m5pro.txt` and `coop_clear_m5pro.txt`. The narrow tile wins
+at small M and loses once the grid fills; split-K wins from K = 12288. The
+latch and accumulator-clear changes are inside the noise and are kept as
+cleanups, not speedups.
+
+### Kernels
+
+![SIMD-group rewrites](img/kernel_ab_simd.svg)
+
+`rope_simdgroup_m5pro.txt`, `row_reduction_simd_m5pro.txt` and
+`gemv_q4_simd_m5pro.txt`. Latency-bound shapes gain most (rope 3.3–11.5× at
+decode and small T, row_sum 4.35× at 1024 columns); bandwidth-bound shapes
+(softmax at 8192 columns, 0.98×) do not move.
+
+### Attention
+
+![Attention speed history](img/attention_speed_history.svg)
+![Attention per-config speedup](img/attention_speed_per_config.svg)
+
+`attn_speed_*.json`, plotted as speedup (the inverse of the stored time
+ratio). The files time different tessl implementations in sequence, so the
+first figure is a history. The latest runs: the routed kernel is 1.60× PyTorch
+MPS and 0.87× MLX at batch 1; the batched-32 decode kernel is 4.51× PyTorch and
+1.04× MLX. tessl is slower than MLX on several decode and global-attention
+configs.
+
+![Attention tuning knobs](img/attention_tuning.svg)
+
+`attn_tune_*.json` and `attn_dispatch_split_m5pro.json`. The best value of each
+knob differs by configuration, which is why they are selected per shape rather
+than fixed. Batching 32 calls per command buffer cuts per-call decode time by
+up to 11×, while prefill gets slower per call.
+
+### Qwen3.5 and dispatch
+
+![Qwen3.5 memory and bf16 operands](img/qwen35_memory_and_bf16.svg)
+
+`qwen35_load_rss_m5pro.txt`, `qwen35_4b_storage_memory_m5pro.txt` and
+`qwen35_train_step_bf16_m5pro.txt`. The streaming loader cuts peak host
+footprint by 1.09 / 2.10 / 3.16 GB (bf16 / bf16 tower / f32). The tower and f32
+paths land within 0.06–0.10 GB of the device bytes; bf16 with the LM head keeps
+one 1.02 GB host copy of the embedding. On the 4B, the two variants with f32
+moments do not fit the 48 GiB working set and the other four do. bf16
+GEMM operands run the 2B train step 2.44× faster (cross-entropy 3.63×); that pair
+was recorded on battery, so compare the two with each other only.
+
+![Dispatch kernels and decode](img/dispatch_and_decode.svg)
+
+`dispatch_host_overhead_*`, `qwen35_decode_token_*`. Per-kernel batched times
+move by 8% at most, and the decode token is unchanged (wall 1.00×): decode is
+GPU-bound. The 16- versus 32-column GDN recurrence has no consistent winner.
+The per-step training and host-path results are in the section above.
+
+### Accuracy
+
+![Numerical accuracy](img/accuracy_parity.svg)
+
+`gemm_parity_grid_m5pro.json` and `attn_parity_m5pro.json`. Parity against a
+reference, not speed. Exact f32 lanes agree to ~5e-6 worst case across tessl,
+MLX and PyTorch alike (identical at 5.11e-06); bf16 lanes to 5e-3–7e-3, and the
+tf32-relaxed lane sits between at 1.5e-3.
+
+### Not plotted
+
+- `gemm_align_probe_m5pro.txt` (264 pass/fail runs, all bit-identical),
+  `kernel_coverage_m5pro.json` (147 entry points covered, none missing) and
+  `fp_contract.txt` (single-shot, "noise, not a speedup") are correctness
+  checks or one-run notes, not benchmarks.
+- `qwen35_train_step_before_m5pro.txt`, `qwen35_decode_token_before_m5pro.txt`
+  and `dispatch_host_overhead_before_m5pro.txt` are the before-only halves of
+  the paired files that are plotted above.
+- `bf16_tile_tune_FINDINGS.md` is prose.
+
 Every table in this repository is reproducible with the commands above, on an
 M5 Pro. On different silicon expect different constants — see Status in the
 README.

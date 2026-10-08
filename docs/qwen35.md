@@ -1058,13 +1058,17 @@ Parity, bounds written before each first run:
 2^-4 of their peak, against transformers' f32 autograd) pass;
 `real_2b_step_on_bf16_storage_stays_near_the_f32_step` passes (loss 2.1e-4,
 worst gradient 4.5e-2 against tessl's exact-f32 step on 512 natural-text
-tokens). `real_2b_loss_curve_tracks_the_f32_step` (quick: one seed, 30 steps
-over four 128-token sequences) fails its per-step 2% bound from step 6: the
-round-to-nearest rules defer most of the first lr 2e-5 updates (under half a
-bf16 ulp) into the master or compensation, and the four sequences are
-memorised to a loss near zero, where a relative bound measures noise. Every
-rule's loss falls from 3.4 to under 1e-2 as f32's does. It stays quick until
-it is run over several seeds with a held-out loss.
+tokens). `real_2b_loss_curve_tracks_the_f32_step` (three seeds, 30 steps
+each on a fresh 128-token chunk, four chunks held out) fails, with its bounds
+kept as written. Every stored precision's held-out loss is within 1% of
+f32's at every scoring (worst 0.98%), and stochastic rounding's training
+loss within 0.74% at every step. The round-to-nearest rules' training loss
+exceeds the 2% per-step bound on 15–16 of 90 steps (worst 4.6%): their
+forward runs on rounded weights, which hold back updates under half a bf16
+ulp, as an f32 model on bf16 GEMM operands does. Its fall bound fails because
+the f32 run's own held-out loss rises on one seed. Two earlier designs that
+repeated their data measured overfitting instead and were replaced; the
+test's comment records them.
 
 Memory at Qwen3.5-4B's shapes (`probe_storage_memory`, random weights;
 `bench/results/qwen35_4b_storage_memory_m5pro.txt`), against the M5 Pro's

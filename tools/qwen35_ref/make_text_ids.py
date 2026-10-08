@@ -5,7 +5,10 @@
 Tokenizes the opening of tessl's own docs/architecture.md (prose, so the
 step's gradients have the magnitudes text gives, not those of uniform random
 ids) with a Qwen3.5 checkpoint's tokenizer.json and writes the first N ids
-(default 512) as an int64 .npy. Needs only the `tokenizers` package; the
+(default 512) as an int64 .npy. Two are committed: tests/fixtures/
+qwen35_text_ids.npy (512 ids) and qwen35_curve_ids.npy (4352 ids, 34 chunks
+of 128 for the loss curve, made 2026-10-08 after architecture.md had
+changed, so its first 512 are not the other's). Needs only the `tokenizers` package; the
 .npy is written by hand so numpy is not required.
 """
 

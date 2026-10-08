@@ -370,12 +370,15 @@ impl FeedbackState {
     }
 }
 
+/// The block Metal calls with a commit's feedback.
+type FeedbackBlock = RcBlock<dyn Fn(NonNull<ProtocolObject<dyn MTL4CommitFeedback>>)>;
+
 /// Keeps the commit-options object and the feedback block alive until Metal
 /// has called the block, or leaks the block if we have to drop earlier.
 struct FeedbackWatch {
     state: Arc<FeedbackState>,
     _options: Retained<MTL4CommitOptions>,
-    block: Option<RcBlock<dyn Fn(NonNull<ProtocolObject<dyn MTL4CommitFeedback>>)>>,
+    block: Option<FeedbackBlock>,
 }
 
 impl Drop for FeedbackWatch {

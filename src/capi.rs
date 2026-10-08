@@ -41,7 +41,9 @@ use crate::gdn_train::{
     gdn_train_backward, gdn_train_forward, GdnTrainDims, GdnTrainGrads, GdnTrainInputs, GdnTrainWorkspace,
 };
 use crate::gemm::GemmOperands;
-use crate::qwen35_adamw::{excluded_from_weight_decay, AdamW, AdamWHyper, Moment};
+use crate::qwen35_adamw::{
+    excluded_from_weight_decay, AdamW, AdamWConfig, AdamWHyper, Moment, MomentStorage, UpdateRule,
+};
 use crate::qwen35_model::{Precision, Qwen35Config, Qwen35Model};
 use crate::qwen35_params::ParamInfo;
 use crate::qwen35_train::{PendingStep, Qwen35Grads, Supervise};
@@ -55,7 +57,7 @@ pub const TESSL_PANIC: i32 = 2;
 
 /// Bumped on any change to a `#[repr(C)]` layout or an entry point's
 /// signature; the Python side refuses a library whose version differs.
-pub const TESSL_ABI_VERSION: u32 = 9;
+pub const TESSL_ABI_VERSION: u32 = 10;
 
 /// Largest tensor rank a [`TesslTensorRef`] carries.
 pub const TESSL_MAX_DIMS: usize = 6;
@@ -69,6 +71,59 @@ pub const TESSL_F16: u32 = 2;
 /// bf16 with f32 accumulation. Any other value is refused.
 pub const TESSL_OPERANDS_EXACT_F32: u32 = 0;
 pub const TESSL_OPERANDS_BF16: u32 = 1;
+
+/// [`tessl_qwen35_load`] precision codes ([`Precision`]): the
+/// [`TESSL_F32`] and [`TESSL_BF16`] dtype codes.
+fn parse_precision(code: u32, what: &str) -> Result<Precision, String> {
+    match code {
+        TESSL_F32 => Ok(Precision::F32),
+        TESSL_BF16 => Ok(Precision::Bf16),
+        c => Err(format!("{what}: precision code {c} is neither 0 (f32) nor 1 (bf16)")),
+    }
+}
+
+/// [`tessl_qwen35_adamw_init`] update-rule codes ([`UpdateRule`]).
+pub const TESSL_UPDATE_F32: u32 = 0;
+pub const TESSL_UPDATE_F32_MASTER: u32 = 1;
+pub const TESSL_UPDATE_BF16_KAHAN: u32 = 2;
+pub const TESSL_UPDATE_BF16_STOCHASTIC: u32 = 3;
+
+/// [`tessl_qwen35_adamw_init`] moment-storage codes ([`MomentStorage`]).
+pub const TESSL_MOMENTS_F32: u32 = 0;
+pub const TESSL_MOMENTS_BF16: u32 = 1;
+pub const TESSL_MOMENTS_BLOCK8: u32 = 2;
+
+/// The [`AdamWConfig`] the codes name; `seed` belongs to the stochastic
+/// rule alone and must be 0 under any other.
+fn parse_adamw_config(update: u32, seed: u64, moments: u32, what: &str) -> Result<AdamWConfig, String> {
+    let update = match update {
+        TESSL_UPDATE_F32 => UpdateRule::F32,
+        TESSL_UPDATE_F32_MASTER => UpdateRule::F32Master,
+        TESSL_UPDATE_BF16_KAHAN => UpdateRule::Bf16Kahan,
+        TESSL_UPDATE_BF16_STOCHASTIC => UpdateRule::Bf16Stochastic { seed },
+        c => {
+            return Err(format!(
+                "{what}: update code {c} is not 0 (f32), 1 (f32 master), 2 (bf16 Kahan) or 3 (bf16 stochastic)"
+            ))
+        }
+    };
+    if seed != 0 && !matches!(update, UpdateRule::Bf16Stochastic { .. }) {
+        return Err(format!(
+            "{what}: seed {seed} given to a rule that takes none (only 3, bf16 stochastic, does)"
+        ));
+    }
+    let moments = match moments {
+        TESSL_MOMENTS_F32 => MomentStorage::F32,
+        TESSL_MOMENTS_BF16 => MomentStorage::Bf16,
+        TESSL_MOMENTS_BLOCK8 => MomentStorage::Block8,
+        c => {
+            return Err(format!(
+                "{what}: moments code {c} is not 0 (f32), 1 (bf16) or 2 (8-bit blocks)"
+            ))
+        }
+    };
+    Ok(AdamWConfig { update, moments })
+}
 
 fn parse_operands(code: u32, what: &str) -> Result<GemmOperands, String> {
     match code {
@@ -662,6 +717,11 @@ pub const TESSL_READ_ADAMW_M: u32 = 3;
 pub const TESSL_READ_ADAMW_V: u32 = 4;
 pub const TESSL_WRITE_ADAMW_M: u32 = 5;
 pub const TESSL_WRITE_ADAMW_V: u32 = 6;
+/// A bf16 model's AdamW auxiliary state, in the parameters' layouts: the f32
+/// masters ([`TESSL_UPDATE_F32_MASTER`]) or the Kahan compensations
+/// ([`TESSL_UPDATE_BF16_KAHAN`]); refused under rules that keep none.
+pub const TESSL_READ_ADAMW_AUX: u32 = 7;
+pub const TESSL_WRITE_ADAMW_AUX: u32 = 8;
 
 /// One entry of a model's parameter table; see
 /// [`crate::qwen35_params::ParamInfo`].
@@ -693,7 +753,7 @@ enum BankState {
     Dirty,
 }
 
-/// What a [`tessl_qwen35_load`] pointer owns: an f32 model, its gradient
+/// What a [`tessl_qwen35_load`] pointer owns: an f32 or bf16 model, its gradient
 /// bank (allocated by the first step and reused by every later one), a step
 /// between [`tessl_qwen35_train_forward`] and [`tessl_qwen35_train_backward`],
 /// and AdamW state once [`tessl_qwen35_adamw_init`] made it.
@@ -768,8 +828,10 @@ unsafe fn c_str<'a>(s: *const c_char, what: &str) -> Result<&'a str, String> {
         .map_err(|_| format!("{what} is not UTF-8"))
 }
 
-/// Load the text tower of a Qwen3.5 checkpoint in f32 for training, on
-/// `runtime`'s device, into a new handle written to `*out`.
+/// Load the text tower of a Qwen3.5 checkpoint for training, on `runtime`'s
+/// device, into a new handle written to `*out`: in f32 ([`TESSL_F32`]), or
+/// with its matrices stored in bf16 ([`TESSL_BF16`]; f32 arithmetic, and its
+/// steps take [`TESSL_OPERANDS_BF16`]).
 ///
 /// `safetensors` is the `.safetensors` file, `config_json` its `config.json`
 /// (with or without `text_config`), and `prefix` the tensor-name prefix
@@ -785,6 +847,7 @@ pub unsafe extern "C" fn tessl_qwen35_load(
     safetensors: *const c_char,
     config_json: *const c_char,
     prefix: *const c_char,
+    precision: u32,
     out: *mut *mut TesslQwen35,
     err: *mut c_char,
     err_len: usize,
@@ -800,9 +863,15 @@ pub unsafe extern "C" fn tessl_qwen35_load(
             let path = c_str(safetensors, "safetensors path").map_err(|e| format!("{WHAT}: {e}"))?;
             let config = c_str(config_json, "config path").map_err(|e| format!("{WHAT}: {e}"))?;
             let prefix = c_str(prefix, "prefix").map_err(|e| format!("{WHAT}: {e}"))?;
+            let precision = parse_precision(precision, WHAT)?;
             let cfg = Qwen35Config::from_config_file(std::path::Path::new(config))?;
             let st = SafeTensors::open(std::path::Path::new(path))?;
-            let model = Qwen35Model::load(&h.rt, &st, prefix, cfg, Precision::F32)?;
+            // A bf16 model trains as the tower alone: nothing here reads the
+            // packed LM head `load` adds.
+            let model = match precision {
+                Precision::F32 => Qwen35Model::load(&h.rt, &st, prefix, cfg, precision)?,
+                Precision::Bf16 => Qwen35Model::load_tower(&h.rt, &st, prefix, cfg, precision)?,
+            };
             let table = model.parameter_table()?;
             if let Some(p) = table
                 .iter()
@@ -1210,29 +1279,98 @@ pub unsafe extern "C" fn tessl_qwen35_copy(
                         h.model.write_adamw_moment(state, which, &ts)
                     }
                 }
+                TESSL_READ_ADAMW_AUX | TESSL_WRITE_ADAMW_AUX => {
+                    let state = h
+                        .adamw
+                        .as_mut()
+                        .ok_or_else(|| format!("{WHAT}: no AdamW state; call tessl_qwen35_adamw_init first"))?;
+                    if direction == TESSL_READ_ADAMW_AUX {
+                        h.model.read_adamw_aux(state, &ts)
+                    } else {
+                        h.model.write_adamw_aux(state, &ts)
+                    }
+                }
                 d => Err(format!(
                     "{WHAT}: direction {d} is not 0 (read params), 1 (read grads), 2 (write params), \
-                     3 or 4 (read AdamW m or v) or 5 or 6 (write AdamW m or v)"
+                     3 or 4 (read AdamW m or v), 5 or 6 (write AdamW m or v) or 7 or 8 (read or write \
+                     the AdamW auxiliary state)"
                 )),
             }
         })
     }
 }
 
-/// Make the handle's AdamW state: both moments zeroed, twice the parameters'
-/// memory (16 GB on the 2B), step count 0. Refused if the handle has one.
+/// Make the handle's AdamW state ([`AdamW::with_config`]): `update`
+/// ([`TESSL_UPDATE_F32`] for an f32 model; [`TESSL_UPDATE_F32_MASTER`],
+/// [`TESSL_UPDATE_BF16_KAHAN`] or [`TESSL_UPDATE_BF16_STOCHASTIC`] with its
+/// `seed` for a bf16 one; `seed` is 0 otherwise) and `moments`
+/// ([`TESSL_MOMENTS_F32`], [`TESSL_MOMENTS_BF16`] or
+/// [`TESSL_MOMENTS_BLOCK8`]). Moments zeroed, step count 0; f32 moments are
+/// twice the parameters' memory (16 GB on the 2B). Refused if the handle has
+/// one.
 ///
 /// # Safety
 /// As [`tessl_qwen35_param_count`].
 #[no_mangle]
-pub unsafe extern "C" fn tessl_qwen35_adamw_init(model: *mut TesslQwen35, err: *mut c_char, err_len: usize) -> i32 {
+pub unsafe extern "C" fn tessl_qwen35_adamw_init(
+    model: *mut TesslQwen35,
+    update: u32,
+    seed: u64,
+    moments: u32,
+    err: *mut c_char,
+    err_len: usize,
+) -> i32 {
     // SAFETY: forwarded from this function's contract.
     unsafe {
         guarded(model, err, err_len, |h| {
+            const WHAT: &str = "tessl_qwen35_adamw_init";
             if h.adamw.is_some() {
-                return Err("tessl_qwen35_adamw_init: the model already has AdamW state".into());
+                return Err(format!("{WHAT}: the model already has AdamW state"));
             }
-            h.adamw = Some(AdamW::new(&h.model)?);
+            let config = parse_adamw_config(update, seed, moments, WHAT)?;
+            h.adamw = Some(AdamW::with_config(&h.model, config)?);
+            Ok(())
+        })
+    }
+}
+
+/// What the handle holds, as one line ([`Qwen35Model::describe`], then
+/// [`AdamW::describe`] once it has AdamW state), NUL-terminated into `out`
+/// (`len` bytes). The line's length plus the NUL is written to `*needed`;
+/// a `len` below it is refused and `out` left as it was.
+///
+/// # Safety
+/// As [`tessl_qwen35_param_count`]; `out` points to `len` writable bytes and
+/// `needed` to a writable `u64`.
+#[no_mangle]
+pub unsafe extern "C" fn tessl_qwen35_describe(
+    model: *mut TesslQwen35,
+    out: *mut c_char,
+    len: u64,
+    needed: *mut u64,
+    err: *mut c_char,
+    err_len: usize,
+) -> i32 {
+    // SAFETY: forwarded from this function's contract.
+    unsafe {
+        guarded(model, err, err_len, |h| {
+            const WHAT: &str = "tessl_qwen35_describe";
+            if out.is_null() || needed.is_null() {
+                return Err(format!("{WHAT}: null out or needed"));
+            }
+            let mut line = h.model.describe();
+            if let Some(state) = &h.adamw {
+                line.push_str("; ");
+                line.push_str(&state.describe());
+            }
+            let n = line.len() + 1;
+            *needed = n as u64;
+            if (len as u128) < n as u128 {
+                return Err(format!("{WHAT}: the line needs {n} bytes, out has {len}"));
+            }
+            let dst = std::slice::from_raw_parts_mut(out.cast::<u8>(), n);
+            dst[..n - 1].copy_from_slice(line.as_bytes());
+            dst[n - 1] = 0;
             Ok(())
         })
     }

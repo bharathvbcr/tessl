@@ -100,6 +100,91 @@ class Qwen35Training(unittest.TestCase):
         self.assertLessEqual(worst, 2.0 ** -5)
         self.assertNotEqual(loss, m.train_step(self.ids))
 
+    def test_a_bf16_stored_step_stays_near_transformers(self):
+        # tests/qwen35_train.rs's bf16-storage bounds (set before its first
+        # run): loss within 2^-7, every gradient within 2^-4 of its own peak.
+        # The forward is the bf16-operand forward, so the loss is that
+        # step's; the gradients come back as f32.
+        m = tessl_torch.Qwen35(SAFETENSORS, CONFIG, prefix="model.", precision="bf16")
+        loss = m.train_step(self.ids, operands="bf16")
+        want_loss, want = torch_step(reference(), self.ids)
+        self.assertLessEqual(abs(loss - want_loss) / abs(want_loss), 2.0 ** -7)
+        grads = m.grads()
+        self.assertEqual(sorted(grads), sorted(want))
+        self.assertTrue(all(g.dtype == torch.float32 for g in grads.values()))
+        worst = max(rel_err(grads[n], want[n]) for n in want)
+        self.assertLessEqual(worst, 2.0 ** -4)
+        self.assertEqual(loss, self.model().train_step(self.ids, operands="bf16"))
+        with self.assertRaisesRegex(TesslError, "trains on GemmOperands::Bf16"):
+            m.train_step(self.ids)
+        self.assertIn("matrices bf16", m.describe())
+
+    def test_a_bf16_adamw_checkpoint_resumes_bit_for_bit(self):
+        # For each update rule and moment storage of a bf16 model: two steps,
+        # a checkpoint (parameters plus adamw_state, which records the
+        # configuration and any aux state), a third step; a fresh bf16 model
+        # restored from it takes the third step to the same bits.
+        def step(model):
+            model.train_step(self.ids, operands="bf16")
+            model.adamw_step(1e-2, weight_decay=0.1)
+
+        def bf16():
+            return tessl_torch.Qwen35(SAFETENSORS, CONFIG, prefix="model.", precision="bf16")
+
+        for update, moments, seed in (("f32-master", "bf16", 0), ("bf16-kahan", "block8", 0),
+                                      ("bf16-stochastic", "block8", 7)):
+            with self.subTest(update=update, moments=moments):
+                m = bf16()
+                m.adamw_init(update, moments, seed)
+                step(m)
+                step(m)
+                params, state = m.parameters(), m.adamw_state()
+                self.assertEqual(state["config"], {"update": update, "seed": seed, "moments": moments})
+                self.assertEqual("aux" in state, update != "bf16-stochastic")
+                self.assertIn(f"update={update}", m.describe())
+                self.assertTrue(m.describe().endswith("step=2"), m.describe())
+                step(m)
+                want = m.parameters()
+                r = bf16()
+                r.load_parameters(params)
+                r.adamw_init(update, moments, seed)
+                r.load_adamw_state(state)
+                step(r)
+                got = r.parameters()
+                for n in want:
+                    self.assertTrue(torch.equal(got[n], want[n]), n)
+
+    def test_bf16_storage_refusals(self):
+        with self.assertRaisesRegex(TesslError, "precision must be 'f32' or 'bf16', not 'f16'"):
+            tessl_torch.Qwen35(SAFETENSORS, CONFIG, prefix="model.", precision="f16")
+        m = tessl_torch.Qwen35(SAFETENSORS, CONFIG, prefix="model.", precision="bf16")
+        with self.assertRaisesRegex(TesslError, "a bf16 model takes update="):
+            m.adamw_init()
+        with self.assertRaisesRegex(TesslError, "does not apply to a Bf16 model"):
+            m.adamw_init("f32")
+        with self.assertRaisesRegex(TesslError, "moments must be one of"):
+            m.adamw_init("bf16-kahan", "int4")
+        with self.assertRaisesRegex(TesslError, "seed 3 given to a rule that takes none"):
+            m.adamw_init("bf16-kahan", "block8", 3)
+        m.adamw_init("bf16-kahan", "block8")
+        state = m.adamw_state()
+        m.adamw_free()
+        m.adamw_init("f32-master", "block8")
+        with self.assertRaisesRegex(TesslError, "the checkpoint's AdamW is .*bf16-kahan.*call adamw_init"):
+            m.load_adamw_state(state)
+        m.adamw_free()
+        m.adamw_init("bf16-kahan", "block8")
+        with self.assertRaisesRegex(TesslError, "'bf16-kahan' needs aux state, and the checkpoint has none"):
+            m.load_adamw_state({k: v for k, v in state.items() if k != "aux"})
+        # A torch-style checkpoint (no config) is f32 AdamW, which this is not.
+        with self.assertRaisesRegex(TesslError, "the checkpoint's AdamW is .*'f32'"):
+            m.load_adamw_state({k: state[k] for k in ("step", "exp_avg", "exp_avg_sq")})
+        self.assertEqual(m.adamw_step_count, 0)
+        f = self.model()
+        f.adamw_init()
+        with self.assertRaisesRegex(TesslError, "'f32' keeps no aux state, and the checkpoint has some"):
+            f.load_adamw_state({**f.adamw_state(), "aux": state["aux"]})
+
     def test_adamw_in_tessl_is_torch_adamw(self):
         # torch.optim.AdamW on CPU copies, with the same two groups (Trainer's
         # exclusions take no decay), fed tessl's gradients each step. Bound

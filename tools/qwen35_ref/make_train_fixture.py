@@ -3,6 +3,7 @@
 gradient from transformers' autograd.
 
     python3 tools/qwen35_ref/make_train_fixture.py tiny     # tests/fixtures/qwen35_train/
+    python3 tools/qwen35_ref/make_train_fixture.py tiny --grouped   # tests/fixtures/qwen35_train_grouped/
     python3 tools/qwen35_ref/make_train_fixture.py 2b --tokens 128   # target/qwen35_train_ref/
 
 `tiny` builds a small random `Qwen3_5ForCausalLM` of the 2B's shape family
@@ -14,6 +15,12 @@ a scale where every term matters (the zero-initialised norm weights would
 otherwise hide a weight applied in the wrong order) and rounded to bf16, so
 the checkpoint tessl loads and the float32 model torch differentiates hold the
 same values.
+
+`tiny --grouped` (tests/fixtures/qwen35_train_grouped/) is the committed tiny
+model with two GDN key heads over four value heads, the 4B's ratio (16 key
+heads, 32 value heads): transformers repeats each key head's q and k across
+its value heads (`repeat_interleave` over heads) before the delta rule. Two
+key heads tell that order from a tiled repeat.
 
 `tiny --layers 24 --out target/qwen35_train_deep` is the same model 24 layers
 deep in the 2B's layer pattern, for tests/qwen35_train.rs's
@@ -45,7 +52,7 @@ ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 TINY_T = 70  # past one 64-token GDN chunk and two 32-row attention blocks
 
 
-def tiny_config(layers=2):
+def tiny_config(layers=2, k_heads=1, v_heads=1):
     # The 2B's pattern: three GDN layers, then full attention. Two layers
     # (the committed fixture) are one of each.
     types = ["linear_attention", "full_attention"] if layers == 2 else [
@@ -58,8 +65,8 @@ def tiny_config(layers=2):
         num_attention_heads=2,
         num_key_value_heads=1,
         head_dim=256,
-        linear_num_key_heads=1,
-        linear_num_value_heads=1,
+        linear_num_key_heads=k_heads,
+        linear_num_value_heads=v_heads,
         linear_key_head_dim=128,
         linear_value_head_dim=128,
         linear_conv_kernel_dim=4,
@@ -106,10 +113,11 @@ def write_common(out, loss, ids):
 
 
 def tiny(args):
-    out = args.out or os.path.join(ROOT, "tests", "fixtures", "qwen35_train")
+    name = "qwen35_train_grouped" if args.grouped else "qwen35_train"
+    out = args.out or os.path.join(ROOT, "tests", "fixtures", name)
     os.makedirs(out, exist_ok=True)
     gen = torch.Generator().manual_seed(20260930)
-    cfg = tiny_config(args.layers)
+    cfg = tiny_config(args.layers, *((2, 4) if args.grouped else (1, 1)))
     torch.manual_seed(0)
     model = mq.Qwen3_5ForCausalLM(cfg).float()
     reinit(model, gen)
@@ -171,6 +179,8 @@ def main():
     ap.add_argument("--layers", type=int, default=2,
                     help="tiny: depth (the 2B's pattern of three GDN layers then attention); the "
                          "committed fixture is 2")
+    ap.add_argument("--grouped", action="store_true",
+                    help="tiny: two GDN key heads over four value heads, the 4B's ratio")
     ap.add_argument("--out", help="tiny: where to write (default: the committed fixture)")
     args = ap.parse_args()
     torch.set_num_threads(max(1, os.cpu_count() // 2))

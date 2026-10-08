@@ -940,8 +940,13 @@ magnitude (attention dK at T = 3, where the few key gradients nearly cancel).
 `train_step(ids)` is one sequence through the model with transformers'
 `ForCausalLMLoss` (position t predicts `ids[t + 1]`, mean over `T - 1`
 positions) and every parameter's gradient of it. It runs in f32
-(`Precision::F32`; a bf16-loaded model is refused) and requires GDN value
-heads equal to key heads, as Qwen3.5-2B has. The forward is the inference
+(`Precision::F32`), or on bf16 storage (see "Training on bf16 storage"). A
+GDN with more value heads than key heads (the 4B's 32 over 16) repeats each
+key head's q and k across its value heads before `gdn_train`, as transformers'
+`repeat_interleave` does, and sums their gradients back over the group
+(`tiny_grouped_gdn_step_matches_transformers_autograd`: two key heads over
+four value heads, every gradient within 3.6e-6 of transformers' in exact
+f32). The forward is the inference
 forward's except where a backward needs more: `gdn_gates` + `gdn_train`
 (checkpointed state) for the gated delta rule and `attn_train` (log-sum-exp)
 for attention. The forward keeps only the residual stream into each layer
@@ -1033,6 +1038,52 @@ the disagreement tenfold but not to the 2B's 4e-3, whose remaining factor
 comes with the real model's scale (hidden 2048, trained weights); the finite
 differences above are what place it in the forward.
 
+### Training on bf16 storage
+
+A `Precision::Bf16` model (`load_tower`) trains on `GemmOperands::Bf16`
+with its matrices, its gradient bank's matrices and each layer's saved input
+in bf16; every accumulation, the GDN state, the softmax and the log-sum-exp
+stay f32, as do the norms, conv and gate parameters. The forward runs on the
+f32 residual stream and keeps a bf16 copy of each layer's input; the backward
+rebuilds each layer from that copy. (Running the forward on the stream
+rounded at every boundary instead compounded the rounding through the layers
+above: on the 2B it put layer 0's `dt_bias` gradient 1.1e-1 from the f32
+step's, against 2.7e-2 now.) `AdamWConfig` picks the update rule
+(`F32Master`, `Bf16Kahan`, `Bf16Stochastic { seed }`) and the moments
+(`F32`, `Bf16`, `Block8`); `AdamW::describe` records both.
+
+Parity, bounds written before each first run:
+`tiny_step_on_bf16_storage_stays_near_transformers` and
+`tiny_grouped_gdn_step_matches_transformers_autograd` (loss 2^-7, gradients
+2^-4 of their peak, against transformers' f32 autograd) pass;
+`real_2b_step_on_bf16_storage_stays_near_the_f32_step` passes (loss 2.1e-4,
+worst gradient 4.5e-2 against tessl's exact-f32 step on 512 natural-text
+tokens). `real_2b_loss_curve_tracks_the_f32_step` (quick: one seed, 30 steps
+over four 128-token sequences) fails its per-step 2% bound from step 6: the
+round-to-nearest rules defer most of the first lr 2e-5 updates (under half a
+bf16 ulp) into the master or compensation, and the four sequences are
+memorised to a loss near zero, where a relative bound measures noise. Every
+rule's loss falls from 3.4 to under 1e-2 as f32's does. It stays quick until
+it is run over several seeds with a held-out loss.
+
+Memory at Qwen3.5-4B's shapes (`probe_storage_memory`, random weights;
+`bench/results/qwen35_4b_storage_memory_m5pro.txt`), against the M5 Pro's
+48 GiB recommended working set, every buffer at its allocated size:
+
+| Weights + bank | Update | Moments | Resident | Fits |
+|---|---|---|---|---|
+| f32 | f32 | f32 | 62.67 GiB (computed) | no |
+| bf16 | f32 master | f32 | 62.67 GiB (computed) | no |
+| bf16 | f32 master | 8-bit | 39.29 GiB | yes |
+| bf16 | Kahan | bf16 | 39.17 GiB | yes |
+| bf16 | Kahan | 8-bit | 31.46 GiB | yes |
+| bf16 | stochastic | 8-bit | 23.63 GiB | yes |
+
+With Kahan and 8-bit moments resident, one training step plus one AdamW step
+on the 4B peaks at 35.28 GiB at T = 512 and 37.35 GiB at T = 2048 (the
+steps' own peaks 3.82 and 5.88 GiB, under their bounds of 6.29 and
+9.16 GiB).
+
 ## Performance
 
 `cargo run --release --bin bench_qwen35_layers` builds Qwen3.5-2B's shapes
@@ -1087,10 +1138,7 @@ is the largest non-GEMM share: 18 × 1.4 ms.
   trimmed to its length (exact for right padding, which a causal model never
   attends), its gradients accumulated in a bank, so a batch of `B` rows costs
   `B` steps rather than one padded one (throughput not measured). What it
-  does not do yet: several sequences in one step, GDN layers whose value
-  heads outnumber their key heads, and bf16
-  storage: weights, activations and gradients stay f32 (bf16 GEMM operands
-  are an option, see "A training step"), and a bf16-loaded model is refused.
+  does not do yet: several sequences in one step.
 - **Exact f32 at the MLP up/gate shape.** Production's exact-f32 NN runs
   2048 x 6144 x 2048 at 4.1 TFLOP/s against 5.7 at 2048^3, and a
   register-accumulator 128x64 sg8 tile runs it 1.45x faster with the same

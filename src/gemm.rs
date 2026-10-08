@@ -1490,7 +1490,7 @@ fn tn_par_k_tile(m: usize, n: usize, k: usize) -> Option<usize> {
 /// and added in partition order (`matmul2d_tensorops_tn_splitk_par_f32`,
 /// then `reduce_partitions_f32`). Deterministic. The rounding differs from
 /// one dispatch over all of K, within the same f32 bound. [`gemm_tn_f32`]
-/// routes here by [`tn_par_k_tile`]; this entry takes the width, so a bench
+/// routes here by `tn_par_k_tile`; this entry takes the width, so a bench
 /// can sweep it.
 pub fn gemm_tn_splitk_par_f32(a_km: &Tensor, b_kn: &Tensor, c: &Tensor, k_tile: usize) -> Result<(), String> {
     let (m, n, k) = validate_gemm(a_km, b_kn, c, Layout::TN, false, "gemm_tn_splitk_par_f32")?;

@@ -4,7 +4,7 @@
 //! ```text
 //! cargo run --release --bin probe_storage_memory -- --config=PATH/config.json
 //! cargo run --release --bin probe_storage_memory -- --config=PATH/config.json --steps=512,2048
-//! cargo run --release --bin probe_storage_memory -- --config=PATH/config.json --proxy-step=512
+//! cargo run --release --bin probe_storage_memory -- --config=PATH/config.json --step=512
 //! ```
 //!
 //! The model is [`Qwen35Model::random_tower`] at the config's exact shapes:
@@ -19,22 +19,17 @@
 //! not fit a 64 GB Mac by construction.
 //!
 //! `--steps=T,...` adds [`Qwen35Model::train_step_bytes`], the bound the
-//! step's pre-flight gate uses, for each length; for a config whose GDN has
-//! more value heads than key heads (the 4B: 32 and 16) the step itself is
-//! refused today (`gdn_train` has no head grouping), so the bound is an
-//! estimate at the value-head count and no step is run.
+//! step's pre-flight gate uses, for each length.
 //!
-//! `--proxy-step=T` runs one step at T tokens, into a bf16 bank with the
-//! smallest variant's optimizer resident, on a proxy of the config whose GDN
-//! key heads equal its value heads (so `gdn_train` can run it), and prints the
-//! measured peak ([`GpuRuntime::peak_allocated_bytes`]) beside the proxy's
-//! bound. The proxy is labelled as such: it is not the config's model.
+//! `--step=T` runs one training step and one AdamW step at T tokens on the
+//! config's model, into a bf16 bank, with a Kahan + 8-bit optimizer resident,
+//! and prints the measured peak ([`GpuRuntime::peak_allocated_bytes`]) beside
+//! the step's bound and the working set.
 
 use std::sync::Arc;
 
 use tessl::gemm::GemmOperands;
-use tessl::qwen35::GdnProjLayout;
-use tessl::qwen35_adamw::{AdamW, AdamWConfig, MomentStorage, UpdateRule};
+use tessl::qwen35_adamw::{AdamW, AdamWConfig, AdamWHyper, MomentStorage, UpdateRule};
 use tessl::qwen35_model::{Precision, Qwen35Config, Qwen35Model};
 use tessl::qwen35_train::{Qwen35Grads, Supervise};
 use tessl::GpuRuntime;
@@ -121,7 +116,7 @@ fn packed_bytes(model: &Qwen35Model, size: usize) -> u64 {
 
 fn main() -> Res<()> {
     let mut config_path = None;
-    let (mut steps, mut proxy) = (Vec::new(), None);
+    let (mut steps, mut step) = (Vec::new(), None);
     for arg in std::env::args().skip(1) {
         if let Some(v) = arg.strip_prefix("--config=") {
             config_path = Some(std::path::PathBuf::from(v));
@@ -132,14 +127,14 @@ fn main() -> Res<()> {
                         .map_err(|_| format!("--steps expects token counts, got {v:?}"))?,
                 );
             }
-        } else if let Some(v) = arg.strip_prefix("--proxy-step=") {
-            proxy = Some(
+        } else if let Some(v) = arg.strip_prefix("--step=") {
+            step = Some(
                 v.parse::<u32>()
-                    .map_err(|_| format!("--proxy-step expects a token count, got {v:?}"))?,
+                    .map_err(|_| format!("--step expects a token count, got {v:?}"))?,
             );
         } else {
             return Err(format!(
-                "expected --config=PATH, --steps=T,... or --proxy-step=T, got {arg:?}"
+                "expected --config=PATH, --steps=T,... or --step=T, got {arg:?}"
             ));
         }
     }
@@ -181,8 +176,8 @@ fn main() -> Res<()> {
 
     println!();
     println!(
-        "{:<56} {:>11} {:>11} {:>11} {:>11}  {}",
-        "variant", "weights", "bank", "optimizer", "total", "fits"
+        "{:<56} {:>11} {:>11} {:>11} {:>11}  fits",
+        "variant", "weights", "bank", "optimizer", "total"
     );
     for (label, precision, config) in variants() {
         let opt = if precision == Precision::F32 {
@@ -228,16 +223,10 @@ fn main() -> Res<()> {
 
     if !steps.is_empty() {
         println!();
-        let refused = cfg.gdn.v_heads() != cfg.gdn.k_heads();
         for &t in &steps {
             println!(
-                "train_step_bytes(T={t}, bf16): {}{}",
-                gib(model.train_step_bytes(t, GemmOperands::Bf16)),
-                if refused {
-                    " (estimate: this config's step is refused, GDN value heads != key heads)"
-                } else {
-                    ""
-                }
+                "train_step_bytes(T={t}, bf16): {}",
+                gib(model.train_step_bytes(t, GemmOperands::Bf16))
             );
         }
     }
@@ -245,27 +234,20 @@ fn main() -> Res<()> {
     drop(model);
     rt.synchronize()?;
 
-    if let Some(t) = proxy {
-        proxy_step(&rt, &cfg, t)?;
+    if let Some(t) = step {
+        measure_step(&rt, &cfg, t)?;
     }
     Ok(())
 }
 
-/// One step at `t` tokens on the config with GDN key heads raised to its
-/// value heads, Kahan and 8-bit moments resident.
-fn proxy_step(rt: &Arc<GpuRuntime>, cfg: &Qwen35Config, t: u32) -> Res<()> {
-    let mut proxy = cfg.clone();
-    proxy.gdn = GdnProjLayout::new(cfg.gdn.v_heads(), cfg.gdn.v_heads(), cfg.gdn.v_dim())?;
+/// One training step and one AdamW step at `t` tokens on the config's
+/// model, Kahan and 8-bit moments resident.
+fn measure_step(rt: &Arc<GpuRuntime>, cfg: &Qwen35Config, t: u32) -> Res<()> {
     println!();
-    println!(
-        "PROXY (not the config's model): GDN key heads {} -> {}, everything else as configured",
-        cfg.gdn.k_heads(),
-        proxy.gdn.k_heads()
-    );
     let base = rt.current_allocated_bytes();
-    let model = Qwen35Model::random_tower(rt, proxy, Precision::Bf16, 2)?;
+    let model = Qwen35Model::random_tower(rt, cfg.clone(), Precision::Bf16, 2)?;
     let bank = Qwen35Grads::zeros_like(&model)?;
-    let state = AdamW::with_config(
+    let mut state = AdamW::with_config(
         &model,
         AdamWConfig {
             update: UpdateRule::Bf16Kahan,
@@ -278,16 +260,27 @@ fn proxy_step(rt: &Arc<GpuRuntime>, cfg: &Qwen35Config, t: u32) -> Res<()> {
     let ids: Vec<u32> = (0..t).map(|i| (i * 104_729 + 17) % model.config().vocab).collect();
     rt.reset_peak_allocated_bytes();
     let loss = model.train_step_into(&ids, GemmOperands::Bf16, Supervise::Causal, &bank, false)?;
+    let step_peak = rt.peak_allocated_bytes();
+    model.adamw_step(
+        &bank,
+        &mut state,
+        &AdamWHyper::default(),
+        &model.default_weight_decay(0.0)?,
+    )?;
+    rt.synchronize()?;
     let peak = rt.peak_allocated_bytes();
     println!(
-        "resident {} (weights, bank, Kahan + 8-bit AdamW); step T={t}: loss {loss:.4}, peak {} over resident, \
-         bound {}; device peak {} of {}",
-        gib(resident - base),
-        gib(peak.saturating_sub(resident)),
+        "{}; resident {} (weights, bank, Kahan + 8-bit AdamW)",
+        state.describe(),
+        gib(resident - base)
+    );
+    println!(
+        "step T={t}: loss {loss:.4}, peak {} over resident, bound {}; device peak {} \
+         (with the AdamW step), recommended working set {}",
+        gib(step_peak.saturating_sub(resident)),
         gib(bound),
         gib(peak - base),
         gib(rt.memory_info().recommended_working_set)
     );
-    drop(state);
     Ok(())
 }

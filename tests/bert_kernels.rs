@@ -162,7 +162,11 @@ fn worst_relative(x: &[f32], got: &[f32], want: &[f64], rel: f64) -> Option<(usi
         let e = (f64::from(g) - w).abs();
         let xi = f64::from(x[i]);
         let allowed = (rel + 4.0 * xi * xi * EPS32) * w.abs() + 1e-30;
-        if !(e <= allowed) {
+        // A NaN error or bound is a failure too.
+        if !matches!(
+            e.partial_cmp(&allowed),
+            Some(std::cmp::Ordering::Less | std::cmp::Ordering::Equal)
+        ) {
             let ratio = if e.is_finite() { e / allowed } else { f64::INFINITY };
             if worst.is_none_or(|(_, r)| ratio > r) {
                 worst = Some((i, ratio));
@@ -184,7 +188,7 @@ fn the_erfc_reference_matches_known_values() {
         (0.5, 0.479_500_122_186_953_5),
         (1.0, 0.157_299_207_050_285_1),
         (2.0, 4.677_734_981_047_266e-3),
-        (2.5, 4.069_520_174_449_590e-4),
+        (2.5, 4.069_520_174_449_59e-4),
         (3.0, 2.209_049_699_858_544e-5),
         (5.0, 1.537_459_794_428_035e-12),
         (10.0, 2.088_487_583_762_545e-45),

@@ -17,7 +17,27 @@ All notable changes to `tessl` are recorded here. The format follows
   `read_adamw_aux` / `write_adamw_aux` checkpoint the master or compensation
   so a run resumes bit for bit. `Qwen35Model::random_tower` and
   `probe_storage_memory` measure what each variant holds at a config's
-  shapes.
+  shapes; `probe_storage_memory --step=T` runs a training step and an AdamW
+  step on the config's own model and reports the measured peak.
+- **bf16 storage through the C ABI and `tessl_torch` (ABI 10).**
+  `tessl_torch.Qwen35(..., precision="bf16")` loads a bf16-stored model, and
+  `adamw_init(update=..., moments=..., seed=...)` picks the update rule
+  (`"f32-master"`, `"bf16-kahan"`, `"bf16-stochastic"`) and the moments
+  (`"f32"`, `"bf16"`, `"block8"`). `describe()` names the stored precision and
+  the optimizer. `adamw_state()` records the configuration (`"config"`) and
+  the f32 masters or Kahan compensations (`"aux"`), and `load_adamw_state`
+  refuses a checkpoint made under another configuration, so a bf16 run
+  resumes bit for bit under every rule. In the C ABI, `tessl_qwen35_describe`
+  and the copy directions `TESSL_READ_ADAMW_AUX` / `TESSL_WRITE_ADAMW_AUX`
+  are new.
+- **Qwen3.5 training on GDN layers with grouped heads.** A GDN with more
+  value heads than key heads (Qwen3.5-4B: 32 over 16) now trains: each key
+  head's q and k are repeated across its value heads before `gdn_train`, as
+  transformers' `repeat_interleave` does, and their gradients sum back over
+  the group. `train_step` no longer refuses such a config. Checked against
+  transformers' autograd on a committed tiny fixture with two key heads over
+  four value heads (`tests/fixtures/qwen35_train_grouped`,
+  `make_train_fixture.py tiny --grouped`).
 - **`tessl::bert`: BERT / DistilBERT learned sparse document encoders.**
   `BertForMaskedLM` and `DistilBertForMaskedLM` checkpoints produce
   `max_t log1p(relu(logits))` term weights, in exact f32. New kernels are in
@@ -34,6 +54,21 @@ All notable changes to `tessl` are recorded here. The format follows
   external `match` on it.
 
 ### Changed
+
+- **C ABI 10: `tessl_qwen35_load` takes a precision and
+  `tessl_qwen35_adamw_init` an optimizer configuration.** `tessl_qwen35_load`
+  gains `precision` (`TESSL_F32` or `TESSL_BF16`) before `out`;
+  `tessl_qwen35_adamw_init` gains `update` (`TESSL_UPDATE_*`), `seed` and
+  `moments` (`TESSL_MOMENTS_*`). A caller built against ABI 9 must pass them
+  (`TESSL_F32`; `TESSL_UPDATE_F32, 0, TESSL_MOMENTS_F32` for the old
+  behaviour); `tessl_torch` refuses a library of another ABI version.
+- **A bf16-stored Qwen3.5 model's forward runs on the f32 residual stream.**
+  It still keeps each layer's input in bf16 for the backward, which rebuilds
+  the layer from that rounded copy. The forward no longer runs on the stream
+  rounded at every layer boundary: on the 2B that rounding compounded
+  through the layers above and put four 1-D gradients past the bf16-storage
+  test's 2^-4 bound (layer 0's `dt_bias` 1.1e-1 from the f32 step's). The
+  loss is now the f32 model's bf16-operand loss, bit for bit.
 
 - **Checkpoint reads fill their destination directly.** `read_bf16_bits` and
   `read_f32` no longer stage the raw bytes and then copy them. A 16-bit tensor

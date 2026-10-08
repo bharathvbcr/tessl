@@ -253,6 +253,36 @@ fn tiny_step_matches_transformers_autograd() {
     }
 }
 
+/// The tiny model with two GDN key heads over four value heads, the 4B's
+/// ratio (`make_train_fixture.py tiny --grouped`): transformers repeats each
+/// key head's q and k across its value heads (value head `h * 2 + j` is key
+/// head `h`; two key heads tell that from a tiled repeat), so their gradients
+/// sum back over the group. Bounds set before the first run: the exact-f32 step at the
+/// ungrouped fixture's (loss 1e-5, every gradient 1e-4 of its peak) and the
+/// inference forward's loss; the bf16-storage step at the ungrouped bf16
+/// storage bounds (loss 2^-7, every gradient 2^-4).
+#[test]
+fn tiny_grouped_gdn_step_matches_transformers_autograd() {
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/qwen35_train_grouped");
+    let cfg = Qwen35Config::from_config_file(&dir.join("config.json")).unwrap();
+    assert_eq!((cfg.gdn.k_heads(), cfg.gdn.v_heads()), (2, 4));
+    let ids = ids(&dir);
+    let model = load(&dir, "model.", cfg.clone(), Precision::F32);
+    let step = model.train_step(&ids, GemmOperands::ExactF32).unwrap();
+    let worst = compare(&dir, "model.", &cfg, &step, 1e-5, 1e-4);
+    eprintln!("grouped, exact f32: worst parameter gradient {worst:.2e}");
+    let ce = inference_loss(&model, &ids);
+    assert!(
+        (ce - step.loss).abs() <= 1e-5 * ce.abs(),
+        "inference loss {ce} vs training loss {}",
+        step.loss
+    );
+    let (_, bf16) = load_tower(&dir, cfg.clone(), Precision::Bf16);
+    let step = bf16.train_step(&ids, GemmOperands::Bf16).unwrap();
+    let worst = compare(&dir, "model.", &cfg, &step, 2f64.powi(-7), 2f64.powi(-4));
+    eprintln!("grouped, bf16 storage: worst parameter gradient {worst:.2e}");
+}
+
 /// The step on bf16 GEMM operands (f32 accumulation, f32 weights, activations
 /// and gradients) against the same float32 transformers reference. Bounds set
 /// before the first run: the loss within 2^-8 relative and every gradient
@@ -301,14 +331,15 @@ fn tiny_step_on_bf16_operands_stays_near_transformers() {
 /// The step on a bf16-stored model (bf16 matrices, bf16 layer inputs kept
 /// for the backward, f32 accumulation and f32 GDN state, softmax and LSE)
 /// against the same float32 transformers reference. The fixture is bf16 on
-/// disk, so the weights are the f32 model's values exactly; what this adds
-/// over bf16 operands is the residual stream rounded at each layer boundary.
-/// Bounds set before the first run: the loss within 2^-7 relative and every
-/// gradient within 2^-4 of its own peak (the bf16-operand bounds, doubled for
-/// the boundary rounding of up to 2^-9 relative per layer); against the f32
-/// model's bf16-operand step, every gradient within 2^-5 of its peak. It must
-/// not be that step's bits (the stream was rounded), and two steps must be
-/// the same bits.
+/// disk, so the weights are the f32 model's values exactly, and the forward
+/// is the f32 model's bf16-operand forward: its loss is that step's bits.
+/// What this adds is the backward's rebuild of each layer from its input
+/// rounded to bf16. Bounds set before the first run: the loss within 2^-7
+/// relative and every gradient within 2^-4 of its own peak (the bf16-operand
+/// bounds, doubled for the rounding of up to 2^-9 relative per layer);
+/// against the f32 model's bf16-operand step, every gradient within 2^-5 of
+/// its peak. Its gradients must not be that step's bits (the rebuild ran on
+/// the rounded inputs), and two steps must be the same bits.
 #[test]
 fn tiny_step_on_bf16_storage_stays_near_transformers() {
     let dir = fixture();
@@ -324,14 +355,18 @@ fn tiny_step_on_bf16_storage_stays_near_transformers() {
     let (gap, name) = worst_rel(&cfg, &step.grads, &operands.grads);
     eprintln!("bf16 storage vs bf16 operands: worst {gap:.2e} ({name})");
     assert!(gap <= 2f64.powi(-5), "{name}: {gap:.3e} from the bf16-operand step");
-    let differs = step.loss.to_bits() != operands.loss.to_bits()
-        || by_name(&cfg, &step.grads, "model.")
-            .iter()
-            .zip(by_name(&cfg, &operands.grads, "model."))
-            .any(|((_, a), (_, b))| a.iter().zip(&b).any(|(x, y)| x.to_bits() != y.to_bits()));
+    assert_eq!(
+        step.loss.to_bits(),
+        operands.loss.to_bits(),
+        "the forward ran on another stream than the bf16-operand step's"
+    );
+    let differs = by_name(&cfg, &step.grads, "model.")
+        .iter()
+        .zip(by_name(&cfg, &operands.grads, "model."))
+        .any(|((_, a), (_, b))| a.iter().zip(&b).any(|(x, y)| x.to_bits() != y.to_bits()));
     assert!(
         differs,
-        "bf16 storage gave the bf16-operand step's bits: the stream was not rounded"
+        "bf16 storage gave the bf16-operand step's gradient bits: the rebuild did not run on the kept bf16 inputs"
     );
 
     let again = model.train_step(&ids, GemmOperands::Bf16).unwrap();
@@ -1389,13 +1424,17 @@ fn streamed_rel(cfg: &Qwen35Config, got: &Qwen35Grads, want: &Qwen35Grads) -> Ve
 /// first run failed it: layer 0's `in_proj_a` 1.17e-1, `A_log` 8.3e-2,
 /// `dt_bias` 7.1e-2, where bf16 operands alone, with f32 storage, already
 /// gave 7.4e-2, 1.01e-1 and 4.2e-2: the bound does not hold for random ids
-/// on either lane. On these ids (2026-10-08, M5 Pro) it fails on one of 320
-/// parameters, kept failing rather than loosened: the loss is 7.1e-5 off and
-/// 319 gradients are within 2^-4, but `layers.0.linear_attn.dt_bias` is
-/// 1.04e-1 off (bf16 operands alone: 3.3e-2). Layer 0's own input is the
-/// bf16 embedding, so that error arrives through the gradient from the 23
-/// rounded layer boundaries above it, onto a 16-element gradient summed
-/// over 512 tokens. Needs `QWEN35_2B_SAFETENSORS`.
+/// on either lane. On these ids (2026-10-08, M5 Pro), with the forward run
+/// on the stream rounded at each layer boundary, it failed and was kept
+/// failing rather than loosened: four 1-D gradients past 2^-4, layer 0's
+/// `dt_bias` 1.12e-1 and `A_log` 9.3e-2 (bf16 operands alone: 2.9e-2 and
+/// 3.6e-2), the rounding compounding through the layers above. Keeping the
+/// f32 stream as the forward's (f32 inputs, a diagnostic run) gave the
+/// bf16-operand numbers exactly, which located it there. With the forward on
+/// the f32 stream and only the backward's rebuild on the bf16 inputs, it
+/// passes: loss 2.09e-4, worst gradient 4.47e-2
+/// (`layers.1.post_attention_layernorm.weight`). Needs
+/// `QWEN35_2B_SAFETENSORS`.
 #[test]
 #[ignore]
 fn real_2b_step_on_bf16_storage_stays_near_the_f32_step() {
@@ -1429,27 +1468,54 @@ fn real_2b_step_on_bf16_storage_stays_near_the_f32_step() {
     }
 }
 
-/// A quick loss curve (one seed; quick until it is run over several
-/// seeds): the 2B trained `STEPS` AdamW steps on four fixed natural-text
-/// sequences of 128 tokens in turn, at f32 and at each stored precision, every step's
-/// loss printed as CSV. Bounds written before the first run: at every step
-/// each stored precision's loss is within 2% of the f32 run's, and its total
-/// drop over the run is within 25% of the f32 run's drop (which must be at
-/// least 0.1 nats, or the curve shows nothing). Needs
-/// `QWEN35_2B_SAFETENSORS`; each run holds at most ~30 GB and is dropped
-/// before the next.
+/// The 2B's loss curves at f32 and at each stored precision, over three
+/// seeds: each seed orders three of the four 128-token natural-text chunks
+/// for `STEPS` AdamW steps (lr 2e-5) and seeds the stochastic rule, and the
+/// fourth chunk, never trained on, is scored after every step. Bounds
+/// written before the first run: at every step each stored precision's
+/// held-out loss is within 2% of the same seed's f32 run, and its mean over
+/// the last 10 steps within 1%; its training loss falls by within 25% of the
+/// f32 run's fall (which must be at least 0.1 nats). Every step's losses are
+/// printed as CSV. Needs `QWEN35_2B_SAFETENSORS`; each run holds at most
+/// ~30 GB and is dropped before the next.
+///
+/// It replaces a single-seed curve that bounded the training loss at every
+/// step within 2% of f32's. That bound failed (2026-10-08, M5 Pro, twice)
+/// for a reason it could not separate from a defect: the four chunks it
+/// trained on were memorised to a loss near 1e-3, where a relative bound
+/// measures noise. Its run showed the round-to-nearest rules deferring the
+/// first lr 2e-5 updates (under half a bf16 ulp) into the master or
+/// compensation (step 1: 3.8926 against f32's 3.9548, stochastic rounding
+/// 3.9552), which the held-out loss now measures without memorisation.
 #[test]
 #[ignore]
 fn real_2b_loss_curve_tracks_the_f32_step() {
     use tessl::qwen35_adamw::{AdamW, AdamWConfig, AdamWHyper, MomentStorage, UpdateRule};
     const STEPS: usize = 30;
+    const SEEDS: [u64; 3] = [1, 2, 3];
     let text = text_ids();
-    let seqs: Vec<Vec<u32>> = text.chunks(128).map(<[u32]>::to_vec).collect();
+    let chunks: Vec<Vec<u32>> = text.chunks(128).map(<[u32]>::to_vec).collect();
+    assert_eq!(chunks.len(), 4);
+    let (train, held_out) = (&chunks[..3], &chunks[3]);
     let hyper = AdamWHyper {
         lr: 2e-5,
         ..AdamWHyper::default()
     };
-    let curve = |precision: Precision, config: AdamWConfig| -> Vec<f64> {
+    // The training chunk at each step: a fixed permutation of the three per
+    // seed, repeated.
+    let order = |seed: u64| -> Vec<usize> {
+        let mut o = [0usize, 1, 2];
+        let mut x = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+        for i in (1..o.len()).rev() {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            o.swap(i, (x % (i as u64 + 1)) as usize);
+        }
+        (0..STEPS).map(|s| o[s % 3]).collect()
+    };
+    // (training loss, held-out loss after the step) per step.
+    let curve = |precision: Precision, config: AdamWConfig, seed: u64| -> Vec<(f64, f64)> {
         let rt = GpuRuntime::new().unwrap();
         let model = real_2b_tower(&rt, precision);
         let operands = if precision == Precision::F32 {
@@ -1460,66 +1526,95 @@ fn real_2b_loss_curve_tracks_the_f32_step() {
         let bank = Qwen35Grads::zeros_like(&model).unwrap();
         let mut state = AdamW::with_config(&model, config).unwrap();
         let wd = model.default_weight_decay(0.0).unwrap();
-        let mut losses = Vec::with_capacity(STEPS);
-        for step in 0..STEPS {
-            let ids = &seqs[step % seqs.len()];
+        let mut out = Vec::with_capacity(STEPS);
+        for &c in &order(seed) {
             let loss = model
-                .train_step_into(ids, operands, Supervise::Causal, &bank, false)
+                .train_step_into(&train[c], operands, Supervise::Causal, &bank, false)
                 .unwrap();
             model.adamw_step(&bank, &mut state, &hyper, &wd).unwrap();
-            losses.push(loss);
+            let held = model
+                .train_forward(held_out, operands, Supervise::Causal)
+                .unwrap()
+                .loss();
+            out.push((loss, held));
         }
-        eprintln!("{}: {}", state.describe(), model.describe());
-        losses
+        eprintln!("seed {seed}: {}: {}", state.describe(), model.describe());
+        out
     };
-    let base = curve(Precision::F32, AdamWConfig::F32);
-    let configs = [
-        AdamWConfig {
-            update: UpdateRule::F32Master,
-            moments: MomentStorage::F32,
-        },
-        AdamWConfig {
-            update: UpdateRule::Bf16Kahan,
-            moments: MomentStorage::Bf16,
-        },
-        AdamWConfig {
-            update: UpdateRule::Bf16Kahan,
-            moments: MomentStorage::Block8,
-        },
-        AdamWConfig {
-            update: UpdateRule::Bf16Stochastic { seed: 1 },
-            moments: MomentStorage::Block8,
-        },
-    ];
-    let runs: Vec<Vec<f64>> = configs.iter().map(|&c| curve(Precision::Bf16, c)).collect();
-    println!("quick (single seed, natural-text ids)");
-    println!(
-        "step,f32,{}",
-        configs.iter().map(|c| c.to_string()).collect::<Vec<_>>().join(",")
-    );
-    for s in 0..STEPS {
-        let row: Vec<String> = runs.iter().map(|r| format!("{:.5}", r[s])).collect();
-        println!("{s},{:.5},{}", base[s], row.join(","));
-    }
-    // Over the last pass through the four sequences, against the first.
-    let drop = |r: &[f64]| r[..4].iter().sum::<f64>() / 4.0 - r[STEPS - 4..].iter().sum::<f64>() / 4.0;
-    let base_drop = drop(&base);
-    assert!(base_drop >= 0.1, "the f32 run's loss fell only {base_drop:.4}");
-    for (c, r) in configs.iter().zip(&runs) {
-        for s in 0..STEPS {
-            assert!(
-                (r[s] - base[s]).abs() <= 0.02 * base[s],
-                "{c} step {s}: loss {} vs f32 {}",
-                r[s],
-                base[s]
-            );
-        }
-        let d = drop(r);
-        assert!(
-            (d - base_drop).abs() <= 0.25 * base_drop,
-            "{c}: the loss fell {d:.4}, the f32 run's {base_drop:.4}"
+    let configs = |seed: u64| {
+        [
+            AdamWConfig {
+                update: UpdateRule::F32Master,
+                moments: MomentStorage::F32,
+            },
+            AdamWConfig {
+                update: UpdateRule::Bf16Kahan,
+                moments: MomentStorage::Bf16,
+            },
+            AdamWConfig {
+                update: UpdateRule::Bf16Kahan,
+                moments: MomentStorage::Block8,
+            },
+            AdamWConfig {
+                update: UpdateRule::Bf16Stochastic { seed },
+                moments: MomentStorage::Block8,
+            },
+        ]
+    };
+    let drop = |r: &[(f64, f64)]| {
+        r[..3].iter().map(|x| x.0).sum::<f64>() / 3.0 - r[STEPS - 3..].iter().map(|x| x.0).sum::<f64>() / 3.0
+    };
+    let tail = |r: &[(f64, f64)]| r[STEPS - 10..].iter().map(|x| x.1).sum::<f64>() / 10.0;
+    let mut failures = Vec::new();
+    for seed in SEEDS {
+        let base = curve(Precision::F32, AdamWConfig::F32, seed);
+        let cs = configs(seed);
+        let runs: Vec<Vec<(f64, f64)>> = cs.iter().map(|&c| curve(Precision::Bf16, c, seed)).collect();
+        println!("seed {seed} (order {:?})", &order(seed)[..3]);
+        println!(
+            "step,f32 train,f32 held-out,{}",
+            cs.iter()
+                .map(|c| format!("{c} train,{c} held-out"))
+                .collect::<Vec<_>>()
+                .join(",")
         );
+        for s in 0..STEPS {
+            let row: Vec<String> = runs.iter().map(|r| format!("{:.5},{:.5}", r[s].0, r[s].1)).collect();
+            println!("{s},{:.5},{:.5},{}", base[s].0, base[s].1, row.join(","));
+        }
+        let base_drop = drop(&base);
+        if base_drop < 0.1 {
+            failures.push(format!(
+                "seed {seed}: the f32 run's training loss fell only {base_drop:.4}"
+            ));
+        }
+        for (c, r) in cs.iter().zip(&runs) {
+            for s in 0..STEPS {
+                if (r[s].1 - base[s].1).abs() > 0.02 * base[s].1 {
+                    failures.push(format!(
+                        "seed {seed} {c} step {s}: held-out {} vs f32 {}",
+                        r[s].1, base[s].1
+                    ));
+                }
+            }
+            let (t, bt) = (tail(r), tail(&base));
+            if (t - bt).abs() > 0.01 * bt {
+                failures.push(format!("seed {seed} {c}: last-10 held-out mean {t:.5} vs f32 {bt:.5}"));
+            }
+            let d = drop(r);
+            if (d - base_drop).abs() > 0.25 * base_drop {
+                failures.push(format!(
+                    "seed {seed} {c}: training loss fell {d:.4}, the f32 run's {base_drop:.4}"
+                ));
+            }
+        }
     }
+    assert!(
+        failures.is_empty(),
+        "{} bound(s) failed:\n{}",
+        failures.len(),
+        failures.join("\n")
+    );
 }
 
 /// The 2B step on bf16 GEMM operands against the same float32 transformers

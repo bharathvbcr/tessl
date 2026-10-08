@@ -623,8 +623,9 @@ fn bf16_or_f32(name: &str, x: f64) -> f64 {
 /// [`UpdateRule::Bf16Kahan`]: one step from the effective value `p + c`
 /// lands on torch's update of it, to within one rounding of the new
 /// compensation (half a bf16 ulp of `c`, which is itself under half an ulp
-/// of `p`) plus the f32 bound: `|p1 + c1 - ref| <= 2^-9 |c1| + 2^-17 |ref|
-/// + 2e-6`. Set before the first run. At lr = 1e-4 most updates are below
+/// of `p`) plus the f32 bound:
+/// `|p1 + c1 - ref| <= 2^-9 |c1| + 2^-17 |ref| + 2e-6`. Set before the first
+/// run. At lr = 1e-4 most updates are below
 /// half an ulp of their weight, which plain rounding to nearest would drop:
 /// after the steps the bf16 weights with their compensation are much nearer
 /// the uninterrupted reference than the bf16 weights alone (checked, 4x).

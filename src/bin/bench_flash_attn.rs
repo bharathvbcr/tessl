@@ -668,14 +668,8 @@ fn run() -> Result<(), String> {
         let tkv = u32_buf(&rt, c.tkv as u32)?;
         let qo = u32_buf(&rt, c.q_off as u32)?;
         let ko = u32_buf(&rt, c.kv_off as u32)?;
-        let scratch = nn::DecodeScratch::with_chunk(
-            &rt,
-            c.b as u32,
-            c.h as u32,
-            c.tkv,
-            c.d as u32,
-            nn::DecodeChunk::C64,
-        )?;
+        let scratch =
+            nn::DecodeScratch::with_chunk(&rt, c.b as u32, c.h as u32, c.tkv, c.d as u32, nn::DecodeChunk::C64)?;
 
         let bufs = Bufs {
             q: &q,

@@ -14,7 +14,9 @@ you changed in the kernel.**
 | `bench_gemm_coop_tile` | Paired, interleaved cooperative GEMM tile A/B (128×64 vs 64×64). |
 | `bench_gemm_epi_tile` | Paired, interleaved fused epilogue tile A/B (128×64 vs 64×64). |
 | `bench_gemm_sweep` | Cross-runtime lane (f32 exact / tf32 / bf16), JSON out. |
-| `bench_qwen35_layers` | Layer kernel benchmarks; `--paired-attn` times paired prefill attention. |
+| `bench_qwen35_layers` | Layer kernel benchmarks; `--paired-attn` times paired prefill attention, `--paired-gdn-recurrent` the 32- vs 16-column decode recurrence, and `--decode[=P]` a batch-1 decode token (host encode and commit+wait apart). |
+| `bench_nn_kernels` | `nn` kernels batched and solo, with each one's host encode per dispatch; then the host path: pipeline cache hits and a decode-style sample loop. `--host-only` skips the kernel table. |
+| `bench/paired_bins.sh` | Interleaved min-of-N across frozen binaries (`BENCH_BINS="before=.. after=.."`) for any bench printing `METRIC` lines. |
 | `probe_gdn_scan` | Gated delta net chunk scan probe; `--paired` times paired 32- vs 16-col widths. |
 | `bench/paired_cross_runtime.py` | Alternates the tessl and PyTorch/MLX lanes round by round. |
 | `bench_embedgemma2` | EmbeddingGemma 2 `encode` latency on the real checkpoint, JSON out. |

@@ -321,7 +321,9 @@ fn run_gdn_with(rt: &Arc<GpuRuntime>, d: &GdnData, path: Path, mode: StateOut) -
 /// [`run_gdn_with`], through the `_varlen` entry points when `lens` is given.
 ///
 /// The chunked path runs with both scan slices (`GdnScanSlice`), which must
-/// agree bit for bit, so every chunked test holds both kernels.
+/// agree bit for bit, so every chunked test holds both kernels; so does the
+/// recurrent path, whose 16-column kernel `gdn_recurrent_with_slice` reaches
+/// (the `_varlen` form runs the default slice only).
 fn run_gdn_lens(
     rt: &Arc<GpuRuntime>,
     d: &GdnData,
@@ -330,11 +332,15 @@ fn run_gdn_lens(
     lens: Option<&[u32]>,
 ) -> (Vec<f32>, Vec<f32>) {
     let base = run_gdn_slice(rt, d, path, mode, lens, GdnScanSlice::Cols32);
-    if path == Path::Chunk {
+    if path == Path::Chunk || lens.is_none() {
         let narrow = run_gdn_slice(rt, d, path, mode, lens, GdnScanSlice::Cols16);
         let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
-        assert_eq!(bits(&narrow.0), bits(&base.0), "16-column scan output vs 32-column");
-        assert_eq!(bits(&narrow.1), bits(&base.1), "16-column scan state vs 32-column");
+        assert_eq!(
+            bits(&narrow.0),
+            bits(&base.0),
+            "{path:?}: 16-column output vs 32-column"
+        );
+        assert_eq!(bits(&narrow.1), bits(&base.1), "{path:?}: 16-column state vs 32-column");
     }
     base
 }
@@ -403,7 +409,8 @@ fn run_gdn_slice(
             .unwrap();
         }
         (Path::Recurrent, None) => {
-            qwen35::gdn_recurrent(rt, &dims, &qkv, &gates, &params, state, out_cols, state_out).unwrap()
+            qwen35::gdn_recurrent_with_slice(rt, &dims, &qkv, &gates, &params, state, out_cols, state_out, slice)
+                .unwrap()
         }
         (Path::Recurrent, Some(l)) => {
             qwen35::gdn_recurrent_varlen(rt, &dims, &qkv, &gates, &params, state, out_cols, state_out, l).unwrap()
@@ -1850,6 +1857,7 @@ fn every_qwen35_kernel_is_in_the_metallib() {
             "qwen35_gdn_chunk_scan",
             "qwen35_gdn_chunk_scan_bv16",
             "qwen35_gdn_recurrent",
+            "qwen35_gdn_recurrent_bv16",
             "qwen35_gated_rms_norm_f32",
             "qwen35_gated_rms_norm_bf16",
             "qwen35_attn_qk_norm_rope",
@@ -2601,13 +2609,15 @@ fn prefix_case(
             len: p as u32,
         };
         if decode {
-            qwen35::attn_prefix_decode(rt, &q, prefix, &skb, &svb, &slen, &qpos, &got, dims, bf16).unwrap();
+            let scratch = tessl::nn::DecodeScratch::new(rt, dims.batch, dims.heads, full_cap, PFX_D as u32).unwrap();
+            qwen35::attn_prefix_decode(rt, &q, prefix, &skb, &svb, &slen, &qpos, &got, &scratch, dims, bf16).unwrap();
             tessl::nn::flash_attn_decode(
                 rt,
                 &q,
                 &fkb,
                 &fvb,
                 &want,
+                &scratch,
                 &tkv,
                 &qpos,
                 &zero,
@@ -2996,8 +3006,9 @@ fn prefix_varlen_case(
     let n = batch * per_q;
     let got = seeded(rt, n, SENTINEL);
     let dims = pfx_dims(batch, tq);
+    let scratch = tessl::nn::DecodeScratch::new(rt, batch as u32, PFX_HQ as u32, p + s_cap, PFX_D as u32).unwrap();
     if decode {
-        qwen35::attn_prefix_decode_varlen(rt, &q, prefix, &skb, &svb, &lb, &qb, &got, dims, false)
+        qwen35::attn_prefix_decode_varlen(rt, &q, prefix, &skb, &svb, &lb, &qb, &got, &scratch, dims, false)
     } else {
         qwen35::attn_prefix_rows_varlen(rt, &q, prefix, &skb, &svb, &lb, &qb, &got, dims, false)
     }
@@ -3011,7 +3022,7 @@ fn prefix_varlen_case(
         let want = seeded(rt, per_q, SENTINEL);
         let d1 = pfx_dims(1, tq);
         if decode {
-            qwen35::attn_prefix_decode(rt, &q1, prefix, &sk1, &sv1, &l1, &p1, &want, d1, false)
+            qwen35::attn_prefix_decode(rt, &q1, prefix, &sk1, &sv1, &l1, &p1, &want, &scratch, d1, false)
         } else {
             qwen35::attn_prefix_rows(rt, &q1, prefix, &sk1, &sv1, &l1, &p1, &want, d1, false)
         }
@@ -3211,8 +3222,9 @@ fn attn_prefix_rows_rejects_bad_shapes_and_aliases() {
         expect_err(run(prefix, &o, grouped), "is not a multiple of heads_kv");
         // The decode path takes one query per row, and shares every other
         // check with the rows path.
+        let scratch = tessl::nn::DecodeScratch::new(rt, b as u32, PFX_HQ as u32, p + 1 + s_cap, PFX_D as u32).unwrap();
         let decode = |prefix: qwen35::SharedPrefix<'_>, dims: tessl::nn::AttnDims| {
-            qwen35::attn_prefix_decode(rt, &q, prefix, &sk, &sv, &slen, &qpos, &o, dims, false)
+            qwen35::attn_prefix_decode(rt, &q, prefix, &sk, &sv, &slen, &qpos, &o, &scratch, dims, false)
         };
         expect_err(decode(prefix, pfx_dims(b, tq)), "one query per row (tq = 1)");
         expect_err(decode(too_long, pfx_dims(b, 1)), "exceeds the prefix K/V capacity");

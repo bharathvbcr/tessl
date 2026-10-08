@@ -1,0 +1,130 @@
+# bench_qwen35_layers BEFORE the dispatch host-overhead changes — M5 Pro, 2026-10-08
+#
+# Binary: bench_qwen35_layers built at e91121e (the harness commit: host-us column, host
+# path section, decode-style sample loops, --decode; no library change),
+# frozen and run through
+#
+#   BENCH_BINS="before=<frozen e91121e binary>" bench/paired_bins.sh 5 OUT --decode=4096
+#
+# One process per round; each process reports medians; the summary is the
+# min (max) of those over 5 rounds. host_us = batched-arm encode per dispatch
+# (64 per command buffer, before its synchronize). sample_* = one token per
+# loop: final-norm-sized rms_norm + sampler over vocab 248320, async encode
+# on, token read back. decode_* = batch-1 Qwen3.5-2B-shaped decode through
+# 24 layers after a 4096-token prefix (random bf16 weights), encode and
+# commit+wait timed apart; LM head and sampler excluded.
+#
+# Conditions: the machine was shared. Other sessions ran cargo test suites
+# (GitPulse, Lappi-decision mac_heavy lanes) on the CPU throughout, and a
+# peer tessl session's qwen35_train test was on the GPU shortly before. The
+# max column shows that load. Compare against the interleaved before/after
+# run (*_after_m5pro.txt), not against these alone.
+#
+# ---- round 0, before: /private/tmp/claude-501/-Users-bharath-Code-research-tessl/0bc74f4b-1227-426e-b4b6-22f33db83c11/scratchpad/before/bench_qwen35_layers --decode=4096 ----
+device: Apple M5 Pro
+Qwen3.5-2B shapes: hidden 2048, GDN 16k/16v heads x 128, attn 8q/2kv x 256 (rotary 64), MLP 6144, vocab 248320
+layers: 18 GDN + 6 attention, batch 1, bf16 weights distinct per layer
+gdn scan: Cols32
+swiglu: qwen35::swiglu (bf16 out)
+attention kernel: qwen35::attn_prefill (TensorOps f32), tile q32_k32_sg4
+weights uploaded in 0.5 s
+decode plausibility gate passed: 271 dispatches per token, prefix 4096
+decode, batch 1, prefix 4096 (median of 21 x 16 tokens):
+  encode           328.3 us/token  (1.21 us/dispatch)
+  commit+wait    21047.0 us/token
+  wall           21376.6 us/token  (46.8 tok/s)
+  gdn_recurrent alone         31.27 us (8 per command buffer)
+  attn_prefix_decode alone   100.67 us (8 per command buffer)
+METRIC decode_encode_us 328.320
+METRIC decode_wait_us 21046.966
+METRIC decode_wall_us 21376.601
+METRIC decode_gdn_recurrent_us 31.271
+METRIC decode_attn_prefix_decode_us 100.672
+# ---- round 1, before: /private/tmp/claude-501/-Users-bharath-Code-research-tessl/0bc74f4b-1227-426e-b4b6-22f33db83c11/scratchpad/before/bench_qwen35_layers --decode=4096 ----
+device: Apple M5 Pro
+Qwen3.5-2B shapes: hidden 2048, GDN 16k/16v heads x 128, attn 8q/2kv x 256 (rotary 64), MLP 6144, vocab 248320
+layers: 18 GDN + 6 attention, batch 1, bf16 weights distinct per layer
+gdn scan: Cols32
+swiglu: qwen35::swiglu (bf16 out)
+attention kernel: qwen35::attn_prefill (TensorOps f32), tile q32_k32_sg4
+weights uploaded in 0.5 s
+decode plausibility gate passed: 271 dispatches per token, prefix 4096
+decode, batch 1, prefix 4096 (median of 21 x 16 tokens):
+  encode           321.7 us/token  (1.19 us/dispatch)
+  commit+wait    20970.7 us/token
+  wall           21296.0 us/token  (47.0 tok/s)
+  gdn_recurrent alone         35.17 us (8 per command buffer)
+  attn_prefix_decode alone   108.15 us (8 per command buffer)
+METRIC decode_encode_us 321.667
+METRIC decode_wait_us 20970.721
+METRIC decode_wall_us 21296.039
+METRIC decode_gdn_recurrent_us 35.167
+METRIC decode_attn_prefix_decode_us 108.146
+# ---- round 2, before: /private/tmp/claude-501/-Users-bharath-Code-research-tessl/0bc74f4b-1227-426e-b4b6-22f33db83c11/scratchpad/before/bench_qwen35_layers --decode=4096 ----
+device: Apple M5 Pro
+Qwen3.5-2B shapes: hidden 2048, GDN 16k/16v heads x 128, attn 8q/2kv x 256 (rotary 64), MLP 6144, vocab 248320
+layers: 18 GDN + 6 attention, batch 1, bf16 weights distinct per layer
+gdn scan: Cols32
+swiglu: qwen35::swiglu (bf16 out)
+attention kernel: qwen35::attn_prefill (TensorOps f32), tile q32_k32_sg4
+weights uploaded in 0.5 s
+decode plausibility gate passed: 271 dispatches per token, prefix 4096
+decode, batch 1, prefix 4096 (median of 21 x 16 tokens):
+  encode           308.4 us/token  (1.14 us/dispatch)
+  commit+wait    20771.4 us/token
+  wall           21056.3 us/token  (47.5 tok/s)
+  gdn_recurrent alone         35.06 us (8 per command buffer)
+  attn_prefix_decode alone   103.12 us (8 per command buffer)
+METRIC decode_encode_us 308.404
+METRIC decode_wait_us 20771.430
+METRIC decode_wall_us 21056.336
+METRIC decode_gdn_recurrent_us 35.062
+METRIC decode_attn_prefix_decode_us 103.125
+# ---- round 3, before: /private/tmp/claude-501/-Users-bharath-Code-research-tessl/0bc74f4b-1227-426e-b4b6-22f33db83c11/scratchpad/before/bench_qwen35_layers --decode=4096 ----
+device: Apple M5 Pro
+Qwen3.5-2B shapes: hidden 2048, GDN 16k/16v heads x 128, attn 8q/2kv x 256 (rotary 64), MLP 6144, vocab 248320
+layers: 18 GDN + 6 attention, batch 1, bf16 weights distinct per layer
+gdn scan: Cols32
+swiglu: qwen35::swiglu (bf16 out)
+attention kernel: qwen35::attn_prefill (TensorOps f32), tile q32_k32_sg4
+weights uploaded in 0.5 s
+decode plausibility gate passed: 271 dispatches per token, prefix 4096
+decode, batch 1, prefix 4096 (median of 21 x 16 tokens):
+  encode           403.2 us/token  (1.49 us/dispatch)
+  commit+wait    24448.0 us/token
+  wall           24891.4 us/token  (40.2 tok/s)
+  gdn_recurrent alone         56.57 us (8 per command buffer)
+  attn_prefix_decode alone   228.88 us (8 per command buffer)
+METRIC decode_encode_us 403.240
+METRIC decode_wait_us 24448.005
+METRIC decode_wall_us 24891.362
+METRIC decode_gdn_recurrent_us 56.568
+METRIC decode_attn_prefix_decode_us 228.880
+# ---- round 4, before: /private/tmp/claude-501/-Users-bharath-Code-research-tessl/0bc74f4b-1227-426e-b4b6-22f33db83c11/scratchpad/before/bench_qwen35_layers --decode=4096 ----
+device: Apple M5 Pro
+Qwen3.5-2B shapes: hidden 2048, GDN 16k/16v heads x 128, attn 8q/2kv x 256 (rotary 64), MLP 6144, vocab 248320
+layers: 18 GDN + 6 attention, batch 1, bf16 weights distinct per layer
+gdn scan: Cols32
+swiglu: qwen35::swiglu (bf16 out)
+attention kernel: qwen35::attn_prefill (TensorOps f32), tile q32_k32_sg4
+weights uploaded in 1.4 s
+decode plausibility gate passed: 271 dispatches per token, prefix 4096
+decode, batch 1, prefix 4096 (median of 21 x 16 tokens):
+  encode           366.3 us/token  (1.35 us/dispatch)
+  commit+wait    23950.3 us/token
+  wall           24319.8 us/token  (41.1 tok/s)
+  gdn_recurrent alone         40.48 us (8 per command buffer)
+  attn_prefix_decode alone   107.17 us (8 per command buffer)
+METRIC decode_encode_us 366.276
+METRIC decode_wait_us 23950.273
+METRIC decode_wall_us 24319.833
+METRIC decode_gdn_recurrent_us 40.484
+METRIC decode_attn_prefix_decode_us 107.167
+
+# ---- summary: 5 rounds; min (max) over rounds of each process's median ----
+metric                                             before min (max)
+decode_encode_us                                308.404 (  403.240)
+decode_wait_us                                20771.430 (24448.005)
+decode_wall_us                                21056.336 (24891.362)
+decode_gdn_recurrent_us                          31.271 (   56.568)
+decode_attn_prefix_decode_us                    100.672 (  228.880)

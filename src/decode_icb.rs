@@ -28,13 +28,10 @@ use std::sync::atomic::{AtomicI8, Ordering};
 
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
-use objc2::ClassType;
-use objc2_foundation::NSString;
 use objc2_metal::{
-    MTL4ArgumentTable, MTL4ArgumentTableDescriptor, MTL4Compiler, MTL4CompilerDescriptor,
-    MTL4ComputePipelineDescriptor, MTL4IndirectCommandBufferSupportState, MTL4LibraryFunctionDescriptor, MTLAllocation,
-    MTLBuffer, MTLComputePipelineState, MTLDevice, MTLIndirectCommandBuffer, MTLIndirectCommandBufferDescriptor,
-    MTLIndirectCommandType, MTLIndirectComputeCommand, MTLLibrary, MTLResourceOptions, MTLSize,
+    MTL4ArgumentTable, MTL4ArgumentTableDescriptor, MTLAllocation, MTLBuffer, MTLComputePipelineState, MTLDevice,
+    MTLIndirectCommandBuffer, MTLIndirectCommandBufferDescriptor, MTLIndirectCommandType, MTLIndirectComputeCommand,
+    MTLResourceOptions, MTLSize,
 };
 
 use crate::ab_flags::env_truthy;
@@ -1299,45 +1296,13 @@ impl DecodeIcb {
     }
 }
 
-/// Build an ICB-capable MTL4 pipeline for `fn_name` from the runtime library.
+/// The ICB-capable pipeline for `fn_name`, from the runtime's pipeline cache
+/// (compiled on first use), whatever [`icb_pipelines_enabled`] says.
 pub fn pipeline_icb(
     rt: &GpuRuntime,
     fn_name: &str,
 ) -> Result<Retained<ProtocolObject<dyn MTLComputePipelineState>>, String> {
-    let compiler_desc = MTL4CompilerDescriptor::new();
-    let compiler = rt
-        .device
-        .newCompilerWithDescriptor_error(&compiler_desc)
-        .map_err(|e| format!("MTL4Compiler: {e}"))?;
-
-    let func_desc = MTL4LibraryFunctionDescriptor::new();
-    func_desc.setName(Some(&NSString::from_str(fn_name)));
-    // Prefer overlay (gemma) then primary library.
-    let lib = {
-        let overlays = rt.overlay_libraries_snapshot()?;
-        let fname = NSString::from_str(fn_name);
-        let mut found = None;
-        for o in &overlays {
-            if o.newFunctionWithName(&fname).is_some() {
-                found = Some(o.clone());
-                break;
-            }
-        }
-        found.unwrap_or_else(|| rt.library.clone())
-    };
-    func_desc.setLibrary(Some(&lib));
-
-    let pipe_desc = MTL4ComputePipelineDescriptor::new();
-    pipe_desc.setComputeFunctionDescriptor(Some(func_desc.as_super()));
-    pipe_desc.setSupportIndirectCommandBuffers(MTL4IndirectCommandBufferSupportState::Enabled);
-
-    let pipe = compiler
-        .newComputePipelineStateWithDescriptor_compilerTaskOptions_error(&pipe_desc, None)
-        .map_err(|e| format!("ICB MTL4 pipeline '{fn_name}': {e}"))?;
-    if !pipe.supportIndirectCommandBuffers() {
-        return Err(format!("ICB pipeline '{fn_name}' supportIndirectCommandBuffers=false"));
-    }
-    Ok(pipe)
+    rt.pipeline_for_mode(fn_name, true)
 }
 
 // --- Capture tape (thread-local) --------------------------------------------

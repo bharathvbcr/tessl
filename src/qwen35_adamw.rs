@@ -393,7 +393,7 @@ impl AdamW {
         // An `AdamW` made for a model loaded on another runtime matches in
         // shape; its buffers are outside this runtime's residency set.
         let rt = &model.rt;
-        require_runtime(rt, &self.dummy, &format!("{what}: the AdamW state"))?;
+        require_runtime(rt, &self.dummy, format_args!("{what}: the AdamW state"))?;
         for (p, s) in ps.iter().zip(&self.slots) {
             let name = &p.info.name;
             for b in [Some(&s.m), Some(&s.v), s.aux.as_ref()]
@@ -401,7 +401,7 @@ impl AdamW {
                 .flatten()
                 .chain(s.scales.iter().flat_map(|(a, b)| [a, b]))
             {
-                require_runtime(rt, b, &format!("{what}: {name}'s AdamW state"))?;
+                require_runtime(rt, b, format_args!("{what}: {name}'s AdamW state"))?;
             }
         }
         Ok(())

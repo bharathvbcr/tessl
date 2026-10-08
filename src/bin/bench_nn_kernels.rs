@@ -20,6 +20,19 @@
 //! The gap between the two columns is what `async_encode` buys, and it is
 //! large. Note that it defaults to **off**.
 //!
+//! A third column, **host us**, is the batched arm's encode time alone: the
+//! `BATCH` calls before the `synchronize()`, divided by `BATCH`. Nothing runs
+//! on the GPU until that commit, so it is what the host pays per dispatch
+//! (validation, pipeline lookup, binder setup, scratch allocation), not the
+//! kernel.
+//!
+//! After the table, a **host path** section times the pieces of that cost
+//! directly, and a **decode-style sample loop**: one sampler call per token,
+//! encoded with async encode on and the token read back, as a GPU-resident
+//! decode loop would. Every figure there is also printed as a `METRIC name
+//! value` line so `bench/paired_bins.sh` can take an interleaved min-of-N
+//! across two frozen binaries. `--host-only` skips the kernel table.
+//!
 //! Every kernel is checked for a plausible result before being timed. A kernel
 //! that silently wrote nothing would otherwise post the best number in the
 //! table.
@@ -62,6 +75,8 @@ struct Row {
     name: String,
     shape: String,
     batched_us: f64,
+    /// Encode time per dispatch in the batched arm, before its synchronize.
+    host_us: f64,
     solo_us: f64,
     gb_s: f64,
 }
@@ -90,11 +105,13 @@ fn measure(
     // point of the measurement.
     rt.set_async_encode(true)?;
     let mut batched = Vec::with_capacity(iters);
+    let mut host = Vec::with_capacity(iters);
     for _ in 0..iters {
         let t0 = Instant::now();
         for _ in 0..BATCH {
             f()?;
         }
+        host.push(t0.elapsed().as_secs_f64() * 1e6 / BATCH as f64);
         rt.synchronize()?;
         batched.push(t0.elapsed().as_secs_f64() * 1e6 / BATCH as f64);
     }
@@ -113,6 +130,7 @@ fn measure(
         name: name.to_string(),
         shape: shape.to_string(),
         batched_us: b,
+        host_us: median(host),
         solo_us: median(solo),
         gb_s: bytes / (b * 1e-6) / 1e9,
     })
@@ -182,10 +200,26 @@ fn main() -> Result<(), String> {
         .and_then(|s| s.parse().ok())
         .unwrap_or(50);
 
+    let mut host_only = false;
+    for arg in std::env::args().skip(1) {
+        match arg.as_str() {
+            "--host-only" => host_only = true,
+            other => return Err(format!("unknown argument {other:?}; expected --host-only")),
+        }
+    }
+
     println!("device: {}", rt.device_name());
+    if !host_only {
+        kernel_table(&rt, warmup, iters)?;
+    }
+    host_path(&rt, warmup, iters)
+}
+
+fn kernel_table(rt: &Arc<GpuRuntime>, warmup: usize, iters: usize) -> Result<(), String> {
+    let rt = rt.clone();
     println!(
         "batched = {BATCH} dispatches per command buffer; solo = 1 dispatch + \
-         synchronize\n"
+         synchronize; host = batched encode before its synchronize\n"
     );
 
     let mut rows: Vec<Row> = Vec::new();
@@ -378,15 +412,25 @@ fn main() -> Result<(), String> {
     }
 
     println!(
-        "{:<38} {:>16} {:>12} {:>12} {:>10}",
-        "kernel", "shape", "batched us", "solo us", "GB/s"
+        "{:<38} {:>16} {:>12} {:>10} {:>12} {:>10}",
+        "kernel", "shape", "batched us", "host us", "solo us", "GB/s"
     );
     for r in &rows {
         println!(
-            "{:<38} {:>16} {:>12.3} {:>12.3} {:>10.1}",
-            r.name, r.shape, r.batched_us, r.solo_us, r.gb_s
+            "{:<38} {:>16} {:>12.3} {:>10.3} {:>12.3} {:>10.1}",
+            r.name, r.shape, r.batched_us, r.host_us, r.solo_us, r.gb_s
         );
     }
+    let host = median(rows.iter().map(|r| r.host_us).collect());
+    println!("\nMedian host encode per batched dispatch: {host:.2} us.");
+    for r in &rows {
+        // The bracketed GFLOP/s in a GEMM row's name changes run to run.
+        let base = r.name.split(" [").next().unwrap_or(&r.name);
+        let tag = r.name.find(" [").map(|i| &r.name[i..]).filter(|t| !t.contains("GFLOP"));
+        let name = format!("{base}{}", tag.unwrap_or("")).replace([' ', '[', ']'], "");
+        println!("METRIC host_us/{name}/{} {:.4}", r.shape, r.host_us);
+    }
+    println!("METRIC host_us/median {host:.4}");
 
     let floor = median(rows.iter().map(|r| r.solo_us).collect());
     println!(
@@ -395,4 +439,148 @@ fn main() -> Result<(), String> {
          alone."
     );
     Ok(())
+}
+
+/// Qwen3.5's vocabulary: the row a decode sampler reduces each token.
+const VOCAB: usize = 248_320;
+/// Tokens per timed sample-loop iteration.
+const TOKENS: usize = 32;
+/// Calls per timed iteration of a host-only microbenchmark.
+const HOST_CALLS: usize = 20_000;
+
+/// Median over `iters` of the mean nanoseconds per call of `f`, `HOST_CALLS`
+/// calls an iteration.
+fn ns_per_call(iters: usize, mut f: impl FnMut() -> Result<(), String>) -> Result<f64, String> {
+    let mut v = Vec::with_capacity(iters);
+    for _ in 0..iters {
+        let t0 = Instant::now();
+        for _ in 0..HOST_CALLS {
+            f()?;
+        }
+        v.push(t0.elapsed().as_secs_f64() * 1e9 / HOST_CALLS as f64);
+    }
+    Ok(median(v))
+}
+
+/// One decode-style token loop: `encode` queues a token's work with async
+/// encode on, `read` returns the token (and is where the wait belongs).
+/// Returns median-over-iterations (encode us, wall us) per token.
+fn sample_loop(
+    rt: &Arc<GpuRuntime>,
+    warmup: usize,
+    iters: usize,
+    mut encode: impl FnMut() -> Result<(), String>,
+    mut read: impl FnMut() -> Result<u32, String>,
+) -> Result<(f64, f64, u32), String> {
+    rt.set_async_encode(true)?;
+    let mut token = 0;
+    for _ in 0..warmup {
+        encode()?;
+        token = read()?;
+    }
+    let (mut enc, mut wall) = (Vec::with_capacity(iters), Vec::with_capacity(iters));
+    for _ in 0..iters {
+        let (mut e, mut w) = (0.0, 0.0);
+        for _ in 0..TOKENS {
+            let t0 = Instant::now();
+            encode()?;
+            let t1 = Instant::now();
+            let got = read()?;
+            let t2 = Instant::now();
+            if got != token {
+                return Err(format!("sample loop: token changed from {token} to {got}"));
+            }
+            e += (t1 - t0).as_secs_f64();
+            w += (t2 - t0).as_secs_f64();
+        }
+        enc.push(e * 1e6 / TOKENS as f64);
+        wall.push(w * 1e6 / TOKENS as f64);
+    }
+    rt.set_async_encode(false)?;
+    Ok((median(enc), median(wall), token))
+}
+
+/// The host side of a dispatch, timed apart from any kernel.
+fn host_path(rt: &Arc<GpuRuntime>, warmup: usize, iters: usize) -> Result<(), String> {
+    println!("\n-- host path --");
+
+    // Pipeline lookup on a cache hit, both cache modes. The ICB mode builds
+    // its own pipeline on first use, so warm it before timing.
+    tessl::decode_icb::set_icb_pipelines(false);
+    rt.pipeline("rms_norm_f32")?;
+    let plain = ns_per_call(iters, || rt.pipeline("rms_norm_f32").map(drop))?;
+    tessl::decode_icb::set_icb_pipelines(true);
+    rt.pipeline("rms_norm_f32")?;
+    let icb = ns_per_call(iters, || rt.pipeline("rms_norm_f32").map(drop))?;
+    tessl::decode_icb::set_icb_pipelines(false);
+    println!("pipeline hit:          {plain:>9.1} ns");
+    println!("pipeline hit (ICB):    {icb:>9.1} ns");
+    println!("METRIC pipeline_hit_ns {plain:.3}");
+    println!("METRIC pipeline_hit_icb_ns {icb:.3}");
+
+    // Decode-style sampling over a full vocabulary: a final-norm-sized
+    // dispatch, then the sampler, then read the token.
+    let logits = buf(rt, &fill(VOCAB, 0x61));
+    let cap = buf(rt, &[30.0]);
+    let hx = buf(rt, &fill(2048, 0x62));
+    let hw = buf(rt, &fill(2048, 0x63));
+    let ho = out_buf(rt, 2048);
+    let norm = || nn::rms_norm_f32(rt, &hx, &hw, &ho, 1, 2048, 1e-6);
+    let tok = rt.alloc_buffer(4)?;
+
+    let (enc, wall, t) = sample_loop(
+        rt,
+        warmup,
+        iters,
+        || {
+            norm()?;
+            nn::softcap_argmax_one_pass(rt, &logits, &tok, &cap, VOCAB as u32)
+        },
+        || read_token(&tok),
+    )?;
+    println!("softcap_argmax_one_pass token loop: encode {enc:>8.2} us, wall {wall:>8.2} us per token (token {t})");
+    println!("METRIC sample_one_pass_encode_us {enc:.4}");
+    println!("METRIC sample_one_pass_wall_us {wall:.4}");
+
+    // Multi-pass: V -> ceil(V/256) -> ... -> 1.
+    let mut ns = vec![VOCAB as u32];
+    while *ns.last().unwrap() > 1 {
+        ns.push(nn::argmax_pass_groups(*ns.last().unwrap()) as u32);
+    }
+    let idx: Vec<GpuBuffer> = ns[1..]
+        .iter()
+        .map(|&g| rt.alloc_buffer(g as usize * 4))
+        .collect::<Result<_, _>>()?;
+    let val: Vec<GpuBuffer> = ns[1..]
+        .iter()
+        .map(|&g| rt.alloc_buffer(g as usize * 4))
+        .collect::<Result<_, _>>()?;
+    let passes = idx.len();
+    let (enc, wall, t) = sample_loop(
+        rt,
+        warmup,
+        iters,
+        || {
+            norm()?;
+            for p in 0..passes {
+                let (input, idx_in) = if p == 0 {
+                    (&logits, None)
+                } else {
+                    (&val[p - 1], Some(&idx[p - 1]))
+                };
+                nn::argmax_f32_pass(rt, input, &idx[p], &val[p], idx_in, &cap, ns[p])?;
+            }
+            Ok(())
+        },
+        || read_token(&idx[passes - 1]),
+    )?;
+    println!("argmax_f32_pass x{passes} token loop:  encode {enc:>8.2} us, wall {wall:>8.2} us per token (token {t})");
+    println!("METRIC sample_multi_pass_encode_us {enc:.4}");
+    println!("METRIC sample_multi_pass_wall_us {wall:.4}");
+    Ok(())
+}
+
+/// The token a sampler wrote, with its no-finite-logit refusal.
+fn read_token(out: &GpuBuffer) -> Result<u32, String> {
+    nn::check_argmax_result(out)
 }

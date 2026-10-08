@@ -28,6 +28,16 @@ All notable changes to `tessl` are recorded here. The format follows
   `--async`, `--step-only` and `--clip`, and prints each step's waits and
   device peak; `bench/paired_qwen35_step.sh` interleaves configurations and
   a before/after pair of binaries.
+- **`qwen35_gdn_recurrent_bv16`, the GDN decode recurrence in 16-column
+  slices.** `qwen35::gdn_recurrent_with_slice(.., GdnScanSlice::Cols16)` runs
+  it: 64-thread groups, each simdgroup holding two 32-row key blocks of the
+  same 16 value columns, so every reduction runs in the 32-column kernel's
+  order and the two agree bit for bit (held by every recurrent test in
+  `tests/qwen35_kernels.rs` and by the CPU emulator). It launches twice the
+  threadgroups of the 32-column kernel. `gdn_recurrent` keeps
+  `GDN_RECURRENT_SLICE = Cols32`: a paired batch-1 sweep
+  (`bench_qwen35_layers --paired-gdn-recurrent`) found no difference outside
+  its noise, so the 16-column kernel is not promoted.
 - **Qwen3.5 training on bf16 storage.** A `Precision::Bf16` model (loaded
   with `load_tower`) trains on `GemmOperands::Bf16` with its matrices kept in
   bf16; arithmetic stays f32. `AdamWConfig` picks an `UpdateRule` for
@@ -88,7 +98,43 @@ All notable changes to `tessl` are recorded here. The format follows
   previous build: -14% / -17% per step sync and -32% / -4% async at
   T = 256 / 2048, peak memory not above before
   (`bench/results/qwen35_train_step_{before,after}_m5pro.txt`).
-
+- **Samplers only encode; `nn::check_argmax_result` reads and refuses the
+  token.** `softcap_sample`, `softcap_argmax_one_pass` and `argmax_f32_pass`
+  (and their `_with_scalars` forms) no longer synchronize and read their output
+  back to refuse a row with no finite logit, so a decode loop can queue the
+  sampler behind the step and a multi-pass argmax no longer drains after every
+  pass. Read the token with `check_argmax_result(out)`, which returns it or
+  the same "no finite value" error; for a multi-pass argmax, pass the final
+  pass's `out_idx`. This also fixes a refusal that was wrong: the per-pass
+  check rejected a row in which only one 256-logit group had no finite value
+  (a masked block of the vocabulary), although the next pass skips such a
+  group. A caller that relied on the sampler's own `Err` must now call
+  `check_argmax_result`. The first `argmax_f32_pass` binds `logits` in its
+  unused `idx_in` slot instead of allocating a 4-byte placeholder.
+- **Decode attention takes a caller-owned `nn::DecodeScratch`.**
+  `nn::flash_attn_decode`, `nn::flash_attn_decode_with_chunk`,
+  `qwen35::attn_prefix_decode` and `qwen35::attn_prefix_decode_varlen` take
+  a `&DecodeScratch` (after `o`) instead of allocating the partial pass's
+  scratch on every call, so a decode loop binds one buffer at one address
+  every token. Size it with `DecodeScratch::new(rt, batch, heads,
+  key_capacity, head_dim)` (`with_chunk` for an explicit chunk); a scratch too
+  small for the call, or one that is also an operand, is refused before
+  anything is encoded. The `nn::flash_attn` router keeps its signature and
+  sizes a scratch per call. This breaks callers of the four functions.
+- **Decode-path validation allocates nothing on success.** The buffer checks
+  take their error label as any `Display`, so call sites pass `format_args!`
+  and format only on failure, and the GDN, conv and QK-norm/RoPE entry points
+  check optional operands without collecting them into a `Vec`.
+  `tests/host_path_allocs.rs` counts heap allocations per call across every
+  entry point a batch-1 Qwen3.5 decode token encodes, and holds them at zero.
+- **Pipeline cache hits allocate nothing.** `GpuRuntime::pipeline` keeps
+  plain and ICB-capable pipelines in separate maps, so the ICB mode no longer
+  formats an `icb:{name}` key per call; a miss looks the function up once per
+  library instead of twice; and the decode/rows attention, `out`-dtype
+  Qwen3.5 kernels resolve static entry-point names. `decode_icb::pipeline_icb`
+  now returns the cached ICB pipeline instead of compiling a new one per call.
+  Pooled-buffer allocation no longer locks a mutex to read the runtime's weak
+  self-handle.
 - **C ABI 10: `tessl_qwen35_load` takes a precision and
   `tessl_qwen35_adamw_init` an optimizer configuration.** `tessl_qwen35_load`
   gains `precision` (`TESSL_F32` or `TESSL_BF16`) before `out`;

@@ -43,6 +43,7 @@
 //! validated capacities, and turn an out-of-range slot, answer or token id into
 //! a NaN row instead of an out-of-bounds read.
 
+use std::fmt;
 use std::sync::Arc;
 
 use objc2::runtime::ProtocolObject;
@@ -51,8 +52,8 @@ use objc2_metal::MTLComputePipelineState;
 use crate::dispatch::{dispatch_2d, set_f32, set_gpu_buf, set_gpu_buf_offset, set_u32, Binder};
 use crate::gemm::{gemm, gemm_epilogue, Epilogue, GemmBackend};
 use crate::nn::{
-    bind_rope_inv_freq, dispatch_tg_1d, reduce_tptg, require, require_disjoint_writes, require_runtime,
-    validate_rms_scalars,
+    bind_rope_inv_freq, dispatch_tg_1d, reduce_tptg, require, require_disjoint_writes, require_disjoint_writes_opt,
+    require_runtime, validate_rms_scalars,
 };
 use crate::runtime::{mtl_size, GpuRuntime};
 use crate::tensor::{DType, GpuBuffer, Tensor};
@@ -72,6 +73,8 @@ const SCAN16_TG_BYTES: usize = 4 * (128 * 20 + 64 * 20 + 4 * 128 + 4 * 64);
 const REC_TG_BYTES: usize = 4 * (2 * 4 * 32);
 const PREP_THREADS: usize = 256;
 const SCAN_THREADS: usize = 128;
+/// Threads of `qwen35_gdn_recurrent_bv16`: 4 key blocks x 16 columns.
+const REC16_THREADS: usize = 64;
 /// Simdgroups per threadgroup for the one-simdgroup-per-row kernels.
 const ROWS_PER_TG: usize = 8;
 /// `REDUCE_MAX_SIMDGROUPS` in kernels/reduce_tree.h.
@@ -114,7 +117,7 @@ impl<'a> Cols<'a> {
 
 /// Elements a `rows x width` window at `off` of stride `ld` reaches, or an error
 /// if it does not fit in its row.
-pub(crate) fn window_elems(rows: u64, ld: u32, off: u32, width: u64, what: &str) -> Result<usize, String> {
+pub(crate) fn window_elems(rows: u64, ld: u32, off: u32, width: u64, what: impl fmt::Display) -> Result<usize, String> {
     if u64::from(off) + width > u64::from(ld) {
         return Err(format!(
             "{what}: window [{off}, {off} + {width}) does not fit a row of {ld}"
@@ -131,7 +134,13 @@ pub(crate) fn window_elems(rows: u64, ld: u32, off: u32, width: u64, what: &str)
 }
 
 /// Check a window's buffer: right runtime, enough `T`-sized elements.
-pub(crate) fn require_window<T>(rt: &GpuRuntime, c: Cols<'_>, rows: u64, width: u64, what: &str) -> Result<(), String> {
+pub(crate) fn require_window<T>(
+    rt: &GpuRuntime,
+    c: Cols<'_>,
+    rows: u64,
+    width: u64,
+    what: impl fmt::Display + Copy,
+) -> Result<(), String> {
     let need = window_elems(rows, c.ld, c.off, width, what)?;
     require::<T>(rt, c.buf, need, what)
 }
@@ -654,18 +663,16 @@ fn conv1d_silu_impl(
     }
     // state_out may never be the input state: output slot j of channel c is
     // input slot j + seq of the extended sequence, which another thread reads.
-    let mut writes = vec![("y", y)];
-    if let Some(s) = state_out {
-        writes.push(("state_out", s));
-    }
-    let mut reads = vec![("x", x.buf), ("weight", weight)];
-    if let Some(s) = state.buffer() {
-        reads.push(("state_in", s));
-    }
-    if let Some(l) = seq_lens {
-        reads.push(("seq_lens", l));
-    }
-    require_disjoint_writes(WHAT, &writes, &reads)?;
+    require_disjoint_writes_opt(
+        WHAT,
+        &[Some(("y", y)), state_out.map(|s| ("state_out", s))],
+        &[
+            Some(("x", x.buf)),
+            Some(("weight", weight)),
+            state.buffer().map(|s| ("state_in", s)),
+            seq_lens.map(|l| ("seq_lens", l)),
+        ],
+    )?;
 
     let flags = in_flag | if state_out.is_some() { 2 } else { 0 } | if seq_lens.is_some() { 4 } else { 0 };
     let p = pipeline_for(rt, "qwen35_conv1d_silu", CONV_THREADS, 0)?;
@@ -725,13 +732,13 @@ pub fn gdn_gates(
             ld: logits.ld,
             off,
         };
-        require_window::<f32>(rt, c, r, u64::from(heads), &format!("{WHAT} {name}"))?;
+        require_window::<f32>(rt, c, r, u64::from(heads), format_args!("{WHAT} {name}"))?;
     }
     let n = usize_product(&[rows as usize, heads as usize], WHAT)?;
-    require::<f32>(rt, params.a_log, heads as usize, &format!("{WHAT} a_log"))?;
-    require::<f32>(rt, params.dt_bias, heads as usize, &format!("{WHAT} dt_bias"))?;
-    require::<f32>(rt, g, n, &format!("{WHAT} g"))?;
-    require::<f32>(rt, beta, n, &format!("{WHAT} beta"))?;
+    require::<f32>(rt, params.a_log, heads as usize, format_args!("{WHAT} a_log"))?;
+    require::<f32>(rt, params.dt_bias, heads as usize, format_args!("{WHAT} dt_bias"))?;
+    require::<f32>(rt, g, n, format_args!("{WHAT} g"))?;
+    require::<f32>(rt, beta, n, format_args!("{WHAT} beta"))?;
     require_disjoint_writes(
         WHAT,
         &[("g", g), ("beta", beta)],
@@ -835,10 +842,12 @@ pub struct GdnParams<'a> {
     pub dt_bias: &'a GpuBuffer,
 }
 
-/// How many value columns one threadgroup of the chunked rule's sequential scan
-/// owns. Each output element runs the same arithmetic either way, so the
-/// results are bit-identical; `Cols16` launches twice the threadgroups, which
-/// pays when a small batch leaves the GPU underfilled (`probe_gdn_scan`).
+/// How many value columns one threadgroup of the chunked rule's sequential scan,
+/// or of the recurrent rule, owns. Each output element runs the same
+/// arithmetic either way, so the results are bit-identical; `Cols16` launches
+/// twice the threadgroups, which pays when a small batch leaves the GPU
+/// underfilled (`probe_gdn_scan`). The [`Default`] is the scan's;
+/// [`GDN_RECURRENT_SLICE`] is the recurrent rule's.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum GdnScanSlice {
     /// `qwen35_gdn_chunk_scan`: `v_dim / 32` threadgroups per head.
@@ -958,7 +967,7 @@ fn validate_gdn(
     state: StateIn<'_>,
     out: Cols<'_>,
     state_out: Option<&GpuBuffer>,
-    extra_writes: &[(&'static str, &GpuBuffer)],
+    workspace: Option<&GdnWorkspace>,
     seq_lens: Option<&GpuBuffer>,
 ) -> Result<(u32, u32), String> {
     dims.validate(what)?;
@@ -1019,28 +1028,36 @@ fn validate_gdn(
     // the elements it later writes, and nothing else touches them. It may not
     // be a snapshot, which every batch row reads.
     let in_place = matches!((state, state_out), (StateIn::PerBatch(i), Some(o)) if i.aliases(o));
-    let mut writes: Vec<(&str, &GpuBuffer)> = vec![("out", out.buf)];
-    writes.extend_from_slice(extra_writes);
-    if let Some(s) = state_out {
-        // In place, the state is one buffer that is both read and written; as
-        // a write it is still checked against every input below, so it cannot
-        // also be, say, the qkv buffer other threadgroups are reading.
-        writes.push((if in_place { "state (in place)" } else { "state_out" }, s));
-    }
-    let mut reads: Vec<(&str, &GpuBuffer)> = vec![
-        ("qkv", qkv.buf),
-        ("gate logits", gates.buf),
-        ("A_log", params.a_log),
-        ("dt_bias", params.dt_bias),
-    ];
-    if let (Some(s), false) = (state.buffer(), in_place) {
-        reads.push(("state_in", s));
-    }
     if let Some(l) = seq_lens {
         require::<u32>(rt, l, dims.batch as usize, "gdn seq_lens")?;
-        reads.push(("seq_lens", l));
     }
-    require_disjoint_writes(what, &writes, &reads)?;
+    // In place, the state is one buffer that is both read and written; as a
+    // write it is still checked against every input below, so it cannot also
+    // be, say, the qkv buffer other threadgroups are reading.
+    let state_write = state_out.map(|s| (if in_place { "state (in place)" } else { "state_out" }, s));
+    let reads = [
+        Some(("qkv", qkv.buf)),
+        Some(("gate logits", gates.buf)),
+        Some(("A_log", params.a_log)),
+        Some(("dt_bias", params.dt_bias)),
+        state.buffer().filter(|_| !in_place).map(|s| ("state_in", s)),
+        seq_lens.map(|l| ("seq_lens", l)),
+    ];
+    // The chunked path's workspace is written too, so it is checked against
+    // the same reads, and against `out` and the state, as one write set.
+    let ws = workspace.map(GdnWorkspace::buffers);
+    let ws_write = |i: usize| ws.map(|b| b[i]);
+    let writes = [
+        Some(("out", out.buf)),
+        state_write,
+        ws_write(0),
+        ws_write(1),
+        ws_write(2),
+        ws_write(3),
+        ws_write(4),
+        ws_write(5),
+    ];
+    require_disjoint_writes_opt(what, &writes, &reads)?;
     let flags = in_flag | if state_out.is_some() { 2 } else { 0 } | if seq_lens.is_some() { 4 } else { 0 };
     Ok((flags, bstride))
 }
@@ -1196,7 +1213,7 @@ fn gdn_chunk_forward_impl(
         state,
         out,
         state_out,
-        &ws.buffers(),
+        Some(ws),
         seq_lens,
     )?;
     // seq == 0 with a state_out still dispatches: it copies the start state
@@ -1311,7 +1328,43 @@ pub fn gdn_recurrent(
     out: Cols<'_>,
     state_out: Option<&GpuBuffer>,
 ) -> Result<(), String> {
-    gdn_recurrent_impl(rt, dims, qkv, gates, params, state, out, state_out, None)
+    gdn_recurrent_impl(
+        rt,
+        dims,
+        qkv,
+        gates,
+        params,
+        state,
+        out,
+        state_out,
+        None,
+        GDN_RECURRENT_SLICE,
+    )
+}
+
+/// The value-column slice [`gdn_recurrent`] and [`gdn_recurrent_varlen`] run in.
+///
+/// `Cols32`. `Cols16` (`qwen35_gdn_recurrent_bv16`) is bit-identical and
+/// launches twice the threadgroups, which at batch 1 is what the 32-column
+/// grid (`v_dim / 32 x v_heads`, 64 groups at the 2B's shapes) leaves idle;
+/// it becomes the default only if a paired batch-1 sweep
+/// (`bench_qwen35_layers --paired-gdn-recurrent`) has it faster.
+pub const GDN_RECURRENT_SLICE: GdnScanSlice = GdnScanSlice::Cols32;
+
+/// [`gdn_recurrent`] in a chosen value-column slice.
+#[allow(clippy::too_many_arguments)]
+pub fn gdn_recurrent_with_slice(
+    rt: &Arc<GpuRuntime>,
+    dims: &GdnDims,
+    qkv: &GdnQkv<'_>,
+    gates: &GdnGateLogits<'_>,
+    params: &GdnParams<'_>,
+    state: StateIn<'_>,
+    out: Cols<'_>,
+    state_out: Option<&GpuBuffer>,
+    slice: GdnScanSlice,
+) -> Result<(), String> {
+    gdn_recurrent_impl(rt, dims, qkv, gates, params, state, out, state_out, None, slice)
 }
 
 /// [`gdn_recurrent`] with a length per row.
@@ -1333,7 +1386,18 @@ pub fn gdn_recurrent_varlen(
     state_out: Option<&GpuBuffer>,
     seq_lens: &GpuBuffer,
 ) -> Result<(), String> {
-    gdn_recurrent_impl(rt, dims, qkv, gates, params, state, out, state_out, Some(seq_lens))
+    gdn_recurrent_impl(
+        rt,
+        dims,
+        qkv,
+        gates,
+        params,
+        state,
+        out,
+        state_out,
+        Some(seq_lens),
+        GDN_RECURRENT_SLICE,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1347,24 +1411,37 @@ fn gdn_recurrent_impl(
     out: Cols<'_>,
     state_out: Option<&GpuBuffer>,
     seq_lens: Option<&GpuBuffer>,
+    slice: GdnScanSlice,
 ) -> Result<(), String> {
     const WHAT: &str = "qwen35::gdn_recurrent";
-    let (flags, bstride) = validate_gdn(rt, WHAT, dims, qkv, gates, params, state, out, state_out, &[], seq_lens)?;
+    let (flags, bstride) = validate_gdn(
+        rt, WHAT, dims, qkv, gates, params, state, out, state_out, None, seq_lens,
+    )?;
     // seq == 0 with a state_out still dispatches: it copies the start state
     // through, so a caller alternating state buffers never reads a stale one.
     if dims.batch == 0 || (dims.seq == 0 && state_out.is_none()) {
         return Ok(());
     }
-    let p = pipeline_for(rt, "qwen35_gdn_recurrent", SCAN_THREADS, REC_TG_BYTES)?;
+    // Literal names, so the emulator's host-contract check sees both kernels
+    // this site binds.
+    let rec_name = match slice {
+        GdnScanSlice::Cols32 => "qwen35_gdn_recurrent",
+        GdnScanSlice::Cols16 => "qwen35_gdn_recurrent_bv16",
+    };
+    let (rec_cols, rec_threads) = match slice {
+        GdnScanSlice::Cols32 => (GDN_VALUE_BLOCK, SCAN_THREADS),
+        GdnScanSlice::Cols16 => (16, REC16_THREADS),
+    };
+    let p = pipeline_for(rt, rec_name, rec_threads, REC_TG_BYTES)?;
     dispatch_groups(
         rt,
         &p,
         (
-            (dims.v_dim / GDN_VALUE_BLOCK) as usize,
+            (dims.v_dim / rec_cols) as usize,
             dims.v_heads as usize,
             dims.batch as usize,
         ),
-        SCAN_THREADS,
+        rec_threads,
         REC_TG_BYTES,
         |bnd| {
             set_gpu_buf(bnd, qkv.buf, 0);
@@ -1403,15 +1480,25 @@ pub struct OutCols<'a> {
     pub dtype: DType,
 }
 
-fn out_kernel(base: &str, dtype: DType, what: &str) -> Result<String, String> {
-    match dtype {
-        DType::F32 => Ok(format!("{base}_f32")),
-        DType::BF16 => Ok(format!("{base}_bf16")),
-        other => Err(format!("{what}: dtype must be F32 or BF16, got {other:?}")),
-    }
+/// The `{base}_f32` or `{base}_bf16` entry point for `dtype`, as a static
+/// name so the call looks its pipeline up without building a key.
+macro_rules! out_kernel {
+    ($base:literal, $dtype:expr, $what:expr) => {
+        match $dtype {
+            DType::F32 => Ok(concat!($base, "_f32")),
+            DType::BF16 => Ok(concat!($base, "_bf16")),
+            other => Err(format!("{}: dtype must be F32 or BF16, got {other:?}", $what)),
+        }
+    };
 }
 
-fn require_out_window(rt: &GpuRuntime, out: OutCols<'_>, rows: u64, width: u64, what: &str) -> Result<(), String> {
+fn require_out_window(
+    rt: &GpuRuntime,
+    out: OutCols<'_>,
+    rows: u64,
+    width: u64,
+    what: impl fmt::Display + Copy,
+) -> Result<(), String> {
     match out.dtype {
         DType::BF16 => require_window::<u16>(rt, out.cols, rows, width, what),
         _ => require_window::<f32>(rt, out.cols, rows, width, what),
@@ -1433,7 +1520,7 @@ pub fn gated_rms_norm(
     eps: f32,
 ) -> Result<(), String> {
     const WHAT: &str = "qwen35::gated_rms_norm";
-    let name = out_kernel("qwen35_gated_rms_norm", out.dtype, WHAT)?;
+    let name = out_kernel!("qwen35_gated_rms_norm", out.dtype, WHAT)?;
     if dim == 0 || !eps.is_finite() || eps <= 0.0 {
         return Err(format!("{WHAT}: dim must be non-zero and eps positive"));
     }
@@ -1451,7 +1538,7 @@ pub fn gated_rms_norm(
         &[("out", out.cols.buf)],
         &[("x", x.buf), ("z", z.buf), ("weight", weight)],
     )?;
-    let p = pipeline_for(rt, &name, ROWS_PER_TG * 32, 0)?;
+    let p = pipeline_for(rt, name, ROWS_PER_TG * 32, 0)?;
     dispatch_groups(
         rt,
         &p,
@@ -1948,18 +2035,23 @@ fn qk_norm_rope_impl(
     if rows == 0 {
         return Ok(());
     }
-    let mut reads = vec![("proj", proj.buf), ("q_norm", q_norm_w), ("k_norm", k_norm_w)];
-    if let RopePos::Buffer(b) | RopePos::PerRow(b) = pos {
-        reads.push(("pos_offset", b));
-    }
-    require_disjoint_writes(
+    let pos_buf = match pos {
+        RopePos::Buffer(b) | RopePos::PerRow(b) => Some(("pos_offset", b)),
+        RopePos::Scalar(_) => None,
+    };
+    require_disjoint_writes_opt(
         WHAT,
         &[
-            ("q_out", targets.q_out),
-            ("k_cache", targets.k_cache),
-            ("v_cache", targets.v_cache),
+            Some(("q_out", targets.q_out)),
+            Some(("k_cache", targets.k_cache)),
+            Some(("v_cache", targets.v_cache)),
         ],
-        &reads,
+        &[
+            Some(("proj", proj.buf)),
+            Some(("q_norm", q_norm_w)),
+            Some(("k_norm", k_norm_w)),
+            pos_buf,
+        ],
     )?;
     let units = usize_product(&[rows as usize, s.q_heads as usize + 2 * s.kv_heads as usize], WHAT)?;
     let name = match pos {
@@ -2019,7 +2111,7 @@ pub fn attn_output_gate(
     head_dim: u32,
 ) -> Result<(), String> {
     const WHAT: &str = "qwen35::attn_output_gate";
-    let name = out_kernel("qwen35_attn_gate", out.dtype, WHAT)?;
+    let name = out_kernel!("qwen35_attn_gate", out.dtype, WHAT)?;
     let width = u32_product(&[q_heads, head_dim], WHAT)?;
     let gate_w = u64::from(u32_product(&[width, 2], WHAT)?);
     require::<f32>(
@@ -2039,7 +2131,7 @@ pub fn attn_output_gate(
     } else {
         require_disjoint_writes(WHAT, &[("out", out.cols.buf)], &[("attn", attn), ("proj", proj.buf)])?;
     }
-    let p = rt.pipeline(&name)?;
+    let p = rt.pipeline(name)?;
     dispatch_2d(rt, &p, width as usize, rows as usize, |bnd| {
         set_gpu_buf(bnd, attn, 0);
         set_gpu_buf(bnd, proj.buf, 1);
@@ -2070,7 +2162,7 @@ pub fn swiglu(
     width: u32,
 ) -> Result<(), String> {
     const WHAT: &str = "qwen35::swiglu";
-    let name = out_kernel("qwen35_swiglu", out.dtype, WHAT)?;
+    let name = out_kernel!("qwen35_swiglu", out.dtype, WHAT)?;
     let (r, w) = (u64::from(rows), u64::from(width));
     require_window::<f32>(rt, gate, r, w, "swiglu gate")?;
     require_window::<f32>(rt, up, r, w, "swiglu up")?;
@@ -2079,7 +2171,7 @@ pub fn swiglu(
         return Ok(());
     }
     require_disjoint_writes(WHAT, &[("out", out.cols.buf)], &[("gate", gate.buf), ("up", up.buf)])?;
-    let p = rt.pipeline(&name)?;
+    let p = rt.pipeline(name)?;
     dispatch_2d(rt, &p, width as usize, rows as usize, |bnd| {
         set_gpu_buf(bnd, gate.buf, 0);
         set_gpu_buf(bnd, up.buf, 1);
@@ -2148,7 +2240,7 @@ fn require_window_at<T>(
     byte_off: usize,
     rows: u64,
     width: u64,
-    what: &str,
+    what: impl fmt::Display + Copy,
 ) -> Result<(), String> {
     let elem = std::mem::size_of::<T>();
     if elem == 0 || byte_off % elem != 0 {
@@ -2180,7 +2272,7 @@ pub fn rms_norm(
     eps: f32,
 ) -> Result<(), String> {
     const WHAT: &str = "qwen35::rms_norm";
-    let name = out_kernel("qwen35_rms_norm", out_dtype, WHAT)?;
+    let name = out_kernel!("qwen35_rms_norm", out_dtype, WHAT)?;
     validate_rms_scalars(dim, eps, WHAT)?;
     let n = (rows as usize)
         .checked_mul(dim as usize)
@@ -2200,7 +2292,7 @@ pub fn rms_norm(
     } else {
         require_disjoint_writes(WHAT, &[("out", out)], &[("w", w)])?;
     }
-    let p = rt.pipeline(&name)?;
+    let p = rt.pipeline(name)?;
     let tptg = reduce_tptg(p.maxTotalThreadsPerThreadgroup(), dim as usize);
     dispatch_tg_1d(rt, &p, rows as usize, tptg, None, |bnd| {
         set_gpu_buf(bnd, x, 0);
@@ -2639,6 +2731,11 @@ const PREFIX_DECODE_REDUCE_THREADS: usize = 256;
 /// cache `prefix ‖ suffix_b` with `window = 0` and `kv_pos_offset = 0`: both
 /// passes are that kernel's D = 256 instantiation with only the key address
 /// (partial) and the live key count (both) changed.
+///
+/// `scratch` holds the partial pass's per-chunk results: size it with
+/// [`crate::nn::DecodeScratch::new`] for `batch`, `heads` and
+/// `prefix.len + suffix capacity` keys at head dim 256, and pass the same one
+/// every token.
 #[allow(clippy::too_many_arguments)]
 pub fn attn_prefix_decode(
     rt: &Arc<GpuRuntime>,
@@ -2649,6 +2746,7 @@ pub fn attn_prefix_decode(
     suffix_len: &GpuBuffer,
     q_pos_offset: &GpuBuffer,
     o: &GpuBuffer,
+    scratch: &crate::nn::DecodeScratch,
     dims: crate::nn::AttnDims,
     out_bf16: bool,
 ) -> Result<(), String> {
@@ -2663,6 +2761,7 @@ pub fn attn_prefix_decode(
             q_pos_offset,
         },
         o,
+        scratch,
         dims,
         out_bf16,
     )
@@ -2681,6 +2780,7 @@ pub fn attn_prefix_decode_varlen(
     suffix_lens: &GpuBuffer,
     q_pos_offsets: &GpuBuffer,
     o: &GpuBuffer,
+    scratch: &crate::nn::DecodeScratch,
     dims: crate::nn::AttnDims,
     out_bf16: bool,
 ) -> Result<(), String> {
@@ -2695,6 +2795,7 @@ pub fn attn_prefix_decode_varlen(
             q_pos_offsets,
         },
         o,
+        scratch,
         dims,
         out_bf16,
     )
@@ -2709,6 +2810,7 @@ fn prefix_decode_impl(
     suffix_v: &GpuBuffer,
     lens: RowLens<'_>,
     o: &GpuBuffer,
+    scratch: &crate::nn::DecodeScratch,
     dims: crate::nn::AttnDims,
     out_bf16: bool,
 ) -> Result<(), String> {
@@ -2729,26 +2831,35 @@ fn prefix_decode_impl(
     // chunk count, so every chunk the reduce reads was written by this
     // partial pass (flash_attn_decode's invariant, unchanged).
     let key_cap = prefix.len as usize + suffix_cap as usize;
-    let chunks = key_cap.div_ceil(PREFIX_DECODE_CHUNK).max(1);
+    let chunks = scratch.check(
+        rt,
+        WHAT,
+        dims.batch,
+        dims.heads,
+        key_cap,
+        PREFIX_ATTN_HEAD_DIM,
+        PREFIX_DECODE_CHUNK,
+        &[
+            ("q", q),
+            ("prefix k", prefix.k),
+            ("prefix v", prefix.v),
+            ("suffix k", suffix_k),
+            ("suffix v", suffix_v),
+            ("o", o),
+            ("suffix_len", suffix_len),
+            ("q_pos_offset", q_pos_offset),
+        ],
+    )?;
+    let scratch = scratch.buffer();
     let heads = dims.heads as usize;
     let group = (dims.heads / dims.heads_kv) as usize;
     // The GQA group shares a threadgroup, as nn's D = 256 decode does.
     let sgs = crate::nn::DecodeHeadBlock::Group.simdgroups(heads, group).unwrap_or(1);
     let bh = usize_product(&[dims.batch as usize, heads], WHAT)?;
-    let scratch_bytes = usize_product(
-        &[
-            bh,
-            chunks,
-            PREFIX_ATTN_HEAD_DIM as usize + 2,
-            std::mem::size_of::<f32>(),
-        ],
-        WHAT,
-    )?;
     // Resolve both pipelines before encoding either: a failure after the
     // partial pass was encoded would leave a producer with no consumer.
     let partial = pipeline_for(rt, "qwen35_attn_prefix_decode_partial", sgs * 32, 0)?;
     let reduce = pipeline_for(rt, "qwen35_attn_prefix_decode_reduce", PREFIX_DECODE_REDUCE_THREADS, 0)?;
-    let scratch = rt.alloc_buffer(scratch_bytes)?;
     dispatch_groups(
         rt,
         &partial,
@@ -2761,7 +2872,7 @@ fn prefix_decode_impl(
             set_gpu_buf(bnd, prefix.v, 2);
             set_gpu_buf(bnd, suffix_k, 3);
             set_gpu_buf(bnd, suffix_v, 4);
-            set_gpu_buf(bnd, &scratch, 5);
+            set_gpu_buf(bnd, scratch, 5);
             set_u32(bnd, prefix.len, 6);
             set_gpu_buf(bnd, suffix_len, 7);
             set_u32(bnd, dims.heads, 8);
@@ -2775,7 +2886,7 @@ fn prefix_decode_impl(
     // The binder orders this after the partial pass, as for the GDN prep and
     // scan.
     dispatch_groups(rt, &reduce, (1, bh, 1), PREFIX_DECODE_REDUCE_THREADS, 0, |bnd| {
-        set_gpu_buf(bnd, &scratch, 0);
+        set_gpu_buf(bnd, scratch, 0);
         set_gpu_buf(bnd, o, 1);
         set_u32(bnd, prefix.len, 2);
         set_gpu_buf(bnd, suffix_len, 3);
@@ -2821,7 +2932,7 @@ fn validate_prefix_attn(
         ("suffix v", suffix_v),
         ("o", o),
     ] {
-        require_runtime(rt, b, &format!("{what} {name}"))?;
+        require_runtime(rt, b, format_args!("{what} {name}"))?;
     }
     // Q/O extents, head grouping, scale, and o against q and the suffix.
     let suffix_cap = crate::nn::validate_attn_storage(dims, D, q, suffix_k, suffix_v, o, out_bf16)
@@ -2840,8 +2951,8 @@ fn validate_prefix_attn(
             prefix.len
         ));
     }
-    require::<u32>(rt, suffix_len, len_elems, &format!("{what} suffix_len"))?;
-    require::<u32>(rt, q_pos_offset, len_elems, &format!("{what} q_pos_offset"))?;
+    require::<u32>(rt, suffix_len, len_elems, format_args!("{what} suffix_len"))?;
+    require::<u32>(rt, q_pos_offset, len_elems, format_args!("{what} q_pos_offset"))?;
     if dims.batch == 0 || dims.tq == 0 || dims.heads == 0 {
         return Ok(None);
     }
@@ -2900,7 +3011,7 @@ pub fn score_answer_rows(
     logprobs: &GpuBuffer,
 ) -> Result<(), String> {
     const WHAT: &str = "qwen35::score_answer_rows";
-    let name = out_kernel("qwen35_score_rows", lm_head.dtype, "qwen35::score_answer_rows lm_head")?;
+    let name = out_kernel!("qwen35_score_rows", lm_head.dtype, "qwen35::score_answer_rows lm_head")?;
     if hidden == 0 || n_answers == 0 || n_answers > MAX_ANSWERS {
         return Err(format!(
             "{WHAT}: hidden must be non-zero and n_answers in 1..={MAX_ANSWERS}"
@@ -2950,7 +3061,7 @@ pub fn score_answer_rows(
     )?;
     // Reduction partials, then the answers' logits.
     let tg_bytes = score_tg_bytes(n_answers);
-    let p = pipeline_for(rt, &name, SCORE_THREADS, tg_bytes)?;
+    let p = pipeline_for(rt, name, SCORE_THREADS, tg_bytes)?;
     dispatch_groups(rt, &p, (n_slots as usize, 1, 1), SCORE_THREADS, tg_bytes, |bnd| {
         set_gpu_buf(bnd, hidden_states, 0);
         set_gpu_buf(bnd, slots, 1);

@@ -47,8 +47,11 @@ fn decode_partial_is_barriered_before_reduce_when_auto_barriers_are_skipped() {
             scale: 1.0 / (D as f32).sqrt(),
         };
 
+        let scratch = nn::DecodeScratch::new(rt, 1, 1, 1, D as u32).unwrap();
         tessl::begin_decode_icb_capture();
-        let result = nn::flash_attn_decode(rt, &q, &k, &v, &out, &tkv, &zero, &zero, dims, D as u32, 1, false);
+        let result = nn::flash_attn_decode(
+            rt, &q, &k, &v, &out, &scratch, &tkv, &zero, &zero, dims, D as u32, 1, false,
+        );
         let capture = tessl::take_decode_icb_capture().expect("decode capture");
         result.expect("encode decode partial and reduction");
 

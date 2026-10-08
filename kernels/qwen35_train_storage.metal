@@ -247,31 +247,70 @@ static inline void qwen35_adamw_stored_body(
     }
 }
 
+/// One parameter-table entry of a table-driven step: where its parameter,
+/// gradient, moments, auxiliary state and 8-bit scales are (GPU addresses,
+/// each at the entry's own byte offset; an unused one points at a dummy),
+/// its window, the first threadgroup of the dispatch that is its, and its
+/// scalars and stochastic-rounding key. `src/qwen35_adamw.rs` writes it
+/// byte for byte (`SLOT_BYTES`).
+struct Qwen35AdamWSlot {
+    ulong p;
+    ulong g;
+    ulong m;
+    ulong v;
+    ulong aux;
+    ulong m_scale;
+    ulong v_scale;
+    uint n;
+    uint width;
+    uint ld;
+    uint off;
+    uint first_block;
+    uint pad;
+    Qwen35AdamW a;
+    Qwen35SrKey key;
+};
+static_assert(sizeof(Qwen35AdamWSlot) == 136, "the host writes 136-byte slots");
+
+/// One step over every entry of `slots` (sorted by `first_block`, the
+/// first's 0) in one dispatch: each threadgroup of 256 finds its entry by
+/// binary search and runs that entry's block `gblk - first_block`, exactly
+/// as one dispatch per entry ran it. The table is in the constant address
+/// space, so each entry's scalars and key reach the body as the constant
+/// references a per-entry dispatch bound (the same code, the same bits
+/// under fast math).
 #define QWEN35_ADAMW_STORED(NAME, P, G, AUX, RULE, MOM)                                              \
     kernel void NAME(                                                                                \
-        device P *p [[buffer(0)]],                                                                   \
-        device const G *g [[buffer(1)]],                                                             \
-        device Qwen35MomTypes<MOM>::M *m [[buffer(2)]],                                              \
-        device Qwen35MomTypes<MOM>::V *v [[buffer(3)]],                                              \
-        constant Qwen35AdamW &a [[buffer(4)]],                                                       \
-        constant uint &n [[buffer(5)]],                                                              \
-        constant uint &width [[buffer(6)]],                                                          \
-        constant uint &ld [[buffer(7)]],                                                             \
-        constant uint &off [[buffer(8)]],                                                            \
-        device AUX *aux [[buffer(9)]],                                                               \
-        device float *m_scale [[buffer(10)]],                                                        \
-        device float *v_scale [[buffer(11)]],                                                        \
-        constant Qwen35SrKey &key [[buffer(12)]],                                                    \
-        uint i [[thread_position_in_grid]],                                                          \
+        constant Qwen35AdamWSlot *slots [[buffer(0)]],                                               \
+        constant uint &n_slots [[buffer(1)]],                                                        \
+        uint gblk [[threadgroup_position_in_grid]],                                                  \
         uint t [[thread_index_in_threadgroup]],                                                      \
-        uint blk [[threadgroup_position_in_grid]],                                                   \
         uint lane [[thread_index_in_simdgroup]],                                                     \
         uint sg [[simdgroup_index_in_threadgroup]],                                                  \
         uint n_sg [[simdgroups_per_threadgroup]])                                                    \
     {                                                                                                \
         threadgroup float part[32];                                                                  \
+        uint lo = 0u, hi = n_slots - 1u;                                                             \
+        while (lo < hi) {                                                                            \
+            const uint mid = (lo + hi + 1u) >> 1;                                                    \
+            if (slots[mid].first_block <= gblk) {                                                    \
+                lo = mid;                                                                            \
+            } else {                                                                                 \
+                hi = mid - 1u;                                                                       \
+            }                                                                                        \
+        }                                                                                            \
+        constant Qwen35AdamWSlot &s = slots[lo];                                                     \
+        const uint blk = gblk - s.first_block;                                                       \
         qwen35_adamw_stored_body<P, G, AUX, RULE, MOM>(                                              \
-            p, g, m, v, a, n, width, ld, off, aux, m_scale, v_scale, key, part, i, t, blk, lane, sg, n_sg); \
+            reinterpret_cast<device P *>(s.p),                                                       \
+            reinterpret_cast<device const G *>(s.g),                                                 \
+            reinterpret_cast<device Qwen35MomTypes<MOM>::M *>(s.m),                                  \
+            reinterpret_cast<device Qwen35MomTypes<MOM>::V *>(s.v),                                  \
+            s.a, s.n, s.width, s.ld, s.off,                                                          \
+            reinterpret_cast<device AUX *>(s.aux),                                                   \
+            reinterpret_cast<device float *>(s.m_scale),                                             \
+            reinterpret_cast<device float *>(s.v_scale),                                             \
+            s.key, part, blk * QWEN35_Q8_BLOCK + t, t, blk, lane, sg, n_sg);                         \
     }
 
 // f32 parameters (their gradients are f32): moments in any storage.

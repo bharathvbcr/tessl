@@ -13,7 +13,10 @@
 # of those medians over the rounds, with the max beside it as the spread,
 # and the largest peak memory footprint and device peak seen. OUT gets every
 # process's full output. BENCH_BIN overrides the binary: a frozen build of an
-# earlier commit, for a before/after pair.
+# earlier commit. BENCH_BINS="before=PATH after=PATH" runs every
+# configuration under each binary in turn inside every round, so a
+# before/after pair shares the session's conditions; its configurations are
+# reported as LABEL/CONFIG.
 set -euo pipefail
 
 if [[ $# -lt 3 ]]; then
@@ -24,8 +27,19 @@ rounds=$1
 out=$2
 shift 2
 configs=("$@")
-bin=${BENCH_BIN:-target/release/bench_qwen35_train}
-[[ -x $bin ]] || { echo "$bin is missing: cargo build --release --bins first" >&2; exit 2; }
+declare -a labels=() paths=()
+if [[ -n ${BENCH_BINS:-} ]]; then
+  for pair in $BENCH_BINS; do
+    labels+=("${pair%%=*}")
+    paths+=("${pair#*=}")
+  done
+else
+  labels+=("")
+  paths+=("${BENCH_BIN:-target/release/bench_qwen35_train}")
+fi
+for p in "${paths[@]}"; do
+  [[ -x $p ]] || { echo "$p is missing: cargo build --release --bins first" >&2; exit 2; }
+done
 : "${QWEN35_2B_SAFETENSORS:?set QWEN35_2B_SAFETENSORS to the Qwen3.5-2B .safetensors}"
 
 : >"$out"
@@ -33,15 +47,16 @@ tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
 
 run_one() {
-  local cfg=$1 round=$2
+  local cfg=$1 round=$2 bin=$3 label=$4
   local t mid mode extra
   IFS=: read -r t mid mode extra <<<"$cfg"
   local args=("$t" --step-only "--step=$t")
   [[ $mode == async ]] && args+=(--async)
   [[ -n ${extra:-} ]] && args+=("$extra")
-  local log="$tmp/$(echo "$cfg" | tr ':/' '__').$round"
+  local name="${label:+$label/}$cfg"
+  local log="$tmp/$(echo "$name" | tr ':/' '__').$round"
   {
-    echo "# ---- round $round, config $cfg: ${args[*]} (TESSL_MID_COMMIT=$mid) ----"
+    echo "# ---- round $round, config $name: ${args[*]} (TESSL_MID_COMMIT=$mid) ----"
     if [[ $mid == - ]]; then
       env -u TESSL_MID_COMMIT -u METAL_RUNTIME_MID_COMMIT /usr/bin/time -l "$bin" "${args[@]}" 2>&1
     else
@@ -54,37 +69,47 @@ run_one() {
   peak=$(awk '/peak memory footprint/ {print $1}' "$log")
   dev=$(sed -n 's/^  device peak over the steps: \([0-9.]*\) GiB.*/\1/p' "$log")
   if [[ -z $secs || -z $peak || -z $dev ]]; then
-    echo "config $cfg round $round produced no timing; see $out" >&2
+    echo "config $name round $round produced no timing; see $out" >&2
     exit 1
   fi
-  echo "$cfg $secs $peak $dev" >>"$tmp/samples"
+  echo "$name $secs $peak $dev" >>"$tmp/samples"
 }
 
+# Every (binary, configuration) pair, binaries innermost so a pair runs back
+# to back.
+declare -a runs=()
+for cfg in "${configs[@]}"; do
+  for ((b = 0; b < ${#paths[@]}; b++)); do runs+=("$b $cfg"); done
+done
 for ((r = 0; r < rounds; r++)); do
   if ((r % 2 == 0)); then
-    order=("${configs[@]}")
+    order=("${runs[@]}")
   else
     order=()
-    for ((i = ${#configs[@]} - 1; i >= 0; i--)); do order+=("${configs[i]}"); done
+    for ((i = ${#runs[@]} - 1; i >= 0; i--)); do order+=("${runs[i]}"); done
   fi
-  for cfg in "${order[@]}"; do
-    run_one "$cfg" "$r"
-    echo "round $r: $cfg done" >&2
+  for item in "${order[@]}"; do
+    b=${item%% *}
+    cfg=${item#* }
+    run_one "$cfg" "$r" "${paths[b]}" "${labels[b]}"
+    echo "round $r: ${labels[b]:+${labels[b]}/}$cfg done" >&2
   done
 done
 
 {
   echo
   echo "# ---- summary: $rounds rounds, each a median of 3 steps; min (max) over rounds ----"
-  printf '%-28s %10s %10s %16s %15s\n' config "min s" "max s" "peak footprint" "device peak"
+  printf '%-34s %10s %10s %16s %15s\n' config "min s" "max s" "peak footprint" "device peak"
   for cfg in "${configs[@]}"; do
-    awk -v c="$cfg" '$1 == c {
-        if (n == 0 || $2 < lo) lo = $2
-        if (n == 0 || $2 > hi) hi = $2
-        if ($3 > pk) pk = $3
-        if ($4 > dv) dv = $4
-        n++
-      }
-      END { printf "%-28s %10.3f %10.3f %13.2f GB %11.2f GiB\n", c, lo, hi, pk / 1e9, dv }' "$tmp/samples"
+    for label in "${labels[@]}"; do
+      awk -v c="${label:+$label/}$cfg" '$1 == c {
+          if (n == 0 || $2 < lo) lo = $2
+          if (n == 0 || $2 > hi) hi = $2
+          if ($3 > pk) pk = $3
+          if ($4 > dv) dv = $4
+          n++
+        }
+        END { printf "%-34s %10.3f %10.3f %13.2f GB %11.2f GiB\n", c, lo, hi, pk / 1e9, dv }' "$tmp/samples"
+    done
   done
 } | tee -a "$out"

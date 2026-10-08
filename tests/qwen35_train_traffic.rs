@@ -392,3 +392,77 @@ fn the_step_adds_its_products_in_the_gemms() {
         );
     });
 }
+
+/// Every parameter's f32 bits, as `read_parameters` lays them out.
+fn params(rt: &Arc<GpuRuntime>, model: &Qwen35Model) -> Vec<u32> {
+    let ts: Vec<Tensor> = model
+        .parameter_table()
+        .unwrap()
+        .iter()
+        .map(|p| rt.alloc_tensor_f32(&p.storage_shape()).unwrap())
+        .collect();
+    model.read_parameters(&ts).unwrap();
+    ts.iter()
+        .flat_map(|t| t.read_f32().unwrap().into_iter().map(f32::to_bits))
+        .collect()
+}
+
+/// An AdamW step over every parameter is one table-driven dispatch per step
+/// kernel (one on an f32 model, where it was one per parameter) and one
+/// wait; `adamw_step_unwaited` makes no wait, and the same parameters, bit
+/// for bit, once something does wait.
+#[test]
+fn an_adamw_step_is_one_dispatch_and_waits_only_if_asked() {
+    let _g = LOCK.lock().unwrap();
+    let ids = ids();
+    let hyper = tessl::qwen35_adamw::AdamWHyper {
+        lr: 1e-3,
+        grad_scale: 0.5,
+        ..Default::default()
+    };
+    let mut after = Vec::new();
+    for unwaited in [false, true] {
+        let (rt, model) = load(Precision::F32);
+        let wd = model.default_weight_decay(0.1).unwrap();
+        let step = model.train_step(&ids, GemmOperands::ExactF32).unwrap();
+        let mut state = tessl::qwen35_adamw::AdamW::new(&model).unwrap();
+        rt.set_async_encode(true).unwrap();
+        let (_, s) = traced(|| {
+            if unwaited {
+                model.adamw_step_unwaited(&step.grads, &mut state, &hyper, &wd).unwrap()
+            } else {
+                model.adamw_step(&step.grads, &mut state, &hyper, &wd).unwrap()
+            }
+        });
+        assert_eq!(s.dispatches, 1, "unwaited {unwaited}: {s:?}");
+        assert_eq!(s.sync_waits, u64::from(!unwaited), "unwaited {unwaited}: {s:?}");
+        assert_eq!(state.step_count(), 1);
+        rt.set_async_encode(false).unwrap();
+        after.push(params(&rt, &model));
+    }
+    assert!(
+        after[0] == after[1],
+        "the unwaited step moved the parameters differently"
+    );
+}
+
+/// The step count of an unwaited step counts at once, and rolls back to the
+/// last waited count when the runtime is poisoned (a GPU fault leaves the
+/// moments unknown); a waited step's stays.
+#[test]
+fn an_unwaited_step_count_rolls_back_on_a_poisoned_runtime() {
+    let _g = LOCK.lock().unwrap();
+    let ids = ids();
+    let (rt, model) = load(Precision::F32);
+    let wd = model.default_weight_decay(0.0).unwrap();
+    let step = model.train_step(&ids, GemmOperands::ExactF32).unwrap();
+    let mut state = tessl::qwen35_adamw::AdamW::new(&model).unwrap();
+    let hyper = tessl::qwen35_adamw::AdamWHyper::default();
+    model.adamw_step(&step.grads, &mut state, &hyper, &wd).unwrap();
+    rt.set_async_encode(true).unwrap();
+    model.adamw_step_unwaited(&step.grads, &mut state, &hyper, &wd).unwrap();
+    model.adamw_step_unwaited(&step.grads, &mut state, &hyper, &wd).unwrap();
+    assert_eq!(state.step_count(), 3);
+    rt.poison_as_shared_event_timeout_for_test();
+    assert_eq!(state.step_count(), 1, "the unwaited steps were not rolled back");
+}

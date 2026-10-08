@@ -113,13 +113,17 @@ impl GdnTrainWorkspace {
     pub fn new(rt: &Arc<GpuRuntime>, dims: GdnTrainDims) -> Result<Self, String> {
         dims.validate("GdnTrainWorkspace")?;
         let [scratch, dq_part, dk_part, dg_part, dbeta_part] = Self::lens(dims);
+        // Not zeroed: the backward writes each chunk's states into `scratch`
+        // before reading them back, and every slice's partial for every row
+        // before the reduction reads it.
+        let f32s = |n: usize| rt.alloc_tensor_unzeroed(&[n], DType::F32);
         Ok(Self {
             dims,
-            scratch: rt.alloc_tensor_f32(&[scratch])?,
-            dq_part: rt.alloc_tensor_f32(&[dq_part])?,
-            dk_part: rt.alloc_tensor_f32(&[dk_part])?,
-            dg_part: rt.alloc_tensor_f32(&[dg_part])?,
-            dbeta_part: rt.alloc_tensor_f32(&[dbeta_part])?,
+            scratch: f32s(scratch)?,
+            dq_part: f32s(dq_part)?,
+            dk_part: f32s(dk_part)?,
+            dg_part: f32s(dg_part)?,
+            dbeta_part: f32s(dbeta_part)?,
         })
     }
 

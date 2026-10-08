@@ -482,8 +482,12 @@ fn f32s(rt: &Arc<GpuRuntime>, n: usize) -> Result<GpuBuffer, String> {
     rt.alloc_buffer(n.max(1) * std::mem::size_of::<f32>())
 }
 
+/// An f32 tensor a kernel writes in full before anything reads it: every
+/// one the step allocates. Not zeroed on the host
+/// ([`GpuRuntime::alloc_tensor_unzeroed`]); what must start at zero is
+/// zeroed on the GPU in order with the work around it ([`zero_part`]).
 fn tensor(rt: &Arc<GpuRuntime>, shape: &[usize]) -> Result<Tensor, String> {
-    rt.alloc_tensor_f32(shape)
+    rt.alloc_tensor_unzeroed(shape, DType::F32)
 }
 
 impl Qwen35Model {
@@ -699,7 +703,7 @@ impl Qwen35Model {
         let mut inputs = Vec::with_capacity(self.layers.len());
         for layer in &self.layers {
             let kept = if self.precision == Precision::Bf16 {
-                let b = rt.alloc_tensor_bf16(&[tu, h])?;
+                let b = rt.alloc_tensor_unzeroed(&[tu, h], DType::BF16)?;
                 cast_f32_to_bf16_into(&resid, &b)?;
                 cast_bf16_to_f32_into(&b, &resid)?;
                 Some(b)

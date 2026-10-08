@@ -208,7 +208,8 @@ fn validate_cast_input(src: &Tensor, dtype: DType) -> Result<(), String> {
 pub fn cast_f32_to_bf16(src: &Tensor) -> Result<Tensor, String> {
     validate_cast_input(src, DType::F32)?;
     let rt = src.runtime();
-    let dst = rt.alloc_tensor_bf16(&src.shape)?;
+    // The cast writes every element.
+    let dst = rt.alloc_tensor_unzeroed(&src.shape, DType::BF16)?;
     cast_f32_to_bf16_into(src, &dst)?;
     Ok(dst)
 }
@@ -274,7 +275,8 @@ pub fn transpose_f32_into(src: &Tensor, dst: &Tensor) -> Result<(), String> {
 pub fn cast_bf16_to_f32(src: &Tensor) -> Result<Tensor, String> {
     validate_cast_input(src, DType::BF16)?;
     let rt = src.runtime();
-    let dst = rt.alloc_tensor_f32(&src.shape)?;
+    // The cast writes every element.
+    let dst = rt.alloc_tensor_unzeroed(&src.shape, DType::F32)?;
     cast_bf16_to_f32_into(src, &dst)?;
     Ok(dst)
 }
@@ -308,7 +310,8 @@ pub fn cast_f32_to_f16(src: &Tensor) -> Result<Tensor, String> {
         return Err("cast_f32_to_f16 expects an f32 source".into());
     }
     let rt = src.runtime();
-    let dst = rt.alloc_tensor_f16(&src.shape)?;
+    // The cast writes every element.
+    let dst = rt.alloc_tensor_unzeroed(&src.shape, DType::F16)?;
     cast_between(src, &dst, "cast_f32_to_f16")?;
     Ok(dst)
 }
@@ -320,7 +323,8 @@ pub fn cast_f16_to_f32(src: &Tensor) -> Result<Tensor, String> {
         return Err("cast_f16_to_f32 expects an f16 source".into());
     }
     let rt = src.runtime();
-    let dst = rt.alloc_tensor_f32(&src.shape)?;
+    // The cast writes every element.
+    let dst = rt.alloc_tensor_unzeroed(&src.shape, DType::F32)?;
     cast_between(src, &dst, "cast_f16_to_f32")?;
     Ok(dst)
 }

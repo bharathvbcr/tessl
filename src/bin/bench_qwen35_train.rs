@@ -637,26 +637,21 @@ fn traced<T>(f: impl FnOnce() -> Res<T>) -> Res<(T, tessl::infer_trace::Snapshot
     let out = f();
     let (secs, s1) = (t0.elapsed().as_secs_f64(), tessl::infer_trace::snapshot());
     tessl::infer_trace::set_enabled(false);
-    let d = tessl::infer_trace::Snapshot {
-        dispatches: s1.dispatches - s0.dispatches,
-        barriers: s1.barriers - s0.barriers,
-        commits: s1.commits - s0.commits,
-        cold_allocs: s1.cold_allocs - s0.cold_allocs,
-        sync_wait_us: s1.sync_wait_us - s0.sync_wait_us,
-        sync_waits: s1.sync_waits - s0.sync_waits,
-        residency_flushes: s1.residency_flushes - s0.residency_flushes,
-    };
+    let d = s1.since(&s0);
     Ok((out?, d, secs))
 }
 
 fn trace_line(s: &tessl::infer_trace::Snapshot) -> String {
     format!(
-        "{} waits ({:.3} s blocked), {} commits, {} dispatches, {} cold allocations",
+        "{} waits ({:.3} s blocked), {} commits, {} dispatches, {} cold allocations, \
+         {} host-zeroed ({:.2} GB)",
         s.sync_waits,
         s.sync_wait_us as f64 / 1e6,
         s.commits,
         s.dispatches,
-        s.cold_allocs
+        s.cold_allocs,
+        s.host_zeros,
+        s.host_zero_bytes as f64 / 1e9
     )
 }
 

@@ -22,6 +22,8 @@ static COMMITS: AtomicU64 = AtomicU64::new(0);
 static COLD_ALLOCS: AtomicU64 = AtomicU64::new(0);
 static SYNC_WAIT_US: AtomicU64 = AtomicU64::new(0);
 static SYNC_WAITS: AtomicU64 = AtomicU64::new(0);
+static HOST_ZEROS: AtomicU64 = AtomicU64::new(0);
+static HOST_ZERO_BYTES: AtomicU64 = AtomicU64::new(0);
 static RESIDENCY_FLUSHES: AtomicU64 = AtomicU64::new(0);
 
 pub fn set_enabled(on: bool) {
@@ -39,6 +41,8 @@ pub fn reset_token_counters() {
     COLD_ALLOCS.store(0, Ordering::Relaxed);
     SYNC_WAIT_US.store(0, Ordering::Relaxed);
     SYNC_WAITS.store(0, Ordering::Relaxed);
+    HOST_ZEROS.store(0, Ordering::Relaxed);
+    HOST_ZERO_BYTES.store(0, Ordering::Relaxed);
     RESIDENCY_FLUSHES.store(0, Ordering::Relaxed);
 }
 
@@ -51,7 +55,27 @@ pub struct Snapshot {
     pub sync_wait_us: u64,
     /// Host waits on the GPU (waited commits and allocator catch-ups).
     pub sync_waits: u64,
+    /// Tensor allocations zeroed on the host, and their bytes.
+    pub host_zeros: u64,
+    pub host_zero_bytes: u64,
     pub residency_flushes: u64,
+}
+
+impl Snapshot {
+    /// What was counted between `earlier` and `self`.
+    pub fn since(&self, earlier: &Snapshot) -> Snapshot {
+        Snapshot {
+            dispatches: self.dispatches - earlier.dispatches,
+            barriers: self.barriers - earlier.barriers,
+            commits: self.commits - earlier.commits,
+            cold_allocs: self.cold_allocs - earlier.cold_allocs,
+            sync_wait_us: self.sync_wait_us - earlier.sync_wait_us,
+            sync_waits: self.sync_waits - earlier.sync_waits,
+            host_zeros: self.host_zeros - earlier.host_zeros,
+            host_zero_bytes: self.host_zero_bytes - earlier.host_zero_bytes,
+            residency_flushes: self.residency_flushes - earlier.residency_flushes,
+        }
+    }
 }
 
 pub fn snapshot() -> Snapshot {
@@ -62,6 +86,8 @@ pub fn snapshot() -> Snapshot {
         cold_allocs: COLD_ALLOCS.load(Ordering::Relaxed),
         sync_wait_us: SYNC_WAIT_US.load(Ordering::Relaxed),
         sync_waits: SYNC_WAITS.load(Ordering::Relaxed),
+        host_zeros: HOST_ZEROS.load(Ordering::Relaxed),
+        host_zero_bytes: HOST_ZERO_BYTES.load(Ordering::Relaxed),
         residency_flushes: RESIDENCY_FLUSHES.load(Ordering::Relaxed),
     }
 }
@@ -91,6 +117,14 @@ pub fn on_commit() {
 pub fn on_cold_alloc() {
     if enabled() {
         COLD_ALLOCS.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+#[inline]
+pub fn on_host_zero(bytes: usize) {
+    if enabled() {
+        HOST_ZEROS.fetch_add(1, Ordering::Relaxed);
+        HOST_ZERO_BYTES.fetch_add(bytes as u64, Ordering::Relaxed);
     }
 }
 

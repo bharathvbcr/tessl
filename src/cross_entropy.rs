@@ -126,6 +126,9 @@ impl CeWorkspace {
         }
         let (n, h, c) = (max_rows as usize, hidden as usize, chunk as usize);
         let f32s = |len: usize| rt.alloc_buffer(len.max(1) * 4);
+        // Not zeroed: each call writes the rows it reads (the gather into
+        // `h`, every logit chunk and `dh_part` by their GEMMs, `w32` by the
+        // widening) before reading them.
         Ok(Self {
             max_rows,
             hidden,
@@ -133,13 +136,13 @@ impl CeWorkspace {
             weight_dtype,
             rows: f32s(n)?,
             targets: f32s(n)?,
-            h: rt.alloc_tensor_f32(&[n, h])?,
-            logits: rt.alloc_tensor_f32(&[n, c])?,
+            h: rt.alloc_tensor_unzeroed(&[n, h], DType::F32)?,
+            logits: rt.alloc_tensor_unzeroed(&[n, c], DType::F32)?,
             w32: match weight_dtype {
-                DType::BF16 => Some(rt.alloc_tensor_f32(&[c, h])?),
+                DType::BF16 => Some(rt.alloc_tensor_unzeroed(&[c, h], DType::F32)?),
                 _ => None,
             },
-            dh_part: rt.alloc_tensor_f32(&[n, h])?,
+            dh_part: rt.alloc_tensor_unzeroed(&[n, h], DType::F32)?,
             m: f32s(n)?,
             s: f32s(n)?,
             tlogit: f32s(n)?,

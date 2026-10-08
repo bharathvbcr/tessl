@@ -343,6 +343,15 @@ impl GpuBuffer {
         // base, so it cannot overrun.
         unsafe { std::ptr::write_bytes(self.metal().contents().as_ptr().cast::<u8>(), 0, self.nbytes()) };
     }
+
+    /// [`Self::zero_unsubmitted`] with `byte` in every byte.
+    ///
+    /// # Safety
+    /// As [`Self::zero_unsubmitted`].
+    pub(crate) unsafe fn fill_unsubmitted(&self, byte: u8) {
+        // SAFETY: as in `zero_unsubmitted`, whose contract this shares.
+        unsafe { std::ptr::write_bytes(self.metal().contents().as_ptr().cast::<u8>(), byte, self.nbytes()) };
+    }
 }
 
 /// Logical tensor: shape + dtype over a GpuBuffer (row-major, contiguous view).

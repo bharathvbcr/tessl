@@ -48,6 +48,23 @@ is `clip_grad_norm_` before the step (checked against it); with a head of
 your own, add its gradients' squares to `grad_sq_norm()` and scale them by
 the same coefficient.
 
+`precision="bf16"` keeps the matrices, their gradients and each layer's
+saved input in bf16 (arithmetic, GDN state, softmax and log-sum-exp stay
+f32), and `adamw_init` then names how the bf16 weights take their updates
+and how the moments are stored. That is what fits the 4B's training in a
+48 GiB working set (`docs/qwen35.md`, "Training on bf16 storage"):
+
+```python
+model = tessl_torch.Qwen35("model.safetensors", "config.json", precision="bf16")
+model.adamw_init(update="bf16-kahan", moments="block8")  # or "f32-master", or "bf16-stochastic" with seed=
+model.describe()  # "... matrices bf16 ...; AdamW update=bf16-kahan moments=block8/256 step=0"
+```
+
+Its steps take `operands="bf16"`. `adamw_state()` then also records the
+configuration (`"config"`) and the f32 masters or Kahan compensations
+(`"aux"`), and `load_adamw_state` refuses a checkpoint made under another
+configuration; a run resumes bit for bit under every rule.
+
 A padded batch with a loss on chosen positions, and a head of your own on
 the final hidden states, runs row by row: each row trimmed to its length
 (right padding is never attended, so this is exact), its gradients added
@@ -108,8 +125,9 @@ and values are the parameters' own (the zero-centred norms as `w`, as tessl
 stores them). Linear weights come back as transposed views, because
 tessl keeps them as `[in, out]`. `load_parameters` needs every parameter,
 checks them all before writing any, and accepts any layout, dtype or device.
-The model runs entirely in f32, the tied embedding included, so a write is
-exact and the parameters torch holds are the ones tessl differentiates.
+An f32 model runs entirely in f32, the tied embedding included, so a write
+is exact and the parameters torch holds are the ones tessl differentiates; a
+bf16 model rounds the matrices it is given to nearest.
 Every read and write
 is a GPU copy of the whole model (about 8 GB of f32 each way on the 2B), and
 torch holds its own copy of the parameters and gradients beside tessl's.

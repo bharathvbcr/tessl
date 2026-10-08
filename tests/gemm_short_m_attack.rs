@@ -24,12 +24,12 @@ const N: usize = 520;
 /// Not a multiple of 8. The selector ignores K; the kernel must not.
 const K: usize = 7;
 const PAD: usize = 64;
+const _: () = assert!(
+    N > 512,
+    "N must be past the 512 cut or the short-M branch is not the one under test"
+);
 
 fn attack_shape() {
-    assert!(
-        N > 512,
-        "N must be past the 512 cut or the short-M branch is not the one under test"
-    );
     assert_ne!(N % 64, 0, "N must leave a partial tile");
     assert_ne!(K % 8, 0, "K must not be a multiple of 8");
 }

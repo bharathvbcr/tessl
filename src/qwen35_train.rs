@@ -20,16 +20,20 @@
 //! their gradient is that of `w` (the same as `1 + w`'s). Every reduction runs in a fixed
 //! order, so a step's gradients are the same bits on every run.
 //!
-//! Scope: one sequence, positions from 0, value heads equal to key heads in
-//! the GDN (Qwen3.5-2B's 16 and 16; `gdn_train` has no head grouping).
+//! Scope: one sequence, positions from 0. A GDN with more value heads than
+//! key heads (the 4B's 32 over 16) repeats each key head's q and k across its
+//! value heads before `gdn_train`, as transformers does, and sums their
+//! gradients back over the group.
 //! Several sequences' gradients sum in a bank through
 //! [`Qwen35Model::train_step_into`], one sequence at a time, and a step can
 //! score chosen positions against given tokens instead ([`Supervise::Rows`]).
 //!
 //! The forward keeps only the residual stream into each layer (`T x hidden`
-//! f32); each layer's intermediates are rebuilt from it just before that
-//! layer's backward. The kernels are deterministic, so the rebuilt
-//! intermediates are the forward's bits. Keeping every layer's
+//! f32, or bf16 on a bf16-stored model); each layer's intermediates are
+//! rebuilt from it just before that layer's backward. The kernels are
+//! deterministic, so on an f32 model the rebuilt intermediates are the
+//! forward's bits; a bf16 model rebuilds from the rounded input (see
+//! `step_forward`). Keeping every layer's
 //! intermediates instead was measured at 10% faster for 22x the activation
 //! memory at T = 2048 on the 2B (`docs/qwen35.md`) and removed.
 
@@ -461,6 +465,8 @@ struct GdnScratch {
     dv: Tensor,
     dg: Tensor,
     dbeta: Tensor,
+    /// Grouped heads: dq or dk summed back to key-head width.
+    dqk: Option<GpuBuffer>,
     ws: GdnTrainWorkspace,
     norm_part: GpuBuffer,
     gates_part: GpuBuffer,
@@ -484,6 +490,89 @@ fn f32s(rt: &Arc<GpuRuntime>, n: usize) -> Result<GpuBuffer, String> {
 
 fn tensor(rt: &Arc<GpuRuntime>, shape: &[usize]) -> Result<Tensor, String> {
     rt.alloc_tensor_f32(shape)
+}
+
+/// `t * k_heads`: the rows of a `[t, k_heads, 128]` operand taken one head
+/// at a time.
+fn head_rows(t: u32, k_heads: u32) -> Result<u32, String> {
+    t.checked_mul(k_heads)
+        .ok_or_else(|| format!("Qwen35Model::train_step: {t} tokens x {k_heads} GDN key heads exceed u32"))
+}
+
+/// `dst` (`[t, k_heads * r, 128]`) = each key head of `src` (`[t, k_heads,
+/// 128]`, dense) repeated over its `r` value heads, as transformers'
+/// `repeat_interleave(r, dim=2)`: value head `h * r + j` is key head `h`.
+fn repeat_heads(
+    rt: &Arc<GpuRuntime>,
+    src: &GpuBuffer,
+    dst: &GpuBuffer,
+    t: u32,
+    k_heads: u32,
+    r: u32,
+) -> Result<(), String> {
+    let (rows, dk) = (head_rows(t, k_heads)?, GDN_TRAIN_DK);
+    for j in 0..r {
+        copy_cols(
+            rt,
+            Cols {
+                buf: src,
+                ld: dk,
+                off: 0,
+            },
+            Cols {
+                buf: dst,
+                ld: r * dk,
+                off: j * dk,
+            },
+            rows,
+            dk,
+        )?;
+    }
+    Ok(())
+}
+
+/// The gradient of [`repeat_heads`]: `dst` (`[t, k_heads, 128]`, dense) =
+/// the sum of `src` (`[t, k_heads * r, 128]`) over each key head's `r` value
+/// heads, added in value-head order.
+fn sum_heads(
+    rt: &Arc<GpuRuntime>,
+    src: &GpuBuffer,
+    dst: &GpuBuffer,
+    t: u32,
+    k_heads: u32,
+    r: u32,
+) -> Result<(), String> {
+    let (rows, dk) = (head_rows(t, k_heads)?, GDN_TRAIN_DK);
+    let group = |j: u32| Cols {
+        buf: src,
+        ld: r * dk,
+        off: j * dk,
+    };
+    copy_cols(
+        rt,
+        group(0),
+        Cols {
+            buf: dst,
+            ld: dk,
+            off: 0,
+        },
+        rows,
+        dk,
+    )?;
+    for j in 1..r {
+        qwen35::residual_add(
+            rt,
+            group(j),
+            Cols {
+                buf: dst,
+                ld: dk,
+                off: 0,
+            },
+            rows,
+            dk,
+        )?;
+    }
+    Ok(())
 }
 
 impl Qwen35Model {
@@ -615,13 +704,6 @@ impl Qwen35Model {
                 "{WHAT}: the step needs exact-f32 GEMMs; switch the runtime's relaxed precision off"
             ));
         }
-        if cfg.gdn.k_heads() != cfg.gdn.v_heads() {
-            return Err(format!(
-                "{WHAT}: GDN value heads ({}) must equal key heads ({}); gdn_train has no head grouping",
-                cfg.gdn.v_heads(),
-                cfg.gdn.k_heads()
-            ));
-        }
         match sup {
             Supervise::Causal if ids.len() < 2 => {
                 return Err(format!("{WHAT}: a step needs at least two tokens (one prediction)"));
@@ -692,16 +774,20 @@ impl Qwen35Model {
             &resid.buffer,
         )?;
         // Each layer's input; everything else its forward made goes back to
-        // the pool for the next layer. A bf16 model keeps the inputs in bf16:
-        // the stream is rounded at each layer boundary and the layer runs on
-        // the rounded value widened back, so the backward's rebuild from the
-        // kept input is the forward's computation, bit for bit.
+        // the pool for the next layer. A bf16 model keeps a bf16 copy of each
+        // input and runs the forward on the f32 stream: the backward rebuilds
+        // each layer from its rounded input, so a layer's gradient is taken
+        // up to 2^-9 relative from where its forward ran, and that error
+        // stays local. Running the forward on the rounded stream instead (the
+        // rebuild then the forward's bits) compounds the rounding through
+        // every layer above: on the 2B (`real_2b_step_on_bf16_storage_stays_near_the_f32_step`)
+        // it put layer 0's `dt_bias` gradient 1.1e-1 from the f32 step's,
+        // against 2.7e-2 this way.
         let mut inputs = Vec::with_capacity(self.layers.len());
         for layer in &self.layers {
             let kept = if self.precision == Precision::Bf16 {
                 let b = rt.alloc_tensor_bf16(&[tu, h])?;
                 cast_f32_to_bf16_into(&resid, &b)?;
-                cast_bf16_to_f32_into(&b, &resid)?;
                 Some(b)
             } else {
                 None
@@ -964,6 +1050,11 @@ impl Qwen35Model {
                 dv: tensor(rt, &[1, tu, hv, dv])?,
                 dg: tensor(rt, &[1, tu, hv])?,
                 dbeta: tensor(rt, &[1, tu, hv])?,
+                dqk: if g.v_heads() > g.k_heads() {
+                    Some(f32s(rt, tu * g.key_dim() as usize)?)
+                } else {
+                    None
+                },
                 ws: GdnTrainWorkspace::new(rt, dims)?,
                 norm_part: f32s(rt, gated_rms_norm_bwd_part_len(t, g.v_heads(), g.v_dim()))?,
                 gates_part: f32s(rt, gdn_gates_bwd_part_len(t, g.v_heads()))?,
@@ -1153,6 +1244,9 @@ impl Qwen35Model {
                     f(tu * hv * dv), // y
                     mm.nn_scratch_bytes(tu, h, hv * dv, wd),
                 ]);
+                if g.v_heads() > g.k_heads() {
+                    b.push(f(tu * g.key_dim() as usize)); // q, k staged at key-head width
+                }
             }
             Mixer::Attn(_) => {
                 let a = cfg.attn;
@@ -1254,6 +1348,9 @@ impl Qwen35Model {
                 f(gdn_gates_bwd_part_len(t, g.v_heads())),
                 f(conv1d_silu_bwd_part_len(1, t, g.conv_dim(), cfg.conv_kernel)),
             ]);
+            if g.v_heads() > g.k_heads() {
+                b.push(f(tu * g.key_dim() as usize)); // dqk
+            }
         }
         if has(crate::qwen35_model::LayerKind::FullAttention) {
             let a = cfg.attn;
@@ -1443,11 +1540,22 @@ impl Qwen35Model {
             tensor(rt, &[1, tu, hv, dk])?,
             tensor(rt, &[1, tu, hv, dv])?,
         );
-        for (off, dst, width) in [
-            (qkv.q_off, &q, g.key_dim()),
-            (qkv.k_off, &k, g.key_dim()),
-            (qkv.v_off, &v, g.value_dim()),
+        // Grouped heads: q and k land at key-head width, then repeat.
+        let r = g.v_heads() / g.k_heads();
+        let staged = if r > 1 {
+            Some(f32s(rt, tu * g.key_dim() as usize)?)
+        } else {
+            None
+        };
+        for (off, dst, width, repeat) in [
+            (qkv.q_off, &q, g.key_dim(), true),
+            (qkv.k_off, &k, g.key_dim(), true),
+            (qkv.v_off, &v, g.value_dim(), false),
         ] {
+            let land = match (&staged, repeat) {
+                (Some(s), true) => s,
+                _ => &dst.buffer,
+            };
             copy_cols(
                 rt,
                 Cols {
@@ -1455,10 +1563,13 @@ impl Qwen35Model {
                     ld: qkv.ld,
                     off,
                 },
-                Cols::dense(&dst.buffer, width),
+                Cols::dense(land, width),
                 t,
                 width,
             )?;
+            if let (Some(s), true) = (&staged, repeat) {
+                repeat_heads(rt, s, &dst.buffer, t, g.k_heads(), r)?;
+            }
         }
         let (gt, beta) = (tensor(rt, &[1, tu, hv])?, tensor(rt, &[1, tu, hv])?);
         qwen35::gdn_gates(
@@ -1741,15 +1852,24 @@ impl Qwen35Model {
         )?;
         // q, k, v back into the conv output's layout, then the conv into the
         // projection's qkv columns.
+        // Grouped heads: dq and dk sum over each key head's value heads first.
         let qkv = g.conv_qkv(&gs.d_conv);
-        for (src, off, width) in [
-            (&gs.dq, qkv.q_off, g.key_dim()),
-            (&gs.dk, qkv.k_off, g.key_dim()),
-            (&gs.dv, qkv.v_off, g.value_dim()),
+        let r = g.v_heads() / g.k_heads();
+        for (src, off, width, grouped) in [
+            (&gs.dq, qkv.q_off, g.key_dim(), true),
+            (&gs.dk, qkv.k_off, g.key_dim(), true),
+            (&gs.dv, qkv.v_off, g.value_dim(), false),
         ] {
+            let src = match (&gs.dqk, grouped) {
+                (Some(sum), true) => {
+                    sum_heads(rt, &src.buffer, sum, t, g.k_heads(), r)?;
+                    sum
+                }
+                _ => &src.buffer,
+            };
             copy_cols(
                 rt,
-                Cols::dense(&src.buffer, width),
+                Cols::dense(src, width),
                 Cols {
                     buf: &gs.d_conv,
                     ld: qkv.ld,

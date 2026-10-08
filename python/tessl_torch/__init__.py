@@ -44,7 +44,7 @@ __all__ = [
     "library_path",
 ]
 
-_ABI_VERSION = 9
+_ABI_VERSION = 10
 _MAX_DIMS = 6
 _DTYPE_CODE = {torch.float32: 0, torch.bfloat16: 1, torch.float16: 2}
 _ERR_LEN = 1024
@@ -177,7 +177,8 @@ def _load():
         err_args = [ctypes.c_char_p, ctypes.c_size_t]
         lib.tessl_qwen35_load.restype = ctypes.c_int32
         lib.tessl_qwen35_load.argtypes = [
-            ctypes.c_void_p, ctypes.c_char_p, ctypes.c_char_p, ctypes.c_char_p, ctypes.POINTER(ctypes.c_void_p),
+            ctypes.c_void_p, ctypes.c_char_p, ctypes.c_char_p, ctypes.c_char_p, ctypes.c_uint32,
+            ctypes.POINTER(ctypes.c_void_p),
         ] + err_args
         lib.tessl_qwen35_free.restype = ctypes.c_int32
         lib.tessl_qwen35_free.argtypes = [ctypes.c_void_p]
@@ -210,9 +211,16 @@ def _load():
         lib.tessl_qwen35_copy.argtypes = [
             ctypes.c_void_p, ctypes.c_uint32, ctypes.POINTER(_TensorRef), ctypes.c_uint64,
         ] + err_args
-        for name in ("tessl_qwen35_adamw_init", "tessl_qwen35_adamw_free"):
-            getattr(lib, name).restype = ctypes.c_int32
-            getattr(lib, name).argtypes = [ctypes.c_void_p] + err_args
+        lib.tessl_qwen35_adamw_init.restype = ctypes.c_int32
+        lib.tessl_qwen35_adamw_init.argtypes = [
+            ctypes.c_void_p, ctypes.c_uint32, ctypes.c_uint64, ctypes.c_uint32,
+        ] + err_args
+        lib.tessl_qwen35_adamw_free.restype = ctypes.c_int32
+        lib.tessl_qwen35_adamw_free.argtypes = [ctypes.c_void_p] + err_args
+        lib.tessl_qwen35_describe.restype = ctypes.c_int32
+        lib.tessl_qwen35_describe.argtypes = [
+            ctypes.c_void_p, ctypes.c_char_p, ctypes.c_uint64, ctypes.POINTER(ctypes.c_uint64),
+        ] + err_args
         lib.tessl_qwen35_adamw_step.restype = ctypes.c_int32
         lib.tessl_qwen35_adamw_step.argtypes = [
             ctypes.c_void_p, ctypes.c_double, ctypes.c_double, ctypes.c_double, ctypes.c_double,
@@ -643,6 +651,14 @@ def patch_transformers_qwen3_5():
 
 _READ_PARAMS, _READ_GRADS, _WRITE_PARAMS = 0, 1, 2
 _READ_ADAMW_M, _READ_ADAMW_V, _WRITE_ADAMW_M, _WRITE_ADAMW_V = 3, 4, 5, 6
+_READ_ADAMW_AUX, _WRITE_ADAMW_AUX = 7, 8
+# Stored precision codes (TESSL_F32, TESSL_BF16), and the AdamW update rules
+# and moment storages by the names tessl's AdamW::describe prints.
+_PRECISION_CODE = {"f32": 0, "bf16": 1}
+_UPDATE_CODE = {"f32": 0, "f32-master": 1, "bf16-kahan": 2, "bf16-stochastic": 3}
+_MOMENTS_CODE = {"f32": 0, "bf16": 1, "block8": 2}
+# The rules that keep auxiliary state: an f32 master, or a Kahan compensation.
+_AUX_RULES = ("f32-master", "bf16-kahan")
 
 
 class Qwen35:
@@ -665,28 +681,40 @@ class Qwen35:
     and values (the zero-centred norms as ``w``, as tessl stores them).
     Linear weights come back as transposed views of ``[in, out]``
     tensors, which is how tessl lays them out; ``load_parameters`` accepts
-    any layout. The model runs entirely in f32, the tied embedding included,
-    so ``load_parameters`` is exact. ``operands="bf16"`` rounds only the
-    GEMMs' operands; the default ``"f32"`` is exact, and it is the lane
-    every stated parity bound is for.
+    any layout. With ``precision="f32"`` (the default) the model runs
+    entirely in f32, the tied embedding included, so ``load_parameters`` is
+    exact. ``operands="bf16"`` rounds only the GEMMs' operands; the default
+    ``"f32"`` is exact, and it is the lane every stated parity bound is for.
+
+    ``precision="bf16"`` stores the matrices, their gradients and each
+    layer's saved input in bf16, with f32 arithmetic: half the memory, and
+    the 4B's training fits a 48 GiB Mac with ``adamw_init`` keeping 8-bit
+    moments. Its steps take ``operands="bf16"``, ``load_parameters`` rounds
+    the matrices to nearest, and ``parameters()`` and ``grads()`` return the
+    stored values widened to f32.
 
     The handle belongs to the thread that made it, like every tessl call.
     Each call synchronizes torch's MPS stream first and returns after tessl's
     queue is idle.
     """
 
-    def __init__(self, safetensors, config_json, prefix: str = "model.language_model."):
+    def __init__(self, safetensors, config_json, prefix: str = "model.language_model.", precision: str = "f32"):
+        if precision not in _PRECISION_CODE:
+            raise TesslError(f"precision must be 'f32' or 'bf16', not {precision!r}")
         rt = _runtime()
         err = ctypes.create_string_buffer(_ERR_LEN)
         handle = ctypes.c_void_p()
         status = rt.lib.tessl_qwen35_load(
             rt.handle, str(safetensors).encode(), str(config_json).encode(), prefix.encode(),
-            ctypes.byref(handle), err, _ERR_LEN,
+            _PRECISION_CODE[precision], ctypes.byref(handle), err, _ERR_LEN,
         )
         if status != 0:
             raise TesslError(err.value.decode(errors="replace"))
         self._rt = rt
         self._handle = handle
+        self._precision = precision
+        # What adamw_init made the AdamW state with, or None.
+        self._adamw_config = None
         count = ctypes.c_uint64()
         self._check(rt.lib.tessl_qwen35_param_count(handle, ctypes.byref(count), err, _ERR_LEN), err)
         table = []
@@ -803,17 +831,59 @@ class Qwen35:
         required, and all are checked before any is written."""
         self._copy(_WRITE_PARAMS, self._staged("load_parameters", params))
 
-    def adamw_init(self) -> None:
-        """Make AdamW state inside tessl: both moments zeroed, twice the
-        parameters' memory (16 GB on the 2B), step count 0. With it a training
-        loop needs no torch copy of the parameters or gradients."""
+    def describe(self) -> str:
+        """One line naming the model's shapes and stored precision, then the
+        AdamW state's update rule, moment storage and step count once
+        ``adamw_init`` made it: what a run's log or checkpoint records."""
         err = ctypes.create_string_buffer(_ERR_LEN)
-        self._check(self._rt.lib.tessl_qwen35_adamw_init(self._handle, err, _ERR_LEN), err)
+        needed = ctypes.c_uint64()
+        out = ctypes.create_string_buffer(1024)
+        status = self._rt.lib.tessl_qwen35_describe(
+            self._handle, out, len(out), ctypes.byref(needed), err, _ERR_LEN)
+        if status != 0 and needed.value > len(out):
+            out = ctypes.create_string_buffer(needed.value)
+            status = self._rt.lib.tessl_qwen35_describe(
+                self._handle, out, len(out), ctypes.byref(needed), err, _ERR_LEN)
+        self._check(status, err)
+        return out.value.decode()
+
+    def adamw_init(self, update: str | None = None, moments: str = "f32", seed: int = 0) -> None:
+        """Make AdamW state inside tessl: moments zeroed, step count 0. With
+        it a training loop needs no torch copy of the parameters or gradients.
+
+        An f32 model takes ``update="f32"`` (the default for it): torch's
+        AdamW, bit for bit. A bf16 model names how its bf16 weights take
+        their updates: ``"f32-master"`` (an f32 master of each weight),
+        ``"bf16-kahan"`` (a bf16 compensation of what rounding dropped) or
+        ``"bf16-stochastic"`` (stochastic rounding from ``seed``, the only
+        rule that takes one). ``moments`` is ``"f32"`` (twice the parameters'
+        memory, 16 GB on the 2B), ``"bf16"`` or ``"block8"`` (8-bit codes,
+        one f32 scale per 256 elements)."""
+        if update is None:
+            if self._precision != "f32":
+                raise TesslError("adamw_init: a bf16 model takes update='f32-master', 'bf16-kahan' or "
+                                 "'bf16-stochastic'")
+            update = "f32"
+        if update not in _UPDATE_CODE:
+            raise TesslError(f"adamw_init: update must be one of {sorted(_UPDATE_CODE)}, not {update!r}")
+        if moments not in _MOMENTS_CODE:
+            raise TesslError(f"adamw_init: moments must be one of {sorted(_MOMENTS_CODE)}, not {moments!r}")
+        seed = int(seed)
+        if not 0 <= seed < 2 ** 64:
+            raise TesslError(f"adamw_init: seed {seed} is outside [0, 2**64)")
+        err = ctypes.create_string_buffer(_ERR_LEN)
+        self._check(
+            self._rt.lib.tessl_qwen35_adamw_init(
+                self._handle, _UPDATE_CODE[update], seed, _MOMENTS_CODE[moments], err, _ERR_LEN),
+            err,
+        )
+        self._adamw_config = {"update": update, "seed": seed, "moments": moments}
 
     def adamw_free(self) -> None:
         """Drop the AdamW state, if any."""
         err = ctypes.create_string_buffer(_ERR_LEN)
         self._check(self._rt.lib.tessl_qwen35_adamw_free(self._handle, err, _ERR_LEN), err)
+        self._adamw_config = None
 
     @property
     def adamw_step_count(self) -> int:
@@ -824,13 +894,20 @@ class Qwen35:
         return count.value
 
     def adamw_state(self, device: str = "mps") -> dict:
-        """A checkpoint of the AdamW state: ``{"step": int, "exp_avg": {name:
-        tensor}, "exp_avg_sq": {name: tensor}}``, the moments laid out as
-        ``parameters()`` and named as torch's AdamW names them. Saved with the
-        parameters, it resumes the run bit for bit through
-        ``load_adamw_state``."""
-        state = {"step": self.adamw_step_count}
-        for key, direction in (("exp_avg", _READ_ADAMW_M), ("exp_avg_sq", _READ_ADAMW_V)):
+        """A checkpoint of the AdamW state: ``{"step": int, "config": {"update",
+        "seed", "moments"}, "exp_avg": {name: tensor}, "exp_avg_sq": {name:
+        tensor}}``, the moments laid out as ``parameters()`` (f32, decoded from
+        bf16 or 8-bit storage) and named as torch's AdamW names them, plus
+        ``"aux"`` (the f32 masters or the Kahan compensations, widened) under
+        a rule that keeps them. Saved with the parameters, it resumes the run
+        bit for bit through ``load_adamw_state``."""
+        if self._adamw_config is None:
+            raise TesslError("adamw_state: no AdamW state; call adamw_init first")
+        state = {"step": self.adamw_step_count, "config": dict(self._adamw_config)}
+        keys = [("exp_avg", _READ_ADAMW_M), ("exp_avg_sq", _READ_ADAMW_V)]
+        if self._adamw_config["update"] in _AUX_RULES:
+            keys.append(("aux", _READ_ADAMW_AUX))
+        for key, direction in keys:
             ts = self._storage(torch.device(device))
             self._copy(direction, ts)
             state[key] = self._views(ts)
@@ -838,19 +915,38 @@ class Qwen35:
 
     def load_adamw_state(self, state: dict) -> None:
         """Restore what ``adamw_state`` returned (or torch's AdamW state for
-        the same parameters, rearranged by name) into the AdamW state that
-        ``adamw_init()`` made. Every moment is checked before any is
-        written."""
-        extra = set(state) - {"step", "exp_avg", "exp_avg_sq"}
-        if extra or len(state) != 3:
-            raise TesslError(f"load_adamw_state: want keys step, exp_avg and exp_avg_sq, got {sorted(state)}")
+        the same parameters, rearranged by name, into an f32 model's f32
+        AdamW) into the AdamW state that ``adamw_init()`` made. A checkpoint
+        without ``"config"`` is torch's AdamW: f32 rule and moments. A
+        checkpoint made under another configuration is refused, as is one
+        whose ``"aux"`` the rule needs and lacks or does not need and has.
+        Everything is checked before anything is written."""
+        required = {"step", "exp_avg", "exp_avg_sq"}
+        if not required <= set(state) or set(state) - required - {"config", "aux"}:
+            raise TesslError(
+                f"load_adamw_state: want keys step, exp_avg and exp_avg_sq (and config and aux as adamw_state "
+                f"writes them), got {sorted(state)}")
+        if self._adamw_config is None:
+            raise TesslError("load_adamw_state: no AdamW state; call tessl_qwen35_adamw_init first")
+        saved = state.get("config", {"update": "f32", "seed": 0, "moments": "f32"})
+        if saved != self._adamw_config:
+            raise TesslError(f"load_adamw_state: the checkpoint's AdamW is {saved}, this model's "
+                             f"{self._adamw_config}; call adamw_init with the checkpoint's configuration")
+        wants_aux = self._adamw_config["update"] in _AUX_RULES
+        if wants_aux != ("aux" in state):
+            raise TesslError(f"load_adamw_state: update {self._adamw_config['update']!r} "
+                             f"{'needs' if wants_aux else 'keeps no'} aux state, and the checkpoint "
+                             f"{'has none' if wants_aux else 'has some'}")
         step = int(state["step"])
         if step < 0:
             raise TesslError(f"load_adamw_state: step {step} is negative")
         m = self._staged("load_adamw_state: exp_avg", state["exp_avg"])
         v = self._staged("load_adamw_state: exp_avg_sq", state["exp_avg_sq"])
+        aux = self._staged("load_adamw_state: aux", state["aux"]) if wants_aux else None
         self._copy(_WRITE_ADAMW_M, m)
         self._copy(_WRITE_ADAMW_V, v)
+        if aux is not None:
+            self._copy(_WRITE_ADAMW_AUX, aux)
         err = ctypes.create_string_buffer(_ERR_LEN)
         self._check(self._rt.lib.tessl_qwen35_adamw_set_step_count(self._handle, step, err, _ERR_LEN), err)
 

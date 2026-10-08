@@ -748,6 +748,7 @@ impl PairKernel {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn dispatch_pair(
     rt: &Arc<GpuRuntime>,
     kernel: PairKernel,

@@ -122,9 +122,12 @@ fn round_trips_f32_bf16_f16_scalars_empty_tensors_and_metadata() {
     std::fs::remove_file(&p).unwrap();
 }
 
+/// A fixture tensor: name, dtype, shape, little-endian bytes.
+type FixtureTensor = (&'static str, Dtype, Vec<usize>, Vec<u8>);
+
 /// One file holding every integer dtype; returns its path and each tensor's
 /// little-endian bytes, keyed by name.
-fn integer_fixture() -> (PathBuf, Vec<(&'static str, Dtype, Vec<usize>, Vec<u8>)>) {
+fn integer_fixture() -> (PathBuf, Vec<FixtureTensor>) {
     let le = |vs: &[u64], w: usize| {
         vs.iter()
             .flat_map(|v| v.to_le_bytes()[..w].to_vec())

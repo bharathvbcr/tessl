@@ -150,6 +150,7 @@ fn scan_ms(rt: &Arc<GpuRuntime>, batch: u32, t: u32, slice: GdnScanSlice) -> Res
     Ok(median(samples))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn phase(
     rt: &Arc<GpuRuntime>,
     dims: &GdnDims,

@@ -18,12 +18,14 @@ use objc2_metal::{MTLBuffer, MTLDevice, MTLResourceOptions};
 use tessl::capi::{
     tessl_abi_version, tessl_cross_entropy_rows, tessl_mtl_buffer_length, tessl_qwen35_adamw_free,
     tessl_qwen35_adamw_init, tessl_qwen35_adamw_set_step_count, tessl_qwen35_adamw_step, tessl_qwen35_adamw_step_count,
-    tessl_qwen35_copy, tessl_qwen35_free, tessl_qwen35_grad_sq_norm, tessl_qwen35_hidden, tessl_qwen35_load,
-    tessl_qwen35_param_count, tessl_qwen35_param_info, tessl_qwen35_train_backward, tessl_qwen35_train_discard,
-    tessl_qwen35_train_forward, tessl_qwen35_train_step, tessl_runtime_free, tessl_runtime_new, tessl_synchronize,
-    TesslCeArgs, TesslParamInfo, TesslQwen35, TesslRuntime, TesslTensorRef, TESSL_ABI_VERSION, TESSL_ERR, TESSL_F32,
-    TESSL_MAX_DIMS, TESSL_OK, TESSL_OPERANDS_BF16, TESSL_OPERANDS_EXACT_F32, TESSL_READ_ADAMW_M, TESSL_READ_ADAMW_V,
-    TESSL_READ_GRADS, TESSL_READ_PARAMS, TESSL_SUPERVISE_CAUSAL, TESSL_SUPERVISE_ROWS, TESSL_WRITE_ADAMW_M,
+    tessl_qwen35_copy, tessl_qwen35_describe, tessl_qwen35_free, tessl_qwen35_grad_sq_norm, tessl_qwen35_hidden,
+    tessl_qwen35_load, tessl_qwen35_param_count, tessl_qwen35_param_info, tessl_qwen35_train_backward,
+    tessl_qwen35_train_discard, tessl_qwen35_train_forward, tessl_qwen35_train_step, tessl_runtime_free,
+    tessl_runtime_new, tessl_synchronize, TesslCeArgs, TesslParamInfo, TesslQwen35, TesslRuntime, TesslTensorRef,
+    TESSL_ABI_VERSION, TESSL_BF16, TESSL_ERR, TESSL_F16, TESSL_F32, TESSL_MAX_DIMS, TESSL_MOMENTS_BLOCK8,
+    TESSL_MOMENTS_F32, TESSL_OK, TESSL_OPERANDS_BF16, TESSL_OPERANDS_EXACT_F32, TESSL_READ_ADAMW_AUX,
+    TESSL_READ_ADAMW_M, TESSL_READ_ADAMW_V, TESSL_READ_GRADS, TESSL_READ_PARAMS, TESSL_SUPERVISE_CAUSAL,
+    TESSL_SUPERVISE_ROWS, TESSL_UPDATE_BF16_KAHAN, TESSL_UPDATE_F32, TESSL_WRITE_ADAMW_AUX, TESSL_WRITE_ADAMW_M,
     TESSL_WRITE_ADAMW_V, TESSL_WRITE_PARAMS,
 };
 use tessl::cross_entropy::{cross_entropy_rows, CeGrads, CeHidden, CeWorkspace, Reduction};
@@ -460,6 +462,11 @@ fn fixture_ids() -> Vec<u32> {
 }
 
 fn load_model(rt: *mut TesslRuntime) -> *mut TesslQwen35 {
+    load_model_as(rt, TESSL_F32)
+}
+
+/// The fixture through [`tessl_qwen35_load`] at `precision`.
+fn load_model_as(rt: *mut TesslRuntime, precision: u32) -> *mut TesslQwen35 {
     let (st, cfg, prefix) = (
         fixture("model.safetensors"),
         fixture("config.json"),
@@ -473,6 +480,7 @@ fn load_model(rt: *mut TesslRuntime) -> *mut TesslQwen35 {
             st.as_ptr(),
             cfg.as_ptr(),
             prefix.as_ptr(),
+            precision,
             &mut out,
             err.as_mut_ptr(),
             ERR_LEN,
@@ -551,8 +559,8 @@ fn the_model_through_the_abi_is_the_rust_model() {
             "{}",
             msg(&err)
         );
-        assert_eq!(copy(7, &refs, &mut err), TESSL_ERR);
-        assert!(msg(&err).contains("direction 7"), "{}", msg(&err));
+        assert_eq!(copy(9, &refs, &mut err), TESSL_ERR);
+        assert!(msg(&err).contains("direction 9"), "{}", msg(&err));
 
         let mut loss = 0.0f64;
         let s = unsafe {
@@ -730,7 +738,7 @@ fn a_model_load_refuses_bad_arguments() {
                 prefix: *const c_char,
                 out: *mut *mut TesslQwen35,
                 err: &mut [c_char; ERR_LEN]| unsafe {
-        tessl_qwen35_load(handle.0, st, cfg, prefix, out, err.as_mut_ptr(), ERR_LEN)
+        tessl_qwen35_load(handle.0, st, cfg, prefix, TESSL_F32, out, err.as_mut_ptr(), ERR_LEN)
     };
     assert_eq!(
         load(ptr::null(), cfg.as_ptr(), prefix.as_ptr(), &mut out, &mut err),
@@ -753,6 +761,25 @@ fn a_model_load_refuses_bad_arguments() {
         TESSL_ERR
     );
     assert!(msg(&err).contains("null out"), "{}", msg(&err));
+    let s = unsafe {
+        tessl_qwen35_load(
+            handle.0,
+            st.as_ptr(),
+            cfg.as_ptr(),
+            prefix.as_ptr(),
+            TESSL_F16,
+            &mut out,
+            err.as_mut_ptr(),
+            ERR_LEN,
+        )
+    };
+    assert_eq!(s, TESSL_ERR);
+    assert!(
+        msg(&err).contains("precision code 2 is neither 0 (f32) nor 1 (bf16)"),
+        "{}",
+        msg(&err)
+    );
+    assert!(out.is_null(), "a failed load leaves *out null");
     assert_eq!(unsafe { tessl_qwen35_free(ptr::null_mut()) }, TESSL_OK);
 }
 
@@ -829,13 +856,17 @@ fn adamw_through_the_abi_is_the_rust_adamw() {
             msg(&err)
         );
         assert_eq!(
-            unsafe { tessl_qwen35_adamw_init(model, err.as_mut_ptr(), ERR_LEN) },
+            unsafe {
+                tessl_qwen35_adamw_init(model, TESSL_UPDATE_F32, 0, TESSL_MOMENTS_F32, err.as_mut_ptr(), ERR_LEN)
+            },
             TESSL_OK,
             "{}",
             msg(&err)
         );
         assert_eq!(
-            unsafe { tessl_qwen35_adamw_init(model, err.as_mut_ptr(), ERR_LEN) },
+            unsafe {
+                tessl_qwen35_adamw_init(model, TESSL_UPDATE_F32, 0, TESSL_MOMENTS_F32, err.as_mut_ptr(), ERR_LEN)
+            },
             TESSL_ERR
         );
         assert!(msg(&err).contains("already has AdamW state"), "{}", msg(&err));
@@ -1322,4 +1353,292 @@ fn a_two_phase_step_through_the_abi_is_the_rust_one() {
         );
     });
     assert_eq!(unsafe { tessl_qwen35_free(model) }, TESSL_OK);
+}
+
+/// A bf16 model through the ABI is the Rust bf16 model (`load_tower`,
+/// `AdamW::with_config`): two steps into the bank and two Kahan / 8-bit
+/// AdamW steps leave the parameters, both moments and the compensations at
+/// the Rust bits; the auxiliary state written back reads as the same bits;
+/// the description names the stored precision and the optimizer; every
+/// refusal is a status and a message.
+#[test]
+fn a_bf16_model_through_the_abi_is_the_rust_bf16_model() {
+    use tessl::qwen35_adamw::{AdamWConfig, MomentStorage, UpdateRule};
+    let handle = Handle::new();
+    let model = load_model_as(handle.0, TESSL_BF16);
+    let ids = fixture_ids();
+    let mut err = [0 as c_char; ERR_LEN];
+    with_gpu(|rt| {
+        let st =
+            tessl::safetensors::SafeTensors::open(std::path::Path::new(fixture("model.safetensors").to_str().unwrap()))
+                .unwrap();
+        let cfg = tessl::qwen35_model::Qwen35Config::from_config_file(std::path::Path::new(
+            fixture("config.json").to_str().unwrap(),
+        ))
+        .unwrap();
+        let rust =
+            tessl::qwen35_model::Qwen35Model::load_tower(rt, &st, "model.", cfg, tessl::qwen35_model::Precision::Bf16)
+                .unwrap();
+        let table = rust.parameter_table().unwrap();
+        let n = table.len() as u64;
+
+        let describe = |len: usize, err: &mut [c_char; ERR_LEN]| -> (i32, String, u64) {
+            let mut out = vec![0 as c_char; len.max(1)];
+            let mut needed = 0u64;
+            let s = unsafe {
+                tessl_qwen35_describe(
+                    model,
+                    out.as_mut_ptr(),
+                    len as u64,
+                    &mut needed,
+                    err.as_mut_ptr(),
+                    ERR_LEN,
+                )
+            };
+            (s, msg(&out), needed)
+        };
+        let (s, line, needed) = describe(1024, &mut err);
+        assert_eq!(s, TESSL_OK, "{}", msg(&err));
+        assert_eq!(line, rust.describe());
+        assert!(line.contains("matrices bf16"), "{line}");
+        assert_eq!(needed as usize, line.len() + 1);
+        let (s, _, short) = describe(8, &mut err);
+        assert_eq!((s, short), (TESSL_ERR, needed));
+        assert!(
+            msg(&err).contains(&format!("needs {needed} bytes, out has 8")),
+            "{}",
+            msg(&err)
+        );
+
+        let init = |update: u32, seed: u64, moments: u32, err: &mut [c_char; ERR_LEN]| unsafe {
+            tessl_qwen35_adamw_init(model, update, seed, moments, err.as_mut_ptr(), ERR_LEN)
+        };
+        assert_eq!(init(TESSL_UPDATE_F32, 0, TESSL_MOMENTS_F32, &mut err), TESSL_ERR);
+        assert!(msg(&err).contains("does not apply to a Bf16 model"), "{}", msg(&err));
+        assert_eq!(init(9, 0, TESSL_MOMENTS_F32, &mut err), TESSL_ERR);
+        assert!(msg(&err).contains("update code 9 is not"), "{}", msg(&err));
+        assert_eq!(init(TESSL_UPDATE_BF16_KAHAN, 0, 7, &mut err), TESSL_ERR);
+        assert!(msg(&err).contains("moments code 7 is not"), "{}", msg(&err));
+        assert_eq!(
+            init(TESSL_UPDATE_BF16_KAHAN, 5, TESSL_MOMENTS_BLOCK8, &mut err),
+            TESSL_ERR
+        );
+        assert!(
+            msg(&err).contains("seed 5 given to a rule that takes none"),
+            "{}",
+            msg(&err)
+        );
+        assert_eq!(
+            init(TESSL_UPDATE_BF16_KAHAN, 0, TESSL_MOMENTS_BLOCK8, &mut err),
+            TESSL_OK,
+            "{}",
+            msg(&err)
+        );
+        let config = AdamWConfig {
+            update: UpdateRule::Bf16Kahan,
+            moments: MomentStorage::Block8,
+        };
+        let mut state = AdamW::with_config(&rust, config).unwrap();
+        let (_, line, _) = describe(1024, &mut err);
+        assert_eq!(line, format!("{}; {}", rust.describe(), state.describe()));
+        assert!(
+            line.ends_with("AdamW update=bf16-kahan moments=block8/256 step=0"),
+            "{line}"
+        );
+
+        let train = |operands: u32, loss: &mut f64, err: &mut [c_char; ERR_LEN]| unsafe {
+            tessl_qwen35_train_step(
+                model,
+                ids.as_ptr(),
+                ids.len() as u64,
+                operands,
+                loss,
+                err.as_mut_ptr(),
+                ERR_LEN,
+            )
+        };
+        let mut loss = 0.0f64;
+        assert_eq!(train(TESSL_OPERANDS_EXACT_F32, &mut loss, &mut err), TESSL_ERR);
+        assert!(msg(&err).contains("trains on GemmOperands::Bf16"), "{}", msg(&err));
+        let bank = Qwen35Grads::zeros_like(&rust).unwrap();
+        let wd = rust.default_weight_decay(0.1).unwrap();
+        let hyper = AdamWHyper {
+            lr: 1e-2,
+            ..AdamWHyper::default()
+        };
+        for _ in 0..2 {
+            assert_eq!(
+                train(TESSL_OPERANDS_BF16, &mut loss, &mut err),
+                TESSL_OK,
+                "{}",
+                msg(&err)
+            );
+            let want = rust
+                .train_step_into(&ids, GemmOperands::Bf16, Supervise::Causal, &bank, false)
+                .unwrap();
+            assert_eq!(loss.to_bits(), want.to_bits());
+            let s = unsafe {
+                tessl_qwen35_adamw_step(
+                    model,
+                    hyper.lr,
+                    hyper.beta1,
+                    hyper.beta2,
+                    hyper.eps,
+                    hyper.grad_scale,
+                    wd.as_ptr(),
+                    n,
+                    err.as_mut_ptr(),
+                    ERR_LEN,
+                )
+            };
+            assert_eq!(s, TESSL_OK, "{}", msg(&err));
+            rust.adamw_step(&bank, &mut state, &hyper, &wd).unwrap();
+        }
+        let (_, line, _) = describe(1024, &mut err);
+        assert!(line.ends_with("step=2"), "{line}");
+
+        // Parameters, moments and compensations: the Rust state's bits.
+        let bufs: Vec<_> = table
+            .iter()
+            .map(|p| shared(rt, &vec![0.0; p.shape.iter().product()]))
+            .collect();
+        let refs: Vec<TesslTensorRef> = table
+            .iter()
+            .zip(&bufs)
+            .map(|(p, b)| tref(b, &p.storage_shape().iter().map(|&d| d as u64).collect::<Vec<_>>()))
+            .collect();
+        let local: Vec<tessl::Tensor> = table
+            .iter()
+            .map(|p| rt.alloc_tensor_f32(&p.storage_shape()).unwrap())
+            .collect();
+        let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+        let abi = |dir: u32, err: &mut [c_char; ERR_LEN]| -> Vec<Vec<u32>> {
+            let s = unsafe { tessl_qwen35_copy(model, dir, refs.as_ptr(), n, err.as_mut_ptr(), ERR_LEN) };
+            assert_eq!(s, TESSL_OK, "direction {dir}: {}", msg(err));
+            table
+                .iter()
+                .zip(&bufs)
+                .map(|(p, b)| bits(&read(b, p.shape.iter().product())))
+                .collect()
+        };
+        let mine =
+            |local: &[tessl::Tensor]| -> Vec<Vec<u32>> { local.iter().map(|t| bits(&t.read_f32().unwrap())).collect() };
+        rust.read_parameters(&local).unwrap();
+        assert_eq!(abi(TESSL_READ_PARAMS, &mut err), mine(&local), "parameters");
+        for (dir, which) in [
+            (TESSL_READ_ADAMW_M, Moment::First),
+            (TESSL_READ_ADAMW_V, Moment::Second),
+        ] {
+            rust.read_adamw_moment(&state, which, &local).unwrap();
+            assert_eq!(abi(dir, &mut err), mine(&local), "{which:?}");
+        }
+        rust.read_adamw_aux(&state, &local).unwrap();
+        let aux = abi(TESSL_READ_ADAMW_AUX, &mut err);
+        assert_eq!(aux, mine(&local), "compensations");
+        assert!(aux.iter().flatten().any(|&b| b != 0), "two steps left no compensation");
+
+        // Written back, the compensations read as the same bits; zeros
+        // written read as zeros.
+        let s = unsafe {
+            tessl_qwen35_copy(
+                model,
+                TESSL_WRITE_ADAMW_AUX,
+                refs.as_ptr(),
+                n,
+                err.as_mut_ptr(),
+                ERR_LEN,
+            )
+        };
+        assert_eq!(s, TESSL_OK, "{}", msg(&err));
+        assert_eq!(abi(TESSL_READ_ADAMW_AUX, &mut err), aux);
+        for (p, b) in table.iter().zip(&bufs) {
+            let z = vec![0.0f32; p.shape.iter().product()];
+            unsafe { ptr::copy_nonoverlapping(z.as_ptr(), b.contents().as_ptr().cast::<f32>(), z.len()) };
+        }
+        let s = unsafe {
+            tessl_qwen35_copy(
+                model,
+                TESSL_WRITE_ADAMW_AUX,
+                refs.as_ptr(),
+                n,
+                err.as_mut_ptr(),
+                ERR_LEN,
+            )
+        };
+        assert_eq!(s, TESSL_OK, "{}", msg(&err));
+        assert!(abi(TESSL_READ_ADAMW_AUX, &mut err).iter().flatten().all(|&b| b == 0));
+    });
+    assert_eq!(unsafe { tessl_qwen35_free(model) }, TESSL_OK);
+
+    // An f32 model's AdamW keeps no auxiliary state.
+    let f32_model = load_model(handle.0);
+    let mut err = [0 as c_char; ERR_LEN];
+    assert_eq!(
+        unsafe {
+            tessl_qwen35_adamw_init(
+                f32_model,
+                TESSL_UPDATE_F32,
+                0,
+                TESSL_MOMENTS_F32,
+                err.as_mut_ptr(),
+                ERR_LEN,
+            )
+        },
+        TESSL_OK,
+        "{}",
+        msg(&err)
+    );
+    with_gpu(|rt| {
+        let mut n = 0u64;
+        assert_eq!(
+            unsafe { tessl_qwen35_param_count(f32_model, &mut n, err.as_mut_ptr(), ERR_LEN) },
+            TESSL_OK
+        );
+        let mut infos = Vec::new();
+        for i in 0..n {
+            let mut info: TesslParamInfo = unsafe { std::mem::zeroed() };
+            assert_eq!(
+                unsafe { tessl_qwen35_param_info(f32_model, i, &mut info, err.as_mut_ptr(), ERR_LEN) },
+                TESSL_OK
+            );
+            infos.push(info);
+        }
+        let bufs: Vec<_> = infos
+            .iter()
+            .map(|i| {
+                shared(
+                    rt,
+                    &vec![0.0; i.shape[..i.ndim as usize].iter().product::<u64>() as usize],
+                )
+            })
+            .collect();
+        let refs: Vec<TesslTensorRef> = infos
+            .iter()
+            .zip(&bufs)
+            .map(|(i, b)| {
+                let mut shape = i.shape[..i.ndim as usize].to_vec();
+                if i.transposed != 0 {
+                    shape.reverse();
+                }
+                tref(b, &shape)
+            })
+            .collect();
+        let s = unsafe {
+            tessl_qwen35_copy(
+                f32_model,
+                TESSL_READ_ADAMW_AUX,
+                refs.as_ptr(),
+                n,
+                err.as_mut_ptr(),
+                ERR_LEN,
+            )
+        };
+        assert_eq!(s, TESSL_ERR);
+        assert!(
+            msg(&err).contains("update rule f32 keeps no auxiliary state"),
+            "{}",
+            msg(&err)
+        );
+    });
+    assert_eq!(unsafe { tessl_qwen35_free(f32_model) }, TESSL_OK);
 }

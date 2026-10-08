@@ -1,0 +1,25 @@
+# cargo run --release --bin probe_storage_memory -- --config=<Qwen3.5-4B-Base config.json> --steps=512,2048 --step=512
+# 2026-10-08, Apple M5 Pro, branch feat/gdn-grouped-train; random weights at the 4B's exact shapes (allocation, not values, is measured)
+device Apple M5 Pro, recommended working set 48.00 GiB (51539607552 B)
+Qwen3.5 text: hidden 2560, intermediate 9216, vocab 248320, 32 layers (24 GDN, 8 attention); matrices bf16, norms/conv/gates f32; LM head tied to the embedding
+parameters 4205751296
+bf16 weights: 7.84 GiB allocated (computed 7.84 GiB)
+bf16 gradient bank: 7.84 GiB allocated
+
+variant                                                      weights        bank   optimizer       total  fits
+f32 everywhere                                             15.67 GiB   15.67 GiB   31.34 GiB   62.67 GiB  NO  computed only
+bf16 weights+bank, f32 master, f32 moments                  7.84 GiB    7.84 GiB   47.00 GiB   62.67 GiB  NO  computed only (not allocated: over the working set)
+bf16 weights+bank, f32 master, 8-bit moments                7.84 GiB    7.84 GiB   23.62 GiB   39.29 GiB  yes  measured optimizer 23.62 GiB, device total 39.29 GiB
+bf16 weights+bank, Kahan, bf16 moments (all bf16)           7.84 GiB    7.84 GiB   23.50 GiB   39.17 GiB  yes  measured optimizer 23.50 GiB, device total 39.17 GiB
+bf16 weights+bank, Kahan, 8-bit moments                     7.84 GiB    7.84 GiB   15.79 GiB   31.46 GiB  yes  measured optimizer 15.79 GiB, device total 31.46 GiB
+bf16 weights+bank, stochastic rounding, 8-bit moments       7.84 GiB    7.84 GiB    7.96 GiB   23.63 GiB  yes  measured optimizer 7.96 GiB, device total 23.63 GiB
+
+train_step_bytes(T=512, bf16): 6.29 GiB
+train_step_bytes(T=2048, bf16): 9.16 GiB
+
+AdamW update=bf16-kahan moments=block8/256 step=1; resident 31.46 GiB (weights, bank, Kahan + 8-bit AdamW)
+step T=512: loss 12.9900, peak 3.82 GiB over resident, bound 6.29 GiB; device peak 35.28 GiB (with the AdamW step), recommended working set 48.00 GiB
+
+# --step=2048
+AdamW update=bf16-kahan moments=block8/256 step=1; resident 31.46 GiB (weights, bank, Kahan + 8-bit AdamW)
+step T=2048: loss 12.9893, peak 5.88 GiB over resident, bound 9.16 GiB; device peak 37.35 GiB (with the AdamW step), recommended working set 48.00 GiB

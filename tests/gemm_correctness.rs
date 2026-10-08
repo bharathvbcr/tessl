@@ -335,6 +335,7 @@ fn f16_tensor(rt: &std::sync::Arc<GpuRuntime>, shape: &[usize], data: &[f32]) ->
 /// `|narrow - wide|` against [`tolerance`] with `operand_u = 0`, the bound
 /// [`assert_within_bound`] uses for bf16 GEMM. Bit-identical tiles never
 /// consult a magnitude: the difference is zero, which is inside that bound.
+#[allow(clippy::too_many_arguments)]
 fn assert_tiles_within_bf16_bound(
     label: &str,
     narrow: &[f32],

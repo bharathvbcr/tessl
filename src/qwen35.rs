@@ -2067,30 +2067,61 @@ pub fn attn_output_gate(
 
 // ---------------------------------------------------------------------- MLP ---
 
-/// `out = silu(gate) * up`, elementwise over `rows x width`: transformers'
-/// `Qwen3_5MLP` between its projections. Both inputs are f32 column windows
-/// (they may be two windows of one buffer, as a fused `[gate | up]` GEMM would
-/// write them). A bf16 `out` is what the down projection's GEMM reads, so it
-/// needs no separate cast pass. `out` may not overlap either input.
-pub fn swiglu(
+/// The activation of a gated MLP, `act(gate) * up`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GatedAct {
+    /// SiLU: transformers' `Qwen3_5MLP`.
+    Silu,
+    /// `gelu_pytorch_tanh`: EmbeddingGemma 2's MLP and per-layer-input gate
+    /// (the same function as [`crate::nn::mlp_gelu_tanh`]).
+    GeluTanh,
+}
+
+/// `out = act(gate) * up`, elementwise over `rows x width`. Both inputs are
+/// f32 column windows (they may be two windows of one buffer, as a fused
+/// `[gate | up]` GEMM writes them). A bf16 `out` is what a bf16 down
+/// projection's GEMM reads, so it needs no separate cast pass. `out` may not
+/// overlap either input.
+pub fn gated_act(
     rt: &Arc<GpuRuntime>,
+    act: GatedAct,
     gate: Cols<'_>,
     up: Cols<'_>,
     out: OutCols<'_>,
     rows: u32,
     width: u32,
 ) -> Result<(), String> {
-    const WHAT: &str = "qwen35::swiglu";
-    let name = out_kernel("qwen35_swiglu", out.dtype, WHAT)?;
+    gated_act_named(rt, act, gate, up, out, rows, width, "qwen35::gated_act")
+}
+
+/// [`gated_act`], its errors naming `what` (the entry the caller used).
+#[allow(clippy::too_many_arguments)]
+fn gated_act_named(
+    rt: &Arc<GpuRuntime>,
+    act: GatedAct,
+    gate: Cols<'_>,
+    up: Cols<'_>,
+    out: OutCols<'_>,
+    rows: u32,
+    width: u32,
+    what: &str,
+) -> Result<(), String> {
+    let name = match (act, out.dtype) {
+        (GatedAct::Silu, DType::F32) => "qwen35_swiglu_f32",
+        (GatedAct::Silu, DType::BF16) => "qwen35_swiglu_bf16",
+        (GatedAct::GeluTanh, DType::F32) => "qwen35_gelu_tanh_glu_f32",
+        (GatedAct::GeluTanh, DType::BF16) => "qwen35_gelu_tanh_glu_bf16",
+        (_, other) => return Err(format!("{what}: dtype must be F32 or BF16, got {other:?}")),
+    };
     let (r, w) = (u64::from(rows), u64::from(width));
-    require_window::<f32>(rt, gate, r, w, "swiglu gate")?;
-    require_window::<f32>(rt, up, r, w, "swiglu up")?;
-    require_out_window(rt, out, r, w, "swiglu out")?;
+    require_window::<f32>(rt, gate, r, w, &format!("{what} gate"))?;
+    require_window::<f32>(rt, up, r, w, &format!("{what} up"))?;
+    require_out_window(rt, out, r, w, &format!("{what} out"))?;
     if rows == 0 || width == 0 {
         return Ok(());
     }
-    require_disjoint_writes(WHAT, &[("out", out.cols.buf)], &[("gate", gate.buf), ("up", up.buf)])?;
-    let p = rt.pipeline(&name)?;
+    require_disjoint_writes(what, &[("out", out.cols.buf)], &[("gate", gate.buf), ("up", up.buf)])?;
+    let p = rt.pipeline(name)?;
     dispatch_2d(rt, &p, width as usize, rows as usize, |bnd| {
         set_gpu_buf(bnd, gate.buf, 0);
         set_gpu_buf(bnd, up.buf, 1);
@@ -2104,6 +2135,19 @@ pub fn swiglu(
         set_u32(bnd, out.cols.ld, 9);
         set_u32(bnd, out.cols.off, 10);
     })
+}
+
+/// `out = silu(gate) * up`: [`gated_act`] with [`GatedAct::Silu`],
+/// transformers' `Qwen3_5MLP` between its projections.
+pub fn swiglu(
+    rt: &Arc<GpuRuntime>,
+    gate: Cols<'_>,
+    up: Cols<'_>,
+    out: OutCols<'_>,
+    rows: u32,
+    width: u32,
+) -> Result<(), String> {
+    gated_act_named(rt, GatedAct::Silu, gate, up, out, rows, width, "qwen35::swiglu")
 }
 
 /// `resid += y`, elementwise over `rows x width` column windows, in exact f32:
@@ -2999,12 +3043,48 @@ pub fn embed_rows(
     hidden: u32,
     out: &GpuBuffer,
 ) -> Result<(), String> {
+    embed_rows_impl(rt, ids, n, table, hidden, None, out)
+}
+
+/// [`embed_rows`] times `scale`, `out[r, :] = table[ids[r], :] * scale` (one
+/// f32 multiply after the exact widening), for a bf16 `table`: the gather and
+/// EmbeddingGemma 2's `sqrt(hidden)` embedding scale in one pass.
+pub fn embed_rows_scaled(
+    rt: &Arc<GpuRuntime>,
+    ids: &GpuBuffer,
+    n: u32,
+    table: LmHead<'_>,
+    hidden: u32,
+    scale: f32,
+    out: &GpuBuffer,
+) -> Result<(), String> {
+    embed_rows_impl(rt, ids, n, table, hidden, Some(scale), out)
+}
+
+fn embed_rows_impl(
+    rt: &Arc<GpuRuntime>,
+    ids: &GpuBuffer,
+    n: u32,
+    table: LmHead<'_>,
+    hidden: u32,
+    scale: Option<f32>,
+    out: &GpuBuffer,
+) -> Result<(), String> {
     const WHAT: &str = "qwen35::embed_rows";
     let kernel = match table.dtype {
         DType::BF16 => "qwen35_embed_rows_bf16",
         DType::F32 => "qwen35_embed_rows_f32",
         d => return Err(format!("{WHAT}: bf16 and f32 tables are compiled, got {d:?}")),
     };
+    if scale.is_some() && table.dtype != DType::BF16 {
+        return Err(format!(
+            "{WHAT}: the scaled gather is compiled for bf16 tables, got {:?}",
+            table.dtype
+        ));
+    }
+    if scale.is_some_and(|s| !s.is_finite()) {
+        return Err(format!("{WHAT}: scale must be finite"));
+    }
     if table.vocab == 0 || hidden == 0 {
         return Err(format!("{WHAT}: vocab and hidden must be non-zero"));
     }
@@ -3025,6 +3105,18 @@ pub fn embed_rows(
         return Ok(());
     }
     require_disjoint_writes(WHAT, &[("out", out)], &[("ids", ids), ("table", table.weight)])?;
+    if let Some(scale) = scale {
+        let p = rt.pipeline("qwen35_embed_rows_bf16_scaled")?;
+        return dispatch_2d(rt, &p, hidden as usize, n as usize, |bnd| {
+            set_gpu_buf(bnd, ids, 0);
+            set_gpu_buf(bnd, table.weight, 1);
+            set_gpu_buf(bnd, out, 2);
+            set_u32(bnd, n, 3);
+            set_u32(bnd, hidden, 4);
+            set_u32(bnd, table.vocab, 5);
+            set_f32(bnd, scale, 6);
+        });
+    }
     let p = rt.pipeline(kernel)?;
     dispatch_2d(rt, &p, hidden as usize, n as usize, |bnd| {
         set_gpu_buf(bnd, ids, 0);

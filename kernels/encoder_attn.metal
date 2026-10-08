@@ -71,8 +71,7 @@ kernel void NAME(                                                             \
     const uint group = max(H / Hkv, 1u);                                      \
     const uint hkv = h / group;                                               \
     const ulong kv_pos_stride = (ulong)Hkv * (D);                             \
-    const ulong kv_head_base = (ulong)b * kv_capacity * kv_pos_stride       \
-        + (ulong)hkv * (D);                                                   \
+    const ulong kv_head_base = (ulong)b * kv_capacity * kv_pos_stride + (ulong)hkv * (D); \
     const ulong q_pos_stride = (ulong)H * (D);                                \
     const ulong q_head_base = (ulong)b * T * q_pos_stride + (ulong)h * (D);   \
     const ulong w = (ulong)window;                                            \

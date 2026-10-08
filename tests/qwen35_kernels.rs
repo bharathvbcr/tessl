@@ -3398,6 +3398,59 @@ fn embed_rows_equals_the_host_gather_bit_for_bit() {
     });
 }
 
+/// The scaled gather is the bf16 gather times `scale` in one f32 multiply:
+/// bit for bit what the gather followed by a separate scale computes. A bad
+/// id's row is NaN, and an f32 table or a non-finite scale is refused.
+#[test]
+fn embed_rows_scaled_is_the_gather_times_the_scale_bit_for_bit() {
+    with_gpu(|rt| {
+        let (vocab, hidden) = (300usize, 512usize);
+        let bits = f32_slice_to_bf16(&random_f32(vocab * hidden, 7902));
+        let table = rt.alloc_buffer(bits.len() * 2).unwrap();
+        table.write_bf16_bits(&bits);
+        let head = LmHead {
+            weight: &table,
+            dtype: DType::BF16,
+            vocab: vocab as u32,
+        };
+        let ids: Vec<u32> = vec![0, 299, 17, vocab as u32, 17, 5];
+        let n = ids.len();
+        let idb = buf_u32(rt, &ids);
+        let scale = (hidden as f32).sqrt();
+        let out = seeded(rt, n * hidden, SENTINEL);
+        qwen35::embed_rows_scaled(rt, &idb, n as u32, head, hidden as u32, scale, &out).unwrap();
+        rt.synchronize().unwrap();
+        let got = out.read_f32();
+        for (r, &id) in ids.iter().enumerate() {
+            let row = &got[r * hidden..(r + 1) * hidden];
+            if id as usize >= vocab {
+                assert!(row.iter().all(|x| x.is_nan()), "row {r}: id {id} is not NaN");
+                continue;
+            }
+            let want = &bits[id as usize * hidden..(id as usize + 1) * hidden];
+            for (c, (g, &w)) in row.iter().zip(want).enumerate() {
+                assert_eq!(
+                    g.to_bits(),
+                    (bf16_bits_to_f32(w) * scale).to_bits(),
+                    "row {r} (id {id}) col {c}"
+                );
+            }
+        }
+        let f32_head = LmHead {
+            dtype: DType::F32,
+            ..head
+        };
+        expect_err(
+            qwen35::embed_rows_scaled(rt, &idb, n as u32, f32_head, hidden as u32, scale, &out),
+            "the scaled gather is compiled for bf16 tables",
+        );
+        expect_err(
+            qwen35::embed_rows_scaled(rt, &idb, n as u32, head, hidden as u32, f32::INFINITY, &out),
+            "scale must be finite",
+        );
+    });
+}
+
 // ------------------------------------------------ matrix-unit prefill attention ---
 
 /// Causal attention in f64 over `[batch, tq, heads, 256]` queries and

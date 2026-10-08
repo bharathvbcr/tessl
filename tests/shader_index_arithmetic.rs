@@ -667,7 +667,7 @@ fn encoder_attn_offsets_are_widened() {
             "key/value position stride",
         ),
         (
-            "const ulong kv_head_base = (ulong)b * T * kv_pos_stride + (ulong)hkv * (D);",
+            "const ulong kv_head_base = (ulong)b * kv_capacity * kv_pos_stride + (ulong)hkv * (D);",
             "key/value plane",
         ),
         (

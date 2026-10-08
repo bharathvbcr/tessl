@@ -899,7 +899,9 @@ impl EmbedGemma2Model {
         let (embeds, resid, x, y) = (at(&a.embeds, h)?, at(&a.resid, h)?, at(&a.x, h)?, at(&a.y, h)?);
         let (gate, up) = (at(&a.gate, cfg.intermediate)?, at(&a.up, cfg.intermediate)?);
         let (ple, ple_gate) = (at(&a.ple, cfg.ple_dim)?, at(&a.ple_gate, cfg.ple_dim)?);
-        qwen35::embed_rows(
+        // transformers multiplies by `embed_scale.to(weight.dtype)`: sqrt(512)
+        // as an f32 in the fp32 forward this mirrors, here inside the gather.
+        qwen35::embed_rows_scaled(
             rt,
             &a.ids,
             rows_u,
@@ -909,11 +911,9 @@ impl EmbedGemma2Model {
                 vocab: cfg.vocab,
             },
             h,
+            (h as f32).sqrt(),
             &embeds.buffer,
         )?;
-        // transformers multiplies by `embed_scale.to(weight.dtype)`: sqrt(512)
-        // as an f32 in the fp32 forward this mirrors.
-        scale_f32_inplace(rt, &embeds.buffer, (h as f32).sqrt(), rows_u * h)?;
         gpu_copy(&embeds, &resid)?;
 
         let mut out_trace = Vec::new();

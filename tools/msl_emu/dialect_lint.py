@@ -72,7 +72,11 @@ def defined_here(src):
     names |= {m.group(1) for m in re.finditer(r"\bkernel\s+void\s+(\w+)\s*\(", s)}
     names |= {m.group(1) for m in re.finditer(r"^#define\s+(\w+)", s, re.M)}
     names |= {m.group(1) for m in re.finditer(r"^(\w+)\(\w+,", s, re.M)}  # macro instantiations
-    names |= {"NAME"}
+    # A function-like macro's parameters (`NAME`, a kernel macro's `ACT`) are
+    # its own names, called or not; what they expand to is checked where the
+    # macro is instantiated.
+    for m in re.finditer(r"^#define\s+\w+\(([^)]*)\)", s, re.M):
+        names |= {p.strip() for p in m.group(1).split(",") if p.strip()}
     return names
 
 

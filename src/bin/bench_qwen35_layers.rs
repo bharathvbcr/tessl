@@ -9,6 +9,7 @@
 //! cargo run --release --bin bench_qwen35_layers -- --attn-tile=q64_k64_sg8
 //! cargo run --release --bin bench_qwen35_layers -- --mlp-unfused # mlp_silu + cast
 //! cargo run --release --bin bench_qwen35_layers -- --gdn-scan16  # 16-column GDN scan
+//! cargo run --release --bin bench_qwen35_layers -- --decode=4096  # per-token decode
 //! ```
 //!
 //! Attention runs on `qwen35::attn_prefill` (the TensorOps kernel) at its
@@ -42,6 +43,20 @@
 //!   as scaled wherever it is used.
 //!
 //! Not counted: the embedding gather, and anything after the logits.
+//!
+//! `--decode[=P]` times batch-1 **decode** instead, one token at a time after a
+//! prefix of `P` positions (default 4096): every GDN layer runs
+//! `conv1d_silu` and `gdn_recurrent` on carried state, every attention layer
+//! writes its token with `attn_qk_norm_rope_suffix_posbuf` and reads the
+//! shared prefix plus its suffix with `attn_prefix_decode`, then the MLP, as
+//! a GPU-resident decode loop would encode them. Each token is encoded with
+//! async encode on and then synchronized, and the two are timed apart:
+//! **encode** is the host building the command buffer (nothing runs on the
+//! GPU until the commit), **commit+wait** is the GPU executing it plus the
+//! submit latency. It also times `gdn_recurrent` and `attn_prefix_decode`
+//! alone, `REPS` per command buffer. Every figure is printed as a `METRIC`
+//! line for `bench/paired_bins.sh`. The LM head and sampler are not included
+//! (`bench_nn_kernels` times the samplers).
 //!
 //! Before anything is timed, one forward runs with every intermediate buffer
 //! pre-filled with NaN, and every buffer a stage writes must come back finite.
@@ -717,6 +732,257 @@ fn lm_head_ms_per_row(rt: &Arc<GpuRuntime>) -> Res<f64> {
     Ok(time_ms(rt, 1, || gemm(&x, &w, &logits, BACKEND))? / LM_ROWS as f64)
 }
 
+// ------------------------------------------------------------------- decode ---
+
+/// Suffix slots per attention layer in `--decode`: the live suffix is one
+/// token, but `attn_prefix_decode`'s grid covers the capacity.
+const DECODE_SUFFIX_CAP: usize = 64;
+/// Tokens per timed `--decode` iteration.
+const DECODE_TOKENS: usize = 16;
+
+/// What one decode token carries between steps, per layer.
+struct DecodeState {
+    /// GDN layers: conv state ping-pong (`conv1d_silu`'s output state may not
+    /// be its input) and the recurrent state, updated in place.
+    conv: Vec<[GpuBuffer; 2]>,
+    gdn: Vec<GpuBuffer>,
+    /// Attention layers: the shared prefix and the suffix caches.
+    prefix_k: Vec<GpuBuffer>,
+    prefix_v: Vec<GpuBuffer>,
+    suffix_k: Vec<GpuBuffer>,
+    suffix_v: Vec<GpuBuffer>,
+    prefix_len: u32,
+    /// Absolute position of the token (`prefix_len`) and the live suffix length (1).
+    q_pos: GpuBuffer,
+    suffix_len: GpuBuffer,
+    /// Tokens decoded so far: picks the conv ping-pong side.
+    step: std::cell::Cell<usize>,
+}
+
+impl DecodeState {
+    fn new(rt: &Arc<GpuRuntime>, m: &Model, prefix_len: usize) -> Res<Self> {
+        let conv_elems = m.gdn.conv_dim() as usize * (CONV_KW as usize - 1);
+        let gdn_elems = m.gdn.dims(1, 1).state_elems_per_row();
+        let kv_row = (KV_HEADS * HEAD_DIM) as usize;
+        let mut st = Self {
+            conv: Vec::new(),
+            gdn: Vec::new(),
+            prefix_k: Vec::new(),
+            prefix_v: Vec::new(),
+            suffix_k: Vec::new(),
+            suffix_v: Vec::new(),
+            prefix_len: prefix_len as u32,
+            q_pos: buf_u32(rt, &[prefix_len as u32])?,
+            suffix_len: buf_u32(rt, &[1])?,
+            step: std::cell::Cell::new(0),
+        };
+        for (l, layer) in m.layers.iter().enumerate() {
+            let seed = 1000 + l as u64 * 8;
+            match layer.mixer {
+                Mixer::Gdn(_) => {
+                    st.conv
+                        .push([buf(rt, &fill(conv_elems, seed, 0.5))?, buf(rt, &vec![0.0; conv_elems])?]);
+                    st.gdn.push(buf(rt, &fill(gdn_elems, seed + 1, 0.05))?);
+                }
+                Mixer::Attn(_) => {
+                    st.prefix_k.push(buf(rt, &fill(prefix_len * kv_row, seed + 2, 1.0))?);
+                    st.prefix_v.push(buf(rt, &fill(prefix_len * kv_row, seed + 3, 1.0))?);
+                    st.suffix_k.push(buf(rt, &vec![0.0; DECODE_SUFFIX_CAP * kv_row])?);
+                    st.suffix_v.push(buf(rt, &vec![0.0; DECODE_SUFFIX_CAP * kv_row])?);
+                }
+            }
+        }
+        rt.synchronize()?;
+        Ok(st)
+    }
+}
+
+fn decode_attn_dims() -> nn::AttnDims {
+    nn::AttnDims {
+        batch: 1,
+        tq: 1,
+        heads: Q_HEADS,
+        heads_kv: KV_HEADS,
+        window: 0,
+        scale: 1.0 / (HEAD_DIM as f32).sqrt(),
+    }
+}
+
+fn decode_gdn_recurrent(rt: &Arc<GpuRuntime>, m: &Model, w: &GdnWeights, a: &Acts, state: &GpuBuffer) -> Res<()> {
+    qwen35::gdn_recurrent(
+        rt,
+        &m.gdn.dims(1, 1),
+        &m.gdn.conv_qkv(&a.g_qkv),
+        &m.gdn.gates(&a.g_proj.buffer),
+        &GdnParams {
+            a_log: &w.a_log,
+            dt_bias: &w.dt_bias,
+        },
+        StateIn::PerBatch(state),
+        Cols::dense(&a.g_o, m.gdn.value_dim()),
+        Some(state),
+    )
+}
+
+fn decode_attention(rt: &Arc<GpuRuntime>, a: &Acts, st: &DecodeState, i: usize) -> Res<()> {
+    qwen35::attn_prefix_decode(
+        rt,
+        &a.a_q,
+        qwen35::SharedPrefix {
+            k: &st.prefix_k[i],
+            v: &st.prefix_v[i],
+            len: st.prefix_len,
+        },
+        &st.suffix_k[i],
+        &st.suffix_v[i],
+        &st.suffix_len,
+        &st.q_pos,
+        &a.a_o,
+        decode_attn_dims(),
+        false,
+    )
+}
+
+/// One decode token through every layer and the final norm, encoded only.
+fn decode_token(rt: &Arc<GpuRuntime>, m: &Model, a: &Acts, st: &DecodeState) -> Res<()> {
+    let side = st.step.get() % 2;
+    st.step.set(st.step.get() + 1);
+    let (mut gi, mut ai) = (0, 0);
+    for l in &m.layers {
+        input_norm(rt, m, a)?;
+        match &l.mixer {
+            Mixer::Gdn(w) => {
+                let proj = &a.g_proj.buffer;
+                qwen35::fused_projection(&a.xb, &w.w_in, &a.g_proj, BACKEND)?;
+                qwen35::conv1d_silu(
+                    rt,
+                    Cols::dense(proj, m.gdn.width()),
+                    &w.conv_w,
+                    CONV_KW,
+                    StateIn::PerBatch(&st.conv[gi][side]),
+                    &a.g_qkv,
+                    Some(&st.conv[gi][1 - side]),
+                    1,
+                    1,
+                    m.gdn.conv_dim(),
+                )?;
+                decode_gdn_recurrent(rt, m, w, a, &st.gdn[gi])?;
+                gdn_stage(rt, m, w, a, 4)?;
+                gdn_stage(rt, m, w, a, 5)?;
+                gi += 1;
+            }
+            Mixer::Attn(w) => {
+                let pc = Cols::dense(&a.a_proj.buffer, m.attn.width());
+                qwen35::fused_projection(&a.xb, &w.w_in, &a.a_proj, BACKEND)?;
+                qwen35::attn_qk_norm_rope_suffix_posbuf(
+                    rt,
+                    &AttnShape {
+                        batch: 1,
+                        seq: 1,
+                        q_heads: Q_HEADS,
+                        kv_heads: KV_HEADS,
+                        head_dim: HEAD_DIM,
+                        rotary_dim: ROTARY_DIM,
+                    },
+                    pc,
+                    &w.q_norm,
+                    &w.k_norm,
+                    &AttnTargets {
+                        q_out: &a.a_q,
+                        k_cache: &st.suffix_k[ai],
+                        v_cache: &st.suffix_v[ai],
+                    },
+                    st.prefix_len,
+                    &st.q_pos,
+                    ROPE_THETA,
+                    EPS,
+                )?;
+                decode_attention(rt, a, st, ai)?;
+                attn_stage(rt, m, w, a, 3)?;
+                attn_stage(rt, m, w, a, 4)?;
+                ai += 1;
+            }
+        }
+        mlp(rt, m, l, a)?;
+    }
+    input_norm(rt, m, a)
+}
+
+fn run_decode(rt: &Arc<GpuRuntime>, m: &Model, prefix_len: usize) -> Res<()> {
+    let a = Acts::new(rt, m, 1)?;
+    let st = DecodeState::new(rt, m, prefix_len)?;
+    rt.set_async_encode(true)?;
+
+    // Plausibility: one token must leave every carried buffer finite and move
+    // the residual stream.
+    a.poison();
+    let before = a.resid.buffer.read_f32();
+    rt.take_dispatch_count();
+    decode_token(rt, m, &a, &st)?;
+    rt.synchronize()?;
+    let dispatches = rt.take_dispatch_count();
+    finite_f32("decode resid", &a.resid.buffer, HIDDEN)?;
+    finite_f32("decode attention out", &a.a_o, (Q_HEADS * HEAD_DIM) as usize)?;
+    finite_f32("decode gdn out", &a.g_o, m.gdn.value_dim() as usize)?;
+    for (i, s) in st.gdn.iter().enumerate() {
+        finite_f32(&format!("decode gdn state {i}"), s, s.nbytes() / 4)?;
+    }
+    if a.resid.buffer.read_f32() == before {
+        return Err("decode: one token left the residual stream unchanged".into());
+    }
+    println!("decode plausibility gate passed: {dispatches} dispatches per token, prefix {prefix_len}");
+
+    for _ in 0..WARMUP {
+        for _ in 0..DECODE_TOKENS {
+            decode_token(rt, m, &a, &st)?;
+            rt.synchronize()?;
+        }
+    }
+    let (mut enc, mut wait, mut wall) = (Vec::new(), Vec::new(), Vec::new());
+    for _ in 0..ITERS * 3 {
+        let (mut e, mut w) = (0.0, 0.0);
+        for _ in 0..DECODE_TOKENS {
+            let t0 = Instant::now();
+            decode_token(rt, m, &a, &st)?;
+            let t1 = Instant::now();
+            rt.synchronize()?;
+            let t2 = Instant::now();
+            e += (t1 - t0).as_secs_f64();
+            w += (t2 - t1).as_secs_f64();
+        }
+        let n = DECODE_TOKENS as f64;
+        enc.push(e * 1e6 / n);
+        wait.push(w * 1e6 / n);
+        wall.push((e + w) * 1e6 / n);
+    }
+    let (enc, wait, wall) = (median(enc), median(wait), median(wall));
+
+    let gdn_l = m.layers.iter().find(|l| matches!(l.mixer, Mixer::Gdn(_))).unwrap();
+    let Mixer::Gdn(gw) = &gdn_l.mixer else { unreachable!() };
+    let rec_us = 1e3 * time_ms(rt, REPS, || decode_gdn_recurrent(rt, m, gw, &a, &st.gdn[0]))?;
+    let attn_us = 1e3 * time_ms(rt, REPS, || decode_attention(rt, &a, &st, 0))?;
+    rt.set_async_encode(false)?;
+
+    println!(
+        "decode, batch 1, prefix {prefix_len} (median of {} x {DECODE_TOKENS} tokens):",
+        ITERS * 3
+    );
+    println!(
+        "  encode       {enc:>9.1} us/token  ({:.2} us/dispatch)",
+        enc / dispatches as f64
+    );
+    println!("  commit+wait  {wait:>9.1} us/token");
+    println!("  wall         {wall:>9.1} us/token  ({:.1} tok/s)", 1e6 / wall);
+    println!("  gdn_recurrent alone      {rec_us:>8.2} us ({REPS} per command buffer)");
+    println!("  attn_prefix_decode alone {attn_us:>8.2} us ({REPS} per command buffer)");
+    println!("METRIC decode_encode_us {enc:.3}");
+    println!("METRIC decode_wait_us {wait:.3}");
+    println!("METRIC decode_wall_us {wall:.3}");
+    println!("METRIC decode_gdn_recurrent_us {rec_us:.3}");
+    println!("METRIC decode_attn_prefix_decode_us {attn_us:.3}");
+    Ok(())
+}
+
 // ------------------------------------------------------- paired attention ---
 
 /// Dispatches per command buffer. T = 200 is ~0.16 GFLOP, under the ~0.25 ms
@@ -892,9 +1158,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut attn = AttnChoice::Tiled(qwen35::ATTN_PREFILL_TILE);
     let mut mlp_unfused = false;
     let mut gdn_scan = qwen35::GdnScanSlice::Cols32;
+    let mut decode: Option<usize> = None;
     let mut ts = Vec::new();
     for arg in std::env::args().skip(1) {
-        if arg == "--check-only" {
+        if arg == "--decode" {
+            decode = Some(4096);
+        } else if let Some(p) = arg.strip_prefix("--decode=") {
+            let p: usize = p
+                .parse()
+                .map_err(|_| format!("--decode=P wants a prefix length, got {p:?}"))?;
+            if p == 0 {
+                return Err("--decode prefix must be positive".into());
+            }
+            decode = Some(p);
+        } else if arg == "--check-only" {
             check_only = true;
         } else if arg == "--paired-attn" {
             paired_attn = true;
@@ -917,7 +1194,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let t: usize = arg.parse().map_err(|_| {
                 format!(
                     "expected a token count, --check-only, --paired-attn, --attn-rows, --attn-tile=LABEL, \
-                     --mlp-unfused or --gdn-scan16, got {arg:?}"
+                     --mlp-unfused, --gdn-scan16 or --decode[=P], got {arg:?}"
                 )
             })?;
             if t == 0 {
@@ -928,6 +1205,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     if paired_attn && check_only {
         return Err("--paired-attn times both kernels; it does not combine with --check-only".into());
+    }
+    if decode.is_some() && (check_only || paired_attn || !ts.is_empty()) {
+        return Err("--decode times decode only; it takes no T, --check-only or --paired-attn".into());
     }
     if ts.is_empty() {
         ts = if paired_attn {
@@ -978,6 +1258,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let t0 = Instant::now();
     let model = Model::new(&rt)?;
     println!("weights uploaded in {:.1} s", t0.elapsed().as_secs_f64());
+    if let Some(prefix_len) = decode {
+        run_decode(&rt, &model, prefix_len)?;
+        return Ok(());
+    }
 
     // Gate under the same encoding the timing uses: every layer in one command
     // buffer, sharing activations through the runtime's barriers.

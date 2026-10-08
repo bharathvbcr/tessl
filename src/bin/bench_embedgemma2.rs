@@ -50,8 +50,7 @@ use tessl::GpuRuntime;
 
 use common::{env_usize, peak_footprint};
 
-const DEFAULT_WORKLOADS: &str =
-    "1x16,64x32,32x256,8x1024,2x4096,128x8-512,1x4096+63x32,1x6147+1x1658+6x10-42";
+const DEFAULT_WORKLOADS: &str = "1x16,64x32,32x256,8x1024,2x4096,128x8-512,1x4096+63x32,1x6147+1x1658+6x10-42";
 
 const MIB: f64 = (1u64 << 20) as f64;
 

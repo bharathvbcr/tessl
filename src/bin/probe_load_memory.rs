@@ -94,7 +94,11 @@ fn main() -> Res<()> {
             "--bf16" => precision = Some(Precision::Bf16),
             "--f32" => precision = Some(Precision::F32),
             "--tower" => with_head = false,
-            _ => return Err(format!("expected --bf16 or --f32 (optionally --tower), or --embedgemma2; got {arg:?}")),
+            _ => {
+                return Err(format!(
+                    "expected --bf16 or --f32 (optionally --tower), or --embedgemma2; got {arg:?}"
+                ))
+            }
         }
     }
     let precision = precision.ok_or("pass --bf16 or --f32")?;

@@ -224,6 +224,7 @@ pub mod gemm;
 pub mod icb_smoke;
 pub mod infer_trace;
 mod json;
+mod loader;
 #[cfg(feature = "quant-prep")]
 pub mod mtl_tensor;
 pub mod nn;

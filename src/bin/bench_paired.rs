@@ -67,7 +67,14 @@ fn run_lane(lane: &Lane) -> Res<LaneRun> {
         .map_err(|e| format!("lane {}: {}: {e}", lane.name, lane.argv[0]))?;
     if !out.status.success() {
         let err = String::from_utf8_lossy(&out.stderr);
-        let tail: String = err.chars().rev().take(4000).collect::<Vec<_>>().into_iter().rev().collect();
+        let tail: String = err
+            .chars()
+            .rev()
+            .take(4000)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect();
         return Err(format!("lane {} failed ({}):\n{tail}", lane.name, out.status));
     }
     let stdout = String::from_utf8(out.stdout).map_err(|e| format!("lane {}: stdout: {e}", lane.name))?;
@@ -86,7 +93,9 @@ fn run_lane(lane: &Lane) -> Res<LaneRun> {
         let Some(Json::Str(w)) = row.get("workload") else {
             return Err(format!("lane {}: a row has no string \"workload\"", lane.name));
         };
-        let Json::Object(kv) = row else { unreachable!("get() succeeded on an object") };
+        let Json::Object(kv) = row else {
+            unreachable!("get() succeeded on an object")
+        };
         let nums: BTreeMap<String, f64> = kv
             .iter()
             .filter_map(|(k, v)| match v {
@@ -179,7 +188,9 @@ fn main() -> Res<()> {
     // Report workloads in the order the base lane printed them in round 1
     // (`LaneRun::fields` is sorted by name).
     let base_order: Vec<String> = {
-        let Json::Array(rows) = json::parse(&runs[0][0].raw, SYNTAX)? else { unreachable!() };
+        let Json::Array(rows) = json::parse(&runs[0][0].raw, SYNTAX)? else {
+            unreachable!()
+        };
         rows.iter()
             .filter_map(|r| match r.get("workload") {
                 Some(Json::Str(w)) => Some(w.clone()),
@@ -189,7 +200,11 @@ fn main() -> Res<()> {
     };
     let get = |r: usize, l: usize, w: &str, f: &str| -> Res<Option<f64>> {
         match runs[r][l].fields.get(w) {
-            None => Err(format!("lane {} did not report workload {w:?} in round {}", lanes[l].name, r + 1)),
+            None => Err(format!(
+                "lane {} did not report workload {w:?} in round {}",
+                lanes[l].name,
+                r + 1
+            )),
             Some(m) => Ok(m.get(f).copied()),
         }
     };
@@ -233,7 +248,10 @@ fn main() -> Res<()> {
                     .flatten()
                     .collect();
                 if !vals.is_empty() {
-                    fields.push(format!("\"{extra}_max\":{}", vals.iter().copied().fold(f64::MIN, f64::max)));
+                    fields.push(format!(
+                        "\"{extra}_max\":{}",
+                        vals.iter().copied().fold(f64::MIN, f64::max)
+                    ));
                 }
             }
             if l == 0 {
@@ -258,11 +276,21 @@ fn main() -> Res<()> {
     if let Some(path) = out_path {
         let lanes_json: Vec<String> = lanes
             .iter()
-            .map(|l| format!("{{\"name\":{},\"argv\":[{}]}}", json_str(&l.name), l.argv.iter().map(|a| json_str(a)).collect::<Vec<_>>().join(",")))
+            .map(|l| {
+                format!(
+                    "{{\"name\":{},\"argv\":[{}]}}",
+                    json_str(&l.name),
+                    l.argv.iter().map(|a| json_str(a)).collect::<Vec<_>>().join(",")
+                )
+            })
             .collect();
         let env_json: Vec<String> = ["BENCH_WORKLOADS", "BENCH_ITERS", "BENCH_WARMUP"]
             .iter()
-            .filter_map(|k| std::env::var(k).ok().map(|v| format!("{}:{}", json_str(k), json_str(&v))))
+            .filter_map(|k| {
+                std::env::var(k)
+                    .ok()
+                    .map(|v| format!("{}:{}", json_str(k), json_str(&v)))
+            })
             .collect();
         let raw: Vec<String> = runs
             .iter()

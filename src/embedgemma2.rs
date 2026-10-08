@@ -48,8 +48,6 @@
 //! `nn::mlp_gelu_tanh`, `nn::scale_f32_inplace`, `qwen35::embed_rows` and
 //! `qwen35::attn_qk_norm_rope_columns` (`* w` norms, full-width RoPE).
 
-use std::cell::RefCell;
-use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use objc2_metal::MTLComputePipelineState;
@@ -57,11 +55,13 @@ use objc2_metal::MTLComputePipelineState;
 use crate::dispatch::{dispatch_1d, dispatch_2d_tg, set_gpu_buf, set_u32};
 use crate::gemm::{gemm, GemmBackend};
 use crate::json::{self, Json, Syntax};
+use crate::loader::Loader;
 use crate::nn::{
     dispatch_tg_1d, mlp_gelu_tanh, reduce_tptg, require, require_disjoint_writes, rms_norm_f32,
     rms_norm_residual_add_f32, scale_f32_inplace,
 };
 use crate::qwen35::{self, AttnShape, AttnTargets, Cols, LmHead, QkvColumns};
+use crate::qwen35_model::Precision;
 use crate::runtime::GpuRuntime;
 use crate::safetensors::SafeTensors;
 use crate::tensor::{gpu_copy, DType, GpuBuffer, Tensor};
@@ -561,109 +561,6 @@ pub struct EncodeOutput {
     pub forwards: u32,
 }
 
-struct Loader<'a> {
-    st: &'a SafeTensors,
-    prefix: &'a str,
-    rt: &'a Arc<GpuRuntime>,
-    /// Every tensor name read so far, for [`Self::refuse_unread`].
-    read: RefCell<BTreeSet<String>>,
-}
-
-impl Loader<'_> {
-    fn name(&self, rest: &str) -> String {
-        format!("{}{rest}", self.prefix)
-    }
-
-    /// `rest`'s full name, recorded as read.
-    fn take(&self, rest: &str) -> String {
-        let name = self.name(rest);
-        self.read.borrow_mut().insert(name.clone());
-        name
-    }
-
-    fn f32(&self, rest: &str, shape: &[usize]) -> Result<Vec<f32>, String> {
-        let name = self.take(rest);
-        let (got, data) = self.st.read_f32(&name)?;
-        if got != shape {
-            return Err(format!("{name}: shape {got:?}, expected {shape:?}"));
-        }
-        Ok(data)
-    }
-
-    fn bf16_bits(&self, rest: &str, shape: &[usize]) -> Result<Vec<u16>, String> {
-        let name = self.take(rest);
-        let (got, bits) = self.st.read_bf16_bits(&name)?;
-        if got != shape {
-            return Err(format!("{name}: shape {got:?}, expected {shape:?}"));
-        }
-        Ok(bits)
-    }
-
-    /// One finite value (a `[1]` or scalar tensor).
-    fn scalar(&self, rest: &str) -> Result<f32, String> {
-        let name = self.take(rest);
-        let (_, data) = self.st.read_f32(&name)?;
-        match data.as_slice() {
-            [s] if s.is_finite() => Ok(*s),
-            other => Err(format!("{name}: expected one finite value, got {other:?}")),
-        }
-    }
-
-    /// A tensor under the prefix that the forward never read would be a
-    /// parameter it silently ignores (a bias, an extra norm): refuse it.
-    fn refuse_unread(&self) -> Result<(), String> {
-        let read = self.read.borrow();
-        let unread: Vec<&str> = self
-            .st
-            .names()
-            .filter(|n| n.starts_with(self.prefix) && !read.contains(*n))
-            .collect();
-        if unread.is_empty() {
-            return Ok(());
-        }
-        let shown: Vec<&str> = unread.iter().copied().take(8).collect();
-        Err(format!(
-            "{} tensor(s) under {:?} are not part of the text encoder this loader implements: {shown:?}{}",
-            unread.len(),
-            self.prefix,
-            if unread.len() > shown.len() { " ..." } else { "" }
-        ))
-    }
-
-    fn buf(&self, data: &[f32]) -> Result<GpuBuffer, String> {
-        let b = self.rt.alloc_buffer_hot(data.len().max(1) * 4)?;
-        b.write_f32(data);
-        Ok(b)
-    }
-
-    fn norm(&self, rest: &str, dim: u32) -> Result<GpuBuffer, String> {
-        self.buf(&self.f32(rest, &[dim as usize])?)
-    }
-
-    /// `nn.Linear` weights `[out_i, in]` packed into the right operand
-    /// `[in, sum(out_i)]` of one exact-f32 GEMM.
-    fn linear(&self, parts: &[(&str, u32)], in_features: u32) -> Result<Tensor, String> {
-        let mut data = Vec::with_capacity(parts.len());
-        for &(rest, out) in parts {
-            data.push(self.f32(rest, &[out as usize, in_features as usize])?);
-        }
-        self.pack(
-            &data.iter().map(Vec::as_slice).collect::<Vec<_>>(),
-            parts.iter().map(|p| p.1).collect(),
-            in_features,
-        )
-    }
-
-    fn pack(&self, parts: &[&[f32]], widths: Vec<u32>, in_features: u32) -> Result<Tensor, String> {
-        let widths: Vec<usize> = widths.into_iter().map(|w| w as usize).collect();
-        let total: usize = widths.iter().sum();
-        let packed = qwen35::pack_linear_weights_f32(parts, &widths, in_features as usize)?;
-        let t = self.rt.alloc_tensor_f32_hot(&[in_features as usize, total])?;
-        t.buffer.write_f32(&packed);
-        Ok(t)
-    }
-}
-
 /// A forward's fixed cost in padded rows, for [`pack_forwards`]: each forward
 /// re-reads every weight (~0.6 GB of f32 outside the embedding table), about
 /// what a few hundred rows of compute cost. An estimate, not a measurement;
@@ -761,40 +658,47 @@ impl EmbedGemma2Model {
     /// error, and so is any tensor under `prefix` the forward does not read
     /// (with an empty prefix, any tensor in the file).
     pub fn load(rt: &Arc<GpuRuntime>, st: &SafeTensors, prefix: &str, cfg: EmbedGemma2Config) -> Result<Self, String> {
-        let ld = Loader {
-            st,
-            prefix,
-            rt,
-            read: RefCell::new(BTreeSet::new()),
-        };
-        let (h, ple, inter, vocab) = (cfg.hidden, cfg.ple_dim, cfg.intermediate, cfg.vocab);
-        let n_layers = cfg.layers.len() as u32;
+        let ld = Loader::new(rt, st, prefix);
+        let (h, ple, inter, vocab) = (
+            cfg.hidden as usize,
+            cfg.ple_dim as usize,
+            cfg.intermediate as usize,
+            cfg.vocab as usize,
+        );
+        let n_layers = cfg.layers.len();
+        let f32 = Precision::F32;
 
-        let embed = {
-            let bits = ld.bf16_bits("embed_tokens.weight", &[vocab as usize, h as usize])?;
-            let t = rt.alloc_tensor_bf16_hot(&[vocab as usize, h as usize])?;
-            t.buffer.write_bf16_bits(&bits);
-            t
+        // Read straight into the device table: no host copy.
+        let embed = rt.alloc_tensor_bf16_hot(&[vocab, h])?;
+        ld.bf16_into("embed_tokens.weight", &[vocab, h], &embed)?;
+        // `[n_layers * ple, hidden]`: layer `i`'s projection is rows
+        // `[i * ple, (i + 1) * ple)`. Every slice is placed into its layer's
+        // `[hidden, ple]` operand here, and the host copy dropped, before any
+        // other tensor is read.
+        let ple_in = {
+            let w = ld.f32("ple.per_layer_model_projection.weight", &[n_layers * ple, h])?;
+            w.chunks_exact(ple * h)
+                .map(|slice| {
+                    let t = rt.alloc_tensor_f32_hot(&[h, ple])?;
+                    qwen35::place_linear_part(&mut t.buffer.try_contents_f32()?, ple, 0, slice, ple, h)?;
+                    Ok(t)
+                })
+                .collect::<Result<Vec<_>, String>>()?
         };
-        let ple_w = ld.f32(
-            "ple.per_layer_model_projection.weight",
-            &[(n_layers * ple) as usize, h as usize],
-        )?;
         let ple_norm = ld.norm("ple.per_layer_projection_norm.weight", ple)?;
         let final_norm = ld.norm("norm.weight", h)?;
-        let projection = ld.linear(&[("embedding_projection.weight", cfg.embedding_dim)], h)?;
+        let projection = ld.linear(&[("embedding_projection.weight", cfg.embedding_dim as usize)], h, f32)?;
 
         let mut ones: Vec<(u32, GpuBuffer)> = Vec::new();
-        let mut layers = Vec::with_capacity(cfg.layers.len());
-        let slice = (ple * h) as usize;
-        for (i, &spec) in cfg.layers.iter().enumerate() {
+        let mut layers = Vec::with_capacity(n_layers);
+        for ((i, &spec), ple_in) in cfg.layers.iter().enumerate().zip(ple_in) {
             let p = |s: &str| format!("layers.{i}.{s}");
-            let (d, q, kv) = (spec.head_dim, cfg.q_heads, spec.kv_heads);
-            let v_norm_ones = match ones.iter().find(|(od, _)| *od == d) {
+            let (d, q, kv) = (spec.head_dim as usize, cfg.q_heads as usize, spec.kv_heads as usize);
+            let v_norm_ones = match ones.iter().find(|(od, _)| *od == spec.head_dim) {
                 Some((_, b)) => b.clone(),
                 None => {
-                    let b = ld.buf(&vec![1.0f32; d as usize])?;
-                    ones.push((d, b.clone()));
+                    let b = ld.buf(&vec![1.0f32; d])?;
+                    ones.push((spec.head_dim, b.clone()));
                     b
                 }
             };
@@ -811,17 +715,18 @@ impl EmbedGemma2Model {
                         (&p("self_attn.v_proj.weight"), kv * d),
                     ],
                     h,
+                    f32,
                 )?,
-                w_o: ld.linear(&[(&p("self_attn.o_proj.weight"), h)], q * d)?,
+                w_o: ld.linear(&[(&p("self_attn.o_proj.weight"), h)], q * d, f32)?,
                 q_norm: ld.norm(&p("self_attn.q_norm.weight"), d)?,
                 k_norm: ld.norm(&p("self_attn.k_norm.weight"), d)?,
                 v_norm_ones,
-                gate: ld.linear(&[(&p("mlp.gate_proj.weight"), inter)], h)?,
-                up: ld.linear(&[(&p("mlp.up_proj.weight"), inter)], h)?,
-                down: ld.linear(&[(&p("mlp.down_proj.weight"), h)], inter)?,
-                ple_in: ld.pack(&[&ple_w[i * slice..(i + 1) * slice]], vec![ple], h)?,
-                ple_gate: ld.linear(&[(&p("ple_block.per_layer_input_gate.weight"), ple)], h)?,
-                ple_out: ld.linear(&[(&p("ple_block.per_layer_projection.weight"), h)], ple)?,
+                gate: ld.linear(&[(&p("mlp.gate_proj.weight"), inter)], h, f32)?,
+                up: ld.linear(&[(&p("mlp.up_proj.weight"), inter)], h, f32)?,
+                down: ld.linear(&[(&p("mlp.down_proj.weight"), h)], inter, f32)?,
+                ple_in,
+                ple_gate: ld.linear(&[(&p("ple_block.per_layer_input_gate.weight"), ple)], h, f32)?,
+                ple_out: ld.linear(&[(&p("ple_block.per_layer_projection.weight"), h)], ple, f32)?,
                 post_ple_norm: ld.norm(&p("ple_block.post_per_layer_input_norm.weight"), h)?,
                 layer_scalar: ld.scalar(&p("layer_scalar"))?,
             });

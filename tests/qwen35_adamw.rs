@@ -971,3 +971,144 @@ fn stored_precision_refusals() {
     assert!(err.contains("another model"), "{err}");
     assert_eq!(sr.step_count(), 0);
 }
+
+// ---- per-parameter learning rate ---------------------------------------------
+
+/// `adamw_step_scaled` is torch's AdamW with one param group per entry, entry
+/// `i`'s lr being `lr * lr_scale[i]`: both the decoupled decay and the step
+/// size take the scaled lr. Here the embedding runs at half the lr, one entry
+/// at 0 (frozen, as a torch group at lr 0: the parameter keeps its bits while
+/// its moments still update) and the rest at the full lr, over two steps. Each
+/// step starts the f64 reference from tessl's moments before it, so a bound is
+/// one step's rounding: every entry against its own scaled reference at
+/// `run`'s bound (2e-6), and the frozen entry's moments within 1e-6 of their
+/// operands' magnitude (`|m0| + |g|`, `v0 + g^2`; f32 is ~6e-8). The
+/// embedding's half-lr update must differ from a full-lr one by far more than
+/// the bound, so a dropped scale cannot pass.
+#[test]
+fn a_per_entry_lr_scale_is_a_torch_param_group() {
+    let (rt, model) = load();
+    let table = model.parameter_table().unwrap();
+    let wd = model.default_weight_decay(0.1).unwrap();
+    let embed = table.iter().position(|p| p.name == "embed_tokens.weight").unwrap();
+    let frozen = table
+        .iter()
+        .position(|p| p.name.ends_with("mlp.down_proj.weight"))
+        .unwrap();
+    let mut scale = vec![1.0f64; table.len()];
+    scale[embed] = 0.5;
+    scale[frozen] = 0.0;
+    let mut state = AdamW::new(&model).unwrap();
+    let (mut worst, mut sensitivity) = (0.0f64, 0.0f64);
+    for step in 1..=2u64 {
+        let s = model.train_step(&ids(), GemmOperands::ExactF32).unwrap();
+        let p0 = host(&rt, &model, &table, None);
+        let g = host(&rt, &model, &table, Some(&s.grads));
+        let (m0, v0) = moments(&rt, &model, &table, &state);
+        let (mut m, mut v) = (m0.clone(), v0.clone());
+        model
+            .adamw_step_scaled(&s.grads, &mut state, &hyper(), &wd, &scale)
+            .unwrap();
+        assert_eq!(state.step_count(), step);
+        let p1 = host(&rt, &model, &table, None);
+        let (m1, v1) = moments(&rt, &model, &table, &state);
+        for (i, info) in table.iter().enumerate() {
+            let h = AdamWHyper {
+                lr: LR * scale[i],
+                ..hyper()
+            };
+            for k in 0..p0[i].len() {
+                let (mut mf, mut vf) = (m[i][k], v[i][k]);
+                let full = reference(&hyper(), step, wd[i], p0[i][k], g[i][k], &mut mf, &mut vf);
+                let want = reference(&h, step, wd[i], p0[i][k], g[i][k], &mut m[i][k], &mut v[i][k]);
+                let err = (p1[i][k] - want).abs();
+                worst = worst.max(err);
+                assert!(
+                    err <= 2e-6,
+                    "step {step} {}[{k}] (scale {}): {} vs {want} (err {err:.3e})",
+                    info.name,
+                    scale[i],
+                    p1[i][k]
+                );
+                if i == embed {
+                    sensitivity = sensitivity.max((want - full).abs());
+                }
+                if i == frozen {
+                    assert_eq!(
+                        p1[i][k].to_bits(),
+                        p0[i][k].to_bits(),
+                        "step {step} {}[{k}]: a scale-0 entry moved",
+                        info.name
+                    );
+                    let gk = g[i][k];
+                    for (got, want, size, what) in [
+                        (m1[i][k], m[i][k], m0[i][k].abs() + gk.abs(), "m"),
+                        (v1[i][k], v[i][k], v0[i][k] + gk * gk, "v"),
+                    ] {
+                        assert!(
+                            (got - want).abs() <= 1e-6 * size + 1e-18,
+                            "step {step} {}[{k}]: frozen {what} {got} vs {want}",
+                            info.name
+                        );
+                    }
+                }
+            }
+        }
+        assert!(
+            m1[frozen].iter().any(|&x| x != 0.0),
+            "step {step}: the frozen entry's first moment did not update"
+        );
+    }
+    eprintln!("lr_scale: worst error {worst:.2e}; the embedding's 0.5 moves it by {sensitivity:.2e}");
+    assert!(
+        sensitivity > 50.0 * 2e-6,
+        "the embedding's scale moves the reference by only {sensitivity:.2e}"
+    );
+}
+
+/// A wrong-length, negative, NaN or infinite `lr_scale`, or one whose scaled
+/// lr overflows, is refused before anything moves: no parameter, moment or
+/// step count changes, and no work is encoded.
+#[test]
+fn lr_scale_refusals_move_nothing() {
+    let (rt, model) = load();
+    let table = model.parameter_table().unwrap();
+    let mut state = AdamW::new(&model).unwrap();
+    let s = model.train_step(&ids(), GemmOperands::ExactF32).unwrap();
+    let wd = model.default_weight_decay(0.1).unwrap();
+    let before = host(&rt, &model, &table, None);
+    let (m0, v0) = moments(&rt, &model, &table, &state);
+    let ones = vec![1.0f64; table.len()];
+    let mut e = |hyper: AdamWHyper, scale: &[f64], needle: &str| {
+        let _ = rt.take_dispatch_count();
+        let r = model.adamw_step_scaled(&s.grads, &mut state, &hyper, &wd, scale);
+        let m = r.err().unwrap_or_else(|| panic!("{needle}: accepted"));
+        assert!(m.contains(needle), "{m:?} lacks {needle:?}");
+        assert_eq!(rt.take_dispatch_count(), 0, "{needle}: a refusal encoded work");
+    };
+    e(hyper(), &ones[1..], "lr scales for");
+    e(hyper(), &[ones.as_slice(), &[1.0]].concat(), "lr scales for");
+    for (bad, needle) in [
+        (-0.5, "lr scale -0.5 must be finite and >= 0"),
+        (f64::NAN, "lr scale NaN must be finite and >= 0"),
+        (f64::INFINITY, "lr scale inf must be finite and >= 0"),
+    ] {
+        let mut scale = ones.clone();
+        scale[3] = bad;
+        e(hyper(), &scale, needle);
+    }
+    let mut huge = ones.clone();
+    huge[2] = f64::MAX;
+    e(AdamWHyper { lr: 2.0, ..hyper() }, &huge, "lr inf must be finite");
+    assert_eq!(state.step_count(), 0);
+    assert_eq!(
+        host(&rt, &model, &table, None),
+        before,
+        "a refused step moved the parameters"
+    );
+    assert_eq!(
+        moments(&rt, &model, &table, &state),
+        (m0, v0),
+        "a refused step moved the moments"
+    );
+}

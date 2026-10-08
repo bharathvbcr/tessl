@@ -645,7 +645,8 @@ impl Qwen35Model {
     /// step count advances only when the step runs. Gradients or state from
     /// another runtime are refused, and a
     /// [`crate::qwen35_train::PendingStep`] from before the update can no
-    /// longer be backpropagated.
+    /// longer be backpropagated. Every entry takes `hyper.lr`; see
+    /// [`Qwen35Model::adamw_step_scaled`] for a learning rate per entry.
     pub fn adamw_step(
         &self,
         grads: &Qwen35Grads,
@@ -653,35 +654,95 @@ impl Qwen35Model {
         hyper: &AdamWHyper,
         weight_decay: &[f32],
     ) -> Result<(), String> {
-        const WHAT: &str = "Qwen35Model::adamw_step";
-        self.require_trainable(WHAT)?;
-        check_hyper(WHAT, hyper)?;
-        state.check_model(WHAT, self)?;
-        let ps = slots(self, Some(grads)).map_err(|e| format!("{WHAT}: {e}"))?;
+        self.adamw_step_inner("Qwen35Model::adamw_step", grads, state, hyper, weight_decay, None)
+    }
+
+    /// [`Qwen35Model::adamw_step`] with entry `i` at learning rate
+    /// `hyper.lr * lr_scale[i]`: torch's AdamW with one param group per
+    /// entry, so the scaled lr forms both the decoupled decay factor
+    /// `1 - lr * wd` and the step size. A scale of 0 freezes the entry as a
+    /// torch group at lr 0 does: the parameter keeps its bits while its
+    /// moments still update. `lr_scale` has one value per
+    /// [`Qwen35Model::parameter_table`] entry, each finite and >= 0, and the
+    /// scaled lr must be finite; all of it is checked before anything moves.
+    pub fn adamw_step_scaled(
+        &self,
+        grads: &Qwen35Grads,
+        state: &mut AdamW,
+        hyper: &AdamWHyper,
+        weight_decay: &[f32],
+        lr_scale: &[f64],
+    ) -> Result<(), String> {
+        self.adamw_step_inner(
+            "Qwen35Model::adamw_step_scaled",
+            grads,
+            state,
+            hyper,
+            weight_decay,
+            Some(lr_scale),
+        )
+    }
+
+    /// The one body of both steps: `lr_scale` `None` is every entry at 1.
+    fn adamw_step_inner(
+        &self,
+        what: &'static str,
+        grads: &Qwen35Grads,
+        state: &mut AdamW,
+        hyper: &AdamWHyper,
+        weight_decay: &[f32],
+        lr_scale: Option<&[f64]>,
+    ) -> Result<(), String> {
+        self.require_trainable(what)?;
+        check_hyper(what, hyper)?;
+        state.check_model(what, self)?;
+        let ps = slots(self, Some(grads)).map_err(|e| format!("{what}: {e}"))?;
         if weight_decay.len() != ps.len() {
             return Err(format!(
-                "{WHAT}: {} weight decays for {} parameters",
+                "{what}: {} weight decays for {} parameters",
                 weight_decay.len(),
                 ps.len()
             ));
         }
+        if let Some(scale) = lr_scale {
+            if scale.len() != ps.len() {
+                return Err(format!("{what}: {} lr scales for {} parameters", scale.len(), ps.len()));
+            }
+        }
         let mut plan = Vec::with_capacity(ps.len());
-        for ((s, st), &wd) in ps.iter().zip(&state.slots).zip(weight_decay) {
+        for (i, ((s, st), &wd)) in ps.iter().zip(&state.slots).zip(weight_decay).enumerate() {
             let name = &s.info.name;
             if !(wd.is_finite() && wd >= 0.0) {
-                return Err(format!("{WHAT}: {name}: weight decay {wd} must be finite and >= 0"));
+                return Err(format!("{what}: {name}: weight decay {wd} must be finite and >= 0"));
             }
+            // torch param-group semantics: the group's lr forms both the
+            // decay factor and the step size, so the whole lr is scaled.
+            let entry_hyper = match lr_scale {
+                None => *hyper,
+                Some(scale) => {
+                    let k = scale[i];
+                    if !(k.is_finite() && k >= 0.0) {
+                        return Err(format!("{what}: {name}: lr scale {k} must be finite and >= 0"));
+                    }
+                    let h = AdamWHyper {
+                        lr: hyper.lr * k,
+                        ..*hyper
+                    };
+                    check_hyper(&format!("{what}: {name}"), &h)?;
+                    h
+                }
+            };
             let pw = s.param_window();
             let gw = s
                 .grad_window()
-                .ok_or_else(|| format!("{WHAT}: {name} has no gradient"))?;
-            pw.check(&format!("{WHAT}: {name} parameter"))?;
-            gw.check(&format!("{WHAT}: {name} gradient"))?;
+                .ok_or_else(|| format!("{what}: {name} has no gradient"))?;
+            pw.check(&format!("{what}: {name} parameter"))?;
+            gw.check(&format!("{what}: {name} gradient"))?;
             if !gw.same_layout(&pw) {
-                return Err(format!("{WHAT}: {name}: the gradient is not laid out as the parameter"));
+                return Err(format!("{what}: {name}: the gradient is not laid out as the parameter"));
             }
-            let kernel = step_kernel(pw.dtype, gw.dtype, state.config).map_err(|e| format!("{WHAT}: {name}: {e}"))?;
-            plan.push((pw, gw, st, kernel, f64::from(wd)));
+            let kernel = step_kernel(pw.dtype, gw.dtype, state.config).map_err(|e| format!("{what}: {name}: {e}"))?;
+            plan.push((pw, gw, st, kernel, entry_hyper, f64::from(wd)));
         }
 
         // torch: the step count increments, then the scalars are formed in f64.
@@ -691,14 +752,14 @@ impl Qwen35Model {
         let next = state
             .step
             .checked_add(1)
-            .ok_or_else(|| format!("{WHAT}: step count {} + 1 does not fit in u64", state.step))?;
+            .ok_or_else(|| format!("{what}: step count {} + 1 does not fit in u64", state.step))?;
         self.bump_param_generation();
         let seed = match state.config.update {
             UpdateRule::Bf16Stochastic { seed } => seed,
             _ => 0,
         };
-        for (salt, (pw, gw, st, kernel, wd)) in plan.iter().enumerate() {
-            let scalars = le_bytes(adamw_scalars(hyper, next, *wd), f32::to_le_bytes);
+        for (salt, (pw, gw, st, kernel, entry_hyper, wd)) in plan.iter().enumerate() {
+            let scalars = le_bytes(adamw_scalars(entry_hyper, next, *wd), f32::to_le_bytes);
             let key = le_bytes(
                 [
                     seed as u32,

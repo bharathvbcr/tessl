@@ -29,6 +29,7 @@
 // any address is formed, since the buffer is device-writable.
 #include <metal_stdlib>
 #include "attn_rows.h"
+#include "attn_tiled.h"
 using namespace metal;
 
 constant uint ENC_SG_W = 32;
@@ -131,3 +132,41 @@ ENC_ROWS_KERNEL(encoder_attn_rows_h32_r2_g8, 32, 2, 8)
 // DistilBERT's (768 over 12): four lanes per row, the same 16 dims per lane
 // and 128 rows per threadgroup.
 ENC_ROWS_KERNEL(encoder_attn_rows_h64_r4_g16, 64, 4, 16)
+
+/// The same contract on the matrix units: `attn_tiled.h`'s FlashAttention-2
+/// body in its `ENCODER` mode, with this file's buffer slots and contract (Q/O `[B, T, H, D]`, K/V `[B, kv_capacity, Hkv, D]`, `lens` `[B]`
+/// device u32, clamped to T before it bounds anything), on the matrix units.
+/// The name spells the geometry, as above. D=512 halves BQ per simdgroup
+/// against D=256 so the O accumulator stays at 64 floats per thread.
+#define ENCODER_TILED_KERNEL(NAME, D, BQ, BK, NSG)                             \
+kernel void NAME(                                                             \
+    device const float *Q [[buffer(0)]],                                      \
+    device const float *K [[buffer(1)]],                                      \
+    device const float *V [[buffer(2)]],                                      \
+    device float *O [[buffer(3)]],                                            \
+    constant uint &T [[buffer(4)]],                                           \
+    device const uint *lens [[buffer(5)]],                                    \
+    constant uint &H [[buffer(6)]],                                           \
+    constant uint &Hkv [[buffer(7)]],                                         \
+    constant uint &window [[buffer(8)]],                                      \
+    constant float &scale [[buffer(9)]],                                      \
+    constant uint &out_bf16 [[buffer(10)]],                                   \
+    constant uint &kv_capacity [[buffer(11)]],                                \
+    uint2 tgpig [[threadgroup_position_in_grid]],                             \
+    uint tid [[thread_index_in_threadgroup]])                                 \
+{                                                                             \
+    threadgroup float S[(BQ) * (BK)];                                         \
+    threadgroup float m_row[BQ];                                              \
+    threadgroup float l_row[BQ];                                              \
+    threadgroup float a_row[BQ];                                              \
+    /* Clamp the device-held length before it bounds any extent. */           \
+    const uint len = min(lens[tgpig.y / H], T);                               \
+    attn_tiled_body<D, BQ, BK, NSG, true>(                                    \
+        const_cast<device float *>(Q), const_cast<device float *>(K),         \
+        const_cast<device float *>(V), O, nullptr, T, len, H, Hkv, scale,     \
+        0ul, 0ul, out_bf16, kv_capacity, window, tgpig, tid, S, m_row, l_row, \
+        a_row);                                                               \
+}
+
+ENCODER_TILED_KERNEL(encoder_attn_tiled_h256_q32_k32_sg4, 256, 32, 32, 4)
+ENCODER_TILED_KERNEL(encoder_attn_tiled_h512_q32_k32_sg8, 512, 32, 32, 8)

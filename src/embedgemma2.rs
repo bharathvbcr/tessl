@@ -41,12 +41,16 @@
 //!
 //! # Kernels
 //!
-//! New for this model: [`encoder_attn`] (`kernels/encoder_attn.metal`),
-//! [`segment_mean_rows`] and [`l2_normalize_rows`] (`kernels/embed_pool.metal`).
-//! The rest are tessl's: exact-f32 GEMM, `nn::rms_norm_f32`,
-//! `nn::rms_norm_residual_add_f32` (the post-norms and the layer scalar),
-//! `nn::mlp_gelu_tanh`, `nn::scale_f32_inplace`, `qwen35::embed_rows` and
-//! `qwen35::attn_qk_norm_rope_columns` (`* w` norms, full-width RoPE).
+//! New for this model: [`encoder_attn`] (`kernels/encoder_attn.metal`: the
+//! TensorOps tiled kernel of `kernels/attn_tiled.h` at head dims 256 and 512,
+//! or one simdgroup per query row), [`segment_mean_rows`] and
+//! [`l2_normalize_rows`] (`kernels/embed_pool.metal`). The rest are tessl's:
+//! exact-f32 GEMMs (NN, and NT for the per-layer-input projection),
+//! `nn::rms_norm_f32`, `nn::rms_norm_residual_add_f32` (the post-norms and the
+//! layer scalar), `nn::scale_f32_inplace`, `qwen35::embed_rows_scaled` (the
+//! gather and the `sqrt(hidden)` scale), `qwen35::gated_act` (GELU-tanh over
+//! column windows) and `qwen35::attn_qk_norm_rope_columns` (`* w` norms,
+//! full-width RoPE, and the weightless V norm).
 
 use std::sync::Arc;
 
@@ -112,7 +116,40 @@ fn encoder_attn_entry(head_dim: u32) -> Option<(&'static str, usize, usize)> {
     }
 }
 
-/// Bidirectional attention over right-padded sequences.
+/// Which kernel runs [`encoder_attn`]'s contract.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EncoderAttnKernel {
+    /// One simdgroup per query row, scalar f32 (`encoder_attn_rows_*`): every
+    /// head dim.
+    Rows,
+    /// FlashAttention-2 on the TensorOps matrix units
+    /// (`encoder_attn_tiled_*`, `kernels/qwen35_attn_tiled.metal`'s body):
+    /// head dims 256 and 512, on a device with TensorOps.
+    Tiled,
+}
+
+/// The kernel [`encoder_attn`] picks: [`EncoderAttnKernel::Tiled`] where it
+/// is compiled and the device has the matrix units, else the rows kernel.
+pub fn encoder_attn_kernel(rt: &GpuRuntime, head_dim: u32) -> EncoderAttnKernel {
+    if rt.has_tensorops() && encoder_attn_tiled_entry(head_dim).is_some() {
+        EncoderAttnKernel::Tiled
+    } else {
+        EncoderAttnKernel::Rows
+    }
+}
+
+/// (entry, queries per threadgroup, simdgroups per threadgroup) as compiled;
+/// the entry spells its geometry.
+fn encoder_attn_tiled_entry(head_dim: u32) -> Option<(&'static str, usize, usize)> {
+    match head_dim {
+        256 => Some(("encoder_attn_tiled_h256_q32_k32_sg4", 32, 4)),
+        512 => Some(("encoder_attn_tiled_h512_q32_k32_sg8", 32, 8)),
+        _ => None,
+    }
+}
+
+/// Bidirectional attention over right-padded sequences, on the kernel
+/// [`encoder_attn_kernel`] picks ([`encoder_attn_with`] names one).
 ///
 /// `q`/`o`: `[batch, seq, heads, head_dim]`; `k`/`v`: `[batch, capacity,
 /// heads_kv, head_dim]` with `capacity >= seq` derived from their size
@@ -133,6 +170,24 @@ pub fn encoder_attn(
     lens: &GpuBuffer,
     dims: EncoderAttnDims,
     out_bf16: bool,
+) -> Result<(), String> {
+    let kernel = encoder_attn_kernel(rt, dims.head_dim);
+    encoder_attn_with(rt, q, k, v, o, lens, dims, out_bf16, kernel)
+}
+
+/// [`encoder_attn`] on a named kernel (for the tests and the paired
+/// benchmark that compare the two). The contract and the checks are the same.
+#[allow(clippy::too_many_arguments)]
+pub fn encoder_attn_with(
+    rt: &Arc<GpuRuntime>,
+    q: &GpuBuffer,
+    k: &GpuBuffer,
+    v: &GpuBuffer,
+    o: &GpuBuffer,
+    lens: &GpuBuffer,
+    dims: EncoderAttnDims,
+    out_bf16: bool,
+    kernel: EncoderAttnKernel,
 ) -> Result<(), String> {
     const WHAT: &str = "embedgemma2::encoder_attn";
     let (entry, lanes, groups) = encoder_attn_entry(dims.head_dim)
@@ -165,6 +220,52 @@ pub fn encoder_attn(
         ));
     }
     require_disjoint_writes(WHAT, &[("o", o)], &[("q", q), ("k", k), ("v", v), ("lens", lens)])?;
+    if kernel == EncoderAttnKernel::Tiled {
+        let (entry, bq, sg) = encoder_attn_tiled_entry(dims.head_dim).ok_or_else(|| {
+            format!(
+                "{WHAT}: the tiled kernel is compiled for head dims 256 and 512, not {}",
+                dims.head_dim
+            )
+        })?;
+        if !rt.has_tensorops() {
+            return Err(format!(
+                "{WHAT}: the tiled kernel needs TensorOps, which this device lacks"
+            ));
+        }
+        // MPP tensor views index one (batch, head) plane with i32 extents
+        // and strides, so a plane's last element must be addressable in i32.
+        let q_plane = u64::from(dims.seq) * u64::from(dims.heads) * u64::from(dims.head_dim);
+        let kv_plane = u64::from(kv_capacity) * u64::from(dims.heads_kv) * u64::from(dims.head_dim);
+        if q_plane > i32::MAX as u64 || kv_plane > i32::MAX as u64 {
+            return Err(format!(
+                "{WHAT}: a head's plane exceeds i32 indexing (seq = {}, kv capacity = {kv_capacity})",
+                dims.seq
+            ));
+        }
+        let threads = sg * 32;
+        let p = rt.pipeline(entry)?;
+        let max = p.maxTotalThreadsPerThreadgroup();
+        if max < threads {
+            return Err(format!(
+                "{WHAT}: {entry} needs {threads} threads per threadgroup, the pipeline allows {max}"
+            ));
+        }
+        let groups_y = elems(&[dims.batch, dims.heads], WHAT)?;
+        return dispatch_2d_tg(rt, &p, (dims.seq as usize).div_ceil(bq), groups_y, threads, |bnd| {
+            set_gpu_buf(bnd, q, 0);
+            set_gpu_buf(bnd, k, 1);
+            set_gpu_buf(bnd, v, 2);
+            set_gpu_buf(bnd, o, 3);
+            set_u32(bnd, dims.seq, 4);
+            set_gpu_buf(bnd, lens, 5);
+            set_u32(bnd, dims.heads, 6);
+            set_u32(bnd, dims.heads_kv, 7);
+            set_u32(bnd, dims.window, 8);
+            crate::dispatch::set_f32(bnd, dims.scale, 9);
+            set_u32(bnd, u32::from(out_bf16), 10);
+            set_u32(bnd, kv_capacity, 11);
+        });
+    }
     let rows_per_tg = groups * (32 / lanes);
     let groups_x = (dims.seq as usize).div_ceil(rows_per_tg);
     let groups_y = elems(&[dims.batch, dims.heads], WHAT)?;
@@ -1154,7 +1255,22 @@ fn view(t: &Tensor, rows: u32, cols: u32) -> Result<Tensor, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{pack_forwards, MAX_BATCH};
+    use super::{encoder_attn_tiled_entry, pack_forwards, MAX_BATCH};
+
+    /// Each tiled entry's name spells the geometry the host builds its grid
+    /// from (`_q{BQ}_k{BK}_sg{NSG}`), and the source instantiates it with
+    /// those numbers: the rule `tools/msl_emu/check_qwen35.py` holds the
+    /// Qwen3.5 instantiations to.
+    #[test]
+    fn tiled_entries_spell_their_geometry() {
+        let src = include_str!("../kernels/encoder_attn.metal");
+        for d in [256u32, 512] {
+            let (entry, bq, sg) = encoder_attn_tiled_entry(d).unwrap();
+            assert!(entry.ends_with(&format!("_h{d}_q{bq}_k32_sg{sg}")), "{entry}");
+            let inst = format!("ENCODER_TILED_KERNEL({entry}, {d}, {bq}, 32, {sg})");
+            assert!(src.contains(&inst), "missing {inst}");
+        }
+    }
 
     /// Every index exactly once; each forward within the row budget and the
     /// sequence cap; each forward padded to its first (longest) sequence.

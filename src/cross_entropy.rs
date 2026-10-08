@@ -286,8 +286,9 @@ pub fn cross_entropy_rows(
     }
     let hidden = hs as u32;
 
-    ws.rows.try_write_u32(&pad(rows, ws.max_rows))?;
-    ws.targets.try_write_u32(&pad(targets, ws.max_rows))?;
+    // In order with the queued work rather than waiting for it.
+    rt.upload_u32(&ws.rows, &pad(rows, ws.max_rows))?;
+    rt.upload_u32(&ws.targets, &pad(targets, ws.max_rows))?;
     let n32 = n as u32;
 
     // 1. Gather the supervised rows into f32.

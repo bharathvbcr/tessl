@@ -344,6 +344,23 @@ impl GpuBuffer {
         unsafe { std::ptr::write_bytes(self.metal().contents().as_ptr().cast::<u8>(), 0, self.nbytes()) };
     }
 
+    /// Copy `data` to the start of the buffer on the host.
+    ///
+    /// # Safety
+    /// As [`Self::zero_unsubmitted`]; `data` must fit in the buffer.
+    pub(crate) unsafe fn write_u32_unsubmitted(&self, data: &[u32]) {
+        debug_assert!(std::mem::size_of_val(data) <= self.nbytes());
+        // SAFETY: no command uses the storage (the caller's contract) and
+        // `data` fits it.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                data.as_ptr(),
+                self.metal().contents().as_ptr().cast::<u32>(),
+                data.len(),
+            )
+        };
+    }
+
     /// [`Self::zero_unsubmitted`] with `byte` in every byte.
     ///
     /// # Safety

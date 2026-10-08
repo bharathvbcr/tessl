@@ -217,3 +217,53 @@ fn poisoned_unzeroed_allocations_change_no_bit() {
         }
     }
 }
+
+/// Under async encode a step waits for the GPU only where it means to: at
+/// each attention layer's forward and rebuild (where the pool recycles what
+/// earlier layers freed, which `train_step_bytes` counts on), at the
+/// cross-entropy's loss, and at its end. Index uploads (the attention
+/// workspace's, the cross-entropy's rows and targets, the embedding
+/// backward's grouping), `dxf`'s zero and the backward's scratch used to
+/// add a drain each; the attention workspace was also rebuilt per layer.
+#[test]
+fn an_async_step_waits_only_where_it_means_to() {
+    let _g = LOCK.lock().unwrap();
+    let (rt, model) = load(Precision::F32);
+    let ids = ids();
+    let attn = model
+        .config()
+        .layers
+        .iter()
+        .filter(|&&k| k == tessl::qwen35_model::LayerKind::FullAttention)
+        .count() as u64;
+    assert!(attn > 0, "the fixture has no attention layer to count");
+    rt.set_async_encode(true).unwrap();
+    let bank = Qwen35Grads::zeros_like(&model).unwrap();
+    for op in [GemmOperands::ExactF32, GemmOperands::Bf16] {
+        let (_, fresh) = traced(|| model.train_step(&ids, op).unwrap());
+        let (_, into) = traced(|| model.train_step_into(&ids, op, Supervise::Causal, &bank, true).unwrap());
+        for (what, s) in [("train_step", fresh), ("train_step_into", into)] {
+            assert_eq!(s.sync_waits, 2 * attn + 2, "{op:?} {what}: {s:?}");
+        }
+    }
+    rt.set_async_encode(false).unwrap();
+}
+
+/// Async encode changes when the step waits, not what it computes: every
+/// gradient bit and the loss on every entry point equal the sync run's.
+#[test]
+fn async_encode_changes_no_bit() {
+    let _g = LOCK.lock().unwrap();
+    for (lane, precision, op) in lanes() {
+        let (rt, model) = load(precision);
+        let sync = entry_points(&rt, &model, op);
+        rt.set_async_encode(true).unwrap();
+        let batched = entry_points(&rt, &model, op);
+        rt.set_async_encode(false).unwrap();
+        for ((name, a), (_, b)) in sync.iter().zip(&batched) {
+            if let Some(k) = (0..a.len()).find(|&k| a[k] != b[k]) {
+                panic!("{lane}: {name}[{k}] is {:#x} sync, {:#x} async", a[k], b[k]);
+            }
+        }
+    }
+}

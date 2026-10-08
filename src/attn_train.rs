@@ -108,15 +108,11 @@ pub struct AttnTrainWorkspace {
 impl AttnTrainWorkspace {
     pub fn new(rt: &Arc<GpuRuntime>, dims: AttnTrainDims) -> Result<Self, String> {
         dims.validate("AttnTrainWorkspace")?;
-        let u32s = |v: u32| -> Result<GpuBuffer, String> {
-            let b = rt.alloc_buffer(std::mem::size_of::<u32>())?;
-            b.try_write_u32(&[v])?;
-            Ok(b)
-        };
+        // Fresh buffers, written without waiting for the GPU.
         Ok(Self {
             dims,
-            tkv: u32s(dims.seq)?,
-            zero: u32s(0)?,
+            tkv: rt.alloc_buffer_from_u32(&[dims.seq])?,
+            zero: rt.alloc_buffer_from_u32(&[0])?,
             dvec: rt.alloc_buffer(dims.lse_len().max(1) * std::mem::size_of::<f32>())?,
         })
     }

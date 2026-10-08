@@ -540,7 +540,7 @@ All runtime configuration uses the canonical `TESSL_*` prefix. Legacy
 |---|---|
 | [**API reference**](https://docs.rs/tessl) | Every public type, entry point and feature flag on docs.rs, rendered from the source of the released version. Start at the crate root for the platform requirements, the two quickstarts and the module map. |
 | [**Architecture**](docs/architecture.md) | Deep dive into kernel selection, cooperative destination register mechanics, $K$-reduction bandwidth analysis, and TN/NT layout optimizations. |
-| [**Benchmarking**](docs/benchmarking.md) | The paired measurement protocol, GPU thermal and frequency scaling mitigation, and five measurement pitfalls. |
+| [**Benchmarking**](docs/benchmarking.md) | The paired measurement protocol, GPU thermal and frequency scaling mitigation, five measurement pitfalls, and plots of every recorded result in `bench/results/` (tessl against PyTorch and MLX, tile tuning, attention, Qwen3.5 memory and step time). |
 | [**EmbeddingGemma 2**](docs/embedgemma2.md) | The `google/embeddinggemma-2` text encoder: what it computes, its kernels, the bounds it is held to against sentence-transformers and the errors observed on an M5 Pro. No timings are published yet. |
 | [**Qwen3.5**](docs/qwen35.md) | The Qwen3.5 kernels, the training step and its backward, training-memory attribution against torch, AdamW, numerics and measured timings. |
 | [**torch binding**](python/README.md) | `tessl_torch`: calling the cross-entropy, GDN seam and whole-model `train_step` / AdamW from a PyTorch loop. |

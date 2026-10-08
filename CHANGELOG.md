@@ -8,6 +8,22 @@ All notable changes to `tessl` are recorded here. The format follows
 
 ### Added
 
+- **`Qwen35Model::adamw_step_scaled`.** `adamw_step` with parameter-table
+  entry `i` at learning rate `hyper.lr * lr_scale[i]`: torch's AdamW with one
+  param group per entry, so the scaled rate forms both the decoupled decay
+  factor and the step size. A scale of 0 freezes the entry's bits while its
+  moments still update. `lr_scale` is checked (one finite, non-negative value
+  per entry; the scaled rate finite) before anything moves.
+- **Every recorded benchmark, plotted.** `docs/img/` holds 13 SVG figures
+  (light and dark) generated from `bench/results/`, and `docs/benchmarking.md`
+  gains a section for the tessl-against-PyTorch GEMM comparison, the Qwen3.5
+  step-waste and dispatch host-overhead runs, and one for every other result
+  family (tile grids, SIMD-group rewrites, attention speed and tuning,
+  loader and training memory, accuracy). The plots exposed that
+  `gemm_sweep_m5pro_f32_bf16.json` predates the cooperative-destination bf16
+  kernel, and that the `attn_speed_*` files store `tessl_ms / other_ms`;
+  both are recorded in the doc.
+
 - **Accumulate GEMM operands.** `GemmOperands::{nn_acc, tn_acc, nt_acc}`
   compute `C += op(A) op(B)` in the GEMM itself on both lanes: the TN/NT
   accumulate kernels, a new exact-f32 `matmul2d_tensorops_nn_accum_f32`
@@ -369,6 +385,19 @@ All notable changes to `tessl` are recorded here. The format follows
 
 ### Fixed
 
+- **`gemm_i8_dequant` bound its exact accumulation with the wrong product.**
+  It took 127 × 127 as the largest int8 product, but (−128) × (−128) = 16384
+  is larger, so at `k = 131072` an all-(−128) sum wrapped to −2³¹ without an
+  error. `MAX_K_EXACT` is now `i32::MAX / 16384 = 131071`. One
+  `gemm::require_i32_extent` is the signed-32-bit extent check for
+  `validate_gemm`, `gemm_batched` and the raw-buffer `gemm_i8_dequant`, so an
+  int8 operand past `i32::MAX` elements is refused before encoding.
+- **A busy or poisoned runtime panicked a trainer.** The training paths wrote
+  and read host mappings through panicking helpers. `GpuBuffer` gains
+  `try_read_f32` and `try_zero` (`read_f32` and `zero` delegate to them), and
+  `attn_train`, `cross_entropy`, `qwen35_bwd` and `qwen35_train` use them:
+  every training entry point now returns an `Err` naming the state
+  (`tests/qwen35_train.rs`).
 - **RoPE drifted from transformers with position.** `qwen35_attn_qk_norm_rope`
   (Qwen3.5 and EmbedGemma2), its backward and `rms_qkv_rope` computed
   `inv_freq` on the device. That is about an ulp off torch's host-computed

@@ -896,7 +896,11 @@ Trainer excludes (every norm and `linear_attn.dt_bias`). Against an f64
 reference of torch's formula over five steps on the tiny model the worst
 error is 1.3e-7 (bound 2e-6), and against `torch.optim.AdamW` itself over
 three steps it is within 1e-6 (`tests/qwen35_adamw.rs`,
-`python/tests/test_qwen35.py`). Clipping is the caller's: `grad_sq_norm`
+`python/tests/test_qwen35.py`). `adamw_step_scaled` takes one learning-rate
+scale per parameter-table entry, as torch's one param group per entry does:
+the scaled rate forms both the decoupled decay factor and the step size, and
+a scale of 0 keeps the entry's bits while its moments still update.
+Clipping is the caller's: `grad_sq_norm`
 gives the square of the global gradient norm, and `grad_scale` multiplies
 every gradient by `clip_grad_norm_`'s coefficient inside the update, with
 no pass over the gradients and the stored ones left unscaled; the caller

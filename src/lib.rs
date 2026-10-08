@@ -212,6 +212,7 @@
 
 pub mod ab_flags;
 pub mod attn_train;
+pub mod bert;
 pub mod capi;
 pub mod cb_replay;
 pub mod cross_entropy;

@@ -153,3 +153,11 @@ kernel void NAME(                                                             \
 // and `nn::rows_groups_for`), the same register budget per lane.
 ENC_ROWS_KERNEL(encoder_attn_rows_h256_r16_g32, 256, 16, 32)
 ENC_ROWS_KERNEL(encoder_attn_rows_h512_r32_g32, 512, 32, 32)
+// BERT's head dim (src/bert.rs: 384 hidden over 12 heads). Two lanes per row
+// keeps the 16 dims per lane above, so 16 rows share a simdgroup; eight
+// simdgroups make a threadgroup of 128 rows, which covers a 512-token
+// sequence in four rather than leaving most of a 32-simdgroup group idle.
+ENC_ROWS_KERNEL(encoder_attn_rows_h32_r2_g8, 32, 2, 8)
+// DistilBERT's (768 over 12): four lanes per row, the same 16 dims per lane
+// and 128 rows per threadgroup.
+ENC_ROWS_KERNEL(encoder_attn_rows_h64_r4_g16, 64, 4, 16)

@@ -88,7 +88,7 @@ pub struct EncoderAttnDims {
     pub seq: u32,
     pub heads: u32,
     pub heads_kv: u32,
-    /// 256 or 512 (the instantiated head dims).
+    /// 32, 64, 256 or 512 (the instantiated head dims).
     pub head_dim: u32,
     /// `0`: every key of the row's sequence. Otherwise keys with
     /// `|t_k - t_q| <= window` (inclusive, both sides).
@@ -100,6 +100,8 @@ pub struct EncoderAttnDims {
 fn encoder_attn_entry(head_dim: u32) -> Option<(&'static str, usize, usize)> {
     // (entry, lanes per row, simdgroups per threadgroup) as compiled.
     match head_dim {
+        32 => Some(("encoder_attn_rows_h32_r2_g8", 2, 8)),
+        64 => Some(("encoder_attn_rows_h64_r4_g16", 4, 16)),
         256 => Some(("encoder_attn_rows_h256_r16_g32", 16, 32)),
         512 => Some(("encoder_attn_rows_h512_r32_g32", 32, 32)),
         _ => None,
@@ -128,7 +130,7 @@ pub fn encoder_attn(
 ) -> Result<(), String> {
     const WHAT: &str = "embedgemma2::encoder_attn";
     let (entry, lanes, groups) = encoder_attn_entry(dims.head_dim)
-        .ok_or_else(|| format!("{WHAT}: head dim {} has no kernel (256 or 512)", dims.head_dim))?;
+        .ok_or_else(|| format!("{WHAT}: head dim {} has no kernel (32, 64, 256 or 512)", dims.head_dim))?;
     if dims.heads == 0 || dims.heads_kv == 0 || dims.heads % dims.heads_kv != 0 {
         return Err(format!(
             "{WHAT}: heads ({}) must be a non-zero multiple of heads_kv ({})",

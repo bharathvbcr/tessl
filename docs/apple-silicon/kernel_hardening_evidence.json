@@ -1,0 +1,722 @@
+{
+  "date": "2026-08-30",
+  "host": {
+    "chip": "Apple M5 Pro",
+    "memory_gib": 64,
+    "os": "macOS 27.0 (26A5421a)",
+    "rustc": "1.96.0"
+  },
+  "scope": "GEMM boundary, checked allocation/view size, CPU BF16 conversion, simdgroup edges and redundant-clear removal",
+  "pre_hardening_commit": "b6e242f",
+  "concurrent_commits_observed": [
+    "7fc29d7",
+    "e445ce5"
+  ],
+  "warning": "Other task committed intermediate changes and later edited native TensorOps NN tuning. No commit/reset performed by this task. This evidence does not attribute TensorOps tuning to this pass.",
+  "paired_protocol": "Existing zero_f32 dispatch plus hardened GEMM versus hardened GEMM alone; alternating order, 10 warmup pairs, 100 measured pairs, sync each call, three processes. Isolates clear cost; no whole-model speed claim.",
+  "paired_measurements": [
+    {
+      "run": 1,
+      "dimension": 16,
+      "pairs": 100,
+      "clear_median_us": 449.0,
+      "overwrite_median_us": 221.938,
+      "speedup": 2.023
+    },
+    {
+      "run": 1,
+      "dimension": 128,
+      "pairs": 100,
+      "clear_median_us": 402.188,
+      "overwrite_median_us": 191.146,
+      "speedup": 2.104
+    },
+    {
+      "run": 1,
+      "dimension": 512,
+      "pairs": 100,
+      "clear_median_us": 500.625,
+      "overwrite_median_us": 267.917,
+      "speedup": 1.869
+    },
+    {
+      "run": 2,
+      "dimension": 16,
+      "pairs": 100,
+      "clear_median_us": 466.417,
+      "overwrite_median_us": 230.938,
+      "speedup": 2.02
+    },
+    {
+      "run": 2,
+      "dimension": 128,
+      "pairs": 100,
+      "clear_median_us": 399.688,
+      "overwrite_median_us": 199.084,
+      "speedup": 2.008
+    },
+    {
+      "run": 2,
+      "dimension": 512,
+      "pairs": 100,
+      "clear_median_us": 457.625,
+      "overwrite_median_us": 259.25,
+      "speedup": 1.765
+    },
+    {
+      "run": 3,
+      "dimension": 16,
+      "pairs": 100,
+      "clear_median_us": 491.75,
+      "overwrite_median_us": 238.291,
+      "speedup": 2.064
+    },
+    {
+      "run": 3,
+      "dimension": 128,
+      "pairs": 100,
+      "clear_median_us": 423.896,
+      "overwrite_median_us": 202.584,
+      "speedup": 2.092
+    },
+    {
+      "run": 3,
+      "dimension": 512,
+      "pairs": 100,
+      "clear_median_us": 506.396,
+      "overwrite_median_us": 265.417,
+      "speedup": 1.908
+    }
+  ],
+  "broad_sweep": {
+    "warmup": 3,
+    "samples": 9,
+    "cases": 24,
+    "note": "Noisy sequential before/after smoke; not a statistical speed gate. Uses pre-existing benchmark (now committed by another process), before later concurrent TensorOps retuning.",
+    "before": [
+      {
+        "shape": "square_512",
+        "backend": "tensorops-f32",
+        "runtime": "metal-native",
+        "m": 512,
+        "n": 512,
+        "k": 512,
+        "median_ms": 0.835333,
+        "best_ms": 0.413708,
+        "gflops": 321.351
+      },
+      {
+        "shape": "square_512",
+        "backend": "simdgroup-f32",
+        "runtime": "metal-native",
+        "m": 512,
+        "n": 512,
+        "k": 512,
+        "median_ms": 0.846375,
+        "best_ms": 0.592792,
+        "gflops": 317.159
+      },
+      {
+        "shape": "square_512",
+        "backend": "tensorops-bf16",
+        "runtime": "metal-native",
+        "m": 512,
+        "n": 512,
+        "k": 512,
+        "median_ms": 0.240209,
+        "best_ms": 0.192459,
+        "gflops": 1117.508
+      },
+      {
+        "shape": "square_1024",
+        "backend": "tensorops-f32",
+        "runtime": "metal-native",
+        "m": 1024,
+        "n": 1024,
+        "k": 1024,
+        "median_ms": 0.496166,
+        "best_ms": 0.467125,
+        "gflops": 4328.156
+      },
+      {
+        "shape": "square_1024",
+        "backend": "simdgroup-f32",
+        "runtime": "metal-native",
+        "m": 1024,
+        "n": 1024,
+        "k": 1024,
+        "median_ms": 1.600708,
+        "best_ms": 1.036375,
+        "gflops": 1341.584
+      },
+      {
+        "shape": "square_1024",
+        "backend": "tensorops-bf16",
+        "runtime": "metal-native",
+        "m": 1024,
+        "n": 1024,
+        "k": 1024,
+        "median_ms": 0.449375,
+        "best_ms": 0.393292,
+        "gflops": 4778.823
+      },
+      {
+        "shape": "square_2048",
+        "backend": "tensorops-f32",
+        "runtime": "metal-native",
+        "m": 2048,
+        "n": 2048,
+        "k": 2048,
+        "median_ms": 2.915,
+        "best_ms": 2.583542,
+        "gflops": 5893.609
+      },
+      {
+        "shape": "square_2048",
+        "backend": "simdgroup-f32",
+        "runtime": "metal-native",
+        "m": 2048,
+        "n": 2048,
+        "k": 2048,
+        "median_ms": 6.911041,
+        "best_ms": 6.19625,
+        "gflops": 2485.858
+      },
+      {
+        "shape": "square_2048",
+        "backend": "tensorops-bf16",
+        "runtime": "metal-native",
+        "m": 2048,
+        "n": 2048,
+        "k": 2048,
+        "median_ms": 1.679167,
+        "best_ms": 1.499959,
+        "gflops": 10231.186
+      },
+      {
+        "shape": "square_4096",
+        "backend": "tensorops-f32",
+        "runtime": "metal-native",
+        "m": 4096,
+        "n": 4096,
+        "k": 4096,
+        "median_ms": 19.608666,
+        "best_ms": 18.975291,
+        "gflops": 7009.092
+      },
+      {
+        "shape": "square_4096",
+        "backend": "simdgroup-f32",
+        "runtime": "metal-native",
+        "m": 4096,
+        "n": 4096,
+        "k": 4096,
+        "median_ms": 63.523833,
+        "best_ms": 61.855083,
+        "gflops": 2163.581
+      },
+      {
+        "shape": "square_4096",
+        "backend": "tensorops-bf16",
+        "runtime": "metal-native",
+        "m": 4096,
+        "n": 4096,
+        "k": 4096,
+        "median_ms": 14.146166,
+        "best_ms": 13.295792,
+        "gflops": 9715.633
+      },
+      {
+        "shape": "qkv_proj",
+        "backend": "tensorops-f32",
+        "runtime": "metal-native",
+        "m": 2048,
+        "n": 768,
+        "k": 768,
+        "median_ms": 0.61025,
+        "best_ms": 0.531042,
+        "gflops": 3958.901
+      },
+      {
+        "shape": "qkv_proj",
+        "backend": "simdgroup-f32",
+        "runtime": "metal-native",
+        "m": 2048,
+        "n": 768,
+        "k": 768,
+        "median_ms": 1.248125,
+        "best_ms": 1.157708,
+        "gflops": 1935.639
+      },
+      {
+        "shape": "qkv_proj",
+        "backend": "tensorops-bf16",
+        "runtime": "metal-native",
+        "m": 2048,
+        "n": 768,
+        "k": 768,
+        "median_ms": 0.40275,
+        "best_ms": 0.343875,
+        "gflops": 5998.558
+      },
+      {
+        "shape": "mlp_up",
+        "backend": "tensorops-f32",
+        "runtime": "metal-native",
+        "m": 8192,
+        "n": 3072,
+        "k": 768,
+        "median_ms": 6.642292,
+        "best_ms": 5.879083,
+        "gflops": 5819.483
+      },
+      {
+        "shape": "mlp_up",
+        "backend": "simdgroup-f32",
+        "runtime": "metal-native",
+        "m": 8192,
+        "n": 3072,
+        "k": 768,
+        "median_ms": 16.197917,
+        "best_ms": 15.891917,
+        "gflops": 2386.4
+      },
+      {
+        "shape": "mlp_up",
+        "backend": "tensorops-bf16",
+        "runtime": "metal-native",
+        "m": 8192,
+        "n": 3072,
+        "k": 768,
+        "median_ms": 3.654416,
+        "best_ms": 3.420208,
+        "gflops": 10577.533
+      },
+      {
+        "shape": "mlp_down",
+        "backend": "tensorops-f32",
+        "runtime": "metal-native",
+        "m": 8192,
+        "n": 768,
+        "k": 3072,
+        "median_ms": 5.762125,
+        "best_ms": 5.503583,
+        "gflops": 6708.412
+      },
+      {
+        "shape": "mlp_down",
+        "backend": "simdgroup-f32",
+        "runtime": "metal-native",
+        "m": 8192,
+        "n": 768,
+        "k": 3072,
+        "median_ms": 18.399084,
+        "best_ms": 17.949709,
+        "gflops": 2100.904
+      },
+      {
+        "shape": "mlp_down",
+        "backend": "tensorops-bf16",
+        "runtime": "metal-native",
+        "m": 8192,
+        "n": 768,
+        "k": 3072,
+        "median_ms": 3.397791,
+        "best_ms": 3.25775,
+        "gflops": 11376.422
+      },
+      {
+        "shape": "tall_k1024",
+        "backend": "tensorops-f32",
+        "runtime": "metal-native",
+        "m": 4096,
+        "n": 4096,
+        "k": 1024,
+        "median_ms": 5.708375,
+        "best_ms": 5.153875,
+        "gflops": 6019.18
+      },
+      {
+        "shape": "tall_k1024",
+        "backend": "simdgroup-f32",
+        "runtime": "metal-native",
+        "m": 4096,
+        "n": 4096,
+        "k": 1024,
+        "median_ms": 13.533375,
+        "best_ms": 12.865167,
+        "gflops": 2538.889
+      },
+      {
+        "shape": "tall_k1024",
+        "backend": "tensorops-bf16",
+        "runtime": "metal-native",
+        "m": 4096,
+        "n": 4096,
+        "k": 1024,
+        "median_ms": 2.997667,
+        "best_ms": 2.955375,
+        "gflops": 11462.16
+      }
+    ],
+    "after": [
+      {
+        "shape": "square_512",
+        "backend": "tensorops-f32",
+        "runtime": "metal-native",
+        "m": 512,
+        "n": 512,
+        "k": 512,
+        "median_ms": 0.504542,
+        "best_ms": 0.453375,
+        "gflops": 532.038
+      },
+      {
+        "shape": "square_512",
+        "backend": "simdgroup-f32",
+        "runtime": "metal-native",
+        "m": 512,
+        "n": 512,
+        "k": 512,
+        "median_ms": 0.711917,
+        "best_ms": 0.638709,
+        "gflops": 377.06
+      },
+      {
+        "shape": "square_512",
+        "backend": "tensorops-bf16",
+        "runtime": "metal-native",
+        "m": 512,
+        "n": 512,
+        "k": 512,
+        "median_ms": 0.333208,
+        "best_ms": 0.301625,
+        "gflops": 805.609
+      },
+      {
+        "shape": "square_1024",
+        "backend": "tensorops-f32",
+        "runtime": "metal-native",
+        "m": 1024,
+        "n": 1024,
+        "k": 1024,
+        "median_ms": 0.698667,
+        "best_ms": 0.5545,
+        "gflops": 3073.687
+      },
+      {
+        "shape": "square_1024",
+        "backend": "simdgroup-f32",
+        "runtime": "metal-native",
+        "m": 1024,
+        "n": 1024,
+        "k": 1024,
+        "median_ms": 0.906542,
+        "best_ms": 0.867667,
+        "gflops": 2368.874
+      },
+      {
+        "shape": "square_1024",
+        "backend": "tensorops-bf16",
+        "runtime": "metal-native",
+        "m": 1024,
+        "n": 1024,
+        "k": 1024,
+        "median_ms": 0.364416,
+        "best_ms": 0.335041,
+        "gflops": 5892.946
+      },
+      {
+        "shape": "square_2048",
+        "backend": "tensorops-f32",
+        "runtime": "metal-native",
+        "m": 2048,
+        "n": 2048,
+        "k": 2048,
+        "median_ms": 2.753958,
+        "best_ms": 2.571792,
+        "gflops": 6238.247
+      },
+      {
+        "shape": "square_2048",
+        "backend": "simdgroup-f32",
+        "runtime": "metal-native",
+        "m": 2048,
+        "n": 2048,
+        "k": 2048,
+        "median_ms": 6.761375,
+        "best_ms": 6.176709,
+        "gflops": 2540.884
+      },
+      {
+        "shape": "square_2048",
+        "backend": "tensorops-bf16",
+        "runtime": "metal-native",
+        "m": 2048,
+        "n": 2048,
+        "k": 2048,
+        "median_ms": 1.718416,
+        "best_ms": 1.522667,
+        "gflops": 9997.503
+      },
+      {
+        "shape": "square_4096",
+        "backend": "tensorops-f32",
+        "runtime": "metal-native",
+        "m": 4096,
+        "n": 4096,
+        "k": 4096,
+        "median_ms": 20.500625,
+        "best_ms": 19.462167,
+        "gflops": 6704.135
+      },
+      {
+        "shape": "square_4096",
+        "backend": "simdgroup-f32",
+        "runtime": "metal-native",
+        "m": 4096,
+        "n": 4096,
+        "k": 4096,
+        "median_ms": 62.384583,
+        "best_ms": 59.921791,
+        "gflops": 2203.092
+      },
+      {
+        "shape": "square_4096",
+        "backend": "tensorops-bf16",
+        "runtime": "metal-native",
+        "m": 4096,
+        "n": 4096,
+        "k": 4096,
+        "median_ms": 13.966,
+        "best_ms": 13.526125,
+        "gflops": 9840.968
+      },
+      {
+        "shape": "qkv_proj",
+        "backend": "tensorops-f32",
+        "runtime": "metal-native",
+        "m": 2048,
+        "n": 768,
+        "k": 768,
+        "median_ms": 0.584167,
+        "best_ms": 0.534375,
+        "gflops": 4135.665
+      },
+      {
+        "shape": "qkv_proj",
+        "backend": "simdgroup-f32",
+        "runtime": "metal-native",
+        "m": 2048,
+        "n": 768,
+        "k": 768,
+        "median_ms": 1.077125,
+        "best_ms": 0.95725,
+        "gflops": 2242.933
+      },
+      {
+        "shape": "qkv_proj",
+        "backend": "tensorops-bf16",
+        "runtime": "metal-native",
+        "m": 2048,
+        "n": 768,
+        "k": 768,
+        "median_ms": 0.444875,
+        "best_ms": 0.366125,
+        "gflops": 5430.557
+      },
+      {
+        "shape": "mlp_up",
+        "backend": "tensorops-f32",
+        "runtime": "metal-native",
+        "m": 8192,
+        "n": 3072,
+        "k": 768,
+        "median_ms": 6.65625,
+        "best_ms": 6.006084,
+        "gflops": 5807.28
+      },
+      {
+        "shape": "mlp_up",
+        "backend": "simdgroup-f32",
+        "runtime": "metal-native",
+        "m": 8192,
+        "n": 3072,
+        "k": 768,
+        "median_ms": 15.176041,
+        "best_ms": 14.462791,
+        "gflops": 2547.088
+      },
+      {
+        "shape": "mlp_up",
+        "backend": "tensorops-bf16",
+        "runtime": "metal-native",
+        "m": 8192,
+        "n": 3072,
+        "k": 768,
+        "median_ms": 3.470333,
+        "best_ms": 3.391667,
+        "gflops": 11138.616
+      },
+      {
+        "shape": "mlp_down",
+        "backend": "tensorops-f32",
+        "runtime": "metal-native",
+        "m": 8192,
+        "n": 768,
+        "k": 3072,
+        "median_ms": 5.81075,
+        "best_ms": 5.556208,
+        "gflops": 6652.275
+      },
+      {
+        "shape": "mlp_down",
+        "backend": "simdgroup-f32",
+        "runtime": "metal-native",
+        "m": 8192,
+        "n": 768,
+        "k": 3072,
+        "median_ms": 16.734417,
+        "best_ms": 15.93925,
+        "gflops": 2309.893
+      },
+      {
+        "shape": "mlp_down",
+        "backend": "tensorops-bf16",
+        "runtime": "metal-native",
+        "m": 8192,
+        "n": 768,
+        "k": 3072,
+        "median_ms": 3.354709,
+        "best_ms": 3.169,
+        "gflops": 11522.521
+      },
+      {
+        "shape": "tall_k1024",
+        "backend": "tensorops-f32",
+        "runtime": "metal-native",
+        "m": 4096,
+        "n": 4096,
+        "k": 1024,
+        "median_ms": 5.501292,
+        "best_ms": 5.117458,
+        "gflops": 6245.758
+      },
+      {
+        "shape": "tall_k1024",
+        "backend": "simdgroup-f32",
+        "runtime": "metal-native",
+        "m": 4096,
+        "n": 4096,
+        "k": 1024,
+        "median_ms": 12.800917,
+        "best_ms": 12.183667,
+        "gflops": 2684.162
+      },
+      {
+        "shape": "tall_k1024",
+        "backend": "tensorops-bf16",
+        "runtime": "metal-native",
+        "m": 4096,
+        "n": 4096,
+        "k": 1024,
+        "median_ms": 3.200334,
+        "best_ms": 3.015916,
+        "gflops": 10736.298
+      }
+    ]
+  },
+  "pre_fix_regressions": {
+    "confirmed_failing": 9,
+    "logs": {
+      "mlsystems-regressions-before.log": "   Compiling metal-runtime v0.1.0 (/Users/bharath/Code/research/MLSystemsLab/Rust_MLKit/crates/metal-runtime)\n    Finished `release` profile [optimized] target(s) in 6.72s\n     Running unittests src/lib.rs (Rust_MLKit/crates/metal-runtime/target/release/deps/metal_runtime-7c3df6d5a9d32785)\n\nrunning 7 tests\ntest gemm::contract_tests::rejects_bad_rank_without_panicking_or_encoding ... FAILED\ntest gemm::contract_tests::rejects_output_alias_before_encoding ... FAILED\ntest gemm::contract_tests::rejects_wrong_dtype_on_transpose_paths ... FAILED\ntest gemm::contract_tests::simdgroup_edges_and_offset_guards ... FAILED\ntest tensor::contract_tests::allocation_rejects_overflow ... FAILED\ntest tensor::contract_tests::bf16_preserves_special_values_and_ties ... FAILED\ntest tensor::contract_tests::view_rejects_offset_overflow - should panic ... FAILED\n\nfailures:\n\n---- gemm::contract_tests::rejects_bad_rank_without_panicking_or_encoding stdout ----\n\nthread 'gemm::contract_tests::rejects_bad_rank_without_panicking_or_encoding' (404223711) panicked at src/gemm.rs:174:5:\nassertion `left == right` failed\n  left: 1\n right: 2\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\n\nthread 'gemm::contract_tests::rejects_bad_rank_without_panicking_or_encoding' (404223711) panicked at src/gemm.rs:1301:13:\npublic Result API panicked\n\n---- gemm::contract_tests::rejects_output_alias_before_encoding stdout ----\n\nthread 'gemm::contract_tests::rejects_output_alias_before_encoding' (404223783) panicked at src/gemm.rs:1314:13:\nassertion failed: launch(&a, &b, &a, GemmBackend::TensorOps).is_err()\n\n---- gemm::contract_tests::rejects_wrong_dtype_on_transpose_paths stdout ----\n\nthread 'gemm::contract_tests::rejects_wrong_dtype_on_transpose_paths' (404223838) panicked at src/gemm.rs:1326:9:\nassertion failed: gemm_tn_f32(&a, &b, &c, GemmBackend::TensorOps).is_err()\n\n---- gemm::contract_tests::simdgroup_edges_and_offset_guards stdout ----\n\nthread 'gemm::contract_tests::simdgroup_edges_and_offset_guards' (404223873) panicked at src/gemm.rs:1346:51:\ncalled `Result::unwrap()` on an `Err` value: \"simdgroup GEMM requires M,N % 16 == 0 and K % 8 == 0; got 1x1 @ 1x1\"\n\n---- tensor::contract_tests::allocation_rejects_overflow stdout ----\n\nthread 'tensor::contract_tests::allocation_rejects_overflow' (404223898) panicked at src/tensor.rs:259:9:\nassertion failed: rt.alloc_tensor_f32(&[usize::MAX, usize::MAX]).is_err()\n\n---- tensor::contract_tests::bf16_preserves_special_values_and_ties stdout ----\n\nthread 'tensor::contract_tests::bf16_preserves_special_values_and_ties' (404223933) panicked at src/tensor.rs:242:13:\nNaN payload 7f800001 became finite or infinity\n\n---- tensor::contract_tests::view_rejects_offset_overflow stdout ----\nnote: test did not panic as expected at src/tensor.rs:267:8\n\nfailures:\n    gemm::contract_tests::rejects_bad_rank_without_panicking_or_encoding\n    gemm::contract_tests::rejects_output_alias_before_encoding\n    gemm::contract_tests::rejects_wrong_dtype_on_transpose_paths\n    gemm::contract_tests::simdgroup_edges_and_offset_guards\n    tensor::contract_tests::allocation_rejects_overflow\n    tensor::contract_tests::bf16_preserves_special_values_and_ties\n    tensor::contract_tests::view_rejects_offset_overflow\n\ntest result: FAILED. 0 passed; 7 failed; 0 ignored; 0 measured; 33 filtered out; finished in 0.08s\n\nerror: test failed, to rerun pass `--lib`\n",
+      "mlsystems-extra-before.log": "   Compiling metal-runtime v0.1.0 (/Users/bharath/Code/research/MLSystemsLab/Rust_MLKit/crates/metal-runtime)\n    Finished `release` profile [optimized] target(s) in 7.07s\n     Running unittests src/lib.rs (Rust_MLKit/crates/metal-runtime/target/release/deps/metal_runtime-7c3df6d5a9d32785)\n\nrunning 6 tests\ntest gemm::contract_tests::rejects_bad_rank_without_panicking_or_encoding ... ok\ntest gemm::contract_tests::rejects_output_alias_before_encoding ... ok\ntest gemm::contract_tests::rejects_wrong_dtype_on_transpose_paths ... ok\ntest gemm::tests::parity_metric_rejects_nonfinite_and_length_mismatch ... FAILED\ntest tensor::contract_tests::allocation_rejects_overflow ... ok\ntest tensor::contract_tests::view_rejects_offset_overflow - should panic ... ok\n\nfailures:\n\n---- gemm::tests::parity_metric_rejects_nonfinite_and_length_mismatch stdout ----\n\nthread 'gemm::tests::parity_metric_rejects_nonfinite_and_length_mismatch' (404506404) panicked at src/gemm.rs:812:13:\nassertion failed: std::panic::catch_unwind(|| max_abs_err(&got, &expected)).is_err()\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\n\n\nfailures:\n    gemm::tests::parity_metric_rejects_nonfinite_and_length_mismatch\n\ntest result: FAILED. 5 passed; 1 failed; 0 ignored; 0 measured; 36 filtered out; finished in 0.07s\n\nerror: test failed, to rerun pass `--lib`\n    Finished `release` profile [optimized] target(s) in 0.01s\n     Running unittests src/lib.rs (Rust_MLKit/crates/metal-runtime/target/release/deps/metal_runtime-7c3df6d5a9d32785)\n\nrunning 1 test\ntest gemm::contract_tests::casts_reject_dtype_and_shape_before_encoding ... FAILED\n\nfailures:\n\n---- gemm::contract_tests::casts_reject_dtype_and_shape_before_encoding stdout ----\n\nthread 'gemm::contract_tests::casts_reject_dtype_and_shape_before_encoding' (404510823) panicked at src/gemm.rs:147:5:\nassertion `left == right` failed\n  left: [16, 16]\n right: [256]\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\n\nthread 'gemm::contract_tests::casts_reject_dtype_and_shape_before_encoding' (404510823) panicked at src/gemm.rs:1276:9:\ncast Result API panicked\n\n\nfailures:\n    gemm::contract_tests::casts_reject_dtype_and_shape_before_encoding\n\ntest result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 41 filtered out; finished in 0.04s\n\nerror: test failed, to rerun pass `--lib`\n"
+    }
+  },
+  "source_sha256_pre_concurrent_work": {
+    "Rust_MLKit/crates/metal-runtime/src/gemm.rs": "b256ea4baaa17fde74a7db3a629a65dafd882cbb2b2dedec28e74f185dc8886e",
+    "Rust_MLKit/crates/metal-runtime/src/tensor.rs": "c8c6698f1bd5835b30d005c4569c4c71fceae52b5e185ec1d2ce504882e6a351",
+    "Rust_MLKit/crates/metal-runtime/src/runtime.rs": "96c86ec801f9eea4f7ccfe4a621a8f13b247c66eb79f2a30d2db0fe9698e2bf8",
+    "Rust_MLKit/crates/metal-runtime/kernels/matmul_simdgroup.metal": "61399f24980a1379458232cb09f890355985974debb0f9d99f29e3dbfaf1a0ce",
+    "Rust_MLKit/arch_02_value_resid/metal-native/src/gemm.rs": "8cdbbde6b6f71eae7a188b47c3adc862ed77f08fbdcb7e852513f3c7059d6133",
+    "Rust_MLKit/arch_02_value_resid/metal-native/src/tensor.rs": "880391bec3664361fd2d7c03998e0fe10f056a01063fbb96121c4b8125920f72",
+    "Rust_MLKit/arch_02_value_resid/metal-native/src/runtime.rs": "add47df71bceda0554091edfd4d94dcdab398afca1c72176a89cb88259b9c487",
+    "Rust_MLKit/arch_02_value_resid/metal-native/kernels/matmul_simdgroup.metal": "61399f24980a1379458232cb09f890355985974debb0f9d99f29e3dbfaf1a0ce"
+  },
+  "validation": {
+    "baseline": {
+      "runtime": 33,
+      "native": 64
+    },
+    "hardening_before_concurrent_retune": {
+      "runtime_passed": 45,
+      "runtime_manual_benchmark_ignored": 1,
+      "native_passed": 76
+    },
+    "consumer": {
+      "gemma_passed": 134,
+      "failed": 0,
+      "ignored": 0,
+      "log": "/tmp/mlsystems-gemma-tests.log"
+    },
+    "debug_tensor_contracts_passed": 3,
+    "shader_validation": {
+      "passed": 8,
+      "ignored_manual_benchmark": 1,
+      "gpu_validation_enable_log": true,
+      "log": "/tmp/mlsystems-shader-validation.log"
+    },
+    "accum_contracts_passed": {
+      "runtime": 8,
+      "native": 8
+    },
+    "current_native": {
+      "passed": 95,
+      "failed": 0,
+      "ignored": 0,
+      "log": "/tmp/mlsystems-kernel-stress-final/05-native.log"
+    },
+    "final_audit": {
+      "serial_repetitions": 5,
+      "runtime_passed_per_run": 63,
+      "runtime_ignored_per_run": 1,
+      "native_passed_per_run": 95,
+      "gemma_passed": 132,
+      "gemma_all_targets_compiled": true,
+      "stress_cases_per_runtime_or_native_run": 288,
+      "stress_case_executions": 2880,
+      "shader_validation": {
+        "requested": true,
+        "runtime_observed": true,
+        "native_observed": true,
+        "log": "/tmp/mlsystems-kernel-shader-final/evidence.json"
+      },
+      "build_publication_contract": {
+        "cases": 9,
+        "passed": 9,
+        "log": "/tmp/mlsystems-audit-build-green.log"
+      },
+      "exact_128m_gate": {
+        "passed": true,
+        "parameter_count": 128367988,
+        "dispatches": 1679,
+        "loss_delta": 1.4305116059570312e-6,
+        "grad_norm_delta": 1.0728836059570312e-6,
+        "sampled_weight_max_delta": 5.445326678454876e-6,
+        "current_physical_mb": 13481.901359558105,
+        "induced_swap_delta_mb": 0.0,
+        "log": "/tmp/mlsystems-exact-gate-final.log"
+      },
+      "doctests": {
+        "runtime_compile_fail_thread_affinity": true,
+        "native_compile_fail_thread_affinity": true
+      },
+      "kernel_declaration_inventory": {
+        "shared_runtime": 23,
+        "training": 152,
+        "gemma": 52,
+        "note": "structural declaration inventory; not execution coverage"
+      }
+    }
+  }
+}

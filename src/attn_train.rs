@@ -184,7 +184,7 @@ pub fn attn_train_forward(
         (o, dims.q_len(), "o"),
         (lse, dims.lse_len(), "lse"),
     ] {
-        require::<f32>(rt, b, len, &format!("{WHAT} {name}"))?;
+        require::<f32>(rt, b, len, format_args!("{WHAT} {name}"))?;
     }
     let [w0, w1, w2] = ws.buffers();
     require_disjoint_writes(
@@ -269,7 +269,7 @@ pub fn attn_train_backward(
         (grads.dk, dims.kv_len(), "dk"),
         (grads.dv, dims.kv_len(), "dv"),
     ] {
-        require::<f32>(rt, b, len, &format!("{WHAT} {name}"))?;
+        require::<f32>(rt, b, len, format_args!("{WHAT} {name}"))?;
     }
     require_disjoint_writes(
         WHAT,

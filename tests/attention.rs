@@ -251,9 +251,11 @@ fn run_decode(
                     Some(nn::DecodeHeadBlock::AllHeads),
                 ] {
                     let probe = seeded(rt, s.b * s.tq * s.h * s.d, UNWRITTEN);
+                    let scratch =
+                        nn::DecodeScratch::with_chunk(rt, dims.batch, dims.heads, s.tkv, s.d as u32, chunk).unwrap();
                     nn::flash_attn_decode_with_chunk(
-                        rt, &qb, &kb, &vb, &probe, &tkv, &qo, &ko, dims, s.d as u32, s.tkv, chunk, lanes, reduce_w,
-                        sgs, false,
+                        rt, &qb, &kb, &vb, &probe, &scratch, &tkv, &qo, &ko, dims, s.d as u32, s.tkv, chunk, lanes,
+                        reduce_w, sgs, false,
                     )
                     .unwrap();
                     rt.synchronize().unwrap();
@@ -272,8 +274,9 @@ fn run_decode(
             }
         }
     }
+    let scratch = nn::DecodeScratch::new(rt, dims.batch, dims.heads, s.tkv, s.d as u32).unwrap();
     nn::flash_attn_decode(
-        rt, &qb, &kb, &vb, &o_dec, &tkv, &qo, &ko, dims, s.d as u32, s.tkv, false,
+        rt, &qb, &kb, &vb, &o_dec, &scratch, &tkv, &qo, &ko, dims, s.d as u32, s.tkv, false,
     )
     .unwrap();
     match window {
@@ -717,7 +720,11 @@ fn fast_paths_survive_extreme_score_magnitudes() {
                     window: 0,
                     scale,
                 };
-                nn::flash_attn_decode(rt, &qb, &kb, &vb, &o_dec, &tkvb, &qo, &ko, dims, d as u32, tkv, false).unwrap();
+                let scratch = nn::DecodeScratch::new(rt, dims.batch, dims.heads, tkv, d as u32).unwrap();
+                nn::flash_attn_decode(
+                    rt, &qb, &kb, &vb, &o_dec, &scratch, &tkvb, &qo, &ko, dims, d as u32, tkv, false,
+                )
+                .unwrap();
                 nn::flash_attn_rows(rt, &qb, &kb, &vb, &o_rows, &tkvb, &qo, &ko, dims, d as u32, false).unwrap();
                 rt.synchronize().unwrap();
                 let want = reference(&q, &k, &v, s, None, tkv - 1, 0, scale);
@@ -752,6 +759,9 @@ fn decode_is_immune_to_a_recycled_scratch() {
         // chunk the partial pass did not write this time, the long run's
         // partials are exactly what would be sitting there.
         let mut prev: Option<Vec<f32>> = None;
+        // One scratch for every call, as a decode loop holds it: the short
+        // calls reuse exactly the bytes the long ones wrote.
+        let scratch = nn::DecodeScratch::new(rt, 1, 4, 2000, d as u32).unwrap();
         for pass in 0..2 {
             for &tkv in &[2000usize, 300, 2000, 257] {
                 let s = Shape {
@@ -778,7 +788,10 @@ fn decode_is_immune_to_a_recycled_scratch() {
                     window: 0,
                     scale: 0.125,
                 };
-                nn::flash_attn_decode(rt, &qb, &kb, &vb, &ob, &tkvb, &qo, &ko, dims, d as u32, tkv, false).unwrap();
+                nn::flash_attn_decode(
+                    rt, &qb, &kb, &vb, &ob, &scratch, &tkvb, &qo, &ko, dims, d as u32, tkv, false,
+                )
+                .unwrap();
                 rt.synchronize().unwrap();
                 let want = reference(&q, &k, &v, s, None, tkv - 1, 0, 0.125);
                 let got = ob.read_f32()[..want.len()].to_vec();
@@ -825,7 +838,11 @@ fn fast_paths_write_bf16_output_within_bf16_resolution() {
                 scale: 0.125,
             };
             if tq == 1 {
-                nn::flash_attn_decode(rt, &qb, &kb, &vb, &o_bf, &tkvb, &qo, &ko, dims, d as u32, tkv, true).unwrap();
+                let scratch = nn::DecodeScratch::new(rt, dims.batch, dims.heads, tkv, d as u32).unwrap();
+                nn::flash_attn_decode(
+                    rt, &qb, &kb, &vb, &o_bf, &scratch, &tkvb, &qo, &ko, dims, d as u32, tkv, true,
+                )
+                .unwrap();
             } else {
                 nn::flash_attn_rows(rt, &qb, &kb, &vb, &o_bf, &tkvb, &qo, &ko, dims, d as u32, true).unwrap();
             }
@@ -1053,7 +1070,8 @@ fn attention_storage_validation_rejects_unsafe_aliases_without_dispatch() {
         let v2 = empty(rt, 2 * 128);
         let tkv = u32_buf(rt, 1);
         let zero = u32_buf(rt, 0);
-        let declared = nn::flash_attn_decode(rt, &q, &k2, &v2, &o, &tkv, &zero, &zero, dims, 128, 1, false)
+        let scratch = nn::DecodeScratch::new(rt, dims.batch, dims.heads, 2, 128).unwrap();
+        let declared = nn::flash_attn_decode(rt, &q, &k2, &v2, &o, &scratch, &tkv, &zero, &zero, dims, 128, 1, false)
             .expect_err("a caller-provided live length must not redefine the fixed batch stride");
         assert!(declared.contains("does not match the fixed K/V layout"), "{declared}");
     });
@@ -1486,8 +1504,9 @@ fn kv_batch_stride_is_independent_of_live_tkv() {
         };
 
         let split = empty(rt, B * D);
+        let scratch = nn::DecodeScratch::new(rt, dims.batch, dims.heads, CAPACITY, D as u32).unwrap();
         nn::flash_attn_decode(
-            rt, &qb, &kb, &vb, &split, &tkv, &zero, &zero, dims, D as u32, CAPACITY, false,
+            rt, &qb, &kb, &vb, &split, &scratch, &tkv, &zero, &zero, dims, D as u32, CAPACITY, false,
         )
         .unwrap();
 
@@ -1595,12 +1614,14 @@ fn the_routed_path_matches_a_direct_kv_split_dispatch() {
             nn::flash_attn_swa(rt, AttnHeadDim::D128, &qb, &kb, &vb, &routed, &tkvb, &qoff, &zero, dims).unwrap();
 
             let direct = empty(rt, b * h * d);
+            let scratch = nn::DecodeScratch::new(rt, dims.batch, dims.heads, tkv, d as u32).unwrap();
             nn::flash_attn_decode_with_chunk(
                 rt,
                 &qb,
                 &kb,
                 &vb,
                 &direct,
+                &scratch,
                 &tkvb,
                 &qoff,
                 &zero,
@@ -1915,7 +1936,8 @@ fn prefix_attention_with_masked_keys(rt: &Arc<GpuRuntime>, p: usize, suffix_len:
         }
         if tq == 1 {
             let ob = seeded(rt, b * h * D, UNWRITTEN);
-            qwen35::attn_prefix_decode(rt, &qb, prefix, &skb, &svb, &slen, &qo, &ob, dims, false).unwrap();
+            let scratch = nn::DecodeScratch::new(rt, b as u32, h as u32, p + SUFFIX_CAP, D as u32).unwrap();
+            qwen35::attn_prefix_decode(rt, &qb, prefix, &skb, &svb, &slen, &qo, &ob, &scratch, dims, false).unwrap();
             rt.synchronize().unwrap();
             let label = format!("prefix decode P={p} S={suffix_len} q={q_pos}");
             let got = ob.read_f32();
@@ -1925,4 +1947,65 @@ fn prefix_attention_with_masked_keys(rt: &Arc<GpuRuntime>, p: usize, suffix_len:
             }
         }
     }
+}
+
+/// A decode loop's scratch is the caller's: every token binds that one buffer
+/// (partial pass slot 3, reduce slot 0), so its address is the same across
+/// tokens, which a replayed command buffer needs. One too small for the call,
+/// or one that is also an operand, is refused before anything is encoded.
+#[test]
+fn decode_binds_the_callers_scratch_every_token_and_refuses_a_bad_one() {
+    with_gpu(|rt| {
+        const D: usize = 128;
+        let (h, hkv, tkv) = (4usize, 2usize, 300usize);
+        let q = buf(rt, &random_f32(h * D, 0xD1));
+        let k = buf(rt, &random_f32(tkv * hkv * D, 0xD2));
+        let v = buf(rt, &random_f32(tkv * hkv * D, 0xD3));
+        let o = empty(rt, h * D);
+        let (tkvb, zero) = (u32_buf(rt, tkv as u32), u32_buf(rt, 0));
+        let dims = AttnDims {
+            batch: 1,
+            tq: 1,
+            heads: h as u32,
+            heads_kv: hkv as u32,
+            window: 0,
+            scale: 0.125,
+        };
+        let scratch = nn::DecodeScratch::new(rt, 1, h as u32, tkv, D as u32).unwrap();
+        let decode = |o: &GpuBuffer, scratch: &nn::DecodeScratch| {
+            nn::flash_attn_decode(
+                rt, &q, &k, &v, o, scratch, &tkvb, &zero, &zero, dims, D as u32, tkv, false,
+            )
+        };
+
+        tessl::end_decode_icb_capture();
+        tessl::begin_decode_icb_capture();
+        let results = [decode(&o, &scratch), decode(&o, &scratch)];
+        let capture = tessl::take_decode_icb_capture().expect("decode capture");
+        results.into_iter().for_each(|r| r.expect("decode"));
+        rt.synchronize().unwrap();
+        assert_eq!(capture.commands.len(), 4, "two tokens of partial + reduce");
+        for (cmd, slot) in [(0, 3), (1, 0), (2, 3), (3, 0)] {
+            let at = capture.commands[cmd]
+                .binds
+                .iter()
+                .find_map(|b| match b {
+                    tessl::DecodeIcbBind::Buf { index, buf, .. } if *index == slot => Some(buf),
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("command {cmd} binds nothing at slot {slot}"));
+            assert!(
+                std::ptr::eq(at.metal(), scratch.buffer().metal()),
+                "command {cmd} slot {slot} is not the caller's scratch"
+            );
+        }
+
+        rt.take_dispatch_count();
+        let small = nn::DecodeScratch::new(rt, 1, h as u32, 100, D as u32).unwrap();
+        let err = decode(&o, &small).expect_err("a scratch sized for 100 keys cannot serve 300");
+        assert!(err.contains("scratch"), "{err}");
+        let err = decode(scratch.buffer(), &scratch).expect_err("the output may not be the scratch");
+        assert!(err.contains("overlaps"), "{err}");
+        assert_eq!(rt.take_dispatch_count(), 0, "a refused call encoded something");
+    });
 }

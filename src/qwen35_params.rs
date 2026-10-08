@@ -381,7 +381,7 @@ pub(crate) fn slots<'a>(m: &'a Qwen35Model, grads: Option<&'a Qwen35Grads>) -> R
     // writes through them.
     for s in &out {
         if let Some(g) = s.grad {
-            require_runtime(&m.rt, g.buffer(), &format!("{}'s gradient", s.info.name))?;
+            require_runtime(&m.rt, g.buffer(), format_args!("{}'s gradient", s.info.name))?;
         }
     }
     Ok(out)
@@ -396,7 +396,7 @@ pub(crate) fn check(what: &str, rt: &Arc<GpuRuntime>, slots: &[Slot<'_>], ts: &[
         if !Arc::ptr_eq(t.runtime(), rt) {
             return Err(format!("{what}: {} belongs to a different runtime", s.info.name));
         }
-        require_runtime(rt, &t.buffer, &format!("{what}: {}", s.info.name))?;
+        require_runtime(rt, &t.buffer, format_args!("{what}: {}", s.info.name))?;
         let want = s.info.storage_shape();
         if t.dtype != DType::F32 || t.shape() != want.as_slice() {
             return Err(format!(

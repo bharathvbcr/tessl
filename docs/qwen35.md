@@ -188,7 +188,11 @@ keys in series per (row, head), so the decode path splits them into 128-key
 chunks across simdgroups and then reduces. Both passes are
 `flash_attn_decode`'s D=256 instantiation (chunk 128, R=16, a GQA group per
 threadgroup), with the key address and the live key count `P + S` changed.
-It returns the same bits as `nn::flash_attn_decode` over the copy.
+It returns the same bits as `nn::flash_attn_decode` over the copy. Both take
+the partial pass's per-chunk results in a caller-owned `nn::DecodeScratch`,
+sized once for the largest call (`batch`, `heads`, `P + suffix capacity` keys)
+and passed every token, so a decode loop neither allocates per call nor moves
+the buffer between tokens.
 
 The live suffix length and query position are one device `u32` each, shared by
 every row, like `flash_attn_rows`' `tkv`. For questions of different lengths,

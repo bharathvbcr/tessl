@@ -367,7 +367,7 @@ impl PendingStep {
             return Err(format!("{WHAT}: position {bad} >= {} tokens", self.t));
         }
         let rt = self.xf.runtime();
-        require_runtime(rt, &out.buffer, &format!("{WHAT}: out"))?;
+        require_runtime(rt, &out.buffer, format_args!("{WHAT}: out"))?;
         if out.overlaps(&self.xf) {
             return Err(format!("{WHAT}: out overlaps the step's own storage"));
         }
@@ -644,7 +644,7 @@ impl Qwen35Model {
         ];
         let dtype_ok = |d: DType| matches!(d, DType::F32 | DType::BF16);
         for (name, (b, _, n, d), (_, _, want, _)) in top {
-            require_runtime(&self.rt, b, &format!("{what}: the bank's {name}"))?;
+            require_runtime(&self.rt, b, format_args!("{what}: the bank's {name}"))?;
             if n != want || b.nbytes() == 0 || !dtype_ok(d) {
                 return Err(format!(
                     "{what}: the bank's {name} holds {n} {d:?} values, the weight {want} (f32 or bf16)"
@@ -657,7 +657,7 @@ impl Qwen35Model {
                 return Err(format!("{what}: layer {i}'s gradients are not its mixer's"));
             }
             for (k, ((b, _, n, d), (_, _, w, _))) in have.iter().zip(&want).enumerate() {
-                require_runtime(&self.rt, b, &format!("{what}: layer {i} buffer {k}"))?;
+                require_runtime(&self.rt, b, format_args!("{what}: layer {i} buffer {k}"))?;
                 if n != w || !dtype_ok(*d) {
                     return Err(format!(
                         "{what}: layer {i} buffer {k} holds {n} {d:?} values, its weight {w} (f32 or bf16)"
@@ -953,7 +953,7 @@ impl Qwen35Model {
             ));
         }
         if let Some((pos, g)) = dh {
-            require_runtime(&self.rt, &g.buffer, &format!("{what}: dh"))?;
+            require_runtime(&self.rt, &g.buffer, format_args!("{what}: dh"))?;
             check_scatter_rows(what, g, pos, p.t as usize, self.cfg.hidden as usize)?;
             if g.overlaps(&p.dxf) {
                 return Err(format!("{what}: dh overlaps the step's own storage"));

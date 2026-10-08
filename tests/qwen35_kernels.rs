@@ -2601,13 +2601,15 @@ fn prefix_case(
             len: p as u32,
         };
         if decode {
-            qwen35::attn_prefix_decode(rt, &q, prefix, &skb, &svb, &slen, &qpos, &got, dims, bf16).unwrap();
+            let scratch = tessl::nn::DecodeScratch::new(rt, dims.batch, dims.heads, full_cap, PFX_D as u32).unwrap();
+            qwen35::attn_prefix_decode(rt, &q, prefix, &skb, &svb, &slen, &qpos, &got, &scratch, dims, bf16).unwrap();
             tessl::nn::flash_attn_decode(
                 rt,
                 &q,
                 &fkb,
                 &fvb,
                 &want,
+                &scratch,
                 &tkv,
                 &qpos,
                 &zero,
@@ -2996,8 +2998,9 @@ fn prefix_varlen_case(
     let n = batch * per_q;
     let got = seeded(rt, n, SENTINEL);
     let dims = pfx_dims(batch, tq);
+    let scratch = tessl::nn::DecodeScratch::new(rt, batch as u32, PFX_HQ as u32, p + s_cap, PFX_D as u32).unwrap();
     if decode {
-        qwen35::attn_prefix_decode_varlen(rt, &q, prefix, &skb, &svb, &lb, &qb, &got, dims, false)
+        qwen35::attn_prefix_decode_varlen(rt, &q, prefix, &skb, &svb, &lb, &qb, &got, &scratch, dims, false)
     } else {
         qwen35::attn_prefix_rows_varlen(rt, &q, prefix, &skb, &svb, &lb, &qb, &got, dims, false)
     }
@@ -3011,7 +3014,7 @@ fn prefix_varlen_case(
         let want = seeded(rt, per_q, SENTINEL);
         let d1 = pfx_dims(1, tq);
         if decode {
-            qwen35::attn_prefix_decode(rt, &q1, prefix, &sk1, &sv1, &l1, &p1, &want, d1, false)
+            qwen35::attn_prefix_decode(rt, &q1, prefix, &sk1, &sv1, &l1, &p1, &want, &scratch, d1, false)
         } else {
             qwen35::attn_prefix_rows(rt, &q1, prefix, &sk1, &sv1, &l1, &p1, &want, d1, false)
         }
@@ -3211,8 +3214,9 @@ fn attn_prefix_rows_rejects_bad_shapes_and_aliases() {
         expect_err(run(prefix, &o, grouped), "is not a multiple of heads_kv");
         // The decode path takes one query per row, and shares every other
         // check with the rows path.
+        let scratch = tessl::nn::DecodeScratch::new(rt, b as u32, PFX_HQ as u32, p + 1 + s_cap, PFX_D as u32).unwrap();
         let decode = |prefix: qwen35::SharedPrefix<'_>, dims: tessl::nn::AttnDims| {
-            qwen35::attn_prefix_decode(rt, &q, prefix, &sk, &sv, &slen, &qpos, &o, dims, false)
+            qwen35::attn_prefix_decode(rt, &q, prefix, &sk, &sv, &slen, &qpos, &o, &scratch, dims, false)
         };
         expect_err(decode(prefix, pfx_dims(b, tq)), "one query per row (tq = 1)");
         expect_err(decode(too_long, pfx_dims(b, 1)), "exceeds the prefix K/V capacity");

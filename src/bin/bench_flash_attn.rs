@@ -309,9 +309,9 @@ fn u32_buf(rt: &Arc<GpuRuntime>, v: u32) -> Result<GpuBuffer, String> {
     Ok(b)
 }
 
-/// The seven buffers every attention dispatch needs. Bundled so the launch and
-/// timing helpers take one operand set rather than a seven-argument tail whose
-/// order is easy to transpose silently.
+/// The seven buffers every attention dispatch needs, plus the decode
+/// scratch. Bundled so the launch and timing helpers take one operand set
+/// rather than a seven-argument tail whose order is easy to transpose silently.
 struct Bufs<'a> {
     q: &'a GpuBuffer,
     k: &'a GpuBuffer,
@@ -320,6 +320,8 @@ struct Bufs<'a> {
     tkv: &'a GpuBuffer,
     qo: &'a GpuBuffer,
     ko: &'a GpuBuffer,
+    /// Sized at the smallest chunk, so it serves every chunk a sweep picks.
+    scratch: &'a nn::DecodeScratch,
 }
 
 /// Which implementation a lane measures.
@@ -453,6 +455,7 @@ fn launch_impl(
             b.k,
             b.v,
             b.o,
+            b.scratch,
             b.tkv,
             b.qo,
             b.ko,
@@ -734,6 +737,14 @@ fn run() -> Result<(), String> {
         let tkv = u32_buf(&rt, c.tkv as u32)?;
         let qo = u32_buf(&rt, c.q_off as u32)?;
         let ko = u32_buf(&rt, c.kv_off as u32)?;
+        let scratch = nn::DecodeScratch::with_chunk(
+            &rt,
+            c.b as u32,
+            c.h as u32,
+            c.tkv,
+            c.d as u32,
+            nn::DecodeChunk::C64,
+        )?;
 
         let bufs = Bufs {
             q: &q,
@@ -743,6 +754,7 @@ fn run() -> Result<(), String> {
             tkv: &tkv,
             qo: &qo,
             ko: &ko,
+            scratch: &scratch,
         };
         // Every Tq == 1 config is timed on both implementations in the same
         // run, so the comparison cannot pick up drift between two invocations.

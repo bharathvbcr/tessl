@@ -209,7 +209,7 @@ pub fn bias_residual_layer_norm(
     require::<f32>(rt, y, n, "bias_residual_layer_norm y")?;
     require::<f32>(rt, resid, n, "bias_residual_layer_norm resid")?;
     for (name, buf) in [("bias", bias), ("w", w), ("b", b)] {
-        require::<f32>(rt, buf, dim as usize, &format!("bias_residual_layer_norm {name}"))?;
+        require::<f32>(rt, buf, dim as usize, format_args!("bias_residual_layer_norm {name}"))?;
     }
     if rows == 0 {
         return Ok(());
@@ -289,8 +289,8 @@ fn bias_elementwise(
     if n > u32::MAX as usize {
         return Err(format!("{what}: {n} elements exceeds the kernel's u32 index"));
     }
-    require::<f32>(rt, x, n, &format!("{what} x"))?;
-    require::<f32>(rt, bias, cols as usize, &format!("{what} bias"))?;
+    require::<f32>(rt, x, n, format_args!("{what} x"))?;
+    require::<f32>(rt, bias, cols as usize, format_args!("{what} bias"))?;
     if n == 0 {
         return Ok(());
     }

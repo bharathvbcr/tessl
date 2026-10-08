@@ -68,6 +68,22 @@ All notable changes to `tessl` are recorded here. The format follows
   group. A caller that relied on the sampler's own `Err` must now call
   `check_argmax_result`. The first `argmax_f32_pass` binds `logits` in its
   unused `idx_in` slot instead of allocating a 4-byte placeholder.
+- **Decode attention takes a caller-owned `nn::DecodeScratch`.**
+  `nn::flash_attn_decode`, `nn::flash_attn_decode_with_chunk`,
+  `qwen35::attn_prefix_decode` and `qwen35::attn_prefix_decode_varlen` take
+  a `&DecodeScratch` (after `o`) instead of allocating the partial pass's
+  scratch on every call, so a decode loop binds one buffer at one address
+  every token. Size it with `DecodeScratch::new(rt, batch, heads,
+  key_capacity, head_dim)` (`with_chunk` for an explicit chunk); a scratch too
+  small for the call, or one that is also an operand, is refused before
+  anything is encoded. The `nn::flash_attn` router keeps its signature and
+  sizes a scratch per call. This breaks callers of the four functions.
+- **Decode-path validation allocates nothing on success.** The buffer checks
+  take their error label as any `Display`, so call sites pass `format_args!`
+  and format only on failure, and the GDN, conv and QK-norm/RoPE entry points
+  check optional operands without collecting them into a `Vec`.
+  `tests/host_path_allocs.rs` counts heap allocations per call across every
+  entry point a batch-1 Qwen3.5 decode token encodes, and holds them at zero.
 - **Pipeline cache hits allocate nothing.** `GpuRuntime::pipeline` keeps
   plain and ICB-capable pipelines in separate maps, so the ICB mode no longer
   formats an `icb:{name}` key per call; a miss looks the function up once per

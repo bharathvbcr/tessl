@@ -49,6 +49,7 @@
 //! }
 //! ```
 
+use std::fmt;
 use std::sync::Arc;
 
 use objc2::runtime::ProtocolObject;
@@ -85,7 +86,10 @@ fn require_1d_indexable(n: usize, what: &str) -> Result<(), String> {
     Ok(())
 }
 
-pub(crate) fn require_runtime(rt: &GpuRuntime, buf: &GpuBuffer, what: &str) -> Result<(), String> {
+/// `what` labels the error. It is any `Display`, so a caller can pass
+/// `format_args!` and pay for formatting only when the check fails: these run
+/// on every dispatch.
+pub(crate) fn require_runtime(rt: &GpuRuntime, buf: &GpuBuffer, what: impl fmt::Display) -> Result<(), String> {
     if !buf.belongs_to(rt) {
         return Err(format!("{what}: buffer belongs to another runtime"));
     }
@@ -119,7 +123,7 @@ pub fn validate_buffer_byte_range(
     checked_buffer_byte_range(buf.nbytes(), byte_offset, byte_len, what)
 }
 
-fn require_capacity<T>(buf: &GpuBuffer, need: usize, what: &str) -> Result<(), String> {
+fn require_capacity<T>(buf: &GpuBuffer, need: usize, what: impl fmt::Display) -> Result<(), String> {
     let have = capacity_of::<T>(buf);
     if have < need {
         return Err(format!(
@@ -129,7 +133,12 @@ fn require_capacity<T>(buf: &GpuBuffer, need: usize, what: &str) -> Result<(), S
     Ok(())
 }
 
-pub(crate) fn require<T>(rt: &GpuRuntime, buf: &GpuBuffer, need: usize, what: &str) -> Result<(), String> {
+pub(crate) fn require<T>(
+    rt: &GpuRuntime,
+    buf: &GpuBuffer,
+    need: usize,
+    what: impl fmt::Display + Copy,
+) -> Result<(), String> {
     require_runtime(rt, buf, what)?;
     require_capacity::<T>(buf, need, what)
 }
@@ -139,13 +148,33 @@ pub(crate) fn require_disjoint_writes(
     writes: &[(&str, &GpuBuffer)],
     reads: &[(&str, &GpuBuffer)],
 ) -> Result<(), String> {
-    for (i, &(lhs_name, lhs)) in writes.iter().enumerate() {
-        for &(rhs_name, rhs) in &writes[i + 1..] {
+    require_disjoint(entry, writes.iter().copied(), reads.iter().copied())
+}
+
+/// [`require_disjoint_writes`] over operands that may be absent: `None`
+/// entries are skipped, so a call with optional buffers checks them without
+/// collecting the present ones into a `Vec` on every dispatch.
+pub(crate) fn require_disjoint_writes_opt(
+    entry: &str,
+    writes: &[Option<(&str, &GpuBuffer)>],
+    reads: &[Option<(&str, &GpuBuffer)>],
+) -> Result<(), String> {
+    require_disjoint(entry, writes.iter().flatten().copied(), reads.iter().flatten().copied())
+}
+
+fn require_disjoint<'a>(
+    entry: &str,
+    writes: impl Iterator<Item = (&'a str, &'a GpuBuffer)> + Clone,
+    reads: impl Iterator<Item = (&'a str, &'a GpuBuffer)> + Clone,
+) -> Result<(), String> {
+    let mut rest = writes;
+    while let Some((lhs_name, lhs)) = rest.next() {
+        for (rhs_name, rhs) in rest.clone() {
             if lhs.aliases(rhs) {
                 return Err(format!("{entry}: writable buffers {lhs_name} and {rhs_name} overlap"));
             }
         }
-        for &(read_name, read) in reads {
+        for (read_name, read) in reads.clone() {
             if lhs.aliases(read) {
                 return Err(format!(
                     "{entry}: writable buffer {lhs_name} overlaps read-only buffer {read_name}"
@@ -264,7 +293,7 @@ fn require_attn_runtime(
     what: &str,
 ) -> Result<(), String> {
     for (name, buffer) in [("q", q), ("k", k), ("v", v), ("o", o)] {
-        require_runtime(rt, buffer, &format!("{what} {name}"))?;
+        require_runtime(rt, buffer, format_args!("{what} {name}"))?;
     }
     Ok(())
 }
@@ -1290,6 +1319,88 @@ pub fn decode_lanes_for(d: u32) -> RowsLanes {
     }
 }
 
+/// Partial-pass scratch for the split-KV decode attention
+/// ([`flash_attn_decode`], [`crate::qwen35::attn_prefix_decode`]):
+/// `head_dim + 2` f32 per (batch row, query head, key chunk).
+///
+/// Allocate one for the largest call and pass it every token. Its address then
+/// stays the same across tokens, which a replayed command buffer needs, and no
+/// call pays a pool lookup for it. It is never zeroed: each call's reduce pass
+/// reads only the chunks its own partial pass wrote. Successive calls may
+/// share one: the runtime orders each call's passes after the previous call's.
+pub struct DecodeScratch {
+    buf: GpuBuffer,
+}
+
+impl DecodeScratch {
+    /// Scratch for calls of up to `batch` rows of `heads` query heads over up
+    /// to `key_capacity` keys (K/V capacity; for a shared prefix, its length
+    /// plus the suffix capacity), at `head_dim`'s default chunk.
+    pub fn new(rt: &GpuRuntime, batch: u32, heads: u32, key_capacity: usize, head_dim: u32) -> Result<Self, String> {
+        Self::with_chunk(rt, batch, heads, key_capacity, head_dim, decode_chunk_for(head_dim))
+    }
+
+    /// [`Self::new`] for an explicit chunk ([`flash_attn_decode_with_chunk`]).
+    pub fn with_chunk(
+        rt: &GpuRuntime,
+        batch: u32,
+        heads: u32,
+        key_capacity: usize,
+        head_dim: u32,
+        chunk: DecodeChunk,
+    ) -> Result<Self, String> {
+        let elems = decode_scratch_elems(batch, heads, key_capacity, head_dim, chunk.keys(), "DecodeScratch")?;
+        let bytes = elems
+            .max(1)
+            .checked_mul(std::mem::size_of::<f32>())
+            .ok_or("DecodeScratch: byte size overflows")?;
+        Ok(Self {
+            buf: rt.alloc_buffer(bytes)?,
+        })
+    }
+
+    pub fn buffer(&self) -> &GpuBuffer {
+        &self.buf
+    }
+
+    /// Check this scratch can serve a call of `batch x heads` over
+    /// `key_capacity` keys in `chunk_keys`-key chunks, and that it is none of
+    /// the call's operands. Returns the chunk count the grid covers.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn check(
+        &self,
+        rt: &GpuRuntime,
+        what: &str,
+        batch: u32,
+        heads: u32,
+        key_capacity: usize,
+        head_dim: u32,
+        chunk_keys: usize,
+        operands: &[(&str, &GpuBuffer)],
+    ) -> Result<usize, String> {
+        let need = decode_scratch_elems(batch, heads, key_capacity, head_dim, chunk_keys, what)?;
+        require::<f32>(rt, &self.buf, need, format_args!("{what} scratch"))?;
+        require_disjoint_writes(what, &[("scratch", &self.buf)], operands)?;
+        Ok(key_capacity.div_ceil(chunk_keys).max(1))
+    }
+}
+
+/// f32 elements of decode scratch: `batch * heads * chunks * (head_dim + 2)`.
+fn decode_scratch_elems(
+    batch: u32,
+    heads: u32,
+    key_capacity: usize,
+    head_dim: u32,
+    chunk_keys: usize,
+    what: &str,
+) -> Result<usize, String> {
+    let chunks = key_capacity.div_ceil(chunk_keys).max(1);
+    [heads as usize, chunks, head_dim as usize + 2]
+        .into_iter()
+        .try_fold(batch as usize, usize::checked_mul)
+        .ok_or_else(|| format!("{what}: partial scratch size overflows"))
+}
+
 /// Single-query attention, split over the KV sequence (FlashDecoding).
 ///
 /// The general kernels tile over query rows, so at `Tq == 1` they run one live
@@ -1310,6 +1421,7 @@ pub fn flash_attn_decode(
     k: &GpuBuffer,
     v: &GpuBuffer,
     o: &GpuBuffer,
+    scratch: &DecodeScratch,
     tkv: &GpuBuffer,
     q_pos_offset: &GpuBuffer,
     kv_pos_offset: &GpuBuffer,
@@ -1326,6 +1438,7 @@ pub fn flash_attn_decode(
         k,
         v,
         o,
+        scratch,
         tkv,
         q_pos_offset,
         kv_pos_offset,
@@ -1348,6 +1461,7 @@ pub fn flash_attn_decode_with_chunk(
     k: &GpuBuffer,
     v: &GpuBuffer,
     o: &GpuBuffer,
+    scratch: &DecodeScratch,
     tkv: &GpuBuffer,
     q_pos_offset: &GpuBuffer,
     kv_pos_offset: &GpuBuffer,
@@ -1397,24 +1511,32 @@ pub fn flash_attn_decode_with_chunk(
              layout capacity {actual_kv_capacity}"
         ));
     }
-    let chunks = (kv_capacity as usize).div_ceil(chunk.keys()).max(1);
-    let stride = head_dim as usize + 2;
-    let scratch_elems = bh
-        .checked_mul(chunks)
-        .and_then(|x| x.checked_mul(stride))
-        .ok_or("flash_attn_decode: partial scratch size overflows")?;
-    let scratch_bytes = scratch_elems
-        .checked_mul(std::mem::size_of::<f32>())
-        .ok_or("flash_attn_decode: partial scratch byte size overflows")?;
-    let scratch = rt.alloc_buffer(scratch_bytes)?;
+    let chunks = scratch.check(
+        rt,
+        "flash_attn_decode",
+        dims.batch,
+        dims.heads,
+        kv_capacity as usize,
+        head_dim,
+        chunk.keys(),
+        &[
+            ("q", q),
+            ("k", k),
+            ("v", v),
+            ("o", o),
+            ("tkv", tkv),
+            ("q_pos_offset", q_pos_offset),
+            ("kv_pos_offset", kv_pos_offset),
+        ],
+    )?;
+    let scratch = scratch.buffer();
     // Deliberately not zeroed. The reduce pass reads chunks
     // `0 .. ceil(Tkv/KV_CHUNK)`, and the partial pass returns early only for
     // `chunk * KV_CHUNK >= Tkv` -- which by construction is exactly the chunks
     // outside that range. So every slot the reduce reads was written by this
-    // dispatch, and zero-filling was a 66 KB host allocation and memcpy on
-    // every decode step. `decode_is_immune_to_a_recycled_scratch` is what
-    // holds that invariant: it alternates long and short histories through the
-    // pooled buffer, so a stale partial would be exactly what it reads.
+    // dispatch. `decode_is_immune_to_a_recycled_scratch` is what holds that
+    // invariant: it alternates long and short histories through one scratch,
+    // so a stale partial would be exactly what it reads.
 
     // Query heads that walk the same K/V go in one threadgroup, so grid.y
     // enumerates (batch, head-block) and the threadgroup is `sgs` simdgroups
@@ -1465,7 +1587,7 @@ pub fn flash_attn_decode_with_chunk(
         set_gpu_buf(bnd, q, 0);
         set_gpu_buf(bnd, k, 1);
         set_gpu_buf(bnd, v, 2);
-        set_gpu_buf(bnd, &scratch, 3);
+        set_gpu_buf(bnd, scratch, 3);
         set_u32(bnd, dims.batch, 4);
         set_gpu_buf(bnd, tkv, 6);
         set_u32(bnd, dims.heads, 7);
@@ -1481,7 +1603,7 @@ pub fn flash_attn_decode_with_chunk(
         }
 
         bnd.set_pipeline(&r);
-        set_gpu_buf(bnd, &scratch, 0);
+        set_gpu_buf(bnd, scratch, 0);
         set_gpu_buf(bnd, o, 1);
         set_u32(bnd, dims.batch, 2);
         set_gpu_buf(bnd, tkv, 3);
@@ -1785,9 +1907,9 @@ pub(crate) fn validate_rows_attn_call(
     require_attn_runtime(rt, q, k, v, o, what)?;
     let kv_capacity = validate_attn_storage_for(dims, head_dim, q, k, v, o, what, out_bf16)?;
     validate_attn_live_scalar_aliases(dims, o, tkv, q_pos_offset, kv_pos_offset, what)?;
-    require::<u32>(rt, tkv, 1, &format!("{what} tkv"))?;
-    require::<u32>(rt, q_pos_offset, 1, &format!("{what} q_pos_offset"))?;
-    require::<u32>(rt, kv_pos_offset, 1, &format!("{what} kv_pos_offset"))?;
+    require::<u32>(rt, tkv, 1, format_args!("{what} tkv"))?;
+    require::<u32>(rt, q_pos_offset, 1, format_args!("{what} q_pos_offset"))?;
+    require::<u32>(rt, kv_pos_offset, 1, format_args!("{what} kv_pos_offset"))?;
     Ok(kv_capacity)
 }
 
@@ -1868,20 +1990,27 @@ fn route_attn(
     // bound before indexing either buffer.
     let capacity = attn_kv_capacity_for(k, v, dims.batch, dims.heads_kv, head_dim, "flash_attn")?;
     match attn_kernel_for(dims.tq, capacity as usize) {
-        AttnKernel::SplitKv => flash_attn_decode(
-            rt,
-            q,
-            k,
-            v,
-            o,
-            tkv,
-            q_pos_offset,
-            kv_pos_offset,
-            dims,
-            head_dim,
-            capacity as usize,
-            out_bf16,
-        ),
+        AttnKernel::SplitKv => {
+            // The router holds no state between calls, so it sizes a scratch
+            // per call. A decode loop calls `flash_attn_decode` with its own
+            // `DecodeScratch` instead, and keeps one address across tokens.
+            let scratch = DecodeScratch::new(rt, dims.batch, dims.heads, capacity as usize, head_dim)?;
+            flash_attn_decode(
+                rt,
+                q,
+                k,
+                v,
+                o,
+                &scratch,
+                tkv,
+                q_pos_offset,
+                kv_pos_offset,
+                dims,
+                head_dim,
+                capacity as usize,
+                out_bf16,
+            )
+        }
         AttnKernel::Rows => flash_attn_rows(
             rt,
             q,
@@ -2230,16 +2359,16 @@ fn validate_attn_dims(
         return Err(format!("{what}: B*H grid extent {grid_y} exceeds Metal uint indexing"));
     }
     let n = elems_product(&[dims.batch, dims.tq, dims.heads, d], what)?;
-    require_capacity::<f32>(q, n, &format!("{what} q"))?;
+    require_capacity::<f32>(q, n, format_args!("{what} q"))?;
     if out_bf16 {
         // `out_bf16` exists to halve this buffer — the kernel writes `bfloat`
         // into it. Validating `o` as f32 regardless demanded twice the memory
         // the kernel touches, so a caller who sized it correctly for bf16 got
         // "buffer holds 2560 elements, kernel reads/writes 5120" and the
         // documented half-width scratch was unreachable.
-        require_capacity::<u16>(o, n, &format!("{what} o (bf16)"))?;
+        require_capacity::<u16>(o, n, format_args!("{what} o (bf16)"))?;
     } else {
-        require_capacity::<f32>(o, n, &format!("{what} o"))?;
+        require_capacity::<f32>(o, n, format_args!("{what} o"))?;
     }
     Ok(())
 }
@@ -3123,9 +3252,9 @@ impl Q4Bank<'_> {
         }
         let groups = shape.groups()?;
         let weights = elems(shape.rows, shape.cols, what)?;
-        require::<u8>(rt, self.packed, weights.div_ceil(2), &format!("{what} packed"))?;
-        require::<f32>(rt, self.scales, groups, &format!("{what} scales"))?;
-        require::<f32>(rt, self.zeros, groups, &format!("{what} zeros"))?;
+        require::<u8>(rt, self.packed, weights.div_ceil(2), format_args!("{what} packed"))?;
+        require::<f32>(rt, self.scales, groups, format_args!("{what} scales"))?;
+        require::<f32>(rt, self.zeros, groups, format_args!("{what} zeros"))?;
         Ok(())
     }
 }
@@ -3188,13 +3317,13 @@ impl Q4MlxBank<'_> {
         }
         let groups = shape.groups()?;
         let weights = elems(shape.rows, shape.cols, what)?;
-        require::<u8>(rt, self.packed, weights.div_ceil(2), &format!("{what} packed"))?;
+        require::<u8>(rt, self.packed, weights.div_ceil(2), format_args!("{what} packed"))?;
         // One bfloat2 = two u16 = 4 bytes per group.
         require::<u32>(
             rt,
             self.scales_biases,
             groups,
-            &format!("{what} scales_biases (bfloat2 per group)"),
+            format_args!("{what} scales_biases (bfloat2 per group)"),
         )?;
         Ok(())
     }
@@ -3244,8 +3373,8 @@ pub fn validate_gemv_q4(
 ) -> Result<(), String> {
     let entry = if tiled { "gemv_q4_tiled" } else { "gemv_q4" };
     bank.validate(rt, &shape, entry)?;
-    require::<f32>(rt, x, shape.cols as usize, &format!("{entry} x"))?;
-    require::<f32>(rt, y, shape.rows as usize, &format!("{entry} y"))?;
+    require::<f32>(rt, x, shape.cols as usize, format_args!("{entry} x"))?;
+    require::<f32>(rt, y, shape.rows as usize, format_args!("{entry} y"))?;
     if shape.rows == 0 {
         return Ok(());
     }
@@ -3602,8 +3731,8 @@ fn validate_gemv_q4_mlx_f32_inputs(
     entry: &str,
 ) -> Result<(), String> {
     bank.validate(rt, &shape, 1, entry)?;
-    require::<f32>(rt, x, shape.cols as usize, &format!("{entry} x"))?;
-    require::<f32>(rt, y, shape.rows as usize, &format!("{entry} y"))?;
+    require::<f32>(rt, x, shape.cols as usize, format_args!("{entry} x"))?;
+    require::<f32>(rt, y, shape.rows as usize, format_args!("{entry} y"))?;
     if shape.rows == 0 {
         return Ok(());
     }
@@ -3822,10 +3951,10 @@ pub fn validate_gemv_q4_mlx_simd(
         (true, Q4MlxLayout::Interleaved4) => "gemv_q4_mlx_simd_add_i4",
     };
     bank.validate(rt, &shape, layout.tile_rows(), entry)?;
-    require::<u16>(rt, x_bf16, shape.cols as usize, &format!("{entry} x_bf16"))?;
-    require::<f32>(rt, y, shape.rows as usize, &format!("{entry} y"))?;
+    require::<u16>(rt, x_bf16, shape.cols as usize, format_args!("{entry} x_bf16"))?;
+    require::<f32>(rt, y, shape.rows as usize, format_args!("{entry} y"))?;
     if let Some(r) = resid {
-        require::<f32>(rt, r, shape.rows as usize, &format!("{entry} resid"))?;
+        require::<f32>(rt, r, shape.rows as usize, format_args!("{entry} resid"))?;
     }
     if shape.rows == 0 {
         return Ok(());
@@ -3959,13 +4088,13 @@ pub unsafe fn gemv_q4_mlx_gate_up_gelu_with_scalars(
     gate.validate(rt, &shape, tile_rows, &format!("{entry} gate"))?;
     up.validate(rt, &shape, tile_rows, &format!("{entry} up"))?;
     match dispatch {
-        GateUpDispatch::Simd(_) => require::<u16>(rt, x, shape.cols as usize, &format!("{entry} x"))?,
-        GateUpDispatch::Blocked => require::<f32>(rt, x, shape.cols as usize, &format!("{entry} x"))?,
+        GateUpDispatch::Simd(_) => require::<u16>(rt, x, shape.cols as usize, format_args!("{entry} x"))?,
+        GateUpDispatch::Blocked => require::<f32>(rt, x, shape.cols as usize, format_args!("{entry} x"))?,
     }
     if mid_as_bf16 {
-        require::<u16>(rt, mid, shape.rows as usize, &format!("{entry} mid (bf16)"))?;
+        require::<u16>(rt, mid, shape.rows as usize, format_args!("{entry} mid (bf16)"))?;
     } else {
-        require::<f32>(rt, mid, shape.rows as usize, &format!("{entry} mid"))?;
+        require::<f32>(rt, mid, shape.rows as usize, format_args!("{entry} mid"))?;
     }
     if shape.rows == 0 {
         return Ok(());
@@ -4054,9 +4183,9 @@ pub unsafe fn gemv_q4_mlx_kv_with_scalars(
     };
     k.validate(rt, &shape, layout.tile_rows(), &format!("{entry} k"))?;
     v.validate(rt, &shape, layout.tile_rows(), &format!("{entry} v"))?;
-    require::<u16>(rt, x_bf16, shape.cols as usize, &format!("{entry} x_bf16"))?;
-    require::<f32>(rt, k_out, shape.rows as usize, &format!("{entry} k_out"))?;
-    require::<f32>(rt, v_out, shape.rows as usize, &format!("{entry} v_out"))?;
+    require::<u16>(rt, x_bf16, shape.cols as usize, format_args!("{entry} x_bf16"))?;
+    require::<f32>(rt, k_out, shape.rows as usize, format_args!("{entry} k_out"))?;
+    require::<f32>(rt, v_out, shape.rows as usize, format_args!("{entry} v_out"))?;
     if shape.rows == 0 {
         return Ok(());
     }
@@ -4185,10 +4314,10 @@ pub unsafe fn gemv_q4_mlx_qkv_with_scalars(
     q.validate(rt, &q_shape, layout.tile_rows(), &format!("{entry} q"))?;
     k.validate(rt, &kv_shape, layout.tile_rows(), &format!("{entry} k"))?;
     v.validate(rt, &kv_shape, layout.tile_rows(), &format!("{entry} v"))?;
-    require::<u16>(rt, x_bf16, cols as usize, &format!("{entry} x_bf16"))?;
-    require::<f32>(rt, out.q_out, rows_q as usize, &format!("{entry} q_out"))?;
-    require::<f32>(rt, out.k_out, rows_kv as usize, &format!("{entry} k_out"))?;
-    require::<f32>(rt, out.v_out, rows_kv as usize, &format!("{entry} v_out"))?;
+    require::<u16>(rt, x_bf16, cols as usize, format_args!("{entry} x_bf16"))?;
+    require::<f32>(rt, out.q_out, rows_q as usize, format_args!("{entry} q_out"))?;
+    require::<f32>(rt, out.k_out, rows_kv as usize, format_args!("{entry} k_out"))?;
+    require::<f32>(rt, out.v_out, rows_kv as usize, format_args!("{entry} v_out"))?;
     if rows_q == 0 && rows_kv == 0 {
         return Ok(());
     }
@@ -4321,10 +4450,10 @@ pub unsafe fn gemm_q4_mlx_with_scalars(
     }
     bank.validate(rt, &shape, layout.tile_rows(), entry)?;
     let out_elems = elems(m, shape.rows, entry)?;
-    require::<u16>(rt, x_bf16, elems(m, shape.cols, entry)?, &format!("{entry} x_bf16"))?;
-    require::<f32>(rt, y, out_elems, &format!("{entry} y"))?;
+    require::<u16>(rt, x_bf16, elems(m, shape.cols, entry)?, format_args!("{entry} x_bf16"))?;
+    require::<f32>(rt, y, out_elems, format_args!("{entry} y"))?;
     if let Some(r) = resid {
-        require::<f32>(rt, r, out_elems, &format!("{entry} resid"))?;
+        require::<f32>(rt, r, out_elems, format_args!("{entry} resid"))?;
     }
     if shape.rows == 0 {
         return Ok(());
@@ -4431,8 +4560,8 @@ fn row_reduce(
         RowOut::WholeRow => cols,
         RowOut::Scalar => 1,
     };
-    require::<f32>(rt, x, elems(rows, cols, entry)?, &format!("{entry} x"))?;
-    require::<f32>(rt, out, elems(rows, out_per_row, entry)?, &format!("{entry} out"))?;
+    require::<f32>(rt, x, elems(rows, cols, entry)?, format_args!("{entry} x"))?;
+    require::<f32>(rt, out, elems(rows, out_per_row, entry)?, format_args!("{entry} out"))?;
     if rows == 0 {
         return Ok(());
     }

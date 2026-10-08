@@ -755,6 +755,8 @@ struct DecodeState {
     /// Absolute position of the token (`prefix_len`) and the live suffix length (1).
     q_pos: GpuBuffer,
     suffix_len: GpuBuffer,
+    /// `attn_prefix_decode`'s partial-pass scratch, one for every layer.
+    attn_scratch: nn::DecodeScratch,
     /// Tokens decoded so far: picks the conv ping-pong side.
     step: std::cell::Cell<usize>,
 }
@@ -774,6 +776,7 @@ impl DecodeState {
             prefix_len: prefix_len as u32,
             q_pos: buf_u32(rt, &[prefix_len as u32])?,
             suffix_len: buf_u32(rt, &[1])?,
+            attn_scratch: nn::DecodeScratch::new(rt, 1, Q_HEADS, prefix_len + DECODE_SUFFIX_CAP, HEAD_DIM)?,
             step: std::cell::Cell::new(0),
         };
         for (l, layer) in m.layers.iter().enumerate() {
@@ -838,6 +841,7 @@ fn decode_attention(rt: &Arc<GpuRuntime>, a: &Acts, st: &DecodeState, i: usize) 
         &st.suffix_len,
         &st.q_pos,
         &a.a_o,
+        &st.attn_scratch,
         decode_attn_dims(),
         false,
     )

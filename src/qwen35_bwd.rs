@@ -129,10 +129,10 @@ pub fn rms_norm_bwd(
         (w, dim as usize, "w"),
         (dw, dim as usize, "dw"),
     ] {
-        require::<f32>(rt, b, len, &format!("{WHAT} {name}"))?;
+        require::<f32>(rt, b, len, format_args!("{WHAT} {name}"))?;
     }
     let nb = blocks(u64::from(rows), RMS_ROWS_PER_BLOCK);
-    require::<f32>(rt, part, rms_norm_bwd_part_len(rows, dim), &format!("{WHAT} part"))?;
+    require::<f32>(rt, part, rms_norm_bwd_part_len(rows, dim), format_args!("{WHAT} part"))?;
     require_disjoint_writes(
         WHAT,
         &[("dx", dx), ("dw", dw), ("part", part)],
@@ -196,16 +196,16 @@ pub fn gated_rms_norm_bwd(
         .ok_or_else(|| format!("{WHAT}: heads x dim exceeds u32"))?;
     let (r, wd) = (u64::from(rows), u64::from(width));
     for (c, name) in [(x, "x"), (z, "z"), (dy, "dy"), (dx, "dx"), (dz, "dz")] {
-        require_window::<f32>(rt, c, r, wd, &format!("{WHAT} {name}"))?;
+        require_window::<f32>(rt, c, r, wd, format_args!("{WHAT} {name}"))?;
     }
-    require::<f32>(rt, w, dim as usize, &format!("{WHAT} w"))?;
-    require::<f32>(rt, dw, dim as usize, &format!("{WHAT} dw"))?;
+    require::<f32>(rt, w, dim as usize, format_args!("{WHAT} w"))?;
+    require::<f32>(rt, dw, dim as usize, format_args!("{WHAT} dw"))?;
     let nb = blocks(r * u64::from(heads), GATED_UNITS_PER_BLOCK);
     require::<f32>(
         rt,
         part,
         gated_rms_norm_bwd_part_len(rows, heads, dim),
-        &format!("{WHAT} part"),
+        format_args!("{WHAT} part"),
     )?;
     no_overlap(
         WHAT,
@@ -267,7 +267,7 @@ pub fn swiglu_bwd(
     const WHAT: &str = "qwen35_bwd::swiglu_bwd";
     let (r, w) = (u64::from(rows), u64::from(width));
     for (c, name) in [(gate, "gate"), (up, "up"), (dy, "dy"), (dgate, "dgate"), (dup, "dup")] {
-        require_window::<f32>(rt, c, r, w, &format!("{WHAT} {name}"))?;
+        require_window::<f32>(rt, c, r, w, format_args!("{WHAT} {name}"))?;
     }
     no_overlap(
         WHAT,
@@ -315,14 +315,14 @@ pub fn attn_gate_bwd(
         .ok_or_else(|| format!("{WHAT}: heads x dim exceeds u32"))?;
     let gate_span = u64::from(width) * 2;
     let r = u64::from(rows);
-    require_window::<f32>(rt, p, r, gate_span, &format!("{WHAT} p"))?;
-    require_window::<f32>(rt, Cols { buf: dp, ..p }, r, gate_span, &format!("{WHAT} dp"))?;
-    require_window::<f32>(rt, dy, r, u64::from(width), &format!("{WHAT} dy"))?;
+    require_window::<f32>(rt, p, r, gate_span, format_args!("{WHAT} p"))?;
+    require_window::<f32>(rt, Cols { buf: dp, ..p }, r, gate_span, format_args!("{WHAT} dp"))?;
+    require_window::<f32>(rt, dy, r, u64::from(width), format_args!("{WHAT} dy"))?;
     let n = (rows as usize)
         .checked_mul(width as usize)
         .ok_or_else(|| format!("{WHAT}: rows x width overflows"))?;
-    require::<f32>(rt, attn, n, &format!("{WHAT} attn"))?;
-    require::<f32>(rt, d_attn, n, &format!("{WHAT} d_attn"))?;
+    require::<f32>(rt, attn, n, format_args!("{WHAT} attn"))?;
+    require::<f32>(rt, d_attn, n, format_args!("{WHAT} d_attn"))?;
     require_disjoint_writes(
         WHAT,
         &[("d_attn", d_attn), ("dp", dp)],
@@ -391,20 +391,20 @@ pub fn conv1d_silu_bwd(
     let rows32 = u32::try_from(rows).map_err(|_| format!("{WHAT}: batch x seq exceeds u32"))?;
     let (r, c) = (rows, u64::from(channels));
     for (w, name) in [(x, "x"), (dy, "dy"), (dx, "dx")] {
-        require_window::<f32>(rt, w, r, c, &format!("{WHAT} {name}"))?;
+        require_window::<f32>(rt, w, r, c, format_args!("{WHAT} {name}"))?;
     }
     let taps = channels
         .checked_mul(kernel_width)
         .ok_or_else(|| format!("{WHAT}: channels x kernel_width exceeds u32"))?;
     let wlen = taps as usize;
-    require::<f32>(rt, weight, wlen, &format!("{WHAT} weight"))?;
-    require::<f32>(rt, dw, wlen, &format!("{WHAT} dw"))?;
+    require::<f32>(rt, weight, wlen, format_args!("{WHAT} weight"))?;
+    require::<f32>(rt, dw, wlen, format_args!("{WHAT} dw"))?;
     let nb = blocks(rows, CONV_ROWS_PER_BLOCK);
     require::<f32>(
         rt,
         part,
         conv1d_silu_bwd_part_len(batch, seq, channels, kernel_width),
-        &format!("{WHAT} part"),
+        format_args!("{WHAT} part"),
     )?;
     no_overlap(
         WHAT,
@@ -518,8 +518,14 @@ pub fn attn_qk_norm_rope_bwd(
     }
     let rows = u64::from(s.batch) * u64::from(s.seq);
     let span = 2 * (u64::from(s.q_heads) + u64::from(s.kv_heads)) * u64::from(s.head_dim);
-    require_window::<f32>(rt, proj, rows, span, &format!("{WHAT} proj"))?;
-    require_window::<f32>(rt, Cols { buf: dproj, ..proj }, rows, span, &format!("{WHAT} dproj"))?;
+    require_window::<f32>(rt, proj, rows, span, format_args!("{WHAT} proj"))?;
+    require_window::<f32>(
+        rt,
+        Cols { buf: dproj, ..proj },
+        rows,
+        span,
+        format_args!("{WHAT} dproj"),
+    )?;
     let d = s.head_dim as usize;
     let per = |heads: u32| -> Result<usize, String> {
         (rows as usize)
@@ -537,10 +543,10 @@ pub fn attn_qk_norm_rope_bwd(
         (dq_norm_w, d, "dq_norm_w"),
         (dk_norm_w, d, "dk_norm_w"),
     ] {
-        require::<f32>(rt, b, len, &format!("{WHAT} {name}"))?;
+        require::<f32>(rt, b, len, format_args!("{WHAT} {name}"))?;
     }
     let nb = blocks(rows, QK_ROWS_PER_BLOCK);
-    require::<f32>(rt, part, attn_qk_norm_rope_bwd_part_len(s), &format!("{WHAT} part"))?;
+    require::<f32>(rt, part, attn_qk_norm_rope_bwd_part_len(s), format_args!("{WHAT} part"))?;
     require_disjoint_writes(
         WHAT,
         &[
@@ -667,8 +673,8 @@ pub fn embed_rows_bwd(
     let n_dw = (vocab as usize)
         .checked_mul(h)
         .ok_or_else(|| format!("{WHAT}: vocab x hidden overflows"))?;
-    require::<f32>(rt, dh, n_dh, &format!("{WHAT} dh"))?;
-    require::<f32>(rt, dw, n_dw, &format!("{WHAT} dw"))?;
+    require::<f32>(rt, dh, n_dh, format_args!("{WHAT} dh"))?;
+    require::<f32>(rt, dw, n_dw, format_args!("{WHAT} dw"))?;
     require_disjoint_writes(
         WHAT,
         &[("dw", dw)],
@@ -756,7 +762,7 @@ pub fn gdn_gates_bwd(
                 ld: logits.ld,
                 off,
             };
-            require_window::<f32>(rt, c, r, u64::from(heads), &format!("{WHAT} {name} {col}"))?;
+            require_window::<f32>(rt, c, r, u64::from(heads), format_args!("{WHAT} {name} {col}"))?;
         }
     }
     let (a, b) = (u64::from(logits.a_off), u64::from(logits.b_off));
@@ -774,10 +780,15 @@ pub fn gdn_gates_bwd(
         (da_log, heads as usize, "da_log"),
         (ddt_bias, heads as usize, "ddt_bias"),
     ] {
-        require::<f32>(rt, buf, len, &format!("{WHAT} {name}"))?;
+        require::<f32>(rt, buf, len, format_args!("{WHAT} {name}"))?;
     }
     let nb = blocks(r, GATES_ROWS_PER_BLOCK);
-    require::<f32>(rt, part, gdn_gates_bwd_part_len(rows, heads), &format!("{WHAT} part"))?;
+    require::<f32>(
+        rt,
+        part,
+        gdn_gates_bwd_part_len(rows, heads),
+        format_args!("{WHAT} part"),
+    )?;
     require_disjoint_writes(
         WHAT,
         &[
@@ -849,8 +860,8 @@ pub fn check_scatter_rows(what: &str, src: &Tensor, pos: &[u32], rows: usize, wi
 /// must be `rt`'s.
 pub fn scatter_add_rows(rt: &Arc<GpuRuntime>, src: &Tensor, pos: &[u32], dst: &Tensor) -> Result<(), String> {
     const WHAT: &str = "qwen35_bwd::scatter_add_rows";
-    require_runtime(rt, &src.buffer, &format!("{WHAT}: src"))?;
-    require_runtime(rt, &dst.buffer, &format!("{WHAT}: dst"))?;
+    require_runtime(rt, &src.buffer, format_args!("{WHAT}: src"))?;
+    require_runtime(rt, &dst.buffer, format_args!("{WHAT}: dst"))?;
     let ds = dst.shape();
     if ds.len() != 2 || dst.dtype != DType::F32 {
         return Err(format!(
@@ -887,8 +898,8 @@ pub fn scatter_add_rows(rt: &Arc<GpuRuntime>, src: &Tensor, pos: &[u32], dst: &T
 /// disjoint.
 pub fn copy_cols(rt: &Arc<GpuRuntime>, src: Cols<'_>, dst: Cols<'_>, rows: u32, width: u32) -> Result<(), String> {
     const WHAT: &str = "qwen35_bwd::copy_cols";
-    require_window::<f32>(rt, src, u64::from(rows), u64::from(width), &format!("{WHAT} src"))?;
-    require_window::<f32>(rt, dst, u64::from(rows), u64::from(width), &format!("{WHAT} dst"))?;
+    require_window::<f32>(rt, src, u64::from(rows), u64::from(width), format_args!("{WHAT} src"))?;
+    require_window::<f32>(rt, dst, u64::from(rows), u64::from(width), format_args!("{WHAT} dst"))?;
     no_overlap(WHAT, &[("dst", dst, width)], &[("src", src, width)])?;
     if rows == 0 || width == 0 {
         return Ok(());

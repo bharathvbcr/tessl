@@ -116,11 +116,7 @@ pub fn fill_dist(n: usize, seed: u64, dist: Dist) -> Vec<f32> {
                 (std::f64::consts::PI * (u - 0.5)).tan().clamp(-1e4, 1e4)
             }
         };
-        debug_assert!(
-            v.is_finite(),
-            "{} produced a non-finite operand",
-            dist.name()
-        );
+        debug_assert!(v.is_finite(), "{} produced a non-finite operand", dist.name());
         out.push(v as f32);
     }
     out
@@ -176,12 +172,8 @@ mod tests {
     #[test]
     fn median_rejects_empty_and_non_finite_samples() {
         assert!(median(Vec::new()).unwrap_err().contains("zero samples"));
-        assert!(median(vec![1.0, f64::NAN])
-            .unwrap_err()
-            .contains("non-finite"));
-        assert!(median(vec![f64::INFINITY])
-            .unwrap_err()
-            .contains("non-finite"));
+        assert!(median(vec![1.0, f64::NAN]).unwrap_err().contains("non-finite"));
+        assert!(median(vec![f64::INFINITY]).unwrap_err().contains("non-finite"));
     }
 
     #[test]
@@ -196,8 +188,6 @@ mod tests {
         assert!(parse_usize_env_value("N", "", 1).is_err());
         assert!(parse_usize_env_value("N", "not-a-count", 1).is_err());
         assert!(parse_usize_env_value("N", "-1", 1).is_err());
-        assert!(parse_usize_env_value("N", "0", 1)
-            .unwrap_err()
-            .contains("minimum"));
+        assert!(parse_usize_env_value("N", "0", 1).unwrap_err().contains("minimum"));
     }
 }

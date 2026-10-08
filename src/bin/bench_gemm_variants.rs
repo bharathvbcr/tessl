@@ -22,9 +22,9 @@ use common::{env_usize, fill_dist, median, Dist};
 use std::sync::Arc;
 use std::time::Instant;
 use tessl::gemm::{
-    cast_f32_to_bf16, cast_f32_to_f16, gemm, gemm_batched, gemm_epilogue, gemm_nt_accum_train,
-    gemm_nt_f32, gemm_nt_train, gemm_tn_accum_train, gemm_tn_f32, gemm_tn_train, Activation,
-    BatchStrides, BatchedGemm, Epilogue, GemmBackend,
+    cast_f32_to_bf16, cast_f32_to_f16, gemm, gemm_batched, gemm_epilogue, gemm_nt_accum_train, gemm_nt_f32,
+    gemm_nt_train, gemm_tn_accum_train, gemm_tn_f32, gemm_tn_train, Activation, BatchStrides, BatchedGemm, Epilogue,
+    GemmBackend,
 };
 use tessl::runtime::{GpuRuntime, PrecisionMode};
 use tessl::tensor::Tensor;
@@ -53,12 +53,7 @@ struct Lane<'a> {
     run: Box<dyn Fn() -> Result<(), String> + 'a>,
 }
 
-fn time_lane(
-    rt: &Arc<GpuRuntime>,
-    l: &Lane,
-    warmup: usize,
-    iters: usize,
-) -> Result<Vec<f64>, String> {
+fn time_lane(rt: &Arc<GpuRuntime>, l: &Lane, warmup: usize, iters: usize) -> Result<Vec<f64>, String> {
     for _ in 0..warmup {
         (l.run)()?;
         rt.synchronize()?;
@@ -76,10 +71,7 @@ fn time_lane(
 /// Emit the kernel trace for `bench/kernel_coverage.py`.
 fn emit_kernel_trace() {
     if tessl::runtime::kernel_trace_enabled() {
-        eprintln!(
-            "KERNEL_TRACE {}",
-            tessl::runtime::traced_kernels().join(",")
-        );
+        eprintln!("KERNEL_TRACE {}", tessl::runtime::traced_kernels().join(","));
     }
 }
 

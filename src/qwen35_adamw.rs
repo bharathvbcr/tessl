@@ -699,7 +699,14 @@ impl Qwen35Model {
         hyper: &AdamWHyper,
         weight_decay: &[f32],
     ) -> Result<(), String> {
-        self.encode_adamw("Qwen35Model::adamw_step_unwaited", grads, state, hyper, weight_decay, None)
+        self.encode_adamw(
+            "Qwen35Model::adamw_step_unwaited",
+            grads,
+            state,
+            hyper,
+            weight_decay,
+            None,
+        )
     }
 
     /// [`Qwen35Model::adamw_step`] with entry `i` at learning rate

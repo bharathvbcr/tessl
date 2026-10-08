@@ -8,6 +8,12 @@ as bench_embedgemma2 (no tokenization in either lane). Prints one JSON array lik
 
     ~/.venvs/ml/bin/python bench/embedgemma2_torch.py --dtype f32
 
+A workload runs as sentence-transformers' `encode` runs it: sorted longest
+first and cut into batches of --batch-size (its default, 32), each padded to
+its own longest sequence. One batch of a ragged workload padded to its
+longest asked MPS for more memory than the machine has (16 GiB for one
+attention at 1x6147 beside seven short texts).
+
 --dtype f32 is the like-for-like lane (tessl's forward is f32 with exact-f32
 GEMMs); bf16 is the checkpoint's dtype, reported as what a torch deployment
 would run. Attention is transformers' default implementation for the model
@@ -58,6 +64,7 @@ def main():
     ap.add_argument("--attn", default=None)
     ap.add_argument("--workloads", default=os.environ.get(
         "BENCH_WORKLOADS", "1x16,64x32,32x256,8x1024,2x4096,128x8-512,1x4096+63x32,1x6147+1x1658+6x10-42"))
+    ap.add_argument("--batch-size", type=int, default=32)
     ap.add_argument("--iters", type=int, default=int(os.environ.get("BENCH_ITERS", "10")))
     ap.add_argument("--warmup", type=int, default=int(os.environ.get("BENCH_WARMUP", "3")))
     args = ap.parse_args()
@@ -72,17 +79,22 @@ def main():
     rows = []
     for w in args.workloads.split(","):
         lens = lengths(w)
-        longest = max(lens)
-        # Right-padded to the longest, as sentence-transformers' tokenizer pads.
-        x = torch.tensor([ids(s, t) + [0] * (longest - t) for s, t in enumerate(lens)],
-                         dtype=torch.long, device="mps")
-        mask = torch.tensor([[1] * t + [0] * (longest - t) for t in lens], dtype=torch.long, device="mps")
-        feats = {"input_ids": x, "attention_mask": mask}
+        order = sorted(range(len(lens)), key=lambda i: -lens[i])
+        batches = []
+        for c in range(0, len(order), args.batch_size):
+            idx = order[c:c + args.batch_size]
+            longest = lens[idx[0]]
+            # Right-padded to the batch's longest, as the tokenizer pads.
+            x = torch.tensor([ids(i, lens[i]) + [0] * (longest - lens[i]) for i in idx],
+                             dtype=torch.long, device="mps")
+            mask = torch.tensor([[1] * lens[i] + [0] * (longest - lens[i]) for i in idx],
+                                dtype=torch.long, device="mps")
+            batches.append({"input_ids": x, "attention_mask": mask})
 
         def run():
             with torch.no_grad():
-                e = model(dict(feats))["sentence_embedding"]
-            return e.float().cpu()
+                es = [model(dict(f))["sentence_embedding"] for f in batches]
+            return torch.cat(es).float().cpu()
 
         e = run()
         norms = e.norm(dim=1)
@@ -99,7 +111,7 @@ def main():
         ms.sort()
         rows.append({"workload": w.strip(), "backend": f"torch-mps-{args.dtype}",
                      "ms_min": round(ms[0], 4), "ms_median": round(statistics.median(ms), 4),
-                     "iters": args.iters})
+                     "iters": args.iters, "forwards": len(batches)})
     print(json.dumps(rows))
 
 

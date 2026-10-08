@@ -42,6 +42,7 @@ use crate::gdn_train::{
     gdn_train_backward, gdn_train_forward, GdnTrainDims, GdnTrainGrads, GdnTrainInputs, GdnTrainWorkspace, GDN_TRAIN_DK,
 };
 use crate::gemm::GemmOperands;
+use crate::nn::require_runtime;
 use crate::qwen35::{self, AttnShape, AttnTargets, Cols, GdnParams, OutCols, StateIn};
 use crate::qwen35_bwd::{
     attn_gate_bwd, attn_qk_norm_rope_bwd, attn_qk_norm_rope_bwd_part_len, check_scatter_rows, conv1d_silu_bwd,
@@ -281,6 +282,10 @@ pub struct PendingStep {
     loss: f64,
     /// The model's embedding buffer: which model made this step.
     embed: GpuBuffer,
+    /// The model's parameter generation when the forward began: the backward
+    /// rebuilds each layer from the weights it finds, so it runs only on the
+    /// weights the forward saw.
+    param_generation: u64,
 }
 
 impl PendingStep {
@@ -317,13 +322,14 @@ impl PendingStep {
         if let Some(&bad) = positions.iter().find(|&&p| p >= self.t) {
             return Err(format!("{WHAT}: position {bad} >= {} tokens", self.t));
         }
+        let rt = self.xf.runtime();
+        require_runtime(rt, &out.buffer, &format!("{WHAT}: out"))?;
         if out.overlaps(&self.xf) {
             return Err(format!("{WHAT}: out overlaps the step's own storage"));
         }
         if n == 0 {
             return Ok(());
         }
-        let rt = self.xf.runtime();
         let pos = rt.alloc_buffer(std::mem::size_of_val(positions))?;
         pos.try_write_u32(positions)?;
         let p = rt.pipeline("ce_gather_rows_f32")?;
@@ -496,6 +502,7 @@ impl Qwen35Model {
             ("final_norm", buf_part(&bank.final_norm), buf_part(&self.final_norm)),
         ];
         for (name, (b, _, n), (_, _, want)) in top {
+            require_runtime(&self.rt, b, &format!("{what}: the bank's {name}"))?;
             if n != want || b.nbytes() == 0 {
                 return Err(format!("{what}: the bank's {name} holds {n} values, the weight {want}"));
             }
@@ -505,7 +512,8 @@ impl Qwen35Model {
             if have.len() != want.len() {
                 return Err(format!("{what}: layer {i}'s gradients are not its mixer's"));
             }
-            for (k, ((_, _, n), (_, _, w))) in have.iter().zip(&want).enumerate() {
+            for (k, ((b, _, n), (_, _, w))) in have.iter().zip(&want).enumerate() {
+                require_runtime(&self.rt, b, &format!("{what}: layer {i} buffer {k}"))?;
                 if n != w {
                     return Err(format!("{what}: layer {i} buffer {k} holds {n} values, its weight {w}"));
                 }
@@ -557,6 +565,9 @@ impl Qwen35Model {
         fresh: bool,
     ) -> Result<PendingStep, String> {
         const WHAT: &str = "Qwen35Model::train_step";
+        // Read before any weight is: a write that lands during the forward
+        // then invalidates the step too.
+        let param_generation = self.param_generation();
         let (rt, cfg) = (&self.rt, &self.cfg);
         if self.precision != Precision::F32 {
             return Err(format!(
@@ -721,6 +732,7 @@ impl Qwen35Model {
             d_embed,
             loss,
             embed: self.embed.buffer.clone(),
+            param_generation,
         })
     }
 
@@ -732,7 +744,9 @@ impl Qwen35Model {
     /// step's own loss gradient is already in `p` ([`Supervise::Rows`] with
     /// no positions has none). Everything is checked before anything runs.
     /// The parameters must be as they were at the forward: each layer is
-    /// rebuilt from its input with the weights it finds.
+    /// rebuilt from its input with the weights it finds, so a step whose
+    /// forward preceded [`Self::write_parameters`] or [`Self::adamw_step`] is
+    /// refused. Tensors from another runtime are refused.
     pub fn train_backward_into(
         &self,
         p: PendingStep,
@@ -756,7 +770,15 @@ impl Qwen35Model {
         if !p.embed.aliases(&self.embed.buffer) || p.inputs.len() != self.layers.len() {
             return Err(format!("{what}: the pending step is another model's"));
         }
+        if p.param_generation != self.param_generation() {
+            return Err(format!(
+                "{what}: the model's parameters were written after the step's forward \
+                 (write_parameters or adamw_step); its gradients would be of weights the \
+                 forward never ran. Run the forward again"
+            ));
+        }
         if let Some((pos, g)) = dh {
+            require_runtime(&self.rt, &g.buffer, &format!("{what}: dh"))?;
             check_scatter_rows(what, g, pos, p.t as usize, self.cfg.hidden as usize)?;
             if g.overlaps(&p.dxf) {
                 return Err(format!("{what}: dh overlaps the step's own storage"));

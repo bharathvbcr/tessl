@@ -36,6 +36,7 @@ const QWEN35_ATTN_BWD: &str = include_str!("../kernels/qwen35_attn_bwd.metal");
 const QWEN35_ADAMW: &str = include_str!("../kernels/qwen35_adamw.metal");
 const ENCODER_ATTN: &str = include_str!("../kernels/encoder_attn.metal");
 const EMBED_POOL: &str = include_str!("../kernels/embed_pool.metal");
+const MTL_TENSOR: &str = include_str!("../kernels/mtl_tensor.metal");
 
 /// Every `.metal` file this suite inspects.
 ///
@@ -59,6 +60,7 @@ const INSPECTED_KERNELS: &[&str] = &[
     "gemv_q8.metal",
     "kv_store.metal",
     "matmul_simdgroup.metal",
+    "mtl_tensor.metal",
     "qwen35_attn.metal",
     "qwen35_adamw.metal",
     "qwen35_attn_bwd.metal",
@@ -678,6 +680,18 @@ fn embed_pool_offsets_are_widened() {
         ("device float *r = x + (ulong)row * ld;", "normalize row"),
     ] {
         require(EMBED_POOL, needle, what);
+    }
+}
+
+/// The bound-tensor probes index the tensor only inside its own extents, and
+/// widen the one raw buffer offset they form.
+#[test]
+fn mtl_tensor_probe_offsets_are_widened() {
+    for (needle, what) in [
+        ("if (c >= cols || r >= rows) { return; }", "extent guard"),
+        ("out[(ulong)r * (ulong)cols + (ulong)c] =", "read-out store"),
+    ] {
+        require(MTL_TENSOR, needle, what);
     }
 }
 

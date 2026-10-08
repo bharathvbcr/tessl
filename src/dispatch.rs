@@ -52,10 +52,15 @@ impl<'a> Binder<'a> {
             None => Ok(()),
         }
     }
-    fn fail(&mut self, message: impl Into<String>) {
+    pub(crate) fn fail(&mut self, message: impl Into<String>) {
         if self.error.is_none() {
             self.error = Some(message.into());
         }
+    }
+    /// The runtime whose argument table and residency set this binds into.
+    #[cfg(feature = "quant-prep")]
+    pub(crate) fn runtime(&self) -> &GpuRuntime {
+        self.runtime
     }
     fn valid_index(&mut self, index: usize) -> bool {
         if index >= self.max_buffers {

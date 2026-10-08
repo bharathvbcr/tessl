@@ -37,6 +37,7 @@
 //! empty and are not returned. Decode and many-question continuation use the
 //! kernels directly (`qwen35::gdn_recurrent`, `attn_prefix_rows`, ...).
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use crate::gemm::{gemm, gemm_nt_f32, GemmBackend};
@@ -397,6 +398,24 @@ pub struct Qwen35Model {
     pub(crate) lm_head_bf16: Option<Tensor>,
     pub(crate) final_norm: GpuBuffer,
     pub(crate) layers: Vec<Layer>,
+    /// Bumped by every write to the weights after load
+    /// ([`Self::bump_param_generation`]). A [`crate::qwen35_train::PendingStep`]
+    /// records it at the forward, and the backward, which rebuilds each layer
+    /// from the weights it finds, refuses a step whose weights have moved.
+    param_generation: AtomicU64,
+}
+
+impl Qwen35Model {
+    /// How many times the weights have been written since load.
+    pub(crate) fn param_generation(&self) -> u64 {
+        self.param_generation.load(Ordering::Relaxed)
+    }
+
+    /// Record a write to the weights. Called before the write is encoded, so
+    /// a write that fails part way still invalidates a pending step.
+    pub(crate) fn bump_param_generation(&self) {
+        self.param_generation.fetch_add(1, Ordering::Relaxed);
+    }
 }
 
 /// What [`Qwen35Model::forward`] returns.
@@ -630,6 +649,7 @@ impl Qwen35Model {
             lm_head_bf16,
             final_norm,
             layers,
+            param_generation: AtomicU64::new(0),
         })
     }
 

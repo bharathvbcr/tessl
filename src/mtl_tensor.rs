@@ -13,8 +13,8 @@ use objc2::runtime::ProtocolObject;
 use objc2::AnyThread;
 use objc2_foundation::NSInteger;
 use objc2_metal::{
-    MTLBuffer, MTLDevice, MTLResourceID, MTLResourceOptions, MTLSizeAndAlign, MTLTensor, MTLTensorDataType,
-    MTLTensorDescriptor, MTLTensorExtents, MTLTensorUsage,
+    MTLAllocation, MTLBuffer, MTLDevice, MTLResourceID, MTLResourceOptions, MTLSizeAndAlign, MTLTensor,
+    MTLTensorDataType, MTLTensorDescriptor, MTLTensorExtents, MTLTensorUsage,
 };
 use std::sync::Arc;
 
@@ -110,19 +110,29 @@ pub fn nax_verify_readiness() -> NaxVerifyReadiness {
 pub const QUANT_PREFILL_GEMM_WIRED: bool = false;
 
 /// Owned MTLTensor handle (device-allocated or buffer-backed).
+///
+/// A device-owned tensor is in its runtime's residency set from allocation.
+/// Dropping the handle does not free the `MTLTensor` at once: Metal 4 command
+/// buffers do not retain what they bind, so the runtime holds it until the
+/// work already submitted has completed, and only then takes a device-owned
+/// one out of the residency set.
 pub struct GpuTensor {
     pub tensor: Retained<ProtocolObject<dyn MTLTensor>>,
     pub dtype: MTLTensorDataType,
     pub dims: Vec<usize>,
-    // Lifetime anchors, never read: the MTLTensor above borrows this storage,
-    // and the runtime owns the allocator that storage came from. Dropping
-    // either while `tensor` is live is a use-after-free, so they are held, not
-    // used. Scoped `allow` rather than a crate-level one, which would hide the
-    // next genuinely dead field.
-    #[allow(dead_code)]
+    /// A buffer-backed tensor's storage: the MTLTensor above borrows it, and
+    /// its residency is the buffer's own. `None` for a device-owned tensor,
+    /// which is registered for residency itself.
     pub(crate) storage: Option<GpuBuffer>,
-    #[allow(dead_code)]
+    /// The runtime whose residency set and argument table this tensor is for.
     pub(crate) runtime: Arc<GpuRuntime>,
+}
+
+impl Drop for GpuTensor {
+    fn drop(&mut self) {
+        let alloc = ProtocolObject::<dyn MTLAllocation>::from_retained(self.tensor.clone());
+        self.runtime.schedule_release(alloc, self.storage.is_none());
+    }
 }
 
 impl GpuTensor {
@@ -143,7 +153,16 @@ impl GpuTensor {
 /// does not range-check `setResource:atBufferIndex:`: an out-of-range slot
 /// writes past the table (a large one segfaults outright), which is why this
 /// safe wrapper rejects it instead of passing it through.
+///
+/// A tensor from another runtime is refused (and fails the binder, so the
+/// dispatch is not encoded even if the `Err` is ignored): it is outside this
+/// runtime's residency set.
 pub fn bind_mtl_tensor(bnd: &mut Binder<'_>, t: &GpuTensor, index: usize) -> Result<(), String> {
+    if !std::ptr::eq(Arc::as_ptr(&t.runtime), bnd.runtime()) {
+        let msg = "MTLTensor belongs to another runtime".to_string();
+        bnd.fail(msg.clone());
+        return Err(msg);
+    }
     if index >= ARGUMENT_TABLE_MAX_BUFFERS {
         return Err(format!(
             "MTLTensor bind index {index} out of range: argument table has \
@@ -192,6 +211,9 @@ pub fn alloc_device_tensor(rt: &Arc<GpuRuntime>, dims: &[usize], dtype: QuantDTy
         .device
         .newTensorWithDescriptor_error(&desc)
         .map_err(|e| format!("newTensorWithDescriptor: {e}"))?;
+    // Metal 4 binds by resource ID and makes nothing resident on its own: a
+    // kernel reading a tensor outside the residency set faults.
+    rt.register_allocation(ProtocolObject::<dyn MTLAllocation>::from_ref(&*tensor));
     Ok(GpuTensor {
         tensor,
         dtype: mtl_dtype,
@@ -478,6 +500,81 @@ mod tests {
             err.localizedDescription().to_string().contains("Strides should be nil"),
             "{err}"
         );
+    }
+
+    /// A kernel writes a device-owned tensor and another reads it back. Both
+    /// dispatches are encoded and the handle dropped *before* the commit: the
+    /// tensor must be resident from allocation and outlive the handle until
+    /// the work completes, then leave the residency set. Isolated, because a
+    /// tensor outside the set, or freed under the GPU, is a fault.
+    #[test]
+    fn a_kernel_reads_a_device_owned_tensor_dropped_before_commit() {
+        in_child(
+            "mtl_tensor::tests::a_kernel_reads_a_device_owned_tensor_dropped_before_commit",
+            || {
+                use crate::dispatch::{dispatch_2d, set_gpu_buf};
+                use objc2_metal::MTLResidencySet;
+
+                let rt = GpuRuntime::new().expect("runtime");
+                let (cols, rows) = (40usize, 7usize);
+                let t = alloc_device_tensor(&rt, &[cols, rows], QuantDType::Int8).expect("int8 tensor");
+                let watch = t.tensor.clone();
+                let alloc = || ProtocolObject::<dyn MTLAllocation>::from_ref(&*watch);
+                assert!(
+                    rt.metal4.residency.containsAllocation(alloc()),
+                    "a device-owned tensor must be resident from allocation"
+                );
+                let out = rt.alloc_buffer(cols * rows * 4).expect("out");
+                let fill = rt.pipeline("mtl_tensor_fill_i8").expect("fill pipeline");
+                let read = rt.pipeline("mtl_tensor_read_i8").expect("read pipeline");
+
+                rt.set_async_encode(true).expect("async encode");
+                let mut binds = Vec::new();
+                dispatch_2d(&rt, &fill, cols, rows, |bnd| binds.push(bind_mtl_tensor(bnd, &t, 0))).expect("fill");
+                dispatch_2d(&rt, &read, cols, rows, |bnd| {
+                    binds.push(bind_mtl_tensor(bnd, &t, 0));
+                    set_gpu_buf(bnd, &out, 1);
+                })
+                .expect("read");
+                drop(t);
+                assert!(
+                    rt.metal4.residency.containsAllocation(alloc()),
+                    "a dropped tensor left residency while its work was still uncommitted"
+                );
+                rt.synchronize().expect("synchronize");
+                rt.set_async_encode(false).expect("sync encode");
+                for b in binds {
+                    b.expect("bind");
+                }
+
+                let want: Vec<f32> = (0..cols * rows).map(|i| ((i % 127) as i32 - 63) as f32).collect();
+                assert_eq!(out.read_f32()[..cols * rows], want[..]);
+                assert!(
+                    !rt.metal4.residency.containsAllocation(alloc()),
+                    "a dropped tensor stayed resident after its work completed"
+                );
+            },
+        );
+    }
+
+    /// A tensor allocated on one runtime is outside another's residency set:
+    /// binding it there is refused, and the binder fails so nothing encodes.
+    #[test]
+    fn bind_mtl_tensor_refuses_a_foreign_runtime() {
+        let rt = GpuRuntime::new().expect("runtime");
+        let other = GpuRuntime::new().expect("second runtime");
+        let t = alloc_device_tensor(&other, &[16, 16], QuantDType::Int8).expect("int8 tensor");
+        let mut outcome = None;
+        let scope = rt.with_binder(|bnd| {
+            outcome = Some(bind_mtl_tensor(bnd, &t, 0));
+            Ok(())
+        });
+        let err = outcome
+            .expect("binder body ran")
+            .expect_err("a foreign tensor must not bind");
+        assert!(err.contains("another runtime"), "{err}");
+        let err = scope.expect_err("the binder must fail with the bind");
+        assert!(err.contains("another runtime"), "{err}");
     }
 
     #[test]

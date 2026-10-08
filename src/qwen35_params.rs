@@ -20,10 +20,12 @@
 //! Gradients come in the same layouts. Every copy is a GPU dispatch, since a
 //! caller's buffers may be GPU-private.
 
+use crate::nn::require_runtime;
 use crate::qwen35::Cols;
 use crate::qwen35_bwd::copy_cols;
 use crate::qwen35_model::{Mixer, Precision, Qwen35Model};
 use crate::qwen35_train::{MixerGrads, Qwen35Grads};
+use crate::runtime::GpuRuntime;
 use crate::tensor::{gpu_copy, DType, GpuBuffer, Tensor};
 
 /// One parameter.
@@ -58,6 +60,15 @@ pub(crate) enum Src<'a> {
     Packed(&'a Tensor, usize),
     /// A dense f32 tensor holding exactly the value.
     Dense(&'a Tensor),
+}
+
+impl Src<'_> {
+    fn buffer(&self) -> &GpuBuffer {
+        match self {
+            Src::Raw(b) => b,
+            Src::Packed(t, _) | Src::Dense(t) => &t.buffer,
+        }
+    }
 }
 
 pub(crate) struct Slot<'a> {
@@ -216,6 +227,14 @@ pub(crate) fn slots<'a>(m: &'a Qwen35Model, grads: Option<&'a Qwen35Grads>) -> R
         param: Src::Raw(&m.final_norm),
         grad: grads.map(|g| Src::Raw(&g.final_norm)),
     });
+    // `Qwen35Grads`' fields are public, and an `AdamW` made for another model
+    // carries that model's runtime: refuse either before anything reads or
+    // writes through them.
+    for s in &out {
+        if let Some(g) = s.grad {
+            require_runtime(&m.rt, g.buffer(), &format!("{}'s gradient", s.info.name))?;
+        }
+    }
     Ok(out)
 }
 
@@ -224,11 +243,12 @@ fn u32_of(n: usize) -> Result<u32, String> {
 }
 
 /// Check the caller's tensors against the table before touching anything.
-fn check(what: &str, slots: &[Slot<'_>], ts: &[Tensor]) -> Result<(), String> {
+fn check(rt: &GpuRuntime, what: &str, slots: &[Slot<'_>], ts: &[Tensor]) -> Result<(), String> {
     if ts.len() != slots.len() {
         return Err(format!("{what}: {} tensors for {} parameters", ts.len(), slots.len()));
     }
     for (s, t) in slots.iter().zip(ts) {
+        require_runtime(rt, &t.buffer, &format!("{what}: {}", s.info.name))?;
         let want = s.info.storage_shape();
         if t.dtype != DType::F32 || t.shape() != want.as_slice() {
             return Err(format!(
@@ -271,7 +291,7 @@ impl Qwen35Model {
         const WHAT: &str = "Qwen35Model::read_parameters";
         self.require_f32(WHAT)?;
         let slots = slots(self, None)?;
-        check(WHAT, &slots, dst)?;
+        check(&self.rt, WHAT, &slots, dst)?;
         for (s, t) in slots.iter().zip(dst) {
             self.read_one(s.param, &s.info, t)
                 .map_err(|e| format!("{WHAT}: {}: {e}", s.info.name))?;
@@ -285,7 +305,7 @@ impl Qwen35Model {
         const WHAT: &str = "Qwen35Model::read_gradients";
         self.require_f32(WHAT)?;
         let slots = slots(self, Some(grads)).map_err(|e| format!("{WHAT}: {e}"))?;
-        check(WHAT, &slots, dst)?;
+        check(&self.rt, WHAT, &slots, dst)?;
         for (s, t) in slots.iter().zip(dst) {
             let g = s
                 .grad
@@ -297,12 +317,15 @@ impl Qwen35Model {
     }
 
     /// Set every parameter from `src`, laid out as [`Self::read_parameters`]
-    /// writes them. Every tensor is checked before anything is written.
+    /// writes them. Every tensor is checked before anything is written. A
+    /// [`crate::qwen35_train::PendingStep`] from before the write can no
+    /// longer be backpropagated.
     pub fn write_parameters(&self, src: &[Tensor]) -> Result<(), String> {
         const WHAT: &str = "Qwen35Model::write_parameters";
         self.require_f32(WHAT)?;
         let slots = slots(self, None)?;
-        check(WHAT, &slots, src)?;
+        check(&self.rt, WHAT, &slots, src)?;
+        self.bump_param_generation();
         for (s, t) in slots.iter().zip(src) {
             self.write_one(s.param, &s.info, t)
                 .map_err(|e| format!("{WHAT}: {}: {e}", s.info.name))?;
@@ -317,7 +340,7 @@ impl Qwen35Model {
     pub(crate) fn write_gradient_layout(&self, what: &str, mirror: &Qwen35Grads, src: &[Tensor]) -> Result<(), String> {
         self.require_f32(what)?;
         let slots = slots(self, Some(mirror)).map_err(|e| format!("{what}: {e}"))?;
-        check(what, &slots, src)?;
+        check(&self.rt, what, &slots, src)?;
         for (s, t) in slots.iter().zip(src) {
             let g = s.grad.ok_or_else(|| format!("{what}: {} has no slot", s.info.name))?;
             self.write_one(g, &s.info, t)

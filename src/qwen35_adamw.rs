@@ -361,6 +361,9 @@ impl Qwen35Model {
     /// [`Qwen35Model::train_step`]), with `weight_decay[i]` for
     /// [`Qwen35Model::parameter_table`] entry `i`. Everything is checked before
     /// anything moves; the step count advances only when the step runs.
+    /// Gradients or moments from another runtime are refused, and a
+    /// [`crate::qwen35_train::PendingStep`] from before the update can no
+    /// longer be backpropagated.
     pub fn adamw_step(
         &self,
         grads: &Qwen35Grads,
@@ -420,6 +423,7 @@ impl Qwen35Model {
             .step
             .checked_add(1)
             .ok_or_else(|| format!("{WHAT}: step count {} + 1 does not fit in u64", state.step))?;
+        self.bump_param_generation();
         // Packed projections are a strided window (`ld`, `off`), not a
         // contiguous `Tensor`, so this loop calls the same encoder as
         // [`adamw_step`] rather than copying each parameter out and back.

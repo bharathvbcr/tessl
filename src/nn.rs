@@ -4344,23 +4344,35 @@ pub fn softmax_rows_f32(
     rows: u32,
     cols: u32,
 ) -> Result<(), String> {
-    row_reduce(rt, "softmax_rows_f32", x, out, rows, cols, cols)
+    row_reduce(rt, "softmax_rows_f32", x, out, rows, cols, RowOut::WholeRow)
 }
 
-/// `out[r] = sum(x[r, :])`. `out` holds one f32 per row.
+/// `out[r] = sum(x[r, :])`. `out` holds one f32 per row and must not be `x`.
 pub fn row_sum_f32(rt: &Arc<GpuRuntime>, x: &GpuBuffer, out: &GpuBuffer, rows: u32, cols: u32) -> Result<(), String> {
-    row_reduce(rt, "row_sum_f32", x, out, rows, cols, 1)
+    row_reduce(rt, "row_sum_f32", x, out, rows, cols, RowOut::Scalar)
 }
 
-/// `out[r] = max(x[r, :])`. `out` holds one f32 per row.
+/// `out[r] = max(x[r, :])`. `out` holds one f32 per row and must not be `x`.
 pub fn row_max_f32(rt: &Arc<GpuRuntime>, x: &GpuBuffer, out: &GpuBuffer, rows: u32, cols: u32) -> Result<(), String> {
-    row_reduce(rt, "row_max_f32", x, out, rows, cols, 1)
+    row_reduce(rt, "row_max_f32", x, out, rows, cols, RowOut::Scalar)
+}
+
+/// What one row of a row reduction writes.
+#[derive(Clone, Copy)]
+enum RowOut {
+    /// `cols` f32 over the row's own span of `out` (softmax). The threadgroup
+    /// reads only its own row before writing it, so `out` may be `x`.
+    WholeRow,
+    /// One f32 at `out[r]` (sum, max). With `out` aliasing `x` that is an
+    /// element of row `r / cols`, which another threadgroup may still be
+    /// reading, so the two must be disjoint.
+    Scalar,
 }
 
 /// Shared dispatch for the row reductions: one threadgroup per row.
 ///
-/// `out_per_row` is how many f32 each row writes — `cols` for softmax, 1 for a
-/// scalar reduction — and is what `out`'s extent is checked against.
+/// `shape` says how many f32 each row writes, which is what `out`'s extent is
+/// checked against, and whether `out` may alias `x`.
 fn row_reduce(
     rt: &Arc<GpuRuntime>,
     entry: &str,
@@ -4368,13 +4380,23 @@ fn row_reduce(
     out: &GpuBuffer,
     rows: u32,
     cols: u32,
-    out_per_row: u32,
+    shape: RowOut,
 ) -> Result<(), String> {
     if cols == 0 {
         return Err(format!("{entry}: cols must be non-zero"));
     }
+    let out_per_row = match shape {
+        RowOut::WholeRow => cols,
+        RowOut::Scalar => 1,
+    };
     require::<f32>(rt, x, elems(rows, cols, entry)?, &format!("{entry} x"))?;
     require::<f32>(rt, out, elems(rows, out_per_row, entry)?, &format!("{entry} out"))?;
+    if rows == 0 {
+        return Ok(());
+    }
+    if let RowOut::Scalar = shape {
+        require_disjoint_writes(entry, &[("out", out)], &[("x", x)])?;
+    }
     let p = rt.pipeline(entry)?;
     let tptg = reduce_tptg(p.maxTotalThreadsPerThreadgroup(), cols as usize);
     dispatch_tg_1d(rt, &p, rows as usize, tptg, None, |bnd| {

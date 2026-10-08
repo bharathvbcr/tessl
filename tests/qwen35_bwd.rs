@@ -12,7 +12,7 @@ mod common;
 use std::sync::Arc;
 
 use common::qwen35::{sigmoid, silu, softplus};
-use common::{buf, random_f32, seeded, with_gpu};
+use common::{buf, random_f32, seeded, with_gpu, with_two_gpus};
 use tessl::qwen35::{self, AttnShape, Cols, GdnGateLogits, GdnParams};
 use tessl::qwen35_bwd::{
     attn_gate_bwd, attn_qk_norm_rope_bwd, attn_qk_norm_rope_bwd_part_len, conv1d_silu_bwd, conv1d_silu_bwd_part_len,
@@ -1505,5 +1505,33 @@ fn scatter_add_rows_adds_each_row_at_its_position() {
         assert!(m.contains("src must be f32 [2, 37]"), "{m}");
         rt.synchronize().unwrap();
         assert_eq!(bits(&dst.read_f32().unwrap()), bits(&want), "a refusal wrote");
+    });
+}
+
+/// `src` (the backward's `dh`) and `dst` must both be `rt`'s: a buffer from
+/// another runtime is outside this one's residency set.
+#[test]
+fn scatter_add_rows_refuses_a_foreign_runtime() {
+    with_two_gpus(|rt, other| {
+        let (rows, width, pos) = (4usize, 8usize, [2u32, 0]);
+        let mine = |shape: &[usize]| rt.alloc_tensor_f32(shape).unwrap();
+        let theirs = |shape: &[usize]| other.alloc_tensor_f32(shape).unwrap();
+        let _ = rt.take_dispatch_count();
+        for (src, dst, needle) in [
+            (
+                theirs(&[2, width]),
+                mine(&[rows, width]),
+                "src: buffer belongs to another runtime",
+            ),
+            (
+                mine(&[2, width]),
+                theirs(&[rows, width]),
+                "dst: buffer belongs to another runtime",
+            ),
+        ] {
+            let m = scatter_add_rows(rt, &src, &pos, &dst).unwrap_err();
+            assert!(m.contains(needle), "{m:?} lacks {needle:?}");
+        }
+        assert_eq!(rt.take_dispatch_count(), 0, "a refusal encoded work");
     });
 }

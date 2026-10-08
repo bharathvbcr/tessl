@@ -283,8 +283,8 @@ pub fn cross_entropy_rows(
     }
     let hidden = hs as u32;
 
-    ws.rows.write_u32(&pad(rows, ws.max_rows));
-    ws.targets.write_u32(&pad(targets, ws.max_rows));
+    ws.rows.try_write_u32(&pad(rows, ws.max_rows))?;
+    ws.targets.try_write_u32(&pad(targets, ws.max_rows))?;
     let n32 = n as u32;
 
     // 1. Gather the supervised rows into f32.
@@ -389,7 +389,7 @@ pub fn cross_entropy_rows(
     }
 
     rt.synchronize()?;
-    let (m, s, t) = (ws.m.read_f32(), ws.s.read_f32(), ws.tlogit.read_f32());
+    let (m, s, t) = (ws.m.try_read_f32()?, ws.s.try_read_f32()?, ws.tlogit.try_read_f32()?);
     let per_row: Vec<f64> = (0..n)
         .map(|i| f64::from(m[i]) + f64::from(s[i]).ln() - f64::from(t[i]))
         .collect();

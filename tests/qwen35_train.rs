@@ -14,12 +14,15 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use tessl::attn_train::{AttnTrainDims, AttnTrainWorkspace};
+use tessl::cross_entropy::{cross_entropy_rows, CeHidden, CeWorkspace, Reduction};
 use tessl::gemm::GemmOperands;
 use tessl::npy::read_npy;
+use tessl::qwen35_bwd::{embed_rows_bwd, scatter_add_rows, EmbedBwdWorkspace};
 use tessl::qwen35_model::{LayerKind, Precision, Qwen35Config, Qwen35Model};
 use tessl::qwen35_train::{MixerGrads, Qwen35Grads, Supervise, TrainStep};
 use tessl::safetensors::SafeTensors;
-use tessl::tensor::{GpuBuffer, Tensor};
+use tessl::tensor::{DType, GpuBuffer, Tensor};
 use tessl::GpuRuntime;
 
 fn fixture() -> PathBuf {
@@ -810,6 +813,94 @@ fn supervised_rows_refuse_bad_selections() {
     model
         .train_step_into(&ids[..1], GemmOperands::ExactF32, sup, &bank, false)
         .unwrap();
+}
+
+/// A runtime that another host mapping holds (busy), or that an earlier
+/// failure poisoned, is an `Err` from every training entry point, never a
+/// panic: a trainer calls these directly, with no `catch_unwind` between it
+/// and them, so a panic here takes the training process down.
+#[test]
+fn a_busy_or_poisoned_runtime_is_an_error_from_every_training_entry_point() {
+    let dir = fixture();
+    let ids = ids(&dir);
+    let mm = GemmOperands::ExactF32;
+    for (state, needle) in [("busy", "busy"), ("poisoned", "poisoned")] {
+        let cfg = tiny_config();
+        let (rt, model) = load_rt(&dir, "model.", cfg.clone(), Precision::F32);
+        let (h, vocab) = (cfg.hidden as usize, cfg.vocab as usize);
+        // Made while the runtime is free: what the entry points take.
+        let pending = model.train_forward(&ids, mm, Supervise::Causal).unwrap();
+        let bank = Qwen35Grads::zeros_like(&model).unwrap();
+        let rows = rt.alloc_tensor_f32(&[1, h]).unwrap();
+        let dh = rt.alloc_tensor_f32(&[1, h]).unwrap();
+        let dw = rt.alloc_tensor_f32(&[vocab, h]).unwrap();
+        let dst = rt.alloc_tensor_f32(&[ids.len(), h]).unwrap();
+        let ce_ws = CeWorkspace::new(&rt, 1, cfg.hidden, cfg.vocab, DType::F32).unwrap();
+        let emb_ws = EmbedBwdWorkspace::new(&rt, ids.len() as u32).unwrap();
+
+        let held = rt.alloc_buffer(4).unwrap();
+        let _mapping = held.try_contents_u32().unwrap();
+        if state == "poisoned" {
+            rt.poison_as_shared_event_timeout_for_test();
+        }
+        let refused = |what: &str, r: Result<(), String>| {
+            let e = r
+                .err()
+                .unwrap_or_else(|| panic!("{what} on a {state} runtime: accepted"));
+            assert!(
+                e.contains(needle),
+                "{what} on a {state} runtime: {e:?} lacks {needle:?}"
+            );
+            // How a trainer tells the two apart without matching the string:
+            // busy passes once the other access ends, poisoned is permanent.
+            assert_eq!(rt.is_poisoned(), state == "poisoned", "{what} on a {state} runtime");
+        };
+        refused("Qwen35Grads::zeros_like", Qwen35Grads::zeros_like(&model).map(drop));
+        refused("train_step", model.train_step(&ids, mm).map(drop));
+        refused(
+            "train_step_into",
+            model
+                .train_step_into(&ids, mm, Supervise::Causal, &bank, false)
+                .map(drop),
+        );
+        refused(
+            "train_forward",
+            model.train_forward(&ids, mm, Supervise::Causal).map(drop),
+        );
+        refused("PendingStep::hidden", pending.hidden(&[0], &rows));
+        refused(
+            "train_backward_into",
+            model.train_backward_into(pending, Some((&[0], &dh)), &bank, false),
+        );
+        let dims = AttnTrainDims {
+            batch: 1,
+            seq: ids.len() as u32,
+            q_heads: 2,
+            kv_heads: 1,
+            scale: 0.0625,
+        };
+        refused("AttnTrainWorkspace::new", AttnTrainWorkspace::new(&rt, dims).map(drop));
+        refused(
+            "cross_entropy_rows",
+            cross_entropy_rows(
+                &rt,
+                CeHidden { rows: &rows, off: 0 },
+                &dw,
+                &[0],
+                &[1],
+                Reduction::Sum,
+                mm,
+                &ce_ws,
+                None,
+            )
+            .map(drop),
+        );
+        refused(
+            "embed_rows_bwd",
+            embed_rows_bwd(&rt, &ids, &dst.buffer, &dw.buffer, cfg.vocab, cfg.hidden, &emb_ws),
+        );
+        refused("scatter_add_rows", scatter_add_rows(&rt, &dh, &[0], &dst));
+    }
 }
 
 /// The 2B reference directory (`make_train_fixture.py 2b`), the model loaded

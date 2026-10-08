@@ -110,7 +110,7 @@ impl AttnTrainWorkspace {
         dims.validate("AttnTrainWorkspace")?;
         let u32s = |v: u32| -> Result<GpuBuffer, String> {
             let b = rt.alloc_buffer(std::mem::size_of::<u32>())?;
-            b.write_u32(&[v]);
+            b.try_write_u32(&[v])?;
             Ok(b)
         };
         Ok(Self {

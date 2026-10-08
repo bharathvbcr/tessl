@@ -126,7 +126,7 @@ fn zeros_tensor(t: &Tensor) -> Result<Tensor, String> {
 
 fn zeros_buf(model: &Qwen35Model, b: &GpuBuffer) -> Result<GpuBuffer, String> {
     let out = model.rt.alloc_buffer_hot(b.nbytes())?;
-    out.zero();
+    out.try_zero()?;
     Ok(out)
 }
 
@@ -325,7 +325,7 @@ impl PendingStep {
         }
         let rt = self.xf.runtime();
         let pos = rt.alloc_buffer(std::mem::size_of_val(positions))?;
-        pos.write_u32(positions);
+        pos.try_write_u32(positions)?;
         let p = rt.pipeline("ce_gather_rows_f32")?;
         dispatch_2d(rt, &p, h, n, |bnd| {
             set_gpu_buf_offset(bnd, &self.xf.buffer, self.xf.byte_offset(), 0);
@@ -665,7 +665,7 @@ impl Qwen35Model {
         };
         let dxf = tensor(rt, &[tu, h])?;
         // Positions nothing scores keep a zero gradient row.
-        dxf.buffer.zero();
+        dxf.buffer.try_zero()?;
         let ce = |rows: &[u32], targets: &[u32], reduction, dh: &Tensor, scale| {
             let ws = CeWorkspace::new(
                 rt,

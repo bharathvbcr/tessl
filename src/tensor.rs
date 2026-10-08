@@ -246,7 +246,13 @@ impl GpuBuffer {
     }
 
     pub fn read_f32(&self) -> Vec<f32> {
-        self.contents_f32().to_vec()
+        self.try_read_f32().expect("exclusive host mapping failed")
+    }
+
+    /// [`Self::read_f32`] without panicking: a poisoned or busy runtime is
+    /// `Err`.
+    pub fn try_read_f32(&self) -> Result<Vec<f32>, String> {
+        Ok(self.try_contents_f32()?.to_vec())
     }
 
     /// Write raw 16-bit elements. Named for bf16 because that was the only
@@ -318,7 +324,13 @@ impl GpuBuffer {
     }
 
     pub fn zero(&self) {
-        self.map_host::<u8>().expect("exclusive host zero failed").fill(0);
+        self.try_zero().expect("exclusive host zero failed");
+    }
+
+    /// [`Self::zero`] without panicking: a poisoned or busy runtime is `Err`.
+    pub fn try_zero(&self) -> Result<(), String> {
+        self.map_host::<u8>()?.fill(0);
+        Ok(())
     }
 
     /// # Safety

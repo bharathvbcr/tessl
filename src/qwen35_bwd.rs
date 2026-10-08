@@ -702,9 +702,9 @@ pub fn embed_rows_bwd(
         out
     };
     let n = ws.max_rows as usize;
-    ws.pos.write_u32(&pad(&order, n));
-    ws.run_start.write_u32(&pad(&starts, n + 1));
-    ws.uniq.write_u32(&pad(&uniq, n));
+    ws.pos.try_write_u32(&pad(&order, n))?;
+    ws.run_start.try_write_u32(&pad(&starts, n + 1))?;
+    ws.uniq.try_write_u32(&pad(&uniq, n))?;
     let p = rt.pipeline("qwen35_embed_rows_bwd_f32")?;
     dispatch_2d(rt, &p, h, n_runs as usize, |bnd| {
         set_gpu_buf(bnd, dh, 0);
@@ -867,7 +867,7 @@ pub fn scatter_add_rows(rt: &Arc<GpuRuntime>, src: &Tensor, pos: &[u32], dst: &T
         u32::try_from(width).map_err(|_| format!("{WHAT}: width {width} exceeds u32"))?,
     );
     let pos_buf = rt.alloc_buffer(std::mem::size_of_val(pos))?;
-    pos_buf.write_u32(pos);
+    pos_buf.try_write_u32(pos)?;
     let p = rt.pipeline("qwen35_scatter_add_rows_f32")?;
     dispatch_2d(rt, &p, width, n, |bnd| {
         set_gpu_buf_offset(bnd, &src.buffer, src.byte_offset(), 0);

@@ -48,12 +48,21 @@ forwards ran. The per-forward cost (256 rows) is an estimate that only steers
 the split: a sequence's embedding does not depend on its batch beyond GEMM
 tiling, which the model test bounds at `1e-5`.
 
-Layers whose `kv_heads * head_dim` differ get separate, exactly sized K/V
-buffers. The K/V writer derives its per-sequence stride from the buffer's
-size, while the attention and the value norm read at stride `seq`, so a
-shared buffer sized for the widest layer misplaces every sequence after the
-first in the narrower layers. The checkpoint's layers all have width 512, so
-it never showed this; `tests/embedgemma2_tiny.rs` mixes 512 and 256.
+The activations are allocated once per `encode`, for its largest forward,
+and every forward works on a prefix of them. None is zeroed on the host:
+every element a forward reads, an earlier kernel of that forward wrote, which
+`tests/embedgemma2_tiny.rs` checks by poisoning every unzeroed allocation with
+NaN (and by asserting an encode zeroes no host bytes and allocates the same
+whether it runs one forward or two).
+
+One K/V pair, sized for the widest layer, serves every layer and forward. The
+K/V writer and the attention both derive the per-sequence capacity from the
+buffers' size, so they agree on the stride whatever the layer's width or the
+forward's shape. When the attention read at stride `seq` instead, a buffer
+holding more positions than `seq` (a narrower layer's, or now a smaller
+forward's) misplaced every sequence after the first: sequence 1 of a batch
+came out at cosine `0.27`. `tests/embedgemma2_tiny.rs` mixes K/V widths 512
+and 256 and runs a 30-token forward in buffers sized for a 4000-token one.
 
 ## Kernels
 

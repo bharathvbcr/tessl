@@ -592,6 +592,20 @@ fn encoder_attn_refuses_what_it_cannot_run() {
             encoder_attn(rt, &q, &k, &v, &q, &lens, ok, false).is_err(),
             "o aliasing q: accepted"
         );
+        // K/V capacity is derived from their size: fewer than `seq` positions
+        // per sequence, or K and V of different capacities, are refused; more
+        // positions than `seq` are a wider stride, not an error.
+        let kv = |positions: usize| rt.alloc_buffer(4 * positions * 256 * 4).unwrap();
+        let (short_k, short_v, long_k, long_v) = (kv(7), kv(7), kv(10), kv(10));
+        assert!(
+            encoder_attn(rt, &q, &short_k, &short_v, &o, &lens, ok, false).is_err(),
+            "K/V of 7 positions for seq 8: accepted"
+        );
+        assert!(
+            encoder_attn(rt, &q, &k, &long_v, &o, &lens, ok, false).is_err(),
+            "K and V of different capacities: accepted"
+        );
+        encoder_attn(rt, &q, &long_k, &long_v, &o, &lens, ok, false).expect("K/V of 10 positions for seq 8");
         let short_lens = buf_u32(rt, &[8]);
         assert!(
             encoder_attn(rt, &q, &k, &v, &o, &short_lens, ok, false).is_err(),

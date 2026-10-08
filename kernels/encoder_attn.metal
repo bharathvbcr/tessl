@@ -11,8 +11,10 @@
 //   * every batch row has its own live length `lens[b]` (right padding): keys
 //     at or past it are masked, and so is every query at or past it, whose
 //     output row is written as zeros;
-//   * positions are 0..T-1 in every row, so there are no position offsets and
-//     no KV capacity distinct from T.
+//   * positions are 0..T-1 in every row, so there are no position offsets.
+//     K/V hold `kv_capacity >= T` positions per sequence (the host derives it
+//     from the buffers' size, as flash attention does), so one pair of K/V
+//     buffers serves forwards of different shapes.
 //
 // It is a separate kernel, not a mode of `flash_attn_rows`, because there the
 // causal rule is not a mask but the loop bound (keys above the query are never
@@ -20,7 +22,7 @@
 // mode flag would put both contracts in one tuned body that gemma-metal and
 // the Qwen3.5 prefill route through.
 //
-// Q/O: [B, T, H, D]; K/V: [B, T, Hkv, D]; lens: [B] device u32. The host
+// Q/O: [B, T, H, D]; K/V: [B, kv_capacity, Hkv, D]; lens: [B] device u32. The host
 // checks lens[b] in 1..=T for every row; the kernel still clamps to T before
 // any address is formed, since the buffer is device-writable.
 #include <metal_stdlib>
@@ -41,6 +43,7 @@ kernel void NAME(                                                             \
     constant uint &window [[buffer(8)]],                                      \
     constant float &scale [[buffer(9)]],                                      \
     constant uint &out_bf16 [[buffer(10)]],                                   \
+    constant uint &kv_capacity [[buffer(11)]],                                \
     uint2 tgpig [[threadgroup_position_in_grid]],                             \
     uint2 tpitg [[thread_position_in_threadgroup]])                           \
 {                                                                             \
@@ -68,7 +71,8 @@ kernel void NAME(                                                             \
     const uint group = max(H / Hkv, 1u);                                      \
     const uint hkv = h / group;                                               \
     const ulong kv_pos_stride = (ulong)Hkv * (D);                             \
-    const ulong kv_head_base = (ulong)b * T * kv_pos_stride + (ulong)hkv * (D); \
+    const ulong kv_head_base = (ulong)b * kv_capacity * kv_pos_stride       \
+        + (ulong)hkv * (D);                                                   \
     const ulong q_pos_stride = (ulong)H * (D);                                \
     const ulong q_head_base = (ulong)b * T * q_pos_stride + (ulong)h * (D);   \
     const ulong w = (ulong)window;                                            \

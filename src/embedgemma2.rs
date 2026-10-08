@@ -57,8 +57,8 @@ use crate::gemm::{gemm, gemm_nt_f32, GemmBackend};
 use crate::json::{self, Json, Syntax};
 use crate::loader::Loader;
 use crate::nn::{
-    dispatch_tg_1d, mlp_gelu_tanh, reduce_tptg, require, require_disjoint_writes, rms_norm_f32,
-    rms_norm_residual_add_f32, scale_f32_inplace,
+    dispatch_tg_1d, reduce_tptg, require, require_disjoint_writes, rms_norm_f32, rms_norm_residual_add_f32,
+    scale_f32_inplace,
 };
 use crate::qwen35::{self, AttnShape, AttnTargets, Cols, GatedAct, LmHead, OutCols, QkvColumns};
 use crate::qwen35_model::Precision;
@@ -530,8 +530,8 @@ struct Layer {
     w_o: Tensor,
     q_norm: GpuBuffer,
     k_norm: GpuBuffer,
-    gate: Tensor,
-    up: Tensor,
+    /// `[hidden, 2 * intermediate]`: `gate | up`.
+    gate_up: Tensor,
     down: Tensor,
     ple_gate: Tensor,
     ple_out: Tensor,
@@ -658,11 +658,12 @@ struct Acts {
     /// `seq`, and the positions past `seq` are never written or read.
     k: Tensor,
     v: Tensor,
+    /// The attention output; then, once the output projection has read it,
+    /// the MLP's `gelu_tanh(gate) * up` (sized for the wider of the two).
     attn: Tensor,
     y: Tensor,
-    /// The gate projection, then `gelu_tanh(gate) * up` in place.
-    gate: Tensor,
-    up: Tensor,
+    /// The MLP's `gate | up`, `[rows, 2 * intermediate]`, from one GEMM.
+    gate_up: Tensor,
     /// The normed per-layer inputs of a run of layers, `[rows, run * ple_dim]`
     /// (see [`PLE_RUN_BYTES`]).
     ple: Tensor,
@@ -721,8 +722,11 @@ impl EmbedGemma2Model {
                 w_o: ld.linear(&[(&p("self_attn.o_proj.weight"), h)], q * d, f32)?,
                 q_norm: ld.norm(&p("self_attn.q_norm.weight"), d)?,
                 k_norm: ld.norm(&p("self_attn.k_norm.weight"), d)?,
-                gate: ld.linear(&[(&p("mlp.gate_proj.weight"), inter)], h, f32)?,
-                up: ld.linear(&[(&p("mlp.up_proj.weight"), inter)], h, f32)?,
+                gate_up: ld.linear(
+                    &[(&p("mlp.gate_proj.weight"), inter), (&p("mlp.up_proj.weight"), inter)],
+                    h,
+                    f32,
+                )?,
                 down: ld.linear(&[(&p("mlp.down_proj.weight"), h)], inter, f32)?,
                 ple_gate: ld.linear(&[(&p("ple_block.per_layer_input_gate.weight"), ple)], h, f32)?,
                 ple_out: ld.linear(&[(&p("ple_block.per_layer_projection.weight"), h)], ple, f32)?,
@@ -913,7 +917,8 @@ impl EmbedGemma2Model {
         let eps = cfg.rms_norm_eps;
         let at = |t: &Tensor, cols: u32| view(t, rows_u, cols);
         let (embeds, resid, x, y) = (at(&a.embeds, h)?, at(&a.resid, h)?, at(&a.x, h)?, at(&a.y, h)?);
-        let (gate, up) = (at(&a.gate, cfg.intermediate)?, at(&a.up, cfg.intermediate)?);
+        let inter = cfg.intermediate;
+        let (gate_up, mid) = (at(&a.gate_up, 2 * inter)?, at(&a.attn, inter)?);
         let (ple_gate, ple_mid) = (at(&a.ple_gate, cfg.ple_dim)?, at(&a.ple_mid, cfg.ple_dim)?);
         let (n_layers, pd) = (self.layers.len(), cfg.ple_dim as usize);
         // Layers whose per-layer inputs one GEMM forms: as many as `a.ple`
@@ -999,11 +1004,25 @@ impl EmbedGemma2Model {
 
             // MLP.
             rms_norm_f32(rt, &resid.buffer, &layer.pre_ffn_norm, &x.buffer, rows_u, h, eps)?;
-            gemm(&x, &layer.gate, &gate, BACKEND)?;
-            gemm(&x, &layer.up, &up, BACKEND)?;
-            // Elementwise, so in place over the gate.
-            mlp_gelu_tanh(rt, &gate.buffer, &up.buffer, &gate.buffer, rows_u * cfg.intermediate)?;
-            gemm(&gate, &layer.down, &y, BACKEND)?;
+            gemm(&x, &layer.gate_up, &gate_up, BACKEND)?;
+            let window = |off: u32| Cols {
+                buf: &gate_up.buffer,
+                ld: 2 * inter,
+                off,
+            };
+            qwen35::gated_act(
+                rt,
+                GatedAct::GeluTanh,
+                window(0),
+                window(inter),
+                OutCols {
+                    cols: Cols::dense(&mid.buffer, inter),
+                    dtype: DType::F32,
+                },
+                rows_u,
+                inter,
+            )?;
+            gemm(&mid, &layer.down, &y, BACKEND)?;
             rms_norm_residual_add_f32(rt, &y.buffer, &layer.post_ffn_norm, &resid.buffer, rows_u, h, eps, 1.0)?;
 
             // Per-layer input: at the first layer of each run, one GEMM over
@@ -1113,10 +1132,9 @@ impl EmbedGemma2Model {
             q: f32s(&[r, q_w])?,
             k: f32s(&[r, kv_w])?,
             v: f32s(&[r, kv_w])?,
-            attn: f32s(&[r, q_w])?,
+            attn: f32s(&[r, q_w.max(inter)])?,
             y: f32s(&[r, h])?,
-            gate: f32s(&[r, inter])?,
-            up: f32s(&[r, inter])?,
+            gate_up: f32s(&[r, 2 * inter])?,
             // A run of per-layer inputs: within `ple_run_bytes`, or one layer's
             // when even that is larger, and never more than every layer's.
             ple: f32s(&[(self.ple_run_bytes / 4).max(r * ple).min(r * ple * cfg.layers.len())])?,

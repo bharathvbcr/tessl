@@ -15,6 +15,8 @@ mod common;
 
 use std::collections::HashSet;
 
+use objc2_metal::MTLSharedEvent;
+
 use common::{assert_within_bound, random_f32, reference, tensor_f32, with_gpu, Layout};
 use tessl::gemm::select_backend;
 use tessl::tensor::gpu_copy;
@@ -300,6 +302,37 @@ fn alloc_temp_refuses_a_poisoned_runtime_instead_of_bypassing_the_bump_arena() {
     });
 }
 
+/// A poisoned runtime refuses every later call, and only the call that
+/// poisoned it saw why. The refusals have to carry the first cause, or a
+/// fault surfaces far from where it happened as a bare "poisoned".
+#[test]
+fn a_poisoned_runtime_names_what_poisoned_it() {
+    with_gpu(|rt| {
+        rt.set_async_encode(true).unwrap();
+        let first = rt.with_binder(|_| Err("injected encode failure".into())).unwrap_err();
+        assert!(first.contains("injected encode failure"), "{first}");
+        // A later, different failure does not replace the first cause.
+        assert!(rt.with_binder(|_| Err("second failure".into())).is_err());
+        for err in [
+            rt.synchronize().unwrap_err(),
+            rt.alloc_tensor_f32(&[4]).map(|_| ()).unwrap_err(),
+            rt.with_binder(|_| Ok(())).unwrap_err(),
+        ] {
+            assert!(err.contains("poisoned"), "{err}");
+            assert!(
+                err.contains("injected encode failure"),
+                "the refusal lost the cause: {err}"
+            );
+        }
+    });
+
+    with_gpu(|rt| {
+        rt.poison_as_shared_event_timeout_for_test();
+        let err = rt.synchronize().unwrap_err();
+        assert!(err.contains("timed out"), "the refusal lost the cause: {err}");
+    });
+}
+
 #[test]
 fn a_long_unsynchronized_chain_keeps_every_result() {
     with_gpu(|rt| {
@@ -355,6 +388,190 @@ fn a_long_unsynchronized_chain_keeps_every_result() {
                 &expected[round % VARIANTS],
                 k,
                 0.0,
+            );
+        }
+    });
+}
+
+#[test]
+fn async_encode_past_the_constant_arena_without_a_synchronize_stays_healthy() {
+    with_gpu(|rt| {
+        // A decode or training loop that encodes asynchronously and never
+        // waits. Every scalar bind takes a slot in the runtime's 16 MiB
+        // constant arena, and only a waiting commit used to give those slots
+        // back, so a long enough run exhausted the arena and the failed bind
+        // poisoned the runtime for good. Separately, the 100k-dispatch hard cap
+        // counted dispatches across non-waiting commits, so once a run passed
+        // 100k every later dispatch committed a command buffer of its own.
+        //
+        // Each dispatch here binds 64 bytes of constants (a 48-byte source
+        // payload and a 4-byte count, each in a 16-byte-aligned slot), so the
+        // loop puts 19.2 MB through the arena -- past its 16 MiB -- and fills
+        // more than one command buffer to the 100k cap, in a few seconds rather
+        // than the ~1M single-scalar dispatches a real run would take.
+        const DISPATCHES: usize = 300_000;
+        const PAYLOAD_FLOATS: usize = 12;
+        const DISPATCH_CAP: usize = 100_000;
+
+        rt.set_async_encode(true).unwrap();
+        rt.take_dispatch_count();
+        let pipe = rt.pipeline("copy_f32").unwrap();
+        let sink = rt.alloc_tensor_f32(&[DISPATCHES]).unwrap();
+        sink.buffer.contents_f32().fill(-1.0);
+
+        tessl::infer_trace::set_enabled(true);
+        let before = tessl::infer_trace::snapshot();
+        for i in 0..DISPATCHES {
+            // The kernel reads its source straight out of the constant arena,
+            // so a slot handed back while the GPU could still read it would
+            // show up as another dispatch's value in this one's sink element.
+            let mut payload = [0u8; PAYLOAD_FLOATS * 4];
+            payload[..4].copy_from_slice(&((i + 1) as f32).to_ne_bytes());
+            let dst = sink.view(&[1], i);
+            let encoded = rt.with_binder(|bnd| {
+                bnd.set_pipeline(&pipe);
+                bnd.bind_bytes(&payload, 0);
+                bnd.bind_tensor(&dst, 1);
+                bnd.bind_u32(1, 2);
+                bnd.dispatch(tessl::runtime::mtl_size(1, 1, 1), tessl::runtime::mtl_size(1, 1, 1));
+                Ok(())
+            });
+            if let Err(err) = encoded {
+                tessl::infer_trace::set_enabled(false);
+                panic!(
+                    "dispatch {i} of {DISPATCHES} failed without a synchronize (poisoned: {}): {err}",
+                    rt.is_poisoned()
+                );
+            }
+        }
+        let encoded = tessl::infer_trace::snapshot().since(&before);
+        tessl::infer_trace::set_enabled(false);
+        assert!(!rt.is_poisoned(), "the runtime was poisoned by the run");
+        rt.synchronize().unwrap();
+
+        assert_eq!(rt.take_dispatch_count(), DISPATCHES);
+        // One commit per full command buffer (the dispatch cap, or the
+        // `TESSL_MID_COMMIT` threshold when a stress run sets one), plus the
+        // arena reclaims -- a handful by default. Committing every dispatch
+        // past the cap would be ~200k.
+        let mid_commit = ["TESSL_MID_COMMIT", "METAL_RUNTIME_MID_COMMIT"]
+            .iter()
+            .find_map(|k| std::env::var(k).ok())
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|&n| n > 0);
+        let per_cb = mid_commit.map_or(DISPATCH_CAP, |n| n.min(DISPATCH_CAP));
+        let laps = 19_200_000usize.div_ceil(16 * 1024 * 1024);
+        let bound = (DISPATCHES / per_cb + laps + 1) as u64;
+        assert!(
+            encoded.commits <= bound,
+            "{} commits for {DISPATCHES} dispatches; at most {bound} expected",
+            encoded.commits
+        );
+
+        let out = sink.buffer.read_f32();
+        for (i, &v) in out.iter().enumerate() {
+            assert_eq!(v, (i + 1) as f32, "dispatch {i} read another dispatch's constants");
+        }
+    });
+}
+
+/// Drop `t`, recording its buffer's release point: the next commit's event.
+fn release(rt: &GpuRuntime, released: &mut std::collections::HashMap<usize, u64>, t: Tensor) {
+    released.insert(buffer_id(&t.buffer), rt.last_signaled_value() + 1);
+    drop(t);
+}
+
+#[test]
+fn temporaries_recycle_across_unwaited_commits() {
+    with_gpu(|rt| {
+        // A run that commits without waiting and never synchronizes. A cold
+        // temporary dropped mid-run cannot go back to the freelist while a
+        // command buffer that may read it is in flight -- but once that command
+        // buffer has completed it can, and has to: otherwise every temporary of
+        // the run stays allocated and resident until a synchronize that never
+        // comes. With two allocators, the third command buffer cannot open
+        // until the first has completed, so the live set is bounded by about
+        // three rounds of temporaries however many rounds run.
+        //
+        // A dropped temporary's release point is the shared-event value of the
+        // next commit after its drop (`last_signaled_value() + 1` then): every
+        // command buffer that could have read it is at or before that one.
+        // After each round an allocation must not hand back a temporary whose
+        // release point the GPU has not reached. The temporaries stay alive
+        // (queued or pooled), so pointer identity is decisive. Each round opens
+        // with a large GEMM, so its last temporaries are usually still in
+        // flight at the probe -- the check has something to catch -- and most
+        // rounds must be; under `TESSL_MID_COMMIT` earlier ones of the round
+        // may legitimately have come back already.
+        const ROUNDS: usize = 16;
+        const TEMPS: usize = 8;
+        const N: usize = 256 * 1024; // 1 MiB of f32: one pool bucket
+        let round_bytes = (TEMPS * N * 4) as u64;
+
+        rt.set_async_encode(true).unwrap();
+        let srcs: Vec<Vec<f32>> = (0..ROUNDS).map(|r| random_f32(N, 700 + r as u64)).collect();
+        let src: Vec<Tensor> = srcs.iter().map(|h| tensor_f32(rt, &[N], h)).collect();
+        let sink = rt.alloc_tensor_f32(&[ROUNDS * N]).unwrap();
+        const G: usize = 1536;
+        let ga = tensor_f32(rt, &[G, G], &random_f32(G * G, 791));
+        let gb = tensor_f32(rt, &[G, G], &random_f32(G * G, 792));
+        let gc = rt.alloc_tensor_f32(&[G, G]).unwrap();
+        rt.synchronize().unwrap();
+
+        let base = rt.current_allocated_bytes();
+        let mut peak_growth = 0u64;
+        let mut checked = 0usize;
+        // Buffer identity -> release point of its latest drop.
+        let mut released = std::collections::HashMap::new();
+        for (round, src) in src.iter().enumerate() {
+            gemm_f32(&ga, &gb, &gc, GemmBackend::TensorOps).unwrap();
+            let mut prev: Option<Tensor> = None;
+            for _ in 0..TEMPS {
+                let temp = rt.alloc_tensor_f32(&[N]).unwrap();
+                gpu_copy(prev.as_ref().unwrap_or(src), &temp).unwrap();
+                if let Some(done) = prev.replace(temp) {
+                    release(rt, &mut released, done);
+                }
+            }
+            let last = prev.expect("TEMPS > 0");
+            gpu_copy(&last, &sink.view(&[N], round * N)).unwrap();
+            release(rt, &mut released, last);
+            rt.commit(false).unwrap();
+            let probe = rt.alloc_tensor_f32(&[N]).unwrap();
+            // Read after the probe: the event only rises, so a release point
+            // above this value was above it at every drain before the probe.
+            let reached = rt.shared_event().signaledValue();
+            if released.values().any(|&after| after > reached) {
+                checked += 1;
+            }
+            if let Some(&after) = released.get(&buffer_id(&probe.buffer)) {
+                assert!(
+                    after <= reached,
+                    "round {round}: a temporary with release point {after} went back to the pool \
+                     while the GPU had reached only {reached}"
+                );
+            }
+            release(rt, &mut released, probe);
+            peak_growth = peak_growth.max(rt.current_allocated_bytes().saturating_sub(base));
+        }
+        rt.synchronize().unwrap();
+
+        assert!(
+            checked >= ROUNDS / 2,
+            "only {checked} of {ROUNDS} rounds had temporaries in flight at their probe; the GEMM no \
+             longer outlasts a round's host work, so the recycle check is not being exercised"
+        );
+        assert!(
+            peak_growth <= 4 * round_bytes,
+            "allocations grew {peak_growth} bytes over {ROUNDS} unwaited rounds of {round_bytes}; \
+             temporaries are not recycling once their command buffer completes"
+        );
+        let out = sink.buffer.read_f32();
+        for (round, expected) in srcs.iter().enumerate() {
+            assert_eq!(
+                &out[round * N..(round + 1) * N],
+                &expected[..],
+                "round {round} read a temporary another round had reused"
             );
         }
     });

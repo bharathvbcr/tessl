@@ -78,8 +78,16 @@ impl<'a> Binder<'a> {
             self.fail("constant arena offset overflow");
             return 0;
         };
-        if bytes.is_empty() || end > self.const_staging.length() {
-            self.fail("constant arena exhausted or empty payload");
+        if bytes.is_empty() {
+            self.fail("constant arena: empty payload");
+            return 0;
+        }
+        if end > self.const_staging.length() {
+            self.fail(format!(
+                "constant arena exhausted: {} bytes at offset {start} overrun its {} bytes",
+                bytes.len(),
+                self.const_staging.length()
+            ));
             return 0;
         }
         // SAFETY: checked the entire destination range before writing.
@@ -737,7 +745,21 @@ mod audit_tests {
             })
         }));
         assert!(result.is_ok(), "Result API panicked on full arena");
-        assert!(result.unwrap().is_err());
+        let err = result.unwrap().unwrap_err();
+        assert!(
+            err.contains("constant arena exhausted") && err.contains(&bytes.len().to_string()),
+            "{err}"
+        );
+
+        // An empty payload is its own error, not reported as an exhausted arena.
+        let rt = GpuRuntime::new().unwrap();
+        let err = rt
+            .with_binder(|b| {
+                b.bind_bytes(&[], 0);
+                Ok(())
+            })
+            .unwrap_err();
+        assert!(err.contains("empty payload") && !err.contains("exhausted"), "{err}");
     }
     #[test]
     fn binder_rejects_bad_view_without_a_dispatch() {

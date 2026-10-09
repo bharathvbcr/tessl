@@ -4,7 +4,8 @@
 //! Encode is **Metal 4 only**: one `MTL4CommandBuffer` per step with
 //! argument-table binds, a bump-allocated const arena (16 MiB), residency
 //! registry, and SharedEvent sync. Steady-state work never host-waits except
-//! at log / loss / eval boundaries via [`GpuRuntime::synchronize`].
+//! at log / loss / eval boundaries via [`GpuRuntime::synchronize`], and once
+//! per ~12 MiB of scalar constants when a run encodes that much without one.
 //!
 //! Four properties this module exists to hold, each of which was a measured
 //! regression before it was a rule: cold buffers recycle and call
@@ -39,6 +40,21 @@ use std::sync::{Arc, Condvar, Mutex, PoisonError, Weak};
 // token before a waiting sync; 1 MiB exhausted mid-token. 16 MiB covers full
 // product shapes with headroom (still tiny vs Hot weight residency).
 const METAL4_CONST_ARENA_BYTES: usize = 16 * 1024 * 1024;
+
+/// Arena headroom a binder scope may still fill after it opens.
+///
+/// A scope cannot reclaim the arena partway through: the live binder holds
+/// the cursor, and the slots behind it may belong to command buffers the GPU
+/// is still reading. So the check runs before each scope, and this has to
+/// cover the largest single scope -- a whole DecodeIcb tape packed into one,
+/// hundreds of immediates and RoPE tables. Below it, the runtime waits for
+/// every in-flight command buffer and rewinds the arena.
+const METAL4_CONST_ARENA_RESERVE: usize = 4 * 1024 * 1024;
+
+/// Dispatch scopes one command buffer takes before it is committed without a
+/// wait, so a client that encodes without `synchronize` does not grow a single
+/// command buffer without bound.
+const METAL4_MAX_DISPATCHES_PER_CB: usize = 100_000;
 
 /// Default pool freelist cap (~2 GiB of cached slabs).
 const DEFAULT_POOL_CACHE_BYTES: usize = 2 * 1024 * 1024 * 1024;
@@ -300,7 +316,6 @@ pub(crate) struct Metal4EncodePackage {
     pub queue: Retained<ProtocolObject<dyn MTL4CommandQueue>>,
     /// Dual allocators — GPU runs one CB while host encodes the next.
     allocators: Mutex<[AllocatorSlot; 2]>,
-    active_alloc: Mutex<usize>,
     /// Legacy alias: allocator 0 (tests / callers that expected a single handle).
     pub allocator: Retained<ProtocolObject<dyn MTL4CommandAllocator>>,
     pub command_buffer: Retained<ProtocolObject<dyn MTL4CommandBuffer>>,
@@ -309,10 +324,15 @@ pub(crate) struct Metal4EncodePackage {
     pub residency: Retained<ProtocolObject<dyn MTLResidencySet>>,
     pub shared_event: Retained<ProtocolObject<dyn MTLSharedEvent>>,
     /// Scratch for scalar `[[buffer(N)]]` constants (M4 has no setBytes).
-    /// 16 MiB bump arena; cursor advances per const pack, reset after sync.
+    /// 16 MiB bump arena; cursor advances per const pack and resets after a
+    /// waiting commit -- `synchronize`, or the reclaim a scope triggers when
+    /// less than `METAL4_CONST_ARENA_RESERVE` is left.
     pub const_staging: Retained<ProtocolObject<dyn MTLBuffer>>,
     pub const_cursor: Mutex<usize>,
-    event_value: Mutex<u64>,
+    /// Last shared-event value a commit has signaled (or queued to signal).
+    /// Atomic so a buffer drop on any thread can read its release point
+    /// without a lock-order question against `active_m4`.
+    event_value: AtomicU64,
     /// Allocations registered into `residency` (debug / telemetry).
     pub residency_count: Mutex<usize>,
 }
@@ -432,9 +452,10 @@ fn mid_commit_threshold() -> usize {
 /// per dispatch costs an encoder setup on every op, which at decode sizes is a
 /// large fraction of the step.
 struct ActiveMetal4Batch {
+    /// Dispatch scopes encoded into this command buffer. Starts at zero with
+    /// every command buffer: the mid-commit threshold and the
+    /// [`METAL4_MAX_DISPATCHES_PER_CB`] cap are both per command buffer.
     dispatches: usize,
-    /// Dispatches since last commit (mid-token overlap).
-    since_commit: usize,
     cb_open: bool,
     stamped_t0: bool,
     encoder: Option<Retained<ProtocolObject<dyn MTL4ComputeCommandEncoder>>>,
@@ -477,6 +498,28 @@ type PendingRetirement = Retained<ProtocolObject<dyn MTLBuffer>>;
 /// `MTLTensor`) whose owner dropped, held until the GPU has caught up, and
 /// whether it is in the residency set and must leave it then.
 type PendingRelease = (Retained<ProtocolObject<dyn MTLAllocation>>, bool);
+
+/// A release held until the GPU passes a shared-event value: the value of the
+/// commit that closes the command buffer open when the owner dropped. Every
+/// command buffer that could have bound the item precedes that commit, and
+/// with no owner left no later one can.
+type Deferred<T> = (u64, T);
+
+/// Take the items of `queue` whose release point the GPU has passed.
+///
+/// A poisoned lock still holds the queue; skipping it would leave the items
+/// waiting forever, and dropping them early could free memory in flight.
+fn take_completed<T>(queue: &Mutex<Vec<Deferred<T>>>, completed: u64) -> Vec<T> {
+    let mut q = queue.lock().unwrap_or_else(PoisonError::into_inner);
+    if q.is_empty() {
+        return Vec::new();
+    }
+    let (done, waiting): (Vec<_>, Vec<_>) = std::mem::take(&mut *q)
+        .into_iter()
+        .partition(|(after, _)| *after <= completed);
+    *q = waiting;
+    done.into_iter().map(|(_, item)| item).collect()
+}
 
 /// Persistent Hot scalar workspace (pos-buffer style). Bounded bump arena for
 /// stable GPU addresses across encodes — not a full decode ICB scalar graph.
@@ -542,9 +585,53 @@ impl ParamsBuffer {
     }
 }
 
+/// The poison latch: set once an encode, submit, or GPU wait fails, after
+/// which the runtime refuses every call. It keeps the first cause, because
+/// only the call that poisoned the runtime returns it; every later refusal
+/// would otherwise say only "poisoned", far from the fault.
+///
+/// Metal's feedback thread sets it too, where a panic cannot be recovered, so
+/// the lock takes a poisoned guard as it is.
+struct RuntimePoison {
+    set: AtomicBool,
+    cause: Mutex<Option<String>>,
+}
+
+impl RuntimePoison {
+    fn new() -> Self {
+        Self {
+            set: AtomicBool::new(false),
+            cause: Mutex::new(None),
+        }
+    }
+
+    /// Poison the runtime. A later cause does not replace the first.
+    fn set(&self, cause: impl Into<String>) {
+        {
+            let mut first = self.cause.lock().unwrap_or_else(PoisonError::into_inner);
+            if first.is_none() {
+                *first = Some(cause.into());
+            }
+        }
+        self.set.store(true, Ordering::Release);
+    }
+
+    fn is_set(&self) -> bool {
+        self.set.load(Ordering::Acquire)
+    }
+
+    /// The refusal a poisoned runtime returns, naming the first cause.
+    fn error(&self) -> String {
+        match &*self.cause.lock().unwrap_or_else(PoisonError::into_inner) {
+            Some(cause) => format!("runtime is poisoned after encode/submit failure ({cause}); recreate it"),
+            None => "runtime is poisoned after encode/submit failure; recreate it".into(),
+        }
+    }
+}
+
 pub struct GpuRuntime {
     access_busy: Arc<AtomicBool>,
-    encode_failed: Arc<AtomicBool>,
+    poison: Arc<RuntimePoison>,
     /// Times `MTL4CommitFeedback` has been delivered. The command buffer
     /// protocol has no status; this counts the feedback path that does.
     commit_feedback_reports: Arc<AtomicU64>,
@@ -577,19 +664,19 @@ pub struct GpuRuntime {
     /// Uncommitted residency adds/removes — flushed before encode / synchronize.
     residency_dirty: Mutex<bool>,
     /// Cold buffers whose last Arc dropped mid-step; recycled after CB wait.
-    pending_cold_recycle: Mutex<Vec<PendingRecycle>>,
+    pending_cold_recycle: Mutex<Vec<Deferred<PendingRecycle>>>,
     /// Hot buffers whose last Arc dropped; removed from residency after CB wait.
-    pending_retirement: Mutex<Vec<PendingRetirement>>,
+    pending_retirement: Mutex<Vec<Deferred<PendingRetirement>>>,
     /// Live [`BufferKind::External`] wraps per `MTLBuffer` (keyed by its
     /// address). Residency is per buffer and wraps are per call, so the buffer
     /// joins the set with its first wrap and leaves it after its last.
     external_wraps: Mutex<HashMap<usize, usize>>,
     /// External wraps dropped since the last drain; released after CB wait.
-    pending_external_release: Mutex<Vec<PendingRetirement>>,
+    pending_external_release: Mutex<Vec<Deferred<PendingRetirement>>>,
     /// Non-buffer allocations dropped since the last drain. Metal 4 command
     /// buffers do not retain what they bind, so this queue is what keeps a
     /// bound one alive until the work that reads it has completed.
-    pending_release: Mutex<Vec<PendingRelease>>,
+    pending_release: Mutex<Vec<Deferred<PendingRelease>>>,
     /// Bounded Hot params workspace for stable scalar binds (pos-buffer style).
     params: Mutex<Option<ParamsBuffer>>,
     /// Self weak handle so Drop on pooled buffers can schedule recycle. Set
@@ -671,15 +758,15 @@ fn library_from_data(
 
 impl GpuRuntime {
     fn acquire_access(&self) -> Result<RuntimeAccess, String> {
-        if self.encode_failed.load(Ordering::Acquire) {
-            return Err("runtime is poisoned after encode/submit failure; recreate it".into());
+        if self.poison.is_set() {
+            return Err(self.poison.error());
         }
         self.access_busy
             .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
             .map_err(|_| "runtime busy: another host mapping, encoder, or submit is active".to_string())?;
         let access = RuntimeAccess(Arc::clone(&self.access_busy));
-        if self.encode_failed.load(Ordering::Acquire) {
-            return Err("runtime poisoned by an earlier encoding/submission failure".into());
+        if self.poison.is_set() {
+            return Err(self.poison.error());
         }
         Ok(access)
     }
@@ -687,19 +774,20 @@ impl GpuRuntime {
     pub(crate) fn host_access(&self) -> Result<RuntimeAccess, String> {
         let access = self.acquire_access()?;
         if let Err(e) = self.commit_m4(true) {
-            self.encode_failed.store(true, Ordering::Release);
+            self.poison.set(e.as_str());
             return Err(e);
         }
         Ok(access)
     }
 
-    /// Apply the same poison `encode_failed` bit that a SharedEvent wait timeout
+    /// Apply the same poison latch, and cause, that a SharedEvent wait timeout
     /// stores before returning. Subsequent encode and alloc refuse reuse.
     ///
     /// This does not hang the GPU. Dependents use it when a real command-buffer
     /// fault cannot be produced, including ojas-metal's host-weight rebuild.
     pub fn poison_as_shared_event_timeout_for_test(&self) {
-        self.encode_failed.store(true, Ordering::Release);
+        self.poison
+            .set("Metal 4 SharedEvent wait timed out (poison_as_shared_event_timeout_for_test)");
     }
 
     pub fn new() -> Result<Arc<Self>, String> {
@@ -790,7 +878,7 @@ impl GpuRuntime {
         #[allow(clippy::arc_with_non_send_sync)]
         let rt = Arc::new_cyclic(|self_weak| Self {
             access_busy: Arc::new(AtomicBool::new(false)),
-            encode_failed: Arc::new(AtomicBool::new(false)),
+            poison: Arc::new(RuntimePoison::new()),
             commit_feedback_reports: Arc::new(AtomicU64::new(0)),
             device,
             library,
@@ -881,7 +969,7 @@ impl GpuRuntime {
     /// same one [`Self::poison_as_shared_event_timeout_for_test`] sets, and the
     /// same one a `MTL4CommitFeedback` error sets.
     pub fn is_poisoned(&self) -> bool {
-        self.encode_failed.load(Ordering::Acquire)
+        self.poison.is_set()
     }
 
     /// Bytes this `MTLDevice` currently has allocated, from
@@ -983,7 +1071,7 @@ impl GpuRuntime {
     /// Last timeline value this runtime has submitted a signal for (`0` if no
     /// commit has signaled yet). Pair with [`Self::shared_event`] for handoff.
     pub fn last_signaled_value(&self) -> u64 {
-        *self.metal4.event_value.lock().unwrap_or_else(|p| p.into_inner())
+        self.metal4.event_value.load(Ordering::Acquire)
     }
 
     /// Register a buffer in the Metal 4 residency set (deferred commit).
@@ -1022,8 +1110,9 @@ impl GpuRuntime {
 
     /// Called from [`crate::tensor::PooledBuffer`] Drop for cold temps.
     pub(crate) fn schedule_cold_recycle(&self, buffer: Retained<ProtocolObject<dyn MTLBuffer>>, nbytes: usize) {
+        let after = self.release_point();
         if let Ok(mut q) = self.pending_cold_recycle.lock() {
-            q.push((buffer, nbytes));
+            q.push((after, (buffer, nbytes)));
         }
     }
 
@@ -1046,14 +1135,16 @@ impl GpuRuntime {
     /// A wrap of a caller-owned buffer dropped; its count falls after the GPU
     /// has caught up, and the last one removes it from residency.
     pub(crate) fn schedule_external_release(&self, buffer: Retained<ProtocolObject<dyn MTLBuffer>>) {
+        let after = self.release_point();
         if let Ok(mut q) = self.pending_external_release.lock() {
-            q.push(buffer);
+            q.push((after, buffer));
         }
     }
 
     pub(crate) fn schedule_hot_retirement(&self, buffer: Retained<ProtocolObject<dyn MTLBuffer>>) {
+        let after = self.release_point();
         if let Ok(mut q) = self.pending_retirement.lock() {
-            q.push(buffer);
+            q.push((after, buffer));
         }
     }
 
@@ -1063,31 +1154,30 @@ impl GpuRuntime {
     pub(crate) fn schedule_release(&self, alloc: Retained<ProtocolObject<dyn MTLAllocation>>, resident: bool) {
         // A poisoned lock still holds the queue; dropping `alloc` here instead
         // would free it under in-flight work.
+        let after = self.release_point();
         self.pending_release
             .lock()
             .unwrap_or_else(|p| p.into_inner())
-            .push((alloc, resident));
+            .push((after, (alloc, resident)));
     }
 
-    /// After GPU catch-up: remove cold allocs from residency and return to
-    /// freelist; remove retired Hot allocs from residency without recycling.
-    fn drain_cold_recycles(&self) {
-        let cold = if let Ok(mut q) = self.pending_cold_recycle.lock() {
-            std::mem::take(&mut *q)
-        } else {
-            Vec::new()
-        };
-        let retired = if let Ok(mut q) = self.pending_retirement.lock() {
-            std::mem::take(&mut *q)
-        } else {
-            Vec::new()
-        };
-        let released = if let Ok(mut q) = self.pending_external_release.lock() {
-            std::mem::take(&mut *q)
-        } else {
-            Vec::new()
-        };
-        let other = std::mem::take(&mut *self.pending_release.lock().unwrap_or_else(|p| p.into_inner()));
+    /// The shared-event value after which a release scheduled now is safe:
+    /// the next commit's. See [`Deferred`].
+    fn release_point(&self) -> u64 {
+        self.metal4.event_value.load(Ordering::Acquire) + 1
+    }
+
+    /// Release what the GPU is done with: every deferred item whose release
+    /// point is at or below `completed`. Cold allocs leave residency and
+    /// return to the freelist; retired Hot allocs leave residency without
+    /// recycling. A waiting commit passes `u64::MAX` (nothing in flight, no
+    /// command buffer open); a non-waiting one passes the event value the GPU
+    /// has reached, so a run that never waits still recycles.
+    fn drain_cold_recycles(&self, completed: u64) {
+        let cold = take_completed(&self.pending_cold_recycle, completed);
+        let retired = take_completed(&self.pending_retirement, completed);
+        let released = take_completed(&self.pending_external_release, completed);
+        let other = take_completed(&self.pending_release, completed);
         if cold.is_empty() && retired.is_empty() && released.is_empty() && other.is_empty() {
             return;
         }
@@ -1303,8 +1393,8 @@ impl GpuRuntime {
     }
 
     pub fn alloc_buffer_kind(&self, nbytes: usize, kind: BufferKind) -> Result<crate::tensor::GpuBuffer, String> {
-        if self.encode_failed.load(Ordering::Acquire) {
-            return Err("runtime is poisoned after encode/submit failure; recreate it".into());
+        if self.poison.is_set() {
+            return Err(self.poison.error());
         }
         if kind == BufferKind::Cold {
             crate::infer_trace::on_cold_alloc();
@@ -1556,8 +1646,8 @@ impl GpuRuntime {
         self.flush_residency();
         let async_on = self.async_encode_enabled();
         if async_on {
-            if let Err(error) = self.encode_into_batch_m4(skip_auto, f) {
-                self.encode_failed.store(true, Ordering::Release);
+            if let Err(error) = self.encode_into_batch_m4(skip_auto, false, f) {
+                self.poison.set(error.as_str());
                 return Err(error);
             }
             if let Ok(mut c) = self.dispatch_count.lock() {
@@ -1566,8 +1656,8 @@ impl GpuRuntime {
             return Ok(());
         }
         let result = self.with_binder_sync(skip_auto, f);
-        if result.is_err() {
-            self.encode_failed.store(true, Ordering::Release);
+        if let Err(error) = &result {
+            self.poison.set(error.as_str());
         }
         result
     }
@@ -1580,6 +1670,7 @@ impl GpuRuntime {
             None => true,
         };
         if need_begin {
+            let mut caught_up = None;
             let alloc_idx = {
                 let mut slots = m4.allocators.lock().map_err(|e| e.to_string())?;
                 // Prefer a free allocator so mid-commit never blocks host encode
@@ -1592,10 +1683,14 @@ impl GpuRuntime {
                     let (i0, v0) = (0usize, slots[0].in_flight);
                     let (i1, v1) = (1usize, slots[1].in_flight);
                     let (i, v) = if v0 <= v1 { (i0, v0) } else { (i1, v1) };
+                    let t0 = std::time::Instant::now();
                     if !m4.shared_event.waitUntilSignaledValue_timeoutMS(v, 30_000) {
-                        self.encode_failed.store(true, Ordering::Release);
-                        return Err("Metal 4 allocator SharedEvent wait timed out".to_string());
+                        let error = "Metal 4 allocator SharedEvent wait timed out";
+                        self.poison.set(error);
+                        return Err(error.to_string());
                     }
+                    crate::infer_trace::record_sync_wait(t0);
+                    caught_up = Some(v);
                     // Reset every slot that has completed (event ≥ in_flight).
                     for s in slots.iter_mut() {
                         if s.in_flight != 0 && s.in_flight <= v {
@@ -1605,11 +1700,12 @@ impl GpuRuntime {
                     }
                     i
                 };
-                if let Ok(mut idx) = m4.active_alloc.lock() {
-                    *idx = i;
-                }
                 i
             };
+            // After the slot lock: the drain takes the pool and residency.
+            if let Some(v) = caught_up {
+                self.drain_cold_recycles(v);
+            }
             let alloc = {
                 let slots = m4.allocators.lock().map_err(|e| e.to_string())?;
                 slots[alloc_idx].allocator.clone()
@@ -1623,11 +1719,8 @@ impl GpuRuntime {
                 }
                 stamped = true;
             }
-            let since = batch.as_ref().map(|b| b.since_commit).unwrap_or(0);
-            let total = batch.as_ref().map(|b| b.dispatches).unwrap_or(0);
             *batch = Some(ActiveMetal4Batch {
-                dispatches: total,
-                since_commit: since,
+                dispatches: 0,
                 cb_open: true,
                 stamped_t0: stamped,
                 encoder: None,
@@ -1638,18 +1731,23 @@ impl GpuRuntime {
         Ok(())
     }
 
-    fn encode_into_batch_m4<F>(&self, skip_auto: Option<bool>, f: F) -> Result<(), String>
+    /// Encode one binder scope into the open command buffer. `commit_follows`
+    /// is true when the caller commits with a wait right after, so a mid-commit
+    /// here would only split the buffer -- and leave the waiting commit no
+    /// open buffer to stamp its end timestamp on.
+    fn encode_into_batch_m4<F>(&self, skip_auto: Option<bool>, commit_follows: bool, f: F) -> Result<(), String>
     where
         F: FnOnce(&mut crate::dispatch::Binder<'_>) -> Result<(), String>,
     {
-        autoreleasepool(|_| self.encode_into_batch_m4_inner(skip_auto, f))
+        autoreleasepool(|_| self.encode_into_batch_m4_inner(skip_auto, commit_follows, f))
     }
 
-    fn encode_into_batch_m4_inner<F>(&self, skip_auto: Option<bool>, f: F) -> Result<(), String>
+    fn encode_into_batch_m4_inner<F>(&self, skip_auto: Option<bool>, commit_follows: bool, f: F) -> Result<(), String>
     where
         F: FnOnce(&mut crate::dispatch::Binder<'_>) -> Result<(), String>,
     {
         let m4 = &self.metal4;
+        self.reclaim_const_arena_if_low()?;
         // Clone Retained encoder so we do not hold `active_m4` across `f`
         // (nested with_binder / flush would otherwise deadlock the Mutex).
         let (enc, pending_edge) = {
@@ -1699,12 +1797,12 @@ impl GpuRuntime {
             })) {
                 Ok(Ok(())) => {}
                 Ok(Err(e)) => {
-                    self.encode_failed.store(true, Ordering::Release);
+                    self.poison.set(e.as_str());
                     self.abort_open_batch();
                     return Err(e);
                 }
                 Err(panic) => {
-                    self.encode_failed.store(true, Ordering::Release);
+                    self.poison.set("a with_binder closure panicked");
                     self.abort_open_batch();
                     std::panic::resume_unwind(panic);
                 }
@@ -1716,16 +1814,36 @@ impl GpuRuntime {
             let batch = guard.as_mut().ok_or_else(|| "M4 batch missing".to_string())?;
             batch.hazard_pending = hazard_pending;
             batch.dispatches += 1;
-            batch.since_commit += 1;
             let thresh = mid_commit_threshold();
             // thresh==0 → mid-commit off (single CB / token). Hard cap avoids
             // unbounded CB growth if a client encodes without synchronize.
-            (thresh > 0 && batch.since_commit >= thresh) || batch.dispatches >= 100_000
+            !commit_follows
+                && ((thresh > 0 && batch.dispatches >= thresh) || batch.dispatches >= METAL4_MAX_DISPATCHES_PER_CB)
         };
         if hit_mid {
             self.commit_m4(/*wait*/ false)?;
         }
         Ok(())
+    }
+
+    /// Rewind the const arena before a scope that might not fit in it.
+    ///
+    /// A non-waiting commit keeps the arena cursor, because the GPU may still
+    /// read the slots behind it, so a run that encodes without `synchronize`
+    /// would otherwise fill the arena and fail a bind -- poisoning the runtime.
+    /// Instead, with less than [`METAL4_CONST_ARENA_RESERVE`] left, commit the
+    /// open command buffer and wait for every one in flight; the waiting
+    /// commit then rewinds the cursor. One host wait per ~12 MiB of constants.
+    fn reclaim_const_arena_if_low(&self) -> Result<(), String> {
+        let used = *self.metal4.const_cursor.lock().map_err(|e| e.to_string())?;
+        if used.saturating_add(METAL4_CONST_ARENA_RESERVE) <= self.metal4.const_staging.length() {
+            return Ok(());
+        }
+        // Without its own wait, so the open command buffer does not stamp the
+        // end timestamp a caller's `synchronize` reads; the waiting commit
+        // then takes the closed-batch path: wait all, rewind, drain recycles.
+        self.commit_m4(false)?;
+        self.commit_m4(true)
     }
 
     fn with_binder_sync<F>(&self, skip_auto: Option<bool>, f: F) -> Result<(), String>
@@ -1741,7 +1859,7 @@ impl GpuRuntime {
                 *self.async_encode.lock().map_err(|e| e.to_string())? = true;
             }
             let result = (|| {
-                self.encode_into_batch_m4(skip_auto, f)?;
+                self.encode_into_batch_m4(skip_auto, true, f)?;
                 self.commit_m4(true)
             })();
             if !was_async {
@@ -1758,8 +1876,8 @@ impl GpuRuntime {
     pub fn commit(&self, wait: bool) -> Result<(), String> {
         let _access = self.acquire_access()?;
         let result = self.commit_m4(wait);
-        if result.is_err() {
-            self.encode_failed.store(true, Ordering::Release);
+        if let Err(error) = &result {
+            self.poison.set(error.as_str());
         }
         result
     }
@@ -1768,7 +1886,7 @@ impl GpuRuntime {
         let mut guard = self.active_m4.lock().map_err(|e| e.to_string())?;
         let Some(batch) = guard.as_mut() else {
             if wait {
-                self.drain_cold_recycles();
+                self.drain_cold_recycles(u64::MAX);
             }
             return Ok(());
         };
@@ -1796,7 +1914,7 @@ impl GpuRuntime {
                     *c = 0;
                 }
                 *guard = None;
-                self.drain_cold_recycles();
+                self.drain_cold_recycles(u64::MAX);
             }
             return Ok(());
         }
@@ -1819,29 +1937,23 @@ impl GpuRuntime {
         m4.command_buffer.endCommandBuffer();
         let watch = self.commit_with_feedback()?;
         batch.cb_open = false;
-        batch.since_commit = 0;
 
-        let next = {
-            let mut v = m4.event_value.lock().map_err(|e| e.to_string())?;
-            *v += 1;
-            *v
-        };
+        let next = m4.event_value.fetch_add(1, Ordering::AcqRel) + 1;
         m4.queue
             .signalEvent_value(ProtocolObject::<dyn MTLEvent>::from_ref(&*m4.shared_event), next);
-        // Mark this allocator in-flight; switch active slot for next begin.
+        // Mark this allocator in-flight; the next begin picks a free slot.
         {
             let mut slots = m4.allocators.lock().map_err(|e| e.to_string())?;
             slots[batch.alloc_idx].in_flight = next;
             slots[batch.alloc_idx].feedback = Some(watch);
-            let mut idx = m4.active_alloc.lock().map_err(|e| e.to_string())?;
-            *idx = 1 - batch.alloc_idx;
         }
 
         if wait {
             let t0 = std::time::Instant::now();
             if !m4.shared_event.waitUntilSignaledValue_timeoutMS(next, 30_000) {
-                self.encode_failed.store(true, Ordering::Release);
-                return Err("Metal 4 SharedEvent wait timed out".to_string());
+                let error = "Metal 4 SharedEvent wait timed out";
+                self.poison.set(error);
+                return Err(error.to_string());
             }
             crate::infer_trace::record_sync_wait(t0);
             self.reset_all_allocators()?;
@@ -1861,12 +1973,14 @@ impl GpuRuntime {
             *guard = None;
             drop(guard);
             // Safe to removeAllocation + freelist now that CB completed.
-            self.drain_cold_recycles();
+            self.drain_cold_recycles(u64::MAX);
             self.observe_finished_feedback()?;
         } else {
             // Keep const_cursor; do not reuse offsets until a waiting commit.
             // Next encode opens on the other allocator.
             batch.cb_open = false;
+            // Without waiting, release what earlier command buffers finished.
+            self.drain_cold_recycles(m4.shared_event.signaledValue());
         }
         Ok(())
     }
@@ -1880,7 +1994,7 @@ impl GpuRuntime {
     fn commit_with_feedback(&self) -> Result<FeedbackWatch, String> {
         let state = Arc::new(FeedbackState::new());
         let state_cb = Arc::clone(&state);
-        let failed = Arc::clone(&self.encode_failed);
+        let poison = Arc::clone(&self.poison);
         let reports = Arc::clone(&self.commit_feedback_reports);
         let block = RcBlock::new(move |feedback: NonNull<ProtocolObject<dyn MTL4CommitFeedback>>| {
             reports.fetch_add(1, Ordering::Release);
@@ -1890,8 +2004,8 @@ impl GpuRuntime {
                 .error()
                 .map(|err| err.localizedDescription().to_string());
             if let Some(message) = message {
+                poison.set(format!("Metal 4 command buffer fault: {message}"));
                 state_cb.fail(message);
-                failed.store(true, Ordering::Release);
             } else {
                 state_cb.succeed();
             }
@@ -1950,7 +2064,7 @@ impl GpuRuntime {
                 continue;
             }
             if let Some(message) = watch.state.message() {
-                self.encode_failed.store(true, Ordering::Release);
+                self.poison.set(format!("Metal 4 command buffer fault: {message}"));
                 fault = Some(message);
             }
         }
@@ -1966,8 +2080,8 @@ impl GpuRuntime {
         if let Some(message) = fault {
             return Err(format!("Metal 4 command buffer fault: {message}"));
         }
-        if self.encode_failed.load(Ordering::Acquire) {
-            return Err("runtime is poisoned after encode/submit failure; recreate it".into());
+        if self.poison.is_set() {
+            return Err(self.poison.error());
         }
         Ok(())
     }
@@ -1985,8 +2099,9 @@ impl GpuRuntime {
         }
         let t0 = std::time::Instant::now();
         if !m4.shared_event.waitUntilSignaledValue_timeoutMS(max_v, 30_000) {
-            self.encode_failed.store(true, Ordering::Release);
-            return Err("Metal 4 SharedEvent wait timed out".to_string());
+            let error = "Metal 4 SharedEvent wait timed out";
+            self.poison.set(error);
+            return Err(error.to_string());
         }
         crate::infer_trace::record_sync_wait(t0);
         self.reset_all_allocators()
@@ -2086,11 +2201,19 @@ impl GpuRuntime {
                 std::mem::forget(buffer.clone());
             }
         }
-        for (buffer, _) in mutex_value_mut(&mut self.pending_cold_recycle).iter() {
+        for (_, (buffer, _)) in mutex_value_mut(&mut self.pending_cold_recycle).iter() {
             std::mem::forget(buffer.clone());
         }
-        for buffer in mutex_value_mut(&mut self.pending_retirement).iter() {
+        for (_, buffer) in mutex_value_mut(&mut self.pending_retirement).iter() {
             std::mem::forget(buffer.clone());
+        }
+        // A caller-owned buffer whose wraps have all dropped is kept alive only
+        // by this queue once the caller releases it too.
+        for (_, buffer) in mutex_value_mut(&mut self.pending_external_release).iter() {
+            std::mem::forget(buffer.clone());
+        }
+        for (_, (alloc, _)) in mutex_value_mut(&mut self.pending_release).iter() {
+            std::mem::forget(alloc.clone());
         }
     }
 }
@@ -2280,7 +2403,6 @@ fn try_init_metal4(device: &ProtocolObject<dyn MTLDevice>, timestamps: bool) -> 
                 feedback: None,
             },
         ]),
-        active_alloc: Mutex::new(0),
         command_buffer: cmd,
         argument_table: PersistentArgumentTable {
             table,
@@ -2291,7 +2413,7 @@ fn try_init_metal4(device: &ProtocolObject<dyn MTLDevice>, timestamps: bool) -> 
         shared_event,
         const_staging,
         const_cursor: Mutex::new(0),
-        event_value: Mutex::new(0),
+        event_value: AtomicU64::new(0),
         residency_count: Mutex::new(1),
     })
 }
@@ -2567,6 +2689,39 @@ mod timestamp_decode_tests {
         let short = vec![0u8; need - 1];
         let err = decode_two_timestamps(&short).expect_err("short buffer must not decode");
         assert!(err.contains("too small"), "{err}");
+    }
+}
+
+#[cfg(test)]
+mod mid_commit_tests {
+    /// The Metal 4 encode tests, re-run with a mid-commit after every dispatch.
+    ///
+    /// `TESSL_MID_COMMIT` is read once per process, so the parent only re-runs
+    /// those tests in a child that has it set. Every commit boundary then
+    /// lands on a dispatch: the synchronous path, which commits and waits
+    /// after each scope, must not also commit without waiting first (that
+    /// left nothing to stamp the end timestamp on), and the async path must
+    /// keep its constants and results across the boundary.
+    #[test]
+    fn metal4_encode_survives_a_mid_commit_at_every_dispatch() {
+        const TESTS: [&str; 3] = [
+            "runtime::tests::metal4_encode_smoke_copy",
+            "runtime::tests::metal4_batched_multi_dispatch_const_arena",
+            "runtime::tests::metal4_arg_table_offset_and_multi_const",
+        ];
+        let exe = std::env::current_exe().expect("test binary path");
+        let out = std::process::Command::new(exe)
+            .args(["--exact", "--test-threads=1"])
+            .args(TESTS)
+            .env("TESSL_MID_COMMIT", "1")
+            .output()
+            .expect("spawn mid-commit child tests");
+        let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+        let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+        assert!(out.status.success(), "mid-commit child failed:\n{stdout}\n{stderr}");
+        // A filter that matched nothing also exits 0 — make that loud.
+        let ran = format!("{} passed", TESTS.len());
+        assert!(stdout.contains(&ran), "child did not run all of {TESTS:?}:\n{stdout}");
     }
 }
 

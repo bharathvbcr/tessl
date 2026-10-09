@@ -110,6 +110,12 @@ All notable changes to `tessl` are recorded here. The format follows
 
 ### Changed
 
+- **`infer_trace` counts every allocator catch-up as a sync wait.** The
+  counter's doc says `sync_waits` and `sync_wait_us` include allocator
+  catch-ups, but only the catch-up inside a waiting commit was counted; the
+  one a new command buffer makes when both allocators are in flight was not.
+  It is now, so a run that mid-commits (`TESSL_MID_COMMIT`, the 100k-dispatch
+  cap, or a constant-arena reclaim) reports the host waits it actually makes.
 - **Qwen3.5 training step traffic.** Allocations a kernel writes in full
   are no longer zeroed on the host (808 allocations, 25.86 GB per 2B step at
   T = 2048); the step makes one attention workspace and uploads its indices
@@ -385,6 +391,35 @@ All notable changes to `tessl` are recorded here. The format follows
 
 ### Fixed
 
+- **Async encode without a waiting sync poisoned the runtime.** Every scalar
+  bind takes a slot in the 16 MiB constant arena, and only a waiting commit
+  rewound it, so a run that never called `synchronize` failed a bind with
+  "constant arena exhausted" after ~1M single-scalar dispatches and stayed
+  poisoned. A binder scope now first checks for 4 MiB of headroom and, short
+  of it, commits the open command buffer, waits for every one in flight and
+  rewinds the arena. The 100k-dispatch cap also counted across non-waiting
+  commits, so past 100k every dispatch committed its own command buffer; the
+  count, like the `TESSL_MID_COMMIT` threshold, is now per command buffer.
+- **Dropped buffers waited for a synchronize to be released.** Cold
+  temporaries, retired Hot buffers, external wraps and `mtl_tensor`
+  allocations queued on drop and left the queue only at a waiting commit, so
+  a run that commits without waiting kept every temporary it dropped
+  allocated and resident. Each release now records the shared-event value of
+  the commit that closes the command buffer open when it dropped, and leaves
+  the queue once the GPU has passed it: at every commit, waited or not. A
+  final drop that times out now also anchors the external and `mtl_tensor`
+  queues, which it had left to free under in-flight work.
+- **A poisoned runtime said only "poisoned".** Only the call that poisoned the
+  runtime saw the cause; every later refusal, including a command-buffer
+  fault reported on Metal's feedback thread, read "runtime is poisoned after
+  encode/submit failure". The refusal now names the first cause. The constant
+  arena's "exhausted or empty payload" error is split in two, and the
+  exhausted one gives the payload size, offset and arena size.
+- **`TESSL_MID_COMMIT` split synchronous scopes.** With async encode off,
+  each scope commits and waits, but the mid-commit threshold could first
+  commit it without waiting; the waiting commit then had no open command
+  buffer to stamp, so `take_metal4_stamps` returned nothing. Synchronous
+  scopes no longer mid-commit.
 - **`gemm_i8_dequant` bound its exact accumulation with the wrong product.**
   It took 127 × 127 as the largest int8 product, but (−128) × (−128) = 16384
   is larger, so at `k = 131072` an all-(−128) sum wrapped to −2³¹ without an

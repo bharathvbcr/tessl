@@ -420,7 +420,12 @@ All notable changes to `tessl` are recorded here. The format follows
   `adamw_step` on state the old weights made; both now refuse, as a
   pending training step does. `prefill` allocated whatever `max_new` asked
   (a 16 GiB session went through on a 1 MiB budget); it is checked against
-  the recommended working set before any GPU work.
+  the recommended working set before any GPU work. Attention heads that do
+  not group (query heads not a multiple of the KV heads) are refused with the
+  config instead of by attention mid-forward; `forward_rows` checks its rows
+  before running the forward (a bad row used to cost the whole forward's
+  dispatches); `score_answers` checks its answer count before allocating;
+  and `prefill` allocates the session's buffers before the prefill runs.
 - **`gemm_i8_dequant` bound its exact accumulation with the wrong product.**
   It took 127 × 127 as the largest int8 product, but (−128) × (−128) = 16384
   is larger, so at `k = 131072` an all-(−128) sum wrapped to −2³¹ without an

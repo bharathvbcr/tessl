@@ -819,3 +819,51 @@ fn stress_hostile_rows_and_answers() {
         assert!(s.score_answers(&[0], &too_many).is_err());
     });
 }
+
+/// Attention heads that do not group (query heads not a multiple of the KV
+/// heads) are refused with the config, not by attention part way through a
+/// forward.
+#[test]
+fn ungrouped_attention_heads_are_refused_at_the_config() {
+    let text = std::fs::read_to_string(fixture().join("config.json")).unwrap();
+    let bad = text
+        .replace("\"num_attention_heads\": 2", "\"num_attention_heads\": 3")
+        .replace("\"num_key_value_heads\": 1", "\"num_key_value_heads\": 2");
+    let m = Qwen35Config::from_config_json(&bad).expect_err("3 query over 2 KV heads was accepted");
+    assert!(m.contains("num_key_value_heads") || m.contains("kv_heads"), "{m}");
+    with_gpu(|rt| {
+        let cfg = Qwen35Config {
+            attn: AttnProjLayout::new(3, 2, 256).unwrap(),
+            ..tiny_config()
+        };
+        assert!(Qwen35Model::random_tower(rt, cfg, Precision::F32, 1).is_err());
+    });
+}
+
+/// What `forward_rows`, `prefill` and `score_answers` can tell is wrong from
+/// their arguments is refused before the forward runs: no dispatch at all.
+#[test]
+fn argument_refusals_encode_nothing() {
+    let st = SafeTensors::open(&fixture().join("model.safetensors")).unwrap();
+    let cfg = tiny_config();
+    with_gpu(|rt| {
+        let model = Qwen35Model::load(rt, &st, "model.", cfg.clone(), Precision::F32).unwrap();
+        let ids = seq(5);
+        let _ = rt.take_dispatch_count();
+        assert!(model.forward_rows(&ids, LogitRows::Rows(&[1, 5]), false).is_err());
+        assert_eq!(rt.take_dispatch_count(), 0, "forward_rows ran before refusing a row");
+        let mut s = model.begin(&ids).unwrap();
+        s.advance_to(cfg.layers.len()).unwrap();
+        let before = rt.current_allocated_bytes();
+        let huge = vec![0u32; qwen35::MAX_ANSWERS as usize + 1];
+        let m = s
+            .score_answers(&vec![0u32; 1 << 16], &huge)
+            .err()
+            .expect("4097 answers were accepted");
+        assert!(m.contains("answers"), "{m}");
+        assert!(
+            rt.current_allocated_bytes() <= before,
+            "score_answers allocated before refusing"
+        );
+    });
+}

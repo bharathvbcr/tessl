@@ -361,6 +361,14 @@ impl Qwen35Config {
         {
             return Err("Qwen35Config: rms_norm_eps and rope_theta must be positive".into());
         }
+        if self.attn.q_heads() % self.attn.kv_heads() != 0 {
+            return Err(format!(
+                "Qwen35Config: {} query heads do not group over {} kv_heads (num_attention_heads must be a \
+                 multiple of num_key_value_heads)",
+                self.attn.q_heads(),
+                self.attn.kv_heads()
+            ));
+        }
         if self.rotary_dim % 2 != 0 || self.rotary_dim > self.attn.head_dim() {
             return Err("Qwen35Config: rotary_dim must be even and at most head_dim".into());
         }
@@ -779,6 +787,7 @@ impl Qwen35Model {
     /// is [`LogitRows::All`]. The trace is the same whatever `rows` is.
     pub fn forward_rows(&self, ids: &[u32], rows: LogitRows<'_>, trace: bool) -> Result<ForwardOutput, String> {
         self.require_head("Qwen35Model::forward")?;
+        check_rows("Qwen35Model::forward_rows", rows, ids.len())?;
         let mut s = self.begin_impl(ids, trace, None)?;
         s.advance_to(self.layers.len())?;
         let logits = s.logits(rows)?;
@@ -846,7 +855,12 @@ impl Qwen35Model {
                  work (shorten the prompt or max_new, or free device memory)"
             ));
         }
+        // Everything the session holds is allocated before the prefill runs,
+        // so a failed allocation never throws a finished prefill away.
         let carry = self.alloc_carry(t, max_new)?;
+        let a = Acts::new(rt, cfg, self.precision, 1, false)?;
+        let logits_t = rt.alloc_tensor_f32(&[1, cfg.vocab as usize])?;
+        let scratch = DecodeScratch::new(rt, 1, q_heads, positions as usize, head_dim)?;
         let mut s = self.begin_impl(ids, false, Some(carry))?;
         s.advance_to(self.layers.len())?;
         let logits = s.logits(LogitRows::Last)?;
@@ -857,9 +871,9 @@ impl Qwen35Model {
         let decode = Decode {
             model: self,
             carry,
-            a: Acts::new(rt, cfg, self.precision, 1, false)?,
-            logits: rt.alloc_tensor_f32(&[1, cfg.vocab as usize])?,
-            scratch: DecodeScratch::new(rt, 1, q_heads, positions as usize, head_dim)?,
+            a,
+            logits: logits_t,
+            scratch,
             prefix_len: t,
             max_new,
             decoded: 0,
@@ -1449,9 +1463,7 @@ impl Staged<'_> {
             LogitRows::Last => Some(&last),
             LogitRows::Rows(r) => Some(r),
         };
-        if let Some(&bad) = pick.into_iter().flatten().find(|&&r| r >= t) {
-            return Err(format!("{WHAT}: position {bad} >= {t} tokens"));
-        }
+        check_rows(WHAT, rows, t as usize)?;
         let (rt, h, vocab) = (&m.rt, m.cfg.hidden as usize, m.cfg.vocab as usize);
         let n = pick.map_or(t as usize, <[u32]>::len);
         if n == 0 {
@@ -1486,6 +1498,13 @@ impl Staged<'_> {
         m.check_generation(WHAT, self.param_generation)?;
         if let Some(&bad) = rows.iter().find(|&&r| r >= t) {
             return Err(format!("{WHAT}: position {bad} >= {t} tokens"));
+        }
+        if answers.is_empty() || answers.len() > qwen35::MAX_ANSWERS as usize {
+            return Err(format!(
+                "{WHAT}: {} answers; 1..={} are scored per call",
+                answers.len(),
+                qwen35::MAX_ANSWERS
+            ));
         }
         if let Some(&bad) = answers.iter().find(|&&id| id >= cfg.vocab) {
             return Err(format!("{WHAT}: answer {bad} >= vocab {}", cfg.vocab));
@@ -1602,6 +1621,16 @@ impl Decode<'_> {
         self.broken = false;
         Ok(self.logits.buffer.read_f32()[..m.cfg.vocab as usize].to_vec())
     }
+}
+
+/// Refuse a [`LogitRows::Rows`] position past a sequence of `t` tokens.
+fn check_rows(what: &str, rows: LogitRows<'_>, t: usize) -> Result<(), String> {
+    if let LogitRows::Rows(r) = rows {
+        if let Some(&bad) = r.iter().find(|&&p| p as usize >= t) {
+            return Err(format!("{what}: position {bad} >= {t} tokens"));
+        }
+    }
+    Ok(())
 }
 
 /// A `[rows, cols]` activation read back as f32 (bf16 widened exactly).

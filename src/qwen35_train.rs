@@ -1513,6 +1513,10 @@ impl Qwen35Model {
     /// with `output`, also the residual stream out of it (a recomputation
     /// needs only the former, and skips the `down` projection's product).
     /// `attn_ws` is the step's attention workspace (an attention layer needs it).
+    /// The layer order is inference's (`Qwen35Model::layer`) on the training
+    /// kernels; `tests/qwen35_train.rs`
+    /// (`train_forward_hidden_states_are_the_inference_forwards`) pins the
+    /// two to the same hidden states.
     fn train_layer_forward(
         &self,
         layer: &Layer,

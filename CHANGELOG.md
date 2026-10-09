@@ -8,6 +8,22 @@ All notable changes to `tessl` are recorded here. The format follows
 
 ### Added
 
+- **Qwen3.5 decode in the model.** `Qwen35Model::prefill(ids, max_new)` runs
+  the forward's prefill keeping each layer's GDN state, conv state and K/V,
+  and returns the last position's logits with a `Decode` session whose
+  `step(id)` runs one token through the same layers on the decode kernels
+  (`conv1d_silu` on carried state, `gdn_recurrent` in place,
+  `attn_qk_norm_rope_suffix` and `attn_prefix_decode`). tessl owns the
+  composition: the layer order is one `Qwen35Model::layer` that the
+  prefill, the staged prefill and decode all run. Prefill of `N` tokens
+  plus decoded steps matches `forward(N + k)`'s last row within 1e-5
+  relative at F32 (`tests/qwen35_model.rs`).
+- **Chosen logit rows and answer scores.** `Qwen35Model::forward_rows` and
+  `Staged::logits` take `LogitRows::{All, Last, Rows}` and run the LM head for
+  those positions only, with no `[tokens, vocab]` buffer unless every row is
+  asked for. `Staged::score_answers` wires `qwen35::score_answer_rows` into
+  the model, on a `load_tower` model too.
+
 - **`Qwen35Model::adamw_step_scaled`.** `adamw_step` with parameter-table
   entry `i` at learning rate `hyper.lr * lr_scale[i]`: torch's AdamW with one
   param group per entry, so the scaled rate forms both the decoupled decay
@@ -110,6 +126,14 @@ All notable changes to `tessl` are recorded here. The format follows
 
 ### Changed
 
+- **Training's layer forward is pinned to inference's.** `train_forward`
+  composes the layers on the training kernels, separately from
+  `Qwen35Model`'s inference `layer`;
+  `train_forward_hidden_states_are_the_inference_forwards` holds its
+  final-norm output to `forward`'s at every position within 1e-5 relative
+  (observed 1.3e-6 and 1.7e-6 on the tiny and grouped fixtures), where the
+  loss comparison saw only the head's average. `qwen35_model`'s docs no
+  longer call it the one place the layer order is written.
 - **Qwen3.5 training step traffic.** Allocations a kernel writes in full
   are no longer zeroed on the host (808 allocations, 25.86 GB per 2B step at
   T = 2048); the step makes one attention workspace and uploads its indices

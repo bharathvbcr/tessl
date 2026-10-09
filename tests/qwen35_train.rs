@@ -283,6 +283,51 @@ fn tiny_grouped_gdn_step_matches_transformers_autograd() {
     eprintln!("grouped, bf16 storage: worst parameter gradient {worst:.2e}");
 }
 
+/// The training forward and the inference forward compose the layers
+/// separately (`train_layer_forward` on the training kernels, keeping what
+/// the backward reads; `Qwen35Model`'s one inference `layer`), so this pins
+/// the first to the second: every position's final-norm output from
+/// `train_forward` (`PendingStep::hidden`) against `forward`'s traced one,
+/// on the tiny fixture and the grouped one, F32 model on exact-f32 GEMMs.
+/// The loss comparison above sees only the head's average; this sees each
+/// hidden element. Bound set before the first run: 1e-5 of the largest
+/// magnitude (the GDN and attention kernels of the two paths sum in
+/// different orders, each within ~1e-7 relative of f64; a layer out of
+/// order, a norm offset or a dropped residual moves elements by their own
+/// size).
+#[test]
+fn train_forward_hidden_states_are_the_inference_forwards() {
+    for dir in [
+        fixture(),
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/qwen35_train_grouped"),
+    ] {
+        let cfg = Qwen35Config::from_config_file(&dir.join("config.json")).unwrap();
+        let (rt, model) = load_rt(&dir, "model.", cfg.clone(), Precision::F32);
+        let ids = ids(&dir);
+        let (t, h) = (ids.len(), cfg.hidden as usize);
+        let trace = model.forward(&ids, true).unwrap().trace;
+        assert_eq!(
+            trace.len(),
+            cfg.layers.len() + 1,
+            "trace: every layer, then the final norm"
+        );
+        let want: Vec<f64> = trace[cfg.layers.len()].iter().map(|&x| f64::from(x)).collect();
+        let p = model
+            .train_forward(&ids, GemmOperands::ExactF32, Supervise::Causal)
+            .unwrap();
+        let out = rt.alloc_tensor_f32(&[t, h]).unwrap();
+        let all: Vec<u32> = (0..t as u32).collect();
+        p.hidden(&all, &out).unwrap();
+        let got: Vec<f64> = out.buffer.read_f32()[..t * h].iter().map(|&x| f64::from(x)).collect();
+        let r = rel(&got, &want);
+        eprintln!(
+            "{}: train_forward vs forward hidden states, rel err {r:.2e}",
+            dir.display()
+        );
+        assert!(r <= 1e-5, "{}: hidden states rel err {r:.3e} > 1e-5", dir.display());
+    }
+}
+
 /// The step on bf16 GEMM operands (f32 accumulation, f32 weights, activations
 /// and gradients) against the same float32 transformers reference. Bounds set
 /// before the first run: the loss within 2^-8 relative and every gradient

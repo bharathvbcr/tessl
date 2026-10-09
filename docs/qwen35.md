@@ -1237,7 +1237,10 @@ is the largest non-GEMM share: 18 × 1.4 ms.
   `begin` and `prefill` still allocates its intermediates from the pool
   rather than reusing a session's. `Decode::step` waits for its logits every
   token, so it is not a GPU-resident loop, and its speed has not been
-  measured.
+  measured. A session (like a `Staged` prefill) does not record the
+  model's parameter generation, so a weight write between `prefill` and a
+  `step` (`adamw_step` takes `&self`) is not refused, as `PendingStep`
+  refuses it; the steps after it run on state the old weights made.
 - **bf16 inputs.** The kernels read f32 activations, which is what tessl's GEMM
   writes. A bf16-activation variant would halve their read traffic.
 - **Shared-prefix attention, remaining gaps.** Only head_dim 256 is compiled. The rows of

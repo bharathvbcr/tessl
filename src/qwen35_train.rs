@@ -41,9 +41,9 @@ use std::sync::Arc;
 
 use crate::attn_train::{attn_train_backward, attn_train_forward, AttnTrainDims, AttnTrainGrads, AttnTrainWorkspace};
 use crate::cross_entropy::{
-    cross_entropy_rows, cross_entropy_rows_accumulating, CeGrads, CeHidden, CeWorkspace, Reduction,
+    cross_entropy_rows, cross_entropy_rows_accumulating, gather_rows_f32, CeGrads, CeHidden, CeWorkspace, Reduction,
 };
-use crate::dispatch::{dispatch_1d, dispatch_2d, set_gpu_buf, set_gpu_buf_offset, set_u32};
+use crate::dispatch::{dispatch_1d, set_gpu_buf_offset, set_u32};
 use crate::gdn_train::{
     gdn_train_backward, gdn_train_forward, GdnTrainDims, GdnTrainGrads, GdnTrainInputs, GdnTrainWorkspace, GDN_TRAIN_DK,
 };
@@ -374,17 +374,7 @@ impl PendingStep {
         if n == 0 {
             return Ok(());
         }
-        let pos = rt.alloc_buffer_from_u32(positions)?;
-        let p = rt.pipeline("ce_gather_rows_f32")?;
-        dispatch_2d(rt, &p, h, n, |bnd| {
-            set_gpu_buf_offset(bnd, &self.xf.buffer, self.xf.byte_offset(), 0);
-            set_gpu_buf(bnd, &pos, 1);
-            set_gpu_buf_offset(bnd, &out.buffer, out.byte_offset(), 2);
-            set_u32(bnd, n as u32, 3);
-            set_u32(bnd, h as u32, 4);
-            set_u32(bnd, h as u32, 5);
-            set_u32(bnd, 0, 6);
-        })?;
+        gather_rows_f32(rt, WHAT, &self.xf, positions, out)?;
         rt.synchronize()
     }
 }
@@ -1523,6 +1513,10 @@ impl Qwen35Model {
     /// with `output`, also the residual stream out of it (a recomputation
     /// needs only the former, and skips the `down` projection's product).
     /// `attn_ws` is the step's attention workspace (an attention layer needs it).
+    /// The layer order is inference's (`Qwen35Model::layer`) on the training
+    /// kernels; `tests/qwen35_train.rs`
+    /// (`train_forward_hidden_states_are_the_inference_forwards`) pins the
+    /// two to the same hidden states.
     fn train_layer_forward(
         &self,
         layer: &Layer,

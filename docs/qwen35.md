@@ -544,10 +544,16 @@ cargo test --release --test shader_index_arithmetic   # includes the qwen35 sour
 ### The whole model: `tests/qwen35_model.rs`
 
 `tessl::qwen35_model` composes the kernels into the text model's prefill
-forward, loaded straight from the Hugging Face `.safetensors` checkpoint
-(`tessl::safetensors`, a strict reader; no conversion step). It is the one
-place the layer order, the norms' `1 + w` (formed in their kernels), the weight layouts and the
-tied LM head are written down. `Precision::Bf16` is the production numerics
+forward and decode, loaded straight from the Hugging Face `.safetensors` checkpoint
+(`tessl::safetensors`, a strict reader; no conversion step). It is where
+inference's layer order, the norms' `1 + w` (formed in their kernels), the weight layouts and the
+tied LM head are written down: one `layer` function that the prefill, the
+staged prefill and decode all run. Training composes its own layer forward
+on the training kernels (`train_layer_forward`, which keeps what the
+backward reads); `train_forward_hidden_states_are_the_inference_forwards`
+in `tests/qwen35_train.rs` pins its final-norm output to `forward`'s at
+every position (1.3e-6 relative on the tiny fixture, 1.7e-6 on the grouped
+one, bound 1e-5). `Precision::Bf16` is the production numerics
 (bf16 GEMM inputs, f32 everywhere else); `Precision::F32` keeps every
 activation f32 with exact-f32 GEMMs, which makes it the same computation as
 transformers' fp32 forward up to operation order.
@@ -585,6 +591,68 @@ that the bf16 transposed LM head needs. At 2B the peak memory footprint is
 peaked at 6.95, 5.93 and 10.79 GB.
 `src/bin/probe_load_memory.rs` measures this, and
 `bench/results/qwen35_load_rss_m5pro.txt` holds the runs.
+
+### Decode, chosen logit rows and answer scores
+
+tessl owns the decode loop rather than leaving it to callers: a caller
+wiring `gdn_recurrent`, `conv1d_silu` and `attn_prefix_decode` into its own
+loop would be one more copy of the layer order, which is the copy that
+drifts. `Qwen35Model::prefill(ids, max_new)` is `forward`'s prefill, except
+that each layer keeps what decode continues from: the GDN recurrent state
+(`gdn_chunk_forward`'s `state_out`), the conv state (`conv1d_silu`'s last
+`conv_kernel - 1` inputs) and its own K/V, which every decode step reads as
+the shared prefix. It returns the last position's logits and a `Decode`
+session; `Decode::step(id)` runs one token through the same `layer` on the
+decode kernels (the conv on carried state, ping-ponging two state buffers
+because its output state may not be its input; `gdn_recurrent` updating the
+state in place; `attn_qk_norm_rope_suffix` into a suffix cache of `max_new`
+slots, then `attn_prefix_decode`) and returns that token's logits. A step
+past `max_new` is refused, and a step that fails part way leaves the
+session refusing further steps rather than continuing from half-advanced
+state. A session, like a `Staged` prefill, records the model's parameter
+generation and refuses to continue once `write_parameters` or `adamw_step`
+has moved it, as a pending training step does. `prefill` checks the state
+it will keep against the device's recommended working set before any GPU
+work, as a training step checks its own. One sequence, batch 1.
+
+Beyond the fixture, the stress tests in the same file decode 40 random
+shapes (1 to 5 layers in any order, every conv width 2 to 8, grouped GDN
+and attention heads, value dims 32 to 128, rotary widths 2 to 256, prompts
+of 1 to 150 tokens) with synchronous and with asynchronous encoding (worst
+7.4e-7 against the 1e-5 bound), 140 tokens after a one-token prompt (F32
+2.0e-6; Bf16 4.5e-3 against 2e-2), three sessions of one model in turn with
+the pool churned between their steps, and a relaxed-precision switch under a
+live session (refused, then continued).
+
+The decode kernels sum in a different order from the prefill's (recurrent
+against chunked GDN, split-KV against tiled attention), so decode matches
+the prefill to f32 rounding rather than bit for bit.
+`prefill_then_decode_matches_forward_at_the_last_row` (`tests/qwen35_model.rs`)
+prefills `N` tokens, decodes three more, and holds every returned row to
+`forward(N + k)`'s last row, for `N` from 1 (a conv history shorter than
+its kernel) past the GDN chunk boundary (63, 64, 65, 70). Bounds were fixed
+before the first run:
+
+| model | bound (relative) | worst observed |
+|---|---:|---:|
+| tiny fixture, F32 | 1e-5, same top-1 | 1.1e-6 |
+| tiny fixture, Bf16 | 2e-2 | 0 |
+| four-layer tower, grouped GDN heads (1 key, 2 value), F32 | 1e-5, same top-1 | 6.2e-7 |
+
+Three steps rather than one because the conv state alternates between two
+buffers and the suffix grows a slot per step: reading the wrong conv side,
+a stale GDN state, the wrong query position, no carried conv state, or a
+suffix length stuck at 1 each fail it (the last only at the second step).
+
+The full-vocabulary head is 1 MB of f32 per position at the 2B's 248,320
+tokens, so `forward_rows(ids, rows, trace)` and `Staged::logits(rows)` run
+it for `LogitRows::All`, `Last` or chosen positions only: the chosen rows
+of the residual stream are gathered (the cross-entropy's row gather, shared
+with `PendingStep::hidden`), normed and multiplied, and nothing
+`[tokens, vocab]` is allocated. `Staged::score_answers(rows, answers)`
+wires `score_answer_rows` into the model: the answer tokens' logits at
+chosen positions and their log-softmax over the answers, with no logits row
+at all, on a model with or without the packed head.
 
 ## Training memory: where torch's backward spends it
 
@@ -1176,7 +1244,13 @@ is the largest non-GEMM share: 18 × 1.4 ms.
   is slow was not diagnosed.
 - **Two compositions of the same model.** `bench_qwen35_layers` (random
   weights, timing) and `qwen35_model` (real checkpoint, parity) each wire the
-  layers; the bench should run on `Qwen35Model` so a wiring fix lands once.
+  layers, prefill and decode; the bench should run on `Qwen35Model` and its
+  `Decode` session so a wiring fix lands once.
+- **Decode, remaining gaps.** One sequence per session, and each `forward`,
+  `begin` and `prefill` still allocates its intermediates from the pool
+  rather than reusing a session's. `Decode::step` waits for its logits every
+  token, so it is not a GPU-resident loop, and its speed has not been
+  measured.
 - **bf16 inputs.** The kernels read f32 activations, which is what tessl's GEMM
   writes. A bf16-activation variant would halve their read traffic.
 - **Shared-prefix attention, remaining gaps.** Only head_dim 256 is compiled. The rows of

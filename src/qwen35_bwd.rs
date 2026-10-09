@@ -352,6 +352,9 @@ pub fn attn_gate_bwd(
 const CONV_ROWS_PER_BLOCK: u32 = 256;
 /// Largest conv kernel width (`CONV_BWD_MAX_KW` in the kernel).
 const CONV_MAX_KW: u32 = 8;
+// The backward runs every width the forward does, which the config checks.
+const _: () =
+    assert!(*crate::qwen35::CONV_KERNEL_WIDTHS.start() == 2 && *crate::qwen35::CONV_KERNEL_WIDTHS.end() == CONV_MAX_KW);
 
 /// f32 elements of scratch [`conv1d_silu_bwd`] needs.
 pub fn conv1d_silu_bwd_part_len(batch: u32, seq: u32, channels: u32, kernel_width: u32) -> usize {

@@ -8,6 +8,25 @@ All notable changes to `tessl` are recorded here. The format follows
 
 ### Added
 
+- **Qwen3.5 decode in the model.** `Qwen35Model::prefill(ids, max_new)` runs
+  the forward's prefill keeping each layer's GDN state, conv state and K/V,
+  and returns the last position's logits with a `Decode` session whose
+  `step(id)` runs one token through the same layers on the decode kernels
+  (`conv1d_silu` on carried state, `gdn_recurrent` in place,
+  `attn_qk_norm_rope_suffix` and `attn_prefix_decode`). tessl owns the
+  composition: the layer order is one `Qwen35Model::layer` that the
+  prefill, the staged prefill and decode all run. Prefill of `N` tokens
+  plus decoded steps matches `forward(N + k)`'s last row within 1e-5
+  relative at F32 (`tests/qwen35_model.rs`).
+- **Chosen logit rows and answer scores.** `Qwen35Model::forward_rows` and
+  `Staged::logits` take `LogitRows::{All, Last, Rows}` and run the LM head for
+  those positions only, with no `[tokens, vocab]` buffer unless every row is
+  asked for. `Staged::score_answers` wires `qwen35::score_answer_rows` into
+  the model, on a `load_tower` model too.
+- **`nn::DecodeScratch::bytes`**, what `DecodeScratch::new` allocates, for a
+  memory check before allocating; and `qwen35::CONV_KERNEL_WIDTHS`, the conv
+  widths the forward and backward kernels are compiled for.
+
 - **`Qwen35Model::adamw_step_scaled`.** `adamw_step` with parameter-table
   entry `i` at learning rate `hyper.lr * lr_scale[i]`: torch's AdamW with one
   param group per entry, so the scaled rate forms both the decoupled decay
@@ -116,6 +135,14 @@ All notable changes to `tessl` are recorded here. The format follows
   one a new command buffer makes when both allocators are in flight was not.
   It is now, so a run that mid-commits (`TESSL_MID_COMMIT`, the 100k-dispatch
   cap, or a constant-arena reclaim) reports the host waits it actually makes.
+- **Training's layer forward is pinned to inference's.** `train_forward`
+  composes the layers on the training kernels, separately from
+  `Qwen35Model`'s inference `layer`;
+  `train_forward_hidden_states_are_the_inference_forwards` holds its
+  final-norm output to `forward`'s at every position within 1e-5 relative
+  (observed 1.3e-6 and 1.7e-6 on the tiny and grouped fixtures), where the
+  loss comparison saw only the head's average. `qwen35_model`'s docs no
+  longer call it the one place the layer order is written.
 - **Qwen3.5 training step traffic.** Allocations a kernel writes in full
   are no longer zeroed on the host (808 allocations, 25.86 GB per 2B step at
   T = 2048); the step makes one attention workspace and uploads its indices
@@ -420,6 +447,20 @@ All notable changes to `tessl` are recorded here. The format follows
   commit it without waiting; the waiting commit then had no open command
   buffer to stamp, so `take_metal4_stamps` returned nothing. Synchronous
   scopes no longer mid-commit.
+- **Qwen3.5 configs and sessions that failed late now fail first.**
+  `Qwen35Config` refused only a zero `linear_conv_kernel_dim`, so a width
+  the conv kernels lack (1, or past 8) loaded and then failed part way
+  through the first forward; it is refused with the config. A `Staged`
+  prefill or `Decode` session continued across `write_parameters` or
+  `adamw_step` on state the old weights made; both now refuse, as a
+  pending training step does. `prefill` allocated whatever `max_new` asked
+  (a 16 GiB session went through on a 1 MiB budget); it is checked against
+  the recommended working set before any GPU work. Attention heads that do
+  not group (query heads not a multiple of the KV heads) are refused with the
+  config instead of by attention mid-forward; `forward_rows` checks its rows
+  before running the forward (a bad row used to cost the whole forward's
+  dispatches); `score_answers` checks its answer count before allocating;
+  and `prefill` allocates the session's buffers before the prefill runs.
 - **`gemm_i8_dequant` bound its exact accumulation with the wrong product.**
   It took 127 × 127 as the largest int8 product, but (−128) × (−128) = 16384
   is larger, so at `k = 131072` an all-(−128) sum wrapped to −2³¹ without an

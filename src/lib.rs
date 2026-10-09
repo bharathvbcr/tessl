@@ -108,7 +108,7 @@
 //! Qwen3.5 layer kernels — the gated delta net (chunked prefill and
 //! snapshot-reading decode), its causal conv and gated norm, the attention
 //! extras, and answer-row scoring — are in [`qwen35`], and the whole
-//! Qwen3.5 text forward built from them in [`qwen35_model`]. The LM-head
+//! Qwen3.5 text forward and decode built from them in [`qwen35_model`]. The LM-head
 //! cross-entropy and its gradients are in [`cross_entropy`], and the gated
 //! delta rule's training forward and backward in [`gdn_train`], and the
 //! backward of the layer's row-local ops in [`qwen35_bwd`], and full

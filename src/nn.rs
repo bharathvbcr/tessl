@@ -1349,14 +1349,28 @@ impl DecodeScratch {
         head_dim: u32,
         chunk: DecodeChunk,
     ) -> Result<Self, String> {
-        let elems = decode_scratch_elems(batch, heads, key_capacity, head_dim, chunk.keys(), "DecodeScratch")?;
-        let bytes = elems
+        Ok(Self {
+            buf: rt.alloc_buffer(Self::bytes_with_chunk(batch, heads, key_capacity, head_dim, chunk)?)?,
+        })
+    }
+
+    /// Bytes [`Self::new`] allocates for these arguments: what a caller
+    /// checks against the device's memory before allocating.
+    pub fn bytes(batch: u32, heads: u32, key_capacity: usize, head_dim: u32) -> Result<usize, String> {
+        Self::bytes_with_chunk(batch, heads, key_capacity, head_dim, decode_chunk_for(head_dim))
+    }
+
+    fn bytes_with_chunk(
+        batch: u32,
+        heads: u32,
+        key_capacity: usize,
+        head_dim: u32,
+        chunk: DecodeChunk,
+    ) -> Result<usize, String> {
+        decode_scratch_elems(batch, heads, key_capacity, head_dim, chunk.keys(), "DecodeScratch")?
             .max(1)
             .checked_mul(std::mem::size_of::<f32>())
-            .ok_or("DecodeScratch: byte size overflows")?;
-        Ok(Self {
-            buf: rt.alloc_buffer(bytes)?,
-        })
+            .ok_or_else(|| "DecodeScratch: byte size overflows".to_string())
     }
 
     pub fn buffer(&self) -> &GpuBuffer {

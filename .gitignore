@@ -67,3 +67,30 @@ Thumbs.db
 
 # CPU emulator build output (tools/msl_emu/build.sh).
 /tools/msl_emu/build/
+
+# GitPulse local state (worktrees, ledger) and the per-checkout Claude account marker.
+.gitpulse/
+.claude-account
+
+# Rust leftovers: rustfmt backups, crash dumps.
+**/*.rs.bk
+*.core
+
+# Python test/coverage/notebook caches not covered above.
+.coverage
+.coverage.*
+htmlcov/
+.ipynb_checkpoints/
+.hypothesis/
+.tox/
+.nox/
+
+# Metal/Xcode captures and Instruments traces; large, machine-local.
+*.gputrace
+*.trace
+xcuserdata/
+DerivedData/
+
+# Logs and scratch output.
+*.log
+*.tmp

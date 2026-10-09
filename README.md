@@ -6,13 +6,13 @@
 </p>
 
 <p align="center">
-  <strong>Low-overhead, zero-host-wait Metal 4 GEMM and encode runtime for Apple silicon.</strong><br>
-  Powered by Metal Performance Primitives (MPP) TensorOps <code>matmul2d</code>.
+  <strong>Low-overhead, zero-host-wait Metal 4 GEMM and GPU tensor runtime for Apple silicon.</strong><br>
+  Powered by Metal Performance Primitives (MPP) TensorOps <code>matmul2d</code>, neural network kernels, on-device Qwen3.5 training, and PyTorch interop.
 </p>
 
 ---
 
-`tessl` is a Rust GPU runtime substrate that executes high-performance matrix multiplication on Apple silicon through Metal 4 and Metal Performance Primitives (MPP) `matmul2d`, targeting the neural accelerators on Apple M-series hardware.
+`tessl` is a Rust GPU runtime substrate that executes high-performance matrix multiplication and deep learning operations on Apple silicon through Metal 4 and Metal Performance Primitives (MPP) `matmul2d`, targeting the neural accelerators on Apple M-series hardware.
 
 The name is short for *tessellation* — the design centers around how matrix operations are partitioned into tile geometries and the order in which those tiles are traversed.
 
@@ -22,12 +22,16 @@ The name is short for *tessellation* — the design centers around how matrix op
   <a href="https://docs.rs/tessl"><img src="https://img.shields.io/docsrs/tessl" alt="docs.rs"></a>
   <a href="https://github.com/bharathvbcr/tessl/actions/workflows/ci.yml"><img src="https://github.com/bharathvbcr/tessl/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
   <a href="#license"><img src="https://img.shields.io/crates/l/tessl.svg" alt="MIT OR Apache-2.0"></a>
+  <img src="https://img.shields.io/badge/Metal_4-macOS_26+-007AFF?style=flat&logo=apple&logoColor=white" alt="Metal 4">
+  <img src="https://img.shields.io/badge/Hardware-Apple_Silicon_M--series-000000?style=flat&logo=apple&logoColor=white" alt="Apple Silicon">
+  <img src="https://img.shields.io/badge/Rust-1.82+-DEA584?style=flat&logo=rust&logoColor=white" alt="Rust 1.82+">
 </p>
 
 <p align="center">
   <a href="https://tessl.vbcr.dev/"><strong>Live Interactive Benchmark Showcase (tessl.vbcr.dev)</strong></a> ·
   <a href="https://docs.rs/tessl"><strong>API documentation</strong></a> ·
   <a href="https://crates.io/crates/tessl"><strong>crates.io</strong></a> ·
+  <a href="docs/README.md">Docs Index</a> ·
   <a href="docs/architecture.md">Architecture</a> ·
   <a href="docs/benchmarking.md">Benchmarking</a> ·
   <a href="docs/verification.md">Verification</a>
@@ -37,7 +41,7 @@ The name is short for *tessellation* — the design centers around how matrix op
 | --- | --- |
 | **Status** | [`0.2.0`](https://crates.io/crates/tessl) — Metal 4 / MPP TensorOps verified on M5 Pro |
 | **API docs** | [docs.rs/tessl](https://docs.rs/tessl) — built on `aarch64-apple-darwin` with all features |
-| **Tests** | 530 `#[test]` functions across 50 integration files and the library, plus doc tests (`cargo test --release -- --test-threads=1`; the GPU suite needs an M-series Mac) |
+| **Tests** | 701 `#[test]` functions across 62 integration files and the library, plus doc tests (`cargo test --release -- --test-threads=1`; the GPU suite needs an M-series Mac) |
 | **Kernel coverage** | All 44 promoted kernels have a numeric test, not only a name check |
 | **Platform** | Apple silicon, macOS 26+, Xcode 26 Metal Toolchain |
 | **License** | MIT OR Apache-2.0 |
@@ -55,9 +59,11 @@ The name is short for *tessellation* — the design centers around how matrix op
 - **Qwen3.5 Layer Kernels (`tessl::qwen35`):** the gated delta net as two fused dispatches (a parallel per-chunk prep with the 64×64 triangular solve in threadgroup memory, then a sequential `simdgroup_matrix` scan), a snapshot-reading recurrent decode, shared-prefix attention (one KV prefix at batch stride 0 for many questions), causal conv+SiLU, gated RMSNorm, Qwen's partial RoPE and output gate, and scoring of only the answer rows — see [docs/qwen35.md](docs/qwen35.md). Checked against transformers' own Qwen3.5 code on a CPU emulator of the kernels and compiled by Apple's Metal compiler in CI (`-std=metal4.0 -Werror`), and tested on the M5 Pro GPU (`tests/qwen35_kernels.rs`); per-kernel, forward and `train_step` timings on the M5 Pro are in the same document.
 - **Qwen3.5 Training on the GPU (`tessl::qwen35_train`, `qwen35_bwd`, `gdn_train`, `attn_train`, `cross_entropy`):** one full training step of the Qwen3.5 text model — forward with per-layer recompute, causal-LM loss, and every parameter's gradient — without leaving Metal. The gated delta rule saves one state per 64 tokens (32 MiB/layer at the 2B's shapes, T = 2048, versus 435 MiB in torch); the LM-head cross-entropy runs in vocabulary chunks and never forms `[rows, vocab]` logits; every weight gradient is a per-block partial summed in order, so a step is deterministic with no atomics. A step can also be split in two halves for a loss computed outside tessl, accumulated into a gradient bank, and scored only at chosen positions. Measured against transformers' own f32 reference in [docs/qwen35.md](docs/qwen35.md).
 - **EmbeddingGemma 2 Encoder (`tessl::embedgemma2`):** the `google/embeddinggemma-2` text path from its own checkpoint — bidirectional attention with a symmetric sliding window and per-sequence lengths, per-layer inputs, row-range mean pooling, and Matryoshka prefixes (`encode`'s `truncate_dim`) normalized on the GPU — with ragged batches split into length-sorted forwards. See [EmbeddingGemma 2](docs/embedgemma2.md).
+- **BERT & DistilBERT Sparse Encoders (`tessl::bert`):** `BertForMaskedLM` and `DistilBertForMaskedLM` checkpoints producing exact vocabulary term weights (`max_t log1p(relu(logits))`) directly from safetensors. Features fused LayerNorms, exact erf GELU, and segmented sparse vocabulary reductions without materializing full logit tensors — see [BERT Encoders](docs/bert.md).
+- **Qwen3.5 bf16 Storage Training & Optimizers:** Trains `Precision::Bf16` models with matrices kept in bf16 and arithmetic in f32. Supports `UpdateRule` strategies (`F32Master`, `Bf16Kahan`, `Bf16Stochastic`) and `MomentStorage::Block8` (8-bit quantized moments with one f32 scale per 256 elements), fitting 4B training into a 48 GiB working set. Features scaled per-parameter learning rates (`adamw_step_scaled`) and unwaited AdamW execution.
 - **Device AdamW (`tessl::qwen35_adamw`):** `adamw_step` on any f32 tensor, and `Qwen35Model::adamw_step` over the model's own parameters in place — packed windows included — with `clip_grad_norm_`-style clipping and checkpoint/restore of the moments and step count. Params, gradients and both moments for the 2B come to 32 GB, which is what lets it fit a 64 GB Mac.
 - **bf16 Operands per Call (`GemmOperands`):** `gemm_bf16`, `gemm_tn_bf16`, `gemm_nt_bf16` and `qwen35_train` / `cross_entropy` options choose bf16 operands (f32 accumulate) for one call without changing the model's f32 storage; the 2B `train_step` on bf16 operands measures 2.44× the exact step at T = 2048.
-- **C ABI and torch binding (`src/capi.rs`, `python/tessl_torch`):** `libtessl.dylib` exposes the training path at ABI version 9 — cross-entropy, `chunk_gated_delta_rule` at transformers' own seam (`patch_transformers_qwen3_5()`), `Qwen35.train_step`, the two-phase step, the gradient bank and AdamW — so a torch loop can call into tessl. See [python/README.md](python/README.md).
+- **C ABI and torch binding (`src/capi.rs`, `python/tessl_torch`):** `libtessl.dylib` exposes the training path at ABI version 10 — cross-entropy, `chunk_gated_delta_rule` at transformers' own seam (`patch_transformers_qwen3_5()`), `Qwen35.train_step`, the two-phase step, the gradient bank and AdamW — so a torch loop can call into tessl. See [python/README.md](python/README.md).
 - **Embedded Metallib:** `GpuRuntime::new` loads the shader library from bytes included at compile time (`newLibraryWithData`), so a binary no longer depends on the build directory's `.metallib` still existing. `add_metallib_bytes` is the same load for an overlay.
 - **Fused GEMM Epilogue:** `C = activation(alpha * A@B + beta * C_prev + bias)` in a single dispatch, applied while the accumulator is still in registers — measured 1.6–2.4× cheaper than the same work as a separate pass over $C$.
 - **Mixed Precision & Quantization:** `f32`, `bf16`, `tf32-relaxed`, IEEE `binary16` (`DType::F16`), and an exact `int8 x int8 -> int32` GEMM with fused per-column dequantization (`nn::gemm_i8_dequant`).
@@ -85,7 +91,8 @@ flowchart TD
     subgraph TesslAPI["tessl Public API Surface"]
         GpuRt["GpuRuntime<br/>(Device, Allocator, Encoder Lease)"]
         GemmAPI["GEMM Suite<br/>gemm() · gemm_epilogue() · gemm_batched()"]
-        NnAPI["tessl::nn (62 Typed Entry Points)<br/>RMSNorm · FlashAttn · Softmax · Q4/Q8 GEMV"]
+        NnAPI["tessl::nn (86 Typed Entry Points)<br/>RMSNorm · FlashAttn · Softmax · Q4/Q8 GEMV"]
+        BertAPI["tessl::bert (Sparse Encoders)<br/>BERT · DistilBERT · OpenSearch"]
         TensorTypes["Tensor &lt;T&gt; / GpuBuffer<br/>(DType: F32, BF16, F16, I8, I32)"]
         IcbAPI["DecodeIcb &amp; PingPongCbReplay<br/>(ICB Capture &amp; Dual-Slot Replay)"]
     end
@@ -110,7 +117,7 @@ flowchart TD
     subgraph MetallibShaders["Compiled Metallib Shader Kernels"]
         TensorOps["matmul_tensorops.metal<br/>(MPP TensorOps matmul2d · Register Accumulation)"]
         SimdFallback["matmul_simdgroup.metal<br/>(Portable SIMDgroup Matrix Fallback)"]
-        NnKernels["30 Kernel Sources (202 Entry Points)<br/>RMSNorm · FlashAttn SWA/Global · MLX Q4/Q8 · RoPE · Qwen3.5 fwd/bwd · AdamW"]
+        NnKernels["35 Kernel Sources (256 Entry Points)<br/>RMSNorm · FlashAttn SWA/Global · MLX Q4/Q8 · RoPE · Qwen3.5 fwd/bwd · AdamW · BERT"]
     end
 
     Downstream -->|Typed API Calls| TesslAPI
@@ -490,8 +497,12 @@ TESSL_GEMM_TUNE=1 cargo build --release --bins
 | `bench_nn_kernels` | Throughput of the `nn` library, timed both batched and solo so the dispatch floor is visible rather than hidden. |
 | `bench_qwen35_layers` | Per-kernel and forward timings of the Qwen3.5 layer kernels at the 2B's shapes; `--paired-attn` times paired prefill attention. |
 | `bench_qwen35_train` | The training step's time at Qwen3.5-2B's shapes, each activation mode alone; `--batch` times a batch run row by row. |
+| `bench_paired` | Rust round-robin runner for paired benchmark lanes with min-of-N telemetry and per-round ratios. |
+| `bench_embedgemma2` | EmbeddingGemma 2 benchmark over ragged workloads, measuring peak device allocation and RSS. |
 | `probe_gdn_scan` | Probe of the gated-delta-net scan; `--paired` times paired 32- vs 16-column slice widths. |
 | `probe_gemm_parity` | Bit-exact verification probe comparing TensorOps against the reference SIMD path. |
+| `probe_storage_memory` | Measures parameter and optimizer memory footprint across Qwen3.5 precision variants. |
+| `probe_load_memory` | Measures model load memory and residency behavior. |
 | `bench/paired_cross_runtime.py` | Python harness driving paired `tessl` vs. PyTorch MPS / MLX evaluation. |
 
 ---
@@ -538,10 +549,12 @@ All runtime configuration uses the canonical `TESSL_*` prefix. Legacy
 
 | Document | Topic & Scope |
 |---|---|
+| [**Docs index**](docs/README.md) | Central guide and index to all architecture, model, benchmarking, and Apple Silicon hardware docs. |
 | [**API reference**](https://docs.rs/tessl) | Every public type, entry point and feature flag on docs.rs, rendered from the source of the released version. Start at the crate root for the platform requirements, the two quickstarts and the module map. |
 | [**Architecture**](docs/architecture.md) | Deep dive into kernel selection, cooperative destination register mechanics, $K$-reduction bandwidth analysis, and TN/NT layout optimizations. |
 | [**Benchmarking**](docs/benchmarking.md) | The paired measurement protocol, GPU thermal and frequency scaling mitigation, five measurement pitfalls, and plots of every recorded result in `bench/results/` (tessl against PyTorch and MLX, tile tuning, attention, Qwen3.5 memory and step time). |
-| [**EmbeddingGemma 2**](docs/embedgemma2.md) | The `google/embeddinggemma-2` text encoder: what it computes, its kernels, the bounds it is held to against sentence-transformers and the errors observed on an M5 Pro. No timings are published yet. |
+| [**EmbeddingGemma 2**](docs/embedgemma2.md) | The `google/embeddinggemma-2` text encoder: what it computes, its kernels, the bounds it is held to against sentence-transformers and the errors observed on an M5 Pro. |
+| [**BERT & DistilBERT**](docs/bert.md) | Learned sparse document encoders: fused LayerNorms, exact erf GELU, and segment sparse max reduction. |
 | [**Qwen3.5**](docs/qwen35.md) | The Qwen3.5 kernels, the training step and its backward, training-memory attribution against torch, AdamW, numerics and measured timings. |
 | [**torch binding**](python/README.md) | `tessl_torch`: calling the cross-entropy, GDN seam and whole-model `train_step` / AdamW from a PyTorch loop. |
 | [**Verification**](docs/verification.md) | Static tile geometry audit, randomized shape fuzzing, and fault injection test suites. |
@@ -563,6 +576,18 @@ below; the rest are capabilities the crate does not have.
 | **No CPU fallback** | Without a Metal 4 device, nothing runs. | Deliberate. This is an Apple-silicon runtime, and a silent CPU path would make every "GPU" benchmark here meaningless. |
 | **GPU CI on hosted runners** | Whether the suite runs unattended, or only on hardware I own. | Measured, not assumed: it does not. On `macos-26` the Metal Toolchain installs and every source under `kernels/` compiles and lints — the `check` job's `cargo build` does exactly that every push — but the device probe fails, so the shaders build there and cannot execute. The suite therefore runs on a gated self-hosted M5 runner. CI covers build, clippy, rustdoc and the static tile audit on every push; the tests do not run unattended. |
 | **Benchmark numbers in CI** | The GFLOP/s figures above are reproducible only by hand. | Hosted runners are virtualised and shared, so a timing from one describes the runner. The `bench` job runs the sweep on bare-metal Apple silicon and is gated behind a repository variable until such a runner is registered. |
+
+---
+
+## Ecosystem & Topics
+
+`tessl` powers low-latency inference and on-device training workloads across the Apple Silicon GPU ecosystem:
+
+- **Keywords & Topic Tags:** `metal-4`, `apple-silicon`, `gemm`, `tensorops`, `mpp`, `rust`, `deep-learning`, `machine-learning`, `pytorch`, `qwen35`, `embeddinggemma`, `bert`, `gpu-computing`, `llm`, `matrix-multiplication`, `neural-networks`, `bf16`, `zero-copy`
+- **Related Projects:**
+  - [**Interactive Benchmark Showcase**](https://tessl.vbcr.dev/) — Live benchmark telemetry, interactive visual charts, and device performance ladders.
+  - [**`tessl_torch`**](python/README.md) — PyTorch bindings and drop-in autograd extensions via `libtessl.dylib`.
+  - [**`sparsl`**](https://github.com/bharathvbcr/sparsl) — Metal 4 sparse matrix multiplication (SpMV / CSR / SpMM) companion library for Apple silicon.
 
 ---
 

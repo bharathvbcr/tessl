@@ -1,10 +1,15 @@
-//! The Qwen3.5 text model's prefill forward, composed from [`crate::qwen35`]'s
-//! kernels and loaded straight from a `.safetensors` checkpoint.
+//! The Qwen3.5 text model, composed from [`crate::qwen35`]'s kernels and
+//! loaded straight from a `.safetensors` checkpoint: the prefill forward, and
+//! decode continuing it a token at a time.
 //!
 //! Each kernel is checked against transformers on its own (`docs/qwen35.md`);
-//! this is the composition, the one place the layer order, norm offsets,
-//! weight layouts and tied LM head are written down, and what
+//! this is the composition: the layer order, norm offsets, weight layouts and
+//! tied LM head of inference, written once in `Qwen35Model::layer` for the
+//! prefill, the staged prefill and decode alike, and what
 //! `tests/qwen35_model.rs` checks end to end against transformers' logits.
+//! Training ([`crate::qwen35_train`]) runs its own layer forward, on the
+//! training kernels and keeping what its backward reads;
+//! `tests/qwen35_train.rs` pins its hidden states to this forward's.
 //!
 //! # Layer
 //!
@@ -33,20 +38,51 @@
 //! the tight oracle for the composition. It needs the runtime's relaxed-f32
 //! GEMM switched off (the default), and checks that it is.
 //!
-//! Prefill only, batch 1, positions from 0: the GDN state and K/V caches start
-//! empty and are not returned. Decode and many-question continuation use the
-//! kernels directly (`qwen35::gdn_recurrent`, `attn_prefix_rows`, ...).
+//! # Prefill and decode
+//!
+//! One sequence, batch 1, positions from 0. [`Qwen35Model::forward`] and
+//! [`Qwen35Model::begin`] prefill and keep nothing: the GDN and conv states
+//! start at zero and end with the call, and every attention layer's K/V lives
+//! in one buffer the next attention layer overwrites.
+//!
+//! Decode is tessl's to compose, not the caller's: the layer order is written
+//! here once, and a caller wiring `gdn_recurrent` and `attn_prefix_decode`
+//! into its own loop would be a second copy of it. [`Qwen35Model::prefill`]
+//! runs the same prefill keeping what decode continues from, per layer: the
+//! GDN recurrent state (`[v_heads, 128, v_dim]` f32, from `gdn_chunk_forward`'s
+//! `state_out`), the conv state (the last `conv_kernel - 1` inputs, from
+//! `conv1d_silu`'s), and each attention layer's own K/V, which becomes the
+//! shared prefix [`crate::qwen35::attn_prefix_decode`] reads. [`Decode::step`]
+//! then runs one token through the same layers on the decode kernels
+//! (`conv1d_silu` on carried state, `gdn_recurrent` updating the state in
+//! place, the token's K/V written to a suffix cache of `max_new` slots with
+//! `attn_qk_norm_rope_suffix`) and returns its logits. The decode kernels sum
+//! in a different order from the prefill ones (the recurrent rule against the
+//! chunked one, split-KV attention against tiled), so a decoded token's
+//! logits equal the prefill's at that position to f32 rounding, not bit for
+//! bit; `tests/qwen35_model.rs` holds them to a bound.
+//!
+//! # Logits
+//!
+//! [`Qwen35Model::forward_rows`] and [`Staged::logits`] compute the head for
+//! chosen positions only ([`LogitRows`]): `[vocab]` f32 per row is about 1 MB
+//! at the 2B's 248,320, so a caller that samples the next token asks for
+//! [`LogitRows::Last`]. [`Staged::score_answers`] scores a few answer tokens
+//! at chosen positions with no logits row at all
+//! ([`crate::qwen35::score_answer_rows`]), on a model with or without the
+//! packed head.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
+use crate::cross_entropy::gather_rows_f32;
 use crate::gemm::{gemm, gemm_nt_f32, GemmBackend};
 use crate::json::{self, Json, Syntax};
 use crate::loader::Loader;
-use crate::nn::AttnDims;
+use crate::nn::{AttnDims, DecodeScratch};
 use crate::qwen35::{
     self, AttnProjLayout, AttnShape, AttnTargets, Cols, GdnParams, GdnProjLayout, GdnWorkspace, LmHead, OutCols,
-    StateIn,
+    SharedPrefix, StateIn,
 };
 use crate::runtime::GpuRuntime;
 use crate::safetensors::SafeTensors;
@@ -419,13 +455,33 @@ impl Qwen35Model {
     }
 }
 
-/// What [`Qwen35Model::forward`] returns.
+/// What [`Qwen35Model::forward`] and [`Qwen35Model::forward_rows`] return.
 pub struct ForwardOutput {
-    /// `[tokens, vocab]` f32.
+    /// `[rows, vocab]` f32, one row per position the [`LogitRows`] chose
+    /// (`[tokens, vocab]` from [`Qwen35Model::forward`]).
     pub logits: Vec<f32>,
     /// With `trace`: the residual stream after each layer, `[tokens, hidden]`
     /// each; then the final norm's output. Empty otherwise.
     pub trace: Vec<Vec<f32>>,
+}
+
+/// Which positions' logits a forward computes and returns.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LogitRows<'a> {
+    /// Every position: `[tokens, vocab]`.
+    All,
+    /// The last position only, `[1, vocab]`: what choosing the next token reads.
+    Last,
+    /// These positions, in this order (repeats allowed): `[rows.len(), vocab]`.
+    Rows(&'a [u32]),
+}
+
+/// What [`Staged::score_answers`] returns, `[positions, answers]` f32 each.
+pub struct AnswerScores {
+    /// The answer tokens' logits at each position.
+    pub logits: Vec<f32>,
+    /// Their log-softmax over the answer set alone (not the vocabulary).
+    pub logprobs: Vec<f32>,
 }
 
 impl Qwen35Model {
@@ -710,33 +766,27 @@ impl Qwen35Model {
     /// position's logits; with `trace`, also the residual stream after each
     /// layer and the final norm's output (one host read per layer, so slower).
     pub fn forward(&self, ids: &[u32], trace: bool) -> Result<ForwardOutput, String> {
-        if self.precision == Precision::Bf16 && self.lm_head_bf16.is_none() {
-            return Err(
-                "Qwen35Model::forward: this model was loaded with load_tower (no LM head); \
-                 use begin / advance_to / final_norm_f32"
-                    .into(),
-            );
-        }
-        let cfg = &self.cfg;
-        let mut s = self.begin_impl(ids, trace, true)?;
+        self.forward_rows(ids, LogitRows::All, trace)
+    }
+
+    /// [`Self::forward`] with the LM head run for the positions `rows`
+    /// chooses only: the logits are `[rows, vocab]`, and the `[tokens,
+    /// vocab]` of every position is neither allocated nor read unless `rows`
+    /// is [`LogitRows::All`]. The trace is the same whatever `rows` is.
+    pub fn forward_rows(&self, ids: &[u32], rows: LogitRows<'_>, trace: bool) -> Result<ForwardOutput, String> {
+        self.require_head("Qwen35Model::forward")?;
+        let mut s = self.begin_impl(ids, trace, None)?;
         s.advance_to(self.layers.len())?;
-        let (rt, a, t) = (&self.rt, &s.a, s.a.t);
-        let logits_t = a
-            .logits
-            .as_ref()
-            .ok_or("Qwen35Model::forward: logits were not allocated")?;
-        self.norm(&a.resid, &self.final_norm, &a.x)?;
-        // The tied head: logits = x @ embed^T.
-        match &self.lm_head_bf16 {
-            Some(head) => gemm(&a.x, head, logits_t, BACKEND)?,
-            None => gemm_nt_f32(&a.x, &self.embed, logits_t, BACKEND)?,
-        }
-        rt.synchronize()?;
+        let logits = s.logits(rows)?;
         let mut out_trace = s.trace.take().unwrap_or_default();
         if trace {
-            out_trace.push(read_rows(&a.x, self.precision)?);
+            // The final norm of every row (the head's own pass covers only
+            // the chosen rows unless all were chosen); the same kernel on the
+            // same stream, so the same bits either way.
+            self.norm(&s.a.resid, &self.final_norm, &s.a.x)?;
+            self.rt.synchronize()?;
+            out_trace.push(read_rows(&s.a.x, self.precision)?);
         }
-        let logits = logits_t.buffer.read_f32()[..t as usize * cfg.vocab as usize].to_vec();
         Ok(ForwardOutput {
             logits,
             trace: out_trace,
@@ -746,67 +796,182 @@ impl Qwen35Model {
     /// Start a prefill of `ids` (one sequence, positions from 0) that runs
     /// only as many layers as asked: [`Staged::advance_to`] continues it,
     /// [`Staged::final_norm_f32`] reads the final norm of the residual stream
-    /// at the layer reached. Nothing of the LM head is touched or allocated,
-    /// so this works on a [`Self::load_tower`] model and at sequence lengths
-    /// whose `[tokens, vocab]` logits would not fit.
+    /// at the layer reached, [`Staged::logits`] the head for chosen rows and
+    /// [`Staged::score_answers`] answer tokens' scores. Nothing of the LM head
+    /// is allocated until one of the last two asks, so this works on a
+    /// [`Self::load_tower`] model and at sequence lengths whose `[tokens,
+    /// vocab]` logits would not fit.
     pub fn begin(&self, ids: &[u32]) -> Result<Staged<'_>, String> {
-        self.begin_impl(ids, false, false)
+        self.begin_impl(ids, false, None)
     }
 
-    fn begin_impl(&self, ids: &[u32], trace: bool, logits: bool) -> Result<Staged<'_>, String> {
-        let rt = &self.rt;
-        let cfg = &self.cfg;
-        if ids.is_empty() {
-            return Err("Qwen35Model::forward: no tokens".into());
+    /// Prefill `ids` (one sequence, positions from 0) for decoding up to
+    /// `max_new` tokens after it. Returns the [`Decode`] session that
+    /// continues the sequence and the last position's logits (`[vocab]` f32:
+    /// the distribution of the first new token).
+    ///
+    /// The prefill is [`Self::forward`]'s, layer for layer, except that each
+    /// layer keeps its state (see the module docs): every attention layer
+    /// holds `ids.len() + max_new` positions of K/V and every GDN layer its
+    /// recurrent and conv states until the session is dropped. Refused on a
+    /// bf16 [`Self::load_tower`] model, which has no head.
+    pub fn prefill(&self, ids: &[u32], max_new: u32) -> Result<(Decode<'_>, Vec<f32>), String> {
+        const WHAT: &str = "Qwen35Model::prefill";
+        self.require_head(WHAT)?;
+        let t = self.check_ids(WHAT, ids)?;
+        if max_new == 0 {
+            return Err(format!("{WHAT}: max_new must be at least 1"));
         }
-        if let Some(&bad) = ids.iter().find(|&&id| id >= cfg.vocab) {
-            return Err(format!("Qwen35Model::forward: token id {bad} >= vocab {}", cfg.vocab));
-        }
-        if self.precision == Precision::F32 && rt.relaxed_precision() {
-            return Err(
-                "Qwen35Model::forward: the F32 forward needs exact-f32 GEMMs; switch the \
-                 runtime's relaxed precision off"
-                    .into(),
-            );
-        }
-        let t = u32::try_from(ids.len()).map_err(|_| "Qwen35Model::forward: too many tokens")?;
-        let a = Acts::new(rt, cfg, self.precision, t, logits)?;
+        let positions = t
+            .checked_add(max_new)
+            .ok_or_else(|| format!("{WHAT}: {t} tokens plus max_new {max_new} exceed u32 positions"))?;
+        let carry = self.alloc_carry(t, max_new)?;
+        let mut s = self.begin_impl(ids, false, Some(carry))?;
+        s.advance_to(self.layers.len())?;
+        let logits = s.logits(LogitRows::Last)?;
+        let carry = s
+            .carry
+            .take()
+            .ok_or_else(|| format!("{WHAT}: the prefill lost its state"))?;
+        let (rt, cfg) = (&self.rt, &self.cfg);
+        let decode = Decode {
+            model: self,
+            carry,
+            a: Acts::new(rt, cfg, self.precision, 1, false)?,
+            logits: rt.alloc_tensor_f32(&[1, cfg.vocab as usize])?,
+            scratch: DecodeScratch::new(rt, 1, cfg.attn.q_heads(), positions as usize, cfg.attn.head_dim())?,
+            prefix_len: t,
+            max_new,
+            decoded: 0,
+            broken: false,
+        };
+        Ok((decode, logits))
+    }
 
-        let id_buf = rt.alloc_buffer(ids.len() * 4)?;
-        id_buf.write_u32(ids);
-        qwen35::embed_rows(
-            rt,
-            &id_buf,
-            t,
-            LmHead {
-                weight: &self.embed.buffer,
-                dtype: self.embed.dtype,
-                vocab: cfg.vocab,
-            },
-            cfg.hidden,
-            &a.resid.buffer,
-        )?;
+    fn begin_impl(&self, ids: &[u32], trace: bool, carry: Option<Vec<Carry>>) -> Result<Staged<'_>, String> {
+        let t = self.check_ids("Qwen35Model::forward", ids)?;
+        let a = Acts::new(&self.rt, &self.cfg, self.precision, t, carry.is_none())?;
+        self.embed_ids(ids, &a.resid)?;
         Ok(Staged {
             model: self,
             a,
             next: 0,
             trace: trace.then(Vec::new),
+            carry,
         })
+    }
+
+    /// What every run checks of its tokens and the runtime: at least one id,
+    /// each below the vocabulary, and exact-f32 GEMMs for the F32 forward.
+    /// Returns the token count.
+    fn check_ids(&self, what: &str, ids: &[u32]) -> Result<u32, String> {
+        if ids.is_empty() {
+            return Err(format!("{what}: no tokens"));
+        }
+        if let Some(&bad) = ids.iter().find(|&&id| id >= self.cfg.vocab) {
+            return Err(format!("{what}: token id {bad} >= vocab {}", self.cfg.vocab));
+        }
+        if self.precision == Precision::F32 && self.rt.relaxed_precision() {
+            return Err(format!(
+                "{what}: the F32 forward needs exact-f32 GEMMs; switch the runtime's relaxed precision off"
+            ));
+        }
+        u32::try_from(ids.len()).map_err(|_| format!("{what}: too many tokens"))
+    }
+
+    /// Refuse what needs the LM head on a model loaded without one.
+    fn require_head(&self, what: &str) -> Result<(), String> {
+        if self.precision == Precision::Bf16 && self.lm_head_bf16.is_none() {
+            return Err(format!(
+                "{what}: this model was loaded with load_tower (no LM head); use begin / advance_to / \
+                 final_norm_f32, or Staged::score_answers"
+            ));
+        }
+        Ok(())
+    }
+
+    /// `out[r] = embed[ids[r]]`, the residual stream's first value (`out` f32
+    /// `[ids.len(), hidden]`).
+    fn embed_ids(&self, ids: &[u32], out: &Tensor) -> Result<(), String> {
+        let id_buf = self.rt.alloc_buffer_from_u32(ids)?;
+        qwen35::embed_rows(
+            &self.rt,
+            &id_buf,
+            ids.len() as u32,
+            LmHead {
+                weight: &self.embed.buffer,
+                dtype: self.embed.dtype,
+                vocab: self.cfg.vocab,
+            },
+            self.cfg.hidden,
+            &out.buffer,
+        )
+    }
+
+    /// Fresh state for [`Self::prefill`] of `t` tokens and `max_new` after
+    /// them, one per layer. Nothing is read before it is written: the
+    /// prefill writes every state and prefix slot, and decode reads a suffix
+    /// slot only after writing it.
+    fn alloc_carry(&self, t: u32, max_new: u32) -> Result<Vec<Carry>, String> {
+        let (rt, cfg) = (&self.rt, &self.cfg);
+        let (g, l) = (cfg.gdn, cfg.attn);
+        let f32s = |n: usize| rt.alloc_buffer(n.max(1) * 4);
+        let conv = g.conv_dim() as usize * (cfg.conv_kernel as usize - 1);
+        let state = g.dims(1, 1).state_elems_per_row();
+        let kv_row = (l.kv_heads() * l.head_dim()) as usize;
+        cfg.layers
+            .iter()
+            .map(|kind| {
+                Ok(match kind {
+                    LayerKind::LinearAttention => Carry::Gdn(GdnCarry {
+                        conv: [f32s(conv)?, f32s(conv)?],
+                        state: f32s(state)?,
+                    }),
+                    LayerKind::FullAttention => Carry::Attn(AttnCarry {
+                        prefix_k: f32s(t as usize * kv_row)?,
+                        prefix_v: f32s(t as usize * kv_row)?,
+                        suffix_k: f32s(max_new as usize * kv_row)?,
+                        suffix_v: f32s(max_new as usize * kv_row)?,
+                    }),
+                })
+            })
+            .collect()
+    }
+
+    /// One decoder layer on `a.resid`, in place: the layer order of every
+    /// inference path (the prefill, the staged prefill and decode). `step`
+    /// picks the mixer's kernels and where its state starts and goes.
+    fn layer(&self, l: &Layer, a: &Acts, step: Step<'_>) -> Result<(), String> {
+        self.norm(&a.resid, &l.input_norm, &a.x)?;
+        match &l.mixer {
+            Mixer::Gdn(w) => self.gdn(w, a, step)?,
+            Mixer::Attn(w) => self.attention(w, a, step)?,
+        }
+        self.norm(&a.resid, &l.post_norm, &a.x)?;
+        self.mlp(l, a)
+    }
+
+    /// `out = (rms_norm(resid) * (1 + norm.w)) @ embedᵀ` for every row of
+    /// `resid` (f32 `[rows, hidden]`), through `x` (`[rows, hidden]` in the
+    /// activation dtype): the final norm and the tied LM head. `out` is f32
+    /// `[rows, vocab]`. Encoded, not waited for.
+    fn head(&self, resid: &Tensor, x: &Tensor, out: &Tensor) -> Result<(), String> {
+        self.norm(resid, &self.final_norm, x)?;
+        match &self.lm_head_bf16 {
+            Some(head) => gemm(x, head, out, BACKEND),
+            None => gemm_nt_f32(x, &self.embed, out, BACKEND),
+        }
     }
 
     /// `out = rms_norm(x) * (1 + w)` in the forward's activation dtype.
     fn norm(&self, x: &Tensor, w: &GpuBuffer, out: &Tensor) -> Result<(), String> {
         let (rows, dim) = (x.shape[0] as u32, x.shape[1] as u32);
-        let dtype = match self.precision {
-            Precision::Bf16 => DType::BF16,
-            Precision::F32 => DType::F32,
-        };
         qwen35::rms_norm(
             &self.rt,
             &x.buffer,
             w,
             &out.buffer,
-            dtype,
+            self.precision.dtype(),
             rows,
             dim,
             self.cfg.rms_norm_eps,
@@ -831,39 +996,83 @@ impl Qwen35Model {
         }
     }
 
-    fn gdn(&self, w: &GdnWeights, a: &Acts) -> Result<(), String> {
+    fn gdn(&self, w: &GdnWeights, a: &Acts, step: Step<'_>) -> Result<(), String> {
         let (rt, g, t) = (&self.rt, self.cfg.gdn, a.t);
         gemm(&a.x, &w.w_in, &a.g_proj, BACKEND)?;
         let proj = &a.g_proj.buffer;
-        qwen35::conv1d_silu(
-            rt,
-            Cols::dense(proj, g.width()),
-            &w.conv_w,
-            self.cfg.conv_kernel,
-            StateIn::Zero,
-            &a.g_qkv,
-            None,
-            1,
-            t,
-            g.conv_dim(),
-        )?;
-        qwen35::gdn_chunk_forward(
-            rt,
-            &g.dims(1, t),
-            &g.conv_qkv(&a.g_qkv),
-            &g.gates(proj),
-            &GdnParams {
-                a_log: &w.a_log,
-                dt_bias: &w.dt_bias,
-            },
-            StateIn::Zero,
-            &a.g_ws,
-            Cols::dense(&a.g_o, g.value_dim()),
-            None,
-        )?;
+        let x = Cols::dense(proj, g.width());
+        let kw = self.cfg.conv_kernel;
+        let (dims, qkv, gates) = (g.dims(1, t), g.conv_qkv(&a.g_qkv), g.gates(proj));
+        let params = GdnParams {
+            a_log: &w.a_log,
+            dt_bias: &w.dt_bias,
+        };
+        let out = Cols::dense(&a.g_o, g.value_dim());
+        match step {
+            // From zero state over the whole sequence: the chunked rule. A
+            // prefill that keeps its state leaves the conv's last inputs in
+            // side 0 and the recurrent state in place.
+            Step::Prefill | Step::Keep(_) => {
+                let keep = match step {
+                    Step::Keep(c) => Some(c.gdn()?),
+                    _ => None,
+                };
+                qwen35::conv1d_silu(
+                    rt,
+                    x,
+                    &w.conv_w,
+                    kw,
+                    StateIn::Zero,
+                    &a.g_qkv,
+                    keep.map(|c| &c.conv[0]),
+                    1,
+                    t,
+                    g.conv_dim(),
+                )?;
+                qwen35::gdn_chunk_forward(
+                    rt,
+                    &dims,
+                    &qkv,
+                    &gates,
+                    &params,
+                    StateIn::Zero,
+                    &a.g_ws,
+                    out,
+                    keep.map(|c| &c.state),
+                )?;
+            }
+            // One token on the carried state: the conv reads one side and
+            // writes the other (its output state may not be its input), and
+            // the recurrent rule updates the state in place.
+            Step::Decode(c, io) => {
+                let c = c.gdn()?;
+                qwen35::conv1d_silu(
+                    rt,
+                    x,
+                    &w.conv_w,
+                    kw,
+                    StateIn::PerBatch(&c.conv[io.side]),
+                    &a.g_qkv,
+                    Some(&c.conv[1 - io.side]),
+                    1,
+                    t,
+                    g.conv_dim(),
+                )?;
+                qwen35::gdn_recurrent(
+                    rt,
+                    &dims,
+                    &qkv,
+                    &gates,
+                    &params,
+                    StateIn::PerBatch(&c.state),
+                    out,
+                    Some(&c.state),
+                )?;
+            }
+        }
         qwen35::gated_rms_norm(
             rt,
-            Cols::dense(&a.g_o, g.value_dim()),
+            out,
             g.z(proj),
             &w.norm_w,
             OutCols {
@@ -878,51 +1087,94 @@ impl Qwen35Model {
         self.project_residual(&a.g_y, &w.w_out, a)
     }
 
-    fn attention(&self, w: &AttnWeights, a: &Acts) -> Result<(), String> {
+    fn attention(&self, w: &AttnWeights, a: &Acts, step: Step<'_>) -> Result<(), String> {
         let (rt, l, t) = (&self.rt, self.cfg.attn, a.t);
         gemm(&a.x, &w.w_in, &a.a_proj, BACKEND)?;
         let pc = Cols::dense(&a.a_proj.buffer, l.width());
-        qwen35::attn_qk_norm_rope(
-            rt,
-            &AttnShape {
-                batch: 1,
-                seq: t,
-                q_heads: l.q_heads(),
-                kv_heads: l.kv_heads(),
-                head_dim: l.head_dim(),
-                rotary_dim: self.cfg.rotary_dim,
-            },
-            pc,
-            &w.q_norm,
-            &w.k_norm,
-            &AttnTargets {
-                q_out: &a.a_q,
-                k_cache: &a.a_k,
-                v_cache: &a.a_v,
-            },
-            0,
-            self.cfg.rope_theta,
-            self.cfg.rms_norm_eps,
-        )?;
-        qwen35::attn_prefill(
-            rt,
-            &a.a_q,
-            &a.a_k,
-            &a.a_v,
-            &a.a_o,
-            &a.tkv,
-            &a.zero,
-            &a.zero,
-            AttnDims {
-                batch: 1,
-                tq: t,
-                heads: l.q_heads(),
-                heads_kv: l.kv_heads(),
-                window: 0,
-                scale: 1.0 / (l.head_dim() as f32).sqrt(),
-            },
-            false,
-        )?;
+        let shape = AttnShape {
+            batch: 1,
+            seq: t,
+            q_heads: l.q_heads(),
+            kv_heads: l.kv_heads(),
+            head_dim: l.head_dim(),
+            rotary_dim: self.cfg.rotary_dim,
+        };
+        let dims = AttnDims {
+            batch: 1,
+            tq: t,
+            heads: l.q_heads(),
+            heads_kv: l.kv_heads(),
+            window: 0,
+            scale: 1.0 / (l.head_dim() as f32).sqrt(),
+        };
+        let (theta, eps) = (self.cfg.rope_theta, self.cfg.rms_norm_eps);
+        match step {
+            // Positions 0..t into a cache of the prefill's own K/V: the shared
+            // buffers, or this layer's prefix when the state is kept.
+            Step::Prefill | Step::Keep(_) => {
+                let (k, v) = match step {
+                    Step::Keep(c) => {
+                        let c = c.attn()?;
+                        (&c.prefix_k, &c.prefix_v)
+                    }
+                    _ => a.kv()?,
+                };
+                qwen35::attn_qk_norm_rope(
+                    rt,
+                    &shape,
+                    pc,
+                    &w.q_norm,
+                    &w.k_norm,
+                    &AttnTargets {
+                        q_out: &a.a_q,
+                        k_cache: k,
+                        v_cache: v,
+                    },
+                    0,
+                    theta,
+                    eps,
+                )?;
+                qwen35::attn_prefill(rt, &a.a_q, k, v, &a.a_o, &a.tkv, &a.zero, &a.zero, dims, false)?;
+            }
+            // One token at position prefix_len + slot: cached at its suffix
+            // slot, attending to the prefix and the suffix so far.
+            Step::Decode(c, io) => {
+                let c = c.attn()?;
+                qwen35::attn_qk_norm_rope_suffix(
+                    rt,
+                    &shape,
+                    pc,
+                    &w.q_norm,
+                    &w.k_norm,
+                    &AttnTargets {
+                        q_out: &a.a_q,
+                        k_cache: &c.suffix_k,
+                        v_cache: &c.suffix_v,
+                    },
+                    io.prefix_len,
+                    io.slot,
+                    theta,
+                    eps,
+                )?;
+                qwen35::attn_prefix_decode(
+                    rt,
+                    &a.a_q,
+                    SharedPrefix {
+                        k: &c.prefix_k,
+                        v: &c.prefix_v,
+                        len: io.prefix_len,
+                    },
+                    &c.suffix_k,
+                    &c.suffix_v,
+                    &io.suffix_len,
+                    &io.q_pos,
+                    &a.a_o,
+                    io.scratch,
+                    dims,
+                    false,
+                )?;
+            }
+        }
         let width = l.q_heads() * l.head_dim();
         qwen35::attn_output_gate(
             rt,
@@ -958,6 +1210,75 @@ impl Qwen35Model {
     }
 }
 
+/// How one layer's mixer runs, and where its state starts and goes.
+#[derive(Clone, Copy)]
+enum Step<'c> {
+    /// Positions `0..t` from zero state, keeping nothing: every attention
+    /// layer's K/V in [`Acts`]' one pair of buffers.
+    Prefill,
+    /// Positions `0..t` from zero state, leaving the layer's state in its
+    /// carry ([`Qwen35Model::prefill`]).
+    Keep(&'c Carry),
+    /// One token after the carry's prefix and the tokens decoded before it.
+    Decode(&'c Carry, &'c DecodeIo<'c>),
+}
+
+/// What one layer hands from the prefill to decode, and decode from token
+/// to token.
+enum Carry {
+    Gdn(GdnCarry),
+    Attn(AttnCarry),
+}
+
+struct GdnCarry {
+    /// The conv's last `conv_kernel - 1` inputs, `[conv_dim, conv_kernel -
+    /// 1]`, twice: a step reads one and writes the other.
+    conv: [GpuBuffer; 2],
+    /// The recurrent state, `[v_heads, 128, v_dim]`, updated in place.
+    state: GpuBuffer,
+}
+
+struct AttnCarry {
+    /// The prefill's K/V, `[prefill tokens, kv_heads, head_dim]`: the shared
+    /// prefix every decode step reads.
+    prefix_k: GpuBuffer,
+    prefix_v: GpuBuffer,
+    /// The decoded tokens' K/V, `[max_new, kv_heads, head_dim]`; slot `s` is
+    /// position `prefix + s`.
+    suffix_k: GpuBuffer,
+    suffix_v: GpuBuffer,
+}
+
+impl Carry {
+    fn gdn(&self) -> Result<&GdnCarry, String> {
+        match self {
+            Carry::Gdn(c) => Ok(c),
+            Carry::Attn(_) => Err("Qwen35Model: a GDN layer was handed an attention layer's state".into()),
+        }
+    }
+
+    fn attn(&self) -> Result<&AttnCarry, String> {
+        match self {
+            Carry::Attn(c) => Ok(c),
+            Carry::Gdn(_) => Err("Qwen35Model: an attention layer was handed a GDN layer's state".into()),
+        }
+    }
+}
+
+/// What a decode step's mixers read besides their carry.
+struct DecodeIo<'s> {
+    /// Prefill tokens: the shared prefix's length.
+    prefix_len: u32,
+    /// Tokens decoded before this one: its suffix slot.
+    slot: u32,
+    /// The conv state side this step reads; it writes the other.
+    side: usize,
+    /// `slot + 1` and `prefix_len + slot`, one device u32 each.
+    suffix_len: GpuBuffer,
+    q_pos: GpuBuffer,
+    scratch: &'s DecodeScratch,
+}
+
 /// A prefill stopped between layers, from [`Qwen35Model::begin`].
 ///
 /// The residual stream after the last layer run stays on the device; run more
@@ -970,6 +1291,8 @@ pub struct Staged<'m> {
     a: Acts,
     next: usize,
     trace: Option<Vec<Vec<f32>>>,
+    /// [`Qwen35Model::prefill`]'s: where each layer leaves its state.
+    carry: Option<Vec<Carry>>,
 }
 
 impl Staged<'_> {
@@ -996,14 +1319,12 @@ impl Staged<'_> {
             ));
         }
         let a = &self.a;
-        for l in &m.layers[self.next..layer] {
-            m.norm(&a.resid, &l.input_norm, &a.x)?;
-            match &l.mixer {
-                Mixer::Gdn(w) => m.gdn(w, a)?,
-                Mixer::Attn(w) => m.attention(w, a)?,
-            }
-            m.norm(&a.resid, &l.post_norm, &a.x)?;
-            m.mlp(l, a)?;
+        for (i, l) in m.layers.iter().enumerate().take(layer).skip(self.next) {
+            let step = match &self.carry {
+                Some(c) => Step::Keep(&c[i]),
+                None => Step::Prefill,
+            };
+            m.layer(l, a, step)?;
             if let Some(trace) = self.trace.as_mut() {
                 m.rt.synchronize()?;
                 trace.push(a.resid.buffer.read_f32()[..(a.t * m.cfg.hidden) as usize].to_vec());
@@ -1038,6 +1359,172 @@ impl Staged<'_> {
             m.cfg.rms_norm_eps,
         )
     }
+
+    /// The final norm and LM head on the residual stream at the layer
+    /// reached, for the positions `rows` chooses: `[rows, vocab]` f32 (after
+    /// every layer, the model's logits). Only the chosen rows are normed,
+    /// multiplied and read back. Waits for the GPU. Refused on a bf16
+    /// [`Qwen35Model::load_tower`] model, which has no head.
+    pub fn logits(&self, rows: LogitRows<'_>) -> Result<Vec<f32>, String> {
+        const WHAT: &str = "Staged::logits";
+        let (m, a, t) = (self.model, &self.a, self.a.t);
+        m.require_head(WHAT)?;
+        let last = [t - 1];
+        // None: every row, in order, through the stream's own buffers.
+        let pick: Option<&[u32]> = match rows {
+            LogitRows::All => None,
+            LogitRows::Last if t == 1 => None,
+            LogitRows::Last => Some(&last),
+            LogitRows::Rows(r) => Some(r),
+        };
+        if let Some(&bad) = pick.into_iter().flatten().find(|&&r| r >= t) {
+            return Err(format!("{WHAT}: position {bad} >= {t} tokens"));
+        }
+        let (rt, h, vocab) = (&m.rt, m.cfg.hidden as usize, m.cfg.vocab as usize);
+        let n = pick.map_or(t as usize, <[u32]>::len);
+        if n == 0 {
+            return Ok(Vec::new());
+        }
+        let out = rt.alloc_tensor_f32(&[n, vocab])?;
+        match pick {
+            None => m.head(&a.resid, &a.x, &out)?,
+            Some(rows) => {
+                let picked = rt.alloc_tensor_f32(&[n, h])?;
+                gather_rows_f32(rt, WHAT, &a.resid, rows, &picked)?;
+                m.head(&picked, &activation(rt, m.precision, n, h)?, &out)?;
+            }
+        }
+        rt.synchronize()?;
+        Ok(out.buffer.read_f32()[..n * vocab].to_vec())
+    }
+
+    /// The `answers` tokens' logits at positions `rows`, and their
+    /// log-softmax over the answers alone, from the residual stream at the
+    /// layer reached: [`qwen35::score_answer_rows`], which applies the final
+    /// norm and dots each row with only the answers' rows of the tied head,
+    /// in f32 (a bf16 embedding is read as stored; the activations are not
+    /// rounded to bf16 as [`Self::logits`]' bf16 GEMM rounds them). No
+    /// logits row is formed, so it runs on a [`Qwen35Model::load_tower`]
+    /// model too. `answers` holds 1..=[`qwen35::MAX_ANSWERS`] token ids.
+    /// Waits for the GPU.
+    pub fn score_answers(&self, rows: &[u32], answers: &[u32]) -> Result<AnswerScores, String> {
+        const WHAT: &str = "Staged::score_answers";
+        let (m, t) = (self.model, self.a.t);
+        let (rt, cfg) = (&m.rt, &m.cfg);
+        if let Some(&bad) = rows.iter().find(|&&r| r >= t) {
+            return Err(format!("{WHAT}: position {bad} >= {t} tokens"));
+        }
+        if let Some(&bad) = answers.iter().find(|&&id| id >= cfg.vocab) {
+            return Err(format!("{WHAT}: answer {bad} >= vocab {}", cfg.vocab));
+        }
+        let n_rows = u32::try_from(rows.len()).map_err(|_| format!("{WHAT}: too many positions"))?;
+        let n_answers = u32::try_from(answers.len()).map_err(|_| format!("{WHAT}: too many answers"))?;
+        let n = rows.len() * answers.len();
+        let (slots, ans) = (rt.alloc_buffer_from_u32(rows)?, rt.alloc_buffer_from_u32(answers)?);
+        let (logits, logprobs) = (rt.alloc_buffer(n.max(1) * 4)?, rt.alloc_buffer(n.max(1) * 4)?);
+        qwen35::score_answer_rows(
+            rt,
+            &self.a.resid.buffer,
+            t,
+            cfg.hidden,
+            &slots,
+            n_rows,
+            &m.final_norm,
+            1.0,
+            cfg.rms_norm_eps,
+            LmHead {
+                weight: &m.embed.buffer,
+                dtype: m.embed.dtype,
+                vocab: cfg.vocab,
+            },
+            &ans,
+            n_answers,
+            &logits,
+            &logprobs,
+        )?;
+        rt.synchronize()?;
+        Ok(AnswerScores {
+            logits: logits.read_f32()[..n].to_vec(),
+            logprobs: logprobs.read_f32()[..n].to_vec(),
+        })
+    }
+}
+
+/// A sequence being decoded a token at a time, from
+/// [`Qwen35Model::prefill`]: every layer's state, and room for `max_new`
+/// tokens after the prefill. Each step runs the inference layer order on the
+/// decode kernels (see the module docs).
+pub struct Decode<'m> {
+    model: &'m Qwen35Model,
+    carry: Vec<Carry>,
+    /// One token's intermediates, reused by every step.
+    a: Acts,
+    /// `[1, vocab]` f32.
+    logits: Tensor,
+    scratch: DecodeScratch,
+    prefix_len: u32,
+    max_new: u32,
+    decoded: u32,
+    /// A step failed part way, so some layers' state may have advanced and
+    /// others not: the session refuses to continue.
+    broken: bool,
+}
+
+impl Decode<'_> {
+    /// The position the next token takes: the prefill's tokens plus those
+    /// decoded since.
+    pub fn position(&self) -> u32 {
+        self.prefix_len + self.decoded
+    }
+
+    /// Tokens this session can still decode.
+    pub fn remaining(&self) -> u32 {
+        self.max_new - self.decoded
+    }
+
+    /// Run `id` at [`Self::position`] through every layer, continuing each
+    /// layer's state, and return its logits (`[vocab]` f32: the distribution
+    /// of the token after it). Waits for the GPU. Refused, before any work,
+    /// once `max_new` tokens have been decoded, and for good after a step
+    /// that failed part way.
+    pub fn step(&mut self, id: u32) -> Result<Vec<f32>, String> {
+        const WHAT: &str = "Decode::step";
+        let m = self.model;
+        if self.broken {
+            return Err(format!(
+                "{WHAT}: an earlier step failed part way, so the layers' state is inconsistent; prefill again"
+            ));
+        }
+        if self.decoded >= self.max_new {
+            return Err(format!(
+                "{WHAT}: all {} tokens the session was prefilled for are decoded; prefill again with a \
+                 larger max_new",
+                self.max_new
+            ));
+        }
+        m.check_ids(WHAT, &[id])?;
+        let rt = &m.rt;
+        let slot = self.decoded;
+        let io = DecodeIo {
+            prefix_len: self.prefix_len,
+            slot,
+            side: (slot % 2) as usize,
+            suffix_len: rt.alloc_buffer_from_u32(&[slot + 1])?,
+            q_pos: rt.alloc_buffer_from_u32(&[self.prefix_len + slot])?,
+            scratch: &self.scratch,
+        };
+        m.embed_ids(&[id], &self.a.resid)?;
+        // From the first layer on, a failure leaves the state part advanced.
+        self.broken = true;
+        for (l, c) in m.layers.iter().zip(&self.carry) {
+            m.layer(l, &self.a, Step::Decode(c, &io))?;
+        }
+        m.head(&self.a.resid, &self.a.x, &self.logits)?;
+        rt.synchronize()?;
+        self.decoded += 1;
+        self.broken = false;
+        Ok(self.logits.buffer.read_f32()[..m.cfg.vocab as usize].to_vec())
+    }
 }
 
 /// A `[rows, cols]` activation read back as f32 (bf16 widened exactly).
@@ -1050,6 +1537,15 @@ fn read_rows(x: &Tensor, precision: Precision) -> Result<Vec<f32>, String> {
             .map(|&b| crate::tensor::bf16_bits_to_f32(b))
             .collect(),
     })
+}
+
+/// A `[rows, cols]` activation in the forward's dtype: what the norms, gated
+/// norm, output gate and SwiGLU write and the GEMMs read.
+fn activation(rt: &Arc<GpuRuntime>, p: Precision, rows: usize, cols: usize) -> Result<Tensor, String> {
+    match p {
+        Precision::Bf16 => rt.alloc_tensor_bf16(&[rows, cols]),
+        Precision::F32 => rt.alloc_tensor_f32(&[rows, cols]),
+    }
 }
 
 /// Every intermediate of one forward at `t` tokens, shared by all layers (the
@@ -1068,8 +1564,10 @@ struct Acts {
     g_ws: GdnWorkspace,
     a_proj: Tensor,
     a_q: GpuBuffer,
-    a_k: GpuBuffer,
-    a_v: GpuBuffer,
+    /// The attention layers' K/V, `[t, kv_heads, head_dim]` each, which every
+    /// attention layer overwrites; none when each layer keeps its own
+    /// ([`Carry`]).
+    kv: Option<(GpuBuffer, GpuBuffer)>,
     a_o: GpuBuffer,
     a_y: Tensor,
     tkv: GpuBuffer,
@@ -1077,26 +1575,16 @@ struct Acts {
     m_gate: Tensor,
     m_up: Tensor,
     m_mid: Tensor,
-    /// `[tokens, vocab]` f32, only for [`Qwen35Model::forward`].
-    logits: Option<Tensor>,
 }
 
 impl Acts {
-    fn new(rt: &Arc<GpuRuntime>, cfg: &Qwen35Config, p: Precision, t: u32, logits: bool) -> Result<Self, String> {
+    fn new(rt: &Arc<GpuRuntime>, cfg: &Qwen35Config, p: Precision, t: u32, shared_kv: bool) -> Result<Self, String> {
         let tu = t as usize;
         let (g, l) = (cfg.gdn, cfg.attn);
-        let act = |cols: usize| match p {
-            Precision::Bf16 => rt.alloc_tensor_bf16(&[tu, cols]),
-            Precision::F32 => rt.alloc_tensor_f32(&[tu, cols]),
-        };
+        let act = |cols: usize| activation(rt, p, tu, cols);
         let f32s = |n: usize| rt.alloc_buffer(n.max(1) * 4);
         let qd = (l.q_heads() * l.head_dim()) as usize;
         let kv = tu * (l.kv_heads() * l.head_dim()) as usize;
-        let u32_buf = |v: u32| -> Result<GpuBuffer, String> {
-            let b = rt.alloc_buffer(4)?;
-            b.write_u32(&[v]);
-            Ok(b)
-        };
         Ok(Self {
             t,
             resid: rt.alloc_tensor_f32(&[tu, cfg.hidden as usize])?,
@@ -1109,20 +1597,22 @@ impl Acts {
             g_ws: GdnWorkspace::new(rt, &g.dims(1, t))?,
             a_proj: rt.alloc_tensor_f32(&[tu, l.width() as usize])?,
             a_q: f32s(tu * qd)?,
-            a_k: f32s(kv)?,
-            a_v: f32s(kv)?,
+            kv: if shared_kv { Some((f32s(kv)?, f32s(kv)?)) } else { None },
             a_o: f32s(tu * qd)?,
             a_y: act(qd)?,
-            tkv: u32_buf(t)?,
-            zero: u32_buf(0)?,
+            tkv: rt.alloc_buffer_from_u32(&[t])?,
+            zero: rt.alloc_buffer_from_u32(&[0])?,
             m_gate: rt.alloc_tensor_f32(&[tu, cfg.intermediate as usize])?,
             m_up: rt.alloc_tensor_f32(&[tu, cfg.intermediate as usize])?,
             m_mid: act(cfg.intermediate as usize)?,
-            logits: if logits {
-                Some(rt.alloc_tensor_f32(&[tu, cfg.vocab as usize])?)
-            } else {
-                None
-            },
         })
+    }
+
+    /// The shared K/V of a prefill that keeps nothing.
+    fn kv(&self) -> Result<(&GpuBuffer, &GpuBuffer), String> {
+        self.kv
+            .as_ref()
+            .map(|(k, v)| (k, v))
+            .ok_or_else(|| "Qwen35Model: a prefill that keeps its state has no shared K/V".to_string())
     }
 }

@@ -41,9 +41,9 @@ use std::sync::Arc;
 
 use objc2_metal::MTLComputePipelineState;
 
-use crate::dispatch::{dispatch_2d, set_f32, set_gpu_buf, set_tensor, set_u32};
+use crate::dispatch::{dispatch_2d, set_f32, set_gpu_buf, set_gpu_buf_offset, set_tensor, set_u32};
 use crate::gemm::{cast_bf16_to_f32_into, GemmOperands};
-use crate::nn::{dispatch_tg_1d, reduce_tptg};
+use crate::nn::{dispatch_tg_1d, reduce_tptg, require_runtime};
 use crate::runtime::{BufferKind, GpuRuntime};
 use crate::tensor::{DType, GpuBuffer, Tensor};
 
@@ -490,4 +490,60 @@ fn ws_buffers(ws: &CeWorkspace) -> Vec<(&'static str, &GpuBuffer)> {
         v.push(("w32", &w.buffer));
     }
     v
+}
+
+/// `out[i, :] = src[positions[i], :]`: chosen rows of a dense f32
+/// `[rows, width]` tensor into a dense f32 `[positions.len(), width]` one
+/// (positions may repeat), with the gather that starts [`cross_entropy_rows`].
+/// For reading a few positions of a sequence's hidden states without the
+/// rest: [`crate::qwen35_train::PendingStep::hidden`], and the Qwen3.5
+/// forward's chosen logit rows. Encoded, not waited for.
+pub(crate) fn gather_rows_f32(
+    rt: &Arc<GpuRuntime>,
+    what: &str,
+    src: &Tensor,
+    positions: &[u32],
+    out: &Tensor,
+) -> Result<(), String> {
+    let (n, ss) = (positions.len(), src.shape());
+    if ss.len() != 2 || src.dtype != DType::F32 {
+        return Err(format!(
+            "{what}: the rows must be f32 [rows, width], got {:?} {ss:?}",
+            src.dtype
+        ));
+    }
+    let (rows, width) = (ss[0], ss[1]);
+    if out.shape() != [n, width] || out.dtype != DType::F32 {
+        return Err(format!(
+            "{what}: out must be f32 [{n}, {width}], got {:?} {:?}",
+            out.dtype,
+            out.shape()
+        ));
+    }
+    if let Some(&bad) = positions.iter().find(|&&p| p as usize >= rows) {
+        return Err(format!("{what}: position {bad} >= {rows} rows"));
+    }
+    require_runtime(rt, &src.buffer, format_args!("{what}: rows"))?;
+    require_runtime(rt, &out.buffer, format_args!("{what}: out"))?;
+    if out.overlaps(src) {
+        return Err(format!("{what}: out overlaps the rows it gathers from"));
+    }
+    if n == 0 || width == 0 {
+        return Ok(());
+    }
+    let (n32, w32) = (
+        u32::try_from(n).map_err(|_| format!("{what}: {n} positions exceed u32"))?,
+        u32::try_from(width).map_err(|_| format!("{what}: width {width} exceeds u32"))?,
+    );
+    let pos = rt.alloc_buffer_from_u32(positions)?;
+    let p = rt.pipeline("ce_gather_rows_f32")?;
+    dispatch_2d(rt, &p, width, n, |bnd| {
+        set_gpu_buf_offset(bnd, &src.buffer, src.byte_offset(), 0);
+        set_gpu_buf(bnd, &pos, 1);
+        set_gpu_buf_offset(bnd, &out.buffer, out.byte_offset(), 2);
+        set_u32(bnd, n32, 3);
+        set_u32(bnd, w32, 4);
+        set_u32(bnd, w32, 5);
+        set_u32(bnd, 0, 6);
+    })
 }

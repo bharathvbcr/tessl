@@ -23,6 +23,9 @@ All notable changes to `tessl` are recorded here. The format follows
   those positions only, with no `[tokens, vocab]` buffer unless every row is
   asked for. `Staged::score_answers` wires `qwen35::score_answer_rows` into
   the model, on a `load_tower` model too.
+- **`nn::DecodeScratch::bytes`**, what `DecodeScratch::new` allocates, for a
+  memory check before allocating; and `qwen35::CONV_KERNEL_WIDTHS`, the conv
+  widths the forward and backward kernels are compiled for.
 
 - **`Qwen35Model::adamw_step_scaled`.** `adamw_step` with parameter-table
   entry `i` at learning rate `hyper.lr * lr_scale[i]`: torch's AdamW with one
@@ -409,6 +412,15 @@ All notable changes to `tessl` are recorded here. The format follows
 
 ### Fixed
 
+- **Qwen3.5 configs and sessions that failed late now fail first.**
+  `Qwen35Config` refused only a zero `linear_conv_kernel_dim`, so a width
+  the conv kernels lack (1, or past 8) loaded and then failed part way
+  through the first forward; it is refused with the config. A `Staged`
+  prefill or `Decode` session continued across `write_parameters` or
+  `adamw_step` on state the old weights made; both now refuse, as a
+  pending training step does. `prefill` allocated whatever `max_new` asked
+  (a 16 GiB session went through on a 1 MiB budget); it is checked against
+  the recommended working set before any GPU work.
 - **`gemm_i8_dequant` bound its exact accumulation with the wrong product.**
   It took 127 × 127 as the largest int8 product, but (−128) × (−128) = 16384
   is larger, so at `k = 131072` an all-(−128) sum wrapped to −2³¹ without an

@@ -349,8 +349,12 @@ impl Qwen35Config {
         if self.hidden == 0 || self.intermediate == 0 || self.vocab == 0 || self.layers.is_empty() {
             return Err("Qwen35Config: hidden, intermediate, vocab and layers must be non-zero".into());
         }
-        if self.conv_kernel == 0 {
-            return Err("Qwen35Config: conv_kernel must be non-zero".into());
+        if !qwen35::CONV_KERNEL_WIDTHS.contains(&self.conv_kernel) {
+            return Err(format!(
+                "Qwen35Config: conv_kernel {} is not supported (the conv kernels are compiled for {:?})",
+                self.conv_kernel,
+                qwen35::CONV_KERNEL_WIDTHS
+            ));
         }
         if !(self.rms_norm_eps.is_finite() && self.rms_norm_eps > 0.0)
             || !(self.rope_theta.is_finite() && self.rope_theta > 0.0)
@@ -825,6 +829,23 @@ impl Qwen35Model {
         let positions = t
             .checked_add(max_new)
             .ok_or_else(|| format!("{WHAT}: {t} tokens plus max_new {max_new} exceed u32 positions"))?;
+        let (rt, cfg) = (&self.rt, &self.cfg);
+        // What the session keeps for its lifetime, checked as a training step
+        // is before any GPU work: past the recommended working set Metal
+        // pages the resident set or the system runs out of memory, rather
+        // than an allocation failing where the caller can see it.
+        let (q_heads, head_dim) = (cfg.attn.q_heads(), cfg.attn.head_dim());
+        let need =
+            self.carry_bytes(t, max_new)
+                .saturating_add(DecodeScratch::bytes(1, q_heads, positions as usize, head_dim)? as u64);
+        let (have, limit) = (rt.current_allocated_bytes(), rt.memory_info().recommended_working_set);
+        if have.saturating_add(need) > limit {
+            return Err(format!(
+                "{WHAT}: a session of {t} tokens and max_new {max_new} keeps {need} B on top of the {have} B \
+                 allocated, over the device's recommended working set of {limit} B; refused before any GPU \
+                 work (shorten the prompt or max_new, or free device memory)"
+            ));
+        }
         let carry = self.alloc_carry(t, max_new)?;
         let mut s = self.begin_impl(ids, false, Some(carry))?;
         s.advance_to(self.layers.len())?;
@@ -833,22 +854,25 @@ impl Qwen35Model {
             .carry
             .take()
             .ok_or_else(|| format!("{WHAT}: the prefill lost its state"))?;
-        let (rt, cfg) = (&self.rt, &self.cfg);
         let decode = Decode {
             model: self,
             carry,
             a: Acts::new(rt, cfg, self.precision, 1, false)?,
             logits: rt.alloc_tensor_f32(&[1, cfg.vocab as usize])?,
-            scratch: DecodeScratch::new(rt, 1, cfg.attn.q_heads(), positions as usize, cfg.attn.head_dim())?,
+            scratch: DecodeScratch::new(rt, 1, q_heads, positions as usize, head_dim)?,
             prefix_len: t,
             max_new,
             decoded: 0,
             broken: false,
+            param_generation: s.param_generation,
         };
         Ok((decode, logits))
     }
 
     fn begin_impl(&self, ids: &[u32], trace: bool, carry: Option<Vec<Carry>>) -> Result<Staged<'_>, String> {
+        // Read before any weight is: a write that lands during the prefill
+        // then stops it too.
+        let param_generation = self.param_generation();
         let t = self.check_ids("Qwen35Model::forward", ids)?;
         let a = Acts::new(&self.rt, &self.cfg, self.precision, t, carry.is_none())?;
         self.embed_ids(ids, &a.resid)?;
@@ -858,7 +882,21 @@ impl Qwen35Model {
             next: 0,
             trace: trace.then(Vec::new),
             carry,
+            param_generation,
         })
+    }
+
+    /// Refuse to continue a prefill or session begun at `since` once the
+    /// weights have been written (write_parameters, adamw_step): its state
+    /// is of weights the model no longer has.
+    fn check_generation(&self, what: &str, since: u64) -> Result<(), String> {
+        if since != self.param_generation() {
+            return Err(format!(
+                "{what}: the model's parameters were written after this prefill began (write_parameters \
+                 or adamw_step), so its state is of weights the model no longer has; prefill again"
+            ));
+        }
+        Ok(())
     }
 
     /// What every run checks of its tokens and the runtime: at least one id,
@@ -913,29 +951,58 @@ impl Qwen35Model {
     /// prefill writes every state and prefix slot, and decode reads a suffix
     /// slot only after writing it.
     fn alloc_carry(&self, t: u32, max_new: u32) -> Result<Vec<Carry>, String> {
-        let (rt, cfg) = (&self.rt, &self.cfg);
-        let (g, l) = (cfg.gdn, cfg.attn);
-        let f32s = |n: usize| rt.alloc_buffer(n.max(1) * 4);
-        let conv = g.conv_dim() as usize * (cfg.conv_kernel as usize - 1);
-        let state = g.dims(1, 1).state_elems_per_row();
-        let kv_row = (l.kv_heads() * l.head_dim()) as usize;
-        cfg.layers
+        let f32s = |n: usize| self.rt.alloc_buffer(n.max(1) * 4);
+        self.cfg
+            .layers
             .iter()
-            .map(|kind| {
-                Ok(match kind {
-                    LayerKind::LinearAttention => Carry::Gdn(GdnCarry {
+            .map(|&kind| {
+                Ok(match (kind, self.carry_elems(kind, t, max_new)) {
+                    (LayerKind::LinearAttention, [conv, state]) => Carry::Gdn(GdnCarry {
                         conv: [f32s(conv)?, f32s(conv)?],
                         state: f32s(state)?,
                     }),
-                    LayerKind::FullAttention => Carry::Attn(AttnCarry {
-                        prefix_k: f32s(t as usize * kv_row)?,
-                        prefix_v: f32s(t as usize * kv_row)?,
-                        suffix_k: f32s(max_new as usize * kv_row)?,
-                        suffix_v: f32s(max_new as usize * kv_row)?,
+                    (LayerKind::FullAttention, [prefix, suffix]) => Carry::Attn(AttnCarry {
+                        prefix_k: f32s(prefix)?,
+                        prefix_v: f32s(prefix)?,
+                        suffix_k: f32s(suffix)?,
+                        suffix_v: f32s(suffix)?,
                     }),
                 })
             })
             .collect()
+    }
+
+    /// f32 elements of one layer's kept state buffers: a GDN layer's conv
+    /// state (one side; there are two) and recurrent state, or an attention
+    /// layer's prefix and suffix (one of K and V; there are both). What
+    /// [`Self::alloc_carry`] allocates and [`Self::carry_bytes`] counts.
+    fn carry_elems(&self, kind: LayerKind, t: u32, max_new: u32) -> [usize; 2] {
+        let (g, l) = (self.cfg.gdn, self.cfg.attn);
+        match kind {
+            LayerKind::LinearAttention => [
+                g.conv_dim() as usize * (self.cfg.conv_kernel as usize - 1),
+                g.dims(1, 1).state_elems_per_row(),
+            ],
+            LayerKind::FullAttention => {
+                let kv_row = (l.kv_heads() * l.head_dim()) as usize;
+                [t as usize * kv_row, max_new as usize * kv_row]
+            }
+        }
+    }
+
+    /// Bytes [`Self::alloc_carry`] allocates, saturating.
+    fn carry_bytes(&self, t: u32, max_new: u32) -> u64 {
+        let buf = |n: usize| (n.max(1) as u64).saturating_mul(4);
+        self.cfg
+            .layers
+            .iter()
+            .map(|&kind| match (kind, self.carry_elems(kind, t, max_new)) {
+                (LayerKind::LinearAttention, [conv, state]) => buf(conv).saturating_mul(2).saturating_add(buf(state)),
+                (LayerKind::FullAttention, [prefix, suffix]) => {
+                    buf(prefix).saturating_add(buf(suffix)).saturating_mul(2)
+                }
+            })
+            .fold(0, u64::saturating_add)
     }
 
     /// One decoder layer on `a.resid`, in place: the layer order of every
@@ -1293,6 +1360,8 @@ pub struct Staged<'m> {
     trace: Option<Vec<Vec<f32>>>,
     /// [`Qwen35Model::prefill`]'s: where each layer leaves its state.
     carry: Option<Vec<Carry>>,
+    /// The model's parameter generation when the prefill began.
+    param_generation: u64,
 }
 
 impl Staged<'_> {
@@ -1311,6 +1380,7 @@ impl Staged<'_> {
     /// (nothing to run) but not go back, or past the model's layer count.
     pub fn advance_to(&mut self, layer: usize) -> Result<(), String> {
         let m = self.model;
+        m.check_generation("Staged::advance_to", self.param_generation)?;
         if layer < self.next || layer > m.layers.len() {
             return Err(format!(
                 "Staged::advance_to({layer}): already at layer {}, the model has {}",
@@ -1340,6 +1410,7 @@ impl Staged<'_> {
     /// Encoded, not waited for: read `out` after a synchronize.
     pub fn final_norm_f32(&self, out: &Tensor) -> Result<(), String> {
         let (m, t) = (self.model, self.a.t);
+        m.check_generation("Staged::final_norm_f32", self.param_generation)?;
         if out.dtype != DType::F32 || out.shape() != [t as usize, m.cfg.hidden as usize] {
             return Err(format!(
                 "Staged::final_norm_f32: out must be f32 [{t}, {}], got {:?} {:?}",
@@ -1369,6 +1440,7 @@ impl Staged<'_> {
         const WHAT: &str = "Staged::logits";
         let (m, a, t) = (self.model, &self.a, self.a.t);
         m.require_head(WHAT)?;
+        m.check_generation(WHAT, self.param_generation)?;
         let last = [t - 1];
         // None: every row, in order, through the stream's own buffers.
         let pick: Option<&[u32]> = match rows {
@@ -1411,6 +1483,7 @@ impl Staged<'_> {
         const WHAT: &str = "Staged::score_answers";
         let (m, t) = (self.model, self.a.t);
         let (rt, cfg) = (&m.rt, &m.cfg);
+        m.check_generation(WHAT, self.param_generation)?;
         if let Some(&bad) = rows.iter().find(|&&r| r >= t) {
             return Err(format!("{WHAT}: position {bad} >= {t} tokens"));
         }
@@ -1468,6 +1541,8 @@ pub struct Decode<'m> {
     /// A step failed part way, so some layers' state may have advanced and
     /// others not: the session refuses to continue.
     broken: bool,
+    /// The model's parameter generation when the prefill began.
+    param_generation: u64,
 }
 
 impl Decode<'_> {
@@ -1485,8 +1560,9 @@ impl Decode<'_> {
     /// Run `id` at [`Self::position`] through every layer, continuing each
     /// layer's state, and return its logits (`[vocab]` f32: the distribution
     /// of the token after it). Waits for the GPU. Refused, before any work,
-    /// once `max_new` tokens have been decoded, and for good after a step
-    /// that failed part way.
+    /// once `max_new` tokens have been decoded, once the model's weights
+    /// have been written since the prefill, and for good after a step that
+    /// failed part way.
     pub fn step(&mut self, id: u32) -> Result<Vec<f32>, String> {
         const WHAT: &str = "Decode::step";
         let m = self.model;
@@ -1502,6 +1578,7 @@ impl Decode<'_> {
                 self.max_new
             ));
         }
+        m.check_generation(WHAT, self.param_generation)?;
         m.check_ids(WHAT, &[id])?;
         let rt = &m.rt;
         let slot = self.decoded;

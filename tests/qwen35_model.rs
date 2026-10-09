@@ -56,7 +56,7 @@ use std::path::{Path, PathBuf};
 
 use common::with_gpu;
 use tessl::npy::read_npy;
-use tessl::qwen35::{AttnProjLayout, GdnProjLayout};
+use tessl::qwen35::{self, AttnProjLayout, GdnProjLayout};
 use tessl::qwen35_model::{LayerKind, LogitRows, Precision, Qwen35Config, Qwen35Model};
 use tessl::safetensors::SafeTensors;
 use tessl::GpuRuntime;
@@ -486,5 +486,336 @@ fn decode_and_row_refusals() {
         assert!(s.score_answers(&[0], &[cfg.vocab]).is_err(), "answer past vocab");
         assert!(s.score_answers(&[0], &[]).is_err(), "no answers");
         assert!(s.score_answers(&[], &[1]).unwrap().logits.is_empty());
+    });
+}
+
+// ------------------------------------------------------------- hardening ---
+
+/// A conv width the kernel is not compiled for (`conv1d_silu` takes 2..=8)
+/// is refused with the config, not part way through a forward.
+#[test]
+fn conv_widths_the_kernel_lacks_are_refused_at_the_config() {
+    let text = std::fs::read_to_string(fixture().join("config.json")).unwrap();
+    for kw in [0u32, 1, 9, 64] {
+        let bad = text.replace(
+            "\"linear_conv_kernel_dim\": 4",
+            &format!("\"linear_conv_kernel_dim\": {kw}"),
+        );
+        assert_ne!(bad, text);
+        let m = Qwen35Config::from_config_json(&bad)
+            .err()
+            .unwrap_or_else(|| panic!("conv_kernel {kw} was accepted"));
+        assert!(m.contains("conv_kernel"), "kw {kw}: {m}");
+    }
+    for kw in [2u32, 8] {
+        let ok = text.replace(
+            "\"linear_conv_kernel_dim\": 4",
+            &format!("\"linear_conv_kernel_dim\": {kw}"),
+        );
+        Qwen35Config::from_config_json(&ok).unwrap();
+    }
+    with_gpu(|rt| {
+        let cfg = Qwen35Config {
+            conv_kernel: 9,
+            ..tiny_config()
+        };
+        assert!(Qwen35Model::random_tower(rt, cfg, Precision::F32, 1).is_err());
+    });
+}
+
+/// Weights written under a live session or staged prefill (write_parameters,
+/// adamw_step) would leave it continuing from state the old weights made:
+/// both refuse, before encoding anything, and a fresh prefill works.
+#[test]
+fn sessions_refuse_to_continue_across_a_weight_write() {
+    let st = SafeTensors::open(&fixture().join("model.safetensors")).unwrap();
+    let cfg = tiny_config();
+    with_gpu(|rt| {
+        let model = Qwen35Model::load(rt, &st, "model.", cfg.clone(), Precision::F32).unwrap();
+        let ids = seq(6);
+        let (mut dec, _) = model.prefill(&ids[..4], 2).unwrap();
+        let mut staged = model.begin(&ids).unwrap();
+        staged.advance_to(1).unwrap();
+        let table = model.parameter_table().unwrap();
+        let values: Vec<tessl::Tensor> = table
+            .iter()
+            .map(|i| rt.alloc_tensor_f32(&i.storage_shape()).unwrap())
+            .collect();
+        model.read_parameters(&values).unwrap();
+        model.write_parameters(&values).unwrap();
+        let _ = rt.take_dispatch_count();
+        let m = dec.step(ids[4]).unwrap_err();
+        assert!(m.contains("parameters were written"), "{m}");
+        assert_eq!(dec.position(), 4);
+        let m = staged.advance_to(2).unwrap_err();
+        assert!(m.contains("parameters were written"), "{m}");
+        assert!(staged.logits(LogitRows::Last).is_err());
+        assert!(staged.score_answers(&[0], &[1]).is_err());
+        let out = rt.alloc_tensor_f32(&[6, cfg.hidden as usize]).unwrap();
+        assert!(staged.final_norm_f32(&out).is_err());
+        assert_eq!(rt.take_dispatch_count(), 0, "a refused call encoded work");
+        let (mut dec, _) = model.prefill(&ids[..4], 2).unwrap();
+        let got = dec.step(ids[4]).unwrap();
+        assert!(rel32(&got, &forward_last(&model, &ids[..5])) <= 1e-5);
+    });
+}
+
+/// A prefill whose kept state would not fit the device's recommended working
+/// set is refused before any GPU work, as a training step is.
+#[test]
+fn a_prefill_over_the_working_set_is_refused_before_it_runs() {
+    let st = SafeTensors::open(&fixture().join("model.safetensors")).unwrap();
+    with_gpu(|rt| {
+        let model = Qwen35Model::load(rt, &st, "model.", tiny_config(), Precision::F32).unwrap();
+        let ids = seq(4);
+        rt.set_recommended_working_set_for_test(rt.current_allocated_bytes() + (1 << 20));
+        let _ = rt.take_dispatch_count();
+        // 8M suffix slots of one KV head of 256 f32 K and V: 16 GiB.
+        let m = model
+            .prefill(&ids, 8 << 20)
+            .err()
+            .expect("an oversized prefill was accepted");
+        assert!(m.contains("working set"), "{m}");
+        assert_eq!(rt.take_dispatch_count(), 0, "the refused prefill encoded work");
+        model.prefill(&ids, 4).expect("a prefill that fits still runs");
+    });
+}
+
+// ---------------------------------------------------------------- stress ---
+
+/// A tiny deterministic generator (splitmix64) for the randomized shapes.
+struct Rng(u64);
+
+impl Rng {
+    fn next(&mut self) -> u64 {
+        self.0 = self.0.wrapping_add(0x9e37_79b9_7f4a_7c15);
+        let mut z = self.0;
+        z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        z ^ (z >> 31)
+    }
+
+    fn pick<T: Copy>(&mut self, from: &[T]) -> T {
+        from[(self.next() % from.len() as u64) as usize]
+    }
+
+    fn below(&mut self, n: u32) -> u32 {
+        (self.next() % u64::from(n)) as u32
+    }
+}
+
+/// A random Qwen3.5 shape the kernels are compiled for: 1..=5 layers in any
+/// order, grouped GDN and attention heads, every conv width, value dims and
+/// rotary widths across their range.
+fn random_config(r: &mut Rng) -> Qwen35Config {
+    let n_layers = 1 + r.below(5) as usize;
+    let layers = (0..n_layers)
+        .map(|_| {
+            if r.below(2) == 0 {
+                LayerKind::LinearAttention
+            } else {
+                LayerKind::FullAttention
+            }
+        })
+        .collect();
+    let k_heads = r.pick(&[1u32, 2]);
+    let q_heads = r.pick(&[1u32, 2, 4]);
+    let kv_heads = r.pick(&[1u32, 2].map(|d| (q_heads / d).max(1)));
+    Qwen35Config {
+        hidden: r.pick(&[32u32, 64, 128]),
+        intermediate: r.pick(&[64u32, 128, 192]),
+        vocab: r.pick(&[17u32, 64, 100]),
+        layers,
+        gdn: GdnProjLayout::new(k_heads, k_heads * r.pick(&[1u32, 2]), r.pick(&[32u32, 64, 128])).unwrap(),
+        conv_kernel: 2 + r.below(7),
+        attn: AttnProjLayout::new(q_heads, kv_heads, 256).unwrap(),
+        rotary_dim: r.pick(&[2u32, 64, 128, 256]),
+        rope_theta: r.pick(&[1e4f32, 1e7]),
+        rms_norm_eps: 1e-6,
+    }
+}
+
+/// `row` matches `want` within `bound`, and has its top-1 token unless the
+/// top two of `want` are closer than the bound allows telling apart.
+fn check_row(label: &str, row: &[f32], want: &[f32], bound: f64) -> f64 {
+    let r = rel32(row, want);
+    assert!(r <= bound, "{label}: rel err {r:.3e} > {bound:.0e}");
+    let peak = want.iter().fold(0.0f64, |m, &w| m.max(f64::from(w).abs()));
+    let mut sorted: Vec<f64> = want.iter().map(|&x| f64::from(x)).collect();
+    sorted.sort_by(|a, b| b.total_cmp(a));
+    if sorted.len() < 2 || sorted[0] - sorted[1] > 2.0 * bound * peak {
+        assert_eq!(argmax32(row), argmax32(want), "{label}: top-1");
+    }
+    r
+}
+
+/// Decode against the forward on 40 random F32 shapes, prompts of 1..=150
+/// tokens and 1..=6 steps, with the runtime's encoding synchronous and then
+/// asynchronous (one command buffer until a wait, so every buffer a call
+/// allocates and drops must outlive the work that reads it). Bound: the
+/// decode test's F32 1e-5.
+#[test]
+fn stress_decode_matches_forward_on_random_shapes() {
+    let mut r = Rng(0x51ce_d00d);
+    // (shape, prompt tokens, steps, weight seed)
+    type Case = (Qwen35Config, usize, u32, u64);
+    let cases: Vec<Case> = (0..40)
+        .map(|_| {
+            let cfg = random_config(&mut r);
+            let n = 1 + r.below(150) as usize;
+            (cfg, n, 1 + r.below(6), r.next())
+        })
+        .collect();
+    // The seed must reach what the sweep claims to cover.
+    let covered = |f: &dyn Fn(&Case) -> bool| cases.iter().any(f);
+    for kw in qwen35::CONV_KERNEL_WIDTHS {
+        assert!(
+            covered(&|c| c.0.conv_kernel == kw && c.0.layers.contains(&LayerKind::LinearAttention)),
+            "conv {kw}"
+        );
+    }
+    assert!(covered(
+        &|c| c.0.gdn.v_heads() > c.0.gdn.k_heads() && c.0.layers.contains(&LayerKind::LinearAttention)
+    ));
+    assert!(covered(
+        &|c| c.0.attn.q_heads() > c.0.attn.kv_heads() && c.0.layers.contains(&LayerKind::FullAttention)
+    ));
+    assert!(covered(&|c| c.0.layers.len() >= 4 && c.1 > 64));
+    assert!(covered(&|c| c.1 < c.0.conv_kernel as usize - 1));
+    for async_encode in [false, true] {
+        with_gpu(|rt| {
+            rt.set_async_encode(async_encode).unwrap();
+            let mut worst = 0.0f64;
+            for (i, (cfg, n, steps, seed)) in cases.iter().enumerate() {
+                let label = format!("case {i} (async {async_encode}, n {n}, steps {steps}, {cfg:?})");
+                let model = Qwen35Model::random_tower(rt, cfg.clone(), Precision::F32, *seed).unwrap();
+                let v = cfg.vocab;
+                let ids: Vec<u32> = (0..*n as u32 + steps).map(|j| (j * 31 + *seed as u32) % v).collect();
+                let (mut dec, first) = model.prefill(&ids[..*n], *steps).unwrap();
+                worst = worst.max(check_row(&label, &first, &forward_last(&model, &ids[..*n]), 1e-5));
+                for k in 0..*steps as usize {
+                    let got = dec.step(ids[n + k]).unwrap();
+                    let want = forward_last(&model, &ids[..n + k + 1]);
+                    worst = worst.max(check_row(&format!("{label} step {k}"), &got, &want, 1e-5));
+                }
+                assert_eq!(dec.remaining(), 0);
+            }
+            eprintln!("async {async_encode}: 40 random shapes, worst rel err {worst:.2e}");
+            rt.set_async_encode(false).unwrap();
+        });
+    }
+}
+
+/// 140 tokens decoded after a one-token prompt, past two GDN chunk
+/// boundaries of the forward it is compared with, at both precisions: a
+/// state that drifts, or a suffix slot that wraps, shows up as the steps go.
+#[test]
+fn stress_long_decode_stays_on_the_forward() {
+    const STEPS: u32 = 140;
+    let st = SafeTensors::open(&fixture().join("model.safetensors")).unwrap();
+    with_gpu(|rt| {
+        for precision in [Precision::F32, Precision::Bf16] {
+            let model = Qwen35Model::load(rt, &st, "model.", tiny_config(), precision).unwrap();
+            let ids = seq(1 + STEPS as usize);
+            let (mut dec, _) = model.prefill(&ids[..1], STEPS).unwrap();
+            let mut worst = 0.0f64;
+            for k in 0..STEPS as usize {
+                let got = dec.step(ids[1 + k]).unwrap();
+                let want = forward_last(&model, &ids[..k + 2]);
+                worst = worst.max(check_row(
+                    &format!("{precision:?} step {k}"),
+                    &got,
+                    &want,
+                    bound(precision),
+                ));
+            }
+            assert!(dec.step(ids[0]).is_err(), "past max_new");
+            eprintln!("{precision:?}: {STEPS} steps, worst rel err {worst:.2e}");
+        }
+    });
+}
+
+/// Three sessions of one model decoded in turn, the forward oracle and a
+/// dropped session churning the buffer pool between their steps, under async
+/// encode: no session's state may leak into another's, and none may read a
+/// buffer the pool handed elsewhere.
+#[test]
+fn stress_interleaved_sessions_keep_their_own_state() {
+    let st = SafeTensors::open(&fixture().join("model.safetensors")).unwrap();
+    with_gpu(|rt| {
+        rt.set_async_encode(true).unwrap();
+        let model = Qwen35Model::load(rt, &st, "model.", tiny_config(), Precision::F32).unwrap();
+        let prompts: [Vec<u32>; 3] = [seq(80), seq(3).iter().map(|x| 63 - x).collect(), seq(65)];
+        let mut sessions: Vec<_> = prompts
+            .iter()
+            .map(|p| (p.clone(), model.prefill(p, 12).unwrap().0))
+            .collect();
+        for k in 0..12u32 {
+            for (s, (ids, dec)) in sessions.iter_mut().enumerate() {
+                let id = (k * 7 + s as u32 * 13) % 64;
+                let got = dec.step(id).unwrap();
+                ids.push(id);
+                check_row(&format!("session {s} step {k}"), &got, &forward_last(&model, ids), 1e-5);
+                // Churn: a session made and dropped, and a forward of another length.
+                drop(model.prefill(&seq(1 + (k as usize * 5) % 70), 3).unwrap());
+                model.forward(&seq(1 + k as usize), false).unwrap();
+            }
+        }
+        rt.set_async_encode(false).unwrap();
+    });
+}
+
+/// Switching the runtime to relaxed-f32 GEMMs under an F32 session refuses
+/// its steps without breaking it, and switching back continues the sequence.
+#[test]
+fn stress_relaxed_precision_mid_session_is_refused_not_fatal() {
+    let st = SafeTensors::open(&fixture().join("model.safetensors")).unwrap();
+    with_gpu(|rt| {
+        let model = Qwen35Model::load(rt, &st, "model.", tiny_config(), Precision::F32).unwrap();
+        let ids = seq(10);
+        let (mut dec, _) = model.prefill(&ids[..7], 3).unwrap();
+        rt.set_relaxed_precision(true);
+        let _ = rt.take_dispatch_count();
+        let m = dec.step(ids[7]).unwrap_err();
+        assert!(m.contains("relaxed precision"), "{m}");
+        assert_eq!(rt.take_dispatch_count(), 0);
+        rt.set_relaxed_precision(false);
+        for k in 7..10 {
+            let got = dec.step(ids[k]).unwrap();
+            check_row(&format!("step {k}"), &got, &forward_last(&model, &ids[..=k]), 1e-5);
+        }
+    });
+}
+
+/// Hostile but valid row and answer selections: the last token id, one row
+/// asked for a thousand times, the largest answer set, and one past it.
+#[test]
+fn stress_hostile_rows_and_answers() {
+    let st = SafeTensors::open(&fixture().join("model.safetensors")).unwrap();
+    let cfg = tiny_config();
+    let v = cfg.vocab as usize;
+    with_gpu(|rt| {
+        let model = Qwen35Model::load(rt, &st, "model.", cfg.clone(), Precision::F32).unwrap();
+        let ids = vec![cfg.vocab - 1; 9];
+        let all = model.forward(&ids, false).unwrap().logits;
+        let rows = vec![8u32; 1000];
+        let got = model.forward_rows(&ids, LogitRows::Rows(&rows), false).unwrap().logits;
+        assert_eq!(got.len(), 1000 * v);
+        for chunk in got.chunks(v) {
+            assert!(rel32(chunk, &all[8 * v..]) <= 1e-5);
+        }
+        let mut s = model.begin(&ids).unwrap();
+        s.advance_to(cfg.layers.len()).unwrap();
+        let max = qwen35::MAX_ANSWERS as usize;
+        let answers: Vec<u32> = (0..max as u32).map(|i| i % cfg.vocab).collect();
+        let scores = s.score_answers(&[8, 0], &answers).unwrap();
+        assert_eq!(scores.logits.len(), 2 * max);
+        assert!(scores.logits.iter().chain(&scores.logprobs).all(|x| x.is_finite()));
+        for (i, &a) in answers.iter().enumerate().take(v) {
+            let w = all[8 * v + a as usize];
+            assert!((scores.logits[i] - w).abs() <= 1e-5 * w.abs().max(1.0), "answer {a}");
+        }
+        let too_many = vec![0u32; max + 1];
+        assert!(s.score_answers(&[0], &too_many).is_err());
     });
 }

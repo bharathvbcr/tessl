@@ -65,6 +65,9 @@ pub const GDN_KEY_DIM: u32 = 128;
 pub const GDN_CHUNK: u32 = 64;
 /// Value columns one scan / decode threadgroup owns; `v_dim` must be a multiple.
 pub const GDN_VALUE_BLOCK: u32 = 32;
+/// Conv kernel widths (`linear_conv_kernel_dim`) [`conv1d_silu`] and its
+/// backward are compiled for.
+pub const CONV_KERNEL_WIDTHS: std::ops::RangeInclusive<u32> = 2..=8;
 
 // Threadgroup memory, mirroring `GDN_*_TG_FLOATS` in kernels/qwen35_gdn.metal.
 const PREP_TG_BYTES: usize = 4 * (64 * 65 + 4 * 64);
@@ -621,8 +624,10 @@ fn conv1d_silu_impl(
     seq_lens: Option<&GpuBuffer>,
 ) -> Result<(), String> {
     const WHAT: &str = "qwen35::conv1d_silu";
-    if !(2..=8).contains(&kernel_width) {
-        return Err(format!("{WHAT}: kernel_width must be 2..=8, got {kernel_width}"));
+    if !CONV_KERNEL_WIDTHS.contains(&kernel_width) {
+        return Err(format!(
+            "{WHAT}: kernel_width must be {CONV_KERNEL_WIDTHS:?}, got {kernel_width}"
+        ));
     }
     let hist = kernel_width - 1;
     // The kernel's grid (and its `T + KW - 1` bound) is seq + hist positions.

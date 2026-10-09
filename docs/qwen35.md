@@ -609,7 +609,20 @@ state in place; `attn_qk_norm_rope_suffix` into a suffix cache of `max_new`
 slots, then `attn_prefix_decode`) and returns that token's logits. A step
 past `max_new` is refused, and a step that fails part way leaves the
 session refusing further steps rather than continuing from half-advanced
-state. One sequence, batch 1.
+state. A session, like a `Staged` prefill, records the model's parameter
+generation and refuses to continue once `write_parameters` or `adamw_step`
+has moved it, as a pending training step does. `prefill` checks the state
+it will keep against the device's recommended working set before any GPU
+work, as a training step checks its own. One sequence, batch 1.
+
+Beyond the fixture, the stress tests in the same file decode 40 random
+shapes (1 to 5 layers in any order, every conv width 2 to 8, grouped GDN
+and attention heads, value dims 32 to 128, rotary widths 2 to 256, prompts
+of 1 to 150 tokens) with synchronous and with asynchronous encoding (worst
+7.4e-7 against the 1e-5 bound), 140 tokens after a one-token prompt (F32
+2.0e-6; Bf16 4.5e-3 against 2e-2), three sessions of one model in turn with
+the pool churned between their steps, and a relaxed-precision switch under a
+live session (refused, then continued).
 
 The decode kernels sum in a different order from the prefill's (recurrent
 against chunked GDN, split-KV against tiled attention), so decode matches
@@ -1237,10 +1250,7 @@ is the largest non-GEMM share: 18 × 1.4 ms.
   `begin` and `prefill` still allocates its intermediates from the pool
   rather than reusing a session's. `Decode::step` waits for its logits every
   token, so it is not a GPU-resident loop, and its speed has not been
-  measured. A session (like a `Staged` prefill) does not record the
-  model's parameter generation, so a weight write between `prefill` and a
-  `step` (`adamw_step` takes `&self`) is not refused, as `PendingStep`
-  refuses it; the steps after it run on state the old weights made.
+  measured.
 - **bf16 inputs.** The kernels read f32 activations, which is what tessl's GEMM
   writes. A bf16-activation variant would halve their read traffic.
 - **Shared-prefix attention, remaining gaps.** Only head_dim 256 is compiled. The rows of

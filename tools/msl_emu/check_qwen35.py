@@ -980,6 +980,58 @@ def _kernel_signatures():
     return sigs
 
 
+_OUT_KERNEL = r'out_kernel!?\(\s*"(\w+)"'
+
+
+def _out_kernel_variants(base):
+    return [base + "_f32", base + "_bf16"]
+
+
+def _name_defs(rs):
+    """[(position, variable, kernels)] for each `let name = ..` that picks a
+    kernel name, so a dispatch can resolve its pipeline variable by position
+    (the name is reused, like the pipelines in `_host_binds`)."""
+    import re
+    # `let name = out_kernel!("base", ..)` picks the _f32 or _bf16 variant.
+    defs = [(m.start(), m.group(1), _out_kernel_variants(m.group(2)))
+            for m in re.finditer(r'let (\w+) = ' + _OUT_KERNEL, rs)]
+    # `let name = match .. { A => "kernel_a", B => out_kernel!("base", ..)? };`:
+    # one dispatch site serving several kernels. An arm may name a kernel
+    # literally or through `out_kernel!`, which serves both variants; the
+    # `out_kernel!` bases are not kernel names themselves.
+    for m in re.finditer(r'let (\w+) = match [^{]*\{(.*?)\};', rs, re.S):
+        body = m.group(2)
+        kernels = [k for b in re.findall(_OUT_KERNEL, body) for k in _out_kernel_variants(b)]
+        kernels += re.findall(r'"(qwen35_\w+)"', re.sub(_OUT_KERNEL, "", body))
+        defs.append((m.start(), m.group(1), kernels))
+    defs.sort()
+    return defs
+
+
+def case_host_contract_parser():
+    """The host-contract parser reads each dispatch-site shape src/qwen35.rs
+    uses. A shape it misreads reports real kernels unbound and invents
+    undeclared ones (43ef12b's `match` over `out_kernel!` did both)."""
+    shapes = [
+        ('let name = out_kernel!("qwen35_a", out.dtype, what)?;',
+         ["qwen35_a_f32", "qwen35_a_bf16"]),
+        ('let name = match bf16 { false => "qwen35_a_f32", true => "qwen35_a_bf16" };',
+         ["qwen35_a_f32", "qwen35_a_bf16"]),
+        ('let name = match act {\n    GatedAct::Silu => out_kernel!("qwen35_swiglu", out.dtype, what)?,\n'
+         '    GatedAct::GeluTanh => out_kernel!("qwen35_gelu_tanh_glu", out.dtype, what)?,\n};',
+         ["qwen35_swiglu_f32", "qwen35_swiglu_bf16", "qwen35_gelu_tanh_glu_f32", "qwen35_gelu_tanh_glu_bf16"]),
+        ('let name = match m { A => out_kernel!("qwen35_a", d, w)?, B => "qwen35_b" };',
+         ["qwen35_a_f32", "qwen35_a_bf16", "qwen35_b"]),
+    ]
+    for src, want in shapes:
+        got = [k for _, _, ks in _name_defs(src) for k in ks]
+        ok = sorted(got) == sorted(want)
+        print(f"  [{'ok  ' if ok else 'FAIL'}] parses {src.splitlines()[0][:60]!r}"
+              + ("" if ok else f"\n      want {sorted(want)}\n      got  {sorted(got)}"))
+        if not ok:
+            FAILURES.append(f"host-contract parser misreads {src.splitlines()[0][:40]!r}")
+
+
 def _host_binds():
     """{kernel name: [(index, kind)]} from the dispatch closures of the host
     files that bind these kernels (src/qwen35.rs, and src/attn_train.rs for
@@ -987,15 +1039,7 @@ def _host_binds():
     import re
     qwen35_rs = open(os.path.join(ROOT, "src", "qwen35.rs")).read()
     rs = qwen35_rs + "\n" + open(os.path.join(ROOT, "src", "attn_train.rs")).read()
-    # `let name = out_kernel!("base", ..)` picks the _f32 or _bf16 variant; like
-    # the pipelines below, the name is reused, so resolve it by position.
-    name_defs = [(m.start(), m.group(1), [m.group(2) + "_f32", m.group(2) + "_bf16"])
-                 for m in re.finditer(r'let (\w+) = out_kernel!?\(\s*"(\w+)"', rs)]
-    # `let name = match .. { A => "kernel_a", B => "kernel_b" };` — one dispatch
-    # site serving several kernels.
-    name_defs += [(m.start(), m.group(1), re.findall(r'"(qwen35_\w+)"', m.group(2)))
-                  for m in re.finditer(r'let (\w+) = match [^{]*\{(.*?)\};', rs, re.S)]
-    name_defs.sort()
+    name_defs = _name_defs(rs)
     # (position, variable, kernels): a dispatch resolves its pipeline variable
     # to the nearest `let` before it, since most functions reuse the name `p`.
     pipe_defs = []
@@ -1109,6 +1153,7 @@ def case_host_contract():
 
 
 CASES = [
+    ("host_contract_parser", case_host_contract_parser),
     ("host_contract", case_host_contract),
     ("swiglu", lambda: [case_swiglu(bf16, 71) for bf16 in (False, True)]),
     ("conv", lambda: [case_conv(2, 37, 100, 4, s, b, 1) for s, b in ((False, False), (True, False), (True, True))]),

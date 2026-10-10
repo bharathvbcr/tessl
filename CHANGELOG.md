@@ -138,6 +138,52 @@ All notable changes to `tessl` are recorded here. The format follows
   and `SafeTensors::read_f32` widens bf16/f16 in blocks with the conversion
   inlined. Both produce the same bytes as before; each is ~2.3× faster in a
   standalone check.
+- **Residency set committed once per command buffer.** `with_binder` no
+  longer commits the residency set before every encode after an
+  allocation; `commit_m4` commits it once, just before the command buffer
+  (removals still commit after the GPU wait). A training step with ~800
+  allocations committed it hundreds of times. `infer_trace`'s
+  `residency_flushes` should now track commits.
+- **Fewer bf16 casts in training.** On the bf16 lane, cross-entropy rounds
+  the gathered rows once per call, each dlogits chunk once for both of its
+  GEMMs and an f32 weight chunk once per walk, and passes a bf16 weight as it
+  is (it was widened and narrowed back per GEMM); the training step rounds
+  each activation several GEMMs read (`x1`, `x2`, `y`, `dresid`, `d_gate`,
+  `d_up`, `dproj`) once into a bf16 twin. Same cast kernel, same bits;
+  roughly 570 cast dispatches and 800 pool allocations fewer per 2B step.
+- **A bank step without temporaries.** Into a bank it overwrites, the step
+  writes every vector gradient in the bank's own buffer (133 allocations and
+  copies per 2B step), the embedding backward's grouping goes into fresh
+  buffers written without staging copies, and a causal step zeroes only the
+  last row of `dxf`.
+- **Unzeroed inference activations.** `Qwen35Model`'s forward and
+  `BertSparseModel`'s encode no longer zero their activations on the host
+  (about 1.2 GB per 1024-token Qwen3.5 prefill, 550 MB per 8192-row BERT
+  forward); every element read is written earlier in the same forward, held
+  by new poison tests (`tiny_forward_reads_no_unwritten_activation`,
+  `tests/bert_tiny.rs`). BERT's head resets its pooled rows on the GPU and
+  its index uploads, like Qwen3.5's `begin`, no longer wait for the GPU.
+- **Decode replay without per-token probes.** `DecodeIcb::execute` reads
+  `TESSL_ICB_EXECUTE` / `TESSL_ICB_TRIAGE` once (new `set_icb_execute` /
+  `set_icb_triage` overrides) and checks pipeline ICB support once per tape,
+  not per command per token; `cb_replay`'s step labels reuse their buffer
+  (the label parameters take `impl AsRef<str>`, was `impl Into<String>`).
+- **Smaller host costs elsewhere.** The Q4 MLX GEMVs and the AdamW step
+  format no error labels on success (`format_args!`), AdamW's kernel names
+  come from a fixed table and its pipelines and slot table are built once,
+  and `Loader::linear` stages every projection part through one reused
+  buffer instead of a fresh `Vec` each.
+- **Parallel, incremental shader build.** `build.rs` compiles the kernel
+  sources concurrently and reuses an `.air` whose inputs (source, headers,
+  compiler, SDK, flags, the script itself) are unchanged; link order,
+  diagnostics and the metal3.2 fallback are as before.
+- **`tessl_torch` drains torch's queue less.** `train_step`,
+  `train_forward` and `adamw_step` no longer call `torch.mps.synchronize()`
+  (they share no torch buffer with tessl), and the cross-entropy autograd
+  path skips the per-row loss copy (`cross_entropy_rows(..., per_row=False)`).
+- **Host-only tests in CI.** The JSON parser tests, the loader's widen and
+  transpose checks and AdamW's kernel-name table run on the hosted macOS
+  `check` job, which needs no Metal device.
 - **Qwen3.5 training step traffic.** Allocations a kernel writes in full
   are no longer zeroed on the host (808 allocations, 25.86 GB per 2B step at
   T = 2048); the step makes one attention workspace and uploads its indices

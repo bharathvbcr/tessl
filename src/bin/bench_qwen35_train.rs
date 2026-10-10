@@ -286,7 +286,7 @@ fn bench_t(rt: &Arc<GpuRuntime>, t: usize, check_only: bool, operands: GemmOpera
     );
     let rows: Vec<u32> = (0..t32 - 1).collect();
     let targets: Vec<u32> = (0..t32 - 1).map(|i| (i * 7919) % VOCAB as u32).collect();
-    let ce_ws = CeWorkspace::new(rt, t32 - 1, HIDDEN as u32, CE_CHUNK, DType::BF16)?;
+    let ce_ws = CeWorkspace::new(rt, t32 - 1, HIDDEN as u32, CE_CHUNK, DType::BF16, operands)?;
     let (dh, dw) = (
         rt.alloc_tensor_f32(&[t - 1, HIDDEN])?,
         rt.alloc_tensor_f32(&[VOCAB, HIDDEN])?,

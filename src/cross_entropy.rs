@@ -11,8 +11,8 @@
 //! 1. gathers the `n` supervised rows into f32 `[n, hidden]` (bf16 widened
 //!    exactly);
 //! 2. walks the vocabulary in chunks: `logits = h @ W[v0..v0+w]ᵀ` (the
-//!    caller's [`GemmOperands`]; a bf16 weight chunk is widened exactly first), folded into a
-//!    running log-sum-exp per row, the target's logit picked up on the way;
+//!    caller's [`GemmOperands`]), folded into a running log-sum-exp per row,
+//!    the target's logit picked up on the way;
 //! 3. with gradients requested, walks it again: the recomputed chunk becomes
 //!    `dlogits = (softmax - onehot) * scale`, then `dh += dlogits @ W_c` (the
 //!    first chunk writes `dh`, the rest accumulate into it in the GEMM) and
@@ -21,9 +21,14 @@
 //!
 //! Every buffer it works in comes from a [`CeWorkspace`] sized for at most
 //! `max_rows` rows and `chunk` vocabulary columns, so the scratch is bounded
-//! by construction: `[max_rows, chunk]` logits, `[chunk, hidden]` of widened
-//! weight, and a few `[max_rows, hidden]` rows. `dW` is `[vocab, hidden]` f32
-//! because a softmax gradient reaches every vocabulary row.
+//! by construction: `[max_rows, chunk]` logits, a few `[max_rows, hidden]`
+//! rows, and the GEMMs' operand copies. Each operand reaches its GEMMs in the
+//! lane's type once: on exact f32 a bf16 weight chunk is widened (exactly)
+//! once per walk; on bf16 operands `h` is rounded once per call, each
+//! dlogits chunk once for its two GEMMs, an f32 weight chunk once per walk,
+//! and a bf16 weight is read as it is (no f32 copy of it exists on that
+//! lane). `dW` is `[vocab, hidden]` f32 because a softmax gradient reaches
+//! every vocabulary row.
 //!
 //! The loss is `mean` (or `sum`) over the supplied rows of
 //! `logsumexp(logits) - logits[target]`, which is
@@ -86,20 +91,28 @@ pub struct CeOutput {
 }
 
 /// Scratch for [`cross_entropy_rows`], sized once for at most `max_rows`
-/// rows, `hidden` columns and `chunk` vocabulary columns per step.
+/// rows, `hidden` columns and `chunk` vocabulary columns per step, for one
+/// weight dtype and one [`GemmOperands`] lane.
 pub struct CeWorkspace {
     max_rows: u32,
     hidden: u32,
     chunk: u32,
     weight_dtype: DType,
+    operands: GemmOperands,
     rows: GpuBuffer,
     targets: GpuBuffer,
     /// Gathered rows `[max_rows, hidden]` f32.
     h: Tensor,
     /// One chunk of logits `[max_rows, chunk]` f32.
     logits: Tensor,
-    /// A bf16 weight chunk widened to f32 `[chunk, hidden]` (bf16 weights only).
-    w32: Option<Tensor>,
+    /// A weight chunk `[chunk, hidden]` in the lane's operand type, when the
+    /// weight is not already: a bf16 weight widened to f32 for exact-f32
+    /// GEMMs, an f32 weight rounded to bf16 for bf16 ones.
+    wc: Option<Tensor>,
+    /// bf16 operands: the gathered rows rounded once `[max_rows, hidden]`,
+    /// and one dlogits chunk rounded once `[max_rows, chunk]`.
+    h16: Option<Tensor>,
+    logits16: Option<Tensor>,
     m: GpuBuffer,
     s: GpuBuffer,
     tlogit: GpuBuffer,
@@ -112,6 +125,7 @@ impl CeWorkspace {
         hidden: u32,
         chunk: u32,
         weight_dtype: DType,
+        operands: GemmOperands,
     ) -> Result<Self, String> {
         const WHAT: &str = "CeWorkspace";
         if max_rows == 0 || hidden == 0 || chunk == 0 {
@@ -125,24 +139,34 @@ impl CeWorkspace {
         if !matches!(weight_dtype, DType::F32 | DType::BF16) {
             return Err(format!("{WHAT}: weight must be f32 or bf16, got {weight_dtype:?}"));
         }
+        let [_, _, _, _, _, _, _, wc, h16, logits16] = Self::nbytes(max_rows, hidden, chunk, weight_dtype, operands);
         let (n, h, c) = (max_rows as usize, hidden as usize, chunk as usize);
         let f32s = |len: usize| rt.alloc_buffer(len.max(1) * 4);
         // Not zeroed: each call writes the rows it reads (the gather into
-        // `h`, every logit chunk by its GEMM, `w32` by the widening) before
-        // reading them.
+        // `h` and its rounding, every logit chunk by its GEMM and its
+        // rounding, the weight chunk by its cast) before reading them.
+        let dtype = |bf16: bool| if bf16 { DType::BF16 } else { DType::F32 };
+        let bf16_ops = operands == GemmOperands::Bf16;
+        let opt = |nbytes: usize, shape: [usize; 2], dt: DType| -> Result<Option<Tensor>, String> {
+            if nbytes == 0 {
+                Ok(None)
+            } else {
+                rt.alloc_tensor_unzeroed(&shape, dt).map(Some)
+            }
+        };
         Ok(Self {
             max_rows,
             hidden,
             chunk,
             weight_dtype,
+            operands,
             rows: f32s(n)?,
             targets: f32s(n)?,
             h: rt.alloc_tensor_unzeroed(&[n, h], DType::F32)?,
             logits: rt.alloc_tensor_unzeroed(&[n, c], DType::F32)?,
-            w32: match weight_dtype {
-                DType::BF16 => Some(rt.alloc_tensor_unzeroed(&[c, h], DType::F32)?),
-                _ => None,
-            },
+            wc: opt(wc, [c, h], dtype(bf16_ops))?,
+            h16: opt(h16, [n, h], DType::BF16)?,
+            logits16: opt(logits16, [n, c], DType::BF16)?,
             m: f32s(n)?,
             s: f32s(n)?,
             tlogit: f32s(n)?,
@@ -151,31 +175,58 @@ impl CeWorkspace {
 
     /// Device bytes this workspace holds, the bound on the call's scratch.
     pub fn bytes(&self) -> usize {
-        Self::bytes_for(self.max_rows, self.hidden, self.chunk, self.weight_dtype)
+        Self::bytes_for(self.max_rows, self.hidden, self.chunk, self.weight_dtype, self.operands)
     }
 
     /// [`Self::bytes`] before allocating.
-    pub fn bytes_for(max_rows: u32, hidden: u32, chunk: u32, weight_dtype: DType) -> usize {
-        4 * Self::lens(max_rows, hidden, chunk, weight_dtype).iter().sum::<usize>()
+    pub fn bytes_for(max_rows: u32, hidden: u32, chunk: u32, weight_dtype: DType, operands: GemmOperands) -> usize {
+        Self::nbytes(max_rows, hidden, chunk, weight_dtype, operands)
+            .iter()
+            .sum::<usize>()
     }
 
     /// [`Self::bytes_for`] as the device charges it: each buffer at the
     /// size the pool makes it ([`GpuRuntime::allocated_bytes_for`]).
-    pub fn allocated_bytes_for(max_rows: u32, hidden: u32, chunk: u32, weight_dtype: DType) -> u64 {
-        Self::lens(max_rows, hidden, chunk, weight_dtype)
+    pub fn allocated_bytes_for(
+        max_rows: u32,
+        hidden: u32,
+        chunk: u32,
+        weight_dtype: DType,
+        operands: GemmOperands,
+    ) -> u64 {
+        Self::nbytes(max_rows, hidden, chunk, weight_dtype, operands)
             .iter()
             .filter(|&&n| n > 0)
-            .map(|&n| GpuRuntime::allocated_bytes_for(n * 4, BufferKind::Cold))
+            .map(|&n| GpuRuntime::allocated_bytes_for(n, BufferKind::Cold))
             .fold(0, u64::saturating_add)
     }
 
-    /// f32 elements of each buffer [`Self::new`] allocates (`w32` is 0 for an
-    /// f32 weight, which has none): `rows`, `targets`, `m`, `s`, `tlogit`,
-    /// `h`, `logits`, `w32`.
-    fn lens(max_rows: u32, hidden: u32, chunk: u32, weight_dtype: DType) -> [usize; 8] {
+    /// Bytes of each buffer [`Self::new`] allocates, 0 for one it does not:
+    /// `rows`, `targets`, `m`, `s`, `tlogit`, `h`, `logits` (f32), then the
+    /// weight chunk in the lane's operand type (a bf16 weight on exact f32,
+    /// an f32 one on bf16 operands), and on bf16 operands `h16` and
+    /// `logits16`.
+    fn nbytes(max_rows: u32, hidden: u32, chunk: u32, weight_dtype: DType, operands: GemmOperands) -> [usize; 10] {
         let (n, h, c) = (max_rows as usize, hidden as usize, chunk as usize);
-        let widened = if weight_dtype == DType::BF16 { c * h } else { 0 };
-        [n, n, n, n, n, n * h, n * c, widened]
+        let bf16_ops = operands == GemmOperands::Bf16;
+        let wc = match (bf16_ops, weight_dtype) {
+            (false, DType::BF16) => 4 * c * h,
+            (true, DType::F32) => 2 * c * h,
+            _ => 0,
+        };
+        let (h16, logits16) = if bf16_ops { (2 * n * h, 2 * n * c) } else { (0, 0) };
+        [
+            4 * n,
+            4 * n,
+            4 * n,
+            4 * n,
+            4 * n,
+            4 * n * h,
+            4 * n * c,
+            wc,
+            h16,
+            logits16,
+        ]
     }
 
     pub fn chunk(&self) -> u32 {
@@ -185,6 +236,11 @@ impl CeWorkspace {
     /// The most rows one call may supply.
     pub fn max_rows(&self) -> u32 {
         self.max_rows
+    }
+
+    /// The GEMM lane every call on this workspace runs.
+    pub fn operands(&self) -> GemmOperands {
+        self.operands
     }
 }
 
@@ -201,6 +257,11 @@ pub fn cross_entropy_rows(
     ws: &CeWorkspace,
     grads: Option<CeGrads<'_>>,
 ) -> Result<CeOutput, String> {
+    let grads = grads.map(|g| Grads {
+        dh: g.dh,
+        scale: g.scale,
+        dw: DwOut::Overwrite(g.dw),
+    });
     ce_rows(
         "cross_entropy_rows",
         rt,
@@ -212,7 +273,6 @@ pub fn cross_entropy_rows(
         operands,
         ws,
         grads,
-        false,
     )
 }
 
@@ -236,22 +296,39 @@ pub fn cross_entropy_rows_accumulating(
     grads: CeGrads<'_>,
 ) -> Result<CeOutput, String> {
     const WHAT: &str = "cross_entropy_rows_accumulating";
-    ce_rows(
-        WHAT,
-        rt,
-        h,
-        weight,
-        rows,
-        targets,
-        reduction,
-        operands,
-        ws,
-        Some(grads),
-        true,
-    )
+    let grads = Grads {
+        dh: grads.dh,
+        scale: grads.scale,
+        dw: DwOut::Add(grads.dw),
+    };
+    ce_rows(WHAT, rt, h, weight, rows, targets, reduction, operands, ws, Some(grads))
 }
 
-/// [`cross_entropy_rows`]; `dw_add` adds into `dw` rather than overwriting it.
+/// Where `dW` goes.
+enum DwOut<'a> {
+    /// Over a dense f32 `[vocab, hidden]` tensor.
+    Overwrite(&'a Tensor),
+    /// Added into one.
+    Add(&'a Tensor),
+}
+
+impl DwOut<'_> {
+    /// The tensor the GEMMs write `dW` into.
+    fn target(&self) -> &Tensor {
+        match self {
+            Self::Overwrite(t) | Self::Add(t) => t,
+        }
+    }
+}
+
+/// The gradients a call computes: `dh` overwritten, `dW` per [`DwOut`].
+struct Grads<'a> {
+    dh: &'a Tensor,
+    scale: f32,
+    dw: DwOut<'a>,
+}
+
+/// [`cross_entropy_rows`], with `dW` going wherever `grads.dw` says.
 #[allow(clippy::too_many_arguments)]
 fn ce_rows(
     what: &'static str,
@@ -263,8 +340,7 @@ fn ce_rows(
     reduction: Reduction,
     operands: GemmOperands,
     ws: &CeWorkspace,
-    grads: Option<CeGrads<'_>>,
-    dw_add: bool,
+    grads: Option<Grads<'_>>,
 ) -> Result<CeOutput, String> {
     let n = rows.len();
     if n == 0 {
@@ -303,6 +379,12 @@ fn ce_rows(
             ws.hidden, ws.weight_dtype, weight.dtype
         ));
     }
+    if operands != ws.operands {
+        return Err(format!(
+            "{what}: workspace is for {:?} operands, not {operands:?}",
+            ws.operands
+        ));
+    }
     if vs > u32::MAX as usize || t_rows > u32::MAX as usize || ld > u32::MAX as usize {
         return Err(format!("{what}: vocabulary, rows and ld must fit u32"));
     }
@@ -319,7 +401,8 @@ fn ce_rows(
         if !g.scale.is_finite() {
             return Err(format!("{what}: scale must be finite"));
         }
-        for (name, t, want) in [("dh", g.dh, [n, hs]), ("dw", g.dw, [vs, hs])] {
+        let (dw_name, dw, dw_want) = ("dw", g.dw.target(), [vs, hs]);
+        for (name, t, want) in [("dh", g.dh, [n, hs]), (dw_name, dw, dw_want)] {
             t.validate().map_err(|e| format!("{what}: {name}: {e}"))?;
             if !Arc::ptr_eq(t.runtime(), rt) {
                 return Err(format!("{what}: {name} belongs to another runtime"));
@@ -332,10 +415,10 @@ fn ce_rows(
                 ));
             }
         }
-        if g.dh.overlaps(g.dw) {
-            return Err(format!("{what}: dh and dw overlap"));
+        if g.dh.overlaps(dw) {
+            return Err(format!("{what}: dh and {dw_name} overlap"));
         }
-        for (out, o) in [("dh", g.dh), ("dw", g.dw)] {
+        for (out, o) in [("dh", g.dh), (dw_name, dw)] {
             for (inp, i) in [("hidden", h.rows), ("weight", weight)] {
                 if o.overlaps(i) {
                     return Err(format!("{what}: {out} overlaps the {inp} it is computed from"));
@@ -373,50 +456,35 @@ fn ce_rows(
 
     let chunk = ws.chunk as usize;
     let lse = rt.pipeline("ce_lse_update")?;
-    // Under bf16 operands each GEMM rounds an f32 operand to bf16 itself,
-    // into a fresh temporary per call: `h` for every chunk's GEMMs in both
-    // walks, each logit chunk for two, an f32 weight chunk for two. Round
-    // each once into a bf16 copy and hand the GEMMs that (same cast kernel,
-    // same bits). A bf16 weight goes to them as it is, rather than widened to
-    // f32 and narrowed back (exact both ways). That was ~310 dispatches and
-    // ~250 allocations per 2B step.
-    let bf16_ops = operands == GemmOperands::Bf16;
-    let h16 = if bf16_ops {
-        let t = rt.alloc_tensor_unzeroed(&[n, hs], DType::BF16)?;
-        cast_f32_to_bf16_into(&h_rows, &t)?;
-        Some(t)
-    } else {
-        None
+    // Each operand reaches the GEMMs in the lane's type once. Under bf16
+    // operands a GEMM handed an f32 operand rounds it into a fresh temporary
+    // of its own: `h` for every chunk's GEMMs in both walks, each logit
+    // chunk for two. Rounded once here instead, into the workspace (same
+    // cast kernel, same bits).
+    let h_op = match &ws.h16 {
+        Some(h16) => {
+            let t = h16.try_view(&[n, hs], 0)?;
+            cast_f32_to_bf16_into(&h_rows, &t)?;
+            t
+        }
+        None => h_rows.clone(),
     };
-    let h_op = h16.as_ref().unwrap_or(&h_rows);
-    let widest = chunk.min(vs);
-    let w16 = if bf16_ops && weight.dtype == DType::F32 {
-        Some(rt.alloc_tensor_unzeroed(&[widest, hs], DType::BF16)?)
-    } else {
-        None
-    };
-    // The weight rows [v0, v0 + w) as the GEMMs take them: a bf16 chunk
-    // widened to f32 for exact-f32 GEMMs, an f32 one rounded once for bf16.
+    // The weight rows [v0, v0 + w) as the GEMMs take them: as stored when
+    // that is the lane's type (a bf16 weight on bf16 operands is never
+    // widened), otherwise cast once per walk into the workspace's chunk (a
+    // bf16 weight widened exactly for exact f32, an f32 one rounded for
+    // bf16).
     let weight_chunk = |v0: usize, w: usize| -> Result<Tensor, String> {
         let src = weight.try_view(&[w, hs], v0 * hs)?;
-        match (weight.dtype, &w16) {
-            (DType::BF16, _) if bf16_ops => Ok(src),
-            (DType::F32, Some(w16)) => {
-                let dst = w16.try_view(&[w, hs], 0)?;
-                cast_f32_to_bf16_into(&src, &dst)?;
-                Ok(dst)
-            }
-            (DType::F32, None) => Ok(src),
-            _ => {
-                let dst = ws
-                    .w32
-                    .as_ref()
-                    .ok_or("CeWorkspace: bf16 weight without a widening buffer")?
-                    .try_view(&[w, hs], 0)?;
-                cast_bf16_to_f32_into(&src, &dst)?;
-                Ok(dst)
-            }
+        let Some(wc) = &ws.wc else {
+            return Ok(src);
+        };
+        let dst = wc.try_view(&[w, hs], 0)?;
+        match weight.dtype {
+            DType::BF16 => cast_bf16_to_f32_into(&src, &dst)?,
+            _ => cast_f32_to_bf16_into(&src, &dst)?,
         }
+        Ok(dst)
     };
 
     // 2. First walk: running log-sum-exp and the target logits.
@@ -424,7 +492,7 @@ fn ce_rows(
         let w = chunk.min(vs - v0);
         let wc = weight_chunk(v0, w)?;
         let logits = ws.logits.try_view(&[n, w], 0)?;
-        operands.nt(h_op, &wc, &logits)?;
+        operands.nt(&h_op, &wc, &logits)?;
         let tptg = reduce_tptg(lse.maxTotalThreadsPerThreadgroup(), w);
         dispatch_tg_1d(rt, &lse, n, tptg, None, |bnd| {
             set_gpu_buf(bnd, &logits.buffer, 0);
@@ -447,16 +515,11 @@ fn ce_rows(
             Reduction::Sum => g.scale,
         };
         let sgrad = rt.pipeline("ce_softmax_grad")?;
-        let logits16 = if bf16_ops {
-            Some(rt.alloc_tensor_unzeroed(&[n, widest], DType::BF16)?)
-        } else {
-            None
-        };
         for v0 in (0..vs).step_by(chunk) {
             let w = chunk.min(vs - v0);
             let wc = weight_chunk(v0, w)?;
             let logits = ws.logits.try_view(&[n, w], 0)?;
-            operands.nt(h_op, &wc, &logits)?;
+            operands.nt(&h_op, &wc, &logits)?;
             dispatch_2d(rt, &sgrad, w, n, |bnd| {
                 set_gpu_buf(bnd, &logits.buffer, 0);
                 set_gpu_buf(bnd, &ws.m, 1);
@@ -469,7 +532,7 @@ fn ce_rows(
                 set_f32(bnd, scale, 8);
             })?;
             // The two GEMMs below share one bf16 rounding of dlogits.
-            let dlogits = match &logits16 {
+            let dlogits = match &ws.logits16 {
                 Some(l16) => {
                     let d = l16.try_view(&[n, w], 0)?;
                     cast_f32_to_bf16_into(&logits, &d)?;
@@ -485,11 +548,9 @@ fn ce_rows(
                 operands.nn_acc(&dlogits, &wc, g.dh)?;
             }
             // dW rows [v0, v0 + w) (+)= dlogitsᵀ @ h.
-            let dw_rows = g.dw.try_view(&[w, hs], v0 * hs)?;
-            if dw_add {
-                operands.tn_acc(&dlogits, h_op, &dw_rows)?;
-            } else {
-                operands.tn(&dlogits, h_op, &dw_rows)?;
+            match &g.dw {
+                DwOut::Overwrite(dw) => operands.tn(&dlogits, &h_op, &dw.try_view(&[w, hs], v0 * hs)?)?,
+                DwOut::Add(dw) => operands.tn_acc(&dlogits, &h_op, &dw.try_view(&[w, hs], v0 * hs)?)?,
             }
         }
     }
@@ -529,8 +590,10 @@ fn ws_buffers(ws: &CeWorkspace) -> Vec<(&'static str, &GpuBuffer)> {
         ("s", &ws.s),
         ("tlogit", &ws.tlogit),
     ];
-    if let Some(w) = &ws.w32 {
-        v.push(("w32", &w.buffer));
+    for (name, t) in [("wc", &ws.wc), ("h16", &ws.h16), ("logits16", &ws.logits16)] {
+        if let Some(t) = t {
+            v.push((name, &t.buffer));
+        }
     }
     v
 }

@@ -886,6 +886,7 @@ impl Qwen35Model {
                 cfg.hidden,
                 CE_CHUNK.min(cfg.vocab),
                 self.embed.dtype,
+                operands,
             )?;
             let hidden = CeHidden { rows: &xf, off: 0 };
             let (dw, add) = match (head, &d_embed) {
@@ -1481,14 +1482,19 @@ impl Qwen35Model {
         let (n, h) = (t as usize, cfg.hidden as usize);
         let chunk = CE_CHUNK.min(cfg.vocab);
         let tc = self.rt.has_tensorops();
-        let per_chunk = |w: usize| {
-            [
+        // Exact f32: every operand is f32 (a bf16 weight chunk widened in
+        // the workspace). bf16 operands: every operand reaches its GEMM
+        // already bf16 (rounded once into the workspace, or the bf16
+        // weight itself), so the GEMMs copy nothing.
+        let per_chunk = |w: usize| match mm {
+            GemmOperands::Bf16 => 0,
+            GemmOperands::ExactF32 => [
                 2 * mm.nt_scratch_bytes(tc, n, w, h, DType::F32),
                 mm.nn_scratch_bytes(n, h, w, DType::F32),
                 mm.tn_scratch_bytes(tc, w, h, n),
             ]
             .iter()
-            .fold(0u64, |a, &b| a.saturating_add(b))
+            .fold(0u64, |a, &b| a.saturating_add(b)),
         };
         let (full, rest) = ((cfg.vocab / chunk) as u64, (cfg.vocab % chunk) as usize);
         let gemms = if batched {
@@ -1499,7 +1505,7 @@ impl Qwen35Model {
             per_chunk(chunk as usize)
         };
         [
-            CeWorkspace::allocated_bytes_for(t, cfg.hidden, chunk, self.embed.dtype),
+            CeWorkspace::allocated_bytes_for(t, cfg.hidden, chunk, self.embed.dtype, mm),
             gemms,
             GpuRuntime::allocated_bytes_for(n * h * 4, BufferKind::Cold),
         ]

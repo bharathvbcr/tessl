@@ -189,7 +189,7 @@ pub struct TesslRuntime {
     owner: ThreadId,
     /// The last cross-entropy workspace, reused while it fits.
     ce_ws: Option<CeWorkspace>,
-    ce_ws_key: (u32, u32, DType),
+    ce_ws_key: (u32, u32, DType, GemmOperands),
     /// The last GDN backward workspace, reused for the same shape.
     gdn_ws: Option<GdnTrainWorkspace>,
 }
@@ -213,7 +213,7 @@ pub unsafe extern "C" fn tessl_runtime_new(err: *mut c_char, err_len: usize) -> 
             rt,
             owner: std::thread::current().id(),
             ce_ws: None,
-            ce_ws_key: (0, 0, DType::F32),
+            ce_ws_key: (0, 0, DType::F32, GemmOperands::ExactF32),
             gdn_ws: None,
         })),
         Ok(Err(e)) => {
@@ -343,14 +343,14 @@ unsafe fn ce(h: &mut TesslRuntime, a: &TesslCeArgs) -> Result<crate::cross_entro
     }
     let hs = u32::try_from(weight.shape()[1]).map_err(|_| format!("{WHAT}: hidden exceeds u32"))?;
     let chunk = if a.chunk == 0 { DEFAULT_CE_CHUNK } else { a.chunk };
-    let key = (hs, chunk, weight.dtype);
+    let key = (hs, chunk, weight.dtype, operands);
     let fits = h.ce_ws.as_ref().is_some_and(|ws| ws.max_rows() >= n32) && h.ce_ws_key == key;
     if !fits {
         // Grow to the next power of two so a slowly growing batch does not
         // reallocate every step.
         let max_rows = n32.checked_next_power_of_two().unwrap_or(n32);
         h.ce_ws = None;
-        h.ce_ws = Some(CeWorkspace::new(&rt, max_rows, hs, chunk, weight.dtype)?);
+        h.ce_ws = Some(CeWorkspace::new(&rt, max_rows, hs, chunk, weight.dtype, operands)?);
         h.ce_ws_key = key;
     }
     let ws = h.ce_ws.as_ref().ok_or_else(|| format!("{WHAT}: workspace missing"))?;

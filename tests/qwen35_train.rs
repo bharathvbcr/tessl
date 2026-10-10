@@ -630,6 +630,44 @@ fn a_bf16_step_peaks_under_its_bound_and_below_the_f32_steps() {
     }
 }
 
+/// On bf16 operands the cross-entropy's workspace holds the rows and one
+/// dlogits chunk rounded to bf16, and no f32 copy of a bf16 weight chunk,
+/// whose GEMMs take it as it is. Where the cross-entropy bounds the step
+/// (the tiny model at hidden 1024, so a `[8192, hidden]` chunk outweighs a
+/// layer), a bf16 model's bound is therefore below the exact lane's, which
+/// widens each weight chunk; it used to be above it (the widened chunk and
+/// every GEMM's bf16 copies of it). The measured peak stays under the
+/// smaller bound.
+#[test]
+fn a_bf16_steps_bound_holds_no_widened_weight_chunk() {
+    let cfg = Qwen35Config {
+        vocab: 16_384,
+        hidden: 1024,
+        ..tiny_config()
+    };
+    let rt = GpuRuntime::new().unwrap();
+    let model = Qwen35Model::random_tower(&rt, cfg.clone(), Precision::Bf16, 7).unwrap();
+    let bank = Qwen35Grads::zeros_like(&model).unwrap();
+    for t in [8u32, 33] {
+        let bf16 = model.train_step_bytes(t, GemmOperands::Bf16);
+        let exact = model.train_step_bytes(t, GemmOperands::ExactF32);
+        assert!(
+            bf16 < exact,
+            "T={t}: bf16 operands' bound {bf16} B not below exact f32's {exact} B"
+        );
+        let ids: Vec<u32> = (0..t).map(|i| (i * 7_919 + 3) % cfg.vocab).collect();
+        rt.synchronize().unwrap();
+        let before = rt.current_allocated_bytes();
+        rt.reset_peak_allocated_bytes();
+        model
+            .train_step_into(&ids, GemmOperands::Bf16, Supervise::Causal, &bank, false)
+            .unwrap();
+        let peak = rt.peak_allocated_bytes().saturating_sub(before);
+        eprintln!("T={t}: peak {peak} B, bound {bf16} B (exact lane's {exact} B)");
+        assert!(peak <= bf16, "T={t}: peak {peak} over the bound {bf16}");
+    }
+}
+
 /// The tiny model 24 layers deep in the 2B's layer pattern
 /// (`make_train_fixture.py tiny --layers 24 --out target/qwen35_train_deep`):
 /// how gradient agreement with transformers changes with depth alone, both
@@ -1346,7 +1384,7 @@ fn a_busy_or_poisoned_runtime_is_an_error_from_every_training_entry_point() {
         let dh = rt.alloc_tensor_f32(&[1, h]).unwrap();
         let dw = rt.alloc_tensor_f32(&[vocab, h]).unwrap();
         let dst = rt.alloc_tensor_f32(&[ids.len(), h]).unwrap();
-        let ce_ws = CeWorkspace::new(&rt, 1, cfg.hidden, cfg.vocab, DType::F32).unwrap();
+        let ce_ws = CeWorkspace::new(&rt, 1, cfg.hidden, cfg.vocab, DType::F32, mm).unwrap();
         let emb_ws = EmbedBwdWorkspace::new(&rt, ids.len() as u32).unwrap();
 
         let held = rt.alloc_buffer(4).unwrap();

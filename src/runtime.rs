@@ -721,21 +721,25 @@ pub struct GpuRuntime {
     poison_unzeroed: AtomicBool,
 }
 
-/// Kernel-use trace, gated on `TESSL_KERNEL_TRACE=1`.
+/// Kernel-use trace, gated on `TESSL_KERNEL_TRACE=1`: each kernel's
+/// pipeline requests, by name.
 ///
 /// Off by default and read through a `OnceLock`, so the cost on the dispatch
 /// path when disabled is one relaxed load.
 static KERNEL_TRACE_ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-static KERNEL_TRACE: std::sync::Mutex<std::collections::BTreeSet<String>> =
-    std::sync::Mutex::new(std::collections::BTreeSet::new());
+static KERNEL_TRACE: std::sync::Mutex<std::collections::BTreeMap<String, u64>> =
+    std::sync::Mutex::new(std::collections::BTreeMap::new());
 
 fn record_kernel_use(name: &str) {
     if !*KERNEL_TRACE_ON.get_or_init(|| std::env::var_os("TESSL_KERNEL_TRACE").is_some()) {
         return;
     }
-    if let Ok(mut set) = KERNEL_TRACE.lock() {
-        if !set.contains(name) {
-            set.insert(name.to_string());
+    if let Ok(mut counts) = KERNEL_TRACE.lock() {
+        match counts.get_mut(name) {
+            Some(n) => *n += 1,
+            None => {
+                counts.insert(name.to_string(), 1);
+            }
         }
     }
 }
@@ -747,8 +751,20 @@ fn record_kernel_use(name: &str) {
 pub fn traced_kernels() -> Vec<String> {
     KERNEL_TRACE
         .lock()
-        .map(|s| s.iter().cloned().collect())
+        .map(|s| s.keys().cloned().collect())
         .unwrap_or_default()
+}
+
+/// How many pipelines this process has requested for `name`, under
+/// `TESSL_KERNEL_TRACE` (0 without it). A request is not a dispatch: a
+/// caller may request once and dispatch many times. Ops that request their
+/// pipeline per call (the elementwise casts, for one) count their
+/// dispatches this way; difference two readings around the work.
+pub fn traced_kernel_count(name: &str) -> u64 {
+    KERNEL_TRACE
+        .lock()
+        .map(|s| s.get(name).copied().unwrap_or(0))
+        .unwrap_or(0)
 }
 
 /// Whether the trace is recording. Lets a caller distinguish "nothing

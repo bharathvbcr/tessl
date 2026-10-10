@@ -268,7 +268,8 @@ fn check(rt: &Arc<GpuRuntime>, c: &Case) -> f64 {
     };
     let n = c.rows.len();
     // A workspace larger than the call needs, as a training loop reuses one.
-    let ws = CeWorkspace::new(rt, n as u32 + 3, c.hidden as u32, c.chunk as u32, c.w_dtype).expect("workspace");
+    let ws =
+        CeWorkspace::new(rt, n as u32 + 3, c.hidden as u32, c.chunk as u32, c.w_dtype, c.operands).expect("workspace");
 
     let fwd = cross_entropy_rows(rt, hid, &wt, &c.rows, &c.targets, c.reduction, c.operands, &ws, None)
         .unwrap_or_else(|e| panic!("{label}: {e}"));
@@ -563,20 +564,91 @@ fn matches_the_reference_at_the_real_vocabulary_and_hidden_width() {
 
 #[test]
 fn the_workspace_is_bounded_by_rows_and_chunk_not_vocabulary() {
+    use GemmOperands::{Bf16, ExactF32};
     // The whole point: scratch does not grow with the vocabulary.
-    let b = CeWorkspace::bytes_for(8, 2048, 4096, DType::BF16);
-    // rows, targets, m, s, tlogit; the gathered rows; one logit chunk; the
-    // widened weight chunk. (dh accumulates in its GEMM: no `dh_part`.)
-    let want = 4 * (5 * 8 + 8 * 2048 + 8 * 4096 + 4096 * 2048);
-    assert_eq!(b, want);
+    // rows, targets, m, s, tlogit; the gathered rows; one logit chunk. (dh
+    // accumulates in its GEMM: no `dh_part`.)
+    let base = 4 * (5 * 8 + 8 * 2048 + 8 * 4096);
+    // Exact f32: a bf16 weight's chunk widened to f32; an f32 weight is read
+    // as it is.
+    let exact_bf16 = base + 4 * 4096 * 2048;
+    assert_eq!(CeWorkspace::bytes_for(8, 2048, 4096, DType::BF16, ExactF32), exact_bf16);
+    assert_eq!(CeWorkspace::bytes_for(8, 2048, 4096, DType::F32, ExactF32), base);
+    // bf16 operands: the gathered rows and one dlogits chunk rounded once,
+    // and no f32 copy of a bf16 weight (the 32 MiB `w32` here, 80 MiB at the
+    // 4B's hidden 2560 and 8192-column chunks); an f32 weight's chunk is
+    // rounded to bf16.
+    let rounded = 2 * (8 * 2048 + 8 * 4096);
+    assert_eq!(CeWorkspace::bytes_for(8, 2048, 4096, DType::BF16, Bf16), base + rounded);
     assert_eq!(
-        CeWorkspace::bytes_for(8, 2048, 4096, DType::F32),
-        want - 4 * 4096 * 2048
+        CeWorkspace::bytes_for(8, 2048, 4096, DType::F32, Bf16),
+        base + rounded + 2 * 4096 * 2048
     );
+    assert!(CeWorkspace::bytes_for(8, 2048, 4096, DType::BF16, Bf16) < exact_bf16);
+    with_gpu(|_| {
+        for (dtype, op) in [
+            (DType::BF16, ExactF32),
+            (DType::BF16, Bf16),
+            (DType::F32, Bf16),
+            (DType::F32, ExactF32),
+        ] {
+            // A fresh runtime: nothing in its pool to reuse, so every buffer
+            // the workspace makes is a fresh allocation.
+            let rt = &GpuRuntime::new().expect("runtime");
+            let before = rt.current_allocated_bytes();
+            let ws = CeWorkspace::new(rt, 8, 2048, 4096, dtype, op).expect("workspace");
+            let held = rt.current_allocated_bytes() - before;
+            assert_eq!(ws.bytes(), CeWorkspace::bytes_for(8, 2048, 4096, dtype, op));
+            assert_eq!(ws.chunk(), 4096);
+            assert_eq!(ws.operands(), op);
+            // What the device charges, as the step's memory bound counts it:
+            // the bound rounds the five 32-byte buffers up to 256 B each,
+            // which the device charges less for below 16 KiB.
+            let bound = CeWorkspace::allocated_bytes_for(8, 2048, 4096, dtype, op);
+            assert!(
+                held <= bound && bound - held <= 5 * 256,
+                "{dtype:?} weight, {op:?}: held {held} B, bound {bound} B"
+            );
+        }
+    });
+}
+
+/// A bf16 weight goes to bf16-operand GEMMs as it is: the loss, `dh` and
+/// `dW` are bit for bit those of the same weight widened to f32 (exact)
+/// and then rounded per chunk by the workspace (exact back), which is the
+/// path every bf16 weight took before. Likewise on exact f32, where the
+/// widening is the workspace's. Several chunks, a partial last one.
+#[test]
+fn a_bf16_weight_computes_the_bits_of_its_exact_widening() {
     with_gpu(|rt| {
-        let ws = CeWorkspace::new(rt, 8, 2048, 4096, DType::BF16).expect("workspace");
-        assert_eq!(ws.bytes(), b);
-        assert_eq!(ws.chunk(), 4096);
+        let (n, hidden, vocab, chunk) = (5usize, 64usize, 300usize, 64u32);
+        let h = random_f32(n * hidden, 0xb16a);
+        let w = round_trip_bf16(&random_f32(vocab * hidden, 0xb16b));
+        let rows: Vec<u32> = vec![0, 3, 1, 4, 2];
+        let targets: Vec<u32> = vec![0, 299, 64, 63, 200];
+        let hid = upload_at(rt, &h, DType::F32, &[n, hidden], 0);
+        let w16 = upload_at(rt, &w, DType::BF16, &[vocab, hidden], 0);
+        let w32 = upload_at(rt, &w, DType::F32, &[vocab, hidden], 0);
+        for op in [GemmOperands::Bf16, GemmOperands::ExactF32] {
+            let run = |wt: &Tensor| {
+                let ws = CeWorkspace::new(rt, n as u32, hidden as u32, chunk, wt.dtype, op).unwrap();
+                let (dh, dw) = (sentinel_tensor(rt, &[n, hidden]), sentinel_tensor(rt, &[vocab, hidden]));
+                let grads = CeGrads {
+                    dh: &dh,
+                    dw: &dw,
+                    scale: 0.75,
+                };
+                let hidden = CeHidden { rows: &hid, off: 0 };
+                let out =
+                    cross_entropy_rows(rt, hidden, wt, &rows, &targets, Reduction::Mean, op, &ws, Some(grads)).unwrap();
+                let bits = |t: &Tensor| t.read_f32().unwrap().iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+                (out.loss.to_bits(), bits(&dh), bits(&dw))
+            };
+            let (a, b) = (run(&w16), run(&w32));
+            assert_eq!(a.0, b.0, "{op:?}: the loss differs");
+            assert!(a.1 == b.1, "{op:?}: dh differs");
+            assert!(a.2 == b.2, "{op:?}: dW differs");
+        }
     });
 }
 
@@ -589,7 +661,7 @@ fn rejects_what_it_cannot_compute() {
         let ht = tensor_at(rt, &h, &[10, 64]);
         let wt = tensor_at(rt, &w, &[997, 64]);
         let hid = CeHidden { rows: &ht, off: 0 };
-        let ws = CeWorkspace::new(rt, 4, 64, 128, DType::F32).expect("workspace");
+        let ws = CeWorkspace::new(rt, 4, 64, 128, DType::F32, GemmOperands::ExactF32).expect("workspace");
         let run = |hid: CeHidden<'_>,
                    wt: &Tensor,
                    rows: &[u32],
@@ -629,8 +701,14 @@ fn rejects_what_it_cannot_compute() {
         expect_err(run(hid, &w16, &[1], &[1], &ws, None), "f32 or bf16");
         let narrow = wt.try_view(&[997, 32], 0).unwrap();
         expect_err(run(hid, &narrow, &[1], &[1], &ws, None), "workspace is for hidden 64");
-        let ws_bf16 = CeWorkspace::new(rt, 4, 64, 128, DType::BF16).expect("workspace");
+        let ws_bf16 = CeWorkspace::new(rt, 4, 64, 128, DType::BF16, GemmOperands::ExactF32).expect("workspace");
         expect_err(run(hid, &wt, &[1], &[1], &ws_bf16, None), "workspace is for");
+        // A workspace holds one lane's operand copies.
+        let ws_lane = CeWorkspace::new(rt, 4, 64, 128, DType::F32, GemmOperands::Bf16).expect("workspace");
+        expect_err(
+            run(hid, &wt, &[1], &[1], &ws_lane, None),
+            "workspace is for Bf16 operands",
+        );
         // Already inside with_gpu's lock, so the second runtime is made here.
         let other = GpuRuntime::new().expect("second runtime");
         let foreign = tensor_at(&other, &h, &[10, 64]);
@@ -639,13 +717,13 @@ fn rejects_what_it_cannot_compute() {
             "hidden belongs to another runtime",
         );
 
-        expect_err(
-            CeWorkspace::new(rt, 4, 60, 128, DType::F32).map(|_| 0.0),
-            "multiple of 8",
-        );
-        expect_err(CeWorkspace::new(rt, 0, 64, 128, DType::F32).map(|_| 0.0), "non-zero");
-        expect_err(CeWorkspace::new(rt, 4, 64, 0, DType::F32).map(|_| 0.0), "non-zero");
-        expect_err(CeWorkspace::new(rt, 4, 64, 8, DType::F16).map(|_| 0.0), "f32 or bf16");
+        let new = |max_rows, hidden, chunk, dtype| {
+            CeWorkspace::new(rt, max_rows, hidden, chunk, dtype, GemmOperands::ExactF32).map(|_| 0.0)
+        };
+        expect_err(new(4, 60, 128, DType::F32), "multiple of 8");
+        expect_err(new(0, 64, 128, DType::F32), "non-zero");
+        expect_err(new(4, 64, 0, DType::F32), "non-zero");
+        expect_err(new(4, 64, 8, DType::F16), "f32 or bf16");
 
         // Gradients: shape, scale, and overlap with each other and the inputs.
         let dh = rt.alloc_tensor_f32(&[2, 64]).expect("alloc");
@@ -722,8 +800,8 @@ fn the_accumulating_call_adds_dw_into_what_it_holds() {
         let targets: Vec<u32> = (0..n as u32).map(|i| (i * 37 + 5) % vocab as u32).collect();
         let hid = upload_at(rt, &h, DType::F32, &[n, hidden], 0);
         let wt = upload_at(rt, &w, DType::F32, &[vocab, hidden], 0);
-        let ws = CeWorkspace::new(rt, n as u32, hidden as u32, chunk, DType::F32).unwrap();
         for op in [GemmOperands::ExactF32, GemmOperands::Bf16] {
+            let ws = CeWorkspace::new(rt, n as u32, hidden as u32, chunk, DType::F32, op).unwrap();
             let run = |dw: &Tensor, dh: &Tensor, add: bool| {
                 let grads = CeGrads { dh, dw, scale: 0.5 };
                 let hidden = CeHidden { rows: &hid, off: 0 };

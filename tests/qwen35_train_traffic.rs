@@ -344,7 +344,7 @@ fn the_step_adds_its_products_in_the_gemms() {
             let w = rt.alloc_tensor_f32(&[v, h]).unwrap();
             w.buffer
                 .write_f32(&(0..v * h).map(|i| (i % 5) as f32 * 0.01).collect::<Vec<_>>());
-            let ws = CeWorkspace::new(&rt, n as u32, h as u32, 16, DType::F32).unwrap();
+            let ws = CeWorkspace::new(&rt, n as u32, h as u32, 16, DType::F32, op).unwrap();
             let (dh, dw) = (
                 rt.alloc_tensor_f32(&[n, h]).unwrap(),
                 rt.alloc_tensor_f32(&[v, h]).unwrap(),
@@ -376,6 +376,72 @@ fn the_step_adds_its_products_in_the_gemms() {
         assert!(
             ran.iter().any(|r| r.starts_with("matmul2d_tensorops_bf16_f32_epi")),
             "the bf16 accumulate (the epilogue, beta = 1) never ran: {ran:?}"
+        );
+    });
+}
+
+/// On a bf16-stored model's lane (a bf16 weight, bf16 operands) the
+/// cross-entropy reads the weight as it is and rounds each f32 operand once:
+/// no `cast_bf16_to_f32` at all, and `cast_f32_to_bf16` once for the
+/// gathered rows plus once per vocabulary chunk for its dlogits (once in
+/// all without gradients). It used to widen each weight chunk to f32 in both
+/// walks for the GEMMs to round it back, and to round the rows for every
+/// GEMM and each dlogits chunk for two. In a whole bf16-storage step the
+/// only widening left is each layer's kept input, once, for its rebuild.
+#[test]
+fn a_bf16_storage_cross_entropy_casts_each_operand_once() {
+    in_traced_child("a_bf16_storage_cross_entropy_casts_each_operand_once", || {
+        let count = tessl::runtime::traced_kernel_count;
+        let (rt, model) = load(Precision::Bf16);
+        let op = GemmOperands::Bf16;
+        let (n, h, v, chunk) = (5usize, model.config().hidden as usize, 300usize, 64u32);
+        let hid = rt.alloc_tensor_f32(&[n + 2, h]).unwrap();
+        hid.buffer
+            .write_f32(&(0..(n + 2) * h).map(|i| (i % 7) as f32 * 0.1).collect::<Vec<_>>());
+        let w = rt.alloc_tensor_bf16(&[v, h]).unwrap();
+        w.buffer.write_bf16_bits(
+            &(0..v * h)
+                .map(|i| ((((i % 5) as f32 - 2.0) * 0.01).to_bits() >> 16) as u16)
+                .collect::<Vec<_>>(),
+        );
+        let ws = CeWorkspace::new(&rt, n as u32, h as u32, chunk, DType::BF16, op).unwrap();
+        let (dh, dw) = (
+            rt.alloc_tensor_f32(&[n, h]).unwrap(),
+            rt.alloc_tensor_f32(&[v, h]).unwrap(),
+        );
+        let rows: Vec<u32> = vec![0, 2, 4, 6, 1];
+        let targets: Vec<u32> = vec![0, 63, 64, 299, 150];
+        let chunks = v.div_ceil(chunk as usize) as u64;
+        for with_grads in [false, true] {
+            let (w0, n0) = (count("cast_bf16_to_f32"), count("cast_f32_to_bf16"));
+            let grads = with_grads.then_some(CeGrads {
+                dh: &dh,
+                dw: &dw,
+                scale: 1.0,
+            });
+            let hidden = CeHidden { rows: &hid, off: 0 };
+            cross_entropy_rows(&rt, hidden, &w, &rows, &targets, Reduction::Mean, op, &ws, grads).unwrap();
+            let (widened, rounded) = (count("cast_bf16_to_f32") - w0, count("cast_f32_to_bf16") - n0);
+            assert_eq!(
+                widened, 0,
+                "grads {with_grads}: the cross-entropy widened {widened} times"
+            );
+            let want = 1 + if with_grads { chunks } else { 0 };
+            assert_eq!(
+                rounded, want,
+                "grads {with_grads}: {rounded} roundings, want {want} (the rows once, each dlogits chunk once)"
+            );
+        }
+        let bank = Qwen35Grads::zeros_like(&model).unwrap();
+        let w0 = count("cast_bf16_to_f32");
+        model
+            .train_step_into(&ids(), op, Supervise::Causal, &bank, false)
+            .unwrap();
+        let widened = count("cast_bf16_to_f32") - w0;
+        let layers = model.config().layers.len() as u64;
+        assert_eq!(
+            widened, layers,
+            "a bf16-storage step widened {widened} times; only its {layers} kept layer inputs should be"
         );
     });
 }

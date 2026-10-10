@@ -110,6 +110,34 @@ All notable changes to `tessl` are recorded here. The format follows
 
 ### Changed
 
+- **Host-side dispatch overhead.** Owned binds (`bind_tensor`,
+  `bind_gpu_buf_offset`) read a GPU address cached on the buffer instead of
+  sending `length` and `gpuAddress` per bind; scalar binds use the const
+  arena's pointer, GPU address and length read once at init instead of three
+  property sends each; `Tensor::validate` compares runtime pointers without
+  an `Arc::downgrade`; the per-dispatch and per-GEMM runtime flags
+  (`async_encode`, `residency_dirty`, `dispatch_count`, precision,
+  `relaxed_precision`, `flash_tensorops`, the residency count) are atomics
+  rather than mutexes; `decode_icb_capture_active` reads a `Cell<bool>`
+  instead of borrowing a `RefCell`; `BufferPool` reads `maxBufferLength`
+  once; split-K GEMMs no longer collect their partition starts. Not yet
+  measured on the M5 Pro: `bench_nn_kernels --host-only` (host_us) is the
+  check.
+  **Breaking:** the public field `GpuRuntime::dispatch_count` is an
+  `AtomicUsize` (was `Mutex<usize>`); `take_dispatch_count` is unchanged.
+- **bf16 GEMM operands are borrowed.** `gemm_bf16`, `gemm_tn_bf16`,
+  `gemm_nt_bf16` and the bf16 accumulate lanes no longer clone a `Tensor`
+  (a shape `Vec` and two refcounts) for an operand that is already bf16.
+  `tests/host_path_allocs.rs` counts `gemm_bf16`.
+- **Model outputs are copied once.** Qwen3.5 logits and traces,
+  EmbeddingGemma 2 embeddings and traces, and BERT pooled outputs map the
+  buffer and copy the logical prefix, instead of copying the whole buffer and
+  then the prefix again (~1 GB per Qwen3.5 forward at t = 1024). A busy or
+  poisoned runtime is an `Err` there rather than a panic.
+- **Faster weight loading.** `place_linear_part` transposes in 64×64 tiles,
+  and `SafeTensors::read_f32` widens bf16/f16 in blocks with the conversion
+  inlined. Both produce the same bytes as before; each is ~2.3× faster in a
+  standalone check.
 - **Qwen3.5 training step traffic.** Allocations a kernel writes in full
   are no longer zeroed on the host (808 allocations, 25.86 GB per 2B step at
   T = 2048); the step makes one attention workspace and uploads its indices
@@ -384,6 +412,15 @@ All notable changes to `tessl` are recorded here. The format follows
     clamp is removed. The speed-up rests on the A/B; no test pins it.
 
 ### Fixed
+
+- **A freeze-binds ICB refused every captured tape.** `bind_tensor` and
+  `bind_gpu_buf_offset` finished in the raw-buffer bind, which marks the
+  capture incomplete, before recording the owned bind. Every captured
+  command then carried `incomplete_binds > 0`, so
+  `DecodeIcb::from_commands_ex(.., true)` (and `TESSL_ICB_FREEZE_BINDS`)
+  rejected any real tape. Owned binds are recorded without that mark; the
+  raw-buffer `Binder::bind_buf` is now test-only. Covered by
+  `owned_binds_capture_complete_and_freeze`.
 
 - **`gemm_i8_dequant` bound its exact accumulation with the wrong product.**
   It took 127 × 127 as the largest int8 product, but (−128) × (−128) = 16384

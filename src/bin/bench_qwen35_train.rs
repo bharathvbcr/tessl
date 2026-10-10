@@ -25,6 +25,11 @@
 //! the ~0.25 ms submit-and-wait floor, `docs/benchmarking.md`). A GDN layer's
 //! training ops are `gdn_train` forward + backward; an attention layer's are
 //! `attn_train` forward + backward; the row-local backwards are listed apart.
+//! Three rows time what a bf16 model's backward does with each layer's saved
+//! bf16 input before rebuilding the layer: the widen to f32, the input norm
+//! reading the widened f32, and the residual copy out of it (with
+//! `rms_norm_bwd`, which also reads it, the ops a bf16-input norm would
+//! change; their sum per layer bounds what it could save).
 //!
 //! `--batch=ROWS,LEN[,SPAN_ROWS]` (repeatable, with the real checkpoint)
 //! times one optimizer step's gradients for a batch run row by row into one
@@ -68,18 +73,18 @@ use tessl::cross_entropy::{cross_entropy_rows, CeGrads, CeHidden, CeWorkspace, R
 use tessl::gdn_train::{
     gdn_train_backward, gdn_train_forward, GdnTrainDims, GdnTrainGrads, GdnTrainInputs, GdnTrainWorkspace,
 };
-use tessl::gemm::GemmOperands;
-use tessl::qwen35::{AttnShape, Cols, GdnGateLogits, GdnParams};
+use tessl::gemm::{cast_bf16_to_f32_into, GemmOperands};
+use tessl::qwen35::{rms_norm, AttnShape, Cols, GdnGateLogits, GdnParams};
 use tessl::qwen35_adamw::{AdamW, AdamWHyper};
 use tessl::qwen35_bwd::{
-    attn_qk_norm_rope_bwd, attn_qk_norm_rope_bwd_part_len, conv1d_silu_bwd, conv1d_silu_bwd_part_len, embed_rows_bwd,
-    gated_rms_norm_bwd, gated_rms_norm_bwd_part_len, gdn_gates_bwd, gdn_gates_bwd_part_len, rms_norm_bwd,
-    rms_norm_bwd_part_len, swiglu_bwd, AttnQkvGrads, EmbedBwdWorkspace,
+    attn_qk_norm_rope_bwd, attn_qk_norm_rope_bwd_part_len, conv1d_silu_bwd, conv1d_silu_bwd_part_len, copy_cols,
+    embed_rows_bwd, gated_rms_norm_bwd, gated_rms_norm_bwd_part_len, gdn_gates_bwd, gdn_gates_bwd_part_len,
+    rms_norm_bwd, rms_norm_bwd_part_len, swiglu_bwd, AttnQkvGrads, EmbedBwdWorkspace,
 };
 use tessl::qwen35_model::{Precision, Qwen35Config, Qwen35Model};
 use tessl::qwen35_train::Qwen35Grads;
 use tessl::safetensors::SafeTensors;
-use tessl::tensor::GpuBuffer;
+use tessl::tensor::{f32_slice_to_bf16, GpuBuffer};
 use tessl::{DType, GpuRuntime, Tensor};
 
 const HIDDEN: usize = 2048;
@@ -293,6 +298,15 @@ fn bench_t(rt: &Arc<GpuRuntime>, t: usize, check_only: bool, operands: GemmOpera
         buf(rt, t * HIDDEN, 0, 0.0)?,
     );
     let (nw, dnw) = (buf(rt, HIDDEN, s(33), 1.0)?, buf(rt, HIDDEN, 0, 0.0)?);
+    // A bf16 layer input, and the f32 it is widened into, normed and copied out of.
+    let x16 = rt.alloc_tensor_bf16(&[t, HIDDEN])?;
+    x16.buffer
+        .write_bf16_bits(&f32_slice_to_bf16(&fill(t * HIDDEN, s(31), 1.0)));
+    let (xw, xn, xc) = (
+        rt.alloc_tensor_f32(&[t, HIDDEN])?,
+        buf(rt, t * HIDDEN, 0, 0.0)?,
+        buf(rt, t * HIDDEN, 0, 0.0)?,
+    );
     let npart = buf(rt, rms_norm_bwd_part_len(t32, HIDDEN as u32), 0, 0.0)?;
     let vd = GDN_HEADS * GDN_DV;
     let (go, gdy, gdo) = (
@@ -451,6 +465,27 @@ fn bench_t(rt: &Arc<GpuRuntime>, t: usize, check_only: bool, operands: GemmOpera
             name: "rms_norm_bwd",
             run: Box::new(|| rms_norm_bwd(rt, &x, &nw, &dy_h, &dx_h, &dnw, &npart, t32, HIDDEN as u32, EPS, false)),
             outputs: vec![("dx", &dx_h, t * HIDDEN), ("dw", &dnw, HIDDEN)],
+            reps: REPS,
+        },
+        Op {
+            name: "widen bf16 layer input",
+            run: Box::new(|| cast_bf16_to_f32_into(&x16, &xw)),
+            outputs: vec![("x", &xw.buffer, t * HIDDEN)],
+            reps: REPS,
+        },
+        Op {
+            name: "rms_norm (f32 input)",
+            run: Box::new(|| rms_norm(rt, &x, &nw, &xn, DType::F32, t32, HIDDEN as u32, EPS)),
+            outputs: vec![("out", &xn, t * HIDDEN)],
+            reps: REPS,
+        },
+        Op {
+            name: "residual copy (f32)",
+            run: Box::new(|| {
+                let h = HIDDEN as u32;
+                copy_cols(rt, Cols::dense(&x, h), Cols::dense(&xc, h), t32, h)
+            }),
+            outputs: vec![("out", &xc, t * HIDDEN)],
             reps: REPS,
         },
         Op {

@@ -2,9 +2,12 @@
 full-model parity test (tests/qwen35_model.rs).
 
     python3 tools/qwen35_ref/make_reference.py            # writes target/qwen35_ref/
+    python3 tools/qwen35_ref/make_reference.py --ids tests/fixtures/qwen35_text_ids.npy \
+        --out target/qwen35_ref_text                       # the 512 natural-text ids
 
 Loads the text tower (`Qwen3_5ForCausalLM`) from the checkpoint in the Hugging
-Face cache, runs one fixed prompt, and writes:
+Face cache, runs one fixed prompt (or, with `--ids`, the int64 token ids of an
+.npy such as make_text_ids.py writes), and writes:
 
   ids.npy                 int64 [T]            the prompt's token ids
   logits_f32.npy          float32 [T, vocab]   fp32 forward (weights widened from bf16)
@@ -74,6 +77,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model-dir", default=None)
     ap.add_argument("--out", default="target/qwen35_ref")
+    ap.add_argument("--ids", default=None, help="an int64 .npy of token ids to run instead of the prompt")
     args = ap.parse_args()
     model_dir = args.model_dir or find_snapshot()
     os.makedirs(args.out, exist_ok=True)
@@ -81,7 +85,10 @@ def main():
     torch.set_num_threads(max(1, os.cpu_count() // 2))
 
     tok = AutoTokenizer.from_pretrained(model_dir)
-    ids = tok(PROMPT, return_tensors="pt").input_ids
+    if args.ids:
+        ids = torch.from_numpy(np.load(args.ids).astype(np.int64)).reshape(1, -1)
+    else:
+        ids = tok(PROMPT, return_tensors="pt").input_ids
     T = ids.shape[1]
     if T < MIN_TOKENS:
         sys.exit(f"prompt is {T} tokens; the test needs at least {MIN_TOKENS} (three GDN chunks)")
@@ -112,7 +119,8 @@ def main():
     with open(os.path.join(args.out, "meta.txt"), "w") as f:
         f.write(f"model_dir {model_dir}\nT {T}\ntorch {torch.__version__}\n")
         import transformers
-        f.write(f"transformers {transformers.__version__}\nprompt {PROMPT!r}\n")
+        f.write(f"transformers {transformers.__version__}\n")
+        f.write(f"ids {args.ids}\n" if args.ids else f"prompt {PROMPT!r}\n")
         f.write(f"fp32 next token {next_token!r}\n")
     print(f"wrote {args.out}: T={T}, fp32 next token {next_token!r}")
 

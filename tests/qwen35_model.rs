@@ -25,7 +25,12 @@
 //! * `Bf16`: bf16 GEMM inputs are a real change of numerics, so it is held to
 //!   transformers' own bf16 forward instead: its mean KL divergence from the
 //!   fp32 reference and its top-1 disagreements with it may not exceed the
-//!   bf16 reference's.
+//!   bf16 reference's. The same bound, unchanged, gates
+//!   `set_bf16_mlp_inputs(true)` (the MLP's gate and up rounded to bf16, as
+//!   transformers' bf16 forward rounds them), run on the same loaded model.
+//!   `make_reference.py --ids tests/fixtures/qwen35_text_ids.npy --out
+//!   target/qwen35_ref_text` with `QWEN35_REF_DIR` pointed at it runs both
+//!   tests on 512 natural-text tokens instead of the prompt.
 //!
 //! **Against the forward itself** (always run, on the tiny two-layer
 //! checkpoint in `tests/fixtures/qwen35_train/` and a seeded four-layer
@@ -143,6 +148,23 @@ fn run(precision: Precision) -> (Vec<f32>, Vec<Vec<f32>>) {
     (out.logits, out.trace)
 }
 
+/// The bf16 forward's logits with the MLP's inputs in f32 (the production
+/// forward) and then in bf16 ([`Qwen35Model::set_bf16_mlp_inputs`]), from
+/// one load.
+fn run_bf16_both() -> [(&'static str, Vec<f32>); 2] {
+    let rt = GpuRuntime::new().unwrap();
+    let st = checkpoint();
+    let mut model = Qwen35Model::load(&rt, &st, PREFIX, Qwen35Config::qwen35_2b().unwrap(), Precision::Bf16).unwrap();
+    let ids = ids();
+    let f32_in = model.forward(&ids, false).unwrap().logits;
+    model.set_bf16_mlp_inputs(true).unwrap();
+    let bf16_in = model.forward(&ids, false).unwrap().logits;
+    for l in [&f32_in, &bf16_in] {
+        assert!(l.iter().all(|x| x.is_finite()), "non-finite logits");
+    }
+    [("tessl bf16", f32_in), ("tessl bf16, bf16 MLP inputs", bf16_in)]
+}
+
 #[test]
 #[ignore]
 fn f32_forward_matches_transformers_fp32_layer_by_layer() {
@@ -190,13 +212,9 @@ fn f32_forward_matches_transformers_fp32_layer_by_layer() {
 #[test]
 #[ignore]
 fn bf16_forward_is_no_worse_than_transformers_bf16() {
-    let (logits, _) = run(Precision::Bf16);
     let (shape, fp32) = load_ref("logits_f32");
     let (_, hf_bf16) = load_ref("logits_bf16");
     let vocab = shape[1];
-    let got64: Vec<f64> = logits.iter().map(|&x| x as f64).collect();
-    let kl_tessl = kl_rows(&fp32, &got64, vocab);
-    let kl_hf = kl_rows(&fp32, &hf_bf16, vocab);
     let mean = |v: &[f64]| v.iter().sum::<f64>() / v.len() as f64;
     let top1_miss = |q: &[f64]| {
         fp32.chunks(vocab)
@@ -204,24 +222,35 @@ fn bf16_forward_is_no_worse_than_transformers_bf16() {
             .filter(|(p, q)| argmax(p) != argmax(q))
             .count()
     };
-    let (m_t, m_h) = (top1_miss(&got64), top1_miss(&hf_bf16));
+    let kl_hf = kl_rows(&fp32, &hf_bf16, vocab);
+    let m_h = top1_miss(&hf_bf16);
     eprintln!(
-        "vs fp32 over {} positions: tessl bf16 mean KL {:.3e} (max {:.3e}), top-1 misses {m_t}; \
-         transformers bf16 mean KL {:.3e} (max {:.3e}), top-1 misses {m_h}",
+        "vs fp32 over {} positions: transformers bf16 mean KL {:.3e} (max {:.3e}), top-1 misses {m_h}",
         shape[0],
-        mean(&kl_tessl),
-        kl_tessl.iter().cloned().fold(0.0, f64::max),
         mean(&kl_hf),
         kl_hf.iter().cloned().fold(0.0, f64::max),
     );
-    assert!(
-        mean(&kl_tessl) <= mean(&kl_hf),
-        "tessl bf16 is further from fp32 than transformers' bf16 forward"
-    );
-    assert!(
-        m_t <= m_h,
-        "tessl bf16 misses more top-1 tokens ({m_t}) than transformers bf16 ({m_h})"
-    );
+    let mut failures = Vec::new();
+    for (name, logits) in run_bf16_both() {
+        let got64: Vec<f64> = logits.iter().map(|&x| x as f64).collect();
+        let kl_tessl = kl_rows(&fp32, &got64, vocab);
+        let m_t = top1_miss(&got64);
+        eprintln!(
+            "vs fp32: {name} mean KL {:.3e} (max {:.3e}), top-1 misses {m_t}, logits rel err {:.3e}",
+            mean(&kl_tessl),
+            kl_tessl.iter().cloned().fold(0.0, f64::max),
+            rel(&logits, &fp32),
+        );
+        if mean(&kl_tessl) > mean(&kl_hf) {
+            failures.push(format!("{name} is further from fp32 than transformers' bf16 forward"));
+        }
+        if m_t > m_h {
+            failures.push(format!(
+                "{name} misses more top-1 tokens ({m_t}) than transformers bf16 ({m_h})"
+            ));
+        }
+    }
+    assert!(failures.is_empty(), "{failures:?}");
 }
 
 // ------------------------------------------------- decode, rows and answers ---

@@ -591,39 +591,15 @@ static inline float gemm_apply_activation(float v, GemmActivation act) {
     }
 }
 
-/// Write the f32 accumulator `cT` to `tC`. An f32 C takes it as is; a bf16 C
-/// takes each element rounded by `bfloat(x)`, the round-to-nearest-even
-/// conversion `cast_f32_to_bf16` uses, so a bf16-output GEMM writes the bits
-/// an f32-output GEMM plus that cast pass would. The rounding goes through a
-/// bfloat destination tensor of the same op and operands (the same layout,
-/// as `attn_tiled.h` stores its bf16 output), since `store` needs the
-/// tensor's element type to be the cooperative tensor's.
-template <typename OutT, typename TA, typename TB, typename Op, typename CT, typename TC>
-inline void coop_store_out(thread const Op &op, thread CT &cT, thread TC &tC) {
-    if constexpr (metal::is_same<OutT, float>::value) {
-        cT.store(tC);
-    } else {
-        auto oT = op.template get_destination_cooperative_tensor<TA, TB, OutT>();
-#pragma clang loop unroll(full)
-        for (uint16_t i = 0; i < oT.get_capacity(); ++i)
-            if (cT.is_valid_element(i)) oT[i] = OutT(cT[i]);
-        oT.store(tC);
-    }
-}
-
 // A call with no explicit template arguments is the production geometry:
-// 128×64, sg4, strict, no epilogue, f32 C (`matmul2d_tensorops_bf16_f32`).
-// `OutT` bfloat rounds C on the store (see `coop_store_out`); the epilogue,
-// which reads C back for `beta`, is f32 C only.
+// 128×64, sg4, strict, no epilogue (`matmul2d_tensorops_bf16_f32`).
 template <typename ElemT, int SM = 128, int SN = 64, int NSG = 4,
-          bool RELAXED = false, bool EPILOGUE = false, typename OutT = float>
-inline void mm_nn_coop_f32acc(device ElemT *A, device ElemT *B, device OutT *C,
+          bool RELAXED = false, bool EPILOGUE = false>
+inline void mm_nn_coop_f32acc(device ElemT *A, device ElemT *B, device float *C,
                               uint M, uint N, uint K, uint tiles_n,
                               uint tiles_m, uint tgpig,
                               device const float *bias, float alpha, float beta,
                               uint act) {
-    static_assert(!EPILOGUE || metal::is_same<OutT, float>::value,
-                  "the GEMM epilogue reads and writes an f32 C");
     constexpr auto d = matmul2d_descriptor(
         SM, SN, dynamic_length_v<int>, false, false, RELAXED,
         matmul2d_descriptor::mode::multiply);
@@ -658,7 +634,7 @@ inline void mm_nn_coop_f32acc(device ElemT *A, device ElemT *B, device OutT *C,
         for (uint16_t i = 0; i < cT.get_capacity(); ++i)
             cT.set(i, 0.0f);
         op.run(tA, tB, cT);
-        if constexpr (EPILOGUE) {
+        if (EPILOGUE) {
             // `beta * C_prev` reuses the accumulate path's trick: a second
             // cooperative tensor loaded from C, combined in registers, so C is
             // read once and written once rather than round-tripped per term.
@@ -695,8 +671,7 @@ inline void mm_nn_coop_f32acc(device ElemT *A, device ElemT *B, device OutT *C,
                     if (cT.is_valid_element(i)) cT[i] = gemm_apply_activation(cT[i], (GemmActivation)act);
             }
         }
-        coop_store_out<OutT, metal::remove_addrspace_t<decltype(tA)>,
-                       metal::remove_addrspace_t<decltype(tB)>>(op, cT, tC);
+        cT.store(tC);
     } else {
         auto mA = tensor(A, dextents<int, 2>{(int)K, (int)M}, array<int, 2>{1, (int)K});
         auto mB = tensor(B, dextents<int, 2>{(int)N, (int)K}, array<int, 2>{1, (int)N});
@@ -711,7 +686,7 @@ inline void mm_nn_coop_f32acc(device ElemT *A, device ElemT *B, device OutT *C,
         for (uint16_t i = 0; i < cT.get_capacity(); ++i)
             cT.set(i, 0.0f);
         op.run(tA, tB, cT);
-        if constexpr (EPILOGUE) {
+        if (EPILOGUE) {
             if (beta != 0.0f) {
                 auto prevT = op.template get_destination_cooperative_tensor<
                     metal::remove_addrspace_t<decltype(tA)>,
@@ -745,8 +720,7 @@ inline void mm_nn_coop_f32acc(device ElemT *A, device ElemT *B, device OutT *C,
                     if (cT.is_valid_element(i)) cT[i] = gemm_apply_activation(cT[i], (GemmActivation)act);
             }
         }
-        coop_store_out<OutT, metal::remove_addrspace_t<decltype(tA)>,
-                       metal::remove_addrspace_t<decltype(tB)>>(op, cT, tC);
+        cT.store(tC);
     }
 }
 
@@ -782,28 +756,6 @@ kernel void matmul2d_tensorops_bf16_f32(
 NN_COOP_KERNEL(matmul2d_tensorops_bf16_f32_64x64_sg4,  bfloat,  64, 64, 4, false)
 NN_COOP_KERNEL(matmul2d_tensorops_f32_relaxed,            float, 128, 64, 4, true)
 NN_COOP_KERNEL(matmul2d_tensorops_f32_relaxed_64x64_sg4,  float,  64, 64, 4, true)
-
-/// f32 accumulation into a bf16 C: NN_COOP_KERNEL with C rounded on the
-/// store (`coop_store_out`). Instantiated for the two bf16 geometries above,
-/// for a GEMM whose only readers want bf16 (Qwen3.5's MLP gate/up into
-/// `qwen35_swiglu_bf16_bf16`), so C is written and read at half the bytes and
-/// no cast pass runs.
-#define NN_COOP_BF16_OUT_KERNEL(NAME, ELEM, SM, SN, NSG, RELAXED)              \
-    kernel void NAME(device ELEM *A [[buffer(0)]],                             \
-                     device ELEM *B [[buffer(1)]],                             \
-                     device bfloat *C [[buffer(2)]],                           \
-                     constant uint &M [[buffer(3)]],                           \
-                     constant uint &N [[buffer(4)]],                           \
-                     constant uint &K [[buffer(5)]],                           \
-                     constant uint &tiles_n [[buffer(6)]],                     \
-                     constant uint &tiles_m [[buffer(7)]],                     \
-                     uint tgpig [[threadgroup_position_in_grid]]) {            \
-        mm_nn_coop_f32acc<ELEM, SM, SN, NSG, RELAXED, false, bfloat>(          \
-            A, B, C, M, N, K, tiles_n, tiles_m, tgpig, nullptr, 1.0f, 0.0f, 0u);\
-    }
-
-NN_COOP_BF16_OUT_KERNEL(matmul2d_tensorops_bf16_bf16,          bfloat, 128, 64, 4, false)
-NN_COOP_BF16_OUT_KERNEL(matmul2d_tensorops_bf16_bf16_64x64_sg4, bfloat,  64, 64, 4, false)
 
 /// Epilogue variants: `C = act(alpha * A@B + beta * C_prev + bias)`.
 ///

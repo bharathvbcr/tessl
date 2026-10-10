@@ -338,9 +338,8 @@ float `select`, may be optimised away.
 
 - **fp32 inside, bf16 only on the way into a GEMM.** Activations are f32, as
   the forward's GEMMs write them. The gated norm and output gate can round once
-  to bf16 on store, so they feed a bf16 GEMM directly. (The GEMM can also round
-  its C to bf16; only the opt-in bf16 MLP inputs use that, see "bf16
-  activation inputs".)
+  to bf16 on store, so they feed a bf16 GEMM directly. (A GEMM that rounds
+  its C to bf16 was built, measured and removed: see "bf16 activation inputs".)
 - **The GDN gate is Qwen3.5's**: `g = −exp(A_log)·softplus(a + dt_bias)`,
   `β = sigmoid(b)`, no clamp. This is *not* the nanolab GDN in
   `tests/common/gdn.rs`, whose sigmoid gate and clamp belong to a different
@@ -1245,22 +1244,20 @@ longer read (and the GEMM would no longer write):
 Over the 2B's 24 MLPs, 18 GDN and 6 attention layers that is 1.9 MB per
 token, 62% of it the MLP's. Where the cast lives: in the producing GEMM's
 store, not in a pass of its own, which would read and write the f32 again.
-`gemm` takes a bf16 C on the bf16 TensorOps path
-(`matmul2d_tensorops_bf16_bf16` and its 64x64 twin), rounding the f32
-accumulator with the `bfloat(x)` the cast kernel uses, so its bits are the
-f32 C's followed by `cast_f32_to_bf16` (`tests/gemm_correctness.rs`).
-
-Built: the MLP only. It is most of the traffic and has one reader.
-`qwen35_swiglu_bf16_bf16` (`qwen35::swiglu_bf16_inputs`) reads bf16 gate
-and up with f32 arithmetic, and `Qwen35Model::set_bf16_mlp_inputs` switches
-the inference MLP, prefill and decode, onto them. GDN and attention were not
-built: each projection has three or more readers, and their decode and
-varlen variants, all of which would need bf16 twins.
+Built in 5ad6035 for this measurement and removed after it: a bf16-C `gemm`
+on the bf16 TensorOps path (`matmul2d_tensorops_bf16_bf16` and a 64x64
+twin, the f32 accumulator rounded on the store, bit for bit the f32 C
+followed by `cast_f32_to_bf16`), a SwiGLU reading bf16 gate and up
+(`qwen35_swiglu_bf16_bf16`), and `Qwen35Model::set_bf16_mlp_inputs` to run
+the inference MLP on them. Only the MLP was built: it is most of the
+traffic and has one reader. GDN and attention were not: each projection
+has three or more readers, and their decode and varlen variants, all of
+which would need bf16 twins.
 
 Accuracy, on the real 2B against transformers' fp32 and bf16 forwards
-(`bf16_forward_is_no_worse_than_transformers_bf16`, whose bound, no further
-from fp32 than transformers' bf16 by mean KL or by top-1 misses, now gates
-both; `bench/results/qwen35_bf16_mlp_inputs_logits_m5pro.txt`):
+(`bf16_forward_is_no_worse_than_transformers_bf16`, no further from fp32
+than transformers' bf16 by mean KL or by top-1 misses, run on both;
+`bench/results/qwen35_bf16_mlp_inputs_logits_m5pro.txt`):
 
 | tokens | transformers bf16 | tessl bf16 | tessl bf16, bf16 MLP inputs |
 |---|---|---|---|
@@ -1272,8 +1269,8 @@ under transformers' bf16). The checkpoint was Qwen/Qwen3.5-2B; this machine
 had no Base weights, and the two share a byte-identical `config.json`.
 
 Speed, paired and interleaved in one process (`bench_qwen35_layers
---paired-mlp-inputs`, ratio bf16 inputs / f32 inputs, median of 15 round
-ratios, or 11 for the forward;
+--paired-mlp-inputs` at eb24de1, ratio bf16 inputs / f32 inputs, median of
+15 round ratios, or 11 for the forward;
 `bench/results/qwen35_bf16_mlp_inputs_paired_m5pro.txt`):
 
 | T | `swiglu` | gate + up GEMMs | MLP block | 24-layer forward |
@@ -1284,17 +1281,17 @@ ratios, or 11 for the forward;
 SwiGLU itself is a third faster, but the GEMMs lose more than it saves. They
 are compute-bound at these shapes, and the f32 cooperative store is nearly
 free. Storing through a bfloat destination tensor, or with each lane writing
-its elements by index, measured the same (1.07-1.08x on the GEMMs). So the
-variant is a loss. `set_bf16_mlp_inputs` stays off, and the production
-forward is the f32-input one. The switch is kept as a measured alternate, as
-`--mlp-unfused` and `--attn-rows` are. Whether to keep it or remove it is
-open.
+its elements by index, measured the same (1.07-1.08x on the GEMMs). The
+variant lost on the whole forward with more logit error, so it was removed
+rather than kept behind a switch. The production forward is the f32-input
+one.
 
-What would win is to not write gate and up at all: one packed `gate | up`
-GEMM whose epilogue applies SwiGLU and stores the bf16 product the down
-projection reads. That removes the f32 intermediate both ways. It needs the
-two weights interleaved by tile in one matrix, which is a layout change
-shared with training (below).
+What could win is not writing gate and up at all: a GEMM that runs gate's
+and up's products in the same threadgroup over one A tile, applies SwiGLU
+in its epilogue and stores the bf16 product the down projection reads. That
+removes the f32 intermediate both ways and needs no weight layout change:
+the two B operands stay the separate `gate` and `up` tensors. Training
+cannot use it, because `swiglu_bwd` reads the f32 gate and up.
 
 **Training on bf16 storage**
 (`bench/results/qwen35_train_gate_up_widen_m5pro.txt`). The brief's two
@@ -1345,11 +1342,10 @@ span ±8% on this machine under load.
   rather than reusing a session's. `Decode::step` waits for its logits every
   token, so it is not a GPU-resident loop, and its speed has not been
   measured.
-- **bf16 inputs, remaining gaps.** Only the MLP has a bf16-input path, and
-  it measured slower (see "bf16 activation inputs"), so it is off. GDN and
-  attention read their projections as f32. The win left is SwiGLU fused into
-  a packed `gate | up` GEMM's epilogue, which needs a weight layout shared
-  with training.
+- **bf16 inputs, remaining gaps.** Every kernel reads its GEMM's output as
+  f32: a bf16-input MLP measured slower and was removed (see "bf16
+  activation inputs"). The candidate left is SwiGLU fused into the gate/up
+  GEMMs' epilogue.
 - **Shared-prefix attention, remaining gaps.** Only head_dim 256 is compiled. The rows of
   a batch read the shared prefix independently: rows that share a head could
   share its K/V lines in one threadgroup, but no measurement says that is

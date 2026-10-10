@@ -25,10 +25,7 @@
 //! * `Bf16`: bf16 GEMM inputs are a real change of numerics, so it is held to
 //!   transformers' own bf16 forward instead: its mean KL divergence from the
 //!   fp32 reference and its top-1 disagreements with it may not exceed the
-//!   bf16 reference's. The same bound, unchanged, gates
-//!   `set_bf16_mlp_inputs(true)` (the MLP's gate and up rounded to bf16, as
-//!   transformers' bf16 forward rounds them), run on the same loaded model.
-//!   `make_reference.py --ids tests/fixtures/qwen35_text_ids.npy --out
+//!   bf16 reference's. `make_reference.py --ids tests/fixtures/qwen35_text_ids.npy --out
 //!   target/qwen35_ref_text` with `QWEN35_REF_DIR` pointed at it runs both
 //!   tests on 512 natural-text tokens instead of the prompt.
 //!
@@ -148,23 +145,6 @@ fn run(precision: Precision) -> (Vec<f32>, Vec<Vec<f32>>) {
     (out.logits, out.trace)
 }
 
-/// The bf16 forward's logits with the MLP's inputs in f32 (the production
-/// forward) and then in bf16 ([`Qwen35Model::set_bf16_mlp_inputs`]), from
-/// one load.
-fn run_bf16_both() -> [(&'static str, Vec<f32>); 2] {
-    let rt = GpuRuntime::new().unwrap();
-    let st = checkpoint();
-    let mut model = Qwen35Model::load(&rt, &st, PREFIX, Qwen35Config::qwen35_2b().unwrap(), Precision::Bf16).unwrap();
-    let ids = ids();
-    let f32_in = model.forward(&ids, false).unwrap().logits;
-    model.set_bf16_mlp_inputs(true).unwrap();
-    let bf16_in = model.forward(&ids, false).unwrap().logits;
-    for l in [&f32_in, &bf16_in] {
-        assert!(l.iter().all(|x| x.is_finite()), "non-finite logits");
-    }
-    [("tessl bf16", f32_in), ("tessl bf16, bf16 MLP inputs", bf16_in)]
-}
-
 #[test]
 #[ignore]
 fn f32_forward_matches_transformers_fp32_layer_by_layer() {
@@ -230,27 +210,24 @@ fn bf16_forward_is_no_worse_than_transformers_bf16() {
         mean(&kl_hf),
         kl_hf.iter().cloned().fold(0.0, f64::max),
     );
-    let mut failures = Vec::new();
-    for (name, logits) in run_bf16_both() {
-        let got64: Vec<f64> = logits.iter().map(|&x| x as f64).collect();
-        let kl_tessl = kl_rows(&fp32, &got64, vocab);
-        let m_t = top1_miss(&got64);
-        eprintln!(
-            "vs fp32: {name} mean KL {:.3e} (max {:.3e}), top-1 misses {m_t}, logits rel err {:.3e}",
-            mean(&kl_tessl),
-            kl_tessl.iter().cloned().fold(0.0, f64::max),
-            rel(&logits, &fp32),
-        );
-        if mean(&kl_tessl) > mean(&kl_hf) {
-            failures.push(format!("{name} is further from fp32 than transformers' bf16 forward"));
-        }
-        if m_t > m_h {
-            failures.push(format!(
-                "{name} misses more top-1 tokens ({m_t}) than transformers bf16 ({m_h})"
-            ));
-        }
-    }
-    assert!(failures.is_empty(), "{failures:?}");
+    let (logits, _) = run(Precision::Bf16);
+    let got64: Vec<f64> = logits.iter().map(|&x| x as f64).collect();
+    let kl_tessl = kl_rows(&fp32, &got64, vocab);
+    let m_t = top1_miss(&got64);
+    eprintln!(
+        "vs fp32: tessl bf16 mean KL {:.3e} (max {:.3e}), top-1 misses {m_t}, logits rel err {:.3e}",
+        mean(&kl_tessl),
+        kl_tessl.iter().cloned().fold(0.0, f64::max),
+        rel(&logits, &fp32),
+    );
+    assert!(
+        mean(&kl_tessl) <= mean(&kl_hf),
+        "tessl bf16 is further from fp32 than transformers' bf16 forward"
+    );
+    assert!(
+        m_t <= m_h,
+        "tessl bf16 misses more top-1 tokens ({m_t}) than transformers bf16 ({m_h})"
+    );
 }
 
 // ------------------------------------------------- decode, rows and answers ---
@@ -304,16 +281,9 @@ fn argmax32(row: &[f32]) -> usize {
     argmax(&wide)
 }
 
-/// The fixture in bf16 with `set_bf16_mlp_inputs(true)`.
-fn fixture_bf16_mlp_inputs(rt: &std::sync::Arc<GpuRuntime>, st: &SafeTensors) -> Qwen35Model {
-    let mut m = Qwen35Model::load(rt, st, "model.", tiny_config(), Precision::Bf16).unwrap();
-    m.set_bf16_mlp_inputs(true).unwrap();
-    m
-}
-
 /// The models the always-run tests cover: the fixture at both precisions
-/// (with its packed bf16 head), the bf16 fixture on bf16 MLP inputs, and the
-/// grouped tower at F32 (whose head is the embedding itself).
+/// (with its packed bf16 head), and the grouped tower at F32 (whose head is
+/// the embedding itself).
 fn models(rt: &std::sync::Arc<GpuRuntime>) -> Vec<(&'static str, Qwen35Model)> {
     let st = SafeTensors::open(&fixture().join("model.safetensors")).unwrap();
     vec![
@@ -325,7 +295,6 @@ fn models(rt: &std::sync::Arc<GpuRuntime>) -> Vec<(&'static str, Qwen35Model)> {
             "fixture bf16",
             Qwen35Model::load(rt, &st, "model.", tiny_config(), Precision::Bf16).unwrap(),
         ),
-        ("fixture bf16, bf16 MLP inputs", fixture_bf16_mlp_inputs(rt, &st)),
         (
             "grouped f32",
             Qwen35Model::random_tower(rt, grouped_config(), Precision::F32, 7).unwrap(),
@@ -380,48 +349,6 @@ fn prefill_then_decode_matches_forward_at_the_last_row() {
             }
             eprintln!("{name}: decode vs forward, worst rel err {worst:.2e} (bound {b:.0e})");
         }
-    });
-}
-
-/// `set_bf16_mlp_inputs` changes only where the MLP's gate and up are
-/// rounded: the logits move (the switch is wired), by no more than the bf16
-/// decode bound (each gate and up element rounded once, 2^-9 relative), and
-/// stay within it of the F32 forward's too, as the bf16 forward does. An F32
-/// model refuses the switch, and turning it off restores the bf16 forward's
-/// bits.
-#[test]
-fn bf16_mlp_inputs_move_the_bf16_forward_by_rounding_only() {
-    with_gpu(|rt| {
-        let st = SafeTensors::open(&fixture().join("model.safetensors")).unwrap();
-        let ids = seq(70);
-        let mut f32m = Qwen35Model::load(rt, &st, "model.", tiny_config(), Precision::F32).unwrap();
-        let err = f32m.set_bf16_mlp_inputs(true).unwrap_err();
-        assert!(err.contains("need a Precision::Bf16 model"), "{err}");
-        assert!(!f32m.bf16_mlp_inputs());
-        let exact = f32m.forward(&ids, false).unwrap().logits;
-        let mut m = Qwen35Model::load(rt, &st, "model.", tiny_config(), Precision::Bf16).unwrap();
-        let off = m.forward(&ids, false).unwrap().logits;
-        m.set_bf16_mlp_inputs(true).unwrap();
-        assert!(m.bf16_mlp_inputs());
-        let on = m.forward(&ids, false).unwrap().logits;
-        m.set_bf16_mlp_inputs(false).unwrap();
-        let off_again = m.forward(&ids, false).unwrap().logits;
-        assert!(
-            off.iter().zip(&off_again).all(|(a, b)| a.to_bits() == b.to_bits()),
-            "turning the switch off did not restore the bf16 forward"
-        );
-        assert!(
-            on.iter().zip(&off).any(|(a, b)| a.to_bits() != b.to_bits()),
-            "bf16 MLP inputs left every logit's bits unchanged: the switch is not wired"
-        );
-        let b = bound(Precision::Bf16);
-        let (vs_off, vs_exact, off_vs_exact) = (rel32(&on, &off), rel32(&on, &exact), rel32(&off, &exact));
-        eprintln!(
-            "bf16 MLP inputs: vs bf16 forward {vs_off:.2e}, vs F32 forward {vs_exact:.2e} \
-             (bf16 forward vs F32 {off_vs_exact:.2e}); bound {b:.0e}"
-        );
-        assert!(vs_off <= b, "vs the bf16 forward: rel err {vs_off:.3e} > {b:.0e}");
-        assert!(vs_exact <= b, "vs the F32 forward: rel err {vs_exact:.3e} > {b:.0e}");
     });
 }
 

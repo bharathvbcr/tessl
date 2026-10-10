@@ -374,26 +374,21 @@ def case_gated_norm(bf16, seed, H=4, rows=37):
         check(kname, got, want, 1e-5, 1e-5)
 
 
-def case_swiglu(bf16, seed, rows=37, width=300, bf16_in=False):
+def case_swiglu(bf16, seed, rows=37, width=300):
     """Qwen3_5MLP's act_fn(gate) * up, both read as windows of one fused
-    [gate | up] row; gates out to +-120, past where exp(-x) overflows. With
-    `bf16_in` the row is bf16 (`qwen35_swiglu_bf16_bf16`, what a bf16-output
-    GEMM writes), and the reference reads the same rounded values."""
+    [gate | up] row; gates out to +-120, past where exp(-x) overflows."""
     g = seeded(seed)
     ld = 2 * width + 5
     gate_off, up_off, ld_out, out_off = 1, 1 + width, width + 4, 3
     fused = torch.randn(rows, ld, generator=g) * 8
     fused[0, gate_off], fused[0, gate_off + 1], fused[1, gate_off] = 120.0, -120.0, -89.0
-    if bf16_in:
-        fused = fused.to(torch.bfloat16).float()
     # The model's own MLP module with the config's default activation.
     mlp = m.Qwen3_5MLP(Qwen3_5TextConfig(), 4)
     want = mlp.act_fn(fused[:, gate_off:gate_off + width]) * fused[:, up_off:up_off + width]
-    kname = "qwen35_swiglu_bf16_bf16" if bf16_in else "qwen35_swiglu_bf16" if bf16 else "qwen35_swiglu_f32"
-    src = fused.to(torch.bfloat16).view(torch.int16) if bf16_in else fused
+    kname = "qwen35_swiglu_bf16" if bf16 else "qwen35_swiglu_f32"
     out = run(kname, dict(rows=rows, width=width, ld_gate=ld, gate_off=gate_off, ld_up=ld, up_off=up_off,
                           ld_out=ld_out, out_off=out_off),
-              {"gate": src, "up": src}, {"out": ("bf16" if bf16 else "f32", rows * ld_out)})
+              {"gate": fused, "up": fused}, {"out": ("bf16" if bf16 else "f32", rows * ld_out)})
     got = out["out"].reshape(rows, ld_out)[:, out_off:out_off + width]
     # The absolute floor is for x <= -88.7, where torch's sigmoid is exactly 0
     # (exp(-x) overflows f32) and the kernel's overflow-free form is ~1e-36.
@@ -1160,7 +1155,7 @@ def case_host_contract():
 CASES = [
     ("host_contract_parser", case_host_contract_parser),
     ("host_contract", case_host_contract),
-    ("swiglu", lambda: [case_swiglu(bf16, 71) for bf16 in (False, True)] + [case_swiglu(True, 72, bf16_in=True)]),
+    ("swiglu", lambda: [case_swiglu(bf16, 71) for bf16 in (False, True)]),
     ("conv", lambda: [case_conv(2, 37, 100, 4, s, b, 1) for s, b in ((False, False), (True, False), (True, True))]),
     ("conv_short", lambda: case_conv(3, 2, 64, 4, True, False, 2)),  # T < KW-1: state carries old entries
     ("chunk_ws", lambda: case_chunk_ws(3)),

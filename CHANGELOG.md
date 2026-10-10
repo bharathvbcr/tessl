@@ -8,18 +8,13 @@ All notable changes to `tessl` are recorded here. The format follows
 
 ### Added
 
-- **bf16 GEMM output and bf16 MLP inputs (measured, off).** `gemm` takes a
-  bf16 C on the bf16 TensorOps path (`matmul2d_tensorops_bf16_bf16` and its
-  64x64 twin), the f32 accumulator rounded on the store to the bits the f32
-  C plus `cast_f32_to_bf16` would give. `qwen35::swiglu_bf16_inputs`
-  (`qwen35_swiglu_bf16_bf16`) reads bf16 gate and up, and
-  `Qwen35Model::set_bf16_mlp_inputs` runs the inference MLP on both. It is
-  off by default: paired on the M5 Pro, SwiGLU is 0.65x but the bf16-output
-  GEMMs are 1.06x, and the 24-layer forward 1.006-1.009x. Its logits pass
-  the real-2B bf16 bound at 1.4-1.6x the production forward's KL from fp32
-  (`docs/qwen35.md`, "bf16 activation inputs").
-- **Benchmarks:** `bench_qwen35_layers --paired-mlp-inputs` and
-  `--paired-gate-up`, `bench_qwen35_train --bf16-storage`, and op-table rows
+- **bf16 MLP inputs, measured and not adopted.** A bf16-output GEMM and a
+  SwiGLU reading bf16 gate and up were built, measured and removed: paired on
+  the M5 Pro, SwiGLU was 0.65x but the bf16-output GEMMs 1.06x and the
+  24-layer forward 1.006-1.009x, with 1.4-1.6x the production forward's KL
+  from fp32 on the real 2B (`docs/qwen35.md`, "bf16 activation inputs").
+- **Benchmarks:** `bench_qwen35_layers --paired-gate-up`,
+  `bench_qwen35_train --bf16-storage`, and op-table rows
   for a bf16 layer input's widen, norm and copy.
   `tools/qwen35_ref/make_reference.py --ids` runs the transformers reference
   on given token ids.

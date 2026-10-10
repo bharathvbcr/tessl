@@ -2199,47 +2199,28 @@ pub fn gated_act(
     rows: u32,
     width: u32,
 ) -> Result<(), String> {
-    gated_act_named(rt, act, gate, up, DType::F32, out, rows, width, "qwen35::gated_act")
+    gated_act_named(rt, act, gate, up, out, rows, width, "qwen35::gated_act")
 }
 
-/// [`gated_act`] on inputs of `in_dtype`, its errors naming `what` (the entry
-/// the caller used). Bf16 inputs are SiLU into a bf16 `out` only
-/// ([`swiglu_bf16_inputs`]).
+/// [`gated_act`], its errors naming `what` (the entry the caller used).
 #[allow(clippy::too_many_arguments)]
 fn gated_act_named(
     rt: &Arc<GpuRuntime>,
     act: GatedAct,
     gate: Cols<'_>,
     up: Cols<'_>,
-    in_dtype: DType,
     out: OutCols<'_>,
     rows: u32,
     width: u32,
     what: &str,
 ) -> Result<(), String> {
-    match (act, in_dtype, out.dtype) {
-        (_, DType::F32, _) | (GatedAct::Silu, DType::BF16, DType::BF16) => {}
-        _ => {
-            return Err(format!(
-                "{what}: {act:?} on {in_dtype:?} inputs into {:?} is not compiled (f32 inputs into f32 or \
-                 bf16, or SiLU on bf16 inputs into bf16)",
-                out.dtype
-            ))
-        }
-    }
-    let name = match (act, in_dtype) {
-        (GatedAct::Silu, DType::BF16) => "qwen35_swiglu_bf16_bf16",
-        (GatedAct::Silu, _) => out_kernel!("qwen35_swiglu", out.dtype, what)?,
-        (GatedAct::GeluTanh, _) => out_kernel!("qwen35_gelu_tanh_glu", out.dtype, what)?,
+    let name = match act {
+        GatedAct::Silu => out_kernel!("qwen35_swiglu", out.dtype, what)?,
+        GatedAct::GeluTanh => out_kernel!("qwen35_gelu_tanh_glu", out.dtype, what)?,
     };
     let (r, w) = (u64::from(rows), u64::from(width));
-    if in_dtype == DType::BF16 {
-        require_window::<u16>(rt, gate, r, w, format_args!("{what} gate"))?;
-        require_window::<u16>(rt, up, r, w, format_args!("{what} up"))?;
-    } else {
-        require_window::<f32>(rt, gate, r, w, format_args!("{what} gate"))?;
-        require_window::<f32>(rt, up, r, w, format_args!("{what} up"))?;
-    }
+    require_window::<f32>(rt, gate, r, w, format_args!("{what} gate"))?;
+    require_window::<f32>(rt, up, r, w, format_args!("{what} up"))?;
     require_out_window(rt, out, r, w, format_args!("{what} out"))?;
     if rows == 0 || width == 0 {
         return Ok(());
@@ -2271,42 +2252,7 @@ pub fn swiglu(
     rows: u32,
     width: u32,
 ) -> Result<(), String> {
-    gated_act_named(
-        rt,
-        GatedAct::Silu,
-        gate,
-        up,
-        DType::F32,
-        out,
-        rows,
-        width,
-        "qwen35::swiglu",
-    )
-}
-
-/// [`swiglu`] on bf16 `gate` and `up` windows, into a bf16 `out`: what a
-/// bf16-output GEMM ([`crate::gemm::gemm`] into a bf16 C) feeds it, read at
-/// half the bytes of f32. The arithmetic is f32, as in [`swiglu`]; only the
-/// inputs are rounded, as transformers' bf16 `Qwen3_5MLP` rounds them.
-pub fn swiglu_bf16_inputs(
-    rt: &Arc<GpuRuntime>,
-    gate: Cols<'_>,
-    up: Cols<'_>,
-    out: OutCols<'_>,
-    rows: u32,
-    width: u32,
-) -> Result<(), String> {
-    gated_act_named(
-        rt,
-        GatedAct::Silu,
-        gate,
-        up,
-        DType::BF16,
-        out,
-        rows,
-        width,
-        "qwen35::swiglu_bf16_inputs",
-    )
+    gated_act_named(rt, GatedAct::Silu, gate, up, out, rows, width, "qwen35::swiglu")
 }
 
 /// `resid += y`, elementwise over `rows x width` column windows, in exact f32:

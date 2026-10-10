@@ -11,7 +11,6 @@
 //! cargo run --release --bin bench_qwen35_layers -- --gdn-scan16  # 16-column GDN scan
 //! cargo run --release --bin bench_qwen35_layers -- --decode=4096  # per-token decode
 //! cargo run --release --bin bench_qwen35_layers -- --paired-gdn-recurrent 1 4
-//! cargo run --release --bin bench_qwen35_layers -- --paired-mlp-inputs 1024 2048
 //! cargo run --release --bin bench_qwen35_layers -- --paired-gate-up 512 2048
 //! ```
 //!
@@ -60,15 +59,6 @@
 //! alone, `REPS` per command buffer. Every figure is printed as a `METRIC`
 //! line for `bench/paired_bins.sh`. The LM head and sampler are not included
 //! (`bench_nn_kernels` times the samplers).
-//!
-//! `--paired-mlp-inputs [T...]` times the MLP's gate and up in f32 (the
-//! production bf16 forward) against bf16 (`Qwen35Model::set_bf16_mlp_inputs`:
-//! the GEMMs round C to bf16, `qwen35::swiglu_bf16_inputs` reads it), ABBA in
-//! one process: SwiGLU alone, the gate and up GEMMs, the MLP block (both
-//! GEMMs, SwiGLU, the down projection into the residual), and a whole
-//! 24-layer prefill on `Qwen35Model` (seeded random 2B weights, no LM head),
-//! the composition the model runs rather than this file's own. Default T is
-//! 1024 and 2048.
 //!
 //! `--paired-gate-up [T...]` times the gate and up projections as the
 //! training forward runs them on bf16 storage (two GEMMs, `[T, 2048] x [2048,
@@ -1305,92 +1295,18 @@ fn run_paired_gdn_recurrent(rt: &Arc<GpuRuntime>, batches: &[usize]) -> Res<()> 
     Ok(())
 }
 
-// ------------------------------------------------------ paired MLP inputs ---
+// ------------------------------------------------------------ paired lanes ---
 
-/// The two lanes of a paired comparison: the production path (`F32`: the
-/// MLP's gate and up in f32 in `--paired-mlp-inputs`, two GEMMs in
-/// `--paired-gate-up`) and the candidate (`Bf16`: bf16 gate and up; one
-/// packed GEMM).
+/// The two lanes of a paired comparison: the production path (`Prod`) and
+/// the candidate (`Cand`).
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum MlpIn {
-    F32,
-    Bf16,
+enum Lane {
+    Prod,
+    Cand,
 }
 
-/// [`paired_lanes`]' lane labels for `--paired-mlp-inputs`.
-const MLP_IN_LANES: [&str; 2] = ["f32_inputs", "bf16_inputs"];
 /// [`paired_lanes`]' lane labels for `--paired-gate-up`.
 const GATE_UP_LANES: [&str; 2] = ["two_gemms", "packed_gemm"];
-
-/// One MLP's buffers at T, both lanes: gate and up in f32 and in bf16.
-struct PairMlp {
-    t: usize,
-    x: Tensor,
-    gate_w: Tensor,
-    up_w: Tensor,
-    down_w: Tensor,
-    gate32: Tensor,
-    up32: Tensor,
-    gate16: Tensor,
-    up16: Tensor,
-    mid: Tensor,
-    resid: Tensor,
-}
-
-impl PairMlp {
-    fn new(rt: &Arc<GpuRuntime>, t: usize) -> Res<Self> {
-        let x = rt.alloc_tensor_bf16(&[t, HIDDEN])?;
-        x.buffer.write_bf16_bits(&f32_slice_to_bf16(&fill(t * HIDDEN, 41, 1.0)));
-        let resid = rt.alloc_tensor_f32(&[t, HIDDEN])?;
-        resid.buffer.write_f32(&fill(t * HIDDEN, 42, 1.0));
-        Ok(Self {
-            t,
-            x,
-            gate_w: weight(rt, HIDDEN, INTER, &weight_bits(HIDDEN, INTER, 43))?,
-            up_w: weight(rt, HIDDEN, INTER, &weight_bits(HIDDEN, INTER, 44))?,
-            down_w: weight(rt, INTER, HIDDEN, &weight_bits(INTER, HIDDEN, 45))?,
-            gate32: rt.alloc_tensor_f32(&[t, INTER])?,
-            up32: rt.alloc_tensor_f32(&[t, INTER])?,
-            gate16: rt.alloc_tensor_bf16(&[t, INTER])?,
-            up16: rt.alloc_tensor_bf16(&[t, INTER])?,
-            mid: rt.alloc_tensor_bf16(&[t, INTER])?,
-            resid,
-        })
-    }
-
-    fn gate_up(&self, lane: MlpIn) -> (&Tensor, &Tensor) {
-        match lane {
-            MlpIn::F32 => (&self.gate32, &self.up32),
-            MlpIn::Bf16 => (&self.gate16, &self.up16),
-        }
-    }
-
-    fn gemms(&self, lane: MlpIn) -> Res<()> {
-        let (g, u) = self.gate_up(lane);
-        gemm(&self.x, &self.gate_w, g, BACKEND)?;
-        gemm(&self.x, &self.up_w, u, BACKEND)
-    }
-
-    fn swiglu(&self, rt: &Arc<GpuRuntime>, lane: MlpIn) -> Res<()> {
-        let (g, u) = self.gate_up(lane);
-        let i = INTER as u32;
-        let (gate, up) = (Cols::dense(&g.buffer, i), Cols::dense(&u.buffer, i));
-        let out = OutCols {
-            cols: Cols::dense(&self.mid.buffer, i),
-            dtype: DType::BF16,
-        };
-        match lane {
-            MlpIn::F32 => qwen35::swiglu(rt, gate, up, out, self.t as u32, i),
-            MlpIn::Bf16 => qwen35::swiglu_bf16_inputs(rt, gate, up, out, self.t as u32, i),
-        }
-    }
-
-    fn block(&self, rt: &Arc<GpuRuntime>, lane: MlpIn) -> Res<()> {
-        self.gemms(lane)?;
-        self.swiglu(rt, lane)?;
-        gemm_epilogue(&self.mid, &self.down_w, &self.resid, BACKEND, residual_add())
-    }
-}
 
 /// `(median, min)` of `samples`, and the median of the per-round ratios
 /// `b[i] / a[i]` (each round times both lanes back to back, so a round's
@@ -1412,14 +1328,14 @@ fn paired_lanes(
     labels: [&str; 2],
     reps: usize,
     (warmup, rounds): (usize, usize),
-    mut run: impl FnMut(MlpIn) -> Res<()>,
+    mut run: impl FnMut(Lane) -> Res<()>,
 ) -> Res<()> {
     let (mut a, mut b) = (Vec::with_capacity(rounds), Vec::with_capacity(rounds));
     for round in 0..(warmup + rounds) {
         let order = if round % 2 == 0 {
-            [MlpIn::F32, MlpIn::Bf16]
+            [Lane::Prod, Lane::Cand]
         } else {
-            [MlpIn::Bf16, MlpIn::F32]
+            [Lane::Cand, Lane::Prod]
         };
         for lane in order {
             rt.synchronize()?;
@@ -1431,8 +1347,8 @@ fn paired_lanes(
             let ms = t0.elapsed().as_secs_f64() * 1e3 / reps as f64;
             if round >= warmup {
                 match lane {
-                    MlpIn::F32 => a.push(ms),
-                    MlpIn::Bf16 => b.push(ms),
+                    Lane::Prod => a.push(ms),
+                    Lane::Cand => b.push(ms),
                 }
             }
         }
@@ -1474,112 +1390,10 @@ fn finite_nonzero(what: &str, t: &Tensor, n: usize) -> Res<()> {
     Ok(())
 }
 
-fn run_paired_mlp_inputs(rt: &Arc<GpuRuntime>, ts: &[usize]) -> Res<()> {
-    use tessl::qwen35_model::{Precision, Qwen35Config, Qwen35Model};
-
-    const KERNEL_ROUNDS: (usize, usize) = (3, 15);
-    const FORWARD_ROUNDS: (usize, usize) = (2, 11);
-    println!("paired MLP inputs: gate/up f32 (production bf16 forward) vs bf16 (set_bf16_mlp_inputs)");
-    println!(
-        "one process, ABBA (first lane rotates each round); kernel units {} warmup + {} timed rounds, \
-         forward {} + {}",
-        KERNEL_ROUNDS.0, KERNEL_ROUNDS.1, FORWARD_ROUNDS.0, FORWARD_ROUNDS.1
-    );
-    let mut model = Qwen35Model::random_tower(rt, Qwen35Config::qwen35_2b()?, Precision::Bf16, 0x51)?;
-    for &t in ts {
-        if t > u32::MAX as usize {
-            return Err(format!("T={t} does not fit the kernels' u32 length"));
-        }
-        let m = PairMlp::new(rt, t)?;
-        // Gate: both lanes write finite, nonzero gate/up, SwiGLU and residual
-        // outputs, and SwiGLU's bf16 output agrees between them up to the
-        // rounding of its inputs.
-        let mut mids = Vec::new();
-        for lane in [MlpIn::F32, MlpIn::Bf16] {
-            m.mid.buffer.write_bf16_bits(&vec![0x7fc1; t * INTER]);
-            m.block(rt, lane)?;
-            rt.synchronize()?;
-            let (g, u) = m.gate_up(lane);
-            finite_nonzero(&format!("T={t} {} gate", MLP_IN_LANES[lane as usize]), g, t * INTER)?;
-            finite_nonzero(&format!("T={t} {} up", MLP_IN_LANES[lane as usize]), u, t * INTER)?;
-            finite_nonzero(
-                &format!("T={t} {} swiglu", MLP_IN_LANES[lane as usize]),
-                &m.mid,
-                t * INTER,
-            )?;
-            finite_nonzero(
-                &format!("T={t} {} resid", MLP_IN_LANES[lane as usize]),
-                &m.resid,
-                t * HIDDEN,
-            )?;
-            let mid: Vec<f32> = m.mid.buffer.contents_u16()[..t * INTER]
-                .iter()
-                .map(|&b| tessl::tensor::bf16_bits_to_f32(b))
-                .collect();
-            mids.push(mid);
-        }
-        let peak = mids[0].iter().fold(0.0f32, |p, x| p.max(x.abs()));
-        let diff = mids[0]
-            .iter()
-            .zip(&mids[1])
-            .fold(0.0f32, |d, (a, b)| d.max((a - b).abs()));
-        println!(
-            "T={t}: gate passed; swiglu max |f32 lane - bf16 lane| / peak = {:.3e}",
-            diff / peak
-        );
-        if diff > peak * 2f32.powi(-5) {
-            return Err(format!(
-                "T={t}: the lanes' SwiGLU outputs differ by {diff} of peak {peak}"
-            ));
-        }
-
-        let reps = paired_reps(t);
-        paired_lanes(rt, t, "swiglu", MLP_IN_LANES, reps, KERNEL_ROUNDS, |l| m.swiglu(rt, l))?;
-        paired_lanes(rt, t, "gate_up_gemms", MLP_IN_LANES, reps.min(32), KERNEL_ROUNDS, |l| {
-            m.gemms(l)
-        })?;
-        paired_lanes(rt, t, "mlp_block", MLP_IN_LANES, reps.min(32), KERNEL_ROUNDS, |l| {
-            m.block(rt, l)
-        })?;
-        drop(m);
-
-        let ids: Vec<u32> = (0..t as u32).map(|i| (i * 7919 + 13) % VOCAB as u32).collect();
-        let check = rt.alloc_tensor_f32(&[t, HIDDEN])?;
-        for lane in [MlpIn::F32, MlpIn::Bf16] {
-            model.set_bf16_mlp_inputs(lane == MlpIn::Bf16)?;
-            let mut s = model.begin(&ids)?;
-            s.advance_to(LAYERS)?;
-            s.final_norm_f32(&check)?;
-            rt.synchronize()?;
-            finite_nonzero(
-                &format!("T={t} {} forward final norm", MLP_IN_LANES[lane as usize]),
-                &check,
-                t * HIDDEN,
-            )?;
-        }
-        let mut forward = |lane: MlpIn| -> Res<()> {
-            model.set_bf16_mlp_inputs(lane == MlpIn::Bf16)?;
-            let mut s = model.begin(&ids)?;
-            s.advance_to(LAYERS)?;
-            rt.synchronize()
-        };
-        paired_lanes(
-            rt,
-            t,
-            "forward_24_layers",
-            MLP_IN_LANES,
-            1,
-            FORWARD_ROUNDS,
-            &mut forward,
-        )?;
-    }
-    Ok(())
-}
-
 // --------------------------------------------------------- paired gate/up ---
 
 /// `--paired-gate-up`: the gate and up projections as two GEMMs
-/// ([`MlpIn::F32`]) or one packed GEMM ([`MlpIn::Bf16`]).
+/// ([`Lane::Prod`]) or one packed GEMM ([`Lane::Cand`]).
 fn run_paired_gate_up(rt: &Arc<GpuRuntime>, ts: &[usize]) -> Res<()> {
     const ROUNDS: (usize, usize) = (3, 15);
     println!("paired gate/up: two GEMMs [T,2048]x[2048,6144] vs one packed [T,2048]x[2048,12288]");
@@ -1604,19 +1418,19 @@ fn run_paired_gate_up(rt: &Arc<GpuRuntime>, ts: &[usize]) -> Res<()> {
         x.buffer.write_bf16_bits(&f32_slice_to_bf16(&fill(t * HIDDEN, 53, 1.0)));
         let (g, u) = (rt.alloc_tensor_f32(&[t, INTER])?, rt.alloc_tensor_f32(&[t, INTER])?);
         let gu = rt.alloc_tensor_f32(&[t, 2 * INTER])?;
-        let run = |lane: MlpIn| -> Res<()> {
+        let run = |lane: Lane| -> Res<()> {
             match lane {
-                MlpIn::F32 => {
+                Lane::Prod => {
                     gemm(&x, &gate_w, &g, BACKEND)?;
                     gemm(&x, &up_w, &u, BACKEND)
                 }
-                MlpIn::Bf16 => gemm(&x, &packed_w, &gu, BACKEND),
+                Lane::Cand => gemm(&x, &packed_w, &gu, BACKEND),
             }
         };
         // Gate: the packed GEMM's two halves are the separate GEMMs' outputs.
         rt.set_async_encode(false)?;
-        run(MlpIn::F32)?;
-        run(MlpIn::Bf16)?;
+        run(Lane::Prod)?;
+        run(Lane::Cand)?;
         rt.synchronize()?;
         let (gv, uv, guv) = (g.buffer.read_f32(), u.buffer.read_f32(), gu.buffer.read_f32());
         let mut worst = 0.0f32;
@@ -1648,14 +1462,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut gdn_scan = qwen35::GdnScanSlice::Cols32;
     let mut decode: Option<usize> = None;
     let mut paired_rec = false;
-    let mut paired_mlp = false;
     let mut paired_gate_up = false;
     let mut ts = Vec::new();
     for arg in std::env::args().skip(1) {
         if arg == "--paired-gdn-recurrent" {
             paired_rec = true;
-        } else if arg == "--paired-mlp-inputs" {
-            paired_mlp = true;
         } else if arg == "--paired-gate-up" {
             paired_gate_up = true;
         } else if arg == "--decode" {
@@ -1690,7 +1501,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         } else {
             let t: usize = arg.parse().map_err(|_| {
                 format!(
-                    "expected a token count, --check-only, --paired-attn, --paired-mlp-inputs, --paired-gate-up, --attn-rows, \
+                    "expected a token count, --check-only, --paired-attn, --paired-gate-up, --attn-rows, \
                      --attn-tile=LABEL, --mlp-unfused, --gdn-scan16 or --decode[=P], got {arg:?}"
                 )
             })?;
@@ -1709,24 +1520,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if paired_rec && (check_only || paired_attn) {
         return Err("--paired-gdn-recurrent takes batch sizes only".into());
     }
-    if paired_mlp && (check_only || paired_attn || paired_rec || decode.is_some()) {
-        return Err("--paired-mlp-inputs takes token counts only".into());
-    }
-    if paired_gate_up && (paired_mlp || check_only || paired_attn || paired_rec || decode.is_some()) {
+    if paired_gate_up && (check_only || paired_attn || paired_rec || decode.is_some()) {
         return Err("--paired-gate-up takes token counts only".into());
     }
     if paired_gate_up {
         let rt = GpuRuntime::new()?;
         println!("device: {}", rt.device_name());
         run_paired_gate_up(&rt, if ts.is_empty() { &[512, 2048] } else { &ts })?;
-        return Ok(());
-    }
-    if paired_mlp {
-        let rt = GpuRuntime::new()?;
-        println!("device: {}", rt.device_name());
-        rt.set_async_encode(true)?;
-        run_paired_mlp_inputs(&rt, if ts.is_empty() { &[1024, 2048] } else { &ts })?;
-        rt.set_async_encode(false)?;
         return Ok(());
     }
     if paired_rec {

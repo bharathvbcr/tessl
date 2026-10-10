@@ -260,22 +260,16 @@ int main(int argc, char **argv) {
                 qwen35_attn_gate_f32(attn, p, outf, rows, Hq, D, ld_p, q_off, ld_out, out_off, gid);
             }
         });
-    } else if (kname == "qwen35_swiglu_f32" || kname == "qwen35_swiglu_bf16" || kname == "qwen35_swiglu_bf16_bf16") {
+    } else if (kname == "qwen35_swiglu_f32" || kname == "qwen35_swiglu_bf16") {
         const uint rows = P("rows"), width = P("width"), ld_gate = P("ld_gate"), gate_off = P("gate_off"),
                    ld_up = P("ld_up"), up_off = P("up_off"), ld_out = P("ld_out"), out_off = P("out_off");
         const bool bf = kname.back() == '6';
-        // `qwen35_swiglu_bf16_bf16` reads bf16 gate and up as well.
-        const bool bf_in = kname == "qwen35_swiglu_bf16_bf16";
-        float *gate = bf_in ? nullptr : F("gate"), *up = bf_in ? nullptr : F("up");
-        bfloat *gate_b = bf_in ? BF("gate") : nullptr, *up_b = bf_in ? BF("up") : nullptr;
+        float *gate = F("gate"), *up = F("up");
         float *outf = bf ? nullptr : F("out");
         bfloat *outb = bf ? BF("out") : nullptr;
         launch(uint3(cdiv(width, 32), rows, 1), uint3(32, 1, 1), 0, [&](const Ids &id, float *) {
             const uint2 gid(id.gid.x, id.gid.y);
-            if (bf_in) {
-                qwen35_swiglu_bf16_bf16(gate_b, up_b, outb, rows, width, ld_gate, gate_off, ld_up, up_off, ld_out,
-                                        out_off, gid);
-            } else if (bf) {
+            if (bf) {
                 qwen35_swiglu_bf16(gate, up, outb, rows, width, ld_gate, gate_off, ld_up, up_off, ld_out, out_off,
                                    gid);
             } else {

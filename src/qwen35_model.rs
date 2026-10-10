@@ -38,13 +38,6 @@
 //! the tight oracle for the composition. It needs the runtime's relaxed-f32
 //! GEMM switched off (the default), and checks that it is.
 //!
-//! [`Qwen35Model::set_bf16_mlp_inputs`] (bf16 only) has the MLP's gate and
-//! up GEMMs write bf16 and SwiGLU read it
-//! ([`crate::qwen35::swiglu_bf16_inputs`]), as transformers' bf16
-//! `Qwen3_5MLP` hands its activation bf16 projections; the other kernels read
-//! the f32 their GEMMs write. `docs/qwen35.md` ("bf16 activation inputs")
-//! has the traffic it saves and its measured logit deviation.
-//!
 //! # Prefill and decode
 //!
 //! One sequence, batch 1, positions from 0. [`Qwen35Model::forward`] and
@@ -459,8 +452,6 @@ pub struct Qwen35Model {
     /// records it at the forward, and the backward, which rebuilds each layer
     /// from the weights it finds, refuses a step whose weights have moved.
     param_generation: AtomicU64,
-    /// [`Self::set_bf16_mlp_inputs`]: the inference MLP's gate and up in bf16.
-    bf16_mlp_inputs: bool,
 }
 
 impl Qwen35Model {
@@ -650,7 +641,6 @@ impl Qwen35Model {
             final_norm,
             layers,
             param_generation: AtomicU64::new(0),
-            bf16_mlp_inputs: false,
         })
     }
 
@@ -746,7 +736,6 @@ impl Qwen35Model {
             final_norm,
             layers,
             param_generation: AtomicU64::new(0),
-            bf16_mlp_inputs: false,
         })
     }
 
@@ -756,36 +745,6 @@ impl Qwen35Model {
 
     pub fn precision(&self) -> Precision {
         self.precision
-    }
-
-    /// With `on`, the inference forward (prefill and decode) writes the MLP's
-    /// gate and up projections as bf16, each element the f32 accumulator
-    /// rounded once on the GEMM's store, and SwiGLU reads them as bf16
-    /// ([`crate::qwen35::swiglu_bf16_inputs`]): half the bytes written and
-    /// read between those GEMMs and the activation, at the cost of rounding
-    /// its inputs, which transformers' bf16 forward also rounds. Off, they
-    /// stay f32. A [`Precision::F32`] model has no bf16 GEMM to round on and
-    /// refuses `on`. Training runs its own forward and is unaffected.
-    pub fn set_bf16_mlp_inputs(&mut self, on: bool) -> Result<(), String> {
-        if on && self.precision != Precision::Bf16 {
-            return Err("Qwen35Model::set_bf16_mlp_inputs: bf16 MLP inputs need a Precision::Bf16 model".into());
-        }
-        self.bf16_mlp_inputs = on;
-        Ok(())
-    }
-
-    /// Whether [`Self::set_bf16_mlp_inputs`] is on.
-    pub fn bf16_mlp_inputs(&self) -> bool {
-        self.bf16_mlp_inputs
-    }
-
-    /// The dtype the inference MLP's gate and up GEMMs write.
-    fn mlp_in_dtype(&self) -> DType {
-        if self.bf16_mlp_inputs {
-            DType::BF16
-        } else {
-            DType::F32
-        }
     }
 
     /// What the model is and how it stores itself, in one line: its shape,
@@ -899,7 +858,7 @@ impl Qwen35Model {
         // Everything the session holds is allocated before the prefill runs,
         // so a failed allocation never throws a finished prefill away.
         let carry = self.alloc_carry(t, max_new)?;
-        let a = Acts::new(rt, cfg, self.precision, self.mlp_in_dtype(), 1, false)?;
+        let a = Acts::new(rt, cfg, self.precision, 1, false)?;
         let logits_t = rt.alloc_tensor_f32(&[1, cfg.vocab as usize])?;
         let scratch = DecodeScratch::new(rt, 1, q_heads, positions as usize, head_dim)?;
         let mut s = self.begin_impl(ids, false, Some(carry))?;
@@ -929,14 +888,7 @@ impl Qwen35Model {
         // then stops it too.
         let param_generation = self.param_generation();
         let t = self.check_ids("Qwen35Model::forward", ids)?;
-        let a = Acts::new(
-            &self.rt,
-            &self.cfg,
-            self.precision,
-            self.mlp_in_dtype(),
-            t,
-            carry.is_none(),
-        )?;
+        let a = Acts::new(&self.rt, &self.cfg, self.precision, t, carry.is_none())?;
         self.embed_ids(ids, &a.resid)?;
         Ok(Staged {
             model: self,
@@ -1324,17 +1276,17 @@ impl Qwen35Model {
         let inter = self.cfg.intermediate;
         gemm(&a.x, &layer.gate, &a.m_gate, BACKEND)?;
         gemm(&a.x, &layer.up, &a.m_up, BACKEND)?;
-        let (gate, up) = (Cols::dense(&a.m_gate.buffer, inter), Cols::dense(&a.m_up.buffer, inter));
-        let out = OutCols {
-            cols: Cols::dense(&a.m_mid.buffer, inter),
-            dtype: self.precision.dtype(),
-        };
-        // The GEMMs wrote the dtype `Acts` gave them (`mlp_in_dtype`).
-        if a.m_gate.dtype == DType::BF16 {
-            qwen35::swiglu_bf16_inputs(&self.rt, gate, up, out, a.t, inter)?;
-        } else {
-            qwen35::swiglu(&self.rt, gate, up, out, a.t, inter)?;
-        }
+        qwen35::swiglu(
+            &self.rt,
+            Cols::dense(&a.m_gate.buffer, inter),
+            Cols::dense(&a.m_up.buffer, inter),
+            OutCols {
+                cols: Cols::dense(&a.m_mid.buffer, inter),
+                dtype: self.precision.dtype(),
+            },
+            a.t,
+            inter,
+        )?;
         self.project_residual(&a.m_mid, &layer.down, a)
     }
 }
@@ -1724,21 +1676,13 @@ struct Acts {
     a_y: Tensor,
     tkv: GpuBuffer,
     zero: GpuBuffer,
-    /// The MLP's gate and up projections, in the model's `mlp_in_dtype`.
     m_gate: Tensor,
     m_up: Tensor,
     m_mid: Tensor,
 }
 
 impl Acts {
-    fn new(
-        rt: &Arc<GpuRuntime>,
-        cfg: &Qwen35Config,
-        p: Precision,
-        mlp_in: DType,
-        t: u32,
-        shared_kv: bool,
-    ) -> Result<Self, String> {
+    fn new(rt: &Arc<GpuRuntime>, cfg: &Qwen35Config, p: Precision, t: u32, shared_kv: bool) -> Result<Self, String> {
         let tu = t as usize;
         let (g, l) = (cfg.gdn, cfg.attn);
         // Every activation is written in full before anything reads it — the
@@ -1770,8 +1714,8 @@ impl Acts {
             a_y: act(qd)?,
             tkv: u32_buf(t)?,
             zero: u32_buf(0)?,
-            m_gate: rt.alloc_tensor_unzeroed(&[tu, cfg.intermediate as usize], mlp_in)?,
-            m_up: rt.alloc_tensor_unzeroed(&[tu, cfg.intermediate as usize], mlp_in)?,
+            m_gate: f32t(cfg.intermediate as usize)?,
+            m_up: f32t(cfg.intermediate as usize)?,
             m_mid: act(cfg.intermediate as usize)?,
         })
     }

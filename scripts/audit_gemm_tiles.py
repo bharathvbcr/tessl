@@ -58,9 +58,6 @@ NN_PAIRS = [
     ("matmul2d_tensorops_f32", "TILE_F32"),
     ("matmul2d_tensorops_bf16_f32", "TILE_COOP_DEFAULT"),
     ("matmul2d_tensorops_bf16_f32_64x64_sg4", "TILE_COOP_NARROW"),
-    # gemm.rs `bf16_out_kernel`: the two above with a bf16 C, same geometry.
-    ("matmul2d_tensorops_bf16_bf16", "TILE_COOP_DEFAULT"),
-    ("matmul2d_tensorops_bf16_bf16_64x64_sg4", "TILE_COOP_NARROW"),
     ("matmul2d_tensorops_f16_f32", "TILE_COOP_DEFAULT"),
     ("matmul2d_tensorops_f16_f32_64x64_sg4", "TILE_COOP_NARROW"),
     ("matmul2d_tensorops_f32_relaxed", "TILE_COOP_DEFAULT"),

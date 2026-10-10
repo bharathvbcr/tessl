@@ -6,11 +6,7 @@
 // forward used to spend a second pass casting the f32 product: at Qwen3.5-2B's
 // shapes (intermediate 6144) that cast was 0.18 ms of the MLP's 0.52 ms of
 // elementwise work per layer at T = 1024. `qwen35_swiglu_bf16` stores the
-// product as bf16 directly, in the one pass. `qwen35_swiglu_bf16_bf16` also
-// reads bf16 gate and up, as a bf16-output GEMM (`matmul2d_tensorops_bf16_bf16`)
-// writes them: half the bytes in, and the values transformers' bf16
-// `Qwen3_5MLP` hands its activation (its `gate_proj` and `up_proj` outputs
-// are bf16).
+// product as bf16 directly, in the one pass.
 //
 // Both operands are column windows of wider rows (`ld`, `off`), like every
 // Qwen3.5 kernel's inputs, so a single GEMM that writes `[gate | up]` side by
@@ -25,13 +21,12 @@ using namespace metal;
 /// for `c < width`, `r < rows`; rows are `ld_*` elements apart. `ACT` is SiLU
 /// (`qwen35_swiglu_*`, Qwen3.5) or GELU-tanh (`qwen35_gelu_tanh_glu_*`,
 /// EmbeddingGemma 2: the same `tessl_gelu_pytorch_tanh` as `mlp_gelu_tanh`).
-/// `IN_T` is the inputs' element type, widened to f32 for the arithmetic.
 ///
 /// Grid: x = column in [0, width), y = row in [0, rows).
-#define GATED_KERNEL(NAME, IN_T, OUT_T, ACT)                                      \
+#define GATED_KERNEL(NAME, OUT_T, ACT)                                            \
 kernel void NAME(                                                                 \
-    device const IN_T *gate [[buffer(0)]],                                        \
-    device const IN_T *up [[buffer(1)]],                                          \
+    device const float *gate [[buffer(0)]],                                       \
+    device const float *up [[buffer(1)]],                                         \
     device OUT_T *out [[buffer(2)]],                                              \
     constant uint &rows [[buffer(3)]],                                            \
     constant uint &width [[buffer(4)]],                                           \
@@ -46,16 +41,15 @@ kernel void NAME(                                                               
     const uint col = gid.x;                                                       \
     const uint r = gid.y;                                                         \
     if (col >= width || r >= rows) return;                                        \
-    const float g = (float)gate[(ulong)r * ld_gate + gate_off + col];             \
-    const float u = (float)up[(ulong)r * ld_up + up_off + col];                   \
+    const float g = gate[(ulong)r * ld_gate + gate_off + col];                    \
+    const float u = up[(ulong)r * ld_up + up_off + col];                          \
     out[(ulong)r * ld_out + out_off + col] = (OUT_T)(ACT(g) * u);             \
 }
 
-GATED_KERNEL(qwen35_swiglu_f32, float, float, qwen35_silu)
-GATED_KERNEL(qwen35_swiglu_bf16, float, bfloat, qwen35_silu)
-GATED_KERNEL(qwen35_swiglu_bf16_bf16, bfloat, bfloat, qwen35_silu)
-GATED_KERNEL(qwen35_gelu_tanh_glu_f32, float, float, tessl_gelu_pytorch_tanh)
-GATED_KERNEL(qwen35_gelu_tanh_glu_bf16, float, bfloat, tessl_gelu_pytorch_tanh)
+GATED_KERNEL(qwen35_swiglu_f32, float, qwen35_silu)
+GATED_KERNEL(qwen35_swiglu_bf16, bfloat, qwen35_silu)
+GATED_KERNEL(qwen35_gelu_tanh_glu_f32, float, tessl_gelu_pytorch_tanh)
+GATED_KERNEL(qwen35_gelu_tanh_glu_bf16, bfloat, tessl_gelu_pytorch_tanh)
 
 /// `resid[r, resid_off + c] += y[r, y_off + c]` for `c < width`, `r < rows`:
 /// the residual add after a projection, for the exact-f32 forward. (The bf16

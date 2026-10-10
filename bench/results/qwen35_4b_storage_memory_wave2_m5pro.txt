@@ -1,0 +1,213 @@
+# Qwen3.5-4B shapes, bf16 storage: the training step's peak, BEFORE and AFTER wave 2 — M5 Pro, 2026-10-10
+#
+#   probe_storage_memory --config=<Qwen3.5-4B-Base config.json> --steps=512,2048 --step=T --no-optimizer
+#
+# before = built at d57f4f7 (main de4747a + the bench flag; no library change)
+# with this branch's probe_storage_memory.rs (the same file, --no-optimizer
+# added); after = built at c5fd930 (628f113 the bf16 bank takes the head
+# gradient a chunk at a time, d4b73c1 the backward releases the final
+# norm's tensors early, 04faf93 no f32 weight chunk in the bf16-lane
+# cross-entropy workspace, b8d4010 the pool cache evicts a larger buffer
+# for a smaller freed one; the bytes are the same at d979c06). Random weights at the 4B's exact shapes
+# (allocation, not values, is measured), a bf16 bank overwritten, one
+# train_step_into on bf16 operands. Interleaved before, after, after,
+# before per length; each pair of runs is identical to the byte.
+#
+# --no-optimizer: this machine runs memguard with a 32 GiB per-process cap,
+# which kills --step with its Kahan + 8-bit AdamW resident (31.5 GiB
+# resident plus the step, ~37 GiB; qwen35_4b_storage_memory_m5pro.txt was
+# taken before the cap). The step's peak over what is resident is the same
+# measurement without the optimizer; its bytes are in the table.
+#
+# Finding: the step's peak over resident drops by more than the [vocab,
+# hidden] f32 head gradient it no longer allocates (248320 x 2560 x 4 =
+# 2,542,796,800 B = 2.37 GiB):
+#   T = 2048: 6,179,487,744 -> 3,594,747,904 B (5.76 -> 3.35 GiB), -2,584,739,840 B
+#   T =  512: 4,053,942,272 -> 1,500,659,712 B (3.78 -> 1.40 GiB), -2,553,282,560 B
+# /usr/bin/time peak footprint: 27.23 -> 24.64 GB (T = 2048), 25.10 -> 22.55 GB (T = 512).
+# Without the early release (628f113 alone) T = 2048 dropped 2.35 GiB, 20
+# MiB short: the by-chunk head holds the token rows' f32 gradient
+# ([T, hidden], 20 MiB) to the end of the backward.
+# With the 4B's 15.79 GiB Kahan + 8-bit state resident the device peak
+# would be 21.43 + 15.79 = 37.22 -> 34.81 GiB at T = 2048 (computed, not
+# measured here). train_step_bytes is unchanged (9.14 / 6.29 GiB): it still
+# bounds train_forward then train_backward_into, which holds the head
+# gradient whole; train_step_into's own pre-flight counts the chunk instead.
+# Load average 6-14 (11:21-11:23); allocation is not sensitive to it.
+#
+### before T=2048 11:21:47 load { 13.82 14.92 18.90 }
+device Apple M5 Pro, recommended working set 48.00 GiB (51539607552 B)
+Qwen3.5 text: hidden 2560, intermediate 9216, vocab 248320, 32 layers (24 GDN, 8 attention); matrices bf16, norms/conv/gates f32; LM head tied to the embedding
+parameters 4205751296
+bf16 weights: 7.84 GiB allocated (computed 7.84 GiB)
+bf16 gradient bank: 7.84 GiB allocated
+
+variant                                                      weights        bank   optimizer       total  fits
+f32 everywhere                                             15.67 GiB   15.67 GiB   31.34 GiB   62.67 GiB  NO  computed only (--no-optimizer)
+bf16 weights+bank, f32 master, f32 moments                  7.84 GiB    7.84 GiB   47.00 GiB   62.67 GiB  NO  computed only (--no-optimizer)
+bf16 weights+bank, f32 master, 8-bit moments                7.84 GiB    7.84 GiB   23.62 GiB   39.29 GiB  yes  computed only (--no-optimizer)
+bf16 weights+bank, Kahan, bf16 moments (all bf16)           7.84 GiB    7.84 GiB   23.50 GiB   39.17 GiB  yes  computed only (--no-optimizer)
+bf16 weights+bank, Kahan, 8-bit moments                     7.84 GiB    7.84 GiB   15.79 GiB   31.46 GiB  yes  computed only (--no-optimizer)
+bf16 weights+bank, stochastic rounding, 8-bit moments       7.84 GiB    7.84 GiB    7.96 GiB   23.63 GiB  yes  computed only (--no-optimizer)
+
+train_step_bytes(T=512, bf16): 6.29 GiB
+train_step_bytes(T=2048, bf16): 9.14 GiB
+
+no optimizer; resident 15.67 GiB (weights, bank)
+step T=2048: loss 12.9893, peak 5.76 GiB (6179487744 B) over resident, bound 9.14 GiB; device peak 21.43 GiB (no optimizer), recommended working set 48.00 GiB
+         27224882440  peak memory footprint
+exit=0
+### after T=2048 11:21:59 load { 11.91 14.45 18.66 }
+device Apple M5 Pro, recommended working set 48.00 GiB (51539607552 B)
+Qwen3.5 text: hidden 2560, intermediate 9216, vocab 248320, 32 layers (24 GDN, 8 attention); matrices bf16, norms/conv/gates f32; LM head tied to the embedding
+parameters 4205751296
+bf16 weights: 7.84 GiB allocated (computed 7.84 GiB)
+bf16 gradient bank: 7.84 GiB allocated
+
+variant                                                      weights        bank   optimizer       total  fits
+f32 everywhere                                             15.67 GiB   15.67 GiB   31.34 GiB   62.67 GiB  NO  computed only (--no-optimizer)
+bf16 weights+bank, f32 master, f32 moments                  7.84 GiB    7.84 GiB   47.00 GiB   62.67 GiB  NO  computed only (--no-optimizer)
+bf16 weights+bank, f32 master, 8-bit moments                7.84 GiB    7.84 GiB   23.62 GiB   39.29 GiB  yes  computed only (--no-optimizer)
+bf16 weights+bank, Kahan, bf16 moments (all bf16)           7.84 GiB    7.84 GiB   23.50 GiB   39.17 GiB  yes  computed only (--no-optimizer)
+bf16 weights+bank, Kahan, 8-bit moments                     7.84 GiB    7.84 GiB   15.79 GiB   31.46 GiB  yes  computed only (--no-optimizer)
+bf16 weights+bank, stochastic rounding, 8-bit moments       7.84 GiB    7.84 GiB    7.96 GiB   23.63 GiB  yes  computed only (--no-optimizer)
+
+train_step_bytes(T=512, bf16): 6.29 GiB
+train_step_bytes(T=2048, bf16): 9.14 GiB
+
+no optimizer; resident 15.67 GiB (weights, bank)
+step T=2048: loss 12.9893, peak 3.35 GiB (3594747904 B) over resident, bound 9.14 GiB; device peak 19.02 GiB (no optimizer), recommended working set 48.00 GiB
+         24640224520  peak memory footprint
+exit=0
+### after T=2048 11:22:11 load { 10.38 14.04 18.46 }
+device Apple M5 Pro, recommended working set 48.00 GiB (51539607552 B)
+Qwen3.5 text: hidden 2560, intermediate 9216, vocab 248320, 32 layers (24 GDN, 8 attention); matrices bf16, norms/conv/gates f32; LM head tied to the embedding
+parameters 4205751296
+bf16 weights: 7.84 GiB allocated (computed 7.84 GiB)
+bf16 gradient bank: 7.84 GiB allocated
+
+variant                                                      weights        bank   optimizer       total  fits
+f32 everywhere                                             15.67 GiB   15.67 GiB   31.34 GiB   62.67 GiB  NO  computed only (--no-optimizer)
+bf16 weights+bank, f32 master, f32 moments                  7.84 GiB    7.84 GiB   47.00 GiB   62.67 GiB  NO  computed only (--no-optimizer)
+bf16 weights+bank, f32 master, 8-bit moments                7.84 GiB    7.84 GiB   23.62 GiB   39.29 GiB  yes  computed only (--no-optimizer)
+bf16 weights+bank, Kahan, bf16 moments (all bf16)           7.84 GiB    7.84 GiB   23.50 GiB   39.17 GiB  yes  computed only (--no-optimizer)
+bf16 weights+bank, Kahan, 8-bit moments                     7.84 GiB    7.84 GiB   15.79 GiB   31.46 GiB  yes  computed only (--no-optimizer)
+bf16 weights+bank, stochastic rounding, 8-bit moments       7.84 GiB    7.84 GiB    7.96 GiB   23.63 GiB  yes  computed only (--no-optimizer)
+
+train_step_bytes(T=512, bf16): 6.29 GiB
+train_step_bytes(T=2048, bf16): 9.14 GiB
+
+no optimizer; resident 15.67 GiB (weights, bank)
+step T=2048: loss 12.9893, peak 3.35 GiB (3594747904 B) over resident, bound 9.14 GiB; device peak 19.02 GiB (no optimizer), recommended working set 48.00 GiB
+         24640044272  peak memory footprint
+exit=0
+### before T=2048 11:22:23 load { 8.59 13.46 18.18 }
+device Apple M5 Pro, recommended working set 48.00 GiB (51539607552 B)
+Qwen3.5 text: hidden 2560, intermediate 9216, vocab 248320, 32 layers (24 GDN, 8 attention); matrices bf16, norms/conv/gates f32; LM head tied to the embedding
+parameters 4205751296
+bf16 weights: 7.84 GiB allocated (computed 7.84 GiB)
+bf16 gradient bank: 7.84 GiB allocated
+
+variant                                                      weights        bank   optimizer       total  fits
+f32 everywhere                                             15.67 GiB   15.67 GiB   31.34 GiB   62.67 GiB  NO  computed only (--no-optimizer)
+bf16 weights+bank, f32 master, f32 moments                  7.84 GiB    7.84 GiB   47.00 GiB   62.67 GiB  NO  computed only (--no-optimizer)
+bf16 weights+bank, f32 master, 8-bit moments                7.84 GiB    7.84 GiB   23.62 GiB   39.29 GiB  yes  computed only (--no-optimizer)
+bf16 weights+bank, Kahan, bf16 moments (all bf16)           7.84 GiB    7.84 GiB   23.50 GiB   39.17 GiB  yes  computed only (--no-optimizer)
+bf16 weights+bank, Kahan, 8-bit moments                     7.84 GiB    7.84 GiB   15.79 GiB   31.46 GiB  yes  computed only (--no-optimizer)
+bf16 weights+bank, stochastic rounding, 8-bit moments       7.84 GiB    7.84 GiB    7.96 GiB   23.63 GiB  yes  computed only (--no-optimizer)
+
+train_step_bytes(T=512, bf16): 6.29 GiB
+train_step_bytes(T=2048, bf16): 9.14 GiB
+
+no optimizer; resident 15.67 GiB (weights, bank)
+step T=2048: loss 12.9893, peak 5.76 GiB (6179487744 B) over resident, bound 9.14 GiB; device peak 21.43 GiB (no optimizer), recommended working set 48.00 GiB
+         27224800496  peak memory footprint
+exit=0
+### before T=512 11:22:35 load { 7.49 13.07 17.98 }
+device Apple M5 Pro, recommended working set 48.00 GiB (51539607552 B)
+Qwen3.5 text: hidden 2560, intermediate 9216, vocab 248320, 32 layers (24 GDN, 8 attention); matrices bf16, norms/conv/gates f32; LM head tied to the embedding
+parameters 4205751296
+bf16 weights: 7.84 GiB allocated (computed 7.84 GiB)
+bf16 gradient bank: 7.84 GiB allocated
+
+variant                                                      weights        bank   optimizer       total  fits
+f32 everywhere                                             15.67 GiB   15.67 GiB   31.34 GiB   62.67 GiB  NO  computed only (--no-optimizer)
+bf16 weights+bank, f32 master, f32 moments                  7.84 GiB    7.84 GiB   47.00 GiB   62.67 GiB  NO  computed only (--no-optimizer)
+bf16 weights+bank, f32 master, 8-bit moments                7.84 GiB    7.84 GiB   23.62 GiB   39.29 GiB  yes  computed only (--no-optimizer)
+bf16 weights+bank, Kahan, bf16 moments (all bf16)           7.84 GiB    7.84 GiB   23.50 GiB   39.17 GiB  yes  computed only (--no-optimizer)
+bf16 weights+bank, Kahan, 8-bit moments                     7.84 GiB    7.84 GiB   15.79 GiB   31.46 GiB  yes  computed only (--no-optimizer)
+bf16 weights+bank, stochastic rounding, 8-bit moments       7.84 GiB    7.84 GiB    7.96 GiB   23.63 GiB  yes  computed only (--no-optimizer)
+
+train_step_bytes(T=512, bf16): 6.29 GiB
+train_step_bytes(T=2048, bf16): 9.14 GiB
+
+no optimizer; resident 15.67 GiB (weights, bank)
+step T=512: loss 12.9900, peak 3.78 GiB (4053942272 B) over resident, bound 6.29 GiB; device peak 19.45 GiB (no optimizer), recommended working set 48.00 GiB
+         25099353328  peak memory footprint
+exit=0
+### after T=512 11:22:44 load { 6.72 12.72 17.80 }
+device Apple M5 Pro, recommended working set 48.00 GiB (51539607552 B)
+Qwen3.5 text: hidden 2560, intermediate 9216, vocab 248320, 32 layers (24 GDN, 8 attention); matrices bf16, norms/conv/gates f32; LM head tied to the embedding
+parameters 4205751296
+bf16 weights: 7.84 GiB allocated (computed 7.84 GiB)
+bf16 gradient bank: 7.84 GiB allocated
+
+variant                                                      weights        bank   optimizer       total  fits
+f32 everywhere                                             15.67 GiB   15.67 GiB   31.34 GiB   62.67 GiB  NO  computed only (--no-optimizer)
+bf16 weights+bank, f32 master, f32 moments                  7.84 GiB    7.84 GiB   47.00 GiB   62.67 GiB  NO  computed only (--no-optimizer)
+bf16 weights+bank, f32 master, 8-bit moments                7.84 GiB    7.84 GiB   23.62 GiB   39.29 GiB  yes  computed only (--no-optimizer)
+bf16 weights+bank, Kahan, bf16 moments (all bf16)           7.84 GiB    7.84 GiB   23.50 GiB   39.17 GiB  yes  computed only (--no-optimizer)
+bf16 weights+bank, Kahan, 8-bit moments                     7.84 GiB    7.84 GiB   15.79 GiB   31.46 GiB  yes  computed only (--no-optimizer)
+bf16 weights+bank, stochastic rounding, 8-bit moments       7.84 GiB    7.84 GiB    7.96 GiB   23.63 GiB  yes  computed only (--no-optimizer)
+
+train_step_bytes(T=512, bf16): 6.29 GiB
+train_step_bytes(T=2048, bf16): 9.14 GiB
+
+no optimizer; resident 15.67 GiB (weights, bank)
+step T=512: loss 12.9900, peak 1.40 GiB (1500659712 B) over resident, bound 6.29 GiB; device peak 17.07 GiB (no optimizer), recommended working set 48.00 GiB
+         22545906904  peak memory footprint
+exit=0
+### after T=512 11:22:53 load { 6.34 12.54 17.71 }
+device Apple M5 Pro, recommended working set 48.00 GiB (51539607552 B)
+Qwen3.5 text: hidden 2560, intermediate 9216, vocab 248320, 32 layers (24 GDN, 8 attention); matrices bf16, norms/conv/gates f32; LM head tied to the embedding
+parameters 4205751296
+bf16 weights: 7.84 GiB allocated (computed 7.84 GiB)
+bf16 gradient bank: 7.84 GiB allocated
+
+variant                                                      weights        bank   optimizer       total  fits
+f32 everywhere                                             15.67 GiB   15.67 GiB   31.34 GiB   62.67 GiB  NO  computed only (--no-optimizer)
+bf16 weights+bank, f32 master, f32 moments                  7.84 GiB    7.84 GiB   47.00 GiB   62.67 GiB  NO  computed only (--no-optimizer)
+bf16 weights+bank, f32 master, 8-bit moments                7.84 GiB    7.84 GiB   23.62 GiB   39.29 GiB  yes  computed only (--no-optimizer)
+bf16 weights+bank, Kahan, bf16 moments (all bf16)           7.84 GiB    7.84 GiB   23.50 GiB   39.17 GiB  yes  computed only (--no-optimizer)
+bf16 weights+bank, Kahan, 8-bit moments                     7.84 GiB    7.84 GiB   15.79 GiB   31.46 GiB  yes  computed only (--no-optimizer)
+bf16 weights+bank, stochastic rounding, 8-bit moments       7.84 GiB    7.84 GiB    7.96 GiB   23.63 GiB  yes  computed only (--no-optimizer)
+
+train_step_bytes(T=512, bf16): 6.29 GiB
+train_step_bytes(T=2048, bf16): 9.14 GiB
+
+no optimizer; resident 15.67 GiB (weights, bank)
+step T=512: loss 12.9900, peak 1.40 GiB (1500659712 B) over resident, bound 6.29 GiB; device peak 17.07 GiB (no optimizer), recommended working set 48.00 GiB
+         22545972440  peak memory footprint
+exit=0
+### before T=512 11:23:02 load { 5.97 12.26 17.55 }
+device Apple M5 Pro, recommended working set 48.00 GiB (51539607552 B)
+Qwen3.5 text: hidden 2560, intermediate 9216, vocab 248320, 32 layers (24 GDN, 8 attention); matrices bf16, norms/conv/gates f32; LM head tied to the embedding
+parameters 4205751296
+bf16 weights: 7.84 GiB allocated (computed 7.84 GiB)
+bf16 gradient bank: 7.84 GiB allocated
+
+variant                                                      weights        bank   optimizer       total  fits
+f32 everywhere                                             15.67 GiB   15.67 GiB   31.34 GiB   62.67 GiB  NO  computed only (--no-optimizer)
+bf16 weights+bank, f32 master, f32 moments                  7.84 GiB    7.84 GiB   47.00 GiB   62.67 GiB  NO  computed only (--no-optimizer)
+bf16 weights+bank, f32 master, 8-bit moments                7.84 GiB    7.84 GiB   23.62 GiB   39.29 GiB  yes  computed only (--no-optimizer)
+bf16 weights+bank, Kahan, bf16 moments (all bf16)           7.84 GiB    7.84 GiB   23.50 GiB   39.17 GiB  yes  computed only (--no-optimizer)
+bf16 weights+bank, Kahan, 8-bit moments                     7.84 GiB    7.84 GiB   15.79 GiB   31.46 GiB  yes  computed only (--no-optimizer)
+bf16 weights+bank, stochastic rounding, 8-bit moments       7.84 GiB    7.84 GiB    7.96 GiB   23.63 GiB  yes  computed only (--no-optimizer)
+
+train_step_bytes(T=512, bf16): 6.29 GiB
+train_step_bytes(T=2048, bf16): 9.14 GiB
+
+no optimizer; resident 15.67 GiB (weights, bank)
+step T=512: loss 12.9900, peak 3.78 GiB (4053942272 B) over resident, bound 6.29 GiB; device peak 19.45 GiB (no optimizer), recommended working set 48.00 GiB
+         25099222256  peak memory footprint
+exit=0

@@ -736,7 +736,9 @@ impl Qwen35Model {
         if trace {
             out_trace.push(read_rows(&a.x, self.precision)?);
         }
-        let logits = logits_t.buffer.read_f32()[..t as usize * cfg.vocab as usize].to_vec();
+        // Map once and copy only the `[t, vocab]` prefix; `read_f32` would
+        // first copy the whole buffer.
+        let logits = logits_t.buffer.try_contents_f32()?[..t as usize * cfg.vocab as usize].to_vec();
         Ok(ForwardOutput {
             logits,
             trace: out_trace,
@@ -1006,7 +1008,7 @@ impl Staged<'_> {
             m.mlp(l, a)?;
             if let Some(trace) = self.trace.as_mut() {
                 m.rt.synchronize()?;
-                trace.push(a.resid.buffer.read_f32()[..(a.t * m.cfg.hidden) as usize].to_vec());
+                trace.push(a.resid.buffer.try_contents_f32()?[..(a.t * m.cfg.hidden) as usize].to_vec());
             }
         }
         self.next = layer;
@@ -1044,7 +1046,7 @@ impl Staged<'_> {
 fn read_rows(x: &Tensor, precision: Precision) -> Result<Vec<f32>, String> {
     let n = x.shape.iter().product::<usize>();
     Ok(match precision {
-        Precision::F32 => x.buffer.read_f32()[..n].to_vec(),
+        Precision::F32 => x.buffer.try_contents_f32()?[..n].to_vec(),
         Precision::Bf16 => x.buffer.contents_u16()[..n]
             .iter()
             .map(|&b| crate::tensor::bf16_bits_to_f32(b))

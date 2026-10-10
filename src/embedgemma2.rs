@@ -1177,7 +1177,7 @@ impl EmbedGemma2Model {
             )?;
             if trace {
                 rt.synchronize()?;
-                out_trace.push(resid.buffer.read_f32()[..rows * h as usize].to_vec());
+                out_trace.push(resid.buffer.try_contents_f32()?[..rows * h as usize].to_vec());
             }
         }
 
@@ -1189,10 +1189,11 @@ impl EmbedGemma2Model {
         l2_normalize_rows(rt, &out.buffer, nb, dim_out, cfg.embedding_dim)?;
         rt.synchronize()?;
         if trace {
-            out_trace.push(x.buffer.read_f32()[..rows * h as usize].to_vec());
+            out_trace.push(x.buffer.try_contents_f32()?[..rows * h as usize].to_vec());
         }
         let (full, dim) = (cfg.embedding_dim as usize, dim_out as usize);
-        let out = out.buffer.read_f32();
+        // Read the prefix columns straight from the mapping: one copy.
+        let out = out.buffer.try_contents_f32()?;
         let rows = out[..nb as usize * full]
             .chunks_exact(full)
             .flat_map(|row| &row[..dim])

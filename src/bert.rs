@@ -913,7 +913,7 @@ impl BertSparseModel {
         let mut out_trace = Vec::new();
         let snap = |t: &Tensor, out: &mut Vec<Vec<f32>>| -> Result<(), String> {
             rt.synchronize()?;
-            out.push(t.buffer.read_f32()[..(rows * h) as usize].to_vec());
+            out.push(t.buffer.try_contents_f32()?[..(rows * h) as usize].to_vec());
             Ok(())
         };
 
@@ -1014,7 +1014,7 @@ impl BertSparseModel {
             )?;
             // The next block reuses the logits and pooled buffers.
             rt.synchronize()?;
-            out[b0 * v..b1 * v].copy_from_slice(&a.pooled.read_f32()[..(b1 - b0) * v]);
+            out[b0 * v..b1 * v].copy_from_slice(&a.pooled.try_contents_f32()?[..(b1 - b0) * v]);
             b0 = b1;
         }
         Ok((out, out_trace))

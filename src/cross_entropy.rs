@@ -42,7 +42,7 @@ use std::sync::Arc;
 use objc2_metal::MTLComputePipelineState;
 
 use crate::dispatch::{dispatch_2d, set_f32, set_gpu_buf, set_tensor, set_u32};
-use crate::gemm::{cast_bf16_to_f32_into, GemmOperands};
+use crate::gemm::{cast_bf16_to_f32_into, cast_f32_to_bf16_into, GemmOperands};
 use crate::nn::{dispatch_tg_1d, reduce_tptg};
 use crate::runtime::{BufferKind, GpuRuntime};
 use crate::tensor::{DType, GpuBuffer, Tensor};
@@ -373,11 +373,40 @@ fn ce_rows(
 
     let chunk = ws.chunk as usize;
     let lse = rt.pipeline("ce_lse_update")?;
-    // The f32 weight rows [v0, v0 + w) for GEMMs, widening a bf16 chunk first.
+    // Under bf16 operands each GEMM rounds an f32 operand to bf16 itself,
+    // into a fresh temporary per call: `h` for every chunk's GEMMs in both
+    // walks, each logit chunk for two, an f32 weight chunk for two. Round
+    // each once into a bf16 copy and hand the GEMMs that (same cast kernel,
+    // same bits). A bf16 weight goes to them as it is, rather than widened to
+    // f32 and narrowed back (exact both ways). That was ~310 dispatches and
+    // ~250 allocations per 2B step.
+    let bf16_ops = operands == GemmOperands::Bf16;
+    let h16 = if bf16_ops {
+        let t = rt.alloc_tensor_unzeroed(&[n, hs], DType::BF16)?;
+        cast_f32_to_bf16_into(&h_rows, &t)?;
+        Some(t)
+    } else {
+        None
+    };
+    let h_op = h16.as_ref().unwrap_or(&h_rows);
+    let widest = chunk.min(vs);
+    let w16 = if bf16_ops && weight.dtype == DType::F32 {
+        Some(rt.alloc_tensor_unzeroed(&[widest, hs], DType::BF16)?)
+    } else {
+        None
+    };
+    // The weight rows [v0, v0 + w) as the GEMMs take them: a bf16 chunk
+    // widened to f32 for exact-f32 GEMMs, an f32 one rounded once for bf16.
     let weight_chunk = |v0: usize, w: usize| -> Result<Tensor, String> {
         let src = weight.try_view(&[w, hs], v0 * hs)?;
-        match weight.dtype {
-            DType::F32 => Ok(src),
+        match (weight.dtype, &w16) {
+            (DType::BF16, _) if bf16_ops => Ok(src),
+            (DType::F32, Some(w16)) => {
+                let dst = w16.try_view(&[w, hs], 0)?;
+                cast_f32_to_bf16_into(&src, &dst)?;
+                Ok(dst)
+            }
+            (DType::F32, None) => Ok(src),
             _ => {
                 let dst = ws
                     .w32
@@ -395,7 +424,7 @@ fn ce_rows(
         let w = chunk.min(vs - v0);
         let wc = weight_chunk(v0, w)?;
         let logits = ws.logits.try_view(&[n, w], 0)?;
-        operands.nt(&h_rows, &wc, &logits)?;
+        operands.nt(h_op, &wc, &logits)?;
         let tptg = reduce_tptg(lse.maxTotalThreadsPerThreadgroup(), w);
         dispatch_tg_1d(rt, &lse, n, tptg, None, |bnd| {
             set_gpu_buf(bnd, &logits.buffer, 0);
@@ -418,11 +447,16 @@ fn ce_rows(
             Reduction::Sum => g.scale,
         };
         let sgrad = rt.pipeline("ce_softmax_grad")?;
+        let logits16 = if bf16_ops {
+            Some(rt.alloc_tensor_unzeroed(&[n, widest], DType::BF16)?)
+        } else {
+            None
+        };
         for v0 in (0..vs).step_by(chunk) {
             let w = chunk.min(vs - v0);
             let wc = weight_chunk(v0, w)?;
             let logits = ws.logits.try_view(&[n, w], 0)?;
-            operands.nt(&h_rows, &wc, &logits)?;
+            operands.nt(h_op, &wc, &logits)?;
             dispatch_2d(rt, &sgrad, w, n, |bnd| {
                 set_gpu_buf(bnd, &logits.buffer, 0);
                 set_gpu_buf(bnd, &ws.m, 1);
@@ -434,19 +468,28 @@ fn ce_rows(
                 set_u32(bnd, v0 as u32, 7);
                 set_f32(bnd, scale, 8);
             })?;
+            // The two GEMMs below share one bf16 rounding of dlogits.
+            let dlogits = match &logits16 {
+                Some(l16) => {
+                    let d = l16.try_view(&[n, w], 0)?;
+                    cast_f32_to_bf16_into(&logits, &d)?;
+                    d
+                }
+                None => logits,
+            };
             // dh (+)= dlogits @ W_c: the first chunk writes, the rest add in
             // the GEMM.
             if v0 == 0 {
-                operands.nn(&logits, &wc, g.dh)?;
+                operands.nn(&dlogits, &wc, g.dh)?;
             } else {
-                operands.nn_acc(&logits, &wc, g.dh)?;
+                operands.nn_acc(&dlogits, &wc, g.dh)?;
             }
             // dW rows [v0, v0 + w) (+)= dlogitsᵀ @ h.
             let dw_rows = g.dw.try_view(&[w, hs], v0 * hs)?;
             if dw_add {
-                operands.tn_acc(&logits, &h_rows, &dw_rows)?;
+                operands.tn_acc(&dlogits, h_op, &dw_rows)?;
             } else {
-                operands.tn(&logits, &h_rows, &dw_rows)?;
+                operands.tn(&dlogits, h_op, &dw_rows)?;
             }
         }
     }

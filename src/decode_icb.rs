@@ -451,8 +451,8 @@ impl DecodeIcb {
             if let Some((i, cmd)) = commands.iter().enumerate().find(|(_, c)| c.incomplete_binds > 0) {
                 return Err(format!(
                     "DecodeIcb freeze_binds: command {i} has {} bind(s) that could not be \
-                     recorded (bound through bind_buf / bind_resource_id, which carry no \
-                     owning GpuBuffer). Freeze-binds writes the tape's binds into the ICB, \
+                     recorded (bound through bind_resource_id, which carries no owning \
+                     GpuBuffer). Freeze-binds writes the tape's binds into the ICB, \
                      so those slots would stay unwritten on every replay and pin nothing \
                      against recycling. Bind through bind_tensor or bind_gpu_buf.",
                     cmd.incomplete_binds

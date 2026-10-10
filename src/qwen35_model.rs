@@ -1047,7 +1047,7 @@ fn read_rows(x: &Tensor, precision: Precision) -> Result<Vec<f32>, String> {
     let n = x.shape.iter().product::<usize>();
     Ok(match precision {
         Precision::F32 => x.buffer.try_contents_f32()?[..n].to_vec(),
-        Precision::Bf16 => x.buffer.contents_u16()[..n]
+        Precision::Bf16 => x.buffer.try_contents_u16()?[..n]
             .iter()
             .map(|&b| crate::tensor::bf16_bits_to_f32(b))
             .collect(),

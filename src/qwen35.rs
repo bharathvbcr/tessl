@@ -467,10 +467,21 @@ pub(crate) fn place_linear_part<T: Copy>(
         // would still walk every one of `out` (possibly enormous) rows.
         return Ok(());
     }
-    for r in 0..out {
-        let src = &part[r * in_features..(r + 1) * in_features];
-        for (k, &v) in src.iter().enumerate() {
-            dst[k * total + col0 + r] = v;
+    // A transpose, in TILE x TILE blocks. Row by row, consecutive writes land
+    // `total` elements apart (16 KB and more for a real layer), so each one
+    // touched a fresh cache line; within a tile the destination lines stay in
+    // L1 across the tile's rows. Every element is written once with the same
+    // value as before, only in a different order.
+    const TILE: usize = 64;
+    for kb in (0..in_features).step_by(TILE) {
+        let kend = (kb + TILE).min(in_features);
+        for rb in (0..out).step_by(TILE) {
+            for r in rb..(rb + TILE).min(out) {
+                let src = &part[r * in_features + kb..r * in_features + kend];
+                for (k, &v) in (kb..kend).zip(src) {
+                    dst[k * total + col0 + r] = v;
+                }
+            }
         }
     }
     Ok(())

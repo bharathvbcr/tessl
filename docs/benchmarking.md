@@ -531,6 +531,25 @@ one-pass sampler is GPU-bound and unchanged. Per-token decode is GPU-bound too
 The sampler encode ratio is plotted at the file's "~0.02", not a per-run
 measurement.
 
+### Wave 2, 2026-10-10
+
+`bench/results/qwen35_train_step_wave2_m5pro.txt` pairs main (d57f4f7) with
+the wave-2 build (c5fd930) the same way, adding bf16 storage
+(`--storage=bf16`, a step into a bf16 bank) and a clipped optimizer step on
+it; load average 2–13. On bf16 storage the device peak is 1.9 GiB lower at
+the same step time; on f32 storage T = 2048 is 2% faster and 1 GiB lower,
+and T = 256 the same time but 1 GiB higher (the pool now caches the step's
+own buffers, see the file). `grad_sq_norm` falls from 320 waits to 1 and
+from 660–770 ms to 41–56 ms; the clipped step from 2.19–2.23 s to
+1.54–1.69 s under sync encode. `adamw_step` reads higher there without
+being slower, which the file traces. The file also records a first run that
+showed a bf16 regression and its cause, the pool cache pinned by the
+loader's staging tensor (fixed in b8d4010).
+`bench/results/qwen35_4b_storage_memory_wave2_m5pro.txt` is the 4B step's
+peak over resident to the byte (`probe_storage_memory --no-optimizer`):
+5.76 → 3.35 GiB at T = 2048, more than the 2.37 GiB f32 head gradient a
+bf16 bank no longer allocates.
+
 ## Every recorded result, plotted
 
 One figure per family of files in `bench/results/`. Blue always means the new

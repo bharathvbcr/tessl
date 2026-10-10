@@ -841,8 +841,15 @@ impl Qwen35Model {
         };
         let dxf = tensor(rt, &[tu, h])?;
         // Positions nothing scores keep a zero gradient row. Zeroed on the
-        // GPU: a host zero would wait for the whole forward first.
-        zero_part(rt, tensor_part(&dxf))?;
+        // GPU: a host zero would wait for the whole forward first. The causal
+        // loss writes rows `0..t - 1` in full (its first vocabulary chunk's
+        // GEMM overwrites them), so only the last row is zeroed there.
+        match (sup, tu) {
+            (Supervise::Causal, 1..) => {
+                zero_part(rt, (&dxf.buffer, dxf.byte_offset() + (tu - 1) * h * 4, h, DType::F32))?
+            }
+            _ => zero_part(rt, tensor_part(&dxf))?,
+        }
         let ce = |rows: &[u32], targets: &[u32], reduction, dh: &Tensor, scale| {
             let ws = CeWorkspace::new(
                 rt,

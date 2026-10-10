@@ -18,7 +18,8 @@ All notable changes to `tessl` are recorded here. The format follows
 - **Benchmarks:** `bench_qwen35_layers --paired-gate-up` and
   `--model-forward` (the model's prefill as METRIC lines for
   `bench/paired_bins.sh`),
-  `bench_qwen35_train --bf16-storage`, and op-table rows
+  `bench_qwen35_train --bf16-storage` (since the merge an alias for
+  `--storage=bf16`), and op-table rows
   for a bf16 layer input's widen, norm and copy.
   `tools/qwen35_ref/make_reference.py --ids` runs the transformers reference
   on given token ids.
@@ -232,6 +233,54 @@ All notable changes to `tessl` are recorded here. The format follows
 - **Host-only tests in CI.** The JSON parser tests, the loader's widen and
   transpose checks and AdamW's kernel-name table run on the hosted macOS
   `check` job, which needs no Metal device.
+- **`grad_sq_norm` is one command buffer and one wait.** It was a dispatch
+  per parameter (a waited commit each under sync encode: 320 on the 2B), a
+  read-back of every row's sum and an f64 sum on the host, with each dense
+  gradient (the whole `[vocab, hidden]` embedding) summed by one
+  threadgroup. Now `qwen35_sq_sum_pieces` sums every gradient's squares in
+  pieces of at most 4096 elements in one table-driven dispatch, and
+  `qwen35_sum_exact_f32` adds the pieces exactly in 128-bit fixed point
+  (integer arithmetic, so no order or fast math can change it), which the
+  host rounds to f64 once. The result is within 2^-18 relative of the exact
+  sum of the squares, and the exact sum rounded once wherever the pieces are
+  exact; on the tiny fixture its bits are unchanged. Replaces
+  `qwen35_sq_sum_rows_{f32,bf16}`. On the 2B (bf16 storage, T = 256) it
+  takes 41-56 ms where it took 660-770 ms, and a clipped optimizer step
+  2.19-2.23 -> 1.54-1.69 s under sync encode, 1.78-1.92 -> 1.33-1.35 s
+  under async (`bench/results/qwen35_train_step_wave2_m5pro.txt`).
+- **A bf16 bank takes the head gradient a chunk at a time.** A step into a
+  bf16 bank (or an f32 bank embedding that is a view) no longer allocates a
+  `[vocab, hidden]` f32 head gradient (2.0 GB on the 2B, 2.54 GB at the
+  4B's shapes): each cross-entropy chunk is rounded into the bank as its
+  GEMM produces it, and the step's token rows wait in f32 until the
+  embedding gather has added to them, so every element is still rounded
+  once (bit for bit as before on every entry point). The backward also
+  releases the final norm's three `[T, hidden]` tensors before the layers.
+  At the 4B's shapes the step's peak over resident falls 5.76 -> 3.35 GiB
+  at T = 2048 and 3.78 -> 1.40 GiB at T = 512
+  (`bench/results/qwen35_4b_storage_memory_wave2_m5pro.txt`); on the 2B
+  the device peak falls 1.9 GiB at the same step time.
+- **The pool cache makes room for a smaller freed buffer.** A buffer freed
+  into a full cache now evicts a larger cached one instead of being
+  released itself (the largest buffer freed is still released when it does
+  not fit). The cache never evicted, so a large buffer freed once and never
+  reused held it for good: loading the 2B leaves its f32 `[vocab, hidden]`
+  staging tensor (1.9 GB of the 2 GiB cap) there, after which a bf16-bank
+  training step released and re-created 668 buffers (6.8 GB) in its
+  backward alone. The cache now holds the step's own freed buffers, so on
+  the 2B an f32 step at T = 256 peaks 1 GiB higher (inside
+  `train_step_bytes`, which counts the cap) at the same time.
+- **`CeWorkspace` is per operand lane (breaking).** `CeWorkspace::new`,
+  `bytes_for` and `allocated_bytes_for` take the `GemmOperands` lane, and a
+  call on another lane is refused. On bf16 operands the workspace holds the
+  rows and one dlogits chunk rounded to bf16 and no f32 copy of a bf16
+  weight chunk (80 MiB at the 4B's shapes); the per-call bf16 temporaries
+  are gone. The C ABI keys its cached workspace on the lane.
+- **Bench and probe modes.** `bench_qwen35_train --storage=bf16` steps a
+  bf16-stored 2B into a bf16 bank (and clips with a Kahan, 8-bit AdamW);
+  `probe_storage_memory --no-optimizer` measures the step with no optimizer
+  resident, under a per-process footprint cap. `infer_trace`'s kernel trace
+  counts pipeline requests per kernel (`runtime::traced_kernel_count`).
 - **Qwen3.5 training step traffic.** Allocations a kernel writes in full
   are no longer zeroed on the host (808 allocations, 25.86 GB per 2B step at
   T = 2048); the step makes one attention workspace and uploads its indices

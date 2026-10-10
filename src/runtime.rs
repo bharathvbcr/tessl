@@ -285,12 +285,37 @@ impl BufferPool {
         Ok((b, false))
     }
 
+    /// Park `buffer` for reuse. One that does not fit under the cap evicts a
+    /// cached buffer larger than itself (the largest) and takes its place;
+    /// with nothing larger cached it is released. A large buffer freed once
+    /// and never asked for again (a loader's staging tensor: the 2B's f32
+    /// `[vocab, hidden]` is 1.9 GB of the 2 GiB cap) otherwise held the cap
+    /// for good, and every smaller buffer freed after it was released and
+    /// made again on its next use: 668 fresh buffers (6.8 GB) a Qwen3.5-2B
+    /// bf16-bank step's backward. The largest buffer freed is still released
+    /// when it does not fit, as before.
     fn recycle(&mut self, buffer: Retained<ProtocolObject<dyn MTLBuffer>>) {
         // Created at its bucket by `alloc`, so its length is its key.
         let key = buffer.length();
-        if key > self.max_cache_bytes.saturating_sub(self.cached_bytes) {
-            // Drop buffer (let ARC release) — over cache cap.
+        if key > self.max_cache_bytes {
             return;
+        }
+        if key > self.max_cache_bytes.saturating_sub(self.cached_bytes) {
+            let larger = self
+                .freelist
+                .iter()
+                .filter(|(&k, v)| k > key && !v.is_empty())
+                .map(|(&k, _)| k)
+                .max();
+            let Some(evict) = larger else {
+                // Drop buffer (let ARC release) — over cache cap.
+                return;
+            };
+            if let Some(v) = self.freelist.get_mut(&evict) {
+                v.pop();
+                self.cached_bytes = self.cached_bytes.saturating_sub(evict);
+            }
+            // The evicted buffer was larger, so this one now fits.
         }
         self.cached_bytes += key;
         self.freelist.entry(key).or_default().push(buffer);
@@ -721,21 +746,25 @@ pub struct GpuRuntime {
     poison_unzeroed: AtomicBool,
 }
 
-/// Kernel-use trace, gated on `TESSL_KERNEL_TRACE=1`.
+/// Kernel-use trace, gated on `TESSL_KERNEL_TRACE=1`: each kernel's
+/// pipeline requests, by name.
 ///
 /// Off by default and read through a `OnceLock`, so the cost on the dispatch
 /// path when disabled is one relaxed load.
 static KERNEL_TRACE_ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-static KERNEL_TRACE: std::sync::Mutex<std::collections::BTreeSet<String>> =
-    std::sync::Mutex::new(std::collections::BTreeSet::new());
+static KERNEL_TRACE: std::sync::Mutex<std::collections::BTreeMap<String, u64>> =
+    std::sync::Mutex::new(std::collections::BTreeMap::new());
 
 fn record_kernel_use(name: &str) {
     if !*KERNEL_TRACE_ON.get_or_init(|| std::env::var_os("TESSL_KERNEL_TRACE").is_some()) {
         return;
     }
-    if let Ok(mut set) = KERNEL_TRACE.lock() {
-        if !set.contains(name) {
-            set.insert(name.to_string());
+    if let Ok(mut counts) = KERNEL_TRACE.lock() {
+        match counts.get_mut(name) {
+            Some(n) => *n += 1,
+            None => {
+                counts.insert(name.to_string(), 1);
+            }
         }
     }
 }
@@ -747,8 +776,20 @@ fn record_kernel_use(name: &str) {
 pub fn traced_kernels() -> Vec<String> {
     KERNEL_TRACE
         .lock()
-        .map(|s| s.iter().cloned().collect())
+        .map(|s| s.keys().cloned().collect())
         .unwrap_or_default()
+}
+
+/// How many pipelines this process has requested for `name`, under
+/// `TESSL_KERNEL_TRACE` (0 without it). A request is not a dispatch: a
+/// caller may request once and dispatch many times. Ops that request their
+/// pipeline per call (the elementwise casts, for one) count their
+/// dispatches this way; difference two readings around the work.
+pub fn traced_kernel_count(name: &str) -> u64 {
+    KERNEL_TRACE
+        .lock()
+        .map(|s| s.get(name).copied().unwrap_or(0))
+        .unwrap_or(0)
 }
 
 /// Whether the trace is recording. Lets a caller distinguish "nothing

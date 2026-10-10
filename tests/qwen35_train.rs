@@ -630,6 +630,148 @@ fn a_bf16_step_peaks_under_its_bound_and_below_the_f32_steps() {
     }
 }
 
+/// A bank embedding the cross-entropy cannot write in place takes the
+/// head's gradient a chunk at a time, the step's token rows held back in f32
+/// until the embedding gather has added to them, so each element is still
+/// rounded once. Over three vocabulary chunks with tokens in each, and every
+/// way a step reaches a bank (a causal step, scored rows, a span step whose
+/// only loss is outside tessl): a bf16 bank's embedding is the f32 gradient
+/// (an f32 bank's, written in place) rounded to nearest, and accumulated,
+/// `bf16(bank + g)` with the add in f32, bit for bit; an f32 bank embedding
+/// that is a view (not a whole buffer, so also by chunk) holds the f32
+/// gradient, then the f32 sum, bit for bit.
+#[test]
+fn a_bank_embedding_by_chunk_rounds_each_element_once() {
+    let cfg = Qwen35Config {
+        vocab: 20_000,
+        ..tiny_config()
+    };
+    let (v, h) = (cfg.vocab as usize, cfg.hidden as usize);
+    let ids: Vec<u32> = (0..24u32).map(|i| (i * 7_919 + 3) % cfg.vocab).collect();
+    let (pos, tgt): (Vec<u32>, Vec<u32>) = (vec![2, 9, 17, 22], vec![5, 8_200, 16_400, 19_999]);
+    for precision in [Precision::Bf16, Precision::F32] {
+        let rt = GpuRuntime::new().unwrap();
+        let model = Qwen35Model::random_tower(&rt, cfg.clone(), precision, 11).unwrap();
+        let op = GemmOperands::Bf16;
+        let dh = rt.alloc_tensor_f32(&[pos.len(), h]).unwrap();
+        dh.write_f32(
+            &(0..pos.len() * h)
+                .map(|i| ((i % 13) as f32 - 6.0) * 1e-3)
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+        let step = |bank: &Qwen35Grads, entry: usize, add: bool| {
+            let rows = Supervise::Rows {
+                positions: &pos,
+                targets: &tgt,
+                scale: 0.5,
+            };
+            let none = Supervise::Rows {
+                positions: &[],
+                targets: &[],
+                scale: 1.0,
+            };
+            match entry {
+                0 => model.train_step_into(&ids, op, Supervise::Causal, bank, add).map(drop),
+                1 => model.train_step_into(&ids, op, rows, bank, add).map(drop),
+                _ => model
+                    .train_forward(&ids, op, none)
+                    .and_then(|p| model.train_backward_into(p, Some((&pos, &dh)), bank, add)),
+            }
+            .unwrap();
+        };
+        for (entry, name) in ["causal", "rows", "span"].iter().enumerate() {
+            let mut reference = Qwen35Grads::zeros_like(&model).unwrap();
+            reference.embed = rt.alloc_tensor_f32(&[v, h]).unwrap();
+            step(&reference, entry, false);
+            let g = reference.embed.read_f32().unwrap();
+            match precision {
+                Precision::Bf16 => {
+                    let bank = Qwen35Grads::zeros_like(&model).unwrap();
+                    assert_eq!(bank.embed.dtype, DType::BF16);
+                    let bits = |b: &Qwen35Grads| b.embed.buffer.contents_u16()[..v * h].to_vec();
+                    step(&bank, entry, false);
+                    let once: Vec<u16> = g.iter().map(|&x| f32_to_bf16_bits(x)).collect();
+                    assert!(
+                        bits(&bank) == once,
+                        "{name}: the bf16 bank is not the f32 gradient rounded once"
+                    );
+                    step(&bank, entry, true);
+                    let twice: Vec<u16> = once
+                        .iter()
+                        .zip(&g)
+                        .map(|(&r, &x)| f32_to_bf16_bits(bf16_bits_to_f32(r) + x))
+                        .collect();
+                    assert!(
+                        bits(&bank) == twice,
+                        "{name}: the accumulated bf16 bank is not bf16(bank + g)"
+                    );
+                }
+                Precision::F32 => {
+                    let mut bank = Qwen35Grads::zeros_like(&model).unwrap();
+                    let buf = rt.alloc_buffer((v * h + 64) * 4).unwrap();
+                    bank.embed = Tensor::from_buffer(&rt, buf, &[v, h], DType::F32, 64 * 4).unwrap();
+                    let bits = |b: &Qwen35Grads| {
+                        b.embed
+                            .read_f32()
+                            .unwrap()
+                            .iter()
+                            .map(|x| x.to_bits())
+                            .collect::<Vec<_>>()
+                    };
+                    step(&bank, entry, false);
+                    let once: Vec<u32> = g.iter().map(|x| x.to_bits()).collect();
+                    assert!(bits(&bank) == once, "{name}: the f32 view is not the f32 gradient");
+                    step(&bank, entry, true);
+                    let twice: Vec<u32> = g.iter().map(|&x| (x + x).to_bits()).collect();
+                    assert!(
+                        bits(&bank) == twice,
+                        "{name}: the accumulated f32 view is not the f32 sum"
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// On bf16 operands the cross-entropy's workspace holds the rows and one
+/// dlogits chunk rounded to bf16, and no f32 copy of a bf16 weight chunk,
+/// whose GEMMs take it as it is. Where the cross-entropy bounds the step
+/// (the tiny model at hidden 1024, so a `[8192, hidden]` chunk outweighs a
+/// layer), a bf16 model's bound is therefore below the exact lane's, which
+/// widens each weight chunk; it used to be above it (the widened chunk and
+/// every GEMM's bf16 copies of it). The measured peak stays under the
+/// smaller bound.
+#[test]
+fn a_bf16_steps_bound_holds_no_widened_weight_chunk() {
+    let cfg = Qwen35Config {
+        vocab: 16_384,
+        hidden: 1024,
+        ..tiny_config()
+    };
+    let rt = GpuRuntime::new().unwrap();
+    let model = Qwen35Model::random_tower(&rt, cfg.clone(), Precision::Bf16, 7).unwrap();
+    let bank = Qwen35Grads::zeros_like(&model).unwrap();
+    for t in [8u32, 33] {
+        let bf16 = model.train_step_bytes(t, GemmOperands::Bf16);
+        let exact = model.train_step_bytes(t, GemmOperands::ExactF32);
+        assert!(
+            bf16 < exact,
+            "T={t}: bf16 operands' bound {bf16} B not below exact f32's {exact} B"
+        );
+        let ids: Vec<u32> = (0..t).map(|i| (i * 7_919 + 3) % cfg.vocab).collect();
+        rt.synchronize().unwrap();
+        let before = rt.current_allocated_bytes();
+        rt.reset_peak_allocated_bytes();
+        model
+            .train_step_into(&ids, GemmOperands::Bf16, Supervise::Causal, &bank, false)
+            .unwrap();
+        let peak = rt.peak_allocated_bytes().saturating_sub(before);
+        eprintln!("T={t}: peak {peak} B, bound {bf16} B (exact lane's {exact} B)");
+        assert!(peak <= bf16, "T={t}: peak {peak} over the bound {bf16}");
+    }
+}
+
 /// The tiny model 24 layers deep in the 2B's layer pattern
 /// (`make_train_fixture.py tiny --layers 24 --out target/qwen35_train_deep`):
 /// how gradient agreement with transformers changes with depth alone, both
@@ -1346,7 +1488,7 @@ fn a_busy_or_poisoned_runtime_is_an_error_from_every_training_entry_point() {
         let dh = rt.alloc_tensor_f32(&[1, h]).unwrap();
         let dw = rt.alloc_tensor_f32(&[vocab, h]).unwrap();
         let dst = rt.alloc_tensor_f32(&[ids.len(), h]).unwrap();
-        let ce_ws = CeWorkspace::new(&rt, 1, cfg.hidden, cfg.vocab, DType::F32).unwrap();
+        let ce_ws = CeWorkspace::new(&rt, 1, cfg.hidden, cfg.vocab, DType::F32, mm).unwrap();
         let emb_ws = EmbedBwdWorkspace::new(&rt, ids.len() as u32).unwrap();
 
         let held = rt.alloc_buffer(4).unwrap();

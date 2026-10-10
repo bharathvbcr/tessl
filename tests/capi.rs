@@ -154,7 +154,7 @@ fn a_call_through_the_abi_is_the_rust_call() {
             rt.alloc_tensor_f32(&[n, h]).unwrap(),
             rt.alloc_tensor_f32(&[v, h]).unwrap(),
         );
-        let ws = CeWorkspace::new(rt, 4, h as u32, 128, DType::F32).unwrap();
+        let ws = CeWorkspace::new(rt, 4, h as u32, 128, DType::F32, GemmOperands::ExactF32).unwrap();
         let want = cross_entropy_rows(
             rt,
             CeHidden { rows: &ht, off: 0 },
@@ -203,7 +203,7 @@ fn a_call_through_the_abi_is_the_rust_call() {
             &targets,
             Reduction::Mean,
             GemmOperands::Bf16,
-            &ws,
+            &CeWorkspace::new(rt, 4, h as u32, 128, DType::F32, GemmOperands::Bf16).unwrap(),
             Some(CeGrads {
                 dh: &dh,
                 dw: &dw,

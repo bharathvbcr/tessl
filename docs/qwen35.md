@@ -909,10 +909,13 @@ operand copies and split-K scratch). Without async encode every dispatch waits, 
 two adjacent layers bound a window; with it, a step waits only at each
 attention layer, and the window is every layer from one attention layer to
 the next (a deliberate wait there, where a fresh workspace's host writes
-used to drain). `train_step_into` into an f32 bank writes the head gradient
-into the bank's embedding instead of holding it, and its pre-flight leaves
-it out; `train_step_bytes`, which also bounds `train_forward` followed by
-`train_backward_into`, still counts it. Against the measured peak (`GpuRuntime::peak_allocated_bytes`,
+used to drain). `train_step_into` never holds the head gradient whole: into
+an f32 bank the cross-entropy's GEMMs write it into the bank's embedding,
+and into a bf16 bank it goes a `[8192, hidden]` chunk at a time, each
+element rounded once, with the step's token rows held in f32 until the
+embedding gather has added to them. Its pre-flight counts that chunk and
+those rows instead; `train_step_bytes`, which also bounds `train_forward`
+followed by `train_backward_into`, still counts the whole tensor. Against the measured peak (`GpuRuntime::peak_allocated_bytes`,
 sampled at every buffer the pool creates) from an empty freelist, bank
 resident, no moments:
 
@@ -1180,7 +1183,13 @@ Memory at Qwen3.5-4B's shapes (`probe_storage_memory`, random weights;
 With Kahan and 8-bit moments resident, one training step plus one AdamW step
 on the 4B peaks at 35.28 GiB at T = 512 and 37.35 GiB at T = 2048 (the
 steps' own peaks 3.82 and 5.88 GiB, under their bounds of 6.29 and
-9.16 GiB).
+9.16 GiB). Since a bf16 bank takes the head gradient a chunk at a time rather than
+through an f32 `[vocab, hidden]` tensor, the step's own peak over what is
+resident is 1.40 GiB at T = 512 and 3.35 GiB at T = 2048 (was 3.78 and
+5.76 GiB measured the same way; `probe_storage_memory --no-optimizer`,
+`bench/results/qwen35_4b_storage_memory_wave2_m5pro.txt`), so with the
+Kahan and 8-bit state resident about 32.9 and 34.8 GiB (computed: this
+machine's 32 GiB per-process cap no longer lets the probe hold both).
 
 ## Performance
 

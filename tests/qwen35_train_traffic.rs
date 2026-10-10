@@ -344,7 +344,7 @@ fn the_step_adds_its_products_in_the_gemms() {
             let w = rt.alloc_tensor_f32(&[v, h]).unwrap();
             w.buffer
                 .write_f32(&(0..v * h).map(|i| (i % 5) as f32 * 0.01).collect::<Vec<_>>());
-            let ws = CeWorkspace::new(&rt, n as u32, h as u32, 16, DType::F32).unwrap();
+            let ws = CeWorkspace::new(&rt, n as u32, h as u32, 16, DType::F32, op).unwrap();
             let (dh, dw) = (
                 rt.alloc_tensor_f32(&[n, h]).unwrap(),
                 rt.alloc_tensor_f32(&[v, h]).unwrap(),
@@ -378,6 +378,142 @@ fn the_step_adds_its_products_in_the_gemms() {
             "the bf16 accumulate (the epilogue, beta = 1) never ran: {ran:?}"
         );
     });
+}
+
+/// On a bf16-stored model's lane (a bf16 weight, bf16 operands) the
+/// cross-entropy reads the weight as it is and rounds each f32 operand once:
+/// no `cast_bf16_to_f32` at all, and `cast_f32_to_bf16` once for the
+/// gathered rows plus once per vocabulary chunk for its dlogits (once in
+/// all without gradients). It used to widen each weight chunk to f32 in both
+/// walks for the GEMMs to round it back, and to round the rows for every
+/// GEMM and each dlogits chunk for two. In a whole bf16-storage step the
+/// only widening left is each layer's kept input, once, for its rebuild.
+#[test]
+fn a_bf16_storage_cross_entropy_casts_each_operand_once() {
+    in_traced_child("a_bf16_storage_cross_entropy_casts_each_operand_once", || {
+        let count = tessl::runtime::traced_kernel_count;
+        let (rt, model) = load(Precision::Bf16);
+        let op = GemmOperands::Bf16;
+        let (n, h, v, chunk) = (5usize, model.config().hidden as usize, 300usize, 64u32);
+        let hid = rt.alloc_tensor_f32(&[n + 2, h]).unwrap();
+        hid.buffer
+            .write_f32(&(0..(n + 2) * h).map(|i| (i % 7) as f32 * 0.1).collect::<Vec<_>>());
+        let w = rt.alloc_tensor_bf16(&[v, h]).unwrap();
+        w.buffer.write_bf16_bits(
+            &(0..v * h)
+                .map(|i| ((((i % 5) as f32 - 2.0) * 0.01).to_bits() >> 16) as u16)
+                .collect::<Vec<_>>(),
+        );
+        let ws = CeWorkspace::new(&rt, n as u32, h as u32, chunk, DType::BF16, op).unwrap();
+        let (dh, dw) = (
+            rt.alloc_tensor_f32(&[n, h]).unwrap(),
+            rt.alloc_tensor_f32(&[v, h]).unwrap(),
+        );
+        let rows: Vec<u32> = vec![0, 2, 4, 6, 1];
+        let targets: Vec<u32> = vec![0, 63, 64, 299, 150];
+        let chunks = v.div_ceil(chunk as usize) as u64;
+        for with_grads in [false, true] {
+            let (w0, n0) = (count("cast_bf16_to_f32"), count("cast_f32_to_bf16"));
+            let grads = with_grads.then_some(CeGrads {
+                dh: &dh,
+                dw: &dw,
+                scale: 1.0,
+            });
+            let hidden = CeHidden { rows: &hid, off: 0 };
+            cross_entropy_rows(&rt, hidden, &w, &rows, &targets, Reduction::Mean, op, &ws, grads).unwrap();
+            let (widened, rounded) = (count("cast_bf16_to_f32") - w0, count("cast_f32_to_bf16") - n0);
+            assert_eq!(
+                widened, 0,
+                "grads {with_grads}: the cross-entropy widened {widened} times"
+            );
+            let want = 1 + if with_grads { chunks } else { 0 };
+            assert_eq!(
+                rounded, want,
+                "grads {with_grads}: {rounded} roundings, want {want} (the rows once, each dlogits chunk once)"
+            );
+        }
+        let bank = Qwen35Grads::zeros_like(&model).unwrap();
+        let w0 = count("cast_bf16_to_f32");
+        model
+            .train_step_into(&ids(), op, Supervise::Causal, &bank, false)
+            .unwrap();
+        let widened = count("cast_bf16_to_f32") - w0;
+        let layers = model.config().layers.len() as u64;
+        assert_eq!(
+            widened, layers,
+            "a bf16-storage step widened {widened} times; only its {layers} kept layer inputs should be"
+        );
+    });
+}
+
+/// Into a bf16 bank the head's gradient goes a chunk at a time (one
+/// `qwen35_head_rows_to_bank_bf16` per vocabulary chunk, one here) and the
+/// step's token rows once the gather has added (one
+/// `qwen35_token_rows_to_bank_bf16`), so `qwen35_deliver_f32_to_bf16` runs
+/// only for the layers' five bf16 matrices each. It ran once more, for a
+/// `[vocab, hidden]` f32 embedding gradient delivered whole.
+#[test]
+fn a_bf16_bank_takes_the_head_gradient_by_chunk() {
+    in_traced_child("a_bf16_bank_takes_the_head_gradient_by_chunk", || {
+        let count = tessl::runtime::traced_kernel_count;
+        let (_rt, model) = load(Precision::Bf16);
+        let bank = Qwen35Grads::zeros_like(&model).unwrap();
+        let kernels = [
+            "qwen35_deliver_f32_to_bf16",
+            "qwen35_head_rows_to_bank_bf16",
+            "qwen35_token_rows_to_bank_bf16",
+        ];
+        let before = kernels.map(count);
+        model
+            .train_step_into(&ids(), GemmOperands::Bf16, Supervise::Causal, &bank, false)
+            .unwrap();
+        let ran = kernels.map(count);
+        let layers = model.config().layers.len() as u64;
+        let chunks = u64::from(model.config().vocab.div_ceil(8192));
+        assert_eq!(
+            [ran[0] - before[0], ran[1] - before[1], ran[2] - before[2]],
+            [5 * layers, chunks, 1],
+            "{kernels:?}"
+        );
+    });
+}
+
+/// A step into a bf16 bank holds no `[vocab, hidden]` f32 head gradient:
+/// its peak above what it starts with stays below that tensor's size (128
+/// MiB here; 2.0 GB on the 2B, 2.5 GB at the 4B's shapes), where the head
+/// gradient was a fresh f32 tensor rounded into the bank at the end. It
+/// holds one `[8192, hidden]` chunk of it instead (32 MiB), and the peak
+/// stays under the step's bound. The device's allocation counts every
+/// runtime in the process, so this holds the lock.
+#[test]
+fn a_bf16_bank_step_holds_no_f32_head_gradient() {
+    let _g = LOCK.lock().unwrap();
+    let cfg = Qwen35Config {
+        vocab: 32_768,
+        hidden: 1024,
+        ..Qwen35Config::from_config_file(&fixture().join("config.json")).unwrap()
+    };
+    let head = cfg.vocab as u64 * cfg.hidden as u64 * 4;
+    let rt = GpuRuntime::new().unwrap();
+    let model = Qwen35Model::random_tower(&rt, cfg.clone(), Precision::Bf16, 5).unwrap();
+    let bank = Qwen35Grads::zeros_like(&model).unwrap();
+    for t in [8u32, 64] {
+        let ids: Vec<u32> = (0..t).map(|i| (i * 7_919 + 3) % cfg.vocab).collect();
+        rt.synchronize().unwrap();
+        let before = rt.current_allocated_bytes();
+        rt.reset_peak_allocated_bytes();
+        model
+            .train_step_into(&ids, GemmOperands::Bf16, Supervise::Causal, &bank, false)
+            .unwrap();
+        let peak = rt.peak_allocated_bytes().saturating_sub(before);
+        let bound = model.train_step_bytes(t, GemmOperands::Bf16);
+        eprintln!("T={t}: peak {peak} B, the f32 head gradient {head} B, bound {bound} B");
+        assert!(
+            peak < head,
+            "T={t}: peak {peak} B is not below the f32 head gradient's {head} B"
+        );
+        assert!(peak <= bound, "T={t}: peak {peak} over the bound {bound}");
+    }
 }
 
 /// Every parameter's f32 bits, as `read_parameters` lays them out.
@@ -431,6 +567,39 @@ fn an_adamw_step_is_one_dispatch_and_waits_only_if_asked() {
         after[0] == after[1],
         "the unwaited step moved the parameters differently"
     );
+}
+
+/// `grad_sq_norm` is one command buffer: one table-driven dispatch over
+/// every gradient, and one that adds its pieces on the GPU. So it waits once
+/// in either encode mode, reads back five words rather than a value per row,
+/// and zeroes nothing on the host. It was a dispatch per parameter, each a
+/// wait under sync encode (27 here, 320 on the 2B), and a read of every
+/// row's sum.
+#[test]
+fn grad_sq_norm_is_one_command_buffer_and_one_wait() {
+    let _g = LOCK.lock().unwrap();
+    let ids = ids();
+    for (lane, precision, op) in lanes() {
+        let (rt, model) = load(precision);
+        let bank = Qwen35Grads::zeros_like(&model).unwrap();
+        model
+            .train_step_into(&ids, op, Supervise::Causal, &bank, false)
+            .unwrap();
+        let mut seen = Vec::new();
+        for batched in [false, true] {
+            rt.set_async_encode(batched).unwrap();
+            let (sq, s) = traced(|| model.grad_sq_norm(&bank).unwrap());
+            rt.set_async_encode(false).unwrap();
+            assert!(sq.is_finite() && sq > 0.0, "{lane}: {sq}");
+            assert_eq!(
+                (s.dispatches, s.commits, s.sync_waits, s.host_zeros),
+                (2, 1, 1, 0),
+                "{lane}, async {batched}: {s:?}"
+            );
+            seen.push(sq.to_bits());
+        }
+        assert_eq!(seen[0], seen[1], "{lane}: the encode mode changed the norm");
+    }
 }
 
 /// The step count of an unwaited step counts at once, and rolls back to the

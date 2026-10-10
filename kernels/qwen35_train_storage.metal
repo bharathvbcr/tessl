@@ -332,6 +332,14 @@ QWEN35_ADAMW_BF16_RULE(master, float, QWEN35_RULE_MASTER)
 QWEN35_ADAMW_BF16_RULE(kahan, bfloat, QWEN35_RULE_KAHAN)
 QWEN35_ADAMW_BF16_RULE(sr, float, QWEN35_RULE_SR)
 
+/// Bank element `d` takes the f32 gradient `s`: `s`, or with `add` the f32
+/// sum `d + s`, rounded to the bank's type once. `d` is read only to add.
+template <typename T>
+inline void qwen35_deliver_into(device T &d, float s, uint add)
+{
+    d = T(add != 0u ? float(d) + s : s);
+}
+
 /// `dst[i] (+)= src[i]` into bf16 from f32, one rounding per element: a
 /// gradient delivered into a bf16 bank. `add` reads the bank's value widened.
 kernel void qwen35_deliver_f32_to_bf16(
@@ -342,8 +350,82 @@ kernel void qwen35_deliver_f32_to_bf16(
     uint i [[thread_position_in_grid]])
 {
     if (i >= n) return;
-    dst[i] = bfloat(add != 0u ? float(dst[i]) + src[i] : src[i]);
+    qwen35_deliver_into(dst[i], src[i], add);
 }
+
+/// `row`'s index in `uniq` (sorted, distinct), or `n_uniq` when it is not
+/// there.
+inline uint qwen35_token_index(device const uint *uniq, uint n_uniq, uint row)
+{
+    uint lo = 0u, hi = n_uniq;
+    while (lo < hi) {
+        const uint mid = (lo + hi) >> 1;
+        if (uniq[mid] < row) {
+            lo = mid + 1u;
+        } else {
+            hi = mid;
+        }
+    }
+    return lo < n_uniq && uniq[lo] == row ? lo : n_uniq;
+}
+
+/// One chunk of a tied head's weight gradient into a bank embedding that
+/// cannot take it in place (bf16): vocabulary rows `[v0, v0 + w)` of `src`
+/// (f32 `[w, hidden]`, or zeros when `has_src` is 0) are delivered into
+/// `bank` (`qwen35_deliver_into`), except the step's token rows (`uniq`, sorted
+/// and distinct), whose gradient the embedding gather has yet to add to:
+/// those are copied unrounded into `side` (f32 `[n_uniq, hidden]`, row `u`
+/// for `uniq[u]`) for `qwen35_token_rows_to_bank` to deliver once the gather
+/// has added. So each bank element is rounded once per step.
+///
+/// Grid: x = column in [0, hidden), y = row of the chunk in [0, w).
+#define QWEN35_HEAD_ROWS_TO_BANK(NAME, T)                                                            \
+    kernel void NAME(                                                                                \
+        device const float *src [[buffer(0)]],                                                       \
+        device T *bank [[buffer(1)]],                                                                \
+        device const uint *uniq [[buffer(2)]],                                                       \
+        device float *side [[buffer(3)]],                                                            \
+        constant uint &n_uniq [[buffer(4)]],                                                         \
+        constant uint &v0 [[buffer(5)]],                                                             \
+        constant uint &w [[buffer(6)]],                                                              \
+        constant uint &hidden [[buffer(7)]],                                                         \
+        constant uint &add [[buffer(8)]],                                                            \
+        constant uint &has_src [[buffer(9)]],                                                        \
+        uint2 gid [[thread_position_in_grid]])                                                       \
+    {                                                                                                \
+        if (gid.x >= hidden || gid.y >= w) return;                                                   \
+        const float s = has_src != 0u ? src[(ulong)gid.y * hidden + gid.x] : 0.0f;                   \
+        const uint row = v0 + gid.y;                                                                 \
+        const uint u = qwen35_token_index(uniq, n_uniq, row);                                        \
+        if (u < n_uniq) {                                                                            \
+            side[(ulong)u * hidden + gid.x] = s;                                                     \
+        } else {                                                                                     \
+            qwen35_deliver_into(bank[(ulong)row * hidden + gid.x], s, add);                          \
+        }                                                                                            \
+    }
+
+/// The step's token rows into the bank: row `uniq[u]` takes `side[u]` (the
+/// head's gradient for that row plus the gather's), delivered once.
+///
+/// Grid: x = column in [0, hidden), y = u in [0, n_uniq).
+#define QWEN35_TOKEN_ROWS_TO_BANK(NAME, T)                                                           \
+    kernel void NAME(                                                                                \
+        device const float *side [[buffer(0)]],                                                      \
+        device T *bank [[buffer(1)]],                                                                \
+        device const uint *uniq [[buffer(2)]],                                                       \
+        constant uint &n_uniq [[buffer(3)]],                                                         \
+        constant uint &hidden [[buffer(4)]],                                                         \
+        constant uint &add [[buffer(5)]],                                                            \
+        uint2 gid [[thread_position_in_grid]])                                                       \
+    {                                                                                                \
+        if (gid.x >= hidden || gid.y >= n_uniq) return;                                              \
+        qwen35_deliver_into(bank[(ulong)uniq[gid.y] * hidden + gid.x], side[(ulong)gid.y * hidden + gid.x], add); \
+    }
+
+QWEN35_HEAD_ROWS_TO_BANK(qwen35_head_rows_to_bank_f32, float)
+QWEN35_HEAD_ROWS_TO_BANK(qwen35_head_rows_to_bank_bf16, bfloat)
+QWEN35_TOKEN_ROWS_TO_BANK(qwen35_token_rows_to_bank_f32, float)
+QWEN35_TOKEN_ROWS_TO_BANK(qwen35_token_rows_to_bank_bf16, bfloat)
 
 /// A `rows` x `width` window copied between two windows (each a leading
 /// dimension and a starting element), converting the element type: f32 to
@@ -367,38 +449,6 @@ kernel void qwen35_deliver_f32_to_bf16(
 QWEN35_WINDOW_CAST(qwen35_window_copy_f32_f32, float, float)
 QWEN35_WINDOW_CAST(qwen35_window_copy_bf16_f32, bfloat, float)
 QWEN35_WINDOW_CAST(qwen35_window_copy_f32_bf16, float, bfloat)
-
-/// `qwen35_sq_sum_rows_f32` over a bf16 window (a bf16 bank's gradient),
-/// each element widened: the same lanes, order and adds.
-kernel void qwen35_sq_sum_rows_bf16(
-    device const bfloat *g [[buffer(0)]],
-    device float *out [[buffer(1)]],
-    constant uint &width [[buffer(2)]],
-    constant uint &ld [[buffer(3)]],
-    constant uint &off [[buffer(4)]],
-    constant uint &out_off [[buffer(5)]],
-    uint r [[threadgroup_position_in_grid]],
-    uint t [[thread_index_in_threadgroup]],
-    uint lane [[thread_index_in_simdgroup]],
-    uint sg [[simdgroup_index_in_threadgroup]],
-    uint n_sg [[simdgroups_per_threadgroup]])
-{
-    threadgroup float part[32];
-    const ulong base = (ulong)r * ld + off;
-    float s = 0.0f;
-    for (ulong c = t; c < (ulong)width; c += 256ul) {
-        const float x = float(g[base + c]);
-        s = fma(x, x, s);
-    }
-    s = simd_sum(s);
-    if (lane == 0) part[sg] = s;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (t == 0) {
-        float total = 0.0f;
-        for (uint i = 0; i < n_sg; ++i) total += part[i];
-        out[out_off + r] = total;
-    }
-}
 
 /// An 8-bit moment written from, or read into, dense f32 values (a
 /// checkpoint): `first` picks the m code, else the v code (whose f32 value

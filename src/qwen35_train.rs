@@ -41,9 +41,10 @@ use std::sync::Arc;
 
 use crate::attn_train::{attn_train_backward, attn_train_forward, AttnTrainDims, AttnTrainGrads, AttnTrainWorkspace};
 use crate::cross_entropy::{
-    cross_entropy_rows, cross_entropy_rows_accumulating, gather_rows_f32, CeGrads, CeHidden, CeWorkspace, Reduction,
+    cross_entropy_rows, cross_entropy_rows_accumulating, cross_entropy_rows_chunked, gather_rows_f32, CeGrads,
+    CeHidden, CeWorkspace, Reduction,
 };
-use crate::dispatch::{dispatch_1d, set_gpu_buf_offset, set_u32};
+use crate::dispatch::{dispatch_1d, dispatch_2d, set_gpu_buf, set_gpu_buf_offset, set_u32};
 use crate::gdn_train::{
     gdn_train_backward, gdn_train_forward, GdnTrainDims, GdnTrainGrads, GdnTrainInputs, GdnTrainWorkspace, GDN_TRAIN_DK,
 };
@@ -315,11 +316,15 @@ pub struct PendingStep {
     dxf: Tensor,
     /// The LM head's weight gradient; none when the step scores nothing in
     /// tessl, whose embedding gradient is then the gather's alone, or when
-    /// the head went straight into the bank (`head_in_bank`).
+    /// the head went straight into the bank (`head_in_bank`, `token_rows`).
     d_embed: Option<Tensor>,
     /// The cross-entropy wrote (or added) the head gradient into the bank's
     /// f32 embedding itself, which the gather then adds onto.
     head_in_bank: bool,
+    /// The cross-entropy delivered the head gradient into a bank embedding
+    /// a chunk at a time ([`Head::ByChunk`]), all but these rows, the
+    /// step's tokens, which wait in f32 for the gather.
+    token_rows: Option<TokenRows>,
     loss: f64,
     /// The step's one attention workspace (a model with attention layers):
     /// every attention layer's forward, rebuild and backward use it.
@@ -397,6 +402,140 @@ fn zero_part(rt: &Arc<GpuRuntime>, (b, off, n, dtype): Part<'_>) -> Result<(), S
 /// (the gather's kernel addresses the buffer from its start).
 fn embed_in_place(t: &Tensor) -> bool {
     t.dtype == DType::F32 && t.byte_offset() == 0 && t.nbytes_logical() == t.buffer.nbytes()
+}
+
+/// Where a step's head gradient (the tied embedding's, from its loss) goes.
+#[derive(Clone, Copy)]
+enum Head<'a> {
+    /// A fresh f32 `[vocab, hidden]` tensor the pending step keeps: a step
+    /// whose gradients come back fresh, or [`Qwen35Model::train_forward`],
+    /// which does not know the bank yet.
+    Fresh,
+    /// Written (or added, `true`) by the cross-entropy's GEMMs into a bank's
+    /// f32 embedding, a whole buffer ([`embed_in_place`]), onto which the
+    /// gather then adds.
+    InPlace(&'a Tensor, bool),
+    /// Into any other bank embedding (bf16, or an f32 view), added to it
+    /// when `true`: a chunk at a time, each element rounded once
+    /// ([`head_rows_to_bank`]), but for the step's token rows
+    /// ([`TokenRows`]), which take the gather's gradient first. No
+    /// `[vocab, hidden]` f32 tensor (2 GB on the 2B, 2.5 GB at the 4B's
+    /// shapes).
+    ByChunk(&'a Tensor, bool),
+}
+
+/// [`Head`]'s kind, for [`Qwen35Model::step_bytes`].
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum HeadKind {
+    Fresh,
+    InPlace,
+    ByChunk,
+}
+
+impl Head<'_> {
+    fn kind(&self) -> HeadKind {
+        match self {
+            Self::Fresh => HeadKind::Fresh,
+            Self::InPlace(..) => HeadKind::InPlace,
+            Self::ByChunk(..) => HeadKind::ByChunk,
+        }
+    }
+}
+
+/// The rows of a bank embedding the embedding gather adds to (the step's
+/// distinct tokens) and their f32 gradient until it has: the head's part
+/// (or zero), then the gather's added, then delivered once
+/// ([`token_rows_to_bank`]).
+struct TokenRows {
+    /// The distinct ids, ascending, on the device.
+    uniq: GpuBuffer,
+    n_uniq: u32,
+    /// Each position's index into `uniq`: the gather's ids into `side`,
+    /// grouped in the order of the ids themselves, so each row's sum is
+    /// formed exactly as into the embedding.
+    compact: Vec<u32>,
+    /// f32 `[n_uniq, hidden]`: row `u` for vocabulary row `uniq[u]`.
+    side: Tensor,
+}
+
+impl TokenRows {
+    fn new(rt: &Arc<GpuRuntime>, ids: &[u32], hidden: usize) -> Result<Self, String> {
+        let mut uniq = ids.to_vec();
+        uniq.sort_unstable();
+        uniq.dedup();
+        let compact = ids
+            .iter()
+            .map(|id| uniq.binary_search(id).map(|u| u as u32))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|_| "TokenRows: an id missing from its own set".to_string())?;
+        Ok(Self {
+            uniq: rt.alloc_buffer_from_u32(&uniq)?,
+            n_uniq: uniq.len() as u32,
+            compact,
+            // Written in full before it is read: every token row lies in one
+            // head chunk, or is zeroed when the step has no head gradient.
+            side: rt.alloc_tensor_unzeroed(&[uniq.len(), hidden], DType::F32)?,
+        })
+    }
+}
+
+/// The bank kernel `base` for `bank`'s dtype.
+fn bank_kernel(base: &'static str, bank: &Tensor) -> Result<&'static str, String> {
+    Ok(match (base, bank.dtype) {
+        ("head", DType::F32) => "qwen35_head_rows_to_bank_f32",
+        ("head", DType::BF16) => "qwen35_head_rows_to_bank_bf16",
+        ("token", DType::F32) => "qwen35_token_rows_to_bank_f32",
+        ("token", DType::BF16) => "qwen35_token_rows_to_bank_bf16",
+        (_, d) => return Err(format!("the bank's embedding is {d:?}; f32 or bf16 only")),
+    })
+}
+
+/// Rows `[v0, v0 + w)` of the head's weight gradient (`src`, f32
+/// `[w, hidden]`; zeros when `None`) into `bank` (over it, or added when
+/// `add`, rounded once), but for `rows`' token rows, which go unrounded into
+/// `rows.side`.
+fn head_rows_to_bank(
+    rt: &Arc<GpuRuntime>,
+    bank: &Tensor,
+    add: bool,
+    rows: &TokenRows,
+    v0: usize,
+    w: usize,
+    src: Option<&Tensor>,
+) -> Result<(), String> {
+    let hidden = bank.shape()[1];
+    let p = rt.pipeline(bank_kernel("head", bank)?)?;
+    dispatch_2d(rt, &p, hidden, w, |bnd| {
+        match src {
+            Some(s) => set_gpu_buf_offset(bnd, &s.buffer, s.byte_offset(), 0),
+            // Never read without a source.
+            None => set_gpu_buf(bnd, &rows.uniq, 0),
+        }
+        set_gpu_buf_offset(bnd, &bank.buffer, bank.byte_offset(), 1);
+        set_gpu_buf(bnd, &rows.uniq, 2);
+        set_gpu_buf_offset(bnd, &rows.side.buffer, rows.side.byte_offset(), 3);
+        set_u32(bnd, rows.n_uniq, 4);
+        set_u32(bnd, v0 as u32, 5);
+        set_u32(bnd, w as u32, 6);
+        set_u32(bnd, hidden as u32, 7);
+        set_u32(bnd, u32::from(add), 8);
+        set_u32(bnd, u32::from(src.is_some()), 9);
+    })
+}
+
+/// `rows.side` into the bank's token rows, rounded once (added to the
+/// bank when `add`).
+fn token_rows_to_bank(rt: &Arc<GpuRuntime>, bank: &Tensor, add: bool, rows: &TokenRows) -> Result<(), String> {
+    let hidden = bank.shape()[1];
+    let p = rt.pipeline(bank_kernel("token", bank)?)?;
+    dispatch_2d(rt, &p, hidden, rows.n_uniq as usize, |bnd| {
+        set_gpu_buf_offset(bnd, &rows.side.buffer, rows.side.byte_offset(), 0);
+        set_gpu_buf_offset(bnd, &bank.buffer, bank.byte_offset(), 1);
+        set_gpu_buf(bnd, &rows.uniq, 2);
+        set_u32(bnd, rows.n_uniq, 3);
+        set_u32(bnd, hidden as u32, 4);
+        set_u32(bnd, u32::from(add), 5);
+    })
 }
 
 /// What [`Qwen35Model::train_step`] returns.
@@ -642,10 +781,13 @@ impl Qwen35Model {
     /// sequences sum in place. Each layer's gradients go into the bank as
     /// soon as its backward is encoded and is then released: its buffers go
     /// back to the pool at the next GPU wait (a few layers' on Qwen3.5, every
-    /// layer's on a model with no wait inside the backward), plus the 2 GB
-    /// embedding's on the 2B, rather than a second copy of every gradient
-    /// held to the end. The bank is checked against the model before anything
-    /// runs. `sup` says what the loss scores; returns that loss.
+    /// layer's on a model with no wait inside the backward), rather than a
+    /// second copy of every gradient held to the end. The embedding's
+    /// gradient (the tied head's and the gather's) is never a tensor of its
+    /// own (2 GB on the 2B): an f32 bank takes it in place, a bf16 bank a
+    /// vocabulary chunk at a time, each element rounded once. The bank is
+    /// checked against the model before anything runs. `sup` says what the
+    /// loss scores; returns that loss.
     pub fn train_step_into(
         &self,
         ids: &[u32],
@@ -705,9 +847,11 @@ impl Qwen35Model {
         sup: Supervise<'_>,
         bank: Option<(&Qwen35Grads, bool)>,
     ) -> Result<(f64, Option<Qwen35Grads>), String> {
-        let head = bank
-            .filter(|(b, _)| embed_in_place(&b.embed))
-            .map(|(b, add)| (&b.embed, add));
+        let head = match bank {
+            None => Head::Fresh,
+            Some((b, add)) if embed_in_place(&b.embed) => Head::InPlace(&b.embed, add),
+            Some((b, add)) => Head::ByChunk(&b.embed, add),
+        };
         let p = self.step_forward(ids, operands, sup, bank.is_none(), head)?;
         let loss = p.loss;
         Ok((loss, self.backward(p, None, bank)?))
@@ -729,21 +873,21 @@ impl Qwen35Model {
         operands: GemmOperands,
         sup: Supervise<'_>,
     ) -> Result<PendingStep, String> {
-        self.step_forward(ids, operands, sup, false, None)
+        self.step_forward(ids, operands, sup, false, Head::Fresh)
     }
 
     /// [`Self::train_forward`]; `fresh` when the backward will return fresh
     /// gradients rather than deliver them into a bank, which the pre-flight
-    /// then counts too. `head` is the bank's f32 embedding (and whether to
-    /// add into it) when the head gradient goes straight there: no
-    /// `[vocab, hidden]` tensor and no copy of it (2 GB on the 2B).
+    /// then counts too. `head` says where the head gradient goes: into a
+    /// bank's embedding, there is no `[vocab, hidden]` tensor and no copy of
+    /// it (2 GB on the 2B).
     fn step_forward(
         &self,
         ids: &[u32],
         operands: GemmOperands,
         sup: Supervise<'_>,
         fresh: bool,
-        head: Option<(&Tensor, bool)>,
+        head: Head<'_>,
     ) -> Result<PendingStep, String> {
         const WHAT: &str = "Qwen35Model::train_step";
         // Read before any weight is: a write that lands during the forward
@@ -810,7 +954,7 @@ impl Qwen35Model {
         id_buf.try_write_u32(ids)?;
         let (have, need) = (
             rt.current_allocated_bytes(),
-            self.step_bytes(t, operands, fresh, head.is_none()),
+            self.step_bytes(t, operands, fresh, head.kind()),
         );
         let limit = rt.memory_info().recommended_working_set;
         if have.saturating_add(need) > limit {
@@ -863,8 +1007,13 @@ impl Qwen35Model {
 
         // ---- loss and the LM head ------------------------------------------
         let scores = !matches!(sup, Supervise::Rows { positions: [], .. });
-        let d_embed = if scores && head.is_none() {
+        let d_embed = if scores && head.kind() == HeadKind::Fresh {
             Some(tensor(rt, &[cfg.vocab as usize, h])?)
+        } else {
+            None
+        };
+        let token_rows = if scores && head.kind() == HeadKind::ByChunk {
+            Some(TokenRows::new(rt, ids, h)?)
         } else {
             None
         };
@@ -880,18 +1029,36 @@ impl Qwen35Model {
             _ => zero_part(rt, tensor_part(&dxf))?,
         }
         let ce = |rows: &[u32], targets: &[u32], reduction, dh: &Tensor, scale| {
-            let ws = CeWorkspace::new(
-                rt,
-                rows.len() as u32,
-                cfg.hidden,
-                CE_CHUNK.min(cfg.vocab),
-                self.embed.dtype,
-            )?;
+            let chunk = CE_CHUNK.min(cfg.vocab);
+            let ws = CeWorkspace::new(rt, rows.len() as u32, cfg.hidden, chunk, self.embed.dtype, operands)?;
             let hidden = CeHidden { rows: &xf, off: 0 };
             let (dw, add) = match (head, &d_embed) {
-                (Some((bank, add)), _) => (bank, add),
-                (None, Some(d)) => (d, false),
-                (None, None) => return Err("a scored step has a head gradient".to_string()),
+                (Head::InPlace(bank, add), _) => (bank, add),
+                (Head::Fresh, Some(d)) => (d, false),
+                (Head::ByChunk(bank, add), _) => {
+                    let tr = token_rows.as_ref().ok_or("a scored step has its token rows")?;
+                    // Each chunk's rows, written by its GEMM and delivered
+                    // before the next chunk's overwrites them.
+                    let scratch = tensor(rt, &[chunk as usize, h])?;
+                    let mut sink = |v0: usize, rows: &Tensor| {
+                        head_rows_to_bank(rt, bank, add, tr, v0, rows.shape()[0], Some(rows))
+                    };
+                    return cross_entropy_rows_chunked(
+                        rt,
+                        hidden,
+                        &self.embed,
+                        rows,
+                        targets,
+                        reduction,
+                        operands,
+                        &ws,
+                        dh,
+                        scale,
+                        &scratch,
+                        &mut sink,
+                    );
+                }
+                (Head::Fresh, None) => return Err("a scored step has a head gradient".to_string()),
             };
             let grads = CeGrads { dh, dw, scale };
             if add {
@@ -939,7 +1106,8 @@ impl Qwen35Model {
             xf,
             dxf,
             d_embed,
-            head_in_bank: scores && head.is_some(),
+            head_in_bank: scores && head.kind() == HeadKind::InPlace,
+            token_rows,
             loss,
             attn_ws,
             embed: self.embed.buffer.clone(),
@@ -1016,9 +1184,15 @@ impl Qwen35Model {
             dxf,
             d_embed,
             head_in_bank,
+            token_rows,
             attn_ws,
+            xf,
             ..
         } = p;
+        // The final norm's output fed the loss, which is done: released now
+        // rather than held through the backward (a [T, hidden] f32 tensor,
+        // which the layers' own then reuse).
+        drop(xf);
         let h = cfg.hidden as usize;
         if let Some((pos, g)) = dh {
             scatter_add_rows(rt, g, pos, &dxf)?;
@@ -1040,6 +1214,9 @@ impl Qwen35Model {
             cfg.rms_norm_eps,
             false,
         )?;
+        // The final norm's input and the gradient at its output are read
+        // there alone: released before the layers' backward, as `xf` was.
+        drop((resid, dxf));
         if let Some((b, add)) = bank {
             deliver(rt, &[buf_part(&final_norm)], &[buf_part(&b.final_norm)], add)?;
         }
@@ -1072,8 +1249,10 @@ impl Qwen35Model {
         // embedding is a whole buffer it adds straight into the bank: onto
         // the head gradient the cross-entropy already wrote there, or, with
         // no head gradient, onto the bank zeroed first unless accumulating.
-        // No 2 GB tensor and no copy on the 2B. A bf16 bank takes it through
-        // an f32 tensor, rounded once on delivery.
+        // Into any other bank (bf16) it adds onto the token rows' f32
+        // gradient the cross-entropy held back, which then goes into the
+        // bank rounded once; every other row took the head's gradient
+        // already, or takes none. No 2 GB tensor and no copy on the 2B.
         let (dw, direct) = match (d_embed, bank) {
             (Some(d), _) => (d, false),
             (None, Some((b, add))) if embed_in_place(&b.embed) => {
@@ -1082,7 +1261,34 @@ impl Qwen35Model {
                 }
                 (b.embed.clone(), true)
             }
-            (None, _) => {
+            (None, Some((b, add))) => {
+                let rows = match token_rows {
+                    Some(rows) => rows,
+                    // No head gradient: the token rows start at zero, and
+                    // the other rows take nothing (zero, over the bank).
+                    None => {
+                        let rows = TokenRows::new(rt, &ids, h)?;
+                        if add {
+                            zero_part(rt, tensor_part(&rows.side))?;
+                        } else {
+                            head_rows_to_bank(rt, &b.embed, false, &rows, 0, cfg.vocab as usize, None)?;
+                        }
+                        rows
+                    }
+                };
+                embed_rows_bwd_once(
+                    rt,
+                    &rows.compact,
+                    &sc.dresid.buffer,
+                    &rows.side.buffer,
+                    rows.n_uniq,
+                    cfg.hidden,
+                )?;
+                token_rows_to_bank(rt, &b.embed, add, &rows)?;
+                rt.synchronize()?;
+                return Ok(None);
+            }
+            (None, None) => {
                 let d = tensor(rt, &[cfg.vocab as usize, h])?;
                 zero_part(rt, tensor_part(&d))?;
                 (d, false)
@@ -1189,6 +1395,9 @@ impl Qwen35Model {
     /// [`Self::train_backward_into`]) that scores its rows, so it holds the
     /// `[vocab, hidden]` head gradient. Every buffer counts at the size the
     /// pool makes it ([`GpuRuntime::allocated_bytes_for`]).
+    /// [`Self::train_step_into`] alone holds less: an f32 bank takes the head
+    /// gradient in place, a bf16 bank a chunk at a time (its own pre-flight
+    /// counts what it holds).
     ///
     /// A freed buffer stays allocated until the next waited commit. Without
     /// async encode (the default) every dispatch is one, so a layer's
@@ -1208,15 +1417,18 @@ impl Qwen35Model {
     /// and the device's current allocation exceed its recommended working
     /// set.
     pub fn train_step_bytes(&self, t: u32, operands: GemmOperands) -> u64 {
-        self.step_bytes(t, operands, false, true)
+        self.step_bytes(t, operands, false, HeadKind::Fresh)
     }
 
     /// [`Self::train_step_bytes`]; `fresh` adds every layer's gradients held
     /// to the end, as [`Self::train_step`] returns them instead of
-    /// delivering each into a bank, and `head` the `[vocab, hidden]` head
-    /// gradient, which [`Self::train_step_into`] writes straight into an f32
-    /// bank instead.
-    fn step_bytes(&self, t: u32, mm: GemmOperands, fresh: bool, head: bool) -> u64 {
+    /// delivering each into a bank, and `head` is where the head gradient
+    /// goes: a `[vocab, hidden]` tensor held to the end ([`Head::Fresh`],
+    /// what [`Self::train_forward`] makes, so what the public bound counts),
+    /// nothing beyond the bank ([`Head::InPlace`]), or one `[chunk, hidden]`
+    /// chunk through the cross-entropy and the token rows held to the end
+    /// ([`Head::ByChunk`]).
+    fn step_bytes(&self, t: u32, mm: GemmOperands, fresh: bool, head: HeadKind) -> u64 {
         let (cfg, tu) = (&self.cfg, t as usize);
         let (h, v) = (cfg.hidden as usize, cfg.vocab as usize);
         let f = |n: usize| GpuRuntime::allocated_bytes_for(n.saturating_mul(4), BufferKind::Cold);
@@ -1239,11 +1451,17 @@ impl Qwen35Model {
         } else {
             0
         };
+        // At most `t` distinct tokens: their f32 rows and their ids.
+        let head_held = match head {
+            HeadKind::Fresh => f(v * h),
+            HeadKind::InPlace => 0,
+            HeadKind::ByChunk => sum(&[th, f(tu)]),
+        };
         let held = sum(&[
             f(tu),
             kept.saturating_mul(layers),
             th.saturating_mul(3),
-            if head { f(v * h) } else { 0 },
+            head_held,
             attn_ws,
         ]);
         let fwd: Vec<u64> = self
@@ -1292,7 +1510,13 @@ impl Qwen35Model {
                 .map(is_attn)
                 .zip(bwd.iter().rev().map(|&(_, b)| b)),
         );
-        let ce = self.ce_bytes(t, mm, batched);
+        let ce = self
+            .ce_bytes(t, mm, batched)
+            .saturating_add(if head == HeadKind::ByChunk {
+                f(CE_CHUNK.min(cfg.vocab) as usize * h)
+            } else {
+                0
+            });
         let backward_held = sum(&[
             self.scratch_bytes(t),
             f(h),
@@ -1481,14 +1705,19 @@ impl Qwen35Model {
         let (n, h) = (t as usize, cfg.hidden as usize);
         let chunk = CE_CHUNK.min(cfg.vocab);
         let tc = self.rt.has_tensorops();
-        let per_chunk = |w: usize| {
-            [
+        // Exact f32: every operand is f32 (a bf16 weight chunk widened in
+        // the workspace). bf16 operands: every operand reaches its GEMM
+        // already bf16 (rounded once into the workspace, or the bf16
+        // weight itself), so the GEMMs copy nothing.
+        let per_chunk = |w: usize| match mm {
+            GemmOperands::Bf16 => 0,
+            GemmOperands::ExactF32 => [
                 2 * mm.nt_scratch_bytes(tc, n, w, h, DType::F32),
                 mm.nn_scratch_bytes(n, h, w, DType::F32),
                 mm.tn_scratch_bytes(tc, w, h, n),
             ]
             .iter()
-            .fold(0u64, |a, &b| a.saturating_add(b))
+            .fold(0u64, |a, &b| a.saturating_add(b)),
         };
         let (full, rest) = ((cfg.vocab / chunk) as u64, (cfg.vocab % chunk) as usize);
         let gemms = if batched {
@@ -1499,7 +1728,7 @@ impl Qwen35Model {
             per_chunk(chunk as usize)
         };
         [
-            CeWorkspace::allocated_bytes_for(t, cfg.hidden, chunk, self.embed.dtype),
+            CeWorkspace::allocated_bytes_for(t, cfg.hidden, chunk, self.embed.dtype, mm),
             gemms,
             GpuRuntime::allocated_bytes_for(n * h * 4, BufferKind::Cold),
         ]

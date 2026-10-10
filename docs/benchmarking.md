@@ -21,7 +21,7 @@ you changed in the kernel.**
 | `bench/paired_cross_runtime.py` | Alternates the tessl and PyTorch/MLX lanes round by round. |
 | `bench_embedgemma2` | EmbeddingGemma 2 `encode` latency and device/process peak memory on the real checkpoint, uniform and ragged batches, JSON out. |
 | `bench_paired` | Alternates any lanes that print `bench_embedgemma2`'s JSON round by round: tessl against `bench/embedgemma2_torch.py` (sentence-transformers on MPS), or two builds of `bench_embedgemma2` for a before/after A/B. |
-| `bench_qwen35_train` | Qwen3.5-2B training ops, and with the checkpoint one whole `train_step` (`--step`, `--async`, `--bf16-storage` for the bf16 tower), a clipped optimizer step (`--clip`), or a row-by-row batch (`--batch`), each with its host waits and device peak. |
+| `bench_qwen35_train` | Qwen3.5-2B training ops, and with the checkpoint one whole `train_step` (`--step`, `--async`, `--storage=bf16` for the bf16 tower), a clipped optimizer step (`--clip`), or a row-by-row batch (`--batch`), each with its host waits and device peak. |
 | `bench/paired_qwen35_step.sh` | Interleaves `bench_qwen35_train --step` configurations (T, `TESSL_MID_COMMIT`, encode mode) one process each, and with `BENCH_BINS` a before and an after binary, round by round; min-of-N with peak memory. |
 
 ```mermaid
@@ -530,6 +530,25 @@ one-pass sampler is GPU-bound and unchanged. Per-token decode is GPU-bound too
 (wall 0.998x), so no decode speedup is claimed; the change there is structural.
 The sampler encode ratio is plotted at the file's "~0.02", not a per-run
 measurement.
+
+### Wave 2, 2026-10-10
+
+`bench/results/qwen35_train_step_wave2_m5pro.txt` pairs main (d57f4f7) with
+the wave-2 build (c5fd930) the same way, adding bf16 storage
+(`--storage=bf16`, a step into a bf16 bank) and a clipped optimizer step on
+it; load average 2–13. On bf16 storage the device peak is 1.9 GiB lower at
+the same step time; on f32 storage T = 2048 is 2% faster and 1 GiB lower,
+and T = 256 the same time but 1 GiB higher (the pool now caches the step's
+own buffers, see the file). `grad_sq_norm` falls from 320 waits to 1 and
+from 660–770 ms to 41–56 ms; the clipped step from 2.19–2.23 s to
+1.54–1.69 s under sync encode. `adamw_step` reads higher there without
+being slower, which the file traces. The file also records a first run that
+showed a bf16 regression and its cause, the pool cache pinned by the
+loader's staging tensor (fixed in b8d4010).
+`bench/results/qwen35_4b_storage_memory_wave2_m5pro.txt` is the 4B step's
+peak over resident to the byte (`probe_storage_memory --no-optimizer`):
+5.76 → 3.35 GiB at T = 2048, more than the 2.37 GiB f32 head gradient a
+bf16 bank no longer allocates.
 
 ## Every recorded result, plotted
 

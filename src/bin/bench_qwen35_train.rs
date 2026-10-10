@@ -7,9 +7,10 @@
 //! cargo run --release --bin bench_qwen35_train -- --check-only  # the gate, no timing
 //! QWEN35_2B_SAFETENSORS=... cargo run --release --bin bench_qwen35_train -- --step=2048
 //! cargo run --release --bin bench_qwen35_train -- --bf16        # bf16 GEMM operands
-//! QWEN35_2B_SAFETENSORS=... cargo run --release --bin bench_qwen35_train -- --bf16-storage --step-only --step=2048
+//! QWEN35_2B_SAFETENSORS=... cargo run --release --bin bench_qwen35_train -- --storage=bf16 --step-only --step=2048
 //! QWEN35_2B_SAFETENSORS=... cargo run --release --bin bench_qwen35_train -- 2048 --step-only --step=2048 --async
 //! QWEN35_2B_SAFETENSORS=... cargo run --release --bin bench_qwen35_train -- 256 --step-only --clip=256
+//! QWEN35_2B_SAFETENSORS=... cargo run --release --bin bench_qwen35_train -- 256 --step-only --step=256 --storage=bf16
 //! ```
 //!
 //! Shapes are Qwen3.5-2B's `text_config` (hidden 2048, 16 GDN heads of 128,
@@ -49,11 +50,6 @@
 //! untimed step's host waits on the GPU, commits, dispatches and fresh
 //! buffer allocations ([`tessl::infer_trace`]).
 //!
-//! `--bf16-storage` loads the checkpoint as a `Precision::Bf16` tower
-//! (`Qwen35Model::load_tower`: bf16 matrices and saved layer inputs, see
-//! docs/qwen35.md "Training on bf16 storage") for `--step`, `--clip` and
-//! `--batch`, and implies `--bf16`.
-//!
 //! `--async` runs the step under [`GpuRuntime::set_async_encode`] (one command
 //! buffer between the waits the step itself makes); without it every
 //! dispatch is a waited commit, as on a runtime nobody switched (ojas-qwen35's
@@ -65,6 +61,16 @@
 //! and host waits counted (median of 3 after one warm-up). It holds the bank
 //! and f32 AdamW moments beside the model (4 parameter copies, ~30 GB on the
 //! 2B).
+//!
+//! `--storage=bf16` loads the checkpoint stored in bf16 (`load_tower`: its
+//! matrices bf16, which only bf16 GEMM operands train, so it implies
+//! `--bf16`), the storage the 4B fits in. Its `--step` times
+//! `train_step_into` a bf16 gradient bank, overwritten each step, as a
+//! trainer on that storage runs it (a fresh step's f32 gradients would hold
+//! twice the bank); its `--clip` keeps a Kahan, 8-bit-moment AdamW
+//! (`probe_storage_memory`'s 4B configuration). `--batch` stays f32-only.
+//! `--bf16-storage` is the same as `--storage=bf16` (see docs/qwen35.md
+//! "Training on bf16 storage").
 //!
 //! Before anything is timed, every op runs once with its outputs pre-filled
 //! with NaN, and every output must come back finite: an op that silently
@@ -81,14 +87,14 @@ use tessl::gdn_train::{
 };
 use tessl::gemm::{cast_bf16_to_f32_into, GemmOperands};
 use tessl::qwen35::{rms_norm, AttnShape, Cols, GdnGateLogits, GdnParams};
-use tessl::qwen35_adamw::{AdamW, AdamWHyper};
+use tessl::qwen35_adamw::{AdamW, AdamWConfig, AdamWHyper, MomentStorage, UpdateRule};
 use tessl::qwen35_bwd::{
     attn_qk_norm_rope_bwd, attn_qk_norm_rope_bwd_part_len, conv1d_silu_bwd, conv1d_silu_bwd_part_len, copy_cols,
     embed_rows_bwd, gated_rms_norm_bwd, gated_rms_norm_bwd_part_len, gdn_gates_bwd, gdn_gates_bwd_part_len,
     rms_norm_bwd, rms_norm_bwd_part_len, swiglu_bwd, AttnQkvGrads, EmbedBwdWorkspace,
 };
 use tessl::qwen35_model::{Precision, Qwen35Config, Qwen35Model};
-use tessl::qwen35_train::Qwen35Grads;
+use tessl::qwen35_train::{Qwen35Grads, Supervise};
 use tessl::safetensors::SafeTensors;
 use tessl::tensor::{f32_slice_to_bf16, GpuBuffer};
 use tessl::{DType, GpuRuntime, Tensor};
@@ -288,7 +294,7 @@ fn bench_t(rt: &Arc<GpuRuntime>, t: usize, check_only: bool, operands: GemmOpera
     );
     let rows: Vec<u32> = (0..t32 - 1).collect();
     let targets: Vec<u32> = (0..t32 - 1).map(|i| (i * 7919) % VOCAB as u32).collect();
-    let ce_ws = CeWorkspace::new(rt, t32 - 1, HIDDEN as u32, CE_CHUNK, DType::BF16)?;
+    let ce_ws = CeWorkspace::new(rt, t32 - 1, HIDDEN as u32, CE_CHUNK, DType::BF16, operands)?;
     let (dh, dw) = (
         rt.alloc_tensor_f32(&[t - 1, HIDDEN])?,
         rt.alloc_tensor_f32(&[VOCAB, HIDDEN])?,
@@ -656,17 +662,25 @@ fn bench_t(rt: &Arc<GpuRuntime>, t: usize, check_only: bool, operands: GemmOpera
     Ok(())
 }
 
-/// The real 2B checkpoint: in f32, or with `bf16_storage` as the bf16 tower
-/// training on bf16 storage loads.
-fn load_2b(rt: &Arc<GpuRuntime>, bf16_storage: bool) -> Res<Qwen35Model> {
+/// The real 2B checkpoint, stored in `precision` (bf16 as a training
+/// tower, without the LM head's packed copy).
+fn load_2b(rt: &Arc<GpuRuntime>, precision: Precision) -> Res<Qwen35Model> {
     let path = std::env::var("QWEN35_2B_SAFETENSORS")
         .map_err(|_| "--step and --batch need QWEN35_2B_SAFETENSORS (the Qwen3.5-2B-Base .safetensors)".to_string())?;
     let st = SafeTensors::open(std::path::Path::new(&path))?;
     let (prefix, cfg) = ("model.language_model.", Qwen35Config::qwen35_2b()?);
-    if bf16_storage {
-        Qwen35Model::load_tower(rt, &st, prefix, cfg, Precision::Bf16)
-    } else {
-        Qwen35Model::load(rt, &st, prefix, cfg, Precision::F32)
+    match precision {
+        Precision::F32 => Qwen35Model::load(rt, &st, prefix, cfg, precision),
+        Precision::Bf16 => Qwen35Model::load_tower(rt, &st, prefix, cfg, precision),
+    }
+}
+
+/// One timed step on `ids`: a fresh `train_step` on an f32-stored model;
+/// `train_step_into` `bank` (overwritten) on a bf16-stored one.
+fn one_step(model: &Qwen35Model, ids: &[u32], operands: GemmOperands, bank: Option<&Qwen35Grads>) -> Res<f64> {
+    match bank {
+        None => Ok(model.train_step(ids, operands)?.loss),
+        Some(b) => model.train_step_into(ids, operands, Supervise::Causal, b, false),
     }
 }
 
@@ -702,20 +716,25 @@ fn gib(b: u64) -> f64 {
 
 fn bench_step(rt: &Arc<GpuRuntime>, model: &Qwen35Model, tokens: usize, operands: GemmOperands) -> Res<()> {
     let ids: Vec<u32> = (0..tokens as u32).map(|i| (i * 104_729 + 17) % VOCAB as u32).collect();
+    let bank = match model.precision() {
+        Precision::F32 => None,
+        Precision::Bf16 => Some(Qwen35Grads::zeros_like(model)?),
+    };
+    let bank = bank.as_ref();
     let base = rt.current_allocated_bytes();
     rt.reset_peak_allocated_bytes();
     // Only the loss is kept: holding the warm-up step would double the
     // gradients resident while timing.
-    let first = model.train_step(&ids, operands)?.loss;
+    let first = one_step(model, &ids, operands, bank)?;
     if !first.is_finite() {
         return Err(format!("train_step: loss {first} is not finite"));
     }
     let mut samples = Vec::new();
     for _ in 0..3 {
         let t0 = Instant::now();
-        let step = model.train_step(&ids, operands)?;
+        let loss = one_step(model, &ids, operands, bank)?;
         samples.push(t0.elapsed().as_secs_f64());
-        if step.loss.to_bits() != first.to_bits() {
+        if loss.to_bits() != first.to_bits() {
             return Err("train_step: the loss changed between identical steps".into());
         }
     }
@@ -732,11 +751,10 @@ fn bench_step(rt: &Arc<GpuRuntime>, model: &Qwen35Model, tokens: usize, operands
         gib(peak),
         gib(peak.saturating_sub(base))
     );
-    let (step, trace, secs) = traced(|| model.train_step(&ids, operands))?;
-    if step.loss.to_bits() != first.to_bits() {
+    let (loss, trace, secs) = traced(|| one_step(model, &ids, operands, bank))?;
+    if loss.to_bits() != first.to_bits() {
         return Err("train_step: the traced step's loss differs".into());
     }
-    drop(step);
     println!("  one traced step: {secs:.3} s, {}", trace_line(&trace));
     Ok(())
 }
@@ -746,11 +764,19 @@ fn bench_step(rt: &Arc<GpuRuntime>, model: &Qwen35Model, tokens: usize, operands
 fn bench_clip(model: &Qwen35Model, tokens: usize, operands: GemmOperands) -> Res<()> {
     let ids: Vec<u32> = (0..tokens as u32).map(|i| (i * 104_729 + 17) % VOCAB as u32).collect();
     let bank = Qwen35Grads::zeros_like(model)?;
-    let mut state = AdamW::new(model)?;
+    let mut state = match model.precision() {
+        Precision::F32 => AdamW::new(model)?,
+        Precision::Bf16 => AdamW::with_config(
+            model,
+            AdamWConfig {
+                update: UpdateRule::Bf16Kahan,
+                moments: MomentStorage::Block8,
+            },
+        )?,
+    };
     let wd = model.default_weight_decay(0.01)?;
     let mut clip = || -> Res<[(f64, tessl::infer_trace::Snapshot); 3]> {
-        let (loss, a, ta) =
-            traced(|| model.train_step_into(&ids, operands, tessl::qwen35_train::Supervise::Causal, &bank, false))?;
+        let (loss, a, ta) = traced(|| model.train_step_into(&ids, operands, Supervise::Causal, &bank, false))?;
         if !loss.is_finite() {
             return Err(format!("--clip: loss {loss} is not finite"));
         }
@@ -907,13 +933,18 @@ fn bench_batch(rt: &Arc<GpuRuntime>, model: &Qwen35Model, b: BatchShape, operand
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (mut check_only, mut step, mut ts, mut operands) = (false, None, Vec::new(), GemmOperands::ExactF32);
     let (mut batches, mut step_only, mut async_encode, mut clip) = (Vec::new(), false, false, None);
-    let mut bf16_storage = false;
+    let mut storage = Precision::F32;
     for arg in std::env::args().skip(1) {
         if arg == "--bf16" {
             operands = GemmOperands::Bf16;
+        } else if let Some(v) = arg.strip_prefix("--storage=") {
+            storage = match v {
+                "f32" => Precision::F32,
+                "bf16" => Precision::Bf16,
+                _ => return Err(format!("--storage expects f32 or bf16, got {v:?}").into()),
+            };
         } else if arg == "--bf16-storage" {
-            bf16_storage = true;
-            operands = GemmOperands::Bf16;
+            storage = Precision::Bf16;
         } else if arg == "--check-only" {
             check_only = true;
         } else if arg == "--step-only" {
@@ -935,14 +966,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         } else {
             let t: usize = arg.parse().map_err(|_| {
                 format!(
-                    "expected a token count, --check-only, --step-only, --bf16, --bf16-storage, --async, --step=N, --clip=N \
-                     or --batch=B,L[,S], got {arg:?}"
+                    "expected a token count, --check-only, --step-only, --bf16, --storage=f32|bf16, --async, \
+                     --step=N, --clip=N or --batch=B,L[,S], got {arg:?}"
                 )
             })?;
             if t < 2 {
                 return Err("T must be at least 2 (one prediction)".into());
             }
             ts.push(t);
+        }
+    }
+    if storage == Precision::Bf16 {
+        // A bf16-stored model's weights are the bf16 operands.
+        operands = GemmOperands::Bf16;
+        if !batches.is_empty() {
+            return Err("--batch runs on f32 storage only".into());
         }
     }
     // The per-op gate runs first whatever else is asked: no timing without it.
@@ -964,8 +1002,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         return Ok(());
     }
-    let model = load_2b(&rt, bf16_storage)?;
+    let model = load_2b(&rt, storage)?;
     rt.set_async_encode(async_encode)?;
+    println!(
+        "storage: {}; operands: {operands:?}",
+        match storage {
+            Precision::F32 => "f32",
+            Precision::Bf16 => "bf16 (steps into a bf16 bank)",
+        }
+    );
     println!(
         "encode: {}; TESSL_MID_COMMIT={}",
         if async_encode {

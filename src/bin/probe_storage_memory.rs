@@ -25,6 +25,13 @@
 //! config's model, into a bf16 bank, with a Kahan + 8-bit optimizer resident,
 //! and prints the measured peak ([`GpuRuntime::peak_allocated_bytes`]) beside
 //! the step's bound and the working set.
+//!
+//! `--no-optimizer` allocates no optimizer state anywhere: the variants are
+//! reported from their computed sizes, and `--step` runs the training step
+//! alone with only the weights and the bank resident. The step's peak over
+//! what is resident is the same measurement; the process stays under a
+//! footprint cap that the optimizer would cross (a 4B step with the Kahan +
+//! 8-bit state holds ~37 GiB).
 
 use std::sync::Arc;
 
@@ -116,9 +123,11 @@ fn packed_bytes(model: &Qwen35Model, size: usize) -> u64 {
 
 fn main() -> Res<()> {
     let mut config_path = None;
-    let (mut steps, mut step) = (Vec::new(), None);
+    let (mut steps, mut step, mut no_optimizer) = (Vec::new(), None, false);
     for arg in std::env::args().skip(1) {
-        if let Some(v) = arg.strip_prefix("--config=") {
+        if arg == "--no-optimizer" {
+            no_optimizer = true;
+        } else if let Some(v) = arg.strip_prefix("--config=") {
             config_path = Some(std::path::PathBuf::from(v));
         } else if let Some(v) = arg.strip_prefix("--steps=") {
             for t in v.split(',') {
@@ -134,7 +143,7 @@ fn main() -> Res<()> {
             );
         } else {
             return Err(format!(
-                "expected --config=PATH, --steps=T,... or --step=T, got {arg:?}"
+                "expected --config=PATH, --steps=T,..., --step=T or --no-optimizer, got {arg:?}"
             ));
         }
     }
@@ -194,7 +203,9 @@ fn main() -> Res<()> {
         };
         let total = w + b + opt;
         let fits = total <= ws;
-        let measured = if precision == Precision::Bf16 && rt.current_allocated_bytes() + opt <= ws {
+        let measured = if no_optimizer {
+            "computed only (--no-optimizer)".to_string()
+        } else if precision == Precision::Bf16 && rt.current_allocated_bytes() + opt <= ws {
             let before = rt.current_allocated_bytes();
             let state = AdamW::with_config(&model, config)?;
             rt.synchronize()?;
@@ -235,18 +246,39 @@ fn main() -> Res<()> {
     rt.synchronize()?;
 
     if let Some(t) = step {
-        measure_step(&rt, &cfg, t)?;
+        measure_step(&rt, &cfg, t, no_optimizer)?;
     }
     Ok(())
 }
 
 /// One training step and one AdamW step at `t` tokens on the config's
-/// model, Kahan and 8-bit moments resident.
-fn measure_step(rt: &Arc<GpuRuntime>, cfg: &Qwen35Config, t: u32) -> Res<()> {
+/// model, Kahan and 8-bit moments resident; the step alone, with only the
+/// weights and the bank resident, under `no_optimizer`.
+fn measure_step(rt: &Arc<GpuRuntime>, cfg: &Qwen35Config, t: u32, no_optimizer: bool) -> Res<()> {
     println!();
     let base = rt.current_allocated_bytes();
     let model = Qwen35Model::random_tower(rt, cfg.clone(), Precision::Bf16, 2)?;
     let bank = Qwen35Grads::zeros_like(&model)?;
+    if no_optimizer {
+        rt.synchronize()?;
+        let resident = rt.current_allocated_bytes();
+        let bound = model.train_step_bytes(t, GemmOperands::Bf16);
+        let ids: Vec<u32> = (0..t).map(|i| (i * 104_729 + 17) % model.config().vocab).collect();
+        rt.reset_peak_allocated_bytes();
+        let loss = model.train_step_into(&ids, GemmOperands::Bf16, Supervise::Causal, &bank, false)?;
+        let step_peak = rt.peak_allocated_bytes();
+        println!("no optimizer; resident {} (weights, bank)", gib(resident - base));
+        println!(
+            "step T={t}: loss {loss:.4}, peak {} ({} B) over resident, bound {}; device peak {} (no optimizer), \
+             recommended working set {}",
+            gib(step_peak.saturating_sub(resident)),
+            step_peak.saturating_sub(resident),
+            gib(bound),
+            gib(step_peak - base),
+            gib(rt.memory_info().recommended_working_set)
+        );
+        return Ok(());
+    }
     let mut state = AdamW::with_config(
         &model,
         AdamWConfig {

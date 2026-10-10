@@ -774,8 +774,8 @@ impl Qwen35Model {
         let t = u32::try_from(ids.len()).map_err(|_| "Qwen35Model::forward: too many tokens")?;
         let a = Acts::new(rt, cfg, self.precision, t, logits)?;
 
-        let id_buf = rt.alloc_buffer(ids.len() * 4)?;
-        id_buf.write_u32(ids);
+        // Fresh, so written without waiting on work another sequence queued.
+        let id_buf = rt.alloc_buffer_from_u32(ids)?;
         qwen35::embed_rows(
             rt,
             &id_buf,
@@ -1101,11 +1101,8 @@ impl Acts {
         let f32s = |n: usize| rt.alloc_buffer(n.max(1) * 4);
         let qd = (l.q_heads() * l.head_dim()) as usize;
         let kv = tu * (l.kv_heads() * l.head_dim()) as usize;
-        let u32_buf = |v: u32| -> Result<GpuBuffer, String> {
-            let b = rt.alloc_buffer(4)?;
-            b.write_u32(&[v]);
-            Ok(b)
-        };
+        // Fresh buffers, written without a GPU wait.
+        let u32_buf = |v: u32| rt.alloc_buffer_from_u32(&[v]);
         Ok(Self {
             t,
             resid: f32t(cfg.hidden as usize)?,

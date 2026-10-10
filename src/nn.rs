@@ -65,12 +65,12 @@ fn capacity_of<T>(buf: &GpuBuffer) -> usize {
 }
 
 /// `rows * dim`, or an error naming the overflow rather than wrapping.
-fn elems(rows: u32, dim: u32, what: &str) -> Result<usize, String> {
+fn elems(rows: u32, dim: u32, what: impl fmt::Display + Copy) -> Result<usize, String> {
     elems_product(&[rows, dim], what)
 }
 
 /// Product of device `u32` dimensions, widened before every multiplication.
-fn elems_product(dims: &[u32], what: &str) -> Result<usize, String> {
+fn elems_product(dims: &[u32], what: impl fmt::Display + Copy) -> Result<usize, String> {
     dims.iter()
         .try_fold(1usize, |product, &dim| product.checked_mul(dim as usize))
         .ok_or_else(|| format!("{what}: dimension product overflows usize"))
@@ -3203,7 +3203,7 @@ impl QuantShape {
         elems(self.rows, self.cols / self.group_size, "QuantShape groups")
     }
 
-    fn validate(&self, what: &str) -> Result<(), String> {
+    fn validate(&self, what: impl fmt::Display + Copy) -> Result<(), String> {
         if self.group_size == 0 {
             return Err(format!("{what}: group_size must be non-zero"));
         }
@@ -3239,7 +3239,7 @@ pub struct Q4Bank<'a> {
 }
 
 impl Q4Bank<'_> {
-    fn validate(&self, rt: &GpuRuntime, shape: &QuantShape, what: &str) -> Result<(), String> {
+    fn validate(&self, rt: &GpuRuntime, shape: &QuantShape, what: impl fmt::Display + Copy) -> Result<(), String> {
         shape.validate(what)?;
         if shape.group_size % 8 != 0 {
             return Err(format!(
@@ -3295,7 +3295,15 @@ const BLOCKED_TILE_ROWS: u32 = 16;
 impl Q4MlxBank<'_> {
     /// Checks `shape` and that the bank holds `rows` rounded up to
     /// `tile_rows` (1 for row-major banks; see the type's docs).
-    fn validate(&self, rt: &GpuRuntime, shape: &QuantShape, tile_rows: u32, what: &str) -> Result<(), String> {
+    /// `what` labels errors only; callers pass `format_args!`, so the success
+    /// path formats nothing.
+    fn validate(
+        &self,
+        rt: &GpuRuntime,
+        shape: &QuantShape,
+        tile_rows: u32,
+        what: impl fmt::Display + Copy,
+    ) -> Result<(), String> {
         shape.validate(what)?;
         let stored_rows = shape
             .rows
@@ -4085,8 +4093,8 @@ pub unsafe fn gemv_q4_mlx_gate_up_gelu_with_scalars(
         GateUpDispatch::Simd(l) => l.tile_rows(),
         GateUpDispatch::Blocked => BLOCKED_TILE_ROWS,
     };
-    gate.validate(rt, &shape, tile_rows, &format!("{entry} gate"))?;
-    up.validate(rt, &shape, tile_rows, &format!("{entry} up"))?;
+    gate.validate(rt, &shape, tile_rows, format_args!("{entry} gate"))?;
+    up.validate(rt, &shape, tile_rows, format_args!("{entry} up"))?;
     match dispatch {
         GateUpDispatch::Simd(_) => require::<u16>(rt, x, shape.cols as usize, format_args!("{entry} x"))?,
         GateUpDispatch::Blocked => require::<f32>(rt, x, shape.cols as usize, format_args!("{entry} x"))?,
@@ -4181,8 +4189,8 @@ pub unsafe fn gemv_q4_mlx_kv_with_scalars(
         Q4MlxLayout::RowMajor => "gemv_q4_mlx_simd_kv",
         Q4MlxLayout::Interleaved4 => "gemv_q4_mlx_simd_kv_i4",
     };
-    k.validate(rt, &shape, layout.tile_rows(), &format!("{entry} k"))?;
-    v.validate(rt, &shape, layout.tile_rows(), &format!("{entry} v"))?;
+    k.validate(rt, &shape, layout.tile_rows(), format_args!("{entry} k"))?;
+    v.validate(rt, &shape, layout.tile_rows(), format_args!("{entry} v"))?;
     require::<u16>(rt, x_bf16, shape.cols as usize, format_args!("{entry} x_bf16"))?;
     require::<f32>(rt, k_out, shape.rows as usize, format_args!("{entry} k_out"))?;
     require::<f32>(rt, v_out, shape.rows as usize, format_args!("{entry} v_out"))?;
@@ -4311,9 +4319,9 @@ pub unsafe fn gemv_q4_mlx_qkv_with_scalars(
         cols,
         group_size,
     };
-    q.validate(rt, &q_shape, layout.tile_rows(), &format!("{entry} q"))?;
-    k.validate(rt, &kv_shape, layout.tile_rows(), &format!("{entry} k"))?;
-    v.validate(rt, &kv_shape, layout.tile_rows(), &format!("{entry} v"))?;
+    q.validate(rt, &q_shape, layout.tile_rows(), format_args!("{entry} q"))?;
+    k.validate(rt, &kv_shape, layout.tile_rows(), format_args!("{entry} k"))?;
+    v.validate(rt, &kv_shape, layout.tile_rows(), format_args!("{entry} v"))?;
     require::<u16>(rt, x_bf16, cols as usize, format_args!("{entry} x_bf16"))?;
     require::<f32>(rt, out.q_out, rows_q as usize, format_args!("{entry} q_out"))?;
     require::<f32>(rt, out.k_out, rows_kv as usize, format_args!("{entry} k_out"))?;

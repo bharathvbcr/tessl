@@ -427,6 +427,9 @@ struct SavedGdn {
     ckpt: Tensor,
     o: Tensor,
     y: Tensor,
+    /// `y`'s [`bf16_twin`]: read by the forward's out-projection and the
+    /// backward's weight gradient.
+    y16: Option<Tensor>,
 }
 
 /// What one attention layer's forward keeps for its backward.
@@ -438,6 +441,8 @@ struct SavedAttn {
     o: GpuBuffer,
     lse: GpuBuffer,
     y: Tensor,
+    /// `y`'s [`bf16_twin`], as [`SavedGdn::y16`].
+    y16: Option<Tensor>,
 }
 
 enum SavedMixer {
@@ -450,9 +455,13 @@ enum SavedMixer {
 struct Saved {
     resid_in: Tensor,
     x1: Tensor,
+    /// `x1`'s [`bf16_twin`]: the in-projection's operand, forward and backward.
+    x1_16: Option<Tensor>,
     mixer: SavedMixer,
     resid_mid: Tensor,
     x2: Tensor,
+    /// `x2`'s [`bf16_twin`]: gate and up, forward and backward.
+    x2_16: Option<Tensor>,
     m_gate: Tensor,
     m_up: Tensor,
     m_mid: Tensor,
@@ -523,6 +532,25 @@ fn vec_grad(rt: &Arc<GpuRuntime>, n: usize, bank: Option<(&GpuBuffer, bool)>) ->
 /// zeroed on the GPU in order with the work around it ([`zero_part`]).
 fn tensor(rt: &Arc<GpuRuntime>, shape: &[usize]) -> Result<Tensor, String> {
     rt.alloc_tensor_unzeroed(shape, DType::F32)
+}
+
+/// `x` rounded to bf16 once, for an f32 activation that several GEMMs read
+/// under [`GemmOperands::Bf16`]; `None` on the exact lane. Each such GEMM
+/// would otherwise round it into a fresh temporary of its own (`x2` four
+/// times a layer, `dresid` four). Same cast kernel, so the GEMMs see the same
+/// bits. Pair with [`op`].
+fn bf16_twin(mm: GemmOperands, x: &Tensor) -> Result<Option<Tensor>, String> {
+    if mm != GemmOperands::Bf16 || x.dtype != DType::F32 {
+        return Ok(None);
+    }
+    let t = x.runtime().alloc_tensor_unzeroed(x.shape(), DType::BF16)?;
+    cast_f32_to_bf16_into(x, &t)?;
+    Ok(Some(t))
+}
+
+/// The tensor a GEMM takes for `x`: its bf16 twin when there is one.
+fn op<'a>(x: &'a Tensor, twin: &'a Option<Tensor>) -> &'a Tensor {
+    twin.as_ref().unwrap_or(x)
 }
 
 /// `t * k_heads`: the rows of a `[t, k_heads, 128]` operand taken one head
@@ -1555,24 +1583,26 @@ impl Qwen35Model {
         let (tu, h, i) = (t as usize, cfg.hidden as usize, cfg.intermediate as usize);
         let x1 = tensor(rt, &[tu, h])?;
         self.norm_f32(&resid_in, &layer.input_norm, &x1, t)?;
+        let x1_16 = bf16_twin(mm, &x1)?;
         let (mixer, resid_mid) = match &layer.mixer {
             Mixer::Gdn(w) => {
-                let s = self.gdn_forward(w, &x1, t, mm)?;
-                let r = self.residual(&resid_in, &s.y, &w.w_out, t, mm)?;
+                let s = self.gdn_forward(w, op(&x1, &x1_16), t, mm)?;
+                let r = self.residual(&resid_in, op(&s.y, &s.y16), &w.w_out, t, mm)?;
                 (SavedMixer::Gdn(Box::new(s)), r)
             }
             Mixer::Attn(w) => {
                 let ws = attn_ws.ok_or("Qwen35Model::train_step: an attention layer without the step's workspace")?;
-                let s = self.attn_forward(w, &x1, t, mm, ws)?;
-                let r = self.residual(&resid_in, &s.y, &w.w_out, t, mm)?;
+                let s = self.attn_forward(w, op(&x1, &x1_16), t, mm, ws)?;
+                let r = self.residual(&resid_in, op(&s.y, &s.y16), &w.w_out, t, mm)?;
                 (SavedMixer::Attn(s), r)
             }
         };
         let x2 = tensor(rt, &[tu, h])?;
         self.norm_f32(&resid_mid, &layer.post_norm, &x2, t)?;
+        let x2_16 = bf16_twin(mm, &x2)?;
         let (m_gate, m_up, m_mid) = (tensor(rt, &[tu, i])?, tensor(rt, &[tu, i])?, tensor(rt, &[tu, i])?);
-        mm.nn(&x2, &layer.gate, &m_gate)?;
-        mm.nn(&x2, &layer.up, &m_up)?;
+        mm.nn(op(&x2, &x2_16), &layer.gate, &m_gate)?;
+        mm.nn(op(&x2, &x2_16), &layer.up, &m_up)?;
         qwen35::swiglu(
             rt,
             Cols::dense(&m_gate.buffer, cfg.intermediate),
@@ -1593,9 +1623,11 @@ impl Qwen35Model {
             Saved {
                 resid_in,
                 x1,
+                x1_16,
                 mixer,
                 resid_mid,
                 x2,
+                x2_16,
                 m_gate,
                 m_up,
                 m_mid,
@@ -1705,6 +1737,7 @@ impl Qwen35Model {
             g.v_dim(),
             self.cfg.rms_norm_eps,
         )?;
+        let y16 = bf16_twin(mm, &y)?;
         Ok(SavedGdn {
             proj,
             q,
@@ -1715,6 +1748,7 @@ impl Qwen35Model {
             ckpt,
             o,
             y,
+            y16,
         })
     }
 
@@ -1773,6 +1807,7 @@ impl Qwen35Model {
             a.q_heads(),
             a.head_dim(),
         )?;
+        let y16 = bf16_twin(mm, &y)?;
         Ok(SavedAttn {
             proj,
             q,
@@ -1781,6 +1816,7 @@ impl Qwen35Model {
             o,
             lse,
             y,
+            y16,
         })
     }
 
@@ -1831,8 +1867,9 @@ impl Qwen35Model {
 
         // MLP: resid_out = resid_mid + swiglu(x2 @ gate, x2 @ up) @ down.
         let into = |pick: fn(&LayerGrads) -> &Tensor| bank.map(|(b, add)| (pick(b), add));
-        let down = self.weight_grad(mm, &s.m_mid, &sc.dresid, into(|b| &b.down))?;
-        mm.nt(&sc.dresid, &layer.down, &sc.d_mid)?;
+        let dresid16 = bf16_twin(mm, &sc.dresid)?;
+        let down = self.weight_grad(mm, &s.m_mid, op(&sc.dresid, &dresid16), into(|b| &b.down))?;
+        mm.nt(op(&sc.dresid, &dresid16), &layer.down, &sc.d_mid)?;
         swiglu_bwd(
             rt,
             Cols::dense(&s.m_gate.buffer, i),
@@ -1843,11 +1880,13 @@ impl Qwen35Model {
             t,
             i,
         )?;
-        let gate = self.weight_grad(mm, &s.x2, &sc.d_gate, into(|b| &b.gate))?;
-        let up = self.weight_grad(mm, &s.x2, &sc.d_up, into(|b| &b.up))?;
+        let (d_gate16, d_up16) = (bf16_twin(mm, &sc.d_gate)?, bf16_twin(mm, &sc.d_up)?);
+        let x2 = op(&s.x2, &s.x2_16);
+        let gate = self.weight_grad(mm, x2, op(&sc.d_gate, &d_gate16), into(|b| &b.gate))?;
+        let up = self.weight_grad(mm, x2, op(&sc.d_up, &d_up16), into(|b| &b.up))?;
         // dx = d_gate @ gate^T + d_up @ up^T, the second added in its GEMM.
-        mm.nt(&sc.d_gate, &layer.gate, &sc.dx)?;
-        mm.nt_acc(&sc.d_up, &layer.up, &sc.dx)?;
+        mm.nt(op(&sc.d_gate, &d_gate16), &layer.gate, &sc.dx)?;
+        mm.nt_acc(op(&sc.d_up, &d_up16), &layer.up, &sc.dx)?;
         let post_norm = vec_grad(rt, hu, bank.map(|(b, add)| (&b.post_norm, add)))?;
         rms_norm_bwd(
             rt,
@@ -1872,7 +1911,7 @@ impl Qwen35Model {
                     Some(_) => return Err(MISMATCH.into()),
                     None => None,
                 };
-                MixerGrads::Gdn(self.gdn_backward(w, sv, &s.x1, sc, mm, into)?)
+                MixerGrads::Gdn(self.gdn_backward(w, sv, op(&s.x1, &s.x1_16), sc, mm, into)?)
             }
             (Mixer::Attn(w), SavedMixer::Attn(sv), into) => {
                 let into = match into {
@@ -1880,7 +1919,7 @@ impl Qwen35Model {
                     Some(_) => return Err(MISMATCH.into()),
                     None => None,
                 };
-                MixerGrads::Attn(self.attn_backward(w, sv, &s.x1, sc, mm, into)?)
+                MixerGrads::Attn(self.attn_backward(w, sv, op(&s.x1, &s.x1_16), sc, mm, into)?)
             }
             _ => return Err(MISMATCH.into()),
         };
@@ -1924,8 +1963,15 @@ impl Qwen35Model {
         let (rt, cfg, g) = (&self.rt, &self.cfg, self.cfg.gdn);
         let t = sc.t;
         let gs = sc.gdn.as_ref().ok_or("Qwen35Model::train_step: no GDN scratch")?;
-        let w_out = self.weight_grad(mm, &s.y, &sc.dresid, bank.map(|(b, add)| (&b.w_out, add)))?;
-        mm.nt(&sc.dresid, &w.w_out, &gs.dy)?;
+        // `dresid` has had the post-norm's gradient added since the MLP's twin.
+        let dresid16 = bf16_twin(mm, &sc.dresid)?;
+        let w_out = self.weight_grad(
+            mm,
+            op(&s.y, &s.y16),
+            op(&sc.dresid, &dresid16),
+            bank.map(|(b, add)| (&b.w_out, add)),
+        )?;
+        mm.nt(op(&sc.dresid, &dresid16), &w.w_out, &gs.dy)?;
         // y = gated_rms_norm(o, z): d_o, and dz into the projection gradient.
         let norm_w = vec_grad(rt, g.v_dim() as usize, bank.map(|(b, add)| (&b.norm_w, add)))?;
         let dproj = &gs.dproj.buffer;
@@ -2042,8 +2088,9 @@ impl Qwen35Model {
             t,
             g.conv_dim(),
         )?;
-        let w_in = self.weight_grad(mm, x1, &gs.dproj, bank.map(|(b, add)| (&b.w_in, add)))?;
-        mm.nt(&gs.dproj, &w.w_in, &sc.dx)?;
+        let dproj16 = bf16_twin(mm, &gs.dproj)?;
+        let w_in = self.weight_grad(mm, x1, op(&gs.dproj, &dproj16), bank.map(|(b, add)| (&b.w_in, add)))?;
+        mm.nt(op(&gs.dproj, &dproj16), &w.w_in, &sc.dx)?;
         Ok(GdnGrads {
             w_in,
             w_out,
@@ -2073,8 +2120,15 @@ impl Qwen35Model {
             .attn
             .as_ref()
             .ok_or("Qwen35Model::train_step: no attention scratch")?;
-        let w_out = self.weight_grad(mm, &s.y, &sc.dresid, bank.map(|(b, add)| (&b.w_out, add)))?;
-        mm.nt(&sc.dresid, &w.w_out, &asc.dy)?;
+        // `dresid` has had the post-norm's gradient added since the MLP's twin.
+        let dresid16 = bf16_twin(mm, &sc.dresid)?;
+        let w_out = self.weight_grad(
+            mm,
+            op(&s.y, &s.y16),
+            op(&sc.dresid, &dresid16),
+            bank.map(|(b, add)| (&b.w_out, add)),
+        )?;
+        mm.nt(op(&sc.dresid, &dresid16), &w.w_out, &asc.dy)?;
         let proj = Cols::dense(&s.proj.buffer, a.width());
         let dproj = &asc.dproj.buffer;
         // y = o * sigmoid(gate): d_o, and the gate columns of dproj.
@@ -2129,8 +2183,9 @@ impl Qwen35Model {
             cfg.rope_theta,
             cfg.rms_norm_eps,
         )?;
-        let w_in = self.weight_grad(mm, x1, &asc.dproj, bank.map(|(b, add)| (&b.w_in, add)))?;
-        mm.nt(&asc.dproj, &w.w_in, &sc.dx)?;
+        let dproj16 = bf16_twin(mm, &asc.dproj)?;
+        let w_in = self.weight_grad(mm, x1, op(&asc.dproj, &dproj16), bank.map(|(b, add)| (&b.w_in, add)))?;
+        mm.nt(op(&asc.dproj, &dproj16), &w.w_in, &sc.dx)?;
         Ok(AttnGrads {
             w_in,
             w_out,

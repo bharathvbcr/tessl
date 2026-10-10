@@ -1182,7 +1182,13 @@ Memory at Qwen3.5-4B's shapes (`probe_storage_memory`, random weights;
 With Kahan and 8-bit moments resident, one training step plus one AdamW step
 on the 4B peaks at 35.28 GiB at T = 512 and 37.35 GiB at T = 2048 (the
 steps' own peaks 3.82 and 5.88 GiB, under their bounds of 6.29 and
-9.16 GiB).
+9.16 GiB). Since a bf16 bank takes the head gradient a chunk at a time rather than
+through an f32 `[vocab, hidden]` tensor, the step's own peak over what is
+resident is 1.40 GiB at T = 512 and 3.35 GiB at T = 2048 (was 3.78 and
+5.76 GiB measured the same way; `probe_storage_memory --no-optimizer`,
+`bench/results/qwen35_4b_storage_memory_wave2_m5pro.txt`), so with the
+Kahan and 8-bit state resident about 32.9 and 34.8 GiB (computed: this
+machine's 32 GiB per-process cap no longer lets the probe hold both).
 
 ## Performance
 

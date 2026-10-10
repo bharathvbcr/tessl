@@ -52,7 +52,7 @@ use crate::nn::require_runtime;
 use crate::qwen35::{self, AttnShape, AttnTargets, Cols, GdnParams, OutCols, StateIn};
 use crate::qwen35_bwd::{
     attn_gate_bwd, attn_qk_norm_rope_bwd, attn_qk_norm_rope_bwd_part_len, check_scatter_rows, conv1d_silu_bwd,
-    conv1d_silu_bwd_part_len, copy_cols, embed_rows_bwd, gated_rms_norm_bwd, gated_rms_norm_bwd_part_len,
+    conv1d_silu_bwd_part_len, copy_cols, embed_rows_bwd_once, gated_rms_norm_bwd, gated_rms_norm_bwd_part_len,
     gdn_gates_bwd, gdn_gates_bwd_part_len, rms_norm_bwd, rms_norm_bwd_part_len, scatter_add_rows, swiglu_bwd,
     AttnQkvGrads, EmbedBwdWorkspace,
 };
@@ -1059,8 +1059,9 @@ impl Qwen35Model {
                 (d, false)
             }
         };
-        let emb_ws = EmbedBwdWorkspace::new(rt, t)?;
-        embed_rows_bwd(rt, &ids, &sc.dresid.buffer, &dw.buffer, cfg.vocab, cfg.hidden, &emb_ws)?;
+        // A one-call grouping: fresh exact-size buffers written without a
+        // wait, rather than a workspace filled by staged uploads and copies.
+        embed_rows_bwd_once(rt, &ids, &sc.dresid.buffer, &dw.buffer, cfg.vocab, cfg.hidden)?;
         if let Some((b, add)) = bank {
             if !direct {
                 deliver(rt, &[tensor_part(&dw)], &[tensor_part(&b.embed)], add)?;

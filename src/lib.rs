@@ -247,10 +247,11 @@ pub use cb_replay::{
 };
 pub use decode_icb::{
     begin_decode_icb_capture, binder_encode_nop, clear_binder_encode_nop, decode_icb_capture_active,
-    decode_icb_enabled, end_decode_icb_capture, icb_coarse_ranges_enabled, icb_freeze_binds_enabled,
-    icb_pipelines_enabled, icb_range_batch_enabled, pipeline_icb, set_decode_icb, set_icb_coarse_ranges,
-    set_icb_freeze_binds, set_icb_pipelines, set_icb_range_batch, take_decode_icb_capture, BinderEncodeNopGuard,
-    DecodeIcb, DecodeIcbBind, DecodeIcbCapture, DecodeIcbCommand,
+    decode_icb_enabled, end_decode_icb_capture, icb_coarse_ranges_enabled, icb_execute_enabled,
+    icb_freeze_binds_enabled, icb_pipelines_enabled, icb_range_batch_enabled, icb_triage_enabled, pipeline_icb,
+    set_decode_icb, set_icb_coarse_ranges, set_icb_execute, set_icb_freeze_binds, set_icb_pipelines,
+    set_icb_range_batch, set_icb_triage, take_decode_icb_capture, BinderEncodeNopGuard, DecodeIcb, DecodeIcbBind,
+    DecodeIcbCapture, DecodeIcbCommand,
 };
 pub use gemm::{
     cast_f16_to_f32, cast_f32_to_f16, gemm, gemm_batched, gemm_epilogue, gemm_f32, Activation, BatchStrides,

@@ -278,7 +278,7 @@ pub fn icb_range_batch_enabled() -> bool {
     on
 }
 
-/// -1 = env / follow range-batch, 0 = off, 1 = on.
+/// -1 = read env, 0 = off, 1 = on, 2 = env unset: follow range-batch.
 static ICB_COARSE_RANGES: AtomicI8 = AtomicI8::new(-1);
 
 /// Force coarse-range barrier elision (tests / harness). Overrides env.
@@ -292,9 +292,12 @@ pub fn set_icb_coarse_ranges(on: bool) {
 ///
 /// Env: `METAL_RUNTIME_ICB_COARSE_RANGES` / `GEMMA_METAL_ICB_COARSE_RANGES`.
 pub fn icb_coarse_ranges_enabled() -> bool {
-    let v = ICB_COARSE_RANGES.load(Ordering::Relaxed);
-    if v >= 0 {
-        return v == 1;
+    match ICB_COARSE_RANGES.load(Ordering::Relaxed) {
+        0 => return false,
+        1 => return true,
+        // Follow range-batch: coarsening only pays when spans are coalesced.
+        2 => return icb_range_batch_enabled(),
+        _ => {}
     }
     if let Some(on) = env_truthy(&[
         "TESSL_ICB_COARSE_RANGES",
@@ -304,8 +307,61 @@ pub fn icb_coarse_ranges_enabled() -> bool {
         ICB_COARSE_RANGES.store(if on { 1 } else { 0 }, Ordering::Relaxed);
         return on;
     }
-    // Follow range-batch: coarsening only pays when spans are coalesced.
+    // Latch "unset" too, so a replay does not re-read three variables every
+    // token; the answer still follows range-batch.
+    ICB_COARSE_RANGES.store(2, Ordering::Relaxed);
     icb_range_batch_enabled()
+}
+
+/// -1 = env, 0 = off, 1 = on.
+static ICB_EXECUTE: AtomicI8 = AtomicI8::new(-1);
+
+/// Force ICB execution of a replayed tape (tests / harness). Overrides env.
+pub fn set_icb_execute(on: bool) {
+    ICB_EXECUTE.store(if on { 1 } else { 0 }, Ordering::Relaxed);
+}
+
+/// Execute replayed commands through the ICB even without freeze-binds
+/// (which implies it). Default **OFF**. Read once, like the other ICB flags,
+/// rather than on every replay.
+///
+/// Env: `TESSL_ICB_EXECUTE`, `METAL_RUNTIME_ICB_EXECUTE` or
+/// `GEMMA_METAL_ICB_EXECUTE`.
+pub fn icb_execute_enabled() -> bool {
+    let v = ICB_EXECUTE.load(Ordering::Relaxed);
+    if v >= 0 {
+        return v == 1;
+    }
+    let on = env_truthy(&[
+        "TESSL_ICB_EXECUTE",
+        "METAL_RUNTIME_ICB_EXECUTE",
+        "GEMMA_METAL_ICB_EXECUTE",
+    ])
+    .unwrap_or(false);
+    ICB_EXECUTE.store(if on { 1 } else { 0 }, Ordering::Relaxed);
+    on
+}
+
+/// -1 = env, 0 = off, 1 = on.
+static ICB_TRIAGE: AtomicI8 = AtomicI8::new(-1);
+
+/// Force decode-ICB triage mode (tests / harness). Overrides env.
+pub fn set_icb_triage(on: bool) {
+    ICB_TRIAGE.store(if on { 1 } else { 0 }, Ordering::Relaxed);
+}
+
+/// Triage mode: replay one command per binder scope with a sync after each,
+/// to localize the first diverging dispatch. Default **OFF**. Read once.
+///
+/// Env: `TESSL_ICB_TRIAGE` or `GEMMA_METAL_ICB_TRIAGE`.
+pub fn icb_triage_enabled() -> bool {
+    let v = ICB_TRIAGE.load(Ordering::Relaxed);
+    if v >= 0 {
+        return v == 1;
+    }
+    let on = env_truthy(&["TESSL_ICB_TRIAGE", "GEMMA_METAL_ICB_TRIAGE"]).unwrap_or(false);
+    ICB_TRIAGE.store(if on { 1 } else { 0 }, Ordering::Relaxed);
+    on
 }
 
 /// Fingerprint of Buf `(index, gpu_addr)` pairs for prebuilt-table dedup.
@@ -375,6 +431,10 @@ pub struct DecodeIcb {
     barriers_coarsened: bool,
     /// How many `barrier_after` markers elided by coarse-range analysis.
     barriers_elided: u64,
+    /// Every command's pipeline supports ICBs. Pipelines are fixed once the
+    /// tape is built, so this is computed once instead of probing each
+    /// pipeline (an Objective-C send) on every replay.
+    all_icb: bool,
 }
 
 /// One argument table per encoded command, plus the number of distinct tables
@@ -505,6 +565,7 @@ impl DecodeIcb {
         } else {
             (Vec::new(), 0)
         };
+        let all_icb = commands.iter().all(|c| c.pipeline.supportIndirectCommandBuffers());
         let mut this = Self {
             icb,
             commands,
@@ -527,6 +588,7 @@ impl DecodeIcb {
             total_buf_binds,
             barriers_coarsened: false,
             barriers_elided: 0,
+            all_icb,
         };
         this.encode_cpu()?;
         Ok(this)
@@ -847,8 +909,7 @@ impl DecodeIcb {
     fn encode_cpu(&mut self) -> Result<(), String> {
         // Tape-only / direct-dispatch replay: allow non-ICB pipelines (default path).
         // Freeze-binds requires ICB-capable pipelines + setKernelBuffer encode.
-        let all_icb = self.commands.iter().all(|c| c.pipeline.supportIndirectCommandBuffers());
-        if !all_icb {
+        if !self.all_icb {
             if self.freeze_binds {
                 return Err(
                     "DecodeIcb freeze_binds: not all pipelines supportIndirectCommandBuffers \
@@ -1041,13 +1102,7 @@ impl DecodeIcb {
             self.barriers_elided = Self::elide_non_interfering_barriers(&mut self.commands);
             self.barriers_coarsened = true;
         }
-        let use_icb_exec = freeze
-            || env_truthy(&[
-                "TESSL_ICB_EXECUTE",
-                "METAL_RUNTIME_ICB_EXECUTE",
-                "GEMMA_METAL_ICB_EXECUTE",
-            ])
-            .unwrap_or(false);
+        let use_icb_exec = freeze || icb_execute_enabled();
         let need_opt = !self.optimized;
         let icb = self.icb.clone();
         let n = self.commands.len() as u64;
@@ -1065,7 +1120,7 @@ impl DecodeIcb {
         // Dropping half a tape is not a degraded mode, it is a wrong answer, so
         // it is refused. `freeze_binds` already rejects the same shape at
         // encode time; this covers the `TESSL_ICB_EXECUTE=1` path that does not.
-        if use_icb_exec && !self.commands.iter().all(|c| c.pipeline.supportIndirectCommandBuffers()) {
+        if use_icb_exec && !self.all_icb {
             return Err(format!(
                 "DecodeIcb: ICB execution requested for a tape whose {} command(s) are not \
                  all ICB-capable. Those commands would be silently dropped. Capture with \
@@ -1074,14 +1129,12 @@ impl DecodeIcb {
             ));
         }
 
+        // `all_icb` holds here: the check above returned otherwise.
         if use_icb_exec && need_opt {
-            let all_icb = self.commands.iter().all(|c| c.pipeline.supportIndirectCommandBuffers());
-            if all_icb {
-                rt.with_binder(|bnd| {
-                    bnd.optimize_icb(&icb, 0, n);
-                    Ok(())
-                })?;
-            }
+            rt.with_binder(|bnd| {
+                bnd.optimize_icb(&icb, 0, n);
+                Ok(())
+            })?;
         }
         // Skip auto-barriers during tape encode; replay captured `barrier_after`
         // markers instead. Forcing always-on here inflated E4B barriers ~364→599
@@ -1089,7 +1142,7 @@ impl DecodeIcb {
         // Scope-local via with_binder_barriers — flipping the process-global
         // flag here would drop the trailing auto barrier of ops other threads
         // encode concurrently.
-        let triage = env_truthy(&["TESSL_ICB_TRIAGE", "GEMMA_METAL_ICB_TRIAGE"]).unwrap_or(false);
+        let triage = icb_triage_enabled();
         let mut sticky = StickyArgTable::new();
         let mut execute_icb_calls = 0u64;
         let mut execute_icb_cmds = 0u64;
@@ -1281,7 +1334,9 @@ impl DecodeIcb {
             if let Some((tg_idx, len)) = cmd.tg_mem {
                 bnd.set_threadgroup_memory(tg_idx, len);
             }
-            if use_icb_exec && cmd.pipeline.supportIndirectCommandBuffers() {
+            // `execute` only sets `use_icb_exec` once every command's pipeline
+            // is ICB-capable (`DecodeIcb::all_icb`), so no per-command probe.
+            if use_icb_exec {
                 bnd.execute_icb(icb, i as u64, 1);
                 icb_calls = 1;
                 icb_cmds = 1;
@@ -1599,7 +1654,7 @@ impl Drop for BinderEncodeNopGuard {
 /// visible to every other test mid-flight.
 #[cfg(test)]
 pub(crate) struct IcbFlagsTestGuard {
-    saved: [i8; 5],
+    saved: [i8; 7],
     saved_binder_encode_nop: bool,
     _lock: std::sync::MutexGuard<'static, ()>,
 }
@@ -1618,6 +1673,8 @@ impl IcbFlagsTestGuard {
                 ICB_RANGE_BATCH.load(Ordering::Relaxed),
                 ICB_COARSE_RANGES.load(Ordering::Relaxed),
                 ICB_PIPELINES.load(Ordering::Relaxed),
+                ICB_EXECUTE.load(Ordering::Relaxed),
+                ICB_TRIAGE.load(Ordering::Relaxed),
             ],
             saved_binder_encode_nop: binder_encode_nop(),
             _lock: lock,
@@ -1633,6 +1690,8 @@ impl Drop for IcbFlagsTestGuard {
         ICB_RANGE_BATCH.store(self.saved[2], Ordering::Relaxed);
         ICB_COARSE_RANGES.store(self.saved[3], Ordering::Relaxed);
         ICB_PIPELINES.store(self.saved[4], Ordering::Relaxed);
+        ICB_EXECUTE.store(self.saved[5], Ordering::Relaxed);
+        ICB_TRIAGE.store(self.saved[6], Ordering::Relaxed);
         set_binder_encode_nop(self.saved_binder_encode_nop);
     }
 }

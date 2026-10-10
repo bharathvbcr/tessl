@@ -77,7 +77,7 @@ pub enum DecodeIcbBind {
 
 #[inline]
 fn buf_gpu_addr(buf: &GpuBuffer, byte_offset: usize) -> u64 {
-    buf.metal().gpuAddress().wrapping_add(byte_offset as u64)
+    buf.gpu_address().wrapping_add(byte_offset as u64)
 }
 
 /// One frozen compute dispatch (pipeline + grid + bind recipe).
@@ -98,14 +98,15 @@ pub struct DecodeIcbCommand {
     pub barrier_after: bool,
     /// Binds that reached the encoder but could NOT be recorded on the tape.
     ///
-    /// `Binder::bind_buf` and `bind_resource_id` take a raw
-    /// `MTLBuffer` / `MTLResourceID` with no owning `GpuBuffer`, so there is
+    /// `Binder::bind_resource_id` (and the test-only raw `bind_buf`) take an
+    /// `MTLResourceID` / `MTLBuffer` with no owning `GpuBuffer`, so there is
     /// nothing for [`DecodeIcbBind::Buf`] to hold — and holding it is what pins
-    /// the operand's `Arc`. Every GEMM binds A, B and C through `bind_buf`, so
-    /// a captured GEMM recorded only its scalar immediates: replay would rebind
+    /// the operand's `Arc`. When GEMMs bound A, B and C as raw buffers, a
+    /// captured GEMM recorded only its scalar immediates: replay would rebind
     /// no operands at all, and the unrecorded buffers were pinned by nothing,
     /// free to be recycled and handed to a new tensor while the tape still
-    /// logically referenced them.
+    /// logically referenced them. Owned binds (`bind_tensor`,
+    /// `bind_gpu_buf_offset`) are recorded and never counted here.
     ///
     /// Recording the count turns that from a silent wrong answer into a refusal
     /// — see the check in [`DecodeIcb::from_commands_ex`].
@@ -2089,11 +2090,64 @@ mod tests {
         }
     }
 
+    /// Owned binds made through the real `Binder` are recorded, not counted as
+    /// unrecordable, so a freeze-binds tape of them builds and replays.
+    ///
+    /// `bind_tensor` and `bind_gpu_buf_offset` used to finish in the raw
+    /// `bind_buf`, which marks every bind unrecordable before the owned bind
+    /// was noted. Any captured kernel then carried `incomplete_binds > 0`, and
+    /// `from_commands_ex(.., true)` refused every real tape.
+    #[test]
+    fn owned_binds_capture_complete_and_freeze() {
+        let _flags = IcbFlagsTestGuard::lock();
+        let rt = GpuRuntime::new().expect("GpuRuntime::new");
+        let n = 64usize;
+        let src = rt.alloc_buffer_hot(n * 4).expect("src");
+        let dst = rt.alloc_tensor_f32(&[n]).expect("dst");
+        unsafe {
+            let p = src.metal().contents().as_ptr() as *mut f32;
+            for i in 0..n {
+                *p.add(i) = i as f32 + 1.0;
+            }
+        }
+        let pipe = pipeline_icb(&rt, "copy_f32").expect("copy_f32 icb pipeline");
+        let tpt = pipe.threadExecutionWidth().min(n).max(1);
+        let groups = n.div_ceil(tpt);
+
+        begin_decode_icb_capture();
+        let encoded = rt.with_binder(|bnd| {
+            bnd.set_pipeline(&pipe);
+            bnd.bind_gpu_buf(&src, 0);
+            bnd.bind_tensor(&dst, 1);
+            bnd.bind_u32(n as u32, 2);
+            bnd.dispatch(mtl_size(groups, 1, 1), mtl_size(tpt, 1, 1));
+            Ok(())
+        });
+        let cap = take_decode_icb_capture().expect("capture");
+        encoded.expect("captured dispatch");
+        rt.synchronize().unwrap();
+
+        assert_eq!(cap.commands.len(), 1);
+        assert_eq!(cap.commands[0].incomplete_binds, 0, "owned binds are recordable");
+        assert_eq!(cap.commands[0].binds.len(), 3);
+
+        let mut dec = DecodeIcb::from_commands_ex(&rt, cap.commands, true).expect("freeze-binds tape builds");
+        unsafe {
+            std::ptr::write_bytes(dst.buffer.metal().contents().as_ptr() as *mut u8, 0, n * 4);
+        }
+        dec.execute(&rt).unwrap();
+        rt.synchronize().unwrap();
+        let out = dst.read_f32().unwrap();
+        for (i, v) in out.iter().enumerate() {
+            assert_eq!(*v, i as f32 + 1.0, "mismatch at {i}");
+        }
+    }
+
     /// A tape with binds that could not be recorded must be refused, not replayed.
     ///
     /// `bind_buf` takes a raw `MTLBuffer` with no owning `GpuBuffer`, so there
-    /// is nothing to record and nothing to pin. Every GEMM binds A, B and C
-    /// that way, so a captured GEMM recorded only its scalar immediates.
+    /// is nothing to record and nothing to pin. When GEMMs bound A, B and C
+    /// that way, a captured GEMM recorded only its scalar immediates.
     /// Replaying it would leave the operand slots unwritten *and* leave the
     /// buffers free to be recycled into unrelated tensors — both silent.
     ///

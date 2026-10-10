@@ -311,6 +311,8 @@ pub(crate) struct Metal4EncodePackage {
     /// Scratch for scalar `[[buffer(N)]]` constants (M4 has no setBytes).
     /// 16 MiB bump arena; cursor advances per const pack, reset after sync.
     pub const_staging: Retained<ProtocolObject<dyn MTLBuffer>>,
+    /// `const_staging`'s contents pointer, GPU address and length, read once.
+    pub(crate) const_arena: crate::dispatch::ConstArena,
     pub const_cursor: Mutex<usize>,
     event_value: Mutex<u64>,
     /// Allocations registered into `residency` (debug / telemetry).
@@ -1320,6 +1322,7 @@ impl GpuRuntime {
         // Always (re)register — freelist buffers were removed on recycle.
         self.register_residency(&buffer);
         let weak = self.self_weak.clone();
+        let gpu_addr = buffer.gpuAddress();
         // Same reason as the runtime Arc above: the pooled buffer holds a
         // `Retained<ProtocolObject<dyn MTLBuffer>>`, and `GpuBuffer` is cloned
         // into every `Tensor` view that borrows it.
@@ -1330,6 +1333,7 @@ impl GpuRuntime {
                 nbytes,
                 kind,
                 runtime: weak,
+                gpu_addr,
             }),
         })
     }
@@ -1681,7 +1685,7 @@ impl GpuRuntime {
             let mut binder = crate::dispatch::Binder::new(
                 enc.as_ref(),
                 &m4.argument_table.table,
-                &m4.const_staging,
+                m4.const_arena,
                 &mut cursor,
                 skip_auto.unwrap_or_else(crate::ab_flags::hazard_barriers),
                 // A previous scope on this encoder ended with an unbarriered
@@ -2289,6 +2293,7 @@ fn try_init_metal4(device: &ProtocolObject<dyn MTLDevice>, timestamps: bool) -> 
         counter_heap,
         residency,
         shared_event,
+        const_arena: crate::dispatch::ConstArena::new(&const_staging),
         const_staging,
         const_cursor: Mutex::new(0),
         event_value: Mutex::new(0),

@@ -15,6 +15,28 @@ use objc2_metal::{
 use crate::runtime::{mtl_size, GpuRuntime};
 use crate::tensor::{GpuBuffer, Tensor};
 
+/// The const arena's host pointer, GPU address and length.
+///
+/// The arena is one `StorageModeShared` buffer created with the runtime and
+/// never replaced, so all three are fixed. Reading them once at init saves
+/// three Objective-C property sends on every scalar bind.
+#[derive(Clone, Copy)]
+pub(crate) struct ConstArena {
+    base: std::ptr::NonNull<u8>,
+    gpu: u64,
+    len: usize,
+}
+
+impl ConstArena {
+    pub(crate) fn new(buffer: &ProtocolObject<dyn MTLBuffer>) -> Self {
+        Self {
+            base: buffer.contents().cast::<u8>(),
+            gpu: buffer.gpuAddress(),
+            len: buffer.length(),
+        }
+    }
+}
+
 /// Metal 4 compute binder (argument table + const arena).
 pub struct Binder<'a> {
     runtime: &'a GpuRuntime,
@@ -23,7 +45,7 @@ pub struct Binder<'a> {
     max_threads: Option<usize>,
     enc: &'a ProtocolObject<dyn MTL4ComputeCommandEncoder>,
     table: &'a ProtocolObject<dyn MTL4ArgumentTable>,
-    const_staging: &'a ProtocolObject<dyn MTLBuffer>,
+    const_arena: ConstArena,
     const_cursor: &'a mut usize,
     /// Last pipeline set (Retained) for DecodeIcb capture.
     last_pipeline: Option<Retained<ProtocolObject<dyn MTLComputePipelineState>>>,
@@ -78,25 +100,29 @@ impl<'a> Binder<'a> {
             self.fail("constant arena offset overflow");
             return 0;
         };
-        if bytes.is_empty() || end > self.const_staging.length() {
+        if bytes.is_empty() || end > self.const_arena.len {
             self.fail("constant arena exhausted or empty payload");
             return 0;
         }
-        // SAFETY: checked the entire destination range before writing.
+        // SAFETY: checked the entire destination range before writing; the
+        // arena buffer lives as long as the runtime that lent this binder.
         unsafe {
-            let dst = self.const_staging.contents().as_ptr().cast::<u8>().add(start);
-            std::ptr::write_bytes(dst, 0, bytes.len().max(4));
+            let dst = self.const_arena.base.as_ptr().add(start);
             std::ptr::copy_nonoverlapping(bytes.as_ptr(), dst, bytes.len());
+            // Only a sub-4-byte payload leaves part of its slot uncovered.
+            if bytes.len() < 4 {
+                std::ptr::write_bytes(dst.add(bytes.len()), 0, 4 - bytes.len());
+            }
         }
         *self.const_cursor = end;
-        self.const_staging.gpuAddress() + start as u64
+        self.const_arena.gpu + start as u64
     }
 
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         enc: &'a ProtocolObject<dyn MTL4ComputeCommandEncoder>,
         table: &'a ProtocolObject<dyn MTL4ArgumentTable>,
-        const_staging: &'a ProtocolObject<dyn MTLBuffer>,
+        const_arena: ConstArena,
         const_cursor: &'a mut usize,
         skip_auto_barriers: bool,
         hazard_pending: bool,
@@ -110,7 +136,7 @@ impl<'a> Binder<'a> {
             max_threads: None,
             enc,
             table,
-            const_staging,
+            const_arena,
             const_cursor,
             last_pipeline: None,
             arg_table_latched: false,
@@ -194,6 +220,9 @@ impl<'a> Binder<'a> {
         }
     }
 
+    /// Bind a raw `MTLBuffer`. Owned buffers go through [`Self::bind_owned`];
+    /// only tests bind a bare buffer, so this is test-only.
+    #[cfg(test)]
     pub(crate) fn bind_buf(&mut self, buf: &ProtocolObject<dyn MTLBuffer>, offset: usize, index: usize) {
         if !self.valid_index(index) {
             return;
@@ -237,10 +266,9 @@ impl<'a> Binder<'a> {
             self.fail("tensor belongs to another runtime");
             return;
         }
-        self.bind_buf(t.buffer.metal(), t.byte_offset, index);
-        if crate::decode_icb::decode_icb_capture_active() {
-            crate::decode_icb::capture_note_bind(index, &t.buffer, t.byte_offset);
-        }
+        // `validate` has already held the view inside the buffer's logical
+        // window, so `bind_owned`'s offset check cannot fire here.
+        self.bind_owned(&t.buffer, t.byte_offset, index);
     }
 
     pub fn bind_gpu_buf(&mut self, b: &GpuBuffer, index: usize) {
@@ -254,11 +282,31 @@ impl<'a> Binder<'a> {
             self.fail("buffer belongs to another runtime");
             return;
         }
+        self.bind_owned(b, byte_offset, index);
+    }
+
+    /// Bind an owned buffer (runtime identity already checked) and record it
+    /// on an active DecodeIcb capture.
+    ///
+    /// Unlike `bind_buf` this sends no Objective-C messages: the GPU
+    /// address is cached on the buffer, and the logical `nbytes` bound implies
+    /// the physical one (`nbytes <= length()` for every pooled and wrapped
+    /// buffer). It also does not mark the capture incomplete. Routing owned
+    /// binds through `bind_buf` used to count every one of them as
+    /// unrecordable, so a `freeze_binds` build refused any captured tape.
+    fn bind_owned(&mut self, b: &GpuBuffer, byte_offset: usize, index: usize) {
+        if !self.valid_index(index) {
+            return;
+        }
         if byte_offset >= b.nbytes() {
             self.fail("owned buffer binding offset out of logical bounds");
             return;
         }
-        self.bind_buf(b.metal(), byte_offset, index);
+        let Some(addr) = b.gpu_address().checked_add(byte_offset as u64) else {
+            self.fail("GPU address overflow");
+            return;
+        };
+        self.bind_addr(addr, index);
         if crate::decode_icb::decode_icb_capture_active() {
             crate::decode_icb::capture_note_bind(index, b, byte_offset);
         }
@@ -287,7 +335,7 @@ impl<'a> Binder<'a> {
         if !self.valid_index(index) {
             return;
         }
-        // As `bind_buf`: a bare `MTLResourceID` carries no owning handle, so a
+        // A bare `MTLResourceID` carries no owning handle, so a
         // capture that contains one cannot be replayed faithfully.
         crate::decode_icb::capture_note_unrecordable_bind();
         unsafe {

@@ -269,28 +269,15 @@ fn async_encode_changes_no_bit() {
     }
 }
 
-/// The step's vector gradients (each norm, the conv, the gates' two) per
-/// layer, and the final norm's: what a bank still takes by delivery.
-fn vectors(model: &Qwen35Model) -> u64 {
-    1 + model
-        .config()
-        .layers
-        .iter()
-        .map(|k| match k {
-            tessl::qwen35_model::LayerKind::LinearAttention => 2 + 4,
-            tessl::qwen35_model::LayerKind::FullAttention => 2 + 2,
-        })
-        .sum::<u64>()
-}
-
-/// A step into an f32 bank writes every weight matrix's gradient and the
-/// embedding's (head and gather) in place, by the GEMMs and the gather
-/// themselves: beyond the fresh step it dispatches only one delivery per
-/// vector gradient. Each matrix used to be a fresh tensor and a copy, and
-/// the head a fresh `[vocab, hidden]` tensor (2 GB on the 2B, 4 GiB at
-/// 4B) zeroed, filled and then added.
+/// A step into an f32 bank that it overwrites writes every gradient in
+/// place: the weight matrices and the embedding (head and gather) by the
+/// GEMMs and the gather themselves, and every vector gradient by its own
+/// kernel (each overwrites its output). Beyond the fresh step it dispatches
+/// nothing. Each matrix used to be a fresh tensor and a copy, each vector a
+/// fresh buffer and a copy, and the head a fresh `[vocab, hidden]` tensor
+/// (2 GB on the 2B, 4 GiB at 4B) zeroed, filled and then added.
 #[test]
-fn an_f32_bank_takes_its_matrices_in_place() {
+fn an_f32_bank_takes_its_gradients_in_place() {
     let _g = LOCK.lock().unwrap();
     let (_rt, model) = load(Precision::F32);
     let ids = ids();
@@ -303,10 +290,10 @@ fn an_f32_bank_takes_its_matrices_in_place() {
                 .unwrap()
         });
         assert_eq!(
-            into.dispatches - fresh.dispatches,
-            vectors(&model),
+            into.dispatches,
+            fresh.dispatches,
             "{op:?}: a step into the bank dispatched {} beyond the fresh step's {}",
-            into.dispatches - fresh.dispatches,
+            into.dispatches.saturating_sub(fresh.dispatches),
             fresh.dispatches
         );
     }

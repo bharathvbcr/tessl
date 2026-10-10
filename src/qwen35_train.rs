@@ -506,6 +506,17 @@ fn f32s(rt: &Arc<GpuRuntime>, n: usize) -> Result<GpuBuffer, String> {
     rt.alloc_buffer(n.max(1) * std::mem::size_of::<f32>())
 }
 
+/// Where a `[n]` vector gradient is written. Every vector gradient's kernel
+/// overwrites its output, so into a bank that is overwritten (not added to)
+/// it goes straight into the bank's buffer, and [`deliver`] skips the
+/// aliased part: no temporary and no copy dispatch. Otherwise a fresh buffer.
+fn vec_grad(rt: &Arc<GpuRuntime>, n: usize, bank: Option<(&GpuBuffer, bool)>) -> Result<GpuBuffer, String> {
+    match bank {
+        Some((b, false)) => Ok(b.clone()),
+        _ => f32s(rt, n),
+    }
+}
+
 /// An f32 tensor a kernel writes in full before anything reads it: every
 /// one the step allocates. Not zeroed on the host
 /// ([`GpuRuntime::alloc_tensor_unzeroed`]); what must start at zero is
@@ -997,7 +1008,7 @@ impl Qwen35Model {
 
         // ---- backward -------------------------------------------------------
         let mut sc = self.scratch(t, attn_ws)?;
-        let final_norm = f32s(rt, h)?;
+        let final_norm = vec_grad(rt, h, bank.map(|(b, add)| (&b.final_norm, add)))?;
         rms_norm_bwd(
             rt,
             &resid.buffer,
@@ -1837,7 +1848,7 @@ impl Qwen35Model {
         // dx = d_gate @ gate^T + d_up @ up^T, the second added in its GEMM.
         mm.nt(&sc.d_gate, &layer.gate, &sc.dx)?;
         mm.nt_acc(&sc.d_up, &layer.up, &sc.dx)?;
-        let post_norm = f32s(rt, hu)?;
+        let post_norm = vec_grad(rt, hu, bank.map(|(b, add)| (&b.post_norm, add)))?;
         rms_norm_bwd(
             rt,
             &s.resid_mid.buffer,
@@ -1857,7 +1868,7 @@ impl Qwen35Model {
         let mixer = match (&layer.mixer, &s.mixer, bank.map(|(b, add)| (&b.mixer, add))) {
             (Mixer::Gdn(w), SavedMixer::Gdn(sv), into) => {
                 let into = match into {
-                    Some((MixerGrads::Gdn(g), add)) => Some((&g.w_in, &g.w_out, add)),
+                    Some((MixerGrads::Gdn(g), add)) => Some((g, add)),
                     Some(_) => return Err(MISMATCH.into()),
                     None => None,
                 };
@@ -1865,7 +1876,7 @@ impl Qwen35Model {
             }
             (Mixer::Attn(w), SavedMixer::Attn(sv), into) => {
                 let into = match into {
-                    Some((MixerGrads::Attn(g), add)) => Some((&g.w_in, &g.w_out, add)),
+                    Some((MixerGrads::Attn(g), add)) => Some((g, add)),
                     Some(_) => return Err(MISMATCH.into()),
                     None => None,
                 };
@@ -1873,7 +1884,7 @@ impl Qwen35Model {
             }
             _ => return Err(MISMATCH.into()),
         };
-        let input_norm = f32s(rt, hu)?;
+        let input_norm = vec_grad(rt, hu, bank.map(|(b, add)| (&b.input_norm, add)))?;
         rms_norm_bwd(
             rt,
             &s.resid_in.buffer,
@@ -1908,15 +1919,15 @@ impl Qwen35Model {
         x1: &Tensor,
         sc: &mut Scratch,
         mm: GemmOperands,
-        bank: Option<(&Tensor, &Tensor, bool)>,
+        bank: Option<(&GdnGrads, bool)>,
     ) -> Result<GdnGrads, String> {
         let (rt, cfg, g) = (&self.rt, &self.cfg, self.cfg.gdn);
         let t = sc.t;
         let gs = sc.gdn.as_ref().ok_or("Qwen35Model::train_step: no GDN scratch")?;
-        let w_out = self.weight_grad(mm, &s.y, &sc.dresid, bank.map(|(_, o, add)| (o, add)))?;
+        let w_out = self.weight_grad(mm, &s.y, &sc.dresid, bank.map(|(b, add)| (&b.w_out, add)))?;
         mm.nt(&sc.dresid, &w.w_out, &gs.dy)?;
         // y = gated_rms_norm(o, z): d_o, and dz into the projection gradient.
-        let norm_w = f32s(rt, g.v_dim() as usize)?;
+        let norm_w = vec_grad(rt, g.v_dim() as usize, bank.map(|(b, add)| (&b.norm_w, add)))?;
         let dproj = &gs.dproj.buffer;
         gated_rms_norm_bwd(
             rt,
@@ -1964,7 +1975,10 @@ impl Qwen35Model {
             },
         )?;
         // The gates' logits (a, b columns) and their parameters.
-        let (a_log, dt_bias) = (f32s(rt, g.v_heads() as usize)?, f32s(rt, g.v_heads() as usize)?);
+        let (a_log, dt_bias) = (
+            vec_grad(rt, g.v_heads() as usize, bank.map(|(b, add)| (&b.a_log, add)))?,
+            vec_grad(rt, g.v_heads() as usize, bank.map(|(b, add)| (&b.dt_bias, add)))?,
+        );
         gdn_gates_bwd(
             rt,
             &g.gates(&s.proj.buffer),
@@ -2010,7 +2024,11 @@ impl Qwen35Model {
                 width,
             )?;
         }
-        let conv_w = f32s(rt, (g.conv_dim() * cfg.conv_kernel) as usize)?;
+        let conv_w = vec_grad(
+            rt,
+            (g.conv_dim() * cfg.conv_kernel) as usize,
+            bank.map(|(b, add)| (&b.conv_w, add)),
+        )?;
         conv1d_silu_bwd(
             rt,
             Cols::dense(&s.proj.buffer, g.width()),
@@ -2024,7 +2042,7 @@ impl Qwen35Model {
             t,
             g.conv_dim(),
         )?;
-        let w_in = self.weight_grad(mm, x1, &gs.dproj, bank.map(|(i, _, add)| (i, add)))?;
+        let w_in = self.weight_grad(mm, x1, &gs.dproj, bank.map(|(b, add)| (&b.w_in, add)))?;
         mm.nt(&gs.dproj, &w.w_in, &sc.dx)?;
         Ok(GdnGrads {
             w_in,
@@ -2046,7 +2064,7 @@ impl Qwen35Model {
         x1: &Tensor,
         sc: &mut Scratch,
         mm: GemmOperands,
-        bank: Option<(&Tensor, &Tensor, bool)>,
+        bank: Option<(&AttnGrads, bool)>,
     ) -> Result<AttnGrads, String> {
         let (rt, cfg, a) = (&self.rt, &self.cfg, self.cfg.attn);
         let t = sc.t;
@@ -2055,7 +2073,7 @@ impl Qwen35Model {
             .attn
             .as_ref()
             .ok_or("Qwen35Model::train_step: no attention scratch")?;
-        let w_out = self.weight_grad(mm, &s.y, &sc.dresid, bank.map(|(_, o, add)| (o, add)))?;
+        let w_out = self.weight_grad(mm, &s.y, &sc.dresid, bank.map(|(b, add)| (&b.w_out, add)))?;
         mm.nt(&sc.dresid, &w.w_out, &asc.dy)?;
         let proj = Cols::dense(&s.proj.buffer, a.width());
         let dproj = &asc.dproj.buffer;
@@ -2089,7 +2107,10 @@ impl Qwen35Model {
             &asc.ws,
         )?;
         // q, k, v back through RoPE and the norms into their dproj columns.
-        let (q_norm, k_norm) = (f32s(rt, a.head_dim() as usize)?, f32s(rt, a.head_dim() as usize)?);
+        let (q_norm, k_norm) = (
+            vec_grad(rt, a.head_dim() as usize, bank.map(|(b, add)| (&b.q_norm, add)))?,
+            vec_grad(rt, a.head_dim() as usize, bank.map(|(b, add)| (&b.k_norm, add)))?,
+        );
         attn_qk_norm_rope_bwd(
             rt,
             &self.attn_shape(t),
@@ -2108,7 +2129,7 @@ impl Qwen35Model {
             cfg.rope_theta,
             cfg.rms_norm_eps,
         )?;
-        let w_in = self.weight_grad(mm, x1, &asc.dproj, bank.map(|(i, _, add)| (i, add)))?;
+        let w_in = self.weight_grad(mm, x1, &asc.dproj, bank.map(|(b, add)| (&b.w_in, add)))?;
         mm.nt(&asc.dproj, &w.w_in, &sc.dx)?;
         Ok(AttnGrads {
             w_in,

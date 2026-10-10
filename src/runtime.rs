@@ -602,7 +602,8 @@ pub struct GpuRuntime {
     relaxed_precision: AtomicBool,
     /// Prefer TensorOps multi-block flash probe over simdgroup FA-2 (`--flash-tensorops`).
     flash_tensorops: AtomicBool,
-    /// Uncommitted residency adds/removes — flushed before encode / synchronize.
+    /// Uncommitted residency adds/removes — committed with the next command
+    /// buffer (`commit_m4`) or after a drain (`drain_cold_recycles`).
     residency_dirty: AtomicBool,
     /// Cold buffers whose last Arc dropped mid-step; recycled after CB wait.
     pending_cold_recycle: Mutex<Vec<PendingRecycle>>,
@@ -1188,6 +1189,27 @@ impl GpuRuntime {
         }
     }
 
+    /// [`Self::flush_residency`] for `commit_m4`, which holds `active_m4`
+    /// with the command buffer still open (so the `try_lock` there would
+    /// fail and skip `useResidencySet`).
+    ///
+    /// Per the Metal 4 contract, an add stays pending until the set is
+    /// committed, `useResidencySet` makes the set's contents resident while
+    /// the command buffer executes, and a command buffer only executes after
+    /// it is committed. Committing the set once here, before the command
+    /// buffer, therefore covers every allocation any of its commands binds.
+    /// Removals are committed after the GPU wait in `drain_cold_recycles`.
+    fn flush_residency_for_open_cb(&self) {
+        if !self.residency_dirty.swap(false, Ordering::AcqRel) {
+            return;
+        }
+        crate::infer_trace::on_residency_flush();
+        let m4 = &self.metal4;
+        m4.residency.commit();
+        m4.residency.requestResidency();
+        m4.command_buffer.useResidencySet(&m4.residency);
+    }
+
     /// Enable multi-kernel command buffers (training hot path).
     pub fn set_async_encode(&self, on: bool) -> Result<(), String> {
         if !on {
@@ -1574,7 +1596,10 @@ impl GpuRuntime {
             return Ok(());
         }
         let _access = self.acquire_access()?;
-        self.flush_residency();
+        // No residency flush here: `commit_m4` commits every add made since the
+        // command buffer began, just before committing it (see
+        // `flush_residency_for_open_cb`). Flushing per dispatch committed the
+        // set once per allocation-then-dispatch, hundreds of times a step.
         let async_on = self.async_encode_enabled();
         if async_on {
             if let Err(error) = self.encode_into_batch_m4(skip_auto, f) {
@@ -1819,6 +1844,10 @@ impl GpuRuntime {
         }
         let m4 = &self.metal4;
         crate::infer_trace::on_commit();
+        // Every allocation registered while this command buffer was recording
+        // is committed into the set before the command buffer is: membership
+        // is read at execution, which cannot start before the commit below.
+        self.flush_residency_for_open_cb();
 
         // Close packed compute encoder before ending the CB.
         if let Some(enc) = batch.encoder.take() {

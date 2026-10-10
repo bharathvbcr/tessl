@@ -304,28 +304,70 @@ pub fn cross_entropy_rows_accumulating(
     ce_rows(WHAT, rt, h, weight, rows, targets, reduction, operands, ws, Some(grads))
 }
 
+/// What becomes of each chunk of `dW` in [`cross_entropy_rows_chunked`]:
+/// called in vocabulary order with the chunk's first vocabulary row and its
+/// f32 `[w, hidden]` rows (a view of the caller's scratch, written by the
+/// chunk's GEMM). Whatever it encodes runs before the next chunk's GEMM
+/// overwrites the scratch.
+pub(crate) type DwSink<'a> = &'a mut dyn FnMut(usize, &Tensor) -> Result<(), String>;
+
+/// [`cross_entropy_rows`] with `dW` handed over a chunk at a time instead of
+/// written into a `[vocab, hidden]` tensor: each chunk's `dlogitsᵀ @ h` is
+/// written into `dw_scratch` (f32 `[ws.chunk(), hidden]`) and given to
+/// `sink`. For a gradient that is not kept whole in f32: a bf16 bank's
+/// embedding, which takes each chunk rounded.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn cross_entropy_rows_chunked(
+    rt: &Arc<GpuRuntime>,
+    h: CeHidden<'_>,
+    weight: &Tensor,
+    rows: &[u32],
+    targets: &[u32],
+    reduction: Reduction,
+    operands: GemmOperands,
+    ws: &CeWorkspace,
+    dh: &Tensor,
+    scale: f32,
+    dw_scratch: &Tensor,
+    sink: DwSink<'_>,
+) -> Result<CeOutput, String> {
+    let grads = Grads {
+        dh,
+        scale,
+        dw: DwOut::Chunks {
+            scratch: dw_scratch,
+            sink,
+        },
+    };
+    ce_rows(
+        "cross_entropy_rows_chunked",
+        rt,
+        h,
+        weight,
+        rows,
+        targets,
+        reduction,
+        operands,
+        ws,
+        Some(grads),
+    )
+}
+
 /// Where `dW` goes.
-enum DwOut<'a> {
+enum DwOut<'a, 'b> {
     /// Over a dense f32 `[vocab, hidden]` tensor.
     Overwrite(&'a Tensor),
     /// Added into one.
     Add(&'a Tensor),
-}
-
-impl DwOut<'_> {
-    /// The tensor the GEMMs write `dW` into.
-    fn target(&self) -> &Tensor {
-        match self {
-            Self::Overwrite(t) | Self::Add(t) => t,
-        }
-    }
+    /// A chunk at a time through `scratch` to `sink`.
+    Chunks { scratch: &'a Tensor, sink: DwSink<'b> },
 }
 
 /// The gradients a call computes: `dh` overwritten, `dW` per [`DwOut`].
-struct Grads<'a> {
+struct Grads<'a, 'b> {
     dh: &'a Tensor,
     scale: f32,
-    dw: DwOut<'a>,
+    dw: DwOut<'a, 'b>,
 }
 
 /// [`cross_entropy_rows`], with `dW` going wherever `grads.dw` says.
@@ -340,7 +382,7 @@ fn ce_rows(
     reduction: Reduction,
     operands: GemmOperands,
     ws: &CeWorkspace,
-    grads: Option<Grads<'_>>,
+    mut grads: Option<Grads<'_, '_>>,
 ) -> Result<CeOutput, String> {
     let n = rows.len();
     if n == 0 {
@@ -401,7 +443,11 @@ fn ce_rows(
         if !g.scale.is_finite() {
             return Err(format!("{what}: scale must be finite"));
         }
-        let (dw_name, dw, dw_want) = ("dw", g.dw.target(), [vs, hs]);
+        // A chunked dW goes through a `[chunk, hidden]` scratch.
+        let (dw_name, dw, dw_want) = match &g.dw {
+            DwOut::Overwrite(t) | DwOut::Add(t) => ("dw", *t, [vs, hs]),
+            DwOut::Chunks { scratch, .. } => ("dw scratch", *scratch, [ws.chunk as usize, hs]),
+        };
         for (name, t, want) in [("dh", g.dh, [n, hs]), (dw_name, dw, dw_want)] {
             t.validate().map_err(|e| format!("{what}: {name}: {e}"))?;
             if !Arc::ptr_eq(t.runtime(), rt) {
@@ -509,7 +555,7 @@ fn ce_rows(
     }
 
     // 3. Second walk: the gradients.
-    if let Some(g) = &grads {
+    if let Some(g) = &mut grads {
         let scale = match reduction {
             Reduction::Mean => g.scale / n as f32,
             Reduction::Sum => g.scale,
@@ -548,9 +594,14 @@ fn ce_rows(
                 operands.nn_acc(&dlogits, &wc, g.dh)?;
             }
             // dW rows [v0, v0 + w) (+)= dlogitsᵀ @ h.
-            match &g.dw {
+            match &mut g.dw {
                 DwOut::Overwrite(dw) => operands.tn(&dlogits, &h_op, &dw.try_view(&[w, hs], v0 * hs)?)?,
                 DwOut::Add(dw) => operands.tn_acc(&dlogits, &h_op, &dw.try_view(&[w, hs], v0 * hs)?)?,
+                DwOut::Chunks { scratch, sink } => {
+                    let rows = scratch.try_view(&[w, hs], 0)?;
+                    operands.tn(&dlogits, &h_op, &rows)?;
+                    sink(v0, &rows)?;
+                }
             }
         }
     }

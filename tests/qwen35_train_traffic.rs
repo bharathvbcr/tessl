@@ -446,6 +446,76 @@ fn a_bf16_storage_cross_entropy_casts_each_operand_once() {
     });
 }
 
+/// Into a bf16 bank the head's gradient goes a chunk at a time (one
+/// `qwen35_head_rows_to_bank_bf16` per vocabulary chunk, one here) and the
+/// step's token rows once the gather has added (one
+/// `qwen35_token_rows_to_bank_bf16`), so `qwen35_deliver_f32_to_bf16` runs
+/// only for the layers' five bf16 matrices each. It ran once more, for a
+/// `[vocab, hidden]` f32 embedding gradient delivered whole.
+#[test]
+fn a_bf16_bank_takes_the_head_gradient_by_chunk() {
+    in_traced_child("a_bf16_bank_takes_the_head_gradient_by_chunk", || {
+        let count = tessl::runtime::traced_kernel_count;
+        let (_rt, model) = load(Precision::Bf16);
+        let bank = Qwen35Grads::zeros_like(&model).unwrap();
+        let kernels = [
+            "qwen35_deliver_f32_to_bf16",
+            "qwen35_head_rows_to_bank_bf16",
+            "qwen35_token_rows_to_bank_bf16",
+        ];
+        let before = kernels.map(count);
+        model
+            .train_step_into(&ids(), GemmOperands::Bf16, Supervise::Causal, &bank, false)
+            .unwrap();
+        let ran = kernels.map(count);
+        let layers = model.config().layers.len() as u64;
+        let chunks = u64::from(model.config().vocab.div_ceil(8192));
+        assert_eq!(
+            [ran[0] - before[0], ran[1] - before[1], ran[2] - before[2]],
+            [5 * layers, chunks, 1],
+            "{kernels:?}"
+        );
+    });
+}
+
+/// A step into a bf16 bank holds no `[vocab, hidden]` f32 head gradient:
+/// its peak above what it starts with stays below that tensor's size (128
+/// MiB here; 2.0 GB on the 2B, 2.5 GB at the 4B's shapes), where the head
+/// gradient was a fresh f32 tensor rounded into the bank at the end. It
+/// holds one `[8192, hidden]` chunk of it instead (32 MiB), and the peak
+/// stays under the step's bound. The device's allocation counts every
+/// runtime in the process, so this holds the lock.
+#[test]
+fn a_bf16_bank_step_holds_no_f32_head_gradient() {
+    let _g = LOCK.lock().unwrap();
+    let cfg = Qwen35Config {
+        vocab: 32_768,
+        hidden: 1024,
+        ..Qwen35Config::from_config_file(&fixture().join("config.json")).unwrap()
+    };
+    let head = cfg.vocab as u64 * cfg.hidden as u64 * 4;
+    let rt = GpuRuntime::new().unwrap();
+    let model = Qwen35Model::random_tower(&rt, cfg.clone(), Precision::Bf16, 5).unwrap();
+    let bank = Qwen35Grads::zeros_like(&model).unwrap();
+    for t in [8u32, 64] {
+        let ids: Vec<u32> = (0..t).map(|i| (i * 7_919 + 3) % cfg.vocab).collect();
+        rt.synchronize().unwrap();
+        let before = rt.current_allocated_bytes();
+        rt.reset_peak_allocated_bytes();
+        model
+            .train_step_into(&ids, GemmOperands::Bf16, Supervise::Causal, &bank, false)
+            .unwrap();
+        let peak = rt.peak_allocated_bytes().saturating_sub(before);
+        let bound = model.train_step_bytes(t, GemmOperands::Bf16);
+        eprintln!("T={t}: peak {peak} B, the f32 head gradient {head} B, bound {bound} B");
+        assert!(
+            peak < head,
+            "T={t}: peak {peak} B is not below the f32 head gradient's {head} B"
+        );
+        assert!(peak <= bound, "T={t}: peak {peak} over the bound {bound}");
+    }
+}
+
 /// Every parameter's f32 bits, as `read_parameters` lays them out.
 fn params(rt: &Arc<GpuRuntime>, model: &Qwen35Model) -> Vec<u32> {
     let ts: Vec<Tensor> = model

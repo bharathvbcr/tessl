@@ -908,10 +908,13 @@ operand copies and split-K scratch). Without async encode every dispatch waits, 
 two adjacent layers bound a window; with it, a step waits only at each
 attention layer, and the window is every layer from one attention layer to
 the next (a deliberate wait there, where a fresh workspace's host writes
-used to drain). `train_step_into` into an f32 bank writes the head gradient
-into the bank's embedding instead of holding it, and its pre-flight leaves
-it out; `train_step_bytes`, which also bounds `train_forward` followed by
-`train_backward_into`, still counts it. Against the measured peak (`GpuRuntime::peak_allocated_bytes`,
+used to drain). `train_step_into` never holds the head gradient whole: into
+an f32 bank the cross-entropy's GEMMs write it into the bank's embedding,
+and into a bf16 bank it goes a `[8192, hidden]` chunk at a time, each
+element rounded once, with the step's token rows held in f32 until the
+embedding gather has added to them. Its pre-flight counts that chunk and
+those rows instead; `train_step_bytes`, which also bounds `train_forward`
+followed by `train_backward_into`, still counts the whole tensor. Against the measured peak (`GpuRuntime::peak_allocated_bytes`,
 sampled at every buffer the pool creates) from an empty freelist, bank
 resident, no moments:
 

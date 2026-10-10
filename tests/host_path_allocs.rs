@@ -84,6 +84,7 @@ fn a_pipeline_cache_hit_allocates_nothing_in_either_mode() {
 /// of every token.
 #[test]
 fn decode_path_entry_points_allocate_nothing_on_success() {
+    use tessl::gemm::gemm_bf16;
     use tessl::qwen35::{
         self, AttnProjLayout, AttnShape, AttnTargets, Cols, GdnParams, GdnProjLayout, OutCols, SharedPrefix, StateIn,
     };
@@ -169,6 +170,8 @@ fn decode_path_entry_points_allocate_nothing_on_success() {
             Box::new(|| nn::rms_norm_bf16(rt, &resid.buffer, &norm_w, &xb.buffer, 1, H as u32, 1e-6)),
         ),
         ("gemm (in-proj)", Box::new(|| gemm(&xb, &g_w, &g_proj, backend))),
+        // Operands already bf16: borrowed, not cloned into new `Tensor`s.
+        ("gemm_bf16 (in-proj)", Box::new(|| gemm_bf16(&xb, &g_w, &g_proj))),
         (
             "qwen35::conv1d_silu",
             Box::new(|| {

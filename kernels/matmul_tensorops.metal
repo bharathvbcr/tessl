@@ -14,6 +14,7 @@
 #include <metal_stdlib>
 #include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>
 #include "gelu.h"
+#include "qwen35_act.h"
 
 using namespace metal;
 using namespace mpp::tensor_ops;
@@ -756,6 +757,96 @@ kernel void matmul2d_tensorops_bf16_f32(
 NN_COOP_KERNEL(matmul2d_tensorops_bf16_f32_64x64_sg4,  bfloat,  64, 64, 4, false)
 NN_COOP_KERNEL(matmul2d_tensorops_f32_relaxed,            float, 128, 64, 4, true)
 NN_COOP_KERNEL(matmul2d_tensorops_f32_relaxed_64x64_sg4,  float,  64, 64, 4, true)
+
+/// Gate, up and SwiGLU in one dispatch: `out = bf16(silu(A @ Bg) * (A @ Bu))`,
+/// the gated MLP's activation from its two projections, with `Bg` and `Bu`
+/// the separate `[K, N]` gate and up weights. Each threadgroup runs both
+/// products over the same A rows and B columns into two register
+/// accumulators (each exactly the accumulator `mm_nn_coop_f32acc` builds at
+/// this geometry), combines them as `qwen35_swiglu_bf16` does and stores the
+/// bf16 product: the f32 gate and up are never written, nor read back, nor is
+/// there a second dispatch. Out is dense `[M, N]`.
+/// One tile of `mm_nn_coop_swiglu`: both products into register
+/// accumulators, `silu(g) * u` rounded to bf16 on the store.
+template <typename Op, typename TA, typename TB, typename TO>
+inline void swiglu_tile(thread const Op &op, thread TA &tA, thread TB &tBg, thread TB &tBu, thread TO &tO) {
+    using A_ = metal::remove_addrspace_t<TA>;
+    using B_ = metal::remove_addrspace_t<TB>;
+    auto g = op.template get_destination_cooperative_tensor<A_, B_, float>();
+    auto u = op.template get_destination_cooperative_tensor<A_, B_, float>();
+#pragma clang loop unroll(full)
+    for (uint16_t i = 0; i < g.get_capacity(); ++i) {
+        g.set(i, 0.0f);
+        u.set(i, 0.0f);
+    }
+    op.run(tA, tBg, g);
+    op.run(tA, tBu, u);
+    auto o = op.template get_destination_cooperative_tensor<A_, B_, bfloat>();
+#pragma clang loop unroll(full)
+    for (uint16_t i = 0; i < o.get_capacity(); ++i)
+        if (g.is_valid_element(i)) o[i] = bfloat(qwen35_silu(g[i]) * u[i]);
+    o.store(tO);
+}
+
+template <typename ElemT, int SM, int SN, int NSG, bool RELAXED>
+inline void mm_nn_coop_swiglu(device ElemT *A, device ElemT *Bg, device ElemT *Bu,
+                              device bfloat *Out, uint M, uint N, uint K,
+                              uint tiles_n, uint tiles_m, uint tgpig) {
+    constexpr auto d = matmul2d_descriptor(
+        SM, SN, dynamic_length_v<int>, false, false, RELAXED,
+        matmul2d_descriptor::mode::multiply);
+    matmul2d<d, execution_simdgroups<NSG>> op;
+
+    // The plain kernel's tile walk, so each tile's products are its own.
+    uint2 tile;
+    if (tiles_n * tiles_m >= 2048u) {
+        tile = tile_from_linear_panel(tgpig, tiles_n, tiles_m, 8u);
+    } else {
+        tile = tile_from_linear(tgpig, tiles_n, tiles_m);
+    }
+    if (tile.x >= tiles_n || tile.y >= tiles_m) return;
+    int tx = (int)tile.x * SN;
+    int ty = (int)tile.y * SM;
+
+    // Interior tiles take offset pointer tensors, edges the bounds-checked
+    // slices, as `mm_nn_coop_f32acc` does.
+    if ((tx + SN <= (int)N) && (ty + SM <= (int)M)) {
+        auto tA = tensor(A + ty * (int)K, dextents<int, 2>{(int)K, SM}, array<int, 2>{1, (int)K});
+        auto tBg = tensor(Bg + tx, dextents<int, 2>{SN, (int)K}, array<int, 2>{1, (int)N});
+        auto tBu = tensor(Bu + tx, dextents<int, 2>{SN, (int)K}, array<int, 2>{1, (int)N});
+        auto tO = tensor(Out + ty * (int)N + tx, dextents<int, 2>{SN, SM}, array<int, 2>{1, (int)N});
+        swiglu_tile(op, tA, tBg, tBu, tO);
+    } else {
+        auto mA = tensor(A, dextents<int, 2>{(int)K, (int)M}, array<int, 2>{1, (int)K});
+        auto mBg = tensor(Bg, dextents<int, 2>{(int)N, (int)K}, array<int, 2>{1, (int)N});
+        auto mBu = tensor(Bu, dextents<int, 2>{(int)N, (int)K}, array<int, 2>{1, (int)N});
+        auto mO = tensor(Out, dextents<int, 2>{(int)N, (int)M}, array<int, 2>{1, (int)N});
+        auto tA = mA.slice(0, ty);
+        auto tBg = mBg.slice(tx, 0);
+        auto tBu = mBu.slice(tx, 0);
+        auto tO = mO.slice(tx, ty);
+        swiglu_tile(op, tA, tBg, tBu, tO);
+    }
+}
+
+#define NN_COOP_SWIGLU_KERNEL(NAME, ELEM, SM, SN, NSG, RELAXED)                \
+    kernel void NAME(device ELEM *A [[buffer(0)]],                             \
+                     device ELEM *Bg [[buffer(1)]],                            \
+                     device ELEM *Bu [[buffer(2)]],                            \
+                     device bfloat *Out [[buffer(3)]],                         \
+                     constant uint &M [[buffer(4)]],                           \
+                     constant uint &N [[buffer(5)]],                           \
+                     constant uint &K [[buffer(6)]],                           \
+                     constant uint &tiles_n [[buffer(7)]],                     \
+                     constant uint &tiles_m [[buffer(8)]],                     \
+                     uint tgpig [[threadgroup_position_in_grid]]) {            \
+        mm_nn_coop_swiglu<ELEM, SM, SN, NSG, RELAXED>(                         \
+            A, Bg, Bu, Out, M, N, K, tiles_n, tiles_m, tgpig);                 \
+    }
+
+// The two bf16 geometries `gemm` picks between (`nn_coop_kernel`).
+NN_COOP_SWIGLU_KERNEL(matmul2d_tensorops_bf16_swiglu,           bfloat, 128, 64, 4, false)
+NN_COOP_SWIGLU_KERNEL(matmul2d_tensorops_bf16_swiglu_64x64_sg4, bfloat,  64, 64, 4, false)
 
 /// Epilogue variants: `C = act(alpha * A@B + beta * C_prev + bias)`.
 ///

@@ -545,13 +545,13 @@ impl PingPongCbReplay {
     /// Advances the ping-pong ledger (record → Ready → flip). Does **not**
     /// claim a Metal replay — callers must still `begin`→encode→`end`→commit.
     /// [`Self::try_replay`] stays [`CbReplayError::NotWired`] (unless dry_run).
-    pub fn mark_live_step(&mut self, label: impl Into<String>) -> Result<(), CbReplayError> {
+    pub fn mark_live_step(&mut self, label: impl AsRef<str>) -> Result<(), CbReplayError> {
         self.mark_step_inner(label, true)
     }
 
     /// Bookkeeping after a DecodeIcb **replay** that skipped host layer encode.
     /// Advances Ready for the next token without incrementing `live_encodes`.
-    pub fn mark_replay_step(&mut self, label: impl Into<String>) -> Result<(), CbReplayError> {
+    pub fn mark_replay_step(&mut self, label: impl AsRef<str>) -> Result<(), CbReplayError> {
         self.mark_step_inner(label, false)
     }
 
@@ -562,13 +562,13 @@ impl PingPongCbReplay {
     /// Deliberately does **not** touch `icb_replays` or the stub's execute
     /// telemetry: no tape ran, and counting it as one made "did a tape replay
     /// actually happen?" unanswerable from the metrics.
-    pub fn note_layer_live_replay(&mut self, label: impl Into<String>) -> Result<(), CbReplayError> {
+    pub fn note_layer_live_replay(&mut self, label: impl AsRef<str>) -> Result<(), CbReplayError> {
         self.mark_replay_step(label)?;
         self.layer_live_replays = self.layer_live_replays.saturating_add(1);
         Ok(())
     }
 
-    fn mark_step_inner(&mut self, label: impl Into<String>, count_live: bool) -> Result<(), CbReplayError> {
+    fn mark_step_inner(&mut self, label: impl AsRef<str>, count_live: bool) -> Result<(), CbReplayError> {
         let slot = self.active;
         match self.slots[slot.index()].phase {
             // Recover from a partial record if a prior step erred mid-encode.
@@ -615,7 +615,7 @@ impl PingPongCbReplay {
     }
 
     /// Begin recording into `slot` (must be Idle or Ready after GPU wait).
-    pub fn begin_record(&mut self, slot: CbSlot, label: impl Into<String>) -> Result<(), CbReplayError> {
+    pub fn begin_record(&mut self, slot: CbSlot, label: impl AsRef<str>) -> Result<(), CbReplayError> {
         let s = &mut self.slots[slot.index()];
         match s.phase {
             CbReplayPhase::Idle | CbReplayPhase::Ready => {}
@@ -625,7 +625,10 @@ impl PingPongCbReplay {
         let gen = self.next_gen.fetch_add(1, Ordering::Relaxed);
         s.phase = CbReplayPhase::Recording;
         s.generation = gen;
-        s.label = label.into();
+        // Reuse the slot's buffer: this runs every decode step, and assigning
+        // a new String allocated each time even for a `&'static str` label.
+        s.label.clear();
+        s.label.push_str(label.as_ref());
         self.active = slot;
         Ok(())
     }

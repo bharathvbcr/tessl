@@ -12,7 +12,6 @@
 //! cargo run --release --bin bench_qwen35_layers -- --decode=4096  # per-token decode
 //! cargo run --release --bin bench_qwen35_layers -- --paired-gdn-recurrent 1 4
 //! cargo run --release --bin bench_qwen35_layers -- --paired-gate-up 512 2048
-//! cargo run --release --bin bench_qwen35_layers -- --paired-mlp-fused 1 512 1024 2048
 //! cargo run --release --bin bench_qwen35_layers -- --model-forward 1024 2048
 //! ```
 //!
@@ -69,12 +68,6 @@
 //! encode modes: async (16 units per command buffer) and sync, the runtime's
 //! default and ojas-qwen35's training mode, where every dispatch is its own
 //! waited commit. Default T is 512 and 2048.
-//!
-//! `--paired-mlp-fused [T...]` times the MLP's gate and up GEMMs plus
-//! `qwen35::swiglu` (f32 gate and up, bf16 product) against
-//! `gemm::gemm_swiglu_bf16` (both products and SwiGLU in one dispatch, the
-//! same bits), ABBA, alone and as the MLP block with the down projection into
-//! the residual. Default T is 1 (decode), 512, 1024 and 2048.
 //!
 //! `--model-forward [T...]` times a 24-layer prefill on `Qwen35Model` (seeded
 //! random 2B weights, bf16, no LM head; one command buffer under async
@@ -1466,73 +1459,7 @@ fn run_paired_gate_up(rt: &Arc<GpuRuntime>, ts: &[usize]) -> Res<()> {
     Ok(())
 }
 
-// ------------------------------------------------------- paired fused MLP ---
-
-/// [`paired_lanes`]' lane labels for `--paired-mlp-fused`.
-const FUSED_LANES: [&str; 2] = ["gemms_then_swiglu", "fused"];
-
-fn run_paired_mlp_fused(rt: &Arc<GpuRuntime>, ts: &[usize]) -> Res<()> {
-    const ROUNDS: (usize, usize) = (3, 15);
-    println!("paired MLP: gate GEMM + up GEMM (f32) + qwen35::swiglu vs gemm_swiglu_bf16 (one dispatch)");
-    println!("one process, ABBA, {} warmup + {} timed rounds", ROUNDS.0, ROUNDS.1);
-    let gate_w = weight(rt, HIDDEN, INTER, &weight_bits(HIDDEN, INTER, 61))?;
-    let up_w = weight(rt, HIDDEN, INTER, &weight_bits(HIDDEN, INTER, 62))?;
-    let down_w = weight(rt, INTER, HIDDEN, &weight_bits(INTER, HIDDEN, 63))?;
-    for &t in ts {
-        let x = rt.alloc_tensor_bf16(&[t, HIDDEN])?;
-        x.buffer.write_bf16_bits(&f32_slice_to_bf16(&fill(t * HIDDEN, 64, 1.0)));
-        let resid = rt.alloc_tensor_f32(&[t, HIDDEN])?;
-        resid.buffer.write_f32(&fill(t * HIDDEN, 65, 1.0));
-        let (g, u) = (rt.alloc_tensor_f32(&[t, INTER])?, rt.alloc_tensor_f32(&[t, INTER])?);
-        let (mid_a, mid_b) = (rt.alloc_tensor_bf16(&[t, INTER])?, rt.alloc_tensor_bf16(&[t, INTER])?);
-        let i = INTER as u32;
-        let act = |lane: Lane| -> Res<()> {
-            match lane {
-                Lane::Prod => {
-                    gemm(&x, &gate_w, &g, BACKEND)?;
-                    gemm(&x, &up_w, &u, BACKEND)?;
-                    let out = OutCols {
-                        cols: Cols::dense(&mid_a.buffer, i),
-                        dtype: DType::BF16,
-                    };
-                    qwen35::swiglu(
-                        rt,
-                        Cols::dense(&g.buffer, i),
-                        Cols::dense(&u.buffer, i),
-                        out,
-                        t as u32,
-                        i,
-                    )
-                }
-                Lane::Cand => gemm::gemm_swiglu_bf16(&x, &gate_w, &up_w, &mid_b),
-            }
-        };
-        let block = |lane: Lane| -> Res<()> {
-            act(lane)?;
-            let mid = if lane == Lane::Prod { &mid_a } else { &mid_b };
-            gemm_epilogue(mid, &down_w, &resid, BACKEND, residual_add())
-        };
-        // Gate: both lanes write the same nonzero bf16 product.
-        rt.set_async_encode(false)?;
-        act(Lane::Prod)?;
-        act(Lane::Cand)?;
-        rt.synchronize()?;
-        finite_nonzero(&format!("T={t} gemms then swiglu"), &mid_a, t * INTER)?;
-        // One host mapping at a time.
-        let a = mid_a.buffer.contents_u16()[..t * INTER].to_vec();
-        let b = mid_b.buffer.contents_u16()[..t * INTER].to_vec();
-        if let Some(e) = a.iter().zip(&b).position(|(x, y)| x != y) {
-            return Err(format!("T={t}: fused and unfused products differ at element {e}"));
-        }
-        println!("T={t}: gate passed; the lanes' bf16 products are identical");
-        rt.set_async_encode(true)?;
-        let reps = paired_reps(t).min(32);
-        paired_lanes(rt, t, "gate_up_swiglu", FUSED_LANES, reps, ROUNDS, act)?;
-        paired_lanes(rt, t, "mlp_block", FUSED_LANES, reps, ROUNDS, block)?;
-        rt.set_async_encode(false)?;
-    }
-    Ok(())
-}
+// ---------------------------------------------------------- model forward ---
 
 /// `--model-forward`: the model's 24-layer prefill, one lane, METRIC lines.
 fn run_model_forward(rt: &Arc<GpuRuntime>, ts: &[usize]) -> Res<()> {
@@ -1580,7 +1507,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut decode: Option<usize> = None;
     let mut paired_rec = false;
     let mut paired_gate_up = false;
-    let mut paired_fused = false;
     let mut model_forward = false;
     let mut ts = Vec::new();
     for arg in std::env::args().skip(1) {
@@ -1588,8 +1514,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             paired_rec = true;
         } else if arg == "--paired-gate-up" {
             paired_gate_up = true;
-        } else if arg == "--paired-mlp-fused" {
-            paired_fused = true;
         } else if arg == "--model-forward" {
             model_forward = true;
         } else if arg == "--decode" {
@@ -1624,7 +1548,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         } else {
             let t: usize = arg.parse().map_err(|_| {
                 format!(
-                    "expected a token count, --check-only, --paired-attn, --paired-gate-up, --paired-mlp-fused, --model-forward, --attn-rows, \
+                    "expected a token count, --check-only, --paired-attn, --paired-gate-up, --model-forward, --attn-rows, \
                      --attn-tile=LABEL, --mlp-unfused, --gdn-scan16 or --decode[=P], got {arg:?}"
                 )
             })?;
@@ -1643,18 +1567,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if paired_rec && (check_only || paired_attn) {
         return Err("--paired-gdn-recurrent takes batch sizes only".into());
     }
-    let modes = [paired_gate_up, paired_fused, model_forward]
-        .iter()
-        .filter(|&&m| m)
-        .count();
+    let modes = [paired_gate_up, model_forward].iter().filter(|&&m| m).count();
     if modes > 1 || (modes == 1 && (check_only || paired_attn || paired_rec || decode.is_some())) {
-        return Err("--paired-gate-up, --paired-mlp-fused and --model-forward each take token counts only".into());
-    }
-    if paired_fused {
-        let rt = GpuRuntime::new()?;
-        println!("device: {}", rt.device_name());
-        run_paired_mlp_fused(&rt, if ts.is_empty() { &[1, 512, 1024, 2048] } else { &ts })?;
-        return Ok(());
+        return Err("--paired-gate-up and --model-forward each take token counts only".into());
     }
     if model_forward {
         let rt = GpuRuntime::new()?;

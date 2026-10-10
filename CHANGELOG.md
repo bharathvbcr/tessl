@@ -13,7 +13,11 @@ All notable changes to `tessl` are recorded here. The format follows
   the M5 Pro, SwiGLU was 0.65x but the bf16-output GEMMs 1.06x and the
   24-layer forward 1.006-1.009x, with 1.4-1.6x the production forward's KL
   from fp32 on the real 2B (`docs/qwen35.md`, "bf16 activation inputs").
-- **Benchmarks:** `bench_qwen35_layers --paired-gate-up`,
+  A fused gate/up/SwiGLU GEMM (same bits, no layout change) was then tried
+  and removed too: the 24-layer forward was 1.034-1.037x.
+- **Benchmarks:** `bench_qwen35_layers --paired-gate-up` and
+  `--model-forward` (the model's prefill as METRIC lines for
+  `bench/paired_bins.sh`),
   `bench_qwen35_train --bf16-storage`, and op-table rows
   for a bf16 layer input's widen, norm and copy.
   `tools/qwen35_ref/make_reference.py --ids` runs the transformers reference

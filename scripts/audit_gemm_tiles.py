@@ -58,9 +58,6 @@ NN_PAIRS = [
     ("matmul2d_tensorops_f32", "TILE_F32"),
     ("matmul2d_tensorops_bf16_f32", "TILE_COOP_DEFAULT"),
     ("matmul2d_tensorops_bf16_f32_64x64_sg4", "TILE_COOP_NARROW"),
-    # gemm.rs `gemm_swiglu_dispatch`: the same two geometries, gate and up fused.
-    ("matmul2d_tensorops_bf16_swiglu", "TILE_COOP_DEFAULT"),
-    ("matmul2d_tensorops_bf16_swiglu_64x64_sg4", "TILE_COOP_NARROW"),
     ("matmul2d_tensorops_f16_f32", "TILE_COOP_DEFAULT"),
     ("matmul2d_tensorops_f16_f32_64x64_sg4", "TILE_COOP_NARROW"),
     ("matmul2d_tensorops_f32_relaxed", "TILE_COOP_DEFAULT"),

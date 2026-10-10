@@ -1286,12 +1286,21 @@ variant lost on the whole forward with more logit error, so it was removed
 rather than kept behind a switch. The production forward is the f32-input
 one.
 
-What could win is not writing gate and up at all: a GEMM that runs gate's
-and up's products in the same threadgroup over one A tile, applies SwiGLU
-in its epilogue and stores the bf16 product the down projection reads. That
-removes the f32 intermediate both ways and needs no weight layout change:
-the two B operands stay the separate `gate` and `up` tensors. Training
-cannot use it, because `swiglu_bwd` reads the f32 gate and up.
+Not writing gate and up at all was tried next (1c91d16, removed after it):
+`gemm_swiglu_bf16` ran gate's and up's products over one A tile into two
+register accumulators and stored `bf16(silu(g) * u)`. That needs no weight
+layout change, since the two B operands stay the separate `gate` and `up`
+tensors, and its output was the production bits on every tested shape and
+tile. The bar, fixed before the forward was timed, was a 24-layer forward
+at least 3% faster at T = 1024 and 2048 with no regression at T = 512 or
+decode. It was slower everywhere: the MLP block 1.02x at T = 1 and
+1.05-1.06x at T >= 512, the forward 1.037x at T = 1024 and 1.034x at 2048
+(`--model-forward`, two frozen builds interleaved by
+`bench/paired_bins.sh`). Interior tiles on offset pointers and the 64x64
+tile did no better. Two accumulators per thread double the plain kernel's
+registers, and the saved f32 traffic and dispatch do not pay for that
+(`bench/results/qwen35_fused_swiglu_gemm_m5pro.txt`). Training could not
+have used it either, because `swiglu_bwd` reads the f32 gate and up.
 
 **Training on bf16 storage**
 (`bench/results/qwen35_train_gate_up_widen_m5pro.txt`). The brief's two
@@ -1303,9 +1312,11 @@ candidates were measured before building either:
   same bits (`--paired-gate-up`): 0.91x async and 0.90x sync at T = 2048,
   but 1.07x async at T = 512. A step runs the pair 48 times (forward and
   rebuild), so at T = 2048 that is 18-25 ms of a 2.65-2.88 s bf16-storage
-  step (under 1%). It would rename `gate` and `up` to one parameter in the
-  parameter table, its torch names, the gradient bank, AdamW and the
-  loaders. Not started.
+  step (under 1%). It would replace `gate` and `up` with one packed matrix in
+  the model, the loaders, the gradient bank and AdamW's parts. The torch
+  names would not change: the parameter table already windows packed
+  matrices (`Src::Packed`). Declined: no step-level win can show, and a
+  fused SwiGLU, the inference reason to pack, lost without packing (above).
 - *A bf16-input norm, so the backward stops widening each saved layer
   input.* The widened f32 is read three times: the input norm, the residual
   copy, and `rms_norm_bwd`. All three would have to read bf16, which takes
@@ -1343,9 +1354,11 @@ span ±8% on this machine under load.
   token, so it is not a GPU-resident loop, and its speed has not been
   measured.
 - **bf16 inputs, remaining gaps.** Every kernel reads its GEMM's output as
-  f32: a bf16-input MLP measured slower and was removed (see "bf16
-  activation inputs"). The candidate left is SwiGLU fused into the gate/up
-  GEMMs' epilogue.
+  f32. A bf16-input MLP and a fused gate/up/SwiGLU GEMM both measured slower
+  and were removed (see "bf16 activation inputs"). GDN and attention were
+  not tried. A gate/up fusion that wins would need to keep one accumulator
+  per thread, for example by staging gate through threadgroup memory; that
+  is untested.
 - **Shared-prefix attention, remaining gaps.** Only head_dim 256 is compiled. The rows of
   a batch read the shared prefix independently: rows that share a head could
   share its K/V lines in one threadgroup, but no measurement says that is

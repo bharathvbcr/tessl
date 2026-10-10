@@ -586,20 +586,26 @@ fn qwen35_bwd_offsets_are_widened() {
 /// AdamW and the squared norm walk every parameter window of the model, the
 /// tied embedding's `[vocab, hidden]` included (5.1e8 elements at the 2B's
 /// 248320 x 2048, past 2^28 and an eighth of u32's range in elements, which
-/// a larger vocab or hidden size crosses); each element offset and row base
-/// is formed in 64 bits.
+/// a larger vocab or hidden size crosses); each element offset and the
+/// squared norm's piece base are formed in 64 bits. The piece loop counts in
+/// `uint` within one piece (at most 4096 elements), and the exact sum's
+/// loop over pieces in `uint` below the host's 2^27 cap, so neither wraps.
 #[test]
 fn qwen35_adamw_offsets_are_widened() {
-    require(
-        QWEN35_ADAMW,
-        "const ulong i = (ulong)r * ld + off + c;",
-        "AdamW element",
-    );
-    require(
-        QWEN35_ADAMW,
-        "const ulong base = (ulong)r * ld + off;",
-        "squared-norm row",
-    );
+    for (needle, what) in [
+        ("const ulong i = (ulong)r * ld + off + c;", "AdamW element"),
+        (
+            "const ulong base = (ulong)row * s.ld + s.off + c0;",
+            "squared-norm piece base",
+        ),
+        (
+            "const uint n = min(QWEN35_SQ_PIECE, s.width - c0);",
+            "squared-norm piece length",
+        ),
+        ("const float x = float(g[base + c]);", "squared-norm element"),
+    ] {
+        require(QWEN35_ADAMW, needle, what);
+    }
 }
 
 /// The training attention indexes [B, T, H, 256] rows and [B, H, T]
@@ -772,10 +778,11 @@ fn bert_offsets_are_widened() {
 
 /// The stored-precision AdamW and the window casts address packed `[in,
 /// total]` projections through `(row, ld, off)`: every window element is
-/// formed in 64 bits, and the squared-norm loop strides in 64 bits so a width
-/// near `u32::MAX` cannot wrap it into a hang. Dense state indices are `uint`, bounded on the host by
+/// formed in 64 bits. Dense state indices are `uint`, bounded on the host by
 /// `Window::check` (every count fits `u32`), so a grid of 256-thread blocks
-/// over them ends at thread `2^32 - 1` at most.
+/// over them ends at thread `2^32 - 1` at most. The head's chunks and the
+/// token rows into a bank embedding (`[vocab, hidden]`, 6.4e8 elements at
+/// the 4B's shapes) form every bank, chunk and side-row offset in 64 bits.
 #[test]
 fn qwen35_train_storage_offsets_are_widened() {
     for (needle, what) in [
@@ -787,10 +794,22 @@ fn qwen35_train_storage_offsets_are_widened() {
             "dst[(ulong)gid.y * dst_ld + dst_off + gid.x] = D(float(src[(ulong)gid.y * src_ld + src_off + gid.x]));",
             "window cast element",
         ),
-        ("const ulong base = (ulong)r * ld + off;", "squared-norm row"),
         (
-            "for (ulong c = t; c < (ulong)width; c += 256ul) {",
-            "squared-norm strided loop",
+            "const float s = has_src != 0u ? src[(ulong)gid.y * hidden + gid.x] : 0.0f;",
+            "head chunk element",
+        ),
+        ("side[(ulong)u * hidden + gid.x] = s;", "head chunk token row"),
+        (
+            "const ulong i = (ulong)row * hidden + gid.x;",
+            "head chunk bank element",
+        ),
+        (
+            "const ulong i = (ulong)uniq[gid.y] * hidden + gid.x;",
+            "token row bank element",
+        ),
+        (
+            "bank[i] = qwen35_delivered(bank[i], side[(ulong)gid.y * hidden + gid.x], add);",
+            "token row side element",
         ),
     ] {
         require(QWEN35_TRAIN_STORAGE, needle, what);

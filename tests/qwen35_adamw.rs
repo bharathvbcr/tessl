@@ -22,7 +22,9 @@ use tessl::qwen35_adamw::{
 };
 use tessl::qwen35_model::{Precision, Qwen35Config, Qwen35Model};
 use tessl::qwen35_params::ParamInfo;
+use tessl::qwen35_train::{MixerGrads, Qwen35Grads};
 use tessl::safetensors::SafeTensors;
+use tessl::tensor::{bf16_bits_to_f32, f32_to_bf16_bits, DType, GpuBuffer};
 use tessl::{GpuRuntime, Tensor};
 
 fn fixture() -> PathBuf {
@@ -1111,5 +1113,144 @@ fn lr_scale_refusals_move_nothing() {
         moments(&rt, &model, &table, &state),
         (m0, v0),
         "a refused step moved the moments"
+    );
+}
+
+// ---- grad_sq_norm ----------------------------------------------------------
+
+/// Every buffer of a bank: the buffer, the byte offset of its elements,
+/// their count and type.
+type Part<'a> = (&'a GpuBuffer, usize, usize, DType);
+
+fn bank_parts(g: &Qwen35Grads) -> Vec<Part<'_>> {
+    fn t(x: &Tensor) -> Part<'_> {
+        (&x.buffer, x.byte_offset(), x.numel(), x.dtype)
+    }
+    fn b(x: &GpuBuffer) -> Part<'_> {
+        (x, 0, x.nbytes() / 4, DType::F32)
+    }
+    let mut v = vec![t(&g.embed), b(&g.final_norm)];
+    for l in &g.layers {
+        v.extend([b(&l.input_norm), b(&l.post_norm)]);
+        match &l.mixer {
+            MixerGrads::Gdn(m) => v.extend([
+                t(&m.w_in),
+                t(&m.w_out),
+                b(&m.conv_w),
+                b(&m.a_log),
+                b(&m.dt_bias),
+                b(&m.norm_w),
+            ]),
+            MixerGrads::Attn(m) => v.extend([t(&m.w_in), t(&m.w_out), b(&m.q_norm), b(&m.k_norm)]),
+        }
+        v.extend([t(&l.gate), t(&l.up), t(&l.down)]);
+    }
+    v
+}
+
+/// Write `f(part, element)` into every element of every bank buffer (each
+/// value must be exact in the buffer's dtype).
+fn fill_bank(g: &Qwen35Grads, f: impl Fn(usize, usize) -> f32) {
+    for (p, (buf, off, n, dtype)) in bank_parts(g).into_iter().enumerate() {
+        match dtype {
+            DType::BF16 => {
+                let mut m = buf.contents_u16();
+                for (i, x) in m[off / 2..][..n].iter_mut().enumerate() {
+                    let v = f(p, i);
+                    *x = f32_to_bf16_bits(v);
+                    assert_eq!(bf16_bits_to_f32(*x).to_bits(), v.to_bits(), "{v} is not a bf16");
+                }
+            }
+            _ => {
+                let mut m = buf.contents_f32();
+                for (i, x) in m[off / 4..][..n].iter_mut().enumerate() {
+                    *x = f(p, i);
+                }
+            }
+        }
+    }
+}
+
+/// The gradients' squares in f64, as `read_gradients` reads them.
+fn host_squares(rt: &Arc<GpuRuntime>, model: &Qwen35Model, g: &Qwen35Grads) -> Vec<f64> {
+    let table = model.parameter_table().unwrap();
+    to_host_grads(rt, model, &table, g)
+        .into_iter()
+        .flatten()
+        .map(|x| x * x)
+        .collect()
+}
+
+fn to_host_grads(rt: &Arc<GpuRuntime>, model: &Qwen35Model, table: &[ParamInfo], g: &Qwen35Grads) -> Vec<Vec<f64>> {
+    let ts = alloc_table(rt, table);
+    model.read_gradients(g, &ts).unwrap();
+    to_host(&ts)
+}
+
+/// `grad_sq_norm` is the exact sum of the squares rounded once to f64
+/// wherever each piece of 4096 elements sums exactly in f32 in any order:
+/// here every gradient is `m * 2^s` with `m` in `0..32` and a scale `s` per
+/// parameter over `2^-14..2^6`, so a piece's squares are integers of one
+/// unit below 2^24, while the whole sum spans ~2^62 and does not fit f32
+/// (or f64: it rounds). The host forms it exactly in integers. On f32 and
+/// bf16 banks of a model with a 64 000-element embedding (16 pieces, the
+/// last short) beside the 64-wide rows of the matrices, both repeatable.
+/// Then a real step's gradients: within 2^-18 relative of the f64 sum.
+#[test]
+fn grad_sq_norm_is_the_exact_sum_rounded_once() {
+    let cfg = Qwen35Config {
+        vocab: 1000,
+        ..Qwen35Config::from_config_file(&fixture().join("config.json")).unwrap()
+    };
+    for precision in [Precision::F32, Precision::Bf16] {
+        let rt = GpuRuntime::new().unwrap();
+        let model = Qwen35Model::random_tower(&rt, cfg.clone(), precision, 3).unwrap();
+        let bank = Qwen35Grads::zeros_like(&model).unwrap();
+        let value = |p: usize, i: usize| {
+            let m = ((i as u64).wrapping_mul(0x9e37_79b9) >> 7) % 32;
+            let s = -14 + ((p * 7) % 21) as i32;
+            m as f32 * 2f32.powi(s - 10)
+        };
+        fill_bank(&bank, value);
+        // Each square is an integer number of 2^-48 (the smallest scale,
+        // squared, times 2^-20) below 2^53, so exact in f64 and in u128.
+        let units: u128 = host_squares(&rt, &model, &bank)
+            .iter()
+            .map(|&q| {
+                let u = q * 2f64.powi(48);
+                assert_eq!(u.fract(), 0.0);
+                u as u128
+            })
+            .sum();
+        let want = units as f64 * 2f64.powi(-48);
+        let got = model.grad_sq_norm(&bank).unwrap();
+        assert_eq!(
+            got.to_bits(),
+            want.to_bits(),
+            "{precision:?}: grad_sq_norm {got:e}, the exact sum rounded once {want:e}"
+        );
+        assert_eq!(
+            model.grad_sq_norm(&bank).unwrap().to_bits(),
+            got.to_bits(),
+            "{precision:?}: rerun"
+        );
+        // A non-finite gradient is a non-finite norm.
+        for (bad, check) in [
+            (f32::INFINITY, f64::is_infinite as fn(f64) -> bool),
+            (f32::NAN, f64::is_nan),
+        ] {
+            fill_bank(&bank, |p, i| if p == 3 && i == 5 { bad } else { value(p, i) });
+            let got = model.grad_sq_norm(&bank).unwrap();
+            assert!(check(got), "{precision:?}: a {bad} gradient gave {got}");
+        }
+    }
+
+    let (rt, model) = load();
+    let s = model.train_step(&ids(), GemmOperands::ExactF32).unwrap();
+    let want: f64 = host_squares(&rt, &model, &s.grads).iter().sum();
+    let got = model.grad_sq_norm(&s.grads).unwrap();
+    assert!(
+        (got - want).abs() <= 2f64.powi(-18) * want,
+        "a step's grad_sq_norm {got:e} vs {want:e} in f64"
     );
 }

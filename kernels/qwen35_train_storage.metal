@@ -368,38 +368,6 @@ QWEN35_WINDOW_CAST(qwen35_window_copy_f32_f32, float, float)
 QWEN35_WINDOW_CAST(qwen35_window_copy_bf16_f32, bfloat, float)
 QWEN35_WINDOW_CAST(qwen35_window_copy_f32_bf16, float, bfloat)
 
-/// `qwen35_sq_sum_rows_f32` over a bf16 window (a bf16 bank's gradient),
-/// each element widened: the same lanes, order and adds.
-kernel void qwen35_sq_sum_rows_bf16(
-    device const bfloat *g [[buffer(0)]],
-    device float *out [[buffer(1)]],
-    constant uint &width [[buffer(2)]],
-    constant uint &ld [[buffer(3)]],
-    constant uint &off [[buffer(4)]],
-    constant uint &out_off [[buffer(5)]],
-    uint r [[threadgroup_position_in_grid]],
-    uint t [[thread_index_in_threadgroup]],
-    uint lane [[thread_index_in_simdgroup]],
-    uint sg [[simdgroup_index_in_threadgroup]],
-    uint n_sg [[simdgroups_per_threadgroup]])
-{
-    threadgroup float part[32];
-    const ulong base = (ulong)r * ld + off;
-    float s = 0.0f;
-    for (ulong c = t; c < (ulong)width; c += 256ul) {
-        const float x = float(g[base + c]);
-        s = fma(x, x, s);
-    }
-    s = simd_sum(s);
-    if (lane == 0) part[sg] = s;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (t == 0) {
-        float total = 0.0f;
-        for (uint i = 0; i < n_sg; ++i) total += part[i];
-        out[out_off + r] = total;
-    }
-}
-
 /// An 8-bit moment written from, or read into, dense f32 values (a
 /// checkpoint): `first` picks the m code, else the v code (whose f32 value
 /// is v itself, not its square root). One threadgroup of 256 per block.

@@ -884,28 +884,94 @@ def case_adamw(seed):
         FAILURES.append("adamw: grad_scale too weak to test")
 
 
-def case_sq_sum_rows(seed):
-    """qwen35_sq_sum_rows_f32, the rows of Qwen35Model::grad_sq_norm: each
-    row's sum of squares over one window (ld > width, off > 0), from 256
-    threads' f32 partials through a kernel-scope threadgroup array, written at
-    out_off + row and nowhere else. Widths of one simdgroup with idle lanes,
-    not a lane multiple, a second pass over the row with a tail, and 4 full
-    passes; against f64."""
+def _exact_sum_f64(words, top):
+    """What Qwen35Model::grad_sq_norm makes of qwen35_sum_exact_f32's output
+    (src/qwen35_adamw.rs, exact_sum_f64)."""
+    import math
+    if top > 0x7F800000:
+        return float("nan")
+    if top == 0x7F800000:
+        return float("inf")
+    total = sum(int(w) << (32 * i) for i, w in enumerate(words))
+    return math.ldexp(float(total), max(top >> 23, 1) - 226)
+
+
+def _sum_exact(x):
+    """Run qwen35_sum_exact_f32 over the f32 values `x`; (f64 result, top bits)."""
+    n = x.numel()
+    out = run("qwen35_sum_exact_f32", dict(n=n), {"x": x.float()}, {"out": ("f32", 5)})["out"]
+    w = [int(v) & 0xFFFFFFFF for v in out.view(torch.int32).tolist()]
+    return _exact_sum_f64(w[:4], w[4]), w[4]
+
+
+def _exactly_rounded(x):
+    """The exact sum of the f32 values `x`, rounded once to f64."""
+    from fractions import Fraction
+    return float(sum((Fraction(v) for v in x.double().tolist()), Fraction(0)))
+
+
+def case_sq_sum_pieces(seed):
+    """qwen35_sq_sum_pieces then qwen35_sum_exact_f32, Qwen35Model::grad_sq_norm's
+    two dispatches. The pieces: windows of an f32 and a bf16 buffer (ld > width,
+    off > 0, a start inside the buffer), a width of one simdgroup with idle
+    lanes, rows of exactly one piece, rows of several with a short last one;
+    each piece's sum of squares against f64, written at its own index and
+    nowhere past the last. The sum: those pieces added exactly and rounded once
+    (against Python's exact rational sum), a set whose low 64-bit words carry,
+    subnormals and zeros, a value 2^-100 below the largest dropped, and an
+    infinity and a NaN reported as such."""
     g = seeded(seed)
-    for rows, width in ((3, 7), (4, 37), (5, 300), (2, 1024)):
-        ld, off, out_off, n_out = width + 5, 3, 2, rows + 4
-        gr = torch.randn(rows, ld, generator=g)
-        sentinel = torch.full((n_out,), -7.0)
-        out = run("qwen35_sq_sum_rows_f32", dict(rows=rows, width=width, ld=ld, off=off, out_off=out_off),
-                  {"g": gr, "out": sentinel}, {"out": ("f32", n_out)})["out"]
-        want = (gr[:, off:off + width].double() ** 2).sum(1)
-        tag = f"sq_sum_rows {rows}x{width}"
-        check(tag, out[out_off:out_off + rows], want, 0.0, 1e-6)
-        rest = torch.cat([out[:out_off], out[out_off + rows:]])
-        ok = bool((rest == -7.0).all())
-        print(f"  [{'ok  ' if ok else 'FAIL'}] {tag}: nothing written outside out_off + row")
+    gf = torch.randn(40_000, generator=g)
+    gb = (torch.randn(30_000, generator=g) * 3).to(torch.bfloat16)
+    # (bf16, start, rows, width, ld, off)
+    windows = [(0, 5, 3, 7, 9, 1), (1, 3, 2, 4096, 4100, 2), (0, 100, 1, 9000, 9000, 0),
+               (1, 9000, 4, 300, 305, 4), (0, 20_000, 2, 4097, 4200, 3)]
+    params = dict(n_slots=len(windows))
+    want = []
+    for i, (bf, start, rows, width, ld, off) in enumerate(windows):
+        params.update({f"s{i}_bf16": bf, f"s{i}_start": start, f"s{i}_rows": rows, f"s{i}_width": width,
+                       f"s{i}_ld": ld, f"s{i}_off": off})
+        src = (gb.float() if bf else gf).double()
+        for r in range(rows):
+            row = src[start + r * ld + off:][:width]
+            for c0 in range(0, width, 4096):
+                want.append((row[c0:c0 + 4096] ** 2).sum())
+    pieces, extra = len(want), 3
+    sentinel = torch.full((pieces + extra,), -7.0)
+    out = run("qwen35_sq_sum_pieces", params, {"g": gf, "gb": gb.view(torch.int16), "out": sentinel},
+              {"out": ("f32", pieces + extra)})["out"]
+    check("sq_sum_pieces", out[:pieces], torch.stack(want), 0.0, 4e-6)
+    ok = bool((out[pieces:] == -7.0).all())
+    print(f"  [{'ok  ' if ok else 'FAIL'}] sq_sum_pieces: nothing written past the last piece")
+    if not ok:
+        FAILURES.append("sq_sum_pieces past the last piece")
+
+    def exact(tag, x):
+        got, _ = _sum_exact(x)
+        want = _exactly_rounded(x)
+        ok = got == want
+        print(f"  [{'ok  ' if ok else 'FAIL'}] sum_exact {tag}: {got!r}" + ("" if ok else f" want {want!r}"))
         if not ok:
-            FAILURES.append(f"{tag} outside its rows")
+            FAILURES.append(f"sum_exact {tag}")
+
+    exact("of the pieces", out[:pieces])
+    # 1.0 sets the fixed point; each (2 - 2^-23) * 2^-37 fills the low word to
+    # just under 2^64 units, so every add after the first carries.
+    exact("carrying", torch.cat([torch.ones(1), torch.full((1000,), (2 - 2 ** -23) * 2 ** -36)]))
+    exact("zeros and subnormals", torch.tensor([0.0, 1e-45, 3e-40, 0.0, 2e-38]))
+    exact("random magnitudes", torch.rand(5000, generator=g) * torch.exp2(torch.randint(-60, 20, (5000,), generator=g)))
+    dropped, _ = _sum_exact(torch.tensor([1.0, 2.0 ** -100]))
+    ok = dropped == 1.0
+    print(f"  [{'ok  ' if ok else 'FAIL'}] sum_exact: a value 2^-100 of the largest is dropped ({dropped!r})")
+    if not ok:
+        FAILURES.append("sum_exact truncation")
+    for tag, x, want_top in (("inf", [1.0, float("inf"), 2.0], 0x7F800000),
+                             ("nan", [1.0, float("inf"), float("nan")], 0x7FC00000)):
+        got, top = _sum_exact(torch.tensor(x))
+        ok = top == want_top and (got != got if tag == "nan" else got == float("inf"))
+        print(f"  [{'ok  ' if ok else 'FAIL'}] sum_exact {tag}: {got!r} (top {top:#x})")
+        if not ok:
+            FAILURES.append(f"sum_exact {tag}")
 
 
 def _expand_macros(src):
@@ -1219,7 +1285,7 @@ CASES = [
     ("score", lambda: [case_score(bf, 18) for bf in (False, True)]),
     ("scatter_add_rows", lambda: case_scatter_add_rows(73)),
     ("adamw", lambda: case_adamw(74)),
-    ("sq_sum_rows", lambda: case_sq_sum_rows(75)),
+    ("sq_sum_pieces", lambda: case_sq_sum_pieces(75)),
 ]
 
 

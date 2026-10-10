@@ -49,6 +49,7 @@ use crate::nn::require_runtime;
 use crate::qwen35_model::{Precision, Qwen35Model};
 use crate::qwen35_params::{check, slots, window_copy, Slot, Window};
 use crate::qwen35_train::Qwen35Grads;
+use crate::runtime::mtl_size;
 use crate::runtime::GpuRuntime;
 use crate::tensor::{DType, GpuBuffer, Tensor};
 
@@ -114,6 +115,18 @@ pub const MOMENT_BLOCK: usize = 256;
 /// `kernels/qwen35_train_storage.metal`, which asserts the same size): seven
 /// GPU addresses, six `u32`s, the eight scalars, the five-word key and a pad.
 const SLOT_BYTES: usize = 136;
+
+/// Bytes of one entry of `qwen35_sq_sum_pieces`'s table (`Qwen35SqSumSlot`
+/// in `kernels/qwen35_adamw.metal`, which asserts the same size): the
+/// window's GPU address, then eight `u32`s.
+const SQ_SLOT_BYTES: usize = 40;
+
+/// Elements of one `qwen35_sq_sum_pieces` piece (`QWEN35_SQ_PIECE`).
+const SQ_PIECE: usize = 4096;
+
+/// Most pieces `qwen35_sum_exact_f32` adds: below 2^27, its 128-bit sum of
+/// values below 2^100 units keeps its top bit clear.
+const SQ_MAX_PIECES: u64 = (1 << 27) - 1;
 
 /// An [`AdamW`]'s stored precision.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -597,6 +610,24 @@ pub fn adamw_step(
     })
 }
 
+/// What `qwen35_sum_exact_f32` wrote, as f64: `words` (least significant
+/// first) are the exact sum in units of `2^(etop - 226)`, where `etop` is
+/// the biased exponent of `top`, the largest value's bits (a subnormal's
+/// counted as 1). The integer is rounded to f64 once; the scaling is by a
+/// power of two, so exact. A `top` that is not finite is the result: NaN
+/// for any NaN, else +inf.
+fn exact_sum_f64(words: [u32; 4], top: u32) -> f64 {
+    if top > 0x7f80_0000 {
+        return f64::NAN;
+    }
+    if top == 0x7f80_0000 {
+        return f64::INFINITY;
+    }
+    let sum = words.iter().rev().fold(0u128, |acc, &w| (acc << 32) | u128::from(w));
+    let etop = (top >> 23).max(1) as i32;
+    sum as f64 * 2f64.powi(etop - 226)
+}
+
 /// The stored-precision step kernel for a parameter window of `p`, its
 /// gradient's dtype `g`, and `config`.
 /// The step kernel's name: `qwen35_adamw_f32_plain_gf32_m{mom}` for an f32
@@ -941,46 +972,83 @@ impl Qwen35Model {
     /// The sum of squares of every gradient in `grads` (this model's
     /// [`Qwen35Model::train_step`], or a bank, f32 or bf16), over the
     /// parameters of [`Qwen35Model::parameter_table`]: the square of the
-    /// global L2 norm `torch.nn.utils.clip_grad_norm_` takes. Each row of
-    /// each gradient is summed in f32 on the GPU in a fixed order and the
-    /// rows are added in f64, so it is deterministic; torch's own reduction
-    /// order differs, so the two agree to rounding, not bits.
+    /// global L2 norm `torch.nn.utils.clip_grad_norm_` takes.
+    ///
+    /// One command buffer and one wait: a table-driven dispatch sums the
+    /// squares of every gradient in pieces of at most 4096 elements (f32,
+    /// in a fixed order: each piece is within 64 f32 roundings, `2^-18`, of
+    /// its exact sum), and a second adds the pieces exactly in integer
+    /// arithmetic, which the host rounds to f64 once. So it is
+    /// deterministic, and within `2^-18` relative of the exact sum of the
+    /// gradients' squares (a non-finite gradient gives a non-finite result);
+    /// torch's own reduction order differs, so the two agree to rounding,
+    /// not bits.
     pub fn grad_sq_norm(&self, grads: &Qwen35Grads) -> Result<f64, String> {
         const WHAT: &str = "Qwen35Model::grad_sq_norm";
         let ps = slots(self, Some(grads)).map_err(|e| format!("{WHAT}: {e}"))?;
-        let mut plan = Vec::with_capacity(ps.len());
-        let mut rows = 0usize;
+        let mut words = Vec::with_capacity(ps.len() * SQ_SLOT_BYTES / 4);
+        let mut pieces = 0u64;
         for s in &ps {
             let name = &s.info.name;
             let w = s
                 .grad_window()
                 .ok_or_else(|| format!("{WHAT}: {name} has no gradient"))?;
+            // f32 or bf16, non-empty, every extent within u32.
             w.check(format_args!("{WHAT}: {name} gradient"))?;
-            let n = w.rows;
-            plan.push((w, rows));
-            rows += n;
+            let per_row = w.width.div_ceil(SQ_PIECE);
+            let first = pieces;
+            pieces += (w.rows * per_row) as u64;
+            if pieces > SQ_MAX_PIECES {
+                return Err(format!(
+                    "{WHAT}: the gradients exceed {SQ_MAX_PIECES} pieces of {SQ_PIECE}"
+                ));
+            }
+            let addr = w.buf.metal().gpuAddress().wrapping_add(w.byte_off as u64);
+            words.extend([
+                addr as u32,
+                (addr >> 32) as u32,
+                w.rows as u32,
+                w.width as u32,
+                w.ld as u32,
+                w.off as u32,
+                per_row as u32,
+                first as u32,
+                u32::from(w.dtype == DType::BF16),
+                0,
+            ]);
         }
-        u32::try_from(rows).map_err(|_| format!("{WHAT}: {rows} rows exceed u32"))?;
-        // Every row is written: the windows' offsets tile `0..rows`, and each
-        // threadgroup stores its row's sum.
-        let out = self.rt.alloc_tensor_unzeroed(&[rows], DType::F32)?;
-        let (p_bf16, p_f32) = (
-            self.rt.pipeline("qwen35_sq_sum_rows_bf16")?,
-            self.rt.pipeline("qwen35_sq_sum_rows_f32")?,
+        if ps.is_empty() {
+            return Ok(0.0);
+        }
+        debug_assert_eq!(words.len() * 4, ps.len() * SQ_SLOT_BYTES);
+        let n_pieces = pieces as usize;
+        // Every piece and every word of `out` is written by the kernels.
+        let parts = self.rt.alloc_tensor_unzeroed(&[n_pieces], DType::F32)?;
+        let out = self.rt.alloc_buffer(5 * 4)?;
+        // Fresh, so written without waiting for the GPU.
+        let table = self.rt.alloc_buffer_from_u32(&words)?;
+        let (p_pieces, p_sum) = (
+            self.rt.pipeline("qwen35_sq_sum_pieces")?,
+            self.rt.pipeline("qwen35_sum_exact_f32")?,
         );
-        for (w, at) in &plan {
-            let p = if w.dtype == DType::BF16 { &p_bf16 } else { &p_f32 };
-            dispatch_2d_tg(&self.rt, p, w.rows, 1, 256, |bnd| {
-                set_gpu_buf_offset(bnd, w.buf, w.byte_off, 0);
-                set_gpu_buf_offset(bnd, &out.buffer, out.byte_offset(), 1);
-                set_u32(bnd, w.width as u32, 2);
-                set_u32(bnd, w.ld as u32, 3);
-                set_u32(bnd, w.off as u32, 4);
-                set_u32(bnd, *at as u32, 5);
-            })?;
-        }
+        // Both in one encode: one commit, so one wait whatever the encode
+        // mode. The binder's barrier after the first orders the second.
+        self.rt.with_binder(|bnd| {
+            bnd.set_pipeline(&p_pieces);
+            set_gpu_buf(bnd, &table, 0);
+            set_u32(bnd, ps.len() as u32, 1);
+            set_gpu_buf_offset(bnd, &parts.buffer, parts.byte_offset(), 2);
+            bnd.dispatch(mtl_size(n_pieces, 1, 1), mtl_size(256, 1, 1));
+            bnd.set_pipeline(&p_sum);
+            set_gpu_buf_offset(bnd, &parts.buffer, parts.byte_offset(), 0);
+            set_gpu_buf(bnd, &out, 1);
+            set_u32(bnd, pieces as u32, 2);
+            bnd.dispatch(mtl_size(1, 1, 1), mtl_size(256, 1, 1));
+            Ok(())
+        })?;
         self.rt.synchronize()?;
-        Ok(out.read_f32()?.iter().map(|&x| f64::from(x)).sum())
+        let r = out.try_contents_u32()?;
+        Ok(exact_sum_f64([r[0], r[1], r[2], r[3]], r[4]))
     }
 
     /// Copy one of `state`'s moments into `dst`, one dense f32 tensor per
@@ -1141,5 +1209,33 @@ mod step_kernel_tests {
                 }
             }
         }
+    }
+
+    /// `qwen35_sum_exact_f32`'s words read back as the 128-bit sum in units
+    /// of `2^(etop - 226)`, rounded to f64 once (to nearest, ties to even);
+    /// a largest value that is not finite is the result.
+    #[test]
+    fn exact_sum_words_round_once() {
+        let one = 1.0f32.to_bits();
+        // 1.0 at its own exponent is 2^99 units: bit 3 of the top word.
+        let at = |bit: u32| {
+            let mut w = [0u32; 4];
+            w[(bit / 32) as usize] |= 1 << (bit % 32);
+            w
+        };
+        let or = |a: [u32; 4], b: [u32; 4]| [a[0] | b[0], a[1] | b[1], a[2] | b[2], a[3] | b[3]];
+        assert_eq!(exact_sum_f64(at(99), one), 1.0);
+        assert_eq!(exact_sum_f64(or(at(99), at(47)), one), 1.0 + 2f64.powi(-52));
+        // Below f64's resolution at 1: to nearest, a tie to even.
+        assert_eq!(exact_sum_f64(or(at(99), at(39)), one), 1.0);
+        assert_eq!(exact_sum_f64(or(at(99), at(46)), one), 1.0);
+        assert_eq!(exact_sum_f64(or(or(at(99), at(47)), at(46)), one), 1.0 + 2f64.powi(-51));
+        assert_eq!(exact_sum_f64([u32::MAX; 4], one), 2f64.powi(29));
+        // A subnormal largest value counts as exponent 1.
+        assert_eq!(exact_sum_f64(at(76), 1), 2f64.powi(-149));
+        assert_eq!(exact_sum_f64([0; 4], 0), 0.0);
+        assert_eq!(exact_sum_f64([0; 4], 0x7f80_0000), f64::INFINITY);
+        assert!(exact_sum_f64([0; 4], 0x7fc0_0000).is_nan());
+        assert!(exact_sum_f64([0; 4], 0xffc0_0000).is_nan());
     }
 }

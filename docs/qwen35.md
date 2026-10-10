@@ -336,9 +336,11 @@ float `select`, may be optimised away.
 
 ## Numerics
 
-- **fp32 inside, bf16 only on the way into a GEMM.** Activations are f32, since
-  tessl's GEMM writes f32. The gated norm and output gate can round once to bf16
-  on store, so they feed a bf16 GEMM directly.
+- **fp32 inside, bf16 only on the way into a GEMM.** Activations are f32, as
+  the forward's GEMMs write them. The gated norm and output gate can round once
+  to bf16 on store, so they feed a bf16 GEMM directly. (The GEMM can also round
+  its C to bf16; only the opt-in bf16 MLP inputs use that, see "bf16
+  activation inputs".)
 - **The GDN gate is Qwen3.5's**: `g = −exp(A_log)·softplus(a + dt_bias)`,
   `β = sigmoid(b)`, no clamp. This is *not* the nanolab GDN in
   `tests/common/gdn.rs`, whose sigmoid gate and clamp belong to a different
@@ -1225,6 +1227,98 @@ TensorOps peak), take about 0.8 s. Attention takes 6 × 43 ms, the GDN chunked
 rule 18 × 8.4 ms, and SwiGLU + cast 24 × 3.6 ms. At 1024 the GDN chunked rule
 is the largest non-GEMM share: 18 × 1.4 ms.
 
+### bf16 activation inputs
+
+The question was whether the kernels that read a GEMM's output should read
+it as bf16, halving their read traffic. Only kernels that read a GEMM
+output are candidates. The residual norms read the residual stream, which
+stays f32 in both precisions because the projections' epilogues accumulate
+into it. Per token per layer, the bytes each projection's readers would no
+longer read (and the GEMM would no longer write):
+
+| projection | f32 columns read | readers | saved read + write per token per layer |
+|---|---|---|---|
+| MLP gate, up | 2 x 6144 | `swiglu` | 24 + 24 KiB |
+| GDN in-proj | 8224 (q, k, v, z, b, a) | `conv1d_silu`, the scan's gates, `gated_rms_norm`'s z | 16 + 16 KiB |
+| attention in-proj | 5120 (q, gate, k, v) | `attn_qk_norm_rope*`, `attn_output_gate` | 10 + 10 KiB |
+
+Over the 2B's 24 MLPs, 18 GDN and 6 attention layers that is 1.9 MB per
+token, 62% of it the MLP's. Where the cast lives: in the producing GEMM's
+store, not in a pass of its own, which would read and write the f32 again.
+`gemm` takes a bf16 C on the bf16 TensorOps path
+(`matmul2d_tensorops_bf16_bf16` and its 64x64 twin), rounding the f32
+accumulator with the `bfloat(x)` the cast kernel uses, so its bits are the
+f32 C's followed by `cast_f32_to_bf16` (`tests/gemm_correctness.rs`).
+
+Built: the MLP only. It is most of the traffic and has one reader.
+`qwen35_swiglu_bf16_bf16` (`qwen35::swiglu_bf16_inputs`) reads bf16 gate
+and up with f32 arithmetic, and `Qwen35Model::set_bf16_mlp_inputs` switches
+the inference MLP, prefill and decode, onto them. GDN and attention were not
+built: each projection has three or more readers, and their decode and
+varlen variants, all of which would need bf16 twins.
+
+Accuracy, on the real 2B against transformers' fp32 and bf16 forwards
+(`bf16_forward_is_no_worse_than_transformers_bf16`, whose bound, no further
+from fp32 than transformers' bf16 by mean KL or by top-1 misses, now gates
+both; `bench/results/qwen35_bf16_mlp_inputs_logits_m5pro.txt`):
+
+| tokens | transformers bf16 | tessl bf16 | tessl bf16, bf16 MLP inputs |
+|---|---|---|---|
+| 155 (prompt) | KL 5.5e-4, 5 misses | KL 3.0e-5, 1 miss | KL 4.3e-5, 1 miss |
+| 512 (natural text) | KL 3.7e-4, 5 misses | KL 2.8e-5, 4 misses | KL 4.3e-5, 4 misses |
+
+The variant passes with room (1.4-1.6x the production forward's KL, 9-13x
+under transformers' bf16). The checkpoint was Qwen/Qwen3.5-2B; this machine
+had no Base weights, and the two share a byte-identical `config.json`.
+
+Speed, paired and interleaved in one process (`bench_qwen35_layers
+--paired-mlp-inputs`, ratio bf16 inputs / f32 inputs, median of 15 round
+ratios, or 11 for the forward;
+`bench/results/qwen35_bf16_mlp_inputs_paired_m5pro.txt`):
+
+| T | `swiglu` | gate + up GEMMs | MLP block | 24-layer forward |
+|---|---|---|---|---|
+| 1024 | 0.66 | 1.06 | 1.02 | 1.009 |
+| 2048 | 0.65 | 1.06 | 1.01 | 1.006 |
+
+SwiGLU itself is a third faster, but the GEMMs lose more than it saves. They
+are compute-bound at these shapes, and the f32 cooperative store is nearly
+free. Storing through a bfloat destination tensor, or with each lane writing
+its elements by index, measured the same (1.07-1.08x on the GEMMs). So the
+variant is a loss. `set_bf16_mlp_inputs` stays off, and the production
+forward is the f32-input one. The switch is kept as a measured alternate, as
+`--mlp-unfused` and `--attn-rows` are. Whether to keep it or remove it is
+open.
+
+What would win is to not write gate and up at all: one packed `gate | up`
+GEMM whose epilogue applies SwiGLU and stores the bf16 product the down
+projection reads. That removes the f32 intermediate both ways. It needs the
+two weights interleaved by tile in one matrix, which is a layout change
+shared with training (below).
+
+**Training on bf16 storage**
+(`bench/results/qwen35_train_gate_up_widen_m5pro.txt`). The brief's two
+candidates were measured before building either:
+
+- *A packed gate/up GEMM.* Since 8ce9ab2 the forward rounds `x2` to bf16
+  once for both GEMMs, so packing saves a dispatch, not a cast. One
+  `[T, 2048] x [2048, 12288]` against two `x [2048, 6144]`, bf16 operands,
+  same bits (`--paired-gate-up`): 0.91x async and 0.90x sync at T = 2048,
+  but 1.07x async at T = 512. A step runs the pair 48 times (forward and
+  rebuild), so at T = 2048 that is 18-25 ms of a 2.65-2.88 s bf16-storage
+  step (under 1%). It would rename `gate` and `up` to one parameter in the
+  parameter table, its torch names, the gradient bank, AdamW and the
+  loaders. Not started.
+- *A bf16-input norm, so the backward stops widening each saved layer
+  input.* The widened f32 is read three times: the input norm, the residual
+  copy, and `rms_norm_bwd`. All three would have to read bf16, which takes
+  two new kernels. Their whole time is 0.86 / 1.23 ms per layer at T = 512 /
+  2048, a hard ceiling of 1.0-2.9% of a step. What would really go is
+  roughly 0.2-0.6% of a step. Not built.
+
+Neither can show a step-level win in the paired step harness, whose rounds
+span ±8% on this machine under load.
+
 ## Not done
 
 - **Training, remaining gaps.** The LM-head cross-entropy and its gradients
@@ -1251,8 +1345,11 @@ is the largest non-GEMM share: 18 × 1.4 ms.
   rather than reusing a session's. `Decode::step` waits for its logits every
   token, so it is not a GPU-resident loop, and its speed has not been
   measured.
-- **bf16 inputs.** The kernels read f32 activations, which is what tessl's GEMM
-  writes. A bf16-activation variant would halve their read traffic.
+- **bf16 inputs, remaining gaps.** Only the MLP has a bf16-input path, and
+  it measured slower (see "bf16 activation inputs"), so it is off. GDN and
+  attention read their projections as f32. The win left is SwiGLU fused into
+  a packed `gate | up` GEMM's epilogue, which needs a weight layout shared
+  with training.
 - **Shared-prefix attention, remaining gaps.** Only head_dim 256 is compiled. The rows of
   a batch read the shared prefix independently: rows that share a head could
   share its K/V lines in one threadgroup, but no measurement says that is

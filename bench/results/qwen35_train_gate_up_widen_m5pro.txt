@@ -1,0 +1,131 @@
+# Training on bf16 storage: packed gate/up and the widened layer input — M5 Pro, 2026-10-10
+#
+#   target/release/bench_qwen35_layers --paired-gate-up 512 2048
+#   target/release/bench_qwen35_train --bf16 512 2048            (op table)
+#   QWEN35_2B_SAFETENSORS=... target/release/bench_qwen35_train --bf16-storage --step-only --step=T [--async]
+#
+# Built at eb24de1 plus the --bf16-storage flag. Conditions: shared machine,
+# other agent sessions' GPU work (ioreg 69-100% busy before each run) and a
+# 1-minute load average of ~21-27. The paired runs put the same load on both
+# lanes; the op table and step times are single-lane and inflated against an
+# idle GPU. Checkpoint: Qwen/Qwen3.5-2B (snapshot 15852e8c), bf16 tower.
+#
+# Since 8ce9ab2 the training forward rounds x2 to bf16 once for both GEMMs,
+# so a packed gate|up GEMM now saves one dispatch per call, not a cast.
+#
+# Finding, packed gate/up (one [T,2048] x [2048,12288] against two
+# [T,2048] x [2048,6144], bf16 operands into f32, outputs identical bit for
+# bit): 0.91x async and 0.90x sync at T = 2048 (0.37 / 0.51 ms per pair);
+# at T = 512, 0.90x sync but 1.07x async (slower). The training step runs
+# the pair twice per layer (forward, and the backward's rebuild), 48 per
+# step: at T = 2048 that is 18 ms async / 25 ms sync of a 2.65 / 2.88 s
+# bf16-storage step (0.7% / 0.9%); at T = 512, +4 ms async, -6 ms sync of
+# 0.71 / 1.16 s. The backward's two weight-gradient GEMMs and two dx GEMMs
+# would pack the same way (one TN into a [2048, 12288] gradient, one NT);
+# not measured. Adopting it changes the weight layout (`gate`, `up` ->
+# `gate_up` [hidden, 2 * intermediate]) everywhere the model's parameters
+# live: qwen35_params.rs's table and its torch names, the gradient bank,
+# AdamW's parts, the loaders. Not started: the step-level gain is under 1%,
+# below what the paired step harness resolves on this machine (its rounds
+# span +-8% under load, bench/results/qwen35_train_step_after_m5pro.txt).
+#
+# Finding, the widened layer input: a bf16 model's backward widens each
+# layer's saved bf16 input to f32 (one dispatch), the input norm and the
+# residual copy read the f32, and rms_norm_bwd reads it again. Removing the
+# widen needs all three to read bf16: a bf16-input qwen35_rms_norm and
+# rms_norm_bwd (neither exists; rms_norm_bwd's x is f32 only), and the copy
+# replaced by a widening copy. The ops it would touch, per layer (ms, median
+# of 7, REPS per command buffer):
+#
+#   T     widen  rms_norm(f32 in)  copy(f32)  rms_norm_bwd  sum
+#   512   0.169  0.182             0.163      0.348         0.862
+#   2048  0.204  0.237             0.260      0.524         1.225
+#
+# Their whole time is a hard ceiling on the saving: x 24 layers, 20.7 ms at
+# T = 512 (1.8% of the sync step, 2.9% of the async) and 29.4 ms at T = 2048
+# (1.0-1.1%). What would really go is the widen dispatch (4.1 / 4.9 ms per
+# step) and half the input bytes of the other three, roughly 0.2-0.6% of a
+# step, plus 24 of the sync step's 1949 waited commits. Not built: under the
+# step harness's resolution, so no committed win is possible to show.
+#
+# ---- packed gate/up ----
+gpu util before: 99% at 10:13:09
+device: Apple M5 Pro
+paired gate/up: two GEMMs [T,2048]x[2048,6144] vs one packed [T,2048]x[2048,12288]
+bf16 operands into f32 C, as GemmOperands::Bf16 runs them; ABBA, 3 warmup + 15 timed rounds
+T=512: gate passed; packed vs separate max |diff| = 0.000e0
+PAIRED t=512 unit=gate_up_async lane=two_gemms n=15 reps=16 median_ms=1.1105 min_ms=1.0848 max_ms=1.1452
+PAIRED t=512 unit=gate_up_async lane=packed_gemm n=15 reps=16 median_ms=1.1907 min_ms=1.1146 max_ms=1.2421
+PAIRED t=512 unit=gate_up_async ratio_packed_gemm_over_two_gemms median_of_round_ratios=1.0707 of_medians=1.0722 of_mins=1.0275
+PAIRED t=512 unit=gate_up_sync lane=two_gemms n=15 reps=4 median_ms=1.4088 min_ms=1.3152 max_ms=1.7150
+PAIRED t=512 unit=gate_up_sync lane=packed_gemm n=15 reps=4 median_ms=1.2847 min_ms=1.2008 max_ms=1.5844
+PAIRED t=512 unit=gate_up_sync ratio_packed_gemm_over_two_gemms median_of_round_ratios=0.8970 of_medians=0.9119 of_mins=0.9130
+T=2048: gate passed; packed vs separate max |diff| = 0.000e0
+PAIRED t=2048 unit=gate_up_async lane=two_gemms n=15 reps=16 median_ms=4.1330 min_ms=3.9897 max_ms=4.2836
+PAIRED t=2048 unit=gate_up_async lane=packed_gemm n=15 reps=16 median_ms=3.7658 min_ms=3.5700 max_ms=3.8894
+PAIRED t=2048 unit=gate_up_async ratio_packed_gemm_over_two_gemms median_of_round_ratios=0.9110 of_medians=0.9112 of_mins=0.8948
+PAIRED t=2048 unit=gate_up_sync lane=two_gemms n=15 reps=4 median_ms=4.3855 min_ms=4.2195 max_ms=4.6682
+PAIRED t=2048 unit=gate_up_sync lane=packed_gemm n=15 reps=4 median_ms=3.8760 min_ms=3.6625 max_ms=4.2253
+PAIRED t=2048 unit=gate_up_sync ratio_packed_gemm_over_two_gemms median_of_round_ratios=0.8959 of_medians=0.8838 of_mins=0.8680
+
+# ---- op table (bench_qwen35_train --bf16 512 2048) ----
+gpu util before: 99% at 10:13:13
+device: Apple M5 Pro
+T = 512: gate passed (15 ops wrote finite outputs)
+op                        ms / call
+gdn_train forward             1.800
+gdn_train backward            5.804
+attn_train forward            0.426
+attn_train backward           2.211
+cross-entropy + grads       124.638
+rms_norm_bwd                  0.348
+widen bf16 layer input        0.169
+rms_norm (f32 input)          0.182
+residual copy (f32)           0.163
+gated_rms_norm_bwd            0.405
+swiglu_bwd                    0.378
+conv1d_silu_bwd               1.296
+attn_qk_norm_rope_bwd         0.794
+gdn_gates_bwd                 0.583
+embed_rows_bwd                0.666
+GDN core, forward + backward: 7.60 ms per layer; attention core: 2.64 ms per layer
+T = 2048: gate passed (15 ops wrote finite outputs)
+op                        ms / call
+gdn_train forward             6.597
+gdn_train backward           21.917
+attn_train forward            3.298
+attn_train backward          14.143
+cross-entropy + grads       377.586
+rms_norm_bwd                  0.524
+widen bf16 layer input        0.204
+rms_norm (f32 input)          0.237
+residual copy (f32)           0.260
+gated_rms_norm_bwd            0.690
+swiglu_bwd                    1.109
+conv1d_silu_bwd               3.527
+attn_qk_norm_rope_bwd         1.003
+gdn_gates_bwd                 0.499
+embed_rows_bwd                0.603
+GDN core, forward + backward: 28.51 ms per layer; attention core: 17.44 ms per layer
+
+# ---- bf16-storage train_step ----
+== T=512 sync (gpu util before 69%, load { 23.58 15.12 15.03 })
+encode: every dispatch waited; TESSL_MID_COMMIT=unset
+train_step, T = 512: 1.158 s (442 tokens/s), loss 14.6644
+  device peak over the steps: 12.10 GiB (6.60 GiB above the loaded model)
+  one traced step: 1.219 s, 1949 waits (0.960 s blocked), 1949 commits, 1949 dispatches, 1422 cold allocations, 0 host-zeroed (0.00 GB)
+== T=512 --async (gpu util before 94%, load { 22.54 15.29 15.09 })
+encode: async (--async); TESSL_MID_COMMIT=unset
+train_step, T = 512: 0.705 s (726 tokens/s), loss 14.6644
+  device peak over the steps: 12.51 GiB (7.01 GiB above the loaded model)
+  one traced step: 0.717 s, 14 waits (0.538 s blocked), 14 commits, 1949 dispatches, 1422 cold allocations, 0 host-zeroed (0.00 GB)
+== T=2048 sync (gpu util before 92%, load { 22.83 15.60 15.20 })
+encode: every dispatch waited; TESSL_MID_COMMIT=unset
+train_step, T = 2048: 2.876 s (712 tokens/s), loss 14.5115
+  device peak over the steps: 13.20 GiB (7.69 GiB above the loaded model)
+  one traced step: 2.833 s, 1949 waits (2.490 s blocked), 1949 commits, 1949 dispatches, 1422 cold allocations, 0 host-zeroed (0.00 GB)
+== T=2048 --async (gpu util before 89%, load { 21.50 15.79 15.28 })
+encode: async (--async); TESSL_MID_COMMIT=unset
+train_step, T = 2048: 2.653 s (772 tokens/s), loss 14.5115
+  device peak over the steps: 14.61 GiB (9.10 GiB above the loaded model)
+  one traced step: 2.630 s, 14 waits (2.177 s blocked), 14 commits, 1949 dispatches, 1422 cold allocations, 0 host-zeroed (0.00 GB)

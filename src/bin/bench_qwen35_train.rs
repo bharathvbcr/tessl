@@ -7,6 +7,7 @@
 //! cargo run --release --bin bench_qwen35_train -- --check-only  # the gate, no timing
 //! QWEN35_2B_SAFETENSORS=... cargo run --release --bin bench_qwen35_train -- --step=2048
 //! cargo run --release --bin bench_qwen35_train -- --bf16        # bf16 GEMM operands
+//! QWEN35_2B_SAFETENSORS=... cargo run --release --bin bench_qwen35_train -- --bf16-storage --step-only --step=2048
 //! QWEN35_2B_SAFETENSORS=... cargo run --release --bin bench_qwen35_train -- 2048 --step-only --step=2048 --async
 //! QWEN35_2B_SAFETENSORS=... cargo run --release --bin bench_qwen35_train -- 256 --step-only --clip=256
 //! ```
@@ -47,6 +48,11 @@
 //! ([`GpuRuntime::peak_allocated_bytes`], reset after loading), and one more
 //! untimed step's host waits on the GPU, commits, dispatches and fresh
 //! buffer allocations ([`tessl::infer_trace`]).
+//!
+//! `--bf16-storage` loads the checkpoint as a `Precision::Bf16` tower
+//! (`Qwen35Model::load_tower`: bf16 matrices and saved layer inputs, see
+//! docs/qwen35.md "Training on bf16 storage") for `--step`, `--clip` and
+//! `--batch`, and implies `--bf16`.
 //!
 //! `--async` runs the step under [`GpuRuntime::set_async_encode`] (one command
 //! buffer between the waits the step itself makes); without it every
@@ -650,18 +656,18 @@ fn bench_t(rt: &Arc<GpuRuntime>, t: usize, check_only: bool, operands: GemmOpera
     Ok(())
 }
 
-/// The real 2B checkpoint, in f32.
-fn load_2b(rt: &Arc<GpuRuntime>) -> Res<Qwen35Model> {
+/// The real 2B checkpoint: in f32, or with `bf16_storage` as the bf16 tower
+/// training on bf16 storage loads.
+fn load_2b(rt: &Arc<GpuRuntime>, bf16_storage: bool) -> Res<Qwen35Model> {
     let path = std::env::var("QWEN35_2B_SAFETENSORS")
         .map_err(|_| "--step and --batch need QWEN35_2B_SAFETENSORS (the Qwen3.5-2B-Base .safetensors)".to_string())?;
     let st = SafeTensors::open(std::path::Path::new(&path))?;
-    Qwen35Model::load(
-        rt,
-        &st,
-        "model.language_model.",
-        Qwen35Config::qwen35_2b()?,
-        Precision::F32,
-    )
+    let (prefix, cfg) = ("model.language_model.", Qwen35Config::qwen35_2b()?);
+    if bf16_storage {
+        Qwen35Model::load_tower(rt, &st, prefix, cfg, Precision::Bf16)
+    } else {
+        Qwen35Model::load(rt, &st, prefix, cfg, Precision::F32)
+    }
 }
 
 /// Host waits, commits, dispatches and fresh allocations `f` made, and its
@@ -901,8 +907,12 @@ fn bench_batch(rt: &Arc<GpuRuntime>, model: &Qwen35Model, b: BatchShape, operand
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (mut check_only, mut step, mut ts, mut operands) = (false, None, Vec::new(), GemmOperands::ExactF32);
     let (mut batches, mut step_only, mut async_encode, mut clip) = (Vec::new(), false, false, None);
+    let mut bf16_storage = false;
     for arg in std::env::args().skip(1) {
         if arg == "--bf16" {
+            operands = GemmOperands::Bf16;
+        } else if arg == "--bf16-storage" {
+            bf16_storage = true;
             operands = GemmOperands::Bf16;
         } else if arg == "--check-only" {
             check_only = true;
@@ -925,7 +935,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         } else {
             let t: usize = arg.parse().map_err(|_| {
                 format!(
-                    "expected a token count, --check-only, --step-only, --bf16, --async, --step=N, --clip=N \
+                    "expected a token count, --check-only, --step-only, --bf16, --bf16-storage, --async, --step=N, --clip=N \
                      or --batch=B,L[,S], got {arg:?}"
                 )
             })?;
@@ -954,7 +964,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         return Ok(());
     }
-    let model = load_2b(&rt)?;
+    let model = load_2b(&rt, bf16_storage)?;
     rt.set_async_encode(async_encode)?;
     println!(
         "encode: {}; TESSL_MID_COMMIT={}",

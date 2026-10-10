@@ -3251,6 +3251,31 @@ fn embed_rows_impl(
 mod tests {
     use super::*;
 
+    /// The tiled transpose places every element where the plain row-by-row
+    /// loop did, across shapes that straddle the tile edge on both axes and
+    /// with a column offset into a wider packed row.
+    #[test]
+    fn place_linear_part_matches_the_row_by_row_transpose() {
+        fn row_by_row(dst: &mut [u32], total: usize, col0: usize, part: &[u32], out: usize, in_f: usize) {
+            for r in 0..out {
+                for k in 0..in_f {
+                    dst[k * total + col0 + r] = part[r * in_f + k];
+                }
+            }
+        }
+        for &(in_f, out) in &[(1, 1), (63, 65), (64, 64), (65, 63), (130, 7), (7, 130), (200, 129)] {
+            for col0 in [0, 5] {
+                let total = out + col0 + 3;
+                let part: Vec<u32> = (0..(out * in_f) as u32).map(|i| i.wrapping_mul(2654435761)).collect();
+                let mut want = vec![u32::MAX; in_f * total];
+                let mut got = want.clone();
+                row_by_row(&mut want, total, col0, &part, out, in_f);
+                place_linear_part(&mut got, total, col0, &part, out, in_f).unwrap();
+                assert_eq!(got, want, "in = {in_f}, out = {out}, col0 = {col0}");
+            }
+        }
+    }
+
     #[test]
     fn pack_puts_each_linear_transposed_side_by_side() {
         // Two linears on in_features = 2: A is 3x2, B is 1x2.

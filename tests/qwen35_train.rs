@@ -219,6 +219,37 @@ fn compare(dir: &Path, prefix: &str, cfg: &Qwen35Config, step: &TrainStep, loss_
     worst
 }
 
+/// The inference forward allocates its activations unzeroed: each one is
+/// written in full before it is read. Poisoning every unzeroed allocation
+/// with NaN must leave the logits bit for bit unchanged, at both precisions.
+#[test]
+fn tiny_forward_reads_no_unwritten_activation() {
+    let dir = fixture();
+    let ids = ids(&dir);
+    for precision in [Precision::F32, Precision::Bf16] {
+        let (rt, model) = load_rt(&dir, "model.", tiny_config(), precision);
+        let clean = model.forward(&ids, true).unwrap();
+        rt.set_poison_unzeroed(true);
+        let poisoned = model.forward(&ids, true);
+        rt.set_poison_unzeroed(false);
+        let poisoned = poisoned.unwrap();
+        let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+        assert!(
+            clean.logits.iter().all(|x| x.is_finite()),
+            "{precision:?}: non-finite logits"
+        );
+        assert_eq!(
+            bits(&poisoned.logits),
+            bits(&clean.logits),
+            "{precision:?}: an unzeroed activation was read before it was written"
+        );
+        assert_eq!(poisoned.trace.len(), clean.trace.len());
+        for (l, (p, c)) in poisoned.trace.iter().zip(&clean.trace).enumerate() {
+            assert_eq!(bits(p), bits(c), "{precision:?}: trace {l} differs under poison");
+        }
+    }
+}
+
 #[test]
 fn tiny_step_matches_transformers_autograd() {
     let dir = fixture();

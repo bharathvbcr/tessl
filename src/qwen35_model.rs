@@ -1087,9 +1087,16 @@ impl Acts {
     fn new(rt: &Arc<GpuRuntime>, cfg: &Qwen35Config, p: Precision, t: u32, logits: bool) -> Result<Self, String> {
         let tu = t as usize;
         let (g, l) = (cfg.gdn, cfg.attn);
+        // Every activation is written in full before anything reads it — the
+        // embedding gather fills `resid`, the norms fill `x`, the GEMMs fill
+        // their outputs, the gate and activation kernels fill `g_y`, `a_y`
+        // and `m_mid` — so none is zeroed on the host (the logits alone are
+        // 1 GB at t = 1024 on the 2B). `tests/qwen35_train.rs` holds this
+        // with `set_poison_unzeroed`.
+        let f32t = |cols: usize| rt.alloc_tensor_unzeroed(&[tu, cols], DType::F32);
         let act = |cols: usize| match p {
-            Precision::Bf16 => rt.alloc_tensor_bf16(&[tu, cols]),
-            Precision::F32 => rt.alloc_tensor_f32(&[tu, cols]),
+            Precision::Bf16 => rt.alloc_tensor_unzeroed(&[tu, cols], DType::BF16),
+            Precision::F32 => f32t(cols),
         };
         let f32s = |n: usize| rt.alloc_buffer(n.max(1) * 4);
         let qd = (l.q_heads() * l.head_dim()) as usize;
@@ -1101,15 +1108,15 @@ impl Acts {
         };
         Ok(Self {
             t,
-            resid: rt.alloc_tensor_f32(&[tu, cfg.hidden as usize])?,
+            resid: f32t(cfg.hidden as usize)?,
             x: act(cfg.hidden as usize)?,
-            proj_out: rt.alloc_tensor_f32(&[tu, cfg.hidden as usize])?,
-            g_proj: rt.alloc_tensor_f32(&[tu, g.width() as usize])?,
+            proj_out: f32t(cfg.hidden as usize)?,
+            g_proj: f32t(g.width() as usize)?,
             g_qkv: f32s(tu * g.conv_dim() as usize)?,
             g_o: f32s(tu * g.value_dim() as usize)?,
             g_y: act(g.value_dim() as usize)?,
             g_ws: GdnWorkspace::new(rt, &g.dims(1, t))?,
-            a_proj: rt.alloc_tensor_f32(&[tu, l.width() as usize])?,
+            a_proj: f32t(l.width() as usize)?,
             a_q: f32s(tu * qd)?,
             a_k: f32s(kv)?,
             a_v: f32s(kv)?,
@@ -1117,14 +1124,10 @@ impl Acts {
             a_y: act(qd)?,
             tkv: u32_buf(t)?,
             zero: u32_buf(0)?,
-            m_gate: rt.alloc_tensor_f32(&[tu, cfg.intermediate as usize])?,
-            m_up: rt.alloc_tensor_f32(&[tu, cfg.intermediate as usize])?,
+            m_gate: f32t(cfg.intermediate as usize)?,
+            m_up: f32t(cfg.intermediate as usize)?,
             m_mid: act(cfg.intermediate as usize)?,
-            logits: if logits {
-                Some(rt.alloc_tensor_f32(&[tu, cfg.vocab as usize])?)
-            } else {
-                None
-            },
+            logits: if logits { Some(f32t(cfg.vocab as usize)?) } else { None },
         })
     }
 }

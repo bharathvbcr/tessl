@@ -1310,6 +1310,11 @@ pub fn pipeline_icb(
 
 thread_local! {
     static CAPTURE: std::cell::RefCell<Option<DecodeIcbCapture>> = const { std::cell::RefCell::new(None) };
+    /// Mirrors `CAPTURE.is_some()`. [`decode_icb_capture_active`] runs a dozen
+    /// times per dispatch; a `Cell<bool>` has no destructor and no borrow
+    /// flag, so the read is a plain thread-local load. Written only next to
+    /// the writes of `CAPTURE` in begin / end / take.
+    static CAPTURE_ACTIVE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// Host-side recording of dispatches for later [`DecodeIcb::from_commands`].
@@ -1428,6 +1433,7 @@ pub fn begin_decode_icb_capture() {
             return;
         }
         *slot = Some(DecodeIcbCapture::default());
+        CAPTURE_ACTIVE.with(|a| a.set(true));
     });
 }
 
@@ -1439,15 +1445,19 @@ pub fn end_decode_icb_capture() {
     CAPTURE.with(|c| {
         *c.borrow_mut() = None;
     });
+    CAPTURE_ACTIVE.with(|a| a.set(false));
 }
 
 /// Finish capture; returns recorded commands (may be empty).
 pub fn take_decode_icb_capture() -> Option<DecodeIcbCapture> {
-    CAPTURE.with(|c| c.borrow_mut().take())
+    let taken = CAPTURE.with(|c| c.borrow_mut().take());
+    CAPTURE_ACTIVE.with(|a| a.set(false));
+    taken
 }
 
+#[inline]
 pub fn decode_icb_capture_active() -> bool {
-    CAPTURE.with(|c| c.borrow().is_some())
+    CAPTURE_ACTIVE.with(|a| a.get())
 }
 
 pub(crate) fn capture_note_pipeline(p: Retained<ProtocolObject<dyn MTLComputePipelineState>>) {

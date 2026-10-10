@@ -1683,7 +1683,6 @@ fn dispatch_k_partitions(
     let z_width = zero_p.threadExecutionWidth();
     let z_tpt = z_width.min(numel).max(1);
     let z_groups = numel.div_ceil(z_tpt);
-    let partitions: Vec<u32> = (0..k_u).step_by(k_tile).collect();
     let (m, n, k, k_tile) = (m_u, n_u, k_u, k_tile_u);
 
     // Zero once (optional) + all K-partitions in one binder.
@@ -1700,7 +1699,9 @@ fn dispatch_k_partitions(
         }
 
         bnd.set_pipeline(pipeline);
-        for (pi, &k0) in partitions.iter().enumerate() {
+        // `k_tile != 0` was checked above; the partition starts are walked
+        // in place rather than collected per call.
+        for (pi, k0) in (0..k).step_by(k_tile as usize).enumerate() {
             if pi > 0 && need_explicit {
                 bnd.barrier();
             }

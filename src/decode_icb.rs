@@ -77,7 +77,7 @@ pub enum DecodeIcbBind {
 
 #[inline]
 fn buf_gpu_addr(buf: &GpuBuffer, byte_offset: usize) -> u64 {
-    buf.metal().gpuAddress().wrapping_add(byte_offset as u64)
+    buf.gpu_address().wrapping_add(byte_offset as u64)
 }
 
 /// One frozen compute dispatch (pipeline + grid + bind recipe).
@@ -98,14 +98,15 @@ pub struct DecodeIcbCommand {
     pub barrier_after: bool,
     /// Binds that reached the encoder but could NOT be recorded on the tape.
     ///
-    /// `Binder::bind_buf` and `bind_resource_id` take a raw
-    /// `MTLBuffer` / `MTLResourceID` with no owning `GpuBuffer`, so there is
+    /// `Binder::bind_resource_id` (and the test-only raw `bind_buf`) take an
+    /// `MTLResourceID` / `MTLBuffer` with no owning `GpuBuffer`, so there is
     /// nothing for [`DecodeIcbBind::Buf`] to hold — and holding it is what pins
-    /// the operand's `Arc`. Every GEMM binds A, B and C through `bind_buf`, so
-    /// a captured GEMM recorded only its scalar immediates: replay would rebind
+    /// the operand's `Arc`. When GEMMs bound A, B and C as raw buffers, a
+    /// captured GEMM recorded only its scalar immediates: replay would rebind
     /// no operands at all, and the unrecorded buffers were pinned by nothing,
     /// free to be recycled and handed to a new tensor while the tape still
-    /// logically referenced them.
+    /// logically referenced them. Owned binds (`bind_tensor`,
+    /// `bind_gpu_buf_offset`) are recorded and never counted here.
     ///
     /// Recording the count turns that from a silent wrong answer into a refusal
     /// — see the check in [`DecodeIcb::from_commands_ex`].
@@ -277,7 +278,7 @@ pub fn icb_range_batch_enabled() -> bool {
     on
 }
 
-/// -1 = env / follow range-batch, 0 = off, 1 = on.
+/// -1 = read env, 0 = off, 1 = on, 2 = env unset: follow range-batch.
 static ICB_COARSE_RANGES: AtomicI8 = AtomicI8::new(-1);
 
 /// Force coarse-range barrier elision (tests / harness). Overrides env.
@@ -291,9 +292,12 @@ pub fn set_icb_coarse_ranges(on: bool) {
 ///
 /// Env: `METAL_RUNTIME_ICB_COARSE_RANGES` / `GEMMA_METAL_ICB_COARSE_RANGES`.
 pub fn icb_coarse_ranges_enabled() -> bool {
-    let v = ICB_COARSE_RANGES.load(Ordering::Relaxed);
-    if v >= 0 {
-        return v == 1;
+    match ICB_COARSE_RANGES.load(Ordering::Relaxed) {
+        0 => return false,
+        1 => return true,
+        // Follow range-batch: coarsening only pays when spans are coalesced.
+        2 => return icb_range_batch_enabled(),
+        _ => {}
     }
     if let Some(on) = env_truthy(&[
         "TESSL_ICB_COARSE_RANGES",
@@ -303,8 +307,61 @@ pub fn icb_coarse_ranges_enabled() -> bool {
         ICB_COARSE_RANGES.store(if on { 1 } else { 0 }, Ordering::Relaxed);
         return on;
     }
-    // Follow range-batch: coarsening only pays when spans are coalesced.
+    // Latch "unset" too, so a replay does not re-read three variables every
+    // token; the answer still follows range-batch.
+    ICB_COARSE_RANGES.store(2, Ordering::Relaxed);
     icb_range_batch_enabled()
+}
+
+/// -1 = env, 0 = off, 1 = on.
+static ICB_EXECUTE: AtomicI8 = AtomicI8::new(-1);
+
+/// Force ICB execution of a replayed tape (tests / harness). Overrides env.
+pub fn set_icb_execute(on: bool) {
+    ICB_EXECUTE.store(if on { 1 } else { 0 }, Ordering::Relaxed);
+}
+
+/// Execute replayed commands through the ICB even without freeze-binds
+/// (which implies it). Default **OFF**. Read once, like the other ICB flags,
+/// rather than on every replay.
+///
+/// Env: `TESSL_ICB_EXECUTE`, `METAL_RUNTIME_ICB_EXECUTE` or
+/// `GEMMA_METAL_ICB_EXECUTE`.
+pub fn icb_execute_enabled() -> bool {
+    let v = ICB_EXECUTE.load(Ordering::Relaxed);
+    if v >= 0 {
+        return v == 1;
+    }
+    let on = env_truthy(&[
+        "TESSL_ICB_EXECUTE",
+        "METAL_RUNTIME_ICB_EXECUTE",
+        "GEMMA_METAL_ICB_EXECUTE",
+    ])
+    .unwrap_or(false);
+    ICB_EXECUTE.store(if on { 1 } else { 0 }, Ordering::Relaxed);
+    on
+}
+
+/// -1 = env, 0 = off, 1 = on.
+static ICB_TRIAGE: AtomicI8 = AtomicI8::new(-1);
+
+/// Force decode-ICB triage mode (tests / harness). Overrides env.
+pub fn set_icb_triage(on: bool) {
+    ICB_TRIAGE.store(if on { 1 } else { 0 }, Ordering::Relaxed);
+}
+
+/// Triage mode: replay one command per binder scope with a sync after each,
+/// to localize the first diverging dispatch. Default **OFF**. Read once.
+///
+/// Env: `TESSL_ICB_TRIAGE` or `GEMMA_METAL_ICB_TRIAGE`.
+pub fn icb_triage_enabled() -> bool {
+    let v = ICB_TRIAGE.load(Ordering::Relaxed);
+    if v >= 0 {
+        return v == 1;
+    }
+    let on = env_truthy(&["TESSL_ICB_TRIAGE", "GEMMA_METAL_ICB_TRIAGE"]).unwrap_or(false);
+    ICB_TRIAGE.store(if on { 1 } else { 0 }, Ordering::Relaxed);
+    on
 }
 
 /// Fingerprint of Buf `(index, gpu_addr)` pairs for prebuilt-table dedup.
@@ -374,6 +431,10 @@ pub struct DecodeIcb {
     barriers_coarsened: bool,
     /// How many `barrier_after` markers elided by coarse-range analysis.
     barriers_elided: u64,
+    /// Every command's pipeline supports ICBs. Pipelines are fixed once the
+    /// tape is built, so this is computed once instead of probing each
+    /// pipeline (an Objective-C send) on every replay.
+    all_icb: bool,
 }
 
 /// One argument table per encoded command, plus the number of distinct tables
@@ -450,8 +511,8 @@ impl DecodeIcb {
             if let Some((i, cmd)) = commands.iter().enumerate().find(|(_, c)| c.incomplete_binds > 0) {
                 return Err(format!(
                     "DecodeIcb freeze_binds: command {i} has {} bind(s) that could not be \
-                     recorded (bound through bind_buf / bind_resource_id, which carry no \
-                     owning GpuBuffer). Freeze-binds writes the tape's binds into the ICB, \
+                     recorded (bound through bind_resource_id, which carries no owning \
+                     GpuBuffer). Freeze-binds writes the tape's binds into the ICB, \
                      so those slots would stay unwritten on every replay and pin nothing \
                      against recycling. Bind through bind_tensor or bind_gpu_buf.",
                     cmd.incomplete_binds
@@ -504,6 +565,7 @@ impl DecodeIcb {
         } else {
             (Vec::new(), 0)
         };
+        let all_icb = commands.iter().all(|c| c.pipeline.supportIndirectCommandBuffers());
         let mut this = Self {
             icb,
             commands,
@@ -526,6 +588,7 @@ impl DecodeIcb {
             total_buf_binds,
             barriers_coarsened: false,
             barriers_elided: 0,
+            all_icb,
         };
         this.encode_cpu()?;
         Ok(this)
@@ -846,8 +909,7 @@ impl DecodeIcb {
     fn encode_cpu(&mut self) -> Result<(), String> {
         // Tape-only / direct-dispatch replay: allow non-ICB pipelines (default path).
         // Freeze-binds requires ICB-capable pipelines + setKernelBuffer encode.
-        let all_icb = self.commands.iter().all(|c| c.pipeline.supportIndirectCommandBuffers());
-        if !all_icb {
+        if !self.all_icb {
             if self.freeze_binds {
                 return Err(
                     "DecodeIcb freeze_binds: not all pipelines supportIndirectCommandBuffers \
@@ -1040,13 +1102,7 @@ impl DecodeIcb {
             self.barriers_elided = Self::elide_non_interfering_barriers(&mut self.commands);
             self.barriers_coarsened = true;
         }
-        let use_icb_exec = freeze
-            || env_truthy(&[
-                "TESSL_ICB_EXECUTE",
-                "METAL_RUNTIME_ICB_EXECUTE",
-                "GEMMA_METAL_ICB_EXECUTE",
-            ])
-            .unwrap_or(false);
+        let use_icb_exec = freeze || icb_execute_enabled();
         let need_opt = !self.optimized;
         let icb = self.icb.clone();
         let n = self.commands.len() as u64;
@@ -1064,7 +1120,7 @@ impl DecodeIcb {
         // Dropping half a tape is not a degraded mode, it is a wrong answer, so
         // it is refused. `freeze_binds` already rejects the same shape at
         // encode time; this covers the `TESSL_ICB_EXECUTE=1` path that does not.
-        if use_icb_exec && !self.commands.iter().all(|c| c.pipeline.supportIndirectCommandBuffers()) {
+        if use_icb_exec && !self.all_icb {
             return Err(format!(
                 "DecodeIcb: ICB execution requested for a tape whose {} command(s) are not \
                  all ICB-capable. Those commands would be silently dropped. Capture with \
@@ -1073,14 +1129,12 @@ impl DecodeIcb {
             ));
         }
 
+        // `all_icb` holds here: the check above returned otherwise.
         if use_icb_exec && need_opt {
-            let all_icb = self.commands.iter().all(|c| c.pipeline.supportIndirectCommandBuffers());
-            if all_icb {
-                rt.with_binder(|bnd| {
-                    bnd.optimize_icb(&icb, 0, n);
-                    Ok(())
-                })?;
-            }
+            rt.with_binder(|bnd| {
+                bnd.optimize_icb(&icb, 0, n);
+                Ok(())
+            })?;
         }
         // Skip auto-barriers during tape encode; replay captured `barrier_after`
         // markers instead. Forcing always-on here inflated E4B barriers ~364→599
@@ -1088,7 +1142,7 @@ impl DecodeIcb {
         // Scope-local via with_binder_barriers — flipping the process-global
         // flag here would drop the trailing auto barrier of ops other threads
         // encode concurrently.
-        let triage = env_truthy(&["TESSL_ICB_TRIAGE", "GEMMA_METAL_ICB_TRIAGE"]).unwrap_or(false);
+        let triage = icb_triage_enabled();
         let mut sticky = StickyArgTable::new();
         let mut execute_icb_calls = 0u64;
         let mut execute_icb_cmds = 0u64;
@@ -1280,7 +1334,9 @@ impl DecodeIcb {
             if let Some((tg_idx, len)) = cmd.tg_mem {
                 bnd.set_threadgroup_memory(tg_idx, len);
             }
-            if use_icb_exec && cmd.pipeline.supportIndirectCommandBuffers() {
+            // `execute` only sets `use_icb_exec` once every command's pipeline
+            // is ICB-capable (`DecodeIcb::all_icb`), so no per-command probe.
+            if use_icb_exec {
                 bnd.execute_icb(icb, i as u64, 1);
                 icb_calls = 1;
                 icb_cmds = 1;
@@ -1309,6 +1365,11 @@ pub fn pipeline_icb(
 
 thread_local! {
     static CAPTURE: std::cell::RefCell<Option<DecodeIcbCapture>> = const { std::cell::RefCell::new(None) };
+    /// Mirrors `CAPTURE.is_some()`. [`decode_icb_capture_active`] runs a dozen
+    /// times per dispatch; a `Cell<bool>` has no destructor and no borrow
+    /// flag, so the read is a plain thread-local load. Written only next to
+    /// the writes of `CAPTURE` in begin / end / take.
+    static CAPTURE_ACTIVE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// Host-side recording of dispatches for later [`DecodeIcb::from_commands`].
@@ -1427,6 +1488,7 @@ pub fn begin_decode_icb_capture() {
             return;
         }
         *slot = Some(DecodeIcbCapture::default());
+        CAPTURE_ACTIVE.with(|a| a.set(true));
     });
 }
 
@@ -1438,15 +1500,19 @@ pub fn end_decode_icb_capture() {
     CAPTURE.with(|c| {
         *c.borrow_mut() = None;
     });
+    CAPTURE_ACTIVE.with(|a| a.set(false));
 }
 
 /// Finish capture; returns recorded commands (may be empty).
 pub fn take_decode_icb_capture() -> Option<DecodeIcbCapture> {
-    CAPTURE.with(|c| c.borrow_mut().take())
+    let taken = CAPTURE.with(|c| c.borrow_mut().take());
+    CAPTURE_ACTIVE.with(|a| a.set(false));
+    taken
 }
 
+#[inline]
 pub fn decode_icb_capture_active() -> bool {
-    CAPTURE.with(|c| c.borrow().is_some())
+    CAPTURE_ACTIVE.with(|a| a.get())
 }
 
 pub(crate) fn capture_note_pipeline(p: Retained<ProtocolObject<dyn MTLComputePipelineState>>) {
@@ -1588,7 +1654,7 @@ impl Drop for BinderEncodeNopGuard {
 /// visible to every other test mid-flight.
 #[cfg(test)]
 pub(crate) struct IcbFlagsTestGuard {
-    saved: [i8; 5],
+    saved: [i8; 7],
     saved_binder_encode_nop: bool,
     _lock: std::sync::MutexGuard<'static, ()>,
 }
@@ -1607,6 +1673,8 @@ impl IcbFlagsTestGuard {
                 ICB_RANGE_BATCH.load(Ordering::Relaxed),
                 ICB_COARSE_RANGES.load(Ordering::Relaxed),
                 ICB_PIPELINES.load(Ordering::Relaxed),
+                ICB_EXECUTE.load(Ordering::Relaxed),
+                ICB_TRIAGE.load(Ordering::Relaxed),
             ],
             saved_binder_encode_nop: binder_encode_nop(),
             _lock: lock,
@@ -1622,6 +1690,8 @@ impl Drop for IcbFlagsTestGuard {
         ICB_RANGE_BATCH.store(self.saved[2], Ordering::Relaxed);
         ICB_COARSE_RANGES.store(self.saved[3], Ordering::Relaxed);
         ICB_PIPELINES.store(self.saved[4], Ordering::Relaxed);
+        ICB_EXECUTE.store(self.saved[5], Ordering::Relaxed);
+        ICB_TRIAGE.store(self.saved[6], Ordering::Relaxed);
         set_binder_encode_nop(self.saved_binder_encode_nop);
     }
 }
@@ -2089,11 +2159,64 @@ mod tests {
         }
     }
 
+    /// Owned binds made through the real `Binder` are recorded, not counted as
+    /// unrecordable, so a freeze-binds tape of them builds and replays.
+    ///
+    /// `bind_tensor` and `bind_gpu_buf_offset` used to finish in the raw
+    /// `bind_buf`, which marks every bind unrecordable before the owned bind
+    /// was noted. Any captured kernel then carried `incomplete_binds > 0`, and
+    /// `from_commands_ex(.., true)` refused every real tape.
+    #[test]
+    fn owned_binds_capture_complete_and_freeze() {
+        let _flags = IcbFlagsTestGuard::lock();
+        let rt = GpuRuntime::new().expect("GpuRuntime::new");
+        let n = 64usize;
+        let src = rt.alloc_buffer_hot(n * 4).expect("src");
+        let dst = rt.alloc_tensor_f32(&[n]).expect("dst");
+        unsafe {
+            let p = src.metal().contents().as_ptr() as *mut f32;
+            for i in 0..n {
+                *p.add(i) = i as f32 + 1.0;
+            }
+        }
+        let pipe = pipeline_icb(&rt, "copy_f32").expect("copy_f32 icb pipeline");
+        let tpt = pipe.threadExecutionWidth().min(n).max(1);
+        let groups = n.div_ceil(tpt);
+
+        begin_decode_icb_capture();
+        let encoded = rt.with_binder(|bnd| {
+            bnd.set_pipeline(&pipe);
+            bnd.bind_gpu_buf(&src, 0);
+            bnd.bind_tensor(&dst, 1);
+            bnd.bind_u32(n as u32, 2);
+            bnd.dispatch(mtl_size(groups, 1, 1), mtl_size(tpt, 1, 1));
+            Ok(())
+        });
+        let cap = take_decode_icb_capture().expect("capture");
+        encoded.expect("captured dispatch");
+        rt.synchronize().unwrap();
+
+        assert_eq!(cap.commands.len(), 1);
+        assert_eq!(cap.commands[0].incomplete_binds, 0, "owned binds are recordable");
+        assert_eq!(cap.commands[0].binds.len(), 3);
+
+        let mut dec = DecodeIcb::from_commands_ex(&rt, cap.commands, true).expect("freeze-binds tape builds");
+        unsafe {
+            std::ptr::write_bytes(dst.buffer.metal().contents().as_ptr() as *mut u8, 0, n * 4);
+        }
+        dec.execute(&rt).unwrap();
+        rt.synchronize().unwrap();
+        let out = dst.read_f32().unwrap();
+        for (i, v) in out.iter().enumerate() {
+            assert_eq!(*v, i as f32 + 1.0, "mismatch at {i}");
+        }
+    }
+
     /// A tape with binds that could not be recorded must be refused, not replayed.
     ///
     /// `bind_buf` takes a raw `MTLBuffer` with no owning `GpuBuffer`, so there
-    /// is nothing to record and nothing to pin. Every GEMM binds A, B and C
-    /// that way, so a captured GEMM recorded only its scalar immediates.
+    /// is nothing to record and nothing to pin. When GEMMs bound A, B and C
+    /// that way, a captured GEMM recorded only its scalar immediates.
     /// Replaying it would leave the operand slots unwritten *and* leave the
     /// buffers free to be recycled into unrelated tensors — both silent.
     ///

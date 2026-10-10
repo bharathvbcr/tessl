@@ -69,6 +69,10 @@ pub(crate) struct PooledBuffer {
     pub(crate) nbytes: usize,
     pub(crate) kind: BufferKind,
     pub(crate) runtime: Weak<GpuRuntime>,
+    /// `buffer.gpuAddress()`, read once at construction. An `MTLBuffer`'s GPU
+    /// address is fixed for the object's lifetime, so every bind reads this
+    /// instead of sending `gpuAddress` again.
+    pub(crate) gpu_addr: u64,
 }
 
 impl Drop for PooledBuffer {
@@ -198,6 +202,12 @@ impl GpuBuffer {
 
     pub fn metal(&self) -> &ProtocolObject<dyn MTLBuffer> {
         &self.inner.buffer
+    }
+
+    /// The buffer's base GPU address, cached at construction.
+    #[inline]
+    pub(crate) fn gpu_address(&self) -> u64 {
+        self.inner.gpu_addr
     }
 
     /// Which residency pool this buffer came from.
@@ -572,6 +582,7 @@ impl Tensor {
         check_view_bounds(nbytes, shape, dtype, byte_offset)?;
         let weak = runtime.weak_self();
         runtime.retain_external(&buffer);
+        let gpu_addr = buffer.gpuAddress();
         #[allow(clippy::arc_with_non_send_sync)]
         let gpu_buf = GpuBuffer {
             inner: Arc::new(PooledBuffer {
@@ -579,6 +590,7 @@ impl Tensor {
                 nbytes,
                 kind: BufferKind::External,
                 runtime: weak,
+                gpu_addr,
             }),
         };
         Self::from_buffer(runtime, gpu_buf, shape, dtype, byte_offset)
@@ -619,7 +631,10 @@ impl Tensor {
     /// Validate public metadata before passing a view to a GPU kernel.
     pub(crate) fn validate(&self) -> Result<(), String> {
         check_view_bounds(self.buffer.nbytes(), &self.shape, self.dtype, self.byte_offset)?;
-        if !self.buffer.inner.runtime.ptr_eq(&Arc::downgrade(&self.runtime)) {
+        // Pointer comparison rather than `Weak::ptr_eq(&Arc::downgrade(..))`:
+        // this runs for every operand of every kernel, and the downgrade is an
+        // atomic increment plus a decrement on drop for an identical answer.
+        if !std::ptr::eq(Weak::as_ptr(&self.buffer.inner.runtime), Arc::as_ptr(&self.runtime)) {
             return Err("tensor buffer belongs to a different runtime".into());
         }
         Ok(())

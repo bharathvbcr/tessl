@@ -143,6 +143,80 @@ All notable changes to `tessl` are recorded here. The format follows
   (observed 1.3e-6 and 1.7e-6 on the tiny and grouped fixtures), where the
   loss comparison saw only the head's average. `qwen35_model`'s docs no
   longer call it the one place the layer order is written.
+- **Host-side dispatch overhead.** Owned binds (`bind_tensor`,
+  `bind_gpu_buf_offset`) read a GPU address cached on the buffer instead of
+  sending `length` and `gpuAddress` per bind; scalar binds use the const
+  arena's pointer, GPU address and length read once at init instead of three
+  property sends each; `Tensor::validate` compares runtime pointers without
+  an `Arc::downgrade`; the per-dispatch and per-GEMM runtime flags
+  (`async_encode`, `residency_dirty`, `dispatch_count`, precision,
+  `relaxed_precision`, `flash_tensorops`, the residency count) are atomics
+  rather than mutexes; `decode_icb_capture_active` reads a `Cell<bool>`
+  instead of borrowing a `RefCell`; `BufferPool` reads `maxBufferLength`
+  once; split-K GEMMs no longer collect their partition starts. Not yet
+  measured on the M5 Pro: `bench_nn_kernels --host-only` (host_us) is the
+  check.
+  **Breaking:** the public field `GpuRuntime::dispatch_count` is an
+  `AtomicUsize` (was `Mutex<usize>`); `take_dispatch_count` is unchanged.
+- **bf16 GEMM operands are borrowed.** `gemm_bf16`, `gemm_tn_bf16`,
+  `gemm_nt_bf16` and the bf16 accumulate lanes no longer clone a `Tensor`
+  (a shape `Vec` and two refcounts) for an operand that is already bf16.
+  `tests/host_path_allocs.rs` counts `gemm_bf16`.
+- **Model outputs are copied once.** Qwen3.5 logits and traces,
+  EmbeddingGemma 2 embeddings and traces, and BERT pooled outputs map the
+  buffer and copy the logical prefix, instead of copying the whole buffer and
+  then the prefix again (~1 GB per Qwen3.5 forward at t = 1024). A busy or
+  poisoned runtime is an `Err` there rather than a panic.
+- **Faster weight loading.** `place_linear_part` transposes in 64×64 tiles,
+  and `SafeTensors::read_f32` widens bf16/f16 in blocks with the conversion
+  inlined. Both produce the same bytes as before; each is ~2.3× faster in a
+  standalone check.
+- **Residency set committed once per command buffer.** `with_binder` no
+  longer commits the residency set before every encode after an
+  allocation; `commit_m4` commits it once, just before the command buffer
+  (removals still commit after the GPU wait). A training step with ~800
+  allocations committed it hundreds of times. `infer_trace`'s
+  `residency_flushes` should now track commits.
+- **Fewer bf16 casts in training.** On the bf16 lane, cross-entropy rounds
+  the gathered rows once per call, each dlogits chunk once for both of its
+  GEMMs and an f32 weight chunk once per walk, and passes a bf16 weight as it
+  is (it was widened and narrowed back per GEMM); the training step rounds
+  each activation several GEMMs read (`x1`, `x2`, `y`, `dresid`, `d_gate`,
+  `d_up`, `dproj`) once into a bf16 twin. Same cast kernel, same bits;
+  roughly 570 cast dispatches and 800 pool allocations fewer per 2B step.
+- **A bank step without temporaries.** Into a bank it overwrites, the step
+  writes every vector gradient in the bank's own buffer (133 allocations and
+  copies per 2B step), the embedding backward's grouping goes into fresh
+  buffers written without staging copies, and a causal step zeroes only the
+  last row of `dxf`.
+- **Unzeroed inference activations.** `Qwen35Model`'s forward and
+  `BertSparseModel`'s encode no longer zero their activations on the host
+  (about 1.2 GB per 1024-token Qwen3.5 prefill, 550 MB per 8192-row BERT
+  forward); every element read is written earlier in the same forward, held
+  by new poison tests (`tiny_forward_reads_no_unwritten_activation`,
+  `tests/bert_tiny.rs`). BERT's head resets its pooled rows on the GPU and
+  its index uploads, like Qwen3.5's `begin`, no longer wait for the GPU.
+- **Decode replay without per-token probes.** `DecodeIcb::execute` reads
+  `TESSL_ICB_EXECUTE` / `TESSL_ICB_TRIAGE` once (new `set_icb_execute` /
+  `set_icb_triage` overrides) and checks pipeline ICB support once per tape,
+  not per command per token; `cb_replay`'s step labels reuse their buffer
+  (the label parameters take `impl AsRef<str>`, was `impl Into<String>`).
+- **Smaller host costs elsewhere.** The Q4 MLX GEMVs and the AdamW step
+  format no error labels on success (`format_args!`), AdamW's kernel names
+  come from a fixed table and its pipelines and slot table are built once,
+  and `Loader::linear` stages every projection part through one reused
+  buffer instead of a fresh `Vec` each.
+- **Parallel, incremental shader build.** `build.rs` compiles the kernel
+  sources concurrently and reuses an `.air` whose inputs (source, headers,
+  compiler, SDK, flags, the script itself) are unchanged; link order,
+  diagnostics and the metal3.2 fallback are as before.
+- **`tessl_torch` drains torch's queue less.** `train_step`,
+  `train_forward` and `adamw_step` no longer call `torch.mps.synchronize()`
+  (they share no torch buffer with tessl), and the cross-entropy autograd
+  path skips the per-row loss copy (`cross_entropy_rows(..., per_row=False)`).
+- **Host-only tests in CI.** The JSON parser tests, the loader's widen and
+  transpose checks and AdamW's kernel-name table run on the hosted macOS
+  `check` job, which needs no Metal device.
 - **Qwen3.5 training step traffic.** Allocations a kernel writes in full
   are no longer zeroed on the host (808 allocations, 25.86 GB per 2B step at
   T = 2048); the step makes one attention workspace and uploads its indices
@@ -461,6 +535,14 @@ All notable changes to `tessl` are recorded here. The format follows
   before running the forward (a bad row used to cost the whole forward's
   dispatches); `score_answers` checks its answer count before allocating;
   and `prefill` allocates the session's buffers before the prefill runs.
+- **A freeze-binds ICB refused every captured tape.** `bind_tensor` and
+  `bind_gpu_buf_offset` finished in the raw-buffer bind, which marks the
+  capture incomplete, before recording the owned bind. Every captured
+  command then carried `incomplete_binds > 0`, so
+  `DecodeIcb::from_commands_ex(.., true)` (and `TESSL_ICB_FREEZE_BINDS`)
+  rejected any real tape. Owned binds are recorded without that mark; the
+  raw-buffer `Binder::bind_buf` is now test-only. Covered by
+  `owned_binds_capture_complete_and_freeze`.
 - **`gemm_i8_dequant` bound its exact accumulation with the wrong product.**
   It took 127 × 127 as the largest int8 product, but (−128) × (−128) = 16384
   is larger, so at `k = 131072` an all-(−128) sum wrapped to −2³¹ without an

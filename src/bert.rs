@@ -52,7 +52,7 @@ use crate::nn::{dispatch_tg_1d, reduce_tptg, require, require_disjoint_writes};
 use crate::qwen35;
 use crate::runtime::GpuRuntime;
 use crate::safetensors::SafeTensors;
-use crate::tensor::{GpuBuffer, Tensor};
+use crate::tensor::{DType, GpuBuffer, Tensor};
 
 const BACKEND: GemmBackend = GemmBackend::TensorOps;
 
@@ -332,9 +332,10 @@ pub fn upload_segments(rt: &Arc<GpuRuntime>, segments: &[(u32, u32)], rows: u32)
         }
     }
     let flat: Vec<u32> = segments.iter().flat_map(|&(a, b)| [a, b]).collect();
-    let buf = rt.alloc_buffer(flat.len().max(1) * 4)?;
-    buf.write_u32(&flat);
-    Ok(buf)
+    // A fresh buffer written without waiting for the GPU: a host write into
+    // an ordinary allocation would first commit and wait on everything
+    // queued, the whole encoder forward on the first head block.
+    rt.alloc_buffer_from_u32(&flat)
 }
 
 /// `pooled[s, v] = max(pooled[s, v], log1p(relu(max_{r in segment s}
@@ -894,26 +895,24 @@ impl BertSparseModel {
     /// One forward over `batch` right-padded to its longest sequence
     /// (validated by [`Self::encode`]).
     fn forward(&self, batch: &[&[u32]], trace: bool) -> Result<(Vec<f32>, Vec<Vec<f32>>), String> {
+        const WHAT: &str = "BertSparseModel::forward";
         let rt = &self.rt;
         let cfg = &self.cfg;
         let seq = batch.iter().map(|ids| ids.len() as u32).max().unwrap_or(0);
         let nb = batch.len() as u32;
         let rows = nb * seq;
         let (h, inter, vocab, eps) = (cfg.hidden, cfg.intermediate, cfg.vocab, cfg.layer_norm_eps);
-        let a = self.acts(nb, seq)?;
-
         let mut padded = vec![0u32; rows as usize];
         for (b, ids) in batch.iter().enumerate() {
             padded[b * seq as usize..b * seq as usize + ids.len()].copy_from_slice(ids);
         }
-        a.ids.write_u32(&padded);
-        a.lens
-            .write_u32(&batch.iter().map(|ids| ids.len() as u32).collect::<Vec<_>>());
+        let lens: Vec<u32> = batch.iter().map(|ids| ids.len() as u32).collect();
+        let a = self.acts(nb, seq, &padded, &lens)?;
 
         let mut out_trace = Vec::new();
         let snap = |t: &Tensor, out: &mut Vec<Vec<f32>>| -> Result<(), String> {
             rt.synchronize()?;
-            out.push(t.buffer.read_f32()[..(rows * h) as usize].to_vec());
+            out.push(t.buffer.try_contents_f32()?[..(rows * h) as usize].to_vec());
             Ok(())
         };
 
@@ -984,6 +983,13 @@ impl BertSparseModel {
         let per_block = (HEAD_BLOCK_ROWS / seq as usize).max(1);
         let v = vocab as usize;
         let mut out = vec![0.0f32; nb as usize * v];
+        // `pooled` is zeroed on the GPU before each block: a host fill would
+        // wait for the queued work and memset up to `per_block * vocab`
+        // floats (250 MB at one-token sequences) on the CPU.
+        let zero_p = rt.pipeline("zero_f32")?;
+        let pooled_n = a.pooled.nbytes() / 4;
+        let pooled_n32 =
+            u32::try_from(pooled_n).map_err(|_| format!("{WHAT}: pooled buffer of {pooled_n} floats exceeds u32"))?;
         let mut b0 = 0usize;
         while b0 < batch.len() {
             let b1 = (b0 + per_block).min(batch.len());
@@ -1001,7 +1007,10 @@ impl BertSparseModel {
             let segments = upload_segments(rt, &segs, block_rows)?;
             // Every sequence lies wholly inside one block, so the block's
             // pooled rows start from zero and are final when it ends.
-            a.pooled.zero();
+            dispatch_1d(rt, &zero_p, pooled_n, |bnd| {
+                set_gpu_buf(bnd, &a.pooled, 0);
+                set_u32(bnd, pooled_n32, 1);
+            })?;
             segment_sparse_max(
                 rt,
                 &a.logits.buffer,
@@ -1014,31 +1023,40 @@ impl BertSparseModel {
             )?;
             // The next block reuses the logits and pooled buffers.
             rt.synchronize()?;
-            out[b0 * v..b1 * v].copy_from_slice(&a.pooled.read_f32()[..(b1 - b0) * v]);
+            out[b0 * v..b1 * v].copy_from_slice(&a.pooled.try_contents_f32()?[..(b1 - b0) * v]);
             b0 = b1;
         }
         Ok((out, out_trace))
     }
 
-    fn acts(&self, nb: u32, seq: u32) -> Result<Acts, String> {
+    /// Activations for `nb` sequences of `seq` rows, with the padded `ids`
+    /// and per-sequence `lens` already in place (written without a GPU wait).
+    fn acts(&self, nb: u32, seq: u32, ids: &[u32], lens: &[u32]) -> Result<Acts, String> {
         let rt = &self.rt;
         let cfg = &self.cfg;
         let r = (nb * seq) as usize;
         let (h, inter, v) = (cfg.hidden as usize, cfg.intermediate as usize, cfg.vocab as usize);
         let per_block = (HEAD_BLOCK_ROWS / seq as usize).max(1).min(nb as usize);
         let block = per_block * seq as usize;
+        // Nothing is zeroed on the host: every element a forward reads, an
+        // earlier kernel of the same forward wrote (the embedding LayerNorm
+        // for every row, padding included; a GEMM; attention for every query
+        // row), and attention reads no key at or past its sequence's length.
+        // `pooled` is zeroed on the GPU per head block. `tests/bert_tiny.rs`
+        // runs the encode with every unzeroed allocation poisoned to NaN.
+        let f32s = |shape: &[usize]| rt.alloc_tensor_unzeroed(shape, DType::F32);
         Ok(Acts {
-            ids: rt.alloc_buffer(r.max(1) * 4)?,
-            lens: rt.alloc_buffer(nb.max(1) as usize * 4)?,
-            resid: rt.alloc_tensor_f32(&[r, h])?,
-            q: rt.alloc_tensor_f32(&[r, h])?,
-            k: rt.alloc_tensor_f32(&[r, h])?,
-            v: rt.alloc_tensor_f32(&[r, h])?,
-            attn: rt.alloc_tensor_f32(&[r, h])?,
-            y: rt.alloc_tensor_f32(&[r, h])?,
-            mid: rt.alloc_tensor_f32(&[r, inter])?,
-            x: rt.alloc_tensor_f32(&[r, h])?,
-            logits: rt.alloc_tensor_f32(&[block, v])?,
+            ids: rt.alloc_buffer_from_u32(ids)?,
+            lens: rt.alloc_buffer_from_u32(lens)?,
+            resid: f32s(&[r, h])?,
+            q: f32s(&[r, h])?,
+            k: f32s(&[r, h])?,
+            v: f32s(&[r, h])?,
+            attn: f32s(&[r, h])?,
+            y: f32s(&[r, h])?,
+            mid: f32s(&[r, inter])?,
+            x: f32s(&[r, h])?,
+            logits: f32s(&[block, v])?,
             pooled: rt.alloc_buffer(per_block.max(1) * v * 4)?,
         })
     }

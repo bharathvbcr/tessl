@@ -349,27 +349,57 @@ impl SafeTensors {
     /// tensor is widened in place inside `dst` as described there.
     pub(crate) fn read_f32_into(&self, name: &str, shape: &[usize], dst: &mut [f32]) -> Result<(), String> {
         let info = self.info(name)?;
-        let widen: Option<fn(u16) -> f32> = match info.dtype {
-            Dtype::F32 => None,
-            Dtype::BF16 => Some(crate::tensor::bf16_bits_to_f32),
-            Dtype::F16 => Some(crate::tensor::f16_bits_to_f32),
+        let narrow = match info.dtype {
+            Dtype::F32 => false,
+            Dtype::BF16 | Dtype::F16 => true,
             other => return Err(format!("{name}: cannot read {other:?} as f32")),
         };
         if info.shape != shape {
             return Err(format!("{name}: shape {:?}, expected {shape:?}", info.shape));
         }
-        let Some(widen) = widen else {
+        if !narrow {
             return self.read_into(name, info, dst);
-        };
+        }
         let n = dst.len();
         let bytes = plain::bytes_mut(dst);
         let (_, upper) = bytes.split_at_mut(2 * n);
         self.read_into(name, info, upper)?;
-        for i in 0..n {
-            let bits = u16::from_le_bytes([bytes[2 * n + 2 * i], bytes[2 * n + 2 * i + 1]]);
-            bytes[4 * i..4 * i + 4].copy_from_slice(&widen(bits).to_ne_bytes());
+        // Monomorphized per dtype, so the widen inlines into the loop instead
+        // of being an indirect call per element.
+        if info.dtype == Dtype::BF16 {
+            widen_in_place(bytes, n, crate::tensor::bf16_bits_to_f32);
+        } else {
+            widen_in_place(bytes, n, crate::tensor::f16_bits_to_f32);
         }
         Ok(())
+    }
+}
+
+/// Widen the `n` little-endian 16-bit values at `bytes[2n..4n]` into the `n`
+/// native-endian f32s at `bytes[..4n]`, front to back (see
+/// [`SafeTensors::read_f32`] for why that order never overwrites an unread
+/// value).
+///
+/// Whole blocks of `B` elements go first, over slices the borrow checker can
+/// see are disjoint, which lets the loop run without per-element bounds
+/// checks: block `i..i + B` writes `[4i, 4i + 4B)` and reads from `2n + 2i`
+/// on, and `4i + 4B <= 2n + 2i` exactly when `i + 2B <= n`. The remaining
+/// fewer than `2B` elements take the element-at-a-time loop.
+fn widen_in_place(bytes: &mut [u8], n: usize, widen: impl Fn(u16) -> f32) {
+    const B: usize = 1024;
+    let mut i = 0;
+    while i + 2 * B <= n {
+        let (lo, hi) = bytes.split_at_mut(2 * n + 2 * i);
+        let dst = &mut lo[4 * i..4 * (i + B)];
+        let src = &hi[..2 * B];
+        for (d, s) in dst.chunks_exact_mut(4).zip(src.chunks_exact(2)) {
+            d.copy_from_slice(&widen(u16::from_le_bytes([s[0], s[1]])).to_ne_bytes());
+        }
+        i += B;
+    }
+    for i in i..n {
+        let bits = u16::from_le_bytes([bytes[2 * n + 2 * i], bytes[2 * n + 2 * i + 1]]);
+        bytes[4 * i..4 * i + 4].copy_from_slice(&widen(bits).to_ne_bytes());
     }
 }
 
@@ -494,4 +524,35 @@ fn tensor_info(name: &str, v: Json) -> Result<TensorInfo, String> {
         begin,
         end,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::widen_in_place;
+    use crate::tensor::{bf16_bits_to_f32, f16_bits_to_f32};
+
+    /// The blocked in-place widen gives the same bytes as widening element by
+    /// element into a separate buffer, at sizes below, at and around the
+    /// block threshold (`2 * 1024`) and with a ragged tail.
+    #[test]
+    fn widen_in_place_matches_elementwise() {
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        for &n in &[0usize, 1, 2, 1023, 2047, 2048, 2049, 3072, 4096, 5000, 10_001] {
+            let src: Vec<u16> = (0..n)
+                .map(|_| {
+                    seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                    (seed >> 48) as u16
+                })
+                .collect();
+            for (name, widen) in [("bf16", bf16_bits_to_f32 as fn(u16) -> f32), ("f16", f16_bits_to_f32)] {
+                let mut bytes = vec![0u8; 4 * n];
+                for (i, v) in src.iter().enumerate() {
+                    bytes[2 * n + 2 * i..2 * n + 2 * i + 2].copy_from_slice(&v.to_le_bytes());
+                }
+                widen_in_place(&mut bytes, n, widen);
+                let want: Vec<u8> = src.iter().flat_map(|&v| widen(v).to_ne_bytes()).collect();
+                assert_eq!(bytes, want, "{name}, n = {n}");
+            }
+        }
+    }
 }

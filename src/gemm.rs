@@ -344,10 +344,13 @@ fn cast_between(src: &Tensor, dst: &Tensor, kernel: &str) -> Result<(), String> 
     })
 }
 
-fn ensure_bf16(t: &Tensor) -> Result<Tensor, String> {
+/// `t` as a bf16 operand: borrowed when it already is one (no `Tensor`
+/// clone, so no shape `Vec` and no refcount traffic per GEMM), a fresh
+/// rounded copy when it is f32.
+fn ensure_bf16(t: &Tensor) -> Result<std::borrow::Cow<'_, Tensor>, String> {
     match t.dtype {
-        DType::BF16 => Ok(t.clone()),
-        DType::F32 => cast_f32_to_bf16(t),
+        DType::BF16 => Ok(std::borrow::Cow::Borrowed(t)),
+        DType::F32 => cast_f32_to_bf16(t).map(std::borrow::Cow::Owned),
         // Deliberately not a conversion. f16 -> bf16 loses three mantissa bits
         // *and* changes the exponent range, so a silent one would degrade the
         // caller's operands to buy a code path they did not ask for. An f16
@@ -1402,7 +1405,7 @@ fn check_bf16_lane(rt: &GpuRuntime, c: &Tensor, what: &str) -> Result<(), String
 pub fn gemm_bf16(a: &Tensor, b: &Tensor, c: &Tensor) -> Result<(), String> {
     validate_gemm(a, b, c, Layout::NN, true, "gemm_bf16")?;
     check_bf16_lane(a.runtime(), c, "gemm_bf16")?;
-    gemm(&ensure_bf16(a)?, &ensure_bf16(b)?, c, GemmBackend::TensorOps)
+    gemm(&*ensure_bf16(a)?, &*ensure_bf16(b)?, c, GemmBackend::TensorOps)
 }
 
 /// `C[M,N] = A[K,M]^T @ B[K,N]` (TN). A is stored `[K,M]`, B `[K,N]`.
@@ -1680,7 +1683,6 @@ fn dispatch_k_partitions(
     let z_width = zero_p.threadExecutionWidth();
     let z_tpt = z_width.min(numel).max(1);
     let z_groups = numel.div_ceil(z_tpt);
-    let partitions: Vec<u32> = (0..k_u).step_by(k_tile).collect();
     let (m, n, k, k_tile) = (m_u, n_u, k_u, k_tile_u);
 
     // Zero once (optional) + all K-partitions in one binder.
@@ -1697,7 +1699,9 @@ fn dispatch_k_partitions(
         }
 
         bnd.set_pipeline(pipeline);
-        for (pi, &k0) in partitions.iter().enumerate() {
+        // `k_tile != 0` was checked above; the partition starts are walked
+        // in place rather than collected per call.
+        for (pi, k0) in (0..k).step_by(k_tile as usize).enumerate() {
             if pi > 0 && need_explicit {
                 bnd.barrier();
             }
@@ -1871,7 +1875,14 @@ fn nn_accum(a: &Tensor, b: &Tensor, c: &Tensor, (m, n, k): (usize, usize, usize)
             beta: 1.0,
             ..Epilogue::default()
         };
-        return run_gemm_epilogue(&ensure_bf16(a)?, &ensure_bf16(b)?, c, GemmBackend::TensorOps, epi, None);
+        return run_gemm_epilogue(
+            &*ensure_bf16(a)?,
+            &*ensure_bf16(b)?,
+            c,
+            GemmBackend::TensorOps,
+            epi,
+            None,
+        );
     }
     if let Some(k_tile) = nn_splitk_k_tile(m, n, k) {
         let pipeline = rt.pipeline("matmul2d_tensorops_nn_splitk_f32")?;

@@ -20,7 +20,7 @@ use tessl::gemm::GemmOperands;
 use tessl::npy::read_npy;
 use tessl::qwen35_adamw::{AdamW, AdamWHyper};
 use tessl::qwen35_bwd::{embed_rows_bwd, scatter_add_rows, EmbedBwdWorkspace};
-use tessl::qwen35_model::{LayerKind, Precision, Qwen35Config, Qwen35Model};
+use tessl::qwen35_model::{LayerKind, LogitRows, Precision, Qwen35Config, Qwen35Model};
 use tessl::qwen35_train::{MixerGrads, Qwen35Grads, Supervise, TrainStep};
 use tessl::safetensors::SafeTensors;
 use tessl::tensor::{bf16_bits_to_f32, f32_to_bf16_bits, DType, GpuBuffer, Tensor};
@@ -217,6 +217,67 @@ fn compare(dir: &Path, prefix: &str, cfg: &Qwen35Config, step: &TrainStep, loss_
         .count();
     assert_eq!(seen, files, "every reference gradient must be compared");
     worst
+}
+
+/// The inference forward allocates its activations unzeroed: each one is
+/// written in full before it is read. Poisoning every unzeroed allocation
+/// with NaN must leave the logits bit for bit unchanged, at both precisions,
+/// through the full forward, chosen rows, and a prefill then decode steps.
+#[test]
+fn tiny_forward_reads_no_unwritten_activation() {
+    let dir = fixture();
+    let ids = ids(&dir);
+    for precision in [Precision::F32, Precision::Bf16] {
+        let (rt, model) = load_rt(&dir, "model.", tiny_config(), precision);
+        let clean = model.forward(&ids, true).unwrap();
+        rt.set_poison_unzeroed(true);
+        let poisoned = model.forward(&ids, true);
+        rt.set_poison_unzeroed(false);
+        let poisoned = poisoned.unwrap();
+        let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+        assert!(
+            clean.logits.iter().all(|x| x.is_finite()),
+            "{precision:?}: non-finite logits"
+        );
+        assert_eq!(
+            bits(&poisoned.logits),
+            bits(&clean.logits),
+            "{precision:?}: an unzeroed activation was read before it was written"
+        );
+        assert_eq!(poisoned.trace.len(), clean.trace.len());
+        for (l, (p, c)) in poisoned.trace.iter().zip(&clean.trace).enumerate() {
+            assert_eq!(bits(p), bits(c), "{precision:?}: trace {l} differs under poison");
+        }
+
+        let rows = [0, ids.len() as u32 - 1];
+        let decode = |n: usize| -> Vec<Vec<f32>> {
+            let (prefix, rest) = ids.split_at(ids.len() - n);
+            let (mut session, first) = model.prefill(prefix, n as u32).unwrap();
+            let mut out = vec![first];
+            out.extend(rest.iter().map(|&id| session.step(id).unwrap()));
+            out
+        };
+        let clean_rows = model.forward_rows(&ids, LogitRows::Rows(&rows), false).unwrap().logits;
+        let clean_decode = decode(2);
+        rt.set_poison_unzeroed(true);
+        let poisoned_rows = model.forward_rows(&ids, LogitRows::Rows(&rows), false);
+        let poisoned_decode = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| decode(2)));
+        rt.set_poison_unzeroed(false);
+        assert_eq!(
+            bits(&poisoned_rows.unwrap().logits),
+            bits(&clean_rows),
+            "{precision:?}: forward_rows read an unwritten activation"
+        );
+        let poisoned_decode = poisoned_decode.unwrap();
+        assert_eq!(poisoned_decode.len(), clean_decode.len());
+        for (i, (p, c)) in poisoned_decode.iter().zip(&clean_decode).enumerate() {
+            assert!(
+                c.iter().all(|x| x.is_finite()),
+                "{precision:?}: non-finite decode logits {i}"
+            );
+            assert_eq!(bits(p), bits(c), "{precision:?}: decode logits {i} differ under poison");
+        }
+    }
 }
 
 #[test]

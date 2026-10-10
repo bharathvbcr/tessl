@@ -19,7 +19,9 @@ use std::sync::Arc;
 use objc2_metal::MTLComputePipelineState;
 
 use crate::dispatch::{dispatch_1d, dispatch_2d, set_f32, set_gpu_buf, set_gpu_buf_offset, set_u32};
-use crate::nn::{dispatch_tg_1d, reduce_tptg, require, require_disjoint_writes, require_runtime};
+use crate::nn::{
+    dispatch_tg_1d, reduce_tptg, require, require_disjoint_writes, require_disjoint_writes_opt, require_runtime,
+};
 use crate::qwen35::{require_window, AttnProjLayout, AttnShape, Cols, GdnGateLogits, GdnParams};
 use crate::runtime::{BufferKind, GpuRuntime};
 use crate::tensor::{DType, GpuBuffer, Tensor};
@@ -665,6 +667,73 @@ pub fn embed_rows_bwd(
             ws.max_rows
         ));
     }
+    let Some(groups) = embed_bwd_check(rt, ids, dh, dw, vocab, hidden, [&ws.pos, &ws.run_start, &ws.uniq])? else {
+        return Ok(());
+    };
+    let pad = |v: &[u32], len: usize| {
+        let mut out = v.to_vec();
+        out.resize(len, 0);
+        out
+    };
+    let n = ws.max_rows as usize;
+    // In order with the queued work rather than waiting for it.
+    rt.upload_u32(&ws.pos, &pad(&groups.order, n))?;
+    rt.upload_u32(&ws.run_start, &pad(&groups.starts, n + 1))?;
+    rt.upload_u32(&ws.uniq, &pad(&groups.uniq, n))?;
+    embed_bwd_encode(
+        rt,
+        dh,
+        dw,
+        [&ws.pos, &ws.run_start, &ws.uniq],
+        groups.uniq.len() as u32,
+        hidden,
+    )
+}
+
+/// [`embed_rows_bwd`] with its grouping in fresh buffers of exactly the
+/// grouping's size, written on the host without a GPU wait
+/// ([`GpuRuntime::alloc_buffer_from_u32`]), for a caller that would
+/// otherwise make a workspace for one call: no staging buffers, no copy
+/// dispatches, no padding. The kernel reads only `pos[..rows]`,
+/// `run_start[..=runs]` and `uniq[..runs]`, which is what these hold.
+pub(crate) fn embed_rows_bwd_once(
+    rt: &Arc<GpuRuntime>,
+    ids: &[u32],
+    dh: &GpuBuffer,
+    dw: &GpuBuffer,
+    vocab: u32,
+    hidden: u32,
+) -> Result<(), String> {
+    let Some(groups) = embed_bwd_check(rt, ids, dh, dw, vocab, hidden, [])? else {
+        return Ok(());
+    };
+    let pos = rt.alloc_buffer_from_u32(&groups.order)?;
+    let run_start = rt.alloc_buffer_from_u32(&groups.starts)?;
+    let uniq = rt.alloc_buffer_from_u32(&groups.uniq)?;
+    embed_bwd_encode(rt, dh, dw, [&pos, &run_start, &uniq], groups.uniq.len() as u32, hidden)
+}
+
+/// Rows grouped by id: `order` sorts rows by `(id, row)`, run `i` is
+/// `order[starts[i]..starts[i + 1]]` with id `uniq[i]`.
+struct EmbedGroups {
+    order: Vec<u32>,
+    starts: Vec<u32>,
+    uniq: Vec<u32>,
+}
+
+/// The checks [`embed_rows_bwd`] makes (ids below `vocab`, buffer sizes, `dw`
+/// disjoint from every read buffer, `scratch` included) and the host
+/// grouping; `None` when there is nothing to add.
+fn embed_bwd_check<const N: usize>(
+    rt: &Arc<GpuRuntime>,
+    ids: &[u32],
+    dh: &GpuBuffer,
+    dw: &GpuBuffer,
+    vocab: u32,
+    hidden: u32,
+    scratch: [&GpuBuffer; N],
+) -> Result<Option<EmbedGroups>, String> {
+    const WHAT: &str = "qwen35_bwd::embed_rows_bwd";
     if let Some((r, &id)) = ids.iter().enumerate().find(|(_, &id)| id >= vocab) {
         return Err(format!("{WHAT}: ids[{r}] = {id} is not below vocab {vocab}"));
     }
@@ -678,18 +747,14 @@ pub fn embed_rows_bwd(
         .ok_or_else(|| format!("{WHAT}: vocab x hidden overflows"))?;
     require::<f32>(rt, dh, n_dh, format_args!("{WHAT} dh"))?;
     require::<f32>(rt, dw, n_dw, format_args!("{WHAT} dw"))?;
-    require_disjoint_writes(
+    let named = |i: usize| scratch.get(i).map(|&b| (["pos", "run_start", "uniq"][i], b));
+    require_disjoint_writes_opt(
         WHAT,
-        &[("dw", dw)],
-        &[
-            ("dh", dh),
-            ("pos", &ws.pos),
-            ("run_start", &ws.run_start),
-            ("uniq", &ws.uniq),
-        ],
+        &[Some(("dw", dw))],
+        &[Some(("dh", dh)), named(0), named(1), named(2)],
     )?;
     if rows == 0 || hidden == 0 {
-        return Ok(());
+        return Ok(None);
     }
     // Rows sorted by (id, row): each id's rows form one run, in row order.
     let mut order: Vec<u32> = (0..rows as u32).collect();
@@ -704,23 +769,25 @@ pub fn embed_rows_bwd(
         }
     }
     starts.push(rows as u32);
-    let n_runs = uniq.len() as u32;
-    let pad = |v: &[u32], len: usize| {
-        let mut out = v.to_vec();
-        out.resize(len, 0);
-        out
-    };
-    let n = ws.max_rows as usize;
-    // In order with the queued work rather than waiting for it.
-    rt.upload_u32(&ws.pos, &pad(&order, n))?;
-    rt.upload_u32(&ws.run_start, &pad(&starts, n + 1))?;
-    rt.upload_u32(&ws.uniq, &pad(&uniq, n))?;
+    Ok(Some(EmbedGroups { order, starts, uniq }))
+}
+
+/// Encode the gather's backward over `n_runs` groups held in
+/// `[pos, run_start, uniq]`.
+fn embed_bwd_encode(
+    rt: &Arc<GpuRuntime>,
+    dh: &GpuBuffer,
+    dw: &GpuBuffer,
+    [pos, run_start, uniq]: [&GpuBuffer; 3],
+    n_runs: u32,
+    hidden: u32,
+) -> Result<(), String> {
     let p = rt.pipeline("qwen35_embed_rows_bwd_f32")?;
-    dispatch_2d(rt, &p, h, n_runs as usize, |bnd| {
+    dispatch_2d(rt, &p, hidden as usize, n_runs as usize, |bnd| {
         set_gpu_buf(bnd, dh, 0);
-        set_gpu_buf(bnd, &ws.pos, 1);
-        set_gpu_buf(bnd, &ws.run_start, 2);
-        set_gpu_buf(bnd, &ws.uniq, 3);
+        set_gpu_buf(bnd, pos, 1);
+        set_gpu_buf(bnd, run_start, 2);
+        set_gpu_buf(bnd, uniq, 3);
         set_gpu_buf(bnd, dw, 4);
         set_u32(bnd, n_runs, 5);
         set_u32(bnd, hidden, 6);

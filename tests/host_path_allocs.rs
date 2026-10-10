@@ -84,6 +84,7 @@ fn a_pipeline_cache_hit_allocates_nothing_in_either_mode() {
 /// of every token.
 #[test]
 fn decode_path_entry_points_allocate_nothing_on_success() {
+    use tessl::gemm::gemm_bf16;
     use tessl::qwen35::{
         self, AttnProjLayout, AttnShape, AttnTargets, Cols, GdnParams, GdnProjLayout, OutCols, SharedPrefix, StateIn,
     };
@@ -145,6 +146,14 @@ fn decode_path_entry_points_allocate_nothing_on_success() {
     let logits = f32b(1000, 0.5);
     let (cap, tok) = (f32b(1, 30.0), u32b(0));
     let (idx, val) = (rt.alloc_buffer(16).unwrap(), f32b(4, 0.0));
+    // A small row-major MLX Q4 bank: 8 rows x 32 cols, one group per row.
+    let (q4_packed, q4_sb) = (rt.alloc_buffer(8 * 32 / 2).unwrap(), rt.alloc_buffer(8 * 4).unwrap());
+    let q4_bank = nn::Q4MlxBank {
+        packed: &q4_packed,
+        scales_biases: &q4_sb,
+    };
+    let q4_x = rt.alloc_buffer(32 * 2).unwrap();
+    let (q4_q, q4_k, q4_v) = (f32b(8, 0.0), f32b(8, 0.0), f32b(8, 0.0));
     let tkv = u32b(P as u32);
     let zero = u32b(0);
     let attn_dims = nn::AttnDims {
@@ -169,6 +178,8 @@ fn decode_path_entry_points_allocate_nothing_on_success() {
             Box::new(|| nn::rms_norm_bf16(rt, &resid.buffer, &norm_w, &xb.buffer, 1, H as u32, 1e-6)),
         ),
         ("gemm (in-proj)", Box::new(|| gemm(&xb, &g_w, &g_proj, backend))),
+        // Operands already bf16: borrowed, not cloned into new `Tensor`s.
+        ("gemm_bf16 (in-proj)", Box::new(|| gemm_bf16(&xb, &g_w, &g_proj))),
         (
             "qwen35::conv1d_silu",
             Box::new(|| {
@@ -315,6 +326,28 @@ fn decode_path_entry_points_allocate_nothing_on_success() {
             Box::new(|| {
                 nn::flash_attn_decode(
                     rt, &a_q, &pk, &pv, &a_o, &scratch, &tkv, &zero, &zero, attn_dims, 256, P, false,
+                )
+            }),
+        ),
+        (
+            "nn::gemv_q4_mlx_qkv",
+            Box::new(|| {
+                nn::gemv_q4_mlx_qkv(
+                    rt,
+                    q4_bank,
+                    q4_bank,
+                    q4_bank,
+                    &q4_x,
+                    nn::QkvOutputs {
+                        q_out: &q4_q,
+                        k_out: &q4_k,
+                        v_out: &q4_v,
+                    },
+                    8,
+                    8,
+                    32,
+                    32,
+                    nn::Q4MlxLayout::RowMajor,
                 )
             }),
         ),

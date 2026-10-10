@@ -1411,7 +1411,7 @@ impl Staged<'_> {
             m.layer(l, a, step)?;
             if let Some(trace) = self.trace.as_mut() {
                 m.rt.synchronize()?;
-                trace.push(a.resid.buffer.read_f32()[..(a.t * m.cfg.hidden) as usize].to_vec());
+                trace.push(a.resid.buffer.try_contents_f32()?[..(a.t * m.cfg.hidden) as usize].to_vec());
             }
         }
         self.next = layer;
@@ -1479,7 +1479,7 @@ impl Staged<'_> {
             }
         }
         rt.synchronize()?;
-        Ok(out.buffer.read_f32()[..n * vocab].to_vec())
+        Ok(out.buffer.try_contents_f32()?[..n * vocab].to_vec())
     }
 
     /// The `answers` tokens' logits at positions `rows`, and their
@@ -1535,10 +1535,10 @@ impl Staged<'_> {
             &logprobs,
         )?;
         rt.synchronize()?;
-        Ok(AnswerScores {
-            logits: logits.read_f32()[..n].to_vec(),
-            logprobs: logprobs.read_f32()[..n].to_vec(),
-        })
+        // One host mapping at a time: two live at once read as a busy runtime.
+        let logits = logits.try_contents_f32()?[..n].to_vec();
+        let logprobs = logprobs.try_contents_f32()?[..n].to_vec();
+        Ok(AnswerScores { logits, logprobs })
     }
 }
 
@@ -1619,7 +1619,7 @@ impl Decode<'_> {
         rt.synchronize()?;
         self.decoded += 1;
         self.broken = false;
-        Ok(self.logits.buffer.read_f32()[..m.cfg.vocab as usize].to_vec())
+        Ok(self.logits.buffer.try_contents_f32()?[..m.cfg.vocab as usize].to_vec())
     }
 }
 
@@ -1637,8 +1637,8 @@ fn check_rows(what: &str, rows: LogitRows<'_>, t: usize) -> Result<(), String> {
 fn read_rows(x: &Tensor, precision: Precision) -> Result<Vec<f32>, String> {
     let n = x.shape.iter().product::<usize>();
     Ok(match precision {
-        Precision::F32 => x.buffer.read_f32()[..n].to_vec(),
-        Precision::Bf16 => x.buffer.contents_u16()[..n]
+        Precision::F32 => x.buffer.try_contents_f32()?[..n].to_vec(),
+        Precision::Bf16 => x.buffer.try_contents_u16()?[..n]
             .iter()
             .map(|&b| crate::tensor::bf16_bits_to_f32(b))
             .collect(),
@@ -1646,12 +1646,10 @@ fn read_rows(x: &Tensor, precision: Precision) -> Result<Vec<f32>, String> {
 }
 
 /// A `[rows, cols]` activation in the forward's dtype: what the norms, gated
-/// norm, output gate and SwiGLU write and the GEMMs read.
+/// norm, output gate and SwiGLU write and the GEMMs read. Unzeroed: each of
+/// those writes it in full before anything reads it.
 fn activation(rt: &Arc<GpuRuntime>, p: Precision, rows: usize, cols: usize) -> Result<Tensor, String> {
-    match p {
-        Precision::Bf16 => rt.alloc_tensor_bf16(&[rows, cols]),
-        Precision::F32 => rt.alloc_tensor_f32(&[rows, cols]),
-    }
+    rt.alloc_tensor_unzeroed(&[rows, cols], p.dtype())
 }
 
 /// Every intermediate of one forward at `t` tokens, shared by all layers (the
@@ -1687,29 +1685,37 @@ impl Acts {
     fn new(rt: &Arc<GpuRuntime>, cfg: &Qwen35Config, p: Precision, t: u32, shared_kv: bool) -> Result<Self, String> {
         let tu = t as usize;
         let (g, l) = (cfg.gdn, cfg.attn);
+        // Every activation is written in full before anything reads it — the
+        // embedding gather fills `resid`, the norms fill `x`, the GEMMs fill
+        // their outputs, the gate and activation kernels fill `g_y`, `a_y`
+        // and `m_mid` — so none is zeroed on the host. `tests/qwen35_train.rs`
+        // holds this with `set_poison_unzeroed`.
+        let f32t = |cols: usize| rt.alloc_tensor_unzeroed(&[tu, cols], DType::F32);
         let act = |cols: usize| activation(rt, p, tu, cols);
         let f32s = |n: usize| rt.alloc_buffer(n.max(1) * 4);
         let qd = (l.q_heads() * l.head_dim()) as usize;
         let kv = tu * (l.kv_heads() * l.head_dim()) as usize;
+        // Fresh buffers, written without a GPU wait.
+        let u32_buf = |v: u32| rt.alloc_buffer_from_u32(&[v]);
         Ok(Self {
             t,
-            resid: rt.alloc_tensor_f32(&[tu, cfg.hidden as usize])?,
+            resid: f32t(cfg.hidden as usize)?,
             x: act(cfg.hidden as usize)?,
-            proj_out: rt.alloc_tensor_f32(&[tu, cfg.hidden as usize])?,
-            g_proj: rt.alloc_tensor_f32(&[tu, g.width() as usize])?,
+            proj_out: f32t(cfg.hidden as usize)?,
+            g_proj: f32t(g.width() as usize)?,
             g_qkv: f32s(tu * g.conv_dim() as usize)?,
             g_o: f32s(tu * g.value_dim() as usize)?,
             g_y: act(g.value_dim() as usize)?,
             g_ws: GdnWorkspace::new(rt, &g.dims(1, t))?,
-            a_proj: rt.alloc_tensor_f32(&[tu, l.width() as usize])?,
+            a_proj: f32t(l.width() as usize)?,
             a_q: f32s(tu * qd)?,
             kv: if shared_kv { Some((f32s(kv)?, f32s(kv)?)) } else { None },
             a_o: f32s(tu * qd)?,
             a_y: act(qd)?,
-            tkv: rt.alloc_buffer_from_u32(&[t])?,
-            zero: rt.alloc_buffer_from_u32(&[0])?,
-            m_gate: rt.alloc_tensor_f32(&[tu, cfg.intermediate as usize])?,
-            m_up: rt.alloc_tensor_f32(&[tu, cfg.intermediate as usize])?,
+            tkv: u32_buf(t)?,
+            zero: u32_buf(0)?,
+            m_gate: f32t(cfg.intermediate as usize)?,
+            m_up: f32t(cfg.intermediate as usize)?,
             m_mid: act(cfg.intermediate as usize)?,
         })
     }

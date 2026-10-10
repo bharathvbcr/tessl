@@ -347,6 +347,7 @@ def cross_entropy_rows(
     grads: bool = False,
     scale: float = 1.0,
     operands: str = "f32",
+    per_row: bool = True,
 ):
     """The raw call: ``hidden`` is a contiguous ``[T, ld]`` MPS tensor whose
     first ``H`` columns are the hidden states, ``weight`` a contiguous
@@ -355,7 +356,9 @@ def cross_entropy_rows(
     a Python float, per-row losses as a CPU float64 tensor, and with
     ``grads`` the f32 ``[n, H]`` and ``[V, H]`` gradients of ``scale * loss``
     (``None`` otherwise). ``operands`` is the GEMMs': ``"f32"`` (exact) or
-    ``"bf16"`` (operands rounded to bf16, f32 accumulation).
+    ``"bf16"`` (operands rounded to bf16, f32 accumulation). With
+    ``per_row=False`` the per-row losses are not copied out and ``None`` is
+    returned in their place.
     """
     if reduction not in ("mean", "sum"):
         raise TesslError(f"reduction must be 'mean' or 'sum', not {reduction!r}")
@@ -391,7 +394,7 @@ def cross_entropy_rows(
         args.dh = _ref(dh, "dh")
         args.dw = _ref(dw, "dw")
     loss = ctypes.c_double()
-    per_row = torch.empty(n, dtype=torch.float64)
+    per_row_out = torch.empty(n, dtype=torch.float64) if per_row else None
     err = ctypes.create_string_buffer(_ERR_LEN)
     # tessl reads buffers torch's queue may still be writing: finish it.
     torch.mps.synchronize()
@@ -399,7 +402,7 @@ def cross_entropy_rows(
         rt.handle,
         ctypes.byref(args),
         ctypes.byref(loss),
-        ctypes.cast(per_row.data_ptr(), ctypes.POINTER(ctypes.c_double)),
+        ctypes.cast(per_row_out.data_ptr(), ctypes.POINTER(ctypes.c_double)) if per_row_out is not None else None,
         err,
         _ERR_LEN,
     )
@@ -407,7 +410,7 @@ def cross_entropy_rows(
     del rows_u32, targets_u32
     if status != 0:
         raise TesslError(err.value.decode(errors="replace"))
-    return loss.value, per_row, dh, dw
+    return loss.value, per_row_out, dh, dw
 
 
 class _HostU32:
@@ -445,7 +448,8 @@ class _CrossEntropy(torch.autograd.Function):
             raise TesslError(f"hidden width {base.shape[1]} is less than the weight's {H}")
         want = ctx.needs_input_grad[0] or ctx.needs_input_grad[1]
         loss, _, dh, dw = cross_entropy_rows(
-            base, weight.contiguous(), rows, tgt, reduction=reduction, chunk=chunk, grads=want, operands=operands
+            base, weight.contiguous(), rows, tgt, reduction=reduction, chunk=chunk, grads=want, operands=operands,
+            per_row=False,
         )
         # Gradients of the loss itself (scale 1); backward scales them by the
         # upstream gradient, which is linear, so nothing is recomputed.
@@ -981,7 +985,11 @@ class Qwen35:
         beta1, beta2 = betas
         arr = (ctypes.c_float * len(wd))(*wd)
         err = ctypes.create_string_buffer(_ERR_LEN)
-        torch.mps.synchronize()
+        # No torch.mps.synchronize(): this call hands tessl no torch buffer
+        # (host arrays only; the model's weights, gradients and moments are
+        # tessl's own), so there is nothing on torch's queue to wait for, and
+        # draining it would only stall overlapping torch work. `guarded`
+        # still finishes tessl's work before the call returns.
         self._check(
             self._rt.lib.tessl_qwen35_adamw_step(
                 self._handle, float(lr), float(beta1), float(beta2), float(eps), float(grad_scale), arr, len(wd), err,
@@ -1023,7 +1031,11 @@ class Qwen35:
             sup, n = _SUPERVISE_ROWS, pos.t.numel()
         loss = ctypes.c_double()
         err = ctypes.create_string_buffer(_ERR_LEN)
-        torch.mps.synchronize()
+        # No torch.mps.synchronize(): this call hands tessl no torch buffer
+        # (host arrays only; the model's weights, gradients and moments are
+        # tessl's own), so there is nothing on torch's queue to wait for, and
+        # draining it would only stall overlapping torch work. `guarded`
+        # still finishes tessl's work before the call returns.
         self._check(
             self._rt.lib.tessl_qwen35_train_forward(
                 self._handle, host.ctypes_ptr, n_ids, code, sup,
@@ -1113,7 +1125,11 @@ class Qwen35:
         host = self._ids(ids)
         loss = ctypes.c_double()
         err = ctypes.create_string_buffer(_ERR_LEN)
-        torch.mps.synchronize()
+        # No torch.mps.synchronize(): this call hands tessl no torch buffer
+        # (host arrays only; the model's weights, gradients and moments are
+        # tessl's own), so there is nothing on torch's queue to wait for, and
+        # draining it would only stall overlapping torch work. `guarded`
+        # still finishes tessl's work before the call returns.
         self._has_grads = False
         status = self._rt.lib.tessl_qwen35_train_step(
             self._handle, host.ctypes_ptr, host.t.numel(), code, ctypes.byref(loss), err, _ERR_LEN,

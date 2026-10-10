@@ -143,7 +143,9 @@ impl<'a> Window<'a> {
 
     /// The window lies inside its buffer, is f32 or bf16, and its geometry
     /// fits the kernels' `uint`s.
-    pub(crate) fn check(&self, what: &str) -> Result<(), String> {
+    /// `what` labels errors only; pass `format_args!` so a passing check
+    /// formats nothing.
+    pub(crate) fn check(&self, what: impl std::fmt::Display + Copy) -> Result<(), String> {
         if !matches!(self.dtype, DType::F32 | DType::BF16) {
             return Err(format!("{what}: {:?} storage is not f32 or bf16", self.dtype));
         }
@@ -182,8 +184,8 @@ impl<'a> Window<'a> {
 /// same-type is exact. Encoded, not waited for.
 pub(crate) fn window_copy(rt: &GpuRuntime, src: &Window<'_>, dst: &Window<'_>) -> Result<(), String> {
     const WHAT: &str = "window_copy";
-    src.check(&format!("{WHAT} src"))?;
-    dst.check(&format!("{WHAT} dst"))?;
+    src.check(format_args!("{WHAT} src"))?;
+    dst.check(format_args!("{WHAT} dst"))?;
     let (rows, width) = (src.rows, src.width);
     if (dst.rows, dst.width) != (rows, width) {
         return Err(format!(
@@ -481,7 +483,7 @@ impl Qwen35Model {
         let slots = slots(self, None)?;
         check(WHAT, &self.rt, &slots, src)?;
         for s in &slots {
-            s.param_window().check(&format!("{WHAT}: {}", s.info.name))?;
+            s.param_window().check(format_args!("{WHAT}: {}", s.info.name))?;
         }
         self.bump_param_generation();
         for (s, t) in slots.iter().zip(src) {

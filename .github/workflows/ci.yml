@@ -151,15 +151,17 @@ jobs:
       - name: Host-only unit tests
         # The `gpu` job is the only place `cargo test` runs, and it skips until a
         # Metal runner is registered. These tests construct no GpuRuntime — the
-        # JSON parser, and the loader's in-place bf16/f16 widen and tiled weight
-        # transpose checked against their plain loops — so they run here, on
-        # every push, instead of waiting on that runner.
+        # JSON parser, the loader's in-place bf16/f16 widen and tiled weight
+        # transpose checked against their plain loops, and AdamW's kernel-name
+        # table — so they run here, on every push, instead of waiting on that
+        # runner.
         #
         # The filter is checked to have matched: a filter that selects nothing
         # also exits 0, and that must not read as a pass.
         run: |
           out=$(cargo test --release --lib -- json::tests:: safetensors::tests:: \
-            qwen35::tests::place_linear_part_matches_the_row_by_row_transpose 2>&1) || { echo "$out"; exit 1; }
+            qwen35::tests::place_linear_part_matches_the_row_by_row_transpose \
+            qwen35_adamw::step_kernel_tests:: 2>&1) || { echo "$out"; exit 1; }
           echo "$out"
           grep -Eq 'test result: ok\. [1-9][0-9]* passed' <<<"$out" || { echo "host-only filter matched no tests"; exit 1; }
 

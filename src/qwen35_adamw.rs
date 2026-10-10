@@ -47,7 +47,7 @@ use objc2_metal::MTLBuffer;
 use crate::dispatch::{dispatch_2d, dispatch_2d_tg, set_gpu_buf, set_gpu_buf_offset, set_u32};
 use crate::nn::require_runtime;
 use crate::qwen35_model::{Precision, Qwen35Model};
-use crate::qwen35_params::{check, slots, window_copy, Window};
+use crate::qwen35_params::{check, slots, window_copy, Slot, Window};
 use crate::qwen35_train::Qwen35Grads;
 use crate::runtime::GpuRuntime;
 use crate::tensor::{DType, GpuBuffer, Tensor};
@@ -259,7 +259,7 @@ impl AdamW {
         let mut out = Vec::new();
         for s in slots(model, None)? {
             let pw = s.param_window();
-            pw.check(&format!("{WHAT}: {}", s.info.name))?;
+            pw.check(format_args!("{WHAT}: {}", s.info.name))?;
             let n = pw.numel();
             let (moment, scale_bytes, aux_bytes) = slot_bytes(n, pw.dtype, config);
             let scales = if scale_bytes > 0 {
@@ -383,7 +383,12 @@ impl AdamW {
 
     /// State for `model`: one entry per parameter of the same size.
     fn check_model(&self, what: &str, model: &Qwen35Model) -> Result<(), String> {
-        let ps = slots(model, None)?;
+        self.check_model_slots(what, model, &slots(model, None)?)
+    }
+
+    /// [`Self::check_model`] against `model`'s parameter slots already built
+    /// (with or without gradients; only the parameter windows are read).
+    fn check_model_slots(&self, what: &str, model: &Qwen35Model, ps: &[Slot<'_>]) -> Result<(), String> {
         if model.precision() != self.precision
             || ps.len() != self.slots.len()
             || ps.iter().zip(&self.slots).any(|(p, s)| p.param_window().numel() != s.n)
@@ -576,7 +581,7 @@ pub fn adamw_step(
         .map(|t| Window::dense(&t.buffer, t.byte_offset(), DType::F32, n))
         .collect();
     for (x, name) in w.iter().zip(names) {
-        x.check(&format!("{WHAT}: {name}"))?;
+        x.check(format_args!("{WHAT}: {name}"))?;
     }
     let bytes = le_bytes(adamw_scalars(hyper, step, f64::from(weight_decay)), f32::to_le_bytes);
     let p = rt.pipeline("qwen35_adamw_f32")?;
@@ -594,28 +599,75 @@ pub fn adamw_step(
 
 /// The stored-precision step kernel for a parameter window of `p`, its
 /// gradient's dtype `g`, and `config`.
-fn step_kernel(p: DType, g: DType, config: AdamWConfig) -> Result<String, String> {
+/// The step kernel's name: `qwen35_adamw_f32_plain_gf32_m{mom}` for an f32
+/// parameter, `qwen35_adamw_bf16_{rule}_g{grad}_m{mom}` for a bf16 one. A
+/// fixed table rather than a `format!`, since this runs per parameter per step.
+fn step_kernel(p: DType, g: DType, config: AdamWConfig) -> Result<&'static str, String> {
     let mom = match config.moments {
-        MomentStorage::F32 => "f32",
-        MomentStorage::Bf16 => "bf16",
-        MomentStorage::Block8 => "q8",
+        MomentStorage::F32 => 0,
+        MomentStorage::Bf16 => 1,
+        MomentStorage::Block8 => 2,
     };
-    let gname = match g {
-        DType::F32 => "f32",
-        DType::BF16 => "bf16",
+    let grad = match g {
+        DType::F32 => 0,
+        DType::BF16 => 1,
         d => return Err(format!("a {d:?} gradient")),
     };
+    const F32: [&str; 3] = [
+        "qwen35_adamw_f32_plain_gf32_mf32",
+        "qwen35_adamw_f32_plain_gf32_mbf16",
+        "qwen35_adamw_f32_plain_gf32_mq8",
+    ];
+    // [rule][grad][mom]
+    const BF16: [[[&str; 3]; 2]; 3] = [
+        [
+            [
+                "qwen35_adamw_bf16_master_gf32_mf32",
+                "qwen35_adamw_bf16_master_gf32_mbf16",
+                "qwen35_adamw_bf16_master_gf32_mq8",
+            ],
+            [
+                "qwen35_adamw_bf16_master_gbf16_mf32",
+                "qwen35_adamw_bf16_master_gbf16_mbf16",
+                "qwen35_adamw_bf16_master_gbf16_mq8",
+            ],
+        ],
+        [
+            [
+                "qwen35_adamw_bf16_kahan_gf32_mf32",
+                "qwen35_adamw_bf16_kahan_gf32_mbf16",
+                "qwen35_adamw_bf16_kahan_gf32_mq8",
+            ],
+            [
+                "qwen35_adamw_bf16_kahan_gbf16_mf32",
+                "qwen35_adamw_bf16_kahan_gbf16_mbf16",
+                "qwen35_adamw_bf16_kahan_gbf16_mq8",
+            ],
+        ],
+        [
+            [
+                "qwen35_adamw_bf16_sr_gf32_mf32",
+                "qwen35_adamw_bf16_sr_gf32_mbf16",
+                "qwen35_adamw_bf16_sr_gf32_mq8",
+            ],
+            [
+                "qwen35_adamw_bf16_sr_gbf16_mf32",
+                "qwen35_adamw_bf16_sr_gbf16_mbf16",
+                "qwen35_adamw_bf16_sr_gbf16_mq8",
+            ],
+        ],
+    ];
     match p {
-        DType::F32 if g == DType::F32 => Ok(format!("qwen35_adamw_f32_plain_gf32_m{mom}")),
+        DType::F32 if g == DType::F32 => Ok(F32[mom]),
         DType::F32 => Err("an f32 parameter with a bf16 gradient".into()),
         DType::BF16 => {
             let rule = match config.update {
-                UpdateRule::F32Master => "master",
-                UpdateRule::Bf16Kahan => "kahan",
-                UpdateRule::Bf16Stochastic { .. } => "sr",
+                UpdateRule::F32Master => 0,
+                UpdateRule::Bf16Kahan => 1,
+                UpdateRule::Bf16Stochastic { .. } => 2,
                 UpdateRule::F32 => return Err("a bf16 parameter under UpdateRule::F32".into()),
             };
-            Ok(format!("qwen35_adamw_bf16_{rule}_g{gname}_m{mom}"))
+            Ok(BF16[rule][grad][mom])
         }
         d => Err(format!("a {d:?} parameter")),
     }
@@ -754,8 +806,8 @@ impl Qwen35Model {
     ) -> Result<(), String> {
         self.require_trainable(what)?;
         check_hyper(what, hyper)?;
-        state.check_model(what, self)?;
         let ps = slots(self, Some(grads)).map_err(|e| format!("{what}: {e}"))?;
+        state.check_model_slots(what, self, &ps)?;
         if weight_decay.len() != ps.len() {
             return Err(format!(
                 "{what}: {} weight decays for {} parameters",
@@ -795,8 +847,8 @@ impl Qwen35Model {
             let gw = s
                 .grad_window()
                 .ok_or_else(|| format!("{what}: {name} has no gradient"))?;
-            pw.check(&format!("{what}: {name} parameter"))?;
-            gw.check(&format!("{what}: {name} gradient"))?;
+            pw.check(format_args!("{what}: {name} parameter"))?;
+            gw.check(format_args!("{what}: {name} gradient"))?;
             if !gw.same_layout(&pw) {
                 return Err(format!("{what}: {name}: the gradient is not laid out as the parameter"));
             }
@@ -823,7 +875,7 @@ impl Qwen35Model {
             let at = match tables.iter().position(|(k, ..)| k == kernel) {
                 Some(at) => at,
                 None => {
-                    tables.push((kernel.as_str(), Vec::new(), 0, 0));
+                    tables.push((kernel, Vec::new(), 0, 0));
                     tables.len() - 1
                 }
             };
@@ -903,20 +955,22 @@ impl Qwen35Model {
             let w = s
                 .grad_window()
                 .ok_or_else(|| format!("{WHAT}: {name} has no gradient"))?;
-            w.check(&format!("{WHAT}: {name} gradient"))?;
+            w.check(format_args!("{WHAT}: {name} gradient"))?;
             let n = w.rows;
             plan.push((w, rows));
             rows += n;
         }
         u32::try_from(rows).map_err(|_| format!("{WHAT}: {rows} rows exceed u32"))?;
-        let out = self.rt.alloc_tensor_f32(&[rows])?;
+        // Every row is written: the windows' offsets tile `0..rows`, and each
+        // threadgroup stores its row's sum.
+        let out = self.rt.alloc_tensor_unzeroed(&[rows], DType::F32)?;
+        let (p_bf16, p_f32) = (
+            self.rt.pipeline("qwen35_sq_sum_rows_bf16")?,
+            self.rt.pipeline("qwen35_sq_sum_rows_f32")?,
+        );
         for (w, at) in &plan {
-            let p = self.rt.pipeline(if w.dtype == DType::BF16 {
-                "qwen35_sq_sum_rows_bf16"
-            } else {
-                "qwen35_sq_sum_rows_f32"
-            })?;
-            dispatch_2d_tg(&self.rt, &p, w.rows, 1, 256, |bnd| {
+            let p = if w.dtype == DType::BF16 { &p_bf16 } else { &p_f32 };
+            dispatch_2d_tg(&self.rt, p, w.rows, 1, 256, |bnd| {
                 set_gpu_buf_offset(bnd, w.buf, w.byte_off, 0);
                 set_gpu_buf_offset(bnd, &out.buffer, out.byte_offset(), 1);
                 set_u32(bnd, w.width as u32, 2);
@@ -1046,5 +1100,46 @@ impl Qwen35Model {
             .iter()
             .map(|p| if excluded_from_weight_decay(&p.name) { 0.0 } else { wd })
             .collect())
+    }
+}
+
+#[cfg(test)]
+mod step_kernel_tests {
+    use super::*;
+
+    /// The table names exactly the kernels the names were formatted as.
+    #[test]
+    fn step_kernel_table_matches_the_formatted_names() {
+        let moments = [
+            (MomentStorage::F32, "f32"),
+            (MomentStorage::Bf16, "bf16"),
+            (MomentStorage::Block8, "q8"),
+        ];
+        let rules = [
+            (UpdateRule::F32Master, "master"),
+            (UpdateRule::Bf16Kahan, "kahan"),
+            (UpdateRule::Bf16Stochastic { seed: 7 }, "sr"),
+        ];
+        for (moments, mom) in moments {
+            let config = AdamWConfig {
+                update: UpdateRule::F32,
+                moments,
+            };
+            assert_eq!(
+                step_kernel(DType::F32, DType::F32, config).unwrap(),
+                format!("qwen35_adamw_f32_plain_gf32_m{mom}")
+            );
+            assert!(step_kernel(DType::F32, DType::BF16, config).is_err());
+            assert!(step_kernel(DType::BF16, DType::F32, config).is_err());
+            for (update, rule) in rules {
+                let config = AdamWConfig { update, moments };
+                for (g, gname) in [(DType::F32, "f32"), (DType::BF16, "bf16")] {
+                    assert_eq!(
+                        step_kernel(DType::BF16, g, config).unwrap(),
+                        format!("qwen35_adamw_bf16_{rule}_g{gname}_m{mom}")
+                    );
+                }
+            }
+        }
     }
 }

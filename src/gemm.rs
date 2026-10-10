@@ -40,13 +40,28 @@ pub(crate) fn require_i32_extent(numel: usize, what: &str) -> Result<(), String>
 
 /// All public GEMM paths validate before casting, allocating scratch, or encoding.
 /// MPP uses signed 32-bit extents/offset arithmetic; reject larger matrices.
-/// `entry` is the public function, named in the alignment error.
+/// `entry` is the public function, named in the alignment error. C must be
+/// f32; [`gemm`] alone also takes a bf16 C, through [`validate_gemm_out`].
 fn validate_gemm(
     a: &Tensor,
     b: &Tensor,
     c: &Tensor,
     layout: Layout,
     allow_bf16: bool,
+    entry: &str,
+) -> Result<(usize, usize, usize), String> {
+    validate_gemm_out(a, b, c, layout, allow_bf16, false, entry)
+}
+
+/// [`validate_gemm`], with `bf16_out` also accepting a bf16 C (the caller
+/// still has to have a kernel that writes one).
+fn validate_gemm_out(
+    a: &Tensor,
+    b: &Tensor,
+    c: &Tensor,
+    layout: Layout,
+    allow_bf16: bool,
+    bf16_out: bool,
     entry: &str,
 ) -> Result<(usize, usize, usize), String> {
     for (t, operand) in [(a, "A"), (b, "B"), (c, "C")] {
@@ -60,7 +75,8 @@ fn validate_gemm(
     if !std::sync::Arc::ptr_eq(a.runtime(), b.runtime()) || !std::sync::Arc::ptr_eq(a.runtime(), c.runtime()) {
         return Err("GEMM tensors must belong to the same runtime".into());
     }
-    if c.dtype != DType::F32 || (!allow_bf16 && (a.dtype != DType::F32 || b.dtype != DType::F32)) {
+    let c_ok = c.dtype == DType::F32 || (bf16_out && c.dtype == DType::BF16);
+    if !c_ok || (!allow_bf16 && (a.dtype != DType::F32 || b.dtype != DType::F32)) {
         return Err("GEMM operand dtype does not match the selected precision path".into());
     }
     let (m, k, k2, n) = match layout {
@@ -375,7 +391,10 @@ fn use_relaxed_f32(rt: &GpuRuntime, backend: GemmBackend) -> bool {
 /// `C[M,N] = A[M,K] @ B[K,N]`. Overwrites C.
 ///
 /// - f32×f32→f32 always supported (exact or relaxed via runtime flag)
-/// - bf16×bf16→f32 accum (C must be f32) via TensorOps when available
+/// - bf16×bf16→f32 accum via TensorOps when available, into an f32 C, or
+///   into a bf16 C with each element rounded as [`cast_f32_to_bf16`] rounds
+///   it (the same bits as an f32 C then that cast, without the f32 C's write
+///   and the cast's read). A bf16 C needs bf16 operands.
 ///
 /// Bf16 operands whose M does not fill a 128-row tile dispatch
 /// `matmul2d_tensorops_bf16_f32_64x64_sg4` even when N > 512. That
@@ -403,11 +422,12 @@ fn gemm_dispatch(
     backend: GemmBackend,
     tile: Option<EpiTile>,
 ) -> Result<(), String> {
-    let (m, n, k) = validate_gemm(
+    let (m, n, k) = validate_gemm_out(
         a,
         b,
         c,
         Layout::NN,
+        true,
         true,
         if tile.is_some() { "gemm_tiled" } else { "gemm" },
     )?;
@@ -417,6 +437,14 @@ fn gemm_dispatch(
     let narrow_dtype = use_bf16 || use_f16;
     if a.dtype != b.dtype || (narrow_dtype && backend != GemmBackend::TensorOps) {
         return Err("GEMM requires matching operand dtypes; bf16 and f16 require TensorOps".into());
+    }
+    let bf16_out = c.dtype == DType::BF16;
+    if bf16_out && !use_bf16 {
+        return Err(format!(
+            "GEMM: a bf16 C needs bf16 operands (got {:?} x {:?}); only the bf16 TensorOps kernels \
+             round C on the store",
+            a.dtype, b.dtype
+        ));
     }
 
     let rt = a.runtime();
@@ -443,6 +471,7 @@ fn gemm_dispatch(
                 Some(forced) => nn_coop_kernel_for(elem, forced),
                 None => nn_coop_kernel(m, n, k, elem),
             };
+            let kernel = if bf16_out { bf16_out_kernel(kernel)? } else { kernel };
             let pipeline = rt.pipeline(kernel)?;
             dispatch_tensorops_nn_coop(rt, &pipeline, a, b, c, m, n, k, geom)?;
         }
@@ -1041,6 +1070,16 @@ fn nn_coop_kernel(m: usize, n: usize, _k: usize, elem: CoopElem) -> (&'static st
     // and relaxed f32 keep the N rule. M ≥ 128 with N > 512 stays on 128×64.
     let short_m = elem == CoopElem::Bf16 && m < TILE_COOP_DEFAULT.sm;
     coop_kernel(elem, short_m || n <= 512)
+}
+
+/// The bf16-C twin of a bf16 cooperative NN kernel: same geometry, C rounded
+/// on the store.
+fn bf16_out_kernel(kernel: &'static str) -> Result<&'static str, String> {
+    match kernel {
+        "matmul2d_tensorops_bf16_f32" => Ok("matmul2d_tensorops_bf16_bf16"),
+        "matmul2d_tensorops_bf16_f32_64x64_sg4" => Ok("matmul2d_tensorops_bf16_bf16_64x64_sg4"),
+        other => Err(format!("GEMM: {other} has no bf16-output twin")),
+    }
 }
 
 fn nn_coop_kernel_for(elem: CoopElem, tile: EpiTile) -> (&'static str, TileGeom) {

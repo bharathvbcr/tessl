@@ -163,8 +163,24 @@ fn gemm_rejects_dtypes_the_selected_path_cannot_run() {
         let c32 = rt.alloc_tensor_f32(&[32, 32]).unwrap();
         let c16 = rt.alloc_tensor_bf16(&[32, 32]).unwrap();
 
-        // C is always f32: bf16 GEMMs accumulate in f32 and store f32.
-        expect_err("bf16 output", gemm(&a16, &b16, &c16, GemmBackend::TensorOps), BAD_DTYPE);
+        // A bf16 C is rounded on the store by the bf16 kernels only
+        // (`tests/gemm_correctness.rs` holds its bits): f32 operands, and
+        // every entry point but `gemm`, still refuse one.
+        expect_err(
+            "bf16 output from f32 operands",
+            gemm(&a32, &b32, &c16, GemmBackend::TensorOps),
+            "GEMM: a bf16 C needs bf16 operands (got F32 x F32); only the bf16 TensorOps kernels round C on the store",
+        );
+        expect_err(
+            "bf16 output from gemm_tn_f32",
+            gemm_tn_f32(&a32, &b32, &c16, GemmBackend::TensorOps),
+            BAD_DTYPE,
+        );
+        expect_err(
+            "bf16 output from gemm_nt_f32",
+            gemm_nt_f32(&a32, &b32, &c16, GemmBackend::TensorOps),
+            BAD_DTYPE,
+        );
 
         // One bf16 operand and one f32 operand is the classic half-migrated
         // call site, and it must not be silently promoted or demoted.

@@ -27,7 +27,7 @@ mod common;
 use std::sync::Arc;
 
 use common::qwen35::*;
-use common::{buf, buf_u32, random_f32, seeded, with_gpu};
+use common::{buf, buf_bf16, buf_u32, random_f32, round_trip_bf16, seeded, with_gpu};
 use tessl::qwen35::{
     self, AttnProjLayout, AttnShape, AttnTargets, Cols, GdnDims, GdnGateLogits, GdnParams, GdnProjLayout, GdnQkv,
     GdnScanSlice, GdnWorkspace, LmHead, OutCols, StateIn,
@@ -1425,6 +1425,98 @@ fn swiglu_f32_and_bf16_from_a_fused_gate_up_buffer() {
         expect_err(
             qwen35::swiglu(rt, gate, up, f16, rows as u32, width as u32),
             "qwen35::swiglu: dtype must be F32 or BF16",
+        );
+    });
+}
+
+/// `swiglu_bf16_inputs` reads bf16 gate and up windows (what a bf16-output
+/// GEMM writes) and does the f32 kernel's arithmetic on their widened
+/// values, so it must give `swiglu`'s bf16 output on the same values widened
+/// to f32, bit for bit, inside its windows and nowhere else.
+#[test]
+fn swiglu_on_bf16_inputs_is_swiglu_on_the_widened_values() {
+    with_gpu(|rt| {
+        let (rows, width) = (37usize, 300usize);
+        let ld = 2 * width + 5;
+        let (g_off, u_off) = (1usize, 1 + width);
+        let mut fused: Vec<f32> = random_f32(rows * ld, 701).iter().map(|v| 8.0 * v).collect();
+        fused[g_off] = 120.0;
+        fused[g_off + 1] = -120.0;
+        // The f32 reference reads exactly the bf16 values.
+        let fused = round_trip_bf16(&fused);
+        let (f32_buf, bf16_buf) = (buf(rt, &fused), buf_bf16(rt, &fused));
+        let win = |b, off: usize| Cols {
+            buf: b,
+            ld: ld as u32,
+            off: off as u32,
+        };
+        let want_buf = rt.alloc_buffer(rows * width * 2).unwrap();
+        let want_out = OutCols {
+            cols: Cols::dense(&want_buf, width as u32),
+            dtype: DType::BF16,
+        };
+        qwen35::swiglu(
+            rt,
+            win(&f32_buf, g_off),
+            win(&f32_buf, u_off),
+            want_out,
+            rows as u32,
+            width as u32,
+        )
+        .unwrap();
+        // bf16 into a window of a wider row: the padding must stay untouched.
+        let (o_ld, o_off) = (width + 4, 3usize);
+        let got_buf = rt.alloc_buffer(rows * o_ld * 2).unwrap();
+        got_buf.write_bf16_bits(&vec![0x7fc1u16; rows * o_ld]);
+        let got_out = OutCols {
+            cols: Cols {
+                buf: &got_buf,
+                ld: o_ld as u32,
+                off: o_off as u32,
+            },
+            dtype: DType::BF16,
+        };
+        let (gate, up) = (win(&bf16_buf, g_off), win(&bf16_buf, u_off));
+        qwen35::swiglu_bf16_inputs(rt, gate, up, got_out, rows as u32, width as u32).unwrap();
+        rt.synchronize().unwrap();
+        {
+            // One host mapping at a time.
+            let want = want_buf.contents_u16()[..rows * width].to_vec();
+            let all = got_buf.contents_u16()[..rows * o_ld].to_vec();
+            for r in 0..rows {
+                let row = &all[r * o_ld..(r + 1) * o_ld];
+                assert!(
+                    row[..o_off].iter().chain(&row[o_off + width..]).all(|&x| x == 0x7fc1),
+                    "row {r}: wrote outside the output window"
+                );
+                for c in 0..width {
+                    let (g, w) = (row[o_off + c], want[r * width + c]);
+                    assert_eq!(g, w, "[{r}, {c}]: {g:#x} vs swiglu on the widened values {w:#x}");
+                }
+            }
+        }
+
+        let f32_out = OutCols {
+            cols: Cols::dense(&f32_buf, width as u32),
+            dtype: DType::F32,
+        };
+        expect_err(
+            qwen35::swiglu_bf16_inputs(rt, gate, up, f32_out, rows as u32, width as u32),
+            "qwen35::swiglu_bf16_inputs: Silu on BF16 inputs into F32 is not compiled",
+        );
+        let short = Cols {
+            off: (ld - width + 1) as u32,
+            ..up
+        };
+        expect_err(
+            qwen35::swiglu_bf16_inputs(rt, gate, short, got_out, rows as u32, width as u32),
+            "qwen35::swiglu_bf16_inputs up",
+        );
+        // Sized in bf16 elements: a buffer short of the window is refused.
+        let tiny = rt.alloc_buffer(16).unwrap();
+        expect_err(
+            qwen35::swiglu_bf16_inputs(rt, win(&tiny, g_off), up, got_out, rows as u32, width as u32),
+            "qwen35::swiglu_bf16_inputs gate",
         );
     });
 }

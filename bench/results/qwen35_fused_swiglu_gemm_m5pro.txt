@@ -1,0 +1,108 @@
+# Fused gate/up/SwiGLU GEMM (gemm_swiglu_bf16) against two GEMMs + swiglu — M5 Pro, 2026-10-10
+#
+# The prototype lives in the commit that adds this file and is removed in
+# the next. matmul2d_tensorops_bf16_swiglu (128x64 sg4) and its 64x64 twin
+# run gate's and up's products over the same A tile into two register
+# accumulators and store bf16(silu(g) * u); bit for bit the production two
+# GEMMs + qwen35::swiglu on every tested shape and tile
+# (fused_swiglu_gemm_is_the_two_gemms_then_swiglu), so the logits do not move.
+#
+# Acceptance bar, fixed before the forward was timed (from the decision
+# recorded in docs/qwen35.md): the 24-layer forward faster by >= 3% in every
+# statistic at T = 1024 and 2048, with no regression at T = 512 or decode.
+#
+# Finding: declined. The fused kernel is slower everywhere it was timed.
+# Kernel units (in-process ABBA, 15 rounds, ratio fused / unfused): the
+# activation 1.03x at T = 1 and 1.075-1.087x at T = 512-2048; the MLP block
+# 1.02x at T = 1 and 1.054-1.058x at T = 512-2048. Two variants were tried
+# and lost the same way or worse: interior tiles on offset pointer tensors
+# (as the plain kernel does; 1.084-1.089x), and the 64x64 tile at large M
+# (1.27-1.36x at T = 512 and 1024, 0.98x at 2048; same bits as 128x64).
+# Whole forward (Qwen35Model random 2B tower, --model-forward, two frozen
+# builds, bench/paired_bins.sh, 5 rounds interleaved, min of each process's
+# median): T = 1024 143.19 -> 148.47 ms (1.037x), T = 2048 277.07 -> 286.46
+# ms (1.034x). The two accumulators per thread are the likely cost (twice the
+# plain kernel's registers at 128x64); the saved f32 write, read and dispatch
+# do not cover it.
+#
+# Conditions: shared machine; other agent sessions' GPU work (ioreg 84-92%
+# busy before the runs), 1-minute load ~8-23. Ratios are the headline.
+#
+# ---- kernel units: bench_qwen35_layers --paired-mlp-fused ----
+device: Apple M5 Pro
+paired MLP: gate GEMM + up GEMM (f32) + qwen35::swiglu vs gemm_swiglu_bf16 (one dispatch)
+one process, ABBA, 3 warmup + 15 timed rounds
+T=1: gate passed; the lanes' bf16 products are identical
+PAIRED t=1 unit=gate_up_swiglu lane=gemms_then_swiglu n=15 reps=32 median_ms=0.2166 min_ms=0.2119 max_ms=0.2252
+PAIRED t=1 unit=gate_up_swiglu lane=fused n=15 reps=32 median_ms=0.2221 min_ms=0.2187 max_ms=0.2264
+PAIRED t=1 unit=gate_up_swiglu ratio_fused_over_gemms_then_swiglu median_of_round_ratios=1.0264 of_medians=1.0253 of_mins=1.0324
+PAIRED t=1 unit=mlp_block lane=gemms_then_swiglu n=15 reps=32 median_ms=0.3601 min_ms=0.3472 max_ms=0.5114
+PAIRED t=1 unit=mlp_block lane=fused n=15 reps=32 median_ms=0.3695 min_ms=0.3549 max_ms=0.4984
+PAIRED t=1 unit=mlp_block ratio_fused_over_gemms_then_swiglu median_of_round_ratios=1.0227 of_medians=1.0263 of_mins=1.0222
+T=512: gate passed; the lanes' bf16 products are identical
+PAIRED t=512 unit=gate_up_swiglu lane=gemms_then_swiglu n=15 reps=32 median_ms=1.0639 min_ms=1.0560 max_ms=1.0935
+PAIRED t=512 unit=gate_up_swiglu lane=fused n=15 reps=32 median_ms=1.1434 min_ms=1.1314 max_ms=1.2120
+PAIRED t=512 unit=gate_up_swiglu ratio_fused_over_gemms_then_swiglu median_of_round_ratios=1.0781 of_medians=1.0748 of_mins=1.0715
+PAIRED t=512 unit=mlp_block lane=gemms_then_swiglu n=15 reps=32 median_ms=1.5689 min_ms=1.5645 max_ms=1.5788
+PAIRED t=512 unit=mlp_block lane=fused n=15 reps=32 median_ms=1.6586 min_ms=1.6421 max_ms=1.6726
+PAIRED t=512 unit=mlp_block ratio_fused_over_gemms_then_swiglu median_of_round_ratios=1.0540 of_medians=1.0571 of_mins=1.0496
+T=1024: gate passed; the lanes' bf16 products are identical
+PAIRED t=1024 unit=gate_up_swiglu lane=gemms_then_swiglu n=15 reps=16 median_ms=2.0511 min_ms=2.0303 max_ms=2.3582
+PAIRED t=1024 unit=gate_up_swiglu lane=fused n=15 reps=16 median_ms=2.2279 min_ms=2.1889 max_ms=2.3279
+PAIRED t=1024 unit=gate_up_swiglu ratio_fused_over_gemms_then_swiglu median_of_round_ratios=1.0873 of_medians=1.0862 of_mins=1.0781
+PAIRED t=1024 unit=mlp_block lane=gemms_then_swiglu n=15 reps=16 median_ms=3.0483 min_ms=3.0068 max_ms=3.0819
+PAIRED t=1024 unit=mlp_block lane=fused n=15 reps=16 median_ms=3.2190 min_ms=3.1727 max_ms=3.4282
+PAIRED t=1024 unit=mlp_block ratio_fused_over_gemms_then_swiglu median_of_round_ratios=1.0582 of_medians=1.0560 of_mins=1.0552
+T=2048: gate passed; the lanes' bf16 products are identical
+PAIRED t=2048 unit=gate_up_swiglu lane=gemms_then_swiglu n=15 reps=16 median_ms=3.9950 min_ms=3.9738 max_ms=4.0349
+PAIRED t=2048 unit=gate_up_swiglu lane=fused n=15 reps=16 median_ms=4.3097 min_ms=4.2597 max_ms=4.4011
+PAIRED t=2048 unit=gate_up_swiglu ratio_fused_over_gemms_then_swiglu median_of_round_ratios=1.0754 of_medians=1.0788 of_mins=1.0720
+PAIRED t=2048 unit=mlp_block lane=gemms_then_swiglu n=15 reps=16 median_ms=5.7787 min_ms=5.7649 max_ms=5.7943
+PAIRED t=2048 unit=mlp_block lane=fused n=15 reps=16 median_ms=6.0908 min_ms=6.0813 max_ms=6.1412
+PAIRED t=2048 unit=mlp_block ratio_fused_over_gemms_then_swiglu median_of_round_ratios=1.0537 of_medians=1.0540 of_mins=1.0549
+
+# ---- whole forward: BENCH_BINS="unfused=... fused=..." bench/paired_bins.sh 5 OUT --model-forward 1024 2048 ----
+# ---- summary: 5 rounds; min (max) over rounds of each process's median ----
+metric                                            unfused min (max)        fused min (max) fused/unfused
+model_forward_ms_t1024                          143.193 (  180.082)    148.467 (  196.170)     1.037
+model_forward_ms_t2048                          277.068 (  330.038)    286.464 (  340.043)     1.034
+T=1024: forward median 143.193 ms, min 142.391 ms
+METRIC model_forward_ms_t1024 143.193
+T=2048: forward median 277.068 ms, min 275.828 ms
+METRIC model_forward_ms_t2048 277.068
+T=1024: forward median 150.495 ms, min 148.303 ms
+METRIC model_forward_ms_t1024 150.495
+T=2048: forward median 330.089 ms, min 319.732 ms
+METRIC model_forward_ms_t2048 330.089
+T=1024: forward median 151.298 ms, min 149.965 ms
+METRIC model_forward_ms_t1024 151.298
+T=2048: forward median 309.021 ms, min 288.437 ms
+METRIC model_forward_ms_t2048 309.021
+T=1024: forward median 150.228 ms, min 147.668 ms
+METRIC model_forward_ms_t1024 150.228
+T=2048: forward median 322.961 ms, min 284.535 ms
+METRIC model_forward_ms_t2048 322.961
+T=1024: forward median 180.082 ms, min 166.094 ms
+METRIC model_forward_ms_t1024 180.082
+T=2048: forward median 330.038 ms, min 323.348 ms
+METRIC model_forward_ms_t2048 330.038
+T=1024: forward median 196.170 ms, min 165.549 ms
+METRIC model_forward_ms_t1024 196.170
+T=2048: forward median 340.043 ms, min 311.817 ms
+METRIC model_forward_ms_t2048 340.043
+T=1024: forward median 156.728 ms, min 154.337 ms
+METRIC model_forward_ms_t1024 156.728
+T=2048: forward median 300.101 ms, min 299.606 ms
+METRIC model_forward_ms_t2048 300.101
+T=1024: forward median 146.174 ms, min 144.861 ms
+METRIC model_forward_ms_t1024 146.174
+T=2048: forward median 284.766 ms, min 283.807 ms
+METRIC model_forward_ms_t2048 284.766
+T=1024: forward median 144.217 ms, min 143.369 ms
+METRIC model_forward_ms_t1024 144.217
+T=2048: forward median 277.883 ms, min 277.086 ms
+METRIC model_forward_ms_t2048 277.883
+T=1024: forward median 148.467 ms, min 148.032 ms
+METRIC model_forward_ms_t1024 148.467
+T=2048: forward median 286.464 ms, min 284.881 ms
+METRIC model_forward_ms_t2048 286.464

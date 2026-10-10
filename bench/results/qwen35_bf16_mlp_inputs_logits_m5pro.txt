@@ -1,0 +1,39 @@
+# Qwen3.5-2B logits with bf16 MLP inputs (Qwen35Model::set_bf16_mlp_inputs) — M5 Pro, 2026-10-10
+#
+# Measured before the variant was considered for adoption. Reference:
+# transformers 5.19.0 / torch 2.14.1 (CPU), `tools/qwen35_ref/make_reference.py
+# --model-dir <Qwen3.5-2B snapshot 15852e8c>`, fp32 and bf16 forwards of the
+# same checkpoint, on (a) the script's fixed prompt (155 tokens) and (b) the
+# 512 natural-text ids of tests/fixtures/qwen35_text_ids.npy (`--ids ...
+# --out target/qwen35_ref_text`). The checkpoint is Qwen/Qwen3.5-2B (the
+# instruct release; this machine has no Qwen3.5-2B-Base weights), whose
+# config.json is byte-identical to the Base model's.
+#
+#   QWEN35_2B_SAFETENSORS=<snapshot>/model.safetensors-00001-of-00001.safetensors \
+#   QWEN35_REF_DIR=<dir> cargo test --release --test qwen35_model -- --ignored --test-threads=1 --nocapture
+#
+# Bound (tests/qwen35_model.rs, fixed before this run; the one the bf16
+# forward already had): mean KL from the fp32 reference and top-1
+# disagreements with it no larger than transformers' bf16 forward's.
+#
+# Finding: both pass with the margin the production bf16 forward has. The
+# variant raises mean KL from fp32 by 1.42x (prompt) and 1.56x (text) over the
+# production bf16 forward, stays 8.6x-12.8x under transformers' bf16, and
+# changes no top-1 token count. The logits' max relative error rises from
+# 3.3e-3 to 3.7e-3 (prompt) and 7.2e-3 (text). The exact-f32 forward matches
+# the fp32 reference to 3.2e-6 / 2.3e-6 with no top-1 mismatch, so the
+# reference is the model tessl loads.
+#
+# ---- (a) prompt, 155 positions ----
+vs fp32 over 155 positions: transformers bf16 mean KL 5.482e-4 (max 1.687e-3), top-1 misses 5
+vs fp32: tessl bf16 mean KL 3.028e-5 (max 2.050e-4), top-1 misses 1, logits rel err 3.296e-3
+vs fp32: tessl bf16, bf16 MLP inputs mean KL 4.287e-5 (max 1.705e-4), top-1 misses 1, logits rel err 3.727e-3
+f32 forward: logits: rel err 3.21e-6, top-1 mismatches 0/155, max KL 3.31e-10
+test result: ok. 2 passed; 0 failed
+
+# ---- (b) natural text, 512 positions ----
+vs fp32 over 512 positions: transformers bf16 mean KL 3.699e-4 (max 2.279e-3), top-1 misses 5
+vs fp32: tessl bf16 mean KL 2.759e-5 (max 3.336e-4), top-1 misses 4, logits rel err 3.322e-3
+vs fp32: tessl bf16, bf16 MLP inputs mean KL 4.307e-5 (max 3.589e-4), top-1 misses 4, logits rel err 7.184e-3
+f32 forward: logits: rel err 2.26e-6, top-1 mismatches 0/512, max KL 2.76e-10
+test result: ok. 2 passed; 0 failed

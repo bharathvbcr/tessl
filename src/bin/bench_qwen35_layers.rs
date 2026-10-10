@@ -11,6 +11,8 @@
 //! cargo run --release --bin bench_qwen35_layers -- --gdn-scan16  # 16-column GDN scan
 //! cargo run --release --bin bench_qwen35_layers -- --decode=4096  # per-token decode
 //! cargo run --release --bin bench_qwen35_layers -- --paired-gdn-recurrent 1 4
+//! cargo run --release --bin bench_qwen35_layers -- --paired-gate-up 512 2048
+//! cargo run --release --bin bench_qwen35_layers -- --model-forward 1024 2048
 //! ```
 //!
 //! Attention runs on `qwen35::attn_prefill` (the TensorOps kernel) at its
@@ -58,6 +60,20 @@
 //! alone, `REPS` per command buffer. Every figure is printed as a `METRIC`
 //! line for `bench/paired_bins.sh`. The LM head and sampler are not included
 //! (`bench_nn_kernels` times the samplers).
+//!
+//! `--paired-gate-up [T...]` times the gate and up projections as the
+//! training forward runs them on bf16 storage (two GEMMs, `[T, 2048] x [2048,
+//! 6144]` each, bf16 operands into f32) against one packed GEMM (`[T, 2048] x
+//! [2048, 12288]`, what a `gate | up` weight layout would run), ABBA, in both
+//! encode modes: async (16 units per command buffer) and sync, the runtime's
+//! default and ojas-qwen35's training mode, where every dispatch is its own
+//! waited commit. Default T is 512 and 2048.
+//!
+//! `--model-forward [T...]` times a 24-layer prefill on `Qwen35Model` (seeded
+//! random 2B weights, bf16, no LM head; one command buffer under async
+//! encode), median of 11 after 2 warm-ups, as `METRIC model_forward_ms_t{T}`
+//! lines: the model's own composition, for `bench/paired_bins.sh` across
+//! frozen builds. Default T is 1024 and 2048.
 //!
 //! Before anything is timed, one forward runs with every intermediate buffer
 //! pre-filled with NaN, and every buffer a stage writes must come back finite.
@@ -1286,6 +1302,200 @@ fn run_paired_gdn_recurrent(rt: &Arc<GpuRuntime>, batches: &[usize]) -> Res<()> 
     Ok(())
 }
 
+// ------------------------------------------------------------ paired lanes ---
+
+/// The two lanes of a paired comparison: the production path (`Prod`) and
+/// the candidate (`Cand`).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Lane {
+    Prod,
+    Cand,
+}
+
+/// [`paired_lanes`]' lane labels for `--paired-gate-up`.
+const GATE_UP_LANES: [&str; 2] = ["two_gemms", "packed_gemm"];
+
+/// `(median, min)` of `samples`, and the median of the per-round ratios
+/// `b[i] / a[i]` (each round times both lanes back to back, so a round's
+/// ratio cancels the drift between rounds).
+fn paired_summary(a: &[f64], b: &[f64]) -> ((f64, f64), (f64, f64), f64) {
+    let stats = |v: &[f64]| (median(v.to_vec()), v.iter().copied().fold(f64::INFINITY, f64::min));
+    let ratios: Vec<f64> = a.iter().zip(b).map(|(x, y)| y / x).collect();
+    (stats(a), stats(b), median(ratios))
+}
+
+/// Time `run(lane)` for both lanes, `reps` per command buffer, ABBA over
+/// `rounds`, and print one PAIRED line per lane (labelled `labels`) plus the
+/// ratio of the candidate to the production lane.
+#[allow(clippy::too_many_arguments)]
+fn paired_lanes(
+    rt: &Arc<GpuRuntime>,
+    t: usize,
+    unit: &str,
+    labels: [&str; 2],
+    reps: usize,
+    (warmup, rounds): (usize, usize),
+    mut run: impl FnMut(Lane) -> Res<()>,
+) -> Res<()> {
+    let (mut a, mut b) = (Vec::with_capacity(rounds), Vec::with_capacity(rounds));
+    for round in 0..(warmup + rounds) {
+        let order = if round % 2 == 0 {
+            [Lane::Prod, Lane::Cand]
+        } else {
+            [Lane::Cand, Lane::Prod]
+        };
+        for lane in order {
+            rt.synchronize()?;
+            let t0 = Instant::now();
+            for _ in 0..reps {
+                run(lane)?;
+            }
+            rt.synchronize()?;
+            let ms = t0.elapsed().as_secs_f64() * 1e3 / reps as f64;
+            if round >= warmup {
+                match lane {
+                    Lane::Prod => a.push(ms),
+                    Lane::Cand => b.push(ms),
+                }
+            }
+        }
+    }
+    let ((a_med, a_min), (b_med, b_min), ratio) = paired_summary(&a, &b);
+    for (label, med, min, v) in [(labels[0], a_med, a_min, &a), (labels[1], b_med, b_min, &b)] {
+        let max = v.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+        println!(
+            "PAIRED t={t} unit={unit} lane={label} n={} reps={reps} median_ms={med:.4} min_ms={min:.4} max_ms={max:.4}",
+            v.len()
+        );
+    }
+    println!(
+        "PAIRED t={t} unit={unit} ratio_{}_over_{} median_of_round_ratios={ratio:.4} \
+         of_medians={:.4} of_mins={:.4}",
+        labels[1],
+        labels[0],
+        b_med / a_med,
+        b_min / a_min
+    );
+    Ok(())
+}
+
+/// Every element of the first `n` of `t` (f32 or bf16) finite, and not all zero.
+fn finite_nonzero(what: &str, t: &Tensor, n: usize) -> Res<()> {
+    let v: Vec<f32> = match t.dtype {
+        DType::BF16 => t.buffer.contents_u16()[..n]
+            .iter()
+            .map(|&b| tessl::tensor::bf16_bits_to_f32(b))
+            .collect(),
+        _ => t.buffer.read_f32()[..n].to_vec(),
+    };
+    if let Some(i) = v.iter().position(|x| !x.is_finite()) {
+        return Err(format!("{what}: element {i} of {n} is non-finite"));
+    }
+    if v.iter().all(|&x| x == 0.0) {
+        return Err(format!("{what}: all zeros"));
+    }
+    Ok(())
+}
+
+// --------------------------------------------------------- paired gate/up ---
+
+/// `--paired-gate-up`: the gate and up projections as two GEMMs
+/// ([`Lane::Prod`]) or one packed GEMM ([`Lane::Cand`]).
+fn run_paired_gate_up(rt: &Arc<GpuRuntime>, ts: &[usize]) -> Res<()> {
+    const ROUNDS: (usize, usize) = (3, 15);
+    println!("paired gate/up: two GEMMs [T,2048]x[2048,6144] vs one packed [T,2048]x[2048,12288]");
+    println!(
+        "bf16 operands into f32 C, as GemmOperands::Bf16 runs them; ABBA, {} warmup + {} timed rounds",
+        ROUNDS.0, ROUNDS.1
+    );
+    let gate_w = weight(rt, HIDDEN, INTER, &weight_bits(HIDDEN, INTER, 51))?;
+    let up_w = weight(rt, HIDDEN, INTER, &weight_bits(HIDDEN, INTER, 52))?;
+    // `gate | up` side by side, as a packed layout would store them.
+    let packed_w = {
+        let (g, u) = (weight_bits(HIDDEN, INTER, 51), weight_bits(HIDDEN, INTER, 52));
+        let mut bits = Vec::with_capacity(HIDDEN * 2 * INTER);
+        for r in 0..HIDDEN {
+            bits.extend_from_slice(&g[r * INTER..(r + 1) * INTER]);
+            bits.extend_from_slice(&u[r * INTER..(r + 1) * INTER]);
+        }
+        weight(rt, HIDDEN, 2 * INTER, &bits)?
+    };
+    for &t in ts {
+        let x = rt.alloc_tensor_bf16(&[t, HIDDEN])?;
+        x.buffer.write_bf16_bits(&f32_slice_to_bf16(&fill(t * HIDDEN, 53, 1.0)));
+        let (g, u) = (rt.alloc_tensor_f32(&[t, INTER])?, rt.alloc_tensor_f32(&[t, INTER])?);
+        let gu = rt.alloc_tensor_f32(&[t, 2 * INTER])?;
+        let run = |lane: Lane| -> Res<()> {
+            match lane {
+                Lane::Prod => {
+                    gemm(&x, &gate_w, &g, BACKEND)?;
+                    gemm(&x, &up_w, &u, BACKEND)
+                }
+                Lane::Cand => gemm(&x, &packed_w, &gu, BACKEND),
+            }
+        };
+        // Gate: the packed GEMM's two halves are the separate GEMMs' outputs.
+        rt.set_async_encode(false)?;
+        run(Lane::Prod)?;
+        run(Lane::Cand)?;
+        rt.synchronize()?;
+        let (gv, uv, guv) = (g.buffer.read_f32(), u.buffer.read_f32(), gu.buffer.read_f32());
+        let mut worst = 0.0f32;
+        for r in 0..t {
+            for c in 0..INTER {
+                worst = worst
+                    .max((gv[r * INTER + c] - guv[r * 2 * INTER + c]).abs())
+                    .max((uv[r * INTER + c] - guv[r * 2 * INTER + INTER + c]).abs());
+            }
+        }
+        finite_nonzero(&format!("T={t} packed gate|up"), &gu, t * 2 * INTER)?;
+        println!("T={t}: gate passed; packed vs separate max |diff| = {worst:.3e}");
+        for (mode, asynchronous, reps) in [("async", true, 16), ("sync", false, 4)] {
+            rt.set_async_encode(asynchronous)?;
+            paired_lanes(rt, t, &format!("gate_up_{mode}"), GATE_UP_LANES, reps, ROUNDS, run)?;
+        }
+        rt.set_async_encode(false)?;
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------- model forward ---
+
+/// `--model-forward`: the model's 24-layer prefill, one lane, METRIC lines.
+fn run_model_forward(rt: &Arc<GpuRuntime>, ts: &[usize]) -> Res<()> {
+    use tessl::qwen35_model::{Precision, Qwen35Config, Qwen35Model};
+    let model = Qwen35Model::random_tower(rt, Qwen35Config::qwen35_2b()?, Precision::Bf16, 0x51)?;
+    rt.set_async_encode(true)?;
+    for &t in ts {
+        let ids: Vec<u32> = (0..t as u32).map(|i| (i * 7919 + 13) % VOCAB as u32).collect();
+        let check = rt.alloc_tensor_f32(&[t, HIDDEN])?;
+        let mut s = model.begin(&ids)?;
+        s.advance_to(LAYERS)?;
+        s.final_norm_f32(&check)?;
+        rt.synchronize()?;
+        drop(s);
+        finite_nonzero(&format!("T={t} forward final norm"), &check, t * HIDDEN)?;
+        let mut samples = Vec::with_capacity(11);
+        for it in 0..13 {
+            let t0 = Instant::now();
+            let mut s = model.begin(&ids)?;
+            s.advance_to(LAYERS)?;
+            rt.synchronize()?;
+            if it >= 2 {
+                samples.push(t0.elapsed().as_secs_f64() * 1e3);
+            }
+        }
+        let min = samples.iter().copied().fold(f64::INFINITY, f64::min);
+        println!(
+            "T={t}: forward median {:.3} ms, min {min:.3} ms",
+            median(samples.clone())
+        );
+        println!("METRIC model_forward_ms_t{t} {:.3}", median(samples));
+    }
+    rt.set_async_encode(false)?;
+    Ok(())
+}
+
 // --------------------------------------------------------------------- main ---
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -1296,10 +1506,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut gdn_scan = qwen35::GdnScanSlice::Cols32;
     let mut decode: Option<usize> = None;
     let mut paired_rec = false;
+    let mut paired_gate_up = false;
+    let mut model_forward = false;
     let mut ts = Vec::new();
     for arg in std::env::args().skip(1) {
         if arg == "--paired-gdn-recurrent" {
             paired_rec = true;
+        } else if arg == "--paired-gate-up" {
+            paired_gate_up = true;
+        } else if arg == "--model-forward" {
+            model_forward = true;
         } else if arg == "--decode" {
             decode = Some(4096);
         } else if let Some(p) = arg.strip_prefix("--decode=") {
@@ -1332,8 +1548,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         } else {
             let t: usize = arg.parse().map_err(|_| {
                 format!(
-                    "expected a token count, --check-only, --paired-attn, --attn-rows, --attn-tile=LABEL, \
-                     --mlp-unfused, --gdn-scan16 or --decode[=P], got {arg:?}"
+                    "expected a token count, --check-only, --paired-attn, --paired-gate-up, --model-forward, --attn-rows, \
+                     --attn-tile=LABEL, --mlp-unfused, --gdn-scan16 or --decode[=P], got {arg:?}"
                 )
             })?;
             if t == 0 {
@@ -1350,6 +1566,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     if paired_rec && (check_only || paired_attn) {
         return Err("--paired-gdn-recurrent takes batch sizes only".into());
+    }
+    let modes = [paired_gate_up, model_forward].iter().filter(|&&m| m).count();
+    if modes > 1 || (modes == 1 && (check_only || paired_attn || paired_rec || decode.is_some())) {
+        return Err("--paired-gate-up and --model-forward each take token counts only".into());
+    }
+    if model_forward {
+        let rt = GpuRuntime::new()?;
+        println!("device: {}", rt.device_name());
+        run_model_forward(&rt, if ts.is_empty() { &[1024, 2048] } else { &ts })?;
+        return Ok(());
+    }
+    if paired_gate_up {
+        let rt = GpuRuntime::new()?;
+        println!("device: {}", rt.device_name());
+        run_paired_gate_up(&rt, if ts.is_empty() { &[512, 2048] } else { &ts })?;
+        return Ok(());
     }
     if paired_rec {
         let rt = GpuRuntime::new()?;

@@ -7,6 +7,7 @@
 //! cargo run --release --bin bench_qwen35_train -- --check-only  # the gate, no timing
 //! QWEN35_2B_SAFETENSORS=... cargo run --release --bin bench_qwen35_train -- --step=2048
 //! cargo run --release --bin bench_qwen35_train -- --bf16        # bf16 GEMM operands
+//! QWEN35_2B_SAFETENSORS=... cargo run --release --bin bench_qwen35_train -- --bf16-storage --step-only --step=2048
 //! QWEN35_2B_SAFETENSORS=... cargo run --release --bin bench_qwen35_train -- 2048 --step-only --step=2048 --async
 //! QWEN35_2B_SAFETENSORS=... cargo run --release --bin bench_qwen35_train -- 256 --step-only --clip=256
 //! ```
@@ -25,6 +26,11 @@
 //! the ~0.25 ms submit-and-wait floor, `docs/benchmarking.md`). A GDN layer's
 //! training ops are `gdn_train` forward + backward; an attention layer's are
 //! `attn_train` forward + backward; the row-local backwards are listed apart.
+//! Three rows time what a bf16 model's backward does with each layer's saved
+//! bf16 input before rebuilding the layer: the widen to f32, the input norm
+//! reading the widened f32, and the residual copy out of it (with
+//! `rms_norm_bwd`, which also reads it, the ops a bf16-input norm would
+//! change; their sum per layer bounds what it could save).
 //!
 //! `--batch=ROWS,LEN[,SPAN_ROWS]` (repeatable, with the real checkpoint)
 //! times one optimizer step's gradients for a batch run row by row into one
@@ -42,6 +48,11 @@
 //! ([`GpuRuntime::peak_allocated_bytes`], reset after loading), and one more
 //! untimed step's host waits on the GPU, commits, dispatches and fresh
 //! buffer allocations ([`tessl::infer_trace`]).
+//!
+//! `--bf16-storage` loads the checkpoint as a `Precision::Bf16` tower
+//! (`Qwen35Model::load_tower`: bf16 matrices and saved layer inputs, see
+//! docs/qwen35.md "Training on bf16 storage") for `--step`, `--clip` and
+//! `--batch`, and implies `--bf16`.
 //!
 //! `--async` runs the step under [`GpuRuntime::set_async_encode`] (one command
 //! buffer between the waits the step itself makes); without it every
@@ -68,18 +79,18 @@ use tessl::cross_entropy::{cross_entropy_rows, CeGrads, CeHidden, CeWorkspace, R
 use tessl::gdn_train::{
     gdn_train_backward, gdn_train_forward, GdnTrainDims, GdnTrainGrads, GdnTrainInputs, GdnTrainWorkspace,
 };
-use tessl::gemm::GemmOperands;
-use tessl::qwen35::{AttnShape, Cols, GdnGateLogits, GdnParams};
+use tessl::gemm::{cast_bf16_to_f32_into, GemmOperands};
+use tessl::qwen35::{rms_norm, AttnShape, Cols, GdnGateLogits, GdnParams};
 use tessl::qwen35_adamw::{AdamW, AdamWHyper};
 use tessl::qwen35_bwd::{
-    attn_qk_norm_rope_bwd, attn_qk_norm_rope_bwd_part_len, conv1d_silu_bwd, conv1d_silu_bwd_part_len, embed_rows_bwd,
-    gated_rms_norm_bwd, gated_rms_norm_bwd_part_len, gdn_gates_bwd, gdn_gates_bwd_part_len, rms_norm_bwd,
-    rms_norm_bwd_part_len, swiglu_bwd, AttnQkvGrads, EmbedBwdWorkspace,
+    attn_qk_norm_rope_bwd, attn_qk_norm_rope_bwd_part_len, conv1d_silu_bwd, conv1d_silu_bwd_part_len, copy_cols,
+    embed_rows_bwd, gated_rms_norm_bwd, gated_rms_norm_bwd_part_len, gdn_gates_bwd, gdn_gates_bwd_part_len,
+    rms_norm_bwd, rms_norm_bwd_part_len, swiglu_bwd, AttnQkvGrads, EmbedBwdWorkspace,
 };
 use tessl::qwen35_model::{Precision, Qwen35Config, Qwen35Model};
 use tessl::qwen35_train::Qwen35Grads;
 use tessl::safetensors::SafeTensors;
-use tessl::tensor::GpuBuffer;
+use tessl::tensor::{f32_slice_to_bf16, GpuBuffer};
 use tessl::{DType, GpuRuntime, Tensor};
 
 const HIDDEN: usize = 2048;
@@ -293,6 +304,15 @@ fn bench_t(rt: &Arc<GpuRuntime>, t: usize, check_only: bool, operands: GemmOpera
         buf(rt, t * HIDDEN, 0, 0.0)?,
     );
     let (nw, dnw) = (buf(rt, HIDDEN, s(33), 1.0)?, buf(rt, HIDDEN, 0, 0.0)?);
+    // A bf16 layer input, and the f32 it is widened into, normed and copied out of.
+    let x16 = rt.alloc_tensor_bf16(&[t, HIDDEN])?;
+    x16.buffer
+        .write_bf16_bits(&f32_slice_to_bf16(&fill(t * HIDDEN, s(31), 1.0)));
+    let (xw, xn, xc) = (
+        rt.alloc_tensor_f32(&[t, HIDDEN])?,
+        buf(rt, t * HIDDEN, 0, 0.0)?,
+        buf(rt, t * HIDDEN, 0, 0.0)?,
+    );
     let npart = buf(rt, rms_norm_bwd_part_len(t32, HIDDEN as u32), 0, 0.0)?;
     let vd = GDN_HEADS * GDN_DV;
     let (go, gdy, gdo) = (
@@ -451,6 +471,27 @@ fn bench_t(rt: &Arc<GpuRuntime>, t: usize, check_only: bool, operands: GemmOpera
             name: "rms_norm_bwd",
             run: Box::new(|| rms_norm_bwd(rt, &x, &nw, &dy_h, &dx_h, &dnw, &npart, t32, HIDDEN as u32, EPS, false)),
             outputs: vec![("dx", &dx_h, t * HIDDEN), ("dw", &dnw, HIDDEN)],
+            reps: REPS,
+        },
+        Op {
+            name: "widen bf16 layer input",
+            run: Box::new(|| cast_bf16_to_f32_into(&x16, &xw)),
+            outputs: vec![("x", &xw.buffer, t * HIDDEN)],
+            reps: REPS,
+        },
+        Op {
+            name: "rms_norm (f32 input)",
+            run: Box::new(|| rms_norm(rt, &x, &nw, &xn, DType::F32, t32, HIDDEN as u32, EPS)),
+            outputs: vec![("out", &xn, t * HIDDEN)],
+            reps: REPS,
+        },
+        Op {
+            name: "residual copy (f32)",
+            run: Box::new(|| {
+                let h = HIDDEN as u32;
+                copy_cols(rt, Cols::dense(&x, h), Cols::dense(&xc, h), t32, h)
+            }),
+            outputs: vec![("out", &xc, t * HIDDEN)],
             reps: REPS,
         },
         Op {
@@ -615,18 +656,18 @@ fn bench_t(rt: &Arc<GpuRuntime>, t: usize, check_only: bool, operands: GemmOpera
     Ok(())
 }
 
-/// The real 2B checkpoint, in f32.
-fn load_2b(rt: &Arc<GpuRuntime>) -> Res<Qwen35Model> {
+/// The real 2B checkpoint: in f32, or with `bf16_storage` as the bf16 tower
+/// training on bf16 storage loads.
+fn load_2b(rt: &Arc<GpuRuntime>, bf16_storage: bool) -> Res<Qwen35Model> {
     let path = std::env::var("QWEN35_2B_SAFETENSORS")
         .map_err(|_| "--step and --batch need QWEN35_2B_SAFETENSORS (the Qwen3.5-2B-Base .safetensors)".to_string())?;
     let st = SafeTensors::open(std::path::Path::new(&path))?;
-    Qwen35Model::load(
-        rt,
-        &st,
-        "model.language_model.",
-        Qwen35Config::qwen35_2b()?,
-        Precision::F32,
-    )
+    let (prefix, cfg) = ("model.language_model.", Qwen35Config::qwen35_2b()?);
+    if bf16_storage {
+        Qwen35Model::load_tower(rt, &st, prefix, cfg, Precision::Bf16)
+    } else {
+        Qwen35Model::load(rt, &st, prefix, cfg, Precision::F32)
+    }
 }
 
 /// Host waits, commits, dispatches and fresh allocations `f` made, and its
@@ -866,8 +907,12 @@ fn bench_batch(rt: &Arc<GpuRuntime>, model: &Qwen35Model, b: BatchShape, operand
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (mut check_only, mut step, mut ts, mut operands) = (false, None, Vec::new(), GemmOperands::ExactF32);
     let (mut batches, mut step_only, mut async_encode, mut clip) = (Vec::new(), false, false, None);
+    let mut bf16_storage = false;
     for arg in std::env::args().skip(1) {
         if arg == "--bf16" {
+            operands = GemmOperands::Bf16;
+        } else if arg == "--bf16-storage" {
+            bf16_storage = true;
             operands = GemmOperands::Bf16;
         } else if arg == "--check-only" {
             check_only = true;
@@ -890,7 +935,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         } else {
             let t: usize = arg.parse().map_err(|_| {
                 format!(
-                    "expected a token count, --check-only, --step-only, --bf16, --async, --step=N, --clip=N \
+                    "expected a token count, --check-only, --step-only, --bf16, --bf16-storage, --async, --step=N, --clip=N \
                      or --batch=B,L[,S], got {arg:?}"
                 )
             })?;
@@ -919,7 +964,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         return Ok(());
     }
-    let model = load_2b(&rt)?;
+    let model = load_2b(&rt, bf16_storage)?;
     rt.set_async_encode(async_encode)?;
     println!(
         "encode: {}; TESSL_MID_COMMIT={}",

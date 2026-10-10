@@ -25,7 +25,9 @@
 //! * `Bf16`: bf16 GEMM inputs are a real change of numerics, so it is held to
 //!   transformers' own bf16 forward instead: its mean KL divergence from the
 //!   fp32 reference and its top-1 disagreements with it may not exceed the
-//!   bf16 reference's.
+//!   bf16 reference's. `make_reference.py --ids tests/fixtures/qwen35_text_ids.npy --out
+//!   target/qwen35_ref_text` with `QWEN35_REF_DIR` pointed at it runs both
+//!   tests on 512 natural-text tokens instead of the prompt.
 //!
 //! **Against the forward itself** (always run, on the tiny two-layer
 //! checkpoint in `tests/fixtures/qwen35_train/` and a seeded four-layer
@@ -190,13 +192,9 @@ fn f32_forward_matches_transformers_fp32_layer_by_layer() {
 #[test]
 #[ignore]
 fn bf16_forward_is_no_worse_than_transformers_bf16() {
-    let (logits, _) = run(Precision::Bf16);
     let (shape, fp32) = load_ref("logits_f32");
     let (_, hf_bf16) = load_ref("logits_bf16");
     let vocab = shape[1];
-    let got64: Vec<f64> = logits.iter().map(|&x| x as f64).collect();
-    let kl_tessl = kl_rows(&fp32, &got64, vocab);
-    let kl_hf = kl_rows(&fp32, &hf_bf16, vocab);
     let mean = |v: &[f64]| v.iter().sum::<f64>() / v.len() as f64;
     let top1_miss = |q: &[f64]| {
         fp32.chunks(vocab)
@@ -204,15 +202,23 @@ fn bf16_forward_is_no_worse_than_transformers_bf16() {
             .filter(|(p, q)| argmax(p) != argmax(q))
             .count()
     };
-    let (m_t, m_h) = (top1_miss(&got64), top1_miss(&hf_bf16));
+    let kl_hf = kl_rows(&fp32, &hf_bf16, vocab);
+    let m_h = top1_miss(&hf_bf16);
     eprintln!(
-        "vs fp32 over {} positions: tessl bf16 mean KL {:.3e} (max {:.3e}), top-1 misses {m_t}; \
-         transformers bf16 mean KL {:.3e} (max {:.3e}), top-1 misses {m_h}",
+        "vs fp32 over {} positions: transformers bf16 mean KL {:.3e} (max {:.3e}), top-1 misses {m_h}",
         shape[0],
-        mean(&kl_tessl),
-        kl_tessl.iter().cloned().fold(0.0, f64::max),
         mean(&kl_hf),
         kl_hf.iter().cloned().fold(0.0, f64::max),
+    );
+    let (logits, _) = run(Precision::Bf16);
+    let got64: Vec<f64> = logits.iter().map(|&x| x as f64).collect();
+    let kl_tessl = kl_rows(&fp32, &got64, vocab);
+    let m_t = top1_miss(&got64);
+    eprintln!(
+        "vs fp32: tessl bf16 mean KL {:.3e} (max {:.3e}), top-1 misses {m_t}, logits rel err {:.3e}",
+        mean(&kl_tessl),
+        kl_tessl.iter().cloned().fold(0.0, f64::max),
+        rel(&logits, &fp32),
     );
     assert!(
         mean(&kl_tessl) <= mean(&kl_hf),

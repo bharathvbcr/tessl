@@ -1,0 +1,67 @@
+# Paired bf16 MLP inputs (Qwen35Model::set_bf16_mlp_inputs) — M5 Pro, 2026-10-10
+#
+#   target/release/bench_qwen35_layers --paired-mlp-inputs 1024 2048
+#
+# Built at eb24de1 (the bench mode; kernels as committed in 5ad6035). Lane
+# f32_inputs is the production bf16 forward (gate and up GEMMs write f32,
+# qwen35_swiglu_bf16 reads f32); bf16_inputs has the GEMMs round C to bf16
+# (matmul2d_tensorops_bf16_bf16) and qwen35_swiglu_bf16_bf16 read it. One
+# process, ABBA (the first lane rotates each round); kernel units 3 warmup + 15
+# timed rounds of `reps` units per command buffer, the 24-layer forward
+# (Qwen35Model::random_tower at the 2B's config, bf16, no LM head; begin +
+# advance_to(24) + synchronize, one command buffer under async encode)
+# 2 + 11 rounds of one forward.
+#
+# Conditions: shared machine. Other agent sessions were running GPU work
+# (an ojas decode benchmark, a torch job) and Go benchmarks; ioreg read the
+# GPU 95% busy before this run and the 1-minute load average was ~15-27.
+# Pairing puts the same load on both lanes within each round, and the
+# per-round ratio is the headline; absolute times are inflated against an
+# idle GPU (the 1024 forward measured 149 ms in a quieter run at 30% GPU).
+#
+# Finding: no win. SwiGLU on bf16 inputs is 0.65x (34% faster: 0.27 -> 0.18
+# ms at T = 1024, 0.54 -> 0.35 ms at 2048, per layer), but the gate and up
+# GEMMs with a bf16 C are 1.06x (+0.13 / +0.24 ms per layer), so the MLP block
+# is 1.01-1.02x and the whole 24-layer forward 1.006-1.009x, slower in every
+# statistic (median of round ratios, of medians, of mins). The GEMMs are
+# compute-bound at these shapes and their f32 cooperative store is nearly
+# free; rounding on the store costs more than the halved write saves.
+#
+# The store was tried two ways, each a frozen binary, interleaved coop,
+# scatter, coop, scatter at T = 1024 (GPU 91-99% busy from other sessions):
+# through a bfloat destination cooperative tensor (attn_tiled.h's way, kept)
+# and by each lane writing its elements at get_multidimensional_index
+# (no second cooperative tensor). gate_up_gemms ratios: coop 1.071, 1.077;
+# scatter 1.079, 1.068. Forward: coop 1.013, 1.008; scatter 1.006, 1.007.
+# Neither is better, so the simpler, precedent form stayed.
+#
+gpu util before: 95% at 10:12:43
+device: Apple M5 Pro
+paired MLP inputs: gate/up f32 (production bf16 forward) vs bf16 (set_bf16_mlp_inputs)
+one process, ABBA (first lane rotates each round); kernel units 3 warmup + 15 timed rounds, forward 2 + 11
+T=1024: gate passed; swiglu max |f32 lane - bf16 lane| / peak = 7.634e-3
+PAIRED t=1024 unit=swiglu lane=f32_inputs n=15 reps=16 median_ms=0.2665 min_ms=0.2556 max_ms=0.3934
+PAIRED t=1024 unit=swiglu lane=bf16_inputs n=15 reps=16 median_ms=0.1756 min_ms=0.1689 max_ms=0.3282
+PAIRED t=1024 unit=swiglu ratio_bf16_inputs_over_f32_inputs median_of_round_ratios=0.6563 of_medians=0.6586 of_mins=0.6609
+PAIRED t=1024 unit=gate_up_gemms lane=f32_inputs n=15 reps=16 median_ms=2.0632 min_ms=1.9916 max_ms=2.1465
+PAIRED t=1024 unit=gate_up_gemms lane=bf16_inputs n=15 reps=16 median_ms=2.1883 min_ms=2.1411 max_ms=2.2469
+PAIRED t=1024 unit=gate_up_gemms ratio_bf16_inputs_over_f32_inputs median_of_round_ratios=1.0607 of_medians=1.0607 of_mins=1.0751
+PAIRED t=1024 unit=mlp_block lane=f32_inputs n=15 reps=16 median_ms=3.5793 min_ms=3.4797 max_ms=3.6283
+PAIRED t=1024 unit=mlp_block lane=bf16_inputs n=15 reps=16 median_ms=3.6238 min_ms=3.5307 max_ms=3.6786
+PAIRED t=1024 unit=mlp_block ratio_bf16_inputs_over_f32_inputs median_of_round_ratios=1.0171 of_medians=1.0124 of_mins=1.0146
+PAIRED t=1024 unit=forward_24_layers lane=f32_inputs n=11 reps=1 median_ms=167.0985 min_ms=164.4986 max_ms=168.8997
+PAIRED t=1024 unit=forward_24_layers lane=bf16_inputs n=11 reps=1 median_ms=168.4227 min_ms=166.7412 max_ms=171.2105
+PAIRED t=1024 unit=forward_24_layers ratio_bf16_inputs_over_f32_inputs median_of_round_ratios=1.0094 of_medians=1.0079 of_mins=1.0136
+T=2048: gate passed; swiglu max |f32 lane - bf16 lane| / peak = 6.667e-3
+PAIRED t=2048 unit=swiglu lane=f32_inputs n=15 reps=16 median_ms=0.5380 min_ms=0.5131 max_ms=0.6739
+PAIRED t=2048 unit=swiglu lane=bf16_inputs n=15 reps=16 median_ms=0.3514 min_ms=0.3405 max_ms=0.4897
+PAIRED t=2048 unit=swiglu ratio_bf16_inputs_over_f32_inputs median_of_round_ratios=0.6518 of_medians=0.6532 of_mins=0.6636
+PAIRED t=2048 unit=gate_up_gemms lane=f32_inputs n=15 reps=16 median_ms=4.1573 min_ms=4.0196 max_ms=4.2542
+PAIRED t=2048 unit=gate_up_gemms lane=bf16_inputs n=15 reps=16 median_ms=4.4010 min_ms=4.2862 max_ms=4.5508
+PAIRED t=2048 unit=gate_up_gemms ratio_bf16_inputs_over_f32_inputs median_of_round_ratios=1.0619 of_medians=1.0586 of_mins=1.0663
+PAIRED t=2048 unit=mlp_block lane=f32_inputs n=15 reps=16 median_ms=6.9075 min_ms=6.6339 max_ms=7.7579
+PAIRED t=2048 unit=mlp_block lane=bf16_inputs n=15 reps=16 median_ms=7.0407 min_ms=6.8537 max_ms=7.7544
+PAIRED t=2048 unit=mlp_block ratio_bf16_inputs_over_f32_inputs median_of_round_ratios=1.0126 of_medians=1.0193 of_mins=1.0331
+PAIRED t=2048 unit=forward_24_layers lane=f32_inputs n=11 reps=1 median_ms=319.2574 min_ms=313.0749 max_ms=323.2810
+PAIRED t=2048 unit=forward_24_layers lane=bf16_inputs n=11 reps=1 median_ms=320.5647 min_ms=315.2210 max_ms=323.8217
+PAIRED t=2048 unit=forward_24_layers ratio_bf16_inputs_over_f32_inputs median_of_round_ratios=1.0062 of_medians=1.0041 of_mins=1.0069

@@ -31,7 +31,7 @@ use objc2_metal::{
 };
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, PoisonError, Weak};
 
 /// Const arena for Metal 4 scalar binds (distinct offsets; reset after sync).
@@ -110,6 +110,23 @@ pub enum PrecisionMode {
     F32,
     /// Phase 4 default: bf16 storage/compute, f32 accum (GEMM/softmax/RMS/loss/optim).
     Bf16,
+}
+
+impl PrecisionMode {
+    /// Encoding for the runtime's `AtomicU8` precision flag.
+    const fn to_u8(self) -> u8 {
+        match self {
+            Self::F32 => 0,
+            Self::Bf16 => 1,
+        }
+    }
+
+    const fn from_u8(v: u8) -> Self {
+        match v {
+            1 => Self::Bf16,
+            _ => Self::F32,
+        }
+    }
 }
 
 /// Compiled pipelines by kernel name. Plain and ICB-capable pipelines of one
@@ -197,14 +214,18 @@ struct BufferPool {
     freelist: HashMap<usize, Vec<Retained<ProtocolObject<dyn MTLBuffer>>>>,
     cached_bytes: usize,
     max_cache_bytes: usize,
+    /// `device.maxBufferLength()`, a fixed device property read once rather
+    /// than twice per allocation.
+    max_buffer_length: usize,
 }
 
 impl BufferPool {
-    fn new(max_cache_bytes: usize) -> Self {
+    fn new(max_cache_bytes: usize, max_buffer_length: usize) -> Self {
         Self {
             freelist: HashMap::new(),
             cached_bytes: 0,
             max_cache_bytes,
+            max_buffer_length,
         }
     }
 
@@ -229,11 +250,11 @@ impl BufferPool {
         nbytes: usize,
         kind: BufferKind,
     ) -> Result<(Retained<ProtocolObject<dyn MTLBuffer>>, bool), String> {
-        if nbytes > isize::MAX as usize || nbytes > device.maxBufferLength() {
+        if nbytes > isize::MAX as usize || nbytes > self.max_buffer_length {
             return Err(format!("buffer request {nbytes} exceeds host/device allocation limit"));
         }
         let key = Self::bucket(nbytes, kind)
-            .filter(|&key| key <= device.maxBufferLength())
+            .filter(|&key| key <= self.max_buffer_length)
             .ok_or("rounded buffer size exceeds device limit")?;
         if let Some(v) = self.freelist.get_mut(&key) {
             if let Some(b) = v.pop() {
@@ -316,7 +337,7 @@ pub(crate) struct Metal4EncodePackage {
     pub const_cursor: Mutex<usize>,
     event_value: Mutex<u64>,
     /// Allocations registered into `residency` (debug / telemetry).
-    pub residency_count: Mutex<usize>,
+    pub residency_count: AtomicUsize,
 }
 
 /// Outcome of one `MTL4CommitFeedback` callback.
@@ -563,21 +584,26 @@ pub struct GpuRuntime {
     bump: Mutex<Option<BumpState>>,
     has_tensorops: bool,
     /// When true, kernels accumulate into one CB until [`Self::synchronize`] / [`Self::commit`].
-    async_encode: Mutex<bool>,
+    async_encode: AtomicBool,
     active_m4: Mutex<Option<ActiveMetal4Batch>>,
     /// Last CounterHeap (t0, t1) resolved at synchronize.
     last_m4_stamps: Mutex<Option<(u64, u64)>>,
     /// `with_binder` calls since the last [`Self::take_dispatch_count`]
     /// (fusion/telemetry). Commits do not clear it; only the taker does.
-    pub dispatch_count: Mutex<usize>,
-    precision: Mutex<PrecisionMode>,
+    ///
+    /// An atomic rather than a `Mutex`: it is bumped on every dispatch, and
+    /// the runtime is single-threaded (`!Send`, `!Sync`), so the lock bought
+    /// nothing. The same holds for the other per-dispatch flags below.
+    pub dispatch_count: AtomicUsize,
+    /// A [`PrecisionMode`] as [`PrecisionMode::to_u8`].
+    precision: AtomicU8,
     /// Phase H bridge: TensorOps f32 GEMM with `relaxed_precision` (tf32-class).
     /// Off by default so f32 goldens stay exact; enable via `--tf32` / `set_relaxed_precision`.
-    relaxed_precision: Mutex<bool>,
+    relaxed_precision: AtomicBool,
     /// Prefer TensorOps multi-block flash probe over simdgroup FA-2 (`--flash-tensorops`).
-    flash_tensorops: Mutex<bool>,
+    flash_tensorops: AtomicBool,
     /// Uncommitted residency adds/removes — flushed before encode / synchronize.
-    residency_dirty: Mutex<bool>,
+    residency_dirty: AtomicBool,
     /// Cold buffers whose last Arc dropped mid-step; recycled after CB wait.
     pending_cold_recycle: Mutex<Vec<PendingRecycle>>,
     /// Hot buffers whose last Arc dropped; removed from residency after CB wait.
@@ -771,6 +797,7 @@ impl GpuRuntime {
             .newFunctionWithName(&NSString::from_str("matmul2d_tensorops_f32"))
             .is_some();
 
+        let max_buffer_length = device.maxBufferLength();
         let recommended = device.recommendedMaxWorkingSetSize();
         let memory_size = probe_system_memory_size();
         let wired_budget = ((recommended as f64) * 0.9) as u64;
@@ -799,17 +826,17 @@ impl GpuRuntime {
             overlay_libraries: Mutex::new(Vec::new()),
             metal4,
             pipelines: Mutex::new(PipelineCache::new()),
-            pool: Mutex::new(BufferPool::new(DEFAULT_POOL_CACHE_BYTES)),
+            pool: Mutex::new(BufferPool::new(DEFAULT_POOL_CACHE_BYTES, max_buffer_length)),
             bump: Mutex::new(None),
             has_tensorops,
-            async_encode: Mutex::new(false),
+            async_encode: AtomicBool::new(false),
             active_m4: Mutex::new(None),
             last_m4_stamps: Mutex::new(None),
-            dispatch_count: Mutex::new(0),
-            precision: Mutex::new(PrecisionMode::F32),
-            relaxed_precision: Mutex::new(false),
-            flash_tensorops: Mutex::new(false),
-            residency_dirty: Mutex::new(false),
+            dispatch_count: AtomicUsize::new(0),
+            precision: AtomicU8::new(PrecisionMode::F32.to_u8()),
+            relaxed_precision: AtomicBool::new(false),
+            flash_tensorops: AtomicBool::new(false),
+            residency_dirty: AtomicBool::new(false),
             pending_cold_recycle: Mutex::new(Vec::new()),
             pending_retirement: Mutex::new(Vec::new()),
             external_wraps: Mutex::new(HashMap::new()),
@@ -845,11 +872,11 @@ impl GpuRuntime {
     }
 
     pub fn set_precision(&self, mode: PrecisionMode) {
-        *self.precision.lock().unwrap() = mode;
+        self.precision.store(mode.to_u8(), Ordering::Release);
     }
 
     pub fn precision(&self) -> PrecisionMode {
-        *self.precision.lock().unwrap()
+        PrecisionMode::from_u8(self.precision.load(Ordering::Acquire))
     }
 
     /// Opt into TensorOps f32 `relaxed_precision` (tf32-class) GEMMs. Ignored when
@@ -858,19 +885,19 @@ impl GpuRuntime {
     /// The cooperative kernels this selects take the same operand views as
     /// exact f32: any view starting on a 16-byte boundary.
     pub fn set_relaxed_precision(&self, on: bool) {
-        *self.relaxed_precision.lock().unwrap() = on;
+        self.relaxed_precision.store(on, Ordering::Release);
     }
 
     pub fn relaxed_precision(&self) -> bool {
-        *self.relaxed_precision.lock().unwrap()
+        self.relaxed_precision.load(Ordering::Acquire)
     }
 
     pub fn set_flash_tensorops(&self, on: bool) {
-        *self.flash_tensorops.lock().unwrap() = on;
+        self.flash_tensorops.store(on, Ordering::Release);
     }
 
     pub fn flash_tensorops(&self) -> bool {
-        *self.flash_tensorops.lock().unwrap()
+        self.flash_tensorops.load(Ordering::Acquire)
     }
 
     pub fn memory_info(&self) -> DeviceMemoryInfo {
@@ -997,12 +1024,8 @@ impl GpuRuntime {
     pub fn register_allocation(&self, alloc: &ProtocolObject<dyn MTLAllocation>) {
         let m4 = &self.metal4;
         m4.residency.addAllocation(alloc);
-        if let Ok(mut c) = m4.residency_count.lock() {
-            *c += 1;
-        }
-        if let Ok(mut d) = self.residency_dirty.lock() {
-            *d = true;
-        }
+        m4.residency_count.fetch_add(1, Ordering::Relaxed);
+        self.residency_dirty.store(true, Ordering::Release);
     }
 
     /// Mark allocation for removal on next residency commit (after CB complete).
@@ -1014,12 +1037,11 @@ impl GpuRuntime {
     fn unregister_allocation(&self, alloc: &ProtocolObject<dyn MTLAllocation>) {
         let m4 = &self.metal4;
         m4.residency.removeAllocation(alloc);
-        if let Ok(mut c) = m4.residency_count.lock() {
-            *c = c.saturating_sub(1);
-        }
-        if let Ok(mut d) = self.residency_dirty.lock() {
-            *d = true;
-        }
+        // Saturating, as the old locked `saturating_sub` was.
+        let _ = m4
+            .residency_count
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |c| Some(c.saturating_sub(1)));
+        self.residency_dirty.store(true, Ordering::Release);
     }
 
     /// Called from [`crate::tensor::PooledBuffer`] Drop for cold temps.
@@ -1149,17 +1171,15 @@ impl GpuRuntime {
 
     /// Commit pending residency adds/removes and request residency (batched).
     pub fn flush_residency(&self) {
-        let dirty = self.residency_dirty.lock().map(|g| *g).unwrap_or(false);
-        if !dirty {
+        // Cleared before the commit, so an add or remove that lands after
+        // this point marks the set dirty again rather than being lost.
+        if !self.residency_dirty.swap(false, Ordering::AcqRel) {
             return;
         }
         crate::infer_trace::on_residency_flush();
         let m4 = &self.metal4;
         m4.residency.commit();
         m4.residency.requestResidency();
-        if let Ok(mut d) = self.residency_dirty.lock() {
-            *d = false;
-        }
         // try_lock: avoid re-entrancy when called under `active_m4`.
         if let Ok(guard) = self.active_m4.try_lock() {
             if guard.as_ref().map(|b| b.cb_open).unwrap_or(false) {
@@ -1173,19 +1193,16 @@ impl GpuRuntime {
         if !on {
             self.synchronize()?;
         }
-        *self.async_encode.lock().map_err(|e| e.to_string())? = on;
+        self.async_encode.store(on, Ordering::Release);
         Ok(())
     }
 
     pub fn async_encode_enabled(&self) -> bool {
-        *self.async_encode.lock().unwrap()
+        self.async_encode.load(Ordering::Acquire)
     }
 
     pub fn take_dispatch_count(&self) -> usize {
-        let mut g = self.dispatch_count.lock().unwrap();
-        let n = *g;
-        *g = 0;
-        n
+        self.dispatch_count.swap(0, Ordering::AcqRel)
     }
 
     /// Register an additional metallib (Gemma kernels, etc.). Pipeline names
@@ -1564,9 +1581,7 @@ impl GpuRuntime {
                 self.encode_failed.store(true, Ordering::Release);
                 return Err(error);
             }
-            if let Ok(mut c) = self.dispatch_count.lock() {
-                *c += 1;
-            }
+            self.dispatch_count.fetch_add(1, Ordering::Relaxed);
             return Ok(());
         }
         let result = self.with_binder_sync(skip_auto, f);
@@ -1742,18 +1757,16 @@ impl GpuRuntime {
         autoreleasepool(|_| {
             let was_async = self.async_encode_enabled();
             if !was_async {
-                *self.async_encode.lock().map_err(|e| e.to_string())? = true;
+                self.async_encode.store(true, Ordering::Release);
             }
             let result = (|| {
                 self.encode_into_batch_m4(skip_auto, f)?;
                 self.commit_m4(true)
             })();
             if !was_async {
-                *self.async_encode.lock().map_err(|e| e.to_string())? = false;
+                self.async_encode.store(false, Ordering::Release);
             }
-            if let Ok(mut c) = self.dispatch_count.lock() {
-                *c += 1;
-            }
+            self.dispatch_count.fetch_add(1, Ordering::Relaxed);
             result
         })
     }
@@ -2297,7 +2310,7 @@ fn try_init_metal4(device: &ProtocolObject<dyn MTLDevice>, timestamps: bool) -> 
         const_staging,
         const_cursor: Mutex::new(0),
         event_value: Mutex::new(0),
-        residency_count: Mutex::new(1),
+        residency_count: AtomicUsize::new(1),
     })
 }
 

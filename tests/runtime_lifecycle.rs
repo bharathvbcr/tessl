@@ -154,6 +154,51 @@ fn cold_buffers_come_back_from_the_freelist_after_a_sync() {
     });
 }
 
+/// A buffer freed into a full cache displaces a larger cached one rather
+/// than being released itself, so one large buffer freed and never asked for
+/// again (a checkpoint loader's staging tensor) cannot hold the cap while
+/// every smaller buffer is released and made again. The largest buffer
+/// freed into a full cache is still released. Observed, as above, through a
+/// sentinel that survives a freelist round trip and not a fresh buffer.
+#[test]
+fn a_full_cache_keeps_the_smaller_buffer_freed_into_it() {
+    const BIG: usize = 1 << 20;
+    const SMALL: usize = 256 * 1024;
+    let (a, b, c) = (2.5e-9f32, 3.5e-9f32, 4.5e-9f32);
+    // Its own runtime: the cap and the freelist are the test's alone.
+    let rt = GpuRuntime::new().unwrap();
+    rt.set_pool_cache_cap_bytes(BIG);
+    let round_trip = |bytes: usize, mark: f32| {
+        rt.alloc_buffer(bytes).unwrap().write_f32_prefix(&[mark; 8]);
+        rt.synchronize().unwrap();
+    };
+    let reused = |bytes: usize, mark: f32| {
+        let buf = rt.alloc_buffer(bytes).unwrap();
+        let hit = buf.read_f32()[0] == mark;
+        (buf, hit)
+    };
+    // The large buffer fills the cache; the small one freed after it evicts it.
+    round_trip(BIG, a);
+    round_trip(SMALL, b);
+    let (small, hit) = reused(SMALL, b);
+    assert!(hit, "the small buffer freed into a full cache was released");
+    let (big, hit) = reused(BIG, a);
+    assert!(
+        !hit,
+        "the large buffer stayed cached beside the small one, over the cap"
+    );
+    drop(big);
+    // Freed back: the small one is cached again, and the large one, larger
+    // than everything cached, is released rather than evicting it.
+    drop(small);
+    rt.synchronize().unwrap();
+    round_trip(BIG, c);
+    let (_small, hit) = reused(SMALL, b);
+    assert!(hit, "a larger buffer evicted the smaller cached one");
+    let (_big, hit) = reused(BIG, c);
+    assert!(!hit, "the largest buffer freed into a full cache was kept");
+}
+
 #[test]
 fn the_pool_keeps_serving_correct_results_under_churn() {
     with_gpu(|rt| {

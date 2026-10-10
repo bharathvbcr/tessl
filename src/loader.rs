@@ -5,7 +5,9 @@
 //! Each tensor is named `{prefix}{rest}` and its shape is checked against
 //! what the model expects. Nothing is held on the host longer than it takes
 //! to reach the device: a projection's parts are placed into the packed
-//! operand one at a time as they are read ([`Loader::linear`]), and a table
+//! operand one at a time as they are read ([`Loader::linear`], through one
+//! scratch buffer the size of the largest part, reused for every part rather
+//! than faulting in fresh pages for each), and a table
 //! is read straight into its device tensor ([`Loader::f32_into`],
 //! [`Loader::bf16_into`]). Every name read is recorded, so a model that
 //! implements everything under its prefix can refuse a checkpoint carrying a
@@ -34,6 +36,11 @@ pub(crate) struct Loader<'a> {
     rt: &'a Arc<GpuRuntime>,
     /// Every tensor name read so far, for [`Self::refuse_unread`].
     read: RefCell<BTreeSet<String>>,
+    /// [`Self::linear`]'s staging for one part, grown to the largest part
+    /// and reused: a fresh `Vec` per part paid page faults and kernel zeroing
+    /// for every one (about 4 GB over a 2B bf16 load).
+    scratch_bf16: RefCell<Vec<u16>>,
+    scratch_f32: RefCell<Vec<f32>>,
 }
 
 impl<'a> Loader<'a> {
@@ -43,6 +50,8 @@ impl<'a> Loader<'a> {
             prefix,
             rt,
             read: RefCell::new(BTreeSet::new()),
+            scratch_bf16: RefCell::new(Vec::new()),
+            scratch_f32: RefCell::new(Vec::new()),
         }
     }
 
@@ -129,18 +138,24 @@ impl<'a> Loader<'a> {
         match precision {
             Precision::Bf16 => {
                 let t = self.rt.alloc_tensor_bf16_hot(&[in_features, total])?;
+                let mut scratch = self.scratch_bf16.borrow_mut();
                 for &(rest, out) in parts {
-                    let part = self.bf16(rest, &[out, in_features])?;
-                    qwen35::place_linear_part(&mut t.buffer.try_contents_u16()?, total, col0, &part, out, in_features)?;
+                    let part = staged(&mut scratch, out, in_features)?;
+                    let name = self.take(rest);
+                    self.st.read_bf16_bits_into(&name, &[out, in_features], part)?;
+                    qwen35::place_linear_part(&mut t.buffer.try_contents_u16()?, total, col0, part, out, in_features)?;
                     col0 += out;
                 }
                 Ok(t)
             }
             Precision::F32 => {
                 let t = self.rt.alloc_tensor_f32_hot(&[in_features, total])?;
+                let mut scratch = self.scratch_f32.borrow_mut();
                 for &(rest, out) in parts {
-                    let part = self.f32(rest, &[out, in_features])?;
-                    qwen35::place_linear_part(&mut t.buffer.try_contents_f32()?, total, col0, &part, out, in_features)?;
+                    let part = staged(&mut scratch, out, in_features)?;
+                    let name = self.take(rest);
+                    self.st.read_f32_into(&name, &[out, in_features], part)?;
+                    qwen35::place_linear_part(&mut t.buffer.try_contents_f32()?, total, col0, part, out, in_features)?;
                     col0 += out;
                 }
                 Ok(t)
@@ -168,6 +183,18 @@ impl<'a> Loader<'a> {
             if unread.len() > shown.len() { " ..." } else { "" }
         ))
     }
+}
+
+/// The first `out * in_features` elements of `scratch`, grown if needed.
+/// Only growth is zero-filled; the read overwrites the whole slice.
+fn staged<T: Copy + Default>(scratch: &mut Vec<T>, out: usize, in_features: usize) -> Result<&mut [T], String> {
+    let n = out
+        .checked_mul(in_features)
+        .ok_or("linear: part element count overflows usize")?;
+    if scratch.len() < n {
+        scratch.resize(n, T::default());
+    }
+    Ok(&mut scratch[..n])
 }
 
 #[cfg(test)]

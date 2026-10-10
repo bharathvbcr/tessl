@@ -800,16 +800,12 @@ fn qwen35_train_storage_offsets_are_widened() {
         ),
         ("side[(ulong)u * hidden + gid.x] = s;", "head chunk token row"),
         (
-            "const ulong i = (ulong)row * hidden + gid.x;",
+            "qwen35_deliver_into(bank[(ulong)row * hidden + gid.x], s, add);",
             "head chunk bank element",
         ),
         (
-            "const ulong i = (ulong)uniq[gid.y] * hidden + gid.x;",
-            "token row bank element",
-        ),
-        (
-            "bank[i] = qwen35_delivered(bank[i], side[(ulong)gid.y * hidden + gid.x], add);",
-            "token row side element",
+            "qwen35_deliver_into(bank[(ulong)uniq[gid.y] * hidden + gid.x], side[(ulong)gid.y * hidden + gid.x], add);",
+            "token row bank and side elements",
         ),
     ] {
         require(QWEN35_TRAIN_STORAGE, needle, what);

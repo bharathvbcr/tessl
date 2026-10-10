@@ -332,12 +332,12 @@ QWEN35_ADAMW_BF16_RULE(master, float, QWEN35_RULE_MASTER)
 QWEN35_ADAMW_BF16_RULE(kahan, bfloat, QWEN35_RULE_KAHAN)
 QWEN35_ADAMW_BF16_RULE(sr, float, QWEN35_RULE_SR)
 
-/// A bank element `d` given the f32 gradient `s`: `s`, or with `add` the f32
-/// sum `d + s`, rounded to the bank's type once.
+/// Bank element `d` takes the f32 gradient `s`: `s`, or with `add` the f32
+/// sum `d + s`, rounded to the bank's type once. `d` is read only to add.
 template <typename T>
-inline T qwen35_delivered(T d, float s, uint add)
+inline void qwen35_deliver_into(device T &d, float s, uint add)
 {
-    return T(add != 0u ? float(d) + s : s);
+    d = T(add != 0u ? float(d) + s : s);
 }
 
 /// `dst[i] (+)= src[i]` into bf16 from f32, one rounding per element: a
@@ -350,7 +350,7 @@ kernel void qwen35_deliver_f32_to_bf16(
     uint i [[thread_position_in_grid]])
 {
     if (i >= n) return;
-    dst[i] = qwen35_delivered(dst[i], src[i], add);
+    qwen35_deliver_into(dst[i], src[i], add);
 }
 
 /// `row`'s index in `uniq` (sorted, distinct), or `n_uniq` when it is not
@@ -372,7 +372,7 @@ inline uint qwen35_token_index(device const uint *uniq, uint n_uniq, uint row)
 /// One chunk of a tied head's weight gradient into a bank embedding that
 /// cannot take it in place (bf16): vocabulary rows `[v0, v0 + w)` of `src`
 /// (f32 `[w, hidden]`, or zeros when `has_src` is 0) are delivered into
-/// `bank` (`qwen35_delivered`), except the step's token rows (`uniq`, sorted
+/// `bank` (`qwen35_deliver_into`), except the step's token rows (`uniq`, sorted
 /// and distinct), whose gradient the embedding gather has yet to add to:
 /// those are copied unrounded into `side` (f32 `[n_uniq, hidden]`, row `u`
 /// for `uniq[u]`) for `qwen35_token_rows_to_bank` to deliver once the gather
@@ -400,8 +400,7 @@ inline uint qwen35_token_index(device const uint *uniq, uint n_uniq, uint row)
         if (u < n_uniq) {                                                                            \
             side[(ulong)u * hidden + gid.x] = s;                                                     \
         } else {                                                                                     \
-            const ulong i = (ulong)row * hidden + gid.x;                                             \
-            bank[i] = qwen35_delivered(bank[i], s, add);                                             \
+            qwen35_deliver_into(bank[(ulong)row * hidden + gid.x], s, add);                          \
         }                                                                                            \
     }
 
@@ -420,8 +419,7 @@ inline uint qwen35_token_index(device const uint *uniq, uint n_uniq, uint row)
         uint2 gid [[thread_position_in_grid]])                                                       \
     {                                                                                                \
         if (gid.x >= hidden || gid.y >= n_uniq) return;                                              \
-        const ulong i = (ulong)uniq[gid.y] * hidden + gid.x;                                         \
-        bank[i] = qwen35_delivered(bank[i], side[(ulong)gid.y * hidden + gid.x], add);               \
+        qwen35_deliver_into(bank[(ulong)uniq[gid.y] * hidden + gid.x], side[(ulong)gid.y * hidden + gid.x], add); \
     }
 
 QWEN35_HEAD_ROWS_TO_BANK(qwen35_head_rows_to_bank_f32, float)

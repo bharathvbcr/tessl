@@ -4,7 +4,7 @@
 #   target/release/bench_qwen35_train --bf16 512 2048            (op table)
 #   QWEN35_2B_SAFETENSORS=... target/release/bench_qwen35_train --bf16-storage --step-only --step=T [--async]
 #
-# Built at eb24de1 plus the --bf16-storage flag. Conditions: shared machine,
+# Built at eb24de1; the --bf16-storage flag landed in 682ec34. Conditions: shared machine,
 # other agent sessions' GPU work (ioreg 69-100% busy before each run) and a
 # 1-minute load average of ~21-27. The paired runs put the same load on both
 # lanes; the op table and step times are single-lane and inflated against an

@@ -1186,8 +1186,13 @@ impl Qwen35Model {
             head_in_bank,
             token_rows,
             attn_ws,
+            xf,
             ..
         } = p;
+        // The final norm's output fed the loss, which is done: released now
+        // rather than held through the backward (a [T, hidden] f32 tensor,
+        // which the layers' own then reuse).
+        drop(xf);
         let h = cfg.hidden as usize;
         if let Some((pos, g)) = dh {
             scatter_add_rows(rt, g, pos, &dxf)?;
@@ -1209,6 +1214,9 @@ impl Qwen35Model {
             cfg.rms_norm_eps,
             false,
         )?;
+        // The final norm's input and the gradient at its output are read
+        // there alone: released before the layers' backward, as `xf` was.
+        drop((resid, dxf));
         if let Some((b, add)) = bank {
             deliver(rt, &[buf_part(&final_norm)], &[buf_part(&b.final_norm)], add)?;
         }

@@ -501,6 +501,7 @@ TESSL_GEMM_TUNE=1 cargo build --release --bins
 | `bench_embedgemma2` | EmbeddingGemma 2 benchmark over ragged workloads, measuring peak device allocation and RSS. |
 | `probe_gdn_scan` | Probe of the gated-delta-net scan; `--paired` times paired 32- vs 16-column slice widths. |
 | `probe_gemm_parity` | Bit-exact verification probe comparing TensorOps against the reference SIMD path. |
+| `probe_gemm_bits` | Hashes every production GEMM entry point's output over a fixed shape grid; diff two builds' output to show a refactor kept every bit. |
 | `probe_storage_memory` | Measures parameter and optimizer memory footprint across Qwen3.5 precision variants. |
 | `probe_load_memory` | Measures model load memory and residency behavior. |
 | `bench/paired_cross_runtime.py` | Python harness driving paired `tessl` vs. PyTorch MPS / MLX evaluation. |

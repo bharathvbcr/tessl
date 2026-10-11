@@ -19,6 +19,7 @@ you changed in the kernel.**
 | `bench_nn_kernels` | `nn` kernels batched and solo, with each one's host encode per dispatch; then the host path: pipeline cache hits and a decode-style sample loop. `--host-only` skips the kernel table. |
 | `bench/paired_bins.sh` | Interleaved min-of-N across frozen binaries (`BENCH_BINS="before=.. after=.."`) for any bench printing `METRIC` lines. |
 | `probe_gdn_scan` | Gated delta net chunk scan probe; `--paired` times paired 32- vs 16-col widths. |
+| `probe_gemm_bits` | Bit snapshot of every production GEMM entry point (FNV-1a per output); diff two builds' snapshots before claiming a kernel change is bit-identical (`bench/results/gemm_coop_header_bits_m5pro.txt`). |
 | `bench/paired_cross_runtime.py` | Alternates the tessl and PyTorch/MLX lanes round by round. |
 | `bench_embedgemma2` | EmbeddingGemma 2 `encode` latency and device/process peak memory on the real checkpoint, uniform and ragged batches, JSON out. |
 | `bench_paired` | Alternates any lanes that print `bench_embedgemma2`'s JSON round by round: tessl against `bench/embedgemma2_torch.py` (sentence-transformers on MPS), or two builds of `bench_embedgemma2` for a before/after A/B. |

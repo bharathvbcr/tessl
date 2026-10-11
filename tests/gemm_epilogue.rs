@@ -371,6 +371,56 @@ fn the_epilogue_refuses_paths_with_nothing_to_fuse_into() {
     });
 }
 
+/// The refusal names the API that turns relaxed precision on and the dtypes
+/// the path takes, and reads as one line. It used to name
+/// `PrecisionMode::Relaxed`, which does not exist (`PrecisionMode` is `F32`
+/// or `Bf16`; relaxed is `GpuRuntime::set_relaxed_precision`), left f16 out,
+/// and carried two 14-space runs from a multi-line literal written without
+/// `\` continuations. `qwen35::project_residual` returns the same refusal.
+#[test]
+fn epilogue_refusals_name_the_real_precision_api_in_one_line() {
+    with_gpu(|rt| {
+        rt.set_relaxed_precision(false);
+        let (m, n, k) = (64usize, 64usize, 64usize);
+        let a = tensor(rt, &[m, k], &vec![1.0f32; m * k]);
+        let b = tensor(rt, &[k, n], &vec![1.0f32; k * n]);
+        let c = tensor(rt, &[m, n], &vec![0.0f32; m * n]);
+        let epi = Epilogue {
+            activation: Activation::Relu,
+            ..Default::default()
+        };
+        let direct = gemm_epilogue(&a, &b, &c, GemmBackend::TensorOps, epi).expect_err("exact f32");
+        let residual = tessl::qwen35::project_residual(&a, &b, &c, GemmBackend::TensorOps).expect_err("exact f32");
+        for err in [&direct, &residual] {
+            assert!(err.contains("set_relaxed_precision"), "{err}");
+            assert!(err.contains("bf16 or f16 operands"), "{err}");
+            assert!(!err.contains("PrecisionMode::Relaxed"), "{err}");
+            assert!(!err.contains("  ") && !err.contains('\n'), "whitespace run in: {err:?}");
+        }
+
+        rt.set_relaxed_precision(true);
+        let short = tensor(rt, &[n - 1], &vec![0.0f32; n - 1]);
+        let err = gemm_epilogue(
+            &a,
+            &b,
+            &c,
+            GemmBackend::TensorOps,
+            Epilogue {
+                bias: Some(&short),
+                ..Default::default()
+            },
+        )
+        .expect_err("short bias");
+        assert_eq!(
+            err,
+            format!(
+                "GEMM epilogue: bias is per-column and must hold at least N = {n} elements, got {}",
+                n - 1
+            )
+        );
+    });
+}
+
 #[test]
 fn a_short_bias_is_refused() {
     with_gpu(|rt| {

@@ -900,7 +900,10 @@ fn run_gemm_epilogue(
     let rt = a.runtime();
     if !(use_bf16 || use_f16 || use_relaxed_f32(rt, backend)) || backend != GemmBackend::TensorOps {
         return Err(
-            "GEMM epilogue needs the cooperative-destination path: bf16 operands, or f32              with PrecisionMode::Relaxed, on the TensorOps backend. The exact-f32 and              simdgroup kernels write C straight from the matmul with no register              accumulator to fuse into, so there is nothing here to make faster"
+            "GEMM epilogue needs the cooperative-destination path: bf16 or f16 operands, or f32 \
+             with GpuRuntime::set_relaxed_precision(true), on the TensorOps backend. The exact-f32 \
+             and simdgroup kernels write C straight from the matmul with no register accumulator \
+             to fuse into, so there is nothing here to make faster"
                 .into(),
         );
     }
@@ -915,7 +918,7 @@ fn run_gemm_epilogue(
         }
         if bias.numel() < n {
             return Err(format!(
-                "GEMM epilogue: bias is per-column and must hold at least N = {n}                  elements, got {}",
+                "GEMM epilogue: bias is per-column and must hold at least N = {n} elements, got {}",
                 bias.numel()
             ));
         }

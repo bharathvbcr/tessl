@@ -556,6 +556,16 @@ All notable changes to `tessl` are recorded here. The format follows
 
 ### Fixed
 
+- **The GEMM epilogue's refusal names the real precision API.** It named
+  `PrecisionMode::Relaxed`, which does not exist (relaxed f32 is
+  `GpuRuntime::set_relaxed_precision`), left out f16, and carried two
+  14-space runs from a multi-line literal without `\` continuations; the
+  short-bias refusal had one too. `qwen35::project_residual`'s doc had the
+  same wording. `epilogue_refusals_name_the_real_precision_api_in_one_line`
+  (`tests/gemm_epilogue.rs`) pins both messages. The headers of
+  `kernels/matmul_tensorops.metal` and the tune file described the
+  pre-cooperative design (64x32 tiles, C zeroed once, a 256x64 NN arm) and
+  now describe the shipped kernels.
 - **The GEMM tuning rigs are interleaved A/Bs and refuse to run without
   their kernels.** `bench_gemm_tnnt_tune` timed production for all its
   iterations before any variant, though `docs/benchmarking.md` called it

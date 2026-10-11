@@ -1,10 +1,14 @@
-// Tile-geometry A/B for the bf16 NN GEMM. Isolates two suspects behind the
-// ~2× gap vs PyTorch MPS bf16:
-//   (a) output-tile size -> arithmetic intensity  (SM*SN/(SM+SN) FLOP/byte)
-//   (b) the host-side zero_f32(C) pre-pass, which only exists because the
-//       production kernel runs multiply_accumulate on the FIRST K block too.
-// Interior-only (exact divisibility) — this is a measurement rig, not a
-// drop-in: the production kernel keeps the ragged-edge paths.
+// Measurement-only GEMM variants, linked only by `TESSL_GEMM_TUNE=1` builds
+// and timed against production by bench_gemm_tile_tune and
+// bench_gemm_tnnt_tune. The first section is the 2026-08 bf16 NN tile/BK
+// ladder, which asked whether output-tile arithmetic intensity
+// (SM*SN/(SM+SN) FLOP/byte) or the zero_f32(C) pre-pass of the then-production
+// kernel (`multiply_accumulate` on every K block, the first included) caused
+// the ~2× gap to PyTorch MPS bf16. Its answer, the cooperative destination
+// tensor, is production now: the NN, TN and NT coop kernels in
+// matmul_tensorops.metal have no pre-pass. Interior-only (exact
+// divisibility) — a measurement rig, not a drop-in: production keeps the
+// ragged-edge paths.
 
 #include <metal_stdlib>
 #include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>
@@ -16,8 +20,9 @@ inline uint2 tune_tile_from_linear(uint linear, uint tiles_n) {
     return uint2(linear % tiles_n, linear / tiles_n);
 }
 
-/// ACCUM_FIRST=true reproduces production (all blocks accumulate; C must be
-/// pre-zeroed). ACCUM_FIRST=false makes block 0 `multiply`, retiring the zero.
+/// ACCUM_FIRST=true reproduces the pre-coop production NN kernel (every block
+/// accumulates, so C must be pre-zeroed); ACCUM_FIRST=false makes block 0
+/// `multiply`, retiring the zero.
 // A call with no explicit template arguments is the control kernel
 // `mm_bf16_64x32_bk128_sg4_accf` (64×32, BK 128, sg4, accumulate-first).
 template <int SM = 64, int SN = 32, int BK = 128, int NSG = 4,
@@ -64,7 +69,7 @@ inline void mm_bf16_tune(device bfloat *A, device bfloat *B, device float *C,
         mm_bf16_tune<SM, SN, BK, NSG, ACCF>(A, B, C, M, N, K, tiles_n, tgpig); \
     }
 
-// Control: production geometry + production accumulate-first behaviour.
+// Control: the pre-coop production geometry and accumulate-first behaviour.
 kernel void mm_bf16_64x32_bk128_sg4_accf(
     device bfloat *A [[buffer(0)]],
     device bfloat *B [[buffer(1)]],

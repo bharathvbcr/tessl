@@ -1,13 +1,21 @@
-// TensorOps GEMM via Metal Performance Primitives (M5 neural accelerators).
-// Primary path for Phase 0+; requires Metal 4 / macOS 26+.
+// TensorOps GEMM via Metal Performance Primitives `matmul2d` (M5 neural
+// accelerators); requires Metal 4 / macOS 26+.
 //
-// GEMM v2 (MPP §2.3):
-//   - Morton 1D threadgroup walk (cache-friendly tile traversal)
-//   - execution_simdgroups<4> on bf16 / relaxed hot paths (64×32 TG tiles)
-//   - BK=128 cooperative K-accumulate for large K (interior tiles)
-//   - Compile-time tile extents via offset+dextents{SN,SM} (pointer tensors
-//     lack static_slice; this is the equivalent bounds-check elision)
-//   - mode::multiply still needs C zeroed once (packed with matmul on host)
+// Three kernel families:
+//   - Exact f32 (NN/TN/NT, their accumulate forms, split-K): 32x32 tiles on
+//     one simdgroup. `mode::multiply` writes into a C the host zeroes first
+//     (the zero and the matmul share one binder); the accumulate and split-K
+//     kernels use `mode::multiply_accumulate` into C instead.
+//   - Cooperative destination (bf16, f16 and relaxed-f32 NN, bf16 TN/NT and
+//     their accumulate forms, int8): the accumulator lives in registers for
+//     all of K and C is written once, so there is no zero pre-pass; an
+//     accumulate or `beta` epilogue loads C once and adds. Tiles 128x64 or
+//     64x64 on four simdgroups (host-side selection in src/gemm.rs).
+//   - bf16 split-K TN: 64x32 on four simdgroups, one `multiply_accumulate`
+//     dispatch per 256-wide K partition into a zeroed C.
+// Tiles are walked by `tile_from_linear` (Morton order on square
+// power-of-two grids, row-major otherwise) or, for a large B operand, by
+// `tile_walk`'s column panels.
 //
 // Note: device pointers must be non-const — `const` poisons MPP type matching.
 
@@ -563,9 +571,11 @@ kernel void matmul2d_tensorops_tn_splitk_bf16_f32(
 // the host zero_f32(C) pre-pass (every in-bounds element is overwritten).
 // Edge tiles run the same coop path over origin-shifted full-extent slices,
 // which bounds-check per the MPPTensorOpsMatMul2d.h cooperative example.
-// Geometry is selected host-side (gemm.rs nn_coop_kernel): 128×64 sg4
-// default, 64×64 sg4 for narrow N, 256×64 sg8 for ≥4096² squares with
-// K ≥ 2048. Register cost of the accumulator is SM*SN*4/(32*NSG) B/thread.
+// Geometry is selected host-side (gemm.rs nn_coop_kernel): 128×64 sg4 by
+// default, 64×64 sg4 when N ≤ 512 or, for bf16, when M does not fill a
+// 128-row tile. (A 256×64 sg8 arm for large squares was measured and retired;
+// bench/results/bf16_tile_tune_FINDINGS.md.) Register cost of the
+// accumulator is SM*SN*4/(32*NSG) B/thread.
 // =============================================================================
 
 /// Activation applied by a fused GEMM epilogue.

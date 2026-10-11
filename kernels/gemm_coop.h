@@ -371,14 +371,15 @@ inline void mm_coop(device ElemT *A, device ElemT *B, device float *C,
 
 /// `C (+)= A @ B` exact f32, `TRANS_A` / `TRANS_B` for TN / NT, `ACCUMULATE`
 /// for `multiply_accumulate`, the tile order from `Walk` (production:
-/// `walk_by_b`). `use_interior` (host `TESSL_GEMM_INTERIOR=1`)
-/// takes interior tiles through offset pointer tensors, which measured slower
-/// on M5 Pro f32 training shapes; otherwise every tile takes the slice path.
+/// `walk_by_b`). Every tile takes the bounds-checked slice path: offset
+/// pointer tensors for interior tiles (`TESSL_GEMM_INTERIOR`) measured
+/// 0.99-1.01x on the Qwen3.5-2B training shapes and were retired
+/// (bench/results/gemm_interior_m5pro.txt).
 template <bool TRANS_A, bool TRANS_B, bool ACCUMULATE, int SM, int SN,
           typename Walk = walk_by_b>
 inline void mm_exact_f32(device float *A, device float *B, device float *C,
                          uint M, uint N, uint K, uint tiles_n, uint tiles_m,
-                         uint use_interior, uint tgpig) {
+                         uint tgpig) {
     constexpr auto desc = matmul2d_descriptor(
         SM, SN, dynamic_length_v<int>, TRANS_A, TRANS_B, false,
         ACCUMULATE ? matmul2d_descriptor::mode::multiply_accumulate
@@ -390,18 +391,10 @@ inline void mm_exact_f32(device float *A, device float *B, device float *C,
     int tx = (int)tile.x * SN;
     int ty = (int)tile.y * SM;
 
-    bool interior = use_interior && (tx + SN <= (int)N) && (ty + SM <= (int)M);
-    if (interior) {
-        auto tA = gemm_a<TRANS_A>::template interior<SM>(A, (int)M, (int)K, ty);
-        auto tB = gemm_b<TRANS_B>::template interior<SN>(B, (int)N, (int)K, tx);
-        auto tC = gemm_c_interior<SM, SN>(C, (int)N, tx, ty, (int)N);
-        op.run(tA, tB, tC);
-    } else {
-        auto tA = gemm_a<TRANS_A>::edge(A, (int)M, (int)K, ty);
-        auto tB = gemm_b<TRANS_B>::edge(B, (int)N, (int)K, tx);
-        auto tC = gemm_c_edge(C, (int)M, (int)N, tx, ty, (int)N);
-        op.run(tA, tB, tC);
-    }
+    auto tA = gemm_a<TRANS_A>::edge(A, (int)M, (int)K, ty);
+    auto tB = gemm_b<TRANS_B>::edge(B, (int)N, (int)K, tx);
+    auto tC = gemm_c_edge(C, (int)M, (int)N, tx, ty, (int)N);
+    op.run(tA, tB, tC);
 }
 
 #endif

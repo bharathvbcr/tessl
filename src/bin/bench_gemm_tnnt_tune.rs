@@ -43,8 +43,6 @@ struct Variant {
     nsg: usize,
     /// Kernel takes tiles_m at buffer(7) (swizzle signature).
     binds_tiles_m: bool,
-    /// An exact-f32 production kernel's `use_interior` at buffer(8).
-    interior: Option<u32>,
     /// Zero C first in the same binder, as production does for the
     /// exact-f32 `mode::multiply` kernels.
     zero_first: bool,
@@ -89,9 +87,6 @@ fn dispatch_variant(
         if v.binds_tiles_m {
             bnd.bind_u32(tiles_m as u32, 7);
         }
-        if let Some(interior) = v.interior {
-            bnd.bind_u32(interior, 8);
-        }
         bnd.dispatch(mtl_size(tg, 1, 1), mtl_size(tpt, 1, 1));
         Ok(())
     })
@@ -125,8 +120,8 @@ enum Lane {
     NtAccPanel,
     /// The exact-f32 kernels on f32 operands: production through `gemm`,
     /// `gemm_tn_f32`, `gemm_nt_f32` and `GemmOperands::ExactF32`'s
-    /// accumulates, against the production kernel dispatched raw with
-    /// `use_interior` 0 and 1 (`TESSL_GEMM_INTERIOR`).
+    /// accumulates, against the production kernel dispatched raw in one
+    /// dispatch (production may split K).
     NnF32,
     TnF32,
     NtF32,
@@ -301,7 +296,6 @@ fn variant(kernel: &'static str, sm: usize, sn: usize, binds_tiles_m: bool) -> V
         sn,
         nsg: 4,
         binds_tiles_m,
-        interior: None,
         zero_first: false,
     }
 }
@@ -315,21 +309,19 @@ fn exact_f32_walk(kernel: &'static str) -> Variant {
         sn: 32,
         nsg: 1,
         binds_tiles_m: true,
-        interior: None,
         zero_first: true,
     }
 }
 
-/// An exact-f32 production kernel dispatched raw with `use_interior` set:
-/// 32x32 tiles on one simdgroup, C zeroed first unless it accumulates.
-fn exact_f32(kernel: &'static str, interior: u32, accumulates: bool) -> Variant {
+/// An exact-f32 production kernel dispatched raw in one dispatch: 32x32
+/// tiles on one simdgroup, C zeroed first unless it accumulates.
+fn exact_f32(kernel: &'static str, accumulates: bool) -> Variant {
     Variant {
         kernel,
         sm: 32,
         sn: 32,
         nsg: 1,
         binds_tiles_m: true,
-        interior: Some(interior),
         zero_first: !accumulates,
     }
 }
@@ -424,7 +416,7 @@ fn main() -> Result<(), String> {
         (Lane::NtF32, 2048, 2048, 4096, "f32nt_morton_sq64"),
         (Lane::TnF32, 2048, 2048, 4096, "f32tn_morton_sq64"),
         (Lane::NtF32, 4096, 16384, 768, "f32nt_vocab_16384"),
-        // `TESSL_GEMM_INTERIOR` at the Qwen3.5-2B training shapes (T = 2048,
+        // The exact-f32 kernels at the Qwen3.5-2B training shapes (T = 2048,
         // hidden 2048, MLP 6144): forward NN (up/gate, down, a square
         // projection), the weight gradients (TN) and input gradients (NT),
         // and the accumulate forms the backward adds into banks with.
@@ -526,7 +518,6 @@ fn main() -> Result<(), String> {
             sn: 64,
             nsg: 4,
             binds_tiles_m: true,
-            interior: None,
             zero_first: false,
         },
         Variant {
@@ -535,7 +526,6 @@ fn main() -> Result<(), String> {
             sn: 64,
             nsg: 4,
             binds_tiles_m: true,
-            interior: None,
             zero_first: false,
         },
         Variant {
@@ -544,7 +534,6 @@ fn main() -> Result<(), String> {
             sn: 64,
             nsg: 8,
             binds_tiles_m: true,
-            interior: None,
             zero_first: false,
         },
     ];
@@ -555,7 +544,6 @@ fn main() -> Result<(), String> {
             sn: 64,
             nsg: 4,
             binds_tiles_m: false,
-            interior: None,
             zero_first: false,
         },
         Variant {
@@ -564,7 +552,6 @@ fn main() -> Result<(), String> {
             sn: 64,
             nsg: 4,
             binds_tiles_m: false,
-            interior: None,
             zero_first: false,
         },
     ];
@@ -575,7 +562,6 @@ fn main() -> Result<(), String> {
             sn: 64,
             nsg: 4,
             binds_tiles_m: false,
-            interior: None,
             zero_first: false,
         },
         Variant {
@@ -584,7 +570,6 @@ fn main() -> Result<(), String> {
             sn: 64,
             nsg: 4,
             binds_tiles_m: false,
-            interior: None,
             zero_first: false,
         },
         Variant {
@@ -593,7 +578,6 @@ fn main() -> Result<(), String> {
             sn: 128,
             nsg: 4,
             binds_tiles_m: false,
-            interior: None,
             zero_first: false,
         },
         Variant {
@@ -602,7 +586,6 @@ fn main() -> Result<(), String> {
             sn: 128,
             nsg: 4,
             binds_tiles_m: false,
-            interior: None,
             zero_first: false,
         },
         Variant {
@@ -611,7 +594,6 @@ fn main() -> Result<(), String> {
             sn: 128,
             nsg: 8,
             binds_tiles_m: false,
-            interior: None,
             zero_first: false,
         },
         Variant {
@@ -620,7 +602,6 @@ fn main() -> Result<(), String> {
             sn: 64,
             nsg: 8,
             binds_tiles_m: false,
-            interior: None,
             zero_first: false,
         },
         Variant {
@@ -629,7 +610,6 @@ fn main() -> Result<(), String> {
             sn: 256,
             nsg: 8,
             binds_tiles_m: false,
-            interior: None,
             zero_first: false,
         },
         Variant {
@@ -638,7 +618,6 @@ fn main() -> Result<(), String> {
             sn: 256,
             nsg: 8,
             binds_tiles_m: false,
-            interior: None,
             zero_first: false,
         },
         Variant {
@@ -647,7 +626,6 @@ fn main() -> Result<(), String> {
             sn: 128,
             nsg: 8,
             binds_tiles_m: false,
-            interior: None,
             zero_first: false,
         },
         Variant {
@@ -656,7 +634,6 @@ fn main() -> Result<(), String> {
             sn: 64,
             nsg: 4,
             binds_tiles_m: false,
-            interior: None,
             zero_first: false,
         },
         Variant {
@@ -665,7 +642,6 @@ fn main() -> Result<(), String> {
             sn: 32,
             nsg: 8,
             binds_tiles_m: false,
-            interior: None,
             zero_first: false,
         },
         Variant {
@@ -674,7 +650,6 @@ fn main() -> Result<(), String> {
             sn: 32,
             nsg: 8,
             binds_tiles_m: false,
-            interior: None,
             zero_first: false,
         },
         Variant {
@@ -683,7 +658,6 @@ fn main() -> Result<(), String> {
             sn: 64,
             nsg: 8,
             binds_tiles_m: false,
-            interior: None,
             zero_first: false,
         },
         Variant {
@@ -692,7 +666,6 @@ fn main() -> Result<(), String> {
             sn: 64,
             nsg: 16,
             binds_tiles_m: false,
-            interior: None,
             zero_first: false,
         },
         Variant {
@@ -701,7 +674,6 @@ fn main() -> Result<(), String> {
             sn: 32,
             nsg: 16,
             binds_tiles_m: false,
-            interior: None,
             zero_first: false,
         },
     ];
@@ -712,7 +684,6 @@ fn main() -> Result<(), String> {
             sn: 64,
             nsg: 4,
             binds_tiles_m: true,
-            interior: None,
             zero_first: false,
         },
         Variant {
@@ -721,7 +692,6 @@ fn main() -> Result<(), String> {
             sn: 64,
             nsg: 4,
             binds_tiles_m: false,
-            interior: None,
             zero_first: false,
         },
     ];
@@ -732,7 +702,6 @@ fn main() -> Result<(), String> {
             sn: 64,
             nsg: 4,
             binds_tiles_m: true,
-            interior: None,
             zero_first: false,
         },
         Variant {
@@ -741,14 +710,14 @@ fn main() -> Result<(), String> {
             sn: 64,
             nsg: 4,
             binds_tiles_m: false,
-            interior: None,
             zero_first: false,
         },
     ];
 
-    // `TESSL_GEMM_INTERIOR`: each exact-f32 production kernel with its
-    // interior-offset branch off (the default) and on.
-    let pair = |kernel: &'static str, acc: bool| [exact_f32(kernel, 0, acc), exact_f32(kernel, 1, acc)];
+    // Each exact-f32 production kernel raw, in one dispatch. (These lanes
+    // decided `TESSL_GEMM_INTERIOR`, with a second arm per kernel that set
+    // the retired interior branch: bench/results/gemm_interior_m5pro.txt.)
+    let pair = |kernel: &'static str, acc: bool| [exact_f32(kernel, acc)];
     let f32_nn_variants = pair("matmul2d_tensorops_f32", false);
     let f32_tn_variants = pair("matmul2d_tensorops_tn_f32", false);
     let f32_nt_variants = pair("matmul2d_tensorops_nt_f32", false);
@@ -764,7 +733,7 @@ fn main() -> Result<(), String> {
     let walk_tnacc_variants = [variant("mm_bf16_tn_accum_coop_64x64_sg4_walkg", 64, 64, true)];
     let walk_ntacc_variants = [variant("mm_bf16_nt_accum_coop_64x64_sg4_walkg", 64, 64, true)];
     let f32_walk_variants = [
-        exact_f32("matmul2d_tensorops_f32", 0, false),
+        exact_f32("matmul2d_tensorops_f32", false),
         exact_f32_walk("mm_f32_exact_32x32_linear"),
         exact_f32_walk("mm_f32_exact_32x32_rowmajor"),
         exact_f32_walk("mm_f32_exact_32x32_ph8"),

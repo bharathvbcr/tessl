@@ -1,15 +1,15 @@
-//! The accumulate kernels behind `gemm_{tn,nt}_accum_train`, and the
-//! interior-offset branch under the flag that selects it.
+//! The accumulate kernels behind `gemm_{tn,nt}_accum_train`, and the retired
+//! interior-offset flag.
 //!
 //! `gemm_{tn,nt}_accum_train` took a temp-plus-`add_inplace_f32` fallback
 //! unless `TESSL_GEMM_ACCUM` / `TESSL_GEMM_ACCUM_DX` were set, while
 //! `GemmOperands::{tn_acc, nt_acc}` ran the accumulate kernels with no flag.
 //! The flags are retired: one path, pinned here bit for bit against
-//! `GemmOperands`. `TESSL_GEMM_INTERIOR` defaults off and latches on first
-//! read, so with the default environment the `use_interior` branch of the
-//! exact-f32 kernels is dead.
+//! `GemmOperands`. `TESSL_GEMM_INTERIOR` selected an interior-offset branch
+//! of the exact-f32 kernels; it measured no faster and is retired, pinned
+//! here as changing no output bit.
 //!
-//! The flag is process-global and the environment cannot be mutated safely
+//! The flags were process-global and the environment cannot be mutated safely
 //! under a concurrent `getenv`, so each configuration re-runs its own test in
 //! a child process with the variables set, filtered to itself and
 //! single-threaded. The child checks numbers against an f64 reference and,
@@ -29,15 +29,16 @@ use tessl::{gemm_f32, GemmBackend, GpuRuntime, PrecisionMode};
 const CHILD_ENV: &str = "TESSL_GEMM_FLAG_PATHS_CHILD";
 
 /// Re-run `test_name` in a child process with `vars` set; the child body is
-/// `body`. Returns in the parent after asserting the child passed.
-fn in_child(test_name: &str, vars: &[(&str, &str)], body: impl FnOnce()) {
+/// `body`. In the parent, returns the child's stdout after asserting it
+/// passed; in the child, `None`.
+fn in_child(test_name: &str, vars: &[(&str, &str)], body: impl FnOnce()) -> Option<String> {
     if std::env::var_os(CHILD_ENV).is_some() {
         body();
-        return;
+        return None;
     }
     let exe = std::env::current_exe().expect("test binary path");
     let mut cmd = std::process::Command::new(exe);
-    cmd.args(["--exact", "--test-threads=1", test_name])
+    cmd.args(["--exact", "--test-threads=1", "--nocapture", test_name])
         .env(CHILD_ENV, "1")
         .env("TESSL_KERNEL_TRACE", "1");
     for (k, v) in vars {
@@ -55,6 +56,7 @@ fn in_child(test_name: &str, vars: &[(&str, &str)], body: impl FnOnce()) {
         stdout.contains("1 passed"),
         "child ran no test (filter out of sync with {test_name}?):\n{stdout}"
     );
+    Some(stdout)
 }
 
 fn operand_shapes(layout: Layout, m: usize, n: usize, k: usize) -> ([usize; 2], [usize; 2]) {
@@ -300,78 +302,115 @@ fn accumulate_kernels_take_views_on_any_16_byte_boundary() {
     });
 }
 
-/// `TESSL_GEMM_INTERIOR=1` (the f32 accumulate kernels take their interior
-/// branch too): every exact-f32 kernel on a shape whose tiles are all
-/// interior and on a ragged one where only some are.
+/// Every exact-f32 output on all-interior, partly-edge and column-panel
+/// shapes, NN / TN / NT and their accumulates, each checked against the f64
+/// reference, as `(label, FNV-1a of the output's bits)`.
+fn exact_f32_outputs(rt: &Arc<GpuRuntime>) -> Vec<(String, u64)> {
+    let hash = |c: &[f32]| {
+        c.iter()
+            .flat_map(|x| x.to_bits().to_le_bytes())
+            .fold(0xcbf2_9ce4_8422_2325u64, |h, b| {
+                (h ^ b as u64).wrapping_mul(0x0100_0000_01b3)
+            })
+    };
+    rt.set_precision(PrecisionMode::F32);
+    let mut out = Vec::new();
+    // 32x32 tiles: 256x256 is all interior, 96x48 is partly edge.
+    let small = [(256usize, 256usize, 128usize), (96, 48, 64), (64, 160, 32)];
+    for (panel, &(m, n, k)) in small
+        .iter()
+        .map(|s| (false, s))
+        .chain(F32_PANEL_SHAPES.iter().map(|s| (true, s)))
+    {
+        for layout in [Layout::Nn, Layout::Tn, Layout::Nt] {
+            let (a_shape, b_shape) = operand_shapes(layout, m, n, k);
+            let (a_host, b_host, expect) = if panel {
+                rank_one_case(layout, m, n, k, 0x3ed ^ (m + n) as u64)
+            } else {
+                let a_host = random_f32(m * k, 0x1ed ^ (m * 7 + k) as u64);
+                let b_host = random_f32(k * n, 0x2ed ^ (n * 5 + k) as u64);
+                let expect = reference(layout, &a_host, &b_host, m, n, k);
+                (a_host, b_host, expect)
+            };
+            let a = tensor_f32(rt, &a_shape, &a_host);
+            let b = tensor_f32(rt, &b_shape, &b_host);
+            let c = rt.alloc_tensor_f32(&[m, n]).unwrap();
+            match layout {
+                Layout::Nn => gemm_f32(&a, &b, &c, GemmBackend::TensorOps),
+                Layout::Tn => gemm_tn_f32(&a, &b, &c, GemmBackend::TensorOps),
+                Layout::Nt => gemm_nt_f32(&a, &b, &c, GemmBackend::TensorOps),
+            }
+            .unwrap();
+            rt.synchronize().unwrap();
+            let label = format!("f32 {layout:?} {m}x{n}x{k}");
+            let got = c.buffer.read_f32();
+            assert_within_bound(&label, &got, &expect, k, 0.0);
+            out.push((label, hash(&got[..m * n])));
+
+            // The accumulate kernel onto a fixed C0.
+            let c0 = random_f32(m * n, 0x4ed ^ (m * n) as u64);
+            let acc = tensor_f32(rt, &[m, n], &c0);
+            match layout {
+                Layout::Nn => GemmOperands::ExactF32.nn_acc(&a, &b, &acc),
+                Layout::Tn => GemmOperands::ExactF32.tn_acc(&a, &b, &acc),
+                Layout::Nt => GemmOperands::ExactF32.nt_acc(&a, &b, &acc),
+            }
+            .unwrap();
+            rt.synchronize().unwrap();
+            let label = format!("f32 accumulate {layout:?} {m}x{n}x{k}");
+            let got = acc.buffer.read_f32();
+            assert_within_bound(&label, &got, &with_previous(expect, &c0), k, 0.0);
+            out.push((label, hash(&got[..m * n])));
+        }
+    }
+    out
+}
+
+/// `TESSL_GEMM_INTERIOR` selected an interior-offset branch in the exact-f32
+/// kernels until it measured 0.99-1.01x and was retired
+/// (bench/results/gemm_interior_m5pro.txt). Set, in any of its spellings, it
+/// must change no output bit: a child process with it on computes every
+/// exact-f32 output, and the parent, with it unset, must get the same bits.
 #[test]
-fn exact_f32_kernels_agree_with_the_reference_on_the_interior_branch() {
-    in_child(
-        "exact_f32_kernels_agree_with_the_reference_on_the_interior_branch",
-        &[("TESSL_GEMM_INTERIOR", "1")],
-        || {
-            with_gpu(|rt| {
-                if !rt.has_tensorops() {
-                    return;
-                }
-                rt.set_precision(PrecisionMode::F32);
-                // 32x32 tiles: 256x256 is all interior, 96x48 is partly edge.
-                for &(m, n, k) in &[(256usize, 256usize, 128usize), (96, 48, 64), (64, 160, 32)] {
-                    for layout in [Layout::Nn, Layout::Tn, Layout::Nt] {
-                        let (a_shape, b_shape) = operand_shapes(layout, m, n, k);
-                        let a_host = random_f32(m * k, 0x1ed ^ (m * 7 + k) as u64);
-                        let b_host = random_f32(k * n, 0x2ed ^ (n * 5 + k) as u64);
-                        let expect = reference(layout, &a_host, &b_host, m, n, k);
-                        let a = tensor_f32(rt, &a_shape, &a_host);
-                        let b = tensor_f32(rt, &b_shape, &b_host);
-                        let c = rt.alloc_tensor_f32(&[m, n]).unwrap();
-                        match layout {
-                            Layout::Nn => gemm_f32(&a, &b, &c, GemmBackend::TensorOps),
-                            Layout::Tn => gemm_tn_f32(&a, &b, &c, GemmBackend::TensorOps),
-                            Layout::Nt => gemm_nt_f32(&a, &b, &c, GemmBackend::TensorOps),
-                        }
-                        .unwrap();
-                        rt.synchronize().unwrap();
-                        assert_within_bound(
-                            &format!("interior f32 {layout:?} {m}x{n}x{k}"),
-                            &c.buffer.read_f32(),
-                            &expect,
-                            k,
-                            0.0,
-                        );
-                    }
-                    check_accum(rt, Layout::Tn, false, m, n, k);
-                    check_accum(rt, Layout::Nt, false, m, n, k);
-                }
-                // The interior branch under the column-panel walk.
-                for &(m, n, k) in F32_PANEL_SHAPES {
-                    for layout in [Layout::Nn, Layout::Tn, Layout::Nt] {
-                        let (a_shape, b_shape) = operand_shapes(layout, m, n, k);
-                        let (a_host, b_host, expect) = rank_one_case(layout, m, n, k, 0x3ed ^ (m + n) as u64);
-                        let a = tensor_f32(rt, &a_shape, &a_host);
-                        let b = tensor_f32(rt, &b_shape, &b_host);
-                        let c = rt.alloc_tensor_f32(&[m, n]).unwrap();
-                        match layout {
-                            Layout::Nn => gemm_f32(&a, &b, &c, GemmBackend::TensorOps),
-                            Layout::Tn => gemm_tn_f32(&a, &b, &c, GemmBackend::TensorOps),
-                            Layout::Nt => gemm_nt_f32(&a, &b, &c, GemmBackend::TensorOps),
-                        }
-                        .unwrap();
-                        rt.synchronize().unwrap();
-                        assert_within_bound(
-                            &format!("interior f32 {layout:?} panel walk {m}x{n}x{k}"),
-                            &c.buffer.read_f32(),
-                            &expect,
-                            k,
-                            0.0,
-                        );
-                    }
-                    check_accum_panel(rt, Layout::Tn, m, n, k);
-                    check_accum_panel(rt, Layout::Nt, m, n, k);
-                }
-                assert_traced("matmul2d_tensorops_f32");
-                assert_traced("matmul2d_tensorops_tn_accum_f32");
-                assert_traced("matmul2d_tensorops_nt_accum_f32");
-            });
-        },
+fn the_retired_interior_flag_changes_no_exact_f32_output() {
+    const NAME: &str = "the_retired_interior_flag_changes_no_exact_f32_output";
+    let vars = [
+        ("TESSL_GEMM_INTERIOR", "1"),
+        ("METAL_RUNTIME_GEMM_INTERIOR", "1"),
+        ("METAL_NATIVE_GEMM_INTERIOR", "1"),
+    ];
+    let child = in_child(NAME, &vars, || {
+        with_gpu(|rt| {
+            if !rt.has_tensorops() {
+                return;
+            }
+            for (label, h) in exact_f32_outputs(rt) {
+                println!("BITS {label}: {h:016x}");
+            }
+        })
+    });
+    let Some(stdout) = child else { return };
+    // libtest prints `test NAME ... ` before the child's own output, so the
+    // first line can carry that prefix.
+    let with_flag: Vec<&str> = stdout
+        .lines()
+        .filter_map(|l| l.find("BITS ").map(|at| &l[at + 5..]))
+        .collect();
+    let without: Vec<String> = with_gpu(|rt| {
+        if !rt.has_tensorops() {
+            return Vec::new();
+        }
+        exact_f32_outputs(rt)
+            .into_iter()
+            .map(|(l, h)| format!("{l}: {h:016x}"))
+            .collect()
+    });
+    assert_eq!(
+        with_flag.len(),
+        without.len(),
+        "the child computed a different set of outputs"
     );
+    for (w, wo) in with_flag.iter().zip(&without) {
+        assert_eq!(w, wo, "TESSL_GEMM_INTERIOR=1 changed an output");
+    }
 }

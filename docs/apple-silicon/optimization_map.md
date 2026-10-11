@@ -647,7 +647,7 @@ cargo run --release --bin train -- --bench --bench-steps 20 --f32
 # Soft ladder (default): EMA ~2.050
 # Soft quality: METAL_NATIVE_FA_TILED=1 → EMA ~2.037 (~69 ms)
 # Speed A/B: METAL_NATIVE_GEMM_ACCUM=1 → ~211 binders (Soft regresses)
-# Other: METAL_NATIVE_MUON_SG=0 | METAL_NATIVE_GEMM_INTERIOR=1
+# Other: METAL_NATIVE_MUON_SG=0 | METAL_NATIVE_GEMM_INTERIOR=1 (retired in tessl 2026-10-11)
 #         METAL_NATIVE_HAZARD_BARRIERS=1 (NaNs — do not default)
 ```
 

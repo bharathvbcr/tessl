@@ -51,12 +51,11 @@
                      constant uint &K [[buffer(5)]],                           \
                      constant uint &tiles_n [[buffer(6)]],                     \
                      constant uint &tiles_m [[buffer(7)]],                     \
-                     constant uint &use_interior [[buffer(8)]],                \
                      uint tgpig [[threadgroup_position_in_grid]]) {            \
         static_assert(NSG == 1, "the exact-f32 body runs on one simdgroup");  \
         mm_exact_f32<EXACT_F32_TRANS_A_##LAYOUT, EXACT_F32_TRANS_B_##LAYOUT,   \
                      EXACT_F32_MODE_##MODE, SM, SN>(                           \
-            A, B, C, M, N, K, tiles_n, tiles_m, use_interior, tgpig);          \
+            A, B, C, M, N, K, tiles_n, tiles_m, tgpig);                        \
     }
 
 EXACT_F32_KERNEL(matmul2d_tensorops_f32,          NN, 32, 32, 1, MULTIPLY)

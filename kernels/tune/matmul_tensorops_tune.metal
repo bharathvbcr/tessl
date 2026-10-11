@@ -447,7 +447,7 @@ TUNE_WALK_KERNEL(mm_bf16_nt_accum_coop_64x64_sg4_walkg, bfloat, 64, 64, 4, false
                      constant uint &tiles_m [[buffer(7)]],                     \
                      uint tgpig [[threadgroup_position_in_grid]]) {            \
         mm_exact_f32<false, false, false, 32, 32, WALK>(                       \
-            A, B, C, M, N, K, tiles_n, tiles_m, 0u, tgpig);                    \
+            A, B, C, M, N, K, tiles_n, tiles_m, tgpig);                        \
     }
 
 TUNE_EXACT_F32_KERNEL(mm_f32_exact_32x32_linear,   walk_linear);

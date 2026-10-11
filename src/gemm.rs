@@ -1148,8 +1148,6 @@ fn dispatch_tensorops_nn(
         bnd.bind_u32(k as u32, 5);
         bnd.bind_u32(tiles_n as u32, 6);
         bnd.bind_u32(tiles_m as u32, 7);
-        // f32 exact NN/TN/NT read buffer(8); bf16/relaxed ignore extra bind.
-        bnd.bind_u32(if crate::ab_flags::gemm_interior_offsets() { 1 } else { 0 }, 8);
         bnd.dispatch(mtl_size(tg, 1, 1), mtl_size(tpt, 1, 1));
         Ok(())
     })
@@ -1181,7 +1179,6 @@ fn dispatch_tensorops_accum(
     n: usize,
     k: usize,
     tile: TileGeom,
-    bind_interior: bool,
 ) -> Result<(), String> {
     let tiles_n = n.div_ceil(tile.sn);
     let tiles_m = m.div_ceil(tile.sm);
@@ -1198,9 +1195,6 @@ fn dispatch_tensorops_accum(
         bnd.bind_u32(k as u32, 5);
         bnd.bind_u32(tiles_n as u32, 6);
         bnd.bind_u32(tiles_m as u32, 7);
-        if bind_interior {
-            bnd.bind_u32(if crate::ab_flags::gemm_interior_offsets() { 1 } else { 0 }, 8);
-        }
         bnd.dispatch(mtl_size(tg, 1, 1), mtl_size(tpt, 1, 1));
         Ok(())
     })
@@ -1814,26 +1808,13 @@ fn tn_accum(
             return gemm_tn_splitk_bf16_opts(&a, &b, c, k, /*zero_first=*/ false);
         }
         let pipeline = rt.pipeline("matmul2d_tensorops_tn_accum_bf16_f32")?;
-        return dispatch_tensorops_accum(
-            rt,
-            &pipeline,
-            &a,
-            &b,
-            c,
-            m,
-            n,
-            k,
-            TILE_COOP_ACCUM,
-            /*bind_interior=*/ false,
-        );
+        return dispatch_tensorops_accum(rt, &pipeline, &a, &b, c, m, n, k, TILE_COOP_ACCUM);
     }
     if prefer_tn_splitk(m, n, k) {
         return gemm_tn_splitk_f32_opts(a_km, b_kn, c, k, /*zero_first=*/ false);
     }
     let pipeline = rt.pipeline("matmul2d_tensorops_tn_accum_f32")?;
-    dispatch_tensorops_accum(
-        rt, &pipeline, a_km, b_kn, c, m, n, k, TILE_F32, /*bind_interior=*/ true,
-    )
+    dispatch_tensorops_accum(rt, &pipeline, a_km, b_kn, c, m, n, k, TILE_F32)
 }
 
 /// `C += A[M,K] @ B[N,K]^T` on the accumulate kernels, as [`tn_accum`].
@@ -1848,23 +1829,10 @@ fn nt_accum(
     if bf16 {
         let (a, b) = (ensure_bf16(a_mk)?, ensure_bf16(b_nk)?);
         let pipeline = rt.pipeline("matmul2d_tensorops_nt_accum_bf16_f32")?;
-        return dispatch_tensorops_accum(
-            rt,
-            &pipeline,
-            &a,
-            &b,
-            c,
-            m,
-            n,
-            k,
-            TILE_COOP_ACCUM,
-            /*bind_interior=*/ false,
-        );
+        return dispatch_tensorops_accum(rt, &pipeline, &a, &b, c, m, n, k, TILE_COOP_ACCUM);
     }
     let pipeline = rt.pipeline("matmul2d_tensorops_nt_accum_f32")?;
-    dispatch_tensorops_accum(
-        rt, &pipeline, a_mk, b_nk, c, m, n, k, TILE_F32, /*bind_interior=*/ true,
-    )
+    dispatch_tensorops_accum(rt, &pipeline, a_mk, b_nk, c, m, n, k, TILE_F32)
 }
 
 /// `C += A[M,K] @ B[K,N]`, C not zeroed: exact f32 on the NN accumulate
@@ -1902,7 +1870,7 @@ fn nn_accum(a: &Tensor, b: &Tensor, c: &Tensor, (m, n, k): (usize, usize, usize)
         );
     }
     let pipeline = rt.pipeline("matmul2d_tensorops_nn_accum_f32")?;
-    dispatch_tensorops_accum(rt, &pipeline, a, b, c, m, n, k, TILE_F32, /*bind_interior=*/ true)
+    dispatch_tensorops_accum(rt, &pipeline, a, b, c, m, n, k, TILE_F32)
 }
 
 /// `C += A[K,M]^T @ B[K,N]` (TN accumulate), C not zeroed, on the accumulate
@@ -3255,20 +3223,20 @@ mod stress_tests {
                 Layout::TN => a.shape[0],
                 _ => a.shape[1],
             };
-            let accum = |kernel: &str, interior: bool| {
+            let accum = |kernel: &str| {
                 let p = rt.pipeline(kernel).unwrap();
-                dispatch_tensorops_accum(rt, &p, a, b, c, m, n, k, self.tile(), interior).unwrap();
+                dispatch_tensorops_accum(rt, &p, a, b, c, m, n, k, self.tile()).unwrap();
             };
             match self {
                 Self::NtBf16 => gemm_nt_bf16(a, b, c).unwrap(),
                 Self::TnBf16 => gemm_tn_bf16(a, b, c).unwrap(),
-                Self::NtAccumBf16 => accum("matmul2d_tensorops_nt_accum_bf16_f32", false),
-                Self::TnAccumBf16 => accum("matmul2d_tensorops_tn_accum_bf16_f32", false),
+                Self::NtAccumBf16 => accum("matmul2d_tensorops_nt_accum_bf16_f32"),
+                Self::TnAccumBf16 => accum("matmul2d_tensorops_tn_accum_bf16_f32"),
                 Self::NnF32 => gemm_f32(a, b, c, GemmBackend::TensorOps).unwrap(),
                 Self::NtF32 => gemm_nt_f32(a, b, c, GemmBackend::TensorOps).unwrap(),
                 Self::TnF32 => gemm_tn_f32(a, b, c, GemmBackend::TensorOps).unwrap(),
-                Self::NtAccumF32 => accum("matmul2d_tensorops_nt_accum_f32", true),
-                Self::TnAccumF32 => accum("matmul2d_tensorops_tn_accum_f32", true),
+                Self::NtAccumF32 => accum("matmul2d_tensorops_nt_accum_f32"),
+                Self::TnAccumF32 => accum("matmul2d_tensorops_tn_accum_f32"),
             }
         }
     }
@@ -3755,7 +3723,7 @@ mod alignment_probe {
             Probe::ExactNn => dispatch_tensorops_nn(rt, &p, &a, &b, &c, m, n, k, TILE_F32)?,
             Probe::ExactTn | Probe::ExactNt => dispatch_tensorops_tn_nt(rt, &p, &a, &b, &c, m, n, k, TILE_F32)?,
             Probe::ExactTnAccum | Probe::ExactNtAccum => {
-                dispatch_tensorops_accum(rt, &p, &a, &b, &c, m, n, k, TILE_F32, true)?
+                dispatch_tensorops_accum(rt, &p, &a, &b, &c, m, n, k, TILE_F32)?
             }
             Probe::Simdgroup => dispatch_simdgroup(rt, &a, &b, &c, m, n, k)?,
             Probe::CoopNn(e, t) => dispatch_tensorops_nn_coop(rt, &p, &a, &b, &c, m, n, k, nn_coop_kernel_for(e, t).1)?,
@@ -3763,7 +3731,7 @@ mod alignment_probe {
                 dispatch_tensorops_nn_coop(rt, &p, &a, &b, &c, m, n, k, TILE_COOP_TN_NT)?
             }
             Probe::CoopTnAccumBf16 | Probe::CoopNtAccumBf16 => {
-                dispatch_tensorops_accum(rt, &p, &a, &b, &c, m, n, k, TILE_COOP_ACCUM, false)?
+                dispatch_tensorops_accum(rt, &p, &a, &b, &c, m, n, k, TILE_COOP_ACCUM)?
             }
             Probe::Epilogue(_) => {
                 let epi = Epilogue {

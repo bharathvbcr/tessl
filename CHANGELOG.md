@@ -145,6 +145,15 @@ All notable changes to `tessl` are recorded here. The format follows
 
 ### Changed
 
+- **`TESSL_GEMM_INTERIOR` is retired.** It sent the exact-f32 kernels'
+  interior tiles through offset pointer tensors; interleaved on the
+  Qwen3.5-2B training shapes, that ran at 0.99-1.01x of the slice path every
+  tile takes by default (`bench/results/gemm_interior_m5pro.txt`). The
+  branch, the kernels' `buffer(8)` argument and the variable (with its
+  `METAL_RUNTIME_*` / `METAL_NATIVE_*` spellings) are gone; the default
+  output is unchanged, and
+  `the_retired_interior_flag_changes_no_exact_f32_output` pins that setting
+  it changes no bit.
 - **One source for the GEMM tile bodies: `kernels/gemm_coop.h`.** The tile
   walks, the interior and edge operand views of a tile, the cooperative
   destination body (zero, run, accumulate or epilogue, store) and the

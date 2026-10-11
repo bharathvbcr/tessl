@@ -1,3 +1,9 @@
+# Reconciled 2026-10-11: measured on the MLSystemsLab copy of this crate;
+# the selection and test named at the end never existed in tessl.
+# Re-measured on tessl's kernels with this method in
+# bench/results/bf16_smallm_coop_reconciled_m5pro.txt: the grid-fill finding
+# holds, and the rule was ported for bf16 (src/gemm.rs, coop_narrow).
+
 bf16 NN coop tile A/B at small M — M5 Pro, 2026-09-04
 =====================================================
 

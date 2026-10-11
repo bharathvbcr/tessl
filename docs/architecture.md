@@ -26,7 +26,7 @@ flowchart TD
 
     LayoutCheck -- "TN exact f32, C under 128 tiles, K of 2+ partitions" --> ParTN["matmul2d_tensorops_tn_splitk_par_f32<br/>+ reduce_partitions_f32<br/>(all K partitions in one dispatch)"]
     LayoutCheck -- "TN / NT Layout" --> SplitKCheck{"prefer_tn_splitk?<br/>(K &gt;= 2048, M,N &lt;= 384,<br/>min(M,N) &lt;= 128)"}
-    SplitKCheck -- Yes --> SplitKKernel["matmul2d_tensorops_tn/nt_splitk_*<br/>(Split-K partial reductions)"]
+    SplitKCheck -- Yes --> SplitKKernel["bf16: matmul2d_tensorops_tn_splitk_par_bf16_f32<br/>+ reduce_partitions_f32 (all K partitions in one dispatch)<br/>exact f32 C +=: matmul2d_tensorops_tn_splitk_f32"]
     SplitKCheck -- No --> CoopTN["matmul2d_tensorops_tn/nt_*_f32<br/>• 128x64 sg4 Cooperative Destination<br/>• Single store, zero host pre-zeroing"]
 
     LayoutCheck -- "NN Layout" --> PrecisionCheck{"Precision Mode"}
@@ -101,19 +101,20 @@ In Round 2 optimization, cooperative destination registers were extended across 
 
 | Layout / Path | Geometry | Implementation | Performance Impact |
 |---|---|---|---|
-| **NN Default** | $128 \times 64$, 4 sg | `matmul2d_tensorops_bf16_f32` + swizzle | **26,642 GFLOP/s** at $4096^3$ (+11% via swizzle) |
-| **NN Narrow ($N \le 512$ or bf16 $M < 128$)** | $64 \times 64$, 4 sg | `matmul2d_tensorops_bf16_f32_64x64_sg4` | +6% on narrow-$N$; outruns 128×64 on short-$M$ bf16 (e.g. M=61 GDN in-proj) |
-| **Fused Epilogue Narrow (bf16 $M < 128$)** | $64 \times 64$, 4 sg | `matmul2d_tensorops_bf16_f32_epi_64x64_sg4` | Specialization for short-$M$ bf16 operands; wide ($128 \times 64$) on $M \ge 128$ |
+| **NN Default** | $128 \times 64$, 4 sg | `matmul2d_tensorops_bf16_f32` | **26,642 GFLOP/s** at $4096^3$ |
+| **NN Narrow ($N \le 512$; bf16 $M < 128$ or under 64 tiles of 128×64)** | $64 \times 64$, 4 sg | `matmul2d_tensorops_bf16_f32_64x64_sg4` (and f16, relaxed f32) | +6% on narrow-$N$; outruns 128×64 on short-$M$ bf16 (e.g. M=61 GDN in-proj) and 1.16–1.56× on bf16 grids under 64 tiles (`bench/results/bf16_smallm_coop_reconciled_m5pro.txt`) |
+| **Fused epilogue and batched** | the plain path's tile (`coop_narrow`) | `*_epi`, `*_batched` and their `_64x64_sg4` forms, every element type | Epilogue 64×64 1.11–2.01× where the rule picks it (`bench/results/gemm_coop_tiles_m5pro.txt`) |
 | **TN bf16 Descriptor** | $128 \times 64$, 4 sg | `matmul2d_tensorops_tn_bf16_f32` | 1.52–1.98× over dynamic-$K$ multiply |
 | **NT bf16 ($dX$ Backward)** | $128 \times 64$, 4 sg | `matmul2d_tensorops_nt_bf16_f32` | 2.00–2.03× speedup at scale |
 | **Accumulate Paths** | $64 \times 64$, 4 sg | Zero $\to$ Run $\to$ Load-Add-Store (`TILE_COOP_ACCUM`) | 1.38–1.49× over `multiply_accumulate` |
-| **Split-K $dW$** | $64 \times 32$, 4 sg | `matmul2d_tensorops_tn_splitk_*` | Tall-$K$ / small-$MN$ (`prefer_tn_splitk`): bf16, and exact f32 into `C +=` |
+| **Parallel split-K TN, bf16** | $64 \times 64$, 4 sg cooperative | `matmul2d_tensorops_tn_splitk_par_bf16_f32` + `reduce_partitions_f32` (`_add_f32` for `C +=`) | Tall-$K$ / small-$MN$ (`prefer_tn_splitk`), overwriting and accumulating: 2.4–19× over the sequential 64×32 lane it replaced (`bench/results/splitk_par_bf16_m5pro.txt`) |
+| **Split-K $dW$, exact f32 `C +=`** | $32 \times 32$, 1 sg | `matmul2d_tensorops_tn_splitk_f32` | Tall-$K$ / small-$MN$ (`prefer_tn_splitk`), exact f32 accumulating: one dispatch per 256 of K, in order |
 | **Parallel split-K TN, exact f32** | $32 \times 32$, 1 sg | `matmul2d_tensorops_tn_splitk_par_f32` + `reduce_partitions_f32` | Every TN whose C has under 128 tiles over a K of ≥ 2 partitions (`tn_par_k_tile`): all partitions in one dispatch into a scratch, added in order. Gate $dW$ (12×768×4096): 225 → 45 µs; attention $dW$ (128×128×4096): 186 µs sequential → 31 µs on M5 Pro |
 | **Split-K NN, exact f32** | $32 \times 32$, 1 sg | `matmul2d_tensorops_nn_splitk_f32` | Long $K$ with $K \times N \ge 2^{23}$: partitions of $2^{21}/N$ rows of B keep each slice of B in cache. LM-head $dX$ (4096×768×50304): 99.8 → 45.4 ms on M5 Pro |
 
 ### Column-Panel Grid Swizzling
 
-For large grids ($\text{tiles}_n \times \text{tiles}_m \ge 2048$), threadgroups are swizzled into 8-tile-row bands:
+Once B ($N \times K$) reaches $2^{23}$ elements, `tile_walk` (`kernels/gemm_coop.h`) swizzles threadgroups into 512-row bands of tile rows, for every GEMM family. (The coop NN kernels used the grid-size gate drawn below, $\text{tiles}_n \times \text{tiles}_m \ge 2048$ and 8-row bands, until 2026-10-11.)
 
 ```mermaid
 flowchart TD
@@ -147,7 +148,7 @@ Three more kernel families take the same walk through `tile_walk<SM>`, in bands 
 - the bf16 TN/NT coop kernels (`matmul2d_tensorops_tn_bf16_f32` and `_nt_bf16_f32`, 128×64, 4-tile-row bands; `_tn_accum_bf16_f32` and `_nt_accum_bf16_f32`, 64×64, 8-tile-row bands);
 - the int8 dequant kernel (`matmul2d_tensorops_i8_f32`, 128×64), in 4-tile-row bands.
 
-A grid that `tile_from_linear` walks in Morton order (square, with a power-of-two side) keeps Morton. On those grids, bf16 panels measured 0.98–1.04× of Morton, and exact-f32 Morton 0.99–1.02× of panels. The coop NN kernel keeps its own grid-gated 8-row walk above, and the split-K kernels walk their partitions.
+A grid that `tile_from_linear` walks in Morton order (square, with a power-of-two side) keeps Morton. On those grids, bf16 panels measured 0.98–1.04× of Morton, and exact-f32 Morton 0.99–1.02× of panels. The coop NN kernels walked by their own grid gate (8-row bands from 2048 tiles) until 2026-10-11; a per-lane A/B (`bench/results/gemm_panel_walk_m5pro.txt`) moved them onto `tile_walk` too, so every family has one policy. The split-K kernels walk their partitions.
 
 Under row-major order, the threadgroups running at one time share an A tile and each read a different B tile, so all of $B$ is re-read once per tile row. A 32-row tile does 16 flop per byte of B. Once B no longer fits in cache, each pass runs at DRAM speed: a 50304×768 f32 LM-head weight ran at ~2.3 TFLOP/s at any row count, against ~6.5 at $N \le 2304$. On M5 Pro, time relative to the walk each kernel had before (data in ojas `bench/results/2026-10-02-gemm` and `2026-10-06-gemm-bf16`):
 

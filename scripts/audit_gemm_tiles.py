@@ -73,6 +73,15 @@ NN_PAIRS = [
     ("matmul2d_tensorops_bf16_f32_epi_64x64_sg4", "TILE_COOP_NARROW"),
     ("matmul2d_tensorops_f16_f32_epi", "TILE_COOP_DEFAULT"),
     ("matmul2d_tensorops_f32_relaxed_epi", "TILE_COOP_DEFAULT"),
+    ("matmul2d_tensorops_f16_f32_epi_64x64_sg4", "TILE_COOP_NARROW"),
+    ("matmul2d_tensorops_f32_relaxed_epi_64x64_sg4", "TILE_COOP_NARROW"),
+    ("matmul2d_tensorops_bf16_f32_batched_64x64_sg4", "TILE_COOP_NARROW"),
+    ("matmul2d_tensorops_f16_f32_batched_64x64_sg4", "TILE_COOP_NARROW"),
+    ("matmul2d_tensorops_f32_relaxed_batched_64x64_sg4", "TILE_COOP_NARROW"),
+    # `SplitKPar::kernel` in gemm.rs pairs each parallel split-K kernel with
+    # its TileGeom on one line, not beside a pipeline("literal").
+    ("matmul2d_tensorops_tn_splitk_par_f32", "TILE_F32"),
+    ("matmul2d_tensorops_tn_splitk_par_bf16_f32", "TILE_COOP_SPLITK"),
 ]
 
 # Kernels this audit deliberately does not check, each with the reason. An

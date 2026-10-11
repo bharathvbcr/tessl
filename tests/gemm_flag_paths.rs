@@ -256,7 +256,8 @@ fn accumulate_train_entries_run_the_accumulate_kernels() {
                     "matmul2d_tensorops_tn_accum_bf16_f32",
                     "matmul2d_tensorops_nt_accum_bf16_f32",
                     "matmul2d_tensorops_tn_splitk_f32",
-                    "matmul2d_tensorops_tn_splitk_bf16_f32",
+                    "matmul2d_tensorops_tn_splitk_par_bf16_f32",
+                    "reduce_partitions_add_f32",
                 ] {
                     assert_traced(kernel);
                 }

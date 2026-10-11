@@ -1,0 +1,315 @@
+# bf16 TN at the split-K-gated dW shapes: sequential vs cooperative vs parallel split-K
+#
+# Machine: Apple M5 Pro, macOS 27.0.1, 2026-10-11 06:50 UTC. GPU otherwise
+# idle; host load average ~12 (recorded below).
+# Tree: 120f675 plus the uncommitted parallel split-K kernel and this bench
+# (src/bin/bench_gemm_routes.rs; the kernel and reduce landed with the
+# routing in the same change as this file).
+# Command:
+#   BENCH_LANES=splitk cargo run --release --bin bench_gemm_routes
+#
+# Questions: (1) reconcile bench/results/splitk_gate_m5pro.txt, measured on
+# the MLSystemsLab copy of this crate ("Landed as SPLITK_MIN_K = 12288": the
+# cooperative kernel beat the sequential split-K below K = 12288; neither the
+# constant nor its test ever existed in tessl), on main's kernels with the
+# same method; (2) bench a bf16 parallel split-K against main's sequential
+# lane.
+#
+# Method (that file's): async encode, 20 GEMMs per command buffer, 8 calls
+# per arm per round, 6 rounds with the order reversed every other round, 2
+# warmup calls; us per GEMM, median of per-round medians; ratio =
+# production / arm (> 1: the arm is faster), median of per-round ratios
+# [range]. All arms read the same bf16 operands; their outputs were checked
+# against production's first (agreement printed per shape). Arms:
+#   production   gemm_tn_bf16 / GemmOperands::Bf16.tn_acc as main shipped
+#                them: the sequential split-K on the gated shapes
+#   seq_splitk   the same, dispatched raw (zero C unless accumulating, then
+#                one 64x32 multiply_accumulate dispatch per 256 of K)
+#   coop_*       one cooperative dispatch over all of K (128x64 overwrite,
+#                64x64 accumulate)
+#   par_splitk_W every partition of W rows of K one 64x64 cooperative tile
+#                set into its scratch slice, then reduce_partitions_f32
+#                (reduce_partitions_add_f32 to accumulate)
+# (384, 384, 4096) is not gated: production is the cooperative kernel there.
+#
+# Result:
+# (1) On main the cooperative kernel beats the sequential split-K by 1-10%
+#     below K = 12288 (overwrite) and ties or loses beyond (0.92-1.00x at
+#     K >= 16384), as the import found; accumulating it wins 1.25-1.59x at every K (the
+#     64x64 accumulate kernel against the sequential lane's per-partition
+#     passes). SPLITK_MIN_K is not ported: (2) supersedes both.
+# (2) The parallel split-K beats the sequential lane at every gated shape:
+#     2.4-19x at its best width, overwriting and accumulating alike (the
+#     reduce reads C once more to add). The best width followed the
+#     threadgroup count, which src/gemm.rs's tn_par_bf16_k_tile encodes: the
+#     widest of 1024/512/256 that keeps >= 32 threadgroups of 64x64 tiles.
+#     At the ungated 384x384x4096 control it was 1.43x over the cooperative
+#     kernel overwriting and 1.03x accumulating; extending the gate beyond
+#     prefer_tn_splitk's shapes is left as a follow-up, unmeasured.
+# Decision: prefer_tn_splitk's shapes take the parallel split-K in
+# gemm_tn_bf16 and in the bf16 accumulate; the sequential bf16 kernel
+# (matmul2d_tensorops_tn_splitk_bf16_f32) and its host lane are removed. The
+# rounding differs from the sequential lane (partials summed per partition,
+# then in partition order) within the same f32 bound; every arm agreed to
+# under 3.2e-6 of the output's scale.
+#
+=== routes 2026-10-11T06:50:27Z load: { 11.94 14.02 31.42 }
+device: Apple M5 Pro
+async encode, 20 GEMMs per command buffer, 8 calls per arm per round, 6 rounds (order reversed every other round) after 2 warmup calls; us per GEMM, median of per-round medians; ratio = first arm / this arm (> 1: this arm is faster), median of per-round ratios [range]
+
+splitk overwrite M=128 N=128 K=4096  (arms agree within 1.6e-6)  (self-spread of production 31.3%, EXCEEDS 10%)
+  production                  83.5 us   production/this 1.00 [1.00–1.00]
+  seq_splitk                  83.4 us   production/this 1.00 [1.00–1.20]
+  coop_128x64                 81.5 us   production/this 1.03 [1.02–1.33]
+  par_splitk_256              24.6 us   production/this 3.41 [3.29–4.43]
+  par_splitk_512              21.5 us   production/this 3.87 [3.47–4.93]
+  par_splitk_1024             25.0 us   production/this 3.33 [3.20–4.39]
+
+splitk accumulate M=128 N=128 K=4096  (arms agree within 1.7e-6)  (self-spread of production 1.0%)
+  production                  82.9 us   production/this 1.00 [1.00–1.00]
+  seq_splitk                  82.6 us   production/this 1.00 [1.00–1.01]
+  coop_64x64                  58.4 us   production/this 1.42 [1.41–1.43]
+  par_splitk_256              24.5 us   production/this 3.38 [3.31–3.43]
+  par_splitk_512              21.4 us   production/this 3.87 [3.78–3.90]
+  par_splitk_1024             25.1 us   production/this 3.30 [3.27–3.34]
+
+splitk overwrite M=128 N=384 K=4096  (arms agree within 1.3e-6)  (self-spread of production 1.6%)
+  production                 103.4 us   production/this 1.00 [1.00–1.00]
+  seq_splitk                 103.1 us   production/this 1.00 [1.00–1.01]
+  coop_128x64                 96.3 us   production/this 1.07 [1.06–1.08]
+  par_splitk_256              46.8 us   production/this 2.21 [2.09–2.25]
+  par_splitk_512              35.6 us   production/this 2.91 [2.85–2.94]
+  par_splitk_1024             33.4 us   production/this 3.12 [3.03–3.14]
+
+splitk accumulate M=128 N=384 K=4096  (arms agree within 1.3e-6)  (self-spread of production 0.6%)
+  production                 100.5 us   production/this 1.00 [1.00–1.00]
+  seq_splitk                 100.4 us   production/this 1.00 [0.99–1.00]
+  coop_64x64                  65.9 us   production/this 1.53 [1.50–1.53]
+  par_splitk_256              48.3 us   production/this 2.08 [2.06–2.11]
+  par_splitk_512              35.9 us   production/this 2.80 [2.77–2.84]
+  par_splitk_1024             33.6 us   production/this 2.99 [2.94–3.02]
+
+splitk overwrite M=384 N=128 K=4096  (arms agree within 1.1e-6)  (self-spread of production 1.1%)
+  production                 100.6 us   production/this 1.00 [1.00–1.00]
+  seq_splitk                 100.7 us   production/this 1.00 [1.00–1.00]
+  coop_128x64                 91.5 us   production/this 1.10 [1.09–1.11]
+  par_splitk_256              46.7 us   production/this 2.15 [2.13–2.18]
+  par_splitk_512              35.4 us   production/this 2.85 [2.80–2.87]
+  par_splitk_1024             33.6 us   production/this 2.99 [2.91–3.06]
+
+splitk accumulate M=384 N=128 K=4096  (arms agree within 1.1e-6)  (self-spread of production 6.1%)
+  production                  98.8 us   production/this 1.00 [1.00–1.00]
+  seq_splitk                  98.2 us   production/this 1.01 [1.00–1.06]
+  coop_64x64                  64.9 us   production/this 1.53 [1.50–1.59]
+  par_splitk_256              48.7 us   production/this 2.05 [2.01–2.12]
+  par_splitk_512              36.1 us   production/this 2.78 [2.51–2.87]
+  par_splitk_1024             34.2 us   production/this 2.90 [2.83–3.06]
+
+splitk overwrite M=64 N=64 K=8192  (arms agree within 1.7e-6)  (self-spread of production 1.3%)
+  production                 154.7 us   production/this 1.00 [1.00–1.00]
+  seq_splitk                 154.3 us   production/this 1.00 [1.00–1.01]
+  coop_128x64                145.4 us   production/this 1.06 [1.06–1.08]
+  par_splitk_256              20.6 us   production/this 7.52 [7.31–7.96]
+  par_splitk_512              20.1 us   production/this 7.71 [7.44–8.47]
+  par_splitk_1024             24.3 us   production/this 6.37 [6.25–7.00]
+
+splitk accumulate M=64 N=64 K=8192  (arms agree within 1.7e-6)  (self-spread of production 1.2%)
+  production                 155.6 us   production/this 1.00 [1.00–1.00]
+  seq_splitk                 155.3 us   production/this 1.00 [0.99–1.00]
+  coop_64x64                 102.8 us   production/this 1.51 [1.50–1.53]
+  par_splitk_256              21.3 us   production/this 7.33 [7.18–7.41]
+  par_splitk_512              20.5 us   production/this 7.59 [7.46–7.69]
+  par_splitk_1024             24.7 us   production/this 6.31 [5.49–6.38]
+
+splitk overwrite M=128 N=128 K=2048  (arms agree within 8.9e-7)  (self-spread of production 7.4%)
+  production                  46.9 us   production/this 1.00 [1.00–1.00]
+  seq_splitk                  46.9 us   production/this 1.00 [0.99–1.02]
+  coop_128x64                 46.1 us   production/this 1.02 [1.00–1.06]
+  par_splitk_256              19.0 us   production/this 2.48 [2.40–2.53]
+  par_splitk_512              19.6 us   production/this 2.41 [2.30–2.48]
+  par_splitk_1024             24.4 us   production/this 1.92 [1.76–2.02]
+
+splitk accumulate M=128 N=128 K=2048  (arms agree within 8.6e-7)  (self-spread of production 4.4%)
+  production                  44.2 us   production/this 1.00 [1.00–1.00]
+  seq_splitk                  44.1 us   production/this 1.01 [0.99–1.02]
+  coop_64x64                  35.3 us   production/this 1.25 [1.20–1.29]
+  par_splitk_256              18.2 us   production/this 2.42 [2.34–2.64]
+  par_splitk_512              18.6 us   production/this 2.37 [2.30–2.50]
+  par_splitk_1024             23.2 us   production/this 1.89 [1.85–1.97]
+
+splitk overwrite M=128 N=384 K=8192  (arms agree within 1.7e-6)  (self-spread of production 6.5%)
+  production                 200.7 us   production/this 1.00 [1.00–1.00]
+  seq_splitk                 200.0 us   production/this 1.01 [1.00–1.05]
+  coop_128x64                195.0 us   production/this 1.03 [1.02–1.08]
+  par_splitk_256              89.0 us   production/this 2.25 [2.18–2.42]
+  par_splitk_512              61.4 us   production/this 3.26 [3.24–3.50]
+  par_splitk_1024             50.5 us   production/this 3.98 [3.95–4.18]
+
+splitk accumulate M=128 N=384 K=8192  (arms agree within 1.7e-6)  (self-spread of production 2.9%)
+  production                 197.6 us   production/this 1.00 [1.00–1.00]
+  seq_splitk                 197.3 us   production/this 1.01 [0.99–1.02]
+  coop_64x64                 123.5 us   production/this 1.59 [1.58–1.62]
+  par_splitk_256              88.4 us   production/this 2.24 [2.16–2.27]
+  par_splitk_512              61.7 us   production/this 3.22 [3.10–3.28]
+  par_splitk_1024             50.6 us   production/this 3.92 [3.84–3.99]
+
+splitk overwrite M=128 N=384 K=12288  (arms agree within 2.1e-6)  (self-spread of production 6.6%)
+  production                 297.5 us   production/this 1.00 [1.00–1.00]
+  seq_splitk                 301.5 us   production/this 0.99 [0.99–1.03]
+  coop_128x64                298.1 us   production/this 1.01 [0.99–1.05]
+  par_splitk_256             145.9 us   production/this 2.08 [1.91–2.12]
+  par_splitk_512              90.8 us   production/this 3.30 [3.13–3.54]
+  par_splitk_1024             72.0 us   production/this 4.14 [3.82–4.38]
+
+splitk accumulate M=128 N=384 K=12288  (arms agree within 2.1e-6)  (self-spread of production 2.0%)
+  production                 296.8 us   production/this 1.00 [1.00–1.00]
+  seq_splitk                 297.9 us   production/this 1.00 [0.99–1.00]
+  coop_64x64                 186.6 us   production/this 1.59 [1.58–1.62]
+  par_splitk_256             142.5 us   production/this 2.09 [2.00–2.11]
+  par_splitk_512              88.9 us   production/this 3.36 [3.29–3.43]
+  par_splitk_1024             72.3 us   production/this 4.13 [4.07–4.28]
+
+splitk overwrite M=128 N=384 K=16384  (arms agree within 2.1e-6)  (self-spread of production 3.1%)
+  production                 407.2 us   production/this 1.00 [1.00–1.00]
+  seq_splitk                 406.6 us   production/this 1.00 [0.98–1.00]
+  coop_128x64                413.7 us   production/this 0.98 [0.95–1.03]
+  par_splitk_256             209.1 us   production/this 1.95 [1.86–2.01]
+  par_splitk_512             130.4 us   production/this 3.13 [2.96–3.22]
+  par_splitk_1024            100.4 us   production/this 4.05 [4.01–4.35]
+
+splitk accumulate M=128 N=384 K=16384  (arms agree within 2.1e-6)  (self-spread of production 2.7%)
+  production                 402.2 us   production/this 1.00 [1.00–1.00]
+  seq_splitk                 404.9 us   production/this 0.99 [0.98–1.02]
+  coop_64x64                 256.6 us   production/this 1.58 [1.55–1.63]
+  par_splitk_256             206.2 us   production/this 1.94 [1.72–2.01]
+  par_splitk_512             129.3 us   production/this 3.10 [3.05–3.18]
+  par_splitk_1024             94.1 us   production/this 4.27 [3.99–4.35]
+
+splitk overwrite M=128 N=384 K=32768  (arms agree within 2.8e-6)  (self-spread of production 0.5%)
+  production                 888.4 us   production/this 1.00 [1.00–1.00]
+  seq_splitk                 889.0 us   production/this 1.00 [0.99–1.00]
+  coop_128x64                965.6 us   production/this 0.92 [0.91–0.93]
+  par_splitk_256             472.9 us   production/this 1.88 [1.87–1.92]
+  par_splitk_512             287.4 us   production/this 3.09 [2.93–3.16]
+  par_splitk_1024            220.1 us   production/this 4.03 [3.93–4.20]
+
+splitk accumulate M=128 N=384 K=32768  (arms agree within 2.8e-6)  (self-spread of production 1.5%)
+  production                 887.0 us   production/this 1.00 [1.00–1.00]
+  seq_splitk                 891.8 us   production/this 1.00 [0.99–1.00]
+  coop_64x64                 580.4 us   production/this 1.53 [1.51–1.54]
+  par_splitk_256             468.4 us   production/this 1.90 [1.87–1.93]
+  par_splitk_512             292.3 us   production/this 3.04 [2.99–3.17]
+  par_splitk_1024            216.3 us   production/this 4.10 [4.04–4.20]
+
+splitk overwrite M=128 N=128 K=8192  (arms agree within 1.6e-6)  (self-spread of production 5.3%)
+  production                 167.9 us   production/this 1.00 [1.00–1.00]
+  seq_splitk                 168.6 us   production/this 1.00 [0.99–1.01]
+  coop_128x64                174.0 us   production/this 0.97 [0.96–1.00]
+  par_splitk_256              39.2 us   production/this 4.27 [3.96–4.33]
+  par_splitk_512              30.1 us   production/this 5.58 [5.12–5.64]
+  par_splitk_1024             30.1 us   production/this 5.56 [5.16–5.65]
+
+splitk accumulate M=128 N=128 K=8192  (arms agree within 1.6e-6)  (self-spread of production 1.4%)
+  production                 170.6 us   production/this 1.00 [1.00–1.00]
+  seq_splitk                 171.1 us   production/this 1.00 [0.99–1.01]
+  coop_64x64                 113.2 us   production/this 1.51 [1.47–1.52]
+  par_splitk_256              39.5 us   production/this 4.31 [4.18–4.38]
+  par_splitk_512              29.9 us   production/this 5.71 [5.65–5.83]
+  par_splitk_1024             29.8 us   production/this 5.73 [5.63–5.74]
+
+splitk overwrite M=128 N=128 K=16384  (arms agree within 1.8e-6)  (self-spread of production 2.0%)
+  production                 345.5 us   production/this 1.00 [1.00–1.00]
+  seq_splitk                 347.3 us   production/this 1.00 [0.99–1.00]
+  coop_128x64                363.3 us   production/this 0.95 [0.94–0.97]
+  par_splitk_256              66.8 us   production/this 5.22 [4.95–5.29]
+  par_splitk_512              50.8 us   production/this 6.82 [6.47–6.95]
+  par_splitk_1024             40.7 us   production/this 8.53 [8.33–8.75]
+
+splitk accumulate M=128 N=128 K=16384  (arms agree within 1.9e-6)  (self-spread of production 3.0%)
+  production                 349.1 us   production/this 1.00 [1.00–1.00]
+  seq_splitk                 349.9 us   production/this 0.99 [0.99–1.01]
+  coop_64x64                 229.2 us   production/this 1.52 [1.51–1.54]
+  par_splitk_256              65.7 us   production/this 5.32 [5.14–5.41]
+  par_splitk_512              50.2 us   production/this 6.96 [6.69–7.18]
+  par_splitk_1024             41.2 us   production/this 8.53 [8.30–8.86]
+
+splitk overwrite M=128 N=128 K=32768  (arms agree within 2.8e-6)  (self-spread of production 4.8%)
+  production                 732.5 us   production/this 1.00 [1.00–1.00]
+  seq_splitk                 738.2 us   production/this 0.99 [0.95–1.03]
+  coop_128x64                789.4 us   production/this 0.93 [0.86–0.95]
+  par_splitk_256             155.1 us   production/this 4.73 [4.37–5.05]
+  par_splitk_512              98.5 us   production/this 7.44 [7.23–8.13]
+  par_splitk_1024             75.1 us   production/this 9.78 [9.63–10.27]
+
+splitk accumulate M=128 N=128 K=32768  (arms agree within 2.7e-6)  (self-spread of production 5.9%)
+  production                 763.0 us   production/this 1.00 [1.00–1.00]
+  seq_splitk                 765.2 us   production/this 1.00 [0.99–1.02]
+  coop_64x64                 493.7 us   production/this 1.55 [1.49–1.58]
+  par_splitk_256             153.8 us   production/this 4.95 [4.77–4.99]
+  par_splitk_512              96.7 us   production/this 7.90 [7.50–8.21]
+  par_splitk_1024             74.8 us   production/this 10.07 [9.92–10.72]
+
+splitk overwrite M=64 N=64 K=16384  (arms agree within 1.7e-6)  (self-spread of production 1.4%)
+  production                 336.6 us   production/this 1.00 [1.00–1.00]
+  seq_splitk                 335.3 us   production/this 1.00 [1.00–1.01]
+  coop_128x64                321.1 us   production/this 1.05 [1.04–1.05]
+  par_splitk_256              36.8 us   production/this 9.16 [8.78–9.47]
+  par_splitk_512              27.7 us   production/this 12.21 [11.82–12.55]
+  par_splitk_1024             29.8 us   production/this 11.33 [11.01–11.43]
+
+splitk accumulate M=64 N=64 K=16384  (arms agree within 1.6e-6)  (self-spread of production 2.7%)
+  production                 339.4 us   production/this 1.00 [1.00–1.00]
+  seq_splitk                 339.7 us   production/this 1.00 [0.98–1.01]
+  coop_64x64                 219.9 us   production/this 1.54 [1.52–1.56]
+  par_splitk_256              36.4 us   production/this 9.30 [8.91–9.63]
+  par_splitk_512              27.7 us   production/this 12.28 [11.87–12.70]
+  par_splitk_1024             29.3 us   production/this 11.59 [10.95–11.93]
+
+splitk overwrite M=64 N=64 K=32768  (arms agree within 3.2e-6)  (self-spread of production 1.2%)
+  production                 710.8 us   production/this 1.00 [1.00–1.00]
+  seq_splitk                 712.9 us   production/this 1.00 [0.99–1.01]
+  coop_128x64                726.1 us   production/this 0.98 [0.94–1.00]
+  par_splitk_256              66.5 us   production/this 10.73 [10.46–10.95]
+  par_splitk_512              48.1 us   production/this 14.77 [14.05–15.28]
+  par_splitk_1024             37.4 us   production/this 19.01 [18.70–19.22]
+
+splitk accumulate M=64 N=64 K=32768  (arms agree within 3.2e-6)  (self-spread of production 3.6%)
+  production                 711.1 us   production/this 1.00 [1.00–1.00]
+  seq_splitk                 716.8 us   production/this 1.00 [0.97–1.01]
+  coop_64x64                 471.7 us   production/this 1.51 [1.50–1.56]
+  par_splitk_256              64.3 us   production/this 11.15 [10.67–11.39]
+  par_splitk_512              46.9 us   production/this 15.27 [14.78–15.45]
+  par_splitk_1024             37.6 us   production/this 19.00 [18.72–19.49]
+
+splitk overwrite M=384 N=128 K=16384  (arms agree within 3.2e-6)  (self-spread of production 2.5%)
+  production                 415.3 us   production/this 1.00 [1.00–1.00]
+  seq_splitk                 413.6 us   production/this 1.01 [0.96–1.01]
+  coop_128x64                414.8 us   production/this 1.00 [0.90–1.01]
+  par_splitk_256             220.4 us   production/this 1.91 [1.83–1.93]
+  par_splitk_512             138.8 us   production/this 3.00 [2.96–3.08]
+  par_splitk_1024            101.7 us   production/this 4.11 [3.99–4.23]
+
+splitk accumulate M=384 N=128 K=16384  (arms agree within 3.2e-6)  (self-spread of production 2.7%)
+  production                 411.9 us   production/this 1.00 [1.00–1.00]
+  seq_splitk                 415.0 us   production/this 0.99 [0.97–1.02]
+  coop_64x64                 262.6 us   production/this 1.58 [1.46–1.61]
+  par_splitk_256             225.2 us   production/this 1.82 [1.58–1.88]
+  par_splitk_512             145.6 us   production/this 2.82 [2.64–2.90]
+  par_splitk_1024            103.7 us   production/this 3.98 [3.04–4.08]
+
+splitk overwrite M=384 N=384 K=4096  (arms agree within 1.3e-6)  (self-spread of production 4.9%)
+  production                 105.0 us   production/this 1.00 [1.00–1.00]
+  seq_splitk                 142.6 us   production/this 0.74 [0.72–0.76]
+  coop_128x64                104.5 us   production/this 1.00 [0.99–1.05]
+  par_splitk_256             131.0 us   production/this 0.79 [0.75–0.87]
+  par_splitk_512              87.6 us   production/this 1.20 [1.10–1.29]
+  par_splitk_1024             73.0 us   production/this 1.43 [1.35–1.50]
+
+splitk accumulate M=384 N=384 K=4096  (arms agree within 1.3e-6)  (self-spread of production 8.9%)
+  production                  77.8 us   production/this 1.00 [1.00–1.00]
+  seq_splitk                 144.5 us   production/this 0.54 [0.52–0.55]
+  coop_64x64                  76.7 us   production/this 1.01 [0.97–1.03]
+  par_splitk_256             127.1 us   production/this 0.62 [0.57–0.63]
+  par_splitk_512              89.1 us   production/this 0.87 [0.83–0.89]
+  par_splitk_1024             75.8 us   production/this 1.03 [0.97–1.05]
+

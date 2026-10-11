@@ -206,46 +206,46 @@ kernel void matmul2d_tensorops_nn_splitk_f32(
 }
 
 // =============================================================================
-// bf16 → f32 accum TN/NT/split-K — execution_simdgroups<4>, 64×32 tiles.
-// (The NN bf16 and relaxed-f32 kernels moved to the cooperative-destination
-// section at the end of this file.)
+// bf16 → f32 split-K TN — cooperative 64×64 tiles per K-partition.
+// (The NN, TN and NT bf16 kernels are in the cooperative-destination section
+// below.)
 // =============================================================================
 
-kernel void matmul2d_tensorops_tn_splitk_bf16_f32(
-    device bfloat *A [[buffer(0)]],
-    device bfloat *B [[buffer(1)]],
-    device float *C [[buffer(2)]],
-    constant uint &M [[buffer(3)]],
-    constant uint &N [[buffer(4)]],
-    constant uint &K [[buffer(5)]],
-    constant uint &k0 [[buffer(6)]],
-    constant uint &k_tile [[buffer(7)]],
-    constant uint &tiles_n [[buffer(8)]],
-    constant uint &tiles_m [[buffer(9)]],
-    uint tgpig [[threadgroup_position_in_grid]])
-{
-    constexpr int SM = 64;
-    constexpr int SN = 32;
-    constexpr auto mmul_mode = matmul2d_descriptor::mode::multiply_accumulate;
-    constexpr auto desc =
-        matmul2d_descriptor(SM, SN, dynamic_length_v<int>, true, false, false, mmul_mode);
-    matmul2d<desc, execution_simdgroups<4>> op;
+/// The bf16 split-K TN with every K-partition in one dispatch, the bf16 form
+/// of `matmul2d_tensorops_tn_splitk_par_f32`: threadgroup `p · tiles + t`
+/// computes tile `t` of partition `p` (K from `p · k_tile`) on the
+/// cooperative destination (gemm_coop.h's `mm_coop`) and stores it into
+/// slice `p` of a scratch `S`, `slice` floats per partition. The store
+/// writes every in-bounds element, so `S` needs no zeroing;
+/// `reduce_partitions_f32` (or `_add_f32` for `C +=`) then sums the slices
+/// in partition order.
+#define TN_SPLITK_PAR_KERNEL(NAME, ELEM, SM, SN, NSG, RELAXED)                 \
+    kernel void NAME(device ELEM *A [[buffer(0)]],                             \
+                     device ELEM *B [[buffer(1)]],                             \
+                     device float *S [[buffer(2)]],                            \
+                     constant uint &M [[buffer(3)]],                           \
+                     constant uint &N [[buffer(4)]],                           \
+                     constant uint &K [[buffer(5)]],                           \
+                     constant uint &k_tile [[buffer(6)]],                      \
+                     constant uint &tiles_n [[buffer(7)]],                     \
+                     constant uint &tiles_m [[buffer(8)]],                     \
+                     constant uint &partitions [[buffer(9)]],                  \
+                     constant uint &slice [[buffer(10)]],                      \
+                     uint tgpig [[threadgroup_position_in_grid]]) {            \
+        const uint tiles = tiles_n * tiles_m;                                  \
+        if (tiles == 0u) return;                                               \
+        const uint p = tgpig / tiles;                                          \
+        if (p >= partitions) return;                                           \
+        const ulong k0 = (ulong)p * k_tile;                                    \
+        if (k0 >= K) return;                                                   \
+        const uint k_len = (uint)min((ulong)k_tile, (ulong)K - k0);            \
+        mm_coop<ELEM, SM, SN, NSG, true, false, RELAXED, false, false,         \
+                walk_by_b>(A + k0 * M, B + k0 * N, S + (ulong)p * slice, M, N, \
+                           k_len, tiles_n, tiles_m, tgpig - p * tiles,         \
+                           nullptr, 1.0f, 0.0f, 0u);                           \
+    }
 
-    uint2 tile = tile_from_linear(tgpig, tiles_n, tiles_m);
-    if (tile.x >= tiles_n || tile.y >= tiles_m) return;
-    int tx = (int)tile.x * SN;
-    int ty = (int)tile.y * SM;
-
-    uint k_len = min(k_tile, K - k0);
-    auto mA = tensor(A + k0 * M, dextents<int, 2>{(int)M, (int)k_len}, array<int, 2>{1, (int)M});
-    auto mB = tensor(B + k0 * N, dextents<int, 2>{(int)N, (int)k_len}, array<int, 2>{1, (int)N});
-    auto mC = tensor(C, dextents<int, 2>{(int)N, (int)M}, array<int, 2>{1, (int)N});
-
-    auto tA = mA.slice(ty, 0);
-    auto tB = mB.slice(tx, 0);
-    auto tC = mC.slice(tx, ty);
-    op.run(tA, tB, tC);
-}
+TN_SPLITK_PAR_KERNEL(matmul2d_tensorops_tn_splitk_par_bf16_f32, bfloat, 64, 64, 4, false)
 
 // =============================================================================
 // bf16 → f32 and relaxed-f32 NN — cooperative destination tensor
@@ -435,6 +435,11 @@ kernel void matmul2d_tensorops_i8_f32(
 NN_COOP_BATCHED_KERNEL(matmul2d_tensorops_bf16_f32_batched,   bfloat, 128, 64, 4, false)
 NN_COOP_BATCHED_KERNEL(matmul2d_tensorops_f16_f32_batched,      half, 128, 64, 4, false)
 NN_COOP_BATCHED_KERNEL(matmul2d_tensorops_f32_relaxed_batched, float, 128, 64, 4, true)
+// The 64x64 geometry, which the single-matrix path takes for N <= 512 (and
+// bf16 short M).
+NN_COOP_BATCHED_KERNEL(matmul2d_tensorops_bf16_f32_batched_64x64_sg4,   bfloat, 64, 64, 4, false)
+NN_COOP_BATCHED_KERNEL(matmul2d_tensorops_f16_f32_batched_64x64_sg4,      half, 64, 64, 4, false)
+NN_COOP_BATCHED_KERNEL(matmul2d_tensorops_f32_relaxed_batched_64x64_sg4, float, 64, 64, 4, true)
 
 #define NN_COOP_EPI_KERNEL(NAME, ELEM, SM, SN, NSG, RELAXED)                   \
     kernel void NAME(device ELEM *A [[buffer(0)]],                             \
@@ -470,6 +475,8 @@ NN_COOP_EPI_KERNEL(matmul2d_tensorops_bf16_f32_epi,           bfloat, 128, 64, 4
 // it only when M does not fill a 128-row tile.
 NN_COOP_EPI_KERNEL(matmul2d_tensorops_bf16_f32_epi_64x64_sg4, bfloat,  64, 64, 4, false)
 NN_COOP_EPI_KERNEL(matmul2d_tensorops_f32_relaxed_epi,         float, 128, 64, 4, true)
+NN_COOP_EPI_KERNEL(matmul2d_tensorops_f16_f32_epi_64x64_sg4,          half,  64, 64, 4, false)
+NN_COOP_EPI_KERNEL(matmul2d_tensorops_f32_relaxed_epi_64x64_sg4,      float,  64, 64, 4, true)
 
 /// TN / NT bf16 GEMMs — cooperative destination tensor (2026-08-30 round 2,
 /// bench/results/bf16_tnnt_coop_m5pro.txt): register accumulator, C touched

@@ -145,6 +145,31 @@ All notable changes to `tessl` are recorded here. The format follows
 
 ### Changed
 
+- **bf16 TN at the split-K-gated dW shapes runs a parallel split-K.** The
+  shapes `prefer_tn_splitk` picks (K >= 2048, M, N <= 384, min <= 128) took
+  a sequential split-K: a zero pass, then one 64x32 `multiply_accumulate`
+  dispatch per 256 rows of K. Every partition now runs in one dispatch as a
+  cooperative 64x64 tile set into its own scratch slice
+  (`matmul2d_tensorops_tn_splitk_par_bf16_f32`), and `reduce_partitions_f32`
+  (or the new `reduce_partitions_add_f32` for `C +=`) sums the slices in
+  partition order; `gemm_tn_splitk_par_bf16` takes an explicit width. Paired
+  on the M5 Pro it was 2.4-19x faster at its best width at every gated shape,
+  overwriting and accumulating (`bench/results/splitk_par_bf16_m5pro.txt`,
+  `bench_gemm_routes`, which also re-measured the imported split-K gate: it
+  held, and is superseded). The sequential bf16 kernel is removed. Outputs
+  at those shapes round differently (partials per partition), within the
+  same f32 bound.
+- **The cooperative NN paths share one tile rule.** bf16 now also takes
+  64x64 when C has fewer than 64 tiles of 128x64, the rule
+  `bench/results/bf16_smallm_coop_m5pro.txt` (an import from the
+  MLSystemsLab copy) described and `bf16_smallm_coop_reconciled_m5pro.txt`
+  re-measured on tessl's kernels (1.16-1.56x in every such case). The fused
+  epilogue and `gemm_batched` (batch > 1) now pick the plain path's tile,
+  with 64x64 epilogue and batched kernels for bf16, f16 and relaxed f32;
+  the epilogue measured 1.11-2.01x faster on 64x64 wherever the rule picks
+  it (`bench/results/gemm_coop_tiles_m5pro.txt`), and the relaxed-f32
+  batched exceptions are in `gemm_batched`'s docstring. The tiles give the
+  same bits, so outputs are unchanged.
 - **One panel-walk policy for every GEMM family.** The cooperative NN
   kernels (plain, epilogue, batched) walked tiles by their own gate (8-row
   column panels from 2048 tiles); everything else used `tile_walk` (512-row

@@ -83,6 +83,26 @@ kernel void reduce_partitions_f32(
     out[gid] = s;
 }
 
+/// `reduce_partitions_f32` adding into `out`:
+/// out[i] = ((out[i] + S[0][i]) + S[1][i]) + ..., in slice order, so a
+/// `C +=` split into partitions adds them to C in the order the sequential
+/// split-K's dispatches do.
+kernel void reduce_partitions_add_f32(
+    device const float *S [[buffer(0)]],
+    device float *out [[buffer(1)]],
+    constant uint &n [[buffer(2)]],
+    constant uint &partitions [[buffer(3)]],
+    constant uint &slice [[buffer(4)]],
+    uint gid [[thread_position_in_grid]])
+{
+    if (gid >= n || slice < n) return;
+    float s = out[gid];
+    for (uint p = 0; p < partitions; p++) {
+        s += S[(ulong)p * slice + gid];
+    }
+    out[gid] = s;
+}
+
 kernel void add_inplace_f32(
     device float *dst [[buffer(0)]],
     device const float *src [[buffer(1)]],

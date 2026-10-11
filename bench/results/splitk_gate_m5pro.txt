@@ -1,3 +1,9 @@
+# Reconciled 2026-10-11: measured on the MLSystemsLab copy of this crate.
+# SPLITK_MIN_K and `splitk_gate_opens_at_the_measured_depth` never existed in
+# tessl. Re-measured on tessl's kernels with this method in
+# bench/results/splitk_par_bf16_m5pro.txt: the finding holds, but a bf16
+# parallel split-K beat both arms 2.4-19x and replaced the sequential lane.
+
 Split-K gate on the bf16 TN dW shapes — M5 Pro, 2026-09-05
 ==========================================================
 

@@ -114,7 +114,8 @@ fn require_view_alignment(t: &Tensor, entry: &str, operand: &str) -> Result<(), 
     Ok(())
 }
 
-/// Tall-K / small-MN → split-K accumulate.
+/// Tall-K / small-MN → split-K: the bf16 lane's parallel split-K
+/// ([`tn_par_bf16_k_tile`]) and exact f32's `C +=` (sequential split-K).
 /// Attn dW: M=N=128, K=BT=4096. MLP dW: one side = mlp_dim=384.
 fn prefer_tn_splitk(m: usize, n: usize, k: usize) -> bool {
     k >= 2048 && m <= 384 && n <= 384 && m.min(n) <= 128
@@ -138,13 +139,6 @@ const TILE_F32: TileGeom = TileGeom {
     sn: 32,
     simdgroups: 1,
 };
-/// Split-K bf16 kernels only; the plain bf16/relaxed NN/TN/NT lanes use the
-/// cooperative-destination geometries below.
-const TILE_V2: TileGeom = TileGeom {
-    sm: 64,
-    sn: 32,
-    simdgroups: 4,
-};
 /// Coop TN/NT descriptor kernels (128×64 sg4; bench/results/
 /// bf16_tnnt_coop_m5pro.txt: 1.5–2.0× over the multiply single-run kernels).
 const TILE_COOP_TN_NT: TileGeom = TileGeom {
@@ -155,6 +149,14 @@ const TILE_COOP_TN_NT: TileGeom = TileGeom {
 /// Coop accumulate kernels (64×64 sg4; load-add-store, 1.4–1.5× over
 /// multiply_accumulate at bandwidth-bound shapes).
 const TILE_COOP_ACCUM: TileGeom = TileGeom {
+    sm: 64,
+    sn: 64,
+    simdgroups: 4,
+};
+
+/// The bf16 parallel split-K's cooperative tile
+/// (`matmul2d_tensorops_tn_splitk_par_bf16_f32`, 64×64 sg4).
+const TILE_COOP_SPLITK: TileGeom = TileGeom {
     sm: 64,
     sn: 64,
     simdgroups: 4,
@@ -377,11 +379,10 @@ fn use_relaxed_f32(rt: &GpuRuntime, backend: GemmBackend) -> bool {
 /// - f32×f32→f32 always supported (exact or relaxed via runtime flag)
 /// - bf16×bf16→f32 accum (C must be f32) via TensorOps when available
 ///
-/// Bf16 operands whose M does not fill a 128-row tile dispatch
-/// `matmul2d_tensorops_bf16_f32_64x64_sg4` even when N > 512. That
-/// instantiation is the same cooperative helper as the 128×64 kernel and
-/// takes N as a runtime extent. M ≥ 128 keeps the previous rule: 64×64 only
-/// when N ≤ 512.
+/// The cooperative paths (bf16, f16, relaxed f32) run 64×64 tiles when N ≤
+/// 512, and for bf16 also when M does not fill a 128-row tile or C has fewer
+/// than 64 tiles of 128×64; 128×64 otherwise (`coop_narrow`). Both
+/// geometries are the same cooperative helper and give the same bits.
 pub fn gemm(a: &Tensor, b: &Tensor, c: &Tensor, backend: GemmBackend) -> Result<(), String> {
     gemm_dispatch(a, b, c, backend, None)
 }
@@ -554,9 +555,18 @@ pub struct BatchedGemm {
 /// `C[i] = A[i] @ B[i]` for `spec.batch` matrices, in one dispatch.
 ///
 /// The batch is the grid's second dimension, so batching costs a pointer offset
-/// per threadgroup and nothing else — the tile geometry, the register
-/// accumulator and the swizzle are the single-matrix path's, and each element
-/// is bit-identical to the [`gemm`] that would have produced it.
+/// per threadgroup and nothing else — the tile geometry (the one [`gemm`]
+/// picks for one `m × n` matrix), the register accumulator and the walk are
+/// the single-matrix path's, and each element is bit-identical to the
+/// [`gemm`] that would have produced it.
+///
+/// Measured batched (bench/results/gemm_coop_tiles_m5pro.txt), the 64×64
+/// tile that rule picks was 1.03-1.25x faster for bf16 and f16 at every
+/// shape, and for relaxed f32 at small grids (1.10-1.70x) but 0.90-0.93x at
+/// 1024×256 ×4 and 2048×128 ×8. Batched keeps the single-matrix rule anyway,
+/// so a batched call and its per-matrix calls run the same kernel; whether
+/// relaxed f32 should leave 64×64 on large grids is a question for the
+/// single-matrix rule, which was not measured there.
 ///
 /// Requires the cooperative-destination path (bf16, f16, or f32 with relaxed
 /// precision on TensorOps), for the same reason [`gemm_epilogue`] does.
@@ -676,13 +686,17 @@ pub fn gemm_batched(a: &Tensor, b: &Tensor, c: &Tensor, backend: GemmBackend, sp
         return dispatch_tensorops_nn_coop(rt, &pipeline, a, b, c, m, n, k, tile);
     }
 
-    let kernel = match coop_elem(use_bf16, use_f16) {
-        CoopElem::Bf16 => "matmul2d_tensorops_bf16_f32_batched",
-        CoopElem::F16 => "matmul2d_tensorops_f16_f32_batched",
-        CoopElem::RelaxedF32 => "matmul2d_tensorops_f32_relaxed_batched",
+    let elem = coop_elem(use_bf16, use_f16);
+    let (kernel, tile) = match (elem, coop_narrow(m, n, elem)) {
+        (CoopElem::Bf16, false) => ("matmul2d_tensorops_bf16_f32_batched", TILE_COOP_DEFAULT),
+        (CoopElem::F16, false) => ("matmul2d_tensorops_f16_f32_batched", TILE_COOP_DEFAULT),
+        (CoopElem::RelaxedF32, false) => ("matmul2d_tensorops_f32_relaxed_batched", TILE_COOP_DEFAULT),
+        (CoopElem::Bf16, true) => ("matmul2d_tensorops_bf16_f32_batched_64x64_sg4", TILE_COOP_NARROW),
+        (CoopElem::F16, true) => ("matmul2d_tensorops_f16_f32_batched_64x64_sg4", TILE_COOP_NARROW),
+        (CoopElem::RelaxedF32, true) => ("matmul2d_tensorops_f32_relaxed_batched_64x64_sg4", TILE_COOP_NARROW),
     };
     let pipeline = rt.pipeline(kernel)?;
-    dispatch_tensorops_batched(rt, &pipeline, a, b, c, spec)
+    dispatch_tensorops_batched(rt, &pipeline, a, b, c, spec, tile)
 }
 
 /// Encode one batched cooperative GEMM. Validation, alignment included, is
@@ -694,6 +708,7 @@ fn dispatch_tensorops_batched(
     b: &Tensor,
     c: &Tensor,
     spec: BatchedGemm,
+    tile: TileGeom,
 ) -> Result<(), String> {
     let BatchedGemm {
         m,
@@ -702,9 +717,6 @@ fn dispatch_tensorops_batched(
         batch,
         strides,
     } = spec;
-    // Only the 128x64 geometry is instantiated batched; a narrow variant is a
-    // tuning question left until measured, as for the epilogue.
-    let tile = TILE_COOP_DEFAULT;
     let tiles_n = n.div_ceil(tile.sn);
     let tiles_m = m.div_ceil(tile.sm);
     let tg = morton_tg_count(tiles_n, tiles_m);
@@ -821,8 +833,9 @@ impl Epilogue<'_> {
 ///
 /// An identity epilogue dispatches to the plain [`gemm`].
 ///
-/// Bf16 operands whose M does not fill a 128-row tile use the 64×64 epilogue
-/// instantiation. Every other shape stays on 128×64.
+/// The tile is the one the plain [`gemm`] picks for the same shape and
+/// operands: fused, the epilogue measured 1.11-2.01x faster on 64×64 where
+/// that rule picks it (bench/results/gemm_coop_tiles_m5pro.txt).
 pub fn gemm_epilogue(
     a: &Tensor,
     b: &Tensor,
@@ -835,14 +848,15 @@ pub fn gemm_epilogue(
 
 /// Cooperative epilogue geometry.
 ///
-/// [`gemm_epilogue`] picks [`EpiTile::Narrow`] for bf16 only when M does not
-/// fill a 128-row tile. [`gemm_epilogue_tiled`] forces a geometry so a numeric
-/// check or a paired timing can run both on the same shape.
+/// [`gemm_epilogue`] picks the tile the plain [`gemm`] would for the same
+/// shape and operands. [`gemm_epilogue_tiled`] forces a geometry so a numeric
+/// check or a paired timing can run both on the same shape. Both geometries
+/// give the same bits.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EpiTile {
-    /// 128×64 simdgroup-4. Instantiated for bf16, f16, and relaxed f32.
+    /// 128×64 simdgroup-4.
     Wide,
-    /// 64×64 simdgroup-4. Instantiated for bf16 only.
+    /// 64×64 simdgroup-4.
     Narrow,
 }
 
@@ -937,7 +951,7 @@ fn run_gemm_epilogue(
     } else {
         CoopElem::RelaxedF32
     };
-    let chosen = tile.unwrap_or_else(|| epi_tile_auto(m, elem));
+    let chosen = tile.unwrap_or_else(|| epi_tile_auto(m, n, elem));
     let (kernel, tile) = epi_kernel(elem, chosen)?;
     let pipeline = rt.pipeline(kernel)?;
     dispatch_tensorops_epi(rt, &pipeline, a, b, c, m, n, k, tile, epi)
@@ -1012,10 +1026,10 @@ enum CoopElem {
     F16,
 }
 
-/// 64×64 epilogue only when a 128-row tile would not be filled, and only for
-/// bf16, which is the dtype that instantiation exists for.
-fn epi_tile_auto(m: usize, elem: CoopElem) -> EpiTile {
-    if elem == CoopElem::Bf16 && m < TILE_COOP_DEFAULT.sm {
+/// The epilogue's tile: the plain path's ([`coop_narrow`]), so a fused GEMM
+/// runs the geometry its unfused form would.
+fn epi_tile_auto(m: usize, n: usize, elem: CoopElem) -> EpiTile {
+    if coop_narrow(m, n, elem) {
         EpiTile::Narrow
     } else {
         EpiTile::Wide
@@ -1023,27 +1037,44 @@ fn epi_tile_auto(m: usize, elem: CoopElem) -> EpiTile {
 }
 
 fn epi_kernel(elem: CoopElem, tile: EpiTile) -> Result<(&'static str, TileGeom), String> {
-    match (elem, tile) {
-        (CoopElem::Bf16, EpiTile::Narrow) => Ok(("matmul2d_tensorops_bf16_f32_epi_64x64_sg4", TILE_COOP_NARROW)),
-        (CoopElem::Bf16, EpiTile::Wide) => Ok(("matmul2d_tensorops_bf16_f32_epi", TILE_COOP_DEFAULT)),
-        (CoopElem::F16, EpiTile::Wide) => Ok(("matmul2d_tensorops_f16_f32_epi", TILE_COOP_DEFAULT)),
-        (CoopElem::RelaxedF32, EpiTile::Wide) => Ok(("matmul2d_tensorops_f32_relaxed_epi", TILE_COOP_DEFAULT)),
-        (_, EpiTile::Narrow) => Err("GEMM epilogue: the 64x64 tile is instantiated for bf16 operands only".into()),
-    }
+    Ok(match (elem, tile) {
+        (CoopElem::Bf16, EpiTile::Narrow) => ("matmul2d_tensorops_bf16_f32_epi_64x64_sg4", TILE_COOP_NARROW),
+        (CoopElem::Bf16, EpiTile::Wide) => ("matmul2d_tensorops_bf16_f32_epi", TILE_COOP_DEFAULT),
+        (CoopElem::F16, EpiTile::Narrow) => ("matmul2d_tensorops_f16_f32_epi_64x64_sg4", TILE_COOP_NARROW),
+        (CoopElem::F16, EpiTile::Wide) => ("matmul2d_tensorops_f16_f32_epi", TILE_COOP_DEFAULT),
+        (CoopElem::RelaxedF32, EpiTile::Narrow) => ("matmul2d_tensorops_f32_relaxed_epi_64x64_sg4", TILE_COOP_NARROW),
+        (CoopElem::RelaxedF32, EpiTile::Wide) => ("matmul2d_tensorops_f32_relaxed_epi", TILE_COOP_DEFAULT),
+    })
 }
 
-/// Shape → coop NN kernel.
+/// Fewer 128×64 tiles than this leave the M5 Pro's GPU underfilled, and the
+/// 64×64 tile, four times as many threadgroups, wins (bf16, below).
+const COOP_GRID_FILL_TILES: usize = 64;
+
+/// Whether the cooperative NN kernels take 64×64 rather than 128×64: the one
+/// rule the plain, epilogue and batched paths share.
 ///
-/// N ≤ 512 uses 64×64 from the 2026-08-30 M5 Pro tile tunes. Bf16 with
-/// M < 128 also uses `matmul2d_tensorops_bf16_f32_64x64_sg4`, whose N is a
-/// runtime extent. M ≥ 128 with N > 512 stays on 128×64: paired timing at
-/// the GDN in-projection (K=2048, N=8224) had non-overlapping ranges, with
-/// 64×64 faster at M=61 and 128×64 faster at M=200.
+/// - N ≤ 512, every element type: the 2026-08-30 M5 Pro tile tunes.
+/// - bf16 with M < 128, whose rows do not fill a 128-row tile: paired timing
+///   at the GDN in-projection (K=2048, N=8224) had non-overlapping ranges,
+///   64×64 faster at M=61 and 128×64 faster at M=200.
+/// - bf16 whose C has fewer than [`COOP_GRID_FILL_TILES`] tiles of 128×64:
+///   `bench_gemm_routes` (bench/results/bf16_smallm_coop_reconciled_m5pro.txt)
+///   measured 64×64 1.16-1.56x faster in every such case at M = 128-512, and
+///   tied or slower (0.84-1.04x) from 64 tiles up. f16 and relaxed f32 were
+///   not measured on the plain path and keep the N rule.
+fn coop_narrow(m: usize, n: usize, elem: CoopElem) -> bool {
+    if n <= 512 {
+        return true;
+    }
+    elem == CoopElem::Bf16
+        && (m < TILE_COOP_DEFAULT.sm
+            || m.div_ceil(TILE_COOP_DEFAULT.sm) * n.div_ceil(TILE_COOP_DEFAULT.sn) < COOP_GRID_FILL_TILES)
+}
+
+/// Shape → coop NN kernel, by [`coop_narrow`]. K does not enter.
 fn nn_coop_kernel(m: usize, n: usize, _k: usize, elem: CoopElem) -> (&'static str, TileGeom) {
-    // N ≤ 512 is the 2026-08-30 tune. The short-M clause is bf16 only: f16
-    // and relaxed f32 keep the N rule. M ≥ 128 with N > 512 stays on 128×64.
-    let short_m = elem == CoopElem::Bf16 && m < TILE_COOP_DEFAULT.sm;
-    coop_kernel(elem, short_m || n <= 512)
+    coop_kernel(elem, coop_narrow(m, n, elem))
 }
 
 fn nn_coop_kernel_for(elem: CoopElem, tile: EpiTile) -> (&'static str, TileGeom) {
@@ -1329,12 +1360,21 @@ impl GemmOperands {
     }
 
     /// As [`Self::nn_scratch_bytes`], for [`Self::tn`] (`C [m, n]`, shared
-    /// dimension `k`): under [`Self::ExactF32`], the parallel split-K's
-    /// partition scratch ([`tn_par_k_tile`]), or the transposed `A` a device
-    /// without TensorOps takes.
+    /// dimension `k`): the parallel split-K's partition scratch
+    /// ([`tn_par_k_tile`] under [`Self::ExactF32`], [`tn_par_bf16_k_tile`]
+    /// under [`Self::Bf16`]), or the transposed `A` a device without
+    /// TensorOps takes.
     pub(crate) fn tn_scratch_bytes(self, has_tensorops: bool, m: usize, n: usize, k: usize) -> u64 {
         match self {
-            Self::Bf16 => bf16_copies(k.saturating_mul(m), k.saturating_mul(n)),
+            Self::Bf16 => {
+                let split = if prefer_tn_splitk(m, n, k) {
+                    let slice = m.saturating_mul(n).div_ceil(4).saturating_mul(4);
+                    f32_temp(slice.saturating_mul(k.div_ceil(tn_par_bf16_k_tile(m, n, k))))
+                } else {
+                    0
+                };
+                bf16_copies(k.saturating_mul(m), k.saturating_mul(n)).saturating_add(split)
+            }
             Self::ExactF32 if !(USE_TN_NT_DESCRIPTORS && has_tensorops) => f32_temp(m.saturating_mul(k)),
             Self::ExactF32 => tn_par_k_tile(m, n, k).map_or(0, |k_tile| {
                 // Each partition's slice is padded to 16 bytes.
@@ -1449,15 +1489,51 @@ pub fn gemm_tn_bf16(a_km: &Tensor, b_kn: &Tensor, c: &Tensor) -> Result<(), Stri
     let a_bf = ensure_bf16(a_km)?;
     let b_bf = ensure_bf16(b_kn)?;
     if prefer_tn_splitk(m, n, k) {
-        return gemm_tn_splitk_bf16(&a_bf, &b_bf, c, k);
+        let k_tile = tn_par_bf16_k_tile(m, n, k);
+        return tn_splitk_par(
+            &a_bf,
+            &b_bf,
+            c,
+            (m, n, k),
+            k_tile,
+            SplitKPar::Bf16,
+            false,
+            "gemm_tn_bf16",
+        );
     }
     // Coop kernel: register accumulator, C written once, no zero pre-pass.
     let pipeline = rt.pipeline("matmul2d_tensorops_tn_bf16_f32")?;
     dispatch_tensorops_nn_coop(rt, &pipeline, &a_bf, &b_bf, c, m, n, k, TILE_COOP_TN_NT)
 }
 
-/// K-partition width of the TN split-K lanes (small M·N, tall K).
+/// K-partition width of the exact-f32 sequential TN split-K (`C +=`).
 const TN_SPLITK_K_TILE: usize = 256;
+
+/// K-partition width of the bf16 parallel split-K at a [`prefer_tn_splitk`]
+/// shape: the widest of 1024, 512 and 256 that still gives at least
+/// `MIN_TGS` threadgroups of `TILE_COOP_SPLITK` tiles, else 256, widened
+/// until the scratch fits `TN_PAR_MAX_SCRATCH`.
+///
+/// M5 Pro, `bench_gemm_routes` (bench/results/splitk_par_bf16_m5pro.txt):
+/// against the sequential 64x32 lane this replaced, 2.4-19x (best width) at every gated
+/// shape, overwriting and accumulating. The best width followed the
+/// threadgroup count: 4 tiles over K = 4096 were best at 512 (32
+/// threadgroups), 12 tiles at 1024 (48), and every shape at K >= 8192 at
+/// 1024; one partition per 256 rows only paid when K was 2048 or the C
+/// was a single tile (within 3% of the best there).
+fn tn_par_bf16_k_tile(m: usize, n: usize, k: usize) -> usize {
+    const MIN_TGS: usize = 32;
+    let tiles = m.div_ceil(TILE_COOP_SPLITK.sm) * n.div_ceil(TILE_COOP_SPLITK.sn);
+    let mut k_tile = [1024, 512, 256]
+        .into_iter()
+        .find(|&w| tiles.saturating_mul(k.div_ceil(w)) >= MIN_TGS)
+        .unwrap_or(256);
+    let slice = m.saturating_mul(n).div_ceil(4).saturating_mul(4);
+    while slice.saturating_mul(k.div_ceil(k_tile)) > TN_PAR_MAX_SCRATCH {
+        k_tile *= 2;
+    }
+    k_tile
+}
 
 /// The sequential exact-f32 TN split-K, now only for `C +=` (`tn_accum`):
 /// its partitions add into C one after another.
@@ -1542,39 +1618,90 @@ fn tn_par_k_tile(m: usize, n: usize, k: usize) -> Option<usize> {
 /// routes here by `tn_par_k_tile`; this entry takes the width, so a bench
 /// can sweep it.
 pub fn gemm_tn_splitk_par_f32(a_km: &Tensor, b_kn: &Tensor, c: &Tensor, k_tile: usize) -> Result<(), String> {
-    let (m, n, k) = validate_gemm(a_km, b_kn, c, Layout::TN, false, "gemm_tn_splitk_par_f32")?;
-    let rt = a_km.runtime();
-    if !rt.has_tensorops() {
-        return Err("gemm_tn_splitk_par_f32: TensorOps is unavailable on this device".into());
+    const WHAT: &str = "gemm_tn_splitk_par_f32";
+    let dims = validate_gemm(a_km, b_kn, c, Layout::TN, false, WHAT)?;
+    if !a_km.runtime().has_tensorops() {
+        return Err(format!("{WHAT}: TensorOps is unavailable on this device"));
     }
+    tn_splitk_par(a_km, b_kn, c, dims, k_tile, SplitKPar::F32, false, WHAT)
+}
+
+/// [`gemm_tn_splitk_par_f32`] on bf16 operands (f32 ones rounded first) with
+/// f32 accumulation: each K-partition is one cooperative 64×64 tile
+/// (`matmul2d_tensorops_tn_splitk_par_bf16_f32`) stored into its scratch
+/// slice, then `reduce_partitions_f32`. This entry takes the width, so a
+/// bench can sweep it.
+pub fn gemm_tn_splitk_par_bf16(a_km: &Tensor, b_kn: &Tensor, c: &Tensor, k_tile: usize) -> Result<(), String> {
+    const WHAT: &str = "gemm_tn_splitk_par_bf16";
+    let dims = validate_gemm(a_km, b_kn, c, Layout::TN, true, WHAT)?;
+    check_bf16_lane(a_km.runtime(), c, WHAT)?;
+    let (a, b) = (ensure_bf16(a_km)?, ensure_bf16(b_kn)?);
+    tn_splitk_par(&a, &b, c, dims, k_tile, SplitKPar::Bf16, false, WHAT)
+}
+
+/// The kernel family of a parallel TN split-K.
+#[derive(Clone, Copy)]
+enum SplitKPar {
+    /// `matmul2d_tensorops_tn_splitk_par_f32`, 32×32 on one simdgroup.
+    F32,
+    /// `matmul2d_tensorops_tn_splitk_par_bf16_f32`, 64×64 cooperative.
+    Bf16,
+}
+
+impl SplitKPar {
+    fn kernel(self) -> (&'static str, TileGeom) {
+        match self {
+            Self::F32 => ("matmul2d_tensorops_tn_splitk_par_f32", TILE_F32),
+            Self::Bf16 => ("matmul2d_tensorops_tn_splitk_par_bf16_f32", TILE_COOP_SPLITK),
+        }
+    }
+}
+
+/// The parallel TN split-K's binder: every partition's tiles in one dispatch
+/// into a scratch of `ceil(K / k_tile)` slices, then one reduce that writes
+/// (or, with `accumulate`, adds into) C. Validation of the operands is the
+/// caller's; the width and the scratch size are checked here.
+#[allow(clippy::too_many_arguments)]
+fn tn_splitk_par(
+    a_km: &Tensor,
+    b_kn: &Tensor,
+    c: &Tensor,
+    (m, n, k): (usize, usize, usize),
+    k_tile: usize,
+    lane: SplitKPar,
+    accumulate: bool,
+    what: &str,
+) -> Result<(), String> {
+    let rt = a_km.runtime();
     // A multiple of 4 keeps every partition's start in A and B 16-byte
     // aligned, as the scratch slices are.
     if k_tile == 0 || k_tile % 4 != 0 {
         return Err(format!(
-            "gemm_tn_splitk_par_f32: a K partition of {k_tile}, not a positive multiple of 4"
+            "{what}: a K partition of {k_tile}, not a positive multiple of 4"
         ));
     }
     let partitions = k.div_ceil(k_tile);
-    let as_u32 = |v: usize, what: &str| -> Result<u32, String> {
-        u32::try_from(v).map_err(|_| format!("gemm_tn_splitk_par_f32: {what} {v} does not fit the kernel's u32"))
+    let as_u32 = |v: usize, label: &str| -> Result<u32, String> {
+        u32::try_from(v).map_err(|_| format!("{what}: {label} {v} does not fit the kernel's u32"))
     };
-    let tiles_n = n.div_ceil(TILE_F32.sn);
-    let tiles_m = m.div_ceil(TILE_F32.sm);
+    let (kernel, tile) = lane.kernel();
+    let tiles_n = n.div_ceil(tile.sn);
+    let tiles_m = m.div_ceil(tile.sm);
     let groups = tiles_n
         .checked_mul(tiles_m)
         .and_then(|t| t.checked_mul(partitions))
-        .ok_or("gemm_tn_splitk_par_f32: threadgroup count overflows")?;
-    let numel = m.checked_mul(n).ok_or("gemm_tn_splitk_par_f32: M·N overflows")?;
+        .ok_or_else(|| format!("{what}: threadgroup count overflows"))?;
+    let numel = m.checked_mul(n).ok_or_else(|| format!("{what}: M·N overflows"))?;
     // Each slice starts 16-byte aligned, as tessl asks of every GEMM operand.
     // The M5 Pro also computes correctly from 4-byte-aligned slices, so no
     // test observes this padding.
     let slice = numel.div_ceil(4) * 4;
     let scratch_len = slice
         .checked_mul(partitions)
-        .ok_or("gemm_tn_splitk_par_f32: scratch length overflows")?;
+        .ok_or_else(|| format!("{what}: scratch length overflows"))?;
     if scratch_len > TN_PAR_MAX_SCRATCH {
         return Err(format!(
-            "gemm_tn_splitk_par_f32: {partitions} partitions of {m}x{n} need {scratch_len} scratch floats, over the cap of {TN_PAR_MAX_SCRATCH}"
+            "{what}: {partitions} partitions of {m}x{n} need {scratch_len} scratch floats, over the cap of {TN_PAR_MAX_SCRATCH}"
         ));
     }
     as_u32(groups, "threadgroup count")?;
@@ -1583,11 +1710,16 @@ pub fn gemm_tn_splitk_par_f32(a_km: &Tensor, b_kn: &Tensor, c: &Tensor, k_tile: 
     let (m_u, n_u, k_u) = (as_u32(m, "M")?, as_u32(n, "N")?, as_u32(k, "K")?);
     let (k_tile_u, parts_u) = (as_u32(k_tile, "k_tile")?, as_u32(partitions, "partitions")?);
     let (numel_u, slice_u) = (as_u32(numel, "M·N")?, as_u32(slice, "slice")?);
-    // Zeroed by allocation (bump and pool both), as `mode::multiply` needs.
+    // Zeroed by allocation (bump and pool both), as the exact kernel's
+    // `mode::multiply` needs; the cooperative one overwrites its slice.
     let scratch = rt.alloc_temp_f32(&[scratch_len])?;
-    let gemm_p = rt.pipeline("matmul2d_tensorops_tn_splitk_par_f32")?;
-    let reduce_p = rt.pipeline("reduce_partitions_f32")?;
-    let tpt = threads_per_tg(&gemm_p, TILE_F32);
+    let gemm_p = rt.pipeline(kernel)?;
+    let reduce_p = rt.pipeline(if accumulate {
+        "reduce_partitions_add_f32"
+    } else {
+        "reduce_partitions_f32"
+    })?;
+    let tpt = threads_per_tg(&gemm_p, tile);
     let r_tpt = reduce_p.threadExecutionWidth().min(numel).max(1);
     let r_groups = numel.div_ceil(r_tpt);
     rt.with_binder(|bnd| {
@@ -1719,33 +1851,6 @@ fn dispatch_k_partitions(
     Ok(())
 }
 
-fn gemm_tn_splitk_bf16(a_km: &Tensor, b_kn: &Tensor, c: &Tensor, k: usize) -> Result<(), String> {
-    gemm_tn_splitk_bf16_opts(a_km, b_kn, c, k, /*zero_first=*/ true)
-}
-
-fn gemm_tn_splitk_bf16_opts(
-    a_km: &Tensor,
-    b_kn: &Tensor,
-    c: &Tensor,
-    k: usize,
-    zero_first: bool,
-) -> Result<(), String> {
-    let (m, n) = (a_km.shape[1], b_kn.shape[1]);
-    let rt = a_km.runtime();
-    let pipeline = rt.pipeline("matmul2d_tensorops_tn_splitk_bf16_f32")?;
-    dispatch_k_partitions(
-        rt,
-        &pipeline,
-        a_km,
-        b_kn,
-        c,
-        (m, n, k),
-        TILE_V2,
-        TN_SPLITK_K_TILE,
-        zero_first,
-    )
-}
-
 /// `C[M,N] = A[M,K] @ B[N,K]^T` (NT). B is stored `[N,K]` (e.g. `W[in,out]`).
 pub fn gemm_nt_f32(a_mk: &Tensor, b_nk: &Tensor, c: &Tensor, backend: GemmBackend) -> Result<(), String> {
     let (m, n, k) = validate_gemm(a_mk, b_nk, c, Layout::NT, false, "gemm_nt_f32")?;
@@ -1805,7 +1910,8 @@ fn tn_accum(
     if bf16 {
         let (a, b) = (ensure_bf16(a_km)?, ensure_bf16(b_kn)?);
         if prefer_tn_splitk(m, n, k) {
-            return gemm_tn_splitk_bf16_opts(&a, &b, c, k, /*zero_first=*/ false);
+            let k_tile = tn_par_bf16_k_tile(m, n, k);
+            return tn_splitk_par(&a, &b, c, (m, n, k), k_tile, SplitKPar::Bf16, true, "tn_accum");
         }
         let pipeline = rt.pipeline("matmul2d_tensorops_tn_accum_bf16_f32")?;
         return dispatch_tensorops_accum(rt, &pipeline, &a, &b, c, m, n, k, TILE_COOP_ACCUM);
@@ -2071,6 +2177,34 @@ mod tests {
             (12, 0, 4096),
         ] {
             assert_eq!(tn_par_k_tile(m, n, k), None, "{m}x{n}x{k}");
+        }
+    }
+
+    /// The bf16 parallel split-K's width at the gated dW shapes, where
+    /// bench/results/splitk_par_bf16_m5pro.txt measured the best of 256, 512
+    /// and 1024: the widest that keeps at least 32 threadgroups of 64x64
+    /// tiles. Every gated width keeps the scratch under the cap and each
+    /// partition's start 16-byte aligned.
+    #[test]
+    fn bf16_parallel_split_k_width_follows_the_threadgroup_count() {
+        assert_eq!(tn_par_bf16_k_tile(128, 128, 4096), 512);
+        assert_eq!(tn_par_bf16_k_tile(128, 384, 4096), 1024);
+        assert_eq!(tn_par_bf16_k_tile(384, 128, 4096), 1024);
+        assert_eq!(tn_par_bf16_k_tile(128, 384, 32_768), 1024);
+        assert_eq!(tn_par_bf16_k_tile(128, 128, 2048), 256);
+        assert_eq!(tn_par_bf16_k_tile(64, 64, 8192), 256);
+        for m in (1..=384).step_by(31) {
+            for n in (1..=384).step_by(29) {
+                for k in [2048, 4096, 50_304, 1 << 20, 1 << 22] {
+                    if !prefer_tn_splitk(m, n, k) {
+                        continue;
+                    }
+                    let k_tile = tn_par_bf16_k_tile(m, n, k);
+                    let scratch = k.div_ceil(k_tile) * (m * n).div_ceil(4) * 4;
+                    assert!(scratch <= TN_PAR_MAX_SCRATCH, "({m}, {n}, {k}) at {k_tile}: {scratch}");
+                    assert!(k_tile % 4 == 0 && k_tile >= 256, "({m}, {n}, {k}): {k_tile}");
+                }
+            }
         }
     }
 
@@ -3388,43 +3522,64 @@ mod stress_tests {
 }
 
 #[cfg(test)]
-mod epi_tile_select {
-    use super::*;
-
-    #[test]
-    fn narrow_only_when_bf16_m_does_not_fill_a_128_row_tile() {
-        assert_eq!(epi_tile_auto(1, CoopElem::Bf16), EpiTile::Narrow);
-        assert_eq!(epi_tile_auto(61, CoopElem::Bf16), EpiTile::Narrow);
-        assert_eq!(epi_tile_auto(127, CoopElem::Bf16), EpiTile::Narrow);
-        assert_eq!(epi_tile_auto(128, CoopElem::Bf16), EpiTile::Wide);
-        assert_eq!(epi_tile_auto(200, CoopElem::Bf16), EpiTile::Wide);
-        assert_eq!(epi_tile_auto(61, CoopElem::F16), EpiTile::Wide);
-        assert_eq!(epi_tile_auto(61, CoopElem::RelaxedF32), EpiTile::Wide);
-    }
-}
-
-#[cfg(test)]
 mod coop_tile_select {
     use super::*;
 
+    const BF16_NARROW: &str = "matmul2d_tensorops_bf16_f32_64x64_sg4";
+    const BF16_WIDE: &str = "matmul2d_tensorops_bf16_f32";
+
+    /// The rule `bench/results/bf16_smallm_coop_m5pro.txt` described on the
+    /// MLSystemsLab copy and bench/results/bf16_smallm_coop_reconciled_m5pro.txt
+    /// re-measured here: bf16 takes 64x64 while C has fewer than 64 tiles of
+    /// 128x64, on top of N <= 512 and short M.
     #[test]
-    fn bf16_short_m_uses_the_existing_64x64_kernel_when_n_exceeds_512() {
-        let narrow = "matmul2d_tensorops_bf16_f32_64x64_sg4";
-        let wide = "matmul2d_tensorops_bf16_f32";
+    fn nn_coop_kernel_selects_the_narrow_tile_by_grid_fill() {
+        // (m, n, wide tiles, narrow?) at the measured shapes.
+        for (m, n, narrow) in [
+            (128usize, 3072usize, true), // 48 tiles: 64x64 1.17x
+            (128, 768, true),            // 12 tiles: 1.49x
+            (256, 768, true),            // 24 tiles: 1.56x
+            (512, 768, true),            // 48 tiles: 1.16x
+            (128, 2048, true),           // 32 tiles: 1.20x
+            (128, 4096, false),          // 64 tiles: 0.99x
+            (256, 2048, false),          // 64 tiles: 1.04x
+            (256, 3072, false),          // 96 tiles: 1.02x
+            (1024, 768, false),          // 96 tiles: 0.87x
+            (512, 4096, false),          // 256 tiles: 0.89x
+        ] {
+            let tiles = m.div_ceil(128) * n.div_ceil(64);
+            assert_eq!(tiles < 64, narrow, "{m}x{n}: {tiles} tiles");
+            let (name, tile) = nn_coop_kernel(m, n, 2048, CoopElem::Bf16);
+            assert_eq!(name, if narrow { BF16_NARROW } else { BF16_WIDE }, "{m}x{n}");
+            assert_eq!((tile.sm, tile.sn), if narrow { (64, 64) } else { (128, 64) });
+            let epi = if narrow { EpiTile::Narrow } else { EpiTile::Wide };
+            assert_eq!(
+                epi_tile_auto(m, n, CoopElem::Bf16),
+                epi,
+                "{m}x{n}: epilogue follows the plain path"
+            );
+            // f16 and relaxed f32 keep the N rule.
+            for elem in [CoopElem::F16, CoopElem::RelaxedF32] {
+                assert_eq!(nn_coop_kernel(m, n, 2048, elem).1.sm, 128, "{elem:?} {m}x{n}");
+                assert_eq!(epi_tile_auto(m, n, elem), EpiTile::Wide, "{elem:?} {m}x{n}");
+            }
+        }
+    }
+
+    /// Short M and N <= 512, which grid fill extends rather than replaces.
+    #[test]
+    fn bf16_short_m_and_narrow_n_take_64x64() {
         for m in [1usize, 61, 127] {
-            let (name, tile) = nn_coop_kernel(m, 8224, 2048, CoopElem::Bf16);
-            assert_eq!(name, narrow, "M={m}");
-            assert_eq!((tile.sm, tile.sn, tile.simdgroups), (64, 64, 4));
+            assert_eq!(nn_coop_kernel(m, 8224, 2048, CoopElem::Bf16).0, BF16_NARROW, "M={m}");
+            assert_eq!(epi_tile_auto(m, 8224, CoopElem::Bf16), EpiTile::Narrow, "M={m}");
         }
-        for m in [128usize, 200] {
-            let (name, tile) = nn_coop_kernel(m, 8224, 2048, CoopElem::Bf16);
-            assert_eq!(name, wide, "M={m}");
-            assert_eq!((tile.sm, tile.sn, tile.simdgroups), (128, 64, 4));
+        // M = 200 at the GDN in-projection: 2 x 129 tiles, so 128x64.
+        assert_eq!(nn_coop_kernel(200, 8224, 2048, CoopElem::Bf16).0, BF16_WIDE);
+        for elem in [CoopElem::Bf16, CoopElem::F16, CoopElem::RelaxedF32] {
+            assert_eq!(nn_coop_kernel(4096, 512, 64, elem).1.sm, 64, "{elem:?}");
+            assert_eq!(epi_tile_auto(4096, 512, elem), EpiTile::Narrow, "{elem:?}");
+            assert_eq!(nn_coop_kernel(4096, 513, 64, elem).1.sm, 128, "{elem:?}");
         }
-        // N ≤ 512 is unchanged, including when M fills a 128-row tile.
-        let (name, _) = nn_coop_kernel(200, 512, 2048, CoopElem::Bf16);
-        assert_eq!(name, narrow);
-        // f16 and relaxed f32 do not take the short-M exception.
         assert_eq!(
             nn_coop_kernel(61, 8224, 2048, CoopElem::F16).0,
             "matmul2d_tensorops_f16_f32"
@@ -3439,48 +3594,41 @@ mod coop_tile_select {
         );
     }
 
-    /// Ragged K and N must not move the tile. `nn_coop_kernel` ignores K, and
-    /// N enters only as `n <= 512`. N = 520 is past that cut and not a multiple
-    /// of 64; K = 7 is not a multiple of 8. f16 and relaxed f32 stay on their
-    /// own 128×64 kernels, never the bf16 64×64 name.
+    /// Every element type has both epilogue tiles, at the plain path's
+    /// geometries.
     #[test]
-    fn ragged_k_and_n_do_not_hand_f16_or_f32_the_bf16_short_m_kernel() {
-        let n = 520usize;
-        let k = 7usize;
-        assert!(
-            n > 512 && n % 64 != 0,
-            "attack shape must keep a partial N tile past the 512 cut"
-        );
-        assert_ne!(k % 8, 0, "attack shape must keep a partial K");
-        let bf16_narrow = "matmul2d_tensorops_bf16_f32_64x64_sg4";
-        let bf16_wide = "matmul2d_tensorops_bf16_f32";
-        for m in [1usize, 127] {
-            let (name, tile) = nn_coop_kernel(m, n, k, CoopElem::Bf16);
-            assert_eq!(name, bf16_narrow, "M={m}");
-            assert_eq!((tile.sm, tile.sn, tile.simdgroups), (64, 64, 4));
-            assert_eq!(epi_tile_auto(m, CoopElem::Bf16), EpiTile::Narrow, "M={m}");
-            for elem in [CoopElem::F16, CoopElem::RelaxedF32] {
-                let (other, wide) = nn_coop_kernel(m, n, k, elem);
-                assert_ne!(other, bf16_narrow, "{elem:?} M={m} took the bf16 short-M kernel");
-                assert_ne!(other, bf16_wide, "{elem:?} M={m} took the bf16 wide kernel");
-                assert_eq!((wide.sm, wide.sn), (128, 64), "{elem:?} M={m}");
-                assert_eq!(epi_tile_auto(m, elem), EpiTile::Wide, "{elem:?} M={m}");
-                let err = match epi_kernel(elem, EpiTile::Narrow) {
-                    Err(err) => err,
-                    Ok((name, _)) => panic!("{elem:?}: narrow epilogue was accepted as {name}"),
-                };
-                assert!(err.contains("bf16"), "{elem:?}: {err}");
+    fn every_epilogue_tile_is_instantiated() {
+        for elem in [CoopElem::Bf16, CoopElem::F16, CoopElem::RelaxedF32] {
+            for (tile, sm) in [(EpiTile::Wide, 128), (EpiTile::Narrow, 64)] {
+                let (name, geom) = epi_kernel(elem, tile).unwrap();
+                assert_eq!((geom.sm, geom.sn, geom.simdgroups), (sm, 64, 4), "{name}");
+                assert_eq!(name.ends_with("_64x64_sg4"), sm == 64, "{name}");
             }
         }
-        let (name, tile) = nn_coop_kernel(128, n, k, CoopElem::Bf16);
-        assert_eq!(name, bf16_wide);
-        assert_eq!((tile.sm, tile.sn), (128, 64));
-        assert_eq!(epi_tile_auto(128, CoopElem::Bf16), EpiTile::Wide);
-        // K is not an input. Branching on K % 8 later would split these.
-        assert_eq!(
-            nn_coop_kernel(127, n, k, CoopElem::Bf16).0,
-            nn_coop_kernel(127, n, k + 1, CoopElem::Bf16).0
-        );
+    }
+
+    /// Ragged K and N must not move the tile: K is not an input, and N
+    /// enters only through `n <= 512` and the tile count. N = 520 is past
+    /// the cut and not a multiple of 64; K = 7 is not a multiple of 8.
+    #[test]
+    fn ragged_k_and_n_do_not_move_the_tile() {
+        let (n, k) = (520usize, 7usize);
+        assert!(n > 512 && n % 64 != 0 && k % 8 != 0);
+        for m in [1usize, 127, 128, 4096] {
+            let narrow = coop_narrow(m, n, CoopElem::Bf16);
+            assert_eq!(narrow, m < 128 || m.div_ceil(128) * 9 < 64, "M={m}");
+            assert_eq!(
+                nn_coop_kernel(m, n, k, CoopElem::Bf16).0,
+                nn_coop_kernel(m, n, k + 1, CoopElem::Bf16).0
+            );
+            for elem in [CoopElem::F16, CoopElem::RelaxedF32] {
+                let (other, wide) = nn_coop_kernel(m, n, k, elem);
+                assert_ne!(other, BF16_NARROW, "{elem:?} M={m} took the bf16 kernel");
+                assert_ne!(other, BF16_WIDE, "{elem:?} M={m} took the bf16 kernel");
+                assert_eq!((wide.sm, wide.sn), (128, 64), "{elem:?} M={m}");
+                assert_eq!(epi_tile_auto(m, n, elem), EpiTile::Wide, "{elem:?} M={m}");
+            }
+        }
     }
 }
 
@@ -3704,7 +3852,7 @@ mod alignment_probe {
                 batch: BATCH,
                 strides,
             };
-            dispatch_tensorops_batched(rt, &p, &a, &b, &c, spec)?;
+            dispatch_tensorops_batched(rt, &p, &a, &b, &c, spec, TILE_COOP_DEFAULT)?;
             rt.synchronize()?;
             let all = c.read_f32()?;
             return Ok((0..BATCH)

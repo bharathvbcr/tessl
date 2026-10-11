@@ -606,6 +606,11 @@ neither shipped.
 `bf16_smallm_coop_m5pro.txt`, `splitk_gate_m5pro.txt`,
 `arg_table_latch_m5pro.txt` and `coop_clear_m5pro.txt`. The narrow tile wins
 at small M and loses once the grid fills; split-K wins from K = 12288. The
+first two were measured on the MLSystemsLab copy of this crate and
+re-measured on tessl's kernels with their method on 2026-10-11
+(`bf16_smallm_coop_reconciled_m5pro.txt`, `splitk_par_bf16_m5pro.txt`): the
+grid-fill rule held and was ported for bf16; a parallel bf16 split-K beat
+both arms of the split-K gate and replaced the sequential lane. The
 latch and accumulator-clear changes are inside the noise and are kept as
 cleanups, not speedups.
 

@@ -630,6 +630,7 @@ fn main() -> Result<(), String> {
         }
     }
     rt.set_async_encode(false)?;
+    common::emit_kernel_trace();
     common::exit_if_unstable("bench_gemm_routes", &run.unstable.borrow());
     Ok(())
 }

@@ -296,6 +296,15 @@ pub fn self_spread(rounds: &[f64]) -> f64 {
 /// more than 10% against itself across the rounds of one shape.
 pub const SELF_SPREAD_LIMIT: f64 = 0.10;
 
+/// Print the kernels this process dispatched as one `KERNEL_TRACE a,b,...`
+/// line on stderr, for `bench/kernel_coverage.py`. Prints nothing when
+/// `TESSL_KERNEL_TRACE` is unset, so normal runs are unchanged.
+pub fn emit_kernel_trace() {
+    if tessl::runtime::kernel_trace_enabled() {
+        eprintln!("KERNEL_TRACE {}", tessl::runtime::traced_kernels().join(","));
+    }
+}
+
 /// Exit 3 when any shape's baseline broke [`SELF_SPREAD_LIMIT`]. Its lines
 /// were printed with the `EXCEEDS 10%` flag; the status keeps a script from
 /// reading the run as clean.

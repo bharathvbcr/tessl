@@ -68,13 +68,6 @@ fn time_lane(rt: &Arc<GpuRuntime>, l: &Lane, warmup: usize, iters: usize) -> Res
     Ok(s)
 }
 
-/// Emit the kernel trace for `bench/kernel_coverage.py`.
-fn emit_kernel_trace() {
-    if tessl::runtime::kernel_trace_enabled() {
-        eprintln!("KERNEL_TRACE {}", tessl::runtime::traced_kernels().join(","));
-    }
-}
-
 fn run() -> Result<(), String> {
     let rt = GpuRuntime::new()?;
     if !rt.has_tensorops() {
@@ -343,6 +336,6 @@ fn run() -> Result<(), String> {
 
 fn main() -> Result<(), String> {
     let outcome = run();
-    emit_kernel_trace();
+    common::emit_kernel_trace();
     outcome
 }

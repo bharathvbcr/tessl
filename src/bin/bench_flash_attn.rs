@@ -572,14 +572,6 @@ fn time_cfg(
 /// is caught rather than inheriting whatever the allocator handed back.
 const UNWRITTEN: f32 = -6.5e28;
 
-/// Emit the kernel trace for `bench/kernel_coverage.py`. Prints nothing when
-/// tracing is off, so normal runs are unchanged.
-fn emit_kernel_trace() {
-    if tessl::runtime::kernel_trace_enabled() {
-        eprintln!("KERNEL_TRACE {}", tessl::runtime::traced_kernels().join(","));
-    }
-}
-
 fn run() -> Result<(), String> {
     let args: Vec<String> = std::env::args().collect();
     let dump_dir = match args.iter().position(|a| a == "--dump-parity") {
@@ -791,7 +783,7 @@ fn main() -> Result<(), String> {
     // early and an error exits earlier still, and a trace that silently skips
     // those paths would under-report coverage exactly where it matters.
     let outcome = run();
-    emit_kernel_trace();
+    common::emit_kernel_trace();
     outcome
 }
 

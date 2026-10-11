@@ -39,7 +39,7 @@
 
 mod common;
 use common::gdn::{alpha_mamba2_refuted, gates_published, sequential_f64, Dims, GateBias, GateClamp, Problem, Rule};
-use common::{random_f32, U_F32};
+use common::{random_f32, sigmoid, U_F32};
 
 /// `ln(1e-4 / (1 - 1e-4))` — the logit at which `alpha`'s floor starts to bite.
 /// Stated to full f64 precision so `alpha_floor_engages_at_the_logit_of_the_bound`
@@ -66,15 +66,6 @@ fn bth(b: usize, l: usize, h: usize, f: impl Fn(usize, usize, usize) -> f32) -> 
         }
     }
     v
-}
-
-fn sigmoid_f64(x: f64) -> f64 {
-    if x >= 0.0 {
-        1.0 / (1.0 + (-x).exp())
-    } else {
-        let e = x.exp();
-        e / (1.0 + e)
-    }
 }
 
 /// What a K7 kernel computing in f32 would produce. Not a reference — a model of
@@ -118,8 +109,8 @@ fn published_gate_is_the_sigmoid_of_the_biased_logit() {
     );
 
     for (i, &x) in logits.iter().enumerate() {
-        assert_close(&format!("alpha[{i}]"), alpha[i], sigmoid_f64(f64::from(x)), 0.0);
-        assert_close(&format!("beta[{i}]"), beta[i], sigmoid_f64(f64::from(-x)), 0.0);
+        assert_close(&format!("alpha[{i}]"), alpha[i], sigmoid(f64::from(x)), 0.0);
+        assert_close(&format!("beta[{i}]"), beta[i], sigmoid(f64::from(-x)), 0.0);
     }
     // Spot-check against values computed outside this file, so the test is not
     // just `sigmoid` compared with itself.
@@ -142,8 +133,8 @@ fn a_gate_drives_alpha_and_b_gate_drives_beta() {
     };
     let (alpha, beta) = gates_published(&a, &b, d, bias, GateClamp::PUBLISHED);
     let (alpha_swapped, beta_swapped) = gates_published(&b, &a, d, bias, GateClamp::PUBLISHED);
-    assert_close("alpha", alpha[0], sigmoid_f64(2.0), 0.0);
-    assert_close("beta", beta[0], sigmoid_f64(-2.0), 0.0);
+    assert_close("alpha", alpha[0], sigmoid(2.0), 0.0);
+    assert_close("beta", beta[0], sigmoid(-2.0), 0.0);
     assert_close("alpha swapped", alpha_swapped[0], beta[0], 0.0);
     assert_close("beta swapped", beta_swapped[0], alpha[0], 0.0);
     assert!(
@@ -176,7 +167,7 @@ fn gate_layout_maps_bth_input_onto_bhl_output() {
     for bi in 0..b {
         for hi in 0..h {
             for t in 0..l {
-                let want = sigmoid_f64(f64::from(code(bi, t, hi)));
+                let want = sigmoid(f64::from(code(bi, t, hi)));
                 let got = alpha[(bi * h + hi) * l + t];
                 assert_close(&format!("alpha[b{bi} h{hi} t{t}]"), got, want, 0.0);
             }
@@ -200,7 +191,7 @@ fn reading_the_gate_without_transposing_gives_a_different_answer() {
     let (alpha, _) = gates_published(&a, &a, d, bias, GateClamp::PUBLISHED);
 
     // The mistake: treat the `[B,T,H]` buffer as if it were already `[B,H,L]`.
-    let naive: Vec<f64> = a.iter().map(|&x| sigmoid_f64(f64::from(x))).collect();
+    let naive: Vec<f64> = a.iter().map(|&x| sigmoid(f64::from(x))).collect();
 
     assert_eq!(
         alpha.len(),
@@ -268,18 +259,8 @@ fn bias_is_per_head_and_broadcasts_over_batch_and_position() {
         for hi in 0..h {
             for t in 0..l {
                 let idx = (bi * h + hi) * l + t;
-                assert_close(
-                    &format!("alpha[b{bi} h{hi} t{t}]"),
-                    alpha[idx],
-                    sigmoid_f64(decay[hi]),
-                    0.0,
-                );
-                assert_close(
-                    &format!("beta[b{bi} h{hi} t{t}]"),
-                    beta[idx],
-                    sigmoid_f64(update[hi]),
-                    0.0,
-                );
+                assert_close(&format!("alpha[b{bi} h{hi} t{t}]"), alpha[idx], sigmoid(decay[hi]), 0.0);
+                assert_close(&format!("beta[b{bi} h{hi} t{t}]"), beta[idx], sigmoid(update[hi]), 0.0);
             }
         }
     }
@@ -438,7 +419,7 @@ fn alpha_saturates_to_exactly_one_later_in_f64_than_in_f32() {
         let (mut lo, mut hi) = (0.0f64, 100.0f64);
         for _ in 0..80 {
             let mid = 0.5 * (lo + hi);
-            if sigmoid_f64(mid) == 1.0 {
+            if sigmoid(mid) == 1.0 {
                 hi = mid;
             } else {
                 lo = mid;
@@ -480,7 +461,7 @@ fn alpha_saturates_to_exactly_one_later_in_f64_than_in_f32() {
     // that has not saturated.
     let x = 0.5 * (t32 + t64);
     assert_eq!(sigmoid_f32(x as f32), 1.0, "f32 should have saturated at {x}");
-    assert!(sigmoid_f64(x) < 1.0, "f64 must not have saturated at {x}");
+    assert!(sigmoid(x) < 1.0, "f64 must not have saturated at {x}");
 }
 
 #[test]
@@ -491,7 +472,7 @@ fn a_saturated_alpha_gap_compounds_past_the_fixture_bound() {
     const L: i32 = 8191; // the longest published fixture
     let x = 17.0f64; // just past 16.6355
     let a_f32 = f64::from(sigmoid_f32(x as f32));
-    let a_f64 = sigmoid_f64(x);
+    let a_f64 = sigmoid(x);
     assert_eq!(a_f32, 1.0, "premise: f32 has saturated at {x}");
     assert!(a_f64 < 1.0, "premise: f64 has not saturated at {x}");
 
@@ -530,7 +511,7 @@ fn the_refuted_formula_is_the_sign_flipped_sigmoid_at_zero_init() {
         assert_close(
             &format!("refuted[{i}] at logit {x}"),
             got[i],
-            sigmoid_f64(f64::from(-x)),
+            sigmoid(f64::from(-x)),
             1e-14,
         );
     }

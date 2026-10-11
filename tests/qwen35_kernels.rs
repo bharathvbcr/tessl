@@ -1333,7 +1333,6 @@ fn swiglu_f32_and_bf16_from_a_fused_gate_up_buffer() {
         fused[g_off] = 120.0;
         fused[g_off + 1] = -120.0;
         fused[ld + g_off] = -89.0;
-        let silu = |x: f64| x / (1.0 + (-x).exp());
         let want: Vec<f64> = (0..rows)
             .flat_map(|r| {
                 let f = &fused;

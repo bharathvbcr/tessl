@@ -6,7 +6,7 @@
 //   gemv_q4_mlx_blocked_gate_up_gelu — fused gate∥up → gelu_pytorch_tanh mid
 //   gemv_q4_mlx_simd* — true qmv_fast peel + bfloat2 sb; row-major or Interleaved4
 #include <metal_stdlib>
-#include "gelu.h"
+#include "act.h"
 #include "q4_mlx_dot.h"
 using namespace metal;
 

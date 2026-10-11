@@ -45,6 +45,8 @@ use std::path::{Path, PathBuf};
 
 use tessl::npy::read_npy;
 
+use super::sigmoid;
+
 /// Which state the delta correction reads.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Rule {
@@ -421,17 +423,6 @@ pub struct GateBias<'a> {
     pub decay: &'a [f64],
     /// `update_bias`, `[H]`. Added before the sigmoid that produces `beta`.
     pub update: &'a [f64],
-}
-
-fn sigmoid(x: f64) -> f64 {
-    // Branch on the sign so neither `exp` argument is ever large and positive.
-    // `1/(1+exp(-x))` overflows for very negative `x`; this form does not.
-    if x >= 0.0 {
-        1.0 / (1.0 + (-x).exp())
-    } else {
-        let e = x.exp();
-        e / (1.0 + e)
-    }
 }
 
 /// **K7.** The published gate production: `sigmoid(gate + per-head bias)`, clamped.

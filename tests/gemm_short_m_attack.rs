@@ -11,8 +11,8 @@ mod common;
 use std::sync::Arc;
 
 use common::{
-    assert_within_bound, random_f32, reference, round_trip_bf16, tensor_bf16, tensor_f32, tolerance, with_gpu, Layout,
-    Reference, U_BF16,
+    assert_within_bound, random_f32, reference, round_trip_bf16, silu, tensor_bf16, tensor_f32, tolerance, with_gpu,
+    Layout, Reference, U_BF16,
 };
 use tessl::gemm::{gemm_epilogue, gemm_epilogue_tiled, gemm_tiled, Activation, EpiTile, Epilogue, GemmBackend};
 use tessl::tensor::{bf16_bits_to_f32, f16_bits_to_f32, f32_slice_to_f16};
@@ -352,7 +352,7 @@ fn epilogue_reference(a: &[f32], b: &[f32], c_prev: &[f32], bias: &[f32], m: usi
                 acc += a[i * K + p] * b[p * N + j];
             }
             let v = alpha * acc + beta * c_prev[i * N + j] + bias[j];
-            out[i * N + j] = v / (1.0 + (-v).exp());
+            out[i * N + j] = silu(f64::from(v)) as f32;
         }
     }
     out

@@ -465,7 +465,7 @@ pub fn dense_gemv(dense: &[f32], x: &[f32], rows: usize, cols: usize) -> Vec<f32
 
 /// CPU `gelu_pytorch_tanh` in f64, the oracle for every GELU kernel test.
 ///
-/// Mirrors `kernels/gelu.h`: only the cubic's input is clamped, and the outer
+/// Mirrors `kernels/act.h`: only the cubic's input is clamped, and the outer
 /// factor is the original `x`, so large positive inputs come out as ~`x`. One
 /// oracle, because a test copy that multiplied by the clamped value agreed with
 /// a kernel that did the same and kept a broken GEMM epilogue green.
@@ -473,6 +473,26 @@ pub fn gelu_pytorch_tanh(x: f64) -> f64 {
     let xc = x.clamp(-20.0, 20.0);
     let inner = 0.7978845608028654 * (xc + 0.044715 * xc * xc * xc);
     0.5 * x * (1.0 + inner.clamp(-10.0, 10.0).tanh())
+}
+
+/// CPU sigmoid in f64, the oracle for every sigmoid and SiLU kernel test.
+///
+/// Branches on the sign so `exp` never sees a large positive argument, like
+/// `kernels/act.h`: the textbook `1 / (1 + exp(-x))` overflows for very
+/// negative `x`, and a reference must not lean on how a division by infinity
+/// comes out.
+pub fn sigmoid(x: f64) -> f64 {
+    if x >= 0.0 {
+        1.0 / (1.0 + (-x).exp())
+    } else {
+        let e = x.exp();
+        e / (1.0 + e)
+    }
+}
+
+/// CPU SiLU (`x * sigmoid(x)`) in f64, the oracle for every SiLU kernel test.
+pub fn silu(x: f64) -> f64 {
+    x * sigmoid(x)
 }
 
 /// Assert `got ~= want` elementwise with a relative-plus-absolute tolerance.

@@ -61,6 +61,7 @@
 // Grouped heads follow transformers' `repeat_interleave`: value head `h`
 // reads key head `h / (Hv / Hk)`.
 #include <metal_stdlib>
+#include "act.h"
 #include "qwen35_act.h"
 using namespace metal;
 
@@ -160,7 +161,7 @@ kernel void qwen35_conv1d_silu(
         for (uint j = 0u; j < KW; ++j) {
             acc += w[(ulong)c * KW + j] * conv_ext(xc, st, ld_x, hist, has_state, e + j);
         }
-        y[((ulong)b * T + e) * (ulong)C + c] = qwen35_silu(acc);
+        y[((ulong)b * T + e) * (ulong)C + c] = tessl_silu(acc);
     } else if ((flags & 2u) != 0u) {
         const uint j = e - T;
         state_out[((ulong)b * C + c) * hist + j] = conv_ext(xc, st, ld_x, hist, has_state, Tb + j);
@@ -266,7 +267,7 @@ kernel void qwen35_gdn_chunk_prep(
                 rq[i] = rsqrt(ssq + GDN_L2_EPS) * q_scale;
                 rk[i] = rsqrt(ssk + GDN_L2_EPS);
                 G[i] = qwen35_log_decay(gr[a_off + hv], a_log[hv], dt_bias[hv]);
-                beta[i] = qwen35_sigmoid(gr[b_off + hv]);
+                beta[i] = tessl_sigmoid(gr[b_off + hv]);
             } else {
                 rq[i] = 0.0f;
                 rk[i] = 0.0f;
@@ -840,7 +841,7 @@ inline void gdn_recurrent_body(
         const float rq = rsqrt(simd_sum(ssq) + GDN_L2_EPS) * q_scale;
         const float rk = rsqrt(simd_sum(ssk) + GDN_L2_EPS);
         const float decay = exp(qwen35_log_decay(gr[a_off + hv], a_log[hv], dt_bias[hv]));
-        const float beta = qwen35_sigmoid(gr[b_off + hv]);
+        const float beta = tessl_sigmoid(gr[b_off + hv]);
 
         // kv_mem = (decay * S)^T k
         float kv = 0.0f;
@@ -952,7 +953,7 @@ inline void gated_rms_norm_row(
     }
     const float inv = rsqrt(simd_sum(ss) / (float)D + eps);
     for (uint d = lane; d < D; d += 32u) {
-        orow[d] = (OutT)(w[d] * (xr[d] * inv) * qwen35_silu(zr[d]));
+        orow[d] = (OutT)(w[d] * (xr[d] * inv) * tessl_silu(zr[d]));
     }
 }
 
@@ -1019,5 +1020,5 @@ kernel void qwen35_gdn_gates_f32(
     device const float *row = p + (ulong)r * ld;
     const ulong o = (ulong)r * H + h;
     g[o] = qwen35_log_decay(row[a_off + h], a_log[h], dt_bias[h]);
-    beta[o] = qwen35_sigmoid(row[b_off + h]);
+    beta[o] = tessl_sigmoid(row[b_off + h]);
 }

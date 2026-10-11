@@ -17,6 +17,7 @@
 // All arithmetic is f32; the inputs are the forward's f32 inputs.
 #include <metal_stdlib>
 #include "reduce_tree.h"
+#include "act.h"
 #include "qwen35_act.h"
 using namespace metal;
 
@@ -30,7 +31,7 @@ constant uint GATED_BWD_SG = 4;
 /// silu'(g) = s (1 + g (1 - s)), s = sigmoid(g).
 inline float qwen35_silu_grad(float g)
 {
-    const float s = qwen35_sigmoid(g);
+    const float s = tessl_sigmoid(g);
     return s * (1.0f + g * (1.0f - s));
 }
 
@@ -190,14 +191,14 @@ kernel void qwen35_gated_rms_norm_bwd_f32(
         float dot = 0.0f;
         for (uint d = lane; d < D; d += 32u) {
             const float xn = xr[d] * rstd;
-            dot += gr[d] * w[d] * qwen35_silu(zr[d]) * xn;
+            dot += gr[d] * w[d] * tessl_silu(zr[d]) * xn;
         }
         const float m = simd_sum(dot) / (float)D;
         uint k = 0;
         for (uint d = lane; d < D; d += 32u, ++k) {
             const float xn = xr[d] * rstd;
             const float zv = zr[d];
-            const float s = qwen35_silu(zv);
+            const float s = tessl_silu(zv);
             const float dxn = gr[d] * w[d] * s;
             xo[d] = rstd * (dxn - xn * m);
             zo[d] = gr[d] * w[d] * xn * qwen35_silu_grad(zv);
@@ -256,7 +257,7 @@ kernel void qwen35_swiglu_bwd_f32(
     const float u = up[(ulong)r * ld_up + up_off + col];
     const float d = dy[(ulong)r * ld_dy + dy_off + col];
     dgate[(ulong)r * ld_dgate + dgate_off + col] = d * u * qwen35_silu_grad(g);
-    dup[(ulong)r * ld_dup + dup_off + col] = d * qwen35_silu(g);
+    dup[(ulong)r * ld_dup + dup_off + col] = d * tessl_silu(g);
 }
 
 /// Attention output gate backward, `out = attn * sigmoid(gate)` with head h's
@@ -287,7 +288,7 @@ kernel void qwen35_attn_gate_bwd_f32(
     const uint h = col / D;
     const uint d = col % D;
     const ulong gi = (ulong)r * ld_p + q_off + (ulong)h * 2u * D + D + d;
-    const float s = qwen35_sigmoid(p[gi]);
+    const float s = tessl_sigmoid(p[gi]);
     const float a = attn[(ulong)r * Hq * D + col];
     const float g = dy[(ulong)r * ld_dy + dy_off + col];
     d_attn[(ulong)r * Hq * D + col] = g * s;
@@ -662,9 +663,9 @@ kernel void qwen35_gdn_gates_bwd_f32(
         device float *drow = dp + r * ld;
         const ulong o = r * H + h;
         const float x = row[a_off + h] + dt_bias[h];
-        const float sp_grad = x > 20.0f ? 1.0f : qwen35_sigmoid(x);
+        const float sp_grad = x > 20.0f ? 1.0f : tessl_sigmoid(x);
         const float da = dg[o] * neg_a * sp_grad;
-        const float s = qwen35_sigmoid(row[b_off + h]);
+        const float s = tessl_sigmoid(row[b_off + h]);
         drow[a_off + h] = da;
         drow[b_off + h] = dbeta[o] * s * (1.0f - s);
         acc_log += dg[o] * qwen35_log_decay(row[a_off + h], a_log[h], dt_bias[h]);

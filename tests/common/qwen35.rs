@@ -13,16 +13,9 @@ use std::path::{Path, PathBuf};
 
 use tessl::npy::read_npy;
 
-pub const DK: usize = 128;
+pub use super::{sigmoid, silu};
 
-pub fn sigmoid(x: f64) -> f64 {
-    if x >= 0.0 {
-        1.0 / (1.0 + (-x).exp())
-    } else {
-        let e = x.exp();
-        e / (1.0 + e)
-    }
-}
+pub const DK: usize = 128;
 
 /// torch's `F.softplus` at its defaults: linear above 20.
 pub fn softplus(x: f64) -> f64 {
@@ -31,10 +24,6 @@ pub fn softplus(x: f64) -> f64 {
     } else {
         x.exp().ln_1p()
     }
-}
-
-pub fn silu(x: f64) -> f64 {
-    x * sigmoid(x)
 }
 
 /// Shape of a GDN problem. Key head dim is [`DK`].

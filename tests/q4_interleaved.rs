@@ -414,7 +414,7 @@ fn gate_up_gelu_i4_matches_two_gemvs_and_a_gelu() {
         let xr = round_trip_bf16(&x);
         let gate = dense_gemv(&bg.dense, &xr, rows, cols);
         let up = dense_gemv(&du, &xr, rows, cols);
-        // The kernel's GELU (gelu.h), as `nn::mlp_gelu_tanh`.
+        // The kernel's GELU (act.h), as `nn::mlp_gelu_tanh`.
         let want: Vec<f32> = gate
             .iter()
             .zip(&up)

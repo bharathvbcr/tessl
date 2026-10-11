@@ -3,9 +3,9 @@
 //
 // The cubic is clamped so x³ cannot overflow, and precise::tanh's argument is
 // clamped because -O2 lowers tanh to fast_tanh, which NaNs past saturation.
-// The outer factor stays the original x (see gelu.h).
+// The outer factor stays the original x (see act.h).
 #include <metal_stdlib>
-#include "gelu.h"
+#include "act.h"
 using namespace metal;
 
 /// out[i] = gelu_pytorch_tanh(gate[i]) * up[i]

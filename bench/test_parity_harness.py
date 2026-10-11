@@ -1188,16 +1188,16 @@ def benchmark_evidence_contract():
     else:
         FAILURES.append(f"pre-validation output discovery selected {selected!r}")
         print(f"  FAIL  pre-validation output discovery selected {selected!r}")
-    old_knob = os.environ.get("TESSL_GEMM_ACCUM")
+    old_knob = os.environ.get("TESSL_ATTN_TILED")
     try:
-        os.environ["TESSL_GEMM_ACCUM"] = "1"
+        os.environ["TESSL_ATTN_TILED"] = "1"
         clean_env = clean_benchmark_env({"BENCH_ITERS": "7"})
     finally:
         if old_knob is None:
-            os.environ.pop("TESSL_GEMM_ACCUM", None)
+            os.environ.pop("TESSL_ATTN_TILED", None)
         else:
-            os.environ["TESSL_GEMM_ACCUM"] = old_knob
-    if ("TESSL_GEMM_ACCUM" not in clean_env and clean_env.get("BENCH_ITERS") == "7"
+            os.environ["TESSL_ATTN_TILED"] = old_knob
+    if ("TESSL_ATTN_TILED" not in clean_env and clean_env.get("BENCH_ITERS") == "7"
             and clean_env.get("PATH") == os.environ.get("PATH")):
         print("  ok    inherited tuning knobs are cleared; only explicit overrides survive")
     else:

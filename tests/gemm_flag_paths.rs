@@ -1,20 +1,19 @@
-//! The accumulate kernels and the interior-offset branch, under the flags
-//! that select them.
+//! The accumulate kernels behind `gemm_{tn,nt}_accum_train`, and the
+//! interior-offset branch under the flag that selects it.
 //!
-//! `TESSL_GEMM_ACCUM`, `TESSL_GEMM_ACCUM_DX` and `TESSL_GEMM_INTERIOR` default
-//! off and latch on first read, so with the default environment the four
-//! shipped `*_accum_*` kernels never run (`gemm_*_accum_train` takes the
-//! temp-plus-`add_inplace_f32` fallback) and the `use_interior` branch of the
-//! exact-f32 kernels is dead. Nothing in the suite set them (audit G7): the
-//! only place that did was a benchmark script asserting the kernels were
-//! *dispatched*, which checks no output value.
+//! `gemm_{tn,nt}_accum_train` took a temp-plus-`add_inplace_f32` fallback
+//! unless `TESSL_GEMM_ACCUM` / `TESSL_GEMM_ACCUM_DX` were set, while
+//! `GemmOperands::{tn_acc, nt_acc}` ran the accumulate kernels with no flag.
+//! The flags are retired: one path, pinned here bit for bit against
+//! `GemmOperands`. `TESSL_GEMM_INTERIOR` defaults off and latches on first
+//! read, so with the default environment the `use_interior` branch of the
+//! exact-f32 kernels is dead.
 //!
-//! The flags are process-global and the environment cannot be mutated safely
+//! The flag is process-global and the environment cannot be mutated safely
 //! under a concurrent `getenv`, so each configuration re-runs its own test in
 //! a child process with the variables set, filtered to itself and
 //! single-threaded. The child checks numbers against an f64 reference and,
-//! with `TESSL_KERNEL_TRACE` on, that the accumulate kernels themselves ran
-//! and the fallback did not.
+//! with `TESSL_KERNEL_TRACE` on, which kernels ran.
 
 mod common;
 
@@ -23,7 +22,7 @@ use common::{
     tensor_f32_at, with_gpu, Layout, Reference, F32_PANEL_SHAPES,
 };
 use std::sync::Arc;
-use tessl::gemm::{gemm_nt_accum_train, gemm_nt_f32, gemm_tn_accum_train, gemm_tn_f32};
+use tessl::gemm::{gemm_nt_accum_train, gemm_nt_f32, gemm_tn_accum_train, gemm_tn_f32, GemmOperands};
 use tessl::runtime::traced_kernels;
 use tessl::{gemm_f32, GemmBackend, GpuRuntime, PrecisionMode};
 
@@ -168,13 +167,55 @@ fn assert_not_traced(kernel: &str) {
     );
 }
 
-/// `TESSL_GEMM_ACCUM=1`: the bf16 and f32 accumulate kernels, TN and NT,
-/// on full-tile and ragged shapes, with the previous C folded in.
+/// `gemm_*_accum_train` and the `GemmOperands` accumulate on one `C0`, bit
+/// for bit: the same kernels, whatever precision the runtime is in.
+fn check_same_as_operands(rt: &Arc<GpuRuntime>, layout: Layout, bf16: bool, (m, n, k): (usize, usize, usize)) {
+    let (a_shape, b_shape) = operand_shapes(layout, m, n, k);
+    let a = tensor_f32(rt, &a_shape, &random_f32(m * k, 0x0e1 ^ (m * 13 + k) as u64));
+    let b = tensor_f32(rt, &b_shape, &random_f32(k * n, 0x0e2 ^ (n * 11 + k) as u64));
+    let c0 = random_f32(m * n, 0x0e3 ^ (m * n) as u64);
+    let (train, ops) = (tensor_f32(rt, &[m, n], &c0), tensor_f32(rt, &[m, n], &c0));
+    let lane = if bf16 {
+        GemmOperands::Bf16
+    } else {
+        GemmOperands::ExactF32
+    };
+    rt.set_precision(if bf16 { PrecisionMode::Bf16 } else { PrecisionMode::F32 });
+    match layout {
+        Layout::Tn => {
+            gemm_tn_accum_train(&a, &b, &train, GemmBackend::TensorOps).unwrap();
+            lane.tn_acc(&a, &b, &ops).unwrap();
+        }
+        Layout::Nt => {
+            gemm_nt_accum_train(&a, &b, &train, GemmBackend::TensorOps).unwrap();
+            lane.nt_acc(&a, &b, &ops).unwrap();
+        }
+        Layout::Nn => unreachable!("no NN accumulate train entry point"),
+    }
+    rt.synchronize().unwrap();
+    let (t, o) = (train.buffer.read_f32(), ops.buffer.read_f32());
+    if let Some(i) = (0..m * n).find(|&i| t[i].to_bits() != o[i].to_bits()) {
+        panic!(
+            "{layout:?} bf16={bf16} {m}x{n}x{k}: accum_train and GemmOperands differ at {i}: {} vs {}",
+            t[i], o[i]
+        );
+    }
+}
+
+/// The bf16 and f32 accumulate kernels, TN and NT, on full-tile, ragged,
+/// K = 3, split-K-gated and column-panel shapes, with the previous C folded
+/// in. The retired variables are set to `0`, the value that used to select
+/// the fallback, and change nothing.
 #[test]
-fn accumulate_kernels_add_into_c_under_the_accum_flag() {
+fn accumulate_train_entries_run_the_accumulate_kernels() {
     in_child(
-        "accumulate_kernels_add_into_c_under_the_accum_flag",
-        &[("TESSL_GEMM_ACCUM", "1")],
+        "accumulate_train_entries_run_the_accumulate_kernels",
+        &[
+            ("TESSL_GEMM_ACCUM", "0"),
+            ("TESSL_GEMM_ACCUM_DX", "0"),
+            ("METAL_NATIVE_GEMM_ACCUM", "0"),
+            ("METAL_NATIVE_GEMM_ACCUM_DX", "0"),
+        ],
         || {
             with_gpu(|rt| {
                 if !rt.has_tensorops() {
@@ -182,13 +223,25 @@ fn accumulate_kernels_add_into_c_under_the_accum_flag() {
                 }
                 // K = 3 keeps a·b small against C0, so the final f32 add's
                 // rounding has to be in the budget (`with_previous`).
-                for &(m, n, k) in &[(128usize, 128usize, 256usize), (96, 48, 64), (200, 72, 96), (96, 48, 3)] {
+                // (128, 384, 4096) takes the split-K TN lanes.
+                for &(m, n, k) in &[
+                    (128usize, 128usize, 256usize),
+                    (96, 48, 64),
+                    (200, 72, 96),
+                    (96, 48, 3),
+                    (128, 384, 4096),
+                ] {
                     rt.set_precision(PrecisionMode::F32);
                     check_accum(rt, Layout::Tn, false, m, n, k);
                     check_accum(rt, Layout::Nt, false, m, n, k);
                     rt.set_precision(PrecisionMode::Bf16);
                     check_accum(rt, Layout::Tn, true, m, n, k);
                     check_accum(rt, Layout::Nt, true, m, n, k);
+                    for layout in [Layout::Tn, Layout::Nt] {
+                        for bf16 in [false, true] {
+                            check_same_as_operands(rt, layout, bf16, (m, n, k));
+                        }
+                    }
                 }
                 rt.set_precision(PrecisionMode::F32);
                 for &(m, n, k) in F32_PANEL_SHAPES {
@@ -200,6 +253,8 @@ fn accumulate_kernels_add_into_c_under_the_accum_flag() {
                     "matmul2d_tensorops_nt_accum_f32",
                     "matmul2d_tensorops_tn_accum_bf16_f32",
                     "matmul2d_tensorops_nt_accum_bf16_f32",
+                    "matmul2d_tensorops_tn_splitk_f32",
+                    "matmul2d_tensorops_tn_splitk_bf16_f32",
                 ] {
                     assert_traced(kernel);
                 }
@@ -209,7 +264,7 @@ fn accumulate_kernels_add_into_c_under_the_accum_flag() {
     );
 }
 
-/// `TESSL_GEMM_ACCUM=1` on views 16, 32 and 48 bytes into their buffers.
+/// Accumulate views 16, 32 and 48 bytes into their buffers.
 /// The exact-f32 accumulate kernels are pointer-tensor kernels like plain f32,
 /// which takes these views; they used to be refused under the cooperative
 /// path's 64-byte rule, so `gemm_tn_f32` accepted a view `gemm_tn_accum_train`
@@ -217,78 +272,42 @@ fn accumulate_kernels_add_into_c_under_the_accum_flag() {
 /// `bench/results/gemm_align_probe_m5pro.txt`), bf16 accumulate included.
 #[test]
 fn accumulate_kernels_take_views_on_any_16_byte_boundary() {
-    in_child(
-        "accumulate_kernels_take_views_on_any_16_byte_boundary",
-        &[("TESSL_GEMM_ACCUM", "1")],
-        || {
-            with_gpu(|rt| {
-                if !rt.has_tensorops() {
-                    return;
-                }
-                for pad in [16, 32, 48] {
-                    for shape in [(96usize, 48usize, 64usize), (130, 97, 70)] {
-                        rt.set_precision(PrecisionMode::F32);
-                        check_accum_at(rt, Layout::Tn, false, shape, pad);
-                        check_accum_at(rt, Layout::Nt, false, shape, pad);
-                        rt.set_precision(PrecisionMode::Bf16);
-                        check_accum_at(rt, Layout::Tn, true, shape, pad);
-                        check_accum_at(rt, Layout::Nt, true, shape, pad);
-                    }
-                }
-                for kernel in [
-                    "matmul2d_tensorops_tn_accum_f32",
-                    "matmul2d_tensorops_nt_accum_f32",
-                    "matmul2d_tensorops_tn_accum_bf16_f32",
-                    "matmul2d_tensorops_nt_accum_bf16_f32",
-                ] {
-                    assert_traced(kernel);
-                }
-                assert_not_traced("add_inplace_f32");
-            });
-        },
-    );
-}
-
-/// `TESSL_GEMM_ACCUM_DX=1` alone: only the NT (dX-class) lane accumulates in
-/// place; TN still takes the fallback.
-#[test]
-fn only_the_nt_lane_accumulates_under_the_dx_flag() {
-    in_child(
-        "only_the_nt_lane_accumulates_under_the_dx_flag",
-        &[("TESSL_GEMM_ACCUM_DX", "1")],
-        || {
-            with_gpu(|rt| {
-                if !rt.has_tensorops() {
-                    return;
-                }
-                for &(m, n, k) in &[(128usize, 128usize, 256usize), (96, 48, 64)] {
+    in_child("accumulate_kernels_take_views_on_any_16_byte_boundary", &[], || {
+        with_gpu(|rt| {
+            if !rt.has_tensorops() {
+                return;
+            }
+            for pad in [16, 32, 48] {
+                for shape in [(96usize, 48usize, 64usize), (130, 97, 70)] {
                     rt.set_precision(PrecisionMode::F32);
-                    check_accum(rt, Layout::Nt, false, m, n, k);
-                    check_accum(rt, Layout::Tn, false, m, n, k);
+                    check_accum_at(rt, Layout::Tn, false, shape, pad);
+                    check_accum_at(rt, Layout::Nt, false, shape, pad);
                     rt.set_precision(PrecisionMode::Bf16);
-                    check_accum(rt, Layout::Nt, true, m, n, k);
-                    check_accum(rt, Layout::Tn, true, m, n, k);
+                    check_accum_at(rt, Layout::Tn, true, shape, pad);
+                    check_accum_at(rt, Layout::Nt, true, shape, pad);
                 }
-                rt.set_precision(PrecisionMode::F32);
-                assert_traced("matmul2d_tensorops_nt_accum_f32");
-                assert_traced("matmul2d_tensorops_nt_accum_bf16_f32");
-                assert_not_traced("matmul2d_tensorops_tn_accum_f32");
-                assert_not_traced("matmul2d_tensorops_tn_accum_bf16_f32");
-                // TN fell back to temp + add, as documented.
-                assert_traced("add_inplace_f32");
-            });
-        },
-    );
+            }
+            for kernel in [
+                "matmul2d_tensorops_tn_accum_f32",
+                "matmul2d_tensorops_nt_accum_f32",
+                "matmul2d_tensorops_tn_accum_bf16_f32",
+                "matmul2d_tensorops_nt_accum_bf16_f32",
+            ] {
+                assert_traced(kernel);
+            }
+            assert_not_traced("add_inplace_f32");
+        });
+    });
 }
 
-/// `TESSL_GEMM_INTERIOR=1` (with `TESSL_GEMM_ACCUM=1` so the f32 accumulate
-/// kernels also take their interior branch): every exact-f32 kernel on a
-/// shape whose tiles are all interior and on a ragged one where only some are.
+/// `TESSL_GEMM_INTERIOR=1` (the f32 accumulate kernels take their interior
+/// branch too): every exact-f32 kernel on a shape whose tiles are all
+/// interior and on a ragged one where only some are.
 #[test]
 fn exact_f32_kernels_agree_with_the_reference_on_the_interior_branch() {
     in_child(
         "exact_f32_kernels_agree_with_the_reference_on_the_interior_branch",
-        &[("TESSL_GEMM_INTERIOR", "1"), ("TESSL_GEMM_ACCUM", "1")],
+        &[("TESSL_GEMM_INTERIOR", "1")],
         || {
             with_gpu(|rt| {
                 if !rt.has_tensorops() {

@@ -145,6 +145,19 @@ All notable changes to `tessl` are recorded here. The format follows
 
 ### Changed
 
+- **`gemm_{tn,nt}_accum_train` always run the accumulate kernels;
+  `TESSL_GEMM_ACCUM` and `TESSL_GEMM_ACCUM_DX` are retired.** Training has
+  reached the accumulate kernels through `GemmOperands::{tn_acc, nt_acc}`
+  with no flag since that API landed, weight banks included; the flags gated
+  only these two legacy entries, which otherwise computed the product into a
+  temporary and added it. They are now `GemmOperands`' path on the precision
+  the runtime picks (bit for bit, pinned by
+  `accumulate_train_entries_run_the_accumulate_kernels`), so the rounding of
+  `C += ...` changes for callers that left the flags unset, as ojas's
+  `arch02` trainer does (`model_bwd.rs`). The simdgroup backend has no
+  accumulate kernel and is now refused instead of taking the temporary. The
+  variables, including their `METAL_RUNTIME_*` / `METAL_NATIVE_*` spellings,
+  are no longer read.
 - **`infer_trace` counts every allocator catch-up as a sync wait.** The
   counter's doc says `sync_waits` and `sync_wait_us` include allocator
   catch-ups, but only the catch-up inside a waiting commit was counted; the

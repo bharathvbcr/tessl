@@ -87,7 +87,7 @@ block. Coop variants measured 0.77–1.10x — no win. Same for the accumulating
 TN/NT kernels: 0.88–1.12x against the real accumulate kernel.
 
 (Measured against the *default* build the accumulate coop looked like 1.19–2.74x,
-but `METAL_NATIVE_GEMM_ACCUM` defaults off, so that baseline was the
+but `METAL_NATIVE_GEMM_ACCUM` defaulted off (retired 2026-10-10), so that baseline was the
 temp-buffer + `add_inplace` fallback. That fallback really is 1.19–2.74x slower
 than the accumulate kernel, but enabling it is a training-quality decision
 already made on numerics grounds.)

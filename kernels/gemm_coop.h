@@ -124,6 +124,15 @@ struct walk_by_grid {
     }
 };
 
+/// `walk_linear`: `tile_from_linear` whatever B's size (Morton on square
+/// power-of-two grids, row-major otherwise): `tile_walk` with no panels.
+struct walk_linear {
+    template <int SM>
+    static inline uint2 tile(uint linear, uint tiles_n, uint tiles_m, uint N, uint K) {
+        return tile_from_linear(linear, tiles_n, tiles_m);
+    }
+};
+
 /// `walk_row_major`: plain row-major, whatever the grid; the tune rig's
 /// baseline walk.
 struct walk_row_major {
@@ -361,10 +370,12 @@ inline void mm_coop(device ElemT *A, device ElemT *B, device float *C,
 // =============================================================================
 
 /// `C (+)= A @ B` exact f32, `TRANS_A` / `TRANS_B` for TN / NT, `ACCUMULATE`
-/// for `multiply_accumulate`. `use_interior` (host `TESSL_GEMM_INTERIOR=1`)
+/// for `multiply_accumulate`, the tile order from `Walk` (production:
+/// `walk_by_b`). `use_interior` (host `TESSL_GEMM_INTERIOR=1`)
 /// takes interior tiles through offset pointer tensors, which measured slower
 /// on M5 Pro f32 training shapes; otherwise every tile takes the slice path.
-template <bool TRANS_A, bool TRANS_B, bool ACCUMULATE, int SM, int SN>
+template <bool TRANS_A, bool TRANS_B, bool ACCUMULATE, int SM, int SN,
+          typename Walk = walk_by_b>
 inline void mm_exact_f32(device float *A, device float *B, device float *C,
                          uint M, uint N, uint K, uint tiles_n, uint tiles_m,
                          uint use_interior, uint tgpig) {
@@ -374,7 +385,7 @@ inline void mm_exact_f32(device float *A, device float *B, device float *C,
                    : matmul2d_descriptor::mode::multiply);
     matmul2d<desc, execution_simdgroup> op;
 
-    uint2 tile = tile_walk<SM>(tgpig, tiles_n, tiles_m, N, K);
+    uint2 tile = Walk::template tile<SM>(tgpig, tiles_n, tiles_m, N, K);
     if (tile.x >= tiles_n || tile.y >= tiles_m) return;
     int tx = (int)tile.x * SN;
     int ty = (int)tile.y * SM;

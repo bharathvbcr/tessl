@@ -396,3 +396,62 @@ TUNE_PANEL_KERNEL(mm_bf16_nt_accum_coop_64x64_sg4_ph8,  mm_bf16_nt_coop_panel, 6
 TUNE_PANEL_KERNEL(mm_bf16_nt_accum_coop_64x64_sg4_ph16, mm_bf16_nt_coop_panel, 64, 64, 4, 16, true)
 TUNE_PANEL_KERNEL(mm_bf16_tn_accum_coop_64x64_sg4_ph8,  mm_bf16_tn_coop_panel, 64, 64, 4,  8, true)
 TUNE_PANEL_KERNEL(mm_bf16_tn_accum_coop_64x64_sg4_ph16, mm_bf16_tn_coop_panel, 64, 64, 4, 16, true)
+
+// =============================================================================
+// One panel-walk policy: the production coop kernels (edges included) with
+// the other family's walk. The NN coop kernels walk by grid size
+// (`walk_by_grid`: >= 2048 tiles take 8-row panels); TN, NT, their
+// accumulate forms, exact f32 and int8 walk by B's size (`walk_by_b`,
+// `tile_walk`). `_walkb` / `_walkg` swap them; the bench's production arm is
+// the shipped walk.
+// =============================================================================
+
+#define TUNE_WALK_KERNEL(NAME, ELEM, SM, SN, NSG, TA, TB, ACCUM, WALK)         \
+    kernel void NAME(device ELEM *A [[buffer(0)]],                             \
+                     device ELEM *B [[buffer(1)]],                             \
+                     device float *C [[buffer(2)]],                            \
+                     constant uint &M [[buffer(3)]],                           \
+                     constant uint &N [[buffer(4)]],                           \
+                     constant uint &K [[buffer(5)]],                           \
+                     constant uint &tiles_n [[buffer(6)]],                     \
+                     constant uint &tiles_m [[buffer(7)]],                     \
+                     uint tgpig [[threadgroup_position_in_grid]]) {            \
+        mm_coop<ELEM, SM, SN, NSG, TA, TB, false, ACCUM, false, WALK>(         \
+            A, B, C, M, N, K, tiles_n, tiles_m, tgpig, nullptr, 1.0f, 0.0f,    \
+            0u);                                                               \
+    }
+
+TUNE_WALK_KERNEL(mm_bf16_coop_128x64_sg4_walkb, bfloat, 128, 64, 4, false, false, false, walk_by_b);
+TUNE_WALK_KERNEL(mm_bf16_coop_64x64_sg4_walkb,  bfloat,  64, 64, 4, false, false, false, walk_by_b);
+TUNE_WALK_KERNEL(mm_bf16_tn_coop_128x64_sg4_walkg, bfloat, 128, 64, 4, true, false, false, walk_by_grid);
+TUNE_WALK_KERNEL(mm_bf16_nt_coop_128x64_sg4_walkg, bfloat, 128, 64, 4, false, true, false, walk_by_grid);
+TUNE_WALK_KERNEL(mm_bf16_tn_accum_coop_64x64_sg4_walkg, bfloat, 64, 64, 4, true, false, true, walk_by_grid);
+TUNE_WALK_KERNEL(mm_bf16_nt_accum_coop_64x64_sg4_walkg, bfloat, 64, 64, 4, false, true, true, walk_by_grid);
+
+// =============================================================================
+// Exact f32 NN, the production 32x32 body (`mm_exact_f32`, slice path, C
+// zeroed by the bench first) under each walk: the 2048x6144x2048 MLP up/gate
+// shape ran at 4.1 TFLOP/s against 5.7 at 2048^3 in one run
+// (bench/results/f32_exact_coop_m5pro.txt). `_linear`: `tile_from_linear`
+// with no panels; `_rowmajor`; `_phN`: N-row panels.
+// =============================================================================
+
+#define TUNE_EXACT_F32_KERNEL(NAME, WALK)                                      \
+    kernel void NAME(device float *A [[buffer(0)]],                            \
+                     device float *B [[buffer(1)]],                            \
+                     device float *C [[buffer(2)]],                            \
+                     constant uint &M [[buffer(3)]],                           \
+                     constant uint &N [[buffer(4)]],                           \
+                     constant uint &K [[buffer(5)]],                           \
+                     constant uint &tiles_n [[buffer(6)]],                     \
+                     constant uint &tiles_m [[buffer(7)]],                     \
+                     uint tgpig [[threadgroup_position_in_grid]]) {            \
+        mm_exact_f32<false, false, false, 32, 32, WALK>(                       \
+            A, B, C, M, N, K, tiles_n, tiles_m, 0u, tgpig);                    \
+    }
+
+TUNE_EXACT_F32_KERNEL(mm_f32_exact_32x32_linear,   walk_linear);
+TUNE_EXACT_F32_KERNEL(mm_f32_exact_32x32_rowmajor, walk_row_major);
+TUNE_EXACT_F32_KERNEL(mm_f32_exact_32x32_ph8,      walk_panel<8u>);
+TUNE_EXACT_F32_KERNEL(mm_f32_exact_32x32_ph16,     walk_panel<16u>);
+TUNE_EXACT_F32_KERNEL(mm_f32_exact_32x32_ph32,     walk_panel<32u>);

@@ -43,6 +43,11 @@ struct Variant {
     nsg: usize,
     /// Kernel takes tiles_m at buffer(7) (swizzle signature).
     binds_tiles_m: bool,
+    /// An exact-f32 production kernel's `use_interior` at buffer(8).
+    interior: Option<u32>,
+    /// Zero C first in the same binder, as production does for the
+    /// exact-f32 `mode::multiply` kernels.
+    zero_first: bool,
 }
 
 fn dispatch_variant(
@@ -56,11 +61,23 @@ fn dispatch_variant(
     k: usize,
 ) -> Result<(), String> {
     let p = rt.pipeline(v.kernel)?;
+    let zero_p = rt.pipeline("zero_f32")?;
     let tiles_n = n / v.sn;
     let tiles_m = m / v.sm;
     let tg = tiles_n * tiles_m;
     let tpt = p.threadExecutionWidth() * v.nsg;
+    let numel = c.numel();
+    let z_tpt = zero_p.threadExecutionWidth().min(numel).max(1);
     rt.with_binder(|bnd| {
+        if v.zero_first {
+            bnd.set_pipeline(&zero_p);
+            bnd.bind_tensor(c, 0);
+            bnd.bind_u32(numel as u32, 1);
+            bnd.dispatch(mtl_size(numel.div_ceil(z_tpt), 1, 1), mtl_size(z_tpt, 1, 1));
+            if bnd.needs_explicit_barriers() {
+                bnd.barrier();
+            }
+        }
         bnd.set_pipeline(&p);
         bnd.bind_tensor(a, 0);
         bnd.bind_tensor(b, 1);
@@ -71,6 +88,9 @@ fn dispatch_variant(
         bnd.bind_u32(tiles_n as u32, 6);
         if v.binds_tiles_m {
             bnd.bind_u32(tiles_m as u32, 7);
+        }
+        if let Some(interior) = v.interior {
+            bnd.bind_u32(interior, 8);
         }
         bnd.dispatch(mtl_size(tg, 1, 1), mtl_size(tpt, 1, 1));
         Ok(())
@@ -103,18 +123,40 @@ enum Lane {
     /// GPU work; only the values C grows to differ.
     TnAccPanel,
     NtAccPanel,
-    /// The exact-f32 TN/NT kernels through `gemm_tn_f32` / `gemm_nt_f32` on
-    /// f32 operands: production only, for an A/B of two builds' tile walks.
+    /// The exact-f32 kernels on f32 operands: production through `gemm`,
+    /// `gemm_tn_f32`, `gemm_nt_f32` and `GemmOperands::ExactF32`'s
+    /// accumulates, against the production kernel dispatched raw with
+    /// `use_interior` 0 and 1 (`TESSL_GEMM_INTERIOR`).
+    NnF32,
     TnF32,
     NtF32,
+    NnAccF32,
+    TnAccF32,
+    NtAccF32,
+    /// One panel-walk policy: production's walk against the production coop
+    /// kernel under the other family's walk (`_walkb`: the NN coop kernels on
+    /// `tile_walk`; `_walkg`: TN, NT and their accumulates on the NN kernels'
+    /// grid gate).
+    WalkNn,
+    WalkTn,
+    WalkNt,
+    WalkTnAcc,
+    WalkNtAcc,
+    /// Exact-f32 NN: production (`gemm`) against the production 32x32 kernel
+    /// in one dispatch under each walk, and the cooperative exact-f32 tiles.
+    F32NnWalk,
     /// The int8 NN kernel through `nn::gemm_i8_dequant`: production only, as
     /// for the f32 lanes.
     NnI8,
 }
 
-/// Time `nn::gemm_i8_dequant` (`C[M,N] = A[M,K] · B[K,N]`, int8 operands
-/// filled from [`fill`], no per-column scale) and print its line in the
-/// production format of the other lanes.
+/// Time `nn::gemm_i8_dequant` (`C[M,N] = (A[M,K] · B[K,N]) · a_scale ·
+/// b_scale[n]`, int8 operands filled from [`fill`]) without and with the
+/// per-column `b_scale`, as two arms of one interleaved A/B, after checking
+/// both outputs exactly against an integer reference at sampled elements
+/// (the edges of C and a spread of interior ones): int8 products accumulate
+/// exactly in int32, and the scales are the kernel's two f32 multiplies in
+/// its order, so anything but equality is an error.
 fn bench_i8(
     rt: &std::sync::Arc<GpuRuntime>,
     m: usize,
@@ -125,35 +167,85 @@ fn bench_i8(
     iters: usize,
     rounds: usize,
 ) -> Result<(), String> {
-    let int8 = |len: usize, seed: u64| -> Vec<u8> {
-        fill(len, seed)
-            .iter()
-            .map(|&x| ((x * 127.0).round() as i8) as u8)
-            .collect()
-    };
+    const A_SCALE: f32 = 0.01;
+    let int8 =
+        |len: usize, seed: u64| -> Vec<i8> { fill(len, seed).iter().map(|&x| (x * 127.0).round() as i8).collect() };
+    let (a_host, b_host) = (int8(m * k, 1), int8(k * n, 2));
+    let scale_host: Vec<f32> = fill(n, 3).iter().map(|x| 0.5 + x.abs()).collect();
+    let bytes = |v: &[i8]| v.iter().map(|&x| x as u8).collect::<Vec<u8>>();
     let a = rt.alloc_buffer(m * k)?;
-    a.write_bytes(&int8(m * k, 1));
+    a.write_bytes(&bytes(&a_host));
     let b = rt.alloc_buffer(k * n)?;
-    b.write_bytes(&int8(k * n, 2));
-    let c = rt.alloc_buffer(m * n * 4)?;
+    b.write_bytes(&bytes(&b_host));
+    let scale = rt.alloc_buffer(n * 4)?;
+    scale.write_f32(&scale_host);
+    let (c, c_scaled) = (rt.alloc_buffer(m * n * 4)?, rt.alloc_buffer(m * n * 4)?);
     let (mu, nu, ku) = (m as u32, n as u32, k as u32);
-    let run = || -> Result<(), String> {
-        gemm_i8_dequant(rt, &a, &b, &c, mu, nu, ku, 0.01, None)?;
-        rt.synchronize()
-    };
-    run()?;
-    let mut arms = [common::Arm {
-        name: "production".into(),
-        reps: 1,
-        run: Box::new(run),
-    }];
+
+    gemm_i8_dequant(rt, &a, &b, &c, mu, nu, ku, A_SCALE, None)?;
+    gemm_i8_dequant(rt, &a, &b, &c_scaled, mu, nu, ku, A_SCALE, Some(&scale))?;
+    rt.synchronize()?;
+    let (got, got_scaled) = (c.read_f32(), c_scaled.read_f32());
+    let mut g = common::Lcg::new((m * n + k) as u64);
+    let mut points: Vec<(usize, usize)> = vec![(0, 0), (m - 1, n - 1), (0, n - 1), (m - 1, 0)];
+    points.extend((0..m).step_by(m.div_ceil(16).max(1)).map(|i| (i, n - 1)));
+    points.extend((0..n).step_by(n.div_ceil(16).max(1)).map(|j| (m - 1, j)));
+    points.extend((0..1024).map(|_| {
+        (
+            (g.next_u01() * (m - 1) as f64) as usize,
+            (g.next_u01() * (n - 1) as f64) as usize,
+        )
+    }));
+    for &(i, j) in &points {
+        let acc: i32 = (0..k)
+            .map(|p| a_host[i * k + p] as i32 * b_host[p * n + j] as i32)
+            .sum();
+        let want = acc as f32 * A_SCALE;
+        let want_scaled = acc as f32 * A_SCALE * scale_host[j];
+        if got[i * n + j] != want || got_scaled[i * n + j] != want_scaled {
+            return Err(format!(
+                "{label}: int8 output wrong at ({i}, {j}): {} (want {want}), with b_scale {} (want {want_scaled})",
+                got[i * n + j],
+                got_scaled[i * n + j]
+            ));
+        }
+    }
+
+    let mut arms = [
+        common::Arm {
+            name: "production".into(),
+            reps: 1,
+            run: Box::new(|| {
+                gemm_i8_dequant(rt, &a, &b, &c, mu, nu, ku, A_SCALE, None)?;
+                rt.synchronize()
+            }),
+        },
+        common::Arm {
+            name: "b_scale".into(),
+            reps: 1,
+            run: Box::new(|| {
+                gemm_i8_dequant(rt, &a, &b, &c_scaled, mu, nu, ku, A_SCALE, Some(&scale))?;
+                rt.synchronize()
+            }),
+        },
+    ];
     let paired = common::run_paired(&mut arms, warmup, iters, rounds)?;
     let ms = common::median(paired.rounds[0].clone())?;
+    let ms_scaled = common::median(paired.rounds[1].clone())?;
+    let (ratio, lo, hi) = common::ratio_stats(&paired.rounds[0], &paired.rounds[1])?;
     let flop = 2.0 * m as f64 * n as f64 * k as f64;
     println!(
-        "\n{label}  M={m} N={n} K={k}   production {ms:.3} ms  {:.0} GFLOP/s  (self-spread {:.1}%)",
+        "\n{label}  M={m} N={n} K={k}   production {ms:.3} ms  {:.0} GOP/s  (self-spread {:.1}%, exact at {} sampled outputs)",
         flop / (ms * 1e6),
-        common::self_spread(&paired.rounds[0]) * 100.0
+        common::self_spread(&paired.rounds[0]) * 100.0,
+        points.len()
+    );
+    println!(
+        "  {:<36}{:>10.3}{:>12.0}{:>8.2}× [{lo:.2}–{hi:.2}]",
+        "b_scale (per-column scale)",
+        ms_scaled,
+        flop / (ms_scaled * 1e6),
+        ratio
     );
     Ok(())
 }
@@ -162,18 +254,42 @@ impl Lane {
     fn is_tn(self) -> bool {
         matches!(
             self,
-            Lane::Tn | Lane::TnAccum | Lane::TnPanel | Lane::TnAccPanel | Lane::TnF32
+            Lane::Tn
+                | Lane::TnAccum
+                | Lane::TnPanel
+                | Lane::TnAccPanel
+                | Lane::TnF32
+                | Lane::TnAccF32
+                | Lane::WalkTn
+                | Lane::WalkTnAcc
         )
     }
 
     fn is_f32(self) -> bool {
-        matches!(self, Lane::TnF32 | Lane::NtF32)
+        matches!(
+            self,
+            Lane::NnF32
+                | Lane::TnF32
+                | Lane::NtF32
+                | Lane::NnAccF32
+                | Lane::TnAccF32
+                | Lane::NtAccF32
+                | Lane::F32NnWalk
+        )
     }
 
     fn is_accum(self) -> bool {
         matches!(
             self,
-            Lane::TnAccum | Lane::NtAccum | Lane::TnAccPanel | Lane::NtAccPanel
+            Lane::TnAccum
+                | Lane::NtAccum
+                | Lane::TnAccPanel
+                | Lane::NtAccPanel
+                | Lane::NnAccF32
+                | Lane::TnAccF32
+                | Lane::NtAccF32
+                | Lane::WalkTnAcc
+                | Lane::WalkNtAcc
         )
     }
 }
@@ -185,6 +301,36 @@ fn variant(kernel: &'static str, sm: usize, sn: usize, binds_tiles_m: bool) -> V
         sn,
         nsg: 4,
         binds_tiles_m,
+        interior: None,
+        zero_first: false,
+    }
+}
+
+/// A tune exact-f32 32x32 kernel (`mm_f32_exact_32x32_*`): C zeroed first, as
+/// production's `mode::multiply` kernel needs.
+fn exact_f32_walk(kernel: &'static str) -> Variant {
+    Variant {
+        kernel,
+        sm: 32,
+        sn: 32,
+        nsg: 1,
+        binds_tiles_m: true,
+        interior: None,
+        zero_first: true,
+    }
+}
+
+/// An exact-f32 production kernel dispatched raw with `use_interior` set:
+/// 32x32 tiles on one simdgroup, C zeroed first unless it accumulates.
+fn exact_f32(kernel: &'static str, interior: u32, accumulates: bool) -> Variant {
+    Variant {
+        kernel,
+        sm: 32,
+        sn: 32,
+        nsg: 1,
+        binds_tiles_m: true,
+        interior: Some(interior),
+        zero_first: !accumulates,
     }
 }
 
@@ -278,6 +424,53 @@ fn main() -> Result<(), String> {
         (Lane::NtF32, 2048, 2048, 4096, "f32nt_morton_sq64"),
         (Lane::TnF32, 2048, 2048, 4096, "f32tn_morton_sq64"),
         (Lane::NtF32, 4096, 16384, 768, "f32nt_vocab_16384"),
+        // `TESSL_GEMM_INTERIOR` at the Qwen3.5-2B training shapes (T = 2048,
+        // hidden 2048, MLP 6144): forward NN (up/gate, down, a square
+        // projection), the weight gradients (TN) and input gradients (NT),
+        // and the accumulate forms the backward adds into banks with.
+        (Lane::NnF32, 2048, 6144, 2048, "f32int_nn_mlp_up"),
+        (Lane::NnF32, 2048, 2048, 6144, "f32int_nn_mlp_down"),
+        (Lane::NnF32, 2048, 2048, 2048, "f32int_nn_proj"),
+        (Lane::TnF32, 2048, 6144, 2048, "f32int_tn_dw_up"),
+        (Lane::TnF32, 6144, 2048, 2048, "f32int_tn_dw_down"),
+        (Lane::NtF32, 2048, 2048, 6144, "f32int_nt_dx_up"),
+        (Lane::NtF32, 2048, 6144, 2048, "f32int_nt_dx_down"),
+        (Lane::NnAccF32, 2048, 2048, 2048, "f32int_nnacc_proj"),
+        (Lane::TnAccF32, 2048, 6144, 2048, "f32int_tnacc_dw_up"),
+        (Lane::NtAccF32, 2048, 2048, 6144, "f32int_ntacc_dx_up"),
+        // One panel-walk policy. NN coop: where the grid gate (>= 2048 tiles
+        // of 128x64 -> 8-row panels) and `tile_walk` (B >= 2^23 elements ->
+        // 4-row panels; Morton kept) disagree, and a control where they agree.
+        (Lane::WalkNn, 4096, 4096, 1024, "walk_nn_grid_only"),
+        (Lane::WalkNn, 4096, 4096, 4096, "walk_nn_both"),
+        (Lane::WalkNn, 8192, 4096, 4096, "walk_nn_morton_sq64"),
+        (Lane::WalkNn, 2048, 8192, 2048, "walk_nn_b16m_grid2048"),
+        (Lane::WalkNn, 1024, 8192, 2048, "walk_nn_b_only"),
+        (Lane::WalkNn, 2048, 6144, 2048, "walk_nn_q35_mlp_up"),
+        (Lane::WalkNn, 2048, 2048, 6144, "walk_nn_q35_mlp_down"),
+        (Lane::WalkNn, 8192, 3072, 768, "walk_nn_mlp_up"),
+        (Lane::WalkNn, 4096, 50304, 768, "walk_nn_lmhead_50304"),
+        (Lane::WalkNn, 1024, 248320, 2048, "walk_nn_lm_head"),
+        (Lane::WalkNn, 2048, 2048, 2048, "walk_nn_control"),
+        // TN / NT / accumulate: production `tile_walk` against the grid gate.
+        (Lane::WalkNt, 4096, 8192, 2048, "walk_nt_both"),
+        (Lane::WalkNt, 4096, 4096, 1024, "walk_nt_grid_only"),
+        (Lane::WalkNt, 4096, 50304, 768, "walk_nt_lmhead_50304"),
+        (Lane::WalkNt, 2048, 6144, 2048, "walk_nt_q35_dx_down"),
+        (Lane::WalkTn, 2048, 8192, 4096, "walk_tn_both"),
+        (Lane::WalkTn, 768, 50304, 4096, "walk_tn_lmhead_dw"),
+        (Lane::WalkTn, 2048, 6144, 2048, "walk_tn_q35_dw_up"),
+        (Lane::WalkTn, 2048, 4096, 1024, "walk_tn_control"),
+        (Lane::WalkNtAcc, 4096, 4096, 1024, "walk_ntacc_morton_grid"),
+        (Lane::WalkNtAcc, 3072, 3072, 1024, "walk_ntacc_grid_only"),
+        (Lane::WalkTnAcc, 4096, 4096, 1024, "walk_tnacc_morton_grid"),
+        (Lane::WalkTnAcc, 3072, 3072, 1024, "walk_tnacc_grid_only"),
+        // Exact f32 NN at the 2B training shapes (T = 2048): the MLP up/gate
+        // shape against the square and down shapes.
+        (Lane::F32NnWalk, 2048, 6144, 2048, "f32walk_q35_mlp_up"),
+        (Lane::F32NnWalk, 2048, 2048, 2048, "f32walk_square_2048"),
+        (Lane::F32NnWalk, 2048, 2048, 6144, "f32walk_q35_mlp_down"),
+        (Lane::F32NnWalk, 2048, 8224, 2048, "f32walk_q35_gdn_in"),
         // The int8 NN kernel (128x64 tiles, B = K x N bytes): an LM-head and
         // a vocabulary B, the gate's bracket on grids that are not square,
         // long K, and two controls the walk leaves alone (a Morton grid, and
@@ -333,6 +526,8 @@ fn main() -> Result<(), String> {
             sn: 64,
             nsg: 4,
             binds_tiles_m: true,
+            interior: None,
+            zero_first: false,
         },
         Variant {
             kernel: "mm_bf16_coop_128x64_sg4_swz8",
@@ -340,6 +535,8 @@ fn main() -> Result<(), String> {
             sn: 64,
             nsg: 4,
             binds_tiles_m: true,
+            interior: None,
+            zero_first: false,
         },
         Variant {
             kernel: "mm_bf16_coop_256x64_sg8_swz4",
@@ -347,6 +544,8 @@ fn main() -> Result<(), String> {
             sn: 64,
             nsg: 8,
             binds_tiles_m: true,
+            interior: None,
+            zero_first: false,
         },
     ];
     let tn_variants = &[
@@ -356,6 +555,8 @@ fn main() -> Result<(), String> {
             sn: 64,
             nsg: 4,
             binds_tiles_m: false,
+            interior: None,
+            zero_first: false,
         },
         Variant {
             kernel: "mm_bf16_tn_coop_128x64_sg4",
@@ -363,6 +564,8 @@ fn main() -> Result<(), String> {
             sn: 64,
             nsg: 4,
             binds_tiles_m: false,
+            interior: None,
+            zero_first: false,
         },
     ];
     let nt_variants = &[
@@ -372,6 +575,8 @@ fn main() -> Result<(), String> {
             sn: 64,
             nsg: 4,
             binds_tiles_m: false,
+            interior: None,
+            zero_first: false,
         },
         Variant {
             kernel: "mm_bf16_nt_coop_128x64_sg4",
@@ -379,6 +584,8 @@ fn main() -> Result<(), String> {
             sn: 64,
             nsg: 4,
             binds_tiles_m: false,
+            interior: None,
+            zero_first: false,
         },
         Variant {
             kernel: "mm_bf16_nt_coop_64x128_sg4",
@@ -386,6 +593,8 @@ fn main() -> Result<(), String> {
             sn: 128,
             nsg: 4,
             binds_tiles_m: false,
+            interior: None,
+            zero_first: false,
         },
         Variant {
             kernel: "mm_bf16_nt_coop_128x128_sg4",
@@ -393,6 +602,8 @@ fn main() -> Result<(), String> {
             sn: 128,
             nsg: 4,
             binds_tiles_m: false,
+            interior: None,
+            zero_first: false,
         },
         Variant {
             kernel: "mm_bf16_nt_coop_128x128_sg8",
@@ -400,6 +611,8 @@ fn main() -> Result<(), String> {
             sn: 128,
             nsg: 8,
             binds_tiles_m: false,
+            interior: None,
+            zero_first: false,
         },
         Variant {
             kernel: "mm_bf16_nt_coop_256x64_sg8",
@@ -407,6 +620,8 @@ fn main() -> Result<(), String> {
             sn: 64,
             nsg: 8,
             binds_tiles_m: false,
+            interior: None,
+            zero_first: false,
         },
         Variant {
             kernel: "mm_bf16_nt_coop_64x256_sg8",
@@ -414,6 +629,8 @@ fn main() -> Result<(), String> {
             sn: 256,
             nsg: 8,
             binds_tiles_m: false,
+            interior: None,
+            zero_first: false,
         },
         Variant {
             kernel: "mm_bf16_nt_coop_128x256_sg8",
@@ -421,6 +638,8 @@ fn main() -> Result<(), String> {
             sn: 256,
             nsg: 8,
             binds_tiles_m: false,
+            interior: None,
+            zero_first: false,
         },
         Variant {
             kernel: "mm_bf16_nt_coop_256x128_sg8",
@@ -428,6 +647,8 @@ fn main() -> Result<(), String> {
             sn: 128,
             nsg: 8,
             binds_tiles_m: false,
+            interior: None,
+            zero_first: false,
         },
         Variant {
             kernel: "mm_bf16_nt_coop_256x64_sg4",
@@ -435,6 +656,8 @@ fn main() -> Result<(), String> {
             sn: 64,
             nsg: 4,
             binds_tiles_m: false,
+            interior: None,
+            zero_first: false,
         },
         Variant {
             kernel: "mm_bf16_nt_coop_256x32_sg8",
@@ -442,6 +665,8 @@ fn main() -> Result<(), String> {
             sn: 32,
             nsg: 8,
             binds_tiles_m: false,
+            interior: None,
+            zero_first: false,
         },
         Variant {
             kernel: "mm_bf16_nt_coop_512x32_sg8",
@@ -449,6 +674,8 @@ fn main() -> Result<(), String> {
             sn: 32,
             nsg: 8,
             binds_tiles_m: false,
+            interior: None,
+            zero_first: false,
         },
         Variant {
             kernel: "mm_bf16_nt_coop_512x64_sg8",
@@ -456,6 +683,8 @@ fn main() -> Result<(), String> {
             sn: 64,
             nsg: 8,
             binds_tiles_m: false,
+            interior: None,
+            zero_first: false,
         },
         Variant {
             kernel: "mm_bf16_nt_coop_512x64_sg16",
@@ -463,6 +692,8 @@ fn main() -> Result<(), String> {
             sn: 64,
             nsg: 16,
             binds_tiles_m: false,
+            interior: None,
+            zero_first: false,
         },
         Variant {
             kernel: "mm_bf16_nt_coop_1024x32_sg16",
@@ -470,6 +701,8 @@ fn main() -> Result<(), String> {
             sn: 32,
             nsg: 16,
             binds_tiles_m: false,
+            interior: None,
+            zero_first: false,
         },
     ];
     let tnacc_variants = &[
@@ -479,6 +712,8 @@ fn main() -> Result<(), String> {
             sn: 64,
             nsg: 4,
             binds_tiles_m: true,
+            interior: None,
+            zero_first: false,
         },
         Variant {
             kernel: "mm_bf16_tn_accum_coop_64x64_sg4",
@@ -486,6 +721,8 @@ fn main() -> Result<(), String> {
             sn: 64,
             nsg: 4,
             binds_tiles_m: false,
+            interior: None,
+            zero_first: false,
         },
     ];
     let ntacc_variants = &[
@@ -495,6 +732,8 @@ fn main() -> Result<(), String> {
             sn: 64,
             nsg: 4,
             binds_tiles_m: true,
+            interior: None,
+            zero_first: false,
         },
         Variant {
             kernel: "mm_bf16_nt_accum_coop_64x64_sg4",
@@ -502,9 +741,48 @@ fn main() -> Result<(), String> {
             sn: 64,
             nsg: 4,
             binds_tiles_m: false,
+            interior: None,
+            zero_first: false,
         },
     ];
 
+    // `TESSL_GEMM_INTERIOR`: each exact-f32 production kernel with its
+    // interior-offset branch off (the default) and on.
+    let pair = |kernel: &'static str, acc: bool| [exact_f32(kernel, 0, acc), exact_f32(kernel, 1, acc)];
+    let f32_nn_variants = pair("matmul2d_tensorops_f32", false);
+    let f32_tn_variants = pair("matmul2d_tensorops_tn_f32", false);
+    let f32_nt_variants = pair("matmul2d_tensorops_nt_f32", false);
+    let f32_nnacc_variants = pair("matmul2d_tensorops_nn_accum_f32", true);
+    let f32_tnacc_variants = pair("matmul2d_tensorops_tn_accum_f32", true);
+    let f32_ntacc_variants = pair("matmul2d_tensorops_nt_accum_f32", true);
+    let walk_nn_variants = [
+        variant("mm_bf16_coop_128x64_sg4_walkb", 128, 64, true),
+        variant("mm_bf16_coop_64x64_sg4_walkb", 64, 64, true),
+    ];
+    let walk_tn_variants = [variant("mm_bf16_tn_coop_128x64_sg4_walkg", 128, 64, true)];
+    let walk_nt_variants = [variant("mm_bf16_nt_coop_128x64_sg4_walkg", 128, 64, true)];
+    let walk_tnacc_variants = [variant("mm_bf16_tn_accum_coop_64x64_sg4_walkg", 64, 64, true)];
+    let walk_ntacc_variants = [variant("mm_bf16_nt_accum_coop_64x64_sg4_walkg", 64, 64, true)];
+    let f32_walk_variants = [
+        exact_f32("matmul2d_tensorops_f32", 0, false),
+        exact_f32_walk("mm_f32_exact_32x32_linear"),
+        exact_f32_walk("mm_f32_exact_32x32_rowmajor"),
+        exact_f32_walk("mm_f32_exact_32x32_ph8"),
+        exact_f32_walk("mm_f32_exact_32x32_ph16"),
+        exact_f32_walk("mm_f32_exact_32x32_ph32"),
+        Variant {
+            nsg: 4,
+            ..variant("mm_f32_exact_coop_128x64_sg4", 128, 64, false)
+        },
+        Variant {
+            nsg: 8,
+            ..variant("mm_f32_exact_coop_128x64_sg8", 128, 64, false)
+        },
+        Variant {
+            nsg: 4,
+            ..variant("mm_f32_exact_coop_64x64_sg4", 64, 64, false)
+        },
+    ];
     let lane_variants = |lane: Lane| -> &[Variant] {
         match lane {
             Lane::Nn => nn_variants,
@@ -516,7 +794,19 @@ fn main() -> Result<(), String> {
             Lane::NtPanel => ntp_variants,
             Lane::TnAccPanel => tnap_variants,
             Lane::NtAccPanel => ntap_variants,
-            Lane::TnF32 | Lane::NtF32 | Lane::NnI8 => &[],
+            Lane::NnF32 => &f32_nn_variants,
+            Lane::TnF32 => &f32_tn_variants,
+            Lane::NtF32 => &f32_nt_variants,
+            Lane::NnAccF32 => &f32_nnacc_variants,
+            Lane::TnAccF32 => &f32_tnacc_variants,
+            Lane::NtAccF32 => &f32_ntacc_variants,
+            Lane::WalkNn => &walk_nn_variants,
+            Lane::WalkTn => &walk_tn_variants,
+            Lane::WalkNt => &walk_nt_variants,
+            Lane::WalkTnAcc => &walk_tnacc_variants,
+            Lane::WalkNtAcc => &walk_ntacc_variants,
+            Lane::F32NnWalk => &f32_walk_variants,
+            Lane::NnI8 => &[],
         }
     };
     let selected = |label: &str| {
@@ -551,7 +841,7 @@ fn main() -> Result<(), String> {
         }
         // Operand storage per lane: NN A[M,K] B[K,N]; TN A[K,M] B[K,N]; NT A[M,K] B[N,K].
         let (a_shape, b_shape) = match lane {
-            Lane::Nn => ([m, k], [k, n]),
+            Lane::Nn | Lane::NnF32 | Lane::NnAccF32 | Lane::WalkNn | Lane::F32NnWalk => ([m, k], [k, n]),
             _ if lane.is_tn() => ([k, m], [k, n]),
             _ => ([m, k], [n, k]),
         };
@@ -578,9 +868,11 @@ fn main() -> Result<(), String> {
         let refv = {
             let r = rt.alloc_tensor_f32(&[m, n])?;
             match lane {
-                Lane::Nn => gemm(&a, &b, &r, GemmBackend::TensorOps)?,
-                Lane::TnF32 => gemm_tn_f32(&a, &b, &r, GemmBackend::TensorOps)?,
-                Lane::NtF32 => gemm_nt_f32(&a, &b, &r, GemmBackend::TensorOps)?,
+                Lane::Nn | Lane::NnF32 | Lane::NnAccF32 | Lane::WalkNn | Lane::F32NnWalk => {
+                    gemm(&a, &b, &r, GemmBackend::TensorOps)?
+                }
+                Lane::TnF32 | Lane::TnAccF32 => gemm_tn_f32(&a, &b, &r, GemmBackend::TensorOps)?,
+                Lane::NtF32 | Lane::NtAccF32 => gemm_nt_f32(&a, &b, &r, GemmBackend::TensorOps)?,
                 _ if lane.is_tn() => gemm_tn_train(&a, &b, &r, GemmBackend::TensorOps)?,
                 _ => gemm_nt_train(&a, &b, &r, GemmBackend::TensorOps)?,
             }
@@ -598,13 +890,17 @@ fn main() -> Result<(), String> {
         let prod_c = rt.alloc_tensor_f32(&[m, n])?;
         let production = |c: &Tensor| -> Result<(), String> {
             match lane {
-                Lane::Nn => gemm(&a, &b, c, GemmBackend::TensorOps),
-                Lane::Tn | Lane::TnPanel => gemm_tn_train(&a, &b, c, GemmBackend::TensorOps),
-                Lane::Nt | Lane::NtPanel => gemm_nt_train(&a, &b, c, GemmBackend::TensorOps),
+                Lane::Nn | Lane::WalkNn | Lane::F32NnWalk => gemm(&a, &b, c, GemmBackend::TensorOps),
+                Lane::Tn | Lane::TnPanel | Lane::WalkTn => gemm_tn_train(&a, &b, c, GemmBackend::TensorOps),
+                Lane::Nt | Lane::NtPanel | Lane::WalkNt => gemm_nt_train(&a, &b, c, GemmBackend::TensorOps),
                 Lane::TnF32 => gemm_tn_f32(&a, &b, c, GemmBackend::TensorOps),
                 Lane::NtF32 => gemm_nt_f32(&a, &b, c, GemmBackend::TensorOps),
-                Lane::TnAccum | Lane::TnAccPanel => GemmOperands::Bf16.tn_acc(&a, &b, c),
-                Lane::NtAccum | Lane::NtAccPanel => GemmOperands::Bf16.nt_acc(&a, &b, c),
+                Lane::NnF32 => gemm(&a, &b, c, GemmBackend::TensorOps),
+                Lane::NnAccF32 => GemmOperands::ExactF32.nn_acc(&a, &b, c),
+                Lane::TnAccF32 => GemmOperands::ExactF32.tn_acc(&a, &b, c),
+                Lane::NtAccF32 => GemmOperands::ExactF32.nt_acc(&a, &b, c),
+                Lane::TnAccum | Lane::TnAccPanel | Lane::WalkTnAcc => GemmOperands::Bf16.tn_acc(&a, &b, c),
+                Lane::NtAccum | Lane::NtAccPanel | Lane::WalkNtAcc => GemmOperands::Bf16.nt_acc(&a, &b, c),
                 Lane::NnI8 => unreachable!("int8 cases are timed by bench_i8"),
             }
         };

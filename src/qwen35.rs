@@ -729,7 +729,7 @@ fn conv1d_silu_impl(
 /// softplus(a[r, h] + dt_bias[h])` and `beta[r, h] = sigmoid(b[r, h])`, each
 /// written dense `[rows, heads]` f32, from the raw logits in the fused
 /// projection. The inference kernels compute the same values in their loads,
-/// with the same helpers (`kernels/qwen35_act.h`).
+/// with the same helpers (`kernels/act.h`, `kernels/qwen35_act.h`).
 #[allow(clippy::too_many_arguments)]
 pub fn gdn_gates(
     rt: &Arc<GpuRuntime>,

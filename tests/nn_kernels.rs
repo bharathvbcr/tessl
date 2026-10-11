@@ -7,7 +7,7 @@
 
 mod common;
 
-use common::{buf, empty, gelu_pytorch_tanh, random_f32, with_gpu};
+use common::{buf, close_rel, empty, gelu_pytorch_tanh, random_f32, silu, with_gpu};
 use tessl::nn;
 use tessl::tensor::bf16_bits_to_f32;
 
@@ -257,9 +257,38 @@ fn mlp_silu_matches_cpu_reference() {
         let want: Vec<f32> = gate
             .iter()
             .zip(&up)
-            .map(|(g, u)| (g / (1.0 + (-g).exp())) * u)
+            .map(|(g, u)| (silu(*g as f64) * (*u as f64)) as f32)
             .collect();
         close("mlp_silu", &ob.read_f32()[..n], &want, 1e-6);
+    });
+}
+
+#[test]
+fn mlp_silu_stays_finite_at_extreme_gates() {
+    with_gpu(|rt| {
+        // Below x ~ -88.7, `exp(-x)` overflows f32, and the kernel compiles
+        // with fast math, which may assume no intermediate is infinite: the
+        // textbook `x / (1 + exp(-x))` divides by +inf there, and whether that
+        // comes out -0 or NaN is the backend's choice. Sweep [-100, 100] in
+        // steps of 0.5 and name the edges a sweep can miss: either side of the
+        // overflow, the far end and both zeros. The textbook kernel passed
+        // this too on the M5 Pro (exactly -0 at -88, -88.5, -88.75, -89, -90
+        // and -100): a guard against a lowering that NaNs, not a repro.
+        let mut gate: Vec<f32> = (0..=400).map(|i| -100.0 + 0.5 * i as f32).collect();
+        gate.extend([-88.5f32, -88.75, -89.0, -100.0, 0.0, -0.0, 88.5, 100.0]);
+        let up = vec![1.0f32; gate.len()];
+        let n = gate.len();
+        let gb = buf(rt, &gate);
+        let ub = buf(rt, &up);
+        let ob = empty(rt, n);
+
+        nn::mlp_silu(rt, &gb, &ub, &ob, n as u32).unwrap();
+        rt.synchronize().unwrap();
+
+        // Where the f64 value is below f32's normal range the kernel flushes
+        // it to zero, which the absolute floor of `close_rel` absorbs.
+        let want: Vec<f32> = gate.iter().map(|&g| silu(g as f64) as f32).collect();
+        close_rel("mlp_silu", &ob.read_f32()[..n], &want, 1e-5);
     });
 }
 
@@ -285,7 +314,7 @@ fn mlp_gelu_tanh_stays_finite_where_fast_tanh_would_nan() {
             "mlp_gelu_tanh produced a non-finite value on |x| up to 64"
         );
 
-        // The cubic is clamped; the outer factor is the original x, matching gelu.h.
+        // The cubic is clamped; the outer factor is the original x, matching act.h.
         let want: Vec<f32> = gate
             .iter()
             .zip(&up)

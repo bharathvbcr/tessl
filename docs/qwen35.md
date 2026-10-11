@@ -312,8 +312,8 @@ either f32 or the bf16 the down projection's GEMM reads. The generic
 layer. That pass was 0.18 of the MLP's 0.52 ms of elementwise work at
 T = 1024 (28732de). The gate and up windows may be two windows of one
 buffer, which is what a single `[gate | up]` GEMM would write. The sigmoid is
-the overflow-free one in `kernels/qwen35_act.h`, shared with the GDN gates and
-the attention output gate. On this GPU the textbook `1 / (1 + exp(-x))`
+the crate's overflow-free one in `kernels/act.h`, shared with the GDN gates,
+the attention output gate, `nn::mlp_silu` and the GEMM SiLU epilogue. On this GPU the textbook `1 / (1 + exp(-x))`
 also returns 0 at x = -120, so no test here can tell the two forms apart.
 The safe form is kept because fast math is allowed to assume `exp` never
 returns infinity.

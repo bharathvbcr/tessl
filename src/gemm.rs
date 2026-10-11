@@ -750,11 +750,13 @@ pub enum Activation {
     None = 0,
     /// `max(x, 0)`.
     Relu = 1,
-    /// `gelu_pytorch_tanh`, computed by `kernels/gelu.h` — the same function
+    /// `gelu_pytorch_tanh`, computed by `kernels/act.h` — the same function
     /// `nn::mlp_gelu_tanh` calls, not a second derivation. At `-O2` MSL lowers
     /// plain `tanh` to `air.fast_tanh`, which NaNs past roughly |10|.
     GeluTanh = 2,
-    /// `x * sigmoid(x)`, matching `nn::mlp_silu`.
+    /// `x * sigmoid(x)`, computed by `kernels/act.h` — the same function
+    /// `nn::mlp_silu` calls, in the form that never forms `e^|x|`, so it stays
+    /// finite under fast math where `exp(-x)` would overflow.
     Silu = 3,
 }
 

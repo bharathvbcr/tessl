@@ -15,7 +15,7 @@ mod common;
 
 use std::sync::Arc;
 
-use common::{close_rel, gelu_pytorch_tanh, random_f32, tensor_bf16, with_gpu};
+use common::{close_rel, gelu_pytorch_tanh, random_f32, silu, tensor_bf16, with_gpu};
 use tessl::gemm::{gemm, gemm_epilogue, gemm_epilogue_tiled, Activation, EpiTile, Epilogue, GemmBackend};
 use tessl::tensor::Tensor;
 use tessl::GpuRuntime;
@@ -60,7 +60,7 @@ fn reference(
                 Activation::None => v,
                 Activation::Relu => v.max(0.0),
                 Activation::GeluTanh => gelu_pytorch_tanh(v as f64) as f32,
-                Activation::Silu => v / (1.0 + (-v).exp()),
+                Activation::Silu => silu(v as f64) as f32,
             };
         }
     }
@@ -174,7 +174,7 @@ fn fused_epilogue_matches_the_unfused_sequence() {
 
 /// GELU past the cubic's clamp must keep growing with its input.
 ///
-/// `gelu.h` clamps `x` to ±20 before cubing so `x^3` cannot overflow, but the
+/// `act.h` clamps `x` to ±20 before cubing so `x^3` cannot overflow, but the
 /// outer factor is the original `x`. A copy that multiplied by the clamped value
 /// instead returned exactly 20 for every input above 20, which no random-operand
 /// test reaches. `A = B = 0` and `beta = 1` make the pre-activation `C_prev`
@@ -217,6 +217,77 @@ fn gelu_epilogue_tracks_x_past_the_cubic_clamp() {
                     &c.buffer.read_f32()[..m * n],
                     &want,
                     1e-4,
+                );
+            }
+        }
+    });
+}
+
+/// SiLU must stay finite where the accumulator is below -89.
+///
+/// There `exp(-x)` overflows f32, and under fast math the textbook
+/// `x / (1 + exp(-x))` leaves the result to however the backend lowers a
+/// division by +inf. The pre-activation comes out of the product itself:
+/// `A[i, 0] = r_i`, `B[0, j] = probe_j`, zero elsewhere, so `A@B` is
+/// `r_i * probe_j` exactly. Every factor is a power of two or a bf16-exact
+/// integer, so neither the tf32-class f32 product nor bf16 operands round it.
+/// The textbook epilogue passed this too on the M5 Pro (exactly -0 at -88.5,
+/// -89, -96 and -100 on the f32 path): a guard against a lowering that NaNs,
+/// not a repro.
+#[test]
+fn silu_epilogue_stays_finite_past_exp_overflow() {
+    const PROBES: &[f32] = &[
+        -100.0, -96.0, -89.0, -88.5, -64.0, -20.0, -1.0, 0.0, 1.0, 20.0, 64.0, 88.5, 89.0, 100.0,
+    ];
+    const ROW_SCALE: &[f32] = &[1.0, -1.0, 0.5];
+    with_gpu(|rt| {
+        rt.set_relaxed_precision(true);
+        // Interior-only and edge-only shapes; f32 and both bf16 tile geometries.
+        for &(m, n, k) in &[(128usize, 64usize, 64usize), (37, 45, 64)] {
+            let mut a_h = vec![0.0f32; m * k];
+            let mut b_h = vec![0.0f32; k * n];
+            for i in 0..m {
+                a_h[i * k] = ROW_SCALE[i % ROW_SCALE.len()];
+            }
+            for j in 0..n {
+                b_h[j] = PROBES[j % PROBES.len()];
+            }
+            let pre: Vec<f64> = (0..m * n)
+                .map(|idx| a_h[(idx / n) * k] as f64 * b_h[idx % n] as f64)
+                .collect();
+            assert!(
+                pre.iter().any(|&x| x < -89.0),
+                "{m}x{n}: no accumulator reaches below -89"
+            );
+            let want: Vec<f32> = pre.iter().map(|&x| silu(x) as f32).collect();
+            let epi = Epilogue {
+                activation: Activation::Silu,
+                ..Epilogue::default()
+            };
+
+            let a = tensor(rt, &[m, k], &a_h);
+            let b = tensor(rt, &[k, n], &b_h);
+            let c = tensor(rt, &[m, n], &vec![0.0f32; m * n]);
+            gemm_epilogue(&a, &b, &c, GemmBackend::TensorOps, epi).expect("f32 silu epilogue");
+            rt.synchronize().unwrap();
+            close_rel(
+                &format!("f32 {m}x{n}x{k} silu"),
+                &c.buffer.read_f32()[..m * n],
+                &want,
+                1e-5,
+            );
+
+            let a16 = tensor_bf16(rt, &[m, k], &a_h);
+            let b16 = tensor_bf16(rt, &[k, n], &b_h);
+            for tile in [EpiTile::Wide, EpiTile::Narrow] {
+                let c = tensor(rt, &[m, n], &vec![0.0f32; m * n]);
+                gemm_epilogue_tiled(&a16, &b16, &c, GemmBackend::TensorOps, epi, tile).expect("bf16 silu epilogue");
+                rt.synchronize().unwrap();
+                close_rel(
+                    &format!("bf16 {tile:?} {m}x{n}x{k} silu"),
+                    &c.buffer.read_f32()[..m * n],
+                    &want,
+                    1e-5,
                 );
             }
         }

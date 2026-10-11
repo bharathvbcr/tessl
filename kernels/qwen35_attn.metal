@@ -27,6 +27,7 @@
 // the same frequency it replaces, so the rotation is plain RoPE at position
 // `pos`. Mixed image/text positions are out of scope here.
 #include <metal_stdlib>
+#include "act.h"
 #include "qwen35_act.h"
 using namespace metal;
 
@@ -272,7 +273,7 @@ kernel void NAME(                                                               
     const uint d = col % D;                                                       \
     const float g = p[(ulong)r * ld_p + q_off + (ulong)h * 2u * D + D + d];       \
     const float a = attn[(ulong)r * Hq * D + col];                                \
-    out[(ulong)r * ld_out + out_off + col] = (OUT_T)(a * qwen35_sigmoid(g));       \
+    out[(ulong)r * ld_out + out_off + col] = (OUT_T)(a * tessl_sigmoid(g));       \
 }
 
 ATTN_GATE_KERNEL(qwen35_attn_gate_f32, float)

@@ -13,7 +13,7 @@
 
 #include <metal_stdlib>
 #include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>
-#include "gelu.h"
+#include "act.h"
 
 using namespace metal;
 using namespace mpp::tensor_ops;
@@ -582,11 +582,12 @@ enum GemmActivation : uint {
 static inline float gemm_apply_activation(float v, GemmActivation act) {
     switch (act) {
         case GEMM_ACT_RELU: return fmax(v, 0.0f);
-        // The crate's one GELU (gelu.h), shared with mlp_gelu_tanh and the q4
+        // The crate's one GELU (act.h), shared with mlp_gelu_tanh and the q4
         // gate/up GEMVs. A local copy here once clipped the output at 20.
         case GEMM_ACT_GELU_TANH: return tessl_gelu_pytorch_tanh(v);
-        // silu(x) = x * sigmoid(x), matching `mlp_silu.metal`.
-        case GEMM_ACT_SILU: return v / (1.0f + exp(-v));
+        // The crate's one SiLU (act.h), shared with mlp_silu and the Qwen3.5
+        // kernels. A textbook local copy here once divided by exp(-v) = inf.
+        case GEMM_ACT_SILU: return tessl_silu(v);
         default: return v;
     }
 }

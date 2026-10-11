@@ -12,8 +12,7 @@
 // Qwen3.5 kernel's inputs, so a single GEMM that writes `[gate | up]` side by
 // side can feed this in place.
 #include <metal_stdlib>
-#include "gelu.h"
-#include "qwen35_act.h"
+#include "act.h"
 #include "reduce_tree.h"
 using namespace metal;
 
@@ -46,8 +45,8 @@ kernel void NAME(                                                               
     out[(ulong)r * ld_out + out_off + col] = (OUT_T)(ACT(g) * u);             \
 }
 
-GATED_KERNEL(qwen35_swiglu_f32, float, qwen35_silu)
-GATED_KERNEL(qwen35_swiglu_bf16, bfloat, qwen35_silu)
+GATED_KERNEL(qwen35_swiglu_f32, float, tessl_silu)
+GATED_KERNEL(qwen35_swiglu_bf16, bfloat, tessl_silu)
 GATED_KERNEL(qwen35_gelu_tanh_glu_f32, float, tessl_gelu_pytorch_tanh)
 GATED_KERNEL(qwen35_gelu_tanh_glu_bf16, bfloat, tessl_gelu_pytorch_tanh)
 

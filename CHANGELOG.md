@@ -556,6 +556,20 @@ All notable changes to `tessl` are recorded here. The format follows
 
 ### Fixed
 
+- **One SiLU, overflow-free.** `nn::mlp_silu` and the GEMM epilogue's
+  `Activation::Silu` computed the textbook `x / (1 + exp(-x))`, which divides
+  by `exp(-x) = inf` below -88 under the fast math every kernel compiles with.
+  Both now call `tessl_silu`, the form the Qwen3.5 kernels already used, which
+  keeps the denominator in [1, 2]. `kernels/gelu.h` becomes `kernels/act.h`
+  and holds the crate's GELU, sigmoid and SiLU; `qwen35_sigmoid` and
+  `qwen35_silu` are now `tessl_sigmoid` and `tessl_silu` there, and
+  `qwen35_act.h` keeps softplus, the log decay and the RoPE angle. The new
+  tests `mlp_silu_stays_finite_at_extreme_gates` and
+  `silu_epilogue_stays_finite_past_exp_overflow` passed on the old kernels
+  too: on the M5 Pro, `mlp_silu` returned exactly -0 at the probed gates from
+  -88 to -100 and the f32 epilogue at accumulators -88.5 to -100 (reciprocal
+  or IEEE lowering, not a NaN), so they stay as guards. The tests' f64 sigmoid and SiLU are one oracle in
+  `tests/common`, also sign-branched.
 - **Async encode without a waiting sync poisoned the runtime.** Every scalar
   bind takes a slot in the 16 MiB constant arena, and only a waiting commit
   rewound it, so a run that never called `synchronize` failed a bind with

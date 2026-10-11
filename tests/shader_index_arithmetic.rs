@@ -532,7 +532,7 @@ fn qwen35_bwd_offsets_are_widened() {
             "SwiGLU gate window",
         ),
         (
-            "dup[(ulong)r * ld_dup + dup_off + col] = d * qwen35_silu(g);",
+            "dup[(ulong)r * ld_dup + dup_off + col] = d * tessl_silu(g);",
             "SwiGLU dup window",
         ),
         (

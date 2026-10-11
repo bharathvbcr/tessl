@@ -10,7 +10,7 @@ mod common;
 
 use std::sync::Arc;
 
-use common::with_gpu;
+use common::{silu, with_gpu};
 use tessl::nn::{
     self, GateUpDispatch, KvStoreTarget, Q4Bank, Q4MlxBank, Q4MlxLayout, Q4MlxRowVariant, QkvBuffers, QkvOutputs,
     QkvRopeDims, QkvRopeVariant, QuantShape,
@@ -112,7 +112,7 @@ fn documented_f32_in_place_norm_and_activation_paths_remain_correct() {
         let want_silu: Vec<_> = gate_values
             .iter()
             .zip(up_values)
-            .map(|(&gate, up)| gate / (1.0 + (-gate).exp()) * up)
+            .map(|(&gate, up)| (silu(f64::from(gate)) * f64::from(up)) as f32)
             .collect();
         let gate = f32_buffer(rt, &gate_values);
         let up = f32_buffer(rt, &up_values);

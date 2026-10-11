@@ -3267,19 +3267,23 @@ mod stress_tests {
         rt.set_precision(PrecisionMode::F32);
     }
 
-    /// The NN kernels switch to the column-panel swizzle only when
-    /// tiles_n*tiles_m >= 2048, a scale no other test reaches — cover the
-    /// swizzle mapping (bijective tile coverage) and its edge interaction
-    /// with sampled f64 parity at small K so the shapes stay cheap.
+    /// The coop NN kernels take `tile_walk`'s column panels once B (N×K)
+    /// holds 2^23 elements on a grid that is not square with a power-of-two
+    /// side. Cover the panel mapping (every tile written once: C starts as
+    /// NaN) and its edge interaction with sampled f64 parity, past the gate
+    /// and on a ragged twin. `panel_walk_matches_row_major_chunks_bit_for_bit`
+    /// holds the same kernels to the row-major walk's bits.
     #[test]
     fn gemm_swizzle_grid_sampled_parity() {
         let rt = GpuRuntime::new().expect("GpuRuntime::new");
         assert!(rt.has_tensorops(), "requires TensorOps metallib");
         rt.set_precision(PrecisionMode::Bf16);
         let mut rng = Rng::new(0x5117_2026u64);
-        // 4096x4096 with 128x64 tiles = 64*32 = 2048 tiles: swizzle ON.
-        // The ragged twin keeps the same grid with edge tiles in play.
-        for (m, n, k) in [(4096usize, 4096usize, 64usize), (4095, 4033, 65)] {
+        // 4096x4096 with 128x64 tiles is 64x32 tiles (not Morton) and B is
+        // 4096*2048 = 2^23 elements: panels ON. The ragged twin keeps the
+        // same grid with edge tiles in play and B at 4033*2081 >= 2^23.
+        for (m, n, k) in [(4096usize, 4096usize, 2048usize), (4095, 4033, 2081)] {
+            assert!(n * k >= 1 << 23, "{m}x{n}x{k} is under the panel gate");
             let a_host: Vec<f32> = (0..m * k).map(|_| Rng::unit(&mut rng)).collect();
             let b_host: Vec<f32> = (0..k * n).map(|_| Rng::unit(&mut rng)).collect();
             let a_ref = round_bf16(&a_host);
@@ -3313,6 +3317,12 @@ mod stress_tests {
     /// case runs, with the operand element it reads.
     #[derive(Clone, Copy, Debug)]
     enum PanelLane {
+        NnBf16Wide,
+        NnBf16Narrow,
+        NnF16Wide,
+        NnRelaxedWide,
+        EpiBf16Wide,
+        BatchedBf16,
         NtBf16,
         TnBf16,
         NtAccumBf16,
@@ -3325,23 +3335,46 @@ mod stress_tests {
     }
 
     impl PanelLane {
+        /// Uploaded as bf16; every other lane uploads f32 (f16 casts it).
         fn bf16(self) -> bool {
             matches!(
                 self,
-                Self::NtBf16 | Self::TnBf16 | Self::NtAccumBf16 | Self::TnAccumBf16
+                Self::NnBf16Wide
+                    | Self::NnBf16Narrow
+                    | Self::EpiBf16Wide
+                    | Self::BatchedBf16
+                    | Self::NtBf16
+                    | Self::TnBf16
+                    | Self::NtAccumBf16
+                    | Self::TnAccumBf16
             )
         }
 
         fn accum(self) -> bool {
             matches!(
                 self,
-                Self::NtAccumBf16 | Self::TnAccumBf16 | Self::NtAccumF32 | Self::TnAccumF32
+                Self::EpiBf16Wide | Self::NtAccumBf16 | Self::TnAccumBf16 | Self::NtAccumF32 | Self::TnAccumF32
             )
+        }
+
+        /// Matrices in one call: the batched lane runs two against one B.
+        fn batch(self) -> usize {
+            if matches!(self, Self::BatchedBf16) {
+                2
+            } else {
+                1
+            }
         }
 
         fn layout(self) -> Layout {
             match self {
-                Self::NnF32 => Layout::NN,
+                Self::NnBf16Wide
+                | Self::NnBf16Narrow
+                | Self::NnF16Wide
+                | Self::NnRelaxedWide
+                | Self::EpiBf16Wide
+                | Self::BatchedBf16
+                | Self::NnF32 => Layout::NN,
                 Self::TnBf16 | Self::TnAccumBf16 | Self::TnF32 | Self::TnAccumF32 => Layout::TN,
                 _ => Layout::NT,
             }
@@ -3360,17 +3393,21 @@ mod stress_tests {
 
         fn tile(self) -> TileGeom {
             match self {
+                Self::NnBf16Narrow => TILE_COOP_NARROW,
+                Self::NnBf16Wide | Self::NnF16Wide | Self::NnRelaxedWide | Self::EpiBf16Wide | Self::BatchedBf16 => {
+                    TILE_COOP_DEFAULT
+                }
                 Self::NtBf16 | Self::TnBf16 => TILE_COOP_TN_NT,
                 Self::NtAccumBf16 | Self::TnAccumBf16 => TILE_COOP_ACCUM,
                 _ => TILE_F32,
             }
         }
 
-        /// `C (+)= op(A) op(B)` through the production entry point, or the
-        /// production accumulate pipeline (reachable from the public API only
-        /// under an A/B flag).
+        /// `C (+)= op(A) op(B)` through the production entry point (on an
+        /// explicit tile where the API takes one), or the production
+        /// accumulate pipeline.
         fn run(self, rt: &std::sync::Arc<GpuRuntime>, a: &Tensor, b: &Tensor, c: &Tensor) {
-            let (m, n) = (c.shape[0], c.shape[1]);
+            let (m, n) = (c.shape[0] / self.batch(), c.shape[1]);
             let k = match self.layout() {
                 Layout::TN => a.shape[0],
                 _ => a.shape[1],
@@ -3379,7 +3416,39 @@ mod stress_tests {
                 let p = rt.pipeline(kernel).unwrap();
                 dispatch_tensorops_accum(rt, &p, a, b, c, m, n, k, self.tile()).unwrap();
             };
+            let to = GemmBackend::TensorOps;
             match self {
+                Self::NnBf16Wide => gemm_tiled(a, b, c, to, EpiTile::Wide).unwrap(),
+                Self::NnBf16Narrow => gemm_tiled(a, b, c, to, EpiTile::Narrow).unwrap(),
+                Self::NnF16Wide => {
+                    let (ah, bh) = (cast_f32_to_f16(a).unwrap(), cast_f32_to_f16(b).unwrap());
+                    gemm_tiled(&ah, &bh, c, to, EpiTile::Wide).unwrap();
+                }
+                Self::NnRelaxedWide => {
+                    rt.set_relaxed_precision(true);
+                    let r = gemm_tiled(a, b, c, to, EpiTile::Wide);
+                    rt.set_relaxed_precision(false);
+                    r.unwrap();
+                }
+                Self::EpiBf16Wide => {
+                    let epi = Epilogue {
+                        alpha: 0.5,
+                        beta: 1.0,
+                        activation: Activation::Silu,
+                        ..Default::default()
+                    };
+                    gemm_epilogue_tiled(a, b, c, to, epi, EpiTile::Wide).unwrap();
+                }
+                Self::BatchedBf16 => {
+                    let spec = BatchedGemm {
+                        m,
+                        n,
+                        k,
+                        batch: self.batch(),
+                        strides: BatchStrides::shared_b(m, n, k),
+                    };
+                    gemm_batched(a, b, c, to, spec).unwrap();
+                }
                 Self::NtBf16 => gemm_nt_bf16(a, b, c).unwrap(),
                 Self::TnBf16 => gemm_tn_bf16(a, b, c).unwrap(),
                 Self::NtAccumBf16 => accum("matmul2d_tensorops_nt_accum_bf16_f32"),
@@ -3402,6 +3471,8 @@ mod stress_tests {
     /// column chunks small enough to keep the row-major walk. Every kernel
     /// that walks by B's size is run past the gate, with ragged M and N (a
     /// partial last band, tile row and tile column), and its chunks under it.
+    /// The cooperative NN kernels (bf16 on both tiles, f16, relaxed f32, the
+    /// epilogue and the batched form) walk by B's size too since 2026-10-11.
     /// Two more cases are square power-of-two grids past the gate, which keep
     /// Morton order. Plain kernels start from NaN, so a skipped tile shows;
     /// accumulate kernels start from the same finite C, so a skipped or
@@ -3417,6 +3488,11 @@ mod stress_tests {
         rt.set_precision(PrecisionMode::F32);
         let mut rng = Rng::new(0x9A2E_2026u64);
         let lanes = [
+            PanelLane::NnBf16Wide,
+            PanelLane::NnBf16Narrow,
+            PanelLane::NnF16Wide,
+            PanelLane::NnRelaxedWide,
+            PanelLane::EpiBf16Wide,
             PanelLane::NtBf16,
             PanelLane::TnBf16,
             PanelLane::NtAccumBf16,
@@ -3434,10 +3510,19 @@ mod stress_tests {
         let mut cases: Vec<(PanelLane, usize, usize, usize, usize, bool)> = lanes
             .iter()
             .map(|&lane| {
-                let n = if lane.bf16() { 16432 } else { 8240 };
+                let n = if lane.bf16() || matches!(lane, PanelLane::NnF16Wide) {
+                    16432
+                } else {
+                    8240
+                };
                 (lane, 2348, n, 1056, 2048, false)
             })
             .collect();
+        // Batched picks its tile by the single-matrix rule, so every chunk
+        // must keep 128x64 (N > 512 and at least 64 tiles): chunks of 1920
+        // (30 tile columns) leave a last one of 1072. Each matrix of 652 rows
+        // is 6 tile rows (bands of 4: the last holds 2).
+        cases.push((PanelLane::BatchedBf16, 652, 16432, 1056, 1920, false));
         cases.push((PanelLane::NtBf16, 4096, 2048, 4096, 1024, true));
         cases.push((PanelLane::NtF32, 2048, 2048, 4096, 1024, true));
         for (lane, m, n, k, chunk, morton) in cases {
@@ -3451,7 +3536,17 @@ mod stress_tests {
             assert!(n * k >= PANEL_MIN_B_ELEMS && chunk * k < PANEL_MIN_B_ELEMS);
             for w in [n, chunk, n % chunk].into_iter().filter(|&w| w > 0) {
                 assert!(lane.single_dispatch(m, w, k), "{lane:?} {m}x{w}x{k} takes split-K");
+                if lane.batch() > 1 {
+                    let (_, geom) = nn_coop_kernel(m, w, k, CoopElem::Bf16);
+                    assert_eq!(
+                        (geom.sm, geom.sn),
+                        (t.sm, t.sn),
+                        "{lane:?} {m}x{w}: the rule changes tile"
+                    );
+                }
             }
+            // A batched lane's A and C stack its matrices' rows.
+            let m = m * lane.batch();
             let a_host: Vec<f32> = (0..m * k).map(|_| Rng::unit(&mut rng)).collect();
             let b_host: Vec<f32> = (0..k * n).map(|_| Rng::unit(&mut rng)).collect();
             // Stored layouts: A [M,K] or [K,M]; B [K,N] (NN, TN) or [N,K] (NT).

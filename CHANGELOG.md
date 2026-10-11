@@ -145,6 +145,15 @@ All notable changes to `tessl` are recorded here. The format follows
 
 ### Changed
 
+- **One panel-walk policy for every GEMM family.** The cooperative NN
+  kernels (plain, epilogue, batched) walked tiles by their own gate (8-row
+  column panels from 2048 tiles); everything else used `tile_walk` (512-row
+  panels once B reaches 2^23 elements, Morton kept). Interleaved per lane,
+  `tile_walk` was never worse beyond noise and won where they disagreed:
+  NN 1.14x at 1024x8192x2048 and 1.06x at the Qwen3.5-2B MLP up/gate shape,
+  while the grid gate lost 0.94x on the 2B TN/NT shapes
+  (`bench/results/gemm_panel_walk_m5pro.txt`). NN now walks by `tile_walk`;
+  output is bit for bit unchanged.
 - **`TESSL_GEMM_INTERIOR` is retired.** It sent the exact-f32 kernels'
   interior tiles through offset pointer tensors; interleaved on the
   Qwen3.5-2B training shapes, that ran at 0.99-1.01x of the slice path every

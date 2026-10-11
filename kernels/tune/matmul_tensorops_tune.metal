@@ -398,12 +398,10 @@ TUNE_PANEL_KERNEL(mm_bf16_tn_accum_coop_64x64_sg4_ph8,  mm_bf16_tn_coop_panel, 6
 TUNE_PANEL_KERNEL(mm_bf16_tn_accum_coop_64x64_sg4_ph16, mm_bf16_tn_coop_panel, 64, 64, 4, 16, true)
 
 // =============================================================================
-// One panel-walk policy: the production coop kernels (edges included) with
-// the other family's walk. The NN coop kernels walk by grid size
-// (`walk_by_grid`: >= 2048 tiles take 8-row panels); TN, NT, their
-// accumulate forms, exact f32 and int8 walk by B's size (`walk_by_b`,
-// `tile_walk`). `_walkb` / `_walkg` swap them; the bench's production arm is
-// the shipped walk.
+// One panel-walk policy: the production coop kernels (edges included) under
+// `walk_by_grid`, the gate the NN coop kernels walked by until every family
+// moved to `walk_by_b` (`tile_walk`). The bench's production arm is the
+// shipped walk.
 // =============================================================================
 
 #define TUNE_WALK_KERNEL(NAME, ELEM, SM, SN, NSG, TA, TB, ACCUM, WALK)         \
@@ -421,8 +419,8 @@ TUNE_PANEL_KERNEL(mm_bf16_tn_accum_coop_64x64_sg4_ph16, mm_bf16_tn_coop_panel, 6
             0u);                                                               \
     }
 
-TUNE_WALK_KERNEL(mm_bf16_coop_128x64_sg4_walkb, bfloat, 128, 64, 4, false, false, false, walk_by_b);
-TUNE_WALK_KERNEL(mm_bf16_coop_64x64_sg4_walkb,  bfloat,  64, 64, 4, false, false, false, walk_by_b);
+TUNE_WALK_KERNEL(mm_bf16_coop_128x64_sg4_walkg, bfloat, 128, 64, 4, false, false, false, walk_by_grid);
+TUNE_WALK_KERNEL(mm_bf16_coop_64x64_sg4_walkg,  bfloat,  64, 64, 4, false, false, false, walk_by_grid);
 TUNE_WALK_KERNEL(mm_bf16_tn_coop_128x64_sg4_walkg, bfloat, 128, 64, 4, true, false, false, walk_by_grid);
 TUNE_WALK_KERNEL(mm_bf16_nt_coop_128x64_sg4_walkg, bfloat, 128, 64, 4, false, true, false, walk_by_grid);
 TUNE_WALK_KERNEL(mm_bf16_tn_accum_coop_64x64_sg4_walkg, bfloat, 64, 64, 4, true, false, true, walk_by_grid);

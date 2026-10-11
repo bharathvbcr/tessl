@@ -173,9 +173,12 @@ on square power-of-two grids. The control read 0.71–0.88× of production *desp
 identical geometry*. A rig must mirror `tile_from_linear`, or every variant is
 penalised on square shapes.
 
-Production now also walks a large B in column panels: through `tile_walk`, the
-exact-f32, bf16 TN/NT and int8 kernels do so once $N \times K \ge 2^{23}$, on
-any grid not walked in Morton order. The rig's base copies of the TN/NT coop
+Production now also walks a large B in column panels: through `tile_walk`,
+every GEMM family (exact f32, the cooperative NN, bf16 TN/NT and their
+accumulates, int8) does so once $N \times K \ge 2^{23}$, on any grid not
+walked in Morton order. The cooperative NN kernels had their own gate (8-row
+panels from 2048 tiles) until 2026-10-11; `bench/results/gemm_panel_walk_m5pro.txt`
+is the per-lane A/B that retired it. The rig's base copies of the TN/NT coop
 kernels still mirror `tile_from_linear`, so past that gate they stand for the
 walk production replaced, not for production. There, compare against the
 production line or the matching `_ph` panel variant: `_ph4` for 128-row tiles

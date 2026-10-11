@@ -61,8 +61,9 @@ inline uint2 tile_from_linear_panel(uint linear, uint tiles_n, uint tiles_m, uin
     return uint2(rem / local_h, band * ph + rem % local_h);
 }
 
-/// Tile walk of the exact-f32, the bf16 TN/NT coop and the int8 dequant
-/// kernels, `SM` rows per tile. Every tile row reads all of B (the N×K
+/// Tile walk of every GEMM family — exact f32, the cooperative NN (bf16, f16,
+/// relaxed f32; plain, epilogue and batched), the bf16 TN/NT coop and their
+/// accumulates, and the int8 dequant kernels — `SM` rows per tile. Every tile row reads all of B (the N×K
 /// operand), so row-major order re-reads B once per tile row. That is free
 /// while B stays in cache and DRAM-bound once it does not: the LM head's
 /// 50304×768 f32 weight ran at ~2.3 TFLOP/s against ~6.5 at N ≤ 2304. Column
@@ -100,9 +101,11 @@ inline uint2 tile_walk(uint linear, uint tiles_n, uint tiles_m, uint N, uint K) 
     return tile_from_linear(linear, tiles_n, tiles_m);
 }
 
-/// Walk policies, as the `Walk` template argument of `mm_coop`.
+/// Walk policies, as the `Walk` template argument of `mm_coop` and
+/// `mm_exact_f32`.
 ///
-/// `walk_by_b`: production's `tile_walk` (column panels for a large B).
+/// `walk_by_b`: production's `tile_walk` (column panels for a large B), for
+/// every GEMM family.
 struct walk_by_b {
     template <int SM>
     static inline uint2 tile(uint linear, uint tiles_n, uint tiles_m, uint N, uint K) {
@@ -110,10 +113,12 @@ struct walk_by_b {
     }
 };
 
-/// `walk_by_grid`: the coop NN kernels' own gate. Large grids take a
-/// column-panel swizzle (8 tile-rows per band): bounds B-tile rereads to
-/// tiles_m/8 full passes — +11% at 4096^3, neutral on tall_k1024/mlp_up,
-/// gated off where it measured -3% (square_2048).
+/// `walk_by_grid`: the gate the coop NN kernels walked by until 2026-10-11.
+/// Large grids took a column-panel swizzle (8 tile-rows per band), measured
+/// +11% at 4096^3 on the blocked tune rig. Interleaved against `walk_by_b`
+/// per lane it tied or lost (0.94x on the 2B dX/dW shapes, `walk_by_b`
+/// 1.14x on NN at 1024x8192x2048), so every family now walks by B's size;
+/// this stays for the tune A/B (bench/results/gemm_panel_walk_m5pro.txt).
 struct walk_by_grid {
     template <int SM>
     static inline uint2 tile(uint linear, uint tiles_n, uint tiles_m, uint N, uint K) {

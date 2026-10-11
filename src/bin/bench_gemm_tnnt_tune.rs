@@ -128,10 +128,9 @@ enum Lane {
     NnAccF32,
     TnAccF32,
     NtAccF32,
-    /// One panel-walk policy: production's walk against the production coop
-    /// kernel under the other family's walk (`_walkb`: the NN coop kernels on
-    /// `tile_walk`; `_walkg`: TN, NT and their accumulates on the NN kernels'
-    /// grid gate).
+    /// One panel-walk policy: production's walk (`tile_walk` for every
+    /// family) against the production coop kernel under the grid gate the NN
+    /// kernels used until 2026-10-11 (`_walkg`).
     WalkNn,
     WalkTn,
     WalkNt,
@@ -725,8 +724,8 @@ fn main() -> Result<(), String> {
     let f32_tnacc_variants = pair("matmul2d_tensorops_tn_accum_f32", true);
     let f32_ntacc_variants = pair("matmul2d_tensorops_nt_accum_f32", true);
     let walk_nn_variants = [
-        variant("mm_bf16_coop_128x64_sg4_walkb", 128, 64, true),
-        variant("mm_bf16_coop_64x64_sg4_walkb", 64, 64, true),
+        variant("mm_bf16_coop_128x64_sg4_walkg", 128, 64, true),
+        variant("mm_bf16_coop_64x64_sg4_walkg", 64, 64, true),
     ];
     let walk_tn_variants = [variant("mm_bf16_tn_coop_128x64_sg4_walkg", 128, 64, true)];
     let walk_nt_variants = [variant("mm_bf16_nt_coop_128x64_sg4_walkg", 128, 64, true)];

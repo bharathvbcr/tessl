@@ -265,7 +265,8 @@ kernel void matmul2d_tensorops_tn_splitk_bf16_f32(
 
 // A call with no explicit template arguments is the production geometry:
 // 128×64, sg4, strict, no epilogue (`matmul2d_tensorops_bf16_f32`). The body
-// is gemm_coop.h's `mm_coop`, walked by the coop NN kernels' own grid gate.
+// is gemm_coop.h's `mm_coop`, walked by `tile_walk` like every other GEMM
+// family (bench/results/gemm_panel_walk_m5pro.txt).
 template <typename ElemT, int SM = 128, int SN = 64, int NSG = 4,
           bool RELAXED = false, bool EPILOGUE = false>
 inline void mm_nn_coop_f32acc(device ElemT *A, device ElemT *B, device float *C,
@@ -273,7 +274,7 @@ inline void mm_nn_coop_f32acc(device ElemT *A, device ElemT *B, device float *C,
                               uint tiles_m, uint tgpig,
                               device const float *bias, float alpha, float beta,
                               uint act) {
-    mm_coop<ElemT, SM, SN, NSG, false, false, RELAXED, false, EPILOGUE, walk_by_grid>(
+    mm_coop<ElemT, SM, SN, NSG, false, false, RELAXED, false, EPILOGUE, walk_by_b>(
         A, B, C, M, N, K, tiles_n, tiles_m, tgpig, bias, alpha, beta, act);
 }
 

@@ -4,7 +4,8 @@
 //! kernels that only a `TESSL_GEMM_TUNE=1` build links. Without them both used
 //! to print `skip(pipe)` for every variant and exit 0, so a run that measured
 //! nothing looked like a run that passed. Each must instead exit 2 before
-//! timing anything and name the build command.
+//! timing anything and name the build command. Likewise a rig that flags a
+//! drifting baseline (`EXCEEDS 10%`) must not then exit 0.
 
 mod common;
 
@@ -56,4 +57,39 @@ fn tuning_binaries_exit_2_without_the_tune_kernels() {
     }
     assert_refuses("bench_gemm_tnnt_tune", env!("CARGO_BIN_EXE_bench_gemm_tnnt_tune"));
     assert_refuses("bench_gemm_tile_tune", env!("CARGO_BIN_EXE_bench_gemm_tile_tune"));
+}
+
+/// Every bench binary that flags a baseline drifting past
+/// `SELF_SPREAD_LIMIT` must end such a run with `exit_if_unstable` (exit 3).
+/// `bench_gemm_routes` printed the flag and exited 0, so its results files
+/// read as clean runs.
+#[test]
+fn every_rig_that_flags_drift_exits_3() {
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/bin");
+    let mut flagging = Vec::new();
+    for entry in std::fs::read_dir(&dir).expect("src/bin") {
+        let path = entry.expect("src/bin entry").path();
+        if path.extension().is_none_or(|e| e != "rs") {
+            continue;
+        }
+        let text = std::fs::read_to_string(&path).expect("bench source");
+        if text.contains("SELF_SPREAD_LIMIT") {
+            let name = path.file_name().unwrap().to_string_lossy().into_owned();
+            assert!(
+                text.contains("common::exit_if_unstable("),
+                "{name} flags drift past SELF_SPREAD_LIMIT but never calls common::exit_if_unstable"
+            );
+            flagging.push(name);
+        }
+    }
+    flagging.sort();
+    assert_eq!(
+        flagging,
+        [
+            "bench_gemm_routes.rs",
+            "bench_gemm_tile_tune.rs",
+            "bench_gemm_tnnt_tune.rs"
+        ],
+        "the scan must see the rigs it guards"
+    );
 }

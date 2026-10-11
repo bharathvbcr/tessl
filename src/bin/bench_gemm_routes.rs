@@ -12,7 +12,9 @@
 //! the clock sees the kernels and not the submit, `BENCH_ITERS` calls per arm
 //! per round (8), `BENCH_ROUNDS` rounds (6) with the arm order reversed
 //! every other round, after `BENCH_WARMUP` calls of each arm (2). A ratio is
-//! the median of the per-round ratios; its range is printed beside it.
+//! the median of the per-round ratios; its range is printed beside it. A
+//! shape whose first arm moved more than 10% against itself across rounds is
+//! flagged `EXCEEDS 10%`, and the run then exits 3 (as the tune rigs do).
 //!
 //! Lanes (`BENCH_LANES`, comma-separated, default all):
 //! - `splitk`: the TN shapes `prefer_tn_splitk` gates (K ≥ 2048, M, N ≤ 384,
@@ -407,6 +409,9 @@ struct Run {
     warmup: usize,
     iters: usize,
     rounds: usize,
+    /// Labels whose first arm broke [`common::SELF_SPREAD_LIMIT`]; a
+    /// non-empty list ends the run with exit 3.
+    unstable: std::cell::RefCell<Vec<String>>,
 }
 
 /// Time `arms` (each one call = `reps` dispatches, then a wait) as one
@@ -415,6 +420,9 @@ fn report(label: &str, arms: &mut [common::Arm<'_>], run: &Run) -> Result<Vec<f6
     let paired = common::run_paired(arms, run.warmup, run.iters, run.rounds)?;
     let base = &paired.rounds[0];
     let spread = common::self_spread(base);
+    if spread > common::SELF_SPREAD_LIMIT {
+        run.unstable.borrow_mut().push(label.to_string());
+    }
     println!(
         "\n{label}  (self-spread of {} {:.1}%{})",
         paired.names[0],
@@ -600,6 +608,7 @@ fn main() -> Result<(), String> {
         warmup: common::env_usize("BENCH_WARMUP", 2, 0)?,
         iters: common::env_usize("BENCH_ITERS", 8, 1)?,
         rounds: common::env_usize("BENCH_ROUNDS", 6, 1)?,
+        unstable: Default::default(),
     };
     let lanes = std::env::var("BENCH_LANES").unwrap_or_else(|_| "splitk,smallm,batched,epi".into());
     println!("device: {}", rt.device_name());
@@ -621,5 +630,6 @@ fn main() -> Result<(), String> {
         }
     }
     rt.set_async_encode(false)?;
+    common::exit_if_unstable("bench_gemm_routes", &run.unstable.borrow());
     Ok(())
 }

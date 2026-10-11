@@ -32,6 +32,8 @@
 #                     shapes, 0.96x TN accumulate at 3072^2, 1.00-1.01x
 #                     elsewhere.
 # tile_walk is never worse beyond noise and wins where the two disagree.
+# (The two shapes where it drops the gate's panels drifted here; re-run at
+# the end of this file with stable baselines: 0.99-1.01x, a tie.)
 # Decision: every family walks by tile_walk (`walk_by_b`); the NN gate stays
 # in gemm_coop.h only as `walk_by_grid`, for the tune `_walkg` variants.
 # The routed kernels' output is unchanged bit for bit (walk only).
@@ -128,3 +130,53 @@ walk_tnacc_morton_grid  M=4096 N=4096 K=1024   production 1.477 ms  23257 GFLOP/
 walk_tnacc_grid_only  M=3072 N=3072 K=1024   production 0.886 ms  21804 GFLOP/s  (self-spread 4.9%, err 0.00e0)
   mm_bf16_tn_accum_coop_64x64_sg4_walkg     0.924       20914    0.96× [0.85–1.01]      0.00e0
 
+# Re-run, 2026-10-11 13:46 UTC: the two shapes where tile_walk drops the
+# grid gate's panels (walk_nn_grid_only: 2048 tiles, B = 4M elements;
+# walk_nn_mlp_up: 3072 tiles, B = 2.4M) both broke the 10% self-spread
+# above, so "never worse" had no stable evidence where the policies
+# disagree in that direction. Tree: 3829434 (production NN on tile_walk;
+# the `_walkg` arms are the retired grid gate). Three runs of 12 rounds,
+# one locked job (Lappi-decision/tools/mac_heavy.sh,
+# MAC_HEAVY_MAX_LOAD=60); host load ~10. (The GPU utilization in runs 2
+# and 3 was sampled one second after the previous run ended and is that
+# run's own tail.) Command:
+#   TESSL_GEMM_TUNE=1 cargo build --release --bin bench_gemm_tnnt_tune
+#   BENCH_ONLY=walk_nn_grid_only,walk_nn_mlp_up BENCH_ROUNDS=12 \
+#     BENCH_ITERS=5 BENCH_WARMUP=4 target/release/bench_gemm_tnnt_tune
+# Result: every baseline held (self-spread 3.7-8.1%, exit 0 each time) and
+# tile_walk ran at 0.99-1.01x of the grid gate at both shapes, all three
+# runs: a tie. The decision stands.
+#
+=== rerun 1 2026-10-11T13:46:14Z load: { 10.25 10.62 12.50 } gpu: "Device Utilization %"=8
+interleaved A/B: 12 rounds (order reversed every other round), 5 timed calls per arm per round after 4 warmup; times are medians of per-round medians, ratios are medians of per-round production/variant ratios [range]
+
+walk_nn_grid_only  M=4096 N=4096 K=1024   production 1.242 ms  27663 GFLOP/s  (self-spread 8.1%, err 0.00e0)
+  mm_bf16_coop_128x64_sg4_walkg            1.248       27527    1.00× [0.96–1.04]      0.00e0
+  mm_bf16_coop_64x64_sg4_walkg             1.236       27795    1.00× [0.97–1.07]      0.00e0
+
+walk_nn_mlp_up  M=8192 N=3072 K=768   production 1.378 ms  28048 GFLOP/s  (self-spread 4.6%, err 0.00e0)
+  mm_bf16_coop_128x64_sg4_walkg            1.387       27873    1.00× [0.97–1.03]      0.00e0
+  mm_bf16_coop_64x64_sg4_walkg             1.386       27886    1.00× [0.97–1.03]      0.00e0
+exit=0
+=== rerun 2 2026-10-11T13:46:15Z load: { 10.25 10.62 12.50 } gpu: "Device Utilization %"=75
+interleaved A/B: 12 rounds (order reversed every other round), 5 timed calls per arm per round after 4 warmup; times are medians of per-round medians, ratios are medians of per-round production/variant ratios [range]
+
+walk_nn_grid_only  M=4096 N=4096 K=1024   production 1.256 ms  27367 GFLOP/s  (self-spread 5.5%, err 0.00e0)
+  mm_bf16_coop_128x64_sg4_walkg            1.260       27270    1.00× [0.97–1.02]      0.00e0
+  mm_bf16_coop_64x64_sg4_walkg             1.250       27495    1.01× [0.98–1.03]      0.00e0
+
+walk_nn_mlp_up  M=8192 N=3072 K=768   production 1.400 ms  27601 GFLOP/s  (self-spread 4.5%, err 0.00e0)
+  mm_bf16_coop_128x64_sg4_walkg            1.405       27509    1.00× [0.96–1.01]      0.00e0
+  mm_bf16_coop_64x64_sg4_walkg             1.394       27732    1.00× [0.98–1.05]      0.00e0
+exit=0
+=== rerun 3 2026-10-11T13:46:16Z load: { 10.25 10.62 12.50 } gpu: "Device Utilization %"=83
+interleaved A/B: 12 rounds (order reversed every other round), 5 timed calls per arm per round after 4 warmup; times are medians of per-round medians, ratios are medians of per-round production/variant ratios [range]
+
+walk_nn_grid_only  M=4096 N=4096 K=1024   production 1.259 ms  27289 GFLOP/s  (self-spread 3.7%, err 0.00e0)
+  mm_bf16_coop_128x64_sg4_walkg            1.265       27156    0.99× [0.96–1.03]      0.00e0
+  mm_bf16_coop_64x64_sg4_walkg             1.250       27493    1.00× [0.98–1.02]      0.00e0
+
+walk_nn_mlp_up  M=8192 N=3072 K=768   production 1.407 ms  27478 GFLOP/s  (self-spread 5.4%, err 0.00e0)
+  mm_bf16_coop_128x64_sg4_walkg            1.406       27502    0.99× [0.95–1.03]      0.00e0
+  mm_bf16_coop_64x64_sg4_walkg             1.382       27972    1.00× [0.97–1.05]      0.00e0
+exit=0

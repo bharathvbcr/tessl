@@ -4,13 +4,19 @@
 //! arithmetic intensity, and the zero_f32(C) pre-pass that only exists because
 //! the production kernel accumulates on the first K block. Every variant is
 //! checked against the production kernel's output before its time is reported.
+//!
+//! Production and the variants of a shape are timed as the arms of one
+//! interleaved A/B (`common::run_paired`, `BENCH_ROUNDS` x `BENCH_ITERS`);
+//! a variant absent from the metallib (a build without `TESSL_GEMM_TUNE=1`)
+//! stops the run with exit status 2 before anything is timed.
 
 // A tuning sweep takes the full GEMM shape plus the tile parameters it is
 // sweeping. Bundling them would add a struct that every call site unpacks.
 #![allow(clippy::too_many_arguments)]
 
+mod common;
+
 use objc2_metal::MTLComputePipelineState;
-use std::time::Instant;
 use tessl::gemm::{cast_f32_to_bf16, gemm, GemmBackend};
 use tessl::runtime::{mtl_size, GpuRuntime};
 use tessl::tensor::Tensor;
@@ -166,16 +172,6 @@ fn fill(n: usize, seed: u64) -> Vec<f32> {
         .collect()
 }
 
-fn median(mut v: Vec<f64>) -> f64 {
-    v.sort_by(|a, b| a.partial_cmp(b).unwrap());
-    let n = v.len();
-    if n % 2 == 1 {
-        v[n / 2]
-    } else {
-        (v[n / 2 - 1] + v[n / 2]) / 2.0
-    }
-}
-
 fn run_variant(
     rt: &std::sync::Arc<GpuRuntime>,
     v: &Variant,
@@ -218,50 +214,95 @@ fn run_variant(
 
 fn main() -> Result<(), String> {
     let rt = GpuRuntime::new()?;
-    let warmup: usize = std::env::var("BENCH_WARMUP")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(10);
-    let iters: usize = std::env::var("BENCH_ITERS")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(30);
+    let warmup = common::env_usize("BENCH_WARMUP", 10, 0)?;
+    let iters = common::env_usize("BENCH_ITERS", 5, 1)?;
+    let rounds = common::env_usize("BENCH_ROUNDS", 6, 1)?;
+    common::require_kernels(
+        &rt,
+        "bench_gemm_tile_tune",
+        VARIANTS.iter().chain(F32_VARIANTS).map(|v| v.kernel),
+    );
 
     println!(
         "{:<32}{:>12}{:>14}{:>16}",
         "kernel", "maxTPTG", "tgMem(B)", "requested TPTG"
     );
     for v in VARIANTS.iter().chain(F32_VARIANTS) {
-        match rt.pipeline(v.kernel) {
-            Ok(p) => {
-                let w = p.threadExecutionWidth();
-                println!(
-                    "{:<32}{:>12}{:>14}{:>16}",
-                    v.kernel,
-                    p.maxTotalThreadsPerThreadgroup(),
-                    p.staticThreadgroupMemoryLength(),
-                    w * v.nsg
-                );
-            }
-            Err(e) => println!("{:<32}  pipeline error: {e}", v.kernel),
-        }
+        let p = rt.pipeline(v.kernel)?;
+        println!(
+            "{:<32}{:>12}{:>14}{:>16}",
+            v.kernel,
+            p.maxTotalThreadsPerThreadgroup(),
+            p.staticThreadgroupMemoryLength(),
+            p.threadExecutionWidth() * v.nsg
+        );
     }
+    println!(
+        "\ninterleaved A/B: {rounds} rounds (order reversed every other round), {iters} timed calls per arm \
+         per round after {warmup} warmup; times are medians of per-round medians, ratios are medians of \
+         per-round production/variant ratios [range]"
+    );
 
+    // `BENCH_ONLY=a,b` runs only the shapes whose label contains one of them.
+    let only: Option<Vec<String>> = std::env::var("BENCH_ONLY")
+        .ok()
+        .map(|s| s.split(',').map(str::to_string).collect());
+    // `BENCH_LANES=bf16` or `=f32` runs one lane; both by default.
+    let lanes = std::env::var("BENCH_LANES").unwrap_or_else(|_| "bf16,f32".into());
+    let mut unstable = Vec::new();
     for &(m, n, k, label) in SHAPES {
+        if let Some(only) = &only {
+            if !only.iter().any(|p| label.contains(p.as_str())) {
+                continue;
+            }
+        }
         let a = rt.alloc_tensor_f32(&[m, k])?;
         let b = rt.alloc_tensor_f32(&[k, n])?;
         a.buffer.write_f32(&fill(m * k, 1));
         b.buffer.write_f32(&fill(k * n, 2));
-        let a_bf = cast_f32_to_bf16(&a)?;
-        let b_bf = cast_f32_to_bf16(&b)?;
-        sweep(&rt, "bf16", VARIANTS, &a_bf, &b_bf, (m, n, k), label, warmup, iters)?;
-        sweep(&rt, "exact f32", F32_VARIANTS, &a, &b, (m, n, k), label, warmup, iters)?;
+        if lanes.split(',').any(|l| l == "bf16") {
+            let a_bf = cast_f32_to_bf16(&a)?;
+            let b_bf = cast_f32_to_bf16(&b)?;
+            if !sweep(
+                &rt,
+                "bf16",
+                VARIANTS,
+                &a_bf,
+                &b_bf,
+                (m, n, k),
+                label,
+                warmup,
+                iters,
+                rounds,
+            )? {
+                unstable.push(format!("{label} [bf16]"));
+            }
+        }
+        if lanes.split(',').any(|l| l == "f32")
+            && !sweep(
+                &rt,
+                "exact f32",
+                F32_VARIANTS,
+                &a,
+                &b,
+                (m, n, k),
+                label,
+                warmup,
+                iters,
+                rounds,
+            )?
+        {
+            unstable.push(format!("{label} [exact f32]"));
+        }
     }
+    common::exit_if_unstable("bench_gemm_tile_tune", &unstable);
     Ok(())
 }
 
-/// Time production `gemm` on `a`, `b` (bf16 or f32 operands pick the kernel),
-/// then every variant, each checked against production's output first.
+/// Production `gemm` on `a`, `b` (bf16 or f32 operands pick the kernel) and
+/// every variant, each checked against production's output first, timed as
+/// the arms of one interleaved A/B. `false` when production's own spread
+/// across rounds broke the 10% limit.
 fn sweep(
     rt: &std::sync::Arc<GpuRuntime>,
     lane: &str,
@@ -272,93 +313,88 @@ fn sweep(
     label: &str,
     warmup: usize,
     iters: usize,
-) -> Result<(), String> {
+    rounds: usize,
+) -> Result<bool, String> {
     let c_ref = rt.alloc_tensor_f32(&[m, n])?;
     gemm(a, b, &c_ref, GemmBackend::TensorOps)?;
     rt.synchronize()?;
     let refv = c_ref.buffer.read_f32()[..m * n].to_vec();
     let refmax = refv.iter().fold(0f32, |acc, x| acc.max(x.abs())) as f64;
-
     let flop = 2.0 * m as f64 * n as f64 * k as f64;
-    let prod = {
-        for _ in 0..warmup {
-            gemm(a, b, &c_ref, GemmBackend::TensorOps)?;
-            rt.synchronize()?;
-        }
-        let mut s = Vec::new();
-        for _ in 0..iters {
-            let t0 = Instant::now();
-            gemm(a, b, &c_ref, GemmBackend::TensorOps)?;
-            rt.synchronize()?;
-            s.push(t0.elapsed().as_secs_f64() * 1000.0);
-        }
-        median(s)
-    };
-    println!(
-        "\n{label} [{lane}]  M={m} N={n} K={k}   production {prod:.3} ms  {:.0} GFLOP/s",
-        flop / (prod * 1e6)
-    );
-    println!(
-        "  {:<32}{:>10}{:>12}{:>9}{:>12}",
-        "variant", "ms", "GFLOP/s", "vs prod", "max_rel_err"
-    );
 
+    let mut runnable: Vec<(&Variant, Tensor, f64)> = Vec::new();
+    let mut skipped: Vec<&Variant> = Vec::new();
     for v in variants {
         if m % v.sm != 0 || n % v.sn != 0 || k % v.bk != 0 {
-            println!("  {:<32}{:>10}", v.kernel, "skip(div)");
+            skipped.push(v);
             continue;
         }
         let c = rt.alloc_tensor_f32(&[m, n])?;
-        if run_variant(rt, v, a, b, &c, m, n, k).is_err() {
-            println!("  {:<32}{:>10}", v.kernel, "skip(pipe)");
-            continue;
-        }
+        run_variant(rt, v, a, b, &c, m, n, k)?;
         rt.synchronize()?;
-        let got = c.buffer.read_f32()[..m * n].to_vec();
-        let err = got
+        let err = c.buffer.read_f32()[..m * n]
             .iter()
             .zip(&refv)
             .map(|(x, y)| (*x as f64 - *y as f64).abs())
             .fold(0.0, f64::max)
             / refmax;
+        runnable.push((v, c, err));
+    }
 
-        for _ in 0..warmup {
-            run_variant(rt, v, a, b, &c, m, n, k)?;
-            rt.synchronize()?;
-        }
-        let mut s = Vec::new();
-        for _ in 0..iters {
-            let t0 = Instant::now();
-            run_variant(rt, v, a, b, &c, m, n, k)?;
-            rt.synchronize()?;
-            s.push(t0.elapsed().as_secs_f64() * 1000.0);
-        }
-        let med = median(s);
+    let mut arms: Vec<common::Arm> = Vec::with_capacity(1 + runnable.len());
+    arms.push(common::Arm {
+        name: "production".into(),
+        reps: 1,
+        run: Box::new(|| {
+            gemm(a, b, &c_ref, GemmBackend::TensorOps)?;
+            rt.synchronize()
+        }),
+    });
+    for (v, c, _) in &runnable {
+        arms.push(common::Arm {
+            name: v.kernel.into(),
+            reps: 1,
+            run: Box::new(move || {
+                run_variant(rt, v, a, b, c, m, n, k)?;
+                rt.synchronize()
+            }),
+        });
+    }
+    let paired = common::run_paired(&mut arms, warmup, iters, rounds)?;
+    drop(arms);
+
+    let prod_rounds = &paired.rounds[0];
+    let prod = common::median(prod_rounds.clone())?;
+    let spread = common::self_spread(prod_rounds);
+    println!(
+        "\n{label} [{lane}]  M={m} N={n} K={k}   production {prod:.3} ms  {:.0} GFLOP/s  (self-spread {:.1}%)",
+        flop / (prod * 1e6),
+        spread * 100.0
+    );
+    if spread > common::SELF_SPREAD_LIMIT {
+        println!("  EXCEEDS 10%: ratios below are not comparable");
+    }
+    println!(
+        "  {:<32}{:>10}{:>12}{:>9}{:>15}{:>12}",
+        "variant", "ms", "GFLOP/s", "vs prod", "range", "max_rel_err"
+    );
+    for ((v, _, err), rounds_ms) in runnable.iter().zip(&paired.rounds[1..]) {
+        let med = common::median(rounds_ms.clone())?;
+        let (ratio, lo, hi) = common::ratio_stats(prod_rounds, rounds_ms)?;
         println!(
-            "  {:<32}{:>10.3}{:>12.0}{:>8.2}×{:>12.2e}",
+            "  {:<32}{:>10.3}{:>12.0}{:>8.2}×   [{lo:.2}–{hi:.2}]{:>12.2e}",
             v.kernel,
             med,
             flop / (med * 1e6),
-            prod / med,
+            ratio,
             err
         );
     }
-
-    let prod_after = {
-        let mut s = Vec::new();
-        for _ in 0..iters {
-            let t0 = Instant::now();
-            gemm(a, b, &c_ref, GemmBackend::TensorOps)?;
-            rt.synchronize()?;
-            s.push(t0.elapsed().as_secs_f64() * 1000.0);
-        }
-        median(s)
-    };
-    println!(
-        "  production re-measured after: {prod_after:.3} ms ({:.0} GFLOP/s) \
-— drift vs before: {:+.1}%",
-        flop / (prod_after * 1e6),
-        (prod_after / prod - 1.0) * 100.0
-    );
-    Ok(())
+    for v in skipped {
+        println!(
+            "  {:<32}{:>10}",
+            v.kernel, "skip(div): the shape is not a multiple of the tile"
+        );
+    }
+    Ok(spread <= common::SELF_SPREAD_LIMIT)
 }

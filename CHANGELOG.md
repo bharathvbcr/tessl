@@ -556,6 +556,18 @@ All notable changes to `tessl` are recorded here. The format follows
 
 ### Fixed
 
+- **The GEMM tuning rigs are interleaved A/Bs and refuse to run without
+  their kernels.** `bench_gemm_tnnt_tune` timed production for all its
+  iterations before any variant, though `docs/benchmarking.md` called it
+  interleaved, and `bench_gemm_tile_tune` did the same; both printed
+  `skip(pipe)` and exited 0 on a metallib without the tune kernels. Both now
+  time production and every variant as the arms of one A/B, round by round
+  with the order reversed every other round (`BENCH_ROUNDS`, `BENCH_ITERS`),
+  and report the median of per-round ratios with their range. A baseline that
+  moves more than 10% across a shape's rounds prints `EXCEEDS 10%` and makes
+  the run exit 3; a missing variant exits 2 before anything is timed
+  (`tests/tune_rigs_refuse_missing_variants.rs`). `bench_gemm_tnnt_tune`'s
+  accumulate lanes now time production through `GemmOperands::Bf16`.
 - **Async encode without a waiting sync poisoned the runtime.** Every scalar
   bind takes a slot in the 16 MiB constant arena, and only a waiting commit
   rewound it, so a run that never called `synchronize` failed a bind with

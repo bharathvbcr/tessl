@@ -9,8 +9,8 @@ you changed in the kernel.**
 
 | tool | for |
 | --- | --- |
-| `bench_gemm_tnnt_tune` | Paired, interleaved TN/NT kernel A/B. Use this for kernel comparisons. |
-| `bench_gemm_tile_tune` | Broad tile/BK ladder. Blocked-style timing — see pitfall 1. |
+| `bench_gemm_tnnt_tune` | Interleaved TN/NT/accumulate kernel A/B against the production API. Use this for kernel comparisons. |
+| `bench_gemm_tile_tune` | Broad NN tile/BK ladder (bf16 and exact f32), interleaved the same way. |
 | `bench_gemm_coop_tile` | Paired, interleaved cooperative GEMM tile A/B (128×64 vs 64×64). |
 | `bench_gemm_epi_tile` | Paired, interleaved fused epilogue tile A/B (128×64 vs 64×64). |
 | `bench_gemm_sweep` | Cross-runtime lane (f32 exact / tf32 / bf16), JSON out. |
@@ -58,18 +58,35 @@ TESSL_GEMM_TUNE=1 cargo build --release --bins
 ```
 
 Both tuning binaries `exit(2)` with that exact command when the variants are
-absent, rather than printing a page of `skip(pipe)` and exiting 0.
+absent, rather than printing a page of `skip(pipe)` and exiting 0 (they did
+the latter until 2026-10-10; `tests/tune_rigs_refuse_missing_variants.rs` pins
+the refusal). They check every variant the run will dispatch before timing
+anything.
+
+Both time production and every variant of a shape as the arms of one
+interleaved A/B (`run_paired` in `src/bin/common/mod.rs`): `BENCH_WARMUP`
+untimed calls of each arm, then `BENCH_ROUNDS` rounds (default 6) with the arm
+order reversed every other round, `BENCH_ITERS` timed calls per arm per round
+(default 5). A variant's ratio is the median of its per-round
+production/variant ratios, printed with their range. A shape whose production
+arm moved more than 10% across its rounds is flagged `EXCEEDS 10%`, and the
+process then exits 3 after printing everything.
 
 ## Pitfall 1 — a noise floor wider than the effect
 
-The tile-tune rig times a baseline block and a variant block minutes apart, so
-GPU clock drift lands entirely in the ratio. Run four times, it showed the
-**production kernel measured against itself** ranging **0.92×–1.46×**.
+Until 2026-10-10 both tuning rigs timed a baseline block and a variant block
+minutes apart, so GPU clock drift landed entirely in the ratio. Run four times,
+`bench_gemm_tile_tune` showed the **production kernel measured against
+itself** ranging **0.92×–1.46×**, and `bench_gemm_tnnt_tune` timed production
+for all its iterations before any variant in exactly the same way, although
+this page called it interleaved. The panel-walk gates in
+`kernels/matmul_tensorops.metal` quote ratios from that blocked rig.
 
-Any single-run conclusion from that rig is inside its own noise.
-The paired lanes interleave baseline and candidate iteration by iteration
-(A,B,A,B,… alternating which goes first) and report the ratio of per-round
-medians across repeated rounds. That brought the spread to roughly ±5%.
+Any single-run conclusion from those rigs is inside their own noise. Both now
+interleave round by round, every arm once per round with the order reversed
+every other round, and report the median of the per-round ratios. The paired
+lanes (`bench_gemm_coop_tile`, `bench_gemm_epi_tile`) do the same, and that
+brought their spread to roughly ±5%.
 
 > [!NOTE]
 > Both places above named `bench_gemm_coop_ab` until 2026-09-01. No such binary
@@ -228,9 +245,9 @@ cargo run --release --bin probe_gemm_parity
 
 > [!NOTE]
 > This block previously named a binary `bench_gemm_coop_ab` and an environment
-> variable `BENCH_ROUNDS`. Neither exists; the crate builds four binaries and
-> they are the ones listed above. The command failed with "no bin target named
-> `bench_gemm_coop_ab`" for anyone who tried it.
+> variable `BENCH_ROUNDS`. Neither existed then; the command failed with "no
+> bin target named `bench_gemm_coop_ab`" for anyone who tried it.
+> `BENCH_ROUNDS` has existed since 2026-10-10, for the two tuning binaries.
 
 ## Measured — M5 Pro, 2026-08-31
 

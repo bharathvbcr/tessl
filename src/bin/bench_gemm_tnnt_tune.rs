@@ -2,15 +2,26 @@
 //! bf16 kernels (training backward), and an NN grid swizzle for the
 //! large-square operand-reread question. Production baselines go through the
 //! public gemm_* API under PrecisionMode::Bf16 with pre-cast operands (the
-//! BWD_CAST_ONCE steady state); variants dispatch raw kernels.
+//! BWD_CAST_ONCE steady state), the accumulate lanes through
+//! `GemmOperands::Bf16`; variants dispatch raw kernels.
+//!
+//! Production and every variant of a shape are arms of one interleaved A/B
+//! (`common::run_paired`): `BENCH_ROUNDS` rounds, the arm order reversed
+//! every other round, `BENCH_ITERS` timed calls per arm per round. A variant
+//! line's ratio is the median of its per-round production/variant ratios.
+//! Variants absent from the metallib (a build without `TESSL_GEMM_TUNE=1`)
+//! stop the run with exit status 2 before anything is timed.
 
 // A tuning sweep takes the full GEMM shape plus the tile parameters it is
 // sweeping. Bundling them would add a struct that every call site unpacks.
 #![allow(clippy::too_many_arguments)]
 
+mod common;
+
 use objc2_metal::MTLComputePipelineState;
-use std::time::Instant;
-use tessl::gemm::{cast_f32_to_bf16, gemm, gemm_nt_f32, gemm_nt_train, gemm_tn_f32, gemm_tn_train, GemmBackend};
+use tessl::gemm::{
+    cast_f32_to_bf16, gemm, gemm_nt_f32, gemm_nt_train, gemm_tn_f32, gemm_tn_train, GemmBackend, GemmOperands,
+};
 use tessl::nn::gemm_i8_dequant;
 use tessl::runtime::{mtl_size, GpuRuntime, PrecisionMode};
 use tessl::tensor::Tensor;
@@ -23,16 +34,6 @@ fn fill(n: usize, seed: u64) -> Vec<f32> {
             ((((s >> 32) as u32) as f64 / u32::MAX as f64) * 2.0 - 1.0) as f32
         })
         .collect()
-}
-
-fn median(mut v: Vec<f64>) -> f64 {
-    v.sort_by(|a, b| a.partial_cmp(b).unwrap());
-    let n = v.len();
-    if n % 2 == 1 {
-        v[n / 2]
-    } else {
-        (v[n / 2 - 1] + v[n / 2]) / 2.0
-    }
 }
 
 struct Variant {
@@ -74,19 +75,6 @@ fn dispatch_variant(
         bnd.dispatch(mtl_size(tg, 1, 1), mtl_size(tpt, 1, 1));
         Ok(())
     })
-}
-
-fn time_it(mut f: impl FnMut() -> Result<(), String>, warmup: usize, iters: usize) -> Result<f64, String> {
-    for _ in 0..warmup {
-        f()?;
-    }
-    let mut s = Vec::with_capacity(iters);
-    for _ in 0..iters {
-        let t0 = Instant::now();
-        f()?;
-        s.push(t0.elapsed().as_secs_f64() * 1000.0);
-    }
-    Ok(median(s))
 }
 
 fn rel_err(got: &[f32], reference: &[f32]) -> f64 {
@@ -135,6 +123,7 @@ fn bench_i8(
     label: &str,
     warmup: usize,
     iters: usize,
+    rounds: usize,
 ) -> Result<(), String> {
     let int8 = |len: usize, seed: u64| -> Vec<u8> {
         fill(len, seed)
@@ -153,11 +142,18 @@ fn bench_i8(
         rt.synchronize()
     };
     run()?;
-    let ms = time_it(run, warmup, iters)?;
+    let mut arms = [common::Arm {
+        name: "production".into(),
+        reps: 1,
+        run: Box::new(run),
+    }];
+    let paired = common::run_paired(&mut arms, warmup, iters, rounds)?;
+    let ms = common::median(paired.rounds[0].clone())?;
     let flop = 2.0 * m as f64 * n as f64 * k as f64;
     println!(
-        "\n{label}  M={m} N={n} K={k}   production {ms:.3} ms  {:.0} GFLOP/s",
-        flop / (ms * 1e6)
+        "\n{label}  M={m} N={n} K={k}   production {ms:.3} ms  {:.0} GFLOP/s  (self-spread {:.1}%)",
+        flop / (ms * 1e6),
+        common::self_spread(&paired.rounds[0]) * 100.0
     );
     Ok(())
 }
@@ -195,14 +191,9 @@ fn variant(kernel: &'static str, sm: usize, sn: usize, binds_tiles_m: bool) -> V
 fn main() -> Result<(), String> {
     let rt = GpuRuntime::new()?;
     rt.set_precision(PrecisionMode::Bf16);
-    let warmup: usize = std::env::var("BENCH_WARMUP")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(8);
-    let iters: usize = std::env::var("BENCH_ITERS")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(30);
+    let warmup = common::env_usize("BENCH_WARMUP", 8, 0)?;
+    let iters = common::env_usize("BENCH_ITERS", 5, 1)?;
+    let rounds = common::env_usize("BENCH_ROUNDS", 6, 1)?;
 
     // (lane, m, n, k, label)
     let cases: &[(Lane, usize, usize, usize, &str)] = &[
@@ -229,8 +220,8 @@ fn main() -> Result<(), String> {
         // table the same logits could come from.
         (Lane::Nn, 1024, 248320, 2048, "nn_lm_head"),
         (Lane::Nt, 1024, 248320, 2048, "nt_lm_head"),
-        // TN accumulate kernels (raw A/B; production kernel is the
-        // GEMM_ACCUM=1 path, default-off in training).
+        // TN/NT accumulate kernels; production is `GemmOperands::Bf16`'s
+        // `tn_acc` / `nt_acc`, the path training takes.
         (Lane::TnAccum, 512, 768, 4096, "tnacc_512x768_k4096"),
         (Lane::TnAccum, 2048, 2048, 2048, "tnacc_square_2048"),
         (Lane::NtAccum, 4096, 128, 384, "ntacc_dx_mlp_in"),
@@ -320,8 +311,8 @@ fn main() -> Result<(), String> {
         variant("mm_bf16_tn_coop_128x64_sg4_ph8", 128, 64, true),
         variant("mm_bf16_tn_coop_128x64_sg4_ph16", 128, 64, true),
     ];
-    // The production accumulate kernels have no public API that reaches them
-    // without an A/B flag, so they lead their lists as raw variants.
+    // Each accumulate list leads with the production kernel dispatched raw: a
+    // control whose ratio to the `GemmOperands` production arm shows the noise.
     let ntap_variants = &[
         variant("matmul2d_tensorops_nt_accum_bf16_f32", 64, 64, true),
         variant("mm_bf16_nt_accum_coop_64x64_sg4", 64, 64, false),
@@ -514,14 +505,48 @@ fn main() -> Result<(), String> {
         },
     ];
 
+    let lane_variants = |lane: Lane| -> &[Variant] {
+        match lane {
+            Lane::Nn => nn_variants,
+            Lane::Tn => tn_variants,
+            Lane::Nt => nt_variants,
+            Lane::TnAccum => tnacc_variants,
+            Lane::NtAccum => ntacc_variants,
+            Lane::TnPanel => tnp_variants,
+            Lane::NtPanel => ntp_variants,
+            Lane::TnAccPanel => tnap_variants,
+            Lane::NtAccPanel => ntap_variants,
+            Lane::TnF32 | Lane::NtF32 | Lane::NnI8 => &[],
+        }
+    };
+    let selected = |label: &str| {
+        only.as_ref()
+            .is_none_or(|only| only.iter().any(|p| label.contains(p.as_str())))
+    };
+    let runs = |v: &Variant| !production_only || v.kernel.starts_with("matmul2d_tensorops");
+    // Every variant this run will dispatch must be in the metallib before
+    // anything is timed.
+    common::require_kernels(
+        &rt,
+        "bench_gemm_tnnt_tune",
+        cases
+            .iter()
+            .filter(|c| selected(c.4))
+            .flat_map(|c| lane_variants(c.0).iter().filter(|v| runs(v)).map(|v| v.kernel)),
+    );
+    println!(
+        "interleaved A/B: {rounds} rounds (order reversed every other round), {iters} timed calls per arm \
+         per round after {warmup} warmup; times are medians of per-round medians, ratios are medians of \
+         per-round production/variant ratios [range]"
+    );
+
+    let mut unstable = Vec::new();
     for &(lane, m, n, k, label) in cases {
-        if let Some(only) = &only {
-            if !only.iter().any(|p| label.contains(p.as_str())) {
-                continue;
-            }
+        if !selected(label) {
+            continue;
         }
         if lane == Lane::NnI8 {
-            bench_i8(&rt, m, n, k, label, warmup, iters)?;
+            bench_i8(&rt, m, n, k, label, warmup, iters, rounds)?;
             continue;
         }
         // Operand storage per lane: NN A[M,K] B[K,N]; TN A[K,M] B[K,N]; NT A[M,K] B[N,K].
@@ -539,162 +564,137 @@ fn main() -> Result<(), String> {
         } else {
             (cast_f32_to_bf16(&a_f)?, cast_f32_to_bf16(&b_f)?)
         };
-        let c_ref = rt.alloc_tensor_f32(&[m, n])?;
 
         let flop = 2.0 * m as f64 * n as f64 * k as f64;
         let prefill = 0.25f32;
-
-        // Production baseline through the public API (accum: raw kernel, since
-        // the public accum path is flag-gated and includes a temp GEMM).
-        let prod_ms = match lane {
-            Lane::Nn => {
-                gemm(&a, &b, &c_ref, GemmBackend::TensorOps)?;
-                rt.synchronize()?;
-                time_it(
-                    || {
-                        gemm(&a, &b, &c_ref, GemmBackend::TensorOps)?;
-                        rt.synchronize()
-                    },
-                    warmup,
-                    iters,
-                )?
-            }
-            Lane::Tn | Lane::TnPanel => {
-                gemm_tn_train(&a, &b, &c_ref, GemmBackend::TensorOps)?;
-                rt.synchronize()?;
-                time_it(
-                    || {
-                        gemm_tn_train(&a, &b, &c_ref, GemmBackend::TensorOps)?;
-                        rt.synchronize()
-                    },
-                    warmup,
-                    iters,
-                )?
-            }
-            Lane::Nt | Lane::NtPanel => {
-                gemm_nt_train(&a, &b, &c_ref, GemmBackend::TensorOps)?;
-                rt.synchronize()?;
-                time_it(
-                    || {
-                        gemm_nt_train(&a, &b, &c_ref, GemmBackend::TensorOps)?;
-                        rt.synchronize()
-                    },
-                    warmup,
-                    iters,
-                )?
-            }
-            Lane::TnF32 => {
-                gemm_tn_f32(&a, &b, &c_ref, GemmBackend::TensorOps)?;
-                rt.synchronize()?;
-                time_it(
-                    || {
-                        gemm_tn_f32(&a, &b, &c_ref, GemmBackend::TensorOps)?;
-                        rt.synchronize()
-                    },
-                    warmup,
-                    iters,
-                )?
-            }
-            Lane::NtF32 => {
-                gemm_nt_f32(&a, &b, &c_ref, GemmBackend::TensorOps)?;
-                rt.synchronize()?;
-                time_it(
-                    || {
-                        gemm_nt_f32(&a, &b, &c_ref, GemmBackend::TensorOps)?;
-                        rt.synchronize()
-                    },
-                    warmup,
-                    iters,
-                )?
-            }
-            Lane::NnI8 => unreachable!("int8 cases are timed by bench_i8 and skip this loop body"),
-            Lane::TnAccum | Lane::NtAccum | Lane::TnAccPanel | Lane::NtAccPanel => {
-                // Reference: prefill + product via the matching train path.
-                let tmp = rt.alloc_tensor_f32(&[m, n])?;
-                if lane.is_tn() {
-                    gemm_tn_train(&a, &b, &tmp, GemmBackend::TensorOps)?;
-                } else {
-                    gemm_nt_train(&a, &b, &tmp, GemmBackend::TensorOps)?;
-                }
-                rt.synchronize()?;
-                let base = tmp.buffer.read_f32();
-                c_ref
-                    .buffer
-                    .write_f32(&base.iter().map(|x| x + prefill).collect::<Vec<_>>());
-                f64::NAN // no API baseline; variants compared against each other below
-            }
-        };
-        let refv = c_ref.buffer.read_f32()[..m * n].to_vec();
-        if prod_ms.is_nan() {
-            println!("\n{label}  M={m} N={n} K={k}   (raw accum kernels; ref = TN product + {prefill})");
-        } else {
-            println!(
-                "\n{label}  M={m} N={n} K={k}   production {prod_ms:.3} ms  {:.0} GFLOP/s",
-                flop / (prod_ms * 1e6)
-            );
-        }
-
-        let variants: &[Variant] = match lane {
-            Lane::Nn => nn_variants,
-            Lane::Tn => tn_variants,
-            Lane::Nt => nt_variants,
-            Lane::TnAccum => tnacc_variants,
-            Lane::NtAccum => ntacc_variants,
-            Lane::TnPanel => tnp_variants,
-            Lane::NtPanel => ntp_variants,
-            Lane::TnAccPanel => tnap_variants,
-            Lane::NtAccPanel => ntap_variants,
-            Lane::TnF32 | Lane::NtF32 | Lane::NnI8 => &[],
-        };
-        // Only the old accumulate lanes reset C inside the timed loop.
+        let is_accum = lane.is_accum();
+        let prefill_host = vec![prefill; m * n];
+        // Only the old accumulate lanes reset C inside the timed loop; every
+        // arm of the shape does, so the host write is in all of them alike.
         let reset_each_iter = matches!(lane, Lane::TnAccum | Lane::NtAccum);
-        for v in variants
-            .iter()
-            .filter(|v| !production_only || v.kernel.starts_with("matmul2d_tensorops"))
-        {
+
+        // Reference: production's own output, or for an accumulate lane the
+        // prefill plus the product of the matching overwriting train path.
+        let refv = {
+            let r = rt.alloc_tensor_f32(&[m, n])?;
+            match lane {
+                Lane::Nn => gemm(&a, &b, &r, GemmBackend::TensorOps)?,
+                Lane::TnF32 => gemm_tn_f32(&a, &b, &r, GemmBackend::TensorOps)?,
+                Lane::NtF32 => gemm_nt_f32(&a, &b, &r, GemmBackend::TensorOps)?,
+                _ if lane.is_tn() => gemm_tn_train(&a, &b, &r, GemmBackend::TensorOps)?,
+                _ => gemm_nt_train(&a, &b, &r, GemmBackend::TensorOps)?,
+            }
+            rt.synchronize()?;
+            let base = r.buffer.read_f32()[..m * n].to_vec();
+            if is_accum {
+                base.iter().map(|x| x + prefill).collect::<Vec<_>>()
+            } else {
+                base
+            }
+        };
+
+        // Production through the public API: the accumulate lanes through
+        // `GemmOperands::Bf16`, the path training takes.
+        let prod_c = rt.alloc_tensor_f32(&[m, n])?;
+        let production = |c: &Tensor| -> Result<(), String> {
+            match lane {
+                Lane::Nn => gemm(&a, &b, c, GemmBackend::TensorOps),
+                Lane::Tn | Lane::TnPanel => gemm_tn_train(&a, &b, c, GemmBackend::TensorOps),
+                Lane::Nt | Lane::NtPanel => gemm_nt_train(&a, &b, c, GemmBackend::TensorOps),
+                Lane::TnF32 => gemm_tn_f32(&a, &b, c, GemmBackend::TensorOps),
+                Lane::NtF32 => gemm_nt_f32(&a, &b, c, GemmBackend::TensorOps),
+                Lane::TnAccum | Lane::TnAccPanel => GemmOperands::Bf16.tn_acc(&a, &b, c),
+                Lane::NtAccum | Lane::NtAccPanel => GemmOperands::Bf16.nt_acc(&a, &b, c),
+                Lane::NnI8 => unreachable!("int8 cases are timed by bench_i8"),
+            }
+        };
+
+        let mut variants: Vec<(&Variant, Tensor, f64)> = Vec::new();
+        let mut skipped: Vec<&Variant> = Vec::new();
+        for v in lane_variants(lane).iter().filter(|v| runs(v)) {
             if m % v.sm != 0 || n % v.sn != 0 {
-                println!("  {:<36}{:>10}", v.kernel, "skip(div)");
+                skipped.push(v);
                 continue;
             }
-            let c = rt.alloc_tensor_f32(&[m, n])?;
-            let is_accum = lane.is_accum();
-            let prefill_host = vec![prefill; m * n];
+            variants.push((v, rt.alloc_tensor_f32(&[m, n])?, 0.0));
+        }
+
+        // One untimed call of every arm, checked against the reference.
+        if is_accum {
+            prod_c.buffer.write_f32(&prefill_host);
+        }
+        production(&prod_c)?;
+        rt.synchronize()?;
+        let prod_err = rel_err(&prod_c.buffer.read_f32()[..m * n], &refv);
+        for (v, c, err) in variants.iter_mut() {
             if is_accum {
                 c.buffer.write_f32(&prefill_host);
             }
-            if dispatch_variant(&rt, v, &a, &b, &c, m, n, k).is_err() {
-                println!("  {:<36}{:>10}", v.kernel, "skip(pipe)");
-                continue;
-            }
+            dispatch_variant(&rt, v, &a, &b, c, m, n, k)?;
             rt.synchronize()?;
-            let err = rel_err(&c.buffer.read_f32()[..m * n], &refv);
+            *err = rel_err(&c.buffer.read_f32()[..m * n], &refv);
+        }
 
-            let med = time_it(
-                || {
+        let mut arms: Vec<common::Arm> = Vec::with_capacity(1 + variants.len());
+        arms.push(common::Arm {
+            name: "production".into(),
+            reps: 1,
+            run: Box::new(|| {
+                if reset_each_iter {
+                    prod_c.buffer.write_f32(&prefill_host);
+                }
+                production(&prod_c)?;
+                rt.synchronize()
+            }),
+        });
+        for (v, c, _) in &variants {
+            let (rt, a, b, prefill_host) = (&rt, &a, &b, &prefill_host);
+            arms.push(common::Arm {
+                name: v.kernel.into(),
+                reps: 1,
+                run: Box::new(move || {
                     if reset_each_iter {
-                        // Accum kernels mutate C; reset so every iter does the same work.
-                        c.buffer.write_f32(&prefill_host);
+                        c.buffer.write_f32(prefill_host);
                     }
-                    dispatch_variant(&rt, v, &a, &b, &c, m, n, k)?;
+                    dispatch_variant(rt, v, a, b, c, m, n, k)?;
                     rt.synchronize()
-                },
-                warmup,
-                iters,
-            )?;
-            let vs = if prod_ms.is_nan() {
-                String::from("      —")
-            } else {
-                format!("{:>6.2}×", prod_ms / med)
-            };
+                }),
+            });
+        }
+        let paired = common::run_paired(&mut arms, warmup, iters, rounds)?;
+        drop(arms);
+
+        let prod_rounds = &paired.rounds[0];
+        let prod_ms = common::median(prod_rounds.clone())?;
+        let spread = common::self_spread(prod_rounds);
+        println!(
+            "\n{label}  M={m} N={n} K={k}   production {prod_ms:.3} ms  {:.0} GFLOP/s  (self-spread {:.1}%, err {prod_err:.2e})",
+            flop / (prod_ms * 1e6),
+            spread * 100.0
+        );
+        if spread > common::SELF_SPREAD_LIMIT {
+            println!("  EXCEEDS 10%: ratios below are not comparable");
+            unstable.push(label.to_string());
+        }
+        for ((v, _, err), rounds_ms) in variants.iter().zip(&paired.rounds[1..]) {
+            let med = common::median(rounds_ms.clone())?;
+            let (ratio, lo, hi) = common::ratio_stats(prod_rounds, rounds_ms)?;
             println!(
-                "  {:<36}{:>10.3}{:>12.0}{}{:>12.2e}",
+                "  {:<36}{:>10.3}{:>12.0}{:>8.2}× [{lo:.2}–{hi:.2}]{:>12.2e}",
                 v.kernel,
                 med,
                 flop / (med * 1e6),
-                vs,
+                ratio,
                 err
             );
         }
+        for v in skipped {
+            println!(
+                "  {:<36}{:>10}",
+                v.kernel, "skip(div): the shape is not a multiple of the tile"
+            );
+        }
     }
+    common::exit_if_unstable("bench_gemm_tnnt_tune", &unstable);
     Ok(())
 }

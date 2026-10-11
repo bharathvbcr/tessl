@@ -240,7 +240,7 @@ rather than printing a page of `skip(pipe)` and exiting 0.
 | tool | what it is for |
 |---|---|
 | `bench_gemm_tnnt_tune` | TN / NT / TN-accum kernel A/B against the production baseline. **Interleaved**, with a baseline-drift gate — use this for kernel comparisons. |
-| `bench_gemm_tile_tune` | Broad tile/BK ladder. Blocked-style timing — see the warning below. |
+| `bench_gemm_tile_tune` | Broad tile/BK ladder, interleaved the same way since 2026-10-10. |
 | `bench_gemm_sweep` | Cross-runtime timing lane (f32 exact / tf32 / bf16), JSON out. |
 | `bench_gemm_sweep --dump-parity DIR` | Separate job, no timing: every lane x `BENCH_PARITY_SEEDS` draws at `BENCH_PARITY_SHAPE`, plus the manifest the scorer validates against. |
 | `bench/parity_ladder.py` | Drives the above across the whole ladder, one shape at a time, and merges. Use this for the accuracy numbers. |
@@ -302,6 +302,16 @@ itself* ranging 0.92x–1.46x.
 >
 > `bench_gemm_tile_tune` is still blocked. Use `bench_gemm_tnnt_tune` for any
 > ratio you intend to quote.
+>
+> **Reconciled with this tree (2026-10-10).** The restoration above was made
+> in the MLSystemsLab copy of this crate and never reached tessl: tessl's
+> `bench_gemm_tnnt_tune` was still blocked, and both binaries still exited 0
+> after `skip(pipe)`. Both now share `run_paired` (`src/bin/common/mod.rs`):
+> any `BENCH_ROUNDS` of at least 1 (default 6), forward and reverse orders
+> alternating, the median of per-round ratios with their range, an
+> `EXCEEDS 10%` line for a baseline that moved more than 10% across rounds
+> (exit status 3 once the run has printed), and exit status 2 before any
+> timing when a variant is not in the metallib. See docs/benchmarking.md.
 
 The same applies across runtimes. Two back-to-back runs of the identical
 cross-runtime sweep disagreed by 16–21% on the torch lane alone, which is why

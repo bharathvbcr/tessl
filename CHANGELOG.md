@@ -8,6 +8,16 @@ All notable changes to `tessl` are recorded here. The format follows
 
 ### Added
 
+- **Measurements: exact f32 at the 2B MLP up/gate shape, and int8.** The
+  4.1 vs 5.7 TFLOP/s exact-f32 gap at 2048x6144x2048 reproduces under the
+  row-major walk production had on 2026-09-30 and is the B operand (50 MB)
+  re-read per tile row; `tile_walk`'s panels already close it with the same
+  bits, and the split-K route production takes there is left as a follow-up
+  because changing it would change exact-f32 bits
+  (`bench/results/f32_exact_mlp_up_gap_m5pro.txt`). int8: exact at sampled
+  outputs with and without `b_scale`, 45-57 TOP/s, `b_scale` costing 0-18%;
+  the NT variant and a per-row scale are filed there as follow-ups
+  (`bench/results/gemm_i8_m5pro.txt`).
 - **bf16 MLP inputs, measured and not adopted.** A bf16-output GEMM and a
   SwiGLU reading bf16 gate and up were built, measured and removed: paired on
   the M5 Pro, SwiGLU was 0.65x but the bf16-output GEMMs 1.06x and the

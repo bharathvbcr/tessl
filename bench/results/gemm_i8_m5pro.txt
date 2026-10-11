@@ -1,0 +1,72 @@
+# int8 GEMM (nn::gemm_i8_dequant): exactness and speed, with and without b_scale
+#
+# Machine: Apple M5 Pro, macOS 27.0.1, 2026-10-11 06:50 UTC. GPU otherwise
+# idle; host load average ~12 (recorded below).
+# Tree: 120f675 plus the bench lanes of b61a765 (the int8 kernel as at
+# 120f675; the later walk and tile commits do not touch it).
+# Command:
+#   TESSL_GEMM_TUNE=1 cargo build --release --bins
+#   BENCH_ONLY=i8nn BENCH_ROUNDS=6 BENCH_ITERS=5 BENCH_WARMUP=4 \
+#     target/release/bench_gemm_tnnt_tune
+# (The int8 lane dispatches only production; the tune build is not needed.)
+#
+# Method: C[M,N] = (A_i8 @ B_i8) * a_scale * b_scale[n], int8 operands from
+# the bench's fill (round(127 x U[-1, 1])), a_scale = 0.01, b_scale in
+# [0.5, 1.5]. Correctness: before timing, both outputs are compared for exact
+# equality, at the four corners, the last row and column every M/16 and N/16,
+# and 1024 random elements (1060 in all), with an integer reference: int8
+# products accumulate exactly in int32 and the kernel's scales are two f32
+# multiplies in that order, so anything but equality is an error. Every
+# shape passed. Speed: no b_scale (production) and b_scale as the two arms
+# of an interleaved A/B (6 rounds, order reversed every other round); GOP/s
+# counts 2*M*N*K.
+#
+# Result: exact at every shape. 45-57 TOP/s without b_scale. The per-column
+# scale costs 0-18%: 0.98-1.00x where K is long (8192, or 4096 on 8192x4096)
+# and 0.82-0.92x at K <= 2048, where the extra cooperative load of the scale
+# tile is a larger share of each tile's work.
+#
+# Not done, filed here as follow-ups of the int8 surface (ft-b4d2a88 item 4):
+# - An NT variant (B stored [N, K], the layout weights usually have). There
+#   is no int8 TN or NT kernel; today a caller transposes.
+# - A per-row (per-token) scale for A beside the per-tensor a_scale.
+# - Also open from the same item: no interior fast path (every tile takes the
+#   bounds-checked slice), 128x64 the only geometry, no bias or activation
+#   epilogue, no batched form, a GpuBuffer/u32 API rather than Tensor, and a
+#   panel gate (PANEL_MIN_B_ELEMS = 2^23 elements, 8 MiB of int8) tuned on
+#   f32/bf16 bytes; the same A/B put int8 panels at 0.99-1.00x at 8-12 MiB.
+# - The b_scale cost above: the scale is loaded per tile through a
+#   destination cooperative tensor; loading it once per threadgroup column is
+#   untried.
+#
+=== i8 2026-10-11T06:50:23Z load: { 11.94 14.02 31.42 }
+interleaved A/B: 6 rounds (order reversed every other round), 5 timed calls per arm per round after 4 warmup; times are medians of per-round medians, ratios are medians of per-round production/variant ratios [range]
+
+i8nn_lmhead_50304  M=4096 N=50304 K=768   production 7.000 ms  45213 GOP/s  (self-spread 1.9%, exact at 1060 sampled outputs)
+  b_scale (per-column scale)               8.571       36923    0.82× [0.81–0.83]
+
+i8nn_vocab_32768  M=4096 N=32768 K=768   production 4.562 ms  45186 GOP/s  (self-spread 3.6%, exact at 1060 sampled outputs)
+  b_scale (per-column scale)               5.489       37559    0.83× [0.83–0.85]
+
+i8nn_b16m  M=4096 N=8192 K=2048   production 2.514 ms  54670 GOP/s  (self-spread 4.6%, exact at 1060 sampled outputs)
+  b_scale (per-column scale)               2.806       48985    0.90× [0.89–0.92]
+
+i8nn_b12m  M=3072 N=6144 K=2048   production 1.496 ms  51693 GOP/s  (self-spread 2.9%, exact at 1060 sampled outputs)
+  b_scale (per-column scale)               1.622       47658    0.92× [0.90–0.93]
+
+i8nn_b8m  M=3072 N=4096 K=2048   production 1.090 ms  47292 GOP/s  (self-spread 7.6%, exact at 1060 sampled outputs)
+  b_scale (per-column scale)               1.202       42869    0.91× [0.88–0.91]
+
+i8nn_b6m  M=3072 N=3072 K=2048   production 0.841 ms  45965 GOP/s  (self-spread 4.3%, exact at 1060 sampled outputs)
+  b_scale (per-column scale)               0.906       42666    0.92× [0.90–0.96]
+
+i8nn_longk_8192  M=4096 N=8192 K=8192   production 9.579 ms  57394 GOP/s  (self-spread 3.0%, exact at 1060 sampled outputs)
+  b_scale (per-column scale)               9.611       57198    1.00× [0.98–1.00]
+
+i8nn_morton_sq64  M=8192 N=4096 K=4096   production 4.858 ms  56586 GOP/s  (self-spread 1.9%, exact at 1060 sampled outputs)
+  b_scale (per-column scale)               4.922       55851    0.98× [0.97–0.99]
+
+i8nn_grid_small_b  M=8192 N=3072 K=768   production 1.022 ms  37821 GOP/s  (self-spread 6.6%, exact at 1060 sampled outputs)
+  b_scale (per-column scale)               1.212       31895    0.84× [0.82–0.86]
+exit 0
+=== end 2026-10-11T06:50:27Z load: { 11.94 14.02 31.42 }

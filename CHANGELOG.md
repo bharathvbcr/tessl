@@ -218,9 +218,10 @@ All notable changes to `tessl` are recorded here. The format follows
   tile takes by default (`bench/results/gemm_interior_m5pro.txt`). The
   branch, the kernels' `buffer(8)` argument and the variable (with its
   `METAL_RUNTIME_*` / `METAL_NATIVE_*` spellings) are gone; the default
-  output is unchanged, and
-  `the_retired_interior_flag_changes_no_exact_f32_output` pins that setting
-  it changes no bit.
+  output is unchanged (the 495-output bit snapshot,
+  `bench/results/gemm_coop_header_bits_m5pro.txt`), and
+  `no_source_reads_a_retired_gemm_flag` pins that nothing reads it, or the
+  accumulate flags, again.
 - **One source for the GEMM tile bodies: `kernels/gemm_coop.h`.** The tile
   walks, the interior and edge operand views of a tile, the cooperative
   destination body (zero, run, accumulate or epilogue, store) and the

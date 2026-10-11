@@ -6,8 +6,8 @@
 //! `GemmOperands::{tn_acc, nt_acc}` ran the accumulate kernels with no flag.
 //! The flags are retired: one path, pinned here bit for bit against
 //! `GemmOperands`. `TESSL_GEMM_INTERIOR` selected an interior-offset branch
-//! of the exact-f32 kernels; it measured no faster and is retired, pinned
-//! here as changing no output bit.
+//! of the exact-f32 kernels; it measured no faster and is retired. A source
+//! scan pins that no code reads any of the three again.
 //!
 //! The flags were process-global and the environment cannot be mutated safely
 //! under a concurrent `getenv`, so each configuration re-runs its own test in
@@ -22,9 +22,9 @@ use common::{
     tensor_f32_at, with_gpu, Layout, Reference, F32_PANEL_SHAPES,
 };
 use std::sync::Arc;
-use tessl::gemm::{gemm_nt_accum_train, gemm_nt_f32, gemm_tn_accum_train, gemm_tn_f32, GemmOperands};
+use tessl::gemm::{gemm_nt_accum_train, gemm_tn_accum_train, GemmOperands};
 use tessl::runtime::traced_kernels;
-use tessl::{gemm_f32, GemmBackend, GpuRuntime, PrecisionMode};
+use tessl::{GemmBackend, GpuRuntime, PrecisionMode};
 
 const CHILD_ENV: &str = "TESSL_GEMM_FLAG_PATHS_CHILD";
 
@@ -303,115 +303,48 @@ fn accumulate_kernels_take_views_on_any_16_byte_boundary() {
     });
 }
 
-/// Every exact-f32 output on all-interior, partly-edge and column-panel
-/// shapes, NN / TN / NT and their accumulates, each checked against the f64
-/// reference, as `(label, FNV-1a of the output's bits)`.
-fn exact_f32_outputs(rt: &Arc<GpuRuntime>) -> Vec<(String, u64)> {
-    let hash = |c: &[f32]| {
-        c.iter()
-            .flat_map(|x| x.to_bits().to_le_bytes())
-            .fold(0xcbf2_9ce4_8422_2325u64, |h, b| {
-                (h ^ b as u64).wrapping_mul(0x0100_0000_01b3)
-            })
-    };
-    rt.set_precision(PrecisionMode::F32);
-    let mut out = Vec::new();
-    // 32x32 tiles: 256x256 is all interior, 96x48 is partly edge.
-    let small = [(256usize, 256usize, 128usize), (96, 48, 64), (64, 160, 32)];
-    for (panel, &(m, n, k)) in small
-        .iter()
-        .map(|s| (false, s))
-        .chain(F32_PANEL_SHAPES.iter().map(|s| (true, s)))
-    {
-        for layout in [Layout::Nn, Layout::Tn, Layout::Nt] {
-            let (a_shape, b_shape) = operand_shapes(layout, m, n, k);
-            let (a_host, b_host, expect) = if panel {
-                rank_one_case(layout, m, n, k, 0x3ed ^ (m + n) as u64)
-            } else {
-                let a_host = random_f32(m * k, 0x1ed ^ (m * 7 + k) as u64);
-                let b_host = random_f32(k * n, 0x2ed ^ (n * 5 + k) as u64);
-                let expect = reference(layout, &a_host, &b_host, m, n, k);
-                (a_host, b_host, expect)
-            };
-            let a = tensor_f32(rt, &a_shape, &a_host);
-            let b = tensor_f32(rt, &b_shape, &b_host);
-            let c = rt.alloc_tensor_f32(&[m, n]).unwrap();
-            match layout {
-                Layout::Nn => gemm_f32(&a, &b, &c, GemmBackend::TensorOps),
-                Layout::Tn => gemm_tn_f32(&a, &b, &c, GemmBackend::TensorOps),
-                Layout::Nt => gemm_nt_f32(&a, &b, &c, GemmBackend::TensorOps),
-            }
-            .unwrap();
-            rt.synchronize().unwrap();
-            let label = format!("f32 {layout:?} {m}x{n}x{k}");
-            let got = c.buffer.read_f32();
-            assert_within_bound(&label, &got, &expect, k, 0.0);
-            out.push((label, hash(&got[..m * n])));
-
-            // The accumulate kernel onto a fixed C0.
-            let c0 = random_f32(m * n, 0x4ed ^ (m * n) as u64);
-            let acc = tensor_f32(rt, &[m, n], &c0);
-            match layout {
-                Layout::Nn => GemmOperands::ExactF32.nn_acc(&a, &b, &acc),
-                Layout::Tn => GemmOperands::ExactF32.tn_acc(&a, &b, &acc),
-                Layout::Nt => GemmOperands::ExactF32.nt_acc(&a, &b, &acc),
-            }
-            .unwrap();
-            rt.synchronize().unwrap();
-            let label = format!("f32 accumulate {layout:?} {m}x{n}x{k}");
-            let got = acc.buffer.read_f32();
-            assert_within_bound(&label, &got, &with_previous(expect, &c0), k, 0.0);
-            out.push((label, hash(&got[..m * n])));
-        }
-    }
-    out
-}
-
-/// `TESSL_GEMM_INTERIOR` selected an interior-offset branch in the exact-f32
-/// kernels until it measured 0.99-1.01x and was retired
-/// (bench/results/gemm_interior_m5pro.txt). Set, in any of its spellings, it
-/// must change no output bit: a child process with it on computes every
-/// exact-f32 output, and the parent, with it unset, must get the same bits.
+/// The retired flags stay retired: no source under `src/` names one of their
+/// variables as a string, which is how `ab_flags` read them (lists of
+/// `TESSL_*`, `METAL_RUNTIME_*` and `METAL_NATIVE_*` spellings).
+/// `TESSL_GEMM_INTERIOR` selected an interior-offset branch of the exact-f32
+/// kernels until it measured 0.99-1.01x (bench/results/gemm_interior_m5pro.txt);
+/// `TESSL_GEMM_ACCUM` / `_ACCUM_DX` kept `gemm_{tn,nt}_accum_train` off the
+/// accumulate kernels. Comments may still name them.
 #[test]
-fn the_retired_interior_flag_changes_no_exact_f32_output() {
-    const NAME: &str = "the_retired_interior_flag_changes_no_exact_f32_output";
-    let vars = [
-        ("TESSL_GEMM_INTERIOR", "1"),
-        ("METAL_RUNTIME_GEMM_INTERIOR", "1"),
-        ("METAL_NATIVE_GEMM_INTERIOR", "1"),
-    ];
-    let child = in_child(NAME, &vars, || {
-        with_gpu(|rt| {
-            if !rt.has_tensorops() {
-                return;
+fn no_source_reads_a_retired_gemm_flag() {
+    const RETIRED: &[&str] = &["GEMM_INTERIOR", "GEMM_ACCUM", "GEMM_ACCUM_DX"];
+    fn walk(dir: &std::path::Path, hits: &mut Vec<String>, scanned: &mut usize) {
+        for entry in std::fs::read_dir(dir).expect("read src") {
+            let path = entry.expect("src entry").path();
+            if path.is_dir() {
+                walk(&path, hits, scanned);
+                continue;
             }
-            for (label, h) in exact_f32_outputs(rt) {
-                println!("BITS {label}: {h:016x}");
+            if path.extension().is_none_or(|e| e != "rs") {
+                continue;
             }
-        })
-    });
-    let Some(stdout) = child else { return };
-    // libtest prints `test NAME ... ` before the child's own output, so the
-    // first line can carry that prefix.
-    let with_flag: Vec<&str> = stdout
-        .lines()
-        .filter_map(|l| l.find("BITS ").map(|at| &l[at + 5..]))
-        .collect();
-    let without: Vec<String> = with_gpu(|rt| {
-        if !rt.has_tensorops() {
-            return Vec::new();
+            *scanned += 1;
+            let text = std::fs::read_to_string(&path).expect("read source");
+            for (no, line) in text.lines().enumerate() {
+                let code = line.split("//").next().unwrap_or("");
+                for literal in code.split('"').skip(1).step_by(2) {
+                    let tail = ["TESSL_", "METAL_RUNTIME_", "METAL_NATIVE_"]
+                        .iter()
+                        .find_map(|p| literal.strip_prefix(p));
+                    if tail.is_some_and(|t| RETIRED.contains(&t)) {
+                        hits.push(format!("{}:{}: {literal}", path.display(), no + 1));
+                    }
+                }
+            }
         }
-        exact_f32_outputs(rt)
-            .into_iter()
-            .map(|(l, h)| format!("{l}: {h:016x}"))
-            .collect()
-    });
-    assert_eq!(
-        with_flag.len(),
-        without.len(),
-        "the child computed a different set of outputs"
-    );
-    for (w, wo) in with_flag.iter().zip(&without) {
-        assert_eq!(w, wo, "TESSL_GEMM_INTERIOR=1 changed an output");
     }
+    let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let (mut hits, mut scanned) = (Vec::new(), 0);
+    walk(&src, &mut hits, &mut scanned);
+    assert!(scanned > 10, "scanned only {scanned} files under {}", src.display());
+    assert!(
+        hits.is_empty(),
+        "retired GEMM flags are read again:\n  {}",
+        hits.join("\n  ")
+    );
 }

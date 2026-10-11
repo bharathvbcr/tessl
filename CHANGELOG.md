@@ -153,6 +153,27 @@ All notable changes to `tessl` are recorded here. The format follows
   are still refused. Adding variants to the exhaustive `Dtype` enum breaks an
   external `match` on it.
 
+### Changed (breaking)
+
+- **`gemm_{tn,nt}_accum_train` always run the accumulate kernels;
+  `TESSL_GEMM_ACCUM` and `TESSL_GEMM_ACCUM_DX` are retired.** Training has
+  reached the accumulate kernels through `GemmOperands::{tn_acc, nt_acc}`
+  with no flag since that API landed, weight banks included; the flags gated
+  only these two legacy entries, which otherwise computed the product into a
+  temporary and added it. They are now `GemmOperands`' path on the precision
+  the runtime picks (bit for bit, pinned by
+  `accumulate_train_entries_run_the_accumulate_kernels`), so the rounding of
+  `C += ...` changes for callers that left the flags unset, as ojas's
+  `arch02` trainer does (`model_bwd.rs`). The simdgroup backend has no
+  accumulate kernel and is now refused instead of taking the temporary. The
+  variables, including their `METAL_RUNTIME_*` / `METAL_NATIVE_*` spellings,
+  are no longer read.
+- **`ab_flags::gemm_accum`, `gemm_accum_dx` and `gemm_interior_offsets`
+  are removed** with the variables they read (`TESSL_GEMM_ACCUM`,
+  `TESSL_GEMM_ACCUM_DX`, `TESSL_GEMM_INTERIOR`, and their `METAL_RUNTIME_*` /
+  `METAL_NATIVE_*` spellings), which nothing reads any more. No caller in
+  ojas, gemma-metal or tessl-arch02 used them.
+
 ### Changed
 
 - **bf16 TN at the split-K-gated dW shapes runs a parallel split-K.** The
@@ -210,20 +231,8 @@ All notable changes to `tessl` are recorded here. The format follows
   cannot drift. The two kernel files went from 1714 lines to 909 plus the
   396-line header. Output is bit for bit what it was: FNV hashes of every
   production GEMM entry point over 495 (entry, shape) cases matched before
-  and after, and the GEMM suites pass unchanged.
-- **`gemm_{tn,nt}_accum_train` always run the accumulate kernels;
-  `TESSL_GEMM_ACCUM` and `TESSL_GEMM_ACCUM_DX` are retired.** Training has
-  reached the accumulate kernels through `GemmOperands::{tn_acc, nt_acc}`
-  with no flag since that API landed, weight banks included; the flags gated
-  only these two legacy entries, which otherwise computed the product into a
-  temporary and added it. They are now `GemmOperands`' path on the precision
-  the runtime picks (bit for bit, pinned by
-  `accumulate_train_entries_run_the_accumulate_kernels`), so the rounding of
-  `C += ...` changes for callers that left the flags unset, as ojas's
-  `arch02` trainer does (`model_bwd.rs`). The simdgroup backend has no
-  accumulate kernel and is now refused instead of taking the temporary. The
-  variables, including their `METAL_RUNTIME_*` / `METAL_NATIVE_*` spellings,
-  are no longer read.
+  and after (a throwaway probe against the public API, not committed), and
+  the GEMM suites pass unchanged.
 - **`infer_trace` counts every allocator catch-up as a sync wait.** The
   counter's doc says `sync_waits` and `sync_wait_us` include allocator
   catch-ups, but only the catch-up inside a waiting commit was counted; the

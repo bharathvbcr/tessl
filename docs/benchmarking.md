@@ -13,6 +13,7 @@ you changed in the kernel.**
 | `bench_gemm_tile_tune` | Broad NN tile/BK ladder (bf16 and exact f32), interleaved the same way. |
 | `bench_gemm_coop_tile` | Paired, interleaved cooperative GEMM tile A/B (128×64 vs 64×64). |
 | `bench_gemm_epi_tile` | Paired, interleaved fused epilogue tile A/B (128×64 vs 64×64). |
+| `bench_gemm_routes` | Paired A/B of the bf16 GEMM routing rules at the shapes they gate on: the split-K lanes of the gated TN dW shapes, and the 128×64 vs 64×64 coop tile on the plain, batched and epilogue paths (`BENCH_LANES=splitk,smallm,batched,epi`). |
 | `bench_gemm_sweep` | Cross-runtime lane (f32 exact / tf32 / bf16), JSON out. |
 | `bench_qwen35_layers` | Layer kernel benchmarks; `--paired-attn` times paired prefill attention, `--paired-gdn-recurrent` the 32- vs 16-column decode recurrence, `--paired-gate-up` two gate/up GEMMs vs one packed (async and sync encode), `--model-forward` a `Qwen35Model` prefill as `METRIC` lines, and `--decode[=P]` a batch-1 decode token (host encode and commit+wait apart). |
 | `bench_nn_kernels` | `nn` kernels batched and solo, with each one's host encode per dispatch; then the host path: pipeline cache hits and a decode-style sample loop. `--host-only` skips the kernel table. |

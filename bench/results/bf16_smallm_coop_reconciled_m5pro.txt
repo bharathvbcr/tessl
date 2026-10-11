@@ -20,11 +20,13 @@
 # before timing.
 #
 # Result: the grid-fill finding holds on tessl's kernels. With M >= 128 and
-# fewer than 64 wide tiles, 64x64 won at every shape: 1.17x (128x3072),
-# 1.49x (128x768), 1.56x (256x768), 1.16x (512x768), 1.20x (128x2048). From
-# 64 tiles up it tied or lost: 0.99x (128x4096, 64 tiles), 1.04x (256x2048,
-# 64, noisy), 1.02-1.03x (96-256 tiles at N = 3072, 2048), 0.87x (1024x768,
-# 96), 0.84-0.90x (N = K = 4096, 128-512 tiles). At M <= 64 tessl already
+# fewer than 64 wide tiles, 64x64 won at every shape whose baseline held
+# within 10%: 1.17x (128x3072), 1.49x (128x768), 1.56x (256x768), 1.16x
+# (512x768). From 64 tiles up it tied or lost: 0.99x (128x4096, 64 tiles),
+# 1.02-1.03x (96-128 tiles at N = 3072, 2048), 1.00x (1024x2048), 0.87x
+# (1024x768, 96), 0.84x (1024x4096, 512). The drifted rows (EXCEEDS 10%:
+# 128x2048 1.20x, 256x2048 1.04x, 256x4096 0.90x, 512x4096 0.89x) agree in
+# direction but are not counted as evidence. At M <= 64 tessl already
 # took 64x64 (M < 128), and production matched the narrow arm there.
 # Decision: ported for bf16 — coop_narrow in src/gemm.rs adds "fewer than 64
 # tiles of 128x64" to N <= 512 and M < 128 (the import's M <= 64 is

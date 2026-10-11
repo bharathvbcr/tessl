@@ -211,7 +211,9 @@ All notable changes to `tessl` are recorded here. The format follows
   NN 1.14x at 1024x8192x2048 and 1.06x at the Qwen3.5-2B MLP up/gate shape,
   while the grid gate lost 0.94x on the 2B TN/NT shapes
   (`bench/results/gemm_panel_walk_m5pro.txt`). NN now walks by `tile_walk`;
-  output is bit for bit unchanged.
+  output is bit for bit unchanged (`gemm_coop_header_bits_m5pro.txt`), and
+  `panel_walk_matches_row_major_chunks_bit_for_bit` now runs the coop NN
+  kernels past the gate too.
 - **`TESSL_GEMM_INTERIOR` is retired.** It sent the exact-f32 kernels'
   interior tiles through offset pointer tensors; interleaved on the
   Qwen3.5-2B training shapes, that ran at 0.99-1.01x of the slice path every
@@ -234,8 +236,9 @@ All notable changes to `tessl` are recorded here. The format follows
   cannot drift. The two kernel files went from 1714 lines to 909 plus the
   396-line header. Output is bit for bit what it was: FNV hashes of every
   production GEMM entry point over 495 (entry, shape) cases matched before
-  and after (a throwaway probe against the public API, not committed), and
-  the GEMM suites pass unchanged.
+  and after (`probe_gemm_bits`, rebuilt against each commit in
+  `bench/results/gemm_coop_header_bits_m5pro.txt`), and the GEMM suites
+  pass unchanged.
 - **`infer_trace` counts every allocator catch-up as a sync wait.** The
   counter's doc says `sync_waits` and `sync_wait_us` include allocator
   catch-ups, but only the catch-up inside a waiting commit was counted; the

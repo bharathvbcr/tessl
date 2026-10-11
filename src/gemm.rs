@@ -1061,7 +1061,8 @@ const COOP_GRID_FILL_TILES: usize = 64;
 /// - bf16 whose C has fewer than [`COOP_GRID_FILL_TILES`] tiles of 128×64:
 ///   `bench_gemm_routes` (bench/results/bf16_smallm_coop_reconciled_m5pro.txt)
 ///   measured 64×64 1.16-1.56x faster in every such case at M = 128-512, and
-///   tied or slower (0.84-1.04x) from 64 tiles up. f16 and relaxed f32 were
+///   tied or slower (0.84-1.03x) from 64 tiles up, counting only shapes whose
+///   baseline held within 10% across rounds. f16 and relaxed f32 were
 ///   not measured on the plain path and keep the N rule.
 fn coop_narrow(m: usize, n: usize, elem: CoopElem) -> bool {
     if n <= 512 {
@@ -1674,7 +1675,10 @@ fn tn_splitk_par(
 ) -> Result<(), String> {
     let rt = a_km.runtime();
     // A multiple of 4 keeps every partition's start in A and B 16-byte
-    // aligned, as the scratch slices are.
+    // aligned for f32, as the scratch slices are, and 8-byte aligned for bf16
+    // (16 when M and N are even). The kernel offsets its own pointers, so no
+    // binding sees these starts; parallel_bf16_tn_partitions_cover_all_of_k
+    // runs k_tile 4 at M = 13, N = 99.
     if k_tile == 0 || k_tile % 4 != 0 {
         return Err(format!(
             "{what}: a K partition of {k_tile}, not a positive multiple of 4"
@@ -1897,8 +1901,10 @@ pub fn gemm_nt_bf16(a_mk: &Tensor, b_nk: &Tensor, c: &Tensor) -> Result<(), Stri
 
 /// `C += A[K,M]^T @ B[K,N]` on the accumulate kernels, C not zeroed: bf16
 /// operands (f32 ones rounded first) or exact f32. Validation is the
-/// caller's. Tall-K, small-MN shapes take the sequential split-K, whose
-/// partitions add into C in order.
+/// caller's. Tall-K, small-MN shapes ([`prefer_tn_splitk`]) take a split-K
+/// whose partitions add into C in order: for bf16 the parallel one, all
+/// partitions in one dispatch and then `reduce_partitions_add_f32`; for exact
+/// f32 the sequential one, one accumulate dispatch per partition.
 fn tn_accum(
     a_km: &Tensor,
     b_kn: &Tensor,
@@ -3653,12 +3659,14 @@ mod coop_tile_select {
             (128, 768, true),            // 12 tiles: 1.49x
             (256, 768, true),            // 24 tiles: 1.56x
             (512, 768, true),            // 48 tiles: 1.16x
-            (128, 2048, true),           // 32 tiles: 1.20x
+            (128, 2048, true),           // 32 tiles: 1.20x, baseline drifted
             (128, 4096, false),          // 64 tiles: 0.99x
-            (256, 2048, false),          // 64 tiles: 1.04x
+            (256, 2048, false),          // 64 tiles: baseline drifted
             (256, 3072, false),          // 96 tiles: 1.02x
             (1024, 768, false),          // 96 tiles: 0.87x
-            (512, 4096, false),          // 256 tiles: 0.89x
+            (512, 2048, false),          // 128 tiles: 1.03x
+            (512, 4096, false),          // 256 tiles: 0.89x, baseline drifted
+            (1024, 4096, false),         // 512 tiles: 0.84x
         ] {
             let tiles = m.div_ceil(128) * n.div_ceil(64);
             assert_eq!(tiles < 64, narrow, "{m}x{n}: {tiles} tiles");

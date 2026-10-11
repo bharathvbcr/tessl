@@ -11,11 +11,12 @@
 //     all of K and C is written once, so there is no zero pre-pass; an
 //     accumulate or `beta` epilogue loads C once and adds. Tiles 128x64 or
 //     64x64 on four simdgroups (host-side selection in src/gemm.rs).
-//   - bf16 split-K TN: 64x32 on four simdgroups, one `multiply_accumulate`
-//     dispatch per 256-wide K partition into a zeroed C.
-// Tiles are walked by `tile_from_linear` (Morton order on square
-// power-of-two grids, row-major otherwise) or, for a large B operand, by
-// `tile_walk`'s column panels.
+//   - bf16 parallel split-K TN: 64x64 coop on four simdgroups, every K
+//     partition in one dispatch into a scratch that utils.metal's
+//     reduce_partitions_f32 (or _add_f32, for C +=) sums into C in order.
+// Every family walks its tiles by gemm_coop.h's `tile_walk`: column panels
+// once B holds 2^23 elements, else `tile_from_linear` (Morton order on
+// square power-of-two grids, row-major otherwise).
 //
 // Note: device pointers must be non-const — `const` poisons MPP type matching.
 
@@ -258,7 +259,8 @@ TN_SPLITK_PAR_KERNEL(matmul2d_tensorops_tn_splitk_par_bf16_f32, bfloat, 64, 64, 
 // which bounds-check per the MPPTensorOpsMatMul2d.h cooperative example.
 // Geometry is selected host-side (gemm.rs nn_coop_kernel): 128×64 sg4 by
 // default, 64×64 sg4 when N ≤ 512 or, for bf16, when M does not fill a
-// 128-row tile. (A 256×64 sg8 arm for large squares was measured and retired;
+// 128-row tile or the 128×64 grid has under 64 tiles (gemm.rs coop_narrow;
+// bench/results/bf16_smallm_coop_reconciled_m5pro.txt). (A 256×64 sg8 arm for large squares was measured and retired;
 // bench/results/bf16_tile_tune_FINDINGS.md.) Register cost of the
 // accumulator is SM*SN*4/(32*NSG) B/thread.
 // =============================================================================

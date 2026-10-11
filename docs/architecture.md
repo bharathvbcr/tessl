@@ -33,11 +33,11 @@ flowchart TD
     
     PrecisionCheck -- "f32 exact" --> F32Exact["matmul2d_tensorops_f32<br/>• Tile: 32x32, 1 simdgroup<br/>• Packed C-zero + matmul binder"]
     
-    PrecisionCheck -- "bf16 / f16 / tf32-relaxed" --> NNTable{"nn_coop_kernel()<br/>(bf16 and M &lt; 128) or N &lt;= 512?"}
+    PrecisionCheck -- "bf16 / f16 / tf32-relaxed" --> NNTable{"nn_coop_kernel() / coop_narrow()<br/>N &lt;= 512, or bf16 with M &lt; 128<br/>or under 64 tiles of 128x64?"}
     
     NNTable -- "Yes (Narrow 64x64)" --> NNNarrow["matmul2d_tensorops_*_64x64_sg4<br/>• TILE_COOP_NARROW (64x64, 4 simdgroups)<br/>• Register accumulator, cT.store<br/>• Edge bounds-checked slices"]
     
-    NNTable -- "No (Default 128x64)" --> NNDefault["matmul2d_tensorops_*<br/>• TILE_COOP_DEFAULT (128x64, 4 simdgroups)<br/>• 8-tile-row column swizzle if grid &gt;= 2048 tiles<br/>• Register accumulator, cT.store<br/>• Edge bounds-checked slices"]
+    NNTable -- "No (Default 128x64)" --> NNDefault["matmul2d_tensorops_*<br/>• TILE_COOP_DEFAULT (128x64, 4 simdgroups)<br/>• tile_walk: 512-row column panels once B &gt;= 2^23 elements<br/>• Register accumulator, cT.store<br/>• Edge bounds-checked slices"]
 ```
 
 ---
@@ -114,7 +114,7 @@ In Round 2 optimization, cooperative destination registers were extended across 
 
 ### Column-Panel Grid Swizzling
 
-Once B ($N \times K$) reaches $2^{23}$ elements, `tile_walk` (`kernels/gemm_coop.h`) swizzles threadgroups into 512-row bands of tile rows, for every GEMM family. (The coop NN kernels used the grid-size gate drawn below, $\text{tiles}_n \times \text{tiles}_m \ge 2048$ and 8-row bands, until 2026-10-11.)
+Once B ($N \times K$) reaches $2^{23}$ elements, `tile_walk` (`kernels/gemm_coop.h`) swizzles threadgroups into 512-row bands of tile rows, for every GEMM family. (The coop NN kernels used a grid-size gate, $\text{tiles}_n \times \text{tiles}_m \ge 2048$ with 8-row bands, until 2026-10-11.)
 
 ```mermaid
 flowchart TD
@@ -123,9 +123,9 @@ flowchart TD
         L0["Row 0: Tiles (0,0) → (N-1,0)<br/>Streams all of Matrix B"] --> L1["Row 1: Tiles (0,1) → (N-1,1)<br/>B is evicted; Streams B again"] --> L2["... Row M-1: Evicts and re-reads B every row"]
     end
 
-    subgraph Swizzled["Column-Panel 8-Row Swizzling (tiles_n × tiles_m ≥ 2048)"]
+    subgraph Swizzled["Column-Panel 512-Row Bands (N × K ≥ 2^23 elements of B)"]
         direction LR
-        S0["Band 0 (8 rows tall):<br/>Iterate col by col across 8 rows<br/>Matrix B tile stays warm in L2 cache!"] --> S1["Band 1 (Next 8 rows):<br/>Iterate col by col across next 8 rows"] --> S2["Bounds B re-reads to tiles_m / 8 passes<br/>(+11% throughput at 4096³)"]
+        S0["Band 0 (512 rows of C):<br/>Iterate col by col down the band<br/>Matrix B tile stays warm in L2 cache"] --> S1["Band 1 (next 512 rows):<br/>Iterate col by col down the band"] --> S2["Reads B once per band<br/>instead of once per tile row"]
     end
 ```
 
@@ -137,12 +137,13 @@ inline uint2 tile_from_linear_panel(uint linear, uint tiles_n, uint tiles_m, uin
     uint local_h = min(ph, tiles_m - band * ph);
     return uint2(rem / local_h, band * ph + rem % local_h);
 }
-// coop NN: tiles_n * tiles_m >= 2048 → tile_from_linear_panel(..., 8)
+// tile_walk<SM>: N * K >= 2^23 and the grid is not Morton
+//   → tile_from_linear_panel(..., 512 / SM); else tile_from_linear
 ```
 
-This bounds operand $B$ rereads to $\text{tiles}_m / 8$ passes, boosting large square throughput ($4096^3$) from 24.9 TFLOP/s to 29.0 TFLOP/s on Apple M5 Pro.
+This bounds operand $B$ rereads to one pass per band. (The retired grid gate was recorded at +11% at $4096^3$ — 24.9 to 29.0 TFLOP/s — on the blocked tune rig; both policies panel that shape — 8-row bands against `tile_walk`'s 4 at 128×64 — and the interleaved per-lane A/B measured them at 0.99× of each other.)
 
-Three more kernel families take the same walk through `tile_walk<SM>`, in bands of 512 rows of C, gated on $N \times K \ge 2^{23}$ elements of B rather than on the grid:
+Every family takes this walk through `tile_walk<SM>`, in bands of 512 rows of C — the coop NN kernels (bf16, f16, relaxed f32; plain, epilogue, batched; 4-tile-row bands at 128×64, 8 at 64×64) and:
 
 - the exact-f32 kernels (`matmul2d_tensorops_f32`, `_tn_f32`, `_nt_f32`, `_tn_accum_f32`, `_nt_accum_f32`; 32×32 tiles, one simdgroup), in 16-tile-row bands;
 - the bf16 TN/NT coop kernels (`matmul2d_tensorops_tn_bf16_f32` and `_nt_bf16_f32`, 128×64, 4-tile-row bands; `_tn_accum_bf16_f32` and `_nt_accum_bf16_f32`, 64×64, 8-tile-row bands);
@@ -329,7 +330,7 @@ builds tensors from raw device pointers.
 
 ## Static Tile Ownership Audit
 
-The Rust `TileGeom` constants (`TILE_COOP_DEFAULT`, `TILE_COOP_NARROW`, `TILE_COOP_TN_NT`, `TILE_COOP_ACCUM`, `TILE_F32`, `TILE_V2`) must strictly equal the `SM`/`SN` compiled into shader kernels.
+The Rust `TileGeom` constants (`TILE_COOP_DEFAULT`, `TILE_COOP_NARROW`, `TILE_COOP_TN_NT`, `TILE_COOP_ACCUM`, `TILE_COOP_SPLITK`, `TILE_F32`) must strictly equal the `SM`/`SN` compiled into shader kernels.
 
 Because Rust's type system cannot verify shader constants at compile time, [`scripts/audit_gemm_tiles.py`](../scripts/audit_gemm_tiles.py) verifies:
 1. Every Rust `TileGeom` matches the `constexpr int SM/SN`, macro arguments, or helper template defaults in Metal shaders.

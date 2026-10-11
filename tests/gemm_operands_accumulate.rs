@@ -90,7 +90,8 @@ fn accumulate_operands_add_the_product_into_c() {
             (96, 48, 64),
             (200, 72, 96),
             (96, 48, 3),
-            // TN's sequential split-K (K >= 2048, M and N <= 384, one <= 128).
+            // TN's split-K (K >= 2048, M and N <= 384, one <= 128): parallel
+            // for bf16, sequential for exact f32.
             (96, 200, 2304),
         ];
         for layout in [Layout::Nn, Layout::Tn, Layout::Nt] {

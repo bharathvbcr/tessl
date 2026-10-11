@@ -145,6 +145,19 @@ All notable changes to `tessl` are recorded here. The format follows
 
 ### Changed
 
+- **One source for the GEMM tile bodies: `kernels/gemm_coop.h`.** The tile
+  walks, the interior and edge operand views of a tile, the cooperative
+  destination body (zero, run, accumulate or epilogue, store) and the
+  exact-f32 body moved into a header that `matmul_tensorops.metal` and the
+  tune variants both include. The six exact-f32 kernels are one template
+  (`mm_exact_f32`, by layout and `multiply` vs `multiply_accumulate`), the
+  epilogue is written once for interior and edge tiles, and every tune coop
+  variant is an instantiation of the production `mm_coop` with its own
+  tile, walk and layout, so a tune winner and the kernel that ships it
+  cannot drift. The two kernel files went from 1714 lines to 909 plus the
+  396-line header. Output is bit for bit what it was: FNV hashes of every
+  production GEMM entry point over 495 (entry, shape) cases matched before
+  and after, and the GEMM suites pass unchanged.
 - **`gemm_{tn,nt}_accum_train` always run the accumulate kernels;
   `TESSL_GEMM_ACCUM` and `TESSL_GEMM_ACCUM_DX` are retired.** Training has
   reached the accumulate kernels through `GemmOperands::{tn_acc, nt_acc}`

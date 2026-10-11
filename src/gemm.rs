@@ -3289,8 +3289,7 @@ mod stress_tests {
     #[test]
     fn panel_walk_matches_row_major_chunks_bit_for_bit() {
         assert!(
-            include_str!("../kernels/matmul_tensorops.metal")
-                .contains("constexpr constant ulong PANEL_MIN_B_ELEMS = 1ul << 23;"),
+            include_str!("../kernels/gemm_coop.h").contains("constexpr constant ulong PANEL_MIN_B_ELEMS = 1ul << 23;"),
             "the shader's panel gate moved; update PANEL_MIN_B_ELEMS and these shapes"
         );
         let rt = GpuRuntime::new().expect("GpuRuntime::new");

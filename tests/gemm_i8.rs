@@ -75,7 +75,7 @@ fn the_integer_accumulation_is_exact() {
 /// Once B (K×N) reaches the shader's `PANEL_MIN_B_ELEMS` = 2^23 elements on a
 /// grid that is not square with a power-of-two side, the kernel walks its
 /// 128x64 tiles in column panels of 4 tile rows (`tile_walk` in
-/// `kernels/matmul_tensorops.metal`). M = 545 is 5 tile rows (a full band
+/// `kernels/gemm_coop.h`). M = 545 is 5 tile rows (a full band
 /// and a partial one) and M = 33 one short band; both Ns leave a ragged last
 /// tile column. A is zero past its first column, so the exact answer is
 /// A[:, 0] times B[0, :], O(M·N) to check at any K. C starts as NaN, so a
@@ -83,8 +83,7 @@ fn the_integer_accumulation_is_exact() {
 #[test]
 fn column_panels_cover_every_tile_exactly() {
     assert!(
-        include_str!("../kernels/matmul_tensorops.metal")
-            .contains("constexpr constant ulong PANEL_MIN_B_ELEMS = 1ul << 23;"),
+        include_str!("../kernels/gemm_coop.h").contains("constexpr constant ulong PANEL_MIN_B_ELEMS = 1ul << 23;"),
         "the shader's panel gate moved; update these shapes"
     );
     with_gpu(|rt| {

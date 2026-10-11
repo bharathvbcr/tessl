@@ -3,7 +3,7 @@
 **Mark:** Morton walk · **Palette:** Silicon Precision.
 
 A 4×4 tiled block threaded by the Z-order walk the kernels actually use —
-`tile_from_linear` in `matmul_tensorops.metal`. The mark and the code agree.
+`tile_from_linear` in `kernels/gemm_coop.h`. The mark and the code agree.
 
 | | |
 | --- | --- |

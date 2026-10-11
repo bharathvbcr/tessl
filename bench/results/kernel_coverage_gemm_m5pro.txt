@@ -1,0 +1,105 @@
+# Kernel coverage of the GEMM entry points, and why kernel_coverage.py
+# --check cannot measure it yet
+#
+# Machine: Apple M5 Pro, macOS 27.0.1, 2026-10-11 13:59 UTC, one locked job
+# (Lappi-decision/tools/mac_heavy.sh). Tree: this branch after cec5051,
+# with bench_gemm_routes added to kernel_coverage.py's SUITES.
+#
+# `python3 bench/kernel_coverage.py --check` stops before running a suite,
+# for reasons that are all on main as well:
+#  1. It finds the metallib by scanning bench_gemm_sweep for the path
+#     string build.rs bakes in. The runtime embeds the bytes
+#     (include_bytes!) and no binary calls tessl::metallib_path(), so the
+#     string is not in the binary: "cannot resolve the benchmark's embedded
+#     metallib ... found []". `--metallib PATH` works around it (the bytes
+#     of target/release/build/tessl-*/out/default-*.metallib were found
+#     inside the binary, so that file is the one it runs).
+#  2. With the metallib given, the source scan misses 29 entry points the
+#     metallib exports, all qwen35 kernels stamped by macros it does not
+#     parse (qwen35_adamw_*_g*_m*, qwen35_attn_tiled_lse_h256_q32_k32_sg4,
+#     qwen35_{head,token}_rows_to_bank_*, qwen35_window_copy_*), so it
+#     refuses ("The scan is wrong; fix it"). No file under kernels/qwen35*
+#     changed on this branch. Every GEMM entry point is matched.
+#  3. Two suites never print the KERNEL_TRACE line the sweep reads:
+#     bench_gemm_sweep and bench_nn_kernels have no emit_kernel_trace
+#     (neither file changed on this branch). bench_nn_kernels also exits 1
+#     under the BENCH_WARMUP=0 the sweep passes: sample_loop starts `token`
+#     at 0 and only a warmup call sets it, so the first timed token reads
+#     as "token changed from 0 to 117223"; it passes at BENCH_WARMUP=1.
+#
+# Method here: kernel_coverage.run_suites with the compiled metallib (266
+# exports) as the inventory and the source scan only for the per-file
+# split (a scratch driver; the script itself is unchanged apart from the
+# new suite). The three suite errors above are expected; the rest ran.
+#
+# Result: 99 of 266 entry points dispatched. Every GEMM kernel this branch
+# added is dispatched — matmul2d_tensorops_tn_splitk_par_bf16_f32,
+# reduce_partitions_add_f32 and the f16 / relaxed-f32 _epi_64x64_sg4
+# kernels, by the new bench_gemm_routes suite. The seven GEMM kernels left
+# uncovered (exact and relaxed f32 NN, relaxed 64x64, the NN split-K and
+# accumulate, the TN split-K, int8) all exist on main; whether
+# bench_gemm_sweep reaches them cannot be read until it emits a trace
+# (item 3). The GEMM tests route to each of them (gemm_i8.rs,
+# gemm_ragged_shapes.rs, gemm_flag_paths.rs, qwen35_train_traffic.rs, ...);
+# that is read from the tests' routes, not from a trace. kernel_coverage_m5pro.json (147 entry points) predates
+# most of today's kernels and was not regenerated.
+#
+ERROR bench_gemm_sweep: emitted no KERNEL_TRACE line; is the runtime honouring TESSL_KERNEL_TRACE?
+ERROR bench_gemm_sweep: emitted no KERNEL_TRACE line; is the runtime honouring TESSL_KERNEL_TRACE?
+ERROR bench_nn_kernels : exited 1
+Error: "sample loop: token changed from 0 to 117223"
+metallib kernels: 266 dispatched: 99 stray: []
+uncovered bert: 6: ['bert_bias_add_f32', 'bert_bias_gelu_erf_f32', 'bert_bias_residual_layer_norm_f32', 'bert_embed_layer_norm_f32', 'bert_layer_norm_f32', 'bert_segment_sparse_max_f32']
+uncovered cross_entropy: 4: ['ce_gather_rows_bf16', 'ce_gather_rows_f32', 'ce_lse_update', 'ce_softmax_grad']
+uncovered embed_lookup: 3: ['embed_lookup_q4', 'embed_lookup_q4_mlx', 'scale_f32_inplace']
+uncovered embed_pool: 2: ['l2_normalize_rows_f32', 'segment_mean_rows_f32']
+uncovered encoder_attn: 6: ['encoder_attn_rows_h256_r16_g32', 'encoder_attn_rows_h32_r2_g8', 'encoder_attn_rows_h512_r32_g32', 'encoder_attn_rows_h64_r4_g16', 'encoder_attn_tiled_h256_q32_k32_sg4', 'encoder_attn_tiled_h512_q32_k32_sg8']
+uncovered flash_attn_rows: 1: ['flash_attn_rows_h64_r8_g8']
+uncovered gdn_train: 3: ['gdn_train_bwd', 'gdn_train_bwd_finish', 'gdn_train_fwd']
+uncovered gemm_q4_mlx: 4: ['gemm_q4_mlx_simd', 'gemm_q4_mlx_simd_add', 'gemm_q4_mlx_simd_add_i4', 'gemm_q4_mlx_simd_i4']
+uncovered gemv_q4: 2: ['gemv_q4', 'gemv_q4_tiled']
+uncovered gemv_q4_mlx: 15: ['gemv_q4_mlx', 'gemv_q4_mlx_blocked', 'gemv_q4_mlx_blocked_gate_up_gelu', 'gemv_q4_mlx_simd', 'gemv_q4_mlx_simd_add', 'gemv_q4_mlx_simd_add_i4', 'gemv_q4_mlx_simd_gate_up_gelu', 'gemv_q4_mlx_simd_gate_up_gelu_i4', 'gemv_q4 [... omitted end of long line]
+uncovered gemv_q8: 1: ['gemv_q8']
+uncovered kv_store: 3: ['kv_ring_densify', 'kv_store_timestep', 'kv_store_timestep_pair']
+uncovered matmul_simdgroup: 1: ['matmul_simdgroup_edges_f32']
+uncovered matmul_tensorops: 7: ['matmul2d_tensorops_f32', 'matmul2d_tensorops_f32_relaxed', 'matmul2d_tensorops_f32_relaxed_64x64_sg4', 'matmul2d_tensorops_i8_f32', 'matmul2d_tensorops_nn_accum_f32', 'matmul2d_tensorops_nn_splitk_f32', 'matmul2d_tens [... omitted end of long line]
+uncovered mlp_gelu_tanh: 2: ['mlp_gelu_tanh', 'mlp_gelu_tanh_bf16']
+uncovered mlp_silu: 1: ['mlp_silu']
+uncovered mtl_tensor: 2: ['mtl_tensor_fill_i8', 'mtl_tensor_read_i8']
+uncovered qwen35_adamw: 3: ['qwen35_adamw_f32', 'qwen35_sq_sum_pieces', 'qwen35_sum_exact_f32']
+uncovered qwen35_attn: 7: ['qwen35_attn_gate_bf16', 'qwen35_attn_gate_f32', 'qwen35_attn_prefix_decode_partial', 'qwen35_attn_prefix_decode_reduce', 'qwen35_attn_prefix_rows', 'qwen35_attn_qk_norm_rope', 'qwen35_attn_qk_norm_rope_posbuf']
+uncovered qwen35_attn_bwd: 4: ['qwen35_attn_bwd_dk_h256_q32_k32_sg4', 'qwen35_attn_bwd_dq_h256_q32_k32_sg4', 'qwen35_attn_bwd_dv_h256_q32_k32_sg4', 'qwen35_attn_bwd_dvec_f32']
+uncovered qwen35_attn_tiled: 4: ['qwen35_attn_tiled_h256_q32_k32_sg4', 'qwen35_attn_tiled_h256_q32_k64_sg4', 'qwen35_attn_tiled_h256_q64_k32_sg8', 'qwen35_attn_tiled_h256_q64_k64_sg8']
+uncovered qwen35_bwd: 12: ['qwen35_attn_gate_bwd_f32', 'qwen35_attn_qk_norm_rope_bwd_f32', 'qwen35_col_sum_blocks_f32', 'qwen35_conv1d_silu_bwd_dw_f32', 'qwen35_conv1d_silu_bwd_dx_f32', 'qwen35_copy_cols_f32', 'qwen35_embed_rows_bwd_f32', 'qwen35_gat [... omitted end of long line]
+uncovered qwen35_gdn: 9: ['qwen35_conv1d_silu', 'qwen35_gated_rms_norm_bf16', 'qwen35_gated_rms_norm_f32', 'qwen35_gdn_chunk_prep', 'qwen35_gdn_chunk_scan', 'qwen35_gdn_chunk_scan_bv16', 'qwen35_gdn_gates_f32', 'qwen35_gdn_recurrent', 'qwen35_gdn_rec [... omitted end of long line]
+uncovered qwen35_mlp: 7: ['qwen35_gelu_tanh_glu_bf16', 'qwen35_gelu_tanh_glu_f32', 'qwen35_residual_add_f32', 'qwen35_rms_norm_bf16', 'qwen35_rms_norm_f32', 'qwen35_swiglu_bf16', 'qwen35_swiglu_f32']
+uncovered qwen35_score: 5: ['qwen35_embed_rows_bf16', 'qwen35_embed_rows_bf16_scaled', 'qwen35_embed_rows_f32', 'qwen35_score_rows_bf16', 'qwen35_score_rows_f32']
+uncovered qwen35_train_storage: 3: ['qwen35_deliver_f32_to_bf16', 'qwen35_moment_q8_decode', 'qwen35_moment_q8_encode']
+uncovered reduce: 3: ['row_max_f32', 'row_sum_f32', 'softmax_rows_f32']
+uncovered rms_norm: 3: ['rms_norm_bf16', 'rms_norm_f32', 'rms_norm_residual_add_f32']
+uncovered rms_qkv_rope: 3: ['rms_qkv_rope', 'rms_qkv_rope_kv_store', 'rms_qkv_rope_posbuf']
+uncovered softcap_sample: 4: ['argmax_f32', 'softcap_argmax_one_pass', 'softcap_logits', 'softcap_sample']
+uncovered utils: 8: ['add_inplace_f32', 'cast_bf16_to_f32', 'cast_f16_to_f32', 'copy_bf16', 'copy_f16', 'copy_f32', 'copy_u32', 'softcap_f32']
+suite bench_flash_attn                                              12
+suite bench_flash_attn BENCH_ATTN_DECODE_CHUNK=64 BENCH_ATTN_DECODE_R=8  18
+suite bench_flash_attn BENCH_ATTN_DECODE_CHUNK=128 BENCH_ATTN_DECODE_R=8  16
+suite bench_flash_attn BENCH_ATTN_DECODE_CHUNK=256 BENCH_ATTN_DECODE_R=8  16
+suite bench_flash_attn BENCH_ATTN_DECODE_CHUNK=64 BENCH_ATTN_DECODE_R=16  18
+suite bench_flash_attn BENCH_ATTN_DECODE_CHUNK=128 BENCH_ATTN_DECODE_R=16  15
+suite bench_flash_attn BENCH_ATTN_DECODE_CHUNK=256 BENCH_ATTN_DECODE_R=16  17
+suite bench_flash_attn BENCH_ATTN_DECODE_CHUNK=64 BENCH_ATTN_DECODE_R=32  18
+suite bench_flash_attn BENCH_ATTN_DECODE_CHUNK=128 BENCH_ATTN_DECODE_R=32  15
+suite bench_flash_attn BENCH_ATTN_DECODE_CHUNK=256 BENCH_ATTN_DECODE_R=32  17
+suite bench_flash_attn BENCH_ATTN_ROWS_R=8 BENCH_ATTN_ROWS_SGT=8     8
+suite bench_flash_attn BENCH_ATTN_ROWS_R=8 BENCH_ATTN_ROWS_SGT=16    9
+suite bench_flash_attn BENCH_ATTN_ROWS_R=8 BENCH_ATTN_ROWS_SGT=32    9
+suite bench_flash_attn BENCH_ATTN_ROWS_R=16 BENCH_ATTN_ROWS_SGT=8    9
+suite bench_flash_attn BENCH_ATTN_ROWS_R=16 BENCH_ATTN_ROWS_SGT=16   9
+suite bench_flash_attn BENCH_ATTN_ROWS_R=16 BENCH_ATTN_ROWS_SGT=32   8
+suite bench_flash_attn BENCH_ATTN_ROWS_R=32 BENCH_ATTN_ROWS_SGT=8    9
+suite bench_flash_attn BENCH_ATTN_ROWS_R=32 BENCH_ATTN_ROWS_SGT=16   9
+suite bench_flash_attn BENCH_ATTN_ROWS_R=32 BENCH_ATTN_ROWS_SGT=32   8
+suite bench_flash_attn TESSL_ATTN_TILED=1                           12
+suite bench_gemm_variants                                           24
+suite bench_gemm_routes                                             21
+matmul_tensorops + reduce_partitions uncovered: ['matmul2d_tensorops_f32', 'matmul2d_tensorops_f32_relaxed', 'matmul2d_tensorops_f32_relaxed_64x64_sg4', 'matmul2d_tensorops_i8_f32', 'matmul2d_tensorops_nn_accum_f32', 'matmul2d_tensorops_nn_splitk_f32 [... omitted end of long line]

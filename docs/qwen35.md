@@ -1347,12 +1347,16 @@ span ±8% on this machine under load.
   attends), its gradients accumulated in a bank, so a batch of `B` rows costs
   `B` steps rather than one padded one (throughput not measured). What it
   does not do yet: several sequences in one step.
-- **Exact f32 at the MLP up/gate shape.** Production's exact-f32 NN runs
-  2048 x 6144 x 2048 at 4.1 TFLOP/s against 5.7 at 2048^3, and a
-  register-accumulator 128x64 sg8 tile runs it 1.45x faster with the same
-  bits (`bench/results/f32_exact_coop_m5pro.txt`). Everywhere else that tile
-  is within 0-11%, so exact f32 stays on its 32x32 kernel; why the one shape
-  is slow was not diagnosed.
+- **Exact f32 at the MLP up/gate shape: the split-K route.** The 4.1 vs
+  5.7 TFLOP/s gap at 2048 x 6144 x 2048 (`bench/results/f32_exact_coop_m5pro.txt`)
+  was the row-major tile walk re-reading B (50 MB of f32) once per tile
+  row; `tile_walk`'s column panels closed it with the same bits, and
+  production now runs the shape at 0.92-1.01x of 2048^3
+  (`bench/results/f32_exact_mlp_up_gap_m5pro.txt`, repeated and
+  interleaved). Left: production routes it through the exact-f32 NN split-K
+  (8 partitions), which runs at 0.90-0.95x of one panel-walked dispatch;
+  taking one dispatch would change exact-f32 bits, so it waits on a
+  decision to narrow `nn_splitk_k_tile`.
 - **Two compositions of the same model.** `bench_qwen35_layers` (random
   weights, timing) and `qwen35_model` (real checkpoint, parity) each wire the
   layers, prefill and decode; the bench should run on `Qwen35Model` and its

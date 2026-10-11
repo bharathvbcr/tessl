@@ -26,18 +26,18 @@ flowchart TD
 
     LayoutCheck -- "TN exact f32, C under 128 tiles, K of 2+ partitions" --> ParTN["matmul2d_tensorops_tn_splitk_par_f32<br/>+ reduce_partitions_f32<br/>(all K partitions in one dispatch)"]
     LayoutCheck -- "TN / NT Layout" --> SplitKCheck{"prefer_tn_splitk?<br/>(K &gt;= 2048, M,N &lt;= 384,<br/>min(M,N) &lt;= 128)"}
-    SplitKCheck -- Yes --> SplitKKernel["matmul2d_tensorops_tn/nt_splitk_*<br/>(Split-K partial reductions)"]
+    SplitKCheck -- Yes --> SplitKKernel["bf16: matmul2d_tensorops_tn_splitk_par_bf16_f32<br/>+ reduce_partitions_f32 (all K partitions in one dispatch)<br/>exact f32 C +=: matmul2d_tensorops_tn_splitk_f32"]
     SplitKCheck -- No --> CoopTN["matmul2d_tensorops_tn/nt_*_f32<br/>• 128x64 sg4 Cooperative Destination<br/>• Single store, zero host pre-zeroing"]
 
     LayoutCheck -- "NN Layout" --> PrecisionCheck{"Precision Mode"}
     
     PrecisionCheck -- "f32 exact" --> F32Exact["matmul2d_tensorops_f32<br/>• Tile: 32x32, 1 simdgroup<br/>• Packed C-zero + matmul binder"]
     
-    PrecisionCheck -- "bf16 / f16 / tf32-relaxed" --> NNTable{"nn_coop_kernel()<br/>(bf16 and M &lt; 128) or N &lt;= 512?"}
+    PrecisionCheck -- "bf16 / f16 / tf32-relaxed" --> NNTable{"nn_coop_kernel() / coop_narrow()<br/>N &lt;= 512, or bf16 with M &lt; 128<br/>or under 64 tiles of 128x64?"}
     
     NNTable -- "Yes (Narrow 64x64)" --> NNNarrow["matmul2d_tensorops_*_64x64_sg4<br/>• TILE_COOP_NARROW (64x64, 4 simdgroups)<br/>• Register accumulator, cT.store<br/>• Edge bounds-checked slices"]
     
-    NNTable -- "No (Default 128x64)" --> NNDefault["matmul2d_tensorops_*<br/>• TILE_COOP_DEFAULT (128x64, 4 simdgroups)<br/>• 8-tile-row column swizzle if grid &gt;= 2048 tiles<br/>• Register accumulator, cT.store<br/>• Edge bounds-checked slices"]
+    NNTable -- "No (Default 128x64)" --> NNDefault["matmul2d_tensorops_*<br/>• TILE_COOP_DEFAULT (128x64, 4 simdgroups)<br/>• tile_walk: 512-row column panels once B &gt;= 2^23 elements<br/>• Register accumulator, cT.store<br/>• Edge bounds-checked slices"]
 ```
 
 ---
@@ -101,19 +101,20 @@ In Round 2 optimization, cooperative destination registers were extended across 
 
 | Layout / Path | Geometry | Implementation | Performance Impact |
 |---|---|---|---|
-| **NN Default** | $128 \times 64$, 4 sg | `matmul2d_tensorops_bf16_f32` + swizzle | **26,642 GFLOP/s** at $4096^3$ (+11% via swizzle) |
-| **NN Narrow ($N \le 512$ or bf16 $M < 128$)** | $64 \times 64$, 4 sg | `matmul2d_tensorops_bf16_f32_64x64_sg4` | +6% on narrow-$N$; outruns 128×64 on short-$M$ bf16 (e.g. M=61 GDN in-proj) |
-| **Fused Epilogue Narrow (bf16 $M < 128$)** | $64 \times 64$, 4 sg | `matmul2d_tensorops_bf16_f32_epi_64x64_sg4` | Specialization for short-$M$ bf16 operands; wide ($128 \times 64$) on $M \ge 128$ |
+| **NN Default** | $128 \times 64$, 4 sg | `matmul2d_tensorops_bf16_f32` | **26,642 GFLOP/s** at $4096^3$ |
+| **NN Narrow ($N \le 512$; bf16 $M < 128$ or under 64 tiles of 128×64)** | $64 \times 64$, 4 sg | `matmul2d_tensorops_bf16_f32_64x64_sg4` (and f16, relaxed f32) | +6% on narrow-$N$; outruns 128×64 on short-$M$ bf16 (e.g. M=61 GDN in-proj) and 1.16–1.56× on bf16 grids under 64 tiles (`bench/results/bf16_smallm_coop_reconciled_m5pro.txt`) |
+| **Fused epilogue and batched** | the plain path's tile (`coop_narrow`) | `*_epi`, `*_batched` and their `_64x64_sg4` forms, every element type | Epilogue 64×64 1.11–2.01× where the rule picks it (`bench/results/gemm_coop_tiles_m5pro.txt`) |
 | **TN bf16 Descriptor** | $128 \times 64$, 4 sg | `matmul2d_tensorops_tn_bf16_f32` | 1.52–1.98× over dynamic-$K$ multiply |
 | **NT bf16 ($dX$ Backward)** | $128 \times 64$, 4 sg | `matmul2d_tensorops_nt_bf16_f32` | 2.00–2.03× speedup at scale |
 | **Accumulate Paths** | $64 \times 64$, 4 sg | Zero $\to$ Run $\to$ Load-Add-Store (`TILE_COOP_ACCUM`) | 1.38–1.49× over `multiply_accumulate` |
-| **Split-K $dW$** | $64 \times 32$, 4 sg | `matmul2d_tensorops_tn_splitk_*` | Tall-$K$ / small-$MN$ (`prefer_tn_splitk`): bf16, and exact f32 into `C +=` |
+| **Parallel split-K TN, bf16** | $64 \times 64$, 4 sg cooperative | `matmul2d_tensorops_tn_splitk_par_bf16_f32` + `reduce_partitions_f32` (`_add_f32` for `C +=`) | Tall-$K$ / small-$MN$ (`prefer_tn_splitk`), overwriting and accumulating: 2.4–19× over the sequential 64×32 lane it replaced (`bench/results/splitk_par_bf16_m5pro.txt`) |
+| **Split-K $dW$, exact f32 `C +=`** | $32 \times 32$, 1 sg | `matmul2d_tensorops_tn_splitk_f32` | Tall-$K$ / small-$MN$ (`prefer_tn_splitk`), exact f32 accumulating: one dispatch per 256 of K, in order |
 | **Parallel split-K TN, exact f32** | $32 \times 32$, 1 sg | `matmul2d_tensorops_tn_splitk_par_f32` + `reduce_partitions_f32` | Every TN whose C has under 128 tiles over a K of ≥ 2 partitions (`tn_par_k_tile`): all partitions in one dispatch into a scratch, added in order. Gate $dW$ (12×768×4096): 225 → 45 µs; attention $dW$ (128×128×4096): 186 µs sequential → 31 µs on M5 Pro |
 | **Split-K NN, exact f32** | $32 \times 32$, 1 sg | `matmul2d_tensorops_nn_splitk_f32` | Long $K$ with $K \times N \ge 2^{23}$: partitions of $2^{21}/N$ rows of B keep each slice of B in cache. LM-head $dX$ (4096×768×50304): 99.8 → 45.4 ms on M5 Pro |
 
 ### Column-Panel Grid Swizzling
 
-For large grids ($\text{tiles}_n \times \text{tiles}_m \ge 2048$), threadgroups are swizzled into 8-tile-row bands:
+Once B ($N \times K$) reaches $2^{23}$ elements, `tile_walk` (`kernels/gemm_coop.h`) swizzles threadgroups into 512-row bands of tile rows, for every GEMM family. (The coop NN kernels used a grid-size gate, $\text{tiles}_n \times \text{tiles}_m \ge 2048$ with 8-row bands, until 2026-10-11.)
 
 ```mermaid
 flowchart TD
@@ -122,9 +123,9 @@ flowchart TD
         L0["Row 0: Tiles (0,0) → (N-1,0)<br/>Streams all of Matrix B"] --> L1["Row 1: Tiles (0,1) → (N-1,1)<br/>B is evicted; Streams B again"] --> L2["... Row M-1: Evicts and re-reads B every row"]
     end
 
-    subgraph Swizzled["Column-Panel 8-Row Swizzling (tiles_n × tiles_m ≥ 2048)"]
+    subgraph Swizzled["Column-Panel 512-Row Bands (N × K ≥ 2^23 elements of B)"]
         direction LR
-        S0["Band 0 (8 rows tall):<br/>Iterate col by col across 8 rows<br/>Matrix B tile stays warm in L2 cache!"] --> S1["Band 1 (Next 8 rows):<br/>Iterate col by col across next 8 rows"] --> S2["Bounds B re-reads to tiles_m / 8 passes<br/>(+11% throughput at 4096³)"]
+        S0["Band 0 (512 rows of C):<br/>Iterate col by col down the band<br/>Matrix B tile stays warm in L2 cache"] --> S1["Band 1 (next 512 rows):<br/>Iterate col by col down the band"] --> S2["Reads B once per band<br/>instead of once per tile row"]
     end
 ```
 
@@ -136,18 +137,19 @@ inline uint2 tile_from_linear_panel(uint linear, uint tiles_n, uint tiles_m, uin
     uint local_h = min(ph, tiles_m - band * ph);
     return uint2(rem / local_h, band * ph + rem % local_h);
 }
-// coop NN: tiles_n * tiles_m >= 2048 → tile_from_linear_panel(..., 8)
+// tile_walk<SM>: N * K >= 2^23 and the grid is not Morton
+//   → tile_from_linear_panel(..., 512 / SM); else tile_from_linear
 ```
 
-This bounds operand $B$ rereads to $\text{tiles}_m / 8$ passes, boosting large square throughput ($4096^3$) from 24.9 TFLOP/s to 29.0 TFLOP/s on Apple M5 Pro.
+This bounds operand $B$ rereads to one pass per band. (The retired grid gate was recorded at +11% at $4096^3$ — 24.9 to 29.0 TFLOP/s — on the blocked tune rig; both policies panel that shape — 8-row bands against `tile_walk`'s 4 at 128×64 — and the interleaved per-lane A/B measured them at 0.99× of each other.)
 
-Three more kernel families take the same walk through `tile_walk<SM>`, in bands of 512 rows of C, gated on $N \times K \ge 2^{23}$ elements of B rather than on the grid:
+Every family takes this walk through `tile_walk<SM>`, in bands of 512 rows of C — the coop NN kernels (bf16, f16, relaxed f32; plain, epilogue, batched; 4-tile-row bands at 128×64, 8 at 64×64) and:
 
 - the exact-f32 kernels (`matmul2d_tensorops_f32`, `_tn_f32`, `_nt_f32`, `_tn_accum_f32`, `_nt_accum_f32`; 32×32 tiles, one simdgroup), in 16-tile-row bands;
 - the bf16 TN/NT coop kernels (`matmul2d_tensorops_tn_bf16_f32` and `_nt_bf16_f32`, 128×64, 4-tile-row bands; `_tn_accum_bf16_f32` and `_nt_accum_bf16_f32`, 64×64, 8-tile-row bands);
 - the int8 dequant kernel (`matmul2d_tensorops_i8_f32`, 128×64), in 4-tile-row bands.
 
-A grid that `tile_from_linear` walks in Morton order (square, with a power-of-two side) keeps Morton. On those grids, bf16 panels measured 0.98–1.04× of Morton, and exact-f32 Morton 0.99–1.02× of panels. The coop NN kernel keeps its own grid-gated 8-row walk above, and the split-K kernels walk their partitions.
+A grid that `tile_from_linear` walks in Morton order (square, with a power-of-two side) keeps Morton. On those grids, bf16 panels measured 0.98–1.04× of Morton, and exact-f32 Morton 0.99–1.02× of panels. The coop NN kernels walked by their own grid gate (8-row bands from 2048 tiles) until 2026-10-11; a per-lane A/B (`bench/results/gemm_panel_walk_m5pro.txt`) moved them onto `tile_walk` too, so every family has one policy. The split-K kernels walk their partitions.
 
 Under row-major order, the threadgroups running at one time share an A tile and each read a different B tile, so all of $B$ is re-read once per tile row. A 32-row tile does 16 flop per byte of B. Once B no longer fits in cache, each pass runs at DRAM speed: a 50304×768 f32 LM-head weight ran at ~2.3 TFLOP/s at any row count, against ~6.5 at $N \le 2304$. On M5 Pro, time relative to the walk each kernel had before (data in ojas `bench/results/2026-10-02-gemm` and `2026-10-06-gemm-bf16`):
 
@@ -332,7 +334,7 @@ builds tensors from raw device pointers.
 
 ## Static Tile Ownership Audit
 
-The Rust `TileGeom` constants (`TILE_COOP_DEFAULT`, `TILE_COOP_NARROW`, `TILE_COOP_TN_NT`, `TILE_COOP_ACCUM`, `TILE_F32`, `TILE_V2`) must strictly equal the `SM`/`SN` compiled into shader kernels.
+The Rust `TileGeom` constants (`TILE_COOP_DEFAULT`, `TILE_COOP_NARROW`, `TILE_COOP_TN_NT`, `TILE_COOP_ACCUM`, `TILE_COOP_SPLITK`, `TILE_F32`) must strictly equal the `SM`/`SN` compiled into shader kernels.
 
 Because Rust's type system cannot verify shader constants at compile time, [`scripts/audit_gemm_tiles.py`](../scripts/audit_gemm_tiles.py) verifies:
 1. Every Rust `TileGeom` matches the `constexpr int SM/SN`, macro arguments, or helper template defaults in Metal shaders.

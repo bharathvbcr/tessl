@@ -84,12 +84,14 @@ SUITES = [
                                   BENCH_ATTN_CFGS="swa128_decode_1k,swa256_decode_4k,"
                                                   "global512_decode_4k")),
     ("bench_nn_kernels", [], dict(BENCH_ITERS="1", BENCH_WARMUP="0")),
+    # The TN/NT accumulate lanes reach the accumulate kernels with no opt-in
+    # since TESSL_GEMM_ACCUM / _ACCUM_DX were retired (2026-10-10).
     ("bench_gemm_variants", [], dict(BENCH_ITERS="1", BENCH_WARMUP="0")),
-    # The native TN/NT accumulate kernels are behind an opt-in: without it the
-    # accumulate lanes take a temp-buffer + add_inplace fallback and the real
-    # kernels are never dispatched.
-    ("bench_gemm_variants", [], dict(BENCH_ITERS="1", BENCH_WARMUP="0",
-                                     TESSL_GEMM_ACCUM="1", TESSL_GEMM_ACCUM_DX="1")),
+    # The routing lanes dispatch the parallel bf16 split-K and its
+    # accumulating reduce, and the f16 / relaxed-f32 64x64 epilogue kernels,
+    # which no other suite reaches. One round, so the drift gate cannot fire.
+    ("bench_gemm_routes", [], dict(BENCH_REPS="1", BENCH_ITERS="1",
+                                   BENCH_WARMUP="0", BENCH_ROUNDS="1")),
 ]
 
 

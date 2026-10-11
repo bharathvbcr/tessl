@@ -169,7 +169,6 @@ Run from the repository root:
 cargo test --release --manifest-path Cargo.toml --lib -- --test-threads=1 --nocapture
 cargo test --release --manifest-path ../ojas/arch02/metal-native/Cargo.toml --lib -- --test-threads=1 --nocapture
 cargo test --release --manifest-path ../ojas/gemma-metal/Cargo.toml --lib -- --test-threads=1 --nocapture
-METAL_RUNTIME_GEMM_ACCUM=1 cargo test --release --manifest-path Cargo.toml --lib gemm::contract_tests -- --test-threads=1
 MTL_SHADER_VALIDATION=1 MTL_SHADER_VALIDATION_REPORT_TO_STDERR=1 MTL_SHADER_VALIDATION_ABORT_ON_FAULT=1 cargo test --release --manifest-path Cargo.toml --lib gemm::contract_tests -- --test-threads=1 --nocapture
 cargo test --release --manifest-path Cargo.toml --lib benchmark_simdgroup_zero_cost -- --ignored --test-threads=1 --nocapture
 ```

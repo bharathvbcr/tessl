@@ -187,9 +187,142 @@ fn parse_usize_env_value(name: &str, raw: &str, min: usize) -> Result<usize, Str
     Ok(v)
 }
 
+/// The measurement-only GEMM kernels live in `kernels/tune/` and are linked
+/// only by this build; the tuning binaries refuse to run without them.
+pub const TUNE_BUILD: &str = "TESSL_GEMM_TUNE=1 cargo build --release --bins";
+
+/// Exit 2, naming [`TUNE_BUILD`], when any of `kernels` has no pipeline in
+/// the loaded metallib. Checked before anything is timed: a variant that
+/// cannot run must not print a line that reads like a result and let the
+/// process exit 0, which is what a page of `skip(pipe)` used to do.
+pub fn require_kernels<'a>(rt: &tessl::GpuRuntime, bin: &str, kernels: impl IntoIterator<Item = &'a str>) {
+    let mut missing: Vec<&str> = kernels.into_iter().filter(|k| rt.pipeline(k).is_err()).collect();
+    missing.sort_unstable();
+    missing.dedup();
+    if !missing.is_empty() {
+        eprintln!(
+            "{bin}: {} kernel(s) are not in the loaded metallib: {}\n\
+             The tuning variants are opt-in. Rebuild with:\n  {TUNE_BUILD}",
+            missing.len(),
+            missing.join(", ")
+        );
+        std::process::exit(2);
+    }
+}
+
+/// Arm `i`'s position in round `round` of an interleaved A/B: forward on
+/// even rounds, reversed on odd ones, so every arm runs first and last
+/// equally often and a clock that drifts during a round lands on every arm.
+pub fn round_order(round: usize, arms: usize) -> Vec<usize> {
+    if round % 2 == 0 {
+        (0..arms).collect()
+    } else {
+        (0..arms).rev().collect()
+    }
+}
+
+/// One arm of an interleaved A/B: a name and one timed call. `run` does
+/// `reps` GEMMs and waits for them; a sample is its wall time over `reps`.
+pub struct Arm<'a> {
+    pub name: String,
+    pub reps: usize,
+    pub run: Box<dyn FnMut() -> Result<(), String> + 'a>,
+}
+
+/// Every arm's per-round median, in ms per GEMM: `rounds[arm][round]`.
+pub struct Paired {
+    pub names: Vec<String>,
+    pub rounds: Vec<Vec<f64>>,
+}
+
+/// Time `arms` interleaved: `warmup` untimed calls of each, then `rounds`
+/// rounds in [`round_order`], each arm taking `iters` timed calls per round
+/// back to back. The comparison is the per-round ratio ([`ratio_stats`]), so
+/// drift between rounds cancels; a baseline block and a variant block timed
+/// minutes apart (pitfall 1 in docs/benchmarking.md) is what this replaces.
+pub fn run_paired(arms: &mut [Arm<'_>], warmup: usize, iters: usize, rounds: usize) -> Result<Paired, String> {
+    if iters == 0 || rounds == 0 {
+        return Err("an interleaved A/B needs BENCH_ITERS >= 1 and BENCH_ROUNDS >= 1".into());
+    }
+    for arm in arms.iter_mut() {
+        for _ in 0..warmup {
+            (arm.run)()?;
+        }
+    }
+    let mut per_round = vec![Vec::with_capacity(rounds); arms.len()];
+    for round in 0..rounds {
+        for i in round_order(round, arms.len()) {
+            let arm = &mut arms[i];
+            let mut samples = Vec::with_capacity(iters);
+            for _ in 0..iters {
+                let t0 = std::time::Instant::now();
+                (arm.run)()?;
+                samples.push(t0.elapsed().as_secs_f64() * 1e3 / arm.reps.max(1) as f64);
+            }
+            per_round[i].push(median(samples)?);
+        }
+    }
+    Ok(Paired {
+        names: arms.iter().map(|a| a.name.clone()).collect(),
+        rounds: per_round,
+    })
+}
+
+/// `base / arm` per round, then the median and range of those ratios
+/// (> 1: `arm` is faster). Rounds are paired by index.
+pub fn ratio_stats(base: &[f64], arm: &[f64]) -> Result<(f64, f64, f64), String> {
+    if base.len() != arm.len() {
+        return Err(format!(
+            "{} baseline rounds against {} arm rounds",
+            base.len(),
+            arm.len()
+        ));
+    }
+    let ratios: Vec<f64> = base.iter().zip(arm).map(|(b, a)| b / a).collect();
+    let lo = ratios.iter().copied().fold(f64::INFINITY, f64::min);
+    let hi = ratios.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+    Ok((median(ratios)?, lo, hi))
+}
+
+/// Largest over smallest of one arm's per-round medians, minus one: how far
+/// the arm moved against itself across the run.
+pub fn self_spread(rounds: &[f64]) -> f64 {
+    let lo = rounds.iter().copied().fold(f64::INFINITY, f64::min);
+    let hi = rounds.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+    hi / lo - 1.0
+}
+
+/// The guard docs/benchmarking.md (pitfall 2) quotes: a baseline that moved
+/// more than 10% against itself across the rounds of one shape.
+pub const SELF_SPREAD_LIMIT: f64 = 0.10;
+
+/// Print the kernels this process dispatched as one `KERNEL_TRACE a,b,...`
+/// line on stderr, for `bench/kernel_coverage.py`. Prints nothing when
+/// `TESSL_KERNEL_TRACE` is unset, so normal runs are unchanged.
+pub fn emit_kernel_trace() {
+    if tessl::runtime::kernel_trace_enabled() {
+        eprintln!("KERNEL_TRACE {}", tessl::runtime::traced_kernels().join(","));
+    }
+}
+
+/// Exit 3 when any shape's baseline broke [`SELF_SPREAD_LIMIT`]. Its lines
+/// were printed with the `EXCEEDS 10%` flag; the status keeps a script from
+/// reading the run as clean.
+pub fn exit_if_unstable(bin: &str, unstable: &[String]) {
+    if !unstable.is_empty() {
+        eprintln!(
+            "{bin}: the production baseline moved more than 10% across rounds at {} shape(s): {}; \
+             their ratios are not comparable",
+            unstable.len(),
+            unstable.join(", ")
+        );
+        std::process::exit(3);
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{median, parse_usize_env_value};
+    use super::{median, parse_usize_env_value, ratio_stats, round_order, run_paired, self_spread, Arm};
 
     #[test]
     fn median_rejects_empty_and_non_finite_samples() {
@@ -202,6 +335,56 @@ mod tests {
     fn median_handles_odd_and_even_sample_counts() {
         assert_eq!(median(vec![3.0, 1.0, 2.0]).unwrap(), 2.0);
         assert_eq!(median(vec![4.0, 1.0, 3.0, 2.0]).unwrap(), 2.5);
+    }
+
+    #[test]
+    fn round_order_alternates_and_covers_every_arm() {
+        assert_eq!(round_order(0, 3), vec![0, 1, 2]);
+        assert_eq!(round_order(1, 3), vec![2, 1, 0]);
+        assert_eq!(round_order(2, 3), vec![0, 1, 2]);
+        assert_eq!(round_order(5, 1), vec![0]);
+        assert!(round_order(0, 0).is_empty());
+    }
+
+    /// The rounds really interleave: with two arms and three rounds the
+    /// calls go A×iters, B×iters, B×iters, A×iters, A×iters, B×iters, after
+    /// each arm's warmup. A blocked rig (all of A, then all of B) fails here.
+    #[test]
+    fn run_paired_interleaves_arms_round_by_round() {
+        let log = std::cell::RefCell::new(Vec::new());
+        let mut arms = vec![
+            Arm {
+                name: "a".into(),
+                reps: 1,
+                run: Box::new(|| {
+                    log.borrow_mut().push('a');
+                    Ok(())
+                }),
+            },
+            Arm {
+                name: "b".into(),
+                reps: 1,
+                run: Box::new(|| {
+                    log.borrow_mut().push('b');
+                    Ok(())
+                }),
+            },
+        ];
+        let paired = run_paired(&mut arms, 1, 2, 3).unwrap();
+        drop(arms);
+        // Warmup "ab", then rounds "aabb", "bbaa", "aabb".
+        assert_eq!(log.into_inner().into_iter().collect::<String>(), "abaabbbbaaaabb");
+        assert_eq!(paired.names, vec!["a", "b"]);
+        assert!(paired.rounds.iter().all(|r| r.len() == 3));
+        assert!(run_paired(&mut [], 0, 0, 1).is_err());
+    }
+
+    #[test]
+    fn ratio_stats_pairs_rounds_by_index() {
+        let (med, lo, hi) = ratio_stats(&[2.0, 4.0, 3.0], &[1.0, 4.0, 1.0]).unwrap();
+        assert_eq!((med, lo, hi), (2.0, 1.0, 3.0));
+        assert!(ratio_stats(&[1.0], &[1.0, 2.0]).is_err());
+        assert!((self_spread(&[1.0, 1.2, 1.1]) - 0.2).abs() < 1e-12);
     }
 
     #[test]

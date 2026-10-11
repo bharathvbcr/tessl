@@ -1,3 +1,9 @@
+# Diagnosed 2026-10-11 (bench/results/f32_exact_mlp_up_gap_m5pro.txt): the
+# MLP up/gate anomaly below was the row-major tile walk re-reading a 50 MB B
+# per tile row; tile_walk's column panels (07f6990, after this run) closed
+# it with the same bits. This file's ratios come from the blocked tile-tune
+# rig of that date (one run).
+
 # Exact-f32 NN with a register accumulator vs production — M5 Pro, 2026-09-30
 #
 # Question: does a cooperative-destination (register-accumulator) exact-f32

@@ -113,7 +113,8 @@ The follow-ups measured and landed (`bench_gemm_tnnt_tune`, results in
 - **NT descriptor** (bf16, the dx lane every backward layer runs): coop
   128×64 sg4 wins everywhere — 2.00–2.03× at scale (nt_wide 13,596 → 27,136),
   +11–22% on the latency-bound dx shapes. Landed.
-- **Accumulate kernels** (opt-in `GEMM_ACCUM`/`ACCUM_DX` paths): coop
+- **Accumulate kernels** (then opt-in `GEMM_ACCUM`/`ACCUM_DX` paths; the
+  only path since those flags were retired on 2026-10-10): coop
   zero→run→load-add-store (the header's cooperative bias pattern, one C read
   + one C write) beats `multiply_accumulate` 1.38–1.49× at bandwidth-bound
   shapes, ties at the dispatch floor. Landed at 64×64 sg4.

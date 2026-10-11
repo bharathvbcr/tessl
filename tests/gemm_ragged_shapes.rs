@@ -25,7 +25,8 @@ use common::{
 };
 use tessl::gemm::{
     gemm_batched, gemm_epilogue, gemm_nt_bf16, gemm_nt_f32, gemm_nt_train, gemm_tn_accum_train, gemm_tn_bf16,
-    gemm_tn_f32, gemm_tn_splitk_par_f32, gemm_tn_train, Activation, BatchStrides, BatchedGemm, Epilogue,
+    gemm_tn_f32, gemm_tn_splitk_par_bf16, gemm_tn_splitk_par_f32, gemm_tn_train, Activation, BatchStrides, BatchedGemm,
+    Epilogue,
 };
 use tessl::{gemm, gemm_f32, GemmBackend, GpuRuntime, PrecisionMode, Tensor};
 
@@ -316,6 +317,59 @@ fn parallel_tn_partitions_cover_all_of_k() {
         check(13, 99, 600, Some(1024));
         check(13, 99, 600, Some(4));
         check(33, 77, 1000, Some(256));
+    });
+}
+
+/// The bf16 parallel split-K: every partition one cooperative 64x64 tile set
+/// into its own scratch slice, the slices summed in order. Rank-one B, so a
+/// partition skipped, repeated or read at the wrong offset misses the bound;
+/// operands are rounded to bf16 on the host, so the products are exact.
+#[test]
+fn parallel_bf16_tn_partitions_cover_all_of_k() {
+    with_gpu(|rt| {
+        if !rt.has_tensorops() {
+            return;
+        }
+        let check = |m: usize, n: usize, k: usize, k_tile: usize| {
+            let (a_host, b_host, _) = rank_one_b_case_tn(m, n, k, 0xb16a ^ (m * n + k) as u64);
+            let (a_host, b_host) = (round_trip_bf16(&a_host), round_trip_bf16(&b_host));
+            let expect = reference(Layout::Tn, &a_host, &b_host, m, n, k);
+            let a = tensor_bf16(rt, &[k, m], &a_host);
+            let b = tensor_bf16(rt, &[k, n], &b_host);
+            let c = rt.alloc_tensor_f32(&[m, n]).unwrap();
+            c.buffer.write_f32(&vec![f32::NAN; m * n]);
+            gemm_tn_splitk_par_bf16(&a, &b, &c, k_tile).unwrap();
+            rt.synchronize().unwrap();
+            assert_within_bound(
+                &format!("bf16 TN parallel split-K {m}x{n}x{k}, k_tile {k_tile}"),
+                &c.buffer.read_f32(),
+                &expect,
+                k,
+                0.0,
+            );
+        };
+        // The split-K-gated dW shapes (full 64x64 tiles), a ragged one with
+        // edge tiles both ways and a short last partition, one partition,
+        // 150 partitions of 4, and f32 operands rounded by the entry itself.
+        check(128, 128, 4096, 256);
+        check(128, 384, 4096, 512);
+        check(100, 300, 2500, 256);
+        check(13, 99, 600, 1024);
+        check(13, 99, 600, 4);
+        check(65, 130, 1000, 256);
+        let (a_host, b_host, _) = rank_one_b_case_tn(96, 80, 700, 0xb16b);
+        let (a_r, b_r) = (round_trip_bf16(&a_host), round_trip_bf16(&b_host));
+        let c = rt.alloc_tensor_f32(&[96, 80]).unwrap();
+        let (a, b) = (tensor_f32(rt, &[700, 96], &a_host), tensor_f32(rt, &[700, 80], &b_host));
+        gemm_tn_splitk_par_bf16(&a, &b, &c, 128).unwrap();
+        rt.synchronize().unwrap();
+        assert_within_bound(
+            "bf16 TN parallel split-K on f32 operands",
+            &c.buffer.read_f32(),
+            &reference(Layout::Tn, &a_r, &b_r, 96, 80, 700),
+            700,
+            0.0,
+        );
     });
 }
 

@@ -1,0 +1,719 @@
+# GEMM output bits across this branch's kernel commits (probe_gemm_bits)
+#
+# Machine: Apple M5 Pro, macOS 27.0.1, 2026-10-11 13:41-13:43 UTC.
+# Probe: src/bin/probe_gemm_bits.rs (FNV-1a of every production GEMM entry
+# point's output over a fixed shape grid and fixed inputs; 543 lines, of
+# which 48 are calls the API refuses, printed as ERR).
+# Command, per commit C (the probe copied into each tree, which predates it):
+#   git archive C | tar -x -C src_C && cp src/bin/probe_gemm_bits.rs src_C/src/bin/
+#   (cd src_C && cargo build --release --bin probe_gemm_bits) && probe_gemm_bits > snap_C.txt
+#   diff snap_d0b1792.txt snap_C.txt
+#
+# Question: the shared header (120f675), the INTERIOR retirement (667179c)
+# and the one panel-walk policy (5d4debb) claim to change no output bit;
+# the routing commit (d88345e) claims to change only the bf16 TN outputs it
+# reroutes and the f16 64x64 epilogue it adds.
+#
+# Result, against main (d0b1792):
+#   fe56994 (accumulate flags retired)       0 of 543 lines differ
+#   120f675 (kernels/gemm_coop.h)            0 of 543 lines differ
+#   667179c (TESSL_GEMM_INTERIOR retired)    0 of 543 lines differ
+#   5d4debb (coop NN on tile_walk)           0 of 543 lines differ
+#   d88345e (parallel bf16 split-K, tiles)  52 of 543 lines differ:
+#     48 epi_f16_narrow_* lines that were ERR ("the 64x64 tile is
+#        instantiated for bf16 operands only") and now hash an output;
+#     4  tn_bf16 / tn_acc_bf16 at 128x128x4096 and 128x384x4096, the two
+#        prefer_tn_splitk shapes in the grid, which the parallel split-K now
+#        sums in a different partition order (checked against an f64
+#        reference by parallel_bf16_tn_partitions_cover_all_of_k).
+#   Every other bf16 NN output is unchanged, including 512x768x3072 (48
+#   tiles), which d88345e moved from 128x64 to 64x64: the two tiles give the
+#   same bits there, as nn_bf16_wide and nn_bf16_narrow do at every shape.
+# The working tree after d88345e (later commits touch no kernel or route)
+# matches d88345e line for line. The same comparison was first run from a
+# scratch copy of this probe against the staged trees before each commit;
+# those snapshots equal these.
+#
+# Snapshot of main (d0b1792), identical for fe56994, 120f675, 667179c and
+# 5d4debb:
+  nn_f32_exact                 256x256x256 ddacbace9c260be5
+  nn_bf16                      256x256x256 3b29ca41f555aab5
+  nn_bf16_wide                 256x256x256 3b29ca41f555aab5
+  nn_bf16_narrow               256x256x256 3b29ca41f555aab5
+  nn_f16                       256x256x256 603367cb07d33636
+  nn_f16_narrow                256x256x256 603367cb07d33636
+  nn_acc_f32                   256x256x256 9d3bb9de533dea7a
+  nn_acc_bf16                  256x256x256 e66bf40e8439f58b
+  epi_bf16_wide_beta1          256x256x256 e66bf40e8439f58b
+  epi_bf16_wide_full           256x256x256 6d2791b1a9dc704e
+  epi_bf16_wide_silu           256x256x256 36ca800b1dfca52d
+  epi_bf16_wide_relu_a         256x256x256 cf1a2bcb01c9beea
+  epi_bf16_narrow_beta1        256x256x256 e66bf40e8439f58b
+  epi_bf16_narrow_full         256x256x256 6d2791b1a9dc704e
+  epi_bf16_narrow_silu         256x256x256 36ca800b1dfca52d
+  epi_bf16_narrow_relu_a       256x256x256 cf1a2bcb01c9beea
+  epi_bf16_auto_beta1          256x256x256 e66bf40e8439f58b
+  epi_bf16_auto_full           256x256x256 6d2791b1a9dc704e
+  epi_bf16_auto_silu           256x256x256 36ca800b1dfca52d
+  epi_bf16_auto_relu_a         256x256x256 cf1a2bcb01c9beea
+  epi_f16_wide_beta1           256x256x256 59cc3ebc63148dbc
+  epi_f16_wide_full            256x256x256 3d8fad47aa217c35
+  epi_f16_wide_silu            256x256x256 97a09f564d3665fd
+  epi_f16_wide_relu_a          256x256x256 cff749a2e586fd22
+  epi_f16_narrow_beta1         256x256x256 ERR GEMM epilogue: the 64x64 tile is instantiated for bf16 operands only
+  epi_f16_narrow_full          256x256x256 ERR GEMM epilogue: the 64x64 tile is instantiated for bf16 operands only
+  epi_f16_narrow_silu          256x256x256 ERR GEMM epilogue: the 64x64 tile is instantiated for bf16 operands only
+  epi_f16_narrow_relu_a        256x256x256 ERR GEMM epilogue: the 64x64 tile is instantiated for bf16 operands only
+  epi_f16_auto_beta1           256x256x256 59cc3ebc63148dbc
+  epi_f16_auto_full            256x256x256 3d8fad47aa217c35
+  epi_f16_auto_silu            256x256x256 97a09f564d3665fd
+  epi_f16_auto_relu_a          256x256x256 cff749a2e586fd22
+  nn_relaxed                   256x256x256 f8d56d5ec5ffd8e0
+  nn_relaxed_narrow            256x256x256 f8d56d5ec5ffd8e0
+  epi_relaxed_full             256x256x256 57ee3589972a46e8
+  nn_f32_exact                 200x72x96 6d62b6431e4c6034
+  nn_bf16                      200x72x96 fe0e901f7ef5b10c
+  nn_bf16_wide                 200x72x96 fe0e901f7ef5b10c
+  nn_bf16_narrow               200x72x96 fe0e901f7ef5b10c
+  nn_f16                       200x72x96 918734554071c6b3
+  nn_f16_narrow                200x72x96 918734554071c6b3
+  nn_acc_f32                   200x72x96 c263d1f5becf54de
+  nn_acc_bf16                  200x72x96 26c65715cc9f8fed
+  epi_bf16_wide_beta1          200x72x96 26c65715cc9f8fed
+  epi_bf16_wide_full           200x72x96 e1183e0004fe9c0b
+  epi_bf16_wide_silu           200x72x96 036b0dc7d21d9896
+  epi_bf16_wide_relu_a         200x72x96 593e5932f0007999
+  epi_bf16_narrow_beta1        200x72x96 26c65715cc9f8fed
+  epi_bf16_narrow_full         200x72x96 e1183e0004fe9c0b
+  epi_bf16_narrow_silu         200x72x96 036b0dc7d21d9896
+  epi_bf16_narrow_relu_a       200x72x96 593e5932f0007999
+  epi_bf16_auto_beta1          200x72x96 26c65715cc9f8fed
+  epi_bf16_auto_full           200x72x96 e1183e0004fe9c0b
+  epi_bf16_auto_silu           200x72x96 036b0dc7d21d9896
+  epi_bf16_auto_relu_a         200x72x96 593e5932f0007999
+  epi_f16_wide_beta1           200x72x96 cc753fde26de0386
+  epi_f16_wide_full            200x72x96 e8fb62c8ba6021b7
+  epi_f16_wide_silu            200x72x96 687641cc57f04c0e
+  epi_f16_wide_relu_a          200x72x96 ff9c036346782805
+  epi_f16_narrow_beta1         200x72x96 ERR GEMM epilogue: the 64x64 tile is instantiated for bf16 operands only
+  epi_f16_narrow_full          200x72x96 ERR GEMM epilogue: the 64x64 tile is instantiated for bf16 operands only
+  epi_f16_narrow_silu          200x72x96 ERR GEMM epilogue: the 64x64 tile is instantiated for bf16 operands only
+  epi_f16_narrow_relu_a        200x72x96 ERR GEMM epilogue: the 64x64 tile is instantiated for bf16 operands only
+  epi_f16_auto_beta1           200x72x96 cc753fde26de0386
+  epi_f16_auto_full            200x72x96 e8fb62c8ba6021b7
+  epi_f16_auto_silu            200x72x96 687641cc57f04c0e
+  epi_f16_auto_relu_a          200x72x96 ff9c036346782805
+  nn_relaxed                   200x72x96 c88daa76e91c7ef0
+  nn_relaxed_narrow            200x72x96 c88daa76e91c7ef0
+  epi_relaxed_full             200x72x96 7d878e41f4a2bbdd
+  nn_f32_exact                 61x2048x2048 1822beafc47eee56
+  nn_bf16                      61x2048x2048 25f43da7e8e38168
+  nn_bf16_wide                 61x2048x2048 25f43da7e8e38168
+  nn_bf16_narrow               61x2048x2048 25f43da7e8e38168
+  nn_f16                       61x2048x2048 bfe660824a6de1a2
+  nn_f16_narrow                61x2048x2048 bfe660824a6de1a2
+  nn_acc_f32                   61x2048x2048 57be08103f4b3e75
+  nn_acc_bf16                  61x2048x2048 bb6033b344f4c350
+  epi_bf16_wide_beta1          61x2048x2048 bb6033b344f4c350
+  epi_bf16_wide_full           61x2048x2048 3cd24463498b3375
+  epi_bf16_wide_silu           61x2048x2048 0d970d8d5dfb6ff9
+  epi_bf16_wide_relu_a         61x2048x2048 41b056b213ee4e1c
+  epi_bf16_narrow_beta1        61x2048x2048 bb6033b344f4c350
+  epi_bf16_narrow_full         61x2048x2048 3cd24463498b3375
+  epi_bf16_narrow_silu         61x2048x2048 0d970d8d5dfb6ff9
+  epi_bf16_narrow_relu_a       61x2048x2048 41b056b213ee4e1c
+  epi_bf16_auto_beta1          61x2048x2048 bb6033b344f4c350
+  epi_bf16_auto_full           61x2048x2048 3cd24463498b3375
+  epi_bf16_auto_silu           61x2048x2048 0d970d8d5dfb6ff9
+  epi_bf16_auto_relu_a         61x2048x2048 41b056b213ee4e1c
+  epi_f16_wide_beta1           61x2048x2048 8619c99064fa27b4
+  epi_f16_wide_full            61x2048x2048 2c8010200ffa2218
+  epi_f16_wide_silu            61x2048x2048 8a5ecc795e7334c3
+  epi_f16_wide_relu_a          61x2048x2048 e05f3c51bd80d325
+  epi_f16_narrow_beta1         61x2048x2048 ERR GEMM epilogue: the 64x64 tile is instantiated for bf16 operands only
+  epi_f16_narrow_full          61x2048x2048 ERR GEMM epilogue: the 64x64 tile is instantiated for bf16 operands only
+  epi_f16_narrow_silu          61x2048x2048 ERR GEMM epilogue: the 64x64 tile is instantiated for bf16 operands only
+  epi_f16_narrow_relu_a        61x2048x2048 ERR GEMM epilogue: the 64x64 tile is instantiated for bf16 operands only
+  epi_f16_auto_beta1           61x2048x2048 8619c99064fa27b4
+  epi_f16_auto_full            61x2048x2048 2c8010200ffa2218
+  epi_f16_auto_silu            61x2048x2048 8a5ecc795e7334c3
+  epi_f16_auto_relu_a          61x2048x2048 e05f3c51bd80d325
+  nn_relaxed                   61x2048x2048 6198de090463568e
+  nn_relaxed_narrow            61x2048x2048 6198de090463568e
+  epi_relaxed_full             61x2048x2048 9b80c01e1763b4e6
+  nn_f32_exact                 128x512x128 660290e9860ff526
+  nn_bf16                      128x512x128 a88633540635bee2
+  nn_bf16_wide                 128x512x128 a88633540635bee2
+  nn_bf16_narrow               128x512x128 a88633540635bee2
+  nn_f16                       128x512x128 d85d2a0277749f92
+  nn_f16_narrow                128x512x128 d85d2a0277749f92
+  nn_acc_f32                   128x512x128 14ea6c287b6f6b8a
+  nn_acc_bf16                  128x512x128 83e39fdf29572dfb
+  epi_bf16_wide_beta1          128x512x128 83e39fdf29572dfb
+  epi_bf16_wide_full           128x512x128 f637bad3ba79c769
+  epi_bf16_wide_silu           128x512x128 62f6474f7ce773fe
+  epi_bf16_wide_relu_a         128x512x128 89fc9dfbbd6d86df
+  epi_bf16_narrow_beta1        128x512x128 83e39fdf29572dfb
+  epi_bf16_narrow_full         128x512x128 f637bad3ba79c769
+  epi_bf16_narrow_silu         128x512x128 62f6474f7ce773fe
+  epi_bf16_narrow_relu_a       128x512x128 89fc9dfbbd6d86df
+  epi_bf16_auto_beta1          128x512x128 83e39fdf29572dfb
+  epi_bf16_auto_full           128x512x128 f637bad3ba79c769
+  epi_bf16_auto_silu           128x512x128 62f6474f7ce773fe
+  epi_bf16_auto_relu_a         128x512x128 89fc9dfbbd6d86df
+  epi_f16_wide_beta1           128x512x128 f2edca1450f79139
+  epi_f16_wide_full            128x512x128 d5b12c5f0d1dd444
+  epi_f16_wide_silu            128x512x128 48eea940b01f14d2
+  epi_f16_wide_relu_a          128x512x128 bb8e2dffbcaf2a18
+  epi_f16_narrow_beta1         128x512x128 ERR GEMM epilogue: the 64x64 tile is instantiated for bf16 operands only
+  epi_f16_narrow_full          128x512x128 ERR GEMM epilogue: the 64x64 tile is instantiated for bf16 operands only
+  epi_f16_narrow_silu          128x512x128 ERR GEMM epilogue: the 64x64 tile is instantiated for bf16 operands only
+  epi_f16_narrow_relu_a        128x512x128 ERR GEMM epilogue: the 64x64 tile is instantiated for bf16 operands only
+  epi_f16_auto_beta1           128x512x128 f2edca1450f79139
+  epi_f16_auto_full            128x512x128 d5b12c5f0d1dd444
+  epi_f16_auto_silu            128x512x128 48eea940b01f14d2
+  epi_f16_auto_relu_a          128x512x128 bb8e2dffbcaf2a18
+  nn_relaxed                   128x512x128 1f4ee7df110d3c09
+  nn_relaxed_narrow            128x512x128 1f4ee7df110d3c09
+  epi_relaxed_full             128x512x128 31eaf95ddf66024f
+  nn_f32_exact                 130x97x70 8db107db16a9b240
+  nn_bf16                      130x97x70 5aa131ec31970b67
+  nn_bf16_wide                 130x97x70 5aa131ec31970b67
+  nn_bf16_narrow               130x97x70 5aa131ec31970b67
+  nn_f16                       130x97x70 8694555054426a15
+  nn_f16_narrow                130x97x70 8694555054426a15
+  nn_acc_f32                   130x97x70 2cfad1e8dac6d8a1
+  nn_acc_bf16                  130x97x70 1dea6138e83b39dc
+  epi_bf16_wide_beta1          130x97x70 1dea6138e83b39dc
+  epi_bf16_wide_full           130x97x70 4457fe6e435295b3
+  epi_bf16_wide_silu           130x97x70 f94ce58f1358f439
+  epi_bf16_wide_relu_a         130x97x70 372612afec798044
+  epi_bf16_narrow_beta1        130x97x70 1dea6138e83b39dc
+  epi_bf16_narrow_full         130x97x70 4457fe6e435295b3
+  epi_bf16_narrow_silu         130x97x70 f94ce58f1358f439
+  epi_bf16_narrow_relu_a       130x97x70 372612afec798044
+  epi_bf16_auto_beta1          130x97x70 1dea6138e83b39dc
+  epi_bf16_auto_full           130x97x70 4457fe6e435295b3
+  epi_bf16_auto_silu           130x97x70 f94ce58f1358f439
+  epi_bf16_auto_relu_a         130x97x70 372612afec798044
+  epi_f16_wide_beta1           130x97x70 1d928dadafb6cb08
+  epi_f16_wide_full            130x97x70 747c566ef962b829
+  epi_f16_wide_silu            130x97x70 3ea55198e0b8e89c
+  epi_f16_wide_relu_a          130x97x70 faf9626649173e02
+  epi_f16_narrow_beta1         130x97x70 ERR GEMM epilogue: the 64x64 tile is instantiated for bf16 operands only
+  epi_f16_narrow_full          130x97x70 ERR GEMM epilogue: the 64x64 tile is instantiated for bf16 operands only
+  epi_f16_narrow_silu          130x97x70 ERR GEMM epilogue: the 64x64 tile is instantiated for bf16 operands only
+  epi_f16_narrow_relu_a        130x97x70 ERR GEMM epilogue: the 64x64 tile is instantiated for bf16 operands only
+  epi_f16_auto_beta1           130x97x70 1d928dadafb6cb08
+  epi_f16_auto_full            130x97x70 747c566ef962b829
+  epi_f16_auto_silu            130x97x70 3ea55198e0b8e89c
+  epi_f16_auto_relu_a          130x97x70 faf9626649173e02
+  nn_relaxed                   130x97x70 cbf20c28f873b405
+  nn_relaxed_narrow            130x97x70 cbf20c28f873b405
+  epi_relaxed_full             130x97x70 21289332518bcc2e
+  nn_f32_exact                 512x16384x512 3b3668e6a5f1344e
+  nn_bf16                      512x16384x512 c2e7e442535951b2
+  nn_bf16_wide                 512x16384x512 c2e7e442535951b2
+  nn_bf16_narrow               512x16384x512 c2e7e442535951b2
+  nn_f16                       512x16384x512 5aa306d932394670
+  nn_f16_narrow                512x16384x512 5aa306d932394670
+  nn_acc_f32                   512x16384x512 0454f6dfdf1d26cf
+  nn_acc_bf16                  512x16384x512 69066abd792eb252
+  epi_bf16_wide_beta1          512x16384x512 69066abd792eb252
+  epi_bf16_wide_full           512x16384x512 54141ded4110ae8d
+  epi_bf16_wide_silu           512x16384x512 3c5a3441ae29b4de
+  epi_bf16_wide_relu_a         512x16384x512 2234975f96d7495e
+  epi_bf16_narrow_beta1        512x16384x512 69066abd792eb252
+  epi_bf16_narrow_full         512x16384x512 54141ded4110ae8d
+  epi_bf16_narrow_silu         512x16384x512 3c5a3441ae29b4de
+  epi_bf16_narrow_relu_a       512x16384x512 2234975f96d7495e
+  epi_bf16_auto_beta1          512x16384x512 69066abd792eb252
+  epi_bf16_auto_full           512x16384x512 54141ded4110ae8d
+  epi_bf16_auto_silu           512x16384x512 3c5a3441ae29b4de
+  epi_bf16_auto_relu_a         512x16384x512 2234975f96d7495e
+  epi_f16_wide_beta1           512x16384x512 5c5b7fb22f9e2964
+  epi_f16_wide_full            512x16384x512 2fe0f99141cf9e21
+  epi_f16_wide_silu            512x16384x512 23b3ef1bd6c2534f
+  epi_f16_wide_relu_a          512x16384x512 50734891e5032966
+  epi_f16_narrow_beta1         512x16384x512 ERR GEMM epilogue: the 64x64 tile is instantiated for bf16 operands only
+  epi_f16_narrow_full          512x16384x512 ERR GEMM epilogue: the 64x64 tile is instantiated for bf16 operands only
+  epi_f16_narrow_silu          512x16384x512 ERR GEMM epilogue: the 64x64 tile is instantiated for bf16 operands only
+  epi_f16_narrow_relu_a        512x16384x512 ERR GEMM epilogue: the 64x64 tile is instantiated for bf16 operands only
+  epi_f16_auto_beta1           512x16384x512 5c5b7fb22f9e2964
+  epi_f16_auto_full            512x16384x512 2fe0f99141cf9e21
+  epi_f16_auto_silu            512x16384x512 23b3ef1bd6c2534f
+  epi_f16_auto_relu_a          512x16384x512 50734891e5032966
+  nn_relaxed                   512x16384x512 9d4ca9475b58b691
+  nn_relaxed_narrow            512x16384x512 9d4ca9475b58b691
+  epi_relaxed_full             512x16384x512 7c0226ea6aa0f50a
+  nn_f32_exact                 4096x4096x256 b23beecb321964d6
+  nn_bf16                      4096x4096x256 17b4d123af1ea3ae
+  nn_bf16_wide                 4096x4096x256 17b4d123af1ea3ae
+  nn_bf16_narrow               4096x4096x256 17b4d123af1ea3ae
+  nn_f16                       4096x4096x256 2fb8c80bf9a7d207
+  nn_f16_narrow                4096x4096x256 2fb8c80bf9a7d207
+  nn_acc_f32                   4096x4096x256 2b33a4c564dccc3f
+  nn_acc_bf16                  4096x4096x256 1f17735333313a60
+  epi_bf16_wide_beta1          4096x4096x256 1f17735333313a60
+  epi_bf16_wide_full           4096x4096x256 cd3f11d656a563fe
+  epi_bf16_wide_silu           4096x4096x256 e60ed353c4d850b3
+  epi_bf16_wide_relu_a         4096x4096x256 4c746b528d96040e
+  epi_bf16_narrow_beta1        4096x4096x256 1f17735333313a60
+  epi_bf16_narrow_full         4096x4096x256 cd3f11d656a563fe
+  epi_bf16_narrow_silu         4096x4096x256 e60ed353c4d850b3
+  epi_bf16_narrow_relu_a       4096x4096x256 4c746b528d96040e
+  epi_bf16_auto_beta1          4096x4096x256 1f17735333313a60
+  epi_bf16_auto_full           4096x4096x256 cd3f11d656a563fe
+  epi_bf16_auto_silu           4096x4096x256 e60ed353c4d850b3
+  epi_bf16_auto_relu_a         4096x4096x256 4c746b528d96040e
+  epi_f16_wide_beta1           4096x4096x256 a7bdc5a7e1f37f8a
+  epi_f16_wide_full            4096x4096x256 10f13dd0f27fb7ad
+  epi_f16_wide_silu            4096x4096x256 021160a416a15b0f
+  epi_f16_wide_relu_a          4096x4096x256 335eba043540427d
+  epi_f16_narrow_beta1         4096x4096x256 ERR GEMM epilogue: the 64x64 tile is instantiated for bf16 operands only
+  epi_f16_narrow_full          4096x4096x256 ERR GEMM epilogue: the 64x64 tile is instantiated for bf16 operands only
+  epi_f16_narrow_silu          4096x4096x256 ERR GEMM epilogue: the 64x64 tile is instantiated for bf16 operands only
+  epi_f16_narrow_relu_a        4096x4096x256 ERR GEMM epilogue: the 64x64 tile is instantiated for bf16 operands only
+  epi_f16_auto_beta1           4096x4096x256 a7bdc5a7e1f37f8a
+  epi_f16_auto_full            4096x4096x256 10f13dd0f27fb7ad
+  epi_f16_auto_silu            4096x4096x256 021160a416a15b0f
+  epi_f16_auto_relu_a          4096x4096x256 335eba043540427d
+  nn_relaxed                   4096x4096x256 438f38c28f17fcce
+  nn_relaxed_narrow            4096x4096x256 438f38c28f17fcce
+  epi_relaxed_full             4096x4096x256 89fbfa9fcc6a43e7
+  nn_f32_exact                 2048x1024x64 6703138d419fedde
+  nn_bf16                      2048x1024x64 2e454e21a74b207b
+  nn_bf16_wide                 2048x1024x64 2e454e21a74b207b
+  nn_bf16_narrow               2048x1024x64 2e454e21a74b207b
+  nn_f16                       2048x1024x64 9ff83bdd4587adf8
+  nn_f16_narrow                2048x1024x64 9ff83bdd4587adf8
+  nn_acc_f32                   2048x1024x64 e238f8d035dd7af8
+  nn_acc_bf16                  2048x1024x64 496b3cc3a5ccfef8
+  epi_bf16_wide_beta1          2048x1024x64 496b3cc3a5ccfef8
+  epi_bf16_wide_full           2048x1024x64 9833423cfee34464
+  epi_bf16_wide_silu           2048x1024x64 6b47904d70fc9e70
+  epi_bf16_wide_relu_a         2048x1024x64 0e7a4a993a915d0a
+  epi_bf16_narrow_beta1        2048x1024x64 496b3cc3a5ccfef8
+  epi_bf16_narrow_full         2048x1024x64 9833423cfee34464
+  epi_bf16_narrow_silu         2048x1024x64 6b47904d70fc9e70
+  epi_bf16_narrow_relu_a       2048x1024x64 0e7a4a993a915d0a
+  epi_bf16_auto_beta1          2048x1024x64 496b3cc3a5ccfef8
+  epi_bf16_auto_full           2048x1024x64 9833423cfee34464
+  epi_bf16_auto_silu           2048x1024x64 6b47904d70fc9e70
+  epi_bf16_auto_relu_a         2048x1024x64 0e7a4a993a915d0a
+  epi_f16_wide_beta1           2048x1024x64 d56c5dcf1c0169e3
+  epi_f16_wide_full            2048x1024x64 215e177c7ec01fd1
+  epi_f16_wide_silu            2048x1024x64 4d16bddf7c93d62a
+  epi_f16_wide_relu_a          2048x1024x64 4b07db565b6c6180
+  epi_f16_narrow_beta1         2048x1024x64 ERR GEMM epilogue: the 64x64 tile is instantiated for bf16 operands only
+  epi_f16_narrow_full          2048x1024x64 ERR GEMM epilogue: the 64x64 tile is instantiated for bf16 operands only
+  epi_f16_narrow_silu          2048x1024x64 ERR GEMM epilogue: the 64x64 tile is instantiated for bf16 operands only
+  epi_f16_narrow_relu_a        2048x1024x64 ERR GEMM epilogue: the 64x64 tile is instantiated for bf16 operands only
+  epi_f16_auto_beta1           2048x1024x64 d56c5dcf1c0169e3
+  epi_f16_auto_full            2048x1024x64 215e177c7ec01fd1
+  epi_f16_auto_silu            2048x1024x64 4d16bddf7c93d62a
+  epi_f16_auto_relu_a          2048x1024x64 4b07db565b6c6180
+  nn_relaxed                   2048x1024x64 ba82ce7a68a7c9e5
+  nn_relaxed_narrow            2048x1024x64 ba82ce7a68a7c9e5
+  epi_relaxed_full             2048x1024x64 aba247657b967526
+  nn_f32_exact                 1024x1024x4096 df4ff36fe389e368
+  nn_bf16                      1024x1024x4096 f18e8782315b10c6
+  nn_bf16_wide                 1024x1024x4096 f18e8782315b10c6
+  nn_bf16_narrow               1024x1024x4096 f18e8782315b10c6
+  nn_f16                       1024x1024x4096 14259e08d3d6d441
+  nn_f16_narrow                1024x1024x4096 14259e08d3d6d441
+  nn_acc_f32                   1024x1024x4096 b2ed4af6ad166fb4
+  nn_acc_bf16                  1024x1024x4096 6e550d4aa4a3f442
+  epi_bf16_wide_beta1          1024x1024x4096 6e550d4aa4a3f442
+  epi_bf16_wide_full           1024x1024x4096 6fc2934e47caa49a
+  epi_bf16_wide_silu           1024x1024x4096 f7d97fb22f45e5a9
+  epi_bf16_wide_relu_a         1024x1024x4096 b81d5bb3c4200954
+  epi_bf16_narrow_beta1        1024x1024x4096 6e550d4aa4a3f442
+  epi_bf16_narrow_full         1024x1024x4096 6fc2934e47caa49a
+  epi_bf16_narrow_silu         1024x1024x4096 f7d97fb22f45e5a9
+  epi_bf16_narrow_relu_a       1024x1024x4096 b81d5bb3c4200954
+  epi_bf16_auto_beta1          1024x1024x4096 6e550d4aa4a3f442
+  epi_bf16_auto_full           1024x1024x4096 6fc2934e47caa49a
+  epi_bf16_auto_silu           1024x1024x4096 f7d97fb22f45e5a9
+  epi_bf16_auto_relu_a         1024x1024x4096 b81d5bb3c4200954
+  epi_f16_wide_beta1           1024x1024x4096 895e928de41cd9a0
+  epi_f16_wide_full            1024x1024x4096 4a2f92780e3c3b61
+  epi_f16_wide_silu            1024x1024x4096 149d64c8da4c16bc
+  epi_f16_wide_relu_a          1024x1024x4096 69e23cfb2139623b
+  epi_f16_narrow_beta1         1024x1024x4096 ERR GEMM epilogue: the 64x64 tile is instantiated for bf16 operands only
+  epi_f16_narrow_full          1024x1024x4096 ERR GEMM epilogue: the 64x64 tile is instantiated for bf16 operands only
+  epi_f16_narrow_silu          1024x1024x4096 ERR GEMM epilogue: the 64x64 tile is instantiated for bf16 operands only
+  epi_f16_narrow_relu_a        1024x1024x4096 ERR GEMM epilogue: the 64x64 tile is instantiated for bf16 operands only
+  epi_f16_auto_beta1           1024x1024x4096 895e928de41cd9a0
+  epi_f16_auto_full            1024x1024x4096 4a2f92780e3c3b61
+  epi_f16_auto_silu            1024x1024x4096 149d64c8da4c16bc
+  epi_f16_auto_relu_a          1024x1024x4096 69e23cfb2139623b
+  nn_relaxed                   1024x1024x4096 8801b66076bf0ea5
+  nn_relaxed_narrow            1024x1024x4096 8801b66076bf0ea5
+  epi_relaxed_full             1024x1024x4096 6db8f9fd2b606632
+  nn_f32_exact                 61x640x256 1496f4d23f2e6e49
+  nn_bf16                      61x640x256 a16eeb221a86430b
+  nn_bf16_wide                 61x640x256 a16eeb221a86430b
+  nn_bf16_narrow               61x640x256 a16eeb221a86430b
+  nn_f16                       61x640x256 64db4d347800449b
+  nn_f16_narrow                61x640x256 64db4d347800449b
+  nn_acc_f32                   61x640x256 5f2ea87115eed442
+  nn_acc_bf16                  61x640x256 9eb880aabc8bcec2
+  epi_bf16_wide_beta1          61x640x256 9eb880aabc8bcec2
+  epi_bf16_wide_full           61x640x256 9a63bf0caa55a267
+  epi_bf16_wide_silu           61x640x256 7f6326597edac709
+  epi_bf16_wide_relu_a         61x640x256 caab94ecb7ce5e9c
+  epi_bf16_narrow_beta1        61x640x256 9eb880aabc8bcec2
+  epi_bf16_narrow_full         61x640x256 9a63bf0caa55a267
+  epi_bf16_narrow_silu         61x640x256 7f6326597edac709
+  epi_bf16_narrow_relu_a       61x640x256 caab94ecb7ce5e9c
+  epi_bf16_auto_beta1          61x640x256 9eb880aabc8bcec2
+  epi_bf16_auto_full           61x640x256 9a63bf0caa55a267
+  epi_bf16_auto_silu           61x640x256 7f6326597edac709
+  epi_bf16_auto_relu_a         61x640x256 caab94ecb7ce5e9c
+  epi_f16_wide_beta1           61x640x256 7e0f313c1ae45662
+  epi_f16_wide_full            61x640x256 c817d8c87c9669ae
+  epi_f16_wide_silu            61x640x256 9e5af85d5e4528d9
+  epi_f16_wide_relu_a          61x640x256 8c0c89d93015c3b1
+  epi_f16_narrow_beta1         61x640x256 ERR GEMM epilogue: the 64x64 tile is instantiated for bf16 operands only
+  epi_f16_narrow_full          61x640x256 ERR GEMM epilogue: the 64x64 tile is instantiated for bf16 operands only
+  epi_f16_narrow_silu          61x640x256 ERR GEMM epilogue: the 64x64 tile is instantiated for bf16 operands only
+  epi_f16_narrow_relu_a        61x640x256 ERR GEMM epilogue: the 64x64 tile is instantiated for bf16 operands only
+  epi_f16_auto_beta1           61x640x256 7e0f313c1ae45662
+  epi_f16_auto_full            61x640x256 c817d8c87c9669ae
+  epi_f16_auto_silu            61x640x256 9e5af85d5e4528d9
+  epi_f16_auto_relu_a          61x640x256 8c0c89d93015c3b1
+  nn_relaxed                   61x640x256 be3655415b544c78
+  nn_relaxed_narrow            61x640x256 be3655415b544c78
+  epi_relaxed_full             61x640x256 f8a317c71173b42b
+  nn_f32_exact                 2048x6144x2048 69bb9858136ac2f1
+  nn_bf16                      2048x6144x2048 b793b58e10fb4b85
+  nn_bf16_wide                 2048x6144x2048 b793b58e10fb4b85
+  nn_bf16_narrow               2048x6144x2048 b793b58e10fb4b85
+  nn_f16                       2048x6144x2048 880f9e56dcfa7e34
+  nn_f16_narrow                2048x6144x2048 880f9e56dcfa7e34
+  nn_acc_f32                   2048x6144x2048 75c2a23cb4205c49
+  nn_acc_bf16                  2048x6144x2048 f57bff62250516d4
+  epi_bf16_wide_beta1          2048x6144x2048 f57bff62250516d4
+  epi_bf16_wide_full           2048x6144x2048 c1b6b4bc27b200b0
+  epi_bf16_wide_silu           2048x6144x2048 fe9de606352046ac
+  epi_bf16_wide_relu_a         2048x6144x2048 c61dcf0927bc2eef
+  epi_bf16_narrow_beta1        2048x6144x2048 f57bff62250516d4
+  epi_bf16_narrow_full         2048x6144x2048 c1b6b4bc27b200b0
+  epi_bf16_narrow_silu         2048x6144x2048 fe9de606352046ac
+  epi_bf16_narrow_relu_a       2048x6144x2048 c61dcf0927bc2eef
+  epi_bf16_auto_beta1          2048x6144x2048 f57bff62250516d4
+  epi_bf16_auto_full           2048x6144x2048 c1b6b4bc27b200b0
+  epi_bf16_auto_silu           2048x6144x2048 fe9de606352046ac
+  epi_bf16_auto_relu_a         2048x6144x2048 c61dcf0927bc2eef
+  epi_f16_wide_beta1           2048x6144x2048 e3997c193e6f4dad
+  epi_f16_wide_full            2048x6144x2048 ea735f1d8a8e5dd0
+  epi_f16_wide_silu            2048x6144x2048 a3d368c3f505287c
+  epi_f16_wide_relu_a          2048x6144x2048 6f070c7604eea7a2
+  epi_f16_narrow_beta1         2048x6144x2048 ERR GEMM epilogue: the 64x64 tile is instantiated for bf16 operands only
+  epi_f16_narrow_full          2048x6144x2048 ERR GEMM epilogue: the 64x64 tile is instantiated for bf16 operands only
+  epi_f16_narrow_silu          2048x6144x2048 ERR GEMM epilogue: the 64x64 tile is instantiated for bf16 operands only
+  epi_f16_narrow_relu_a        2048x6144x2048 ERR GEMM epilogue: the 64x64 tile is instantiated for bf16 operands only
+  epi_f16_auto_beta1           2048x6144x2048 e3997c193e6f4dad
+  epi_f16_auto_full            2048x6144x2048 ea735f1d8a8e5dd0
+  epi_f16_auto_silu            2048x6144x2048 a3d368c3f505287c
+  epi_f16_auto_relu_a          2048x6144x2048 6f070c7604eea7a2
+  nn_relaxed                   2048x6144x2048 30e265fca5c65b0e
+  nn_relaxed_narrow            2048x6144x2048 30e265fca5c65b0e
+  epi_relaxed_full             2048x6144x2048 298f833c0e1dbc88
+  nn_f32_exact                 512x768x3072 d17fe5c75c4c22f7
+  nn_bf16                      512x768x3072 0c0cdb394c8a56fc
+  nn_bf16_wide                 512x768x3072 0c0cdb394c8a56fc
+  nn_bf16_narrow               512x768x3072 0c0cdb394c8a56fc
+  nn_f16                       512x768x3072 daa569e91cf6b606
+  nn_f16_narrow                512x768x3072 daa569e91cf6b606
+  nn_acc_f32                   512x768x3072 8db7e4b6b0df81fe
+  nn_acc_bf16                  512x768x3072 02baf4e38fc94fa4
+  epi_bf16_wide_beta1          512x768x3072 02baf4e38fc94fa4
+  epi_bf16_wide_full           512x768x3072 30a64c3756324b99
+  epi_bf16_wide_silu           512x768x3072 9d786ae5b910af9f
+  epi_bf16_wide_relu_a         512x768x3072 0f7c27e2c5769b36
+  epi_bf16_narrow_beta1        512x768x3072 02baf4e38fc94fa4
+  epi_bf16_narrow_full         512x768x3072 30a64c3756324b99
+  epi_bf16_narrow_silu         512x768x3072 9d786ae5b910af9f
+  epi_bf16_narrow_relu_a       512x768x3072 0f7c27e2c5769b36
+  epi_bf16_auto_beta1          512x768x3072 02baf4e38fc94fa4
+  epi_bf16_auto_full           512x768x3072 30a64c3756324b99
+  epi_bf16_auto_silu           512x768x3072 9d786ae5b910af9f
+  epi_bf16_auto_relu_a         512x768x3072 0f7c27e2c5769b36
+  epi_f16_wide_beta1           512x768x3072 232a23ad593f7d72
+  epi_f16_wide_full            512x768x3072 ebb3e1ea2f6be692
+  epi_f16_wide_silu            512x768x3072 87e9cf092afa603d
+  epi_f16_wide_relu_a          512x768x3072 58ad25f5e783694e
+  epi_f16_narrow_beta1         512x768x3072 ERR GEMM epilogue: the 64x64 tile is instantiated for bf16 operands only
+  epi_f16_narrow_full          512x768x3072 ERR GEMM epilogue: the 64x64 tile is instantiated for bf16 operands only
+  epi_f16_narrow_silu          512x768x3072 ERR GEMM epilogue: the 64x64 tile is instantiated for bf16 operands only
+  epi_f16_narrow_relu_a        512x768x3072 ERR GEMM epilogue: the 64x64 tile is instantiated for bf16 operands only
+  epi_f16_auto_beta1           512x768x3072 232a23ad593f7d72
+  epi_f16_auto_full            512x768x3072 ebb3e1ea2f6be692
+  epi_f16_auto_silu            512x768x3072 87e9cf092afa603d
+  epi_f16_auto_relu_a          512x768x3072 58ad25f5e783694e
+  nn_relaxed                   512x768x3072 8eb1aa3051777b6e
+  nn_relaxed_narrow            512x768x3072 8eb1aa3051777b6e
+  epi_relaxed_full             512x768x3072 74963b591175a0c9
+  batched_bf16_contig          64x64x192 755374b504a5d977
+  batched_f16_contig           64x64x192 573679d7e61d00f9
+  batched_relaxed_contig       64x64x192 0535748a5ee3d421
+  batched_bf16_shared_b        64x64x192 755374b504a5d977
+  batched_f16_shared_b         64x64x192 573679d7e61d00f9
+  batched_relaxed_shared_b     64x64x192 0535748a5ee3d421
+  batched_last_full            64x64x64x3 8225caf7417c363b
+  batched_bf16_contig          200x72x288 15cd9db69117c1f2
+  batched_f16_contig           200x72x288 d022b217177a9a61
+  batched_relaxed_contig       200x72x288 eaffc25ca55d3d8f
+  batched_bf16_shared_b        200x72x288 15cd9db69117c1f2
+  batched_f16_shared_b         200x72x288 d022b217177a9a61
+  batched_relaxed_shared_b     200x72x288 eaffc25ca55d3d8f
+  batched_last_full            200x72x96x3 abc97c684482ecfa
+  batched_bf16_contig          61x640x512 32cfd86ef844c41d
+  batched_f16_contig           61x640x512 e477841638f08bf8
+  batched_relaxed_contig       61x640x512 20d37682d26e7a46
+  batched_bf16_shared_b        61x640x512 32cfd86ef844c41d
+  batched_f16_shared_b         61x640x512 e477841638f08bf8
+  batched_relaxed_shared_b     61x640x512 20d37682d26e7a46
+  batched_last_full            61x640x256x2 945e878e5e934731
+  batched_bf16_contig          256x1024x512 a1dd7b2674417a4c
+  batched_f16_contig           256x1024x512 91ba0d1e2a4f1d52
+  batched_relaxed_contig       256x1024x512 a4431a0979aa3869
+  batched_bf16_shared_b        256x1024x512 a1dd7b2674417a4c
+  batched_f16_shared_b         256x1024x512 91ba0d1e2a4f1d52
+  batched_relaxed_shared_b     256x1024x512 a4431a0979aa3869
+  batched_last_full            256x1024x128x4 837d74e3eb1dbb0d
+  tn_f32                       256x256x256 c41312da25f1e310
+  nt_f32                       256x256x256 6653fafb7098a070
+  tn_bf16                      256x256x256 08564924eb25ad4a
+  nt_bf16                      256x256x256 45c7d5905198f5c8
+  tn_acc_f32                   256x256x256 d8cea045dd83abe9
+  nt_acc_f32                   256x256x256 b728729fb88aa783
+  tn_acc_bf16                  256x256x256 3d4778f17e44a3c7
+  nt_acc_bf16                  256x256x256 cc033b3005e80c34
+  tn_splitk_par_f32_512        256x256x256 c41312da25f1e310
+  tn_f32                       200x72x96 6fd543169858fc19
+  nt_f32                       200x72x96 14f0d5a0bbc28fde
+  tn_bf16                      200x72x96 fc7d62a49b5b1996
+  nt_bf16                      200x72x96 6d3b03394b51fca8
+  tn_acc_f32                   200x72x96 7880e6e801c7d627
+  nt_acc_f32                   200x72x96 2414306d29c2c69f
+  tn_acc_bf16                  200x72x96 7ce79d926f39c5a1
+  nt_acc_bf16                  200x72x96 79b2fda5e483a62b
+  tn_splitk_par_f32_512        200x72x96 6fd543169858fc19
+  tn_f32                       130x97x70 328e709a430b9244
+  nt_f32                       130x97x70 06677a942750db64
+  tn_bf16                      130x97x70 428eb459d05bc269
+  nt_bf16                      130x97x70 ac52362269682bf6
+  tn_acc_f32                   130x97x70 2923a47df04f1a85
+  nt_acc_f32                   130x97x70 c678bc541cb8213b
+  tn_acc_bf16                  130x97x70 55b58de4094e02eb
+  nt_acc_bf16                  130x97x70 f920d8a8f9836d87
+  tn_splitk_par_f32_512        130x97x70 328e709a430b9244
+  tn_f32                       128x384x4096 d8a1b80762e8ca3d
+  nt_f32                       128x384x4096 e08a62fae7c604e9
+  tn_bf16                      128x384x4096 110ad337d72f780e
+  nt_bf16                      128x384x4096 a8d1d90bae613562
+  tn_acc_f32                   128x384x4096 0ada98ded300b93f
+  nt_acc_f32                   128x384x4096 7983194de36ece19
+  tn_acc_bf16                  128x384x4096 65887e1bafb8cd7b
+  nt_acc_bf16                  128x384x4096 33031be92f56ddee
+  tn_splitk_par_f32_512        128x384x4096 c7c6448b1edb5404
+  tn_f32                       128x128x4096 2f5ed46d5139e483
+  nt_f32                       128x128x4096 276dd5bbceee58f8
+  tn_bf16                      128x128x4096 503a5ae9c86656be
+  nt_bf16                      128x128x4096 b6560bf827505158
+  tn_acc_f32                   128x128x4096 1f8404124c6394cd
+  nt_acc_f32                   128x128x4096 c744de2e1cfd8e35
+  tn_acc_bf16                  128x128x4096 9715cc3a6495d35e
+  nt_acc_bf16                  128x128x4096 f75d66f07454b1c5
+  tn_splitk_par_f32_512        128x128x4096 ff684c32c8081b5f
+  tn_f32                       12x768x4096 9bd73d5331e62e97
+  nt_f32                       12x768x4096 83dc7ad419a0ca82
+  tn_bf16                      12x768x4096 099485b9d0ca4a7c
+  nt_bf16                      12x768x4096 765123a618658ada
+  tn_acc_f32                   12x768x4096 d28e2a758c2787af
+  nt_acc_f32                   12x768x4096 d2fbe89635bbe744
+  tn_acc_bf16                  12x768x4096 4a913d26d34240ad
+  nt_acc_bf16                  12x768x4096 c6c409b2602a3aa1
+  tn_splitk_par_f32_512        12x768x4096 7e761cdf225c59c8
+  tn_f32                       512x8192x1024 2cf57fe51cb2842d
+  nt_f32                       512x8192x1024 9940f0cf7f6c07cc
+  tn_bf16                      512x8192x1024 894073f02d345a11
+  nt_bf16                      512x8192x1024 0e527a87e05bb555
+  tn_acc_f32                   512x8192x1024 5a8660592e9e6201
+  nt_acc_f32                   512x8192x1024 64f3e027a0fd5845
+  tn_acc_bf16                  512x8192x1024 3de2f6b24665a16f
+  nt_acc_bf16                  512x8192x1024 1baf7dedbd4bf4fb
+  tn_f32                       256x8192x1024 2ba6453a1c93ec2f
+  nt_f32                       256x8192x1024 202e3522088d8113
+  tn_bf16                      256x8192x1024 6521143ec4b19198
+  nt_bf16                      256x8192x1024 d44fc65fb83cc964
+  tn_acc_f32                   256x8192x1024 d7adde22ecc589e6
+  nt_acc_f32                   256x8192x1024 fe8109ddc3118f98
+  tn_acc_bf16                  256x8192x1024 e09126a0bea8d4d9
+  nt_acc_bf16                  256x8192x1024 733e92f77dbbec11
+  tn_f32                       2048x2048x2048 e47a48734b6ddaef
+  nt_f32                       2048x2048x2048 8fd55b9f58acef15
+  tn_bf16                      2048x2048x2048 f1cdd0291e0e51ca
+  nt_bf16                      2048x2048x2048 536cc9aaf3949b57
+  tn_acc_f32                   2048x2048x2048 e1ef107e31eab7bf
+  nt_acc_f32                   2048x2048x2048 6fab1680c8f00bbb
+  tn_acc_bf16                  2048x2048x2048 95ed11b3cf42c98c
+  nt_acc_bf16                  2048x2048x2048 51e166005ec8bb72
+  tn_f32                       64x64x8192 6e96c95b93358816
+  nt_f32                       64x64x8192 19446c5325582097
+  tn_bf16                      64x64x8192 1696ae192a637cff
+  nt_bf16                      64x64x8192 dfdcdb65544616d8
+  tn_acc_f32                   64x64x8192 a7e257eba4d61b45
+  nt_acc_f32                   64x64x8192 6ad90f10408b273b
+  tn_acc_bf16                  64x64x8192 dc770dc17dfd9644
+  nt_acc_bf16                  64x64x8192 0e8f99572e6bca15
+  tn_splitk_par_f32_512        64x64x8192 09955aa4ccc5e45b
+  i8                           200x72x96 16ca7c36ffe8990d
+  i8_bscale                    200x72x96 e91e3ddf3e0b6bd1
+  i8                           256x256x256 d37643c556919148
+  i8_bscale                    256x256x256 7ac296bea913adee
+  i8                           512x8192x1024 2ad7c7ae8cb7de9c
+  i8_bscale                    512x8192x1024 0858a972628ce1ec
+  i8                           130x97x70 a94a0c7c4bf12564
+  i8_bscale                    130x97x70 e6eedd4fb3aa9a06
+#
+# diff snap_d0b1792.txt snap_d88345e.txt
+  25,28c25,28
+  < epi_f16_narrow_beta1         256x256x256 ERR GEMM epilogue: the 64x64 tile is instantiated for bf16 operands only
+  < epi_f16_narrow_full          256x256x256 ERR GEMM epilogue: the 64x64 tile is instantiated for bf16 operands only
+  < epi_f16_narrow_silu          256x256x256 ERR GEMM epilogue: the 64x64 tile is instantiated for bf16 operands only
+  < epi_f16_narrow_relu_a        256x256x256 ERR GEMM epilogue: the 64x64 tile is instantiated for bf16 operands only
+  ---
+  > epi_f16_narrow_beta1         256x256x256 59cc3ebc63148dbc
+  > epi_f16_narrow_full          256x256x256 3d8fad47aa217c35
+  > epi_f16_narrow_silu          256x256x256 97a09f564d3665fd
+  > epi_f16_narrow_relu_a        256x256x256 cff749a2e586fd22
+  60,63c60,63
+  < epi_f16_narrow_beta1         200x72x96 ERR GEMM epilogue: the 64x64 tile is instantiated for bf16 operands only
+  < epi_f16_narrow_full          200x72x96 ERR GEMM epilogue: the 64x64 tile is instantiated for bf16 operands only
+  < epi_f16_narrow_silu          200x72x96 ERR GEMM epilogue: the 64x64 tile is instantiated for bf16 operands only
+  < epi_f16_narrow_relu_a        200x72x96 ERR GEMM epilogue: the 64x64 tile is instantiated for bf16 operands only
+  ---
+  > epi_f16_narrow_beta1         200x72x96 cc753fde26de0386
+  > epi_f16_narrow_full          200x72x96 e8fb62c8ba6021b7
+  > epi_f16_narrow_silu          200x72x96 687641cc57f04c0e
+  > epi_f16_narrow_relu_a        200x72x96 ff9c036346782805
+  95,98c95,98
+  < epi_f16_narrow_beta1         61x2048x2048 ERR GEMM epilogue: the 64x64 tile is instantiated for bf16 operands only
+  < epi_f16_narrow_full          61x2048x2048 ERR GEMM epilogue: the 64x64 tile is instantiated for bf16 operands only
+  < epi_f16_narrow_silu          61x2048x2048 ERR GEMM epilogue: the 64x64 tile is instantiated for bf16 operands only
+  < epi_f16_narrow_relu_a        61x2048x2048 ERR GEMM epilogue: the 64x64 tile is instantiated for bf16 operands only
+  ---
+  > epi_f16_narrow_beta1         61x2048x2048 8619c99064fa27b4
+  > epi_f16_narrow_full          61x2048x2048 2c8010200ffa2218
+  > epi_f16_narrow_silu          61x2048x2048 8a5ecc795e7334c3
+  > epi_f16_narrow_relu_a        61x2048x2048 e05f3c51bd80d325
+  130,133c130,133
+  < epi_f16_narrow_beta1         128x512x128 ERR GEMM epilogue: the 64x64 tile is instantiated for bf16 operands only
+  < epi_f16_narrow_full          128x512x128 ERR GEMM epilogue: the 64x64 tile is instantiated for bf16 operands only
+  < epi_f16_narrow_silu          128x512x128 ERR GEMM epilogue: the 64x64 tile is instantiated for bf16 operands only
+  < epi_f16_narrow_relu_a        128x512x128 ERR GEMM epilogue: the 64x64 tile is instantiated for bf16 operands only
+  ---
+  > epi_f16_narrow_beta1         128x512x128 f2edca1450f79139
+  > epi_f16_narrow_full          128x512x128 d5b12c5f0d1dd444
+  > epi_f16_narrow_silu          128x512x128 48eea940b01f14d2
+  > epi_f16_narrow_relu_a        128x512x128 bb8e2dffbcaf2a18
+  165,168c165,168
+  < epi_f16_narrow_beta1         130x97x70 ERR GEMM epilogue: the 64x64 tile is instantiated for bf16 operands only
+  < epi_f16_narrow_full          130x97x70 ERR GEMM epilogue: the 64x64 tile is instantiated for bf16 operands only
+  < epi_f16_narrow_silu          130x97x70 ERR GEMM epilogue: the 64x64 tile is instantiated for bf16 operands only
+  < epi_f16_narrow_relu_a        130x97x70 ERR GEMM epilogue: the 64x64 tile is instantiated for bf16 operands only
+  ---
+  > epi_f16_narrow_beta1         130x97x70 1d928dadafb6cb08
+  > epi_f16_narrow_full          130x97x70 747c566ef962b829
+  > epi_f16_narrow_silu          130x97x70 3ea55198e0b8e89c
+  > epi_f16_narrow_relu_a        130x97x70 faf9626649173e02
+  200,203c200,203
+  < epi_f16_narrow_beta1         512x16384x512 ERR GEMM epilogue: the 64x64 tile is instantiated for bf16 operands only
+  < epi_f16_narrow_full          512x16384x512 ERR GEMM epilogue: the 64x64 tile is instantiated for bf16 operands only
+  < epi_f16_narrow_silu          512x16384x512 ERR GEMM epilogue: the 64x64 tile is instantiated for bf16 operands only
+  < epi_f16_narrow_relu_a        512x16384x512 ERR GEMM epilogue: the 64x64 tile is instantiated for bf16 operands only
+  ---
+  > epi_f16_narrow_beta1         512x16384x512 5c5b7fb22f9e2964
+  > epi_f16_narrow_full          512x16384x512 2fe0f99141cf9e21
+  > epi_f16_narrow_silu          512x16384x512 23b3ef1bd6c2534f
+  > epi_f16_narrow_relu_a        512x16384x512 50734891e5032966
+  235,238c235,238
+  < epi_f16_narrow_beta1         4096x4096x256 ERR GEMM epilogue: the 64x64 tile is instantiated for bf16 operands only
+  < epi_f16_narrow_full          4096x4096x256 ERR GEMM epilogue: the 64x64 tile is instantiated for bf16 operands only
+  < epi_f16_narrow_silu          4096x4096x256 ERR GEMM epilogue: the 64x64 tile is instantiated for bf16 operands only
+  < epi_f16_narrow_relu_a        4096x4096x256 ERR GEMM epilogue: the 64x64 tile is instantiated for bf16 operands only
+  ---
+  > epi_f16_narrow_beta1         4096x4096x256 a7bdc5a7e1f37f8a
+  > epi_f16_narrow_full          4096x4096x256 10f13dd0f27fb7ad
+  > epi_f16_narrow_silu          4096x4096x256 021160a416a15b0f
+  > epi_f16_narrow_relu_a        4096x4096x256 335eba043540427d
+  270,273c270,273
+  < epi_f16_narrow_beta1         2048x1024x64 ERR GEMM epilogue: the 64x64 tile is instantiated for bf16 operands only
+  < epi_f16_narrow_full          2048x1024x64 ERR GEMM epilogue: the 64x64 tile is instantiated for bf16 operands only
+  < epi_f16_narrow_silu          2048x1024x64 ERR GEMM epilogue: the 64x64 tile is instantiated for bf16 operands only
+  < epi_f16_narrow_relu_a        2048x1024x64 ERR GEMM epilogue: the 64x64 tile is instantiated for bf16 operands only
+  ---
+  > epi_f16_narrow_beta1         2048x1024x64 d56c5dcf1c0169e3
+  > epi_f16_narrow_full          2048x1024x64 215e177c7ec01fd1
+  > epi_f16_narrow_silu          2048x1024x64 4d16bddf7c93d62a
+  > epi_f16_narrow_relu_a        2048x1024x64 4b07db565b6c6180
+  305,308c305,308
+  < epi_f16_narrow_beta1         1024x1024x4096 ERR GEMM epilogue: the 64x64 tile is instantiated for bf16 operands only
+  < epi_f16_narrow_full          1024x1024x4096 ERR GEMM epilogue: the 64x64 tile is instantiated for bf16 operands only
+  < epi_f16_narrow_silu          1024x1024x4096 ERR GEMM epilogue: the 64x64 tile is instantiated for bf16 operands only
+  < epi_f16_narrow_relu_a        1024x1024x4096 ERR GEMM epilogue: the 64x64 tile is instantiated for bf16 operands only
+  ---
+  > epi_f16_narrow_beta1         1024x1024x4096 895e928de41cd9a0
+  > epi_f16_narrow_full          1024x1024x4096 4a2f92780e3c3b61
+  > epi_f16_narrow_silu          1024x1024x4096 149d64c8da4c16bc
+  > epi_f16_narrow_relu_a        1024x1024x4096 69e23cfb2139623b
+  340,343c340,343
+  < epi_f16_narrow_beta1         61x640x256 ERR GEMM epilogue: the 64x64 tile is instantiated for bf16 operands only
+  < epi_f16_narrow_full          61x640x256 ERR GEMM epilogue: the 64x64 tile is instantiated for bf16 operands only
+  < epi_f16_narrow_silu          61x640x256 ERR GEMM epilogue: the 64x64 tile is instantiated for bf16 operands only
+  < epi_f16_narrow_relu_a        61x640x256 ERR GEMM epilogue: the 64x64 tile is instantiated for bf16 operands only
+  ---
+  > epi_f16_narrow_beta1         61x640x256 7e0f313c1ae45662
+  > epi_f16_narrow_full          61x640x256 c817d8c87c9669ae
+  > epi_f16_narrow_silu          61x640x256 9e5af85d5e4528d9
+  > epi_f16_narrow_relu_a        61x640x256 8c0c89d93015c3b1
+  375,378c375,378
+  < epi_f16_narrow_beta1         2048x6144x2048 ERR GEMM epilogue: the 64x64 tile is instantiated for bf16 operands only
+  < epi_f16_narrow_full          2048x6144x2048 ERR GEMM epilogue: the 64x64 tile is instantiated for bf16 operands only
+  < epi_f16_narrow_silu          2048x6144x2048 ERR GEMM epilogue: the 64x64 tile is instantiated for bf16 operands only
+  < epi_f16_narrow_relu_a        2048x6144x2048 ERR GEMM epilogue: the 64x64 tile is instantiated for bf16 operands only
+  ---
+  > epi_f16_narrow_beta1         2048x6144x2048 e3997c193e6f4dad
+  > epi_f16_narrow_full          2048x6144x2048 ea735f1d8a8e5dd0
+  > epi_f16_narrow_silu          2048x6144x2048 a3d368c3f505287c
+  > epi_f16_narrow_relu_a        2048x6144x2048 6f070c7604eea7a2
+  410,413c410,413
+  < epi_f16_narrow_beta1         512x768x3072 ERR GEMM epilogue: the 64x64 tile is instantiated for bf16 operands only
+  < epi_f16_narrow_full          512x768x3072 ERR GEMM epilogue: the 64x64 tile is instantiated for bf16 operands only
+  < epi_f16_narrow_silu          512x768x3072 ERR GEMM epilogue: the 64x64 tile is instantiated for bf16 operands only
+  < epi_f16_narrow_relu_a        512x768x3072 ERR GEMM epilogue: the 64x64 tile is instantiated for bf16 operands only
+  ---
+  > epi_f16_narrow_beta1         512x768x3072 232a23ad593f7d72
+  > epi_f16_narrow_full          512x768x3072 ebb3e1ea2f6be692
+  > epi_f16_narrow_silu          512x768x3072 87e9cf092afa603d
+  > epi_f16_narrow_relu_a        512x768x3072 58ad25f5e783694e
+  478c478
+  < tn_bf16                      128x384x4096 110ad337d72f780e
+  ---
+  > tn_bf16                      128x384x4096 d64b56433b167744
+  482c482
+  < tn_acc_bf16                  128x384x4096 65887e1bafb8cd7b
+  ---
+  > tn_acc_bf16                  128x384x4096 fc682f9c391516fe
+  487c487
+  < tn_bf16                      128x128x4096 503a5ae9c86656be
+  ---
+  > tn_bf16                      128x128x4096 0105d9e83c7c9b3a
+  491c491
+  < tn_acc_bf16                  128x128x4096 9715cc3a6495d35e
+  ---
+  > tn_acc_bf16                  128x128x4096 4c334d4b050dc44f

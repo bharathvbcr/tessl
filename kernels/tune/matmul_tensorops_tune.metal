@@ -1,23 +1,25 @@
-// Tile-geometry A/B for the bf16 NN GEMM. Isolates two suspects behind the
-// ~2× gap vs PyTorch MPS bf16:
-//   (a) output-tile size -> arithmetic intensity  (SM*SN/(SM+SN) FLOP/byte)
-//   (b) the host-side zero_f32(C) pre-pass, which only exists because the
-//       production kernel runs multiply_accumulate on the FIRST K block too.
-// Interior-only (exact divisibility) — this is a measurement rig, not a
-// drop-in: the production kernel keeps the ragged-edge paths.
+// Measurement-only GEMM variants, linked only by `TESSL_GEMM_TUNE=1` builds
+// and timed against production by bench_gemm_tile_tune and
+// bench_gemm_tnnt_tune. The first section is the 2026-08 bf16 NN tile/BK
+// ladder, which asked whether output-tile arithmetic intensity
+// (SM*SN/(SM+SN) FLOP/byte) or the zero_f32(C) pre-pass of the then-production
+// kernel (`multiply_accumulate` on every K block, the first included) caused
+// the ~2× gap to PyTorch MPS bf16. Its answer, the cooperative destination
+// tensor, is production now: the NN, TN and NT coop kernels in
+// matmul_tensorops.metal have no pre-pass. Interior-only (exact
+// divisibility) — a measurement rig, not a drop-in: production keeps the
+// ragged-edge paths.
 
-#include <metal_stdlib>
-#include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>
+#include "../gemm_coop.h"
 
-using namespace metal;
-using namespace mpp::tensor_ops;
+// Every cooperative variant below is an instantiation of gemm_coop.h's
+// `mm_coop`, the body the production coop kernels run, with its own tile,
+// walk and operand layout. The rig's shapes divide exactly, so a kernel
+// without a `tiles_m` argument takes `M / SM`; every tile is interior.
 
-inline uint2 tune_tile_from_linear(uint linear, uint tiles_n) {
-    return uint2(linear % tiles_n, linear / tiles_n);
-}
-
-/// ACCUM_FIRST=true reproduces production (all blocks accumulate; C must be
-/// pre-zeroed). ACCUM_FIRST=false makes block 0 `multiply`, retiring the zero.
+/// ACCUM_FIRST=true reproduces the pre-coop production NN kernel (every block
+/// accumulates, so C must be pre-zeroed); ACCUM_FIRST=false makes block 0
+/// `multiply`, retiring the zero.
 // A call with no explicit template arguments is the control kernel
 // `mm_bf16_64x32_bk128_sg4_accf` (64×32, BK 128, sg4, accumulate-first).
 template <int SM = 64, int SN = 32, int BK = 128, int NSG = 4,
@@ -32,7 +34,7 @@ inline void mm_bf16_tune(device bfloat *A, device bfloat *B, device float *C,
     matmul2d<d_mul, execution_simdgroups<NSG>> op_mul;
     matmul2d<d_acc, execution_simdgroups<NSG>> op_acc;
 
-    uint2 tile = tune_tile_from_linear(tgpig, tiles_n);
+    uint2 tile = walk_row_major::tile<SM>(tgpig, tiles_n, M / SM, N, K);
     int tx = (int)tile.x * SN;
     int ty = (int)tile.y * SM;
     if (tx + SN > (int)N || ty + SM > (int)M) return;
@@ -64,7 +66,7 @@ inline void mm_bf16_tune(device bfloat *A, device bfloat *B, device float *C,
         mm_bf16_tune<SM, SN, BK, NSG, ACCF>(A, B, C, M, N, K, tiles_n, tgpig); \
     }
 
-// Control: production geometry + production accumulate-first behaviour.
+// Control: the pre-coop production geometry and accumulate-first behaviour.
 kernel void mm_bf16_64x32_bk128_sg4_accf(
     device bfloat *A [[buffer(0)]],
     device bfloat *B [[buffer(1)]],
@@ -122,34 +124,8 @@ TUNE_KERNEL(mm_bf16_256x64_bk256_sg8,   256,  64, 256, 8, false)
 template <int SM = 64, int SN = 32, int NSG = 4, typename ElemT = bfloat>
 inline void mm_bf16_coop(device ElemT *A, device ElemT *B, device float *C,
                          uint M, uint N, uint K, uint tiles_n, uint tgpig) {
-    constexpr auto d = matmul2d_descriptor(
-        SM, SN, dynamic_length_v<int>, false, false, false,
-        matmul2d_descriptor::mode::multiply);
-    matmul2d<d, execution_simdgroups<NSG>> op;
-
-    uint2 tile = tune_tile_from_linear(tgpig, tiles_n);
-    int tx = (int)tile.x * SN;
-    int ty = (int)tile.y * SM;
-    if (tx + SN > (int)N || ty + SM > (int)M) return;
-
-    auto tA = tensor(A + ty * (int)K, dextents<int, 2>{(int)K, SM},
-                     array<int, 2>{1, (int)K});
-    auto tB = tensor(B + tx, dextents<int, 2>{SN, (int)K},
-                     array<int, 2>{1, (int)N});
-    auto tC = tensor(C + ty * (int)N + tx, dextents<int, 2>{SN, SM},
-                     array<int, 2>{1, (int)N});
-
-    auto cT = op.template get_destination_cooperative_tensor<
-        metal::remove_addrspace_t<decltype(tA)>,
-        metal::remove_addrspace_t<decltype(tB)>, float>();
-    // Header doc says get_mask; the shipping metal_cooperative_tensor spells
-    // it is_valid_element (set() wraps the same check).
-#pragma clang loop unroll(full)
-    for (uint16_t i = 0; i < cT.get_capacity(); ++i) {
-        cT.set(i, 0.0f);
-    }
-    op.run(tA, tB, cT);
-    cT.store(tC);
+    mm_coop<ElemT, SM, SN, NSG, false, false, false, false, false, walk_row_major>(
+        A, B, C, M, N, K, tiles_n, M / SM, tgpig, nullptr, 1.0f, 0.0f, 0u);
 }
 
 #define TUNE_COOP_KERNEL(NAME, SM, SN, NSG)                                    \
@@ -206,26 +182,8 @@ TUNE_COOP_KERNEL_F32(mm_f32_exact_coop_128x64_sg8, 128, 64, 8)
 template <int SM = 64, int SN = 64, int NSG = 4>
 inline void mm_bf16_tn_coop(device bfloat *A, device bfloat *B, device float *C,
                             uint M, uint N, uint K, uint tiles_n, uint tgpig) {
-    constexpr auto d = matmul2d_descriptor(
-        SM, SN, dynamic_length_v<int>, true, false, false,
-        matmul2d_descriptor::mode::multiply);
-    matmul2d<d, execution_simdgroups<NSG>> op;
-    uint2 tile = tune_tile_from_linear(tgpig, tiles_n);
-    int tx = (int)tile.x * SN;
-    int ty = (int)tile.y * SM;
-    if (tx + SN > (int)N || ty + SM > (int)M) return;
-    auto tA = tensor(A + ty, dextents<int, 2>{SM, (int)K}, array<int, 2>{1, (int)M});
-    auto tB = tensor(B + tx, dextents<int, 2>{SN, (int)K}, array<int, 2>{1, (int)N});
-    auto tC = tensor(C + ty * (int)N + tx, dextents<int, 2>{SN, SM},
-                     array<int, 2>{1, (int)N});
-    auto cT = op.template get_destination_cooperative_tensor<
-        metal::remove_addrspace_t<decltype(tA)>,
-        metal::remove_addrspace_t<decltype(tB)>, float>();
-#pragma clang loop unroll(full)
-    for (uint16_t i = 0; i < cT.get_capacity(); ++i)
-        cT.set(i, 0.0f);
-    op.run(tA, tB, cT);
-    cT.store(tC);
+    mm_coop<bfloat, SM, SN, NSG, true, false, false, false, false, walk_row_major>(
+        A, B, C, M, N, K, tiles_n, M / SM, tgpig, nullptr, 1.0f, 0.0f, 0u);
 }
 
 /// C[M,N] = A[M,K] @ B_stored[N,K]^T — coop destination, interior-only rig.
@@ -233,28 +191,8 @@ inline void mm_bf16_tn_coop(device bfloat *A, device bfloat *B, device float *C,
 template <int SM = 64, int SN = 64, int NSG = 4>
 inline void mm_bf16_nt_coop(device bfloat *A, device bfloat *B, device float *C,
                             uint M, uint N, uint K, uint tiles_n, uint tgpig) {
-    constexpr auto d = matmul2d_descriptor(
-        SM, SN, dynamic_length_v<int>, false, true, false,
-        matmul2d_descriptor::mode::multiply);
-    matmul2d<d, execution_simdgroups<NSG>> op;
-    uint2 tile = tune_tile_from_linear(tgpig, tiles_n);
-    int tx = (int)tile.x * SN;
-    int ty = (int)tile.y * SM;
-    if (tx + SN > (int)N || ty + SM > (int)M) return;
-    auto tA = tensor(A + ty * (int)K, dextents<int, 2>{(int)K, SM},
-                     array<int, 2>{1, (int)K});
-    auto tB = tensor(B + tx * (int)K, dextents<int, 2>{(int)K, SN},
-                     array<int, 2>{1, (int)K});
-    auto tC = tensor(C + ty * (int)N + tx, dextents<int, 2>{SN, SM},
-                     array<int, 2>{1, (int)N});
-    auto cT = op.template get_destination_cooperative_tensor<
-        metal::remove_addrspace_t<decltype(tA)>,
-        metal::remove_addrspace_t<decltype(tB)>, float>();
-#pragma clang loop unroll(full)
-    for (uint16_t i = 0; i < cT.get_capacity(); ++i)
-        cT.set(i, 0.0f);
-    op.run(tA, tB, cT);
-    cT.store(tC);
+    mm_coop<bfloat, SM, SN, NSG, false, true, false, false, false, walk_row_major>(
+        A, B, C, M, N, K, tiles_n, M / SM, tgpig, nullptr, 1.0f, 0.0f, 0u);
 }
 
 /// C[M,N] += A_stored[K,M]^T @ B[K,N] — coop zero→run, then load-add-store of
@@ -265,35 +203,8 @@ template <int SM = 64, int SN = 64, int NSG = 4>
 inline void mm_bf16_tn_accum_coop(device bfloat *A, device bfloat *B,
                                   device float *C, uint M, uint N, uint K,
                                   uint tiles_n, uint tgpig) {
-    constexpr auto d = matmul2d_descriptor(
-        SM, SN, dynamic_length_v<int>, true, false, false,
-        matmul2d_descriptor::mode::multiply);
-    matmul2d<d, execution_simdgroups<NSG>> op;
-    uint2 tile = tune_tile_from_linear(tgpig, tiles_n);
-    int tx = (int)tile.x * SN;
-    int ty = (int)tile.y * SM;
-    if (tx + SN > (int)N || ty + SM > (int)M) return;
-    auto tA = tensor(A + ty, dextents<int, 2>{SM, (int)K}, array<int, 2>{1, (int)M});
-    auto tB = tensor(B + tx, dextents<int, 2>{SN, (int)K}, array<int, 2>{1, (int)N});
-    auto tC = tensor(C + ty * (int)N + tx, dextents<int, 2>{SN, SM},
-                     array<int, 2>{1, (int)N});
-    auto cT = op.template get_destination_cooperative_tensor<
-        metal::remove_addrspace_t<decltype(tA)>,
-        metal::remove_addrspace_t<decltype(tB)>, float>();
-#pragma clang loop unroll(full)
-    for (uint16_t i = 0; i < cT.get_capacity(); ++i)
-        cT.set(i, 0.0f);
-    op.run(tA, tB, cT);
-    auto prevT = op.template get_destination_cooperative_tensor<
-        metal::remove_addrspace_t<decltype(tA)>,
-        metal::remove_addrspace_t<decltype(tB)>, float>();
-    prevT.load(tC);
-#pragma clang loop unroll(full)
-    for (uint16_t i = 0; i < cT.get_capacity(); ++i) {
-        if (cT.is_valid_element(i))
-            cT[i] += prevT[i];
-    }
-    cT.store(tC);
+    mm_coop<bfloat, SM, SN, NSG, true, false, false, true, false, walk_row_major>(
+        A, B, C, M, N, K, tiles_n, M / SM, tgpig, nullptr, 1.0f, 0.0f, 0u);
 }
 
 #define TUNE_TN_COOP(NAME, SM, SN, NSG)                                        \
@@ -380,34 +291,8 @@ template <int SM = 128, int SN = 64, int NSG = 4, int PH = 4>
 inline void mm_bf16_coop_swz(device bfloat *A, device bfloat *B, device float *C,
                              uint M, uint N, uint K, uint tiles_n, uint tiles_m,
                              uint tgpig) {
-    constexpr auto d = matmul2d_descriptor(
-        SM, SN, dynamic_length_v<int>, false, false, false,
-        matmul2d_descriptor::mode::multiply);
-    matmul2d<d, execution_simdgroups<NSG>> op;
-
-    uint band = tgpig / (PH * tiles_n);
-    uint rem = tgpig - band * PH * tiles_n;
-    uint local_h = min((uint)PH, tiles_m - band * PH);
-    uint2 tile = uint2(rem / local_h, band * PH + rem % local_h);
-    if (tile.x >= tiles_n || tile.y >= tiles_m) return;
-    int tx = (int)tile.x * SN;
-    int ty = (int)tile.y * SM;
-    if (tx + SN > (int)N || ty + SM > (int)M) return;
-
-    auto tA = tensor(A + ty * (int)K, dextents<int, 2>{(int)K, SM},
-                     array<int, 2>{1, (int)K});
-    auto tB = tensor(B + tx, dextents<int, 2>{SN, (int)K},
-                     array<int, 2>{1, (int)N});
-    auto tC = tensor(C + ty * (int)N + tx, dextents<int, 2>{SN, SM},
-                     array<int, 2>{1, (int)N});
-    auto cT = op.template get_destination_cooperative_tensor<
-        metal::remove_addrspace_t<decltype(tA)>,
-        metal::remove_addrspace_t<decltype(tB)>, float>();
-#pragma clang loop unroll(full)
-    for (uint16_t i = 0; i < cT.get_capacity(); ++i)
-        cT.set(i, 0.0f);
-    op.run(tA, tB, cT);
-    cT.store(tC);
+    mm_coop<bfloat, SM, SN, NSG, false, false, false, false, false, walk_panel<(uint)PH>>(
+        A, B, C, M, N, K, tiles_n, tiles_m, tgpig, nullptr, 1.0f, 0.0f, 0u);
 }
 
 #define TUNE_SWZ_KERNEL(NAME, SM, SN, NSG, PH)                                 \
@@ -445,37 +330,8 @@ template <int SM = 64, int SN = 64, int NSG = 4>
 inline void mm_bf16_nt_accum_coop(device bfloat *A, device bfloat *B,
                                   device float *C, uint M, uint N, uint K,
                                   uint tiles_n, uint tgpig) {
-    constexpr auto d = matmul2d_descriptor(
-        SM, SN, dynamic_length_v<int>, false, true, false,
-        matmul2d_descriptor::mode::multiply);
-    matmul2d<d, execution_simdgroups<NSG>> op;
-    uint2 tile = tune_tile_from_linear(tgpig, tiles_n);
-    int tx = (int)tile.x * SN;
-    int ty = (int)tile.y * SM;
-    if (tx + SN > (int)N || ty + SM > (int)M) return;
-    auto tA = tensor(A + ty * (int)K, dextents<int, 2>{(int)K, SM},
-                     array<int, 2>{1, (int)K});
-    auto tB = tensor(B + tx * (int)K, dextents<int, 2>{(int)K, SN},
-                     array<int, 2>{1, (int)K});
-    auto tC = tensor(C + ty * (int)N + tx, dextents<int, 2>{SN, SM},
-                     array<int, 2>{1, (int)N});
-    auto cT = op.template get_destination_cooperative_tensor<
-        metal::remove_addrspace_t<decltype(tA)>,
-        metal::remove_addrspace_t<decltype(tB)>, float>();
-#pragma clang loop unroll(full)
-    for (uint16_t i = 0; i < cT.get_capacity(); ++i)
-        cT.set(i, 0.0f);
-    op.run(tA, tB, cT);
-    auto prevT = op.template get_destination_cooperative_tensor<
-        metal::remove_addrspace_t<decltype(tA)>,
-        metal::remove_addrspace_t<decltype(tB)>, float>();
-    prevT.load(tC);
-#pragma clang loop unroll(full)
-    for (uint16_t i = 0; i < cT.get_capacity(); ++i) {
-        if (cT.is_valid_element(i))
-            cT[i] += prevT[i];
-    }
-    cT.store(tC);
+    mm_coop<bfloat, SM, SN, NSG, false, true, false, true, false, walk_row_major>(
+        A, B, C, M, N, K, tiles_n, M / SM, tgpig, nullptr, 1.0f, 0.0f, 0u);
 }
 
 kernel void mm_bf16_nt_accum_coop_64x64_sg4(
@@ -498,52 +354,13 @@ kernel void mm_bf16_nt_accum_coop_64x64_sg4(
 // row-major baselines are the mm_bf16_{tn,nt}[_accum]_coop kernels above.
 // =============================================================================
 
-inline uint2 tune_tile_from_panel(uint linear, uint tiles_n, uint tiles_m, uint ph) {
-    uint band = linear / (ph * tiles_n);
-    uint rem = linear - band * ph * tiles_n;
-    uint local_h = min(ph, tiles_m - band * ph);
-    return uint2(rem / local_h, band * ph + rem % local_h);
-}
-
 /// C[M,N] (+)= A[M,K] @ B_stored[N,K]^T over the panel walk.
 template <int SM, int SN, int NSG, int PH, bool ACCUM>
 inline void mm_bf16_nt_coop_panel(device bfloat *A, device bfloat *B,
                                   device float *C, uint M, uint N, uint K,
                                   uint tiles_n, uint tiles_m, uint tgpig) {
-    constexpr auto d = matmul2d_descriptor(
-        SM, SN, dynamic_length_v<int>, false, true, false,
-        matmul2d_descriptor::mode::multiply);
-    matmul2d<d, execution_simdgroups<NSG>> op;
-    if (tgpig >= tiles_n * tiles_m) return;
-    uint2 tile = tune_tile_from_panel(tgpig, tiles_n, tiles_m, (uint)PH);
-    int tx = (int)tile.x * SN;
-    int ty = (int)tile.y * SM;
-    if (tx + SN > (int)N || ty + SM > (int)M) return;
-    auto tA = tensor(A + ty * (int)K, dextents<int, 2>{(int)K, SM},
-                     array<int, 2>{1, (int)K});
-    auto tB = tensor(B + tx * (int)K, dextents<int, 2>{(int)K, SN},
-                     array<int, 2>{1, (int)K});
-    auto tC = tensor(C + ty * (int)N + tx, dextents<int, 2>{SN, SM},
-                     array<int, 2>{1, (int)N});
-    auto cT = op.template get_destination_cooperative_tensor<
-        metal::remove_addrspace_t<decltype(tA)>,
-        metal::remove_addrspace_t<decltype(tB)>, float>();
-#pragma clang loop unroll(full)
-    for (uint16_t i = 0; i < cT.get_capacity(); ++i)
-        cT.set(i, 0.0f);
-    op.run(tA, tB, cT);
-    if (ACCUM) {
-        auto prevT = op.template get_destination_cooperative_tensor<
-            metal::remove_addrspace_t<decltype(tA)>,
-            metal::remove_addrspace_t<decltype(tB)>, float>();
-        prevT.load(tC);
-#pragma clang loop unroll(full)
-        for (uint16_t i = 0; i < cT.get_capacity(); ++i) {
-            if (cT.is_valid_element(i))
-                cT[i] += prevT[i];
-        }
-    }
-    cT.store(tC);
+    mm_coop<bfloat, SM, SN, NSG, false, true, false, ACCUM, false, walk_panel<(uint)PH>>(
+        A, B, C, M, N, K, tiles_n, tiles_m, tgpig, nullptr, 1.0f, 0.0f, 0u);
 }
 
 /// C[M,N] (+)= A_stored[K,M]^T @ B[K,N] over the panel walk.
@@ -551,38 +368,8 @@ template <int SM, int SN, int NSG, int PH, bool ACCUM>
 inline void mm_bf16_tn_coop_panel(device bfloat *A, device bfloat *B,
                                   device float *C, uint M, uint N, uint K,
                                   uint tiles_n, uint tiles_m, uint tgpig) {
-    constexpr auto d = matmul2d_descriptor(
-        SM, SN, dynamic_length_v<int>, true, false, false,
-        matmul2d_descriptor::mode::multiply);
-    matmul2d<d, execution_simdgroups<NSG>> op;
-    if (tgpig >= tiles_n * tiles_m) return;
-    uint2 tile = tune_tile_from_panel(tgpig, tiles_n, tiles_m, (uint)PH);
-    int tx = (int)tile.x * SN;
-    int ty = (int)tile.y * SM;
-    if (tx + SN > (int)N || ty + SM > (int)M) return;
-    auto tA = tensor(A + ty, dextents<int, 2>{SM, (int)K}, array<int, 2>{1, (int)M});
-    auto tB = tensor(B + tx, dextents<int, 2>{SN, (int)K}, array<int, 2>{1, (int)N});
-    auto tC = tensor(C + ty * (int)N + tx, dextents<int, 2>{SN, SM},
-                     array<int, 2>{1, (int)N});
-    auto cT = op.template get_destination_cooperative_tensor<
-        metal::remove_addrspace_t<decltype(tA)>,
-        metal::remove_addrspace_t<decltype(tB)>, float>();
-#pragma clang loop unroll(full)
-    for (uint16_t i = 0; i < cT.get_capacity(); ++i)
-        cT.set(i, 0.0f);
-    op.run(tA, tB, cT);
-    if (ACCUM) {
-        auto prevT = op.template get_destination_cooperative_tensor<
-            metal::remove_addrspace_t<decltype(tA)>,
-            metal::remove_addrspace_t<decltype(tB)>, float>();
-        prevT.load(tC);
-#pragma clang loop unroll(full)
-        for (uint16_t i = 0; i < cT.get_capacity(); ++i) {
-            if (cT.is_valid_element(i))
-                cT[i] += prevT[i];
-        }
-    }
-    cT.store(tC);
+    mm_coop<bfloat, SM, SN, NSG, true, false, false, ACCUM, false, walk_panel<(uint)PH>>(
+        A, B, C, M, N, K, tiles_n, tiles_m, tgpig, nullptr, 1.0f, 0.0f, 0u);
 }
 
 #define TUNE_PANEL_KERNEL(NAME, IMPL, SM, SN, NSG, PH, ACCUM)                 \
@@ -609,3 +396,60 @@ TUNE_PANEL_KERNEL(mm_bf16_nt_accum_coop_64x64_sg4_ph8,  mm_bf16_nt_coop_panel, 6
 TUNE_PANEL_KERNEL(mm_bf16_nt_accum_coop_64x64_sg4_ph16, mm_bf16_nt_coop_panel, 64, 64, 4, 16, true)
 TUNE_PANEL_KERNEL(mm_bf16_tn_accum_coop_64x64_sg4_ph8,  mm_bf16_tn_coop_panel, 64, 64, 4,  8, true)
 TUNE_PANEL_KERNEL(mm_bf16_tn_accum_coop_64x64_sg4_ph16, mm_bf16_tn_coop_panel, 64, 64, 4, 16, true)
+
+// =============================================================================
+// One panel-walk policy: the production coop kernels (edges included) under
+// `walk_by_grid`, the gate the NN coop kernels walked by until every family
+// moved to `walk_by_b` (`tile_walk`). The bench's production arm is the
+// shipped walk.
+// =============================================================================
+
+#define TUNE_WALK_KERNEL(NAME, ELEM, SM, SN, NSG, TA, TB, ACCUM, WALK)         \
+    kernel void NAME(device ELEM *A [[buffer(0)]],                             \
+                     device ELEM *B [[buffer(1)]],                             \
+                     device float *C [[buffer(2)]],                            \
+                     constant uint &M [[buffer(3)]],                           \
+                     constant uint &N [[buffer(4)]],                           \
+                     constant uint &K [[buffer(5)]],                           \
+                     constant uint &tiles_n [[buffer(6)]],                     \
+                     constant uint &tiles_m [[buffer(7)]],                     \
+                     uint tgpig [[threadgroup_position_in_grid]]) {            \
+        mm_coop<ELEM, SM, SN, NSG, TA, TB, false, ACCUM, false, WALK>(         \
+            A, B, C, M, N, K, tiles_n, tiles_m, tgpig, nullptr, 1.0f, 0.0f,    \
+            0u);                                                               \
+    }
+
+TUNE_WALK_KERNEL(mm_bf16_coop_128x64_sg4_walkg, bfloat, 128, 64, 4, false, false, false, walk_by_grid);
+TUNE_WALK_KERNEL(mm_bf16_coop_64x64_sg4_walkg,  bfloat,  64, 64, 4, false, false, false, walk_by_grid);
+TUNE_WALK_KERNEL(mm_bf16_tn_coop_128x64_sg4_walkg, bfloat, 128, 64, 4, true, false, false, walk_by_grid);
+TUNE_WALK_KERNEL(mm_bf16_nt_coop_128x64_sg4_walkg, bfloat, 128, 64, 4, false, true, false, walk_by_grid);
+TUNE_WALK_KERNEL(mm_bf16_tn_accum_coop_64x64_sg4_walkg, bfloat, 64, 64, 4, true, false, true, walk_by_grid);
+TUNE_WALK_KERNEL(mm_bf16_nt_accum_coop_64x64_sg4_walkg, bfloat, 64, 64, 4, false, true, true, walk_by_grid);
+
+// =============================================================================
+// Exact f32 NN, the production 32x32 body (`mm_exact_f32`, slice path, C
+// zeroed by the bench first) under each walk: the 2048x6144x2048 MLP up/gate
+// shape ran at 4.1 TFLOP/s against 5.7 at 2048^3 in one run
+// (bench/results/f32_exact_coop_m5pro.txt). `_linear`: `tile_from_linear`
+// with no panels; `_rowmajor`; `_phN`: N-row panels.
+// =============================================================================
+
+#define TUNE_EXACT_F32_KERNEL(NAME, WALK)                                      \
+    kernel void NAME(device float *A [[buffer(0)]],                            \
+                     device float *B [[buffer(1)]],                            \
+                     device float *C [[buffer(2)]],                            \
+                     constant uint &M [[buffer(3)]],                           \
+                     constant uint &N [[buffer(4)]],                           \
+                     constant uint &K [[buffer(5)]],                           \
+                     constant uint &tiles_n [[buffer(6)]],                     \
+                     constant uint &tiles_m [[buffer(7)]],                     \
+                     uint tgpig [[threadgroup_position_in_grid]]) {            \
+        mm_exact_f32<false, false, false, 32, 32, WALK>(                       \
+            A, B, C, M, N, K, tiles_n, tiles_m, tgpig);                        \
+    }
+
+TUNE_EXACT_F32_KERNEL(mm_f32_exact_32x32_linear,   walk_linear);
+TUNE_EXACT_F32_KERNEL(mm_f32_exact_32x32_rowmajor, walk_row_major);
+TUNE_EXACT_F32_KERNEL(mm_f32_exact_32x32_ph8,      walk_panel<8u>);
+TUNE_EXACT_F32_KERNEL(mm_f32_exact_32x32_ph16,     walk_panel<16u>);
+TUNE_EXACT_F32_KERNEL(mm_f32_exact_32x32_ph32,     walk_panel<32u>);

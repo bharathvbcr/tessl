@@ -1,5 +1,14 @@
 # tessl GEMM: kernel selection, the coop gate, and how to check it
 
+> **Historical through "Why TN/NT have no coop kernel".** Those sections
+> describe the blocked-versus-coop split before Round 2 (2026-08-30, at the
+> end of this file): `tensorops_nn_kernel`, `use_coop_nn`, `COOP_MIN_K` and
+> the `_coop` kernel names no longer exist, and TN/NT bf16 and their
+> accumulates now run cooperative kernels. Current selection: `nn_coop_kernel`
+> and `coop_narrow` in `src/gemm.rs`, drawn in
+> [docs/architecture.md](../architecture.md); every family's tile body and
+> walk live in `kernels/gemm_coop.h`.
+
 Covers the TensorOps (MPP `matmul2d`) GEMM path, which lives in `tessl`
 (`crates/tessl`) and has exactly one copy.
 
@@ -87,7 +96,7 @@ block. Coop variants measured 0.77–1.10x — no win. Same for the accumulating
 TN/NT kernels: 0.88–1.12x against the real accumulate kernel.
 
 (Measured against the *default* build the accumulate coop looked like 1.19–2.74x,
-but `METAL_NATIVE_GEMM_ACCUM` defaults off, so that baseline was the
+but `METAL_NATIVE_GEMM_ACCUM` defaulted off (retired 2026-10-10), so that baseline was the
 temp-buffer + `add_inplace` fallback. That fallback really is 1.19–2.74x slower
 than the accumulate kernel, but enabling it is a training-quality decision
 already made on numerics grounds.)
@@ -240,7 +249,7 @@ rather than printing a page of `skip(pipe)` and exiting 0.
 | tool | what it is for |
 |---|---|
 | `bench_gemm_tnnt_tune` | TN / NT / TN-accum kernel A/B against the production baseline. **Interleaved**, with a baseline-drift gate — use this for kernel comparisons. |
-| `bench_gemm_tile_tune` | Broad tile/BK ladder. Blocked-style timing — see the warning below. |
+| `bench_gemm_tile_tune` | Broad tile/BK ladder, interleaved the same way since 2026-10-10. |
 | `bench_gemm_sweep` | Cross-runtime timing lane (f32 exact / tf32 / bf16), JSON out. |
 | `bench_gemm_sweep --dump-parity DIR` | Separate job, no timing: every lane x `BENCH_PARITY_SEEDS` draws at `BENCH_PARITY_SHAPE`, plus the manifest the scorer validates against. |
 | `bench/parity_ladder.py` | Drives the above across the whole ladder, one shape at a time, and merges. Use this for the accuracy numbers. |
@@ -302,6 +311,16 @@ itself* ranging 0.92x–1.46x.
 >
 > `bench_gemm_tile_tune` is still blocked. Use `bench_gemm_tnnt_tune` for any
 > ratio you intend to quote.
+>
+> **Reconciled with this tree (2026-10-10).** The restoration above was made
+> in the MLSystemsLab copy of this crate and never reached tessl: tessl's
+> `bench_gemm_tnnt_tune` was still blocked, and both binaries still exited 0
+> after `skip(pipe)`. Both now share `run_paired` (`src/bin/common/mod.rs`):
+> any `BENCH_ROUNDS` of at least 1 (default 6), forward and reverse orders
+> alternating, the median of per-round ratios with their range, an
+> `EXCEEDS 10%` line for a baseline that moved more than 10% across rounds
+> (exit status 3 once the run has printed), and exit status 2 before any
+> timing when a variant is not in the metallib. See docs/benchmarking.md.
 
 The same applies across runtimes. Two back-to-back runs of the identical
 cross-runtime sweep disagreed by 16–21% on the torch lane alone, which is why
@@ -332,7 +351,8 @@ were expanded across all primary GEMM paths:
 - **Accumulate kernels:** Replaced `multiply_accumulate` with cooperative zero→run→load-add-store
   bias pattern (`TILE_COOP_ACCUM` 64×64 sg4), cutting memory traffic to 1 read + 1 write total.
 - **NN Grid Swizzle:** Added column-panel swizzling (8 tile-rows per band) for large grids
-  (`tiles_n * tiles_m >= 2048`). Recorded at 29,022 GFLOP/s at $4096^3$ on M5 Pro
+  (`tiles_n * tiles_m >= 2048`); retired 2026-10-11 for `tile_walk`'s B-size gate, which every
+  family now shares (`bench/results/gemm_panel_walk_m5pro.txt`). Recorded at 29,022 GFLOP/s at $4096^3$ on M5 Pro
   when it landed. That peak has **not** reproduced: the paired ladder measured
   26,702 GFLOP/s at that shape on 2026-09-01 and 27,734 on 2026-09-03. Absolute
   GFLOP/s is the quantity the paired design exists to avoid comparing across runs,

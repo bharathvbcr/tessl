@@ -53,9 +53,9 @@ The name is short for *tessellation* — the design centers around how matrix op
 - **Pure Metal 4 Architecture:** Built strictly on Metal 4 primitives (`MTL4CommandBuffer`, `MTL4ComputeCommandEncoder`, `MTL4ArgumentTable`, `MTLResidencySet`). Legacy `MTLCommandQueue` and command buffer paths are deliberately absent.
 - **Hardware-Accelerated GEMM:** Direct integration with MPP TensorOps `matmul2d` across NN, TN, and NT layouts in `f32`, `bf16` (with `f32` accumulate), and `tf32-relaxed` precision modes.
 - **Cooperative Register Accumulators:** High-throughput cooperative destination kernels (`get_destination_cooperative_tensor`) holding `f32` accumulators in GPU registers across the entire $K$-reduction, eliminating device memory round-trips for NN, TN, NT, and accumulating paths.
-- **In-Kernel Grid Swizzling & Bounds Checking:** Column-panel tile swizzling bounding operand rereads (on large grids, $\ge 2048$ tiles, in the coop NN kernel; once $B$ holds $\ge 2^{23}$ elements in the exact-f32, bf16 TN/NT and int8 kernels), combined with origin-shifted slice bounds checking for ragged edges.
+- **In-Kernel Grid Swizzling & Bounds Checking:** Column-panel tile swizzling bounding operand rereads (once $B$ holds $\ge 2^{23}$ elements, one `tile_walk` policy for every GEMM family), combined with origin-shifted slice bounds checking for ragged edges.
 - **Zero-Wait Execution Pipeline:** Packed command encoding with bump-allocated constant arenas (16 MiB) and `MTLSharedEvent` synchronization—host threads never block mid-step, except to rewind the constant arena once per ~12 MiB of constants in a run that never synchronizes.
-- **Neural-Network Kernel Library:** 35 Metal source files providing 260 kernel entry points — RMSNorm, gated MLP activations (SiLU / GELU-tanh), flash attention (sliding-window $h{=}128/256$, global $h{=}512$), fused RMSNorm+QKV+RoPE, MLX-format Q4 GEMV/GEMM, Q8 GEMV, KV-cache stores, embedding lookup, row-wise softmax/sum/max, and softcap sampling. All reachable through 86 shape-checked entry points in `tessl::nn`, not as raw pipeline-name strings.
+- **Neural-Network Kernel Library:** 35 Metal source files providing 266 kernel entry points — RMSNorm, gated MLP activations (SiLU / GELU-tanh), flash attention (sliding-window $h{=}128/256$, global $h{=}512$), fused RMSNorm+QKV+RoPE, MLX-format Q4 GEMV/GEMM, Q8 GEMV, KV-cache stores, embedding lookup, row-wise softmax/sum/max, and softcap sampling. All reachable through 86 shape-checked entry points in `tessl::nn`, not as raw pipeline-name strings.
 - **Qwen3.5 Layer Kernels (`tessl::qwen35`):** the gated delta net as two fused dispatches (a parallel per-chunk prep with the 64×64 triangular solve in threadgroup memory, then a sequential `simdgroup_matrix` scan), a snapshot-reading recurrent decode, shared-prefix attention (one KV prefix at batch stride 0 for many questions), causal conv+SiLU, gated RMSNorm, Qwen's partial RoPE and output gate, and scoring of only the answer rows — see [docs/qwen35.md](docs/qwen35.md). Checked against transformers' own Qwen3.5 code on a CPU emulator of the kernels and compiled by Apple's Metal compiler in CI (`-std=metal4.0 -Werror`), and tested on the M5 Pro GPU (`tests/qwen35_kernels.rs`); per-kernel, forward and `train_step` timings on the M5 Pro are in the same document.
 - **Qwen3.5 Training on the GPU (`tessl::qwen35_train`, `qwen35_bwd`, `gdn_train`, `attn_train`, `cross_entropy`):** one full training step of the Qwen3.5 text model — forward with per-layer recompute, causal-LM loss, and every parameter's gradient — without leaving Metal. The gated delta rule saves one state per 64 tokens (32 MiB/layer at the 2B's shapes, T = 2048, versus 435 MiB in torch); the LM-head cross-entropy runs in vocabulary chunks and never forms `[rows, vocab]` logits; every weight gradient is a per-block partial summed in order, so a step is deterministic with no atomics. A step can also be split in two halves for a loss computed outside tessl, accumulated into a gradient bank, and scored only at chosen positions. Measured against transformers' own f32 reference in [docs/qwen35.md](docs/qwen35.md).
 - **EmbeddingGemma 2 Encoder (`tessl::embedgemma2`):** the `google/embeddinggemma-2` text path from its own checkpoint — bidirectional attention with a symmetric sliding window and per-sequence lengths, per-layer inputs, row-range mean pooling, and Matryoshka prefixes (`encode`'s `truncate_dim`) normalized on the GPU — with ragged batches split into length-sorted forwards. See [EmbeddingGemma 2](docs/embedgemma2.md).
@@ -238,7 +238,7 @@ flowchart TD
 
     LayoutCheck -- "TN exact f32, C under 128 tiles, K of 2+ partitions" --> ParTN["matmul2d_tensorops_tn_splitk_par_f32<br/>+ reduce_partitions_f32<br/>(all K partitions in one dispatch)"]
     LayoutCheck -- "TN / NT Layout" --> SplitKCheck{"prefer_tn_splitk?<br/>(K &gt;= 2048, M,N &lt;= 384,<br/>min(M,N) &lt;= 128)"}
-    SplitKCheck -- Yes --> SplitKKernel["matmul2d_tensorops_tn/nt_splitk_*<br/>(Split-K partial reductions)"]
+    SplitKCheck -- Yes --> SplitKKernel["bf16: matmul2d_tensorops_tn_splitk_par_bf16_f32<br/>+ reduce_partitions_f32 (all K partitions in one dispatch)<br/>exact f32 C +=: matmul2d_tensorops_tn_splitk_f32"]
     SplitKCheck -- No --> CoopTN["matmul2d_tensorops_tn/nt_*_f32<br/>• 128x64 sg4 Cooperative Destination<br/>• Single store, zero host pre-zeroing"]
 
     LayoutCheck -- "NN Layout" --> PrecisionCheck{"Precision Mode"}
@@ -501,6 +501,7 @@ TESSL_GEMM_TUNE=1 cargo build --release --bins
 | `bench_embedgemma2` | EmbeddingGemma 2 benchmark over ragged workloads, measuring peak device allocation and RSS. |
 | `probe_gdn_scan` | Probe of the gated-delta-net scan; `--paired` times paired 32- vs 16-column slice widths. |
 | `probe_gemm_parity` | Bit-exact verification probe comparing TensorOps against the reference SIMD path. |
+| `probe_gemm_bits` | Hashes every production GEMM entry point's output over a fixed shape grid; diff two builds' output to show a refactor kept every bit. |
 | `probe_storage_memory` | Measures parameter and optimizer memory footprint across Qwen3.5 precision variants. |
 | `probe_load_memory` | Measures model load memory and residency behavior. |
 | `bench/paired_cross_runtime.py` | Python harness driving paired `tessl` vs. PyTorch MPS / MLX evaluation. |
@@ -515,9 +516,6 @@ All runtime configuration uses the canonical `TESSL_*` prefix. Legacy
 | Variable | Default | Description |
 |---|---|---|
 | `TESSL_GEMM_TUNE` | `0` | Compiles the 92-kernel A/B tuning suite into the metallib (build-time). |
-| `TESSL_GEMM_ACCUM` | `0` | Enables native TensorOps `multiply_accumulate` for TN/NT accumulate paths. |
-| `TESSL_GEMM_ACCUM_DX` | `0` | Enables the hardware accumulate path specifically for $dX$ NT GEMM. |
-| `TESSL_GEMM_INTERIOR` | `0` | Enables interior-offset tile optimizations for `f32` GEMM. |
 | `TESSL_HAZARD_BARRIERS` | `0` (barriers on) | **Unsafe, do not enable.** `1` *removes* the always-on Dispatch→Dispatch device barrier. The sense is the opposite of what this row said until 2026-08-31, and following the old wording to "enforce barriers" removed them. Enabling it requires the caller to place an explicit `Binder::barrier` at every RAW edge, and tessl's own ops do not: measured on an M5 Pro, `gemm_tn_accum_train` 64×64×128 under async encode produced wrong results in **300 of 300** repetitions with this set. |
 | `TESSL_COARSE_BARRIERS` | inherits `TESSL_HAZARD_BARRIERS` | Replaces per-RAW barriers with coarse phase-level synchronization. |
 | `TESSL_MID_COMMIT=N` | `0` | Overlaps host command encoding with GPU execution every $N$ dispatches. |

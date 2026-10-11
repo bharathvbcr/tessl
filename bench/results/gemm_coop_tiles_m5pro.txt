@@ -1,0 +1,259 @@
+# Cooperative NN tiles on the batched and epilogue paths, against the plain path's rule
+#
+# Machine: Apple M5 Pro, macOS 27.0.1, 2026-10-11 07:00 UTC. GPU otherwise
+# idle; host load average was 40-50 from other sessions' CPU work during this
+# run (recorded below); per-shape baseline spreads are printed and nearly all
+# stayed under 10%.
+# Tree: 5d4debb's kernels plus the uncommitted 64x64 batched and epilogue
+# instantiations and src/bin/bench_gemm_routes.rs.
+# Command:
+#   BENCH_LANES=batched,epi cargo run --release --bin bench_gemm_routes
+#
+# Question: gemm_batched (batch > 1) always ran 128x64, and the f16 and
+# relaxed-f32 epilogues had no 64x64 instantiation, while the plain path
+# takes 64x64 at N <= 512 (and bf16 short M or small grids). Should batched
+# and the epilogue pick the plain path's tile?
+#
+# Method: bench_gemm_routes' interleaved A/B (async encode, 20 GEMMs per
+# command buffer, 8 calls per arm per round, 6 rounds alternating order).
+# Arms: production as it then was (128x64 batched, the old epilogue rule),
+# the 128x64 kernel raw, the 64x64 kernel raw. ratio = production / arm.
+# Each shape's arms were checked bit-identical before timing. Epilogue:
+# beta = 1, a bias and SiLU.
+#
+# Result:
+# - Epilogue: 64x64 won at every shape the plain rule sends to it, for all
+#   three element types: 1.11-2.01x at N <= 512 and at the bf16 grid-fill
+#   shapes (fewer than 64 tiles of 128x64), and lost at 128x4096 (64 tiles:
+#   0.82-0.95x), where the plain rule keeps 128x64.
+# - Batched: 64x64 won for bf16 and f16 at every shape (1.03-1.25x) and at
+#   bf16 short M (1.17x); relaxed f32 won on small grids (1.10-1.70x) but
+#   lost at 1024x256 x4 (0.90x) and 2048x128 x8 (0.93x).
+# Decision: the plain, epilogue and batched paths share one rule
+# (coop_narrow in src/gemm.rs), with 64x64 epilogue and batched kernels for
+# every element type. The relaxed-f32 batched losses are recorded in
+# gemm_batched's docstring: batched follows the single-matrix rule so a
+# batched call runs the kernel its per-matrix calls would, and whether
+# relaxed f32 should leave 64x64 on large grids is a question for that rule,
+# not measured here.
+#
+=== batched_epi 2026-10-11T07:00:53Z load: { 50.89 74.65 57.73 }
+device: Apple M5 Pro
+async encode, 20 GEMMs per command buffer, 8 calls per arm per round, 6 rounds (order reversed every other round) after 2 warmup calls; us per GEMM, median of per-round medians; ratio = first arm / this arm (> 1: this arm is faster), median of per-round ratios [range]
+
+batched bf16 M=256 N=64 K=64 batch=16  (outputs bit-identical)  (self-spread of production 3.1%)
+  production                  30.0 us   production/this 1.00 [1.00–1.00]
+  batched_128x64              30.2 us   production/this 0.99 [0.98–1.02]
+  batched_64x64               27.0 us   production/this 1.11 [1.03–1.12]
+
+batched f16 M=256 N=64 K=64 batch=16  (outputs bit-identical)  (self-spread of production 4.4%)
+  production                  30.1 us   production/this 1.00 [1.00–1.00]
+  batched_128x64              30.4 us   production/this 1.00 [0.96–1.04]
+  batched_64x64               27.5 us   production/this 1.11 [1.08–1.12]
+
+batched f32_relaxed M=256 N=64 K=64 batch=16  (outputs bit-identical)  (self-spread of production 4.8%)
+  production                  35.0 us   production/this 1.00 [1.00–1.00]
+  batched_128x64              34.3 us   production/this 1.03 [0.99–1.04]
+  batched_64x64               29.4 us   production/this 1.19 [1.12–1.23]
+
+batched bf16 M=512 N=128 K=512 batch=8  (outputs bit-identical)  (self-spread of production 77.0%, EXCEEDS 10%)
+  production                  34.2 us   production/this 1.00 [1.00–1.00]
+  batched_128x64              34.5 us   production/this 1.00 [0.97–1.31]
+  batched_64x64               32.8 us   production/this 1.06 [1.02–1.77]
+
+batched f16 M=512 N=128 K=512 batch=8  (outputs bit-identical)  (self-spread of production 7.2%)
+  production                  34.7 us   production/this 1.00 [1.00–1.00]
+  batched_128x64              34.3 us   production/this 1.02 [0.99–1.03]
+  batched_64x64               33.8 us   production/this 1.03 [1.01–1.05]
+
+batched f32_relaxed M=512 N=128 K=512 batch=8  (outputs bit-identical)  (self-spread of production 4.8%)
+  production                  47.7 us   production/this 1.00 [1.00–1.00]
+  batched_128x64              47.6 us   production/this 1.00 [0.98–1.03]
+  batched_64x64               43.7 us   production/this 1.10 [1.06–1.14]
+
+batched bf16 M=1024 N=256 K=256 batch=4  (outputs bit-identical)  (self-spread of production 8.7%)
+  production                  32.9 us   production/this 1.00 [1.00–1.00]
+  batched_128x64              33.3 us   production/this 0.99 [0.94–1.02]
+  batched_64x64               29.9 us   production/this 1.07 [1.03–1.15]
+
+batched f16 M=1024 N=256 K=256 batch=4  (outputs bit-identical)  (self-spread of production 3.4%)
+  production                  33.3 us   production/this 1.00 [1.00–1.00]
+  batched_128x64              33.6 us   production/this 1.01 [0.97–1.03]
+  batched_64x64               31.3 us   production/this 1.07 [1.01–1.16]
+
+batched f32_relaxed M=1024 N=256 K=256 batch=4  (outputs bit-identical)  (self-spread of production 3.5%)
+  production                  44.9 us   production/this 1.00 [1.00–1.00]
+  batched_128x64              44.6 us   production/this 1.01 [0.97–1.04]
+  batched_64x64               49.8 us   production/this 0.90 [0.88–0.92]
+
+batched bf16 M=128 N=512 K=2048 batch=4  (outputs bit-identical)  (self-spread of production 3.8%)
+  production                  67.4 us   production/this 1.00 [1.00–1.00]
+  batched_128x64              67.8 us   production/this 0.99 [0.98–1.01]
+  batched_64x64               53.9 us   production/this 1.24 [1.18–1.27]
+
+batched f16 M=128 N=512 K=2048 batch=4  (outputs bit-identical)  (self-spread of production 3.0%)
+  production                  68.3 us   production/this 1.00 [1.00–1.00]
+  batched_128x64              67.6 us   production/this 1.01 [1.00–1.02]
+  batched_64x64               54.4 us   production/this 1.25 [1.24–1.27]
+
+batched f32_relaxed M=128 N=512 K=2048 batch=4  (outputs bit-identical)  (self-spread of production 12.1%, EXCEEDS 10%)
+  production                 137.6 us   production/this 1.00 [1.00–1.00]
+  batched_128x64             139.7 us   production/this 1.01 [0.98–1.03]
+  batched_64x64               81.1 us   production/this 1.70 [1.59–1.78]
+
+batched bf16 M=2048 N=128 K=128 batch=8  (outputs bit-identical)  (self-spread of production 9.5%)
+  production                  41.0 us   production/this 1.00 [1.00–1.00]
+  batched_128x64              40.2 us   production/this 1.01 [0.99–1.05]
+  batched_64x64               36.9 us   production/this 1.11 [1.08–1.17]
+
+batched f16 M=2048 N=128 K=128 batch=8  (outputs bit-identical)  (self-spread of production 6.3%)
+  production                  40.7 us   production/this 1.00 [1.00–1.00]
+  batched_128x64              40.8 us   production/this 1.00 [0.99–1.02]
+  batched_64x64               36.4 us   production/this 1.12 [1.11–1.14]
+
+batched f32_relaxed M=2048 N=128 K=128 batch=8  (outputs bit-identical)  (self-spread of production 3.8%)
+  production                  56.6 us   production/this 1.00 [1.00–1.00]
+  batched_128x64              56.4 us   production/this 1.01 [0.98–1.01]
+  batched_64x64               61.0 us   production/this 0.93 [0.91–0.96]
+
+batched bf16 M=64 N=3072 K=768 batch=8  (outputs bit-identical)  (self-spread of production 2.1%)
+  production                 224.0 us   production/this 1.00 [1.00–1.00]
+  batched_128x64             222.5 us   production/this 1.00 [0.96–1.01]
+  batched_64x64              190.2 us   production/this 1.17 [1.14–1.18]
+
+epi bf16 M=2048 N=384 K=2048 beta=1 bias silu  (outputs bit-identical)  (self-spread of production 0.5%)
+  production                 169.7 us   production/this 1.00 [1.00–1.00]
+  epi_128x64                 169.6 us   production/this 1.00 [1.00–1.01]
+  epi_64x64                  152.6 us   production/this 1.11 [1.11–1.12]
+
+epi f16 M=2048 N=384 K=2048 beta=1 bias silu  (outputs bit-identical)  (self-spread of production 0.7%)
+  production                 169.7 us   production/this 1.00 [1.00–1.00]
+  epi_128x64                 170.3 us   production/this 1.00 [0.99–1.01]
+  epi_64x64                  152.5 us   production/this 1.11 [1.11–1.13]
+
+epi f32_relaxed M=2048 N=384 K=2048 beta=1 bias silu  (outputs bit-identical)  (self-spread of production 4.6%)
+  production                 307.2 us   production/this 1.00 [1.00–1.00]
+  epi_128x64                 308.2 us   production/this 1.00 [0.98–1.02]
+  epi_64x64                  237.0 us   production/this 1.30 [1.27–1.34]
+
+epi bf16 M=4096 N=128 K=768 beta=1 bias silu  (outputs bit-identical)  (self-spread of production 4.4%)
+  production                  76.8 us   production/this 1.00 [1.00–1.00]
+  epi_128x64                  76.8 us   production/this 1.00 [0.98–1.03]
+  epi_64x64                   65.1 us   production/this 1.18 [1.15–1.21]
+
+epi f16 M=4096 N=128 K=768 beta=1 bias silu  (outputs bit-identical)  (self-spread of production 5.8%)
+  production                  76.6 us   production/this 1.00 [1.00–1.00]
+  epi_128x64                  77.6 us   production/this 0.99 [0.95–1.03]
+  epi_64x64                   66.1 us   production/this 1.17 [1.12–1.20]
+
+epi f32_relaxed M=4096 N=128 K=768 beta=1 bias silu  (outputs bit-identical)  (self-spread of production 3.2%)
+  production                 102.1 us   production/this 1.00 [1.00–1.00]
+  epi_128x64                 102.7 us   production/this 1.00 [0.98–1.02]
+  epi_64x64                   73.4 us   production/this 1.40 [1.36–1.43]
+
+epi bf16 M=1024 N=256 K=1024 beta=1 bias silu  (outputs bit-identical)  (self-spread of production 5.6%)
+  production                  51.9 us   production/this 1.00 [1.00–1.00]
+  epi_128x64                  52.7 us   production/this 0.98 [0.93–1.02]
+  epi_64x64                   41.2 us   production/this 1.29 [1.24–1.32]
+
+epi f16 M=1024 N=256 K=1024 beta=1 bias silu  (outputs bit-identical)  (self-spread of production 8.8%)
+  production                  52.4 us   production/this 1.00 [1.00–1.00]
+  epi_128x64                  52.6 us   production/this 1.01 [0.96–1.04]
+  epi_64x64                   41.3 us   production/this 1.29 [1.21–1.31]
+
+epi f32_relaxed M=1024 N=256 K=1024 beta=1 bias silu  (outputs bit-identical)  (self-spread of production 3.4%)
+  production                  77.5 us   production/this 1.00 [1.00–1.00]
+  epi_128x64                  77.4 us   production/this 1.00 [0.98–1.03]
+  epi_64x64                   46.8 us   production/this 1.67 [1.61–1.71]
+
+epi bf16 M=512 N=512 K=512 beta=1 bias silu  (outputs bit-identical)  (self-spread of production 3.7%)
+  production                  42.3 us   production/this 1.00 [1.00–1.00]
+  epi_128x64                  41.8 us   production/this 1.02 [0.96–1.07]
+  epi_64x64                   31.5 us   production/this 1.35 [1.28–1.38]
+
+epi f16 M=512 N=512 K=512 beta=1 bias silu  (outputs bit-identical)  (self-spread of production 5.2%)
+  production                  41.5 us   production/this 1.00 [1.00–1.00]
+  epi_128x64                  41.7 us   production/this 1.00 [0.98–1.03]
+  epi_64x64                   31.2 us   production/this 1.35 [1.29–1.39]
+
+epi f32_relaxed M=512 N=512 K=512 beta=1 bias silu  (outputs bit-identical)  (self-spread of production 5.7%)
+  production                  53.3 us   production/this 1.00 [1.00–1.00]
+  epi_128x64                  53.0 us   production/this 1.01 [0.97–1.02]
+  epi_64x64                   35.5 us   production/this 1.48 [1.39–1.53]
+
+epi bf16 M=8192 N=512 K=768 beta=1 bias silu  (outputs bit-identical)  (self-spread of production 1.1%)
+  production                 441.0 us   production/this 1.00 [1.00–1.00]
+  epi_128x64                 441.2 us   production/this 1.00 [1.00–1.00]
+  epi_64x64                  332.3 us   production/this 1.33 [1.32–1.34]
+
+epi f16 M=8192 N=512 K=768 beta=1 bias silu  (outputs bit-identical)  (self-spread of production 1.1%)
+  production                 442.1 us   production/this 1.00 [1.00–1.00]
+  epi_128x64                 439.7 us   production/this 1.01 [1.00–1.01]
+  epi_64x64                  334.9 us   production/this 1.32 [1.30–1.34]
+
+epi f32_relaxed M=8192 N=512 K=768 beta=1 bias silu  (outputs bit-identical)  (self-spread of production 2.0%)
+  production                 595.3 us   production/this 1.00 [1.00–1.00]
+  epi_128x64                 597.1 us   production/this 1.00 [0.99–1.01]
+  epi_64x64                  507.2 us   production/this 1.17 [1.15–1.20]
+
+epi bf16 M=256 N=768 K=3072 beta=1 bias silu  (outputs bit-identical)  (self-spread of production 3.0%)
+  production                 111.4 us   production/this 1.00 [1.00–1.00]
+  epi_128x64                 110.3 us   production/this 1.01 [0.98–1.03]
+  epi_64x64                   69.9 us   production/this 1.59 [1.53–1.63]
+
+epi f16 M=256 N=768 K=3072 beta=1 bias silu  (outputs bit-identical)  (self-spread of production 2.6%)
+  production                 109.9 us   production/this 1.00 [1.00–1.00]
+  epi_128x64                 111.0 us   production/this 0.99 [0.98–1.01]
+  epi_64x64                   70.4 us   production/this 1.57 [1.54–1.62]
+
+epi f32_relaxed M=256 N=768 K=3072 beta=1 bias silu  (outputs bit-identical)  (self-spread of production 3.9%)
+  production                 184.5 us   production/this 1.00 [1.00–1.00]
+  epi_128x64                 185.7 us   production/this 1.00 [0.98–1.01]
+  epi_64x64                  101.2 us   production/this 1.83 [1.80–1.86]
+
+epi bf16 M=128 N=2048 K=2048 beta=1 bias silu  (outputs bit-identical)  (self-spread of production 2.2%)
+  production                  84.1 us   production/this 1.00 [1.00–1.00]
+  epi_128x64                  83.4 us   production/this 1.01 [0.98–1.04]
+  epi_64x64                   63.7 us   production/this 1.31 [1.30–1.38]
+
+epi f16 M=128 N=2048 K=2048 beta=1 bias silu  (outputs bit-identical)  (self-spread of production 3.9%)
+  production                  83.3 us   production/this 1.00 [1.00–1.00]
+  epi_128x64                  83.9 us   production/this 1.00 [0.98–1.02]
+  epi_64x64                   64.0 us   production/this 1.31 [1.28–1.34]
+
+epi f32_relaxed M=128 N=2048 K=2048 beta=1 bias silu  (outputs bit-identical)  (self-spread of production 2.9%)
+  production                 148.9 us   production/this 1.00 [1.00–1.00]
+  epi_128x64                 148.2 us   production/this 1.00 [0.99–1.03]
+  epi_64x64                   74.4 us   production/this 2.01 [1.94–2.04]
+
+epi bf16 M=512 N=768 K=3072 beta=1 bias silu  (outputs bit-identical)  (self-spread of production 1.5%)
+  production                 133.0 us   production/this 1.00 [1.00–1.00]
+  epi_128x64                 133.1 us   production/this 1.00 [0.99–1.01]
+  epi_64x64                  108.9 us   production/this 1.22 [1.21–1.24]
+
+epi f16 M=512 N=768 K=3072 beta=1 bias silu  (outputs bit-identical)  (self-spread of production 6.8%)
+  production                 136.5 us   production/this 1.00 [1.00–1.00]
+  epi_128x64                 135.3 us   production/this 1.01 [0.98–1.02]
+  epi_64x64                  115.2 us   production/this 1.20 [1.02–1.24]
+
+epi f32_relaxed M=512 N=768 K=3072 beta=1 bias silu  (outputs bit-identical)  (self-spread of production 20.2%, EXCEEDS 10%)
+  production                 229.8 us   production/this 1.00 [1.00–1.00]
+  epi_128x64                 220.1 us   production/this 1.02 [0.89–1.06]
+  epi_64x64                  212.4 us   production/this 1.06 [0.98–1.11]
+
+epi bf16 M=128 N=4096 K=4096 beta=1 bias silu  (outputs bit-identical)  (self-spread of production 9.6%)
+  production                 247.9 us   production/this 1.00 [1.00–1.00]
+  epi_128x64                 249.0 us   production/this 1.00 [0.98–1.02]
+  epi_64x64                  261.7 us   production/this 0.95 [0.92–1.00]
+
+epi f16 M=128 N=4096 K=4096 beta=1 bias silu  (outputs bit-identical)  (self-spread of production 5.9%)
+  production                 244.9 us   production/this 1.00 [1.00–1.00]
+  epi_128x64                 249.0 us   production/this 1.00 [0.98–1.01]
+  epi_64x64                  263.8 us   production/this 0.94 [0.90–0.96]
+
+epi f32_relaxed M=128 N=4096 K=4096 beta=1 bias silu  (outputs bit-identical)  (self-spread of production 2.5%)
+  production                 424.5 us   production/this 1.00 [1.00–1.00]
+  epi_128x64                 428.7 us   production/this 0.99 [0.97–1.01]
+  epi_64x64                  521.1 us   production/this 0.82 [0.81–0.83]
+exit 0
+=== end 2026-10-11T07:01:10Z load: { 41.31 71.37 56.85 }

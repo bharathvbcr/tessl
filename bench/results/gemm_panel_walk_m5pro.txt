@@ -1,0 +1,182 @@
+# One panel-walk policy for every GEMM family — per-lane A/B
+#
+# Machine: Apple M5 Pro, macOS 27.0.1, 2026-10-11 06:49 UTC. GPU otherwise
+# idle; host load average 12-16 (other sessions' CPU work), recorded below.
+# Tree: 120f675 plus the bench lanes and tune variants of b61a765.
+# Command:
+#   TESSL_GEMM_TUNE=1 cargo build --release --bins
+#   BENCH_ONLY=walk_ BENCH_ROUNDS=8 BENCH_ITERS=5 BENCH_WARMUP=4 \
+#     target/release/bench_gemm_tnnt_tune
+# (`walk_` also matches the f32walk_ lanes; they are the exact-f32 run of
+# bench/results/f32_exact_mlp_up_gap_m5pro.txt.)
+#
+# Question: two walk policies served one problem. The coop NN kernels
+# panelled by grid size (>= 2048 tiles -> 8 tile rows per band, else
+# tile_from_linear); every other family used `tile_walk` (B = N x K >= 2^23
+# elements -> 512-row bands, Morton kept on square power-of-two grids).
+#
+# Method: bench_gemm_tnnt_tune's interleaved A/B (8 rounds, order reversed
+# every other round). Production arm: the public API with the walk it then
+# shipped. Variants: the same production cooperative kernel (edges included,
+# from gemm_coop.h's mm_coop) under the other policy — `_walkb` puts the NN
+# kernels on tile_walk, `_walkg` puts TN, NT and their accumulates on the NN
+# gate. Outputs are bit-identical (err 0): the walk only orders the tiles.
+# Ratios are production / variant (> 1: the variant is faster). Rows flagged
+# EXCEEDS 10% had a baseline that drifted across rounds; read them as
+# uninformative, not as ties.
+#
+# Result, at the shapes whose baseline held still:
+#   NN on tile_walk:  1.14x [1.08-1.19] at 1024x8192x2048 (B only), 1.06x at
+#                     the 2B MLP up/gate, 1.03x at MLP down, 0.99x at 4096^3.
+#   TN/NT/accumulate on the NN gate: 0.94x at the 2B dX (NT) and dW (TN)
+#                     shapes, 0.96x TN accumulate at 3072^2, 1.00-1.01x
+#                     elsewhere.
+# tile_walk is never worse beyond noise and wins where the two disagree.
+# (The two shapes where it drops the gate's panels drifted here; re-run at
+# the end of this file with stable baselines: 0.99-1.01x, a tie.)
+# Decision: every family walks by tile_walk (`walk_by_b`); the NN gate stays
+# in gemm_coop.h only as `walk_by_grid`, for the tune `_walkg` variants.
+# The routed kernels' output is unchanged bit for bit (walk only).
+#
+=== walk 2026-10-11T06:49:49Z load: { 15.99 14.93 32.46 }
+interleaved A/B: 8 rounds (order reversed every other round), 5 timed calls per arm per round after 4 warmup; times are medians of per-round medians, ratios are medians of per-round production/variant ratios [range]
+
+walk_nn_grid_only  M=4096 N=4096 K=1024   production 1.249 ms  27510 GFLOP/s  (self-spread 18.3%, err 0.00e0)
+  EXCEEDS 10%: ratios below are not comparable
+  mm_bf16_coop_128x64_sg4_walkb            1.243       27646    1.01× [0.97–1.04]      0.00e0
+  mm_bf16_coop_64x64_sg4_walkb             1.254       27390    1.00× [0.95–1.14]      0.00e0
+
+walk_nn_both  M=4096 N=4096 K=4096   production 4.642 ms  29605 GFLOP/s  (self-spread 7.5%, err 0.00e0)
+  mm_bf16_coop_128x64_sg4_walkb            4.704       29219    0.99× [0.98–1.00]      0.00e0
+  mm_bf16_coop_64x64_sg4_walkb             4.675       29399    0.99× [0.99–1.01]      0.00e0
+
+walk_nn_morton_sq64  M=8192 N=4096 K=4096   production 9.855 ms  27892 GFLOP/s  (self-spread 14.8%, err 0.00e0)
+  EXCEEDS 10%: ratios below are not comparable
+  mm_bf16_coop_128x64_sg4_walkb            9.819       27994    1.00× [0.99–1.01]      0.00e0
+  mm_bf16_coop_64x64_sg4_walkb             9.912       27731    0.99× [0.97–1.01]      0.00e0
+
+walk_nn_b16m_grid2048  M=2048 N=8192 K=2048   production 2.736 ms  25116 GFLOP/s  (self-spread 31.4%, err 0.00e0)
+  EXCEEDS 10%: ratios below are not comparable
+  mm_bf16_coop_128x64_sg4_walkb            2.754       24949    0.99× [0.97–1.27]      0.00e0
+  mm_bf16_coop_64x64_sg4_walkb             2.761       24890    0.99× [0.95–1.27]      0.00e0
+
+walk_nn_b_only  M=1024 N=8192 K=2048   production 1.658 ms  20719 GFLOP/s  (self-spread 3.9%, err 0.00e0)
+  mm_bf16_coop_128x64_sg4_walkb            1.451       23682    1.14× [1.08–1.19]      0.00e0
+  mm_bf16_coop_64x64_sg4_walkb             1.431       24015    1.14× [1.06–1.17]      0.00e0
+
+walk_nn_q35_mlp_up  M=2048 N=6144 K=2048   production 2.173 ms  23717 GFLOP/s  (self-spread 6.0%, err 0.00e0)
+  mm_bf16_coop_128x64_sg4_walkb            2.040       25264    1.06× [1.02–1.09]      0.00e0
+  mm_bf16_coop_64x64_sg4_walkb             2.121       24299    1.03× [0.99–1.05]      0.00e0
+
+walk_nn_q35_mlp_down  M=2048 N=2048 K=6144   production 2.169 ms  23759 GFLOP/s  (self-spread 5.2%, err 0.00e0)
+  mm_bf16_coop_128x64_sg4_walkb            2.116       24357    1.03× [0.98–1.08]      0.00e0
+  mm_bf16_coop_64x64_sg4_walkb             2.144       24044    1.02× [0.96–1.07]      0.00e0
+
+walk_nn_mlp_up  M=8192 N=3072 K=768   production 1.575 ms  24536 GFLOP/s  (self-spread 37.6%, err 0.00e0)
+  EXCEEDS 10%: ratios below are not comparable
+  mm_bf16_coop_128x64_sg4_walkb            1.570       24620    1.01× [0.96–1.32]      0.00e0
+  mm_bf16_coop_64x64_sg4_walkb             1.561       24760    1.00× [1.00–1.33]      0.00e0
+
+walk_nn_lmhead_50304  M=4096 N=50304 K=768   production 11.844 ms  26721 GFLOP/s  (self-spread 27.0%, err 0.00e0)
+  EXCEEDS 10%: ratios below are not comparable
+  mm_bf16_coop_128x64_sg4_walkb           11.966       26448    1.00× [0.98–1.01]      0.00e0
+  mm_bf16_coop_64x64_sg4_walkb            11.965       26451    0.99× [0.96–1.01]      0.00e0
+
+walk_nn_lm_head  M=1024 N=248320 K=2048   production 38.015 ms  27398 GFLOP/s  (self-spread 15.0%, err 0.00e0)
+  EXCEEDS 10%: ratios below are not comparable
+  mm_bf16_coop_128x64_sg4_walkb           38.196       27268    1.00× [0.96–1.01]      0.00e0
+  mm_bf16_coop_64x64_sg4_walkb            40.439       25756    0.94× [0.83–1.00]      0.00e0
+
+walk_nn_control  M=2048 N=2048 K=2048   production 0.821 ms  20934 GFLOP/s  (self-spread 14.8%, err 0.00e0)
+  EXCEEDS 10%: ratios below are not comparable
+  mm_bf16_coop_128x64_sg4_walkb            0.814       21107    0.99× [0.93–1.06]      0.00e0
+  mm_bf16_coop_64x64_sg4_walkb             0.832       20656    0.97× [0.90–1.01]      0.00e0
+
+walk_nt_both  M=4096 N=8192 K=2048   production 4.745 ms  28967 GFLOP/s  (self-spread 4.4%, err 0.00e0)
+  mm_bf16_nt_coop_128x64_sg4_walkg         4.747       28950    1.00× [0.98–1.02]      0.00e0
+
+walk_nt_grid_only  M=4096 N=4096 K=1024   production 1.423 ms  24152 GFLOP/s  (self-spread 5.6%, err 0.00e0)
+  mm_bf16_nt_coop_128x64_sg4_walkg         1.418       24225    1.01× [0.97–1.06]      0.00e0
+
+walk_nt_lmhead_50304  M=4096 N=50304 K=768   production 10.479 ms  30202 GFLOP/s  (self-spread 10.8%, err 0.00e0)
+  EXCEEDS 10%: ratios below are not comparable
+  mm_bf16_nt_coop_128x64_sg4_walkg        10.463       30248    1.01× [0.98–1.02]      0.00e0
+
+walk_nt_q35_dx_down  M=2048 N=6144 K=2048   production 1.920 ms  26847 GFLOP/s  (self-spread 4.2%, err 0.00e0)
+  mm_bf16_nt_coop_128x64_sg4_walkg         2.035       25323    0.94× [0.93–0.98]      0.00e0
+
+walk_tn_both  M=2048 N=8192 K=4096   production 4.727 ms  29078 GFLOP/s  (self-spread 2.8%, err 0.00e0)
+  mm_bf16_tn_coop_128x64_sg4_walkg         4.733       29038    1.00× [0.98–1.01]      0.00e0
+
+walk_tn_lmhead_dw  M=768 N=50304 K=4096   production 10.865 ms  29130 GFLOP/s  (self-spread 7.5%, err 0.00e0)
+  mm_bf16_tn_coop_128x64_sg4_walkg        10.720       29523    1.01× [1.00–1.02]      0.00e0
+
+walk_tn_q35_dw_up  M=2048 N=6144 K=2048   production 1.893 ms  27233 GFLOP/s  (self-spread 5.6%, err 0.00e0)
+  mm_bf16_tn_coop_128x64_sg4_walkg         2.010       25637    0.94× [0.91–0.97]      0.00e0
+
+walk_tn_control  M=2048 N=4096 K=1024   production 0.741 ms  23174 GFLOP/s  (self-spread 6.2%, err 0.00e0)
+  mm_bf16_tn_coop_128x64_sg4_walkg         0.745       23046    0.99× [0.92–1.06]      0.00e0
+
+walk_ntacc_morton_grid  M=4096 N=4096 K=1024   production 1.420 ms  24189 GFLOP/s  (self-spread 4.9%, err 0.00e0)
+  mm_bf16_nt_accum_coop_64x64_sg4_walkg     1.413       24321    1.00× [0.99–1.03]      0.00e0
+
+walk_ntacc_grid_only  M=3072 N=3072 K=1024   production 0.879 ms  22000 GFLOP/s  (self-spread 7.9%, err 0.00e0)
+  mm_bf16_nt_accum_coop_64x64_sg4_walkg     0.875       22094    1.01× [0.99–1.05]      0.00e0
+
+walk_tnacc_morton_grid  M=4096 N=4096 K=1024   production 1.477 ms  23257 GFLOP/s  (self-spread 46.1%, err 0.00e0)
+  EXCEEDS 10%: ratios below are not comparable
+  mm_bf16_tn_accum_coop_64x64_sg4_walkg     1.494       23000    0.99× [0.91–1.18]      0.00e0
+
+walk_tnacc_grid_only  M=3072 N=3072 K=1024   production 0.886 ms  21804 GFLOP/s  (self-spread 4.9%, err 0.00e0)
+  mm_bf16_tn_accum_coop_64x64_sg4_walkg     0.924       20914    0.96× [0.85–1.01]      0.00e0
+
+# Re-run, 2026-10-11 13:46 UTC: the two shapes where tile_walk drops the
+# grid gate's panels (walk_nn_grid_only: 2048 tiles, B = 4M elements;
+# walk_nn_mlp_up: 3072 tiles, B = 2.4M) both broke the 10% self-spread
+# above, so "never worse" had no stable evidence where the policies
+# disagree in that direction. Tree: 3829434 (production NN on tile_walk;
+# the `_walkg` arms are the retired grid gate). Three runs of 12 rounds,
+# one locked job (Lappi-decision/tools/mac_heavy.sh,
+# MAC_HEAVY_MAX_LOAD=60); host load ~10. (The GPU utilization in runs 2
+# and 3 was sampled one second after the previous run ended and is that
+# run's own tail.) Command:
+#   TESSL_GEMM_TUNE=1 cargo build --release --bin bench_gemm_tnnt_tune
+#   BENCH_ONLY=walk_nn_grid_only,walk_nn_mlp_up BENCH_ROUNDS=12 \
+#     BENCH_ITERS=5 BENCH_WARMUP=4 target/release/bench_gemm_tnnt_tune
+# Result: every baseline held (self-spread 3.7-8.1%, exit 0 each time) and
+# tile_walk ran at 0.99-1.01x of the grid gate at both shapes, all three
+# runs: a tie. The decision stands.
+#
+=== rerun 1 2026-10-11T13:46:14Z load: { 10.25 10.62 12.50 } gpu: "Device Utilization %"=8
+interleaved A/B: 12 rounds (order reversed every other round), 5 timed calls per arm per round after 4 warmup; times are medians of per-round medians, ratios are medians of per-round production/variant ratios [range]
+
+walk_nn_grid_only  M=4096 N=4096 K=1024   production 1.242 ms  27663 GFLOP/s  (self-spread 8.1%, err 0.00e0)
+  mm_bf16_coop_128x64_sg4_walkg            1.248       27527    1.00× [0.96–1.04]      0.00e0
+  mm_bf16_coop_64x64_sg4_walkg             1.236       27795    1.00× [0.97–1.07]      0.00e0
+
+walk_nn_mlp_up  M=8192 N=3072 K=768   production 1.378 ms  28048 GFLOP/s  (self-spread 4.6%, err 0.00e0)
+  mm_bf16_coop_128x64_sg4_walkg            1.387       27873    1.00× [0.97–1.03]      0.00e0
+  mm_bf16_coop_64x64_sg4_walkg             1.386       27886    1.00× [0.97–1.03]      0.00e0
+exit=0
+=== rerun 2 2026-10-11T13:46:15Z load: { 10.25 10.62 12.50 } gpu: "Device Utilization %"=75
+interleaved A/B: 12 rounds (order reversed every other round), 5 timed calls per arm per round after 4 warmup; times are medians of per-round medians, ratios are medians of per-round production/variant ratios [range]
+
+walk_nn_grid_only  M=4096 N=4096 K=1024   production 1.256 ms  27367 GFLOP/s  (self-spread 5.5%, err 0.00e0)
+  mm_bf16_coop_128x64_sg4_walkg            1.260       27270    1.00× [0.97–1.02]      0.00e0
+  mm_bf16_coop_64x64_sg4_walkg             1.250       27495    1.01× [0.98–1.03]      0.00e0
+
+walk_nn_mlp_up  M=8192 N=3072 K=768   production 1.400 ms  27601 GFLOP/s  (self-spread 4.5%, err 0.00e0)
+  mm_bf16_coop_128x64_sg4_walkg            1.405       27509    1.00× [0.96–1.01]      0.00e0
+  mm_bf16_coop_64x64_sg4_walkg             1.394       27732    1.00× [0.98–1.05]      0.00e0
+exit=0
+=== rerun 3 2026-10-11T13:46:16Z load: { 10.25 10.62 12.50 } gpu: "Device Utilization %"=83
+interleaved A/B: 12 rounds (order reversed every other round), 5 timed calls per arm per round after 4 warmup; times are medians of per-round medians, ratios are medians of per-round production/variant ratios [range]
+
+walk_nn_grid_only  M=4096 N=4096 K=1024   production 1.259 ms  27289 GFLOP/s  (self-spread 3.7%, err 0.00e0)
+  mm_bf16_coop_128x64_sg4_walkg            1.265       27156    0.99× [0.96–1.03]      0.00e0
+  mm_bf16_coop_64x64_sg4_walkg             1.250       27493    1.00× [0.98–1.02]      0.00e0
+
+walk_nn_mlp_up  M=8192 N=3072 K=768   production 1.407 ms  27478 GFLOP/s  (self-spread 5.4%, err 0.00e0)
+  mm_bf16_coop_128x64_sg4_walkg            1.406       27502    0.99× [0.95–1.03]      0.00e0
+  mm_bf16_coop_64x64_sg4_walkg             1.382       27972    1.00× [0.97–1.05]      0.00e0
+exit=0

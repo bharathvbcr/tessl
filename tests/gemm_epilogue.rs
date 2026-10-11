@@ -16,7 +16,9 @@ mod common;
 use std::sync::Arc;
 
 use common::{close_rel, gelu_pytorch_tanh, random_f32, silu, tensor_bf16, with_gpu};
-use tessl::gemm::{gemm, gemm_epilogue, gemm_epilogue_tiled, Activation, EpiTile, Epilogue, GemmBackend};
+use tessl::gemm::{
+    cast_f32_to_f16, gemm, gemm_epilogue, gemm_epilogue_tiled, Activation, EpiTile, Epilogue, GemmBackend,
+};
 use tessl::tensor::Tensor;
 use tessl::GpuRuntime;
 
@@ -442,6 +444,56 @@ fn the_epilogue_refuses_paths_with_nothing_to_fuse_into() {
     });
 }
 
+/// The refusal names the API that turns relaxed precision on and the dtypes
+/// the path takes, and reads as one line. It used to name
+/// `PrecisionMode::Relaxed`, which does not exist (`PrecisionMode` is `F32`
+/// or `Bf16`; relaxed is `GpuRuntime::set_relaxed_precision`), left f16 out,
+/// and carried two 14-space runs from a multi-line literal written without
+/// `\` continuations. `qwen35::project_residual` returns the same refusal.
+#[test]
+fn epilogue_refusals_name_the_real_precision_api_in_one_line() {
+    with_gpu(|rt| {
+        rt.set_relaxed_precision(false);
+        let (m, n, k) = (64usize, 64usize, 64usize);
+        let a = tensor(rt, &[m, k], &vec![1.0f32; m * k]);
+        let b = tensor(rt, &[k, n], &vec![1.0f32; k * n]);
+        let c = tensor(rt, &[m, n], &vec![0.0f32; m * n]);
+        let epi = Epilogue {
+            activation: Activation::Relu,
+            ..Default::default()
+        };
+        let direct = gemm_epilogue(&a, &b, &c, GemmBackend::TensorOps, epi).expect_err("exact f32");
+        let residual = tessl::qwen35::project_residual(&a, &b, &c, GemmBackend::TensorOps).expect_err("exact f32");
+        for err in [&direct, &residual] {
+            assert!(err.contains("set_relaxed_precision"), "{err}");
+            assert!(err.contains("bf16 or f16 operands"), "{err}");
+            assert!(!err.contains("PrecisionMode::Relaxed"), "{err}");
+            assert!(!err.contains("  ") && !err.contains('\n'), "whitespace run in: {err:?}");
+        }
+
+        rt.set_relaxed_precision(true);
+        let short = tensor(rt, &[n - 1], &vec![0.0f32; n - 1]);
+        let err = gemm_epilogue(
+            &a,
+            &b,
+            &c,
+            GemmBackend::TensorOps,
+            Epilogue {
+                bias: Some(&short),
+                ..Default::default()
+            },
+        )
+        .expect_err("short bias");
+        assert_eq!(
+            err,
+            format!(
+                "GEMM epilogue: bias is per-column and must hold at least N = {n} elements, got {}",
+                n - 1
+            )
+        );
+    });
+}
+
 #[test]
 fn a_short_bias_is_refused() {
     with_gpu(|rt| {
@@ -568,23 +620,52 @@ fn narrow_bf16_epilogue_matches_wide_within_unfused_tolerance() {
             }
         }
 
-        rt.set_relaxed_precision(true);
-        let (m, n, k) = (32usize, 32usize, 32usize);
-        let a = tensor(rt, &[m, k], &vec![1.0f32; m * k]);
-        let b = tensor(rt, &[k, n], &vec![1.0f32; k * n]);
-        let c = tensor(rt, &[m, n], &vec![0.0f32; m * n]);
-        let err = gemm_epilogue_tiled(
-            &a,
-            &b,
-            &c,
-            GemmBackend::TensorOps,
-            Epilogue {
-                beta: 1.0,
-                ..Epilogue::default()
-            },
-            EpiTile::Narrow,
-        )
-        .expect_err("f32 has no 64x64 epilogue");
-        assert!(err.contains("bf16"), "{err}");
+        // f16 and relaxed f32 have the 64x64 epilogue too (the plain path's
+        // N <= 512 tile), and it gives the wide tile's bits.
+        let (m, n, k) = (200usize, 384usize, 96usize);
+        let a_h = random_f32(m * k, 0xE500);
+        let b_h = random_f32(k * n, 0xE600);
+        let c_h = random_f32(m * n, 0xE700);
+        let bias_h = random_f32(n, 0xE800);
+        let bias = tensor(rt, &[n], &bias_h);
+        for relaxed in [false, true] {
+            rt.set_relaxed_precision(relaxed);
+            let (a, b) = if relaxed {
+                (tensor(rt, &[m, k], &a_h), tensor(rt, &[k, n], &b_h))
+            } else {
+                let (a, b) = (tensor(rt, &[m, k], &a_h), tensor(rt, &[k, n], &b_h));
+                (cast_f32_to_f16(&a).unwrap(), cast_f32_to_f16(&b).unwrap())
+            };
+            let outs: Vec<Vec<f32>> = [Some(EpiTile::Wide), Some(EpiTile::Narrow), None]
+                .into_iter()
+                .map(|tile| {
+                    let c = tensor(rt, &[m, n], &c_h);
+                    let epi = residual_or_silu(true, &bias);
+                    match tile {
+                        Some(t) => gemm_epilogue_tiled(&a, &b, &c, GemmBackend::TensorOps, epi, t),
+                        None => gemm_epilogue(&a, &b, &c, GemmBackend::TensorOps, epi),
+                    }
+                    .expect("epilogue");
+                    rt.synchronize().unwrap();
+                    c.buffer.read_f32()[..m * n].to_vec()
+                })
+                .collect();
+            assert!(
+                outs[0].iter().any(|v| v.abs() > 1e-3),
+                "relaxed={relaxed}: wide wrote nothing"
+            );
+            for (name, out) in [("narrow", &outs[1]), ("auto", &outs[2])] {
+                let differ = out
+                    .iter()
+                    .zip(&outs[0])
+                    .filter(|(x, y)| x.to_bits() != y.to_bits())
+                    .count();
+                assert_eq!(
+                    differ, 0,
+                    "relaxed={relaxed}: {name} epilogue differs from wide in {differ} outputs"
+                );
+            }
+        }
+        rt.set_relaxed_precision(false);
     });
 }

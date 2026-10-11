@@ -14,7 +14,9 @@ use common::{
     assert_within_bound, random_f32, reference, round_trip_bf16, silu, tensor_bf16, tensor_f32, tolerance, with_gpu,
     Layout, Reference, U_BF16,
 };
-use tessl::gemm::{gemm_epilogue, gemm_epilogue_tiled, gemm_tiled, Activation, EpiTile, Epilogue, GemmBackend};
+use tessl::gemm::{
+    cast_f32_to_f16, gemm_epilogue, gemm_epilogue_tiled, gemm_tiled, Activation, EpiTile, Epilogue, GemmBackend,
+};
 use tessl::tensor::{bf16_bits_to_f32, f16_bits_to_f32, f32_slice_to_f16};
 use tessl::{gemm, DType, GpuRuntime, Tensor};
 
@@ -380,9 +382,10 @@ fn close_abs(what: &str, got: &[f32], want: &[f32], tol: f32) {
 
 /// Partial M and partial N, with a bias longer than N and a NaN guard past
 /// both the bias and C. The edge tile has to ignore that guard. A short bias
-/// and an f16 request for the 64×64 epilogue are refused before dispatch.
+/// is refused before dispatch, and f16's 64×64 epilogue matches its 128×64
+/// one bit for bit.
 #[test]
-fn short_m_epilogue_ragged_bias_keeps_its_guard_and_refuses_the_wrong_tile() {
+fn short_m_epilogue_ragged_bias_keeps_its_guard_and_refuses_a_short_bias() {
     attack_shape();
     with_gpu(|rt| {
         require_tensorops(rt);
@@ -406,25 +409,32 @@ fn short_m_epilogue_ragged_bias_keeps_its_guard_and_refuses_the_wrong_tile() {
         assert!(err.contains("per-column"), "{err}");
         assert_eq!(rt.take_dispatch_count(), 0, "a short bias encoded a dispatch");
 
-        let a16 = rt.alloc_tensor_f16(&[m, K]).unwrap();
-        let b16 = rt.alloc_tensor_f16(&[K, N]).unwrap();
-        let err = gemm_epilogue_tiled(
-            &a16,
-            &b16,
-            &c,
-            GemmBackend::TensorOps,
-            Epilogue {
-                beta: 1.0,
-                ..Epilogue::default()
-            },
-            EpiTile::Narrow,
-        )
-        .expect_err("f16 narrow epilogue");
-        assert!(err.contains("bf16"), "{err}");
-        assert_eq!(
-            rt.take_dispatch_count(),
-            0,
-            "a refused f16 narrow epilogue encoded a dispatch"
+        // f16 has the 64x64 epilogue too (the plain path's tile at N <= 512),
+        // and on this ragged shape it gives the 128x64 tile's bits.
+        let a16 = cast_f32_to_f16(&tensor_f32(rt, &[m, K], &random_f32(m * K, 0xE510))).unwrap();
+        let b16 = cast_f32_to_f16(&tensor_f32(rt, &[K, N], &random_f32(K * N, 0xE511))).unwrap();
+        let c_prev = random_f32(m * N, 0xE512);
+        let mut outs = Vec::new();
+        for tile in [EpiTile::Wide, EpiTile::Narrow] {
+            let c16 = tensor_f32(rt, &[m, N], &c_prev);
+            gemm_epilogue_tiled(
+                &a16,
+                &b16,
+                &c16,
+                GemmBackend::TensorOps,
+                Epilogue {
+                    beta: 1.0,
+                    ..Epilogue::default()
+                },
+                tile,
+            )
+            .expect("f16 epilogue");
+            rt.synchronize().unwrap();
+            outs.push(c16.buffer.read_f32()[..m * N].to_vec());
+        }
+        assert!(
+            outs[0].iter().zip(&outs[1]).all(|(w, n)| w.to_bits() == n.to_bits()),
+            "f16 64x64 epilogue differs from 128x64"
         );
 
         let alpha = 0.75f32;

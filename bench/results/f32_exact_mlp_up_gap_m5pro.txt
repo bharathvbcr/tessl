@@ -1,0 +1,211 @@
+# Exact-f32 NN at the 2B MLP up/gate shape: the 4.1 vs 5.7 TFLOP/s gap, reproduced and diagnosed
+#
+# Machine: Apple M5 Pro, macOS 27.0.1, 2026-10-11 06:49-06:52 UTC. GPU
+# otherwise idle; host load average 10-16 (recorded per run below).
+# Tree: 120f675 plus the bench lanes and tune variants of b61a765.
+# Commands (three runs, separate processes, interleaved within each):
+#   TESSL_GEMM_TUNE=1 cargo build --release --bins
+#   BENCH_ONLY=f32walk BENCH_ROUNDS=8 BENCH_ITERS=5 BENCH_WARMUP=4 \
+#     target/release/bench_gemm_tnnt_tune           # runs A and B below
+#   (a third copy of the lane ran inside the walk run of
+#   bench/results/gemm_panel_walk_m5pro.txt, same numbers to within 6%)
+#   BENCH_LANES=f32 BENCH_ONLY=q35_mlp_up,square_2048,q35_mlp_down \
+#     BENCH_ROUNDS=8 BENCH_ITERS=5 target/release/bench_gemm_tile_tune  # run C
+#
+# The claim (bench/results/f32_exact_coop_m5pro.txt, 2026-09-30, one run on
+# the then-blocked tile-tune rig): production's exact-f32 NN ran
+# 2048x6144x2048 at 4.1 TFLOP/s against 5.7 at 2048^3, and a 128x64 sg8
+# register-accumulator tile ran it 1.37-1.45x faster with the same bits.
+#
+# Method: interleaved A/B (8 rounds, order reversed every other round, 5
+# timed calls per arm per round). Production is `gemm` on f32 operands.
+# The other arms run the production 32x32 kernel body (mm_exact_f32) in one
+# dispatch under each tile walk: `_linear` (tile_from_linear: Morton on
+# square power-of-two grids, row-major otherwise; production's walk on
+# 2026-09-30), `_rowmajor`, and `_ph8/_ph16/_ph32` (column panels of 8, 16
+# and 32 tile rows; ph16 is tile_walk's 512-row band at 32-row tiles), plus
+# `matmul2d_tensorops_f32` itself (production's kernel in one dispatch, on
+# tile_walk) and the coop exact tiles. err is against production's output.
+#
+# Reproduced: under the 2026-09-30 walk the up/gate shape is slow. A:
+# 5.06 TFLOP/s (`_linear`) against 5.67 at 2048^3; B: 4.97 against 6.09.
+# The GDN in-projection (2048x8224x2048) shows it more: 4.1-4.4 TFLOP/s
+# against 6.6-7.0 on panels.
+#
+# Diagnosis: B is the cause, through the tile walk. At 2048x6144x2048 B is
+# K x N f32 = 50 MB (67 MB at N = 8224), past what the GPU keeps cached;
+# the grid (192 x 64 tiles of 32x32) is not square, so tile_from_linear
+# walks it row-major, and each of the 64 tile rows re-reads all of B from
+# DRAM. Evidence, same runs:
+# - every column-panel walk restores the square shape's speed: ph8/16/32
+#   ran 5.85-6.75 TFLOP/s at the up/gate shape (1.05-1.12x production,
+#   1.16-1.24x row-major) and 6.6-7.0 at the GDN in-projection (1.58-1.60x
+#   row-major);
+# - 2048^3 (B = 16 MB, a square power-of-two grid in Morton order) is
+#   insensitive to the walk: every arm within 0.99-1.03x;
+# - at MLP down (2048x2048x6144, B = 50 MB but a square grid) Morton keeps
+#   it fast and only plain row-major loses (0.87-0.91x).
+# The coop 128x64 tiles' 1.37-1.45x on 2026-09-30 is the same effect: a
+# 128-row tile re-reads B a quarter as often. Under panels they gain
+# 1.04-1.16x over production at up/gate, as at every other shape there
+# (bench_gemm_tile_tune run C: 1.07-1.15x up/gate, 0.96-1.02x elsewhere).
+#
+# Fixed already: tile_walk's column panels (07f6990, 2026-10-03, after the
+# claim) are what production's exact-f32 kernels walk by. A walk only orders
+# the tiles, so output is bit-identical across every walk arm (same err to
+# the last digit), and src/gemm.rs's panel_walk_matches_row_major_chunks_bit_for_bit
+# tests that. Production now runs up/gate at 5.6-6.1 TFLOP/s, at 0.92-1.01x
+# of 2048^3 in the same run: the gap is closed.
+#
+# Left, not fixed: production now routes up/gate (and MLP down) through the
+# exact-f32 NN split-K (nn_splitk_k_tile: 8 partitions of 256 rows at
+# up/gate), which runs at 0.90-0.95x of one panel-walked dispatch of the
+# same kernel (production / matmul2d_tensorops_f32: 1.05-1.11x favouring the
+# single dispatch). Taking one dispatch there would change exact-f32 output
+# bits (err 2.19e-6 between the two routes: K is summed in a different
+# order), which this card's exact-f32 bit-identity rule does not allow, so
+# it is a follow-up: narrow nn_splitk_k_tile (made for the LM head's dX at
+# K = 50304) to shapes it measured faster on.
+#
+
+### run: f32walk_a
+=== f32walk_a 2026-10-11T06:49:35Z load: { 14.39 14.58 32.66 }
+interleaved A/B: 8 rounds (order reversed every other round), 5 timed calls per arm per round after 4 warmup; times are medians of per-round medians, ratios are medians of per-round production/variant ratios [range]
+
+f32walk_q35_mlp_up  M=2048 N=6144 K=2048   production 9.251 ms  5571 GFLOP/s  (self-spread 14.7%, err 0.00e0)
+  EXCEEDS 10%: ratios below are not comparable
+  matmul2d_tensorops_f32                   8.802        5856    1.05× [1.05–1.12]     2.19e-6
+  mm_f32_exact_32x32_linear               10.181        5062    0.90× [0.87–0.93]     2.19e-6
+  mm_f32_exact_32x32_rowmajor             10.171        5068    0.91× [0.84–0.93]     2.19e-6
+  mm_f32_exact_32x32_ph8                   8.805        5853    1.05× [1.04–1.11]     2.19e-6
+  mm_f32_exact_32x32_ph16                  8.794        5861    1.05× [1.04–1.10]     2.19e-6
+  mm_f32_exact_32x32_ph32                  8.795        5860    1.05× [1.03–1.10]     2.19e-6
+  mm_f32_exact_coop_128x64_sg4             8.787        5865    1.05× [1.02–1.11]     2.19e-6
+  mm_f32_exact_coop_128x64_sg8             8.500        6063    1.09× [1.05–1.15]     2.19e-6
+  mm_f32_exact_coop_64x64_sg4              8.517        6052    1.07× [1.00–1.14]     2.19e-6
+
+f32walk_square_2048  M=2048 N=2048 K=2048   production 3.028 ms  5673 GFLOP/s  (self-spread 12.4%, err 0.00e0)
+  EXCEEDS 10%: ratios below are not comparable
+  matmul2d_tensorops_f32                   3.028        5673    1.01× [0.98–1.01]      0.00e0
+  mm_f32_exact_32x32_linear                2.999        5728    1.01× [0.89–1.04]      0.00e0
+  mm_f32_exact_32x32_rowmajor              3.022        5686    0.99× [0.98–1.02]      0.00e0
+  mm_f32_exact_32x32_ph8                   3.036        5658    1.00× [0.96–1.03]      0.00e0
+  mm_f32_exact_32x32_ph16                  3.033        5665    1.00× [0.96–1.04]      0.00e0
+  mm_f32_exact_32x32_ph32                  3.028        5674    1.00× [0.97–1.05]      0.00e0
+  mm_f32_exact_coop_128x64_sg4             3.040        5651    1.00× [0.98–1.03]      0.00e0
+  mm_f32_exact_coop_128x64_sg8             2.960        5803    1.02× [1.01–1.08]      0.00e0
+  mm_f32_exact_coop_64x64_sg4              2.950        5823    1.03× [1.01–1.05]      0.00e0
+
+f32walk_q35_mlp_down  M=2048 N=2048 K=6144   production 8.111 ms  6355 GFLOP/s  (self-spread 5.9%, err 0.00e0)
+  matmul2d_tensorops_f32                   8.015        6430    1.02× [1.01–1.03]     3.88e-6
+  mm_f32_exact_32x32_linear                8.000        6443    1.02× [1.00–1.03]     3.88e-6
+  mm_f32_exact_32x32_rowmajor              8.926        5774    0.91× [0.89–0.93]     3.88e-6
+  mm_f32_exact_32x32_ph8                   8.034        6415    1.01× [1.00–1.03]     3.88e-6
+  mm_f32_exact_32x32_ph16                  8.054        6399    1.01× [0.99–1.03]     3.88e-6
+  mm_f32_exact_32x32_ph32                  8.136        6335    1.00× [0.98–1.02]     3.88e-6
+  mm_f32_exact_coop_128x64_sg4             8.429        6115    0.96× [0.94–0.98]     3.88e-6
+  mm_f32_exact_coop_128x64_sg8             8.039        6411    1.01× [0.99–1.03]     3.88e-6
+  mm_f32_exact_coop_64x64_sg4              8.060        6394    1.01× [0.99–1.03]     3.88e-6
+
+f32walk_q35_gdn_in  M=2048 N=8224 K=2048   production 9.843 ms  7009 GFLOP/s  (self-spread 3.3%, err 0.00e0)
+  matmul2d_tensorops_f32                   9.838        7013    1.00× [0.99–1.01]      0.00e0
+  mm_f32_exact_32x32_linear               15.555        4435    0.63× [0.59–0.66]      0.00e0
+  mm_f32_exact_32x32_rowmajor             15.474        4458    0.63× [0.62–0.66]      0.00e0
+  mm_f32_exact_32x32_ph8                   9.848        7005    1.00× [0.99–1.01]      0.00e0
+  mm_f32_exact_32x32_ph16                  9.887        6977    1.00× [1.00–1.01]      0.00e0
+  mm_f32_exact_32x32_ph32                  9.850        7004    1.00× [0.99–1.00]      0.00e0
+  mm_f32_exact_coop_128x64_sg4        skip(div): the shape is not a multiple of the tile
+  mm_f32_exact_coop_128x64_sg8        skip(div): the shape is not a multiple of the tile
+  mm_f32_exact_coop_64x64_sg4         skip(div): the shape is not a multiple of the tile
+bench_gemm_tnnt_tune: the production baseline moved more than 10% across rounds at 2 shape(s): f32walk_q35_mlp_up, f32walk_square_2048; their ratios are not comparable
+exit 3
+=== end 2026-10-11T06:49:49Z load: { 15.99 14.93 32.46 }
+
+### run: f32walk_b
+=== f32walk_b 2026-10-11T06:51:36Z load: { 9.98 12.86 29.60 }
+interleaved A/B: 8 rounds (order reversed every other round), 5 timed calls per arm per round after 4 warmup; times are medians of per-round medians, ratios are medians of per-round production/variant ratios [range]
+
+f32walk_q35_mlp_up  M=2048 N=6144 K=2048   production 8.951 ms  5758 GFLOP/s  (self-spread 7.6%, err 0.00e0)
+  matmul2d_tensorops_f32                   8.417        6123    1.06× [1.04–1.20]     2.19e-6
+  mm_f32_exact_32x32_linear               10.372        4969    0.85× [0.82–0.91]     2.19e-6
+  mm_f32_exact_32x32_rowmajor             10.438        4938    0.85× [0.82–0.91]     2.19e-6
+  mm_f32_exact_32x32_ph8                   8.511        6056    1.05× [0.95–1.21]     2.19e-6
+  mm_f32_exact_32x32_ph16                  8.448        6100    1.05× [1.05–1.13]     2.19e-6
+  mm_f32_exact_32x32_ph32                  8.512        6055    1.05× [1.03–1.09]     2.19e-6
+  mm_f32_exact_coop_128x64_sg4             8.516        6052    1.04× [1.02–1.13]     2.19e-6
+  mm_f32_exact_coop_128x64_sg8             8.242        6253    1.09× [0.86–1.24]     2.19e-6
+  mm_f32_exact_coop_64x64_sg4              8.483        6076    1.06× [0.98–1.19]     2.19e-6
+
+f32walk_square_2048  M=2048 N=2048 K=2048   production 2.822 ms  6088 GFLOP/s  (self-spread 2.8%, err 0.00e0)
+  matmul2d_tensorops_f32                   2.819        6094    1.00× [0.96–1.03]      0.00e0
+  mm_f32_exact_32x32_linear                2.823        6086    1.00× [0.98–1.04]      0.00e0
+  mm_f32_exact_32x32_rowmajor              2.820        6091    0.99× [0.97–1.03]      0.00e0
+  mm_f32_exact_32x32_ph8                   2.811        6112    0.99× [0.98–1.02]      0.00e0
+  mm_f32_exact_32x32_ph16                  2.811        6113    1.00× [0.98–1.03]      0.00e0
+  mm_f32_exact_32x32_ph32                  2.830        6070    1.00× [0.97–1.01]      0.00e0
+  mm_f32_exact_coop_128x64_sg4             2.853        6021    0.99× [0.96–1.01]      0.00e0
+  mm_f32_exact_coop_128x64_sg8             2.759        6228    1.02× [0.98–1.05]      0.00e0
+  mm_f32_exact_coop_64x64_sg4              2.753        6240    1.02× [0.98–1.05]      0.00e0
+
+f32walk_q35_mlp_down  M=2048 N=2048 K=6144   production 8.107 ms  6358 GFLOP/s  (self-spread 4.6%, err 0.00e0)
+  matmul2d_tensorops_f32                   7.949        6483    1.02× [0.96–1.05]     3.88e-6
+  mm_f32_exact_32x32_linear                7.901        6524    1.02× [1.01–1.05]     3.88e-6
+  mm_f32_exact_32x32_rowmajor              9.237        5580    0.87× [0.86–0.89]     3.88e-6
+  mm_f32_exact_32x32_ph8                   8.036        6414    1.01× [1.00–1.03]     3.88e-6
+  mm_f32_exact_32x32_ph16                  8.026        6421    1.01× [0.96–1.05]     3.88e-6
+  mm_f32_exact_32x32_ph32                  8.243        6253    0.98× [0.92–1.03]     3.88e-6
+  mm_f32_exact_coop_128x64_sg4             8.436        6110    0.95× [0.94–1.00]     3.88e-6
+  mm_f32_exact_coop_128x64_sg8             8.067        6389    1.01× [0.96–1.04]     3.88e-6
+  mm_f32_exact_coop_64x64_sg4              8.065        6391    1.00× [0.98–1.04]     3.88e-6
+
+f32walk_q35_gdn_in  M=2048 N=8224 K=2048   production 10.420 ms  6621 GFLOP/s  (self-spread 3.5%, err 0.00e0)
+  matmul2d_tensorops_f32                  10.436        6611    1.00× [0.99–1.01]      0.00e0
+  mm_f32_exact_32x32_linear               16.594        4157    0.63× [0.61–0.64]      0.00e0
+  mm_f32_exact_32x32_rowmajor             16.761        4116    0.63× [0.60–0.65]      0.00e0
+  mm_f32_exact_32x32_ph8                  10.398        6635    0.99× [0.99–1.02]      0.00e0
+  mm_f32_exact_32x32_ph16                 10.388        6641    1.00× [0.99–1.01]      0.00e0
+  mm_f32_exact_32x32_ph32                 10.386        6642    1.00× [0.99–1.01]      0.00e0
+  mm_f32_exact_coop_128x64_sg4        skip(div): the shape is not a multiple of the tile
+  mm_f32_exact_coop_128x64_sg8        skip(div): the shape is not a multiple of the tile
+  mm_f32_exact_coop_64x64_sg4         skip(div): the shape is not a multiple of the tile
+exit 0
+=== end 2026-10-11T06:51:49Z load: { 10.32 12.81 29.29 }
+
+### run: tile_f32
+=== tile_f32 2026-10-11T06:51:49Z load: { 10.32 12.81 29.29 }
+kernel                               maxTPTG      tgMem(B)  requested TPTG
+mm_bf16_64x32_bk128_sg4_accf            1024             0             128
+mm_bf16_64x64_bk256_sg4                 1024             0             128
+mm_bf16_128x64_bk256_sg8                1024             0             256
+mm_bf16_128x128_bk256_sg4               1024             0             128
+mm_bf16_coop_64x32_sg4                  1024             0             128
+mm_bf16_coop_64x64_sg4                  1024             0             128
+mm_bf16_coop_128x64_sg4                 1024             0             128
+mm_bf16_coop_128x64_sg8                 1024             0             256
+mm_bf16_coop_128x128_sg8                1024             0             256
+mm_bf16_coop_256x64_sg8                 1024             0             256
+mm_f32_exact_coop_64x64_sg4             1024             0             128
+mm_f32_exact_coop_128x64_sg4            1024             0             128
+mm_f32_exact_coop_128x64_sg8            1024             0             256
+
+interleaved A/B: 8 rounds (order reversed every other round), 5 timed calls per arm per round after 10 warmup; times are medians of per-round medians, ratios are medians of per-round production/variant ratios [range]
+
+square_2048 [exact f32]  M=2048 N=2048 K=2048   production 2.597 ms  6615 GFLOP/s  (self-spread 4.2%)
+  variant                                 ms     GFLOP/s  vs prod          range max_rel_err
+  mm_f32_exact_coop_64x64_sg4          2.516        6829    1.02×   [1.02–1.04]      0.00e0
+  mm_f32_exact_coop_128x64_sg4         2.606        6593    0.99×   [0.97–1.02]      0.00e0
+  mm_f32_exact_coop_128x64_sg8         2.536        6773    1.02×   [0.92–1.04]      0.00e0
+
+q35_mlp_up [exact f32]  M=2048 N=6144 K=2048   production 8.479 ms  6078 GFLOP/s  (self-spread 7.9%)
+  variant                                 ms     GFLOP/s  vs prod          range max_rel_err
+  mm_f32_exact_coop_64x64_sg4          7.836        6577    1.09×   [0.85–1.14]     2.19e-6
+  mm_f32_exact_coop_128x64_sg4         7.943        6489    1.07×   [1.00–1.12]     2.19e-6
+  mm_f32_exact_coop_128x64_sg8         7.488        6883    1.15×   [1.10–1.19]     2.19e-6
+
+q35_mlp_down [exact f32]  M=2048 N=2048 K=6144   production 8.043 ms  6408 GFLOP/s  (self-spread 2.3%)
+  variant                                 ms     GFLOP/s  vs prod          range max_rel_err
+  mm_f32_exact_coop_64x64_sg4          7.965        6470    1.01×   [1.01–1.01]     3.88e-6
+  mm_f32_exact_coop_128x64_sg4         8.362        6163    0.96×   [0.96–0.96]     3.88e-6
+  mm_f32_exact_coop_128x64_sg8         7.986        6454    1.00×   [0.99–1.02]     3.88e-6
+exit 0
+=== end 2026-10-11T06:51:54Z load: { 10.29 12.76 29.18 }

@@ -56,7 +56,7 @@ Apple GEMM checklist → our status on M5 Pro:
 | 2.3.5 | Static tensor extents | **DONE** where shapes fixed | `slice<DIM,…>` |
 | — | Packed zero+matmul | **DONE** | Killed double-binder tax |
 | — | TN/NT + split-K (attn/MLP dW) | **DONE** | |
-| — | Interior offset tiles | **CLOSED** | Measured ≤1 ms / slower — `METAL_NATIVE_GEMM_INTERIOR=1` only |
+| — | Interior offset tiles | **CLOSED** | Measured ≤1 ms / slower; retired 2026-10-11 at 0.99–1.01× (bench/results/gemm_interior_m5pro.txt), and `METAL_NATIVE_GEMM_INTERIOR` is no longer read |
 | 3.x coop **inputs** | Cooperative tensor **inputs** | **macOS 26.3+** API available | Prefer for new epilogues when shapes fit |
 | 3.x coop **postfix** | MLP-up cooperative postfix | **OPEN / optional** | A/B only if epilogue still BW-bound after NAX util gate |
 | Muon NS5 | simdgroup **inside** bank | **DONE** (keep on) | Not TensorOps; profile NAX util before rewrite |

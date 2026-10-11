@@ -3,8 +3,6 @@
 //! The defaults below are conservative on purpose. Each one was measured to
 //! matter, and the unsafe direction is the one that looks like free speed:
 //! - always-on Device barrier after each dispatch (golden-safe)
-//! - f32 GEMM interior offset tiles off by default
-//! - TensorOps multiply_accumulate off by default
 //!
 //! Env names are canonically `TESSL_*`. The legacy `METAL_RUNTIME_*`,
 //! `METAL_NATIVE_*` and (for coarse barriers only) `GEMMA_METAL_*` spellings are
@@ -17,7 +15,6 @@
 //! through to the default.
 
 use std::sync::atomic::{AtomicI8, Ordering};
-use std::sync::OnceLock;
 
 // Env name lists, canonical `TESSL_*` first and legacy spellings after. They are
 // named constants rather than inline literals because the *order* is the part
@@ -25,21 +22,6 @@ use std::sync::OnceLock;
 // `GEMMA_METAL_COARSE_BARRIERS` ahead of its own canonical name, so the one flag
 // whose doc promised "TESSL_* first" was the one flag that did not do it. A test
 // pins the invariant for every list at once.
-const ENV_GEMM_INTERIOR: &[&str] = &[
-    "TESSL_GEMM_INTERIOR",
-    "METAL_RUNTIME_GEMM_INTERIOR",
-    "METAL_NATIVE_GEMM_INTERIOR",
-];
-const ENV_GEMM_ACCUM: &[&str] = &[
-    "TESSL_GEMM_ACCUM",
-    "METAL_RUNTIME_GEMM_ACCUM",
-    "METAL_NATIVE_GEMM_ACCUM",
-];
-const ENV_GEMM_ACCUM_DX: &[&str] = &[
-    "TESSL_GEMM_ACCUM_DX",
-    "METAL_RUNTIME_GEMM_ACCUM_DX",
-    "METAL_NATIVE_GEMM_ACCUM_DX",
-];
 const ENV_HAZARD_BARRIERS: &[&str] = &[
     "TESSL_HAZARD_BARRIERS",
     "METAL_RUNTIME_HAZARD_BARRIERS",
@@ -73,9 +55,9 @@ fn parse_truthy(value: Option<&str>) -> Option<bool> {
 /// `lookup` is a parameter rather than a hard-wired `std::env::var` so the
 /// precedence rule can be tested against a table. Mutating the real environment
 /// from a test is not an option here: `setenv` races every concurrent `getenv`,
-/// and this crate reads env lazily from inside GPU paths ([`flags`] latches on
-/// the first `gemm_accum()` call, which happens mid-GEMM), so a test that set a
-/// variable could corrupt an unrelated test's numerics rather than its own.
+/// and this crate reads env lazily from inside GPU paths ([`hazard_barriers`]
+/// latches on the first dispatch that asks), so a test that set a variable
+/// could corrupt an unrelated test's numerics rather than its own.
 ///
 /// Lazy on purpose: `find_map` stops at the first name that parses, so a later
 /// name is not even looked up.
@@ -85,19 +67,6 @@ fn resolve(names: &[&str], lookup: impl Fn(&str) -> Option<String>) -> Option<bo
 
 pub(crate) fn env_truthy(names: &[&str]) -> Option<bool> {
     resolve(names, |name| std::env::var(name).ok())
-}
-
-fn flags() -> &'static (bool, bool, bool) {
-    static FLAGS: OnceLock<(bool, bool, bool)> = OnceLock::new();
-    FLAGS.get_or_init(|| {
-        let gemm_interior = env_truthy(ENV_GEMM_INTERIOR).unwrap_or(false);
-        let gemm_accum = env_truthy(ENV_GEMM_ACCUM).unwrap_or(false);
-        // dX-only accumulate. Separate from `gemm_accum` because every NT-accum
-        // call site targets a fresh pre-zeroed activation-grad buffer, never a
-        // weight bank — the case the full flag was turned off for.
-        let gemm_accum_dx = env_truthy(ENV_GEMM_ACCUM_DX).unwrap_or(false);
-        (gemm_interior, gemm_accum, gemm_accum_dx)
-    })
 }
 
 /// -1 = unset (read env), 0 = always-on barriers, 1 = skip auto (hazard mode).
@@ -116,11 +85,6 @@ pub fn hazard_barriers_explicitly_set() -> bool {
     HAZARD_BARRIERS.load(Ordering::Relaxed) >= 0
 }
 
-/// Use interior offset tile extents in f32 GEMM. Default: false.
-pub fn gemm_interior_offsets() -> bool {
-    flags().0
-}
-
 /// Skip always-on Dispatch→Dispatch Device barrier after every `Binder::dispatch`.
 /// Packed multi-dispatch ops still insert explicit barriers. Default: false
 /// (golden-safe). **Do not enable as default** without RAW-edge barriers.
@@ -132,18 +96,6 @@ pub fn hazard_barriers() -> bool {
     let from_env = env_truthy(ENV_HAZARD_BARRIERS).unwrap_or(false);
     HAZARD_BARRIERS.store(if from_env { 1 } else { 0 }, Ordering::Relaxed);
     from_env
-}
-
-/// Use TensorOps `multiply_accumulate` for accumulate GEMMs. Default: false.
-pub fn gemm_accum() -> bool {
-    flags().1
-}
-
-/// Accumulate-mode for the **dX** NT path only. Every caller accumulates into a
-/// fresh pre-zeroed activation-grad buffer, never a weight bank, so this is safe
-/// to enable independently of [`gemm_accum`].
-pub fn gemm_accum_dx() -> bool {
-    flags().2
 }
 
 /// -1 unset, 0 fine-grained RAW barriers, 1 phase-coarsened (default when hazard).
@@ -208,14 +160,14 @@ mod tests {
 
     // Concurrency policy for this module's tests, stated once.
     //
-    // These flags are process-global (`OnceLock` + `AtomicI8`) with an env
+    // These flags are process-global (`AtomicI8`) with an env
     // fallback that latches on first read, and cargo runs tests as parallel
     // threads in one process. So:
     //
     // * Nothing here mutates the environment. `setenv` is not thread-safe against
     //   a concurrent `getenv`, and this crate reads env lazily from inside GPU
-    //   paths (`flags()` latches on the first `gemm_accum()`, mid-GEMM), so a
-    //   test that set a variable could corrupt an unrelated test's numerics.
+    //   paths (`hazard_barriers()` latches on the first dispatch that asks),
+    //   so a test that set a variable could corrupt an unrelated test's numerics.
     //   Parsing and precedence are covered through `parse_truthy` / `resolve`
     //   with a table-driven lookup instead, which is stronger anyway: it can
     //   assert which names were consulted, which env vars cannot.
@@ -322,9 +274,6 @@ mod tests {
     #[test]
     fn every_flag_reads_its_canonical_tessl_name_first() {
         let lists: &[(&str, &[&str])] = &[
-            ("gemm_interior", ENV_GEMM_INTERIOR),
-            ("gemm_accum", ENV_GEMM_ACCUM),
-            ("gemm_accum_dx", ENV_GEMM_ACCUM_DX),
             ("hazard_barriers", ENV_HAZARD_BARRIERS),
             ("coarse_barriers", ENV_COARSE_BARRIERS),
         ];

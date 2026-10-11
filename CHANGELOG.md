@@ -8,6 +8,16 @@ All notable changes to `tessl` are recorded here. The format follows
 
 ### Added
 
+- **Measurements: exact f32 at the 2B MLP up/gate shape, and int8.** The
+  4.1 vs 5.7 TFLOP/s exact-f32 gap at 2048x6144x2048 reproduces under the
+  row-major walk production had on 2026-09-30 and is the B operand (50 MB)
+  re-read per tile row; `tile_walk`'s panels already close it with the same
+  bits, and the split-K route production takes there is left as a follow-up
+  because changing it would change exact-f32 bits
+  (`bench/results/f32_exact_mlp_up_gap_m5pro.txt`). int8: exact at sampled
+  outputs with and without `b_scale`, 45-57 TOP/s, `b_scale` costing 0-18%;
+  the NT variant and a per-row scale are filed there as follow-ups
+  (`bench/results/gemm_i8_m5pro.txt`).
 - **bf16 MLP inputs, measured and not adopted.** A bf16-output GEMM and a
   SwiGLU reading bf16 gate and up were built, measured and removed: paired on
   the M5 Pro, SwiGLU was 0.65x but the bf16-output GEMMs 1.06x and the
@@ -143,8 +153,93 @@ All notable changes to `tessl` are recorded here. The format follows
   are still refused. Adding variants to the exhaustive `Dtype` enum breaks an
   external `match` on it.
 
+### Changed (breaking)
+
+- **`gemm_{tn,nt}_accum_train` always run the accumulate kernels on
+  TensorOps;
+  `TESSL_GEMM_ACCUM` and `TESSL_GEMM_ACCUM_DX` are retired.** Training has
+  reached the accumulate kernels through `GemmOperands::{tn_acc, nt_acc}`
+  with no flag since that API landed, weight banks included; the flags gated
+  only these two legacy entries, which otherwise computed the product into a
+  temporary and added it. They are now `GemmOperands`' path on the precision
+  the runtime picks (bit for bit, pinned by
+  `accumulate_train_entries_run_the_accumulate_kernels`), so the rounding of
+  `C += ...` changes for callers that left the flags unset, as ojas's
+  `arch02` trainer does (`model_bwd.rs`). The simdgroup backend, which has
+  no accumulate kernel and is `select_backend`'s pick without TensorOps,
+  still adds a temporary; `transpose_edges_precision_and_accumulation`
+  checks its `C +=` against a CPU sum. The
+  variables, including their `METAL_RUNTIME_*` / `METAL_NATIVE_*` spellings,
+  are no longer read.
+- **`ab_flags::gemm_accum`, `gemm_accum_dx` and `gemm_interior_offsets`
+  are removed** with the variables they read (`TESSL_GEMM_ACCUM`,
+  `TESSL_GEMM_ACCUM_DX`, `TESSL_GEMM_INTERIOR`, and their `METAL_RUNTIME_*` /
+  `METAL_NATIVE_*` spellings), which nothing reads any more. No caller in
+  ojas, gemma-metal or tessl-arch02 used them.
+
 ### Changed
 
+- **bf16 TN at the split-K-gated dW shapes runs a parallel split-K.** The
+  shapes `prefer_tn_splitk` picks (K >= 2048, M, N <= 384, min <= 128) took
+  a sequential split-K: a zero pass, then one 64x32 `multiply_accumulate`
+  dispatch per 256 rows of K. Every partition now runs in one dispatch as a
+  cooperative 64x64 tile set into its own scratch slice
+  (`matmul2d_tensorops_tn_splitk_par_bf16_f32`), and `reduce_partitions_f32`
+  (or the new `reduce_partitions_add_f32` for `C +=`) sums the slices in
+  partition order; `gemm_tn_splitk_par_bf16` takes an explicit width. Paired
+  on the M5 Pro it was 2.4-19x faster at its best width at every gated shape,
+  overwriting and accumulating (`bench/results/splitk_par_bf16_m5pro.txt`,
+  `bench_gemm_routes`, which also re-measured the imported split-K gate: it
+  held, and is superseded). The sequential bf16 kernel is removed. Outputs
+  at those shapes round differently (partials per partition), within the
+  same f32 bound.
+- **The cooperative NN paths share one tile rule.** bf16 now also takes
+  64x64 when C has fewer than 64 tiles of 128x64, the rule
+  `bench/results/bf16_smallm_coop_m5pro.txt` (an import from the
+  MLSystemsLab copy) described and `bf16_smallm_coop_reconciled_m5pro.txt`
+  re-measured on tessl's kernels (1.16-1.56x in every such case). The fused
+  epilogue and `gemm_batched` (batch > 1) now pick the plain path's tile,
+  with 64x64 epilogue and batched kernels for bf16, f16 and relaxed f32;
+  the epilogue measured 1.11-2.01x faster on 64x64 wherever the rule picks
+  it (`bench/results/gemm_coop_tiles_m5pro.txt`), and the relaxed-f32
+  batched exceptions are in `gemm_batched`'s docstring. The tiles give the
+  same bits, so outputs are unchanged.
+- **One panel-walk policy for every GEMM family.** The cooperative NN
+  kernels (plain, epilogue, batched) walked tiles by their own gate (8-row
+  column panels from 2048 tiles); everything else used `tile_walk` (512-row
+  panels once B reaches 2^23 elements, Morton kept). Interleaved per lane,
+  `tile_walk` was never worse beyond noise and won where they disagreed:
+  NN 1.14x at 1024x8192x2048 and 1.06x at the Qwen3.5-2B MLP up/gate shape,
+  while the grid gate lost 0.94x on the 2B TN/NT shapes
+  (`bench/results/gemm_panel_walk_m5pro.txt`). NN now walks by `tile_walk`;
+  output is bit for bit unchanged (`gemm_coop_header_bits_m5pro.txt`), and
+  `panel_walk_matches_row_major_chunks_bit_for_bit` now runs the coop NN
+  kernels past the gate too.
+- **`TESSL_GEMM_INTERIOR` is retired.** It sent the exact-f32 kernels'
+  interior tiles through offset pointer tensors; interleaved on the
+  Qwen3.5-2B training shapes, that ran at 0.99-1.01x of the slice path every
+  tile takes by default (`bench/results/gemm_interior_m5pro.txt`). The
+  branch, the kernels' `buffer(8)` argument and the variable (with its
+  `METAL_RUNTIME_*` / `METAL_NATIVE_*` spellings) are gone; the default
+  output is unchanged (the 495-output bit snapshot,
+  `bench/results/gemm_coop_header_bits_m5pro.txt`), and
+  `no_source_reads_a_retired_gemm_flag` pins that nothing reads it, or the
+  accumulate flags, again.
+- **One source for the GEMM tile bodies: `kernels/gemm_coop.h`.** The tile
+  walks, the interior and edge operand views of a tile, the cooperative
+  destination body (zero, run, accumulate or epilogue, store) and the
+  exact-f32 body moved into a header that `matmul_tensorops.metal` and the
+  tune variants both include. The six exact-f32 kernels are one template
+  (`mm_exact_f32`, by layout and `multiply` vs `multiply_accumulate`), the
+  epilogue is written once for interior and edge tiles, and every tune coop
+  variant is an instantiation of the production `mm_coop` with its own
+  tile, walk and layout, so a tune winner and the kernel that ships it
+  cannot drift. The two kernel files went from 1714 lines to 909 plus the
+  396-line header. Output is bit for bit what it was: FNV hashes of every
+  production GEMM entry point over 495 (entry, shape) cases matched before
+  and after (`probe_gemm_bits`, rebuilt against each commit in
+  `bench/results/gemm_coop_header_bits_m5pro.txt`), and the GEMM suites
+  pass unchanged.
 - **`infer_trace` counts every allocator catch-up as a sync wait.** The
   counter's doc says `sync_waits` and `sync_wait_us` include allocator
   catch-ups, but only the catch-up inside a waiting commit was counted; the
@@ -570,6 +665,28 @@ All notable changes to `tessl` are recorded here. The format follows
   -88 to -100 and the f32 epilogue at accumulators -88.5 to -100 (reciprocal
   or IEEE lowering, not a NaN), so they stay as guards. The tests' f64 sigmoid and SiLU are one oracle in
   `tests/common`, also sign-branched.
+- **The GEMM epilogue's refusal names the real precision API.** It named
+  `PrecisionMode::Relaxed`, which does not exist (relaxed f32 is
+  `GpuRuntime::set_relaxed_precision`), left out f16, and carried two
+  14-space runs from a multi-line literal without `\` continuations; the
+  short-bias refusal had one too. `qwen35::project_residual`'s doc had the
+  same wording. `epilogue_refusals_name_the_real_precision_api_in_one_line`
+  (`tests/gemm_epilogue.rs`) pins both messages. The headers of
+  `kernels/matmul_tensorops.metal` and the tune file described the
+  pre-cooperative design (64x32 tiles, C zeroed once, a 256x64 NN arm) and
+  now describe the shipped kernels.
+- **The GEMM tuning rigs are interleaved A/Bs and refuse to run without
+  their kernels.** `bench_gemm_tnnt_tune` timed production for all its
+  iterations before any variant, though `docs/benchmarking.md` called it
+  interleaved, and `bench_gemm_tile_tune` did the same; both printed
+  `skip(pipe)` and exited 0 on a metallib without the tune kernels. Both now
+  time production and every variant as the arms of one A/B, round by round
+  with the order reversed every other round (`BENCH_ROUNDS`, `BENCH_ITERS`),
+  and report the median of per-round ratios with their range. A baseline that
+  moves more than 10% across a shape's rounds prints `EXCEEDS 10%` and makes
+  the run exit 3; a missing variant exits 2 before anything is timed
+  (`tests/tune_rigs_refuse_missing_variants.rs`). `bench_gemm_tnnt_tune`'s
+  accumulate lanes now time production through `GemmOperands::Bf16`.
 - **Async encode without a waiting sync poisoned the runtime.** Every scalar
   bind takes a slot in the 16 MiB constant arena, and only a waiting commit
   rewound it, so a run that never called `synchronize` failed a bind with

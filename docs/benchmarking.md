@@ -9,15 +9,17 @@ you changed in the kernel.**
 
 | tool | for |
 | --- | --- |
-| `bench_gemm_tnnt_tune` | Paired, interleaved TN/NT kernel A/B. Use this for kernel comparisons. |
-| `bench_gemm_tile_tune` | Broad tile/BK ladder. Blocked-style timing — see pitfall 1. |
+| `bench_gemm_tnnt_tune` | Interleaved TN/NT/accumulate kernel A/B against the production API. Use this for kernel comparisons. |
+| `bench_gemm_tile_tune` | Broad NN tile/BK ladder (bf16 and exact f32), interleaved the same way. |
 | `bench_gemm_coop_tile` | Paired, interleaved cooperative GEMM tile A/B (128×64 vs 64×64). |
 | `bench_gemm_epi_tile` | Paired, interleaved fused epilogue tile A/B (128×64 vs 64×64). |
+| `bench_gemm_routes` | Paired A/B of the bf16 GEMM routing rules at the shapes they gate on: the split-K lanes of the gated TN dW shapes, and the 128×64 vs 64×64 coop tile on the plain, batched and epilogue paths (`BENCH_LANES=splitk,smallm,batched,epi`). |
 | `bench_gemm_sweep` | Cross-runtime lane (f32 exact / tf32 / bf16), JSON out. |
 | `bench_qwen35_layers` | Layer kernel benchmarks; `--paired-attn` times paired prefill attention, `--paired-gdn-recurrent` the 32- vs 16-column decode recurrence, `--paired-gate-up` two gate/up GEMMs vs one packed (async and sync encode), `--model-forward` a `Qwen35Model` prefill as `METRIC` lines, and `--decode[=P]` a batch-1 decode token (host encode and commit+wait apart). |
 | `bench_nn_kernels` | `nn` kernels batched and solo, with each one's host encode per dispatch; then the host path: pipeline cache hits and a decode-style sample loop. `--host-only` skips the kernel table. |
 | `bench/paired_bins.sh` | Interleaved min-of-N across frozen binaries (`BENCH_BINS="before=.. after=.."`) for any bench printing `METRIC` lines. |
 | `probe_gdn_scan` | Gated delta net chunk scan probe; `--paired` times paired 32- vs 16-col widths. |
+| `probe_gemm_bits` | Bit snapshot of every production GEMM entry point (FNV-1a per output); diff two builds' snapshots before claiming a kernel change is bit-identical (`bench/results/gemm_coop_header_bits_m5pro.txt`). |
 | `bench/paired_cross_runtime.py` | Alternates the tessl and PyTorch/MLX lanes round by round. |
 | `bench_embedgemma2` | EmbeddingGemma 2 `encode` latency and device/process peak memory on the real checkpoint, uniform and ragged batches, JSON out. |
 | `bench_paired` | Alternates any lanes that print `bench_embedgemma2`'s JSON round by round: tessl against `bench/embedgemma2_torch.py` (sentence-transformers on MPS), or two builds of `bench_embedgemma2` for a before/after A/B. |
@@ -58,18 +60,35 @@ TESSL_GEMM_TUNE=1 cargo build --release --bins
 ```
 
 Both tuning binaries `exit(2)` with that exact command when the variants are
-absent, rather than printing a page of `skip(pipe)` and exiting 0.
+absent, rather than printing a page of `skip(pipe)` and exiting 0 (they did
+the latter until 2026-10-10; `tests/tune_rigs_refuse_missing_variants.rs` pins
+the refusal). They check every variant the run will dispatch before timing
+anything.
+
+Both time production and every variant of a shape as the arms of one
+interleaved A/B (`run_paired` in `src/bin/common/mod.rs`): `BENCH_WARMUP`
+untimed calls of each arm, then `BENCH_ROUNDS` rounds (default 6) with the arm
+order reversed every other round, `BENCH_ITERS` timed calls per arm per round
+(default 5). A variant's ratio is the median of its per-round
+production/variant ratios, printed with their range. A shape whose production
+arm moved more than 10% across its rounds is flagged `EXCEEDS 10%`, and the
+process then exits 3 after printing everything.
 
 ## Pitfall 1 — a noise floor wider than the effect
 
-The tile-tune rig times a baseline block and a variant block minutes apart, so
-GPU clock drift lands entirely in the ratio. Run four times, it showed the
-**production kernel measured against itself** ranging **0.92×–1.46×**.
+Until 2026-10-10 both tuning rigs timed a baseline block and a variant block
+minutes apart, so GPU clock drift landed entirely in the ratio. Run four times,
+`bench_gemm_tile_tune` showed the **production kernel measured against
+itself** ranging **0.92×–1.46×**, and `bench_gemm_tnnt_tune` timed production
+for all its iterations before any variant in exactly the same way, although
+this page called it interleaved. The panel-walk gates in
+`kernels/matmul_tensorops.metal` quote ratios from that blocked rig.
 
-Any single-run conclusion from that rig is inside its own noise.
-The paired lanes interleave baseline and candidate iteration by iteration
-(A,B,A,B,… alternating which goes first) and report the ratio of per-round
-medians across repeated rounds. That brought the spread to roughly ±5%.
+Any single-run conclusion from those rigs is inside their own noise. Both now
+interleave round by round, every arm once per round with the order reversed
+every other round, and report the median of the per-round ratios. The paired
+lanes (`bench_gemm_coop_tile`, `bench_gemm_epi_tile`) do the same, and that
+brought their spread to roughly ±5%.
 
 > [!NOTE]
 > Both places above named `bench_gemm_coop_ab` until 2026-09-01. No such binary
@@ -156,9 +175,12 @@ on square power-of-two grids. The control read 0.71–0.88× of production *desp
 identical geometry*. A rig must mirror `tile_from_linear`, or every variant is
 penalised on square shapes.
 
-Production now also walks a large B in column panels: through `tile_walk`, the
-exact-f32, bf16 TN/NT and int8 kernels do so once $N \times K \ge 2^{23}$, on
-any grid not walked in Morton order. The rig's base copies of the TN/NT coop
+Production now also walks a large B in column panels: through `tile_walk`,
+every GEMM family (exact f32, the cooperative NN, bf16 TN/NT and their
+accumulates, int8) does so once $N \times K \ge 2^{23}$, on any grid not
+walked in Morton order. The cooperative NN kernels had their own gate (8-row
+panels from 2048 tiles) until 2026-10-11; `bench/results/gemm_panel_walk_m5pro.txt`
+is the per-lane A/B that retired it. The rig's base copies of the TN/NT coop
 kernels still mirror `tile_from_linear`, so past that gate they stand for the
 walk production replaced, not for production. There, compare against the
 production line or the matching `_ph` panel variant: `_ph4` for 128-row tiles
@@ -228,9 +250,9 @@ cargo run --release --bin probe_gemm_parity
 
 > [!NOTE]
 > This block previously named a binary `bench_gemm_coop_ab` and an environment
-> variable `BENCH_ROUNDS`. Neither exists; the crate builds four binaries and
-> they are the ones listed above. The command failed with "no bin target named
-> `bench_gemm_coop_ab`" for anyone who tried it.
+> variable `BENCH_ROUNDS`. Neither existed then; the command failed with "no
+> bin target named `bench_gemm_coop_ab`" for anyone who tried it.
+> `BENCH_ROUNDS` has existed since 2026-10-10, for the two tuning binaries.
 
 ## Measured — M5 Pro, 2026-08-31
 
@@ -586,6 +608,11 @@ neither shipped.
 `bf16_smallm_coop_m5pro.txt`, `splitk_gate_m5pro.txt`,
 `arg_table_latch_m5pro.txt` and `coop_clear_m5pro.txt`. The narrow tile wins
 at small M and loses once the grid fills; split-K wins from K = 12288. The
+first two were measured on the MLSystemsLab copy of this crate and
+re-measured on tessl's kernels with their method on 2026-10-11
+(`bf16_smallm_coop_reconciled_m5pro.txt`, `splitk_par_bf16_m5pro.txt`): the
+grid-fill rule held and was ported for bf16; a parallel bf16 split-K beat
+both arms of the split-K gate and replaced the sequential lane. The
 latch and accumulator-clear changes are inside the noise and are kept as
 cleanups, not speedups.
 

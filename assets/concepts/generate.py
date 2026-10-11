@@ -87,7 +87,7 @@ def concept_b(u, p):
     return body
 
 # C — 4x4 tiles threaded by the Z-order walk the kernels actually use
-# (`tile_from_linear` in matmul_tensorops.metal).
+# (`tile_from_linear` in kernels/gemm_coop.h).
 def morton_order(n=4):
     return [((i & 1) | ((i >> 1) & 2), ((i >> 1) & 1) | ((i >> 2) & 2)) for i in range(n*n)]
 def concept_c(u, p):

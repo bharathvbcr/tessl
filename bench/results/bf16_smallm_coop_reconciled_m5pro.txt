@@ -1,0 +1,332 @@
+# bf16 NN coop tile at small M, re-measured on tessl's kernels
+#
+# Machine: Apple M5 Pro, macOS 27.0.1, 2026-10-11 ~06:51 UTC. GPU otherwise
+# idle; host load average ~12 (recorded with the run below).
+# Tree: 120f675 plus src/bin/bench_gemm_routes.rs.
+# Command:
+#   BENCH_LANES=smallm cargo run --release --bin bench_gemm_routes
+#
+# Question: reconcile bench/results/bf16_smallm_coop_m5pro.txt, measured on
+# the MLSystemsLab copy of this crate. It reported the 64x64 tile faster
+# while C has fewer than 64 tiles of 128x64 and "Selection landed as
+# n <= 512 || m <= 64 || ceil(m/128)*ceil(n/64) < 64", pinned by
+# nn_coop_kernel_selects_the_narrow_tile_by_grid_fill; neither existed in
+# tessl, whose rule was N <= 512 or (bf16) M < 128.
+#
+# Method (that file's): plain bf16 gemm through gemm_tiled (Wide, Narrow) and
+# gemm (production's choice); async encode, 20 GEMMs per command buffer, 8
+# calls per arm per round, 6 rounds alternating order. ratio = wide / arm
+# (> 1: the arm is faster). The tiles' outputs were checked bit-identical
+# before timing.
+#
+# Result: the grid-fill finding holds on tessl's kernels. With M >= 128 and
+# fewer than 64 wide tiles, 64x64 won at every shape whose baseline held
+# within 10%: 1.17x (128x3072), 1.49x (128x768), 1.56x (256x768), 1.16x
+# (512x768). From 64 tiles up it tied or lost: 0.99x (128x4096, 64 tiles),
+# 1.02-1.03x (96-128 tiles at N = 3072, 2048), 1.00x (1024x2048), 0.87x
+# (1024x768, 96), 0.84x (1024x4096, 512). The drifted rows (EXCEEDS 10%:
+# 128x2048 1.20x, 256x2048 1.04x, 256x4096 0.90x, 512x4096 0.89x) agree in
+# direction but are not counted as evidence. At M <= 64 tessl already
+# took 64x64 (M < 128), and production matched the narrow arm there.
+# Decision: ported for bf16 — coop_narrow in src/gemm.rs adds "fewer than 64
+# tiles of 128x64" to N <= 512 and M < 128 (the import's M <= 64 is
+# subsumed), for the plain, epilogue and batched paths, pinned by
+# nn_coop_kernel_selects_the_narrow_tile_by_grid_fill. f16 and relaxed f32
+# were not measured on the plain path and keep the N rule.
+#
+smallm M=16 N=3072 K=768  (48 tiles of 128x64; outputs bit-identical)  (self-spread of wide_128x64 47.2%, EXCEEDS 10%)
+  wide_128x64                 36.1 us   wide_128x64/this 1.00 [1.00–1.00]
+  narrow_64x64                22.9 us   wide_128x64/this 1.63 [1.41–2.09]
+  production                  23.3 us   wide_128x64/this 1.58 [1.50–2.03]
+
+smallm M=32 N=3072 K=768  (48 tiles of 128x64; outputs bit-identical)  (self-spread of wide_128x64 5.0%)
+  wide_128x64                 35.2 us   wide_128x64/this 1.00 [1.00–1.00]
+  narrow_64x64                22.3 us   wide_128x64/this 1.58 [1.52–1.65]
+  production                  22.6 us   wide_128x64/this 1.57 [1.47–1.63]
+
+smallm M=64 N=3072 K=768  (48 tiles of 128x64; outputs bit-identical)  (self-spread of wide_128x64 4.7%)
+  wide_128x64                 35.3 us   wide_128x64/this 1.00 [1.00–1.00]
+  narrow_64x64                22.8 us   wide_128x64/this 1.55 [1.50–1.62]
+  production                  23.2 us   wide_128x64/this 1.52 [1.49–1.57]
+
+smallm M=128 N=3072 K=768  (48 tiles of 128x64; outputs bit-identical)  (self-spread of wide_128x64 4.8%)
+  wide_128x64                 37.8 us   wide_128x64/this 1.00 [1.00–1.00]
+  narrow_64x64                32.6 us   wide_128x64/this 1.17 [1.12–1.21]
+  production                  37.6 us   wide_128x64/this 1.01 [0.98–1.02]
+
+smallm M=256 N=3072 K=768  (96 tiles of 128x64; outputs bit-identical)  (self-spread of wide_128x64 5.6%)
+  wide_128x64                 55.6 us   wide_128x64/this 1.00 [1.00–1.00]
+  narrow_64x64                53.8 us   wide_128x64/this 1.02 [0.98–1.07]
+  production                  56.7 us   wide_128x64/this 0.98 [0.94–1.00]
+
+smallm M=512 N=3072 K=768  (192 tiles of 128x64; outputs bit-identical)  (self-spread of wide_128x64 5.4%)
+  wide_128x64                102.6 us   wide_128x64/this 1.00 [1.00–1.00]
+  narrow_64x64               100.0 us   wide_128x64/this 1.03 [1.02–1.04]
+  production                 103.1 us   wide_128x64/this 1.00 [0.98–1.01]
+
+smallm M=1024 N=3072 K=768  (384 tiles of 128x64; outputs bit-identical)  (self-spread of wide_128x64 7.7%)
+  wide_128x64                207.2 us   wide_128x64/this 1.00 [1.00–1.00]
+  narrow_64x64               203.4 us   wide_128x64/this 1.02 [1.00–1.03]
+  production                 207.2 us   wide_128x64/this 1.00 [0.98–1.02]
+
+smallm M=16 N=768 K=3072  (12 tiles of 128x64; outputs bit-identical)  (self-spread of wide_128x64 8.6%)
+  wide_128x64                 85.3 us   wide_128x64/this 1.00 [1.00–1.00]
+  narrow_64x64                55.2 us   wide_128x64/this 1.54 [1.53–1.55]
+  production                  55.3 us   wide_128x64/this 1.54 [1.53–1.57]
+
+smallm M=32 N=768 K=3072  (12 tiles of 128x64; outputs bit-identical)  (self-spread of wide_128x64 6.4%)
+  wide_128x64                 79.6 us   wide_128x64/this 1.00 [1.00–1.00]
+  narrow_64x64                52.7 us   wide_128x64/this 1.53 [1.49–1.54]
+  production                  52.2 us   wide_128x64/this 1.53 [1.50–1.55]
+
+smallm M=64 N=768 K=3072  (12 tiles of 128x64; outputs bit-identical)  (self-spread of wide_128x64 2.7%)
+  wide_128x64                 76.8 us   wide_128x64/this 1.00 [1.00–1.00]
+  narrow_64x64                50.5 us   wide_128x64/this 1.52 [1.50–1.53]
+  production                  50.4 us   wide_128x64/this 1.51 [1.50–1.55]
+
+smallm M=128 N=768 K=3072  (12 tiles of 128x64; outputs bit-identical)  (self-spread of wide_128x64 0.5%)
+  wide_128x64                 77.9 us   wide_128x64/this 1.00 [1.00–1.00]
+  narrow_64x64                52.2 us   wide_128x64/this 1.49 [1.48–1.53]
+  production                  78.1 us   wide_128x64/this 1.00 [0.98–1.00]
+
+smallm M=256 N=768 K=3072  (24 tiles of 128x64; outputs bit-identical)  (self-spread of wide_128x64 2.1%)
+  wide_128x64                 88.4 us   wide_128x64/this 1.00 [1.00–1.00]
+  narrow_64x64                56.6 us   wide_128x64/this 1.56 [1.55–1.59]
+  production                  88.7 us   wide_128x64/this 0.99 [0.99–1.02]
+
+smallm M=512 N=768 K=3072  (48 tiles of 128x64; outputs bit-identical)  (self-spread of wide_128x64 4.0%)
+  wide_128x64                103.9 us   wide_128x64/this 1.00 [1.00–1.00]
+  narrow_64x64                89.8 us   wide_128x64/this 1.16 [1.14–1.17]
+  production                 103.3 us   wide_128x64/this 1.00 [0.98–1.02]
+
+smallm M=1024 N=768 K=3072  (96 tiles of 128x64; outputs bit-identical)  (self-spread of wide_128x64 6.2%)
+  wide_128x64                178.2 us   wide_128x64/this 1.00 [1.00–1.00]
+  narrow_64x64               203.6 us   wide_128x64/this 0.87 [0.86–0.89]
+  production                 180.4 us   wide_128x64/this 0.99 [0.98–1.01]
+
+smallm M=16 N=4096 K=4096  (64 tiles of 128x64; outputs bit-identical)  (self-spread of wide_128x64 3.2%)
+  wide_128x64                192.3 us   wide_128x64/this 1.00 [1.00–1.00]
+  narrow_64x64               121.3 us   wide_128x64/this 1.59 [1.54–1.62]
+  production                 121.2 us   wide_128x64/this 1.57 [1.56–1.64]
+
+smallm M=32 N=4096 K=4096  (64 tiles of 128x64; outputs bit-identical)  (self-spread of wide_128x64 3.3%)
+  wide_128x64                191.5 us   wide_128x64/this 1.00 [1.00–1.00]
+  narrow_64x64               122.5 us   wide_128x64/this 1.57 [1.47–1.59]
+  production                 122.1 us   wide_128x64/this 1.55 [1.53–1.60]
+
+smallm M=64 N=4096 K=4096  (64 tiles of 128x64; outputs bit-identical)  (self-spread of wide_128x64 1.2%)
+  wide_128x64                191.4 us   wide_128x64/this 1.00 [1.00–1.00]
+  narrow_64x64               128.7 us   wide_128x64/this 1.49 [1.45–1.50]
+  production                 129.1 us   wide_128x64/this 1.49 [1.46–1.56]
+
+smallm M=128 N=4096 K=4096  (64 tiles of 128x64; outputs bit-identical)  (self-spread of wide_128x64 3.8%)
+  wide_128x64                199.3 us   wide_128x64/this 1.00 [1.00–1.00]
+  narrow_64x64               204.1 us   wide_128x64/this 0.99 [0.95–1.01]
+  production                 200.5 us   wide_128x64/this 1.00 [0.98–1.00]
+
+smallm M=256 N=4096 K=4096  (128 tiles of 128x64; outputs bit-identical)  (self-spread of wide_128x64 10.8%, EXCEEDS 10%)
+  wide_128x64                383.9 us   wide_128x64/this 1.00 [1.00–1.00]
+  narrow_64x64               427.3 us   wide_128x64/this 0.90 [0.87–0.92]
+  production                 383.7 us   wide_128x64/this 1.00 [0.99–1.01]
+
+smallm M=512 N=4096 K=4096  (256 tiles of 128x64; outputs bit-identical)  (self-spread of wide_128x64 29.4%, EXCEEDS 10%)
+  wide_128x64                863.9 us   wide_128x64/this 1.00 [1.00–1.00]
+  narrow_64x64              1034.7 us   wide_128x64/this 0.89 [0.77–0.91]
+  production                 855.3 us   wide_128x64/this 1.01 [0.93–1.04]
+
+smallm M=1024 N=4096 K=4096  (512 tiles of 128x64; outputs bit-identical)  (self-spread of wide_128x64 5.6%)
+  wide_128x64               1640.7 us   wide_128x64/this 1.00 [1.00–1.00]
+  narrow_64x64              1967.3 us   wide_128x64/this 0.84 [0.79–0.87]
+  production                1625.3 us   wide_128x64/this 1.02 [0.98–1.03]
+
+smallm M=16 N=2048 K=2048  (32 tiles of 128x64; outputs bit-identical)  (self-spread of wide_128x64 7.8%)
+  wide_128x64                 76.9 us   wide_128x64/this 1.00 [1.00–1.00]
+  narrow_64x64                46.3 us   wide_128x64/this 1.66 [1.55–1.75]
+  production                  46.1 us   wide_128x64/this 1.63 [1.60–1.72]
+
+smallm M=32 N=2048 K=2048  (32 tiles of 128x64; outputs bit-identical)  (self-spread of wide_128x64 27.3%, EXCEEDS 10%)
+  wide_128x64                 72.5 us   wide_128x64/this 1.00 [1.00–1.00]
+  narrow_64x64                45.8 us   wide_128x64/this 1.55 [0.30–1.90]
+  production                  45.5 us   wide_128x64/this 1.56 [0.94–1.99]
+
+smallm M=64 N=2048 K=2048  (32 tiles of 128x64; outputs bit-identical)  (self-spread of wide_128x64 4.2%)
+  wide_128x64                 68.5 us   wide_128x64/this 1.00 [1.00–1.00]
+  narrow_64x64                43.4 us   wide_128x64/this 1.57 [1.54–1.61]
+  production                  43.2 us   wide_128x64/this 1.59 [1.58–1.61]
+
+smallm M=128 N=2048 K=2048  (32 tiles of 128x64; outputs bit-identical)  (self-spread of wide_128x64 21.4%, EXCEEDS 10%)
+  wide_128x64                 70.1 us   wide_128x64/this 1.00 [1.00–1.00]
+  narrow_64x64                58.3 us   wide_128x64/this 1.20 [1.17–1.41]
+  production                  70.2 us   wide_128x64/this 0.98 [0.57–1.02]
+
+smallm M=256 N=2048 K=2048  (64 tiles of 128x64; outputs bit-identical)  (self-spread of wide_128x64 56.6%, EXCEEDS 10%)
+  wide_128x64                 99.6 us   wide_128x64/this 1.00 [1.00–1.00]
+  narrow_64x64                95.7 us   wide_128x64/this 1.04 [0.92–1.33]
+  production                 100.1 us   wide_128x64/this 1.00 [0.98–1.48]
+
+smallm M=512 N=2048 K=2048  (128 tiles of 128x64; outputs bit-identical)  (self-spread of wide_128x64 9.5%)
+  wide_128x64                182.3 us   wide_128x64/this 1.00 [1.00–1.00]
+  narrow_64x64               177.8 us   wide_128x64/this 1.03 [0.96–1.07]
+  production                 182.7 us   wide_128x64/this 1.00 [0.95–1.06]
+
+smallm M=1024 N=2048 K=2048  (256 tiles of 128x64; outputs bit-identical)  (self-spread of wide_128x64 4.2%)
+  wide_128x64                351.0 us   wide_128x64/this 1.00 [1.00–1.00]
+  narrow_64x64               348.7 us   wide_128x64/this 1.00 [1.00–1.02]
+  production                 353.0 us   wide_128x64/this 0.99 [0.99–1.01]
+
+batched bf16 M=256 N=64 K=64 batch=16  (outputs bit-identical)  (self-spread of production 10.5%, EXCEEDS 10%)
+  production                  12.2 us   production/this 1.00 [1.00–1.00]
+  batched_128x64              12.2 us   production/this 0.98 [0.44–1.04]
+  batched_64x64               11.3 us   production/this 1.04 [0.95–1.12]
+
+batched f16 M=256 N=64 K=64 batch=16  (outputs bit-identical)  (self-spread of production 88.7%, EXCEEDS 10%)
+  production                  22.4 us   production/this 1.00 [1.00–1.00]
+  batched_128x64              22.5 us   production/this 1.01 [0.97–1.06]
+  batched_64x64               25.0 us   production/this 1.11 [0.65–1.22]
+
+batched f32_relaxed M=256 N=64 K=64 batch=16  (outputs bit-identical)  (self-spread of production 107.2%, EXCEEDS 10%)
+  production                  18.2 us   production/this 1.00 [1.00–1.00]
+  batched_128x64              18.8 us   production/this 1.00 [0.91–1.08]
+  batched_64x64               16.1 us   production/this 1.16 [0.66–1.36]
+
+batched bf16 M=512 N=128 K=512 batch=8  (outputs bit-identical)  (self-spread of production 65.4%, EXCEEDS 10%)
+  production                  41.9 us   production/this 1.00 [1.00–1.00]
+  batched_128x64              43.0 us   production/this 0.99 [0.93–1.11]
+  batched_64x64               40.1 us   production/this 1.07 [0.99–1.27]
+
+batched f16 M=512 N=128 K=512 batch=8  (outputs bit-identical)  (self-spread of production 13.8%, EXCEEDS 10%)
+  production                  33.9 us   production/this 1.00 [1.00–1.00]
+  batched_128x64              33.5 us   production/this 1.03 [0.95–1.08]
+  batched_64x64               31.8 us   production/this 1.08 [0.98–1.11]
+
+batched f32_relaxed M=512 N=128 K=512 batch=8  (outputs bit-identical)  (self-spread of production 13.7%, EXCEEDS 10%)
+  production                  45.4 us   production/this 1.00 [1.00–1.00]
+  batched_128x64              44.9 us   production/this 1.00 [0.88–1.03]
+  batched_64x64               40.8 us   production/this 1.12 [1.05–1.19]
+
+batched bf16 M=1024 N=256 K=256 batch=4  (outputs bit-identical)  (self-spread of production 10.6%, EXCEEDS 10%)
+  production                  33.2 us   production/this 1.00 [1.00–1.00]
+  batched_128x64              32.4 us   production/this 1.01 [0.98–1.10]
+  batched_64x64               29.5 us   production/this 1.12 [1.07–1.15]
+
+batched f16 M=1024 N=256 K=256 batch=4  (outputs bit-identical)  (self-spread of production 48.0%, EXCEEDS 10%)
+  production                  32.1 us   production/this 1.00 [1.00–1.00]
+  batched_128x64              33.3 us   production/this 0.98 [0.48–1.34]
+  batched_64x64               30.2 us   production/this 1.06 [1.02–1.54]
+
+batched f32_relaxed M=1024 N=256 K=256 batch=4  (outputs bit-identical)  (self-spread of production 14.6%, EXCEEDS 10%)
+  production                  46.5 us   production/this 1.00 [1.00–1.00]
+  batched_128x64              45.8 us   production/this 0.99 [0.90–1.12]
+  batched_64x64               50.6 us   production/this 0.93 [0.56–0.96]
+
+batched bf16 M=128 N=512 K=2048 batch=4  (outputs bit-identical)  (self-spread of production 6.1%)
+  production                  65.1 us   production/this 1.00 [1.00–1.00]
+  batched_128x64              65.0 us   production/this 1.01 [0.98–1.02]
+  batched_64x64               54.9 us   production/this 1.19 [1.15–1.22]
+
+batched f16 M=128 N=512 K=2048 batch=4  (outputs bit-identical)  (self-spread of production 6.2%)
+  production                  64.5 us   production/this 1.00 [1.00–1.00]
+  batched_128x64              64.9 us   production/this 0.99 [0.98–1.02]
+  batched_64x64               54.0 us   production/this 1.19 [1.19–1.21]
+
+batched f32_relaxed M=128 N=512 K=2048 batch=4  (outputs bit-identical)  (self-spread of production 10.8%, EXCEEDS 10%)
+  production                 132.5 us   production/this 1.00 [1.00–1.00]
+  batched_128x64             137.2 us   production/this 0.99 [0.93–1.00]
+  batched_64x64               80.6 us   production/this 1.62 [1.31–1.73]
+
+batched bf16 M=2048 N=128 K=128 batch=8  (outputs bit-identical)  (self-spread of production 55.5%, EXCEEDS 10%)
+  production                  44.9 us   production/this 1.00 [1.00–1.00]
+  batched_128x64              47.0 us   production/this 0.98 [0.49–1.43]
+  batched_64x64               41.7 us   production/this 1.14 [0.51–1.31]
+
+batched f16 M=2048 N=128 K=128 batch=8  (outputs bit-identical)  (self-spread of production 8.7%)
+  production                  41.1 us   production/this 1.00 [1.00–1.00]
+  batched_128x64              40.4 us   production/this 1.01 [0.98–1.10]
+  batched_64x64               36.8 us   production/this 1.11 [0.97–1.19]
+
+batched f32_relaxed M=2048 N=128 K=128 batch=8  (outputs bit-identical)  (self-spread of production 3.3%)
+  production                  56.5 us   production/this 1.00 [1.00–1.00]
+  batched_128x64              58.3 us   production/this 0.95 [0.93–1.02]
+  batched_64x64               61.6 us   production/this 0.91 [0.89–0.92]
+
+batched bf16 M=64 N=3072 K=768 batch=8  (outputs bit-identical)  (self-spread of production 6.3%)
+  production                 227.1 us   production/this 1.00 [1.00–1.00]
+  batched_128x64             225.8 us   production/this 1.00 [0.96–1.02]
+  batched_64x64              194.9 us   production/this 1.17 [1.14–1.19]
+
+epi bf16 M=2048 N=384 K=2048 beta=1 bias silu  (outputs bit-identical)  (self-spread of production 7.4%)
+  production                 171.4 us   production/this 1.00 [1.00–1.00]
+  epi_128x64                 171.6 us   production/this 1.00 [0.80–1.00]
+  epi_64x64                  155.7 us   production/this 1.09 [0.91–1.12]
+
+epi f16 M=2048 N=384 K=2048 beta=1 bias silu  (outputs bit-identical)  (self-spread of production 5.5%)
+  production                 170.8 us   production/this 1.00 [1.00–1.00]
+  epi_128x64                 169.6 us   production/this 1.01 [1.00–1.02]
+  epi_64x64                  152.5 us   production/this 1.12 [1.10–1.14]
+
+epi f32_relaxed M=2048 N=384 K=2048 beta=1 bias silu  (outputs bit-identical)  (self-spread of production 9.1%)
+  production                 310.2 us   production/this 1.00 [1.00–1.00]
+  epi_128x64                 307.9 us   production/this 1.00 [0.98–1.02]
+  epi_64x64                  235.9 us   production/this 1.32 [1.28–1.39]
+
+epi bf16 M=4096 N=128 K=768 beta=1 bias silu  (outputs bit-identical)  (self-spread of production 2.8%)
+  production                  79.2 us   production/this 1.00 [1.00–1.00]
+  epi_128x64                  79.8 us   production/this 0.99 [0.97–1.01]
+  epi_64x64                   67.7 us   production/this 1.17 [1.16–1.18]
+
+epi f16 M=4096 N=128 K=768 beta=1 bias silu  (outputs bit-identical)  (self-spread of production 4.8%)
+  production                  79.0 us   production/this 1.00 [1.00–1.00]
+  epi_128x64                  78.9 us   production/this 1.00 [0.99–1.01]
+  epi_64x64                   67.3 us   production/this 1.17 [1.16–1.19]
+
+epi f32_relaxed M=4096 N=128 K=768 beta=1 bias silu  (outputs bit-identical)  (self-spread of production 2.7%)
+  production                 103.0 us   production/this 1.00 [1.00–1.00]
+  epi_128x64                 101.8 us   production/this 1.01 [0.86–1.03]
+  epi_64x64                   74.1 us   production/this 1.39 [1.31–1.41]
+
+epi bf16 M=1024 N=256 K=1024 beta=1 bias silu  (outputs bit-identical)  (self-spread of production 9.3%)
+  production                  56.4 us   production/this 1.00 [1.00–1.00]
+  epi_128x64                  55.3 us   production/this 1.01 [1.00–1.05]
+  epi_64x64                   45.1 us   production/this 1.27 [1.20–1.31]
+
+epi f16 M=1024 N=256 K=1024 beta=1 bias silu  (outputs bit-identical)  (self-spread of production 4.7%)
+  production                  55.8 us   production/this 1.00 [1.00–1.00]
+  epi_128x64                  55.5 us   production/this 1.00 [0.97–1.01]
+  epi_64x64                   43.4 us   production/this 1.28 [1.24–1.31]
+
+epi f32_relaxed M=1024 N=256 K=1024 beta=1 bias silu  (outputs bit-identical)  (self-spread of production 5.0%)
+  production                  80.1 us   production/this 1.00 [1.00–1.00]
+  epi_128x64                  80.2 us   production/this 1.00 [0.99–1.01]
+  epi_64x64                   49.2 us   production/this 1.63 [1.62–1.65]
+
+epi bf16 M=512 N=512 K=512 beta=1 bias silu  (outputs bit-identical)  (self-spread of production 5.1%)
+  production                  41.8 us   production/this 1.00 [1.00–1.00]
+  epi_128x64                  42.0 us   production/this 1.00 [0.97–1.06]
+  epi_64x64                   31.7 us   production/this 1.34 [1.30–1.39]
+
+epi f16 M=512 N=512 K=512 beta=1 bias silu  (outputs bit-identical)  (self-spread of production 4.4%)
+  production                  42.8 us   production/this 1.00 [1.00–1.00]
+  epi_128x64                  42.0 us   production/this 1.01 [0.96–1.06]
+  epi_64x64                   31.6 us   production/this 1.33 [1.26–1.43]
+
+epi f32_relaxed M=512 N=512 K=512 beta=1 bias silu  (outputs bit-identical)  (self-spread of production 4.7%)
+  production                  53.3 us   production/this 1.00 [1.00–1.00]
+  epi_128x64                  54.1 us   production/this 0.99 [0.97–1.00]
+  epi_64x64                   38.0 us   production/this 1.40 [1.35–1.43]
+
+epi bf16 M=8192 N=512 K=768 beta=1 bias silu  (outputs bit-identical)  (self-spread of production 12.1%, EXCEEDS 10%)
+  production                 494.0 us   production/this 1.00 [1.00–1.00]
+  epi_128x64                 494.5 us   production/this 1.01 [0.99–1.05]
+  epi_64x64                  367.9 us   production/this 1.32 [1.30–1.39]
+
+epi f16 M=8192 N=512 K=768 beta=1 bias silu  (outputs bit-identical)  (self-spread of production 24.1%, EXCEEDS 10%)
+  production                 545.2 us   production/this 1.00 [1.00–1.00]
+  epi_128x64                 538.8 us   production/this 1.00 [0.92–1.11]
+  epi_64x64                  412.5 us   production/this 1.34 [1.29–1.55]
+
+epi f32_relaxed M=8192 N=512 K=768 beta=1 bias silu  (outputs bit-identical)  (self-spread of production 21.5%, EXCEEDS 10%)
+  production                 749.7 us   production/this 1.00 [1.00–1.00]
+  epi_128x64                 747.6 us   production/this 1.00 [0.94–1.16]
+  epi_64x64                  641.8 us   production/this 1.15 [1.10–1.21]
+exit 0
+=== end 2026-10-11T06:51:36Z load: { 9.98 12.86 29.60 }

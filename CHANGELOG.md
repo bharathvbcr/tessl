@@ -155,7 +155,8 @@ All notable changes to `tessl` are recorded here. The format follows
 
 ### Changed (breaking)
 
-- **`gemm_{tn,nt}_accum_train` always run the accumulate kernels;
+- **`gemm_{tn,nt}_accum_train` always run the accumulate kernels on
+  TensorOps;
   `TESSL_GEMM_ACCUM` and `TESSL_GEMM_ACCUM_DX` are retired.** Training has
   reached the accumulate kernels through `GemmOperands::{tn_acc, nt_acc}`
   with no flag since that API landed, weight banks included; the flags gated

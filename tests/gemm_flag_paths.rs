@@ -4,10 +4,11 @@
 //! `gemm_{tn,nt}_accum_train` took a temp-plus-`add_inplace_f32` fallback
 //! unless `TESSL_GEMM_ACCUM` / `TESSL_GEMM_ACCUM_DX` were set, while
 //! `GemmOperands::{tn_acc, nt_acc}` ran the accumulate kernels with no flag.
-//! The flags are retired: one path, pinned here bit for bit against
-//! `GemmOperands`. `TESSL_GEMM_INTERIOR` selected an interior-offset branch
-//! of the exact-f32 kernels; it measured no faster and is retired. A source
-//! scan pins that no code reads any of the three again.
+//! The flags are retired: on TensorOps one path, pinned here bit for bit
+//! against `GemmOperands` (the simdgroup backend, which has no accumulate
+//! kernel, still adds a temporary). `TESSL_GEMM_INTERIOR` selected an
+//! interior-offset branch of the exact-f32 kernels; it measured no faster and
+//! is retired. A source scan pins that no code reads any of the three again.
 //!
 //! The flags were process-global and the environment cannot be mutated safely
 //! under a concurrent `getenv`, so each configuration re-runs its own test in

@@ -82,14 +82,16 @@ fn every_rig_that_flags_drift_exits_3() {
             flagging.push(name);
         }
     }
-    flagging.sort();
-    assert_eq!(
-        flagging,
-        [
-            "bench_gemm_routes.rs",
-            "bench_gemm_tile_tune.rs",
-            "bench_gemm_tnnt_tune.rs"
-        ],
-        "the scan must see the rigs it guards"
-    );
+    // A new rig that calls exit_if_unstable passes; the scan must still see
+    // the three it was written for.
+    for rig in [
+        "bench_gemm_routes.rs",
+        "bench_gemm_tile_tune.rs",
+        "bench_gemm_tnnt_tune.rs",
+    ] {
+        assert!(
+            flagging.iter().any(|f| f == rig),
+            "the scan must see {rig}; it saw {flagging:?}"
+        );
+    }
 }

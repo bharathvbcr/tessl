@@ -1989,12 +1989,17 @@ fn nn_accum(a: &Tensor, b: &Tensor, c: &Tensor, (m, n, k): (usize, usize, usize)
 /// `TESSL_GEMM_ACCUM_DX`, read until 2026-10-10). Until then this entry
 /// computed the product into a temporary and added it unless a flag was set;
 /// the rounding now matches [`GemmOperands`]' instead (see its `nn_acc`).
-/// The simdgroup backend has no accumulate kernel and is refused.
+/// The simdgroup backend has no accumulate kernel, so it keeps the temporary
+/// (`simdgroup_accum`): it is [`select_backend`]'s pick on a GPU without
+/// TensorOps.
 pub fn gemm_tn_accum_train(a_km: &Tensor, b_kn: &Tensor, c: &Tensor, backend: GemmBackend) -> Result<(), String> {
     const WHAT: &str = "gemm_tn_accum_train";
     let bf16 = use_bf16_gemm(a_km.runtime(), backend);
     let dims = validate_gemm(a_km, b_kn, c, Layout::TN, bf16, WHAT)?;
-    accum_train_lane(a_km.runtime(), backend, c, bf16, WHAT)?;
+    if backend == GemmBackend::Simdgroup {
+        return simdgroup_accum(c, dims, |tmp| gemm_tn_train(a_km, b_kn, tmp, backend));
+    }
+    accum_train_lane(a_km.runtime(), c, bf16, WHAT)?;
     tn_accum(a_km, b_kn, c, dims, bf16)
 }
 
@@ -2004,24 +2009,47 @@ pub fn gemm_nt_accum_train(a_mk: &Tensor, b_nk: &Tensor, c: &Tensor, backend: Ge
     const WHAT: &str = "gemm_nt_accum_train";
     let bf16 = use_bf16_gemm(a_mk.runtime(), backend);
     let dims = validate_gemm(a_mk, b_nk, c, Layout::NT, bf16, WHAT)?;
-    accum_train_lane(a_mk.runtime(), backend, c, bf16, WHAT)?;
+    if backend == GemmBackend::Simdgroup {
+        return simdgroup_accum(c, dims, |tmp| gemm_nt_train(a_mk, b_nk, tmp, backend));
+    }
+    accum_train_lane(a_mk.runtime(), c, bf16, WHAT)?;
     nt_accum(a_mk, b_nk, c, dims, bf16)
 }
 
-/// The `*_accum_train` lanes' preconditions: the TensorOps backend on a device
-/// that has it, and for bf16 an f32 C. Relaxed precision is not refused, as
-/// it is by [`GemmOperands::ExactF32`]: the TN and NT kernels have no relaxed
+/// The `*_accum_train` TensorOps lanes' preconditions: a device that has
+/// TensorOps, and for bf16 an f32 C. Relaxed precision is not refused, as it
+/// is by [`GemmOperands::ExactF32`]: the TN and NT kernels have no relaxed
 /// form, so [`gemm_tn_train`] and [`gemm_nt_train`] run exact under it too.
-fn accum_train_lane(rt: &GpuRuntime, backend: GemmBackend, c: &Tensor, bf16: bool, what: &str) -> Result<(), String> {
-    if backend != GemmBackend::TensorOps || !rt.has_tensorops() {
+fn accum_train_lane(rt: &GpuRuntime, c: &Tensor, bf16: bool, what: &str) -> Result<(), String> {
+    if !rt.has_tensorops() {
         return Err(format!(
-            "{what}: the accumulate kernels need the TensorOps backend; the simdgroup backend has none"
+            "{what}: the TensorOps backend is unavailable on this device; pass select_backend's pick"
         ));
     }
     if bf16 {
         check_bf16_lane(rt, c, what)?;
     }
     Ok(())
+}
+
+/// The simdgroup backend's `C += product`: it has no accumulate kernel, so
+/// `product` writes a temporary that `add_inplace_f32` adds into C. On a GPU
+/// without TensorOps this is the only route; the TensorOps lanes accumulate
+/// in the kernel instead. `dims` are the validated (M, N, K).
+fn simdgroup_accum(
+    c: &Tensor,
+    (m, n, _): (usize, usize, usize),
+    product: impl FnOnce(&Tensor) -> Result<(), String>,
+) -> Result<(), String> {
+    let rt = c.runtime();
+    let tmp = rt.alloc_temp_f32(&[m, n])?;
+    product(&tmp)?;
+    let p = rt.pipeline("add_inplace_f32")?;
+    crate::dispatch::dispatch_1d(rt, &p, c.numel(), |bnd| {
+        crate::dispatch::set_tensor(bnd, c, 0);
+        crate::dispatch::set_tensor(bnd, &tmp, 1);
+        crate::dispatch::set_u32(bnd, c.numel() as u32, 2);
+    })
 }
 
 /// Prefer bf16 / relaxed GEMM per runtime precision policy.
@@ -2729,16 +2757,6 @@ mod contract_tests {
                             (true, true) => gemm_tn_accum_train,
                             (false, true) => gemm_nt_accum_train,
                         };
-                        if accum && backend == GemmBackend::Simdgroup {
-                            // No accumulate kernel on that backend: refused
-                            // before anything is encoded, C untouched.
-                            rt.take_dispatch_count();
-                            let err = launch(&a, &b, &c, backend).expect_err("simdgroup has no accumulate");
-                            assert!(err.contains("need the TensorOps backend"), "{err}");
-                            assert_eq!(rt.take_dispatch_count(), 0);
-                            assert!(bank.buffer.read_f32().iter().all(|&x| x == 2.0));
-                            continue;
-                        }
                         launch(&a, &b, &c, backend).unwrap();
                         rt.synchronize().unwrap();
                         let got = bank.buffer.read_f32();

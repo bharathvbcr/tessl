@@ -164,8 +164,10 @@ All notable changes to `tessl` are recorded here. The format follows
   the runtime picks (bit for bit, pinned by
   `accumulate_train_entries_run_the_accumulate_kernels`), so the rounding of
   `C += ...` changes for callers that left the flags unset, as ojas's
-  `arch02` trainer does (`model_bwd.rs`). The simdgroup backend has no
-  accumulate kernel and is now refused instead of taking the temporary. The
+  `arch02` trainer does (`model_bwd.rs`). The simdgroup backend, which has
+  no accumulate kernel and is `select_backend`'s pick without TensorOps,
+  still adds a temporary; `transpose_edges_precision_and_accumulation`
+  checks its `C +=` against a CPU sum. The
   variables, including their `METAL_RUNTIME_*` / `METAL_NATIVE_*` spellings,
   are no longer read.
 - **`ab_flags::gemm_accum`, `gemm_accum_dx` and `gemm_interior_offsets`

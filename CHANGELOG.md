@@ -689,6 +689,16 @@ All notable changes to `tessl` are recorded here. The format follows
 
 ### Fixed
 
+- **`rms_qkv_rope` refuses `eps == 0`.** `QkvRopeDims::validate` refused only
+  a negative eps, so an eps of 0 with an all-zero head row gave
+  `0 * rsqrt(0)` = NaN in q and k and, in the KV-store variant, in the
+  persistent cache. All three variants now go through the one RMS eps check
+  (`validate_rms_eps`, also behind `validate_rms_scalars`): finite and
+  positive, refused before anything is encoded.
+- **`Decode::step` reads its logits before counting the token decoded.** A
+  failed read used to leave `position()` advanced past a token whose logits
+  were lost. It now leaves the position where it was and the session poisoned,
+  as a failure in the layers does.
 - **C ABI: validate before mutate, allocate or publish.** Every slice built
   from a caller's `n` goes through one checked helper that refuses a byte
   length past `isize::MAX`, a null pointer with elements and a misaligned

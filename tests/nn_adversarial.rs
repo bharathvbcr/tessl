@@ -15,6 +15,7 @@ mod common;
 use std::sync::Arc;
 
 use common::with_gpu;
+use objc2_metal::MTLComputePipelineState;
 use tessl::nn::{
     self, AttnDims, AttnHeadDim, Q4Bank, Q4MlxBank, Q4MlxLayout, Q4MlxRowVariant, QkvBuffers, QkvRopeDims,
     QkvRopeVariant, QuantShape,
@@ -445,5 +446,22 @@ fn the_runtime_is_still_usable_after_the_whole_hostile_sweep() {
         nn::mlp_silu(rt, &x, &x, &out, n as u32).expect("real work after the sweep");
         rt.synchronize().expect("synchronize after the sweep");
         assert!(out.read_f32()[..n].iter().all(|v| v.is_finite()));
+    });
+}
+
+/// A fixed threadgroup size above the pipeline's limit is refused before
+/// encoding, with the kernel name, the request and the limit in the error.
+#[test]
+fn oversize_threadgroup_names_the_kernel_the_request_and_the_limit() {
+    with_gpu(|rt| {
+        let p = rt.pipeline("add_inplace_f32").unwrap();
+        let limit = p.maxTotalThreadsPerThreadgroup();
+        let ask = limit + 1;
+        rt.take_dispatch_count();
+        let e = tessl::dispatch::dispatch_2d_tg(rt, &p, 1, 1, ask, |_| {}).expect_err("oversize accepted");
+        for want in ["add_inplace_f32", &ask.to_string(), &limit.to_string()] {
+            assert!(e.contains(want), "{want} missing from: {e}");
+        }
+        assert_eq!(rt.take_dispatch_count(), 0);
     });
 }

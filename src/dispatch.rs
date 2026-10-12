@@ -741,6 +741,25 @@ pub(crate) fn validate_dispatch_geometry(
     Ok(())
 }
 
+/// Refuse `threads_per_tg` above what `pipeline` can run, naming the kernel,
+/// the request and the limit. A fixed-size dispatch otherwise fails in
+/// [`Binder::dispatch`] with text that names none of them.
+pub(crate) fn check_threadgroup_limit(
+    rt: &GpuRuntime,
+    pipeline: &ProtocolObject<dyn MTLComputePipelineState>,
+    threads_per_tg: usize,
+) -> Result<(), String> {
+    let limit = pipeline.maxTotalThreadsPerThreadgroup();
+    if threads_per_tg > limit {
+        let name = rt.pipeline_name(pipeline).unwrap_or_else(|| "<unnamed pipeline>".into());
+        return Err(format!(
+            "dispatch of '{name}': {threads_per_tg} threads per threadgroup exceeds the pipeline's \
+             maxTotalThreadsPerThreadgroup {limit}"
+        ));
+    }
+    Ok(())
+}
+
 /// 2D grid of threadgroups with fixed threads-per-threadgroup (FA-2 tiles).
 pub fn dispatch_2d_tg(
     rt: &GpuRuntime,
@@ -753,6 +772,7 @@ pub fn dispatch_2d_tg(
     if groups_x == 0 || groups_y == 0 || threads_per_tg == 0 {
         return Ok(());
     }
+    check_threadgroup_limit(rt, pipeline, threads_per_tg)?;
     rt.with_binder(|bnd| {
         bnd.set_pipeline(pipeline);
         encode_bufs(bnd);

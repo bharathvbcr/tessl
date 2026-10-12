@@ -852,7 +852,7 @@ impl BertSparseModel {
         if trace && batch.len() != 1 {
             return Err(format!("{WHAT}: trace takes one sequence, got {}", batch.len()));
         }
-        if self.rt.relaxed_precision() {
+        if self.rt.f32_gemm_runs_relaxed() {
             return Err(format!(
                 "{WHAT}: the forward needs exact-f32 GEMMs; switch the runtime's relaxed precision off"
             ));

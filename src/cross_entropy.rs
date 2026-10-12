@@ -396,7 +396,7 @@ pub(crate) fn validate_ce_inputs(
     if targets.len() != n {
         return Err(format!("{what}: {n} rows but {} targets", targets.len()));
     }
-    if rt.relaxed_precision() {
+    if rt.f32_gemm_runs_relaxed() {
         return Err(format!("{what}: needs exact-f32 GEMMs; switch relaxed precision off"));
     }
     for (name, t) in [("hidden", h.rows), ("weight", weight)] {

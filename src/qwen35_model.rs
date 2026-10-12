@@ -1068,7 +1068,7 @@ impl Qwen35Model {
         if let Some(&bad) = ids.iter().find(|&&id| id >= self.cfg.vocab) {
             return Err(format!("{what}: token id {bad} >= vocab {}", self.cfg.vocab));
         }
-        if self.precision == Precision::F32 && self.rt.relaxed_precision() {
+        if self.precision == Precision::F32 && self.rt.f32_gemm_runs_relaxed() {
             return Err(relaxed_refusal(what));
         }
         u32::try_from(ids.len()).map_err(|_| format!("{what}: too many tokens"))

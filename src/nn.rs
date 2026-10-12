@@ -1043,6 +1043,7 @@ pub(crate) fn dispatch_tg_1d(
     if groups == 0 || threads_per_tg == 0 {
         return Ok(());
     }
+    crate::dispatch::check_threadgroup_limit(rt, pipeline, threads_per_tg)?;
     rt.with_binder(|bnd| {
         bnd.set_pipeline(pipeline);
         encode(bnd);
@@ -2343,6 +2344,11 @@ pub unsafe fn flash_attn_global_h512_with_scalars(
         set_gpu_buf(bnd, q_pos_offset, 10);
         set_gpu_buf(bnd, kv_pos_offset, 11);
         scalars(bnd, kv_capacity);
+        // The kernel reads `out_bf16` from slot 12 and `o` was validated at
+        // that width above; a callback that left it stale or set it the other
+        // way would have the kernel write f32 into a bf16-sized `o`. This
+        // wrapper owns the slot, bound after the callback whatever it did.
+        set_u32(bnd, u32::from(out_bf16), 12);
     })
 }
 
@@ -4711,6 +4717,22 @@ pub fn gemm_i8_dequant(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The 1D threadgroup dispatch refuses a group above the pipeline limit,
+    /// naming the kernel, the request and the limit, and encodes nothing.
+    #[test]
+    fn dispatch_tg_1d_refuses_an_oversize_threadgroup_by_name() {
+        let rt = GpuRuntime::new().expect("runtime");
+        let p = rt.pipeline("add_inplace_f32").unwrap();
+        let limit = p.maxTotalThreadsPerThreadgroup();
+        let ask = limit + 1;
+        rt.take_dispatch_count();
+        let e = dispatch_tg_1d(&rt, &p, 1, ask, None, |_| {}).expect_err("oversize accepted");
+        for want in ["add_inplace_f32", &ask.to_string(), &limit.to_string()] {
+            assert!(e.contains(want), "{want} missing from: {e}");
+        }
+        assert_eq!(rt.take_dispatch_count(), 0);
+    }
 
     /// The static entry-point tables name exactly the kernels the formatted
     /// names they replaced did, for every instantiation.

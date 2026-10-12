@@ -232,6 +232,49 @@ fn exact_f32_operands_refuse_relaxed_precision() {
     });
 }
 
+/// `ExactF32.nn` is the exact-f32 lane: bf16 and f16 operands are refused, as
+/// `tn` and `nt` refuse them, instead of running the narrow cooperative kernel.
+#[test]
+fn exact_f32_nn_refuses_narrow_operands() {
+    with_gpu(|rt| {
+        let host = random_f32(64 * 64, 3);
+        let a32 = tensor_f32(rt, &[64, 64], &host);
+        let c = rt.alloc_tensor_f32(&[64, 64]).unwrap();
+        let narrow = [
+            tensor_bf16(rt, &[64, 64], &host),
+            rt.alloc_tensor_f16(&[64, 64]).unwrap(),
+        ];
+        narrow[1].buffer.write_f16_bits(&f32_slice_to_f16(&host));
+        rt.take_dispatch_count();
+        for t in &narrow {
+            assert!(GemmOperands::ExactF32.nn(t, t, &c).is_err(), "{:?} nn accepted", t.dtype);
+            assert!(GemmOperands::ExactF32.nn(&a32, t, &c).is_err(), "mixed nn accepted");
+            assert!(GemmOperands::ExactF32.tn(t, t, &c).is_err());
+            assert!(GemmOperands::ExactF32.nt(t, t, &c).is_err());
+        }
+        assert_eq!(rt.take_dispatch_count(), 0);
+    });
+}
+
+/// Under `PrecisionMode::Bf16` the relaxed flag is ignored (no relaxed kernel
+/// is selected), so the exact lane runs and equals plain `gemm_nt_f32`.
+#[test]
+fn exact_f32_runs_under_bf16_mode_with_relaxed_flag_on() {
+    with_gpu(|rt| {
+        rt.set_precision(PrecisionMode::Bf16);
+        rt.set_relaxed_precision(true);
+        let (m, n, k) = (64, 64, 64);
+        let a = tensor_f32(rt, &[m, k], &random_f32(m * k, 11));
+        let b = tensor_f32(rt, &[n, k], &random_f32(n * k, 12));
+        let lane = rt.alloc_tensor_f32(&[m, n]).unwrap();
+        let plain = rt.alloc_tensor_f32(&[m, n]).unwrap();
+        GemmOperands::ExactF32.nt(&a, &b, &lane).unwrap();
+        gemm_nt_f32(&a, &b, &plain, GemmBackend::TensorOps).unwrap();
+        rt.synchronize().unwrap();
+        assert_eq!(lane.buffer.read_f32(), plain.buffer.read_f32());
+    });
+}
+
 #[test]
 fn tn_splitk_matches_cpu_reference() {
     with_gpu(|rt| {

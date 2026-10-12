@@ -367,6 +367,17 @@ fn use_bf16_gemm(rt: &GpuRuntime, backend: GemmBackend) -> bool {
     rt.precision() == PrecisionMode::Bf16 && backend == GemmBackend::TensorOps && rt.has_tensorops()
 }
 
+impl GpuRuntime {
+    /// Whether the f32 GEMMs of the TensorOps backend run relaxed (tf32-class)
+    /// right now. The one question every "needs exact f32" refusal asks:
+    /// [`GpuRuntime::relaxed_precision`] alone is ignored under
+    /// `PrecisionMode::Bf16` and on a device without TensorOps, where the
+    /// GEMMs stay exact, so refusing on the flag over-refuses.
+    pub(crate) fn f32_gemm_runs_relaxed(&self) -> bool {
+        use_relaxed_f32(self, GemmBackend::TensorOps)
+    }
+}
+
 /// Whether an f32 [`gemm`] on `backend` runs the relaxed (tf32-class) kernel
 /// right now: the one predicate for "the exact-f32 forward is not exact".
 /// A session that must stay exact re-checks it on every entry, since the
@@ -1267,7 +1278,7 @@ pub enum GemmOperands {
 
 impl GemmOperands {
     fn exact(rt: &GpuRuntime, what: &str) -> Result<(), String> {
-        if rt.relaxed_precision() {
+        if rt.f32_gemm_runs_relaxed() {
             return Err(format!(
                 "{what}: exact-f32 operands asked for, but the runtime's relaxed precision is on"
             ));
@@ -1280,6 +1291,8 @@ impl GemmOperands {
         match self {
             Self::ExactF32 => {
                 Self::exact(a.runtime(), "GemmOperands::nn")?;
+                // `gemm` takes bf16 and f16 too; the exact lane must not.
+                validate_gemm(a, b, c, Layout::NN, false, "GemmOperands::nn")?;
                 gemm(a, b, c, GemmBackend::TensorOps)
             }
             Self::Bf16 => gemm_bf16(a, b, c),

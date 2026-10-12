@@ -35,7 +35,9 @@ constant uint SIMD_W = 32;
 // this kernel -- measured at 21x off memory bound, decode is latency bound, so
 // concurrency is the lever rather than arithmetic. Swept by
 // `bench_flash_attn` with BENCH_ATTN_DECODE_CHUNK; see the tessl README.
-constant uint KV_CHUNK = 256;
+// Read by the host-mirror test, not by the shader: the partial pass takes its
+// chunk width from the dispatch.
+[[maybe_unused]] constant uint KV_CHUNK = 256;
 
 /// Partial pass: one simdgroup, one (batch, head, kv-chunk).
 ///
@@ -286,8 +288,6 @@ kernel void NAME(                                                             \
     /* Match the partial pass's independently bounded scratch layout. */      \
     const uint Tkv = min(*Tkv_ptr, kv_capacity);                              \
     const uint bh = tgpig.y;                                                  \
-    const uint h = bh % H;                                                    \
-    const uint b = bh / H;                                                    \
     const uint n_chunks = Tkv / (CH) + ((Tkv % (CH)) != 0u ? 1u : 0u);        \
     const uint stride = D + 2u;                                              \
     const ulong chunk0 = (ulong)bh * n_chunks;                                \

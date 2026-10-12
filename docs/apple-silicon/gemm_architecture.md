@@ -225,16 +225,18 @@ in well under 1% of cases and it never dispatched those kernels at all.
 
 ## Benchmarking
 
-The A/B rig (`crates/tessl/kernels/tune/`) is **not** in the default metallib. It
-sits in a subdirectory so neither build script's directory glob can pick it up by
-accident. Measured with `xcrun metal-nm` on 2026-09-03: the default library holds
-**147 entry points at 1.13 MB**, and the tuning build adds **34** `mm_bf16_*`
-variants for **181 at 1.46 MB**. (This paragraph said "92 measurement-only
-kernels" and "0.20 MB to 1.07 MB" until then; both predate the NN and attention
-kernels landing in the default library.) Opt in:
+The A/B rig (`kernels/tune/`) is **not** in the default metallib. It
+sits in a subdirectory so build.rs's top-level directory glob cannot pick it up
+by accident. A tune build adds its 71 measurement-only entry points to the
+default library (`tests/docs_name_real_tools.rs` derives that count with
+`xcrun metal-nm` and fails when this paragraph quotes another). Opt in, with the
+variable on every `cargo` command, `cargo run` included: build.rs reruns when
+`TESSL_GEMM_TUNE` changes, so a plain `cargo run` after a tune build rebuilds
+the metallib without the rig.
 
 ```bash
 TESSL_GEMM_TUNE=1 cargo build --release --bins
+TESSL_GEMM_TUNE=1 cargo run --release --bin bench_gemm_tnnt_tune
 ```
 
 Both tuning binaries `exit(2)` with that command when the variants are absent,

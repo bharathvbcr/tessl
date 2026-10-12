@@ -11,6 +11,14 @@
 //! breaks cryptex Metal Toolchain resolution on Xcode 26+. Use `xcrun metal`
 //! plus an explicit `-isysroot`.
 //!
+//! Compiler diagnostics: stderr from every successful `metal` compile is
+//! forwarded as `cargo:warning=` lines (deduplicated across sources, replayed
+//! from the `.air` cache so a cached build keeps showing them).
+//! `TESSL_METAL_WERROR=1` is the opt-in strict mode: every source, tune rig
+//! included, is compiled with `-Wall -Werror` and a warning (or any metal4.0
+//! failure, no metal3.2 fallback) fails the build. CI runs the build that way,
+//! so this file is the one owner of the flag list.
+//!
 //! `TESSL_SKIP_AOT` is an explicit offline escape hatch. It requires
 //! `TESSL_PREBUILT_METALLIB` to name an existing absolute path; the build
 //! script never creates or replaces files in `CARGO_MANIFEST_DIR`.
@@ -23,6 +31,10 @@ use std::process::Command;
 fn main() {
     println!("cargo::rustc-check-cfg=cfg(tessl_embedded_metallib)");
     println!("cargo:rerun-if-env-changed=DEVELOPER_DIR");
+    println!("cargo:rerun-if-env-changed=SDKROOT");
+    println!("cargo:rerun-if-env-changed=TOOLCHAINS");
+    println!("cargo:rerun-if-env-changed=MACOSX_DEPLOYMENT_TARGET");
+    println!("cargo:rerun-if-env-changed=TESSL_METAL_WERROR");
     println!("cargo:rerun-if-env-changed=DOCS_RS");
     println!("cargo:rerun-if-env-changed=TESSL_SKIP_AOT");
     println!("cargo:rerun-if-env-changed=METAL_RUNTIME_SKIP_AOT");
@@ -101,19 +113,26 @@ fn main() {
     let sdk = xcrun_stdout(&["--sdk", "macosx", "--show-sdk-path"]);
     let metal = resolve_metal();
     let metallib = resolve_metallib();
+    track_toolchain(&metal, &metallib, &sdk);
+    let werror = env::var_os("TESSL_METAL_WERROR").is_some_and(|v| v != "0" && !v.is_empty());
 
     let mut air_files: Vec<PathBuf> = Vec::new();
 
     // TensorOps kernels — Metal 4 dialect (macOS 26+ / MPP). Hard-fail: NAX GEMM
     // is the hot path; a simdgroup-only metallib is not acceptable.
-    // The GEMM A/B rig (kernels/tune/) is 50 measurement-only kernels that
+    // The GEMM A/B rig (kernels/tune/) is measurement-only kernels that
     // nothing dispatches at runtime, so it stays opt-in to keep the shipped
-    // metallib small. It lives in a subdirectory precisely so the directory
-    // glob below cannot pick it up by accident.
+    // metallib small (`tests/docs_name_real_tools.rs` derives its count from
+    // a compile). It lives in a subdirectory precisely so the directory glob
+    // below cannot pick it up by accident.
     let want_tune = env::var_os("TESSL_GEMM_TUNE").is_some() || env::var_os("METAL_NATIVE_GEMM_TUNE").is_some();
     let mut tensorops_sources: Vec<PathBuf> = vec![kernels_dir.join("matmul_tensorops.metal")];
     if want_tune {
-        tensorops_sources.push(kernels_dir.join("tune/matmul_tensorops_tune.metal"));
+        let mut tune = metal_sources(&kernels_dir.join("tune"));
+        if tune.is_empty() {
+            panic!("TESSL_GEMM_TUNE is set but kernels/tune/ holds no .metal source");
+        }
+        tensorops_sources.append(&mut tune);
     }
     for src in &tensorops_sources {
         if !src.exists() {
@@ -126,16 +145,10 @@ fn main() {
 
     // All other .metal sources (simdgroup GEMM + util kernels).
     let skip: &[&str] = &["matmul_tensorops.metal"];
-    let mut others: Vec<PathBuf> = fs::read_dir(&kernels_dir)
-        .unwrap_or_else(|e| panic!("read kernels/: {e}"))
-        .filter_map(|e| e.ok())
-        .map(|e| e.path())
-        .filter(|p| {
-            p.extension().and_then(|s| s.to_str()) == Some("metal")
-                && !skip.iter().any(|s| p.file_name().and_then(|n| n.to_str()) == Some(*s))
-        })
+    let others: Vec<PathBuf> = metal_sources(&kernels_dir)
+        .into_iter()
+        .filter(|p| !skip.iter().any(|s| p.file_name().and_then(|n| n.to_str()) == Some(*s)))
         .collect();
-    others.sort();
 
     // Every source compiles under metal4.0 at once (bounded by the machine's
     // parallelism), each `.air` reused when nothing it depends on changed;
@@ -143,27 +156,31 @@ fn main() {
     // diagnostics and the metal3.2 fallback are what a one-at-a-time build
     // produced.
     let sources: Vec<PathBuf> = tensorops_sources.iter().chain(&others).cloned().collect();
-    let cache = AirCache::new(&metal, &sdk, &kernels_dir);
-    let outcomes = compile_metal4_all(&metal, &sdk, &out_dir, &cache, &sources);
+    let cache = AirCache::new(&metal, &sdk, &kernels_dir, werror);
+    let outcomes = compile_metal4_all(&metal, &sdk, &out_dir, &cache, &sources, werror);
+    let mut seen_diagnostics = std::collections::HashSet::new();
 
     // TensorOps kernels: hard-fail, no fallback.
     for (src, outcome) in sources.iter().zip(&outcomes).take(tensorops_sources.len()) {
         let name = src.file_name().and_then(|n| n.to_str()).unwrap_or("<unnamed>");
         match outcome {
-            Air::Ready { air, .. } => air_files.push(air.clone()),
+            Air::Ready { air, warnings, .. } => {
+                forward_warnings(name, warnings, &mut seen_diagnostics);
+                air_files.push(air.clone());
+            }
             Air::Metal4Failed { diag, .. } => panic!(
                 "{name} failed to compile (need Metal 4 / macOS 26 SDK + MetalToolchain); \
                  refusing simdgroup-only metallib\n{diag}"
             ),
         }
     }
-    println!("cargo:rustc-cfg=metal_runtime_tensorops");
 
     for (src, outcome) in sources.iter().zip(&outcomes).skip(tensorops_sources.len()) {
         let stem = src.file_stem().unwrap().to_string_lossy();
         let name = src.file_name().and_then(|n| n.to_str()).unwrap_or(&stem);
         match outcome {
-            Air::Ready { air, std } => {
+            Air::Ready { air, std, warnings } => {
+                forward_warnings(name, warnings, &mut seen_diagnostics);
                 if std != "metal4.0" {
                     // Reused from a build that already printed the metal4.0
                     // diagnostic below; say so again rather than go quiet.
@@ -179,6 +196,12 @@ fn main() {
                 diag: metal4_diag,
                 key,
             } => {
+                if werror {
+                    panic!(
+                        "{name} failed under -std=metal4.0 -Wall -Werror (TESSL_METAL_WERROR is set, so \
+                         there is no metal3.2 fallback)\n{metal4_diag}"
+                    );
+                }
                 // The fallback is a dialect downgrade, so its cause is printed with
                 // it rather than discarded: a green build whose kernel silently
                 // compiled under metal3.2 should be diagnosable from the log, and
@@ -191,13 +214,16 @@ fn main() {
                 for line in metal4_diag.lines().take(40) {
                     println!("cargo:warning=  {line}");
                 }
-                if let Err(metal32_diag) = try_metal_compile(&metal, &sdk, src, air, "metal3.2") {
-                    panic!(
+                match try_metal_compile(&metal, &sdk, src, air, "metal3.2", false) {
+                    Ok(warnings) => {
+                        forward_warnings(name, &warnings, &mut seen_diagnostics);
+                        AirCache::record(air, *key, "metal3.2", &warnings);
+                    }
+                    Err(metal32_diag) => panic!(
                         "{name} failed under both -std=metal4.0 and -std=metal3.2.\n\
                          --- metal4.0 ---\n{metal4_diag}\n--- metal3.2 ---\n{metal32_diag}"
-                    );
+                    ),
                 }
-                AirCache::record(air, *key, "metal3.2");
                 air_files.push(air.clone());
             }
         }
@@ -271,7 +297,13 @@ fn sweep_previous_metallibs(out_dir: &Path) {
 /// One source after the parallel metal4.0 pass.
 enum Air {
     /// `air` holds this source compiled under `std`: just now, or reused.
-    Ready { air: PathBuf, std: String },
+    /// `warnings` is the compiler's stderr for that compile, replayed from the
+    /// cache when the `.air` was reused.
+    Ready {
+        air: PathBuf,
+        std: String,
+        warnings: String,
+    },
     /// metal4.0 failed with `diag`; `key` is what to record for `air` once a
     /// fallback compile succeeds.
     Metal4Failed { air: PathBuf, diag: String, key: u64 },
@@ -280,7 +312,14 @@ enum Air {
 /// Compile every source under metal4.0 into `out_dir/<stem>.air`, reusing an
 /// `.air` whose recorded key still matches, on up to
 /// `available_parallelism()` threads. Results are in `sources` order.
-fn compile_metal4_all(metal: &Path, sdk: &str, out_dir: &Path, cache: &AirCache, sources: &[PathBuf]) -> Vec<Air> {
+fn compile_metal4_all(
+    metal: &Path,
+    sdk: &str,
+    out_dir: &Path,
+    cache: &AirCache,
+    sources: &[PathBuf],
+    werror: bool,
+) -> Vec<Air> {
     let next = std::sync::atomic::AtomicUsize::new(0);
     let workers = std::thread::available_parallelism()
         .map(|n| n.get())
@@ -299,16 +338,17 @@ fn compile_metal4_all(metal: &Path, sdk: &str, out_dir: &Path, cache: &AirCache,
                         };
                         let air = out_dir.join(format!("{}.air", src.file_stem().unwrap().to_string_lossy()));
                         let key = cache.key(src);
-                        let outcome = if let Some(std) = AirCache::reusable(&air, key) {
-                            Air::Ready { air, std }
+                        let outcome = if let Some((std, warnings)) = AirCache::reusable(&air, key) {
+                            Air::Ready { air, std, warnings }
                         } else {
                             AirCache::forget(&air);
-                            match try_metal_compile(metal, sdk, src, &air, "metal4.0") {
-                                Ok(()) => {
-                                    AirCache::record(&air, key, "metal4.0");
+                            match try_metal_compile(metal, sdk, src, &air, "metal4.0", werror) {
+                                Ok(warnings) => {
+                                    AirCache::record(&air, key, "metal4.0", &warnings);
                                     Air::Ready {
                                         air,
                                         std: "metal4.0".into(),
+                                        warnings,
                                     }
                                 }
                                 Err(diag) => Air::Metal4Failed { air, diag, key },
@@ -336,18 +376,22 @@ fn compile_metal4_all(metal: &Path, sdk: &str, out_dir: &Path, cache: &AirCache,
 /// compiler binary (path, size and modification time), the SDK (path and
 /// `SDKSettings.json`), every header under `kernels/` (any header edit
 /// invalidates every kernel; the conservative choice), the source's path and
-/// bytes and whether it is built without FP contraction. The key is written
+/// bytes, whether it is built without FP contraction and whether the strict
+/// (`-Wall -Werror`) flags are on. The key is written
 /// next to the `.air` only after a successful compile, and removed before a
-/// compile starts, so an interrupted or failed compile is never reused.
+/// compile starts, so an interrupted or failed compile is never reused. A
+/// successful compile's stderr is kept beside it (`.air.warn`) so a reused
+/// `.air` still reports what the compiler said.
 struct AirCache {
     shared: u64,
 }
 
 impl AirCache {
-    fn new(metal: &Path, sdk: &str, kernels_dir: &Path) -> Self {
+    fn new(metal: &Path, sdk: &str, kernels_dir: &Path, werror: bool) -> Self {
         use std::hash::{Hash, Hasher};
         let mut h = std::collections::hash_map::DefaultHasher::new();
         include_str!("build.rs").hash(&mut h);
+        werror.hash(&mut h);
         metal.hash(&mut h);
         if let Ok(meta) = fs::metadata(metal) {
             meta.len().hash(&mut h);
@@ -387,19 +431,32 @@ impl AirCache {
         PathBuf::from(p)
     }
 
-    /// The `-std` the existing `air` was compiled under, if its key matches.
-    fn reusable(air: &Path, key: u64) -> Option<String> {
+    fn warn_path(air: &Path) -> PathBuf {
+        let mut p = air.as_os_str().to_owned();
+        p.push(".warn");
+        PathBuf::from(p)
+    }
+
+    /// The `-std` and compiler stderr of the existing `air`, if its key matches.
+    fn reusable(air: &Path, key: u64) -> Option<(String, String)> {
         let recorded = fs::read_to_string(Self::key_path(air)).ok()?;
         let (hex, std) = recorded.trim().split_once(' ')?;
-        (u64::from_str_radix(hex, 16).ok()? == key && air.is_file()).then(|| std.to_string())
+        if u64::from_str_radix(hex, 16).ok()? != key || !air.is_file() {
+            return None;
+        }
+        let warnings = fs::read_to_string(Self::warn_path(air)).unwrap_or_default();
+        Some((std.to_string(), warnings))
     }
 
     fn forget(air: &Path) {
         let _ = fs::remove_file(Self::key_path(air));
+        let _ = fs::remove_file(Self::warn_path(air));
     }
 
-    fn record(air: &Path, key: u64, std: &str) {
-        // A key that cannot be written costs a recompile next time, nothing more.
+    fn record(air: &Path, key: u64, std: &str, warnings: &str) {
+        // Neither file being writable costs a recompile or a quiet replay next
+        // time, nothing more. The warnings go first: the key is the commit.
+        let _ = fs::write(Self::warn_path(air), warnings);
         let _ = fs::write(Self::key_path(air), format!("{key:016x} {std}\n"));
     }
 }
@@ -419,39 +476,110 @@ fn collect_headers(dir: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
-/// Compile one kernel under `metal_std`; on failure return the compiler's
-/// diagnostic (or the spawn error) instead of swallowing it.
-fn try_metal_compile(metal: &Path, sdk: &str, src: &Path, air: &Path, metal_std: &str) -> Result<(), String> {
-    let std_flag = format!("-std={metal_std}");
-    let mut cmd = Command::new(metal);
-    cmd.args([
-        std_flag.as_str(),
+/// The one flag list every compile uses. `werror` adds `-Wall -Werror`.
+fn metal_args(sdk: &str, src: &Path, metal_std: &str, werror: bool) -> Vec<String> {
+    let mut args: Vec<String> = [
+        &format!("-std={metal_std}")[..],
         "-O2",
         "-fmetal-math-mode=fast",
         "-isysroot",
         sdk,
         "-mmacosx-version-min=26.0",
-    ]);
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect();
     if disable_fp_contract(src) {
-        cmd.arg("-ffp-contract=off");
+        args.push("-ffp-contract=off".into());
     }
-    let out = cmd
+    if werror {
+        args.extend(["-Wall".into(), "-Werror".into()]);
+    }
+    args
+}
+
+/// Compile one kernel under `metal_std`. On success return the compiler's
+/// stderr (its warnings); on failure return the diagnostic (or the spawn
+/// error) instead of swallowing it.
+fn try_metal_compile(
+    metal: &Path,
+    sdk: &str,
+    src: &Path,
+    air: &Path,
+    metal_std: &str,
+    werror: bool,
+) -> Result<String, String> {
+    let out = Command::new(metal)
+        .args(metal_args(sdk, src, metal_std, werror))
         .arg("-c")
         .arg(src)
         .arg("-o")
         .arg(air)
         .output()
         .map_err(|e| format!("failed to spawn {}: {e}", metal.display()))?;
-    if out.status.success() {
-        return Ok(());
-    }
     let stderr = String::from_utf8_lossy(&out.stderr);
     let stderr = stderr.trim();
+    if out.status.success() {
+        return Ok(stderr.to_string());
+    }
     Err(if stderr.is_empty() {
         format!("metal exited with {}", out.status)
     } else {
         stderr.to_string()
     })
+}
+
+/// Print a source's compiler stderr as `cargo:warning=` lines. A diagnostic
+/// block (its `warning:` line plus the source excerpt and notes that follow)
+/// already printed for another source, as headers produce for each includer, is
+/// dropped; `seen` carries the blocks across sources.
+fn forward_warnings(name: &str, stderr: &str, seen: &mut std::collections::HashSet<String>) {
+    let mut blocks: Vec<Vec<&str>> = Vec::new();
+    for line in stderr.lines().filter(|l| !l.trim().is_empty()) {
+        if line.contains(": warning:") || blocks.is_empty() {
+            blocks.push(Vec::new());
+        }
+        blocks.last_mut().expect("a block was just pushed").push(line);
+    }
+    for block in blocks {
+        if !seen.insert(block.join("\n")) {
+            continue;
+        }
+        println!("cargo:warning={name}: metal compiler diagnostics");
+        for line in block {
+            println!("cargo:warning=  {line}");
+        }
+    }
+}
+
+/// Every `.metal` file directly in `dir`, sorted.
+fn metal_sources(dir: &Path) -> Vec<PathBuf> {
+    let mut out: Vec<PathBuf> = fs::read_dir(dir)
+        .unwrap_or_else(|e| panic!("read {}: {e}", dir.display()))
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("metal"))
+        .collect();
+    out.sort();
+    out
+}
+
+/// Rebuild when the toolchain changes underneath an unchanged tree: the
+/// resolved compiler and linker (the path and, through its symlink, the file
+/// Cargo stats), the SDK directory and its `SDKSettings.json`. An in-place
+/// Xcode or Metal Toolchain update moves one of them.
+fn track_toolchain(metal: &Path, metallib: &Path, sdk: &str) {
+    for tool in [metal, metallib] {
+        println!("cargo:rerun-if-changed={}", tool.display());
+        if let Ok(real) = tool.canonicalize() {
+            println!("cargo:rerun-if-changed={}", real.display());
+        }
+    }
+    println!("cargo:rerun-if-changed={sdk}");
+    println!(
+        "cargo:rerun-if-changed={}",
+        Path::new(sdk).join("SDKSettings.json").display()
+    );
 }
 
 fn ensure_developer_dir() {

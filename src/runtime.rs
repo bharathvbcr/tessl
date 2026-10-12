@@ -725,6 +725,9 @@ pub struct GpuRuntime {
     /// address). Residency is per buffer and wraps are per call, so the buffer
     /// joins the set with its first wrap and leaves it after its last.
     external_wraps: Mutex<HashMap<usize, usize>>,
+    /// Every external wrap ever counted, for tests that assert a refused call
+    /// wrapped nothing (the live count above falls back after a sync).
+    external_wrap_total: AtomicU64,
     /// External wraps dropped since the last drain; released after CB wait.
     pending_external_release: Mutex<Vec<Deferred<PendingRetirement>>>,
     /// Non-buffer allocations dropped since the last drain. Metal 4 command
@@ -970,6 +973,7 @@ impl GpuRuntime {
             pending_cold_recycle: Mutex::new(Vec::new()),
             pending_retirement: Mutex::new(Vec::new()),
             external_wraps: Mutex::new(HashMap::new()),
+            external_wrap_total: AtomicU64::new(0),
             pending_external_release: Mutex::new(Vec::new()),
             pending_release: Mutex::new(Vec::new()),
             params: Mutex::new(None),
@@ -1192,8 +1196,15 @@ impl GpuRuntime {
     /// when its final handle drops.
     /// Count a new wrap of a caller-owned buffer, adding it to the residency
     /// set if it is the first live one.
+    /// Wraps of caller buffers counted since the runtime was made. Test hook.
+    #[doc(hidden)]
+    pub fn external_wrap_total(&self) -> u64 {
+        self.external_wrap_total.load(Ordering::Relaxed)
+    }
+
     pub(crate) fn retain_external(&self, buffer: &ProtocolObject<dyn MTLBuffer>) {
         let key = buffer as *const ProtocolObject<dyn MTLBuffer> as *const () as usize;
+        self.external_wrap_total.fetch_add(1, Ordering::Relaxed);
         let mut wraps = self.external_wraps.lock().unwrap_or_else(|p| p.into_inner());
         let n = wraps.entry(key).or_insert(0);
         *n += 1;

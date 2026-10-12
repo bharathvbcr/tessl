@@ -651,6 +651,22 @@ All notable changes to `tessl` are recorded here. The format follows
 
 ### Fixed
 
+- **C ABI: validate before mutate, allocate or publish.** Every slice built
+  from a caller's `n` goes through one checked helper that refuses a byte
+  length past `isize::MAX`, a null pointer with elements and a misaligned
+  pointer (undefined behaviour in release, an uncatchable abort in debug)
+  with `TESSL_ERR`. `tessl_qwen35_copy` checks its direction and the state it
+  needs before wrapping any tensor. `tessl_cross_entropy_rows` and
+  `tessl_gdn_train_backward` run the same validators as their Rust entry
+  points (`validate_ce_inputs`, `validate_gdn_backward`) before replacing the
+  cached workspace, so a refused call keeps it; the CE `chunk` is clamped to
+  the vocabulary, so it no longer sizes the logits buffer.
+  `tessl_qwen35_train_step` parses `operands` before it marks the bank dirty:
+  a refused argument leaves the previous gradients readable, and only a step
+  that starts and fails leaves none (the doc now says so).
+  `tessl_qwen35_load` writes `*out` only after its final synchronize
+  succeeds, and frees the model otherwise: `*out` is null whenever the status
+  is not `TESSL_OK`.
 - **One SiLU, overflow-free.** `nn::mlp_silu` and the GEMM epilogue's
   `Activation::Silu` computed the textbook `x / (1 + exp(-x))`, which divides
   by `exp(-x) = inf` below -88 under the fast math every kernel compiles with.

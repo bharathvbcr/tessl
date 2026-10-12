@@ -8,6 +8,19 @@ All notable changes to `tessl` are recorded here. The format follows
 
 ### Added
 
+- **Parser mutation tests** (`tests/parser_mutation.rs`, CPU only, no
+  dependency): seeded truncation at every byte, byte and bit flips, extreme
+  length/offset/shape values, invalid UTF-8 and deep nesting driven through
+  `safetensors` (and its JSON parser) and `npy`, with a counting allocator
+  asserting that no declared size is allocated before it is checked against
+  the file. `TESSL_MUTATION_CASES` / `TESSL_MUTATION_SEED` set the random pass.
+- **`bench/test_parity_harness.py --pure` passes again, and `scripts/ci_local.sh`
+  runs it.** The 6c62ab7 import left main's older `gemm_sweep_mlx.py` and
+  `paired_cross_runtime.py` beside the harness that tests the imported ones;
+  the imported scorers (per-element budget, `adjudicate`, seed-directory
+  `parity()`, `missing_coverage`) are restored. `scripts/audit_gemm_tiles.py`
+  keeps its stricter main logic, gains `geometry_error`/`geometry_matches`
+  and a `__main__` guard so the harness can import it.
 - **Measurements: exact f32 at the 2B MLP up/gate shape, and int8.** The
   4.1 vs 5.7 TFLOP/s exact-f32 gap at 2048x6144x2048 reproduces under the
   row-major walk production had on 2026-09-30 and is the B operand (50 MB)
@@ -668,6 +681,8 @@ All notable changes to `tessl` are recorded here. The format follows
 
 ### Fixed
 
+- `npy::read_npy` panicked (slicing inside a multi-byte character) when
+  `fortran_order` was followed by non-ASCII text; it now returns the error.
 - **C ABI: validate before mutate, allocate or publish.** Every slice built
   from a caller's `n` goes through one checked helper that refuses a byte
   length past `isize::MAX`, a null pointer with elements and a misaligned

@@ -568,7 +568,11 @@ fn forward_warnings(name: &str, stderr: &str, seen: &mut std::collections::HashS
         }
     }
     for block in blocks {
-        let diagnostic = if block.body.is_empty() { &block.include } else { &block.body };
+        let diagnostic = if block.body.is_empty() {
+            &block.include
+        } else {
+            &block.body
+        };
         if !seen.insert(diagnostic.join("\n")) {
             continue;
         }

@@ -751,7 +751,9 @@ pub(crate) fn check_threadgroup_limit(
 ) -> Result<(), String> {
     let limit = pipeline.maxTotalThreadsPerThreadgroup();
     if threads_per_tg > limit {
-        let name = rt.pipeline_name(pipeline).unwrap_or_else(|| "<unnamed pipeline>".into());
+        let name = rt
+            .pipeline_name(pipeline)
+            .unwrap_or_else(|| "<unnamed pipeline>".into());
         return Err(format!(
             "dispatch of '{name}': {threads_per_tg} threads per threadgroup exceeds the pipeline's \
              maxTotalThreadsPerThreadgroup {limit}"

@@ -247,7 +247,11 @@ fn exact_f32_nn_refuses_narrow_operands() {
         narrow[1].buffer.write_f16_bits(&f32_slice_to_f16(&host));
         rt.take_dispatch_count();
         for t in &narrow {
-            assert!(GemmOperands::ExactF32.nn(t, t, &c).is_err(), "{:?} nn accepted", t.dtype);
+            assert!(
+                GemmOperands::ExactF32.nn(t, t, &c).is_err(),
+                "{:?} nn accepted",
+                t.dtype
+            );
             assert!(GemmOperands::ExactF32.nn(&a32, t, &c).is_err(), "mixed nn accepted");
             assert!(GemmOperands::ExactF32.tn(t, t, &c).is_err());
             assert!(GemmOperands::ExactF32.nt(t, t, &c).is_err());

@@ -383,7 +383,9 @@ fn metal_diagnostics_are_forwarded_cached_and_strict_on_request() {
     let log = scratch.0.join("metal.log");
     let run = |env: &[(&str, &str)]| {
         let mut command = build_command(&build_script, &manifest, &out, &tools);
-        command.env("TESSL_FAKE_METAL_LOG", &log).env_remove("TESSL_METAL_WERROR");
+        command
+            .env("TESSL_FAKE_METAL_LOG", &log)
+            .env_remove("TESSL_METAL_WERROR");
         for (k, v) in env {
             command.env(k, v);
         }
@@ -395,11 +397,7 @@ fn metal_diagnostics_are_forwarded_cached_and_strict_on_request() {
     // 1. Fresh build: both warnings, the header's once, no tally lines; the
     //    metal4.0-only failure falls back to metal3.2 as before.
     let first = run(&[]);
-    assert!(
-        first.status.success(),
-        "{}",
-        String::from_utf8_lossy(&first.stderr)
-    );
+    assert!(first.status.success(), "{}", String::from_utf8_lossy(&first.stderr));
     let first_out = stdout(&first);
     assert_eq!(
         first_out.matches(header).count(),
@@ -415,10 +413,7 @@ fn metal_diagnostics_are_forwarded_cached_and_strict_on_request() {
         !first_out.contains("generated."),
         "the per-source tally is not a diagnostic:\n{first_out}"
     );
-    assert!(
-        first_out.contains("falling back to -std=metal3.2"),
-        "{first_out}"
-    );
+    assert!(first_out.contains("falling back to -std=metal3.2"), "{first_out}");
     assert!(first_out.contains("cargo:rerun-if-env-changed=TESSL_METAL_WERROR"));
     let compiled = log_lines(&log).len();
     assert!(
@@ -478,11 +473,7 @@ fn metal_diagnostics_are_forwarded_cached_and_strict_on_request() {
     write("c.metal", "kernel void c() {}\n");
     let before = log_lines(&log).len();
     let clean = run(&[("TESSL_METAL_WERROR", "1"), ("TESSL_GEMM_TUNE", "1")]);
-    assert!(
-        clean.status.success(),
-        "{}",
-        String::from_utf8_lossy(&clean.stderr)
-    );
+    assert!(clean.status.success(), "{}", String::from_utf8_lossy(&clean.stderr));
     let clean_log = log_lines(&log).split_off(before);
     for src in [
         "matmul_tensorops.metal",

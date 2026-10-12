@@ -2068,6 +2068,10 @@ fn global_h512_with_scalars_pins_out_bf16_after_the_callback() {
         }
         rt.synchronize().unwrap();
 
-        assert_eq!(o.read_u32()[..n / 2], reference.read_u32()[..n / 2], "bf16 output differs");
+        assert_eq!(
+            o.read_u32()[..n / 2],
+            reference.read_u32()[..n / 2],
+            "bf16 output differs"
+        );
     });
 }

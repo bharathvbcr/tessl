@@ -120,7 +120,6 @@ pub struct GpuTensor {
     // Private: `bind_mtl_tensor` binds `tensor` on the premise that this handle
     // owns it and keeps it resident, which a swapped-in field would break.
     tensor: Retained<ProtocolObject<dyn MTLTensor>>,
-    dtype: MTLTensorDataType,
     dims: Vec<usize>,
     /// A buffer-backed tensor's storage: the MTLTensor above borrows it, and
     /// its residency is the buffer's own. `None` for a device-owned tensor,
@@ -228,7 +227,6 @@ pub fn alloc_device_tensor(rt: &Arc<GpuRuntime>, dims: &[usize], dtype: QuantDTy
     rt.register_allocation(ProtocolObject::<dyn MTLAllocation>::from_ref(&*tensor));
     Ok(GpuTensor {
         tensor,
-        dtype: mtl_dtype,
         dims: dims.to_vec(),
         storage: None,
         runtime: Arc::clone(rt),
@@ -289,7 +287,6 @@ pub unsafe fn tensor_from_buffer(
         .map_err(|e| format!("buffer.newTensor: {e}"))?;
     Ok(GpuTensor {
         tensor,
-        dtype: mtl_dtype,
         dims: dims.to_vec(),
         storage: Some(buf.clone()),
         runtime: Arc::clone(rt),

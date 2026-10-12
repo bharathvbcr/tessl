@@ -38,10 +38,7 @@ fn assert_refuses(bin: &str, exe: &str) {
         out.status
     );
     let command = format!("{TUNE_RUN} {bin}");
-    assert!(
-        stderr.contains(&command),
-        "{bin} must name `{command}`:\n{stderr}"
-    );
+    assert!(stderr.contains(&command), "{bin} must name `{command}`:\n{stderr}");
     assert!(
         !stdout.contains("skip(pipe)"),
         "{bin} printed skip(pipe) lines:\n{stdout}"

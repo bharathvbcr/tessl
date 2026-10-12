@@ -30,7 +30,9 @@ fn relaxed_flag_is_read_only_by_the_shared_predicate() {
         let name = f.file_name().unwrap().to_string_lossy().into_owned();
         for (i, line) in text.lines().enumerate() {
             let code = line.split("//").next().unwrap_or("");
-            if code.contains("relaxed_precision()") && !(name == "runtime.rs" && code.contains("pub fn relaxed_precision")) {
+            if code.contains("relaxed_precision()")
+                && !(name == "runtime.rs" && code.contains("pub fn relaxed_precision"))
+            {
                 hits.push(format!("{name}:{}: {}", i + 1, line.trim()));
             }
         }

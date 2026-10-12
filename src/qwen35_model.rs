@@ -27,6 +27,16 @@
 //! the attention Q/K norms in theirs); the GDN gated norm's weight is used
 //! as stored.
 //!
+//! # Loading
+//!
+//! [`Qwen35Model::load`] reads every tensor of the model by name under the
+//! checkpoint's prefix and refuses the checkpoint if any tensor under that
+//! prefix was not read (`Loader::refuse_unread`): a longer layer stack than
+//! the config's, a projection bias, an extra norm. Such a tensor is a
+//! parameter of a model this forward does not implement, and ignoring it would
+//! return the wrong model's logits without a word. Tensors outside the prefix
+//! (the vision tower, `mtp.`) are not looked at.
+//!
 //! # Precision
 //!
 //! [`Precision::Bf16`] is the production forward: bf16 weights, and every GEMM
@@ -153,8 +163,16 @@ impl Qwen35Config {
     /// Everything the forward depends on is read, and everything it does not
     /// implement is refused by name rather than ignored: untied embeddings,
     /// MoE, attention bias, an ungated attention output, an activation other
-    /// than SiLU, `mlp_only_layers`, a RoPE other than the default, and key or
-    /// head dims the kernels are not compiled for.
+    /// than SiLU, `mlp_only_layers`, a RoPE other than the default, a
+    /// `mamba_ssm_dtype` other than `"float32"`, a non-zero `attention_dropout`,
+    /// and key or head dims the kernels are not compiled for.
+    ///
+    /// Keys the forward has no use for are left unread: `dtype` (the caller
+    /// picks the [`Precision`]), `eos_token_id`, `initializer_range`,
+    /// `max_position_embeddings`, `use_cache`, `model_type`, the `mtp_*` keys
+    /// (the checkpoint's `mtp.` tensors are outside the prefix), and
+    /// `rope_parameters.mrope_*` (text positions are one stream, so the
+    /// multimodal sections do not apply).
     pub fn from_config_json(text: &str) -> Result<Self, String> {
         const SYNTAX: Syntax = Syntax {
             what: "config.json",
@@ -226,6 +244,27 @@ impl Qwen35Config {
         }
         if flag("attention_bias")? == Some(true) {
             return Err("config.json: attention_bias is not supported".into());
+        }
+        // The GDN rules run in float32 whatever this says: transformers casts
+        // them unconditionally (modeling_qwen3_5.py:266, 347) and declares no
+        // `mamba_ssm_dtype` at all, so an absent key is float32 too (as in
+        // ojas-qwen35). Any other dtype would be a request this forward cannot
+        // honour.
+        if let Some(d) = string("mamba_ssm_dtype")? {
+            if d != "float32" {
+                return Err(format!(
+                    "config.json: mamba_ssm_dtype {d:?} is not supported (the GDN state is float32)"
+                ));
+            }
+        }
+        // Inference and dropout-free training only: no kernel drops attention
+        // probabilities (transformers' default is 0.0,
+        // configuration_qwen3_5.py:96).
+        if let Some(v) = c.get("attention_dropout") {
+            let p = float(v, "attention_dropout")?;
+            if p != 0.0 {
+                return Err(format!("config.json: attention_dropout {p} is not supported (only 0)"));
+            }
         }
         if flag("attn_output_gate")? == Some(false) {
             return Err("config.json: an ungated attention output is not supported".into());
@@ -631,6 +670,9 @@ impl Qwen35Model {
                 down: ld.linear(&[(&p("mlp.down_proj.weight"), h)], inter, precision)?,
             });
         }
+        // Every tensor under the prefix is a parameter of this model: a longer
+        // layer stack, a bias or an extra norm is a different model.
+        ld.refuse_unread()?;
         rt.synchronize()?;
         Ok(Self {
             cfg,

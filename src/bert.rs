@@ -29,6 +29,13 @@
 //! decoder matrix); one that does store `cls.predictions.decoder.weight` is
 //! read from it instead.
 //!
+//! # Loading
+//!
+//! [`BertSparseModel::load`] reads every tensor by name and refuses a
+//! checkpoint carrying any tensor it did not read (a deeper stack than the
+//! config's, a stray bias, an unexpected head): the model is exactly what it
+//! read, so an unread tensor is a parameter being ignored.
+//!
 //! # Precision
 //!
 //! Weights and activations are f32 and every GEMM is exact f32, which is
@@ -48,6 +55,7 @@ use crate::dispatch::{dispatch_1d, set_f32, set_gpu_buf, set_u32};
 use crate::embedgemma2::{encoder_attn, EncoderAttnDims};
 use crate::gemm::{gemm, gemm_nt_f32, GemmBackend};
 use crate::json::{self, Json, Syntax};
+use crate::loader::Loader;
 use crate::nn::{dispatch_tg_1d, reduce_tptg, require, require_disjoint_writes};
 use crate::qwen35;
 use crate::runtime::GpuRuntime;
@@ -639,21 +647,17 @@ fn names(family: BertFamily) -> Names {
     }
 }
 
-struct Loader<'a> {
-    st: &'a SafeTensors,
+/// BERT's reads: [`crate::loader::Loader`] (empty prefix, so every tensor in
+/// the file is recorded and checked by `Loader::refuse_unread`) with finite
+/// weights required and `Cold` buffers.
+struct Weights<'a> {
+    ld: Loader<'a>,
     rt: &'a Arc<GpuRuntime>,
 }
 
-impl Loader<'_> {
+impl Weights<'_> {
     fn f32(&self, name: &str, shape: &[usize]) -> Result<Vec<f32>, String> {
-        let (got, data) = self.st.read_f32(name)?;
-        if got != shape {
-            return Err(format!("{name}: shape {got:?}, expected {shape:?}"));
-        }
-        if let Some(i) = data.iter().position(|v| !v.is_finite()) {
-            return Err(format!("{name}: element {i} is {}", data[i]));
-        }
-        Ok(data)
+        self.ld.f32_finite(name, shape)
     }
 
     fn buf(&self, data: &[f32]) -> Result<GpuBuffer, String> {
@@ -740,9 +744,10 @@ struct Acts {
 impl BertSparseModel {
     /// Load the encoder and its masked-LM head from `st`. Every tensor's
     /// shape is checked against `cfg`, and every weight must be finite; a
-    /// missing one is an error.
+    /// missing one is an error, and so is one the checkpoint carries that
+    /// this model never reads (`Loader::refuse_unread`).
     pub fn load(rt: &Arc<GpuRuntime>, st: &SafeTensors, cfg: BertConfig) -> Result<Self, String> {
-        let ld = Loader { st, rt };
+        let ld = Weights { ld: Loader::new(rt, st, ""), rt };
         let n = names(cfg.family);
         let (h, inter, vocab) = (cfg.hidden, cfg.intermediate, cfg.vocab);
         let e = |rest: &str| format!("{}{rest}", n.embed);
@@ -797,6 +802,9 @@ impl BertSparseModel {
         let transform = ld.dense(n.transform, h, h)?;
         let transform_norm = ld.norm(n.transform_norm, h)?;
         let decoder_bias = ld.vector(n.decoder_bias, vocab)?;
+        // The model is everything it read: a tensor beyond that (a deeper
+        // stack than the config's, a pooler, a stray bias) is refused by name.
+        ld.ld.refuse_unread()?;
         rt.synchronize()?;
         Ok(Self {
             cfg,

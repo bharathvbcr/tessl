@@ -190,3 +190,120 @@ fn the_kernel_counts_the_docs_quote_are_the_builds() {
         "README.md should say `{readme_nn_claim}`"
     );
 }
+
+/// Entry points the GEMM tune rig adds, from a compile of `kernels/tune/`.
+/// Entry-point names do not depend on math mode, so the flags here are the
+/// bare minimum, not build.rs's.
+///
+/// No toolchain is a failure, not a skip: this crate does not build without
+/// the Metal 4 compiler (build.rs refuses a simdgroup-only metallib), and a
+/// count that could not be taken must not read as one that matched.
+fn tune_entry_points() -> usize {
+    let root = crate_root();
+    let sdk = std::process::Command::new("xcrun")
+        .args(["--sdk", "macosx", "--show-sdk-path"])
+        .output()
+        .expect("spawn xcrun --show-sdk-path");
+    assert!(
+        sdk.status.success(),
+        "no macOS SDK, so the tune-kernel count cannot be taken: {}",
+        String::from_utf8_lossy(&sdk.stderr)
+    );
+    let sdk = String::from_utf8_lossy(&sdk.stdout).trim().to_string();
+    let dir = std::env::temp_dir().join(format!("tessl-tune-count-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("temp dir");
+    let mut total = 0;
+    let mut sources: Vec<_> = std::fs::read_dir(root.join("kernels/tune"))
+        .expect("kernels/tune")
+        .filter_map(Result::ok)
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|x| x == "metal"))
+        .collect();
+    sources.sort();
+    assert!(!sources.is_empty(), "kernels/tune holds no .metal source");
+    for src in &sources {
+        let air = dir.join(format!("{}.air", src.file_stem().unwrap().to_string_lossy()));
+        let cc = std::process::Command::new("xcrun")
+            .args([
+                "metal",
+                "-std=metal4.0",
+                "-O2",
+                "-isysroot",
+                &sdk,
+                "-mmacosx-version-min=26.0",
+                "-c",
+            ])
+            .arg(src)
+            .arg("-o")
+            .arg(&air)
+            .output()
+            .expect("spawn xcrun metal");
+        assert!(
+            cc.status.success(),
+            "{} failed to compile under -std=metal4.0 (a missing Metal Toolchain fails here too): {}",
+            src.display(),
+            String::from_utf8_lossy(&cc.stderr)
+        );
+        let nm = std::process::Command::new("xcrun")
+            .arg("metal-nm")
+            .arg(&air)
+            .output()
+            .expect("xcrun metal-nm");
+        assert!(nm.status.success(), "metal-nm: {}", String::from_utf8_lossy(&nm.stderr));
+        total += String::from_utf8_lossy(&nm.stdout)
+            .lines()
+            .filter(|l| l.split_whitespace().nth(1) == Some("T"))
+            .count();
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+    total
+}
+
+/// Every integer a doc puts directly before a tune-kernel phrase, with the
+/// phrase it sits before.
+fn quoted_tune_counts<'a>(text: &'a str, phrases: &[&'a str]) -> Vec<(&'a str, usize)> {
+    let mut found = Vec::new();
+    for &phrase in phrases {
+        for (at, _) in text.match_indices(phrase) {
+            let head = text[..at].trim_end_matches([' ', '-']);
+            let digits = head.len() - head.trim_end_matches(|c: char| c.is_ascii_digit()).len();
+            if digits > 0 {
+                found.push((phrase, head[head.len() - digits..].parse().expect("digits")));
+            }
+        }
+    }
+    found
+}
+
+#[test]
+fn the_tune_kernel_count_the_docs_quote_is_the_builds() {
+    let tune = tune_entry_points();
+    assert!(tune > 0, "kernels/tune/ compiled to no entry points");
+    const PHRASES: &[&str] = &[
+        " variants)",
+        "-kernel A/B",
+        " A/B Kernels",
+        " measurement-only kernels",
+        " measurement-only entry points",
+        " measurement kernels",
+    ];
+    let mut quoted = 0;
+    for doc in [
+        "README.md",
+        "docs/benchmarking.md",
+        "docs/apple-silicon/gemm_architecture.md",
+    ] {
+        let text = std::fs::read_to_string(crate_root().join(doc)).expect(doc);
+        for (phrase, n) in quoted_tune_counts(&text, PHRASES) {
+            quoted += 1;
+            assert_eq!(
+                n, tune,
+                "{doc} quotes {n}{phrase:?}, but kernels/tune/ builds {tune} entry points"
+            );
+        }
+    }
+    assert!(
+        quoted >= 6,
+        "found only {quoted} tune-count claims; did the docs' wording move?"
+    );
+}

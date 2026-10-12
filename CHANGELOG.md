@@ -244,6 +244,21 @@ All notable changes to `tessl` are recorded here. The format follows
   synchronize.
 
 ### Changed
+- build.rs: every kernel's Metal compiler stderr is now forwarded as
+  deduplicated `cargo:warning=` lines (previously only `matmul_tensorops.metal`
+  surfaced warnings), replayed from the `.air` cache. `TESSL_METAL_WERROR=1`
+  compiles every source, `kernels/tune/` included under `TESSL_GEMM_TUNE=1`,
+  with `-Wall -Werror` and no metal3.2 fallback; `metal-compile.yml` runs the
+  build that way instead of keeping a second source list and flag set.
+  Rebuilds now also trigger on the resolved `metal`/`metallib` binaries, the
+  SDK and `SDKROOT`/`TOOLCHAINS`/`MACOSX_DEPLOYMENT_TARGET`. The unread
+  `metal_runtime_tensorops` cfg is gone.
+- `kernels/flash_attn_decode.metal`: dropped two unused locals in the reduce
+  kernel and marked the host-mirror `KV_CHUNK` constant `[[maybe_unused]]`
+  (the only `-Wall` warnings in the tree).
+- Docs: the tune-bench commands put `TESSL_GEMM_TUNE=1` on every `cargo run`;
+  the tune-kernel count (71) is derived from a compile by
+  `tests/docs_name_real_tools.rs`.
 
 - **bf16 TN at the split-K-gated dW shapes runs a parallel split-K.** The
   shapes `prefer_tn_splitk` picks (K >= 2048, M, N <= 384, min <= 128) took

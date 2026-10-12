@@ -267,3 +267,237 @@ esac
     );
     assert_eq!(source_snapshot(&manifest), before);
 }
+
+/// A fake `metal` that answers from the source it is given: `#include
+/// "shared.h"` reports a header warning while `shared.h` says `WARN`,
+/// `WARN_SELF` reports one of the source's own, `FAIL_METAL4` fails under
+/// `-std=metal4.0`, and `-Werror` turns any warning into a failure. It prints
+/// the include chain and the `N warnings generated.` tally the way clang does,
+/// and logs each invocation (source, then flags) to `$TESSL_FAKE_METAL_LOG`.
+const DIAGNOSING_TOOLS: &str = r#"#!/bin/sh
+set -eu
+case "$(basename "$0")" in
+  xcrun)
+    if [ "${1:-}" = "-f" ]; then
+      printf '%s/%s\n' "$(dirname "$0")" "$2"
+    else
+      printf '/tmp\n'
+    fi
+    exit 0
+    ;;
+esac
+src=''
+out=''
+std=''
+werror=0
+prev=''
+for a in "$@"; do
+  case "$prev" in
+    -c) src="$a" ;;
+    -o) out="$a" ;;
+  esac
+  case "$a" in
+    -std=*) std="${a#-std=}" ;;
+    -Werror) werror=1 ;;
+  esac
+  prev="$a"
+done
+test -n "$out"
+if [ "$(basename "$0")" = "metallib" ]; then
+  printf 'synthetic-metallib\n' > "$out"
+  exit 0
+fi
+printf '%s %s\n' "$(basename "$src")" "$*" >> "$TESSL_FAKE_METAL_LOG"
+if [ "$std" = "metal4.0" ] && grep -q FAIL_METAL4 "$src"; then
+  echo "$src:1:1: error: synthetic metal4.0-only failure" >&2
+  exit 1
+fi
+n=0
+if grep -q '#include "shared.h"' "$src" && grep -q WARN "$(dirname "$src")/shared.h"; then
+  echo "In file included from $src:1:" >&2
+  echo "$(dirname "$src")/shared.h:1:5: warning: synthetic header warning [-Wunused-variable]" >&2
+  echo "int shared_unused;" >&2
+  echo "    ^" >&2
+  n=$((n + 1))
+fi
+if grep -q WARN_SELF "$src"; then
+  echo "$src:2:5: warning: synthetic own warning [-Wunused-variable]" >&2
+  echo "int WARN_SELF;" >&2
+  echo "    ^" >&2
+  n=$((n + 1))
+fi
+if [ "$n" -eq 1 ]; then echo "1 warning generated." >&2; fi
+if [ "$n" -gt 1 ]; then echo "$n warnings generated." >&2; fi
+if [ "$werror" -eq 1 ] && [ "$n" -gt 0 ]; then exit 1; fi
+printf 'synthetic-air\n' > "$out"
+"#;
+
+fn log_lines(log: &Path) -> Vec<String> {
+    fs::read_to_string(log)
+        .unwrap_or_default()
+        .lines()
+        .map(str::to_string)
+        .collect()
+}
+
+/// Every source's compiler warnings reach `cargo:warning=`, a header's once
+/// however many sources include it, and a reused `.air` replays its own. A
+/// header-only edit recompiles and drops a warning the header no longer
+/// produces. `TESSL_METAL_WERROR=1` passes `-Wall -Werror` to every source,
+/// the tune rig included, and fails rather than falling back to metal3.2;
+/// without it a metal4.0 failure still falls back.
+#[test]
+fn metal_diagnostics_are_forwarded_cached_and_strict_on_request() {
+    let scratch = Scratch::new();
+    let manifest = scratch.0.join("crate");
+    let kernels = manifest.join("kernels");
+    fs::create_dir_all(kernels.join("tune")).expect("create synthetic kernels/tune");
+    let write = |rel: &str, body: &str| fs::write(kernels.join(rel), body).expect("write synthetic kernel");
+    write("matmul_tensorops.metal", "kernel void synthetic_tensorops() {}\n");
+    write("tune/matmul_tensorops_tune.metal", "kernel void synthetic_tune() {}\n");
+    write("shared.h", "WARN\n");
+    write("a.metal", "#include \"shared.h\"\nWARN_SELF\n");
+    write("b.metal", "#include \"shared.h\"\n");
+    write("c.metal", "FAIL_METAL4\n");
+
+    let build_script = scratch.0.join("tessl-build-script");
+    let compile = Command::new("rustc")
+        .arg("--edition=2021")
+        .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("build.rs"))
+        .arg("-o")
+        .arg(&build_script)
+        .output()
+        .expect("compile tessl build script");
+    assert!(
+        compile.status.success(),
+        "build.rs did not compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let tools = scratch.0.join("fake-tools");
+    fs::create_dir(&tools).expect("create fake tool directory");
+    for name in ["xcrun", "metal", "metallib"] {
+        write_executable(&tools.join(name), DIAGNOSING_TOOLS);
+    }
+    let out = scratch.0.join("target/out");
+    fs::create_dir_all(&out).expect("create OUT_DIR");
+    let log = scratch.0.join("metal.log");
+    let run = |env: &[(&str, &str)]| {
+        let mut command = build_command(&build_script, &manifest, &out, &tools);
+        command.env("TESSL_FAKE_METAL_LOG", &log).env_remove("TESSL_METAL_WERROR");
+        for (k, v) in env {
+            command.env(k, v);
+        }
+        command.output().expect("run build script")
+    };
+    let header = "synthetic header warning";
+    let own = "synthetic own warning";
+
+    // 1. Fresh build: both warnings, the header's once, no tally lines; the
+    //    metal4.0-only failure falls back to metal3.2 as before.
+    let first = run(&[]);
+    assert!(
+        first.status.success(),
+        "{}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    let first_out = stdout(&first);
+    assert_eq!(
+        first_out.matches(header).count(),
+        1,
+        "a header warning is printed once, not once per includer:\n{first_out}"
+    );
+    assert_eq!(first_out.matches(own).count(), 1, "{first_out}");
+    assert!(
+        first_out.contains("cargo:warning=  In file included from"),
+        "the include chain stays with its warning:\n{first_out}"
+    );
+    assert!(
+        !first_out.contains("generated."),
+        "the per-source tally is not a diagnostic:\n{first_out}"
+    );
+    assert!(
+        first_out.contains("falling back to -std=metal3.2"),
+        "{first_out}"
+    );
+    assert!(first_out.contains("cargo:rerun-if-env-changed=TESSL_METAL_WERROR"));
+    let compiled = log_lines(&log).len();
+    assert!(
+        log_lines(&log)
+            .iter()
+            .any(|l| l.starts_with("c.metal ") && l.contains("-std=metal3.2")),
+        "c.metal must have been compiled under the metal3.2 fallback"
+    );
+    assert!(
+        log_lines(&log).iter().all(|l| !l.contains("-Werror")),
+        "strict flags are opt-in"
+    );
+
+    // 2. Nothing changed: every `.air` is reused and still reports.
+    let second = run(&[]);
+    assert!(second.status.success());
+    let second_out = stdout(&second);
+    assert_eq!(log_lines(&log).len(), compiled, "an unchanged tree recompiled");
+    assert_eq!(second_out.matches(header).count(), 1, "{second_out}");
+    assert_eq!(second_out.matches(own).count(), 1, "{second_out}");
+
+    // 3. A header-only edit recompiles its includers and the warning it no
+    //    longer produces is not replayed.
+    write("shared.h", "quiet\n");
+    let third = run(&[]);
+    assert!(third.status.success());
+    let third_out = stdout(&third);
+    assert!(log_lines(&log).len() > compiled, "a header edit must recompile");
+    assert_eq!(
+        third_out.matches(header).count(),
+        0,
+        "stale header warning replayed:\n{third_out}"
+    );
+    assert_eq!(third_out.matches(own).count(), 1, "{third_out}");
+
+    // 4. Strict mode: a warning is an error and there is no metal3.2 fallback.
+    write("shared.h", "WARN\n");
+    let before = log_lines(&log).len();
+    let strict = run(&[("TESSL_METAL_WERROR", "1"), ("TESSL_GEMM_TUNE", "1")]);
+    assert!(!strict.status.success(), "a warning passed under TESSL_METAL_WERROR=1");
+    assert!(
+        String::from_utf8_lossy(&strict.stderr).contains("TESSL_METAL_WERROR"),
+        "{}",
+        String::from_utf8_lossy(&strict.stderr)
+    );
+    let strict_log = log_lines(&log).split_off(before);
+    assert!(
+        strict_log.iter().all(|l| !l.contains("-std=metal3.2")),
+        "strict mode fell back to metal3.2: {strict_log:?}"
+    );
+
+    // 5. Strict mode on a clean tree builds, and every compile in it, the
+    //    tune rig included, carried -Wall -Werror. The header edit changes
+    //    every source's cache key, so step 4's strict `.air`s are not reused.
+    write("shared.h", "quiet\n");
+    write("a.metal", "#include \"shared.h\"\n");
+    write("c.metal", "kernel void c() {}\n");
+    let before = log_lines(&log).len();
+    let clean = run(&[("TESSL_METAL_WERROR", "1"), ("TESSL_GEMM_TUNE", "1")]);
+    assert!(
+        clean.status.success(),
+        "{}",
+        String::from_utf8_lossy(&clean.stderr)
+    );
+    let clean_log = log_lines(&log).split_off(before);
+    for src in [
+        "matmul_tensorops.metal",
+        "matmul_tensorops_tune.metal",
+        "a.metal",
+        "b.metal",
+        "c.metal",
+    ] {
+        let line = clean_log
+            .iter()
+            .find(|l| l.starts_with(&format!("{src} ")))
+            .unwrap_or_else(|| panic!("{src} was not compiled in strict mode: {clean_log:?}"));
+        assert!(
+            line.contains(" -Wall ") && line.contains(" -Werror "),
+            "{src} compiled without -Wall -Werror: {line}"
+        );
+    }
+}

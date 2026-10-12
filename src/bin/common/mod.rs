@@ -188,10 +188,14 @@ fn parse_usize_env_value(name: &str, raw: &str, min: usize) -> Result<usize, Str
 }
 
 /// The measurement-only GEMM kernels live in `kernels/tune/` and are linked
-/// only by this build; the tuning binaries refuse to run without them.
-pub const TUNE_BUILD: &str = "TESSL_GEMM_TUNE=1 cargo build --release --bins";
+/// only when `TESSL_GEMM_TUNE` is set; the tuning binaries refuse to run
+/// without them. The command is `cargo run`, with the variable on it, followed
+/// by the binary's name: `TESSL_GEMM_TUNE` is a build-time input, so a plain
+/// `cargo run` after a tune `cargo build` reruns build.rs without it and links
+/// the metallib without the variants again.
+pub const TUNE_RUN: &str = "TESSL_GEMM_TUNE=1 cargo run --release --bin";
 
-/// Exit 2, naming [`TUNE_BUILD`], when any of `kernels` has no pipeline in
+/// Exit 2, naming [`TUNE_RUN`] for `bin`, when any of `kernels` has no pipeline in
 /// the loaded metallib. Checked before anything is timed: a variant that
 /// cannot run must not print a line that reads like a result and let the
 /// process exit 0, which is what a page of `skip(pipe)` used to do.
@@ -202,7 +206,7 @@ pub fn require_kernels<'a>(rt: &tessl::GpuRuntime, bin: &str, kernels: impl Into
     if !missing.is_empty() {
         eprintln!(
             "{bin}: {} kernel(s) are not in the loaded metallib: {}\n\
-             The tuning variants are opt-in. Rebuild with:\n  {TUNE_BUILD}",
+             The tuning variants are opt-in. Rebuild and run with:\n  {TUNE_RUN} {bin}",
             missing.len(),
             missing.join(", ")
         );

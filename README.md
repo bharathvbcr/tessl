@@ -480,11 +480,15 @@ across non-standard dimensions, reporting the failing seed for replay via
 
 ## Benchmarking & Tuning Binaries
 
-Tuning and A/B measurement kernels (92 variants) are excluded from the default
+Tuning and A/B measurement kernels (71 variants) are excluded from the default
 metallib to keep release binaries light (0.20 MB vs. 1.07 MB):
 
+`TESSL_GEMM_TUNE` is a build-time variable that decides what the metallib
+holds, so every `cargo` command that may rebuild it needs it (a plain
+`cargo run` afterwards rebuilds the metallib without the tune kernels):
+
 ```bash
-TESSL_GEMM_TUNE=1 cargo build --release --bins
+TESSL_GEMM_TUNE=1 cargo run --release --bin bench_gemm_tnnt_tune
 ```
 
 | Binary | Purpose |
@@ -515,7 +519,7 @@ All runtime configuration uses the canonical `TESSL_*` prefix. Legacy
 
 | Variable | Default | Description |
 |---|---|---|
-| `TESSL_GEMM_TUNE` | `0` | Compiles the 92-kernel A/B tuning suite into the metallib (build-time). |
+| `TESSL_GEMM_TUNE` | `0` | Compiles the 71-kernel A/B tuning suite into the metallib (build-time). |
 | `TESSL_HAZARD_BARRIERS` | `0` (barriers on) | **Unsafe, do not enable.** `1` *removes* the always-on Dispatch→Dispatch device barrier. The sense is the opposite of what this row said until 2026-08-31, and following the old wording to "enforce barriers" removed them. Enabling it requires the caller to place an explicit `Binder::barrier` at every RAW edge, and tessl's own ops do not: measured on an M5 Pro, `gemm_tn_accum_train` 64×64×128 under async encode produced wrong results in **300 of 300** repetitions with this set. |
 | `TESSL_COARSE_BARRIERS` | inherits `TESSL_HAZARD_BARRIERS` | Replaces per-RAW barriers with coarse phase-level synchronization. |
 | `TESSL_MID_COMMIT=N` | `0` | Overlaps host command encoding with GPU execution every $N$ dispatches. |

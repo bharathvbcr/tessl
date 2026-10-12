@@ -35,7 +35,7 @@ flowchart TD
         NnBench["bench_nn_kernels<br/>(62 nn entry points · batched vs solo)"]
         Parity["probe_gemm_parity<br/>(Bit-exact TensorOps vs SIMD verification)"]
         
-        subgraph TuneGated["Behind TESSL_GEMM_TUNE=1 (92 A/B Kernels)"]
+        subgraph TuneGated["Behind TESSL_GEMM_TUNE=1 (71 A/B Kernels)"]
             TnNtTune["bench_gemm_tnnt_tune<br/>(Paired interleaved TN/NT A/B lane)"]
             TileTune["bench_gemm_tile_tune<br/>(Tile geometry &amp; BK ladder search)"]
         end
@@ -52,15 +52,20 @@ flowchart TD
     PyHarness -->|In-Process Dispatch| MLX
 ```
 
-The A/B rig is 50 measurement-only kernels and is **not** in the default
+The A/B rig is 71 measurement-only kernels and is **not** in the default
 metallib — linking it took the shipped artifact from 0.22 MB to 1.09 MB. Opt in:
+
+`TESSL_GEMM_TUNE` changes what build.rs links, so it goes on **every** `cargo`
+command that may rebuild the metallib, `cargo run` included; a plain `cargo run`
+after a tune build reruns build.rs without it and drops the tune kernels:
 
 ```bash
 TESSL_GEMM_TUNE=1 cargo build --release --bins
+TESSL_GEMM_TUNE=1 cargo run --release --bin bench_gemm_tile_tune
 ```
 
-Both tuning binaries `exit(2)` with that exact command when the variants are
-absent, rather than printing a page of `skip(pipe)` and exiting 0 (they did
+Both tuning binaries `exit(2)` naming their own `TESSL_GEMM_TUNE=1 cargo run`
+line when the variants are absent, rather than printing a page of `skip(pipe)` and exiting 0 (they did
 the latter until 2026-10-10; `tests/tune_rigs_refuse_missing_variants.rs` pins
 the refusal). They check every variant the run will dispatch before timing
 anything.
@@ -239,10 +244,11 @@ BENCH_SHAPES="2048x2048x2048,4096x4096x1024" cargo run --release --bin bench_gem
 python3 bench/paired_cross_runtime.py --rounds 5 --lanes torch,mlx
 
 # Tile-geometry and TN/NT A/B lanes. These live behind TESSL_GEMM_TUNE because
-# the 92 measurement kernels are excluded from the default metallib.
+# the 71 measurement kernels are excluded from the default metallib; the
+# variable goes on each command, or build.rs rebuilds the metallib without them.
 TESSL_GEMM_TUNE=1 cargo build --release --bins
-cargo run --release --bin bench_gemm_tile_tune
-cargo run --release --bin bench_gemm_tnnt_tune
+TESSL_GEMM_TUNE=1 cargo run --release --bin bench_gemm_tile_tune
+TESSL_GEMM_TUNE=1 cargo run --release --bin bench_gemm_tnnt_tune
 
 # Bit-exact parity of TensorOps against the reference SIMD path
 cargo run --release --bin probe_gemm_parity

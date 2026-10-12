@@ -207,6 +207,15 @@
 //! one of them has a `// SAFETY:` comment stating which invariant makes it
 //! sound and where that invariant is established.
 //!
+//! **The `Binder` is the raw-kernel escape hatch.** [`runtime::GpuRuntime::with_binder`]
+//! is safe and hands out a [`dispatch::Binder`] that runs any pipeline; the
+//! scalars it binds are not checked against the buffers a kernel indexes, so a
+//! bad count can make a kernel run past a buffer. That is a deliberate
+//! trade-off (`unsafe fn with_binder` would break every raw-kernel caller), not
+//! an oversight; see the `Binder` docs. Operations that take a raw address
+//! (`Binder::bind_addr`, `Binder::bind_resource_id`) are `unsafe`, and
+//! `Binder::bind_bytes` only ever copies into the runtime-owned const arena.
+//!
 //! If you add an `unsafe` block that is not a bare message send, it belongs in
 //! the second class: write the comment.
 

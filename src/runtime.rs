@@ -1250,12 +1250,12 @@ impl GpuRuntime {
     }
 
     /// Register a buffer in the Metal 4 residency set (deferred commit).
-    pub fn register_residency(&self, buf: &ProtocolObject<dyn MTLBuffer>) {
+    pub(crate) fn register_residency(&self, buf: &ProtocolObject<dyn MTLBuffer>) {
         self.register_allocation(ProtocolObject::<dyn MTLAllocation>::from_ref(buf));
     }
 
     /// Register any [`MTLAllocation`] (buffers, ICB, …) in the residency set.
-    pub fn register_allocation(&self, alloc: &ProtocolObject<dyn MTLAllocation>) {
+    pub(crate) fn register_allocation(&self, alloc: &ProtocolObject<dyn MTLAllocation>) {
         let m4 = &self.metal4;
         m4.residency.addAllocation(alloc);
         m4.residency_count.fetch_add(1, Ordering::Relaxed);
@@ -1263,7 +1263,7 @@ impl GpuRuntime {
     }
 
     /// Mark allocation for removal on next residency commit (after CB complete).
-    pub fn unregister_residency(&self, buf: &ProtocolObject<dyn MTLBuffer>) {
+    pub(crate) fn unregister_residency(&self, buf: &ProtocolObject<dyn MTLBuffer>) {
         self.unregister_allocation(ProtocolObject::<dyn MTLAllocation>::from_ref(buf));
     }
 

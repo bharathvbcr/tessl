@@ -215,6 +215,34 @@ All notable changes to `tessl` are recorded here. The format follows
   `METAL_NATIVE_*` spellings), which nothing reads any more. No caller in
   ojas, gemma-metal or tessl-arch02 used them.
 
+- **Binder and runtime soundness narrowing (ft-c125d85).** Safe code could
+  make a kernel touch memory it does not own through several doors; none had an
+  in-tree or sibling-repo user (`rg -uu` over ojas, qd-metal, MLSystemsLab,
+  Lappi-decision, BINN found none).
+  - `Binder::bind_addr` is now `unsafe fn` (the address must stay live and
+    resident until the command buffer completes; a `compile_fail` doctest pins
+    it). `Binder::materialize_bytes` is `pub(crate)`: its address is only valid
+    until the next const-arena rewind. `bind_bytes` stays safe: it copies into
+    the runtime-owned arena after a bounds check and returns an address inside it.
+  - **Decision: `with_binder` stays safe.** `Binder` is the documented
+    raw-kernel escape hatch (struct docs and the `lib.rs` "Unsafe code"
+    section): scalar counts bound through it are not checked against buffer
+    extents. Making it `unsafe` would break about 50 external call sites.
+  - `GpuRuntime::{register_residency, register_allocation,
+    unregister_residency}` are `pub(crate)`; unregistering a live buffer
+    faults in-flight work.
+  - `GpuTensor`'s `tensor`, `dims` and `dtype` fields (`quant-prep`) are private;
+    use `tensor()`, `dims()` and `data_type()`.
+- **`DecodeIcb::from_commands_ex` validates `Buf` binds.** `gpu_addr` is
+  recomputed from `buf` + `byte_offset` (a forged value is discarded), and a
+  `byte_offset` at or past the buffer, a buffer from another runtime, or a
+  `tg_mem` slot past the argument table is an `Err`.
+- **`IcbCopySmoke` refuses buffers it cannot copy between.** `encode_copy`
+  returns `Err` for a buffer shorter than `n * 4` bytes or owned by another
+  runtime, before touching the ICB; `new` refuses `n > u32::MAX`. Re-encoding
+  while an earlier `execute` is in flight is documented as the caller's to
+  synchronize.
+
 ### Changed
 
 - **bf16 TN at the split-K-gated dW shapes runs a parallel split-K.** The

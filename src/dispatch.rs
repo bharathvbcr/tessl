@@ -38,6 +38,18 @@ impl ConstArena {
 }
 
 /// Metal 4 compute binder (argument table + const arena).
+///
+/// # Raw-kernel escape hatch
+/// A `Binder` runs any pipeline over any buffers it is given, and the scalars
+/// it binds (`bind_u32`, `bind_f32`, `bind_bytes`) are not checked against the
+/// extents of the buffers a kernel indexes with them. So safe code that
+/// reaches [`crate::runtime::GpuRuntime::with_binder`] can still make a kernel
+/// read or write past a buffer by binding a bad count. This is the deliberate
+/// raw-kernel layer; the checked, typed entry points live in [`crate::nn`]
+/// (see its `*_with_scalars` notes). What the `Binder` does guarantee: buffer
+/// and tensor binds are ownership- and bounds-checked, and the operations that
+/// take a raw address ([`Self::bind_addr`], [`Self::bind_resource_id`]) are
+/// `unsafe`.
 pub struct Binder<'a> {
     runtime: &'a GpuRuntime,
     error: Option<String>,
@@ -205,7 +217,11 @@ impl<'a> Binder<'a> {
     ///
     /// Does **not** call `setAddress` or capture — used when writing into a
     /// prebuilt per-command argument table (Immediate residual only).
-    pub fn materialize_bytes(&mut self, bytes: &[u8]) -> u64 {
+    ///
+    /// Crate-private: the returned address is only valid until the next
+    /// const-arena rewind, so handing it to safe out-of-crate code would let
+    /// it bind a dangling address.
+    pub(crate) fn materialize_bytes(&mut self, bytes: &[u8]) -> u64 {
         self.write_constants(bytes)
     }
 
@@ -247,12 +263,30 @@ impl<'a> Binder<'a> {
         // for the capture tape to record or to pin. Mark the tape incomplete
         // instead of letting it silently omit the operand.
         crate::decode_icb::capture_note_unrecordable_bind();
-        self.bind_addr(addr, index);
+        // SAFETY: `addr` is `buf`'s own GPU address plus an offset checked
+        // against `buf.length()` above; test-only, and the caller holds `buf`.
+        unsafe { self.bind_addr(addr, index) };
     }
 
     /// Bind a precomputed GPU address (DecodeIcb tape replay bind-tax cut).
+    ///
+    /// # Safety
+    /// `gpu_addr` must be the GPU address of memory that stays live and
+    /// resident until the command buffer being encoded completes, and the
+    /// kernel must stay inside that allocation for every access it makes
+    /// through it. Nothing here checks ownership, bounds or residency, and
+    /// MTL4 command buffers do not retain what they bind. Prefer
+    /// [`Self::bind_gpu_buf`] / [`Self::bind_tensor`], which check all three.
+    ///
+    /// Safe code cannot call it:
+    ///
+    /// ```compile_fail
+    /// fn forge(b: &mut tessl::dispatch::Binder<'_>) {
+    ///     b.bind_addr(0xdead_beef, 0);
+    /// }
+    /// ```
     #[inline]
-    pub fn bind_addr(&mut self, gpu_addr: u64, index: usize) {
+    pub unsafe fn bind_addr(&mut self, gpu_addr: u64, index: usize) {
         if !self.valid_index(index) {
             return;
         }
@@ -314,7 +348,10 @@ impl<'a> Binder<'a> {
             self.fail("GPU address overflow");
             return;
         };
-        self.bind_addr(addr, index);
+        // SAFETY: `addr` is `b`'s own GPU address plus an offset checked against
+        // `b.nbytes()` above; the caller's `&GpuBuffer` pins the allocation and
+        // the runtime's residency set covers it for the command buffer.
+        unsafe { self.bind_addr(addr, index) };
         if crate::decode_icb::decode_icb_capture_active() {
             crate::decode_icb::capture_note_bind(index, b, byte_offset);
         }
@@ -360,7 +397,10 @@ impl<'a> Binder<'a> {
         if self.error.is_some() {
             return 0;
         }
-        self.bind_addr(addr, index);
+        // SAFETY: `addr` was just returned by `write_constants`, which checked
+        // the whole payload against the runtime-owned const arena, and the
+        // arena is not rewound while this binder is encoding.
+        unsafe { self.bind_addr(addr, index) };
         if crate::decode_icb::decode_icb_capture_active() {
             crate::decode_icb::capture_note_immediate(index, bytes);
         }

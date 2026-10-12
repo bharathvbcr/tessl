@@ -152,8 +152,14 @@ impl GpuBuffer {
     /// Raw-buffer kernel entry points do not carry a [`Tensor`]'s runtime
     /// metadata, so they use this identity check before opening an encoder.
     pub(crate) fn belongs_to(&self, runtime: &GpuRuntime) -> bool {
+        self.belongs_to_addr(runtime as *const GpuRuntime as usize)
+    }
+
+    /// [`Self::belongs_to`] for a holder that remembers the runtime's address
+    /// instead of borrowing it (it is only compared, never dereferenced).
+    pub(crate) fn belongs_to_addr(&self, runtime_addr: usize) -> bool {
         std::sync::Weak::strong_count(&self.inner.runtime) > 0
-            && std::ptr::eq(std::sync::Weak::as_ptr(&self.inner.runtime), runtime)
+            && std::sync::Weak::as_ptr(&self.inner.runtime) as usize == runtime_addr
     }
 
     /// Whether two handles name the same Metal allocation.

@@ -68,6 +68,8 @@ pub enum DecodeIcbBind {
         buf: GpuBuffer,
         byte_offset: usize,
         /// `buf.gpuAddress() + byte_offset` cached at capture (A2 bind-tax cut).
+        /// Advisory only: [`DecodeIcb::from_commands_ex`] recomputes it from
+        /// `buf` and `byte_offset`, so a value that disagrees is discarded.
         gpu_addr: u64,
     },
     /// Const-arena scalar snapshotted at capture; materialized into a Hot buffer
@@ -163,7 +165,11 @@ impl StickyArgTable {
             self.addr[index] = gpu_addr;
             self.valid |= bit;
         }
-        bnd.bind_addr(gpu_addr, index);
+        // SAFETY: `gpu_addr` comes from a `DecodeIcbBind::Buf` whose address
+        // `DecodeIcb::from_commands_ex` recomputed from `buf` + a bounds-checked
+        // `byte_offset`; the tape holds `buf`, so the allocation outlives the
+        // replay, and the runtime's residency set covers it.
+        unsafe { bnd.bind_addr(gpu_addr, index) };
         self.set_calls = self.set_calls.saturating_add(1);
     }
 
@@ -477,15 +483,69 @@ impl DecodeIcb {
         //
         // Unlike the incomplete-bind check below, this is not scoped to
         // freeze-binds: an index past the table is invalid in every mode.
-        for (i, cmd) in commands.iter().enumerate() {
-            for b in &cmd.binds {
-                let index = match b {
-                    DecodeIcbBind::Buf { index, .. } | DecodeIcbBind::Immediate { index, .. } => *index,
-                };
-                if index >= ARG_TABLE_SLOTS {
+        //
+        // The same pass makes the tape self-consistent, because `Buf`'s fields
+        // are public and a caller can build one that disagrees with itself:
+        // `gpu_addr` is recomputed from `buf` + `byte_offset` (whatever the
+        // caller supplied is discarded), `byte_offset` must lie inside the
+        // buffer, the buffer must belong to `rt`, and `tg_mem` must name a
+        // slot the argument table has. Without this, safe code could replay a
+        // forged address or a past-the-end offset into a kernel.
+        let mut commands = commands;
+        for (i, cmd) in commands.iter_mut().enumerate() {
+            for b in cmd.binds.iter_mut() {
+                match b {
+                    DecodeIcbBind::Buf {
+                        index,
+                        buf,
+                        byte_offset,
+                        gpu_addr,
+                    } => {
+                        if *index >= ARG_TABLE_SLOTS {
+                            return Err(format!(
+                                "DecodeIcb: command {i} binds index {index}, but the argument table \
+                                 has {ARG_TABLE_SLOTS} slots. Encoding would drop it silently.",
+                                index = *index
+                            ));
+                        }
+                        if !buf.belongs_to(rt) {
+                            return Err(format!(
+                                "DecodeIcb: command {i} binds a buffer at index {index} that belongs to another runtime",
+                                index = *index
+                            ));
+                        }
+                        if *byte_offset >= buf.nbytes() {
+                            return Err(format!(
+                                "DecodeIcb: command {i} binds index {index} at byte offset {byte_offset}, \
+                                 outside its {} byte buffer",
+                                buf.nbytes(),
+                                index = *index,
+                                byte_offset = *byte_offset
+                            ));
+                        }
+                        *gpu_addr = buf.gpu_address().checked_add(*byte_offset as u64).ok_or_else(|| {
+                            format!(
+                                "DecodeIcb: command {i} bind at index {} overflows the GPU address space",
+                                *index
+                            )
+                        })?;
+                    }
+                    DecodeIcbBind::Immediate { index, .. } => {
+                        if *index >= ARG_TABLE_SLOTS {
+                            return Err(format!(
+                                "DecodeIcb: command {i} binds index {index}, but the argument table \
+                                 has {ARG_TABLE_SLOTS} slots. Encoding would drop it silently.",
+                                index = *index
+                            ));
+                        }
+                    }
+                }
+            }
+            if let Some((tg_idx, _)) = cmd.tg_mem {
+                if tg_idx >= ARG_TABLE_SLOTS {
                     return Err(format!(
-                        "DecodeIcb: command {i} binds index {index}, but the argument table \
-                         has {ARG_TABLE_SLOTS} slots. Encoding would drop it silently."
+                        "DecodeIcb: command {i} sets threadgroup memory at slot {tg_idx}, but the \
+                         argument table has {ARG_TABLE_SLOTS} slots"
                     ));
                 }
             }
@@ -520,7 +580,6 @@ impl DecodeIcb {
             }
         }
 
-        let mut commands = commands;
         if freeze_binds {
             // Classic setKernelBuffer needs real MTLBuffers; materialize any
             // residual Immediate bytes into owned Hot Bufs (mini+E4B usually 0).
@@ -2156,6 +2215,66 @@ mod tests {
                 err.contains("argument table"),
                 "the error must name the cause, got: {err}"
             );
+        }
+    }
+
+    /// `Buf`'s fields are public, so a tape can disagree with itself. The
+    /// builder must recompute the address and refuse offsets/slots outside what
+    /// the buffer and the argument table hold.
+    ///
+    /// Against the pre-fix code every refusal below returns `Ok`, and the
+    /// forged `gpu_addr` survives into the built tape.
+    #[test]
+    fn from_commands_ex_refuses_forged_buf_addresses_and_offsets() {
+        let _flags = IcbFlagsTestGuard::lock();
+        let rt = GpuRuntime::new().expect("GpuRuntime::new");
+        let other = GpuRuntime::new().expect("second runtime");
+        let a = rt.alloc_buffer_hot(64 * 4).expect("a");
+        let foreign = other.alloc_buffer_hot(64 * 4).expect("foreign");
+        let pipe = pipeline_icb(&rt, "copy_f32").expect("copy_f32 icb pipeline");
+        let tg = mtl_size(1, 1, 1);
+        let cmd = |bind: DecodeIcbBind, tg_mem: Option<(usize, usize)>| DecodeIcbCommand {
+            pipeline: pipe.clone(),
+            threadgroups: tg,
+            threads_per_tg: tg,
+            binds: vec![bind],
+            tg_mem,
+            owned_immediates: Vec::new(),
+            barrier_after: false,
+            incomplete_binds: 0,
+        };
+        let buf_at = |buf: &GpuBuffer, byte_offset: usize, gpu_addr: u64| DecodeIcbBind::Buf {
+            index: 0,
+            buf: buf.clone(),
+            byte_offset,
+            gpu_addr,
+        };
+
+        for freeze in [false, true] {
+            let at_end = cmd(buf_at(&a, a.nbytes(), 1 << 32), None);
+            let err = DecodeIcb::from_commands_ex(&rt, vec![at_end], freeze)
+                .map(|_| ())
+                .expect_err("byte_offset == nbytes is outside the buffer");
+            assert!(err.contains("byte offset"), "{err}");
+
+            let err = DecodeIcb::from_commands_ex(&rt, vec![cmd(buf_at(&foreign, 0, 0), None)], freeze)
+                .map(|_| ())
+                .expect_err("another runtime's buffer");
+            assert!(err.contains("another runtime"), "{err}");
+
+            let bad_tg = cmd(buf_at(&a, 0, buf_gpu_addr(&a, 0)), Some((ARG_TABLE_SLOTS, 16)));
+            let err = DecodeIcb::from_commands_ex(&rt, vec![bad_tg], freeze)
+                .map(|_| ())
+                .expect_err("threadgroup slot past the table");
+            assert!(err.contains("threadgroup"), "{err}");
+
+            // A forged address with a legal offset is replaced, not trusted.
+            let forged = cmd(buf_at(&a, 16, 1 << 32), None);
+            let dec = DecodeIcb::from_commands_ex(&rt, vec![forged], freeze).expect("legal offset builds");
+            let DecodeIcbBind::Buf { gpu_addr, .. } = &dec.commands[0].binds[0] else {
+                panic!("expected a Buf bind");
+            };
+            assert_eq!(*gpu_addr, buf_gpu_addr(&a, 16), "gpu_addr must be recomputed");
         }
     }
 

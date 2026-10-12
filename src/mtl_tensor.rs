@@ -117,9 +117,11 @@ pub const QUANT_PREFILL_GEMM_WIRED: bool = false;
 /// work already submitted has completed, and only then takes a device-owned
 /// one out of the residency set.
 pub struct GpuTensor {
-    pub tensor: Retained<ProtocolObject<dyn MTLTensor>>,
-    pub dtype: MTLTensorDataType,
-    pub dims: Vec<usize>,
+    // Private: `bind_mtl_tensor` binds `tensor` on the premise that this handle
+    // owns it and keeps it resident, which a swapped-in field would break.
+    tensor: Retained<ProtocolObject<dyn MTLTensor>>,
+    dtype: MTLTensorDataType,
+    dims: Vec<usize>,
     /// A buffer-backed tensor's storage: the MTLTensor above borrows it, and
     /// its residency is the buffer's own. `None` for a device-owned tensor,
     /// which is registered for residency itself.
@@ -136,6 +138,16 @@ impl Drop for GpuTensor {
 }
 
 impl GpuTensor {
+    /// The underlying `MTLTensor` (borrowed; this handle keeps ownership).
+    pub fn tensor(&self) -> &ProtocolObject<dyn MTLTensor> {
+        &self.tensor
+    }
+
+    /// Extents the tensor was created with.
+    pub fn dims(&self) -> &[usize] {
+        &self.dims
+    }
+
     pub fn gpu_resource_id(&self) -> MTLResourceID {
         self.tensor.gpuResourceID()
     }

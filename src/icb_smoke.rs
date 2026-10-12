@@ -70,6 +70,8 @@ pub struct IcbCopySmoke {
     /// Stable `u32` length bind (ICB / arg-table cannot use bump const-arena).
     n_buf: GpuBuffer,
     n: usize,
+    /// Address of the creating runtime, compared against each buffer's owner.
+    rt_addr: usize,
     bridge: IcbBindBridge,
     /// Retained for classic-bridge re-encode / inherit execute binds.
     src: Option<GpuBuffer>,
@@ -88,6 +90,10 @@ impl IcbCopySmoke {
     pub fn new_with_bridge(rt: &GpuRuntime, n: usize, bridge: IcbBindBridge) -> Result<Self, String> {
         if n == 0 {
             return Err("icb smoke: n must be > 0".into());
+        }
+        // `n` is bound as a `u32` and sizes `n * 4` byte buffers.
+        if u32::try_from(n).is_err() || n.checked_mul(4).is_none() {
+            return Err(format!("icb smoke: n = {n} does not fit the kernel's u32 length"));
         }
         let pipeline = pipeline_copy_f32_icb(rt)?;
         let n_buf = rt.alloc_buffer_hot(4)?;
@@ -134,6 +140,7 @@ impl IcbCopySmoke {
             pipeline,
             n_buf,
             n,
+            rt_addr: rt as *const GpuRuntime as usize,
             bridge,
             src: None,
             dst: None,
@@ -167,7 +174,27 @@ impl IcbCopySmoke {
     }
 
     /// CPU-encode command 0 once (pipeline + dispatch; binds per [`IcbBindBridge`]).
+    ///
+    /// Refuses, before touching the ICB, a buffer owned by another runtime or
+    /// shorter than `n * 4` bytes: the kernel copies `n` floats unchecked.
+    ///
+    /// Re-encoding rewrites command 0 in place, so the caller must not do it
+    /// while an earlier [`Self::execute`] may still be in flight; synchronize
+    /// the runtime first.
     pub fn encode_copy(&mut self, src: &GpuBuffer, dst: &GpuBuffer) -> Result<(), String> {
+        let need = self.n * 4;
+        for (name, b) in [("src", src), ("dst", dst)] {
+            if !b.belongs_to_addr(self.rt_addr) {
+                return Err(format!("icb smoke: {name} buffer belongs to another runtime"));
+            }
+            if b.nbytes() < need {
+                return Err(format!(
+                    "icb smoke: {name} buffer has {} bytes, but copying n = {} floats needs {need}",
+                    b.nbytes(),
+                    self.n
+                ));
+            }
+        }
         let cmd: Retained<ProtocolObject<dyn MTLIndirectComputeCommand>> =
             unsafe { self.icb.indirectComputeCommandAtIndex(0) };
         cmd.reset();
@@ -363,5 +390,40 @@ mod tests {
         assert!(stub.smoke_proven);
         assert_eq!(stub.phase, crate::IcbStubPhase::SmokeProven);
         eprintln!("icb_mini_copy_smoke: {}", smoke.status_line());
+    }
+
+    /// Against the pre-fix code `encode_copy` returns `Ok` for every case here.
+    #[test]
+    fn encode_copy_refuses_undersized_and_foreign_buffers() {
+        let rt = GpuRuntime::new().expect("runtime");
+        let other = GpuRuntime::new().expect("second runtime");
+        let mut smoke = IcbCopySmoke::new(&rt, 1 << 20).expect("smoke");
+
+        let small = rt.alloc_buffer(4).unwrap();
+        let big = rt.alloc_buffer(4 << 20).unwrap();
+        let err = smoke.encode_copy(&small, &big).unwrap_err();
+        assert!(err.contains("src buffer has"), "{err}");
+        let err = smoke.encode_copy(&big, &small).unwrap_err();
+        assert!(err.contains("dst buffer has"), "{err}");
+        assert!(!smoke.encoded(), "a refused encode must leave the ICB untouched");
+
+        let foreign = other.alloc_buffer(4 << 20).unwrap();
+        let err = smoke.encode_copy(&big, &foreign).unwrap_err();
+        assert!(err.contains("another runtime"), "{err}");
+        assert!(!smoke.encoded());
+
+        smoke
+            .encode_copy(&big, &big.clone())
+            .expect("exactly-sized buffers encode");
+        assert!(smoke.encoded());
+    }
+
+    #[test]
+    fn new_refuses_n_beyond_u32() {
+        let rt = GpuRuntime::new().expect("runtime");
+        let err = IcbCopySmoke::new(&rt, u32::MAX as usize + 1)
+            .err()
+            .expect("n > u32::MAX");
+        assert!(err.contains("u32"), "{err}");
     }
 }

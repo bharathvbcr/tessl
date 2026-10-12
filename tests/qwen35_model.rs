@@ -230,6 +230,55 @@ fn bf16_forward_is_no_worse_than_transformers_bf16() {
     );
 }
 
+/// The real 2B at F32, on the staged and decode entry points the tiny tests
+/// cover: `begin` / `advance_to` / `final_norm_f32` on a `load_tower` model
+/// give `forward`'s traced final norm, and `prefill` then three `Decode::step`s
+/// give `forward`'s last row at every length. Bounds are the tiny tests': the
+/// decode test's F32 1e-5 with the same top-1 token, and 1e-5 for the staged
+/// final norm (the same arithmetic as the forward's). Needs only the
+/// checkpoint, not the transformers reference. One model is resident at a time:
+/// two F32 copies of the 2B would be ~15 GB.
+#[test]
+#[ignore]
+fn f32_staged_and_decode_match_forward_on_the_real_2b() {
+    const STEPS: usize = 3;
+    const PROMPT: usize = 12;
+    let rt = GpuRuntime::new().unwrap();
+    let st = checkpoint();
+    let cfg = Qwen35Config::qwen35_2b().unwrap();
+    let n_layers = cfg.layers.len();
+    let hidden = cfg.hidden as usize;
+    let vocab = cfg.vocab;
+    let ids: Vec<u32> = (0..(PROMPT + STEPS) as u32).map(|i| (i * 7919 + 101) % vocab).collect();
+
+    let want_norm = {
+        let model = Qwen35Model::load(&rt, &st, PREFIX, cfg.clone(), Precision::F32).unwrap();
+        let (mut dec, first) = model.prefill(&ids[..PROMPT], STEPS as u32).unwrap();
+        let mut got = vec![first];
+        for k in 0..STEPS {
+            got.push(dec.step(ids[PROMPT + k]).unwrap());
+        }
+        for (k, row) in got.iter().enumerate() {
+            let want = forward_last(&model, &ids[..PROMPT + k]);
+            check_row(&format!("prefill {PROMPT} + {k} decoded"), row, &want, 1e-5);
+        }
+        let traced = model.forward(&ids[..PROMPT], true).unwrap();
+        traced.trace[n_layers].clone()
+    };
+
+    let tower = Qwen35Model::load_tower(&rt, &st, PREFIX, cfg, Precision::F32).unwrap();
+    let mut s = tower.begin(&ids[..PROMPT]).unwrap();
+    for stop in [1, n_layers / 2, n_layers] {
+        s.advance_to(stop).unwrap();
+        assert_eq!(s.layers_done(), stop);
+    }
+    let out = rt.alloc_tensor_f32(&[PROMPT, hidden]).unwrap();
+    s.final_norm_f32(&out).unwrap();
+    rt.synchronize().unwrap();
+    let r = rel32(&out.buffer.read_f32(), &want_norm);
+    assert!(r <= 1e-5, "staged final norm vs forward's: rel err {r:.3e} > 1e-5");
+}
+
 // ------------------------------------------------- decode, rows and answers ---
 
 fn fixture() -> PathBuf {
@@ -813,6 +862,34 @@ fn decode_step_failing_part_way_poisons_the_session() {
         assert!(e.contains("earlier step failed"), "{e}");
         assert_eq!(rt.take_dispatch_count(), 0, "the refused step encoded work");
         assert_eq!(dec.position(), at);
+    });
+}
+
+/// A step whose logits cannot be read back after its layers ran does not
+/// advance the session: `position()` stays where it was (the token's logits
+/// were lost, so counting it decoded would skip it), and the session is
+/// poisoned, since its layers' state moved on.
+#[test]
+fn decode_step_failing_to_read_its_logits_does_not_advance() {
+    let st = SafeTensors::open(&fixture().join("model.safetensors")).unwrap();
+    with_gpu(|rt| {
+        let model = Qwen35Model::load(rt, &st, "model.", tiny_config(), Precision::F32).unwrap();
+        let ids = seq(10);
+        let (mut dec, _) = model.prefill(&ids[..7], 3).unwrap();
+        dec.step(ids[7]).unwrap();
+        let at = (dec.position(), dec.remaining());
+        model.fail_logits_read_for_test();
+        let e = dec.step(ids[8]).unwrap_err();
+        assert!(e.contains("injected fault"), "{e}");
+        assert_eq!(
+            (dec.position(), dec.remaining()),
+            at,
+            "a failed read advanced the session"
+        );
+        let _ = rt.take_dispatch_count();
+        let e = dec.step(ids[8]).unwrap_err();
+        assert!(e.contains("earlier step failed"), "{e}");
+        assert_eq!(rt.take_dispatch_count(), 0, "the refused step encoded work");
     });
 }
 

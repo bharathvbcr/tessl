@@ -116,10 +116,17 @@ fn tensors(family: BertFamily) -> Vec<(String, Vec<usize>)> {
 /// Random f32 weights for every tensor, as safetensors bytes. Norm weights
 /// sit near 1 so the activations stay well scaled.
 fn checkpoint(family: BertFamily, seed: u64) -> SafeTensors {
+    checkpoint_with(family, seed, &[])
+}
+
+/// [`checkpoint`] plus `extra` tensors `BertSparseModel::load` never reads.
+fn checkpoint_with(family: BertFamily, seed: u64, extra: &[(&str, &[usize])]) -> SafeTensors {
     let mut rng = SplitMix::new(seed);
     let mut header = String::from("{");
     let mut data: Vec<u8> = Vec::new();
-    for (i, (name, shape)) in tensors(family).iter().enumerate() {
+    let mut all = tensors(family);
+    all.extend(extra.iter().map(|&(n, s)| (n.to_string(), s.to_vec())));
+    for (i, (name, shape)) in all.iter().enumerate() {
         let n: usize = shape.iter().product();
         let is_norm_weight = name.ends_with("LayerNorm.weight") || name.ends_with("layer_norm.weight");
         let start = data.len();
@@ -196,6 +203,36 @@ fn encode_reads_no_unwritten_activation_and_zeroes_nothing_on_the_host() {
                 bits(&clean.pooled),
                 "{family:?}: an unzeroed activation was read before it was written"
             );
+        }
+    });
+}
+
+/// A tensor the model never reads (a deeper layer than the config's, a pooler,
+/// a stray bias) is refused by name rather than ignored; the same checkpoint
+/// without it loads.
+#[test]
+fn a_tensor_the_model_never_reads_is_refused_by_name() {
+    with_gpu(|rt| {
+        for family in [BertFamily::Bert, BertFamily::DistilBert] {
+            BertSparseModel::load(rt, &checkpoint(family, 3), config(family)).unwrap();
+            let stray: &[&str] = match family {
+                BertFamily::Bert => &[
+                    "bert.encoder.layer.2.attention.self.query.weight",
+                    "bert.pooler.dense.weight",
+                    "bert.encoder.layer.0.attention.self.query.extra_bias",
+                ],
+                BertFamily::DistilBert => &[
+                    "distilbert.transformer.layer.2.attention.q_lin.weight",
+                    "distilbert.embeddings.stray.weight",
+                ],
+            };
+            for name in stray {
+                let bad = checkpoint_with(family, 3, &[(name, &[4])]);
+                let err = BertSparseModel::load(rt, &bad, config(family))
+                    .err()
+                    .unwrap_or_else(|| panic!("{family:?}: {name} was ignored"));
+                assert!(err.contains(name), "{family:?}: error does not name {name}: {err}");
+            }
         }
     });
 }

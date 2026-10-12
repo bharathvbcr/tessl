@@ -16,9 +16,9 @@
 //! The two models kept near-copies of this (`name`/`f32`/`norm`/`linear`)
 //! until EmbedGemma2's copy fell behind: it held every part of a projection
 //! and a packed host copy at once, and read its embedding through a `Vec`.
-//! One owner keeps that from recurring. `bert`'s loader stays separate for
-//! now: it has no prefix, refuses non-finite weights, and allocates its
-//! weights `Cold` (ft-afb1c42 is the convergence card).
+//! One owner keeps that from recurring. `bert` reads through this loader too
+//! (with an empty prefix, so every tensor in the file is its own), adding only
+//! what is BERT's: [`Loader::f32_finite`] and `Cold` weight buffers.
 
 use std::cell::RefCell;
 use std::collections::BTreeSet;
@@ -68,6 +68,15 @@ impl<'a> Loader<'a> {
         let (got, data) = self.st.read_f32(&name)?;
         if got != shape {
             return Err(format!("{name}: shape {got:?}, expected {shape:?}"));
+        }
+        Ok(data)
+    }
+
+    /// [`Self::f32`], refusing a non-finite element by index.
+    pub(crate) fn f32_finite(&self, rest: &str, shape: &[usize]) -> Result<Vec<f32>, String> {
+        let data = self.f32(rest, shape)?;
+        if let Some(i) = data.iter().position(|v| !v.is_finite()) {
+            return Err(format!("{}{rest}: element {i} is {}", self.prefix, data[i]));
         }
         Ok(data)
     }

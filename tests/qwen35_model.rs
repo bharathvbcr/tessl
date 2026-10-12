@@ -873,3 +873,139 @@ fn argument_refusals_encode_nothing() {
         );
     });
 }
+
+// ------------------------------------------ unread tensors and config keys ---
+
+/// `st`'s tensors plus `extra` `(name, shape)` F32 zeros, as a checkpoint.
+fn checkpoint_with(st: &SafeTensors, extra: &[(&str, &[usize])]) -> SafeTensors {
+    let mut entries: Vec<(String, String, Vec<usize>, Vec<u8>)> = Vec::new();
+    for name in st.names() {
+        let (info, bytes) = st.read_raw(name).unwrap();
+        let dtype = format!("{:?}", info.dtype).to_uppercase();
+        assert!(dtype == "F32" || dtype == "BF16", "{name}: fixture dtype {dtype}");
+        entries.push((name.to_string(), dtype, info.shape, bytes));
+    }
+    for &(name, shape) in extra {
+        let n: usize = shape.iter().product();
+        entries.push((name.to_string(), "F32".into(), shape.to_vec(), vec![0u8; n * 4]));
+    }
+    let (mut header, mut data) = (String::from("{"), Vec::new());
+    for (i, (name, dtype, shape, bytes)) in entries.iter().enumerate() {
+        let dims: Vec<String> = shape.iter().map(usize::to_string).collect();
+        header += &format!(
+            "{}\"{name}\":{{\"dtype\":\"{dtype}\",\"shape\":[{}],\"data_offsets\":[{},{}]}}",
+            if i > 0 { "," } else { "" },
+            dims.join(","),
+            data.len(),
+            data.len() + bytes.len()
+        );
+        data.extend_from_slice(bytes);
+    }
+    header.push('}');
+    let mut out = (header.len() as u64).to_le_bytes().to_vec();
+    out.extend_from_slice(header.as_bytes());
+    out.extend_from_slice(&data);
+    SafeTensors::from_bytes("qwen35 loader test", out).unwrap()
+}
+
+/// A tensor under the prefix the model never reads is refused by name, for
+/// each way it can arise: a layer past the config's stack (a config shorter
+/// than the checkpoint), a projection bias, an extra norm. Tensors outside
+/// the prefix are not the loader's business.
+#[test]
+fn tensors_the_model_never_reads_are_refused_by_name() {
+    let st = SafeTensors::open(&fixture().join("model.safetensors")).unwrap();
+    let full = tiny_config();
+    let shorter = Qwen35Config {
+        layers: vec![LayerKind::LinearAttention],
+        ..tiny_config()
+    };
+    with_gpu(|rt| {
+        // The unmodified checkpoint loads.
+        Qwen35Model::load(rt, &st, "model.", full.clone(), Precision::F32).unwrap();
+
+        // (a) Fewer layers than the checkpoint: layer 1 is dropped unless refused.
+        let m = Qwen35Model::load(rt, &st, "model.", shorter, Precision::F32)
+            .err()
+            .expect("a config with fewer layers than the checkpoint loaded");
+        assert!(m.contains("model.layers.1."), "{m}");
+
+        // (b) A stray bias, an extra norm, an extra layer's tensor.
+        for stray in [
+            "model.layers.1.self_attn.q_proj.bias",
+            "model.layers.0.linear_attn.extra_norm.weight",
+            "model.layers.2.mlp.up_proj.weight",
+        ] {
+            let bad = checkpoint_with(&st, &[(stray, &[4])]);
+            for precision in [Precision::F32, Precision::Bf16] {
+                let m = Qwen35Model::load(rt, &bad, "model.", full.clone(), precision)
+                    .err()
+                    .unwrap_or_else(|| panic!("{stray}: loaded at {precision:?}"));
+                assert!(m.contains(stray), "{stray}: error does not name it: {m}");
+            }
+            let m = Qwen35Model::load_tower(rt, &bad, "model.", full.clone(), Precision::F32)
+                .err()
+                .unwrap_or_else(|| panic!("{stray}: load_tower accepted it"));
+            assert!(m.contains(stray), "{stray}: load_tower error does not name it: {m}");
+        }
+
+        // Outside the prefix: the visual tower and `mtp.` ride along.
+        let ok = checkpoint_with(&st, &[("visual.blocks.0.attn.qkv.bias", &[4]), ("mtp.fc.weight", &[4])]);
+        Qwen35Model::load(rt, &ok, "model.", full, Precision::F32).unwrap();
+    });
+}
+
+fn with_key(text: &str, key_line: &str) -> String {
+    let anchor = "\"head_dim\": 256,";
+    assert!(text.contains(anchor));
+    text.replacen(anchor, &format!("{anchor}\n {key_line},"), 1)
+}
+
+/// `mamba_ssm_dtype` is accepted absent or `"float32"` (transformers casts
+/// the GDN rules to float32 unconditionally) and refused, by name, otherwise.
+#[test]
+fn mamba_ssm_dtype_other_than_float32_is_refused_at_the_config() {
+    let text = std::fs::read_to_string(fixture().join("config.json")).unwrap();
+    assert!(!text.contains("mamba_ssm_dtype"));
+    Qwen35Config::from_config_json(&text).expect("an absent mamba_ssm_dtype is float32");
+    Qwen35Config::from_config_json(&with_key(&text, "\"mamba_ssm_dtype\": \"float32\"")).unwrap();
+    for bad in ["\"bfloat16\"", "\"float16\"", "\"\"", "1", "null"] {
+        let m = Qwen35Config::from_config_json(&with_key(&text, &format!("\"mamba_ssm_dtype\": {bad}")))
+            .err()
+            .unwrap_or_else(|| panic!("mamba_ssm_dtype {bad} was accepted"));
+        assert!(m.contains("mamba_ssm_dtype"), "{bad}: {m}");
+    }
+}
+
+/// `attention_dropout` is accepted only as 0 (the fixture carries 0.0).
+#[test]
+fn nonzero_attention_dropout_is_refused_at_the_config() {
+    let text = std::fs::read_to_string(fixture().join("config.json")).unwrap();
+    assert!(text.contains("\"attention_dropout\": 0.0,"));
+    for bad in ["0.1", "1e-9", "1", "-0.5", "\"0.0\"", "null"] {
+        let t = text.replace("\"attention_dropout\": 0.0,", &format!("\"attention_dropout\": {bad},"));
+        let m = Qwen35Config::from_config_json(&t)
+            .err()
+            .unwrap_or_else(|| panic!("attention_dropout {bad} was accepted"));
+        assert!(m.contains("attention_dropout"), "{bad}: {m}");
+    }
+    let t = text.replace("\"attention_dropout\": 0.0,", "");
+    Qwen35Config::from_config_json(&t).expect("an absent attention_dropout is 0");
+}
+
+/// The real 2B's `config.json` (text_config with `mamba_ssm_dtype: float32`
+/// and `attention_dropout: 0.0`) still loads.
+#[test]
+fn the_real_2b_config_shape_still_loads() {
+    let text = r#"{"model_type":"qwen3_5","tie_word_embeddings":true,"text_config":{
+        "attention_bias":false,"attention_dropout":0.0,"attn_output_gate":true,"dtype":"bfloat16",
+        "full_attention_interval":4,"head_dim":256,"hidden_act":"silu","hidden_size":2048,
+        "intermediate_size":6144,"linear_conv_kernel_dim":4,"linear_key_head_dim":128,
+        "linear_num_key_heads":16,"linear_num_value_heads":16,"linear_value_head_dim":128,
+        "mlp_only_layers":[],"mtp_num_hidden_layers":1,"num_attention_heads":8,"num_hidden_layers":24,
+        "num_key_value_heads":2,"rms_norm_eps":1e-06,"tie_word_embeddings":true,"vocab_size":248320,
+        "mamba_ssm_dtype":"float32","rope_parameters":{"mrope_interleaved":true,"mrope_section":[11,11,10],
+        "rope_type":"default","rope_theta":10000000,"partial_rotary_factor":0.25}}}"#;
+    let cfg = Qwen35Config::from_config_json(text).unwrap();
+    assert_eq!(cfg.layers.len(), 24);
+}

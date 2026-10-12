@@ -368,7 +368,18 @@ pub(crate) struct Metal4EncodePackage {
     pub argument_table: PersistentArgumentTable,
     pub counter_heap: Option<Retained<ProtocolObject<dyn MTL4CounterHeap>>>,
     pub residency: Retained<ProtocolObject<dyn MTLResidencySet>>,
-    pub shared_event: Retained<ProtocolObject<dyn MTLSharedEvent>>,
+    /// The private lifetime event. Every decision about when GPU memory is
+    /// free (allocator reset, const-arena rewind, pool recycle, the drop
+    /// wait) reads this and nothing else. Only the queue signals it, and no
+    /// code outside the crate can reach it (see [`GpuRuntime::shared_event`]).
+    pub lifetime_event: Retained<ProtocolObject<dyn MTLSharedEvent>>,
+    /// The public handoff event. The queue signals it at the same value as
+    /// `lifetime_event`, after it, so it never runs ahead of tessl's own
+    /// completion. Foreign code may wait on it and, being public, signal it:
+    /// no lifetime decision reads it.
+    pub handoff_event: Retained<ProtocolObject<dyn MTLSharedEvent>>,
+    /// Longest a runtime wait on `lifetime_event` blocks, in milliseconds.
+    event_wait_ms: AtomicU64,
     /// Scratch for scalar `[[buffer(N)]]` constants (M4 has no setBytes).
     /// 16 MiB bump arena; cursor advances per const pack and resets after a
     /// waiting commit -- `synchronize`, or the reclaim a scope triggers when
@@ -847,7 +858,7 @@ impl GpuRuntime {
     pub(crate) fn host_access(&self) -> Result<RuntimeAccess, String> {
         let access = self.acquire_access()?;
         if let Err(e) = self.commit_m4(true) {
-            self.poison.set(e.as_str());
+            self.poison_on_failure(e.as_str());
             return Err(e);
         }
         Ok(access)
@@ -1124,13 +1135,36 @@ impl GpuRuntime {
         self.self_weak.clone()
     }
 
-    /// SharedEvent signaled on every Metal 4 commit. Cross-crate callers that
-    /// share an `MTLBuffer` (for example sparsl SpMV reading a tessl GEMM
-    /// output) wait on this event after tessl work — queues are not merged.
+    /// The handoff event: a `MTLSharedEvent` tessl signals on every Metal 4
+    /// commit, after its own work up to that value has completed. Cross-crate
+    /// callers that share an `MTLBuffer` (for example sparsl SpMV reading a
+    /// tessl GEMM output) wait on this event after tessl work -- queues are not
+    /// merged.
     ///
-    /// This accessor and [`Self::last_signaled_value`] are the whole public
-    /// view of the Metal 4 package. Its queue, allocators, argument table,
-    /// constant arena and residency set stay inside the crate: a caller
+    /// This is a handoff point and nothing more. It is **not** the event the
+    /// runtime frees memory on: the allocator reset, the const-arena rewind,
+    /// pool recycling and the drop wait all read a private lifetime event that
+    /// only tessl's queue signals and that no code outside the crate can
+    /// reach. So a foreign `setSignaledValue` on this event (a safe call in
+    /// objc2-metal) cannot make tessl reset or recycle memory the GPU is still
+    /// using. What a foreign signal can do is make a waiter on this event
+    /// wake before tessl's work is done; that is the signaler's own
+    /// contract, and [`Self::handoff_foreign_signal`] reports it.
+    ///
+    /// Two directions, both explicit:
+    /// - tessl to foreign: wait on `(shared_event(), v)` with `v <=`
+    ///   [`Self::last_signaled_value`]. Reaching `v` implies tessl's work
+    ///   through commit `v` has completed.
+    /// - foreign to tessl: tessl has no wait on a value it did not submit.
+    ///   Finish the foreign work and wait for it on the host (for example
+    ///   `waitUntilSignaledValue` on the foreign queue's own event) before
+    ///   tessl encodes against the buffer, or before the last tessl owner of an
+    ///   external buffer lets go of it. See `Tensor::from_mtl_buffer`.
+    ///
+    /// This accessor, [`Self::last_signaled_value`] and
+    /// [`Self::last_completed_value`] are the whole public view of the Metal 4
+    /// package. Its queue, allocators, argument table, constant arena,
+    /// residency set and lifetime event stay inside the crate: a caller
     /// holding them could encode or reset outside the encoder lease, or
     /// advance the arena cursor under a command buffer still reading it.
     ///
@@ -1139,14 +1173,80 @@ impl GpuRuntime {
     ///     let _queue = &rt.metal4.queue;
     /// }
     /// ```
+    ///
+    /// ```compile_fail,E0616
+    /// fn reach_the_lifetime_event(rt: &tessl::GpuRuntime) {
+    ///     let _event = &rt.metal4.lifetime_event;
+    /// }
+    /// ```
     pub fn shared_event(&self) -> &ProtocolObject<dyn MTLSharedEvent> {
-        &self.metal4.shared_event
+        &self.metal4.handoff_event
     }
 
     /// Last timeline value this runtime has submitted a signal for (`0` if no
     /// commit has signaled yet). Pair with [`Self::shared_event`] for handoff.
     pub fn last_signaled_value(&self) -> u64 {
         self.metal4.event_value.load(Ordering::Acquire)
+    }
+
+    /// The highest commit whose work tessl itself has seen complete (read from
+    /// the private lifetime event, so a foreign signal cannot raise it). It is
+    /// at most [`Self::last_signaled_value`].
+    pub fn last_completed_value(&self) -> u64 {
+        // Signaled first, then submitted: the second read can only be larger,
+        // so the minimum is never above a value the runtime had submitted.
+        let completed = self.metal4.lifetime_event.signaledValue();
+        completed.min(self.metal4.event_value.load(Ordering::Acquire))
+    }
+
+    /// `Some(v)` when the handoff event holds a value above anything this
+    /// runtime has submitted, which only foreign code can have put there.
+    ///
+    /// Safe to ignore for memory lifetime (no lifetime decision reads that
+    /// event). Pre-signaling `last_signaled_value() + 1` to announce "the next
+    /// commit" is such a signal. A waiter on [`Self::shared_event`] that sees
+    /// it must not read it as "tessl completed commit `v`".
+    pub fn handoff_foreign_signal(&self) -> Option<u64> {
+        // Signaled first, then submitted, as in `last_completed_value`.
+        let signaled = self.metal4.handoff_event.signaledValue();
+        let submitted = self.metal4.event_value.load(Ordering::Acquire);
+        (signaled > submitted).then_some(signaled)
+    }
+
+    /// Longest, in milliseconds, one runtime wait on the GPU timeline blocks
+    /// before it returns the error [`Self::is_event_wait_timeout`] recognises.
+    /// Starts at [`DEFAULT_EVENT_WAIT_MS`], or `TESSL_EVENT_WAIT_MS` when that
+    /// holds a value in [`EVENT_WAIT_MS_RANGE`].
+    pub fn event_wait_ms(&self) -> u64 {
+        self.metal4.event_wait_ms.load(Ordering::Acquire)
+    }
+
+    /// Set the wait budget of [`Self::event_wait_ms`]. Refuses a value outside
+    /// [`EVENT_WAIT_MS_RANGE`], so no wait is unbounded or zero.
+    pub fn set_event_wait_ms(&self, ms: u64) -> Result<(), String> {
+        if !EVENT_WAIT_MS_RANGE.contains(&ms) {
+            return Err(format!(
+                "event wait budget {ms} ms is outside {}..={} ms",
+                EVENT_WAIT_MS_RANGE.start(),
+                EVENT_WAIT_MS_RANGE.end()
+            ));
+        }
+        self.metal4.event_wait_ms.store(ms, Ordering::Release);
+        Ok(())
+    }
+
+    /// Whether `error` is the budget-exceeded error of a wait on the GPU
+    /// timeline.
+    ///
+    /// That error does **not** poison the runtime. A slow command buffer is not
+    /// a faulted one: the work is still queued and every allocator, arena
+    /// offset and pooled buffer stays exactly as it was, so nothing was reset or
+    /// recycled early. Retry [`Self::synchronize`] to keep waiting, raise the
+    /// budget with [`Self::set_event_wait_ms`] or `TESSL_EVENT_WAIT_MS`, or give
+    /// up and recreate the runtime. (A GPU fault, and a lifetime event that
+    /// runs ahead of what was submitted, still poison.)
+    pub fn is_event_wait_timeout(error: &str) -> bool {
+        error.starts_with(EVENT_WAIT_TIMEOUT_PREFIX)
     }
 
     /// Register a buffer in the Metal 4 residency set (deferred commit).
@@ -1246,6 +1346,50 @@ impl GpuRuntime {
     /// the next commit's. See [`Deferred`].
     fn release_point(&self) -> u64 {
         self.metal4.event_value.load(Ordering::Acquire) + 1
+    }
+
+    /// The lifetime event's value, after checking it against what this runtime
+    /// submitted. A value above that was set by something other than the queue
+    /// and cannot be evidence of completion, so the runtime poisons and
+    /// refuses the lifetime decision that was about to rest on it.
+    fn checked_lifetime_value(&self) -> Result<u64, String> {
+        let m4 = &self.metal4;
+        // Signaled first, then submitted: `event_value` is bumped before the
+        // queue signals, so an honest event never reads above the second load.
+        let signaled = m4.lifetime_event.signaledValue();
+        let submitted = m4.event_value.load(Ordering::Acquire);
+        match lifetime_event_violation(signaled, submitted) {
+            Some(error) => {
+                self.poison.set(error.as_str());
+                Err(error)
+            }
+            None => Ok(signaled),
+        }
+    }
+
+    /// Block until the lifetime event reaches `value` (a value this runtime
+    /// submitted), for at most [`Self::event_wait_ms`]. The one wait every
+    /// lifetime decision goes through.
+    fn wait_lifetime_event(&self, value: u64) -> Result<(), String> {
+        let m4 = &self.metal4;
+        let budget = m4.event_wait_ms.load(Ordering::Acquire);
+        if !m4.lifetime_event.waitUntilSignaledValue_timeoutMS(value, budget) {
+            return Err(event_wait_timeout_error(
+                budget,
+                value,
+                m4.lifetime_event.signaledValue(),
+                m4.event_value.load(Ordering::Acquire),
+            ));
+        }
+        self.checked_lifetime_value().map(|_| ())
+    }
+
+    /// Latch a failure as permanent, except a wait that merely ran out of
+    /// budget: that leaves the runtime consistent and retryable.
+    fn poison_on_failure(&self, error: &str) {
+        if !Self::is_event_wait_timeout(error) {
+            self.poison.set(error);
+        }
     }
 
     /// Release what the GPU is done with: every deferred item whose release
@@ -1749,7 +1893,7 @@ impl GpuRuntime {
         let async_on = self.async_encode_enabled();
         if async_on {
             if let Err(error) = self.encode_into_batch_m4(skip_auto, false, f) {
-                self.poison.set(error.as_str());
+                self.poison_on_failure(error.as_str());
                 return Err(error);
             }
             self.dispatch_count.fetch_add(1, Ordering::Relaxed);
@@ -1757,7 +1901,7 @@ impl GpuRuntime {
         }
         let result = self.with_binder_sync(skip_auto, f);
         if let Err(error) = &result {
-            self.poison.set(error.as_str());
+            self.poison_on_failure(error.as_str());
         }
         result
     }
@@ -1784,11 +1928,7 @@ impl GpuRuntime {
                     let (i1, v1) = (1usize, slots[1].in_flight);
                     let (i, v) = if v0 <= v1 { (i0, v0) } else { (i1, v1) };
                     let t0 = std::time::Instant::now();
-                    if !m4.shared_event.waitUntilSignaledValue_timeoutMS(v, 30_000) {
-                        let error = "Metal 4 allocator SharedEvent wait timed out";
-                        self.poison.set(error);
-                        return Err(error.to_string());
-                    }
+                    self.wait_lifetime_event(v)?;
                     crate::infer_trace::record_sync_wait(t0);
                     caught_up = Some(v);
                     // Reset every slot that has completed (event ≥ in_flight).
@@ -1975,7 +2115,7 @@ impl GpuRuntime {
         let _access = self.acquire_access()?;
         let result = self.commit_m4(wait);
         if let Err(error) = &result {
-            self.poison.set(error.as_str());
+            self.poison_on_failure(error.as_str());
         }
         result
     }
@@ -1984,6 +2124,7 @@ impl GpuRuntime {
         let mut guard = self.active_m4.lock().map_err(|e| e.to_string())?;
         let Some(batch) = guard.as_mut() else {
             if wait {
+                self.checked_lifetime_value()?;
                 self.drain_cold_recycles(u64::MAX);
             }
             return Ok(());
@@ -2012,6 +2153,7 @@ impl GpuRuntime {
                     *c = 0;
                 }
                 *guard = None;
+                self.checked_lifetime_value()?;
                 self.drain_cold_recycles(u64::MAX);
             }
             return Ok(());
@@ -2042,7 +2184,11 @@ impl GpuRuntime {
 
         let next = m4.event_value.fetch_add(1, Ordering::AcqRel) + 1;
         m4.queue
-            .signalEvent_value(ProtocolObject::<dyn MTLEvent>::from_ref(&*m4.shared_event), next);
+            .signalEvent_value(ProtocolObject::<dyn MTLEvent>::from_ref(&*m4.lifetime_event), next);
+        // Queue order puts this after the lifetime signal, so the handoff
+        // event reaches `next` only once tessl's own work up to `next` is done.
+        m4.queue
+            .signalEvent_value(ProtocolObject::<dyn MTLEvent>::from_ref(&*m4.handoff_event), next);
         // Mark this allocator in-flight; the next begin picks a free slot.
         {
             let mut slots = m4.allocators.lock().map_err(|e| e.to_string())?;
@@ -2052,11 +2198,7 @@ impl GpuRuntime {
 
         if wait {
             let t0 = std::time::Instant::now();
-            if !m4.shared_event.waitUntilSignaledValue_timeoutMS(next, 30_000) {
-                let error = "Metal 4 SharedEvent wait timed out";
-                self.poison.set(error);
-                return Err(error.to_string());
-            }
+            self.wait_lifetime_event(next)?;
             crate::infer_trace::record_sync_wait(t0);
             self.reset_all_allocators()?;
             if write_t1 {
@@ -2082,7 +2224,8 @@ impl GpuRuntime {
             // Next encode opens on the other allocator.
             batch.cb_open = false;
             // Without waiting, release what earlier command buffers finished.
-            self.drain_cold_recycles(m4.shared_event.signaledValue());
+            let reached = self.checked_lifetime_value()?;
+            self.drain_cold_recycles(reached);
         }
         Ok(())
     }
@@ -2200,11 +2343,7 @@ impl GpuRuntime {
             return Ok(());
         }
         let t0 = std::time::Instant::now();
-        if !m4.shared_event.waitUntilSignaledValue_timeoutMS(max_v, 30_000) {
-            let error = "Metal 4 SharedEvent wait timed out";
-            self.poison.set(error);
-            return Err(error.to_string());
-        }
+        self.wait_lifetime_event(max_v)?;
         crate::infer_trace::record_sync_wait(t0);
         self.reset_all_allocators()
     }
@@ -2287,7 +2426,8 @@ impl GpuRuntime {
             std::mem::forget(counter_heap.clone());
         }
         std::mem::forget(self.metal4.residency.clone());
-        std::mem::forget(self.metal4.shared_event.clone());
+        std::mem::forget(self.metal4.lifetime_event.clone());
+        std::mem::forget(self.metal4.handoff_event.clone());
         std::mem::forget(self.metal4.const_staging.clone());
 
         if let Some(batch) = mutex_value_mut(&mut self.active_m4).as_ref() {
@@ -2320,7 +2460,52 @@ impl GpuRuntime {
     }
 }
 
-const FINAL_DROP_WAIT_MS: u64 = 30_000;
+/// Default longest wait, in milliseconds, on the GPU timeline.
+pub const DEFAULT_EVENT_WAIT_MS: u64 = 30_000;
+
+/// Accepted range of the wait budget: at least 1 ms, at most an hour.
+pub const EVENT_WAIT_MS_RANGE: std::ops::RangeInclusive<u64> = 1..=3_600_000;
+
+/// Start of the error a wait that ran out of budget returns. See
+/// [`GpuRuntime::is_event_wait_timeout`].
+const EVENT_WAIT_TIMEOUT_PREFIX: &str = "Metal 4 SharedEvent wait budget exceeded";
+
+fn event_wait_timeout_error(budget_ms: u64, value: u64, signaled: u64, submitted: u64) -> String {
+    format!(
+        "{EVENT_WAIT_TIMEOUT_PREFIX} (timed out): waited {budget_ms} ms for lifetime event value {value} \
+         (reached {signaled}, submitted {submitted}); the GPU work may only be slow, so the runtime is \
+         not poisoned: retry, or raise the budget with set_event_wait_ms or TESSL_EVENT_WAIT_MS"
+    )
+}
+
+/// The refusal for a lifetime event that holds more than was ever submitted.
+fn lifetime_event_violation(signaled: u64, submitted: u64) -> Option<String> {
+    (signaled > submitted).then(|| {
+        format!(
+            "Metal 4 lifetime event is at {signaled} but this runtime only submitted {submitted}: \
+             something other than the queue signaled it, so it cannot show the GPU is done with a \
+             buffer; refusing to reset allocators or recycle memory"
+        )
+    })
+}
+
+/// `TESSL_EVENT_WAIT_MS` if it is set to a value in range, else the default.
+fn event_wait_ms_from_env() -> u64 {
+    let Ok(raw) = std::env::var("TESSL_EVENT_WAIT_MS") else {
+        return DEFAULT_EVENT_WAIT_MS;
+    };
+    match raw.trim().parse::<u64>() {
+        Ok(ms) if EVENT_WAIT_MS_RANGE.contains(&ms) => ms,
+        _ => {
+            eprintln!(
+                "tessl: ignoring TESSL_EVENT_WAIT_MS={raw:?} (want an integer in {}..={}); using {DEFAULT_EVENT_WAIT_MS} ms",
+                EVENT_WAIT_MS_RANGE.start(),
+                EVENT_WAIT_MS_RANGE.end()
+            );
+            DEFAULT_EVENT_WAIT_MS
+        }
+    }
+}
 
 #[inline]
 fn max_event_value(events: impl Iterator<Item = u64>) -> u64 {
@@ -2351,11 +2536,18 @@ impl Drop for GpuRuntime {
             return;
         }
 
-        if self
+        let budget = self.metal4.event_wait_ms.load(Ordering::Acquire);
+        let reached = self
             .metal4
-            .shared_event
-            .waitUntilSignaledValue_timeoutMS(max_event, FINAL_DROP_WAIT_MS)
-        {
+            .lifetime_event
+            .waitUntilSignaledValue_timeoutMS(max_event, budget);
+        // An event above what was submitted is not evidence the GPU is done.
+        let honest = lifetime_event_violation(
+            self.metal4.lifetime_event.signaledValue(),
+            self.metal4.event_value.load(Ordering::Acquire),
+        )
+        .is_none();
+        if reached && honest {
             for slot in mutex_value_mut(&mut self.metal4.allocators).iter_mut() {
                 if slot.in_flight != 0 && slot.in_flight <= max_event {
                     slot.allocator.reset();
@@ -2368,8 +2560,9 @@ impl Drop for GpuRuntime {
         use std::io::Write as _;
         let _ = writeln!(
             std::io::stderr().lock(),
-            "tessl: final GpuRuntime drop timed out after {FINAL_DROP_WAIT_MS} ms waiting for \
-             Metal event {max_event}; leaking in-flight MTL4 objects to prevent GPU use-after-free"
+            "tessl: final GpuRuntime drop gave up (waited up to {budget} ms for Metal event \
+             {max_event}, lifetime event honest: {honest}); leaking in-flight MTL4 objects to \
+             prevent GPU use-after-free"
         );
         self.leak_in_flight_anchors();
     }
@@ -2473,9 +2666,12 @@ fn try_init_metal4(device: &ProtocolObject<dyn MTLDevice>, timestamps: bool) -> 
     };
 
     let res_desc = MTLResidencySetDescriptor::new();
-    let shared_event = device
+    let lifetime_event = device
         .newSharedEvent()
         .ok_or_else(|| "newSharedEvent returned nil".to_string())?;
+    let handoff_event = device
+        .newSharedEvent()
+        .ok_or_else(|| "newSharedEvent (handoff) returned nil".to_string())?;
 
     // Multi-slot const arena for batched argument-table encode (16 MiB).
     let const_staging = device
@@ -2512,7 +2708,9 @@ fn try_init_metal4(device: &ProtocolObject<dyn MTLDevice>, timestamps: bool) -> 
         },
         counter_heap,
         residency,
-        shared_event,
+        lifetime_event,
+        handoff_event,
+        event_wait_ms: AtomicU64::new(event_wait_ms_from_env()),
         const_arena: crate::dispatch::ConstArena::new(&const_staging),
         const_staging,
         const_cursor: Mutex::new(0),
@@ -3104,5 +3302,104 @@ mod drop_wait_tests {
         assert_eq!(max_event_value([].into_iter()), 0);
         assert_eq!(max_event_value([0, 4, 2, 9, 0, 7].into_iter()), 9);
         assert_eq!(max_event_value([u64::MAX, 1].into_iter()), u64::MAX);
+    }
+}
+
+#[cfg(test)]
+mod lifetime_event_tests {
+    use super::*;
+
+    #[test]
+    fn a_lifetime_event_above_what_was_submitted_is_a_violation() {
+        assert!(lifetime_event_violation(0, 0).is_none());
+        assert!(lifetime_event_violation(7, 7).is_none());
+        assert!(lifetime_event_violation(3, 7).is_none());
+        let error = lifetime_event_violation(8, 7).expect("8 > 7 is dishonest");
+        assert!(error.contains("lifetime event is at 8"), "{error}");
+        assert!(error.contains("only submitted 7"), "{error}");
+        assert!(lifetime_event_violation(u64::MAX, 0).is_some());
+    }
+
+    #[test]
+    fn the_wait_budget_is_bounded() {
+        let rt = GpuRuntime::new().unwrap();
+        assert!(EVENT_WAIT_MS_RANGE.contains(&rt.event_wait_ms()));
+        assert!(rt.set_event_wait_ms(0).is_err());
+        assert!(rt.set_event_wait_ms(EVENT_WAIT_MS_RANGE.end() + 1).is_err());
+        assert!(rt.set_event_wait_ms(u64::MAX).is_err());
+        let before = rt.event_wait_ms();
+        assert!(rt.set_event_wait_ms(0).is_err());
+        assert_eq!(rt.event_wait_ms(), before, "a refused budget must not change the setting");
+        rt.set_event_wait_ms(1).unwrap();
+        assert_eq!(rt.event_wait_ms(), 1);
+    }
+
+    #[test]
+    fn a_signal_the_queue_never_made_poisons_before_anything_is_recycled() {
+        let rt = GpuRuntime::new().unwrap();
+        let submitted = rt.last_signaled_value();
+        // The private event is out of reach of other crates; this is the
+        // defense in depth should something inside the process still set it.
+        rt.metal4.lifetime_event.setSignaledValue(submitted + 5);
+        let error = rt.synchronize().unwrap_err();
+        assert!(error.contains("lifetime event is at"), "unnamed error: {error}");
+        assert!(rt.is_poisoned());
+        let refused = rt.alloc_tensor_f32(&[4]).map(|_| ()).unwrap_err();
+        assert!(refused.contains("lifetime event is at"), "the refusal lost the cause: {refused}");
+    }
+
+    #[test]
+    fn a_wait_that_runs_out_of_budget_names_itself_and_leaves_the_runtime_usable() {
+        let rt = GpuRuntime::new().unwrap();
+        rt.set_event_wait_ms(1).unwrap();
+        // A commit that was submitted but whose signal has not landed.
+        let value = rt.metal4.event_value.fetch_add(1, Ordering::AcqRel) + 1;
+        rt.metal4.allocators.lock().unwrap()[0].in_flight = value;
+
+        let error = rt.wait_all_allocators().unwrap_err();
+        assert!(GpuRuntime::is_event_wait_timeout(&error), "{error}");
+        assert!(error.contains("waited 1 ms"), "{error}");
+        assert!(error.contains(&format!("value {value}")), "{error}");
+        assert!(error.contains("reached 0"), "{error}");
+        rt.poison_on_failure(&error);
+        assert!(!rt.is_poisoned(), "a slow wait must not brick the runtime");
+        assert_eq!(
+            rt.metal4.allocators.lock().unwrap()[0].in_flight,
+            value,
+            "the allocator was reset while its work was still outstanding"
+        );
+
+        // The work finishes: the same wait now completes and resets the slot.
+        rt.set_event_wait_ms(1_000).unwrap();
+        rt.metal4.lifetime_event.setSignaledValue(value);
+        rt.wait_all_allocators().unwrap();
+        assert_eq!(rt.metal4.allocators.lock().unwrap()[0].in_flight, 0);
+        let t = rt.alloc_tensor_f32(&[4]).unwrap();
+        drop(t);
+        rt.synchronize().unwrap();
+        assert!(!rt.is_poisoned());
+    }
+
+    #[test]
+    fn only_a_budget_error_is_recognised_as_one_and_other_failures_still_poison() {
+        let rt = GpuRuntime::new().unwrap();
+        assert!(!GpuRuntime::is_event_wait_timeout(
+            "Metal 4 SharedEvent wait timed out (poison_as_shared_event_timeout_for_test)"
+        ));
+        rt.poison_on_failure("encode failed");
+        assert!(rt.is_poisoned());
+    }
+
+    #[test]
+    fn a_foreign_signal_on_the_handoff_event_moves_no_lifetime_decision() {
+        let rt = GpuRuntime::new().unwrap();
+        let submitted = rt.last_signaled_value();
+        assert_eq!(rt.handoff_foreign_signal(), None);
+        rt.shared_event().setSignaledValue(submitted + 1_000);
+        assert_eq!(rt.handoff_foreign_signal(), Some(submitted + 1_000));
+        // The lifetime event did not move, and a waiting commit still works.
+        assert_eq!(rt.last_completed_value(), submitted);
+        rt.synchronize().unwrap();
+        assert!(!rt.is_poisoned());
     }
 }

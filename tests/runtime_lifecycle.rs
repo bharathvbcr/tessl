@@ -528,7 +528,27 @@ fn release(rt: &GpuRuntime, released: &mut std::collections::HashMap<usize, u64>
 
 #[test]
 fn temporaries_recycle_across_unwaited_commits() {
+    with_gpu(|rt| recycle_across_unwaited_commits(rt, false));
+}
+
+/// The BINN pattern: a foreign queue (sparsl) host-signals the handoff event to
+/// `last_signaled_value() + 1`, a value tessl has not committed yet, before
+/// every commit. Lifetime decisions rest on a private event, so the same
+/// bookkeeping must hold: nothing recycles before tessl's own completion.
+#[test]
+fn a_foreign_signal_on_the_handoff_event_recycles_nothing_early() {
     with_gpu(|rt| {
+        recycle_across_unwaited_commits(rt, true);
+        // Said out loud: a waiter on the handoff event is told about it.
+        assert!(
+            rt.handoff_foreign_signal().is_some() || rt.last_completed_value() == rt.last_signaled_value(),
+            "a foreign signal ahead of tessl went unreported"
+        );
+    });
+}
+
+fn recycle_across_unwaited_commits(rt: &std::sync::Arc<GpuRuntime>, foreign_handoff_signal: bool) {
+    {
         // A run that commits without waiting and never synchronizes. A cold
         // temporary dropped mid-run cannot go back to the freelist while a
         // command buffer that may read it is in flight -- but once that command
@@ -554,6 +574,9 @@ fn temporaries_recycle_across_unwaited_commits() {
         let round_bytes = (TEMPS * N * 4) as u64;
 
         rt.set_async_encode(true).unwrap();
+        if foreign_handoff_signal {
+            rt.shared_event().setSignaledValue(rt.last_signaled_value() + 1);
+        }
         let srcs: Vec<Vec<f32>> = (0..ROUNDS).map(|r| random_f32(N, 700 + r as u64)).collect();
         let src: Vec<Tensor> = srcs.iter().map(|h| tensor_f32(rt, &[N], h)).collect();
         let sink = rt.alloc_tensor_f32(&[ROUNDS * N]).unwrap();
@@ -581,11 +604,15 @@ fn temporaries_recycle_across_unwaited_commits() {
             let last = prev.expect("TEMPS > 0");
             gpu_copy(&last, &sink.view(&[N], round * N)).unwrap();
             release(rt, &mut released, last);
+            if foreign_handoff_signal {
+                rt.shared_event().setSignaledValue(rt.last_signaled_value() + 1);
+            }
             rt.commit(false).unwrap();
             let probe = rt.alloc_tensor_f32(&[N]).unwrap();
             // Read after the probe: the event only rises, so a release point
             // above this value was above it at every drain before the probe.
-            let reached = rt.shared_event().signaledValue();
+            // This is tessl's own completion, not the handoff event's value.
+            let reached = rt.last_completed_value();
             if released.values().any(|&after| after > reached) {
                 checked += 1;
             }
@@ -619,7 +646,7 @@ fn temporaries_recycle_across_unwaited_commits() {
                 "round {round} read a temporary another round had reused"
             );
         }
-    });
+    }
 }
 
 #[test]
@@ -855,5 +882,38 @@ fn a_params_push_waits_for_encoded_work_reading_the_slot() {
             vec![7.0],
             "the encoded dispatch read the next step's value"
         );
+    });
+}
+
+/// Waiting on the handoff point implies tessl's work up to it has completed:
+/// a kernel writes a buffer, a foreign waiter blocks on `(shared_event(), v)`
+/// with no tessl synchronize in between, and the values it then reads are the
+/// finished ones.
+#[test]
+fn reaching_the_handoff_point_implies_the_work_completed() {
+    with_gpu(|rt| {
+        const G: usize = 768;
+        let a = tensor_f32(rt, &[G, G], &random_f32(G * G, 811));
+        let b = tensor_f32(rt, &[G, G], &random_f32(G * G, 812));
+        let c = rt.alloc_tensor_f32(&[G, G]).unwrap();
+        rt.synchronize().unwrap();
+        let before = rt.last_signaled_value();
+        rt.set_async_encode(true).unwrap();
+        gemm_f32(&a, &b, &c, GemmBackend::TensorOps).unwrap();
+        rt.commit(false).unwrap();
+        let point = rt.last_signaled_value();
+        assert!(point > before, "the commit signaled nothing");
+        assert_eq!(rt.handoff_foreign_signal(), None);
+        assert!(
+            rt.shared_event().waitUntilSignaledValue_timeoutMS(point, 60_000),
+            "the handoff point {point} was never reached"
+        );
+        assert!(
+            rt.last_completed_value() >= point,
+            "the handoff point {point} was reached before tessl saw its own work complete"
+        );
+        let want = reference(Layout::Nn, &random_f32(G * G, 811), &random_f32(G * G, 812), G, G, G);
+        assert_within_bound("read at the handoff point", &c.buffer.read_f32(), &want, G, 0.0);
+        rt.synchronize().unwrap();
     });
 }

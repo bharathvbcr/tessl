@@ -41,7 +41,13 @@ fn from_mtl_buffer_gemm_operand_matches_native_tensor() {
         assert!(want.iter().any(|&x| x != 0.0));
         // Commit advanced the SharedEvent timeline used for cross-crate handoff.
         assert!(rt.last_signaled_value() > 0);
-        let _ = rt.shared_event().signaledValue();
+        // The handoff event is signaled behind the lifetime event, so once
+        // tessl has completed its work the handoff event reaches that value.
+        let point = rt.last_signaled_value();
+        assert!(rt.shared_event().waitUntilSignaledValue_timeoutMS(point, 30_000));
+        assert_eq!(rt.shared_event().signaledValue(), point);
+        assert_eq!(rt.last_completed_value(), point);
+        assert_eq!(rt.handoff_foreign_signal(), None);
     });
 }
 

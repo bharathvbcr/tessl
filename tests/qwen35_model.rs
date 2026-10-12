@@ -234,8 +234,9 @@ fn bf16_forward_is_no_worse_than_transformers_bf16() {
 /// cover: `begin` / `advance_to` / `final_norm_f32` on a `load_tower` model
 /// give `forward`'s traced final norm, and `prefill` then three `Decode::step`s
 /// give `forward`'s last row at every length. Bounds are the tiny tests': the
-/// decode test's F32 1e-5 with the same top-1 token, and 1e-5 for the staged
-/// final norm (the same arithmetic as the forward's). Needs only the
+/// decode test's F32 1e-5, with the same top-1 token wherever the top two
+/// logits are further apart than that bound (`check_row`), and 1e-5 for the
+/// staged final norm (the same arithmetic as the forward's). Needs only the
 /// checkpoint, not the transformers reference. One model is resident at a time:
 /// two F32 copies of the 2B would be ~15 GB.
 #[test]

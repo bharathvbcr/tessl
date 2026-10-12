@@ -1750,8 +1750,8 @@ impl Decode<'_> {
         }
         m.head(&self.a.resid, &self.a.x, &self.logits)?;
         rt.synchronize()?;
-        // Read before advancing: a failed read leaves `position()` where it was
-        // (and the session poisoned, as the state past the layers is not).
+        // Read before advancing: a failed read leaves `position()` where it was,
+        // and the session poisoned, since the layers' state has moved past it.
         m.take_read_fault()?;
         let row = self.logits.buffer.try_contents_f32()?[..m.cfg.vocab as usize].to_vec();
         self.decoded += 1;

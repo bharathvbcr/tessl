@@ -91,10 +91,10 @@ use crate::json::{self, Json, Syntax};
 use crate::loader::Loader;
 use crate::nn::{AttnDims, DecodeScratch};
 use crate::qwen35::{
-    self, AttnProjLayout, AttnShape, AttnTargets, Cols, GdnParams, GdnProjLayout, GdnWorkspace, LmHead, OutCols,
-    SharedPrefix, StateIn,
+    self, AttnProjLayout, AttnShape, AttnTargets, Cols, GdnDims, GdnParams, GdnProjLayout, GdnWorkspace, LmHead,
+    OutCols, SharedPrefix, StateIn,
 };
-use crate::runtime::GpuRuntime;
+use crate::runtime::{BufferKind, GpuRuntime};
 use crate::safetensors::SafeTensors;
 use crate::tensor::{DType, GpuBuffer, Tensor};
 
@@ -884,7 +884,14 @@ impl Qwen35Model {
     pub fn forward_rows(&self, ids: &[u32], rows: LogitRows<'_>, trace: bool) -> Result<ForwardOutput, String> {
         self.require_head("Qwen35Model::forward")?;
         check_rows("Qwen35Model::forward_rows", rows, ids.len())?;
-        let mut s = self.begin_impl("Qwen35Model::forward", ids, trace, None)?;
+        // The logits the head writes, `[rows, vocab]` f32, after the activations.
+        let n_rows = match rows {
+            LogitRows::All => ids.len(),
+            LogitRows::Last => ids.len().min(1),
+            LogitRows::Rows(r) => r.len(),
+        };
+        let logits_bytes = f32_bytes(n_rows.saturating_mul(self.cfg.vocab as usize));
+        let mut s = self.begin_impl("Qwen35Model::forward", ids, trace, None, logits_bytes)?;
         s.advance_to(self.layers.len())?;
         let logits = s.logits(rows)?;
         let mut out_trace = s.trace.take().unwrap_or_default();
@@ -911,7 +918,7 @@ impl Qwen35Model {
     /// [`Self::load_tower`] model and at sequence lengths whose `[tokens,
     /// vocab]` logits would not fit.
     pub fn begin(&self, ids: &[u32]) -> Result<Staged<'_>, String> {
-        self.begin_impl("Qwen35Model::begin", ids, false, None)
+        self.begin_impl("Qwen35Model::begin", ids, false, None, 0)
     }
 
     /// Prefill `ids` (one sequence, positions from 0) for decoding up to
@@ -935,29 +942,36 @@ impl Qwen35Model {
             .checked_add(max_new)
             .ok_or_else(|| format!("{WHAT}: {t} tokens plus max_new {max_new} exceed u32 positions"))?;
         let (rt, cfg) = (&self.rt, &self.cfg);
-        // What the session keeps for its lifetime, checked as a training step
-        // is before any GPU work: past the recommended working set Metal
-        // pages the resident set or the system runs out of memory, rather
-        // than an allocation failing where the caller can see it.
+        // Everything the prefill allocates, checked as a training step is
+        // before any GPU work: past the recommended working set Metal pages
+        // the resident set or the system runs out of memory, rather than an
+        // allocation failing where the caller can see it. That is what the
+        // session keeps (state, decode activations, logits, scratch) and what
+        // only the prefill holds (its activations for all `t` tokens, with
+        // the GDN workspace, and the head's `[1, vocab]` row). The prefill's
+        // activations are counted again by `begin_impl`, against what is
+        // allocated by then.
         let (q_heads, head_dim) = (cfg.attn.q_heads(), cfg.attn.head_dim());
-        let need =
-            self.carry_bytes(t, max_new)
-                .saturating_add(DecodeScratch::bytes(1, q_heads, positions as usize, head_dim)? as u64);
-        let (have, limit) = (rt.current_allocated_bytes(), rt.memory_info().recommended_working_set);
-        if have.saturating_add(need) > limit {
-            return Err(format!(
-                "{WHAT}: a session of {t} tokens and max_new {max_new} keeps {need} B on top of the {have} B \
-                 allocated, over the device's recommended working set of {limit} B; refused before any GPU \
-                 work (shorten the prompt or max_new, or free device memory)"
-            ));
-        }
+        let logits_bytes = f32_bytes(cfg.vocab as usize);
+        let need = self
+            .carry_bytes(t, max_new)
+            .saturating_add(DecodeScratch::bytes(1, q_heads, positions as usize, head_dim)? as u64)
+            .saturating_add(Acts::bytes(cfg, self.precision, 1, false)?)
+            .saturating_add(logits_bytes.saturating_mul(2))
+            .saturating_add(Acts::bytes(cfg, self.precision, t, false)?);
+        self.check_working_set(
+            WHAT,
+            need,
+            &format!("a session of {t} tokens and max_new {max_new} needs"),
+            "shorten the prompt or max_new, or free device memory",
+        )?;
         // Everything the session holds is allocated before the prefill runs,
         // so a failed allocation never throws a finished prefill away.
         let carry = self.alloc_carry(t, max_new)?;
         let a = Acts::new(rt, cfg, self.precision, 1, false)?;
         let logits_t = rt.alloc_tensor_f32(&[1, cfg.vocab as usize])?;
         let scratch = DecodeScratch::new(rt, 1, q_heads, positions as usize, head_dim)?;
-        let mut s = self.begin_impl(WHAT, ids, false, Some(carry))?;
+        let mut s = self.begin_impl(WHAT, ids, false, Some(carry), 0)?;
         s.advance_to(self.layers.len())?;
         let logits = s.logits(LogitRows::Last)?;
         let carry = s
@@ -985,11 +999,21 @@ impl Qwen35Model {
         ids: &[u32],
         trace: bool,
         carry: Option<Vec<Carry>>,
+        extra_bytes: u64,
     ) -> Result<Staged<'_>, String> {
         // Read before any weight is: a write that lands during the prefill
         // then stops it too.
         let param_generation = self.param_generation();
         let t = self.check_ids(what, ids)?;
+        // Counted against what is allocated now, so a prefill that has
+        // already allocated its session's state is not charged for it twice.
+        let need = Acts::bytes(&self.cfg, self.precision, t, carry.is_none())?.saturating_add(extra_bytes);
+        self.check_working_set(
+            what,
+            need,
+            &format!("a forward of {t} tokens needs"),
+            "shorten the sequence, or free device memory",
+        )?;
         let a = Acts::new(&self.rt, &self.cfg, self.precision, t, carry.is_none())?;
         self.embed_ids(ids, &a.resid)?;
         Ok(Staged {
@@ -1001,6 +1025,24 @@ impl Qwen35Model {
             param_generation,
             broken: false,
         })
+    }
+
+    /// Refuse, before any GPU work, an allocation of `need` bytes that would
+    /// take the device's current allocation past its recommended working set.
+    /// `what` names the entry point, `subject` what needs the bytes and `hint`
+    /// what the caller can do.
+    fn check_working_set(&self, what: &str, need: u64, subject: &str, hint: &str) -> Result<(), String> {
+        let (have, limit) = (
+            self.rt.current_allocated_bytes(),
+            self.rt.memory_info().recommended_working_set,
+        );
+        if have.saturating_add(need) > limit {
+            return Err(format!(
+                "{what}: {subject} {need} B on top of the {have} B allocated, over the device's \
+                 recommended working set of {limit} B; refused before any GPU work ({hint})"
+            ));
+        }
+        Ok(())
     }
 
     /// Refuse to continue a prefill or session begun at `since` once the
@@ -1822,10 +1864,68 @@ struct Acts {
     m_mid: Tensor,
 }
 
-impl Acts {
-    fn new(rt: &Arc<GpuRuntime>, cfg: &Qwen35Config, p: Precision, t: u32, shared_kv: bool) -> Result<Self, String> {
+/// The allocated size of an `n`-element f32 buffer, as [`Acts`] and the
+/// session's other buffers make it (never empty).
+fn f32_bytes(n: usize) -> u64 {
+    GpuRuntime::allocated_bytes_for(n.max(1).saturating_mul(4), BufferKind::Cold)
+}
+
+/// What [`Acts`] allocates at `t` tokens: the one place its sizes are
+/// decided, which [`Acts::new`] allocates from and [`Acts::bytes`] sums.
+struct ActsPlan {
+    t: usize,
+    p: Precision,
+    hidden: usize,
+    intermediate: usize,
+    /// Columns of the GDN projection, its value width and the attention
+    /// projection.
+    g_width: usize,
+    g_value: usize,
+    a_width: usize,
+    /// Elements of the GDN conv input and of the attention's `[t, q_heads *
+    /// head_dim]` buffers.
+    g_qkv: usize,
+    qd: usize,
+    /// Elements of one of the shared K and V; none when each layer keeps its own.
+    kv: Option<usize>,
+    gdn: GdnDims,
+}
+
+impl ActsPlan {
+    fn new(cfg: &Qwen35Config, p: Precision, t: u32, shared_kv: bool) -> Self {
         let tu = t as usize;
         let (g, l) = (cfg.gdn, cfg.attn);
+        let qd = (l.q_heads() * l.head_dim()) as usize;
+        Self {
+            t: tu,
+            p,
+            hidden: cfg.hidden as usize,
+            intermediate: cfg.intermediate as usize,
+            g_width: g.width() as usize,
+            g_value: g.value_dim() as usize,
+            a_width: l.width() as usize,
+            g_qkv: tu.saturating_mul(g.conv_dim() as usize),
+            qd,
+            kv: shared_kv.then(|| tu.saturating_mul((l.kv_heads() * l.head_dim()) as usize)),
+            gdn: g.dims(1, t),
+        }
+    }
+
+    /// Bytes of a `[t, cols]` tensor in f32 and in the forward's dtype.
+    fn f32_rows(&self, cols: usize) -> u64 {
+        f32_bytes(self.t.saturating_mul(cols))
+    }
+
+    fn act_rows(&self, cols: usize) -> u64 {
+        let nbytes = self.t.saturating_mul(cols).saturating_mul(self.p.dtype().size_of());
+        GpuRuntime::allocated_bytes_for(nbytes, BufferKind::Cold)
+    }
+}
+
+impl Acts {
+    fn new(rt: &Arc<GpuRuntime>, cfg: &Qwen35Config, p: Precision, t: u32, shared_kv: bool) -> Result<Self, String> {
+        let plan = ActsPlan::new(cfg, p, t, shared_kv);
+        let tu = plan.t;
         // Every activation is written in full before anything reads it — the
         // embedding gather fills `resid`, the norms fill `x`, the GEMMs fill
         // their outputs, the gate and activation kernels fill `g_y`, `a_y`
@@ -1834,31 +1934,65 @@ impl Acts {
         let f32t = |cols: usize| rt.alloc_tensor_unzeroed(&[tu, cols], DType::F32);
         let act = |cols: usize| activation(rt, p, tu, cols);
         let f32s = |n: usize| rt.alloc_buffer(n.max(1) * 4);
-        let qd = (l.q_heads() * l.head_dim()) as usize;
-        let kv = tu * (l.kv_heads() * l.head_dim()) as usize;
         // Fresh buffers, written without a GPU wait.
         let u32_buf = |v: u32| rt.alloc_buffer_from_u32(&[v]);
         Ok(Self {
             t,
-            resid: f32t(cfg.hidden as usize)?,
-            x: act(cfg.hidden as usize)?,
-            proj_out: f32t(cfg.hidden as usize)?,
-            g_proj: f32t(g.width() as usize)?,
-            g_qkv: f32s(tu * g.conv_dim() as usize)?,
-            g_o: f32s(tu * g.value_dim() as usize)?,
-            g_y: act(g.value_dim() as usize)?,
-            g_ws: GdnWorkspace::new(rt, &g.dims(1, t))?,
-            a_proj: f32t(l.width() as usize)?,
-            a_q: f32s(tu * qd)?,
-            kv: if shared_kv { Some((f32s(kv)?, f32s(kv)?)) } else { None },
-            a_o: f32s(tu * qd)?,
-            a_y: act(qd)?,
+            resid: f32t(plan.hidden)?,
+            x: act(plan.hidden)?,
+            proj_out: f32t(plan.hidden)?,
+            g_proj: f32t(plan.g_width)?,
+            g_qkv: f32s(plan.g_qkv)?,
+            g_o: f32s(tu * plan.g_value)?,
+            g_y: act(plan.g_value)?,
+            g_ws: GdnWorkspace::new(rt, &plan.gdn)?,
+            a_proj: f32t(plan.a_width)?,
+            a_q: f32s(tu * plan.qd)?,
+            kv: match plan.kv {
+                Some(n) => Some((f32s(n)?, f32s(n)?)),
+                None => None,
+            },
+            a_o: f32s(tu * plan.qd)?,
+            a_y: act(plan.qd)?,
             tkv: u32_buf(t)?,
             zero: u32_buf(0)?,
-            m_gate: f32t(cfg.intermediate as usize)?,
-            m_up: f32t(cfg.intermediate as usize)?,
-            m_mid: act(cfg.intermediate as usize)?,
+            m_gate: f32t(plan.intermediate)?,
+            m_up: f32t(plan.intermediate)?,
+            m_mid: act(plan.intermediate)?,
         })
+    }
+
+    /// Bytes [`Self::new`] allocates at `t` tokens, as the device counts them
+    /// (each buffer at its allocated size; the GDN workspace at
+    /// [`GdnWorkspace::bytes_for`]'s). What a caller checks against the
+    /// device's memory before allocating.
+    fn bytes(cfg: &Qwen35Config, p: Precision, t: u32, shared_kv: bool) -> Result<u64, String> {
+        let plan = ActsPlan::new(cfg, p, t, shared_kv);
+        let ws = GdnWorkspace::bytes_for(&plan.gdn)? as u64;
+        let scalar = f32_bytes(1);
+        let kv = plan.kv.map_or(0, |n| f32_bytes(n).saturating_mul(2));
+        Ok([
+            plan.f32_rows(plan.hidden),
+            plan.act_rows(plan.hidden),
+            plan.f32_rows(plan.hidden),
+            plan.f32_rows(plan.g_width),
+            f32_bytes(plan.g_qkv),
+            plan.f32_rows(plan.g_value),
+            plan.act_rows(plan.g_value),
+            ws,
+            plan.f32_rows(plan.a_width),
+            plan.f32_rows(plan.qd),
+            kv,
+            plan.f32_rows(plan.qd),
+            plan.act_rows(plan.qd),
+            scalar,
+            scalar,
+            plan.f32_rows(plan.intermediate),
+            plan.f32_rows(plan.intermediate),
+            plan.act_rows(plan.intermediate),
+        ]
+        .into_iter()
+        .fold(0, u64::saturating_add))
     }
 
     /// The shared K/V of a prefill that keeps nothing.
@@ -1867,5 +2001,42 @@ impl Acts {
             .as_ref()
             .map(|(k, v)| (k, v))
             .ok_or_else(|| "Qwen35Model: a prefill that keeps its state has no shared K/V".to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `Acts::bytes` is what `Acts::new` allocates: every buffer's allocated
+    /// size summed, the GDN workspace at `GdnWorkspace::bytes_for`'s.
+    #[test]
+    fn acts_bytes_is_what_acts_new_allocates() {
+        let cfg = Qwen35Config::from_config_file(
+            &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/qwen35_train/config.json"),
+        )
+        .unwrap();
+        let rt = GpuRuntime::new().expect("runtime");
+        let alloc = |b: &GpuBuffer| GpuRuntime::allocated_bytes_for(b.nbytes(), BufferKind::Cold);
+        for p in [Precision::F32, Precision::Bf16] {
+            for t in [1u32, 5, 64, 65, 200] {
+                for shared in [false, true] {
+                    let a = Acts::new(&rt, &cfg, p, t, shared).unwrap();
+                    let mut got = [&a.resid, &a.x, &a.proj_out, &a.g_proj, &a.g_y, &a.a_proj, &a.a_y]
+                        .iter()
+                        .chain([&&a.m_gate, &&a.m_up, &&a.m_mid])
+                        .map(|x| alloc(&x.buffer))
+                        .sum::<u64>();
+                    got += [&a.g_qkv, &a.g_o, &a.a_q, &a.a_o, &a.tkv, &a.zero]
+                        .into_iter()
+                        .map(alloc)
+                        .sum::<u64>();
+                    got += a.kv.as_ref().map_or(0, |(k, v)| alloc(k) + alloc(v));
+                    got += GdnWorkspace::bytes_for(&cfg.gdn.dims(1, t)).unwrap() as u64;
+                    let want = Acts::bytes(&cfg, p, t, shared).unwrap();
+                    assert_eq!(want, got, "{p:?} t={t} shared_kv={shared}");
+                }
+            }
+        }
     }
 }

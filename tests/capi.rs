@@ -16,17 +16,17 @@ use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_metal::{MTLBuffer, MTLDevice, MTLResourceOptions};
 use tessl::capi::{
-    tessl_abi_version, tessl_cross_entropy_rows, tessl_mtl_buffer_length, tessl_qwen35_adamw_free,
-    tessl_qwen35_adamw_init, tessl_qwen35_adamw_set_step_count, tessl_qwen35_adamw_step, tessl_qwen35_adamw_step_count,
-    tessl_qwen35_copy, tessl_qwen35_describe, tessl_qwen35_free, tessl_qwen35_grad_sq_norm, tessl_qwen35_hidden,
-    tessl_qwen35_load, tessl_qwen35_param_count, tessl_qwen35_param_info, tessl_qwen35_train_backward,
-    tessl_qwen35_train_discard, tessl_qwen35_train_forward, tessl_qwen35_train_step, tessl_runtime_free,
-    tessl_runtime_new, tessl_synchronize, TesslCeArgs, TesslParamInfo, TesslQwen35, TesslRuntime, TesslTensorRef,
-    TESSL_ABI_VERSION, TESSL_BF16, TESSL_ERR, TESSL_F16, TESSL_F32, TESSL_MAX_DIMS, TESSL_MOMENTS_BLOCK8,
-    TESSL_MOMENTS_F32, TESSL_OK, TESSL_OPERANDS_BF16, TESSL_OPERANDS_EXACT_F32, TESSL_READ_ADAMW_AUX,
-    TESSL_READ_ADAMW_M, TESSL_READ_ADAMW_V, TESSL_READ_GRADS, TESSL_READ_PARAMS, TESSL_SUPERVISE_CAUSAL,
-    TESSL_SUPERVISE_ROWS, TESSL_UPDATE_BF16_KAHAN, TESSL_UPDATE_F32, TESSL_WRITE_ADAMW_AUX, TESSL_WRITE_ADAMW_M,
-    TESSL_WRITE_ADAMW_V, TESSL_WRITE_PARAMS,
+    tessl_abi_version, tessl_cross_entropy_rows, tessl_gdn_train_backward, tessl_gdn_train_forward,
+    tessl_mtl_buffer_length, tessl_qwen35_adamw_free, tessl_qwen35_adamw_init, tessl_qwen35_adamw_set_step_count,
+    tessl_qwen35_adamw_step, tessl_qwen35_adamw_step_count, tessl_qwen35_copy, tessl_qwen35_describe,
+    tessl_qwen35_free, tessl_qwen35_grad_sq_norm, tessl_qwen35_hidden, tessl_qwen35_load, tessl_qwen35_param_count,
+    tessl_qwen35_param_info, tessl_qwen35_train_backward, tessl_qwen35_train_discard, tessl_qwen35_train_forward,
+    tessl_qwen35_train_step, tessl_runtime_free, tessl_runtime_new, tessl_synchronize, TesslCeArgs, TesslGdnArgs,
+    TesslParamInfo, TesslQwen35, TesslRuntime, TesslTensorRef, TESSL_ABI_VERSION, TESSL_BF16, TESSL_ERR, TESSL_F16,
+    TESSL_F32, TESSL_MAX_DIMS, TESSL_MOMENTS_BLOCK8, TESSL_MOMENTS_F32, TESSL_OK, TESSL_OPERANDS_BF16,
+    TESSL_OPERANDS_EXACT_F32, TESSL_READ_ADAMW_AUX, TESSL_READ_ADAMW_M, TESSL_READ_ADAMW_V, TESSL_READ_GRADS,
+    TESSL_READ_PARAMS, TESSL_SUPERVISE_CAUSAL, TESSL_SUPERVISE_ROWS, TESSL_UPDATE_BF16_KAHAN, TESSL_UPDATE_F32,
+    TESSL_WRITE_ADAMW_AUX, TESSL_WRITE_ADAMW_M, TESSL_WRITE_ADAMW_V, TESSL_WRITE_PARAMS,
 };
 use tessl::cross_entropy::{cross_entropy_rows, CeGrads, CeHidden, CeWorkspace, Reduction};
 use tessl::gemm::GemmOperands;
@@ -1641,4 +1641,304 @@ fn a_bf16_model_through_the_abi_is_the_rust_bf16_model() {
         );
     });
     assert_eq!(unsafe { tessl_qwen35_free(f32_model) }, TESSL_OK);
+}
+
+// --------------------------------------- validate before mutate or publish ---
+
+fn ce_args<'a>(
+    hb: &ProtocolObject<dyn MTLBuffer>,
+    wb: &ProtocolObject<dyn MTLBuffer>,
+    rows: &'a [u32],
+    targets: &'a [u32],
+    chunk: u32,
+) -> TesslCeArgs {
+    TesslCeArgs {
+        hidden: tref(hb, &[10, 64]),
+        col_off: 0,
+        weight: tref(wb, &[300, 64]),
+        rows: rows.as_ptr(),
+        targets: targets.as_ptr(),
+        n: rows.len() as u64,
+        reduction: 1,
+        operands: TESSL_OPERANDS_EXACT_F32,
+        chunk,
+        want_grads: 0,
+        scale: 1.0,
+        dh: NULL_REF,
+        dw: NULL_REF,
+    }
+}
+
+/// A refused cross-entropy call keeps the cached workspace and sizes nothing
+/// from the caller's `chunk`; a `chunk` past the vocabulary is one full-width
+/// chunk, not a `[rows, chunk]` allocation.
+#[test]
+fn a_refused_cross_entropy_call_keeps_the_cached_workspace() {
+    let handle = Handle::new();
+    with_gpu(|rt| {
+        let (hb, wb) = (shared(rt, &random_f32(640, 5)), shared(rt, &random_f32(64 * 300, 6)));
+        let (rows, targets, bad_targets) = ([1u32, 2], [3u32, 4], [3u32, 300]);
+        let call = |args: &TesslCeArgs| {
+            let mut loss = 0.0;
+            let mut err = [0 as c_char; ERR_LEN];
+            let s = unsafe {
+                tessl_cross_entropy_rows(handle.0, args, &mut loss, ptr::null_mut(), err.as_mut_ptr(), ERR_LEN)
+            };
+            (s, loss, msg(&err))
+        };
+        let builds = || unsafe { tessl::capi::test_workspace_builds(handle.0) }.0;
+
+        let good = ce_args(&hb, &wb, &rows, &targets, 64);
+        let (s, first, m) = call(&good);
+        assert_eq!(s, TESSL_OK, "{m}");
+        assert_eq!(builds(), 1);
+
+        // Refused: a target past the vocabulary, with a `chunk` that would ask
+        // for a [rows, u32::MAX] f32 logits buffer if it were honoured.
+        let (s, _, m) = call(&ce_args(&hb, &wb, &rows, &bad_targets, u32::MAX));
+        assert_eq!(s, TESSL_ERR);
+        assert!(m.contains("targets[1] = 300"), "{m}");
+        assert_eq!(builds(), 1, "a refused call must not build a workspace");
+        let (s, again, m) = call(&good);
+        assert_eq!(s, TESSL_OK, "{m}");
+        assert_eq!(builds(), 1, "the next good call reuses the cached workspace");
+        assert_eq!(again.to_bits(), first.to_bits());
+
+        // Accepted: the same call with valid targets and the huge chunk is one
+        // 300-wide chunk, the same answer to rounding.
+        let (s, wide, m) = call(&ce_args(&hb, &wb, &rows, &targets, u32::MAX));
+        assert_eq!(s, TESSL_OK, "{m}");
+        assert!((wide - first).abs() <= 1e-4 * first.abs().max(1.0), "{wide} vs {first}");
+    });
+}
+
+/// A copy with an unknown direction, or one whose state is missing, wraps no
+/// tensor.
+#[test]
+fn a_refused_copy_wraps_nothing() {
+    let handle = Handle::new();
+    let model = load_model(handle.0);
+    with_gpu(|rt| {
+        let buf = shared(rt, &[0.0]);
+        let n = unsafe { tessl_qwen35_param_count(model) } as usize;
+        let refs = vec![tref(&buf, &[1]); n];
+        let wraps = || unsafe { tessl::capi::test_external_wrap_total(model) };
+        let copy = |direction: u32| {
+            let mut err = [0 as c_char; ERR_LEN];
+            let s = unsafe { tessl_qwen35_copy(model, direction, refs.as_ptr(), n as u64, err.as_mut_ptr(), ERR_LEN) };
+            (s, msg(&err))
+        };
+        let before = wraps();
+        let (s, m) = copy(99);
+        assert_eq!(s, TESSL_ERR);
+        assert!(m.contains("direction 99"), "{m}");
+        let (s, m) = copy(TESSL_READ_ADAMW_M);
+        assert_eq!(s, TESSL_ERR);
+        assert!(m.contains("no AdamW state"), "{m}");
+        let (s, m) = copy(TESSL_READ_GRADS);
+        assert_eq!(s, TESSL_ERR);
+        assert!(m.contains("no gradients yet"), "{m}");
+        assert_eq!(wraps(), before, "a refused copy wrapped tensors");
+        // The check is not vacuous: a valid direction wraps all n.
+        let _ = copy(TESSL_READ_PARAMS);
+        assert_eq!(wraps(), before + n as u64);
+    });
+    assert_eq!(unsafe { tessl_qwen35_free(model) }, TESSL_OK);
+}
+
+/// A step refused for its arguments leaves the bank as it was: the previous
+/// step's gradients are still readable. (A step that starts and fails leaves
+/// none; see the function's doc.)
+#[test]
+fn a_refused_train_step_keeps_the_previous_gradients() {
+    let handle = Handle::new();
+    let model = load_model(handle.0);
+    let ids = fixture_ids();
+    let mut err = [0 as c_char; ERR_LEN];
+    let mut loss = 0.0f64;
+    let step = |operands: u32, loss: &mut f64, err: &mut [c_char; ERR_LEN]| unsafe {
+        tessl_qwen35_train_step(
+            model,
+            ids.as_ptr(),
+            ids.len() as u64,
+            operands,
+            loss,
+            err.as_mut_ptr(),
+            ERR_LEN,
+        )
+    };
+    assert_eq!(
+        step(TESSL_OPERANDS_EXACT_F32, &mut loss, &mut err),
+        TESSL_OK,
+        "{}",
+        msg(&err)
+    );
+    with_gpu(|rt| {
+        let n = unsafe { tessl_qwen35_param_count(model) } as usize;
+        let mut infos = Vec::new();
+        for i in 0..n {
+            let mut info: TesslParamInfo = unsafe { std::mem::zeroed() };
+            let mut e = [0 as c_char; ERR_LEN];
+            assert_eq!(
+                unsafe { tessl_qwen35_param_info(model, i as u64, &mut info, e.as_mut_ptr(), ERR_LEN) },
+                TESSL_OK
+            );
+            infos.push(info);
+        }
+        let bufs: Vec<_> = infos
+            .iter()
+            .map(|p| {
+                shared(
+                    rt,
+                    &vec![0.0; p.shape[..p.ndim as usize].iter().product::<u64>() as usize],
+                )
+            })
+            .collect();
+        let refs: Vec<_> = bufs
+            .iter()
+            .zip(&infos)
+            .map(|(b, p)| tref(b, &p.shape[..p.ndim as usize]))
+            .collect();
+        let read = |err: &mut [c_char; ERR_LEN]| unsafe {
+            tessl_qwen35_copy(
+                model,
+                TESSL_READ_GRADS,
+                refs.as_ptr(),
+                n as u64,
+                err.as_mut_ptr(),
+                ERR_LEN,
+            )
+        };
+        assert_eq!(read(&mut err), TESSL_OK, "{}", msg(&err));
+        assert_eq!(step(99, &mut loss, &mut err), TESSL_ERR);
+        assert!(msg(&err).contains("operands"), "{}", msg(&err));
+        assert_eq!(
+            read(&mut err),
+            TESSL_OK,
+            "a step refused for its operands code discarded the gradients: {}",
+            msg(&err)
+        );
+    });
+    assert_eq!(unsafe { tessl_qwen35_free(model) }, TESSL_OK);
+}
+
+/// Resets the load hook even when the test panics.
+struct PoisonAfterLoad;
+
+impl PoisonAfterLoad {
+    fn on() -> Self {
+        tessl::capi::test_poison_after_load(true);
+        Self
+    }
+}
+
+impl Drop for PoisonAfterLoad {
+    fn drop(&mut self) {
+        tessl::capi::test_poison_after_load(false);
+    }
+}
+
+/// A load whose closing synchronize fails (the runtime is poisoned after the
+/// model is built) writes no handle to `*out`.
+#[test]
+fn a_load_whose_final_sync_fails_publishes_no_handle() {
+    let handle = Handle::new();
+    let (st, cfg, prefix) = (
+        fixture("model.safetensors"),
+        fixture("config.json"),
+        std::ffi::CString::new("model.").unwrap(),
+    );
+    let mut out: *mut TesslQwen35 = ptr::null_mut();
+    let mut err = [0 as c_char; ERR_LEN];
+    let s = {
+        let _poison = PoisonAfterLoad::on();
+        unsafe {
+            tessl_qwen35_load(
+                handle.0,
+                st.as_ptr(),
+                cfg.as_ptr(),
+                prefix.as_ptr(),
+                TESSL_F32,
+                &mut out,
+                err.as_mut_ptr(),
+                ERR_LEN,
+            )
+        }
+    };
+    assert_eq!(s, TESSL_ERR, "{}", msg(&err));
+    assert!(out.is_null(), "*out is null whenever the status is not TESSL_OK");
+}
+
+/// A GDN backward refused for its tensors keeps the cached workspace.
+#[test]
+fn a_refused_gdn_backward_keeps_the_cached_workspace() {
+    use tessl::gdn_train::GdnTrainDims;
+    let handle = Handle::new();
+    with_gpu(|rt| {
+        let dims = GdnTrainDims {
+            batch: 1,
+            seq: 16,
+            heads: 2,
+            v_dim: 128,
+        };
+        let (b, t, h, dv) = (1usize, 16usize, 2usize, 128usize);
+        let buf = |n: usize, seed: u64| shared(rt, &random_f32(n, seed));
+        let (q, k) = (buf(b * t * h * 128, 1), buf(b * t * h * 128, 2));
+        let (v, g, beta) = (buf(b * t * h * dv, 3), buf(b * t * h, 4), buf(b * t * h, 5));
+        let ck = dims.checkpoint_shape();
+        let ckpt = buf(ck.iter().product(), 6);
+        let (o, d_o) = (buf(b * t * h * dv, 7), buf(b * t * h * dv, 8));
+        let (dq, dk, dvv) = (
+            buf(b * t * h * 128, 9),
+            buf(b * t * h * 128, 10),
+            buf(b * t * h * dv, 11),
+        );
+        let (dg, db) = (buf(b * t * h, 12), buf(b * t * h, 13));
+        let (bu, tu, hu, du) = (b as u64, t as u64, h as u64, dv as u64);
+        let ck64: Vec<u64> = ck.iter().map(|&d| d as u64).collect();
+        let args = TesslGdnArgs {
+            batch: 1,
+            seq: 16,
+            heads: 2,
+            v_dim: 128,
+            q: tref(&q, &[bu, tu, hu, 128]),
+            k: tref(&k, &[bu, tu, hu, 128]),
+            v: tref(&v, &[bu, tu, hu, du]),
+            g: tref(&g, &[bu, tu, hu]),
+            beta: tref(&beta, &[bu, tu, hu]),
+            s0: NULL_REF,
+            ckpt: tref(&ckpt, &ck64),
+            o: tref(&o, &[bu, tu, hu, du]),
+            s_fin: NULL_REF,
+            d_o: tref(&d_o, &[bu, tu, hu, du]),
+            d_fin: NULL_REF,
+            dq: tref(&dq, &[bu, tu, hu, 128]),
+            dk: tref(&dk, &[bu, tu, hu, 128]),
+            dv: tref(&dvv, &[bu, tu, hu, du]),
+            dg: tref(&dg, &[bu, tu, hu]),
+            dbeta: tref(&db, &[bu, tu, hu]),
+            ds0: NULL_REF,
+        };
+        let run = |f: unsafe extern "C" fn(*mut TesslRuntime, *const TesslGdnArgs, *mut c_char, usize) -> i32,
+                   a: &TesslGdnArgs| {
+            let mut err = [0 as c_char; ERR_LEN];
+            let s = unsafe { f(handle.0, a, err.as_mut_ptr(), ERR_LEN) };
+            (s, msg(&err))
+        };
+        let builds = || unsafe { tessl::capi::test_workspace_builds(handle.0) }.1;
+        let (s, m) = run(tessl_gdn_train_forward, &args);
+        assert_eq!(s, TESSL_OK, "{m}");
+        let (s, m) = run(tessl_gdn_train_backward, &args);
+        assert_eq!(s, TESSL_OK, "{m}");
+        assert_eq!(builds(), 1);
+
+        // Other dims over the same tensors: refused, and the cached workspace
+        // (for the dims above) is neither dropped nor replaced.
+        let (s, m) = run(tessl_gdn_train_backward, &TesslGdnArgs { seq: 32, ..args });
+        assert_eq!(s, TESSL_ERR, "{m}");
+        assert_eq!(builds(), 1, "a refused call must not build a workspace: {m}");
+        let (s, m) = run(tessl_gdn_train_backward, &args);
+        assert_eq!(s, TESSL_OK, "{m}");
+        assert_eq!(builds(), 1, "the next good call reuses the cached workspace");
+    });
 }

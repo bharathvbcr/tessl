@@ -370,29 +370,31 @@ struct Grads<'a, 'b> {
     dw: DwOut<'a, 'b>,
 }
 
-/// [`cross_entropy_rows`], with `dW` going wherever `grads.dw` says.
-#[allow(clippy::too_many_arguments)]
-fn ce_rows(
-    what: &'static str,
+/// What [`validate_ce_inputs`] read off the two tensors.
+pub(crate) struct CeShape {
+    pub vs: usize,
+    pub hs: usize,
+    pub ld: usize,
+}
+
+/// Everything about a call that does not depend on its workspace: rows, targets,
+/// the two tensors, the hidden window and the index ranges. The one validator
+/// [`cross_entropy_rows`] and the C ABI both run, so the ABI can refuse before
+/// it replaces a cached workspace.
+pub(crate) fn validate_ce_inputs(
+    what: &str,
     rt: &Arc<GpuRuntime>,
-    h: CeHidden<'_>,
+    h: &CeHidden<'_>,
     weight: &Tensor,
     rows: &[u32],
     targets: &[u32],
-    reduction: Reduction,
-    operands: GemmOperands,
-    ws: &CeWorkspace,
-    mut grads: Option<Grads<'_, '_>>,
-) -> Result<CeOutput, String> {
+) -> Result<CeShape, String> {
     let n = rows.len();
     if n == 0 {
         return Err(format!("{what}: no supervised rows (an empty selection has no mean)"));
     }
     if targets.len() != n {
         return Err(format!("{what}: {n} rows but {} targets", targets.len()));
-    }
-    if n > ws.max_rows as usize {
-        return Err(format!("{what}: {n} rows exceed the workspace's {}", ws.max_rows));
     }
     if rt.relaxed_precision() {
         return Err(format!("{what}: needs exact-f32 GEMMs; switch relaxed precision off"));
@@ -415,18 +417,6 @@ fn ce_rows(
     if vs == 0 {
         return Err(format!("{what}: empty vocabulary"));
     }
-    if hs != ws.hidden as usize || weight.dtype != ws.weight_dtype {
-        return Err(format!(
-            "{what}: workspace is for hidden {} / {:?} weights, not {hs} / {:?}",
-            ws.hidden, ws.weight_dtype, weight.dtype
-        ));
-    }
-    if operands != ws.operands {
-        return Err(format!(
-            "{what}: workspace is for {:?} operands, not {operands:?}",
-            ws.operands
-        ));
-    }
     if vs > u32::MAX as usize || t_rows > u32::MAX as usize || ld > u32::MAX as usize {
         return Err(format!("{what}: vocabulary, rows and ld must fit u32"));
     }
@@ -439,6 +429,62 @@ fn ce_rows(
     if let Some((i, &t)) = targets.iter().enumerate().find(|(_, &t)| t as usize >= vs) {
         return Err(format!("{what}: targets[{i}] = {t} is past the vocabulary {vs}"));
     }
+    Ok(CeShape { vs, hs, ld })
+}
+
+/// A gradient output must be a valid f32 tensor of shape `want` on `rt`.
+pub(crate) fn check_grad_tensor(
+    what: &str,
+    rt: &Arc<GpuRuntime>,
+    name: &str,
+    t: &Tensor,
+    want: [usize; 2],
+) -> Result<(), String> {
+    t.validate().map_err(|e| format!("{what}: {name}: {e}"))?;
+    if !Arc::ptr_eq(t.runtime(), rt) {
+        return Err(format!("{what}: {name} belongs to another runtime"));
+    }
+    if t.dtype != DType::F32 || t.shape() != want {
+        return Err(format!(
+            "{what}: {name} must be f32 {want:?}, got {:?} {:?}",
+            t.dtype,
+            t.shape()
+        ));
+    }
+    Ok(())
+}
+
+/// [`cross_entropy_rows`], with `dW` going wherever `grads.dw` says.
+#[allow(clippy::too_many_arguments)]
+fn ce_rows(
+    what: &'static str,
+    rt: &Arc<GpuRuntime>,
+    h: CeHidden<'_>,
+    weight: &Tensor,
+    rows: &[u32],
+    targets: &[u32],
+    reduction: Reduction,
+    operands: GemmOperands,
+    ws: &CeWorkspace,
+    mut grads: Option<Grads<'_, '_>>,
+) -> Result<CeOutput, String> {
+    let n = rows.len();
+    if n > ws.max_rows as usize {
+        return Err(format!("{what}: {n} rows exceed the workspace's {}", ws.max_rows));
+    }
+    let CeShape { vs, hs, ld } = validate_ce_inputs(what, rt, &h, weight, rows, targets)?;
+    if hs != ws.hidden as usize || weight.dtype != ws.weight_dtype {
+        return Err(format!(
+            "{what}: workspace is for hidden {} / {:?} weights, not {hs} / {:?}",
+            ws.hidden, ws.weight_dtype, weight.dtype
+        ));
+    }
+    if operands != ws.operands {
+        return Err(format!(
+            "{what}: workspace is for {:?} operands, not {operands:?}",
+            ws.operands
+        ));
+    }
     if let Some(g) = &grads {
         if !g.scale.is_finite() {
             return Err(format!("{what}: scale must be finite"));
@@ -449,17 +495,7 @@ fn ce_rows(
             DwOut::Chunks { scratch, .. } => ("dw scratch", *scratch, [ws.chunk as usize, hs]),
         };
         for (name, t, want) in [("dh", g.dh, [n, hs]), (dw_name, dw, dw_want)] {
-            t.validate().map_err(|e| format!("{what}: {name}: {e}"))?;
-            if !Arc::ptr_eq(t.runtime(), rt) {
-                return Err(format!("{what}: {name} belongs to another runtime"));
-            }
-            if t.dtype != DType::F32 || t.shape() != want {
-                return Err(format!(
-                    "{what}: {name} must be f32 {want:?}, got {:?} {:?}",
-                    t.dtype,
-                    t.shape()
-                ));
-            }
+            check_grad_tensor(what, rt, name, t, want)?;
         }
         if g.dh.overlaps(dw) {
             return Err(format!("{what}: dh and {dw_name} overlap"));

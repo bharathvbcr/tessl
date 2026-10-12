@@ -29,6 +29,7 @@
 
 use std::ffi::{c_char, c_void};
 use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread::ThreadId;
 
@@ -36,9 +37,12 @@ use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_metal::MTLBuffer;
 
-use crate::cross_entropy::{cross_entropy_rows, CeGrads, CeHidden, CeWorkspace, Reduction};
+use crate::cross_entropy::{
+    check_grad_tensor, cross_entropy_rows, validate_ce_inputs, CeGrads, CeHidden, CeWorkspace, Reduction,
+};
 use crate::gdn_train::{
-    gdn_train_backward, gdn_train_forward, GdnTrainDims, GdnTrainGrads, GdnTrainInputs, GdnTrainWorkspace,
+    gdn_train_backward, gdn_train_forward, validate_gdn_backward, GdnTrainDims, GdnTrainGrads, GdnTrainInputs,
+    GdnTrainWorkspace,
 };
 use crate::gemm::GemmOperands;
 use crate::qwen35_adamw::{
@@ -192,6 +196,9 @@ pub struct TesslRuntime {
     ce_ws_key: (u32, u32, DType, GemmOperands),
     /// The last GDN backward workspace, reused for the same shape.
     gdn_ws: Option<GdnTrainWorkspace>,
+    /// Workspaces built, for [`test_workspace_builds`].
+    ce_builds: u64,
+    gdn_builds: u64,
 }
 
 /// The ABI version this library implements ([`TESSL_ABI_VERSION`]).
@@ -215,6 +222,8 @@ pub unsafe extern "C" fn tessl_runtime_new(err: *mut c_char, err_len: usize) -> 
             ce_ws: None,
             ce_ws_key: (0, 0, DType::F32, GemmOperands::ExactF32),
             gdn_ws: None,
+            ce_builds: 0,
+            gdn_builds: 0,
         })),
         Ok(Err(e)) => {
             // SAFETY: forwarded from this function's contract.
@@ -324,8 +333,8 @@ unsafe fn ce(h: &mut TesslRuntime, a: &TesslCeArgs) -> Result<crate::cross_entro
     // SAFETY: n readable u32s each, by the contract.
     let (rows, targets) = unsafe {
         (
-            std::slice::from_raw_parts(a.rows, n),
-            std::slice::from_raw_parts(a.targets, n),
+            checked_slice(a.rows, n, WHAT, "rows")?,
+            checked_slice(a.targets, n, WHAT, "targets")?,
         )
     };
     let reduction = match a.reduction {
@@ -342,7 +351,38 @@ unsafe fn ce(h: &mut TesslRuntime, a: &TesslCeArgs) -> Result<crate::cross_entro
         return Err(format!("{WHAT}: weight must be 2-D, got {:?}", weight.shape()));
     }
     let hs = u32::try_from(weight.shape()[1]).map_err(|_| format!("{WHAT}: hidden exceeds u32"))?;
-    let chunk = if a.chunk == 0 { DEFAULT_CE_CHUNK } else { a.chunk };
+    // Everything that does not need the workspace is checked before the cached
+    // one is replaced: a refused call keeps it, and allocates nothing.
+    let shape = validate_ce_inputs(
+        WHAT,
+        &rt,
+        &CeHidden {
+            rows: &hidden,
+            off: a.col_off,
+        },
+        &weight,
+        rows,
+        targets,
+    )?;
+    let (dh, dw);
+    let grads = if a.want_grads != 0 {
+        // SAFETY: as above.
+        dh = unsafe { wrap(&rt, &a.dh, "dh") }?;
+        dw = unsafe { wrap(&rt, &a.dw, "dw") }?;
+        check_grad_tensor(WHAT, &rt, "dh", &dh, [n, shape.hs])?;
+        check_grad_tensor(WHAT, &rt, "dw", &dw, [shape.vs, shape.hs])?;
+        Some(CeGrads {
+            dh: &dh,
+            dw: &dw,
+            scale: a.scale,
+        })
+    } else {
+        None
+    };
+    // A chunk wider than the vocabulary is one full-width chunk: clamp it, so
+    // a caller's `chunk` cannot size the `[rows, chunk]` logits buffer.
+    let vs32 = u32::try_from(shape.vs).map_err(|_| format!("{WHAT}: vocabulary exceeds u32"))?;
+    let chunk = if a.chunk == 0 { DEFAULT_CE_CHUNK } else { a.chunk }.min(vs32);
     let key = (hs, chunk, weight.dtype, operands);
     let fits = h.ce_ws.as_ref().is_some_and(|ws| ws.max_rows() >= n32) && h.ce_ws_key == key;
     if !fits {
@@ -352,21 +392,9 @@ unsafe fn ce(h: &mut TesslRuntime, a: &TesslCeArgs) -> Result<crate::cross_entro
         h.ce_ws = None;
         h.ce_ws = Some(CeWorkspace::new(&rt, max_rows, hs, chunk, weight.dtype, operands)?);
         h.ce_ws_key = key;
+        h.ce_builds += 1;
     }
     let ws = h.ce_ws.as_ref().ok_or_else(|| format!("{WHAT}: workspace missing"))?;
-    let (dh, dw);
-    let grads = if a.want_grads != 0 {
-        // SAFETY: as above.
-        dh = unsafe { wrap(&rt, &a.dh, "dh") }?;
-        dw = unsafe { wrap(&rt, &a.dw, "dw") }?;
-        Some(CeGrads {
-            dh: &dh,
-            dw: &dw,
-            scale: a.scale,
-        })
-    } else {
-        None
-    };
     cross_entropy_rows(
         &rt,
         CeHidden {
@@ -381,6 +409,56 @@ unsafe fn ce(h: &mut TesslRuntime, a: &TesslCeArgs) -> Result<crate::cross_entro
         ws,
         grads,
     )
+}
+
+/// The largest byte length a Rust slice may have.
+const MAX_SLICE_BYTES: usize = isize::MAX as usize;
+
+/// Check a caller's `(ptr, n)` before `slice::from_raw_parts`: a slice longer
+/// than `isize::MAX` bytes, a null pointer with elements, or a misaligned
+/// pointer is undefined behaviour (an uncatchable abort in debug builds), so
+/// each is refused as an error instead.
+fn check_extent<T>(p: *const T, n: usize, what: &str, name: &str) -> Result<(), String> {
+    match n.checked_mul(std::mem::size_of::<T>()) {
+        Some(bytes) if bytes <= MAX_SLICE_BYTES => {}
+        _ => return Err(format!("{what}: {name}: {n} elements exceed the largest slice")),
+    }
+    if n != 0 {
+        if p.is_null() {
+            return Err(format!("{what}: null {name} for {n} elements"));
+        }
+        if (p as usize) & (std::mem::align_of::<T>() - 1) != 0 {
+            return Err(format!("{what}: {name} is not aligned"));
+        }
+    }
+    Ok(())
+}
+
+/// The one way this module turns a caller's `(ptr, n)` into a slice.
+///
+/// # Safety
+/// When `n` is non-zero and the checks pass, `p` points to `n` readable `T`s
+/// that nothing writes for `'a`.
+unsafe fn checked_slice<'a, T>(p: *const T, n: usize, what: &str, name: &str) -> Result<&'a [T], String> {
+    check_extent(p, n, what, name)?;
+    if n == 0 {
+        return Ok(&[]);
+    }
+    // SAFETY: extent, null and alignment checked above; validity by the contract.
+    Ok(unsafe { std::slice::from_raw_parts(p, n) })
+}
+
+/// [`checked_slice`] for a writable buffer.
+///
+/// # Safety
+/// As [`checked_slice`], with `p` writable and unaliased for `'a`.
+unsafe fn checked_slice_mut<'a, T>(p: *mut T, n: usize, what: &str, name: &str) -> Result<&'a mut [T], String> {
+    check_extent(p.cast_const(), n, what, name)?;
+    if n == 0 {
+        return Ok(&mut []);
+    }
+    // SAFETY: as above.
+    Ok(unsafe { std::slice::from_raw_parts_mut(p, n) })
 }
 
 /// # Safety
@@ -676,28 +754,24 @@ pub unsafe extern "C" fn tessl_gdn_train_backward(
             );
             let (dg, dbeta) = (wrap(&rt, &a.dg, "dg")?, wrap(&rt, &a.dbeta, "dbeta")?);
             let ds0 = wrap_opt(&rt, &a.ds0, "ds0")?;
+            let grads = GdnTrainGrads {
+                dq: &dq,
+                dk: &dk,
+                dv: &dv,
+                dg: &dg,
+                dbeta: &dbeta,
+                ds0: ds0.as_ref(),
+            };
+            // Checked before the cached workspace is replaced: a refused call
+            // keeps it and allocates nothing.
+            validate_gdn_backward(&rt, x.dims, &x.inputs(), &x.ckpt, &d_o, d_fin.as_ref(), &grads)?;
             if h.gdn_ws.as_ref().map(GdnTrainWorkspace::dims) != Some(x.dims) {
                 h.gdn_ws = None;
                 h.gdn_ws = Some(GdnTrainWorkspace::new(&rt, x.dims)?);
+                h.gdn_builds += 1;
             }
             let ws = h.gdn_ws.as_ref().ok_or("tessl_gdn_train_backward: workspace missing")?;
-            gdn_train_backward(
-                &rt,
-                x.dims,
-                x.inputs(),
-                &x.ckpt,
-                &d_o,
-                d_fin.as_ref(),
-                ws,
-                GdnTrainGrads {
-                    dq: &dq,
-                    dk: &dk,
-                    dv: &dv,
-                    dg: &dg,
-                    dbeta: &dbeta,
-                    ds0: ds0.as_ref(),
-                },
-            )
+            gdn_train_backward(&rt, x.dims, x.inputs(), &x.ckpt, &d_o, d_fin.as_ref(), ws, grads)
         })
     }
 }
@@ -838,6 +912,10 @@ unsafe fn c_str<'a>(s: *const c_char, what: &str) -> Result<&'a str, String> {
 /// (`"model.language_model."` in the Qwen3.5 checkpoints). Free the handle
 /// with [`tessl_qwen35_free`], on this thread.
 ///
+/// `*out` is null whenever the status is not [`TESSL_OK`]: the handle is
+/// written only after the call's final synchronize succeeds, and a model built
+/// by a call that then fails is freed here, not leaked into `*out`.
+///
 /// # Safety
 /// As [`tessl_cross_entropy_rows`] for `runtime`, `err` and `err_len`; the
 /// three strings are NUL-terminated (null is refused); `out` is writable.
@@ -854,12 +932,15 @@ pub unsafe extern "C" fn tessl_qwen35_load(
 ) -> i32 {
     // SAFETY: forwarded from this function's contract.
     unsafe {
-        guarded(runtime, err, err_len, |h| {
+        if !out.is_null() {
+            *out = std::ptr::null_mut();
+        }
+        let mut built: Option<Box<TesslQwen35>> = None;
+        let status = guarded(runtime, err, err_len, |h| {
             const WHAT: &str = "tessl_qwen35_load";
             if out.is_null() {
                 return Err(format!("{WHAT}: null out"));
             }
-            *out = std::ptr::null_mut();
             let path = c_str(safetensors, "safetensors path").map_err(|e| format!("{WHAT}: {e}"))?;
             let config = c_str(config_json, "config path").map_err(|e| format!("{WHAT}: {e}"))?;
             let prefix = c_str(prefix, "prefix").map_err(|e| format!("{WHAT}: {e}"))?;
@@ -879,7 +960,7 @@ pub unsafe extern "C" fn tessl_qwen35_load(
             {
                 return Err(format!("{WHAT}: {} does not fit a TesslParamInfo", p.name));
             }
-            *out = Box::into_raw(Box::new(TesslQwen35 {
+            built = Some(Box::new(TesslQwen35 {
                 model,
                 table,
                 grads: None,
@@ -888,9 +969,53 @@ pub unsafe extern "C" fn tessl_qwen35_load(
                 adamw: None,
                 owner: h.owner,
             }));
+            if POISON_AFTER_LOAD.load(Ordering::Relaxed) {
+                h.rt.poison_as_shared_event_timeout_for_test();
+            }
             Ok(())
-        })
+        });
+        match (status, built) {
+            (TESSL_OK, Some(model)) => *out = Box::into_raw(model),
+            // A failed sync or a panic: the model never reaches the caller.
+            // Dropping waits on the GPU, which must not unwind into C.
+            (_, model) => {
+                let _ = catch_unwind(AssertUnwindSafe(move || drop(model)));
+            }
+        }
+        status
     }
+}
+
+/// Test hook: poison the runtime at the end of the next
+/// [`tessl_qwen35_load`] closures, after the model is built and before the
+/// call's final synchronize, so a test can fail that synchronize.
+static POISON_AFTER_LOAD: AtomicBool = AtomicBool::new(false);
+
+#[doc(hidden)]
+pub fn test_poison_after_load(on: bool) {
+    POISON_AFTER_LOAD.store(on, Ordering::Relaxed);
+}
+
+/// Test hook: how many cross-entropy and GDN backward workspaces `runtime`
+/// has built, so a test can tell a reused cache from a rebuilt one.
+///
+/// # Safety
+/// `runtime` is a live handle from [`tessl_runtime_new`].
+#[doc(hidden)]
+pub unsafe fn test_workspace_builds(runtime: *const TesslRuntime) -> (u64, u64) {
+    // SAFETY: live by the contract.
+    let h = unsafe { &*runtime };
+    (h.ce_builds, h.gdn_builds)
+}
+
+/// Test hook: [`GpuRuntime::external_wrap_total`] of the model's runtime.
+///
+/// # Safety
+/// `model` is a live handle from [`tessl_qwen35_load`].
+#[doc(hidden)]
+pub unsafe fn test_external_wrap_total(model: *const TesslQwen35) -> u64 {
+    // SAFETY: live by the contract.
+    unsafe { &*model }.model.rt.external_wrap_total()
 }
 
 /// Free a handle from [`tessl_qwen35_load`], as [`tessl_runtime_free`] frees
@@ -976,9 +1101,10 @@ pub unsafe extern "C" fn tessl_qwen35_param_info(
 /// One training step on the `n` token ids at `ids` (one sequence), its GEMMs
 /// on `operands` ([`TESSL_OPERANDS_EXACT_F32`] or [`TESSL_OPERANDS_BF16`]):
 /// writes the loss to `*loss` and every parameter's gradient into the
-/// handle's bank for [`tessl_qwen35_copy`], over the previous step's (a
-/// refused or failed step leaves none). Refused while a step is pending,
-/// which leaves the bank as it was.
+/// handle's bank for [`tessl_qwen35_copy`], over the previous step's. A
+/// refused call (null or oversized arguments, a bad `operands`, a pending
+/// step) leaves the bank as it was; a step that starts and then fails leaves
+/// none.
 ///
 /// # Safety
 /// As [`tessl_qwen35_param_count`]; `ids` points to `n` readable `u32`s and
@@ -1001,13 +1127,13 @@ pub unsafe extern "C" fn tessl_qwen35_train_step(
                 return Err(format!("{WHAT}: null ids or loss"));
             }
             let n = usize::try_from(n).map_err(|_| format!("{WHAT}: n overflows usize"))?;
-            let ids = std::slice::from_raw_parts(ids, n);
-            // A pending step's bank is left alone; any other refusal leaves
-            // no gradients.
+            let ids = checked_slice(ids, n, WHAT, "ids")?;
+            // A refused argument or a pending step leaves the bank as it was;
+            // only a step that starts and fails leaves none.
+            let operands = parse_operands(operands, WHAT)?;
             h.no_pending(WHAT)?;
             h.bank()?;
             h.bank = BankState::Dirty;
-            let operands = parse_operands(operands, WHAT)?;
             let bank = h.grads.as_ref().ok_or("no gradient bank")?;
             *loss = h.model.train_step_into(ids, operands, Supervise::Causal, bank, false)?;
             h.bank = BankState::Ready;
@@ -1058,13 +1184,13 @@ pub unsafe extern "C" fn tessl_qwen35_train_forward(
             }
             let n = usize::try_from(n).map_err(|_| format!("{WHAT}: n overflows usize"))?;
             let n_rows = usize::try_from(n_rows).map_err(|_| format!("{WHAT}: n_rows overflows usize"))?;
-            let ids = std::slice::from_raw_parts(ids, n);
+            let ids = checked_slice(ids, n, WHAT, "ids")?;
             let operands = parse_operands(operands, WHAT)?;
             let rows = |p: *const u32, name: &str| -> Result<&[u32], String> {
                 match (p.is_null(), n_rows) {
                     (true, 0) => Ok(&[]),
                     (true, _) => Err(format!("{WHAT}: null {name} for {n_rows} rows")),
-                    (false, k) => Ok(std::slice::from_raw_parts(p, k)),
+                    (false, k) => checked_slice(p, k, WHAT, name),
                 }
             };
             let sup = match supervise {
@@ -1122,7 +1248,7 @@ pub unsafe extern "C" fn tessl_qwen35_hidden(
             let positions = if n == 0 {
                 &[][..]
             } else {
-                std::slice::from_raw_parts(positions, n)
+                checked_slice(positions, n, WHAT, "positions")?
             };
             let p = h
                 .pending
@@ -1164,7 +1290,7 @@ pub unsafe extern "C" fn tessl_qwen35_train_backward(
             let rt = Arc::clone(&h.model.rt);
             let dh = match (dh.is_null(), positions.is_null(), n) {
                 (true, true, 0) => None,
-                (false, false, k) => Some((std::slice::from_raw_parts(positions, k), wrap(&rt, &*dh, "dh")?)),
+                (false, false, k) => Some((checked_slice(positions, k, WHAT, "positions")?, wrap(&rt, &*dh, "dh")?)),
                 (false, true, 0) => Some((&[][..], wrap(&rt, &*dh, "dh")?)),
                 _ => {
                     return Err(format!(
@@ -1212,6 +1338,14 @@ pub unsafe extern "C" fn tessl_qwen35_train_discard(model: *mut TesslQwen35, err
     }
 }
 
+fn bad_copy_direction(what: &str, d: u32) -> String {
+    format!(
+        "{what}: direction {d} is not 0 (read params), 1 (read grads), 2 (write params), \
+         3 or 4 (read AdamW m or v), 5 or 6 (write AdamW m or v) or 7 or 8 (read or write \
+         the AdamW auxiliary state)"
+    )
+}
+
 /// Copy between the model and `n` caller tensors, one per parameter-table
 /// entry in order, each dense f32 of the entry's shape (transposed when the
 /// entry says so): [`TESSL_READ_PARAMS`] and [`TESSL_READ_GRADS`] (the last
@@ -1244,7 +1378,20 @@ pub unsafe extern "C" fn tessl_qwen35_copy(
             if tensors.is_null() {
                 return Err(format!("{WHAT}: null tensors"));
             }
-            let refs = std::slice::from_raw_parts(tensors, n);
+            let refs = checked_slice(tensors, n, WHAT, "tensors")?;
+            // The direction and the state it needs, before any tensor is wrapped.
+            match direction {
+                TESSL_READ_PARAMS => {}
+                TESSL_READ_GRADS => {
+                    ready_grads(WHAT, &h.grads, h.bank, &h.pending)?;
+                }
+                TESSL_WRITE_PARAMS => h.no_pending(WHAT)?,
+                TESSL_READ_ADAMW_M..=TESSL_WRITE_ADAMW_AUX if h.adamw.is_none() => {
+                    return Err(format!("{WHAT}: no AdamW state; call tessl_qwen35_adamw_init first"));
+                }
+                TESSL_READ_ADAMW_M..=TESSL_WRITE_ADAMW_AUX => {}
+                d => return Err(bad_copy_direction(WHAT, d)),
+            }
             let rt = Arc::clone(&h.model.rt);
             let ts = refs
                 .iter()
@@ -1290,11 +1437,7 @@ pub unsafe extern "C" fn tessl_qwen35_copy(
                         h.model.write_adamw_aux(state, &ts)
                     }
                 }
-                d => Err(format!(
-                    "{WHAT}: direction {d} is not 0 (read params), 1 (read grads), 2 (write params), \
-                     3 or 4 (read AdamW m or v), 5 or 6 (write AdamW m or v) or 7 or 8 (read or write \
-                     the AdamW auxiliary state)"
-                )),
+                d => Err(bad_copy_direction(WHAT, d)),
             }
         })
     }
@@ -1368,7 +1511,7 @@ pub unsafe extern "C" fn tessl_qwen35_describe(
             if (len as u128) < n as u128 {
                 return Err(format!("{WHAT}: the line needs {n} bytes, out has {len}"));
             }
-            let dst = std::slice::from_raw_parts_mut(out.cast::<u8>(), n);
+            let dst = checked_slice_mut(out.cast::<u8>(), n, WHAT, "out")?;
             dst[..n - 1].copy_from_slice(line.as_bytes());
             dst[n - 1] = 0;
             Ok(())
@@ -1426,7 +1569,7 @@ pub unsafe extern "C" fn tessl_qwen35_adamw_step(
             if weight_decay.is_null() {
                 return Err(format!("{WHAT}: null weight_decay"));
             }
-            let wd = std::slice::from_raw_parts(weight_decay, n);
+            let wd = checked_slice(weight_decay, n, WHAT, "weight_decay")?;
             let grads = ready_grads(WHAT, &h.grads, h.bank, &h.pending)?;
             let state = h
                 .adamw

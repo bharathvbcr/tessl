@@ -317,19 +317,18 @@ pub struct GdnTrainGrads<'a> {
     pub ds0: Option<&'a Tensor>,
 }
 
-/// The backward of [`gdn_train_forward`], from `d_o` (and `d_fin`, the final
-/// state's gradient, when the forward's final state was used), given the
-/// same inputs and the checkpoints it saved.
+/// Everything [`gdn_train_backward`] checks that does not need its workspace:
+/// dims, input and gradient shapes, and that no output overlaps an input. The
+/// C ABI runs it before it replaces a cached workspace.
 #[allow(clippy::too_many_arguments)]
-pub fn gdn_train_backward(
+pub(crate) fn validate_gdn_backward(
     rt: &Arc<GpuRuntime>,
     dims: GdnTrainDims,
-    x: GdnTrainInputs<'_>,
+    x: &GdnTrainInputs<'_>,
     ckpt: &Tensor,
     d_o: &Tensor,
     d_fin: Option<&Tensor>,
-    ws: &GdnTrainWorkspace,
-    grads: GdnTrainGrads<'_>,
+    grads: &GdnTrainGrads<'_>,
 ) -> Result<(), String> {
     const WHAT: &str = "gdn_train_backward";
     dims.validate(WHAT)?;
@@ -341,9 +340,6 @@ pub fn gdn_train_backward(
         dims.v_dim as usize,
         GDN_TRAIN_DK as usize,
     );
-    if ws.dims != dims {
-        return Err(format!("{WHAT}: the workspace is for {:?}, not {dims:?}", ws.dims));
-    }
     want(ckpt, &dims.checkpoint_shape(), "ckpt", WHAT, rt)?;
     want(d_o, &[b, t, h, dv], "d_o", WHAT, rt)?;
     if let Some(df) = d_fin {
@@ -377,6 +373,39 @@ pub fn gdn_train_backward(
         ins.push(("d_fin", df));
     }
     disjoint(WHAT, &outs, &ins)?;
+    Ok(())
+}
+
+/// The backward of [`gdn_train_forward`], from `d_o` (and `d_fin`, the final
+/// state's gradient, when the forward's final state was used), given the
+/// same inputs and the checkpoints it saved.
+#[allow(clippy::too_many_arguments)]
+pub fn gdn_train_backward(
+    rt: &Arc<GpuRuntime>,
+    dims: GdnTrainDims,
+    x: GdnTrainInputs<'_>,
+    ckpt: &Tensor,
+    d_o: &Tensor,
+    d_fin: Option<&Tensor>,
+    ws: &GdnTrainWorkspace,
+    grads: GdnTrainGrads<'_>,
+) -> Result<(), String> {
+    const WHAT: &str = "gdn_train_backward";
+    validate_gdn_backward(rt, dims, &x, ckpt, d_o, d_fin, &grads)?;
+    let (b, h) = (dims.batch as usize, dims.heads as usize);
+    if ws.dims != dims {
+        return Err(format!("{WHAT}: the workspace is for {:?}, not {dims:?}", ws.dims));
+    }
+    let mut outs = vec![
+        ("dq", grads.dq),
+        ("dk", grads.dk),
+        ("dv", grads.dv),
+        ("dg", grads.dg),
+        ("dbeta", grads.dbeta),
+    ];
+    if let Some(ds0) = grads.ds0 {
+        outs.push(("ds0", ds0));
+    }
     for (name, o) in &outs {
         for (wname, w) in [
             ("scratch", &ws.scratch),

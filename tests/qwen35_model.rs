@@ -637,6 +637,78 @@ fn a_prefill_over_the_working_set_is_refused_before_it_runs() {
     });
 }
 
+/// The bytes a refusal names ("needs N B on top of the H B allocated").
+fn refused_need(msg: &str) -> u64 {
+    let head = &msg[..msg
+        .find(" B on top of")
+        .unwrap_or_else(|| panic!("not a working-set refusal: {msg}"))];
+    let digits: String = head
+        .chars()
+        .rev()
+        .take_while(char::is_ascii_digit)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
+    digits.parse().unwrap_or_else(|_| panic!("no byte count in {msg}"))
+}
+
+/// The pre-flight counts what the prefill allocates, not only what the
+/// session keeps: its activations for every token (with the GDN workspace),
+/// the decode activations and the logits. A limit that admits a one-token
+/// prompt with the same K/V capacity refuses a 4096-token prompt before any
+/// GPU work; `forward` and `begin` are refused on their activations alone.
+#[test]
+fn a_prefill_counts_its_own_activations_against_the_working_set() {
+    let st = SafeTensors::open(&fixture().join("model.safetensors")).unwrap();
+    with_gpu(|rt| {
+        let model = Qwen35Model::load(rt, &st, "model.", tiny_config(), Precision::F32).unwrap();
+        let (long, max_new) = (4096usize, 4u32);
+        let ids = seq(long);
+        let refuse = |limit_over: u64, f: &dyn Fn() -> Result<(), String>| {
+            rt.set_recommended_working_set_for_test(rt.current_allocated_bytes() + limit_over);
+            let _ = rt.take_dispatch_count();
+            f()
+        };
+        // What a session of the same K/V capacity needs at one token, from
+        // the refusal's own figure.
+        let small = refuse(0, &|| model.prefill(&ids[..1], max_new + long as u32 - 1).map(|_| ()))
+            .expect_err("a zero limit admitted a prefill");
+        let kept = refused_need(&small);
+        let margin = 1 << 20;
+        let m = refuse(kept + margin, &|| model.prefill(&ids, max_new).map(|_| ()))
+            .expect_err("a prefill whose activations do not fit was accepted");
+        assert!(m.contains("working set") && m.contains("Qwen35Model::prefill"), "{m}");
+        assert!(
+            refused_need(&m) > kept + margin,
+            "the activations of 4096 tokens were not counted: {m}"
+        );
+        assert_eq!(rt.take_dispatch_count(), 0, "the refused prefill encoded work");
+        // The same limit still admits the small session: the figure is not inflated.
+        refuse(kept + margin, &|| {
+            model.prefill(&ids[..1], max_new + long as u32 - 1).map(|_| ())
+        })
+        .expect("a prefill that fits was refused");
+
+        for (what, run) in [
+            (
+                "forward",
+                &(|| model.forward(&ids, false).map(|_| ())) as &dyn Fn() -> Result<(), String>,
+            ),
+            ("begin", &|| model.begin(&ids).map(|_| ())),
+        ] {
+            let m = refuse(margin, run).expect_err("an oversized forward was accepted");
+            assert!(
+                m.contains("working set") && m.contains(&format!("Qwen35Model::{what}")),
+                "{m}"
+            );
+            assert_eq!(rt.take_dispatch_count(), 0, "the refused {what} encoded work");
+        }
+        rt.set_recommended_working_set_for_test(u64::MAX / 2);
+        model.forward(&ids[..8], false).expect("a forward that fits still runs");
+    });
+}
+
 // ---------------------------------------------------------------- stress ---
 
 /// A tiny deterministic generator (splitmix64) for the randomized shapes.

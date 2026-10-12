@@ -3151,9 +3151,10 @@ pub fn score_answer_rows(
 // --------------------------------------------------------------- embedding ---
 
 /// The embedding gather on the device: `out[r, :] = table[ids[r], :]`, bf16
-/// widened exactly to f32. `table` is the `[vocab, hidden]` vocabulary matrix
+/// or f32 (each its own kernel, `qwen35_embed_rows_bf16` / `_f32`) widened
+/// exactly to f32; only those two tables are compiled. `table` is the `[vocab, hidden]` vocabulary matrix
 /// (Qwen3.5 ties it to the LM head, so it is the [`LmHead`] that
-/// [`score_answer_rows`] reads); only [`DType::BF16`] is compiled. `ids` is
+/// [`score_answer_rows`] reads). `ids` is
 /// `n` u32 token ids on the device and `out` is dense `[n, hidden]` f32, the
 /// residual stream's first value, so the whole forward stays in one command
 /// buffer with no host gather.

@@ -900,7 +900,7 @@ impl Qwen35Model {
                 "{WHAT}: a model stored in bf16 trains on GemmOperands::Bf16 (its weights are the bf16 operands)"
             ));
         }
-        if rt.relaxed_precision() {
+        if rt.f32_gemm_runs_relaxed() {
             return Err(format!(
                 "{WHAT}: the step needs exact-f32 GEMMs; switch the runtime's relaxed precision off"
             ));

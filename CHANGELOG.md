@@ -668,6 +668,18 @@ All notable changes to `tessl` are recorded here. The format follows
 
 ### Fixed
 
+- **`GemmOperands` lane contract and dispatch limits.** `ExactF32.nn` refuses
+  bf16 and f16 operands, as `tn` and `nt` do, instead of running the narrow
+  cooperative kernel. Every "needs exact f32" refusal (`GemmOperands::ExactF32`,
+  `cross_entropy_rows`, BERT, EmbedGemma2, the Qwen3.5 F32 forward and training
+  step) asks one predicate, `GpuRuntime::f32_gemm_runs_relaxed`, rather than the
+  raw `relaxed_precision` flag, which is ignored under `PrecisionMode::Bf16`:
+  `ExactF32.nt` and the rest now run there with the flag on. `dispatch_tg_1d`
+  and `dispatch_2d_tg` return an error naming the kernel, the request and
+  `maxTotalThreadsPerThreadgroup` for an oversize threadgroup, before encoding.
+  `flash_attn_global_h512_with_scalars` binds `out_bf16` (slot 12) itself after
+  the callback, as the D=256 wrapper does its slot.
+
 - **C ABI: validate before mutate, allocate or publish.** Every slice built
   from a caller's `n` goes through one checked helper that refuses a byte
   length past `isize::MAX`, a null pointer with elements and a misaligned

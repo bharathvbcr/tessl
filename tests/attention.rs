@@ -2009,3 +2009,65 @@ fn decode_binds_the_callers_scratch_every_token_and_refuses_a_bad_one() {
         assert_eq!(rt.take_dispatch_count(), 0, "a refused call encoded something");
     });
 }
+
+/// `flash_attn_global_h512_with_scalars` owns kernel slot 12 (`out_bf16`): a
+/// callback that binds 0 while `out_bf16 = true` must not make the kernel
+/// write f32 into the bf16-sized `o`: the output must equal the one a correct
+/// callback gives.
+#[test]
+fn global_h512_with_scalars_pins_out_bf16_after_the_callback() {
+    with_gpu(|rt| {
+        let (tq, h, d) = (5usize, 2usize, 512usize);
+        let n = tq * h * d;
+        let q = random_f32(n, 0xF6);
+        let k = random_f32(tq * d, 0xF7);
+        let v = random_f32(tq * d, 0xF8);
+        let (qb, kb, vb) = (buf(rt, &q), buf(rt, &k), buf(rt, &v));
+        let tkv = u32_buf(rt, tq as u32);
+        let zero = u32_buf(rt, 0);
+        let dims = AttnDims {
+            batch: 1,
+            tq: tq as u32,
+            heads: h as u32,
+            heads_kv: 1,
+            window: 4096,
+            scale: 0.125,
+        };
+
+        let reference = rt.alloc_buffer(n * 2).unwrap();
+        reference.zero();
+        nn::flash_attn_global_h512(rt, &qb, &kb, &vb, &reference, &tkv, &zero, &zero, dims, true).unwrap();
+
+        let o = rt.alloc_buffer(n * 2).unwrap();
+        o.zero();
+        // SAFETY: the callback binds only documented scalar slots (and slot
+        // 12 to the wrong value, which the wrapper overrides).
+        unsafe {
+            nn::flash_attn_global_h512_with_scalars(
+                rt,
+                &qb,
+                &kb,
+                &vb,
+                &o,
+                &tkv,
+                &zero,
+                &zero,
+                dims,
+                true,
+                |bnd, kv_capacity| {
+                    bnd.bind_u32(dims.batch, 4);
+                    bnd.bind_u32(dims.tq, 5);
+                    bnd.bind_u32(dims.heads, 7);
+                    bnd.bind_u32(dims.heads_kv, 8);
+                    bnd.bind_f32(dims.scale, 9);
+                    bnd.bind_u32(0, 12);
+                    bnd.bind_u32(kv_capacity, 13);
+                },
+            )
+            .unwrap();
+        }
+        rt.synchronize().unwrap();
+
+        assert_eq!(o.read_u32()[..n / 2], reference.read_u32()[..n / 2], "bf16 output differs");
+    });
+}

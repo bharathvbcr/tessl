@@ -178,6 +178,16 @@ impl PipelineCache {
         self.plain.values().chain(self.icb.values())
     }
 
+    /// The kernel name `pipeline` was built from, found by object identity.
+    fn name_of(&self, pipeline: &ProtocolObject<dyn MTLComputePipelineState>) -> Option<&str> {
+        let want = pipeline as *const ProtocolObject<dyn MTLComputePipelineState>;
+        self.plain
+            .iter()
+            .chain(self.icb.iter())
+            .find(|(_, p)| std::ptr::eq(&***p, want))
+            .map(|(name, _)| name.as_str())
+    }
+
     fn get_or_create(
         &mut self,
         device: &ProtocolObject<dyn MTLDevice>,
@@ -1578,6 +1588,13 @@ impl GpuRuntime {
         let overlays = self.overlay_libraries.lock().map_err(|e| e.to_string())?;
         let mut cache = self.pipelines.lock().map_err(|e| e.to_string())?;
         cache.get_or_create(&self.device, &self.library, &overlays, name, icb)
+    }
+
+    /// The kernel name `pipeline` was built from, for an error message
+    /// (`None` for a pipeline this runtime did not build, or a poisoned cache).
+    pub(crate) fn pipeline_name(&self, pipeline: &ProtocolObject<dyn MTLComputePipelineState>) -> Option<String> {
+        let cache = self.pipelines.lock().ok()?;
+        cache.name_of(pipeline).map(str::to_owned)
     }
 
     /// Snapshot of overlay metallibs (for ICB pipeline construction).

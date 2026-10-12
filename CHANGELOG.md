@@ -44,6 +44,23 @@ All notable changes to `tessl` are recorded here. The format follows
   prefill, the staged prefill and decode all run. Prefill of `N` tokens
   plus decoded steps matches `forward(N + k)`'s last row within 1e-5
   relative at F32 (`tests/qwen35_model.rs`).
+- **Staged prefill: `begin`, `Staged`, `advance_to`, `final_norm_f32`,
+  `load_tower`.** `Qwen35Model::begin(ids)` starts a prefill that runs only
+  as many layers as asked: `Staged::advance_to(layer)` continues it,
+  `final_norm_f32` reads the final norm of the residual stream at the layer
+  reached (an early exit; the un-normed residual stays on the device, and
+  `forward(ids, true)`'s trace is the way to read it), and `layers_done()`
+  says where it is. Advancing in steps is `forward`'s own dispatches in the
+  same order, bit for bit at F32. `Qwen35Model::load_tower` loads without
+  the packed bf16 head: a bf16 tower has no head (`forward`, `prefill` and
+  `Staged::logits` refuse it, and `describe()` says so), an f32 tower uses
+  the embedding as its head and runs them, and any tower runs
+  `Staged::score_answers`. A `Staged` whose `advance_to` failed part way is
+  poisoned the way a `Decode` is (every later entry point refuses before
+  encoding), and an F32 `Staged` re-checks the runtime's relaxed precision on
+  every entry, not only at `begin`. `begin` and `prefill` errors carry
+  their own names. `Qwen35Model::fail_layer_after_for_test` (doc-hidden)
+  fails one layer after N, for tests of both poison paths.
 - **Chosen logit rows and answer scores.** `Qwen35Model::forward_rows` and
   `Staged::logits` take `LogitRows::{All, Last, Rows}` and run the LM head for
   those positions only, with no `[tokens, vocab]` buffer unless every row is

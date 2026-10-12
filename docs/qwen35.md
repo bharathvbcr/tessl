@@ -655,6 +655,30 @@ wires `score_answer_rows` into the model: the answer tokens' logits at
 chosen positions and their log-softmax over the answers, with no logits row
 at all, on a model with or without the packed head.
 
+`Staged` has the same part-way rule as `Decode`: `advance_to` marks the
+session broken before its first layer and clears it after the last, so a
+layer that fails leaves a session that refuses `advance_to`,
+`final_norm_f32`, `logits` and `score_answers` ("an earlier advance failed
+part way") rather than a residual past `layers_done()` that a retry would run
+layers on again. Every entry point also re-checks, before encoding, that an
+F32 model is not running relaxed GEMMs (`gemm::use_relaxed_f32`, the one
+predicate; the runtime's switch can be thrown after `begin`). A bf16
+`load_tower` model has no head (`describe()` says "none"); an f32 tower's head
+is the embedding, so it runs `forward` and `Staged::logits` (compared with the
+full model's bit for bit in `tests/qwen35_staged.rs`), and every tower runs
+`score_answers`, which counts an answer listed twice twice in its softmax.
+`Qwen35Model::fail_layer_after_for_test` (doc-hidden) makes one layer fail
+after N, which is how `staged_part_way_failure_poisons_the_session` and
+`decode_step_failing_part_way_poisons_the_session` reach the failure.
+
+Decision, the raw residual: `Staged` does not expose the un-normed residual
+(transformers' `hidden_states[l]`). `final_norm_f32` is the only device read,
+and `forward(ids, true)` already returns every layer's un-normed residual
+(one host read per layer), which is what a parity check needs. An early-exit
+consumer wants the normed state, and a second read path would be one more
+buffer contract (f32 `[tokens, hidden]` aliasing live state) to keep honest.
+Revisit if a caller needs the raw residual without tracing every layer.
+
 ## Training memory: where torch's backward spends it
 
 `tools/qwen35_ref/saved_memory.py` attributes every tensor autograd saves

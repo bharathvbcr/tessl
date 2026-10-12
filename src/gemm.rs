@@ -367,7 +367,11 @@ fn use_bf16_gemm(rt: &GpuRuntime, backend: GemmBackend) -> bool {
     rt.precision() == PrecisionMode::Bf16 && backend == GemmBackend::TensorOps && rt.has_tensorops()
 }
 
-fn use_relaxed_f32(rt: &GpuRuntime, backend: GemmBackend) -> bool {
+/// Whether an f32 [`gemm`] on `backend` runs the relaxed (tf32-class) kernel
+/// right now: the one predicate for "the exact-f32 forward is not exact".
+/// A session that must stay exact re-checks it on every entry, since the
+/// runtime's relaxed switch can be thrown after the session began.
+pub(crate) fn use_relaxed_f32(rt: &GpuRuntime, backend: GemmBackend) -> bool {
     rt.relaxed_precision()
         && rt.precision() == PrecisionMode::F32
         && backend == GemmBackend::TensorOps

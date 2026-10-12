@@ -793,6 +793,29 @@ fn stress_relaxed_precision_mid_session_is_refused_not_fatal() {
     });
 }
 
+/// A step that fails after the first layer leaves the position where it was
+/// and poisons the session for good: the next step is refused before any work.
+#[test]
+fn decode_step_failing_part_way_poisons_the_session() {
+    let st = SafeTensors::open(&fixture().join("model.safetensors")).unwrap();
+    with_gpu(|rt| {
+        let model = Qwen35Model::load(rt, &st, "model.", tiny_config(), Precision::F32).unwrap();
+        let ids = seq(10);
+        let (mut dec, _) = model.prefill(&ids[..7], 3).unwrap();
+        dec.step(ids[7]).unwrap();
+        let at = dec.position();
+        model.fail_layer_after_for_test(1);
+        let e = dec.step(ids[8]).unwrap_err();
+        assert!(e.contains("injected fault"), "{e}");
+        assert_eq!(dec.position(), at, "a failed step does not advance");
+        let _ = rt.take_dispatch_count();
+        let e = dec.step(ids[8]).unwrap_err();
+        assert!(e.contains("earlier step failed"), "{e}");
+        assert_eq!(rt.take_dispatch_count(), 0, "the refused step encoded work");
+        assert_eq!(dec.position(), at);
+    });
+}
+
 /// Hostile but valid row and answer selections: the last token id, one row
 /// asked for a thousand times, the largest answer set, and one past it.
 #[test]

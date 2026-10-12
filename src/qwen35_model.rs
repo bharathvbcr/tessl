@@ -72,11 +72,11 @@
 //! ([`crate::qwen35::score_answer_rows`]), on a model with or without the
 //! packed head.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use crate::cross_entropy::gather_rows_f32;
-use crate::gemm::{gemm, gemm_nt_f32, GemmBackend};
+use crate::gemm::{gemm, gemm_nt_f32, use_relaxed_f32, GemmBackend};
 use crate::json::{self, Json, Syntax};
 use crate::loader::Loader;
 use crate::nn::{AttnDims, DecodeScratch};
@@ -452,6 +452,9 @@ pub struct Qwen35Model {
     /// records it at the forward, and the backward, which rebuilds each layer
     /// from the weights it finds, refuses a step whose weights have moved.
     param_generation: AtomicU64,
+    /// Test hook ([`Self::fail_layer_after_for_test`]): layers still to run
+    /// before one fails; `usize::MAX` is off.
+    layer_fault: AtomicUsize,
 }
 
 impl Qwen35Model {
@@ -464,6 +467,29 @@ impl Qwen35Model {
     /// a write that fails part way still invalidates a pending step.
     pub(crate) fn bump_param_generation(&self) {
         self.param_generation.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Make the layer that runs after `n` more successful ones fail, once,
+    /// with an error: how a test reaches the failure after the embed and
+    /// after earlier layers' encodes that [`Staged::advance_to`] and
+    /// [`Decode::step`] must survive as poisoned. Tests only.
+    #[doc(hidden)]
+    pub fn fail_layer_after_for_test(&self, n: usize) {
+        self.layer_fault.store(n, Ordering::Relaxed);
+    }
+
+    fn take_layer_fault(&self) -> Result<(), String> {
+        match self.layer_fault.load(Ordering::Relaxed) {
+            usize::MAX => Ok(()),
+            0 => {
+                self.layer_fault.store(usize::MAX, Ordering::Relaxed);
+                Err("layer: injected fault (fail_layer_after_for_test)".into())
+            }
+            n => {
+                self.layer_fault.store(n - 1, Ordering::Relaxed);
+                Ok(())
+            }
+        }
     }
 }
 
@@ -513,7 +539,11 @@ impl Qwen35Model {
     /// [`Self::load`] without the LM head: for a model that is read through
     /// [`Self::begin`] (hidden states, never logits). At bf16 this skips the
     /// `[hidden, vocab]` packed head copy of the embedding (1.27 GB at the
-    /// 4B's shapes); [`Self::forward`] on such a model is refused.
+    /// 4B's shapes), and the model then has no head: [`Self::forward`],
+    /// [`Self::prefill`] and [`Staged::logits`] refuse it. At f32 the
+    /// embedding is the head (the tied one), so an f32 tower runs all of
+    /// them. [`Staged::score_answers`] reads the embedding's rows directly and
+    /// runs on any tower.
     pub fn load_tower(
         rt: &Arc<GpuRuntime>,
         st: &SafeTensors,
@@ -641,6 +671,7 @@ impl Qwen35Model {
             final_norm,
             layers,
             param_generation: AtomicU64::new(0),
+            layer_fault: AtomicUsize::new(usize::MAX),
         })
     }
 
@@ -736,6 +767,7 @@ impl Qwen35Model {
             final_norm,
             layers,
             param_generation: AtomicU64::new(0),
+            layer_fault: AtomicUsize::new(usize::MAX),
         })
     }
 
@@ -768,8 +800,10 @@ impl Qwen35Model {
             c.layers.len() - attn,
             if self.lm_head_bf16.is_some() {
                 "packed bf16 copy"
-            } else {
+            } else if self.precision == Precision::F32 {
                 "tied to the embedding"
+            } else {
+                "none (load_tower; only begin / Staged::score_answers read it)"
             }
         )
     }
@@ -788,7 +822,7 @@ impl Qwen35Model {
     pub fn forward_rows(&self, ids: &[u32], rows: LogitRows<'_>, trace: bool) -> Result<ForwardOutput, String> {
         self.require_head("Qwen35Model::forward")?;
         check_rows("Qwen35Model::forward_rows", rows, ids.len())?;
-        let mut s = self.begin_impl(ids, trace, None)?;
+        let mut s = self.begin_impl("Qwen35Model::forward", ids, trace, None)?;
         s.advance_to(self.layers.len())?;
         let logits = s.logits(rows)?;
         let mut out_trace = s.trace.take().unwrap_or_default();
@@ -815,7 +849,7 @@ impl Qwen35Model {
     /// [`Self::load_tower`] model and at sequence lengths whose `[tokens,
     /// vocab]` logits would not fit.
     pub fn begin(&self, ids: &[u32]) -> Result<Staged<'_>, String> {
-        self.begin_impl(ids, false, None)
+        self.begin_impl("Qwen35Model::begin", ids, false, None)
     }
 
     /// Prefill `ids` (one sequence, positions from 0) for decoding up to
@@ -861,7 +895,7 @@ impl Qwen35Model {
         let a = Acts::new(rt, cfg, self.precision, 1, false)?;
         let logits_t = rt.alloc_tensor_f32(&[1, cfg.vocab as usize])?;
         let scratch = DecodeScratch::new(rt, 1, q_heads, positions as usize, head_dim)?;
-        let mut s = self.begin_impl(ids, false, Some(carry))?;
+        let mut s = self.begin_impl(WHAT, ids, false, Some(carry))?;
         s.advance_to(self.layers.len())?;
         let logits = s.logits(LogitRows::Last)?;
         let carry = s
@@ -883,11 +917,17 @@ impl Qwen35Model {
         Ok((decode, logits))
     }
 
-    fn begin_impl(&self, ids: &[u32], trace: bool, carry: Option<Vec<Carry>>) -> Result<Staged<'_>, String> {
+    fn begin_impl(
+        &self,
+        what: &str,
+        ids: &[u32],
+        trace: bool,
+        carry: Option<Vec<Carry>>,
+    ) -> Result<Staged<'_>, String> {
         // Read before any weight is: a write that lands during the prefill
         // then stops it too.
         let param_generation = self.param_generation();
-        let t = self.check_ids("Qwen35Model::forward", ids)?;
+        let t = self.check_ids(what, ids)?;
         let a = Acts::new(&self.rt, &self.cfg, self.precision, t, carry.is_none())?;
         self.embed_ids(ids, &a.resid)?;
         Ok(Staged {
@@ -897,6 +937,7 @@ impl Qwen35Model {
             trace: trace.then(Vec::new),
             carry,
             param_generation,
+            broken: false,
         })
     }
 
@@ -924,9 +965,7 @@ impl Qwen35Model {
             return Err(format!("{what}: token id {bad} >= vocab {}", self.cfg.vocab));
         }
         if self.precision == Precision::F32 && self.rt.relaxed_precision() {
-            return Err(format!(
-                "{what}: the F32 forward needs exact-f32 GEMMs; switch the runtime's relaxed precision off"
-            ));
+            return Err(relaxed_refusal(what));
         }
         u32::try_from(ids.len()).map_err(|_| format!("{what}: too many tokens"))
     }
@@ -1023,6 +1062,7 @@ impl Qwen35Model {
     /// inference path (the prefill, the staged prefill and decode). `step`
     /// picks the mixer's kernels and where its state starts and goes.
     fn layer(&self, l: &Layer, a: &Acts, step: Step<'_>) -> Result<(), String> {
+        self.take_layer_fault()?;
         self.norm(&a.resid, &l.input_norm, &a.x)?;
         match &l.mixer {
             Mixer::Gdn(w) => self.gdn(w, a, step)?,
@@ -1376,6 +1416,9 @@ pub struct Staged<'m> {
     carry: Option<Vec<Carry>>,
     /// The model's parameter generation when the prefill began.
     param_generation: u64,
+    /// An advance failed part way, so the residual is past `next`: the
+    /// session refuses to continue (the same latch as [`Decode`]'s).
+    broken: bool,
 }
 
 impl Staged<'_> {
@@ -1390,11 +1433,30 @@ impl Staged<'_> {
         self.next
     }
 
+    /// What every entry point checks before encoding: the session is not
+    /// poisoned, the weights are the ones it began with, and an F32 model
+    /// is not now running relaxed GEMMs (the switch can be thrown after
+    /// `begin`).
+    fn check_usable(&self, what: &str) -> Result<(), String> {
+        let m = self.model;
+        if self.broken {
+            return Err(format!(
+                "{what}: an earlier advance failed part way, so the residual stream is past \
+                 layers_done(); begin again"
+            ));
+        }
+        m.check_generation(what, self.param_generation)?;
+        if m.precision == Precision::F32 && use_relaxed_f32(&m.rt, BACKEND) {
+            return Err(relaxed_refusal(what));
+        }
+        Ok(())
+    }
+
     /// Run layers `layers_done()..layer`. `layer` may equal `layers_done()`
     /// (nothing to run) but not go back, or past the model's layer count.
     pub fn advance_to(&mut self, layer: usize) -> Result<(), String> {
         let m = self.model;
-        m.check_generation("Staged::advance_to", self.param_generation)?;
+        self.check_usable("Staged::advance_to")?;
         if layer < self.next || layer > m.layers.len() {
             return Err(format!(
                 "Staged::advance_to({layer}): already at layer {}, the model has {}",
@@ -1402,6 +1464,11 @@ impl Staged<'_> {
                 m.layers.len()
             ));
         }
+        if layer == self.next {
+            return Ok(());
+        }
+        // From the first layer on, a failure leaves the residual advanced.
+        self.broken = true;
         let a = &self.a;
         for (i, l) in m.layers.iter().enumerate().take(layer).skip(self.next) {
             let step = match &self.carry {
@@ -1415,6 +1482,7 @@ impl Staged<'_> {
             }
         }
         self.next = layer;
+        self.broken = false;
         Ok(())
     }
 
@@ -1424,7 +1492,7 @@ impl Staged<'_> {
     /// Encoded, not waited for: read `out` after a synchronize.
     pub fn final_norm_f32(&self, out: &Tensor) -> Result<(), String> {
         let (m, t) = (self.model, self.a.t);
-        m.check_generation("Staged::final_norm_f32", self.param_generation)?;
+        self.check_usable("Staged::final_norm_f32")?;
         if out.dtype != DType::F32 || out.shape() != [t as usize, m.cfg.hidden as usize] {
             return Err(format!(
                 "Staged::final_norm_f32: out must be f32 [{t}, {}], got {:?} {:?}",
@@ -1449,12 +1517,13 @@ impl Staged<'_> {
     /// reached, for the positions `rows` chooses: `[rows, vocab]` f32 (after
     /// every layer, the model's logits). Only the chosen rows are normed,
     /// multiplied and read back. Waits for the GPU. Refused on a bf16
-    /// [`Qwen35Model::load_tower`] model, which has no head.
+    /// [`Qwen35Model::load_tower`] model, which has no head (an f32 tower
+    /// has one: the embedding).
     pub fn logits(&self, rows: LogitRows<'_>) -> Result<Vec<f32>, String> {
         const WHAT: &str = "Staged::logits";
         let (m, a, t) = (self.model, &self.a, self.a.t);
         m.require_head(WHAT)?;
-        m.check_generation(WHAT, self.param_generation)?;
+        self.check_usable(WHAT)?;
         let last = [t - 1];
         // None: every row, in order, through the stream's own buffers.
         let pick: Option<&[u32]> = match rows {
@@ -1489,13 +1558,15 @@ impl Staged<'_> {
     /// in f32 (a bf16 embedding is read as stored; the activations are not
     /// rounded to bf16 as [`Self::logits`]' bf16 GEMM rounds them). No
     /// logits row is formed, so it runs on a [`Qwen35Model::load_tower`]
-    /// model too. `answers` holds 1..=[`qwen35::MAX_ANSWERS`] token ids.
+    /// model too. `answers` holds 1..=[`qwen35::MAX_ANSWERS`] token ids; a
+    /// token listed twice is scored twice and counts twice in the
+    /// log-softmax over the answers (legal, and not deduplicated).
     /// Waits for the GPU.
     pub fn score_answers(&self, rows: &[u32], answers: &[u32]) -> Result<AnswerScores, String> {
         const WHAT: &str = "Staged::score_answers";
         let (m, t) = (self.model, self.a.t);
         let (rt, cfg) = (&m.rt, &m.cfg);
-        m.check_generation(WHAT, self.param_generation)?;
+        self.check_usable(WHAT)?;
         if let Some(&bad) = rows.iter().find(|&&r| r >= t) {
             return Err(format!("{WHAT}: position {bad} >= {t} tokens"));
         }
@@ -1621,6 +1692,10 @@ impl Decode<'_> {
         self.broken = false;
         Ok(self.logits.buffer.try_contents_f32()?[..m.cfg.vocab as usize].to_vec())
     }
+}
+
+fn relaxed_refusal(what: &str) -> String {
+    format!("{what}: the F32 forward needs exact-f32 GEMMs; switch the runtime's relaxed precision off")
 }
 
 /// Refuse a [`LogitRows::Rows`] position past a sequence of `t` tokens.

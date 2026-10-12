@@ -5,8 +5,8 @@
 //! every layer (an early exit) against the same norm of `forward`'s traced
 //! residual on the host, at both precisions; at the last layer, **bit for
 //! bit** against `forward`'s own final-norm output (F32); and advancing in
-//! one step against advancing a layer at a time, bit for bit. `load_tower` must refuse `forward` (it has no head) and
-//! still run every staged step. Runs on the tiny two-layer checkpoint in
+//! one step against advancing a layer at a time, bit for bit. A bf16 `load_tower` model has no head, so it refuses `forward`; an f32 one
+//! has the embedding as its head and runs it; both run every staged step. Runs on the tiny two-layer checkpoint in
 //! `tests/fixtures/qwen35_train/` (one GDN layer, one attention layer).
 
 mod common;
@@ -108,9 +108,18 @@ fn staged_refusals() {
         );
         // F32 keeps the embedding as its head, so a tower still runs forward.
         let f32_tower = Qwen35Model::load_tower(rt, &st, "model.", cfg.clone(), Precision::F32).unwrap();
-        assert!(f32_tower.forward(&ids(4), false).is_ok());
+        let want = Qwen35Model::load(rt, &st, "model.", cfg.clone(), Precision::F32)
+            .unwrap()
+            .forward(&ids(4), false)
+            .unwrap()
+            .logits;
+        let got = f32_tower.forward(&ids(4), false).unwrap().logits;
+        assert_eq!(bits(&got), bits(&want), "an f32 tower's forward is the full model's");
 
-        assert!(tower.begin(&[]).is_err(), "no tokens");
+        let e = tower.begin(&[]).map(|_| ()).unwrap_err();
+        assert!(e.starts_with("Qwen35Model::begin"), "begin labels its own errors: {e}");
+        let e = tower.prefill(&[], 1).map(|_| ()).unwrap_err();
+        assert!(e.starts_with("Qwen35Model::prefill"), "{e}");
         assert!(tower.begin(&[cfg.vocab]).is_err(), "id past vocab");
         let mut s = tower.begin(&ids(4)).unwrap();
         s.advance_to(n).unwrap();
@@ -142,4 +151,74 @@ fn host_norm(x: &[f32], w: &[f32], t: usize, h: usize, eps: f32) -> Vec<f64> {
         );
     }
     out
+}
+
+/// A layer failing after the first leaves the residual advanced with
+/// `layers_done()` stale: the session is poisoned, and every entry point
+/// refuses before encoding anything.
+#[test]
+fn staged_part_way_failure_poisons_the_session() {
+    let cfg = Qwen35Config::from_config_file(&fixture().join("config.json")).unwrap();
+    let st = SafeTensors::open(&fixture().join("model.safetensors")).unwrap();
+    let (n, h) = (cfg.layers.len(), cfg.hidden as usize);
+    with_gpu(|rt| {
+        let model = Qwen35Model::load(rt, &st, "model.", cfg.clone(), Precision::F32).unwrap();
+        let t = 4;
+        let mut s = model.begin(&ids(t)).unwrap();
+        // Layer 0 runs, layer 1 fails.
+        model.fail_layer_after_for_test(1);
+        let e = s.advance_to(n).unwrap_err();
+        assert!(e.contains("injected fault"), "{e}");
+        assert_eq!(s.layers_done(), 0, "progress is only recorded on success");
+        let out = rt.alloc_tensor_f32(&[t, h]).unwrap();
+        let _ = rt.take_dispatch_count();
+        for (what, e) in [
+            ("advance_to", s.advance_to(n).unwrap_err()),
+            ("advance_to(0)", s.advance_to(0).unwrap_err()),
+            ("final_norm_f32", s.final_norm_f32(&out).unwrap_err()),
+            ("logits", s.logits(tessl::qwen35_model::LogitRows::Last).unwrap_err()),
+            ("score_answers", s.score_answers(&[0], &[1, 2]).map(|_| ()).unwrap_err()),
+        ] {
+            assert!(e.contains("earlier advance failed"), "{what}: {e}");
+        }
+        assert_eq!(rt.take_dispatch_count(), 0, "a refused call encoded work");
+        // A fresh session is unaffected (the fault was one-shot).
+        let mut s2 = model.begin(&ids(t)).unwrap();
+        s2.advance_to(n).unwrap();
+        assert_eq!(s2.layers_done(), n);
+    });
+}
+
+/// The F32 forward is exact-f32 GEMMs only; the relaxed switch thrown after
+/// `begin` is refused by every entry point before anything is encoded, and
+/// the session continues once it is off again.
+#[test]
+fn staged_f32_refuses_relaxed_precision_thrown_mid_session() {
+    let cfg = Qwen35Config::from_config_file(&fixture().join("config.json")).unwrap();
+    let st = SafeTensors::open(&fixture().join("model.safetensors")).unwrap();
+    let (n, h) = (cfg.layers.len(), cfg.hidden as usize);
+    with_gpu(|rt| {
+        let model = Qwen35Model::load(rt, &st, "model.", cfg.clone(), Precision::F32).unwrap();
+        let t = 4;
+        let mut s = model.begin(&ids(t)).unwrap();
+        s.advance_to(1).unwrap();
+        let out = rt.alloc_tensor_f32(&[t, h]).unwrap();
+        rt.set_relaxed_precision(true);
+        let _ = rt.take_dispatch_count();
+        let errs = [
+            s.advance_to(n).unwrap_err(),
+            s.final_norm_f32(&out).unwrap_err(),
+            s.logits(tessl::qwen35_model::LogitRows::Last).unwrap_err(),
+            s.score_answers(&[0], &[1]).map(|_| ()).unwrap_err(),
+        ];
+        let dispatched = rt.take_dispatch_count();
+        rt.set_relaxed_precision(false);
+        for e in &errs {
+            assert!(e.contains("relaxed precision"), "{e}");
+        }
+        assert_eq!(dispatched, 0, "a refused call encoded work");
+        assert_eq!(s.layers_done(), 1, "a refusal is not a poison");
+        s.advance_to(n).unwrap();
+        s.final_norm_f32(&out).unwrap();
+    });
 }

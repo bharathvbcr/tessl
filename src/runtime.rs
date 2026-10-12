@@ -3329,7 +3329,11 @@ mod lifetime_event_tests {
         assert!(rt.set_event_wait_ms(u64::MAX).is_err());
         let before = rt.event_wait_ms();
         assert!(rt.set_event_wait_ms(0).is_err());
-        assert_eq!(rt.event_wait_ms(), before, "a refused budget must not change the setting");
+        assert_eq!(
+            rt.event_wait_ms(),
+            before,
+            "a refused budget must not change the setting"
+        );
         rt.set_event_wait_ms(1).unwrap();
         assert_eq!(rt.event_wait_ms(), 1);
     }
@@ -3345,7 +3349,10 @@ mod lifetime_event_tests {
         assert!(error.contains("lifetime event is at"), "unnamed error: {error}");
         assert!(rt.is_poisoned());
         let refused = rt.alloc_tensor_f32(&[4]).map(|_| ()).unwrap_err();
-        assert!(refused.contains("lifetime event is at"), "the refusal lost the cause: {refused}");
+        assert!(
+            refused.contains("lifetime event is at"),
+            "the refusal lost the cause: {refused}"
+        );
     }
 
     #[test]

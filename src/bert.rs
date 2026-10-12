@@ -747,7 +747,10 @@ impl BertSparseModel {
     /// missing one is an error, and so is one the checkpoint carries that
     /// this model never reads (`Loader::refuse_unread`).
     pub fn load(rt: &Arc<GpuRuntime>, st: &SafeTensors, cfg: BertConfig) -> Result<Self, String> {
-        let ld = Weights { ld: Loader::new(rt, st, ""), rt };
+        let ld = Weights {
+            ld: Loader::new(rt, st, ""),
+            rt,
+        };
         let n = names(cfg.family);
         let (h, inter, vocab) = (cfg.hidden, cfg.intermediate, cfg.vocab);
         let e = |rest: &str| format!("{}{rest}", n.embed);

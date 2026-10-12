@@ -491,6 +491,15 @@ fn load_model_as(rt: *mut TesslRuntime, precision: u32) -> *mut TesslQwen35 {
     out
 }
 
+/// The model's parameter count through [`tessl_qwen35_param_count`].
+fn param_count(model: *mut TesslQwen35) -> usize {
+    let mut n = 0u64;
+    let mut err = [0 as c_char; ERR_LEN];
+    let s = unsafe { tessl_qwen35_param_count(model, &mut n, err.as_mut_ptr(), ERR_LEN) };
+    assert_eq!(s, TESSL_OK, "{}", msg(&err));
+    n as usize
+}
+
 /// The whole model surface through the ABI against the Rust API on the tiny
 /// training fixture: the table, the step's loss, the gradients and the
 /// parameters bit for bit, and a write through the ABI moving the model.
@@ -1720,7 +1729,7 @@ fn a_refused_copy_wraps_nothing() {
     let model = load_model(handle.0);
     with_gpu(|rt| {
         let buf = shared(rt, &[0.0]);
-        let n = unsafe { tessl_qwen35_param_count(model) } as usize;
+        let n = param_count(model);
         let refs = vec![tref(&buf, &[1]); n];
         let wraps = || unsafe { tessl::capi::test_external_wrap_total(model) };
         let copy = |direction: u32| {
@@ -1774,7 +1783,7 @@ fn a_refused_train_step_keeps_the_previous_gradients() {
         msg(&err)
     );
     with_gpu(|rt| {
-        let n = unsafe { tessl_qwen35_param_count(model) } as usize;
+        let n = param_count(model);
         let mut infos = Vec::new();
         for i in 0..n {
             let mut info: TesslParamInfo = unsafe { std::mem::zeroed() };

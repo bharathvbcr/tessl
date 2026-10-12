@@ -529,12 +529,31 @@ impl Tensor {
     /// # Cross-crate SharedEvent handoff
     ///
     /// Tessl and sparsl use different Metal queues (Metal 4 vs Metal 3). Do not
-    /// merge queues. When both crates touch the same `MTLBuffer`, synchronize
-    /// with the SharedEvent pattern:
+    /// merge queues. When both crates touch the same `MTLBuffer`, hand it off
+    /// explicitly in each direction. [`GpuRuntime::shared_event`] is the
+    /// handoff event: tessl signals it after its own work, and it is **not**
+    /// the event tessl frees memory on, so signaling it moves no lifetime
+    /// decision.
+    ///
+    /// tessl to foreign:
     /// 1. After tessl commits, read `(runtime.shared_event(), runtime.last_signaled_value())`.
-    /// 2. Before sparsl reads that buffer, call sparsl's `wait_shared_event`.
-    /// 3. After sparsl completes, `signal_shared_event` (or rely on its own
-    ///    completion timeline) so tessl can wait before reuse.
+    /// 2. Before sparsl reads that buffer, call sparsl's `wait_shared_event`
+    ///    with that pair. Reaching a value at or below `last_signaled_value()`
+    ///    means tessl's work through that commit has completed.
+    ///
+    /// foreign to tessl: tessl never waits on a value it did not submit, and
+    /// does not wait on the handoff event at all.
+    /// 1. Finish sparsl's work on the buffer, and wait for it on the host (for
+    ///    example `waitUntilSignaledValue` on sparsl's own event) before tessl
+    ///    encodes against the buffer.
+    /// 2. Likewise wait before the last tessl owner of the wrapped buffer lets
+    ///    go of it.
+    ///
+    /// Do not call `setSignaledValue` on the handoff event to announce sparsl
+    /// completion or "the next commit": it cannot make tessl wait, and a value
+    /// above `last_signaled_value()` makes a tessl-to-foreign waiter wake
+    /// before tessl's work is done ([`GpuRuntime::handoff_foreign_signal`]
+    /// reports it).
     ///
     /// The wrap retains the buffer, and a GPU-private one is accepted as a
     /// GPU operand (its host mappings are refused).

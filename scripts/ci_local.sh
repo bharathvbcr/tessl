@@ -22,6 +22,25 @@ RUSTDOCFLAGS='-D warnings' cargo doc --no-deps
 echo "==> static tile audit"
 python3 scripts/audit_gemm_tiles.py
 
+echo "==> MSL dialect lint (CI: kernel-emulator job)"
+python3 tools/msl_emu/dialect_lint.py
+
+echo "==> emulator host contract (CI: kernel-emulator job; needs the torch oracle)"
+# check_qwen35.py imports torch at module top, so no torch means no check. That
+# must fail loudly: a skipped check must never read as a passed one.
+ORACLE_PY=""
+for cand in "${TESSL_ORACLE_PYTHON:-}" "$HOME/.venvs/rsijev-oracle/bin/python" python3; do
+  [[ -n "$cand" ]] || continue
+  if "$cand" -c 'import torch' >/dev/null 2>&1; then ORACLE_PY="$cand"; break; fi
+done
+if [[ -z "$ORACLE_PY" ]]; then
+  echo "error: no python with torch found (tried \$TESSL_ORACLE_PYTHON, ~/.venvs/rsijev-oracle, python3)." >&2
+  echo "       pip install -r tools/msl_emu/requirements.txt --extra-index-url https://download.pytorch.org/whl/cpu" >&2
+  exit 1
+fi
+# -k host_contract selects both the parser self-test and the src/qwen35.rs binds/constants case.
+"$ORACLE_PY" tools/msl_emu/check_qwen35.py -k host_contract
+
 echo "==> test (release, serialized)"
 cargo test --release -- --test-threads=1
 

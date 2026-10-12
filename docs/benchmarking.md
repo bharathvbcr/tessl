@@ -64,8 +64,8 @@ TESSL_GEMM_TUNE=1 cargo build --release --bins
 TESSL_GEMM_TUNE=1 cargo run --release --bin bench_gemm_tile_tune
 ```
 
-Both tuning binaries `exit(2)` with that exact command when the variants are
-absent, rather than printing a page of `skip(pipe)` and exiting 0 (they did
+Both tuning binaries `exit(2)` naming their own `TESSL_GEMM_TUNE=1 cargo run`
+line when the variants are absent, rather than printing a page of `skip(pipe)` and exiting 0 (they did
 the latter until 2026-10-10; `tests/tune_rigs_refuse_missing_variants.rs` pins
 the refusal). They check every variant the run will dispatch before timing
 anything.

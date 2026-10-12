@@ -191,16 +191,24 @@ fn the_kernel_counts_the_docs_quote_are_the_builds() {
     );
 }
 
-/// Entry points the GEMM tune rig adds, from a compile of `kernels/tune/`
-/// (`None` when there is no Metal toolchain to ask). Entry-point names do not
-/// depend on math mode, so the flags here are the bare minimum, not build.rs's.
-fn tune_entry_points() -> Option<usize> {
+/// Entry points the GEMM tune rig adds, from a compile of `kernels/tune/`.
+/// Entry-point names do not depend on math mode, so the flags here are the
+/// bare minimum, not build.rs's.
+///
+/// No toolchain is a failure, not a skip: this crate does not build without
+/// the Metal 4 compiler (build.rs refuses a simdgroup-only metallib), and a
+/// count that could not be taken must not read as one that matched.
+fn tune_entry_points() -> usize {
     let root = crate_root();
     let sdk = std::process::Command::new("xcrun")
         .args(["--sdk", "macosx", "--show-sdk-path"])
         .output()
-        .ok()
-        .filter(|o| o.status.success())?;
+        .expect("spawn xcrun --show-sdk-path");
+    assert!(
+        sdk.status.success(),
+        "no macOS SDK, so the tune-kernel count cannot be taken: {}",
+        String::from_utf8_lossy(&sdk.stderr)
+    );
     let sdk = String::from_utf8_lossy(&sdk.stdout).trim().to_string();
     let dir = std::env::temp_dir().join(format!("tessl-tune-count-{}", std::process::id()));
     std::fs::create_dir_all(&dir).expect("temp dir");
@@ -229,17 +237,13 @@ fn tune_entry_points() -> Option<usize> {
             .arg("-o")
             .arg(&air)
             .output()
-            .ok()?;
-        if !cc.status.success() {
-            // No Metal 4 compiler here (the toolchain component is absent).
-            let stderr = String::from_utf8_lossy(&cc.stderr);
-            assert!(
-                stderr.contains("unable to find utility") || stderr.contains("not a developer tool"),
-                "{} failed to compile: {stderr}",
-                src.display()
-            );
-            return None;
-        }
+            .expect("spawn xcrun metal");
+        assert!(
+            cc.status.success(),
+            "{} failed to compile under -std=metal4.0 (a missing Metal Toolchain fails here too): {}",
+            src.display(),
+            String::from_utf8_lossy(&cc.stderr)
+        );
         let nm = std::process::Command::new("xcrun")
             .arg("metal-nm")
             .arg(&air)
@@ -252,7 +256,7 @@ fn tune_entry_points() -> Option<usize> {
             .count();
     }
     let _ = std::fs::remove_dir_all(&dir);
-    Some(total)
+    total
 }
 
 /// Every integer a doc puts directly before a tune-kernel phrase, with the
@@ -273,10 +277,7 @@ fn quoted_tune_counts<'a>(text: &'a str, phrases: &[&'a str]) -> Vec<(&'a str, u
 
 #[test]
 fn the_tune_kernel_count_the_docs_quote_is_the_builds() {
-    let Some(tune) = tune_entry_points() else {
-        eprintln!("skipping: no Metal 4 toolchain to compile kernels/tune/");
-        return;
-    };
+    let tune = tune_entry_points();
     assert!(tune > 0, "kernels/tune/ compiled to no entry points");
     const PHRASES: &[&str] = &[
         " variants)",

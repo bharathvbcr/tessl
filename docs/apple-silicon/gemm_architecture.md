@@ -239,8 +239,9 @@ TESSL_GEMM_TUNE=1 cargo build --release --bins
 TESSL_GEMM_TUNE=1 cargo run --release --bin bench_gemm_tnnt_tune
 ```
 
-Both tuning binaries `exit(2)` with that command when the variants are absent,
-rather than printing a page of `skip(pipe)` and exiting 0.
+Both tuning binaries `exit(2)` naming their own `TESSL_GEMM_TUNE=1 cargo run`
+line when the variants are absent, rather than printing a page of `skip(pipe)`
+and exiting 0.
 
 > **Evidence status.** All numeric performance results below come from
 > historical schema-v1 artifacts. They lack the current revision, dirty-state,

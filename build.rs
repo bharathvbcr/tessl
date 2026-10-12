@@ -530,23 +530,50 @@ fn try_metal_compile(
 }
 
 /// Print a source's compiler stderr as `cargo:warning=` lines. A diagnostic
-/// block (its `warning:` line plus the source excerpt and notes that follow)
-/// already printed for another source, as headers produce for each includer, is
-/// dropped; `seen` carries the blocks across sources.
+/// block is its `In file included from` chain, its `warning:` line and the
+/// source excerpt and notes that follow. A block whose diagnostic (the part
+/// after the include chain, which names the includer) was already printed for
+/// another source, as a header warning is for each includer, is dropped;
+/// `seen` carries the diagnostics across sources. The compiler's per-source
+/// `N warnings generated.` tally is dropped too: it would otherwise end the
+/// last block and make that block differ between includers.
 fn forward_warnings(name: &str, stderr: &str, seen: &mut std::collections::HashSet<String>) {
-    let mut blocks: Vec<Vec<&str>> = Vec::new();
+    struct Block<'a> {
+        include: Vec<&'a str>,
+        body: Vec<&'a str>,
+    }
+    let mut blocks: Vec<Block> = Vec::new();
     for line in stderr.lines().filter(|l| !l.trim().is_empty()) {
-        if line.contains(": warning:") || blocks.is_empty() {
-            blocks.push(Vec::new());
+        let tally = line.trim().split_once(' ').is_some_and(|(n, rest)| {
+            !n.is_empty()
+                && n.bytes().all(|b| b.is_ascii_digit())
+                && matches!(rest, "warning generated." | "warnings generated.")
+        });
+        if tally {
+            continue;
         }
-        blocks.last_mut().expect("a block was just pushed").push(line);
+        let include = line.starts_with("In file included from ");
+        let starts = include || line.contains(": warning:");
+        if blocks.last().is_none_or(|b| starts && !b.body.is_empty()) {
+            blocks.push(Block {
+                include: Vec::new(),
+                body: Vec::new(),
+            });
+        }
+        let block = blocks.last_mut().expect("a block was just pushed");
+        if include {
+            block.include.push(line);
+        } else {
+            block.body.push(line);
+        }
     }
     for block in blocks {
-        if !seen.insert(block.join("\n")) {
+        let diagnostic = if block.body.is_empty() { &block.include } else { &block.body };
+        if !seen.insert(diagnostic.join("\n")) {
             continue;
         }
         println!("cargo:warning={name}: metal compiler diagnostics");
-        for line in block {
+        for line in block.include.iter().chain(&block.body) {
             println!("cargo:warning=  {line}");
         }
     }

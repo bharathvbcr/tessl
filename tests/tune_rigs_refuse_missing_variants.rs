@@ -11,7 +11,10 @@ mod common;
 
 use std::process::Command;
 
-const TUNE_BUILD: &str = "TESSL_GEMM_TUNE=1 cargo build --release --bins";
+/// `TESSL_GEMM_TUNE` goes on the `cargo run` itself: it is a build-time input,
+/// so naming only a `cargo build` sends the reader to a `cargo run` that
+/// rebuilds the metallib without the variants.
+const TUNE_RUN: &str = "TESSL_GEMM_TUNE=1 cargo run --release --bin";
 
 /// Whether this build's metallib carries the tune kernels; one entry point
 /// from `kernels/tune/matmul_tensorops_tune.metal` stands for the file.
@@ -34,9 +37,10 @@ fn assert_refuses(bin: &str, exe: &str) {
         "{bin} without the tune kernels must exit 2, not {:?}:\n{stdout}\n{stderr}",
         out.status
     );
+    let command = format!("{TUNE_RUN} {bin}");
     assert!(
-        stderr.contains(TUNE_BUILD),
-        "{bin} must name the build command:\n{stderr}"
+        stderr.contains(&command),
+        "{bin} must name `{command}`:\n{stderr}"
     );
     assert!(
         !stdout.contains("skip(pipe)"),

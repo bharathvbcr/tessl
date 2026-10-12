@@ -454,3 +454,108 @@ fn kv_store_variant_writes_the_rotated_k_and_v_into_the_cache() {
         }
     });
 }
+
+/// Every RMS eps validator refuses zero, not only a negative: `rsqrt(0)` is
+/// inf, so an all-zero row would come out NaN. A `eps < 0.0` check in library
+/// code is the shape of the bug `rms_qkv_rope` once had.
+#[test]
+fn no_rms_eps_validator_admits_zero() {
+    let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut offenders = Vec::new();
+    let mut dirs = vec![src];
+    while let Some(dir) = dirs.pop() {
+        for entry in std::fs::read_dir(&dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                dirs.push(path);
+            } else if path.extension().is_some_and(|e| e == "rs") {
+                let text = std::fs::read_to_string(&path).unwrap();
+                for (n, line) in text.lines().enumerate() {
+                    let l = line.trim_start();
+                    if !l.starts_with("//") && (l.contains("eps < 0.0") || l.contains("eps < 0 ")) {
+                        offenders.push(format!("{}:{}: {l}", path.display(), n + 1));
+                    }
+                }
+            }
+        }
+    }
+    assert!(offenders.is_empty(), "eps checks that admit 0: {offenders:#?}");
+}
+
+/// A zero, negative or non-finite eps is refused by all three variants before
+/// anything is encoded: a named error, no dispatch, and no buffer written.
+#[test]
+fn rms_qkv_rope_refuses_a_non_positive_or_non_finite_eps() {
+    with_gpu(|rt| {
+        let dm = Dims {
+            t: 2,
+            hq: 4,
+            hkv: 2,
+            d: 64,
+            rotary: 64,
+            theta: 10_000.0,
+            eps: 1e-6,
+        };
+        let f = fixture(dm, 0x77);
+        let (qwb, kwb, vwb) = (buf(rt, &f.qw), buf(rt, &f.kw), buf(rt, &f.vw));
+        let kv_elems = dm.t * dm.hkv * dm.d;
+        let pb = u32_buf(rt, 3);
+        let off = u32_buf(rt, 0);
+        rt.synchronize().unwrap();
+        rt.take_dispatch_count();
+        for variant in [
+            QkvRopeVariant::PosConst,
+            QkvRopeVariant::PosBuffer,
+            QkvRopeVariant::PosBufferKvStore,
+        ] {
+            for eps in [0.0f32, -0.0, -1e-6, f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+                let (qb, kb, vb) = f.upload(rt);
+                let dst_k = seeded(rt, kv_elems, UNWRITTEN);
+                let dst_v = seeded(rt, kv_elems, UNWRITTEN);
+                let mut dims = f.dims();
+                dims.eps = eps;
+                let kv = (variant == QkvRopeVariant::PosBufferKvStore).then_some(KvStoreTarget {
+                    dst_k: &dst_k,
+                    dst_v: &dst_v,
+                    dst_offset: &off,
+                    capacity: kv_elems as u32,
+                });
+                let err = nn::rms_qkv_rope(
+                    rt,
+                    variant,
+                    QkvBuffers {
+                        q: &qb,
+                        k: &kb,
+                        v: &vb,
+                        q_weight: &qwb,
+                        k_weight: &kwb,
+                        v_weight: &vwb,
+                    },
+                    dims,
+                    3,
+                    (variant != QkvRopeVariant::PosConst).then_some(&pb),
+                    kv,
+                    false,
+                )
+                .expect_err(&format!("{variant:?} eps {eps}: accepted"));
+                assert!(
+                    err.contains("eps"),
+                    "{variant:?} eps {eps}: error does not name eps: {err}"
+                );
+                assert_eq!(rt.take_dispatch_count(), 0, "{variant:?} eps {eps}: dispatched");
+                rt.synchronize().unwrap();
+                assert_eq!(qb.read_f32(), f.q, "{variant:?} eps {eps}: q written");
+                assert_eq!(kb.read_f32(), f.k, "{variant:?} eps {eps}: k written");
+                assert_eq!(vb.read_f32(), f.v, "{variant:?} eps {eps}: v written");
+                assert!(
+                    dst_k.read_f32().iter().all(|x| *x == UNWRITTEN),
+                    "{variant:?} eps {eps}: dst_k written"
+                );
+                assert!(
+                    dst_v.read_f32().iter().all(|x| *x == UNWRITTEN),
+                    "{variant:?} eps {eps}: dst_v written"
+                );
+            }
+        }
+    });
+}

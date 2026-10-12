@@ -31,13 +31,6 @@ CRATE = pathlib.Path(__file__).resolve().parents[1]
 # cannot drift by construction. A local copy reappearing there is itself the
 # regression, so fail if one shows up (skipped when the sibling is absent, as
 # it is inside a published crate).
-_stale = CRATE.parents[2] / "arch_02_value_resid/metal-native/kernels/matmul_tensorops.metal"
-if _stale.exists():
-    raise SystemExit(
-        "audit_gemm_tiles: tessl-arch02 has its own matmul_tensorops.metal again. "
-        "It must compile tessl's copy via DEP_TESSL_KERNELS; a local one silently drifts."
-    )
-
 METAL = CRATE / "kernels/matmul_tensorops.metal"
 GEMM_RS = CRATE / "src/gemm.rs"
 # Every Rust source is scanned for literal `pipeline("matmul2d_tensorops_...")`
@@ -185,71 +178,99 @@ def rust_tiles(gemm_rs, src_dir):
                 unpaired.append((km.group(1), f"{rel}:{i + 1}"))
     return consts, pairs, unpaired
 
-bad = 0
-kt, unparsed = kernel_tiles(METAL)
-consts, pairs, unpaired = rust_tiles(GEMM_RS, SRC)
-print(f"\n=== {CRATE}")
-print(f"    tile constants: {consts}")
-print(f"    kernels in matmul_tensorops.metal: {len(kt)}")
+def geometry_error(kernels, consts, kern, tile):
+    """Why `kern` cannot be compared with Rust's `tile`, or None when it can.
 
-for u in unparsed:
-    print(f"  FAIL  unparsed kernel macro {u}")
-    bad += 1
-# A literal dispatch with no TileGeom beside it launches a geometry this audit
-# cannot see. Its kernel may still be checked through another site, which is
-# exactly why the site itself has to fail.
-for kern, site in unpaired:
-    print(f"  FAIL  {kern:<44} no TILE_* within {PAIR_WINDOW} lines of pipeline() ({site})")
-    bad += 1
+    `kernels` is `kernel_tiles`' output and `consts` the TileGeom constants.
+    Missing data is an error, never an unaudited row."""
+    if kern not in kernels:
+        return "kernel not in matmul_tensorops.metal"
+    if tile not in consts:
+        return "no such TileGeom in src/gemm.rs"
+    if kernels[kern][0] is None:
+        return f"{kernels[kern][3]}: cannot check"
+    return None
 
-pairs = [(k, t, "pinned") for k, t in NN_PAIRS] + pairs
-checked, n_pairs = set(), 0
-for kern, tile, line in pairs:
-    if kern not in kt:
-        unchecked = "kernel not in matmul_tensorops.metal"
-    elif tile not in consts:
-        unchecked = "no such TileGeom in src/gemm.rs"
-    elif kt[kern][0] is None:
-        unchecked = f"{kt[kern][3]}: cannot check"
-    else:
-        unchecked = None
-    if unchecked:
-        print(f"  FAIL  {kern:<44} {tile:<18} {unchecked} ({line})")
+
+def geometry_matches(kernel_geom, tile_geom):
+    """Whether a kernel's (SM, SN, simdgroups, source) agrees with a Rust
+    (sm, sn, simdgroups). A simdgroup count the kernel does not state is not
+    compared."""
+    ksm, ksn, ksg, _ = kernel_geom
+    rsm, rsn, rsg = tile_geom
+    return (ksm, ksn) == (rsm, rsn) and (ksg is None or ksg == rsg)
+
+
+def main():
+    _stale = CRATE.parents[2] / "arch_02_value_resid/metal-native/kernels/matmul_tensorops.metal"
+    if _stale.exists():
+        raise SystemExit(
+            "audit_gemm_tiles: tessl-arch02 has its own matmul_tensorops.metal again. "
+            "It must compile tessl's copy via DEP_TESSL_KERNELS; a local one silently drifts."
+        )
+
+    bad = 0
+    kt, unparsed = kernel_tiles(METAL)
+    consts, pairs, unpaired = rust_tiles(GEMM_RS, SRC)
+    print(f"\n=== {CRATE}")
+    print(f"    tile constants: {consts}")
+    print(f"    kernels in matmul_tensorops.metal: {len(kt)}")
+
+    for u in unparsed:
+        print(f"  FAIL  unparsed kernel macro {u}")
         bad += 1
-        continue
-    ksm, ksn, ksg, _ = kt[kern]
-    rsm, rsn, rsg = consts[tile]
-    ok = (ksm, ksn) == (rsm, rsn) and (ksg is None or ksg == rsg)
-    n_pairs += 1
-    checked.add(kern)
-    if not ok:
+    # A literal dispatch with no TileGeom beside it launches a geometry this audit
+    # cannot see. Its kernel may still be checked through another site, which is
+    # exactly why the site itself has to fail.
+    for kern, site in unpaired:
+        print(f"  FAIL  {kern:<44} no TILE_* within {PAIR_WINDOW} lines of pipeline() ({site})")
         bad += 1
-    print(f"  {'OK' if ok else 'MISMATCH'}  {kern:<44} {tile:<18} "
-          f"kernel={ksm}x{ksn}/sg{ksg}  rust={rsm}x{rsn}/sg{rsg}  ({line})")
 
-# Every entry point is checked or exempt. Kernels the host selects through a
-# variable never sit next to a pipeline("literal"), so without this they would
-# escape the audit entirely.
-for kern in sorted(kt):
-    if kern in EXEMPT:
-        if kern in checked:
-            print(f"  FAIL  {kern:<44} both checked and EXEMPT; drop the exemption")
+    pairs = [(k, t, "pinned") for k, t in NN_PAIRS] + pairs
+    checked, n_pairs = set(), 0
+    for kern, tile, line in pairs:
+        unchecked = geometry_error(kt, consts, kern, tile)
+        if unchecked:
+            print(f"  FAIL  {kern:<44} {tile:<18} {unchecked} ({line})")
             bad += 1
-        else:
-            print(f"  EXEMPT  {kern:<42} {EXEMPT[kern]}")
-    elif kern not in checked:
-        print(f"  FAIL  {kern:<44} not checked: pin it in NN_PAIRS or EXEMPT it with a reason")
+            continue
+        ksm, ksn, ksg, _ = kt[kern]
+        rsm, rsn, rsg = consts[tile]
+        ok = geometry_matches(kt[kern], consts[tile])
+        n_pairs += 1
+        checked.add(kern)
+        if not ok:
+            bad += 1
+        print(f"  {'OK' if ok else 'MISMATCH'}  {kern:<44} {tile:<18} "
+              f"kernel={ksm}x{ksn}/sg{ksg}  rust={rsm}x{rsn}/sg{rsg}  ({line})")
+
+    # Every entry point is checked or exempt. Kernels the host selects through a
+    # variable never sit next to a pipeline("literal"), so without this they would
+    # escape the audit entirely.
+    for kern in sorted(kt):
+        if kern in EXEMPT:
+            if kern in checked:
+                print(f"  FAIL  {kern:<44} both checked and EXEMPT; drop the exemption")
+                bad += 1
+            else:
+                print(f"  EXEMPT  {kern:<42} {EXEMPT[kern]}")
+        elif kern not in checked:
+            print(f"  FAIL  {kern:<44} not checked: pin it in NN_PAIRS or EXEMPT it with a reason")
+            bad += 1
+    for kern in sorted(set(EXEMPT) - set(kt)):
+        print(f"  FAIL  {kern:<44} EXEMPT names a kernel that no longer exists")
         bad += 1
-for kern in sorted(set(EXEMPT) - set(kt)):
-    print(f"  FAIL  {kern:<44} EXEMPT names a kernel that no longer exists")
-    bad += 1
 
-if not kt or n_pairs == 0:
-    print("  FAIL  examined nothing: no kernels parsed or no Rust dispatch pairs checked")
-    bad += 1
+    if not kt or n_pairs == 0:
+        print("  FAIL  examined nothing: no kernels parsed or no Rust dispatch pairs checked")
+        bad += 1
 
-exempt = sorted(set(EXEMPT) & set(kt))
-coverage = (f"tile geometry: {len(checked)} kernels, {n_pairs} Rust dispatch pairs; "
-            f"{len(exempt)} exempt ({', '.join(exempt) or 'none'})")
-print(f"\nFAIL: {bad} problem(s); {coverage}" if bad else f"\nPASS: {coverage}")
-sys.exit(1 if bad else 0)
+    exempt = sorted(set(EXEMPT) & set(kt))
+    coverage = (f"tile geometry: {len(checked)} kernels, {n_pairs} Rust dispatch pairs; "
+                f"{len(exempt)} exempt ({', '.join(exempt) or 'none'})")
+    print(f"\nFAIL: {bad} problem(s); {coverage}" if bad else f"\nPASS: {coverage}")
+    return 1 if bad else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

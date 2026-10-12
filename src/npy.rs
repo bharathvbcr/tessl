@@ -181,9 +181,10 @@ fn parse_fortran_order(header: &str) -> Result<bool, String> {
     } else if rest.starts_with("True") {
         Ok(true)
     } else {
+        // First 16 characters, not bytes: a byte slice can end inside a multi-byte one.
         Err(format!(
             "fortran_order is neither True nor False: {:?}",
-            &rest[..rest.len().min(16)]
+            rest.chars().take(16).collect::<String>()
         ))
     }
 }

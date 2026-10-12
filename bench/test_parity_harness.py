@@ -1043,16 +1043,14 @@ def tile_audit_contract():
     spec.loader.exec_module(audit)
 
     print("\n-- static TileGeom audit fails closed --")
-    kernels = {"matmul_ok": (32, 64, 4)}
+    kernels = {"matmul_ok": (32, 64, 4, "constexpr")}
     tiles = {"TILE_OK": (32, 64, 4)}
     cases = [
         ("matching geometry", kernels, tiles, "matmul_ok", "TILE_OK", False),
         ("missing kernel", kernels, tiles, "matmul_missing", "TILE_OK", True),
         ("missing Rust tile", kernels, tiles, "matmul_ok", "TILE_MISSING", True),
-        ("kernel with no geometry", {"matmul_ok": (None, None, None)},
+        ("kernel with no geometry", {"matmul_ok": (None, None, None, "no compile-time SM/SN")},
          tiles, "matmul_ok", "TILE_OK", True),
-        ("mismatched geometry", kernels, {"TILE_OK": (64, 64, 4)},
-         "matmul_ok", "TILE_OK", True),
     ]
     for name, kt, rt, kernel, tile, expect_error in cases:
         error = audit.geometry_error(kt, rt, kernel, tile)
@@ -1061,6 +1059,16 @@ def tile_audit_contract():
             print(f"  FAIL  {name}: {error!r}")
         else:
             print(f"  ok    {name}: {error or 'accepted'}")
+    for name, tile, expect_match in [
+        ("agreeing geometry", (32, 64, 4), True),
+        ("different tile rows", (64, 64, 4), False),
+        ("different simdgroups", (32, 64, 2), False),
+    ]:
+        if audit.geometry_matches(kernels["matmul_ok"], tile) != expect_match:
+            FAILURES.append(f"tile audit {name}: wrong verdict")
+            print(f"  FAIL  {name}")
+        else:
+            print(f"  ok    {name}: {'matches' if expect_match else 'refused'}")
 
 
 def execution_policy_contract():

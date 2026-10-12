@@ -397,6 +397,40 @@ mod tests {
         assert!(parse("[[[1]]]", strict).unwrap_err().contains("nesting deeper"));
     }
 
+    /// Nesting is refused at `max_depth` before recursion can exhaust the stack,
+    /// whatever the input length, and a hostile document never panics.
+    #[test]
+    fn deep_and_hostile_documents_are_refused_not_crashed() {
+        let million = 1 << 20;
+        for text in [
+            "[".repeat(million),
+            format!("{}1{}", "[".repeat(million), "]".repeat(million)),
+            r#"{"a":"#.repeat(million / 8),
+        ] {
+            assert!(parse(&text, ANY).unwrap_err().contains("nesting deeper"));
+        }
+        for bad in [
+            "\"\\ud800\"",
+            "\"\\udc00\"",
+            "\"\\ud800\\u0041\"",
+            "\"\\u00",
+            "\"\\u+123\"",
+            "{\"a\":1,\"a\":2}",
+            "{\"a\"",
+            "[1,]",
+            "",
+            "\u{feff}1",
+        ] {
+            assert!(parse(bad, ANY).is_err(), "{bad:?} should be refused");
+        }
+        // Every proper prefix of a valid document is an error, not a panic.
+        let doc = r#"{"a":[1,-2.5e3,"x\u00e9\ud83d\ude00",true,null,{"b":{}}],"c":"\u0041"}"#;
+        assert!(parse(doc, ANY).is_ok());
+        for end in (0..doc.len()).filter(|&i| doc.is_char_boundary(i)) {
+            assert!(parse(&doc[..end], ANY).is_err(), "prefix of {end} bytes parsed");
+        }
+    }
+
     #[test]
     fn get_finds_object_fields() {
         let v = parse(r#"{"a":{"b":[1]},"c":"d"}"#, ANY).unwrap();

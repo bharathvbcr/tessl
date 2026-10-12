@@ -41,6 +41,11 @@ fi
 # -k host_contract selects both the parser self-test and the src/qwen35.rs binds/constants case.
 "$ORACLE_PY" tools/msl_emu/check_qwen35.py -k host_contract
 
+echo "==> parity harness, host-only (adversarial scorer, ladder, tile-audit and evidence contracts)"
+# Needs numpy, which the oracle environment carries. A non-zero exit (any assertion failure,
+# or a required section that did not run) stops the script; GPU sections are skipped visibly.
+"$ORACLE_PY" -I bench/test_parity_harness.py --pure
+
 echo "==> test (release, serialized)"
 cargo test --release -- --test-threads=1
 

@@ -185,14 +185,20 @@ fn require_disjoint<'a>(
     Ok(())
 }
 
-pub(crate) fn validate_rms_scalars(dim: u32, eps: f32, what: &str) -> Result<(), String> {
-    if dim == 0 {
-        return Err(format!("{what}: dim must be non-zero"));
-    }
+/// The one check of an RMS epsilon: finite and strictly positive. Zero is
+/// refused because `rsqrt(0)` is inf, so an all-zero row would come out NaN.
+pub(crate) fn validate_rms_eps(eps: f32, what: &str) -> Result<(), String> {
     if !eps.is_finite() || eps <= 0.0 {
         return Err(format!("{what}: eps must be finite and positive"));
     }
     Ok(())
+}
+
+pub(crate) fn validate_rms_scalars(dim: u32, eps: f32, what: &str) -> Result<(), String> {
+    if dim == 0 {
+        return Err(format!("{what}: dim must be non-zero"));
+    }
+    validate_rms_eps(eps, what)
 }
 
 pub fn attn_kv_capacity(k: &GpuBuffer, v: &GpuBuffer, batch: u32, heads_kv: u32, head_dim: u32) -> Result<u32, String> {
@@ -2444,10 +2450,7 @@ impl QkvRopeDims {
         if !self.theta.is_finite() || self.theta <= 0.0 {
             return Err(format!("{what}: theta must be finite and positive"));
         }
-        if !self.eps.is_finite() || self.eps < 0.0 {
-            return Err(format!("{what}: eps must be finite and non-negative"));
-        }
-        Ok(())
+        validate_rms_eps(self.eps, what)
     }
 }
 

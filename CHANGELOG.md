@@ -172,6 +172,27 @@ All notable changes to `tessl` are recorded here. The format follows
 
 ### Changed (breaking)
 
+- **`GpuRuntime::shared_event()` returns a handoff event, not the lifetime
+  event.** The allocator reset, const-arena rewind, pool recycling and the
+  drop wait now read a crate-private event only tessl's queue signals;
+  `shared_event()` is a second event the queue signals after it, at the same
+  value, so a foreign `setSignaledValue` (a safe call in objc2-metal) can no
+  longer make tessl free memory the GPU is still using. Waiting on
+  `(shared_event(), v)` for `v <= last_signaled_value()` still means tessl's
+  work through commit `v` is done. Signaling the event does not make tessl
+  wait: hand foreign work to tessl by finishing it on the host first
+  (`Tensor::from_mtl_buffer`'s handoff doc says so). New:
+  `last_completed_value()` and `handoff_foreign_signal()`.
+- **A runtime wait that runs out of budget no longer poisons the runtime, and
+  the budget is configurable.** One setting, `GpuRuntime::event_wait_ms()` /
+  `set_event_wait_ms()`, covers every wait on the GPU timeline. Default
+  `DEFAULT_EVENT_WAIT_MS` (30 000 ms); accepted range `EVENT_WAIT_MS_RANGE`
+  (1 to 3 600 000 ms); the `TESSL_EVENT_WAIT_MS` environment variable sets it
+  at runtime creation (an out-of-range value is ignored with a warning). A
+  timeout returns a named error saying how long it waited and for which value,
+  `GpuRuntime::is_event_wait_timeout` recognises it, and retrying
+  `synchronize` keeps waiting. A GPU fault, or a lifetime event ahead of what
+  was submitted, still poisons.
 - **`gemm_{tn,nt}_accum_train` always run the accumulate kernels on
   TensorOps;
   `TESSL_GEMM_ACCUM` and `TESSL_GEMM_ACCUM_DX` are retired.** Training has
@@ -668,6 +689,16 @@ All notable changes to `tessl` are recorded here. The format follows
 
 ### Fixed
 
+- **`rms_qkv_rope` refuses `eps == 0`.** `QkvRopeDims::validate` refused only
+  a negative eps, so an eps of 0 with an all-zero head row gave
+  `0 * rsqrt(0)` = NaN in q and k and, in the KV-store variant, in the
+  persistent cache. All three variants now go through the one RMS eps check
+  (`validate_rms_eps`, also behind `validate_rms_scalars`): finite and
+  positive, refused before anything is encoded.
+- **`Decode::step` reads its logits before counting the token decoded.** A
+  failed read used to leave `position()` advanced past a token whose logits
+  were lost. It now leaves the position where it was and the session poisoned,
+  as a failure in the layers does.
 - **C ABI: validate before mutate, allocate or publish.** Every slice built
   from a caller's `n` goes through one checked helper that refuses a byte
   length past `isize::MAX`, a null pointer with elements and a misaligned

@@ -422,6 +422,15 @@ flowchart TD
     SharedEvent -->|pending_retirement| ResSet
 ```
 
+Two events back this. Every lifetime decision (allocator reset, constant-arena
+rewind, pool recycling, the drop wait) reads a crate-private lifetime event only
+tessl's queue signals. `GpuRuntime::shared_event()` is a separate handoff event
+the queue signals after it, so foreign code that signals it cannot make tessl
+free memory early. Waits on the GPU timeline are bounded by
+`GpuRuntime::event_wait_ms()` (default 30 s, range 1 ms to 1 h, overridden by
+`set_event_wait_ms` or `TESSL_EVENT_WAIT_MS`). Running out of budget returns a
+named error and does not poison the runtime.
+
 ---
 
 ## Indirect Command Buffer (ICB) & Dual-Slot Replay State Machine

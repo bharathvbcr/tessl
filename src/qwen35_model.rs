@@ -82,7 +82,7 @@
 //! ([`crate::qwen35::score_answer_rows`]), on a model with or without the
 //! packed head.
 
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use crate::cross_entropy::gather_rows_f32;
@@ -494,6 +494,9 @@ pub struct Qwen35Model {
     /// Test hook ([`Self::fail_layer_after_for_test`]): layers still to run
     /// before one fails; `usize::MAX` is off.
     layer_fault: AtomicUsize,
+    /// Test hook ([`Self::fail_logits_read_for_test`]): the next [`Decode::step`]
+    /// logits read fails.
+    read_fault: AtomicBool,
 }
 
 impl Qwen35Model {
@@ -515,6 +518,21 @@ impl Qwen35Model {
     #[doc(hidden)]
     pub fn fail_layer_after_for_test(&self, n: usize) {
         self.layer_fault.store(n, Ordering::Relaxed);
+    }
+
+    /// Make the next [`Decode::step`] fail at the host read of its logits,
+    /// once, after its layers ran and the runtime synchronized: how a test
+    /// reaches the failure a step must survive without advancing. Tests only.
+    #[doc(hidden)]
+    pub fn fail_logits_read_for_test(&self) {
+        self.read_fault.store(true, Ordering::Relaxed);
+    }
+
+    fn take_read_fault(&self) -> Result<(), String> {
+        if self.read_fault.swap(false, Ordering::Relaxed) {
+            return Err("logits read: injected fault (fail_logits_read_for_test)".into());
+        }
+        Ok(())
     }
 
     fn take_layer_fault(&self) -> Result<(), String> {
@@ -714,6 +732,7 @@ impl Qwen35Model {
             layers,
             param_generation: AtomicU64::new(0),
             layer_fault: AtomicUsize::new(usize::MAX),
+            read_fault: AtomicBool::new(false),
         })
     }
 
@@ -810,6 +829,7 @@ impl Qwen35Model {
             layers,
             param_generation: AtomicU64::new(0),
             layer_fault: AtomicUsize::new(usize::MAX),
+            read_fault: AtomicBool::new(false),
         })
     }
 
@@ -1730,9 +1750,13 @@ impl Decode<'_> {
         }
         m.head(&self.a.resid, &self.a.x, &self.logits)?;
         rt.synchronize()?;
+        // Read before advancing: a failed read leaves `position()` where it was,
+        // and the session poisoned, since the layers' state has moved past it.
+        m.take_read_fault()?;
+        let row = self.logits.buffer.try_contents_f32()?[..m.cfg.vocab as usize].to_vec();
         self.decoded += 1;
         self.broken = false;
-        Ok(self.logits.buffer.try_contents_f32()?[..m.cfg.vocab as usize].to_vec())
+        Ok(row)
     }
 }
 

@@ -36,14 +36,24 @@ fn staged_readbacks_report_a_busy_runtime_instead_of_panicking() {
         let held = rt.alloc_buffer(64).unwrap();
         let mapping = held.contents_u8();
         let busy = |what: &str, r: std::thread::Result<Result<(), String>>| {
-            let e = r.unwrap_or_else(|_| panic!("{what} panicked on a busy runtime")).unwrap_err();
+            let e = r
+                .unwrap_or_else(|_| panic!("{what} panicked on a busy runtime"))
+                .unwrap_err();
             assert!(e.contains("busy"), "{what}: {e}");
         };
-        busy("logits", catch_unwind(AssertUnwindSafe(|| s.logits(LogitRows::Last).map(|_| ()))));
-        busy("score_answers", catch_unwind(AssertUnwindSafe(|| s.score_answers(&[0], &[1, 2]).map(|_| ()))));
+        busy(
+            "logits",
+            catch_unwind(AssertUnwindSafe(|| s.logits(LogitRows::Last).map(|_| ()))),
+        );
+        busy(
+            "score_answers",
+            catch_unwind(AssertUnwindSafe(|| s.score_answers(&[0], &[1, 2]).map(|_| ()))),
+        );
         busy(
             "forward_rows",
-            catch_unwind(AssertUnwindSafe(|| model.forward_rows(&ids(4), LogitRows::Last, false).map(|_| ()))),
+            catch_unwind(AssertUnwindSafe(|| {
+                model.forward_rows(&ids(4), LogitRows::Last, false).map(|_| ())
+            })),
         );
         drop(mapping);
         assert!(!s.logits(LogitRows::Last).unwrap().is_empty());
@@ -58,7 +68,9 @@ fn upload_segments_reports_a_busy_runtime_instead_of_panicking() {
         let held = rt.alloc_buffer(64).unwrap();
         let mapping = held.contents_u8();
         let outcome = catch_unwind(AssertUnwindSafe(|| upload_segments(rt, &[(0, 2), (2, 5)], 5)));
-        let err = outcome.expect("upload_segments panicked on a busy runtime").unwrap_err();
+        let err = outcome
+            .expect("upload_segments panicked on a busy runtime")
+            .unwrap_err();
         assert!(err.contains("busy") && err.contains("upload_segments"), "{err}");
         drop(mapping);
         let ok = upload_segments(rt, &[(0, 2), (2, 5)], 5).unwrap();
@@ -86,7 +98,9 @@ fn mini_copy_chain_reports_a_busy_runtime_instead_of_panicking() {
         let held = rt.alloc_buffer(64).unwrap();
         let mapping = held.contents_u8();
         let outcome = catch_unwind(AssertUnwindSafe(|| DecodeIcb::mini_copy_chain(rt, 8).map(|_| ())));
-        let err = outcome.expect("mini_copy_chain panicked on a busy runtime").unwrap_err();
+        let err = outcome
+            .expect("mini_copy_chain panicked on a busy runtime")
+            .unwrap_err();
         assert!(err.contains("busy"), "{err}");
         drop(mapping);
         let (mut dec, out) = DecodeIcb::mini_copy_chain(rt, 8).unwrap();

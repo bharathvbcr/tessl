@@ -3462,7 +3462,10 @@ pub unsafe fn gemv_q4_with_scalars(
     })
 }
 
-/// Threads per group for the one-thread-per-row Q4 GEMV kernels.
+/// Threads per group for the one-thread-per-row MLX Q4 GEMV variants
+/// (`Q4MlxRowVariant::Standard` and `Wide`; `gemv_q4_mlx.metal` still stages
+/// `x` in threadgroup memory for these). `Tiled` and the Q4 `gemv_q4` kernels
+/// do not use it.
 ///
 /// 128 amortizes the shared `x` cache across enough rows to pay for staging it,
 /// without making the tail group wasteful on short matrices.
@@ -3694,7 +3697,8 @@ impl Q4MlxRowVariant {
 
 /// `y = W @ x` with MLX Q4 weights and an **f32** activation vector.
 ///
-/// One thread per output row, staging `x` in threadgroup memory. For the
+/// One thread per output row for `Standard` and `Wide`, staging `x` in
+/// threadgroup memory (`Tiled` is one threadgroup per row and does not). For the
 /// bandwidth-limited decode shape prefer [`gemv_q4_mlx_simd`], which reads a
 /// bf16 activation stream and halves the traffic.
 ///

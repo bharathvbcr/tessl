@@ -4,6 +4,17 @@ name: Release
 # leave GitHub Releases empty while crates.io moved — Status links in the
 # CHANGELOG footers then pointed at missing release pages. This job is the
 # single path that keeps tag, crates.io, and GitHub Release in lockstep.
+#
+# Gates (all fail closed):
+#   * Publishing (a tag push, or workflow_dispatch with dry_run=false) requires
+#     CI and Metal compile to have concluded `success` for exactly $GITHUB_SHA
+#     (scripts/require_green_ci.sh). A missing, running, failed, or unqueryable
+#     run blocks the publish.
+#   * Publishing also requires the ref to be a `v*` tag whose version equals
+#     Cargo.toml. A dispatch from a branch is therefore only ever a dry run,
+#     which publishes nothing and so needs neither the tag nor the CI gate.
+#   * The GitHub Release is created with --target "$GITHUB_SHA", so it points at
+#     the commit that was verified.
 on:
   push:
     tags:
@@ -17,6 +28,7 @@ on:
 
 permissions:
   contents: write
+  actions: read   # require_green_ci.sh lists workflow runs
 
 env:
   CARGO_TERM_COLOR: always
@@ -27,6 +39,13 @@ jobs:
     runs-on: macos-26
     steps:
       - uses: actions/checkout@v4
+
+      - name: Require green CI for this exact commit
+        if: ${{ github.event_name == 'push' || inputs.dry_run == false }}
+        timeout-minutes: 5
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: ./scripts/require_green_ci.sh "$GITHUB_SHA" ci.yml metal-compile.yml
 
       - uses: dtolnay/rust-toolchain@stable
 
@@ -45,7 +64,13 @@ jobs:
         run: |
           set -euo pipefail
           VERSION="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
-          if [[ "${{ github.event_name }}" == "push" ]]; then
+          # Anything that publishes must come from a v* tag matching Cargo.toml.
+          # Only a dispatch dry run (publishes nothing) may run from a branch.
+          if [[ "${{ github.event_name }}" == "push" || "${{ inputs.dry_run }}" == "false" ]]; then
+            if [[ "$GITHUB_REF_TYPE" != "tag" || "$GITHUB_REF_NAME" != v* ]]; then
+              echo "error: publishing requires a v* tag ref, got $GITHUB_REF_TYPE '$GITHUB_REF_NAME'" >&2
+              exit 1
+            fi
             TAG="${GITHUB_REF_NAME#v}"
             if [[ "$TAG" != "$VERSION" ]]; then
               echo "error: tag v$TAG does not match Cargo.toml $VERSION" >&2
@@ -108,5 +133,5 @@ jobs:
           if gh release view "$TAG" >/dev/null 2>&1; then
             echo "GitHub Release $TAG already exists; leaving it"
           else
-            gh release create "$TAG" --title "tessl ${VERSION}" --notes-file "$BODY_FILE"
+            gh release create "$TAG" --target "$GITHUB_SHA" --title "tessl ${VERSION}" --notes-file "$BODY_FILE"
           fi

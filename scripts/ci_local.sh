@@ -16,6 +16,9 @@ cargo build --release --all-targets
 echo "==> clippy"
 cargo clippy --release --all-targets -- -D warnings
 
+echo "==> clippy (quant-prep; mtl_tensor is compiled only with the feature)"
+cargo clippy --release --all-targets --features quant-prep -- -D warnings
+
 echo "==> doc"
 RUSTDOCFLAGS='-D warnings' cargo doc --no-deps
 

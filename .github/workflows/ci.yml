@@ -140,6 +140,11 @@ jobs:
       - name: Clippy
         run: cargo clippy --release --all-targets -- -D warnings
 
+      - name: Clippy (quant-prep)
+        # `mtl_tensor` is compiled only with `quant-prep`, so the run above
+        # never sees it.
+        run: cargo clippy --release --all-targets --features quant-prep -- -D warnings
+
       - name: Rustdoc
         # `[package.metadata.docs.rs]` renders this crate for
         # aarch64-apple-darwin, so the configuration readers see is the one
@@ -185,7 +190,7 @@ jobs:
   #
   # It ran, and the device probe failed. Everything upstream of it succeeded:
   # the Metal Toolchain installed, `xcrun metal --version` executed, and the
-  # `check` job compiled all 18 kernel sources and linted clean on the same
+  # `check` job compiled every kernel source and linted clean on the same
   # image. So the shaders build on a hosted runner; what fails is executing
   # them. Whether the runner has no Metal 4 device or a device without
   # TensorOps, the consequence for this workflow is identical.
@@ -229,7 +234,7 @@ jobs:
         # known GEMM result. It is the narrowest thing that distinguishes "no
         # Metal 4 device" from "device present, TensorOps unusable" from
         # "working", and it runs before the suite so the distinction appears at
-        # the top of the log rather than inside 199 tests.
+        # the top of the log rather than inside the full suite.
         run: cargo run --release --example gemm
 
       - name: Full suite
@@ -237,7 +242,7 @@ jobs:
         # command encoders across threads and are not safe to run concurrently.
         #
         # This covers doc tests too: passing a harness argument does not
-        # suppress them, and the `Doc-tests tessl` section is part of the 199.
+        # suppress them, and the `Doc-tests tessl` section is part of the suite.
         run: cargo test --release -- --test-threads=1
 
       - name: mtl_tensor tests (quant-prep)

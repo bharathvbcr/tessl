@@ -963,8 +963,9 @@ against the tiny model's measured peak at three lengths.
 `ps` RSS is not a device-memory cap. It counts a Metal shared buffer's pages
 only while they are resident and uncompressed: zeroing the 7.53 GB bank on
 the host raised it by 7.53 GB, but the 15.05 GB of moments by 6.9 GB, and
-after a step it read 7.84 GB with 15.07 GB allocated. A cap on RSS (Lappi's
-`tools/mac_heavy.sh` 32 GiB) therefore lets the device allocate well past
+after a step it read 7.84 GB with 15.07 GB allocated. A cap on RSS (the 32 GiB
+limit in Lappi-decision's `tools/mac_heavy.sh`, a script in that repository and
+not in this one) therefore lets the device allocate well past
 it; `currentAllocatedSize` is the figure the working set is measured
 against.
 
@@ -1425,6 +1426,9 @@ span ±8% on this machine under load.
   16 value heads), 2× at `Qwen3_5TextConfig()`'s defaults†. The prep
   products are uneven across simdgroups (triangular). Both are
   performance-only.
-- **Untuned tiles.** GDN's 64-row chunks and 32-column value slices, and the
-  prefill attention's tile (`ATTN_PREFILL_TILE`, 32x32), are first
-  choices, not swept ones. Four attention tiles are compiled for the sweep.
+- **Untuned tiles.** GDN's 64-row chunks, the decode recurrence's 32-column
+  value slices (`GDN_RECURRENT_SLICE`, `Cols32`; `Cols16` is bit-identical but
+  has not won a paired batch-1 sweep there), and the prefill attention's tile
+  (`ATTN_PREFILL_TILE`, 32x32) are first choices, not swept ones. The chunked
+  scan's slice is swept: `GdnScanSlice` defaults to `Cols16`
+  (`probe_gdn_scan --paired`). Four attention tiles are compiled for the sweep.

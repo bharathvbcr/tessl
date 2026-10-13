@@ -3364,13 +3364,16 @@ impl Q4MlxBank<'_> {
 
 /// `y[rows] = W[rows, cols] @ x[cols]` with [`Q4Bank`] weights.
 ///
-/// One thread per output row. Each threadgroup stages the whole `x` vector in
-/// threadgroup memory, so `cols * 4` bytes must fit the device limit — checked
-/// against [`GpuRuntime::max_threadgroup_memory`] before encoding, because the
-/// dispatch-time failure names neither this kernel nor `cols`.
+/// One simdgroup owns four output rows, with its 32 lanes striding K eight
+/// nibbles at a time (`SIMD_ROWS_PER_TG` = 8 rows per 64-thread threadgroup).
+/// `x` is read straight from device memory, not staged in threadgroup memory
+/// (the kernel stopped staging it on 2026-09-05), so `cols` is not bounded by
+/// [`GpuRuntime::max_threadgroup_memory`]; the host validates only buffer
+/// lengths and the group size.
 ///
-/// Set `tiled` to use `gemv_q4_tiled`, which walks one threadgroup per row tile
-/// instead of one thread per row.
+/// Set `tiled` to use `gemv_q4_tiled`, the A/B baseline: one 128-thread
+/// threadgroup per output row with a scalar inner loop and a threadgroup
+/// reduction scratch of 128 floats. It does not stage `x` either.
 ///
 /// Scalar indices for `_with_scalars`: 5 = `rows`, 6 = `cols`, 7 = `group_size`.
 pub fn gemv_q4(

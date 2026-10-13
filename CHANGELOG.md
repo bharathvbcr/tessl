@@ -183,6 +183,223 @@ All notable changes to `tessl` are recorded here. The format follows
   are still refused. Adding variants to the exhaustive `Dtype` enum breaks an
   external `match` on it.
 
+
+- **EmbeddingGemma 2 text encoder (`tessl::embedgemma2`).** It loads
+  `google/embeddinggemma-2`'s text path from its own `model.safetensors` and
+  embeds ragged batches: the `encoder_attn` bidirectional sliding-window
+  kernel, `segment_mean_rows`, `l2_normalize_rows`, and length-sorted forward
+  packing. It was first run on the GPU on an M5 Pro against
+  sentence-transformers 6.1 (fp32 eager): every embedding up to 6147 tokens
+  is within `2.5e-7` max abs, every Matryoshka prefix within `3.9e-7`, and
+  the per-layer residual stream of a 1658-token text within `4.9e-5` of its
+  largest magnitude. `docs/embedgemma2.md` has the bounds and observed
+  errors.
+  - `tests/embedgemma2_tiny.rs` runs the whole forward on a random tiny
+    checkpoint, built in memory, against an f64 host forward, in the plain
+    GPU suite.
+  - The reference and fixture generators record `provenance.json`: library
+    versions and the generator commit.
+- **`SafeTensors::from_bytes`** validates and reads a `.safetensors`
+  serialization held in memory, through the same header checks as
+  `SafeTensors::open`. Every malformed-file test now runs through both.
+- **`nn::rope_inv_freq`**: transformers' RoPE frequency table (`1.0 /
+  (theta ** ((2p).float() / dim))` in f32), the one every RoPE kernel now
+  reads.
+- **Device memory accounting.** `GpuRuntime::peak_allocated_bytes` and
+  `reset_peak_allocated_bytes` (the high-water mark of `currentAllocatedSize`,
+  sampled at every buffer the pool creates), `GpuRuntime::allocated_bytes_for`
+  (what a pool allocation of a given size and kind costs),
+  `allocated_bytes_for` on `GdnTrainWorkspace`, `CeWorkspace`,
+  `AttnTrainWorkspace` and `EmbedBwdWorkspace`, `Qwen35Model::train_step_bytes`,
+  `GpuRuntime::set_recommended_working_set_for_test`, and the
+  `probe_train_memory` binary that measures the 2B's tables and steps.
+- **GPU faults are read from commit feedback.** `MTL4CommandBuffer` has no
+  `status` or `error`, so a fault was invisible after a wait. Each commit now
+  registers an `MTL4CommitFeedback` handler through `MTL4CommitOptions`
+  (features `MTL4CommitFeedback`, `block2`; `block2` is the block crate
+  objc2-metal already uses). After a GPU wait, a reported error latches the
+  runtime the same way a shared-event timeout does: later encodes and
+  allocations refuse reuse, and `GpuRuntime::is_poisoned` lets
+  callers read the latch instead of matching the poison string. The wait on the
+  callback is bounded and returns on the callback's notify rather than a poll
+  tick; a callback that has not run stays pending. Also adds `GpuRuntime::current_allocated_bytes`, a live
+  `currentAllocatedSize` reading alongside the startup `memory_info` snapshot.
+- **Causal flash attention at head dimension 64 (`tessl::nn::flash_attn_rows`)**:
+  new kernel instantiation `flash_attn_rows_h64_r8_g8` at R=8, SGT=8,
+  satisfying `D % (4*R) == 0` for float4 lane coverage. Tested in
+  `tests/flash_attn_rows_h64.rs`.
+- **Packed QK RMSNorm and half-split RoPE (`tessl::qwen35::attn_qk_norm_rope_packed`)**:
+  adds support for explicit query-head stride (`head_dim` for packed
+  `[T, H, D]`, or `2 * head_dim` for Qwen's query-gate layout) and
+  configurable RMSNorm `weight_bias` (`0.0` for learnable scale `* w`,
+  `1.0` for Qwen's `*(1 + w)`). Tested in `tests/qk_norm_half_rope.rs`.
+- **Non-finite protection in argmax and softcap sampling**:
+  `argmax_f32`, `softcap_sample`, and `softcap_argmax_one_pass` guard against
+  NaNs and non-finite inputs, writing `0xFFFFFFFF` / returning error instead
+  of sampling token 0.
+- **Stand-alone host validators for MLX Q4 GEMV**:
+  `tessl::nn::validate_gemv_q4_mlx_inputs`, `validate_gemv_q4_mlx_blocked`,
+  and `validate_gemv_q4_mlx_simd` expose host-side buffer shape, bank bounds,
+  and disjointness validation without encoding.
+- **Fallible u32 buffer writing (`GpuBuffer::try_write_u32`)**:
+  reports buffer length mismatches and poisoned runtime states via `Result`
+  instead of unconditionally panicking.
+- **Device AdamW on any f32 tensor (`tessl::qwen35_adamw::adamw_step`)**:
+  one step of `qwen35_adamw_f32` on a parameter, its gradient and both
+  moments. `Qwen35Model::adamw_step` is that function in a loop over the
+  parameter table, including packed windows, so there is no second kernel.
+  A step of 0 is refused (the value `u64::MAX + 1` wraps to, which zeroes
+  the bias correction). The model method still refuses to increment a count
+  that is already `u64::MAX`. Callers synchronize before a host read.
+  `tests/adamw_step.rs` checks a non-contracted f32 reference within the
+  existing `2e-6` absolute bound, mismatched shapes and dtypes, a zero-length
+  view, a byte-offset view, and a gradient that belongs to another runtime.
+- **The metallib is embedded.** `GpuRuntime::new` loads the shader library
+  with `newLibraryWithData` (`MTLDevice::newLibraryWithData:error:`,
+  objc2-metal 0.3.2's `newLibraryWithData_error`, feature `dispatch2`) from
+  bytes included at compile time. Moving or deleting the build-directory
+  `.metallib` no longer stops a binary from opening a runtime.
+  `add_metallib_bytes` is the same load for an adopter overlay.
+  `metallib_path` and `DEP_TESSL_METALLIB` still name the on-disk artifact
+  for tooling.
+- **Metal math mode is explicit.** `build.rs` passes `-fmetal-math-mode=fast`,
+  which is the compiler default, on every shader. `-ffp-contract=off` is
+  applied to `kernels/qwen35_adamw.metal` only: with contraction on, a step
+  at magnitude ~1e4 missed the `2e-6` bound by one ulp (`6.104e-5`); with
+  the flag the same step is bit-identical to a non-contracted f32 reference.
+  A million-element batched step was 0.2336 ms with the flag and 0.2456 ms
+  without (one release run each; the flag was not slower). RMSNorm's gap
+  against a serial f32 sum is `3.576e-7` (inside `1e-5`, and it is the
+  reduction tree) and cross-entropy's exact-f32 `dh` relative error is
+  `1.58e-6` (inside `1e-5`, `precise::exp`/`log` already). Those two were
+  not given the flag. Numbers: `bench/results/fp_contract.txt`.
+- **LM-head cross-entropy with gradients (`tessl::cross_entropy`)**:
+  `cross_entropy_rows` over the supervised `(row, target)` pairs only, in
+  vocabulary chunks, never forming `[rows, vocab]` logits. Loss (mean or sum),
+  `dh` for the supplied rows and the full `dW`, exact f32, scratch bounded by
+  a `CeWorkspace` sized by rows and chunk. Kernels `ce_gather_rows_{f32,bf16}`,
+  `ce_lse_update`, `ce_softmax_grad`. `gemm::cast_bf16_to_f32_into` widens
+  into a caller's buffer.
+- **GDN training forward and backward (`tessl::gdn_train`)**: the gated
+  delta rule at transformers' `torch_chunk_gated_delta_rule` seam (`g`,
+  `beta` given, in-kernel q/k l2norm), saving only a state per 64 tokens
+  (32 MiB/layer at the 2B's shapes, T = 2048, vs 435 MiB in torch), with a
+  deterministic chunk-reverse backward. Kernels `gdn_train_fwd`,
+  `gdn_train_bwd`, `gdn_train_bwd_finish`.
+  From torch: `tessl_torch.chunk_gated_delta_rule` (transformers'
+  signature) and `patch_transformers_qwen3_5()`; C ABI 3 adds
+  `tessl_gdn_train_forward`/`_backward` and tensors up to rank 6.
+- **Backward of the Qwen3.5 row-local ops (`tessl::qwen35_bwd`)**:
+  `rms_norm_bwd` (with an accumulate flag for the residual stream),
+  `gated_rms_norm_bwd` (the GDN output norm), `swiglu_bwd` and
+  `attn_gate_bwd`, in the forward's own row windows: `dgate`/`dup` and the
+  output gate's column land in the fused projections' gradient windows.
+  Weight gradients are per-block partials summed in order, no atomics.
+  Kernels `qwen35_rms_norm_bwd_f32`, `qwen35_col_sum_blocks_f32`,
+  `qwen35_gated_rms_norm_bwd_f32`, `qwen35_swiglu_bwd_f32`,
+  `qwen35_attn_gate_bwd_f32`.
+- **Causal conv + SiLU backward (`qwen35_bwd::conv1d_silu_bwd`)**: the GDN
+  conv as training runs it (zero state, as transformers' no-cache path),
+  `dx` into a window of the fused projection's gradient and a
+  deterministic `dw [C, KW]`; the pre-activation is recomputed from `x`.
+  Kernels `qwen35_conv1d_silu_bwd_dx_f32`, `qwen35_conv1d_silu_bwd_dw_f32`.
+- **Attention Q/K norm + partial RoPE backward
+  (`qwen35_bwd::attn_qk_norm_rope_bwd`)**: from the q/k/v gradients into
+  the fused projection's gradient (q, k, v columns; the gate's are
+  `attn_gate_bwd`'s), with deterministic `(1 + w)` gradients for both norms.
+  The RoPE angle is now one helper, `qwen35_rope_angle` in
+  `kernels/qwen35_act.h`, shared by the forward and the backward. Kernel
+  `qwen35_attn_qk_norm_rope_bwd_f32`.
+- **Embedding backward (`qwen35_bwd::embed_rows_bwd`)**: `dW[id] += dh[r]`,
+  added onto the tied LM head's gradient after `cross_entropy_rows`. The
+  host checks the ids and groups the rows by id; each id's rows are summed
+  in row order without atomics. `EmbedBwdWorkspace` holds the grouping.
+  Kernel `qwen35_embed_rows_bwd_f32`.
+- **A Qwen3.5 training step (`Qwen35Model::train_step`, `tessl::qwen35_train`)**:
+  transformers' causal-LM loss for one sequence and every parameter's
+  gradient, in f32, in each weight's own layout (packed fused projections,
+  `[vocab, hidden]` for the tied embedding and head). The forward keeps
+  only each layer's input and each layer is rebuilt just before its
+  backward (0.38 GiB of activations at T = 2048 on the 2B, against 8.54 GiB
+  saved, for 10% more time); it uses `gdn_train`, `attn_train` and
+  `gdn_gates`, and the backward chains the CE, row-local, conv, gate, Q/K,
+  attention and embedding backwards with exact-f32 GEMMs. Checked against
+  transformers' autograd on a committed tiny model
+  (`tests/fixtures/qwen35_train/`, from
+  `tools/qwen35_ref/make_train_fixture.py tiny`), and on the real 2B by an
+  ignored test (`make_train_fixture.py 2b`): loss within 4.6e-5, gradients
+  within 3.9e-3 of each parameter's largest, a difference finite differences
+  of tessl's own loss attribute to the two f32 forwards, not the backward
+  (`real_2b_gradients_are_those_of_tessls_forward`);
+  `tools/qwen35_ref/train_noise_floor.py` measures transformers' own
+  run-to-run gradient disagreement for comparison.
+- **A Qwen3.5 model's parameters under transformers' names
+  (`tessl::qwen35_params`)**: `parameter_table`, `read_parameters`,
+  `read_gradients` and `write_parameters` copy between the model and caller
+  f32 tensors on the GPU, with transformers' shapes and values (norms as
+  `w`; linear weights as `[in, out]` windows of the
+  packed projections), honouring a caller's byte offset and checking every
+  tensor before writing any. `gemm::transpose_f32_into` is the checked GPU
+  transpose (the TN/NT fallbacks now share it).
+- **Training attention (`tessl::attn_train`)**: `attn_train_forward` is
+  `attn_prefill`'s tiled kernel at its default geometry with each row's
+  log-sum-exp written out (new entry point
+  `qwen35_attn_tiled_lse_h256_q32_k32_sg4`; the four existing entry points
+  are unchanged and bind no new slot), and bit-identical O.
+  `attn_train_backward` is FlashAttention-2's backward on the matrix units
+  (`kernels/qwen35_attn_bwd.metal`): dQ per query block, dK and dV per key
+  block walking the KV head's query heads in order, each gradient written
+  once, no atomics. Kernels `qwen35_attn_bwd_dvec_f32`,
+  `qwen35_attn_bwd_{dq,dk,dv}_h256_q32_k32_sg4`.
+- **GDN gates for training (`qwen35::gdn_gates`, `qwen35_bwd::gdn_gates_bwd`)**:
+  `g = -exp(A_log) * softplus(a + dt_bias)` and `beta = sigmoid(b)` written
+  dense `[rows, heads]` for `gdn_train`, and their backward into the fused
+  projection's a/b gradient columns with deterministic `dA_log`, `ddt_bias`.
+  torch's softplus and the log decay move to `kernels/qwen35_act.h`
+  (`qwen35_softplus`, `qwen35_log_decay`), shared with the inference loads.
+  `qwen35_bwd::copy_cols` moves a column window between layouts. Kernels
+  `qwen35_gdn_gates_f32`, `qwen35_gdn_gates_bwd_f32`, `qwen35_copy_cols_f32`.
+- **qwen35_gdn.metal compiles under -Wall -Werror again**: the 16-column
+  scan's threadgroup-memory constant gets the 32 KB static_assert its
+  siblings have (the current compiler rejected it as unused).
+- **`bench_qwen35_train`**: every training op at Qwen3.5-2B's shapes behind a
+  NaN-poison gate, and `--step=N` for a whole `train_step` on the checkpoint
+  (7.2 s at T = 2048 on an M5 Pro; per-op numbers in docs/qwen35.md).
+- **Randomized-shape stress for the backward kernels**
+  (`randomized_shapes_stress` in `tests/qwen35_bwd.rs`, `tests/attn_train.rs`):
+  shapes drawn within each kernel's contract, each draw checked like the
+  targeted tests; `TESSL_FUZZ_ITERS` / `TESSL_FUZZ_SEED` scale it (500 draws
+  per sweep pass).
+- **msl_emu host contract**: macro instantiations are expanded by a small
+  preprocessor (nested macros, object-like parameter macros), the
+  TensorOps backward's signatures and `src/attn_train.rs`'s binds are
+  checked, and a host bind of a kernel no inspected source declares fails.
+- **torch binding (`python/tessl_torch`) over a C ABI (`tessl::capi`)**:
+  `tessl_torch.cross_entropy(hidden, weight, targets, mask)`, a
+  `torch.autograd.Function` over MPS tensors, loaded with `ctypes` (no C++
+  extension, no new dependency). The crate now also builds a `cdylib`
+  (`libtessl.dylib`); the ABI is versioned, catches panics at the boundary,
+  and refuses calls from a thread other than the handle's.
+- **The Qwen3.5 text forward (`tessl::qwen35_model`)**, loaded from the
+  Hugging Face checkpoint, checked end to end against transformers
+  (`tests/qwen35_model.rs`, opt-in): F32 within 2.3e-6 per layer, Bf16 18x
+  closer to fp32 than transformers' own bf16. See `docs/qwen35.md`.
+- **`Qwen35Config::from_config_json` / `from_config_file`**: any Qwen3.5 text
+  `config.json` (nested `text_config` or text-only), with every feature the
+  forward lacks refused by name. The published 2B config parses to exactly
+  `qwen35_2b()`; other sizes are parsed, not yet run against transformers.
+  The JSON parser is the safetensors one, moved to a crate-private
+  `json` module with per-format syntax limits.
+- **`tessl::safetensors`**, a strict `.safetensors` reader (exact offsets,
+  bounded header, JSON subset, reads through the handle it opened).
+- **`qwen35::residual_add`** (`qwen35_residual_add_f32`), the exact-f32
+  residual add for strided windows.
+- **`tessl_torch.Qwen35.grads(into=...)`** writes a step's gradients into
+  tensors an earlier `grads()` returned (the optimizer's `.grad`s), checking
+  them all first, instead of allocating another copy of every gradient (8 GB
+  on the 2B) while the previous one is still alive. The documented training
+  recipe uses it and shows `operands="bf16"`; the default stays exact f32.
+
 ### Changed (breaking)
 
 - **`GpuRuntime::shared_event()` returns a handoff event, not the lifetime
@@ -256,7 +473,155 @@ All notable changes to `tessl` are recorded here. The format follows
   while an earlier `execute` is in flight is documented as the caller's to
   synchronize.
 
+
+- **`EmbedGemma2Model::encode` takes `truncate_dim: Option<u32>`** between
+  the batch and `trace`. `Some(d)` returns `[batch, d]` Matryoshka prefixes,
+  normalized on the GPU over the prefix, as sentence-transformers'
+  `encode(truncate_dim=d, normalize_embeddings=True)` does. `None` keeps the
+  full `embedding_dim`.
+- **`embedgemma2::truncate_renormalize` is removed.** It was a host copy of
+  what `l2_normalize_rows` does on the GPU; pass `truncate_dim` to `encode`
+  instead.
+- **`EmbedGemma2Model::load` refuses tensors under the prefix that the
+  forward does not read** (a bias, an extra norm), naming them, where it
+  ignored them before. Tensors outside the prefix (the vision and audio
+  towers) are still not read.
+- `set_binder_encode_nop` is no longer public: while armed, every encode on
+  its thread returns `Ok(())` having done nothing. `BinderEncodeNopGuard`
+  still arms it for a scope, and the new `clear_binder_encode_nop` can only
+  disarm it.
+- **C ABI 9** (was 3; the binding and library refuse each other across
+  versions, so rebuild `libtessl.dylib` with the binding). It adds a
+  Qwen3.5 model handle: `tessl_qwen35_load`, `_train_step`,
+  `_param_count`, `_param_info` (`TesslParamInfo`), `_copy` (read
+  parameters, read gradients, write parameters) and `_free`, with the
+  runtime's thread affinity. `tessl_torch.Qwen35` wraps it:
+  `parameters()`, `train_step(ids)`, `grads()`, `load_parameters()`, under
+  transformers' names and values, for a torch optimizer. Checked against
+  transformers' own autograd before and after an AdamW step written back
+  (`python/tests/test_qwen35.py`). ABI 9 also runs AdamW inside tessl
+  (`tessl_qwen35_adamw_init`, `_step`, `_step_count`, `_set_step_count`,
+  `_free`, and `_copy` directions 3-6 reading and writing both moments, over
+  `qwen35_adamw`), and `TesslParamInfo` gains `decay_excluded`, Trainer's
+  weight-decay exclusion for that entry; `tessl_torch.Qwen35` wraps them
+  as `adamw_init()`, `adamw_step(lr, betas, eps, weight_decay)` (a float
+  for every non-excluded parameter, or a dict by name), `adamw_free()` and
+  `adamw_step_count`, with `adamw_state()` and `load_adamw_state()` for a
+  checkpoint (step, `exp_avg`, `exp_avg_sq` by name), so a loop needs no
+  torch copy of the parameters or gradients. Checked against
+  `torch.optim.AdamW` itself, over three steps within 1e-6, and the ABI
+  against the Rust call bit for bit; a run restored from a checkpoint takes
+  its next step to the same bits as the run that never stopped
+  (`tests/qwen35_adamw.rs`, `python/tests/test_qwen35.py`). Gradient
+  clipping: `tessl_qwen35_grad_sq_norm` (`Qwen35.grad_sq_norm()`,
+  `Qwen35Model::grad_sq_norm`) gives the global norm's square, and
+  `_adamw_step` takes a `grad_scale` (`AdamWHyper::grad_scale`) that
+  multiplies every gradient before the update, leaving the stored gradients
+  as they are; `tessl_torch.clip_coef(norm, max_norm)` is
+  `clip_grad_norm_`'s coefficient. The caller forms it, so gradients
+  outside tessl (a head of its own) join the norm. Checked against
+  `clip_grad_norm_` then `torch.optim.AdamW` within 1e-6. The handle's
+  gradients are a bank, allocated by the first step and reused, and a step
+  splits in two: `tessl_qwen35_train_forward` (`TESSL_SUPERVISE_CAUSAL`, or
+  `TESSL_SUPERVISE_ROWS` with positions, targets and a scale),
+  `tessl_qwen35_hidden` (final-norm rows for a loss outside tessl),
+  `tessl_qwen35_train_backward` (that loss's gradient at those rows, and
+  `accumulate` to add into the bank) and `tessl_qwen35_train_discard`.
+  While a step is pending, another step, the gradients and AdamW are
+  refused; accumulating onto a bank a refused or failed step marked is
+  refused. `tessl_torch.Qwen35` wraps them as `train_forward(ids,
+  positions=, targets=, scale=)`, `hidden(positions)`,
+  `train_backward(dh=, positions=, accumulate=)` (summing the rows of a
+  repeated position) and `train_discard()`. Checked against transformers on
+  a right-padded two-row batch with a letter row through the tied head and
+  a span row through a pointer head in torch: run row by row and
+  accumulated, the same losses, summed gradients and global norm
+  (`python/tests/test_qwen35.py`); the ABI
+  against the Rust calls bit for bit (`tests/capi.rs`).
+- **msl_emu runs two training kernels**: `qwen35_scatter_add_rows_f32`
+  (against torch's `index_add_`, bit for bit) and `qwen35_adamw_f32`
+  (against torch's AdamW formula in f64 on a packed window, with
+  `grad_scale`, and nothing outside the window moving), so the
+  kernel-emulator CI job checks them without a Mac. The shim gains
+  `precise::sqrt` and `precise::rsqrt`.
+- **msl_emu shares kernel-scope threadgroup arrays across a group**, as a
+  GPU does: `build.sh` rewrites each `threadgroup T name[N];` into a static
+  registered with `metal::emu::tg_static`, which `launch` poisons with NaN
+  before every group, and refuses to build if one is left unrewritten.
+  Before, `threadgroup` was defined away and each thread got a private
+  array. `qwen35_sq_sum_rows_f32` (the rows of `grad_sq_norm`) now runs
+  against f64 on a packed window at four widths, writing nothing outside
+  its rows; without the rewrite three of them fail. `barrier_probe` holds
+  the sharing and the poison to a probe of its own, and CI's
+  ThreadSanitizer step runs `sq_sum_rows`, which reports a race with the
+  kernel's barrier removed.
+- **`bench_qwen35_train --batch=ROWS,LEN[,SPAN_ROWS]`** times one optimizer
+  step's gradients for a batch run row by row into one bank (letter rows
+  supervise one position, span rows go through `hidden` and an outside
+  gradient), reporting seconds per optimizer step and per row; two lengths
+  at one row count separate the per-row fixed cost from the per-token cost.
+  An extra run after the timed ones prints each row's wall time, time
+  waiting on the GPU, allocations and commits. On an M5 Pro that showed the
+  same 1625-token letter row taking 3.0 to 5.9 s between moments in one
+  process, with accumulated rows no slower than the first, so a batch-versus-
+  single comparison from one run each is within the noise.
+- **`Qwen35Model::train_step_into(ids, operands, sup, bank, accumulate)`**
+  writes a step's gradients into a bank from `Qwen35Grads::zeros_like`
+  (over it, or added to it), so several sequences' gradients sum in place.
+  Each layer's gradients go into the bank as soon as its backward is
+  encoded and released (freed buffers return to the pool at the next GPU
+  wait, so a few layers' are held at once on Qwen3.5, not every gradient).
+  A copy is `train_step`'s bits and an add is one f32 rounding
+  (`tests/qwen35_train.rs`). `Qwen35Grads::zeros_like` also allocates
+  AdamW's moments (it moved from `qwen35_adamw`). What the step scores is a
+  `Supervise`: `Causal` (transformers' causal-LM mean, `train_step`'s) or
+  `Rows { positions, targets, scale }`, chosen hidden positions against
+  given tokens, returning the sum of their cross-entropies with the
+  gradients of `scale` times it (so a batch mean over rows spread across
+  steps is `scale = 1 / N` in each); an empty selection is allowed (zero
+  loss). The rows' gradient goes back through
+  `qwen35_bwd::scatter_add_rows` (kernel `qwen35_scatter_add_rows_f32`).
+  Checked against the causal step (every row at `1 / (T - 1)`), additivity
+  over disjoint sets, and causality (a position on the sequence cut just
+  after it). A step also splits in two for a loss outside tessl:
+  `train_forward(ids, operands, sup)` returns a `PendingStep` (its loss, and
+  `hidden(positions, out)`: rows of the final norm's output, transformers'
+  `last_hidden_state`), and `train_backward_into(pending, dh, bank,
+  accumulate)` adds that loss's gradient at those rows to the step's own
+  before the backward. Checked with the tied head's cross-entropy computed
+  on the host from `hidden`'s rows: the same loss and, fed back as `dh`, the
+  same gradients as `Supervise::Rows` inside tessl. A step that scores
+  nothing in tessl (an outside loss only) adds its embedding gradient
+  straight into the bank: no `[vocab, hidden]` tensor (2 GB on the 2B) and
+  no copy per row.
+- **`Qwen35Model::train_step(ids, operands)` and
+  `cross_entropy_rows(.., reduction, operands, ws, grads)`** take a
+  `gemm::GemmOperands`: `ExactF32` (the previous behaviour) or `Bf16`, bf16
+  GEMM operands with f32 accumulation while weights, activations and
+  gradients stay f32. The C ABI carries it: `TesslCeArgs.operands` and an
+  `operands` parameter of `tessl_qwen35_train_step` (`TESSL_OPERANDS_EXACT_F32`
+  0, `TESSL_OPERANDS_BF16` 1, anything else refused); `tessl_torch` takes
+  `operands="f32" | "bf16"` (default `"f32"`) on `Qwen35.train_step`,
+  `cross_entropy` and `cross_entropy_rows`. `Bf16` runs the
+  2B's cross-entropy with gradients 3.15x faster at T = 2048 (561 against
+  1768 ms); on the tiny model its gradients are within 2.3e-2 of
+  transformers' f32 (see docs/qwen35.md, "A training step").
+  `gemm_bf16`, `gemm_tn_bf16` and `gemm_nt_bf16` are that lane whatever the
+  runtime's `PrecisionMode` (the `*_train` GEMMs now delegate to them), and
+  `GemmOperands::ExactF32` refuses a runtime with relaxed precision on.
+  `bench_qwen35_train --bf16` times it.
+- `Tensor::from_mtl_buffer` is an `unsafe fn`: tessl cannot see another
+  queue's work on a wrapped buffer, and its `# Safety` section states the
+  cross-queue contract.
+- `GpuRuntime::metal4` and `Metal4EncodePackage` are crate-private;
+  `shared_event()` and `last_signaled_value()` remain the public handoff.
+- `cross_entropy_rows` takes the hidden states and weight as `Tensor`s
+  (`CeHidden { rows, off }`, `&Tensor`), so views at a storage offset work.
+- `ParamsBuffer::push_u32`/`push_f32` take the host-access lease: they wait
+  for encoded work and fail with "runtime busy" inside an encoder closure.
+
 ### Changed
+
 - build.rs: every kernel's Metal compiler stderr is now forwarded as
   deduplicated `cargo:warning=` lines (previously only `matmul_tensorops.metal`
   surfaced warnings), replayed from the `.air` cache. `TESSL_METAL_WERROR=1`
@@ -625,7 +990,8 @@ All notable changes to `tessl` are recorded here. The format follows
     $T=200$ (0.116 vs 0.232 ms) and $T=8192$ (55.3 vs 176.2 ms) with
     non-overlapping ranges.
   - **Audit:** `scripts/audit_gemm_tiles.py` now parses `NN_COOP_EPI_KERNEL`
-    macros, verifying 19 pipeline geometries (20 checks) with 0 mismatches.
+    macros, so the epilogue pipelines are checked too. The audit's own `PASS` line is
+    the current count (33 kernels, 38 Rust dispatch pairs at `2972027`).
   - **Tests:** `short_m_bf16_plain_gemm_matches_the_wide_tile`,
     `narrow_bf16_epilogue_matches_wide_within_unfused_tolerance`,
     `short_m_bf16_ragged_extents_match_the_other_tile_and_the_reference`,
@@ -742,6 +1108,47 @@ All notable changes to `tessl` are recorded here. The format follows
     (`tests/gemm_i8.rs`) checks int8 exactly with a rank-one A. Both fail,
     as does `exact_f32_column_panels_cover_every_tile`, when the partial-band
     clamp is removed. The speed-up rests on the A/B; no test pins it.
+
+
+- `Qwen35Model` in `Precision::F32` holds the tied embedding as one f32
+  `[vocab, hidden]` table (the gather reads it through the new
+  `qwen35_embed_rows_f32`, training's cross-entropy as its weight, and
+  `forward()`'s head through `gemm_nt_f32`) instead of a bf16 gather table
+  plus an f32 `[hidden, vocab]` head: 1 GB less on the 2B, a parameter write
+  is exact, and gradients are taken at the parameters themselves rather
+  than at a bf16 rounding of the embedding. `qwen35::embed_rows` accepts an
+  f32 table. The bf16 model is unchanged.
+- `Qwen35Model` stores the zero-centred norms (`input_layernorm`,
+  `post_attention_layernorm`, the final `norm`) as `w`, as the checkpoint
+  holds them, and their kernels form `1 + w` in f32, as transformers does
+  and as the attention Q/K norms already did: the new
+  `qwen35::rms_norm` (`qwen35_rms_norm_f32`, `_bf16`) for the forward, and
+  `qwen35_rms_norm_bwd_f32` (whose `w` is now the stored `w`). Storing
+  `1 + w` rounded `w` to ulp(1 + w), so a parameter written and read back,
+  or a checkpoint restored into a fresh model, moved by an ulp (a stored
+  0.3405694 came back as 0.34056938), and each AdamW update of a norm was
+  rounded to about 6e-8. Reads and writes are now exact for every entry and
+  AdamW updates the norms as stored; the forward and the gradients are the
+  same bits as before on the tiny model (f32 and bf16), and
+  `qwen35::rms_norm` in f32 is `nn::rms_norm_f32` on `1 + w` bit for bit.
+- **Static documentation drift.** `docs/verification.md` quotes the tile
+  audit's own output (33 kernels, 38 Rust dispatch pairs at `2972027`, from
+  `python3 scripts/audit_gemm_tiles.py`) and the `#[test]` count (800: 177 in
+  `src/`, 623 in `tests/`), and no longer presents 349 passing as current;
+  the GPU pass counts are not re-run at that commit. `docs/qwen35.md` states
+  that the chunked scan defaults to `Cols16` and that the decode recurrence's
+  `Cols32` is the untuned one, and names `tools/mac_heavy.sh` as Lappi-decision's.
+  `docs/bert.md` documents the real `BertSparseModel::load(rt, &SafeTensors,
+  BertConfig)` and `encode(&[&[u32]], trace)` and the bounds
+  `tests/bert_kernels.rs` uses, and drops the nonexistent `encode_topk`. The
+  `gemv_q4` and `GdnTrainWorkspace` rustdoc match the code (no threadgroup
+  staging of `x`; a workspace is for exactly one `GdnTrainDims`), the two
+  `qwen-decision` references now name `Lappi-decision/AUDIT/`, and the
+  duplicate `[Unreleased]` headings are merged and given a compare link.
+  `bench/results/PROVENANCE.md` lists the 29 files imported from the
+  MLSystemsLab copy, `docs/benchmarking.md` labels each one it presents as
+  imported, and it no longer quotes or plots attention ratios against MLX or
+  PyTorch from that data.
 
 ### Fixed
 
@@ -1008,397 +1415,6 @@ All notable changes to `tessl` are recorded here. The format follows
   large `C0` was therefore held to the rounding of `a·b` alone, and failed on
   the final f32 add (1 ulp at K = 3).
 
-### Added
-
-- **EmbeddingGemma 2 text encoder (`tessl::embedgemma2`).** It loads
-  `google/embeddinggemma-2`'s text path from its own `model.safetensors` and
-  embeds ragged batches: the `encoder_attn` bidirectional sliding-window
-  kernel, `segment_mean_rows`, `l2_normalize_rows`, and length-sorted forward
-  packing. It was first run on the GPU on an M5 Pro against
-  sentence-transformers 6.1 (fp32 eager): every embedding up to 6147 tokens
-  is within `2.5e-7` max abs, every Matryoshka prefix within `3.9e-7`, and
-  the per-layer residual stream of a 1658-token text within `4.9e-5` of its
-  largest magnitude. `docs/embedgemma2.md` has the bounds and observed
-  errors.
-  - `tests/embedgemma2_tiny.rs` runs the whole forward on a random tiny
-    checkpoint, built in memory, against an f64 host forward, in the plain
-    GPU suite.
-  - The reference and fixture generators record `provenance.json`: library
-    versions and the generator commit.
-- **`SafeTensors::from_bytes`** validates and reads a `.safetensors`
-  serialization held in memory, through the same header checks as
-  `SafeTensors::open`. Every malformed-file test now runs through both.
-- **`nn::rope_inv_freq`**: transformers' RoPE frequency table (`1.0 /
-  (theta ** ((2p).float() / dim))` in f32), the one every RoPE kernel now
-  reads.
-- **Device memory accounting.** `GpuRuntime::peak_allocated_bytes` and
-  `reset_peak_allocated_bytes` (the high-water mark of `currentAllocatedSize`,
-  sampled at every buffer the pool creates), `GpuRuntime::allocated_bytes_for`
-  (what a pool allocation of a given size and kind costs),
-  `allocated_bytes_for` on `GdnTrainWorkspace`, `CeWorkspace`,
-  `AttnTrainWorkspace` and `EmbedBwdWorkspace`, `Qwen35Model::train_step_bytes`,
-  `GpuRuntime::set_recommended_working_set_for_test`, and the
-  `probe_train_memory` binary that measures the 2B's tables and steps.
-- **GPU faults are read from commit feedback.** `MTL4CommandBuffer` has no
-  `status` or `error`, so a fault was invisible after a wait. Each commit now
-  registers an `MTL4CommitFeedback` handler through `MTL4CommitOptions`
-  (features `MTL4CommitFeedback`, `block2`; `block2` is the block crate
-  objc2-metal already uses). After a GPU wait, a reported error latches the
-  runtime the same way a shared-event timeout does: later encodes and
-  allocations refuse reuse, and `GpuRuntime::is_poisoned` lets
-  callers read the latch instead of matching the poison string. The wait on the
-  callback is bounded and returns on the callback's notify rather than a poll
-  tick; a callback that has not run stays pending. Also adds `GpuRuntime::current_allocated_bytes`, a live
-  `currentAllocatedSize` reading alongside the startup `memory_info` snapshot.
-- **Causal flash attention at head dimension 64 (`tessl::nn::flash_attn_rows`)**:
-  new kernel instantiation `flash_attn_rows_h64_r8_g8` at R=8, SGT=8,
-  satisfying `D % (4*R) == 0` for float4 lane coverage. Tested in
-  `tests/flash_attn_rows_h64.rs`.
-- **Packed QK RMSNorm and half-split RoPE (`tessl::qwen35::attn_qk_norm_rope_packed`)**:
-  adds support for explicit query-head stride (`head_dim` for packed
-  `[T, H, D]`, or `2 * head_dim` for Qwen's query-gate layout) and
-  configurable RMSNorm `weight_bias` (`0.0` for learnable scale `* w`,
-  `1.0` for Qwen's `*(1 + w)`). Tested in `tests/qk_norm_half_rope.rs`.
-- **Non-finite protection in argmax and softcap sampling**:
-  `argmax_f32`, `softcap_sample`, and `softcap_argmax_one_pass` guard against
-  NaNs and non-finite inputs, writing `0xFFFFFFFF` / returning error instead
-  of sampling token 0.
-- **Stand-alone host validators for MLX Q4 GEMV**:
-  `tessl::nn::validate_gemv_q4_mlx_inputs`, `validate_gemv_q4_mlx_blocked`,
-  and `validate_gemv_q4_mlx_simd` expose host-side buffer shape, bank bounds,
-  and disjointness validation without encoding.
-- **Fallible u32 buffer writing (`GpuBuffer::try_write_u32`)**:
-  reports buffer length mismatches and poisoned runtime states via `Result`
-  instead of unconditionally panicking.
-- **Device AdamW on any f32 tensor (`tessl::qwen35_adamw::adamw_step`)**:
-  one step of `qwen35_adamw_f32` on a parameter, its gradient and both
-  moments. `Qwen35Model::adamw_step` is that function in a loop over the
-  parameter table, including packed windows, so there is no second kernel.
-  A step of 0 is refused (the value `u64::MAX + 1` wraps to, which zeroes
-  the bias correction). The model method still refuses to increment a count
-  that is already `u64::MAX`. Callers synchronize before a host read.
-  `tests/adamw_step.rs` checks a non-contracted f32 reference within the
-  existing `2e-6` absolute bound, mismatched shapes and dtypes, a zero-length
-  view, a byte-offset view, and a gradient that belongs to another runtime.
-- **The metallib is embedded.** `GpuRuntime::new` loads the shader library
-  with `newLibraryWithData` (`MTLDevice::newLibraryWithData:error:`,
-  objc2-metal 0.3.2's `newLibraryWithData_error`, feature `dispatch2`) from
-  bytes included at compile time. Moving or deleting the build-directory
-  `.metallib` no longer stops a binary from opening a runtime.
-  `add_metallib_bytes` is the same load for an adopter overlay.
-  `metallib_path` and `DEP_TESSL_METALLIB` still name the on-disk artifact
-  for tooling.
-- **Metal math mode is explicit.** `build.rs` passes `-fmetal-math-mode=fast`,
-  which is the compiler default, on every shader. `-ffp-contract=off` is
-  applied to `kernels/qwen35_adamw.metal` only: with contraction on, a step
-  at magnitude ~1e4 missed the `2e-6` bound by one ulp (`6.104e-5`); with
-  the flag the same step is bit-identical to a non-contracted f32 reference.
-  A million-element batched step was 0.2336 ms with the flag and 0.2456 ms
-  without (one release run each; the flag was not slower). RMSNorm's gap
-  against a serial f32 sum is `3.576e-7` (inside `1e-5`, and it is the
-  reduction tree) and cross-entropy's exact-f32 `dh` relative error is
-  `1.58e-6` (inside `1e-5`, `precise::exp`/`log` already). Those two were
-  not given the flag. Numbers: `bench/results/fp_contract.txt`.
-- **LM-head cross-entropy with gradients (`tessl::cross_entropy`)**:
-  `cross_entropy_rows` over the supervised `(row, target)` pairs only, in
-  vocabulary chunks, never forming `[rows, vocab]` logits. Loss (mean or sum),
-  `dh` for the supplied rows and the full `dW`, exact f32, scratch bounded by
-  a `CeWorkspace` sized by rows and chunk. Kernels `ce_gather_rows_{f32,bf16}`,
-  `ce_lse_update`, `ce_softmax_grad`. `gemm::cast_bf16_to_f32_into` widens
-  into a caller's buffer.
-- **GDN training forward and backward (`tessl::gdn_train`)**: the gated
-  delta rule at transformers' `torch_chunk_gated_delta_rule` seam (`g`,
-  `beta` given, in-kernel q/k l2norm), saving only a state per 64 tokens
-  (32 MiB/layer at the 2B's shapes, T = 2048, vs 435 MiB in torch), with a
-  deterministic chunk-reverse backward. Kernels `gdn_train_fwd`,
-  `gdn_train_bwd`, `gdn_train_bwd_finish`.
-  From torch: `tessl_torch.chunk_gated_delta_rule` (transformers'
-  signature) and `patch_transformers_qwen3_5()`; C ABI 3 adds
-  `tessl_gdn_train_forward`/`_backward` and tensors up to rank 6.
-- **Backward of the Qwen3.5 row-local ops (`tessl::qwen35_bwd`)**:
-  `rms_norm_bwd` (with an accumulate flag for the residual stream),
-  `gated_rms_norm_bwd` (the GDN output norm), `swiglu_bwd` and
-  `attn_gate_bwd`, in the forward's own row windows: `dgate`/`dup` and the
-  output gate's column land in the fused projections' gradient windows.
-  Weight gradients are per-block partials summed in order, no atomics.
-  Kernels `qwen35_rms_norm_bwd_f32`, `qwen35_col_sum_blocks_f32`,
-  `qwen35_gated_rms_norm_bwd_f32`, `qwen35_swiglu_bwd_f32`,
-  `qwen35_attn_gate_bwd_f32`.
-- **Causal conv + SiLU backward (`qwen35_bwd::conv1d_silu_bwd`)**: the GDN
-  conv as training runs it (zero state, as transformers' no-cache path),
-  `dx` into a window of the fused projection's gradient and a
-  deterministic `dw [C, KW]`; the pre-activation is recomputed from `x`.
-  Kernels `qwen35_conv1d_silu_bwd_dx_f32`, `qwen35_conv1d_silu_bwd_dw_f32`.
-- **Attention Q/K norm + partial RoPE backward
-  (`qwen35_bwd::attn_qk_norm_rope_bwd`)**: from the q/k/v gradients into
-  the fused projection's gradient (q, k, v columns; the gate's are
-  `attn_gate_bwd`'s), with deterministic `(1 + w)` gradients for both norms.
-  The RoPE angle is now one helper, `qwen35_rope_angle` in
-  `kernels/qwen35_act.h`, shared by the forward and the backward. Kernel
-  `qwen35_attn_qk_norm_rope_bwd_f32`.
-- **Embedding backward (`qwen35_bwd::embed_rows_bwd`)**: `dW[id] += dh[r]`,
-  added onto the tied LM head's gradient after `cross_entropy_rows`. The
-  host checks the ids and groups the rows by id; each id's rows are summed
-  in row order without atomics. `EmbedBwdWorkspace` holds the grouping.
-  Kernel `qwen35_embed_rows_bwd_f32`.
-- **A Qwen3.5 training step (`Qwen35Model::train_step`, `tessl::qwen35_train`)**:
-  transformers' causal-LM loss for one sequence and every parameter's
-  gradient, in f32, in each weight's own layout (packed fused projections,
-  `[vocab, hidden]` for the tied embedding and head). The forward keeps
-  only each layer's input and each layer is rebuilt just before its
-  backward (0.38 GiB of activations at T = 2048 on the 2B, against 8.54 GiB
-  saved, for 10% more time); it uses `gdn_train`, `attn_train` and
-  `gdn_gates`, and the backward chains the CE, row-local, conv, gate, Q/K,
-  attention and embedding backwards with exact-f32 GEMMs. Checked against
-  transformers' autograd on a committed tiny model
-  (`tests/fixtures/qwen35_train/`, from
-  `tools/qwen35_ref/make_train_fixture.py tiny`), and on the real 2B by an
-  ignored test (`make_train_fixture.py 2b`): loss within 4.6e-5, gradients
-  within 3.9e-3 of each parameter's largest, a difference finite differences
-  of tessl's own loss attribute to the two f32 forwards, not the backward
-  (`real_2b_gradients_are_those_of_tessls_forward`);
-  `tools/qwen35_ref/train_noise_floor.py` measures transformers' own
-  run-to-run gradient disagreement for comparison.
-- **A Qwen3.5 model's parameters under transformers' names
-  (`tessl::qwen35_params`)**: `parameter_table`, `read_parameters`,
-  `read_gradients` and `write_parameters` copy between the model and caller
-  f32 tensors on the GPU, with transformers' shapes and values (norms as
-  `w`; linear weights as `[in, out]` windows of the
-  packed projections), honouring a caller's byte offset and checking every
-  tensor before writing any. `gemm::transpose_f32_into` is the checked GPU
-  transpose (the TN/NT fallbacks now share it).
-- **Training attention (`tessl::attn_train`)**: `attn_train_forward` is
-  `attn_prefill`'s tiled kernel at its default geometry with each row's
-  log-sum-exp written out (new entry point
-  `qwen35_attn_tiled_lse_h256_q32_k32_sg4`; the four existing entry points
-  are unchanged and bind no new slot), and bit-identical O.
-  `attn_train_backward` is FlashAttention-2's backward on the matrix units
-  (`kernels/qwen35_attn_bwd.metal`): dQ per query block, dK and dV per key
-  block walking the KV head's query heads in order, each gradient written
-  once, no atomics. Kernels `qwen35_attn_bwd_dvec_f32`,
-  `qwen35_attn_bwd_{dq,dk,dv}_h256_q32_k32_sg4`.
-- **GDN gates for training (`qwen35::gdn_gates`, `qwen35_bwd::gdn_gates_bwd`)**:
-  `g = -exp(A_log) * softplus(a + dt_bias)` and `beta = sigmoid(b)` written
-  dense `[rows, heads]` for `gdn_train`, and their backward into the fused
-  projection's a/b gradient columns with deterministic `dA_log`, `ddt_bias`.
-  torch's softplus and the log decay move to `kernels/qwen35_act.h`
-  (`qwen35_softplus`, `qwen35_log_decay`), shared with the inference loads.
-  `qwen35_bwd::copy_cols` moves a column window between layouts. Kernels
-  `qwen35_gdn_gates_f32`, `qwen35_gdn_gates_bwd_f32`, `qwen35_copy_cols_f32`.
-- **qwen35_gdn.metal compiles under -Wall -Werror again**: the 16-column
-  scan's threadgroup-memory constant gets the 32 KB static_assert its
-  siblings have (the current compiler rejected it as unused).
-- **`bench_qwen35_train`**: every training op at Qwen3.5-2B's shapes behind a
-  NaN-poison gate, and `--step=N` for a whole `train_step` on the checkpoint
-  (7.2 s at T = 2048 on an M5 Pro; per-op numbers in docs/qwen35.md).
-- **Randomized-shape stress for the backward kernels**
-  (`randomized_shapes_stress` in `tests/qwen35_bwd.rs`, `tests/attn_train.rs`):
-  shapes drawn within each kernel's contract, each draw checked like the
-  targeted tests; `TESSL_FUZZ_ITERS` / `TESSL_FUZZ_SEED` scale it (500 draws
-  per sweep pass).
-- **msl_emu host contract**: macro instantiations are expanded by a small
-  preprocessor (nested macros, object-like parameter macros), the
-  TensorOps backward's signatures and `src/attn_train.rs`'s binds are
-  checked, and a host bind of a kernel no inspected source declares fails.
-- **torch binding (`python/tessl_torch`) over a C ABI (`tessl::capi`)**:
-  `tessl_torch.cross_entropy(hidden, weight, targets, mask)`, a
-  `torch.autograd.Function` over MPS tensors, loaded with `ctypes` (no C++
-  extension, no new dependency). The crate now also builds a `cdylib`
-  (`libtessl.dylib`); the ABI is versioned, catches panics at the boundary,
-  and refuses calls from a thread other than the handle's.
-- **The Qwen3.5 text forward (`tessl::qwen35_model`)**, loaded from the
-  Hugging Face checkpoint, checked end to end against transformers
-  (`tests/qwen35_model.rs`, opt-in): F32 within 2.3e-6 per layer, Bf16 18x
-  closer to fp32 than transformers' own bf16. See `docs/qwen35.md`.
-- **`Qwen35Config::from_config_json` / `from_config_file`**: any Qwen3.5 text
-  `config.json` (nested `text_config` or text-only), with every feature the
-  forward lacks refused by name. The published 2B config parses to exactly
-  `qwen35_2b()`; other sizes are parsed, not yet run against transformers.
-  The JSON parser is the safetensors one, moved to a crate-private
-  `json` module with per-format syntax limits.
-- **`tessl::safetensors`**, a strict `.safetensors` reader (exact offsets,
-  bounded header, JSON subset, reads through the handle it opened).
-- **`qwen35::residual_add`** (`qwen35_residual_add_f32`), the exact-f32
-  residual add for strided windows.
-- **`tessl_torch.Qwen35.grads(into=...)`** writes a step's gradients into
-  tensors an earlier `grads()` returned (the optimizer's `.grad`s), checking
-  them all first, instead of allocating another copy of every gradient (8 GB
-  on the 2B) while the previous one is still alive. The documented training
-  recipe uses it and shows `operands="bf16"`; the default stays exact f32.
-
-### Changed (breaking)
-
-- **`EmbedGemma2Model::encode` takes `truncate_dim: Option<u32>`** between
-  the batch and `trace`. `Some(d)` returns `[batch, d]` Matryoshka prefixes,
-  normalized on the GPU over the prefix, as sentence-transformers'
-  `encode(truncate_dim=d, normalize_embeddings=True)` does. `None` keeps the
-  full `embedding_dim`.
-- **`embedgemma2::truncate_renormalize` is removed.** It was a host copy of
-  what `l2_normalize_rows` does on the GPU; pass `truncate_dim` to `encode`
-  instead.
-- **`EmbedGemma2Model::load` refuses tensors under the prefix that the
-  forward does not read** (a bias, an extra norm), naming them, where it
-  ignored them before. Tensors outside the prefix (the vision and audio
-  towers) are still not read.
-- `set_binder_encode_nop` is no longer public: while armed, every encode on
-  its thread returns `Ok(())` having done nothing. `BinderEncodeNopGuard`
-  still arms it for a scope, and the new `clear_binder_encode_nop` can only
-  disarm it.
-- **C ABI 9** (was 3; the binding and library refuse each other across
-  versions, so rebuild `libtessl.dylib` with the binding). It adds a
-  Qwen3.5 model handle: `tessl_qwen35_load`, `_train_step`,
-  `_param_count`, `_param_info` (`TesslParamInfo`), `_copy` (read
-  parameters, read gradients, write parameters) and `_free`, with the
-  runtime's thread affinity. `tessl_torch.Qwen35` wraps it:
-  `parameters()`, `train_step(ids)`, `grads()`, `load_parameters()`, under
-  transformers' names and values, for a torch optimizer. Checked against
-  transformers' own autograd before and after an AdamW step written back
-  (`python/tests/test_qwen35.py`). ABI 9 also runs AdamW inside tessl
-  (`tessl_qwen35_adamw_init`, `_step`, `_step_count`, `_set_step_count`,
-  `_free`, and `_copy` directions 3-6 reading and writing both moments, over
-  `qwen35_adamw`), and `TesslParamInfo` gains `decay_excluded`, Trainer's
-  weight-decay exclusion for that entry; `tessl_torch.Qwen35` wraps them
-  as `adamw_init()`, `adamw_step(lr, betas, eps, weight_decay)` (a float
-  for every non-excluded parameter, or a dict by name), `adamw_free()` and
-  `adamw_step_count`, with `adamw_state()` and `load_adamw_state()` for a
-  checkpoint (step, `exp_avg`, `exp_avg_sq` by name), so a loop needs no
-  torch copy of the parameters or gradients. Checked against
-  `torch.optim.AdamW` itself, over three steps within 1e-6, and the ABI
-  against the Rust call bit for bit; a run restored from a checkpoint takes
-  its next step to the same bits as the run that never stopped
-  (`tests/qwen35_adamw.rs`, `python/tests/test_qwen35.py`). Gradient
-  clipping: `tessl_qwen35_grad_sq_norm` (`Qwen35.grad_sq_norm()`,
-  `Qwen35Model::grad_sq_norm`) gives the global norm's square, and
-  `_adamw_step` takes a `grad_scale` (`AdamWHyper::grad_scale`) that
-  multiplies every gradient before the update, leaving the stored gradients
-  as they are; `tessl_torch.clip_coef(norm, max_norm)` is
-  `clip_grad_norm_`'s coefficient. The caller forms it, so gradients
-  outside tessl (a head of its own) join the norm. Checked against
-  `clip_grad_norm_` then `torch.optim.AdamW` within 1e-6. The handle's
-  gradients are a bank, allocated by the first step and reused, and a step
-  splits in two: `tessl_qwen35_train_forward` (`TESSL_SUPERVISE_CAUSAL`, or
-  `TESSL_SUPERVISE_ROWS` with positions, targets and a scale),
-  `tessl_qwen35_hidden` (final-norm rows for a loss outside tessl),
-  `tessl_qwen35_train_backward` (that loss's gradient at those rows, and
-  `accumulate` to add into the bank) and `tessl_qwen35_train_discard`.
-  While a step is pending, another step, the gradients and AdamW are
-  refused; accumulating onto a bank a refused or failed step marked is
-  refused. `tessl_torch.Qwen35` wraps them as `train_forward(ids,
-  positions=, targets=, scale=)`, `hidden(positions)`,
-  `train_backward(dh=, positions=, accumulate=)` (summing the rows of a
-  repeated position) and `train_discard()`. Checked against transformers on
-  a right-padded two-row batch with a letter row through the tied head and
-  a span row through a pointer head in torch: run row by row and
-  accumulated, the same losses, summed gradients and global norm
-  (`python/tests/test_qwen35.py`); the ABI
-  against the Rust calls bit for bit (`tests/capi.rs`).
-- **msl_emu runs two training kernels**: `qwen35_scatter_add_rows_f32`
-  (against torch's `index_add_`, bit for bit) and `qwen35_adamw_f32`
-  (against torch's AdamW formula in f64 on a packed window, with
-  `grad_scale`, and nothing outside the window moving), so the
-  kernel-emulator CI job checks them without a Mac. The shim gains
-  `precise::sqrt` and `precise::rsqrt`.
-- **msl_emu shares kernel-scope threadgroup arrays across a group**, as a
-  GPU does: `build.sh` rewrites each `threadgroup T name[N];` into a static
-  registered with `metal::emu::tg_static`, which `launch` poisons with NaN
-  before every group, and refuses to build if one is left unrewritten.
-  Before, `threadgroup` was defined away and each thread got a private
-  array. `qwen35_sq_sum_rows_f32` (the rows of `grad_sq_norm`) now runs
-  against f64 on a packed window at four widths, writing nothing outside
-  its rows; without the rewrite three of them fail. `barrier_probe` holds
-  the sharing and the poison to a probe of its own, and CI's
-  ThreadSanitizer step runs `sq_sum_rows`, which reports a race with the
-  kernel's barrier removed.
-- **`bench_qwen35_train --batch=ROWS,LEN[,SPAN_ROWS]`** times one optimizer
-  step's gradients for a batch run row by row into one bank (letter rows
-  supervise one position, span rows go through `hidden` and an outside
-  gradient), reporting seconds per optimizer step and per row; two lengths
-  at one row count separate the per-row fixed cost from the per-token cost.
-  An extra run after the timed ones prints each row's wall time, time
-  waiting on the GPU, allocations and commits. On an M5 Pro that showed the
-  same 1625-token letter row taking 3.0 to 5.9 s between moments in one
-  process, with accumulated rows no slower than the first, so a batch-versus-
-  single comparison from one run each is within the noise.
-- **`Qwen35Model::train_step_into(ids, operands, sup, bank, accumulate)`**
-  writes a step's gradients into a bank from `Qwen35Grads::zeros_like`
-  (over it, or added to it), so several sequences' gradients sum in place.
-  Each layer's gradients go into the bank as soon as its backward is
-  encoded and released (freed buffers return to the pool at the next GPU
-  wait, so a few layers' are held at once on Qwen3.5, not every gradient).
-  A copy is `train_step`'s bits and an add is one f32 rounding
-  (`tests/qwen35_train.rs`). `Qwen35Grads::zeros_like` also allocates
-  AdamW's moments (it moved from `qwen35_adamw`). What the step scores is a
-  `Supervise`: `Causal` (transformers' causal-LM mean, `train_step`'s) or
-  `Rows { positions, targets, scale }`, chosen hidden positions against
-  given tokens, returning the sum of their cross-entropies with the
-  gradients of `scale` times it (so a batch mean over rows spread across
-  steps is `scale = 1 / N` in each); an empty selection is allowed (zero
-  loss). The rows' gradient goes back through
-  `qwen35_bwd::scatter_add_rows` (kernel `qwen35_scatter_add_rows_f32`).
-  Checked against the causal step (every row at `1 / (T - 1)`), additivity
-  over disjoint sets, and causality (a position on the sequence cut just
-  after it). A step also splits in two for a loss outside tessl:
-  `train_forward(ids, operands, sup)` returns a `PendingStep` (its loss, and
-  `hidden(positions, out)`: rows of the final norm's output, transformers'
-  `last_hidden_state`), and `train_backward_into(pending, dh, bank,
-  accumulate)` adds that loss's gradient at those rows to the step's own
-  before the backward. Checked with the tied head's cross-entropy computed
-  on the host from `hidden`'s rows: the same loss and, fed back as `dh`, the
-  same gradients as `Supervise::Rows` inside tessl. A step that scores
-  nothing in tessl (an outside loss only) adds its embedding gradient
-  straight into the bank: no `[vocab, hidden]` tensor (2 GB on the 2B) and
-  no copy per row.
-- **`Qwen35Model::train_step(ids, operands)` and
-  `cross_entropy_rows(.., reduction, operands, ws, grads)`** take a
-  `gemm::GemmOperands`: `ExactF32` (the previous behaviour) or `Bf16`, bf16
-  GEMM operands with f32 accumulation while weights, activations and
-  gradients stay f32. The C ABI carries it: `TesslCeArgs.operands` and an
-  `operands` parameter of `tessl_qwen35_train_step` (`TESSL_OPERANDS_EXACT_F32`
-  0, `TESSL_OPERANDS_BF16` 1, anything else refused); `tessl_torch` takes
-  `operands="f32" | "bf16"` (default `"f32"`) on `Qwen35.train_step`,
-  `cross_entropy` and `cross_entropy_rows`. `Bf16` runs the
-  2B's cross-entropy with gradients 3.15x faster at T = 2048 (561 against
-  1768 ms); on the tiny model its gradients are within 2.3e-2 of
-  transformers' f32 (see docs/qwen35.md, "A training step").
-  `gemm_bf16`, `gemm_tn_bf16` and `gemm_nt_bf16` are that lane whatever the
-  runtime's `PrecisionMode` (the `*_train` GEMMs now delegate to them), and
-  `GemmOperands::ExactF32` refuses a runtime with relaxed precision on.
-  `bench_qwen35_train --bf16` times it.
-- `Tensor::from_mtl_buffer` is an `unsafe fn`: tessl cannot see another
-  queue's work on a wrapped buffer, and its `# Safety` section states the
-  cross-queue contract.
-- `GpuRuntime::metal4` and `Metal4EncodePackage` are crate-private;
-  `shared_event()` and `last_signaled_value()` remain the public handoff.
-- `cross_entropy_rows` takes the hidden states and weight as `Tensor`s
-  (`CeHidden { rows, off }`, `&Tensor`), so views at a storage offset work.
-- `ParamsBuffer::push_u32`/`push_f32` take the host-access lease: they wait
-  for encoded work and fail with "runtime busy" inside an encoder closure.
-
-### Changed
-
-- `Qwen35Model` in `Precision::F32` holds the tied embedding as one f32
-  `[vocab, hidden]` table (the gather reads it through the new
-  `qwen35_embed_rows_f32`, training's cross-entropy as its weight, and
-  `forward()`'s head through `gemm_nt_f32`) instead of a bf16 gather table
-  plus an f32 `[hidden, vocab]` head: 1 GB less on the 2B, a parameter write
-  is exact, and gradients are taken at the parameters themselves rather
-  than at a bf16 rounding of the embedding. `qwen35::embed_rows` accepts an
-  f32 table. The bf16 model is unchanged.
-- `Qwen35Model` stores the zero-centred norms (`input_layernorm`,
-  `post_attention_layernorm`, the final `norm`) as `w`, as the checkpoint
-  holds them, and their kernels form `1 + w` in f32, as transformers does
-  and as the attention Q/K norms already did: the new
-  `qwen35::rms_norm` (`qwen35_rms_norm_f32`, `_bf16`) for the forward, and
-  `qwen35_rms_norm_bwd_f32` (whose `w` is now the stored `w`). Storing
-  `1 + w` rounded `w` to ulp(1 + w), so a parameter written and read back,
-  or a checkpoint restored into a fresh model, moved by an ulp (a stored
-  0.3405694 came back as 0.34056938), and each AdamW update of a norm was
-  rounded to about 6e-8. Reads and writes are now exact for every entry and
-  AdamW updates the norms as stored; the forward and the gradients are the
-  same bits as before on the tiny model (f32 and bf16), and
-  `qwen35::rms_norm` in f32 is `nn::rms_norm_f32` on `1 + w` bit for bit.
-
-### Fixed
 
 - `cross_entropy_rows` adds every vocabulary chunk after the first into
   `dh`'s own view. Those chunks' partial `dh` was added at the start of
@@ -1472,8 +1488,10 @@ All notable changes to `tessl` are recorded here. The format follows
   slices, selected by `GdnWorkspace::with_scan_slice(GdnScanSlice::Cols16)`.
   It launches twice the threadgroups and is bit-identical to the 32-column
   scan. `probe_gdn_scan` found the 32-column scan underfilling the GPU at
-  batch 1; `bench_qwen35_layers --gdn-scan16` selects it. The default stays
-  32 until a clean A/B.
+  batch 1; `bench_qwen35_layers --gdn-scan16` selects it. It was opt-in when
+  added; `GdnScanSlice` now defaults to `Cols16` (see the default-switch entry
+  under Changed), while the decode recurrence's `GDN_RECURRENT_SLICE` stays
+  `Cols32`.
 - **`qwen35_swiglu_{f32,bf16}` / `qwen35::swiglu`**: Qwen3.5's MLP activation,
   `silu(gate) * up`, from f32 column windows straight to bf16 for the down
   GEMM, replacing `nn::mlp_silu` plus a cast pass in `bench_qwen35_layers`
@@ -2041,6 +2059,7 @@ test, and the reasoning is the useful part.
   that existed alongside it.
 
 
+[Unreleased]: https://github.com/bharathvbcr/tessl/compare/v0.2.0...HEAD
 [0.2.0]: https://github.com/bharathvbcr/tessl/releases/tag/v0.2.0
 [0.1.4]: https://github.com/bharathvbcr/tessl/releases/tag/v0.1.4
 [0.1.3]: https://github.com/bharathvbcr/tessl/releases/tag/v0.1.3

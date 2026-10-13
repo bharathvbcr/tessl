@@ -518,7 +518,10 @@ was checked.
 lanes round by round per the protocol above. Raw data:
 `bench/results/gemm_speed_ladder_m5pro.json` (run 1, top panel),
 `gemm_speed_ladder_m5pro_b.json` (run 2) and
-`gemm_speed_bf16_confirm_m5pro.json` (9 rounds, bf16 only).
+`gemm_speed_bf16_confirm_m5pro.json` (9 rounds, bf16 only). These three files
+were imported from the MLSystemsLab copy of this crate (see
+[Provenance of `bench/results/`](#provenance-of-benchresults)): they are that
+copy's measurements, not a run of this tree's kernels.
 
 ![GEMM speed ratio, tessl over PyTorch MPS](img/gemm_tessl_vs_pytorch.svg)
 
@@ -531,9 +534,9 @@ lanes round by round per the protocol above. Raw data:
   f32 lane is full precision; this lane trades mantissa bits, so it is not a
   like-for-like win.
 
-The attention comparisons are plotted separately below: their files store a
-time ratio (`tessl_ms / other_ms`, `bench/attn_paired.py:130`), the inverse of
-this axis.
+The attention files store a time ratio (`tessl_ms / other_ms`,
+`bench/attn_paired.py:130`), the inverse of this axis. They are imported and
+their ratios are not quoted here (see Attention below).
 
 ## Measured — step-waste and dispatch host-overhead, M5 Pro, 2026-10-08
 
@@ -578,6 +581,16 @@ peak over resident to the byte (`probe_storage_memory --no-optimizer`):
 5.76 → 3.35 GiB at T = 2048, more than the 2.37 GiB f32 head gradient a
 bf16 bank no longer allocates.
 
+## Provenance of `bench/results/`
+
+29 of the files in `bench/results/` came from the MLSystemsLab nested copy of
+this crate (commit `6c62ab7`, merged as "nested-only files" in `ff0d954`) and
+were measured on that copy's code, which differs from this tree: for example
+`SPLITK_MIN_K` and `splitk_gate_opens_at_the_measured_depth` do not exist here,
+and the attention kernels differ between the copies. They are listed in
+[`bench/results/PROVENANCE.md`](../bench/results/PROVENANCE.md). Wherever this
+document presents one of them, it says "imported".
+
 ## Every recorded result, plotted
 
 One figure per family of files in `bench/results/`. Blue always means the new
@@ -612,7 +625,8 @@ neither shipped.
 ![GEMM gating decisions and host micro-latches](img/kernel_ab_gemm_gating.svg)
 
 `bf16_smallm_coop_m5pro.txt`, `splitk_gate_m5pro.txt`,
-`arg_table_latch_m5pro.txt` and `coop_clear_m5pro.txt`. The narrow tile wins
+`arg_table_latch_m5pro.txt` and `coop_clear_m5pro.txt` (all four imported:
+measured on the MLSystemsLab copy). The narrow tile wins
 at small M and loses once the grid fills; split-K wins from K = 12288. The
 first two were measured on the MLSystemsLab copy of this crate and
 re-measured on tessl's kernels with their method on 2026-10-11
@@ -627,25 +641,25 @@ cleanups, not speedups.
 ![SIMD-group rewrites](img/kernel_ab_simd.svg)
 
 `rope_simdgroup_m5pro.txt`, `row_reduction_simd_m5pro.txt` and
-`gemv_q4_simd_m5pro.txt`. Latency-bound shapes gain most (rope 3.3–11.5× at
+`gemv_q4_simd_m5pro.txt` (all three imported: measured on the MLSystemsLab
+copy, not re-run on this tree). Latency-bound shapes gain most (rope 3.3–11.5× at
 decode and small T, row_sum 4.35× at 1024 columns); bandwidth-bound shapes
 (softmax at 8192 columns, 0.98×) do not move.
 
 ### Attention
 
-![Attention speed history](img/attention_speed_history.svg)
-![Attention per-config speedup](img/attention_speed_per_config.svg)
-
-`attn_speed_*.json`, plotted as speedup (the inverse of the stored time
-ratio). The files time different tessl implementations in sequence, so the
-first figure is a history. The latest runs: the routed kernel is 1.60× PyTorch
-MPS and 0.87× MLX at batch 1; the batched-32 decode kernel is 4.51× PyTorch and
-1.04× MLX. tessl is slower than MLX on several decode and global-attention
-configs.
+The `attn_speed_*.json` files (imported: measured on the MLSystemsLab copy,
+whose attention kernels differ from this tree's) hold tessl-against-PyTorch-MPS
+and tessl-against-MLX attention timings. No attention ratio against MLX or
+PyTorch is quoted here, and their two figures (`img/attention_speed_history.svg`,
+`img/attention_speed_per_config.svg`) are not embedded, because those ratios are
+unverified for this tree. They become quotable when `bench/attn_paired.py` is
+re-run on this tree.
 
 ![Attention tuning knobs](img/attention_tuning.svg)
 
-`attn_tune_*.json` and `attn_dispatch_split_m5pro.json`. The best value of each
+`attn_tune_*.json` and `attn_dispatch_split_m5pro.json` (imported: knob sweeps
+on the MLSystemsLab copy). The best value of each
 knob differs by configuration, which is why they are selected per shape rather
 than fixed. Batching 32 calls per command buffer cuts per-call decode time by
 up to 11×, while prefill gets slower per call.
@@ -674,7 +688,8 @@ The per-step training and host-path results are in the section above.
 
 ![Numerical accuracy](img/accuracy_parity.svg)
 
-`gemm_parity_grid_m5pro.json` and `attn_parity_m5pro.json`. Parity against a
+`gemm_parity_grid_m5pro.json` and `attn_parity_m5pro.json` (both imported).
+Parity against a
 reference, not speed. Exact f32 lanes agree to ~5e-6 worst case across tessl,
 MLX and PyTorch alike (identical at 5.11e-06); bf16 lanes to 5e-3–7e-3, and the
 tf32-relaxed lane sits between at 1.5e-3.
@@ -682,7 +697,8 @@ tf32-relaxed lane sits between at 1.5e-3.
 ### Not plotted
 
 - `gemm_align_probe_m5pro.txt` (264 pass/fail runs, all bit-identical),
-  `kernel_coverage_m5pro.json` (147 entry points covered, none missing) and
+  `kernel_coverage_m5pro.json` (imported; 147 entry points covered, none
+missing, on the MLSystemsLab copy) and
   `fp_contract.txt` (single-shot, "noise, not a speedup") are correctness
   checks or one-run notes, not benchmarks.
 - `qwen35_train_step_before_m5pro.txt`, `qwen35_decode_token_before_m5pro.txt`

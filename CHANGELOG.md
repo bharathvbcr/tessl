@@ -622,6 +622,16 @@ All notable changes to `tessl` are recorded here. The format follows
 
 ### Changed
 
+- **Releases require green CI for the exact commit.** `release.yml` runs
+  `scripts/require_green_ci.sh "$GITHUB_SHA" ci.yml metal-compile.yml` before
+  anything publishes: a missing, running, failed or unqueryable run blocks the
+  publish. Every publishing path (tag push, or dispatch with `dry_run=false`)
+  must run from a `v*` tag matching `Cargo.toml`, and the GitHub Release is
+  created with `--target "$GITHUB_SHA"`. A tag pushed before CI finishes on its
+  commit is refused; re-run the release job once CI is green.
+- Clippy also runs with `--features quant-prep` (`ci.yml`, `metal-compile.yml`,
+  `scripts/ci_local.sh`), so `mtl_tensor` is linted.
+
 - build.rs: every kernel's Metal compiler stderr is now forwarded as
   deduplicated `cargo:warning=` lines (previously only `matmul_tensorops.metal`
   surfaced warnings), replayed from the `.air` cache. `TESSL_METAL_WERROR=1`
@@ -1151,6 +1161,29 @@ All notable changes to `tessl` are recorded here. The format follows
   PyTorch from that data.
 
 ### Fixed
+
+- **Busy host mappings return errors, not panics, in `upload_segments` and
+  `DecodeIcb::mini_copy_chain`.** Both wrote a small host buffer through the
+  panicking `write_u32`; `upload_segments` now uploads through
+  `alloc_buffer_from_u32` and `mini_copy_chain` initialises all four of its
+  buffers under one host-access lease, so a live `HostMapping` (or an active
+  encoder or submit) is reported as `runtime busy` with the function's name.
+  `mini_copy_chain` also refuses an `n` that does not fit a `u32` or overflows
+  `n * 4` before allocating (`tests/host_access_fallible.rs`; the two busy tests
+  panic at `src/tensor.rs:317` on the previous code). The `set_max_tokens`
+  rustdoc names the real cap, `MAX_BATCH_TOKENS` (32768); 262144 is the
+  checkpoint's `max_position_embeddings`, which is not a limit here.
+- **`bench/test_parity_harness.py --pure` no longer depends on which comparison
+  runtimes are installed.** The failure blamed on numpy 2.4.6 was MLX: where
+  `mlx` is importable, the scorer contract tests scored the live MLX GPU f32
+  matmul, which is reduced precision on the M5 Pro (about 3.5e-3 absolute at
+  K=16 against 7e-7 on MLX's CPU stream) and broke the f32 budget by about 600x
+  on a valid dump. `parity()` takes `external_lanes`, validated up front (known,
+  unique names that do not collide with a dumped lane); the contract tests pass
+  deterministic stub lanes, including bf16 ones, and cover a raising lane, a
+  partial-seed failure and a dtype flip. An empty list is reported as "no
+  comparison runtimes scored", and a tessl-only breach without them is
+  "unconfirmed" rather than "a kernel defect". Budgets are unchanged.
 
 - **`rms_qkv_rope` refuses `eps == 0`.** `QkvRopeDims::validate` refused only
   a negative eps, so an eps of 0 with an all-zero head row gave

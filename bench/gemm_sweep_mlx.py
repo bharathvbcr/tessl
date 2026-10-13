@@ -127,17 +127,26 @@ EXTERNAL_LANES = [
 ]
 
 
-def adjudicate(over):
+def adjudicate(over, externals_scored=True):
     """Message for a set of {lane: worst budget ratio} that exceeded 1.0.
 
     Split out so all three verdicts are reachable from a test. Which one
     applies decides the response, and they are opposite: a tessl-only breach is
     a kernel to fix, an everyone-breached result is a bound to re-derive.
+
+    `externals_scored=False` means no comparison runtime produced a score, so
+    "the others stayed inside" is not evidence anyone has: the verdict must not
+    claim corroboration it lacks.
     """
     tessl = sorted(l for l in over if l.startswith(("tensorops-", "simdgroup-")))
     other = sorted(l for l in over if l not in tessl)
     detail = ", ".join(f"{l} {over[l]:.3f}x" for l in sorted(over))
-    if tessl and not other:
+    if tessl and not other and not externals_scored:
+        verdict = ("Only tessl lanes were scored (no comparison runtime was "
+                   "scored), so this cannot be told apart from a bound that is "
+                   "too tight for these operands: unconfirmed, not a verified "
+                   "kernel defect. Re-run with comparison runtimes.")
+    elif tessl and not other:
         verdict = ("Only tessl lanes exceeded it, and the comparison runtimes "
                    "stayed inside on the same operands: this is a kernel defect.")
     elif other and not tessl:
@@ -265,7 +274,43 @@ def _score(lane, c, ref, mag, scale, k, where):
             elem_rel, worst)
 
 
-def parity(parity_dir):
+def _check_external_lanes(external_lanes, dumped):
+    """Validate a caller-supplied (lane, fn, dtype) list before any scoring.
+
+    A name outside LANE_PRECISION would be scored against a budget nobody
+    chose; a duplicate or a collision with a dumped lane would merge two
+    different runtimes into one row.
+    """
+    try:
+        entries = list(external_lanes)
+    except TypeError:
+        raise SystemExit(f"external_lanes must be a list of (lane, fn, dtype); "
+                         f"got {type(external_lanes).__name__}")
+    seen = set()
+    for i, ent in enumerate(entries):
+        if not isinstance(ent, (tuple, list)) or len(ent) != 3:
+            raise SystemExit(f"external_lanes[{i}] must be a (lane, fn, dtype) "
+                             f"3-tuple, got {ent!r}")
+        lane, fn, dt = ent
+        if not isinstance(lane, str) or lane not in LANE_PRECISION:
+            raise SystemExit(
+                f"external_lanes[{i}]: lane {lane!r} has no entry in "
+                f"LANE_PRECISION; known: {sorted(LANE_PRECISION)}")
+        if not callable(fn):
+            raise SystemExit(f"external_lanes[{i}] ({lane}): fn is not callable")
+        if dt not in ("f32", "bf16"):
+            raise SystemExit(f"external_lanes[{i}] ({lane}): dtype {dt!r} must be "
+                             "'f32' or 'bf16'")
+        if lane in seen:
+            raise SystemExit(f"external_lanes: lane {lane!r} listed more than once")
+        if lane in dumped:
+            raise SystemExit(f"external_lanes: lane {lane!r} collides with a lane "
+                             "in the dump; two runtimes would share one row")
+        seen.add(lane)
+    return [tuple(e) for e in entries]
+
+
+def parity(parity_dir, external_lanes=None):
     """Score every dumped lane on every seed against one float64 reference per
     seed, alongside MLX and torch on those same operands.
 
@@ -277,10 +322,22 @@ def parity(parity_dir):
 
     Reported per lane is the **worst** relative error across all seeds, not the
     last and not the mean: one draw cannot tell a bound from a lucky sample.
+
+    `external_lanes` defaults to EXTERNAL_LANES (live MLX / torch-MPS). A caller
+    that needs a result independent of which runtimes are installed, and of how
+    the installed GPU rounds an f32 matmul, passes its own (lane, fn, dtype)
+    list.
     """
     import os
+    if external_lanes is None:
+        external_lanes = EXTERNAL_LANES
     man = _load_manifest(parity_dir)
     lanes, seeds = man["lanes"], man["seeds"]
+    external_lanes = _check_external_lanes(external_lanes, lanes)
+    if not external_lanes:
+        print("parity: NO COMPARISON RUNTIMES SCORED -- external_lanes is empty, "
+              "so tessl lanes are checked against the float64 reference only and "
+              "carry no cross-runtime corroboration.", file=sys.stderr)
     m, n, k = man["m"], man["n"], man["k"]
     print(f"parity: {len(lanes)} lanes x {len(seeds)} seeds at "
           f"{man.get('shape', '?')} (M={m} N={n} K={k})", file=sys.stderr)
@@ -335,7 +392,7 @@ def parity(parity_dir):
                     "partial check as a complete one.")
             record(lane, "f32", _score(lane, np.load(fn), ref, mag, scale, k, seed))
 
-        for lane, fn, dt in EXTERNAL_LANES:
+        for lane, fn, dt in external_lanes:
             try:
                 c, out_dtype = fn(a, b, dt)
             except Exception as exc:
@@ -350,8 +407,10 @@ def parity(parity_dir):
     # bound is the thing that is wrong.
     over = {lane: max(e["higham"]) for lane, e in acc.items() if max(e["higham"]) > 1.0}
     if over:
-        raise SystemExit(adjudicate(over))
+        raise SystemExit(adjudicate(
+            over, externals_scored=any(l in acc for l, _, _ in external_lanes)))
 
+    n_ext_scored = sum(1 for l, _, _ in external_lanes if l in acc)
     rows = []
     for lane in list(acc) + [l for l in skipped if l not in acc]:
         miss = skipped.get(lane, {})
@@ -384,7 +443,10 @@ def parity(parity_dir):
             # would already have aborted; this says how much headroom is left.
             max_higham_ratio=max(e["higham"]),
             per_seed_rel_err=e["rel"],
-            per_seed_higham=e["higham"]))
+            per_seed_higham=e["higham"],
+            # How many comparison runtimes this run was scored alongside; 0
+            # means the numbers above had no cross-runtime corroboration.
+            external_lanes_scored=n_ext_scored))
         print(f"parity {lane:<22} out={e['out']:<4} norm={max(e['rel']):.2e}  "
               f"elem={max(e['elem']):.2e}  budget={max(e['higham']):.3f}x  "
               f"({len(e['rel'])} seeds)", file=sys.stderr)

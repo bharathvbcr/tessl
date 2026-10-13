@@ -116,7 +116,7 @@ def merge(per_shape, cells):
                 f"absent on {missing}. A lane must cover the whole grid or none.")
         dtypes = {r["out_dtype"] for r in scored}
         if len(dtypes) != 1:
-            raise SystemExit(f"lane {lane}: output dtype varies across cells: {dtypes}")
+            raise SystemExit(f"lane {lane}: output dtype varies across cells: {sorted(dtypes)}")
         worst = max(scored, key=lambda r: r["max_rel_err"])
         # The budget ratio is the one that decides whether a lane is *correct*;
         # the others describe how wrong it is when it is still inside.

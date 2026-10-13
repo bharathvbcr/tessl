@@ -57,29 +57,43 @@ Each layer computes:
 
 ## SafeTensors Checkpoint Loading
 
-`BertSparseModel::load` loads standard HuggingFace / OpenSearch models from a directory containing `model.safetensors` and `config.json`:
+`BertSparseModel::load(rt: &Arc<GpuRuntime>, st: &SafeTensors, cfg: BertConfig)`
+takes an opened checkpoint and a parsed config; `BertConfig::from_config_file`
+(or `from_config_json`) reads the model's `config.json`. Every tensor's shape is
+checked against `cfg`, every weight must be finite, and a checkpoint tensor the
+model never reads is an error. `encode(&self, batch: &[&[u32]], trace: bool)`
+returns a `SparseOutput`:
 
 ```rust
 use std::path::Path;
-use std::sync::Arc;
-use tessl::bert::BertSparseModel;
+use tessl::bert::{BertConfig, BertSparseModel};
+use tessl::safetensors::SafeTensors;
 use tessl::GpuRuntime;
 
-let rt = Arc::new(GpuRuntime::new()?);
-let model = BertSparseModel::load(rt, Path::new("models/opensearch-neural-sparse-encoding-doc-v2-distilbert"))?;
+let rt = GpuRuntime::new()?;
+let dir = Path::new("models/opensearch-neural-sparse-encoding-doc-v2-distilbert");
+let cfg = BertConfig::from_config_file(&dir.join("config.json"))?;
+let st = SafeTensors::open(&dir.join("model.safetensors"))?;
+let model = BertSparseModel::load(&rt, &st, cfg)?;
 
-// Encode a batch of tokenized sequences:
+// Encode a batch of tokenized sequences (the tokenizer's [CLS] and [SEP]
+// already in the ids, each at most `max_positions` long):
 let batch: Vec<Vec<u32>> = vec![
     vec![101, 2054, 2003, 1037, 13997, 102], // "[CLS] what is a document [SEP]"
 ];
 let slices: Vec<&[u32]> = batch.iter().map(|s| s.as_slice()).collect();
 
-// Full vocabulary sparse vector (f32 tensor [batch_size, vocab_size]):
-let sparse_tensor = model.encode(&slices)?;
-
-// Or directly extract top-k non-zero (term_id, weight) pairs for inverted index posting:
-let top_k_postings = model.encode_topk(&slices, 64)?;
+// `trace = false`; `trace = true` takes exactly one sequence.
+let out = model.encode(&slices, false)?;
+// `out.pooled`: Vec<f32>, [batch, vocab], row b is sequence b's sparse vector.
+// `out.forwards`: how many forwards the batch was split into.
 ```
+
+There is no top-k extraction method: `encode` returns the full-vocabulary
+vector, and selecting the non-zero `(term_id, weight)` pairs for an inverted
+index is the caller's job. `SparseOutput::trace` is empty unless `trace` is set;
+with it, it holds the embedding LayerNorm output and the residual stream after
+each layer, `[tokens, hidden]` each.
 
 ## Batching & Memory Safety
 
@@ -90,6 +104,6 @@ let top_k_postings = model.encode_topk(&slices, 64)?;
 ## Numerical Parity & Verification
 
 Every kernel in `kernels/bert.metal` is verified against high-precision float64 or PyTorch reference implementations in `tests/bert_kernels.rs`:
-- Fused LayerNorm: verified against f64 reference with epsilon bounds $\le 10^{-6}$.
-- erf GELU: bit-level parity against exact mathematical erf formulation.
+- LayerNorm (plain, fused and after the embedding sum): within `1e-5 * max(1, max|ref|)` of the f64 reference.
+- erf GELU: within `(1e-6 + 4 x^2 eps) * |ref| + 1e-30`, a relative bound element by element, not bit-for-bit; the tanh approximation must fail the same bound.
 - Segment Sparse Max: tested with randomized logits and variable segment lengths against reference CPU reduction.

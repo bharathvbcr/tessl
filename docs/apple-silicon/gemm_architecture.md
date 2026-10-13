@@ -161,7 +161,10 @@ python3 bench/test_parity_harness.py --require-gpu
 ```
 
 Measured on M5 Pro over an **8 shape x 5 distribution x 4 seed grid**
-(`bench/results/gemm_parity_grid_m5pro.json`), 320 scored cells per lane. Three
+(`bench/results/gemm_parity_grid_m5pro.json`), 320 scored cells per lane. The
+file is imported from the MLSystemsLab copy of this crate (see
+`bench/results/PROVENANCE.md`): these numbers are that copy's, not a run of
+this tree's kernels. Three
 numbers per lane, because they answer different questions:
 
 | lane | out | normwise | worst element | budget used | worst cell |

@@ -67,11 +67,15 @@ It fails closed rather than skipping:
   exists, and a pinned kernel whose geometry it cannot see each fail the audit;
 - an audit that parsed no kernels, or checked no Rust dispatch pairs, fails.
 
-Its `PASS` line names what it checked. On 2026-10-07:
+Its `PASS` line names what it checked. At `2972027`
+(`python3 scripts/audit_gemm_tiles.py`, exit status 0):
 
 ```
-PASS: tile geometry: 27 kernels, 31 Rust dispatch pairs; 0 exempt (none)
+PASS: tile geometry: 33 kernels, 38 Rust dispatch pairs; 0 exempt (none)
 ```
+
+The counts move whenever a kernel or a dispatch site is added; the script's own
+output, not this document, is the current figure.
 
 Paths resolve from the script's own location, so it runs from any directory and
 from inside an extracted `.crate`. `tests/audit_gemm_tiles.rs` runs a copy of the
@@ -489,9 +493,11 @@ log.
 
 ## Current state
 
-> The figures below are the 2026-09-19 run. A `#[test]` count on 2026-10-02 finds
-> 530 test functions across `tests/` and `src/`; the GPU suite has not been
-> re-run for this document, so the pass counts below are not yet updated.
+> The pass counts below are the 2026-09-19 run and have not been re-run at
+> `2972027`. At that commit `rg -c '^\s*#\[test\]' src tests` sums to 800
+> `#[test]` functions (177 in `src/`, 623 in `tests/`), and 14 lines start
+> `#[ignore` (`rg '^\s*#\[ignore' src tests | wc -l`). A `#[test]` count is
+> what is collected, not what passes: no pass count is quoted for `2972027`.
 
 Re-measured 2026-09-19 with `cargo test --release -- --test-threads=1`, which is
 mandatory rather than tuning: GPU tests share default command encoders across
@@ -511,6 +517,7 @@ On 2026-10-05 (M5 Pro, macOS 27.0.1) this ran 9 tests, 9 passing. Before
 `tensor_from_buffer` faulted on every call.
 
 ```
+(2026-09-19 run; NOT re-run at 2972027, where 800 #[test] functions exist)
 lib tests      95 (94 passing, 1 #[ignore]d deep soak)
 integration    251 across 33 files
 doc tests      4
@@ -518,10 +525,10 @@ total          349 passing, 0 failing, 1 ignored
 ```
 
 ```
-audit          PASS (2026-10-06): tile geometry, 26 kernels, 30 Rust dispatch
-               pairs; 1 exempt. Tile geometry is all it checks (section 1)
-GDN mutations  19 of 19 caught (section 6, re-run this pass)
-fault tests    NOT RE-RUN this pass. Last recorded: 6 of 6 caught
+audit          PASS (re-run at 2972027): tile geometry, 33 kernels, 38 Rust
+               dispatch pairs; 0 exempt. Tile geometry is all it checks (section 1)
+GDN mutations  19 of 19 caught (section 6; 2026-10-06 pass, not re-run at 2972027)
+fault tests    NOT RE-RUN at 2972027. Last recorded: 6 of 6 caught
 ```
 
 The last line is carried forward from an earlier pass, not measured here. It is

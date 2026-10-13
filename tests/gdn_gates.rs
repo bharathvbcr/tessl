@@ -19,7 +19,7 @@
 //! which is the Mamba2 / SSD decay from a *different* mixer in the same source
 //! file. The gated delta rule's gate is a plain sigmoid of a per-head-biased
 //! logit (`nanolab/mixers.py:803-804`, recorded in
-//! `qwen-decision/AUDIT/gdn-reference-and-contracts.md` §4.2). `A_log` and
+//! `Lappi-decision/AUDIT/gdn-reference-and-contracts.md` §4.2). `A_log` and
 //! `dt_bias` are not GDN parameters; `decay_bias` is.
 //!
 //! The audit calls this the most dangerous single error in the plan, and the

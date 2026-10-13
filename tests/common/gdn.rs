@@ -428,7 +428,7 @@ pub struct GateBias<'a> {
 /// **K7.** The published gate production: `sigmoid(gate + per-head bias)`, clamped.
 ///
 /// `MLSystemsLab/nanolab/mixers.py:803-804`, as recorded in
-/// `qwen-decision/AUDIT/gdn-reference-and-contracts.md` §4.2:
+/// `Lappi-decision/AUDIT/gdn-reference-and-contracts.md` §4.2:
 ///
 /// ```text
 /// alpha = sigmoid(a_gate + decay_bias ).clamp(1e-4, 1.0)

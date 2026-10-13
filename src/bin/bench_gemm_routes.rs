@@ -8,7 +8,7 @@
 //!
 //! The method of `bench/results/splitk_gate_m5pro.txt` and
 //! `bf16_smallm_coop_m5pro.txt`, which were measured on the MLSystemsLab copy
-//! of this crate: async encode, `BENCH_REPS` GEMMs per command buffer (20) so
+//! of this crate (imported; see bench/results/PROVENANCE.md): async encode, `BENCH_REPS` GEMMs per command buffer (20) so
 //! the clock sees the kernels and not the submit, `BENCH_ITERS` calls per arm
 //! per round (8), `BENCH_ROUNDS` rounds (6) with the arm order reversed
 //! every other round, after `BENCH_WARMUP` calls of each arm (2). A ratio is

@@ -98,8 +98,10 @@ impl GdnTrainDims {
 }
 
 /// Scratch for [`gdn_train_backward`]: one chunk of recomputed states per
-/// threadgroup, and the per-slice partial gradients. Sized for one shape and
-/// reusable across layers and steps of that shape or smaller.
+/// threadgroup, and the per-slice partial gradients. Sized for exactly one
+/// [`GdnTrainDims`] and reusable across layers and steps of that same shape;
+/// [`gdn_train_backward`] returns an error for any other dims, smaller ones
+/// included.
 pub struct GdnTrainWorkspace {
     dims: GdnTrainDims,
     scratch: Tensor,

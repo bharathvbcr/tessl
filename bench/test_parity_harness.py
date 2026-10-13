@@ -26,7 +26,11 @@ import numpy as np
 
 HERE_BENCH = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE_BENCH)
-from gemm_sweep_mlx import parity as _parity  # noqa: E402
+import contextlib  # noqa: E402
+import io  # noqa: E402
+
+import gemm_sweep_mlx  # noqa: E402
+from gemm_sweep_mlx import adjudicate, parity as _parity  # noqa: E402
 
 
 def _exact_runtime(a, b, dtype):
@@ -49,6 +53,146 @@ STUB_EXTERNAL_LANES = [(lane, _exact_runtime, "f32")
 
 def parity(parity_dir):
     return _parity(parity_dir, external_lanes=STUB_EXTERNAL_LANES)
+
+
+def _bf16(x):
+    """Round float32 to bfloat16 (nearest-even) and return it as float64."""
+    u = np.ascontiguousarray(x, dtype=np.float32).view(np.uint32).astype(np.uint64)
+    u = (u + 0x7FFF + ((u >> 16) & 1)) & 0xFFFF0000
+    return u.astype(np.uint32).view(np.float32).astype(np.float64)
+
+
+def _bf16_runtime(a, b, dtype):
+    """Stand-in bf16 runtime: bf16 operands, exact product, bf16 result."""
+    c = _bf16(a) @ _bf16(b)
+    return _bf16(c.astype(np.float32)).astype(np.float32), "bf16"
+
+
+BF16_STUB_LANES = [("mlx-bf16", _bf16_runtime, "bf16"),
+                   ("torch-mps-bf16", _bf16_runtime, "bf16")]
+
+
+def external_lane_contracts(tmp):
+    """`parity(external_lanes=...)`: validation, skip/abort paths, defaults."""
+    good = build_dump(os.path.join(tmp, "ext"), seeds=3)
+    both = STUB_EXTERNAL_LANES + BF16_STUB_LANES
+
+    def run(lanes):
+        return _parity(good, external_lanes=lanes)
+
+    print("\n-- external_lanes: bf16 stubs are scored through the out_u budget --")
+    rows = check("f32 + bf16 stub lanes", lambda: run(both), expect_reject=False)
+    if rows is not None:
+        got = {r["lane"]: r for r in rows}
+        for lane in ("mlx-bf16", "torch-mps-bf16"):
+            r = got.get(lane)
+            if r is None or r.get("out_dtype") != "bf16" or r.get("seeds") != 3:
+                FAILURES.append(f"{lane} stub not scored as bf16 on 3 seeds: {r}")
+                print(f"  FAIL  {lane} stub not scored")
+            else:
+                print(f"  ok    {lane} scored as bf16 on 3 seeds, "
+                      f"budget {r['max_higham_ratio']:.3f}x")
+        if any(r.get("external_lanes_scored") != 4 for r in rows if "skipped" not in r):
+            FAILURES.append("rows do not report 4 comparison runtimes scored")
+            print("  FAIL  external_lanes_scored != 4")
+
+    print("\n-- external_lanes: a lane that raises on every seed is a visible skip --")
+    def boom(a, b, dt):
+        raise RuntimeError("stub boom")
+    rows = check("raises on every seed",
+                 lambda: run([("mlx-f32", boom, "f32"), STUB_EXTERNAL_LANES[1]]),
+                 expect_reject=False)
+    if rows is not None:
+        r = next((x for x in rows if x["lane"] == "mlx-f32"), None)
+        if not r or "stub boom" not in r.get("skipped", "") or r.get("seeds") != 0:
+            FAILURES.append(f"skip reason not surfaced: {r}")
+            print(f"  FAIL  skip reason not surfaced: {r}")
+        else:
+            print("  ok    skipped row carries the reason 'stub boom'")
+
+    print("\n-- external_lanes: partial-seed and dtype-flip lanes abort --")
+    calls = {"n": 0}
+    def boom_on_third(a, b, dt):
+        calls["n"] += 1
+        if calls["n"] == 3:
+            raise RuntimeError("stub seed-2 failure")
+        return _exact_runtime(a, b, dt)
+    check("raises on seed 2 only",
+          lambda: run([("mlx-f32", boom_on_third, "f32")]), True,
+          "cover every seed")
+    flips = {"n": 0}
+    def flip(a, b, dt):
+        flips["n"] += 1
+        c, _ = _exact_runtime(a, b, dt)
+        return c, ("f32" if flips["n"] == 1 else "bf16")
+    check("dtype label flips between seeds",
+          lambda: run([("mlx-f32", flip, "f32")]), True, "dtype changed")
+
+    print("\n-- external_lanes: malformed lists are refused up front --")
+    ok = STUB_EXTERNAL_LANES[0]
+    for label, lanes, needle in (
+        ("duplicate name", [ok, ok], "more than once"),
+        ("collides with a dumped lane", [("tensorops-f32", _exact_runtime, "f32")],
+         "collides"),
+        ("unknown name", [("cuda-f32", _exact_runtime, "f32")], "LANE_PRECISION"),
+        ("not a 3-tuple", [("mlx-f32", _exact_runtime)], "3-tuple"),
+        ("fn not callable", [("mlx-f32", None, "f32")], "callable"),
+        ("bad dtype", [("mlx-f32", _exact_runtime, "f16")], "dtype"),
+        ("not iterable", 7, "list of"),
+    ):
+        check(f"external_lanes {label}", lambda l=lanes: run(l), True, needle)
+
+    print("\n-- external_lanes: None means the live EXTERNAL_LANES, by identity --")
+    sentinel = {"called": 0}
+    def stub_live(a, b, dt):
+        sentinel["called"] += 1
+        return _exact_runtime(a, b, dt)
+    real = gemm_sweep_mlx.EXTERNAL_LANES
+    gemm_sweep_mlx.EXTERNAL_LANES = [("mlx-f32", stub_live, "f32")]
+    try:
+        rows = check("external_lanes=None", lambda: _parity(good), expect_reject=False)
+    finally:
+        gemm_sweep_mlx.EXTERNAL_LANES = real
+    if rows is not None:
+        if sentinel["called"] == 3:
+            print("  ok    None resolved to the module's EXTERNAL_LANES (3 seeds)")
+        else:
+            FAILURES.append(f"None did not use EXTERNAL_LANES: {sentinel}")
+            print(f"  FAIL  None did not use EXTERNAL_LANES: {sentinel}")
+
+    print("\n-- external_lanes=[]: loud note, and no claimed corroboration --")
+    err = io.StringIO()
+    with contextlib.redirect_stderr(err):
+        rows = check("empty external_lanes", lambda: run([]), expect_reject=False)
+    if rows is not None:
+        if "NO COMPARISON RUNTIMES SCORED" not in err.getvalue():
+            FAILURES.append("empty external_lanes printed no loud note")
+            print("  FAIL  no loud note for empty external_lanes")
+        elif any(r.get("external_lanes_scored") != 0 for r in rows):
+            FAILURES.append("rows claim comparison runtimes that were not scored")
+            print("  FAIL  rows claim external runtimes")
+        else:
+            print("  ok    loud note printed; rows report external_lanes_scored=0")
+    d = build_dump(os.path.join(tmp, "ext_drift"))
+    for sd in os.listdir(d):
+        if sd.startswith("seed_"):
+            fn = os.path.join(d, sd, "parity_c_tensorops-f32.npy")
+            np.save(fn, (np.load(fn).astype(np.float64) * (1 + 1e-5)).astype(np.float32))
+    try:
+        with contextlib.redirect_stderr(io.StringIO()):
+            _parity(d, external_lanes=[])
+        FAILURES.append("drifted lane accepted with no comparison runtimes")
+        print("  FAIL  drifted lane accepted")
+    except SystemExit as exc:
+        msg = str(exc)
+        if "unconfirmed" in msg and "stayed inside" not in msg:
+            print("  ok    tessl-only breach with no externals is called unconfirmed")
+        else:
+            FAILURES.append(f"verdict claims corroboration it lacks: {msg}")
+            print(f"  FAIL  verdict claims corroboration: {msg}")
+    if "stayed inside" in adjudicate({"tensorops-f32": 2.0}, externals_scored=False):
+        FAILURES.append("adjudicate claims externals stayed inside with none scored")
+        print("  FAIL  adjudicate(externals_scored=False) claims corroboration")
 
 M, N, K = 32, 24, 16
 LANES = ["tensorops-f32", "simdgroup-f32", "tensorops-bf16", "tensorops-tf32"]
@@ -1632,7 +1776,6 @@ def main(argv=None):
               "LANE_PRECISION")
 
         print("\n-- budget verdicts (which response the breach calls for) --")
-        from gemm_sweep_mlx import adjudicate
         for name, over, needle in (
             ("tessl only", {"tensorops-bf16": 2.0}, "kernel defect"),
             ("comparison runtime only", {"torch-mps-bf16": 2.0}, "other runtime is the outlier"),
@@ -1645,6 +1788,7 @@ def main(argv=None):
             else:
                 FAILURES.append(f"adjudicate({name}) lacks {needle!r}: {msg}")
                 print(f"  FAIL  {name}: lacks {needle!r}")
+        external_lane_contracts(tmp)
     except SystemExit as exc:
         FAILURES.append(f"parity scorer contracts: exited unexpectedly -- {exc}")
         print(f"  FAIL  parity scorer contracts: unexpected exit: {exc}")

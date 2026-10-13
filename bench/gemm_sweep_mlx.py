@@ -265,7 +265,7 @@ def _score(lane, c, ref, mag, scale, k, where):
             elem_rel, worst)
 
 
-def parity(parity_dir):
+def parity(parity_dir, external_lanes=None):
     """Score every dumped lane on every seed against one float64 reference per
     seed, alongside MLX and torch on those same operands.
 
@@ -277,8 +277,15 @@ def parity(parity_dir):
 
     Reported per lane is the **worst** relative error across all seeds, not the
     last and not the mean: one draw cannot tell a bound from a lucky sample.
+
+    `external_lanes` defaults to EXTERNAL_LANES (live MLX / torch-MPS). A caller
+    that needs a result independent of which runtimes are installed, and of how
+    the installed GPU rounds an f32 matmul, passes its own (lane, fn, dtype)
+    list.
     """
     import os
+    if external_lanes is None:
+        external_lanes = EXTERNAL_LANES
     man = _load_manifest(parity_dir)
     lanes, seeds = man["lanes"], man["seeds"]
     m, n, k = man["m"], man["n"], man["k"]
@@ -335,7 +342,7 @@ def parity(parity_dir):
                     "partial check as a complete one.")
             record(lane, "f32", _score(lane, np.load(fn), ref, mag, scale, k, seed))
 
-        for lane, fn, dt in EXTERNAL_LANES:
+        for lane, fn, dt in external_lanes:
             try:
                 c, out_dtype = fn(a, b, dt)
             except Exception as exc:

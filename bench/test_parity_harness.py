@@ -26,7 +26,29 @@ import numpy as np
 
 HERE_BENCH = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE_BENCH)
-from gemm_sweep_mlx import parity  # noqa: E402
+from gemm_sweep_mlx import parity as _parity  # noqa: E402
+
+
+def _exact_runtime(a, b, dtype):
+    """Stand-in comparison runtime: the float64 product rounded once to f32.
+
+    The scorer-contract fixtures must not depend on which of MLX / torch-MPS is
+    installed or on how the local GPU rounds an f32 matmul. On this machine MLX
+    0.32.3's GPU f32 matmul errs by ~3.5e-3 absolute where its CPU stream errs by
+    ~7e-7 (it is reduced precision), so a live MLX lane busts the f32 budget by
+    ~600x on a perfectly valid dump -- and which interpreter happened to have
+    `mlx` importable decided whether this suite passed.
+    """
+    return (a.astype(np.float64) @ b.astype(np.float64)).astype(np.float32), "f32"
+
+
+# Same lane names and scoring path as the live ones, deterministic outputs.
+STUB_EXTERNAL_LANES = [(lane, _exact_runtime, "f32")
+                       for lane in ("mlx-f32", "torch-mps-f32")]
+
+
+def parity(parity_dir):
+    return _parity(parity_dir, external_lanes=STUB_EXTERNAL_LANES)
 
 M, N, K = 32, 24, 16
 LANES = ["tensorops-f32", "simdgroup-f32", "tensorops-bf16", "tensorops-tf32"]

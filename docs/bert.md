@@ -66,12 +66,11 @@ returns a `SparseOutput`:
 
 ```rust
 use std::path::Path;
-use std::sync::Arc;
 use tessl::bert::{BertConfig, BertSparseModel};
 use tessl::safetensors::SafeTensors;
 use tessl::GpuRuntime;
 
-let rt = Arc::new(GpuRuntime::new()?);
+let rt = GpuRuntime::new()?;
 let dir = Path::new("models/opensearch-neural-sparse-encoding-doc-v2-distilbert");
 let cfg = BertConfig::from_config_file(&dir.join("config.json"))?;
 let st = SafeTensors::open(&dir.join("model.safetensors"))?;

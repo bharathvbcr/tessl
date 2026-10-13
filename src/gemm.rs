@@ -3667,7 +3667,8 @@ mod coop_tile_select {
     const BF16_WIDE: &str = "matmul2d_tensorops_bf16_f32";
 
     /// The rule `bench/results/bf16_smallm_coop_m5pro.txt` described on the
-    /// MLSystemsLab copy and bench/results/bf16_smallm_coop_reconciled_m5pro.txt
+    /// MLSystemsLab copy (imported; see bench/results/PROVENANCE.md) and
+    /// bench/results/bf16_smallm_coop_reconciled_m5pro.txt
     /// re-measured here: bf16 takes 64x64 while C has fewer than 64 tiles of
     /// 128x64, on top of N <= 512 and short M.
     #[test]

@@ -1138,7 +1138,8 @@ impl DecodeChunk {
 /// useful widths are shape-derived: `Group` is `H/Hkv` simdgroups, `AllHeads`
 /// is `H`.
 ///
-/// Measured, `bench/attn_tune.py --knob decode-sgs --batched 32`, median ms:
+/// Measured, `bench/attn_tune.py --knob decode-sgs --batched 32`, median ms
+/// (stored in `bench/results/attn_tune_decode_sgs_m5pro.json` (imported from the MLSystemsLab copy; see bench/results/PROVENANCE.md)):
 ///
 /// | config | one | group | all |
 /// |---|---|---|---|
@@ -1211,14 +1212,16 @@ pub fn decode_head_block_for(d: u32) -> DecodeHeadBlock {
 
 /// Threads per threadgroup in the decode reduce pass.
 ///
-/// Swept with `bench/attn_tune.py --knob reduce-w --batched 32`; it is a
+/// Swept with `bench/attn_tune.py --knob reduce-w --batched 32`
+/// (`bench/results/attn_tune_reduce_w_m5pro.json` (imported from the MLSystemsLab copy; see bench/results/PROVENANCE.md)); it is a
 /// dispatch parameter, not a compiled constant, so the values are not kernels.
 pub const DECODE_REDUCE_THREADS: usize = 256;
 
 /// Chunk size chosen per head dimension.
 ///
 /// Measured with `bench/attn_tune.py --knob decode --batched 32`, five
-/// interleaved rounds (median ms). The `--batched 32` matters: swept at one
+/// interleaved rounds (median ms; `bench/results/attn_tune_decode_kernel_m5pro.json`
+/// (imported from the MLSystemsLab copy; see bench/results/PROVENANCE.md)). The `--batched 32` matters: swept at one
 /// launch per submit, ~88% of every number is the host round trip, which
 /// compresses the margins towards 1.0x and decides near-ties on noise.
 ///
@@ -1290,7 +1293,8 @@ fn decode_entries(d: u32, c: DecodeChunk, r: RowsLanes) -> Option<(&'static str,
 /// Lanes per key in the decode partial pass, per head dimension.
 ///
 /// Measured with `bench/attn_tune.py --knob decode-r --batched 32`, five
-/// interleaved rounds (median ms):
+/// interleaved rounds (median ms; `bench/results/attn_tune_decode_r_kernel_m5pro.json`
+/// (imported from the MLSystemsLab copy; see bench/results/PROVENANCE.md)):
 ///
 /// | config | R=8 | R=16 | R=32 |
 /// |---/// |---/// |---/// |---|
@@ -1723,7 +1727,7 @@ pub fn rows_lanes_for(d: u32) -> RowsLanes {
 
 /// Measured with `bench/attn_tune.py --knob rows`, five interleaved rounds
 /// (median ms) -- generated from
-/// `bench/results/attn_tune_rows_m5pro.json`, not transcribed:
+/// `bench/results/attn_tune_rows_m5pro.json` (imported from the MLSystemsLab copy; see bench/results/PROVENANCE.md), not transcribed:
 ///
 /// | config | R=8 | R=16 | R=32 | winner |
 /// |---|---|---|---|---|
@@ -1744,7 +1748,8 @@ pub const ROWS_LANES_D512: RowsLanes = RowsLanes::R32;
 
 /// Simdgroups per threadgroup, per head dimension.
 ///
-/// Swept with `bench/attn_tune.py --knob rows-g`. It was a single constant 8
+/// Swept with `bench/attn_tune.py --knob rows-g` (`bench/results/attn_tune_rows_g_m5pro.json`
+/// (imported from the MLSystemsLab copy; see bench/results/PROVENANCE.md)). It was a single constant 8
 /// for every head dim, and that is what left D=512 behind: rows per threadgroup
 /// are `SGT * 32/R`, so at R=32 eight simdgroups gave 8 rows of reuse per K/V
 /// line against 32 at D=128/R=8 — the same arithmetic per byte over four times
@@ -3368,8 +3373,9 @@ impl Q4MlxBank<'_> {
 /// nibbles at a time (`SIMD_ROWS_PER_TG` = 8 rows per 64-thread threadgroup).
 /// `x` is read straight from device memory, not staged in threadgroup memory
 /// (the kernel stopped staging it on 2026-09-05), so `cols` is not bounded by
-/// [`GpuRuntime::max_threadgroup_memory`]; the host validates only buffer
-/// lengths and the group size.
+/// [`GpuRuntime::max_threadgroup_memory`]. The host validates the bank's
+/// buffer lengths and group size, the lengths of `x` and `y`, and that `y`
+/// does not alias the weights, scales, zeros or `x`.
 ///
 /// Set `tiled` to use `gemv_q4_tiled`, the A/B baseline: one 128-thread
 /// threadgroup per output row with a scalar inner loop and a threadgroup

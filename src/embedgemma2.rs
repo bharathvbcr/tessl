@@ -297,9 +297,8 @@ pub fn upload_segments(rt: &Arc<GpuRuntime>, segments: &[(u32, u32)], rows: u32)
         }
     }
     let flat: Vec<u32> = segments.iter().flat_map(|&(a, b)| [a, b]).collect();
-    let buf = rt.alloc_buffer(flat.len().max(1) * 4)?;
-    buf.write_u32(&flat);
-    Ok(buf)
+    rt.alloc_buffer_from_u32(&flat)
+        .map_err(|e| format!("embedgemma2::upload_segments: {e}"))
 }
 
 /// `out[s] = mean(x[start_s..end_s])` over `x: [rows, dim]` f32, into `out:
@@ -859,8 +858,10 @@ impl EmbedGemma2Model {
         self.max_tokens
     }
 
-    /// Raise or lower the per-sequence token limit (the position table goes
-    /// to 262144; the model card states 8192).
+    /// Raise or lower the per-sequence token limit, up to
+    /// [`MAX_BATCH_TOKENS`] (32768). RoPE has no position table, so the
+    /// checkpoint's `max_position_embeddings` (262144) is not a limit here;
+    /// the model card states 8192 ([`DEFAULT_MAX_TOKENS`]).
     pub fn set_max_tokens(&mut self, max_tokens: u32) -> Result<(), String> {
         if max_tokens == 0 || max_tokens as usize > MAX_BATCH_TOKENS {
             return Err(format!(

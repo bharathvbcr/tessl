@@ -901,30 +901,43 @@ impl DecodeIcb {
 
     /// Like [`Self::mini_copy_chain`] with explicit freeze-binds control.
     pub fn mini_copy_chain_ex(rt: &GpuRuntime, n: usize, freeze_binds: bool) -> Result<(Self, GpuBuffer), String> {
+        const WHAT: &str = "DecodeIcb::mini_copy_chain";
         if n == 0 {
-            return Err("DecodeIcb::mini_copy_chain: n > 0".into());
+            return Err(format!("{WHAT}: n > 0"));
         }
+        let n32 = u32::try_from(n).map_err(|_| format!("{WHAT}: n = {n} does not fit a u32"))?;
+        let nbytes = n
+            .checked_mul(4)
+            .ok_or_else(|| format!("{WHAT}: n = {n} overflows n * 4 bytes"))?;
         // Hot/shared staging: classic setKernelBuffer freeze is flaky with
         // Private-only allocs on some SDK paths; Hot matches layer-graph residency.
-        let a = rt.alloc_buffer_hot(n * 4)?;
-        let b = rt.alloc_buffer_hot(n * 4)?;
-        let c = rt.alloc_buffer_hot(n * 4)?;
+        let a = rt.alloc_buffer_hot(nbytes)?;
+        let b = rt.alloc_buffer_hot(nbytes)?;
+        let c = rt.alloc_buffer_hot(nbytes)?;
         let n_buf = rt.alloc_buffer_hot(4)?;
-        n_buf.write_u32(&[n as u32]);
-        // SAFETY: `a`, `b` and `c` were each allocated at `n * 4` bytes just
-        // above and are not yet shared with anything, so these writes are
-        // unaliased and in bounds. They are Hot (shared-storage) buffers, so
-        // `contents()` is a valid, Metal-aligned host pointer. No command
-        // referencing them has been encoded yet.
-        unsafe {
-            let p = a.metal().contents().as_ptr() as *mut f32;
-            for i in 0..n {
-                *p.add(i) = (i as f32) + 1.0;
+        // One host-access lease for the whole initialisation: a live host
+        // mapping (or an active encoder or submit) makes this fail as "busy"
+        // instead of racing the writes below.
+        {
+            let _access = rt.acquire_access().map_err(|e| format!("{WHAT}: {e}"))?;
+            // SAFETY: `_access` is held until the end of this block, so no
+            // other host mapping, encoder or submit exists. `a`, `b`, `c` were
+            // each allocated at `n * 4` bytes and `n_buf` at 4 just above and are
+            // not yet shared with anything, so these writes are unaliased and in
+            // bounds. They are Hot (shared-storage) buffers, so `contents()` is
+            // a valid, Metal-aligned host pointer. No command referencing them
+            // has been encoded yet.
+            unsafe {
+                n_buf.write_u32_unsubmitted(&[n32]);
+                let p = a.metal().contents().as_ptr() as *mut f32;
+                for i in 0..n {
+                    *p.add(i) = (i as f32) + 1.0;
+                }
+                let zb = b.metal().contents().as_ptr() as *mut u8;
+                let zc = c.metal().contents().as_ptr() as *mut u8;
+                std::ptr::write_bytes(zb, 0, nbytes);
+                std::ptr::write_bytes(zc, 0, nbytes);
             }
-            let zb = b.metal().contents().as_ptr() as *mut u8;
-            let zc = c.metal().contents().as_ptr() as *mut u8;
-            std::ptr::write_bytes(zb, 0, n * 4);
-            std::ptr::write_bytes(zc, 0, n * 4);
         }
         let pipe = pipeline_icb(rt, "copy_f32")?;
         let tpt = pipe.threadExecutionWidth().min(n).max(1);

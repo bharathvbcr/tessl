@@ -851,7 +851,7 @@ fn library_from_data(
 }
 
 impl GpuRuntime {
-    fn acquire_access(&self) -> Result<RuntimeAccess, String> {
+    pub(crate) fn acquire_access(&self) -> Result<RuntimeAccess, String> {
         if self.poison.is_set() {
             return Err(self.poison.error());
         }

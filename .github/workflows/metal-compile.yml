@@ -124,3 +124,7 @@ jobs:
 
       - name: Clippy
         run: cargo clippy --release --all-targets -- -D warnings
+
+      - name: Clippy (quant-prep)
+        # `mtl_tensor` is compiled only with `quant-prep`.
+        run: cargo clippy --release --all-targets --features quant-prep -- -D warnings

@@ -272,53 +272,145 @@ fn bracketed(s: &str, open: usize) -> (&str, usize) {
     );
 }
 
-/// Drops `# ...` to the end of each line, leaving `#` inside a one-line
-/// string literal alone. Line structure is kept so later offsets still line up.
+/// Drops Python comments and the contents of triple-quoted strings (docstrings
+/// are text, not declarations). Strings are lexed with backslash escapes, so a
+/// `#` or quote after `\"` is read the way Python reads it. Newlines are kept
+/// so later line structure still lines up.
 fn strip_py_comments(src: &str) -> String {
-    src.lines()
-        .map(|l| {
-            let mut quote = None;
-            for (i, c) in l.char_indices() {
-                match (quote, c) {
-                    (None, '#') => return &l[..i],
-                    (None, '"' | '\'') => quote = Some(c),
-                    (Some(q), _) if c == q => quote = None,
-                    _ => {}
+    let c: Vec<char> = src.chars().collect();
+    let (mut out, mut i) = (String::new(), 0usize);
+    while i < c.len() {
+        let ch = c[i];
+        if ch == '#' {
+            while i < c.len() && c[i] != '\n' {
+                i += 1;
+            }
+        } else if ch == '"' || ch == '\'' {
+            let triple = i + 2 < c.len() && c[i + 1] == ch && c[i + 2] == ch;
+            if triple {
+                i += 3;
+                while i < c.len() && !(c[i] == ch && c.get(i + 1) == Some(&ch) && c.get(i + 2) == Some(&ch)) {
+                    if c[i] == '\\' {
+                        i += 1;
+                    }
+                    if let Some(&n) = c.get(i) {
+                        if n == '\n' {
+                            out.push('\n');
+                        }
+                    }
+                    i += 1;
+                }
+                i += 3;
+            } else {
+                out.push(ch);
+                i += 1;
+                while i < c.len() && c[i] != ch && c[i] != '\n' {
+                    if c[i] == '\\' && i + 1 < c.len() && c[i + 1] != '\n' {
+                        out.push(c[i]);
+                        i += 1;
+                    }
+                    out.push(c[i]);
+                    i += 1;
+                }
+                if i < c.len() && c[i] == ch {
+                    out.push(ch);
+                    i += 1;
                 }
             }
-            l
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
-/// Drops `/* ... */` (which nests in Rust), keeping newlines.
-fn strip_block_comments(src: &str) -> String {
-    let (mut out, mut depth, mut rest) = (String::new(), 0usize, src);
-    while !rest.is_empty() {
-        if rest.starts_with("/*") {
-            depth += 1;
-            rest = &rest[2..];
-        } else if depth > 0 && rest.starts_with("*/") {
-            depth -= 1;
-            rest = &rest[2..];
         } else {
-            let c = rest.chars().next().unwrap();
-            if depth == 0 || c == '\n' {
-                out.push(c);
-            }
-            rest = &rest[c.len_utf8()..];
+            out.push(ch);
+            i += 1;
         }
     }
     out
 }
 
+/// Drops Rust `//` and (nesting) `/* */` comments, keeping newlines. One
+/// lexer, so a comment opener inside a string, a char literal or another
+/// comment is not an opener, and a string's text is kept whole.
 fn strip_line_comments(src: &str) -> String {
-    strip_block_comments(src)
-        .lines()
-        .map(|l| l.find("//").map_or(l, |i| &l[..i]))
-        .collect::<Vec<_>>()
-        .join("\n")
+    let c: Vec<char> = src.chars().collect();
+    let (mut out, mut i) = (String::new(), 0usize);
+    while i < c.len() {
+        let at = |j: usize| c.get(j).copied();
+        if c[i] == '/' && at(i + 1) == Some('/') {
+            while i < c.len() && c[i] != '\n' {
+                i += 1;
+            }
+        } else if c[i] == '/' && at(i + 1) == Some('*') {
+            let mut depth = 0usize;
+            loop {
+                if at(i) == Some('/') && at(i + 1) == Some('*') {
+                    depth += 1;
+                    i += 2;
+                } else if at(i) == Some('*') && at(i + 1) == Some('/') {
+                    depth -= 1;
+                    i += 2;
+                    if depth == 0 {
+                        break;
+                    }
+                } else if let Some(x) = at(i) {
+                    if x == '\n' {
+                        out.push('\n');
+                    }
+                    i += 1;
+                } else {
+                    break;
+                }
+            }
+        } else if c[i] == 'r'
+            && matches!(at(i + 1), Some('"' | '#'))
+            && !at(i.wrapping_sub(1)).is_some_and(|p| p.is_alphanumeric() || p == '_')
+        {
+            // Raw string: r"..." or r#"..."#.
+            let mut j = i + 1;
+            while at(j) == Some('#') {
+                j += 1;
+            }
+            if at(j) != Some('"') {
+                out.push(c[i]);
+                i += 1;
+                continue;
+            }
+            let hashes = j - i - 1;
+            j += 1;
+            while j < c.len() && !(c[j] == '"' && (1..=hashes).all(|k| at(j + k) == Some('#'))) {
+                j += 1;
+            }
+            let end = (j + 1 + hashes).min(c.len());
+            out.extend(&c[i..end]);
+            i = end;
+        } else if c[i] == '"' {
+            out.push('"');
+            i += 1;
+            while i < c.len() && c[i] != '"' {
+                if c[i] == '\\' && i + 1 < c.len() {
+                    out.push(c[i]);
+                    i += 1;
+                }
+                out.push(c[i]);
+                i += 1;
+            }
+            if i < c.len() {
+                out.push('"');
+                i += 1;
+            }
+        } else if c[i] == '\'' {
+            // A char literal ('x', '\n', '\'') or a lifetime ('a).
+            let end = match (at(i + 1), at(i + 2)) {
+                (Some('\\'), _) => (i + 3..c.len().min(i + 14)).find(|&j| c[j] == '\''),
+                (Some(_), Some('\'')) => Some(i + 2),
+                _ => None,
+            };
+            let to = end.map_or(i + 1, |e| e + 1);
+            out.extend(&c[i..to]);
+            i = to;
+        } else {
+            out.push(c[i]);
+            i += 1;
+        }
+    }
+    out
 }
 
 /// `<decl>NAME[: T] = <integer>` constants, for array lengths.
@@ -1223,7 +1315,6 @@ fn a_block_commented_export_is_not_an_export() {
 const PHANTOM_FN: &str = "pub extern \"C\" fn tessl_phantom(x: u32) -> i32 { 0 }";
 
 #[test]
-#[ignore = "known gap: comment strippers are not string/comment aware"]
 fn a_block_opener_inside_a_line_comment_does_not_swallow_a_real_export() {
     let (_, py) = real();
     let rs = format!("{}\n// see the /* legacy path\n{PHANTOM_FN}\n", read(RS));
@@ -1232,7 +1323,6 @@ fn a_block_opener_inside_a_line_comment_does_not_swallow_a_real_export() {
 }
 
 #[test]
-#[ignore = "known gap: comment strippers are not string/comment aware"]
 fn a_block_opener_inside_a_string_literal_does_not_swallow_a_real_export() {
     let (_, py) = real();
     let rs = format!("{}\nconst GLOB: &str = \"/*\";\n{PHANTOM_FN}\n", read(RS));
@@ -1241,7 +1331,6 @@ fn a_block_opener_inside_a_string_literal_does_not_swallow_a_real_export() {
 }
 
 #[test]
-#[ignore = "known gap: comment strippers are not string/comment aware"]
 fn a_line_comment_marker_inside_a_rust_string_does_not_hide_the_rest_of_the_line() {
     let (_, py) = real();
     let rs = format!("{}\nconst U: &str = \"http://x\"; {PHANTOM_FN}\n", read(RS));
@@ -1250,7 +1339,6 @@ fn a_line_comment_marker_inside_a_rust_string_does_not_hide_the_rest_of_the_line
 }
 
 #[test]
-#[ignore = "known gap: comment strippers are not string/comment aware"]
 fn an_escaped_quote_before_a_hash_in_a_python_string_does_not_end_the_string() {
     let (rust, _) = real();
     let py = py_faulted(
@@ -1275,4 +1363,25 @@ fn multibyte_text_in_comments_does_not_break_either_stripper() {
     let pys = format!("# \u{1F980} \u{00e9}\n{}  # \u{4e2d}\n", read(PY));
     assert!(fn_problems(&parse_rust_abi(&rs), &parse_py_abi(&pys), UNBOUND_EXPORTS).is_empty());
     let _ = (rust, py);
+}
+
+#[test]
+fn a_docstring_that_looks_like_a_binding_is_not_live() {
+    let (rust, _) = real();
+    let py = py_faulted(
+        "lib.tessl_synchronize.restype = ctypes.c_int32\n",
+        "lib.tessl_synchronize.restype = ctypes.c_int32\n        \"\"\"\n        lib.tessl_synchronize.restype = ctypes.c_int64\n        \"\"\"\n",
+    );
+    assert!(fn_problems(&rust, &py, UNBOUND_EXPORTS).is_empty());
+}
+
+#[test]
+fn a_char_literal_and_raw_string_do_not_confuse_the_rust_stripper() {
+    let (_, py) = real();
+    let rs = format!(
+        "{}\nconst Q: char = '\\''; const R: &str = r#\"/* \"#; fn f<'a>(x: &'a u8) {{}} {PHANTOM_FN}\n",
+        read(RS)
+    );
+    let p = fn_problems(&parse_rust_abi(&rs), &py, UNBOUND_EXPORTS);
+    assert!(mentions(&p, "tessl_phantom: in src/capi.rs"), "{p:?}");
 }

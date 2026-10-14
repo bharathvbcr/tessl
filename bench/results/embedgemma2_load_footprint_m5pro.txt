@@ -1,0 +1,31 @@
+EmbedGemma2 load: peak physical footprint, before and after the streaming loader
+=================================================================================
+Machine: Apple M5 Pro, 64 GB. Date 2026-10-14.
+Command (one load per process, three processes per build, min of 3 reported):
+  EMBEDGEMMA2_SNAPSHOT=~/.cache/huggingface/hub/models--google--embeddinggemma-2/snapshots/914f7f89142e33e77833254d9c9b90c3cef7303b \
+    /usr/bin/time -l <build>/target/release/probe_load_memory --embedgemma2
+Figure compared: "peak memory footprint" from /usr/bin/time -l (not ru_maxrss).
+Run under Lappi mac_heavy.sh; nothing else of ours on the GPU.
+
+Builds
+  before  2a7cb8b  library as of the last commit before the EmbedGemma2 speed work. Its
+                   own probe_load_memory has no --embedgemma2, so HEAD's
+                   src/bin/probe_load_memory.rs and src/bin/common/mod.rs were copied in as
+                   UNCOMMITTED files in a detached worktree; src/ (the library) is untouched.
+  after   77d8732  "loader: one streaming checkpoint loader for EmbedGemma2 and Qwen3.5"
+                   (carries its own probe).
+  head    0055612  origin/main when this was measured. c076ad5 (gate and up packed) landed
+                   between 77d8732 and 0055612 and changed the loader after 77d8732.
+
+Results (peak memory footprint, bytes; the three runs of each build)
+  build     run1          run2          run3          min           min (MiB)  device +   host beyond device
+  2a7cb8b   1157285280    1156236680    1156203936    1156203936    1102.6     0.82 GB    0.32 GB
+  77d8732    871924912     871875760     870859952     870859952     830.5     0.82 GB    0.03 GB
+  0055612    845218992     845169840     845202608     845169840     806.0     0.82 GB    0.01 GB
+
+Change: 2a7cb8b -> 77d8732  -285.3 MB (-24.7%), 1156.2 -> 870.9 MB.
+        77d8732 -> 0055612   -25.7 MB  (-3.0%), 870.9 -> 845.2 MB (the loader after c076ad5).
+        2a7cb8b -> 0055612  -311.0 MB (-26.9%).
+The device weights are 0.82 GB in every build; what fell is the host copy the old loader held
+beside them (0.32 GB beyond the device bytes at 2a7cb8b, 0.01 GB at 0055612). The runs agree to
+within 0.1% on each build, so the three-run spread does not touch the conclusion.

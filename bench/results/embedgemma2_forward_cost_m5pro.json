@@ -1,0 +1,221 @@
+{
+ "what": "EmbedGemma2 encode time against padded rows: calibration of FORWARD_COST_ROWS (src/embedgemma2.rs)",
+ "machine": "Apple M5 Pro, 64 GB",
+ "date": "2026-10-14",
+ "build": "branch bl/embedgemma (from 0055612) with the queued-forward encode, before the pack_forwards cost became a parameter; uniform single-forward workloads, so the split is not involved",
+ "command": "BENCH_WORKLOADS=1x32,2x32,4x32,8x32,16x32,32x32,64x32,128x32 BENCH_ITERS=10 BENCH_WARMUP=3 BENCH_ASYNC={0,1} target/release/bench_embedgemma2, 5 rounds alternating the two modes, under mac_heavy.sh",
+ "method": "per shape, ms_min = min over the 5 rounds of each process's min-of-10; ordinary least squares ms = c0 + c1*rows over the 8 shapes (rows = sequences*32 padded rows); FORWARD_COST_ROWS = round(c0/c1)",
+ "modes": {
+  "async_encode_off": {
+   "rows": [
+    32,
+    64,
+    128,
+    256,
+    512,
+    1024,
+    2048,
+    4096
+   ],
+   "workloads": [
+    "1x32",
+    "2x32",
+    "4x32",
+    "8x32",
+    "16x32",
+    "32x32",
+    "64x32",
+    "128x32"
+   ],
+   "ms_min_per_round": {
+    "1x32": [
+     85.4574,
+     65.2919,
+     64.6452,
+     62.8698,
+     86.7917
+    ],
+    "2x32": [
+     65.3884,
+     67.5694,
+     69.2427,
+     65.035,
+     93.9816
+    ],
+    "4x32": [
+     60.7714,
+     63.2073,
+     80.195,
+     71.1237,
+     68.3352
+    ],
+    "8x32": [
+     61.7195,
+     67.467,
+     73.7651,
+     67.795,
+     63.3714
+    ],
+    "16x32": [
+     76.9431,
+     85.8595,
+     83.8409,
+     82.011,
+     76.94
+    ],
+    "32x32": [
+     105.6945,
+     127.5163,
+     131.8744,
+     132.341,
+     129.9113
+    ],
+    "64x32": [
+     168.1212,
+     171.6095,
+     163.5544,
+     165.3499,
+     165.942
+    ],
+    "128x32": [
+     277.2968,
+     286.3433,
+     283.8372,
+     273.128,
+     270.9445
+    ]
+   },
+   "ms_min": {
+    "1x32": 62.8698,
+    "2x32": 65.035,
+    "4x32": 60.7714,
+    "8x32": 61.7195,
+    "16x32": 76.94,
+    "32x32": 105.6945,
+    "64x32": 163.5544,
+    "128x32": 270.9445
+   },
+   "c0_ms": 54.904,
+   "c1_ms_per_row": 0.05249,
+   "c0_over_c1_rows": 1046,
+   "residual_ms": [
+    6.29,
+    6.77,
+    -0.85,
+    -6.62,
+    -4.84,
+    -2.96,
+    1.16,
+    1.05
+   ]
+  },
+  "async_encode_on": {
+   "rows": [
+    32,
+    64,
+    128,
+    256,
+    512,
+    1024,
+    2048,
+    4096
+   ],
+   "workloads": [
+    "1x32",
+    "2x32",
+    "4x32",
+    "8x32",
+    "16x32",
+    "32x32",
+    "64x32",
+    "128x32"
+   ],
+   "ms_min_per_round": {
+    "1x32": [
+     7.7034,
+     7.6933,
+     7.5804,
+     7.2528,
+     7.5618
+    ],
+    "2x32": [
+     7.935,
+     8.5837,
+     8.2008,
+     7.9218,
+     8.3462
+    ],
+    "4x32": [
+     10.2542,
+     10.5182,
+     10.6235,
+     10.4043,
+     10.2818
+    ],
+    "8x32": [
+     15.5435,
+     16.3694,
+     16.4901,
+     16.2065,
+     16.3956
+    ],
+    "16x32": [
+     29.0254,
+     31.1736,
+     30.422,
+     28.9287,
+     29.0707
+    ],
+    "32x32": [
+     54.6872,
+     58.9713,
+     58.7891,
+     55.2234,
+     55.7111
+    ],
+    "64x32": [
+     107.2584,
+     120.4891,
+     122.2444,
+     109.2988,
+     110.3048
+    ],
+    "128x32": [
+     215.6156,
+     249.6763,
+     236.0435,
+     215.498,
+     217.8442
+    ]
+   },
+   "ms_min": {
+    "1x32": 7.2528,
+    "2x32": 7.9218,
+    "4x32": 10.2542,
+    "8x32": 15.5435,
+    "16x32": 28.9287,
+    "32x32": 54.6872,
+    "64x32": 107.2584,
+    "128x32": 215.498
+   },
+   "c0_ms": 3.423,
+   "c1_ms_per_row": 0.05147,
+   "c0_over_c1_rows": 67,
+   "residual_ms": [
+    2.18,
+    1.21,
+    0.24,
+    -1.05,
+    -0.84,
+    -1.44,
+    -1.57,
+    1.27
+   ]
+  }
+ },
+ "result": {
+  "FORWARD_COST_ROWS_SYNC": 1046,
+  "FORWARD_COST_ROWS_ASYNC": 67,
+  "note": "The two modes differ 15x, so pack_forwards takes the cost for the runtime's mode (async_encode_enabled) rather than one constant. Before this the constant was 256, an estimate."
+ }
+}

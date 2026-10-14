@@ -1,0 +1,81 @@
+EmbedGemma2 whole-encode speed and memory: before and after, paired and interleaved
+===================================================================================
+Machine: Apple M5 Pro, 64 GB, 2026-10-14, under Lappi mac_heavy.sh. Data:
+embedgemma2_before_after_m5pro.json (bench_paired output: every round of every lane, the
+summary, the lane argv, the env). Tool: target/release/bench_paired --rounds 5, BENCH_ITERS=10
+BENCH_WARMUP=3, EMBEDGEMMA2_SNAPSHOT = ~/.cache/huggingface/hub/models--google--embeddinggemma-2/
+snapshots/914f7f89142e33e77833254d9c9b90c3cef7303b, default BENCH_WORKLOADS (five uniform, three
+ragged). Every round runs every lane once as a fresh process, in lane order on even rounds and
+reversed on odd ones; a lane's figure is the median over rounds of its process's min-of-10.
+What is timed: one encode() call, host token ids to host embeddings (upload, forwards, pooling,
+projection, readback); not the tokenizer, not the load.
+
+Lanes
+  before-2a7cb8b   the library at 2a7cb8b ("embedgemma2 + RoPE: host inv_freq table ..."), the last
+                   commit before the speed work. Its bench_embedgemma2 has no ragged workloads or
+                   peak memory, no src/bin/common/, and its probe has no --embedgemma2, so HEAD's
+                   src/bin/bench_embedgemma2.rs, src/bin/common/mod.rs and
+                   src/bin/probe_load_memory.rs were copied into a detached worktree as UNCOMMITTED
+                   files. src/ (the library) is untouched, so the lane times 2a7cb8b's encode.
+  after-0055612    origin/main at 0055612, the same bench source. Includes 085ea56 (unzeroed acts
+                   reused), f7c7f66 (one online-softmax row body), 8a117fe (TensorOps tiled encoder
+                   attention), 4a168d1 (PLE per run of layers), c076ad5 (gate+up packed), bbd0f1d
+                   (V norm fused), d4c479e (embed scale in the gather), 77d8732 (streaming loader).
+  branch-sync      bl/embedgemma (this change: forwards queued, one wait per encode; cost per forward
+                   by runtime mode; encoder_attn without out_bf16), runtime as every library caller
+                   runs it, async_encode off.
+  branch-async     the same binary with BENCH_ASYNC=1 (set_async_encode(true)).
+
+Attribution: the before -> after-0055612 difference is the COMBINED effect of the nine landed
+changes (085ea56..77d8732, c4f2eb4 is the bench itself); no per-commit chain was built, so no
+single commit is credited. The branch lanes are this change on top.
+
+encode time, ms (median of 5 rounds), ratio against before-2a7cb8b [lowest, highest round]
+  workload                  before     after-0055612         branch-sync           branch-async
+  1x16                        94.4    75.4  0.81x [.71,.89]   84.9  0.90x [.81,.97]   7.4  0.079x [.07,.08]
+  64x32                      224.4   156.6  0.70x [.68,.79]  163.2  0.77x [.62,.86] 102.7  0.457x [.41,.52]
+  32x256                     590.2   496.5  0.84x [.81,.91]  543.0  0.93x [.83,.98] 466.1  0.792x [.71,.81]
+  8x1024                     947.8   611.7  0.63x [.58,.67]  638.5  0.66x [.54,.71] 528.7  0.548x [.49,.62]
+  2x4096                    1863.8   759.6  0.39x [.36,.45]  772.5  0.41x [.35,.45] 689.1  0.386x [.32,.39]
+  128x8-512  (ragged)       3069.7  2432.7  0.78x [.73,.88] 2366.4  0.76x [.72,.82] 1903.3  0.592x [.56,.65]
+  1x4096+63x32 (ragged)     1146.0   554.6  0.49x [.41,.55]  560.5  0.49x [.41,.50]  458.2  0.387x [.36,.40]
+  1x6147+1x1658+6x10-42      2572.4   877.6  0.35x [.34,.37]  875.9  0.35x [.34,.36]  751.7  0.292x [.27,.32]
+                                                                  (the reference texts' shape)
+The nine landed changes make an encode 1.2x to 2.9x faster (0.35x-0.84x of the time) in the
+default runtime. The wide round-to-round spread on the short workloads (1x16 .71-.89) is machine
+noise: see embedgemma2_sync_regression_m5pro.json, a control with the same binary in two lanes.
+
+Regression gate (plan: the synchronous branch no more than 5 % slower than after-0055612 on any
+workload). In the 5-round table above branch-sync reads 1.06-1.10x of after-0055612 on the four
+short uniform workloads, inside that noise. A focused rerun, 8 rounds of min-of-15 with the base
+binary in two lanes as a control (embedgemma2_sync_regression_m5pro.json): branch-sync / base
+1x16 1.010x [0.91,1.39], 64x32 1.010x [0.99,1.19], 32x256 1.002x [0.83,1.02]; the base's own copy
+reads 0.968x [0.76,1.02], 0.995x, 1.007x. Medians agree within 1 %, so this is not a regression;
+the spread (up to +-20 %) is wider than any 5 % gate could resolve on these workloads, which is
+a limit of this measurement, stated rather than hidden.
+
+Device peak, MiB above the loaded model, max over rounds (forwards in brackets)
+  workload                  before        after-0055612   branch-sync     branch-async
+  1x16                         3 (1)          4 (1)           4 (1)           4 (1)
+  64x32                      291 (1)        436 (1)         436 (1)         436 (1)
+  32x256 / 8x1024 / 2x4096  1283 (1)       1652 (1)        1652 (1)        1652 (1)
+  128x8-512                 2859 (9)       2509 (9)        3130 (5)        2478 (16)
+  1x4096+63x32              2477 (2)       2813 (2)        3178 (2)        2638 (2)
+  1x6147+1x1658+6x10-42     2621 (3)       3262 (3)        3193 (3)        3120 (3)
+Process peak physical footprint, MiB, lifetime peak so far (last value of each lane, so the
+largest workload's): before 4020, after-0055612 4133, branch-sync 4065, branch-async 3996.
+Honest reading: the landed changes raised the peak for the single-forward workloads (+29 % device
+peak at 32x256; the cause is inferred to be the packed gate|up buffer and the per-layer-input
+run buffer, not isolated), and cut it on 128x8-512
+(2859 -> 2509). The branch's synchronous lane splits 128x8-512 into 5 forwards instead of 9 (the
+forward cost is now 1046 rows, not 256), which reads 4-5 % faster there (0.954x of after-0055612,
+[0.93,0.98]; the split is the likely cause, not isolated) and uses 3130 MiB (+25 % over after-0055612). The queued lane splits it into 16
+forwards and uses 2478.
+
+What the queued forwards are worth, and what they are not. branch-async vs branch-sync: 1x16
+84.9 -> 7.4 ms (11x), 64x32 163 -> 103 ms, ragged 128x8-512 2366 -> 1903 ms (0.80x), the other
+large workloads 0.80-0.90x. The brief's premise needs a correction: with async_encode off, which
+is every caller's default, every dispatch commits and waits, so removing the per-forward
+synchronize changes nothing measurable (branch-sync vs after-0055612 above). The gain exists only
+for a caller that runs rt.set_async_encode(true). encode() does not flip that global flag, since
+the runtime is shared through an Arc; the choice stays with the caller.

@@ -24,7 +24,9 @@
 // mode flag would put both contracts in one tuned body that gemma-metal and
 // the Qwen3.5 prefill route through.
 //
-// Q/O: [B, T, H, D]; K/V: [B, kv_capacity, Hkv, D]; lens: [B] device u32. The host
+// Q/O: [B, T, H, D] f32 (no bf16 store: `attn_rows.h` and `attn_tiled.h` take
+// their output-type flag as a literal 0 here, because no encoder has a bf16
+// path); K/V: [B, kv_capacity, Hkv, D]; lens: [B] device u32. The host
 // checks lens[b] in 1..=T for every row; the kernel still clamps to T before
 // any address is formed, since the buffer is device-writable.
 #include <metal_stdlib>
@@ -46,8 +48,7 @@ kernel void NAME(                                                             \
     constant uint &Hkv [[buffer(7)]],                                         \
     constant uint &window [[buffer(8)]],                                      \
     constant float &scale [[buffer(9)]],                                      \
-    constant uint &out_bf16 [[buffer(10)]],                                   \
-    constant uint &kv_capacity [[buffer(11)]],                                \
+    constant uint &kv_capacity [[buffer(10)]],                                \
     uint2 tgpig [[threadgroup_position_in_grid]],                             \
     uint2 tpitg [[thread_position_in_threadgroup]])                           \
 {                                                                             \
@@ -116,7 +117,7 @@ kernel void NAME(                                                             \
     if (!row_live) { return; }                                                \
     /* A padding query (or, defensively, a row that saw no key) is zeros. */  \
     const float inv_l = (q_valid && l_i > 0.0f) ? (1.0f / l_i) : 0.0f;        \
-    attn_rows_store<DPV, (R)>(O, o_off, dl, acc, inv_l, out_bf16);           \
+    attn_rows_store<DPV, (R)>(O, o_off, dl, acc, inv_l, 0u);                 \
 }
 
 // The lane counts and simdgroups per threadgroup are `flash_attn_rows`'
@@ -150,8 +151,7 @@ kernel void NAME(                                                             \
     constant uint &Hkv [[buffer(7)]],                                         \
     constant uint &window [[buffer(8)]],                                      \
     constant float &scale [[buffer(9)]],                                      \
-    constant uint &out_bf16 [[buffer(10)]],                                   \
-    constant uint &kv_capacity [[buffer(11)]],                                \
+    constant uint &kv_capacity [[buffer(10)]],                                \
     uint2 tgpig [[threadgroup_position_in_grid]],                             \
     uint tid [[thread_index_in_threadgroup]])                                 \
 {                                                                             \
@@ -164,7 +164,7 @@ kernel void NAME(                                                             \
     attn_tiled_body<D, BQ, BK, NSG, true>(                                    \
         const_cast<device float *>(Q), const_cast<device float *>(K),         \
         const_cast<device float *>(V), O, nullptr, T, len, H, Hkv, scale,     \
-        0ul, 0ul, out_bf16, kv_capacity, window, tgpig, tid, S, m_row, l_row, \
+        0ul, 0ul, 0u, kv_capacity, window, tgpig, tid, S, m_row, l_row,       \
         a_row);                                                               \
 }
 

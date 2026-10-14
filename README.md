@@ -355,8 +355,8 @@ use std::path::Path;
 let rt = GpuRuntime::from_metallib_path(Path::new("/path/to/custom.metallib"))?;
 
 // Or overlay onto tessl's default library. Pipeline names must be unique across
-// the primary library and every overlay: `pipeline()` resolves the primary
-// first, so a duplicate name in an overlay is silently unreachable.
+// the primary library and every overlay: an overlay that repeats an entry point
+// is refused with an error naming it and the library that already holds it.
 let rt = GpuRuntime::new()?;
 rt.add_metallib(Path::new("/path/to/custom_overlay.metallib"))?;
 

@@ -355,3 +355,75 @@ fn missing_kernels_and_metallibs_are_named_in_the_error() {
         );
     });
 }
+
+/// A one-kernel metallib built with the toolchain's `xcrun metal`, in a fresh
+/// directory under the system temp dir; returns its bytes.
+fn tiny_metallib(tag: &str, kernel: &str) -> Vec<u8> {
+    let dir = std::env::temp_dir().join(format!("tessl-overlay-{tag}-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("create overlay scratch dir");
+    let src = dir.join("k.metal");
+    std::fs::write(&src, format!("kernel void {kernel}() {{}}\n")).unwrap();
+    let air = dir.join("k.air");
+    let lib = dir.join("k.metallib");
+    for args in [
+        vec![
+            "metal",
+            "-std=metal4.0",
+            "-c",
+            src.to_str().unwrap(),
+            "-o",
+            air.to_str().unwrap(),
+        ],
+        vec!["metallib", air.to_str().unwrap(), "-o", lib.to_str().unwrap()],
+    ] {
+        let out = std::process::Command::new("xcrun")
+            .args(&args)
+            .output()
+            .expect("run xcrun");
+        assert!(
+            out.status.success(),
+            "xcrun {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    let bytes = std::fs::read(&lib).unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+    bytes
+}
+
+#[test]
+fn add_metallib_refuses_a_duplicate_entry_point_and_accepts_distinct_ones() {
+    with_gpu(|rt| {
+        // The embedded library defines every entry point it has, so adding it
+        // again as an overlay repeats all of them.
+        let primary = env!("TESSL_METALLIB");
+        let err = rt
+            .add_metallib(std::path::Path::new(primary))
+            .expect_err("duplicate overlay accepted");
+        assert!(err.contains("already defined by the primary metallib"), "{err}");
+        assert!(err.contains(primary), "error should name the new library: {err}");
+
+        // A fresh overlay with a unique name is accepted and resolves.
+        let first = tiny_metallib("a", "tessl_overlay_probe_a");
+        rt.add_metallib_bytes(&first).expect("distinct overlay refused");
+        rt.pipeline("tessl_overlay_probe_a").expect("overlay kernel resolves");
+
+        // The same overlay again repeats a name an earlier overlay holds; the
+        // error names that entry point and that overlay, and nothing changes.
+        let err = rt
+            .add_metallib_bytes(&first)
+            .expect_err("duplicate of an overlay accepted");
+        assert!(err.contains("tessl_overlay_probe_a"), "{err}");
+        assert!(err.contains("overlay #1") && err.contains("overlay bytes"), "{err}");
+        assert_eq!(
+            rt.overlay_libraries_snapshot().unwrap().len(),
+            1,
+            "a refused overlay was registered"
+        );
+
+        let second = tiny_metallib("b", "tessl_overlay_probe_b");
+        rt.add_metallib_bytes(&second).expect("second distinct overlay refused");
+        rt.pipeline("tessl_overlay_probe_b")
+            .expect("second overlay kernel resolves");
+    });
+}

@@ -189,3 +189,33 @@ fn token_counts_above_u32_are_refused_before_any_gpu_work() {
     }
     assert_refused_before_gpu(&["--paired-gdn-recurrent", "4294967297"], "at most");
 }
+
+#[test]
+fn token_count_cap_boundary_and_odd_forms_are_refused_before_any_gpu_work() {
+    // One past the cap is refused in every lane that takes a token count.
+    let over = "16777217";
+    assert_refused_before_gpu(&[over], "at most 16777216");
+    assert_refused_before_gpu(&["--check-only", over], "at most 16777216");
+    assert_refused_before_gpu(&["--paired-attn", over], "at most 16777216");
+    assert_refused_before_gpu(&["--paired-gate-up", over], "at most 16777216");
+    assert_refused_before_gpu(&["--paired-gdn-recurrent", over], "at most 16777216");
+    assert_refused_before_gpu(&[&format!("--decode={over}")], "at most 16777216");
+    // A valid count earlier or later in the list does not mask an oversized one.
+    assert_refused_before_gpu(&["1024", "4294967297"], "at most");
+    assert_refused_before_gpu(&["4294967297", "1024"], "at most");
+    assert_refused_before_gpu(&["--model-forward", "16", "8589934592", "16"], "at most");
+    // Zero-extended / odd spellings never slip past the parser as a small count.
+    for odd in ["-1", " 16", "16 ", "1_000", "0x10", "1e3", "\u{ff11}\u{ff16}", "", "٣"] {
+        let (ok, stdout, stderr) = run(&["--check-only", odd]);
+        assert!(!ok, "{odd:?} must be refused");
+        assert!(!stdout.contains("device:"), "{odd:?} reached the GPU:\n{stdout}");
+        assert!(stderr.contains("expected a token count"), "{odd:?}: {stderr}");
+    }
+    // Leading zeros are plain decimal and still bounded.
+    assert_refused_before_gpu(&["00000000000000004294967297"], "at most");
+    assert_refused_before_gpu(&["+4294967297"], "at most");
+    // Numbers beyond usize are a parse refusal, not a wrap.
+    assert_refused_before_gpu(&["99999999999999999999999999"], "expected a token count");
+    assert_refused_before_gpu(&["--decode=99999999999999999999999999"], "--decode=P wants");
+    assert_refused_before_gpu(&["--decode=0"], "must be positive");
+}

@@ -478,7 +478,8 @@ fn traced<T>(f: impl FnOnce() -> T) -> (T, infer_trace::Snapshot) {
 }
 
 /// An encode's forwards share one set of activations, none of it zeroed on
-/// the host, and poisoning every unzeroed allocation with NaN changes no bit
+/// the host (each forward adds only its four small input and output
+/// buffers), and poisoning every unzeroed allocation with NaN changes no bit
 /// of any embedding: no kernel reads an element its forward did not write.
 /// Before the activations were reused, each forward allocated its own (the
 /// two-forward encode made twice the one-forward encode's allocations) and
@@ -511,10 +512,17 @@ fn encode_reuses_unzeroed_activations() {
             "two forwards zeroed {} bytes on the host",
             t2.host_zero_bytes
         );
+        // Each forward past the first adds only its own small host-visible
+        // buffers (ids, lens, segments, embeddings: `ForwardIo`), not another
+        // set of activations.
+        let io_buffers = 4 * u64::from(two.forwards - 1);
         assert_eq!(
-            t2.cold_allocs, t1.cold_allocs,
-            "two forwards made {} allocations, one made {}: the activations are not shared",
-            t2.cold_allocs, t1.cold_allocs
+            t2.cold_allocs,
+            t1.cold_allocs + io_buffers,
+            "two forwards made {} allocations, one made {}: more than {io_buffers} extra, so the \
+             activations are not shared",
+            t2.cold_allocs,
+            t1.cold_allocs
         );
 
         rt.set_poison_unzeroed(true);
@@ -545,6 +553,77 @@ fn encode_reuses_unzeroed_activations() {
             assert!(
                 f64::from(drift) <= BATCH_ABS,
                 "sequence {n} ({} tokens) in the two-forward batch vs alone: {drift:.3e}",
+                ids.len()
+            );
+        }
+    });
+}
+
+/// With `async_encode` on, an `encode` that runs several forwards queues them
+/// all and waits for the GPU once, not once per forward, and its embeddings
+/// are bit for bit those the same encode gives with the runtime synchronous
+/// (where every dispatch waits and nothing can overlap), with every unzeroed
+/// activation poisoned. Each sequence also still matches itself run alone.
+/// Before, every forward ended in its own `synchronize` and readback, so an
+/// encode of N forwards waited N times however the runtime was set.
+#[test]
+fn multi_forward_encode_waits_once_and_matches_synchronous() {
+    let cfg = EmbedGemma2Config::from_config_json(CONFIG).unwrap();
+    let w = random_weights(&cfg, 11);
+    let st = open("async_forwards", safetensors_bytes(&w, &[]));
+    // Three padded shapes: a long sequence alone, mid-length ones, short ones.
+    let seq = |n: u32, s: u32| -> Vec<u32> { (0..n).map(|i| (i * 5 + s * 3 + 1) % cfg.vocab).collect() };
+    let long = seq(4000, 0);
+    let mid: Vec<Vec<u32>> = (0..3).map(|s| seq(300, s)).collect();
+    let short: Vec<Vec<u32>> = (0..7).map(|s| seq(30, s + 5)).collect();
+    let mut batch: Vec<&[u32]> = vec![&long];
+    batch.extend(mid.iter().map(Vec::as_slice));
+    batch.extend(short.iter().map(Vec::as_slice));
+    let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+    with_gpu(|rt| {
+        let model = EmbedGemma2Model::load(rt, &st, PREFIX, cfg.clone()).unwrap();
+        let (sync, t_sync) = traced(|| model.encode(&batch, None, false).unwrap());
+        assert!(
+            sync.forwards >= 3,
+            "test bug: {} forwards, need at least 3",
+            sync.forwards
+        );
+        assert!(
+            t_sync.sync_waits >= u64::from(sync.forwards),
+            "test bug: the synchronous encode waited only {} times",
+            t_sync.sync_waits
+        );
+
+        rt.set_async_encode(true).unwrap();
+        rt.set_poison_unzeroed(true);
+        let (queued, t_async) = traced(|| model.encode(&batch, None, false));
+        rt.set_poison_unzeroed(false);
+        rt.set_async_encode(false).unwrap();
+        let queued = queued.unwrap();
+
+        assert_eq!(queued.forwards, sync.forwards);
+        assert_eq!(
+            t_async.sync_waits, 1,
+            "{} forwards made {} host waits, want one for the encode",
+            queued.forwards, t_async.sync_waits
+        );
+        assert_eq!(
+            bits(&queued.embeddings),
+            bits(&sync.embeddings),
+            "queueing the forwards changed an embedding"
+        );
+
+        let dim = cfg.embedding_dim as usize;
+        for (n, ids) in batch.iter().enumerate() {
+            let alone = model.encode(&[ids], None, false).unwrap().embeddings;
+            let drift = queued.embeddings[n * dim..(n + 1) * dim]
+                .iter()
+                .zip(&alone)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0f32, f32::max);
+            assert!(
+                f64::from(drift) <= BATCH_ABS,
+                "sequence {n} ({} tokens), queued vs alone: {drift:.3e}",
                 ids.len()
             );
         }
@@ -704,5 +783,100 @@ fn set_max_tokens_bounds_encode_and_refuses_out_of_range() {
         model.set_max_tokens(MAX_BATCH_TOKENS as u32).unwrap();
         model.set_max_tokens(1).unwrap();
         assert_eq!(model.max_tokens(), 1);
+    });
+}
+
+/// Adversarial companions to the one-wait encode: with `async_encode` on and
+/// unzeroed activations poisoned, a batch that splits into several forwards
+/// of different shapes gives bit-identical embeddings to the synchronous
+/// encode for a Matryoshka prefix, in a shuffled input order, and when the
+/// shapes alternate large, small, large across calls (the shared activations
+/// are rewritten by forward n + 1 while forward n may still be queued).
+#[test]
+fn async_multi_forward_truncated_shuffled_and_repeated_stay_bitwise() {
+    let cfg = EmbedGemma2Config::from_config_json(CONFIG).unwrap();
+    let w = random_weights(&cfg, 23);
+    let st = open("async_adversarial", safetensors_bytes(&w, &[]));
+    let seq = |n: u32, s: u32| -> Vec<u32> { (0..n).map(|i| (i * 7 + s * 11 + 2) % cfg.vocab).collect() };
+    let long = seq(4000, 1);
+    let mid: Vec<Vec<u32>> = (0..3).map(|s| seq(300, s + 20)).collect();
+    let short: Vec<Vec<u32>> = (0..5).map(|s| seq(1 + s, s + 40)).collect();
+    let mut batch: Vec<&[u32]> = vec![&long];
+    batch.extend(mid.iter().map(Vec::as_slice));
+    batch.extend(short.iter().map(Vec::as_slice));
+    let small: Vec<&[u32]> = short.iter().map(Vec::as_slice).collect();
+    let mut shuffled = batch.clone();
+    shuffled.reverse();
+    shuffled.swap(1, 4);
+    let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+    with_gpu(|rt| {
+        let model = EmbedGemma2Model::load(rt, &st, PREFIX, cfg.clone()).unwrap();
+        let dim = cfg.embedding_dim as usize;
+        let trunc = Some(cfg.embedding_dim / 2);
+        let sync_full = model.encode(&batch, None, false).unwrap();
+        let sync_trunc = model.encode(&batch, trunc, false).unwrap();
+        let sync_small = model.encode(&small, None, false).unwrap();
+        assert!(sync_full.forwards >= 3, "test bug: {} forwards", sync_full.forwards);
+
+        rt.set_async_encode(true).unwrap();
+        rt.set_poison_unzeroed(true);
+        let run = |f: &dyn Fn() -> Result<tessl::embedgemma2::EncodeOutput, String>| f();
+        let a_trunc = run(&|| model.encode(&batch, trunc, false));
+        let a_small = run(&|| model.encode(&small, None, false));
+        let a_full = run(&|| model.encode(&batch, None, false));
+        let a_shuf = run(&|| model.encode(&shuffled, None, false));
+        rt.set_poison_unzeroed(false);
+        rt.set_async_encode(false).unwrap();
+        let (a_trunc, a_small, a_full, a_shuf) = (a_trunc.unwrap(), a_small.unwrap(), a_full.unwrap(), a_shuf.unwrap());
+
+        assert_eq!(bits(&a_trunc.embeddings), bits(&sync_trunc.embeddings), "truncated");
+        assert_eq!(
+            bits(&a_small.embeddings),
+            bits(&sync_small.embeddings),
+            "small after large"
+        );
+        assert_eq!(
+            bits(&a_full.embeddings),
+            bits(&sync_full.embeddings),
+            "large after small"
+        );
+        for row in a_trunc.embeddings.chunks_exact(dim / 2) {
+            let n: f32 = row.iter().map(|x| x * x).sum();
+            assert!((n - 1.0).abs() < 1e-4, "truncated row norm^2 {n}");
+        }
+        // Input order is irrelevant: row i of the shuffled run is its sequence's.
+        let n = batch.len();
+        for (i, s) in shuffled.iter().enumerate() {
+            let orig = batch.iter().position(|b| std::ptr::eq(*b, *s)).unwrap();
+            assert_eq!(
+                bits(&a_shuf.embeddings[i * dim..(i + 1) * dim]),
+                bits(&a_full.embeddings[orig * dim..(orig + 1) * dim]),
+                "shuffled position {i} of {n}"
+            );
+        }
+    });
+}
+
+/// A failed encode (token past the vocab, truncate_dim 0) queues nothing and
+/// leaves the model usable: the next encode, async, equals the one before.
+#[test]
+fn rejected_encode_leaves_the_async_model_usable() {
+    let cfg = EmbedGemma2Config::from_config_json(CONFIG).unwrap();
+    let w = random_weights(&cfg, 5);
+    let st = open("async_reject", safetensors_bytes(&w, &[]));
+    let ok: Vec<u32> = (0..40).map(|i| i % cfg.vocab).collect();
+    let bad: Vec<u32> = vec![1, cfg.vocab];
+    let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+    with_gpu(|rt| {
+        let model = EmbedGemma2Model::load(rt, &st, PREFIX, cfg.clone()).unwrap();
+        rt.set_async_encode(true).unwrap();
+        let first = model.encode(&[&ok], None, false);
+        let r1 = model.encode(&[&ok, &bad], None, false);
+        let r2 = model.encode(&[&ok], Some(0), false);
+        let r3 = model.encode(&[&ok, &[]], None, false);
+        let again = model.encode(&[&ok], None, false);
+        rt.set_async_encode(false).unwrap();
+        assert!(r1.is_err() && r2.is_err() && r3.is_err());
+        assert_eq!(bits(&first.unwrap().embeddings), bits(&again.unwrap().embeddings));
     });
 }

@@ -968,16 +968,7 @@ impl BertSparseModel {
                 gemm(&a.resid, &dense.w, out, BACKEND)?;
                 bias_add(rt, &out.buffer, &dense.b, rows, h)?;
             }
-            encoder_attn(
-                rt,
-                &a.q.buffer,
-                &a.k.buffer,
-                &a.v.buffer,
-                &a.attn.buffer,
-                &a.lens,
-                dims,
-                false,
-            )?;
+            encoder_attn(rt, &a.q.buffer, &a.k.buffer, &a.v.buffer, &a.attn.buffer, &a.lens, dims)?;
             gemm(&a.attn, &layer.o.w, &a.y, BACKEND)?;
             let n = &layer.attn_norm;
             bias_residual_layer_norm(rt, &a.y.buffer, &layer.o.b, &a.resid.buffer, &n.w, &n.b, rows, h, eps)?;

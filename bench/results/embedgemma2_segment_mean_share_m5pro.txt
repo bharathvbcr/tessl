@@ -1,0 +1,28 @@
+EmbedGemma2: what share of an encode is segment_mean_rows_f32 (kernels/embed_pool.metal)
+=======================================================================================
+Machine: Apple M5 Pro, 64 GB. Date 2026-10-14. Build: bl/embedgemma (kernel unchanged from 0055612).
+
+Question (ft-4efcd42f): the kernel has one thread per (segment, column) and sums its rows
+serially. Is that worth a parallel-over-rows kernel?
+
+Method: segment_mean_rows called alone, hidden = 512 columns (the checkpoint's), x all ones,
+segments [i*seq, i*seq + len_i), under mac_heavy.sh, runtime in its default synchronous mode
+(each call = one dispatch committed and waited). Min of 200 calls after 20 warm-up. The same
+harness times l2_normalize_rows_f32 on one tiny row for the dispatch+wait floor and subtracts
+it: 0.0785 ms. (The harness was a throwaway example, not committed; the numbers are what is
+recorded.)
+
+  workload         segments x padded seq   segment_mean min   minus floor   encode (after-0055612,   share
+                                                                             bench_paired median)
+  2x4096           2 x 4096                0.965 ms           0.887 ms      792.9 ms                 0.11 %
+  1x4096+63x32     64 x 4096               0.948 ms           0.869 ms      579.4 ms                 0.15 %
+  8x1024           8 x 1024                0.320 ms           0.242 ms      638.2 ms                 0.04 %
+  128x8-512        128 x 512               0.375 ms           0.296 ms     2509.2 ms                 0.01 %
+
+(The encode column is bench/results/embedgemma2_before_after_m5pro.json, lane after-0055612.)
+
+Result: under 0.2 % of the encode on every workload, the worst case being the longest
+sequences with the fewest segments (2x4096, where 1024 threads each add 4096 rows). Far under
+the 1 % bar the plan set, so the kernel is left alone, as the card allows ("or a recorded
+measurement shows it is negligible"). Its invariant (the sum is sequential and independent of
+the launch shape) is kept, and no test or needle changes.

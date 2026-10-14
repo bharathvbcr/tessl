@@ -166,6 +166,38 @@ run, so the excess was tessl's. The RoPE kernels (this one, its backward and
 torch's formula. Layer 0 is now `1.9e-6`, at the reference's own fp32 noise,
 and the 6147-token embedding moved from `9.2e-7` to `2.1e-7`.
 
+## Speed
+
+Measured on an M5 Pro against the real checkpoint, paired and interleaved
+(`bench_paired` over `bench_embedgemma2`; `bench/results/embedgemma2_*_m5pro.*`).
+
+* **Whole encode, before and after the nine landed changes** (2a7cb8b against
+  0055612, combined, not per commit): an encode takes 0.35x to 0.84x of the
+  time (1.2x to 2.9x faster) in the default runtime, uniform and ragged
+  workloads alike. The loader's peak physical footprint fell from 1156 MB to
+  871 MB (77d8732) and 845 MB (0055612). The device peak of the single-forward
+  workloads rose 29 % (1283 to 1652 MiB at 8x1024). Numbers:
+  `embedgemma2_before_after_m5pro.txt`, `embedgemma2_load_footprint_m5pro.txt`.
+* **One host wait per `encode`.** The forwards of one `encode` are queued back
+  to back and the host waits once; each keeps its own small ids, lengths,
+  segments and output buffers (written with `alloc_buffer_from_u32`, which does
+  not wait), and the large activations stay shared because the GPU orders
+  them. This only overlaps anything when the caller runs the runtime with
+  `set_async_encode(true)`: with it off (the default) every dispatch commits
+  and waits, so nothing changes. `encode` does not flip the flag, since the
+  runtime is shared. With it on, `bench_embedgemma2` (`BENCH_ASYNC=1`) runs
+  1x16 in 7.4 ms against 84.9 ms, and the 128x8-512 ragged batch in 1903 ms
+  against 2366 ms.
+* **What a forward costs, for the split.** `pack_forwards` trades padded rows
+  against a fixed cost per forward, which the sweep
+  (`embedgemma2_forward_cost_m5pro.json`) puts at `54.9 ms + 0.0525 ms/row`
+  synchronous (1046 rows) and `3.42 ms + 0.0515 ms/row` queued (67 rows); it
+  uses the one for the runtime's mode.
+* **`segment_mean_rows`** stays serial: it is under 0.2 % of an encode on
+  every workload (`embedgemma2_segment_mean_share_m5pro.txt`).
+* **No bf16 attention output.** `encoder_attn` writes f32 only; the `out_bf16`
+  argument had no caller and is gone.
+
 ## Precision
 
 F32 only: bf16 weights widened exactly, f32 activations, exact-f32 GEMMs.

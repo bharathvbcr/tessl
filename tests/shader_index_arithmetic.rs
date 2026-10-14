@@ -485,7 +485,34 @@ fn cross_entropy_row_offsets_are_widened() {
 #[test]
 fn gdn_train_offsets_are_widened() {
     for (needle, what) in [
-        ("const ulong r = ((ulong)b * T + t) * H + h;", "token row"),
+        ("const ulong tok = (ulong)b * T + t;", "token"),
+        ("const ulong r = tok * H + h;", "token row"),
+        // Column windows: every (token, ld, off) offset is formed from the
+        // 64-bit `tok`, so a matrix past 2^32 elements does not wrap.
+        ("q[tok * ldq + offq + hk * GDN_TRAIN_DK + i]", "q window read"),
+        ("k[tok * ldk + offk + hk * GDN_TRAIN_DK + i]", "k window read"),
+        ("v[tok * ldv + offv + (ulong)h * Dv + j0 + j]", "v window read"),
+        ("dv[tok * lddv + offdv + (ulong)h * Dv + j0 + i]", "dv window write"),
+        (
+            "const ulong qat = (ulong)tok * ldq + offq + (ulong)hk * GDN_TRAIN_DK + i;",
+            "finish q window",
+        ),
+        (
+            "const ulong kat = (ulong)tok * ldk + offk + (ulong)hk * GDN_TRAIN_DK + i;",
+            "finish k window",
+        ),
+        (
+            "const ulong vr = (ulong)tok * H + (ulong)hk * ratio + j;",
+            "finish value-head row",
+        ),
+        (
+            "dq[(ulong)tok * lddq + offdq + (ulong)hk * GDN_TRAIN_DK + i]",
+            "dq window write",
+        ),
+        (
+            "dk[(ulong)tok * lddk + offdk + (ulong)hk * GDN_TRAIN_DK + i]",
+            "dk window write",
+        ),
         (
             "const ulong srow = ((ulong)bh * GDN_TRAIN_DK + i) * Dv + j0;",
             "state row",

@@ -45,10 +45,20 @@ fn run(bs: &Path, manifest: &Path) -> Output {
     Command::new("bash").arg(script()).arg(bs).arg(manifest).output().unwrap()
 }
 
-fn manifest(dir: &Path) -> PathBuf {
+/// A manifest whose `kernels/` holds `n` top-level `.metal` sources (plus one
+/// in a subdirectory, which the build script does not compile).
+fn manifest_with(dir: &Path, n: usize) -> PathBuf {
     let m = dir.join("man ifest");
-    fs::create_dir_all(m.join("kernels")).unwrap();
+    fs::create_dir_all(m.join("kernels/sub")).unwrap();
+    fs::write(m.join("kernels/sub/inc.metal"), "").unwrap();
+    for i in 0..n {
+        fs::write(m.join(format!("kernels/k{i}.metal")), "").unwrap();
+    }
     m
+}
+
+fn manifest(dir: &Path) -> PathBuf {
+    manifest_with(dir, 35)
 }
 
 #[test]
@@ -85,6 +95,19 @@ fn malformed_runs_exit_nonzero_and_print_no_metric() {
 }
 
 #[test]
+fn the_expected_air_count_follows_the_kernel_sources() {
+    // Adding a kernel must not make a correct build fail the benchmark.
+    let d = scratch("n36");
+    let out = run(&fake_bs(&d, 36, 0, false, 0), &manifest_with(&d, 36));
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    // ...and a build that dropped a source still fails.
+    let d = scratch("n36short");
+    let out = run(&fake_bs(&d, 35, 0, false, 0), &manifest_with(&d, 36));
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("expected 36 .air"));
+}
+
+#[test]
 fn bad_arguments_are_a_usage_error() {
     let d = scratch("args");
     let bs = fake_bs(&d, 35, 0, false, 0);
@@ -94,4 +117,29 @@ fn bad_arguments_are_a_usage_error() {
     assert_eq!(out.status.code(), Some(2));
     let out = run(&d.join("absent"), &manifest(&d));
     assert_eq!(out.status.code(), Some(2));
+}
+
+#[test]
+fn paired_bins_accepts_newline_separated_paths_with_spaces() {
+    let d = scratch("pb");
+    let mk = |name: &str, v: &str| {
+        let p = d.join(name);
+        fs::write(&p, format!("#!/bin/sh\necho METRIC m {v}\n")).unwrap();
+        fs::set_permissions(&p, fs::Permissions::from_mode(0o755)).unwrap();
+        p
+    };
+    let a = mk("bin a", "2");
+    let b = mk("bin b", "1");
+    let bins = format!("a={}\nb={}", a.display(), b.display());
+    let log = d.join("out.log");
+    let out = Command::new("bash")
+        .arg(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("bench/paired_bins.sh"))
+        .args(["2"])
+        .arg(&log)
+        .env("BENCH_BINS", bins)
+        .output()
+        .unwrap();
+    let so = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "{so}{}", String::from_utf8_lossy(&out.stderr));
+    assert!(so.contains("a") && so.contains("b"), "{so}");
 }

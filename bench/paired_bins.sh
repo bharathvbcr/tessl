@@ -21,7 +21,16 @@ rounds=$1
 out=$2
 shift 2
 declare -a labels=() paths=()
-for pair in $BENCH_BINS; do
+# Entries are split on newlines when BENCH_BINS has one (so paths may hold
+# spaces), else on whitespace as before.
+pairs=()
+if [[ $BENCH_BINS == *$'\n'* ]]; then
+  while IFS= read -r line; do pairs+=("$line"); done <<<"$BENCH_BINS"
+else
+  read -r -a pairs <<<"$BENCH_BINS"
+fi
+for pair in ${pairs[@]+"${pairs[@]}"}; do
+  [[ -n $pair ]] || continue
   labels+=("${pair%%=*}")
   paths+=("${pair#*=}")
 done

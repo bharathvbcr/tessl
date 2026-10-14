@@ -11,8 +11,15 @@
 # binary the same ARGS). Pairing a build.rs with a different tree's kernels
 # (BUILD_SCRIPT_BIN from one commit, MANIFEST_DIR from another) is the control
 # that separates the build script's change from the kernel sources' change.
+#
+# macOS only: it samples `sysctl vm.loadavg`, times with perl Time::HiRes and
+# needs the Metal toolchain; elsewhere it exits 2 before doing anything.
 set -euo pipefail
 
+if [[ $(uname -s) != Darwin ]]; then
+  echo "$0 needs macOS (sysctl vm.loadavg, Metal toolchain)" >&2
+  exit 2
+fi
 if [[ $# -ne 2 ]]; then
   echo "usage: $0 BUILD_SCRIPT_BIN MANIFEST_DIR" >&2
   exit 2
@@ -39,12 +46,15 @@ end=$(perl -MTime::HiRes=time -e 'printf "%.3f", time')
 
 metallib=$(sed -n 's/^cargo:rustc-env=TESSL_METALLIB=//p' "$log" | tail -1)
 [[ -n $metallib && -f $metallib ]] || { echo "no metallib at '$metallib'" >&2; exit 1; }
+# One .air per top-level kernels/*.metal (the build script does not compile
+# subdirectories), so the expected count follows the sources.
+want=$(find "$manifest/kernels" -maxdepth 1 -name '*.metal' | wc -l | tr -d ' ')
 airs=$(find "$out/o" -name '*.air' | wc -l | tr -d ' ')
-[[ $airs -eq 35 ]] || { echo "expected 35 .air, found $airs" >&2; exit 1; }
+[[ $airs -eq $want ]] || { echo "expected $want .air, found $airs" >&2; exit 1; }
 # The cache-key files exist only in the parallel build script; when present
 # every one must be fresh (this OUT_DIR started empty, so none can be reused).
 keys=$(find "$out/o" -name '*.air.key' | wc -l | tr -d ' ')
-[[ $keys -eq 0 || $keys -eq 35 ]] || { echo "expected 0 or 35 .air.key, found $keys" >&2; exit 1; }
+[[ $keys -eq 0 || $keys -eq $want ]] || { echo "expected 0 or $want .air.key, found $keys" >&2; exit 1; }
 fallbacks=$(grep -c 'falling back to -std=metal3.2' "$log" || true)
 
 echo "METRIC metallib_clean_s $(awk -v a="$start" -v b="$end" 'BEGIN { printf "%.3f", b - a }')"

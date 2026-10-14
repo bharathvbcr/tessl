@@ -177,3 +177,15 @@ fn non_utf8_config_and_iters_forms_are_refused_before_any_gpu_work() {
         assert_refused_before_gpu(&[bad, "16"], "--iters");
     }
 }
+
+#[test]
+fn token_counts_above_u32_are_refused_before_any_gpu_work() {
+    // 2^32 + 1 used to wrap to a 1-token sequence while labels kept the big T.
+    for big in ["4294967297", "4294967295", "18446744073709551615"] {
+        assert_refused_before_gpu(&["--check-only", big], "at most");
+        assert_refused_before_gpu(&[big], "at most");
+        assert_refused_before_gpu(&["--model-forward", big], "at most");
+        assert_refused_before_gpu(&[&format!("--decode={big}")], "at most");
+    }
+    assert_refused_before_gpu(&["--paired-gdn-recurrent", "4294967297"], "at most");
+}

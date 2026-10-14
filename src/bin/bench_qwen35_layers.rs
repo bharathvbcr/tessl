@@ -727,9 +727,10 @@ fn build_model(rt: &Arc<GpuRuntime>, o: &Opts) -> Res<Qwen35Model> {
 
 /// Deterministic token ids below `vocab`.
 fn token_ids(n: usize, vocab: u32) -> Vec<u32> {
-    (0..n as u32)
-        .map(|i| i.wrapping_mul(7919).wrapping_add(13) % vocab)
-        .collect()
+    // `n` is bounded by `MAX_TOKENS` at argument parsing; a larger count would
+    // silently wrap to a short sequence, so it is a bug here, not a truncation.
+    let n = u32::try_from(n).expect("token count exceeds u32; refused at argument parsing");
+    (0..n).map(|i| i.wrapping_mul(7919).wrapping_add(13) % vocab).collect()
 }
 
 fn min_of(v: &[f64]) -> f64 {
@@ -1197,6 +1198,19 @@ fn print_power_state() {
 
 // --------------------------------------------------------------------- main ---
 
+/// Largest token count (T, or `--decode=P`) accepted. Well above any real
+/// context, and below `u32::MAX` so every position fits the kernels' `u32`
+/// sequence arguments and `token_ids` cannot wrap.
+const MAX_TOKENS: usize = 1 << 24;
+
+/// Refuse a token count above [`MAX_TOKENS`] before any GPU work.
+fn bounded_tokens(n: usize, what: &str) -> Result<usize, String> {
+    if n > MAX_TOKENS {
+        return Err(format!("{what} must be at most {MAX_TOKENS}, got {n}"));
+    }
+    Ok(n)
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut check_only = false;
     let mut paired_attn = false;
@@ -1226,7 +1240,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             if p == 0 {
                 return Err("--decode prefix must be positive".into());
             }
-            decode = Some(p);
+            decode = Some(bounded_tokens(p, "--decode prefix")?);
         } else if arg == "--check-only" {
             check_only = true;
         } else if arg == "--paired-attn" {
@@ -1254,7 +1268,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             if t == 0 {
                 return Err("T must be positive".into());
             }
-            ts.push(t);
+            ts.push(bounded_tokens(t, "T")?);
         }
     }
     if paired_attn && check_only {

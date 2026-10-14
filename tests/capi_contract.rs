@@ -1548,3 +1548,81 @@ fn the_real_sources_survive_stripping_idempotently() {
         assert_eq!(f(&once), once, "stripping is not idempotent");
     }
 }
+
+// ---- tester round 4: adversarial lexer cases ----
+
+#[test]
+fn a_byte_char_quote_does_not_open_a_string() {
+    let p = rs_with(&format!("const Q: u8 = b'\"'; /* c */ {PHANTOM_FN}"));
+    assert!(mentions(&p, "tessl_phantom: in src/capi.rs"), "{p:?}");
+}
+
+#[test]
+fn a_raw_identifier_with_a_block_comment_keeps_the_phantom_visible() {
+    let p = rs_with(&format!("fn r#type() {{}} /* c */ {PHANTOM_FN}"));
+    assert!(mentions(&p, "tessl_phantom: in src/capi.rs"), "{p:?}");
+}
+
+#[test]
+fn a_block_comment_hides_a_quote_and_nests() {
+    let p = rs_with(&format!("/* \" /* \" */ \" */ {PHANTOM_FN}"));
+    assert!(mentions(&p, "tessl_phantom: in src/capi.rs"), "{p:?}");
+}
+
+#[test]
+fn an_unterminated_rust_block_comment_does_not_panic() {
+    for s in ["/*", "/* /*", "/", "r#\"", "\"", "'", "'\\", "br", "br#", "b'"] {
+        let _ = strip_line_comments(s);
+        let _ = strip_py_comments(s);
+    }
+}
+
+#[test]
+fn a_python_raw_string_ending_in_an_escaped_quote_stays_open() {
+    // r"a\"" is the string a\" ; the trailing comment must not hide the next line.
+    let src = "x = r\"a\\\"\" # c\n_pack_ = 1\n";
+    assert!(layout_guard_problem(src).is_some());
+}
+
+#[test]
+fn a_python_comment_hides_a_layout_keyword() {
+    assert!(layout_guard_problem("x = 1  # _pack_ = 1\n").is_none());
+    assert!(layout_guard_problem("x = '''\n_pack_\n'''\n").is_none());
+}
+
+#[test]
+fn a_python_layout_keyword_after_a_closed_string_is_code() {
+    assert!(layout_guard_problem("x = 'a' ; _pack_ = 1\n").is_some());
+    assert!(layout_guard_problem("x = '' ; _anonymous_ = []\n").is_some());
+    assert!(layout_guard_problem("x = \"\"\"d\"\"\"; _pack_ = 1\n").is_some());
+}
+
+#[test]
+fn python_stripping_keeps_line_count() {
+    for s in [
+        "a # b\nc\n",
+        "'''x\ny\nz'''\nw\n",
+        "'a\\\nb'\nc\n",
+        "x = '''a\\\nb'''\n",
+    ] {
+        assert_eq!(
+            strip_py_comments(s).matches('\n').count(),
+            s.matches('\n').count(),
+            "{s:?}"
+        );
+    }
+}
+
+#[test]
+fn rust_stripping_keeps_line_count_and_is_idempotent() {
+    for s in [
+        "a // b\nc\n",
+        "/* x\ny\n*/ z\n",
+        "\"a\nb\" // c\n",
+        "r#\"a\nb\"# /* c\n*/\n",
+    ] {
+        let once = strip_line_comments(s);
+        assert_eq!(once.matches('\n').count(), s.matches('\n').count(), "{s:?}");
+        assert_eq!(strip_line_comments(&once), once, "{s:?}");
+    }
+}

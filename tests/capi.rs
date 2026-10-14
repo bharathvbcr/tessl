@@ -638,8 +638,9 @@ fn the_model_through_the_abi_is_the_rust_model() {
                 p.name
             );
         }
-        // An unknown operands code is refused, and the refused step leaves no
-        // gradients behind.
+        // An unknown operands code is refused before the bank is touched
+        // (4551470: validate before mutate), so the bf16 step's gradients
+        // above are still readable.
         let s = unsafe {
             tessl_qwen35_train_step(
                 model,
@@ -657,8 +658,12 @@ fn the_model_through_the_abi_is_the_rust_model() {
             "{}",
             msg(&err)
         );
-        assert_eq!(copy(TESSL_READ_GRADS, &refs, &mut err), TESSL_ERR);
-        assert!(msg(&err).contains("no gradients yet"), "{}", msg(&err));
+        assert_eq!(
+            copy(TESSL_READ_GRADS, &refs, &mut err),
+            TESSL_OK,
+            "a step refused for its operands code discarded the gradients: {}",
+            msg(&err)
+        );
         // Put the buffers back to the parameters for the write below.
         assert_eq!(copy(TESSL_READ_PARAMS, &refs, &mut err), TESSL_OK, "{}", msg(&err));
 
@@ -1328,7 +1333,8 @@ fn a_two_phase_step_through_the_abi_is_the_rust_one() {
             TESSL_OK
         );
 
-        // A step refused for its operands code leaves no gradients either.
+        // A step refused for its operands code leaves the bank as it was
+        // (Ready from the backward above), unlike one that starts and fails.
         let bad_operands = unsafe {
             tessl_qwen35_train_step(
                 model,
@@ -1343,9 +1349,10 @@ fn a_two_phase_step_through_the_abi_is_the_rust_one() {
         assert_eq!(bad_operands, TESSL_ERR);
         assert_eq!(
             unsafe { tessl_qwen35_grad_sq_norm(model, &mut sq, err.as_mut_ptr(), ERR_LEN) },
-            TESSL_ERR
+            TESSL_OK,
+            "{}",
+            msg(&err)
         );
-        assert!(msg(&err).contains("no gradients yet"), "{}", msg(&err));
         // A step refused because one is pending leaves them as they were.
         assert_eq!(train(&mut loss, &ids, &mut err), TESSL_OK, "{}", msg(&err));
         assert_eq!(forward(TESSL_SUPERVISE_CAUSAL, &[], &[], &mut loss, &mut err), TESSL_OK);
@@ -1806,7 +1813,15 @@ fn a_refused_train_step_keeps_the_previous_gradients() {
         let refs: Vec<_> = bufs
             .iter()
             .zip(&infos)
-            .map(|(b, p)| tref(b, &p.shape[..p.ndim as usize]))
+            .map(|(b, p)| {
+                // A copy reads into the storage shape: transformers' shape,
+                // reversed for a `transposed` entry (see TesslParamInfo).
+                let mut shape = p.shape[..p.ndim as usize].to_vec();
+                if p.transposed != 0 {
+                    shape.reverse();
+                }
+                tref(b, &shape)
+            })
             .collect();
         let read = |err: &mut [c_char; ERR_LEN]| unsafe {
             tessl_qwen35_copy(

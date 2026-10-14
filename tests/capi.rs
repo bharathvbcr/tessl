@@ -21,12 +21,12 @@ use tessl::capi::{
     tessl_qwen35_adamw_step, tessl_qwen35_adamw_step_count, tessl_qwen35_copy, tessl_qwen35_describe,
     tessl_qwen35_free, tessl_qwen35_grad_sq_norm, tessl_qwen35_hidden, tessl_qwen35_load, tessl_qwen35_param_count,
     tessl_qwen35_param_info, tessl_qwen35_train_backward, tessl_qwen35_train_discard, tessl_qwen35_train_forward,
-    tessl_qwen35_train_step, tessl_runtime_free, tessl_runtime_new, tessl_synchronize, TesslCeArgs, TesslGdnArgs,
-    TesslParamInfo, TesslQwen35, TesslRuntime, TesslTensorRef, TESSL_ABI_VERSION, TESSL_BF16, TESSL_ERR, TESSL_F16,
-    TESSL_F32, TESSL_MAX_DIMS, TESSL_MOMENTS_BLOCK8, TESSL_MOMENTS_F32, TESSL_OK, TESSL_OPERANDS_BF16,
-    TESSL_OPERANDS_EXACT_F32, TESSL_READ_ADAMW_AUX, TESSL_READ_ADAMW_M, TESSL_READ_ADAMW_V, TESSL_READ_GRADS,
-    TESSL_READ_PARAMS, TESSL_SUPERVISE_CAUSAL, TESSL_SUPERVISE_ROWS, TESSL_UPDATE_BF16_KAHAN, TESSL_UPDATE_F32,
-    TESSL_WRITE_ADAMW_AUX, TESSL_WRITE_ADAMW_M, TESSL_WRITE_ADAMW_V, TESSL_WRITE_PARAMS,
+    tessl_qwen35_train_step, tessl_runtime_free, tessl_runtime_new, tessl_runtime_poisoned, tessl_synchronize,
+    TesslCeArgs, TesslGdnArgs, TesslParamInfo, TesslQwen35, TesslRuntime, TesslTensorRef, TESSL_ABI_VERSION,
+    TESSL_BF16, TESSL_ERR, TESSL_F16, TESSL_F32, TESSL_MAX_DIMS, TESSL_MOMENTS_BLOCK8, TESSL_MOMENTS_F32, TESSL_OK,
+    TESSL_OPERANDS_BF16, TESSL_OPERANDS_EXACT_F32, TESSL_READ_ADAMW_AUX, TESSL_READ_ADAMW_M, TESSL_READ_ADAMW_V,
+    TESSL_READ_GRADS, TESSL_READ_PARAMS, TESSL_SUPERVISE_CAUSAL, TESSL_SUPERVISE_ROWS, TESSL_UPDATE_BF16_KAHAN,
+    TESSL_UPDATE_F32, TESSL_WRITE_ADAMW_AUX, TESSL_WRITE_ADAMW_M, TESSL_WRITE_ADAMW_V, TESSL_WRITE_PARAMS,
 };
 use tessl::cross_entropy::{cross_entropy_rows, CeGrads, CeHidden, CeWorkspace, Reduction};
 use tessl::gemm::GemmOperands;
@@ -1891,6 +1891,55 @@ fn a_load_whose_final_sync_fails_publishes_no_handle() {
     };
     assert_eq!(s, TESSL_ERR, "{}", msg(&err));
     assert!(out.is_null(), "*out is null whenever the status is not TESSL_OK");
+}
+
+fn poisoned(rt: *mut TesslRuntime) -> i32 {
+    let mut out = -1i32;
+    let mut err = [0 as c_char; ERR_LEN];
+    let s = unsafe { tessl_runtime_poisoned(rt, &mut out, err.as_mut_ptr(), ERR_LEN) };
+    assert_eq!(s, TESSL_OK, "{}", msg(&err));
+    out
+}
+
+/// `tessl_runtime_poisoned` reads 0 on a healthy runtime and 1 once a failed
+/// call has latched it, and keeps answering when every other call is refused.
+#[test]
+fn the_poisoned_query_reports_a_latched_runtime() {
+    let healthy = Handle::new();
+    assert_eq!(poisoned(healthy.0), 0);
+
+    let handle = Handle::new();
+    assert_eq!(poisoned(handle.0), 0);
+    let (st, cfg, prefix) = (
+        fixture("model.safetensors"),
+        fixture("config.json"),
+        std::ffi::CString::new("model.").unwrap(),
+    );
+    let mut out: *mut TesslQwen35 = ptr::null_mut();
+    let mut err = [0 as c_char; ERR_LEN];
+    let s = {
+        let _poison = PoisonAfterLoad::on();
+        unsafe {
+            tessl_qwen35_load(
+                handle.0,
+                st.as_ptr(),
+                cfg.as_ptr(),
+                prefix.as_ptr(),
+                TESSL_F32,
+                &mut out,
+                err.as_mut_ptr(),
+                ERR_LEN,
+            )
+        }
+    };
+    assert_eq!(s, TESSL_ERR, "{}", msg(&err));
+    assert_eq!(poisoned(handle.0), 1);
+    // Every other call on it is refused, and the other runtime is untouched.
+    assert_eq!(
+        unsafe { tessl_synchronize(handle.0, err.as_mut_ptr(), ERR_LEN) },
+        TESSL_ERR
+    );
+    assert_eq!(poisoned(healthy.0), 0);
 }
 
 /// A GDN backward refused for its tensors keeps the cached workspace.

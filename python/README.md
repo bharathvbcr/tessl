@@ -165,11 +165,13 @@ error. The binding therefore:
   leaked); either way the object is closed. A finalizer issues a
   `ResourceWarning` instead of raising.
 
-Not yet distinguished: a runtime whose GPU work failed is "poisoned" and
-refuses every later call with a status-1 message ("recreate it"); `TesslPanic`
-does not cover it, and the thread's cached runtime is not replaced
-automatically. Until the C ABI reports it separately, drop the model and call
-nothing further on that thread's runtime, or restart the process.
+A runtime whose GPU work failed is "poisoned": it latches and refuses every
+later call (status 1, "recreate it"). That is not a status code of its own, so
+the binding asks the library (`tessl_runtime_poisoned`, ABI 11) after any
+failed call. If the runtime is poisoned it closes the runtime and every
+`Qwen35` loaded on it, drops the thread's cached runtime, and raises
+`TesslPoisoned` (a subclass of `TesslError`) naming the original error. The
+next call on that thread builds a fresh runtime; a model must be loaded again.
 
 ## How the buffers cross
 

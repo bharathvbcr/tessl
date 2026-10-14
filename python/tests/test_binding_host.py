@@ -19,7 +19,7 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import torch  # noqa: E402
 import tessl_torch  # noqa: E402
-from tessl_torch import TesslError, TesslPanic  # noqa: E402
+from tessl_torch import TesslError, TesslPanic, TesslPoisoned  # noqa: E402
 
 RUNTIME, MODEL = 0xBEEF0000, 0xDEAD0000
 
@@ -33,6 +33,8 @@ class FakeLib:
         self.status = 0
         self.free_status = 0
         self.load_status = 0
+        self.poisoned = 0
+        self.poison_query_status = 0
 
     def _rec(self, name, *args):
         self.calls.append((name, args[0] if args else None))
@@ -47,6 +49,11 @@ class FakeLib:
     def tessl_runtime_free(self, h):
         self._rec("tessl_runtime_free", h.value)
         return self.free_status
+
+    def tessl_runtime_poisoned(self, h, out, err, n):
+        self._rec("tessl_runtime_poisoned", h.value)
+        out._obj.value = self.poisoned
+        return self.poison_query_status
 
     def tessl_qwen35_load(self, rt, st, cfg, prefix, precision, out, err, n):
         if self.load_status:
@@ -197,6 +204,73 @@ class Panic(HostCase):
             model.adamw_free()
         self.assertEqual(self.calls("tessl_runtime_free"), [("tessl_runtime_free", RUNTIME)])
         self.assertTrue(tessl_torch._runtime() is not model._rt)
+
+
+class Poisoned(HostCase):
+    def test_a_model_call_that_poisons_the_runtime_raises_tesslpoisoned_and_closes_everything(self):
+        model = self.model()
+        other = self.model()
+        rt = model._rt
+        self.assertIs(other._rt, rt)
+        self.lib.status, self.lib.poisoned = 1, 1
+        with self.assertRaises(TesslPoisoned) as caught:
+            model.adamw_free()
+        self.assertIsInstance(caught.exception, TesslError)
+        self.assertNotIsInstance(caught.exception, TesslPanic)
+        self.assertIn("boom", str(caught.exception))  # names the original error
+        self.assertTrue(model.closed and other.closed and rt.closed)
+        self.assertEqual(len(self.calls("tessl_qwen35_free")), 2)
+        self.assertEqual(self.calls("tessl_runtime_free"), [("tessl_runtime_free", RUNTIME)])
+
+    def test_the_next_call_builds_a_fresh_runtime(self):
+        model = self.model()
+        self.lib.status, self.lib.poisoned = 1, 1
+        with self.assertRaises(TesslPoisoned):
+            model.adamw_free()
+        self.lib.status, self.lib.poisoned = 0, 0
+        fresh = tessl_torch._runtime()
+        self.assertFalse(fresh.closed)
+        self.assertIsNot(fresh, model._rt)
+        self.assertEqual(len(self.calls("tessl_runtime_new")), 2)
+        self.assertFalse(self.model().closed)
+
+    def test_a_runtime_call_that_poisons_the_runtime_raises_tesslpoisoned(self):
+        rt = tessl_torch._runtime()
+        self.lib.status, self.lib.poisoned = 1, 1
+        with self.assertRaisesRegex(TesslPoisoned, "boom"):
+            tessl_torch._gdn_call("tessl_gdn_train_forward", tessl_torch._GdnArgs())
+        self.assertTrue(rt.closed)
+        self.assertIsNot(tessl_torch._runtime(), rt)
+
+    def test_a_load_that_poisons_the_runtime_raises_tesslpoisoned(self):
+        self.lib.load_status, self.lib.poisoned = 1, 1
+        with self.assertRaisesRegex(TesslPoisoned, "load failed"):
+            self.model()
+        self.assertEqual(self.calls("tessl_runtime_free"), [("tessl_runtime_free", RUNTIME)])
+
+    def test_a_healthy_runtime_keeps_a_plain_error_and_everything_open(self):
+        model = self.model()
+        self.lib.status, self.lib.poisoned = 1, 0
+        with self.assertRaises(TesslError) as caught:
+            model.adamw_free()
+        self.assertNotIsInstance(caught.exception, TesslPoisoned)
+        self.assertFalse(model.closed or model._rt.closed)
+        self.assertEqual(self.calls("tessl_runtime_free"), [])
+
+    def test_a_refused_query_leaves_the_original_error(self):
+        model = self.model()
+        self.lib.status, self.lib.poisoned, self.lib.poison_query_status = 1, 1, 1
+        with self.assertRaises(TesslError) as caught:
+            model.adamw_free()
+        self.assertNotIsInstance(caught.exception, TesslPoisoned)
+        self.assertFalse(model.closed)
+
+    def test_a_panic_stays_a_panic_without_the_query(self):
+        model = self.model()
+        self.lib.status, self.lib.poisoned = 2, 1
+        with self.assertRaises(TesslPanic):
+            model.adamw_free()
+        self.assertEqual(self.calls("tessl_runtime_poisoned"), [])
 
 
 class Close(HostCase):

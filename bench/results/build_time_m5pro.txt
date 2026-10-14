@@ -1,7 +1,31 @@
-tessl clean build time (M5 Pro), parallel metal4.0 compile in build.rs
-commit: 6b4842f (branch gp/closers-w2, base gp/wave1 0e7e674)
-command: cargo clean --release -p tessl; cargo build --release --lib   (dependencies already built; includes rustc for the crate, so build.rs metallib compile is a part of this, not separable)
-under mac_heavy lock, separate CARGO_TARGET_DIR, warm AIR cache removed by the clean
-runs (s): 14.10, 14.62, 17.61
-min-of-3: 14.10 s
-pre-parallel baseline: unavailable (no knob selects the serial path; reverting dbb8200/ff443a8 was out of scope), so no speedup is claimed.
+tessl clean metallib build time (M5 Pro, 18 cores, 64 GB, macOS 27.0.1, SDK 27.0)
+toolchain: Apple metal version 32023.921 (metalfe-32023.921.6); rustc 1.99.0 (b940084d7 2026-09-28)
+measured 2026-10-14 under the mac_heavy lock (default MAC_HEAVY_MAX_LOAD=12; load1 7.9-9.5 at run start, none flagged)
+
+what is timed: the build script alone, driven directly with an empty OUT_DIR per run (so no .air is reused), not the whole crate.
+  bench/metallib_clean_time.sh BUILD_SCRIPT_BIN MANIFEST_DIR   (prints METRIC lines for bench/paired_bins.sh)
+  rustc --edition 2021 -O <wt>/build.rs -o bs_<arm>
+arms (3 wrapper scripts, one per arm, same harness):
+  before  = build.rs of 65be2db (serial, = 04bff20^)     on 65be2db's kernels/
+  after   = build.rs of 0055612 (parallel, available_parallelism() = 18 threads) on 0055612's kernels/
+  control = build.rs of 65be2db (serial)                 on 0055612's kernels/
+Each run asserts: exit 0, an existing TESSL_METALLIB, 35 .air; the after arm also 35 fresh .air.key (0 for the serial script, which has no cache).
+Per arm one discarded warm-up first (warms the shared clang module cache and page cache; the cache is not cleared between arms).
+command: BENCH_BINS="before=.. after=.. control=.." bench/paired_bins.sh 7 OUT   (7 rounds, order alternates each round)
+
+per-run metallib_clean_s, in round order:
+  before : 2.033 2.081 2.059 2.137 2.256 2.023 2.056
+  after  : 0.471 0.475 0.469 0.499 0.503 0.460 0.498
+  control: 2.041 2.002 2.016 2.052 2.020 2.089 2.065
+per-run load1 at start (same order):
+  before : 9.39 9.00 9.00 8.54 8.54 7.92 7.92
+  after  : 9.52 9.00 8.76 8.54 8.17 7.92 7.92
+  control: 9.52 9.52 8.76 8.76 8.17 8.17 8.40
+
+min-of-7 (max):  before 2.023 s (2.256)   after 0.460 s (0.503)   control 2.002 s (2.089)
+after/control = 0.230  (serial -> parallel on identical kernel sources: 4.35x faster; this is the speedup claim)
+after/before  = 0.227  (also includes the kernel-source diff between the two commits: 18 files, +1064/-1106; control shows it is a wash, 2.002 vs 2.023 s)
+metal3.2 fallbacks: 0 in every run of every arm (no fallback confound).
+drift: first vs last round within noise per arm (before 2.033/2.056, after 0.471/0.498, control 2.041/2.065).
+
+Not comparable: the previous figure of 14.10 s (min-of-3 at 6b4842f) was a whole-crate "cargo clean -p tessl; cargo build --release --lib" that included rustc and could not separate the metallib step. The whole-crate cross-check was not run for this file. Default builds with a warm OUT_DIR reuse .air and are faster still; that case is not in these numbers.

@@ -1942,6 +1942,62 @@ fn the_poisoned_query_reports_a_latched_runtime() {
     assert_eq!(poisoned(healthy.0), 0);
 }
 
+/// What a binding does after the poisoned status: free the latched runtime
+/// and build a new one on the same thread. The new runtime must load a real
+/// model and train a step; a stand-in library cannot show that.
+#[test]
+fn a_fresh_runtime_on_the_poisoned_thread_loads_and_runs_a_model() {
+    let mut err = [0 as c_char; ERR_LEN];
+    let a = unsafe { tessl_runtime_new(err.as_mut_ptr(), ERR_LEN) };
+    assert!(!a.is_null(), "{}", msg(&err));
+    let (st, cfg, prefix) = (
+        fixture("model.safetensors"),
+        fixture("config.json"),
+        std::ffi::CString::new("model.").unwrap(),
+    );
+    let mut out: *mut TesslQwen35 = ptr::null_mut();
+    let s = {
+        let _poison = PoisonAfterLoad::on();
+        unsafe {
+            tessl_qwen35_load(
+                a,
+                st.as_ptr(),
+                cfg.as_ptr(),
+                prefix.as_ptr(),
+                TESSL_F32,
+                &mut out,
+                err.as_mut_ptr(),
+                ERR_LEN,
+            )
+        }
+    };
+    assert_eq!(s, TESSL_ERR, "{}", msg(&err));
+    assert!(out.is_null());
+    assert_eq!(poisoned(a), 1);
+    assert_eq!(unsafe { tessl_runtime_free(a) }, TESSL_OK, "a poisoned runtime frees");
+
+    let b = Handle::new();
+    assert_eq!(poisoned(b.0), 0);
+    let model = load_model(b.0);
+    let ids = fixture_ids();
+    let mut loss = f64::NAN;
+    let s = unsafe {
+        tessl_qwen35_train_step(
+            model,
+            ids.as_ptr(),
+            ids.len() as u64,
+            TESSL_OPERANDS_EXACT_F32,
+            &mut loss,
+            err.as_mut_ptr(),
+            ERR_LEN,
+        )
+    };
+    assert_eq!(s, TESSL_OK, "{}", msg(&err));
+    assert!(loss.is_finite(), "loss {loss}");
+    assert_eq!(poisoned(b.0), 0);
+    assert_eq!(unsafe { tessl_qwen35_free(model) }, TESSL_OK);
+}
+
 /// A GDN backward refused for its tensors keeps the cached workspace.
 #[test]
 fn a_refused_gdn_backward_keeps_the_cached_workspace() {
@@ -2013,5 +2069,381 @@ fn a_refused_gdn_backward_keeps_the_cached_workspace() {
         let (s, m) = run(tessl_gdn_train_backward, &args);
         assert_eq!(s, TESSL_OK, "{m}");
         assert_eq!(builds(), 1, "the next good call reuses the cached workspace");
+    });
+}
+
+type GdnFn = unsafe extern "C" fn(*mut TesslRuntime, *const TesslGdnArgs, *mut c_char, usize) -> i32;
+
+fn run_gdn(f: GdnFn, handle: &Handle, a: &TesslGdnArgs) -> (i32, String) {
+    let mut err = [0 as c_char; ERR_LEN];
+    let s = unsafe { f(handle.0, a, err.as_mut_ptr(), ERR_LEN) };
+    (s, msg(&err))
+}
+
+fn bits(v: &[f32]) -> Vec<u32> {
+    v.iter().map(|x| x.to_bits()).collect()
+}
+
+/// Every GDN output through the C ABI is the Rust call's, bit for bit, with
+/// every optional tensor (`s0`, `s_fin`, `d_fin`, `ds0`) present, and the
+/// optional ones are really read. A mis-wired field (q for k, dg for dbeta,
+/// a dropped `s_fin`) fails by name. `T = 80` crosses a checkpoint
+/// (`GDN_TRAIN_CKPT` = 64), `Dv = 32` is not the 128 a swapped dimension
+/// would hide behind, and `B = 2` exercises the batch stride.
+///
+/// This replaces `python/tests/test_gdn.py`'s ABI-versus-Rust role: that file
+/// needs MPS, so no hosted runner runs it. Its transformers-oracle role is
+/// not replaced; `tests/gdn_train.rs` holds the kernels to an f64 reference.
+#[test]
+fn the_gdn_abi_is_the_rust_gdn() {
+    use tessl::gdn_train::{
+        gdn_train_backward, gdn_train_forward, GdnTrainDims, GdnTrainGrads, GdnTrainInputs, GdnTrainWorkspace,
+    };
+    const SENTINEL: f32 = -7.25e27;
+    let (t, h, dv) = (80usize, 2usize, 32usize);
+    let handle = Handle::new();
+    with_gpu(|rt| {
+        for b in [1usize, 2] {
+            let n = b * t * h;
+            let seed = 100 * b as u64;
+            let q = random_f32(n * 128, seed + 1);
+            let k = random_f32(n * 128, seed + 2);
+            let v = random_f32(n * dv, seed + 3);
+            let g: Vec<f32> = random_f32(n, seed + 4)
+                .iter()
+                .map(|&x| -0.75 * (x + 1.0) - 1e-3)
+                .collect();
+            let beta: Vec<f32> = random_f32(n, seed + 5).iter().map(|&x| 0.5 + 0.45 * x).collect();
+            let s0 = random_f32(b * h * 128 * dv, seed + 6);
+            let d_o = random_f32(n * dv, seed + 7);
+            let d_fin = random_f32(b * h * 128 * dv, seed + 8);
+            let dims = GdnTrainDims {
+                batch: b as u32,
+                seq: t as u32,
+                heads: h as u32,
+                v_dim: dv as u32,
+            };
+            let ck = dims.checkpoint_shape();
+            assert_eq!(ck[2], 2, "the case must cross a checkpoint");
+            let ck64: Vec<u64> = ck.iter().map(|&d| d as u64).collect();
+            let sizes = [
+                ("o", n * dv),
+                ("s_fin", b * h * 128 * dv),
+                ("ckpt", ck.iter().product()),
+                ("dq", n * 128),
+                ("dk", n * 128),
+                ("dv", n * dv),
+                ("dg", n),
+                ("dbeta", n),
+                ("ds0", b * h * 128 * dv),
+            ];
+
+            // ---- the ABI side
+            let sentinel = |i: usize| shared(rt, &vec![SENTINEL; sizes[i].1]);
+            let outs: Vec<_> = (0..sizes.len()).map(sentinel).collect();
+            let (qb, kb, vb, gb, bb) = (
+                shared(rt, &q),
+                shared(rt, &k),
+                shared(rt, &v),
+                shared(rt, &g),
+                shared(rt, &beta),
+            );
+            let (s0b, dob, dfb) = (shared(rt, &s0), shared(rt, &d_o), shared(rt, &d_fin));
+            let (bu, tu, hu, du) = (b as u64, t as u64, h as u64, dv as u64);
+            let o_shape = [bu, tu, hu, du];
+            let st_shape = [bu, hu, 128, du];
+            let args = TesslGdnArgs {
+                batch: b as u32,
+                seq: t as u32,
+                heads: h as u32,
+                v_dim: dv as u32,
+                q: tref(&qb, &[bu, tu, hu, 128]),
+                k: tref(&kb, &[bu, tu, hu, 128]),
+                v: tref(&vb, &o_shape),
+                g: tref(&gb, &[bu, tu, hu]),
+                beta: tref(&bb, &[bu, tu, hu]),
+                s0: tref(&s0b, &st_shape),
+                ckpt: tref(&outs[2], &ck64),
+                o: tref(&outs[0], &o_shape),
+                s_fin: tref(&outs[1], &st_shape),
+                d_o: tref(&dob, &o_shape),
+                d_fin: tref(&dfb, &st_shape),
+                dq: tref(&outs[3], &[bu, tu, hu, 128]),
+                dk: tref(&outs[4], &[bu, tu, hu, 128]),
+                dv: tref(&outs[5], &o_shape),
+                dg: tref(&outs[6], &[bu, tu, hu]),
+                dbeta: tref(&outs[7], &[bu, tu, hu]),
+                ds0: tref(&outs[8], &st_shape),
+            };
+            let (s, m) = run_gdn(tessl_gdn_train_forward, &handle, &args);
+            assert_eq!(s, TESSL_OK, "B={b} forward: {m}");
+            let (s, m) = run_gdn(tessl_gdn_train_backward, &handle, &args);
+            assert_eq!(s, TESSL_OK, "B={b} backward: {m}");
+
+            // ---- the Rust side
+            let up = |d: &[f32], shape: &[usize]| {
+                let x = rt.alloc_tensor_f32(shape).unwrap();
+                x.write_f32(d).unwrap();
+                x
+            };
+            let (qt, kt) = (up(&q, &[b, t, h, 128]), up(&k, &[b, t, h, 128]));
+            let (vt, gt, bt) = (up(&v, &[b, t, h, dv]), up(&g, &[b, t, h]), up(&beta, &[b, t, h]));
+            let s0t = up(&s0, &[b, h, 128, dv]);
+            let (dot, dft) = (up(&d_o, &[b, t, h, dv]), up(&d_fin, &[b, h, 128, dv]));
+            let shapes: [&[usize]; 9] = [
+                &[b, t, h, dv],
+                &[b, h, 128, dv],
+                &ck,
+                &[b, t, h, 128],
+                &[b, t, h, 128],
+                &[b, t, h, dv],
+                &[b, t, h],
+                &[b, t, h],
+                &[b, h, 128, dv],
+            ];
+            let want: Vec<_> = (0..sizes.len())
+                .map(|i| up(&vec![SENTINEL; sizes[i].1], shapes[i]))
+                .collect();
+            let inputs = GdnTrainInputs {
+                q: &qt,
+                k: &kt,
+                v: &vt,
+                g: &gt,
+                beta: &bt,
+                s0: Some(&s0t),
+            };
+            gdn_train_forward(rt, dims, inputs, &want[0], Some(&want[1]), &want[2]).unwrap();
+            let ws = GdnTrainWorkspace::new(rt, dims).unwrap();
+            gdn_train_backward(
+                rt,
+                dims,
+                inputs,
+                &want[2],
+                &dot,
+                Some(&dft),
+                &ws,
+                GdnTrainGrads {
+                    dq: &want[3],
+                    dk: &want[4],
+                    dv: &want[5],
+                    dg: &want[6],
+                    dbeta: &want[7],
+                    ds0: Some(&want[8]),
+                },
+            )
+            .unwrap();
+
+            for (i, (name, len)) in sizes.iter().enumerate() {
+                let (got, exp) = (read(&outs[i], *len), want[i].read_f32().unwrap());
+                assert!(
+                    exp.iter().all(|x| x.is_finite() && *x != SENTINEL),
+                    "B={b} {name}: the Rust call left a sentinel or a non-finite value"
+                );
+                assert!(
+                    got.iter().all(|x| x.is_finite() && *x != SENTINEL),
+                    "B={b} {name}: the ABI left a sentinel or a non-finite value"
+                );
+                assert_eq!(bits(&got), bits(&exp), "B={b} {name}: ABI differs from the Rust call");
+            }
+
+            if b != 1 {
+                continue;
+            }
+            // ---- the optional tensors are read, so equality above is not vacuous
+            let fresh = |len: usize| shared(rt, &vec![SENTINEL; len]);
+            let (o2, ck2) = (fresh(sizes[0].1), fresh(sizes[2].1));
+            let no_s0 = TesslGdnArgs {
+                s0: NULL_REF,
+                s_fin: NULL_REF,
+                o: tref(&o2, &o_shape),
+                ckpt: tref(&ck2, &ck64),
+                ..args
+            };
+            let (s, m) = run_gdn(tessl_gdn_train_forward, &handle, &no_s0);
+            assert_eq!(s, TESSL_OK, "{m}");
+            assert_ne!(
+                bits(&read(&o2, sizes[0].1)),
+                bits(&read(&outs[0], sizes[0].1)),
+                "o must depend on s0"
+            );
+            let dv2 = fresh(sizes[5].1);
+            let no_dfin = TesslGdnArgs {
+                d_fin: NULL_REF,
+                s0: tref(&s0b, &st_shape),
+                dv: tref(&dv2, &o_shape),
+                ..args
+            };
+            let (s, m) = run_gdn(tessl_gdn_train_backward, &handle, &no_dfin);
+            assert_eq!(s, TESSL_OK, "{m}");
+            assert_ne!(
+                bits(&read(&dv2, sizes[5].1)),
+                bits(&read(&outs[5], sizes[5].1)),
+                "dv must depend on d_fin (it flows through the state gradient)"
+            );
+
+            // ---- a required tensor that is null is refused by name
+            let bad = TesslGdnArgs { q: NULL_REF, ..args };
+            for f in [tessl_gdn_train_forward, tessl_gdn_train_backward] {
+                let (s, m) = run_gdn(f, &handle, &bad);
+                assert_eq!(s, TESSL_ERR);
+                assert!(m.contains("q: null MTLBuffer"), "{m}");
+            }
+        }
+    });
+}
+
+/// Hostile GDN arguments are refused with an error, never a panic or a
+/// poisoned handle, and a refused call writes nothing: zero and overflowing
+/// dimensions, `s0` without `ds0` and the reverse, a wrong-shaped `ckpt`, and
+/// a v_dim the tensors do not carry. A NaN input flows through without
+/// crashing, and the handle still serves a good call afterwards.
+#[test]
+fn hostile_gdn_args_are_refused_and_leave_outputs_untouched() {
+    use tessl::gdn_train::GdnTrainDims;
+    const SENTINEL: f32 = -7.25e27;
+    let handle = Handle::new();
+    with_gpu(|rt| {
+        let (b, t, h, dv) = (1usize, 16usize, 2usize, 32usize);
+        let buf = |n: usize, seed: u64| shared(rt, &random_f32(n, seed));
+        let sent = |n: usize| shared(rt, &vec![SENTINEL; n]);
+        let dims = GdnTrainDims {
+            batch: 1,
+            seq: 16,
+            heads: 2,
+            v_dim: 32,
+        };
+        let ck = dims.checkpoint_shape();
+        let ck64: Vec<u64> = ck.iter().map(|&d| d as u64).collect();
+        let (q, k) = (buf(b * t * h * 128, 1), buf(b * t * h * 128, 2));
+        let (v, g, beta) = (buf(b * t * h * dv, 3), buf(b * t * h, 4), buf(b * t * h, 5));
+        let s0 = buf(b * h * 128 * dv, 6);
+        let ckpt = sent(ck.iter().product());
+        let (o, s_fin) = (sent(b * t * h * dv), sent(b * h * 128 * dv));
+        let d_o = buf(b * t * h * dv, 7);
+        let (dq, dk, dvv) = (sent(b * t * h * 128), sent(b * t * h * 128), sent(b * t * h * dv));
+        let (dg, db, ds0) = (sent(b * t * h), sent(b * t * h), sent(b * h * 128 * dv));
+        let (bu, tu, hu, du) = (b as u64, t as u64, h as u64, dv as u64);
+        let st = [bu, hu, 128, du];
+        let os = [bu, tu, hu, du];
+        let args = TesslGdnArgs {
+            batch: 1,
+            seq: 16,
+            heads: 2,
+            v_dim: 32,
+            q: tref(&q, &[bu, tu, hu, 128]),
+            k: tref(&k, &[bu, tu, hu, 128]),
+            v: tref(&v, &os),
+            g: tref(&g, &[bu, tu, hu]),
+            beta: tref(&beta, &[bu, tu, hu]),
+            s0: tref(&s0, &st),
+            ckpt: tref(&ckpt, &ck64),
+            o: tref(&o, &os),
+            s_fin: tref(&s_fin, &st),
+            d_o: tref(&d_o, &os),
+            d_fin: NULL_REF,
+            dq: tref(&dq, &[bu, tu, hu, 128]),
+            dk: tref(&dk, &[bu, tu, hu, 128]),
+            dv: tref(&dvv, &os),
+            dg: tref(&dg, &[bu, tu, hu]),
+            dbeta: tref(&db, &[bu, tu, hu]),
+            ds0: tref(&ds0, &st),
+        };
+        let untouched = |what: &str| {
+            for (name, b, n) in [
+                ("o", &o, b * t * h * dv),
+                ("s_fin", &s_fin, b * h * 128 * dv),
+                ("ckpt", &ckpt, ck.iter().product()),
+                ("dq", &dq, b * t * h * 128),
+                ("dv", &dvv, b * t * h * dv),
+                ("dg", &dg, b * t * h),
+                ("ds0", &ds0, b * h * 128 * dv),
+            ] {
+                assert!(read(b, n).iter().all(|x| *x == SENTINEL), "{what}: {name} was written");
+            }
+        };
+        let cases: Vec<(&str, TesslGdnArgs)> = vec![
+            ("batch 0", TesslGdnArgs { batch: 0, ..args }),
+            ("seq 0", TesslGdnArgs { seq: 0, ..args }),
+            ("heads 0", TesslGdnArgs { heads: 0, ..args }),
+            ("v_dim 0", TesslGdnArgs { v_dim: 0, ..args }),
+            (
+                "batch max",
+                TesslGdnArgs {
+                    batch: u32::MAX,
+                    ..args
+                },
+            ),
+            ("seq max", TesslGdnArgs { seq: u32::MAX, ..args }),
+            (
+                "heads max",
+                TesslGdnArgs {
+                    heads: u32::MAX,
+                    ..args
+                },
+            ),
+            (
+                "v_dim max",
+                TesslGdnArgs {
+                    v_dim: u32::MAX,
+                    ..args
+                },
+            ),
+            ("v_dim 33", TesslGdnArgs { v_dim: 33, ..args }),
+            ("v_dim 64 on 32 tensors", TesslGdnArgs { v_dim: 64, ..args }),
+            (
+                "ckpt too small",
+                TesslGdnArgs {
+                    ckpt: tref(&ckpt, &[bu, hu, 0, 128, du]),
+                    ..args
+                },
+            ),
+            (
+                "s0 shape wrong",
+                TesslGdnArgs {
+                    s0: tref(&s0, &[bu, hu, du, 128]),
+                    ..args
+                },
+            ),
+        ];
+        let run = |f: GdnFn, a: &TesslGdnArgs| run_gdn(f, &handle, a);
+        for (name, a) in &cases {
+            for f in [tessl_gdn_train_forward, tessl_gdn_train_backward] {
+                let (s, m) = run(f, a);
+                assert_eq!(s, TESSL_ERR, "{name}: accepted ({m})");
+                assert!(!m.is_empty(), "{name}: refused without a message");
+            }
+            untouched(name);
+            assert_eq!(poisoned(handle.0), 0, "{name}: poisoned the handle");
+        }
+        // ds0 exactly when s0 is given, both directions of the mismatch.
+        let (s, m) = run(tessl_gdn_train_backward, &TesslGdnArgs { ds0: NULL_REF, ..args });
+        assert_eq!(s, TESSL_ERR, "s0 without ds0 accepted ({m})");
+        let (s, m) = run(tessl_gdn_train_backward, &TesslGdnArgs { s0: NULL_REF, ..args });
+        assert_eq!(s, TESSL_ERR, "ds0 without s0 accepted ({m})");
+        untouched("ds0 mismatch");
+        assert_eq!(poisoned(handle.0), 0);
+
+        // NaN in q: the call completes, the NaN reaches o, the handle survives.
+        let mut qn = random_f32(b * t * h * 128, 1);
+        qn[0] = f32::NAN;
+        let qnb = shared(rt, &qn);
+        let a = TesslGdnArgs {
+            q: tref(&qnb, &[bu, tu, hu, 128]),
+            ..args
+        };
+        let (s, m) = run(tessl_gdn_train_forward, &a);
+        assert_eq!(s, TESSL_OK, "{m}");
+        assert!(
+            read(&o, b * t * h * dv).iter().any(|x| x.is_nan()),
+            "NaN q must reach o"
+        );
+        assert_eq!(poisoned(handle.0), 0);
+
+        // The same handle still serves a good call.
+        let (s, m) = run(tessl_gdn_train_forward, &args);
+        assert_eq!(s, TESSL_OK, "{m}");
+        let (s, m) = run(tessl_gdn_train_backward, &args);
+        assert_eq!(s, TESSL_OK, "{m}");
+        assert!(read(&dq, b * t * h * 128).iter().all(|x| x.is_finite()));
     });
 }

@@ -917,3 +917,39 @@ fn reaching_the_handoff_point_implies_the_work_completed() {
         rt.synchronize().unwrap();
     });
 }
+
+/// `new_inference` is `new` without the CounterHeap timestamps: both run work,
+/// but only `new` records the (t0, t1) pair a synchronize resolves.
+#[test]
+fn new_inference_runs_work_without_timestamps() {
+    use tessl::nn;
+    let run = |rt: &std::sync::Arc<GpuRuntime>| {
+        let x = rt.alloc_buffer(64 * 4).unwrap();
+        x.write_f32(&[1.5; 64]);
+        nn::scale_f32_inplace(rt, &x, 2.0, 64).unwrap();
+        rt.synchronize().unwrap();
+        assert!(
+            x.read_f32().iter().all(|&v| v == 3.0),
+            "the runtime did not run the dispatch"
+        );
+    };
+    with_gpu(|timed| {
+        let lean = GpuRuntime::new_inference().expect("GpuRuntime::new_inference");
+        assert!(
+            timed.metal4_counter_heap_available(),
+            "new() must create the timestamp heap on this device"
+        );
+        assert!(
+            !lean.metal4_counter_heap_available(),
+            "new_inference() created a timestamp heap"
+        );
+        run(timed);
+        run(&lean);
+        let (t0, t1) = timed.take_metal4_stamps().expect("new() resolved no timestamps");
+        assert!(t1 >= t0, "timestamps not monotonic: ({t0}, {t1})");
+        assert!(
+            lean.take_metal4_stamps().is_none(),
+            "new_inference() resolved timestamps"
+        );
+    });
+}

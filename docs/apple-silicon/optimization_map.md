@@ -279,7 +279,8 @@ unified" is itself a legitimate finding.
 **Phase F status (Mac probe 2026-07-21):** this host is Apple M5 Pro / arm64 —
 `nvidia-smi` absent, `torch.cuda.is_available() == False`. Probe/bench/quality
 **must** run on the 3070 Ti box. Mac ingest path is ready:
-`logs/cuda128m/` + `scripts/ingest_cuda128m.sh` + `scripts/score_cuda128m.py`.
+`logs/cuda128m/` + [`scripts/ingest_cuda128m.sh`](../../../ojas/arch02/metal-native/scripts/ingest_cuda128m.sh) +
+[`scripts/score_cuda128m.py`](../../../ojas/arch02/metal-native/scripts/score_cuda128m.py).
 Until those CUDA artifacts arrive, same-shape 128M CUDA speed/BPB = **null**.
 Do not quote sota 1.9944 / 650–840 ms against 128M.
 

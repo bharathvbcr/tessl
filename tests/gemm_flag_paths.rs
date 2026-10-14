@@ -221,9 +221,10 @@ fn accumulate_train_entries_run_the_accumulate_kernels() {
         ],
         || {
             with_gpu(|rt| {
-                if !rt.has_tensorops() {
-                    return;
-                }
+                assert!(
+                    rt.has_tensorops(),
+                    "requires the TensorOps metallib: build.rs refuses a metallib without it, so a runtime lacking it is a broken build, not a skip"
+                );
                 // K = 3 keeps a·b small against C0, so the final f32 add's
                 // rounding has to be in the budget (`with_previous`).
                 // (128, 384, 4096) takes the split-K TN lanes.
@@ -278,9 +279,10 @@ fn accumulate_train_entries_run_the_accumulate_kernels() {
 fn accumulate_kernels_take_views_on_any_16_byte_boundary() {
     in_child("accumulate_kernels_take_views_on_any_16_byte_boundary", &[], || {
         with_gpu(|rt| {
-            if !rt.has_tensorops() {
-                return;
-            }
+            assert!(
+                rt.has_tensorops(),
+                "requires the TensorOps metallib: build.rs refuses a metallib without it, so a runtime lacking it is a broken build, not a skip"
+            );
             for pad in [16, 32, 48] {
                 for shape in [(96usize, 48usize, 64usize), (130, 97, 70)] {
                     rt.set_precision(PrecisionMode::F32);

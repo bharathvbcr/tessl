@@ -330,9 +330,10 @@ K7 cannot be held to better than f32 against a fixture, whatever the kernel does
 
 **First, a limit on this whole section.** The plan document that enumerates
 K1–K7 is not in either repository. `K7` is named once —
-`gdn_gate_prologue`, at `docs/plan-corrections.md:244` — and K3 is named
-nowhere. Its identity here is reconstructed from seven cross-references, which
-agree but do not amount to a specification:
+`gdn_gate_prologue`, at Lappi-decision's `docs/plan-corrections.md:244`
+(that repository, not this one) — and K3 is named nowhere. Its identity here
+is reconstructed from seven cross-references, which agree but do not amount to
+a specification:
 
 | what the references pin | where |
 | --- | --- |

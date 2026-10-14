@@ -53,6 +53,40 @@ pub fn with_gpu<R>(f: impl FnOnce(&Arc<GpuRuntime>) -> R) -> R {
     f(&rt)
 }
 
+/// Run `body` in a child process with `TESSL_KERNEL_TRACE=1`.
+///
+/// The kernel trace is switched on by the environment once per process, and
+/// the environment cannot be mutated safely under a concurrent `getenv`, so a
+/// test that has to see which kernels ran re-runs itself, filtered to itself
+/// and single-threaded. In the child this runs `body` and returns `None`; in
+/// the parent it spawns the child, asserts it passed *and ran exactly one
+/// test* (a filter matching nothing also exits 0), and returns its stdout.
+pub fn in_traced_child(test_name: &str, body: impl FnOnce()) -> Option<String> {
+    const CHILD: &str = "TESSL_TRACED_CHILD";
+    if std::env::var_os(CHILD).is_some() {
+        body();
+        return None;
+    }
+    let exe = std::env::current_exe().expect("test binary path");
+    let out = std::process::Command::new(exe)
+        .args(["--exact", "--test-threads=1", "--nocapture", test_name])
+        .env(CHILD, "1")
+        .env("TESSL_KERNEL_TRACE", "1")
+        .output()
+        .expect("spawn traced child test");
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert!(
+        out.status.success(),
+        "traced child {test_name} failed:\n{stdout}\n{stderr}"
+    );
+    assert!(
+        stdout.contains("1 passed"),
+        "traced child ran no test (filter out of sync with {test_name}?):\n{stdout}"
+    );
+    Some(stdout)
+}
+
 /// Like [`with_gpu`], but hands out two independent runtimes.
 ///
 /// Cross-runtime rejection is a real hazard for consumers that hold an

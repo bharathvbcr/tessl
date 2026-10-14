@@ -91,10 +91,10 @@ fn decode_path_entry_points_allocate_nothing_on_success() {
     use tessl::{gemm, gemm_epilogue, nn, DType, Epilogue, GemmBackend};
 
     let rt = &tessl::GpuRuntime::new().expect("GpuRuntime::new");
-    if !rt.has_tensorops() {
-        eprintln!("skipped: the bf16 GEMMs need TensorOps");
-        return;
-    }
+    assert!(
+        rt.has_tensorops(),
+        "the bf16 GEMMs need the TensorOps metallib: build.rs refuses a metallib without it, so a runtime lacking it is a broken build, not a skip"
+    );
     const H: usize = 128;
     const INTER: usize = 256;
     const KW: u32 = 4;

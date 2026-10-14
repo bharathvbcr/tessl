@@ -75,9 +75,11 @@ fn from_mtl_buffer_rejects_foreign_device_when_available() {
     with_gpu(|rt| {
         let devices = objc2_metal::MTLCopyAllDevices();
         if devices.count() < 2 {
+            eprintln!("SKIPPED: from_mtl_buffer foreign-device refusal needs a second Metal device; this host has one");
             return;
         }
         let Some(foreign) = devices.iter().find(|d| d.registryID() != rt.device.registryID()) else {
+            eprintln!("SKIPPED: no Metal device distinct from the runtime's");
             return;
         };
         let raw = foreign

@@ -43,61 +43,165 @@ fn bench_binaries_named_in(text: &str) -> BTreeSet<String> {
     found
 }
 
-fn check(doc: &Path, label: &str, missing: &mut Vec<String>) {
-    let text =
-        std::fs::read_to_string(doc).unwrap_or_else(|e| panic!("{label}: could not read {}: {e}", doc.display()));
-    for name in bench_binaries_named_in(&text) {
-        if DELIBERATELY_ABSENT.contains(&name.as_str()) {
-            continue;
-        }
-        let src = crate_root().join("src/bin").join(format!("{name}.rs"));
-        if !src.exists() {
-            missing.push(format!("{label} names `{name}`, but {} does not exist", src.display()));
+/// Every tracked-or-not `.md` under `docs/`, plus the crate README, as
+/// `(label, path)`. A missing `docs/` is a failure: the directory sits in the
+/// repo root and a scan that found nothing must not read as a clean one.
+fn doc_files() -> Vec<(String, PathBuf)> {
+    fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
+        let entries = std::fs::read_dir(dir).unwrap_or_else(|e| panic!("could not read {}: {e}", dir.display()));
+        for entry in entries.map(|e| e.expect("directory entry")) {
+            let path = entry.path();
+            if path.is_dir() {
+                walk(&path, out);
+            } else if path.extension().is_some_and(|x| x == "md") {
+                out.push(path);
+            }
         }
     }
+    let root = crate_root();
+    let readme = root.join("README.md");
+    assert!(readme.is_file(), "the crate README must be present to check");
+    let mut found = Vec::new();
+    walk(&root.join("docs"), &mut found);
+    assert!(
+        found.len() >= 10,
+        "found only {} markdown files under docs/; the scan is not reaching them",
+        found.len()
+    );
+    found.sort();
+    let mut docs = vec![("README.md".to_string(), readme)];
+    for path in found {
+        let label = path
+            .strip_prefix(&root)
+            .expect("under crate root")
+            .display()
+            .to_string();
+        docs.push((label, path));
+    }
+    docs
+}
+
+/// Repo-relative directories a backticked path may start with.
+const PATH_ROOTS: &[&str] = &[
+    "bench/",
+    "scripts/",
+    "tools/",
+    "src/",
+    "kernels/",
+    "tests/",
+    "docs/",
+    "examples/",
+    "python/",
+];
+
+/// References that name files in a *different* repository, as
+/// `(path prefix, marker)`. A reference is exempt only when its path starts
+/// with the prefix **and its own line says which repository it lives in** (the
+/// marker), so a typo'd in-repo path cannot hide behind an entry. Keep each
+/// entry justified.
+const EXTERNAL_REFERENCES: &[(&str, &str)] = &[
+    // docs/qwen35.md: the memory cap in Lappi-decision's lock script, "a
+    // script in that repository and not in this one".
+    ("tools/mac_heavy.sh", "Lappi-decision"),
+    // docs/verification.md cites the planning log, which lives in
+    // Lappi-decision, and says so.
+    ("docs/plan-corrections.md", "Lappi-decision"),
+    // docs/apple-silicon/*.md name scripts and kernels of the ojas
+    // arch02 metal-native crate; each is a link whose target spells that path.
+    ("scripts/", "ojas/arch02/metal-native"),
+    ("kernels/", "ojas/arch02/metal-native"),
+];
+
+/// Backticked tokens that are repo-relative file paths: `(line, path)`.
+/// Globs, placeholders, URLs and `:line` / `#anchor` suffixes are not paths
+/// to resolve, so the suffixes are stripped and the rest are skipped.
+fn paths_named_in(text: &str) -> Vec<(usize, String)> {
+    let mut found = Vec::new();
+    for (i, line) in text.lines().enumerate() {
+        for chunk in line.split('`').skip(1).step_by(2) {
+            let name = chunk.trim();
+            let name = name.split(['#', ':']).next().unwrap_or(name);
+            let plain = !name.contains(|c: char| "*{}<>$ ()[]|,=".contains(c));
+            let has_ext = Path::new(name).extension().is_some();
+            if plain && has_ext && PATH_ROOTS.iter().any(|r| name.starts_with(r)) {
+                found.push((i + 1, name.to_string()));
+            }
+        }
+    }
+    found
+}
+
+/// Dangling references in one document's text, as `label:line: message`.
+fn dangling_in(label: &str, text: &str, root: &Path) -> Vec<String> {
+    let mut missing = Vec::new();
+    for (i, line) in text.lines().enumerate() {
+        for name in bench_binaries_named_in(line) {
+            if DELIBERATELY_ABSENT.contains(&name.as_str()) {
+                continue;
+            }
+            let src = root.join("src/bin").join(format!("{name}.rs"));
+            if !src.exists() {
+                missing.push(format!(
+                    "{label}:{}: names `{name}`, but {} does not exist",
+                    i + 1,
+                    src.display()
+                ));
+            }
+        }
+    }
+    for (line, name) in paths_named_in(text) {
+        if root.join(&name).exists() {
+            continue;
+        }
+        let here = text.lines().nth(line - 1).unwrap_or("");
+        let external = EXTERNAL_REFERENCES
+            .iter()
+            .any(|(prefix, marker)| name.starts_with(prefix) && here.contains(marker));
+        // A path the prose names as deliberately absent (its stem is on the list).
+        let absent = Path::new(&name)
+            .file_stem()
+            .is_some_and(|s| DELIBERATELY_ABSENT.contains(&s.to_string_lossy().as_ref()));
+        if !external && !absent {
+            missing.push(format!("{label}:{line}: names path `{name}`, which does not exist"));
+        }
+    }
+    missing
 }
 
 #[test]
-fn every_bench_binary_the_docs_name_exists() {
+fn every_bench_binary_and_path_the_docs_name_exists() {
+    let root = crate_root();
     let mut missing = Vec::new();
-
-    let readme = crate_root().join("README.md");
-    assert!(readme.exists(), "the crate README must be present to check");
-    check(&readme, "tessl/README.md", &mut missing);
-
-    // Lives outside the crate, so it is absent from a packaged `.crate`.
-    // Announce that rather than passing as though it had been checked.
-    let arch = crate_root().join("../../docs/gemm_architecture.md");
-    if arch.exists() {
-        check(&arch, "docs/gemm_architecture.md", &mut missing);
-    } else {
-        println!(
-            "note: {} not present (packaged crate?) — that document was NOT checked",
-            arch.display()
-        );
+    for (label, path) in doc_files() {
+        let text = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{label}: could not read: {e}"));
+        missing.extend(dangling_in(&label, &text, &root));
     }
-
     assert!(
         missing.is_empty(),
-        "dangling tool references:\n  {}",
+        "dangling tool or path references:\n  {}",
         missing.join("\n  ")
     );
 }
 
-/// The scripts the docs point at have to be there too. Same failure, different
-/// directory: `bench/parity_ladder.py` is quoted as a command to run.
+/// The check itself must detect a fault: a doc naming a missing path, a
+/// missing binary, or a local `tools/` script must fail; an external-repo
+/// reference with its repo named must not.
 #[test]
-fn every_bench_script_the_docs_name_exists() {
-    let text = std::fs::read_to_string(crate_root().join("README.md")).expect("README");
-    let mut missing = Vec::new();
-    for chunk in text.split('`').skip(1).step_by(2) {
-        let name = chunk.trim();
-        let is_path = (name.starts_with("bench/") || name.starts_with("scripts/")) && name.ends_with(".py");
-        if is_path && !crate_root().join(name).exists() {
-            missing.push(name.to_string());
-        }
-    }
-    assert!(missing.is_empty(), "README names missing scripts: {missing:?}");
+fn the_dangling_reference_check_detects_faults() {
+    let root = crate_root();
+    let bad = dangling_in("x.md", "ok\nrun `scripts/no_such_file.py` now", &root);
+    assert_eq!(bad.len(), 1, "{bad:?}");
+    assert!(bad[0].starts_with("x.md:2:"), "{bad:?}");
+    assert_eq!(dangling_in("x.md", "see `bench_no_such_tool`", &root).len(), 1);
+    assert_eq!(dangling_in("x.md", "see `tools/mac_heavy.sh` here", &root).len(), 1);
+    assert!(dangling_in("x.md", "Lappi-decision's `tools/mac_heavy.sh`", &root).is_empty());
+    // The marker must be on the reference's own line, and match its prefix.
+    assert_eq!(
+        dangling_in("x.md", "Lappi-decision\n`tools/mac_heavy.sh`", &root).len(),
+        1
+    );
+    assert_eq!(dangling_in("x.md", "Lappi-decision's `tools/other.sh`", &root).len(), 1);
+    assert!(dangling_in("x.md", "see `README.md` and `src/lib.rs:10`", &root).is_empty());
 }
 
 /// The allowlist must not outlive its justification: an entry naming a binary

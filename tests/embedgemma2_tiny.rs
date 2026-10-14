@@ -24,7 +24,7 @@ mod common;
 
 use common::embedgemma2::{attn_ref, gelu_tanh, l2_normalize, lin, rms, rope, Attn};
 use common::{with_gpu, SplitMix};
-use tessl::embedgemma2::{EmbedGemma2Config, EmbedGemma2Model};
+use tessl::embedgemma2::{EmbedGemma2Config, EmbedGemma2Model, DEFAULT_MAX_TOKENS, MAX_BATCH_TOKENS};
 use tessl::infer_trace;
 use tessl::safetensors::SafeTensors;
 use tessl::tensor::{bf16_bits_to_f32, f32_slice_to_bf16};
@@ -655,5 +655,54 @@ fn loader_refuses_tensors_it_would_ignore() {
             EmbedGemma2Model::load(rt, &st, PREFIX, cfg.clone()).is_err(),
             "missing layer_scalar: loaded"
         );
+    });
+}
+
+/// `set_max_tokens` takes effect on `encode` and refuses what it cannot
+/// honour, leaving the old limit in force when it refuses.
+#[test]
+fn set_max_tokens_bounds_encode_and_refuses_out_of_range() {
+    let cfg = EmbedGemma2Config::from_config_json(CONFIG).unwrap();
+    let w = random_weights(&cfg, 2026);
+    let st = open("max_tokens", safetensors_bytes(&w, &[]));
+    let seq = sequences(cfg.vocab).remove(0);
+    let n = seq.len() as u32;
+    assert!(n > 1, "test bug: need a sequence of at least two tokens");
+    with_gpu(|rt| {
+        let mut model = EmbedGemma2Model::load(rt, &st, PREFIX, cfg.clone()).unwrap();
+        assert_eq!(model.max_tokens(), DEFAULT_MAX_TOKENS);
+        let full = model
+            .encode(&[&seq], None, false)
+            .expect("default limit admits the sequence");
+
+        // Refusals: zero and one past the ceiling; the limit does not move.
+        for bad in [0u32, MAX_BATCH_TOKENS as u32 + 1, u32::MAX] {
+            let err = model.set_max_tokens(bad).expect_err("out-of-range limit accepted");
+            assert!(err.contains("max_tokens must be in 1..="), "{bad}: {err}");
+            assert_eq!(
+                model.max_tokens(),
+                DEFAULT_MAX_TOKENS,
+                "a refused set changed the limit"
+            );
+        }
+
+        // The limit is exactly the longest admitted sequence.
+        model.set_max_tokens(n - 1).unwrap();
+        assert_eq!(model.max_tokens(), n - 1);
+        let err = model
+            .encode(&[&seq], None, false)
+            .err()
+            .expect("over-limit sequence encoded");
+        assert!(err.contains("the limit is") && err.contains("set_max_tokens"), "{err}");
+        model.set_max_tokens(n).unwrap();
+        let again = model
+            .encode(&[&seq], None, false)
+            .expect("a sequence at the limit encodes");
+        assert_eq!(again.embeddings, full.embeddings, "the limit changed the result");
+
+        // The ceiling itself is accepted, and so is 1.
+        model.set_max_tokens(MAX_BATCH_TOKENS as u32).unwrap();
+        model.set_max_tokens(1).unwrap();
+        assert_eq!(model.max_tokens(), 1);
     });
 }

@@ -1,0 +1,42 @@
+{
+ "generator": "scripts/gen_bert_fixtures.py",
+ "generator_sha256": "cf9519af82640987c1b2bbeedae412ce652878483b9c9f38e4fb2d5aa7c01aa3",
+ "seed": 20260713,
+ "python": "3.13.14",
+ "versions": {
+  "torch": "2.14.1",
+  "transformers": "5.17.0",
+  "numpy": "2.5.3",
+  "safetensors": "0.8.0"
+ },
+ "shape": {
+  "hidden": 64,
+  "heads": 2,
+  "layers": 2,
+  "intermediate": 96,
+  "vocab": 96,
+  "positions": 16,
+  "lens": [
+   16,
+   3,
+   9,
+   12,
+   5,
+   16
+  ]
+ },
+ "files_sha256": {
+  "bert/config.json": "ed1d1b1947c2ec3c830d70b7d9684925c7aaa04d80322d3713510a8bea31c1e4",
+  "bert/ids.npy": "cf2467cc7e138aa613e417df26128f5c87db30974dc68acd1a61901f7378ba77",
+  "bert/lens.npy": "41f831ae1db8c1d9d3fb8992973f83312464fe5e172087d9058b6e8f6988c4a5",
+  "bert/model.safetensors": "654869685f88c99f52e5f2f6780d6c21c3b822a99d929472b9251b701aa90755",
+  "bert/pooled.npy": "1f2f5908071c78b5173b413b232197432ad364b064f89ce756bb6368cea124ca",
+  "bert/trace.npy": "362758d723e0cd6b32af37b03be48dd13a985b15b86d84dd34ffb031156f4038",
+  "distilbert/config.json": "38d797fa195fd449c596a4097427f0a754652dedb4e4c71d9411ba8b0ff88990",
+  "distilbert/ids.npy": "c39dca08338fec0eb88f7023f1234209e3a42ef6794a1be9533011e49586d6ea",
+  "distilbert/lens.npy": "41f831ae1db8c1d9d3fb8992973f83312464fe5e172087d9058b6e8f6988c4a5",
+  "distilbert/model.safetensors": "d366a8e91d2fcc3553f9fac2735e984d81f8023974bac586775dc1e5980ef931",
+  "distilbert/pooled.npy": "9fd554ec3ecd55929e15ba37353b8ceb14a595e9a39eeb63fa888fe0d8ac5448",
+  "distilbert/trace.npy": "4dcec92ad9ea00ba8cefeb4864d55e5bf8da216a918596c8d9c069423c638053"
+ }
+}

@@ -107,3 +107,5 @@ Every kernel in `kernels/bert.metal` is verified against high-precision float64 
 - LayerNorm (plain, fused and after the embedding sum): within `1e-5 * max(1, max|ref|)` of the f64 reference.
 - erf GELU: within `(1e-6 + 4 x^2 eps) * |ref| + 1e-30`, a relative bound element by element, not bit-for-bit; the tanh approximation must fail the same bound.
 - Segment Sparse Max: tested with randomized logits and variable segment lengths against reference CPU reduction.
+
+The composed forward is held to transformers in `tests/bert_model.rs`: a tiny random `BertForMaskedLM` and `DistilBertForMaskedLM` (`tests/fixtures/bert_tiny/`) are encoded as one padded batch and compared with transformers' fp32 forward of each sequence alone (pooled sparse vectors, the embedding output and every layer's output; bound `2e-4 + 2e-4 * |want|`, stated in the test). The fixtures come from `scripts/gen_bert_fixtures.py` (run with the oracle venv), and `tests/fixtures/bert_tiny/manifest.json` records the torch, transformers and numpy versions, the seed, and the sha256 of the generator and of every file. Exchanging two layers' weights fails the test.

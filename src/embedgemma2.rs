@@ -778,6 +778,25 @@ struct Acts {
     pooled: Tensor,
 }
 
+/// Queue `chunks` in order: for each, `make` its [`ForwardIo`], push it into
+/// `pending` and only then `run` the forward on it, so a forward that fails
+/// after queuing some dispatches still has its io held in `pending` until the
+/// caller's wait (Metal 4 command buffers do not retain what they bind).
+fn queue_forwards<Io>(
+    chunks: Vec<Vec<usize>>,
+    pending: &mut Vec<(Vec<usize>, Io)>,
+    mut make: impl FnMut(&[usize]) -> Result<Io, String>,
+    mut run: impl FnMut(&[usize], &Io) -> Result<(), String>,
+) -> Result<(), String> {
+    for chunk in chunks {
+        let io = make(&chunk)?;
+        pending.push((chunk, io));
+        let (chunk, io) = pending.last().expect("just pushed");
+        run(chunk, io)?;
+    }
+    Ok(())
+}
+
 /// What one forward alone owns, because the host writes it before the forward
 /// runs and reads it after: a later forward must not rewrite it while the GPU
 /// may still be reading it, so each gets its own (small) set, and
@@ -992,18 +1011,23 @@ impl EmbedGemma2Model {
         // `async_encode`, which the caller owns: with it off every dispatch
         // still commits and waits.
         let mut pending: Vec<(Vec<usize>, ForwardIo)> = Vec::with_capacity(chunks.len());
-        let queued = (|| -> Result<(), String> {
-            for chunk in chunks {
+        let queued = queue_forwards(
+            chunks,
+            &mut pending,
+            |chunk| {
                 let seqs: Vec<&[u32]> = chunk.iter().map(|&i| batch[i]).collect();
-                let (io, t) = self.forward(&acts, &seqs, dim_out, trace)?;
-                out_trace = t;
+                self.forward_io(&seqs)
+            },
+            |chunk, io| {
+                let seqs: Vec<&[u32]> = chunk.iter().map(|&i| batch[i]).collect();
+                out_trace = self.forward(&acts, io, &seqs, dim_out, trace)?;
                 forwards += 1;
-                pending.push((chunk, io));
-            }
-            Ok(())
-        })();
-        // Wait even when queuing failed: the buffers in `pending` and `acts`
-        // must outlive every command already queued on them (Metal 4 command
+                Ok(())
+            },
+        );
+        // Wait even when queuing failed: the buffers in `pending` (the failed
+        // forward's included, which `queue_forwards` registers before running
+        // it) and `acts` must outlive every command already queued on them (Metal 4 command
         // buffers do not retain what they bind).
         let waited = self.rt.synchronize();
         queued?;
@@ -1022,58 +1046,67 @@ impl EmbedGemma2Model {
         })
     }
 
+    /// This forward's own host-written inputs and host-read output for
+    /// `batch` padded to its longest sequence, written without waiting for
+    /// the GPU ([`GpuRuntime::alloc_buffer_from_u32`]; writing into a buffer
+    /// already bound would wait for every queued forward). The GPU reads them
+    /// when the forward runs, which may be after the host has queued the next
+    /// one.
+    fn forward_io(&self, batch: &[&[u32]]) -> Result<ForwardIo, String> {
+        const WHAT: &str = "EmbedGemma2Model::forward";
+        let rt = &self.rt;
+        let seq = batch.iter().map(|ids| ids.len()).max().unwrap_or(0);
+        let rows = batch.len() * seq;
+        if seq == 0 || rows > MAX_BATCH_TOKENS {
+            return Err(format!(
+                "{WHAT}: {} sequences padded to {seq} tokens is {rows} rows; need 1..={MAX_BATCH_TOKENS}",
+                batch.len()
+            ));
+        }
+        let mut padded = vec![0u32; rows];
+        for (b, ids) in batch.iter().enumerate() {
+            padded[b * seq..b * seq + ids.len()].copy_from_slice(ids);
+        }
+        let lens: Vec<u32> = batch.iter().map(|ids| ids.len() as u32).collect();
+        let segs: Vec<u32> = batch
+            .iter()
+            .enumerate()
+            .flat_map(|(b, ids)| [(b * seq) as u32, (b * seq + ids.len()) as u32])
+            .collect();
+        Ok(ForwardIo {
+            ids: rt.alloc_buffer_from_u32(&padded)?,
+            lens: rt.alloc_buffer_from_u32(&lens)?,
+            segments: rt.alloc_buffer_from_u32(&segs)?,
+            out: rt.alloc_tensor_unzeroed(&[batch.len(), self.cfg.embedding_dim as usize], DType::F32)?,
+        })
+    }
+
     /// Queue one forward over `batch` padded to its longest sequence
-    /// (validated by [`Self::encode`]; `batch.len() * longest <=
-    /// MAX_BATCH_TOKENS`) in `a`, without waiting for it. The embeddings are
-    /// in the returned [`ForwardIo`]'s `out` once the caller has
+    /// (`io` from [`Self::forward_io`] for the same `batch`) in `a`, without
+    /// waiting for it. The embeddings are in `io.out` once the caller has
     /// synchronized, `[batch, embedding_dim]` with the first `dim_out`
     /// columns normalized. With `trace` the forward waits per layer (one
     /// sequence, one forward) and returns the residual stream after each.
     fn forward(
         &self,
         a: &Acts,
+        io: &ForwardIo,
         batch: &[&[u32]],
         dim_out: u32,
         trace: bool,
-    ) -> Result<(ForwardIo, Vec<Vec<f32>>), String> {
+    ) -> Result<Vec<Vec<f32>>, String> {
         const WHAT: &str = "EmbedGemma2Model::forward";
         let rt = &self.rt;
         let cfg = &self.cfg;
         let seq = batch.iter().map(|ids| ids.len() as u32).max().unwrap_or(0);
         let nb = batch.len() as u32;
         let rows = nb as usize * seq as usize;
-        if seq == 0 || rows > MAX_BATCH_TOKENS {
-            return Err(format!(
-                "{WHAT}: {nb} sequences padded to {seq} tokens is {rows} rows; need 1..={MAX_BATCH_TOKENS}"
-            ));
-        }
         if rows > a.rows || batch.len() > a.nb {
             return Err(format!(
                 "{WHAT}: {rows} rows of {nb} sequences exceed the activations' {} rows of {}",
                 a.rows, a.nb
             ));
         }
-        // This forward's own inputs, written on the host without waiting for
-        // the GPU ([`GpuRuntime::alloc_buffer_from_u32`]; writing into a
-        // buffer already bound would wait for every queued forward). The GPU
-        // reads them when the forward runs, which may be after the host has
-        // queued the next one.
-        let mut padded = vec![0u32; rows];
-        for (b, ids) in batch.iter().enumerate() {
-            padded[b * seq as usize..b * seq as usize + ids.len()].copy_from_slice(ids);
-        }
-        let lens: Vec<u32> = batch.iter().map(|ids| ids.len() as u32).collect();
-        let segs: Vec<u32> = batch
-            .iter()
-            .enumerate()
-            .flat_map(|(b, ids)| [b as u32 * seq, b as u32 * seq + ids.len() as u32])
-            .collect();
-        let io = ForwardIo {
-            ids: rt.alloc_buffer_from_u32(&padded)?,
-            lens: rt.alloc_buffer_from_u32(&lens)?,
-            segments: rt.alloc_buffer_from_u32(&segs)?,
-            out: rt.alloc_tensor_unzeroed(&[nb as usize, cfg.embedding_dim as usize], DType::F32)?,
-        };
 
         let (h, rows_u) = (cfg.hidden, rows as u32);
         let eps = cfg.rms_norm_eps;
@@ -1251,7 +1284,7 @@ impl EmbedGemma2Model {
             rt.synchronize()?;
             out_trace.push(x.buffer.try_contents_f32()?[..rows * h as usize].to_vec());
         }
-        Ok((io, out_trace))
+        Ok(out_trace)
     }
 
     /// [`Acts`] for forwards of up to `rows` padded rows over up to `nb`
@@ -1303,7 +1336,61 @@ fn view(t: &Tensor, rows: u32, cols: u32) -> Result<Tensor, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{encoder_attn_tiled_entry, pack_forwards, FORWARD_COST_ROWS_ASYNC, FORWARD_COST_ROWS_SYNC, MAX_BATCH};
+    use super::{
+        encoder_attn_tiled_entry, pack_forwards, queue_forwards, FORWARD_COST_ROWS_ASYNC, FORWARD_COST_ROWS_SYNC,
+        MAX_BATCH,
+    };
+
+    /// A forward that fails after queuing dispatches must still have its io
+    /// held (not dropped) when `queue_forwards` returns, so the caller's wait
+    /// precedes its release.
+    #[test]
+    fn a_failed_forward_keeps_its_io_until_the_caller_waits() {
+        use std::cell::Cell;
+        struct Io<'a>(&'a Cell<usize>);
+        impl Drop for Io<'_> {
+            fn drop(&mut self) {
+                self.0.set(self.0.get() + 1);
+            }
+        }
+        let drops = Cell::new(0);
+        let mut pending = Vec::new();
+        let r = queue_forwards(
+            vec![vec![0], vec![1], vec![2]],
+            &mut pending,
+            |_| Ok(Io(&drops)),
+            |chunk, _| {
+                if chunk[0] == 1 {
+                    Err("mid-forward".to_string())
+                } else {
+                    Ok(())
+                }
+            },
+        );
+        assert_eq!(r, Err("mid-forward".to_string()));
+        assert_eq!(
+            pending.len(),
+            2,
+            "the failing forward's io is registered before it runs"
+        );
+        assert_eq!(drops.get(), 0, "no io dropped before the caller's wait");
+        drop(pending);
+        assert_eq!(drops.get(), 2);
+    }
+
+    /// A failing `make` queues nothing for that chunk.
+    #[test]
+    fn a_failed_io_allocation_stops_the_queue() {
+        let mut pending: Vec<(Vec<usize>, ())> = Vec::new();
+        let r = queue_forwards(
+            vec![vec![0], vec![1]],
+            &mut pending,
+            |c| if c[0] == 1 { Err("alloc".into()) } else { Ok(()) },
+            |_, _| Ok(()),
+        );
+        assert_eq!(r, Err("alloc".to_string()));
+        assert_eq!(pending.len(), 1);
+    }
 
     /// Each tiled entry's name spells the geometry the host builds its grid
     /// from (`_q{BQ}_k{BK}_sg{NSG}`), and the source instantiates it with

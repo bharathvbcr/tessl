@@ -9,6 +9,7 @@
 mod common;
 
 use common::{with_gpu, SplitMix};
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use tessl::bert::{BertConfig, BertFamily, BertSparseModel, HEAD_BLOCK_ROWS, MAX_BATCH, MAX_BATCH_TOKENS};
 use tessl::infer_trace;
 use tessl::safetensors::SafeTensors;
@@ -234,5 +235,107 @@ fn a_tensor_the_model_never_reads_is_refused_by_name() {
                 assert!(err.contains(name), "{family:?}: error does not name {name}: {err}");
             }
         }
+    });
+}
+
+fn pooled_bits(v: &tessl::bert::SparseOutput) -> Vec<u32> {
+    v.pooled.iter().map(|x| x.to_bits()).collect()
+}
+
+/// A live `HostMapping` makes `encode` (activations, id/length uploads and the
+/// per-block segment upload) return a "busy" error instead of panicking, and
+/// leaves nothing behind: the next encode is bit-identical, the runtime is not
+/// poisoned, and stale activations are not reused.
+#[test]
+fn encode_reports_a_busy_runtime_instead_of_panicking_and_leaves_no_state() {
+    with_gpu(|rt| {
+        for family in [BertFamily::Bert, BertFamily::DistilBert] {
+            let model = BertSparseModel::load(rt, &checkpoint(family, 7), config(family)).unwrap();
+            let seqs = batch(11);
+            let refs: Vec<&[u32]> = seqs.iter().map(Vec::as_slice).collect();
+            let first = model.encode(&refs, false).unwrap();
+
+            let held = rt.alloc_buffer(64).unwrap();
+            let mapping = held.contents_u8();
+            let err = catch_unwind(AssertUnwindSafe(|| model.encode(&refs, false).map(|_| ())))
+                .unwrap_or_else(|_| panic!("{family:?}: encode panicked on a busy runtime"))
+                .unwrap_err();
+            assert!(err.contains("busy"), "{family:?}: {err}");
+            drop(mapping);
+
+            assert!(rt.synchronize().is_ok(), "{family:?}: the runtime is poisoned");
+            let again = model.encode(&refs, false).unwrap();
+            assert_eq!(
+                pooled_bits(&again),
+                pooled_bits(&first),
+                "{family:?}: re-encode differs"
+            );
+
+            rt.set_poison_unzeroed(true);
+            let poisoned = model.encode(&refs, false);
+            rt.set_poison_unzeroed(false);
+            assert_eq!(
+                pooled_bits(&poisoned.unwrap()),
+                pooled_bits(&first),
+                "{family:?}: stale activations were read"
+            );
+        }
+    });
+}
+
+/// With async encode on and a batch already open, an encode waits once per
+/// head block (the `rt.synchronize` that frees the logits and pooled buffers
+/// for the next block) and for nothing else: the id/length upload of its
+/// activations and every block's segment upload add no wait. A waiting upload
+/// would make the count exceed the block count.
+#[test]
+fn async_encode_waits_only_once_per_head_block() {
+    assert!(
+        std::env::var_os("TESSL_MID_COMMIT").is_none(),
+        "TESSL_MID_COMMIT changes the commit and wait counts"
+    );
+    let head_blocks = SEQUENCES.div_ceil(HEAD_BLOCK_ROWS / MAX_SEQ) as u64;
+    assert_eq!(head_blocks, 2, "test bug: the batch should span two head blocks");
+    with_gpu(|rt| {
+        let family = BertFamily::Bert;
+        let model = BertSparseModel::load(rt, &checkpoint(family, 7), config(family)).unwrap();
+        let seqs = batch(11);
+        let refs: Vec<&[u32]> = seqs.iter().map(Vec::as_slice).collect();
+        let sync_out = model.encode(&refs, false).unwrap();
+
+        // Positive control, then the measured encode, each behind an open batch.
+        rt.set_async_encode(true).unwrap();
+        let dst = rt.alloc_buffer(16).unwrap();
+        rt.upload_u32(&dst, &[1, 2, 3, 4]).unwrap();
+        infer_trace::set_enabled(true);
+        let c0 = infer_trace::snapshot();
+        let control = dst.try_write_u32(&[9, 9, 9, 9]);
+        let c1 = infer_trace::snapshot();
+        infer_trace::set_enabled(false);
+        control.unwrap();
+        assert!(
+            c1.since(&c0).sync_waits >= 1,
+            "positive control: a bound host write counted no wait"
+        );
+
+        rt.upload_u32(&dst, &[1, 2, 3, 4]).unwrap();
+        infer_trace::set_enabled(true);
+        let s0 = infer_trace::snapshot();
+        let out = model.encode(&refs, false);
+        let s1 = infer_trace::snapshot();
+        infer_trace::set_enabled(false);
+        rt.synchronize().unwrap();
+        rt.set_async_encode(false).unwrap();
+        let waits = s1.since(&s0).sync_waits;
+        let out = out.unwrap();
+        assert_eq!(
+            waits, head_blocks,
+            "encode waited {waits} times for {head_blocks} head blocks"
+        );
+        assert_eq!(
+            pooled_bits(&out),
+            pooled_bits(&sync_out),
+            "async encode differs from sync encode"
+        );
     });
 }

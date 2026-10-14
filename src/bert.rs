@@ -344,6 +344,7 @@ pub fn upload_segments(rt: &Arc<GpuRuntime>, segments: &[(u32, u32)], rows: u32)
     // an ordinary allocation would first commit and wait on everything
     // queued, the whole encoder forward on the first head block.
     rt.alloc_buffer_from_u32(&flat)
+        .map_err(|e| format!("bert::upload_segments: {e}"))
 }
 
 /// `pooled[s, v] = max(pooled[s, v], log1p(relu(max_{r in segment s}

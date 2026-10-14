@@ -1,7 +1,8 @@
 //! The C ABI's handle contract: null handles, foreign threads, freed handles.
 //!
-//! The null-handle tests create no runtime and need no GPU. The foreign-thread
-//! test needs one real runtime handle (a Metal device). The aliasing the
+//! No test here creates a runtime or needs a GPU (a guard test scans this file
+//! for runtime creation); the foreign-thread test, which needs one real runtime
+//! handle (a Metal device), lives in `tests/capi.rs`. The aliasing the
 //! thread check used to cause (a `&mut` formed on a foreign thread while the
 //! owner may be inside a call) is undefined behaviour Miri cannot exercise
 //! through Metal, so what is pinned here is the observable half: the refusal
@@ -12,8 +13,6 @@
 //! handles, so a call on a freed pointer is undefined behaviour by contract
 //! (documented in `src/capi.rs`), and a test would have to commit it.
 
-mod common;
-
 use std::ffi::{c_char, CStr};
 use std::ptr;
 
@@ -21,8 +20,8 @@ use tessl::capi::{
     tessl_cross_entropy_rows, tessl_gdn_train_backward, tessl_gdn_train_forward, tessl_qwen35_adamw_free,
     tessl_qwen35_adamw_set_step_count, tessl_qwen35_adamw_step_count, tessl_qwen35_free, tessl_qwen35_grad_sq_norm,
     tessl_qwen35_load, tessl_qwen35_param_count, tessl_qwen35_train_discard, tessl_qwen35_train_step,
-    tessl_runtime_free, tessl_runtime_new, tessl_runtime_poisoned, tessl_synchronize, TesslQwen35, TesslRuntime,
-    TESSL_ABI_VERSION, TESSL_ERR, TESSL_F32, TESSL_OK,
+    tessl_runtime_free, tessl_runtime_poisoned, tessl_synchronize, TesslQwen35, TesslRuntime, TESSL_ABI_VERSION,
+    TESSL_ERR, TESSL_F32, TESSL_OK,
 };
 
 const ERR_LEN: usize = 512;
@@ -117,40 +116,6 @@ fn a_null_handle_with_no_error_buffer_is_still_a_status() {
         unsafe { tessl_synchronize(ptr::null_mut(), ptr::null_mut(), 0) },
         TESSL_ERR
     );
-}
-
-#[test]
-fn every_runtime_entry_refuses_a_foreign_thread_before_looking_at_its_arguments() {
-    let _gpu = common::gpu_lock();
-    let mut err = [0 as c_char; ERR_LEN];
-    let rt = unsafe { tessl_runtime_new(err.as_mut_ptr(), ERR_LEN) };
-    assert!(!rt.is_null(), "{}", msg(&err));
-    let raw = rt as usize;
-    // The arguments are all null: were they looked at first, the message
-    // would be "null args", not the thread's.
-    let calls = std::thread::spawn(move || runtime_entries(raw as *mut TesslRuntime))
-        .join()
-        .unwrap();
-    assert_eq!(calls.len(), 6);
-    for (name, status, message) in &calls {
-        assert_eq!(*status, TESSL_ERR, "{name}");
-        assert!(
-            message.contains("other than the one that created it"),
-            "{name}: {message:?}"
-        );
-    }
-    // A foreign free leaks rather than drops, and the owner still works.
-    let freed = std::thread::spawn(move || unsafe { tessl_runtime_free(raw as *mut TesslRuntime) })
-        .join()
-        .unwrap();
-    assert_eq!(freed, TESSL_ERR);
-    assert_eq!(
-        unsafe { tessl_synchronize(rt, err.as_mut_ptr(), ERR_LEN) },
-        TESSL_OK,
-        "{}",
-        msg(&err)
-    );
-    assert_eq!(unsafe { tessl_runtime_free(rt) }, TESSL_OK);
 }
 
 /// `None` when the binding's `_ABI_VERSION` line is `ver`.
@@ -327,16 +292,17 @@ fn strip_py_comments(src: &str) -> String {
     out
 }
 
-/// True when the `r` at `i` continues an identifier. A `b` directly before it
-/// is the byte-string prefix (`br"..."`), not an identifier, unless that `b`
-/// itself follows an identifier char (`ab r"` cannot occur, but `abr#` is one).
+/// True when the `r` at `i` continues an identifier. A `b` or `c` directly
+/// before it is the byte / C string prefix (`br"..."`, `cr"..."`), not an
+/// identifier, unless that prefix letter itself follows an identifier char
+/// (`abr#` and `acr#` are identifiers).
 fn prefix_is_ident(c: &[char], i: usize) -> bool {
     let ident = |j: Option<usize>| {
         j.and_then(|j| c.get(j))
             .is_some_and(|p| p.is_alphanumeric() || *p == '_')
     };
     match i.checked_sub(1) {
-        Some(b) if c[b] == 'b' => ident(b.checked_sub(1)),
+        Some(b) if c[b] == 'b' || c[b] == 'c' => ident(b.checked_sub(1)),
         p => ident(p),
     }
 }
@@ -375,7 +341,8 @@ fn strip_line_comments(src: &str) -> String {
                 }
             }
         } else if c[i] == 'r' && matches!(at(i + 1), Some('"' | '#')) && !prefix_is_ident(&c, i) {
-            // Raw string: r"..." or r#"..."#.
+            // Raw string: r"..", r#".."#, and the br / cr forms (the b or c
+            // is already in `out`). b".." and c".." are ordinary strings.
             let mut j = i + 1;
             while at(j) == Some('#') {
                 j += 1;
@@ -1528,7 +1495,39 @@ fn a_byte_raw_string_hides_a_trailing_comment_and_what_follows() {
 
 #[test]
 fn an_identifier_ending_in_br_is_not_a_byte_raw_string() {
-    let p = rs_with(&format!("fn abr(x: u8) {{}} const S: &str = \"\\\"; {PHANTOM_FN}"));
+    // Read as `abr` then an ordinary string `"\"; // "`, the phantom after it is
+    // live. Mis-lexed as the byte raw string `br"\"` the rest is a comment and
+    // the phantom is hidden, so this fails if the identifier check is removed.
+    let p = rs_with(&format!("const X: u8 = abr\"\\\"; // \" {PHANTOM_FN}"));
+    assert!(mentions(&p, "tessl_phantom: in src/capi.rs"), "{p:?}");
+}
+
+#[test]
+fn an_identifier_ending_in_cr_is_not_a_c_raw_string() {
+    let p = rs_with(&format!("const X: u8 = acr\"\\\"; // \" {PHANTOM_FN}"));
+    assert!(mentions(&p, "tessl_phantom: in src/capi.rs"), "{p:?}");
+}
+
+#[test]
+fn a_c_raw_string_hides_a_trailing_comment_and_what_follows() {
+    // `cr"\"` ends at its second quote, then `// ...` is a comment: phantom hidden.
+    let p = rs_with(&format!("const R: &core::ffi::CStr = cr\"\\\"; // \" {PHANTOM_FN}"));
+    assert!(!mentions(&p, "tessl_phantom"), "{p:?}");
+}
+
+#[test]
+fn a_c_raw_string_with_hashes_hides_inner_quotes() {
+    let p = rs_with(&format!("const R: &core::ffi::CStr = cr##\"\"# /* \"##; {PHANTOM_FN}"));
+    assert!(mentions(&p, "tessl_phantom: in src/capi.rs"), "{p:?}");
+    let q = rs_with(&format!("const R: &core::ffi::CStr = cr#\"\\\"#; /* {PHANTOM_FN} */"));
+    assert!(!mentions(&q, "tessl_phantom"), "{q:?}");
+}
+
+#[test]
+fn a_c_string_is_an_ordinary_string_with_escapes() {
+    // `c"\"; // "` is one string (the escaped quote does not end it), so the
+    // phantom after it is live.
+    let p = rs_with(&format!("const R: &core::ffi::CStr = c\"\\\"; // \"; {PHANTOM_FN}"));
     assert!(mentions(&p, "tessl_phantom: in src/capi.rs"), "{p:?}");
 }
 
@@ -1624,5 +1623,144 @@ fn rust_stripping_keeps_line_count_and_is_idempotent() {
         let once = strip_line_comments(s);
         assert_eq!(once.matches('\n').count(), s.matches('\n').count(), "{s:?}");
         assert_eq!(strip_line_comments(&once), once, "{s:?}");
+    }
+}
+
+#[test]
+fn this_file_never_creates_a_runtime() {
+    // The contract file is GPU-free: a runtime is a Metal device. Runtime
+    // creation lives in tests/capi.rs. The needles are assembled so this
+    // guard's own text does not contain them.
+    let src = read("tests/capi_contract.rs");
+    for needle in [["tessl_runtime", "_new"].concat(), ["GpuRuntime", "::new"].concat()] {
+        let hits: Vec<_> = src
+            .lines()
+            .enumerate()
+            .filter(|(_, l)| l.contains(&needle) && !l.trim_start().starts_with("//"))
+            .map(|(n, _)| n + 1)
+            .collect();
+        assert!(hits.is_empty(), "{needle} used at lines {hits:?}");
+    }
+}
+
+// ---- adversarial: generated token streams with a known expected output ----
+
+/// A tiny deterministic generator (no dependency).
+struct Lcg(u64);
+
+impl Lcg {
+    fn next(&mut self, n: usize) -> usize {
+        self.0 = self
+            .0
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        ((self.0 >> 33) as usize) % n
+    }
+}
+
+/// One Rust token as (source text, text the stripper must keep).
+fn rust_token(g: &mut Lcg) -> (String, String) {
+    let keep = |s: String| (s.clone(), s);
+    match g.next(13) {
+        0 => keep("ident_x".to_string()),
+        1 => keep(["abr", "acr", "xr", "_r", "bar", "for"][g.next(6)].to_string()),
+        2 => {
+            let h = "#".repeat(g.next(4));
+            let body = ["//", "/*", "\"", "\\", " \" // ", "\"#", "x"][g.next(7)];
+            // A body may hold `"` only if the terminator needs more hashes.
+            let body = if h.len() < 2 && body.contains('"') { "x" } else { body };
+            keep(format!("r{h}\"{body}\"{h}"))
+        }
+        3 => {
+            let h = "#".repeat(1 + g.next(3));
+            keep(format!("br{h}\"a // b \\\"{h}"))
+        }
+        4 => {
+            let h = "#".repeat(1 + g.next(3));
+            keep(format!("cr{h}\"a /* b \\\"{h}"))
+        }
+        5 => keep(r#""a // \" /* b""#.to_string()),
+        6 => keep(r#"b"x\"//""#.to_string()),
+        7 => keep(r#"c"x\"//""#.to_string()),
+        8 => keep(
+            [
+                "'\"'",
+                "'\\''",
+                "'\\\\'",
+                "'x'",
+                "b'\"'",
+                "'\\u{1F600}'",
+                "'é'",
+                "&'a str",
+            ][g.next(8)]
+            .to_string(),
+        ),
+        9 => (
+            format!("// {} \" r#\" /*\n", ["x", "'", "\\"][g.next(3)]),
+            "\n".to_string(),
+        ),
+        10 => ("/* a \" /* nested // */ \" */".to_string(), String::new()),
+        11 => keep("r#type".to_string()),
+        _ => keep(["+", "{", "}", "::", "0x1r"][g.next(5)].to_string()),
+    }
+}
+
+#[test]
+fn generated_rust_token_streams_strip_to_exactly_their_non_comment_text() {
+    let mut g = Lcg(0x5eed);
+    for case in 0..4000 {
+        let (mut src, mut want) = (String::new(), String::new());
+        for _ in 0..1 + g.next(8) {
+            let (s, k) = rust_token(&mut g);
+            src.push_str(&s);
+            want.push_str(&k);
+            // A separator keeps adjacent tokens from fusing into one.
+            src.push(' ');
+            want.push(' ');
+        }
+        assert_eq!(strip_line_comments(&src), want, "case {case}: {src:?}");
+    }
+}
+
+/// One Python token as (source text, text the stripper must keep).
+fn py_token(g: &mut Lcg) -> (String, String) {
+    let keep = |s: String| (s.clone(), s);
+    match g.next(8) {
+        0 => keep("name_1".to_string()),
+        1 => keep(
+            [
+                "'a # b'",
+                "\"a # b\"",
+                "r'a # \\' # b'",
+                "b\"\\\"#\"",
+                "f'{x} # y'",
+                "''",
+                "\"\"",
+            ][g.next(7)]
+            .to_string(),
+        ),
+        2 => ("# a ' \" '''\n".to_string(), "\n".to_string()),
+        3 => ("\"\"\"doc ' # \\\"\"\" \"\"\"".to_string(), String::new()),
+        4 => ("'''doc \" # '''".to_string(), String::new()),
+        5 => keep("1 + 2".to_string()),
+        6 => keep("'it\\'s # not a comment'".to_string()),
+        _ => keep("(".to_string()),
+    }
+}
+
+#[test]
+fn generated_python_token_streams_strip_to_exactly_their_non_comment_text() {
+    let mut g = Lcg(0xfeed);
+    for case in 0..4000 {
+        let (mut src, mut want) = (String::new(), String::new());
+        for _ in 0..1 + g.next(8) {
+            let (s, k) = py_token(&mut g);
+            src.push_str(&s);
+            want.push_str(&k);
+            src.push('\n');
+            want.push('\n');
+        }
+        // A comment token already ends in a newline, so the separator adds one.
+        assert_eq!(strip_py_comments(&src), want, "case {case}: {src:?}");
     }
 }

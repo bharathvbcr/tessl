@@ -72,6 +72,44 @@ BF16_STUB_LANES = [("mlx-bf16", _bf16_runtime, "bf16"),
                    ("torch-mps-bf16", _bf16_runtime, "bf16")]
 
 
+def _tf32(x):
+    """Round float32 to tf32 (10 explicit mantissa bits, nearest-even), as float64."""
+    u = np.ascontiguousarray(x, dtype=np.float32).view(np.uint32).astype(np.uint64)
+    u = (u + 0xFFF + ((u >> 13) & 1)) & 0xFFFFE000
+    return u.astype(np.uint32).view(np.float32).astype(np.float64)
+
+
+def _tf32_runtime(a, b, dtype):
+    """Stand-in for MLX's measured GPU f32 matmul: tf32 operands, exact product."""
+    return (_tf32(a) @ _tf32(b)).astype(np.float32), "f32"
+
+
+def mlx_f32_precision_class(tmp):
+    """`mlx-f32` is scored as the tf32-class lane it measures as, not f32-exact."""
+    good = build_dump(os.path.join(tmp, "mlx_tf32"), seeds=3)
+    lanes = [("mlx-f32", _tf32_runtime, "f32"), ("torch-mps-f32", _exact_runtime, "f32")]
+
+    print("\n-- mlx-f32: tf32-class error is inside its budget --")
+    rows = check("tf32-class mlx-f32 stub", lambda: _parity(good, external_lanes=lanes),
+                 expect_reject=False)
+    if rows is not None:
+        print("  ok    tf32-class mlx-f32 scored without abort")
+
+    print("\n-- mlx-f32: the same error against an f32-exact claim aborts --")
+    real = gemm_sweep_mlx.LANE_PRECISION["mlx-f32"]
+    gemm_sweep_mlx.LANE_PRECISION["mlx-f32"] = (0.0, 0.0)
+    try:
+        check("f32-exact claim for mlx-f32", lambda: _parity(good, external_lanes=lanes),
+              True, "mlx-f32")
+    finally:
+        gemm_sweep_mlx.LANE_PRECISION["mlx-f32"] = real
+
+    print("\n-- torch-mps-f32 stays f32-exact: a tf32-class torch lane aborts --")
+    bad = [("mlx-f32", _exact_runtime, "f32"), ("torch-mps-f32", _tf32_runtime, "f32")]
+    check("tf32-class torch-mps-f32 stub", lambda: _parity(good, external_lanes=bad),
+          True, "torch-mps-f32")
+
+
 def external_lane_contracts(tmp):
     """`parity(external_lanes=...)`: validation, skip/abort paths, defaults."""
     good = build_dump(os.path.join(tmp, "ext"), seeds=3)
@@ -1789,6 +1827,7 @@ def main(argv=None):
                 FAILURES.append(f"adjudicate({name}) lacks {needle!r}: {msg}")
                 print(f"  FAIL  {name}: lacks {needle!r}")
         external_lane_contracts(tmp)
+        mlx_f32_precision_class(tmp)
     except SystemExit as exc:
         FAILURES.append(f"parity scorer contracts: exited unexpectedly -- {exc}")
         print(f"  FAIL  parity scorer contracts: unexpected exit: {exc}")

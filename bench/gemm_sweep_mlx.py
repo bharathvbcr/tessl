@@ -211,7 +211,14 @@ LANE_PRECISION = {
     "simdgroup-f32": (0.0, 0.0),
     "tensorops-tf32": (U_BF16, 0.0),
     "tensorops-bf16": (U_BF16, 0.0),
-    "mlx-f32": (0.0, 0.0),
+    # MLX's GPU f32 matmul is tf32-class, measured on M5 Pro (MLX 0.32.3): worst
+    # abs error 3.5e-3 at K=16 against 7e-7 on its CPU stream, on operands that
+    # an f32 kernel scores at ~1e-7. So its lane takes the same operand class as
+    # `tensorops-tf32`, not the f32-exact (0.0, 0.0) it was given first; under
+    # that budget every valid dump aborted wherever `mlx` was importable. The
+    # lane keeps its label (the dtype it is asked for is f32); only the budget
+    # reflects what it does. torch-mps-f32 is unchanged and still f32-exact.
+    "mlx-f32": (U_BF16, 0.0),
     "mlx-bf16": (U_BF16, U_BF16),
     "torch-mps-f32": (0.0, 0.0),
     "torch-mps-bf16": (U_BF16, U_BF16),

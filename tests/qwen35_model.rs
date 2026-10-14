@@ -652,6 +652,77 @@ fn encode_part_in_order_is_advance_to() {
     });
 }
 
+/// Adversarial: `encode_part` refuses a layer index at the extremes and a
+/// session an earlier failed advance broke, before encoding anything.
+#[test]
+fn encode_part_refuses_extreme_layers_and_a_broken_session() {
+    with_gpu(|rt| {
+        let model = Qwen35Model::random(rt, grouped_config(), Precision::Bf16, 7).unwrap();
+        let ids = seq(9);
+        let s = model.begin(&ids).unwrap();
+        for l in [usize::MAX, usize::MAX - 1, model.config().layers.len()] {
+            let e = s.encode_part(l, LayerPart::Mixer).unwrap_err();
+            assert!(e.contains("encode_part"), "{e}");
+        }
+        let mut broken = model.begin(&ids).unwrap();
+        model.fail_layer_after_for_test(1);
+        assert!(broken.advance_to(3).is_err());
+        let _ = rt.take_dispatch_count();
+        let e = broken.encode_part(0, LayerPart::InputNorm).unwrap_err();
+        assert!(e.contains("earlier advance failed"), "{e}");
+        assert_eq!(rt.take_dispatch_count(), 0, "a refused part encoded work");
+    });
+}
+
+/// Adversarial: same seed is the same model, another seed is not, and the f32
+/// `random` is `random_tower` bit for bit (its head is the embedding either way).
+#[test]
+fn random_is_seeded_and_f32_matches_the_tower() {
+    with_gpu(|rt| {
+        let ids = seq(9);
+        let bits = |m: &Qwen35Model| -> Vec<u32> {
+            m.forward(&ids, false)
+                .unwrap()
+                .logits
+                .iter()
+                .map(|x| x.to_bits())
+                .collect()
+        };
+        let a = Qwen35Model::random(rt, grouped_config(), Precision::F32, 7).unwrap();
+        let b = Qwen35Model::random_tower(rt, grouped_config(), Precision::F32, 7).unwrap();
+        let c = Qwen35Model::random(rt, grouped_config(), Precision::F32, 8).unwrap();
+        assert_eq!(bits(&a), bits(&b), "f32 random vs random_tower");
+        assert_ne!(bits(&a), bits(&c), "seed ignored");
+        let d = Qwen35Model::random(rt, grouped_config(), Precision::Bf16, 7).unwrap();
+        let e = Qwen35Model::random(rt, grouped_config(), Precision::Bf16, 7).unwrap();
+        assert_eq!(bits(&d), bits(&e), "bf16 not reproducible");
+    });
+}
+
+/// Adversarial: the scan-slice knob reaches `prefill` and `begin`/`advance_to`
+/// as well as `forward`, and a slice set before use survives repeated sessions.
+#[test]
+fn gdn_scan_slice_reaches_prefill_and_staged() {
+    with_gpu(|rt| {
+        let ids = seq(70);
+        let m16 = Qwen35Model::random(rt, grouped_config(), Precision::Bf16, 7).unwrap();
+        let m32 = Qwen35Model::random(rt, grouped_config(), Precision::Bf16, 7)
+            .unwrap()
+            .with_gdn_scan_slice(GdnScanSlice::Cols32);
+        let first =
+            |m: &Qwen35Model| -> Vec<u32> { m.prefill(&ids, 1).unwrap().1.iter().map(|x| x.to_bits()).collect() };
+        assert_eq!(first(&m16), first(&m32), "prefill differs across slices");
+        let n = m16.config().layers.len();
+        let (mut a, mut b) = (m16.begin(&ids).unwrap(), m32.begin(&ids).unwrap());
+        a.advance_to(n).unwrap();
+        b.advance_to(n).unwrap();
+        assert_eq!(final_norm_bits(rt, &m16, &a), final_norm_bits(rt, &m32, &b));
+        let mut b2 = m32.begin(&ids).unwrap();
+        b2.advance_to(n).unwrap();
+        assert_eq!(final_norm_bits(rt, &m32, &b), final_norm_bits(rt, &m32, &b2));
+    });
+}
+
 // ------------------------------------------------------------- hardening ---
 
 /// A conv width the kernel is not compiled for (`conv1d_silu` takes 2..=8)

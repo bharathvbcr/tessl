@@ -9,8 +9,8 @@
 mod common;
 
 use common::{with_gpu, SplitMix};
-use tessl::bert::{BertConfig, BertFamily, BertSparseModel, HEAD_BLOCK_ROWS, MAX_BATCH, MAX_BATCH_TOKENS};
 use std::panic::{catch_unwind, AssertUnwindSafe};
+use tessl::bert::{BertConfig, BertFamily, BertSparseModel, HEAD_BLOCK_ROWS, MAX_BATCH, MAX_BATCH_TOKENS};
 use tessl::infer_trace;
 use tessl::safetensors::SafeTensors;
 
@@ -265,7 +265,11 @@ fn encode_reports_a_busy_runtime_instead_of_panicking_and_leaves_no_state() {
 
             assert!(rt.synchronize().is_ok(), "{family:?}: the runtime is poisoned");
             let again = model.encode(&refs, false).unwrap();
-            assert_eq!(pooled_bits(&again), pooled_bits(&first), "{family:?}: re-encode differs");
+            assert_eq!(
+                pooled_bits(&again),
+                pooled_bits(&first),
+                "{family:?}: re-encode differs"
+            );
 
             rt.set_poison_unzeroed(true);
             let poisoned = model.encode(&refs, false);
@@ -309,7 +313,10 @@ fn async_encode_waits_only_once_per_head_block() {
         let c1 = infer_trace::snapshot();
         infer_trace::set_enabled(false);
         control.unwrap();
-        assert!(c1.since(&c0).sync_waits >= 1, "positive control: a bound host write counted no wait");
+        assert!(
+            c1.since(&c0).sync_waits >= 1,
+            "positive control: a bound host write counted no wait"
+        );
 
         rt.upload_u32(&dst, &[1, 2, 3, 4]).unwrap();
         infer_trace::set_enabled(true);
@@ -321,7 +328,14 @@ fn async_encode_waits_only_once_per_head_block() {
         rt.set_async_encode(false).unwrap();
         let waits = s1.since(&s0).sync_waits;
         let out = out.unwrap();
-        assert_eq!(waits, head_blocks, "encode waited {waits} times for {head_blocks} head blocks");
-        assert_eq!(pooled_bits(&out), pooled_bits(&sync_out), "async encode differs from sync encode");
+        assert_eq!(
+            waits, head_blocks,
+            "encode waited {waits} times for {head_blocks} head blocks"
+        );
+        assert_eq!(
+            pooled_bits(&out),
+            pooled_bits(&sync_out),
+            "async encode differs from sync encode"
+        );
     });
 }

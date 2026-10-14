@@ -8,12 +8,12 @@ use common::with_gpu;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
 use tessl::decode_icb::DecodeIcb;
-use tessl::infer_trace;
-use tessl::tensor::GpuBuffer;
-use tessl::GpuRuntime;
 use tessl::embedgemma2::upload_segments;
+use tessl::infer_trace;
 use tessl::qwen35_model::{LogitRows, Precision, Qwen35Config, Qwen35Model};
 use tessl::safetensors::SafeTensors;
+use tessl::tensor::GpuBuffer;
+use tessl::GpuRuntime;
 
 fn fixture() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/qwen35_train")
@@ -163,7 +163,10 @@ fn assert_counter_sees_a_waiting_write(rt: &GpuRuntime) {
     let bound = open_batch(rt);
     let (r, d) = traced(|| bound.try_write_u32(&[9, 9, 9, 9]));
     r.unwrap();
-    assert!(d.sync_waits >= 1, "positive control: a bound host write counted no wait");
+    assert!(
+        d.sync_waits >= 1,
+        "positive control: a bound host write counted no wait"
+    );
     close_batch(rt);
 }
 
@@ -182,14 +185,128 @@ fn upload_paths_do_not_wait_under_async_encode() {
 
         let _batch = open_batch(rt);
         let (r, d) = traced(|| upload_segments(rt, &[(0, 2), (2, 5)], 5).map(|b| b.nbytes()));
-        assert_eq!((r.unwrap(), d.sync_waits, d.commits), (16, 0, 0), "embedgemma2::upload_segments: {d:?}");
+        assert_eq!(
+            (r.unwrap(), d.sync_waits, d.commits),
+            (16, 0, 0),
+            "embedgemma2::upload_segments: {d:?}"
+        );
 
         let (r, d) = traced(|| tessl::bert::upload_segments(rt, &[(0, 2), (2, 5)], 5).map(|b| b.nbytes()));
-        assert_eq!((r.unwrap(), d.sync_waits, d.commits), (16, 0, 0), "bert::upload_segments: {d:?}");
+        assert_eq!(
+            (r.unwrap(), d.sync_waits, d.commits),
+            (16, 0, 0),
+            "bert::upload_segments: {d:?}"
+        );
 
         let (r, d) = traced(|| DecodeIcb::mini_copy_chain(rt, 8).map(|_| ()));
         r.unwrap();
         assert_eq!((d.sync_waits, d.commits), (0, 0), "mini_copy_chain (n_buf): {d:?}");
         close_batch(rt);
+    });
+}
+
+type Upload = fn(&std::sync::Arc<GpuRuntime>, &[(u32, u32)], u32) -> Result<GpuBuffer, String>;
+
+fn both_uploads() -> [(&'static str, Upload); 2] {
+    [
+        ("embedgemma2", upload_segments as Upload),
+        ("bert", tessl::bert::upload_segments as Upload),
+    ]
+}
+
+/// Hostile segment lists are refused by name (never a panic), an empty list
+/// still yields a readable buffer, and extreme u32 bounds round-trip.
+#[test]
+fn upload_segments_handles_hostile_segment_lists_as_values() {
+    with_gpu(|rt| {
+        for (name, up) in both_uploads() {
+            for (segs, rows) in [
+                (vec![(3u32, 3u32)], 10u32),
+                (vec![(5, 2)], 10),
+                (vec![(0, 11)], 10),
+                (vec![(0, 2), (u32::MAX, u32::MAX)], u32::MAX),
+                (vec![(0, 1)], 0),
+            ] {
+                let r = catch_unwind(AssertUnwindSafe(|| up(rt, &segs, rows)))
+                    .unwrap_or_else(|_| panic!("{name} panicked on {segs:?}/{rows}"));
+                let e = r.map(|_| ()).unwrap_err();
+                assert!(e.contains("upload_segments"), "{name}: {e}");
+            }
+            let empty = up(rt, &[], 0).unwrap_or_else(|e| panic!("{name} empty: {e}"));
+            assert!(empty.nbytes() >= 4, "{name}: empty buffer is {} bytes", empty.nbytes());
+            let max = up(rt, &[(u32::MAX - 1, u32::MAX)], u32::MAX).unwrap();
+            assert_eq!(max.read_u32(), vec![u32::MAX - 1, u32::MAX], "{name}");
+            let many: Vec<(u32, u32)> = (0..50_000u32).map(|i| (i, i + 1)).collect();
+            let big = up(rt, &many, 50_000).unwrap();
+            let got = big.read_u32();
+            assert_eq!(got.len(), 100_000, "{name}");
+            assert_eq!(
+                (got[0], got[1], got[99_998], got[99_999]),
+                (0, 1, 49_999, 50_000),
+                "{name}"
+            );
+        }
+        assert!(rt.synchronize().is_ok(), "runtime poisoned by hostile inputs");
+    });
+}
+
+/// A busy refusal while an async batch is open neither loses nor reorders
+/// the queued work: the batch's upload still lands, and nothing is poisoned.
+#[test]
+fn busy_refusal_under_an_open_async_batch_keeps_the_batch_and_the_runtime() {
+    with_gpu(|rt| {
+        let dst = open_batch(rt);
+        let held = rt.alloc_buffer(64).unwrap();
+        let mapping = held.contents_u8();
+        for (name, up) in both_uploads() {
+            let (r, d) = traced(|| catch_unwind(AssertUnwindSafe(|| up(rt, &[(0, 2)], 2))));
+            let e = r.unwrap_or_else(|_| panic!("{name} panicked")).map(|_| ()).unwrap_err();
+            assert!(e.contains("busy"), "{name}: {e}");
+            assert_eq!((d.sync_waits, d.commits), (0, 0), "{name} waited while refusing: {d:?}");
+        }
+        let r = catch_unwind(AssertUnwindSafe(|| DecodeIcb::mini_copy_chain(rt, 4).map(|_| ())));
+        assert!(r.expect("mini_copy_chain panicked").unwrap_err().contains("busy"));
+        drop(mapping);
+        close_batch(rt);
+        assert_eq!(dst.read_u32(), vec![1, 2, 3, 4], "queued upload was lost");
+        assert_eq!(upload_segments(rt, &[(0, 2)], 2).unwrap().read_u32(), vec![0, 2]);
+    });
+}
+
+/// Repeated busy/ok cycles (a mapping taken and dropped, uploads refused in
+/// between) never leave the access flag set or poison the runtime.
+#[test]
+fn repeated_busy_cycles_recover_every_time() {
+    with_gpu(|rt| {
+        for round in 0..50 {
+            let held = rt.alloc_buffer(64).unwrap();
+            let mapping = held.contents_u8();
+            for r in [
+                upload_segments(rt, &[(0, 2)], 2).map(|_| ()),
+                tessl::bert::upload_segments(rt, &[(0, 2)], 2).map(|_| ()),
+                DecodeIcb::mini_copy_chain(rt, 2).map(|_| ()),
+            ] {
+                assert!(r.unwrap_err().contains("busy"), "round {round}");
+            }
+            drop(mapping);
+            drop(held);
+            assert!(upload_segments(rt, &[(0, 2)], 2).is_ok(), "round {round}");
+        }
+        assert!(rt.synchronize().is_ok());
+    });
+}
+
+/// `n == 1` is the smallest chain: it still builds under an open async batch
+/// without a wait and runs to the right value.
+#[test]
+fn mini_copy_chain_of_one_does_not_wait_and_runs() {
+    with_gpu(|rt| {
+        let _batch = open_batch(rt);
+        let (r, d) = traced(|| DecodeIcb::mini_copy_chain(rt, 1));
+        let (mut dec, out) = r.unwrap();
+        assert_eq!((d.sync_waits, d.commits), (0, 0), "{d:?}");
+        dec.execute(rt).unwrap();
+        close_batch(rt);
+        assert_eq!(out.read_f32(), vec![1.0]);
     });
 }

@@ -379,3 +379,64 @@ fn a_failed_host_read_is_an_error_and_a_failed_step_does_not_advance() {
         assert_eq!(d.position(), pos + 1);
     });
 }
+
+/// `Qwen35Model::prefill` and `Decode::step` under a live `HostMapping`
+/// return a busy error rather than panicking, and a refused step leaves the
+/// session usable: the refusal comes before any layer state moves, so it must
+/// not poison it or advance its position.
+#[test]
+fn decode_prefill_and_step_report_a_busy_runtime_without_poisoning() {
+    let cfg = Qwen35Config::from_config_file(&fixture().join("config.json")).unwrap();
+    let st = SafeTensors::open(&fixture().join("model.safetensors")).unwrap();
+    with_gpu(|rt| {
+        let model = Qwen35Model::load(rt, &st, "model.", cfg.clone(), Precision::F32).unwrap();
+        let (mut d, _) = model.prefill(&ids(4), 3).unwrap();
+        let (pos, left) = (d.position(), d.remaining());
+        let held = rt.alloc_buffer(64).unwrap();
+        let mapping = held.contents_u8();
+        let r = catch_unwind(AssertUnwindSafe(|| d.step(5).map(|_| ())));
+        let e = r.expect("Decode::step panicked on a busy runtime").unwrap_err();
+        assert!(e.contains("busy"), "{e}");
+        let r = catch_unwind(AssertUnwindSafe(|| model.prefill(&ids(4), 3).map(|_| ())));
+        let e = r.expect("prefill panicked on a busy runtime").unwrap_err();
+        assert!(e.contains("busy"), "{e}");
+        let r = catch_unwind(AssertUnwindSafe(|| model.forward(&ids(4), true).map(|_| ())));
+        let e = r.expect("forward panicked on a busy runtime").unwrap_err();
+        assert!(e.contains("busy"), "{e}");
+        assert_eq!((d.position(), d.remaining()), (pos, left), "a refused step advanced");
+        drop(mapping);
+        let row = d.step(5).expect("a step refused as busy poisoned the session");
+        assert_eq!(row.len(), cfg.vocab as usize);
+        assert_eq!(d.position(), pos + 1);
+        assert!(model.forward(&ids(4), true).is_ok());
+    });
+}
+
+/// A decode that hits a read fault on step k, replayed on a fresh session,
+/// gives bit-identical logits to an undisturbed run: the fault leaves nothing
+/// behind in the model (shared weights, scratch) that a new session inherits.
+#[test]
+fn a_read_fault_leaves_no_state_in_the_model_for_later_sessions() {
+    let cfg = Qwen35Config::from_config_file(&fixture().join("config.json")).unwrap();
+    let st = SafeTensors::open(&fixture().join("model.safetensors")).unwrap();
+    with_gpu(|rt| {
+        let model = Qwen35Model::load(rt, &st, "model.", cfg.clone(), Precision::F32).unwrap();
+        let run = || {
+            let (mut d, first) = model.prefill(&ids(5), 3).unwrap();
+            let a = d.step(7).unwrap();
+            let b = d.step(9).unwrap();
+            (first, a, b)
+        };
+        let want = run();
+        let (mut d, _) = model.prefill(&ids(5), 3).unwrap();
+        d.step(7).unwrap();
+        model.fail_host_read_after_for_test(0);
+        assert!(d.step(9).unwrap_err().contains("injected fault"));
+        drop(d);
+        let got = run();
+        assert_eq!(got, want, "a failed session changed what a later one computes");
+        // Disarming with usize::MAX leaves a clean run.
+        model.fail_host_read_after_for_test(usize::MAX);
+        assert_eq!(run(), want);
+    });
+}

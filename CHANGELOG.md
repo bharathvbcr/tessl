@@ -8,6 +8,14 @@ All notable changes to `tessl` are recorded here. The format follows
 
 ### Added
 
+- **bf16 storage's documented default update rule is stochastic rounding**
+  (`UpdateRule::bf16_default`). On the 2B loss curve it was the only rule
+  inside the 2% per-step bound (worst 0.74%; round-to-nearest worst 4.6%
+  on 15–16 of 90 steps). The loss-curve test's fall bound, which failed
+  because the f32 run's own held-out mean rose on seed 2, is replaced by
+  that 2% bound on the default and the existing 1% held-out comparison.
+  The GPU curve has not been re-run. The 4B numbers in `docs/qwen35.md`
+  stay the random-weight shape measurement.
 - **Parser mutation tests** (`tests/parser_mutation.rs`, CPU only, no
   dependency): seeded truncation at every byte, byte and bit flips, extreme
   length/offset/shape values, invalid UTF-8 and deep nesting driven through

@@ -132,6 +132,39 @@ Every read and write
 is a GPU copy of the whole model (about 8 GB of f32 each way on the 2B), and
 torch holds its own copy of the parameters and gradients beside tessl's.
 
+## Handle ownership, closing and errors
+
+A `Qwen35` (and the per-thread runtime behind every call) owns a C handle
+that tessl frees exactly once; the C ABI keeps no registry of live handles, so
+a second free or a call on a freed handle is undefined behaviour there, not an
+error. The binding therefore:
+
+- refuses `copy.copy`, `copy.deepcopy` and pickling (`TypeError`): a copy
+  would own the same pointer and free it twice;
+- gives `Qwen35` an idempotent `close()` (also `with tessl_torch.Qwen35(...) as
+  model:`, and called when the object is dropped). After it the object is
+  `closed` and every use raises `TesslError` without reaching the library.
+  A model's weights and optimizer state are released at `close()`, not at the
+  garbage collector's whim;
+- uses a handle from the thread that made it. Another thread's call is
+  refused (`TesslError`), and a `close()` from another thread leaks the handle
+  rather than drop a thread-affine runtime there;
+- raises `TesslPanic` (a subclass of `TesslError`) when the library reports a
+  bug in tessl caught at its boundary (status 2). The object that made the
+  call is closed, and a panic in a runtime call (cross-entropy, GDN) drops that
+  thread's runtime so the next call builds a new one. An ordinary refusal
+  (status 1) stays a plain `TesslError` and the object stays usable;
+- range-checks every integer headed for a C field (`chunk` below 2**32, the
+  AdamW `step` and `seed` below 2**64, tensor dimensions) and raises
+  `TesslError` naming it, before any tensor is touched. ctypes would wrap
+  `-1` or `2**32` silently.
+
+Not yet distinguished: a runtime whose GPU work failed is "poisoned" and
+refuses every later call with a status-1 message ("recreate it"); `TesslPanic`
+does not cover it, and the thread's cached runtime is not replaced
+automatically. Until the C ABI reports it separately, drop the model and call
+nothing further on that thread's runtime, or restart the process.
+
 ## How the buffers cross
 
 An MPS tensor's `untyped_storage().data_ptr()` is its `id<MTLBuffer>`, the
@@ -155,6 +188,9 @@ cargo build --release
 ```bash
 python3 -m unittest discover -s python/tests -v
 ```
+
+`python/tests/test_binding_host.py` needs no GPU (a recording stand-in
+replaces the library): `python3 -m unittest python/tests/test_binding_host.py`.
 
 `TESSL_LIB` overrides where `libtessl.dylib` is loaded from. The library
 reads its kernels from the metallib path baked in when it was built, so keep

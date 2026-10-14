@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import ctypes
 import math
+import operator
 import os
 import threading
 from pathlib import Path
@@ -41,6 +42,7 @@ __all__ = [
     "patch_transformers_qwen3_5",
     "Qwen35",
     "TesslError",
+    "TesslPanic",
     "library_path",
 ]
 
@@ -54,8 +56,95 @@ _OPERANDS_CODE = {"f32": 0, "bf16": 1}
 _SUPERVISE_CAUSAL, _SUPERVISE_ROWS = 0, 1
 
 
+_STATUS_PANIC = 2  # TESSL_PANIC: a bug in tessl, caught at the C boundary
+
+
 class TesslError(RuntimeError):
     """A tessl call refused its arguments or failed on the device."""
+
+
+class TesslPanic(TesslError):
+    """A tessl call hit a bug in tessl (the C ABI's ``TESSL_PANIC``) and was
+    caught at the boundary. The handle it came from is closed (the library
+    says it should be freed): later calls on that object raise
+    :class:`TesslError` without reaching the library."""
+
+
+def _status_error(status: int, err) -> TesslError:
+    """The exception for a non-zero status, with the library's message."""
+    cls = TesslPanic if status == _STATUS_PANIC else TesslError
+    return cls(err.value.decode(errors="replace"))
+
+
+def _check_uint(name: str, value, bits: int) -> int:
+    """``value`` as an int in ``[0, 2**bits)``, the range of the C field it
+    is about to fill. ctypes wraps out-of-range integers silently (``-1``
+    becomes ``2**32 - 1``, ``2**32`` becomes 0), so every integer headed for
+    a ctypes field is checked here first."""
+    try:
+        v = operator.index(value)
+    except TypeError:
+        raise TesslError(f"{name} must be an integer, not {type(value).__name__}") from None
+    if v < 0:
+        raise TesslError(f"{name} {v} is negative")
+    if v >= 1 << bits:
+        raise TesslError(f"{name} {v} is outside [0, 2**{bits})")
+    return v
+
+
+class _Owned:
+    """A tessl handle with one owner. ``close()`` frees it once (a second call
+    does nothing) and after it every use raises :class:`TesslError` without
+    reaching the library. Copying and pickling are refused: a copy would own
+    the same pointer, and the library frees a handle exactly once. Also a
+    context manager (``with`` closes on exit).
+
+    Subclasses name the C free function in ``_free_name`` and read the live
+    handle through ``_live()``."""
+
+    _free_name = ""
+    _kind = "handle"
+    _h = None
+    _lib = None
+
+    def _own(self, lib, handle) -> None:
+        self._lib = lib
+        self._h = handle
+
+    def _live(self):
+        if self._h is None:
+            raise TesslError(f"this tessl {self._kind} is closed")
+        return self._h
+
+    @property
+    def closed(self) -> bool:
+        return self._h is None
+
+    def close(self) -> None:
+        """Free the handle. Idempotent. From a thread other than the one that
+        made it the library refuses and leaks the handle rather than drop it
+        on the wrong thread; either way this object is closed."""
+        h, self._h = self._h, None
+        if h is not None and self._lib is not None:
+            getattr(self._lib, self._free_name)(h)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc) -> None:
+        self.close()
+
+    def __del__(self):
+        self.close()
+
+    def __copy__(self):
+        raise TypeError(f"tessl {self._kind}s own a C handle and cannot be copied")
+
+    def __deepcopy__(self, memo):
+        raise TypeError(f"tessl {self._kind}s own a C handle and cannot be copied")
+
+    def __reduce__(self):
+        raise TypeError(f"tessl {self._kind}s own a C handle and cannot be pickled")
 
 
 def _operands_code(operands: str) -> int:
@@ -236,32 +325,42 @@ def _load():
         return lib
 
 
-class _Runtime:
+class _Runtime(_Owned):
     """One tessl runtime per thread: tessl's runtime is thread-affine."""
+
+    _free_name = "tessl_runtime_free"
+    _kind = "runtime"
+    handle = property(lambda self: self._live())
 
     def __init__(self):
         lib = _load()
         err = ctypes.create_string_buffer(_ERR_LEN)
         handle = lib.tessl_runtime_new(err, _ERR_LEN)
         if not handle:
-            raise TesslError(err.value.decode(errors="replace"))
+            raise _status_error(1, err)
         self.lib = lib
-        self.handle = ctypes.c_void_p(handle)
+        self._own(lib, ctypes.c_void_p(handle))
 
-    def __del__(self):
-        # From a foreign thread (interpreter shutdown) the library refuses and
-        # leaks the runtime rather than drop it on the wrong thread.
-        lib, handle = getattr(self, "lib", None), getattr(self, "handle", None)
-        if lib is not None and handle:
-            lib.tessl_runtime_free(handle)
+    # close() from a foreign thread (interpreter shutdown) is refused by the
+    # library, which leaks the runtime rather than drop it on the wrong thread.
 
 
 _local = threading.local()
 
 
+def _runtime_status(rt: "_Runtime", status: int, err) -> None:
+    """Raise for a non-zero status of a call on the thread's runtime. A panic
+    closes that runtime; the next call on this thread builds a fresh one."""
+    if status == 0:
+        return
+    if status == _STATUS_PANIC:
+        rt.close()
+    raise _status_error(status, err)
+
+
 def _runtime() -> _Runtime:
     rt = getattr(_local, "rt", None)
-    if rt is None:
+    if rt is None or rt.closed:
         rt = _Runtime()
         _local.rt = rt
     return rt
@@ -360,6 +459,7 @@ def cross_entropy_rows(
     ``per_row=False`` the per-row losses are not copied out and ``None`` is
     returned in their place.
     """
+    chunk = _check_uint("chunk", chunk, 32)
     if reduction not in ("mean", "sum"):
         raise TesslError(f"reduction must be 'mean' or 'sum', not {reduction!r}")
     operands_code = _operands_code(operands)
@@ -408,8 +508,7 @@ def cross_entropy_rows(
     )
     # Keep the host arrays alive across the call.
     del rows_u32, targets_u32
-    if status != 0:
-        raise TesslError(err.value.decode(errors="replace"))
+    _runtime_status(rt, status, err)
     return loss.value, per_row_out, dh, dw
 
 
@@ -500,6 +599,7 @@ def cross_entropy(
     ``operands`` is the GEMMs': ``"f32"`` (exact) or ``"bf16"`` (operands
     rounded to bf16, f32 accumulation).
     """
+    chunk = _check_uint("chunk", chunk, 32)
     if mask is None:
         mask = torch.ones(hidden.shape[:-1], dtype=torch.bool)
     if tuple(mask.shape) != tuple(hidden.shape[:-1]) or tuple(targets.shape) != tuple(hidden.shape[:-1]):
@@ -527,7 +627,9 @@ def _f32(t: torch.Tensor) -> torch.Tensor:
 
 def _gdn_args(B, T, H, Dv, **refs) -> _GdnArgs:
     a = _GdnArgs()
-    a.batch, a.seq, a.heads, a.v_dim = B, T, H, Dv
+    a.batch, a.seq, a.heads, a.v_dim = (
+        _check_uint(n, v, 32) for n, v in (("batch", B), ("seq", T), ("heads", H), ("v_dim", Dv))
+    )
     for name, t in refs.items():
         setattr(a, name, _NULL_REF if t is None else _ref(t, name))
     return a
@@ -538,8 +640,7 @@ def _gdn_call(fn_name: str, args: _GdnArgs):
     err = ctypes.create_string_buffer(_ERR_LEN)
     torch.mps.synchronize()
     status = getattr(rt.lib, fn_name)(rt.handle, ctypes.byref(args), err, _ERR_LEN)
-    if status != 0:
-        raise TesslError(err.value.decode(errors="replace"))
+    _runtime_status(rt, status, err)
 
 
 class _GdnChunk(torch.autograd.Function):
@@ -665,7 +766,7 @@ _MOMENTS_CODE = {"f32": 0, "bf16": 1, "block8": 2}
 _AUX_RULES = ("f32-master", "bf16-kahan")
 
 
-class Qwen35:
+class Qwen35(_Owned):
     """A Qwen3.5 text model trained by tessl's ``train_step``, with torch
     running the optimizer.
 
@@ -702,6 +803,10 @@ class Qwen35:
     queue is idle.
     """
 
+    _free_name = "tessl_qwen35_free"
+    _kind = "model"
+    _handle = property(lambda self: self._live())
+
     def __init__(self, safetensors, config_json, prefix: str = "model.language_model.", precision: str = "f32"):
         if precision not in _PRECISION_CODE:
             raise TesslError(f"precision must be 'f32' or 'bf16', not {precision!r}")
@@ -713,9 +818,9 @@ class Qwen35:
             _PRECISION_CODE[precision], ctypes.byref(handle), err, _ERR_LEN,
         )
         if status != 0:
-            raise TesslError(err.value.decode(errors="replace"))
+            raise _status_error(status, err)
         self._rt = rt
-        self._handle = handle
+        self._own(rt.lib, handle)
         self._precision = precision
         # What adamw_init made the AdamW state with, or None.
         self._adamw_config = None
@@ -739,15 +844,13 @@ class Qwen35:
         self._grads_before_pending = False
         self._hidden = dict((n, s) for n, s, _ in table)["norm.weight"][0]
 
-    @staticmethod
-    def _check(status: int, err):
+    def _check(self, status: int, err):
+        """Raise for a non-zero status. A panic (a bug in tessl) closes the
+        model: the library says its handle should be freed."""
         if status != 0:
-            raise TesslError(err.value.decode(errors="replace"))
-
-    def __del__(self):
-        rt, handle = getattr(self, "_rt", None), getattr(self, "_handle", None)
-        if rt is not None and handle:
-            rt.lib.tessl_qwen35_free(handle)
+            if status == _STATUS_PANIC:
+                self.close()
+            raise _status_error(status, err)
 
     @property
     def shapes(self) -> dict:
@@ -872,9 +975,7 @@ class Qwen35:
             raise TesslError(f"adamw_init: update must be one of {sorted(_UPDATE_CODE)}, not {update!r}")
         if moments not in _MOMENTS_CODE:
             raise TesslError(f"adamw_init: moments must be one of {sorted(_MOMENTS_CODE)}, not {moments!r}")
-        seed = int(seed)
-        if not 0 <= seed < 2 ** 64:
-            raise TesslError(f"adamw_init: seed {seed} is outside [0, 2**64)")
+        seed = _check_uint("adamw_init: seed", seed, 64)
         err = ctypes.create_string_buffer(_ERR_LEN)
         self._check(
             self._rt.lib.tessl_qwen35_adamw_init(
@@ -941,9 +1042,7 @@ class Qwen35:
             raise TesslError(f"load_adamw_state: update {self._adamw_config['update']!r} "
                              f"{'needs' if wants_aux else 'keeps no'} aux state, and the checkpoint "
                              f"{'has none' if wants_aux else 'has some'}")
-        step = int(state["step"])
-        if step < 0:
-            raise TesslError(f"load_adamw_state: step {step} is negative")
+        step = _check_uint("load_adamw_state: step", int(state["step"]), 64)
         m = self._staged("load_adamw_state: exp_avg", state["exp_avg"])
         v = self._staged("load_adamw_state: exp_avg_sq", state["exp_avg_sq"])
         aux = self._staged("load_adamw_state: aux", state["aux"]) if wants_aux else None

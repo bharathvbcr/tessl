@@ -21,7 +21,15 @@
 //!   synchronizes tessl before it returns, so outputs are complete.
 //! - A handle is used from the thread that created it; calls from any other
 //!   thread are refused (tessl's runtime is thread-affine, and `ctypes`
-//!   releases the GIL around foreign calls).
+//!   releases the GIL around foreign calls). The thread is checked before any
+//!   reference to the handle is formed (only its `owner` field is read, through
+//!   the raw pointer), so a refused foreign-thread call creates no aliasing
+//!   `&mut`; the caller still may not run two calls on one handle at once.
+//! - Null handles are refused with [`TESSL_ERR`] (the free functions accept
+//!   null as a no-op). A freed handle cannot be detected: the C ABI keeps no
+//!   registry of live handles, so any call on a freed pointer, and a second
+//!   free of it, is undefined behaviour. The caller frees each handle exactly
+//!   once and drops its pointer; the Python wrapper's `close()` does this.
 //!
 //! Status codes: [`TESSL_OK`], [`TESSL_ERR`] (the message says why), and
 //! [`TESSL_PANIC`] (a bug in tessl, caught at the boundary rather than
@@ -496,14 +504,24 @@ unsafe fn wrap(rt: &Arc<GpuRuntime>, t: &TesslTensorRef, name: &str) -> Result<T
 trait Handle {
     /// What the handle is, in messages.
     const KIND: &'static str;
-    fn owner(&self) -> ThreadId;
+    /// The creating thread, read through a raw pointer so the thread check
+    /// can run before any `&` or `&mut` to the handle exists: a reference
+    /// formed on a foreign thread, while the owner may be inside a call that
+    /// holds a `&mut`, would alias it (undefined behaviour) even if only this
+    /// one field were read.
+    ///
+    /// # Safety
+    /// `this` is non-null and points to a live handle (not freed); no `&mut`
+    /// to its `owner` field is live (nothing ever writes it after creation).
+    unsafe fn owner_of(this: *const Self) -> ThreadId;
     fn runtime(&self) -> &Arc<GpuRuntime>;
 }
 
 impl Handle for TesslRuntime {
     const KIND: &'static str = "runtime";
-    fn owner(&self) -> ThreadId {
-        self.owner
+    unsafe fn owner_of(this: *const Self) -> ThreadId {
+        // SAFETY: by the trait contract; a field place read, no reference.
+        unsafe { std::ptr::addr_of!((*this).owner).read() }
     }
     fn runtime(&self) -> &Arc<GpuRuntime> {
         &self.rt
@@ -518,8 +536,8 @@ unsafe fn free_handle<H: Handle>(handle: *mut H) -> i32 {
     if handle.is_null() {
         return TESSL_OK;
     }
-    // SAFETY: live by the contract; only read here.
-    if unsafe { (*handle).owner() } != std::thread::current().id() {
+    // SAFETY: live by the contract; the owner is read through the raw pointer.
+    if unsafe { H::owner_of(handle) } != std::thread::current().id() {
         return TESSL_ERR;
     }
     // SAFETY: by the contract, the Box its constructor leaked, freed once.
@@ -549,9 +567,10 @@ unsafe fn guarded<H: Handle>(
         unsafe { write_err(err, err_len, &format!("null {} handle", H::KIND)) };
         return TESSL_ERR;
     }
-    // SAFETY: live and unshared by the contract.
-    let h = unsafe { &mut *handle };
-    if std::thread::current().id() != h.owner() {
+    // The thread check comes first and forms no reference: on a foreign
+    // thread the handle may be inside the owner's call.
+    // SAFETY: live by the contract; the owner is read through the raw pointer.
+    if std::thread::current().id() != unsafe { H::owner_of(handle) } {
         let msg = format!(
             "tessl {} used from a thread other than the one that created it",
             H::KIND
@@ -560,6 +579,8 @@ unsafe fn guarded<H: Handle>(
         unsafe { write_err(err, err_len, &msg) };
         return TESSL_ERR;
     }
+    // SAFETY: live and, now on its owning thread, unshared by the contract.
+    let h = unsafe { &mut *handle };
     match catch_unwind(AssertUnwindSafe(|| f(h).and_then(|()| h.runtime().synchronize()))) {
         Ok(Ok(())) => TESSL_OK,
         Ok(Err(e)) => {
@@ -882,8 +903,9 @@ fn ready_grads<'a>(
 
 impl Handle for TesslQwen35 {
     const KIND: &'static str = "model";
-    fn owner(&self) -> ThreadId {
-        self.owner
+    unsafe fn owner_of(this: *const Self) -> ThreadId {
+        // SAFETY: by the trait contract; a field place read, no reference.
+        unsafe { std::ptr::addr_of!((*this).owner).read() }
     }
     fn runtime(&self) -> &Arc<GpuRuntime> {
         &self.model.rt

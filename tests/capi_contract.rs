@@ -1385,3 +1385,138 @@ fn a_char_literal_and_raw_string_do_not_confuse_the_rust_stripper() {
     let p = fn_problems(&parse_rust_abi(&rs), &py, UNBOUND_EXPORTS);
     assert!(mentions(&p, "tessl_phantom: in src/capi.rs"), "{p:?}");
 }
+
+// ---------------------------------------------------------------------------
+// Adversarial comment-stripping cases (tester round 3).
+
+fn rs_with(extra: &str) -> Vec<String> {
+    let (_, py) = real();
+    let rs = format!("{}\n{extra}\n", read(RS));
+    fn_problems(&parse_rust_abi(&rs), &py, UNBOUND_EXPORTS)
+}
+
+#[test]
+fn a_double_quote_char_literal_does_not_open_a_string() {
+    let p = rs_with(&format!("const Q: char = '\"'; {PHANTOM_FN}"));
+    assert!(mentions(&p, "tessl_phantom: in src/capi.rs"), "{p:?}");
+}
+
+#[test]
+fn a_comment_opener_inside_a_nested_block_comment_is_inert() {
+    let p = rs_with(&format!("/* a /* b // c */ d */ {PHANTOM_FN}"));
+    assert!(mentions(&p, "tessl_phantom: in src/capi.rs"), "{p:?}");
+}
+
+#[test]
+fn an_unterminated_block_comment_swallows_to_eof_without_panicking() {
+    let p = rs_with(&format!("/* never closed {PHANTOM_FN}"));
+    assert!(!mentions(&p, "tessl_phantom"), "{p:?}");
+}
+
+#[test]
+fn a_raw_string_with_hashes_hides_inner_quotes_and_comment_markers() {
+    let p = rs_with(&format!("const R: &str = r##\"a \"# /* \"##; {PHANTOM_FN}"));
+    assert!(mentions(&p, "tessl_phantom: in src/capi.rs"), "{p:?}");
+}
+
+#[test]
+fn a_raw_identifier_is_not_a_raw_string() {
+    let p = rs_with(&format!("fn f(r#type: u8) {{}} {PHANTOM_FN}"));
+    assert!(mentions(&p, "tessl_phantom: in src/capi.rs"), "{p:?}");
+}
+
+#[test]
+fn a_raw_string_ending_in_a_backslash_does_not_escape_its_quote() {
+    let p = rs_with(&format!("const R: &str = r\"\\\"; {PHANTOM_FN}"));
+    assert!(mentions(&p, "tessl_phantom: in src/capi.rs"), "{p:?}");
+}
+
+#[test]
+fn a_byte_raw_string_ending_in_a_backslash_does_not_escape_its_quote() {
+    let p = rs_with(&format!("const R: &[u8] = br\"\\\"; {PHANTOM_FN}"));
+    assert!(mentions(&p, "tessl_phantom: in src/capi.rs"), "{p:?}");
+}
+
+#[test]
+fn a_lifetime_pair_does_not_pair_up_as_a_char_literal() {
+    let p = rs_with(&format!("fn g<'a, 'b>(x: &'a u8, y: &'b u8) {{}} /* c */ {PHANTOM_FN}"));
+    assert!(mentions(&p, "tessl_phantom: in src/capi.rs"), "{p:?}");
+}
+
+#[test]
+fn a_unicode_escape_char_literal_is_one_token() {
+    let p = rs_with(&format!(
+        "const C: char = '\\u{{1F980}}'; const D: char = '\u{4e2d}'; {PHANTOM_FN}"
+    ));
+    assert!(mentions(&p, "tessl_phantom: in src/capi.rs"), "{p:?}");
+}
+
+#[test]
+fn a_python_triple_single_quote_docstring_is_not_live() {
+    let (rust, _) = real();
+    let py = py_faulted(
+        "lib.tessl_synchronize.restype = ctypes.c_int32\n",
+        "lib.tessl_synchronize.restype = ctypes.c_int32\n        '''\n        lib.tessl_synchronize.restype = ctypes.c_int64\n        '''\n",
+    );
+    assert!(fn_problems(&rust, &py, UNBOUND_EXPORTS).is_empty());
+}
+
+#[test]
+fn a_python_docstring_holding_the_other_triple_quote_stays_one_string() {
+    let (rust, _) = real();
+    let py = py_faulted(
+        "lib.tessl_synchronize.restype = ctypes.c_int32\n",
+        "lib.tessl_synchronize.restype = ctypes.c_int32\n        \"\"\" ''' \n        lib.tessl_synchronize.restype = ctypes.c_int64\n        \"\"\"\n",
+    );
+    assert!(fn_problems(&rust, &py, UNBOUND_EXPORTS).is_empty());
+}
+
+#[test]
+fn a_python_docstring_with_an_escaped_quote_run_stays_one_string() {
+    let (rust, _) = real();
+    let py = py_faulted(
+        "lib.tessl_synchronize.restype = ctypes.c_int32\n",
+        "lib.tessl_synchronize.restype = ctypes.c_int32\n        \"\"\" \\\"\"\" \n        lib.tessl_synchronize.restype = ctypes.c_int64\n        \"\"\"\n",
+    );
+    assert!(fn_problems(&rust, &py, UNBOUND_EXPORTS).is_empty());
+}
+
+#[test]
+fn an_unterminated_python_triple_quote_does_not_panic() {
+    let py = format!("{}\n\"\"\"never closed", read(PY));
+    let _ = parse_py_abi(&py);
+}
+
+#[test]
+fn a_python_hash_inside_a_single_quoted_string_is_not_a_comment() {
+    let (rust, _) = real();
+    let py = py_faulted(
+        "lib.tessl_synchronize.restype = ctypes.c_int32\n",
+        "lib.tessl_synchronize.restype = ctypes.c_int32\n        _n = '#'; lib.tessl_synchronize.restype = ctypes.c_int64\n",
+    );
+    let p = fn_problems(&rust, &py, UNBOUND_EXPORTS);
+    assert!(mentions(&p, "tessl_synchronize: returns"), "{p:?}");
+}
+
+#[test]
+#[ignore = "known gap: strip_py_comments ends a single-quoted string at a backslash-newline continuation"]
+fn a_python_backslash_continued_string_keeps_its_hash_inside() {
+    let (rust, _) = real();
+    let py = py_faulted(
+        "lib.tessl_synchronize.restype = ctypes.c_int32\n",
+        "lib.tessl_synchronize.restype = ctypes.c_int32\n        _n = 'a\\\n#b'; lib.tessl_synchronize.restype = ctypes.c_int64\n",
+    );
+    let p = fn_problems(&rust, &py, UNBOUND_EXPORTS);
+    assert!(mentions(&p, "tessl_synchronize: returns"), "{p:?}");
+}
+
+#[test]
+fn the_real_sources_survive_stripping_idempotently() {
+    for (src, f) in [
+        (read(RS), strip_line_comments as fn(&str) -> String),
+        (read(PY), strip_py_comments as fn(&str) -> String),
+    ] {
+        let once = f(&src);
+        assert_eq!(f(&once), once, "stripping is not idempotent");
+    }
+}

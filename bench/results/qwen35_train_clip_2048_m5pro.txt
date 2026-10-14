@@ -43,7 +43,8 @@
 # waits 2392 -> 2104. Async: 16 -> 16 on both (as at T = 256).
 #
 # Findings (min over 3 rounds of each run's median of 3 steps; max in the table):
-# - sync:  total 3257 ms -> 2975 ms (-8.7 %). grad_sq_norm 589 -> 21 ms
+# - sync:  total 3257 ms -> 2975 ms (-8.7 %). grad_sq_norm 589.2 -> 20.7 ms
+#   (the table's minima over the 3 timed rounds; the probe run, 20.3 ms, is excluded)
 #   (320 dispatches/waits -> 2 dispatches/1 wait). Peak footprint 22.65 ->
 #   20.59 GB (-2.1 GB).
 # - async: total 3118 ms -> 2636 ms (-15.5 %). grad_sq_norm 556 -> 23 ms.
@@ -52,7 +53,9 @@
 #   2383 ms (min); its waits rise 2070 -> 2101 (31 head-by-chunk dispatches,
 #   as in the wave-2 file). The sync train_step_into difference is within the
 #   before binary's own spread (2461-3118 ms) and was not isolated here; the
-#   clipped total, which includes it, is the comparison. Under sync the
+#   clipped total, which includes it, is the comparison. The ranges overlap
+#   (before 2461-3118, after 2684-2968), so the slowdown is neither shown to be
+#   real nor shown to be noise. Under sync the
 #   total's win is the grad_sq_norm phase; do not read the total as a
 #   train_step speedup (the wave-2 file's unclipped T = 2048 bf16 step shows
 #   2.583 -> 2.563 s sync, unchanged within noise).
@@ -67,6 +70,10 @@
 #   train_step_into difference.
 #
 # ---- summary: 3 rounds, each a median of 3 steps; min over rounds (max beside total) ----
+# Each column is an INDEPENDENT minimum over the 3 timed rounds, so a row's
+# phase columns come from different runs and do not sum to its total: after/sync
+# total 2974.6 is one run (grad_sq 21.5, train 2683.7), while its grad_sq 20.7 is
+# from another run whose total is 3018.6. Compare columns across rows, not within a row.
 # (ms; footprint in GB; waits are the total of the clipped step)
 # config                      total     (max)     train   grad_sq     adamw    fp GB  waits total (train/gsn/adamw)
 # before/sync    min    3257.2    4023.2    2460.9     589.2     219.6    22.65  2392

@@ -116,3 +116,19 @@ fn grad_sq_norm_waits_hold_in_every_run() {
         }
     }
 }
+
+#[test]
+fn prose_matches_table_and_states_columns_are_independent_minima() {
+    assert!(
+        FILE.contains("INDEPENDENT minimum"),
+        "summary must say its columns are per-column minima from different runs"
+    );
+    assert!(
+        FILE.contains("grad_sq_norm 589.2 -> 20.7 ms"),
+        "findings prose must cite the table's grad_sq minima, not rounded figures"
+    );
+    assert!(
+        FILE.contains("neither shown to be\n#   real nor shown to be noise"),
+        "train_step_into slowdown must be reported as unresolved"
+    );
+}

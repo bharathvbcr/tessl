@@ -104,3 +104,25 @@ fn a_later_bad_weights_flag_wins_over_nothing_and_a_later_bad_iters_still_refuse
     assert_refused_before_gpu(&["--iters=", "16"], "--iters");
     assert_refused_before_gpu(&["--iters=99999999999999999999999", "16"], "--iters");
 }
+
+#[test]
+fn directory_named_safetensors_and_unloadable_checkpoints_are_refused_before_any_gpu_work() {
+    let d = Scratch::new("bq35_dir_st");
+    std::fs::create_dir(d.0.join("x.safetensors")).unwrap();
+    std::fs::write(d.0.join("config.json"), "{}").unwrap();
+    let p = d.0.to_str().unwrap();
+    assert_refused_before_gpu(&[&format!("--weights={p}"), "16"], "found 0");
+    // A real file but an unusable config / empty checkpoint.
+    let e = Scratch::new("bq35_bad_content");
+    std::fs::write(e.0.join("config.json"), "{}").unwrap();
+    std::fs::write(e.0.join("a.safetensors"), b"").unwrap();
+    let q = e.0.to_str().unwrap();
+    assert_refused_before_gpu(&[&format!("--weights={q}"), "16"], "--weights");
+}
+
+#[test]
+fn huge_iters_is_refused_before_any_gpu_work() {
+    assert_refused_before_gpu(&["--iters=18446744073709551615", "16"], "--iters");
+    assert_refused_before_gpu(&["--iters=1000000000", "16"], "--iters");
+    assert_refused_before_gpu(&["--iters=10001", "16"], "--iters");
+}

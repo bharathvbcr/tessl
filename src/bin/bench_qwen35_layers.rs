@@ -101,6 +101,8 @@ const BACKEND: GemmBackend = GemmBackend::TensorOps;
 const REPS: usize = 8;
 const WARMUP: usize = 2;
 const ITERS: usize = 7;
+/// Upper bound on `--iters`: keeps the sample buffers and the run time sane.
+const MAX_ITERS: usize = 10_000;
 const DEFAULT_T: [usize; 3] = [1024, 2048, 8192];
 
 type Res<T> = Result<T, String>;
@@ -673,7 +675,7 @@ fn checkpoint_file(dir: &Path) -> Res<PathBuf> {
     let mut files = Vec::new();
     for entry in entries {
         let path = entry.map_err(|e| format!("--weights {}: {e}", dir.display()))?.path();
-        if path.extension().is_some_and(|x| x == "safetensors") {
+        if path.is_file() && path.extension().is_some_and(|x| x == "safetensors") {
             files.push(path);
         }
     }
@@ -693,9 +695,14 @@ fn checkpoint(dir: &Path) -> Res<Weights> {
     if !cfg.is_file() {
         return Err(format!("--weights {}: no config.json", dir.display()));
     }
+    let st = checkpoint_file(dir)?;
+    // Parse both now, on the CPU: a config or checkpoint that cannot load is
+    // refused here, not after GPU init.
+    Qwen35Config::from_config_file(&cfg).map_err(|e| format!("--weights {}: {e}", dir.display()))?;
+    SafeTensors::open(&st).map_err(|e| format!("--weights {}: {e}", st.display()))?;
     Ok(Weights::Dir {
         dir: dir.to_path_buf(),
-        st: checkpoint_file(dir)?,
+        st,
     })
 }
 
@@ -1230,8 +1237,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             opts.iters = n
                 .parse()
                 .ok()
-                .filter(|&n| n > 0)
-                .ok_or_else(|| format!("--iters=N wants a positive count, got {n:?}"))?;
+                .filter(|n| (1..=MAX_ITERS).contains(n))
+                .ok_or_else(|| format!("--iters=N wants a count in 1..={MAX_ITERS}, got {n:?}"))?;
         } else if let Some(dir) = arg.strip_prefix("--weights=") {
             if dir.is_empty() {
                 return Err("--weights=DIR wants a checkpoint directory".into());

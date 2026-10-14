@@ -280,3 +280,165 @@ fn a_missing_kernels_dir_with_a_valid_build_is_a_usage_error() {
     let out = run(&fake_bs(&d, 3, 0, false, 0), &m);
     assert_eq!(out.status.code(), Some(2));
 }
+
+// ---- amendment round: ROUNDS validation and resolved-path containment ----
+
+#[test]
+fn paired_bins_rejects_a_rounds_that_is_not_a_positive_integer() {
+    let d = scratch("rounds");
+    let a = mk_metric_bin(&d, "a", "1");
+    let bins = format!("a={}", a.display());
+    let long = "9".repeat(10);
+    for bad in ["0", "00", "-1", "", "abc", "1.5", "+2", " 2", "2 ", &long] {
+        let out = run_pb(&bins, bad, &d.join("log"));
+        assert_eq!(out.status.code(), Some(2), "ROUNDS={bad:?}");
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(err.contains("ROUNDS"), "ROUNDS={bad:?}: {err}");
+        assert!(!String::from_utf8_lossy(&out.stdout).contains("summary"));
+        assert!(!err.contains("round 0"), "ran despite ROUNDS={bad:?}");
+    }
+    let ok = run_pb(&bins, "2", &d.join("log"));
+    assert_eq!(ok.status.code(), Some(0));
+    assert!(String::from_utf8_lossy(&ok.stdout).contains("summary"));
+}
+
+/// A fake build script that makes `$OUT_DIR/<setup>` then prints a metallib path.
+fn escaping_bs(dir: &Path, setup: &str, lib_expr: &str) -> PathBuf {
+    let bs = dir.join("fake bs");
+    let body = format!(
+        "#!/bin/sh\ni=0; while [ $i -lt 3 ]; do i=$((i+1)); : > \"$OUT_DIR/k$i.air\"; done\n\
+         {setup}\necho \"cargo:rustc-env=TESSL_METALLIB={lib_expr}\"\n"
+    );
+    fs::write(&bs, body).unwrap();
+    fs::set_permissions(&bs, fs::Permissions::from_mode(0o755)).unwrap();
+    bs
+}
+
+fn assert_rejected_as_escape(out: &Output) {
+    assert_eq!(out.status.code(), Some(1));
+    assert!(!String::from_utf8_lossy(&out.stdout).contains("METRIC"));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("not under the scratch OUT_DIR"));
+}
+
+#[test]
+fn a_dotdot_traversal_out_of_the_scratch_out_dir_is_rejected() {
+    let d = scratch("dotdot");
+    // OUT_DIR is <scratch>/o, so ../x.metallib is textually under it but lands beside it.
+    let bs = escaping_bs(&d, "echo x > \"$OUT_DIR/../x.metallib\"", "$OUT_DIR/../o/../x.metallib");
+    assert_rejected_as_escape(&run(&bs, &manifest_with(&d, 3)));
+}
+
+#[test]
+fn a_symlinked_directory_inside_out_dir_pointing_outside_is_rejected() {
+    let d = scratch("symdir");
+    let outside = d.join("outside");
+    fs::create_dir_all(&outside).unwrap();
+    fs::write(outside.join("x.metallib"), "x").unwrap();
+    let bs = escaping_bs(
+        &d,
+        &format!("ln -s '{}' \"$OUT_DIR/link\"", outside.display()),
+        "$OUT_DIR/link/x.metallib",
+    );
+    assert_rejected_as_escape(&run(&bs, &manifest_with(&d, 3)));
+}
+
+#[test]
+fn a_symlinked_metallib_pointing_outside_is_rejected() {
+    let d = scratch("symfile");
+    let lib = d.join("outside.metallib");
+    fs::write(&lib, "x").unwrap();
+    let bs = escaping_bs(
+        &d,
+        &format!("ln -s '{}' \"$OUT_DIR/default.metallib\"", lib.display()),
+        "$OUT_DIR/default.metallib",
+    );
+    assert_rejected_as_escape(&run(&bs, &manifest_with(&d, 3)));
+}
+
+// ---- adversarial round 2 (tester) ----
+
+#[test]
+fn paired_bins_rounds_rejects_exotic_numerals_and_embedded_newlines() {
+    let d = scratch("rounds2");
+    let a = mk_metric_bin(&d, "a", "1");
+    let bins = format!("a={}", a.display());
+    for bad in [
+        "1\n2",
+        "1\n",
+        "\n1",
+        "007",
+        "0x10",
+        "1e3",
+        "1_0",
+        "\u{661}",
+        "\u{ff11}",
+        "1000000",
+        "1;echo",
+        "$(echo 1)",
+        "1,2",
+    ] {
+        let log = d.join("log");
+        let _ = fs::remove_file(&log);
+        let out = run_pb(&bins, bad, &log);
+        assert_eq!(out.status.code(), Some(2), "ROUNDS={bad:?}");
+        assert!(!log.exists(), "OUT created before validation for ROUNDS={bad:?}");
+    }
+}
+
+#[test]
+fn a_metallib_in_a_sibling_directory_sharing_the_out_dir_prefix_is_rejected() {
+    let d = scratch("sibling");
+    // OUT_DIR is <scratch>/o; <scratch>/o2 shares its textual prefix.
+    let bs = escaping_bs(
+        &d,
+        "mkdir -p \"$OUT_DIR/../o2\"; echo x > \"$OUT_DIR/../o2/x.metallib\"",
+        "$OUT_DIR/../o2/x.metallib",
+    );
+    assert_rejected_as_escape(&run(&bs, &manifest_with(&d, 3)));
+}
+
+#[test]
+fn a_metallib_in_a_real_subdirectory_of_out_dir_is_accepted() {
+    let d = scratch("subdir");
+    let bs = escaping_bs(
+        &d,
+        "mkdir -p \"$OUT_DIR/a/b\"; echo x > \"$OUT_DIR/a/b/x.metallib\"",
+        "$OUT_DIR/a/b/x.metallib",
+    );
+    let out = run(&bs, &manifest_with(&d, 3));
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+}
+
+#[test]
+fn a_relative_metallib_path_is_not_resolved_against_out_dir() {
+    let d = scratch("relative");
+    let bs = escaping_bs(&d, "echo x > \"$OUT_DIR/x.metallib\"", "x.metallib");
+    let out = run(&bs, &manifest_with(&d, 3));
+    assert!(!out.status.success());
+    assert!(!String::from_utf8_lossy(&out.stdout).contains("METRIC"));
+}
+
+#[test]
+fn a_metallib_path_with_odd_characters_inside_out_dir_is_accepted() {
+    let d = scratch("odd");
+    let bs = escaping_bs(
+        &d,
+        "mkdir -p \"$OUT_DIR/we ird*dir\"; echo x > \"$OUT_DIR/we ird*dir/x y.metallib\"",
+        "$OUT_DIR/we ird*dir/x y.metallib",
+    );
+    let out = run(&bs, &manifest_with(&d, 3));
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+}
+
+#[test]
+fn a_dangling_symlinked_metallib_is_rejected_without_metrics() {
+    let d = scratch("dangling");
+    let bs = escaping_bs(
+        &d,
+        "ln -s /nonexistent/zzz \"$OUT_DIR/default.metallib\"",
+        "$OUT_DIR/default.metallib",
+    );
+    let out = run(&bs, &manifest_with(&d, 3));
+    assert!(!out.status.success());
+    assert!(!String::from_utf8_lossy(&out.stdout).contains("METRIC"));
+}

@@ -50,6 +50,11 @@
 //! untimed step's host waits on the GPU, commits, dispatches and fresh
 //! buffer allocations ([`tessl::infer_trace`]).
 //!
+//! `--random-config=PATH` times the step on a random tower at that
+//! `config.json`'s shapes instead of the checkpoint (a size with no local
+//! weights, e.g. the 4B's r = 2 grouped heads; use `--storage=bf16`). The
+//! per-op gate still runs at the 2B's shapes.
+//!
 //! `--async` runs the step under [`GpuRuntime::set_async_encode`] (one command
 //! buffer between the waits the step itself makes); without it every
 //! dispatch is a waited commit, as on a runtime nobody switched (ojas-qwen35's
@@ -664,6 +669,20 @@ fn bench_t(rt: &Arc<GpuRuntime>, t: usize, check_only: bool, operands: GemmOpera
 
 /// The real 2B checkpoint, stored in `precision` (bf16 as a training
 /// tower, without the LM head's packed copy).
+/// The model the step times: the 2B checkpoint, or with `random_config` a
+/// [`Qwen35Model::random_tower`] at that `config.json`'s shapes (allocation
+/// and kernel time, not values: how a size with no local checkpoint, the
+/// 4B's grouped r = 2 heads, is timed).
+fn load_model(rt: &Arc<GpuRuntime>, precision: Precision, random_config: Option<&str>) -> Res<Qwen35Model> {
+    match random_config {
+        Some(path) => {
+            let cfg = Qwen35Config::from_config_file(std::path::Path::new(path))?;
+            Qwen35Model::random_tower(rt, cfg, precision, 1)
+        }
+        None => load_2b(rt, precision),
+    }
+}
+
 fn load_2b(rt: &Arc<GpuRuntime>, precision: Precision) -> Res<Qwen35Model> {
     let path = std::env::var("QWEN35_2B_SAFETENSORS")
         .map_err(|_| "--step and --batch need QWEN35_2B_SAFETENSORS (the Qwen3.5-2B-Base .safetensors)".to_string())?;
@@ -933,7 +952,7 @@ fn bench_batch(rt: &Arc<GpuRuntime>, model: &Qwen35Model, b: BatchShape, operand
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (mut check_only, mut step, mut ts, mut operands) = (false, None, Vec::new(), GemmOperands::ExactF32);
     let (mut batches, mut step_only, mut async_encode, mut clip) = (Vec::new(), false, false, None);
-    let mut storage = Precision::F32;
+    let (mut storage, mut random_config) = (Precision::F32, None::<String>);
     for arg in std::env::args().skip(1) {
         if arg == "--bf16" {
             operands = GemmOperands::Bf16;
@@ -951,6 +970,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             step_only = true;
         } else if arg == "--async" {
             async_encode = true;
+        } else if let Some(v) = arg.strip_prefix("--random-config=") {
+            random_config = Some(v.to_string());
         } else if let Some(n) = arg.strip_prefix("--clip=") {
             clip = Some(
                 n.parse::<usize>()
@@ -967,7 +988,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let t: usize = arg.parse().map_err(|_| {
                 format!(
                     "expected a token count, --check-only, --step-only, --bf16, --storage=f32|bf16, --async, \
-                     --step=N, --clip=N or --batch=B,L[,S], got {arg:?}"
+                     --random-config=PATH, --step=N, --clip=N or --batch=B,L[,S], got {arg:?}"
                 )
             })?;
             if t < 2 {
@@ -1002,7 +1023,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         return Ok(());
     }
-    let model = load_2b(&rt, storage)?;
+    let model = load_model(&rt, storage, random_config.as_deref())?;
     rt.set_async_encode(async_encode)?;
     println!(
         "storage: {}; operands: {operands:?}",

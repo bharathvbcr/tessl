@@ -499,7 +499,7 @@ TESSL_GEMM_TUNE=1 cargo run --release --bin bench_gemm_tnnt_tune
 | `bench_gemm_epi_tile` | Paired, interleaved A/B benchmark for fused epilogue tile geometries (128×64 vs 64×64). |
 | `bench_gemm_sweep` | Cross-runtime sweep (`f32`, `tf32`, `bf16`) with JSON telemetry output. |
 | `bench_nn_kernels` | Throughput of the `nn` library, timed both batched and solo so the dispatch floor is visible rather than hidden. |
-| `bench_qwen35_layers` | Per-kernel and forward timings of the Qwen3.5 layer kernels at the 2B's shapes; `--paired-attn` times paired prefill attention. |
+| `bench_qwen35_layers` | `Qwen35Model` prefill, per-layer and decode timings at the 2B's shapes (random or `--weights=DIR`); `--paired-attn` times paired prefill attention. |
 | `bench_qwen35_train` | The training step's time at Qwen3.5-2B's shapes, each activation mode alone; `--batch` times a batch run row by row. |
 | `bench_paired` | Rust round-robin runner for paired benchmark lanes with min-of-N telemetry and per-round ratios. |
 | `bench_embedgemma2` | EmbeddingGemma 2 benchmark over ragged workloads, measuring peak device allocation and RSS. |

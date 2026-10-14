@@ -91,8 +91,8 @@ use crate::json::{self, Json, Syntax};
 use crate::loader::Loader;
 use crate::nn::{AttnDims, DecodeScratch};
 use crate::qwen35::{
-    self, AttnProjLayout, AttnShape, AttnTargets, Cols, GdnDims, GdnParams, GdnProjLayout, GdnWorkspace, LmHead,
-    OutCols, SharedPrefix, StateIn,
+    self, AttnProjLayout, AttnShape, AttnTargets, Cols, GdnDims, GdnParams, GdnProjLayout, GdnScanSlice, GdnWorkspace,
+    LmHead, OutCols, SharedPrefix, StateIn,
 };
 use crate::runtime::{BufferKind, GpuRuntime};
 use crate::safetensors::SafeTensors;
@@ -486,6 +486,9 @@ pub struct Qwen35Model {
     pub(crate) lm_head_bf16: Option<Tensor>,
     pub(crate) final_norm: GpuBuffer,
     pub(crate) layers: Vec<Layer>,
+    /// The GDN chunk scan's column slice for every prefill this model runs
+    /// ([`Self::with_gdn_scan_slice`]); the library default unless chosen.
+    gdn_scan: GdnScanSlice,
     /// Bumped by every write to the weights after load
     /// ([`Self::bump_param_generation`]). A [`crate::qwen35_train::PendingStep`]
     /// records it at the forward, and the backward, which rebuilds each layer
@@ -636,9 +639,7 @@ impl Qwen35Model {
                     t.buffer
                         .try_write_bf16_bits(&bits)
                         .map_err(|e| format!("Qwen35Model::load: embed_tokens: {e}"))?;
-                    let head = rt.alloc_tensor_bf16_hot(&[h, vocab])?;
-                    qwen35::place_linear_part(&mut head.buffer.try_contents_u16()?, vocab, 0, &bits, vocab, h)?;
-                    Some(head)
+                    Some(Self::pack_head(rt, &bits, vocab, h)?)
                 } else {
                     // No head to transpose into: read straight into the table.
                     ld.bf16_into("embed_tokens.weight", &[vocab, h], &t)?;
@@ -732,23 +733,53 @@ impl Qwen35Model {
             lm_head_bf16,
             final_norm,
             layers,
+            gdn_scan: GdnScanSlice::default(),
             param_generation: AtomicU64::new(0),
             layer_fault: AtomicUsize::new(usize::MAX),
             read_fault: AtomicBool::new(false),
         })
     }
 
+    /// The tied head packed `[hidden, vocab]` from the embedding's bf16 `bits`
+    /// (`[vocab, hidden]`): the one place [`Self::load`] and [`Self::random`]
+    /// build it.
+    fn pack_head(rt: &Arc<GpuRuntime>, bits: &[u16], vocab: usize, h: usize) -> Result<Tensor, String> {
+        let head = rt.alloc_tensor_bf16_hot(&[h, vocab])?;
+        qwen35::place_linear_part(&mut head.buffer.try_contents_u16()?, vocab, 0, bits, vocab, h)?;
+        Ok(head)
+    }
+
     /// A model of `cfg`'s shapes with seeded random weights and no checkpoint,
-    /// loaded as [`Self::load_tower`] loads (no packed LM head): for memory
-    /// probes and tests at shapes with no local checkpoint. Every matrix and
-    /// the conv weights are uniform with standard deviation 0.02
-    /// (transformers' `initializer_range`), the norms' `w`, `A_log` and
-    /// `dt_bias` zero. Not a trained model.
+    /// loaded as [`Self::load`] loads (at bf16, with the packed LM head, so
+    /// [`Self::forward`] and [`Self::prefill`] run): for benches and tests at
+    /// shapes with no local checkpoint. Every matrix and the conv weights are
+    /// uniform with standard deviation 0.02 (transformers' `initializer_range`),
+    /// the norms' `w`, `A_log` and `dt_bias` zero. Not a trained model. The
+    /// head is the embedding's own bits, so it costs one more `[hidden,
+    /// vocab]` table (1.0 GB at the 2B's) and [`Self::random_tower`]'s weights
+    /// are this model's, bit for bit.
+    pub fn random(rt: &Arc<GpuRuntime>, cfg: Qwen35Config, precision: Precision, seed: u64) -> Result<Self, String> {
+        Self::random_impl(rt, cfg, precision, seed, true)
+    }
+
+    /// [`Self::random`] loaded as [`Self::load_tower`] loads (no packed LM
+    /// head): for memory probes and tests that read hidden states only. At
+    /// bf16, [`Self::forward`], [`Self::prefill`] and [`Staged::logits`] refuse it.
     pub fn random_tower(
         rt: &Arc<GpuRuntime>,
         cfg: Qwen35Config,
         precision: Precision,
         seed: u64,
+    ) -> Result<Self, String> {
+        Self::random_impl(rt, cfg, precision, seed, false)
+    }
+
+    fn random_impl(
+        rt: &Arc<GpuRuntime>,
+        cfg: Qwen35Config,
+        precision: Precision,
+        seed: u64,
+        with_head: bool,
     ) -> Result<Self, String> {
         cfg.validate()?;
         let mut state = seed ^ 0x9e37_79b9_7f4a_7c15;
@@ -766,33 +797,50 @@ impl Qwen35Model {
                 })
                 .collect()
         };
-        let mut tensor = |shape: &[usize], p: Precision| -> Result<Tensor, String> {
-            let data = uniform(shape.iter().product());
+        let (h, inter, vocab) = (cfg.hidden as usize, cfg.intermediate as usize, cfg.vocab as usize);
+        // The embedding's draw is the first of the stream whether or not a head
+        // is built, so the head reuses its bits and the tower stays the same.
+        let embed_data = uniform(vocab * h);
+        let upload = |shape: &[usize], p: Precision, data: &[f32]| -> Result<Tensor, String> {
             match p {
                 Precision::Bf16 => {
                     let t = rt.alloc_tensor_bf16_hot(shape)?;
                     t.buffer
-                        .try_write_bf16_bits(&crate::tensor::f32_slice_to_bf16(&data))
+                        .try_write_bf16_bits(&crate::tensor::f32_slice_to_bf16(data))
                         .map_err(|e| format!("Qwen35Model::random: {e}"))?;
                     Ok(t)
                 }
                 Precision::F32 => {
                     let t = rt.alloc_tensor_f32_hot(shape)?;
                     t.buffer
-                        .try_write_f32(&data)
+                        .try_write_f32(data)
                         .map_err(|e| format!("Qwen35Model::random: {e}"))?;
                     Ok(t)
                 }
             }
+        };
+        let mut tensor = |shape: &[usize], p: Precision| -> Result<Tensor, String> {
+            let data = uniform(shape.iter().product());
+            upload(shape, p, &data)
         };
         let zeros = |n: usize| -> Result<GpuBuffer, String> {
             let b = rt.alloc_buffer_hot(n.max(1) * 4)?;
             b.try_zero().map_err(|e| format!("Qwen35Model::random: {e}"))?;
             Ok(b)
         };
-        let (h, inter, vocab) = (cfg.hidden as usize, cfg.intermediate as usize, cfg.vocab as usize);
         let (g, a) = (cfg.gdn, cfg.attn);
-        let embed = tensor(&[vocab, h], precision)?;
+        let embed = upload(&[vocab, h], precision, &embed_data)?;
+        let lm_head_bf16 = if with_head && precision == Precision::Bf16 {
+            Some(Self::pack_head(
+                rt,
+                &crate::tensor::f32_slice_to_bf16(&embed_data),
+                vocab,
+                h,
+            )?)
+        } else {
+            None
+        };
+        drop(embed_data);
         let mut layers = Vec::with_capacity(cfg.layers.len());
         for kind in &cfg.layers {
             let mixer = match kind {
@@ -830,13 +878,24 @@ impl Qwen35Model {
             precision,
             rt: Arc::clone(rt),
             embed,
-            lm_head_bf16: None,
+            lm_head_bf16,
             final_norm,
             layers,
+            gdn_scan: GdnScanSlice::default(),
             param_generation: AtomicU64::new(0),
             layer_fault: AtomicUsize::new(usize::MAX),
             read_fault: AtomicBool::new(false),
         })
+    }
+
+    /// This model with the GDN chunk scan run in `slice`-column slices by
+    /// every prefill (`forward`, `begin`, `prefill`). The slices are
+    /// bit-identical, so this changes speed only; the default is the
+    /// library's ([`GdnScanSlice::default`]). Decode's recurrence has its own
+    /// width and is not affected.
+    pub fn with_gdn_scan_slice(mut self, slice: GdnScanSlice) -> Self {
+        self.gdn_scan = slice;
+        self
     }
 
     pub fn config(&self) -> &Qwen35Config {
@@ -871,7 +930,7 @@ impl Qwen35Model {
             } else if self.precision == Precision::F32 {
                 "tied to the embedding"
             } else {
-                "none (load_tower; only begin / Staged::score_answers read it)"
+                "none (load_tower / random_tower; only begin / Staged::score_answers read it)"
             }
         )
     }
@@ -1020,7 +1079,8 @@ impl Qwen35Model {
             &format!("a forward of {t} tokens needs"),
             "shorten the sequence, or free device memory",
         )?;
-        let a = Acts::new(&self.rt, &self.cfg, self.precision, t, carry.is_none())?;
+        let mut a = Acts::new(&self.rt, &self.cfg, self.precision, t, carry.is_none())?;
+        a.g_ws.set_scan_slice(self.gdn_scan);
         self.embed_ids(ids, &a.resid)?;
         Ok(Staged {
             model: self,
@@ -1084,7 +1144,7 @@ impl Qwen35Model {
     fn require_head(&self, what: &str) -> Result<(), String> {
         if self.precision == Precision::Bf16 && self.lm_head_bf16.is_none() {
             return Err(format!(
-                "{what}: this model was loaded with load_tower (no LM head); use begin / advance_to / \
+                "{what}: this model was built without an LM head (load_tower or random_tower); use begin / advance_to / \
                  final_norm_f32, or Staged::score_answers"
             ));
         }
@@ -1173,13 +1233,23 @@ impl Qwen35Model {
     /// picks the mixer's kernels and where its state starts and goes.
     fn layer(&self, l: &Layer, a: &Acts, step: Step<'_>) -> Result<(), String> {
         self.take_layer_fault()?;
-        self.norm(&a.resid, &l.input_norm, &a.x)?;
-        match &l.mixer {
-            Mixer::Gdn(w) => self.gdn(w, a, step)?,
-            Mixer::Attn(w) => self.attention(w, a, step)?,
+        LayerPart::ORDER
+            .into_iter()
+            .try_for_each(|part| self.layer_part(l, a, step, part))
+    }
+
+    /// One [`LayerPart`] of a layer: the only place the parts' bodies are
+    /// written, and [`Self::layer`] runs them in [`LayerPart::ORDER`].
+    fn layer_part(&self, l: &Layer, a: &Acts, step: Step<'_>, part: LayerPart) -> Result<(), String> {
+        match part {
+            LayerPart::InputNorm => self.norm(&a.resid, &l.input_norm, &a.x),
+            LayerPart::Mixer => match &l.mixer {
+                Mixer::Gdn(w) => self.gdn(w, a, step),
+                Mixer::Attn(w) => self.attention(w, a, step),
+            },
+            LayerPart::PostNorm => self.norm(&a.resid, &l.post_norm, &a.x),
+            LayerPart::Mlp => self.mlp(l, a),
         }
-        self.norm(&a.resid, &l.post_norm, &a.x)?;
-        self.mlp(l, a)
     }
 
     /// `out = (rms_norm(resid) * (1 + norm.w)) @ embedᵀ` for every row of
@@ -1441,6 +1511,25 @@ impl Qwen35Model {
     }
 }
 
+/// One of the four encoded steps of a decoder layer (see the module docs'
+/// layer), in the order [`Self::ORDER`] runs them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LayerPart {
+    /// `x = rms_norm(resid) * (1 + input_layernorm.w)`.
+    InputNorm,
+    /// The GDN or attention mixer: `resid += mixer(x)`.
+    Mixer,
+    /// `x = rms_norm(resid) * (1 + post_attention_layernorm.w)`.
+    PostNorm,
+    /// `resid += down(silu(gate(x)) * up(x))`.
+    Mlp,
+}
+
+impl LayerPart {
+    /// The order a layer runs its parts in.
+    pub const ORDER: [LayerPart; 4] = [Self::InputNorm, Self::Mixer, Self::PostNorm, Self::Mlp];
+}
+
 /// How one layer's mixer runs, and where its state starts and goes.
 #[derive(Clone, Copy)]
 enum Step<'c> {
@@ -1594,6 +1683,29 @@ impl Staged<'_> {
         self.next = layer;
         self.broken = false;
         Ok(())
+    }
+
+    /// Encode one `part` of layer `layer` on the session's activations, as a
+    /// prefill runs it (nothing kept), without advancing [`Self::layers_done`]
+    /// and without waiting: for timing a layer's parts one at a time (several
+    /// per command buffer under async encode). The residual stream is
+    /// updated in place by the mixer and the MLP, so repeating a part moves
+    /// it; the numbers a session returns after this are not a forward's.
+    /// Refused on a session that keeps state (only [`Qwen35Model::prefill`]'s
+    /// internal one does), on a broken session, and for a layer the model does
+    /// not have.
+    pub fn encode_part(&self, layer: usize, part: LayerPart) -> Result<(), String> {
+        const WHAT: &str = "Staged::encode_part";
+        let m = self.model;
+        self.check_usable(WHAT)?;
+        if self.carry.is_some() {
+            return Err(format!("{WHAT}: a session that keeps state runs whole layers only"));
+        }
+        let l = m
+            .layers
+            .get(layer)
+            .ok_or_else(|| format!("{WHAT}: layer {layer} of a model with {}", m.layers.len()))?;
+        m.layer_part(l, &self.a, Step::Prefill, part)
     }
 
     /// `out = rms_norm(resid) * (1 + norm.w)` in f32, `[tokens, hidden]`: the

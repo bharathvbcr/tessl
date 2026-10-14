@@ -415,6 +415,21 @@ fn the_host_refuses_what_the_kernels_cannot_run() {
             "multiple of 16",
         );
         refused(fwd(GdnTrainDims { seq: 0, ..dims }, x, &o, None, &ckpt), "non-zero");
+        // heads * 128 = 2^32: the dense window's u32 row stride would wrap.
+        refused(
+            fwd(
+                GdnTrainDims {
+                    heads: 1 << 25,
+                    seq: 1,
+                    ..dims
+                },
+                x,
+                &o,
+                None,
+                &ckpt,
+            ),
+            "row width past u32",
+        );
         refused(
             fwd(GdnTrainDims { seq: 6, ..dims }, x, &o, None, &ckpt),
             "q must be f32 [1, 6, 2, 128]",

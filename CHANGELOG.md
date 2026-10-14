@@ -639,6 +639,27 @@ All notable changes to `tessl` are recorded here. The format follows
 
 ### Changed
 
+- **GDN training reads q/k/v where the model keeps them.**
+  `gdn_train_forward_windowed` / `gdn_train_backward_windowed` take `(ld, off)`
+  column windows of the conv output and write `dq`/`dk`/`dv` back the same way,
+  and index key heads as `h / (Hv/Hk)` so grouped heads are never repeated.
+  `gdn_train_backward_windowed` sums `dq`/`dk` over each key head's value heads,
+  in value-head order. The dense `gdn_train_forward` / `gdn_train_backward` are
+  the dense window and delegate to them, so ojas-metal and the C ABI are
+  unchanged.
+  - The Qwen3.5 training step no longer runs `copy_cols`, `repeat_heads` or
+    `sum_heads` for GDN layers. Those helpers and their staging buffers are
+    deleted.
+  - Gradients are bit-identical on the tiny and grouped fixtures.
+  - The adversarial pass confirmed 64-bit kernel indices with rows past 2^32
+    elements, that conservative aliasing refusals hold, and that results do
+    not depend on the padding columns.
+  - Paired step: within ±1% at r=1 (2B, f32 and bf16); 4-5% faster at r=2
+    (4B config); `bench/results/qwen35_gdn_windows_m5pro.txt`.
+  - `GdnTrainDims` refuses a row width past `u32`.
+  - `bench_qwen35_train --random-config=PATH` times a size with no local
+    checkpoint.
+
 - **No panicking host access in library code.** Weight loads (`Loader`, BERT,
   Qwen3.5 `load` and `random_tower`) and the ICB triage probe return an error on
   a busy runtime instead of panicking. `tests/host_access_ban.rs` scans non-test

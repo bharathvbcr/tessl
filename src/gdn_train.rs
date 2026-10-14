@@ -77,6 +77,11 @@ impl GdnTrainDims {
         if rows > u64::from(u32::MAX) || widest > i64::MAX as u64 / 4 {
             return Err(format!("{what}: shape {self:?} is too large"));
         }
+        // A dense row (`heads * 128` or `heads * v_dim` columns) is a window
+        // stride in u32; refuse a width that does not fit rather than wrap.
+        if u64::from(self.heads) * u64::from(GDN_TRAIN_DK.max(self.v_dim)) > u64::from(u32::MAX) {
+            return Err(format!("{what}: shape {self:?} has a row width past u32"));
+        }
         Ok(())
     }
 

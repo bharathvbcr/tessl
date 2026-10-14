@@ -522,7 +522,8 @@ or the GitHub workflows. `scripts/ci_local.sh` runs the GPU-free
 `test_binding_host.py` on every invocation with the torch oracle python (it
 fails if there is none). It runs the GPU and MPS tests (`test_cross_entropy.py`,
 `test_gdn.py`, `test_qwen35.py`) only when `MAC_HEAVY_LABEL` is set, that is
-under `tools/mac_heavy.sh`; otherwise it prints a `SKIPPED` line. The script
+under Lappi-decision's `tools/mac_heavy.sh` (a script in that repository, not
+this one); otherwise it prints a `SKIPPED` line. The script
 also runs `cargo test` with `--no-fail-fast` and exits non-zero if any test
 binary failed.
 

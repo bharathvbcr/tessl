@@ -1216,3 +1216,63 @@ fn a_block_commented_export_is_not_an_export() {
     let p = fn_problems(&parse_rust_abi(&rs), &py, UNBOUND_EXPORTS);
     assert!(!mentions(&p, "tessl_phantom"), "{p:?}");
 }
+
+// ---------------------------------------------------------------------------
+// Adversarial comment-stripping cases (tester round).
+
+const PHANTOM_FN: &str = "pub extern \"C\" fn tessl_phantom(x: u32) -> i32 { 0 }";
+
+#[test]
+#[ignore = "known gap: comment strippers are not string/comment aware"]
+fn a_block_opener_inside_a_line_comment_does_not_swallow_a_real_export() {
+    let (_, py) = real();
+    let rs = format!("{}\n// see the /* legacy path\n{PHANTOM_FN}\n", read(RS));
+    let p = fn_problems(&parse_rust_abi(&rs), &py, UNBOUND_EXPORTS);
+    assert!(mentions(&p, "tessl_phantom: in src/capi.rs"), "{p:?}");
+}
+
+#[test]
+#[ignore = "known gap: comment strippers are not string/comment aware"]
+fn a_block_opener_inside_a_string_literal_does_not_swallow_a_real_export() {
+    let (_, py) = real();
+    let rs = format!("{}\nconst GLOB: &str = \"/*\";\n{PHANTOM_FN}\n", read(RS));
+    let p = fn_problems(&parse_rust_abi(&rs), &py, UNBOUND_EXPORTS);
+    assert!(mentions(&p, "tessl_phantom: in src/capi.rs"), "{p:?}");
+}
+
+#[test]
+#[ignore = "known gap: comment strippers are not string/comment aware"]
+fn a_line_comment_marker_inside_a_rust_string_does_not_hide_the_rest_of_the_line() {
+    let (_, py) = real();
+    let rs = format!("{}\nconst U: &str = \"http://x\"; {PHANTOM_FN}\n", read(RS));
+    let p = fn_problems(&parse_rust_abi(&rs), &py, UNBOUND_EXPORTS);
+    assert!(mentions(&p, "tessl_phantom: in src/capi.rs"), "{p:?}");
+}
+
+#[test]
+#[ignore = "known gap: comment strippers are not string/comment aware"]
+fn an_escaped_quote_before_a_hash_in_a_python_string_does_not_end_the_string() {
+    let (rust, _) = real();
+    let py = py_faulted(
+        "lib.tessl_synchronize.restype = ctypes.c_int32\n",
+        "lib.tessl_synchronize.restype = ctypes.c_int32\n        _note = \"a\\\"#b\"; lib.tessl_synchronize.restype = ctypes.c_int64\n",
+    );
+    let p = fn_problems(&rust, &py, UNBOUND_EXPORTS);
+    assert!(mentions(&p, "tessl_synchronize: returns"), "{p:?}");
+}
+
+#[test]
+fn crlf_line_endings_in_the_binding_are_read_like_lf() {
+    let (rust, _) = real();
+    let py = parse_py_abi(&read(PY).replace('\n', "\r\n"));
+    assert!(fn_problems(&rust, &py, UNBOUND_EXPORTS).is_empty());
+}
+
+#[test]
+fn multibyte_text_in_comments_does_not_break_either_stripper() {
+    let (rust, py) = real();
+    let rs = format!("/* \u{1F980} \u{00e9} */\n// \u{4e2d}\u{6587}\n{}", read(RS));
+    let pys = format!("# \u{1F980} \u{00e9}\n{}  # \u{4e2d}\n", read(PY));
+    assert!(fn_problems(&parse_rust_abi(&rs), &parse_py_abi(&pys), UNBOUND_EXPORTS).is_empty());
+    let _ = (rust, py);
+}

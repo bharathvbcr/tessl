@@ -662,7 +662,7 @@ impl Weights<'_> {
 
     fn buf(&self, data: &[f32]) -> Result<GpuBuffer, String> {
         let b = self.rt.alloc_buffer(data.len().max(1) * 4)?;
-        b.write_f32(data);
+        b.try_write_f32(data).map_err(|e| format!("Weights::buf: {e}"))?;
         Ok(b)
     }
 
@@ -687,7 +687,9 @@ impl Weights<'_> {
         let t = self
             .rt
             .alloc_tensor_f32(&[in_features as usize, out_features as usize])?;
-        t.buffer.write_f32(&packed);
+        t.buffer
+            .try_write_f32(&packed)
+            .map_err(|e| format!("Weights::dense: {e}"))?;
         Ok(Dense {
             w: t,
             b: self.vector(&format!("{prefix}.bias"), out_features)?,
@@ -757,7 +759,9 @@ impl BertSparseModel {
 
         let word_data = ld.f32(&e("word_embeddings.weight"), &[vocab as usize, h as usize])?;
         let word = rt.alloc_tensor_f32(&[vocab as usize, h as usize])?;
-        word.buffer.write_f32(&word_data);
+        word.buffer
+            .try_write_f32(&word_data)
+            .map_err(|e| format!("BertSparseModel::load: word embeddings: {e}"))?;
         let decoder = match st.info(n.decoder) {
             Ok(_) => {
                 let d = ld.f32(n.decoder, &[vocab as usize, h as usize])?;
@@ -766,7 +770,9 @@ impl BertSparseModel {
                     None
                 } else {
                     let t = rt.alloc_tensor_f32(&[vocab as usize, h as usize])?;
-                    t.buffer.write_f32(&d);
+                    t.buffer
+                        .try_write_f32(&d)
+                        .map_err(|e| format!("BertSparseModel::load: decoder: {e}"))?;
                     Some(t)
                 }
             }

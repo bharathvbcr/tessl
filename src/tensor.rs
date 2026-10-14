@@ -231,6 +231,8 @@ impl GpuBuffer {
         self.map_host::<f32>()
     }
 
+    /// Test/bench convenience: panics on a busy or poisoned runtime. Library
+    /// code uses [`Self::try_contents_f32`].
     pub fn contents_f32(&self) -> HostMapping<'_, f32> {
         self.try_contents_f32().expect("exclusive host mapping failed")
     }
@@ -239,28 +241,53 @@ impl GpuBuffer {
         self.map_host::<u16>()
     }
 
+    /// Test/bench convenience: panics on a busy or poisoned runtime. Library
+    /// code uses [`Self::try_contents_u16`].
     pub fn contents_u16(&self) -> HostMapping<'_, u16> {
         self.try_contents_u16().expect("exclusive host mapping failed")
     }
 
+    /// Test/bench convenience: panics on a busy or poisoned runtime and on a
+    /// length mismatch. Library code uses [`Self::try_write_f32`].
     pub fn write_f32(&self, data: &[f32]) {
-        let mut dst = self.contents_f32();
-        assert_eq!(dst.len(), data.len());
+        self.try_write_f32(data).expect("write_f32");
+    }
+
+    /// [`Self::write_f32`] without panicking: a poisoned or busy runtime, and a
+    /// length that is not the buffer's logical `f32` count, are `Err`.
+    pub fn try_write_f32(&self, data: &[f32]) -> Result<(), String> {
+        let mut dst = self.try_contents_f32()?;
+        if dst.len() != data.len() {
+            return Err(format!(
+                "write_f32: {} elements for a buffer of {}",
+                data.len(),
+                dst.len()
+            ));
+        }
         dst.copy_from_slice(data);
+        Ok(())
     }
 
     /// Write into the leading `data.len()` floats (buffer may be oversized scratch).
+    ///
+    /// Test/bench convenience: panics on a busy or poisoned runtime and on
+    /// oversized `data`. Library code uses [`Self::try_write_f32_prefix`].
     pub fn write_f32_prefix(&self, data: &[f32]) {
-        let mut dst = self.contents_f32();
-        assert!(
-            data.len() <= dst.len(),
-            "write_f32_prefix: data {} > buf {}",
-            data.len(),
-            dst.len()
-        );
-        dst[..data.len()].copy_from_slice(data);
+        self.try_write_f32_prefix(data).expect("write_f32_prefix");
     }
 
+    /// [`Self::write_f32_prefix`] without panicking.
+    pub fn try_write_f32_prefix(&self, data: &[f32]) -> Result<(), String> {
+        let mut dst = self.try_contents_f32()?;
+        if data.len() > dst.len() {
+            return Err(format!("write_f32_prefix: data {} > buf {}", data.len(), dst.len()));
+        }
+        dst[..data.len()].copy_from_slice(data);
+        Ok(())
+    }
+
+    /// Test/bench convenience: panics on a busy or poisoned runtime. Library
+    /// code uses [`Self::try_read_f32`].
     pub fn read_f32(&self) -> Vec<f32> {
         self.try_read_f32().expect("exclusive host mapping failed")
     }
@@ -274,10 +301,25 @@ impl GpuBuffer {
     /// Write raw 16-bit elements. Named for bf16 because that was the only
     /// two-byte dtype when it was added; [`GpuBuffer::write_f16_bits`] is the
     /// same call under the name an f16 caller expects.
+    ///
+    /// Test/bench convenience: panics on a busy or poisoned runtime and on a
+    /// length mismatch. Library code uses [`Self::try_write_bf16_bits`].
     pub fn write_bf16_bits(&self, data: &[u16]) {
-        let mut dst = self.contents_u16();
-        assert_eq!(dst.len(), data.len());
+        self.try_write_bf16_bits(data).expect("write_bf16_bits");
+    }
+
+    /// [`Self::write_bf16_bits`] without panicking.
+    pub fn try_write_bf16_bits(&self, data: &[u16]) -> Result<(), String> {
+        let mut dst = self.try_contents_u16()?;
+        if dst.len() != data.len() {
+            return Err(format!(
+                "write_bf16_bits: {} elements for a buffer of {}",
+                data.len(),
+                dst.len()
+            ));
+        }
         dst.copy_from_slice(data);
+        Ok(())
     }
 
     /// Write raw IEEE binary16 elements.
@@ -288,31 +330,51 @@ impl GpuBuffer {
     /// different formats in one line and invites exactly the mix-up that
     /// produces plausible, wrong numbers.
     pub fn write_f16_bits(&self, data: &[u16]) {
-        self.write_bf16_bits(data);
+        self.try_write_bf16_bits(data).expect("write_f16_bits");
     }
 
     pub fn try_contents_u8(&self) -> Result<HostMapping<'_, u8>, String> {
         self.map_host::<u8>()
     }
 
+    /// Test/bench convenience: panics on a busy or poisoned runtime. Library
+    /// code uses [`Self::try_contents_u8`].
     pub fn contents_u8(&self) -> HostMapping<'_, u8> {
         self.try_contents_u8().expect("exclusive host mapping failed")
     }
 
+    /// Test/bench convenience: panics on a busy or poisoned runtime and on
+    /// oversized `data`. Library code uses [`Self::try_write_bytes`].
     pub fn write_bytes(&self, data: &[u8]) {
-        let mut dst = self.contents_u8();
-        assert!(data.len() <= dst.len());
+        self.try_write_bytes(data).expect("write_bytes");
+    }
+
+    /// [`Self::write_bytes`] without panicking.
+    pub fn try_write_bytes(&self, data: &[u8]) -> Result<(), String> {
+        let mut dst = self.try_contents_u8()?;
+        if data.len() > dst.len() {
+            return Err(format!(
+                "write_bytes: {} bytes for a buffer of {}",
+                data.len(),
+                dst.len()
+            ));
+        }
         dst[..data.len()].copy_from_slice(data);
+        Ok(())
     }
 
     pub fn try_contents_u32(&self) -> Result<HostMapping<'_, u32>, String> {
         self.map_host::<u32>()
     }
 
+    /// Test/bench convenience: panics on a busy or poisoned runtime. Library
+    /// code uses [`Self::try_contents_u32`].
     pub fn contents_u32(&self) -> HostMapping<'_, u32> {
         self.try_contents_u32().expect("exclusive host mapping failed")
     }
 
+    /// Test/bench convenience: panics on a busy or poisoned runtime and on a
+    /// length mismatch. Library code uses [`Self::try_write_u32`].
     pub fn write_u32(&self, data: &[u32]) {
         self.try_write_u32(data).expect("write_u32");
     }
@@ -335,8 +397,16 @@ impl GpuBuffer {
         Ok(())
     }
 
+    /// Test/bench convenience: panics on a busy or poisoned runtime. Library
+    /// code uses [`Self::try_read_u32`].
     pub fn read_u32(&self) -> Vec<u32> {
-        self.contents_u32().to_vec()
+        self.try_read_u32().expect("read_u32")
+    }
+
+    /// [`Self::read_u32`] without panicking: a poisoned or busy runtime is
+    /// `Err`.
+    pub fn try_read_u32(&self) -> Result<Vec<u32>, String> {
+        Ok(self.try_contents_u32()?.to_vec())
     }
 
     pub fn zero(&self) {

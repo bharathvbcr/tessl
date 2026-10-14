@@ -622,6 +622,20 @@ All notable changes to `tessl` are recorded here. The format follows
 
 ### Changed
 
+- **Tests that passed without checking now check.**
+  - `docs_name_real_tools` scans `README.md` and all of `docs/**`, and fails
+    with `file:line` on a dangling bench binary or repo path. Cross-repo
+    references are allowlisted, and the marker must be on the same line.
+  - The promoted-kernel set is derived from the kernel sources instead of a
+    literal 44.
+  - TensorOps probes assert instead of returning early.
+  - The genuinely hardware-dependent skips print `SKIPPED:`.
+  - `set_scan_slice`, `new_inference` and `set_max_tokens` have tests.
+  - The SharedEvent wait-budget test asserts the submitted value, a bounded
+    deadline, and both ends of `EVENT_WAIT_MS_RANGE`.
+  - A clean release build is recorded: 14.1 s min-of-3,
+    `bench/results/build_time_m5pro.txt`.
+
 - **Releases require green CI for the exact commit.** `release.yml` runs
   `scripts/require_green_ci.sh "$GITHUB_SHA" ci.yml metal-compile.yml` before
   anything publishes: a missing, running, failed or unqueryable run blocks the
@@ -1161,6 +1175,33 @@ All notable changes to `tessl` are recorded here. The format follows
   PyTorch from that data.
 
 ### Fixed
+
+- **C ABI: the owning thread is checked before any reference to a handle is
+  formed.** `guarded` and `free_handle` formed `&mut *handle` and then compared
+  the owner, so a refused foreign-thread call could alias the owner's live
+  `&mut`. The owner is now read through the raw pointer (`Handle::owner_of`)
+  first. The module doc states that a freed handle cannot be detected and that
+  a second free is undefined behaviour (`tests/capi_contract.rs`, GPU-free
+  where possible).
+- **`tessl_torch` handle ownership.** `Qwen35` and the per-thread runtime refuse
+  `copy`, `deepcopy` and pickle (a copy would double-free), gain an idempotent
+  `close()` and context-manager support, and raise `TesslPanic` on a panic
+  status, closing the object and dropping that thread's cached runtime (the Rust
+  model holds its own `Arc`). Integers bound for the C ABI (`chunk`, `step`,
+  `seed`, GDN dimensions, `accumulate`, AdamW `step`) are range-checked and
+  refuse floats and `bool`; float index tensors are refused, not truncated.
+  `close()` reports a failed free instead of swallowing it
+  (`python/tests/test_binding_host.py`, 21 host tests).
+- **Four GPU tests that had failed on `main`, unseen because hosted CI runs no
+  GPU tests, are corrected; no library code changed.**
+  `global_h512_with_scalars_pins_out_bf16_after_the_callback` compared the tiled
+  kernel `_with_scalars` dispatches against `flash_attn_global_h512`, which
+  routes `Tq > 1` to the rows kernel, so the two accumulated in a different
+  order. It now compares against `flash_attn_global_h512_tiled`, and it still
+  fails when the slot-12 override is removed. Two `tests/capi.rs` expectations
+  still said a step refused for its operands code discards the gradients;
+  4551470 made it keep them, as `tessl_qwen35_train_step` documents. A third
+  read gradients into transformers' shape instead of the storage shape.
 
 - **Busy host mappings return errors, not panics, in `upload_segments` and
   `DecodeIcb::mini_copy_chain`.** Both wrote a small host buffer through the

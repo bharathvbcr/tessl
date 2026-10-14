@@ -75,3 +75,32 @@ fn iters_flag_reaches_the_layer_table_label() {
     );
     assert!(!stdout.contains("median of 7"), "stale default in output:\n{stdout}");
 }
+
+#[test]
+fn config_json_that_is_a_directory_is_refused_before_any_gpu_work() {
+    let d = Scratch::new("bq35_cfg_dir");
+    std::fs::create_dir(d.0.join("config.json")).unwrap();
+    std::fs::write(d.0.join("a.safetensors"), b"").unwrap();
+    let p = d.0.to_str().unwrap();
+    assert_refused_before_gpu(&[&format!("--weights={p}"), "16"], "config.json");
+}
+
+#[test]
+fn unicode_and_spaced_weights_paths_are_refused_cleanly() {
+    let d = Scratch::new("bq35_ü ñ dir");
+    let p = d.0.to_str().unwrap();
+    assert_refused_before_gpu(&[&format!("--weights={p}"), "16"], "config.json");
+}
+
+#[test]
+fn bad_weights_with_a_paired_lane_is_refused_before_any_gpu_work() {
+    assert_refused_before_gpu(&["--weights=/nonexistent-tessl-dir", "--paired-attn"], "--weights");
+}
+
+#[test]
+fn a_later_bad_weights_flag_wins_over_nothing_and_a_later_bad_iters_still_refuses() {
+    assert_refused_before_gpu(&["--weights=/nonexistent-tessl-dir", "--iters=0", "16"], "--weights");
+    assert_refused_before_gpu(&["--iters=-1", "16"], "--iters");
+    assert_refused_before_gpu(&["--iters=", "16"], "--iters");
+    assert_refused_before_gpu(&["--iters=99999999999999999999999", "16"], "--iters");
+}

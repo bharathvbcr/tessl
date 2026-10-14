@@ -143,3 +143,78 @@ fn paired_bins_accepts_newline_separated_paths_with_spaces() {
     assert!(out.status.success(), "{so}{}", String::from_utf8_lossy(&out.stderr));
     assert!(so.contains("a") && so.contains("b"), "{so}");
 }
+
+// ---- adversarial round (tester) ----
+
+fn run_pb(bins: &str, rounds: &str, log: &Path) -> Output {
+    Command::new("bash")
+        .arg(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("bench/paired_bins.sh"))
+        .arg(rounds)
+        .arg(log)
+        .env("BENCH_BINS", bins)
+        .output()
+        .unwrap()
+}
+
+fn mk_metric_bin(d: &Path, name: &str, v: &str) -> PathBuf {
+    let p = d.join(name);
+    fs::write(&p, format!("#!/bin/sh\necho METRIC m {v}\n")).unwrap();
+    fs::set_permissions(&p, fs::Permissions::from_mode(0o755)).unwrap();
+    p
+}
+
+#[test]
+fn paired_bins_tolerates_trailing_newline_and_blank_lines() {
+    let d = scratch("pbnl");
+    let a = mk_metric_bin(&d, "bin a", "2");
+    let b = mk_metric_bin(&d, "bin b", "1");
+    let bins = format!("\na={}\n\n\nb={}\n\n", a.display(), b.display());
+    let out = run_pb(&bins, "2", &d.join("o.log"));
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    // Exactly two labels: the ratio column only appears with exactly two bins.
+    assert!(String::from_utf8_lossy(&out.stdout).contains("b/a"));
+}
+
+#[test]
+fn paired_bins_single_spaced_path_with_trailing_newline_is_one_entry() {
+    let d = scratch("pb1");
+    let a = mk_metric_bin(&d, "bin a", "2");
+    let out = run_pb(&format!("a={}\n", a.display()), "1", &d.join("o.log"));
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+}
+
+#[test]
+fn paired_bins_missing_binary_is_a_usage_error_not_a_metric() {
+    let d = scratch("pbmiss");
+    let a = mk_metric_bin(&d, "bin a", "2");
+    let bins = format!("a={}\nb={}/nope", a.display(), d.display());
+    let out = run_pb(&bins, "1", &d.join("o.log"));
+    assert_eq!(out.status.code(), Some(2));
+}
+
+#[test]
+fn paired_bins_whitespace_only_bins_is_rejected() {
+    let d = scratch("pbws");
+    let out = run_pb("   ", "1", &d.join("o.log"));
+    assert!(!out.status.success(), "no binaries must not look like a run");
+}
+
+#[test]
+fn paired_bins_a_binary_without_metrics_fails_the_run() {
+    let d = scratch("pbnom");
+    let p = d.join("quiet");
+    fs::write(&p, "#!/bin/sh\necho hi\n").unwrap();
+    fs::set_permissions(&p, fs::Permissions::from_mode(0o755)).unwrap();
+    let out = run_pb(&format!("q={}", p.display()), "1", &d.join("o.log"));
+    assert_eq!(out.status.code(), Some(1));
+}
+
+#[test]
+fn a_symlinked_or_non_utf8_kernel_name_still_counts_once() {
+    // Sources reached through a symlink are still sources.
+    let d = scratch("sym");
+    let m = manifest_with(&d, 3);
+    std::os::unix::fs::symlink(m.join("kernels/k0.metal"), m.join("kernels/link.metal")).unwrap();
+    let out = run(&fake_bs(&d, 4, 0, false, 0), &m);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+}

@@ -110,6 +110,7 @@ Each lane worked in its own worktree on a branch from `main` or `gp/wave1`. Ever
 | 4 | `gp/host-access-ban` | ft-f5d97431 (AC4) | Fallible twins added; every non-test library call converted, loads included; `tests/host_access_ban.rs` (12 violations before the change; catches a planted call; ignores test modules); no load-time regression. Weak spots: calls on a receiver named `st` are exempt by name, and `.zero()` is not covered. |
 | 4 | `gp/owner-decisions` | ft-06dcbdff A1, ft-691a7474 (2 decisions), new issues | AdamW wording; `add_metallib` refuses duplicates (no tessl or ojas caller shadows a name: the compiled overlays define only `ple_*`, `persistent_interp_*` and `ojas_*`); `ci_local` gains `--no-fail-fast` and the python tests; MLX lane scored as tf32-class (a real `--parity-dir` run scored it at 0.37x of budget, with no abort); release-gate docs; SC2012 fixed. |
 | 4 | `gp/bert-goldens` | ft-691a7474 (Bert) | Generator + manifest + `tests/bert_model.rs` (BERT and DistilBERT; bound fixed before the first run; about 3e-6 error against a 2e-4 bound; a swapped-layer test and a GELU-constant fault are both caught). |
+| 5 | `gp/gdn-windows` | ft-5622b8a3 | The GDN training kernels read q/k/v through `(ld, off)` windows and share key heads (`h / (Hv/Hk)`), with new `*_windowed` entry points. The dense entry points delegate to them, so ojas-metal and the C ABI are unchanged (additive; no ojas branch needed). `copy_cols`, `repeat_heads` and `sum_heads` are gone from the GDN step. Gradients are bit-identical (253 hashes per fixture). The paired step bench is within ±1% at r=1 and 4-5% faster at r=2. The adversarial pass found no break (64-bit indices confirmed on a 17 GB buffer; conservative aliasing). It also found a gap, now fixed: a dense row width past u32 is refused. The full ci_local run showed one source-text test pinned to the old index line; it now pins the new 64-bit window offsets and catches a planted 32-bit `tok`. |
 
 Diff `main..gp/wave1`: see `git diff --stat main..gp/wave1`; the CHANGELOG heading merge alone accounts for about 885 changed lines.
 
@@ -127,7 +128,7 @@ When you are ready to update the board, these are the moves the evidence support
 
 | Card | Why |
 |---|---|
-| ft-5622b8a3 GDN `(ld, off)` windows | Approved on delegation; now wave 5 (`gp/gdn-windows`), built additively so ojas-metal's direct callers keep working. |
+| ft-5622b8a3 GDN `(ld, off)` windows | Done in wave 5. |
 | ft-dc1fa0a3 per-entry host mapping | Decided Rust-only. Blocked on another session's uncommitted `src/qwen35_adamw.rs` edits, and its ojas side has to land in the same work. |
 | ft-a2151b52, ft-4efcd42f, ft-4dc74fad (bench part) | Benchmarks need an idle GPU. The lock was contended all session and benching beside other sessions would be contaminated. ft-a2151b52 also needs the real 2B weights at 8K. |
 | ft-a9661824 bf16 default update rule | Decided (stochastic rounding); another session is implementing it, uncommitted in the main checkout. |
@@ -136,7 +137,7 @@ When you are ready to update the board, these are the moves the evidence support
 
 ## Benchmarks
 
-No hot path changed: no kernel, GEMM, attention, training-step or decode-loop code was touched. The only library changes are host-side, in one-off setup paths (`upload_segments` now uses `alloc_buffer_from_u32`, and `mini_copy_chain` is a test/smoke ICB builder) and in C-ABI argument checks. So there is no benchmark delta to report, and none was taken on the contended GPU. The one new measurement is the clean build: 14.10 s min-of-3, `bench/results/build_time_m5pro.txt`.
+Waves 1-4 changed no hot path: no kernel, GEMM, attention, training-step or decode-loop code was touched. The only library changes are host-side, in one-off setup paths (`upload_segments` now uses `alloc_buffer_from_u32`, and `mini_copy_chain` is a test/smoke ICB builder) and in C-ABI argument checks. So there is no benchmark delta to report, and none was taken on the contended GPU. Wave 5 changed the GDN training kernels; its paired step bench (`bench/results/qwen35_gdn_windows_m5pro.txt`, frozen binaries, interleaved, 5 rounds, min of medians, AC power) shows 2B r=1 at 0.974-1.004x and 4B-config r=2 at 0.946-0.962x of before, with no regression over 5%. The other new measurement is the clean build: 14.10 s min-of-3, `bench/results/build_time_m5pro.txt`.
 
 ## New tasks to file (grouped by concern)
 
@@ -182,7 +183,7 @@ No hot path changed: no kernel, GEMM, attention, training-step or decode-loop co
 
 - **ft-a96618241 (bf16 default):** being implemented by another session. Its 348-line diff sits uncommitted in the main checkout and applies cleanly on gp/wave1 (`git apply --check`); a copy is in this session's scratchpad. It is not committed here, because it is not this session's work.
 - **ft-dc1fa0a3:** waits for that session's `src/qwen35_adamw.rs` edits to be committed, and needs its ojas side in the same work.
-- **ft-5622b8a3:** in progress as wave 5, `gp/gdn-windows`.
+- **ft-5622b8a3:** done in wave 5 and merged.
 - **Benchmark cards** (ft-a2151b52, ft-4efcd42f, ft-4dc74fad's T=2048 clipped run): need an idle GPU and the real 2B weights at 8K.
 - **`main`:** fast-forwarded to gp/wave1 on origin only when hosted CI is green. The local `main` checkout is left untouched because of the uncommitted work above. Whoever owns that work: `git stash && git pull --ff-only && git stash pop` (the patch applies cleanly).
 8. **Host-access ban gaps:** the `st` receiver exemption is name-based, and `GpuBuffer::zero()` and the `Tensor` view `read_f32`/`write_f32` are not covered.

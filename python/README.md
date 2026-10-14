@@ -198,6 +198,13 @@ python3 -m unittest discover -s python/tests -v
 `python/tests/test_binding_host.py` needs no GPU (a recording stand-in
 replaces the library): `python3 -m unittest python/tests/test_binding_host.py`.
 
+Where they run: `scripts/ci_local.sh` runs `test_binding_host.py` on every
+invocation with the torch oracle python (and fails if there is none). It runs
+the rest of `python/tests` (`test_cross_entropy.py`, `test_gdn.py`,
+`test_qwen35.py`: GPU and MPS, transformers) only under the machine-wide heavy
+lock (`MAC_HEAVY_LABEL` set by `tools/mac_heavy.sh`); otherwise it prints a
+`SKIPPED` line. GitHub's CI does not run `python/tests`.
+
 `TESSL_LIB` overrides where `libtessl.dylib` is loaded from. The library
 reads its kernels from the metallib path baked in when it was built, so keep
 that build's `target/` directory. The tests compare against

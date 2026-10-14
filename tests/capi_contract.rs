@@ -305,7 +305,9 @@ fn strip_py_comments(src: &str) -> String {
                 out.push(ch);
                 i += 1;
                 while i < c.len() && c[i] != ch && c[i] != '\n' {
-                    if c[i] == '\\' && i + 1 < c.len() && c[i + 1] != '\n' {
+                    if c[i] == '\\' && i + 1 < c.len() {
+                        // An escape, or a backslash-newline continuation:
+                        // both chars belong to the string.
                         out.push(c[i]);
                         i += 1;
                     }
@@ -323,6 +325,20 @@ fn strip_py_comments(src: &str) -> String {
         }
     }
     out
+}
+
+/// True when the `r` at `i` continues an identifier. A `b` directly before it
+/// is the byte-string prefix (`br"..."`), not an identifier, unless that `b`
+/// itself follows an identifier char (`ab r"` cannot occur, but `abr#` is one).
+fn prefix_is_ident(c: &[char], i: usize) -> bool {
+    let ident = |j: Option<usize>| {
+        j.and_then(|j| c.get(j))
+            .is_some_and(|p| p.is_alphanumeric() || *p == '_')
+    };
+    match i.checked_sub(1) {
+        Some(b) if c[b] == 'b' => ident(b.checked_sub(1)),
+        p => ident(p),
+    }
 }
 
 /// Drops Rust `//` and (nesting) `/* */` comments, keeping newlines. One
@@ -358,10 +374,7 @@ fn strip_line_comments(src: &str) -> String {
                     break;
                 }
             }
-        } else if c[i] == 'r'
-            && matches!(at(i + 1), Some('"' | '#'))
-            && !at(i.wrapping_sub(1)).is_some_and(|p| p.is_alphanumeric() || p == '_')
-        {
+        } else if c[i] == 'r' && matches!(at(i + 1), Some('"' | '#')) && !prefix_is_ident(&c, i) {
             // Raw string: r"..." or r#"..."#.
             let mut j = i + 1;
             while at(j) == Some('#') {
@@ -859,11 +872,7 @@ fn offset_problems(
 /// `_pack_` or `_anonymous_` would change ctypes's layout rules and make
 /// `py_offsets` wrong without any field changing.
 fn layout_guard_problem(py_src: &str) -> Option<String> {
-    let code: String = py_src
-        .lines()
-        .map(|l| l.find('#').map_or(l, |i| &l[..i]))
-        .collect::<Vec<_>>()
-        .join("\n");
+    let code = strip_py_comments(py_src);
     ["_pack_", "_anonymous_"]
         .into_iter()
         .find(|k| code.contains(k))
@@ -1499,7 +1508,6 @@ fn a_python_hash_inside_a_single_quoted_string_is_not_a_comment() {
 }
 
 #[test]
-#[ignore = "known gap: strip_py_comments ends a single-quoted string at a backslash-newline continuation"]
 fn a_python_backslash_continued_string_keeps_its_hash_inside() {
     let (rust, _) = real();
     let py = py_faulted(
@@ -1508,6 +1516,26 @@ fn a_python_backslash_continued_string_keeps_its_hash_inside() {
     );
     let p = fn_problems(&rust, &py, UNBOUND_EXPORTS);
     assert!(mentions(&p, "tessl_synchronize: returns"), "{p:?}");
+}
+
+#[test]
+fn a_byte_raw_string_hides_a_trailing_comment_and_what_follows() {
+    // Read right, the raw string ends at its second quote and `// ...` is a
+    // comment, so the phantom is hidden. Mis-lexed as a plain string it shows.
+    let p = rs_with(&format!("const R: &[u8] = br\"\\\"; // \" {PHANTOM_FN}"));
+    assert!(!mentions(&p, "tessl_phantom"), "{p:?}");
+}
+
+#[test]
+fn an_identifier_ending_in_br_is_not_a_byte_raw_string() {
+    let p = rs_with(&format!("fn abr(x: u8) {{}} const S: &str = \"\\\"; {PHANTOM_FN}"));
+    assert!(mentions(&p, "tessl_phantom: in src/capi.rs"), "{p:?}");
+}
+
+#[test]
+fn a_layout_keyword_after_a_hash_inside_a_string_is_still_code() {
+    let src = "class _A(ctypes.Structure):\n    _n = '#'; _pack_ = 1\n";
+    assert!(layout_guard_problem(src).is_some());
 }
 
 #[test]

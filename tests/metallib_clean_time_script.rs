@@ -42,7 +42,12 @@ fn fake_bs(dir: &Path, airs: usize, keys: usize, no_lib: bool, exit: i32) -> Pat
 }
 
 fn run(bs: &Path, manifest: &Path) -> Output {
-    Command::new("bash").arg(script()).arg(bs).arg(manifest).output().unwrap()
+    Command::new("bash")
+        .arg(script())
+        .arg(bs)
+        .arg(manifest)
+        .output()
+        .unwrap()
 }
 
 /// A manifest whose `kernels/` holds `n` top-level `.metal` sources (plus one
@@ -196,7 +201,8 @@ fn paired_bins_missing_binary_is_a_usage_error_not_a_metric() {
 fn paired_bins_whitespace_only_bins_is_rejected() {
     let d = scratch("pbws");
     let out = run_pb("   ", "1", &d.join("o.log"));
-    assert!(!out.status.success(), "no binaries must not look like a run");
+    assert_eq!(out.status.code(), Some(2), "no binaries must be a usage error");
+    assert!(String::from_utf8_lossy(&out.stderr).contains("names no binaries"));
 }
 
 #[test]
@@ -210,11 +216,47 @@ fn paired_bins_a_binary_without_metrics_fails_the_run() {
 }
 
 #[test]
-fn a_symlinked_or_non_utf8_kernel_name_still_counts_once() {
+fn a_symlinked_kernel_source_counts_as_a_source() {
     // Sources reached through a symlink are still sources.
     let d = scratch("sym");
     let m = manifest_with(&d, 3);
     std::os::unix::fs::symlink(m.join("kernels/k0.metal"), m.join("kernels/link.metal")).unwrap();
     let out = run(&fake_bs(&d, 4, 0, false, 0), &m);
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+}
+
+#[test]
+fn zero_kernel_sources_is_an_error_with_no_metric() {
+    let d = scratch("zero");
+    let out = run(&fake_bs(&d, 0, 0, false, 0), &manifest_with(&d, 0));
+    assert_eq!(out.status.code(), Some(1));
+    assert!(!String::from_utf8_lossy(&out.stdout).contains("METRIC"));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("no top-level .metal"));
+}
+
+#[test]
+fn a_directory_named_like_a_kernel_is_not_a_source() {
+    let d = scratch("dirmetal");
+    let m = manifest_with(&d, 3);
+    fs::create_dir(m.join("kernels/fake.metal")).unwrap();
+    let out = run(&fake_bs(&d, 3, 0, false, 0), &m);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+}
+
+#[test]
+fn a_metallib_outside_the_scratch_out_dir_is_rejected() {
+    let d = scratch("stale");
+    let lib = d.join("stale.metallib");
+    fs::write(&lib, "x").unwrap();
+    let bs = d.join("fake bs");
+    let body = format!(
+        "#!/bin/sh\ni=0; while [ $i -lt 3 ]; do i=$((i+1)); : > \"$OUT_DIR/k$i.air\"; done\necho \"cargo:rustc-env=TESSL_METALLIB={}\"\n",
+        lib.display()
+    );
+    fs::write(&bs, body).unwrap();
+    fs::set_permissions(&bs, fs::Permissions::from_mode(0o755)).unwrap();
+    let out = run(&bs, &manifest_with(&d, 3));
+    assert_eq!(out.status.code(), Some(1));
+    assert!(!String::from_utf8_lossy(&out.stdout).contains("METRIC"));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("not under the scratch OUT_DIR"));
 }

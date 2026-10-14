@@ -46,9 +46,17 @@ end=$(perl -MTime::HiRes=time -e 'printf "%.3f", time')
 
 metallib=$(sed -n 's/^cargo:rustc-env=TESSL_METALLIB=//p' "$log" | tail -1)
 [[ -n $metallib && -f $metallib ]] || { echo "no metallib at '$metallib'" >&2; exit 1; }
+# The artifact must come from this run's scratch OUT_DIR, not a stale or
+# prebuilt path the script happened to print.
+case $metallib in
+  "$out"/o/*) ;;
+  *) echo "metallib '$metallib' is not under the scratch OUT_DIR '$out/o'" >&2; exit 1 ;;
+esac
 # One .air per top-level kernels/*.metal (the build script does not compile
 # subdirectories), so the expected count follows the sources.
-want=$(find "$manifest/kernels" -maxdepth 1 -name '*.metal' | wc -l | tr -d ' ')
+# Regular files and symlinks (build.rs follows them); a directory named x.metal is not a source.
+want=$(find "$manifest/kernels" -maxdepth 1 -name '*.metal' \( -type f -o -type l \) | wc -l | tr -d ' ')
+((want > 0)) || { echo "$manifest/kernels has no top-level .metal sources" >&2; exit 1; }
 airs=$(find "$out/o" -name '*.air' | wc -l | tr -d ' ')
 [[ $airs -eq $want ]] || { echo "expected $want .air, found $airs" >&2; exit 1; }
 # The cache-key files exist only in the parallel build script; when present

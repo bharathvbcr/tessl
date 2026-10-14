@@ -34,6 +34,11 @@ for pair in ${pairs[@]+"${pairs[@]}"}; do
   labels+=("${pair%%=*}")
   paths+=("${pair#*=}")
 done
+if ((${#paths[@]} == 0)); then
+  echo "BENCH_BINS names no binaries" >&2
+  echo "usage: BENCH_BINS=\"before=PATH after=PATH\" $0 ROUNDS OUT ARGS..." >&2
+  exit 2
+fi
 for p in "${paths[@]}"; do
   [[ -x $p ]] || { echo "$p is missing or not executable" >&2; exit 2; }
 done

@@ -155,10 +155,12 @@ fn every_runtime_entry_refuses_a_foreign_thread_before_looking_at_its_arguments(
 
 /// `None` when the binding's `_ABI_VERSION` line is `ver`.
 fn abi_line_problem(src: &str, ver: u32) -> Option<String> {
+    let src = strip_py_comments(src);
     let Some(line) = src.lines().find(|l| l.starts_with("_ABI_VERSION = ")) else {
         return Some("no `_ABI_VERSION = ` line in the binding".to_string());
     };
     let want = format!("_ABI_VERSION = {ver}");
+    let line = line.trim_end();
     (line != want).then(|| format!("binding says `{line}`, TESSL_ABI_VERSION says `{want}`"))
 }
 
@@ -270,8 +272,50 @@ fn bracketed(s: &str, open: usize) -> (&str, usize) {
     );
 }
 
-fn strip_line_comments(src: &str) -> String {
+/// Drops `# ...` to the end of each line, leaving `#` inside a one-line
+/// string literal alone. Line structure is kept so later offsets still line up.
+fn strip_py_comments(src: &str) -> String {
     src.lines()
+        .map(|l| {
+            let mut quote = None;
+            for (i, c) in l.char_indices() {
+                match (quote, c) {
+                    (None, '#') => return &l[..i],
+                    (None, '"' | '\'') => quote = Some(c),
+                    (Some(q), _) if c == q => quote = None,
+                    _ => {}
+                }
+            }
+            l
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Drops `/* ... */` (which nests in Rust), keeping newlines.
+fn strip_block_comments(src: &str) -> String {
+    let (mut out, mut depth, mut rest) = (String::new(), 0usize, src);
+    while !rest.is_empty() {
+        if rest.starts_with("/*") {
+            depth += 1;
+            rest = &rest[2..];
+        } else if depth > 0 && rest.starts_with("*/") {
+            depth -= 1;
+            rest = &rest[2..];
+        } else {
+            let c = rest.chars().next().unwrap();
+            if depth == 0 || c == '\n' {
+                out.push(c);
+            }
+            rest = &rest[c.len_utf8()..];
+        }
+    }
+    out
+}
+
+fn strip_line_comments(src: &str) -> String {
+    strip_block_comments(src)
+        .lines()
         .map(|l| l.find("//").map_or(l, |i| &l[..i]))
         .collect::<Vec<_>>()
         .join("\n")
@@ -459,7 +503,7 @@ fn inline_aliases(src: &str) -> String {
 }
 
 fn parse_py_abi(src: &str) -> PyAbi {
-    let src: &str = &inline_aliases(src);
+    let src: &str = &inline_aliases(&strip_py_comments(src));
     // Module-level constants sit at column 0 as `_NAME = 6`.
     let consts = int_consts(src, "");
 
@@ -1058,8 +1102,8 @@ fn an_abi_version_mismatch_is_caught() {
 }
 
 // ---------------------------------------------------------------------------
-// Adversarial cases from the review of this checker. The `#[ignore]`d ones are
-// known gaps: each fails today and names the input that slips through.
+// Adversarial cases from the review of this checker: comment handling, layout
+// edges and the void-pointer wildcard.
 
 #[test]
 fn a_zero_width_array_and_empty_struct_have_no_size() {
@@ -1117,7 +1161,6 @@ fn a_swapped_pair_of_equal_width_arguments_is_invisible_by_design() {
 }
 
 #[test]
-#[ignore = "known gap (loud): a trailing `# comment` on a restype/argtypes line panics the parser"]
 fn a_python_comment_ending_a_line_does_not_leak_into_the_type() {
     let (rust, _) = real();
     let py = py_faulted(
@@ -1128,7 +1171,6 @@ fn a_python_comment_ending_a_line_does_not_leak_into_the_type() {
 }
 
 #[test]
-#[ignore = "known gap (loud): a trailing comment on the _ABI_VERSION line is reported as a mismatch"]
 fn an_abi_line_with_a_trailing_comment_is_still_read() {
     let src = format!("_ABI_VERSION = {TESSL_ABI_VERSION}  # keep in step\n");
     assert_eq!(abi_line_problem(&src, TESSL_ABI_VERSION), None);
@@ -1142,7 +1184,6 @@ fn a_leading_zero_abi_literal_is_not_the_same_line() {
 }
 
 #[test]
-#[ignore = "known gap: a commented-out restype line is parsed as a live declaration"]
 fn a_commented_out_restype_is_reported_not_assumed() {
     let (rust, _) = real();
     let py = py_faulted(
@@ -1154,7 +1195,6 @@ fn a_commented_out_restype_is_reported_not_assumed() {
 }
 
 #[test]
-#[ignore = "known gap: a commented-out argtypes line is parsed as a live declaration"]
 fn a_commented_out_argtypes_is_a_missing_declaration() {
     let (rust, _) = real();
     let src = fault(
@@ -1167,7 +1207,6 @@ fn a_commented_out_argtypes_is_a_missing_declaration() {
 }
 
 #[test]
-#[ignore = "known gap: a block-commented export in capi.rs is parsed as a live export"]
 fn a_block_commented_export_is_not_an_export() {
     let (_, py) = real();
     let rs = format!(

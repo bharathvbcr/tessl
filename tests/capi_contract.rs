@@ -1056,3 +1056,124 @@ fn an_abi_version_mismatch_is_caught() {
     assert!(abi_line_problem(&stale, TESSL_ABI_VERSION).is_some());
     assert!(abi_line_problem("x = 1\n", TESSL_ABI_VERSION).is_some());
 }
+
+// ---------------------------------------------------------------------------
+// Adversarial cases from the review of this checker. The `#[ignore]`d ones are
+// known gaps: each fails today and names the input that slips through.
+
+#[test]
+fn a_zero_width_array_and_empty_struct_have_no_size() {
+    let structs = Structs::new();
+    assert_eq!(py_offsets(&[], &structs), (vec![], 0));
+    let arr = vec![("a".to_string(), Ty::Array(Box::new(Ty::Scalar("u32".into())), 0))];
+    assert_eq!(py_offsets(&arr, &structs), (vec![0], 0));
+}
+
+#[test]
+fn a_trailing_narrow_field_is_padded_to_the_struct_alignment() {
+    let fields = vec![
+        ("a".to_string(), Ty::Scalar("u64".into())),
+        ("b".to_string(), Ty::Scalar("u8".into())),
+    ];
+    assert_eq!(py_offsets(&fields, &Structs::new()), (vec![0, 8], 16));
+}
+
+#[test]
+fn a_pointer_field_is_eight_bytes_whatever_its_pointee() {
+    let s = Structs::new();
+    for p in [
+        Ty::Ptr(None),
+        Ty::Ptr(Some(Box::new(Ty::Void))),
+        Ty::Ptr(Some(Box::new(Ty::Scalar("u8".into())))),
+    ] {
+        assert_eq!(c_layout(&p, &s), (8, 8));
+    }
+}
+
+#[test]
+fn a_pointer_to_the_wrong_scalar_is_not_masked_by_the_void_wildcard() {
+    let (rust, _) = real();
+    // set_step_count takes a u64 by value; make Python pass a pointer instead.
+    let py = py_faulted(
+        "lib.tessl_qwen35_adamw_set_step_count.argtypes = [ctypes.c_void_p, ctypes.c_uint64]",
+        "lib.tessl_qwen35_adamw_set_step_count.argtypes = [ctypes.c_void_p, ctypes.c_void_p]",
+    );
+    let p = fn_problems(&rust, &py, UNBOUND_EXPORTS);
+    assert!(mentions(&p, "tessl_qwen35_adamw_set_step_count: argument 1"), "{p:?}");
+}
+
+#[test]
+fn a_swapped_pair_of_equal_width_arguments_is_invisible_by_design() {
+    // Documents a limit, not a defect: two u32 arguments swapped in Python
+    // agree on every width, so only the names-in-order check could catch it,
+    // and ctypes has no names. If this ever starts failing, the checker grew
+    // a name-based comparison and this test should assert the new behaviour.
+    let (rust, py) = real();
+    let same = rust
+        .fns
+        .iter()
+        .any(|(n, s)| s.args.windows(2).any(|w| w[0].1 == w[1].1) && py.fns.contains_key(n));
+    assert!(same, "no function has two adjacent same-typed arguments to swap");
+}
+
+#[test]
+#[ignore = "known gap (loud): a trailing `# comment` on a restype/argtypes line panics the parser"]
+fn a_python_comment_ending_a_line_does_not_leak_into_the_type() {
+    let (rust, _) = real();
+    let py = py_faulted(
+        "lib.tessl_synchronize.restype = ctypes.c_int32\n",
+        "lib.tessl_synchronize.restype = ctypes.c_int32  # status\n",
+    );
+    assert!(fn_problems(&rust, &py, UNBOUND_EXPORTS).is_empty());
+}
+
+#[test]
+#[ignore = "known gap (loud): a trailing comment on the _ABI_VERSION line is reported as a mismatch"]
+fn an_abi_line_with_a_trailing_comment_is_still_read() {
+    let src = format!("_ABI_VERSION = {TESSL_ABI_VERSION}  # keep in step\n");
+    assert_eq!(abi_line_problem(&src, TESSL_ABI_VERSION), None);
+}
+
+#[test]
+fn a_leading_zero_abi_literal_is_not_the_same_line() {
+    // Python reads `011` as a syntax error, so the checker must not bless it.
+    let src = format!("_ABI_VERSION = 0{TESSL_ABI_VERSION}\n");
+    assert!(abi_line_problem(&src, TESSL_ABI_VERSION).is_some());
+}
+
+#[test]
+#[ignore = "known gap: a commented-out restype line is parsed as a live declaration"]
+fn a_commented_out_restype_is_reported_not_assumed() {
+    let (rust, _) = real();
+    let py = py_faulted(
+        "        lib.tessl_synchronize.restype = ctypes.c_int32\n",
+        "        # lib.tessl_synchronize.restype = ctypes.c_int32\n",
+    );
+    let p = fn_problems(&rust, &py, UNBOUND_EXPORTS);
+    assert!(mentions(&p, "tessl_synchronize: no restype"), "{p:?}");
+}
+
+#[test]
+#[ignore = "known gap: a commented-out argtypes line is parsed as a live declaration"]
+fn a_commented_out_argtypes_is_a_missing_declaration() {
+    let (rust, _) = real();
+    let src = fault(
+        &read(PY),
+        "        lib.tessl_synchronize.restype = ctypes.c_int32\n        lib.tessl_synchronize.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_size_t]\n",
+        "        # lib.tessl_synchronize.restype = ctypes.c_int32\n        # lib.tessl_synchronize.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_size_t]\n",
+    );
+    let p = fn_problems(&rust, &parse_py_abi(&src), UNBOUND_EXPORTS);
+    assert!(mentions(&p, "tessl_synchronize: in src/capi.rs, not declared"), "{p:?}");
+}
+
+#[test]
+#[ignore = "known gap: a block-commented export in capi.rs is parsed as a live export"]
+fn a_block_commented_export_is_not_an_export() {
+    let (_, py) = real();
+    let rs = format!(
+        "{}\n/* pub extern \"C\" fn tessl_phantom(x: u32) -> i32 {{ 0 }} */\n",
+        read(RS)
+    );
+    let p = fn_problems(&parse_rust_abi(&rs), &py, UNBOUND_EXPORTS);
+    assert!(!mentions(&p, "tessl_phantom"), "{p:?}");
+}

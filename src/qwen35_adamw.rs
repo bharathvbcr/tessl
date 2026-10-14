@@ -85,7 +85,11 @@ impl Default for AdamWHyper {
 /// How a parameter takes its update (see the module docs).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum UpdateRule {
-    /// An f32 model: every parameter updated in f32, torch's bits.
+    /// An f32 model: every parameter updated in f32. The moments and the
+    /// denominator follow torch's `_single_tensor_adam` order; the final update
+    /// is `w * decay + (-lr) * (m / denom)` (`kernels/qwen35_adamw_math.h`),
+    /// which can differ from torch's `addcdiv_` by up to 1 ulp per parameter,
+    /// so it is not bit-identical to torch.
     F32,
     /// A bf16 model: an f32 master of each bf16 weight is updated, and the
     /// weight is the master rounded to nearest.

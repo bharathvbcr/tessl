@@ -850,6 +850,11 @@ fn library_from_data(
         .map_err(|e| format!("{what}: {e}"))
 }
 
+/// The entry-point names a library defines.
+fn library_function_names(library: &ProtocolObject<dyn MTLLibrary>) -> std::collections::HashSet<String> {
+    library.functionNames().iter().map(|n| n.to_string()).collect()
+}
+
 impl GpuRuntime {
     pub(crate) fn acquire_access(&self) -> Result<RuntimeAccess, String> {
         if self.poison.is_set() {
@@ -1528,7 +1533,9 @@ impl GpuRuntime {
     }
 
     /// Register an additional metallib (Gemma kernels, etc.). Pipeline names
-    /// must be unique across primary + overlays.
+    /// must be unique across primary + overlays: a library that defines an
+    /// entry point already resolvable is refused (see
+    /// [`Self::add_metallib_bytes`]).
     pub fn add_metallib(&self, path: &Path) -> Result<(), String> {
         let path_str = path
             .to_str()
@@ -1537,7 +1544,7 @@ impl GpuRuntime {
             return Err(format!("metallib missing at {path_str}"));
         }
         let bytes = std::fs::read(path).map_err(|e| format!("read overlay metallib {path_str}: {e}"))?;
-        self.add_metallib_bytes(&bytes)
+        self.add_overlay(&bytes, path_str)
     }
 
     /// Register an additional metallib from bytes already in memory.
@@ -1545,14 +1552,43 @@ impl GpuRuntime {
     /// This is the relocatable form of [`Self::add_metallib`]: an adopter that
     /// embeds its own overlay (`include_bytes!`) passes the slice here and does
     /// not need the build directory to still exist. Pipeline names must be
-    /// unique across the primary library and every overlay.
+    /// unique across the primary library and every overlay: `pipeline()`
+    /// resolves the primary first and then overlays in registration order, so
+    /// a repeated name would be silently unreachable. Such a library is
+    /// refused with an error naming the entry points and both libraries, and
+    /// nothing is registered.
     pub fn add_metallib_bytes(&self, bytes: &[u8]) -> Result<(), String> {
+        self.add_overlay(bytes, "overlay bytes")
+    }
+
+    /// `add_metallib_bytes`, with `label` naming the new library in a
+    /// duplicate-name error.
+    fn add_overlay(&self, bytes: &[u8], label: &str) -> Result<(), String> {
         if bytes.is_empty() {
             return Err("load overlay metallib: metallib is empty".into());
         }
         let data = DispatchData::from_bytes(bytes);
         let library = library_from_data(&self.device, &data, "load overlay metallib")?;
         let mut libs = self.overlay_libraries.lock().map_err(|e| e.to_string())?;
+        let new_names = library_function_names(&library);
+        let existing = std::iter::once(("the primary metallib".to_string(), &self.library)).chain(
+            libs.iter()
+                .enumerate()
+                .map(|(i, lib)| (format!("overlay #{}", i + 1), lib)),
+        );
+        for (owner, lib) in existing {
+            let have = library_function_names(lib);
+            let mut dups: Vec<&String> = new_names.iter().filter(|n| have.contains(*n)).collect();
+            if !dups.is_empty() {
+                dups.sort();
+                let names: Vec<&str> = dups.iter().map(|n| n.as_str()).collect();
+                return Err(format!(
+                    "overlay metallib {label} defines entry point(s) [{}] already defined by {owner}; \
+                     pipeline names must be unique across the primary library and every overlay",
+                    names.join(", ")
+                ));
+            }
+        }
         libs.push(library);
         Ok(())
     }

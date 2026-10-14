@@ -85,7 +85,15 @@ jobs:
       - name: Check every Qwen3.5 / training / encoder entry point is exported by the built metallib
         run: |
           set -euo pipefail
-          metallib="$(ls -t target/release/build/*/out/default-*.metallib | head -n 1)"
+          # Newest build's artifact (a `for` glob, not `ls -t`: shellcheck SC2012).
+          metallib=""
+          for candidate in target/release/build/*/out/default-*.metallib; do
+            if [[ -z "$metallib" || "$candidate" -nt "$metallib" ]]; then metallib="$candidate"; fi
+          done
+          if [[ ! -f "$metallib" ]]; then
+            echo "::error::no target/release/build/*/out/default-*.metallib was built"
+            exit 1
+          fi
           echo "metallib: $metallib"
           # To a file first: `strings | grep -q` under pipefail can report a
           # false miss when grep exits early and strings takes SIGPIPE.

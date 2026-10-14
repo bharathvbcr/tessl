@@ -49,8 +49,26 @@ echo "==> parity harness, host-only (adversarial scorer, ladder, tile-audit and 
 # or a required section that did not run) stops the script; GPU sections are skipped visibly.
 "$ORACLE_PY" -I bench/test_parity_harness.py --pure
 
-echo "==> test (release, serialized)"
-cargo test --release -- --test-threads=1
+echo "==> torch binding host tests (python/tests/test_binding_host.py; no GPU, needs the torch oracle)"
+# The same oracle python as above: a missing torch already stopped the script, so this
+# cannot be skipped silently. The recording stand-in replaces libtessl; nothing is built.
+"$ORACLE_PY" -m unittest python/tests/test_binding_host.py -v
+
+echo "==> torch binding GPU tests (python/tests: test_cross_entropy, test_gdn, test_qwen35)"
+# These load target/release/libtessl.dylib (built above) and run on MPS next to the Metal
+# runtime, so they belong under the machine-wide heavy-job lock, which exports MAC_HEAVY_LABEL.
+# Outside the lock they are not run, and that is printed rather than left to read as a pass.
+if [[ -n "${MAC_HEAVY_LABEL:-}" ]]; then
+  "$ORACLE_PY" -m unittest discover -s python/tests -v
+else
+  echo "SKIPPED: python/tests GPU tests (MAC_HEAVY_LABEL unset; rerun under tools/mac_heavy.sh to run them)"
+fi
+
+echo "==> test (release, serialized, every binary even after a failure)"
+# --no-fail-fast runs every test binary so one red binary does not hide the rest; the
+# script then still ends non-zero (below) if any of them failed.
+TEST_FAILED=0
+cargo test --release --no-fail-fast -- --test-threads=1 || TEST_FAILED=1
 
 echo "==> test mtl_tensor (quant-prep; the default suite does not compile it)"
 mtl_out=$(cargo test --release --features quant-prep --lib mtl_tensor:: -- --test-threads=1 2>&1) || { echo "$mtl_out"; exit 1; }
@@ -69,4 +87,8 @@ else
   ./scripts/check_release_ready.sh
 fi
 
+if [[ "$TEST_FAILED" -ne 0 ]]; then
+  echo "ci:local FAILED: one or more cargo test binaries failed (see the full run above)" >&2
+  exit 1
+fi
 echo "ci:local OK"

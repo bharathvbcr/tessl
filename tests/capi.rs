@@ -420,6 +420,69 @@ fn a_wrap_through_the_abi_leaves_residency_balanced() {
     });
 }
 
+/// Every runtime-handle entry refuses a foreign thread with the thread message
+/// before any argument is looked at (all arguments are null: were they looked
+/// at first the message would be "null args"), and the owner stays usable.
+#[test]
+fn every_runtime_entry_refuses_a_foreign_thread_before_looking_at_its_arguments() {
+    fn run(out: &mut Vec<(&'static str, i32, String)>, name: &'static str, f: &dyn Fn(*mut c_char, usize) -> i32) {
+        let mut err = [0 as c_char; ERR_LEN];
+        let s = f(err.as_mut_ptr(), ERR_LEN);
+        out.push((name, s, msg(&err)));
+    }
+    fn runtime_entries(rt: *mut TesslRuntime) -> Vec<(&'static str, i32, String)> {
+        let mut out = Vec::new();
+        unsafe {
+            run(&mut out, "tessl_synchronize", &|e, n| tessl_synchronize(rt, e, n));
+            run(&mut out, "tessl_runtime_poisoned", &|e, n| {
+                tessl_runtime_poisoned(rt, ptr::null_mut(), e, n)
+            });
+            run(&mut out, "tessl_cross_entropy_rows", &|e, n| {
+                tessl_cross_entropy_rows(rt, ptr::null(), ptr::null_mut(), ptr::null_mut(), e, n)
+            });
+            run(&mut out, "tessl_gdn_train_forward", &|e, n| {
+                tessl_gdn_train_forward(rt, ptr::null(), e, n)
+            });
+            run(&mut out, "tessl_gdn_train_backward", &|e, n| {
+                tessl_gdn_train_backward(rt, ptr::null(), e, n)
+            });
+            run(&mut out, "tessl_qwen35_load", &|e, n| {
+                let mut m = ptr::null_mut();
+                tessl_qwen35_load(rt, ptr::null(), ptr::null(), ptr::null(), TESSL_F32, &mut m, e, n)
+            });
+        }
+        out
+    }
+    let _gpu = common::gpu_lock();
+    let mut err = [0 as c_char; ERR_LEN];
+    let rt = unsafe { tessl_runtime_new(err.as_mut_ptr(), ERR_LEN) };
+    assert!(!rt.is_null(), "{}", msg(&err));
+    let raw = rt as usize;
+    let calls = std::thread::spawn(move || runtime_entries(raw as *mut TesslRuntime))
+        .join()
+        .unwrap();
+    assert_eq!(calls.len(), 6);
+    for (name, status, message) in &calls {
+        assert_eq!(*status, TESSL_ERR, "{name}");
+        assert!(
+            message.contains("other than the one that created it"),
+            "{name}: {message:?}"
+        );
+    }
+    // A foreign free leaks rather than drops, and the owner still works.
+    let freed = std::thread::spawn(move || unsafe { tessl_runtime_free(raw as *mut TesslRuntime) })
+        .join()
+        .unwrap();
+    assert_eq!(freed, TESSL_ERR);
+    assert_eq!(
+        unsafe { tessl_synchronize(rt, err.as_mut_ptr(), ERR_LEN) },
+        TESSL_OK,
+        "{}",
+        msg(&err)
+    );
+    assert_eq!(unsafe { tessl_runtime_free(rt) }, TESSL_OK);
+}
+
 /// A free from a foreign thread (a finalizer at interpreter shutdown) leaks
 /// the handle instead of dropping a thread-affine runtime there; the owner can
 /// still use and free it.
@@ -1940,6 +2003,62 @@ fn the_poisoned_query_reports_a_latched_runtime() {
         TESSL_ERR
     );
     assert_eq!(poisoned(healthy.0), 0);
+}
+
+/// What a binding does after the poisoned status: free the latched runtime
+/// and build a new one on the same thread. The new runtime must load a real
+/// model and train a step; a stand-in library cannot show that.
+#[test]
+fn a_fresh_runtime_on_the_poisoned_thread_loads_and_runs_a_model() {
+    let mut err = [0 as c_char; ERR_LEN];
+    let a = unsafe { tessl_runtime_new(err.as_mut_ptr(), ERR_LEN) };
+    assert!(!a.is_null(), "{}", msg(&err));
+    let (st, cfg, prefix) = (
+        fixture("model.safetensors"),
+        fixture("config.json"),
+        std::ffi::CString::new("model.").unwrap(),
+    );
+    let mut out: *mut TesslQwen35 = ptr::null_mut();
+    let s = {
+        let _poison = PoisonAfterLoad::on();
+        unsafe {
+            tessl_qwen35_load(
+                a,
+                st.as_ptr(),
+                cfg.as_ptr(),
+                prefix.as_ptr(),
+                TESSL_F32,
+                &mut out,
+                err.as_mut_ptr(),
+                ERR_LEN,
+            )
+        }
+    };
+    assert_eq!(s, TESSL_ERR, "{}", msg(&err));
+    assert!(out.is_null());
+    assert_eq!(poisoned(a), 1);
+    assert_eq!(unsafe { tessl_runtime_free(a) }, TESSL_OK, "a poisoned runtime frees");
+
+    let b = Handle::new();
+    assert_eq!(poisoned(b.0), 0);
+    let model = load_model(b.0);
+    let ids = fixture_ids();
+    let mut loss = f64::NAN;
+    let s = unsafe {
+        tessl_qwen35_train_step(
+            model,
+            ids.as_ptr(),
+            ids.len() as u64,
+            TESSL_OPERANDS_EXACT_F32,
+            &mut loss,
+            err.as_mut_ptr(),
+            ERR_LEN,
+        )
+    };
+    assert_eq!(s, TESSL_OK, "{}", msg(&err));
+    assert!(loss.is_finite(), "loss {loss}");
+    assert_eq!(poisoned(b.0), 0);
+    assert_eq!(unsafe { tessl_qwen35_free(model) }, TESSL_OK);
 }
 
 /// A GDN backward refused for its tensors keeps the cached workspace.

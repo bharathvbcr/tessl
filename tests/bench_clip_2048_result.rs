@@ -309,3 +309,45 @@ fn sync_gap_prose_arithmetic_is_derived_from_the_table() {
         "the old claim that the gap equals the removed phase minus the train difference must stay gone"
     );
 }
+
+#[test]
+fn every_parenthesised_subtraction_in_the_prose_is_arithmetically_true_and_in_the_table() {
+    // Any "(A - B)" with two decimal numbers in the result file must satisfy the
+    // stated figure's arithmetic and cite numbers that exist in the file.
+    let mut checked = 0;
+    for line in FILE.lines() {
+        let mut rest = line;
+        while let Some(i) = rest.find('(') {
+            let inner = &rest[i + 1..];
+            let Some(j) = inner.find(')') else { break };
+            let parts: Vec<&str> = inner[..j].split(" - ").collect();
+            if parts.len() == 2 {
+                if let (Ok(a), Ok(b)) = (parts[0].trim().parse::<f64>(), parts[1].trim().parse::<f64>()) {
+                    let d = a - b;
+                    assert!(d > 0.0, "subtraction ({a} - {b}) must be positive in {line}");
+                    assert!(
+                        FILE.contains(&format!("{d:.1} ms")),
+                        "difference {d:.1} of ({a} - {b}) not stated: {line}"
+                    );
+                    for n in [parts[0].trim(), parts[1].trim()] {
+                        assert!(
+                            FILE.matches(n).count() >= 2,
+                            "{n} is cited only inside its own subtraction"
+                        );
+                    }
+                    checked += 1;
+                }
+            }
+            rest = &inner[j..];
+        }
+    }
+    assert!(checked >= 3, "expected at least 3 subtractions, found {checked}");
+}
+
+#[test]
+fn cross_file_wave2_claim_matches_the_wave2_file() {
+    let wave2 = include_str!("../bench/results/qwen35_train_step_wave2_m5pro.txt");
+    assert!(FILE.contains("2.583 -> 2.563 s sync"));
+    assert!(wave2.contains("after/2048:-:sync:--storage=bf16        2.563"));
+    assert!(wave2.contains("before/2048:-:sync:--storage=bf16       2.583"));
+}

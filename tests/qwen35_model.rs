@@ -1129,7 +1129,7 @@ fn decode_step_failing_to_read_its_logits_does_not_advance() {
         let (mut dec, _) = model.prefill(&ids[..7], 3).unwrap();
         dec.step(ids[7]).unwrap();
         let at = (dec.position(), dec.remaining());
-        model.fail_logits_read_for_test();
+        model.fail_host_read_after_for_test(0);
         let e = dec.step(ids[8]).unwrap_err();
         assert!(e.contains("injected fault"), "{e}");
         assert_eq!(

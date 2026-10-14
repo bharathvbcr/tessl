@@ -82,7 +82,7 @@
 //! ([`crate::qwen35::score_answer_rows`]), on a model with or without the
 //! packed head.
 
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use crate::cross_entropy::gather_rows_f32;
@@ -497,9 +497,9 @@ pub struct Qwen35Model {
     /// Test hook ([`Self::fail_layer_after_for_test`]): layers still to run
     /// before one fails; `usize::MAX` is off.
     layer_fault: AtomicUsize,
-    /// Test hook ([`Self::fail_logits_read_for_test`]): the next [`Decode::step`]
-    /// logits read fails.
-    read_fault: AtomicBool,
+    /// Test hook ([`Self::fail_host_read_after_for_test`]): host reads still
+    /// to succeed before one fails; `usize::MAX` is off.
+    read_fault: AtomicUsize,
 }
 
 impl Qwen35Model {
@@ -523,33 +523,27 @@ impl Qwen35Model {
         self.layer_fault.store(n, Ordering::Relaxed);
     }
 
-    /// Make the next [`Decode::step`] fail at the host read of its logits,
-    /// once, after its layers ran and the runtime synchronized: how a test
-    /// reaches the failure a step must survive without advancing. Tests only.
+    /// Make the host read that comes after `n` more successful ones fail with
+    /// an error, once, after the work ran and the runtime synchronized. The
+    /// reads, in order: one per layer of [`Staged::advance_to`]'s trace,
+    /// [`Staged::logits`], [`Staged::score_answers`], [`Decode::step`]'s
+    /// logits, and the final-norm row of [`Qwen35Model::forward`]'s trace. How
+    /// a test reaches the failure each must return as `Err`, and a step must
+    /// survive without advancing. Tests only.
     #[doc(hidden)]
-    pub fn fail_logits_read_for_test(&self) {
-        self.read_fault.store(true, Ordering::Relaxed);
+    pub fn fail_host_read_after_for_test(&self, n: usize) {
+        self.read_fault.store(n, Ordering::Relaxed);
     }
 
     fn take_read_fault(&self) -> Result<(), String> {
-        if self.read_fault.swap(false, Ordering::Relaxed) {
-            return Err("logits read: injected fault (fail_logits_read_for_test)".into());
-        }
-        Ok(())
+        count_down_fault(
+            &self.read_fault,
+            "host read: injected fault (fail_host_read_after_for_test)",
+        )
     }
 
     fn take_layer_fault(&self) -> Result<(), String> {
-        match self.layer_fault.load(Ordering::Relaxed) {
-            usize::MAX => Ok(()),
-            0 => {
-                self.layer_fault.store(usize::MAX, Ordering::Relaxed);
-                Err("layer: injected fault (fail_layer_after_for_test)".into())
-            }
-            n => {
-                self.layer_fault.store(n - 1, Ordering::Relaxed);
-                Ok(())
-            }
-        }
+        count_down_fault(&self.layer_fault, "layer: injected fault (fail_layer_after_for_test)")
     }
 }
 
@@ -736,7 +730,7 @@ impl Qwen35Model {
             gdn_scan: GdnScanSlice::default(),
             param_generation: AtomicU64::new(0),
             layer_fault: AtomicUsize::new(usize::MAX),
-            read_fault: AtomicBool::new(false),
+            read_fault: AtomicUsize::new(usize::MAX),
         })
     }
 
@@ -884,7 +878,7 @@ impl Qwen35Model {
             gdn_scan: GdnScanSlice::default(),
             param_generation: AtomicU64::new(0),
             layer_fault: AtomicUsize::new(usize::MAX),
-            read_fault: AtomicBool::new(false),
+            read_fault: AtomicUsize::new(usize::MAX),
         })
     }
 
@@ -966,6 +960,7 @@ impl Qwen35Model {
             // same stream, so the same bits either way.
             self.norm(&s.a.resid, &self.final_norm, &s.a.x)?;
             self.rt.synchronize()?;
+            self.take_read_fault()?;
             out_trace.push(read_rows(&s.a.x, self.precision)?);
         }
         Ok(ForwardOutput {
@@ -1677,6 +1672,7 @@ impl Staged<'_> {
             m.layer(l, a, step)?;
             if let Some(trace) = self.trace.as_mut() {
                 m.rt.synchronize()?;
+                m.take_read_fault()?;
                 trace.push(a.resid.buffer.try_contents_f32()?[..(a.t * m.cfg.hidden) as usize].to_vec());
             }
         }
@@ -1770,6 +1766,7 @@ impl Staged<'_> {
             }
         }
         rt.synchronize()?;
+        m.take_read_fault()?;
         Ok(out.buffer.try_contents_f32()?[..n * vocab].to_vec())
     }
 
@@ -1828,6 +1825,7 @@ impl Staged<'_> {
             &logprobs,
         )?;
         rt.synchronize()?;
+        m.take_read_fault()?;
         // One host mapping at a time: two live at once read as a busy runtime.
         let logits = logits.try_contents_f32()?[..n].to_vec();
         let logprobs = logprobs.try_contents_f32()?[..n].to_vec();
@@ -1917,6 +1915,22 @@ impl Decode<'_> {
         self.decoded += 1;
         self.broken = false;
         Ok(row)
+    }
+}
+
+/// A test hook's countdown: `usize::MAX` is off, `0` fires once (and turns
+/// the hook off), `n` lets `n` more calls pass.
+fn count_down_fault(hook: &AtomicUsize, message: &str) -> Result<(), String> {
+    match hook.load(Ordering::Relaxed) {
+        usize::MAX => Ok(()),
+        0 => {
+            hook.store(usize::MAX, Ordering::Relaxed);
+            Err(message.into())
+        }
+        n => {
+            hook.store(n - 1, Ordering::Relaxed);
+            Ok(())
+        }
     }
 }
 

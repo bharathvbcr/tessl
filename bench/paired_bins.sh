@@ -20,11 +20,32 @@ fi
 rounds=$1
 out=$2
 shift 2
+# Positive decimal integer, no sign or leading zero, at most 6 digits (also
+# keeps bash arithmetic clear of overflow).
+if [[ ! $rounds =~ ^[1-9][0-9]{0,5}$ ]]; then
+  echo "ROUNDS must be a positive integer (1-999999), got '$rounds'" >&2
+  echo "usage: BENCH_BINS=\"before=PATH after=PATH\" $0 ROUNDS OUT ARGS..." >&2
+  exit 2
+fi
 declare -a labels=() paths=()
-for pair in $BENCH_BINS; do
+# Entries are split on newlines when BENCH_BINS has one (so paths may hold
+# spaces), else on whitespace as before.
+pairs=()
+if [[ $BENCH_BINS == *$'\n'* ]]; then
+  while IFS= read -r line; do pairs+=("$line"); done <<<"$BENCH_BINS"
+else
+  read -r -a pairs <<<"$BENCH_BINS"
+fi
+for pair in ${pairs[@]+"${pairs[@]}"}; do
+  [[ -n $pair ]] || continue
   labels+=("${pair%%=*}")
   paths+=("${pair#*=}")
 done
+if ((${#paths[@]} == 0)); then
+  echo "BENCH_BINS names no binaries" >&2
+  echo "usage: BENCH_BINS=\"before=PATH after=PATH\" $0 ROUNDS OUT ARGS..." >&2
+  exit 2
+fi
 for p in "${paths[@]}"; do
   [[ -x $p ]] || { echo "$p is missing or not executable" >&2; exit 2; }
 done

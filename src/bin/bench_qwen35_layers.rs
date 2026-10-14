@@ -166,7 +166,7 @@ fn finite_f32(name: &str, b: &GpuBuffer, n: usize) -> Res<()> {
 // ------------------------------------------------------------------- timing ---
 
 /// Median milliseconds of one `f`, with `reps` of it per command buffer.
-fn time_ms(rt: &Arc<GpuRuntime>, reps: usize, mut f: impl FnMut() -> Res<()>) -> Res<f64> {
+fn time_ms(rt: &Arc<GpuRuntime>, reps: usize, iters: usize, mut f: impl FnMut() -> Res<()>) -> Res<f64> {
     rt.synchronize()?;
     for _ in 0..WARMUP {
         for _ in 0..reps {
@@ -174,8 +174,8 @@ fn time_ms(rt: &Arc<GpuRuntime>, reps: usize, mut f: impl FnMut() -> Res<()>) ->
         }
         rt.synchronize()?;
     }
-    let mut samples = Vec::with_capacity(ITERS);
-    for _ in 0..ITERS {
+    let mut samples = Vec::with_capacity(iters);
+    for _ in 0..iters {
         let t0 = Instant::now();
         for _ in 0..reps {
             f()?;
@@ -654,8 +654,9 @@ use tessl::safetensors::SafeTensors;
 enum Weights {
     /// `Qwen35Model::random` at the 2B's shapes, seeded.
     Random,
-    /// A checkpoint directory: `config.json` and one `*.safetensors` file.
-    Dir(PathBuf),
+    /// A checkpoint directory, already checked: its `config.json` and its one
+    /// `*.safetensors` file.
+    Dir { dir: PathBuf, st: PathBuf },
 }
 
 /// What the run was asked to time, from the command line.
@@ -685,14 +686,27 @@ fn checkpoint_file(dir: &Path) -> Res<PathBuf> {
     }
 }
 
+/// Check `--weights=DIR` before any GPU work: a directory holding a
+/// `config.json` and exactly one `*.safetensors` file.
+fn checkpoint(dir: &Path) -> Res<Weights> {
+    let cfg = dir.join("config.json");
+    if !cfg.is_file() {
+        return Err(format!("--weights {}: no config.json", dir.display()));
+    }
+    Ok(Weights::Dir {
+        dir: dir.to_path_buf(),
+        st: checkpoint_file(dir)?,
+    })
+}
+
 /// The model to time: bf16 (the production precision) with the packed head.
 fn build_model(rt: &Arc<GpuRuntime>, o: &Opts) -> Res<Qwen35Model> {
     let t0 = Instant::now();
     let model = match &o.weights {
         Weights::Random => Qwen35Model::random(rt, Qwen35Config::qwen35_2b()?, Precision::Bf16, 0x51)?,
-        Weights::Dir(dir) => {
+        Weights::Dir { dir, st } => {
             let cfg = Qwen35Config::from_config_file(&dir.join("config.json"))?;
-            let st = SafeTensors::open(&checkpoint_file(dir)?)?;
+            let st = SafeTensors::open(st)?;
             Qwen35Model::load(rt, &st, "model.language_model.", cfg, Precision::Bf16)?
         }
     };
@@ -857,7 +871,7 @@ fn part_name(part: LayerPart) -> &'static str {
 /// Per-layer and per-part times through `Staged::encode_part`, `REPS` per
 /// command buffer. Repeats move the residual stream (the mixer and MLP add to
 /// it in place), so the residual is read back after and must still be finite.
-fn time_parts(rt: &Arc<GpuRuntime>, model: &Qwen35Model, ids: &[u32]) -> Res<Parts> {
+fn time_parts(rt: &Arc<GpuRuntime>, model: &Qwen35Model, ids: &[u32], iters: usize) -> Res<Parts> {
     let kinds = &model.config().layers;
     let find = |k: LayerKind| {
         kinds
@@ -868,7 +882,9 @@ fn time_parts(rt: &Arc<GpuRuntime>, model: &Qwen35Model, ids: &[u32]) -> Res<Par
     let (gdn, attn) = (find(LayerKind::LinearAttention)?, find(LayerKind::FullAttention)?);
     let s = model.begin(ids)?;
     let run = |layer: usize, parts: &[LayerPart]| -> Res<f64> {
-        time_ms(rt, REPS, || parts.iter().try_for_each(|&p| s.encode_part(layer, p)))
+        time_ms(rt, REPS, iters, || {
+            parts.iter().try_for_each(|&p| s.encode_part(layer, p))
+        })
     };
     let mixer = [LayerPart::InputNorm, LayerPart::Mixer];
     let mlp_parts = [LayerPart::PostNorm, LayerPart::Mlp];
@@ -950,7 +966,7 @@ fn run_model(rt: &Arc<GpuRuntime>, model: &Qwen35Model, ts: &[usize], o: &Opts, 
         let layers = time_layers(rt, model, &ids, o.iters)?;
         let fwd = time_forward_last(model, &ids, o.iters)?;
         let prefill = time_prefill(model, &ids, 1, o.iters)?;
-        let parts = time_parts(rt, model, &ids)?;
+        let parts = time_parts(rt, model, &ids, o.iters)?;
         rows.push(Row {
             t,
             tower,
@@ -1004,8 +1020,9 @@ fn run_model(rt: &Arc<GpuRuntime>, model: &Qwen35Model, ts: &[usize], o: &Opts, 
 
     println!();
     println!(
-        "per layer (ms, median of {ITERS}, {REPS} per command buffer, Staged::encode_part). GDN / attention layer = \
-         input norm + mixer; MLP = post-norm + MLP"
+        "per layer (ms, median of {}, {REPS} per command buffer, Staged::encode_part). GDN / attention layer = \
+         input norm + mixer; MLP = post-norm + MLP",
+        o.iters
     );
     println!(
         "{:>6} {:>9} {:>9} {:>9} | {:>11} {:>11}",
@@ -1219,7 +1236,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             if dir.is_empty() {
                 return Err("--weights=DIR wants a checkpoint directory".into());
             }
-            opts.weights = Weights::Dir(PathBuf::from(dir));
+            opts.weights = checkpoint(Path::new(dir))?;
         } else {
             let t: usize = arg.parse().map_err(|_| {
                 format!(
@@ -1249,7 +1266,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Err("--paired-gate-up and --model-forward each take token counts only".into());
     }
     let paired = paired_attn || paired_rec || paired_gate_up;
-    if paired && (matches!(opts.weights, Weights::Dir(_)) || opts.scan != qwen35::GdnScanSlice::default()) {
+    if paired && (matches!(opts.weights, Weights::Dir { .. }) || opts.scan != qwen35::GdnScanSlice::default()) {
         return Err("--weights and --gdn-scan32 apply to the model lanes, not --paired-*".into());
     }
     if paired_gate_up {
@@ -1283,7 +1300,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "weights: {}",
         match &opts.weights {
             Weights::Random => "random (seed 0x51)".to_string(),
-            Weights::Dir(d) => d.display().to_string(),
+            Weights::Dir { dir, .. } => dir.display().to_string(),
         }
     );
     let model = build_model(&rt, &opts)?;

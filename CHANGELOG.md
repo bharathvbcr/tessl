@@ -8,6 +8,23 @@ All notable changes to `tessl` are recorded here. The format follows
 
 ### Added
 
+- **`tessl_runtime_poisoned` (C ABI 10 → 11).** A poisoned runtime is reported
+  by a query function, not a new status code, so existing calls keep the
+  statuses they can return. `tessl_torch` asks after any failed call and, if the
+  runtime is poisoned, closes the models bound to it and the runtime, then
+  raises `TesslPoisoned`; the next call builds a fresh runtime.
+  `tests/capi_contract.rs` now parses every `extern "C"` signature and
+  `#[repr(C)]` struct in `src/capi.rs` and checks each against the ctypes
+  declarations. It found that `tessl_synchronize` had never been declared.
+- **`GpuBuffer::try_write_f32`, `try_read_u32`, `try_write_bf16_bits`,
+  `try_write_f32_prefix`, `try_write_bytes`.** The panicking accessors now
+  delegate to these and are documented as test/bench conveniences.
+- **BERT and DistilBERT goldens from transformers.** `tests/bert_model.rs`
+  compares the pooled sparse output, the embedding and every layer against
+  transformers fp32 on a padded batch, with the bound written before the first
+  run (measured error about 3e-6 against a 2e-4 bound). The goldens come from
+  `scripts/gen_bert_fixtures.py`, recorded in `tests/fixtures/bert_tiny/manifest.json`.
+
 - **Parser mutation tests** (`tests/parser_mutation.rs`, CPU only, no
   dependency): seeded truncation at every byte, byte and bit flips, extreme
   length/offset/shape values, invalid UTF-8 and deep nesting driven through
@@ -621,6 +638,26 @@ All notable changes to `tessl` are recorded here. The format follows
   for encoded work and fail with "runtime busy" inside an encoder closure.
 
 ### Changed
+
+- **No panicking host access in library code.** Weight loads (`Loader`, BERT,
+  Qwen3.5 `load` and `random_tower`) and the ICB triage probe return an error on
+  a busy runtime instead of panicking. `tests/host_access_ban.rs` scans non-test
+  `src/` (not `src/bin/`) and fails on any call to a panicking accessor. Load
+  time on the fixture model did not change (min of 200, 3 runs each, before and
+  after).
+- **`add_metallib` / `add_metallib_bytes` refuse an overlay that repeats an entry
+  point** already in the primary library or an earlier overlay, naming the
+  function(s) and both libraries. `pipeline()` resolves the primary first, so
+  such a kernel was unreachable. No caller in tessl or ojas shadows a name.
+- **AdamW's f32 rule is documented as torch's order, not torch's bits.** The
+  final update may differ from `addcdiv_` by up to 1 ulp per parameter.
+- **The `mlx-f32` parity lane is scored as tf32-class.** Its GPU matmul measures
+  3.5e-3 against 7e-7 on MLX's CPU stream on the M5 Pro, so valid parity dumps
+  no longer abort wherever MLX is installed.
+- **`scripts/ci_local.sh`** runs `cargo test --no-fail-fast` (failing if any
+  binary failed), the torch-binding host tests, and the GPU binding tests under
+  the `mac_heavy` lock. The release workflow's two gate edge cases are
+  documented under "Releasing" in `docs/verification.md`.
 
 - **Tests that passed without checking now check.**
   - `docs_name_real_tools` scans `README.md` and all of `docs/**`, and fails

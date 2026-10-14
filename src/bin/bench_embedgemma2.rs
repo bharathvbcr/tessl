@@ -19,9 +19,14 @@
 //!   texts).
 //!
 //! `BENCH_ITERS` (default 10) and `BENCH_WARMUP` (default 3) are per
-//! workload. Prints one JSON array on stdout, one object per workload:
-//! `{workload, backend, ms_min, ms_median, iters, forwards, device_peak_mib,
-//! peak_footprint_mib}`. `device_peak_mib` is the device's peak allocation
+//! workload. `BENCH_ASYNC=1` runs the runtime with `set_async_encode(true)`
+//! (default off, as every library caller runs): only then does a dispatch
+//! return before the GPU finishes it, so the forwards of one `encode` queue
+//! back to back and the host waits once; with it off every dispatch commits
+//! and waits and the forwards cannot overlap. Each object carries
+//! `"async":0|1`. Prints one JSON array on stdout, one object per workload:
+//! `{workload, backend, ms_min, ms_median, iters, async, forwards,
+//! device_peak_mib, peak_footprint_mib}`. `device_peak_mib` is the device's peak allocation
 //! during that workload above the loaded model
 //! ([`GpuRuntime::peak_allocated_bytes`]); `peak_footprint_mib` is the
 //! process's lifetime peak physical footprint so far (what `/usr/bin/time -l`
@@ -109,6 +114,12 @@ fn main() -> Result<(), String> {
     let cfg = EmbedGemma2Config::from_config_file(&snap.join("config.json"))?;
     let st = SafeTensors::open(&snap.join("model.safetensors"))?;
     let rt = GpuRuntime::new_inference()?;
+    let async_encode = match std::env::var("BENCH_ASYNC").as_deref() {
+        Err(_) | Ok("0") => false,
+        Ok("1") => true,
+        Ok(other) => return Err(format!("BENCH_ASYNC={other:?}: expected 0 or 1")),
+    };
+    rt.set_async_encode(async_encode)?;
     let model = EmbedGemma2Model::load(&rt, &st, "language_model.", cfg.clone())?;
     let dim = cfg.embedding_dim as usize;
     let loaded = rt.current_allocated_bytes();
@@ -141,9 +152,10 @@ fn main() -> Result<(), String> {
         ms.sort_by(f64::total_cmp);
         let device_peak = rt.peak_allocated_bytes().saturating_sub(loaded);
         rows.push(format!(
-            "{{\"workload\":\"{name}\",\"backend\":\"tessl-f32\",\"ms_min\":{:.4},\"ms_median\":{:.4},\"iters\":{iters},\"forwards\":{},\"device_peak_mib\":{:.1},\"peak_footprint_mib\":{:.1}}}",
+            "{{\"workload\":\"{name}\",\"backend\":\"tessl-f32\",\"ms_min\":{:.4},\"ms_median\":{:.4},\"iters\":{iters},\"async\":{},\"forwards\":{},\"device_peak_mib\":{:.1},\"peak_footprint_mib\":{:.1}}}",
             ms[0],
             ms[ms.len() / 2],
+            u8::from(async_encode),
             out.forwards,
             device_peak as f64 / MIB,
             peak_footprint()? as f64 / MIB,

@@ -725,6 +725,17 @@ fn encoder_attn_offsets_are_widened() {
     ] {
         require(ENCODER_ATTN, needle, what);
     }
+    // No encoder has a bf16 path: the kernels take no `out_bf16` argument and
+    // hand the shared bodies a literal 0, and the K/V capacity is slot 10.
+    assert!(
+        !ENCODER_ATTN.contains("out_bf16"),
+        "encoder_attn.metal has an out_bf16 argument no caller binds"
+    );
+    require(
+        ENCODER_ATTN,
+        "constant uint &kv_capacity [[buffer(10)]],",
+        "key/value capacity slot",
+    );
     // The tiled entries clamp the device length before it bounds an extent.
     require(
         ENCODER_ATTN,

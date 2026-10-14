@@ -283,7 +283,6 @@ fn run_attn(
             window: a.window as u32,
             scale: 1.0,
         },
-        false,
         kernel,
     )
     .unwrap_or_else(|e| panic!("{kernel:?}: {e}"));
@@ -604,7 +603,7 @@ fn encoder_attn_refuses_what_it_cannot_run() {
             window: 512,
             scale: 1.0,
         };
-        encoder_attn(rt, &q, &k, &v, &o, &lens, ok, false).expect("the baseline call");
+        encoder_attn(rt, &q, &k, &v, &o, &lens, ok).expect("the baseline call");
         let cases: Vec<(&str, EncoderAttnDims)> = vec![
             ("head dim 128", EncoderAttnDims { head_dim: 128, ..ok }),
             (
@@ -622,12 +621,12 @@ fn encoder_attn_refuses_what_it_cannot_run() {
         ];
         for (what, dims) in cases {
             assert!(
-                encoder_attn(rt, &q, &k, &v, &o, &lens, dims, false).is_err(),
+                encoder_attn(rt, &q, &k, &v, &o, &lens, dims).is_err(),
                 "{what}: accepted"
             );
         }
         assert!(
-            encoder_attn(rt, &q, &k, &v, &q, &lens, ok, false).is_err(),
+            encoder_attn(rt, &q, &k, &v, &q, &lens, ok).is_err(),
             "o aliasing q: accepted"
         );
         // K/V capacity is derived from their size: fewer than `seq` positions
@@ -636,14 +635,14 @@ fn encoder_attn_refuses_what_it_cannot_run() {
         let kv = |positions: usize| rt.alloc_buffer(4 * positions * 256 * 4).unwrap();
         let (short_k, short_v, long_k, long_v) = (kv(7), kv(7), kv(10), kv(10));
         assert!(
-            encoder_attn(rt, &q, &short_k, &short_v, &o, &lens, ok, false).is_err(),
+            encoder_attn(rt, &q, &short_k, &short_v, &o, &lens, ok).is_err(),
             "K/V of 7 positions for seq 8: accepted"
         );
         assert!(
-            encoder_attn(rt, &q, &k, &long_v, &o, &lens, ok, false).is_err(),
+            encoder_attn(rt, &q, &k, &long_v, &o, &lens, ok).is_err(),
             "K and V of different capacities: accepted"
         );
-        encoder_attn(rt, &q, &long_k, &long_v, &o, &lens, ok, false).expect("K/V of 10 positions for seq 8");
+        encoder_attn(rt, &q, &long_k, &long_v, &o, &lens, ok).expect("K/V of 10 positions for seq 8");
         // The tiled kernel is compiled for head dims 256 and 512 only.
         let small = EncoderAttnDims { head_dim: 64, ..ok };
         let (q64, k64, v64, o64) = (
@@ -652,26 +651,15 @@ fn encoder_attn_refuses_what_it_cannot_run() {
             rt.alloc_buffer(4 * 8 * 64 * 4).unwrap(),
             rt.alloc_buffer(4 * 8 * 2 * 64 * 4).unwrap(),
         );
-        encoder_attn_with(rt, &q64, &k64, &v64, &o64, &lens, small, false, EncoderAttnKernel::Rows)
+        encoder_attn_with(rt, &q64, &k64, &v64, &o64, &lens, small, EncoderAttnKernel::Rows)
             .expect("the rows kernel at head dim 64");
         assert!(
-            encoder_attn_with(
-                rt,
-                &q64,
-                &k64,
-                &v64,
-                &o64,
-                &lens,
-                small,
-                false,
-                EncoderAttnKernel::Tiled
-            )
-            .is_err(),
+            encoder_attn_with(rt, &q64, &k64, &v64, &o64, &lens, small, EncoderAttnKernel::Tiled).is_err(),
             "the tiled kernel at head dim 64: accepted"
         );
         let short_lens = buf_u32(rt, &[8]);
         assert!(
-            encoder_attn(rt, &q, &k, &v, &o, &short_lens, ok, false).is_err(),
+            encoder_attn(rt, &q, &k, &v, &o, &short_lens, ok).is_err(),
             "short lens: accepted"
         );
     });

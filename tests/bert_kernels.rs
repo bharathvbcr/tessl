@@ -601,7 +601,7 @@ fn encoder_attention_at_head_dims_32_and_64_matches_f64() {
                     window: 0,
                     scale: 1.0 / (d as f32).sqrt(),
                 };
-                encoder_attn(rt, &qb, &kb, &vb, &ob, &lb, dims, false).unwrap();
+                encoder_attn(rt, &qb, &kb, &vb, &ob, &lb, dims).unwrap();
                 let got = read(rt, &ob, n);
                 let want = attn_ref(b, t, h, d, lens, &q, &k, &v);
                 let scale = want.iter().fold(0.0f64, |m, &w| m.max(w.abs()));

@@ -478,7 +478,8 @@ fn traced<T>(f: impl FnOnce() -> T) -> (T, infer_trace::Snapshot) {
 }
 
 /// An encode's forwards share one set of activations, none of it zeroed on
-/// the host, and poisoning every unzeroed allocation with NaN changes no bit
+/// the host (each forward adds only its four small input and output
+/// buffers), and poisoning every unzeroed allocation with NaN changes no bit
 /// of any embedding: no kernel reads an element its forward did not write.
 /// Before the activations were reused, each forward allocated its own (the
 /// two-forward encode made twice the one-forward encode's allocations) and
@@ -511,10 +512,17 @@ fn encode_reuses_unzeroed_activations() {
             "two forwards zeroed {} bytes on the host",
             t2.host_zero_bytes
         );
+        // Each forward past the first adds only its own small host-visible
+        // buffers (ids, lens, segments, embeddings: `ForwardIo`), not another
+        // set of activations.
+        let io_buffers = 4 * u64::from(two.forwards - 1);
         assert_eq!(
-            t2.cold_allocs, t1.cold_allocs,
-            "two forwards made {} allocations, one made {}: the activations are not shared",
-            t2.cold_allocs, t1.cold_allocs
+            t2.cold_allocs,
+            t1.cold_allocs + io_buffers,
+            "two forwards made {} allocations, one made {}: more than {io_buffers} extra, so the \
+             activations are not shared",
+            t2.cold_allocs,
+            t1.cold_allocs
         );
 
         rt.set_poison_unzeroed(true);
@@ -545,6 +553,77 @@ fn encode_reuses_unzeroed_activations() {
             assert!(
                 f64::from(drift) <= BATCH_ABS,
                 "sequence {n} ({} tokens) in the two-forward batch vs alone: {drift:.3e}",
+                ids.len()
+            );
+        }
+    });
+}
+
+/// With `async_encode` on, an `encode` that runs several forwards queues them
+/// all and waits for the GPU once, not once per forward, and its embeddings
+/// are bit for bit those the same encode gives with the runtime synchronous
+/// (where every dispatch waits and nothing can overlap), with every unzeroed
+/// activation poisoned. Each sequence also still matches itself run alone.
+/// Before, every forward ended in its own `synchronize` and readback, so an
+/// encode of N forwards waited N times however the runtime was set.
+#[test]
+fn multi_forward_encode_waits_once_and_matches_synchronous() {
+    let cfg = EmbedGemma2Config::from_config_json(CONFIG).unwrap();
+    let w = random_weights(&cfg, 11);
+    let st = open("async_forwards", safetensors_bytes(&w, &[]));
+    // Three padded shapes: a long sequence alone, mid-length ones, short ones.
+    let seq = |n: u32, s: u32| -> Vec<u32> { (0..n).map(|i| (i * 5 + s * 3 + 1) % cfg.vocab).collect() };
+    let long = seq(4000, 0);
+    let mid: Vec<Vec<u32>> = (0..3).map(|s| seq(300, s)).collect();
+    let short: Vec<Vec<u32>> = (0..7).map(|s| seq(30, s + 5)).collect();
+    let mut batch: Vec<&[u32]> = vec![&long];
+    batch.extend(mid.iter().map(Vec::as_slice));
+    batch.extend(short.iter().map(Vec::as_slice));
+    let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+    with_gpu(|rt| {
+        let model = EmbedGemma2Model::load(rt, &st, PREFIX, cfg.clone()).unwrap();
+        let (sync, t_sync) = traced(|| model.encode(&batch, None, false).unwrap());
+        assert!(
+            sync.forwards >= 3,
+            "test bug: {} forwards, need at least 3",
+            sync.forwards
+        );
+        assert!(
+            t_sync.sync_waits >= u64::from(sync.forwards),
+            "test bug: the synchronous encode waited only {} times",
+            t_sync.sync_waits
+        );
+
+        rt.set_async_encode(true).unwrap();
+        rt.set_poison_unzeroed(true);
+        let (queued, t_async) = traced(|| model.encode(&batch, None, false));
+        rt.set_poison_unzeroed(false);
+        rt.set_async_encode(false).unwrap();
+        let queued = queued.unwrap();
+
+        assert_eq!(queued.forwards, sync.forwards);
+        assert_eq!(
+            t_async.sync_waits, 1,
+            "{} forwards made {} host waits, want one for the encode",
+            queued.forwards, t_async.sync_waits
+        );
+        assert_eq!(
+            bits(&queued.embeddings),
+            bits(&sync.embeddings),
+            "queueing the forwards changed an embedding"
+        );
+
+        let dim = cfg.embedding_dim as usize;
+        for (n, ids) in batch.iter().enumerate() {
+            let alone = model.encode(&[ids], None, false).unwrap().embeddings;
+            let drift = queued.embeddings[n * dim..(n + 1) * dim]
+                .iter()
+                .zip(&alone)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0f32, f32::max);
+            assert!(
+                f64::from(drift) <= BATCH_ABS,
+                "sequence {n} ({} tokens), queued vs alone: {drift:.3e}",
                 ids.len()
             );
         }

@@ -154,7 +154,7 @@ fn encoder_attn_tiled_entry(head_dim: u32) -> Option<(&'static str, usize, usize
 /// `q`/`o`: `[batch, seq, heads, head_dim]`; `k`/`v`: `[batch, capacity,
 /// heads_kv, head_dim]` with `capacity >= seq` derived from their size
 /// ([`crate::nn::attn_kv_capacity`], as the K/V writer derives it), all f32
-/// (`o` bf16 when `out_bf16`). `lens`: `[batch]` u32,
+/// (there is no bf16 output: no encoder has a bf16 path). `lens`: `[batch]` u32,
 /// each sequence's live length. Keys at or past a row's length are masked,
 /// and every query at or past it is written as zeros. The lengths are device
 /// values the host cannot see; the kernel clamps each to `seq`, and a length
@@ -169,10 +169,9 @@ pub fn encoder_attn(
     o: &GpuBuffer,
     lens: &GpuBuffer,
     dims: EncoderAttnDims,
-    out_bf16: bool,
 ) -> Result<(), String> {
     let kernel = encoder_attn_kernel(rt, dims.head_dim);
-    encoder_attn_with(rt, q, k, v, o, lens, dims, out_bf16, kernel)
+    encoder_attn_with(rt, q, k, v, o, lens, dims, kernel)
 }
 
 /// [`encoder_attn`] on a named kernel (for the tests and the paired
@@ -186,7 +185,6 @@ pub fn encoder_attn_with(
     o: &GpuBuffer,
     lens: &GpuBuffer,
     dims: EncoderAttnDims,
-    out_bf16: bool,
     kernel: EncoderAttnKernel,
 ) -> Result<(), String> {
     const WHAT: &str = "embedgemma2::encoder_attn";
@@ -203,11 +201,7 @@ pub fn encoder_attn_with(
     }
     let q_elems = elems(&[dims.batch, dims.seq, dims.heads, dims.head_dim], WHAT)?;
     require::<f32>(rt, q, q_elems, "encoder_attn q")?;
-    if out_bf16 {
-        require::<u16>(rt, o, q_elems, "encoder_attn o")?;
-    } else {
-        require::<f32>(rt, o, q_elems, "encoder_attn o")?;
-    }
+    require::<f32>(rt, o, q_elems, "encoder_attn o")?;
     require::<u32>(rt, lens, dims.batch as usize, "encoder_attn lens")?;
     if q_elems == 0 {
         return Ok(());
@@ -262,8 +256,7 @@ pub fn encoder_attn_with(
             set_u32(bnd, dims.heads_kv, 7);
             set_u32(bnd, dims.window, 8);
             crate::dispatch::set_f32(bnd, dims.scale, 9);
-            set_u32(bnd, u32::from(out_bf16), 10);
-            set_u32(bnd, kv_capacity, 11);
+            set_u32(bnd, kv_capacity, 10);
         });
     }
     let rows_per_tg = groups * (32 / lanes);
@@ -281,8 +274,7 @@ pub fn encoder_attn_with(
         set_u32(bnd, dims.heads_kv, 7);
         set_u32(bnd, dims.window, 8);
         crate::dispatch::set_f32(bnd, dims.scale, 9);
-        set_u32(bnd, u32::from(out_bf16), 10);
-        set_u32(bnd, kv_capacity, 11);
+        set_u32(bnd, kv_capacity, 10);
     })
 }
 
@@ -678,18 +670,36 @@ pub struct EncodeOutput {
 /// each), against 24 one-layer GEMMs before.
 pub const PLE_RUN_BYTES: usize = 256 << 20;
 
-/// A forward's fixed cost in padded rows, for [`pack_forwards`]: each forward
-/// re-reads every weight (~0.6 GB of f32 outside the embedding table), about
-/// what a few hundred rows of compute cost. An estimate, not a measurement;
-/// it only steers how a batch is split, never what a sequence's embedding is.
-const FORWARD_COST_ROWS: usize = 256;
+/// A forward's fixed cost in padded rows, for [`pack_forwards`], measured as
+/// the intercept over the slope of `encode` time against padded rows (short
+/// uniform sequences, so attention is negligible: 1 to 128 sequences of 32
+/// tokens, min of 5 rounds, an ordinary least squares fit over the 8 shapes)
+/// on an M5 Pro with the real checkpoint.
+///
+/// With `async_encode` off, as every library caller runs (each dispatch
+/// commits and waits), it is `54.9 ms + 0.0525 ms/row`, so
+/// [`FORWARD_COST_ROWS_SYNC`] is 1046. The fixed part is a forward's
+/// dispatches each committing and waiting (inferred from the size of the gap
+/// to the queued fit).
+///
+/// With it on (the forwards queue and the host waits once) it is `3.42 ms +
+/// 0.0515 ms/row`, so [`FORWARD_COST_ROWS_ASYNC`] is 67. The fixed part is
+/// what a forward costs however few rows it has, most likely re-reading the
+/// f32 weights (inferred, not separately measured).
+///
+/// The data and the fits are `bench/results/embedgemma2_forward_cost_m5pro.json`
+/// (residuals within 2.2 ms of the queued fit, 6.8 ms of the synchronous
+/// one). The cost only steers how a batch is split, never what a sequence's
+/// embedding is.
+const FORWARD_COST_ROWS_SYNC: usize = 1046;
+const FORWARD_COST_ROWS_ASYNC: usize = 67;
 
 /// Split `batch` into forwards of at most `max_rows` padded rows and at most
 /// [`MAX_BATCH`] sequences. Indices are sorted longest first (ties in input
 /// order) and cut into contiguous runs minimizing `sum(run_len * longest) +
-/// FORWARD_COST_ROWS * runs`, so a long document does not pad short queries
+/// forward_cost_rows * runs`, so a long document does not pad short queries
 /// to its length. A sequence longer than `max_rows` runs alone.
-fn pack_forwards(batch: &[&[u32]], max_rows: usize) -> Vec<Vec<usize>> {
+fn pack_forwards(batch: &[&[u32]], max_rows: usize, forward_cost_rows: usize) -> Vec<Vec<usize>> {
     let mut order: Vec<usize> = (0..batch.len()).collect();
     order.sort_by_key(|&i| std::cmp::Reverse(batch[i].len()));
     let n = order.len();
@@ -708,7 +718,7 @@ fn pack_forwards(batch: &[&[u32]], max_rows: usize) -> Vec<Vec<usize>> {
             if rows > max_rows && end > start + 1 {
                 break;
             }
-            let cost = best[start].saturating_add(rows).saturating_add(FORWARD_COST_ROWS);
+            let cost = best[start].saturating_add(rows).saturating_add(forward_cost_rows);
             if cost < best[end] {
                 best[end] = cost;
                 cut[end] = start;
@@ -740,10 +750,6 @@ fn pack_forwards(batch: &[&[u32]], max_rows: usize) -> Vec<Vec<usize>> {
 struct Acts {
     rows: usize,
     nb: usize,
-    ids: GpuBuffer,
-    lens: GpuBuffer,
-    /// `[batch, 2]`: each sequence's live rows, `[b * seq, b * seq + len)`.
-    segments: GpuBuffer,
     /// `embed_tokens[ids] * sqrt(hidden)`, kept for the per-layer inputs.
     embeds: Tensor,
     resid: Tensor,
@@ -770,6 +776,18 @@ struct Acts {
     ple_gate: Tensor,
     ple_mid: Tensor,
     pooled: Tensor,
+}
+
+/// What one forward alone owns, because the host writes it before the forward
+/// runs and reads it after: a later forward must not rewrite it while the GPU
+/// may still be reading it, so each gets its own (small) set, and
+/// [`EmbedGemma2Model::encode`] keeps it alive until its one wait.
+struct ForwardIo {
+    ids: GpuBuffer,
+    lens: GpuBuffer,
+    /// `[batch, 2]`: each sequence's live rows, `[b * seq, b * seq + len)`.
+    segments: GpuBuffer,
+    /// `[batch, embedding_dim]`: the embeddings.
     out: Tensor,
 }
 
@@ -946,24 +964,56 @@ impl EmbedGemma2Model {
         }
 
         let dim = dim_out as usize;
+        let full = cfg.embedding_dim as usize;
         let mut embeddings = vec![0.0f32; batch.len() * dim];
         let mut out_trace = Vec::new();
         let mut forwards = 0u32;
-        let chunks = pack_forwards(batch, MAX_BATCH_TOKENS);
+        let cost = if self.rt.async_encode_enabled() {
+            FORWARD_COST_ROWS_ASYNC
+        } else {
+            FORWARD_COST_ROWS_SYNC
+        };
+        let chunks = pack_forwards(batch, MAX_BATCH_TOKENS, cost);
         // One set of activations for every forward: the most padded rows and
         // the most sequences any of them has (a chunk is padded to its first,
         // longest sequence).
         let rows = chunks.iter().map(|c| c.len() * batch[c[0]].len()).max().unwrap_or(0);
         let nb = chunks.iter().map(Vec::len).max().unwrap_or(0);
         let acts = self.acts(nb, rows)?;
-        for chunk in chunks {
-            let seqs: Vec<&[u32]> = chunk.iter().map(|&i| batch[i]).collect();
-            let (e, t) = self.forward(&acts, &seqs, dim_out, trace)?;
-            for (n, &i) in chunk.iter().enumerate() {
-                embeddings[i * dim..(i + 1) * dim].copy_from_slice(&e[n * dim..(n + 1) * dim]);
+        // The forwards are queued back to back and the host waits once, after
+        // the last. Each keeps its own host-written inputs and host-read
+        // output ([`ForwardIo`]), held in `pending` until then. The shared
+        // activations need no copy per forward: forward n + 1 rewrites them
+        // after forward n's last read of them, the same order of dependent
+        // dispatches (the runtime barriers each against the one before, and
+        // each command buffer against the queue) that one forward's layers
+        // already rely on for `resid`. Whether the GPU then runs ahead of the
+        // host encoding the next forward depends on the runtime's
+        // `async_encode`, which the caller owns: with it off every dispatch
+        // still commits and waits.
+        let mut pending: Vec<(Vec<usize>, ForwardIo)> = Vec::with_capacity(chunks.len());
+        let queued = (|| -> Result<(), String> {
+            for chunk in chunks {
+                let seqs: Vec<&[u32]> = chunk.iter().map(|&i| batch[i]).collect();
+                let (io, t) = self.forward(&acts, &seqs, dim_out, trace)?;
+                out_trace = t;
+                forwards += 1;
+                pending.push((chunk, io));
             }
-            out_trace = t;
-            forwards += 1;
+            Ok(())
+        })();
+        // Wait even when queuing failed: the buffers in `pending` and `acts`
+        // must outlive every command already queued on them (Metal 4 command
+        // buffers do not retain what they bind).
+        let waited = self.rt.synchronize();
+        queued?;
+        waited?;
+        for (chunk, io) in &pending {
+            // Read the prefix columns straight from the mapping: one copy.
+            let out = io.out.buffer.try_contents_f32()?;
+            for (n, &i) in chunk.iter().enumerate() {
+                embeddings[i * dim..(i + 1) * dim].copy_from_slice(&out[n * full..n * full + dim]);
+            }
         }
         Ok(EncodeOutput {
             embeddings,
@@ -972,16 +1022,20 @@ impl EmbedGemma2Model {
         })
     }
 
-    /// One forward over `batch` padded to its longest sequence (validated by
-    /// [`Self::encode`]; `batch.len() * longest <= MAX_BATCH_TOKENS`) in `a`,
-    /// returning `[batch, dim_out]` embeddings.
+    /// Queue one forward over `batch` padded to its longest sequence
+    /// (validated by [`Self::encode`]; `batch.len() * longest <=
+    /// MAX_BATCH_TOKENS`) in `a`, without waiting for it. The embeddings are
+    /// in the returned [`ForwardIo`]'s `out` once the caller has
+    /// synchronized, `[batch, embedding_dim]` with the first `dim_out`
+    /// columns normalized. With `trace` the forward waits per layer (one
+    /// sequence, one forward) and returns the residual stream after each.
     fn forward(
         &self,
         a: &Acts,
         batch: &[&[u32]],
         dim_out: u32,
         trace: bool,
-    ) -> Result<(Vec<f32>, Vec<Vec<f32>>), String> {
+    ) -> Result<(ForwardIo, Vec<Vec<f32>>), String> {
         const WHAT: &str = "EmbedGemma2Model::forward";
         let rt = &self.rt;
         let cfg = &self.cfg;
@@ -999,21 +1053,27 @@ impl EmbedGemma2Model {
                 a.rows, a.nb
             ));
         }
-        // The host buffers are rewritten in prefix; the previous forward
-        // waited for the GPU before reading its embeddings back.
+        // This forward's own inputs, written on the host without waiting for
+        // the GPU ([`GpuRuntime::alloc_buffer_from_u32`]; writing into a
+        // buffer already bound would wait for every queued forward). The GPU
+        // reads them when the forward runs, which may be after the host has
+        // queued the next one.
         let mut padded = vec![0u32; rows];
         for (b, ids) in batch.iter().enumerate() {
             padded[b * seq as usize..b * seq as usize + ids.len()].copy_from_slice(ids);
         }
-        a.ids.try_contents_u32()?[..rows].copy_from_slice(&padded);
         let lens: Vec<u32> = batch.iter().map(|ids| ids.len() as u32).collect();
-        a.lens.try_contents_u32()?[..lens.len()].copy_from_slice(&lens);
         let segs: Vec<u32> = batch
             .iter()
             .enumerate()
             .flat_map(|(b, ids)| [b as u32 * seq, b as u32 * seq + ids.len() as u32])
             .collect();
-        a.segments.try_contents_u32()?[..segs.len()].copy_from_slice(&segs);
+        let io = ForwardIo {
+            ids: rt.alloc_buffer_from_u32(&padded)?,
+            lens: rt.alloc_buffer_from_u32(&lens)?,
+            segments: rt.alloc_buffer_from_u32(&segs)?,
+            out: rt.alloc_tensor_unzeroed(&[nb as usize, cfg.embedding_dim as usize], DType::F32)?,
+        };
 
         let (h, rows_u) = (cfg.hidden, rows as u32);
         let eps = cfg.rms_norm_eps;
@@ -1031,7 +1091,7 @@ impl EmbedGemma2Model {
         // as an f32 in the fp32 forward this mirrors, here inside the gather.
         qwen35::embed_rows_scaled(
             rt,
-            &a.ids,
+            &io.ids,
             rows_u,
             LmHead {
                 weight: &self.embed.buffer,
@@ -1088,7 +1148,7 @@ impl EmbedGemma2Model {
                 &a.k.buffer,
                 &a.v.buffer,
                 &a.attn.buffer,
-                &a.lens,
+                &io.lens,
                 EncoderAttnDims {
                     batch: nb,
                     seq,
@@ -1098,7 +1158,6 @@ impl EmbedGemma2Model {
                     window: if s.sliding { cfg.sliding_window } else { 0 },
                     scale: 1.0,
                 },
-                false,
             )?;
             let attn = at(&a.attn, cfg.q_heads * s.head_dim)?;
             gemm(&attn, &layer.w_o, &y, BACKEND)?;
@@ -1182,25 +1241,17 @@ impl EmbedGemma2Model {
             }
         }
 
-        let (pooled, out) = (view(&a.pooled, nb, h)?, view(&a.out, nb, cfg.embedding_dim)?);
+        let (pooled, out) = (view(&a.pooled, nb, h)?, view(&io.out, nb, cfg.embedding_dim)?);
         rms_norm_f32(rt, &resid.buffer, &self.final_norm, &x.buffer, rows_u, h, eps)?;
-        segment_mean_rows(rt, &x.buffer, &a.segments, &pooled.buffer, nb, rows_u, h)?;
+        segment_mean_rows(rt, &x.buffer, &io.segments, &pooled.buffer, nb, rows_u, h)?;
         gemm(&pooled, &self.projection, &out, BACKEND)?;
         // A Matryoshka prefix normalizes its own columns; the rest are not read.
         l2_normalize_rows(rt, &out.buffer, nb, dim_out, cfg.embedding_dim)?;
-        rt.synchronize()?;
         if trace {
+            rt.synchronize()?;
             out_trace.push(x.buffer.try_contents_f32()?[..rows * h as usize].to_vec());
         }
-        let (full, dim) = (cfg.embedding_dim as usize, dim_out as usize);
-        // Read the prefix columns straight from the mapping: one copy.
-        let out = out.buffer.try_contents_f32()?;
-        let rows = out[..nb as usize * full]
-            .chunks_exact(full)
-            .flat_map(|row| &row[..dim])
-            .copied()
-            .collect();
-        Ok((rows, out_trace))
+        Ok((io, out_trace))
     }
 
     /// [`Acts`] for forwards of up to `rows` padded rows over up to `nb`
@@ -1221,13 +1272,9 @@ impl EmbedGemma2Model {
             kv_w = kv_w.max(kv * d);
         }
         let f32s = |shape: &[usize]| rt.alloc_tensor_unzeroed(shape, DType::F32);
-        let u32s = |n: usize| rt.alloc_buffer(n * 4);
         Ok(Acts {
             rows: r,
             nb,
-            ids: u32s(r)?,
-            lens: u32s(nb)?,
-            segments: u32s(2 * nb)?,
             embeds: f32s(&[r, h])?,
             resid: f32s(&[r, h])?,
             x: f32s(&[r, h])?,
@@ -1244,7 +1291,6 @@ impl EmbedGemma2Model {
             ple_gate: f32s(&[r, ple])?,
             ple_mid: f32s(&[r, ple])?,
             pooled: f32s(&[nb, h])?,
-            out: f32s(&[nb, cfg.embedding_dim as usize])?,
         })
     }
 }
@@ -1257,7 +1303,7 @@ fn view(t: &Tensor, rows: u32, cols: u32) -> Result<Tensor, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{encoder_attn_tiled_entry, pack_forwards, MAX_BATCH};
+    use super::{encoder_attn_tiled_entry, pack_forwards, FORWARD_COST_ROWS_ASYNC, FORWARD_COST_ROWS_SYNC, MAX_BATCH};
 
     /// Each tiled entry's name spells the geometry the host builds its grid
     /// from (`_q{BQ}_k{BK}_sg{NSG}`), and the source instantiates it with
@@ -1274,12 +1320,20 @@ mod tests {
         }
     }
 
-    /// Every index exactly once; each forward within the row budget and the
-    /// sequence cap; each forward padded to its first (longest) sequence.
+    /// [`check_at`] under the synchronous runtime's forward cost.
     fn check(lens: &[usize], max_rows: usize) -> Vec<Vec<usize>> {
+        let packs = check_at(lens, max_rows, FORWARD_COST_ROWS_SYNC);
+        check_at(lens, max_rows, FORWARD_COST_ROWS_ASYNC);
+        packs
+    }
+
+    /// Every index exactly once; each forward within the row budget and the
+    /// sequence cap; each forward padded to its first (longest) sequence;
+    /// never costlier than the two simple splits it replaces.
+    fn check_at(lens: &[usize], max_rows: usize, forward_cost: usize) -> Vec<Vec<usize>> {
         let seqs: Vec<Vec<u32>> = lens.iter().map(|&n| vec![0; n]).collect();
         let batch: Vec<&[u32]> = seqs.iter().map(Vec::as_slice).collect();
-        let packs = pack_forwards(&batch, max_rows);
+        let packs = pack_forwards(&batch, max_rows, forward_cost);
         let mut seen: Vec<usize> = packs.iter().flatten().copied().collect();
         seen.sort_unstable();
         assert_eq!(seen, (0..lens.len()).collect::<Vec<_>>(), "{lens:?}");
@@ -1291,12 +1345,7 @@ mod tests {
         }
         // Never worse than the two simple splits it replaces: all in one
         // forward when that fits, and greedy first-fit.
-        let cost = |packs: &[Vec<usize>]| -> usize {
-            packs
-                .iter()
-                .map(|p| p.len() * lens[p[0]] + super::FORWARD_COST_ROWS)
-                .sum()
-        };
+        let cost = |packs: &[Vec<usize>]| -> usize { packs.iter().map(|p| p.len() * lens[p[0]] + forward_cost).sum() };
         let mut order: Vec<usize> = (0..lens.len()).collect();
         order.sort_by_key(|&i| std::cmp::Reverse(lens[i]));
         let mut greedy: Vec<Vec<usize>> = Vec::new();
@@ -1323,6 +1372,23 @@ mod tests {
         // or the short texts padded to 1658.
         let packs = check(&[20, 27, 10, 28, 42, 17, 1658, 6147], 32_768);
         assert_eq!(packs, vec![vec![7], vec![6], vec![4, 3, 1, 0, 5, 2]]);
+    }
+
+    /// A forward's fixed cost steers the split: two sequences of 300 and 200
+    /// tokens cost 600 padded rows together and 500 apart plus one more
+    /// forward's fixed cost. Where a forward costs more than 100 rows (the
+    /// synchronous runtime's 1046) they share one; where it costs less (the
+    /// queued runtime's 67) they split. A single constant, 256 before it was
+    /// measured, packed them together in both.
+    #[test]
+    fn the_forward_cost_decides_whether_a_small_saving_splits() {
+        let seqs = [vec![0u32; 300], vec![0u32; 200]];
+        let batch: Vec<&[u32]> = seqs.iter().map(Vec::as_slice).collect();
+        assert_eq!(pack_forwards(&batch, 32_768, FORWARD_COST_ROWS_SYNC), vec![vec![0, 1]]);
+        assert_eq!(
+            pack_forwards(&batch, 32_768, FORWARD_COST_ROWS_ASYNC),
+            vec![vec![0], vec![1]]
+        );
     }
 
     #[test]

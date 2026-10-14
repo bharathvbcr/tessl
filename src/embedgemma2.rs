@@ -1378,6 +1378,114 @@ mod tests {
         assert_eq!(drops.get(), 2);
     }
 
+    /// Adversarial: the call order is make, run per chunk in input order, a
+    /// failure stops later chunks from being made or run, and no io is
+    /// released by `queue_forwards` itself, success or failure.
+    #[test]
+    fn queue_forwards_orders_calls_and_never_releases_io() {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+        struct Io(usize, Rc<RefCell<Vec<String>>>);
+        impl Drop for Io {
+            fn drop(&mut self) {
+                self.1.borrow_mut().push(format!("drop{}", self.0));
+            }
+        }
+        for fail_at in [None, Some(0usize), Some(2)] {
+            let log = Rc::new(RefCell::new(Vec::<String>::new()));
+            let mut pending: Vec<(Vec<usize>, Io)> = Vec::new();
+            let (l1, l2) = (log.clone(), log.clone());
+            let r = queue_forwards(
+                vec![vec![0], vec![1], vec![2], vec![3]],
+                &mut pending,
+                |c| {
+                    l1.borrow_mut().push(format!("make{}", c[0]));
+                    Ok(Io(c[0], l1.clone()))
+                },
+                |c, io| {
+                    assert_eq!(io.0, c[0], "run gets the io made for its own chunk");
+                    l2.borrow_mut().push(format!("run{}", c[0]));
+                    if Some(c[0]) == fail_at {
+                        Err("boom".to_string())
+                    } else {
+                        Ok(())
+                    }
+                },
+            );
+            let expect_queued = fail_at.map_or(4, |f| f + 1);
+            assert_eq!(r.is_err(), fail_at.is_some());
+            assert_eq!(pending.len(), expect_queued, "fail_at {fail_at:?}");
+            let want: Vec<String> = (0..expect_queued)
+                .flat_map(|i| [format!("make{i}"), format!("run{i}")])
+                .collect();
+            assert_eq!(
+                *log.borrow(),
+                want,
+                "no later chunk is made or run, and nothing dropped"
+            );
+            let ids: Vec<usize> = pending.iter().map(|(c, _)| c[0]).collect();
+            assert_eq!(ids, (0..expect_queued).collect::<Vec<_>>(), "input order");
+        }
+    }
+
+    /// A panicking forward (not just an Err) leaves its io in `pending`, which
+    /// the caller owns and unwinds after the wait.
+    #[test]
+    fn a_panicking_run_leaves_its_io_registered() {
+        let mut pending: Vec<(Vec<usize>, u8)> = Vec::new();
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = queue_forwards(
+                vec![vec![7]],
+                &mut pending,
+                |_| Ok(1u8),
+                |_, _| -> Result<(), String> { panic!("run panics") },
+            );
+        }));
+        assert!(r.is_err());
+        assert_eq!(pending.len(), 1);
+    }
+
+    /// Existing entries in `pending` are kept and appended to; no chunks is a
+    /// no-op that calls neither closure.
+    #[test]
+    fn queue_forwards_appends_and_handles_no_chunks() {
+        let mut pending = vec![(vec![9usize], 0u8)];
+        let r = queue_forwards(
+            Vec::new(),
+            &mut pending,
+            |_| -> Result<u8, String> { panic!("make called") },
+            |_, _| -> Result<(), String> { panic!("run called") },
+        );
+        assert_eq!(r, Ok(()));
+        assert_eq!(pending.len(), 1);
+        queue_forwards(vec![vec![1]], &mut pending, |_| Ok(1u8), |_, _| Ok(())).unwrap();
+        assert_eq!(pending.iter().map(|p| p.0[0]).collect::<Vec<_>>(), vec![9, 1]);
+    }
+
+    /// Adversarial packing: pack_forwards on degenerate budgets still yields a
+    /// forward per sequence at worst, every index once, nothing over the cap.
+    #[test]
+    fn pack_forwards_degenerate_budgets() {
+        let seqs: Vec<Vec<u32>> = vec![vec![0; 3], vec![0; 1], vec![0; 2]];
+        let batch: Vec<&[u32]> = seqs.iter().map(Vec::as_slice).collect();
+        for max_rows in [0usize, 1, 2, usize::MAX] {
+            for cost in [0usize, 1, usize::MAX] {
+                let packs = pack_forwards(&batch, max_rows, cost);
+                let mut seen: Vec<usize> = packs.iter().flatten().copied().collect();
+                seen.sort_unstable();
+                assert_eq!(seen, vec![0, 1, 2], "max_rows {max_rows} cost {cost}");
+                for p in &packs {
+                    assert!(p.len() <= MAX_BATCH);
+                    assert_eq!(batch[p[0]].len(), p.iter().map(|&i| batch[i].len()).max().unwrap());
+                }
+            }
+        }
+        assert!(pack_forwards(&[], 10, 1).is_empty());
+        let many = vec![vec![0u32; 1]; MAX_BATCH * 2 + 1];
+        let b: Vec<&[u32]> = many.iter().map(Vec::as_slice).collect();
+        assert!(pack_forwards(&b, usize::MAX, 0).iter().all(|p| p.len() <= MAX_BATCH));
+    }
+
     /// A failing `make` queues nothing for that chunk.
     #[test]
     fn a_failed_io_allocation_stops_the_queue() {

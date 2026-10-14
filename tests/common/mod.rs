@@ -36,7 +36,7 @@ use tessl::{GpuRuntime, Tensor};
 /// that fails in CI, so the serialization is enforced here instead.
 static GPU: Mutex<()> = Mutex::new(());
 
-fn gpu_lock() -> MutexGuard<'static, ()> {
+pub fn gpu_lock() -> MutexGuard<'static, ()> {
     // A panicking test poisons the mutex. Recovering keeps one real failure
     // from cascading into a screen of misleading "poisoned" errors that hide it.
     GPU.lock().unwrap_or_else(|poisoned| poisoned.into_inner())

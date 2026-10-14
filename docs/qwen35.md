@@ -804,8 +804,10 @@ rounds to 1), so its test is the forward past 88, where only the threshold
 keeps `e^x` from overflowing. Within 7e-7 of the f64 reference through the
 threshold, the series range and block edges; ten of twelve injected defects
 fail it, the other two (moving or removing the backward's threshold) being
-f32-equivalent. `copy_cols` moves a column window between layouts (q, k, v
-between the conv output and `gdn_train`'s dense operands).
+f32-equivalent. `copy_cols` moves a column window between layouts. The GDN
+training step no longer uses it: `gdn_train` reads q, k, v through column
+windows of the conv output and writes dq, dk, dv into the conv gradient the
+same way, key heads shared by their value heads.
 
 ### Training attention: `tessl::attn_train`
 

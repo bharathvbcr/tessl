@@ -26,9 +26,17 @@
 // fixed order by gdn_train_bwd_finish, which also applies the l2norm
 // backward: nothing uses atomics, so every result is deterministic.
 //
-// Layouts (all f32, dense): q, k, dq, dk [B, T, H, 128]; v, o, dv, do
-// [B, T, H, Dv]; g, beta, dg, dbeta [B, T, H]; states [B, H, 128, Dv];
-// checkpoints [B, H, NC, 128, Dv] with NC = ceil(T / GDN_TRAIN_CKPT).
+// Layouts (all f32): o, do [B, T, H, Dv]; g, beta, dg, dbeta [B, T, H];
+// states [B, H, 128, Dv]; checkpoints [B, H, NC, 128, Dv] with
+// NC = ceil(T / GDN_TRAIN_CKPT). q, k, v and the gradients dq, dk, dv are
+// column windows of a row-major matrix with one row per token (b * T + t):
+// element (token, head, d) of q is q[token * ldq + offq + head * 128 + d], of
+// v v[token * ldv + offv + head * Dv + d], and so on (the Qwen3.5 conv output
+// is [q | k | v] with ld = its width). q and k have Hk key heads and H value
+// heads share them, H / Hk to a key head: value head h reads key head
+// h / (H / Hk) (transformers' repeat_interleave), and dq, dk are summed over
+// each key head's value heads in value-head order. A dense [B, T, H, 128]
+// operand is ld = H * 128, off = 0, Hk = H.
 #include <metal_stdlib>
 using namespace metal;
 
@@ -75,6 +83,13 @@ kernel void gdn_train_fwd(
     constant uint &H [[buffer(11)]],
     constant uint &Dv [[buffer(12)]],
     constant uint &flags [[buffer(13)]],
+    constant uint &ldq [[buffer(14)]],
+    constant uint &offq [[buffer(15)]],
+    constant uint &ldk [[buffer(16)]],
+    constant uint &offk [[buffer(17)]],
+    constant uint &ldv [[buffer(18)]],
+    constant uint &offv [[buffer(19)]],
+    constant uint &Hk [[buffer(20)]],
     uint2 tg [[threadgroup_position_in_grid]],
     uint i [[thread_index_in_threadgroup]],
     uint sg [[simdgroup_index_in_threadgroup]],
@@ -85,6 +100,7 @@ kernel void gdn_train_fwd(
     const uint bh = tg.y;
     if (bh >= B * H || (tg.x + 1) * BV > Dv) return;  // uniform per threadgroup
     const uint b = bh / H, h = bh % H, j0 = tg.x * BV;
+    const uint hk = h / (H / Hk);
     const uint nc = (T + GDN_TRAIN_CKPT - 1) / GDN_TRAIN_CKPT;
     const float scale = rsqrt((float)GDN_TRAIN_DK);
     const ulong srow = ((ulong)bh * GDN_TRAIN_DK + i) * Dv + j0;
@@ -100,9 +116,10 @@ kernel void gdn_train_fwd(
                 ckpt[c * Dv + j0 + j] = S[j];
             }
         }
-        const ulong r = ((ulong)b * T + t) * H + h;
-        const float qi = q[r * GDN_TRAIN_DK + i];
-        const float ki = k[r * GDN_TRAIN_DK + i];
+        const ulong tok = (ulong)b * T + t;
+        const ulong r = tok * H + h;
+        const float qi = q[tok * ldq + offq + hk * GDN_TRAIN_DK + i];
+        const float ki = k[tok * ldk + offk + hk * GDN_TRAIN_DK + i];
         const float a = precise::exp(g[r]);
         const float bt = beta[r];
 
@@ -121,7 +138,7 @@ kernel void gdn_train_fwd(
 
         float po[BV], out[BV];
         for (uint j = 0; j < BV; ++j) {
-            const float u = v[r * Dv + j0 + j] - rk * tot[j];
+            const float u = v[tok * ldv + offv + (ulong)h * Dv + j0 + j] - rk * tot[j];
             S[j] += kh * (bt * u);
             po[j] = S[j] * qh;
         }
@@ -167,6 +184,15 @@ kernel void gdn_train_bwd(
     constant uint &H [[buffer(17)]],
     constant uint &Dv [[buffer(18)]],
     constant uint &flags [[buffer(19)]],
+    constant uint &ldq [[buffer(20)]],
+    constant uint &offq [[buffer(21)]],
+    constant uint &ldk [[buffer(22)]],
+    constant uint &offk [[buffer(23)]],
+    constant uint &ldv [[buffer(24)]],
+    constant uint &offv [[buffer(25)]],
+    constant uint &Hk [[buffer(26)]],
+    constant uint &lddv [[buffer(27)]],
+    constant uint &offdv [[buffer(28)]],
     uint2 tg [[threadgroup_position_in_grid]],
     uint i [[thread_index_in_threadgroup]],
     uint sg [[simdgroup_index_in_threadgroup]],
@@ -182,6 +208,7 @@ kernel void gdn_train_bwd(
     const uint ns = Dv / BV;
     if (bh >= B * H || (tg.x + 1) * BV > Dv) return;  // uniform per threadgroup
     const uint b = bh / H, h = bh % H, j0 = tg.x * BV;
+    const uint hk = h / (H / Hk);
     const uint nc = (T + C - 1) / C;
     const float scale = rsqrt((float)GDN_TRAIN_DK);
     const ulong srow = ((ulong)bh * GDN_TRAIN_DK + i) * Dv + j0;
@@ -210,9 +237,10 @@ kernel void gdn_train_bwd(
             for (uint j = 0; j < BV; ++j) {
                 mine[((ulong)lt * GDN_TRAIN_DK + i) * BV + j] = S[j];
             }
-            const ulong r = ((ulong)b * T + t) * H + h;
-            const float qi = q[r * GDN_TRAIN_DK + i];
-            const float ki = k[r * GDN_TRAIN_DK + i];
+            const ulong tok = (ulong)b * T + t;
+            const ulong r = tok * H + h;
+            const float qi = q[tok * ldq + offq + hk * GDN_TRAIN_DK + i];
+            const float ki = k[tok * ldk + offk + hk * GDN_TRAIN_DK + i];
             const float a = precise::exp(g[r]);
             float p[BV + 2], tot[BV + 2];
             for (uint j = 0; j < BV; ++j) {
@@ -226,7 +254,7 @@ kernel void gdn_train_bwd(
             const float kh = ki * rk;
             const float bt = beta[r];
             for (uint j = 0; j < BV; ++j) {
-                const float u = v[r * Dv + j0 + j] - rk * tot[j];
+                const float u = v[tok * ldv + offv + (ulong)h * Dv + j0 + j] - rk * tot[j];
                 S[j] += kh * (bt * u);
                 if (i == j) {
                     u_c[lt * BV + j] = u;
@@ -242,11 +270,12 @@ kernel void gdn_train_bwd(
         // Reverse over the chunk.
         for (uint t = t1; t-- > t0;) {
             const uint lt = t - t0;
-            const ulong r = ((ulong)b * T + t) * H + h;
+            const ulong tok = (ulong)b * T + t;
+            const ulong r = tok * H + h;
             const float a = precise::exp(g[r]);
             const float bt = beta[r];
-            const float kh = k[r * GDN_TRAIN_DK + i] * rk_c[lt];
-            const float qh = q[r * GDN_TRAIN_DK + i] * rq_c[lt] * scale;
+            const float kh = k[tok * ldk + offk + hk * GDN_TRAIN_DK + i] * rk_c[lt];
+            const float qh = q[tok * ldq + offq + hk * GDN_TRAIN_DK + i] * rq_c[lt] * scale;
 
             float Sh[BV], delta[BV], dorow[BV];
             float dqh = 0.0f;
@@ -273,7 +302,7 @@ kernel void gdn_train_bwd(
             gdn_colsum<1>(dgp, red[1], sg, lane, dgt);
 
             if (i < BV) {
-                dv[r * Dv + j0 + i] = bt * ddelta[i];
+                dv[tok * lddv + offdv + (ulong)h * Dv + j0 + i] = bt * ddelta[i];
             }
             const ulong part = (ulong)tg.x * rows + r;
             dq_part[part * GDN_TRAIN_DK + i] = dqh;
@@ -298,7 +327,12 @@ kernel void gdn_train_bwd(
 /// Sum the per-slice partials in slice order and apply the l2norm backward:
 /// with y = x r, r = rsqrt(|x|^2 + eps), dx = r (dy - y (y . dy)); for q the
 /// incoming gradient is also scaled by 1/sqrt(Dk). One threadgroup of 128 per
-/// (b, t, h) row.
+/// (token, key head) row: q and k are read through their windows once, and
+/// each of the key head's H / Hk value heads (partials, dg, dbeta live per
+/// value head, `rows` = B * T * H of them) contributes its dx; they are added
+/// in value-head order into the dq and dk windows. The sum goes through
+/// threadgroup memory so the compiler cannot fuse the add into the product
+/// that made it: the result is the sum of separately rounded gradients.
 kernel void gdn_train_bwd_finish(
     device const float *q [[buffer(0)]],
     device const float *k [[buffer(1)]],
@@ -312,37 +346,64 @@ kernel void gdn_train_bwd_finish(
     device float *dbeta [[buffer(9)]],
     constant uint &rows [[buffer(10)]],
     constant uint &ns [[buffer(11)]],
+    constant uint &ldq [[buffer(12)]],
+    constant uint &offq [[buffer(13)]],
+    constant uint &ldk [[buffer(14)]],
+    constant uint &offk [[buffer(15)]],
+    constant uint &lddq [[buffer(16)]],
+    constant uint &offdq [[buffer(17)]],
+    constant uint &lddk [[buffer(18)]],
+    constant uint &offdk [[buffer(19)]],
+    constant uint &toks [[buffer(20)]],
+    constant uint &H [[buffer(21)]],
+    constant uint &Hk [[buffer(22)]],
     uint r [[threadgroup_position_in_grid]],
     uint i [[thread_index_in_threadgroup]],
     uint sg [[simdgroup_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]])
 {
     threadgroup float red[2][GDN_TRAIN_SG * 2];
-    if (r >= rows) return;  // uniform per threadgroup
-    const ulong at = (ulong)r * GDN_TRAIN_DK + i;
-    float dqh = 0.0f, dkh = 0.0f;
-    for (uint s = 0; s < ns; ++s) {
-        dqh += dq_part[(ulong)s * rows * GDN_TRAIN_DK + at];
-        dkh += dk_part[(ulong)s * rows * GDN_TRAIN_DK + at];
-    }
-    const float qi = q[at], ki = k[at];
+    threadgroup float stage[2][GDN_TRAIN_DK];
+    if (r >= toks * Hk) return;  // uniform per threadgroup
+    const uint tok = r / Hk, hk = r % Hk, ratio = H / Hk;
+    const ulong qat = (ulong)tok * ldq + offq + (ulong)hk * GDN_TRAIN_DK + i;
+    const ulong kat = (ulong)tok * ldk + offk + (ulong)hk * GDN_TRAIN_DK + i;
+    const float qi = q[qat], ki = k[kat];
     float p[2] = {qi * qi, ki * ki}, tot[2];
     gdn_colsum<2>(p, red[0], sg, lane, tot);
     const float rq = precise::rsqrt(tot[0] + GDN_TRAIN_L2_EPS);
     const float rk = precise::rsqrt(tot[1] + GDN_TRAIN_L2_EPS);
     const float yq = qi * rq, yk = ki * rk;
-    const float dyq = dqh * rsqrt((float)GDN_TRAIN_DK);
-    float p2[2] = {yq * dyq, yk * dkh}, dots[2];
-    gdn_colsum<2>(p2, red[1], sg, lane, dots);
-    dq[at] = rq * (dyq - yq * dots[0]);
-    dk[at] = rk * (dkh - yk * dots[1]);
-    if (i == 0) {
-        float a = 0.0f, bsum = 0.0f;
+    float sq = 0.0f, sk = 0.0f;
+    for (uint j = 0; j < ratio; ++j) {
+        const ulong vr = (ulong)tok * H + (ulong)hk * ratio + j;
+        const ulong at = vr * GDN_TRAIN_DK + i;
+        float dqh = 0.0f, dkh = 0.0f;
         for (uint s = 0; s < ns; ++s) {
-            a += dg_part[(ulong)s * rows + r];
-            bsum += dbeta_part[(ulong)s * rows + r];
+            dqh += dq_part[(ulong)s * rows * GDN_TRAIN_DK + at];
+            dkh += dk_part[(ulong)s * rows * GDN_TRAIN_DK + at];
         }
-        dg[r] = a;
-        dbeta[r] = bsum;
+        const float dyq = dqh * rsqrt((float)GDN_TRAIN_DK);
+        float p2[2] = {yq * dyq, yk * dkh}, dots[2];
+        // red[0] holds the norms' sums (read above, ordered by this call's
+        // barrier for j = 0); successive calls alternate buffers.
+        gdn_colsum<2>(p2, red[(j + 1) & 1u], sg, lane, dots);
+        stage[0][i] = rq * (dyq - yq * dots[0]);
+        stage[1][i] = rk * (dkh - yk * dots[1]);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        const float xq = stage[0][i], xk = stage[1][i];
+        sq = j == 0 ? xq : sq + xq;
+        sk = j == 0 ? xk : sk + xk;
+        if (i == 0) {
+            float a = 0.0f, bsum = 0.0f;
+            for (uint s = 0; s < ns; ++s) {
+                a += dg_part[(ulong)s * rows + vr];
+                bsum += dbeta_part[(ulong)s * rows + vr];
+            }
+            dg[vr] = a;
+            dbeta[vr] = bsum;
+        }
     }
+    dq[(ulong)tok * lddq + offdq + (ulong)hk * GDN_TRAIN_DK + i] = sq;
+    dk[(ulong)tok * lddk + offdk + (ulong)hk * GDN_TRAIN_DK + i] = sk;
 }

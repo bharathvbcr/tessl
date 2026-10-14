@@ -622,3 +622,46 @@ fn an_unwaited_step_count_rolls_back_on_a_poisoned_runtime() {
     rt.poison_as_shared_event_timeout_for_test();
     assert_eq!(state.step_count(), 1, "the unwaited steps were not rolled back");
 }
+
+/// The GDN kernels read q, k and v through column windows of the conv output
+/// and write dq, dk and dv into the conv gradient's columns, key heads
+/// shared by their value heads: a step runs no `qwen35_copy_cols_f32` (it
+/// used to copy q, k, v out of the conv output and their gradients back, and
+/// on grouped heads repeat each key head and sum each gradient back, per
+/// layer), on the ungrouped fixture and the grouped one (4 value heads over
+/// 2 key heads), on every lane. A step still runs the GDN kernels.
+#[test]
+fn a_gdn_step_copies_no_columns() {
+    in_traced_child("a_gdn_step_copies_no_columns", || {
+        let count = tessl::runtime::traced_kernel_count;
+        for dir in ["qwen35_train", "qwen35_train_grouped"] {
+            let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures").join(dir);
+            let ids = tessl::npy::read_npy(&root.join("ids.npy")).unwrap();
+            let ids: Vec<u32> = ids.i64_slice().unwrap().iter().map(|&x| x as u32).collect();
+            let rt = GpuRuntime::new().unwrap();
+            let cfg = Qwen35Config::from_config_file(&root.join("config.json")).unwrap();
+            let st = SafeTensors::open(&root.join("model.safetensors")).unwrap();
+            for (lane, precision, op) in lanes() {
+                let model = match precision {
+                    Precision::F32 => Qwen35Model::load(&rt, &st, "model.", cfg.clone(), precision).unwrap(),
+                    Precision::Bf16 => Qwen35Model::load_tower(&rt, &st, "model.", cfg.clone(), precision).unwrap(),
+                };
+                let (copies, gdn) = (count("qwen35_copy_cols_f32"), count("gdn_train_bwd"));
+                let bank = Qwen35Grads::zeros_like(&model).unwrap();
+                model
+                    .train_step_into(&ids, op, Supervise::Causal, &bank, false)
+                    .unwrap();
+                rt.synchronize().unwrap();
+                assert!(
+                    count("gdn_train_bwd") > gdn,
+                    "{dir}, {lane}: the step ran no GDN backward"
+                );
+                assert_eq!(
+                    count("qwen35_copy_cols_f32"),
+                    copies,
+                    "{dir}, {lane}: a training step copied columns"
+                );
+            }
+        }
+    });
+}

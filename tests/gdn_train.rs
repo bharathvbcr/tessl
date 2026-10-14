@@ -500,3 +500,317 @@ fn the_host_refuses_what_the_kernels_cannot_run() {
         );
     });
 }
+
+/// The grouped-heads form: `q`, `k`, `v` read, and `dq`, `dk`, `dv` written,
+/// as windows of one `[tokens, ld]` matrix (the Qwen3.5 conv output's layout,
+/// behind a pad column block), with `key_heads < heads`. Every output is
+/// bit-identical to what the dense kernels give on the host-repeated operands
+/// (each key head copied to its `r` value heads), with `dq` and `dk` the host
+/// sums of the dense per-value-head gradients in value-head order: what
+/// `repeat_heads` and `sum_heads` computed. Columns outside the windows are
+/// never written.
+#[test]
+fn windows_with_shared_key_heads_equal_the_repeated_dense_path() {
+    use tessl::gdn_train::{gdn_train_backward_windowed, gdn_train_forward_windowed};
+    use tessl::gdn_train::{GdnTrainWindowedGrads, GdnTrainWindowedInputs, GdnWindow};
+    const PAD: usize = 8;
+    with_gpu(|rt| {
+        for (hk, hv) in [(2usize, 2usize), (2, 4), (1, 3)] {
+            let (b, t, dv, dk) = (2usize, 70usize, 32usize, 128usize);
+            let r = hv / hk;
+            let tokens = b * t;
+            let (qw, vw) = (hk * dk, hv * dv);
+            let ld = PAD + 2 * qw + vw;
+            let seed = 500 + hv as u64;
+            let conv = random_f32(tokens * ld, seed);
+            let col = |tok: usize, c: usize| conv[tok * ld + c];
+            // The dense operands: value head h reads key head h / r.
+            let (mut qd, mut kd, mut vd) = (Vec::new(), Vec::new(), Vec::new());
+            for tok in 0..tokens {
+                for h in 0..hv {
+                    let hkh = h / r;
+                    qd.extend((0..dk).map(|i| col(tok, PAD + hkh * dk + i)));
+                    kd.extend((0..dk).map(|i| col(tok, PAD + qw + hkh * dk + i)));
+                    vd.extend((0..dv).map(|j| col(tok, PAD + 2 * qw + h * dv + j)));
+                }
+            }
+            let n = tokens * hv;
+            let g: Vec<f32> = random_f32(n, seed + 1)
+                .iter()
+                .map(|&x| -0.75 * (x + 1.0) - 1e-3)
+                .collect();
+            let beta: Vec<f32> = random_f32(n, seed + 2).iter().map(|&x| 0.5 + 0.45 * x).collect();
+            let s0 = random_f32(b * hv * dk * dv, seed + 3);
+            let d_o = random_f32(n * dv, seed + 4);
+            let dfin = random_f32(b * hv * dk * dv, seed + 5);
+            let dims = GdnTrainDims {
+                batch: b as u32,
+                seq: t as u32,
+                heads: hv as u32,
+                v_dim: dv as u32,
+            };
+            let label = format!("hk={hk} hv={hv}");
+
+            let convt = tensor(rt, &[tokens, ld], &conv);
+            let (gt, bt) = (tensor(rt, &[b, t, hv], &g), tensor(rt, &[b, t, hv], &beta));
+            let s0t = tensor(rt, &[b, hv, dk, dv], &s0);
+            let (d_ot, dfint) = (tensor(rt, &[b, t, hv, dv], &d_o), tensor(rt, &[b, hv, dk, dv], &dfin));
+            let ws = GdnTrainWorkspace::new(rt, dims).unwrap();
+
+            // Dense reference on the repeated operands.
+            let (q, k, v) = (
+                tensor(rt, &[b, t, hv, dk], &qd),
+                tensor(rt, &[b, t, hv, dk], &kd),
+                tensor(rt, &[b, t, hv, dv], &vd),
+            );
+            let xd = GdnTrainInputs {
+                q: &q,
+                k: &k,
+                v: &v,
+                g: &gt,
+                beta: &bt,
+                s0: Some(&s0t),
+            };
+            let (od, sfd, ckd) = (
+                sentinel(rt, &[b, t, hv, dv]),
+                sentinel(rt, &[b, hv, dk, dv]),
+                sentinel(rt, &dims.checkpoint_shape()),
+            );
+            gdn_train_forward(rt, dims, xd, &od, Some(&sfd), &ckd).unwrap();
+            let (dq, dkk, dvd) = (
+                sentinel(rt, &[b, t, hv, dk]),
+                sentinel(rt, &[b, t, hv, dk]),
+                sentinel(rt, &[b, t, hv, dv]),
+            );
+            let (dgd, dbd, ds0d) = (
+                sentinel(rt, &[b, t, hv]),
+                sentinel(rt, &[b, t, hv]),
+                sentinel(rt, &[b, hv, dk, dv]),
+            );
+            gdn_train_backward(
+                rt,
+                dims,
+                xd,
+                &ckd,
+                &d_ot,
+                Some(&dfint),
+                &ws,
+                GdnTrainGrads {
+                    dq: &dq,
+                    dk: &dkk,
+                    dv: &dvd,
+                    dg: &dgd,
+                    dbeta: &dbd,
+                    ds0: Some(&ds0d),
+                },
+            )
+            .unwrap();
+
+            // Windowed.
+            macro_rules! win {
+                ($t:expr, $off:expr) => {
+                    GdnWindow {
+                        tensor: $t,
+                        ld: ld as u32,
+                        off: $off as u32,
+                    }
+                };
+            }
+            let xw = GdnTrainWindowedInputs {
+                q: win!(&convt, PAD),
+                k: win!(&convt, PAD + qw),
+                v: win!(&convt, PAD + 2 * qw),
+                key_heads: hk as u32,
+                g: &gt,
+                beta: &bt,
+                s0: Some(&s0t),
+            };
+            let (ow, sfw, ckw) = (
+                sentinel(rt, &[b, t, hv, dv]),
+                sentinel(rt, &[b, hv, dk, dv]),
+                sentinel(rt, &dims.checkpoint_shape()),
+            );
+            gdn_train_forward_windowed(rt, dims, xw, &ow, Some(&sfw), &ckw).unwrap();
+            let dconv = sentinel(rt, &[tokens, ld]);
+            let (dgw, dbw, ds0w) = (
+                sentinel(rt, &[b, t, hv]),
+                sentinel(rt, &[b, t, hv]),
+                sentinel(rt, &[b, hv, dk, dv]),
+            );
+            gdn_train_backward_windowed(
+                rt,
+                dims,
+                xw,
+                &ckw,
+                &d_ot,
+                Some(&dfint),
+                &ws,
+                GdnTrainWindowedGrads {
+                    dq: win!(&dconv, PAD),
+                    dk: win!(&dconv, PAD + qw),
+                    dv: win!(&dconv, PAD + 2 * qw),
+                    dg: &dgw,
+                    dbeta: &dbw,
+                    ds0: Some(&ds0w),
+                },
+            )
+            .unwrap();
+
+            let same = |name: &str, a: &Tensor, bb: &Tensor| {
+                let (x, y) = (a.read_f32().unwrap(), bb.read_f32().unwrap());
+                assert_eq!(x.len(), y.len(), "{label} {name}: length");
+                if let Some(i) = (0..x.len()).find(|&i| x[i].to_bits() != y[i].to_bits()) {
+                    panic!("{label} {name}[{i}]: windowed {} dense {}", x[i], y[i]);
+                }
+            };
+            same("o", &ow, &od);
+            same("final state", &sfw, &sfd);
+            same("ckpt", &ckw, &ckd);
+            same("dg", &dgw, &dgd);
+            same("dbeta", &dbw, &dbd);
+            same("ds0", &ds0w, &ds0d);
+            let dc = dconv.read_f32().unwrap();
+            let (dqh, dkh, dvh) = (dq.read_f32().unwrap(), dkk.read_f32().unwrap(), dvd.read_f32().unwrap());
+            for tok in 0..tokens {
+                let row = &dc[tok * ld..(tok + 1) * ld];
+                assert!(
+                    row[..PAD].iter().all(|&x| x == SENTINEL),
+                    "{label}: the pad columns were written"
+                );
+                for (name, off, dense) in [("dq", PAD, &dqh), ("dk", PAD + qw, &dkh)] {
+                    for hkh in 0..hk {
+                        for i in 0..dk {
+                            // Value heads' gradients added in value-head order.
+                            let at = |j: usize| dense[(tok * hv + hkh * r + j) * dk + i];
+                            let want = (1..r).fold(at(0), |acc, j| acc + at(j));
+                            let got = row[off + hkh * dk + i];
+                            assert_eq!(
+                                got.to_bits(),
+                                want.to_bits(),
+                                "{label} {name} tok {tok} head {hkh} [{i}]"
+                            );
+                        }
+                    }
+                }
+                for h in 0..hv {
+                    for j in 0..dv {
+                        let got = row[PAD + 2 * qw + h * dv + j];
+                        let want = dvh[(tok * hv + h) * dv + j];
+                        assert_eq!(got.to_bits(), want.to_bits(), "{label} dv tok {tok} head {h} [{j}]");
+                    }
+                }
+            }
+            eprintln!("{label}: windowed == repeated dense, bit for bit");
+        }
+    });
+}
+
+/// A window that does not fit its matrix, or windows of one output matrix
+/// that overlap, or an output window over an input, is refused by name.
+#[test]
+fn the_host_refuses_bad_windows() {
+    use tessl::gdn_train::{gdn_train_backward_windowed, gdn_train_forward_windowed};
+    use tessl::gdn_train::{GdnTrainWindowedGrads, GdnTrainWindowedInputs, GdnWindow};
+    with_gpu(|rt| {
+        let dims = GdnTrainDims {
+            batch: 1,
+            seq: 5,
+            heads: 4,
+            v_dim: 32,
+        };
+        let z = |shape: &[usize]| rt.alloc_tensor_f32(shape).unwrap();
+        // [q (1 key head) | k | v (4 heads)] = 128 + 128 + 128 columns.
+        let ld = 2 * 128 + 4 * 32;
+        let (conv, dconv) = (z(&[5, ld]), z(&[5, ld]));
+        let (g, beta) = (z(&[1, 5, 4]), z(&[1, 5, 4]));
+        macro_rules! w {
+            ($t:expr, $off:expr) => {
+                GdnWindow {
+                    tensor: $t,
+                    ld: ld as u32,
+                    off: $off,
+                }
+            };
+        }
+        let x = GdnTrainWindowedInputs {
+            q: w!(&conv, 0),
+            k: w!(&conv, 128),
+            v: w!(&conv, 256),
+            key_heads: 1,
+            g: &g,
+            beta: &beta,
+            s0: None,
+        };
+        let (o, ckpt) = (z(&[1, 5, 4, 32]), z(&dims.checkpoint_shape()));
+        let refused = |r: Result<(), String>, needle: &str| {
+            let e = r.expect_err(needle);
+            assert!(e.contains(needle), "{e:?} lacks {needle:?}");
+        };
+        gdn_train_forward_windowed(rt, dims, x, &o, None, &ckpt).expect("valid windows");
+        refused(
+            gdn_train_forward_windowed(rt, dims, GdnTrainWindowedInputs { key_heads: 3, ..x }, &o, None, &ckpt),
+            "not a multiple of 3 key heads",
+        );
+        refused(
+            gdn_train_forward_windowed(rt, dims, GdnTrainWindowedInputs { key_heads: 0, ..x }, &o, None, &ckpt),
+            "0 key heads",
+        );
+        refused(
+            gdn_train_forward_windowed(
+                rt,
+                dims,
+                GdnTrainWindowedInputs { v: w!(&conv, 300), ..x },
+                &o,
+                None,
+                &ckpt,
+            ),
+            "does not fit its row stride",
+        );
+        let small = z(&[4, ld]);
+        refused(
+            gdn_train_forward_windowed(
+                rt,
+                dims,
+                GdnTrainWindowedInputs { q: w!(&small, 0), ..x },
+                &o,
+                None,
+                &ckpt,
+            ),
+            "q holds",
+        );
+        let ws = GdnTrainWorkspace::new(rt, dims).unwrap();
+        let (d_o, dg, db) = (z(&[1, 5, 4, 32]), z(&[1, 5, 4]), z(&[1, 5, 4]));
+        let bwd = |dq: GdnWindow<'_>, dk: GdnWindow<'_>, dv: GdnWindow<'_>| {
+            gdn_train_backward_windowed(
+                rt,
+                dims,
+                x,
+                &ckpt,
+                &d_o,
+                None,
+                &ws,
+                GdnTrainWindowedGrads {
+                    dq,
+                    dk,
+                    dv,
+                    dg: &dg,
+                    dbeta: &db,
+                    ds0: None,
+                },
+            )
+        };
+        bwd(w!(&dconv, 0), w!(&dconv, 128), w!(&dconv, 256)).expect("disjoint windows of one matrix");
+        refused(
+            bwd(w!(&dconv, 0), w!(&dconv, 64), w!(&dconv, 256)),
+            "outputs dq and dk overlap",
+        );
+        refused(
+            bwd(w!(&dconv, 0), w!(&dconv, 128), w!(&dconv, 200)),
+            "outputs dk and dv overlap",
+        );
+        refused(
+            bwd(w!(&conv, 0), w!(&dconv, 128), w!(&dconv, 256)),
+            "output dq overlaps input",
+        );
+    });
+}

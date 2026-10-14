@@ -21,10 +21,18 @@
 //! o_t = S_t^T q^
 //! ```
 //!
-//! All operands are dense f32: `q`, `k` `[B, T, H, 128]`, `v` `[B, T, H, Dv]`,
-//! `g`, `beta` `[B, T, H]`, states `[B, H, 128, Dv]`. Grouped heads are the
-//! caller's (transformers repeats them before the call). Every reduction is in
-//! a fixed order, so results are deterministic.
+//! All operands are f32. `g`, `beta` are `[B, T, H]`, states `[B, H, 128, Dv]`,
+//! `o` and `d_o` `[B, T, H, Dv]`. `q`, `k`, `v` and their gradients are
+//! column windows ([`GdnWindow`]) of a matrix with one row per token, so the
+//! kernels read them where a model keeps them (Qwen3.5's conv output is
+//! `[q | k | v]`) and write `dq`, `dk`, `dv` back the same way; `q` and `k`
+//! have `key_heads` heads that the `H` value heads share (`H / key_heads` to a
+//! key head, as transformers' `repeat_interleave`), and `dq`, `dk` come back
+//! summed over each key head's value heads. [`gdn_train_forward_windowed`] and
+//! [`gdn_train_backward_windowed`] take that form; [`gdn_train_forward`] and
+//! [`gdn_train_backward`] take dense `[B, T, H, 128]` operands (a window with
+//! `ld = H * 128`, `off = 0`, `key_heads = H`) and delegate to them. Every
+//! reduction is in a fixed order, so results are deterministic.
 
 use std::sync::Arc;
 
@@ -211,7 +219,78 @@ fn pipeline_128(
     Ok(p)
 }
 
-/// The inputs both directions read.
+/// A column window of an f32 matrix with one row per token (`b * T + t`):
+/// element `(token, c)` is at `token * ld + off + c` of `tensor`. The matrix
+/// may be wider than the window and `tensor` a view into a larger buffer.
+#[derive(Clone, Copy)]
+pub struct GdnWindow<'a> {
+    pub tensor: &'a Tensor,
+    /// Elements between consecutive tokens' rows.
+    pub ld: u32,
+    /// First element of the window in a row.
+    pub off: u32,
+}
+
+impl<'a> GdnWindow<'a> {
+    /// The whole of `tensor` read as one row of `width` per token.
+    pub fn dense(tensor: &'a Tensor, width: u32) -> Self {
+        Self {
+            tensor,
+            ld: width,
+            off: 0,
+        }
+    }
+
+    /// `width` columns of every one of `tokens` rows must lie inside `tensor`.
+    fn check(&self, rt: &Arc<GpuRuntime>, name: &str, tokens: usize, width: usize, what: &str) -> Result<(), String> {
+        let t = self.tensor;
+        t.validate().map_err(|e| format!("{what}: {name}: {e}"))?;
+        if !Arc::ptr_eq(t.runtime(), rt) {
+            return Err(format!("{what}: {name} belongs to another runtime"));
+        }
+        if t.dtype != DType::F32 {
+            return Err(format!("{what}: {name} must be f32, got {:?}", t.dtype));
+        }
+        let (ld, off) = (self.ld as usize, self.off as usize);
+        if off + width > ld {
+            return Err(format!(
+                "{what}: {name}'s window of {width} columns at offset {off} does not fit its row stride {ld}"
+            ));
+        }
+        let need = (tokens - 1)
+            .checked_mul(ld)
+            .and_then(|n| n.checked_add(off + width))
+            .ok_or_else(|| format!("{what}: {name}'s window is too large"))?;
+        let have = t.try_numel().map_err(|e| format!("{what}: {name}: {e}"))?;
+        if have < need {
+            return Err(format!(
+                "{what}: {name} holds {have} elements; {tokens} rows of stride {ld} with a window of \
+                 {width} at {off} need {need}"
+            ));
+        }
+        Ok(())
+    }
+
+    /// Whether this window (`width` columns) and `other` can touch the same
+    /// element: the same matrix at the same stride with disjoint columns do
+    /// not; anything else that shares a byte does.
+    fn overlaps(&self, width: usize, other: &GdnWindow<'_>, other_width: usize) -> bool {
+        if !self.tensor.overlaps(other.tensor) {
+            return false;
+        }
+        let same_matrix = self.tensor.byte_offset() == other.tensor.byte_offset()
+            && self.ld == other.ld
+            && self.tensor.try_numel().ok() == other.tensor.try_numel().ok();
+        if !same_matrix {
+            return true;
+        }
+        let (a0, b0) = (self.off as usize, other.off as usize);
+        a0 < b0 + other_width && b0 < a0 + width
+    }
+}
+
+/// The inputs both directions read, dense: `q`, `k` `[B, T, H, 128]`, `v`
+/// `[B, T, H, Dv]`.
 #[derive(Clone, Copy)]
 pub struct GdnTrainInputs<'a> {
     pub q: &'a Tensor,
@@ -223,7 +302,7 @@ pub struct GdnTrainInputs<'a> {
     pub s0: Option<&'a Tensor>,
 }
 
-impl GdnTrainInputs<'_> {
+impl<'a> GdnTrainInputs<'a> {
     fn check(&self, rt: &Arc<GpuRuntime>, d: &GdnTrainDims, what: &str) -> Result<(), String> {
         let (b, t, h, dv, dk) = (
             d.batch as usize,
@@ -243,11 +322,69 @@ impl GdnTrainInputs<'_> {
         Ok(())
     }
 
+    /// The same operands as windows: every row's `H * 128` (or `H * Dv`)
+    /// columns, `key_heads = H`.
+    fn windowed(&self, d: &GdnTrainDims) -> GdnTrainWindowedInputs<'a> {
+        let (qk, v) = (d.heads * GDN_TRAIN_DK, d.heads * d.v_dim);
+        GdnTrainWindowedInputs {
+            q: GdnWindow::dense(self.q, qk),
+            k: GdnWindow::dense(self.k, qk),
+            v: GdnWindow::dense(self.v, v),
+            key_heads: d.heads,
+            g: self.g,
+            beta: self.beta,
+            s0: self.s0,
+        }
+    }
+}
+
+/// The inputs both directions read, as windows. `q` and `k` hold `key_heads`
+/// heads of 128 columns, `v` holds `dims.heads` heads of `dims.v_dim`;
+/// `dims.heads` must be a multiple of `key_heads`.
+#[derive(Clone, Copy)]
+pub struct GdnTrainWindowedInputs<'a> {
+    pub q: GdnWindow<'a>,
+    pub k: GdnWindow<'a>,
+    pub v: GdnWindow<'a>,
+    pub key_heads: u32,
+    pub g: &'a Tensor,
+    pub beta: &'a Tensor,
+    /// The initial state; zeros when `None`.
+    pub s0: Option<&'a Tensor>,
+}
+
+impl GdnTrainWindowedInputs<'_> {
+    fn check(&self, rt: &Arc<GpuRuntime>, d: &GdnTrainDims, what: &str) -> Result<(), String> {
+        let (b, t, h, dv, dk) = (
+            d.batch as usize,
+            d.seq as usize,
+            d.heads as usize,
+            d.v_dim as usize,
+            GDN_TRAIN_DK as usize,
+        );
+        if self.key_heads == 0 || d.heads % self.key_heads != 0 {
+            return Err(format!(
+                "{what}: {} value heads are not a multiple of {} key heads",
+                d.heads, self.key_heads
+            ));
+        }
+        let (tokens, hk) = (b * t, self.key_heads as usize);
+        self.q.check(rt, "q", tokens, hk * dk, what)?;
+        self.k.check(rt, "k", tokens, hk * dk, what)?;
+        self.v.check(rt, "v", tokens, h * dv, what)?;
+        want(self.g, &[b, t, h], "g", what, rt)?;
+        want(self.beta, &[b, t, h], "beta", what, rt)?;
+        if let Some(s0) = self.s0 {
+            want(s0, &[b, h, dk, dv], "s0", what, rt)?;
+        }
+        Ok(())
+    }
+
     fn named(&self) -> Vec<(&'static str, &Tensor)> {
         let mut v = vec![
-            ("q", self.q),
-            ("k", self.k),
-            ("v", self.v),
+            ("q", self.q.tensor),
+            ("k", self.k.tensor),
+            ("v", self.v.tensor),
             ("g", self.g),
             ("beta", self.beta),
         ];
@@ -260,11 +397,27 @@ impl GdnTrainInputs<'_> {
 
 /// `o` `[B, T, H, Dv]`, the final state into `s_fin` when given, and the
 /// checkpoints [`gdn_train_backward`] needs into `ckpt`
-/// ([`GdnTrainDims::checkpoint_shape`]).
+/// ([`GdnTrainDims::checkpoint_shape`]). Dense operands; see
+/// [`gdn_train_forward_windowed`].
 pub fn gdn_train_forward(
     rt: &Arc<GpuRuntime>,
     dims: GdnTrainDims,
     x: GdnTrainInputs<'_>,
+    o: &Tensor,
+    s_fin: Option<&Tensor>,
+    ckpt: &Tensor,
+) -> Result<(), String> {
+    dims.validate("gdn_train_forward")?;
+    x.check(rt, &dims, "gdn_train_forward")?;
+    gdn_train_forward_windowed(rt, dims, x.windowed(&dims), o, s_fin, ckpt)
+}
+
+/// [`gdn_train_forward`] with `q`, `k`, `v` read through column windows and
+/// key heads shared by value heads.
+pub fn gdn_train_forward_windowed(
+    rt: &Arc<GpuRuntime>,
+    dims: GdnTrainDims,
+    x: GdnTrainWindowedInputs<'_>,
     o: &Tensor,
     s_fin: Option<&Tensor>,
     ckpt: &Tensor,
@@ -290,13 +443,13 @@ pub fn gdn_train_forward(
     let flags = u32::from(x.s0.is_some()) | (u32::from(s_fin.is_some()) << 1);
     let p = pipeline_128(rt, "gdn_train_fwd")?;
     dispatch_2d_tg(rt, &p, dims.slices() as usize, b * h, THREADS, |bnd| {
-        set_tensor(bnd, x.q, 0);
-        set_tensor(bnd, x.k, 1);
-        set_tensor(bnd, x.v, 2);
+        set_tensor(bnd, x.q.tensor, 0);
+        set_tensor(bnd, x.k.tensor, 1);
+        set_tensor(bnd, x.v.tensor, 2);
         set_tensor(bnd, x.g, 3);
         set_tensor(bnd, x.beta, 4);
         // Unused slots get a live buffer the kernel never touches.
-        set_tensor(bnd, x.s0.unwrap_or(x.q), 5);
+        set_tensor(bnd, x.s0.unwrap_or(x.q.tensor), 5);
         set_tensor(bnd, o, 6);
         set_tensor(bnd, s_fin.unwrap_or(ckpt), 7);
         set_tensor(bnd, ckpt, 8);
@@ -305,14 +458,49 @@ pub fn gdn_train_forward(
         set_u32(bnd, dims.heads, 11);
         set_u32(bnd, dims.v_dim, 12);
         set_u32(bnd, flags, 13);
+        set_u32(bnd, x.q.ld, 14);
+        set_u32(bnd, x.q.off, 15);
+        set_u32(bnd, x.k.ld, 16);
+        set_u32(bnd, x.k.off, 17);
+        set_u32(bnd, x.v.ld, 18);
+        set_u32(bnd, x.v.off, 19);
+        set_u32(bnd, x.key_heads, 20);
     })
 }
 
-/// Gradients of every input, written in full.
+/// Gradients of every input, written in full. Dense: `dq`, `dk`
+/// `[B, T, H, 128]`, `dv` `[B, T, H, Dv]`.
 pub struct GdnTrainGrads<'a> {
     pub dq: &'a Tensor,
     pub dk: &'a Tensor,
     pub dv: &'a Tensor,
+    pub dg: &'a Tensor,
+    pub dbeta: &'a Tensor,
+    /// Required exactly when the forward had an initial state.
+    pub ds0: Option<&'a Tensor>,
+}
+
+impl<'a> GdnTrainGrads<'a> {
+    fn windowed(&self, d: &GdnTrainDims) -> GdnTrainWindowedGrads<'a> {
+        let (qk, v) = (d.heads * GDN_TRAIN_DK, d.heads * d.v_dim);
+        GdnTrainWindowedGrads {
+            dq: GdnWindow::dense(self.dq, qk),
+            dk: GdnWindow::dense(self.dk, qk),
+            dv: GdnWindow::dense(self.dv, v),
+            dg: self.dg,
+            dbeta: self.dbeta,
+            ds0: self.ds0,
+        }
+    }
+}
+
+/// [`GdnTrainGrads`] with `dq`, `dk`, `dv` written through column windows;
+/// `dq` and `dk` hold the forward's `key_heads` heads, summed over each key
+/// head's value heads. The three may be disjoint windows of one matrix.
+pub struct GdnTrainWindowedGrads<'a> {
+    pub dq: GdnWindow<'a>,
+    pub dk: GdnWindow<'a>,
+    pub dv: GdnWindow<'a>,
     pub dg: &'a Tensor,
     pub dbeta: &'a Tensor,
     /// Required exactly when the forward had an initial state.
@@ -342,14 +530,47 @@ pub(crate) fn validate_gdn_backward(
         dims.v_dim as usize,
         GDN_TRAIN_DK as usize,
     );
+    want(grads.dq, &[b, t, h, dk], "dq", WHAT, rt)?;
+    want(grads.dk, &[b, t, h, dk], "dk", WHAT, rt)?;
+    want(grads.dv, &[b, t, h, dv], "dv", WHAT, rt)?;
+    validate_windowed_backward(rt, dims, &x.windowed(&dims), ckpt, d_o, d_fin, &grads.windowed(&dims))
+}
+
+/// [`validate_gdn_backward`] for windowed operands.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn validate_windowed_backward(
+    rt: &Arc<GpuRuntime>,
+    dims: GdnTrainDims,
+    x: &GdnTrainWindowedInputs<'_>,
+    ckpt: &Tensor,
+    d_o: &Tensor,
+    d_fin: Option<&Tensor>,
+    grads: &GdnTrainWindowedGrads<'_>,
+) -> Result<(), String> {
+    const WHAT: &str = "gdn_train_backward";
+    dims.validate(WHAT)?;
+    x.check(rt, &dims, WHAT)?;
+    let (b, t, h, dv, dk) = (
+        dims.batch as usize,
+        dims.seq as usize,
+        dims.heads as usize,
+        dims.v_dim as usize,
+        GDN_TRAIN_DK as usize,
+    );
     want(ckpt, &dims.checkpoint_shape(), "ckpt", WHAT, rt)?;
     want(d_o, &[b, t, h, dv], "d_o", WHAT, rt)?;
     if let Some(df) = d_fin {
         want(df, &[b, h, dk, dv], "d_fin", WHAT, rt)?;
     }
-    want(grads.dq, &[b, t, h, dk], "dq", WHAT, rt)?;
-    want(grads.dk, &[b, t, h, dk], "dk", WHAT, rt)?;
-    want(grads.dv, &[b, t, h, dv], "dv", WHAT, rt)?;
+    let (tokens, hk) = (b * t, x.key_heads as usize);
+    let wins = [
+        ("dq", &grads.dq, hk * dk),
+        ("dk", &grads.dk, hk * dk),
+        ("dv", &grads.dv, h * dv),
+    ];
+    for (name, w, width) in &wins {
+        w.check(rt, name, tokens, *width, WHAT)?;
+    }
     want(grads.dg, &[b, t, h], "dg", WHAT, rt)?;
     want(grads.dbeta, &[b, t, h], "dbeta", WHAT, rt)?;
     match (x.s0, grads.ds0) {
@@ -359,9 +580,9 @@ pub(crate) fn validate_gdn_backward(
         (None, Some(_)) => return Err(format!("{WHAT}: ds0 given but the forward had no initial state")),
     }
     let mut outs = vec![
-        ("dq", grads.dq),
-        ("dk", grads.dk),
-        ("dv", grads.dv),
+        ("dq", grads.dq.tensor),
+        ("dk", grads.dk.tensor),
+        ("dv", grads.dv.tensor),
         ("dg", grads.dg),
         ("dbeta", grads.dbeta),
     ];
@@ -374,13 +595,35 @@ pub(crate) fn validate_gdn_backward(
     if let Some(df) = d_fin {
         ins.push(("d_fin", df));
     }
-    disjoint(WHAT, &outs, &ins)?;
+    // dq, dk and dv may share a matrix, in columns of their own: those pairs
+    // are checked as windows, every other pair by tensor.
+    for (i, (a, wa, na)) in wins.iter().enumerate() {
+        for (b, wb, nb) in &wins[i + 1..] {
+            if wa.overlaps(*na, wb, *nb) {
+                return Err(format!("{WHAT}: outputs {a} and {b} overlap"));
+            }
+        }
+    }
+    let window = |n: &str| matches!(n, "dq" | "dk" | "dv");
+    for (i, (a, ta)) in outs.iter().enumerate() {
+        for (b, tb) in &outs[i + 1..] {
+            if !(window(a) && window(b)) && ta.overlaps(tb) {
+                return Err(format!("{WHAT}: outputs {a} and {b} overlap"));
+            }
+        }
+        for (b, tb) in &ins {
+            if ta.overlaps(tb) {
+                return Err(format!("{WHAT}: output {a} overlaps input {b}"));
+            }
+        }
+    }
     Ok(())
 }
 
 /// The backward of [`gdn_train_forward`], from `d_o` (and `d_fin`, the final
 /// state's gradient, when the forward's final state was used), given the
-/// same inputs and the checkpoints it saved.
+/// same inputs and the checkpoints it saved. Dense operands; see
+/// [`gdn_train_backward_windowed`].
 #[allow(clippy::too_many_arguments)]
 pub fn gdn_train_backward(
     rt: &Arc<GpuRuntime>,
@@ -392,16 +635,33 @@ pub fn gdn_train_backward(
     ws: &GdnTrainWorkspace,
     grads: GdnTrainGrads<'_>,
 ) -> Result<(), String> {
-    const WHAT: &str = "gdn_train_backward";
     validate_gdn_backward(rt, dims, &x, ckpt, d_o, d_fin, &grads)?;
+    gdn_train_backward_windowed(rt, dims, x.windowed(&dims), ckpt, d_o, d_fin, ws, grads.windowed(&dims))
+}
+
+/// [`gdn_train_backward`] with `q`, `k`, `v` read, and `dq`, `dk`, `dv`
+/// written, through column windows, key heads shared by value heads.
+#[allow(clippy::too_many_arguments)]
+pub fn gdn_train_backward_windowed(
+    rt: &Arc<GpuRuntime>,
+    dims: GdnTrainDims,
+    x: GdnTrainWindowedInputs<'_>,
+    ckpt: &Tensor,
+    d_o: &Tensor,
+    d_fin: Option<&Tensor>,
+    ws: &GdnTrainWorkspace,
+    grads: GdnTrainWindowedGrads<'_>,
+) -> Result<(), String> {
+    const WHAT: &str = "gdn_train_backward";
+    validate_windowed_backward(rt, dims, &x, ckpt, d_o, d_fin, &grads)?;
     let (b, h) = (dims.batch as usize, dims.heads as usize);
     if ws.dims != dims {
         return Err(format!("{WHAT}: the workspace is for {:?}, not {dims:?}", ws.dims));
     }
     let mut outs = vec![
-        ("dq", grads.dq),
-        ("dk", grads.dk),
-        ("dv", grads.dv),
+        ("dq", grads.dq.tensor),
+        ("dk", grads.dk.tensor),
+        ("dv", grads.dv.tensor),
         ("dg", grads.dg),
         ("dbeta", grads.dbeta),
     ];
@@ -425,41 +685,61 @@ pub fn gdn_train_backward(
     let flags = u32::from(x.s0.is_some()) | (u32::from(d_fin.is_some()) << 1);
     let p = pipeline_128(rt, "gdn_train_bwd")?;
     dispatch_2d_tg(rt, &p, dims.slices() as usize, b * h, THREADS, |bnd| {
-        set_tensor(bnd, x.q, 0);
-        set_tensor(bnd, x.k, 1);
-        set_tensor(bnd, x.v, 2);
+        set_tensor(bnd, x.q.tensor, 0);
+        set_tensor(bnd, x.k.tensor, 1);
+        set_tensor(bnd, x.v.tensor, 2);
         set_tensor(bnd, x.g, 3);
         set_tensor(bnd, x.beta, 4);
         set_tensor(bnd, d_o, 5);
         set_tensor(bnd, d_fin.unwrap_or(d_o), 6);
         set_tensor(bnd, ckpt, 7);
         set_gpu_buf(bnd, &ws.scratch.buffer, 8);
-        set_tensor(bnd, grads.dv, 9);
+        set_tensor(bnd, grads.dv.tensor, 9);
         set_gpu_buf(bnd, &ws.dq_part.buffer, 10);
         set_gpu_buf(bnd, &ws.dk_part.buffer, 11);
         set_gpu_buf(bnd, &ws.dg_part.buffer, 12);
         set_gpu_buf(bnd, &ws.dbeta_part.buffer, 13);
-        set_tensor(bnd, grads.ds0.unwrap_or(grads.dv), 14);
+        set_tensor(bnd, grads.ds0.unwrap_or(grads.dv.tensor), 14);
         set_u32(bnd, dims.batch, 15);
         set_u32(bnd, dims.seq, 16);
         set_u32(bnd, dims.heads, 17);
         set_u32(bnd, dims.v_dim, 18);
         set_u32(bnd, flags, 19);
+        set_u32(bnd, x.q.ld, 20);
+        set_u32(bnd, x.q.off, 21);
+        set_u32(bnd, x.k.ld, 22);
+        set_u32(bnd, x.k.off, 23);
+        set_u32(bnd, x.v.ld, 24);
+        set_u32(bnd, x.v.off, 25);
+        set_u32(bnd, x.key_heads, 26);
+        set_u32(bnd, grads.dv.ld, 27);
+        set_u32(bnd, grads.dv.off, 28);
     })?;
     let fin = pipeline_128(rt, "gdn_train_bwd_finish")?;
-    let rows = dims.rows();
-    dispatch_tg_1d(rt, &fin, rows, THREADS, None, |bnd| {
-        set_tensor(bnd, x.q, 0);
-        set_tensor(bnd, x.k, 1);
+    let toks = dims.batch * dims.seq;
+    dispatch_tg_1d(rt, &fin, toks as usize * x.key_heads as usize, THREADS, None, |bnd| {
+        set_tensor(bnd, x.q.tensor, 0);
+        set_tensor(bnd, x.k.tensor, 1);
         set_gpu_buf(bnd, &ws.dq_part.buffer, 2);
         set_gpu_buf(bnd, &ws.dk_part.buffer, 3);
         set_gpu_buf(bnd, &ws.dg_part.buffer, 4);
         set_gpu_buf(bnd, &ws.dbeta_part.buffer, 5);
-        set_tensor(bnd, grads.dq, 6);
-        set_tensor(bnd, grads.dk, 7);
+        set_tensor(bnd, grads.dq.tensor, 6);
+        set_tensor(bnd, grads.dk.tensor, 7);
         set_tensor(bnd, grads.dg, 8);
         set_tensor(bnd, grads.dbeta, 9);
-        set_u32(bnd, rows as u32, 10);
+        set_u32(bnd, dims.rows() as u32, 10);
         set_u32(bnd, dims.slices(), 11);
+        set_u32(bnd, x.q.ld, 12);
+        set_u32(bnd, x.q.off, 13);
+        set_u32(bnd, x.k.ld, 14);
+        set_u32(bnd, x.k.off, 15);
+        set_u32(bnd, grads.dq.ld, 16);
+        set_u32(bnd, grads.dq.off, 17);
+        set_u32(bnd, grads.dk.ld, 18);
+        set_u32(bnd, grads.dk.off, 19);
+        set_u32(bnd, toks, 20);
+        set_u32(bnd, dims.heads, 21);
+        set_u32(bnd, x.key_heads, 22);
     })
 }

@@ -46,16 +46,17 @@ use crate::cross_entropy::{
 };
 use crate::dispatch::{dispatch_1d, dispatch_2d, set_gpu_buf, set_gpu_buf_offset, set_u32};
 use crate::gdn_train::{
-    gdn_train_backward, gdn_train_forward, GdnTrainDims, GdnTrainGrads, GdnTrainInputs, GdnTrainWorkspace, GDN_TRAIN_DK,
+    gdn_train_backward_windowed, gdn_train_forward_windowed, GdnTrainDims, GdnTrainWindowedGrads,
+    GdnTrainWindowedInputs, GdnTrainWorkspace, GdnWindow,
 };
 use crate::gemm::{cast_bf16_to_f32_into, cast_f32_to_bf16_into, GemmOperands};
 use crate::nn::require_runtime;
 use crate::qwen35::{self, AttnShape, AttnTargets, Cols, GdnParams, OutCols, StateIn};
 use crate::qwen35_bwd::{
     attn_gate_bwd, attn_qk_norm_rope_bwd, attn_qk_norm_rope_bwd_part_len, check_scatter_rows, conv1d_silu_bwd,
-    conv1d_silu_bwd_part_len, copy_cols, embed_rows_bwd_once, gated_rms_norm_bwd, gated_rms_norm_bwd_part_len,
-    gdn_gates_bwd, gdn_gates_bwd_part_len, rms_norm_bwd, rms_norm_bwd_part_len, scatter_add_rows, swiglu_bwd,
-    AttnQkvGrads, EmbedBwdWorkspace,
+    conv1d_silu_bwd_part_len, embed_rows_bwd_once, gated_rms_norm_bwd, gated_rms_norm_bwd_part_len, gdn_gates_bwd,
+    gdn_gates_bwd_part_len, rms_norm_bwd, rms_norm_bwd_part_len, scatter_add_rows, swiglu_bwd, AttnQkvGrads,
+    EmbedBwdWorkspace,
 };
 use crate::qwen35_model::{AttnWeights, GdnWeights, Layer, Mixer, Precision, Qwen35Model};
 use crate::runtime::{BufferKind, GpuRuntime};
@@ -548,9 +549,9 @@ pub struct TrainStep {
 /// What one GDN layer's forward keeps for its backward.
 struct SavedGdn {
     proj: Tensor,
-    q: Tensor,
-    k: Tensor,
-    v: Tensor,
+    /// The conv output `[t, conv_dim]`, `q | k | v`: the GDN kernels read
+    /// them through windows of it, at key-head width.
+    conv: Tensor,
     g: Tensor,
     beta: Tensor,
     ckpt: Tensor,
@@ -615,14 +616,11 @@ struct GdnScratch {
     dy: Tensor,
     d_o: Tensor,
     dproj: Tensor,
-    d_conv: GpuBuffer,
-    dq: Tensor,
-    dk: Tensor,
-    dv: Tensor,
+    /// The conv output's gradient `[t, conv_dim]`: the GDN backward writes
+    /// dq, dk and dv into their columns.
+    d_conv: Tensor,
     dg: Tensor,
     dbeta: Tensor,
-    /// Grouped heads: dq or dk summed back to key-head width.
-    dqk: Option<GpuBuffer>,
     ws: GdnTrainWorkspace,
     norm_part: GpuBuffer,
     gates_part: GpuBuffer,
@@ -680,89 +678,6 @@ fn bf16_twin(mm: GemmOperands, x: &Tensor) -> Result<Option<Tensor>, String> {
 /// The tensor a GEMM takes for `x`: its bf16 twin when there is one.
 fn op<'a>(x: &'a Tensor, twin: &'a Option<Tensor>) -> &'a Tensor {
     twin.as_ref().unwrap_or(x)
-}
-
-/// `t * k_heads`: the rows of a `[t, k_heads, 128]` operand taken one head
-/// at a time.
-fn head_rows(t: u32, k_heads: u32) -> Result<u32, String> {
-    t.checked_mul(k_heads)
-        .ok_or_else(|| format!("Qwen35Model::train_step: {t} tokens x {k_heads} GDN key heads exceed u32"))
-}
-
-/// `dst` (`[t, k_heads * r, 128]`) = each key head of `src` (`[t, k_heads,
-/// 128]`, dense) repeated over its `r` value heads, as transformers'
-/// `repeat_interleave(r, dim=2)`: value head `h * r + j` is key head `h`.
-fn repeat_heads(
-    rt: &Arc<GpuRuntime>,
-    src: &GpuBuffer,
-    dst: &GpuBuffer,
-    t: u32,
-    k_heads: u32,
-    r: u32,
-) -> Result<(), String> {
-    let (rows, dk) = (head_rows(t, k_heads)?, GDN_TRAIN_DK);
-    for j in 0..r {
-        copy_cols(
-            rt,
-            Cols {
-                buf: src,
-                ld: dk,
-                off: 0,
-            },
-            Cols {
-                buf: dst,
-                ld: r * dk,
-                off: j * dk,
-            },
-            rows,
-            dk,
-        )?;
-    }
-    Ok(())
-}
-
-/// The gradient of [`repeat_heads`]: `dst` (`[t, k_heads, 128]`, dense) =
-/// the sum of `src` (`[t, k_heads * r, 128]`) over each key head's `r` value
-/// heads, added in value-head order.
-fn sum_heads(
-    rt: &Arc<GpuRuntime>,
-    src: &GpuBuffer,
-    dst: &GpuBuffer,
-    t: u32,
-    k_heads: u32,
-    r: u32,
-) -> Result<(), String> {
-    let (rows, dk) = (head_rows(t, k_heads)?, GDN_TRAIN_DK);
-    let group = |j: u32| Cols {
-        buf: src,
-        ld: r * dk,
-        off: j * dk,
-    };
-    copy_cols(
-        rt,
-        group(0),
-        Cols {
-            buf: dst,
-            ld: dk,
-            off: 0,
-        },
-        rows,
-        dk,
-    )?;
-    for j in 1..r {
-        qwen35::residual_add(
-            rt,
-            group(j),
-            Cols {
-                buf: dst,
-                ld: dk,
-                off: 0,
-            },
-            rows,
-            dk,
-        )?;
-    }
-    Ok(())
 }
 
 impl Qwen35Model {
@@ -1336,22 +1251,13 @@ impl Qwen35Model {
                 heads: g.v_heads(),
                 v_dim: g.v_dim(),
             };
-            let dk = GDN_TRAIN_DK as usize;
             Some(GdnScratch {
                 dy: tensor(rt, &[tu, hv * dv])?,
                 d_o: tensor(rt, &[1, tu, hv, dv])?,
                 dproj: tensor(rt, &[tu, g.width() as usize])?,
-                d_conv: f32s(rt, tu * g.conv_dim() as usize)?,
-                dq: tensor(rt, &[1, tu, hv, dk])?,
-                dk: tensor(rt, &[1, tu, hv, dk])?,
-                dv: tensor(rt, &[1, tu, hv, dv])?,
+                d_conv: tensor(rt, &[tu, g.conv_dim() as usize])?,
                 dg: tensor(rt, &[1, tu, hv])?,
                 dbeta: tensor(rt, &[1, tu, hv])?,
-                dqk: if g.v_heads() > g.k_heads() {
-                    Some(f32s(rt, tu * g.key_dim() as usize)?)
-                } else {
-                    None
-                },
                 ws: GdnTrainWorkspace::new(rt, dims)?,
                 norm_part: f32s(rt, gated_rms_norm_bwd_part_len(t, g.v_heads(), g.v_dim()))?,
                 gates_part: f32s(rt, gdn_gates_bwd_part_len(t, g.v_heads()))?,
@@ -1550,7 +1456,7 @@ impl Qwen35Model {
         match &layer.mixer {
             Mixer::Gdn(_) => {
                 let g = cfg.gdn;
-                let (hv, dv, dk) = (g.v_heads() as usize, g.v_dim() as usize, GDN_TRAIN_DK as usize);
+                let (hv, dv) = (g.v_heads() as usize, g.v_dim() as usize);
                 let ckpt = GdnTrainDims {
                     batch: 1,
                     seq: t,
@@ -1561,10 +1467,7 @@ impl Qwen35Model {
                 b.extend([
                     f(tu * g.width() as usize), // proj
                     mm.nn_scratch_bytes(tu, g.width() as usize, h, wd),
-                    f(tu * g.conv_dim() as usize),
-                    f(tu * hv * dk),
-                    f(tu * hv * dk),
-                    f(tu * hv * dv), // q, k, v
+                    f(tu * g.conv_dim() as usize), // conv: q, k, v
                     f(tu * hv),
                     f(tu * hv), // g, beta
                     f(ckpt.iter().product()),
@@ -1572,9 +1475,6 @@ impl Qwen35Model {
                     f(tu * hv * dv), // y
                     mm.nn_scratch_bytes(tu, h, hv * dv, wd),
                 ]);
-                if g.v_heads() > g.k_heads() {
-                    b.push(f(tu * g.key_dim() as usize)); // q, k staged at key-head width
-                }
             }
             Mixer::Attn(_) => {
                 let a = cfg.attn;
@@ -1657,14 +1557,12 @@ impl Qwen35Model {
         ];
         if has(crate::qwen35_model::LayerKind::LinearAttention) {
             let g = cfg.gdn;
-            let (hv, dv, dk) = (g.v_heads() as usize, g.v_dim() as usize, GDN_TRAIN_DK as usize);
+            let (hv, dv) = (g.v_heads() as usize, g.v_dim() as usize);
             b.extend([
                 2 * f(tu * hv * dv), // dy, d_o
                 f(tu * g.width() as usize),
-                f(tu * g.conv_dim() as usize),
-                2 * f(tu * hv * dk), // dq, dk
-                f(tu * hv * dv),     // dv
-                2 * f(tu * hv),      // dg, dbeta
+                f(tu * g.conv_dim() as usize), // d_conv: dq, dk, dv
+                2 * f(tu * hv),                // dg, dbeta
                 GdnTrainWorkspace::allocated_bytes_for(GdnTrainDims {
                     batch: 1,
                     seq: t,
@@ -1675,9 +1573,6 @@ impl Qwen35Model {
                 f(gdn_gates_bwd_part_len(t, g.v_heads())),
                 f(conv1d_silu_bwd_part_len(1, t, g.conv_dim(), cfg.conv_kernel)),
             ]);
-            if g.v_heads() > g.k_heads() {
-                b.push(f(tu * g.key_dim() as usize)); // dqk
-            }
         }
         if has(crate::qwen35_model::LayerKind::FullAttention) {
             let a = cfg.attn;
@@ -1862,59 +1757,21 @@ impl Qwen35Model {
     fn gdn_forward(&self, w: &GdnWeights, x1: &Tensor, t: u32, mm: GemmOperands) -> Result<SavedGdn, String> {
         let (rt, g) = (&self.rt, self.cfg.gdn);
         let (tu, hv, dv) = (t as usize, g.v_heads() as usize, g.v_dim() as usize);
-        let dk = GDN_TRAIN_DK as usize;
         let proj = tensor(rt, &[tu, g.width() as usize])?;
         mm.nn(x1, &w.w_in, &proj)?;
-        let conv = f32s(rt, tu * g.conv_dim() as usize)?;
+        let conv = tensor(rt, &[tu, g.conv_dim() as usize])?;
         qwen35::conv1d_silu(
             rt,
             Cols::dense(&proj.buffer, g.width()),
             &w.conv_w,
             self.cfg.conv_kernel,
             StateIn::Zero,
-            &conv,
+            &conv.buffer,
             None,
             1,
             t,
             g.conv_dim(),
         )?;
-        let qkv = g.conv_qkv(&conv);
-        let (q, k, v) = (
-            tensor(rt, &[1, tu, hv, dk])?,
-            tensor(rt, &[1, tu, hv, dk])?,
-            tensor(rt, &[1, tu, hv, dv])?,
-        );
-        // Grouped heads: q and k land at key-head width, then repeat.
-        let r = g.v_heads() / g.k_heads();
-        let staged = if r > 1 {
-            Some(f32s(rt, tu * g.key_dim() as usize)?)
-        } else {
-            None
-        };
-        for (off, dst, width, repeat) in [
-            (qkv.q_off, &q, g.key_dim(), true),
-            (qkv.k_off, &k, g.key_dim(), true),
-            (qkv.v_off, &v, g.value_dim(), false),
-        ] {
-            let land = match (&staged, repeat) {
-                (Some(s), true) => s,
-                _ => &dst.buffer,
-            };
-            copy_cols(
-                rt,
-                Cols {
-                    buf: &conv,
-                    ld: qkv.ld,
-                    off,
-                },
-                Cols::dense(land, width),
-                t,
-                width,
-            )?;
-            if let (Some(s), true) = (&staged, repeat) {
-                repeat_heads(rt, s, &dst.buffer, t, g.k_heads(), r)?;
-            }
-        }
         let (gt, beta) = (tensor(rt, &[1, tu, hv])?, tensor(rt, &[1, tu, hv])?);
         qwen35::gdn_gates(
             rt,
@@ -1936,15 +1793,22 @@ impl Qwen35Model {
         };
         let ckpt = tensor(rt, &dims.checkpoint_shape())?;
         let o = tensor(rt, &[1, tu, hv, dv])?;
-        let inputs = GdnTrainInputs {
-            q: &q,
-            k: &k,
-            v: &v,
+        let qkv = g.conv_qkv(&conv.buffer);
+        let win = |off| GdnWindow {
+            tensor: &conv,
+            ld: qkv.ld,
+            off,
+        };
+        let inputs = GdnTrainWindowedInputs {
+            q: win(qkv.q_off),
+            k: win(qkv.k_off),
+            v: win(qkv.v_off),
+            key_heads: g.k_heads(),
             g: &gt,
             beta: &beta,
             s0: None,
         };
-        gdn_train_forward(rt, dims, inputs, &o, None, &ckpt)?;
+        gdn_train_forward_windowed(rt, dims, inputs, &o, None, &ckpt)?;
         let y = tensor(rt, &[tu, hv * dv])?;
         qwen35::gated_rms_norm(
             rt,
@@ -1963,9 +1827,7 @@ impl Qwen35Model {
         let y16 = bf16_twin(mm, &y)?;
         Ok(SavedGdn {
             proj,
-            q,
-            k,
-            v,
+            conv,
             g: gt,
             beta,
             ckpt,
@@ -2219,13 +2081,18 @@ impl Qwen35Model {
             heads: g.v_heads(),
             v_dim: g.v_dim(),
         };
-        gdn_train_backward(
+        let qkv = g.conv_qkv(&s.conv.buffer);
+        let dqkv = g.conv_qkv(&gs.d_conv.buffer);
+        let ld = qkv.ld;
+        let win = |tensor, off| GdnWindow { tensor, ld, off };
+        gdn_train_backward_windowed(
             rt,
             dims,
-            GdnTrainInputs {
-                q: &s.q,
-                k: &s.k,
-                v: &s.v,
+            GdnTrainWindowedInputs {
+                q: win(&s.conv, qkv.q_off),
+                k: win(&s.conv, qkv.k_off),
+                v: win(&s.conv, qkv.v_off),
+                key_heads: g.k_heads(),
                 g: &s.g,
                 beta: &s.beta,
                 s0: None,
@@ -2234,10 +2101,12 @@ impl Qwen35Model {
             &gs.d_o,
             None,
             &gs.ws,
-            GdnTrainGrads {
-                dq: &gs.dq,
-                dk: &gs.dk,
-                dv: &gs.dv,
+            // dq, dk (summed over each key head's value heads) and dv land in
+            // the conv output's gradient, in its layout.
+            GdnTrainWindowedGrads {
+                dq: win(&gs.d_conv, dqkv.q_off),
+                dk: win(&gs.d_conv, dqkv.k_off),
+                dv: win(&gs.d_conv, dqkv.v_off),
                 dg: &gs.dg,
                 dbeta: &gs.dbeta,
                 ds0: None,
@@ -2264,35 +2133,7 @@ impl Qwen35Model {
             t,
             g.v_heads(),
         )?;
-        // q, k, v back into the conv output's layout, then the conv into the
-        // projection's qkv columns.
-        // Grouped heads: dq and dk sum over each key head's value heads first.
-        let qkv = g.conv_qkv(&gs.d_conv);
-        let r = g.v_heads() / g.k_heads();
-        for (src, off, width, grouped) in [
-            (&gs.dq, qkv.q_off, g.key_dim(), true),
-            (&gs.dk, qkv.k_off, g.key_dim(), true),
-            (&gs.dv, qkv.v_off, g.value_dim(), false),
-        ] {
-            let src = match (&gs.dqk, grouped) {
-                (Some(sum), true) => {
-                    sum_heads(rt, &src.buffer, sum, t, g.k_heads(), r)?;
-                    sum
-                }
-                _ => &src.buffer,
-            };
-            copy_cols(
-                rt,
-                Cols::dense(src, width),
-                Cols {
-                    buf: &gs.d_conv,
-                    ld: qkv.ld,
-                    off,
-                },
-                t,
-                width,
-            )?;
-        }
+        // The conv into the projection's qkv columns.
         let conv_w = vec_grad(
             rt,
             (g.conv_dim() * cfg.conv_kernel) as usize,
@@ -2303,7 +2144,7 @@ impl Qwen35Model {
             Cols::dense(&s.proj.buffer, g.width()),
             &w.conv_w,
             cfg.conv_kernel,
-            Cols::dense(&gs.d_conv, g.conv_dim()),
+            Cols::dense(&gs.d_conv.buffer, g.conv_dim()),
             Cols::dense(dproj, g.width()),
             &conv_w,
             &gs.conv_part,

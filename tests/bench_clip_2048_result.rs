@@ -132,3 +132,148 @@ fn prose_matches_table_and_states_columns_are_independent_minima() {
         "train_step_into slowdown must be reported as unresolved"
     );
 }
+
+// ---- adversarial additions: the remaining summary columns and the prose figures ----
+
+fn summary_row(variant: &str, mode: &str) -> Vec<f64> {
+    let row = FILE
+        .lines()
+        .find(|l| l.starts_with(&format!("# {variant}/{mode}")) && l.contains(" min "))
+        .unwrap_or_else(|| panic!("no summary row {variant}/{mode}"));
+    // total, max, train, grad_sq, adamw, fp GB, waits
+    row.split_whitespace().skip(3).map(|x| x.parse().unwrap()).collect()
+}
+
+fn timed(variant: &str, mode: &str) -> Vec<(Run, f64, f64)> {
+    // (run, train_step_into ms, adamw ms) for non-probe runs
+    let mut res = Vec::new();
+    let mut cur: Option<usize> = None;
+    let all = runs();
+    let mut idx = 0usize;
+    let (mut train, mut adamw) = (0.0, 0.0);
+    let mut pending: Vec<(usize, f64, f64)> = Vec::new();
+    for line in FILE.lines() {
+        if line.starts_with("# ---- clip round ") {
+            if let Some(i) = cur {
+                pending.push((i, train, adamw));
+            }
+            cur = Some(idx);
+            idx += 1;
+        } else {
+            let t = line.trim_start();
+            if t.starts_with("train_step_into") && t.contains("waits") {
+                train = num_after(t, "train_step_into");
+            } else if t.starts_with("adamw_step") && t.contains("waits") {
+                adamw = num_after(t, "adamw_step");
+            }
+        }
+    }
+    if let Some(i) = cur {
+        pending.push((i, train, adamw));
+    }
+    for (i, t, a) in pending {
+        let r = &all[i];
+        if r.label.starts_with("P/") {
+            continue;
+        }
+        let key = r.label.split_once('/').unwrap().1;
+        if key == format!("{variant}/{mode}") {
+            res.push((
+                Run {
+                    label: r.label.clone(),
+                    total_ms: r.total_ms,
+                    gsn_ms: r.gsn_ms,
+                    gsn_waits: r.gsn_waits,
+                    total_waits: r.total_waits,
+                    footprint: r.footprint,
+                    exit: r.exit,
+                },
+                t,
+                a,
+            ));
+        }
+    }
+    res
+}
+
+#[test]
+fn every_summary_column_is_the_minimum_of_its_raw_runs() {
+    for variant in ["before", "after"] {
+        for mode in ["sync", "async"] {
+            let rows = timed(variant, mode);
+            assert_eq!(rows.len(), 3, "{variant}/{mode}: 3 timed rounds");
+            let s = summary_row(variant, mode);
+            let fmin = |f: &dyn Fn(&(Run, f64, f64)) -> f64| rows.iter().map(f).fold(f64::MAX, f64::min);
+            let fmax = |f: &dyn Fn(&(Run, f64, f64)) -> f64| rows.iter().map(f).fold(f64::MIN, f64::max);
+            let close = |a: f64, b: f64, what: &str| {
+                assert!((a - b).abs() < 0.06, "{variant}/{mode} {what}: summary {a} vs raw {b}")
+            };
+            close(s[0], fmin(&|r| r.0.total_ms), "total");
+            close(s[1], fmax(&|r| r.0.total_ms), "max total");
+            close(s[2], fmin(&|r| r.1), "train_step_into");
+            close(s[3], fmin(&|r| r.0.gsn_ms), "grad_sq_norm");
+            close(s[4], fmin(&|r| r.2), "adamw_step");
+            let fp = rows.iter().map(|r| r.0.footprint).min().unwrap() as f64 / 1e9;
+            close(s[5], fp, "footprint GB");
+            let waits = rows[0].0.total_waits as f64;
+            assert!(rows.iter().all(|r| r.0.total_waits as f64 == waits), "waits stable");
+            close(s[6], waits, "waits");
+        }
+    }
+}
+
+#[test]
+fn prose_percentages_and_ranges_match_the_table() {
+    let (bs, as_) = (summary_row("before", "sync"), summary_row("after", "sync"));
+    let (ba, aa) = (summary_row("before", "async"), summary_row("after", "async"));
+    let pct = |b: f64, a: f64| (b - a) / b * 100.0;
+    assert!((pct(bs[0], as_[0]) - 8.7).abs() < 0.06, "sync -8.7 %");
+    assert!((pct(ba[0], aa[0]) - 15.5).abs() < 0.06, "async -15.5 %");
+    assert!(FILE.contains("-8.7 %") && FILE.contains("-15.5 %"));
+    // overlap claim: before train range must overlap after train range
+    let b = timed("before", "sync");
+    let a = timed("after", "sync");
+    let rng = |v: &Vec<(Run, f64, f64)>| {
+        (
+            v.iter().map(|r| r.1).fold(f64::MAX, f64::min),
+            v.iter().map(|r| r.1).fold(f64::MIN, f64::max),
+        )
+    };
+    let (bl, bh) = rng(&b);
+    let (al, ah) = rng(&a);
+    assert!(al <= bh && bl <= ah, "ranges overlap, as the prose says");
+    assert!(FILE.contains("2461-3118") && FILE.contains("2684-2968"));
+    assert!((bl - 2461.0).abs() < 0.6 && (bh - 3118.0).abs() < 0.6);
+    assert!((al - 2684.0).abs() < 0.6 && (ah - 2968.0).abs() < 0.6);
+}
+
+#[test]
+fn independent_minimum_example_is_real_and_probe_is_excluded() {
+    // The example in the summary: the run with total 2974.6 has grad_sq 21.5 / train 2683.7,
+    // and the 20.7 grad_sq minimum belongs to a run with total 3018.6.
+    let a = timed("after", "sync");
+    let r1 = a
+        .iter()
+        .find(|r| (r.0.total_ms - 2974.6).abs() < 0.06)
+        .expect("total run");
+    assert!((r1.0.gsn_ms - 21.5).abs() < 0.06 && (r1.1 - 2683.7).abs() < 0.06);
+    let r2 = a.iter().find(|r| (r.0.gsn_ms - 20.7).abs() < 0.06).expect("gsn run");
+    assert!((r2.0.total_ms - 3018.6).abs() < 0.06);
+    // the probe's 20.3 ms must be lower than every timed grad_sq, i.e. excluding it matters
+    let probe = runs()
+        .into_iter()
+        .find(|r| r.label == "P/probe-after/sync")
+        .map(|r| r.gsn_ms);
+    let probe = probe.expect("probe-after run");
+    assert!((probe - 20.3).abs() < 0.06 && probe < 20.7);
+}
+
+#[test]
+fn every_run_has_ac_power_and_no_peers() {
+    assert_eq!(FILE.matches("Now drawing from 'AC Power'").count(), 14);
+    assert_eq!(FILE.lines().filter(|l| l.starts_with("# peers: ")).count(), 14);
+    assert!(FILE
+        .lines()
+        .filter(|l| l.starts_with("# peers: "))
+        .all(|l| l == "# peers: 0"));
+}

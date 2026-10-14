@@ -15,6 +15,16 @@ name: Release
 #     which publishes nothing and so needs neither the tag nor the CI gate.
 #   * The GitHub Release is created with --target "$GITHUB_SHA", so it points at
 #     the commit that was verified.
+#
+# Pushing a tag (edge cases of the CI gate, by design not waited out):
+#   * Push the tag after CI and Metal compile on that commit have finished. The
+#     gate does not wait for a run still in progress, it refuses; re-run this
+#     job once they are green.
+#   * metal-compile.yml runs only for pushes touching its path filter (kernels/,
+#     src/, tests/, build.rs, Cargo.toml, Cargo.lock, the workflow itself). A tag
+#     on a commit with no Metal-compile run is refused as "no run". Dispatch it
+#     on the tag first, then re-run this job:
+#         gh workflow run metal-compile.yml --ref vX.Y.Z
 on:
   push:
     tags:

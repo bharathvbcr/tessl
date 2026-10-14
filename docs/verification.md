@@ -544,3 +544,20 @@ fault tests    NOT RE-RUN at 2972027. Last recorded: 6 of 6 caught
 The last line is carried forward from an earlier pass, not measured here. It is
 listed separately from the checks above for the reason section 6 gives: a check
 that was not run must not be presented alongside checks that ran and passed.
+
+## Releasing
+
+`scripts/check_release_ready.sh` (clean tree, version triad) runs before a tag.
+Pushing a `v*` tag starts `.github/workflows/release.yml`, which publishes only
+if CI and Metal compile both concluded `success` for exactly the tagged commit
+(`scripts/require_green_ci.sh`). Two edge cases are refused by design rather
+than waited out:
+
+- A tag pushed while CI or Metal compile on that commit is still running is
+  refused. Push the tag after those runs have finished, or re-run the release
+  job once they are green.
+- `metal-compile.yml` runs only for pushes touching `kernels/`, `src/`,
+  `tests/`, `build.rs`, `Cargo.toml`, `Cargo.lock` or its own file. A tag on a
+  commit outside that filter has no Metal-compile run and is refused as "no
+  run". Dispatch it on the tag first, then re-run the release job:
+  `gh workflow run metal-compile.yml --ref vX.Y.Z`.

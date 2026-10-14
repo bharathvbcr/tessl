@@ -1255,7 +1255,7 @@ impl DecodeIcb {
                 })?;
                 if let Some((probe, n)) = self.triage_probe.as_ref() {
                     rt.synchronize()?;
-                    let host = probe.read_f32();
+                    let host = probe.try_read_f32()?;
                     let take = (*n).min(host.len());
                     let absmean = if take > 0 {
                         host[..take].iter().map(|v| v.abs()).sum::<f32>() / take as f32

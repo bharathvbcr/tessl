@@ -120,7 +120,7 @@ impl<'a> Loader<'a> {
     /// model, not as a step temporary).
     pub(crate) fn buf(&self, data: &[f32]) -> Result<GpuBuffer, String> {
         let b = self.rt.alloc_buffer_hot(data.len().max(1) * 4)?;
-        b.write_f32(data);
+        b.try_write_f32(data).map_err(|e| format!("Loader::buf: {e}"))?;
         Ok(b)
     }
 

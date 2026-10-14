@@ -633,7 +633,9 @@ impl Qwen35Model {
                     // One host copy of the table, placed into both device
                     // tensors and dropped; never a second, packed host copy.
                     let bits = ld.bf16("embed_tokens.weight", &[vocab, h])?;
-                    t.buffer.write_bf16_bits(&bits);
+                    t.buffer
+                        .try_write_bf16_bits(&bits)
+                        .map_err(|e| format!("Qwen35Model::load: embed_tokens: {e}"))?;
                     let head = rt.alloc_tensor_bf16_hot(&[h, vocab])?;
                     qwen35::place_linear_part(&mut head.buffer.try_contents_u16()?, vocab, 0, &bits, vocab, h)?;
                     Some(head)
@@ -769,19 +771,23 @@ impl Qwen35Model {
             match p {
                 Precision::Bf16 => {
                     let t = rt.alloc_tensor_bf16_hot(shape)?;
-                    t.buffer.write_bf16_bits(&crate::tensor::f32_slice_to_bf16(&data));
+                    t.buffer
+                        .try_write_bf16_bits(&crate::tensor::f32_slice_to_bf16(&data))
+                        .map_err(|e| format!("Qwen35Model::random: {e}"))?;
                     Ok(t)
                 }
                 Precision::F32 => {
                     let t = rt.alloc_tensor_f32_hot(shape)?;
-                    t.buffer.write_f32(&data);
+                    t.buffer
+                        .try_write_f32(&data)
+                        .map_err(|e| format!("Qwen35Model::random: {e}"))?;
                     Ok(t)
                 }
             }
         };
         let zeros = |n: usize| -> Result<GpuBuffer, String> {
             let b = rt.alloc_buffer_hot(n.max(1) * 4)?;
-            b.zero();
+            b.try_zero().map_err(|e| format!("Qwen35Model::random: {e}"))?;
             Ok(b)
         };
         let (h, inter, vocab) = (cfg.hidden as usize, cfg.intermediate as usize, cfg.vocab as usize);

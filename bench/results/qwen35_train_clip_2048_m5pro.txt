@@ -65,9 +65,12 @@
 #   min total is lower in both modes and sync waits are lower; async waits
 #   are equal (16 = 16), which is the expected shape.
 # - Spread is large (before/sync total 3257-4023 ms, after/sync 2975-3267 ms)
-#   with 3 rounds; the min is the comparison and the gap, 282 ms sync, is
-#   about the size of the removed grad_sq_norm phase (568 ms) minus the
-#   train_step_into difference.
+#   with 3 rounds; the min is the comparison. The sync total gap is 282.6 ms
+#   (3257.2 - 2974.6). From the column minima: grad_sq_norm removed 568.5 ms
+#   (589.2 - 20.7), train_step_into +222.8 ms (2683.7 - 2460.9), adamw_step
+#   +21.6 ms (241.2 - 219.6), net 324.1 ms. That is not 282.6 because each
+#   column is an independent minimum (see the summary note), so the columns
+#   do not sum to the total; the total's own 282.6 is the figure to cite.
 #
 # ---- summary: 3 rounds, each a median of 3 steps; min over rounds (max beside total) ----
 # Each column is an INDEPENDENT minimum over the 3 timed rounds, so a row's

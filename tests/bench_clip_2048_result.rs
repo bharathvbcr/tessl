@@ -277,3 +277,35 @@ fn every_run_has_ac_power_and_no_peers() {
         .filter(|l| l.starts_with("# peers: "))
         .all(|l| l == "# peers: 0"));
 }
+
+#[test]
+fn sync_gap_prose_arithmetic_is_derived_from_the_table() {
+    let b = summary_row("before", "sync");
+    let a = summary_row("after", "sync");
+    // summary_row columns: total, max, train, grad_sq, adamw, footprint
+    let gap = b[0] - a[0];
+    let gsn = b[3] - a[3];
+    let train = a[2] - b[2];
+    let adamw = a[4] - b[4];
+    let net = gsn - train - adamw;
+    for (v, s) in [
+        (gap, "282.6 ms"),
+        (gsn, "568.5 ms"),
+        (train, "+222.8 ms"),
+        (adamw, "+21.6 ms"),
+        (net, "net 324.1 ms"),
+    ] {
+        assert!(FILE.contains(s), "prose must state {s} (computed {v:.1})");
+        let stated: f64 = s
+            .trim_start_matches("net ")
+            .trim_start_matches('+')
+            .trim_end_matches(" ms")
+            .parse()
+            .unwrap();
+        assert!((stated - v).abs() < 0.06, "{s} disagrees with table: {v:.1}");
+    }
+    assert!(
+        !FILE.contains("gap, 282 ms sync, is"),
+        "the old claim that the gap equals the removed phase minus the train difference must stay gone"
+    );
+}

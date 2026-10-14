@@ -310,3 +310,72 @@ fn mini_copy_chain_of_one_does_not_wait_and_runs() {
         assert_eq!(out.read_f32(), vec![1.0]);
     });
 }
+
+/// A host read that fails after the work ran and the runtime synchronized is an
+/// `Err` from every readback of the staged and decode entry points, never a
+/// panic; a failed `Decode::step` leaves `position()` and the logits it would
+/// have returned unconsumed (the session is poisoned, since its layers'
+/// state moved on), and the read-only entry points work again afterwards.
+#[test]
+fn a_failed_host_read_is_an_error_and_a_failed_step_does_not_advance() {
+    let cfg = Qwen35Config::from_config_file(&fixture().join("config.json")).unwrap();
+    let st = SafeTensors::open(&fixture().join("model.safetensors")).unwrap();
+    let layers = cfg.layers.len();
+    with_gpu(|rt| {
+        let model = Qwen35Model::load(rt, &st, "model.", cfg.clone(), Precision::F32).unwrap();
+        let faulted = |what: &str, r: std::thread::Result<Result<(), String>>| {
+            let e = r
+                .unwrap_or_else(|_| panic!("{what} panicked on a failed host read"))
+                .unwrap_err();
+            assert!(e.contains("injected fault"), "{what}: {e}");
+        };
+
+        // Staged::logits and score_answers: read-only, so the session survives.
+        let mut s = model.begin(&ids(4)).unwrap();
+        s.advance_to(layers).unwrap();
+        let want = s.logits(LogitRows::Last).unwrap();
+        model.fail_host_read_after_for_test(0);
+        faulted(
+            "logits",
+            catch_unwind(AssertUnwindSafe(|| s.logits(LogitRows::Last).map(|_| ()))),
+        );
+        assert_eq!(s.logits(LogitRows::Last).unwrap(), want, "the fault was one-shot");
+        model.fail_host_read_after_for_test(0);
+        faulted(
+            "score_answers",
+            catch_unwind(AssertUnwindSafe(|| s.score_answers(&[0], &[1, 2]).map(|_| ()))),
+        );
+        assert!(s.score_answers(&[0], &[1, 2]).is_ok());
+
+        // Staged::advance_to's trace (reached through forward): the read after
+        // the second layer fails.
+        model.fail_host_read_after_for_test(1);
+        faulted(
+            "advance_to trace",
+            catch_unwind(AssertUnwindSafe(|| model.forward(&ids(4), true).map(|_| ()))),
+        );
+
+        // forward's final-norm trace row (`read_rows`): after one read per
+        // layer and the logits.
+        model.fail_host_read_after_for_test(layers + 1);
+        faulted(
+            "forward trace row",
+            catch_unwind(AssertUnwindSafe(|| model.forward(&ids(4), true).map(|_| ()))),
+        );
+        assert!(model.forward(&ids(4), true).is_ok(), "the fault was one-shot");
+
+        // Decode::step reads before it advances.
+        let (mut d, _) = model.prefill(&ids(4), 3).unwrap();
+        let (pos, left) = (d.position(), d.remaining());
+        model.fail_host_read_after_for_test(0);
+        faulted("Decode::step", catch_unwind(AssertUnwindSafe(|| d.step(5).map(|_| ()))));
+        assert_eq!(d.position(), pos, "a failed read advanced the session");
+        assert_eq!(d.remaining(), left);
+        let e = d.step(5).unwrap_err();
+        assert!(e.contains("failed part way"), "the session must stay poisoned: {e}");
+        // A fresh session on the same model decodes normally.
+        let (mut d, _) = model.prefill(&ids(4), 3).unwrap();
+        assert_eq!(d.step(5).unwrap().len(), cfg.vocab as usize);
+        assert_eq!(d.position(), pos + 1);
+    });
+}

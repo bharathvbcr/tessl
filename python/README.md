@@ -158,6 +158,12 @@ error. The binding therefore:
   AdamW `step` and `seed` below 2**64, tensor dimensions) and raises
   `TesslError` naming it, before any tensor is touched. ctypes would wrap
   `-1` or `2**32` silently.
+  Integer arguments must be integers (no floats, no `bool`; `accumulate`
+  takes a bool or 0/1), and id tensors must have an integer dtype.
+- reports a failed free: `close()` raises `TesslPanic` if the free hit a bug
+  in tessl and `TesslError` if called from another thread (the handle is then
+  leaked); either way the object is closed. A finalizer issues a
+  `ResourceWarning` instead of raising.
 
 Not yet distinguished: a runtime whose GPU work failed is "poisoned" and
 refuses every later call with a status-1 message ("recreate it"); `TesslPanic`

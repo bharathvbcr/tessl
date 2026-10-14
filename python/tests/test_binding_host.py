@@ -12,10 +12,12 @@ import pickle
 import sys
 import threading
 import unittest
+import warnings
 from pathlib import Path
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+import torch  # noqa: E402
 import tessl_torch  # noqa: E402
 from tessl_torch import TesslError, TesslPanic  # noqa: E402
 
@@ -29,6 +31,8 @@ class FakeLib:
     def __init__(self):
         self.calls = []
         self.status = 0
+        self.free_status = 0
+        self.load_status = 0
 
     def _rec(self, name, *args):
         self.calls.append((name, args[0] if args else None))
@@ -42,15 +46,18 @@ class FakeLib:
 
     def tessl_runtime_free(self, h):
         self._rec("tessl_runtime_free", h.value)
-        return 0
+        return self.free_status
 
     def tessl_qwen35_load(self, rt, st, cfg, prefix, precision, out, err, n):
+        if self.load_status:
+            err.value = b"load failed"
+            return self.load_status
         out._obj.value = MODEL
         return 0
 
     def tessl_qwen35_free(self, h):
         self._rec("tessl_qwen35_free", h.value)
-        return 0
+        return self.free_status
 
     def tessl_qwen35_param_count(self, h, count, err, n):
         count._obj.value = 1
@@ -168,6 +175,58 @@ class Panic(HostCase):
         self.assertEqual(self.calls("tessl_runtime_free"), [("tessl_runtime_free", RUNTIME)])
         self.assertFalse(tessl_torch._runtime().closed)
 
+    def test_a_load_panic_closes_the_runtime_that_panicked(self):
+        self.lib.load_status = 2
+        with self.assertRaises(TesslPanic):
+            self.model()
+        self.assertEqual(self.calls("tessl_runtime_free"), [("tessl_runtime_free", RUNTIME)])
+        self.assertEqual(self.calls("tessl_qwen35_free"), [])
+        self.assertFalse(tessl_torch._runtime().closed)
+
+    def test_a_load_refusal_keeps_the_runtime(self):
+        self.lib.load_status = 1
+        with self.assertRaises(TesslError) as caught:
+            self.model()
+        self.assertNotIsInstance(caught.exception, TesslPanic)
+        self.assertEqual(self.calls("tessl_runtime_free"), [])
+
+    def test_a_model_panic_also_drops_the_threads_runtime(self):
+        model = self.model()
+        self.lib.status = 2
+        with self.assertRaises(TesslPanic):
+            model.adamw_free()
+        self.assertEqual(self.calls("tessl_runtime_free"), [("tessl_runtime_free", RUNTIME)])
+        self.assertTrue(tessl_torch._runtime() is not model._rt)
+
+
+class Close(HostCase):
+    def test_a_panic_from_the_free_raises_tesslpanic_after_closing(self):
+        model = self.model()
+        self.lib.free_status = 2
+        with self.assertRaises(TesslPanic):
+            model.close()
+        self.assertTrue(model.closed)
+        self.lib.free_status = 0
+        model.close()  # idempotent: nothing more is freed or raised
+        self.assertEqual(len(self.calls("tessl_qwen35_free")), 1)
+
+    def test_a_foreign_thread_free_raises_naming_the_leak(self):
+        model = self.model()
+        self.lib.free_status = 1
+        with self.assertRaisesRegex(TesslError, "leaked") as caught:
+            model.close()
+        self.assertNotIsInstance(caught.exception, TesslPanic)
+        self.assertTrue(model.closed)
+        self.lib.free_status = 0
+
+    def test_a_finalizer_warns_instead_of_raising(self):
+        model = self.model()
+        self.lib.free_status = 1
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            model.__del__()
+        self.assertTrue(any(issubclass(w.category, ResourceWarning) and "leaked" in str(w.message) for w in caught))
+
 
 class Ranges(HostCase):
     def test_chunk_is_checked_before_any_tensor_is_touched(self):
@@ -184,6 +243,37 @@ class Ranges(HostCase):
     def test_the_u32_edges_are_accepted_by_the_check(self):
         self.assertEqual(tessl_torch._check_uint("chunk", 0, 32), 0)
         self.assertEqual(tessl_torch._check_uint("chunk", 2**32 - 1, 32), 2**32 - 1)
+
+    def test_bool_is_refused_as_an_integer_but_accepted_as_a_flag(self):
+        with self.assertRaisesRegex(TesslError, "chunk"):
+            tessl_torch._check_uint("chunk", True, 32)
+        self.assertEqual(tessl_torch._flag("accumulate", True), 1)
+        self.assertEqual(tessl_torch._flag("accumulate", 0), 0)
+        for bad in (2, 2**32, -1, 1.0, None):
+            with self.assertRaisesRegex(TesslError, "accumulate"):
+                tessl_torch._flag("accumulate", bad)
+
+    def test_a_non_integral_step_is_a_tessl_error(self):
+        model = self.model()
+        model.adamw_init()
+        for step in (float("nan"), 3.9, "3", None, True):
+            state = {"step": step, "exp_avg": {}, "exp_avg_sq": {}}
+            with self.assertRaisesRegex(TesslError, "step"):
+                model.load_adamw_state(state)
+
+    def test_train_backward_accumulate_is_a_flag(self):
+        model = self.model()
+        with self.assertRaisesRegex(TesslError, "accumulate"):
+            model.train_backward(accumulate=2**32)
+
+    def test_float_and_bool_index_tensors_are_refused_and_empty_ones_are_not(self):
+        for bad in (torch.tensor([3.5]), torch.tensor([True]), torch.tensor([1.0])):
+            with self.assertRaisesRegex(TesslError, "ids must be an integer tensor"):
+                tessl_torch._u32(bad, 10, "ids")
+        self.assertEqual(tessl_torch._u32(torch.tensor([3, 4]), 10, "ids").t.tolist(), [3, 4])
+        self.assertEqual(tessl_torch._u32(torch.as_tensor([]), 10, "ids").t.numel(), 0)
+        with self.assertRaisesRegex(TesslError, "ids must be an integer tensor"):
+            self.model().train_step(torch.tensor([1.5, 2.5]))
 
     def test_gdn_dims_are_range_checked(self):
         with self.assertRaisesRegex(TesslError, "seq"):

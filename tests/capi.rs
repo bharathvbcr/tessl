@@ -420,6 +420,69 @@ fn a_wrap_through_the_abi_leaves_residency_balanced() {
     });
 }
 
+/// Every runtime-handle entry refuses a foreign thread with the thread message
+/// before any argument is looked at (all arguments are null: were they looked
+/// at first the message would be "null args"), and the owner stays usable.
+#[test]
+fn every_runtime_entry_refuses_a_foreign_thread_before_looking_at_its_arguments() {
+    fn run(out: &mut Vec<(&'static str, i32, String)>, name: &'static str, f: &dyn Fn(*mut c_char, usize) -> i32) {
+        let mut err = [0 as c_char; ERR_LEN];
+        let s = f(err.as_mut_ptr(), ERR_LEN);
+        out.push((name, s, msg(&err)));
+    }
+    fn runtime_entries(rt: *mut TesslRuntime) -> Vec<(&'static str, i32, String)> {
+        let mut out = Vec::new();
+        unsafe {
+            run(&mut out, "tessl_synchronize", &|e, n| tessl_synchronize(rt, e, n));
+            run(&mut out, "tessl_runtime_poisoned", &|e, n| {
+                tessl_runtime_poisoned(rt, ptr::null_mut(), e, n)
+            });
+            run(&mut out, "tessl_cross_entropy_rows", &|e, n| {
+                tessl_cross_entropy_rows(rt, ptr::null(), ptr::null_mut(), ptr::null_mut(), e, n)
+            });
+            run(&mut out, "tessl_gdn_train_forward", &|e, n| {
+                tessl_gdn_train_forward(rt, ptr::null(), e, n)
+            });
+            run(&mut out, "tessl_gdn_train_backward", &|e, n| {
+                tessl_gdn_train_backward(rt, ptr::null(), e, n)
+            });
+            run(&mut out, "tessl_qwen35_load", &|e, n| {
+                let mut m = ptr::null_mut();
+                tessl_qwen35_load(rt, ptr::null(), ptr::null(), ptr::null(), TESSL_F32, &mut m, e, n)
+            });
+        }
+        out
+    }
+    let _gpu = common::gpu_lock();
+    let mut err = [0 as c_char; ERR_LEN];
+    let rt = unsafe { tessl_runtime_new(err.as_mut_ptr(), ERR_LEN) };
+    assert!(!rt.is_null(), "{}", msg(&err));
+    let raw = rt as usize;
+    let calls = std::thread::spawn(move || runtime_entries(raw as *mut TesslRuntime))
+        .join()
+        .unwrap();
+    assert_eq!(calls.len(), 6);
+    for (name, status, message) in &calls {
+        assert_eq!(*status, TESSL_ERR, "{name}");
+        assert!(
+            message.contains("other than the one that created it"),
+            "{name}: {message:?}"
+        );
+    }
+    // A foreign free leaks rather than drops, and the owner still works.
+    let freed = std::thread::spawn(move || unsafe { tessl_runtime_free(raw as *mut TesslRuntime) })
+        .join()
+        .unwrap();
+    assert_eq!(freed, TESSL_ERR);
+    assert_eq!(
+        unsafe { tessl_synchronize(rt, err.as_mut_ptr(), ERR_LEN) },
+        TESSL_OK,
+        "{}",
+        msg(&err)
+    );
+    assert_eq!(unsafe { tessl_runtime_free(rt) }, TESSL_OK);
+}
+
 /// A free from a foreign thread (a finalizer at interpreter shutdown) leaks
 /// the handle instead of dropping a thread-affine runtime there; the owner can
 /// still use and free it.

@@ -3353,6 +3353,13 @@ mod lifetime_event_tests {
         );
         rt.set_event_wait_ms(1).unwrap();
         assert_eq!(rt.event_wait_ms(), 1);
+        // Both ends of the range are accepted; one past either is not.
+        rt.set_event_wait_ms(*EVENT_WAIT_MS_RANGE.end()).unwrap();
+        assert_eq!(rt.event_wait_ms(), *EVENT_WAIT_MS_RANGE.end());
+        assert!(rt.set_event_wait_ms(EVENT_WAIT_MS_RANGE.end() + 1).is_err());
+        assert_eq!(rt.event_wait_ms(), *EVENT_WAIT_MS_RANGE.end());
+        let message = rt.set_event_wait_ms(0).unwrap_err();
+        assert!(message.contains('0'), "the refusal does not name the value: {message}");
     }
 
     #[test]
@@ -3380,9 +3387,17 @@ mod lifetime_event_tests {
         let value = rt.metal4.event_value.fetch_add(1, Ordering::AcqRel) + 1;
         rt.metal4.allocators.lock().unwrap()[0].in_flight = value;
 
+        let started = std::time::Instant::now();
         let error = rt.wait_all_allocators().unwrap_err();
+        // Deadline: a 1 ms budget must return promptly, never hang the suite.
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(10),
+            "a 1 ms budget took {:?}",
+            started.elapsed()
+        );
         assert!(GpuRuntime::is_event_wait_timeout(&error), "{error}");
         assert!(error.contains("waited 1 ms"), "{error}");
+        assert!(error.contains(&format!("submitted {value}")), "{error}");
         assert!(error.contains(&format!("value {value}")), "{error}");
         assert!(error.contains("reached 0"), "{error}");
         rt.poison_on_failure(&error);

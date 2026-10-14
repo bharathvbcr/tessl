@@ -2036,7 +2036,11 @@ fn global_h512_with_scalars_pins_out_bf16_after_the_callback() {
 
         let reference = rt.alloc_buffer(n * 2).unwrap();
         reference.zero();
-        nn::flash_attn_global_h512(rt, &qb, &kb, &vb, &reference, &tkv, &zero, &zero, dims, true).unwrap();
+        // The reference must be the *tiled* entry point: `flash_attn_global_h512`
+        // routes through `route_attn` to the rows kernel for Tq > 1, a different
+        // accumulation order whose bf16 rounding legitimately differs from the
+        // tiled kernel that `_with_scalars` dispatches.
+        nn::flash_attn_global_h512_tiled(rt, &qb, &kb, &vb, &reference, &tkv, &zero, &zero, dims, true).unwrap();
 
         let o = rt.alloc_buffer(n * 2).unwrap();
         o.zero();

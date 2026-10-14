@@ -153,14 +153,19 @@ fn every_runtime_entry_refuses_a_foreign_thread_before_looking_at_its_arguments(
     assert_eq!(unsafe { tessl_runtime_free(rt) }, TESSL_OK);
 }
 
+/// `None` when the binding's `_ABI_VERSION` line is `ver`.
+fn abi_line_problem(src: &str, ver: u32) -> Option<String> {
+    let Some(line) = src.lines().find(|l| l.starts_with("_ABI_VERSION = ")) else {
+        return Some("no `_ABI_VERSION = ` line in the binding".to_string());
+    };
+    let want = format!("_ABI_VERSION = {ver}");
+    (line != want).then(|| format!("binding says `{line}`, TESSL_ABI_VERSION says `{want}`"))
+}
+
 #[test]
 fn the_python_binding_expects_this_abi_version() {
-    let src = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/python/tessl_torch/__init__.py")).unwrap();
-    let line = src
-        .lines()
-        .find(|l| l.starts_with("_ABI_VERSION = "))
-        .expect("_ABI_VERSION in the binding");
-    assert_eq!(line, format!("_ABI_VERSION = {TESSL_ABI_VERSION}"));
+    let src = read("python/tessl_torch/__init__.py");
+    assert_eq!(abi_line_problem(&src, TESSL_ABI_VERSION), None);
 }
 
 // ---------------------------------------------------------------------------
@@ -409,8 +414,9 @@ fn py_ty(expr: &str, consts: &BTreeMap<String, usize>) -> Ty {
 }
 
 struct PyAbi {
-    /// name -> (argtypes, restype), as declared.
-    fns: BTreeMap<String, (Vec<Ty>, Ty)>,
+    /// name -> (argtypes, restype), as declared. A function with no
+    /// `restype` line keeps `None`: ctypes would assume a C int.
+    fns: BTreeMap<String, (Vec<Ty>, Option<Ty>)>,
     structs: BTreeMap<String, Vec<(String, Ty)>>,
 }
 
@@ -534,13 +540,6 @@ fn parse_py_abi(src: &str) -> PyAbi {
         }
         rest = body;
     }
-    let fns = fns
-        .into_iter()
-        .map(|(n, (a, r))| {
-            let r = r.unwrap_or_else(|| panic!("{n}: no restype (ctypes would assume a C int)"));
-            (n, (a, r))
-        })
-        .collect();
     PyAbi { fns, structs }
 }
 
@@ -548,17 +547,30 @@ fn read(path: &str) -> String {
     std::fs::read_to_string(format!("{}/{path}", env!("CARGO_MANIFEST_DIR"))).unwrap()
 }
 
-#[test]
-fn every_c_function_is_declared_in_python_with_the_same_arity_and_widths() {
-    let rust = parse_rust_abi(&read("src/capi.rs"));
-    let py = parse_py_abi(&read("python/tessl_torch/__init__.py"));
-    // A parser that quietly found nothing would pass vacuously.
-    assert!(rust.fns.len() >= 26, "parsed only {} C functions", rust.fns.len());
-    assert!(rust.fns.contains_key("tessl_runtime_poisoned"));
+/// Exports the binding deliberately does not declare. Empty: every export is
+/// bound, `tessl_synchronize` included. An entry that is bound, or not
+/// exported, is itself a problem, so the list cannot go stale.
+const UNBOUND_EXPORTS: &[&str] = &[];
 
+/// Every way a bound function can disagree with its C signature, as data so
+/// that a fault can be fed in as edited source text.
+fn fn_problems(rust: &RustAbi, py: &PyAbi, unbound_ok: &[&str]) -> Vec<String> {
     let mut problems = Vec::new();
     for name in rust.fns.keys().filter(|k| !py.fns.contains_key(*k)) {
-        problems.push(format!("{name}: in src/capi.rs, not declared in the Python binding"));
+        if !unbound_ok.contains(&name.as_str()) {
+            problems.push(format!(
+                "{name}: in src/capi.rs, not declared in the Python binding and not on the allowlist"
+            ));
+        }
+    }
+    for name in unbound_ok {
+        if !rust.fns.contains_key(*name) {
+            problems.push(format!(
+                "{name}: on the unbound allowlist, but not exported by src/capi.rs"
+            ));
+        } else if py.fns.contains_key(*name) {
+            problems.push(format!("{name}: on the unbound allowlist, but the binding declares it"));
+        }
     }
     for name in py.fns.keys().filter(|k| !rust.fns.contains_key(*k)) {
         problems.push(format!("{name}: declared in the Python binding, not in src/capi.rs"));
@@ -567,6 +579,13 @@ fn every_c_function_is_declared_in_python_with_the_same_arity_and_widths() {
         let Some((pargs, pret)) = py.fns.get(name) else {
             continue;
         };
+        match pret {
+            None => problems.push(format!("{name}: no restype (ctypes would assume a C int)")),
+            Some(pret) if !sig.ret.agrees(pret) => {
+                problems.push(format!("{name}: returns {:?} in C, restype is {pret:?}", sig.ret));
+            }
+            Some(_) => {}
+        }
         if sig.args.len() != pargs.len() {
             problems.push(format!(
                 "{name}: C takes {} arguments, ctypes declares {}",
@@ -582,24 +601,24 @@ fn every_c_function_is_declared_in_python_with_the_same_arity_and_widths() {
                 ));
             }
         }
-        if !sig.ret.agrees(pret) {
-            problems.push(format!("{name}: returns {:?} in C, restype is {pret:?}", sig.ret));
-        }
     }
-    assert!(problems.is_empty(), "C ABI / ctypes mismatch:\n{}", problems.join("\n"));
+    problems
 }
 
-#[test]
-fn every_repr_c_struct_matches_its_ctypes_structure_field_for_field() {
-    let rust = parse_rust_abi(&read("src/capi.rs"));
-    let py = parse_py_abi(&read("python/tessl_torch/__init__.py"));
-    assert!(rust.structs.len() >= 4, "parsed only {} structs", rust.structs.len());
+/// Struct names, field order, field types.
+fn struct_problems(rust: &RustAbi, py: &PyAbi) -> Vec<String> {
+    let mut problems = Vec::new();
     let rust_names: Vec<_> = rust.structs.keys().collect();
     let py_names: Vec<_> = py.structs.keys().collect();
-    assert_eq!(rust_names, py_names, "#[repr(C)] structs vs ctypes Structures");
-    let mut problems = Vec::new();
+    if rust_names != py_names {
+        problems.push(format!(
+            "#[repr(C)] structs {rust_names:?} vs ctypes Structures {py_names:?}"
+        ));
+    }
     for (name, rfields) in &rust.structs {
-        let pfields = &py.structs[name];
+        let Some(pfields) = py.structs.get(name) else {
+            continue;
+        };
         if rfields.len() != pfields.len() {
             problems.push(format!(
                 "{name}: {} fields in C, {} in ctypes",
@@ -616,5 +635,424 @@ fn every_repr_c_struct_matches_its_ctypes_structure_field_for_field() {
             }
         }
     }
+    problems
+}
+
+type Structs = BTreeMap<String, Vec<(String, Ty)>>;
+
+/// Size and alignment under C's natural-alignment rules, which is what both
+/// rustc (`repr(C)`) and ctypes (no `_pack_`) apply.
+fn c_layout(ty: &Ty, structs: &Structs) -> (usize, usize) {
+    match ty {
+        Ty::Scalar(n) => {
+            let w = match n.as_str() {
+                "i8" | "u8" | "c_char" => 1,
+                "i16" | "u16" => 2,
+                "i32" | "u32" | "f32" => 4,
+                "i64" | "u64" | "f64" | "usize" | "isize" => 8,
+                other => panic!("no width for scalar {other:?}"),
+            };
+            (w, w)
+        }
+        Ty::Ptr(_) => (8, 8),
+        Ty::Void => panic!("a void value has no layout"),
+        Ty::Array(elem, n) => {
+            let (size, align) = c_layout(elem, structs);
+            (size * n, align)
+        }
+        Ty::Struct(name) => {
+            let fields = structs.get(name).unwrap_or_else(|| panic!("unknown struct {name:?}"));
+            let (_, size, align) = field_offsets(fields, structs);
+            (size, align)
+        }
+    }
+}
+
+/// Offsets, total size and alignment of a struct's fields in declaration order.
+fn field_offsets(fields: &[(String, Ty)], structs: &Structs) -> (Vec<usize>, usize, usize) {
+    let (mut at, mut max_align, mut offsets) = (0usize, 1usize, Vec::new());
+    for (_, ty) in fields {
+        let (size, align) = c_layout(ty, structs);
+        at = at.next_multiple_of(align);
+        offsets.push(at);
+        at += size;
+        max_align = max_align.max(align);
+    }
+    (offsets, at.next_multiple_of(max_align), max_align)
+}
+
+/// The ctypes side's offsets and size.
+fn py_offsets(fields: &[(String, Ty)], structs: &Structs) -> (Vec<usize>, usize) {
+    let (offsets, size, _) = field_offsets(fields, structs);
+    (offsets, size)
+}
+
+/// `rustc`'s offsets and size (from `offset_of!`) against ctypes's.
+fn offset_problems(
+    name: &str,
+    rust_offsets: &[(String, usize)],
+    rust_size: usize,
+    py_fields: &[(String, Ty)],
+    py_structs: &Structs,
+) -> Vec<String> {
+    let (offsets, size) = py_offsets(py_fields, py_structs);
+    let mut problems = Vec::new();
+    for (field, at) in rust_offsets {
+        match py_fields.iter().position(|(n, _)| n == field) {
+            None => problems.push(format!("{name}.{field}: at byte {at} in C, absent from ctypes")),
+            Some(i) if offsets[i] != *at => problems.push(format!(
+                "{name}.{field}: at byte {at} in C, at byte {} in ctypes",
+                offsets[i]
+            )),
+            Some(_) => {}
+        }
+    }
+    if py_fields.len() != rust_offsets.len() {
+        problems.push(format!(
+            "{name}: {} fields in C, {} in ctypes",
+            rust_offsets.len(),
+            py_fields.len()
+        ));
+    }
+    if size != rust_size {
+        problems.push(format!("{name}: {rust_size} bytes in C, {size} in ctypes"));
+    }
+    problems
+}
+
+/// `_pack_` or `_anonymous_` would change ctypes's layout rules and make
+/// `py_offsets` wrong without any field changing.
+fn layout_guard_problem(py_src: &str) -> Option<String> {
+    let code: String = py_src
+        .lines()
+        .map(|l| l.find('#').map_or(l, |i| &l[..i]))
+        .collect::<Vec<_>>()
+        .join("\n");
+    ["_pack_", "_anonymous_"]
+        .into_iter()
+        .find(|k| code.contains(k))
+        .map(|k| format!("the binding uses `{k}`, which the layout check does not model"))
+}
+
+/// `(name, [(field, offset_of!)], size_of)` straight from rustc.
+macro_rules! rust_layout {
+    ($t:ident { $($f:ident),+ $(,)? }) => {(
+        stringify!($t).trim_start_matches("Tessl").to_string(),
+        vec![$((stringify!($f).to_string(), std::mem::offset_of!(tessl::capi::$t, $f))),+],
+        std::mem::size_of::<tessl::capi::$t>(),
+    )};
+}
+
+/// A struct's name, its `(field, offset)` pairs and its size.
+type RustLayout = (String, Vec<(String, usize)>, usize);
+
+fn rust_layouts() -> Vec<RustLayout> {
+    vec![
+        rust_layout!(TesslTensorRef {
+            buffer,
+            byte_offset,
+            dtype,
+            ndim,
+            shape
+        }),
+        rust_layout!(TesslCeArgs {
+            hidden,
+            col_off,
+            weight,
+            rows,
+            targets,
+            n,
+            reduction,
+            operands,
+            chunk,
+            want_grads,
+            scale,
+            dh,
+            dw
+        }),
+        rust_layout!(TesslGdnArgs {
+            batch,
+            seq,
+            heads,
+            v_dim,
+            q,
+            k,
+            v,
+            g,
+            beta,
+            s0,
+            ckpt,
+            o,
+            s_fin,
+            d_o,
+            d_fin,
+            dq,
+            dk,
+            dv,
+            dg,
+            dbeta,
+            ds0
+        }),
+        rust_layout!(TesslParamInfo {
+            name,
+            ndim,
+            transposed,
+            decay_excluded,
+            shape
+        }),
+    ]
+}
+
+const PY: &str = "python/tessl_torch/__init__.py";
+const RS: &str = "src/capi.rs";
+
+#[test]
+fn every_c_function_is_declared_in_python_with_the_same_arity_and_widths() {
+    let rust = parse_rust_abi(&read(RS));
+    let py = parse_py_abi(&read(PY));
+    // A parser that quietly found nothing would pass vacuously.
+    assert!(rust.fns.len() >= 26, "parsed only {} C functions", rust.fns.len());
+    assert!(rust.fns.contains_key("tessl_runtime_poisoned"));
+    let problems = fn_problems(&rust, &py, UNBOUND_EXPORTS);
+    assert!(problems.is_empty(), "C ABI / ctypes mismatch:\n{}", problems.join("\n"));
+}
+
+#[test]
+fn every_repr_c_struct_matches_its_ctypes_structure_field_for_field() {
+    let rust = parse_rust_abi(&read(RS));
+    let py = parse_py_abi(&read(PY));
+    assert!(rust.structs.len() >= 4, "parsed only {} structs", rust.structs.len());
+    let problems = struct_problems(&rust, &py);
     assert!(problems.is_empty(), "struct layout mismatch:\n{}", problems.join("\n"));
+}
+
+#[test]
+fn every_ctypes_structure_has_the_rust_field_offsets_and_size() {
+    let rust = parse_rust_abi(&read(RS));
+    let py = parse_py_abi(&read(PY));
+    assert_eq!(layout_guard_problem(&read(PY)), None);
+    let layouts = rust_layouts();
+    assert_eq!(
+        layouts.len(),
+        rust.structs.len(),
+        "a #[repr(C)] struct is missing from rust_layouts"
+    );
+    let mut problems = Vec::new();
+    for (name, offsets, size) in &layouts {
+        let parsed = rust
+            .structs
+            .get(name)
+            .unwrap_or_else(|| panic!("{name} is not a parsed #[repr(C)] struct"));
+        let parsed_names: Vec<_> = parsed.iter().map(|(n, _)| n.as_str()).collect();
+        let listed: Vec<_> = offsets.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(
+            listed, parsed_names,
+            "{name}: rust_layouts lists different fields than src/capi.rs"
+        );
+        // The layout model must agree with rustc, or it proves nothing about ctypes.
+        let (model, model_size, _) = field_offsets(parsed, &rust.structs);
+        for ((field, at), m) in offsets.iter().zip(&model) {
+            assert_eq!(at, m, "{name}.{field}: offset_of! vs the layout model");
+        }
+        assert_eq!(*size, model_size, "{name}: size_of vs the layout model");
+        let pfields = py
+            .structs
+            .get(name)
+            .unwrap_or_else(|| panic!("{name}: no ctypes Structure"));
+        problems.extend(offset_problems(name, offsets, *size, pfields, &py.structs));
+    }
+    assert!(problems.is_empty(), "struct offsets differ:\n{}", problems.join("\n"));
+}
+
+// ---------------------------------------------------------------------------
+// Injected faults: an edited copy of each source with one thing changed must
+// be reported. Every edit asserts its needle is present, so a rename fails
+// loudly rather than letting the fault go vacuous.
+
+fn fault(src: &str, needle: &str, with: &str) -> String {
+    assert!(src.contains(needle), "fault needle not in the source: {needle:?}");
+    src.replacen(needle, with, 1)
+}
+
+fn py_faulted(needle: &str, with: &str) -> PyAbi {
+    parse_py_abi(&fault(&read(PY), needle, with))
+}
+
+fn real() -> (RustAbi, PyAbi) {
+    (parse_rust_abi(&read(RS)), parse_py_abi(&read(PY)))
+}
+
+fn mentions(problems: &[String], what: &str) -> bool {
+    problems.iter().any(|p| p.contains(what))
+}
+
+#[test]
+fn the_unmodified_sources_are_clean() {
+    let (rust, py) = real();
+    assert!(fn_problems(&rust, &py, UNBOUND_EXPORTS).is_empty());
+    assert!(struct_problems(&rust, &py).is_empty());
+}
+
+#[test]
+fn a_narrowed_argument_width_is_caught() {
+    let (rust, _) = real();
+    let py = py_faulted(
+        "lib.tessl_qwen35_adamw_set_step_count.argtypes = [ctypes.c_void_p, ctypes.c_uint64]",
+        "lib.tessl_qwen35_adamw_set_step_count.argtypes = [ctypes.c_void_p, ctypes.c_uint32]",
+    );
+    let p = fn_problems(&rust, &py, UNBOUND_EXPORTS);
+    assert!(
+        mentions(&p, "tessl_qwen35_adamw_set_step_count: argument 1 `step`"),
+        "{p:?}"
+    );
+}
+
+#[test]
+fn a_signedness_change_is_caught() {
+    let (rust, _) = real();
+    let py = py_faulted(
+        "lib.tessl_synchronize.restype = ctypes.c_int32",
+        "lib.tessl_synchronize.restype = ctypes.c_uint32",
+    );
+    let p = fn_problems(&rust, &py, UNBOUND_EXPORTS);
+    assert!(mentions(&p, "tessl_synchronize: returns"), "{p:?}");
+}
+
+#[test]
+fn a_dropped_argument_is_caught() {
+    let (rust, _) = real();
+    let py = py_faulted(
+        "lib.tessl_mtl_buffer_length.argtypes = [ctypes.c_void_p]",
+        "lib.tessl_mtl_buffer_length.argtypes = []",
+    );
+    let p = fn_problems(&rust, &py, UNBOUND_EXPORTS);
+    assert!(
+        mentions(&p, "tessl_mtl_buffer_length: C takes 1 arguments, ctypes declares 0"),
+        "{p:?}"
+    );
+}
+
+#[test]
+fn a_changed_rust_width_is_caught() {
+    let (_, py) = real();
+    let rs = fault(
+        &read(RS),
+        "tessl_qwen35_adamw_set_step_count(\n    model: *mut TesslQwen35,\n    step: u64,",
+        "tessl_qwen35_adamw_set_step_count(\n    model: *mut TesslQwen35,\n    step: u32,",
+    );
+    let p = fn_problems(&parse_rust_abi(&rs), &py, UNBOUND_EXPORTS);
+    assert!(
+        mentions(&p, "tessl_qwen35_adamw_set_step_count: argument 1 `step`"),
+        "{p:?}"
+    );
+}
+
+#[test]
+fn a_removed_restype_is_reported_not_assumed() {
+    let (rust, _) = real();
+    let py = py_faulted("        lib.tessl_synchronize.restype = ctypes.c_int32\n", "");
+    let p = fn_problems(&rust, &py, UNBOUND_EXPORTS);
+    assert!(mentions(&p, "tessl_synchronize: no restype"), "{p:?}");
+}
+
+#[test]
+fn an_unbound_export_fails_unless_allowlisted() {
+    let (rust, _) = real();
+    let src = fault(
+        &read(PY),
+        "        lib.tessl_synchronize.restype = ctypes.c_int32\n        lib.tessl_synchronize.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_size_t]\n",
+        "",
+    );
+    let py = parse_py_abi(&src);
+    let p = fn_problems(&rust, &py, UNBOUND_EXPORTS);
+    assert!(mentions(&p, "tessl_synchronize: in src/capi.rs, not declared"), "{p:?}");
+    assert_eq!(fn_problems(&rust, &py, &["tessl_synchronize"]), Vec::<String>::new());
+}
+
+#[test]
+fn a_stale_allowlist_entry_fails() {
+    let (rust, py) = real();
+    let bound = fn_problems(&rust, &py, &["tessl_synchronize"]);
+    assert!(
+        mentions(
+            &bound,
+            "tessl_synchronize: on the unbound allowlist, but the binding declares it"
+        ),
+        "{bound:?}"
+    );
+    let gone = fn_problems(&rust, &py, &["tessl_no_such_export"]);
+    assert!(
+        mentions(
+            &gone,
+            "tessl_no_such_export: on the unbound allowlist, but not exported"
+        ),
+        "{gone:?}"
+    );
+}
+
+#[test]
+fn a_reordered_struct_field_is_caught() {
+    let (rust, _) = real();
+    let src = fault(
+        &read(PY),
+        "        (\"col_off\", ctypes.c_uint32),\n        (\"weight\", _TensorRef),\n",
+        "        (\"weight\", _TensorRef),\n        (\"col_off\", ctypes.c_uint32),\n",
+    );
+    let py = parse_py_abi(&src);
+    let p = struct_problems(&rust, &py);
+    assert!(mentions(&p, "CeArgs: field 1"), "{p:?}");
+    let (_, offsets, size) = rust_layouts().into_iter().find(|(n, ..)| n == "CeArgs").unwrap();
+    let p = offset_problems("CeArgs", &offsets, size, &py.structs["CeArgs"], &py.structs);
+    assert!(mentions(&p, "CeArgs.col_off"), "{p:?}");
+    assert!(mentions(&p, "CeArgs.weight"), "{p:?}");
+}
+
+#[test]
+fn a_narrowed_struct_field_changes_the_offsets_and_size() {
+    let src = fault(
+        &read(PY),
+        "        (\"byte_offset\", ctypes.c_uint64),\n        (\"dtype\", ctypes.c_uint32),",
+        "        (\"byte_offset\", ctypes.c_uint32),\n        (\"dtype\", ctypes.c_uint32),",
+    );
+    let py = parse_py_abi(&src);
+    let (_, offsets, size) = rust_layouts().into_iter().find(|(n, ..)| n == "TensorRef").unwrap();
+    let p = offset_problems("TensorRef", &offsets, size, &py.structs["TensorRef"], &py.structs);
+    assert!(mentions(&p, "TensorRef.dtype"), "{p:?}");
+}
+
+#[test]
+fn natural_alignment_pads_a_narrow_field_before_a_wide_one() {
+    let mut structs = Structs::new();
+    let fields = vec![
+        ("a".to_string(), Ty::Scalar("u32".into())),
+        ("b".to_string(), Ty::Scalar("u64".into())),
+    ];
+    structs.insert("X".to_string(), fields.clone());
+    assert_eq!(py_offsets(&fields, &structs), (vec![0, 8], 16));
+    // A nested struct takes its own alignment and rounds its size up.
+    let outer = vec![
+        ("c".to_string(), Ty::Scalar("u8".into())),
+        ("x".to_string(), Ty::Struct("X".into())),
+        ("p".to_string(), Ty::Ptr(None)),
+    ];
+    assert_eq!(py_offsets(&outer, &structs), (vec![0, 8, 24], 32));
+}
+
+#[test]
+fn packed_ctypes_layout_is_refused() {
+    assert!(layout_guard_problem("class _A(ctypes.Structure):\n    _pack_ = 1\n").is_some());
+    assert!(layout_guard_problem("# _pack_ is not used\nx = 1\n").is_none());
+}
+
+#[test]
+fn an_abi_version_mismatch_is_caught() {
+    let src = read(PY);
+    assert_eq!(abi_line_problem(&src, TESSL_ABI_VERSION), None);
+    let stale = fault(
+        &src,
+        &format!("_ABI_VERSION = {TESSL_ABI_VERSION}"),
+        "_ABI_VERSION = 10",
+    );
+    assert!(abi_line_problem(&stale, TESSL_ABI_VERSION).is_some());
+    assert!(abi_line_problem("x = 1\n", TESSL_ABI_VERSION).is_some());
 }

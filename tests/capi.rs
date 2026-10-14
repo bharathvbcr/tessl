@@ -1942,6 +1942,62 @@ fn the_poisoned_query_reports_a_latched_runtime() {
     assert_eq!(poisoned(healthy.0), 0);
 }
 
+/// What a binding does after the poisoned status: free the latched runtime
+/// and build a new one on the same thread. The new runtime must load a real
+/// model and train a step; a stand-in library cannot show that.
+#[test]
+fn a_fresh_runtime_on_the_poisoned_thread_loads_and_runs_a_model() {
+    let mut err = [0 as c_char; ERR_LEN];
+    let a = unsafe { tessl_runtime_new(err.as_mut_ptr(), ERR_LEN) };
+    assert!(!a.is_null(), "{}", msg(&err));
+    let (st, cfg, prefix) = (
+        fixture("model.safetensors"),
+        fixture("config.json"),
+        std::ffi::CString::new("model.").unwrap(),
+    );
+    let mut out: *mut TesslQwen35 = ptr::null_mut();
+    let s = {
+        let _poison = PoisonAfterLoad::on();
+        unsafe {
+            tessl_qwen35_load(
+                a,
+                st.as_ptr(),
+                cfg.as_ptr(),
+                prefix.as_ptr(),
+                TESSL_F32,
+                &mut out,
+                err.as_mut_ptr(),
+                ERR_LEN,
+            )
+        }
+    };
+    assert_eq!(s, TESSL_ERR, "{}", msg(&err));
+    assert!(out.is_null());
+    assert_eq!(poisoned(a), 1);
+    assert_eq!(unsafe { tessl_runtime_free(a) }, TESSL_OK, "a poisoned runtime frees");
+
+    let b = Handle::new();
+    assert_eq!(poisoned(b.0), 0);
+    let model = load_model(b.0);
+    let ids = fixture_ids();
+    let mut loss = f64::NAN;
+    let s = unsafe {
+        tessl_qwen35_train_step(
+            model,
+            ids.as_ptr(),
+            ids.len() as u64,
+            TESSL_OPERANDS_EXACT_F32,
+            &mut loss,
+            err.as_mut_ptr(),
+            ERR_LEN,
+        )
+    };
+    assert_eq!(s, TESSL_OK, "{}", msg(&err));
+    assert!(loss.is_finite(), "loss {loss}");
+    assert_eq!(poisoned(b.0), 0);
+    assert_eq!(unsafe { tessl_qwen35_free(model) }, TESSL_OK);
+}
+
 /// A GDN backward refused for its tensors keeps the cached workspace.
 #[test]
 fn a_refused_gdn_backward_keeps_the_cached_workspace() {

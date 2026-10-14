@@ -2291,3 +2291,159 @@ fn the_gdn_abi_is_the_rust_gdn() {
         }
     });
 }
+
+/// Hostile GDN arguments are refused with an error, never a panic or a
+/// poisoned handle, and a refused call writes nothing: zero and overflowing
+/// dimensions, `s0` without `ds0` and the reverse, a wrong-shaped `ckpt`, and
+/// a v_dim the tensors do not carry. A NaN input flows through without
+/// crashing, and the handle still serves a good call afterwards.
+#[test]
+fn hostile_gdn_args_are_refused_and_leave_outputs_untouched() {
+    use tessl::gdn_train::GdnTrainDims;
+    const SENTINEL: f32 = -7.25e27;
+    let handle = Handle::new();
+    with_gpu(|rt| {
+        let (b, t, h, dv) = (1usize, 16usize, 2usize, 32usize);
+        let buf = |n: usize, seed: u64| shared(rt, &random_f32(n, seed));
+        let sent = |n: usize| shared(rt, &vec![SENTINEL; n]);
+        let dims = GdnTrainDims {
+            batch: 1,
+            seq: 16,
+            heads: 2,
+            v_dim: 32,
+        };
+        let ck = dims.checkpoint_shape();
+        let ck64: Vec<u64> = ck.iter().map(|&d| d as u64).collect();
+        let (q, k) = (buf(b * t * h * 128, 1), buf(b * t * h * 128, 2));
+        let (v, g, beta) = (buf(b * t * h * dv, 3), buf(b * t * h, 4), buf(b * t * h, 5));
+        let s0 = buf(b * h * 128 * dv, 6);
+        let ckpt = sent(ck.iter().product());
+        let (o, s_fin) = (sent(b * t * h * dv), sent(b * h * 128 * dv));
+        let d_o = buf(b * t * h * dv, 7);
+        let (dq, dk, dvv) = (sent(b * t * h * 128), sent(b * t * h * 128), sent(b * t * h * dv));
+        let (dg, db, ds0) = (sent(b * t * h), sent(b * t * h), sent(b * h * 128 * dv));
+        let (bu, tu, hu, du) = (b as u64, t as u64, h as u64, dv as u64);
+        let st = [bu, hu, 128, du];
+        let os = [bu, tu, hu, du];
+        let args = TesslGdnArgs {
+            batch: 1,
+            seq: 16,
+            heads: 2,
+            v_dim: 32,
+            q: tref(&q, &[bu, tu, hu, 128]),
+            k: tref(&k, &[bu, tu, hu, 128]),
+            v: tref(&v, &os),
+            g: tref(&g, &[bu, tu, hu]),
+            beta: tref(&beta, &[bu, tu, hu]),
+            s0: tref(&s0, &st),
+            ckpt: tref(&ckpt, &ck64),
+            o: tref(&o, &os),
+            s_fin: tref(&s_fin, &st),
+            d_o: tref(&d_o, &os),
+            d_fin: NULL_REF,
+            dq: tref(&dq, &[bu, tu, hu, 128]),
+            dk: tref(&dk, &[bu, tu, hu, 128]),
+            dv: tref(&dvv, &os),
+            dg: tref(&dg, &[bu, tu, hu]),
+            dbeta: tref(&db, &[bu, tu, hu]),
+            ds0: tref(&ds0, &st),
+        };
+        let untouched = |what: &str| {
+            for (name, b, n) in [
+                ("o", &o, b * t * h * dv),
+                ("s_fin", &s_fin, b * h * 128 * dv),
+                ("ckpt", &ckpt, ck.iter().product()),
+                ("dq", &dq, b * t * h * 128),
+                ("dv", &dvv, b * t * h * dv),
+                ("dg", &dg, b * t * h),
+                ("ds0", &ds0, b * h * 128 * dv),
+            ] {
+                assert!(read(b, n).iter().all(|x| *x == SENTINEL), "{what}: {name} was written");
+            }
+        };
+        let cases: Vec<(&str, TesslGdnArgs)> = vec![
+            ("batch 0", TesslGdnArgs { batch: 0, ..args }),
+            ("seq 0", TesslGdnArgs { seq: 0, ..args }),
+            ("heads 0", TesslGdnArgs { heads: 0, ..args }),
+            ("v_dim 0", TesslGdnArgs { v_dim: 0, ..args }),
+            (
+                "batch max",
+                TesslGdnArgs {
+                    batch: u32::MAX,
+                    ..args
+                },
+            ),
+            ("seq max", TesslGdnArgs { seq: u32::MAX, ..args }),
+            (
+                "heads max",
+                TesslGdnArgs {
+                    heads: u32::MAX,
+                    ..args
+                },
+            ),
+            (
+                "v_dim max",
+                TesslGdnArgs {
+                    v_dim: u32::MAX,
+                    ..args
+                },
+            ),
+            ("v_dim 33", TesslGdnArgs { v_dim: 33, ..args }),
+            ("v_dim 64 on 32 tensors", TesslGdnArgs { v_dim: 64, ..args }),
+            (
+                "ckpt too small",
+                TesslGdnArgs {
+                    ckpt: tref(&ckpt, &[bu, hu, 0, 128, du]),
+                    ..args
+                },
+            ),
+            (
+                "s0 shape wrong",
+                TesslGdnArgs {
+                    s0: tref(&s0, &[bu, hu, du, 128]),
+                    ..args
+                },
+            ),
+        ];
+        let run = |f: GdnFn, a: &TesslGdnArgs| run_gdn(f, &handle, a);
+        for (name, a) in &cases {
+            for f in [tessl_gdn_train_forward, tessl_gdn_train_backward] {
+                let (s, m) = run(f, a);
+                assert_eq!(s, TESSL_ERR, "{name}: accepted ({m})");
+                assert!(!m.is_empty(), "{name}: refused without a message");
+            }
+            untouched(name);
+            assert_eq!(poisoned(handle.0), 0, "{name}: poisoned the handle");
+        }
+        // ds0 exactly when s0 is given, both directions of the mismatch.
+        let (s, m) = run(tessl_gdn_train_backward, &TesslGdnArgs { ds0: NULL_REF, ..args });
+        assert_eq!(s, TESSL_ERR, "s0 without ds0 accepted ({m})");
+        let (s, m) = run(tessl_gdn_train_backward, &TesslGdnArgs { s0: NULL_REF, ..args });
+        assert_eq!(s, TESSL_ERR, "ds0 without s0 accepted ({m})");
+        untouched("ds0 mismatch");
+        assert_eq!(poisoned(handle.0), 0);
+
+        // NaN in q: the call completes, the NaN reaches o, the handle survives.
+        let mut qn = random_f32(b * t * h * 128, 1);
+        qn[0] = f32::NAN;
+        let qnb = shared(rt, &qn);
+        let a = TesslGdnArgs {
+            q: tref(&qnb, &[bu, tu, hu, 128]),
+            ..args
+        };
+        let (s, m) = run(tessl_gdn_train_forward, &a);
+        assert_eq!(s, TESSL_OK, "{m}");
+        assert!(
+            read(&o, b * t * h * dv).iter().any(|x| x.is_nan()),
+            "NaN q must reach o"
+        );
+        assert_eq!(poisoned(handle.0), 0);
+
+        // The same handle still serves a good call.
+        let (s, m) = run(tessl_gdn_train_forward, &args);
+        assert_eq!(s, TESSL_OK, "{m}");
+        let (s, m) = run(tessl_gdn_train_backward, &args);
+        assert_eq!(s, TESSL_OK, "{m}");
+        assert!(read(&dq, b * t * h * 128).iter().all(|x| x.is_finite()));
+    });
+}

@@ -5,7 +5,8 @@
 #
 # A CONFIG is `T:MID:MODE[:EXTRA]`: T tokens, MID the TESSL_MID_COMMIT value
 # (`-` leaves it unset), MODE `sync` or `async` (`--async`), and EXTRA an
-# optional bench flag (e.g. `--bf16`). Each round runs every configuration in
+# optional bench flag (e.g. `--bf16`), or several joined by commas (e.g.
+# `--storage=bf16,--random-config=PATH`). Each round runs every configuration in
 # its own process under `/usr/bin/time -l` (TESSL_MID_COMMIT is read once
 # per process), forward order on even rounds and reversed on odd ones, so
 # drift lands on every configuration alike (docs/benchmarking.md, pitfalls 1
@@ -52,7 +53,10 @@ run_one() {
   IFS=: read -r t mid mode extra <<<"$cfg"
   local args=("$t" --step-only "--step=$t")
   [[ $mode == async ]] && args+=(--async)
-  [[ -n ${extra:-} ]] && args+=("$extra")
+  if [[ -n ${extra:-} ]]; then
+    IFS=, read -r -a more <<<"$extra"
+    args+=("${more[@]}")
+  fi
   local name="${label:+$label/}$cfg"
   local log="$tmp/$(echo "$name" | tr ':/' '__').$round"
   {

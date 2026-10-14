@@ -1,0 +1,1397 @@
+# GDN column windows: train_step before/after, paired - M5 Pro, 2026-10-14
+#
+# before = bench_qwen35_train frozen at 28dfadf (gp/wave1 75a4f31 + the
+# --random-config flag, no library change); after = frozen at 478dbb2 (gdn_train
+# reads q/k/v and writes dq/dk/dv through (ld, off) windows, key heads shared
+# by value heads; no copy_cols / repeat_heads / sum_heads in a GDN layer).
+# Power: AC attached, battery 85% not charging. Load average 8-12 at start,
+# logged per run below. One mac_heavy-locked job, 5 rounds, every
+# configuration under both binaries back to back, order reversed on odd rounds.
+#
+#   BENCH_BINS="before=... after=..." bench/paired_qwen35_step.sh 5 OUT \
+#     2048:-:sync 2048:-:async 2048:-:sync:--storage=bf16 \
+#     1024:-:sync:--storage=bf16,--random-config=<Qwen3.5-4B-Base config.json> \
+#     1024:-:async:--storage=bf16,--random-config=<same>
+#
+# 2B rows (r = 1): Qwen/Qwen3.5-2B checkpoint (the instruct release; the -Base
+# snapshot here has no weights). 4B rows (r = 2: 32 value / 16 key heads): a
+# random tower at Qwen3.5-4B-Base's config.json (kernel time and allocation,
+# not values), bf16 storage into a bf16 bank. Min of the rounds' medians of 3:
+#
+#   config                      before s   after s   after/before   device peak GiB
+#   2B f32 sync, T=2048           5.912     5.890       0.996        15.38 -> 15.35
+#   2B f32 async, T=2048          5.169     5.192       1.004        16.54 -> 16.36
+#   2B bf16 sync, T=2048          2.530     2.465       0.974         9.02 ->  9.07
+#   4B r=2 bf16 sync, T=1024      2.823     2.671       0.946        19.02 -> 18.97
+#   4B r=2 bf16 async, T=1024     2.856     2.747       0.962        20.68 -> 20.50
+#
+# No regression above 5% on any row; the r = 2 rows are 4-5% faster, the r = 1
+# rows are within noise (the max column of the raw summary shows the spread,
+# e.g. one slow round in after/2048 bf16). The device peak barely moves
+# (-0.03 to -0.18 GiB, +0.05 on one row): the GDN staging was short-lived
+# per layer and the peak is set elsewhere (the head and the cross-entropy).
+# Gradients are bit-identical (tests, not this file).
+#
+# ---- round 0, config before/2048:-:sync: 2048 --step-only --step=2048 (TESSL_MID_COMMIT=-) ----
+# 23:36:25, load average { 10.80 11.71 16.84 }
+device: Apple M5 Pro
+T = 2048: gate passed (15 ops wrote finite outputs)
+storage: f32; operands: ExactF32
+encode: every dispatch waited; TESSL_MID_COMMIT=unset
+train_step, T = 2048: 5.912 s (346 tokens/s), loss 14.5117
+  device peak over the steps: 15.38 GiB (7.85 GiB above the loaded model)
+  one traced step: 5.707 s, 1557 waits (5.396 s blocked), 1557 commits, 3097 dispatches, 1059 cold allocations, 0 host-zeroed (0.00 GB)
+       38.16 real         5.57 user         3.56 sys
+         10760077312  maximum resident set size
+                   0  average shared memory size
+                   0  average unshared data size
+                   0  average unshared stack size
+              843664  page reclaims
+                   3  page faults
+                   0  swaps
+                   0  block input operations
+                   0  block output operations
+                   0  messages sent
+                   0  messages received
+                   0  signals received
+                  94  voluntary context switches
+               46535  involuntary context switches
+         67233048556  instructions retired
+         37286567804  cycles elapsed
+         19749150976  peak memory footprint
+# ---- round 0, config after/2048:-:sync: 2048 --step-only --step=2048 (TESSL_MID_COMMIT=-) ----
+# 23:37:03, load average { 10.24 11.44 16.50 }
+device: Apple M5 Pro
+T = 2048: gate passed (15 ops wrote finite outputs)
+storage: f32; operands: ExactF32
+encode: every dispatch waited; TESSL_MID_COMMIT=unset
+train_step, T = 2048: 5.890 s (348 tokens/s), loss 14.5117
+  device peak over the steps: 15.35 GiB (7.82 GiB above the loaded model)
+  one traced step: 5.757 s, 1395 waits (5.454 s blocked), 1395 commits, 2935 dispatches, 948 cold allocations, 0 host-zeroed (0.00 GB)
+       37.06 real         5.55 user         2.99 sys
+         10760011776  maximum resident set size
+                   0  average shared memory size
+                   0  average unshared data size
+                   0  average unshared stack size
+              843516  page reclaims
+                   3  page faults
+                   0  swaps
+                   0  block input operations
+                   0  block output operations
+                   0  messages sent
+                   0  messages received
+                   0  signals received
+                  45  voluntary context switches
+               38268  involuntary context switches
+         64403646255  instructions retired
+         35109975725  cycles elapsed
+         19715121432  peak memory footprint
+# ---- round 0, config before/2048:-:async: 2048 --step-only --step=2048 --async (TESSL_MID_COMMIT=-) ----
+# 23:37:40, load average { 9.21 11.07 16.16 }
+device: Apple M5 Pro
+T = 2048: gate passed (15 ops wrote finite outputs)
+storage: f32; operands: ExactF32
+encode: async (--async); TESSL_MID_COMMIT=unset
+train_step, T = 2048: 5.169 s (396 tokens/s), loss 14.5117
+  device peak over the steps: 16.54 GiB (9.02 GiB above the loaded model)
+  one traced step: 5.158 s, 14 waits (4.926 s blocked), 14 commits, 3097 dispatches, 1059 cold allocations, 0 host-zeroed (0.00 GB)
+       33.99 real         5.09 user         2.60 sys
+         10760110080  maximum resident set size
+                   0  average shared memory size
+                   0  average unshared data size
+                   0  average unshared stack size
+              843302  page reclaims
+                 198  page faults
+                   0  swaps
+                   0  block input operations
+                   0  block output operations
+                   0  messages sent
+                   0  messages received
+                   0  signals received
+                  89  voluntary context switches
+               17763  involuntary context switches
+         65718515815  instructions retired
+         31794869878  cycles elapsed
+         20999643368  peak memory footprint
+# ---- round 0, config after/2048:-:async: 2048 --step-only --step=2048 --async (TESSL_MID_COMMIT=-) ----
+# 23:38:14, load average { 5.69 9.98 15.56 }
+device: Apple M5 Pro
+T = 2048: gate passed (15 ops wrote finite outputs)
+storage: f32; operands: ExactF32
+encode: async (--async); TESSL_MID_COMMIT=unset
+train_step, T = 2048: 5.192 s (394 tokens/s), loss 14.5117
+  device peak over the steps: 16.36 GiB (8.83 GiB above the loaded model)
+  one traced step: 5.322 s, 14 waits (5.122 s blocked), 14 commits, 2935 dispatches, 948 cold allocations, 0 host-zeroed (0.00 GB)
+       34.41 real         5.37 user         2.58 sys
+         10761224192  maximum resident set size
+                   0  average shared memory size
+                   0  average unshared data size
+                   0  average unshared stack size
+              843351  page reclaims
+                 198  page faults
+                   0  swaps
+                   0  block input operations
+                   0  block output operations
+                   0  messages sent
+                   0  messages received
+                   0  signals received
+                  42  voluntary context switches
+               11458  involuntary context switches
+         63634736479  instructions retired
+         32266161744  cycles elapsed
+         20799250688  peak memory footprint
+# ---- round 0, config before/2048:-:sync:--storage=bf16: 2048 --step-only --step=2048 --storage=bf16 (TESSL_MID_COMMIT=-) ----
+# 23:38:49, load average { 5.27 9.41 15.13 }
+device: Apple M5 Pro
+T = 2048: gate passed (15 ops wrote finite outputs)
+storage: bf16 (steps into a bf16 bank); operands: Bf16
+encode: every dispatch waited; TESSL_MID_COMMIT=unset
+train_step, T = 2048: 2.530 s (810 tokens/s), loss 14.5115
+  device peak over the steps: 9.02 GiB (0.68 GiB above the loaded model)
+  one traced step: 2.436 s, 2101 waits (2.322 s blocked), 2101 commits, 2101 dispatches, 1290 cold allocations, 0 host-zeroed (0.00 GB)
+       17.76 real         3.95 user         2.15 sys
+         11686068224  maximum resident set size
+                   0  average shared memory size
+                   0  average unshared data size
+                   0  average unshared stack size
+              899799  page reclaims
+                 208  page faults
+                   0  swaps
+                   0  block input operations
+                   0  block output operations
+                   0  messages sent
+                   0  messages received
+                   0  signals received
+                  20  voluntary context switches
+               47701  involuntary context switches
+         40401385219  instructions retired
+         25177456498  cycles elapsed
+         12984198048  peak memory footprint
+# ---- round 0, config after/2048:-:sync:--storage=bf16: 2048 --step-only --step=2048 --storage=bf16 (TESSL_MID_COMMIT=-) ----
+# 23:39:07, load average { 7.12 9.61 15.10 }
+device: Apple M5 Pro
+T = 2048: gate passed (15 ops wrote finite outputs)
+storage: bf16 (steps into a bf16 bank); operands: Bf16
+encode: every dispatch waited; TESSL_MID_COMMIT=unset
+train_step, T = 2048: 2.549 s (803 tokens/s), loss 14.5115
+  device peak over the steps: 9.07 GiB (0.72 GiB above the loaded model)
+  one traced step: 3.305 s, 1939 waits (2.912 s blocked), 1939 commits, 1939 dispatches, 1179 cold allocations, 0 host-zeroed (0.00 GB)
+       20.15 real         4.12 user         2.33 sys
+         11685789696  maximum resident set size
+                   0  average shared memory size
+                   0  average unshared data size
+                   0  average unshared stack size
+              899990  page reclaims
+                   1  page faults
+                   0  swaps
+                   0  block input operations
+                   0  block output operations
+                   0  messages sent
+                   0  messages received
+                   0  signals received
+                   0  voluntary context switches
+               49309  involuntary context switches
+         40066429674  instructions retired
+         25839915368  cycles elapsed
+         13034218376  peak memory footprint
+# ---- round 0, config before/1024:-:sync:--storage=bf16,--random-config=/Users/bharath/.cache/huggingface/hub/models--Qwen--Qwen3.5-4B-Base/snapshots/1001bb4d826a52d1f399e183466143f4da7b741b/config.json: 1024 --step-only --step=1024 --storage=bf16 --random-config=/Users/bharath/.cache/huggingface/hub/models--Qwen--Qwen3.5-4B-Base/snapshots/1001bb4d826a52d1f399e183466143f4da7b741b/config.json (TESSL_MID_COMMIT=-) ----
+# 23:39:27, load average { 11.26 10.27 15.20 }
+device: Apple M5 Pro
+T = 1024: gate passed (15 ops wrote finite outputs)
+storage: bf16 (steps into a bf16 bank); operands: Bf16
+encode: every dispatch waited; TESSL_MID_COMMIT=unset
+train_step, T = 1024: 2.823 s (363 tokens/s), loss 12.9264
+  device peak over the steps: 19.02 GiB (1.73 GiB above the loaded model)
+  one traced step: 2.822 s, 3003 waits (2.704 s blocked), 3003 commits, 3003 dispatches, 1751 cold allocations, 0 host-zeroed (0.00 GB)
+       23.70 real         4.48 user         4.39 sys
+         22150496256  maximum resident set size
+                   0  average shared memory size
+                   0  average unshared data size
+                   0  average unshared stack size
+             1598352  page reclaims
+                   1  page faults
+                   0  swaps
+                   0  block input operations
+                   0  block output operations
+                   0  messages sent
+                   0  messages received
+                   0  signals received
+                   2  voluntary context switches
+              103362  involuntary context switches
+        112192228975  instructions retired
+         35336261925  cycles elapsed
+         24444995152  peak memory footprint
+# ---- round 0, config after/1024:-:sync:--storage=bf16,--random-config=/Users/bharath/.cache/huggingface/hub/models--Qwen--Qwen3.5-4B-Base/snapshots/1001bb4d826a52d1f399e183466143f4da7b741b/config.json: 1024 --step-only --step=1024 --storage=bf16 --random-config=/Users/bharath/.cache/huggingface/hub/models--Qwen--Qwen3.5-4B-Base/snapshots/1001bb4d826a52d1f399e183466143f4da7b741b/config.json (TESSL_MID_COMMIT=-) ----
+# 23:39:50, load average { 9.50 9.98 14.96 }
+device: Apple M5 Pro
+T = 1024: gate passed (15 ops wrote finite outputs)
+storage: bf16 (steps into a bf16 bank); operands: Bf16
+encode: every dispatch waited; TESSL_MID_COMMIT=unset
+train_step, T = 1024: 2.729 s (375 tokens/s), loss 12.9264
+  device peak over the steps: 18.97 GiB (1.68 GiB above the loaded model)
+  one traced step: 2.689 s, 2499 waits (2.594 s blocked), 2499 commits, 2499 dispatches, 1555 cold allocations, 0 host-zeroed (0.00 GB)
+       21.18 real         4.02 user         3.54 sys
+         23298441216  maximum resident set size
+                   0  average shared memory size
+                   0  average unshared data size
+                   0  average unshared stack size
+             1598032  page reclaims
+                 198  page faults
+                   0  swaps
+                   0  block input operations
+                   0  block output operations
+                   0  messages sent
+                   0  messages received
+                   0  signals received
+                   4  voluntary context switches
+               72444  involuntary context switches
+        110736669705  instructions retired
+         31139820901  cycles elapsed
+         24434099768  peak memory footprint
+# ---- round 0, config before/1024:-:async:--storage=bf16,--random-config=/Users/bharath/.cache/huggingface/hub/models--Qwen--Qwen3.5-4B-Base/snapshots/1001bb4d826a52d1f399e183466143f4da7b741b/config.json: 1024 --step-only --step=1024 --async --storage=bf16 --random-config=/Users/bharath/.cache/huggingface/hub/models--Qwen--Qwen3.5-4B-Base/snapshots/1001bb4d826a52d1f399e183466143f4da7b741b/config.json (TESSL_MID_COMMIT=-) ----
+# 23:40:12, load average { 7.84 9.58 14.70 }
+device: Apple M5 Pro
+T = 1024: gate passed (15 ops wrote finite outputs)
+storage: bf16 (steps into a bf16 bank); operands: Bf16
+encode: async (--async); TESSL_MID_COMMIT=unset
+train_step, T = 1024: 2.863 s (358 tokens/s), loss 12.9264
+  device peak over the steps: 20.68 GiB (3.39 GiB above the loaded model)
+  one traced step: 2.875 s, 18 waits (2.344 s blocked), 18 commits, 3003 dispatches, 1751 cold allocations, 0 host-zeroed (0.00 GB)
+       20.99 real         3.60 user         4.40 sys
+         24140300288  maximum resident set size
+                   0  average shared memory size
+                   0  average unshared data size
+                   0  average unshared stack size
+             1598500  page reclaims
+                   3  page faults
+                   0  swaps
+                   0  block input operations
+                   0  block output operations
+                   0  messages sent
+                   0  messages received
+                   0  signals received
+                   0  voluntary context switches
+               22808  involuntary context switches
+        129317655844  instructions retired
+         33749457180  cycles elapsed
+         28168520600  peak memory footprint
+# ---- round 0, config after/1024:-:async:--storage=bf16,--random-config=/Users/bharath/.cache/huggingface/hub/models--Qwen--Qwen3.5-4B-Base/snapshots/1001bb4d826a52d1f399e183466143f4da7b741b/config.json: 1024 --step-only --step=1024 --async --storage=bf16 --random-config=/Users/bharath/.cache/huggingface/hub/models--Qwen--Qwen3.5-4B-Base/snapshots/1001bb4d826a52d1f399e183466143f4da7b741b/config.json (TESSL_MID_COMMIT=-) ----
+# 23:40:33, load average { 7.02 9.27 14.46 }
+device: Apple M5 Pro
+T = 1024: gate passed (15 ops wrote finite outputs)
+storage: bf16 (steps into a bf16 bank); operands: Bf16
+encode: async (--async); TESSL_MID_COMMIT=unset
+train_step, T = 1024: 2.747 s (373 tokens/s), loss 12.9264
+  device peak over the steps: 20.50 GiB (3.20 GiB above the loaded model)
+  one traced step: 2.776 s, 18 waits (2.299 s blocked), 18 commits, 2499 dispatches, 1555 cold allocations, 0 host-zeroed (0.00 GB)
+       20.86 real         3.63 user         4.33 sys
+         24140251136  maximum resident set size
+                   0  average shared memory size
+                   0  average unshared data size
+                   0  average unshared stack size
+             1598109  page reclaims
+                 198  page faults
+                   0  swaps
+                   0  block input operations
+                   0  block output operations
+                   0  messages sent
+                   0  messages received
+                   0  signals received
+                   0  voluntary context switches
+               32273  involuntary context switches
+        127387735520  instructions retired
+         33395901403  cycles elapsed
+         27966997376  peak memory footprint
+# ---- round 1, config after/1024:-:async:--storage=bf16,--random-config=/Users/bharath/.cache/huggingface/hub/models--Qwen--Qwen3.5-4B-Base/snapshots/1001bb4d826a52d1f399e183466143f4da7b741b/config.json: 1024 --step-only --step=1024 --async --storage=bf16 --random-config=/Users/bharath/.cache/huggingface/hub/models--Qwen--Qwen3.5-4B-Base/snapshots/1001bb4d826a52d1f399e183466143f4da7b741b/config.json (TESSL_MID_COMMIT=-) ----
+# 23:40:54, load average { 6.63 9.00 14.22 }
+device: Apple M5 Pro
+T = 1024: gate passed (15 ops wrote finite outputs)
+storage: bf16 (steps into a bf16 bank); operands: Bf16
+encode: async (--async); TESSL_MID_COMMIT=unset
+train_step, T = 1024: 2.895 s (354 tokens/s), loss 12.9264
+  device peak over the steps: 20.50 GiB (3.20 GiB above the loaded model)
+  one traced step: 2.764 s, 18 waits (2.284 s blocked), 18 commits, 2499 dispatches, 1555 cold allocations, 0 host-zeroed (0.00 GB)
+       21.46 real         3.73 user         4.49 sys
+         24142905344  maximum resident set size
+                   0  average shared memory size
+                   0  average unshared data size
+                   0  average unshared stack size
+             1598438  page reclaims
+                   3  page faults
+                   0  swaps
+                   0  block input operations
+                   0  block output operations
+                   0  messages sent
+                   0  messages received
+                   0  signals received
+                   1  voluntary context switches
+               27608  involuntary context switches
+        125994519040  instructions retired
+         34154305704  cycles elapsed
+         27969668016  peak memory footprint
+# ---- round 1, config before/1024:-:async:--storage=bf16,--random-config=/Users/bharath/.cache/huggingface/hub/models--Qwen--Qwen3.5-4B-Base/snapshots/1001bb4d826a52d1f399e183466143f4da7b741b/config.json: 1024 --step-only --step=1024 --async --storage=bf16 --random-config=/Users/bharath/.cache/huggingface/hub/models--Qwen--Qwen3.5-4B-Base/snapshots/1001bb4d826a52d1f399e183466143f4da7b741b/config.json (TESSL_MID_COMMIT=-) ----
+# 23:41:15, load average { 7.46 9.05 14.11 }
+device: Apple M5 Pro
+T = 1024: gate passed (15 ops wrote finite outputs)
+storage: bf16 (steps into a bf16 bank); operands: Bf16
+encode: async (--async); TESSL_MID_COMMIT=unset
+train_step, T = 1024: 2.972 s (345 tokens/s), loss 12.9264
+  device peak over the steps: 20.68 GiB (3.39 GiB above the loaded model)
+  one traced step: 3.213 s, 18 waits (2.483 s blocked), 18 commits, 3003 dispatches, 1751 cold allocations, 0 host-zeroed (0.00 GB)
+       26.32 real         4.73 user         6.15 sys
+         23873339392  maximum resident set size
+                   0  average shared memory size
+                   0  average unshared data size
+                   0  average unshared stack size
+             1598586  page reclaims
+                 199  page faults
+                   0  swaps
+                   0  block input operations
+                   0  block output operations
+                   0  messages sent
+                   0  messages received
+                   0  signals received
+                   5  voluntary context switches
+               25617  involuntary context switches
+        132584830177  instructions retired
+         44410935722  cycles elapsed
+         25779209832  peak memory footprint
+# ---- round 1, config after/1024:-:sync:--storage=bf16,--random-config=/Users/bharath/.cache/huggingface/hub/models--Qwen--Qwen3.5-4B-Base/snapshots/1001bb4d826a52d1f399e183466143f4da7b741b/config.json: 1024 --step-only --step=1024 --storage=bf16 --random-config=/Users/bharath/.cache/huggingface/hub/models--Qwen--Qwen3.5-4B-Base/snapshots/1001bb4d826a52d1f399e183466143f4da7b741b/config.json (TESSL_MID_COMMIT=-) ----
+# 23:41:41, load average { 15.28 10.71 14.56 }
+device: Apple M5 Pro
+T = 1024: gate passed (15 ops wrote finite outputs)
+storage: bf16 (steps into a bf16 bank); operands: Bf16
+encode: every dispatch waited; TESSL_MID_COMMIT=unset
+train_step, T = 1024: 2.889 s (354 tokens/s), loss 12.9264
+  device peak over the steps: 18.97 GiB (1.68 GiB above the loaded model)
+  one traced step: 2.852 s, 2499 waits (2.695 s blocked), 2499 commits, 2499 dispatches, 1555 cold allocations, 0 host-zeroed (0.00 GB)
+       20.51 real         4.30 user         2.93 sys
+         24143872000  maximum resident set size
+                   0  average shared memory size
+                   0  average unshared data size
+                   0  average unshared stack size
+             1598097  page reclaims
+                 200  page faults
+                   0  swaps
+                   0  block input operations
+                   0  block output operations
+                   0  messages sent
+                   0  messages received
+                   0  signals received
+                   6  voluntary context switches
+               74675  involuntary context switches
+        106025231787  instructions retired
+         29134592808  cycles elapsed
+         26336298576  peak memory footprint
+# ---- round 1, config before/1024:-:sync:--storage=bf16,--random-config=/Users/bharath/.cache/huggingface/hub/models--Qwen--Qwen3.5-4B-Base/snapshots/1001bb4d826a52d1f399e183466143f4da7b741b/config.json: 1024 --step-only --step=1024 --storage=bf16 --random-config=/Users/bharath/.cache/huggingface/hub/models--Qwen--Qwen3.5-4B-Base/snapshots/1001bb4d826a52d1f399e183466143f4da7b741b/config.json (TESSL_MID_COMMIT=-) ----
+# 23:42:02, load average { 14.63 10.87 14.53 }
+device: Apple M5 Pro
+T = 1024: gate passed (15 ops wrote finite outputs)
+storage: bf16 (steps into a bf16 bank); operands: Bf16
+encode: every dispatch waited; TESSL_MID_COMMIT=unset
+train_step, T = 1024: 3.223 s (318 tokens/s), loss 12.9264
+  device peak over the steps: 19.02 GiB (1.73 GiB above the loaded model)
+  one traced step: 3.555 s, 3003 waits (3.155 s blocked), 3003 commits, 3003 dispatches, 1751 cold allocations, 0 host-zeroed (0.00 GB)
+       21.94 real         4.38 user         3.07 sys
+         24144642048  maximum resident set size
+                   0  average shared memory size
+                   0  average unshared data size
+                   0  average unshared stack size
+             1598135  page reclaims
+                 199  page faults
+                   0  swaps
+                   0  block input operations
+                   0  block output operations
+                   0  messages sent
+                   0  messages received
+                   0  signals received
+                   4  voluntary context switches
+               75191  involuntary context switches
+        106720459391  instructions retired
+         30134230308  cycles elapsed
+         26387416680  peak memory footprint
+# ---- round 1, config after/2048:-:sync:--storage=bf16: 2048 --step-only --step=2048 --storage=bf16 (TESSL_MID_COMMIT=-) ----
+# 23:42:24, load average { 12.85 10.71 14.36 }
+device: Apple M5 Pro
+T = 2048: gate passed (15 ops wrote finite outputs)
+storage: bf16 (steps into a bf16 bank); operands: Bf16
+encode: every dispatch waited; TESSL_MID_COMMIT=unset
+train_step, T = 2048: 2.465 s (831 tokens/s), loss 14.5115
+  device peak over the steps: 9.07 GiB (0.72 GiB above the loaded model)
+  one traced step: 2.419 s, 1939 waits (2.309 s blocked), 1939 commits, 1939 dispatches, 1179 cold allocations, 0 host-zeroed (0.00 GB)
+       18.40 real         4.25 user         2.20 sys
+         11686281216  maximum resident set size
+                   0  average shared memory size
+                   0  average unshared data size
+                   0  average unshared stack size
+              899819  page reclaims
+                 200  page faults
+                   0  swaps
+                   0  block input operations
+                   0  block output operations
+                   0  messages sent
+                   0  messages received
+                   0  signals received
+                  92  voluntary context switches
+               53448  involuntary context switches
+         40460326506  instructions retired
+         25294242260  cycles elapsed
+         13034677152  peak memory footprint
+# ---- round 1, config before/2048:-:sync:--storage=bf16: 2048 --step-only --step=2048 --storage=bf16 (TESSL_MID_COMMIT=-) ----
+# 23:42:42, load average { 12.79 10.80 14.33 }
+device: Apple M5 Pro
+T = 2048: gate passed (15 ops wrote finite outputs)
+storage: bf16 (steps into a bf16 bank); operands: Bf16
+encode: every dispatch waited; TESSL_MID_COMMIT=unset
+train_step, T = 2048: 2.576 s (795 tokens/s), loss 14.5115
+  device peak over the steps: 9.02 GiB (0.68 GiB above the loaded model)
+  one traced step: 2.753 s, 2101 waits (2.575 s blocked), 2101 commits, 2101 dispatches, 1290 cold allocations, 0 host-zeroed (0.00 GB)
+       18.68 real         4.50 user         2.22 sys
+         11686363136  maximum resident set size
+                   0  average shared memory size
+                   0  average unshared data size
+                   0  average unshared stack size
+              900017  page reclaims
+                   1  page faults
+                   0  swaps
+                   0  block input operations
+                   0  block output operations
+                   0  messages sent
+                   0  messages received
+                   0  signals received
+                   1  voluntary context switches
+               57041  involuntary context switches
+         39188935533  instructions retired
+         25634726299  cycles elapsed
+         12984509368  peak memory footprint
+# ---- round 1, config after/2048:-:async: 2048 --step-only --step=2048 --async (TESSL_MID_COMMIT=-) ----
+# 23:43:01, load average { 12.16 10.78 14.24 }
+device: Apple M5 Pro
+T = 2048: gate passed (15 ops wrote finite outputs)
+storage: f32; operands: ExactF32
+encode: async (--async); TESSL_MID_COMMIT=unset
+train_step, T = 2048: 5.614 s (365 tokens/s), loss 14.5117
+  device peak over the steps: 16.36 GiB (8.83 GiB above the loaded model)
+  one traced step: 5.548 s, 14 waits (5.278 s blocked), 14 commits, 2935 dispatches, 948 cold allocations, 0 host-zeroed (0.00 GB)
+       36.84 real         5.56 user         2.91 sys
+         10760945664  maximum resident set size
+                   0  average shared memory size
+                   0  average unshared data size
+                   0  average unshared stack size
+              843686  page reclaims
+                   1  page faults
+                   0  swaps
+                   0  block input operations
+                   0  block output operations
+                   0  messages sent
+                   0  messages received
+                   0  signals received
+                   0  voluntary context switches
+               33162  involuntary context switches
+         63170764638  instructions retired
+         32617655934  cycles elapsed
+         20799250688  peak memory footprint
+# ---- round 1, config before/2048:-:async: 2048 --step-only --step=2048 --async (TESSL_MID_COMMIT=-) ----
+# 23:43:38, load average { 14.08 11.37 14.31 }
+device: Apple M5 Pro
+T = 2048: gate passed (15 ops wrote finite outputs)
+storage: f32; operands: ExactF32
+encode: async (--async); TESSL_MID_COMMIT=unset
+train_step, T = 2048: 5.538 s (370 tokens/s), loss 14.5117
+  device peak over the steps: 16.54 GiB (9.02 GiB above the loaded model)
+  one traced step: 5.985 s, 14 waits (5.587 s blocked), 14 commits, 3097 dispatches, 1059 cold allocations, 0 host-zeroed (0.00 GB)
+       36.59 real         5.26 user         3.07 sys
+         10760486912  maximum resident set size
+                   0  average shared memory size
+                   0  average unshared data size
+                   0  average unshared stack size
+              843434  page reclaims
+                 199  page faults
+                   0  swaps
+                   0  block input operations
+                   0  block output operations
+                   0  messages sent
+                   0  messages received
+                   0  signals received
+                 102  voluntary context switches
+               32574  involuntary context switches
+         65261327505  instructions retired
+         32532897964  cycles elapsed
+         21000069376  peak memory footprint
+# ---- round 1, config after/2048:-:sync: 2048 --step-only --step=2048 (TESSL_MID_COMMIT=-) ----
+# 23:44:15, load average { 21.49 13.40 14.91 }
+device: Apple M5 Pro
+T = 2048: gate passed (15 ops wrote finite outputs)
+storage: f32; operands: ExactF32
+encode: every dispatch waited; TESSL_MID_COMMIT=unset
+train_step, T = 2048: 6.730 s (304 tokens/s), loss 14.5117
+  device peak over the steps: 15.35 GiB (7.82 GiB above the loaded model)
+  one traced step: 6.477 s, 1395 waits (5.987 s blocked), 1395 commits, 2935 dispatches, 948 cold allocations, 0 host-zeroed (0.00 GB)
+       41.85 real         6.17 user         4.11 sys
+         10759995392  maximum resident set size
+                   0  average shared memory size
+                   0  average unshared data size
+                   0  average unshared stack size
+              843407  page reclaims
+                 200  page faults
+                   0  swaps
+                   0  block input operations
+                   0  block output operations
+                   0  messages sent
+                   0  messages received
+                   0  signals received
+                  91  voluntary context switches
+               58623  involuntary context switches
+         65337420536  instructions retired
+         39910402230  cycles elapsed
+         19715219712  peak memory footprint
+# ---- round 1, config before/2048:-:sync: 2048 --step-only --step=2048 (TESSL_MID_COMMIT=-) ----
+# 23:44:57, load average { 20.93 14.25 15.15 }
+device: Apple M5 Pro
+T = 2048: gate passed (15 ops wrote finite outputs)
+storage: f32; operands: ExactF32
+encode: every dispatch waited; TESSL_MID_COMMIT=unset
+train_step, T = 2048: 6.302 s (325 tokens/s), loss 14.5117
+  device peak over the steps: 15.38 GiB (7.85 GiB above the loaded model)
+  one traced step: 6.207 s, 1557 waits (5.753 s blocked), 1557 commits, 3097 dispatches, 1059 cold allocations, 0 host-zeroed (0.00 GB)
+       40.12 real         6.11 user         3.90 sys
+         10760044544  maximum resident set size
+                   0  average shared memory size
+                   0  average unshared data size
+                   0  average unshared stack size
+              843481  page reclaims
+                 195  page faults
+                   0  swaps
+                   0  block input operations
+                   0  block output operations
+                   0  messages sent
+                   0  messages received
+                   0  signals received
+                  88  voluntary context switches
+               59420  involuntary context switches
+         65384825655  instructions retired
+         39014326878  cycles elapsed
+         19748954392  peak memory footprint
+# ---- round 2, config before/2048:-:sync: 2048 --step-only --step=2048 (TESSL_MID_COMMIT=-) ----
+# 23:45:37, load average { 17.15 14.06 15.03 }
+device: Apple M5 Pro
+T = 2048: gate passed (15 ops wrote finite outputs)
+storage: f32; operands: ExactF32
+encode: every dispatch waited; TESSL_MID_COMMIT=unset
+train_step, T = 2048: 6.318 s (324 tokens/s), loss 14.5117
+  device peak over the steps: 15.38 GiB (7.85 GiB above the loaded model)
+  one traced step: 6.064 s, 1557 waits (5.681 s blocked), 1557 commits, 3097 dispatches, 1059 cold allocations, 0 host-zeroed (0.00 GB)
+       39.31 real         6.11 user         3.73 sys
+         10760912896  maximum resident set size
+                   0  average shared memory size
+                   0  average unshared data size
+                   0  average unshared stack size
+              843519  page reclaims
+                  10  page faults
+                   0  swaps
+                   0  block input operations
+                   0  block output operations
+                   0  messages sent
+                   0  messages received
+                   0  signals received
+                  84  voluntary context switches
+               51489  involuntary context switches
+         65200208174  instructions retired
+         37710789022  cycles elapsed
+         19749413144  peak memory footprint
+# ---- round 2, config after/2048:-:sync: 2048 --step-only --step=2048 (TESSL_MID_COMMIT=-) ----
+# 23:46:16, load average { 14.22 13.68 14.84 }
+device: Apple M5 Pro
+T = 2048: gate passed (15 ops wrote finite outputs)
+storage: f32; operands: ExactF32
+encode: every dispatch waited; TESSL_MID_COMMIT=unset
+train_step, T = 2048: 6.230 s (329 tokens/s), loss 14.5117
+  device peak over the steps: 15.35 GiB (7.82 GiB above the loaded model)
+  one traced step: 6.050 s, 1395 waits (5.714 s blocked), 1395 commits, 2935 dispatches, 948 cold allocations, 0 host-zeroed (0.00 GB)
+       40.17 real         6.04 user         3.55 sys
+         10760257536  maximum resident set size
+                   0  average shared memory size
+                   0  average unshared data size
+                   0  average unshared stack size
+              843396  page reclaims
+                 198  page faults
+                   0  swaps
+                   0  block input operations
+                   0  block output operations
+                   0  messages sent
+                   0  messages received
+                   0  signals received
+                  98  voluntary context switches
+               56074  involuntary context switches
+         65270730154  instructions retired
+         37573533440  cycles elapsed
+         19715481880  peak memory footprint
+# ---- round 2, config before/2048:-:async: 2048 --step-only --step=2048 --async (TESSL_MID_COMMIT=-) ----
+# 23:46:56, load average { 13.16 13.59 14.76 }
+device: Apple M5 Pro
+T = 2048: gate passed (15 ops wrote finite outputs)
+storage: f32; operands: ExactF32
+encode: async (--async); TESSL_MID_COMMIT=unset
+train_step, T = 2048: 5.781 s (354 tokens/s), loss 14.5117
+  device peak over the steps: 16.54 GiB (9.02 GiB above the loaded model)
+  one traced step: 5.886 s, 14 waits (5.615 s blocked), 14 commits, 3097 dispatches, 1059 cold allocations, 0 host-zeroed (0.00 GB)
+       37.26 real         5.49 user         2.81 sys
+         10760781824  maximum resident set size
+                   0  average shared memory size
+                   0  average unshared data size
+                   0  average unshared stack size
+              843532  page reclaims
+                 195  page faults
+                   0  swaps
+                   0  block input operations
+                   0  block output operations
+                   0  messages sent
+                   0  messages received
+                   0  signals received
+                  99  voluntary context switches
+               27377  involuntary context switches
+         65261468919  instructions retired
+         33074549389  cycles elapsed
+         21000429824  peak memory footprint
+# ---- round 2, config after/2048:-:async: 2048 --step-only --step=2048 --async (TESSL_MID_COMMIT=-) ----
+# 23:47:34, load average { 13.26 13.43 14.64 }
+device: Apple M5 Pro
+T = 2048: gate passed (15 ops wrote finite outputs)
+storage: f32; operands: ExactF32
+encode: async (--async); TESSL_MID_COMMIT=unset
+train_step, T = 2048: 5.738 s (357 tokens/s), loss 14.5117
+  device peak over the steps: 16.36 GiB (8.83 GiB above the loaded model)
+  one traced step: 5.809 s, 14 waits (5.577 s blocked), 14 commits, 2935 dispatches, 948 cold allocations, 0 host-zeroed (0.00 GB)
+       36.02 real         5.25 user         2.59 sys
+         10760585216  maximum resident set size
+                   0  average shared memory size
+                   0  average unshared data size
+                   0  average unshared stack size
+              843305  page reclaims
+                 196  page faults
+                   0  swaps
+                   0  block input operations
+                   0  block output operations
+                   0  messages sent
+                   0  messages received
+                   0  signals received
+                  40  voluntary context switches
+               21916  involuntary context switches
+         63447444519  instructions retired
+         31765576453  cycles elapsed
+         20798628096  peak memory footprint
+# ---- round 2, config before/2048:-:sync:--storage=bf16: 2048 --step-only --step=2048 --storage=bf16 (TESSL_MID_COMMIT=-) ----
+# 23:48:10, load average { 11.08 12.84 14.38 }
+device: Apple M5 Pro
+T = 2048: gate passed (15 ops wrote finite outputs)
+storage: bf16 (steps into a bf16 bank); operands: Bf16
+encode: every dispatch waited; TESSL_MID_COMMIT=unset
+train_step, T = 2048: 2.647 s (774 tokens/s), loss 14.5115
+  device peak over the steps: 9.02 GiB (0.68 GiB above the loaded model)
+  one traced step: 2.764 s, 2101 waits (2.625 s blocked), 2101 commits, 2101 dispatches, 1290 cold allocations, 0 host-zeroed (0.00 GB)
+       18.76 real         4.27 user         2.36 sys
+         11686690816  maximum resident set size
+                   0  average shared memory size
+                   0  average unshared data size
+                   0  average unshared stack size
+              899832  page reclaims
+                 207  page faults
+                   0  swaps
+                   0  block input operations
+                   0  block output operations
+                   0  messages sent
+                   0  messages received
+                   0  signals received
+                  95  voluntary context switches
+               61210  involuntary context switches
+         40839034280  instructions retired
+         26777273319  cycles elapsed
+         12984820640  peak memory footprint
+# ---- round 2, config after/2048:-:sync:--storage=bf16: 2048 --step-only --step=2048 --storage=bf16 (TESSL_MID_COMMIT=-) ----
+# 23:48:28, load average { 11.02 12.70 14.29 }
+device: Apple M5 Pro
+T = 2048: gate passed (15 ops wrote finite outputs)
+storage: bf16 (steps into a bf16 bank); operands: Bf16
+encode: every dispatch waited; TESSL_MID_COMMIT=unset
+train_step, T = 2048: 2.777 s (738 tokens/s), loss 14.5115
+  device peak over the steps: 9.07 GiB (0.72 GiB above the loaded model)
+  one traced step: 2.698 s, 1939 waits (2.563 s blocked), 1939 commits, 1939 dispatches, 1179 cold allocations, 0 host-zeroed (0.00 GB)
+       19.77 real         4.50 user         2.37 sys
+         11686559744  maximum resident set size
+                   0  average shared memory size
+                   0  average unshared data size
+                   0  average unshared stack size
+              900034  page reclaims
+                   1  page faults
+                   0  swaps
+                   0  block input operations
+                   0  block output operations
+                   0  messages sent
+                   0  messages received
+                   0  signals received
+                   1  voluntary context switches
+               53197  involuntary context switches
+         39363349202  instructions retired
+         27500591430  cycles elapsed
+         13034972088  peak memory footprint
+# ---- round 2, config before/1024:-:sync:--storage=bf16,--random-config=/Users/bharath/.cache/huggingface/hub/models--Qwen--Qwen3.5-4B-Base/snapshots/1001bb4d826a52d1f399e183466143f4da7b741b/config.json: 1024 --step-only --step=1024 --storage=bf16 --random-config=/Users/bharath/.cache/huggingface/hub/models--Qwen--Qwen3.5-4B-Base/snapshots/1001bb4d826a52d1f399e183466143f4da7b741b/config.json (TESSL_MID_COMMIT=-) ----
+# 23:48:48, load average { 11.41 12.70 14.25 }
+device: Apple M5 Pro
+T = 1024: gate passed (15 ops wrote finite outputs)
+storage: bf16 (steps into a bf16 bank); operands: Bf16
+encode: every dispatch waited; TESSL_MID_COMMIT=unset
+train_step, T = 1024: 3.337 s (307 tokens/s), loss 12.9264
+  device peak over the steps: 19.02 GiB (1.73 GiB above the loaded model)
+  one traced step: 3.295 s, 3003 waits (3.043 s blocked), 3003 commits, 3003 dispatches, 1751 cold allocations, 0 host-zeroed (0.00 GB)
+       26.28 real         5.31 user         4.87 sys
+         23851630592  maximum resident set size
+                   0  average shared memory size
+                   0  average unshared data size
+                   0  average unshared stack size
+             1598979  page reclaims
+                   1  page faults
+                   0  swaps
+                   0  block input operations
+                   0  block output operations
+                   0  messages sent
+                   0  messages received
+                   0  signals received
+                   2  voluntary context switches
+               99518  involuntary context switches
+        111674035643  instructions retired
+         40619177518  cycles elapsed
+         25002198632  peak memory footprint
+# ---- round 2, config after/1024:-:sync:--storage=bf16,--random-config=/Users/bharath/.cache/huggingface/hub/models--Qwen--Qwen3.5-4B-Base/snapshots/1001bb4d826a52d1f399e183466143f4da7b741b/config.json: 1024 --step-only --step=1024 --storage=bf16 --random-config=/Users/bharath/.cache/huggingface/hub/models--Qwen--Qwen3.5-4B-Base/snapshots/1001bb4d826a52d1f399e183466143f4da7b741b/config.json (TESSL_MID_COMMIT=-) ----
+# 23:49:15, load average { 14.12 13.19 14.38 }
+device: Apple M5 Pro
+T = 1024: gate passed (15 ops wrote finite outputs)
+storage: bf16 (steps into a bf16 bank); operands: Bf16
+encode: every dispatch waited; TESSL_MID_COMMIT=unset
+train_step, T = 1024: 3.260 s (314 tokens/s), loss 12.9264
+  device peak over the steps: 18.97 GiB (1.68 GiB above the loaded model)
+  one traced step: 5.039 s, 2499 waits (4.174 s blocked), 2499 commits, 2499 dispatches, 1555 cold allocations, 0 host-zeroed (0.00 GB)
+       25.14 real         5.12 user         3.71 sys
+         24144445440  maximum resident set size
+                   0  average shared memory size
+                   0  average unshared data size
+                   0  average unshared stack size
+             1598276  page reclaims
+                 198  page faults
+                   0  swaps
+                   0  block input operations
+                   0  block output operations
+                   0  messages sent
+                   0  messages received
+                   0  signals received
+                   1  voluntary context switches
+               74992  involuntary context switches
+        107406038249  instructions retired
+         34101846329  cycles elapsed
+         26336822888  peak memory footprint
+# ---- round 2, config before/1024:-:async:--storage=bf16,--random-config=/Users/bharath/.cache/huggingface/hub/models--Qwen--Qwen3.5-4B-Base/snapshots/1001bb4d826a52d1f399e183466143f4da7b741b/config.json: 1024 --step-only --step=1024 --async --storage=bf16 --random-config=/Users/bharath/.cache/huggingface/hub/models--Qwen--Qwen3.5-4B-Base/snapshots/1001bb4d826a52d1f399e183466143f4da7b741b/config.json (TESSL_MID_COMMIT=-) ----
+# 23:49:40, load average { 20.83 14.68 14.88 }
+device: Apple M5 Pro
+T = 1024: gate passed (15 ops wrote finite outputs)
+storage: bf16 (steps into a bf16 bank); operands: Bf16
+encode: async (--async); TESSL_MID_COMMIT=unset
+train_step, T = 1024: 3.102 s (330 tokens/s), loss 12.9264
+  device peak over the steps: 20.68 GiB (3.39 GiB above the loaded model)
+  one traced step: 3.184 s, 18 waits (2.522 s blocked), 18 commits, 3003 dispatches, 1751 cold allocations, 0 host-zeroed (0.00 GB)
+       26.73 real         4.72 user         6.58 sys
+         23190568960  maximum resident set size
+                   0  average shared memory size
+                   0  average unshared data size
+                   0  average unshared stack size
+             1598751  page reclaims
+                 197  page faults
+                   0  swaps
+                   0  block input operations
+                   0  block output operations
+                   0  messages sent
+                   0  messages received
+                   0  signals received
+                   4  voluntary context switches
+               38344  involuntary context switches
+        133476681654  instructions retired
+         43120012457  cycles elapsed
+         25575376488  peak memory footprint
+# ---- round 2, config after/1024:-:async:--storage=bf16,--random-config=/Users/bharath/.cache/huggingface/hub/models--Qwen--Qwen3.5-4B-Base/snapshots/1001bb4d826a52d1f399e183466143f4da7b741b/config.json: 1024 --step-only --step=1024 --async --storage=bf16 --random-config=/Users/bharath/.cache/huggingface/hub/models--Qwen--Qwen3.5-4B-Base/snapshots/1001bb4d826a52d1f399e183466143f4da7b741b/config.json (TESSL_MID_COMMIT=-) ----
+# 23:50:07, load average { 18.19 14.56 14.83 }
+device: Apple M5 Pro
+T = 1024: gate passed (15 ops wrote finite outputs)
+storage: bf16 (steps into a bf16 bank); operands: Bf16
+encode: async (--async); TESSL_MID_COMMIT=unset
+train_step, T = 1024: 2.847 s (360 tokens/s), loss 12.9264
+  device peak over the steps: 20.50 GiB (3.20 GiB above the loaded model)
+  one traced step: 3.112 s, 18 waits (2.584 s blocked), 18 commits, 2499 dispatches, 1555 cold allocations, 0 host-zeroed (0.00 GB)
+       22.38 real         4.26 user         4.76 sys
+         24142446592  maximum resident set size
+                   0  average shared memory size
+                   0  average unshared data size
+                   0  average unshared stack size
+             1598400  page reclaims
+                 198  page faults
+                   0  swaps
+                   0  block input operations
+                   0  block output operations
+                   0  messages sent
+                   0  messages received
+                   0  signals received
+                   1  voluntary context switches
+               37793  involuntary context switches
+        126248369464  instructions retired
+         35375322282  cycles elapsed
+         27969274848  peak memory footprint
+# ---- round 3, config after/1024:-:async:--storage=bf16,--random-config=/Users/bharath/.cache/huggingface/hub/models--Qwen--Qwen3.5-4B-Base/snapshots/1001bb4d826a52d1f399e183466143f4da7b741b/config.json: 1024 --step-only --step=1024 --async --storage=bf16 --random-config=/Users/bharath/.cache/huggingface/hub/models--Qwen--Qwen3.5-4B-Base/snapshots/1001bb4d826a52d1f399e183466143f4da7b741b/config.json (TESSL_MID_COMMIT=-) ----
+# 23:50:29, load average { 15.81 14.29 14.72 }
+device: Apple M5 Pro
+T = 1024: gate passed (15 ops wrote finite outputs)
+storage: bf16 (steps into a bf16 bank); operands: Bf16
+encode: async (--async); TESSL_MID_COMMIT=unset
+train_step, T = 1024: 2.782 s (368 tokens/s), loss 12.9264
+  device peak over the steps: 20.50 GiB (3.20 GiB above the loaded model)
+  one traced step: 3.116 s, 18 waits (2.620 s blocked), 18 commits, 2499 dispatches, 1555 cold allocations, 0 host-zeroed (0.00 GB)
+       21.03 real         3.91 user         4.19 sys
+         24142430208  maximum resident set size
+                   0  average shared memory size
+                   0  average unshared data size
+                   0  average unshared stack size
+             1598662  page reclaims
+                   3  page faults
+                   0  swaps
+                   0  block input operations
+                   0  block output operations
+                   0  messages sent
+                   0  messages received
+                   0  signals received
+                   0  voluntary context switches
+               23536  involuntary context switches
+        126016171442  instructions retired
+         32632972304  cycles elapsed
+         27969176448  peak memory footprint
+# ---- round 3, config before/1024:-:async:--storage=bf16,--random-config=/Users/bharath/.cache/huggingface/hub/models--Qwen--Qwen3.5-4B-Base/snapshots/1001bb4d826a52d1f399e183466143f4da7b741b/config.json: 1024 --step-only --step=1024 --async --storage=bf16 --random-config=/Users/bharath/.cache/huggingface/hub/models--Qwen--Qwen3.5-4B-Base/snapshots/1001bb4d826a52d1f399e183466143f4da7b741b/config.json (TESSL_MID_COMMIT=-) ----
+# 23:50:50, load average { 14.44 14.08 14.63 }
+device: Apple M5 Pro
+T = 1024: gate passed (15 ops wrote finite outputs)
+storage: bf16 (steps into a bf16 bank); operands: Bf16
+encode: async (--async); TESSL_MID_COMMIT=unset
+train_step, T = 1024: 2.856 s (359 tokens/s), loss 12.9264
+  device peak over the steps: 20.68 GiB (3.39 GiB above the loaded model)
+  one traced step: 2.849 s, 18 waits (2.307 s blocked), 18 commits, 3003 dispatches, 1751 cold allocations, 0 host-zeroed (0.00 GB)
+       22.16 real         4.02 user         4.80 sys
+         24144560128  maximum resident set size
+                   0  average shared memory size
+                   0  average unshared data size
+                   0  average unshared stack size
+             1598495  page reclaims
+                 197  page faults
+                   0  swaps
+                   0  block input operations
+                   0  block output operations
+                   0  messages sent
+                   0  messages received
+                   0  signals received
+                   5  voluntary context switches
+               47358  involuntary context switches
+        129879677816  instructions retired
+         36090338004  cycles elapsed
+         28172764008  peak memory footprint
+# ---- round 3, config after/1024:-:sync:--storage=bf16,--random-config=/Users/bharath/.cache/huggingface/hub/models--Qwen--Qwen3.5-4B-Base/snapshots/1001bb4d826a52d1f399e183466143f4da7b741b/config.json: 1024 --step-only --step=1024 --storage=bf16 --random-config=/Users/bharath/.cache/huggingface/hub/models--Qwen--Qwen3.5-4B-Base/snapshots/1001bb4d826a52d1f399e183466143f4da7b741b/config.json (TESSL_MID_COMMIT=-) ----
+# 23:51:12, load average { 13.29 13.84 14.54 }
+device: Apple M5 Pro
+T = 1024: gate passed (15 ops wrote finite outputs)
+storage: bf16 (steps into a bf16 bank); operands: Bf16
+encode: every dispatch waited; TESSL_MID_COMMIT=unset
+train_step, T = 1024: 2.671 s (383 tokens/s), loss 12.9264
+  device peak over the steps: 18.97 GiB (1.68 GiB above the loaded model)
+  one traced step: 2.713 s, 2499 waits (2.616 s blocked), 2499 commits, 2499 dispatches, 1555 cold allocations, 0 host-zeroed (0.00 GB)
+       19.98 real         4.25 user         2.79 sys
+         24142905344  maximum resident set size
+                   0  average shared memory size
+                   0  average unshared data size
+                   0  average unshared stack size
+             1598046  page reclaims
+                 198  page faults
+                   0  swaps
+                   0  block input operations
+                   0  block output operations
+                   0  messages sent
+                   0  messages received
+                   0  signals received
+                   1  voluntary context switches
+               74753  involuntary context switches
+        105954735392  instructions retired
+         28272848770  cycles elapsed
+         26335282792  peak memory footprint
+# ---- round 3, config before/1024:-:sync:--storage=bf16,--random-config=/Users/bharath/.cache/huggingface/hub/models--Qwen--Qwen3.5-4B-Base/snapshots/1001bb4d826a52d1f399e183466143f4da7b741b/config.json: 1024 --step-only --step=1024 --storage=bf16 --random-config=/Users/bharath/.cache/huggingface/hub/models--Qwen--Qwen3.5-4B-Base/snapshots/1001bb4d826a52d1f399e183466143f4da7b741b/config.json (TESSL_MID_COMMIT=-) ----
+# 23:51:32, load average { 11.87 13.49 14.39 }
+device: Apple M5 Pro
+T = 1024: gate passed (15 ops wrote finite outputs)
+storage: bf16 (steps into a bf16 bank); operands: Bf16
+encode: every dispatch waited; TESSL_MID_COMMIT=unset
+train_step, T = 1024: 3.952 s (259 tokens/s), loss 12.9264
+  device peak over the steps: 19.02 GiB (1.73 GiB above the loaded model)
+  one traced step: 3.766 s, 3003 waits (3.156 s blocked), 3003 commits, 3003 dispatches, 1751 cold allocations, 0 host-zeroed (0.00 GB)
+       26.39 real         4.84 user         3.76 sys
+         24140890112  maximum resident set size
+                   0  average shared memory size
+                   0  average unshared data size
+                   0  average unshared stack size
+             1597980  page reclaims
+                 197  page faults
+                   0  swaps
+                   0  block input operations
+                   0  block output operations
+                   0  messages sent
+                   0  messages received
+                   0  signals received
+                   6  voluntary context switches
+              125699  involuntary context switches
+        108069714937  instructions retired
+         35124075019  cycles elapsed
+         26383763024  peak memory footprint
+# ---- round 3, config after/2048:-:sync:--storage=bf16: 2048 --step-only --step=2048 --storage=bf16 (TESSL_MID_COMMIT=-) ----
+# 23:51:59, load average { 13.77 13.78 14.47 }
+device: Apple M5 Pro
+T = 2048: gate passed (15 ops wrote finite outputs)
+storage: bf16 (steps into a bf16 bank); operands: Bf16
+encode: every dispatch waited; TESSL_MID_COMMIT=unset
+train_step, T = 2048: 4.124 s (497 tokens/s), loss 14.5115
+  device peak over the steps: 9.07 GiB (0.72 GiB above the loaded model)
+  one traced step: 3.597 s, 1939 waits (3.102 s blocked), 1939 commits, 1939 dispatches, 1179 cold allocations, 0 host-zeroed (0.00 GB)
+       29.49 real         4.47 user         3.38 sys
+         11686264832  maximum resident set size
+                   0  average shared memory size
+                   0  average unshared data size
+                   0  average unshared stack size
+              899823  page reclaims
+                 198  page faults
+                   0  swaps
+                   0  block input operations
+                   0  block output operations
+                   0  messages sent
+                   0  messages received
+                   0  signals received
+                 120  voluntary context switches
+              139222  involuntary context switches
+         42256547353  instructions retired
+         33142494342  cycles elapsed
+         13034677176  peak memory footprint
+# ---- round 3, config before/2048:-:sync:--storage=bf16: 2048 --step-only --step=2048 --storage=bf16 (TESSL_MID_COMMIT=-) ----
+# 23:52:28, load average { 24.97 16.21 15.31 }
+device: Apple M5 Pro
+T = 2048: gate passed (15 ops wrote finite outputs)
+storage: bf16 (steps into a bf16 bank); operands: Bf16
+encode: every dispatch waited; TESSL_MID_COMMIT=unset
+train_step, T = 2048: 2.785 s (735 tokens/s), loss 14.5115
+  device peak over the steps: 9.02 GiB (0.68 GiB above the loaded model)
+  one traced step: 2.730 s, 2101 waits (2.595 s blocked), 2101 commits, 2101 dispatches, 1290 cold allocations, 0 host-zeroed (0.00 GB)
+       20.08 real         4.38 user         2.57 sys
+         11686166528  maximum resident set size
+                   0  average shared memory size
+                   0  average unshared data size
+                   0  average unshared stack size
+              899817  page reclaims
+                 195  page faults
+                   0  swaps
+                   0  block input operations
+                   0  block output operations
+                   0  messages sent
+                   0  messages received
+                   0  signals received
+                 146  voluntary context switches
+               69614  involuntary context switches
+         40708656767  instructions retired
+         27236364725  cycles elapsed
+         12984312760  peak memory footprint
+# ---- round 3, config after/2048:-:async: 2048 --step-only --step=2048 --async (TESSL_MID_COMMIT=-) ----
+# 23:52:49, load average { 22.48 16.22 15.33 }
+device: Apple M5 Pro
+T = 2048: gate passed (15 ops wrote finite outputs)
+storage: f32; operands: ExactF32
+encode: async (--async); TESSL_MID_COMMIT=unset
+train_step, T = 2048: 5.992 s (342 tokens/s), loss 14.5117
+  device peak over the steps: 16.36 GiB (8.83 GiB above the loaded model)
+  one traced step: 6.129 s, 14 waits (5.843 s blocked), 14 commits, 2935 dispatches, 948 cold allocations, 0 host-zeroed (0.00 GB)
+       38.31 real         5.35 user         2.78 sys
+         10760798208  maximum resident set size
+                   0  average shared memory size
+                   0  average unshared data size
+                   0  average unshared stack size
+              843627  page reclaims
+                  10  page faults
+                   0  swaps
+                   0  block input operations
+                   0  block output operations
+                   0  messages sent
+                   0  messages received
+                   0  signals received
+                   2  voluntary context switches
+               43773  involuntary context switches
+         62835969276  instructions retired
+         31893885003  cycles elapsed
+         20799054056  peak memory footprint
+# ---- round 3, config before/2048:-:async: 2048 --step-only --step=2048 --async (TESSL_MID_COMMIT=-) ----
+# 23:53:27, load average { 16.32 15.36 15.05 }
+device: Apple M5 Pro
+T = 2048: gate passed (15 ops wrote finite outputs)
+storage: f32; operands: ExactF32
+encode: async (--async); TESSL_MID_COMMIT=unset
+train_step, T = 2048: 6.095 s (336 tokens/s), loss 14.5117
+  device peak over the steps: 16.54 GiB (9.02 GiB above the loaded model)
+  one traced step: 6.038 s, 14 waits (5.711 s blocked), 14 commits, 3097 dispatches, 1059 cold allocations, 0 host-zeroed (0.00 GB)
+       38.99 real         5.70 user         3.26 sys
+         10760716288  maximum resident set size
+                   0  average shared memory size
+                   0  average unshared data size
+                   0  average unshared stack size
+              843309  page reclaims
+                 197  page faults
+                   0  swaps
+                   0  block input operations
+                   0  block output operations
+                   0  messages sent
+                   0  messages received
+                   0  signals received
+                  78  voluntary context switches
+               27984  involuntary context switches
+         64976850364  instructions retired
+         32666436441  cycles elapsed
+         21000118528  peak memory footprint
+# ---- round 3, config after/2048:-:sync: 2048 --step-only --step=2048 (TESSL_MID_COMMIT=-) ----
+# 23:54:06, load average { 15.69 15.28 15.03 }
+device: Apple M5 Pro
+T = 2048: gate passed (15 ops wrote finite outputs)
+storage: f32; operands: ExactF32
+encode: every dispatch waited; TESSL_MID_COMMIT=unset
+train_step, T = 2048: 6.274 s (326 tokens/s), loss 14.5117
+  device peak over the steps: 15.35 GiB (7.82 GiB above the loaded model)
+  one traced step: 6.229 s, 1395 waits (5.845 s blocked), 1395 commits, 2935 dispatches, 948 cold allocations, 0 host-zeroed (0.00 GB)
+       41.16 real         6.25 user         3.76 sys
+         10760585216  maximum resident set size
+                   0  average shared memory size
+                   0  average unshared data size
+                   0  average unshared stack size
+              843415  page reclaims
+                 198  page faults
+                   0  swaps
+                   0  block input operations
+                   0  block output operations
+                   0  messages sent
+                   0  messages received
+                   0  signals received
+                  40  voluntary context switches
+               58529  involuntary context switches
+         64305023467  instructions retired
+         37587754168  cycles elapsed
+         19715776768  peak memory footprint
+# ---- round 3, config before/2048:-:sync: 2048 --step-only --step=2048 (TESSL_MID_COMMIT=-) ----
+# 23:54:47, load average { 15.25 15.24 15.03 }
+device: Apple M5 Pro
+T = 2048: gate passed (15 ops wrote finite outputs)
+storage: f32; operands: ExactF32
+encode: every dispatch waited; TESSL_MID_COMMIT=unset
+train_step, T = 2048: 6.052 s (338 tokens/s), loss 14.5117
+  device peak over the steps: 15.38 GiB (7.85 GiB above the loaded model)
+  one traced step: 5.968 s, 1557 waits (5.597 s blocked), 1557 commits, 3097 dispatches, 1059 cold allocations, 0 host-zeroed (0.00 GB)
+       39.34 real         6.19 user         3.71 sys
+         10760585216  maximum resident set size
+                   0  average shared memory size
+                   0  average unshared data size
+                   0  average unshared stack size
+              843344  page reclaims
+                 197  page faults
+                   0  swaps
+                   0  block input operations
+                   0  block output operations
+                   0  messages sent
+                   0  messages received
+                   0  signals received
+                  58  voluntary context switches
+               61315  involuntary context switches
+         64550185034  instructions retired
+         37674059371  cycles elapsed
+         19749396760  peak memory footprint
+# ---- round 4, config before/2048:-:sync: 2048 --step-only --step=2048 (TESSL_MID_COMMIT=-) ----
+# 23:55:27, load average { 13.06 14.70 14.84 }
+device: Apple M5 Pro
+T = 2048: gate passed (15 ops wrote finite outputs)
+storage: f32; operands: ExactF32
+encode: every dispatch waited; TESSL_MID_COMMIT=unset
+train_step, T = 2048: 6.088 s (336 tokens/s), loss 14.5117
+  device peak over the steps: 15.38 GiB (7.85 GiB above the loaded model)
+  one traced step: 6.210 s, 1557 waits (5.766 s blocked), 1557 commits, 3097 dispatches, 1059 cold allocations, 0 host-zeroed (0.00 GB)
+       38.77 real         5.93 user         3.30 sys
+         10760044544  maximum resident set size
+                   0  average shared memory size
+                   0  average unshared data size
+                   0  average unshared stack size
+              843472  page reclaims
+                   3  page faults
+                   0  swaps
+                   0  block input operations
+                   0  block output operations
+                   0  messages sent
+                   0  messages received
+                   0  signals received
+                  18  voluntary context switches
+               60978  involuntary context switches
+         63870946003  instructions retired
+         36140300418  cycles elapsed
+         19748544720  peak memory footprint
+# ---- round 4, config after/2048:-:sync: 2048 --step-only --step=2048 (TESSL_MID_COMMIT=-) ----
+# 23:56:05, load average { 11.23 14.05 14.60 }
+device: Apple M5 Pro
+T = 2048: gate passed (15 ops wrote finite outputs)
+storage: f32; operands: ExactF32
+encode: every dispatch waited; TESSL_MID_COMMIT=unset
+train_step, T = 2048: 6.232 s (329 tokens/s), loss 14.5117
+  device peak over the steps: 15.35 GiB (7.82 GiB above the loaded model)
+  one traced step: 6.037 s, 1395 waits (5.674 s blocked), 1395 commits, 2935 dispatches, 948 cold allocations, 0 host-zeroed (0.00 GB)
+       38.39 real         5.80 user         3.19 sys
+         10760093696  maximum resident set size
+                   0  average shared memory size
+                   0  average unshared data size
+                   0  average unshared stack size
+              843277  page reclaims
+                 198  page faults
+                   0  swaps
+                   0  block input operations
+                   0  block output operations
+                   0  messages sent
+                   0  messages received
+                   0  signals received
+                  50  voluntary context switches
+               46472  involuntary context switches
+         63705934504  instructions retired
+         35409017571  cycles elapsed
+         19714973928  peak memory footprint
+# ---- round 4, config before/2048:-:async: 2048 --step-only --step=2048 --async (TESSL_MID_COMMIT=-) ----
+# 23:56:44, load average { 9.70 13.29 14.29 }
+device: Apple M5 Pro
+T = 2048: gate passed (15 ops wrote finite outputs)
+storage: f32; operands: ExactF32
+encode: async (--async); TESSL_MID_COMMIT=unset
+train_step, T = 2048: 5.833 s (351 tokens/s), loss 14.5117
+  device peak over the steps: 16.54 GiB (9.02 GiB above the loaded model)
+  one traced step: 5.753 s, 14 waits (5.498 s blocked), 14 commits, 3097 dispatches, 1059 cold allocations, 0 host-zeroed (0.00 GB)
+       36.80 real         5.35 user         2.68 sys
+         10760503296  maximum resident set size
+                   0  average shared memory size
+                   0  average unshared data size
+                   0  average unshared stack size
+              843299  page reclaims
+                 197  page faults
+                   0  swaps
+                   0  block input operations
+                   0  block output operations
+                   0  messages sent
+                   0  messages received
+                   0  signals received
+                  40  voluntary context switches
+               21855  involuntary context switches
+         64651427889  instructions retired
+         32303916082  cycles elapsed
+         20999921944  peak memory footprint
+# ---- round 4, config after/2048:-:async: 2048 --step-only --step=2048 --async (TESSL_MID_COMMIT=-) ----
+# 23:57:21, load average { 8.02 12.50 13.96 }
+device: Apple M5 Pro
+T = 2048: gate passed (15 ops wrote finite outputs)
+storage: f32; operands: ExactF32
+encode: async (--async); TESSL_MID_COMMIT=unset
+train_step, T = 2048: 5.941 s (345 tokens/s), loss 14.5117
+  device peak over the steps: 16.36 GiB (8.83 GiB above the loaded model)
+  one traced step: 5.877 s, 14 waits (5.657 s blocked), 14 commits, 2935 dispatches, 948 cold allocations, 0 host-zeroed (0.00 GB)
+       37.00 real         5.14 user         2.50 sys
+         10760421376  maximum resident set size
+                   0  average shared memory size
+                   0  average unshared data size
+                   0  average unshared stack size
+              843287  page reclaims
+                 198  page faults
+                   0  swaps
+                   0  block input operations
+                   0  block output operations
+                   0  messages sent
+                   0  messages received
+                   0  signals received
+                  23  voluntary context switches
+               16583  involuntary context switches
+         62933770026  instructions retired
+         30954879393  cycles elapsed
+         20798480664  peak memory footprint
+# ---- round 4, config before/2048:-:sync:--storage=bf16: 2048 --step-only --step=2048 --storage=bf16 (TESSL_MID_COMMIT=-) ----
+# 23:57:58, load average { 8.60 12.15 13.78 }
+device: Apple M5 Pro
+T = 2048: gate passed (15 ops wrote finite outputs)
+storage: bf16 (steps into a bf16 bank); operands: Bf16
+encode: every dispatch waited; TESSL_MID_COMMIT=unset
+train_step, T = 2048: 2.837 s (722 tokens/s), loss 14.5115
+  device peak over the steps: 9.02 GiB (0.68 GiB above the loaded model)
+  one traced step: 2.805 s, 2101 waits (2.655 s blocked), 2101 commits, 2101 dispatches, 1290 cold allocations, 0 host-zeroed (0.00 GB)
+       20.07 real         4.40 user         2.50 sys
+         11686641664  maximum resident set size
+                   0  average shared memory size
+                   0  average unshared data size
+                   0  average unshared stack size
+              899840  page reclaims
+                 197  page faults
+                   0  swaps
+                   0  block input operations
+                   0  block output operations
+                   0  messages sent
+                   0  messages received
+                   0  signals received
+                 137  voluntary context switches
+               74006  involuntary context switches
+         40967968435  instructions retired
+         27412352883  cycles elapsed
+         12984771488  peak memory footprint
+# ---- round 4, config after/2048:-:sync:--storage=bf16: 2048 --step-only --step=2048 --storage=bf16 (TESSL_MID_COMMIT=-) ----
+# 23:58:18, load average { 8.78 11.96 13.67 }
+device: Apple M5 Pro
+T = 2048: gate passed (15 ops wrote finite outputs)
+storage: bf16 (steps into a bf16 bank); operands: Bf16
+encode: every dispatch waited; TESSL_MID_COMMIT=unset
+train_step, T = 2048: 2.642 s (775 tokens/s), loss 14.5115
+  device peak over the steps: 9.07 GiB (0.72 GiB above the loaded model)
+  one traced step: 2.680 s, 1939 waits (2.596 s blocked), 1939 commits, 1939 dispatches, 1179 cold allocations, 0 host-zeroed (0.00 GB)
+       18.30 real         3.91 user         2.06 sys
+         11686019072  maximum resident set size
+                   0  average shared memory size
+                   0  average unshared data size
+                   0  average unshared stack size
+              899994  page reclaims
+                   1  page faults
+                   0  swaps
+                   0  block input operations
+                   0  block output operations
+                   0  messages sent
+                   0  messages received
+                   0  signals received
+                   1  voluntary context switches
+               54189  involuntary context switches
+         39643793548  instructions retired
+         24404425419  cycles elapsed
+         13034431416  peak memory footprint
+# ---- round 4, config before/1024:-:sync:--storage=bf16,--random-config=/Users/bharath/.cache/huggingface/hub/models--Qwen--Qwen3.5-4B-Base/snapshots/1001bb4d826a52d1f399e183466143f4da7b741b/config.json: 1024 --step-only --step=1024 --storage=bf16 --random-config=/Users/bharath/.cache/huggingface/hub/models--Qwen--Qwen3.5-4B-Base/snapshots/1001bb4d826a52d1f399e183466143f4da7b741b/config.json (TESSL_MID_COMMIT=-) ----
+# 23:58:36, load average { 9.73 11.98 13.64 }
+device: Apple M5 Pro
+T = 1024: gate passed (15 ops wrote finite outputs)
+storage: bf16 (steps into a bf16 bank); operands: Bf16
+encode: every dispatch waited; TESSL_MID_COMMIT=unset
+train_step, T = 1024: 3.252 s (315 tokens/s), loss 12.9264
+  device peak over the steps: 19.02 GiB (1.73 GiB above the loaded model)
+  one traced step: 3.413 s, 3003 waits (3.200 s blocked), 3003 commits, 3003 dispatches, 1751 cold allocations, 0 host-zeroed (0.00 GB)
+       23.21 real         4.54 user         3.54 sys
+         24140398592  maximum resident set size
+                   0  average shared memory size
+                   0  average unshared data size
+                   0  average unshared stack size
+             1598225  page reclaims
+                   1  page faults
+                   0  swaps
+                   0  block input operations
+                   0  block output operations
+                   0  messages sent
+                   0  messages received
+                   0  signals received
+                   6  voluntary context switches
+               93225  involuntary context switches
+        107723839932  instructions retired
+         31897394037  cycles elapsed
+         26383320656  peak memory footprint
+# ---- round 4, config after/1024:-:sync:--storage=bf16,--random-config=/Users/bharath/.cache/huggingface/hub/models--Qwen--Qwen3.5-4B-Base/snapshots/1001bb4d826a52d1f399e183466143f4da7b741b/config.json: 1024 --step-only --step=1024 --storage=bf16 --random-config=/Users/bharath/.cache/huggingface/hub/models--Qwen--Qwen3.5-4B-Base/snapshots/1001bb4d826a52d1f399e183466143f4da7b741b/config.json (TESSL_MID_COMMIT=-) ----
+# 23:58:59, load average { 10.94 12.03 13.60 }
+device: Apple M5 Pro
+T = 1024: gate passed (15 ops wrote finite outputs)
+storage: bf16 (steps into a bf16 bank); operands: Bf16
+encode: every dispatch waited; TESSL_MID_COMMIT=unset
+train_step, T = 1024: 3.247 s (315 tokens/s), loss 12.9264
+  device peak over the steps: 18.97 GiB (1.68 GiB above the loaded model)
+  one traced step: 3.090 s, 2499 waits (2.917 s blocked), 2499 commits, 2499 dispatches, 1555 cold allocations, 0 host-zeroed (0.00 GB)
+       23.30 real         4.82 user         3.50 sys
+         24142544896  maximum resident set size
+                   0  average shared memory size
+                   0  average unshared data size
+                   0  average unshared stack size
+             1598338  page reclaims
+                   3  page faults
+                   0  swaps
+                   0  block input operations
+                   0  block output operations
+                   0  messages sent
+                   0  messages received
+                   0  signals received
+                   0  voluntary context switches
+               85232  involuntary context switches
+        107165043253  instructions retired
+         32667614826  cycles elapsed
+         26335020648  peak memory footprint
+# ---- round 4, config before/1024:-:async:--storage=bf16,--random-config=/Users/bharath/.cache/huggingface/hub/models--Qwen--Qwen3.5-4B-Base/snapshots/1001bb4d826a52d1f399e183466143f4da7b741b/config.json: 1024 --step-only --step=1024 --async --storage=bf16 --random-config=/Users/bharath/.cache/huggingface/hub/models--Qwen--Qwen3.5-4B-Base/snapshots/1001bb4d826a52d1f399e183466143f4da7b741b/config.json (TESSL_MID_COMMIT=-) ----
+# 23:59:23, load average { 11.07 11.98 13.55 }
+device: Apple M5 Pro
+T = 1024: gate passed (15 ops wrote finite outputs)
+storage: bf16 (steps into a bf16 bank); operands: Bf16
+encode: async (--async); TESSL_MID_COMMIT=unset
+train_step, T = 1024: 3.133 s (327 tokens/s), loss 12.9264
+  device peak over the steps: 20.68 GiB (3.39 GiB above the loaded model)
+  one traced step: 3.115 s, 18 waits (2.512 s blocked), 18 commits, 3003 dispatches, 1751 cold allocations, 0 host-zeroed (0.00 GB)
+       22.21 real         4.00 user         4.67 sys
+         24143560704  maximum resident set size
+                   0  average shared memory size
+                   0  average unshared data size
+                   0  average unshared stack size
+             1598398  page reclaims
+                   3  page faults
+                   0  swaps
+                   0  block input operations
+                   0  block output operations
+                   0  messages sent
+                   0  messages received
+                   0  signals received
+                   3  voluntary context switches
+               20592  involuntary context switches
+        128424954000  instructions retired
+         33829163638  cycles elapsed
+         28037153664  peak memory footprint
+# ---- round 4, config after/1024:-:async:--storage=bf16,--random-config=/Users/bharath/.cache/huggingface/hub/models--Qwen--Qwen3.5-4B-Base/snapshots/1001bb4d826a52d1f399e183466143f4da7b741b/config.json: 1024 --step-only --step=1024 --async --storage=bf16 --random-config=/Users/bharath/.cache/huggingface/hub/models--Qwen--Qwen3.5-4B-Base/snapshots/1001bb4d826a52d1f399e183466143f4da7b741b/config.json (TESSL_MID_COMMIT=-) ----
+# 23:59:45, load average { 9.31 11.50 13.33 }
+device: Apple M5 Pro
+T = 1024: gate passed (15 ops wrote finite outputs)
+storage: bf16 (steps into a bf16 bank); operands: Bf16
+encode: async (--async); TESSL_MID_COMMIT=unset
+train_step, T = 1024: 2.935 s (349 tokens/s), loss 12.9264
+  device peak over the steps: 20.50 GiB (3.20 GiB above the loaded model)
+  one traced step: 3.000 s, 18 waits (2.459 s blocked), 18 commits, 2499 dispatches, 1555 cold allocations, 0 host-zeroed (0.00 GB)
+       21.05 real         3.93 user         4.33 sys
+         24140513280  maximum resident set size
+                   0  average shared memory size
+                   0  average unshared data size
+                   0  average unshared stack size
+             1598476  page reclaims
+                   3  page faults
+                   0  swaps
+                   0  block input operations
+                   0  block output operations
+                   0  messages sent
+                   0  messages received
+                   0  signals received
+                   1  voluntary context switches
+               19738  involuntary context switches
+        125323780707  instructions retired
+         32426254983  cycles elapsed
+         27967259520  peak memory footprint
+
+# ---- summary: 5 rounds, each a median of 3 steps; min (max) over rounds ----
+config                                  min s      max s   peak footprint     device peak
+before/2048:-:sync                      5.912      6.318         19.75 GB       15.38 GiB
+after/2048:-:sync                       5.890      6.730         19.72 GB       15.35 GiB
+before/2048:-:async                     5.169      6.095         21.00 GB       16.54 GiB
+after/2048:-:async                      5.192      5.992         20.80 GB       16.36 GiB
+before/2048:-:sync:--storage=bf16       2.530      2.837         12.98 GB        9.02 GiB
+after/2048:-:sync:--storage=bf16        2.465      4.124         13.03 GB        9.07 GiB
+before/1024:-:sync:--storage=bf16,--random-config=/Users/bharath/.cache/huggingface/hub/models--Qwen--Qwen3.5-4B-Base/snapshots/1001bb4d826a52d1f399e183466143f4da7b741b/config.json      2.823      3.952         26.39 GB       19.02 GiB
+after/1024:-:sync:--storage=bf16,--random-config=/Users/bharath/.cache/huggingface/hub/models--Qwen--Qwen3.5-4B-Base/snapshots/1001bb4d826a52d1f399e183466143f4da7b741b/config.json      2.671      3.260         26.34 GB       18.97 GiB
+before/1024:-:async:--storage=bf16,--random-config=/Users/bharath/.cache/huggingface/hub/models--Qwen--Qwen3.5-4B-Base/snapshots/1001bb4d826a52d1f399e183466143f4da7b741b/config.json      2.856      3.133         28.17 GB       20.68 GiB
+after/1024:-:async:--storage=bf16,--random-config=/Users/bharath/.cache/huggingface/hub/models--Qwen--Qwen3.5-4B-Base/snapshots/1001bb4d826a52d1f399e183466143f4da7b741b/config.json      2.747      2.935         27.97 GB       20.50 GiB

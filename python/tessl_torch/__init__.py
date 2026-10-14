@@ -30,6 +30,7 @@ import math
 import operator
 import os
 import threading
+import warnings
 from pathlib import Path
 
 import torch
@@ -76,11 +77,21 @@ def _status_error(status: int, err) -> TesslError:
     return cls(err.value.decode(errors="replace"))
 
 
+def _flag(name: str, value) -> int:
+    """A boolean flag as the C ABI's 0 or 1: a bool or the ints 0 and 1,
+    nothing else (``2**32`` would wrap to 0 in a c_uint32)."""
+    if isinstance(value, bool) or (isinstance(value, int) and value in (0, 1)):
+        return int(value)
+    raise TesslError(f"{name} must be a bool, not {value!r}")
+
+
 def _check_uint(name: str, value, bits: int) -> int:
     """``value`` as an int in ``[0, 2**bits)``, the range of the C field it
     is about to fill. ctypes wraps out-of-range integers silently (``-1``
     becomes ``2**32 - 1``, ``2**32`` becomes 0), so every integer headed for
     a ctypes field is checked here first."""
+    if isinstance(value, bool):
+        raise TesslError(f"{name} must be an integer, not bool")
     try:
         v = operator.index(value)
     except TypeError:
@@ -121,12 +132,33 @@ class _Owned:
         return self._h is None
 
     def close(self) -> None:
-        """Free the handle. Idempotent. From a thread other than the one that
-        made it the library refuses and leaks the handle rather than drop it
-        on the wrong thread; either way this object is closed."""
+        """Free the handle. Idempotent: the object is closed after the first
+        call whatever the library says, and later calls do nothing.
+
+        Raises :class:`TesslPanic` if the free itself hit a bug in tessl, and
+        :class:`TesslError` if it was called from a thread other than the one
+        that made the handle: the library then refuses and leaks the handle
+        (held until the process exits) rather than drop a thread-affine
+        runtime on the wrong thread."""
         h, self._h = self._h, None
-        if h is not None and self._lib is not None:
-            getattr(self._lib, self._free_name)(h)
+        if h is None or self._lib is None:
+            return
+        status = getattr(self._lib, self._free_name)(h)
+        if status == _STATUS_PANIC:
+            raise TesslPanic(f"tessl {self._kind}: freeing the handle hit a bug in tessl")
+        if status != 0:
+            raise TesslError(
+                f"tessl {self._kind} closed from a thread other than the one that made it: "
+                f"the handle is leaked until the process exits"
+            )
+
+    def _close_after_panic(self) -> None:
+        """Close the object whose call panicked. A failing free is dropped:
+        the panic being raised is the news."""
+        try:
+            self.close()
+        except TesslError:
+            pass
 
     def __enter__(self):
         return self
@@ -135,7 +167,14 @@ class _Owned:
         self.close()
 
     def __del__(self):
-        self.close()
+        try:
+            self.close()
+        except TesslError as e:
+            # A finalizer must not raise; a leak is still worth saying.
+            try:
+                warnings.warn(str(e), ResourceWarning, stacklevel=2)
+            except Exception:  # interpreter shutdown
+                pass
 
     def __copy__(self):
         raise TypeError(f"tessl {self._kind}s own a C handle and cannot be copied")
@@ -354,7 +393,7 @@ def _runtime_status(rt: "_Runtime", status: int, err) -> None:
     if status == 0:
         return
     if status == _STATUS_PANIC:
-        rt.close()
+        rt._close_after_panic()
     raise _status_error(status, err)
 
 
@@ -520,8 +559,17 @@ class _HostU32:
         self.ctypes_ptr = ctypes.cast(self.t.data_ptr(), ctypes.POINTER(ctypes.c_uint32))
 
 
+def _index_tensor(v: torch.Tensor, name: str) -> torch.Tensor:
+    """``v`` flattened to a CPU int64 tensor. Integer dtypes only: a float
+    id (3.5) would truncate to 3 silently and a bool is a mask, not an index.
+    An empty tensor of any dtype is fine (``torch.as_tensor([])`` is f32)."""
+    if v.numel() and (v.dtype == torch.bool or v.dtype.is_floating_point or v.dtype.is_complex):
+        raise TesslError(f"{name} must be an integer tensor, not {v.dtype}")
+    return v.reshape(-1).to("cpu", torch.int64)
+
+
 def _u32(v: torch.Tensor, bound: int, name: str) -> _HostU32:
-    flat = v.reshape(-1).to("cpu", torch.int64)
+    flat = _index_tensor(v, name)
     if flat.numel() and (int(flat.min()) < 0 or int(flat.max()) >= bound):
         raise TesslError(f"{name} must lie in [0, {bound})")
     return _HostU32(flat.to(torch.int32).view(torch.int32))
@@ -817,8 +865,7 @@ class Qwen35(_Owned):
             rt.handle, str(safetensors).encode(), str(config_json).encode(), prefix.encode(),
             _PRECISION_CODE[precision], ctypes.byref(handle), err, _ERR_LEN,
         )
-        if status != 0:
-            raise _status_error(status, err)
+        _runtime_status(rt, status, err)
         self._rt = rt
         self._own(rt.lib, handle)
         self._precision = precision
@@ -849,7 +896,14 @@ class Qwen35(_Owned):
         model: the library says its handle should be freed."""
         if status != 0:
             if status == _STATUS_PANIC:
-                self.close()
+                self._close_after_panic()
+                # The runtime the model ran on is dropped too: a bug in tessl
+                # may have left it unusable. A live model never depends on the
+                # Python runtime object's handle: the Rust model holds its own
+                # Arc of the GpuRuntime (capi.rs `Handle::runtime`), and every
+                # model call passes the model's handle, so closing the thread's
+                # runtime cannot free anything a live model uses.
+                self._rt._close_after_panic()
             raise _status_error(status, err)
 
     @property
@@ -1042,7 +1096,7 @@ class Qwen35(_Owned):
             raise TesslError(f"load_adamw_state: update {self._adamw_config['update']!r} "
                              f"{'needs' if wants_aux else 'keeps no'} aux state, and the checkpoint "
                              f"{'has none' if wants_aux else 'has some'}")
-        step = _check_uint("load_adamw_state: step", int(state["step"]), 64)
+        step = _check_uint("load_adamw_state: step", state["step"], 64)
         m = self._staged("load_adamw_state: exp_avg", state["exp_avg"])
         v = self._staged("load_adamw_state: exp_avg_sq", state["exp_avg_sq"])
         aux = self._staged("load_adamw_state: aux", state["aux"]) if wants_aux else None
@@ -1174,13 +1228,14 @@ class Qwen35(_Owned):
         reads, added to the step's own; rows of a repeated position are
         summed first. A refused call keeps the step pending
         (``train_discard()`` drops it)."""
+        accumulate = _flag("accumulate", accumulate)
         if (dh is None) != (positions is None):
             raise TesslError("train_backward: give dh and positions together")
         err = ctypes.create_string_buffer(_ERR_LEN)
         if dh is None:
             pos_ptr, n, ref = None, 0, None
         else:
-            positions = torch.as_tensor(positions).reshape(-1).to("cpu", torch.int64)
+            positions = _index_tensor(torch.as_tensor(positions), "positions")
             if tuple(dh.shape) != (positions.numel(), self._hidden):
                 raise TesslError(
                     f"train_backward: dh must be [{positions.numel()}, {self._hidden}], got {tuple(dh.shape)}"
@@ -1199,7 +1254,7 @@ class Qwen35(_Owned):
             ref = ctypes.byref(_ref(dh32, "dh")) if n else None
         torch.mps.synchronize()
         self._check(
-            self._rt.lib.tessl_qwen35_train_backward(self._handle, pos_ptr, n, ref, int(accumulate), err, _ERR_LEN),
+            self._rt.lib.tessl_qwen35_train_backward(self._handle, pos_ptr, n, ref, accumulate, err, _ERR_LEN),
             err,
         )
         self._has_grads, self._pending = True, False

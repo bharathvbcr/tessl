@@ -986,7 +986,10 @@ directions 3-6 read and write both moments, for checkpoints), and
 training loop needs no torch copy of the parameters or gradients: on the 2B
 that is params 8 + gradients 8 + moments 16 GB plus the step's scratch,
 against about 55 GB with torch's optimizer (estimated, not measured). The
-update is `torch.optim.AdamW`'s single-tensor path in its order, per
+update is `torch.optim.AdamW`'s single-tensor path in its order (the moments and
+denominator as torch forms them; the final `w*decay + (-lr)*(m/denom)` can differ
+from torch's `addcdiv_` by up to 1 ulp per parameter, so it is not bit-identical),
+per
 parameter-table entry, every parameter (the norms' `w` included) as stored;
 weight decay is per entry, and the default excludes what transformers'
 Trainer excludes (every norm and `linear_attn.dt_bias`). Against an f64

@@ -34,6 +34,13 @@
 //! Status codes: [`TESSL_OK`], [`TESSL_ERR`] (the message says why), and
 //! [`TESSL_PANIC`] (a bug in tessl, caught at the boundary rather than
 //! unwinding into C; the handle should be freed).
+//!
+//! A runtime that an encode, submit or GPU fault has latched is *poisoned*
+//! and refuses all further work. That is not a status code of its own (a new
+//! value would change what existing calls can return, breaking callers that
+//! switch on the status): the failing call returns [`TESSL_ERR`], and a
+//! caller asks [`tessl_runtime_poisoned`] whether the runtime is now
+//! unrecoverable and must be recreated. ABI 11 added that query.
 
 use std::ffi::{c_char, c_void};
 use std::panic::{catch_unwind, AssertUnwindSafe};
@@ -69,7 +76,7 @@ pub const TESSL_PANIC: i32 = 2;
 
 /// Bumped on any change to a `#[repr(C)]` layout or an entry point's
 /// signature; the Python side refuses a library whose version differs.
-pub const TESSL_ABI_VERSION: u32 = 10;
+pub const TESSL_ABI_VERSION: u32 = 11;
 
 /// Largest tensor rank a [`TesslTensorRef`] carries.
 pub const TESSL_MAX_DIMS: usize = 6;
@@ -213,6 +220,43 @@ pub struct TesslRuntime {
 #[no_mangle]
 pub extern "C" fn tessl_abi_version() -> u32 {
     TESSL_ABI_VERSION
+}
+
+/// Whether the runtime is poisoned (an encode, submit or GPU fault latched
+/// it; every later call on it is refused), written as 1 or 0 to `*out`.
+///
+/// The one call that works on a poisoned runtime: it only reads the latch,
+/// and does not synchronize (a synchronize on a poisoned runtime fails, which
+/// would hide the answer). A model handle's runtime is the one its
+/// [`tessl_qwen35_load`] was given, so the binding asks that runtime.
+///
+/// # Safety
+/// `handle` comes from [`tessl_runtime_new`], is not freed, and is used on
+/// its creating thread (checked: null and foreign-thread handles are refused
+/// with [`TESSL_ERR`] before any reference is formed). `out` is writable;
+/// `err` is null or points to `err_len` writable bytes.
+#[no_mangle]
+pub unsafe extern "C" fn tessl_runtime_poisoned(
+    handle: *mut TesslRuntime,
+    out: *mut i32,
+    err: *mut c_char,
+    err_len: usize,
+) -> i32 {
+    // SAFETY: forwarded from this function's contract.
+    if let Some(status) = unsafe { refuse_unowned(handle, err, err_len) } {
+        return status;
+    }
+    if out.is_null() {
+        // SAFETY: forwarded.
+        unsafe { write_err(err, err_len, "tessl_runtime_poisoned: null out") };
+        return TESSL_ERR;
+    }
+    // SAFETY: live and on its owning thread by the checks above; the latch is
+    // read through a shared reference to the runtime only.
+    let poisoned = unsafe { (*handle).rt.is_poisoned() };
+    // SAFETY: `out` is non-null and writable by the contract.
+    unsafe { *out = i32::from(poisoned) };
+    TESSL_OK
 }
 
 /// A new runtime on the system default device, or null with the reason in
@@ -549,6 +593,32 @@ unsafe fn free_handle<H: Handle>(handle: *mut H) -> i32 {
     }
 }
 
+/// The refusal for a null or foreign-thread handle, or `None` when the handle
+/// is live and this is its thread. The thread check forms no reference: on a
+/// foreign thread the handle may be inside the owner's call.
+///
+/// # Safety
+/// `handle` is null or a live handle from its constructor; `err` is null or
+/// points to `err_len` writable bytes.
+unsafe fn refuse_unowned<H: Handle>(handle: *mut H, err: *mut c_char, err_len: usize) -> Option<i32> {
+    if handle.is_null() {
+        // SAFETY: forwarded.
+        unsafe { write_err(err, err_len, &format!("null {} handle", H::KIND)) };
+        return Some(TESSL_ERR);
+    }
+    // SAFETY: live by the contract; the owner is read through the raw pointer.
+    if std::thread::current().id() != unsafe { H::owner_of(handle) } {
+        let msg = format!(
+            "tessl {} used from a thread other than the one that created it",
+            H::KIND
+        );
+        // SAFETY: forwarded.
+        unsafe { write_err(err, err_len, &msg) };
+        return Some(TESSL_ERR);
+    }
+    None
+}
+
 /// Run `f` on the handle with every failure turned into a status: a null or
 /// foreign-thread handle, an `Err`, or a panic. A successful call leaves the
 /// runtime synchronized.
@@ -562,22 +632,9 @@ unsafe fn guarded<H: Handle>(
     err_len: usize,
     f: impl FnOnce(&mut H) -> Result<(), String>,
 ) -> i32 {
-    if handle.is_null() {
-        // SAFETY: forwarded.
-        unsafe { write_err(err, err_len, &format!("null {} handle", H::KIND)) };
-        return TESSL_ERR;
-    }
-    // The thread check comes first and forms no reference: on a foreign
-    // thread the handle may be inside the owner's call.
-    // SAFETY: live by the contract; the owner is read through the raw pointer.
-    if std::thread::current().id() != unsafe { H::owner_of(handle) } {
-        let msg = format!(
-            "tessl {} used from a thread other than the one that created it",
-            H::KIND
-        );
-        // SAFETY: forwarded.
-        unsafe { write_err(err, err_len, &msg) };
-        return TESSL_ERR;
+    // SAFETY: forwarded from this function's contract.
+    if let Some(status) = unsafe { refuse_unowned(handle, err, err_len) } {
+        return status;
     }
     // SAFETY: live and, now on its owning thread, unshared by the contract.
     let h = unsafe { &mut *handle };

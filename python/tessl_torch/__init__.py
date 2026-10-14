@@ -31,6 +31,7 @@ import operator
 import os
 import threading
 import warnings
+import weakref
 from pathlib import Path
 
 import torch
@@ -44,10 +45,11 @@ __all__ = [
     "Qwen35",
     "TesslError",
     "TesslPanic",
+    "TesslPoisoned",
     "library_path",
 ]
 
-_ABI_VERSION = 10
+_ABI_VERSION = 11
 _MAX_DIMS = 6
 _DTYPE_CODE = {torch.float32: 0, torch.bfloat16: 1, torch.float16: 2}
 _ERR_LEN = 1024
@@ -69,6 +71,14 @@ class TesslPanic(TesslError):
     caught at the boundary. The handle it came from is closed (the library
     says it should be freed): later calls on that object raise
     :class:`TesslError` without reaching the library."""
+
+
+class TesslPoisoned(TesslError):
+    """A tessl call failed and left the runtime poisoned (an encode, submit or
+    GPU fault latched it; the library refuses all further work on it). The
+    message names the original error. The runtime and every model bound to it
+    are closed; the next call on this thread builds a fresh runtime, and a
+    model must be loaded again."""
 
 
 def _status_error(status: int, err) -> TesslError:
@@ -287,6 +297,10 @@ def _load():
         lib.tessl_runtime_new.argtypes = [ctypes.c_char_p, ctypes.c_size_t]
         lib.tessl_runtime_free.restype = ctypes.c_int32
         lib.tessl_runtime_free.argtypes = [ctypes.c_void_p]
+        lib.tessl_runtime_poisoned.restype = ctypes.c_int32
+        lib.tessl_runtime_poisoned.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_int32), ctypes.c_char_p, ctypes.c_size_t]
+        lib.tessl_synchronize.restype = ctypes.c_int32
+        lib.tessl_synchronize.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_size_t]
         lib.tessl_mtl_buffer_length.restype = ctypes.c_uint64
         lib.tessl_mtl_buffer_length.argtypes = [ctypes.c_void_p]
         lib.tessl_cross_entropy_rows.restype = ctypes.c_int32
@@ -379,6 +393,28 @@ class _Runtime(_Owned):
             raise _status_error(1, err)
         self.lib = lib
         self._own(lib, ctypes.c_void_p(handle))
+        # Models loaded on this runtime, closed with it if it is poisoned.
+        self._models = weakref.WeakSet()
+
+    def is_poisoned(self) -> bool:
+        """Whether the library reports this runtime poisoned. False when it is
+        closed or the query itself is refused (the caller reports the original
+        error then)."""
+        if self.closed:
+            return False
+        out = ctypes.c_int32()
+        err = ctypes.create_string_buffer(_ERR_LEN)
+        status = self.lib.tessl_runtime_poisoned(self.handle, ctypes.byref(out), err, _ERR_LEN)
+        return status == 0 and out.value == 1
+
+    def _close_poisoned(self) -> None:
+        """Close the models bound to this runtime and then the runtime, and
+        drop it as the thread's runtime so the next call builds a fresh one."""
+        for model in list(self._models):
+            model._close_after_panic()
+        self._close_after_panic()
+        if getattr(_local, "rt", None) is self:
+            _local.rt = None
 
     # close() from a foreign thread (interpreter shutdown) is refused by the
     # library, which leaks the runtime rather than drop it on the wrong thread.
@@ -389,12 +425,27 @@ _local = threading.local()
 
 def _runtime_status(rt: "_Runtime", status: int, err) -> None:
     """Raise for a non-zero status of a call on the thread's runtime. A panic
-    closes that runtime; the next call on this thread builds a fresh one."""
+    closes that runtime; a refusal that left it poisoned closes it and its
+    models and raises :class:`TesslPoisoned`; the next call on this thread
+    builds a fresh runtime."""
     if status == 0:
         return
     if status == _STATUS_PANIC:
         rt._close_after_panic()
-    raise _status_error(status, err)
+        raise _status_error(status, err)
+    raise _error_or_poisoned(rt, status, err)
+
+
+def _error_or_poisoned(rt: "_Runtime", status: int, err) -> TesslError:
+    """The exception for a failed call on ``rt``: :class:`TesslPoisoned` (after
+    closing ``rt`` and its models) when the library says the call poisoned the
+    runtime, else the plain status error. The message is read before the
+    query, which reuses no buffer of the caller's."""
+    error = _status_error(status, err)
+    if rt.is_poisoned():
+        rt._close_poisoned()
+        return TesslPoisoned(f"tessl runtime poisoned: {error}")
+    return error
 
 
 def _runtime() -> _Runtime:
@@ -868,6 +919,7 @@ class Qwen35(_Owned):
         _runtime_status(rt, status, err)
         self._rt = rt
         self._own(rt.lib, handle)
+        rt._models.add(self)
         self._precision = precision
         # What adamw_init made the AdamW state with, or None.
         self._adamw_config = None
@@ -904,7 +956,8 @@ class Qwen35(_Owned):
                 # model call passes the model's handle, so closing the thread's
                 # runtime cannot free anything a live model uses.
                 self._rt._close_after_panic()
-            raise _status_error(status, err)
+                raise _status_error(status, err)
+            raise _error_or_poisoned(self._rt, status, err)
 
     @property
     def shapes(self) -> dict:

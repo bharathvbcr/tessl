@@ -1,0 +1,531 @@
+bench_qwen35_layers on Qwen35Model: 8K prefill, decode baseline, before/after (M5 Pro, 2026-10-14)
+
+Built from tessl commit cf537a1 (branch bl/qwen35bench, from 0055612), release,
+binary `bench_qwen35_layers`. "Old" below is the 0055612 binary (the bench's own
+layer wiring), run with --gdn-scan16 so both use the library-default Cols16 scan.
+Every GPU run is under Lappi's mac_heavy lock. Weights: "random" is
+Qwen35Model::random(qwen35_2b, Bf16, seed 0x51); "REAL" is the instruct
+Qwen3.5-2B checkpoint, models--Qwen--Qwen3.5-2B/snapshots/15852e8c..., loaded
+at bf16 with the packed head. Power: AC, powermode 2 (pmset), recorded per run.
+
+CAVEAT, GPU not strictly idle: the lock serialises Lappi's jobs only. The
+GPU utilisation printed before each run (ioreg "Device Utilization %") is 0 at
+the start of the first section and in round 1 of the 8K comparison, but other
+sessions' GPU work shows up in rounds 2-3 and the decode runs (up to ~60-99%
+on the first sample, which can also be this binary's own predecessor exiting).
+Read the minima, and round 1 as the clean pair.
+
+== RULING: 3,797 vs 6,213 tok/s (GAP-QDM-8K-PREFILL-3797-VS-REPORTED-6213-TOKS-2026-10-03)
+On this tree, 8K prefill on Qwen35Model with the REAL Qwen3.5-2B weights, min of 9:
+  tower (begin + 24 layers + final norm):  1252.3 ms = 6541 tok/s  (round 1, GPU idle at start)
+  forward_rows(Last) (tower + LM head):    1307.0 ms = 6268 tok/s  (best of all runs; round 1: 1318.5 ms = 6213 tok/s)
+  prefill (head + decode state):           1298.4 ms = 6309 tok/s  (best; round 1: 1319.5 ms = 6208 tok/s)
+The lowest figure in any run is 5,775-5,900 tok/s, under visible GPU contention.
+None is near 3.8-4.1k. By Fable's rule (~6.2k on today's tree = the qd-metal
+prefill path is the gap; ~3.8-4.1k = a tessl regression) the gap is qd-metal's,
+not a tessl regression. The old bench's own figure on this tree (random
+weights, 0055612) is 6012 / 5684 / 5713 tok/s (its "forward" column), the same
+band as the 6,213 reported on 2026-09-28. Random and real weights time the
+same in round 1 (1252.5 vs 1252.3 ms tower).
+
+== DECODE BASELINE (--decode=4096, async encode, tok/s from min of 32 steps)
+Decode::step per token, measured with infer_trace over 4 separate traced steps:
+  host waits (synchronize) per token ......... 1
+  command buffer commits per token ........... 1
+  cold allocations per token ................. 3
+  dispatches per token ....................... 273
+The 3 cold allocations are Decode::step's two 4-byte buffers (suffix_len,
+q_pos: alloc_buffer_from_u32) plus the one-token id buffer Qwen35Model::embed_ids
+makes (alloc_buffer_from_u32 again). The brief expected 2; the third is the
+embedding gather's. A GPU-resident decode loop removes all three and the wait.
+  random weights: decode 17.302 ms/token min (57.8 tok/s), median 18.143 ms (55.1);
+                  prefill P=4096 min 575.6 ms (7116 tok/s)
+  REAL weights:   decode 19.894 ms/token min (50.3 tok/s), median 21.435 ms (46.7);
+                  prefill P=4096 min 690.1 ms (5935 tok/s)  [GPU contended: an
+                  earlier run had it at 570.0 ms / 7186 tok/s and decode
+                  17.715 ms / 56.4 tok/s, see the first log below]
+Each step includes the head and the 1 MB logits read. The sampler is not timed.
+The token ids are a fixed pattern, not sampled.
+
+== BEFORE / AFTER, same stage breakdown (ABAB x3, T = 1024 2048 8192, Cols16)
+Old bench -> table "per layer" (median of 7, 8 per command buffer) and "forward";
+new bench -> same "per layer" table (Staged::encode_part) and "layers" (min).
+8192, ms:           GDN layer       attn layer      MLP             forward/layers min
+  old r1,r2,r3      24.19 24.96 24.87   58.30 60.10 59.89   25.30 25.96 26.11   1362.6 1441.3 1434.0
+  new r1,r2,r3      24.72 24.78 24.27   59.64 60.02 56.91   26.23 25.97 25.03   1413.7 1421.2 1404.1
+2048, ms:           old forward 294.3 307.7 310.8   new layers min 308.6 306.2 301.3
+1024, ms:           old forward 139.4 147.8 175.7   new layers min 149.7 150.8 151.7
+The layer-kind rows agree within the run-to-run spread (old's own forward spans
+1362-1441 ms at 8192). Not reproduced: the old fine sub-mixer table (in-proj,
+conv, prep, scan, gated norm, out-proj; qkv, qk_norm_rope, attention, output
+gate, o-proj; gate, up, swiglu, down). The model has no stage seam below
+LayerPart (input norm / mixer / post norm / MLP); splitting gdn(), attention()
+and mlp() into an enumerated stage list is a decision for the owner. The new
+bench reports the layer kinds and the four parts; the old per-stage rows sum
+to the same layer totals.
+
+The full logs follow: first the smoke runs, ABAB, REAL 8K (Cols16 and Cols32)
+and decode (t2), then the interleaved random/REAL 8K rounds and decode again (t4).
+
+================================================================ t2 (smoke, ABAB, REAL, decode)
+== machine state
+Wed Oct 14 10:48:46 CDT 2026
+Now drawing from 'AC Power'
+ -InternalBattery-0 (id=23724131)	85%; AC attached; not charging present: true
+ powermode            2
+10:48  up 2 days, 21:02, 1 user, load averages: 8.85 11.70 16.34
+gpu util:
+"Device Utilization %"=63
+== smoke: new --check-only 1024 2048 8192
+device: Apple M5 Pro
+power: Now drawing from 'AC Power'
+power: -InternalBattery-0 (id=23724131)	85%; AC attached; not charging present: true
+power: powermode            2
+gdn scan: Cols16
+weights: random (seed 0x51)
+weights ready in 1.9 s: Qwen3.5 text: hidden 2048, intermediate 6144, vocab 248320, 24 layers (18 GDN, 6 attention); matrices bf16, norms/conv/gates f32; LM head packed bf16 copy
+T=1024: gate passed (final norm and last-row logits finite and not all zero)
+T=2048: gate passed (final norm and last-row logits finite and not all zero)
+T=8192: gate passed (final norm and last-row logits finite and not all zero)
+--check-only: nothing timed
+== smoke: --gdn-scan32 --check-only 1024
+gdn scan: Cols32
+weights ready in 2.1 s: Qwen3.5 text: hidden 2048, intermediate 6144, vocab 248320, 24 layers (18 GDN, 6 attention); matrices bf16, norms/conv/gates f32; LM head packed bf16 copy
+T=1024: gate passed (final norm and last-row logits finite and not all zero)
+== ABAB old(--gdn-scan16) vs new at 1024 2048 8192
+---- round 1 OLD
+device: Apple M5 Pro
+Qwen3.5-2B shapes: hidden 2048, GDN 16k/16v heads x 128, attn 8q/2kv x 256 (rotary 64), MLP 6144, vocab 248320
+layers: 18 GDN + 6 attention, batch 1, bf16 weights distinct per layer
+gdn scan: Cols16
+swiglu: qwen35::swiglu (bf16 out)
+attention kernel: qwen35::attn_prefill (TensorOps f32), tile q32_k32_sg4
+weights uploaded in 0.3 s
+T=1024: plausibility gate passed (every stage output finite, residual moved; GDN workspace 25 MB)
+T=2048: plausibility gate passed (every stage output finite, residual moved; GDN workspace 51 MB)
+T=8192: plausibility gate passed (every stage output finite, residual moved; GDN workspace 202 MB)
+
+per layer (ms, median of 7, 8 per command buffer). GDN / attention layer = input norm + mixer; MLP = post-norm + SwiGLU
+     T       GDN      attn       MLP |  sum layers     forward |      tok/s    +lm_head*  launches
+  1024     3.085     2.163     3.205 |      145.43      139.42 |       7345         5899       283
+  2048     6.239     5.915     6.319 |      299.45      294.32 |       6958         5647       283
+  8192    24.190    58.301    25.298 |     1392.38     1362.59 |       6012         5007       283
+forward = all 24 layers + final norm in one command buffer (measured, not summed). * lm_head scaled from 1024 rows: 0.0334 ms/row
+
+per stage (ms)
+       stage                 T=1024    T=2048    T=8192
+gdn    input norm             0.067     0.113     0.457
+gdn    in-proj GEMM           1.280     2.549    10.143
+gdn    conv1d_silu            0.355     0.714     2.843
+gdn    gdn chunk prep         0.395     0.659     2.287
+gdn    gdn chunk scan         0.785     1.630     6.397
+gdn    gated_rms_norm         0.108     0.215     0.798
+gdn    out-proj + resid       0.400     0.749     2.756
+attn   qkv+gate GEMM          0.783     1.560     6.550
+attn   qk_norm_rope           0.112     0.230     0.870
+attn   attention              0.881     3.231    48.236
+attn   output gate            0.083     0.201     0.714
+attn   o-proj + resid         0.408     0.754     2.837
+mlp    post-norm              0.073     0.124     0.453
+mlp    gate GEMM              0.936     1.855     7.761
+mlp    up GEMM                0.942     1.932     7.908
+mlp    swiglu -> bf16         0.293     0.557     2.161
+mlp    down + resid           1.054     2.007     8.159
+---- round 1 NEW
+device: Apple M5 Pro
+power: Now drawing from 'AC Power'
+power: -InternalBattery-0 (id=23724131)	85%; AC attached; not charging present: true
+power: powermode            2
+gdn scan: Cols16
+weights: random (seed 0x51)
+weights ready in 2.2 s: Qwen3.5 text: hidden 2048, intermediate 6144, vocab 248320, 24 layers (18 GDN, 6 attention); matrices bf16, norms/conv/gates f32; LM head packed bf16 copy
+T=1024: gate passed (final norm and last-row logits finite and not all zero)
+T=2048: gate passed (final norm and last-row logits finite and not all zero)
+T=8192: gate passed (final norm and last-row logits finite and not all zero)
+METRIC model_forward_ms_t1024 157.547
+METRIC model_forward_ms_t2048 312.167
+METRIC model_forward_ms_t8192 1455.306
+
+Qwen35Model prefill (ms, min / median of 7), async encode. tower = begin + layers + final norm; layers = layers + final norm only; forward_rows = tower + head (last row); prefill = forward_rows + decode state
+     T | tower min    median    layers |   fwd min    median |   prefill |    median | tower tok/s  fwd tok/s  pre tok/s |  launches
+  1024 |    156.47    157.55    149.66 |    152.98    153.20 |    152.57 |    154.46 |       6544       6694       6712 |       284
+  2048 |    307.60    312.17    308.59 |    302.42    307.19 |    309.89 |    313.19 |       6658       6772       6609 |       284
+  8192 |   1443.97   1455.31   1413.68 |   1456.62   1462.38 |   1445.98 |   1457.84 |       5673       5624       5665 |       284
+
+per layer (ms, median of 7, 8 per command buffer, Staged::encode_part). GDN / attention layer = input norm + mixer; MLP = post-norm + MLP
+     T       GDN      attn       MLP |  sum layers  layers min
+  1024     3.289     2.395     3.516 |      157.97      149.66
+  2048     6.596     5.949     6.598 |      312.79      308.59
+  8192    24.717    59.642    26.232 |     1432.33     1413.68
+
+per part (ms)
+       part                              T=1024    T=2048    T=8192
+gdn    input norm                         0.068     0.144     0.457
+gdn    mixer                              3.457     6.551    24.517
+attn   input norm                         0.070     0.125     0.536
+attn   mixer                              2.424     5.894    59.872
+mlp    post norm                          0.073     0.134     0.442
+mlp    MLP (gate, up, swiglu, down)       3.447     6.521    25.638
+---- round 2 OLD
+device: Apple M5 Pro
+Qwen3.5-2B shapes: hidden 2048, GDN 16k/16v heads x 128, attn 8q/2kv x 256 (rotary 64), MLP 6144, vocab 248320
+layers: 18 GDN + 6 attention, batch 1, bf16 weights distinct per layer
+gdn scan: Cols16
+swiglu: qwen35::swiglu (bf16 out)
+attention kernel: qwen35::attn_prefill (TensorOps f32), tile q32_k32_sg4
+weights uploaded in 0.4 s
+T=1024: plausibility gate passed (every stage output finite, residual moved; GDN workspace 25 MB)
+T=2048: plausibility gate passed (every stage output finite, residual moved; GDN workspace 51 MB)
+T=8192: plausibility gate passed (every stage output finite, residual moved; GDN workspace 202 MB)
+
+per layer (ms, median of 7, 8 per command buffer). GDN / attention layer = input norm + mixer; MLP = post-norm + SwiGLU
+     T       GDN      attn       MLP |  sum layers     forward |      tok/s    +lm_head*  launches
+  1024     3.463     2.368     3.383 |      157.74      147.84 |       6926         5654       283
+  2048     6.526     6.124     6.564 |      311.74      307.67 |       6656         5473       283
+  8192    24.962    60.097    25.961 |     1432.96     1441.30 |       5684         4798       283
+forward = all 24 layers + final norm in one command buffer (measured, not summed). * lm_head scaled from 1024 rows: 0.0325 ms/row
+
+per stage (ms)
+       stage                 T=1024    T=2048    T=8192
+gdn    input norm             0.078     0.131     0.449
+gdn    in-proj GEMM           1.328     2.682    10.577
+gdn    conv1d_silu            0.400     0.744     2.797
+gdn    gdn chunk prep         0.409     0.685     2.232
+gdn    gdn chunk scan         0.839     1.667     6.030
+gdn    gated_rms_norm         0.119     0.232     0.790
+gdn    out-proj + resid       0.430     0.763     2.698
+attn   qkv+gate GEMM          0.830     1.573     6.248
+attn   qk_norm_rope           0.122     0.225     0.840
+attn   attention              0.978     3.275    48.249
+attn   output gate            0.085     0.202     0.700
+attn   o-proj + resid         0.433     0.757     2.784
+mlp    post-norm              0.075     0.126     0.441
+mlp    gate GEMM              1.079     1.913     7.714
+mlp    up GEMM                1.007     1.932     8.011
+mlp    swiglu -> bf16         0.301     0.540     2.103
+mlp    down + resid           1.123     2.048     8.114
+---- round 2 NEW
+device: Apple M5 Pro
+power: Now drawing from 'AC Power'
+power: -InternalBattery-0 (id=23724131)	85%; AC attached; not charging present: true
+power: powermode            2
+gdn scan: Cols16
+weights: random (seed 0x51)
+weights ready in 2.5 s: Qwen3.5 text: hidden 2048, intermediate 6144, vocab 248320, 24 layers (18 GDN, 6 attention); matrices bf16, norms/conv/gates f32; LM head packed bf16 copy
+T=1024: gate passed (final norm and last-row logits finite and not all zero)
+T=2048: gate passed (final norm and last-row logits finite and not all zero)
+T=8192: gate passed (final norm and last-row logits finite and not all zero)
+METRIC model_forward_ms_t1024 153.738
+METRIC model_forward_ms_t2048 349.456
+METRIC model_forward_ms_t8192 1476.090
+
+Qwen35Model prefill (ms, min / median of 7), async encode. tower = begin + layers + final norm; layers = layers + final norm only; forward_rows = tower + head (last row); prefill = forward_rows + decode state
+     T | tower min    median    layers |   fwd min    median |   prefill |    median | tower tok/s  fwd tok/s  pre tok/s |  launches
+  1024 |    152.50    153.74    150.84 |    156.40    158.55 |    158.61 |    191.55 |       6715       6547       6456 |       284
+  2048 |    309.77    349.46    306.17 |    304.95    310.72 |    313.22 |    315.04 |       6611       6716       6539 |       284
+  8192 |   1460.73   1476.09   1421.22 |   1464.89   1470.11 |   1462.61 |   1466.70 |       5608       5592       5601 |       284
+
+per layer (ms, median of 7, 8 per command buffer, Staged::encode_part). GDN / attention layer = input norm + mixer; MLP = post-norm + MLP
+     T       GDN      attn       MLP |  sum layers  layers min
+  1024     4.102     2.842     4.078 |      188.77      150.84
+  2048     6.529     6.116     6.593 |      312.44      306.17
+  8192    24.782    60.024    25.967 |     1429.44     1421.22
+
+per part (ms)
+       part                              T=1024    T=2048    T=8192
+gdn    input norm                         0.067     0.195     0.453
+gdn    mixer                              4.190     6.339    24.474
+attn   input norm                         0.080     0.132     0.444
+attn   mixer                              2.794     5.910    59.580
+mlp    post norm                          0.129     0.135     0.460
+mlp    MLP (gate, up, swiglu, down)       4.121     6.467    25.620
+---- round 3 OLD
+device: Apple M5 Pro
+Qwen3.5-2B shapes: hidden 2048, GDN 16k/16v heads x 128, attn 8q/2kv x 256 (rotary 64), MLP 6144, vocab 248320
+layers: 18 GDN + 6 attention, batch 1, bf16 weights distinct per layer
+gdn scan: Cols16
+swiglu: qwen35::swiglu (bf16 out)
+attention kernel: qwen35::attn_prefill (TensorOps f32), tile q32_k32_sg4
+weights uploaded in 0.4 s
+T=1024: plausibility gate passed (every stage output finite, residual moved; GDN workspace 25 MB)
+T=2048: plausibility gate passed (every stage output finite, residual moved; GDN workspace 51 MB)
+T=8192: plausibility gate passed (every stage output finite, residual moved; GDN workspace 202 MB)
+
+per layer (ms, median of 7, 8 per command buffer). GDN / attention layer = input norm + mixer; MLP = post-norm + SwiGLU
+     T       GDN      attn       MLP |  sum layers     forward |      tok/s    +lm_head*  launches
+  1024     3.975     2.773     4.073 |      185.93      175.68 |       5829         4763       283
+  2048     6.609     6.121     6.566 |      313.28      310.83 |       6589         5259       283
+  8192    24.873    59.894    26.110 |     1433.71     1433.97 |       5713         4685       283
+forward = all 24 layers + final norm in one command buffer (measured, not summed). * lm_head scaled from 1024 rows: 0.0384 ms/row
+
+per stage (ms)
+       stage                 T=1024    T=2048    T=8192
+gdn    input norm             0.071     0.127     0.449
+gdn    in-proj GEMM           1.526     2.635    10.658
+gdn    conv1d_silu            0.404     0.745     2.801
+gdn    gdn chunk prep         0.444     0.680     2.289
+gdn    gdn chunk scan         0.903     1.695     6.196
+gdn    gated_rms_norm         0.121     0.216     0.883
+gdn    out-proj + resid       0.483     0.767     2.904
+attn   qkv+gate GEMM          0.974     1.589     6.799
+attn   qk_norm_rope           0.119     0.235     0.955
+attn   attention              0.962     3.390    48.968
+attn   output gate            0.090     0.209     0.709
+attn   o-proj + resid         0.446     0.775     2.757
+mlp    post-norm              0.069     0.132     0.468
+mlp    gate GEMM              1.039     1.910     7.716
+mlp    up GEMM                1.040     1.946     8.086
+mlp    swiglu -> bf16         0.313     0.547     2.167
+mlp    down + resid           1.145     2.084     8.008
+---- round 3 NEW
+device: Apple M5 Pro
+power: Now drawing from 'AC Power'
+power: -InternalBattery-0 (id=23724131)	85%; AC attached; not charging present: true
+power: powermode            2
+gdn scan: Cols16
+weights: random (seed 0x51)
+weights ready in 2.6 s: Qwen3.5 text: hidden 2048, intermediate 6144, vocab 248320, 24 layers (18 GDN, 6 attention); matrices bf16, norms/conv/gates f32; LM head packed bf16 copy
+T=1024: gate passed (final norm and last-row logits finite and not all zero)
+T=2048: gate passed (final norm and last-row logits finite and not all zero)
+T=8192: gate passed (final norm and last-row logits finite and not all zero)
+METRIC model_forward_ms_t1024 155.368
+METRIC model_forward_ms_t2048 309.106
+METRIC model_forward_ms_t8192 1454.944
+
+Qwen35Model prefill (ms, min / median of 7), async encode. tower = begin + layers + final norm; layers = layers + final norm only; forward_rows = tower + head (last row); prefill = forward_rows + decode state
+     T | tower min    median    layers |   fwd min    median |   prefill |    median | tower tok/s  fwd tok/s  pre tok/s |  launches
+  1024 |    153.08    155.37    151.72 |    154.61    155.86 |    154.36 |    157.06 |       6690       6623       6634 |       284
+  2048 |    305.60    309.11    301.28 |    306.51    309.36 |    305.32 |    306.41 |       6702       6682       6708 |       284
+  8192 |   1443.56   1454.94   1404.12 |   1455.86   1463.66 |   1422.74 |   1450.19 |       5675       5627       5758 |       284
+
+per layer (ms, median of 7, 8 per command buffer, Staged::encode_part). GDN / attention layer = input norm + mixer; MLP = post-norm + MLP
+     T       GDN      attn       MLP |  sum layers  layers min
+  1024     3.350     2.392     3.354 |      155.15      151.72
+  2048     6.499     5.994     6.556 |      310.30      301.28
+  8192    24.265    56.909    25.029 |     1378.93     1404.12
+
+per part (ms)
+       part                              T=1024    T=2048    T=8192
+gdn    input norm                         0.077     0.127     0.441
+gdn    mixer                              3.308     6.565    23.564
+attn   input norm                         0.074     0.702     0.429
+attn   mixer                              2.327     5.949    56.348
+mlp    post norm                          0.067     0.130     0.436
+mlp    MLP (gate, up, swiglu, down)       3.254     6.508    24.084
+== real weights 8192 prefill, iters 9
+gpu util:
+"Device Utilization %"=99
+device: Apple M5 Pro
+power: Now drawing from 'AC Power'
+power: -InternalBattery-0 (id=23724131)	85%; AC attached; not charging present: true
+power: powermode            2
+gdn scan: Cols16
+weights: /Users/bharath/.cache/huggingface/hub/models--Qwen--Qwen3.5-2B/snapshots/15852e8c16360a2fea060d615a32b45270f8a8fc
+weights ready in 3.6 s: Qwen3.5 text: hidden 2048, intermediate 6144, vocab 248320, 24 layers (18 GDN, 6 attention); matrices bf16, norms/conv/gates f32; LM head packed bf16 copy
+T=8192: gate passed (final norm and last-row logits finite and not all zero)
+METRIC model_forward_ms_t8192 1348.000
+
+Qwen35Model prefill (ms, min / median of 9), async encode. tower = begin + layers + final norm; layers = layers + final norm only; forward_rows = tower + head (last row); prefill = forward_rows + decode state
+     T | tower min    median    layers |   fwd min    median |   prefill |    median | tower tok/s  fwd tok/s  pre tok/s |  launches
+  8192 |   1331.34   1348.00   1310.10 |   1307.04   1311.23 |   1298.43 |   1301.34 |       6153       6268       6309 |       284
+
+per layer (ms, median of 7, 8 per command buffer, Staged::encode_part). GDN / attention layer = input norm + mixer; MLP = post-norm + MLP
+     T       GDN      attn       MLP |  sum layers  layers min
+  8192    22.935    53.689    23.442 |     1297.58     1310.10
+
+per part (ms)
+       part                              T=8192
+gdn    input norm                         0.492
+gdn    mixer                             22.515
+attn   input norm                         0.449
+attn   mixer                             53.463
+mlp    post norm                          0.834
+mlp    MLP (gate, up, swiglu, down)      23.135
+== real weights 8192 prefill, Cols32, iters 9
+device: Apple M5 Pro
+power: Now drawing from 'AC Power'
+power: -InternalBattery-0 (id=23724131)	85%; AC attached; not charging present: true
+power: powermode            2
+gdn scan: Cols32
+weights: /Users/bharath/.cache/huggingface/hub/models--Qwen--Qwen3.5-2B/snapshots/15852e8c16360a2fea060d615a32b45270f8a8fc
+weights ready in 4.0 s: Qwen3.5 text: hidden 2048, intermediate 6144, vocab 248320, 24 layers (18 GDN, 6 attention); matrices bf16, norms/conv/gates f32; LM head packed bf16 copy
+T=8192: gate passed (final norm and last-row logits finite and not all zero)
+METRIC model_forward_ms_t8192 1347.937
+
+Qwen35Model prefill (ms, min / median of 9), async encode. tower = begin + layers + final norm; layers = layers + final norm only; forward_rows = tower + head (last row); prefill = forward_rows + decode state
+     T | tower min    median    layers |   fwd min    median |   prefill |    median | tower tok/s  fwd tok/s  pre tok/s |  launches
+  8192 |   1334.44   1347.94   1318.99 |   1317.60   1326.40 |   1323.79 |   1327.02 |       6139       6217       6188 |       284
+
+per layer (ms, median of 7, 8 per command buffer, Staged::encode_part). GDN / attention layer = input norm + mixer; MLP = post-norm + MLP
+     T       GDN      attn       MLP |  sum layers  layers min
+  8192    24.964    54.013    23.441 |     1336.01     1318.99
+
+per part (ms)
+       part                              T=8192
+gdn    input norm                         0.427
+gdn    mixer                             24.646
+attn   input norm                         0.495
+attn   mixer                             53.578
+mlp    post norm                          0.423
+mlp    MLP (gate, up, swiglu, down)      23.017
+== decode random P=4096
+device: Apple M5 Pro
+power: Now drawing from 'AC Power'
+power: -InternalBattery-0 (id=23724131)	85%; AC attached; not charging present: true
+power: powermode            2
+gdn scan: Cols16
+weights: random (seed 0x51)
+weights ready in 2.3 s: Qwen3.5 text: hidden 2048, intermediate 6144, vocab 248320, 24 layers (18 GDN, 6 attention); matrices bf16, norms/conv/gates f32; LM head packed bf16 copy
+prefill P=4096: min 567.69 ms, median 599.53 ms (7215 tok/s at min)
+decode after P=4096: 32 steps min 17.392 ms, median 17.667 ms -> 57.5 tok/s at min, 56.6 at median
+Decode::step per token (4 traced steps): cold allocs 3, host waits 1, commits 1, dispatches 273, wait 17579 us (min)
+METRIC model_prefill_ms_p4096 567.694
+METRIC model_decode_ms_min 17.392
+METRIC model_decode_ms_median 17.667
+METRIC model_decode_toks_per_s 57.50
+METRIC model_decode_cold_allocs_per_token 3
+METRIC model_decode_sync_waits_per_token 1
+METRIC model_decode_commits_per_token 1
+METRIC model_decode_dispatches_per_token 273
+METRIC model_decode_sync_wait_us 17579
+== decode real P=4096
+device: Apple M5 Pro
+power: Now drawing from 'AC Power'
+power: -InternalBattery-0 (id=23724131)	85%; AC attached; not charging present: true
+power: powermode            2
+gdn scan: Cols16
+weights: /Users/bharath/.cache/huggingface/hub/models--Qwen--Qwen3.5-2B/snapshots/15852e8c16360a2fea060d615a32b45270f8a8fc
+weights ready in 3.5 s: Qwen3.5 text: hidden 2048, intermediate 6144, vocab 248320, 24 layers (18 GDN, 6 attention); matrices bf16, norms/conv/gates f32; LM head packed bf16 copy
+prefill P=4096: min 570.03 ms, median 607.91 ms (7186 tok/s at min)
+decode after P=4096: 32 steps min 17.715 ms, median 18.053 ms -> 56.4 tok/s at min, 55.4 at median
+Decode::step per token (4 traced steps): cold allocs 3, host waits 1, commits 1, dispatches 273, wait 17696 us (min)
+METRIC model_prefill_ms_p4096 570.035
+METRIC model_decode_ms_min 17.715
+METRIC model_decode_ms_median 18.053
+METRIC model_decode_toks_per_s 56.45
+METRIC model_decode_cold_allocs_per_token 3
+METRIC model_decode_sync_waits_per_token 1
+METRIC model_decode_commits_per_token 1
+METRIC model_decode_dispatches_per_token 273
+METRIC model_decode_sync_wait_us 17696
+== done
+Wed Oct 14 10:59:06 CDT 2026
+"Device Utilization %"=87
+
+================================================================ t4 (random/REAL 8K interleaved x3, decode)
+== machine state
+Wed Oct 14 10:59:39 CDT 2026
+Now drawing from 'AC Power'
+ -InternalBattery-0 (id=23724131)	85%; AC attached; not charging present: true
+ powermode            2
+10:59  up 2 days, 21:13, 1 user, load averages: 15.69 16.03 16.24
+gpu util x5: "Device Utilization %"=0 "Device Utilization %"=0 "Device Utilization %"=0 "Device Utilization %"=0 "Device Utilization %"=0 
+==== round 1: random 8192
+gpu util x5: "Device Utilization %"=0 "Device Utilization %"=0 "Device Utilization %"=0 "Device Utilization %"=0 "Device Utilization %"=0 
+power: Now drawing from 'AC Power'
+power: -InternalBattery-0 (id=23724131)	85%; AC attached; not charging present: true
+power: powermode            2
+gdn scan: Cols16
+weights: random (seed 0x51)
+weights ready in 1.9 s: Qwen3.5 text: hidden 2048, intermediate 6144, vocab 248320, 24 layers (18 GDN, 6 attention); matrices bf16, norms/conv/gates f32; LM head packed bf16 copy
+T=8192: gate passed (final norm and last-row logits finite and not all zero)
+METRIC model_forward_ms_t8192 1309.880
+  8192 |   1252.54   1309.88   1250.13 |   1243.01   1329.32 |   1242.09 |   1278.84 |       6540       6590       6595 |       284
+  8192    22.320    51.978    23.140 |     1268.98     1250.13
+==== round 1: REAL 8192
+gpu util x5: "Device Utilization %"=82 "Device Utilization %"=0 "Device Utilization %"=0 "Device Utilization %"=0 "Device Utilization %"=0 
+power: Now drawing from 'AC Power'
+power: -InternalBattery-0 (id=23724131)	85%; AC attached; not charging present: true
+power: powermode            2
+gdn scan: Cols16
+weights: /Users/bharath/.cache/huggingface/hub/models--Qwen--Qwen3.5-2B/snapshots/15852e8c16360a2fea060d615a32b45270f8a8fc
+weights ready in 3.0 s: Qwen3.5 text: hidden 2048, intermediate 6144, vocab 248320, 24 layers (18 GDN, 6 attention); matrices bf16, norms/conv/gates f32; LM head packed bf16 copy
+T=8192: gate passed (final norm and last-row logits finite and not all zero)
+METRIC model_forward_ms_t8192 1266.124
+  8192 |   1252.33   1266.12   1251.62 |   1318.51   1331.75 |   1319.51 |   1329.84 |       6541       6213       6208 |       284
+  8192    23.099    54.128    24.097 |     1318.88     1251.62
+==== round 2: random 8192
+gpu util x5: "Device Utilization %"=86 "Device Utilization %"=0 "Device Utilization %"=0 "Device Utilization %"=0 "Device Utilization %"=0 
+power: Now drawing from 'AC Power'
+power: -InternalBattery-0 (id=23724131)	85%; AC attached; not charging present: true
+power: powermode            2
+gdn scan: Cols16
+weights: random (seed 0x51)
+weights ready in 2.3 s: Qwen3.5 text: hidden 2048, intermediate 6144, vocab 248320, 24 layers (18 GDN, 6 attention); matrices bf16, norms/conv/gates f32; LM head packed bf16 copy
+T=8192: gate passed (final norm and last-row logits finite and not all zero)
+METRIC model_forward_ms_t8192 1348.910
+  8192 |   1332.59   1348.91   1326.03 |   1269.68   1309.76 |   1271.60 |   1287.51 |       6147       6452       6442 |       284
+  8192    22.577    52.465    22.006 |     1249.31     1326.03
+==== round 2: REAL 8192
+gpu util x5: "Device Utilization %"=81 "Device Utilization %"=59 "Device Utilization %"=64 "Device Utilization %"=63 "Device Utilization %"=67 
+power: Now drawing from 'AC Power'
+power: -InternalBattery-0 (id=23724131)	85%; AC attached; not charging present: true
+power: powermode            2
+gdn scan: Cols16
+weights: /Users/bharath/.cache/huggingface/hub/models--Qwen--Qwen3.5-2B/snapshots/15852e8c16360a2fea060d615a32b45270f8a8fc
+weights ready in 3.6 s: Qwen3.5 text: hidden 2048, intermediate 6144, vocab 248320, 24 layers (18 GDN, 6 attention); matrices bf16, norms/conv/gates f32; LM head packed bf16 copy
+T=8192: gate passed (final norm and last-row logits finite and not all zero)
+METRIC model_forward_ms_t8192 1369.689
+  8192 |   1331.87   1369.69   1345.66 |   1389.28   1433.20 |   1312.21 |   1345.74 |       6151       5897       6243 |       284
+  8192    24.722    58.136    24.016 |     1370.19     1345.66
+==== round 3: random 8192
+gpu util x5: "Device Utilization %"=98 "Device Utilization %"=32 "Device Utilization %"=27 "Device Utilization %"=16 "Device Utilization %"=27 
+power: Now drawing from 'AC Power'
+power: -InternalBattery-0 (id=23724131)	85%; AC attached; not charging present: true
+power: powermode            2
+gdn scan: Cols16
+weights: random (seed 0x51)
+weights ready in 1.9 s: Qwen3.5 text: hidden 2048, intermediate 6144, vocab 248320, 24 layers (18 GDN, 6 attention); matrices bf16, norms/conv/gates f32; LM head packed bf16 copy
+T=8192: gate passed (final norm and last-row logits finite and not all zero)
+METRIC model_forward_ms_t8192 1538.501
+  8192 |   1283.80   1538.50   1427.11 |   1417.90   1485.77 |   1418.65 |   1481.59 |       6381       5778       5775 |       284
+  8192    27.865    61.018    26.251 |     1497.71     1427.11
+==== round 3: REAL 8192
+gpu util x5: "Device Utilization %"=96 "Device Utilization %"=9 "Device Utilization %"=4 "Device Utilization %"=10 "Device Utilization %"=8 
+power: Now drawing from 'AC Power'
+power: -InternalBattery-0 (id=23724131)	85%; AC attached; not charging present: true
+power: powermode            2
+gdn scan: Cols16
+weights: /Users/bharath/.cache/huggingface/hub/models--Qwen--Qwen3.5-2B/snapshots/15852e8c16360a2fea060d615a32b45270f8a8fc
+weights ready in 3.4 s: Qwen3.5 text: hidden 2048, intermediate 6144, vocab 248320, 24 layers (18 GDN, 6 attention); matrices bf16, norms/conv/gates f32; LM head packed bf16 copy
+T=8192: gate passed (final norm and last-row logits finite and not all zero)
+METRIC model_forward_ms_t8192 1376.875
+  8192 |   1284.30   1376.88   1412.26 |   1350.67   1367.95 |   1347.48 |   1456.50 |       6379       6065       6079 |       284
+  8192    25.844    62.776    27.488 |     1501.57     1412.26
+==== decode random P=4096
+gpu util x5: "Device Utilization %"=99 "Device Utilization %"=17 "Device Utilization %"=9 "Device Utilization %"=10 "Device Utilization %"=10 
+gdn scan: Cols16
+weights: random (seed 0x51)
+weights ready in 2.2 s: Qwen3.5 text: hidden 2048, intermediate 6144, vocab 248320, 24 layers (18 GDN, 6 attention); matrices bf16, norms/conv/gates f32; LM head packed bf16 copy
+prefill P=4096: min 575.60 ms, median 578.58 ms (7116 tok/s at min)
+decode after P=4096: 32 steps min 17.302 ms, median 18.143 ms -> 57.8 tok/s at min, 55.1 at median
+Decode::step per token (4 traced steps): cold allocs 3, host waits 1, commits 1, dispatches 273, wait 17325 us (min)
+METRIC model_prefill_ms_p4096 575.596
+METRIC model_decode_ms_min 17.302
+METRIC model_decode_ms_median 18.143
+METRIC model_decode_toks_per_s 57.80
+METRIC model_decode_cold_allocs_per_token 3
+METRIC model_decode_sync_waits_per_token 1
+METRIC model_decode_commits_per_token 1
+METRIC model_decode_dispatches_per_token 273
+METRIC model_decode_sync_wait_us 17325
+==== decode REAL P=4096
+gpu util x5: "Device Utilization %"=99 "Device Utilization %"=10 "Device Utilization %"=9 "Device Utilization %"=0 "Device Utilization %"=9 
+gdn scan: Cols16
+weights: /Users/bharath/.cache/huggingface/hub/models--Qwen--Qwen3.5-2B/snapshots/15852e8c16360a2fea060d615a32b45270f8a8fc
+weights ready in 3.9 s: Qwen3.5 text: hidden 2048, intermediate 6144, vocab 248320, 24 layers (18 GDN, 6 attention); matrices bf16, norms/conv/gates f32; LM head packed bf16 copy
+prefill P=4096: min 690.11 ms, median 733.20 ms (5935 tok/s at min)
+decode after P=4096: 32 steps min 19.894 ms, median 21.435 ms -> 50.3 tok/s at min, 46.7 at median
+Decode::step per token (4 traced steps): cold allocs 3, host waits 1, commits 1, dispatches 273, wait 20449 us (min)
+METRIC model_prefill_ms_p4096 690.110
+METRIC model_decode_ms_min 19.894
+METRIC model_decode_ms_median 21.435
+METRIC model_decode_toks_per_s 50.27
+METRIC model_decode_cold_allocs_per_token 3
+METRIC model_decode_sync_waits_per_token 1
+METRIC model_decode_commits_per_token 1
+METRIC model_decode_dispatches_per_token 273
+METRIC model_decode_sync_wait_us 20449
+== done
+Wed Oct 14 11:09:06 CDT 2026
+gpu util x5: "Device Utilization %"=96 "Device Utilization %"=44 "Device Utilization %"=38 "Device Utilization %"=41 "Device Utilization %"=42 

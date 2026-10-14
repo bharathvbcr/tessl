@@ -260,3 +260,23 @@ fn a_metallib_outside_the_scratch_out_dir_is_rejected() {
     assert!(!String::from_utf8_lossy(&out.stdout).contains("METRIC"));
     assert!(String::from_utf8_lossy(&out.stderr).contains("not under the scratch OUT_DIR"));
 }
+
+#[test]
+fn only_exact_dot_metal_names_count_as_sources() {
+    // `.metal.bak` and a nested source are not top-level kernels.
+    let d = scratch("names");
+    let m = manifest_with(&d, 3);
+    fs::write(m.join("kernels/k0.metal.bak"), "").unwrap();
+    fs::write(m.join("kernels/notes.txt"), "").unwrap();
+    let out = run(&fake_bs(&d, 3, 0, false, 0), &m);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+}
+
+#[test]
+fn a_missing_kernels_dir_with_a_valid_build_is_a_usage_error() {
+    let d = scratch("nokern");
+    let m = d.join("m");
+    fs::create_dir_all(&m).unwrap();
+    let out = run(&fake_bs(&d, 3, 0, false, 0), &m);
+    assert_eq!(out.status.code(), Some(2));
+}

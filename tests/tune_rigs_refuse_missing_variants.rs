@@ -53,7 +53,7 @@ fn assert_refuses(bin: &str, exe: &str) {
 fn tuning_binaries_exit_2_without_the_tune_kernels() {
     if tune_kernels_linked() {
         // A TESSL_GEMM_TUNE=1 build: the refusal has nothing to refuse.
-        eprintln!("tune kernels are linked in this build; the missing-variant refusal is not reachable");
+        eprintln!("SKIPPED: tune kernels are linked in this build; the missing-variant refusal is not reachable");
         return;
     }
     assert_refuses("bench_gemm_tnnt_tune", env!("CARGO_BIN_EXE_bench_gemm_tnnt_tune"));

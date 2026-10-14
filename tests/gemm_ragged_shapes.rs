@@ -327,9 +327,10 @@ fn parallel_tn_partitions_cover_all_of_k() {
 #[test]
 fn parallel_bf16_tn_partitions_cover_all_of_k() {
     with_gpu(|rt| {
-        if !rt.has_tensorops() {
-            return;
-        }
+        assert!(
+            rt.has_tensorops(),
+            "requires the TensorOps metallib: build.rs refuses a metallib without it, so a runtime lacking it is a broken build, not a skip"
+        );
         let check = |m: usize, n: usize, k: usize, k_tile: usize| {
             let (a_host, b_host, _) = rank_one_b_case_tn(m, n, k, 0xb16a ^ (m * n + k) as u64);
             let (a_host, b_host) = (round_trip_bf16(&a_host), round_trip_bf16(&b_host));

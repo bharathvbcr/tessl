@@ -3829,3 +3829,67 @@ fn attn_prefill_rejects_a_window_and_bad_storage() {
         );
     });
 }
+
+/// `GdnWorkspace::set_scan_slice` repoints a workspace that is already built:
+/// the default workspace runs the 16-column scan, `Cols32` after the setter
+/// runs the 32-column one, and setting back returns to 16. Both give the same
+/// bits (the arithmetic per element is identical), so only the kernel trace
+/// tells the setter worked, which is why this runs in a traced child.
+#[test]
+fn set_scan_slice_selects_the_scan_kernel_of_an_existing_workspace() {
+    common::in_traced_child(
+        "set_scan_slice_selects_the_scan_kernel_of_an_existing_workspace",
+        || {
+            use tessl::runtime::traced_kernel_count;
+            const WIDE: &str = "qwen35_gdn_chunk_scan";
+            const NARROW: &str = "qwen35_gdn_chunk_scan_bv16";
+            with_gpu(|rt| {
+                let d = GdnData::fixture();
+                let dims = dims_of(d.s);
+                let p = Packed::new(rt, &d);
+                let width = d.s.hv * d.s.dv;
+                let mut ws = GdnWorkspace::new(rt, &dims).unwrap();
+                assert_eq!(GdnScanSlice::default(), GdnScanSlice::Cols16);
+                let run = |ws: &GdnWorkspace| -> (u64, u64, Vec<u32>) {
+                    let out = seeded(rt, d.s.b * d.s.t * width, f32::NAN);
+                    let (w0, n0) = (traced_kernel_count(WIDE), traced_kernel_count(NARROW));
+                    qwen35::gdn_chunk_forward(
+                        rt,
+                        &dims,
+                        &p.qkv(),
+                        &p.gates(dims.v_heads),
+                        &p.params(),
+                        StateIn::Zero,
+                        ws,
+                        Cols::dense(&out, width as u32),
+                        None,
+                    )
+                    .unwrap();
+                    rt.synchronize().unwrap();
+                    let bits = out.read_f32().iter().map(|x| x.to_bits()).collect();
+                    (traced_kernel_count(WIDE) - w0, traced_kernel_count(NARROW) - n0, bits)
+                };
+                let (w, n, base) = run(&ws);
+                assert_eq!((w, n), (0, 1), "a fresh workspace runs the 16-column scan");
+                assert!(
+                    base.iter().all(|b| f32::from_bits(*b).is_finite()),
+                    "scan wrote nothing"
+                );
+
+                ws.set_scan_slice(GdnScanSlice::Cols32);
+                let (w, n, wide) = run(&ws);
+                assert_eq!((w, n), (1, 0), "set_scan_slice(Cols32) must run the 32-column scan");
+                assert_eq!(wide, base, "the two slices must agree bit for bit");
+
+                ws.set_scan_slice(GdnScanSlice::Cols16);
+                let (w, n, narrow) = run(&ws);
+                assert_eq!(
+                    (w, n),
+                    (0, 1),
+                    "set_scan_slice(Cols16) must return to the 16-column scan"
+                );
+                assert_eq!(narrow, base);
+            });
+        },
+    );
+}

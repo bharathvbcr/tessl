@@ -1,7 +1,7 @@
 //! Every kernel promoted out of `gemma-metal` must live in tessl's *own*
 //! metallib.
 //!
-//! These 44 entry points were compiled into gemma-metal's overlay metallib and
+//! These entry points were compiled into gemma-metal's overlay metallib and
 //! reached only through `GpuRuntime::add_metallib`. They are model-agnostic —
 //! RMSNorm, GELU/SiLU gating, flash attention, quantized GEMV/GEMM, KV cache
 //! stores, embedding lookup, sampling — so they belong to the kernel library,
@@ -116,19 +116,84 @@ fn the_promoted_list_has_no_duplicates() {
     assert_eq!(before, sorted.len(), "duplicate entry in PROMOTED");
 }
 
+/// The `.metal` sources the promotion moved into this crate. "Promoted" is
+/// defined by these files: every `kernel void` entry point in them.
+const PROMOTED_SOURCES: &[&str] = &[
+    "rms_norm",
+    "mlp_silu",
+    "mlp_gelu_tanh",
+    "flash_attn_swa_h128",
+    "flash_attn_swa_h256",
+    "flash_attn_global_h512",
+    "rms_qkv_rope",
+    "kv_store",
+    "gemv_q4",
+    "gemv_q8",
+    "gemv_q4_mlx",
+    "gemm_q4_mlx",
+    "embed_lookup",
+    "softcap_sample",
+];
+
+/// Entry-point names declared by `kernel void <name>(` at the start of a line.
+fn kernel_entry_points(source: &str) -> Vec<String> {
+    source
+        .lines()
+        .filter_map(|l| l.strip_prefix("kernel void "))
+        .map(|rest| {
+            rest.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                .next()
+                .unwrap_or("")
+                .to_string()
+        })
+        .collect()
+}
+
+/// `PROMOTED` is the entry-point set of `PROMOTED_SOURCES`, as a relation: no
+/// kernel added to a promoted source goes unlisted (and so untested), and no
+/// listed name has left its source. The count is whatever the sources hold.
 #[test]
-fn promoted_count_matches_the_kernel_sources() {
-    // Guards the other direction: a kernel added to one of the promoted
-    // `.metal` files without being listed here ships untested. The number is
-    // the count of `kernel void` entry points across the 14 promoted sources.
+fn promoted_list_matches_the_kernel_sources() {
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("kernels");
+    let mut from_sources = std::collections::BTreeSet::new();
+    let mut declared = 0usize;
+    for stem in PROMOTED_SOURCES {
+        let path = dir.join(format!("{stem}.metal"));
+        let text = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+        let names = kernel_entry_points(&text);
+        assert!(
+            !names.is_empty(),
+            "{} declares no `kernel void` entry point",
+            path.display()
+        );
+        declared += names.len();
+        from_sources.extend(names);
+    }
     assert_eq!(
-        PROMOTED.len(),
-        44,
-        "PROMOTED drifted from the 44 entry points in the promoted .metal sources; \
-         re-run: grep -hc '^kernel void' kernels/{{rms_norm,mlp_silu,mlp_gelu_tanh,\
-flash_attn_swa_h128,flash_attn_swa_h256,flash_attn_global_h512,rms_qkv_rope,kv_store,\
-gemv_q4,gemv_q8,gemv_q4_mlx,gemm_q4_mlx,embed_lookup,softcap_sample}}.metal"
+        declared,
+        from_sources.len(),
+        "an entry point name is declared twice across the promoted sources"
     );
+    let listed: std::collections::BTreeSet<String> = PROMOTED.iter().map(|s| s.to_string()).collect();
+    let unlisted: Vec<_> = from_sources.difference(&listed).collect();
+    let stale: Vec<_> = listed.difference(&from_sources).collect();
+    assert!(
+        unlisted.is_empty() && stale.is_empty(),
+        "PROMOTED drifted from the promoted .metal sources ({} listed, {} in sources): \
+         in sources but not listed {unlisted:?}; listed but not in sources {stale:?}",
+        listed.len(),
+        from_sources.len()
+    );
+}
+
+/// The parser must see a fault: an entry point it fails to read would let the
+/// relation above pass vacuously.
+#[test]
+fn the_entry_point_parser_reads_declarations() {
+    let names = kernel_entry_points(
+        "// kernel void commented\nkernel void a_1(\n  x)\n  kernel void indented(\nkernel void b(",
+    );
+    assert_eq!(names, ["a_1", "b"]);
 }
 
 /// Kernels deliberately **left** in `gemma-metal`, and why.

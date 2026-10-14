@@ -1,0 +1,535 @@
+# Qwen3.5-2B clipped optimizer step at T = 2048, wave 2 AFTER paired with BEFORE — M5 Pro, 2026-10-14
+#
+# Closes the one measurement bench/results/qwen35_train_step_wave2_m5pro.txt
+# lacks (acceptance criterion 8): its clipped-step section ran T = 256 only.
+# That file is untouched; this one carries the T = 2048 rows beside it.
+#
+# before = bench_qwen35_train frozen at d57f4f7 (main de4747a + the
+# --storage=bf16 flag; no library change); after = built at c5fd930 (the
+# wave-2 head: 04faf93 bf16-lane cross-entropy workspace, 337fedd grad_sq_norm
+# in one command buffer, 628f113 bf16 bank head gradient by chunk, d4b73c1,
+# b8d4010, c5fd930). Both are ancestors of 0055612 (git merge-base
+# --is-ancestor), the tree this file was produced from; the binaries were
+# built with `cargo build --release --bin bench_qwen35_train` at each commit.
+# Checkpoint: Qwen/Qwen3.5-2B (the instruct release; the -Base snapshot here
+# has no weights), as in the wave-2 file.
+#
+# Command per run (TESSL_MID_COMMIT and METAL_RUNTIME_MID_COMMIT unset via env -u):
+#   /usr/bin/time -l BIN 2048 --step-only --clip=2048 --storage=bf16 [--async]
+# 3 rounds, before/after order alternating each round (before,after in round
+# 0 and 2; after,before in round 1), over {sync, async}; the timed set is
+# preceded by one sync probe per binary (kept below, labelled P, excluded from
+# the summary). Run as one locked job:
+#   MAC_HEAVY_MAX_LOAD=60 bash Lappi-decision/tools/mac_heavy.sh tessl-bl-trainwaste clip2048.sh
+# A shell interleave is used, not bench_paired / bench/paired_qwen35_step.sh:
+# the script always passes --step=N and parses only `train_step,` lines (it
+# would ignore the clip output), and bench_paired needs a JSON last line
+# (workload, ms_min) that bench_qwen35_train does not print. Adding that is a
+# harness change outside this bench-only card.
+#
+# Conditions: AC power on every run (pmset); 1-minute load average 8.4-17.7 at
+# run start (logged per run); no other bench_/qwen35_ process by name at any
+# run start (the `peers:` lines). The `gpu:` lines report IOAccelerator
+# Device Utilization of 83-95 % at each run start; that reading is taken
+# seconds after the previous run's exit and includes it, and I could not tell
+# it from another tenant's load. The lock was held by this job throughout the
+# timed set. Treat the absolute milliseconds as carrying that caveat; the
+# before/after pairs ran back to back inside each round.
+#
+# f32 storage clipped step: not measurable within memguard's 32 GiB per-process cap (f32 bank + f32 moments beside the model, ~37 GB); not run.
+#
+# Expected-shape check (grad_sq_norm goes from 320 to 1 wait under sync): HOLDS.
+# Every sync run: grad_sq_norm 320 waits (before) -> 1 wait (after); total
+# waits 2392 -> 2104. Async: 16 -> 16 on both (as at T = 256).
+#
+# Findings (min over 3 rounds of each run's median of 3 steps; max in the table):
+# - sync:  total 3257 ms -> 2975 ms (-8.7 %). grad_sq_norm 589.2 -> 20.7 ms
+#   (the table's minima over the 3 timed rounds; the probe run, 20.3 ms, is excluded)
+#   (320 dispatches/waits -> 2 dispatches/1 wait). Peak footprint 22.65 ->
+#   20.59 GB (-2.1 GB).
+# - async: total 3118 ms -> 2636 ms (-15.5 %). grad_sq_norm 556 -> 23 ms.
+#   Peak footprint 25.05 -> 23.05 GB (-2.0 GB).
+# - train_step_into is NOT faster: sync 2461 -> 2684 ms (min), async 2334 ->
+#   2383 ms (min); its waits rise 2070 -> 2101 (31 head-by-chunk dispatches,
+#   as in the wave-2 file). The sync train_step_into difference is within the
+#   before binary's own spread (2461-3118 ms) and was not isolated here; the
+#   clipped total, which includes it, is the comparison. The ranges overlap
+#   (before 2461-3118, after 2684-2968), so the slowdown is neither shown to be
+#   real nor shown to be noise. Under sync the
+#   total's win is the grad_sq_norm phase; do not read the total as a
+#   train_step speedup (the wave-2 file's unclipped T = 2048 bf16 step shows
+#   2.583 -> 2.563 s sync, unchanged within noise).
+# - adamw_step: 220 -> 241 ms sync, 224 -> 219 ms async (min); code unchanged,
+#   see the settling-cost note in the wave-2 file.
+# - Regression gate (after slower or waits not lower): not triggered. After's
+#   min total is lower in both modes and sync waits are lower; async waits
+#   are equal (16 = 16), which is the expected shape.
+# - Spread is large (before/sync total 3257-4023 ms, after/sync 2975-3267 ms)
+#   with 3 rounds; the min is the comparison. The sync total gap is 282.6 ms
+#   (3257.2 - 2974.6). From the column minima: grad_sq_norm removed 568.5 ms
+#   (589.2 - 20.7), train_step_into +222.8 ms (2683.7 - 2460.9), adamw_step
+#   +21.6 ms (241.2 - 219.6), net 324.1 ms. That is not 282.6 because each
+#   column is an independent minimum (see the summary note), so the columns
+#   do not sum to the total; the total's own 282.6 is the figure to cite.
+#
+# ---- summary: 3 rounds, each a median of 3 steps; min over rounds (max beside total) ----
+# Each column is an INDEPENDENT minimum over the 3 timed rounds, so a row's
+# phase columns come from different runs and do not sum to its total: after/sync
+# total 2974.6 is one run (grad_sq 21.5, train 2683.7), while its grad_sq 20.7 is
+# from another run whose total is 3018.6. Compare columns across rows, not within a row.
+# (ms; footprint in GB; waits are the total of the clipped step)
+# config                      total     (max)     train   grad_sq     adamw    fp GB  waits total (train/gsn/adamw)
+# before/sync    min    3257.2    4023.2    2460.9     589.2     219.6    22.65  2392
+# after/sync     min    2974.6    3267.0    2683.7      20.7     241.2    20.59  2104
+# before/async   min    3117.8    3771.0    2333.7     556.3     224.4    25.05  16
+# after/async    min    2635.9    3142.5    2382.6      22.8     219.2    23.05  16
+#
+# ---- raw output of every run (probe runs P first, then rounds 0-2) ----
+# ---- clip round P, probe-before, T = 2048 sync, bf16 storage (10:42:45, load { 9.96 12.82 18.93 }) ----
+# power: Now drawing from 'AC Power'
+# gpu: Device Utilization %"=90
+# peers: 0
+device: Apple M5 Pro
+T = 2048: gate passed (12 ops wrote finite outputs)
+storage: bf16 (steps into a bf16 bank); operands: Bf16
+encode: every dispatch waited; TESSL_MID_COMMIT=unset
+clipped optimizer step, T = 2048 (median of 3; waits from the last run):
+  train_step_into      2809.2 ms, 2070 waits (2.500 s blocked), 2070 commits, 2070 dispatches, 1289 cold allocations, 0 host-zeroed (0.00 GB)
+  grad_sq_norm          618.1 ms, 320 waits (0.609 s blocked), 320 commits, 320 dispatches, 1 cold allocations, 0 host-zeroed (0.00 GB)
+  adamw_step            225.8 ms, 2 waits (0.216 s blocked), 2 commits, 2 dispatches, 2 cold allocations, 0 host-zeroed (0.00 GB)
+  total                3652.7 ms, 2392 waits
+       22.70 real         4.28 user         4.11 sys
+         15388065792  maximum resident set size
+                   0  average shared memory size
+                   0  average unshared data size
+                   0  average unshared stack size
+             1294916  page reclaims
+                  16  page faults
+                   0  swaps
+                   0  block input operations
+                   0  block output operations
+                   0  messages sent
+                   0  messages received
+                   0  signals received
+                  96  voluntary context switches
+               72603  involuntary context switches
+         53513508295  instructions retired
+         34419198481  cycles elapsed
+         22656579624  peak memory footprint
+# exit: 0
+# ---- clip round P, probe-after, T = 2048 sync, bf16 storage (10:43:08, load { 9.89 12.62 18.71 }) ----
+# power: Now drawing from 'AC Power'
+# gpu: Device Utilization %"=88
+# peers: 0
+device: Apple M5 Pro
+T = 2048: gate passed (12 ops wrote finite outputs)
+storage: bf16 (steps into a bf16 bank); operands: Bf16
+encode: every dispatch waited; TESSL_MID_COMMIT=unset
+clipped optimizer step, T = 2048 (median of 3; waits from the last run):
+  train_step_into      2766.0 ms, 2101 waits (2.557 s blocked), 2101 commits, 2101 dispatches, 1290 cold allocations, 0 host-zeroed (0.00 GB)
+  grad_sq_norm           20.3 ms, 1 waits (0.020 s blocked), 1 commits, 2 dispatches, 3 cold allocations, 0 host-zeroed (0.00 GB)
+  adamw_step            250.5 ms, 2 waits (0.250 s blocked), 2 commits, 2 dispatches, 2 cold allocations, 0 host-zeroed (0.00 GB)
+  total                3067.9 ms, 2104 waits
+       17.92 real         4.15 user         2.30 sys
+         19094437888  maximum resident set size
+                   0  average shared memory size
+                   0  average unshared data size
+                   0  average unshared stack size
+             1352172  page reclaims
+                   3  page faults
+                   0  swaps
+                   0  block input operations
+                   0  block output operations
+                   0  messages sent
+                   0  messages received
+                   0  signals received
+                   5  voluntary context switches
+               47002  involuntary context switches
+         45134305965  instructions retired
+         26216099197  cycles elapsed
+         20585232472  peak memory footprint
+# exit: 0
+# ---- clip round 0, before, T = 2048 sync, bf16 storage (10:43:26, load { 9.83 12.44 18.51 }) ----
+# power: Now drawing from 'AC Power'
+# gpu: Device Utilization %"=89
+# peers: 0
+device: Apple M5 Pro
+T = 2048: gate passed (12 ops wrote finite outputs)
+storage: bf16 (steps into a bf16 bank); operands: Bf16
+encode: every dispatch waited; TESSL_MID_COMMIT=unset
+clipped optimizer step, T = 2048 (median of 3; waits from the last run):
+  train_step_into      2460.9 ms, 2070 waits (2.309 s blocked), 2070 commits, 2070 dispatches, 1289 cold allocations, 0 host-zeroed (0.00 GB)
+  grad_sq_norm          589.2 ms, 320 waits (0.568 s blocked), 320 commits, 320 dispatches, 1 cold allocations, 0 host-zeroed (0.00 GB)
+  adamw_step            219.6 ms, 2 waits (0.215 s blocked), 2 commits, 2 dispatches, 2 cold allocations, 0 host-zeroed (0.00 GB)
+  total                3257.2 ms, 2392 waits
+       18.53 real         3.78 user         2.33 sys
+         19047809024  maximum resident set size
+                   0  average shared memory size
+                   0  average unshared data size
+                   0  average unshared stack size
+             1290325  page reclaims
+                   1  page faults
+                   0  swaps
+                   0  block input operations
+                   0  block output operations
+                   0  messages sent
+                   0  messages received
+                   0  signals received
+                   0  voluntary context switches
+               51596  involuntary context switches
+         47492727474  instructions retired
+         25333021984  cycles elapsed
+         22653794344  peak memory footprint
+# exit: 0
+# ---- clip round 0, after, T = 2048 sync, bf16 storage (10:43:45, load { 8.42 11.95 18.19 }) ----
+# power: Now drawing from 'AC Power'
+# gpu: Device Utilization %"=89
+# peers: 0
+device: Apple M5 Pro
+T = 2048: gate passed (12 ops wrote finite outputs)
+storage: bf16 (steps into a bf16 bank); operands: Bf16
+encode: every dispatch waited; TESSL_MID_COMMIT=unset
+clipped optimizer step, T = 2048 (median of 3; waits from the last run):
+  train_step_into      2683.7 ms, 2101 waits (2.709 s blocked), 2101 commits, 2101 dispatches, 1290 cold allocations, 0 host-zeroed (0.00 GB)
+  grad_sq_norm           21.5 ms, 1 waits (0.021 s blocked), 1 commits, 2 dispatches, 3 cold allocations, 0 host-zeroed (0.00 GB)
+  adamw_step            250.8 ms, 2 waits (0.251 s blocked), 2 commits, 2 dispatches, 2 cold allocations, 0 host-zeroed (0.00 GB)
+  total                2974.6 ms, 2104 waits
+       17.43 real         4.17 user         2.43 sys
+         19094568960  maximum resident set size
+                   0  average shared memory size
+                   0  average unshared data size
+                   0  average unshared stack size
+             1352181  page reclaims
+                   1  page faults
+                   0  swaps
+                   0  block input operations
+                   0  block output operations
+                   0  messages sent
+                   0  messages received
+                   0  signals received
+                   0  voluntary context switches
+               48125  involuntary context switches
+         45358215087  instructions retired
+         27157132565  cycles elapsed
+         20585347136  peak memory footprint
+# exit: 0
+# ---- clip round 0, before, T = 2048 async, bf16 storage (10:44:02, load { 8.44 11.77 18.02 }) ----
+# power: Now drawing from 'AC Power'
+# gpu: Device Utilization %"=90
+# peers: 0
+device: Apple M5 Pro
+T = 2048: gate passed (12 ops wrote finite outputs)
+storage: bf16 (steps into a bf16 bank); operands: Bf16
+encode: async (--async); TESSL_MID_COMMIT=unset
+clipped optimizer step, T = 2048 (median of 3; waits from the last run):
+  train_step_into      2935.7 ms, 14 waits (2.567 s blocked), 14 commits, 2070 dispatches, 1289 cold allocations, 0 host-zeroed (0.00 GB)
+  grad_sq_norm          569.0 ms, 1 waits (0.567 s blocked), 1 commits, 320 dispatches, 1 cold allocations, 0 host-zeroed (0.00 GB)
+  adamw_step            274.8 ms, 1 waits (0.233 s blocked), 1 commits, 2 dispatches, 2 cold allocations, 0 host-zeroed (0.00 GB)
+  total                3771.0 ms, 16 waits
+       21.19 real         3.84 user         3.44 sys
+         19043811328  maximum resident set size
+                   0  average shared memory size
+                   0  average unshared data size
+                   0  average unshared stack size
+             1290737  page reclaims
+                   1  page faults
+                   0  swaps
+                   0  block input operations
+                   0  block output operations
+                   0  messages sent
+                   0  messages received
+                   0  signals received
+                   2  voluntary context switches
+               23744  involuntary context switches
+         53355170708  instructions retired
+         28257863863  cycles elapsed
+         25053738664  peak memory footprint
+# exit: 0
+# ---- clip round 0, after, T = 2048 async, bf16 storage (10:44:23, load { 12.21 12.38 18.06 }) ----
+# power: Now drawing from 'AC Power'
+# gpu: Device Utilization %"=95
+# peers: 0
+device: Apple M5 Pro
+T = 2048: gate passed (12 ops wrote finite outputs)
+storage: bf16 (steps into a bf16 bank); operands: Bf16
+encode: async (--async); TESSL_MID_COMMIT=unset
+clipped optimizer step, T = 2048 (median of 3; waits from the last run):
+  train_step_into      2839.9 ms, 14 waits (2.605 s blocked), 14 commits, 2101 dispatches, 1290 cold allocations, 0 host-zeroed (0.00 GB)
+  grad_sq_norm           26.7 ms, 1 waits (0.023 s blocked), 1 commits, 2 dispatches, 3 cold allocations, 0 host-zeroed (0.00 GB)
+  adamw_step            274.0 ms, 1 waits (0.271 s blocked), 1 commits, 2 dispatches, 2 cold allocations, 0 host-zeroed (0.00 GB)
+  total                3142.5 ms, 16 waits
+       17.78 real         3.88 user         2.90 sys
+         19094437888  maximum resident set size
+                   0  average shared memory size
+                   0  average unshared data size
+                   0  average unshared stack size
+             1352019  page reclaims
+                 182  page faults
+                   0  swaps
+                   0  block input operations
+                   0  block output operations
+                   0  messages sent
+                   0  messages received
+                   0  signals received
+                   0  voluntary context switches
+               16467  involuntary context switches
+         53305122943  instructions retired
+         27608969851  cycles elapsed
+         23053809536  peak memory footprint
+# exit: 0
+# ---- clip round 1, after, T = 2048 sync, bf16 storage (10:44:41, load { 11.66 12.25 17.91 }) ----
+# power: Now drawing from 'AC Power'
+# gpu: Device Utilization %"=93
+# peers: 0
+device: Apple M5 Pro
+T = 2048: gate passed (12 ops wrote finite outputs)
+storage: bf16 (steps into a bf16 bank); operands: Bf16
+encode: every dispatch waited; TESSL_MID_COMMIT=unset
+clipped optimizer step, T = 2048 (median of 3; waits from the last run):
+  train_step_into      2760.3 ms, 2101 waits (2.591 s blocked), 2101 commits, 2101 dispatches, 1290 cold allocations, 0 host-zeroed (0.00 GB)
+  grad_sq_norm           20.7 ms, 1 waits (0.020 s blocked), 1 commits, 2 dispatches, 3 cold allocations, 0 host-zeroed (0.00 GB)
+  adamw_step            241.2 ms, 2 waits (0.238 s blocked), 2 commits, 2 dispatches, 2 cold allocations, 0 host-zeroed (0.00 GB)
+  total                3018.6 ms, 2104 waits
+       18.40 real         4.46 user         2.81 sys
+         19094978560  maximum resident set size
+                   0  average shared memory size
+                   0  average unshared data size
+                   0  average unshared stack size
+             1352215  page reclaims
+                   1  page faults
+                   0  swaps
+                   0  block input operations
+                   0  block output operations
+                   0  messages sent
+                   0  messages received
+                   0  signals received
+                   2  voluntary context switches
+               57065  involuntary context switches
+         44983020982  instructions retired
+         29717875222  cycles elapsed
+         20585773144  peak memory footprint
+# exit: 0
+# ---- clip round 1, before, T = 2048 sync, bf16 storage (10:45:00, load { 10.87 12.04 17.70 }) ----
+# power: Now drawing from 'AC Power'
+# gpu: Device Utilization %"=85
+# peers: 0
+device: Apple M5 Pro
+T = 2048: gate passed (12 ops wrote finite outputs)
+storage: bf16 (steps into a bf16 bank); operands: Bf16
+encode: every dispatch waited; TESSL_MID_COMMIT=unset
+clipped optimizer step, T = 2048 (median of 3; waits from the last run):
+  train_step_into      3117.7 ms, 2070 waits (2.885 s blocked), 2070 commits, 2070 dispatches, 1289 cold allocations, 0 host-zeroed (0.00 GB)
+  grad_sq_norm          639.8 ms, 320 waits (0.635 s blocked), 320 commits, 320 dispatches, 1 cold allocations, 0 host-zeroed (0.00 GB)
+  adamw_step            265.8 ms, 2 waits (0.265 s blocked), 2 commits, 2 dispatches, 2 cold allocations, 0 host-zeroed (0.00 GB)
+  total                4023.2 ms, 2392 waits
+       21.44 real         4.50 user         3.10 sys
+         19050201088  maximum resident set size
+                   0  average shared memory size
+                   0  average unshared data size
+                   0  average unshared stack size
+             1290468  page reclaims
+                   1  page faults
+                   0  swaps
+                   0  block input operations
+                   0  block output operations
+                   0  messages sent
+                   0  messages received
+                   0  signals received
+                   1  voluntary context switches
+               54238  involuntary context switches
+         47203381653  instructions retired
+         30542235812  cycles elapsed
+         22655547408  peak memory footprint
+# exit: 0
+# ---- clip round 1, after, T = 2048 async, bf16 storage (10:45:21, load { 10.76 11.94 17.53 }) ----
+# power: Now drawing from 'AC Power'
+# gpu: Device Utilization %"=92
+# peers: 0
+device: Apple M5 Pro
+T = 2048: gate passed (12 ops wrote finite outputs)
+storage: bf16 (steps into a bf16 bank); operands: Bf16
+encode: async (--async); TESSL_MID_COMMIT=unset
+clipped optimizer step, T = 2048 (median of 3; waits from the last run):
+  train_step_into      2508.3 ms, 14 waits (2.096 s blocked), 14 commits, 2101 dispatches, 1290 cold allocations, 0 host-zeroed (0.00 GB)
+  grad_sq_norm           23.5 ms, 1 waits (0.019 s blocked), 1 commits, 2 dispatches, 3 cold allocations, 0 host-zeroed (0.00 GB)
+  adamw_step            219.2 ms, 1 waits (0.217 s blocked), 1 commits, 2 dispatches, 2 cold allocations, 0 host-zeroed (0.00 GB)
+  total                2751.0 ms, 16 waits
+       17.45 real         3.94 user         3.19 sys
+         19094634496  maximum resident set size
+                   0  average shared memory size
+                   0  average unshared data size
+                   0  average unshared stack size
+             1352038  page reclaims
+                 184  page faults
+                   0  swaps
+                   0  block input operations
+                   0  block output operations
+                   0  messages sent
+                   0  messages received
+                   0  signals received
+                  34  voluntary context switches
+               36674  involuntary context switches
+         54707345685  instructions retired
+         29549782395  cycles elapsed
+         23060641688  peak memory footprint
+# exit: 0
+# ---- clip round 1, before, T = 2048 async, bf16 storage (10:45:39, load { 9.55 11.58 17.28 }) ----
+# power: Now drawing from 'AC Power'
+# gpu: Device Utilization %"=89
+# peers: 0
+device: Apple M5 Pro
+T = 2048: gate passed (12 ops wrote finite outputs)
+storage: bf16 (steps into a bf16 bank); operands: Bf16
+encode: async (--async); TESSL_MID_COMMIT=unset
+clipped optimizer step, T = 2048 (median of 3; waits from the last run):
+  train_step_into      2837.7 ms, 14 waits (2.323 s blocked), 14 commits, 2070 dispatches, 1289 cold allocations, 0 host-zeroed (0.00 GB)
+  grad_sq_norm          565.5 ms, 1 waits (0.555 s blocked), 1 commits, 320 dispatches, 1 cold allocations, 0 host-zeroed (0.00 GB)
+  adamw_step            231.4 ms, 1 waits (0.221 s blocked), 1 commits, 2 dispatches, 2 cold allocations, 0 host-zeroed (0.00 GB)
+  total                3627.3 ms, 16 waits
+       20.98 real         3.79 user         3.15 sys
+         19043352576  maximum resident set size
+                   0  average shared memory size
+                   0  average unshared data size
+                   0  average unshared stack size
+             1290612  page reclaims
+                 183  page faults
+                   0  swaps
+                   0  block input operations
+                   0  block output operations
+                   0  messages sent
+                   0  messages received
+                   0  signals received
+                  17  voluntary context switches
+               33909  involuntary context switches
+         53120997636  instructions retired
+         28338113531  cycles elapsed
+         25051592360  peak memory footprint
+# exit: 0
+# ---- clip round 2, before, T = 2048 sync, bf16 storage (10:46:00, load { 17.67 13.19 17.71 }) ----
+# power: Now drawing from 'AC Power'
+# gpu: Device Utilization %"=93
+# peers: 0
+device: Apple M5 Pro
+T = 2048: gate passed (12 ops wrote finite outputs)
+storage: bf16 (steps into a bf16 bank); operands: Bf16
+encode: every dispatch waited; TESSL_MID_COMMIT=unset
+clipped optimizer step, T = 2048 (median of 3; waits from the last run):
+  train_step_into      2772.3 ms, 2070 waits (2.552 s blocked), 2070 commits, 2070 dispatches, 1289 cold allocations, 0 host-zeroed (0.00 GB)
+  grad_sq_norm          635.7 ms, 320 waits (0.624 s blocked), 320 commits, 320 dispatches, 1 cold allocations, 0 host-zeroed (0.00 GB)
+  adamw_step            223.0 ms, 2 waits (0.217 s blocked), 2 commits, 2 dispatches, 2 cold allocations, 0 host-zeroed (0.00 GB)
+  total                3633.2 ms, 2392 waits
+       28.71 real         4.53 user         3.50 sys
+         19043958784  maximum resident set size
+                   0  average shared memory size
+                   0  average unshared data size
+                   0  average unshared stack size
+             1290572  page reclaims
+                   9  page faults
+                   0  swaps
+                   0  block input operations
+                   0  block output operations
+                   0  messages sent
+                   0  messages received
+                   0  signals received
+                  88  voluntary context switches
+               52212  involuntary context switches
+         48597766118  instructions retired
+         33121653447  cycles elapsed
+         22656006208  peak memory footprint
+# exit: 0
+# ---- clip round 2, after, T = 2048 sync, bf16 storage (10:46:29, load { 16.53 13.40 17.63 }) ----
+# power: Now drawing from 'AC Power'
+# gpu: Device Utilization %"=83
+# peers: 0
+device: Apple M5 Pro
+T = 2048: gate passed (12 ops wrote finite outputs)
+storage: bf16 (steps into a bf16 bank); operands: Bf16
+encode: every dispatch waited; TESSL_MID_COMMIT=unset
+clipped optimizer step, T = 2048 (median of 3; waits from the last run):
+  train_step_into      2968.1 ms, 2101 waits (2.679 s blocked), 2101 commits, 2101 dispatches, 1290 cold allocations, 0 host-zeroed (0.00 GB)
+  grad_sq_norm           24.8 ms, 1 waits (0.020 s blocked), 1 commits, 2 dispatches, 3 cold allocations, 0 host-zeroed (0.00 GB)
+  adamw_step            269.4 ms, 2 waits (0.245 s blocked), 2 commits, 2 dispatches, 2 cold allocations, 0 host-zeroed (0.00 GB)
+  total                3267.0 ms, 2104 waits
+       19.34 real         4.36 user         2.63 sys
+         19094847488  maximum resident set size
+                   0  average shared memory size
+                   0  average unshared data size
+                   0  average unshared stack size
+             1352010  page reclaims
+                 189  page faults
+                   0  swaps
+                   0  block input operations
+                   0  block output operations
+                   0  messages sent
+                   0  messages received
+                   0  signals received
+                   9  voluntary context switches
+               56566  involuntary context switches
+         44485401097  instructions retired
+         28656519779  cycles elapsed
+         20585658480  peak memory footprint
+# exit: 0
+# ---- clip round 2, before, T = 2048 async, bf16 storage (10:46:48, load { 14.69 13.18 17.46 }) ----
+# power: Now drawing from 'AC Power'
+# gpu: Device Utilization %"=86
+# peers: 0
+device: Apple M5 Pro
+T = 2048: gate passed (12 ops wrote finite outputs)
+storage: bf16 (steps into a bf16 bank); operands: Bf16
+encode: async (--async); TESSL_MID_COMMIT=unset
+clipped optimizer step, T = 2048 (median of 3; waits from the last run):
+  train_step_into      2333.7 ms, 14 waits (2.067 s blocked), 14 commits, 2070 dispatches, 1289 cold allocations, 0 host-zeroed (0.00 GB)
+  grad_sq_norm          556.3 ms, 1 waits (0.556 s blocked), 1 commits, 320 dispatches, 1 cold allocations, 0 host-zeroed (0.00 GB)
+  adamw_step            224.4 ms, 1 waits (0.218 s blocked), 1 commits, 2 dispatches, 2 cold allocations, 0 host-zeroed (0.00 GB)
+  total                3117.8 ms, 16 waits
+       18.96 real         3.83 user         2.75 sys
+         19043778560  maximum resident set size
+                   0  average shared memory size
+                   0  average unshared data size
+                   0  average unshared stack size
+             1290665  page reclaims
+                   1  page faults
+                   0  swaps
+                   0  block input operations
+                   0  block output operations
+                   0  messages sent
+                   0  messages received
+                   0  signals received
+                   1  voluntary context switches
+               14784  involuntary context switches
+         52749204754  instructions retired
+         27224198900  cycles elapsed
+         25052542632  peak memory footprint
+# exit: 0
+# ---- clip round 2, after, T = 2048 async, bf16 storage (10:47:07, load { 13.26 12.94 17.29 }) ----
+# power: Now drawing from 'AC Power'
+# gpu: Device Utilization %"=94
+# peers: 0
+device: Apple M5 Pro
+T = 2048: gate passed (12 ops wrote finite outputs)
+storage: bf16 (steps into a bf16 bank); operands: Bf16
+encode: async (--async); TESSL_MID_COMMIT=unset
+clipped optimizer step, T = 2048 (median of 3; waits from the last run):
+  train_step_into      2382.6 ms, 14 waits (2.166 s blocked), 14 commits, 2101 dispatches, 1290 cold allocations, 0 host-zeroed (0.00 GB)
+  grad_sq_norm           22.8 ms, 1 waits (0.019 s blocked), 1 commits, 2 dispatches, 3 cold allocations, 0 host-zeroed (0.00 GB)
+  adamw_step            229.2 ms, 1 waits (0.230 s blocked), 1 commits, 2 dispatches, 2 cold allocations, 0 host-zeroed (0.00 GB)
+  total                2635.9 ms, 16 waits
+       17.02 real         3.92 user         2.72 sys
+         19094257664  maximum resident set size
+                   0  average shared memory size
+                   0  average unshared data size
+                   0  average unshared stack size
+             1351998  page reclaims
+                 186  page faults
+                   0  swaps
+                   0  block input operations
+                   0  block output operations
+                   0  messages sent
+                   0  messages received
+                   0  signals received
+                   1  voluntary context switches
+               10221  involuntary context switches
+         52920676542  instructions retired
+         26935855432  cycles elapsed
+         23053612928  peak memory footprint
+# exit: 0

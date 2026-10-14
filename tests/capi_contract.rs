@@ -1642,3 +1642,125 @@ fn this_file_never_creates_a_runtime() {
         assert!(hits.is_empty(), "{needle} used at lines {hits:?}");
     }
 }
+
+// ---- adversarial: generated token streams with a known expected output ----
+
+/// A tiny deterministic generator (no dependency).
+struct Lcg(u64);
+
+impl Lcg {
+    fn next(&mut self, n: usize) -> usize {
+        self.0 = self
+            .0
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        ((self.0 >> 33) as usize) % n
+    }
+}
+
+/// One Rust token as (source text, text the stripper must keep).
+fn rust_token(g: &mut Lcg) -> (String, String) {
+    let keep = |s: String| (s.clone(), s);
+    match g.next(13) {
+        0 => keep("ident_x".to_string()),
+        1 => keep(["abr", "acr", "xr", "_r", "bar", "for"][g.next(6)].to_string()),
+        2 => {
+            let h = "#".repeat(g.next(4));
+            let body = ["//", "/*", "\"", "\\", " \" // ", "\"#", "x"][g.next(7)];
+            // A body may hold `"` only if the terminator needs more hashes.
+            let body = if h.len() < 2 && body.contains('"') { "x" } else { body };
+            keep(format!("r{h}\"{body}\"{h}"))
+        }
+        3 => {
+            let h = "#".repeat(1 + g.next(3));
+            keep(format!("br{h}\"a // b \\\"{h}"))
+        }
+        4 => {
+            let h = "#".repeat(1 + g.next(3));
+            keep(format!("cr{h}\"a /* b \\\"{h}"))
+        }
+        5 => keep(r#""a // \" /* b""#.to_string()),
+        6 => keep(r#"b"x\"//""#.to_string()),
+        7 => keep(r#"c"x\"//""#.to_string()),
+        8 => keep(
+            [
+                "'\"'",
+                "'\\''",
+                "'\\\\'",
+                "'x'",
+                "b'\"'",
+                "'\\u{1F600}'",
+                "'é'",
+                "&'a str",
+            ][g.next(8)]
+            .to_string(),
+        ),
+        9 => (
+            format!("// {} \" r#\" /*\n", ["x", "'", "\\"][g.next(3)]),
+            "\n".to_string(),
+        ),
+        10 => ("/* a \" /* nested // */ \" */".to_string(), String::new()),
+        11 => keep("r#type".to_string()),
+        _ => keep(["+", "{", "}", "::", "0x1r"][g.next(5)].to_string()),
+    }
+}
+
+#[test]
+fn generated_rust_token_streams_strip_to_exactly_their_non_comment_text() {
+    let mut g = Lcg(0x5eed);
+    for case in 0..4000 {
+        let (mut src, mut want) = (String::new(), String::new());
+        for _ in 0..1 + g.next(8) {
+            let (s, k) = rust_token(&mut g);
+            src.push_str(&s);
+            want.push_str(&k);
+            // A separator keeps adjacent tokens from fusing into one.
+            src.push(' ');
+            want.push(' ');
+        }
+        assert_eq!(strip_line_comments(&src), want, "case {case}: {src:?}");
+    }
+}
+
+/// One Python token as (source text, text the stripper must keep).
+fn py_token(g: &mut Lcg) -> (String, String) {
+    let keep = |s: String| (s.clone(), s);
+    match g.next(8) {
+        0 => keep("name_1".to_string()),
+        1 => keep(
+            [
+                "'a # b'",
+                "\"a # b\"",
+                "r'a # \\' # b'",
+                "b\"\\\"#\"",
+                "f'{x} # y'",
+                "''",
+                "\"\"",
+            ][g.next(7)]
+            .to_string(),
+        ),
+        2 => ("# a ' \" '''\n".to_string(), "\n".to_string()),
+        3 => ("\"\"\"doc ' # \\\"\"\" \"\"\"".to_string(), String::new()),
+        4 => ("'''doc \" # '''".to_string(), String::new()),
+        5 => keep("1 + 2".to_string()),
+        6 => keep("'it\\'s # not a comment'".to_string()),
+        _ => keep("(".to_string()),
+    }
+}
+
+#[test]
+fn generated_python_token_streams_strip_to_exactly_their_non_comment_text() {
+    let mut g = Lcg(0xfeed);
+    for case in 0..4000 {
+        let (mut src, mut want) = (String::new(), String::new());
+        for _ in 0..1 + g.next(8) {
+            let (s, k) = py_token(&mut g);
+            src.push_str(&s);
+            want.push_str(&k);
+            src.push('\n');
+            want.push('\n');
+        }
+        // A comment token already ends in a newline, so the separator adds one.
+        assert_eq!(strip_py_comments(&src), want, "case {case}: {src:?}");
+    }
+}

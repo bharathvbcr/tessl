@@ -58,8 +58,8 @@ use std::path::{Path, PathBuf};
 
 use common::with_gpu;
 use tessl::npy::read_npy;
-use tessl::qwen35::{self, AttnProjLayout, GdnProjLayout};
-use tessl::qwen35_model::{LayerKind, LogitRows, Precision, Qwen35Config, Qwen35Model};
+use tessl::qwen35::{self, AttnProjLayout, GdnProjLayout, GdnScanSlice};
+use tessl::qwen35_model::{LayerKind, LayerPart, LogitRows, Precision, Qwen35Config, Qwen35Model};
 use tessl::safetensors::SafeTensors;
 use tessl::GpuRuntime;
 
@@ -332,8 +332,8 @@ fn argmax32(row: &[f32]) -> usize {
 }
 
 /// The models the always-run tests cover: the fixture at both precisions
-/// (with its packed bf16 head), and the grouped tower at F32 (whose head is
-/// the embedding itself).
+/// (with its packed bf16 head), the grouped tower at F32 (whose head is the
+/// embedding itself) and the grouped random model at bf16 (with its packed head).
 fn models(rt: &std::sync::Arc<GpuRuntime>) -> Vec<(&'static str, Qwen35Model)> {
     let st = SafeTensors::open(&fixture().join("model.safetensors")).unwrap();
     vec![
@@ -348,6 +348,10 @@ fn models(rt: &std::sync::Arc<GpuRuntime>) -> Vec<(&'static str, Qwen35Model)> {
         (
             "grouped f32",
             Qwen35Model::random_tower(rt, grouped_config(), Precision::F32, 7).unwrap(),
+        ),
+        (
+            "grouped bf16",
+            Qwen35Model::random(rt, grouped_config(), Precision::Bf16, 7).unwrap(),
         ),
     ]
 }
@@ -542,6 +546,109 @@ fn decode_and_row_refusals() {
         assert!(s.score_answers(&[0], &[cfg.vocab]).is_err(), "answer past vocab");
         assert!(s.score_answers(&[0], &[]).is_err(), "no answers");
         assert!(s.score_answers(&[], &[1]).unwrap().logits.is_empty());
+    });
+}
+
+/// `final_norm_f32` of `s`'s residual stream, read back.
+fn final_norm_bits(
+    rt: &std::sync::Arc<GpuRuntime>,
+    model: &Qwen35Model,
+    s: &tessl::qwen35_model::Staged<'_>,
+) -> Vec<u32> {
+    let out = rt
+        .alloc_tensor_f32(&[s.tokens() as usize, model.config().hidden as usize])
+        .unwrap();
+    s.final_norm_f32(&out).unwrap();
+    rt.synchronize().unwrap();
+    out.buffer.read_f32().iter().map(|x| x.to_bits()).collect()
+}
+
+/// A random bf16 model has the packed LM head, so `forward` and `prefill`
+/// run on it (the bench times them on random weights); `random_tower` is the
+/// same weights without the head and still refuses both, and the two give the
+/// same hidden states bit for bit.
+#[test]
+fn random_bf16_model_runs_forward_and_prefill() {
+    with_gpu(|rt| {
+        let cfg = grouped_config();
+        let model = Qwen35Model::random(rt, cfg.clone(), Precision::Bf16, 7).unwrap();
+        assert!(model.describe().contains("packed bf16 copy"), "{}", model.describe());
+        let ids = seq(9);
+        let v = cfg.vocab as usize;
+        let fwd = model.forward_rows(&ids, LogitRows::Last, false).unwrap().logits;
+        assert_eq!(fwd.len(), v);
+        assert!(
+            fwd.iter().all(|x| x.is_finite()) && fwd.iter().any(|&x| x != 0.0),
+            "forward logits"
+        );
+        let (mut dec, first) = model.prefill(&ids, 2).unwrap();
+        assert!(
+            rel32(&first, &fwd) <= bound(Precision::Bf16),
+            "prefill's last row is forward's"
+        );
+        for id in [3u32, 5] {
+            let row = dec.step(id).unwrap();
+            assert_eq!(row.len(), v);
+            assert!(row.iter().all(|x| x.is_finite()), "decoded logits");
+        }
+
+        let tower = Qwen35Model::random_tower(rt, cfg, Precision::Bf16, 7).unwrap();
+        let m = tower.prefill(&ids, 2).err().expect("a bf16 tower has no head");
+        assert!(m.contains("random_tower"), "{m}");
+        assert!(tower.forward(&ids, false).is_err());
+        let (mut a, mut b) = (model.begin(&ids).unwrap(), tower.begin(&ids).unwrap());
+        a.advance_to(4).unwrap();
+        b.advance_to(4).unwrap();
+        assert_eq!(final_norm_bits(rt, &model, &a), final_norm_bits(rt, &tower, &b));
+    });
+}
+
+/// The GDN scan's column slice changes speed, not bits: a model told to run
+/// `Cols32` returns the default's logits exactly, through `forward`.
+#[test]
+fn gdn_scan_slice_is_bit_identical_on_the_model() {
+    with_gpu(|rt| {
+        let ids = seq(70);
+        let run = |slice: Option<GdnScanSlice>| {
+            let m = Qwen35Model::random(rt, grouped_config(), Precision::Bf16, 7).unwrap();
+            let m = match slice {
+                Some(s) => m.with_gdn_scan_slice(s),
+                None => m,
+            };
+            m.forward(&ids, false)
+                .unwrap()
+                .logits
+                .iter()
+                .map(|x| x.to_bits())
+                .collect::<Vec<_>>()
+        };
+        let default = run(None);
+        assert_eq!(default, run(Some(GdnScanSlice::Cols16)), "Cols16 is the default");
+        assert_eq!(default, run(Some(GdnScanSlice::Cols32)), "Cols32 changed bits");
+    });
+}
+
+/// `Staged::encode_part` runs a layer's four parts as `advance_to` runs the
+/// layer (the same code, in `LayerPart::ORDER`), and refuses a layer the model
+/// does not have.
+#[test]
+fn encode_part_in_order_is_advance_to() {
+    with_gpu(|rt| {
+        let model = Qwen35Model::random(rt, grouped_config(), Precision::Bf16, 7).unwrap();
+        let ids = seq(33);
+        let n = model.config().layers.len();
+        let mut whole = model.begin(&ids).unwrap();
+        whole.advance_to(n).unwrap();
+        let parts = model.begin(&ids).unwrap();
+        for l in 0..n {
+            for part in LayerPart::ORDER {
+                parts.encode_part(l, part).unwrap();
+            }
+        }
+        assert_eq!(parts.layers_done(), 0, "encode_part does not advance the session");
+        assert_eq!(final_norm_bits(rt, &model, &whole), final_norm_bits(rt, &model, &parts));
+        let m = parts.encode_part(n, LayerPart::Mlp).unwrap_err();
+        assert!(m.contains("layer 4 of a model with 4"), "{m}");
     });
 }
 

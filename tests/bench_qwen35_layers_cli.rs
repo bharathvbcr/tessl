@@ -126,3 +126,54 @@ fn huge_iters_is_refused_before_any_gpu_work() {
     assert_refused_before_gpu(&["--iters=1000000000", "16"], "--iters");
     assert_refused_before_gpu(&["--iters=10001", "16"], "--iters");
 }
+
+fn valid_config_dir(name: &str) -> Scratch {
+    let d = Scratch::new(name);
+    let cfg = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/qwen35/config_qwen35_2b_base.json");
+    std::fs::copy(cfg, d.0.join("config.json")).expect("copy fixture config");
+    d
+}
+
+#[test]
+fn valid_config_with_corrupt_safetensors_is_refused_before_any_gpu_work() {
+    let d = valid_config_dir("bq35_corrupt_st");
+    let p = d.0.to_str().unwrap().to_string();
+    // Lying header length (2^63-1), truncated header, non-JSON header, and an 8-byte-only file.
+    let cases: [&[u8]; 4] = [
+        b"\xff\xff\xff\xff\xff\xff\xff\x7f{}",
+        b"\x10\0\0\0\0\0\0\0{}",
+        b"\x02\0\0\0\0\0\0\0zz",
+        b"\0\0\0\0\0\0\0\0",
+    ];
+    for bytes in cases {
+        std::fs::write(d.0.join("m.safetensors"), bytes).unwrap();
+        assert_refused_before_gpu(&[&format!("--weights={p}"), "16"], "--weights");
+    }
+}
+
+#[test]
+fn broken_and_directory_symlinked_safetensors_are_not_counted() {
+    let d = valid_config_dir("bq35_symlinks");
+    std::os::unix::fs::symlink("/nonexistent-tessl-target", d.0.join("a.safetensors")).unwrap();
+    std::os::unix::fs::symlink("/tmp", d.0.join("b.safetensors")).unwrap();
+    let p = d.0.to_str().unwrap();
+    assert_refused_before_gpu(&[&format!("--weights={p}"), "16"], "found 0");
+}
+
+#[test]
+fn non_utf8_config_and_iters_forms_are_refused_before_any_gpu_work() {
+    let d = Scratch::new("bq35_nonutf8_cfg");
+    std::fs::write(d.0.join("config.json"), b"\xff\xfe\x00").unwrap();
+    std::fs::write(d.0.join("a.safetensors"), b"\x02\0\0\0\0\0\0\0{}").unwrap();
+    let p = d.0.to_str().unwrap();
+    assert_refused_before_gpu(&[&format!("--weights={p}"), "16"], "--weights");
+    for bad in [
+        "--iters= 5",
+        "--iters=1e3",
+        "--iters=10000x",
+        "--iters=0x10",
+        "--iters=\u{661}",
+    ] {
+        assert_refused_before_gpu(&[bad, "16"], "--iters");
+    }
+}

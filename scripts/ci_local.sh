@@ -28,6 +28,11 @@ python3 scripts/audit_gemm_tiles.py
 echo "==> MSL dialect lint (CI: kernel-emulator job)"
 python3 tools/msl_emu/dialect_lint.py
 
+echo "==> kernel IR check (fast-math: no inf/NaN constants, no fcmp uno/ord, isfinite stays a bit test)"
+# Exit 77 means no Metal toolchain: SKIPPED is printed and the run still fails, because the
+# build step above already needed that toolchain and a skipped check must not read as passed.
+./scripts/check_kernel_ir.sh
+
 echo "==> emulator host contract (CI: kernel-emulator job; needs the torch oracle)"
 # check_qwen35.py imports torch at module top, so no torch means no check. That
 # must fail loudly: a skipped check must never read as a passed one.

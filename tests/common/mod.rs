@@ -37,6 +37,15 @@ use tessl::{GpuRuntime, Tensor};
 static GPU: Mutex<()> = Mutex::new(());
 
 pub fn gpu_lock() -> MutexGuard<'static, ()> {
+    // The hosted CI selection (scripts/hosted_tests.sh) runs tests that must
+    // not touch a device. A runner that does expose one would let a test that
+    // opens it pass, so under that selection every helper that leads to a
+    // runtime refuses by name instead.
+    assert!(
+        std::env::var_os("TESSL_HOSTED_NO_DEVICE").is_none(),
+        "a test in the hosted device-free selection (TESSL_HOSTED_NO_DEVICE is set) asked for a GPU; \
+         remove it from scripts/hosted_tests.txt or make it device-free"
+    );
     // A panicking test poisons the mutex. Recovering keeps one real failure
     // from cascading into a screen of misleading "poisoned" errors that hide it.
     GPU.lock().unwrap_or_else(|poisoned| poisoned.into_inner())

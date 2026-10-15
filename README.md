@@ -444,7 +444,12 @@ would make the call quietly slower than the unfused code it replaced.
 cargo test --release -- --test-threads=1
 
 # Validate static TileGeom definitions against compiled Metal kernel constants
-python3 scripts/audit_gemm_tiles.py
+# (a #[test]; it is also part of the full suite above)
+cargo test --release --test audit_gemm_tiles
+
+# The device-free selection the hosted CI job runs, with the Metal device hidden
+# from every test (a test in it that opens a device fails)
+scripts/hosted_tests.sh
 
 # Quick shape fuzz (160 cases) runs as part of the ordinary suite:
 cargo test --release --lib -- --test-threads=1 --nocapture gemm_fuzz_quick
@@ -456,8 +461,10 @@ cargo test --release --lib -- --ignored --test-threads=1 --nocapture gemm_fuzz_d
 STRESS_SEED=0xdeadbeef cargo test --release --lib -- --test-threads=1 gemm_fuzz_quick
 ```
 
-**Static tile audit** (`scripts/audit_gemm_tiles.py`) cross-references every Rust
-`TileGeom` struct against the `constexpr int SM/SN` parameters compiled into
+**Static tile audit** (`tests/audit_gemm_tiles.rs`) reads the Rust selectors
+(`coop_kernel`, `epi_kernel`, the batched `match`, `SplitKPar::kernel`) and every
+`pipeline("matmul2d_tensorops_...")` site, and cross-references each `TileGeom`
+they pair a kernel with against the `constexpr int SM/SN` parameters compiled into
 `matmul_tensorops.metal`, including macro-instantiated kernels
 (`NN_COOP_KERNEL`, `TN_NT_COOP_KERNEL`). A mismatch would make the host dispatch
 incorrect threadgroup grids, silently leaving output tiles unwritten.
@@ -572,9 +579,10 @@ below; the rest are capabilities the crate does not have.
 | Gap | Why it matters | Why not yet |
 |---|---|---|
 | **Full decode-graph ICB replay** | Replaying a whole decode step from an indirect command buffer would skip the per-token host encode. | `IcbReplayStub` and `IcbStubPhase` (`tessl::cb_replay`) are a host-side scaffold: `try_allocate` always returns `CbReplayError::NotWired`, and `try_execute` does too until a mini `DecodeIcb` has marked the stub `Allocated`, which says nothing about the full graph. Mini and layer-level `DecodeIcb` replay is real (`PingPongCbReplay::try_replay_icb`, opt-in) but the full decode graph is not migrated: `MTL4CommandBuffer` has no replay-prior-encoding API. `cb_replay_api_gap_summary()` lists the surveyed gaps, including the opt-in ICB bind paths the module records as parked behind direct dispatch with prebuilt argument tables. |
+| **No off-device check for `attn_prefill`** | `attn_prefill` (the TensorOps tiled kernel, `prefill_attn_kernel` always returns `Tiled`) is checked against f64 only on a Metal 4 device. | The CPU emulator in `tools/msl_emu` cannot execute TensorOps, so there is no off-device numeric check; `check_qwen35.py`'s host contract reads its buffer slots and `TILED_ATTN_*` constants from source and nothing more. The same holds for `encoder_attn_tiled_*`; the rows kernels `encoder_attn_rows_*` and `embed_pool.metal` are emulated. |
 | **Int4 TensorOps GEMM** | Half the weight bandwidth of int8. | TensorOps itself accepts `int4b_format` — the block is the shader-side tensor constructor for a sub-byte element type, not the objc2 binding this table used to blame. `nn::gemm_i8_dequant` ships the int8 case. |
 | **No CPU fallback** | Without a Metal 4 device, nothing runs. | Deliberate. This is an Apple-silicon runtime, and a silent CPU path would make every "GPU" benchmark here meaningless. |
-| **GPU CI on hosted runners** | Whether the suite runs unattended, or only on hardware I own. | Measured, not assumed: it does not. On `macos-26` the Metal Toolchain installs and every source under `kernels/` compiles and lints — the `check` job's `cargo build` does exactly that every push — but the device probe fails, so the shaders build there and cannot execute. The suite therefore runs on a gated self-hosted M5 runner. CI covers build, clippy, rustdoc and the static tile audit on every push; the tests do not run unattended. |
+| **GPU CI on hosted runners** | Whether the suite runs unattended, or only on hardware I own. | Measured, not assumed: it does not. On `macos-26` the Metal Toolchain installs and every source under `kernels/` compiles and lints — the `check` job's `cargo build` does exactly that every push — but the device probe fails, so the shaders build there and cannot execute. The suite therefore runs on a gated self-hosted M5 runner. CI covers build, clippy, rustdoc, the device-free cargo tests (run with the Metal device hidden, including the static tile audit), the kernel IR fast-math scan and the parity harness's host-only sections on every push; the GPU tests do not run unattended. |
 | **Benchmark numbers in CI** | The GFLOP/s figures above are reproducible only by hand. | Hosted runners are virtualised and shared, so a timing from one describes the runner. The `bench` job runs the sweep on bare-metal Apple silicon and is gated behind a repository variable until such a runner is registered. |
 
 ---

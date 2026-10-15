@@ -424,10 +424,13 @@ model, the logits move by less than 4e-5.
 
 **Compile risk, without a compiler.** `tools/msl_emu/dialect_lint.py` lists
 the MSL constructs these kernels use that no other tessl kernel uses (the others
-compile on every release build). There are 11: `as_type`, a
-`(device uint *)` cast, `log`, `mem_flags::mem_device`, six `precise::`
-functions and `uint3` (`static_assert` and `fabs` are now used elsewhere too).
-Each is standard MSL and on a reviewed list. An unreviewed one fails CI.
+compile on every release build). There are three: `log`, `mem_flags::mem_device`
+and `uint3`. Each is standard MSL and on a reviewed list. An unreviewed one fails
+CI, and so does a reviewed entry that is no longer new (it used to print a note and
+exit 0, and ten went stale that way). It stays Python, not Rust: it is a stdlib-only
+text lint that ships no code, `tests/dialect_lint_script.rs` holds it to failing on an
+unreviewed construct, a stale entry and an empty tree, and it runs on the Linux
+emulator job and, through that test, on the hosted macOS job.
 
 The `host_contract` case parses `src/qwen35.rs` and the kernel signatures. It
 checks that every `set_*` bind has the kernel's index and kind (buffer, `uint`,

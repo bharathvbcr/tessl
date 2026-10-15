@@ -599,6 +599,91 @@ def case_embed_rows(seed):
         FAILURES.append("embed_rows_f32")
 
 
+def case_embed_pool(seed):
+    """embed_pool.metal, the EmbeddingGemma pooling kernels. `segment_mean_rows_f32` adds each
+    column in row order, so it is bit-identical to the same sequential f32 loop here (the mean
+    over `[start, end)`, an empty range zeros, an `end` past `rows` clamped). `l2_normalize_rows_f32`
+    is torch's `normalize` over the first `dim` columns to a tree reduction's rounding, and never
+    touches the columns past `dim`."""
+    g = seeded(seed)
+    rows, D = 11, 40
+    x = torch.randn(rows, D, generator=g)
+    segs = [(0, 11), (2, 3), (4, 4), (5, 99), (7, 3), (10, 11)]
+    S = len(segs)
+    out = run("segment_mean_rows_f32", dict(S=S, rows=rows, D=D),
+              {"x": x, "segments": torch.tensor(segs, dtype=torch.int32).flatten()},
+              {"out": ("f32", S * D)})["out"].reshape(S, D)
+    want = torch.zeros(S, D)
+    for i, (a, b) in enumerate(segs):
+        b = min(b, rows)
+        a = min(a, b)
+        if b > a:
+            acc = torch.zeros(D)
+            for r in range(a, b):
+                acc = acc + x[r]
+            want[i] = acc / float(b - a)
+    ok = torch.equal(out.view(torch.int32), want.view(torch.int32))
+    print(f"  [{'ok  ' if ok else 'FAIL'}] segment_mean_rows: bit-identical to the sequential f32 mean, "
+          "empty range zeros, end clamped")
+    if not ok:
+        FAILURES.append("segment_mean_rows")
+    # A one-off shifted segment must change the answer, so the case can fail.
+    shifted = torch.zeros(S, D)
+    shifted[0] = x[1:].sum(0) / float(rows - 1)
+    if torch.equal(shifted[0].view(torch.int32), want[0].view(torch.int32)):
+        FAILURES.append("segment_mean_rows case cannot tell a shifted range from the real one")
+
+    nrows, ld, dim = 5, 24, 17
+    y = torch.randn(nrows, ld, generator=g) * 3
+    y[2, :dim] = 0.0  # a zero row stays zero (the 1e-12 floor), not NaN
+    got = run("l2_normalize_rows_f32", dict(rows=nrows, dim=dim, ld=ld, tptg=64),
+              {"x": y}, {"x": ("f32", nrows * ld)})["x"].reshape(nrows, ld)
+    want = y.clone()
+    want[:, :dim] = torch.nn.functional.normalize(y[:, :dim].double(), dim=1, eps=1e-12).float()
+    check("l2_normalize_rows prefix", got[:, :dim], want[:, :dim], atol=2e-6)
+    ok = torch.equal(got[:, dim:].view(torch.int32), y[:, dim:].view(torch.int32))
+    print(f"  [{'ok  ' if ok else 'FAIL'}] l2_normalize_rows: columns past dim untouched")
+    if not ok:
+        FAILURES.append("l2_normalize_rows past dim")
+
+
+def case_encoder_attn_rows(seed, D, window):
+    """encoder_attn.metal's rows kernel, bidirectional with a symmetric inclusive window
+    (`window == 0` is every key), per-row live lengths, and zeros for a padded query, against
+    an f64 softmax. K/V slots past each row's length are NaN, so reading one would show."""
+    g = seeded(seed)
+    B, T, H, Hkv = 2, 37, 4, 2
+    cap = T + 3
+    lens = torch.tensor([T, 20], dtype=torch.int32)
+    q = torch.randn(B, T, H, D, generator=g)
+    k = torch.randn(B, cap, Hkv, D, generator=g)
+    v = torch.randn(B, cap, Hkv, D, generator=g)
+    for b in range(B):
+        k[b, int(lens[b]):] = float("nan")
+        v[b, int(lens[b]):] = float("nan")
+    scale = D ** -0.5
+    got = run("encoder_attn_rows",
+              dict(B=B, T=T, H=H, Hkv=Hkv, D=D, window=window, kv_capacity=cap, scale=scale),
+              {"q": q, "k": k, "v": v, "lens": lens}, {"o": ("f32", B * T * H * D)})["o"]
+    got = got.reshape(B, T, H, D)
+    want = torch.zeros(B, T, H, D, dtype=torch.float64)
+    for b in range(B):
+        n = int(lens[b])
+        kk = k[b, :n].double().repeat_interleave(H // Hkv, dim=1)
+        vv = v[b, :n].double().repeat_interleave(H // Hkv, dim=1)
+        for t in range(n):
+            lo = 0 if window == 0 else max(0, t - window)
+            hi = n if window == 0 else min(n, t + window + 1)
+            sc = torch.einsum("hd,shd->hs", q[b, t].double(), kk[lo:hi]) * scale
+            want[b, t] = torch.einsum("hs,shd->hd", sc.softmax(-1), vv[lo:hi])
+    check(f"encoder_attn_rows D{D} window{window}", got, want, atol=2e-6)
+    pad = got[1, int(lens[1]):]
+    ok = bool((pad == 0).all())
+    print(f"  [{'ok  ' if ok else 'FAIL'}] encoder_attn_rows D{D} window{window}: padded queries are exactly zero")
+    if not ok:
+        FAILURES.append(f"encoder_attn_rows D{D} window{window} padded queries")
+
+
 def case_prefix_varlen(seed, decode):
     """Per-row suffix lengths and query positions (row_stride 1): each row of
     a ragged batch is bit-identical to that row run alone with shared values."""
@@ -1088,6 +1173,12 @@ def case_host_contract_parser():
          ["qwen35_swiglu_f32", "qwen35_swiglu_bf16", "qwen35_gelu_tanh_glu_f32", "qwen35_gelu_tanh_glu_bf16"]),
         ('let name = match m { A => out_kernel!("qwen35_a", d, w)?, B => "qwen35_b" };',
          ["qwen35_a_f32", "qwen35_a_bf16", "qwen35_b"]),
+        # ft-7f859b9's regression: every arm an `out_kernel!` call, on one line, with the
+        # `?` after the macro. Each arm serves both dtype variants and the bases
+        # ("base", "other") are not kernels themselves.
+        ('let name = match act { A => out_kernel!("qwen35_base", out.dtype, what)?, '
+         'B => out_kernel!("qwen35_other", out.dtype, what)? };',
+         ["qwen35_base_f32", "qwen35_base_bf16", "qwen35_other_f32", "qwen35_other_bf16"]),
     ]
     for src, want in shapes:
         got = [k for _, _, ks in _name_defs(src) for k in ks]
@@ -1286,6 +1377,11 @@ CASES = [
     ("scatter_add_rows", lambda: case_scatter_add_rows(73)),
     ("adamw", lambda: case_adamw(74)),
     ("sq_sum_pieces", lambda: case_sq_sum_pieces(75)),
+    # The EmbeddingGemma / BERT kernels, outside the Qwen3.5 set. Their TensorOps half
+    # (encoder_attn_tiled_*) has no off-device check: the emulator cannot run TensorOps.
+    ("embed_pool", lambda: case_embed_pool(76)),
+    ("encoder_attn_rows", lambda: [case_encoder_attn_rows(77 + i, D, w) for i, (D, w) in enumerate(
+        [(32, 0), (32, 5), (64, 0), (64, 3)])]),
 ]
 
 

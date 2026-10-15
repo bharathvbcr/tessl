@@ -22,8 +22,13 @@ cargo clippy --release --all-targets --features quant-prep -- -D warnings
 echo "==> doc"
 RUSTDOCFLAGS='-D warnings' cargo doc --no-deps
 
-echo "==> static tile audit"
-python3 scripts/audit_gemm_tiles.py
+echo "==> device-free selection with the device hidden (CI: check job; includes the static tile audit)"
+# The same invocation the hosted macOS job runs: scripts/hosted_tests.txt under a sandbox that
+# denies IOKit, every filter guarded to have run tests. Any test in it that opens a device fails.
+./scripts/hosted_tests.sh
+
+echo "==> hosted manifest completeness (every test that passes with the device hidden is selected)"
+./scripts/hosted_tests.sh --outside
 
 echo "==> MSL dialect lint (CI: kernel-emulator job)"
 python3 tools/msl_emu/dialect_lint.py
@@ -49,7 +54,7 @@ fi
 # -k host_contract selects both the parser self-test and the src/qwen35.rs binds/constants case.
 "$ORACLE_PY" tools/msl_emu/check_qwen35.py -k host_contract
 
-echo "==> parity harness, host-only (adversarial scorer, ladder, tile-audit and evidence contracts)"
+echo "==> parity harness, host-only (adversarial scorer, ladder and evidence contracts)"
 # Needs numpy, which the oracle environment carries. A non-zero exit (any assertion failure,
 # or a required section that did not run) stops the script; GPU sections are skipped visibly.
 "$ORACLE_PY" -I bench/test_parity_harness.py --pure

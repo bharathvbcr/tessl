@@ -85,7 +85,7 @@ and 256 and runs a 30-token forward in buffers sized for a 4000-token one.
 | embedding gather times `sqrt(hidden)` (bf16 table) | `qwen35_embed_rows_bf16_scaled` via `qwen35::embed_rows_scaled` | new: the gather and the scale in one pass |
 | GELU-tanh gate over column windows (`gate \| up` from one GEMM; each layer's slice of the per-layer inputs) | `qwen35_gelu_tanh_glu_f32` via `qwen35::gated_act` | new: `qwen35_swiglu`'s kernel with the activation as a parameter |
 | RMSNorm, post-norm residual add with layer scale, scale | `nn::rms_norm_f32`, `nn::rms_norm_residual_add_f32`, `nn::scale_f32_inplace` | reused |
-| GEMM | exact f32, TensorOps (NN, and NT for the per-layer-input projection) | reused |
+| GEMM | exact f32, or bf16 operands with f32 accumulation (`load_with`), TensorOps (NN, and NT for the per-layer-input projection) | reused |
 
 The rows encoder attention is its own kernel rather than a mode of
 `flash_attn_rows`: there the causal rule is the loop bound (keys above the
@@ -219,6 +219,61 @@ Measured on an M5 Pro against the real checkpoint, paired and interleaved
 
 ## Precision
 
-F32 only: bf16 weights widened exactly, f32 activations, exact-f32 GEMMs.
-A bf16-operand path is not written; it would be held to transformers' bf16
-forward the way `tests/qwen35_model.rs` holds Qwen3.5's.
+`EmbedGemma2Model::load(..)` is the exact-f32 forward: bf16 weights widened
+exactly, f32 activations, exact-f32 GEMMs (`GemmOperands::ExactF32`). Its
+results are unchanged by the bf16 path below: the embeddings and the layer
+trace of the tiny model and of the real checkpoint (8 texts, and text 0's
+24-layer trace) hash identically before and after.
+
+`EmbedGemma2Model::load_with(.., GemmOperands::Bf16)` is the bf16-operand
+forward, chosen when the model is loaded (`GemmOperands` is the operand
+precision `src/gemm.rs` already defines for callers that choose per call):
+
+* **Weights.** Every projection stays as the checkpoint stores it, bf16, on the
+  device, with no f32 copy; a checkpoint tensor stored in another dtype is
+  refused by name rather than rounded. The embedding table is bf16 under both
+  modes, so it does not change; the norms and the scalar stay f32. Device
+  weight bytes (`EmbedGemma2Model::weight_bytes`, the real checkpoint):
+  `ExactF32` 815,575,040 (777.8 MiB), `Bf16` 542,158,848 (517.0 MiB), 66 %.
+  Each forward re-reads the projections at half the width.
+* **GEMMs.** All eight are bf16 x bf16 -> f32 accumulation on the TensorOps
+  lane (`GemmOperands::Bf16.nn` / `.nt`, the per-layer-input projection being
+  the NT one). A GEMM taking an f32 A and a bf16 B does not exist (`gemm`
+  requires matching operand dtypes), so A is staged in bf16, in buffers
+  allocated once per `encode` like the other activations: the norms
+  (`rms_norm_bf16`) and the GELU gates (`qwen35_gelu_tanh_glu_bf16`) write
+  bf16 directly, at no extra dispatch, and four cast passes
+  (`cast_f32_to_bf16_into`) cover the rest: the attention output and the
+  residual stream into the per-layer-input gate once per layer, the embeddings
+  and the pooled vectors once per forward. `encoder_attn` writes f32 only, so
+  the attention output's cast stays until it gains a bf16 output.
+* **What stays f32.** The residual stream, the norms' arithmetic, the q/k/v
+  norms and RoPE, the attention, the pooling, the normalization, and every
+  GEMM output.
+* **Relaxed precision.** No f32 GEMM runs, so the runtime's relaxed-f32 switch
+  does not touch the forward and `encode` does not refuse it (the exact-f32
+  model still does); the embeddings are bit-identical with the switch on.
+* **Needs** TensorOps (refused at load otherwise).
+
+Bounds, fixed before the first run, derived in the header of
+`tests/embedgemma2_tiny.rs` (bf16 rounding is a relative error of at most
+`2^-8`, about `2^-8 / sqrt(3)` rms; a GEMM's error is that of its inputs, not
+of K; three layers of three branches add in quadrature) and, for the real
+checkpoint, in `tests/embedgemma2_model.rs` (held to transformers' bf16 forward
+the way `tests/qwen35_model.rs` holds Qwen3.5's):
+
+| Check | Bound | Observed |
+|---|---|---|
+| tiny: per-layer residual + final norm vs the f64 forward over the same bf16 weights | `5e-2` x max | `4.9e-3` to `8.4e-3` x max |
+| tiny: embeddings, alone and batched | `1e-2` max abs, cos >= `0.9999` | <= `1.4e-3`, cos >= `0.999987` |
+| tiny: batched vs alone, ragged runs of per-layer inputs, sync vs async | `1e-5` | 0 (bit-identical) |
+| real: cos vs fp32, each of 8 texts | >= `0.9999` | `0.99999324` to `0.99999848` (max abs <= `4.3e-4`) |
+| real: mean `1 - cos` vs fp32, against transformers' bf16 forward | <= its | `4.1e-6` against `4.7e-5` |
+| real: cos vs transformers' bf16 (`emb_bf16.npy`) | >= `0.9996` (triangle inequality over two `1e-4` deficits) | `0.99989959` to `0.99997965` |
+| real: alone vs one ragged batch (>= 2 forwards) | `1e-5` | 0 (bit-identical) |
+
+transformers' bf16 forward rounds every activation, the residual stream
+included, which is why it sits at cosine `0.99990` to `0.99998` from fp32
+while this forward, which rounds only what feeds a GEMM, sits an order of
+magnitude closer (`1 - cos` of `1.5e-6` to `6.8e-6`). Against `emb_bf16.npy` the two
+are therefore about as far apart as `emb_bf16.npy` is from fp32.

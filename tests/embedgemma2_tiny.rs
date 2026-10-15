@@ -19,21 +19,81 @@
 //! layer's residual stream and the final norm within `1e-4` of their largest
 //! magnitude; embeddings within `1e-4` max abs and cosine `>= 0.99999`; each
 //! sequence alone vs inside the batch within `1e-5`.
+//!
+//! `Bf16` (`GemmOperands::Bf16`: the projections stay bf16 on the device and
+//! every GEMM input is rounded to bf16; accumulation, the residual stream, the
+//! norms and attention stay f32) runs the same checks against the same f64
+//! forward, with bounds derived from the rounding rather than tuned, fixed
+//! before its first run. The projections here are stored as bf16, as the
+//! checkpoint's are, so the f64 forward uses exactly the weights the device
+//! holds and only the activations round:
+//!
+//! * a bf16 rounding is a relative error of at most `u = 2^-8` (3.9e-3) and
+//!   about `u / sqrt(3)` (2.3e-3) rms for values spread across a binade. A
+//!   GEMM output sums K terms each carrying such an error, which add as a
+//!   random walk, as the terms themselves do, so the output's error is about
+//!   2.3e-3 of its own rms whatever K is;
+//! * an attention branch rounds its input, the attention output and meets
+//!   the softmax, about four sources: 5e-3 of the branch rms, and the branch is
+//!   rms-normed afterwards (scale-free, O(1) per element). A maximum over some
+//!   thousand elements sits at about 4 rms, 2e-2 of the branch;
+//! * 3 layers of 3 branches add in quadrature to about 3x one branch (6e-2 of
+//!   a branch's scale), and the residual's largest element is about 3x its
+//!   rms: about 2e-2 of that maximum. The bound is `5e-2` of it, 2.5x of margin
+//!   and still far below a wrong layer, slice or orientation (O(1));
+//! * an embedding is a mean over tokens, projected and normalized: about 5e-3
+//!   relative rms, `1 - cos ~ theta^2 / 2 ~ 1e-5`. The bound is cosine
+//!   `>= 0.9999` (10x of margin; the floor the real model is held to) and max
+//!   abs `1e-2` on the unit vector (cosine 0.9999 is an L2 distance of 0.014,
+//!   and no element can be further than that);
+//! * alone vs batched stays `1e-5`: the bf16 GEMM sums K in the same order
+//!   whatever M is, so the f32 values that round are the same bits.
 
 mod common;
 
 use common::embedgemma2::{attn_ref, gelu_tanh, l2_normalize, lin, rms, rope, Attn};
 use common::{with_gpu, SplitMix};
 use tessl::embedgemma2::{EmbedGemma2Config, EmbedGemma2Model, DEFAULT_MAX_TOKENS, MAX_BATCH_TOKENS};
+use tessl::gemm::GemmOperands;
 use tessl::infer_trace;
 use tessl::safetensors::SafeTensors;
 use tessl::tensor::{bf16_bits_to_f32, f32_slice_to_bf16};
 
 const PREFIX: &str = "language_model.";
-const LAYER_REL: f64 = 1e-4;
-const EMB_ABS: f64 = 1e-4;
-const EMB_COS: f64 = 0.99999;
 const BATCH_ABS: f64 = 1e-5;
+const MODES: [GemmOperands; 2] = [GemmOperands::ExactF32, GemmOperands::Bf16];
+
+/// What a mode is held to against the f64 forward.
+#[derive(Clone, Copy)]
+struct Bounds {
+    /// Each layer's residual and the final norm, of their largest magnitude.
+    layer_rel: f64,
+    /// Embeddings, max abs.
+    emb_abs: f64,
+    /// Embeddings, cosine at least.
+    emb_cos: f64,
+}
+
+fn bounds(operands: GemmOperands) -> Bounds {
+    match operands {
+        GemmOperands::ExactF32 => Bounds {
+            layer_rel: 1e-4,
+            emb_abs: 1e-4,
+            emb_cos: 0.99999,
+        },
+        GemmOperands::Bf16 => Bounds {
+            layer_rel: 5e-2,
+            emb_abs: 1e-2,
+            emb_cos: 0.9999,
+        },
+    }
+}
+
+/// The tiny checkpoint's weights for a mode: the `Bf16` load reads bf16
+/// projections only.
+fn weights_for(cfg: &EmbedGemma2Config, seed: u64, operands: GemmOperands) -> Weights {
+    random_weights(cfg, seed, operands == GemmOperands::Bf16)
+}
 
 /// Three layers: full (d 512, 1 KV head: K/V width 512), sliding (d 256,
 /// 1 KV head: 256), sliding (d 256, 2 KV heads: 512).
@@ -72,7 +132,13 @@ impl Weights {
     }
 }
 
-fn random_weights(cfg: &EmbedGemma2Config, seed: u64) -> Weights {
+/// Random weights for `cfg`.
+///
+/// With `bf16_proj`, every projection (the checkpoint's own dtype for them) is
+/// stored as bf16 and kept here rounded to it: a `Bf16` load reads bf16
+/// tensors only, and the f64 forward then uses exactly the weights the device
+/// holds, so the only error left is the rounding of the activations.
+fn random_weights(cfg: &EmbedGemma2Config, seed: u64, bf16_proj: bool) -> Weights {
     let mut r = SplitMix::new(seed);
     let mut out = Vec::new();
     let mut push = |name: String, shape: Vec<usize>, scale: f64, offset: f64, bf16: bool| {
@@ -108,7 +174,7 @@ fn random_weights(cfg: &EmbedGemma2Config, seed: u64) -> Weights {
         vec![l * ple, h],
         lin_scale(h),
         0.0,
-        false,
+        bf16_proj,
     );
     push(
         "ple.per_layer_projection_norm.weight".into(),
@@ -123,7 +189,7 @@ fn random_weights(cfg: &EmbedGemma2Config, seed: u64) -> Weights {
         vec![cfg.embedding_dim as usize, h],
         lin_scale(h),
         0.0,
-        false,
+        bf16_proj,
     );
     for (i, s) in cfg.layers.iter().enumerate() {
         let p = |n: &str| format!("layers.{i}.{n}");
@@ -136,15 +202,33 @@ fn random_weights(cfg: &EmbedGemma2Config, seed: u64) -> Weights {
         ] {
             push(p(&format!("{n}.weight")), vec![h], 0.3, 1.0, false);
         }
-        push(p("self_attn.q_proj.weight"), vec![q * d, h], lin_scale(h), 0.0, false);
-        push(p("self_attn.k_proj.weight"), vec![kv * d, h], lin_scale(h), 0.0, false);
-        push(p("self_attn.v_proj.weight"), vec![kv * d, h], lin_scale(h), 0.0, false);
+        push(
+            p("self_attn.q_proj.weight"),
+            vec![q * d, h],
+            lin_scale(h),
+            0.0,
+            bf16_proj,
+        );
+        push(
+            p("self_attn.k_proj.weight"),
+            vec![kv * d, h],
+            lin_scale(h),
+            0.0,
+            bf16_proj,
+        );
+        push(
+            p("self_attn.v_proj.weight"),
+            vec![kv * d, h],
+            lin_scale(h),
+            0.0,
+            bf16_proj,
+        );
         push(
             p("self_attn.o_proj.weight"),
             vec![h, q * d],
             lin_scale(q * d),
             0.0,
-            false,
+            bf16_proj,
         );
         // Scale 1.0 attention over RMS-normed d-wide heads: weights near
         // d^-0.25 keep q.k O(1), so the softmax spreads over the window
@@ -152,22 +236,28 @@ fn random_weights(cfg: &EmbedGemma2Config, seed: u64) -> Weights {
         let qk = (d as f64).powf(-0.25);
         push(p("self_attn.q_norm.weight"), vec![d], 0.3 * qk, qk, false);
         push(p("self_attn.k_norm.weight"), vec![d], 0.3 * qk, qk, false);
-        push(p("mlp.gate_proj.weight"), vec![inter, h], lin_scale(h), 0.0, false);
-        push(p("mlp.up_proj.weight"), vec![inter, h], lin_scale(h), 0.0, false);
-        push(p("mlp.down_proj.weight"), vec![h, inter], lin_scale(inter), 0.0, false);
+        push(p("mlp.gate_proj.weight"), vec![inter, h], lin_scale(h), 0.0, bf16_proj);
+        push(p("mlp.up_proj.weight"), vec![inter, h], lin_scale(h), 0.0, bf16_proj);
+        push(
+            p("mlp.down_proj.weight"),
+            vec![h, inter],
+            lin_scale(inter),
+            0.0,
+            bf16_proj,
+        );
         push(
             p("ple_block.per_layer_input_gate.weight"),
             vec![ple, h],
             lin_scale(h),
             0.0,
-            false,
+            bf16_proj,
         );
         push(
             p("ple_block.per_layer_projection.weight"),
             vec![h, ple],
             lin_scale(ple),
             0.0,
-            false,
+            bf16_proj,
         );
         push(
             p("ple_block.post_per_layer_input_norm.weight"),
@@ -379,6 +469,22 @@ fn sequences(vocab: u32) -> Vec<Vec<u32>> {
 
 #[test]
 fn tiny_checkpoint_matches_the_f64_forward() {
+    matches_the_f64_forward(GemmOperands::ExactF32);
+}
+
+/// The same checks at bf16 operands, against the f64 forward over the same
+/// bf16 weights, under the derived bounds in the module docs.
+#[test]
+fn tiny_checkpoint_bf16_matches_the_f64_forward() {
+    matches_the_f64_forward(GemmOperands::Bf16);
+}
+
+fn matches_the_f64_forward(operands: GemmOperands) {
+    let Bounds {
+        layer_rel,
+        emb_abs,
+        emb_cos,
+    } = bounds(operands);
     let cfg = EmbedGemma2Config::from_config_json(CONFIG).unwrap();
     let widths: Vec<u32> = cfg.layers.iter().map(|s| s.kv_heads * s.head_dim).collect();
     assert_eq!(
@@ -386,13 +492,14 @@ fn tiny_checkpoint_matches_the_f64_forward() {
         [512, 256, 512],
         "test bug: the config must mix K/V widths, narrow after wide"
     );
-    let w = random_weights(&cfg, 2026);
+    let w = weights_for(&cfg, 2026, operands);
     let st = open("ok", safetensors_bytes(&w, &[("vision_tower.unused.weight", &[3])]));
     let seqs = sequences(cfg.vocab);
     let (h, dim) = (cfg.hidden as usize, cfg.embedding_dim as usize);
 
     with_gpu(|rt| {
-        let model = EmbedGemma2Model::load(rt, &st, PREFIX, cfg.clone()).unwrap();
+        let model = EmbedGemma2Model::load_with(rt, &st, PREFIX, cfg.clone(), operands).unwrap();
+        assert_eq!(model.operands(), operands);
 
         // 1. Layer by layer, the longest sequence (past the window both ways).
         let (want_trace, _) = host_forward(&cfg, &w, &seqs[0]);
@@ -403,8 +510,8 @@ fn tiny_checkpoint_matches_the_f64_forward() {
             let err = max_abs(&got[..seqs[0].len() * h], want);
             eprintln!("trace {i}: max abs {err:.3e} of scale {scale:.3e}");
             assert!(
-                err <= LAYER_REL * scale,
-                "trace {i}: max abs {err:.3e} > {LAYER_REL:.0e} * {scale:.3e}"
+                err <= layer_rel * scale,
+                "trace {i}: max abs {err:.3e} > {layer_rel:.0e} * {scale:.3e}"
             );
         }
 
@@ -419,7 +526,7 @@ fn tiny_checkpoint_matches_the_f64_forward() {
                 ids.len()
             );
             assert!(
-                err <= EMB_ABS && cos >= EMB_COS,
+                err <= emb_abs && cos >= emb_cos,
                 "sequence {n}: max abs {err:.3e}, cosine {cos:.9}"
             );
             alone.push((e, want));
@@ -435,7 +542,7 @@ fn tiny_checkpoint_matches_the_f64_forward() {
             let drift = got.iter().zip(e).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
             eprintln!("sequence {n} batched: max abs {err:.3e}, cosine {cos:.9}, vs alone {drift:.3e}");
             assert!(
-                err <= EMB_ABS && cos >= EMB_COS,
+                err <= emb_abs && cos >= emb_cos,
                 "sequence {n} batched: max abs {err:.3e}, cosine {cos:.9}"
             );
             assert!(
@@ -454,7 +561,7 @@ fn tiny_checkpoint_matches_the_f64_forward() {
                 let got = &out.embeddings[n * d..(n + 1) * d];
                 let (err, cos) = (max_abs(got, &want), cosine(got, &want));
                 assert!(
-                    err <= EMB_ABS && cos >= EMB_COS,
+                    err <= emb_abs && cos >= emb_cos,
                     "prefix {d}, sequence {n}: max abs {err:.3e}, cosine {cos:.9}"
                 );
             }
@@ -484,10 +591,9 @@ fn traced<T>(f: impl FnOnce() -> T) -> (T, infer_trace::Snapshot) {
 /// Before the activations were reused, each forward allocated its own (the
 /// two-forward encode made twice the one-forward encode's allocations) and
 /// zeroed them on the host.
-#[test]
-fn encode_reuses_unzeroed_activations() {
+fn encode_reuses_unzeroed_activations_at(operands: GemmOperands) {
     let cfg = EmbedGemma2Config::from_config_json(CONFIG).unwrap();
-    let w = random_weights(&cfg, 7);
+    let w = weights_for(&cfg, 7, operands);
     let st = open("reuse", safetensors_bytes(&w, &[]));
     // A long sequence beside short ones: `encode` runs the long one alone and
     // the short ones together in a second, smaller forward.
@@ -498,7 +604,7 @@ fn encode_reuses_unzeroed_activations() {
     let mut batch: Vec<&[u32]> = vec![&long];
     batch.extend(short.iter().map(Vec::as_slice));
     with_gpu(|rt| {
-        let model = EmbedGemma2Model::load(rt, &st, PREFIX, cfg.clone()).unwrap();
+        let model = EmbedGemma2Model::load_with(rt, &st, PREFIX, cfg.clone(), operands).unwrap();
         let (one, t1) = traced(|| model.encode(&batch[1..2], None, false).unwrap());
         let (two, t2) = traced(|| model.encode(&batch, None, false).unwrap());
         assert_eq!((one.forwards, two.forwards), (1, 2), "test bug: the split changed");
@@ -567,10 +673,9 @@ fn encode_reuses_unzeroed_activations() {
 /// sequence also still matches itself run alone. Before, every forward ended
 /// in its own `synchronize` and readback, so an encode of N forwards waited N
 /// times.
-#[test]
-fn multi_forward_encode_waits_once_and_matches_synchronous() {
+fn multi_forward_encode_waits_once_and_matches_synchronous_at(operands: GemmOperands) {
     let cfg = EmbedGemma2Config::from_config_json(CONFIG).unwrap();
-    let w = random_weights(&cfg, 11);
+    let w = weights_for(&cfg, 11, operands);
     let st = open("async_forwards", safetensors_bytes(&w, &[]));
     // Three padded shapes: a long sequence alone, mid-length ones, short ones.
     let seq = |n: u32, s: u32| -> Vec<u32> { (0..n).map(|i| (i * 5 + s * 3 + 1) % cfg.vocab).collect() };
@@ -582,7 +687,7 @@ fn multi_forward_encode_waits_once_and_matches_synchronous() {
     batch.extend(short.iter().map(Vec::as_slice));
     let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
     with_gpu(|rt| {
-        let model = EmbedGemma2Model::load(rt, &st, PREFIX, cfg.clone()).unwrap();
+        let model = EmbedGemma2Model::load_with(rt, &st, PREFIX, cfg.clone(), operands).unwrap();
         rt.set_serialized_dispatch(true).unwrap();
         let (sync, t_sync) = traced(|| model.encode(&batch, None, false).unwrap());
         rt.set_serialized_dispatch(false).unwrap();
@@ -649,7 +754,7 @@ fn default_runtime_encode_queues_and_waits_once() {
         "TESSL_MID_COMMIT changes the commit and wait counts"
     );
     let cfg = EmbedGemma2Config::from_config_json(CONFIG).unwrap();
-    let w = random_weights(&cfg, 31);
+    let w = random_weights(&cfg, 31, false);
     let st = open("default_queued", safetensors_bytes(&w, &[]));
     let seq = |n: u32, s: u32| -> Vec<u32> { (0..n).map(|i| (i * 5 + s * 3 + 1) % cfg.vocab).collect() };
     let long = seq(4000, 0);
@@ -694,7 +799,7 @@ fn full_ragged_batch_and_trace_match_serialized_with_bounded_queue() {
         "TESSL_MID_COMMIT changes the commit and wait counts"
     );
     let cfg = EmbedGemma2Config::from_config_json(CONFIG).unwrap();
-    let w = random_weights(&cfg, 41);
+    let w = random_weights(&cfg, 41, false);
     let st = open("ragged_256", safetensors_bytes(&w, &[]));
     let mut rng = SplitMix::new(99);
     let seqs: Vec<Vec<u32>> = (0..256usize)
@@ -768,10 +873,10 @@ fn full_ragged_batch_and_trace_match_serialized_with_bounded_queue() {
 /// `ple_run_bytes`, which read row-offset slices of the projection and column
 /// windows past a run's first layer. The embeddings agree within GEMM
 /// rounding, and each is the f64 forward's.
-#[test]
-fn per_layer_input_runs_agree() {
+fn per_layer_input_runs_agree_at(operands: GemmOperands) {
+    let Bounds { emb_abs, emb_cos, .. } = bounds(operands);
     let cfg = EmbedGemma2Config::from_config_json(CONFIG).unwrap();
-    let w = random_weights(&cfg, 11);
+    let w = weights_for(&cfg, 11, operands);
     let st = open("runs", safetensors_bytes(&w, &[]));
     let seqs = sequences(cfg.vocab);
     let refs: Vec<&[u32]> = seqs.iter().map(Vec::as_slice).collect();
@@ -779,7 +884,7 @@ fn per_layer_input_runs_agree() {
     let per_layer = rows * cfg.ple_dim as usize * 4;
     let dim = cfg.embedding_dim as usize;
     with_gpu(|rt| {
-        let mut model = EmbedGemma2Model::load(rt, &st, PREFIX, cfg.clone()).unwrap();
+        let mut model = EmbedGemma2Model::load_with(rt, &st, PREFIX, cfg.clone(), operands).unwrap();
         let all = model.encode(&refs, None, false).unwrap().embeddings;
         assert!(model.set_ple_run_bytes(0).is_err());
         for layers_per_run in [2usize, 1] {
@@ -793,7 +898,7 @@ fn per_layer_input_runs_agree() {
                 let e = &got[n * dim..(n + 1) * dim];
                 let (err, cos) = (max_abs(e, &want), cosine(e, &want));
                 assert!(
-                    err <= EMB_ABS && cos >= EMB_COS,
+                    err <= emb_abs && cos >= emb_cos,
                     "runs of {layers_per_run}, sequence {n}: max abs {err:.3e}, cosine {cos:.9}"
                 );
             }
@@ -808,39 +913,140 @@ fn per_layer_input_runs_agree() {
 #[test]
 fn dropping_the_model_releases_its_weights() {
     let cfg = EmbedGemma2Config::from_config_json(CONFIG).unwrap();
-    let w = random_weights(&cfg, 2026);
-    let st = open("drop", safetensors_bytes(&w, &[]));
+    for operands in MODES {
+        // Each tensor is held in the dtype it is stored in: f32 projections
+        // as f32 under `ExactF32`, bf16 ones as bf16 under `Bf16`.
+        let w = weights_for(&cfg, 2026, operands);
+        let st = open("drop", safetensors_bytes(&w, &[]));
+        with_gpu(|rt| {
+            rt.synchronize().unwrap();
+            let before = rt.current_allocated_bytes();
+            let model = EmbedGemma2Model::load_with(rt, &st, PREFIX, cfg.clone(), operands).unwrap();
+            let loaded = rt.current_allocated_bytes();
+            let weights: u64 =
+                w.0.iter()
+                    .map(|t| t.data.len() as u64 * if t.bf16 { 2 } else { 4 })
+                    .sum();
+            // Buffers under 16 KiB (the norms) are not charged one by one, so the
+            // load is held to half its bytes: enough to show the weights are seen.
+            assert!(
+                loaded >= before + weights / 2,
+                "{operands:?}: loading added {} bytes for {weights} of weights",
+                loaded - before
+            );
+            drop(model);
+            rt.synchronize().unwrap();
+            let after = rt.current_allocated_bytes();
+            assert!(
+                after <= before,
+                "{operands:?}: {} bytes still allocated after the model dropped",
+                after.saturating_sub(before)
+            );
+        });
+    }
+}
+
+/// `Bf16` keeps every projection at two bytes on the device where `ExactF32`
+/// widens it to four, and nothing else changes: the embedding table (bf16
+/// either way), the norms and the scalars are the same bytes. Exact, from the
+/// model's own accounting ([`EmbedGemma2Model::weight_bytes`]), and visible in
+/// the device's allocation.
+#[test]
+fn bf16_holds_the_projections_at_half_the_bytes() {
+    let cfg = EmbedGemma2Config::from_config_json(CONFIG).unwrap();
+    let w = weights_for(&cfg, 2026, GemmOperands::Bf16);
+    let st = open("bytes", safetensors_bytes(&w, &[]));
+    let projection_elems: u64 =
+        w.0.iter()
+            .filter(|t| t.bf16 && t.name != "embed_tokens.weight")
+            .map(|t| t.data.len() as u64)
+            .sum();
+    assert!(projection_elems > 0, "test bug: no projection is stored as bf16");
     with_gpu(|rt| {
-        rt.synchronize().unwrap();
-        let before = rt.current_allocated_bytes();
-        let model = EmbedGemma2Model::load(rt, &st, PREFIX, cfg.clone()).unwrap();
-        let loaded = rt.current_allocated_bytes();
-        let weights: u64 =
-            w.0.iter()
-                .map(|t| t.data.len() as u64 * if t.bf16 { 2 } else { 4 })
-                .sum();
-        // Buffers under 16 KiB (the norms) are not charged one by one, so the
-        // load is held to half its bytes: enough to show the weights are seen.
-        assert!(
-            loaded >= before + weights / 2,
-            "loading added {} bytes for {weights} of weights",
-            loaded - before
+        let (mut bytes, mut device) = (Vec::new(), Vec::new());
+        for operands in MODES {
+            rt.synchronize().unwrap();
+            let before = rt.current_allocated_bytes();
+            let model = EmbedGemma2Model::load_with(rt, &st, PREFIX, cfg.clone(), operands).unwrap();
+            device.push(rt.current_allocated_bytes() - before);
+            bytes.push(model.weight_bytes() as u64);
+        }
+        assert_eq!(
+            bytes[0] - bytes[1],
+            2 * projection_elems,
+            "ExactF32 holds {} bytes of weights, Bf16 {}: want a difference of 2 bytes for each of the {projection_elems} projection elements",
+            bytes[0],
+            bytes[1]
         );
-        drop(model);
-        rt.synchronize().unwrap();
-        let after = rt.current_allocated_bytes();
         assert!(
-            after <= before,
-            "{} bytes still allocated after the model dropped",
-            after.saturating_sub(before)
+            device[1] < device[0],
+            "the device holds {} bytes after a Bf16 load, {} after an ExactF32 one",
+            device[1],
+            device[0]
         );
     });
+}
+
+/// A `Bf16` load keeps the checkpoint's bf16 projections as they are, so it
+/// refuses one stored in another dtype by name instead of rounding it
+/// silently; the same file loads at `ExactF32`.
+#[test]
+fn bf16_load_refuses_projections_that_are_not_bf16() {
+    let cfg = EmbedGemma2Config::from_config_json(CONFIG).unwrap();
+    let w = random_weights(&cfg, 2026, false);
+    let st = open("f32_proj", safetensors_bytes(&w, &[]));
+    with_gpu(|rt| {
+        let err = EmbedGemma2Model::load_with(rt, &st, PREFIX, cfg.clone(), GemmOperands::Bf16)
+            .err()
+            .expect("a Bf16 load of f32 projections succeeded");
+        assert!(err.contains("BF16") && err.contains("proj"), "{err}");
+        EmbedGemma2Model::load_with(rt, &st, PREFIX, cfg.clone(), GemmOperands::ExactF32).unwrap();
+    });
+}
+
+/// The exact-f32 forward needs the runtime's relaxed (tf32-class) f32 GEMMs
+/// off and refuses to run otherwise. The bf16 forward runs no f32 GEMM (every
+/// projection takes bf16 operands), so the switch cannot touch it: it runs
+/// with the switch on, to the bit what it computes with it off.
+#[test]
+fn relaxed_precision_is_refused_by_exact_f32_and_moves_nothing_at_bf16() {
+    let cfg = EmbedGemma2Config::from_config_json(CONFIG).unwrap();
+    let seqs = sequences(cfg.vocab);
+    let refs: Vec<&[u32]> = seqs.iter().map(Vec::as_slice).collect();
+    let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+    for operands in MODES {
+        let w = weights_for(&cfg, 2026, operands);
+        let st = open("relaxed", safetensors_bytes(&w, &[]));
+        with_gpu(|rt| {
+            let model = EmbedGemma2Model::load_with(rt, &st, PREFIX, cfg.clone(), operands).unwrap();
+            let exact = model.encode(&refs, None, false).unwrap();
+            rt.set_relaxed_precision(true);
+            let relaxed = model.encode(&refs, None, false);
+            rt.set_relaxed_precision(false);
+            match operands {
+                GemmOperands::ExactF32 => {
+                    let err = relaxed.err().expect("ExactF32 ran with relaxed precision on");
+                    assert!(err.contains("exact-f32"), "{err}");
+                }
+                GemmOperands::Bf16 => assert_eq!(
+                    bits(&relaxed.expect("Bf16 refused relaxed precision").embeddings),
+                    bits(&exact.embeddings),
+                    "relaxed precision changed a bf16 embedding"
+                ),
+            }
+            // The refusal leaves the model usable.
+            assert_eq!(
+                bits(&model.encode(&refs, None, false).unwrap().embeddings),
+                bits(&exact.embeddings)
+            );
+        });
+    }
 }
 
 #[test]
 fn loader_refuses_tensors_it_would_ignore() {
     let cfg = EmbedGemma2Config::from_config_json(CONFIG).unwrap();
-    let w = random_weights(&cfg, 2026);
+    let w = random_weights(&cfg, 2026, false);
     with_gpu(|rt| {
         for extra in [
             "language_model.layers.1.self_attn.q_proj.bias",
@@ -875,7 +1081,7 @@ fn loader_refuses_tensors_it_would_ignore() {
 #[test]
 fn set_max_tokens_bounds_encode_and_refuses_out_of_range() {
     let cfg = EmbedGemma2Config::from_config_json(CONFIG).unwrap();
-    let w = random_weights(&cfg, 2026);
+    let w = random_weights(&cfg, 2026, false);
     let st = open("max_tokens", safetensors_bytes(&w, &[]));
     let seq = sequences(cfg.vocab).remove(0);
     let n = seq.len() as u32;
@@ -925,10 +1131,9 @@ fn set_max_tokens_bounds_encode_and_refuses_out_of_range() {
 /// encode for a Matryoshka prefix, in a shuffled input order, and when the
 /// shapes alternate large, small, large across calls (the shared activations
 /// are rewritten by forward n + 1 while forward n may still be queued).
-#[test]
-fn async_multi_forward_truncated_shuffled_and_repeated_stay_bitwise() {
+fn async_multi_forward_truncated_shuffled_and_repeated_stay_bitwise_at(operands: GemmOperands) {
     let cfg = EmbedGemma2Config::from_config_json(CONFIG).unwrap();
-    let w = random_weights(&cfg, 23);
+    let w = weights_for(&cfg, 23, operands);
     let st = open("async_adversarial", safetensors_bytes(&w, &[]));
     let seq = |n: u32, s: u32| -> Vec<u32> { (0..n).map(|i| (i * 7 + s * 11 + 2) % cfg.vocab).collect() };
     let long = seq(4000, 1);
@@ -943,7 +1148,7 @@ fn async_multi_forward_truncated_shuffled_and_repeated_stay_bitwise() {
     shuffled.swap(1, 4);
     let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
     with_gpu(|rt| {
-        let model = EmbedGemma2Model::load(rt, &st, PREFIX, cfg.clone()).unwrap();
+        let model = EmbedGemma2Model::load_with(rt, &st, PREFIX, cfg.clone(), operands).unwrap();
         let dim = cfg.embedding_dim as usize;
         let trunc = Some(cfg.embedding_dim / 2);
         rt.set_serialized_dispatch(true).unwrap();
@@ -994,16 +1199,15 @@ fn async_multi_forward_truncated_shuffled_and_repeated_stay_bitwise() {
 
 /// A failed encode (token past the vocab, truncate_dim 0) queues nothing and
 /// leaves the model usable: the next encode, async, equals the one before.
-#[test]
-fn rejected_encode_leaves_the_async_model_usable() {
+fn rejected_encode_leaves_the_async_model_usable_at(operands: GemmOperands) {
     let cfg = EmbedGemma2Config::from_config_json(CONFIG).unwrap();
-    let w = random_weights(&cfg, 5);
+    let w = weights_for(&cfg, 5, operands);
     let st = open("async_reject", safetensors_bytes(&w, &[]));
     let ok: Vec<u32> = (0..40).map(|i| i % cfg.vocab).collect();
     let bad: Vec<u32> = vec![1, cfg.vocab];
     let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
     with_gpu(|rt| {
-        let model = EmbedGemma2Model::load(rt, &st, PREFIX, cfg.clone()).unwrap();
+        let model = EmbedGemma2Model::load_with(rt, &st, PREFIX, cfg.clone(), operands).unwrap();
         rt.set_async_encode(true).unwrap();
         let first = model.encode(&[&ok], None, false);
         let r1 = model.encode(&[&ok, &bad], None, false);
@@ -1014,4 +1218,31 @@ fn rejected_encode_leaves_the_async_model_usable() {
         assert!(r1.is_err() && r2.is_err() && r3.is_err());
         assert_eq!(bits(&first.unwrap().embeddings), bits(&again.unwrap().embeddings));
     });
+}
+
+// The invariants above hold at both operand precisions: each test runs once at
+// `ExactF32` (under its original name) and once at `Bf16`.
+macro_rules! at_both_precisions {
+    ($($exact:ident, $bf16:ident => $inner:ident;)*) => {$(
+        #[test]
+        fn $exact() {
+            $inner(GemmOperands::ExactF32);
+        }
+
+        #[test]
+        fn $bf16() {
+            $inner(GemmOperands::Bf16);
+        }
+    )*};
+}
+
+at_both_precisions! {
+    encode_reuses_unzeroed_activations, bf16_encode_reuses_unzeroed_activations => encode_reuses_unzeroed_activations_at;
+    multi_forward_encode_waits_once_and_matches_synchronous, bf16_multi_forward_encode_waits_once_and_matches_synchronous
+        => multi_forward_encode_waits_once_and_matches_synchronous_at;
+    per_layer_input_runs_agree, bf16_per_layer_input_runs_agree => per_layer_input_runs_agree_at;
+    async_multi_forward_truncated_shuffled_and_repeated_stay_bitwise, bf16_async_multi_forward_truncated_shuffled_and_repeated_stay_bitwise
+        => async_multi_forward_truncated_shuffled_and_repeated_stay_bitwise_at;
+    rejected_encode_leaves_the_async_model_usable, bf16_rejected_encode_leaves_the_async_model_usable
+        => rejected_encode_leaves_the_async_model_usable_at;
 }

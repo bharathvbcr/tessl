@@ -33,11 +33,25 @@
 //!
 //! # Precision
 //!
-//! Weights are widened from the checkpoint's bf16 to f32 exactly (the
-//! embedding table stays bf16 and its gather widens exactly), every
-//! activation is f32 and every GEMM is exact f32: transformers' fp32 forward
-//! up to operation order, which is what `tests/embedgemma2_model.rs` holds it
-//! to. It needs the runtime's relaxed-f32 GEMM switched off (the default).
+//! [`EmbedGemma2Model::load`] is [`GemmOperands::ExactF32`]: weights are
+//! widened from the checkpoint's bf16 to f32 exactly (the embedding table
+//! stays bf16 and its gather widens exactly), every activation is f32 and every
+//! GEMM is exact f32: transformers' fp32 forward up to operation order, which
+//! is what `tests/embedgemma2_model.rs` holds it to. It needs the runtime's
+//! relaxed-f32 GEMM switched off (the default).
+//!
+//! [`EmbedGemma2Model::load_with`] with [`GemmOperands::Bf16`] keeps every
+//! projection as the checkpoint stores it, bf16, on the device (no f32 copy),
+//! and runs every GEMM with bf16 operands and f32 accumulation. The inputs of
+//! the GEMMs are rounded to bf16 where they are produced when a kernel can
+//! write bf16 (the norms, the GELU gates) and by a cast pass where one cannot
+//! (the attention output, the residual stream into the per-layer-input gate,
+//! the embeddings once per forward, the pooled vector); the residual stream,
+//! the norms, the attention, the pooling and the outputs of every GEMM stay f32.
+//! The embedding table is bf16 under both modes, so it does not change. No f32
+//! GEMM runs, so the runtime's relaxed-f32 switch does not matter and `encode`
+//! does not refuse it. `tests/embedgemma2_model.rs` holds this forward to
+//! transformers' bf16 forward the way `tests/qwen35_model.rs` holds Qwen3.5's.
 //!
 //! # Kernels
 //!
@@ -45,9 +59,10 @@
 //! TensorOps tiled kernel of `kernels/attn_tiled.h` at head dims 256 and 512,
 //! or one simdgroup per query row), [`segment_mean_rows`] and
 //! [`l2_normalize_rows`] (`kernels/embed_pool.metal`). The rest are tessl's:
-//! exact-f32 GEMMs (NN, and NT for the per-layer-input projection),
-//! `nn::rms_norm_f32`, `nn::rms_norm_residual_add_f32` (the post-norms and the
-//! layer scalar), `nn::scale_f32_inplace`, `qwen35::embed_rows_scaled` (the
+//! GEMMs, exact f32 or bf16 (NN, and NT for the per-layer-input projection),
+//! `nn::rms_norm_f32` (`nn::rms_norm_bf16` into a bf16 GEMM's input),
+//! `nn::rms_norm_residual_add_f32` (the post-norms and the layer scalar),
+//! `nn::scale_f32_inplace`, `qwen35::embed_rows_scaled` (the
 //! gather and the `sqrt(hidden)` scale), `qwen35::gated_act` (GELU-tanh over
 //! column windows) and `qwen35::attn_qk_norm_rope_columns` (`* w` norms,
 //! full-width RoPE, and the weightless V norm).
@@ -57,12 +72,12 @@ use std::sync::Arc;
 use objc2_metal::MTLComputePipelineState;
 
 use crate::dispatch::{dispatch_1d, dispatch_2d_tg, set_gpu_buf, set_u32};
-use crate::gemm::{gemm, gemm_nt_f32, GemmBackend};
+use crate::gemm::{cast_f32_to_bf16_into, gemm, gemm_nt_f32, GemmBackend, GemmOperands};
 use crate::json::{self, Json, Syntax};
 use crate::loader::Loader;
 use crate::nn::{
-    dispatch_tg_1d, reduce_tptg, require, require_disjoint_writes, rms_norm_f32, rms_norm_residual_add_f32,
-    scale_f32_inplace,
+    dispatch_tg_1d, reduce_tptg, require, require_disjoint_writes, rms_norm_bf16, rms_norm_f32,
+    rms_norm_residual_add_f32, scale_f32_inplace,
 };
 use crate::qwen35::{self, AttnShape, AttnTargets, Cols, GatedAct, LmHead, OutCols, QkvColumns};
 use crate::qwen35_model::Precision;
@@ -611,6 +626,9 @@ impl EmbedGemma2Config {
 // Model
 // ---------------------------------------------------------------------------
 
+/// The projections (`w_*`, `gate_up`, `down`, `ple_*`) are f32 under
+/// [`GemmOperands::ExactF32`] and bf16 under [`GemmOperands::Bf16`]; the norms
+/// are f32 under both.
 struct Layer {
     spec: LayerSpec,
     input_norm: GpuBuffer,
@@ -635,7 +653,7 @@ struct Layer {
 pub struct EmbedGemma2Model {
     cfg: EmbedGemma2Config,
     rt: Arc<GpuRuntime>,
-    /// `[vocab, hidden]` bf16, as the checkpoint holds it.
+    /// `[vocab, hidden]` bf16, as the checkpoint holds it, under either mode.
     embed: Tensor,
     /// The per-layer-input projection as the checkpoint holds it,
     /// `[n_layers * ple_dim, hidden]`: layer `i`'s rows are `[i * ple_dim,
@@ -647,6 +665,9 @@ pub struct EmbedGemma2Model {
     /// `[hidden, embedding_dim]`.
     projection: Tensor,
     layers: Vec<Layer>,
+    /// How the projections are held and the GEMMs run
+    /// ([`EmbedGemma2Model::load_with`]).
+    operands: GemmOperands,
     max_tokens: u32,
     /// See [`EmbedGemma2Model::set_ple_run_bytes`].
     ple_run_bytes: usize,
@@ -765,8 +786,10 @@ struct Acts {
     /// `seq`, and the positions past `seq` are never written or read.
     k: Tensor,
     v: Tensor,
-    /// The attention output; then, once the output projection has read it,
-    /// the MLP's `gelu_tanh(gate) * up` (sized for the wider of the two).
+    /// The attention output; then, under [`GemmOperands::ExactF32`], once the
+    /// output projection has read it, the MLP's `gelu_tanh(gate) * up` (sized
+    /// for the wider of the two). Under `Bf16` the MLP's lives in
+    /// [`Bf16Acts::wide`] and this is the attention output's width only.
     attn: Tensor,
     y: Tensor,
     /// The MLP's `gate | up`, `[rows, 2 * intermediate]`, from one GEMM.
@@ -775,7 +798,31 @@ struct Acts {
     /// (see [`PLE_RUN_BYTES`]).
     ple: Tensor,
     ple_gate: Tensor,
+    /// `gelu_tanh(ple_gate) * ple input`, what the layer's output projection
+    /// reads: f32, or bf16 under `Bf16`.
     ple_mid: Tensor,
+    pooled: Tensor,
+    bf16: Option<Bf16Acts>,
+}
+
+/// What [`GemmOperands::Bf16`] adds to [`Acts`]: the bf16 form of each GEMM
+/// input that no kernel writes in bf16 itself (a norm and the GELU gate do,
+/// into `x` and `wide`/`ple_mid`; the attention output, the residual stream,
+/// the embeddings and the pooled vector are cast). Persistent and unzeroed
+/// like the rest, so a GEMM never allocates its own rounded copy of an operand.
+struct Bf16Acts {
+    /// `[rows, hidden]`: the normed input of the `q|k|v` and `gate|up` GEMMs
+    /// (the norms write bf16 into it), then the rounded residual stream that
+    /// feeds the per-layer-input gate once those have read it.
+    x: Tensor,
+    /// `[rows, max(q_heads * head_dim, intermediate)]`: the rounded attention
+    /// output, then, once the output projection has read it, the MLP's
+    /// `gelu_tanh(gate) * up` (written bf16 by the gate kernel).
+    wide: Tensor,
+    /// `[rows, hidden]`: the rounded embeddings, the per-layer-input GEMM's
+    /// left operand, read by every run of layers.
+    embeds: Tensor,
+    /// `[sequences, hidden]`: the rounded pooled vectors.
     pooled: Tensor,
 }
 
@@ -817,7 +864,35 @@ impl EmbedGemma2Model {
     /// Every tensor's shape is checked against `cfg`; a missing one is an
     /// error, and so is any tensor under `prefix` the forward does not read
     /// (with an empty prefix, any tensor in the file).
+    ///
+    /// This is [`GemmOperands::ExactF32`] ([`Self::load_with`]): the
+    /// projections widened to f32, the GEMMs exact f32.
     pub fn load(rt: &Arc<GpuRuntime>, st: &SafeTensors, prefix: &str, cfg: EmbedGemma2Config) -> Result<Self, String> {
+        Self::load_with(rt, st, prefix, cfg, GemmOperands::ExactF32)
+    }
+
+    /// [`Self::load`] with the operand precision chosen
+    /// (see the module docs, Precision).
+    ///
+    /// * [`GemmOperands::ExactF32`]: every projection widened to f32 on the
+    ///   device, every GEMM exact f32 (transformers' fp32 forward up to
+    ///   operation order). `encode` refuses a runtime whose relaxed f32 GEMMs
+    ///   are on.
+    /// * [`GemmOperands::Bf16`]: every projection kept as the checkpoint stores
+    ///   it, bf16, with no f32 copy (the real checkpoint's weights are 0.54 GB
+    ///   against 0.82 GB, and each forward reads the projections at half the
+    ///   width), and every GEMM run with bf16 operands and f32 accumulation.
+    ///   The checkpoint's projections must be bf16 (a tensor stored in another
+    ///   dtype is refused by name rather than rounded), and the device needs
+    ///   TensorOps. `encode` accepts a runtime with relaxed f32 GEMMs on, which
+    ///   no GEMM of this forward uses.
+    pub fn load_with(
+        rt: &Arc<GpuRuntime>,
+        st: &SafeTensors,
+        prefix: &str,
+        cfg: EmbedGemma2Config,
+        operands: GemmOperands,
+    ) -> Result<Self, String> {
         let ld = Loader::new(rt, st, prefix);
         let (h, ple, inter, vocab) = (
             cfg.hidden as usize,
@@ -826,17 +901,39 @@ impl EmbedGemma2Model {
             cfg.vocab as usize,
         );
         let n_layers = cfg.layers.len();
-        let f32 = Precision::F32;
+        let proj = match operands {
+            GemmOperands::ExactF32 => Precision::F32,
+            GemmOperands::Bf16 => {
+                if !rt.has_tensorops() {
+                    return Err(
+                        "EmbedGemma2Model::load_with: bf16 operands need TensorOps, which this device lacks".into(),
+                    );
+                }
+                Precision::Bf16
+            }
+        };
 
         // Read straight into the device table: no host copy.
         let embed = rt.alloc_tensor_bf16_hot(&[vocab, h])?;
         ld.bf16_into("embed_tokens.weight", &[vocab, h], &embed)?;
-        // Widened straight into the device tensor, in the checkpoint's layout.
-        let ple_w = rt.alloc_tensor_f32_hot(&[n_layers * ple, h])?;
-        ld.f32_into("ple.per_layer_model_projection.weight", &[n_layers * ple, h], &ple_w)?;
+        // In the checkpoint's layout, straight into the device tensor: widened
+        // to f32, or as stored.
+        let ple_name = "ple.per_layer_model_projection.weight";
+        let ple_w = match proj {
+            Precision::F32 => {
+                let t = rt.alloc_tensor_f32_hot(&[n_layers * ple, h])?;
+                ld.f32_into(ple_name, &[n_layers * ple, h], &t)?;
+                t
+            }
+            Precision::Bf16 => {
+                let t = rt.alloc_tensor_bf16_hot(&[n_layers * ple, h])?;
+                ld.bf16_into(ple_name, &[n_layers * ple, h], &t)?;
+                t
+            }
+        };
         let ple_norm = ld.norm("ple.per_layer_projection_norm.weight", ple)?;
         let final_norm = ld.norm("norm.weight", h)?;
-        let projection = ld.linear(&[("embedding_projection.weight", cfg.embedding_dim as usize)], h, f32)?;
+        let projection = ld.linear(&[("embedding_projection.weight", cfg.embedding_dim as usize)], h, proj)?;
 
         let mut layers = Vec::with_capacity(n_layers);
         for (i, &spec) in cfg.layers.iter().enumerate() {
@@ -855,19 +952,19 @@ impl EmbedGemma2Model {
                         (&p("self_attn.v_proj.weight"), kv * d),
                     ],
                     h,
-                    f32,
+                    proj,
                 )?,
-                w_o: ld.linear(&[(&p("self_attn.o_proj.weight"), h)], q * d, f32)?,
+                w_o: ld.linear(&[(&p("self_attn.o_proj.weight"), h)], q * d, proj)?,
                 q_norm: ld.norm(&p("self_attn.q_norm.weight"), d)?,
                 k_norm: ld.norm(&p("self_attn.k_norm.weight"), d)?,
                 gate_up: ld.linear(
                     &[(&p("mlp.gate_proj.weight"), inter), (&p("mlp.up_proj.weight"), inter)],
                     h,
-                    f32,
+                    proj,
                 )?,
-                down: ld.linear(&[(&p("mlp.down_proj.weight"), h)], inter, f32)?,
-                ple_gate: ld.linear(&[(&p("ple_block.per_layer_input_gate.weight"), ple)], h, f32)?,
-                ple_out: ld.linear(&[(&p("ple_block.per_layer_projection.weight"), h)], ple, f32)?,
+                down: ld.linear(&[(&p("mlp.down_proj.weight"), h)], inter, proj)?,
+                ple_gate: ld.linear(&[(&p("ple_block.per_layer_input_gate.weight"), ple)], h, proj)?,
+                ple_out: ld.linear(&[(&p("ple_block.per_layer_projection.weight"), h)], ple, proj)?,
                 post_ple_norm: ld.norm(&p("ple_block.post_per_layer_input_norm.weight"), h)?,
                 layer_scalar: ld.scalar(&p("layer_scalar"))?,
             });
@@ -883,6 +980,7 @@ impl EmbedGemma2Model {
             final_norm,
             projection,
             layers,
+            operands,
             max_tokens: DEFAULT_MAX_TOKENS,
             ple_run_bytes: PLE_RUN_BYTES,
         })
@@ -890,6 +988,41 @@ impl EmbedGemma2Model {
 
     pub fn config(&self) -> &EmbedGemma2Config {
         &self.cfg
+    }
+
+    /// The operand precision this model was loaded with.
+    pub fn operands(&self) -> GemmOperands {
+        self.operands
+    }
+
+    /// Bytes of weights held on the device: the embedding table, every
+    /// projection in the dtype the mode holds it in, and the norms (f32). The
+    /// activations are not counted.
+    pub fn weight_bytes(&self) -> usize {
+        let t = |t: &Tensor| t.nbytes_logical();
+        let l: usize = self
+            .layers
+            .iter()
+            .map(|l| {
+                [&l.w_qkv, &l.w_o, &l.gate_up, &l.down, &l.ple_gate, &l.ple_out]
+                    .into_iter()
+                    .map(t)
+                    .sum::<usize>()
+                    + [
+                        &l.input_norm,
+                        &l.post_attn_norm,
+                        &l.pre_ffn_norm,
+                        &l.post_ffn_norm,
+                        &l.q_norm,
+                        &l.k_norm,
+                        &l.post_ple_norm,
+                    ]
+                    .into_iter()
+                    .map(GpuBuffer::nbytes)
+                    .sum::<usize>()
+            })
+            .sum();
+        t(&self.embed) + t(&self.ple_w) + t(&self.projection) + self.ple_norm.nbytes() + self.final_norm.nbytes() + l
     }
 
     pub fn max_tokens(&self) -> u32 {
@@ -971,7 +1104,7 @@ impl EmbedGemma2Model {
         if trace && batch.len() != 1 {
             return Err(format!("{WHAT}: trace takes one sequence, got {}", batch.len()));
         }
-        if self.rt.f32_gemm_runs_relaxed() {
+        if self.operands == GemmOperands::ExactF32 && self.rt.f32_gemm_runs_relaxed() {
             return Err(format!(
                 "{WHAT}: the forward needs exact-f32 GEMMs; switch the runtime's relaxed precision off"
             ));
@@ -1129,7 +1262,24 @@ impl EmbedGemma2Model {
         let at = |t: &Tensor, cols: u32| view(t, rows_u, cols);
         let (embeds, resid, x, y) = (at(&a.embeds, h)?, at(&a.resid, h)?, at(&a.x, h)?, at(&a.y, h)?);
         let inter = cfg.intermediate;
-        let (gate_up, mid) = (at(&a.gate_up, 2 * inter)?, at(&a.attn, inter)?);
+        // Under `Bf16`, each GEMM input that has a bf16 staging reads that
+        // instead of its f32 buffer. Each costs the kernel that writes it
+        // nothing (a norm or a GELU gate writes bf16 in place of f32) or one
+        // elementwise cast pass: the attention output and the residual stream
+        // once per layer, the embeddings and the pooled vectors once per forward.
+        // A cast reads 4 bytes and writes 2 per element, against the GEMM
+        // reading the operand at half the width and no per-GEMM copy: the
+        // rounded copies are made once, into these buffers, never allocated.
+        let bf = a.bf16.as_ref();
+        let (x_in, embeds_in) = match bf {
+            Some(b) => (at(&b.x, h)?, at(&b.embeds, h)?),
+            None => (x.clone(), embeds.clone()),
+        };
+        let gate_up = at(&a.gate_up, 2 * inter)?;
+        let mid = match bf {
+            Some(b) => view(&b.wide, rows_u, inter)?,
+            None => at(&a.attn, inter)?,
+        };
         let (ple_gate, ple_mid) = (at(&a.ple_gate, cfg.ple_dim)?, at(&a.ple_mid, cfg.ple_dim)?);
         let (n_layers, pd) = (self.layers.len(), cfg.ple_dim as usize);
         // Layers whose per-layer inputs one GEMM forms: as many as `a.ple`
@@ -1152,16 +1302,25 @@ impl EmbedGemma2Model {
             &embeds.buffer,
         )?;
         gpu_copy(&embeds, &resid)?;
+        if bf.is_some() {
+            cast_f32_to_bf16_into(&embeds, &embeds_in)?;
+        }
+        // The normed input of the GEMMs that read `x_in`: bf16 straight from
+        // the norm under `Bf16`.
+        let norm_x_in = |weight: &GpuBuffer| match bf {
+            Some(_) => rms_norm_bf16(rt, &resid.buffer, weight, &x_in.buffer, rows_u, h, eps),
+            None => rms_norm_f32(rt, &resid.buffer, weight, &x_in.buffer, rows_u, h, eps),
+        };
 
         let mut out_trace = Vec::new();
         let ple_scale = (h as f32).powf(-0.5);
         for (i, layer) in self.layers.iter().enumerate() {
             let s = layer.spec;
             // Attention.
-            rms_norm_f32(rt, &resid.buffer, &layer.input_norm, &x.buffer, rows_u, h, eps)?;
+            norm_x_in(&layer.input_norm)?;
             let qkv_width = (cfg.q_heads + 2 * s.kv_heads) * s.head_dim;
             let qkv = at(&a.qkv, qkv_width)?;
-            gemm(&x, &layer.w_qkv, &qkv, BACKEND)?;
+            self.project(&x_in, &layer.w_qkv, &qkv)?;
             qwen35::attn_qk_norm_rope_columns(
                 rt,
                 &AttnShape {
@@ -1208,13 +1367,21 @@ impl EmbedGemma2Model {
                     scale: 1.0,
                 },
             )?;
-            let attn = at(&a.attn, cfg.q_heads * s.head_dim)?;
-            gemm(&attn, &layer.w_o, &y, BACKEND)?;
+            let attn_width = cfg.q_heads * s.head_dim;
+            let attn = at(&a.attn, attn_width)?;
+            match bf {
+                Some(b) => {
+                    let attn_in = view(&b.wide, rows_u, attn_width)?;
+                    cast_f32_to_bf16_into(&attn, &attn_in)?;
+                    self.project(&attn_in, &layer.w_o, &y)?;
+                }
+                None => self.project(&attn, &layer.w_o, &y)?,
+            }
             rms_norm_residual_add_f32(rt, &y.buffer, &layer.post_attn_norm, &resid.buffer, rows_u, h, eps, 1.0)?;
 
             // MLP.
-            rms_norm_f32(rt, &resid.buffer, &layer.pre_ffn_norm, &x.buffer, rows_u, h, eps)?;
-            gemm(&x, &layer.gate_up, &gate_up, BACKEND)?;
+            norm_x_in(&layer.pre_ffn_norm)?;
+            self.project(&x_in, &layer.gate_up, &gate_up)?;
             let window = |off: u32| Cols {
                 buf: &gate_up.buffer,
                 ld: 2 * inter,
@@ -1227,12 +1394,12 @@ impl EmbedGemma2Model {
                 window(inter),
                 OutCols {
                     cols: Cols::dense(&mid.buffer, inter),
-                    dtype: DType::F32,
+                    dtype: mid.dtype,
                 },
                 rows_u,
                 inter,
             )?;
-            gemm(&mid, &layer.down, &y, BACKEND)?;
+            self.project(&mid, &layer.down, &y)?;
             rms_norm_residual_add_f32(rt, &y.buffer, &layer.post_ffn_norm, &resid.buffer, rows_u, h, eps, 1.0)?;
 
             // Per-layer input: at the first layer of each run, one GEMM over
@@ -1244,7 +1411,10 @@ impl EmbedGemma2Model {
                 ple_ld = (k * pd) as u32;
                 let w = self.ple_w.try_view(&[k * pd, h as usize], i * pd * h as usize)?;
                 let out = at(&a.ple, ple_ld)?;
-                gemm_nt_f32(&embeds, &w, &out, BACKEND)?;
+                match self.operands {
+                    GemmOperands::ExactF32 => gemm_nt_f32(&embeds_in, &w, &out, BACKEND)?,
+                    GemmOperands::Bf16 => GemmOperands::Bf16.nt(&embeds_in, &w, &out)?,
+                }
                 scale_f32_inplace(rt, &out.buffer, ple_scale, rows_u * ple_ld)?;
                 rms_norm_f32(
                     rt,
@@ -1256,7 +1426,16 @@ impl EmbedGemma2Model {
                     eps,
                 )?;
             }
-            gemm(&resid, &layer.ple_gate, &ple_gate, BACKEND)?;
+            match bf {
+                // The residual stream stays f32; `x_in` is free again (the
+                // GEMMs that read the normed input have), so it holds the
+                // rounded copy the gate projection reads.
+                Some(_) => {
+                    cast_f32_to_bf16_into(&resid, &x_in)?;
+                    self.project(&x_in, &layer.ple_gate, &ple_gate)?;
+                }
+                None => self.project(&resid, &layer.ple_gate, &ple_gate)?,
+            }
             qwen35::gated_act(
                 rt,
                 GatedAct::GeluTanh,
@@ -1268,12 +1447,12 @@ impl EmbedGemma2Model {
                 },
                 OutCols {
                     cols: Cols::dense(&ple_mid.buffer, cfg.ple_dim),
-                    dtype: DType::F32,
+                    dtype: ple_mid.dtype,
                 },
                 rows_u,
                 cfg.ple_dim,
             )?;
-            gemm(&ple_mid, &layer.ple_out, &y, BACKEND)?;
+            self.project(&ple_mid, &layer.ple_out, &y)?;
             rms_norm_residual_add_f32(
                 rt,
                 &y.buffer,
@@ -1293,7 +1472,14 @@ impl EmbedGemma2Model {
         let (pooled, out) = (view(&a.pooled, nb, h)?, view(&io.out, nb, cfg.embedding_dim)?);
         rms_norm_f32(rt, &resid.buffer, &self.final_norm, &x.buffer, rows_u, h, eps)?;
         segment_mean_rows(rt, &x.buffer, &io.segments, &pooled.buffer, nb, rows_u, h)?;
-        gemm(&pooled, &self.projection, &out, BACKEND)?;
+        match bf {
+            Some(b) => {
+                let pooled_in = view(&b.pooled, nb, h)?;
+                cast_f32_to_bf16_into(&pooled, &pooled_in)?;
+                self.project(&pooled_in, &self.projection, &out)?;
+            }
+            None => self.project(&pooled, &self.projection, &out)?,
+        }
         // A Matryoshka prefix normalizes its own columns; the rest are not read.
         l2_normalize_rows(rt, &out.buffer, nb, dim_out, cfg.embedding_dim)?;
         if trace {
@@ -1301,6 +1487,16 @@ impl EmbedGemma2Model {
             out_trace.push(x.buffer.try_contents_f32()?[..rows * h as usize].to_vec());
         }
         Ok(out_trace)
+    }
+
+    /// `out = a @ w` at the model's operand precision. `a` is in the mode's
+    /// activation dtype (f32, or bf16 under `Bf16`, as `forward` stages it), so
+    /// neither lane rounds or allocates anything of its own here.
+    fn project(&self, a: &Tensor, w: &Tensor, out: &Tensor) -> Result<(), String> {
+        match self.operands {
+            GemmOperands::ExactF32 => gemm(a, w, out, BACKEND),
+            GemmOperands::Bf16 => GemmOperands::Bf16.nn(a, w, out),
+        }
     }
 
     /// [`Acts`] for forwards of up to `rows` padded rows over up to `nb`
@@ -1321,6 +1517,8 @@ impl EmbedGemma2Model {
             kv_w = kv_w.max(kv * d);
         }
         let f32s = |shape: &[usize]| rt.alloc_tensor_unzeroed(shape, DType::F32);
+        let bf16 = self.operands == GemmOperands::Bf16;
+        let bf16s = |shape: &[usize]| rt.alloc_tensor_unzeroed(shape, DType::BF16);
         Ok(Acts {
             rows: r,
             nb,
@@ -1331,15 +1529,26 @@ impl EmbedGemma2Model {
             q: f32s(&[r, q_w])?,
             k: f32s(&[r, kv_w])?,
             v: f32s(&[r, kv_w])?,
-            attn: f32s(&[r, q_w.max(inter)])?,
+            // Under `Bf16` the MLP's activation lives in `Bf16Acts::wide`.
+            attn: f32s(&[r, if bf16 { q_w } else { q_w.max(inter) }])?,
             y: f32s(&[r, h])?,
             gate_up: f32s(&[r, 2 * inter])?,
             // A run of per-layer inputs: within `ple_run_bytes`, or one layer's
             // when even that is larger, and never more than every layer's.
             ple: f32s(&[(self.ple_run_bytes / 4).max(r * ple).min(r * ple * cfg.layers.len())])?,
             ple_gate: f32s(&[r, ple])?,
-            ple_mid: f32s(&[r, ple])?,
+            ple_mid: if bf16 { bf16s(&[r, ple])? } else { f32s(&[r, ple])? },
             pooled: f32s(&[nb, h])?,
+            bf16: if bf16 {
+                Some(Bf16Acts {
+                    x: bf16s(&[r, h])?,
+                    wide: bf16s(&[r, q_w.max(inter)])?,
+                    embeds: bf16s(&[r, h])?,
+                    pooled: bf16s(&[nb, h])?,
+                })
+            } else {
+                None
+            },
         })
     }
 }

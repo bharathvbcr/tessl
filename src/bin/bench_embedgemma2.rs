@@ -19,14 +19,21 @@
 //!   texts).
 //!
 //! `BENCH_ITERS` (default 10) and `BENCH_WARMUP` (default 3) are per
-//! workload. `BENCH_ASYNC=1` runs the runtime with `set_async_encode(true)`
-//! (default off, as every library caller runs): only then does a dispatch
-//! return before the GPU finishes it, so the forwards of one `encode` queue
-//! back to back and the host waits once; with it off every dispatch commits
-//! and waits and the forwards cannot overlap. Each object carries
-//! `"async":0|1`. Prints one JSON array on stdout, one object per workload:
-//! `{workload, backend, ms_min, ms_median, iters, async, forwards,
-//! device_peak_mib, peak_footprint_mib}`. `device_peak_mib` is the device's peak allocation
+//! workload. `encode` queues its dispatches and waits once whatever the
+//! runtime's `async_encode` flag says (it opens a `GpuRuntime::async_scope`),
+//! so `BENCH_ASYNC=1` (`set_async_encode(true)`) no longer changes how it
+//! runs; it is kept so older result files' lanes can be re-run. Each object
+//! carries `"async":0|1`. `BENCH_SERIALIZED=1` (`set_serialized_dispatch`)
+//! makes every dispatch commit and wait, which is how `encode` ran on a
+//! default runtime before the scope: the baseline for what queueing is worth.
+//! Each object carries `"serialized":0|1`. `BENCH_PRECISION=f32|bf16` (default `f32`) picks the
+//! operand precision the model is loaded with
+//! ([`EmbedGemma2Model::load_with`]: `GemmOperands::ExactF32` or `Bf16`); the
+//! object's `backend` says which (`tessl-f32`, `tessl-bf16`) and `weight_mib`
+//! is the model's weight bytes on the device. Prints one JSON array on stdout,
+//! one object per workload: `{workload, backend, ms_min, ms_median, iters,
+//! async, serialized, forwards, weight_mib, device_peak_mib, peak_footprint_mib}`.
+//! `device_peak_mib` is the device's peak allocation
 //! during that workload above the loaded model
 //! ([`GpuRuntime::peak_allocated_bytes`]); `peak_footprint_mib` is the
 //! process's lifetime peak physical footprint so far (what `/usr/bin/time -l`
@@ -50,6 +57,7 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 use tessl::embedgemma2::{EmbedGemma2Config, EmbedGemma2Model};
+use tessl::gemm::GemmOperands;
 use tessl::safetensors::SafeTensors;
 use tessl::GpuRuntime;
 
@@ -120,7 +128,19 @@ fn main() -> Result<(), String> {
         Ok(other) => return Err(format!("BENCH_ASYNC={other:?}: expected 0 or 1")),
     };
     rt.set_async_encode(async_encode)?;
-    let model = EmbedGemma2Model::load(&rt, &st, "language_model.", cfg.clone())?;
+    let serialized = match std::env::var("BENCH_SERIALIZED").as_deref() {
+        Err(_) | Ok("0") => false,
+        Ok("1") => true,
+        Ok(other) => return Err(format!("BENCH_SERIALIZED={other:?}: expected 0 or 1")),
+    };
+    rt.set_serialized_dispatch(serialized)?;
+    let (operands, backend) = match std::env::var("BENCH_PRECISION").as_deref() {
+        Err(_) | Ok("f32") => (GemmOperands::ExactF32, "tessl-f32"),
+        Ok("bf16") => (GemmOperands::Bf16, "tessl-bf16"),
+        Ok(other) => return Err(format!("BENCH_PRECISION={other:?}: expected f32 or bf16")),
+    };
+    let model = EmbedGemma2Model::load_with(&rt, &st, "language_model.", cfg.clone(), operands)?;
+    let weight_mib = model.weight_bytes() as f64 / MIB;
     let dim = cfg.embedding_dim as usize;
     let loaded = rt.current_allocated_bytes();
 
@@ -152,10 +172,11 @@ fn main() -> Result<(), String> {
         ms.sort_by(f64::total_cmp);
         let device_peak = rt.peak_allocated_bytes().saturating_sub(loaded);
         rows.push(format!(
-            "{{\"workload\":\"{name}\",\"backend\":\"tessl-f32\",\"ms_min\":{:.4},\"ms_median\":{:.4},\"iters\":{iters},\"async\":{},\"forwards\":{},\"device_peak_mib\":{:.1},\"peak_footprint_mib\":{:.1}}}",
+            "{{\"workload\":\"{name}\",\"backend\":\"{backend}\",\"ms_min\":{:.4},\"ms_median\":{:.4},\"iters\":{iters},\"async\":{},\"serialized\":{},\"forwards\":{},\"weight_mib\":{weight_mib:.1},\"device_peak_mib\":{:.1},\"peak_footprint_mib\":{:.1}}}",
             ms[0],
             ms[ms.len() / 2],
             u8::from(async_encode),
+            u8::from(serialized),
             out.forwards,
             device_peak as f64 / MIB,
             peak_footprint()? as f64 / MIB,

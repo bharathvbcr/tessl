@@ -84,34 +84,49 @@ fn replay_emits_exactly_the_captured_barrier_markers() {
 
 /// The unmarked last command must still be ordered before whatever the runtime
 /// encodes next: dropping its pending hazard would be a missing barrier.
+///
+/// Async encode is what keeps one encoder (and its pending hazard) across
+/// scopes; the sync path commits each scope on its own. Buffers are prepared
+/// before the tape runs, because a host write waits for the GPU and so
+/// commits the open batch, which would clear the hazard under test.
 #[test]
 fn the_last_unmarked_command_still_orders_the_next_scope() {
     let _g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let live = |rt: &GpuRuntime| {
+    type Prep = (
+        std::sync::Arc<GpuRuntime>,
+        tessl::tensor::GpuBuffer,
+        tessl::tensor::GpuBuffer,
+        tessl::tensor::GpuBuffer,
+    );
+    let prep = || -> Prep {
+        let rt = GpuRuntime::new().unwrap();
+        rt.set_async_encode(true).unwrap();
+        let a = rt.alloc_buffer_hot(N * 4).unwrap();
+        let b = rt.alloc_buffer_hot(N * 4).unwrap();
+        let n = rt.alloc_buffer_hot(4).unwrap();
+        n.write_u32(&[N as u32]);
+        (rt, a, b, n)
+    };
+    let live = |(rt, a, b, n): &Prep| {
         let p = rt.pipeline("copy_f32").unwrap();
         let (res, snap) = traced(|| {
-            let a = rt.alloc_buffer_hot(N * 4).unwrap();
-            let b = rt.alloc_buffer_hot(N * 4).unwrap();
-            let n = rt.alloc_buffer_hot(4).unwrap();
-            n.write_u32(&[N as u32]);
             tessl::dispatch::dispatch_1d(rt, &p, N, |bnd| {
-                tessl::dispatch::set_gpu_buf(bnd, &a, 0);
-                tessl::dispatch::set_gpu_buf(bnd, &b, 1);
-                tessl::dispatch::set_gpu_buf(bnd, &n, 2);
+                tessl::dispatch::set_gpu_buf(bnd, a, 0);
+                tessl::dispatch::set_gpu_buf(bnd, b, 1);
+                tessl::dispatch::set_gpu_buf(bnd, n, 2);
             })
         });
         res.unwrap();
         rt.synchronize().unwrap();
         snap.barriers
     };
-    let baseline = live(&GpuRuntime::new().unwrap());
+    let baseline = live(&prep());
 
-    let rt = GpuRuntime::new().unwrap();
-    let mut dec = tape(&rt, [false; CMDS]);
-    dec.execute(&rt).unwrap();
-    let after_tape = live(&rt);
+    let after = prep();
+    let mut dec = tape(&after.0, [false; CMDS]);
+    dec.execute(&after.0).unwrap();
     assert_eq!(
-        after_tape,
+        live(&after),
         baseline + 1,
         "the tape's unbarriered last command must be ordered before the next dispatch"
     );

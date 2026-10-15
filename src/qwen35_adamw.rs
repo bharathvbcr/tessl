@@ -28,7 +28,10 @@
 //!   the rules are an f32 master copy ([`UpdateRule::F32Master`], 4 bytes per
 //!   weight more), a bf16 Kahan compensation ([`UpdateRule::Bf16Kahan`], 2
 //!   bytes), or stochastic rounding ([`UpdateRule::Bf16Stochastic`],
-//!   nothing). Parameters stored in f32 (an f32 model's, and a bf16 model's
+//!   nothing). The documented default for bf16 storage is stochastic
+//!   rounding ([`UpdateRule::bf16_default`]): on the 2B loss curve it was
+//!   the only rule whose training loss stayed inside the 2% per-step bound.
+//!   Parameters stored in f32 (an f32 model's, and a bf16 model's
 //!   norms, conv, `A_log` and `dt_bias`) are updated in f32 under any rule.
 //! - [`MomentStorage`]: both moments in f32 (8 bytes per weight), bf16 (4),
 //!   or 8-bit codes in blocks of [`MOMENT_BLOCK`] with one f32 scale each
@@ -100,7 +103,22 @@ pub enum UpdateRule {
     /// A bf16 model: each new weight is rounded up or down with probability
     /// equal to the distance, from bits hashed from `seed`, the step count,
     /// the parameter-table index and the element, so a run is reproducible.
+    /// This is the documented default for bf16 storage ([`Self::bf16_default`]).
     Bf16Stochastic { seed: u64 },
+}
+
+impl UpdateRule {
+    /// The documented default update rule for a bf16-stored model.
+    ///
+    /// Stochastic rounding is the only rule whose training loss stayed
+    /// within 2% of the f32 run at every step of the 2B loss curve (worst
+    /// 0.74% across 90 steps). Round-to-nearest exceeded that bound on
+    /// 15–16 of those steps (worst 4.6%). `seed` is hashed with the step,
+    /// the parameter and the element, so the same seed repeats. Moment
+    /// storage is chosen separately.
+    pub const fn bf16_default(seed: u64) -> Self {
+        Self::Bf16Stochastic { seed }
+    }
 }
 
 /// What both moments are stored as (see the module docs).
@@ -257,7 +275,8 @@ impl AdamW {
 
     /// Zeroed state for `model` in `config`'s stored precision. An f32
     /// model takes [`UpdateRule::F32`] and a bf16 model one of the bf16
-    /// rules; any [`MomentStorage`] goes with either. An f32 master starts
+    /// rules; the documented default is [`UpdateRule::bf16_default`].
+    /// Any [`MomentStorage`] goes with either. An f32 master starts
     /// as the model's current weights.
     pub fn with_config(model: &Qwen35Model, config: AdamWConfig) -> Result<Self, String> {
         const WHAT: &str = "AdamW::with_config";
@@ -1178,6 +1197,16 @@ impl Qwen35Model {
 #[cfg(test)]
 mod step_kernel_tests {
     use super::*;
+
+    /// bf16 storage's documented default is stochastic rounding, not a
+    /// round-to-nearest rule.
+    #[test]
+    fn bf16_storage_default_update_rule_is_stochastic_rounding() {
+        assert_eq!(UpdateRule::bf16_default(7), UpdateRule::Bf16Stochastic { seed: 7 });
+        assert_ne!(UpdateRule::bf16_default(7), UpdateRule::F32Master);
+        assert_ne!(UpdateRule::bf16_default(7), UpdateRule::Bf16Kahan);
+        assert_ne!(UpdateRule::bf16_default(7), UpdateRule::F32);
+    }
 
     /// The table names exactly the kernels the names were formatted as.
     #[test]

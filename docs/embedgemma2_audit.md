@@ -97,6 +97,17 @@ and gates, pooling), so the next kernel to fuse or rewrite is unranked.
 "inferred … not isolated" (packed gate|up, per-layer-input run buffer).
 **verified** (committed result says so).
 
+**Resolved by measurement** (lane D, `embedgemma2_stage_profile_m5pro.txt`,
+reconciled to 0.01 MiB): the packed gate|up *saves* 64 MiB; one activation
+set at 8192 rows grew 576 → 736 MiB because the per-layer-input run buffer
+is 256 MiB instead of 16. The table's figure doubles it: `encode` drops its
+activations after its last wait, the pool recycles them only at the next
+commit, and the next `encode` allocates first, so two sets are live (1472
+MiB, 736 with a commit between calls), and the three rows are one number
+carried by the freelist cache. Fixes: release before returning, a 16 MiB
+per-layer-input run (no measurable time), and aliasing qkv with gate|up
+(inferred 96 MiB).
+
 ### G7. Many small elementwise dispatches per layer
 
 Per layer: three RMSNorm-residual adds, two RMSNorms, two gated activations,

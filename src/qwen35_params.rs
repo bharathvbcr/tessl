@@ -31,7 +31,7 @@ use crate::nn::require_runtime;
 use crate::qwen35_model::{Mixer, Precision, Qwen35Model};
 use crate::qwen35_train::{MixerGrads, Qwen35Grads};
 use crate::runtime::GpuRuntime;
-use crate::tensor::{bf16_bits_to_f32, f32_to_bf16_bits, DType, GpuBuffer, Tensor};
+use crate::tensor::{bf16_bits_to_f32, f32_to_bf16_bits_gpu, DType, GpuBuffer, Tensor};
 
 /// One parameter.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -244,7 +244,7 @@ pub(crate) fn window_read_host(w: &Window<'_>, dst: &mut [f32], what: &str) -> R
 }
 
 /// `src` into `window`, on the host, as [`window_read_host`] reads it (a bf16
-/// window takes each value rounded to nearest). `before_first_byte` runs once
+/// window takes each value as the GPU copy stores it, [`f32_to_bf16_bits_gpu`]). `before_first_byte` runs once
 /// the mapping is held and before anything is written, so a refused mapping
 /// has run nothing.
 pub(crate) fn window_write_host(
@@ -273,7 +273,7 @@ pub(crate) fn window_write_host(
             let base = w.byte_off / 2 + w.off;
             for (r, row) in rows.enumerate() {
                 for (d, &x) in m[base + r * w.ld..][..w.width].iter_mut().zip(row) {
-                    *d = f32_to_bf16_bits(x);
+                    *d = f32_to_bf16_bits_gpu(x);
                 }
             }
         }
@@ -613,7 +613,7 @@ impl Qwen35Model {
 
     /// Set parameter-table entry `index` from `src` on the host, laid out as
     /// [`Self::read_parameter_host`] reads it (a bf16 matrix takes each value
-    /// rounded to nearest). The index, the length and the model are checked
+    /// stored as the GPU copy stores it: rounded to nearest even, a NaN canonical, an f32 subnormal flushed to a signed zero, see [`crate::tensor::f32_to_bf16_bits_gpu`]). The index, the length and the model are checked
     /// before anything moves, and the parameter generation is bumped once
     /// the mapping is held, before the first byte lands: a
     /// [`crate::qwen35_train::PendingStep`], [`crate::qwen35_model::Decode`]

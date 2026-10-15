@@ -558,12 +558,13 @@ fn host_write_rounds_like_the_gpu_write_bit_for_bit() {
         let diff: Vec<(usize, u32, u32, u32)> = (0..host.len())
             .filter(|&k| host[k] != gpu[i][k])
             .map(|k| (k, vals[i][k].to_bits(), gpu[i][k], host[k]))
-            .take(4)
             .collect();
         assert!(
             diff.is_empty(),
-            "{}: (index, input bits, gpu bits, host bits) {diff:x?}",
-            p.name
+            "{}: {} of {} differ; (index, input bits, gpu bits, host bits) {diff:x?}",
+            p.name,
+            diff.len(),
+            host.len()
         );
     }
 }
@@ -585,5 +586,42 @@ fn per_entry_host_calls_refuse_on_a_poisoned_runtime() {
         ("write_parameter_host", model.write_parameter_host(1, &vec![7.0; n])),
     ] {
         assert!(r.is_err(), "{what} succeeded on a poisoned runtime");
+    }
+}
+
+/// Every bf16 bit pattern (subnormals, NaN payloads of both signs, infinities,
+/// zeros) stored in a bf16 gradient bank reads out through the host copy as
+/// the GPU `read_gradients` widens it, bit for bit; every mismatch is listed.
+#[test]
+fn host_read_widens_like_the_gpu_read_bit_for_bit() {
+    let (rt, model) = load_tower(Precision::Bf16);
+    let table = model.parameter_table().unwrap();
+    let bank = tessl::qwen35_train::Qwen35Grads::zeros_like(&model).unwrap();
+    let gate = table
+        .iter()
+        .position(|p| p.name == "layers.0.mlp.gate_proj.weight")
+        .unwrap();
+    // Entry 0 is a dense bf16 tensor; the gate is a packed window.
+    let targets = [(0usize, &bank.embed), (gate, &bank.layers[0].gate)];
+    for (i, t) in targets {
+        assert_eq!(t.dtype, tessl::DType::BF16, "{}", table[i].name);
+        let raw: Vec<u16> = (0..t.buffer.nbytes() / 2).map(|k| (k % 65536) as u16).collect();
+        t.buffer.write_bf16_bits(&raw);
+        let dst = alloc(&rt, &table);
+        model.read_gradients(&bank, &dst).unwrap();
+        let gpu = dst[i].read_f32().unwrap();
+        let mut host = vec![0.0f32; numel(&table[i])];
+        model.read_gradient_host(&bank, i, &mut host).unwrap();
+        let diff: Vec<(usize, u32, u32)> = (0..host.len())
+            .filter(|&k| host[k].to_bits() != gpu[k].to_bits())
+            .map(|k| (k, gpu[k].to_bits(), host[k].to_bits()))
+            .collect();
+        assert!(
+            diff.is_empty(),
+            "{}: {} of {} differ; (index, gpu bits, host bits) {diff:x?}",
+            table[i].name,
+            diff.len(),
+            host.len()
+        );
     }
 }

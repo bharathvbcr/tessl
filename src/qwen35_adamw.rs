@@ -1128,7 +1128,8 @@ impl Qwen35Model {
 
     /// Set one of `state`'s moments for parameter-table entry `index` from
     /// `src` on the host, as [`Self::read_adamw_moment_host`] reads it (bf16
-    /// rounds to nearest, 8-bit encodes per block). Index and length are
+    /// stores what the GPU copy stores, [`crate::tensor::f32_to_bf16_bits_gpu`];
+    /// 8-bit encodes per block). Index and length are
     /// checked before anything is written; a moment write does not move the
     /// forward, so the parameter generation is untouched.
     pub fn write_adamw_moment_host(

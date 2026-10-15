@@ -1447,12 +1447,12 @@ fn bf16_moment_host_write_rounds_like_the_gpu_write_bit_for_bit() {
             let diff: Vec<(usize, u32, u32, u32)> = (0..n)
                 .filter(|&k| a[k].to_bits() != b[k].to_bits())
                 .map(|k| (k, v[k].to_bits(), a[k].to_bits(), b[k].to_bits()))
-                .take(4)
                 .collect();
             assert!(
                 diff.is_empty(),
-                "{which:?} {}: (index, input, gpu, host) {diff:x?}",
-                table[i].name
+                "{which:?} {}: {} of {n} differ; (index, input, gpu, host) {diff:x?}",
+                table[i].name,
+                diff.len()
             );
         }
     }

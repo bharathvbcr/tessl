@@ -187,7 +187,7 @@ Checked with the towers out of the loop (their golden soft tokens,
 `tools/embedgemma2_ref/make_mm_reference.py`), `tests/embedgemma2_mm_model.rs`
 (opt-in, `EMBEDGEMMA2_MM_REF_DIR`) and the f64 forward with an `inputs_embeds`
 override on the tiny checkpoint, `tests/embedgemma2_mm_tiny.rs`. Bounds, fixed
-before the first run, the text tests'; observed on this Apple GPU, 2026-10-15:
+before the first run, the text tests'; observed on an Apple M5 Pro, 2026-10-15, branch `worktree-agent-a403f81d87fc8f2cd` at `744d3b9` on base `ac5364a`, the status line's snapshot:
 
 | Check | Bound | Observed |
 |---|---|---|
@@ -195,7 +195,7 @@ before the first run, the text tests'; observed on this Apple GPU, 2026-10-15:
 | embedding vs `emb_f32`, ExactF32 | max abs `1e-4`, cosine `>= 0.99999` | max abs 1.2e-7 to 2.1e-7, cosine 1.00000000 |
 | the four in one call vs alone, both modes | `1e-5` | 0 (bit for bit; 2 forwards) |
 | Bf16 vs fp32, per input | cosine `>= 0.9999` | 0.999995 to 0.999999 |
-| Bf16 vs transformers bf16, per input | cosine `>= 0.9996` | 0.99976 to 0.99997 |
+| Bf16 vs transformers bf16, per input | cosine `>= 0.9996` | 0.99975 to 0.99997 |
 | Bf16 mean `1 - cos` vs fp32 | no worse than transformers' bf16 | 2.2e-6 against 8.6e-5 |
 | tiny checkpoint vs f64 forward, ExactF32 | layers `1e-4`, embedding `1e-4` / `0.99999` | layers 2.2e-6 of scale at worst, embedding max abs 5.4e-7 |
 | tiny checkpoint vs f64 forward, Bf16 | layers `5e-2`, embedding `1e-2` / `0.9999` | layers 1.2e-2 of scale at worst, embedding max abs 2.1e-3, cosine 0.999977 |

@@ -67,6 +67,13 @@ moves those logits by O(1). Each of those was injected and caught.
   transformers' `modeling_qwen3_5` functions and an f64 recurrence. Outputs are
   pre-filled with NaN, so a skipped element fails.
 
+`embed_pool.metal` (the EmbeddingGemma pooling kernels) and the rows kernels of
+`encoder_attn.metal` (BERT's and DistilBERT's head dims) are emulated too, as
+the `embed_pool` and `encoder_attn_rows` cases. `build.sh` cuts `encoder_attn.metal`
+before its `ENCODER_TILED_KERNEL` half: those kernels run on TensorOps through
+`attn_tiled.h`, which the emulator cannot execute, so `encoder_attn_tiled_*` (like
+`qwen35_attn_tiled`) has no off-device numeric check.
+
 `dialect_lint.py` is the stand-in for the one thing the emulator cannot see,
 the Metal compiler. It lists every function, qualified name, attribute, cast
 and language feature the Qwen3.5 kernels use that no other tessl kernel (all

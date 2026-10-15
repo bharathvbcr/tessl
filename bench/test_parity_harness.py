@@ -902,44 +902,6 @@ def coverage_inventory():
     return partial_skip
 
 
-def tile_audit_contract():
-    """The static tile audit must reject missing or unverifiable geometry."""
-    import importlib.util
-
-    path = os.path.join(os.path.dirname(HERE_BENCH), "scripts", "audit_gemm_tiles.py")
-    spec = importlib.util.spec_from_file_location("audit_gemm_tiles", path)
-    audit = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(audit)
-
-    print("\n-- static TileGeom audit fails closed --")
-    kernels = {"matmul_ok": (32, 64, 4, "constexpr")}
-    tiles = {"TILE_OK": (32, 64, 4)}
-    cases = [
-        ("matching geometry", kernels, tiles, "matmul_ok", "TILE_OK", False),
-        ("missing kernel", kernels, tiles, "matmul_missing", "TILE_OK", True),
-        ("missing Rust tile", kernels, tiles, "matmul_ok", "TILE_MISSING", True),
-        ("kernel with no geometry", {"matmul_ok": (None, None, None, "no compile-time SM/SN")},
-         tiles, "matmul_ok", "TILE_OK", True),
-    ]
-    for name, kt, rt, kernel, tile, expect_error in cases:
-        error = audit.geometry_error(kt, rt, kernel, tile)
-        if (error is not None) != expect_error:
-            FAILURES.append(f"tile audit {name}: unexpected result {error!r}")
-            print(f"  FAIL  {name}: {error!r}")
-        else:
-            print(f"  ok    {name}: {error or 'accepted'}")
-    for name, tile, expect_match in [
-        ("agreeing geometry", (32, 64, 4), True),
-        ("different tile rows", (64, 64, 4), False),
-        ("different simdgroups", (32, 64, 2), False),
-    ]:
-        if audit.geometry_matches(kernels["matmul_ok"], tile) != expect_match:
-            FAILURES.append(f"tile audit {name}: wrong verdict")
-            print(f"  FAIL  {name}")
-        else:
-            print(f"  ok    {name}: {'matches' if expect_match else 'refused'}")
-
-
 def execution_policy_contract():
     """Pure regression for mode routing, accounting, verdicts, and exit codes."""
     print("\n-- harness execution policy and accounting --")
@@ -1224,7 +1186,6 @@ def main(argv=None):
     run_gpu_section(summary, mode, "bench_flash_attn CLI contract", attn_cli_contract)
     run_section(summary, "attention tuning contract", tune_knob_contract)
     run_section(summary, "kernel inventory contract", coverage_inventory)
-    run_section(summary, "static tile audit contract", tile_audit_contract)
     run_section(summary, "execution policy contract", execution_policy_contract)
 
     print()

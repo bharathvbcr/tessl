@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Flag MSL constructs in the Qwen3.5 kernels that no compiling kernel uses.
 
-    python3 tools/msl_emu/dialect_lint.py
+    python3 tools/msl_emu/dialect_lint.py [ROOT]
 
 The emulator compiles the kernels as C++, so it cannot see a construct Apple's
 Metal compiler rejects. The next best evidence without a Mac: every function,
@@ -10,6 +10,18 @@ is either already used by one of tessl's other kernels (which compile on every
 release build) or listed in REVIEWED below with the reason it is standard MSL.
 A new construct that is neither fails this check, so it gets a deliberate look
 before it gets a compiler.
+
+Exit status: 1 for a construct that is new and unreviewed, and equally for a
+REVIEWED entry that is no longer new (another kernel now uses it, or the
+Qwen3.5 sources dropped it). A stale allowlist entry is an unchecked claim, so
+it fails rather than printing a note: delete the entry. ROOT defaults to the
+repository; tests/dialect_lint_script.rs passes a planted tree.
+
+Why this stays Python: it is a text lint over .metal sources with no Rust
+dependency on the crate, it needs only the standard library (it runs on the
+Linux emulator job and on the hosted macOS job with the runner's python3), and
+the language policy lets Python stay as a gate over source text that ships no
+code. tests/dialect_lint_script.rs holds it to failing when it should.
 """
 
 import glob
@@ -17,26 +29,16 @@ import os
 import re
 import sys
 
-ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+ROOT = os.path.abspath(sys.argv[1]) if len(sys.argv) > 1 else os.path.dirname(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 NEW = [os.path.join(ROOT, "kernels", f"{k}.metal") for k in ("qwen35_gdn", "qwen35_attn", "qwen35_mlp", "qwen35_score")]
 
 # Constructs the Qwen3.5 kernels introduce, each checked against the Metal
 # Shading Language specification when it was added.
 REVIEWED = {
-    "as_type": "MSL 2.19 reinterpret-cast function (as_type<T>(x))",
-    "fabs": "MSL common math function",
     "log": "MSL math function (fast variant under the default fast math)",
     "mem_flags::mem_device": "threadgroup_barrier flag ordering device memory across the threadgroup",
-    "precise::cos": "metal::precise math namespace",
-    "precise::divide": "metal::precise math namespace",
-    "precise::exp": "metal::precise math namespace",
-    "precise::log": "metal::precise math namespace",
-    "precise::pow": "metal::precise math namespace",
-    "precise::sin": "metal::precise math namespace",
-    "static_assert": "C++14 language feature; operands are program-scope `constant uint`s, which the "
-                     "existing kernels already use as array bounds (constant expressions)",
     "uint3": "vector type for the 3-D [[threadgroup_position_in_grid]] builtin",
-    "cast (device uint *)": "pointer cast within the device address space",
 }
 
 KEYWORDS = {"if", "for", "while", "return", "switch", "sizeof", "defined", "kernel", "void", "else"}
@@ -103,9 +105,14 @@ def main():
         mark = "ok  " if c in REVIEWED else "FAIL"
         print(f"  [{mark}] {c:<24} {novel[c]:<20} {REVIEWED.get(c, 'not reviewed: check the MSL spec, then list it')}")
     if stale:
-        print("  note: reviewed entries no longer needed (now used elsewhere, or removed):", ", ".join(stale))
+        print("  FAIL  reviewed entries no longer needed (now used by another kernel, or removed "
+              "from the Qwen3.5 sources); delete them from REVIEWED:", ", ".join(stale))
     if unreviewed:
         print(f"\n{len(unreviewed)} construct(s) new to tessl's kernels and not reviewed")
+    if stale or unreviewed:
+        sys.exit(1)
+    if not novel:
+        print("\nexamined nothing: no construct is new to tessl's kernels, so the Qwen3.5 sources were not read")
         sys.exit(1)
     print(f"\n{len(novel)} construct(s) new to tessl's kernels, all reviewed")
 

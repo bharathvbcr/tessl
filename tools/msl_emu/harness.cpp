@@ -21,6 +21,8 @@ namespace msl_emu_kernels {
 #include "flash_attn_rows.cpp"
 #include "qwen35_adamw.cpp"
 #include "qwen35_bwd.cpp"
+#include "embed_pool.cpp"
+#include "encoder_attn.cpp"
 } // namespace msl_emu_kernels
 
 #include <algorithm>
@@ -299,6 +301,45 @@ int main(int argc, char **argv) {
         launch(uint3(cdiv(Tq, rows_per_tg), B * H, 1), uint3(G * 32, 1, 1), 0, [&](const Ids &id, float *) {
             fn(q, k, v, o, B, Tq, tkv, H, Hkv, window, scale, qpos, kvpos, out_bf16, cap,
                uint2(id.tg.x, id.tg.y), uint2(id.tid_in_tg.x, 0));
+        });
+    } else if (kname == "segment_mean_rows_f32") {
+        // embed_pool.metal: one thread per (segment, column).
+        const uint S = P("S"), rows = P("rows"), D = P("D");
+        float *x = F("x"), *out = F("out");
+        uint *segments = U("segments");
+        launch(uint3(cdiv(S * D, 256), 1, 1), uint3(256, 1, 1), 0, [&](const Ids &id, float *) {
+            segment_mean_rows_f32(x, segments, out, S, rows, D, id.gid.x);
+        });
+    } else if (kname == "l2_normalize_rows_f32") {
+        // embed_pool.metal: one threadgroup per row; `tptg` is what the host's
+        // reduce_tptg picks, a multiple of 32 up to the pipeline's maximum.
+        const uint rows = P("rows"), dim = P("dim"), ld = P("ld"), tptg = P("tptg");
+        float *x = F("x");
+        launch(uint3(rows, 1, 1), uint3(tptg, 1, 1), 0, [&](const Ids &id, float *) {
+            l2_normalize_rows_f32(x, rows, dim, ld, id.tg.x, id.lid, id.sg, id.lane, id.tptg);
+        });
+    } else if (kname == "encoder_attn_rows") {
+        // encoder_attn.metal's ENC_ROWS_KERNEL at BERT's and DistilBERT's head dims. Rows per
+        // threadgroup = G simdgroups * (32 / R) rows each; grid x = ceil(T / that), y = B*H.
+        const uint B = P("B"), T = P("T"), H = P("H"), Hkv = P("Hkv"), D = P("D"), window = P("window"),
+                   cap = P("kv_capacity");
+        const float scale = PF("scale");
+        uint R, G;
+        decltype(&encoder_attn_rows_h32_r2_g8) fn;
+        if (D == 32) {
+            R = 2, G = 8, fn = &encoder_attn_rows_h32_r2_g8;
+        } else if (D == 64) {
+            R = 4, G = 16, fn = &encoder_attn_rows_h64_r4_g16;
+        } else {
+            std::fprintf(stderr, "harness: encoder_attn_rows has no D=%u instantiation\n", D);
+            return 2;
+        }
+        const uint rows_per_tg = G * (32 / R);
+        float *q = F("q"), *k = F("k"), *v = F("v"), *o = F("o");
+        uint *lens = U("lens");
+        launch(uint3(cdiv(T, rows_per_tg), B * H, 1), uint3(G * 32, 1, 1), 0, [&](const Ids &id, float *) {
+            fn(q, k, v, o, T, lens, H, Hkv, window, scale, cap, uint2(id.tg.x, id.tg.y),
+               uint2(id.tid_in_tg.x, 0));
         });
     } else if (kname == "qwen35_attn_prefix_rows") {
         // qwen35::attn_prefix_rows' grid: x = ceil(Tq / rows per threadgroup),

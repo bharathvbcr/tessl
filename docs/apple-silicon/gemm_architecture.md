@@ -105,10 +105,9 @@ already made on numerics grounds.)
 
 ```bash
 # Static: every Rust TileGeom vs the kernel's constexpr SM/SN and simdgroup
-# count. Resolves paths from its own
-# location, so it runs from any directory and survives `cargo package`. It also
-# fails if tessl-arch02 grows a local copy of the kernels again.
-python3 scripts/audit_gemm_tiles.py
+# count, read from the Rust selectors themselves. It also fails if
+# tessl-arch02 grows a local copy of the kernels again.
+cargo test --release --test audit_gemm_tiles
 ```
 
 ```bash
@@ -341,9 +340,11 @@ under this submit-and-wait protocol — tessl's wall time is flat from 4 MFLOP t
 
 1. Compile-time `SM`/`SN` must equal the `TileGeom` the host dispatches with,
    and `constexpr int BKC` must equal `COOP_BKC` (if using explicit K loop blocking).
-2. Pin it in `NN_PAIRS` in `scripts/audit_gemm_tiles.py`. The audit verifies both
-   explicit `kernel void` and macro-instantiated (`NN_COOP_KERNEL`, `TN_NT_COOP_KERNEL`)
-   tiles against Rust constants.
+2. Select it in `coop_kernel` / `epi_kernel` / the batched `match` / `SplitKPar::kernel`
+   (or dispatch it by a literal `pipeline("...")` with its `TILE_*` within 12 lines).
+   `tests/audit_gemm_tiles.rs` reads those selectors and verifies both explicit
+   `kernel void` and macro-instantiated (`NN_COOP_KERNEL`, `TN_NT_COOP_KERNEL`)
+   tiles against Rust constants; a kernel no selector pairs fails it.
 3. Route it through `nn_coop_kernel` / `src/gemm.rs` so tests and benches exercise it.
 4. Verify the net can fail: inject a fault (tile drift, drop store, offset column)
    and confirm the test suite catches it before trusting a pass.

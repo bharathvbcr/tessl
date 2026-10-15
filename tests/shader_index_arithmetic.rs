@@ -39,6 +39,7 @@ const QWEN35_ADAMW: &str = include_str!("../kernels/qwen35_adamw.metal");
 const ENCODER_ATTN: &str = include_str!("../kernels/encoder_attn.metal");
 const ATTN_ROWS_H: &str = include_str!("../kernels/attn_rows.h");
 const EMBED_POOL: &str = include_str!("../kernels/embed_pool.metal");
+const EMBEDGEMMA2_VISION: &str = include_str!("../kernels/embedgemma2_vision.metal");
 const MTL_TENSOR: &str = include_str!("../kernels/mtl_tensor.metal");
 const BERT: &str = include_str!("../kernels/bert.metal");
 const QWEN35_TRAIN_STORAGE: &str = include_str!("../kernels/qwen35_train_storage.metal");
@@ -53,6 +54,7 @@ const INSPECTED_KERNELS: &[&str] = &[
     "cross_entropy.metal",
     "embed_lookup.metal",
     "embed_pool.metal",
+    "embedgemma2_vision.metal",
     "encoder_attn.metal",
     "flash_attn_decode.metal",
     "flash_attn_global_h512.metal",
@@ -766,6 +768,39 @@ fn embed_pool_offsets_are_widened() {
         ("device float *r = x + (ulong)row * ld;", "normalize row"),
     ] {
         require(EMBED_POOL, needle, what);
+    }
+}
+
+/// The vision tower's kernels form every row base, cache slot, table row and
+/// member row in 64 bits, and clamp or bound the device-held indices (the
+/// positions, the pool offsets and members) before any address is formed.
+#[test]
+fn embedgemma2_vision_offsets_are_widened() {
+    for (needle, what) in [
+        // The norm + axial RoPE + K/V store.
+        ("const ulong unit = (ulong)tg * (tptg / 32u) + sg;", "simdgroup unit"),
+        ("if (unit >= (ulong)B * T * heads) return;", "unit bound"),
+        ("if (t >= (ulong)kv_capacity) return;", "slot bound"),
+        ("device const float *row = p + r * (ulong)ld_p;", "projection row"),
+        ("const float pos_x = (float)positions[2ul * r];", "x position"),
+        (
+            "const ulong slot = ((b * kv_capacity + t) * Hkv + h) * (ulong)D;",
+            "cache slot",
+        ),
+        // The position embedding add.
+        ("const ulong o = (ulong)r * D + c;", "pos embed element"),
+        ("const ulong xi = (ulong)clamp(x, 0, last);", "clamped x row"),
+        ("float(table[((ulong)table_len + yi) * D + c])", "y table row"),
+        // The pool.
+        (
+            "const uint end = min(offsets[s + 1u], n_members);",
+            "clamped member range",
+        ),
+        ("if (m < rows) {", "member row bound"),
+        ("acc += h[(ulong)m * D + c] * weight;", "member row read"),
+        ("out[(ulong)s * D + c] = acc * scale;", "pooled store"),
+    ] {
+        require(EMBEDGEMMA2_VISION, needle, what);
     }
 }
 

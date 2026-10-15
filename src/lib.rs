@@ -104,7 +104,7 @@
 //!
 //! # Kernels
 //!
-//! 35 Metal sources compile to 266 kernel entry points: RMSNorm, gated MLP
+//! 36 Metal sources compile to 269 kernel entry points: RMSNorm, gated MLP
 //! activations, flash attention (sliding-window and global), fused
 //! RMSNorm+QKV+RoPE, MLX-format Q4 GEMV/GEMM, Q8 GEMV, an exact int8 GEMM, KV
 //! cache stores, embedding lookup, row-wise softmax/sum/max, and softcap
@@ -121,7 +121,8 @@
 //! [`qwen35_model::Qwen35Model::train_step`], in [`qwen35_train`], and an AdamW
 //! step over the model's own parameters is [`qwen35_adamw`]. The EmbeddingGemma 2
 //! text encoder (bidirectional windowed attention, row-range mean pooling and
-//! normalization) is [`embedgemma2`].
+//! normalization) is [`embedgemma2`], and its vision tower and multimodal
+//! embedder (image patches to soft tokens) are [`embedgemma2_vision`].
 //!
 //! 44 of these were promoted out of `gemma-metal`, where they were reachable
 //! only as raw pipeline-name strings through an overlay metallib. All 44 now
@@ -234,6 +235,7 @@ pub mod cross_entropy;
 pub mod decode_icb;
 pub mod dispatch;
 pub mod embedgemma2;
+pub mod embedgemma2_vision;
 pub mod gdn_train;
 pub mod gemm;
 pub mod icb_smoke;

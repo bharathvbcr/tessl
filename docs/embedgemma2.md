@@ -1,8 +1,9 @@
 # EmbeddingGemma 2 text encoder
 
 `tessl::embedgemma2` runs `google/embeddinggemma-2`'s text path (the 271M
-encoder; the vision and audio towers in the same checkpoint are not loaded)
-on tessl's kernels, from the checkpoint's own `model.safetensors`.
+encoder) on tessl's kernels, from the checkpoint's own `model.safetensors`.
+The vision tower and its embedder are `tessl::embedgemma2_vision`
+([below](#vision-tower)); the audio tower is not implemented.
 
 > **Status: run on the GPU against sentence-transformers** (Apple M5 Pro,
 > 2026-10-08, branch `fix/embedgemma2-kv-and-e2e` on base `163b28d`, snapshot
@@ -353,3 +354,135 @@ included, which is why it sits at cosine `0.99990` to `0.99998` from fp32
 while this forward, which rounds only what feeds a GEMM, sits an order of
 magnitude closer (`1 - cos` of `1.5e-6` to `6.8e-6`). Against `emb_bf16.npy` the two
 are therefore about as far apart as `emb_bf16.npy` is from fp32.
+
+## Vision tower
+
+> **Status: run on the GPU against sentence-transformers** (Apple M5 Pro,
+> 2026-10-15, worktree branch `worktree-agent-a00e8fdf52347d85d` on base
+> `60a6240`, snapshot `914f7f89142e33e77833254d9c9b90c3cef7303b`; goldens from
+> `make_mm_reference.py`, the multimodal sibling of `make_reference.py` that
+> lives on branch `eg2/integrate` and not on this base: fp32, eager attention,
+> CPU).
+
+`tessl::embedgemma2_vision` (`src/embedgemma2_vision.rs`) is the 167M-parameter
+vision tower (`vision_tower.*`, transformers 5.19's `Gemma4VisionModel`) and
+`EmbeddingGemma2MultimodalEmbedder` (`embed_vision.*`). It maps the image
+processor's `pixel_values [P, 768]` and `position_ids [P, 2]` to the 512-wide
+soft tokens the text encoder substitutes for an image's placeholder tokens
+(`image_token_id` 258880; the soft tokens are not scaled by `sqrt(hidden)`).
+Merging them into a text sequence, and the processor (resize, patchify,
+`P = 280 * 9 = 2520` with `(-1, -1)` padding), stay the caller's, as
+tokenization does.
+
+```text
+let model = EmbedGemma2VisionModel::load(rt, &st, VisionConfig::from_config_file(..)?)?;
+let out = model.encode_images(&[ImageInput { pixel_values, position_ids }, ..], trace)?;
+// out.soft[i]: [S_i, 512] f32; out.tokens[i] = S_i; out.trace (per layer) when asked
+```
+
+**What it computes.** `x = 2 * (pixels - 0.5)` (the host, f32); `h = x @ Wproj +
+tab[0][pos_x] + tab[1][pos_y]` (zero on padding; the table is `[2, 10240, 768]`
+bf16); 16 layers with the text encoder's four `* w` norms, q/k RMSNorm with
+weights, a weightless v norm, **2-D axial RoPE**, bidirectional attention at
+scale 1.0 over 12 heads of 64 (MHA) and a GELU-tanh gated MLP; then a `3 x 3`
+average pool by patch position times `sqrt(768)`; then a weightless RMSNorm and
+`embedding_projection` (768 to 512). The axial RoPE splits each head's 64
+channels into halves of 32: the first rotates by the patch's x, the second by
+its y, each with `rotate_half` over its own 32 channels and `inv_freq[p] =
+100^(-2p/32)`, `p < 16`; the table is `nn::rope_inv_freq(16, 32, 100)` on the
+host (the text path's lesson: a device `pow` is an ulp off at most pairs).
+`use_clipped_linears` and `standardize` are false in this checkpoint; the
+config parser refuses a config that sets them (and `attention_bias`, a nonzero
+dropout, a kv-head count that is not the head count, a pooling kernel under 2,
+and any `rope_type` but `axial`).
+
+**Padding and batching.** Padding patches are a suffix of `(-1, -1)` and never
+reach a real one (keys are masked and the pooler gives them zero hidden state),
+so the host strips them: only a suffix is accepted (anything else is refused),
+and so is a real patch with one negative coordinate, which transformers would
+treat as real and clamp to 0 (deliberately stricter than the reference). `P`
+only sizes the pool's output (`P / k²` cells, `k² * (P / k²) == P`, as
+`_avg_pool_by_positions` checks). Images of different real-patch counts run in
+one forward padded to the longest, with a per-image length for attention
+(`encoder_attn`, window 0, scale 1.0; its K/V layout `[batch, capacity, heads,
+64]` is exactly what the new rope kernel writes). A call is cut into forwards
+of at most 16,384 padded patches (`MAX_BATCH_PATCHES`) and 256 images,
+longest first, queued behind one `synchronize`. `GpuRuntime::async_scope()` is
+not on this base; when it lands, `encode_images` is where it replaces that
+call.
+
+**Pooling.** A patch at `(x, y)` goes to cell `x/k + (max_x/k) * (y/k)`,
+`max_x = max(x) + 1` of its own image, which collides cells when the grid width
+is not a multiple of `k` (transformers' behaviour, kept: the tiny test uses an
+odd width on purpose). The output has one row per occupied cell in cell order,
+plus cell 0 when the image has padding (transformers clamps a padding position
+to `(0, 0)`, so cell 0 always counts it; an empty cell 0 yields exactly `+0`
+and a soft token of `+0`). A cell at or past `P / k²` is an error in
+transformers (`one_hot`) and here. `plan_pooling` is that mapping on the host;
+the kernel sums each cell's rows in patch order.
+
+| Kernel | File | New? |
+|---|---|---|
+| `vision_qkv_norm_rope_f32` | `kernels/embedgemma2_vision.metal` | new: q/k RMSNorm (`* w`), the two-axis RoPE, the weightless v norm and the K/V store, one simdgroup per (patch, head). Its own kernel, not a mode of `qwen35_attn_qk_norm_rope`: that one rotates a head by one position per token and its row routine is mirrored by the training backward, whose inverse rotation must stay its exact transpose |
+| `vision_pos_embed_add_f32` | same | new: `proj + (x_emb + y_emb)` from the bf16 table, exactly `+0` on padding. The `+0` guarantee lives here and at the pool's output; the rope kernel does not special-case padding (a zero row rotated by -1 may come out `-0.0`), and its padded q/k/v slots are masked or overwritten by `encoder_attn` |
+| `vision_pool_members_f32` | same | new: the pooler's cell sums, weighted `1/k²`, times `sqrt(hidden)` |
+| weightless RMSNorm | `nn::rms_norm_f32` with a hot `[768]` buffer of ones | reused (the multiply by `1.0` is exact) |
+| attention | `embedgemma2::encoder_attn`, rows kernel `encoder_attn_rows_h64_r4_g16` | reused |
+| RMSNorm, residual add, GELU-tanh gate, GEMM | `nn::rms_norm_f32`, `nn::rms_norm_residual_add_f32`, `qwen35::gated_act`, exact-f32 TensorOps GEMM | reused |
+
+**Bounds and observed errors.** Fixed before the first run; the tiny and
+kernel tests run in the plain GPU suite, the model test is opt-in.
+
+Kernel tests, `tests/embedgemma2_vision_kernels.rs`, against f64 references
+(`tests/common/embedgemma2_vision.rs`), at fixture shapes and the real ones
+(2376 patches in a 66 x 36 grid plus 144 padding, 12 heads of 64, a 10240-row
+table, 768 columns):
+
+| Check | Bound | Observed |
+|---|---|---|
+| axial RoPE + norms + K/V store (`q`, `k`) | `2e-5` × max, plus `max_pos * max_p \|inv_freq_f32 - f64\|` | ≤ `2.2e-6` × max |
+| weightless v norm | `2e-5` × max | ≤ `1.3e-7` × max |
+| position-embedding add, 2520 x 768 | `1e-6` × max | ≤ `3e-8` × max; padding rows exactly `+0` |
+| pool, 2520 rows to 256 / 264 cells x 768 | `2e-5` × max | ≤ `1.5e-7` × max |
+| `plan_pooling` vs the dense one-hot reference | equal cells and sums | equal (and equal where it raises) |
+
+Tiny-checkpoint test, `tests/embedgemma2_vision_tiny.rs` (random weights, 2
+layers of 3 heads of 32, hidden 96, patch 4, 2x2 pooling; four images of 48, 20,
+1 and 4 real patches, one with an odd grid width, against the f64 forward):
+
+| Check | Bound | Observed |
+|---|---|---|
+| patch embedder, each layer, pooled output | `1e-4` × max | ≤ `7.3e-7` × max |
+| soft tokens | `1e-4` max abs | ≤ `7.9e-7` |
+| batched vs alone, reversed order | bit-identical | bit-identical |
+| every unzeroed activation poisoned with NaN | bit-identical | bit-identical |
+| a call over `MAX_BATCH_PATCHES` (2 forwards), async, poisoned | each image bit-identical to alone | bit-identical |
+
+Model test, `tests/embedgemma2_vision_model.rs` (opt-in: `EMBEDGEMMA2_SNAPSHOT`
+and `EMBEDGEMMA2_MM_REF_DIR`). Image 0 is 224 x 224 (2304 real patches, 256 soft
+tokens), image 1 is 640 x 360 (2376, 264); each fp32 golden is run alone:
+
+| Check | Bound | Observed |
+|---|---|---|
+| patch embedder (real rows) | `1e-4` × max | `0` |
+| layers 0 to 15 (real rows) | `1e-4` × max | `4e-7` to `1.4e-5` × max (image 0), `4e-7` to `2.9e-5` (image 1); grows with depth, largest at layer 15 |
+| pooled (after `* sqrt(768)`) | `1e-4` × max | `3.9e-6` (image 0), `6.9e-6` (image 1) |
+| soft tokens | `1e-4` × max | `1.2e-5` (image 0), `3.3e-5` (image 1) × max |
+| both in one forward vs each alone | bit-identical | bit-identical |
+
+The residual stream reaches magnitudes near 1000 by layer 15 (the checkpoint's
+norms do not bound it), so the layer-15 absolute error of `3e-2` is the same
+`3e-5` relative. Nothing needed tuning: the bounds held on the first run.
+
+**Speed follow-ups, not done.** (1) Attention at 2520 patches runs the scalar
+rows kernel (`encoder_attn_rows_h64_r4_g16`), one simdgroup per query row: about
+17 GFLOP of QK and PV per layer per image at 12 heads (2376 x 2376 x 64 x 4
+flops per head: arithmetic, inferred, not measured), all through scalar f32.
+A tiled TensorOps kernel for head dim 64 (the h256/h512 tiled kernels'
+FlashAttention-2 body with a 64-wide tile) is the next step; no timing was
+taken here. (2) The 16 layers' f32 weights are 600 MiB resident; a bf16
+operand path (a later step) halves that. (3) The pos-embed add, the pool and
+the rope kernel each take one pass over the hidden state that the neighbouring
+norm or GEMM epilogue could absorb. (4) Images are padded to the longest of a
+forward; the greedy longest-first cut does not weigh a per-forward fixed cost
+as the text packer does.

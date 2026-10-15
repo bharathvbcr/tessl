@@ -261,7 +261,7 @@ and exiting 0.
 | `bench/parity_ladder.py` | Drives the above across the whole ladder, one shape at a time, and merges. Use this for the accuracy numbers. |
 | `bench/test_parity_harness.py` | Adversarial cases for every harness, with machine-readable ran/skipped/failed accounting. Use `--pure` on host-only lanes and `--require-gpu` on physical Metal. |
 | `bench_gemm_variants` | TN / NT / accumulate / split-K / batched / epilogue / f16 lanes -- the 18 GEMM kernels the cross-runtime sweep cannot reach. |
-| `bench/kernel_coverage.py` | Measures which kernels the suite dispatches (`TESSL_KERNEL_TRACE`), cross-checked against `metal-nm` on the exact OUT_DIR metallib embedded in the release binary. `--check` gates on 100%; `--metallib` selects an explicit artifact. |
+| `bench/kernel_coverage.py` | Measures which kernels the suite dispatches (`TESSL_KERNEL_TRACE`), cross-checked against `metal-nm` on the metallib bytes the release binary embeds (`bench_gemm_sweep --dump-metallib`). `--check` gates on 100%; `--metallib` selects an explicit artifact. |
 | `bench_flash_attn` + `bench_paired` | The attention kernels, prefill and decode, over 14 configs. Historical runs first measured 11x (torch) / 20.5x (MLX) slower, geomean, worst case 271x. The row-parallel and KV-split rewrites, four throughput changes, and a routing fix followed; later schema-v1 snapshots measured 0.90-0.97x MLX prefill and 0.91-0.97x decode kernel-only. See the tessl README and do not treat those snapshots as current evidence. |
 | `bench_paired --format rows:...` | Alternates the tessl and torch/MLX lanes round by round. Aborts rather than reporting a geomean over part of the ladder (`--keys`); `--evidence --out` writes the artifact. Recipes in docs/benchmarking.md. |
 

@@ -337,6 +337,75 @@ pub fn self_spread(rounds: &[f64]) -> f64 {
 /// more than 10% against itself across the rounds of one shape.
 pub const SELF_SPREAD_LIMIT: f64 = 0.10;
 
+/// A process-unique suffix for a staged file name.
+pub fn unique_stamp() -> String {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos());
+    format!("{:x}-{nanos:x}", std::process::id())
+}
+
+/// Refuse an existing `path` that is not a regular file, without blocking.
+///
+/// The open is `O_NONBLOCK` and the answer comes from `fstat` of that handle,
+/// as `tessl::plain::open_regular_file` does for checkpoints: a FIFO with no
+/// reader or writer must not hang the caller, and a device or directory is not
+/// something to replace. A missing path is fine.
+pub fn refuse_non_regular_target(path: &std::path::Path) -> Result<(), String> {
+    use std::os::unix::fs::OpenOptionsExt;
+    match std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(path)
+    {
+        Ok(f) => {
+            let md = f.metadata().map_err(|e| format!("{}: {e}", path.display()))?;
+            if md.is_file() {
+                Ok(())
+            } else {
+                Err(format!(
+                    "{}: exists and is not a regular file; refusing to replace it",
+                    path.display()
+                ))
+            }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(format!("{}: {e}", path.display())),
+    }
+}
+
+/// Replace `path` with `bytes` durably, exposing no partial content: a staged
+/// file in the same directory is synced, renamed over `path`, and the
+/// directory synced. A non-regular existing target is refused first.
+pub fn atomic_write(path: &std::path::Path, bytes: &[u8]) -> Result<(), String> {
+    let abs = std::path::absolute(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let dir = abs
+        .parent()
+        .ok_or_else(|| format!("{}: no parent directory", abs.display()))?;
+    let name = abs.file_name().and_then(|n| n.to_str()).unwrap_or("out");
+    if !dir.is_dir() {
+        return Err(format!(
+            "{}: parent directory does not exist (never created implicitly)",
+            abs.display()
+        ));
+    }
+    refuse_non_regular_target(&abs)?;
+    let staged = dir.join(format!(".{name}.{}", unique_stamp()));
+    let result = (|| -> std::io::Result<()> {
+        use std::io::Write;
+        let mut f = std::fs::File::create(&staged)?;
+        f.write_all(bytes)?;
+        f.sync_all()?;
+        std::fs::rename(&staged, &abs)?;
+        std::fs::File::open(dir)?.sync_all()
+    })();
+    if let Err(e) = result {
+        let _ = std::fs::remove_file(&staged);
+        return Err(format!("{}: {e}", abs.display()));
+    }
+    Ok(())
+}
+
 /// Print the kernels this process dispatched as one `KERNEL_TRACE a,b,...`
 /// line on stderr, for `bench/kernel_coverage.py`. Prints nothing when
 /// `TESSL_KERNEL_TRACE` is unset, so normal runs are unchanged.

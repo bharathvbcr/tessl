@@ -207,6 +207,19 @@ Not covered: video (the placeholder id is handled like the other two, but no
 video tower or reference exists here), and the C and Python entries, which
 embed text only.
 
+The table above was observed against goldens written under eager attention;
+the same test passes against the sdpa goldens `make_mm_reference.py` now
+writes by default (see [Audio tower](#audio-tower) for why).
+
+**End to end** (`tests/embedgemma2_e2e_model.rs`, opt-in; Apple M5 Pro,
+2026-10-15, `eg2/integrate` after the audio merge `06465a9`, sdpa goldens):
+the processor's pixels and log-mel features go through tessl's vision and audio
+towers, and their soft tokens through `encode_multimodal`, all four inputs in
+one call. The towers' soft-token counts equal the placeholders of `ids.npy`,
+and the builders lay out exactly `ids.npy`. Against sentence-transformers'
+`emb_f32` (bounds `1e-4` max abs and cosine `0.99999`, fixed before the run):
+max abs 2.2e-7 to 3.8e-7, cosine 1.000000000 for both images and both clips.
+
 ## Kernels
 
 | Kernel | File | New? |

@@ -2,8 +2,9 @@
 //! accessors of `GpuBuffer` (`write_f32`, `read_f32`, `contents_f32`, ...). A
 //! load or inference path that panics on a busy runtime (a live `HostMapping`)
 //! is the same bug as any other; library code uses the `try_*` twins and
-//! propagates the error. Binaries (`src/bin/**`) and `#[cfg(test)]` items are
-//! exempt, and so are the definitions in `src/tensor.rs` (a `fn` item is not a
+//! propagates the error. Binaries (`src/bin/**`), `#[cfg(test)]` items and
+//! whole files whose `mod` declaration is `#[cfg(test)]` (e.g. `src/lib.rs`'s
+//! `#[cfg(test)] mod parser_mutation;`) are exempt, and so are the definitions in `src/tensor.rs` (a `fn` item is not a
 //! `.name(` call). CPU-only.
 
 use std::path::{Path, PathBuf};
@@ -37,6 +38,11 @@ fn is_safetensors_receiver(line: &str, at: usize) -> bool {
 /// Blank out comments, string and char literals (keeping newlines so line
 /// numbers survive), then blank every `#[cfg(test)]` item (brace-matched).
 fn strip(src: &str) -> String {
+    blank_cfg_test_items(strip_comments_and_strings(src))
+}
+
+/// Blank out comments, string and char literals, keeping newlines.
+fn strip_comments_and_strings(src: &str) -> String {
     let b = src.as_bytes();
     let mut out = vec![b' '; b.len()];
     let mut i = 0;
@@ -119,7 +125,11 @@ fn strip(src: &str) -> String {
     // Everything kept is ASCII-or-original bytes at their original offsets and
     // everything else is a space or newline, so this stays valid UTF-8 only if
     // we never split a multi-byte char: lossy conversion covers the rest.
-    let mut s = String::from_utf8_lossy(&out).into_owned();
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Blank every `#[cfg(test)]` item of comment-stripped source.
+fn blank_cfg_test_items(mut s: String) -> String {
     // Blank `#[cfg(test)]` items: from the attribute through the matching `}`
     // (or the `;` of a body-less item such as `use`).
     let attr = "#[cfg(test)]";
@@ -192,14 +202,73 @@ fn rs_files(dir: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
+/// Module names that `src` declares out of line under `#[cfg(test)]`
+/// (`#[cfg(test)] mod name;`, other attributes allowed between). Comments and
+/// strings are blanked first, so a commented-out declaration does not count.
+fn cfg_test_out_of_line_mods(src: &str) -> Vec<String> {
+    let s = strip_comments_and_strings(src);
+    let mut out = Vec::new();
+    let attr = "#[cfg(test)]";
+    let mut from = 0;
+    while let Some(i) = s[from..].find(attr) {
+        let mut rest = s[from + i + attr.len()..].trim_start();
+        // Further attributes on the same item.
+        while rest.starts_with("#[") {
+            match rest.find(']') {
+                Some(j) => rest = rest[j + 1..].trim_start(),
+                None => break,
+            }
+        }
+        let rest = rest
+            .strip_prefix("pub(crate) ")
+            .or_else(|| rest.strip_prefix("pub "))
+            .unwrap_or(rest);
+        if let Some(decl) = rest.strip_prefix("mod ") {
+            let name: String = decl.chars().take_while(|c| c.is_alphanumeric() || *c == '_').collect();
+            if !name.is_empty() && decl[name.len()..].trim_start().starts_with(';') {
+                out.push(name);
+            }
+        }
+        from += i + attr.len();
+    }
+    out
+}
+
+/// The file (`name.rs`) or directory (`name/`) an out-of-line `mod name;` in
+/// `decl_file` refers to: a sibling for `lib.rs`/`main.rs`/`mod.rs`, otherwise
+/// under the declaring file's own directory (`foo.rs` → `foo/name.rs`).
+fn mod_paths(decl_file: &Path, name: &str) -> [PathBuf; 2] {
+    let parent = decl_file.parent().unwrap();
+    let stem = decl_file.file_stem().unwrap();
+    let dir = if ["lib", "main", "mod"].iter().any(|s| stem == *s) {
+        parent.to_path_buf()
+    } else {
+        parent.join(stem)
+    };
+    [dir.join(format!("{name}.rs")), dir.join(name)]
+}
+
+/// Every source path compiled only under `cfg(test)` because its `mod`
+/// declaration is gated: a file, or a whole directory module.
+fn cfg_test_only_paths(files: &[PathBuf]) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    for f in files {
+        for name in cfg_test_out_of_line_mods(&std::fs::read_to_string(f).unwrap()) {
+            out.extend(mod_paths(f, &name).into_iter().filter(|p| p.exists()));
+        }
+    }
+    out
+}
+
 #[test]
 fn library_code_never_calls_a_panicking_host_accessor() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let mut files = Vec::new();
     rs_files(&root.join("src"), &mut files);
     assert!(files.len() > 10, "found only {} source files", files.len());
+    let test_only = cfg_test_only_paths(&files);
     let mut bad = Vec::new();
-    for f in &files {
+    for f in files.iter().filter(|f| !test_only.iter().any(|t| f.starts_with(t))) {
         let rel = f.strip_prefix(root).unwrap().display().to_string();
         bad.extend(violations(&rel, &std::fs::read_to_string(f).unwrap()));
     }
@@ -252,4 +321,49 @@ fn after_tests(b: &GpuBuffer) {
     // A SafeTensors read (a `Result`-returning file read) is not a mapping.
     assert!(violations("y.rs", "fn f() { self.st.read_f32(&n)?; }").is_empty());
     assert_eq!(violations("y.rs", "fn f() { self.st2.read_f32(&n)?; }").len(), 1);
+}
+
+#[test]
+fn a_cfg_test_mod_declaration_exempts_its_file_and_nothing_else() {
+    let src = r##"
+pub mod tensor;
+#[cfg(test)]
+mod parser_mutation;
+#[cfg(test)]
+#[allow(dead_code)]
+pub(crate) mod helpers;
+#[cfg(test)]
+mod inline { fn t() {} }
+// #[cfg(test)] mod commented;
+const S: &str = "#[cfg(test)] mod in_a_string;";
+#[cfg(not(test))]
+mod real;
+"##;
+    assert_eq!(cfg_test_out_of_line_mods(src), vec!["parser_mutation", "helpers"]);
+    let lib = Path::new("/r/src/lib.rs");
+    assert_eq!(
+        mod_paths(lib, "parser_mutation"),
+        [
+            PathBuf::from("/r/src/parser_mutation.rs"),
+            PathBuf::from("/r/src/parser_mutation")
+        ]
+    );
+    assert_eq!(
+        mod_paths(Path::new("/r/src/nn.rs"), "t"),
+        [PathBuf::from("/r/src/nn/t.rs"), PathBuf::from("/r/src/nn/t")]
+    );
+    // The real tree: the gated module is found, and an ordinary library
+    // module is not exempt.
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut files = Vec::new();
+    rs_files(&root.join("src"), &mut files);
+    let test_only = cfg_test_only_paths(&files);
+    assert!(
+        test_only.contains(&root.join("src/parser_mutation.rs")),
+        "{test_only:?}"
+    );
+    assert!(
+        !test_only.iter().any(|t| root.join("src/tensor.rs").starts_with(t)),
+        "{test_only:?}"
+    );
 }

@@ -797,6 +797,23 @@ pub fn f32_to_bf16_bits(x: f32) -> u16 {
     round as u16
 }
 
+/// Host f32 → bf16 bits exactly as the GPU's `bfloat(float)` cast stores them
+/// (the `qwen35_window_copy_f32_bf16` kernel, measured on the Mac GPU): a NaN
+/// of any sign or payload becomes the positive quiet NaN `0x7fc0`; an f32
+/// subnormal input flushes to a zero of its own sign before any rounding (so
+/// `0x007f_ffff` is `0`, not the smallest normal); everything else rounds to
+/// nearest even, overflowing to ±infinity. Differs from [`f32_to_bf16_bits`],
+/// which keeps NaN sign and payload and rounds subnormals; use this wherever a
+/// host write must store the bits a GPU write of the same value stores.
+pub fn f32_to_bf16_bits_gpu(x: f32) -> u16 {
+    let bits = x.to_bits();
+    match bits & 0x7fff_ffff {
+        m if m > 0x7f80_0000 => 0x7fc0,
+        m if m < 0x0080_0000 => (bits >> 16) as u16 & 0x8000,
+        _ => f32_to_bf16_bits(x),
+    }
+}
+
 pub fn bf16_bits_to_f32(b: u16) -> f32 {
     f32::from_bits((b as u32) << 16)
 }
@@ -903,6 +920,30 @@ mod contract_tests {
             if !x.is_nan() {
                 assert_eq!(f32_to_bf16_bits(x), b);
             }
+        }
+    }
+
+    #[test]
+    fn gpu_matching_bf16_cast_canonicalises_nan_and_flushes_subnormals() {
+        for bits in [0x7f80_0001u32, 0xffff_ffff, 0x7fc0_0001, 0xff80_0001] {
+            assert_eq!(f32_to_bf16_bits_gpu(f32::from_bits(bits)), 0x7fc0, "{bits:x}");
+        }
+        for (bits, want) in [
+            (0x0000_0001u32, 0x0000u16),
+            (0x007f_ffff, 0x0000),
+            (0x8000_0001, 0x8000),
+            (0x807f_ffff, 0x8000),
+            (0x0000_0000, 0x0000),
+            (0x8000_0000, 0x8000),
+            (0x0080_0000, 0x0080),
+            (0x3f80_8000, 0x3f80),
+            (0x3f81_8000, 0x3f82),
+            (0x7f7f_8000, 0x7f80),
+            (0xff7f_ffff, 0xff80),
+            (0x7f80_0000, 0x7f80),
+            (0xff80_0000, 0xff80),
+        ] {
+            assert_eq!(f32_to_bf16_bits_gpu(f32::from_bits(bits)), want, "{bits:x}");
         }
     }
 

@@ -1067,7 +1067,7 @@ impl Qwen35Model {
         if p.param_generation != self.param_generation() {
             return Err(format!(
                 "{what}: the model's parameters were written after the step's forward \
-                 (write_parameters or adamw_step); its gradients would be of weights the \
+                 (write_parameters, write_parameter_host or adamw_step); its gradients would be of weights the \
                  forward never ran. Run the forward again"
             ));
         }

@@ -34,6 +34,10 @@ fn benches_refuse_malformed_counts() {
             assert_refuses(exe, var, "abc");
         }
         assert_refuses(exe, "BENCH_ITERS", "0");
+        // One strict, bounded count: no sign, no padding, nothing past MAX_COUNT.
+        for bad in ["+5", " 5", "05", "18446744073709551615", "1000000"] {
+            assert_refuses(exe, "BENCH_ITERS", bad);
+        }
     }
 }
 

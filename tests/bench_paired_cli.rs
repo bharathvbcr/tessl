@@ -203,7 +203,6 @@ fn evidence_marks_stale_and_rejects_bad_policy_before_launching_a_lane() {
     let a = metric_bin(&d, "a", "1");
     let b = metric_bin(&d, "b", "1");
     for (tag, bad, needle) in [
-        ("cap", &["--max-spread", "9"][..], "ratio-spread limit"),
         ("round3", &["--rounds", "3"][..], "even integer >= 4"),
         ("round5", &["--rounds", "5"][..], "even integer >= 4"),
         ("iters", &[][..], "BENCH_ITERS must be >= 3"),
@@ -360,8 +359,7 @@ fn evidence_publishes_provenance_atomically_and_hashes_every_lane_input() {
 }
 
 // ---------------------------------------------------------------------------
-// Adversarial-review regression tests. Tests marked `#[ignore = "KNOWN BREAK"]`
-// pin a defect in the implementation as reviewed (commit 6f9d1f3): they FAIL
+// Adversarial-review regression tests. Tests marked `// pin a defect in the implementation as reviewed (commit 6f9d1f3): they FAIL
 // today (`cargo test --test bench_paired_cli -- --ignored`) and should be
 // un-ignored by the commit that fixes the defect.
 // ---------------------------------------------------------------------------
@@ -500,7 +498,6 @@ fn evidence_paths_with_spaces_and_unicode_publish_and_overwrite_atomically() {
 }
 
 #[test]
-#[ignore = "KNOWN BREAK: a negative METRIC value is accepted and a ratio of two negatives is reported as a result"]
 fn a_negative_metric_is_refused_not_ratioed() {
     let d = scratch("negmetric");
     let a = metric_bin(&d, "a", "-1");
@@ -516,7 +513,6 @@ fn a_negative_metric_is_refused_not_ratioed() {
 }
 
 #[test]
-#[ignore = "KNOWN BREAK: trailing tokens on a METRIC line are silently dropped (`METRIC x 1 2 3` means x=1)"]
 fn a_metric_line_with_trailing_tokens_is_malformed() {
     let d = scratch("trailing");
     let a = script(&d, "a", "echo METRIC m 1 2 3");
@@ -531,13 +527,12 @@ fn a_metric_line_with_trailing_tokens_is_malformed() {
 }
 
 #[test]
-#[ignore = "KNOWN BREAK: no per-lane timeout; a hung lane hangs the run forever (src/bin/bench_paired.rs run_lane uses Command::output)"]
 fn a_hung_lane_is_bounded_by_a_timeout() {
     let d = scratch("hang");
     let hang = script(&d, "hang", "exec sleep 40");
     let ok = metric_bin(&d, "ok", "1");
     let mut child = Command::new(env!("CARGO_BIN_EXE_bench_paired"))
-        .args(["--format", "metrics"])
+        .args(["--format", "metrics", "--lane-timeout", "2"])
         .arg(format!("h={}", hang.display()))
         .arg(format!("o={}", ok.display()))
         .stderr(std::process::Stdio::null())
@@ -563,18 +558,28 @@ fn a_hung_lane_is_bounded_by_a_timeout() {
 }
 
 #[test]
-#[ignore = "KNOWN BREAK: `--rounds=N` / `--out=PATH` are parsed as lanes named `--rounds` / `--out`, though the evidence marker code accepts `--out=`"]
 fn equals_style_options_are_options_or_usage_errors_never_lanes() {
     let d = scratch("eqopt");
     let (a, b) = (metric_bin(&d, "a", "1"), metric_bin(&d, "b", "2"));
     let lanes = [format!("a={}", a.display()), format!("b={}", b.display())];
+    // The `=` form is an option, not a lane named `--rounds`.
     let o = run(&[strs(&["--format", "metrics", "--rounds=3"]), lanes.to_vec()].concat());
-    assert_eq!(
-        o.status.code(),
-        Some(2),
-        "--rounds=3 must be a usage error or work: {}",
+    assert!(o.status.success(), "--rounds=3: {}", stderr(&o));
+    assert!(
+        stderr(&o).contains("round 3/3 done"),
+        "--rounds=3 was not read: {}",
         stderr(&o)
     );
+    for bad in [
+        "--rounds=0",
+        "--rounds=",
+        "--bogus=1",
+        "--evidence=1",
+        "--clean-env=yes",
+    ] {
+        let o = run(&[strs(&["--format", "metrics", bad]), lanes.to_vec()].concat());
+        assert_eq!(o.status.code(), Some(2), "{bad}: {}", stderr(&o));
+    }
     let out_path = d.join("o.json");
     let o = run(&[
         strs(&[
@@ -595,7 +600,6 @@ fn equals_style_options_are_options_or_usage_errors_never_lanes() {
 }
 
 #[test]
-#[ignore = "KNOWN BREAK: lane executables are hashed once before round 1; one rewritten mid-run is published under the stale hash"]
 fn evidence_refuses_a_lane_executable_that_changes_between_rounds() {
     let d = scratch("swap");
     let swap = d.join("swap");
@@ -625,4 +629,236 @@ fn evidence_refuses_a_lane_executable_that_changes_between_rounds() {
         !o.status.success() && !out_path.exists(),
         "published evidence for a binary that changed mid-run"
     );
+}
+
+#[test]
+fn a_timed_out_lane_is_killed_with_its_children_and_named_with_its_round() {
+    let d = scratch("timeout");
+    let pidfile = d.join("child.pid");
+    // The lane's own child outlives a plain kill of the lane; the group kill reaps it.
+    let hang = script(
+        &d,
+        "hang",
+        &format!("sleep 60 &\necho $! > '{}'\nwait", pidfile.display()),
+    );
+    let ok = metric_bin(&d, "ok", "1");
+    let out = run(&strs(&[
+        "--format",
+        "metrics",
+        "--lane-timeout=1",
+        &format!("ok={}", ok.display()),
+        &format!("hang={}", hang.display()),
+    ]));
+    assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
+    let err = stderr(&out);
+    assert!(
+        err.contains("lane hang") && err.contains("timed out after 1s") && err.contains("round 1/5"),
+        "{err}"
+    );
+    assert!(stdout(&out).is_empty(), "a result was printed");
+    let pid: i32 = fs::read_to_string(&pidfile).unwrap().trim().parse().unwrap();
+    let alive = Command::new("kill")
+        .args(["-0", &pid.to_string()])
+        .status()
+        .unwrap()
+        .success();
+    assert!(!alive, "the lane's child {pid} survived the timeout");
+}
+
+#[test]
+fn a_malformed_evidence_command_line_leaves_no_marker() {
+    let d = scratch("nomarker");
+    let (a, b) = (metric_bin(&d, "a", "1"), metric_bin(&d, "b", "1"));
+    let out_json = d.join("o.json");
+    for bad in [
+        vec!["--bogus"],
+        vec!["--max-spread=9"],
+        vec!["--rounds=x"],
+        vec!["--evidence=1"],
+    ] {
+        let mut args = strs(&[
+            "--format",
+            "metrics",
+            "--evidence",
+            &format!("--out={}", out_json.display()),
+        ]);
+        args.extend(strs(&bad));
+        args.push(format!("a={}", a.display()));
+        args.push(format!("b={}", b.display()));
+        let o = run(&args);
+        assert_eq!(o.status.code(), Some(2), "{bad:?}: {}", stderr(&o));
+        assert!(!d.join("o.json.attempt.json").exists(), "{bad:?} wrote a marker");
+    }
+}
+
+#[test]
+fn the_out_equals_form_marks_the_older_output_stale_like_the_spaced_form() {
+    let d = scratch("eqmarker");
+    let (a, b) = (metric_bin(&d, "a", "1"), metric_bin(&d, "b", "1"));
+    let out_json = d.join("o.json");
+    fs::write(&out_json, "{\"generation\":\"old\"}").unwrap();
+    let o = run(&strs(&[
+        "--format",
+        "metrics",
+        "--evidence",
+        "--rounds=3",
+        &format!("--out={}", out_json.display()),
+        &format!("a={}", a.display()),
+        &format!("b={}", b.display()),
+    ]));
+    assert_eq!(o.status.code(), Some(2), "{}", stderr(&o));
+    let marker = fs::read_to_string(d.join("o.json.attempt.json")).unwrap();
+    assert!(marker.contains("not_published"), "{marker}");
+    assert_eq!(fs::read_to_string(&out_json).unwrap(), "{\"generation\":\"old\"}");
+}
+
+#[test]
+fn out_keeps_every_lane_process_output_load_and_timestamp_per_round() {
+    let d = scratch("archive");
+    let noisy = script(
+        &d,
+        "noisy",
+        "echo METRIC m 2\necho to-stdout-marker\necho to-stderr-marker >&2",
+    );
+    let ok = metric_bin(&d, "ok", "1");
+    let out_json = d.join("o.json");
+    let o = run(&strs(&[
+        "--format",
+        "metrics",
+        "--rounds",
+        "2",
+        "--out",
+        out_json.to_str().unwrap(),
+        &format!("base={}", ok.display()),
+        &format!("odd name={}", noisy.display()),
+    ]));
+    assert!(o.status.success(), "{}", stderr(&o));
+    let lanes = d.join("o.json.lanes");
+    let mut names: Vec<String> = fs::read_dir(&lanes)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    // 2 rounds x 2 lanes x (stdout, stderr, meta).
+    assert_eq!(names.len(), 12, "{names:?}");
+    assert!(names.contains(&"r02-1-odd_name.stdout".to_string()), "{names:?}");
+    let out1 = fs::read_to_string(lanes.join("r01-1-odd_name.stdout")).unwrap();
+    assert!(
+        out1.contains("METRIC m 2") && out1.contains("to-stdout-marker"),
+        "{out1}"
+    );
+    assert!(fs::read_to_string(lanes.join("r01-1-odd_name.stderr"))
+        .unwrap()
+        .contains("to-stderr-marker"));
+    let meta = fs::read_to_string(lanes.join("r02-0-base.meta.json")).unwrap();
+    for needle in [
+        "started_at_utc",
+        "finished_at_utc",
+        "loadavg_1m",
+        "\"exit_code\": 0",
+        "\"round\": 2",
+    ] {
+        assert!(meta.contains(needle), "meta lacks {needle}: {meta}");
+    }
+    assert!(fs::read_to_string(&out_json).unwrap().contains("lane_archive"));
+    // A failing run still leaves what ran.
+    let bad = script(&d, "bad", "echo partial-output; echo boom >&2; exit 4");
+    let out2 = d.join("o2.json");
+    let o = run(&strs(&[
+        "--format",
+        "metrics",
+        "--out",
+        out2.to_str().unwrap(),
+        &format!("base={}", ok.display()),
+        &format!("bad={}", bad.display()),
+    ]));
+    assert_eq!(o.status.code(), Some(1));
+    assert!(!out2.exists());
+    let stderr_file = fs::read_to_string(d.join("o2.json.lanes/r01-1-bad.stderr")).unwrap();
+    assert!(stderr_file.contains("boom"), "{stderr_file}");
+}
+
+#[test]
+fn a_metric_dropped_in_round_two_fails_at_the_end_of_round_two() {
+    let d = scratch("failfast");
+    let flaky = counter_lane(
+        &d,
+        "flaky",
+        "echo METRIC m 1\nif [ \"$n\" -ne 2 ]; then echo METRIC extra 1; fi",
+    );
+    let base = script(&d, "base", "echo METRIC m 1\necho METRIC extra 1");
+    let out = run(&strs(&[
+        "--format",
+        "metrics",
+        "--rounds",
+        "6",
+        &format!("base={}", base.display()),
+        &format!("f={}", flaky.display()),
+    ]));
+    assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
+    let err = stderr(&out);
+    assert!(
+        err.contains("round 1/6 done") && err.contains("\"extra\"") && err.contains("round 2"),
+        "{err}"
+    );
+    assert!(
+        !err.contains("round 2/6 done") && !err.contains("round 3/6 done"),
+        "kept running: {err}"
+    );
+    // The lane ran twice, not six times.
+    assert_eq!(fs::read_to_string(d.join("flaky.cnt")).unwrap().trim(), "2");
+}
+
+#[test]
+fn an_unparsable_lane_fails_in_the_round_it_prints_it() {
+    let d = scratch("failfast-parse");
+    let bad = counter_lane(
+        &d,
+        "bad",
+        "if [ \"$n\" -eq 2 ]; then echo METRIC m oops; else echo METRIC m 1; fi",
+    );
+    let ok = metric_bin(&d, "ok", "1");
+    let out = run(&strs(&[
+        "--format",
+        "metrics",
+        "--rounds",
+        "6",
+        &format!("ok={}", ok.display()),
+        &format!("b={}", bad.display()),
+    ]));
+    assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
+    assert_eq!(fs::read_to_string(d.join("bad.cnt")).unwrap().trim(), "2");
+}
+
+#[test]
+fn counts_are_one_strict_bounded_grammar_for_rounds_and_bench_iters() {
+    let d = scratch("counts");
+    let (a, b) = (metric_bin(&d, "a", "1"), metric_bin(&d, "b", "1"));
+    let lanes = |iters: &str| {
+        strs(&[
+            "--format",
+            "metrics",
+            "--evidence",
+            "--out",
+            d.join("o.json").to_str().unwrap(),
+            &format!("a:BENCH_ITERS={iters}={}", a.display()),
+            &format!("b={}", b.display()),
+        ])
+    };
+    for bad in ["18446744073709551615", "1000000", "+5", "005"] {
+        let o = run(&lanes(bad));
+        assert_eq!(o.status.code(), Some(2), "BENCH_ITERS={bad:?}: {}", stderr(&o));
+        assert!(stderr(&o).contains("BENCH_ITERS"), "{}", stderr(&o));
+    }
+    for bad in ["18446744073709551615", "+4", " 4"] {
+        let o = run(&strs(&[
+            "--format",
+            "metrics",
+            "--rounds",
+            bad,
+            &format!("a={}", a.display()),
+            &format!("b={}", b.display()),
+        ]));
+        assert_eq!(o.status.code(), Some(2), "--rounds {bad:?}");
+    }
 }

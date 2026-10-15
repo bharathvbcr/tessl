@@ -3,8 +3,8 @@
 //!
 //! ```text
 //! bench_paired [--rounds N] [--out PATH] [--format F] [--max-spread X]
-//!              [--clean-env] [--evidence] [--compare A:B]... [--keys K,..]
-//!              [--require FIELD=VALUE]... LANE...
+//!              [--lane-timeout SECS] [--clean-env] [--evidence]
+//!              [--compare A:B]... [--keys K,..] [--require FIELD=VALUE]... LANE...
 //! LANE = NAME=COMMAND  |  NAME:ENV=V[,ENV=V...]=COMMAND
 //! ```
 //!
@@ -57,19 +57,22 @@
 //! marker that makes an older output stale until the new one is published
 //! atomically, and a provenance block (git revision, dirty flag and diff
 //! hash, the hash of every lane executable, which embeds its metallib, and
-//! of every script argument, host, power, load). Exit status: 2 usage, 1 a lane or the output failed, 3 drift.
+//! of every script argument, host, power, load). `--out` also keeps every lane
+//! run's stdout, stderr, load and time under `PATH.lanes/`. Every option takes
+//! `--name value` or `--name=value`. Exit status: 2 usage, 1 a lane (or its
+//! timeout) or the output failed, 3 drift.
 
 mod common;
 
 #[path = "common/evidence.rs"]
 mod evidence;
 #[path = "../json.rs"]
-#[allow(dead_code)]
 mod json;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::Duration;
 
 use common::median;
 use evidence::{Jv, Summary};
@@ -221,6 +224,9 @@ fn parse_lane(arg: &str) -> Res<Lane> {
                         (&after[..end], &after[end..])
                     }
                 };
+                if env.iter().any(|(e, _): &(String, String)| e == k) {
+                    return Err(format!("{arg:?}: {k} is set twice in one lane"));
+                }
                 env.push((k.to_string(), value.to_string()));
                 match after_value.as_bytes().first() {
                     Some(b'=') => break &after_value[1..],
@@ -276,11 +282,8 @@ struct LaneRun {
 }
 
 fn positive(what: &str, lane: &str, v: f64) -> Res<f64> {
-    if v.is_finite() && v > 0.0 {
-        Ok(v)
-    } else {
-        Err(format!("lane {lane}: {what} is not a positive finite number: {v}"))
-    }
+    evidence::positive_finite(&[v], &format!("lane {lane}: {what}"))?;
+    Ok(v)
 }
 
 fn parse_workloads(lane: &str, stdout: &str) -> Res<LaneRun> {
@@ -329,16 +332,16 @@ fn parse_workloads(lane: &str, stdout: &str) -> Res<LaneRun> {
 fn parse_metrics(lane: &str, stdout: &str) -> Res<LaneRun> {
     let (mut fields, mut order) = (BTreeMap::new(), Vec::new());
     for line in stdout.lines().filter(|l| l.starts_with("METRIC ")) {
-        let mut tok = line.split_whitespace().skip(1);
-        let (Some(name), Some(v)) = (tok.next(), tok.next()) else {
+        // Exactly `METRIC name value`: trailing tokens are not silently dropped.
+        let [_, name, v] = line.split_whitespace().collect::<Vec<_>>()[..] else {
             return Err(format!("lane {lane}: malformed METRIC line {line:?}"));
         };
-        let v: f64 = v
+        // Every statistic here is a ratio of two runs, so no metric may be zero
+        // or negative; a counter that can be 0 is not a METRIC for this driver.
+        let v = v
             .parse()
-            .map_err(|_| format!("lane {lane}: METRIC {name} value {v:?} is not a number"))?;
-        if !v.is_finite() {
-            return Err(format!("lane {lane}: METRIC {name} is not finite: {v}"));
-        }
+            .map_err(|_| format!("lane {lane}: METRIC {name} value {v:?} is not a number"))
+            .and_then(|v| positive(&format!("METRIC {name}"), lane, v))?;
         let id = (name.to_string(), String::new());
         if fields
             .insert(id.clone(), BTreeMap::from([("value".to_string(), v)]))
@@ -441,6 +444,13 @@ fn parse_rows(
     Ok(LaneRun { fields, order, raw })
 }
 
+/// A lane gets this long per run unless `--lane-timeout` says otherwise. One
+/// hour: the slowest current lane is a 2B `bench_qwen35_train --step` (checkpoint
+/// load, a warm-up, three timed steps and a traced one, a few minutes at T=2048
+/// on an M5 Pro), and a hung lane must still end a run.
+const DEFAULT_LANE_TIMEOUT_SECS: u64 = 3600;
+const MAX_LANE_TIMEOUT_SECS: u64 = 86_400;
+
 struct Options {
     rounds: usize,
     out: Option<PathBuf>,
@@ -449,11 +459,26 @@ struct Options {
     keys: Option<Vec<String>>,
     require: Vec<(String, f64)>,
     max_spread: Option<f64>,
+    lane_timeout: Duration,
     clean_env: bool,
     evidence: bool,
     lanes: Vec<Lane>,
 }
 
+/// Options that take a value; each also accepts `--name=value`.
+const VALUE_OPTIONS: [&str; 8] = [
+    "--rounds",
+    "--out",
+    "--format",
+    "--compare",
+    "--keys",
+    "--require",
+    "--max-spread",
+    "--lane-timeout",
+];
+
+/// The only command-line parser: `main`, the evidence marker and the tests all
+/// go through it, so none can read an argument differently from another.
 fn parse_args(args: &[String]) -> Res<Options> {
     let mut o = Options {
         rounds: 0,
@@ -463,6 +488,7 @@ fn parse_args(args: &[String]) -> Res<Options> {
         keys: None,
         require: Vec::new(),
         max_spread: None,
+        lane_timeout: Duration::from_secs(DEFAULT_LANE_TIMEOUT_SECS),
         clean_env: false,
         evidence: false,
         lanes: Vec::new(),
@@ -470,24 +496,43 @@ fn parse_args(args: &[String]) -> Res<Options> {
     let mut rounds = None;
     let mut it = args.iter();
     while let Some(a) = it.next() {
-        let mut value = |flag: &str| it.next().cloned().ok_or_else(|| format!("{flag} needs a value"));
-        match a.as_str() {
-            "--rounds" => {
-                rounds = Some(parse_rounds(&value("--rounds")?)?);
+        // `--name=value` is `--name value`; anything else starting `--` is an option.
+        let (flag, inline) = match a.split_once('=') {
+            Some((f, v)) if f.starts_with("--") => (f, Some(v.to_string())),
+            _ => (a.as_str(), None),
+        };
+        if flag.starts_with("--") && !VALUE_OPTIONS.contains(&flag) {
+            if inline.is_some() || !matches!(flag, "--clean-env" | "--evidence") {
+                return Err(format!("unknown option {flag}; lanes are NAME=COMMAND"));
             }
-            "--out" => o.out = Some(PathBuf::from(value("--out")?)),
-            "--format" => o.format = Format::parse(&value("--format")?)?,
-            "--compare" => {
-                let v = value("--compare")?;
-                match v.split_once(':') {
-                    Some((x, y)) if !x.is_empty() && !y.is_empty() && x != y => {
-                        o.compares.push((x.to_string(), y.to_string()))
-                    }
-                    _ => return Err(format!("--compare {v:?}: expected two different variants A:B")),
+            match flag {
+                "--clean-env" => o.clean_env = true,
+                _ => o.evidence = true,
+            }
+            continue;
+        }
+        if !flag.starts_with("--") {
+            let lane = parse_lane(a)?;
+            if o.lanes.iter().any(|l| l.name == lane.name) {
+                return Err(format!("lane {:?} given twice", lane.name));
+            }
+            o.lanes.push(lane);
+            continue;
+        }
+        let v = inline
+            .or_else(|| it.next().cloned())
+            .ok_or_else(|| format!("{flag} needs a value"))?;
+        match flag {
+            "--rounds" => rounds = Some(common::parse_count(flag, &v, 1)?),
+            "--out" => o.out = Some(PathBuf::from(v)),
+            "--format" => o.format = Format::parse(&v)?,
+            "--compare" => match v.split_once(':') {
+                Some((x, y)) if !x.is_empty() && !y.is_empty() && x != y => {
+                    o.compares.push((x.to_string(), y.to_string()))
                 }
-            }
+                _ => return Err(format!("--compare {v:?}: expected two different variants A:B")),
+            },
             "--keys" => {
-                let v = value("--keys")?;
                 let keys: Vec<String> = v.split(',').map(|k| k.trim().to_string()).collect();
                 if keys.iter().any(String::is_empty) || keys.iter().collect::<BTreeSet<_>>().len() != keys.len() {
                     return Err(format!("--keys {v:?}: empty or duplicate key"));
@@ -495,7 +540,6 @@ fn parse_args(args: &[String]) -> Res<Options> {
                 o.keys = Some(keys);
             }
             "--require" => {
-                let v = value("--require")?;
                 let (f, n) = v
                     .split_once('=')
                     .ok_or_else(|| format!("--require {v:?}: expected FIELD=VALUE"))?;
@@ -504,18 +548,13 @@ fn parse_args(args: &[String]) -> Res<Options> {
                     .map_err(|_| format!("--require {v:?}: VALUE is not a number"))?;
                 o.require.push((f.to_string(), n));
             }
-            "--max-spread" => o.max_spread = Some(evidence::parse_ratio_spread_limit(&value("--max-spread")?)?),
-            "--clean-env" => o.clean_env = true,
-            "--evidence" => o.evidence = true,
-            _ if a.starts_with("--") && !a.contains('=') => {
-                return Err(format!("unknown option {a}; lanes are NAME=COMMAND"));
-            }
+            "--max-spread" => o.max_spread = Some(evidence::parse_ratio_spread_limit(&v)?),
             _ => {
-                let lane = parse_lane(a)?;
-                if o.lanes.iter().any(|l| l.name == lane.name) {
-                    return Err(format!("lane {:?} given twice", lane.name));
+                let secs = common::parse_count(flag, &v, 1)? as u64;
+                if secs > MAX_LANE_TIMEOUT_SECS {
+                    return Err(format!("{flag}={secs} is above the maximum of {MAX_LANE_TIMEOUT_SECS}"));
                 }
-                o.lanes.push(lane);
+                o.lane_timeout = Duration::from_secs(secs);
             }
         }
     }
@@ -542,36 +581,107 @@ fn parse_args(args: &[String]) -> Res<Options> {
     Ok(o)
 }
 
-/// A positive decimal integer: ASCII digits, no sign, no leading zero, at most
-/// six digits. `str::parse` would also take `+2` and `007`.
-fn parse_rounds(v: &str) -> Res<usize> {
-    let ok = !v.is_empty() && v.len() <= 6 && v.bytes().all(|b| b.is_ascii_digit()) && !v.starts_with('0');
-    if !ok {
-        return Err(format!("--rounds must be a positive integer (1-999999), got {v:?}"));
-    }
-    Ok(v.parse().expect("validated digits"))
-}
-
 /// A lane's `BENCH_ITERS`, from the lane line or this process.
 fn lane_iters(env: &BTreeMap<String, String>) -> Res<Option<usize>> {
     env.get("BENCH_ITERS")
-        .map(|v| {
-            v.trim()
-                .parse()
-                .map_err(|_| format!("BENCH_ITERS={v:?} is not a non-negative integer"))
-        })
+        .map(|v| common::parse_count("BENCH_ITERS", v, 0))
         .transpose()
 }
 
-fn run_lane(lane: &Lane, env: &BTreeMap<String, String>, o: &Options) -> Res<LaneRun> {
-    let out = Command::new(&lane.argv[0])
-        .args(&lane.argv[1..])
-        .env_clear()
-        .envs(env)
-        .output()
-        .map_err(|e| format!("lane {}: {}: {e}", lane.name, lane.argv[0]))?;
-    if !out.status.success() {
-        let err = String::from_utf8_lossy(&out.stderr);
+/// Every lane process's full output, kept under `<out>.lanes/` as
+/// `rNN-LANE-INDEX-NAME.{stdout,stderr,meta.json}`: what the retired shell
+/// drivers appended to their log, written as each run ends, so a run that
+/// fails halfway still leaves its evidence.
+struct Archive {
+    dir: PathBuf,
+}
+
+impl Archive {
+    fn create(out: &Path) -> Res<Self> {
+        let dir = PathBuf::from(format!("{}.lanes", out.display()));
+        if dir.is_dir() {
+            std::fs::remove_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+        }
+        std::fs::create_dir(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+        Ok(Self { dir })
+    }
+
+    fn write(
+        &self,
+        round: usize,
+        index: usize,
+        lane: &Lane,
+        raw: &evidence::RawRun,
+        started: &str,
+        load: Jv,
+    ) -> Res<()> {
+        let safe: String = lane
+            .name
+            .chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || "._-".contains(c) {
+                    c
+                } else {
+                    '_'
+                }
+            })
+            .collect();
+        let stem = self.dir.join(format!("r{:02}-{index}-{safe}", round + 1));
+        let meta = Jv::obj([
+            ("round", Jv::Int(round as u64 + 1)),
+            ("lane", Jv::str(lane.name.clone())),
+            (
+                "argv",
+                Jv::Arr(lane.argv.iter().map(|a| Jv::str(evidence::redact_text(a))).collect()),
+            ),
+            ("started_at_utc", Jv::str(started)),
+            ("finished_at_utc", Jv::str(evidence::utc_now())),
+            ("load_at_start", load),
+            ("exit_code", raw.returncode.map_or(Jv::Null, |c| Jv::Num(f64::from(c)))),
+            ("signal", raw.signal.map_or(Jv::Null, |c| Jv::Num(f64::from(c)))),
+            ("error", Jv::opt_str(raw.error.clone())),
+        ]);
+        for (ext, bytes) in [
+            ("stdout", raw.stdout.clone()),
+            ("stderr", raw.stderr.clone()),
+            ("meta.json", meta.render()?.into_bytes()),
+        ] {
+            let path = PathBuf::from(format!("{}.{ext}", stem.display()));
+            std::fs::write(&path, bytes).map_err(|e| format!("{}: {e}", path.display()))?;
+        }
+        Ok(())
+    }
+}
+
+fn run_lane(
+    lane: &Lane,
+    index: usize,
+    round: usize,
+    env: &BTreeMap<String, String>,
+    o: &Options,
+    archive: Option<&Archive>,
+) -> Res<LaneRun> {
+    let mut cmd = Command::new(&lane.argv[0]);
+    cmd.args(&lane.argv[1..]).env_clear().envs(env);
+    let (started, load) = (evidence::utc_now(), evidence::load_snapshot());
+    let raw = evidence::run_command(cmd, o.lane_timeout);
+    if let Some(a) = archive {
+        a.write(round, index, lane, &raw, &started, load)?;
+    }
+    if let Some(e) = &raw.error {
+        return Err(if e.starts_with("timed out") {
+            format!(
+                "lane {} {e} in round {}/{} and was killed (--lane-timeout)",
+                lane.name,
+                round + 1,
+                o.rounds
+            )
+        } else {
+            format!("lane {}: {}: {e}", lane.name, lane.argv[0])
+        });
+    }
+    if raw.returncode != Some(0) {
+        let err = String::from_utf8_lossy(&raw.stderr);
         let tail: String = err
             .chars()
             .rev()
@@ -580,14 +690,71 @@ fn run_lane(lane: &Lane, env: &BTreeMap<String, String>, o: &Options) -> Res<Lan
             .into_iter()
             .rev()
             .collect();
-        return Err(format!("lane {} failed ({}):\n{tail}", lane.name, out.status));
+        let how = match (raw.returncode, raw.signal) {
+            (Some(c), _) => format!("exit status {c}"),
+            (None, Some(sig)) => format!("terminated by signal {sig}"),
+            (None, None) => "no exit status".to_string(),
+        };
+        return Err(format!(
+            "lane {} failed in round {}/{} ({how}):\n{tail}",
+            lane.name,
+            round + 1,
+            o.rounds
+        ));
     }
-    let stdout = String::from_utf8(out.stdout).map_err(|e| format!("lane {}: stdout: {e}", lane.name))?;
+    let stdout = String::from_utf8(raw.stdout).map_err(|e| format!("lane {}: stdout: {e}", lane.name))?;
     match &o.format {
         Format::Workloads => parse_workloads(&lane.name, &stdout),
         Format::Metrics => parse_metrics(&lane.name, &stdout),
         Format::Rows { key, variant, value } => parse_rows(&lane.name, &stdout, key, variant, value, &o.require),
     }
+}
+
+fn id_name((key, variant): &Id) -> String {
+    if variant.is_empty() {
+        key.clone()
+    } else {
+        format!("{key}/{variant}")
+    }
+}
+
+/// Round `r` (0-based) must hold what the rounds before it held: the base's
+/// workloads in every lane after round 1, and each lane's own set unchanged
+/// after that. Checked as each round ends, so a lane that dropped a metric
+/// fails the run then, not after every remaining round has been spent.
+fn check_round(o: &Options, runs: &[Vec<LaneRun>], r: usize) -> Res<()> {
+    let round = &runs[r];
+    for (l, lane) in o.lanes.iter().enumerate() {
+        let missing = |id: &Id| {
+            format!(
+                "lane {} did not report workload {:?} in round {}",
+                lane.name,
+                id_name(id),
+                r + 1
+            )
+        };
+        if r == 0 {
+            if l > 0 && !matches!(o.format, Format::Rows { .. }) {
+                if let Some(id) = round[0].order.iter().find(|id| !round[l].fields.contains_key(*id)) {
+                    return Err(missing(id));
+                }
+            }
+            continue;
+        }
+        let first = &runs[0][l];
+        if let Some(id) = first.order.iter().find(|id| !round[l].fields.contains_key(*id)) {
+            return Err(missing(id));
+        }
+        if let Some(id) = round[l].order.iter().find(|id| !first.fields.contains_key(*id)) {
+            return Err(format!(
+                "lane {} reported workload {:?} in round {} that it did not report in round 1",
+                lane.name,
+                id_name(id),
+                r + 1
+            ));
+        }
+    }
+    Ok(())
 }
 
 // ------------------------------------------------------------------ report
@@ -954,18 +1121,31 @@ fn provenance_files(lanes: &[Lane]) -> Vec<(String, PathBuf)> {
     files
 }
 
+/// Hash of each evidence input file, by name; compared again after every round.
+fn input_hashes(files: &[(String, PathBuf)]) -> Res<Vec<(String, PathBuf, String)>> {
+    files
+        .iter()
+        .map(|(n, p)| {
+            Ok((
+                n.clone(),
+                p.clone(),
+                evidence::file_sha256(p).map_err(|e| format!("{n}: {e}"))?,
+            ))
+        })
+        .collect()
+}
+
 fn real_main(args: &[String]) -> Result<(), Fail> {
-    // The marker goes down before anything else is validated, so even a
-    // malformed rerun makes a preserved older output visibly stale.
-    let mut publisher = None;
-    if args.iter().any(|a| a == "--evidence") {
-        if let Some(path) = evidence::requested_output_path(args) {
-            let p = evidence::EvidenceOutput::new(Path::new(&path), args)?;
-            p.begin()?;
-            publisher = Some(p);
-        }
-    }
     let o = parse_args(args).map_err(Fail::Usage)?;
+    // The marker goes down once the command line is known to be well formed and
+    // before the policy is checked, so a rerun the policy refuses still makes a
+    // preserved older output visibly stale. A malformed command line writes none.
+    let mut publisher = None;
+    if let (true, Some(path)) = (o.evidence, &o.out) {
+        let p = evidence::EvidenceOutput::new(path, args)?;
+        p.begin()?;
+        publisher = Some(p);
+    }
     let inherited: Vec<(String, String)> = std::env::vars().collect();
     let envs: Vec<BTreeMap<String, String>> = o
         .lanes
@@ -985,7 +1165,9 @@ fn real_main(args: &[String]) -> Result<(), Fail> {
             evidence::validate_evidence_sample_counts(o.rounds, iters).map_err(Fail::Usage)?;
         }
     }
+    let archive = o.out.as_deref().map(Archive::create).transpose()?;
     let mut provenance = None;
+    let mut hashes = Vec::new();
     if o.evidence {
         let config = Jv::obj([
             ("rounds", Jv::Int(o.rounds as u64)),
@@ -993,6 +1175,7 @@ fn real_main(args: &[String]) -> Result<(), Fail> {
                 "max_spread",
                 Jv::Num(o.max_spread.unwrap_or(evidence::DEFAULT_MAX_RATIO_SPREAD)),
             ),
+            ("lane_timeout_secs", Jv::Int(o.lane_timeout.as_secs())),
             ("clean_env", Jv::Bool(o.clean_env)),
             ("format", Jv::str(format!("{:?}", o.format))),
             ("lanes", Jv::Arr(o.lanes.iter().map(lane_json).collect())),
@@ -1004,26 +1187,24 @@ fn real_main(args: &[String]) -> Result<(), Fail> {
         let mut files = provenance_files(&o.lanes);
         files.sort();
         files.dedup();
-        provenance = Some(evidence::start_provenance(&evidence::ProvenanceInputs {
+        hashes = input_hashes(&files)?;
+        let mut prov = evidence::start_provenance(&evidence::ProvenanceInputs {
             argv: args,
             scope: Path::new("."),
             files,
             config,
             probe_device: true,
-        })?);
+        })?;
         for lane in &o.lanes {
             if lane.argv[0].rsplit('/').next().is_some_and(|n| n.starts_with("python")) {
-                if let Some(Jv::Obj(runtime)) = provenance.as_mut().and_then(|p| match p {
-                    Jv::Obj(f) => f.iter_mut().find(|(k, _)| k == "runtime").map(|(_, v)| v),
-                    _ => None,
-                }) {
-                    runtime.push((
-                        format!("python_packages:{}", lane.name),
-                        evidence::python_packages(&lane.argv[0]),
-                    ));
-                }
+                evidence::add_runtime_record(
+                    &mut prov,
+                    &format!("python_packages:{}", lane.name),
+                    evidence::python_packages(&lane.argv[0]),
+                );
             }
         }
+        provenance = Some(prov);
     }
 
     // runs[round][lane]
@@ -1035,9 +1216,23 @@ fn real_main(args: &[String]) -> Result<(), Fail> {
         }
         let mut this: Vec<Option<LaneRun>> = (0..o.lanes.len()).map(|_| None).collect();
         for i in order {
-            this[i] = Some(run_lane(&o.lanes[i], &envs[i], &o)?);
+            this[i] = Some(run_lane(&o.lanes[i], i, r, &envs[i], &o, archive.as_ref())?);
         }
         runs.push(this.into_iter().map(|x| x.expect("every lane ran")).collect());
+        check_round(&o, &runs, r)?;
+        // A lane executable or script rewritten mid-run would be published
+        // under the hash taken before round 1.
+        for (name, path, before) in &hashes {
+            let now = evidence::file_sha256(path).map_err(|e| format!("{name}: {e}"))?;
+            if &now != before {
+                return Err(Fail::Run(format!(
+                    "{name} ({}) changed during round {}/{}: sha256 {before} before, {now} after; refusing to publish",
+                    path.display(),
+                    r + 1,
+                    o.rounds
+                )));
+            }
+        }
         eprintln!("round {}/{} done", r + 1, o.rounds);
     }
 
@@ -1091,6 +1286,12 @@ fn real_main(args: &[String]) -> Result<(), Fail> {
             Jv::Arr(report.summary),
         ));
         doc.push(("raw".into(), Jv::Arr(raw)));
+        if let Some(a) = &archive {
+            doc.push((
+                "lane_archive".into(),
+                Jv::str(evidence::redact_text(&a.dir.to_string_lossy())),
+            ));
+        }
         if let Some(mut prov) = provenance {
             evidence::finish_provenance(&mut prov);
             doc.push(("provenance".into(), prov));
@@ -1225,6 +1426,11 @@ mod tests {
             "METRIC a x\n",
             "METRIC a NaN\n",
             "METRIC a 1\nMETRIC a 2\n",
+            "METRIC a 0\n",
+            "METRIC a -1\n",
+            "METRIC a inf\n",
+            "METRIC a 1 2 3\n",
+            "METRIC a 1 #c\n",
         ] {
             assert!(parse_metrics("l", bad).is_err(), "{bad:?} accepted");
         }
@@ -1292,6 +1498,7 @@ mod tests {
             keys,
             require: Vec::new(),
             max_spread: spread,
+            lane_timeout: Duration::from_secs(60),
             clean_env: false,
             evidence: false,
             lanes: vec![parse_lane("tessl=a").unwrap(), parse_lane("other=b").unwrap()],
@@ -1423,11 +1630,61 @@ mod tests {
         assert_eq!(with(&[]).unwrap().rounds, 5);
         assert!(with(&["--rounds", "1"]).is_err());
         for bad in [
-            "0", "00", "-1", "", "abc", "1.5", "+2", " 2", "2 ", "007", "0x10", "1e3", "1000000", "\u{661}", "1\n2",
+            "0",
+            "00",
+            "-1",
+            "",
+            "abc",
+            "1.5",
+            "+2",
+            " 2",
+            "2 ",
+            "007",
+            "0x10",
+            "1e3",
+            "1000000",
+            "\u{661}",
+            "1\n2",
+            "18446744073709551615",
         ] {
-            assert!(parse_rounds(bad).is_err(), "--rounds {bad:?} accepted");
+            assert!(with(&["--rounds", bad]).is_err(), "--rounds {bad:?} accepted");
+            assert!(
+                with(&[&format!("--rounds={bad}")]).is_err(),
+                "--rounds={bad:?} accepted"
+            );
         }
-        assert_eq!(parse_rounds("12").unwrap(), 12);
+        assert_eq!(with(&["--rounds", "12"]).unwrap().rounds, 12);
+        assert_eq!(with(&["--rounds=12"]).unwrap().rounds, 12);
+        // The `=` form works for every value option, and is never a lane.
+        let o = with(&[
+            "--out=o.json",
+            "--format=metrics",
+            "--max-spread=1.2",
+            "--lane-timeout=7",
+        ])
+        .unwrap();
+        assert_eq!(o.out.as_deref(), Some(Path::new("o.json")));
+        assert_eq!(
+            (o.format.clone(), o.max_spread, o.lane_timeout.as_secs()),
+            (Format::Metrics, Some(1.2), 7)
+        );
+        assert_eq!(o.lanes.len(), 2);
+        let o = with(&["--format=rows:k,v,x", "--compare=t:o", "--keys=a,b", "--require=n=2"]).unwrap();
+        assert_eq!(
+            (o.compares.len(), o.keys.map(|k| k.len()), o.require.len()),
+            (1, Some(2), 1)
+        );
+        for bad in [
+            "--bogus=1",
+            "--evidence=1",
+            "--clean-env=0",
+            "--out",
+            "--lane-timeout=0",
+            "--lane-timeout=86401",
+        ] {
+            assert!(with(&[bad]).is_err(), "{bad} accepted");
+        }
+        assert_eq!(with(&[]).unwrap().lane_timeout.as_secs(), DEFAULT_LANE_TIMEOUT_SECS);
         assert!(parse_args(&args(&["a=x"])).is_err());
         assert!(with(&["--format", "bogus"]).is_err());
         assert!(with(&["--format", "rows:k,v,x"]).is_err(), "rows needs --compare");
@@ -1530,8 +1787,32 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "KNOWN BREAK: a repeated ENV key in one lane is accepted (last wins, both recorded) instead of refused"]
     fn a_repeated_env_key_in_one_lane_is_refused() {
         assert!(parse_lane("x:K=1,K=2=bin").is_err());
+    }
+
+    #[test]
+    fn check_round_fails_a_dropped_or_added_workload_in_the_round_it_happens() {
+        let o = Options {
+            format: Format::Metrics,
+            compares: Vec::new(),
+            ..rows_options(None, None)
+        };
+        let m = |ids: &[&str]| rows_run(&ids.iter().map(|i| (*i, "", 1.0)).collect::<Vec<_>>());
+        let mut runs = vec![vec![m(&["a", "b"]), m(&["a", "b"])]];
+        check_round(&o, &runs, 0).unwrap();
+        runs.push(vec![m(&["a", "b"]), m(&["a"])]);
+        let err = check_round(&o, &runs, 1).unwrap_err();
+        assert!(
+            err.contains("other") && err.contains("\"b\"") && err.contains("round 2"),
+            "{err}"
+        );
+        runs[1][1] = m(&["a", "b", "c"]);
+        assert!(check_round(&o, &runs, 1)
+            .unwrap_err()
+            .contains("did not report in round 1"));
+        // Round 1: a lane missing a base workload.
+        let first = vec![vec![m(&["a", "b"]), m(&["a"])]];
+        assert!(check_round(&o, &first, 0).unwrap_err().contains("round 1"));
     }
 }

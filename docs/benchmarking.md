@@ -170,6 +170,29 @@ per-round ratios against the base lane, with the lowest and highest round beside
 it. `--max-spread X` (1 to 1.25) turns a ratio series whose max/min exceeds `X`
 into exit 3 with nothing reported.
 
+Options take `--name value` or `--name=value`; one parser reads both, and an
+unknown `--option` is a usage error, never a lane. Counts (`--rounds`,
+`BENCH_ITERS` and the other `BENCH_*` counts) are ASCII digits only: no sign, no
+padding, no leading zero, at most 999999. A `METRIC` line is exactly
+`METRIC name value`, and every metric must be positive and finite: the
+statistic is a ratio of two runs, so a counter that can be 0 (or a `lo..hi`
+range) is not a metric for this driver and fails the run naming it. Each lane
+run is bounded by `--lane-timeout SECS` (default 3600, at most 86400): one hour
+covers the slowest current lane, a 2B `bench_qwen35_train --step` including the
+checkpoint load, a warm-up, three timed steps and a traced one. On expiry the
+lane's process group is killed and the run fails (exit 1) naming the lane and
+round. Every round is checked as it ends: a lane that dropped (or added) a
+workload fails the run in that round, not after the remaining rounds.
+
+With `--out PATH`, every lane process's full stdout and stderr is kept under
+`PATH.lanes/` (recreated on each run) as `rNN-LANE_INDEX-NAME.stdout`, `.stderr`
+and `.meta.json`; the meta file has the round, argv, start and finish UTC time,
+the load average at the start, and the exit status. They are written as each run
+ends, so a run that fails halfway still leaves what ran. This is what the old
+`paired_bins.sh` and `paired_qwen35_step.sh` logs held. Under `--evidence`,
+each lane executable and script argument is re-hashed after every round, and a
+file that changed fails the run with nothing published.
+
 | replaces | run |
 | --- | --- |
 | `paired_bins.sh ROUNDS OUT ARGS` with `BENCH_BINS="before=A after=B"` | `bench_paired --format metrics --rounds N --out OUT.json "before=A ARGS" "after=B ARGS"` |
@@ -182,10 +205,11 @@ What each script did, and where it went:
 | behaviour | now |
 | --- | --- |
 | Min-of-N over rounds with the max as spread (`paired_bins`, `paired_qwen35_step`) | The JSON keeps `value_min`, `value_max` and `value_all` per lane; the table is the median plus the ratio's `[lo, hi]`. The ratio of medians of rounds replaces the ratio of mins. Two lanes give the same `vs base` column the old `b/a` column was. |
-| `ROUNDS >= 1` (`paired_bins`) | `--rounds` is at least 2 (a single round has no spread), at least 4 and even with `--evidence`; digits only, no sign or leading zero. |
+| `ROUNDS >= 1` (`paired_bins`) | `--rounds` is at least 2 (a single round has no spread), at least 4 and even with `--evidence`; the strict count grammar above. |
 | Frozen binaries `BENCH_BINS`, paths with spaces | One lane per binary; quote a path that holds spaces. |
 | `/usr/bin/time -l` peak footprint, device peak | `METRIC` lines from `bench_qwen35_train --step`; `bench_embedgemma2`'s JSON extras (`device_peak_mib`, `peak_footprint_mib`, `forwards`) are carried as before. |
-| A lane that prints no `METRIC` line fails the run | Same (exit 1), as does a metric a lane stops reporting in a later round. |
+| A lane that prints no `METRIC` line fails the run | Same (exit 1), as does a metric a lane stops reporting in a later round. A zero or negative metric, a trailing token on a `METRIC` line, and a lane that exceeds `--lane-timeout` also fail. |
+| Per-process logs, timestamp and load average per round (`paired_bins`, `paired_qwen35_step`) | `PATH.lanes/` under `--out`, described above. |
 | Same shape ladder for both runtimes, never a geomean over part of it | `--keys` names the ladder; a (key, variant) absent from any round is an error naming it. |
 | Same batching on both sides (`attn_paired`) | `--require FIELD=VALUE`: a row that lacks the field, or carries another value, is refused. |
 | Spread gate per shape and on the per-round geomean, default 1.10, cap 1.25 | `--max-spread`, default 1.10 under `--evidence`; the per-key series and the paired geomean are both gated, and nothing is printed or published when one fails. |

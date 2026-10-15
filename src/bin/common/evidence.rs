@@ -86,27 +86,6 @@ pub fn clean_benchmark_env(base: impl IntoIterator<Item = (String, String)>) -> 
         .collect()
 }
 
-/// The last usable `--out` value, found before any other option is validated,
-/// so even a malformed rerun marks an older output stale.
-pub fn requested_output_path(args: &[String]) -> Option<String> {
-    let mut selected = None;
-    let mut i = 0;
-    while i < args.len() {
-        let token = &args[i];
-        if token == "--out" {
-            if let Some(next) = args.get(i + 1).filter(|n| !n.starts_with('-')) {
-                selected = Some(next.clone());
-                i += 2;
-                continue;
-            }
-        } else if let Some(v) = token.strip_prefix("--out=").filter(|v| !v.is_empty()) {
-            selected = Some(v.to_string());
-        }
-        i += 1;
-    }
-    selected
-}
-
 // -------------------------------------------------------------- statistics
 
 pub fn positive_finite(values: &[f64], label: &str) -> Res<()> {
@@ -361,6 +340,22 @@ fn display_path(path: &Path) -> String {
     redact_text(&abs.to_string_lossy())
 }
 
+/// `pid-nanoseconds`, unique per call within a process.
+fn unique_stamp() -> String {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos());
+    format!("{:x}-{nanos:x}", std::process::id())
+}
+
+/// This executable and `argv`, with the home directory redacted.
+fn invocation_argv(exe: &Path, argv: &[String]) -> Vec<String> {
+    std::iter::once(exe.to_string_lossy().into_owned())
+        .chain(argv.iter().cloned())
+        .map(|a| redact_text(&a))
+        .collect()
+}
+
 pub fn shell_join(argv: &[String]) -> String {
     argv.iter()
         .map(|a| {
@@ -381,6 +376,21 @@ fn mtime_ns(meta: &std::fs::Metadata) -> Jv {
         .ok()
         .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
         .map_or(Jv::Null, |d| Jv::Int(d.as_nanos() as u64))
+}
+
+pub fn file_sha256(path: &Path) -> Res<String> {
+    std::fs::read(path)
+        .map(|d| sha256_hex(&d))
+        .map_err(|e| format!("{}: {}", path.display(), redact_text(&e.to_string())))
+}
+
+/// Add `name: value` to the provenance's `runtime` block.
+pub fn add_runtime_record(prov: &mut Jv, name: &str, value: Jv) {
+    if let Jv::Obj(fields) = prov {
+        if let Some((_, Jv::Obj(runtime))) = fields.iter_mut().find(|(k, _)| k == "runtime") {
+            runtime.push((name.to_string(), value));
+        }
+    }
 }
 
 /// `{path, size_bytes, mtime_ns, sha256}`, or `{path, unavailable}`.
@@ -410,25 +420,27 @@ pub fn record_sha256(rec: &Jv) -> Option<&str> {
 
 pub struct RawRun {
     pub returncode: Option<i32>,
+    /// The signal that ended the process, when one did.
+    pub signal: Option<i32>,
     pub stdout: Vec<u8>,
     pub stderr: Vec<u8>,
     pub error: Option<String>,
 }
 
-/// Run `argv`, draining both pipes on threads (a large `git diff` would fill
-/// one) and killing the child, which this function started, past `timeout`.
-pub fn run_raw(argv: &[&str], cwd: Option<&Path>, timeout: Duration) -> RawRun {
+/// Run `cmd` with piped output, draining both pipes on threads (a large `git
+/// diff` would fill one). The child leads its own process group, and past
+/// `timeout` that group, which this function started, is killed so a lane's own
+/// children cannot outlive it.
+pub fn run_command(mut cmd: Command, timeout: Duration) -> RawRun {
+    use std::os::unix::process::CommandExt;
     let fail = |e: String| RawRun {
         returncode: None,
+        signal: None,
         stdout: Vec::new(),
         stderr: Vec::new(),
         error: Some(e),
     };
-    let mut cmd = Command::new(argv[0]);
-    cmd.args(&argv[1..]).stdout(Stdio::piped()).stderr(Stdio::piped());
-    if let Some(dir) = cwd {
-        cmd.current_dir(dir);
-    }
+    cmd.stdout(Stdio::piped()).stderr(Stdio::piped()).process_group(0);
     let mut child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => return fail(e.to_string()),
@@ -447,6 +459,9 @@ pub fn run_raw(argv: &[&str], cwd: Option<&Path>, timeout: Duration) -> RawRun {
         match child.try_wait() {
             Ok(Some(s)) => break Ok(s),
             Ok(None) if Instant::now() >= deadline => {
+                // SAFETY: `kill` takes a pid and a signal; the negated pid is the
+                // group of the child spawned above, whose pid is its group id.
+                unsafe { libc::kill(-(child.id() as libc::pid_t), libc::SIGKILL) };
                 let _ = child.kill();
                 let _ = child.wait();
                 break Err(format!("timed out after {}s", timeout.as_secs()));
@@ -456,20 +471,30 @@ pub fn run_raw(argv: &[&str], cwd: Option<&Path>, timeout: Duration) -> RawRun {
         }
     };
     let (stdout, stderr) = (out.join().unwrap_or_default(), err.join().unwrap_or_default());
-    match status {
-        Ok(s) => RawRun {
-            returncode: s.code(),
-            stdout,
-            stderr,
-            error: None,
-        },
-        Err(e) => RawRun {
-            returncode: None,
-            stdout,
-            stderr,
-            error: Some(e),
-        },
+    let (returncode, signal, error) = match status {
+        Ok(s) => {
+            use std::os::unix::process::ExitStatusExt;
+            (s.code(), s.signal(), None)
+        }
+        Err(e) => (None, None, Some(e)),
+    };
+    RawRun {
+        returncode,
+        signal,
+        stdout,
+        stderr,
+        error,
     }
+}
+
+/// [`run_command`] on `argv`, optionally from `cwd`.
+pub fn run_raw(argv: &[&str], cwd: Option<&Path>, timeout: Duration) -> RawRun {
+    let mut cmd = Command::new(argv[0]);
+    cmd.args(&argv[1..]);
+    if let Some(dir) = cwd {
+        cmd.current_dir(dir);
+    }
+    run_command(cmd, timeout)
 }
 
 fn clip(bytes: &[u8], limit: usize) -> String {
@@ -561,7 +586,7 @@ pub fn git_snapshot(scope: &Path) -> Res<Jv> {
     ]))
 }
 
-fn load_snapshot() -> Jv {
+pub fn load_snapshot() -> Jv {
     let mut l = [0f64; 3];
     // SAFETY: `getloadavg` writes at most `nelem` doubles into `l`, which holds 3.
     let n = unsafe { libc::getloadavg(l.as_mut_ptr(), 3) };
@@ -690,10 +715,7 @@ pub struct ProvenanceInputs<'a> {
 pub fn start_provenance(inp: &ProvenanceInputs) -> Res<Jv> {
     let git = git_snapshot(inp.scope)?;
     let exe = std::env::current_exe().map_err(|e| format!("current_exe: {e}"))?;
-    let invocation: Vec<String> = std::iter::once(exe.to_string_lossy().into_owned())
-        .chain(inp.argv.iter().cloned())
-        .map(|a| redact_text(&a))
-        .collect();
+    let invocation = invocation_argv(&exe, inp.argv);
     let mut inputs = vec![("driver".to_string(), file_record(&exe))];
     inputs.extend(inp.files.iter().map(|(n, p)| (n.clone(), file_record(p))));
     let missing: Vec<&str> = inputs
@@ -813,10 +835,7 @@ pub fn atomic_write(path: &Path, bytes: &[u8]) -> Res<()> {
             abs.display()
         ));
     }
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_nanos());
-    let staged = dir.join(format!(".{name}.{}.{nanos}", std::process::id()));
+    let staged = dir.join(format!(".{name}.{}", unique_stamp()));
     let result = (|| -> std::io::Result<()> {
         use std::io::Write;
         let mut f = std::fs::File::create(&staged)?;
@@ -847,19 +866,10 @@ impl EvidenceOutput {
         let output = std::path::absolute(output).map_err(|e| e.to_string())?;
         let marker = PathBuf::from(format!("{}.attempt.json", output.display()));
         let exe = std::env::current_exe().map_err(|e| e.to_string())?;
-        let invocation: Vec<String> = std::iter::once(exe.to_string_lossy().into_owned())
-            .chain(argv.iter().cloned())
-            .map(|a| redact_text(&a))
-            .collect();
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |d| d.as_nanos());
+        let invocation = invocation_argv(&exe, argv);
         let record = vec![
             ("schema_version".to_string(), Jv::Int(1)),
-            (
-                "attempt_id".into(),
-                Jv::str(format!("{:x}-{:x}", std::process::id(), nanos)),
-            ),
+            ("attempt_id".into(), Jv::str(unique_stamp())),
             ("status".into(), Jv::str("not_published")),
             ("started_at_utc".into(), Jv::str(utc_now())),
             ("invocation_shell".into(), Jv::str(shell_join(&invocation))),
@@ -977,14 +987,6 @@ mod tests {
                 "iters {iters}"
             );
         }
-    }
-
-    #[test]
-    fn output_discovery_uses_the_last_usable_value() {
-        let a = args(&["--out", "first.json", "--out=second.json"]);
-        assert_eq!(requested_output_path(&a).as_deref(), Some("second.json"));
-        assert_eq!(requested_output_path(&args(&["--out", "--rounds"])), None);
-        assert_eq!(requested_output_path(&args(&["--out="])), None);
     }
 
     #[test]

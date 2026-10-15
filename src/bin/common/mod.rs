@@ -170,8 +170,7 @@ pub fn median(mut v: Vec<f64>) -> Result<f64, String> {
 
 /// Environment integers fail loud. This tree already lost a run to the opposite
 /// policy: a malformed `GEMM_FUZZ_SEED` was silently ignored and one seed ran
-/// eight times while the log claimed eight. `BENCH_WARMUP` and `BENCH_ITERS`
-/// still had that exact `.ok().unwrap_or(default)` shape.
+/// eight times while the log claimed eight. (See [`env_usize`].)
 /// This process's lifetime peak physical footprint in bytes: the figure
 /// `/usr/bin/time -l` prints as `peak memory footprint`. Not `ru_maxrss`,
 /// which under-reads when macOS compresses or reclaims pages
@@ -194,24 +193,35 @@ pub fn peak_footprint() -> Result<u64, String> {
     Ok(unsafe { info.assume_init() }.ri_lifetime_max_phys_footprint)
 }
 
-pub fn env_usize(name: &str, default: usize, min: usize) -> Result<usize, String> {
-    let raw = match std::env::var(name) {
-        Ok(v) => v,
-        Err(std::env::VarError::NotPresent) => return Ok(default),
-        Err(e) => return Err(format!("{name}: {e}")),
-    };
-    parse_usize_env_value(name, &raw, min)
-}
+/// The largest count any benchmark knob (`BENCH_ITERS`, `--rounds`, ...) may
+/// name. No bench runs a million of anything; the bound turns `2^64 - 1`, and a
+/// typo that adds digits, into an error instead of a run that never ends.
+pub const MAX_COUNT: usize = 999_999;
 
-fn parse_usize_env_value(name: &str, raw: &str, min: usize) -> Result<usize, String> {
-    let v: usize = raw
-        .trim()
-        .parse()
-        .map_err(|_| format!("{name}={raw:?} is not a non-negative integer"))?;
+/// The one strict count parser: ASCII digits only (no sign, no surrounding
+/// whitespace), no leading zero unless the whole value is `0`, between `min`
+/// and [`MAX_COUNT`]. `name` is the variable or flag, for the message.
+pub fn parse_count(name: &str, raw: &str, min: usize) -> Result<usize, String> {
+    let digits = !raw.is_empty() && raw.bytes().all(|b| b.is_ascii_digit()) && (raw == "0" || !raw.starts_with('0'));
+    let v = digits.then(|| raw.parse::<usize>().ok()).flatten().ok_or_else(|| {
+        format!("{name}={raw:?} is not a non-negative integer (ASCII digits, no sign or leading zero)")
+    })?;
     if v < min {
         return Err(format!("{name}={v} is below the minimum of {min}"));
     }
+    if v > MAX_COUNT {
+        return Err(format!("{name}={v} is above the maximum of {MAX_COUNT}"));
+    }
     Ok(v)
+}
+
+/// `name` from the environment through [`parse_count`], `default` when unset.
+pub fn env_usize(name: &str, default: usize, min: usize) -> Result<usize, String> {
+    match std::env::var(name) {
+        Ok(v) => parse_count(name, &v, min),
+        Err(std::env::VarError::NotPresent) => Ok(default),
+        Err(e) => Err(format!("{name}: {e}")),
+    }
 }
 
 /// The measurement-only GEMM kernels live in `kernels/tune/` and are linked
@@ -353,9 +363,7 @@ pub fn exit_if_unstable(bin: &str, unstable: &[String]) {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        fill, fill_affine, median, parse_usize_env_value, ratio_stats, round_order, run_paired, self_spread, Arm,
-    };
+    use super::{fill, fill_affine, median, parse_count, ratio_stats, round_order, run_paired, self_spread, Arm};
 
     #[test]
     fn median_rejects_empty_and_non_finite_samples() {
@@ -438,10 +446,31 @@ mod tests {
 
     #[test]
     fn benchmark_count_parser_is_strict_and_bounded() {
-        assert_eq!(parse_usize_env_value("N", " 7 ", 1).unwrap(), 7);
-        assert!(parse_usize_env_value("N", "", 1).is_err());
-        assert!(parse_usize_env_value("N", "not-a-count", 1).is_err());
-        assert!(parse_usize_env_value("N", "-1", 1).is_err());
-        assert!(parse_usize_env_value("N", "0", 1).unwrap_err().contains("minimum"));
+        assert_eq!(parse_count("N", "7", 1).unwrap(), 7);
+        assert_eq!(parse_count("N", "0", 0).unwrap(), 0);
+        for bad in [
+            "",
+            " 7",
+            "7 ",
+            " 7 ",
+            "+7",
+            "-1",
+            "007",
+            "00",
+            "0x7",
+            "1e3",
+            "1_0",
+            "\u{661}",
+            "not-a-count",
+            "7\n",
+            "1000000",
+            "18446744073709551615",
+            "18446744073709551616",
+        ] {
+            assert!(parse_count("N", bad, 0).is_err(), "{bad:?} accepted");
+        }
+        assert!(parse_count("N", "0", 1).unwrap_err().contains("minimum"));
+        assert!(parse_count("N", "999999", 1).is_ok());
+        assert!(parse_count("N", "1000000", 1).unwrap_err().contains("maximum"));
     }
 }

@@ -94,3 +94,8 @@ DerivedData/
 # Logs and scratch output.
 *.log
 *.tmp
+
+# DevCouncil local state
+.devcouncil/*
+!/.devcouncil/
+!.devcouncil/config.yaml

@@ -6,7 +6,7 @@
 //! barrier changes the numbers), replay it many times, and compare each replay
 //! to the live result bit for bit.
 //!
-//! The process-global flags (hazard mode, ICB pipelines, freeze, range batch)
+//! The process-global flags (hazard mode, ICB pipelines, ICB execute)
 //! are shared, so every test holds [`LOCK`] and this file owns its process.
 
 use std::sync::{Arc, Mutex};
@@ -27,9 +27,7 @@ impl Drop for Flags {
     fn drop(&mut self) {
         tessl::end_decode_icb_capture();
         set_icb_pipelines(false);
-        tessl::set_icb_freeze_binds(false);
-        tessl::set_icb_range_batch(false);
-        tessl::set_icb_coarse_ranges(false);
+        tessl::set_icb_execute(false);
     }
 }
 
@@ -99,8 +97,8 @@ fn capture_marks_every_edge_of_an_inplace_chain() {
     }
 }
 
-fn replay_matches(freeze_range: bool, hazard: bool, async_encode: bool) {
-    let c = capture_chain(hazard, async_encode, freeze_range);
+fn replay_matches(icb_exec: bool, hazard: bool, async_encode: bool) {
+    let c = capture_chain(hazard, async_encode, icb_exec);
     let Chain {
         rt,
         logits,
@@ -108,9 +106,7 @@ fn replay_matches(freeze_range: bool, hazard: bool, async_encode: bool) {
         live,
         capture,
     } = c;
-    tessl::set_icb_freeze_binds(freeze_range);
-    tessl::set_icb_range_batch(freeze_range);
-    tessl::set_icb_coarse_ranges(false);
+    tessl::set_icb_execute(icb_exec);
     let mut icb = DecodeIcb::from_commands(&rt, capture.commands).expect("tape");
     let mut bad = 0;
     for r in 0..REPLAYS {
@@ -131,7 +127,7 @@ fn replay_matches(freeze_range: bool, hazard: bool, async_encode: bool) {
     drop(caps);
     assert_eq!(
         bad, 0,
-        "freeze_range={freeze_range} hazard={hazard} async={async_encode}: {bad}/{REPLAYS} replays differ"
+        "icb_exec={icb_exec} hazard={hazard} async={async_encode}: {bad}/{REPLAYS} replays differ"
     );
 }
 
@@ -140,10 +136,10 @@ fn replay_matches(freeze_range: bool, hazard: bool, async_encode: bool) {
 fn replay_is_bit_identical_across_modes_and_runs() {
     let _g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let _f = Flags;
-    for freeze_range in [false, true] {
+    for icb_exec in [false, true] {
         for hazard in [false, true] {
             for async_encode in [false, true] {
-                replay_matches(freeze_range, hazard, async_encode);
+                replay_matches(icb_exec, hazard, async_encode);
             }
         }
     }

@@ -68,7 +68,7 @@ The name is short for *tessellation* — the design centers around how matrix op
 - **Fused GEMM Epilogue:** `C = activation(alpha * A@B + beta * C_prev + bias)` in a single dispatch, applied while the accumulator is still in registers — measured 1.6–2.4× cheaper than the same work as a separate pass over $C$.
 - **Mixed Precision & Quantization:** `f32`, `bf16`, `tf32-relaxed`, IEEE `binary16` (`DType::F16`), and an exact `int8 x int8 -> int32` GEMM with fused per-column dequantization (`nn::gemm_i8_dequant`).
 - **Strided Batched GEMM:** `gemm_batched` with explicit per-operand batch strides, so a batch dimension is expressed rather than inferred from a rank-2 shape.
-- **Decode ICB Capture & Replay:** Low-latency Indirect Command Buffer (ICB) capture and ping-pong execution with freeze-binds and range-batching for decode-shaped inference workloads.
+- **Decode ICB Capture & Replay (opt-in, off by default):** Indirect Command Buffer (ICB) capture of a Binder tape and ping-pong replay through MTL4 prebuilt argument tables, for the mini and layer-level decode graphs. It is a measured experiment, not the shipping decode path: dispatch with prebuilt argument tables beat the ICB bind variants on product tok/s (the freeze-binds, range-batch and coarse-range variants were removed), and the full decode graph is not migrated. See Known Gaps.
 
 > [!IMPORTANT]
 > **Platform Requirements:**
@@ -283,14 +283,14 @@ sequenceDiagram
         Binder->>Tape: Record Command (PSO, ArgTable, Buffer Pointers, Grid Geometry)
     end
     Host->>Tape: take_decode_icb_capture()
-    Tape->>ICB: Encode ICB Commands<br/>(Freeze-binds: bake pointers &amp; tg_mem · Range-batching: coalesce spans)
+    Tape->>ICB: Encode ICB Commands<br/>(inheritBuffers: pipeline + grid per command)
     end
 
     rect rgb(245, 255, 245)
     Note over Host,GPU: Phase 2: Steady-State Low-Latency Replay (Subsequent Tokens)
     loop Each Autoregressive Token
         Host->>Tape: try_replay_icb(runtime)
-        Tape->>ICB: executeCommandsInBuffer:withRange:<br/>(0 setArgumentTable host calls · Coalesced barrier spans)
+        Tape->>ICB: executeCommandsInBuffer:withRange:<br/>(prebuilt argument tables · recorded barriers)
         Host->>GPU: Commit MTL4CommandBuffer (Ping-Pong A/B allocators)
         GPU-->>Host: Signal MTLSharedEvent (Zero-wait async execution)
     end
@@ -520,7 +520,8 @@ TESSL_GEMM_TUNE=1 cargo run --release --bin bench_gemm_tnnt_tune
 ## Environment Variables
 
 All runtime configuration uses the canonical `TESSL_*` prefix. Legacy
-`METAL_RUNTIME_*` and `METAL_NATIVE_*` variants are still accepted.
+`METAL_RUNTIME_*` variants are still accepted.
+The removed `GEMMA_METAL_*` and `METAL_NATIVE_*` spellings are no longer read.
 
 | Variable | Default | Description |
 |---|---|---|
@@ -529,14 +530,11 @@ All runtime configuration uses the canonical `TESSL_*` prefix. Legacy
 | `TESSL_COARSE_BARRIERS` | inherits `TESSL_HAZARD_BARRIERS` | Replaces per-RAW barriers with coarse phase-level synchronization. |
 | `TESSL_MID_COMMIT=N` | `0` | Overlaps host command encoding with GPU execution every $N$ dispatches. |
 | `TESSL_DECODE_ICB` | `0` | Enables the Indirect Command Buffer capture and execution path. |
-| `TESSL_ICB_FREEZE_BINDS` | `0` | Freezes argument table buffer bindings directly into ICB commands. |
-| `TESSL_ICB_RANGE_BATCH` | `0` | Coalesces contiguous ICB command ranges into single execution dispatches. |
 | `TESSL_SKIP_AOT` | unset | Offline escape hatch: skips the `build.rs` shader compile. Requires `TESSL_PREBUILT_METALLIB`; the build panics if that is missing, not absolute, or not a file. The prebuilt library is embedded the same way a freshly built one is. |
 | `TESSL_PREBUILT_METALLIB` | unset | Absolute path of an existing metallib to embed when `TESSL_SKIP_AOT` is set. Ignored otherwise. |
-| `TESSL_ICB_EXECUTE` | `0` | Executes captured decode commands through the ICB. Implied by `TESSL_ICB_FREEZE_BINDS`. |
+| `TESSL_ICB_EXECUTE` | `0` | Executes captured decode commands through the ICB. |
 | `TESSL_ICB_PIPELINES` | `0` | Builds ICB-capable pipelines. Needed for ICB execute; replay refuses without it rather than running a path that cannot execute. |
 | `TESSL_ICB_PREBUILT_TABLES` | `1` (on) | Freezes buffer binds into per-command argument tables, shared by fingerprint. `0` opts out. |
-| `TESSL_ICB_COARSE_RANGES` | follows `TESSL_ICB_RANGE_BATCH` | Elides non-interfering barriers before range batching. `0` keeps every captured barrier. |
 | `TESSL_ICB_TRIAGE` | `0` | Decode-ICB triage mode for diagnosing a replay regression. |
 | `TESSL_ICB_SMOKE` | `0` | Opt-in ICB smoke wiring. |
 | `TESSL_ATTN_TILED` | unset | Set (any value) to force the original tiled attention kernels instead of the default. Read once per process, for A/B runs. |
@@ -573,13 +571,12 @@ All runtime configuration uses the canonical `TESSL_*` prefix. Legacy
 ## Known Gaps
 
 Recorded rather than implied. Every kernel is wired to a typed Rust API and the
-suite is warning-free. One public scaffold ships unwired and is the first row
-below; the rest are capabilities the crate does not have.
+suite is warning-free. Each row is a capability the crate does not have.
 
 | Gap | Why it matters | Why not yet |
 |---|---|---|
-| **Full decode-graph ICB replay** | Replaying a whole decode step from an indirect command buffer would skip the per-token host encode. | `IcbReplayStub` and `IcbStubPhase` (`tessl::cb_replay`) are a host-side scaffold: `try_allocate` always returns `CbReplayError::NotWired`, and `try_execute` does too until a mini `DecodeIcb` has marked the stub `Allocated`, which says nothing about the full graph. Mini and layer-level `DecodeIcb` replay is real (`PingPongCbReplay::try_replay_icb`, opt-in) but the full decode graph is not migrated: `MTL4CommandBuffer` has no replay-prior-encoding API. `cb_replay_api_gap_summary()` lists the surveyed gaps, including the opt-in ICB bind paths the module records as parked behind direct dispatch with prebuilt argument tables. |
-| **No off-device check for `attn_prefill`** | `attn_prefill` (the TensorOps tiled kernel, `prefill_attn_kernel` always returns `Tiled`) is checked against f64 only on a Metal 4 device. | The CPU emulator in `tools/msl_emu` cannot execute TensorOps, so there is no off-device numeric check; `check_qwen35.py`'s host contract reads its buffer slots and `TILED_ATTN_*` constants from source and nothing more. The same holds for `encoder_attn_tiled_*`; the rows kernels `encoder_attn_rows_*` and `embed_pool.metal` are emulated. |
+| **Full decode-graph ICB replay** | Replaying a whole decode step from an indirect command buffer would skip the per-token host encode. | `MTL4CommandBuffer` has no replay-prior-encoding API, so `PingPongCbReplay::try_replay` returns `CbReplayError::NotWired` outside dry runs. Mini and layer-level `DecodeIcb` replay is real (`PingPongCbReplay::try_replay_icb`, opt-in via `TESSL_DECODE_ICB`) but the full decode graph is not migrated. `cb_replay_api_gap_summary()` is the single record of the surveyed gaps. |
+| **No off-device check for `attn_prefill`** | `attn_prefill` (the TensorOps tiled kernel, which `attn_prefill_by_length` calls at every query length) is checked against f64 only on a Metal 4 device. | The CPU emulator in `tools/msl_emu` cannot execute TensorOps, so there is no off-device numeric check; `check_qwen35.py`'s host contract reads its buffer slots and `TILED_ATTN_*` constants from source and nothing more. The same holds for `encoder_attn_tiled_*`; the rows kernels `encoder_attn_rows_*` and `embed_pool.metal` are emulated. |
 | **Int4 TensorOps GEMM** | Half the weight bandwidth of int8. | TensorOps itself accepts `int4b_format` — the block is the shader-side tensor constructor for a sub-byte element type, not the objc2 binding this table used to blame. `nn::gemm_i8_dequant` ships the int8 case. |
 | **No CPU fallback** | Without a Metal 4 device, nothing runs. | Deliberate. This is an Apple-silicon runtime, and a silent CPU path would make every "GPU" benchmark here meaningless. |
 | **GPU CI on hosted runners** | Whether the suite runs unattended, or only on hardware I own. | Measured, not assumed: it does not. On `macos-26` the Metal Toolchain installs and every source under `kernels/` compiles and lints — the `check` job's `cargo build` does exactly that every push — but the device probe fails, so the shaders build there and cannot execute. The suite therefore runs on a gated self-hosted M5 runner. CI covers build, clippy, rustdoc, the device-free cargo tests (run with the Metal device hidden, including the static tile audit), the kernel IR fast-math scan and the parity harness's host-only sections on every push; the GPU tests do not run unattended. |

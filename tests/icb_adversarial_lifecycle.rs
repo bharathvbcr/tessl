@@ -12,8 +12,7 @@ struct Flags;
 impl Drop for Flags {
     fn drop(&mut self) {
         set_icb_pipelines(false);
-        tessl::set_icb_freeze_binds(false);
-        tessl::set_icb_range_batch(false);
+        tessl::set_icb_execute(false);
     }
 }
 
@@ -24,8 +23,7 @@ fn dropping_a_tape_with_its_execute_in_flight_is_safe() {
     let _g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let _f = Flags;
     set_icb_pipelines(true);
-    tessl::set_icb_freeze_binds(true);
-    tessl::set_icb_range_batch(true);
+    tessl::set_icb_execute(true);
     let rt = GpuRuntime::new().expect("runtime");
     rt.set_async_encode(true).unwrap();
     for round in 0..200 {
@@ -44,7 +42,7 @@ fn dropping_a_tape_after_its_runtime_does_not_crash() {
     let _g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let _f = Flags;
     set_icb_pipelines(true);
-    tessl::set_icb_freeze_binds(true);
+    tessl::set_icb_execute(true);
     let rt = GpuRuntime::new().expect("runtime");
     let (mut dec, out) = DecodeIcb::mini_copy_chain(&rt, 64).expect("tape");
     dec.execute(&rt).expect("execute");

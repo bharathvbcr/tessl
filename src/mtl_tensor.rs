@@ -60,8 +60,11 @@ impl QuantDType {
 
 /// Snapshot of TensorOps / NAX readiness for verify(M) / prefill planning.
 ///
-/// Int4 is **unbound** in objc2-metal 0.3 — verify(M) remains on hand simdgroup Q4
-/// GEMM (`gemm_q4_mlx_simd*`). DDTree stays parked until verify(M) flattens (it will
+/// `MTLTensorDataType::Int4` is not bound in objc2-metal 0.3, which gates only the
+/// host-created `MTLTensor` descriptor path; TensorOps itself accepts
+/// `int4b_format`. verify(M) remains on hand simdgroup Q4 GEMM
+/// (`gemm_q4_mlx_simd*`) because no quantized TensorOps prefill GEMM is wired
+/// ([`QUANT_PREFILL_GEMM_WIRED`]). DDTree stays parked until verify(M) flattens (it will
 /// not with current simdgroup Q4 alone).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NaxVerifyReadiness {
@@ -82,7 +85,9 @@ pub fn nax_verify_readiness() -> NaxVerifyReadiness {
         // `.is_ok()` off it. There is one fact here — quantized TensorOps
         // prefill GEMM does not exist — and it is stated once.
         quant_prefill_gemm_wired: QUANT_PREFILL_GEMM_WIRED,
-        note: "Int4 unbound in objc2-metal 0.3; verify(M) = hand simdgroup Q4; TensorOps Q4 not shipped",
+        note: "MTLTensorDataType::Int4 is not bound in objc2-metal 0.3, which gates only host-created MTLTensor \
+               descriptors (TensorOps itself accepts int4b_format); verify(M) = hand simdgroup Q4 because no \
+               quantized TensorOps prefill GEMM is wired",
     }
 }
 
@@ -602,7 +607,13 @@ mod tests {
         assert!(!r.int4_tensorops_dtype);
         assert!(!r.fp8_e8m0_tensorops_dtype);
         assert!(!r.quant_prefill_gemm_wired);
-        assert!(r.note.contains("Int4 unbound"));
+        // The corrected diagnosis: the missing binding gates only host-created
+        // descriptors, and TensorOps itself takes int4b_format. The old note
+        // ("Int4 unbound ... TensorOps Q4 not shipped") read as a TensorOps limit.
+        assert!(r.note.contains("Int4 is not bound"), "{}", r.note);
+        assert!(r.note.contains("host-created MTLTensor"), "{}", r.note);
+        assert!(r.note.contains("int4b_format"), "{}", r.note);
+        assert!(!r.note.contains("TensorOps Q4 not shipped"), "{}", r.note);
     }
 
     /// The argument table has 31 buffer slots, so 30 is the last valid index

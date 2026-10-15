@@ -335,7 +335,7 @@ impl<'a> Binder<'a> {
     /// the physical one (`nbytes <= length()` for every pooled and wrapped
     /// buffer). It also does not mark the capture incomplete. Routing owned
     /// binds through `bind_buf` used to count every one of them as
-    /// unrecordable, so a `freeze_binds` build refused any captured tape.
+    /// unrecordable, so every captured tape reported itself incomplete.
     fn bind_owned(&mut self, b: &GpuBuffer, byte_offset: usize, index: usize) {
         if !self.valid_index(index) {
             return;
@@ -515,9 +515,9 @@ impl<'a> Binder<'a> {
     /// Execute a pre-encoded compute [`MTLIndirectCommandBuffer`] range.
     ///
     /// When `inherit_arg_table` is true, latches the current MTL4 argument table
-    /// so `inheritBuffers=true` ICB cmds see host binds. Freeze-binds
-    /// (`inheritBuffers=false` + classic `setKernelBuffer`) passes false — no
-    /// `setArgumentTable` traffic.
+    /// so `inheritBuffers=true` ICB cmds see host binds. The classic
+    /// smoke bridge (`inheritBuffers=false` + `setKernelBuffer`) passes false —
+    /// no `setArgumentTable` traffic.
     pub fn execute_icb(&mut self, icb: &ProtocolObject<dyn MTLIndirectCommandBuffer>, start: u64, count: u64) {
         self.execute_icb_ex(icb, start, count, true);
     }

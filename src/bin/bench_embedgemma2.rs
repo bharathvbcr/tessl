@@ -5,6 +5,9 @@
 //!   cargo run --release --bin bench_embedgemma2
 //! ```
 //!
+//! `--attn-kernel=rows|tiled` instead times the encoder attention kernel alone
+//! at the checkpoint's layer shapes, with no weights (see `run_attn_kernel`).
+//!
 //! `BENCH_WORKLOADS` lists workloads separated by `,`. A workload is one
 //! `encode` call: terms joined by `+`, each `BxT` (`B` sequences of `T`
 //! tokens) or `BxLO-HI` (`B` sequences, the `i`-th of
@@ -49,7 +52,7 @@ mod common;
 use std::path::PathBuf;
 use std::time::Instant;
 
-use tessl::embedgemma2::{EmbedGemma2Config, EmbedGemma2Model};
+use tessl::embedgemma2::{encoder_attn_with, EmbedGemma2Config, EmbedGemma2Model, EncoderAttnDims, EncoderAttnKernel};
 use tessl::safetensors::SafeTensors;
 use tessl::GpuRuntime;
 
@@ -99,10 +102,109 @@ fn parse_workload(w: &str) -> Result<Vec<usize>, String> {
     Ok(lens)
 }
 
+/// Uniform workloads `--attn-kernel` times by default: the `encode` defaults'
+/// uniform shapes above the window (512) and the long document of `1x4096+63x32`.
+const DEFAULT_ATTN_SHAPES: &str = "64x32,32x256,8x1024,2x4096,1x6147";
+
+/// `--attn-kernel=rows|tiled`: the encoder attention kernel alone, per
+/// distinct layer kind of the checkpoint's `config.json` (no weights are
+/// read), at each uniform `BxT` of `BENCH_ATTN_SHAPES`. One `METRIC
+/// encoder_attn_{sliding|global}_h{D}_b{B}_t{T}_ms` per kind per shape, the
+/// median of `BENCH_ITERS` buffers of `BENCH_ATTN_REPS` launches; the metric
+/// names carry no kernel, so `bench_paired --format metrics` lanes `rows` and
+/// `tiled` (or two builds) compare name for name. Before any timing the
+/// output must be finite and not all zero.
+fn run_attn_kernel(snap: &std::path::Path, kernel: EncoderAttnKernel) -> Result<(), String> {
+    let cfg = EmbedGemma2Config::from_config_file(&snap.join("config.json"))?;
+    let rt = GpuRuntime::new_inference()?;
+    if kernel == EncoderAttnKernel::Tiled && !rt.has_tensorops() {
+        return Err("--attn-kernel=tiled needs a device with TensorOps".into());
+    }
+    let shapes = std::env::var("BENCH_ATTN_SHAPES").unwrap_or_else(|_| DEFAULT_ATTN_SHAPES.into());
+    let iters = env_usize("BENCH_ITERS", 10, 1)?;
+    let warmup = env_usize("BENCH_WARMUP", 3, 0)?;
+    let reps = env_usize("BENCH_ATTN_REPS", 8, 1)?;
+    let mut kinds: Vec<(bool, u32, u32)> = Vec::new();
+    for l in &cfg.layers {
+        if !kinds.contains(&(l.sliding, l.head_dim, l.kv_heads)) {
+            kinds.push((l.sliding, l.head_dim, l.kv_heads));
+        }
+    }
+    println!(
+        "encoder attention kernel {kernel:?}, heads {}, window {}",
+        cfg.q_heads, cfg.sliding_window
+    );
+    for shape in shapes.split(',') {
+        let lens = parse_workload(shape.trim())?;
+        let (b, t) = match lens.as_slice() {
+            [first, rest @ ..] if rest.iter().all(|l| l == first) => (lens.len(), *first),
+            _ => return Err(format!("BENCH_ATTN_SHAPES: {shape:?} is not a uniform BxT")),
+        };
+        for &(sliding, d, kv_heads) in &kinds {
+            let (h, hkv, d) = (cfg.q_heads as usize, kv_heads as usize, d as usize);
+            let dims = EncoderAttnDims {
+                batch: b as u32,
+                seq: t as u32,
+                heads: cfg.q_heads,
+                heads_kv: kv_heads,
+                head_dim: d as u32,
+                window: if sliding { cfg.sliding_window } else { 0 },
+                scale: 1.0,
+            };
+            let mk = |n: usize, seed: u64| -> Result<tessl::tensor::GpuBuffer, String> {
+                let buf = rt.alloc_buffer(n * 4)?;
+                buf.write_f32(&common::fill_affine(n, seed, 1.0 / (d as f32).sqrt(), 0.0));
+                Ok(buf)
+            };
+            let q = mk(b * t * h * d, 21)?;
+            let k = mk(b * t * hkv * d, 22)?;
+            let v = mk(b * t * hkv * d, 23)?;
+            let o = rt.alloc_buffer(b * t * h * d * 4)?;
+            let len_buf = rt.alloc_buffer(b * 4)?;
+            len_buf.write_u32(&vec![t as u32; b]);
+            o.write_f32(&vec![f32::NAN; b * t * h * d]);
+            encoder_attn_with(&rt, &q, &k, &v, &o, &len_buf, dims, kernel)?;
+            rt.synchronize()?;
+            let out = o.read_f32();
+            if out.iter().any(|x| !x.is_finite()) || out.iter().all(|&x| x == 0.0) {
+                return Err(format!("{shape} d={d}: the output is not finite and non-zero"));
+            }
+            let mut ms = Vec::with_capacity(iters);
+            for round in 0..warmup + iters {
+                rt.synchronize()?;
+                let t0 = Instant::now();
+                for _ in 0..reps {
+                    encoder_attn_with(&rt, &q, &k, &v, &o, &len_buf, dims, kernel)?;
+                }
+                rt.synchronize()?;
+                if round >= warmup {
+                    ms.push(t0.elapsed().as_secs_f64() * 1e3 / reps as f64);
+                }
+            }
+            let med = common::median(ms)?;
+            let kind = if sliding { "sliding" } else { "global" };
+            println!("METRIC encoder_attn_{kind}_h{d}_b{b}_t{t}_ms {med:.4}");
+        }
+    }
+    Ok(())
+}
+
 fn main() -> Result<(), String> {
     let snap = PathBuf::from(
         std::env::var("EMBEDGEMMA2_SNAPSHOT").map_err(|_| "EMBEDGEMMA2_SNAPSHOT must name the snapshot directory")?,
     );
+    let mut args = std::env::args().skip(1);
+    if let Some(arg) = args.next() {
+        let kernel = match arg.strip_prefix("--attn-kernel=") {
+            Some("rows") => EncoderAttnKernel::Rows,
+            Some("tiled") => EncoderAttnKernel::Tiled,
+            _ => return Err(format!("expected --attn-kernel=rows|tiled or nothing, got {arg:?}")),
+        };
+        if let Some(extra) = args.next() {
+            return Err(format!("unexpected argument {extra:?}"));
+        }
+        return run_attn_kernel(&snap, kernel);
+    }
     let spec = std::env::var("BENCH_WORKLOADS").unwrap_or_else(|_| DEFAULT_WORKLOADS.into());
     let workloads = spec
         .split(',')

@@ -11,6 +11,7 @@
 //! cargo run --release --bin bench_qwen35_layers -- --decode=4096  # prefill + per-token decode
 //! cargo run --release --bin bench_qwen35_layers -- --model-forward 1024 2048  # METRIC lines only
 //! cargo run --release --bin bench_qwen35_layers -- --paired-attn 200 8192
+//! cargo run --release --bin bench_qwen35_layers -- --attn-tiles 2048  # METRIC per tile
 //! cargo run --release --bin bench_qwen35_layers -- --paired-gdn-recurrent 1 4
 //! cargo run --release --bin bench_qwen35_layers -- --paired-gate-up 512 2048
 //! ```
@@ -70,6 +71,11 @@
 //! 12288]`), in both encode modes: async (16 units per command buffer) and
 //! sync, the runtime's default and ojas-qwen35's training mode. Default T is
 //! 512 and 2048.
+//!
+//! `--attn-tiles [T...]` times `qwen35::attn_prefill_with_tile` at each of the
+//! four tiles on the same Q/K/V (default T = 2048) and prints one `METRIC
+//! attn_prefill_q{BQ}_k{BK}_sg{NSG}_ms_t{T}` per tile: the lane
+//! `bench_paired --format metrics` alternates between two builds of this binary.
 //!
 //! `--model-forward [T...]` runs the tower lane alone and prints its METRIC
 //! lines. Default T is 1024 and 2048.
@@ -189,14 +195,14 @@ fn paired_reps(t: usize) -> usize {
 #[derive(Clone, Copy)]
 enum PairKernel {
     Rows,
-    Tiled,
+    Tiled(qwen35::AttnTile),
 }
 
 impl PairKernel {
     fn name(self) -> &'static str {
         match self {
             PairKernel::Rows => "flash_attn_rows",
-            PairKernel::Tiled => "attn_prefill",
+            PairKernel::Tiled(_) => "attn_prefill",
         }
     }
 }
@@ -223,7 +229,7 @@ fn dispatch_pair(
     };
     match kernel {
         PairKernel::Rows => nn::flash_attn_rows(rt, q, k, v, o, tkv, pos, pos, dims, HEAD_DIM, false),
-        PairKernel::Tiled => qwen35::attn_prefill(rt, q, k, v, o, tkv, pos, pos, dims, false),
+        PairKernel::Tiled(tile) => qwen35::attn_prefill_with_tile(rt, q, k, v, o, tkv, pos, pos, dims, false, tile),
     }
 }
 
@@ -261,7 +267,7 @@ fn run_paired_attn(rt: &Arc<GpuRuntime>, ts: &[usize]) -> Res<()> {
         let pos = buf_u32(rt, &[0])?;
 
         let mut checksums = Vec::new();
-        for kernel in [PairKernel::Rows, PairKernel::Tiled] {
+        for kernel in [PairKernel::Rows, PairKernel::Tiled(qwen35::ATTN_PREFILL_TILE)] {
             o.write_f32(&vec![f32::NAN; qd]);
             dispatch_pair(rt, kernel, &q, &k, &v, &o, &tkv, &pos, t)?;
             rt.synchronize()?;
@@ -292,9 +298,9 @@ fn run_paired_attn(rt: &Arc<GpuRuntime>, ts: &[usize]) -> Res<()> {
         for round in 0..(WARMUP_ROUNDS + ROUNDS) {
             let record = round >= WARMUP_ROUNDS;
             let order = if round % 2 == 0 {
-                [PairKernel::Rows, PairKernel::Tiled]
+                [PairKernel::Rows, PairKernel::Tiled(qwen35::ATTN_PREFILL_TILE)]
             } else {
-                [PairKernel::Tiled, PairKernel::Rows]
+                [PairKernel::Tiled(qwen35::ATTN_PREFILL_TILE), PairKernel::Rows]
             };
             for kernel in order {
                 rt.synchronize()?;
@@ -315,7 +321,7 @@ fn run_paired_attn(rt: &Arc<GpuRuntime>, ts: &[usize]) -> Res<()> {
                     let _ = std::io::stdout().flush();
                     match kernel {
                         PairKernel::Rows => rows.push(ms),
-                        PairKernel::Tiled => tiled.push(ms),
+                        PairKernel::Tiled(_) => tiled.push(ms),
                     }
                 }
             }
@@ -333,6 +339,77 @@ fn run_paired_attn(rt: &Arc<GpuRuntime>, ts: &[usize]) -> Res<()> {
         }
         let ratio = common::median(tiled.clone())? / common::median(rows.clone())?;
         println!("PAIRED t={t} ratio_tiled_over_rows={ratio:.4}");
+    }
+    Ok(())
+}
+
+/// `--attn-tiles`: every `qwen35_attn_tiled_h256_*` geometry on the same Q/K/V
+/// at the 2B's head geometry, one process, the tile order rotating each round
+/// (every tile meets every position in the round). Prints one `METRIC
+/// attn_prefill_{label}_ms_t{T}` (the median over rounds, per launch) per tile
+/// per T, so `bench_paired --format metrics` alternates whole builds of this
+/// binary round by round.
+fn run_attn_tiles(rt: &Arc<GpuRuntime>, ts: &[usize]) -> Res<()> {
+    const WARMUP_ROUNDS: usize = 3;
+    const ROUNDS: usize = 8;
+    let tiles = qwen35::AttnTile::ALL;
+    println!(
+        "attn_prefill_with_tile, every tile: batch 1, heads {Q_HEADS}q/{KV_HEADS}kv x {HEAD_DIM}, causal from 0; \
+         tile order rotates each round; {WARMUP_ROUNDS} warmup + {ROUNDS} timed rounds"
+    );
+    for &t in ts {
+        if t > u32::MAX as usize {
+            return Err(format!("T={t} does not fit the kernel's u32 length"));
+        }
+        let reps = paired_reps(t);
+        let qd = t * (Q_HEADS * HEAD_DIM) as usize;
+        let kv = t * (KV_HEADS * HEAD_DIM) as usize;
+        let scale = 1.0 / (HEAD_DIM as f32).sqrt();
+        let q = buf(rt, &common::fill_affine(qd, 11, scale, 0.0))?;
+        let k = buf(rt, &common::fill_affine(kv, 12, scale, 0.0))?;
+        let v = buf(rt, &common::fill_affine(kv, 13, scale, 0.0))?;
+        let o = rt.alloc_buffer(qd * 4)?;
+        let tkv = buf_u32(rt, &[t as u32])?;
+        let pos = buf_u32(rt, &[0])?;
+
+        for tile in tiles {
+            o.write_f32(&vec![f32::NAN; qd]);
+            dispatch_pair(rt, PairKernel::Tiled(tile), &q, &k, &v, &o, &tkv, &pos, t)?;
+            rt.synchronize()?;
+            let out = o.read_f32();
+            if let Some(i) = out[..qd].iter().position(|x| !x.is_finite()) {
+                return Err(format!("T={t} {}: element {i} of {qd} is non-finite", tile.label()));
+            }
+            if out[..qd].iter().all(|&x| x == 0.0) {
+                return Err(format!("T={t} {}: output is all zeros", tile.label()));
+            }
+        }
+
+        let mut samples: Vec<Vec<f64>> = vec![Vec::with_capacity(ROUNDS); tiles.len()];
+        for round in 0..(WARMUP_ROUNDS + ROUNDS) {
+            for step in 0..tiles.len() {
+                let i = (round + step) % tiles.len();
+                rt.synchronize()?;
+                let t0 = Instant::now();
+                for _ in 0..reps {
+                    dispatch_pair(rt, PairKernel::Tiled(tiles[i]), &q, &k, &v, &o, &tkv, &pos, t)?;
+                }
+                rt.synchronize()?;
+                if round >= WARMUP_ROUNDS {
+                    samples[i].push(t0.elapsed().as_secs_f64() * 1e3 / reps as f64);
+                }
+            }
+        }
+        for (tile, s) in tiles.iter().zip(samples) {
+            let lo = s.iter().copied().fold(f64::INFINITY, f64::min);
+            let hi = s.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+            let med = common::median(s)?;
+            println!(
+                "attn_prefill {} T={t}: median {med:.4} ms, min {lo:.4}, max {hi:.4} ({reps} launches per buffer)",
+                tile.label()
+            );
+            println!("METRIC attn_prefill_{}_ms_t{t} {med:.4}", tile.label());
+        }
     }
     Ok(())
 }
@@ -1214,6 +1291,7 @@ fn bounded_tokens(n: usize, what: &str) -> Result<usize, String> {
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut check_only = false;
     let mut paired_attn = false;
+    let mut attn_tiles = false;
     let mut decode: Option<usize> = None;
     let mut paired_rec = false;
     let mut paired_gate_up = false;
@@ -1245,6 +1323,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             check_only = true;
         } else if arg == "--paired-attn" {
             paired_attn = true;
+        } else if arg == "--attn-tiles" {
+            attn_tiles = true;
         } else if arg == "--gdn-scan32" {
             opts.scan = qwen35::GdnScanSlice::Cols32;
         } else if let Some(n) = arg.strip_prefix("--iters=") {
@@ -1261,7 +1341,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         } else {
             let t: usize = arg.parse().map_err(|_| {
                 format!(
-                    "expected a token count, --check-only, --paired-attn, --paired-gdn-recurrent, --paired-gate-up, \
+                    "expected a token count, --check-only, --paired-attn, --attn-tiles, --paired-gdn-recurrent, --paired-gate-up, \
                      --model-forward, --weights=DIR, --gdn-scan32, --iters=N or --decode[=P], got {arg:?}"
                 )
             })?;
@@ -1270,6 +1350,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             ts.push(bounded_tokens(t, "T")?);
         }
+    }
+    if attn_tiles && (check_only || paired_attn || paired_rec || paired_gate_up || model_forward || decode.is_some()) {
+        return Err("--attn-tiles takes token counts only".into());
     }
     if paired_attn && check_only {
         return Err("--paired-attn times both kernels; it does not combine with --check-only".into());
@@ -1286,7 +1369,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if modes > 1 || (modes == 1 && (check_only || paired_attn || paired_rec || decode.is_some())) {
         return Err("--paired-gate-up and --model-forward each take token counts only".into());
     }
-    let paired = paired_attn || paired_rec || paired_gate_up;
+    let paired = paired_attn || attn_tiles || paired_rec || paired_gate_up;
     if paired && (matches!(opts.weights, Weights::Dir { .. }) || opts.scan != qwen35::GdnScanSlice::default()) {
         return Err("--weights and --gdn-scan32 apply to the model lanes, not --paired-*".into());
     }
@@ -1309,6 +1392,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Err("bf16 GEMMs need the TensorOps backend, which this device lacks".into());
     }
     println!("device: {}", rt.device_name());
+    if attn_tiles {
+        rt.set_async_encode(true)?;
+        run_attn_tiles(&rt, if ts.is_empty() { &[2048] } else { &ts })?;
+        rt.set_async_encode(false)?;
+        return Ok(());
+    }
     if paired_attn {
         rt.set_async_encode(true)?;
         run_paired_attn(&rt, if ts.is_empty() { &[200, 8192] } else { &ts })?;

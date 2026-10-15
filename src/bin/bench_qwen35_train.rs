@@ -20,6 +20,12 @@
 //! accumulation under `--bf16`. Inputs are
 //! random and bounded.
 //!
+//! Every timed op also prints `METRIC op_NAME_ms_t{T} MS` (spaces and `-` in
+//! the name become `_`), for `bench_paired --format metrics`. `--op=NAME`
+//! (repeatable, the name as the table prints it, with `_` for spaces) times
+//! only the named ops, after the gate has run on all of them:
+//! `--op=attn_train_forward` is the training attention forward's lane.
+//!
 //! Per op, the time of one call at the given T: the median of 7 runs after 2
 //! warm-ups, each run `REPS` calls encoded into one command buffer and
 //! divided, except the cross-entropy and the embedding backward, which write
@@ -190,7 +196,12 @@ fn gate(rt: &Arc<GpuRuntime>, op: &mut Op<'_>) -> Res<()> {
     Ok(())
 }
 
-fn bench_t(rt: &Arc<GpuRuntime>, t: usize, check_only: bool, operands: GemmOperands) -> Res<()> {
+/// An op's name as `--op=` and its `METRIC` line spell it: no spaces or `-`.
+fn op_key(name: &str) -> String {
+    name.replace([' ', '-'], "_")
+}
+
+fn bench_t(rt: &Arc<GpuRuntime>, t: usize, check_only: bool, operands: GemmOperands, only: &[String]) -> Res<()> {
     let t32 = t as u32;
     let (qd, kvd) = (Q_HEADS * HEAD_DIM, KV_HEADS * HEAD_DIM);
     let s = |i: u64| (t as u64) * 1000 + i;
@@ -634,12 +645,25 @@ fn bench_t(rt: &Arc<GpuRuntime>, t: usize, check_only: bool, operands: GemmOpera
     if check_only {
         return Ok(());
     }
+    if let Some(missing) = only.iter().find(|f| !ops.iter().any(|op| op_key(op.name) == **f)) {
+        return Err(format!(
+            "--op={missing}: no such op; the ops are {}",
+            ops.iter().map(|op| op_key(op.name)).collect::<Vec<_>>().join(", ")
+        ));
+    }
     println!("{:<24} {:>10}", "op", "ms / call");
     let mut times = Vec::new();
     for op in &mut ops {
+        if !only.is_empty() && !only.contains(&op_key(op.name)) {
+            continue;
+        }
         let ms = time_ms(rt, op.reps, &mut op.run)?;
         println!("{:<24} {:>10.3}", op.name, ms);
+        println!("METRIC op_{}_ms_t{t} {ms:.4}", op_key(op.name));
         times.push((op.name, ms));
+    }
+    if !only.is_empty() {
+        return Ok(());
     }
     let get = |n: &str| times.iter().find(|(m, _)| *m == n).map(|(_, v)| *v).unwrap();
     println!(
@@ -945,6 +969,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (mut check_only, mut step, mut ts, mut operands) = (false, None, Vec::new(), GemmOperands::ExactF32);
     let (mut batches, mut step_only, mut async_encode, mut clip) = (Vec::new(), false, false, None);
     let (mut storage, mut random_config) = (Precision::F32, None::<String>);
+    let mut only: Vec<String> = Vec::new();
     for arg in std::env::args().skip(1) {
         if arg == "--bf16" {
             operands = GemmOperands::Bf16;
@@ -958,6 +983,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             storage = Precision::Bf16;
         } else if arg == "--check-only" {
             check_only = true;
+        } else if let Some(v) = arg.strip_prefix("--op=") {
+            only.push(v.replace([' ', '-'], "_"));
         } else if arg == "--step-only" {
             step_only = true;
         } else if arg == "--async" {
@@ -980,7 +1007,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let t: usize = arg.parse().map_err(|_| {
                 format!(
                     "expected a token count, --check-only, --step-only, --bf16, --storage=f32|bf16, --async, \
-                     --random-config=PATH, --step=N, --clip=N or --batch=B,L[,S], got {arg:?}"
+                     --random-config=PATH, --op=NAME, --step=N, --clip=N or --batch=B,L[,S], got {arg:?}"
                 )
             })?;
             if t < 2 {
@@ -1006,7 +1033,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     println!("device: {}", rt.device_name());
     for t in ts {
-        bench_t(&rt, t, check_only || step_only, operands)?;
+        bench_t(&rt, t, check_only || step_only, operands, &only)?;
     }
     let model_runs = step.is_some() || clip.is_some() || !batches.is_empty();
     if check_only || !model_runs {
@@ -1043,4 +1070,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         bench_batch(&rt, &model, b, operands)?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::op_key;
+
+    #[test]
+    fn op_keys_have_no_spaces_or_dashes() {
+        assert_eq!(op_key("attn_train forward"), "attn_train_forward");
+        assert_eq!(op_key("rms-norm bwd"), "rms_norm_bwd");
+    }
 }

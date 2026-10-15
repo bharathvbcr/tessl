@@ -120,6 +120,11 @@ impl GdnData {
         }
     }
 
+    /// The `qwen35_gdn_*` arrays in `tests/fixtures/qwen35/`. They are marked
+    /// `published: false` in that directory's `MANIFEST.json` (ft-b8561dbb): kept
+    /// for the tests that read them today, and nothing new uses them as a golden.
+    /// The model-level golden is `tests/fixtures/qwen35_train*`; the gate golden is
+    /// `qwen35_gates_*`.
     fn fixture() -> Self {
         let (qs, q) = load_f32("gdn_q");
         let (vs, v) = load_f32("gdn_v");
@@ -166,6 +171,7 @@ impl GdnData {
     }
 }
 
+// The `qwen35_gdn_*` goldens below are `published: false` (see `GdnData::fixture`).
 #[test]
 fn gdn_reference_matches_transformers() {
     let d = GdnData::fixture();
@@ -1846,6 +1852,83 @@ fn fused_projection_equals_the_separate_linears() {
 }
 
 // ------------------------------------------------------------ host contract ---
+
+/// `qwen35_gdn_gates_f32` against the golden captured from transformers' own
+/// `Qwen3_5GatedDeltaNet.forward` (`qwen35_gates_*`, written by
+/// `scripts/gen_qwen35_fixtures.py::gates`): `g = -exp(A_log) * softplus(a +
+/// dt_bias)` and `beta = sigmoid(b)`, B x T = 2 x 37 rows over the 4B's 32 value
+/// heads, with logits past softplus' linear threshold either side and `b` at
+/// +-20. The logits sit inside a wider fused row at an offset, with junk in the
+/// columns between, so a kernel that read the wrong columns or the wrong stride
+/// reads junk, not the right answer.
+///
+/// `tests/gdn_gates.rs` is not this test's golden: it holds the nanolab sigmoid
+/// operator, a different gate (`alpha = sigmoid(a + decay_bias)`), which
+/// the Qwen3.5 forward never computes.
+#[test]
+fn gdn_gates_kernel_matches_the_transformers_module_golden() {
+    let (sh, a) = load_f32("gates_a");
+    let (_, b) = load_f32("gates_b");
+    let (_, a_log) = load_f32("gates_a_log");
+    let (_, dt_bias) = load_f32("gates_dt_bias");
+    let (gsh, g_want) = load("gates_g");
+    let (_, beta_want) = load("gates_beta");
+    assert_eq!(sh.len(), 3, "gates_a is [B, T, H]");
+    assert_eq!(gsh, sh, "the golden has the inputs' shape");
+    let (rows, heads) = (sh[0] * sh[1], sh[2]);
+    assert_eq!((a_log.len(), dt_bias.len()), (heads, heads));
+
+    with_gpu(|rt| {
+        // One fused row per token: `a` at column 3, `b` after a 2-column gap.
+        let (a_off, b_off) = (3usize, 3 + heads + 2);
+        let ld = b_off + heads + 2;
+        let mut fused = vec![777.0f32; rows * ld];
+        for r in 0..rows {
+            fused[r * ld + a_off..r * ld + a_off + heads].copy_from_slice(&a[r * heads..(r + 1) * heads]);
+            fused[r * ld + b_off..r * ld + b_off + heads].copy_from_slice(&b[r * heads..(r + 1) * heads]);
+        }
+        let logits = buf(rt, &fused);
+        let (alb, dtb) = (buf(rt, &a_log), buf(rt, &dt_bias));
+        let g = seeded(rt, rows * heads, SENTINEL);
+        let beta = seeded(rt, rows * heads, SENTINEL);
+        qwen35::gdn_gates(
+            rt,
+            &GdnGateLogits {
+                buf: &logits,
+                ld: ld as u32,
+                a_off: a_off as u32,
+                b_off: b_off as u32,
+            },
+            &GdnParams {
+                a_log: &alb,
+                dt_bias: &dtb,
+            },
+            &g,
+            &beta,
+            rows as u32,
+            heads as u32,
+        )
+        .unwrap();
+        // The golden is torch's f32 on the CPU; the kernel's `exp`, `log` and divide are
+        // Metal's, a few ulps each. 2e-6 relative is ~35 u_f32 and the observed worst
+        // is far inside it, while a wrong branch (the softplus threshold, the series
+        // below -3, the sigmoid's sign split) is off by orders of magnitude more.
+        let (got_g, got_beta) = (g.read_f32(), beta.read_f32());
+        assert_close_rel("gdn_gates g", &got_g[..rows * heads], &g_want, 2e-6, 0.0);
+        assert_close_rel("gdn_gates beta", &got_beta[..rows * heads], &beta_want, 2e-6, 0.0);
+        let worst = |got: &[f32], want: &[f64]| {
+            got.iter()
+                .zip(want)
+                .map(|(&x, &w)| (f64::from(x) - w).abs() / w.abs().max(f64::MIN_POSITIVE))
+                .fold(0.0, f64::max)
+        };
+        println!(
+            "gdn_gates vs transformers: worst relative error g {:.3e}, beta {:.3e}",
+            worst(&got_g[..rows * heads], &g_want),
+            worst(&got_beta[..rows * heads], &beta_want)
+        );
+    });
+}
 
 #[test]
 fn every_qwen35_kernel_is_in_the_metallib() {

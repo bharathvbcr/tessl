@@ -1,0 +1,150 @@
+{
+ "schema": 1,
+ "generator": "scripts/gen_qwen35_fixtures.py",
+ "generator_commit": "f6a4bb820872ee437464b51fd625a23d79c8104a",
+ "versions": {
+  "torch": "2.14.1",
+  "transformers": "5.17.0",
+  "numpy": "2.5.3",
+  "python": "3.13.14"
+ },
+ "versions_role": "produced",
+ "inputs_source": "stored: every role=input file is the committed array and is never redrawn. The gdn and rope inputs are the original torch.randn(generator=) draws, extracted from the first committed fixtures; the gate inputs are numpy default_rng draws. Only the goldens are recomputed.",
+ "files": {
+  "config_qwen35_2b_base.json": {
+   "role": "config",
+   "published": true,
+   "note": "Qwen3.5-2B-Base's real text config, the shape source for tests that need the 2B's dimensions"
+  },
+  "qwen35_gates_a.npy": {
+   "role": "input",
+   "published": true,
+   "note": "numpy default_rng stream, drawn once by --init-gate-inputs"
+  },
+  "qwen35_gates_a_log.npy": {
+   "role": "input",
+   "published": true,
+   "note": "numpy default_rng stream, drawn once by --init-gate-inputs"
+  },
+  "qwen35_gates_b.npy": {
+   "role": "input",
+   "published": true,
+   "note": "numpy default_rng stream, drawn once by --init-gate-inputs"
+  },
+  "qwen35_gates_beta.npy": {
+   "role": "golden",
+   "published": true,
+   "note": "captured from Qwen3_5GatedDeltaNet.forward (g = -exp(A_log) * softplus(a + dt_bias); beta = sigmoid(b)): the golden of qwen35_gdn_gates_f32"
+  },
+  "qwen35_gates_dt_bias.npy": {
+   "role": "input",
+   "published": true,
+   "note": "numpy default_rng stream, drawn once by --init-gate-inputs"
+  },
+  "qwen35_gates_g.npy": {
+   "role": "golden",
+   "published": true,
+   "note": "captured from Qwen3_5GatedDeltaNet.forward (g = -exp(A_log) * softplus(a + dt_bias); beta = sigmoid(b)): the golden of qwen35_gdn_gates_f32"
+  },
+  "qwen35_gdn_a.npy": {
+   "role": "input",
+   "published": false,
+   "note": "kept for tests/qwen35_kernels.rs's gdn_* tests and tools/msl_emu/check_qwen35.py, which read it by path; the operator is transformers' Qwen3.5 form with the weights drawn here, and nothing new uses it as a golden (the model-level golden is tests/fixtures/qwen35_train*)"
+  },
+  "qwen35_gdn_a_log.npy": {
+   "role": "input",
+   "published": false,
+   "note": "kept for tests/qwen35_kernels.rs's gdn_* tests and tools/msl_emu/check_qwen35.py, which read it by path; the operator is transformers' Qwen3.5 form with the weights drawn here, and nothing new uses it as a golden (the model-level golden is tests/fixtures/qwen35_train*)"
+  },
+  "qwen35_gdn_b.npy": {
+   "role": "input",
+   "published": false,
+   "note": "kept for tests/qwen35_kernels.rs's gdn_* tests and tools/msl_emu/check_qwen35.py, which read it by path; the operator is transformers' Qwen3.5 form with the weights drawn here, and nothing new uses it as a golden (the model-level golden is tests/fixtures/qwen35_train*)"
+  },
+  "qwen35_gdn_dt_bias.npy": {
+   "role": "input",
+   "published": false,
+   "note": "kept for tests/qwen35_kernels.rs's gdn_* tests and tools/msl_emu/check_qwen35.py, which read it by path; the operator is transformers' Qwen3.5 form with the weights drawn here, and nothing new uses it as a golden (the model-level golden is tests/fixtures/qwen35_train*)"
+  },
+  "qwen35_gdn_k.npy": {
+   "role": "input",
+   "published": false,
+   "note": "kept for tests/qwen35_kernels.rs's gdn_* tests and tools/msl_emu/check_qwen35.py, which read it by path; the operator is transformers' Qwen3.5 form with the weights drawn here, and nothing new uses it as a golden (the model-level golden is tests/fixtures/qwen35_train*)"
+  },
+  "qwen35_gdn_q.npy": {
+   "role": "input",
+   "published": false,
+   "note": "kept for tests/qwen35_kernels.rs's gdn_* tests and tools/msl_emu/check_qwen35.py, which read it by path; the operator is transformers' Qwen3.5 form with the weights drawn here, and nothing new uses it as a golden (the model-level golden is tests/fixtures/qwen35_train*)"
+  },
+  "qwen35_gdn_state0.npy": {
+   "role": "input",
+   "published": false,
+   "note": "kept for tests/qwen35_kernels.rs's gdn_* tests and tools/msl_emu/check_qwen35.py, which read it by path; the operator is transformers' Qwen3.5 form with the weights drawn here, and nothing new uses it as a golden (the model-level golden is tests/fixtures/qwen35_train*)"
+  },
+  "qwen35_gdn_state_f64.npy": {
+   "role": "golden",
+   "published": false,
+   "note": "kept for tests/qwen35_kernels.rs's gdn_* tests and tools/msl_emu/check_qwen35.py, which read it by path; the operator is transformers' Qwen3.5 form with the weights drawn here, and nothing new uses it as a golden (the model-level golden is tests/fixtures/qwen35_train*)"
+  },
+  "qwen35_gdn_state_hf.npy": {
+   "role": "golden",
+   "published": false,
+   "note": "kept for tests/qwen35_kernels.rs's gdn_* tests and tools/msl_emu/check_qwen35.py, which read it by path; the operator is transformers' Qwen3.5 form with the weights drawn here, and nothing new uses it as a golden (the model-level golden is tests/fixtures/qwen35_train*)"
+  },
+  "qwen35_gdn_v.npy": {
+   "role": "input",
+   "published": false,
+   "note": "kept for tests/qwen35_kernels.rs's gdn_* tests and tools/msl_emu/check_qwen35.py, which read it by path; the operator is transformers' Qwen3.5 form with the weights drawn here, and nothing new uses it as a golden (the model-level golden is tests/fixtures/qwen35_train*)"
+  },
+  "qwen35_gdn_y_f64.npy": {
+   "role": "golden",
+   "published": false,
+   "note": "kept for tests/qwen35_kernels.rs's gdn_* tests and tools/msl_emu/check_qwen35.py, which read it by path; the operator is transformers' Qwen3.5 form with the weights drawn here, and nothing new uses it as a golden (the model-level golden is tests/fixtures/qwen35_train*)"
+  },
+  "qwen35_gdn_y_hf.npy": {
+   "role": "golden",
+   "published": false,
+   "note": "kept for tests/qwen35_kernels.rs's gdn_* tests and tools/msl_emu/check_qwen35.py, which read it by path; the operator is transformers' Qwen3.5 form with the weights drawn here, and nothing new uses it as a golden (the model-level golden is tests/fixtures/qwen35_train*)"
+  },
+  "qwen35_rope_k_in.npy": {
+   "role": "input",
+   "published": true,
+   "note": "stored input"
+  },
+  "qwen35_rope_k_norm_w.npy": {
+   "role": "input",
+   "published": true,
+   "note": "stored input"
+  },
+  "qwen35_rope_k_out.npy": {
+   "role": "golden",
+   "published": true,
+   "note": "Qwen3_5RMSNorm + partial RoPE"
+  },
+  "qwen35_rope_q_in.npy": {
+   "role": "input",
+   "published": true,
+   "note": "stored input"
+  },
+  "qwen35_rope_q_norm_w.npy": {
+   "role": "input",
+   "published": true,
+   "note": "stored input"
+  },
+  "qwen35_rope_q_out.npy": {
+   "role": "golden",
+   "published": true,
+   "note": "Qwen3_5RMSNorm + partial RoPE"
+  }
+ },
+ "regeneration": {
+  "max_relative_to_peak_vs_previous_build": {
+   "qwen35_gdn_state_f64.npy": 1.5983211146853317e-16,
+   "qwen35_gdn_state_hf.npy": 1.1441226078398484e-07,
+   "qwen35_gdn_y_f64.npy": 6.599531266739819e-16,
+   "qwen35_gdn_y_hf.npy": 2.6019619191468786e-07,
+   "qwen35_rope_k_out.npy": 2.122529676148667e-07,
+   "qwen35_rope_q_out.npy": 1.2456633010712766e-07
+  }
+ }
+}

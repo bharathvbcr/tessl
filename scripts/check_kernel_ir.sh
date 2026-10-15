@@ -6,9 +6,13 @@
 #   scripts/check_kernel_ir.sh [KERNELS_DIR]     (default: <repo>/kernels)
 #
 # Fails (exit 1) when any kernel's IR holds
-#   * an inf / NaN constant: 0x7FF0000000000000, 0xFFF0000000000000, 0x7FF8...
-#     (a compare against INFINITY / NAN / HUGE_VAL / MAXFLOAT is poison under
-#     `fcmp fast`), or
+#   * an inf / NaN float constant, found by parsing the exponent rather than
+#     matching fixed spellings: any `0x` + 16 hex digits (f32/f64) whose 11
+#     exponent bits are all ones (0x7FF0000000000000, 0x7FF4... signalling NaN,
+#     0x7FF0000000000001, 0xFFF8...), any half `0xH....` with 5 exponent bits
+#     all ones (0xH7C00, 0xHFC00) and any bfloat `0xR....` with 8 (0xR7F80).
+#     A compare against INFINITY / NAN / HUGE_VAL / MAXFLOAT is poison under
+#     `fcmp fast`.
 #   * an unordered/ordered compare (`fcmp uno` / `fcmp ord`: what a self
 #     compare `v != v` or a std::isnan lowers to when it is not folded), or
 #   * a source that calls isfinite / isnan / isinf (headers included) while its
@@ -17,6 +21,13 @@
 #     a per-kernel-file lower bound, not a per-call-site proof: LLVM may merge
 #     two identical tests, so the check says "the bit test survived", and the
 #     inf/NaN-constant and fcmp checks above say "nothing replaced it".
+#   * a compile that exited 0 but left no IR (a missing or empty .ll is a
+#     failure, never a pass).
+#
+# Sources: what build.rs compiles. kernels/*.metal always; kernels/tune/*.metal
+# only when TESSL_GEMM_TUNE or METAL_NATIVE_GEMM_TUNE is set, as build.rs does.
+# matmul_tensorops.metal (and the tune rig) compile under metal4.0 only;
+# every other source falls back to metal3.2, exactly as build.rs does.
 #
 # Exit status: 0 clean, 1 violation or compile failure, 77 SKIPPED (no
 # `xcrun metal`). 77 is deliberately not success; ci_local.sh lets it fail the
@@ -39,6 +50,22 @@ trap 'rm -rf "$OUT"' EXIT
 
 # build.rs `metal_args`: -std, -O2, fast math, sysroot, deployment target, and
 # -ffp-contract=off for the sources in `disable_fp_contract`.
+indent() { awk '{ print "    " $0 }'; }
+
+# inf_nan_constants <ll>: print each float constant whose exponent is all ones.
+inf_nan_constants() {
+  local ll="$1" tok d
+  while IFS= read -r tok; do
+    d="${tok:2}"
+    case "$tok" in
+      0x[0-9A-Fa-f][0-9A-Fa-f][0-9A-Fa-f][0-9A-Fa-f][0-9A-Fa-f][0-9A-Fa-f][0-9A-Fa-f][0-9A-Fa-f][0-9A-Fa-f][0-9A-Fa-f][0-9A-Fa-f][0-9A-Fa-f][0-9A-Fa-f][0-9A-Fa-f][0-9A-Fa-f][0-9A-Fa-f])
+        (( (16#${d:0:3} & 16#7FF) == 16#7FF )) && echo "$tok" ;;
+      0xH*) (( ((16#${d:1} >> 10) & 16#1F) == 16#1F )) && echo "$tok" ;;
+      0xR*) (( ((16#${d:1} >> 7) & 16#FF) == 16#FF )) && echo "$tok" ;;
+    esac
+  done < <(grep -oE '0x(H|R)?[0-9A-Fa-f]+' "$ll" | sort -u)
+}
+
 compile() { # compile <src> <std> <out.ll>
   local src="$1" std="$2" ll="$3" extra=()
   [[ "$(basename "$src")" == "qwen35_adamw.metal" ]] && extra=(-ffp-contract=off)
@@ -52,26 +79,36 @@ check_one() { # check_one <src>; prints violations, exit 1 if any
   name="$(basename "$src" .metal)"
   ll="$OUT/$name.ll"
   # build.rs falls back to metal3.2 for non-TensorOps sources; mirror it.
-  for std in metal4.0 metal3.2; do
+  local stds=(metal4.0 metal3.2)
+  # build.rs: the TensorOps sources hard-fail, no metal3.2 fallback.
+  [[ "$name" == matmul_tensorops || "$src" == */tune/* ]] && stds=(metal4.0)
+  for std in "${stds[@]}"; do
+    rm -f "$ll"
     compile "$src" "$std" "$ll" && break
     std=""
   done
   if [[ -z "$std" ]]; then
     echo "FAIL $name: does not compile under metal4.0 or metal3.2:" >&2
-    sed 's/^/    /' "$ll.err" >&2
+    indent <"$ll.err" >&2
+    return 1
+  fi
+  if [[ ! -s "$ll" ]]; then
+    echo "FAIL $name: metal exited 0 but wrote no IR ($ll missing or empty); nothing was checked" >&2
     return 1
   fi
   local hits
-  hits="$(grep -nEi '0x7FF0000000000000|0xFFF0000000000000|0x7FF8[0-9A-F]*|0xFFF8[0-9A-F]*' "$ll" | head -5)"
+  hits="$(inf_nan_constants "$ll" | head -5)"
   if [[ -n "$hits" ]]; then
     echo "FAIL $name: inf/NaN constant in IR (fast math treats a compare against it as poison):" >&2
-    sed 's/^/    /' <<<"$hits" >&2
+    while IFS= read -r tok; do
+      grep -m1 -F -- "$tok" "$ll" | indent >&2
+    done <<<"$hits"
     rc=1
   fi
   hits="$(grep -nE 'fcmp( [a-z]+)* (uno|ord) ' "$ll" | head -5)"
   if [[ -n "$hits" ]]; then
     echo "FAIL $name: unordered/ordered fcmp in IR (self-compare or NaN test fast math may fold):" >&2
-    sed 's/^/    /' <<<"$hits" >&2
+    indent <<<"$hits" >&2
     rc=1
   fi
   # isfinite / isnan / isinf in the source or a header it includes (one level
@@ -93,6 +130,9 @@ check_one() { # check_one <src>; prints violations, exit 1 if any
 
 shopt -s nullglob
 SOURCES=("$KERNELS"/*.metal)
+if [[ -n "${TESSL_GEMM_TUNE:-}${METAL_NATIVE_GEMM_TUNE:-}" ]]; then
+  SOURCES+=("$KERNELS"/tune/*.metal)
+fi
 if [[ ${#SOURCES[@]} -eq 0 ]]; then
   echo "error: no .metal sources in $KERNELS" >&2
   exit 1

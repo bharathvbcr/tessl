@@ -1452,7 +1452,10 @@ impl Qwen35Model {
             // Untied, the gather's gradient is a second [vocab, hidden] tensor.
             HeadKind::Fresh => f(v * h).saturating_mul(1 + u64::from(self.lm_head.is_some())),
             HeadKind::InPlace => 0,
-            HeadKind::ByChunk => sum(&[th, f(tu)]),
+            // Tied, the token rows wait for the gather; an untied head's
+            // chunks go straight into its own bank matrix, so nothing waits.
+            HeadKind::ByChunk if self.lm_head.is_none() => sum(&[th, f(tu)]),
+            HeadKind::ByChunk => 0,
         };
         let held = sum(&[
             f(tu),
@@ -1514,8 +1517,16 @@ impl Qwen35Model {
             } else {
                 0
             });
+        // An untied bf16 bank head is zeroed, when nothing scores, from one
+        // zeroed f32 `[chunk, hidden]` tensor ([`zero_matrix`]).
+        let zero_chunk = if head != HeadKind::Fresh && self.lm_head.is_some() && bf16 {
+            f(CE_CHUNK.min(cfg.vocab) as usize * h)
+        } else {
+            0
+        };
         let backward_held = sum(&[
             self.scratch_bytes(t),
+            zero_chunk,
             f(h),
             EmbedBwdWorkspace::allocated_bytes_for(t),
             fresh_grads,

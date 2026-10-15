@@ -1,0 +1,180 @@
+{
+ "schema": 1,
+ "generator": "tools/qwen35_ref/make_train_fixture.py",
+ "generator_commit": "6bf10c26753f5305e38bb8532f69db7b8cbd22c3",
+ "versions": {
+  "torch": "2.14.1",
+  "transformers": "5.17.0",
+  "numpy": "2.5.3",
+  "python": "3.13.14"
+ },
+ "versions_role": "produced",
+ "inputs_source": "drawn: torch.Generator().manual_seed(20260930) feeds the parameter init and the token ids (make_train_fixture.py tiny --untied); the drawn model (model.safetensors) and ids.npy are committed, so the draws are the inputs. 1 key head over 1 value head; the head is its own drawn tensor.",
+ "files": {
+  "config.json": {
+   "role": "config",
+   "published": true,
+   "note": "the tiny untied model's config.json (tie_word_embeddings false)"
+  },
+  "grad.lm_head.weight.npy": {
+   "role": "golden",
+   "published": true,
+   "note": "float32 gradient from transformers' loss.backward() (the untied head's own gradient)"
+  },
+  "grad.model.embed_tokens.weight.npy": {
+   "role": "golden",
+   "published": true,
+   "note": "float32 gradient from transformers' loss.backward()"
+  },
+  "grad.model.layers.0.input_layernorm.weight.npy": {
+   "role": "golden",
+   "published": true,
+   "note": "float32 gradient from transformers' loss.backward()"
+  },
+  "grad.model.layers.0.linear_attn.A_log.npy": {
+   "role": "golden",
+   "published": true,
+   "note": "float32 gradient from transformers' loss.backward()"
+  },
+  "grad.model.layers.0.linear_attn.conv1d.weight.npy": {
+   "role": "golden",
+   "published": true,
+   "note": "float32 gradient from transformers' loss.backward()"
+  },
+  "grad.model.layers.0.linear_attn.dt_bias.npy": {
+   "role": "golden",
+   "published": true,
+   "note": "float32 gradient from transformers' loss.backward()"
+  },
+  "grad.model.layers.0.linear_attn.in_proj_a.weight.npy": {
+   "role": "golden",
+   "published": true,
+   "note": "float32 gradient from transformers' loss.backward()"
+  },
+  "grad.model.layers.0.linear_attn.in_proj_b.weight.npy": {
+   "role": "golden",
+   "published": true,
+   "note": "float32 gradient from transformers' loss.backward()"
+  },
+  "grad.model.layers.0.linear_attn.in_proj_qkv.weight.npy": {
+   "role": "golden",
+   "published": true,
+   "note": "float32 gradient from transformers' loss.backward()"
+  },
+  "grad.model.layers.0.linear_attn.in_proj_z.weight.npy": {
+   "role": "golden",
+   "published": true,
+   "note": "float32 gradient from transformers' loss.backward()"
+  },
+  "grad.model.layers.0.linear_attn.norm.weight.npy": {
+   "role": "golden",
+   "published": true,
+   "note": "float32 gradient from transformers' loss.backward()"
+  },
+  "grad.model.layers.0.linear_attn.out_proj.weight.npy": {
+   "role": "golden",
+   "published": true,
+   "note": "float32 gradient from transformers' loss.backward()"
+  },
+  "grad.model.layers.0.mlp.down_proj.weight.npy": {
+   "role": "golden",
+   "published": true,
+   "note": "float32 gradient from transformers' loss.backward()"
+  },
+  "grad.model.layers.0.mlp.gate_proj.weight.npy": {
+   "role": "golden",
+   "published": true,
+   "note": "float32 gradient from transformers' loss.backward()"
+  },
+  "grad.model.layers.0.mlp.up_proj.weight.npy": {
+   "role": "golden",
+   "published": true,
+   "note": "float32 gradient from transformers' loss.backward()"
+  },
+  "grad.model.layers.0.post_attention_layernorm.weight.npy": {
+   "role": "golden",
+   "published": true,
+   "note": "float32 gradient from transformers' loss.backward()"
+  },
+  "grad.model.layers.1.input_layernorm.weight.npy": {
+   "role": "golden",
+   "published": true,
+   "note": "float32 gradient from transformers' loss.backward()"
+  },
+  "grad.model.layers.1.mlp.down_proj.weight.npy": {
+   "role": "golden",
+   "published": true,
+   "note": "float32 gradient from transformers' loss.backward()"
+  },
+  "grad.model.layers.1.mlp.gate_proj.weight.npy": {
+   "role": "golden",
+   "published": true,
+   "note": "float32 gradient from transformers' loss.backward()"
+  },
+  "grad.model.layers.1.mlp.up_proj.weight.npy": {
+   "role": "golden",
+   "published": true,
+   "note": "float32 gradient from transformers' loss.backward()"
+  },
+  "grad.model.layers.1.post_attention_layernorm.weight.npy": {
+   "role": "golden",
+   "published": true,
+   "note": "float32 gradient from transformers' loss.backward()"
+  },
+  "grad.model.layers.1.self_attn.k_norm.weight.npy": {
+   "role": "golden",
+   "published": true,
+   "note": "float32 gradient from transformers' loss.backward()"
+  },
+  "grad.model.layers.1.self_attn.k_proj.weight.npy": {
+   "role": "golden",
+   "published": true,
+   "note": "float32 gradient from transformers' loss.backward()"
+  },
+  "grad.model.layers.1.self_attn.o_proj.weight.npy": {
+   "role": "golden",
+   "published": true,
+   "note": "float32 gradient from transformers' loss.backward()"
+  },
+  "grad.model.layers.1.self_attn.q_norm.weight.npy": {
+   "role": "golden",
+   "published": true,
+   "note": "float32 gradient from transformers' loss.backward()"
+  },
+  "grad.model.layers.1.self_attn.q_proj.weight.npy": {
+   "role": "golden",
+   "published": true,
+   "note": "float32 gradient from transformers' loss.backward()"
+  },
+  "grad.model.layers.1.self_attn.v_proj.weight.npy": {
+   "role": "golden",
+   "published": true,
+   "note": "float32 gradient from transformers' loss.backward()"
+  },
+  "grad.model.norm.weight.npy": {
+   "role": "golden",
+   "published": true,
+   "note": "float32 gradient from transformers' loss.backward()"
+  },
+  "ids.npy": {
+   "role": "input",
+   "published": true,
+   "note": "token ids the loss, logits and gradients are at"
+  },
+  "logits.npy": {
+   "role": "golden",
+   "published": true,
+   "note": "float32 logits [tokens, vocab] from transformers' forward"
+  },
+  "loss.npy": {
+   "role": "golden",
+   "published": true,
+   "note": "mean cross-entropy, float64"
+  },
+  "model.safetensors": {
+   "role": "model",
+   "published": true,
+   "note": "bf16 checkpoint with a separate root lm_head.weight; the float32 model torch differentiated holds the same values"
+  }
+ }
+}

@@ -2400,3 +2400,288 @@ fn untied_head_is_its_own_parameter_gradient_and_adamw_entry() {
     }
     let _ = rt;
 }
+
+// ------------------------------------------- untied head, several chunks ---
+
+/// Above two cross-entropy chunks (`CE_CHUNK` is 8192, private to
+/// `qwen35_train.rs`) and not a multiple of one: three vocabulary chunks, the
+/// last 37 rows wide. The 64-row fixtures never run a second chunk, so the
+/// head's by-chunk delivery (`matrix_rows_part`'s offset) and the bf16 bank's
+/// chunked zeroing (`zero_matrix`) are only exercised here.
+const MULTI_CHUNK_VOCAB: u32 = 2 * 8192 + 37;
+const CHUNK_ROWS: usize = 8192;
+
+/// A tied tower and an untied one with the same random tower (same seed) whose
+/// `lm_head` is bit-equal to its `embed`: the head's table is the only thing
+/// that differs from the tied model, and not its values.
+fn tied_and_equal_untied(rt: &Arc<GpuRuntime>, precision: Precision, hidden: u32) -> (Qwen35Model, Qwen35Model) {
+    let tied_cfg = Qwen35Config {
+        vocab: MULTI_CHUNK_VOCAB,
+        hidden,
+        ..tiny_config()
+    };
+    let untied_cfg = Qwen35Config {
+        tie_word_embeddings: false,
+        ..tied_cfg.clone()
+    };
+    let tied = Qwen35Model::random_tower(rt, tied_cfg, precision, 5).unwrap();
+    let untied = Qwen35Model::random_tower(rt, untied_cfg, precision, 5).unwrap();
+    let table = untied.parameter_table().unwrap();
+    let (e, hd) = (0, table.len() - 1);
+    assert_eq!(
+        (table[e].name.as_str(), table[hd].name.as_str()),
+        ("embed_tokens.weight", "lm_head.weight")
+    );
+    let n = table[e].shape.iter().product::<usize>();
+    let mut embed = vec![0.0f32; n];
+    untied.read_parameter_host(e, &mut embed).unwrap();
+    untied.write_parameter_host(hd, &embed).unwrap();
+    let mut head = vec![0.0f32; n];
+    untied.read_parameter_host(hd, &mut head).unwrap();
+    assert!(head == embed, "the head was not set equal to the embedding");
+    (tied, untied)
+}
+
+/// Token ids spread over all three vocabulary chunks, with the chunk edges and
+/// the last row among them.
+fn multi_chunk_ids() -> Vec<u32> {
+    let mut ids: Vec<u32> = (0..40u32).map(|i| (i * 977 + 5) % MULTI_CHUNK_VOCAB).collect();
+    for (slot, id) in [(3, MULTI_CHUNK_VOCAB - 1), (7, 8192), (8, 8191), (9, 16384), (10, 0)] {
+        ids[slot] = id;
+    }
+    ids
+}
+
+/// `x` rounded as a bank of `dtype` stores it, as bit patterns.
+fn stored_bits(dtype: DType, x: &[f32]) -> Vec<u32> {
+    x.iter()
+        .map(|&v| {
+            if dtype == DType::BF16 {
+                bf16_bits_to_f32(f32_to_bf16_bits(v)).to_bits()
+            } else {
+                v.to_bits()
+            }
+        })
+        .collect()
+}
+
+/// An untied head whose values are the tied embedding's, over a vocabulary of
+/// three chunks, against the tied model it mirrors, in f32 and in bf16
+/// storage (where the bank is delivered by chunk):
+///
+/// - the logits (f32; a bf16 tower has no packed head to run) and the loss
+///   are bit-equal;
+/// - the untied head gradient plus the untied embedding gradient is the tied
+///   embedding gradient, to f32 summation order: the tied step adds the
+///   gather's rows onto the head's, the sum here is taken on the host in
+///   f64 and rounded once, so they differ by a few f32 ulps of the element;
+///   the bound is 1e-6 of the tied gradient's largest element (6e-8 is one
+///   ulp at the peak);
+/// - the untied embedding gradient is nonzero only on the step's own token
+///   rows, and the head gradient is nonzero in every chunk, the 37-row tail
+///   included, so a delivery at a dropped or wrong offset cannot hide;
+/// - every bank path (in place for f32, by chunk for bf16) delivers the fresh
+///   step's gradients, rounded once, bit for bit, head and embedding, tied and
+///   untied; accumulation adds each; an unscored step zeroes the head over a
+///   non-zero bank (the chunked zeroing) and leaves an accumulated one alone.
+#[test]
+fn a_multi_chunk_untied_head_is_the_tied_head_plus_the_embedding() {
+    let rt = GpuRuntime::new().unwrap();
+    let ids = multi_chunk_ids();
+    let other: Vec<u32> = ids.iter().rev().copied().collect();
+    let v = MULTI_CHUNK_VOCAB as usize;
+    let none = Supervise::Rows {
+        positions: &[],
+        targets: &[],
+        scale: 1.0,
+    };
+    for precision in [Precision::F32, Precision::Bf16] {
+        let mm = if precision == Precision::F32 {
+            GemmOperands::ExactF32
+        } else {
+            GemmOperands::Bf16
+        };
+        let (tied, untied) = tied_and_equal_untied(&rt, precision, tiny_config().hidden);
+        let h = tied.config().hidden as usize;
+        if precision == Precision::F32 {
+            let (a, b) = (
+                tied.forward(&ids, false).unwrap().logits,
+                untied.forward(&ids, false).unwrap().logits,
+            );
+            assert!(
+                a.len() == ids.len() * v && a == b,
+                "f32 logits of the tied and the equal untied head differ"
+            );
+        }
+        let (ta, ua) = (tied.train_step(&ids, mm).unwrap(), untied.train_step(&ids, mm).unwrap());
+        assert_eq!(
+            ta.loss.to_bits(),
+            ua.loss.to_bits(),
+            "{precision:?}: loss {} vs {}",
+            ta.loss,
+            ua.loss
+        );
+
+        let (te, ue, uh) = (
+            widened(&ta.grads.embed),
+            widened(&ua.grads.embed),
+            widened(ua.grads.lm_head.as_ref().unwrap()),
+        );
+        let peak = te.iter().fold(0.0f32, |m, x| m.max(x.abs()));
+        assert!(peak > 0.0);
+        let worst = (0..te.len())
+            .map(|k| (f64::from(te[k]) - (f64::from(ue[k]) + f64::from(uh[k]))).abs())
+            .fold(0.0, f64::max);
+        eprintln!("{precision:?}: tied embed vs untied head + embed: worst {worst:.2e} (peak {peak:.2e})");
+        assert!(
+            worst <= 1e-6 * f64::from(peak),
+            "{precision:?}: head + embedding gradients off the tied one by {worst:.2e} (peak {peak:.2e})"
+        );
+        // Every chunk of the head has a gradient; the embedding's is the token rows only.
+        let row_max =
+            |x: &[f32], r: std::ops::Range<usize>| x[r.start * h..r.end * h].iter().fold(0.0f32, |m, y| m.max(y.abs()));
+        for (name, rows) in [
+            ("chunk 0", 0..CHUNK_ROWS),
+            ("chunk 1", CHUNK_ROWS..2 * CHUNK_ROWS),
+            ("the 37-row tail", 2 * CHUNK_ROWS..v),
+        ] {
+            assert!(row_max(&uh, rows) > 0.0, "{precision:?}: no head gradient in {name}");
+        }
+        let used: std::collections::BTreeSet<usize> = ids.iter().map(|&i| i as usize).collect();
+        for r in (0..v).filter(|r| !used.contains(r)) {
+            assert!(
+                row_max(&ue, r..r + 1) == 0.0,
+                "{precision:?}: the untied embedding has a gradient at unused row {r}"
+            );
+        }
+        // The tower's gradients do not know the head is separate.
+        let (tn, un) = (
+            by_name(tied.config(), &ta.grads, "model."),
+            by_name(untied.config(), &ua.grads, "model."),
+        );
+        for (name, want) in tn.iter().filter(|(n, _)| !n.ends_with("embed_tokens.weight")) {
+            let got = &un.iter().find(|(n, _)| n == name).unwrap().1;
+            let pk = want.iter().fold(0.0f64, |m, x| m.max(x.abs())).max(1e-30);
+            let worst = got.iter().zip(want).map(|(a, b)| (a - b).abs()).fold(0.0, f64::max);
+            assert!(
+                worst <= 1e-6 * pk,
+                "{precision:?}: {name} differs by {worst:.2e} (peak {pk:.2e})"
+            );
+        }
+
+        // Every way into a bank delivers the fresh gradients, rounded once.
+        let bits = |t: &Tensor| widened(t).iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+        let tbank = Qwen35Grads::zeros_like(&tied).unwrap();
+        tied.train_step_into(&ids, mm, Supervise::Causal, &tbank, false)
+            .unwrap();
+        assert!(
+            bits(&tbank.embed) == stored_bits(tbank.embed.dtype, &te),
+            "{precision:?}: tied bank embed"
+        );
+        let bank = Qwen35Grads::zeros_like(&untied).unwrap();
+        let head = bank.lm_head.as_ref().unwrap();
+        assert_eq!(
+            head.dtype,
+            if precision == Precision::F32 {
+                DType::F32
+            } else {
+                DType::BF16
+            }
+        );
+        untied
+            .train_step_into(&ids, mm, Supervise::Causal, &bank, false)
+            .unwrap();
+        assert!(bits(head) == stored_bits(head.dtype, &uh), "{precision:?}: bank head");
+        assert!(
+            bits(&bank.embed) == stored_bits(head.dtype, &ue),
+            "{precision:?}: bank embed"
+        );
+        let split = Qwen35Grads::zeros_like(&untied).unwrap();
+        let p = untied.train_forward(&ids, mm, Supervise::Causal).unwrap();
+        untied.train_backward_into(p, None, &split, false).unwrap();
+        assert!(
+            bits(split.lm_head.as_ref().unwrap()) == stored_bits(head.dtype, &uh),
+            "{precision:?}: split head"
+        );
+        assert!(
+            bits(&split.embed) == stored_bits(head.dtype, &ue),
+            "{precision:?}: split embed"
+        );
+
+        // Accumulating: bank + g per element, rounded once.
+        let ub = untied.train_step(&other, mm).unwrap();
+        untied
+            .train_step_into(&other, mm, Supervise::Causal, &bank, true)
+            .unwrap();
+        let sum = |first: &[f32], g: &[f32]| -> Vec<u32> {
+            let r: Vec<f32> = stored_bits(head.dtype, first)
+                .iter()
+                .map(|&b| f32::from_bits(b))
+                .collect();
+            stored_bits(head.dtype, &r.iter().zip(g).map(|(a, b)| a + b).collect::<Vec<_>>())
+        };
+        assert!(
+            bits(head) == sum(&uh, &widened(ub.grads.lm_head.as_ref().unwrap())),
+            "{precision:?}: accumulated head"
+        );
+        assert!(
+            bits(&bank.embed) == sum(&ue, &widened(&ub.grads.embed)),
+            "{precision:?}: accumulated embed"
+        );
+
+        // Nothing scored: unchanged when accumulating, zero over a non-zero bank otherwise.
+        let before = bits(head);
+        assert!(before.iter().any(|&x| f32::from_bits(x) != 0.0));
+        untied.train_step_into(&ids, mm, none, &bank, true).unwrap();
+        assert!(
+            bits(head) == before,
+            "{precision:?}: an unscored accumulated step moved the head"
+        );
+        untied.train_step_into(&ids, mm, none, &bank, false).unwrap();
+        for (name, t) in [("head", head), ("embed", &bank.embed)] {
+            let z = widened(t);
+            let at = z.iter().position(|&x| x != 0.0);
+            assert!(
+                at.is_none(),
+                "{precision:?}: {name} row {:?} not zeroed",
+                at.map(|k| k / h)
+            );
+        }
+    }
+}
+
+/// The multi-chunk untied step stays under its pre-flight bound
+/// ([`Qwen35Model::train_step_bytes`] is what the gate trusts), with a
+/// `[8192, hidden]` chunk the heaviest allocation (hidden 1024, as the bf16
+/// bound test above), through the paths that allocate a chunk: the by-chunk
+/// bank of a bf16 model, scored and unscored (the zeroing's chunk), and the
+/// f32 in-place bank.
+#[test]
+fn an_untied_multi_chunk_step_peaks_under_its_bound() {
+    let rt = GpuRuntime::new().unwrap();
+    let none = Supervise::Rows {
+        positions: &[],
+        targets: &[],
+        scale: 1.0,
+    };
+    for precision in [Precision::F32, Precision::Bf16] {
+        let mm = if precision == Precision::F32 {
+            GemmOperands::ExactF32
+        } else {
+            GemmOperands::Bf16
+        };
+        let (_, model) = tied_and_equal_untied(&rt, precision, 1024);
+        let bank = Qwen35Grads::zeros_like(&model).unwrap();
+        for sup in [Supervise::Causal, none] {
+            let bound = model.train_step_bytes(33, mm);
+            let ids: Vec<u32> = (0..33u32).map(|i| (i * 7_919 + 3) % MULTI_CHUNK_VOCAB).collect();
+            rt.synchronize().unwrap();
+            let before = rt.current_allocated_bytes();
+            rt.reset_peak_allocated_bytes();
+            model.train_step_into(&ids, mm, sup, &bank, false).unwrap();
+            let peak = rt.peak_allocated_bytes().saturating_sub(before);
+            eprintln!("{precision:?}: peak {peak} B, bound {bound} B");
+            assert!(peak <= bound, "{precision:?}: peak {peak} over the bound {bound}");
+        }
+    }
+}

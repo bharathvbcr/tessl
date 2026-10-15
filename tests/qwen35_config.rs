@@ -140,6 +140,59 @@ fn tie_word_embeddings_is_read_and_must_be_consistent() {
     refused(&both("true", "\"yes\""), "must be true or false");
 }
 
+/// The REAL config with `tie_word_embeddings` at the root (its first
+/// occurrence) and in `text_config` (its second) set to the given JSON value,
+/// or, for `None`, replaced by an unrelated key so the key is absent.
+fn tie_edit(root: Option<&str>, text: Option<&str>) -> String {
+    let key = "\"tie_word_embeddings\": true";
+    let spots: Vec<usize> = REAL.match_indices(key).map(|(i, _)| i).collect();
+    assert_eq!(spots.len(), 2, "the key at root and in text_config");
+    let put = |v: Option<&str>| match v {
+        Some(v) => format!("\"tie_word_embeddings\": {v}"),
+        None => "\"unrelated_key\": 0".to_string(),
+    };
+    format!(
+        "{}{}{}{}{}",
+        &REAL[..spots[0]],
+        put(root),
+        &REAL[spots[0] + key.len()..spots[1]],
+        put(text),
+        &REAL[spots[1] + key.len()..]
+    )
+}
+
+/// transformers 5.17.0 defaults the key to False (untied) in both config
+/// classes (configuration_qwen3_5.py:93 and :184), so a config that is silent
+/// is ambiguous and refused; and the three ways to disagree or misspell it
+/// are each refused by name: only the root flipped, only `text_config`
+/// flipped (above), and a number where a bool belongs.
+#[test]
+fn tie_word_embeddings_refusals_name_the_key() {
+    // Sanity: the helper reproduces the real file when it changes nothing.
+    assert_eq!(tie_edit(Some("true"), Some("true")), REAL);
+    // Silent at both places: refused, not defaulted to either layout.
+    refused(&tie_edit(None, None), "tie_word_embeddings is not set");
+    // One place alone states it: accepted, either place, either value.
+    assert!(
+        Qwen35Config::from_config_json(&tie_edit(None, Some("true")))
+            .unwrap()
+            .tie_word_embeddings
+    );
+    assert!(
+        !Qwen35Config::from_config_json(&tie_edit(Some("false"), None))
+            .unwrap()
+            .tie_word_embeddings
+    );
+    // Only the root flipped: it disagrees with text_config.
+    refused(&tie_edit(Some("false"), Some("true")), "disagrees");
+    // A number is not a bool, at either place and for both 0 and 1.
+    for v in ["0", "1"] {
+        refused(&tie_edit(Some(v), Some("true")), "must be true or false");
+        refused(&tie_edit(Some("true"), Some(v)), "must be true or false");
+        refused(&tie_edit(Some(v), Some(v)), "must be true or false");
+    }
+}
+
 #[test]
 fn features_the_forward_lacks_are_refused_by_name() {
     refused(

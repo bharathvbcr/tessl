@@ -232,9 +232,12 @@ impl Qwen35Config {
 
         // `tie_word_embeddings`, at the root and in `text_config`: whichever
         // are present must be booleans and agree, and one must be present
-        // (transformers defaults an absent key to tied; a config that does not
-        // say is refused rather than guessed, as the head is the whole
-        // difference between two checkpoint layouts).
+        // (transformers 5.17.0's `Qwen3_5Config` and `Qwen3_5TextConfig` both
+        // default it to False, configuration_qwen3_5.py:184 and :93, while
+        // the tied checkpoints state it, as the published 2B-Base config
+        // does; so a config that is silent could be either layout, and is
+        // refused rather than guessed: the head is the whole difference
+        // between the two checkpoint layouts).
         let mut tie: Option<bool> = None;
         for t in [root.get("tie_word_embeddings"), c.get("tie_word_embeddings")]
             .into_iter()

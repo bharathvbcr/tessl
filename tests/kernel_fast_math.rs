@@ -365,3 +365,80 @@ fn check_kernel_ir_uses_build_rs_flags() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// Adversarial regression tests (tester commit). The `known_gap` tests FAIL on
+// the implementation as committed: each is a self-compare spelling a kernel can
+// use that `self_compare_lines` does not see.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn known_gap_self_compare_of_parenthesised_and_cast_operands() {
+    let hit = |src: &str| self_compare_lines(&strip_comments(src));
+    assert_eq!(hit("#define ISN(x) ((x) != (x))"), vec![1], "parenthesised operands");
+    assert_eq!(hit("auto b = (x) == (x);"), vec![1], "parenthesised operands");
+    assert_eq!(hit("if (float(x) != float(x)) {}"), vec![1], "functional cast");
+    assert_eq!(
+        hit("if (static_cast<float>(x) != static_cast<float>(x)) {}"),
+        vec![1],
+        "static_cast"
+    );
+    assert_eq!(hit("if (*p != *p) {}"), vec![1], "dereference");
+    assert_eq!(hit("if (ns::v != ns::v) {}"), vec![1], "scope-qualified name");
+}
+
+#[test]
+fn known_gap_self_compare_split_across_lines() {
+    let hit = |src: &str| self_compare_lines(&strip_comments(src));
+    assert_eq!(hit("if (v\n    != v) {}").len(), 1, "operator on the next line");
+    assert_eq!(hit("if (v !=\n    v) {}").len(), 1, "operand on the next line");
+}
+
+#[test]
+fn known_gap_slash_slash_inside_a_string_does_not_hide_the_rest_of_the_line() {
+    let hit = |src: &str| self_compare_lines(&strip_comments(src));
+    assert_eq!(hit("const char *s = \"//\"; if (v != v) {}"), vec![1]);
+}
+
+/// The `-` flag literals of `fn metal_args` in `build.rs`.
+fn metal_args_flags(build_rs: &str) -> Vec<String> {
+    let start = build_rs.find("fn metal_args").expect("build.rs defines metal_args");
+    let body = &build_rs[start..];
+    let end = body.find("\n}\n").expect("metal_args ends");
+    let mut flags = Vec::new();
+    for lit in body[..end].split('"').skip(1).step_by(2) {
+        // `-std={metal_std}` is the dialect, spelled per source by the script.
+        if lit.starts_with('-') && !lit.starts_with("-std=") {
+            flags.push(lit.to_string());
+        }
+    }
+    flags
+}
+
+#[test]
+fn the_metal_args_extractor_sees_a_planted_flag() {
+    let planted = "fn metal_args() -> Vec<String> {\n    let mut args = [\"-O2\", \"-std={x}\"];\n    if cond {\n        args.push(\"-fno-fast-math\".into());\n    }\n    args\n}\n";
+    assert_eq!(metal_args_flags(planted), vec!["-O2", "-fno-fast-math"]);
+}
+
+/// Every flag literal in `metal_args` is either spelled by the script or on the
+/// explicit list of flags that cannot change the IR (`-Wall -Werror` only
+/// turn warnings into errors under TESSL_METAL_WERROR). The tester found the
+/// hand list in `check_kernel_ir_uses_build_rs_flags` does not notice a flag
+/// added to build.rs that is not on it.
+#[test]
+fn every_build_rs_flag_is_in_the_ir_script_or_exempt() {
+    const IR_NEUTRAL: [&str; 2] = ["-Wall", "-Werror"];
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let build = std::fs::read_to_string(root.join("build.rs")).expect("build.rs is readable");
+    let script =
+        std::fs::read_to_string(root.join("scripts/check_kernel_ir.sh")).expect("check_kernel_ir.sh is readable");
+    let flags = metal_args_flags(&build);
+    assert!(flags.len() >= 5, "extractor found only {flags:?}");
+    for flag in flags {
+        assert!(
+            IR_NEUTRAL.contains(&flag.as_str()) || script.contains(&flag),
+            "build.rs passes {flag} to metal but scripts/check_kernel_ir.sh does not"
+        );
+    }
+}

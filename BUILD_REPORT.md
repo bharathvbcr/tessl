@@ -1,6 +1,6 @@
 # BUILD_REPORT — GitPulse backlog, waves 6–7 (2026-10-14/15)
 
-Base: `main` @ `620939d` (which already held waves 1–5, see the earlier report below). All of this run's work is on **`gp/wave7`** (worktree `../tessl-wave6`): `gp/wave6` (wave 6 plus integration fixes) with the four wave-7 lanes merged on top. That is 55 commits and 94 files (+13.1k / −4.3k) ahead of `main`. **Nothing is merged into `main` or pushed**, because that is your call.
+Base: `main` @ `620939d` (which already held waves 1–5, see the earlier report below). All of this run's work is on **`gp/wave7`** (worktree `../tessl-wave6`): `gp/wave6` (wave 6 plus integration fixes) with the four wave-7 lanes merged on top. That is 56 commits and 96 files (+13.3k / −4.3k, report and CHANGELOG included) ahead of `main`. **Nothing is merged into `main` or pushed**, because that is your call.
 
 ## How this run worked
 

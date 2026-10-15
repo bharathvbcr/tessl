@@ -37,6 +37,8 @@
 //! that silently wrote nothing would otherwise post the best number in the
 //! table.
 
+mod common;
+
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -44,26 +46,6 @@ use tessl::tensor::GpuBuffer;
 use tessl::{nn, GpuRuntime};
 
 const BATCH: usize = 64;
-
-fn fill(n: usize, seed: u64) -> Vec<f32> {
-    let mut s = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
-    (0..n)
-        .map(|_| {
-            s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-            (((s >> 32) as u32) as f64 / (u32::MAX as f64) * 2.0 - 1.0) as f32
-        })
-        .collect()
-}
-
-fn median(mut v: Vec<f64>) -> f64 {
-    v.sort_by(|a, b| a.partial_cmp(b).unwrap());
-    let n = v.len();
-    if n % 2 == 1 {
-        v[n / 2]
-    } else {
-        (v[n / 2 - 1] + v[n / 2]) / 2.0
-    }
-}
 
 fn buf(rt: &Arc<GpuRuntime>, data: &[f32]) -> GpuBuffer {
     let b = rt.alloc_buffer(data.len().max(1) * 4).expect("alloc");
@@ -125,13 +107,13 @@ fn measure(
         solo.push(t0.elapsed().as_secs_f64() * 1e6);
     }
 
-    let b = median(batched);
+    let b = common::median(batched)?;
     Ok(Row {
         name: name.to_string(),
         shape: shape.to_string(),
         batched_us: b,
-        host_us: median(host),
-        solo_us: median(solo),
+        host_us: common::median(host)?,
+        solo_us: common::median(solo)?,
         gb_s: bytes / (b * 1e-6) / 1e9,
     })
 }
@@ -190,15 +172,9 @@ fn out_buf(rt: &Arc<GpuRuntime>, elems: usize) -> GpuBuffer {
 }
 
 fn main() -> Result<(), String> {
+    let warmup = common::env_usize("BENCH_WARMUP", 10, 0)?;
+    let iters = common::env_usize("BENCH_ITERS", 50, 1)?;
     let rt = GpuRuntime::new()?;
-    let warmup: usize = std::env::var("BENCH_WARMUP")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(10);
-    let iters: usize = std::env::var("BENCH_ITERS")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(50);
 
     let mut host_only = false;
     for arg in std::env::args().skip(1) {
@@ -226,8 +202,8 @@ fn kernel_table(rt: &Arc<GpuRuntime>, warmup: usize, iters: usize) -> Result<(),
 
     // ---------------------------------------------------------- RMSNorm ---
     for &(r, d) in &[(1usize, 4096usize), (512, 4096), (2048, 4096)] {
-        let x = buf(&rt, &fill(r * d, 0x11));
-        let w = buf(&rt, &fill(d, 0x12));
+        let x = buf(&rt, &common::fill(r * d, 0x11));
+        let w = buf(&rt, &common::fill(d, 0x12));
         let o = out_buf(&rt, r * d);
         verify(&rt, "rms_norm_f32", &o, r * d, || {
             nn::rms_norm_f32(&rt, &x, &w, &o, r as u32, d as u32, 1e-6)
@@ -247,8 +223,8 @@ fn kernel_table(rt: &Arc<GpuRuntime>, warmup: usize, iters: usize) -> Result<(),
 
     // ------------------------------------------------------- MLP gating ---
     for &n in &[4096usize, 1 << 20, 8 << 20] {
-        let g = buf(&rt, &fill(n, 0x21));
-        let u = buf(&rt, &fill(n, 0x22));
+        let g = buf(&rt, &common::fill(n, 0x21));
+        let u = buf(&rt, &common::fill(n, 0x22));
         let o = out_buf(&rt, n);
         let bytes = (3 * n * 4) as f64;
 
@@ -279,7 +255,7 @@ fn kernel_table(rt: &Arc<GpuRuntime>, warmup: usize, iters: usize) -> Result<(),
 
     // -------------------------------------------------------- Reductions ---
     for &(r, c) in &[(32usize, 1024usize), (512, 4096), (2048, 8192)] {
-        let x = buf(&rt, &fill(r * c, 0x31));
+        let x = buf(&rt, &common::fill(r * c, 0x31));
         let o = out_buf(&rt, r * c);
         verify(&rt, "softmax_rows_f32", &o, r * c, || {
             nn::softmax_rows_f32(&rt, &x, &o, r as u32, c as u32)
@@ -330,7 +306,7 @@ fn kernel_table(rt: &Arc<GpuRuntime>, warmup: usize, iters: usize) -> Result<(),
         pb.write_bytes(&packed);
         let sb = buf(&rt, &vec![0.01f32; groups]);
         let zb = buf(&rt, &vec![1.0f32; groups]);
-        let xb = buf(&rt, &fill(c, 0x41));
+        let xb = buf(&rt, &common::fill(c, 0x41));
         let yb = out_buf(&rt, r);
 
         verify(&rt, "gemv_q8", &yb, r, || {
@@ -360,7 +336,7 @@ fn kernel_table(rt: &Arc<GpuRuntime>, warmup: usize, iters: usize) -> Result<(),
         packed.write_bytes(&(0..r * c / 2).map(|i| (i % 251) as u8).collect::<Vec<u8>>());
         let sc = buf(&rt, &vec![0.02f32; groups]);
         let ze = buf(&rt, &vec![7.0f32; groups]);
-        let xb = buf(&rt, &fill(c, 0x51));
+        let xb = buf(&rt, &common::fill(c, 0x51));
         let yb = out_buf(&rt, r);
         let shape = nn::QuantShape {
             rows: r as u32,
@@ -421,7 +397,7 @@ fn kernel_table(rt: &Arc<GpuRuntime>, warmup: usize, iters: usize) -> Result<(),
             r.name, r.shape, r.batched_us, r.host_us, r.solo_us, r.gb_s
         );
     }
-    let host = median(rows.iter().map(|r| r.host_us).collect());
+    let host = common::median(rows.iter().map(|r| r.host_us).collect())?;
     println!("\nMedian host encode per batched dispatch: {host:.2} us.");
     for r in &rows {
         // The bracketed GFLOP/s in a GEMM row's name changes run to run.
@@ -432,7 +408,7 @@ fn kernel_table(rt: &Arc<GpuRuntime>, warmup: usize, iters: usize) -> Result<(),
     }
     println!("METRIC host_us/median {host:.4}");
 
-    let floor = median(rows.iter().map(|r| r.solo_us).collect());
+    let floor = common::median(rows.iter().map(|r| r.solo_us).collect())?;
     println!(
         "\nMedian solo dispatch: {floor:.1} us. Every kernel whose batched time \
          is below that is\nentirely inside the submit-and-wait floor when issued \
@@ -459,7 +435,7 @@ fn ns_per_call(iters: usize, mut f: impl FnMut() -> Result<(), String>) -> Resul
         }
         v.push(t0.elapsed().as_secs_f64() * 1e9 / HOST_CALLS as f64);
     }
-    Ok(median(v))
+    common::median(v)
 }
 
 /// One decode-style token loop: `encode` queues a token's work with async
@@ -497,7 +473,7 @@ fn sample_loop(
         wall.push(w * 1e6 / TOKENS as f64);
     }
     rt.set_async_encode(false)?;
-    Ok((median(enc), median(wall), token))
+    Ok((common::median(enc)?, common::median(wall)?, token))
 }
 
 /// The host side of a dispatch, timed apart from any kernel.
@@ -520,10 +496,10 @@ fn host_path(rt: &Arc<GpuRuntime>, warmup: usize, iters: usize) -> Result<(), St
 
     // Decode-style sampling over a full vocabulary: a final-norm-sized
     // dispatch, then the sampler, then read the token.
-    let logits = buf(rt, &fill(VOCAB, 0x61));
+    let logits = buf(rt, &common::fill(VOCAB, 0x61));
     let cap = buf(rt, &[30.0]);
-    let hx = buf(rt, &fill(2048, 0x62));
-    let hw = buf(rt, &fill(2048, 0x63));
+    let hx = buf(rt, &common::fill(2048, 0x62));
+    let hw = buf(rt, &common::fill(2048, 0x63));
     let ho = out_buf(rt, 2048);
     let norm = || nn::rms_norm_f32(rt, &hx, &hw, &ho, 1, 2048, 1e-6);
     let tok = rt.alloc_buffer(4)?;

@@ -1,22 +1,28 @@
-//! Paired 128×64 vs 64×64 plain bf16 GEMM at Qwen3.5-2B's GDN fused in-projection.
+//! Paired 128x64 vs 64x64 bf16 GEMM tiles at Qwen3.5-2B's two N>512 projections.
 //!
 //! ```text
-//! cargo run --release --bin bench_gemm_coop_tile
+//! cargo run --release --bin bench_gemm_coop_tile -- --family plain      # default
+//! cargo run --release --bin bench_gemm_coop_tile -- --family epilogue
 //! ```
 //!
-//! One process, one pair of buffers per M. `gemm` (not the epilogue) launches
-//! this shape from `Qwen35Model::gdn`: A is `[M, hidden]` bf16, B is
-//! `[hidden, width]` bf16, C is `[M, width]` f32. hidden = 2048.
-//! `GdnProjLayout::width` for 16/16/128 is the fused in-proj N. M = 61 does
-//! not fill a 128-row tile; M = 200 does.
+//! One process, one pair of buffers per M. A is `[M, K]` bf16, B is `[K, N]`
+//! bf16, C is `[M, N]` f32. M = 61 does not fill a 128-row tile; M = 200 does.
+//!
+//! * `plain`: `gemm_tiled`, which `Qwen35Model::gdn` launches for the fused
+//!   in-projection. K = hidden = 2048, N = `GdnProjLayout::width` for 16/16/128.
+//! * `epilogue`: `gemm_epilogue_tiled` with the residual add (`beta = 1`),
+//!   which `project_residual` dispatches. K = 8 query heads x 256, N = hidden
+//!   2048. The two tiles must agree within the unfused-sequence tolerance.
 //!
 //! ABBA, three warmup rounds, nine timed rounds. Each sample is many launches
 //! in one command buffer so the submit floor is not the measurement.
 
+mod common;
+
 use std::sync::Arc;
 use std::time::Instant;
 
-use tessl::gemm::{gemm_tiled, EpiTile, GemmBackend};
+use tessl::gemm::{gemm_epilogue_tiled, gemm_tiled, EpiTile, Epilogue, GemmBackend};
 use tessl::qwen35::GdnProjLayout;
 use tessl::tensor::{f32_slice_to_bf16, Tensor};
 use tessl::GpuRuntime;
@@ -27,14 +33,64 @@ const REPS: usize = 256;
 const WARMUP_ROUNDS: usize = 3;
 const ROUNDS: usize = 9;
 
-fn fill(n: usize, seed: u64) -> Vec<f32> {
-    let mut s = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
-    (0..n)
-        .map(|_| {
-            s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-            (((s >> 33) as u32) as f32) / (u32::MAX as f32) * 2.0 - 1.0
-        })
-        .collect()
+/// Which projection's launch the tiles are compared on.
+#[derive(Clone, Copy)]
+enum Family {
+    Plain,
+    Epilogue,
+}
+
+impl Family {
+    fn parse(name: &str) -> Result<Self, String> {
+        match name {
+            "plain" => Ok(Family::Plain),
+            "epilogue" => Ok(Family::Epilogue),
+            other => Err(format!(
+                "--family {other:?} is not a family; expected plain or epilogue"
+            )),
+        }
+    }
+
+    fn from_args() -> Result<Self, String> {
+        let mut family = Family::Plain;
+        let mut args = std::env::args().skip(1);
+        while let Some(arg) = args.next() {
+            let value = match arg.strip_prefix("--family=") {
+                Some(v) => v.to_string(),
+                None if arg == "--family" => args.next().ok_or("--family needs plain or epilogue")?,
+                None => return Err(format!("unknown argument {arg:?}; expected --family plain|epilogue")),
+            };
+            family = Family::parse(&value)?;
+        }
+        Ok(family)
+    }
+
+    /// The output width: the fused GDN in-projection's, or the hidden size.
+    fn n(self) -> Result<usize, String> {
+        match self {
+            Family::Plain => {
+                let n = GdnProjLayout::new(16, 16, 128)?.width() as usize;
+                if n <= 512 {
+                    return Err(format!("GDN in-proj N={n} does not exercise the N>512 path"));
+                }
+                Ok(n)
+            }
+            Family::Epilogue => Ok(2048),
+        }
+    }
+
+    fn launch(self, a: &Tensor, b: &Tensor, c: &Tensor, tile: EpiTile) -> Result<(), String> {
+        match self {
+            Family::Plain => gemm_tiled(a, b, c, GemmBackend::TensorOps, tile),
+            Family::Epilogue => {
+                let residual_add = Epilogue {
+                    beta: 1.0,
+                    ..Epilogue::default()
+                };
+                gemm_epilogue_tiled(a, b, c, GemmBackend::TensorOps, residual_add, tile)
+            }
+        }
+    }
 }
 
 fn bf16(rt: &Arc<GpuRuntime>, shape: &[usize], data: &[f32]) -> Result<Tensor, String> {
@@ -49,28 +105,24 @@ fn f32_tensor(rt: &Arc<GpuRuntime>, shape: &[usize], data: &[f32]) -> Result<Ten
     Ok(t)
 }
 
-fn median(mut v: Vec<f64>) -> f64 {
-    v.sort_by(|a, b| a.partial_cmp(b).unwrap());
-    let n = v.len();
-    if n % 2 == 1 {
-        v[n / 2]
-    } else {
-        (v[n / 2 - 1] + v[n / 2]) / 2.0
-    }
-}
-
 fn main() -> Result<(), String> {
-    let n = GdnProjLayout::new(16, 16, 128)?.width() as usize;
-    if n <= 512 {
-        return Err(format!("GDN in-proj N={n} does not exercise the N>512 path"));
-    }
+    let family = Family::from_args()?;
+    let n = family.n()?;
     let rt = GpuRuntime::new()?;
     if !rt.has_tensorops() {
         return Err("bf16 GEMM needs TensorOps".into());
     }
     println!("device: {}", rt.device_name());
-    println!("paired plain GEMM tiles: 128x64 (wide) vs 64x64 (narrow), bf16, f32 accumulate");
-    println!("Qwen3.5-2B GDN fused in-projection: K={K} N={n}, M={MS:?}");
+    match family {
+        Family::Plain => {
+            println!("paired plain GEMM tiles: 128x64 (wide) vs 64x64 (narrow), bf16, f32 accumulate");
+            println!("Qwen3.5-2B GDN fused in-projection: K={K} N={n}, M={MS:?}");
+        }
+        Family::Epilogue => {
+            println!("paired epilogue tiles: 128x64 (wide) vs 64x64 (narrow), bf16, f32 accumulate, beta=1");
+            println!("Qwen3.5-2B output projection: K={K} N={n}, M={MS:?}");
+        }
+    }
     println!(
         "one process, same A/B/C per M, ABBA (first tile rotates each round), \
          warmup {WARMUP_ROUNDS}, timed {ROUNDS}, {REPS} launches per sample"
@@ -78,14 +130,14 @@ fn main() -> Result<(), String> {
 
     rt.set_async_encode(true)?;
     for &m in &MS {
-        let a = bf16(&rt, &[m, K], &fill(m * K, 0xA100 + m as u64))?;
-        let b = bf16(&rt, &[K, n], &fill(K * n, 0xB200))?;
-        let c_init = fill(m * n, 0xC300 + m as u64);
+        let a = bf16(&rt, &[m, K], &common::fill(m * K, 0xA100 + m as u64))?;
+        let b = bf16(&rt, &[K, n], &common::fill(K * n, 0xB200))?;
+        let c_init = common::fill(m * n, 0xC300 + m as u64);
         let wide_c = f32_tensor(&rt, &[m, n], &c_init)?;
         let narrow_c = f32_tensor(&rt, &[m, n], &c_init)?;
 
-        gemm_tiled(&a, &b, &wide_c, GemmBackend::TensorOps, EpiTile::Wide)?;
-        gemm_tiled(&a, &b, &narrow_c, GemmBackend::TensorOps, EpiTile::Narrow)?;
+        family.launch(&a, &b, &wide_c, EpiTile::Wide)?;
+        family.launch(&a, &b, &narrow_c, EpiTile::Narrow)?;
         rt.synchronize()?;
         let wide_out = wide_c.buffer.read_f32();
         let narrow_out = narrow_c.buffer.read_f32();
@@ -107,10 +159,19 @@ fn main() -> Result<(), String> {
             "M={m}: max |narrow-wide| = {worst:.4e} bits_differ {bits_differ}/{}",
             m * n
         );
+        if let Family::Epilogue = family {
+            let tol = 2e-2 * (K as f32).sqrt();
+            if worst > tol {
+                return Err(format!(
+                    "M={m}: tiles differ by {worst}, above the unfused-sequence tol {tol}"
+                ));
+            }
+        }
         if wide_out[..m * n].iter().all(|v| v.abs() < 1e-3) {
             return Err(format!("M={m}: wide output is ~0"));
         }
 
+        // Both tiles write the same C, so any epilogue traffic matches.
         let c = f32_tensor(&rt, &[m, n], &c_init)?;
         let mut wide_ms = Vec::with_capacity(ROUNDS);
         let mut narrow_ms = Vec::with_capacity(ROUNDS);
@@ -125,7 +186,7 @@ fn main() -> Result<(), String> {
                 rt.synchronize()?;
                 let t0 = Instant::now();
                 for _ in 0..REPS {
-                    gemm_tiled(&a, &b, &c, GemmBackend::TensorOps, tile)?;
+                    family.launch(&a, &b, &c, tile)?;
                 }
                 rt.synchronize()?;
                 let ms = t0.elapsed().as_secs_f64() * 1e3 / REPS as f64;
@@ -149,7 +210,7 @@ fn main() -> Result<(), String> {
             }
         }
         for (name, samples) in [("wide128", &wide_ms), ("narrow64", &narrow_ms)] {
-            let med = median(samples.clone());
+            let med = common::median(samples.clone())?;
             let lo = samples.iter().copied().fold(f64::INFINITY, f64::min);
             let hi = samples.iter().copied().fold(f64::NEG_INFINITY, f64::max);
             println!(
@@ -165,7 +226,7 @@ fn main() -> Result<(), String> {
         let narrow_wins = n_hi < w_lo;
         println!(
             "PAIRED m={m} ratio_narrow_over_wide={:.4} ranges_overlap={overlap} narrow_range_entirely_faster={narrow_wins}",
-            median(narrow_ms) / median(wide_ms)
+            common::median(narrow_ms)? / common::median(wide_ms)?
         );
     }
     rt.set_async_encode(false)?;

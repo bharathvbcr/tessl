@@ -80,6 +80,8 @@
 //! knobs, so they are gone (`--paired-attn` and `bench/results/
 //! qwen35_fused_swiglu_gemm_m5pro.txt` hold those comparisons).
 
+mod common;
+
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -107,26 +109,6 @@ const DEFAULT_T: [usize; 3] = [1024, 2048, 8192];
 
 type Res<T> = Result<T, String>;
 
-fn fill(n: usize, seed: u64, scale: f32) -> Vec<f32> {
-    let mut s = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
-    (0..n)
-        .map(|_| {
-            s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-            ((((s >> 32) as u32) as f64 / (u32::MAX as f64) * 2.0 - 1.0) as f32) * scale
-        })
-        .collect()
-}
-
-fn median(mut v: Vec<f64>) -> f64 {
-    v.sort_by(|a, b| a.partial_cmp(b).unwrap());
-    let n = v.len();
-    if n % 2 == 1 {
-        v[n / 2]
-    } else {
-        (v[n / 2 - 1] + v[n / 2]) / 2.0
-    }
-}
-
 fn buf(rt: &Arc<GpuRuntime>, data: &[f32]) -> Res<GpuBuffer> {
     let b = rt.alloc_buffer(data.len().max(1) * 4)?;
     b.write_f32(data);
@@ -149,7 +131,7 @@ fn weight(rt: &Arc<GpuRuntime>, rows: usize, cols: usize, bits: &[u16]) -> Res<T
 
 /// Uniform in ±sqrt(3 / fan_in): unit-variance outputs from unit-variance inputs.
 fn weight_bits(rows: usize, cols: usize, seed: u64) -> Vec<u16> {
-    f32_slice_to_bf16(&fill(rows * cols, seed, (3.0 / rows as f32).sqrt()))
+    f32_slice_to_bf16(&common::fill_affine(rows * cols, seed, (3.0 / rows as f32).sqrt(), 0.0))
 }
 
 // --------------------------------------------------------------------- gate ---
@@ -185,7 +167,7 @@ fn time_ms(rt: &Arc<GpuRuntime>, reps: usize, iters: usize, mut f: impl FnMut() 
         rt.synchronize()?;
         samples.push(t0.elapsed().as_secs_f64() * 1e3 / reps as f64);
     }
-    Ok(median(samples))
+    common::median(samples)
 }
 
 // ------------------------------------------------------- paired attention ---
@@ -271,9 +253,9 @@ fn run_paired_attn(rt: &Arc<GpuRuntime>, ts: &[usize]) -> Res<()> {
         let qd = t * (Q_HEADS * HEAD_DIM) as usize;
         let kv = t * (KV_HEADS * HEAD_DIM) as usize;
         let scale = 1.0 / (HEAD_DIM as f32).sqrt();
-        let q = buf(rt, &fill(qd, 11, scale))?;
-        let k = buf(rt, &fill(kv, 12, scale))?;
-        let v = buf(rt, &fill(kv, 13, scale))?;
+        let q = buf(rt, &common::fill_affine(qd, 11, scale, 0.0))?;
+        let k = buf(rt, &common::fill_affine(kv, 12, scale, 0.0))?;
+        let v = buf(rt, &common::fill_affine(kv, 13, scale, 0.0))?;
         let o = rt.alloc_buffer(qd * 4)?;
         let tkv = buf_u32(rt, &[t as u32])?;
         let pos = buf_u32(rt, &[0])?;
@@ -340,7 +322,7 @@ fn run_paired_attn(rt: &Arc<GpuRuntime>, ts: &[usize]) -> Res<()> {
         }
 
         for (name, samples) in [("flash_attn_rows", &rows), ("attn_prefill", &tiled)] {
-            let med = median(samples.clone());
+            let med = common::median(samples.clone())?;
             let lo = samples.iter().copied().fold(f64::INFINITY, f64::min);
             let hi = samples.iter().copied().fold(f64::NEG_INFINITY, f64::max);
             println!(
@@ -349,7 +331,7 @@ fn run_paired_attn(rt: &Arc<GpuRuntime>, ts: &[usize]) -> Res<()> {
                 med * reps as f64
             );
         }
-        let ratio = median(tiled.clone()) / median(rows.clone());
+        let ratio = common::median(tiled.clone())? / common::median(rows.clone())?;
         println!("PAIRED t={t} ratio_tiled_over_rows={ratio:.4}");
     }
     Ok(())
@@ -411,14 +393,23 @@ fn run_paired_gdn_recurrent(rt: &Arc<GpuRuntime>, batches: &[usize]) -> Res<()> 
         let m = PairRec {
             gdn,
             dims,
-            proj: buf(rt, &fill(b * gdn.width() as usize, 31, 1.0))?,
-            qkv: buf(rt, &fill(b * gdn.conv_dim() as usize, 32, 1.0))?,
-            a_log: buf(rt, &fill(vh, 33, 1.0).iter().map(|v| 1.4 + 1.3 * v).collect::<Vec<_>>())?,
+            proj: buf(rt, &common::fill_affine(b * gdn.width() as usize, 31, 1.0, 0.0))?,
+            qkv: buf(rt, &common::fill_affine(b * gdn.conv_dim() as usize, 32, 1.0, 0.0))?,
+            a_log: buf(
+                rt,
+                &common::fill_affine(vh, 33, 1.0, 0.0)
+                    .iter()
+                    .map(|v| 1.4 + 1.3 * v)
+                    .collect::<Vec<_>>(),
+            )?,
             dt_bias: buf(
                 rt,
-                &fill(vh, 34, 1.0).iter().map(|v| -4.5 + 2.5 * v).collect::<Vec<_>>(),
+                &common::fill_affine(vh, 34, 1.0, 0.0)
+                    .iter()
+                    .map(|v| -4.5 + 2.5 * v)
+                    .collect::<Vec<_>>(),
             )?,
-            state: buf(rt, &fill(dims.state_elems_per_row(), 35, 0.05))?,
+            state: buf(rt, &common::fill_affine(dims.state_elems_per_row(), 35, 0.05, 0.0))?,
             out: rt.alloc_buffer(b * gdn.value_dim() as usize * 4)?,
             state_out: rt.alloc_buffer(b * dims.state_elems_per_row() * 4)?,
         };
@@ -468,20 +459,20 @@ fn run_paired_gdn_recurrent(rt: &Arc<GpuRuntime>, batches: &[usize]) -> Res<()> 
         for (name, v) in [("cols32", &t32), ("cols16", &t16)] {
             println!(
                 "PAIRED b={b} slice={name} median_us={:.3} min_us={:.3} max_us={:.3}",
-                median(v.clone()),
+                common::median(v.clone())?,
                 lo(v),
                 hi(v)
             );
         }
         println!(
             "PAIRED b={b} ratio_cols16_over_cols32 median={:.4} min={:.4} max={:.4}",
-            median(ratios.clone()),
+            common::median(ratios.clone())?,
             lo(&ratios),
             hi(&ratios)
         );
-        println!("METRIC gdn_rec_b{b}_cols32_us {:.4}", median(t32));
-        println!("METRIC gdn_rec_b{b}_cols16_us {:.4}", median(t16));
-        println!("METRIC gdn_rec_b{b}_ratio_16_over_32 {:.4}", median(ratios));
+        println!("METRIC gdn_rec_b{b}_cols32_us {:.4}", common::median(t32)?);
+        println!("METRIC gdn_rec_b{b}_cols16_us {:.4}", common::median(t16)?);
+        println!("METRIC gdn_rec_b{b}_ratio_16_over_32 {:.4}", common::median(ratios)?);
     }
     Ok(())
 }
@@ -499,13 +490,21 @@ enum Lane {
 /// [`paired_lanes`]' lane labels for `--paired-gate-up`.
 const GATE_UP_LANES: [&str; 2] = ["two_gemms", "packed_gemm"];
 
+/// `((median, min) of a, (median, min) of b, median ratio)` of [`paired_summary`].
+type PairedSummary = ((f64, f64), (f64, f64), f64);
+
 /// `(median, min)` of `samples`, and the median of the per-round ratios
 /// `b[i] / a[i]` (each round times both lanes back to back, so a round's
 /// ratio cancels the drift between rounds).
-fn paired_summary(a: &[f64], b: &[f64]) -> ((f64, f64), (f64, f64), f64) {
-    let stats = |v: &[f64]| (median(v.to_vec()), v.iter().copied().fold(f64::INFINITY, f64::min));
+fn paired_summary(a: &[f64], b: &[f64]) -> Res<PairedSummary> {
+    let stats = |v: &[f64]| -> Res<(f64, f64)> {
+        Ok((
+            common::median(v.to_vec())?,
+            v.iter().copied().fold(f64::INFINITY, f64::min),
+        ))
+    };
     let ratios: Vec<f64> = a.iter().zip(b).map(|(x, y)| y / x).collect();
-    (stats(a), stats(b), median(ratios))
+    Ok((stats(a)?, stats(b)?, common::median(ratios)?))
 }
 
 /// Time `run(lane)` for both lanes, `reps` per command buffer, ABBA over
@@ -544,7 +543,7 @@ fn paired_lanes(
             }
         }
     }
-    let ((a_med, a_min), (b_med, b_min), ratio) = paired_summary(&a, &b);
+    let ((a_med, a_min), (b_med, b_min), ratio) = paired_summary(&a, &b)?;
     for (label, med, min, v) in [(labels[0], a_med, a_min, &a), (labels[1], b_med, b_min, &b)] {
         let max = v.iter().copied().fold(f64::NEG_INFINITY, f64::max);
         println!(
@@ -606,7 +605,8 @@ fn run_paired_gate_up(rt: &Arc<GpuRuntime>, ts: &[usize]) -> Res<()> {
     };
     for &t in ts {
         let x = rt.alloc_tensor_bf16(&[t, HIDDEN])?;
-        x.buffer.write_bf16_bits(&f32_slice_to_bf16(&fill(t * HIDDEN, 53, 1.0)));
+        x.buffer
+            .write_bf16_bits(&f32_slice_to_bf16(&common::fill_affine(t * HIDDEN, 53, 1.0, 0.0)));
         let (g, u) = (rt.alloc_tensor_f32(&[t, INTER])?, rt.alloc_tensor_f32(&[t, INTER])?);
         let gu = rt.alloc_tensor_f32(&[t, 2 * INTER])?;
         let run = |lane: Lane| -> Res<()> {
@@ -760,11 +760,11 @@ struct Stat {
 }
 
 impl Stat {
-    fn of(samples: Vec<f64>) -> Self {
-        Self {
+    fn of(samples: Vec<f64>) -> Res<Self> {
+        Ok(Self {
             min: min_of(&samples),
-            median: median(samples),
-        }
+            median: common::median(samples)?,
+        })
     }
 
     fn tok_s(&self, tokens: usize) -> f64 {
@@ -809,12 +809,12 @@ fn gate(rt: &Arc<GpuRuntime>, model: &Qwen35Model, ids: &[u32]) -> Res<()> {
 fn time_tower(rt: &Arc<GpuRuntime>, model: &Qwen35Model, ids: &[u32], iters: usize) -> Res<Stat> {
     let layers = model.config().layers.len();
     let out = rt.alloc_tensor_f32(&[ids.len(), model.config().hidden as usize])?;
-    Ok(Stat::of(samples_ms(iters, || {
+    Stat::of(samples_ms(iters, || {
         let mut s = model.begin(ids)?;
         s.advance_to(layers)?;
         s.final_norm_f32(&out)?;
         rt.synchronize()
-    })?))
+    })?)
 }
 
 /// All layers and the final norm on a session that is already begun: the
@@ -837,19 +837,19 @@ fn time_layers(rt: &Arc<GpuRuntime>, model: &Qwen35Model, ids: &[u32], iters: us
         rt.synchronize()?;
         samples.push(t0.elapsed().as_secs_f64() * 1e3);
     }
-    Ok(Stat::of(samples))
+    Stat::of(samples)
 }
 
 /// `Qwen35Model::forward_rows(Last)`: the tower plus the head's one row.
 fn time_forward_last(model: &Qwen35Model, ids: &[u32], iters: usize) -> Res<Stat> {
-    Ok(Stat::of(samples_ms(iters, || {
+    Stat::of(samples_ms(iters, || {
         model.forward_rows(ids, LogitRows::Last, false).map(drop)
-    })?))
+    })?)
 }
 
 /// `Qwen35Model::prefill` to the first logits, keeping the decode state.
 fn time_prefill(model: &Qwen35Model, ids: &[u32], max_new: u32, iters: usize) -> Res<Stat> {
-    Ok(Stat::of(samples_ms(iters, || model.prefill(ids, max_new).map(drop))?))
+    Stat::of(samples_ms(iters, || model.prefill(ids, max_new).map(drop))?)
 }
 
 /// One row of the per-part table.
@@ -1116,7 +1116,7 @@ fn run_decode(rt: &Arc<GpuRuntime>, model: &Qwen35Model, prefix_len: usize, o: &
     for _ in 0..DECODE_STEPS {
         samples.push(step(&mut dec)?);
     }
-    let stat = Stat::of(samples);
+    let stat = Stat::of(samples)?;
     // The same steps with the runtime's counters on: per token, what a
     // GPU-resident decode loop would remove.
     infer_trace::set_enabled(true);

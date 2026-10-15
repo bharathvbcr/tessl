@@ -26,16 +26,6 @@ use tessl::nn::gemm_i8_dequant;
 use tessl::runtime::{mtl_size, GpuRuntime, PrecisionMode};
 use tessl::tensor::Tensor;
 
-fn fill(n: usize, seed: u64) -> Vec<f32> {
-    let mut s = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
-    (0..n)
-        .map(|_| {
-            s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-            ((((s >> 32) as u32) as f64 / u32::MAX as f64) * 2.0 - 1.0) as f32
-        })
-        .collect()
-}
-
 struct Variant {
     kernel: &'static str,
     sm: usize,
@@ -162,10 +152,14 @@ fn bench_i8(
     rounds: usize,
 ) -> Result<(), String> {
     const A_SCALE: f32 = 0.01;
-    let int8 =
-        |len: usize, seed: u64| -> Vec<i8> { fill(len, seed).iter().map(|&x| (x * 127.0).round() as i8).collect() };
+    let int8 = |len: usize, seed: u64| -> Vec<i8> {
+        common::fill(len, seed)
+            .iter()
+            .map(|&x| (x * 127.0).round() as i8)
+            .collect()
+    };
     let (a_host, b_host) = (int8(m * k, 1), int8(k * n, 2));
-    let scale_host: Vec<f32> = fill(n, 3).iter().map(|x| 0.5 + x.abs()).collect();
+    let scale_host: Vec<f32> = common::fill(n, 3).iter().map(|x| 0.5 + x.abs()).collect();
     let bytes = |v: &[i8]| v.iter().map(|&x| x as u8).collect::<Vec<u8>>();
     let a = rt.alloc_buffer(m * k)?;
     a.write_bytes(&bytes(&a_host));
@@ -815,8 +809,8 @@ fn main() -> Result<(), String> {
         };
         let a_f = rt.alloc_tensor_f32(&a_shape)?;
         let b_f = rt.alloc_tensor_f32(&b_shape)?;
-        a_f.buffer.write_f32(&fill(a_shape[0] * a_shape[1], 1));
-        b_f.buffer.write_f32(&fill(b_shape[0] * b_shape[1], 2));
+        a_f.buffer.write_f32(&common::fill(a_shape[0] * a_shape[1], 1));
+        b_f.buffer.write_f32(&common::fill(b_shape[0] * b_shape[1], 2));
         let (a, b) = if lane.is_f32() {
             (a_f, b_f)
         } else {

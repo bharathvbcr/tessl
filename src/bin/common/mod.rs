@@ -1,8 +1,19 @@
 //! Shared benchmark utilities.
 //!
-//! `bench_gemm_sweep` and `bench_flash_attn` must draw operands from the same
-//! RNG and honour the same environment contract, or their numbers are not
-//! comparable to each other and a reader has no way to tell. One copy.
+//! One owner for what every benchmark binary must agree on, or their numbers
+//! are not comparable and a reader has no way to tell: the operand RNG
+//! ([`fill`], [`fill_dist`]), the median ([`median`], which refuses an empty or
+//! non-finite sample set), the environment contract ([`env_usize`], which
+//! refuses a malformed or below-minimum count), and the interleaved A/B
+//! statistics ([`run_paired`], [`ratio_stats`], [`self_spread`]). A binary
+//! that needs one adds it here; it does not carry a copy.
+//!
+//! Declared with `mod common;` by (`rg -l '^mod common;' src/bin`):
+//! bench_embedgemma2, bench_flash_attn, bench_gemm_coop_tile,
+//! bench_gemm_routes, bench_gemm_sweep, bench_gemm_tile_tune,
+//! bench_gemm_tnnt_tune, bench_gemm_variants, bench_nn_kernels, bench_paired,
+//! bench_qwen35_layers, bench_qwen35_train, probe_gdn_scan, probe_gemm_bits,
+//! probe_gemm_parity, probe_load_memory.
 //!
 //! Not a `src/bin/*.rs` file: cargo would build it as its own binary. A
 //! directory without `main.rs` is not a target, which is the same trick
@@ -120,6 +131,22 @@ pub fn fill_dist(n: usize, seed: u64, dist: Dist) -> Vec<f32> {
         out.push(v as f32);
     }
     out
+}
+
+/// The uniform [-1, 1) operand fill every bench draws from: `fill_dist` with
+/// [`Dist::Uniform`], the same LCG stream the per-binary copies used.
+pub fn fill(n: usize, seed: u64) -> Vec<f32> {
+    fill_dist(n, seed, Dist::Uniform)
+}
+
+/// [`fill`] mapped through `x * scale + shift`, for operands that are not
+/// centred on zero or are smaller than one.
+pub fn fill_affine(n: usize, seed: u64, scale: f32, shift: f32) -> Vec<f32> {
+    let mut v = fill(n, seed);
+    for x in &mut v {
+        *x = *x * scale + shift;
+    }
+    v
 }
 
 /// Fails rather than returning a number nothing sampled. An empty sample set
@@ -326,7 +353,9 @@ pub fn exit_if_unstable(bin: &str, unstable: &[String]) {
 
 #[cfg(test)]
 mod tests {
-    use super::{median, parse_usize_env_value, ratio_stats, round_order, run_paired, self_spread, Arm};
+    use super::{
+        fill, fill_affine, median, parse_usize_env_value, ratio_stats, round_order, run_paired, self_spread, Arm,
+    };
 
     #[test]
     fn median_rejects_empty_and_non_finite_samples() {
@@ -389,6 +418,22 @@ mod tests {
         assert_eq!((med, lo, hi), (2.0, 1.0, 3.0));
         assert!(ratio_stats(&[1.0], &[1.0, 2.0]).is_err());
         assert!((self_spread(&[1.0, 1.2, 1.1]) - 0.2).abs() < 1e-12);
+    }
+
+    #[test]
+    fn fill_is_the_seeded_uniform_stream_every_bench_used() {
+        let v = fill(4096, 7);
+        assert_eq!(v, fill(4096, 7));
+        assert_ne!(v, fill(4096, 8));
+        assert!(v.iter().all(|x| (-1.0..=1.0).contains(x)));
+        assert!(v.iter().any(|x| *x < -0.5) && v.iter().any(|x| *x > 0.5));
+        // The retired per-binary copies: one LCG step, high 32 bits, mapped to [-1, 1].
+        let mut s = 7u64.wrapping_mul(6364136223846793005).wrapping_add(1);
+        s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        let first = (((s >> 32) as u32) as f64 / (u32::MAX as f64) * 2.0 - 1.0) as f32;
+        assert_eq!(v[0], first);
+        let a = fill_affine(16, 7, 0.5, 2.0);
+        assert!(a.iter().zip(fill(16, 7)).all(|(y, x)| *y == x * 0.5 + 2.0));
     }
 
     #[test]

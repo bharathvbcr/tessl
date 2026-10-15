@@ -50,14 +50,9 @@ use tessl::gemm::{
 use tessl::runtime::{mtl_size, GpuRuntime};
 use tessl::tensor::Tensor;
 
-fn fill(n: usize, seed: u64) -> Vec<f32> {
-    let mut g = common::Lcg::new(seed);
-    (0..n).map(|_| (g.next_u01() * 2.0 - 1.0) as f32).collect()
-}
-
 fn bf16(rt: &Arc<GpuRuntime>, shape: &[usize], seed: u64) -> Result<Tensor, String> {
     let t = rt.alloc_tensor_f32(shape)?;
-    t.buffer.write_f32(&fill(shape.iter().product(), seed));
+    t.buffer.write_f32(&common::fill(shape.iter().product(), seed));
     cast_f32_to_bf16(&t)
 }
 
@@ -238,7 +233,7 @@ impl Elem {
     /// turns the runtime's relaxed precision on.
     fn operand(self, rt: &Arc<GpuRuntime>, shape: &[usize], seed: u64) -> Result<Tensor, String> {
         let t = rt.alloc_tensor_f32(shape)?;
-        t.buffer.write_f32(&fill(shape.iter().product(), seed));
+        t.buffer.write_f32(&common::fill(shape.iter().product(), seed));
         rt.set_relaxed_precision(matches!(self, Elem::Relaxed));
         match self {
             Elem::Bf16 => cast_f32_to_bf16(&t),
@@ -347,8 +342,8 @@ fn epi_lane(rt: &Arc<GpuRuntime>, run: &Run) -> Result<(), String> {
             let a = elem.operand(rt, &[m, k], 0x8a1 ^ (m * n) as u64)?;
             let b = elem.operand(rt, &[k, n], 0x8b2 ^ (n * k) as u64)?;
             let bias = rt.alloc_tensor_f32(&[n])?;
-            bias.buffer.write_f32(&fill(n, 0x8c3));
-            let c0 = fill(m * n, 0x8d4);
+            bias.buffer.write_f32(&common::fill(n, 0x8c3));
+            let c0 = common::fill(m * n, 0x8d4);
             let cs: Vec<Tensor> = (0..3)
                 .map(|_| {
                     let t = rt.alloc_tensor_f32(&[m, n])?;
@@ -504,7 +499,7 @@ fn splitk_lane(rt: &Arc<GpuRuntime>, run: &Run) -> Result<(), String> {
         let b = bf16(rt, &[k, n], 0x5b2 ^ (m * n + k) as u64)?;
         for acc in [false, true] {
             // Outputs, checked against each other before anything is timed.
-            let c0 = fill(m * n, 0x5c3 ^ k as u64);
+            let c0 = common::fill(m * n, 0x5c3 ^ k as u64);
             let fresh = || -> Result<Tensor, String> {
                 let t = rt.alloc_tensor_f32(&[m, n])?;
                 t.buffer.write_f32(&c0);

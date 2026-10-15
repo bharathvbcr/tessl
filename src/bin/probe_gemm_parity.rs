@@ -1,17 +1,9 @@
 //! Decisive check: do the TensorOps and simdgroup GEMM lanes agree bit-for-bit?
 //! Separate C buffers (no reuse), compared in-process against a CPU f64 reference.
+mod common;
+
 use tessl::gemm::{cast_f32_to_bf16, gemm, gemm_f32_cpu, GemmBackend};
 use tessl::runtime::GpuRuntime;
-
-fn fill(n: usize, seed: u64) -> Vec<f32> {
-    let mut s = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
-    (0..n)
-        .map(|_| {
-            s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-            ((((s >> 32) as u32) as f64 / u32::MAX as f64) * 2.0 - 1.0) as f32
-        })
-        .collect()
-}
 
 fn main() -> Result<(), String> {
     let rt = GpuRuntime::new()?;
@@ -20,8 +12,8 @@ fn main() -> Result<(), String> {
     let b = rt.alloc_tensor_f32(&[k, n])?;
     let c_t = rt.alloc_tensor_f32(&[m, n])?;
     let c_s = rt.alloc_tensor_f32(&[m, n])?;
-    let ah = fill(m * k, 1);
-    let bh = fill(k * n, 2);
+    let ah = common::fill(m * k, 1);
+    let bh = common::fill(k * n, 2);
     a.buffer.write_f32(&ah);
     b.buffer.write_f32(&bh);
 

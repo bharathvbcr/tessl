@@ -559,13 +559,14 @@ fn encode_reuses_unzeroed_activations() {
     });
 }
 
-/// With `async_encode` on, an `encode` that runs several forwards queues them
-/// all and waits for the GPU once, not once per forward, and its embeddings
-/// are bit for bit those the same encode gives with the runtime synchronous
-/// (where every dispatch waits and nothing can overlap), with every unzeroed
-/// activation poisoned. Each sequence also still matches itself run alone.
-/// Before, every forward ended in its own `synchronize` and readback, so an
-/// encode of N forwards waited N times however the runtime was set.
+/// An `encode` that runs several forwards queues them all and waits for the
+/// GPU once, not once per forward, and its embeddings are bit for bit those
+/// the same encode gives with the runtime serialized (every dispatch commits
+/// and waits, so nothing can overlap), with every unzeroed activation
+/// poisoned. It does so on a default runtime and with `async_encode` on. Each
+/// sequence also still matches itself run alone. Before, every forward ended
+/// in its own `synchronize` and readback, so an encode of N forwards waited N
+/// times.
 #[test]
 fn multi_forward_encode_waits_once_and_matches_synchronous() {
     let cfg = EmbedGemma2Config::from_config_json(CONFIG).unwrap();
@@ -582,7 +583,9 @@ fn multi_forward_encode_waits_once_and_matches_synchronous() {
     let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
     with_gpu(|rt| {
         let model = EmbedGemma2Model::load(rt, &st, PREFIX, cfg.clone()).unwrap();
+        rt.set_serialized_dispatch(true).unwrap();
         let (sync, t_sync) = traced(|| model.encode(&batch, None, false).unwrap());
+        rt.set_serialized_dispatch(false).unwrap();
         assert!(
             sync.forwards >= 3,
             "test bug: {} forwards, need at least 3",
@@ -590,28 +593,31 @@ fn multi_forward_encode_waits_once_and_matches_synchronous() {
         );
         assert!(
             t_sync.sync_waits >= u64::from(sync.forwards),
-            "test bug: the synchronous encode waited only {} times",
+            "test bug: the serialized encode waited only {} times",
             t_sync.sync_waits
         );
 
-        rt.set_async_encode(true).unwrap();
         rt.set_poison_unzeroed(true);
+        let (default, t_default) = traced(|| model.encode(&batch, None, false));
+        rt.set_async_encode(true).unwrap();
         let (queued, t_async) = traced(|| model.encode(&batch, None, false));
-        rt.set_poison_unzeroed(false);
         rt.set_async_encode(false).unwrap();
-        let queued = queued.unwrap();
+        rt.set_poison_unzeroed(false);
+        let (default, queued) = (default.unwrap(), queued.unwrap());
 
-        assert_eq!(queued.forwards, sync.forwards);
-        assert_eq!(
-            t_async.sync_waits, 1,
-            "{} forwards made {} host waits, want one for the encode",
-            queued.forwards, t_async.sync_waits
-        );
-        assert_eq!(
-            bits(&queued.embeddings),
-            bits(&sync.embeddings),
-            "queueing the forwards changed an embedding"
-        );
+        for (what, out, t) in [("default", &default, t_default), ("async_encode", &queued, t_async)] {
+            assert_eq!(out.forwards, sync.forwards, "{what}");
+            assert_eq!(
+                t.sync_waits, 1,
+                "{what}: {} forwards made {} host waits, want one for the encode",
+                out.forwards, t.sync_waits
+            );
+            assert_eq!(
+                bits(&out.embeddings),
+                bits(&sync.embeddings),
+                "{what}: queueing the forwards changed an embedding"
+            );
+        }
 
         let dim = cfg.embedding_dim as usize;
         for (n, ids) in batch.iter().enumerate() {
@@ -627,6 +633,133 @@ fn multi_forward_encode_waits_once_and_matches_synchronous() {
                 ids.len()
             );
         }
+    });
+}
+
+/// A default runtime (`async_encode` off, as every library caller runs it)
+/// still encodes queued: an `encode` that runs several forwards makes one
+/// waited commit and one host wait, however many dispatches it has, and
+/// leaves the runtime's flag as it found it. Before, `encode` ran every
+/// dispatch commit-and-wait unless the caller had set the runtime's global
+/// flag (84.9 ms against 7.4 ms for 1x16 tokens on an M5 Pro).
+#[test]
+fn default_runtime_encode_queues_and_waits_once() {
+    assert!(
+        std::env::var_os("TESSL_MID_COMMIT").is_none(),
+        "TESSL_MID_COMMIT changes the commit and wait counts"
+    );
+    let cfg = EmbedGemma2Config::from_config_json(CONFIG).unwrap();
+    let w = random_weights(&cfg, 31);
+    let st = open("default_queued", safetensors_bytes(&w, &[]));
+    let seq = |n: u32, s: u32| -> Vec<u32> { (0..n).map(|i| (i * 5 + s * 3 + 1) % cfg.vocab).collect() };
+    let long = seq(4000, 0);
+    let short: Vec<Vec<u32>> = (0..7).map(|s| seq(30, s + 5)).collect();
+    let mut batch: Vec<&[u32]> = vec![&long];
+    batch.extend(short.iter().map(Vec::as_slice));
+    with_gpu(|rt| {
+        let model = EmbedGemma2Model::load(rt, &st, PREFIX, cfg.clone()).unwrap();
+        assert!(
+            !rt.async_encode_enabled(),
+            "test bug: the default runtime is not synchronous"
+        );
+        let _ = model.encode(&batch, None, false).unwrap(); // warm pipelines and pools
+        let (out, t) = traced(|| model.encode(&batch, None, false).unwrap());
+        assert!(out.forwards >= 2, "test bug: {} forwards", out.forwards);
+        assert!(t.dispatches > 50, "test bug: only {} dispatches", t.dispatches);
+        assert_eq!(
+            t.sync_waits, 1,
+            "{} forwards, {} dispatches made {} host waits, want one",
+            out.forwards, t.dispatches, t.sync_waits
+        );
+        assert_eq!(
+            t.commits, 1,
+            "{} dispatches made {} commits, want one command buffer",
+            t.dispatches, t.commits
+        );
+        assert!(!rt.async_encode_enabled(), "encode left the runtime's flag on");
+    });
+}
+
+/// A full batch of 256 ragged sequences, which splits into several forwards,
+/// is one queue: one host wait, a command buffer count bounded by the
+/// runtime's per-buffer dispatch cap (100_000, `METAL4_MAX_DISPATCHES_PER_CB`)
+/// however many dispatches it makes, and the bits of the serialized run. The
+/// per-layer trace of one sequence, which waits at every layer, gives the
+/// same bits queued as serialized. No scope outlives either call.
+#[test]
+fn full_ragged_batch_and_trace_match_serialized_with_bounded_queue() {
+    const CAP: u64 = 100_000;
+    assert!(
+        std::env::var_os("TESSL_MID_COMMIT").is_none(),
+        "TESSL_MID_COMMIT changes the commit and wait counts"
+    );
+    let cfg = EmbedGemma2Config::from_config_json(CONFIG).unwrap();
+    let w = random_weights(&cfg, 41);
+    let st = open("ragged_256", safetensors_bytes(&w, &[]));
+    let mut rng = SplitMix::new(99);
+    let seqs: Vec<Vec<u32>> = (0..256usize)
+        .map(|s| {
+            // Lengths from 1 to 150: some forwards hold many short rows, some a few long.
+            let n = rng.range(1, 150);
+            (0..n).map(|i| ((i * 13 + s * 7 + 1) as u32) % cfg.vocab).collect()
+        })
+        .collect();
+    let batch: Vec<&[u32]> = seqs.iter().map(Vec::as_slice).collect();
+    let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+    with_gpu(|rt| {
+        let model = EmbedGemma2Model::load(rt, &st, PREFIX, cfg.clone()).unwrap();
+        let _ = model.encode(&batch, None, false).unwrap(); // warm pipelines and pools
+        let (queued, t) = traced(|| model.encode(&batch, None, false).unwrap());
+        assert_eq!(rt.async_scope_depth(), 0, "encode leaked a scope");
+        assert!(!rt.async_encode_enabled());
+        assert_eq!(
+            t.sync_waits, 1,
+            "{} forwards made {} host waits",
+            queued.forwards, t.sync_waits
+        );
+        assert!(
+            t.commits <= 1 + t.dispatches / CAP,
+            "{} dispatches made {} command buffers, past the {CAP}-dispatch cap",
+            t.dispatches,
+            t.commits
+        );
+
+        rt.set_serialized_dispatch(true).unwrap();
+        let serial = model.encode(&batch, None, false).unwrap();
+        let serial_trace = model.encode(&batch[..1], None, true).unwrap();
+        rt.set_serialized_dispatch(false).unwrap();
+        // The two runs cut the batch differently (a queued forward costs 67
+        // padded rows, a serialized one 1046), so the same sequence sits in a
+        // different GEMM tiling: equal to within `BATCH_ABS`, not bit for bit.
+        assert!(
+            queued.forwards > serial.forwards,
+            "test bug: queued {} forwards, serialized {}",
+            queued.forwards,
+            serial.forwards
+        );
+        let drift = queued
+            .embeddings
+            .iter()
+            .zip(&serial.embeddings)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            f64::from(drift) <= BATCH_ABS,
+            "256 sequences, queued vs serialized: {drift:.3e}"
+        );
+
+        let traced_out = model.encode(&batch[..1], None, true).unwrap();
+        assert_eq!(rt.async_scope_depth(), 0);
+        assert_eq!(
+            traced_out.trace.len(),
+            cfg.layers.len() + 1,
+            "each layer, then the final norm"
+        );
+        assert_eq!(traced_out.trace.len(), serial_trace.trace.len());
+        for (l, (a, b)) in traced_out.trace.iter().zip(&serial_trace.trace).enumerate() {
+            assert_eq!(bits(a), bits(b), "trace entry {l}, queued vs serialized");
+        }
+        assert_eq!(bits(&traced_out.embeddings), bits(&serial_trace.embeddings));
     });
 }
 
@@ -813,9 +946,11 @@ fn async_multi_forward_truncated_shuffled_and_repeated_stay_bitwise() {
         let model = EmbedGemma2Model::load(rt, &st, PREFIX, cfg.clone()).unwrap();
         let dim = cfg.embedding_dim as usize;
         let trunc = Some(cfg.embedding_dim / 2);
+        rt.set_serialized_dispatch(true).unwrap();
         let sync_full = model.encode(&batch, None, false).unwrap();
         let sync_trunc = model.encode(&batch, trunc, false).unwrap();
         let sync_small = model.encode(&small, None, false).unwrap();
+        rt.set_serialized_dispatch(false).unwrap();
         assert!(sync_full.forwards >= 3, "test bug: {} forwards", sync_full.forwards);
 
         rt.set_async_encode(true).unwrap();

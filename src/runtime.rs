@@ -540,6 +540,20 @@ struct BumpState {
     capacity: usize,
 }
 
+/// Keeps [`GpuRuntime::async_scope`]'s batching on until it is dropped. It
+/// only decrements the runtime's scope counter: waiting is the caller's, with
+/// its result, before the drop.
+#[must_use = "the scope ends when the guard is dropped"]
+pub struct AsyncScope<'a> {
+    rt: &'a GpuRuntime,
+}
+
+impl Drop for AsyncScope<'_> {
+    fn drop(&mut self) {
+        self.rt.async_scopes.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
 /// Shared GPU runtime (Metal 4 encode required).
 /// Exclusive CPU/GPU access lease. Busy/reentrant access fails instead of blocking.
 pub(crate) struct RuntimeAccess(Arc<AtomicBool>);
@@ -718,6 +732,12 @@ pub struct GpuRuntime {
     has_tensorops: bool,
     /// When true, kernels accumulate into one CB until [`Self::synchronize`] / [`Self::commit`].
     async_encode: AtomicBool,
+    /// Open [`AsyncScope`]s. While nonzero, dispatches batch as if
+    /// `async_encode` were on, without touching that flag.
+    async_scopes: AtomicUsize,
+    /// When true, every dispatch commits and waits, whatever `async_encode`
+    /// and the open scopes say ([`Self::set_serialized_dispatch`]).
+    serialized: AtomicBool,
     active_m4: Mutex<Option<ActiveMetal4Batch>>,
     /// Last CounterHeap (t0, t1) resolved at synchronize.
     last_m4_stamps: Mutex<Option<(u64, u64)>>,
@@ -989,6 +1009,8 @@ impl GpuRuntime {
             bump: Mutex::new(None),
             has_tensorops,
             async_encode: AtomicBool::new(false),
+            async_scopes: AtomicUsize::new(0),
+            serialized: AtomicBool::new(false),
             active_m4: Mutex::new(None),
             last_m4_stamps: Mutex::new(None),
             dispatch_count: AtomicUsize::new(0),
@@ -1523,8 +1545,73 @@ impl GpuRuntime {
         Ok(())
     }
 
+    /// The runtime-wide flag [`Self::set_async_encode`] sets, and nothing
+    /// else: a dispatch can still batch because a scope is open
+    /// ([`Self::dispatch_batching`] is the effective answer).
     pub fn async_encode_enabled(&self) -> bool {
         self.async_encode.load(Ordering::Acquire)
+    }
+
+    /// Queue this runtime's dispatches until the guard's scope ends, then let
+    /// the caller wait once ([`Self::synchronize`]), without touching
+    /// [`Self::set_async_encode`]'s flag. The way a library call
+    /// (`EmbedGemma2Model::encode`) gets the queued path whatever the caller
+    /// configured; storing and restoring the flag instead would clobber the
+    /// caller's setting if anything else changed it while the call ran.
+    ///
+    /// While any scope is open every dispatch on this runtime batches, not
+    /// only the opener's: the runtime is `!Send` and `!Sync`, so that is
+    /// the opener's own thread, and only code the opener runs (or calls back
+    /// into) while the guard is alive. Such a dispatch is encoded into the
+    /// open command buffer and is *not* waited for. A host mapping
+    /// (`try_contents_*`, `try_write_*`) and `synchronize` still commit
+    /// and wait for everything queued first, so a readback is correct
+    /// inside a scope; each ends that command buffer, not the scope, and the
+    /// next dispatch opens another. Scopes nest (a counter, not a flag), the
+    /// guard decrements on every exit including an error return or an unwind,
+    /// and a poisoned runtime refuses dispatches inside a scope as outside.
+    ///
+    /// Dropping the guard does not wait: it cannot return an error, and on
+    /// an unwind the runtime is already poisoned and its open batch aborted.
+    /// The caller waits (and propagates the result) before it drops the guard
+    /// or reads anything the queued work writes, and keeps every buffer the
+    /// queued work binds alive until then (Metal 4 command buffers do not
+    /// retain what they bind). A batch left open by an early return is
+    /// committed by the next synchronous dispatch or host access.
+    ///
+    /// The per-command-buffer dispatch cap (100,000, committed without a
+    /// wait) and the const-arena reclaim bound a scope's growth exactly as
+    /// they bound `set_async_encode(true)`'s.
+    #[must_use = "the scope ends when the guard is dropped"]
+    pub fn async_scope(&self) -> AsyncScope<'_> {
+        self.async_scopes.fetch_add(1, Ordering::AcqRel);
+        AsyncScope { rt: self }
+    }
+
+    /// Scopes opened by [`Self::async_scope`] and not yet dropped.
+    pub fn async_scope_depth(&self) -> usize {
+        self.async_scopes.load(Ordering::Acquire)
+    }
+
+    /// Whether a dispatch now is queued rather than committed and waited for:
+    /// the `async_encode` flag or an open [`AsyncScope`], unless dispatches
+    /// are serialized.
+    pub fn dispatch_batching(&self) -> bool {
+        !self.serialized.load(Ordering::Acquire) && (self.async_encode_enabled() || self.async_scope_depth() > 0)
+    }
+
+    /// Make every dispatch commit and wait, overriding `async_encode` and
+    /// any open [`AsyncScope`]: no two dispatches overlap on the GPU. A
+    /// reference mode, for checking that a queued run (whose consecutive
+    /// dispatches and command buffers rely on the runtime's barriers) gives
+    /// the bits of a run where nothing can overlap, and for bisecting a
+    /// suspected hazard. Turning it on first waits for queued work.
+    pub fn set_serialized_dispatch(&self, on: bool) -> Result<(), String> {
+        if on {
+            self.synchronize()?;
+        }
+        self.serialized.store(on, Ordering::Release);
+        Ok(())
     }
 
     pub fn take_dispatch_count(&self) -> usize {
@@ -1948,8 +2035,7 @@ impl GpuRuntime {
         // command buffer began, just before committing it (see
         // `flush_residency_for_open_cb`). Flushing per dispatch committed the
         // set once per allocation-then-dispatch, hundreds of times a step.
-        let async_on = self.async_encode_enabled();
-        if async_on {
+        if self.dispatch_batching() {
             if let Err(error) = self.encode_into_batch_m4(skip_auto, false, f) {
                 self.poison_on_failure(error.as_str());
                 return Err(error);
@@ -2165,17 +2251,10 @@ impl GpuRuntime {
         // One autorelease pool per CB commit drains transient ObjC objects from
         // argument-table / encoder traffic that would otherwise accumulate.
         autoreleasepool(|_| {
-            let was_async = self.async_encode_enabled();
-            if !was_async {
-                self.async_encode.store(true, Ordering::Release);
-            }
             let result = (|| {
                 self.encode_into_batch_m4(skip_auto, true, f)?;
                 self.commit_m4(true)
             })();
-            if !was_async {
-                self.async_encode.store(false, Ordering::Release);
-            }
             self.dispatch_count.fetch_add(1, Ordering::Relaxed);
             result
         })

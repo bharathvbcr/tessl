@@ -676,16 +676,17 @@ pub const PLE_RUN_BYTES: usize = 256 << 20;
 /// tokens, min of 5 rounds, an ordinary least squares fit over the 8 shapes)
 /// on an M5 Pro with the real checkpoint.
 ///
-/// With `async_encode` off, as every library caller runs (each dispatch
-/// commits and waits), it is `54.9 ms + 0.0525 ms/row`, so
+/// Measured with every dispatch committing and waiting (what `encode` ran
+/// before it opened a [`GpuRuntime::async_scope`], and what a runtime set to
+/// serialize its dispatches still runs) it is `54.9 ms + 0.0525 ms/row`, so
 /// [`FORWARD_COST_ROWS_SYNC`] is 1046. The fixed part is a forward's
 /// dispatches each committing and waiting (inferred from the size of the gap
 /// to the queued fit).
 ///
-/// With it on (the forwards queue and the host waits once) it is `3.42 ms +
-/// 0.0515 ms/row`, so [`FORWARD_COST_ROWS_ASYNC`] is 67. The fixed part is
-/// what a forward costs however few rows it has, most likely re-reading the
-/// f32 weights (inferred, not separately measured).
+/// With the forwards queued and one host wait, as `encode` runs them, it is
+/// `3.42 ms + 0.0515 ms/row`, so [`FORWARD_COST_ROWS_ASYNC`] is 67. The fixed
+/// part is what a forward costs however few rows it has, most likely
+/// re-reading the f32 weights (inferred, not separately measured).
 ///
 /// The data and the fits are `bench/results/embedgemma2_forward_cost_m5pro.json`
 /// (residuals within 2.2 ms of the queued fit, 6.8 ms of the synchronous
@@ -939,6 +940,15 @@ impl EmbedGemma2Model {
     /// programming) that minimize padded rows plus a fixed per-forward cost,
     /// so one long document does not pad every short query to its length.
     /// `trace` (per-layer residuals, for parity tests) takes one sequence.
+    ///
+    /// The forwards' dispatches are queued and waited for once, on a runtime
+    /// whatever its [`GpuRuntime::set_async_encode`] flag says: `encode` opens
+    /// a [`GpuRuntime::async_scope`] and leaves the flag as it found it. The
+    /// runtime is single-threaded, so no other caller dispatches on it while
+    /// `encode` runs; work the caller queued before the call is waited for by
+    /// `encode`'s own wait. A runtime set to serialize its dispatches
+    /// ([`GpuRuntime::set_serialized_dispatch`]) still commits and waits for
+    /// each.
     pub fn encode(&self, batch: &[&[u32]], truncate_dim: Option<u32>, trace: bool) -> Result<EncodeOutput, String> {
         const WHAT: &str = "EmbedGemma2Model::encode";
         let cfg = &self.cfg;
@@ -987,7 +997,13 @@ impl EmbedGemma2Model {
         let mut embeddings = vec![0.0f32; batch.len() * dim];
         let mut out_trace = Vec::new();
         let mut forwards = 0u32;
-        let cost = if self.rt.async_encode_enabled() {
+        // Queue every dispatch and wait once, whatever the caller set
+        // ([`GpuRuntime::async_scope`] leaves the runtime's `async_encode`
+        // flag alone). Opened before the cost is chosen, which is what a
+        // dispatch costs under it. It ends after the wait below, so a failed
+        // forward or a panic ends it too.
+        let scope = self.rt.async_scope();
+        let cost = if self.rt.dispatch_batching() {
             FORWARD_COST_ROWS_ASYNC
         } else {
             FORWARD_COST_ROWS_SYNC
@@ -1006,10 +1022,9 @@ impl EmbedGemma2Model {
         // after forward n's last read of them, the same order of dependent
         // dispatches (the runtime barriers each against the one before, and
         // each command buffer against the queue) that one forward's layers
-        // already rely on for `resid`. Whether the GPU then runs ahead of the
-        // host encoding the next forward depends on the runtime's
-        // `async_encode`, which the caller owns: with it off every dispatch
-        // still commits and waits.
+        // already rely on for `resid`. The GPU runs ahead of the host
+        // encoding the next forward because of the scope above; only a runtime
+        // set to serialize its dispatches commits and waits for each.
         let mut pending: Vec<(Vec<usize>, ForwardIo)> = Vec::with_capacity(chunks.len());
         let queued = queue_forwards(
             chunks,
@@ -1030,6 +1045,7 @@ impl EmbedGemma2Model {
         // it) and `acts` must outlive every command already queued on them (Metal 4 command
         // buffers do not retain what they bind).
         let waited = self.rt.synchronize();
+        drop(scope);
         queued?;
         waited?;
         for (chunk, io) in &pending {

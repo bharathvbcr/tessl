@@ -351,3 +351,197 @@ fn duplicate_and_inconsistent_names_are_refused_at_open() {
         assert!(err.contains(needle), "{text}: {err}");
     }
 }
+
+// ---- adversarial additions (wave-7 tester) ----
+
+/// Every tensor of the fixture split over `n` shards, round-robin from the
+/// back so neither the shard order nor the tensor order is alphabetical.
+fn write_interleaved(dir: &Path, n: usize) {
+    let all = fixture_entries();
+    let mut shards: Vec<Vec<Entry>> = vec![Vec::new(); n];
+    for (i, e) in all.into_iter().rev().enumerate() {
+        shards[(i * 7 + 1) % n].push(e);
+    }
+    // Shard file names run opposite to the shard numbering.
+    let file = |i: usize| format!("part-{:03}.safetensors", n - i);
+    let mut map: Vec<(String, String)> = Vec::new();
+    for (i, s) in shards.iter().enumerate() {
+        write_st(&dir.join(file(i)), s);
+        map.extend(s.iter().map(|e| (e.0.clone(), file(i))));
+    }
+    let pairs: Vec<(&str, &str)> = map.iter().map(|(a, b)| (a.as_str(), b.as_str())).collect();
+    std::fs::write(dir.join(INDEX_FILE_NAME), index_text(&pairs)).unwrap();
+}
+
+#[test]
+fn three_interleaved_shards_load_bit_identically_f32_bf16_and_tower() {
+    let _g = common::gpu_lock();
+    let sc = Scratch::new("three");
+    write_interleaved(&sc.0, 3);
+    let view = CheckpointView::open(&sc.0).unwrap();
+    assert_eq!(view.shard_count(), 3);
+    let single = SafeTensors::open(&fixture().join("model.safetensors")).unwrap();
+    let rt = GpuRuntime::new().unwrap();
+    for precision in [Precision::F32, Precision::Bf16] {
+        for tower in [false, true] {
+            let go = |st: &dyn TensorSource| {
+                if tower {
+                    Qwen35Model::load_tower(&rt, st, "model.", tiny_config(), precision)
+                } else {
+                    Qwen35Model::load(&rt, st, "model.", tiny_config(), precision)
+                }
+            };
+            let (a, b) = (go(&single), go(&view));
+            // Same verdict (Ok/Err and message) through either source.
+            assert_eq!(a.is_ok(), b.is_ok(), "{precision:?} tower={tower}");
+            let (Ok(a), Ok(b)) = (a, b) else { continue };
+            for (i, p) in a.parameter_table().unwrap().iter().enumerate() {
+                let n: usize = p.shape.iter().product();
+                let (mut x, mut y) = (vec![0f32; n], vec![0f32; n]);
+                a.read_parameter_host(i, &mut x).unwrap();
+                b.read_parameter_host(i, &mut y).unwrap();
+                assert!(
+                    x.iter().zip(&y).all(|(p, q)| p.to_bits() == q.to_bits()),
+                    "{precision:?} tower={tower} {}",
+                    p.name
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn hostile_index_shapes_are_named_errors() {
+    let sc = Scratch::new("shapes");
+    write_split(&sc.0, None);
+    let index = sc.0.join(INDEX_FILE_NAME);
+    for text in [
+        r#"{"weight_map":[]}"#,
+        r#"{"weight_map":null}"#,
+        r#"{"weight_map":"x"}"#,
+        r#"{"weight_map":{"a":null}}"#,
+        r#"{"weight_map":{"a":["f"]}}"#,
+        r#"{"weight_map":{"a":{"b":"f"}}}"#,
+        r#"{"weight_map":{"a":"f"},"metadata":"x"}"#,
+        r#"{"weight_map":{"a":"f"},"metadata":{"total_size":-1}}"#,
+        r#"{"weight_map":{"a":"f"},"metadata":{"total_size":1e400}}"#,
+        r#"{"weight_map":{"a":"f"}} trailing"#,
+        "\u{feff}{\"weight_map\":{\"a\":\"f\"}}",
+        r#"{"weight_map":{"a":"f"},"weight_map":{"a":"f"}}"#,
+        r#"{"weight_map":{"a":"f.safetensors\u0000"}}"#,
+        "",
+        "{",
+    ] {
+        std::fs::write(&index, text).unwrap();
+        let err = open_err(&sc.0);
+        assert!(!err.is_empty(), "{text}");
+    }
+    // A lying metadata.total_size is only metadata.
+    let map = write_split(&sc.0, None);
+    let pairs: Vec<(&str, &str)> = map.iter().map(|(n, f)| (n.as_str(), *f)).collect();
+    let lying = index_text(&pairs).replace("\"total_size\":1", "\"total_size\":18446744073709551615");
+    std::fs::write(&index, lying).unwrap();
+    CheckpointView::open(&sc.0).expect("total_size is advisory");
+}
+
+#[test]
+fn awkward_but_bare_shard_names_load_literally() {
+    let sc = Scratch::new("awkward");
+    let all = fixture_entries();
+    let names = ["sp ace.safetensors", "trail \n.safetensors", "caf\u{e9}-\u{4e2d}.safetensors"];
+    let mut map: Vec<(String, String)> = Vec::new();
+    let mut shards: Vec<Vec<Entry>> = vec![Vec::new(); 3];
+    for (i, e) in all.into_iter().enumerate() {
+        shards[i % 3].push(e);
+    }
+    for (f, s) in names.iter().zip(&shards) {
+        write_st(&sc.0.join(f), s);
+        map.extend(s.iter().map(|e| (e.0.clone(), f.to_string())));
+    }
+    let pairs: Vec<(&str, &str)> = map.iter().map(|(a, b)| (a.as_str(), b.as_str())).collect();
+    std::fs::write(sc.0.join(INDEX_FILE_NAME), index_text(&pairs)).unwrap();
+    assert_eq!(CheckpointView::open(&sc.0).unwrap().shard_count(), 3);
+}
+
+#[test]
+fn one_file_under_two_spellings_is_refused_not_double_counted() {
+    // macOS volumes are case-insensitive: `Model.safetensors` and
+    // `model.safetensors` open the same file. Two weight_map files that are
+    // one inode must not pass as two shards (every tensor is then "in both").
+    let sc = Scratch::new("case");
+    let all = fixture_entries();
+    write_st(&sc.0.join("model.safetensors"), &all);
+    let mut pairs: Vec<(&str, &str)> = Vec::new();
+    for (i, e) in all.iter().enumerate() {
+        pairs.push((&e.0, if i % 2 == 0 { "Model.safetensors" } else { "model.safetensors" }));
+    }
+    std::fs::write(sc.0.join(INDEX_FILE_NAME), index_text(&pairs)).unwrap();
+    let on_ci_fs = std::fs::metadata(sc.0.join("Model.safetensors")).is_ok();
+    if !on_ci_fs {
+        return; // case-sensitive volume: Model.safetensors is simply missing.
+    }
+    let err = open_err(&sc.0);
+    assert!(!err.is_empty());
+}
+
+#[test]
+fn a_huge_index_is_refused_quickly() {
+    let sc = Scratch::new("huge");
+    write_split(&sc.0, None);
+    let body: Vec<String> = (0..300_000).map(|i| format!("\"t{i}\":\"model-00001-of-00002.safetensors\"")).collect();
+    std::fs::write(
+        sc.0.join(INDEX_FILE_NAME),
+        format!("{{\"weight_map\":{{{}}}}}", body.join(",")),
+    )
+    .unwrap();
+    let t = std::time::Instant::now();
+    let err = open_err(&sc.0);
+    assert!(t.elapsed().as_secs() < 10, "{:?}: {err}", t.elapsed());
+    assert!(err.contains("t0") || err.contains("no such tensor") || err.contains("cap"), "{err}");
+}
+
+#[test]
+fn directory_with_both_an_index_and_a_model_file_follows_the_index() {
+    let sc = Scratch::new("both");
+    write_split(&sc.0, None);
+    std::fs::copy(fixture().join("model.safetensors"), sc.0.join("model.safetensors")).unwrap();
+    assert_eq!(CheckpointView::open(&sc.0).unwrap().shard_count(), 2);
+    // A broken index is not papered over by falling back to model.safetensors.
+    std::fs::write(sc.0.join(INDEX_FILE_NAME), "{").unwrap();
+    open_err(&sc.0);
+    // Nor is a dangling-symlink index.
+    std::fs::remove_file(sc.0.join(INDEX_FILE_NAME)).unwrap();
+    std::os::unix::fs::symlink("nowhere", sc.0.join(INDEX_FILE_NAME)).unwrap();
+    open_err(&sc.0);
+}
+
+#[test]
+fn a_directory_without_index_or_model_file_is_a_named_error() {
+    let sc = Scratch::new("empty-dir");
+    let err = open_err(&sc.0);
+    assert!(err.contains("model.safetensors"), "{err}");
+    let err = open_err(Path::new(""));
+    assert!(!err.is_empty());
+}
+
+#[test]
+fn many_distinct_shards_that_exhaust_fds_fail_named_and_release() {
+    // Run under a low `ulimit -n` to exercise exhaustion; with the default
+    // limit it just checks that 400 shards open and every handle is retained.
+    let sc = Scratch::new("fds");
+    let mut pairs: Vec<(String, String)> = Vec::new();
+    for i in 0..400 {
+        let f = format!("s{i:04}.safetensors");
+        let n = format!("t{i}");
+        write_st(&sc.0.join(&f), &[(n.clone(), Dtype::F32, vec![1], vec![0u8; 4])]);
+        pairs.push((n, f));
+    }
+    let p: Vec<(&str, &str)> = pairs.iter().map(|(a, b)| (a.as_str(), b.as_str())).collect();
+    std::fs::write(sc.0.join(INDEX_FILE_NAME), index_text(&p)).unwrap();
+    match CheckpointView::open(&sc.0) {
+        Ok(v) => assert_eq!(v.shard_count(), 400),
+        Err(e) => assert!(e.contains("s0") && e.to_lowercase().contains("too many open files"), "{e}"),
+    }
+    // Nothing leaked: the process can still open files.
+    CheckpointView::open(&fixture().join("model.safetensors")).unwrap();
+}

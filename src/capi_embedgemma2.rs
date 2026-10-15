@@ -372,5 +372,5 @@ pub unsafe extern "C" fn tessl_embedgemma2_encode(
 #[doc(hidden)]
 pub unsafe fn test_embedgemma2_model<'a>(model: *const TesslEmbedGemma2) -> &'a EmbedGemma2Model {
     // SAFETY: live by the contract.
-    &unsafe { &*model }.model
+    unsafe { &(*model).model }
 }

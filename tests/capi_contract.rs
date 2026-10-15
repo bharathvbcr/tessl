@@ -1791,10 +1791,7 @@ const EG2_FNS: [&str; 6] = [
 fn every_embedgemma2_c_function_is_declared_in_python_with_the_same_arity_and_widths() {
     let (rust, py) = eg2_abi();
     // A parser that quietly found nothing would pass vacuously.
-    assert_eq!(
-        rust.fns.keys().map(String::as_str).collect::<Vec<_>>().len(),
-        EG2_FNS.len()
-    );
+    assert_eq!(rust.fns.len(), EG2_FNS.len());
     for name in EG2_FNS {
         assert!(rust.fns.contains_key(name), "{name} not parsed from {RS_EG2}");
         assert!(py.fns.contains_key(name), "{name} not parsed from {PY_EG2}");
@@ -1849,15 +1846,14 @@ fn an_embedgemma2_signature_that_drifts_on_either_side_is_reported() {
     );
     assert!(mentions(&p, "tessl_embedgemma2_encode: argument 4 `n_seqs`"), "{p:?}");
     let p = fn_problems(
-        &parse_rust_abi(&fault(
-            &rs_src,
-            "    truncate_dim: u32,\n",
-            "    truncate_dim: u64,\n",
-        )),
+        &parse_rust_abi(&fault(&rs_src, "    truncate_dim: u32,\n", "    truncate_dim: u64,\n")),
         &py,
         &[],
     );
-    assert!(mentions(&p, "tessl_embedgemma2_encode: argument 5 `truncate_dim`"), "{p:?}");
+    assert!(
+        mentions(&p, "tessl_embedgemma2_encode: argument 5 `truncate_dim`"),
+        "{p:?}"
+    );
 
     // An export with no declaration, and a declaration with no export.
     let phantom = "pub unsafe extern \"C\" fn tessl_embedgemma2_phantom(x: u32) -> i32 { 0 }";

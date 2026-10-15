@@ -8,6 +8,27 @@ All notable changes to `tessl` are recorded here. The format follows
 
 ### Added
 
+- **EmbeddingGemma 2's multimodal merge** (`EmbedGemma2Model::encode_multimodal`,
+  `MmSequence`, `EmbedGemma2Config::{image_sequence, audio_sequence,
+  special_tokens}`, `SpecialTokens`, `MmTokens`; audit gap G8, the part that
+  does not need a tower). A sequence's soft tokens (`[n, hidden]` f32, the
+  towers' 512-wide outputs) replace, in order and unscaled, the rows of its
+  image, video and audio placeholder ids, which are embedded as
+  `pad_token_id` through the scaled table first, before the per-layer inputs
+  and the residual stream are formed: what `EmbeddingGemma2Model.forward`
+  does. `encode` is the special case with no soft rows and shares the
+  batching, packing and queueing (one host wait per call); the scatter is
+  `qwen35_bwd::copy_cols`, one flat copy per run of consecutive placeholder
+  rows, so there is no new kernel. A missing id, a ragged or non-finite
+  `soft`, or a soft-row count different from the placeholder count is
+  refused before any GPU work. The config now keeps the special token ids
+  (a text-only config still loads). Held to sentence-transformers' image and
+  audio embeddings from golden soft tokens (`tests/embedgemma2_mm_model.rs`,
+  opt-in; fp32 embeddings within 2.1e-7 max abs, bf16 cosine 0.999995 or
+  better against fp32) and to an f64 forward with an `inputs_embeds`
+  override (`tests/embedgemma2_mm_tiny.rs`). The f64 host forward and its
+  bounds moved from `tests/embedgemma2_tiny.rs` to `tests/common/embedgemma2.rs`
+  to be shared. The C and Python entries still embed text only.
 - **A bf16-operand EmbeddingGemma 2** (`EmbedGemma2Model::load_with(.., GemmOperands::Bf16)`,
   `operands`, `weight_bytes`; `load` stays `ExactF32`, bit-for-bit unchanged).
   The projections stay bf16 on the device (517 MiB of weights against 778 MiB

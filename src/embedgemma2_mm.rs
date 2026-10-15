@@ -44,7 +44,7 @@
 //! Everything a call can be refused for is checked before the first
 //! allocation or dispatch: the towers' input checks
 //! ([`EmbedGemma2VisionModel::check_images`], [`EmbedGemma2Audio::check_clips`]),
-//! the text side's ([`EmbedGemma2Model::check_sequences`]: lengths, ids,
+//! the text side's (`EmbedGemma2Model::check_sequences`: lengths, ids,
 //! `truncate_dim`, the batch size) and the facade's own (placeholder counts
 //! against soft-token counts). A refused call allocates nothing and waits for
 //! nothing. Media are numbered across the call in item order in the towers'

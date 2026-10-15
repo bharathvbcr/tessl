@@ -17,8 +17,8 @@ MANIFEST.json) is read from the committed .npy, never drawn from
 builds (a rerun on another build moved 16 of 18 files by an ulp-scale input
 change), and a golden that moves with the generator's RNG is not a golden. What
 this script rewrites is the goldens, which move only by the arithmetic of the
-installed torch (measured: at most ~7.8e-7 relative to the file's peak across
-builds). The goldens are therefore reproducible to ~1e-6 across torch versions,
+installed torch (measured: 2.6e-7 of the file's peak for the build that wrote the
+first fixtures versus torch 2.14.1, 7.8e-7 for the worst build pair seen). The goldens are therefore reproducible to ~1e-6 across torch versions,
 not bit-for-bit. The gate inputs are drawn
 once, by `--init-gate-inputs`, from numpy's `default_rng`, and stored like the rest.
 

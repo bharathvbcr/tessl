@@ -1288,6 +1288,11 @@ impl EmbedGemma2Model {
         &self.cfg
     }
 
+    /// The runtime this model was loaded on.
+    pub(crate) fn runtime(&self) -> &Arc<GpuRuntime> {
+        &self.rt
+    }
+
     /// The operand precision this model was loaded with.
     pub fn operands(&self) -> GemmOperands {
         self.operands
@@ -1415,6 +1420,78 @@ impl EmbedGemma2Model {
         self.encode_impl(WHAT, batch, Some(tokens), truncate_dim, trace)
     }
 
+    /// Everything about a batch of id sequences that [`Self::encode`] and
+    /// [`Self::encode_multimodal`] refuse before any GPU work, without
+    /// allocating or waiting: `truncate_dim` in range, a non-empty batch of at
+    /// most [`MAX_BATCH`] sequences, `trace` only for one, exact-f32 GEMMs when
+    /// loaded `ExactF32`, `pad_token_id` inside the vocabulary (`tokens` given),
+    /// and for each sequence: non-empty, at most [`Self::max_tokens`], every
+    /// id inside the vocabulary (a placeholder id is exempt when `tokens` is
+    /// given, since it is never looked up). Returns each sequence's count of
+    /// placeholder ids (zero for all when `tokens` is `None`), which the
+    /// caller matches against its soft rows. The multimodal composition
+    /// ([`crate::embedgemma2_mm`]) runs this before it queues a tower.
+    pub(crate) fn check_sequences(
+        &self,
+        what: &str,
+        ids: &[&[u32]],
+        tokens: Option<MmTokens>,
+        truncate_dim: Option<u32>,
+        trace: bool,
+    ) -> Result<Vec<usize>, String> {
+        let cfg = &self.cfg;
+        let dim_out = truncate_dim.unwrap_or(cfg.embedding_dim);
+        if dim_out == 0 || dim_out > cfg.embedding_dim {
+            return Err(format!(
+                "{what}: truncate_dim {dim_out} must be in 1..={}",
+                cfg.embedding_dim
+            ));
+        }
+        if ids.is_empty() {
+            return Err(format!("{what}: empty batch"));
+        }
+        if ids.len() > MAX_BATCH {
+            return Err(format!(
+                "{what}: {} sequences exceeds the batch limit {MAX_BATCH}",
+                ids.len()
+            ));
+        }
+        if trace && ids.len() != 1 {
+            return Err(format!("{what}: trace takes one sequence, got {}", ids.len()));
+        }
+        if self.operands == GemmOperands::ExactF32 && self.rt.f32_gemm_runs_relaxed() {
+            return Err(format!(
+                "{what}: the forward needs exact-f32 GEMMs; switch the runtime's relaxed precision off"
+            ));
+        }
+        if let Some(t) = &tokens {
+            if t.pad >= cfg.vocab {
+                return Err(format!("{what}: pad_token_id {} >= vocab {}", t.pad, cfg.vocab));
+            }
+        }
+        // A placeholder is looked up as the pad id, so only the other ids are
+        // bounded by the vocabulary.
+        let is_ph = |id: u32| tokens.is_some_and(|t| t.is_placeholder(id));
+        let mut placeholders = Vec::with_capacity(ids.len());
+        for (b, seq) in ids.iter().enumerate() {
+            if seq.is_empty() {
+                return Err(format!("{what}: sequence {b} is empty"));
+            }
+            if seq.len() > self.max_tokens as usize {
+                return Err(format!(
+                    "{what}: sequence {b} has {} tokens; the limit is {} (truncate it, or raise it with set_max_tokens)",
+                    seq.len(),
+                    self.max_tokens
+                ));
+            }
+            if let Some(&bad) = seq.iter().find(|&&id| id >= cfg.vocab && !is_ph(id)) {
+                return Err(format!("{what}: sequence {b}: token id {bad} >= vocab {}", cfg.vocab));
+            }
+            placeholders.push(seq.iter().filter(|&&id| is_ph(id)).count());
+        }
+        Ok(placeholders)
+    }
+
     /// The batching, packing and queueing of [`Self::encode`] and
     /// [`Self::encode_multimodal`] (`tokens`: `Some` for the latter, whose
     /// placeholders and soft rows it then checks and applies; `None` for the
@@ -1429,53 +1506,10 @@ impl EmbedGemma2Model {
     ) -> Result<EncodeOutput, String> {
         let cfg = &self.cfg;
         let hidden = cfg.hidden as usize;
+        let ids: Vec<&[u32]> = batch.iter().map(|s| s.ids).collect();
+        let placeholders = self.check_sequences(what, &ids, tokens, truncate_dim, trace)?;
         let dim_out = truncate_dim.unwrap_or(cfg.embedding_dim);
-        if dim_out == 0 || dim_out > cfg.embedding_dim {
-            return Err(format!(
-                "{what}: truncate_dim {dim_out} must be in 1..={}",
-                cfg.embedding_dim
-            ));
-        }
-        if batch.is_empty() {
-            return Err(format!("{what}: empty batch"));
-        }
-        if batch.len() > MAX_BATCH {
-            return Err(format!(
-                "{what}: {} sequences exceeds the batch limit {MAX_BATCH}",
-                batch.len()
-            ));
-        }
-        if trace && batch.len() != 1 {
-            return Err(format!("{what}: trace takes one sequence, got {}", batch.len()));
-        }
-        if self.operands == GemmOperands::ExactF32 && self.rt.f32_gemm_runs_relaxed() {
-            return Err(format!(
-                "{what}: the forward needs exact-f32 GEMMs; switch the runtime's relaxed precision off"
-            ));
-        }
-        if let Some(t) = &tokens {
-            if t.pad >= cfg.vocab {
-                return Err(format!("{what}: pad_token_id {} >= vocab {}", t.pad, cfg.vocab));
-            }
-        }
         for (b, s) in batch.iter().enumerate() {
-            let ids = s.ids;
-            if ids.is_empty() {
-                return Err(format!("{what}: sequence {b} is empty"));
-            }
-            if ids.len() > self.max_tokens as usize {
-                return Err(format!(
-                    "{what}: sequence {b} has {} tokens; the limit is {} (truncate it, or raise it with set_max_tokens)",
-                    ids.len(),
-                    self.max_tokens
-                ));
-            }
-            // A placeholder is looked up as the pad id, so only the other ids
-            // are bounded by the vocabulary.
-            let is_ph = |id: u32| tokens.is_some_and(|t| t.is_placeholder(id));
-            if let Some(&bad) = ids.iter().find(|&&id| id >= cfg.vocab && !is_ph(id)) {
-                return Err(format!("{what}: sequence {b}: token id {bad} >= vocab {}", cfg.vocab));
-            }
             if s.soft.len() % hidden != 0 {
                 return Err(format!(
                     "{what}: sequence {b}: {} soft values is not a multiple of hidden {hidden}",
@@ -1490,10 +1524,10 @@ impl EmbedGemma2Model {
                     i % hidden
                 ));
             }
-            let placeholders = ids.iter().filter(|&&id| is_ph(id)).count();
-            if placeholders != s.soft.len() / hidden {
+            if placeholders[b] != s.soft.len() / hidden {
                 return Err(format!(
-                    "{what}: sequence {b} has {placeholders} placeholder ids but {} soft rows",
+                    "{what}: sequence {b} has {} placeholder ids but {} soft rows",
+                    placeholders[b],
                     s.soft.len() / hidden
                 ));
             }

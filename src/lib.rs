@@ -122,7 +122,9 @@
 //! step over the model's own parameters is [`qwen35_adamw`]. The EmbeddingGemma 2
 //! text encoder (bidirectional windowed attention, row-range mean pooling and
 //! normalization) is [`embedgemma2`], and its vision tower and multimodal
-//! embedder (image patches to soft tokens) are [`embedgemma2_vision`].
+//! embedder (image patches to soft tokens) are [`embedgemma2_vision`], and the
+//! text encoder and both towers behind one snapshot and one call are
+//! [`embedgemma2_mm`].
 //!
 //! 44 of these were promoted out of `gemma-metal`, where they were reachable
 //! only as raw pipeline-name strings through an overlay metallib. All 44 now
@@ -236,6 +238,7 @@ pub mod decode_icb;
 pub mod dispatch;
 pub mod embedgemma2;
 pub mod embedgemma2_audio;
+pub mod embedgemma2_mm;
 pub mod embedgemma2_vision;
 pub mod gdn_train;
 pub mod gemm;

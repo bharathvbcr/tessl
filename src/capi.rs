@@ -144,7 +144,7 @@ fn parse_adamw_config(update: u32, seed: u64, moments: u32, what: &str) -> Resul
     Ok(AdamWConfig { update, moments })
 }
 
-fn parse_operands(code: u32, what: &str) -> Result<GemmOperands, String> {
+pub(crate) fn parse_operands(code: u32, what: &str) -> Result<GemmOperands, String> {
     match code {
         TESSL_OPERANDS_EXACT_F32 => Ok(GemmOperands::ExactF32),
         TESSL_OPERANDS_BF16 => Ok(GemmOperands::Bf16),

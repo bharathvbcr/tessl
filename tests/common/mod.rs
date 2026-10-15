@@ -25,6 +25,9 @@ pub mod embedgemma2;
 /// f64 references for EmbeddingGemma 2's audio tower, written as transformers
 /// writes the chunked attention, and composable into a whole host forward.
 pub mod embedgemma2_audio;
+/// The tiny multimodal checkpoint (text, vision and audio in one file) and the
+/// processor-shaped inputs for `EmbedGemma2Multimodal` and its C ABI entries.
+pub mod embedgemma2_mm;
 /// f64 references for EmbeddingGemma 2's vision tower: the axial RoPE, the
 /// pooler as transformers writes it, and a whole host forward.
 pub mod embedgemma2_vision;

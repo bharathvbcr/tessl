@@ -448,7 +448,11 @@ fn hostile_index_shapes_are_named_errors() {
 fn awkward_but_bare_shard_names_load_literally() {
     let sc = Scratch::new("awkward");
     let all = fixture_entries();
-    let names = ["sp ace.safetensors", "trail \n.safetensors", "caf\u{e9}-\u{4e2d}.safetensors"];
+    let names = [
+        "sp ace.safetensors",
+        "trail \n.safetensors",
+        "caf\u{e9}-\u{4e2d}.safetensors",
+    ];
     let mut map: Vec<(String, String)> = Vec::new();
     let mut shards: Vec<Vec<Entry>> = vec![Vec::new(); 3];
     for (i, e) in all.into_iter().enumerate() {
@@ -473,7 +477,14 @@ fn one_file_under_two_spellings_is_refused_not_double_counted() {
     write_st(&sc.0.join("model.safetensors"), &all);
     let mut pairs: Vec<(&str, &str)> = Vec::new();
     for (i, e) in all.iter().enumerate() {
-        pairs.push((&e.0, if i % 2 == 0 { "Model.safetensors" } else { "model.safetensors" }));
+        pairs.push((
+            &e.0,
+            if i % 2 == 0 {
+                "Model.safetensors"
+            } else {
+                "model.safetensors"
+            },
+        ));
     }
     std::fs::write(sc.0.join(INDEX_FILE_NAME), index_text(&pairs)).unwrap();
     let on_ci_fs = std::fs::metadata(sc.0.join("Model.safetensors")).is_ok();
@@ -488,7 +499,9 @@ fn one_file_under_two_spellings_is_refused_not_double_counted() {
 fn a_huge_index_is_refused_quickly() {
     let sc = Scratch::new("huge");
     write_split(&sc.0, None);
-    let body: Vec<String> = (0..300_000).map(|i| format!("\"t{i}\":\"model-00001-of-00002.safetensors\"")).collect();
+    let body: Vec<String> = (0..300_000)
+        .map(|i| format!("\"t{i}\":\"model-00001-of-00002.safetensors\""))
+        .collect();
     std::fs::write(
         sc.0.join(INDEX_FILE_NAME),
         format!("{{\"weight_map\":{{{}}}}}", body.join(",")),
@@ -497,7 +510,10 @@ fn a_huge_index_is_refused_quickly() {
     let t = std::time::Instant::now();
     let err = open_err(&sc.0);
     assert!(t.elapsed().as_secs() < 10, "{:?}: {err}", t.elapsed());
-    assert!(err.contains("t0") || err.contains("no such tensor") || err.contains("cap"), "{err}");
+    assert!(
+        err.contains("t0") || err.contains("no such tensor") || err.contains("cap"),
+        "{err}"
+    );
 }
 
 #[test]
@@ -540,7 +556,10 @@ fn many_distinct_shards_that_exhaust_fds_fail_named_and_release() {
     std::fs::write(sc.0.join(INDEX_FILE_NAME), index_text(&p)).unwrap();
     match CheckpointView::open(&sc.0) {
         Ok(v) => assert_eq!(v.shard_count(), 400),
-        Err(e) => assert!(e.contains("s0") && e.to_lowercase().contains("too many open files"), "{e}"),
+        Err(e) => assert!(
+            e.contains("s0") && e.to_lowercase().contains("too many open files"),
+            "{e}"
+        ),
     }
     // Nothing leaked: the process can still open files.
     CheckpointView::open(&fixture().join("model.safetensors")).unwrap();

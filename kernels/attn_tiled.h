@@ -13,13 +13,50 @@
 using namespace metal;
 using namespace mpp::tensor_ops;
 
-template <int D, int BQ, int BK, int NSG, bool ENCODER>
-inline void attn_tiled_body(
-    device float *Q, device float *K, device float *V, device float *O,
+// The probability tile P is the left operand of P.V, stored in the matrix
+// unit's operand type. The store returns the weight the row's sum must count:
+// the stored (rounded) value, so a normalized bf16 row is still a convex
+// combination of V's rows.
+inline float attn_store_p(threadgroup float *P, uint i, float p)
+{
+    P[i] = p;
+    return p;
+}
+
+inline float attn_store_p(threadgroup bfloat *P, uint i, float p)
+{
+    const bfloat b = bfloat(p);
+    P[i] = b;
+    return float(b);
+}
+
+// The tensor view of P. With f32 P it is S's own view (P is S, overwritten in
+// place), so the f32 path builds no second tensor; a bf16 P is a tile of its own.
+// (A reference, not a copy: a copied tensor is a second descriptor.)
+template <int BK, int BQ, typename TS>
+inline thread TS &attn_p_tensor(thread TS &tS, threadgroup float *)
+{
+    return tS;
+}
+
+template <int BK, int BQ, typename TS>
+inline auto attn_p_tensor(thread TS &, threadgroup bfloat *P)
+{
+    return tensor(P, dextents<int, 2>{BK, BQ}, array<int, 2>{1, BK});
+}
+
+// IN: the element type of Q, K and V in device memory (float, or bfloat for
+// the bf16-operand encoder). PT: the type of the probability tile P. Scores
+// S, the online-softmax state, the output accumulator and O are f32 whatever
+// IN and PT are. With PT = float, P is S itself (overwritten in place); with
+// PT = bfloat it is a second tile.
+template <int D, int BQ, int BK, int NSG, bool ENCODER, typename IN, typename PT>
+inline void attn_tiled_core(
+    device IN *Q, device IN *K, device IN *V, device float *O,
     device float *lse,
     uint Tq, uint Tkv, uint H, uint Hkv, float scale, ulong q_off,
     ulong kv_off, uint out_bf16, uint kv_capacity, uint window, uint2 tgpig,
-    uint tid, threadgroup float *S, threadgroup float *m_row,
+    uint tid, threadgroup float *S, threadgroup PT *P, threadgroup float *m_row,
     threadgroup float *l_row, threadgroup float *a_row)
 {
     constexpr int THREADS = NSG * 32;
@@ -71,7 +108,8 @@ inline void attn_tiled_body(
                      array<int, 2>{1, (int)kv_row});
     auto mV = tensor(V + kv_base, dextents<int, 2>{D, (int)Tkv},
                      array<int, 2>{1, (int)kv_row});
-    auto tP = tensor(S, dextents<int, 2>{BK, BQ}, array<int, 2>{1, BK});
+    auto tS = tensor(S, dextents<int, 2>{BK, BQ}, array<int, 2>{1, BK});
+    thread auto &&tP = attn_p_tensor<BK, BQ>(tS, P);
 
     auto oT = pv_op.template get_destination_cooperative_tensor<
         decltype(tP), decltype(mV.slice(0, 0)), float>();
@@ -99,7 +137,7 @@ inline void attn_tiled_body(
         auto sT = qk_op.template get_destination_cooperative_tensor<
             decltype(tQ), decltype(tK), float>();
         qk_op.run(tQ, tK, sT);
-        sT.store(tP);
+        sT.store(tS);
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
         // Online softmax for row r over this block's columns. The TPR threads
@@ -132,8 +170,7 @@ inline void attn_tiled_body(
         float sum = 0.0f;
         for (int j = 0; j < CPT; ++j) {
             const float p = live[j] ? exp(s_loc[j] - m_new) : 0.0f;
-            S[r * (uint)BK + part * (uint)CPT + (uint)j] = p;
-            sum += p;
+            sum += attn_store_p(P, r * (uint)BK + part * (uint)CPT + (uint)j, p);
         }
         for (uint off = (uint)TPR / 2u; off > 0u; off >>= 1) {
             sum += simd_shuffle_xor(sum, (ushort)off);
@@ -192,3 +229,19 @@ inline void attn_tiled_body(
     }
 }
 
+
+// The f32 body Qwen3.5 (prefill and the training forward) and the f32 encoder
+// call: operands f32, P is S overwritten in place.
+template <int D, int BQ, int BK, int NSG, bool ENCODER>
+inline void attn_tiled_body(
+    device float *Q, device float *K, device float *V, device float *O,
+    device float *lse,
+    uint Tq, uint Tkv, uint H, uint Hkv, float scale, ulong q_off,
+    ulong kv_off, uint out_bf16, uint kv_capacity, uint window, uint2 tgpig,
+    uint tid, threadgroup float *S, threadgroup float *m_row,
+    threadgroup float *l_row, threadgroup float *a_row)
+{
+    attn_tiled_core<D, BQ, BK, NSG, ENCODER, float, float>(
+        Q, K, V, O, lse, Tq, Tkv, H, Hkv, scale, q_off, kv_off, out_bf16,
+        kv_capacity, window, tgpig, tid, S, S, m_row, l_row, a_row);
+}

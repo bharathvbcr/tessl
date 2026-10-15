@@ -38,6 +38,8 @@ const QWEN35_ATTN_BWD: &str = include_str!("../kernels/qwen35_attn_bwd.metal");
 const QWEN35_ADAMW: &str = include_str!("../kernels/qwen35_adamw.metal");
 const ENCODER_ATTN: &str = include_str!("../kernels/encoder_attn.metal");
 const ATTN_ROWS_H: &str = include_str!("../kernels/attn_rows.h");
+/// The matrix-unit encoder entry points `encoder_attn.metal` and the tune rig instantiate.
+const ENCODER_ATTN_TILED_H: &str = include_str!("../kernels/encoder_attn_tiled.h");
 const EMBED_POOL: &str = include_str!("../kernels/embed_pool.metal");
 const EMBEDGEMMA2_VISION: &str = include_str!("../kernels/embedgemma2_vision.metal");
 const EMBEDGEMMA2_AUDIO: &str = include_str!("../kernels/embedgemma2_audio.metal");
@@ -106,6 +108,13 @@ const EXEMPT_KERNELS: &[(&str, &str)] = &[
         "Tile-tuning variants of matmul_tensorops.metal, built only by the \
          tuning binaries and never linked into the shipped metallib; same \
          addressing and same host bound.",
+    ),
+    (
+        "tune/encoder_attn_tune.metal",
+        "Geometry variants of encoder_attn.metal's tiled kernels, built only by \
+         `TESSL_GEMM_TUNE` and timed by `bench_encoder_attn`; every entry is \
+         one of `encoder_attn_tiled.h`'s macros (inspected in \
+         `encoder_attn_offsets_are_widened`) and adds no arithmetic of its own.",
     ),
     (
         "mlp_gelu_tanh.metal",
@@ -731,20 +740,37 @@ fn encoder_attn_offsets_are_widened() {
     }
     // No encoder has a bf16 path: the kernels take no `out_bf16` argument and
     // hand the shared bodies a literal 0, and the K/V capacity is slot 10.
-    assert!(
-        !ENCODER_ATTN.contains("out_bf16"),
-        "encoder_attn.metal has an out_bf16 argument no caller binds"
+    // (The bf16 *operand* kernels are not a bf16 output: O is f32 in every
+    // entry and the body's flag is the literal 0u.)
+    for (src, name) in [
+        (ENCODER_ATTN, "encoder_attn.metal"),
+        (ENCODER_ATTN_TILED_H, "encoder_attn_tiled.h"),
+    ] {
+        assert!(
+            !src.contains("out_bf16"),
+            "{name} has an out_bf16 argument no caller binds"
+        );
+        require(
+            src,
+            "constant uint &kv_capacity [[buffer(10)]],",
+            "key/value capacity slot",
+        );
+    }
+    // The tiled entries clamp the device length before it bounds an extent,
+    // in both operand precisions, and hand the body a literal 0 for out_bf16.
+    assert_eq!(
+        ENCODER_ATTN_TILED_H
+            .matches("const uint len = min(lens[tgpig.y / H], T);")
+            .count(),
+        2,
+        "the f32 and the bf16 tiled entries each clamp the device length"
     );
-    require(
-        ENCODER_ATTN,
-        "constant uint &kv_capacity [[buffer(10)]],",
-        "key/value capacity slot",
-    );
-    // The tiled entries clamp the device length before it bounds an extent.
-    require(
-        ENCODER_ATTN,
-        "const uint len = min(lens[tgpig.y / H], T);",
-        "tiled encoder live length clamp",
+    assert_eq!(
+        ENCODER_ATTN_TILED_H
+            .matches("0ul, 0ul, 0u, kv_capacity, window")
+            .count(),
+        2,
+        "the tiled entries pass no position offsets and no bf16 output"
     );
     // The store is `attn_rows.h`'s, shared with `flash_attn_rows`.
     require(

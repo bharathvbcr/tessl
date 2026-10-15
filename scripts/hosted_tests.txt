@@ -66,7 +66,7 @@ exact tune_rigs_refuse_missing_variants every_rig_that_flags_drift_exits_3
 
 # Unit tests of the src/bin targets (bench drivers, probes, and bench common::tests):
 # every one of them is device-free. One cargo invocation, counted as a total.
-bins 156
+bins 163
 
 # Library tests.
 lib ab_flags::tests:: 10

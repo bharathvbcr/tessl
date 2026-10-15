@@ -9,7 +9,7 @@
 //! that needs one adds it here; it does not carry a copy.
 //!
 //! Declared with `mod common;` by (`rg -l '^mod common;' src/bin`):
-//! bench_embedgemma2, bench_flash_attn, bench_gemm_coop_tile,
+//! bench_embedgemma2, bench_encoder_attn, bench_flash_attn, bench_gemm_coop_tile,
 //! bench_gemm_routes, bench_gemm_sweep, bench_gemm_tile_tune,
 //! bench_gemm_tnnt_tune, bench_gemm_variants, bench_nn_kernels, bench_paired,
 //! bench_qwen35_layers, bench_qwen35_train, probe_gdn_scan, probe_gemm_bits,

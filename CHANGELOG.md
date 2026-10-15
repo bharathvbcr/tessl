@@ -29,6 +29,29 @@ All notable changes to `tessl` are recorded here. The format follows
   override (`tests/embedgemma2_mm_tiny.rs`). The f64 host forward and its
   bounds moved from `tests/embedgemma2_tiny.rs` to `tests/common/embedgemma2.rs`
   to be shared. The C and Python entries still embed text only.
+- **bf16 operand tiles for the encoder attention, and the matrix-unit kernel at
+  head dims 32 and 64** (`kernels/encoder_attn_tiled.h`, `encoder_attn.metal`,
+  `kernels/tune/encoder_attn_tune.metal`; `embedgemma2::encoder_attn_bf16`,
+  `EncoderAttnKernel::TiledBf16`, `nn::attn_kv_capacity_bf16`).
+  `attn_tiled.h`'s template now takes its Q/K/V element type and its P tile
+  type separately; the f32 instantiations (Qwen3.5 prefill, the training LSE
+  forward, the ExactF32 encoder) compile to the same IR as before.
+  Under `GemmOperands::Bf16` the EmbeddingGemma 2 attention reads bf16 Q, K and
+  V and keeps scores, softmax, accumulator and output f32; P is rounded to
+  bf16 and the row sum is taken over the rounded weights. The q/k-norm-RoPE
+  writer emits bf16 directly (`qwen35_attn_qk_norm_rope_bf16`), so there is no
+  cast pass. Geometries come from a measured sweep (BQ x BK x NSG): D=64 f32
+  and bf16 `q32_k32_sg2`, D=32 f32 `q16_k32_sg1`, D=256 bf16 `q32_k64_sg4`,
+  D=512 bf16 `q32_k128_sg8`. `encoder_attn` now routes head dims 32 and 64 to
+  the tiled kernel (2.3x and 2.8-2.9x over the rows kernel). Measured on an M5
+  Pro, the bf16 kernel is 3.0-3.1x (D=256), 3.6-3.8x (D=512) and 2.5-2.6x
+  (vision D=64) faster than the f32 tiled kernel; the bf16 model forward is
+  0.87x / 0.66x / 0.54x the time at 32x256 / 8x1024 / 2x4096. ExactF32 output
+  hashes are unchanged. New bench `bench_encoder_attn` (paired, min-of-N,
+  `BENCH_SWEEP=1` for the tune candidates); numbers and method in
+  `bench/results/embedgemma2_attention_m5pro.txt`. The bf16 kernel is held to
+  an error bound derived from the bf16 unit roundoff in
+  `tests/embedgemma2_kernels.rs`.
 - **A bf16-operand EmbeddingGemma 2** (`EmbedGemma2Model::load_with(.., GemmOperands::Bf16)`,
   `operands`, `weight_bytes`; `load` stays `ExactF32`, bit-for-bit unchanged).
   The projections stay bf16 on the device (517 MiB of weights against 778 MiB
@@ -544,6 +567,10 @@ All notable changes to `tessl` are recorded here. The format follows
   recipe uses it and shows `operands="bf16"`; the default stays exact f32.
 
 ### Changed (breaking)
+
+- **`qwen35::attn_qk_norm_rope_columns` takes an output `DType`** (after
+  `targets`): `DType::F32` is the previous behaviour, `DType::BF16` (scalar
+  `RopePos` only) writes the rounded values for the bf16 attention kernels.
 
 - **`GpuRuntime::shared_event()` returns a handoff event, not the lifetime
   event.** The allocator reset, const-arena rewind, pool recycling and the

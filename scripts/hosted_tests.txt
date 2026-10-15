@@ -19,6 +19,7 @@ bin capi_contract 73
 bin check_kernel_ir_planted 6
 bin dialect_lint_script 5
 bin docs_name_real_tools 6
+bin embedgemma2_audio_fixtures 2
 bin gdn_fixtures 11
 bin gdn_gates 22
 bin gdn_state 10
@@ -32,7 +33,7 @@ bin parser_mutation 13
 bin qwen35_config 5
 bin relaxed_predicate 1
 bin safetensors 12
-bin shader_index_arithmetic 20
+bin shader_index_arithmetic 21
 bin icb_flag_env 4
 bin bench_gemm_sweep_metallib 5
 
@@ -65,6 +66,7 @@ bins 147
 # Library tests.
 lib ab_flags::tests:: 10
 lib embedgemma2::tests:: 10
+lib embedgemma2_audio::tests:: 8
 lib gemm::coop_tile_select:: 4
 lib json::tests:: 4
 lib parser_mutation:: 15

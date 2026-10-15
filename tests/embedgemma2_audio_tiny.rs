@@ -83,7 +83,12 @@ fn random_weights(cfg: &AudioConfig, seed: u64) -> Vec<Weight> {
         /// A clipped linear: its weight and four bounds that clip a visible
         /// share of the values (inputs and outputs are O(1)).
         fn clipped(&mut self, name: String, out_f: usize, in_f: usize) {
-            self.push(format!("{name}.linear.weight"), vec![out_f, in_f], 1.7 * (in_f as f64).powf(-0.5), 0.0);
+            self.push(
+                format!("{name}.linear.weight"),
+                vec![out_f, in_f],
+                1.7 * (in_f as f64).powf(-0.5),
+                0.0,
+            );
             for (s, sign, lo, spread) in [
                 ("input_min", -1.0, 1.3, 0.5),
                 ("input_max", 1.0, 1.3, 0.5),
@@ -108,7 +113,12 @@ fn random_weights(cfg: &AudioConfig, seed: u64) -> Vec<Weight> {
     g.push(sub("layer0.norm.weight"), vec![c0], 0.3, 1.0);
     g.push(sub("layer1.conv.weight"), vec![c1, c0, 3, 3], lin(9 * c0), 0.0);
     g.push(sub("layer1.norm.weight"), vec![c1], 0.3, 1.0);
-    g.push(sub("input_proj_linear.weight"), vec![h, cfg.proj_in() as usize], lin(cfg.proj_in() as usize), 0.0);
+    g.push(
+        sub("input_proj_linear.weight"),
+        vec![h, cfg.proj_in() as usize],
+        lin(cfg.proj_in() as usize),
+        0.0,
+    );
     for li in 0..cfg.layers as usize {
         let p = |s: &str| format!("audio_tower.layers.{li}.{s}");
         for ff in ["feed_forward1", "feed_forward2"] {
@@ -124,15 +134,31 @@ fn random_weights(cfg: &AudioConfig, seed: u64) -> Vec<Weight> {
             g.push(p(&format!("{ff}.pre_layer_norm.weight")), vec![h], 0.3, 1.0);
             g.push(p(&format!("{ff}.post_layer_norm.weight")), vec![h], 0.3, 1.0);
         }
-        for n in ["norm_pre_attn", "norm_post_attn", "norm_out", "lconv1d.pre_layer_norm", "lconv1d.conv_norm"] {
+        for n in [
+            "norm_pre_attn",
+            "norm_post_attn",
+            "norm_out",
+            "lconv1d.pre_layer_norm",
+            "lconv1d.conv_norm",
+        ] {
             g.push(p(&format!("{n}.weight")), vec![h], 0.3, 1.0);
         }
         g.push(p("self_attn.relative_k_proj.weight"), vec![h, h], lin(h), 0.0);
         g.push(p("self_attn.per_dim_scale"), vec![hd], 0.6, 0.0);
         g.push(p("lconv1d.depthwise_conv1d.weight"), vec![h, 1, k], 0.6, 0.0);
     }
-    g.push("audio_tower.output_proj.weight".into(), vec![cfg.out_dims as usize, h], lin(h), 0.0);
-    g.push("audio_tower.output_proj.bias".into(), vec![cfg.out_dims as usize], 0.2, 0.0);
+    g.push(
+        "audio_tower.output_proj.weight".into(),
+        vec![cfg.out_dims as usize, h],
+        lin(h),
+        0.0,
+    );
+    g.push(
+        "audio_tower.output_proj.bias".into(),
+        vec![cfg.out_dims as usize],
+        0.2,
+        0.0,
+    );
     g.push(
         "embed_audio.embedding_projection.weight".into(),
         vec![cfg.embed_dim as usize, cfg.out_dims as usize],
@@ -211,7 +237,10 @@ fn to_f64(v: &[f32]) -> Vec<f64> {
 
 fn max_abs(a: &[f32], b: &[f64]) -> f64 {
     assert_eq!(a.len(), b.len());
-    a.iter().zip(b).map(|(x, y)| (f64::from(*x) - y).abs()).fold(0.0, f64::max)
+    a.iter()
+        .zip(b)
+        .map(|(x, y)| (f64::from(*x) - y).abs())
+        .fold(0.0, f64::max)
 }
 
 fn bits(v: &[f32]) -> Vec<u32> {
@@ -221,7 +250,11 @@ fn bits(v: &[f32]) -> Vec<u32> {
 /// Every stage of clip `i`, bit for bit, in two outputs.
 fn assert_bit_equal(what: &str, a: &AudioOutput, ia: usize, b: &AudioOutput, ib: usize) {
     assert_eq!(a.out_masks[ia], b.out_masks[ib], "{what}: out mask");
-    assert_eq!(bits(&a.soft_tokens[ia]), bits(&b.soft_tokens[ib]), "{what}: soft tokens");
+    assert_eq!(
+        bits(&a.soft_tokens[ia]),
+        bits(&b.soft_tokens[ib]),
+        "{what}: soft tokens"
+    );
     if !a.trace.is_empty() && !b.trace.is_empty() {
         let (ta, tb) = (&a.trace[ia], &b.trace[ib]);
         assert_eq!(bits(&ta.subsample), bits(&tb.subsample), "{what}: subsample");
@@ -241,13 +274,21 @@ fn check_against_reference(name: &str, cfg: &AudioConfig, w: &[Weight], scale: u
         .map(|c| audio_forward(cfg, &rw, &to_f64(&c.input_features), &c.mask))
         .collect();
     // The mask patterns must really exercise padding.
-    assert!(refs[1].out_mask.iter().any(|&m| !m) && refs[1].out_mask[0], "test bug: trailing mask");
+    assert!(
+        refs[1].out_mask.iter().any(|&m| !m) && refs[1].out_mask[0],
+        "test bug: trailing mask"
+    );
     let hole = &refs[2].out_mask;
     assert!(
-        hole.iter().position(|&m| !m).is_some_and(|f| hole[f..].iter().any(|&m| m)),
+        hole.iter()
+            .position(|&m| !m)
+            .is_some_and(|f| hole[f..].iter().any(|&m| m)),
         "test bug: the hole must be followed by valid rows"
     );
-    assert!(refs[4].soft.is_empty() && !refs[4].out_mask[0], "test bug: no valid frame");
+    assert!(
+        refs[4].soft.is_empty() && !refs[4].out_mask[0],
+        "test bug: no valid frame"
+    );
 
     with_gpu(|rt| {
         let model = EmbedGemma2Audio::load(rt, &st, "", cfg.clone()).unwrap();
@@ -269,7 +310,10 @@ fn check_against_reference(name: &str, cfg: &AudioConfig, w: &[Weight], scale: u
                 assert_eq!(got.len(), t * width, "{name} clip {i} {stage}: rows");
                 let scale = want_v.iter().map(|v| v.abs()).fold(0.0, f64::max);
                 let err = max_abs(got, want_v);
-                eprintln!("{name} clip {i} ({} frames) {stage}: max abs {err:.3e} of scale {scale:.3e}", c.mask.len());
+                eprintln!(
+                    "{name} clip {i} ({} frames) {stage}: max abs {err:.3e} of scale {scale:.3e}",
+                    c.mask.len()
+                );
                 assert!(
                     err <= LAYER_REL * scale,
                     "{name} clip {i} {stage}: max abs {err:.3e} > {LAYER_REL:.0e} * {scale:.3e}"
@@ -279,7 +323,10 @@ fn check_against_reference(name: &str, cfg: &AudioConfig, w: &[Weight], scale: u
             assert_eq!(want.soft.len(), want.out_mask.iter().filter(|&&m| m).count() * ed);
             let err = max_abs(&out.soft_tokens[i], &want.soft);
             eprintln!("{name} clip {i}: soft max abs {err:.3e}");
-            assert!(err <= SOFT_ABS, "{name} clip {i}: soft tokens max abs {err:.3e} > {SOFT_ABS:.0e}");
+            assert!(
+                err <= SOFT_ABS,
+                "{name} clip {i}: soft tokens max abs {err:.3e} > {SOFT_ABS:.0e}"
+            );
         }
 
         // Each clip alone is bit for bit what it is in the batch.
@@ -298,7 +345,11 @@ fn check_against_reference(name: &str, cfg: &AudioConfig, w: &[Weight], scale: u
         let plain = model.encode_audio(&batch, false).unwrap();
         assert!(plain.trace.is_empty());
         for i in 0..batch.len() {
-            assert_eq!(bits(&plain.soft_tokens[i]), bits(&out.soft_tokens[i]), "{name} clip {i}: trace");
+            assert_eq!(
+                bits(&plain.soft_tokens[i]),
+                bits(&out.soft_tokens[i]),
+                "{name} clip {i}: trace"
+            );
         }
 
         // Every unzeroed activation poisoned with NaN: no bit moves.
@@ -316,14 +367,20 @@ fn check_against_reference(name: &str, cfg: &AudioConfig, w: &[Weight], scale: u
 #[test]
 fn tiny_audio_tower_matches_the_f64_forward() {
     let cfg = AudioConfig::from_config_json(TINY).unwrap();
-    assert_eq!((cfg.head_dim(), cfg.chunk, cfg.past(), cfg.mel_bins(), cfg.proj_in()), (16, 4, 4, 32, 64));
+    assert_eq!(
+        (cfg.head_dim(), cfg.chunk, cfg.past(), cfg.mel_bins(), cfg.proj_in()),
+        (16, 4, 4, 32, 64)
+    );
     check_against_reference("tiny", &cfg, &random_weights(&cfg, 2026), 1);
 }
 
 #[test]
 fn wide_audio_tower_has_the_checkpoints_attention_geometry() {
     let cfg = AudioConfig::from_config_json(WIDE).unwrap();
-    assert_eq!((cfg.head_dim(), cfg.chunk, cfg.past(), cfg.ctx(), cfg.rel_rows()), (128, 12, 12, 24, 13));
+    assert_eq!(
+        (cfg.head_dim(), cfg.chunk, cfg.past(), cfg.ctx(), cfg.rel_rows()),
+        (128, 12, 12, 24, 13)
+    );
     check_against_reference("wide", &cfg, &random_weights(&cfg, 7), 1);
 }
 
@@ -338,7 +395,12 @@ fn the_bounds_bite() {
     let base = audio_forward(&cfg, &reference_weights(&w), &feats, mask);
     let scale = base.tower.iter().map(|v| v.abs()).fold(0.0, f64::max);
     let far = |other: &AudioRef| -> f64 {
-        base.tower.iter().zip(&other.tower).map(|(a, b)| (a - b).abs()).fold(0.0, f64::max) / scale
+        base.tower
+            .iter()
+            .zip(&other.tower)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0, f64::max)
+            / scale
     };
 
     let mut no_bounds = reference_weights(&w);
@@ -358,7 +420,10 @@ fn the_bounds_bite() {
     let d_cap = far(&audio_forward(&uncapped, &reference_weights(&w), &feats, mask));
     eprintln!("relative change of the tower output without: bounds {d_bounds:.2e}, gradient clip {d_clip:.2e}, softcap {d_cap:.2e}");
     for (what, d) in [("clip bounds", d_bounds), ("gradient clip", d_clip), ("softcap", d_cap)] {
-        assert!(d > 100.0 * LAYER_REL, "{what} change the output by only {d:.2e}: they do not bite");
+        assert!(
+            d > 100.0 * LAYER_REL,
+            "{what} change the output by only {d:.2e}: they do not bite"
+        );
     }
 }
 
@@ -383,7 +448,10 @@ fn a_batch_past_the_frame_budget_splits_into_forwards() {
         for (i, c) in batch.iter().enumerate() {
             let alone = model.encode_audio(std::slice::from_ref(c), false).unwrap();
             assert_bit_equal(&format!("split clip {i}"), &alone, 0, &all, i);
-            assert_eq!(all.soft_tokens[i].len(), all.out_masks[i].iter().filter(|&&m| m).count() * cfg.embed_dim as usize);
+            assert_eq!(
+                all.soft_tokens[i].len(),
+                all.out_masks[i].iter().filter(|&&m| m).count() * cfg.embed_dim as usize
+            );
         }
         rt.set_poison_unzeroed(true);
         let poisoned = model.encode_audio(&batch, false);
@@ -427,10 +495,10 @@ fn encode_audio_refuses_what_it_cannot_run() {
         bad.input_features.extend([0.0; 7]);
         assert!(err(&[bad]).contains("mel bins"));
         // The model is still usable after refusals.
-        assert!(model.encode_audio(&[good.clone()], false).is_ok());
+        assert!(model.encode_audio(std::slice::from_ref(&good), false).is_ok());
         // Relaxed f32 GEMMs would not be exact: refused by name.
         rt.set_relaxed_precision(true);
-        let relaxed = model.encode_audio(&[good.clone()], false);
+        let relaxed = model.encode_audio(std::slice::from_ref(&good), false);
         rt.set_relaxed_precision(false);
         if rt.has_tensorops() {
             assert!(relaxed.expect_err("relaxed accepted").contains("exact-f32"));
@@ -451,21 +519,37 @@ fn load_refuses_a_checkpoint_that_does_not_match() {
         // A tensor the forward does not read, under either prefix.
         let e = load("extra tower", &w, &[("audio_tower.layers.0.self_attn.bias", &[4])]).expect("accepted");
         assert!(e.contains("audio_tower.layers.0.self_attn.bias"), "{e}");
-        let e = load("extra embed", &w, &[("embed_audio.embedding_pre_projection_norm.weight", &[4])]).expect("accepted");
+        let e = load(
+            "extra embed",
+            &w,
+            &[("embed_audio.embedding_pre_projection_norm.weight", &[4])],
+        )
+        .expect("accepted");
         assert!(e.contains("embed_audio."), "{e}");
         // A missing tensor, and a wrong shape.
         let missing: Vec<Weight> = w
             .iter()
             .filter(|t| t.name != "audio_tower.layers.1.lconv1d.conv_norm.weight")
-            .map(|t| Weight { name: t.name.clone(), shape: t.shape.clone(), data: t.data.clone() })
+            .map(|t| Weight {
+                name: t.name.clone(),
+                shape: t.shape.clone(),
+                data: t.data.clone(),
+            })
             .collect();
         let e = load("missing", &missing, &[]).expect("accepted");
         assert!(e.contains("lconv1d.conv_norm"), "{e}");
         let mut reshaped: Vec<Weight> = w
             .iter()
-            .map(|t| Weight { name: t.name.clone(), shape: t.shape.clone(), data: t.data.clone() })
+            .map(|t| Weight {
+                name: t.name.clone(),
+                shape: t.shape.clone(),
+                data: t.data.clone(),
+            })
             .collect();
-        let t = reshaped.iter_mut().find(|t| t.name == "audio_tower.output_proj.bias").unwrap();
+        let t = reshaped
+            .iter_mut()
+            .find(|t| t.name == "audio_tower.output_proj.bias")
+            .unwrap();
         t.shape = vec![t.data.len() / 2, 2];
         let e = load("reshaped", &reshaped, &[]).expect("accepted");
         assert!(e.contains("output_proj.bias"), "{e}");

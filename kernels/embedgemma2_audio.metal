@@ -110,7 +110,8 @@ kernel void eg2a_sub_conv0_ln_relu(
 /// The second subsampling layer: `C0 -> C1` channels over the first layer's
 /// output, whose rows are masked by `mask[::2]` (the frame mask at every
 /// other frame) before the convolution. One simdgroup per output position,
-/// one lane per channel (up to four per lane); the LayerNorm statistics are
+/// one lane per channel (up to four per lane: at most 128 channels, checked on
+/// the host); the LayerNorm statistics are
 /// `simd_sum`s. The output row is `[mels2, C1]`, which is `permute(0, 2, 3,
 /// 1).reshape(T, -1)` of transformers' `[C1, T, mels2]`: `index = f2 * C1 + co`.
 ///
@@ -301,8 +302,9 @@ kernel void eg2a_glu(
 /// `Gemma4AudioCausalConv1d` (depthwise, kernel `taps`, left pad `taps - 1`):
 /// `out[t, c] = sum_j w[c, j] * x[t - (taps - 1) + j, c]`, rows before the
 /// clip's first reading as 0. x, out [R, hidden]; w [hidden, taps] (the
-/// checkpoint's `[hidden, 1, taps]`). Grid: x = channels, y = clip-local row,
-/// z = clip.
+/// checkpoint's `[hidden, 1, taps]`). Grid: x = `max rows * ceil(hidden / 32)`
+/// threadgroups of 32 channels (row-major: all channel groups of a row, then
+/// the next row), y = clip.
 kernel void eg2a_dwconv1d_causal(
     device const float *x [[buffer(0)]],
     device const float *w [[buffer(1)]],
@@ -310,13 +312,15 @@ kernel void eg2a_dwconv1d_causal(
     device const uint *clips [[buffer(3)]],
     constant uint &hidden [[buffer(4)]],
     constant uint &taps [[buffer(5)]],
-    uint3 gid [[thread_position_in_grid]])
+    uint2 tg [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_threadgroup]])
 {
-    const uint ch = gid.x;
+    const uint groups = (hidden + 31u) / 32u;
+    const uint ch = (tg.x % groups) * 32u + lane;
     if (ch >= hidden) return;
-    device const uint *c = clips + (ulong)gid.z * EGA_CLIP_WORDS;
+    device const uint *c = clips + (ulong)tg.y * EGA_CLIP_WORDS;
     const uint row0 = c[4];
-    const uint t = gid.y;
+    const uint t = tg.x / groups;
     if (t >= c[5]) return;
     float acc = 0.0f;
     for (uint j = 0u; j < taps; ++j) {

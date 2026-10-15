@@ -37,12 +37,20 @@ fn dir() -> PathBuf {
 fn f32s(name: &str) -> Vec<f64> {
     let p = dir().join(format!("eg2a_audio_{name}.npy"));
     let a = read_npy(&p).unwrap_or_else(|e| panic!("load {}: {e}", p.display()));
-    a.f32_slice().expect("f32 fixture").iter().map(|&v| f64::from(v)).collect()
+    a.f32_slice()
+        .expect("f32 fixture")
+        .iter()
+        .map(|&v| f64::from(v))
+        .collect()
 }
 
 fn ints(name: &str) -> Vec<i64> {
     let p = dir().join(format!("eg2a_audio_{name}.npy"));
-    read_npy(&p).unwrap_or_else(|e| panic!("load {}: {e}", p.display())).i64_slice().expect("i64 fixture").to_vec()
+    read_npy(&p)
+        .unwrap_or_else(|e| panic!("load {}: {e}", p.display()))
+        .i64_slice()
+        .expect("i64 fixture")
+        .to_vec()
 }
 
 fn config() -> AudioConfig {
@@ -93,7 +101,11 @@ fn the_f64_reference_matches_transformers() {
         ];
         for (name, g, want) in stages {
             let rel = max_rel(g, &want);
-            eprintln!("clip {n} ({} frames, {} valid) {name}: max abs error {rel:.2e} of max |ref|", mask.len(), mask.iter().filter(|&&m| m).count());
+            eprintln!(
+                "clip {n} ({} frames, {} valid) {name}: max abs error {rel:.2e} of max |ref|",
+                mask.len(),
+                mask.iter().filter(|&&m| m).count()
+            );
             assert!(rel <= FIXTURE_REL, "clip {n} {name}: {rel:.3e} > {FIXTURE_REL:.0e}");
         }
     }
@@ -112,5 +124,8 @@ fn transformers_eager_differs_from_the_specified_mask() {
     let eager = f32s("c1_eager_tower");
     let rel = max_rel(&got.tower, &eager);
     eprintln!("eager vs specified tower output: {rel:.2e} of max |ref|");
-    assert!(rel > 1e-2, "eager agrees with the specified mask ({rel:.2e}): retire this test");
+    assert!(
+        rel > 1e-2,
+        "eager agrees with the specified mask ({rel:.2e}): retire this test"
+    );
 }

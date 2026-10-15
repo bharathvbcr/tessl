@@ -1,7 +1,8 @@
 # EmbeddingGemma 2 text encoder
 
 `tessl::embedgemma2` runs `google/embeddinggemma-2`'s text path (the 271M
-encoder; the vision and audio towers in the same checkpoint are not loaded)
+encoder; the audio tower is `tessl::embedgemma2_audio`, see
+[Audio tower](#audio-tower), and the vision tower is not loaded here)
 on tessl's kernels, from the checkpoint's own `model.safetensors`.
 
 > **Status: run on the GPU against sentence-transformers** (Apple M5 Pro,
@@ -203,3 +204,164 @@ Measured on an M5 Pro against the real checkpoint, paired and interleaved
 F32 only: bf16 weights widened exactly, f32 activations, exact-f32 GEMMs.
 A bf16-operand path is not written; it would be held to transformers' bf16
 forward the way `tests/qwen35_model.rs` holds Qwen3.5's.
+
+## Audio tower
+
+`tessl::embedgemma2_audio` runs the checkpoint's audio tower (`audio_tower.*`,
+305M parameters: a conformer of 12 layers, hidden 1024, 8 heads of 128) and
+its multimodal embedder (`embed_audio.*`) on the same kernels' conventions:
+bf16 weights widened exactly, f32 activations, exact-f32 GEMMs, a strict
+loader that refuses an unread tensor under either prefix. Preprocessing (the
+128-bin log-mel front end) is the caller's: the input is the processor's
+`input_features [frames, 128]` and `input_features_mask [frames]`.
+
+```rust
+let cfg = AudioConfig::from_config_file(&snapshot.join("config.json"))?;
+let model = EmbedGemma2Audio::load(&rt, &safetensors, "", cfg)?;
+let out = model.encode_audio(&[AudioInput { input_features, mask }, ...], false)?;
+// out.soft_tokens[i]: [S_i, 512], the rows the text encoder takes in place of
+// clip i's audio placeholders; out.out_masks[i]: which tower rows were kept.
+```
+
+> **Status** (Apple M5 Pro, 2026-10-15, branch
+> `worktree-agent-a975c42e7f8ed0908` on base `60a6240`, snapshot
+> `914f7f89`; torch 2.12.1, transformers 5.19.0): every bound below holds. The
+> runtime has no `async_scope` on this base, so `encode_audio` queues its
+> forwards and ends with one `synchronize()`.
+
+### What it computes
+
+`Gemma4AudioModel.forward` then `EmbeddingGemma2MultimodalEmbedder.forward`
+(transformers 5.19), written out in the module docs of
+`src/embedgemma2_audio.rs`:
+
+* **Subsampling.** The frames are multiplied by the frame mask, then two
+  `Conv2d(3x3, stride 2, pad 1, no bias)` (1 -> 128 -> 32 channels), each
+  followed by a channel `LayerNorm` (weight, no bias, eps 1e-6) and ReLU; the
+  second conv's input is masked by `mask[::2]`. The rows are flattened
+  `(frequency, channel)` and projected 1024 -> 1024. `T = ceil(ceil(F/2)/2)`
+  rows, and the tower's mask is `mask[::4]` (99 frames: 25 tokens; 330 frames
+  with 329 valid: 83).
+* **Layer.** Half-weighted feed-forward, chunked local attention, the light
+  conv (pre-norm, linear 1024 -> 2048, GLU, depthwise causal conv with 5 taps,
+  norm, SiLU, linear), a second feed-forward, a final norm. Every linear is a
+  `Gemma4ClippableLinear`: its input and output are clamped to four scalar bf16
+  bounds from the checkpoint, and the residual stream is clamped to
+  `+-gradient_clipping` (1e10) around the norms.
+* **Attention.** Queries come in blocks of 12; each block sees a window of 24
+  keys; a query attends to itself and the 11 frames before it (the mask is
+  `0 <= q - k < attention_context_left - 1 = 12`; a query sees 12 keys, not 13
+  and none ahead), restricted to valid frames. Logits are Transformer-XL:
+  `(q * q_scale * softplus(per_dim_scale)) . (k * k_scale)` plus the same query
+  against `relative_k_proj(sinusoidal table)` shifted by `_rel_shift`, a tanh
+  softcap of 50, masked logits at -1e9, softmax in f32. `q_scale = head_dim^-0.5
+  / ln 2`, `k_scale = ln(1 + e) / ln 2`. The relative-position table and the
+  query scale are computed once per layer at load (f64, rounded once).
+  `rel_shift_source` is the shift's index math in one function: output `(i, j)`
+  of a block reads column `j - i` of row `i` when `0 <= j - i < 13`, else zero,
+  so a visible key at distance `d` reads table row `12 - d` (position `d`) and
+  row 0 is never visible.
+* **Output.** `output_proj` 1024 -> 1536 with bias is the tower output; the
+  embedder is a weightless RMSNorm over 1536 and `embedding_projection`
+  1536 -> 512. Soft tokens are kept where the tower's mask is true.
+
+### The attention mask: transformers' eager path inverts it
+
+`Gemma4AudioAttention.forward` fills masked logits with
+`attention_mask.logical_not()`, which expects a bool mask. Under
+`attn_implementation="sdpa"` it gets one. Under `"eager"` (what the
+multimodal reference generator `make_mm_reference.py`, in `tools/embedgemma2_ref/`
+on the multimodal branch, runs) `create_bidirectional_mask` returns a float additive mask (0.0 visible, `finfo.min` not), and
+`logical_not()` of a float is true exactly where it is 0.0: the visible keys are
+filled with -1e9 and the keys outside the window, and the zero padding the
+blocked layout adds, are attended to. The attention is hand-written matmuls in
+both, so the setting selects only the mask's dtype, and the sdpa behaviour is
+the specified one. tessl implements that.
+
+Consequence for references: `make_mm_reference.py`'s audio files
+(`layer*.npy`, `tower_out.npy`, `soft.npy`, and the audio `emb_*`) describe the
+inverted mask; its `subsample.npy` does not touch attention and is right.
+`tools/embedgemma2_ref/make_audio_sdpa_reference.py` rewrites the audio
+references under sdpa from the same `input_features`; the fix to the generator
+is `attn_implementation="sdpa"` (the text and vision towers only change
+rounding). Measured, tessl against the eager references of the first clip:
+subsample `3.1e-7` of max (agrees), layer 0 `2.8e-2` of max, layer 3 `1.2e-1`,
+layer 10 `4.8e-1`, tower output `6.8e-1`
+(`eager_references_encode_the_inverted_mask`, opt-in). The fixture
+`eg2a_audio_c1_eager_tower` pins the same difference device-free (`5.4e-1`).
+
+### Kernels
+
+New, `kernels/embedgemma2_audio.metal`; the matmuls are the exact-f32 `gemm`.
+`gemm_epilogue` has no exact-f32 path (its contract needs bf16 or relaxed f32),
+so no clamp rides on a GEMM; each is folded into the elementwise pass beside it.
+
+| Kernel | Does |
+|---|---|
+| `eg2a_sub_conv0_ln_relu`, `eg2a_sub_conv1_ln_relu` | the strided conv with the frame mask, the channel LayerNorm and ReLU in one pass; threadgroup per output position (channels across threads), simdgroup per position for the 32-channel layer. Output channels-last, so the second layer's flatten order is its store order |
+| `eg2a_rms_norm` | `[resid +] scale * clamp(act(rms_norm(clamp(clamp(x))) [* w]))`: a linear's output clamp and the gradient clamp before, SiLU and the next linear's input clamp after, the residual add; in place allowed. The weightless embedder norm is `weight = None` |
+| `eg2a_ew` | `clamp(act(clamp(x))) + residual \| bias`: between the feed-forward's linears, a linear's output clamp plus the residual, an input clamp, the output bias |
+| `eg2a_glu` | the GLU with the linear's output clamp |
+| `eg2a_dwconv1d_causal` | the depthwise causal conv over clips (rows before a clip's start read 0) |
+| `eg2a_attn` | the chunked local attention, one simdgroup per (query, head); the q/k/v output clamps are applied as it loads, the output projection's input clamp as it stores |
+
+SiLU and the sigmoid are `kernels/act.h`'s overflow-free forms. A clip bound of
+infinity (the module's untrained default) is held as `+-f32::MAX`, since the
+kernels are compiled with fast math.
+
+### Batches and limits
+
+`encode_audio` takes up to 256 clips of any lengths. They are laid end to end
+in each row space and run as one forward up to 16,384 frames (`MAX_FRAMES_PER_FORWARD`;
+a clip above that is refused, more clips are more forwards, all queued before the
+one wait). Clips never read each other's rows: the convolutions and the attention
+work in clip-local indices through a clip table, and everything else is row-wise,
+so a clip is bit for bit the same alone or in any batch. Padding (masked)
+frames are defined everywhere: the only place a masked frame influences a kept
+one is the subsampling's zeroing before each conv. Rows of masked frames are
+computed exactly as transformers computes them (a query with no visible key
+softmaxes to the uniform `1/24` over its window), and then dropped.
+`trace` returns each clip's subsample output, per-layer residuals and tower
+output. The activations are unzeroed, as the text encoder's are; the tests
+poison every one with NaN.
+
+### Bounds and observed errors
+
+Fixed before the first run (the real-checkpoint bounds are the ones
+`tests/embedgemma2_audio_model.rs` states):
+
+| Check | Bound | Observed |
+|---|---|---|
+| the f64 reference vs transformers (`tests/embedgemma2_audio_fixtures.rs`: tiny random tower, 3 clips, trailing and interior padding, bounds that bite) | `1e-5` × max | ≤ `5.7e-7` |
+| each kernel vs the f64 reference, small and real shapes (`tests/embedgemma2_audio_kernels.rs`) | `2e-5` × max | ≤ `1.4e-6` (second conv, 128 -> 32 channels) |
+| tiny tower, 2 layers (`tests/embedgemma2_audio_tiny.rs`): subsample, each layer, tower output | `1e-4` × max | ≤ `1.7e-6` |
+| tiny tower, soft tokens | `1e-4` max abs | ≤ `2.4e-6` |
+| same at the checkpoint's attention geometry (hidden 256, head dim 128, chunk 12) | as above | ≤ `1.4e-6`, soft ≤ `2.2e-6` |
+| clip alone vs inside any batch, reordered, traced, with every unzeroed activation poisoned, across a split into two forwards | bit-identical | bit-identical |
+| real checkpoint, clip 0 (99 frames, 25 tokens), subsample, 12 layers, tower output | `1e-4` × max | ≤ `2.9e-6` (layer 11), tower `3.9e-6` |
+| real checkpoint, clip 1 (330 frames, 329 valid, 83 tokens) | `1e-4` × max | ≤ `5.1e-6` (layer 11), tower `1.0e-5` |
+| real checkpoint, soft tokens | `1e-4` × max | `5.7e-6` and `2.1e-5` (max abs `2.9e-5`, `1.1e-4` on values up to 5.5); cosine 1.000000000 |
+| both clips in one batch vs alone | bit-identical | bit-identical |
+
+The tiny test's bounds bite: with the clip bounds, the gradient clip or the
+softcap relaxed in the reference, the tower output moves by `74 %`, `30 %`
+and `3.7 %` of its maximum. Two mutations of the attention kernel (the window
+one frame wider, the relative index off by one) each fail it at `1e-1`.
+
+The first run of the real-checkpoint test failed its soft-token check at
+`1.14e-4` max abs because the check had been written as an absolute `1e-4`
+where the other stages (and the task) bound by `1e-4` of the largest
+magnitude; the stated bound is the relative one, and the soft tokens are within
+`2.1e-5` of it. Nothing else was changed. The reference there is the sdpa one.
+
+### Speed follow-ups (not measured; no timing was run)
+
+About 28 dispatches per layer, most of them elementwise, and 48 MFLOP per row
+per layer in the GEMMs (two feed-forwards 33.6, attention projections 8.4,
+light-conv linears 6.3; inferred from the shapes). Candidates, each needing a
+benchmark before it is believed: one packed q|k|v GEMM (the three input bounds
+differ in the checkpoint, so it needs a clamping prologue or one clamped copy per
+distinct bound); clamps on the exact-f32 GEMM path; fusing the GLU into the
+depthwise conv and the conv-norm; sharing K/V loads across the 12 queries of a
+block in the attention (each (query, head) reloads its 12 keys and values); the
+bf16 mode.

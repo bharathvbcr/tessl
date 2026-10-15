@@ -113,7 +113,14 @@ fn conv0_case(rt: &Arc<GpuRuntime>, frames: &[usize], mels: usize, channels: usi
     .unwrap();
     let got = read(rt, &out, n_out);
     for (i, c) in table.clips.iter().enumerate() {
-        let (want, (_, to, fo), _) = conv_layer(&f64s(&feats[i]), (1, c.frames, mels), &ms[i], &f64s(&w), &f64s(&gamma), f64::from(eps));
+        let (want, (_, to, fo), _) = conv_layer(
+            &f64s(&feats[i]),
+            (1, c.frames, mels),
+            &ms[i],
+            &f64s(&w),
+            &f64s(&gamma),
+            f64::from(eps),
+        );
         assert_eq!((to, fo), (c.mid_rows, mels1));
         let mut g = Vec::new();
         let mut e = Vec::new();
@@ -125,7 +132,11 @@ fn conv0_case(rt: &Arc<GpuRuntime>, frames: &[usize], mels: usize, channels: usi
                 }
             }
         }
-        assert_close(&format!("conv0 mels {mels} channels {channels} clip {i} ({} frames)", c.frames), &g, &e);
+        assert_close(
+            &format!("conv0 mels {mels} channels {channels} clip {i} ({} frames)", c.frames),
+            &g,
+            &e,
+        );
     }
 }
 
@@ -147,7 +158,10 @@ fn conv1_case(rt: &Arc<GpuRuntime>, frames: &[usize], mels1: usize, c0: usize, c
     let ms = masks(frames);
     let table = ClipTable::new(rt, frames).unwrap();
     // The first layer's output is post-ReLU: non-negative.
-    let mid: Vec<f32> = rand(&mut r, table.mid_rows * mels1 * c0, 1.0, 0.0).iter().map(|v| v.abs()).collect();
+    let mid: Vec<f32> = rand(&mut r, table.mid_rows * mels1 * c0, 1.0, 0.0)
+        .iter()
+        .map(|v| v.abs())
+        .collect();
     // The checkpoint's [c1, c0, 3, 3], and the kernel's [tap, c0, c1].
     let w_ck = rand(&mut r, c1 * c0 * 9, 2.0 / (9.0 * c0 as f64).sqrt(), 0.0);
     let mut w_k = vec![0.0f32; 9 * c0 * c1];
@@ -190,7 +204,14 @@ fn conv1_case(rt: &Arc<GpuRuntime>, frames: &[usize], mels1: usize, c0: usize, c
             }
         }
         let m1: Vec<bool> = ms[i].iter().step_by(2).copied().collect();
-        let (want, (_, t2, f2), _) = conv_layer(&x, (c0, c.mid_rows, mels1), &m1, &f64s(&w_ck), &f64s(&gamma), f64::from(eps));
+        let (want, (_, t2, f2), _) = conv_layer(
+            &x,
+            (c0, c.mid_rows, mels1),
+            &m1,
+            &f64s(&w_ck),
+            &f64s(&gamma),
+            f64::from(eps),
+        );
         assert_eq!((t2, f2), (c.rows, mels2));
         let mut g = Vec::new();
         let mut e = Vec::new();
@@ -264,11 +285,18 @@ fn norm_case(rt: &Arc<GpuRuntime>, c: &NormCase, eps: f32, seed: u64) {
         for (d, y) in normed.into_iter().enumerate() {
             let y = if c.silu { silu(y) } else { y };
             let y = clamp(y, f64::from(c.post.lo), f64::from(c.post.hi)) * f64::from(c.scale);
-            want.push(if c.resid { y + f64::from(res[row * c.dim + d]) } else { y });
+            want.push(if c.resid {
+                y + f64::from(res[row * c.dim + d])
+            } else {
+                y
+            });
         }
     }
     assert_close(
-        &format!("rms_norm {}x{} weight {} silu {} resid {}", c.rows, c.dim, c.weight, c.silu, c.resid),
+        &format!(
+            "rms_norm {}x{} weight {} silu {} resid {}",
+            c.rows, c.dim, c.weight, c.silu, c.resid
+        ),
         &got,
         &want,
     );
@@ -291,18 +319,91 @@ fn rms_norm_matches_the_f64_reference() {
     let none = Clamp::NONE;
     let c = |lo: f32, hi: f32| Clamp::new(lo, hi).unwrap();
     with_gpu(|rt| {
-        for (i, (rows, dim)) in [(5usize, 64usize), (3, 7), (4, 33), (9, 1024), (6, 1536)].into_iter().enumerate() {
+        for (i, (rows, dim)) in [(5usize, 64usize), (3, 7), (4, 33), (9, 1024), (6, 1536)]
+            .into_iter()
+            .enumerate()
+        {
             let seed = 100 + i as u64;
             // The plain weighted norm.
-            norm_case(rt, &NormCase { rows, dim, weight: true, pre: [none; 2], silu: false, post: none, scale: 1.0, resid: false }, 1e-6, seed);
+            norm_case(
+                rt,
+                &NormCase {
+                    rows,
+                    dim,
+                    weight: true,
+                    pre: [none; 2],
+                    silu: false,
+                    post: none,
+                    scale: 1.0,
+                    resid: false,
+                },
+                1e-6,
+                seed,
+            );
             // The weightless embedder norm.
-            norm_case(rt, &NormCase { rows, dim, weight: false, pre: [none; 2], silu: false, post: none, scale: 1.0, resid: false }, 1e-6, seed);
+            norm_case(
+                rt,
+                &NormCase {
+                    rows,
+                    dim,
+                    weight: false,
+                    pre: [none; 2],
+                    silu: false,
+                    post: none,
+                    scale: 1.0,
+                    resid: false,
+                },
+                1e-6,
+                seed,
+            );
             // Both pre clamps, the activation, the post clamp (conv_norm).
-            norm_case(rt, &NormCase { rows, dim, weight: true, pre: [c(-1.5, 2.0), c(-1.0, 1.2)], silu: true, post: c(-0.5, 0.9), scale: 1.0, resid: false }, 1e-5, seed);
+            norm_case(
+                rt,
+                &NormCase {
+                    rows,
+                    dim,
+                    weight: true,
+                    pre: [c(-1.5, 2.0), c(-1.0, 1.2)],
+                    silu: true,
+                    post: c(-0.5, 0.9),
+                    scale: 1.0,
+                    resid: false,
+                },
+                1e-5,
+                seed,
+            );
             // The feed-forward's post norm: scale, then the residual.
-            norm_case(rt, &NormCase { rows, dim, weight: true, pre: [c(-2.0, 2.5), none], silu: false, post: none, scale: 0.5, resid: true }, 1e-6, seed);
+            norm_case(
+                rt,
+                &NormCase {
+                    rows,
+                    dim,
+                    weight: true,
+                    pre: [c(-2.0, 2.5), none],
+                    silu: false,
+                    post: none,
+                    scale: 0.5,
+                    resid: true,
+                },
+                1e-6,
+                seed,
+            );
             // A lo > hi clamp gives hi (torch.clamp).
-            norm_case(rt, &NormCase { rows, dim, weight: true, pre: [c(1.0, -1.0), none], silu: false, post: none, scale: 1.0, resid: false }, 1e-6, seed);
+            norm_case(
+                rt,
+                &NormCase {
+                    rows,
+                    dim,
+                    weight: true,
+                    pre: [c(1.0, -1.0), none],
+                    silu: false,
+                    post: none,
+                    scale: 1.0,
+                    resid: false,
+                },
+                1e-6,
+                seed,
+            );
         }
     });
 }
@@ -332,6 +433,7 @@ fn rms_norm_adds_into_its_residual_in_place() {
     });
 }
 
+#[allow(clippy::too_many_arguments)]
 fn ew_case(rt: &Arc<GpuRuntime>, n: usize, pre: Clamp, silu_on: bool, post: Clamp, add: u8, cols: usize, seed: u64) {
     let mut r = SplitMix::new(seed);
     let x = rand(&mut r, n, 4.0, 0.0);
@@ -410,7 +512,11 @@ fn glu_matches_the_f64_reference() {
 fn dwconv1d_causal_matches_the_f64_reference() {
     with_gpu(|rt| {
         // Clips shorter than the taps, a single row, and the checkpoint's.
-        for (frames, hidden, taps) in [(vec![3usize, 12, 1, 7], 9usize, 5usize), (vec![99, 330, 4], 1024, 5), (vec![6, 2], 16, 1)] {
+        for (frames, hidden, taps) in [
+            (vec![3usize, 12, 1, 7], 9usize, 5usize),
+            (vec![99, 330, 4], 1024, 5),
+            (vec![6, 2], 16, 1),
+        ] {
             let mut r = SplitMix::new(hidden as u64);
             let table = ClipTable::new(rt, &frames).unwrap();
             let x = rand(&mut r, table.rows * hidden, 2.0, 0.0);
@@ -434,7 +540,11 @@ fn dwconv1d_causal_matches_the_f64_reference() {
                     }
                 }
             }
-            assert_close(&format!("dwconv {} rows hidden {hidden} taps {taps}", table.rows), &read(rt, &out, n), &want);
+            assert_close(
+                &format!("dwconv {} rows hidden {hidden} taps {taps}", table.rows),
+                &read(rt, &out, n),
+                &want,
+            );
         }
     });
 }
@@ -507,7 +617,11 @@ fn attn_case(rt: &Arc<GpuRuntime>, a: &AttnCase, frames: &[usize], seed: u64) {
     .unwrap();
     let got = read(rt, &out, rows * hidden);
 
-    let cl = |v: &[f32], c: Clamp| -> Vec<f64> { v.iter().map(|&x| clamp(f64::from(x), f64::from(c.lo), f64::from(c.hi))).collect() };
+    let cl = |v: &[f32], c: Clamp| -> Vec<f64> {
+        v.iter()
+            .map(|&x| clamp(f64::from(x), f64::from(c.lo), f64::from(c.hi)))
+            .collect()
+    };
     let aspec = AttnSpec {
         heads: nh,
         head_dim: hd,
@@ -524,12 +638,23 @@ fn attn_case(rt: &Arc<GpuRuntime>, a: &AttnCase, frames: &[usize], seed: u64) {
     let mut e = Vec::new();
     for (i, c) in table.clips.iter().enumerate() {
         let span = c.row0 * hidden..(c.row0 + c.rows) * hidden;
-        let want = attention_ref(&aspec, &qc[span.clone()], &kc[span.clone()], &vc[span.clone()], &rel_r, &qm_r, &oms[i]);
+        let want = attention_ref(
+            &aspec,
+            &qc[span.clone()],
+            &kc[span.clone()],
+            &vc[span.clone()],
+            &rel_r,
+            &qm_r,
+            &oms[i],
+        );
         g.extend_from_slice(&got[span]);
         e.extend(want.iter().map(|&v| clamp(v, f64::from(co.lo), f64::from(co.hi))));
     }
     assert_close(
-        &format!("attention {nh} heads of {hd}, chunk {}, left {}, clips {frames:?}", a.chunk, a.left),
+        &format!(
+            "attention {nh} heads of {hd}, chunk {}, left {}, clips {frames:?}",
+            a.chunk, a.left
+        ),
         &g,
         &e,
     );
@@ -539,17 +664,41 @@ fn attn_case(rt: &Arc<GpuRuntime>, a: &AttnCase, frames: &[usize], seed: u64) {
 fn attention_matches_the_f64_reference() {
     with_gpu(|rt| {
         // Small, with a head dim that is not a multiple of the lane count.
-        let small = AttnCase { heads: 3, head_dim: 10, chunk: 4, left: 5, cap: 3.0 };
+        let small = AttnCase {
+            heads: 3,
+            head_dim: 10,
+            chunk: 4,
+            left: 5,
+            cap: 3.0,
+        };
         attn_case(rt, &small, &[14, 40, 3, 9, 100, 4, 1], 1);
         // Another window geometry: the past longer than the chunk.
-        let long_past = AttnCase { heads: 2, head_dim: 33, chunk: 3, left: 8, cap: 5.0 };
+        let long_past = AttnCase {
+            heads: 2,
+            head_dim: 33,
+            chunk: 3,
+            left: 8,
+            cap: 5.0,
+        };
         attn_case(rt, &long_past, &[10, 60, 13], 2);
         // The checkpoint's: 8 heads of 128, chunk 12, 12 frames of past,
         // clips of one, a few, a block, a block and a bit, and many blocks.
-        let real = AttnCase { heads: 8, head_dim: 128, chunk: 12, left: 13, cap: 50.0 };
+        let real = AttnCase {
+            heads: 8,
+            head_dim: 128,
+            chunk: 12,
+            left: 13,
+            cap: 50.0,
+        };
         attn_case(rt, &real, &[1, 11, 12, 13, 25, 83, 100, 4], 3);
         // Head dim 256, the most a lane holds.
-        let wide = AttnCase { heads: 1, head_dim: 256, chunk: 6, left: 7, cap: 8.0 };
+        let wide = AttnCase {
+            heads: 1,
+            head_dim: 256,
+            chunk: 6,
+            left: 7,
+            cap: 8.0,
+        };
         attn_case(rt, &wide, &[30, 7], 4);
     });
 }
@@ -576,15 +725,56 @@ fn the_wrappers_refuse_what_the_kernels_cannot_run() {
         assert!(err(sub_conv0_ln_relu(rt, &ok, &mask, &ok, &ok, &ok, &table, 8, 513, 1e-6)).contains("channels"));
         assert!(err(sub_conv0_ln_relu(rt, &ok, &mask, &ok, &ok, &ok, &table, 8, 4, 0.0)).contains("eps"));
         assert!(err(sub_conv0_ln_relu(rt, &small, &mask, &ok, &ok, &ok, &table, 8, 4, 1e-6)).contains("sub_conv0"));
-        assert!(err(sub_conv1_ln_relu(rt, &ok, &mask, &ok, &ok, &ok, &table, 4, 4, 129, 1e-6)).contains("c1"));
-        assert!(err(sub_conv1_ln_relu(rt, &ok, &mask, &small, &ok, &ok, &table, 4, 4, 4, 1e-6)).contains("sub_conv1"));
+        assert!(err(sub_conv1_ln_relu(
+            rt, &ok, &mask, &ok, &ok, &ok, &table, 4, 4, 129, 1e-6
+        ))
+        .contains("c1"));
+        assert!(err(sub_conv1_ln_relu(
+            rt, &ok, &mask, &small, &ok, &ok, &table, 4, 4, 4, 1e-6
+        ))
+        .contains("sub_conv1"));
         // Norms and elementwise passes.
         assert!(err(rms_norm(rt, &small, &ok, 4, 4, &RmsNorm::new(1e-6, None))).contains("rms_norm"));
         assert!(err(rms_norm(rt, &ok, &ok, 4, 0, &RmsNorm::new(1e-6, None))).contains("dim"));
         assert!(err(rms_norm(rt, &ok, &ok, 4, 4, &RmsNorm::new(f32::NAN, None))).contains("eps"));
-        assert!(err(rms_norm(rt, &ok, &ok, 4, 4, &RmsNorm { scale: f32::INFINITY, ..RmsNorm::new(1e-6, None) })).contains("scale"));
-        assert!(err(ew(rt, &ok, &ok, 12, &Ew { pre: Clamp::NONE, silu: false, post: Clamp::NONE, add: EwAdd::Bias(&ok, 5) })).contains("bias"));
-        assert!(err(ew(rt, &small, &ok, 12, &Ew { pre: Clamp::NONE, silu: false, post: Clamp::NONE, add: EwAdd::None })).contains("ew x"));
+        assert!(err(rms_norm(
+            rt,
+            &ok,
+            &ok,
+            4,
+            4,
+            &RmsNorm {
+                scale: f32::INFINITY,
+                ..RmsNorm::new(1e-6, None)
+            }
+        ))
+        .contains("scale"));
+        assert!(err(ew(
+            rt,
+            &ok,
+            &ok,
+            12,
+            &Ew {
+                pre: Clamp::NONE,
+                silu: false,
+                post: Clamp::NONE,
+                add: EwAdd::Bias(&ok, 5)
+            }
+        ))
+        .contains("bias"));
+        assert!(err(ew(
+            rt,
+            &small,
+            &ok,
+            12,
+            &Ew {
+                pre: Clamp::NONE,
+                silu: false,
+                post: Clamp::NONE,
+                add: EwAdd::None
+            }
+        ))
+        .contains("ew x"));
         assert!(Clamp::new(f32::NAN, 0.0).is_err());
         assert!(err(glu(rt, &small, &ok, 2, 4, Clamp::NONE)).contains("glu"));
         assert!(err(dwconv1d_causal(rt, &ok, &ok, &ok, &table, 4, 0)).contains("taps"));
@@ -609,7 +799,12 @@ fn the_wrappers_refuse_what_the_kernels_cannot_run() {
         assert!(err(call(&AttentionSpec { cap: 0.0, ..spec })).contains("unsupported"));
         assert!(err(call(&AttentionSpec { past: 0, ..spec })).contains("unsupported"));
         // A window whose shifted rows the table would reach.
-        assert!(err(call(&AttentionSpec { chunk: 30, past: 2, ..spec })).contains("unsupported"));
+        assert!(err(call(&AttentionSpec {
+            chunk: 30,
+            past: 2,
+            ..spec
+        }))
+        .contains("unsupported"));
         // Outputs aliasing inputs.
         assert!(attention(rt, &ok, &ok, &ok, &ok, &ok, &mask, &ok, &table, &spec).is_err());
     });

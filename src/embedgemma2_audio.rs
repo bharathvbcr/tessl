@@ -81,7 +81,7 @@ use std::sync::Arc;
 
 use objc2_metal::MTLComputePipelineState;
 
-use crate::dispatch::{dispatch_1d, dispatch_2d_tg, dispatch_3d, set_gpu_buf, set_u32};
+use crate::dispatch::{dispatch_1d, dispatch_2d_tg, set_gpu_buf, set_u32};
 use crate::gemm::{gemm, select_backend, GemmBackend};
 use crate::json::{self, Json, Syntax};
 use crate::loader::Loader;
@@ -354,7 +354,9 @@ impl AudioConfig {
         };
         let text_hidden = match root.get("text_config") {
             Some(t) => uint_in(t, "hidden_size")?,
-            None => return Err("config.json: missing \"text_config\" (the soft tokens' width is its hidden_size)".into()),
+            None => {
+                return Err("config.json: missing \"text_config\" (the soft tokens' width is its hidden_size)".into())
+            }
         };
         let cfg = Self {
             hidden: uint("hidden_size")?,
@@ -532,10 +534,7 @@ impl ClipTable {
     /// for the GPU ([`GpuRuntime::alloc_buffer_from_u32`]).
     pub fn new(rt: &Arc<GpuRuntime>, frames: &[usize]) -> Result<ClipTable, String> {
         if frames.is_empty() || frames.len() > MAX_CLIPS {
-            return Err(format!(
-                "{WHAT}: {} clips; need 1..={MAX_CLIPS}",
-                frames.len()
-            ));
+            return Err(format!("{WHAT}: {} clips; need 1..={MAX_CLIPS}", frames.len()));
         }
         let (mut clips, mut words) = (Vec::with_capacity(frames.len()), Vec::new());
         let (mut f0, mut m0, mut r0) = (0usize, 0usize, 0usize);
@@ -626,7 +625,13 @@ pub fn sub_conv0_ln_relu(
     require_disjoint_writes(
         E,
         &[("out", out)],
-        &[("feats", feats), ("fmask", fmask), ("w", w), ("gamma", gamma), ("clips", &clips.buffer)],
+        &[
+            ("feats", feats),
+            ("fmask", fmask),
+            ("w", w),
+            ("gamma", gamma),
+            ("clips", &clips.buffer),
+        ],
     )?;
     let p = rt.pipeline("eg2a_sub_conv0_ln_relu")?;
     let tptg = (channels as usize)
@@ -682,25 +687,21 @@ pub fn sub_conv1_ln_relu(
     }
     let mels2 = conv_out(mels1 as usize) as u32;
     check_table(rt, clips, E)?;
-    require::<f32>(
-        rt,
-        mid,
-        elems(&[clips.mid_rows as u32, mels1, c0], E)?,
-        "sub_conv1 mid",
-    )?;
+    require::<f32>(rt, mid, elems(&[clips.mid_rows as u32, mels1, c0], E)?, "sub_conv1 mid")?;
     require::<u32>(rt, fmask, clips.frames, "sub_conv1 fmask")?;
     require::<f32>(rt, w, elems(&[9, c0, c1], E)?, "sub_conv1 w")?;
     require::<f32>(rt, gamma, c1 as usize, "sub_conv1 gamma")?;
-    require::<f32>(
-        rt,
-        out,
-        elems(&[clips.rows as u32, mels2, c1], E)?,
-        "sub_conv1 out",
-    )?;
+    require::<f32>(rt, out, elems(&[clips.rows as u32, mels2, c1], E)?, "sub_conv1 out")?;
     require_disjoint_writes(
         E,
         &[("out", out)],
-        &[("mid", mid), ("fmask", fmask), ("w", w), ("gamma", gamma), ("clips", &clips.buffer)],
+        &[
+            ("mid", mid),
+            ("fmask", fmask),
+            ("w", w),
+            ("gamma", gamma),
+            ("clips", &clips.buffer),
+        ],
     )?;
     let p = rt.pipeline("eg2a_sub_conv1_ln_relu")?;
     dispatch_2d_tg(
@@ -934,21 +935,15 @@ pub fn dwconv1d_causal(
     require::<f32>(rt, w, elems(&[hidden, taps], E)?, "dwconv w")?;
     require_disjoint_writes(E, &[("out", out)], &[("x", x), ("w", w), ("clips", &clips.buffer)])?;
     let p = rt.pipeline("eg2a_dwconv1d_causal")?;
-    dispatch_3d(
-        rt,
-        &p,
-        hidden as usize,
-        clips.max_rows(),
-        clips.clips.len(),
-        |bnd| {
-            set_gpu_buf(bnd, x, 0);
-            set_gpu_buf(bnd, w, 1);
-            set_gpu_buf(bnd, out, 2);
-            set_gpu_buf(bnd, &clips.buffer, 3);
-            set_u32(bnd, hidden, 4);
-            set_u32(bnd, taps, 5);
-        },
-    )
+    let groups_x = clips.max_rows() * (hidden as usize).div_ceil(32);
+    dispatch_2d_tg(rt, &p, groups_x, clips.clips.len(), 32, |bnd| {
+        set_gpu_buf(bnd, x, 0);
+        set_gpu_buf(bnd, w, 1);
+        set_gpu_buf(bnd, out, 2);
+        set_gpu_buf(bnd, &clips.buffer, 3);
+        set_u32(bnd, hidden, 4);
+        set_u32(bnd, taps, 5);
+    })
 }
 
 /// Shape and constants of one [`attention`] call.
@@ -1018,7 +1013,15 @@ pub fn attention(
     require_disjoint_writes(
         E,
         &[("out", out)],
-        &[("q", q), ("k", k), ("v", v), ("rel", rel), ("q_mult", q_mult), ("omask", omask), ("clips", &clips.buffer)],
+        &[
+            ("q", q),
+            ("k", k),
+            ("v", v),
+            ("rel", rel),
+            ("q_mult", q_mult),
+            ("omask", omask),
+            ("clips", &clips.buffer),
+        ],
     )?;
     let p = rt.pipeline("eg2a_attn")?;
     let params = bytes(&[
@@ -1239,11 +1242,7 @@ impl EmbedGemma2Audio {
         }
         let conv1_w = ld.buf(&w1p)?;
         let conv1_norm = ld.norm(&sub("layer1.norm.weight"), c1)?;
-        let input_proj = ld.linear(
-            &[(&sub("input_proj_linear.weight"), h)],
-            cfg.proj_in() as usize,
-            f32p,
-        )?;
+        let input_proj = ld.linear(&[(&sub("input_proj_linear.weight"), h)], cfg.proj_in() as usize, f32p)?;
 
         let bound = |name: &str| -> Result<Bounds, String> {
             if !cfg.clipped_linears {
@@ -1359,7 +1358,10 @@ impl EmbedGemma2Audio {
             return Err(format!("{E}: empty batch"));
         }
         if clips.len() > MAX_CLIPS {
-            return Err(format!("{E}: {} clips exceeds the batch limit {MAX_CLIPS}", clips.len()));
+            return Err(format!(
+                "{E}: {} clips exceeds the batch limit {MAX_CLIPS}",
+                clips.len()
+            ));
         }
         if self.rt.f32_gemm_runs_relaxed() {
             return Err(format!(
@@ -1457,7 +1459,8 @@ impl EmbedGemma2Audio {
         };
         for (g, io) in &pending {
             // One host mapping at a time (the runtime's access is exclusive).
-            let read = |t: &Tensor| -> Result<Vec<f32>, String> { Ok(t.buffer.try_contents_f32()?[..t.numel()].to_vec()) };
+            let read =
+                |t: &Tensor| -> Result<Vec<f32>, String> { Ok(t.buffer.try_contents_f32()?[..t.numel()].to_vec()) };
             let soft = read(&io.soft)?;
             let traced: Vec<Vec<f32>> = io.trace.iter().map(read).collect::<Result<_, _>>()?;
             for (&i, cr) in g.iter().zip(&io.clips.clips) {
@@ -1494,6 +1497,16 @@ impl EmbedGemma2Audio {
         let rt = &self.rt;
         let (h, mid, rows) = (cfg.hidden as usize, mid.max(1), rows.max(1));
         let mels1 = conv_out(cfg.mel_bins() as usize);
+        // Every elementwise pass counts its elements in a u32.
+        let widest = rows
+            .checked_mul(4 * h.max(cfg.out_dims as usize))
+            .filter(|&n| n <= u32::MAX as usize);
+        if widest.is_none() {
+            return Err(format!(
+                "EmbedGemma2Audio::encode_audio: {rows} rows of width {} overflow a 32-bit element count",
+                4 * h.max(cfg.out_dims as usize)
+            ));
+        }
         let f32s = |shape: &[usize]| rt.alloc_tensor_unzeroed(shape, DType::F32);
         Ok(Acts {
             mid: f32s(&[mid, mels1 * cfg.sub_channels[0] as usize])?,
@@ -1732,7 +1745,14 @@ impl EmbedGemma2Audio {
             gpu_copy(&tower, t)?;
         }
         let emb = at(&a.emb, cfg.out_dims)?;
-        rms_norm(rt, &tower.buffer, &emb.buffer, rows_u, cfg.out_dims, &RmsNorm::new(eps, None))?;
+        rms_norm(
+            rt,
+            &tower.buffer,
+            &emb.buffer,
+            rows_u,
+            cfg.out_dims,
+            &RmsNorm::new(eps, None),
+        )?;
         gemm(&emb, &self.embed_proj, &io.soft, backend)
     }
 }
@@ -1740,7 +1760,13 @@ impl EmbedGemma2Audio {
 /// The tower's mask for a clip's frame mask: `mask[::2][::2]`, one entry per
 /// tower row.
 pub fn out_mask(mask: &[bool]) -> Vec<bool> {
-    mask.iter().step_by(2).copied().collect::<Vec<_>>().into_iter().step_by(2).collect()
+    mask.iter()
+        .step_by(2)
+        .copied()
+        .collect::<Vec<_>>()
+        .into_iter()
+        .step_by(2)
+        .collect()
 }
 
 #[cfg(test)]
@@ -1764,7 +1790,10 @@ mod tests {
         let c = real();
         assert_eq!((c.hidden, c.layers, c.heads, c.head_dim()), (1024, 12, 8, 128));
         assert_eq!((c.chunk, c.past(), c.ctx(), c.rel_rows()), (12, 12, 24, 13));
-        assert_eq!((c.mel_bins(), c.proj_in(), c.out_dims, c.embed_dim), (128, 1024, 1536, 512));
+        assert_eq!(
+            (c.mel_bins(), c.proj_in(), c.out_dims, c.embed_dim),
+            (128, 1024, 1536, 512)
+        );
         assert_eq!(c.gradient_clip, 1e10);
         assert!(c.clipped_linears);
     }
@@ -1773,18 +1802,54 @@ mod tests {
     fn config_refuses_what_the_forward_does_not_implement() {
         let swap = |from: &str, to: &str| REAL.replace(from, to);
         for (from, to, why) in [
-            ("\"attention_context_right\":0", "\"attention_context_right\":2", "future context"),
+            (
+                "\"attention_context_right\":0",
+                "\"attention_context_right\":2",
+                "future context",
+            ),
             ("\"hidden_act\":\"silu\"", "\"hidden_act\":\"gelu\"", "activation"),
-            ("\"num_attention_heads\":8", "\"num_attention_heads\":7", "heads that do not divide"),
-            ("\"subsampling_conv_channels\":[128,32]", "\"subsampling_conv_channels\":[128]", "one conv"),
-            ("\"subsampling_conv_channels\":[128,32]", "\"subsampling_conv_channels\":[130,32]", "channels % 4"),
-            ("\"subsampling_conv_channels\":[128,32]", "\"subsampling_conv_channels\":[128,200]", "wide second conv"),
-            ("\"attention_chunk_size\":12", "\"attention_chunk_size\":0", "zero chunk"),
-            ("\"attention_chunk_size\":12", "\"attention_chunk_size\":60", "window past 64"),
-            ("\"attention_context_left\":13", "\"attention_context_left\":1", "no past"),
+            (
+                "\"num_attention_heads\":8",
+                "\"num_attention_heads\":7",
+                "heads that do not divide",
+            ),
+            (
+                "\"subsampling_conv_channels\":[128,32]",
+                "\"subsampling_conv_channels\":[128]",
+                "one conv",
+            ),
+            (
+                "\"subsampling_conv_channels\":[128,32]",
+                "\"subsampling_conv_channels\":[130,32]",
+                "channels % 4",
+            ),
+            (
+                "\"subsampling_conv_channels\":[128,32]",
+                "\"subsampling_conv_channels\":[128,200]",
+                "wide second conv",
+            ),
+            (
+                "\"attention_chunk_size\":12",
+                "\"attention_chunk_size\":0",
+                "zero chunk",
+            ),
+            (
+                "\"attention_chunk_size\":12",
+                "\"attention_chunk_size\":60",
+                "window past 64",
+            ),
+            (
+                "\"attention_context_left\":13",
+                "\"attention_context_left\":1",
+                "no past",
+            ),
             ("\"rms_norm_eps\":1e-06", "\"rms_norm_eps\":0.0", "zero eps"),
             ("\"use_clipped_linears\":true", "\"use_clipped_linears\":1", "non-bool"),
-            ("\"model_type\":\"gemma4_audio\"", "\"model_type\":\"gemma4_vision\"", "model type"),
+            (
+                "\"model_type\":\"gemma4_audio\"",
+                "\"model_type\":\"gemma4_vision\"",
+                "model type",
+            ),
         ] {
             let e = AudioConfig::from_config_json(&swap(from, to)).expect_err(why);
             assert!(e.contains("config.json"), "{why}: {e}");
@@ -1818,7 +1883,11 @@ mod tests {
                 assert!((t[p * hidden + 4 + d] - (pos * f).cos()).abs() < 1e-12);
             }
         }
-        assert_eq!(rel_position_table(2, 2).len(), 2 * 2, "one timescale: the divisor is max(n - 1, 1)");
+        assert_eq!(
+            rel_position_table(2, 2).len(),
+            2 * 2,
+            "one timescale: the divisor is max(n - 1, 1)"
+        );
     }
 
     /// `_rel_shift` literally: pad each row of `[chunk, rel_rows]` to `ctx + 1`,
@@ -1843,9 +1912,8 @@ mod tests {
             let lit = rel_shift_literal(chunk, rel_rows, ctx);
             // Only configurations the config accepts read no shifted rows.
             let accepted = ctx + 2 >= chunk + rel_rows;
-            for i in 0..chunk {
-                for j in 0..ctx {
-                    let want = lit[i][j];
+            for (i, row) in lit.iter().enumerate() {
+                for (j, &want) in row.iter().enumerate() {
                     match rel_shift_source(i, j, rel_rows) {
                         Some(col) => assert_eq!(want, i * 1000 + col + 1, "chunk {chunk} past {past} ({i},{j})"),
                         None if accepted => assert_eq!(want, 0, "chunk {chunk} past {past} ({i},{j})"),
@@ -1934,7 +2002,7 @@ mod tests {
     fn row_spaces() {
         assert_eq!(
             [1usize, 2, 3, 4, 5, 99, 330].map(sub_rows),
-            [1, 1, 2, 2, 3, 25, 83],
+            [1, 1, 1, 1, 2, 25, 83],
             "ceil(ceil(F/2)/2): the goldens' 99 frames give 25 tokens and 330 give 83"
         );
         let mask: Vec<bool> = (0..330).map(|i| i < 329).collect();
@@ -1952,13 +2020,7 @@ mod tests {
         assert!(Clamp::new(f32::NAN, 1.0).is_err());
         assert_eq!(Clamp::symmetric(f32::INFINITY), Clamp::NONE);
         assert_eq!(Clamp::symmetric(2.0), Clamp { lo: -2.0, hi: 2.0 });
-        assert_eq!(
-            Clamp::symmetric(1e10),
-            Clamp {
-                lo: -1e10,
-                hi: 1e10
-            }
-        );
+        assert_eq!(Clamp::symmetric(1e10), Clamp { lo: -1e10, hi: 1e10 });
     }
 
     #[test]

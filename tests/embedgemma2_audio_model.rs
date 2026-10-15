@@ -95,7 +95,10 @@ fn clip_input(dir: &std::path::Path, prefix: &str) -> AudioInput {
 
 fn max_abs(a: &[f32], b: &[f32]) -> f64 {
     assert_eq!(a.len(), b.len());
-    a.iter().zip(b).map(|(x, y)| (f64::from(*x) - f64::from(*y)).abs()).fold(0.0, f64::max)
+    a.iter()
+        .zip(b)
+        .map(|(x, y)| (f64::from(*x) - f64::from(*y)).abs())
+        .fold(0.0, f64::max)
 }
 
 fn scale_of(v: &[f32]) -> f64 {
@@ -124,11 +127,26 @@ fn stages(
 ) -> Vec<(String, Vec<f32>, Vec<f32>, usize)> {
     let tr = &out.trace[i];
     let (h, od) = (cfg.hidden as usize, cfg.out_dims as usize);
-    let mut v = vec![("subsample".to_string(), tr.subsample.clone(), npy_f32(dir, &format!("{prefix}subsample.npy")).1, h)];
+    let mut v = vec![(
+        "subsample".to_string(),
+        tr.subsample.clone(),
+        npy_f32(dir, &format!("{prefix}subsample.npy")).1,
+        h,
+    )];
     for (l, got) in tr.layers.iter().enumerate() {
-        v.push((format!("layer{l}"), got.clone(), npy_f32(dir, &format!("{prefix}layer{l}.npy")).1, h));
+        v.push((
+            format!("layer{l}"),
+            got.clone(),
+            npy_f32(dir, &format!("{prefix}layer{l}.npy")).1,
+            h,
+        ));
     }
-    v.push(("tower_out".to_string(), tr.tower_out.clone(), npy_f32(dir, &format!("{prefix}tower_out.npy")).1, od));
+    v.push((
+        "tower_out".to_string(),
+        tr.tower_out.clone(),
+        npy_f32(dir, &format!("{prefix}tower_out.npy")).1,
+        od,
+    ));
     v
 }
 
@@ -157,7 +175,9 @@ fn audio_tower_matches_transformers_sdpa() {
                     err / scale
                 );
                 if err > LAYER_REL * scale {
-                    failures.push(format!("{prefix}{name}: max abs {err:.3e} > {LAYER_REL:.0e} * {scale:.3e}"));
+                    failures.push(format!(
+                        "{prefix}{name}: max abs {err:.3e} > {LAYER_REL:.0e} * {scale:.3e}"
+                    ));
                 }
             }
             let (shape, want_soft) = npy_f32(&dir, &format!("{prefix}soft.npy"));
@@ -165,17 +185,33 @@ fn audio_tower_matches_transformers_sdpa() {
             assert_eq!(shape, [kept, cfg.embed_dim as usize], "{prefix}soft shape");
             let err = max_abs(&out.soft_tokens[0], &want_soft);
             let cos: f64 = {
-                let dot: f64 = out.soft_tokens[0].iter().zip(&want_soft).map(|(a, b)| f64::from(*a) * f64::from(*b)).sum();
-                let na = out.soft_tokens[0].iter().map(|a| f64::from(*a).powi(2)).sum::<f64>().sqrt();
+                let dot: f64 = out.soft_tokens[0]
+                    .iter()
+                    .zip(&want_soft)
+                    .map(|(a, b)| f64::from(*a) * f64::from(*b))
+                    .sum();
+                let na = out.soft_tokens[0]
+                    .iter()
+                    .map(|a| f64::from(*a).powi(2))
+                    .sum::<f64>()
+                    .sqrt();
                 let nb = want_soft.iter().map(|b| f64::from(*b).powi(2)).sum::<f64>().sqrt();
                 dot / (na * nb)
             };
-            eprintln!("{prefix}soft: {kept} tokens, max abs {err:.3e} (max |ref| {:.3e}), cosine {cos:.9}", scale_of(&want_soft));
+            eprintln!(
+                "{prefix}soft: {kept} tokens, max abs {err:.3e} (max |ref| {:.3e}), cosine {cos:.9}",
+                scale_of(&want_soft)
+            );
             let soft_scale = scale_of(&want_soft);
             if err > LAYER_REL * soft_scale {
-                failures.push(format!("{prefix}soft: max abs {err:.3e} > {LAYER_REL:.0e} * {soft_scale:.3e}"));
+                failures.push(format!(
+                    "{prefix}soft: max abs {err:.3e} > {LAYER_REL:.0e} * {soft_scale:.3e}"
+                ));
             }
-            assert!(out.soft_tokens[0].iter().all(|v| v.is_finite()), "{prefix}: non-finite soft token");
+            assert!(
+                out.soft_tokens[0].iter().all(|v| v.is_finite()),
+                "{prefix}: non-finite soft token"
+            );
             alone.push((out, i));
         }
 
@@ -189,9 +225,15 @@ fn audio_tower_matches_transformers_sdpa() {
             same &= bits(&ta.subsample) == bits(&tb.subsample) && bits(&ta.tower_out) == bits(&tb.tower_out);
             same &= ta.layers.iter().zip(&tb.layers).all(|(x, y)| bits(x) == bits(y));
             let drift = max_abs(&a.soft_tokens[0], &b.soft_tokens[*i]);
-            eprintln!("{}: alone vs batched soft max abs {drift:.3e}, bit-identical {same}", CLIPS[*i]);
+            eprintln!(
+                "{}: alone vs batched soft max abs {drift:.3e}, bit-identical {same}",
+                CLIPS[*i]
+            );
             if !same {
-                failures.push(format!("{}: alone vs batched differ (soft max abs {drift:.3e})", CLIPS[*i]));
+                failures.push(format!(
+                    "{}: alone vs batched differ (soft max abs {drift:.3e})",
+                    CLIPS[*i]
+                ));
             }
         }
         // The reverse order is the same two answers.
@@ -230,9 +272,16 @@ fn eager_references_encode_the_inverted_mask() {
         let mut first_bad = None;
         for (name, got, want, _) in stages(&cfg, &eager, CLIPS[0], &out, 0) {
             let (err, scale) = (max_abs(&got, &want), scale_of(&want));
-            eprintln!("eager {}{name}: max abs {err:.3e} = {:.3e} of max |ref| {scale:.3e}", CLIPS[0], err / scale);
+            eprintln!(
+                "eager {}{name}: max abs {err:.3e} = {:.3e} of max |ref| {scale:.3e}",
+                CLIPS[0],
+                err / scale
+            );
             if name == "subsample" {
-                assert!(err <= LAYER_REL * scale, "the subsampling does not touch attention: {err:.3e}");
+                assert!(
+                    err <= LAYER_REL * scale,
+                    "the subsampling does not touch attention: {err:.3e}"
+                );
             } else if err > LAYER_REL * scale && first_bad.is_none() {
                 first_bad = Some((name, err / scale));
             }

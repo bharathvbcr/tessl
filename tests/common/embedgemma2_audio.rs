@@ -41,7 +41,10 @@ pub fn softplus(x: f64) -> f64 {
 pub fn rms_eps(x: &[f64], w: Option<&[f64]>, eps: f64) -> Vec<f64> {
     let ms = x.iter().map(|v| v * v).sum::<f64>() / x.len() as f64;
     let inv = (ms + eps).powf(-0.5);
-    x.iter().enumerate().map(|(i, v)| v * inv * w.map_or(1.0, |w| w[i])).collect()
+    x.iter()
+        .enumerate()
+        .map(|(i, v)| v * inv * w.map_or(1.0, |w| w[i]))
+        .collect()
 }
 
 /// One subsampling layer on `x: [cin][t][f]` (channels first, as torch holds
@@ -58,7 +61,7 @@ pub fn conv_layer(
     eps: f64,
 ) -> (Vec<f64>, (usize, usize, usize), Vec<bool>) {
     let cout = gamma.len();
-    let (to, fo) = ((t + 1) / 2, (f + 1) / 2);
+    let (to, fo) = (t.div_ceil(2), f.div_ceil(2));
     let at = |c: usize, r: i64, col: i64| -> f64 {
         if r < 0 || col < 0 || r >= t as i64 || col >= f as i64 || !mask[r as usize] {
             0.0
@@ -224,9 +227,7 @@ pub fn attention_ref(
                 }
                 let mut logits: Vec<f64> = (0..ctx)
                     .map(|j| {
-                        let ac: f64 = (0..hd)
-                            .map(|d| qb(b, i, h, d) * ctx_at(k, k_scale, b, j, h, d))
-                            .sum();
+                        let ac: f64 = (0..hd).map(|d| qb(b, i, h, d) * ctx_at(k, k_scale, b, j, h, d)).sum();
                         let x = (ac + flat[i * ctx + j]) / s.cap;
                         let x = x.tanh() * s.cap;
                         if m5(b, i, j) {
@@ -255,7 +256,12 @@ pub type Weights = HashMap<String, Vec<f64>>;
 /// A `Gemma4ClippableLinear` on one row: clamp in, `w [out, in]`, clamp out.
 pub fn clip_lin(w: &Weights, name: &str, x: &[f64], out_f: usize) -> Vec<f64> {
     let bound = |s: &str| w[&format!("{name}.{s}")][0];
-    let (imin, imax, omin, omax) = (bound("input_min"), bound("input_max"), bound("output_min"), bound("output_max"));
+    let (imin, imax, omin, omax) = (
+        bound("input_min"),
+        bound("input_max"),
+        bound("output_min"),
+        bound("output_max"),
+    );
     let wt = &w[&format!("{name}.linear.weight")];
     let in_f = x.len();
     let xc: Vec<f64> = x.iter().map(|&v| clamp(v, imin, imax)).collect();
@@ -291,7 +297,14 @@ pub fn audio_forward(cfg: &AudioConfig, w: &Weights, feats: &[f64], mask: &[bool
         p(&sc("layer0.norm.weight")),
         eps,
     );
-    let (x, d1, om) = conv_layer(&x, d0, &m1, p(&sc("layer1.conv.weight")), p(&sc("layer1.norm.weight")), eps);
+    let (x, d1, om) = conv_layer(
+        &x,
+        d0,
+        &m1,
+        p(&sc("layer1.conv.weight")),
+        p(&sc("layer1.norm.weight")),
+        eps,
+    );
     let (c1, t, f2) = d1;
     // permute(0, 2, 3, 1).reshape(t, -1): row t holds [f2][c1].
     let proj = p(&sc("input_proj_linear.weight"));
@@ -299,8 +312,13 @@ pub fn audio_forward(cfg: &AudioConfig, w: &Weights, feats: &[f64], mask: &[bool
     assert_eq!(proj.len(), h * proj_in, "test bug: input_proj shape");
     let mut hs: Vec<Vec<f64>> = (0..t)
         .map(|ti| {
-            let row: Vec<f64> = (0..f2).flat_map(|fi| (0..c1).map(move |c| (c, fi))).map(|(c, fi)| x[(c * t + ti) * f2 + fi]).collect();
-            (0..h).map(|o| (0..proj_in).map(|i| proj[o * proj_in + i] * row[i]).sum()).collect()
+            let row: Vec<f64> = (0..f2)
+                .flat_map(|fi| (0..c1).map(move |c| (c, fi)))
+                .map(|(c, fi)| x[(c * t + ti) * f2 + fi])
+                .collect();
+            (0..h)
+                .map(|o| (0..proj_in).map(|i| proj[o * proj_in + i] * row[i]).sum())
+                .collect()
         })
         .collect();
     let subsample = hs.concat();
@@ -323,7 +341,12 @@ pub fn audio_forward(cfg: &AudioConfig, w: &Weights, feats: &[f64], mask: &[bool
         let ff = |hs: &mut Vec<Vec<f64>>, name: &str| {
             for r in hs.iter_mut() {
                 let a = rms_eps(&cl(r), Some(p(&lp(&format!("{name}.pre_layer_norm.weight")))), eps);
-                let a = clip_lin(w, &format!("audio_tower.{}", lp(&format!("{name}.ffw_layer_1"))), &a, 4 * h);
+                let a = clip_lin(
+                    w,
+                    &format!("audio_tower.{}", lp(&format!("{name}.ffw_layer_1"))),
+                    &a,
+                    4 * h,
+                );
                 let a: Vec<f64> = a.iter().map(|&v| silu(v)).collect();
                 let a = clip_lin(w, &format!("audio_tower.{}", lp(&format!("{name}.ffw_layer_2"))), &a, h);
                 let a = rms_eps(&cl(&a), Some(p(&lp(&format!("{name}.post_layer_norm.weight")))), eps);
@@ -395,7 +418,11 @@ pub fn audio_forward(cfg: &AudioConfig, w: &Weights, feats: &[f64], mask: &[bool
     let od = cfg.out_dims as usize;
     let tower_rows: Vec<Vec<f64>> = hs
         .iter()
-        .map(|r| (0..od).map(|o| (0..h).map(|i| ow[o * h + i] * r[i]).sum::<f64>() + ob[o]).collect())
+        .map(|r| {
+            (0..od)
+                .map(|o| (0..h).map(|i| ow[o * h + i] * r[i]).sum::<f64>() + ob[o])
+                .collect()
+        })
         .collect();
     let ew = &w["embed_audio.embedding_projection.weight"];
     let ed = cfg.embed_dim as usize;

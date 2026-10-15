@@ -316,3 +316,158 @@ fn refusals_leave_the_model_untouched() {
     bf16.read_parameters(&alloc(&brt, &table)).unwrap();
     e(bf16.write_parameters(&alloc(&brt, &table)), "load_tower");
 }
+
+// ---- per-entry host copies (`*_host`) ----
+
+fn load_tower(precision: Precision) -> (Arc<GpuRuntime>, Qwen35Model) {
+    let rt = GpuRuntime::new().unwrap();
+    let st = SafeTensors::open(&fixture().join("model.safetensors")).unwrap();
+    let cfg = Qwen35Config::from_config_file(&fixture().join("config.json")).unwrap();
+    let model = Qwen35Model::load_tower(&rt, &st, "model.", cfg, precision).unwrap();
+    (rt, model)
+}
+
+fn bits(v: &[f32]) -> Vec<u32> {
+    v.iter().map(|x| x.to_bits()).collect()
+}
+
+/// Every parameter on the host through the whole-table copy.
+fn whole(rt: &Arc<GpuRuntime>, model: &Qwen35Model, table: &[ParamInfo]) -> Vec<Vec<f32>> {
+    let ts = alloc(rt, table);
+    model.read_parameters(&ts).unwrap();
+    ts.iter().map(|t| t.read_f32().unwrap()).collect()
+}
+
+fn numel(p: &ParamInfo) -> usize {
+    p.shape.iter().product()
+}
+
+/// Each entry, f32 and bf16 bank alike (every packed projection past the
+/// first in its bank has a window offset): the per-entry read is the
+/// whole-table read's bits, a gradient likewise, a write of a read changes
+/// nothing, and a write of new values lands in that entry alone.
+#[test]
+fn per_entry_host_copies_match_the_whole_table_copies() {
+    for precision in [Precision::F32, Precision::Bf16] {
+        let (rt, model) = load_tower(precision);
+        let table = model.parameter_table().unwrap();
+        let ids = ids();
+        let step = model
+            .train_step(
+                &ids,
+                if precision == Precision::F32 {
+                    GemmOperands::ExactF32
+                } else {
+                    GemmOperands::Bf16
+                },
+            )
+            .unwrap();
+        let params = whole(&rt, &model, &table);
+        let grads = alloc(&rt, &table);
+        model.read_gradients(&step.grads, &grads).unwrap();
+        for (i, p) in table.iter().enumerate() {
+            let mut got = vec![0.0f32; numel(p)];
+            model.read_parameter_host(i, &mut got).unwrap();
+            assert_eq!(bits(&got), bits(&params[i]), "{precision:?} {} parameter", p.name);
+            model.read_gradient_host(&step.grads, i, &mut got).unwrap();
+            assert_eq!(
+                bits(&got),
+                bits(&grads[i].read_f32().unwrap()),
+                "{precision:?} {} gradient",
+                p.name
+            );
+        }
+        // A read written back is the identity (bf16: widen then round is exact).
+        for (i, p) in table.iter().enumerate() {
+            model.write_parameter_host(i, &params[i]).unwrap();
+            assert_eq!(
+                whole(&rt, &model, &table).iter().map(|v| bits(v)).collect::<Vec<_>>(),
+                params.iter().map(|v| bits(v)).collect::<Vec<_>>(),
+                "{precision:?} {}: write of a read moved something",
+                p.name
+            );
+        }
+        // New values land in their entry alone; bf16 takes them rounded to nearest.
+        for (i, p) in table.iter().enumerate() {
+            let new: Vec<f32> = (0..numel(p)).map(|k| 0.37 + 0.0123 * (k % 31) as f32).collect();
+            model.write_parameter_host(i, &new).unwrap();
+            let after = whole(&rt, &model, &table);
+            let matrix = p.transposed || p.name == "embed_tokens.weight";
+            let stored = |x: f32| match precision {
+                Precision::Bf16 if matrix => tessl::tensor::bf16_bits_to_f32(tessl::tensor::f32_to_bf16_bits(x)),
+                _ => x,
+            };
+            let want: Vec<f32> = new.iter().map(|&x| stored(x)).collect();
+            assert_eq!(bits(&after[i]), bits(&want), "{precision:?} {} written", p.name);
+            for (j, q) in table.iter().enumerate().filter(|(j, _)| *j != i) {
+                assert_eq!(
+                    bits(&after[j]),
+                    bits(&params[j]),
+                    "{precision:?} writing {} moved {}",
+                    p.name,
+                    q.name
+                );
+            }
+            model.write_parameter_host(i, &params[i]).unwrap();
+        }
+    }
+}
+
+/// A bad index or length, a head that cannot be written, or a busy runtime is
+/// a named refusal that moves nothing: values and a live `Decode` (which
+/// refuses once the generation moves) are as they were.
+#[test]
+fn per_entry_host_refusals_move_nothing() {
+    let (rt, model, _st) = load(Precision::F32);
+    let table = model.parameter_table().unwrap();
+    let ids = ids();
+    let before = whole(&rt, &model, &table);
+    let (mut dec, _) = model.prefill(&ids[..4], 2).unwrap();
+    let n = numel(&table[1]);
+    let e = |r: Result<(), String>, needle: &str| {
+        let m = r.expect_err(needle);
+        assert!(m.contains(needle), "{m:?} lacks {needle:?}");
+    };
+    let len = table.len();
+    e(
+        model.write_parameter_host(len, &[1.0]),
+        &format!("parameter index {len} out of range for {len} entries"),
+    );
+    e(model.read_parameter_host(len, &mut [0.0]), "out of range");
+    let mut buf = vec![0.0; n];
+    e(model.write_parameter_host(1, &vec![9.0; n + 1]), &table[1].name);
+    e(model.write_parameter_host(1, &[]), "takes");
+    e(model.read_parameter_host(1, &mut buf[1..]), "takes");
+    e(model.read_parameter_host(1, &mut []), "takes");
+    // Busy: another mapping on the same runtime is the existing refusal.
+    {
+        let other = rt.alloc_tensor_f32(&[1]).unwrap();
+        let _held = other.buffer.try_contents_f32().unwrap();
+        e(model.read_parameter_host(1, &mut buf), "runtime busy");
+        e(model.write_parameter_host(1, &vec![9.0; n]), "runtime busy");
+        let g = model.train_step(&ids, GemmOperands::ExactF32);
+        assert!(g.is_err(), "a train step ran under a host mapping");
+    }
+    let step = model.train_step(&ids, GemmOperands::ExactF32).unwrap();
+    {
+        let held = rt.alloc_tensor_f32(&[1]).unwrap();
+        let _held = held.buffer.try_contents_f32().unwrap();
+        e(model.read_gradient_host(&step.grads, 1, &mut buf), "runtime busy");
+    }
+    e(model.read_gradient_host(&step.grads, 1, &mut buf[1..]), "takes");
+    // Another runtime's gradients are refused by name.
+    let (_, other, _) = load(Precision::F32);
+    let theirs = other.train_step(&ids, GemmOperands::ExactF32).unwrap();
+    e(model.read_gradient_host(&theirs.grads, 1, &mut buf), "another runtime");
+    // Nothing moved: values the same, the session still continues.
+    assert_eq!(
+        whole(&rt, &model, &table).iter().map(|v| bits(v)).collect::<Vec<_>>(),
+        before.iter().map(|v| bits(v)).collect::<Vec<_>>()
+    );
+    dec.step(ids[4]).expect("a refused write bumped the generation");
+    // The inference head's packed copy cannot be left stale.
+    let (_, packed, _) = load(Precision::Bf16);
+    e(packed.write_parameter_host(1, &vec![0.0; n]), "load_tower");
+    let mut out = vec![0.0; n];
+    packed.read_parameter_host(1, &mut out).unwrap();
+}

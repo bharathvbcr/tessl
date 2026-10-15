@@ -611,8 +611,8 @@ slots, then `attn_prefix_decode`) and returns that token's logits. A step
 past `max_new` is refused, and a step that fails part way leaves the
 session refusing further steps rather than continuing from half-advanced
 state. A session, like a `Staged` prefill, records the model's parameter
-generation and refuses to continue once `write_parameters` or `adamw_step`
-has moved it, as a pending training step does. `prefill` checks the state
+generation and refuses to continue once `write_parameters`,
+`write_parameter_host` or `adamw_step` has moved it, as a pending training step does. `prefill` checks the state
 it will keep against the device's recommended working set before any GPU
 work, as a training step checks its own. One sequence, batch 1.
 
@@ -1007,6 +1007,31 @@ gives the square of the global gradient norm, and `grad_scale` multiplies
 every gradient by `clip_grad_norm_`'s coefficient inside the update, with
 no pass over the gradients and the stored ones left unscaled; the caller
 forms the coefficient so gradients outside tessl join the norm.
+
+`adamw_step_scaled` is Rust-only: the C API and `tessl_torch` do not expose it
+(a recorded decision, not a gap).
+
+Parameters, gradients and both AdamW moments also copy one entry at a time on
+the host, so a caller need not allocate a table of GPU tensors the size of the
+model: `read_parameter_host(index, dst)`, `read_gradient_host(grads, index,
+dst)`, `read_adamw_moment_host(state, which, index, dst)` into a `&mut [f32]`,
+and `write_parameter_host(index, src)` and `write_adamw_moment_host(state,
+which, index, src)` from a `&[f32]`. `index` is the position in
+`parameter_table()` and the slice is the entry's `storage_shape` in row-major
+order, the layout the whole-table copies give that entry (a bf16 matrix
+widens exactly on read and rounds to nearest on write). Each call maps only
+that entry's buffer, honouring its window offset and leading dimension, under
+the runtime's exclusive host lease: it waits for earlier GPU work, and while
+another host mapping, encoder or submit is live it fails with the existing
+`runtime busy` error. An f32 or bf16 moment is copied with no GPU dispatch;
+an 8-bit (`Block8`) moment is decoded or encoded by its kernel through a
+scratch tensor of that one entry's size. Index and length are checked first
+(the error names the entry), and `write_parameter_host` bumps the parameter
+generation once the mapping is held and before the first byte lands, so a
+`Decode`, `Staged` or pending training step from before the write refuses to
+continue, naming the write; a moment write changes no forward and does not
+bump it. A packed-head bf16 model refuses `write_parameter_host` as
+`write_parameters` does (`load_tower`).
 
 A step also runs in two halves for a loss outside tessl (a head of the
 caller's own): `train_forward` scores chosen positions against given tokens

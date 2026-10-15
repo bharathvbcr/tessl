@@ -50,7 +50,7 @@ use objc2_metal::MTLBuffer;
 use crate::dispatch::{dispatch_2d, dispatch_2d_tg, set_gpu_buf, set_gpu_buf_offset, set_u32};
 use crate::nn::require_runtime;
 use crate::qwen35_model::{Precision, Qwen35Model};
-use crate::qwen35_params::{check, slots, window_copy, Slot, Window};
+use crate::qwen35_params::{check, entry, slots, window_copy, window_read_host, window_write_host, Slot, Window};
 use crate::qwen35_train::Qwen35Grads;
 use crate::runtime::mtl_size;
 use crate::runtime::GpuRuntime;
@@ -758,6 +758,20 @@ fn dispatch_q8(
     })
 }
 
+/// A moment's host side in [`Qwen35Model::moment_host`].
+enum HostMoment<'a> {
+    Read(&'a mut [f32]),
+    Write(&'a [f32]),
+}
+
+/// What a dense (not 8-bit) moment buffer holds; 8-bit moments decode to f32.
+fn moment_dtype(m: MomentStorage) -> DType {
+    match m {
+        MomentStorage::F32 | MomentStorage::Block8 => DType::F32,
+        MomentStorage::Bf16 => DType::BF16,
+    }
+}
+
 /// A slot's dense state buffer as a window shaped like the parameter's.
 fn state_window<'a>(buf: &'a GpuBuffer, dtype: DType, like: &Window<'_>) -> Window<'a> {
     Window {
@@ -1094,15 +1108,94 @@ impl Qwen35Model {
         self.moment_copy(WHAT, state, which, src, true)
     }
 
+    /// Copy one of `state`'s moments for parameter-table entry `index` into
+    /// `dst` on the host, laid out as [`Self::read_adamw_moment`] lays it out
+    /// (bf16 widened, 8-bit decoded), without a table of GPU tensors.
+    /// `dst.len()` must be the entry's element count. An f32 or bf16 moment is
+    /// copied through a host mapping, with no GPU dispatch; an 8-bit one is
+    /// decoded by its kernel into a scratch tensor of this one entry's size.
+    /// Refused as "runtime busy" while another host mapping is live.
+    pub fn read_adamw_moment_host(
+        &self,
+        state: &AdamW,
+        which: Moment,
+        index: usize,
+        dst: &mut [f32],
+    ) -> Result<(), String> {
+        const WHAT: &str = "Qwen35Model::read_adamw_moment_host";
+        self.moment_host(WHAT, state, which, index, HostMoment::Read(dst))
+    }
+
+    /// Set one of `state`'s moments for parameter-table entry `index` from
+    /// `src` on the host, as [`Self::read_adamw_moment_host`] reads it (bf16
+    /// rounds to nearest, 8-bit encodes per block). Index and length are
+    /// checked before anything is written; a moment write does not move the
+    /// forward, so the parameter generation is untouched.
+    pub fn write_adamw_moment_host(
+        &self,
+        state: &mut AdamW,
+        which: Moment,
+        index: usize,
+        src: &[f32],
+    ) -> Result<(), String> {
+        const WHAT: &str = "Qwen35Model::write_adamw_moment_host";
+        self.moment_host(WHAT, state, which, index, HostMoment::Write(src))
+    }
+
+    fn moment_host(
+        &self,
+        what: &str,
+        state: &AdamW,
+        which: Moment,
+        index: usize,
+        io: HostMoment<'_>,
+    ) -> Result<(), String> {
+        let ps = slots(self, None)?;
+        state.check_model_slots(what, self, &ps)?;
+        let len = match &io {
+            HostMoment::Read(d) => d.len(),
+            HostMoment::Write(s) => s.len(),
+        };
+        let s = entry(what, &ps, index, len)?;
+        let label = format!("{what}: {}", s.info.name);
+        let (buf, scale) = state.moment(&state.slots[index], which);
+        match scale {
+            None => {
+                let w = state_window(&buf, moment_dtype(state.config.moments), &s.param_window());
+                match io {
+                    HostMoment::Read(d) => window_read_host(&w, d, &label)?,
+                    HostMoment::Write(x) => window_write_host(&w, x, &label, || {})?,
+                }
+            }
+            Some(scale) => {
+                let n = state.slots[index].n;
+                let tmp = self.rt.alloc_tensor_f32(&[n]).map_err(|e| format!("{label}: {e}"))?;
+                let first = which == Moment::First;
+                match io {
+                    HostMoment::Read(d) => {
+                        dispatch_q8(&self.rt, false, &buf, &scale, &tmp, n, first)
+                            .map_err(|e| format!("{label}: {e}"))?;
+                        self.rt.synchronize()?;
+                        d.copy_from_slice(&tmp.buffer.try_contents_f32()?[..]);
+                    }
+                    HostMoment::Write(x) => {
+                        tmp.buffer.try_write_f32(x).map_err(|e| format!("{label}: {e}"))?;
+                        dispatch_q8(&self.rt, true, &buf, &scale, &tmp, n, first)
+                            .map_err(|e| format!("{label}: {e}"))?;
+                        self.rt.synchronize()?;
+                    }
+                }
+            }
+        }
+        state.confirmed.set(state.step);
+        Ok(())
+    }
+
     fn moment_copy(&self, what: &str, state: &AdamW, which: Moment, ts: &[Tensor], write: bool) -> Result<(), String> {
         state.check_model(what, self)?;
         let ps = slots(self, None)?;
         check(what, &self.rt, &ps, ts)?;
-        let dtype = match state.config.moments {
-            MomentStorage::F32 => DType::F32,
-            MomentStorage::Bf16 => DType::BF16,
-            MomentStorage::Block8 => DType::F32,
-        };
+        let dtype = moment_dtype(state.config.moments);
         for ((s, st), t) in ps.iter().zip(&state.slots).zip(ts) {
             let pw = s.param_window();
             let (buf, scale) = state.moment(st, which);

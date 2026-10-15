@@ -1360,3 +1360,42 @@ fn the_real_2b_config_shape_still_loads() {
     let cfg = Qwen35Config::from_config_json(text).unwrap();
     assert_eq!(cfg.layers.len(), 24);
 }
+
+/// A per-entry host write moves the generation too: the session and the
+/// staged prefill from before it refuse, naming the write API, before
+/// encoding anything.
+#[test]
+fn sessions_refuse_to_continue_across_a_per_entry_host_write() {
+    let st = SafeTensors::open(&fixture().join("model.safetensors")).unwrap();
+    let cfg = tiny_config();
+    with_gpu(|rt| {
+        let model = Qwen35Model::load(rt, &st, "model.", cfg.clone(), Precision::F32).unwrap();
+        let ids = seq(6);
+        let (mut dec, _) = model.prefill(&ids[..4], 2).unwrap();
+        let mut staged = model.begin(&ids).unwrap();
+        staged.advance_to(1).unwrap();
+        let table = model.parameter_table().unwrap();
+        let last = table.len() - 1;
+        let mut v = vec![0.0f32; table[last].shape.iter().product()];
+        model.read_parameter_host(last, &mut v).unwrap();
+        model.write_parameter_host(last, &v).unwrap();
+        let _ = rt.take_dispatch_count();
+        let m = dec.step(ids[4]).unwrap_err();
+        assert!(
+            m.contains("parameters were written") && m.contains("write_parameter_host"),
+            "{m}"
+        );
+        let m = staged.advance_to(2).unwrap_err();
+        assert!(
+            m.contains("parameters were written") && m.contains("write_parameter_host"),
+            "{m}"
+        );
+        let m = staged.logits(LogitRows::Last).unwrap_err();
+        assert!(m.contains("write_parameter_host"), "{m}");
+        let m = staged.score_answers(&[0], &[1]).err().expect("score_answers ran");
+        assert!(m.contains("write_parameter_host"), "{m}");
+        assert_eq!(rt.take_dispatch_count(), 0, "a refused call encoded work");
+        let (mut dec, _) = model.prefill(&ids[..4], 2).unwrap();
+        dec.step(ids[4]).unwrap();
+    });
+}

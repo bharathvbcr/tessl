@@ -1107,13 +1107,13 @@ impl Qwen35Model {
     }
 
     /// Refuse to continue a prefill or session begun at `since` once the
-    /// weights have been written (write_parameters, adamw_step): its state
+    /// weights have been written (write_parameters, write_parameter_host, adamw_step): its state
     /// is of weights the model no longer has.
     fn check_generation(&self, what: &str, since: u64) -> Result<(), String> {
         if since != self.param_generation() {
             return Err(format!(
-                "{what}: the model's parameters were written after this prefill began (write_parameters \
-                 or adamw_step), so its state is of weights the model no longer has; prefill again"
+                "{what}: the model's parameters were written after this prefill began (write_parameters, \
+                 write_parameter_host or adamw_step), so its state is of weights the model no longer has; prefill again"
             ));
         }
         Ok(())

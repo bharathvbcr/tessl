@@ -31,7 +31,7 @@ use crate::nn::require_runtime;
 use crate::qwen35_model::{Mixer, Precision, Qwen35Model};
 use crate::qwen35_train::{MixerGrads, Qwen35Grads};
 use crate::runtime::GpuRuntime;
-use crate::tensor::{DType, GpuBuffer, Tensor};
+use crate::tensor::{bf16_bits_to_f32, f32_to_bf16_bits, DType, GpuBuffer, Tensor};
 
 /// One parameter.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -210,6 +210,75 @@ pub(crate) fn window_copy(rt: &GpuRuntime, src: &Window<'_>, dst: &Window<'_>) -
         set_u32(bnd, dst.ld as u32, 6);
         set_u32(bnd, dst.off as u32, 7);
     })
+}
+
+/// `window` into `dst`, on the host: map its buffer (the runtime lease waits
+/// for prior GPU work and refuses while another mapping or encoder is live),
+/// copy row by row, release. `dst` is the dense [`ParamInfo::storage_shape`]
+/// order; a bf16 window widens exactly. No GPU dispatch.
+pub(crate) fn window_read_host(w: &Window<'_>, dst: &mut [f32], what: &str) -> Result<(), String> {
+    w.check(what)?;
+    if dst.len() != w.numel() {
+        return Err(format!("{what}: {} elements for a window of {}", dst.len(), w.numel()));
+    }
+    let rows = dst.chunks_exact_mut(w.width);
+    match w.dtype {
+        DType::F32 => {
+            let m = w.buf.try_contents_f32().map_err(|e| format!("{what}: {e}"))?;
+            let base = w.byte_off / 4 + w.off;
+            for (r, row) in rows.enumerate() {
+                row.copy_from_slice(&m[base + r * w.ld..][..w.width]);
+            }
+        }
+        _ => {
+            let m = w.buf.try_contents_u16().map_err(|e| format!("{what}: {e}"))?;
+            let base = w.byte_off / 2 + w.off;
+            for (r, row) in rows.enumerate() {
+                for (d, &b) in row.iter_mut().zip(&m[base + r * w.ld..][..w.width]) {
+                    *d = bf16_bits_to_f32(b);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// `src` into `window`, on the host, as [`window_read_host`] reads it (a bf16
+/// window takes each value rounded to nearest). `before_first_byte` runs once
+/// the mapping is held and before anything is written, so a refused mapping
+/// has run nothing.
+pub(crate) fn window_write_host(
+    w: &Window<'_>,
+    src: &[f32],
+    what: &str,
+    before_first_byte: impl FnOnce(),
+) -> Result<(), String> {
+    w.check(what)?;
+    if src.len() != w.numel() {
+        return Err(format!("{what}: {} elements for a window of {}", src.len(), w.numel()));
+    }
+    let rows = src.chunks_exact(w.width);
+    match w.dtype {
+        DType::F32 => {
+            let mut m = w.buf.try_contents_f32().map_err(|e| format!("{what}: {e}"))?;
+            before_first_byte();
+            let base = w.byte_off / 4 + w.off;
+            for (r, row) in rows.enumerate() {
+                m[base + r * w.ld..][..w.width].copy_from_slice(row);
+            }
+        }
+        _ => {
+            let mut m = w.buf.try_contents_u16().map_err(|e| format!("{what}: {e}"))?;
+            before_first_byte();
+            let base = w.byte_off / 2 + w.off;
+            for (r, row) in rows.enumerate() {
+                for (d, &x) in m[base + r * w.ld..][..w.width].iter_mut().zip(row) {
+                    *d = f32_to_bf16_bits(x);
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 pub(crate) struct Slot<'a> {
@@ -420,6 +489,30 @@ pub(crate) fn check(what: &str, rt: &Arc<GpuRuntime>, slots: &[Slot<'_>], ts: &[
     Ok(())
 }
 
+/// Entry `index` of the table, for a host copy of `len` elements: both are
+/// checked before anything is touched.
+pub(crate) fn entry<'s, 'a>(
+    what: &str,
+    slots: &'s [Slot<'a>],
+    index: usize,
+    len: usize,
+) -> Result<&'s Slot<'a>, String> {
+    let s = slots.get(index).ok_or_else(|| {
+        format!(
+            "{what}: parameter index {index} out of range for {} entries",
+            slots.len()
+        )
+    })?;
+    let want = s.info.storage_shape().iter().product::<usize>();
+    if len != want {
+        return Err(format!(
+            "{what}: {} (index {index}) takes {want} elements, got {len}",
+            s.info.name
+        ));
+    }
+    Ok(s)
+}
+
 impl Qwen35Model {
     /// The model can be trained and written: f32, or bf16 without the
     /// inference head's packed copy of the embedding, which a write or an
@@ -492,6 +585,49 @@ impl Qwen35Model {
                 .map_err(|e| format!("{WHAT}: {}: {e}", s.info.name))?;
         }
         self.rt.synchronize()
+    }
+
+    /// Copy parameter-table entry `index` into `dst` on the host, in its
+    /// [`ParamInfo::storage_shape`] order (a bf16 matrix widened exactly), as
+    /// [`Self::read_parameters`] would copy it, without a GPU tensor for it.
+    /// `dst.len()` must be the entry's element count. Waits for prior GPU
+    /// work; refused as "runtime busy" while another host mapping is live.
+    pub fn read_parameter_host(&self, index: usize, dst: &mut [f32]) -> Result<(), String> {
+        const WHAT: &str = "Qwen35Model::read_parameter_host";
+        let slots = slots(self, None)?;
+        let s = entry(WHAT, &slots, index, dst.len())?;
+        window_read_host(&s.param_window(), dst, &format!("{WHAT}: {}", s.info.name))
+    }
+
+    /// Copy `grads`' entry `index` into `dst` on the host, as
+    /// [`Self::read_gradients`] lays it out; see [`Self::read_parameter_host`].
+    pub fn read_gradient_host(&self, grads: &Qwen35Grads, index: usize, dst: &mut [f32]) -> Result<(), String> {
+        const WHAT: &str = "Qwen35Model::read_gradient_host";
+        let slots = slots(self, Some(grads)).map_err(|e| format!("{WHAT}: {e}"))?;
+        let s = entry(WHAT, &slots, index, dst.len())?;
+        let g = s
+            .grad_window()
+            .ok_or_else(|| format!("{WHAT}: {} has no gradient", s.info.name))?;
+        window_read_host(&g, dst, &format!("{WHAT}: {}", s.info.name))
+    }
+
+    /// Set parameter-table entry `index` from `src` on the host, laid out as
+    /// [`Self::read_parameter_host`] reads it (a bf16 matrix takes each value
+    /// rounded to nearest). The index, the length and the model are checked
+    /// before anything moves, and the parameter generation is bumped once
+    /// the mapping is held, before the first byte lands: a
+    /// [`crate::qwen35_train::PendingStep`], [`crate::qwen35_model::Decode`]
+    /// or [`crate::qwen35_model::Staged`] from before the write refuses to
+    /// continue. An optimizer's f32 master is its own state and is not moved
+    /// by this.
+    pub fn write_parameter_host(&self, index: usize, src: &[f32]) -> Result<(), String> {
+        const WHAT: &str = "Qwen35Model::write_parameter_host";
+        self.require_trainable(WHAT)?;
+        let slots = slots(self, None)?;
+        let s = entry(WHAT, &slots, index, src.len())?;
+        window_write_host(&s.param_window(), src, &format!("{WHAT}: {}", s.info.name), || {
+            self.bump_param_generation()
+        })
     }
 
     fn read_one(&self, from: Window<'_>, dst: &Tensor) -> Result<(), String> {

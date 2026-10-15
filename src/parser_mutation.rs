@@ -856,3 +856,146 @@ fn npy_hostile_headers_are_named_errors() {
     }
     f.finish(total);
 }
+
+/// Second-pass adversarial review: inputs the mutation operators cannot reach,
+/// the public file-path entry points, and positive controls for the harness
+/// itself (an internal-consistency failure inside `check_safetensors` comes
+/// back as an ordinary `Err`, which the mutation passes accept, so the seed
+/// files must be shown to read back clean separately).
+#[cfg(test)]
+mod adversarial {
+    use super::*;
+    use std::path::Path;
+    use std::time::Duration;
+
+    /// Positive control: a valid safetensors file passes every read-back
+    /// check in `check_safetensors`. Without this, a parser fault that made
+    /// `read_raw` return the wrong bytes surfaces only as an `Err` that the
+    /// mutation passes treat as a refusal (verified by injecting
+    /// `bytes.pop()` into `read_raw`: all six existing tests stayed green).
+    #[test]
+    fn safetensors_seed_reads_back_clean() {
+        let scratch = Scratch::new("adv-st-seed");
+        let o = check_safetensors(&st_seed(), &scratch);
+        assert!(o.ok, "valid seed refused or inconsistent: {:?} {:?}", o.err, o.violations);
+        assert!(o.violations.is_empty());
+    }
+
+    /// The mutation passes must generate a non-trivial number of inputs: a
+    /// regression to zero cases would otherwise pass silently.
+    #[test]
+    fn mutation_corpora_are_non_trivial() {
+        assert!(cases() > 0, "PARSER_MUTATION_CASES=0 runs no random cases");
+        let st = st_seed();
+        let n = mutations(&st, seed(), 0).len();
+        assert!(n >= st.len() * 9, "only {n} exhaustive mutations of a {}-byte file", st.len());
+        assert!(mutations(QWEN_CONFIG.as_bytes(), seed(), 0).len() >= 5000);
+        for (_, b) in npy_seeds() {
+            assert!(mutations(&b, seed(), 0).len() >= b.len() * 9);
+        }
+    }
+
+    fn timed<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> Option<T> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(f());
+        });
+        rx.recv_timeout(Duration::from_secs(2)).ok()
+    }
+
+    /// Directories, character devices and a file shrunk or rewritten after
+    /// `open` are named errors (no mmap, so no SIGBUS: reads are `pread`s on
+    /// the validated handle).
+    #[test]
+    fn file_entry_points_refuse_non_regular_and_shrunk_files() {
+        let sc = Scratch::new("adv-files");
+        assert!(SafeTensors::open(&sc.0).is_err());
+        assert!(read_npy(&sc.0).is_err());
+        for dev in ["/dev/zero", "/dev/null"] {
+            assert!(SafeTensors::open(Path::new(dev)).is_err(), "{dev}");
+            assert!(read_npy(Path::new(dev)).is_err(), "{dev}");
+        }
+        assert!(SafeTensors::open(Path::new("")).is_err());
+        assert!(SafeTensors::open(&sc.0.join("a".repeat(300))).is_err());
+        let bytes = st_seed();
+        assert_eq!(SafeTensors::open(&sc.write("caf\u{e9}-\u{1F600}.safetensors", &bytes)).unwrap().names().count(), 4);
+        let p = sc.write("shrink.safetensors", &bytes);
+        let s = SafeTensors::open(&p).unwrap();
+        std::fs::OpenOptions::new().write(true).open(&p).unwrap().set_len(60).unwrap();
+        assert!(s.read_raw("d.i64").is_err(), "a read past the shrunk end must be an Err");
+        std::fs::write(&p, b"").unwrap();
+        assert!(s.read_raw("a.f32").is_err());
+    }
+
+    /// KNOWN BREAK (fails on e6188ee): opening a FIFO with no writer blocks
+    /// forever in `File::open`, in both `SafeTensors::open` and `read_npy`.
+    /// A caller handed a FIFO path hangs instead of getting an `Err`. Fix
+    /// shape: stat first and refuse non-regular files, or open `O_NONBLOCK`.
+    #[test]
+    #[ignore = "known break: FIFO open blocks forever (run with --ignored to see it fail)"]
+    fn file_entry_points_do_not_block_on_a_fifo() {
+        let sc = Scratch::new("adv-fifo");
+        let fifo = sc.0.join("f.bin");
+        assert!(std::process::Command::new("mkfifo").arg(&fifo).status().unwrap().success());
+        let p1 = fifo.clone();
+        let st = timed(move || SafeTensors::open(&p1).is_err());
+        let p2 = fifo.clone();
+        let npy = timed(move || read_npy(&p2).is_err());
+        // Release any blocked readers so the process can exit cleanly.
+        for _ in 0..2 {
+            drop(std::fs::OpenOptions::new().write(true).open(&fifo));
+        }
+        assert_eq!(st, Some(true), "SafeTensors::open on a FIFO blocked");
+        assert_eq!(npy, Some(true), "read_npy on a FIFO blocked");
+    }
+
+    /// A header exactly at the cap is read; one byte more is refused, and in
+    /// both cases the one big allocation is the header itself.
+    #[test]
+    fn header_length_at_the_cap() {
+        let cap = crate::safetensors::MAX_HEADER_BYTES as usize;
+        for (extra, ok) in [(0usize, true), (1, false)] {
+            let h = format!("{{}}{}", " ".repeat(cap + extra - 2));
+            let b = st_bytes(&h, 0);
+            let o = run(b.len(), || SafeTensors::from_bytes("m", b.clone()).map(|_| ()));
+            assert!(o.violations.is_empty(), "{:?}", o.violations);
+            assert_eq!(o.ok, ok, "header of cap+{extra}: {:?}", o.err);
+        }
+    }
+
+    /// Text-to-structure amplification is linear and bounded: 5M `0` dims
+    /// (10 MB) make one allocation of about 27x the input (the `Json` array),
+    /// well inside the harness's 64x bound but worth pinning, since a 100 MB
+    /// header reaches the same ratio. A growth in node size shows up here.
+    #[test]
+    fn header_amplification_is_pinned() {
+        let dims = vec!["0"; 5_000_000].join(",");
+        let h = format!(r#"{{"x":{{"dtype":"U8","shape":[{dims}],"data_offsets":[0,0]}}}}"#);
+        let b = st_bytes(&h, 0);
+        let o = run(b.len(), || SafeTensors::from_bytes("m", b.clone()).map(|_| ()));
+        let max = MAX_ALLOC.with(Cell::get);
+        assert!(o.ok && o.violations.is_empty(), "{:?} {:?}", o.err, o.violations);
+        assert!(max <= 32 * b.len(), "single allocation {max} B for a {} B header", b.len());
+    }
+
+    /// JSON number edges under the config syntax: huge exponent is a named
+    /// error, `-0`, 2^64 and an enormous negative exponent are values, a 1 MB
+    /// digit run and a 10 MB string are linear.
+    #[test]
+    fn json_number_and_string_edges() {
+        let parse = |t: &str| run(t.len(), || json::parse(t, CONFIG_SYNTAX).map(|_| ()));
+        assert!(!parse(r#"{"a":1e999999999}"#).ok);
+        for t in [r#"{"a":-0}"#, r#"{"a":18446744073709551616}"#, r#"{"a":-0e-999999999}"#] {
+            let o = parse(t);
+            assert!(o.ok && o.violations.is_empty(), "{t}: {:?}", o.err);
+        }
+        let digits = format!("{{\"a\":{}}}", "9".repeat(1_000_000));
+        let o = parse(&digits);
+        assert!(o.err.is_some() && o.violations.is_empty(), "{:?}", o.violations);
+        let s = format!("{{\"a\":\"{}\"}}", "x".repeat(10_000_000));
+        let o = parse(&s);
+        assert!(o.ok && o.violations.is_empty(), "{:?}", o.violations);
+        let mixed = "{\"a\":[".repeat(100_000);
+        assert!(parse(&mixed).err.unwrap().contains("nesting"));
+    }
+}

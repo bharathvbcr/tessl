@@ -877,7 +877,11 @@ mod adversarial {
     fn safetensors_seed_reads_back_clean() {
         let scratch = Scratch::new("adv-st-seed");
         let o = check_safetensors(&st_seed(), &scratch);
-        assert!(o.ok, "valid seed refused or inconsistent: {:?} {:?}", o.err, o.violations);
+        assert!(
+            o.ok,
+            "valid seed refused or inconsistent: {:?} {:?}",
+            o.err, o.violations
+        );
         assert!(o.violations.is_empty());
     }
 
@@ -888,7 +892,11 @@ mod adversarial {
         assert!(cases() > 0, "PARSER_MUTATION_CASES=0 runs no random cases");
         let st = st_seed();
         let n = mutations(&st, seed(), 0).len();
-        assert!(n >= st.len() * 9, "only {n} exhaustive mutations of a {}-byte file", st.len());
+        assert!(
+            n >= st.len() * 9,
+            "only {n} exhaustive mutations of a {}-byte file",
+            st.len()
+        );
         assert!(mutations(QWEN_CONFIG.as_bytes(), seed(), 0).len() >= 5000);
         for (_, b) in npy_seeds() {
             assert!(mutations(&b, seed(), 0).len() >= b.len() * 9);
@@ -918,11 +926,25 @@ mod adversarial {
         assert!(SafeTensors::open(Path::new("")).is_err());
         assert!(SafeTensors::open(&sc.0.join("a".repeat(300))).is_err());
         let bytes = st_seed();
-        assert_eq!(SafeTensors::open(&sc.write("caf\u{e9}-\u{1F600}.safetensors", &bytes)).unwrap().names().count(), 4);
+        assert_eq!(
+            SafeTensors::open(&sc.write("caf\u{e9}-\u{1F600}.safetensors", &bytes))
+                .unwrap()
+                .names()
+                .count(),
+            4
+        );
         let p = sc.write("shrink.safetensors", &bytes);
         let s = SafeTensors::open(&p).unwrap();
-        std::fs::OpenOptions::new().write(true).open(&p).unwrap().set_len(60).unwrap();
-        assert!(s.read_raw("d.i64").is_err(), "a read past the shrunk end must be an Err");
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&p)
+            .unwrap()
+            .set_len(60)
+            .unwrap();
+        assert!(
+            s.read_raw("d.i64").is_err(),
+            "a read past the shrunk end must be an Err"
+        );
         std::fs::write(&p, b"").unwrap();
         assert!(s.read_raw("a.f32").is_err());
     }
@@ -936,7 +958,11 @@ mod adversarial {
     fn file_entry_points_do_not_block_on_a_fifo() {
         let sc = Scratch::new("adv-fifo");
         let fifo = sc.0.join("f.bin");
-        assert!(std::process::Command::new("mkfifo").arg(&fifo).status().unwrap().success());
+        assert!(std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .unwrap()
+            .success());
         let p1 = fifo.clone();
         let st = timed(move || SafeTensors::open(&p1).is_err());
         let p2 = fifo.clone();
@@ -975,7 +1001,11 @@ mod adversarial {
         let o = run(b.len(), || SafeTensors::from_bytes("m", b.clone()).map(|_| ()));
         let max = MAX_ALLOC.with(Cell::get);
         assert!(o.ok && o.violations.is_empty(), "{:?} {:?}", o.err, o.violations);
-        assert!(max <= 32 * b.len(), "single allocation {max} B for a {} B header", b.len());
+        assert!(
+            max <= 32 * b.len(),
+            "single allocation {max} B for a {} B header",
+            b.len()
+        );
     }
 
     /// JSON number edges under the config syntax: huge exponent is a named

@@ -301,7 +301,29 @@ fn async_encode_waits_only_once_per_head_block() {
         let model = BertSparseModel::load(rt, &checkpoint(family, 7), config(family)).unwrap();
         let seqs = batch(11);
         let refs: Vec<&[u32]> = seqs.iter().map(Vec::as_slice).collect();
+        // The reference: every dispatch commits and waits, nothing overlaps.
+        rt.set_serialized_dispatch(true).unwrap();
         let sync_out = model.encode(&refs, false).unwrap();
+        rt.set_serialized_dispatch(false).unwrap();
+
+        // A default runtime (flag off) queues too: the same waits, the same bits.
+        infer_trace::set_enabled(true);
+        let d0 = infer_trace::snapshot();
+        let default_out = model.encode(&refs, false);
+        let d1 = infer_trace::snapshot();
+        infer_trace::set_enabled(false);
+        let default_out = default_out.unwrap();
+        assert!(!rt.async_encode_enabled(), "encode left the runtime's flag on");
+        assert_eq!(
+            d1.since(&d0).sync_waits,
+            head_blocks,
+            "a default-runtime encode waited more than once per head block"
+        );
+        assert_eq!(
+            pooled_bits(&default_out),
+            pooled_bits(&sync_out),
+            "default encode differs from the serialized encode"
+        );
 
         // Positive control, then the measured encode, each behind an open batch.
         rt.set_async_encode(true).unwrap();

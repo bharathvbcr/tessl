@@ -44,9 +44,19 @@ a fixed per-forward cost (each forward re-reads every weight), with each
 forward at most 32,768 padded rows. A 6,000-token document therefore runs on
 its own instead of padding a batch of queries to its length. Embeddings come
 back in the caller's order, and `EncodeOutput::forwards` says how many
-forwards ran. The per-forward cost (256 rows) is an estimate that only steers
-the split: a sequence's embedding does not depend on its batch beyond GEMM
-tiling, which the model test bounds at `1e-5`.
+forwards ran. The per-forward cost (67 padded rows, see Speed) is an estimate
+that only steers the split: a sequence's embedding does not depend on its
+batch beyond GEMM tiling, which the model test bounds at `1e-5`. Because the
+cost differs between a queued run (67) and a serialized one (1046), the same
+batch can be cut into different forwards in the two modes, and the embeddings
+then agree to that bound rather than bit for bit.
+
+`encode` queues every dispatch of the batch and waits once, on a runtime in
+any mode: it opens a `GpuRuntime::async_scope` and leaves the runtime's
+`set_async_encode` flag as it found it. The runtime is `!Send`/`!Sync`, so
+nothing else dispatches on it during the call, and anything the caller queued
+before it is waited for by `encode`'s own wait. With `trace` the forward still
+waits at every layer, to read the residual back.
 
 The activations are allocated once per `encode`, for its largest forward,
 and every forward works on a prefix of them. None is zeroed on the host:
@@ -182,17 +192,26 @@ Measured on an M5 Pro against the real checkpoint, paired and interleaved
   to back and the host waits once; each keeps its own small ids, lengths,
   segments and output buffers (written with `alloc_buffer_from_u32`, which does
   not wait), and the large activations stay shared because the GPU orders
-  them. This only overlaps anything when the caller runs the runtime with
-  `set_async_encode(true)`: with it off (the default) every dispatch commits
-  and waits, so nothing changes. `encode` does not flip the flag, since the
-  runtime is shared. With it on, `bench_embedgemma2` (`BENCH_ASYNC=1`) runs
-  1x16 in 7.4 ms against 84.9 ms, and the 128x8-512 ragged batch in 1903 ms
-  against 2366 ms.
+  them. `encode` opens a `GpuRuntime::async_scope`, so this holds on a
+  default runtime: before it, nothing overlapped unless the caller had set
+  `set_async_encode(true)`, and every other caller's dispatches each
+  committed and waited. The scope is a counter beside the flag, so `encode`
+  never stores or restores the caller's setting; the scope's other effects are
+  on its API doc. With the flag on and `bench_embedgemma2` (`BENCH_ASYNC=1`),
+  the figures measured before the scope were 1x16 in 7.4 ms against 84.9 ms
+  synchronous, and the 128x8-512 ragged batch in 1903 ms against 2366 ms; the
+  default runtime now takes the queued path (indicative, not re-measured here:
+  the paired benchmark is the coordinator's).
+  `tests/embedgemma2_tiny.rs` asserts one host wait and one command buffer for
+  a default-runtime encode, and `tests/async_scope.rs` the scope itself.
 * **What a forward costs, for the split.** `pack_forwards` trades padded rows
   against a fixed cost per forward, which the sweep
   (`embedgemma2_forward_cost_m5pro.json`) puts at `54.9 ms + 0.0525 ms/row`
-  synchronous (1046 rows) and `3.42 ms + 0.0515 ms/row` queued (67 rows); it
-  uses the one for the runtime's mode.
+  synchronous (1046 rows) and `3.42 ms + 0.0515 ms/row` queued (67 rows). It
+  uses the queued one unless the runtime is serialized
+  (`set_serialized_dispatch`, a reference mode in which every dispatch
+  commits and waits; the tests use it as the oracle that queuing changes no
+  bit).
 * **`segment_mean_rows`** stays serial: it is under 0.2 % of an encode on
   every workload (`embedgemma2_segment_mean_share_m5pro.txt`).
 * **No bf16 attention output.** `encoder_attn` writes f32 only; the `out_bf16`

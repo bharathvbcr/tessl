@@ -522,6 +522,7 @@ fn py_ty(expr: &str, consts: &BTreeMap<String, usize>) -> Ty {
         "c_int64" => Ty::Scalar("i64".into()),
         "c_uint64" => Ty::Scalar("u64".into()),
         "c_size_t" => Ty::Scalar("usize".into()),
+        "c_uint8" | "c_ubyte" => Ty::Scalar("u8".into()),
         "c_float" => Ty::Scalar("f32".into()),
         "c_double" => Ty::Scalar("f64".into()),
         name if name.starts_with('_') => Ty::Struct(name.trim_start_matches('_').to_string()),
@@ -1778,13 +1779,16 @@ fn eg2_abi() -> (RustAbi, PyAbi) {
     (parse_rust_abi(&read(RS_EG2)), parse_py_abi(&read(PY_EG2)))
 }
 
-const EG2_FNS: [&str; 6] = [
+const EG2_FNS: [&str; 9] = [
     "tessl_embedgemma2_load",
     "tessl_embedgemma2_free",
     "tessl_embedgemma2_embedding_dim",
     "tessl_embedgemma2_max_tokens",
     "tessl_embedgemma2_set_max_tokens",
     "tessl_embedgemma2_encode",
+    "tessl_embedgemma2_load_multimodal",
+    "tessl_embedgemma2_encode_images",
+    "tessl_embedgemma2_encode_audio",
 ];
 
 #[test]
@@ -1870,6 +1874,73 @@ fn an_embedgemma2_signature_that_drifts_on_either_side_is_reported() {
     );
     assert!(
         mentions(&p, "tessl_embedgemma2_ghost: declared in the Python binding"),
+        "{p:?}"
+    );
+}
+
+/// The same faults for the multimodal entries: a signedness or width change on
+/// either side of a pointer to the processor's tensors, the byte mask, and a
+/// dropped argument.
+#[test]
+fn a_multimodal_embedgemma2_signature_that_drifts_on_either_side_is_reported() {
+    let (rust, py) = eg2_abi();
+    let py_src = read(PY_EG2);
+    let rs_src = read(RS_EG2);
+    // The unmodified pair is clean, and the byte pointer is parsed as one.
+    assert!(fn_problems(&rust, &py, &[]).is_empty());
+    let mask = &rust.fns["tessl_embedgemma2_encode_audio"].args[3];
+    assert_eq!(mask.0, "input_features_mask");
+    assert_eq!(mask.1, Ty::Ptr(Some(Box::new(Ty::Scalar("u8".into())))));
+    assert!(py.fns["tessl_embedgemma2_encode_audio"].0[3].agrees(&mask.1));
+
+    let py_fault = |needle: &str, with: &str| fn_problems(&rust, &parse_py_abi(&fault(&py_src, needle, with)), &[]);
+    let rs_fault = |needle: &str, with: &str| fn_problems(&parse_rust_abi(&fault(&rs_src, needle, with)), &py, &[]);
+
+    // ctypes side: signed positions read as unsigned, a mask read as u32, a lost argument.
+    let p = py_fault(
+        "ctypes.c_void_p, f32p, ctypes.c_uint64, i32p, ctypes.c_uint64, u64p, ctypes.c_uint64,",
+        "ctypes.c_void_p, f32p, ctypes.c_uint64, ctypes.POINTER(ctypes.c_uint32), ctypes.c_uint64, u64p, ctypes.c_uint64,",
+    );
+    assert!(
+        mentions(&p, "tessl_embedgemma2_encode_images: argument 3 `position_ids`"),
+        "{p:?}"
+    );
+    let p = py_fault(
+        "ctypes.c_void_p, f32p, ctypes.c_uint64, u8p, ctypes.c_uint64, u64p, ctypes.c_uint64,",
+        "ctypes.c_void_p, f32p, ctypes.c_uint64, ctypes.POINTER(ctypes.c_uint32), ctypes.c_uint64, u64p, ctypes.c_uint64,",
+    );
+    assert!(
+        mentions(&p, "tessl_embedgemma2_encode_audio: argument 3 `input_features_mask`"),
+        "{p:?}"
+    );
+    let p = py_fault(
+        "ctypes.c_void_p, ctypes.c_char_p, ctypes.c_uint64, ctypes.c_uint32, ctypes.POINTER(ctypes.c_void_p),",
+        "ctypes.c_void_p, ctypes.c_char_p, ctypes.c_uint64, ctypes.POINTER(ctypes.c_void_p),",
+    );
+    assert!(mentions(&p, "tessl_embedgemma2_load_multimodal: C takes"), "{p:?}");
+
+    // Rust side.
+    let p = rs_fault("    n_images: u64,\n", "    n_images: u32,\n");
+    assert!(
+        mentions(&p, "tessl_embedgemma2_encode_images: argument 6 `n_images`"),
+        "{p:?}"
+    );
+    let p = rs_fault(
+        "    input_features_mask: *const u8,\n",
+        "    input_features_mask: *const u32,\n",
+    );
+    assert!(
+        mentions(&p, "tessl_embedgemma2_encode_audio: argument 3 `input_features_mask`"),
+        "{p:?}"
+    );
+    let p = rs_fault("    operands: u32,\n", "    operands: u64,\n");
+    assert!(
+        mentions(&p, "tessl_embedgemma2_load_multimodal: argument 3 `operands`"),
+        "{p:?}"
+    );
+    let p = rs_fault("    position_ids: *const i32,\n", "    position_ids: *const u32,\n");
+    assert!(
+        mentions(&p, "tessl_embedgemma2_encode_images: argument 3 `position_ids`"),
         "{p:?}"
     );
 }

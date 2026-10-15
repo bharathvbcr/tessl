@@ -127,6 +127,85 @@ a successful call equals `EmbedGemma2Model::encode` bit for bit on the same
 weights; `python/tests/test_embedgemma2.py` holds the real checkpoint to the
 bounds below (set `EMBEDGEMMA2_SNAPSHOT`).
 
+## Multimodal input
+
+The vision and audio towers are other modules (`embedgemma2_vision`,
+`embedgemma2_audio`); this is the merge they feed. Their outputs are 512-wide
+"soft tokens" that replace the placeholder rows of the text sequence before the
+text encoder runs, as transformers' `EmbeddingGemma2Model.forward` does: the
+ids with every `image_token_id` (258880), `video_token_id` (258884) and
+`audio_token_id` (258881) replaced by `pad_token_id` (0) are embedded through the
+*scaled* table (`sqrt(hidden)`), then `masked_scatter` writes the soft tokens
+over those rows, in order and **unscaled**; the text encoder, the per-layer
+inputs included, runs on the result, followed by the same mean pool over every
+token (soft ones too, `include_prompt`) and normalize.
+
+```rust
+let ids = model.config().image_sequence(soft.len() / hidden)?; // or audio_sequence
+let out = model.encode_multimodal(&[MmSequence { ids: &ids, soft: &soft }], None, false)?;
+```
+
+* `MmSequence { ids, soft }`: `soft` is `[n_placeholders, hidden]` row-major f32
+  and replaces, in order, the rows of `ids` whose id is any of the three
+  placeholder ids. A batch may mix sequences with and without soft rows, and
+  placeholders of any kind in any positions; the result is one
+  `EncodeOutput` as `encode` returns it, with the same Matryoshka `truncate_dim`
+  and `trace`.
+* `image_sequence(n)` and `audio_sequence(n)` (on `EmbedGemma2Config`) build the
+  processor's layout from the config's ids: `[<bos>, <boi>, <image> x n, <eoi>,
+  <eos>]` and `[<bos>, <boa>, <audio> x n, <eoa>, <eos>]`. They equal the
+  generator's `ids.npy` for all four reference inputs (checked in the real test).
+* The config keeps `special_tokens`: `text_config.pad_token_id`, `bos_token_id`,
+  `eos_token_id`, and the top-level `image_token_id`, `video_token_id`,
+  `audio_token_id`, `boi_token_id`, `eoi_token_id`, `boa_token_id`,
+  `eoa_token_index` (spelled so in the checkpoint). A text-only config still
+  loads and `encode` still runs; `encode_multimodal` refuses one that lacks any,
+  naming each missing key.
+* Refused before any GPU work (no allocation, no wait): a missing id, a `soft`
+  whose length is not a multiple of `hidden`, a non-finite soft value (with its
+  row and column), a count of soft rows different from the count of placeholder
+  ids, a `pad_token_id` outside the vocabulary, and everything `encode`
+  refuses. A placeholder id is exempt from the vocabulary bound (the real ones
+  are inside it; the tiny test puts them outside), since it is never looked up.
+* `encode` is the special case with no soft rows and no placeholder ids: a text
+  id that equals a placeholder id stays an ordinary token there, as before, and
+  `encode_multimodal` with no soft rows is bit for bit `encode`. Batching,
+  packing (longest first), the activation reuse, the single host wait and the
+  async queueing are shared code, not a copy.
+
+The soft rows are uploaded with the forward's ids (`alloc_buffer_from_u32` on the
+f32 bits: no wait, and a forward with no soft rows allocates nothing extra), and
+land in `embeds` after the scaled gather and before anything reads it: the
+residual stream, the bf16 copy and the per-layer-input GEMM all see the merged
+rows, so the rest of the forward is unchanged. The write is `qwen35_bwd::copy_cols`
+(one flat copy per maximal run of consecutive placeholder rows of the padded
+forward, a single row of the run's whole width): no new kernel. One image or clip
+is one run; an adversarial layout of alternating placeholder and text tokens is
+one dispatch per placeholder, at most `(rows + 1) / 2` of a forward's (32,768
+padded rows at most).
+
+Checked with the towers out of the loop (their golden soft tokens,
+`tools/embedgemma2_ref/make_mm_reference.py`), `tests/embedgemma2_mm_model.rs`
+(opt-in, `EMBEDGEMMA2_MM_REF_DIR`) and the f64 forward with an `inputs_embeds`
+override on the tiny checkpoint, `tests/embedgemma2_mm_tiny.rs`. Bounds, fixed
+before the first run, the text tests'; observed on an Apple M5 Pro, 2026-10-15, branch `worktree-agent-a403f81d87fc8f2cd` at `744d3b9` on base `ac5364a`, the status line's snapshot:
+
+| Check | Bound | Observed |
+|---|---|---|
+| `lm_final`, ExactF32, 4 inputs (29 to 268 tokens) | within `1e-4` of the largest magnitude | 3.6e-7 to 1.3e-6 of it |
+| embedding vs `emb_f32`, ExactF32 | max abs `1e-4`, cosine `>= 0.99999` | max abs 1.2e-7 to 2.1e-7, cosine 1.00000000 |
+| the four in one call vs alone, both modes | `1e-5` | 0 (bit for bit; 2 forwards) |
+| Bf16 vs fp32, per input | cosine `>= 0.9999` | 0.999995 to 0.999999 |
+| Bf16 vs transformers bf16, per input | cosine `>= 0.9996` | 0.99975 to 0.99997 |
+| Bf16 mean `1 - cos` vs fp32 | no worse than transformers' bf16 | 2.2e-6 against 8.6e-5 |
+| tiny checkpoint vs f64 forward, ExactF32 | layers `1e-4`, embedding `1e-4` / `0.99999` | layers 2.2e-6 of scale at worst, embedding max abs 5.4e-7 |
+| tiny checkpoint vs f64 forward, Bf16 | layers `5e-2`, embedding `1e-2` / `0.9999` | layers 1.2e-2 of scale at worst, embedding max abs 2.1e-3, cosine 0.999977 |
+| tiny: one-forward batch vs alone | `1e-5` first, made bit-exact after the first run measured 0 | 0 |
+
+Not covered: video (the placeholder id is handled like the other two, but no
+video tower or reference exists here), and the C and Python entries, which
+embed text only.
+
 ## Kernels
 
 | Kernel | File | New? |
@@ -137,6 +216,7 @@ bounds below (set `EMBEDGEMMA2_SNAPSHOT`).
 | q/k norm + full RoPE + K/V store, with the weightless V norm | `qwen35_attn_qk_norm_rope` via `qwen35::attn_qk_norm_rope_columns` (`QkvColumns::v_norm`) | reused; the host entry is new (separate K and V column blocks), and so is the V norm inside it. The frequencies are the host table `nn::rope_inv_freq` (torch's formula), not a device `pow` |
 | embedding gather times `sqrt(hidden)` (bf16 table) | `qwen35_embed_rows_bf16_scaled` via `qwen35::embed_rows_scaled` | new: the gather and the scale in one pass |
 | GELU-tanh gate over column windows (`gate \| up` from one GEMM; each layer's slice of the per-layer inputs) | `qwen35_gelu_tanh_glu_f32` via `qwen35::gated_act` | new: `qwen35_swiglu`'s kernel with the activation as a parameter |
+| soft tokens over the placeholder rows (`encode_multimodal`) | `qwen35_copy_cols_f32` via `qwen35_bwd::copy_cols` | reused: a flat copy per run of consecutive rows |
 | RMSNorm, post-norm residual add with layer scale, scale | `nn::rms_norm_f32`, `nn::rms_norm_residual_add_f32`, `nn::scale_f32_inplace` | reused |
 | GEMM | exact f32, or bf16 operands with f32 accumulation (`load_with`), TensorOps (NN, and NT for the per-layer-input projection) | reused |
 
@@ -360,9 +440,9 @@ are therefore about as far apart as `emb_bf16.npy` is from fp32.
 > **Status: run on the GPU against sentence-transformers** (Apple M5 Pro,
 > 2026-10-15, worktree branch `worktree-agent-a00e8fdf52347d85d` on base
 > `60a6240`, snapshot `914f7f89142e33e77833254d9c9b90c3cef7303b`; goldens from
-> `make_mm_reference.py`, the multimodal sibling of `make_reference.py` that
-> lives on branch `eg2/integrate` and not on this base: fp32, eager attention,
-> CPU).
+> `tools/embedgemma2_ref/make_mm_reference.py`: fp32, eager attention, CPU).
+> The real-checkpoint test passed again on `eg2/integrate` at the merge
+> (`6eedd5a`).
 
 `tessl::embedgemma2_vision` (`src/embedgemma2_vision.rs`) is the 167M-parameter
 vision tower (`vision_tower.*`, transformers 5.19's `Gemma4VisionModel`) and

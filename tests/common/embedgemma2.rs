@@ -1,9 +1,13 @@
 //! f64 references for EmbeddingGemma 2. `tests/embedgemma2_kernels.rs` holds
 //! each one to transformers by fixture (`scripts/gen_embedgemma2_fixtures.py`);
-//! `tests/embedgemma2_tiny.rs` composes them into a whole host forward.
+//! [`host_forward`] composes them into a whole host forward, which
+//! `tests/embedgemma2_tiny.rs` and `tests/embedgemma2_mm_tiny.rs` hold the
+//! device to.
 
 use super::SplitMix;
 use tessl::embedgemma2::EmbedGemma2Config;
+use tessl::gemm::GemmOperands;
+use tessl::safetensors::SafeTensors;
 use tessl::tensor::{bf16_bits_to_f32, f32_slice_to_bf16};
 
 /// `rms_norm_eps` of the checkpoint, used by every reference here.
@@ -345,4 +349,223 @@ pub fn safetensors_bytes(w: &Weights, extra: &[(&str, &[usize])]) -> Vec<u8> {
     out.extend_from_slice(header.as_bytes());
     out.extend_from_slice(&data);
     out
+}
+
+// ---------------------------------------------------------------------------
+// The whole forward in f64, shared by `tests/embedgemma2_tiny.rs` and
+// `tests/embedgemma2_mm_tiny.rs`.
+// ---------------------------------------------------------------------------
+
+/// `embed_tokens[id] * sqrt(hidden)` for each id: `inputs_embeds` of a text
+/// sequence (transformers: `embed * embed_scale.to(bf16)`; sqrt(64) = 8 is
+/// exact).
+pub fn embed_ids(cfg: &EmbedGemma2Config, w: &Weights, ids: &[u32]) -> Vec<Vec<f64>> {
+    let h = cfg.hidden as usize;
+    let table = w.get("embed_tokens.weight");
+    let embed_scale = f64::from((h as f32).sqrt());
+    ids.iter()
+        .map(|&id| {
+            table[id as usize * h..(id as usize + 1) * h]
+                .iter()
+                .map(|v| v * embed_scale)
+                .collect()
+        })
+        .collect()
+}
+
+/// `inputs_embeds` of a multimodal sequence, as
+/// `EmbeddingGemma2Model.forward` builds them: each id in `placeholders` is
+/// gathered as `pad` (through the scaled embedding), then `masked_scatter`
+/// writes `soft` (`[n_placeholders, hidden]`, row-major) over those rows in
+/// order, unscaled.
+pub fn mm_embeds(
+    cfg: &EmbedGemma2Config,
+    w: &Weights,
+    ids: &[u32],
+    placeholders: &[u32],
+    pad: u32,
+    soft: &[f64],
+) -> Vec<Vec<f64>> {
+    let h = cfg.hidden as usize;
+    let gathered: Vec<u32> = ids
+        .iter()
+        .map(|&id| if placeholders.contains(&id) { pad } else { id })
+        .collect();
+    let mut embeds = embed_ids(cfg, w, &gathered);
+    let mut next = 0;
+    for (e, &id) in embeds.iter_mut().zip(ids) {
+        if placeholders.contains(&id) {
+            e.copy_from_slice(&soft[next * h..(next + 1) * h]);
+            next += 1;
+        }
+    }
+    assert_eq!(next * h, soft.len(), "test bug: soft rows and placeholders differ");
+    embeds
+}
+
+/// The forward of one unpadded text sequence in f64, transformers' order:
+/// returns the residual stream after each layer, the final norm's output
+/// (each `[T, hidden]`) and the L2-normalized embedding.
+pub fn host_forward(cfg: &EmbedGemma2Config, w: &Weights, ids: &[u32]) -> (Vec<Vec<f64>>, Vec<f64>) {
+    host_forward_embeds(cfg, w, embed_ids(cfg, w, ids))
+}
+
+/// [`host_forward`] from `inputs_embeds` (`language_model(inputs_embeds=...)`):
+/// both the residual stream and the per-layer inputs start from `embeds`.
+pub fn host_forward_embeds(cfg: &EmbedGemma2Config, w: &Weights, embeds: Vec<Vec<f64>>) -> (Vec<Vec<f64>>, Vec<f64>) {
+    let (h, ple, inter) = (cfg.hidden as usize, cfg.ple_dim as usize, cfg.intermediate as usize);
+    let t = embeds.len();
+    let n_layers = cfg.layers.len();
+    // Projection-only per-layer inputs: [T, layers, ple].
+    let ple_w = w.get("ple.per_layer_model_projection.weight");
+    let ple_norm = w.get("ple.per_layer_projection_norm.weight");
+    let per_layer: Vec<Vec<Vec<f64>>> = embeds
+        .iter()
+        .map(|e| {
+            let p: Vec<f64> = lin(ple_w, e, n_layers * ple, h)
+                .iter()
+                .map(|v| v * (h as f64).powf(-0.5))
+                .collect();
+            (0..n_layers)
+                .map(|l| rms(&p[l * ple..(l + 1) * ple], Some(ple_norm)))
+                .collect()
+        })
+        .collect();
+
+    let mut resid = embeds.clone();
+    let mut trace = Vec::new();
+    for (li, s) in cfg.layers.iter().enumerate() {
+        let g = |n: &str| w.get(&format!("layers.{li}.{n}"));
+        let (hq, hkv, d) = (cfg.q_heads as usize, s.kv_heads as usize, s.head_dim as usize);
+        let theta = f64::from(s.rope_theta);
+        let (mut q, mut k, mut v) = (Vec::new(), Vec::new(), Vec::new());
+        for (pos, r) in resid.iter().enumerate() {
+            let x = rms(r, Some(g("input_layernorm.weight")));
+            let qp = lin(g("self_attn.q_proj.weight"), &x, hq * d, h);
+            let kp = lin(g("self_attn.k_proj.weight"), &x, hkv * d, h);
+            let vp = lin(g("self_attn.v_proj.weight"), &x, hkv * d, h);
+            for head in 0..hq {
+                q.extend(rope(
+                    &rms(&qp[head * d..(head + 1) * d], Some(g("self_attn.q_norm.weight"))),
+                    pos as f64,
+                    theta,
+                ));
+            }
+            for head in 0..hkv {
+                k.extend(rope(
+                    &rms(&kp[head * d..(head + 1) * d], Some(g("self_attn.k_norm.weight"))),
+                    pos as f64,
+                    theta,
+                ));
+                v.extend(rms(&vp[head * d..(head + 1) * d], None));
+            }
+        }
+        let a = Attn {
+            b: 1,
+            t,
+            h: hq,
+            hkv,
+            d,
+            window: if s.sliding { cfg.sliding_window as usize } else { 0 },
+            lens: vec![t],
+        };
+        let o = attn_ref(&a, &q, &k, &v, None);
+        for (pos, r) in resid.iter_mut().enumerate() {
+            let y = lin(
+                g("self_attn.o_proj.weight"),
+                &o[pos * hq * d..(pos + 1) * hq * d],
+                h,
+                hq * d,
+            );
+            let y = rms(&y, Some(g("post_attention_layernorm.weight")));
+            r.iter_mut().zip(&y).for_each(|(a, b)| *a += b);
+
+            let x = rms(r, Some(g("pre_feedforward_layernorm.weight")));
+            let gate = lin(g("mlp.gate_proj.weight"), &x, inter, h);
+            let up = lin(g("mlp.up_proj.weight"), &x, inter, h);
+            let mid: Vec<f64> = gate.iter().zip(&up).map(|(a, b)| gelu_tanh(*a) * b).collect();
+            let y = rms(
+                &lin(g("mlp.down_proj.weight"), &mid, h, inter),
+                Some(g("post_feedforward_layernorm.weight")),
+            );
+            r.iter_mut().zip(&y).for_each(|(a, b)| *a += b);
+
+            let gp = lin(g("ple_block.per_layer_input_gate.weight"), r, ple, h);
+            let gm: Vec<f64> = gp
+                .iter()
+                .zip(&per_layer[pos][li])
+                .map(|(a, b)| gelu_tanh(*a) * b)
+                .collect();
+            let y = rms(
+                &lin(g("ple_block.per_layer_projection.weight"), &gm, h, ple),
+                Some(g("ple_block.post_per_layer_input_norm.weight")),
+            );
+            let scalar = g("layer_scalar")[0];
+            r.iter_mut().zip(&y).for_each(|(a, b)| *a = (*a + b) * scalar);
+        }
+        trace.push(resid.concat());
+    }
+    let normed: Vec<Vec<f64>> = resid.iter().map(|r| rms(r, Some(w.get("norm.weight")))).collect();
+    trace.push(normed.concat());
+    // Project every token, then mean-pool (transformers' order; the Rust side
+    // pools first, which is the same linear map).
+    let proj = w.get("embedding_projection.weight");
+    let e = cfg.embedding_dim as usize;
+    let mut mean = vec![0.0; e];
+    for n in &normed {
+        lin(proj, n, e, h)
+            .iter()
+            .zip(mean.iter_mut())
+            .for_each(|(p, m)| *m += p / t as f64);
+    }
+    (trace, l2_normalize(&mean))
+}
+/// What a mode is held to against the f64 forward.
+#[derive(Clone, Copy)]
+pub struct Bounds {
+    /// Each layer's residual and the final norm, of their largest magnitude.
+    pub layer_rel: f64,
+    /// Embeddings, max abs.
+    pub emb_abs: f64,
+    /// Embeddings, cosine at least.
+    pub emb_cos: f64,
+}
+
+pub fn bounds(operands: GemmOperands) -> Bounds {
+    match operands {
+        GemmOperands::ExactF32 => Bounds {
+            layer_rel: 1e-4,
+            emb_abs: 1e-4,
+            emb_cos: 0.99999,
+        },
+        GemmOperands::Bf16 => Bounds {
+            layer_rel: 5e-2,
+            emb_abs: 1e-2,
+            emb_cos: 0.9999,
+        },
+    }
+}
+
+/// The tiny checkpoint's weights for a mode: the `Bf16` load reads bf16
+/// projections only.
+pub fn weights_for(cfg: &EmbedGemma2Config, seed: u64, operands: GemmOperands) -> Weights {
+    random_weights(cfg, seed, operands == GemmOperands::Bf16)
+}
+
+pub fn open(tag: &str, bytes: Vec<u8>) -> SafeTensors {
+    SafeTensors::from_bytes(tag, bytes).unwrap()
+}
+
+pub fn max_abs(a: &[f32], b: &[f64]) -> f64 {
+    a.iter()
+        .zip(b)
+        .map(|(x, y)| (f64::from(*x) - y).abs())
+        .fold(0.0, f64::max)
+}
+
+pub fn cosine(a: &[f32], b: &[f64]) -> f64 {
+    let dot: f64 = a.iter().zip(b).map(|(x, y)| f64::from(*x) * y).sum();
+    let na = a.iter().map(|x| f64::from(*x).powi(2)).sum::<f64>().sqrt();
+    let nb = b.iter().map(|y| y * y).sum::<f64>().sqrt();
+    dot / (na * nb)
 }

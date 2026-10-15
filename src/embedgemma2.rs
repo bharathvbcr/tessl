@@ -4,8 +4,10 @@
 //! The text path is a 24-layer bidirectional encoder over a Gemma-4-style
 //! block, then a mean pool and an L2 normalize: what sentence-transformers'
 //! `Transformer -> Pooling(mean, include_prompt) -> Normalize` computes for
-//! this checkpoint. The vision and audio towers in the same file are not
-//! loaded.
+//! this checkpoint. This model does not load the vision or audio towers in
+//! the same file ([`crate::embedgemma2_vision`] holds the vision tower); their
+//! soft tokens enter through [`EmbedGemma2Model::encode_multimodal`] (see
+//! "Multimodal input" below).
 //!
 //! # Layer (transformers 5.19 `EmbeddingGemma2EncoderLayer`)
 //!
@@ -53,6 +55,21 @@
 //! does not refuse it. `tests/embedgemma2_model.rs` holds this forward to
 //! transformers' bf16 forward the way `tests/qwen35_model.rs` holds Qwen3.5's.
 //!
+//! # Multimodal input
+//!
+//! `EmbeddingGemma2Model.forward` embeds the ids with every image, video and
+//! audio placeholder id (`image_token_id`, `video_token_id`, `audio_token_id`)
+//! replaced by `pad_token_id`, so the placeholder rows are the pad row times
+//! `sqrt(hidden)`, then `masked_scatter`s the towers' soft tokens over the
+//! placeholder rows, in order and unscaled, and runs the text model on the
+//! result. [`EmbedGemma2Model::encode_multimodal`] is that entry with the soft
+//! tokens given: the scatter lands in the activation the per-layer inputs and
+//! the residual stream both read, so the rest of the forward is unchanged.
+//! [`EmbedGemma2Model::encode`] is the case with no soft rows and no
+//! placeholder ids (a text id equal to a placeholder id is an ordinary token
+//! there, as before). [`EmbedGemma2Config::image_sequence`] and
+//! [`EmbedGemma2Config::audio_sequence`] build the processor's id layout.
+//!
 //! # Kernels
 //!
 //! New for this model: [`encoder_attn`] (`kernels/encoder_attn.metal`: the
@@ -64,8 +81,10 @@
 //! `nn::rms_norm_residual_add_f32` (the post-norms and the layer scalar),
 //! `nn::scale_f32_inplace`, `qwen35::embed_rows_scaled` (the
 //! gather and the `sqrt(hidden)` scale), `qwen35::gated_act` (GELU-tanh over
-//! column windows) and `qwen35::attn_qk_norm_rope_columns` (`* w` norms,
-//! full-width RoPE, and the weightless V norm).
+//! column windows), `qwen35::attn_qk_norm_rope_columns` (`* w` norms,
+//! full-width RoPE, and the weightless V norm) and `qwen35_bwd::copy_cols`
+//! (one flat copy per run of consecutive placeholder rows, for the soft
+//! tokens; no new kernel).
 
 use std::sync::Arc;
 
@@ -80,6 +99,7 @@ use crate::nn::{
     rms_norm_residual_add_f32, scale_f32_inplace,
 };
 use crate::qwen35::{self, AttnShape, AttnTargets, Cols, GatedAct, LmHead, OutCols, QkvColumns};
+use crate::qwen35_bwd::copy_cols;
 use crate::qwen35_model::Precision;
 use crate::runtime::GpuRuntime;
 use crate::safetensors::SafeTensors;
@@ -405,9 +425,143 @@ pub struct EmbedGemma2Config {
     pub sliding_window: u32,
     pub rms_norm_eps: f32,
     pub layers: Vec<LayerSpec>,
+    /// The special token ids the multimodal entry needs; each is `None` when
+    /// `config.json` does not carry it (a text-only config).
+    pub special_tokens: SpecialTokens,
+}
+
+/// The special token ids of `config.json`, each present only if the file has
+/// it. [`EmbedGemma2Model::encode`] needs none of them;
+/// [`EmbedGemma2Model::encode_multimodal`] needs [`Self::multimodal`], and the
+/// sequence builders ([`EmbedGemma2Config::image_sequence`],
+/// [`EmbedGemma2Config::audio_sequence`]) the ones they place.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SpecialTokens {
+    /// `text_config.pad_token_id`: what a placeholder is embedded as.
+    pub pad: Option<u32>,
+    /// `text_config.bos_token_id` and `eos_token_id`: the ends of a sequence.
+    pub bos: Option<u32>,
+    pub eos: Option<u32>,
+    /// Top-level `image_token_id`, `video_token_id` and `audio_token_id`: the
+    /// placeholders that soft tokens replace.
+    pub image: Option<u32>,
+    pub video: Option<u32>,
+    pub audio: Option<u32>,
+    /// `boi_token_id`, `eoi_token_id`, `boa_token_id` and `eoa_token_index`
+    /// (spelled so in the checkpoint's config): the markers around an image's
+    /// and an audio clip's placeholders.
+    pub boi: Option<u32>,
+    pub eoi: Option<u32>,
+    pub boa: Option<u32>,
+    pub eoa: Option<u32>,
+}
+
+/// The ids [`EmbedGemma2Model::encode_multimodal`] works with.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MmTokens {
+    pub pad: u32,
+    pub image: u32,
+    pub video: u32,
+    pub audio: u32,
+}
+
+impl MmTokens {
+    /// Whether `id` is a placeholder that a soft token replaces.
+    pub fn is_placeholder(&self, id: u32) -> bool {
+        id == self.image || id == self.video || id == self.audio
+    }
+}
+
+impl SpecialTokens {
+    /// Every id of `named`, or an error naming each missing one by its
+    /// `config.json` key.
+    fn all<const N: usize>(what: &str, named: [(&str, Option<u32>); N]) -> Result<[u32; N], String> {
+        let missing: Vec<&str> = named.iter().filter(|(_, v)| v.is_none()).map(|(k, _)| *k).collect();
+        if !missing.is_empty() {
+            return Err(format!("{what}: config.json has no {}", missing.join(", ")));
+        }
+        Ok(named.map(|(_, v)| v.unwrap_or_default()))
+    }
+
+    /// What the multimodal entry needs: `pad_token_id`, the three
+    /// placeholders, and the four markers (`boi_token_id`, `eoi_token_id`,
+    /// `boa_token_id`, `eoa_token_index`) of a config that serves it. An
+    /// error names every missing key.
+    pub fn multimodal(&self, what: &str) -> Result<MmTokens, String> {
+        let [pad, image, video, audio, _, _, _, _] = Self::all(
+            what,
+            [
+                ("text_config.pad_token_id", self.pad),
+                ("image_token_id", self.image),
+                ("video_token_id", self.video),
+                ("audio_token_id", self.audio),
+                ("boi_token_id", self.boi),
+                ("eoi_token_id", self.eoi),
+                ("boa_token_id", self.boa),
+                ("eoa_token_index", self.eoa),
+            ],
+        )?;
+        Ok(MmTokens {
+            pad,
+            image,
+            video,
+            audio,
+        })
+    }
 }
 
 impl EmbedGemma2Config {
+    /// The processor's ids for one image of `n_soft` soft tokens:
+    /// `[<bos>, <boi>, <image> x n_soft, <eoi>, <eos>]`. Refused when
+    /// `config.json` lacks one of those ids, or for `n_soft == 0` (a
+    /// processor never emits an empty run).
+    pub fn image_sequence(&self, n_soft: usize) -> Result<Vec<u32>, String> {
+        let t = &self.special_tokens;
+        let [bos, boi, image, eoi, eos] = SpecialTokens::all(
+            "image_sequence",
+            [
+                ("text_config.bos_token_id", t.bos),
+                ("boi_token_id", t.boi),
+                ("image_token_id", t.image),
+                ("eoi_token_id", t.eoi),
+                ("text_config.eos_token_id", t.eos),
+            ],
+        )?;
+        Self::framed("image_sequence", [bos, boi], image, [eoi, eos], n_soft)
+    }
+
+    /// The processor's ids for one audio clip of `n_soft` soft tokens:
+    /// `[<bos>, <boa>, <audio> x n_soft, <eoa>, <eos>]`. Refused as
+    /// [`Self::image_sequence`] is.
+    pub fn audio_sequence(&self, n_soft: usize) -> Result<Vec<u32>, String> {
+        let t = &self.special_tokens;
+        let [bos, boa, audio, eoa, eos] = SpecialTokens::all(
+            "audio_sequence",
+            [
+                ("text_config.bos_token_id", t.bos),
+                ("boa_token_id", t.boa),
+                ("audio_token_id", t.audio),
+                ("eoa_token_index", t.eoa),
+                ("text_config.eos_token_id", t.eos),
+            ],
+        )?;
+        Self::framed("audio_sequence", [bos, boa], audio, [eoa, eos], n_soft)
+    }
+
+    fn framed(what: &str, head: [u32; 2], placeholder: u32, tail: [u32; 2], n_soft: usize) -> Result<Vec<u32>, String> {
+        if n_soft == 0 {
+            return Err(format!("{what}: n_soft is zero"));
+        }
+        let len = n_soft
+            .checked_add(4)
+            .ok_or_else(|| format!("{what}: n_soft {n_soft} overflows"))?;
+        let mut ids = Vec::with_capacity(len);
+        ids.extend(head);
+        ids.resize(2 + n_soft, placeholder);
+        ids.extend(tail);
+        Ok(ids)
+    }
+
     /// Parse the checkpoint's `config.json` (the multimodal root with a
     /// `text_config`, or a bare text config). Everything the forward does not
     /// implement is refused by name.
@@ -438,6 +592,14 @@ impl EmbedGemma2Config {
                 Some(Json::Num { value, .. }) => Ok(*value),
                 Some(v) => Err(format!("config.json: {k} must be a number, got {v:?}")),
                 None => Err(format!("config.json: missing {k:?}")),
+            }
+        };
+        // An id that may be absent (or null: a text-only config); a present one
+        // must be a u32.
+        let opt_uint = |obj: &Json, k: &str| -> Result<Option<u32>, String> {
+            match obj.get(k) {
+                None | Some(Json::Null) => Ok(None),
+                Some(_) => uint_in(obj, k).map(Some),
             }
         };
         let string = |k: &str| -> Result<Option<&str>, String> {
@@ -603,6 +765,18 @@ impl EmbedGemma2Config {
             }
             layers.push(spec);
         }
+        let special_tokens = SpecialTokens {
+            pad: opt_uint(c, "pad_token_id")?,
+            bos: opt_uint(c, "bos_token_id")?,
+            eos: opt_uint(c, "eos_token_id")?,
+            image: opt_uint(&root, "image_token_id")?,
+            video: opt_uint(&root, "video_token_id")?,
+            audio: opt_uint(&root, "audio_token_id")?,
+            boi: opt_uint(&root, "boi_token_id")?,
+            eoi: opt_uint(&root, "eoi_token_id")?,
+            boa: opt_uint(&root, "boa_token_id")?,
+            eoa: opt_uint(&root, "eoa_token_index")?,
+        };
         Ok(Self {
             hidden,
             ple_dim,
@@ -613,6 +787,7 @@ impl EmbedGemma2Config {
             sliding_window,
             rms_norm_eps: eps as f32,
             layers,
+            special_tokens,
         })
     }
 
@@ -850,12 +1025,63 @@ fn queue_forwards<Io>(
 /// may still be reading it, so each gets its own (small) set, and
 /// [`EmbedGemma2Model::encode`] keeps it alive until its one wait.
 struct ForwardIo {
+    /// The ids as the embedding gather reads them: padding is id 0, and under
+    /// [`EmbedGemma2Model::encode_multimodal`] each placeholder is `pad_token_id`.
     ids: GpuBuffer,
     lens: GpuBuffer,
     /// `[batch, 2]`: each sequence's live rows, `[b * seq, b * seq + len)`.
     segments: GpuBuffer,
     /// `[batch, embedding_dim]`: the embeddings.
     out: Tensor,
+    /// The forward's soft tokens, when it has any.
+    soft: Option<SoftIo>,
+}
+
+/// One input sequence of [`EmbedGemma2Model::encode_multimodal`]: its token
+/// ids, and the soft tokens that replace its placeholder ids.
+#[derive(Clone, Copy, Debug)]
+pub struct MmSequence<'a> {
+    /// The token ids, placeholders included (`[<bos>, <boi>, <image> x S,
+    /// <eoi>, <eos>]` for [`EmbedGemma2Config::image_sequence`]).
+    pub ids: &'a [u32],
+    /// `[n_placeholders, hidden]` row-major, finite: row `j` replaces the
+    /// `j`-th row of `ids` whose id is an image, video or audio placeholder,
+    /// in order, as it is (not scaled by `sqrt(hidden)`).
+    pub soft: &'a [f32],
+}
+
+/// A forward's soft tokens: its sequences' rows in chunk order, and where
+/// each run of them lands.
+struct SoftIo {
+    /// `[n, hidden]` f32, uploaded without a wait.
+    rows: GpuBuffer,
+    n: u32,
+    /// `(first soft row, first padded row, row count)`: each maximal run of
+    /// consecutive padded rows, one flat copy each.
+    runs: Vec<(u32, u32, u32)>,
+}
+
+/// Where the soft tokens of `chunk` land in a forward padded to `seq`:
+/// maximal runs of consecutive padded rows, `(first soft row, first padded
+/// row, row count)` with the soft rows numbered in chunk order. The count is
+/// what [`EmbedGemma2Model::encode_multimodal`] checked each sequence against.
+fn soft_runs(chunk: &[MmSequence<'_>], seq: usize, tokens: &MmTokens) -> Vec<(u32, u32, u32)> {
+    let mut runs: Vec<(u32, u32, u32)> = Vec::new();
+    let mut next = 0u32;
+    for (b, s) in chunk.iter().enumerate() {
+        for (t, &id) in s.ids.iter().enumerate() {
+            if !tokens.is_placeholder(id) {
+                continue;
+            }
+            let row = (b * seq + t) as u32;
+            match runs.last_mut() {
+                Some((_, dst, len)) if *dst + *len == row => *len += 1,
+                _ => runs.push((next, row, 1)),
+            }
+            next += 1;
+        }
+    }
+    runs
 }
 
 impl EmbedGemma2Model {
@@ -1083,45 +1309,121 @@ impl EmbedGemma2Model {
     /// ([`GpuRuntime::set_serialized_dispatch`]) still commits and waits for
     /// each.
     pub fn encode(&self, batch: &[&[u32]], truncate_dim: Option<u32>, trace: bool) -> Result<EncodeOutput, String> {
-        const WHAT: &str = "EmbedGemma2Model::encode";
+        let seqs: Vec<MmSequence<'_>> = batch.iter().map(|&ids| MmSequence { ids, soft: &[] }).collect();
+        self.encode_impl("EmbedGemma2Model::encode", &seqs, None, truncate_dim, trace)
+    }
+
+    /// [`Self::encode`] for sequences whose placeholder ids (`image_token_id`,
+    /// `video_token_id`, `audio_token_id`) are replaced by soft tokens, what
+    /// `EmbeddingGemma2Model.forward` does with the towers' outputs (see the
+    /// module docs, Multimodal input): the placeholders are embedded as
+    /// `pad_token_id`, then each sequence's `soft` rows overwrite its
+    /// placeholder rows in order, unscaled, before the per-layer inputs and the
+    /// residual stream are formed. The mean pool takes every token of the
+    /// sequence, soft ones included (`include_prompt`).
+    ///
+    /// Refused before any GPU work: a config without the ids
+    /// ([`SpecialTokens::multimodal`]), a `soft` whose length is not a
+    /// multiple of `hidden`, a non-finite soft value, a number of soft rows
+    /// that differs from the number of placeholder ids in `ids`, and
+    /// everything [`Self::encode`] refuses (a placeholder id is exempt from
+    /// the `vocab` bound, as in transformers, since it is never looked up).
+    /// A sequence with no placeholders and no soft rows is a text sequence.
+    /// Batching, packing and queueing are [`Self::encode`]'s: one host wait
+    /// per call, and a sequence's embedding does not depend on its batch
+    /// beyond GEMM tiling.
+    pub fn encode_multimodal(
+        &self,
+        batch: &[MmSequence<'_>],
+        truncate_dim: Option<u32>,
+        trace: bool,
+    ) -> Result<EncodeOutput, String> {
+        const WHAT: &str = "EmbedGemma2Model::encode_multimodal";
+        let tokens = self.cfg.special_tokens.multimodal(WHAT)?;
+        self.encode_impl(WHAT, batch, Some(tokens), truncate_dim, trace)
+    }
+
+    /// The batching, packing and queueing of [`Self::encode`] and
+    /// [`Self::encode_multimodal`] (`tokens`: `Some` for the latter, whose
+    /// placeholders and soft rows it then checks and applies; `None` for the
+    /// former, whose `soft` is always empty).
+    fn encode_impl(
+        &self,
+        what: &'static str,
+        batch: &[MmSequence<'_>],
+        tokens: Option<MmTokens>,
+        truncate_dim: Option<u32>,
+        trace: bool,
+    ) -> Result<EncodeOutput, String> {
         let cfg = &self.cfg;
+        let hidden = cfg.hidden as usize;
         let dim_out = truncate_dim.unwrap_or(cfg.embedding_dim);
         if dim_out == 0 || dim_out > cfg.embedding_dim {
             return Err(format!(
-                "{WHAT}: truncate_dim {dim_out} must be in 1..={}",
+                "{what}: truncate_dim {dim_out} must be in 1..={}",
                 cfg.embedding_dim
             ));
         }
         if batch.is_empty() {
-            return Err(format!("{WHAT}: empty batch"));
+            return Err(format!("{what}: empty batch"));
         }
         if batch.len() > MAX_BATCH {
             return Err(format!(
-                "{WHAT}: {} sequences exceeds the batch limit {MAX_BATCH}",
+                "{what}: {} sequences exceeds the batch limit {MAX_BATCH}",
                 batch.len()
             ));
         }
         if trace && batch.len() != 1 {
-            return Err(format!("{WHAT}: trace takes one sequence, got {}", batch.len()));
+            return Err(format!("{what}: trace takes one sequence, got {}", batch.len()));
         }
         if self.operands == GemmOperands::ExactF32 && self.rt.f32_gemm_runs_relaxed() {
             return Err(format!(
-                "{WHAT}: the forward needs exact-f32 GEMMs; switch the runtime's relaxed precision off"
+                "{what}: the forward needs exact-f32 GEMMs; switch the runtime's relaxed precision off"
             ));
         }
-        for (b, ids) in batch.iter().enumerate() {
+        if let Some(t) = &tokens {
+            if t.pad >= cfg.vocab {
+                return Err(format!("{what}: pad_token_id {} >= vocab {}", t.pad, cfg.vocab));
+            }
+        }
+        for (b, s) in batch.iter().enumerate() {
+            let ids = s.ids;
             if ids.is_empty() {
-                return Err(format!("{WHAT}: sequence {b} is empty"));
+                return Err(format!("{what}: sequence {b} is empty"));
             }
             if ids.len() > self.max_tokens as usize {
                 return Err(format!(
-                    "{WHAT}: sequence {b} has {} tokens; the limit is {} (truncate it, or raise it with set_max_tokens)",
+                    "{what}: sequence {b} has {} tokens; the limit is {} (truncate it, or raise it with set_max_tokens)",
                     ids.len(),
                     self.max_tokens
                 ));
             }
-            if let Some(&bad) = ids.iter().find(|&&id| id >= cfg.vocab) {
-                return Err(format!("{WHAT}: sequence {b}: token id {bad} >= vocab {}", cfg.vocab));
+            // A placeholder is looked up as the pad id, so only the other ids
+            // are bounded by the vocabulary.
+            let is_ph = |id: u32| tokens.is_some_and(|t| t.is_placeholder(id));
+            if let Some(&bad) = ids.iter().find(|&&id| id >= cfg.vocab && !is_ph(id)) {
+                return Err(format!("{what}: sequence {b}: token id {bad} >= vocab {}", cfg.vocab));
+            }
+            if s.soft.len() % hidden != 0 {
+                return Err(format!(
+                    "{what}: sequence {b}: {} soft values is not a multiple of hidden {hidden}",
+                    s.soft.len()
+                ));
+            }
+            if let Some(i) = s.soft.iter().position(|v| !v.is_finite()) {
+                return Err(format!(
+                    "{what}: sequence {b}: soft value {} (row {}, column {}) is not finite",
+                    s.soft[i],
+                    i / hidden,
+                    i % hidden
+                ));
+            }
+            let placeholders = ids.iter().filter(|&&id| is_ph(id)).count();
+            if placeholders != s.soft.len() / hidden {
+                return Err(format!(
+                    "{what}: sequence {b} has {placeholders} placeholder ids but {} soft rows",
+                    s.soft.len() / hidden
+                ));
             }
         }
 
@@ -1141,11 +1443,12 @@ impl EmbedGemma2Model {
         } else {
             FORWARD_COST_ROWS_SYNC
         };
-        let chunks = pack_forwards(batch, MAX_BATCH_TOKENS, cost);
+        let id_lists: Vec<&[u32]> = batch.iter().map(|s| s.ids).collect();
+        let chunks = pack_forwards(&id_lists, MAX_BATCH_TOKENS, cost);
         // One set of activations for every forward: the most padded rows and
         // the most sequences any of them has (a chunk is padded to its first,
         // longest sequence).
-        let rows = chunks.iter().map(|c| c.len() * batch[c[0]].len()).max().unwrap_or(0);
+        let rows = chunks.iter().map(|c| c.len() * id_lists[c[0]].len()).max().unwrap_or(0);
         let nb = chunks.iter().map(Vec::len).max().unwrap_or(0);
         let acts = self.acts(nb, rows)?;
         // The forwards are queued back to back and the host waits once, after
@@ -1163,11 +1466,11 @@ impl EmbedGemma2Model {
             chunks,
             &mut pending,
             |chunk| {
-                let seqs: Vec<&[u32]> = chunk.iter().map(|&i| batch[i]).collect();
-                self.forward_io(&seqs)
+                let seqs: Vec<MmSequence<'_>> = chunk.iter().map(|&i| batch[i]).collect();
+                self.forward_io(&seqs, tokens.as_ref())
             },
             |chunk, io| {
-                let seqs: Vec<&[u32]> = chunk.iter().map(|&i| batch[i]).collect();
+                let seqs: Vec<&[u32]> = chunk.iter().map(|&i| id_lists[i]).collect();
                 out_trace = self.forward(&acts, io, &seqs, dim_out, trace)?;
                 forwards += 1;
                 Ok(())
@@ -1201,10 +1504,16 @@ impl EmbedGemma2Model {
     /// already bound would wait for every queued forward). The GPU reads them
     /// when the forward runs, which may be after the host has queued the next
     /// one.
-    fn forward_io(&self, batch: &[&[u32]]) -> Result<ForwardIo, String> {
+    ///
+    /// With `tokens` (the multimodal entry) each placeholder id is uploaded as
+    /// `pad_token_id`, and the sequences' soft rows, in order, are uploaded
+    /// too, as raw f32 bits through the same no-wait path (the runtime has no
+    /// f32 twin of `alloc_buffer_from_u32`). A forward with no soft rows
+    /// allocates nothing for them.
+    fn forward_io(&self, batch: &[MmSequence<'_>], tokens: Option<&MmTokens>) -> Result<ForwardIo, String> {
         const WHAT: &str = "EmbedGemma2Model::forward";
         let rt = &self.rt;
-        let seq = batch.iter().map(|ids| ids.len()).max().unwrap_or(0);
+        let seq = batch.iter().map(|s| s.ids.len()).max().unwrap_or(0);
         let rows = batch.len() * seq;
         if seq == 0 || rows > MAX_BATCH_TOKENS {
             return Err(format!(
@@ -1213,21 +1522,89 @@ impl EmbedGemma2Model {
             ));
         }
         let mut padded = vec![0u32; rows];
-        for (b, ids) in batch.iter().enumerate() {
-            padded[b * seq..b * seq + ids.len()].copy_from_slice(ids);
+        for (b, s) in batch.iter().enumerate() {
+            let dst = &mut padded[b * seq..b * seq + s.ids.len()];
+            match tokens {
+                Some(t) => {
+                    for (d, &id) in dst.iter_mut().zip(s.ids) {
+                        *d = if t.is_placeholder(id) { t.pad } else { id };
+                    }
+                }
+                None => dst.copy_from_slice(s.ids),
+            }
         }
-        let lens: Vec<u32> = batch.iter().map(|ids| ids.len() as u32).collect();
+        let lens: Vec<u32> = batch.iter().map(|s| s.ids.len() as u32).collect();
         let segs: Vec<u32> = batch
             .iter()
             .enumerate()
-            .flat_map(|(b, ids)| [(b * seq) as u32, (b * seq + ids.len()) as u32])
+            .flat_map(|(b, s)| [(b * seq) as u32, (b * seq + s.ids.len()) as u32])
             .collect();
+        let soft = match tokens {
+            Some(t) if batch.iter().any(|s| !s.soft.is_empty()) => {
+                let bits: Vec<u32> = batch.iter().flat_map(|s| s.soft.iter().map(|v| v.to_bits())).collect();
+                let n = bits.len() / self.cfg.hidden as usize;
+                Some(SoftIo {
+                    rows: rt.alloc_buffer_from_u32(&bits)?,
+                    n: u32::try_from(n).map_err(|_| format!("{WHAT}: {n} soft rows exceed u32"))?,
+                    runs: soft_runs(batch, seq, t),
+                })
+            }
+            _ => None,
+        };
         Ok(ForwardIo {
             ids: rt.alloc_buffer_from_u32(&padded)?,
             lens: rt.alloc_buffer_from_u32(&lens)?,
             segments: rt.alloc_buffer_from_u32(&segs)?,
             out: rt.alloc_tensor_unzeroed(&[batch.len(), self.cfg.embedding_dim as usize], DType::F32)?,
+            soft,
         })
+    }
+
+    /// Overwrite the placeholder rows of `embeds` (`rows` rows of `hidden`,
+    /// just gathered as the pad id) with the forward's soft rows, unscaled:
+    /// one flat [`copy_cols`] per run of consecutive placeholder rows, a
+    /// single row of the run's whole width. A document with one image or
+    /// clip has one run; the runs number at most `(rows + 1) / 2`.
+    fn scatter_soft(&self, soft: &SoftIo, embeds: &GpuBuffer, rows: u32) -> Result<(), String> {
+        const WHAT: &str = "EmbedGemma2Model::forward";
+        let h = self.cfg.hidden;
+        let flat = |count: u32, what: &str| {
+            count
+                .checked_mul(h)
+                .ok_or_else(|| format!("{WHAT}: {what} ({count} rows of {h}) exceeds u32 indexing"))
+        };
+        let (soft_len, embeds_len) = (flat(soft.n, "soft rows")?, flat(rows, "padded rows")?);
+        let covered: u32 = soft.runs.iter().map(|&(_, _, len)| len).sum();
+        if covered != soft.n {
+            return Err(format!(
+                "{WHAT}: the placeholder runs cover {covered} rows, the forward has {} soft rows",
+                soft.n
+            ));
+        }
+        for &(src, dst, len) in &soft.runs {
+            if src + len > soft.n || dst + len > rows {
+                return Err(format!(
+                    "{WHAT}: soft run (src {src}, dst {dst}, len {len}) exceeds {} soft rows or {rows} padded rows",
+                    soft.n
+                ));
+            }
+            copy_cols(
+                &self.rt,
+                Cols {
+                    buf: &soft.rows,
+                    ld: soft_len,
+                    off: src * h,
+                },
+                Cols {
+                    buf: embeds,
+                    ld: embeds_len,
+                    off: dst * h,
+                },
+                1,
+                len * h,
+            )?;
+        }
+        Ok(())
     }
 
     /// Queue one forward over `batch` padded to its longest sequence
@@ -1301,6 +1678,12 @@ impl EmbedGemma2Model {
             (h as f32).sqrt(),
             &embeds.buffer,
         )?;
+        // The multimodal entry: soft tokens over the placeholder rows, before
+        // anything reads `embeds` (the residual stream, the bf16 copy, the
+        // per-layer-input GEMM).
+        if let Some(soft) = &io.soft {
+            self.scatter_soft(soft, &a.embeds.buffer, rows_u)?;
+        }
         gpu_copy(&embeds, &resid)?;
         if bf.is_some() {
             cast_f32_to_bf16_into(&embeds, &embeds_in)?;
@@ -1562,9 +1945,91 @@ fn view(t: &Tensor, rows: u32, cols: u32) -> Result<Tensor, String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        encoder_attn_tiled_entry, pack_forwards, queue_forwards, FORWARD_COST_ROWS_ASYNC, FORWARD_COST_ROWS_SYNC,
-        MAX_BATCH,
+        encoder_attn_tiled_entry, pack_forwards, queue_forwards, soft_runs, MmSequence, MmTokens, SpecialTokens,
+        FORWARD_COST_ROWS_ASYNC, FORWARD_COST_ROWS_SYNC, MAX_BATCH,
     };
+
+    /// The soft tokens' destinations: soft rows numbered in chunk order,
+    /// padded rows `b * seq + t`, a run broken by any non-placeholder row or
+    /// padding but continued across a sequence boundary when the last row of
+    /// one and the first of the next are both placeholders.
+    #[test]
+    fn soft_runs_follow_the_padded_layout() {
+        let tokens = MmTokens {
+            pad: 0,
+            image: 90,
+            video: 91,
+            audio: 92,
+        };
+        let seq = |ids: &'static [u32]| MmSequence { ids, soft: &[] };
+        let run = |chunk: &[MmSequence<'_>], seq: usize| soft_runs(chunk, seq, &tokens);
+        assert!(run(&[seq(&[1, 2, 3])], 3).is_empty(), "no placeholders");
+        // One image: a single run over the placeholders.
+        assert_eq!(run(&[seq(&[1, 90, 90, 90, 2])], 5), [(0, 1, 3)]);
+        // Three kinds, scattered: runs split at text, kinds merge when adjacent.
+        assert_eq!(
+            run(&[seq(&[90, 91, 5, 92, 5, 5, 90])], 7),
+            [(0, 0, 2), (2, 3, 1), (3, 6, 1)]
+        );
+        // Padding separates: a sequence of 2 padded to 3 ends a run at its last token.
+        assert_eq!(run(&[seq(&[5, 90]), seq(&[90, 5, 5])], 3), [(0, 1, 1), (1, 3, 1)]);
+        // Full-length sequences touch: rows 2 and 3 are one run, its soft rows
+        // are consecutive.
+        assert_eq!(
+            run(&[seq(&[5, 5, 90]), seq(&[90, 90, 5]), seq(&[5, 5, 90])], 3),
+            [(0, 2, 3), (3, 8, 1)]
+        );
+        // A second sequence's rows continue the numbering.
+        assert_eq!(run(&[seq(&[90, 5]), seq(&[5, 91])], 2), [(0, 0, 1), (1, 3, 1)]);
+    }
+
+    /// The special tokens: every key named when missing, the multimodal set
+    /// complete or refused, and the placeholders (not the markers) test true.
+    #[test]
+    fn special_tokens_name_what_is_missing() {
+        let none = SpecialTokens::default();
+        let e = none.multimodal("w").unwrap_err();
+        for key in [
+            "text_config.pad_token_id",
+            "image_token_id",
+            "video_token_id",
+            "audio_token_id",
+            "boi_token_id",
+            "eoi_token_id",
+            "boa_token_id",
+            "eoa_token_index",
+        ] {
+            assert!(e.contains(key), "{e}");
+        }
+        assert!(e.starts_with("w: "));
+        let all = SpecialTokens {
+            pad: Some(0),
+            bos: Some(2),
+            eos: Some(1),
+            image: Some(10),
+            video: Some(11),
+            audio: Some(12),
+            boi: Some(20),
+            eoi: Some(21),
+            boa: Some(22),
+            eoa: Some(23),
+        };
+        let m = all.multimodal("w").unwrap();
+        assert_eq!(
+            m,
+            MmTokens {
+                pad: 0,
+                image: 10,
+                video: 11,
+                audio: 12
+            }
+        );
+        for id in 0..30 {
+            assert_eq!(m.is_placeholder(id), (10..=12).contains(&id), "{id}");
+        }
+        let e = SpecialTokens { eoa: None, ..all }.multimodal("w").unwrap_err();
+        assert!(e.contains("eoa_token_index") && !e.contains("boa_token_id"), "{e}");
+    }
 
     /// A forward that fails after queuing dispatches must still have its io
     /// held (not dropped) when `queue_forwards` returns, so the caller's wait

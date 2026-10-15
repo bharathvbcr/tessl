@@ -18,6 +18,22 @@ All notable changes to `tessl` are recorded here. The format follows
   the same bf16 weights in `tests/embedgemma2_tiny.rs`. `encode` does not
   refuse the runtime's relaxed-f32 switch at `Bf16`, since no f32 GEMM runs.
   `bench_embedgemma2` takes `BENCH_PRECISION=f32|bf16`.
+- **EmbeddingGemma 2 from Python and C** (`src/capi_embedgemma2.rs`,
+  `python/tessl_torch/embedgemma2.py`; audit gap G3).
+  `tessl_embedgemma2_{load,free,embedding_dim,max_tokens,set_max_tokens,encode}`
+  load a snapshot directory and embed flat `u32` ids with CSR offsets into
+  `f32 [n_seqs, dim]`, validating every pointer and length before any
+  allocation or GPU work and writing the output only on success. Python gets
+  `EmbedGemma2.from_pretrained(dir).encode(ids, truncate_dim)` and
+  `encode_texts(texts, tokenizer, prompt_name)`, which prepends the snapshot's
+  prompt and duck-types a `tokenizers` or transformers tokenizer (neither is
+  imported). Additive: the ABI version is unchanged, and a library built before
+  these entries is named as such by the binding. `capi.rs` only widens
+  `Handle`, `guarded`, `free_handle`, `checked_slice` and `checked_slice_mut`
+  to `pub(crate)`. The tiny-checkpoint builder moved from
+  `tests/embedgemma2_tiny.rs` to `tests/common/embedgemma2.rs`, and
+  `tests/capi_contract.rs` holds the new module and Python file to the same
+  signature rules as the originals.
 - **Per-entry host reads and writes of the Qwen3.5 parameter table**
   (`Qwen35Model::{read_parameter_host, write_parameter_host,
   read_gradient_host, read_adamw_moment_host, write_adamw_moment_host}`).

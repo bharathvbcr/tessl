@@ -74,6 +74,58 @@ forward's) misplaced every sequence after the first: sequence 1 of a batch
 came out at cosine `0.27`. `tests/embedgemma2_tiny.rs` mixes K/V widths 512
 and 256 and runs a 30-token forward in buffers sized for a 4000-token one.
 
+## From Python / C
+
+The C ABI in `src/capi_embedgemma2.rs` (a module of its own beside
+`src/capi.rs`, whose handle, thread and status conventions it reuses) and
+`python/tessl_torch/embedgemma2.py` put the encoder behind the tokenizer the
+caller already holds. Build the library once (`cargo build --release`, or point
+`TESSL_LIB` at a `libtessl.dylib`):
+
+```python
+from tokenizers import Tokenizer            # or transformers.AutoTokenizer
+from tessl_torch.embedgemma2 import EmbedGemma2
+
+model = EmbedGemma2.from_pretrained(snapshot_dir)   # a local snapshot directory
+tok = Tokenizer.from_file(f"{snapshot_dir}/tokenizer.json")
+q = model.encode_texts(["how do I speed up attention?"], tok, prompt_name="query")
+d = model.encode_texts(["Sliding-window attention ..."], tok, prompt_name="document")
+scores = q @ d.T                                    # rows are L2-normalized float32
+small = model.encode(ids, truncate_dim=256)         # token ids you tokenized yourself
+```
+
+`encode_texts` prepends the snapshot's own prompt (the `prompts` of
+`config_sentence_transformers.json`) to each text and asks the tokenizer for
+special tokens, which is what sentence-transformers' `encode(prompt_name=...)`
+does. The Python test checks that the ids it produces equal the reference's
+for both a `tokenizers.Tokenizer` and a transformers tokenizer. It duck-types the
+tokenizer and imports neither package, so neither is a dependency.
+
+The C entries, each returning a status with its message in a caller buffer, as
+the training entries do:
+
+| Entry | Does |
+|---|---|
+| `tessl_embedgemma2_load(runtime, dir, dir_len, &out, err, err_len)` | reads `config.json` and `model.safetensors` from the snapshot directory (UTF-8, not NUL-terminated, at most 4096 bytes) |
+| `tessl_embedgemma2_free(model)` | frees it once; null is a no-op |
+| `tessl_embedgemma2_embedding_dim` / `_max_tokens` / `_set_max_tokens` | the width, and the per-sequence token limit (1 to 32768, default 8192) |
+| `tessl_embedgemma2_encode(model, ids, n_ids, offsets, n_seqs, truncate_dim, out, out_len, err, err_len)` | `ids` flat `u32`, `offsets[n_seqs + 1]` CSR-style `u64` (starting at 0, strictly increasing, ending at `n_ids`), `truncate_dim` 0 for the full width, `out` `f32 [n_seqs, dim]` with `out_len` exactly `n_seqs * dim` |
+
+Everything about an `encode` call is checked before anything is allocated or
+sent to the GPU, and the output is written only when the whole batch has
+succeeded: null pointers, `n_seqs` past 256, an offset table that is not
+monotone or does not end at `n_ids`, a sequence past `max_tokens`, a token id
+past the vocabulary, a `truncate_dim` past the width, an `out_len` that is not
+the output's size. No caller length sizes a slice before it is bounded by those
+limits. The model takes its own reference to the runtime, so it stays valid if
+the runtime handle is freed first. As everywhere in the C ABI, a handle is used
+from the thread that made it (a foreign-thread call is refused) and a freed
+handle is the caller's to drop; the runtime must have relaxed f32 precision off,
+as the C ABI leaves it. `tests/capi_embedgemma2.rs` pins each refusal and that
+a successful call equals `EmbedGemma2Model::encode` bit for bit on the same
+weights; `python/tests/test_embedgemma2.py` holds the real checkpoint to the
+bounds below (set `EMBEDGEMMA2_SNAPSHOT`).
+
 ## Kernels
 
 | Kernel | File | New? |

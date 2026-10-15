@@ -1764,3 +1764,143 @@ fn generated_python_token_streams_strip_to_exactly_their_non_comment_text() {
         assert_eq!(strip_py_comments(&src), want, "case {case}: {src:?}");
     }
 }
+
+// ---------------------------------------------------------------------------
+// The EmbeddingGemma 2 entries live in their own module and Python file, so the
+// tests above (which read `RS` and `PY` alone) never see them. These hold the
+// pair to the same rules, with the same injected faults, so a mismatch there
+// cannot pass for want of being looked at.
+
+const RS_EG2: &str = "src/capi_embedgemma2.rs";
+const PY_EG2: &str = "python/tessl_torch/embedgemma2.py";
+
+fn eg2_abi() -> (RustAbi, PyAbi) {
+    (parse_rust_abi(&read(RS_EG2)), parse_py_abi(&read(PY_EG2)))
+}
+
+const EG2_FNS: [&str; 6] = [
+    "tessl_embedgemma2_load",
+    "tessl_embedgemma2_free",
+    "tessl_embedgemma2_embedding_dim",
+    "tessl_embedgemma2_max_tokens",
+    "tessl_embedgemma2_set_max_tokens",
+    "tessl_embedgemma2_encode",
+];
+
+#[test]
+fn every_embedgemma2_c_function_is_declared_in_python_with_the_same_arity_and_widths() {
+    let (rust, py) = eg2_abi();
+    // A parser that quietly found nothing would pass vacuously.
+    assert_eq!(rust.fns.len(), EG2_FNS.len());
+    for name in EG2_FNS {
+        assert!(rust.fns.contains_key(name), "{name} not parsed from {RS_EG2}");
+        assert!(py.fns.contains_key(name), "{name} not parsed from {PY_EG2}");
+    }
+    let problems = fn_problems(&rust, &py, &[]);
+    assert!(problems.is_empty(), "C ABI / ctypes mismatch:\n{}", problems.join("\n"));
+}
+
+#[test]
+fn an_embedgemma2_signature_that_drifts_on_either_side_is_reported() {
+    let (rust, py) = eg2_abi();
+    let py_src = read(PY_EG2);
+    let rs_src = read(RS_EG2);
+
+    // A narrower restype, a narrower length, a dropped argument.
+    let p = fn_problems(
+        &rust,
+        &parse_py_abi(&fault(
+            &py_src,
+            "lib.tessl_embedgemma2_encode.restype = ctypes.c_int32",
+            "lib.tessl_embedgemma2_encode.restype = ctypes.c_int64",
+        )),
+        &[],
+    );
+    assert!(mentions(&p, "tessl_embedgemma2_encode: returns"), "{p:?}");
+    let p = fn_problems(
+        &rust,
+        &parse_py_abi(&fault(
+            &py_src,
+            "ctypes.c_void_p, u32p, ctypes.c_uint64, ctypes.POINTER(ctypes.c_uint64), ctypes.c_uint64,",
+            "ctypes.c_void_p, u32p, ctypes.c_uint32, ctypes.POINTER(ctypes.c_uint64), ctypes.c_uint64,",
+        )),
+        &[],
+    );
+    assert!(mentions(&p, "tessl_embedgemma2_encode: argument 2 `n_ids`"), "{p:?}");
+    let p = fn_problems(
+        &rust,
+        &parse_py_abi(&fault(
+            &py_src,
+            "lib.tessl_embedgemma2_set_max_tokens.argtypes = [ctypes.c_void_p, ctypes.c_uint32] + err_args",
+            "lib.tessl_embedgemma2_set_max_tokens.argtypes = [ctypes.c_void_p] + err_args",
+        )),
+        &[],
+    );
+    assert!(mentions(&p, "tessl_embedgemma2_set_max_tokens: C takes"), "{p:?}");
+
+    // The same on the Rust side.
+    let p = fn_problems(
+        &parse_rust_abi(&fault(&rs_src, "    n_seqs: u64,\n", "    n_seqs: u32,\n")),
+        &py,
+        &[],
+    );
+    assert!(mentions(&p, "tessl_embedgemma2_encode: argument 4 `n_seqs`"), "{p:?}");
+    let p = fn_problems(
+        &parse_rust_abi(&fault(&rs_src, "    truncate_dim: u32,\n", "    truncate_dim: u64,\n")),
+        &py,
+        &[],
+    );
+    assert!(
+        mentions(&p, "tessl_embedgemma2_encode: argument 5 `truncate_dim`"),
+        "{p:?}"
+    );
+
+    // An export with no declaration, and a declaration with no export.
+    let phantom = "pub unsafe extern \"C\" fn tessl_embedgemma2_phantom(x: u32) -> i32 { 0 }";
+    let p = fn_problems(&parse_rust_abi(&format!("{rs_src}\n{phantom}\n")), &py, &[]);
+    assert!(mentions(&p, "tessl_embedgemma2_phantom: in src/capi.rs"), "{p:?}");
+    let p = fn_problems(
+        &rust,
+        &parse_py_abi(&fault(
+            &py_src,
+            "        lib.tessl_embedgemma2_free.restype = ctypes.c_int32\n",
+            "        lib.tessl_embedgemma2_free.restype = ctypes.c_int32\n        lib.tessl_embedgemma2_ghost.restype = ctypes.c_int32\n        lib.tessl_embedgemma2_ghost.argtypes = [ctypes.c_void_p]\n",
+        )),
+        &[],
+    );
+    assert!(
+        mentions(&p, "tessl_embedgemma2_ghost: declared in the Python binding"),
+        "{p:?}"
+    );
+}
+
+/// Every module that exports `tessl_*` entry points, found by scanning `src/`.
+/// A third one would be checked by neither contract above, so adding one must
+/// start here.
+#[test]
+fn only_the_two_known_modules_export_c_entry_points() {
+    fn walk(dir: &std::path::Path, out: &mut Vec<String>) {
+        for e in std::fs::read_dir(dir).unwrap() {
+            let p = e.unwrap().path();
+            if p.is_dir() {
+                walk(&p, out);
+            } else if p.extension().is_some_and(|x| x == "rs")
+                && strip_line_comments(&std::fs::read_to_string(&p).unwrap()).contains("extern \"C\" fn tessl_")
+            {
+                out.push(
+                    p.strip_prefix(env!("CARGO_MANIFEST_DIR"))
+                        .unwrap()
+                        .to_string_lossy()
+                        .into_owned(),
+                );
+            }
+        }
+    }
+    let mut found = Vec::new();
+    walk(
+        &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src"),
+        &mut found,
+    );
+    found.sort();
+    assert_eq!(found, [RS, RS_EG2]);
+}

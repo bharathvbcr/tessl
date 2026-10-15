@@ -48,7 +48,11 @@ import torch
 from safetensors.torch import save_file
 from transformers.models.qwen3_5 import modeling_qwen3_5 as mq
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import fixture_manifest as fm  # noqa: E402
+
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+GENERATOR = "tools/qwen35_ref/make_train_fixture.py"
 TINY_T = 70  # past one 64-token GDN chunk and two 32-row attention blocks
 
 
@@ -112,6 +116,38 @@ def write_common(out, loss, ids):
     np.save(os.path.join(out, "loss.npy"), np.array([loss], dtype=np.float64))
 
 
+def train_manifest(directory, out, grouped, role, reproduction):
+    """MANIFEST.json for a committed `tiny` fixture directory (the format and its
+    meaning are in fixture_manifest.py). Every file here is a golden of record: the
+    loss and the gradients come from transformers' own autograd, and the checkpoint
+    and ids are what they were differentiated at."""
+    files = {}
+    for name in sorted(os.listdir(out)):
+        if name == "config.json":
+            files[name] = dict(role="config", published=True, note="the tiny model's config.json")
+        elif name == "model.safetensors":
+            files[name] = dict(role="model", published=True,
+                               note="bf16 checkpoint; the float32 model torch differentiated holds the same values")
+        elif name == "ids.npy":
+            files[name] = dict(role="input", published=True, note="token ids the loss and gradients are at")
+        elif name == "loss.npy":
+            files[name] = dict(role="golden", published=True, note="mean cross-entropy, float64")
+        else:
+            files[name] = dict(role="golden", published=True,
+                               note="float32 gradient from transformers' loss.backward()")
+    heads = "2 key heads over 4 value heads" if grouped else "1 key head over 1 value head"
+    fm.write_manifest(
+        directory, GENERATOR,
+        f"drawn: torch.Generator().manual_seed(20260930) feeds the parameter init and the token ids; the "
+        f"drawn model (model.safetensors) and ids.npy are committed, so the draws are the inputs. {heads}.",
+        files, role, reproduction=reproduction,
+        extra={"gdn_path": "chunked: Qwen3_5ForCausalLM runs with no cache, so every GDN layer calls "
+                           "transformers' torch_chunk_gated_delta_rule (modeling_qwen3_5.py, 5.17.0 :301) and "
+                           "autograd differentiates it; the recurrent rule runs only for a cached single-token "
+                           "step. Both read the decayed state, which is the published rule (arXiv:2412.06464 eq. 8). "
+                           "Checked by wrapping both entry points over one forward at T=70."})
+
+
 def tiny(args):
     name = "qwen35_train_grouped" if args.grouped else "qwen35_train"
     out = args.out or os.path.join(ROOT, "tests", "fixtures", name)
@@ -133,6 +169,12 @@ def tiny(args):
     write_common(out, loss, ids)
     for n, g in grads.items():
         np.save(os.path.join(out, f"grad.{n}.npy"), g.astype(np.float32))
+    if args.reproduces:
+        # The committed files predate the manifest: compare this run with them and
+        # record that, rather than claiming they were produced by it.
+        train_manifest(args.reproduces, out, args.grouped, "reproduced", fm.compare(args.reproduces, out))
+    else:
+        train_manifest(out, out, args.grouped, "produced", None)
     print(f"tiny: loss {loss:.6f}, {len(grads)} gradients -> {out}")
 
 
@@ -182,6 +224,9 @@ def main():
     ap.add_argument("--grouped", action="store_true",
                     help="tiny: two GDN key heads over four value heads, the 4B's ratio")
     ap.add_argument("--out", help="tiny: where to write (default: the committed fixture)")
+    ap.add_argument("--reproduces", metavar="DIR",
+                    help="tiny, with --out: DIR is a committed fixture. Compare this run with it and write "
+                         "DIR/MANIFEST.json recording the comparison (versions_role: reproduced)")
     args = ap.parse_args()
     torch.set_num_threads(max(1, os.cpu_count() // 2))
     (tiny if args.which == "tiny" else two_b)(args)

@@ -12,10 +12,12 @@
 //! versions, and lists exactly the files present, each with a role and a
 //! `published` status. No device is opened.
 //!
-//! `gdn/` keeps its own corpus manifest (`gdn_published_MANIFEST.json`, with
-//! `SHA256SUMS`, checked by `tests/gdn_fixtures.rs`): it records the nanolab
-//! generator's cases, not this format. A new fixture directory written by these
-//! generators belongs in [`DIRS`].
+//! The directories are discovered, not listed: every directory under
+//! `tests/fixtures/` must carry `MANIFEST.json` in this format, or be named in
+//! [`OWN_RECORD`] (a directory whose generator predates this format and writes a
+//! record of its own, which must exist and parse), or in [`EXEMPT`] (not
+//! generator-backed, with the reason). A new directory with none of the three
+//! fails, so a fixture cannot arrive without its provenance.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -26,8 +28,19 @@ mod json;
 
 use json::{Json, Syntax};
 
-/// The generator-backed directories under `tests/fixtures/`.
-const DIRS: [&str; 3] = ["qwen35", "qwen35_train", "qwen35_train_grouped"];
+/// Directories whose generator writes its own record, in its own format. Each file
+/// must exist and parse; moving them onto `MANIFEST.json` is a change to their
+/// generators (`scripts/gen_bert_fixtures.py`, `scripts/gen_embedgemma2_fixtures.py`)
+/// and to the nanolab corpus manifest, not to this test.
+const OWN_RECORD: [(&str, &str); 3] = [
+    ("bert_tiny", "manifest.json"),
+    ("embedgemma2", "provenance.json"),
+    ("gdn", "gdn_published_MANIFEST.json"),
+];
+
+/// Directories with no generator to record. Nothing that has a generator belongs
+/// here; each entry says why it is not generator-backed.
+const EXEMPT: [(&str, &str); 0] = [];
 
 const ROLES: [&str; 4] = ["input", "golden", "model", "config"];
 
@@ -122,16 +135,45 @@ fn files_in(dir: &Path) -> BTreeSet<String> {
 }
 
 #[test]
-fn every_generator_backed_fixture_directory_has_a_manifest_that_lists_every_file() {
+fn every_fixture_directory_has_a_manifest_that_lists_every_file() {
     let repo = Path::new(env!("CARGO_MANIFEST_DIR"));
-    for d in DIRS {
+    let mut dirs: Vec<String> = std::fs::read_dir(fixtures())
+        .expect("tests/fixtures exists")
+        .map(|e| e.expect("readable entry"))
+        .filter(|e| e.path().is_dir())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    dirs.sort();
+    assert!(
+        !dirs.is_empty(),
+        "no fixture directories found; the test would pass vacuously"
+    );
+    for d in &dirs {
         let dir = fixtures().join(d);
-        let path = dir.join("MANIFEST.json");
-        let text = std::fs::read_to_string(&path)
-            .unwrap_or_else(|e| panic!("tests/fixtures/{d} has no readable MANIFEST.json: {e}"));
-        if let Err(e) = check_manifest(&text, &files_in(&dir), repo) {
-            panic!("tests/fixtures/{d}/MANIFEST.json: {e}");
+        let manifest = dir.join("MANIFEST.json");
+        if manifest.is_file() {
+            let text =
+                std::fs::read_to_string(&manifest).unwrap_or_else(|e| panic!("tests/fixtures/{d}/MANIFEST.json: {e}"));
+            if let Err(e) = check_manifest(&text, &files_in(&dir), repo) {
+                panic!("tests/fixtures/{d}/MANIFEST.json: {e}");
+            }
+        } else if let Some((_, record)) = OWN_RECORD.iter().find(|(n, _)| n == d) {
+            let text = std::fs::read_to_string(dir.join(record))
+                .unwrap_or_else(|e| panic!("tests/fixtures/{d} names {record} as its record: {e}"));
+            parse(&text).unwrap_or_else(|e| panic!("tests/fixtures/{d}/{record} does not parse: {e}"));
+        } else if !EXEMPT.iter().any(|(n, _)| n == d) {
+            panic!(
+                "tests/fixtures/{d} has no MANIFEST.json and is in neither OWN_RECORD nor EXEMPT; \
+                 write one with tools/qwen35_ref/fixture_manifest.py"
+            );
         }
+    }
+    // A stale table entry would hide a removed or renamed directory.
+    for (n, _) in OWN_RECORD.iter().chain(EXEMPT.iter()) {
+        assert!(
+            dirs.iter().any(|d| d == n),
+            "the table names tests/fixtures/{n}, which does not exist"
+        );
     }
 }
 

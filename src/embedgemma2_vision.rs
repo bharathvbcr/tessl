@@ -81,9 +81,13 @@
 //!
 //! # Waiting
 //!
-//! Every forward of an [`EmbedGemma2VisionModel::encode_images`] call queues
-//! behind one `synchronize`. (`GpuRuntime::async_scope` is not on this base;
-//! when it lands, that call is where it belongs.)
+//! Every forward of an [`EmbedGemma2VisionModel::encode_images`] call is queued
+//! under a [`GpuRuntime::async_scope`] (on a runtime whatever its
+//! `set_async_encode` flag says) behind one `synchronize`.
+//! [`EmbedGemma2VisionModel::queue_images`] is that call up to the wait: it
+//! returns a [`PendingImages`] so a caller can queue more work (the audio
+//! tower, the text encoder) behind the same wait, then
+//! [`PendingImages::collect`] the soft tokens.
 
 use std::sync::Arc;
 
@@ -785,6 +789,99 @@ struct RawTrace {
     pooled: Vec<f32>,
 }
 
+/// What a queued [`EmbedGemma2VisionModel::queue_images`] call keeps alive:
+/// the activations, each forward's host-written inputs and device-written
+/// output, and what the host needs to split that output per image.
+struct PendingState {
+    _acts: Acts,
+    pending: Vec<(Vec<usize>, ForwardIo)>,
+    raw: Vec<Option<RawTrace>>,
+    prepared: Vec<Prepared>,
+    valid: Vec<usize>,
+    trace: bool,
+}
+
+/// An [`EmbedGemma2VisionModel::queue_images`] call whose forwards are queued
+/// and not yet waited for. [`Self::collect`] waits for them (if the caller has
+/// not) and reads the soft tokens; dropping it without collecting waits for the
+/// queued work and discards the result, since Metal 4 command buffers do not
+/// retain the buffers they bind.
+pub struct PendingImages {
+    rt: Arc<GpuRuntime>,
+    hidden: usize,
+    n_layers: usize,
+    text_hidden: usize,
+    state: Option<PendingState>,
+}
+
+impl PendingImages {
+    /// How many forwards were queued.
+    pub fn forwards(&self) -> u32 {
+        self.state.as_ref().map_or(0, |s| s.pending.len() as u32)
+    }
+
+    /// The call's [`VisionOutput`]. Waits for the queued forwards first if
+    /// nothing has (the wait is a no-op when the caller already waited).
+    pub fn collect(mut self) -> Result<VisionOutput, String> {
+        let state = self.state.take().expect("collect consumes the pending call");
+        let PendingState {
+            _acts,
+            pending,
+            raw,
+            prepared,
+            valid,
+            trace,
+        } = state;
+        // The buffers in `pending` must outlive the queued work, so a failed
+        // wait still holds them until the end of this function.
+        self.rt.synchronize()?;
+        let (text_h, h) = (self.text_hidden, self.hidden);
+        let n_images = valid.len();
+        let n_layers = self.n_layers;
+        let mut soft = vec![Vec::new(); n_images];
+        let mut out_trace = VisionTrace {
+            patch_embed: vec![Vec::new(); if trace { n_images } else { 0 }],
+            layers: vec![vec![Vec::new(); if trace { n_images } else { 0 }]; if trace { n_layers } else { 0 }],
+            pooled: vec![Vec::new(); if trace { n_images } else { 0 }],
+        };
+        for (c, (chunk, io)) in pending.iter().enumerate() {
+            let seq = valid[chunk[0]];
+            let all_soft = io.soft.buffer.try_contents_f32()?;
+            let mut out_row = 0usize;
+            for (b, &i) in chunk.iter().enumerate() {
+                let s = prepared[i].rows_out();
+                soft[i] = all_soft[out_row * text_h..(out_row + s) * text_h].to_vec();
+                if let Some(t) = raw[c].as_ref() {
+                    let n = prepared[i].n;
+                    out_trace.patch_embed[i] = t.embed[b * seq * h..(b * seq + n) * h].to_vec();
+                    for (l, layer) in t.layers.iter().enumerate() {
+                        out_trace.layers[l][i] = layer[b * seq * h..(b * seq + n) * h].to_vec();
+                    }
+                    out_trace.pooled[i] = t.pooled[out_row * h..(out_row + s) * h].to_vec();
+                }
+                out_row += s;
+            }
+        }
+        Ok(VisionOutput {
+            tokens: prepared.iter().map(Prepared::rows_out).collect(),
+            patches: valid,
+            soft,
+            trace: out_trace,
+            forwards: pending.len() as u32,
+        })
+    }
+}
+
+impl Drop for PendingImages {
+    fn drop(&mut self) {
+        if self.state.is_some() {
+            // The result cannot be returned; the wait is for the buffers. A
+            // failure leaves the runtime poisoned, which its own checks report.
+            let _ = self.rt.synchronize();
+        }
+    }
+}
+
 /// A `[rows, cols]` view over the front of `t`'s buffer.
 fn view(t: &Tensor, rows: u32, cols: u32) -> Result<Tensor, String> {
     t.try_view(&[rows as usize, cols as usize], 0)
@@ -866,6 +963,11 @@ impl EmbedGemma2VisionModel {
         &self.cfg
     }
 
+    /// The runtime this model was loaded on.
+    pub(crate) fn runtime(&self) -> &Arc<GpuRuntime> {
+        &self.rt
+    }
+
     /// Check one image and reduce it to its real patches and pooling plan.
     fn prepare(&self, i: usize, img: &ImageInput<'_>) -> Result<Prepared, String> {
         let what = format!("EmbedGemma2VisionModel::encode_images: image {i}");
@@ -921,6 +1023,36 @@ impl EmbedGemma2VisionModel {
         Ok(Prepared { n: valid, plan })
     }
 
+    /// Everything [`Self::encode_images`] checks before it touches the device,
+    /// without doing any GPU work, no allocation and no wait: the batch is
+    /// non-empty and within [`MAX_IMAGES`], the runtime's f32 GEMMs are exact,
+    /// and each image is well formed ([`ImageInput`]). Returns the number of soft
+    /// tokens each image will produce, which is what a caller needs to lay out
+    /// the placeholders of its text sequence before the towers have run.
+    pub fn check_images(&self, images: &[ImageInput<'_>]) -> Result<Vec<usize>, String> {
+        let prepared = self.check_call("EmbedGemma2VisionModel::check_images", images)?;
+        Ok(prepared.iter().map(Prepared::rows_out).collect())
+    }
+
+    /// [`Self::check_images`]'s checks, keeping what they computed.
+    fn check_call(&self, what: &str, images: &[ImageInput<'_>]) -> Result<Vec<Prepared>, String> {
+        if images.is_empty() {
+            return Err(format!("{what}: empty batch"));
+        }
+        if images.len() > MAX_IMAGES {
+            return Err(format!(
+                "{what}: {} images exceeds the batch limit {MAX_IMAGES}",
+                images.len()
+            ));
+        }
+        if self.rt.f32_gemm_runs_relaxed() {
+            return Err(format!(
+                "{what}: the forward needs exact-f32 GEMMs; switch the runtime's relaxed precision off"
+            ));
+        }
+        images.iter().enumerate().map(|(i, img)| self.prepare(i, img)).collect()
+    }
+
     /// Encode a batch of images to soft tokens. Each [`ImageInput`] is one
     /// image's processor tensors; the result's `soft[i]` is its `[S_i,
     /// text_hidden]` soft tokens in placeholder order. An image's tokens do
@@ -929,29 +1061,31 @@ impl EmbedGemma2VisionModel {
     ///
     /// The call runs as one or more forwards (images sorted longest first, cut
     /// into runs of at most [`MAX_BATCH_PATCHES`] padded patches) queued
-    /// behind one wait. `trace` also returns the patch embedder's output, the
-    /// residual stream after each layer and the pooled output.
+    /// behind one wait, on a runtime whatever its
+    /// [`GpuRuntime::set_async_encode`] flag says (the forwards are queued
+    /// under a [`GpuRuntime::async_scope`]). `trace` also returns the patch
+    /// embedder's output, the residual stream after each layer and the pooled
+    /// output. This is [`Self::queue_images`], the wait, and
+    /// [`PendingImages::collect`].
     pub fn encode_images(&self, images: &[ImageInput<'_>], trace: bool) -> Result<VisionOutput, String> {
-        const WHAT: &str = "EmbedGemma2VisionModel::encode_images";
-        if images.is_empty() {
-            return Err(format!("{WHAT}: empty batch"));
-        }
-        if images.len() > MAX_IMAGES {
-            return Err(format!(
-                "{WHAT}: {} images exceeds the batch limit {MAX_IMAGES}",
-                images.len()
-            ));
-        }
-        if self.rt.f32_gemm_runs_relaxed() {
-            return Err(format!(
-                "{WHAT}: the forward needs exact-f32 GEMMs; switch the runtime's relaxed precision off"
-            ));
-        }
-        let prepared: Vec<Prepared> = images
-            .iter()
-            .enumerate()
-            .map(|(i, img)| self.prepare(i, img))
-            .collect::<Result<_, _>>()?;
+        let pending = self.queue_impl("EmbedGemma2VisionModel::encode_images", images, trace)?;
+        self.rt.synchronize()?;
+        pending.collect()
+    }
+
+    /// [`Self::encode_images`] up to the wait: the call is checked, its forwards
+    /// are queued, and the host does not wait for them. The returned
+    /// [`PendingImages`] holds every buffer the queued work binds; a caller that
+    /// has other work to queue behind it (the text encoder, another tower) does
+    /// so, waits once, and then [`PendingImages::collect`]s. Nothing is queued
+    /// when the call is refused, and a call that fails while queuing waits for
+    /// what it queued before it returns the error.
+    pub fn queue_images(&self, images: &[ImageInput<'_>], trace: bool) -> Result<PendingImages, String> {
+        self.queue_impl("EmbedGemma2VisionModel::queue_images", images, trace)
+    }
+
+    fn queue_impl(&self, what: &str, images: &[ImageInput<'_>], trace: bool) -> Result<PendingImages, String> {
+        let prepared = self.check_call(what, images)?;
         let valid: Vec<usize> = prepared.iter().map(|p| p.n).collect();
         let chunks = pack_images(&valid);
         let dims = |c: &[usize]| (c.len(), valid[c[0]]);
@@ -965,9 +1099,11 @@ impl EmbedGemma2VisionModel {
         let acts = self.acts(nb, rows, pooled_rows)?;
 
         // The forwards are queued back to back and the host waits once, after
-        // the last. Each keeps its own host-written inputs and host-read
-        // output, held in `pending` until then (Metal 4 command buffers do not
-        // retain what they bind), including a forward that fails midway.
+        // the last (the caller's wait, or `encode_images`'). Each keeps its own
+        // host-written inputs and host-read output, held in `pending` until
+        // then (Metal 4 command buffers do not retain what they bind),
+        // including a forward that fails midway.
+        let scope = self.rt.async_scope();
         let mut pending: Vec<(Vec<usize>, ForwardIo)> = Vec::with_capacity(chunks.len());
         let mut raw: Vec<Option<RawTrace>> = Vec::with_capacity(chunks.len());
         let mut queued: Result<(), String> = Ok(());
@@ -990,46 +1126,26 @@ impl EmbedGemma2VisionModel {
                 }
             }
         }
-        // Wait even when queuing failed: `pending` and `acts` must outlive
-        // every command already queued on them.
-        let waited = self.rt.synchronize();
-        queued?;
-        waited?;
-
-        let text_h = self.cfg.text_hidden as usize;
-        let h = self.cfg.hidden as usize;
-        let n_images = images.len();
-        let mut soft = vec![Vec::new(); n_images];
-        let mut out_trace = VisionTrace {
-            patch_embed: vec![Vec::new(); if trace { n_images } else { 0 }],
-            layers: vec![vec![Vec::new(); if trace { n_images } else { 0 }]; if trace { self.layers.len() } else { 0 }],
-            pooled: vec![Vec::new(); if trace { n_images } else { 0 }],
+        let state = PendingState {
+            _acts: acts,
+            pending,
+            raw,
+            prepared,
+            valid,
+            trace,
         };
-        for (c, (chunk, io)) in pending.iter().enumerate() {
-            let seq = valid[chunk[0]];
-            let all_soft = io.soft.buffer.try_contents_f32()?;
-            let mut out_row = 0usize;
-            for (b, &i) in chunk.iter().enumerate() {
-                let s = prepared[i].rows_out();
-                soft[i] = all_soft[out_row * text_h..(out_row + s) * text_h].to_vec();
-                if let Some(t) = raw[c].as_ref() {
-                    let n = prepared[i].n;
-                    out_trace.patch_embed[i] = t.embed[b * seq * h..(b * seq + n) * h].to_vec();
-                    for (l, layer) in t.layers.iter().enumerate() {
-                        out_trace.layers[l][i] = layer[b * seq * h..(b * seq + n) * h].to_vec();
-                    }
-                    out_trace.pooled[i] = t.pooled[out_row * h..(out_row + s) * h].to_vec();
-                }
-                out_row += s;
-            }
-        }
-        Ok(VisionOutput {
-            tokens: prepared.iter().map(Prepared::rows_out).collect(),
-            patches: valid,
-            soft,
-            trace: out_trace,
-            forwards: pending.len() as u32,
-        })
+        let out = PendingImages {
+            rt: Arc::clone(&self.rt),
+            hidden: self.cfg.hidden as usize,
+            n_layers: self.layers.len(),
+            text_hidden: self.cfg.text_hidden as usize,
+            state: Some(state),
+        };
+        drop(scope);
+        // On an error `out` is dropped, which waits for what was queued (see
+        // its `Drop`).
+        queued?;
+        Ok(out)
     }
 
     /// This forward's own host-written inputs and host-read output for the

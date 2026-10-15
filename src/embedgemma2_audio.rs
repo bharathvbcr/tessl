@@ -77,6 +77,7 @@
 //! are not fused into them. The sinusoidal table, `relative_k_proj` of it and
 //! the query scale are computed once per layer at load.
 
+use std::borrow::Borrow;
 use std::sync::Arc;
 
 use objc2_metal::MTLComputePipelineState;
@@ -1212,6 +1213,117 @@ struct ForwardIo {
     trace: Vec<Tensor>,
 }
 
+/// A batch of clips, owned or borrowed, as references.
+fn refs<C: Borrow<AudioInput>>(clips: &[C]) -> Vec<&AudioInput> {
+    clips.iter().map(Borrow::borrow).collect()
+}
+
+/// What a queued [`EmbedGemma2Audio::queue_audio`] call keeps alive: the
+/// activations, each forward's host-written inputs and device-written
+/// outputs, and the clips' frame masks the host splits the output by.
+struct AudioPendingState {
+    _acts: Acts,
+    pending: Vec<(Vec<usize>, ForwardIo)>,
+    /// Each clip's `[frames]` mask.
+    masks: Vec<Vec<bool>>,
+    trace: bool,
+}
+
+/// An [`EmbedGemma2Audio::queue_audio`] call whose forwards are queued and not
+/// yet waited for. [`Self::collect`] waits for them (if the caller has not) and
+/// reads the soft tokens; dropping it without collecting waits for the queued
+/// work and discards the result, since Metal 4 command buffers do not retain
+/// the buffers they bind.
+pub struct PendingAudio {
+    rt: Arc<GpuRuntime>,
+    hidden: usize,
+    layers: usize,
+    out_dims: usize,
+    embed: usize,
+    state: Option<AudioPendingState>,
+}
+
+impl PendingAudio {
+    /// How many forwards were queued.
+    pub fn forwards(&self) -> u32 {
+        self.state.as_ref().map_or(0, |s| s.pending.len() as u32)
+    }
+
+    /// The call's [`AudioOutput`]. Waits for the queued forwards first if
+    /// nothing has (the wait is a no-op when the caller already waited).
+    pub fn collect(mut self) -> Result<AudioOutput, String> {
+        let state = self.state.take().expect("collect consumes the pending call");
+        let AudioPendingState {
+            _acts,
+            pending,
+            masks,
+            trace,
+        } = state;
+        // The buffers in `pending` must outlive the queued work, so a failed
+        // wait still holds them until the end of this function.
+        self.rt.synchronize()?;
+        let n_clips = masks.len();
+        let (embed, layers) = (self.embed, self.layers);
+        let mut out = AudioOutput {
+            soft_tokens: vec![Vec::new(); n_clips],
+            out_masks: vec![Vec::new(); n_clips],
+            trace: if trace {
+                vec![
+                    AudioClipTrace {
+                        subsample: Vec::new(),
+                        layers: Vec::new(),
+                        tower_out: Vec::new(),
+                    };
+                    n_clips
+                ]
+            } else {
+                Vec::new()
+            },
+            forwards: pending.len() as u32,
+        };
+        for (g, io) in &pending {
+            // One host mapping at a time (the runtime's access is exclusive).
+            let read =
+                |t: &Tensor| -> Result<Vec<f32>, String> { Ok(t.buffer.try_contents_f32()?[..t.numel()].to_vec()) };
+            let soft = read(&io.soft)?;
+            let traced: Vec<Vec<f32>> = io.trace.iter().map(read).collect::<Result<_, _>>()?;
+            for (&i, cr) in g.iter().zip(&io.clips.clips) {
+                let omask = out_mask(&masks[i]);
+                debug_assert_eq!(omask.len(), cr.rows);
+                let mut tokens = Vec::new();
+                for (t, &keep) in omask.iter().enumerate() {
+                    if keep {
+                        let r = cr.row0 + t;
+                        tokens.extend_from_slice(&soft[r * embed..(r + 1) * embed]);
+                    }
+                }
+                out.soft_tokens[i] = tokens;
+                out.out_masks[i] = omask;
+                if trace {
+                    let h = self.hidden;
+                    let rows = |m: &[f32], w: usize| m[cr.row0 * w..(cr.row0 + cr.rows) * w].to_vec();
+                    out.trace[i] = AudioClipTrace {
+                        subsample: rows(&traced[0], h),
+                        layers: (0..layers).map(|l| rows(&traced[1 + l], h)).collect(),
+                        tower_out: rows(&traced[1 + layers], self.out_dims),
+                    };
+                }
+            }
+        }
+        Ok(out)
+    }
+}
+
+impl Drop for PendingAudio {
+    fn drop(&mut self) {
+        if self.state.is_some() {
+            // The result cannot be returned; the wait is for the buffers. A
+            // failure leaves the runtime poisoned, which its own checks report.
+            let _ = self.rt.synchronize();
+        }
+    }
+}
+
 impl EmbedGemma2Audio {
     /// Load the tower from `st`, whose tensors are named
     /// `{prefix}audio_tower.*` and `{prefix}embed_audio.*`. Every tensor's
@@ -1340,59 +1452,101 @@ impl EmbedGemma2Audio {
         &self.cfg
     }
 
-    /// Embed a batch of clips into soft tokens. Each clip's output is its own
-    /// tower rows through the embedder, kept where the tower's mask is true;
-    /// it does not depend on what else is in the batch beyond GEMM tiling.
-    ///
-    /// The batch runs as one or more forwards (clips in order, cut at
-    /// [`MAX_FRAMES_PER_FORWARD`] frames), all queued before the host waits
-    /// once. `trace` also returns each clip's subsample output, per-layer
-    /// residuals and tower output. On a runtime without `async_scope`, as
-    /// this one, the wait is one `synchronize()` after the last forward; the
-    /// runtime's `async_encode` setting decides whether the forwards overlap
-    /// the host encoding the next.
-    pub fn encode_audio(&self, clips: &[AudioInput], trace: bool) -> Result<AudioOutput, String> {
-        const E: &str = "EmbedGemma2Audio::encode_audio";
+    /// The runtime this model was loaded on.
+    pub(crate) fn runtime(&self) -> &Arc<GpuRuntime> {
+        &self.rt
+    }
+
+    /// Everything [`Self::encode_audio`] checks before it touches the device,
+    /// with no allocation and no wait: the batch is non-empty and within
+    /// [`MAX_CLIPS`], the runtime's f32 GEMMs are exact, and each clip has
+    /// frames (at most [`MAX_FRAMES_PER_FORWARD`]), `frames * mel_bins` finite
+    /// features. Returns the number of soft tokens each clip will produce (the
+    /// true entries of its tower mask), which is what a caller needs to lay out
+    /// the placeholders of its text sequence before the tower has run.
+    pub fn check_clips<C: Borrow<AudioInput>>(&self, clips: &[C]) -> Result<Vec<usize>, String> {
+        let clips = refs(clips);
+        self.check_call("EmbedGemma2Audio::check_clips", &clips)?;
+        Ok(clips
+            .iter()
+            .map(|c| out_mask(&c.mask).into_iter().filter(|&k| k).count())
+            .collect())
+    }
+
+    /// [`Self::check_clips`]'s checks.
+    fn check_call(&self, what: &str, clips: &[&AudioInput]) -> Result<(), String> {
         let cfg = &self.cfg;
         if clips.is_empty() {
-            return Err(format!("{E}: empty batch"));
+            return Err(format!("{what}: empty batch"));
         }
         if clips.len() > MAX_CLIPS {
             return Err(format!(
-                "{E}: {} clips exceeds the batch limit {MAX_CLIPS}",
+                "{what}: {} clips exceeds the batch limit {MAX_CLIPS}",
                 clips.len()
             ));
         }
         if self.rt.f32_gemm_runs_relaxed() {
             return Err(format!(
-                "{E}: the forward needs exact-f32 GEMMs; switch the runtime's relaxed precision off"
+                "{what}: the forward needs exact-f32 GEMMs; switch the runtime's relaxed precision off"
             ));
         }
         let mels = cfg.mel_bins() as usize;
         for (i, c) in clips.iter().enumerate() {
             let frames = c.mask.len();
             if frames == 0 {
-                return Err(format!("{E}: clip {i} has no frames"));
+                return Err(format!("{what}: clip {i} has no frames"));
             }
             if frames > MAX_FRAMES_PER_FORWARD {
                 return Err(format!(
-                    "{E}: clip {i} has {frames} frames; the limit is {MAX_FRAMES_PER_FORWARD} (split it)"
+                    "{what}: clip {i} has {frames} frames; the limit is {MAX_FRAMES_PER_FORWARD} (split it)"
                 ));
             }
             if c.input_features.len() != frames * mels {
                 return Err(format!(
-                    "{E}: clip {i} has {} feature values for {frames} frames of {mels} mel bins ({} expected)",
+                    "{what}: clip {i} has {} feature values for {frames} frames of {mels} mel bins ({} expected)",
                     c.input_features.len(),
                     frames * mels
                 ));
             }
             if let Some(at) = c.input_features.iter().position(|v| !v.is_finite()) {
                 return Err(format!(
-                    "{E}: clip {i}: input_features[{at}] = {} is not finite",
+                    "{what}: clip {i}: input_features[{at}] = {} is not finite",
                     c.input_features[at]
                 ));
             }
         }
+        Ok(())
+    }
+
+    /// Embed a batch of clips into soft tokens. Each clip's output is its own
+    /// tower rows through the embedder, kept where the tower's mask is true;
+    /// it does not depend on what else is in the batch beyond GEMM tiling.
+    ///
+    /// The batch runs as one or more forwards (clips in order, cut at
+    /// [`MAX_FRAMES_PER_FORWARD`] frames), all queued under a
+    /// [`GpuRuntime::async_scope`] (whatever the runtime's `async_encode`
+    /// setting) before the host waits once. `trace` also returns each clip's
+    /// subsample output, per-layer residuals and tower output. This is
+    /// [`Self::queue_audio`], the wait, and [`PendingAudio::collect`].
+    pub fn encode_audio(&self, clips: &[AudioInput], trace: bool) -> Result<AudioOutput, String> {
+        let pending = self.queue_impl("EmbedGemma2Audio::encode_audio", &refs(clips), trace)?;
+        self.rt.synchronize()?;
+        pending.collect()
+    }
+
+    /// [`Self::encode_audio`] up to the wait: the call is checked and its
+    /// forwards are queued, and the host does not wait for them. The returned
+    /// [`PendingAudio`] holds every buffer the queued work binds; a caller with
+    /// other work to queue behind it (the vision tower, the text encoder) does
+    /// so, waits once, and then [`PendingAudio::collect`]s. Nothing is queued
+    /// when the call is refused, and a call that fails while queuing waits for
+    /// what it queued before it returns the error.
+    pub fn queue_audio<C: Borrow<AudioInput>>(&self, clips: &[C], trace: bool) -> Result<PendingAudio, String> {
+        self.queue_impl("EmbedGemma2Audio::queue_audio", &refs(clips), trace)
+    }
+
+    fn queue_impl(&self, what: &str, clips: &[&AudioInput], trace: bool) -> Result<PendingAudio, String> {
+        self.check_call(what, clips)?;
 
         // Clips in order, cut where a forward would pass the frame budget.
         let mut plan: Vec<Vec<usize>> = Vec::new();
@@ -1422,6 +1576,10 @@ impl EmbedGemma2Audio {
         });
         let acts = self.acts(max_m, max_r)?;
 
+        // Held by the returned `PendingAudio` until the work is waited for
+        // (Metal 4 command buffers do not retain what they bind), including
+        // the buffers of a forward that fails midway.
+        let scope = self.rt.async_scope();
         let mut pending: Vec<(Vec<usize>, ForwardIo)> = Vec::with_capacity(plan.len());
         let queued: Result<(), String> = (|| {
             for g in &plan {
@@ -1432,61 +1590,23 @@ impl EmbedGemma2Audio {
             }
             Ok(())
         })();
-        // Wait even when queuing failed: the buffers in `pending` and `acts`
-        // must outlive every command already queued on them (Metal 4 command
-        // buffers do not retain what they bind).
-        let waited = self.rt.synchronize();
-        queued?;
-        waited?;
-
-        let embed = cfg.embed_dim as usize;
-        let mut out = AudioOutput {
-            soft_tokens: vec![Vec::new(); clips.len()],
-            out_masks: vec![Vec::new(); clips.len()],
-            trace: if trace {
-                vec![
-                    AudioClipTrace {
-                        subsample: Vec::new(),
-                        layers: Vec::new(),
-                        tower_out: Vec::new(),
-                    };
-                    clips.len()
-                ]
-            } else {
-                Vec::new()
-            },
-            forwards: pending.len() as u32,
+        let out = PendingAudio {
+            rt: Arc::clone(&self.rt),
+            hidden: self.cfg.hidden as usize,
+            layers: self.cfg.layers as usize,
+            out_dims: self.cfg.out_dims as usize,
+            embed: self.cfg.embed_dim as usize,
+            state: Some(AudioPendingState {
+                _acts: acts,
+                pending,
+                masks: clips.iter().map(|c| c.mask.clone()).collect(),
+                trace,
+            }),
         };
-        for (g, io) in &pending {
-            // One host mapping at a time (the runtime's access is exclusive).
-            let read =
-                |t: &Tensor| -> Result<Vec<f32>, String> { Ok(t.buffer.try_contents_f32()?[..t.numel()].to_vec()) };
-            let soft = read(&io.soft)?;
-            let traced: Vec<Vec<f32>> = io.trace.iter().map(read).collect::<Result<_, _>>()?;
-            for (&i, cr) in g.iter().zip(&io.clips.clips) {
-                let omask = out_mask(&clips[i].mask);
-                debug_assert_eq!(omask.len(), cr.rows);
-                let mut tokens = Vec::new();
-                for (t, &keep) in omask.iter().enumerate() {
-                    if keep {
-                        let r = cr.row0 + t;
-                        tokens.extend_from_slice(&soft[r * embed..(r + 1) * embed]);
-                    }
-                }
-                out.soft_tokens[i] = tokens;
-                out.out_masks[i] = omask;
-                if trace {
-                    let h = cfg.hidden as usize;
-                    let rows = |m: &[f32], w: usize| m[cr.row0 * w..(cr.row0 + cr.rows) * w].to_vec();
-                    let layers = cfg.layers as usize;
-                    out.trace[i] = AudioClipTrace {
-                        subsample: rows(&traced[0], h),
-                        layers: (0..layers).map(|l| rows(&traced[1 + l], h)).collect(),
-                        tower_out: rows(&traced[1 + layers], cfg.out_dims as usize),
-                    };
-                }
-            }
-        }
+        drop(scope);
+        // On an error `out` is dropped, which waits for what was queued (see
+        // its `Drop`).
+        queued?;
         Ok(out)
     }
 
@@ -1526,7 +1646,7 @@ impl EmbedGemma2Audio {
 
     /// This forward's own host-written inputs and host-read outputs for the
     /// clips `g`, written without waiting for the GPU.
-    fn forward_io(&self, clips: &[AudioInput], g: &[usize], trace: bool) -> Result<ForwardIo, String> {
+    fn forward_io(&self, clips: &[&AudioInput], g: &[usize], trace: bool) -> Result<ForwardIo, String> {
         let cfg = &self.cfg;
         let rt = &self.rt;
         let frames: Vec<usize> = g.iter().map(|&i| clips[i].mask.len()).collect();

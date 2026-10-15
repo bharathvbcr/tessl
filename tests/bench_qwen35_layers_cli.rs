@@ -62,6 +62,9 @@ fn bad_flags_are_refused_before_any_gpu_work() {
     assert_refused_before_gpu(&["--iters=0", "16"], "--iters");
     assert_refused_before_gpu(&["--bogus"], "expected a token count");
     assert_refused_before_gpu(&["0"], "T must be positive");
+    assert_refused_before_gpu(&["--attn-tiles", "--check-only"], "--attn-tiles takes token counts only");
+    assert_refused_before_gpu(&["--attn-tiles", "--paired-attn"], "--attn-tiles takes token counts only");
+    assert_refused_before_gpu(&["--attn-tiles", "--weights=/tmp"], "--weights");
 }
 
 /// GPU: the per-layer table's header reports the sample count that ran.

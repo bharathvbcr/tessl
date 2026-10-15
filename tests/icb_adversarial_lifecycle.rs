@@ -85,7 +85,10 @@ fn nop_scope_mutates_nothing_and_reports_poison() {
     assert_eq!(dec.execute_count(), count);
     assert_eq!(dec.status_line(), status);
     assert!(!rt.is_poisoned());
-    assert!(rt.with_binder(|_| Ok(())).is_ok(), "runtime still usable after nop scope");
+    assert!(
+        rt.with_binder(|_| Ok(())).is_ok(),
+        "runtime still usable after nop scope"
+    );
     assert!(rt.with_binder(|_| Err("x".into())).is_err());
     let _nop = BinderEncodeNopGuard::enter();
     assert!(rt.with_binder(|_| Ok(())).is_err(), "with_binder under nop on poison");

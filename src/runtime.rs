@@ -2072,7 +2072,10 @@ impl GpuRuntime {
                 );
                 batch.encoder = Some(e);
             }
-            let pending_edge = std::mem::take(&mut batch.hazard_pending);
+            // A capture also carries the state across a command-buffer boundary
+            // (sync encode, mid-commit), which the batch does not.
+            let pending_edge =
+                std::mem::take(&mut batch.hazard_pending) | crate::decode_icb::capture_take_carried_hazard();
             let enc = batch
                 .encoder
                 .as_ref()
@@ -2113,7 +2116,9 @@ impl GpuRuntime {
                     std::panic::resume_unwind(panic);
                 }
             }
-            binder.hazard_pending()
+            let pending = binder.hazard_pending();
+            crate::decode_icb::capture_carry_hazard(pending);
+            pending
         };
         let hit_mid = {
             let mut guard = self.active_m4.lock().map_err(|e| e.to_string())?;

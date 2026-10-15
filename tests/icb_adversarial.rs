@@ -118,7 +118,12 @@ fn replay_matches(freeze_range: bool, hazard: bool, async_encode: bool) {
         rt.synchronize().unwrap();
         icb.execute(&rt).expect("execute");
         rt.synchronize().unwrap();
-        if logits.read_f32().iter().zip(&live).any(|(a, b)| a.to_bits() != b.to_bits()) {
+        if logits
+            .read_f32()
+            .iter()
+            .zip(&live)
+            .any(|(a, b)| a.to_bits() != b.to_bits())
+        {
             bad += 1;
             eprintln!("replay {r} differs from the live result");
         }
@@ -169,7 +174,12 @@ fn an_unmarked_raw_chain_is_the_captures_responsibility() {
         rt.synchronize().unwrap();
         icb.execute(&rt).expect("execute");
         rt.synchronize().unwrap();
-        if logits.read_f32().iter().zip(&live).any(|(a, b)| a.to_bits() != b.to_bits()) {
+        if logits
+            .read_f32()
+            .iter()
+            .zip(&live)
+            .any(|(a, b)| a.to_bits() != b.to_bits())
+        {
             bad += 1;
         }
     }
@@ -246,6 +256,9 @@ fn a_sync_hazard_capture_of_a_raw_chain_replays_with_its_barriers() {
             marks[..CHAIN - 1].iter().all(|&m| m),
             "hazard={hazard} async={async_encode}: capture dropped a RAW edge: {marks:?}"
         );
-        assert_eq!(bad, 0, "hazard={hazard} async={async_encode}: replay diverged from live");
+        assert_eq!(
+            bad, 0,
+            "hazard={hazard} async={async_encode}: replay diverged from live"
+        );
     }
 }

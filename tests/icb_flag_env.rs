@@ -66,16 +66,35 @@ fn run_child(env: &[(&str, &str)]) -> Vec<bool> {
     let mut cmd = Command::new(std::env::current_exe().unwrap());
     cmd.args(["--exact", "child_report", "--nocapture", "--test-threads=1"]);
     for var in [
-        "TESSL_DECODE_ICB", "METAL_RUNTIME_DECODE_ICB", "GEMMA_METAL_DECODE_ICB",
-        "TESSL_ICB_FREEZE_BINDS", "METAL_RUNTIME_ICB_FREEZE_BINDS", "GEMMA_METAL_ICB_FREEZE_BINDS",
-        "TESSL_ICB_RANGE_BATCH", "METAL_RUNTIME_ICB_RANGE_BATCH", "GEMMA_METAL_ICB_RANGE_BATCH",
-        "TESSL_ICB_COARSE_RANGES", "METAL_RUNTIME_ICB_COARSE_RANGES", "GEMMA_METAL_ICB_COARSE_RANGES",
-        "TESSL_ICB_EXECUTE", "METAL_RUNTIME_ICB_EXECUTE", "GEMMA_METAL_ICB_EXECUTE",
-        "TESSL_ICB_TRIAGE", "GEMMA_METAL_ICB_TRIAGE",
-        "TESSL_ICB_PIPELINES", "METAL_RUNTIME_ICB_PIPELINES", "GEMMA_METAL_ICB_PIPELINES",
-        "TESSL_ICB_SMOKE", "METAL_RUNTIME_ICB_SMOKE", "GEMMA_METAL_ICB_SMOKE",
-        "TESSL_HAZARD_BARRIERS", "METAL_RUNTIME_HAZARD_BARRIERS", "METAL_NATIVE_HAZARD_BARRIERS",
-        "TESSL_COARSE_BARRIERS", "GEMMA_METAL_COARSE_BARRIERS", "METAL_RUNTIME_COARSE_BARRIERS",
+        "TESSL_DECODE_ICB",
+        "METAL_RUNTIME_DECODE_ICB",
+        "GEMMA_METAL_DECODE_ICB",
+        "TESSL_ICB_FREEZE_BINDS",
+        "METAL_RUNTIME_ICB_FREEZE_BINDS",
+        "GEMMA_METAL_ICB_FREEZE_BINDS",
+        "TESSL_ICB_RANGE_BATCH",
+        "METAL_RUNTIME_ICB_RANGE_BATCH",
+        "GEMMA_METAL_ICB_RANGE_BATCH",
+        "TESSL_ICB_COARSE_RANGES",
+        "METAL_RUNTIME_ICB_COARSE_RANGES",
+        "GEMMA_METAL_ICB_COARSE_RANGES",
+        "TESSL_ICB_EXECUTE",
+        "METAL_RUNTIME_ICB_EXECUTE",
+        "GEMMA_METAL_ICB_EXECUTE",
+        "TESSL_ICB_TRIAGE",
+        "GEMMA_METAL_ICB_TRIAGE",
+        "TESSL_ICB_PIPELINES",
+        "METAL_RUNTIME_ICB_PIPELINES",
+        "GEMMA_METAL_ICB_PIPELINES",
+        "TESSL_ICB_SMOKE",
+        "METAL_RUNTIME_ICB_SMOKE",
+        "GEMMA_METAL_ICB_SMOKE",
+        "TESSL_HAZARD_BARRIERS",
+        "METAL_RUNTIME_HAZARD_BARRIERS",
+        "METAL_NATIVE_HAZARD_BARRIERS",
+        "TESSL_COARSE_BARRIERS",
+        "GEMMA_METAL_COARSE_BARRIERS",
+        "METAL_RUNTIME_COARSE_BARRIERS",
     ] {
         cmd.env_remove(var);
     }
@@ -88,7 +107,12 @@ fn run_child(env: &[(&str, &str)]) -> Vec<bool> {
     let line = text
         .lines()
         .find_map(|l| l.split_once("REPORT ").map(|(_, r)| r))
-        .unwrap_or_else(|| panic!("no REPORT in child output: {text}\n{}", String::from_utf8_lossy(&out.stderr)));
+        .unwrap_or_else(|| {
+            panic!(
+                "no REPORT in child output: {text}\n{}",
+                String::from_utf8_lossy(&out.stderr)
+            )
+        });
     line.split(',').map(|s| s == "true").collect()
 }
 
@@ -99,14 +123,55 @@ const VALUES: [&str; 14] = [
 /// (getter index, names in precedence order, default).
 fn table() -> Vec<(usize, Vec<&'static str>)> {
     vec![
-        (0, vec!["TESSL_DECODE_ICB", "METAL_RUNTIME_DECODE_ICB", "GEMMA_METAL_DECODE_ICB"]),
-        (1, vec!["TESSL_ICB_FREEZE_BINDS", "METAL_RUNTIME_ICB_FREEZE_BINDS", "GEMMA_METAL_ICB_FREEZE_BINDS"]),
-        (2, vec!["TESSL_ICB_RANGE_BATCH", "METAL_RUNTIME_ICB_RANGE_BATCH", "GEMMA_METAL_ICB_RANGE_BATCH"]),
-        (4, vec!["TESSL_ICB_EXECUTE", "METAL_RUNTIME_ICB_EXECUTE", "GEMMA_METAL_ICB_EXECUTE"]),
+        (
+            0,
+            vec!["TESSL_DECODE_ICB", "METAL_RUNTIME_DECODE_ICB", "GEMMA_METAL_DECODE_ICB"],
+        ),
+        (
+            1,
+            vec![
+                "TESSL_ICB_FREEZE_BINDS",
+                "METAL_RUNTIME_ICB_FREEZE_BINDS",
+                "GEMMA_METAL_ICB_FREEZE_BINDS",
+            ],
+        ),
+        (
+            2,
+            vec![
+                "TESSL_ICB_RANGE_BATCH",
+                "METAL_RUNTIME_ICB_RANGE_BATCH",
+                "GEMMA_METAL_ICB_RANGE_BATCH",
+            ],
+        ),
+        (
+            4,
+            vec![
+                "TESSL_ICB_EXECUTE",
+                "METAL_RUNTIME_ICB_EXECUTE",
+                "GEMMA_METAL_ICB_EXECUTE",
+            ],
+        ),
         (5, vec!["TESSL_ICB_TRIAGE", "GEMMA_METAL_ICB_TRIAGE"]),
-        (6, vec!["TESSL_ICB_PIPELINES", "METAL_RUNTIME_ICB_PIPELINES", "GEMMA_METAL_ICB_PIPELINES"]),
-        (7, vec!["TESSL_ICB_SMOKE", "METAL_RUNTIME_ICB_SMOKE", "GEMMA_METAL_ICB_SMOKE"]),
-        (8, vec!["TESSL_HAZARD_BARRIERS", "METAL_RUNTIME_HAZARD_BARRIERS", "METAL_NATIVE_HAZARD_BARRIERS"]),
+        (
+            6,
+            vec![
+                "TESSL_ICB_PIPELINES",
+                "METAL_RUNTIME_ICB_PIPELINES",
+                "GEMMA_METAL_ICB_PIPELINES",
+            ],
+        ),
+        (
+            7,
+            vec!["TESSL_ICB_SMOKE", "METAL_RUNTIME_ICB_SMOKE", "GEMMA_METAL_ICB_SMOKE"],
+        ),
+        (
+            8,
+            vec![
+                "TESSL_HAZARD_BARRIERS",
+                "METAL_RUNTIME_HAZARD_BARRIERS",
+                "METAL_NATIVE_HAZARD_BARRIERS",
+            ],
+        ),
     ]
 }
 
@@ -132,7 +197,11 @@ fn every_getter_matches_the_old_env_semantics() {
 
 #[test]
 fn coarse_ranges_follows_range_batch_only_when_its_env_does_not_parse() {
-    let coarse = ["TESSL_ICB_COARSE_RANGES", "METAL_RUNTIME_ICB_COARSE_RANGES", "GEMMA_METAL_ICB_COARSE_RANGES"];
+    let coarse = [
+        "TESSL_ICB_COARSE_RANGES",
+        "METAL_RUNTIME_ICB_COARSE_RANGES",
+        "GEMMA_METAL_ICB_COARSE_RANGES",
+    ];
     for cv in VALUES {
         for rv in VALUES {
             for name in coarse {
@@ -149,7 +218,11 @@ fn coarse_ranges_follows_range_batch_only_when_its_env_does_not_parse() {
 
 #[test]
 fn coarse_barriers_inherits_hazard_only_when_its_env_does_not_parse() {
-    let coarse = ["TESSL_COARSE_BARRIERS", "GEMMA_METAL_COARSE_BARRIERS", "METAL_RUNTIME_COARSE_BARRIERS"];
+    let coarse = [
+        "TESSL_COARSE_BARRIERS",
+        "GEMMA_METAL_COARSE_BARRIERS",
+        "METAL_RUNTIME_COARSE_BARRIERS",
+    ];
     for cv in VALUES {
         for hv in VALUES {
             for name in coarse {

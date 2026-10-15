@@ -956,7 +956,14 @@ mod audit_tests {
     /// end, overflowing `start + count`, and an in-range one that must work.
     #[test]
     fn execute_icb_refuses_out_of_range_and_overflowing_ranges() {
-        for (start, count) in [(0u64, 2u64), (1, 1), (2, 1), (u64::MAX, 1), (1, u64::MAX), (u64::MAX, u64::MAX)] {
+        for (start, count) in [
+            (0u64, 2u64),
+            (1, 1),
+            (2, 1),
+            (u64::MAX, 1),
+            (1, u64::MAX),
+            (u64::MAX, u64::MAX),
+        ] {
             let rt = GpuRuntime::new().unwrap();
             let icb = one_command_icb(&rt);
             rt.register_allocation(ProtocolObject::<dyn MTLAllocation>::from_ref(&*icb));

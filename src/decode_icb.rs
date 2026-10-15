@@ -1421,6 +1421,9 @@ pub struct DecodeIcbCapture {
     /// How many times `begin_decode_icb_capture` was called while this capture
     /// was already live. Non-zero means a previous capture was never taken.
     pub nested_begins: usize,
+    /// The last scope ended with an unbarriered dispatch. See
+    /// [`capture_take_carried_hazard`].
+    carried_hazard: bool,
 }
 
 impl DecodeIcbCapture {
@@ -1599,6 +1602,36 @@ pub(crate) fn capture_note_dispatch(threadgroups: MTLSize, threads_per_tg: MTLSi
             cap.note_dispatch(threadgroups, threads_per_tg);
         }
     });
+}
+
+/// While capturing, remember whether a binder scope ended with an unbarriered
+/// dispatch (`pending`), so the next scope can order it even when the runtime
+/// itself dropped that state.
+///
+/// Live execution orders consecutive scopes in one of two ways: the binder's
+/// pending-hazard barrier inside a shared encoder (async encode), or the
+/// command-buffer boundary (sync encode, or a mid-commit), which orders them
+/// for free and so leaves no barrier for capture to see. Replay packs the whole
+/// tape into one encoder, where only a marker orders anything. Carrying the
+/// pending state across scopes while capturing makes every capture record what
+/// the async path would have: the next scope's first dispatch emits the
+/// barrier, and `Binder::barrier` lands it on the previous command.
+pub(crate) fn capture_carry_hazard(pending: bool) {
+    CAPTURE.with(|c| {
+        if let Some(cap) = c.borrow_mut().as_mut() {
+            cap.carried_hazard = pending;
+        }
+    });
+}
+
+/// The state [`capture_carry_hazard`] stored, cleared by the read. `false` when
+/// not capturing.
+pub(crate) fn capture_take_carried_hazard() -> bool {
+    CAPTURE.with(|c| {
+        c.borrow_mut()
+            .as_mut()
+            .is_some_and(|cap| std::mem::take(&mut cap.carried_hazard))
+    })
 }
 
 /// Record that the last captured command needs a Device barrier after it.

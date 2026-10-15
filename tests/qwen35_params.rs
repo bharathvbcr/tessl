@@ -471,3 +471,25 @@ fn per_entry_host_refusals_move_nothing() {
     let mut out = vec![0.0; n];
     packed.read_parameter_host(1, &mut out).unwrap();
 }
+
+// ---- adversarial: per-entry host writes against the GPU path ----
+
+/// A poisoned runtime is an `Err` from every per-entry call, not a panic or a
+/// silent success, and a refused write leaves the parameters unmoved.
+#[test]
+fn per_entry_host_calls_refuse_on_a_poisoned_runtime() {
+    let (rt, model, _st) = load(Precision::F32);
+    let table = model.parameter_table().unwrap();
+    let ids = ids();
+    let step = model.train_step(&ids, GemmOperands::ExactF32).unwrap();
+    let n = numel(&table[1]);
+    rt.poison_as_shared_event_timeout_for_test();
+    let mut buf = vec![0.0f32; n];
+    for (what, r) in [
+        ("read_parameter_host", model.read_parameter_host(1, &mut buf)),
+        ("read_gradient_host", model.read_gradient_host(&step.grads, 1, &mut buf)),
+        ("write_parameter_host", model.write_parameter_host(1, &vec![7.0; n])),
+    ] {
+        assert!(r.is_err(), "{what} succeeded on a poisoned runtime");
+    }
+}

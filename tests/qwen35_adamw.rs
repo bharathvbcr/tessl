@@ -1373,3 +1373,67 @@ fn per_entry_moment_host_copies_match_the_whole_table() {
         assert_eq!(whole(&state, Moment::First), before, "{moments:?}: a refusal wrote");
     }
 }
+
+// ---- adversarial: per-entry moment host copies ----
+
+/// An unwaited step is waited for by the per-entry reads (parameters and each
+/// moment storage), so they see the stepped values, not stale ones.
+#[test]
+fn per_entry_host_reads_wait_for_an_unwaited_step() {
+    for moments in [MomentStorage::F32, MomentStorage::Bf16, MomentStorage::Block8] {
+        let (rt, model) = load_bf16();
+        let table = model.parameter_table().unwrap();
+        let wd = model.default_weight_decay(0.1).unwrap();
+        let cfg = AdamWConfig {
+            update: UpdateRule::F32Master,
+            moments,
+        };
+        let mut state = AdamW::with_config(&model, cfg).unwrap();
+        let s = model.train_step(&ids(), GemmOperands::Bf16).unwrap();
+        let i = table.len() / 2;
+        let n: usize = table[i].shape.iter().product();
+        let mut before = vec![0.0f32; n];
+        model.read_parameter_host(i, &mut before).unwrap();
+        model.adamw_step_unwaited(&s.grads, &mut state, &hyper(), &wd).unwrap();
+        let mut got = vec![0.0f32; n];
+        let mut m = vec![0.0f32; n];
+        // The very first host read after the unwaited encode.
+        model.read_adamw_moment_host(&state, Moment::First, i, &mut m).unwrap();
+        model.read_parameter_host(i, &mut got).unwrap();
+        let ts = alloc_table(&rt, &table);
+        model.read_parameters(&ts).unwrap();
+        let want = ts[i].read_f32().unwrap();
+        assert_ne!(got, before, "{moments:?}: the step did not move the entry");
+        assert_eq!(got, want, "{moments:?}: a host read ran before the step finished");
+        let ms = alloc_table(&rt, &table);
+        model.read_adamw_moment(&state, Moment::First, &ms).unwrap();
+        assert_eq!(m, ms[i].read_f32().unwrap(), "{moments:?}: moment read raced the step");
+    }
+}
+
+/// On a poisoned runtime every per-entry moment call (the 8-bit one
+/// dispatches a kernel) is an `Err`, never a panic, and the state's step
+/// count does not move.
+#[test]
+fn per_entry_moment_host_calls_refuse_on_a_poisoned_runtime() {
+    for moments in [MomentStorage::F32, MomentStorage::Bf16, MomentStorage::Block8] {
+        let (rt, model) = load_bf16();
+        let table = model.parameter_table().unwrap();
+        let cfg = AdamWConfig {
+            update: UpdateRule::F32Master,
+            moments,
+        };
+        let mut state = AdamW::with_config(&model, cfg).unwrap();
+        let n: usize = table[1].shape.iter().product();
+        rt.poison_as_shared_event_timeout_for_test();
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut buf = vec![0.0f32; n];
+            let a = model.read_adamw_moment_host(&state, Moment::First, 1, &mut buf);
+            let b = model.write_adamw_moment_host(&mut state, Moment::Second, 1, &vec![1.0; n]);
+            (a, b)
+        }));
+        let (a, b) = r.unwrap_or_else(|_| panic!("{moments:?}: a poisoned runtime panicked"));
+        assert!(a.is_err(), "{moments:?}: read succeeded on a poisoned runtime");
+        assert!(b.is_err(), "{moments:?}: write succeeded on a poisoned runtime");
+    }
+}

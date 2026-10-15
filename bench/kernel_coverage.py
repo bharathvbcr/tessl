@@ -15,10 +15,11 @@ is selected; each bench binary prints its trace on exit, on every exit path.
   python3 bench/kernel_coverage.py            # report
   python3 bench/kernel_coverage.py --check    # non-zero if anything is uncovered
 
-By default the compiled library is resolved from the absolute `OUT_DIR` path
-embedded in `target/release/bench_gemm_sweep`. Pass `--metallib PATH` to audit
-an explicit artifact. The build never writes a compatibility copy into the
-crate source tree.
+The census is read from the metallib the binaries run. The runtime embeds the
+library's bytes (`include_bytes!`), so no binary carries a path to look up;
+`target/release/bench_gemm_sweep --dump-metallib PATH` writes those bytes out and
+`metal-nm` reads them. Pass `--metallib PATH` to audit an explicit artifact
+instead. The build never writes a compatibility copy into the crate source tree.
 """
 import argparse
 import json
@@ -108,6 +109,98 @@ def strip_macro_bodies(text):
     return "\n".join(out)
 
 
+DEFINE = re.compile(r'^[ \t]*#[ \t]*define[ \t]+([A-Za-z_][A-Za-z0-9_]*)\(([^)]*)\)(.*)$')
+CALL = re.compile(r'\b([A-Za-z_][A-Za-z0-9_]*)\(')
+KERNEL_DECL = re.compile(r'\bkernel\s+void\s+([A-Za-z_][A-Za-z0-9_]*)')
+MAX_EXPANSION_DEPTH = 8
+
+
+def function_macros(kdir):
+    """Every function-like `#define NAME(params) body` in the kernel sources.
+
+    Headers count: a family can be defined in a `.h` and stamped in a `.metal`.
+    Continuation lines are joined, so `body` is the whole definition.
+    """
+    defs = {}
+    for f in sorted(os.listdir(kdir)):
+        if not f.endswith((".metal", ".h")):
+            continue
+        lines = open(os.path.join(kdir, f)).read().splitlines()
+        i = 0
+        while i < len(lines):
+            joined = lines[i]
+            while joined.rstrip().endswith("\\") and i + 1 < len(lines):
+                i += 1
+                joined = joined.rstrip()[:-1] + " " + lines[i]
+            i += 1
+            m = DEFINE.match(joined)
+            if m:
+                params = [p.strip() for p in m.group(2).split(",") if p.strip()]
+                defs[m.group(1)] = (params, m.group(3))
+    return defs
+
+
+def call_args(text, open_paren):
+    """Top-level arguments of the call whose `(` is at `open_paren`, and the
+    index after its `)`. Brackets nest; a call that never closes is an error."""
+    depth, args, start = 0, [], open_paren + 1
+    for i in range(open_paren, len(text)):
+        c = text[i]
+        if c in "([{":
+            depth += 1
+        elif c in ")]}":
+            depth -= 1
+            if depth == 0:
+                tail = text[start:i].strip()
+                if tail or args:
+                    args.append(tail)
+                return args, i + 1
+        elif c == "," and depth == 1:
+            args.append(text[start:i].strip())
+            start = i + 1
+    raise SystemExit(f"unterminated macro call near {text[open_paren - 40:open_paren]!r}")
+
+
+def expand_kernels(name, args, defs, depth=0):
+    """Kernel names a call to the function-like macro `name` declares.
+
+    Substitutes the arguments, resolves `##` token pasting, reads every
+    `kernel void NAME`, and follows calls to other macros in the result, which
+    is how `QWEN35_ADAMW_BF16_RULE` reaches `QWEN35_ADAMW_STORED`.
+    """
+    params, body = defs[name]
+    if len(args) != len(params):
+        raise SystemExit(f"macro {name} takes {len(params)} argument(s), called with {len(args)}")
+    if depth > MAX_EXPANSION_DEPTH:
+        raise SystemExit(f"macro {name} expands more than {MAX_EXPANSION_DEPTH} levels deep")
+    if params:
+        sub = dict(zip(params, args))
+        body = re.sub(r"\b(" + "|".join(map(re.escape, params)) + r")\b",
+                      lambda m: sub[m.group(1)], body)
+    body = re.sub(r"\s*##\s*", "", body)
+    found = set(KERNEL_DECL.findall(body))
+    for m in CALL.finditer(body):
+        if m.group(1) in defs:
+            inner, _ = call_args(body, m.end() - 1)
+            found |= expand_kernels(m.group(1), inner, defs, depth + 1)
+    return found
+
+
+def macro_declared(text, defs):
+    """Kernels stamped by line-start invocations of defined function macros.
+
+    Returns (names, handled): `handled` is the macro names that were defined
+    and so expanded, whether or not they declared a kernel.
+    """
+    names, handled = set(), set()
+    for m in re.finditer(r"^([A-Za-z_][A-Za-z0-9_]*)\(", text, re.M):
+        if m.group(1) in defs:
+            args, _ = call_args(text, m.end() - 1)
+            names |= expand_kernels(m.group(1), args, defs)
+            handled.add(m.group(1))
+    return names, handled
+
+
 def inventory(kdir=None, metallib=None, require_metallib=False):
     """Every kernel entry point declared in the shipped kernel sources.
 
@@ -117,6 +210,7 @@ def inventory(kdir=None, metallib=None, require_metallib=False):
     """
     kdir = kdir or KDIR
     names, by_file = set(), {}
+    defs = function_macros(kdir)
     for f in sorted(os.listdir(kdir)):
         if not f.endswith(".metal"):
             continue
@@ -127,8 +221,14 @@ def inventory(kdir=None, metallib=None, require_metallib=False):
         # -- which continue while lines end in a backslash -- before scanning;
         # the invocations below the block are what name the real kernels.
         text = strip_macro_bodies(text)
-        found = set(PLAIN.findall(text)) | {m[1] for m in MACRO.findall(text)}
-        seen_macro = {m for m in MACROISH.findall(text)}
+        # Macros defined in the sources are expanded, whatever their name;
+        # that is what reaches `QWEN35_ADAMW_STORED` and `TILED_ATTN_KERNEL_IMPL`.
+        # A `*KERNEL(` macro defined nowhere in `kdir` falls back to its first
+        # argument, and one whose first argument is no identifier is refused.
+        expanded, handled = macro_declared(text, defs)
+        found = (set(PLAIN.findall(text)) | expanded
+                 | {m[1] for m in MACRO.findall(text) if m[0] not in handled})
+        seen_macro = {m for m in MACROISH.findall(text)} - handled
         parsed_macro = {m[0] for m in MACRO.findall(text)}
         unparsed = seen_macro - parsed_macro
         if unparsed:
@@ -159,6 +259,28 @@ def inventory(kdir=None, metallib=None, require_metallib=False):
     return names, by_file
 
 
+def dump_embedded_metallib(binary, directory):
+    """Write the metallib `binary` embeds into `directory`; return its path.
+
+    Raises SystemExit naming the fix when the binary cannot produce it, so a
+    stale binary (built before `--dump-metallib` existed) is not mistaken for
+    a library with nothing in it.
+    """
+    out = os.path.join(directory, "embedded.metallib")
+    fix = "rebuild with `cargo build --release --bins`"
+    try:
+        r = subprocess.run([binary, "--dump-metallib", out], capture_output=True,
+                           text=True, timeout=60)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise SystemExit(f"could not run {binary} --dump-metallib: {exc}; {fix}")
+    if r.returncode != 0 or not os.path.isfile(out) or os.path.getsize(out) == 0:
+        detail = r.stderr.strip()[:400] or "no diagnostic"
+        raise SystemExit(
+            f"{binary} --dump-metallib exited {r.returncode} without a library "
+            f"({detail}); the binary is stale or embeds no metallib: {fix}")
+    return out
+
+
 def metallib_symbols(path=None, required=False):
     """Exported kernel names from the built metallib, or None if unavailable.
 
@@ -168,9 +290,9 @@ def metallib_symbols(path=None, required=False):
     failure rather than the same PASS as one that actually verified the binary.
     """
     if path is None:
-        # The runtime embeds build.rs's immutable OUT_DIR artifact. Resolving
-        # that exact path keeps the census tied to the binaries being measured
-        # and avoids relying on a stale, source-tree `default.metallib` copy.
+        # The runtime embeds the library's bytes, so the census is read from
+        # those bytes, dumped by the binary being measured. Nothing is resolved
+        # from the source tree, and a stale `default.metallib` copy is not read.
         binary = os.path.join(BIN, "bench_gemm_sweep")
         if not os.path.isfile(binary):
             if required:
@@ -178,13 +300,13 @@ def metallib_symbols(path=None, required=False):
                     f"benchmark binary missing at {binary}; run "
                     "`cargo build --release --bins` before measuring kernel coverage")
             return None
-        from benchmark_evidence import embedded_metallib_path
-        try:
-            path = embedded_metallib_path(binary)
-        except ValueError as exc:
-            if required:
-                raise SystemExit(f"cannot resolve the benchmark's embedded metallib: {exc}")
-            return None
+        with tempfile.TemporaryDirectory(prefix="kernel-coverage-lib-") as d:
+            try:
+                return metallib_symbols(dump_embedded_metallib(binary, d), required)
+            except SystemExit:
+                if required:
+                    raise
+                return None
     if not os.path.exists(path):
         if required:
             raise SystemExit(
@@ -253,7 +375,7 @@ def main():
                     help="exit non-zero if any kernel is never dispatched")
     ap.add_argument(
         "--metallib",
-        help="explicit compiled metallib to inventory (default: path embedded in the release binary)",
+        help="explicit compiled metallib to inventory (default: the library bench_gemm_sweep embeds, via --dump-metallib)",
     )
     ap.add_argument("--out")
     args = ap.parse_args()

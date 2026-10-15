@@ -172,6 +172,13 @@ fn out_buf(rt: &Arc<GpuRuntime>, elems: usize) -> GpuBuffer {
 }
 
 fn main() -> Result<(), String> {
+    // Wrapped so every exit path, an error included, prints the trace.
+    let outcome = run();
+    common::emit_kernel_trace();
+    outcome
+}
+
+fn run() -> Result<(), String> {
     let warmup = common::env_usize("BENCH_WARMUP", 10, 0)?;
     let iters = common::env_usize("BENCH_ITERS", 50, 1)?;
     let rt = GpuRuntime::new()?;
@@ -445,14 +452,30 @@ fn sample_loop(
     rt: &Arc<GpuRuntime>,
     warmup: usize,
     iters: usize,
+    encode: impl FnMut() -> Result<(), String>,
+    read: impl FnMut() -> Result<u32, String>,
+) -> Result<(f64, f64, u32), String> {
+    rt.set_async_encode(true)?;
+    let timed = timed_token_loop(warmup, iters, encode, read);
+    // Restore before surfacing a loop error, so a failed lane cannot leave
+    // async encode on for the next one.
+    rt.set_async_encode(false)?;
+    timed
+}
+
+/// The loop under [`sample_loop`], with no runtime in it. The token every read
+/// must agree on is seeded by the first read, warmup or not: `BENCH_WARMUP=0`
+/// (what `bench/kernel_coverage.py` passes) has no warmup read to seed it.
+fn timed_token_loop(
+    warmup: usize,
+    iters: usize,
     mut encode: impl FnMut() -> Result<(), String>,
     mut read: impl FnMut() -> Result<u32, String>,
 ) -> Result<(f64, f64, u32), String> {
-    rt.set_async_encode(true)?;
-    let mut token = 0;
+    let mut token: Option<u32> = None;
     for _ in 0..warmup {
         encode()?;
-        token = read()?;
+        token = Some(read()?);
     }
     let (mut enc, mut wall) = (Vec::with_capacity(iters), Vec::with_capacity(iters));
     for _ in 0..iters {
@@ -463,8 +486,12 @@ fn sample_loop(
             let t1 = Instant::now();
             let got = read()?;
             let t2 = Instant::now();
-            if got != token {
-                return Err(format!("sample loop: token changed from {token} to {got}"));
+            match token {
+                None => token = Some(got),
+                Some(expected) if expected != got => {
+                    return Err(format!("sample loop: token changed from {expected} to {got}"));
+                }
+                Some(_) => {}
             }
             e += (t1 - t0).as_secs_f64();
             w += (t2 - t0).as_secs_f64();
@@ -472,7 +499,7 @@ fn sample_loop(
         enc.push(e * 1e6 / TOKENS as f64);
         wall.push(w * 1e6 / TOKENS as f64);
     }
-    rt.set_async_encode(false)?;
+    let token = token.ok_or("sample loop: no token was read (iters and TOKENS must be nonzero)")?;
     Ok((common::median(enc)?, common::median(wall)?, token))
 }
 
@@ -559,4 +586,36 @@ fn host_path(rt: &Arc<GpuRuntime>, warmup: usize, iters: usize) -> Result<(), St
 /// The token a sampler wrote, with its no-finite-logit refusal.
 fn read_token(out: &GpuBuffer) -> Result<u32, String> {
     nn::check_argmax_result(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::timed_token_loop;
+
+    /// `BENCH_WARMUP=0` has no warmup read to seed the expected token, so the
+    /// first timed read must. (It used to compare against a literal 0 and fail
+    /// with "token changed from 0 to 117223".)
+    #[test]
+    fn token_loop_seeds_from_the_first_read_without_warmup() {
+        let (_, _, token) = timed_token_loop(0, 2, || Ok(()), || Ok(117_223)).unwrap();
+        assert_eq!(token, 117_223);
+        let (_, _, token) = timed_token_loop(1, 1, || Ok(()), || Ok(5)).unwrap();
+        assert_eq!(token, 5);
+    }
+
+    #[test]
+    fn token_loop_still_rejects_a_token_that_changes() {
+        let mut n = 0u32;
+        let err = timed_token_loop(
+            0,
+            1,
+            || Ok(()),
+            || {
+                n += 1;
+                Ok(if n == 3 { 9 } else { 4 })
+            },
+        )
+        .unwrap_err();
+        assert!(err.contains("token changed from 4 to 9"), "{err}");
+    }
 }

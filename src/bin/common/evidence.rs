@@ -1,7 +1,7 @@
 //! Evidence for a paired benchmark: the drift policy, the provenance block and
 //! the atomic, fail-closed publication of the artifact.
 //!
-//! This is the Rust owner of what `bench/benchmark_evidence.py` did for the
+//! This is the Rust owner of what the retired `bench/benchmark_evidence.py` did for the
 //! retired `paired_cross_runtime.py` and `attn_paired.py` drivers. Shader
 //! provenance is the hash of each lane executable: the runtime bakes the
 //! metallib into the binary (`include_bytes!` in `src/runtime.rs`), so the

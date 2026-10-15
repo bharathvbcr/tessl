@@ -840,6 +840,42 @@ def coverage_inventory():
             FAILURES.append("an unparsed kernel macro was silently undercounted")
             print("  FAIL  unparsed macro silently undercounted")
 
+        # Macro families that stamp kernels under names the old pattern could not
+        # see: a name not ending in KERNEL, `##` pasting, and a macro that stamps
+        # through another macro (the shapes of the 29 qwen35 kernels it missed).
+        d = write("#define STAMP(NAME, T) \\\n"
+                  "kernel void NAME(device T* x) {}\n"
+                  "#define STAMP_RULE(R, T) \\\n"
+                  "    STAMP(fam_##R##_a, T) \\\n"
+                  "    STAMP(fam_##R##_b, T)\n"
+                  "STAMP(plain_stamp, float)\n"
+                  "STAMP_RULE(kahan, bfloat)\n"
+                  "STAMP_RULE(sr,\n"
+                  "           float)\n")
+        names, _ = inventory(d, metallib="/nonexistent")
+        want = {"plain_stamp", "fam_kahan_a", "fam_kahan_b", "fam_sr_a", "fam_sr_b"}
+        if names == want:
+            print("  ok    defined macro families are expanded (non-KERNEL names, ##, nesting)")
+        else:
+            FAILURES.append(f"macro expansion got {sorted(names)}")
+            print(f"  FAIL  macro expansion got {sorted(names)}")
+
+        # A binary that cannot dump its metallib (stale, built before
+        # `--dump-metallib`) is a hard failure naming the fix, never a library
+        # with nothing in it.
+        from kernel_coverage import dump_embedded_metallib
+        try:
+            dump_embedded_metallib("/usr/bin/true", tmp)
+        except SystemExit as exc:
+            if "cargo build --release --bins" in str(exc):
+                print("  ok    a binary that dumps no metallib fails, naming the rebuild")
+            else:
+                FAILURES.append(f"stale-binary error does not name the fix: {exc}")
+                print(f"  FAIL  stale-binary error: {exc}")
+        else:
+            FAILURES.append("a binary that dumped no metallib was accepted")
+            print("  FAIL  dump-less binary accepted")
+
         # An empty kernel directory is a broken run, not zero kernels.
         d = tempfile.mkdtemp(dir=tmp)
         try:

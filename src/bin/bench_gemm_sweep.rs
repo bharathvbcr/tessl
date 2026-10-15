@@ -5,6 +5,10 @@
 //! so no lane hides dispatch cost behind pipelining, median over iters.
 //!
 //! `--dump-parity DIR` writes A/B/C as .npy for the numeric check in the Python lane.
+//!
+//! `--dump-metallib PATH` writes the metallib bytes this binary embeds and exits
+//! without touching the GPU. `bench/kernel_coverage.py` reads the kernel census
+//! from that file, so it audits the library the benchmarks actually run.
 
 mod common;
 
@@ -64,14 +68,43 @@ fn shapes_from_env() -> Option<Vec<(usize, usize, usize, String)>> {
     Some(out)
 }
 
+/// The metallib `build.rs` produced, as the runtime embeds it
+/// (`include_bytes!` of the same artifact in `src/runtime.rs`).
+#[cfg(tessl_embedded_metallib)]
+fn embedded_metallib() -> Result<&'static [u8], String> {
+    Ok(include_bytes!(env!("TESSL_METALLIB")))
+}
+
+#[cfg(not(tessl_embedded_metallib))]
+fn embedded_metallib() -> Result<&'static [u8], String> {
+    Err("this build embeds no metallib (docs.rs-style build)".to_string())
+}
+
+fn dump_metallib(path: &str) -> Result<(), String> {
+    let bytes = embedded_metallib()?;
+    std::fs::write(path, bytes).map_err(|e| format!("--dump-metallib {path}: {e}"))
+}
+
 fn main() -> Result<(), String> {
+    // Wrapped so every exit path, an error included, prints the trace.
+    let outcome = run();
+    common::emit_kernel_trace();
+    outcome
+}
+
+fn run() -> Result<(), String> {
+    let args: Vec<String> = std::env::args().collect();
+    if let Some(i) = args.iter().position(|a| a == "--dump-metallib") {
+        let path = args.get(i + 1).ok_or("--dump-metallib needs a PATH")?;
+        return dump_metallib(path);
+    }
+
     // Validated before the GPU is touched: a malformed count must not cost a
     // device init, and must not silently run the default.
     let warmup = common::env_usize("BENCH_WARMUP", 10, 0)?;
     let iters = common::env_usize("BENCH_ITERS", 50, 1)?;
     let rt = GpuRuntime::new()?;
 
-    let args: Vec<String> = std::env::args().collect();
     let dump_dir = args
         .iter()
         .position(|a| a == "--dump-parity")

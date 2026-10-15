@@ -220,9 +220,9 @@ What each script did, and where it went:
 | Artifact fields `peak_gflops`, `schema_version: 2` compatibility keys (`geomean`, `geomean_tessl_over_other`) | Not emitted. Per-key medians of each variant are under `per_key[].a_value` and `b_value`, the canonical aggregate is `paired_geomean`. Old result files keep their old schema. |
 | `bench/attn_tune.py` knob sweeps | Unchanged, not replaced: it sweeps knobs through `bench_flash_attn`, it does not pair runtimes. |
 
-`bench/benchmark_evidence.py` shrank to `embedded_metallib_path`, the one helper
-`bench/kernel_coverage.py` imports. The helper resolves a path no current binary
-embeds (it returns "found []"), which is `kernel_coverage.py`'s to settle.
+`bench/benchmark_evidence.py` is gone. Its last helper, `embedded_metallib_path`,
+scanned binaries for a path none carries; `bench/kernel_coverage.py` now has
+`bench_gemm_sweep --dump-metallib PATH` write the embedded bytes and reads those.
 
 ## Pitfall 4 — stale binaries
 

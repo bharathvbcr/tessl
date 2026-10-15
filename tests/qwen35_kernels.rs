@@ -1909,24 +1909,69 @@ fn gdn_gates_kernel_matches_the_transformers_module_golden() {
             heads as u32,
         )
         .unwrap();
-        // The golden is torch's f32 on the CPU; the kernel's `exp`, `log` and divide are
-        // Metal's, a few ulps each. 2e-6 relative is ~35 u_f32 and the observed worst
-        // is far inside it, while a wrong branch (the softplus threshold, the series
-        // below -3, the sigmoid's sign split) is off by orders of magnitude more.
+        // The bound is derived per element from an ulp budget over the op chain, not fitted
+        // to a run. One ulp is taken as 2^-23 of the value (the worst case; the ulp of a
+        // value is between 2^-24 and 2^-23 relative to it). The kernel-side figures are
+        // Metal's documented accuracies (the kernel's own comments quote fast `exp` as
+        // 3 + floor(2|x|) ulp; precise `exp`/`log` are taken as 3 ulp and the fast divide
+        // as 2.5 ulp, from the MSL spec table, which this test does not re-measure). The
+        // golden side is torch's f32 CPU `exp`/`softplus`/`sigmoid`, budgeted 2/3/3 ulp.
+        // `a + dt_bias` is the same IEEE f32 add on both sides, so it adds nothing.
+        //
+        //   g    = -exp(A_log) * softplus(a + dt_bias)
+        //        = fast exp 3+floor(2|A_log|) + golden exp 2 + softplus (precise log branch:
+        //          0.5 rounding of 1+e, 3 log, 3 exp attenuated to <= 3) 6.5 + golden
+        //          softplus 3 + multiply 0.5                 [per head; <= 7 ulp of exp]
+        //   beta = sigmoid(b): worst at b < 0, where beta = e * r and e = fast exp(-|b|)
+        //          enters unattenuated: 3+floor(2|b|) (43 ulp at b = -20) + divide 2.5 +
+        //          multiply 0.5 + add 0.5 + golden sigmoid 3  [per element]
+        //
+        // At this fixture's worst inputs that is 3+4+2+6.5+3+0.5 = 19 ulp (2.3e-6) for g
+        // and 43+6.5 = 49.5 ulp (5.9e-6) for beta. A kernel outside its element's budget is
+        // a finding, not a tolerance to loosen.
+        let ulp = 2f64.powi(-23);
+        let fast_exp_ulps = |x: f32| 3.0 + (2.0 * f64::from(x).abs()).floor();
         let (got_g, got_beta) = (g.read_f32(), beta.read_f32());
-        assert_close_rel("gdn_gates g", &got_g[..rows * heads], &g_want, 2e-6, 0.0);
-        assert_close_rel("gdn_gates beta", &got_beta[..rows * heads], &beta_want, 2e-6, 0.0);
-        let worst = |got: &[f32], want: &[f64]| {
-            got.iter()
-                .zip(want)
-                .map(|(&x, &w)| (f64::from(x) - w).abs() / w.abs().max(f64::MIN_POSITIVE))
-                .fold(0.0, f64::max)
-        };
-        println!(
-            "gdn_gates vs transformers: worst relative error g {:.3e}, beta {:.3e}",
-            worst(&got_g[..rows * heads], &g_want),
-            worst(&got_beta[..rows * heads], &beta_want)
-        );
+        let n = rows * heads;
+        let g_budget: Vec<f64> = (0..n)
+            .map(|i| fast_exp_ulps(a_log[i % heads]) + 2.0 + 6.5 + 3.0 + 0.5)
+            .collect();
+        let beta_budget: Vec<f64> = (0..n).map(|i| fast_exp_ulps(b[i]) + 2.5 + 0.5 + 0.5 + 3.0).collect();
+        let mut report = String::new();
+        for (what, got, want, budget) in [
+            ("g", &got_g[..n], &g_want, &g_budget),
+            ("beta", &got_beta[..n], &beta_want, &beta_budget),
+        ] {
+            let mut worst_rel = (0.0f64, 0usize);
+            let mut worst_used = (0.0f64, 0usize);
+            for (i, (&x, &w)) in got.iter().zip(want).enumerate() {
+                assert!(x != SENTINEL, "gdn_gates {what}[{i}]: never written");
+                assert!(x.is_finite(), "gdn_gates {what}[{i}]: non-finite {x}");
+                let rel = (f64::from(x) - w).abs() / w.abs();
+                let used = rel / (budget[i] * ulp);
+                assert!(
+                    used <= 1.0,
+                    "gdn_gates {what}[{i}]: got {x} want {w}: relative error {rel:.3e} is over the \
+                     {:.1}-ulp budget ({:.3e})",
+                    budget[i],
+                    budget[i] * ulp
+                );
+                if rel > worst_rel.0 {
+                    worst_rel = (rel, i);
+                }
+                if used > worst_used.0 {
+                    worst_used = (used, i);
+                }
+            }
+            report += &format!(
+                "{what}: worst relative error {:.3e} (element {}); most of its budget used {:.1}% (element {})\n",
+                worst_rel.0,
+                worst_rel.1,
+                100.0 * worst_used.0,
+                worst_used.1
+            );
+        }
+        println!("gdn_gates vs transformers:\n{report}");
     });
 }
 

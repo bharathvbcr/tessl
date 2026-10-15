@@ -31,7 +31,7 @@ flowchart TD
         NnBench["bench_nn_kernels<br/>(62 nn entry points · batched vs solo)"]
         Parity["probe_gemm_parity<br/>(Bit-exact TensorOps vs SIMD verification)"]
         
-        subgraph TuneGated["Behind TESSL_GEMM_TUNE=1 (71 A/B Kernels)"]
+        subgraph TuneGated["Behind TESSL_GEMM_TUNE=1 (152 A/B Kernels)"]
             TnNtTune["bench_gemm_tnnt_tune<br/>(Paired interleaved TN/NT A/B lane)"]
             TileTune["bench_gemm_tile_tune<br/>(Tile geometry &amp; BK ladder search)"]
         end
@@ -48,7 +48,7 @@ flowchart TD
     PyHarness -->|In-Process Dispatch| MLX
 ```
 
-The A/B rig is 71 measurement-only kernels and is **not** in the default
+The A/B rig is 152 measurement-only kernels and is **not** in the default
 metallib — linking it took the shipped artifact from 0.22 MB to 1.09 MB. Opt in:
 
 `TESSL_GEMM_TUNE` changes what build.rs links, so it goes on **every** `cargo`
@@ -331,7 +331,7 @@ target/release/bench_paired --format rows:shape,backend,gflops --compare tensoro
   'py:BENCH_SHAPES=1024x1024x1024=python3 bench/gemm_sweep_mlx.py --lanes torch --dtypes f32 --iters 30 --warmup 10'
 
 # Tile-geometry and TN/NT A/B lanes. These live behind TESSL_GEMM_TUNE because
-# the 71 measurement kernels are excluded from the default metallib; the
+# the 152 measurement kernels are excluded from the default metallib; the
 # variable goes on each command, or build.rs rebuilds the metallib without them.
 TESSL_GEMM_TUNE=1 cargo build --release --bins
 TESSL_GEMM_TUNE=1 cargo run --release --bin bench_gemm_tile_tune

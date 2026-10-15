@@ -56,7 +56,7 @@
 //! # Kernels
 //!
 //! New for this model: [`encoder_attn`] (`kernels/encoder_attn.metal`: the
-//! TensorOps tiled kernel of `kernels/attn_tiled.h` at head dims 256 and 512,
+//! TensorOps tiled kernel of `kernels/attn_tiled.h` (head dims 32 to 512; bf16 operand tiles at 64, 256 and 512),
 //! or one simdgroup per query row), [`segment_mean_rows`] and
 //! [`l2_normalize_rows`] (`kernels/embed_pool.metal`). The rest are tessl's:
 //! GEMMs, exact f32 or bf16 (NN, and NT for the per-layer-input projection),
@@ -138,9 +138,17 @@ pub enum EncoderAttnKernel {
     /// head dim.
     Rows,
     /// FlashAttention-2 on the TensorOps matrix units
-    /// (`encoder_attn_tiled_*`, `kernels/qwen35_attn_tiled.metal`'s body):
-    /// head dims 256 and 512, on a device with TensorOps.
+    /// (`encoder_attn_tiled_*`, `kernels/attn_tiled.h`'s body in its encoder
+    /// mode, the one `kernels/qwen35_attn_tiled.metal` runs causally): head
+    /// dims 32, 64, 256 and 512, f32 operands, on a device with TensorOps.
     Tiled,
+    /// [`Self::Tiled`] with bf16 operand tiles (`encoder_attn_tiled_bf16_*`):
+    /// Q, K and V are bf16 buffers, and so is the probability tile that
+    /// multiplies V; scores, the online softmax, the accumulator and the
+    /// output stay f32. Head dims 64, 256 and 512. Never picked by
+    /// [`encoder_attn_kernel`]: the caller owns the operand dtype
+    /// ([`encoder_attn_bf16`]).
+    TiledBf16,
 }
 
 /// The kernel [`encoder_attn`] picks: [`EncoderAttnKernel::Tiled`] where it
@@ -154,11 +162,24 @@ pub fn encoder_attn_kernel(rt: &GpuRuntime, head_dim: u32) -> EncoderAttnKernel 
 }
 
 /// (entry, queries per threadgroup, simdgroups per threadgroup) as compiled;
-/// the entry spells its geometry.
+/// the entry spells its geometry. Each head dim's geometry is the winner of
+/// the sweep in `bench/results/embedgemma2_attention_m5pro.txt`.
 fn encoder_attn_tiled_entry(head_dim: u32) -> Option<(&'static str, usize, usize)> {
     match head_dim {
+        32 => Some(("encoder_attn_tiled_h32_q16_k32_sg1", 16, 1)),
+        64 => Some(("encoder_attn_tiled_h64_q32_k32_sg2", 32, 2)),
         256 => Some(("encoder_attn_tiled_h256_q32_k32_sg4", 32, 4)),
         512 => Some(("encoder_attn_tiled_h512_q32_k32_sg8", 32, 8)),
+        _ => None,
+    }
+}
+
+/// [`encoder_attn_tiled_entry`] for [`EncoderAttnKernel::TiledBf16`].
+fn encoder_attn_tiled_bf16_entry(head_dim: u32) -> Option<(&'static str, usize, usize)> {
+    match head_dim {
+        64 => Some(("encoder_attn_tiled_bf16_h64_q32_k32_sg2", 32, 2)),
+        256 => Some(("encoder_attn_tiled_bf16_h256_q32_k64_sg4", 32, 4)),
+        512 => Some(("encoder_attn_tiled_bf16_h512_q32_k128_sg8", 32, 8)),
         _ => None,
     }
 }
@@ -169,7 +190,8 @@ fn encoder_attn_tiled_entry(head_dim: u32) -> Option<(&'static str, usize, usize
 /// `q`/`o`: `[batch, seq, heads, head_dim]`; `k`/`v`: `[batch, capacity,
 /// heads_kv, head_dim]` with `capacity >= seq` derived from their size
 /// ([`crate::nn::attn_kv_capacity`], as the K/V writer derives it), all f32
-/// (there is no bf16 output: no encoder has a bf16 path). `lens`: `[batch]` u32,
+/// (the bf16-operand form is [`encoder_attn_bf16`]; there is no bf16 output).
+/// `lens`: `[batch]` u32,
 /// each sequence's live length. Keys at or past a row's length are masked,
 /// and every query at or past it is written as zeros. The lengths are device
 /// values the host cannot see; the kernel clamps each to `seq`, and a length
@@ -189,8 +211,27 @@ pub fn encoder_attn(
     encoder_attn_with(rt, q, k, v, o, lens, dims, kernel)
 }
 
+/// [`encoder_attn`] with bf16 operand tiles ([`EncoderAttnKernel::TiledBf16`]):
+/// `q`, `k` and `v` are bf16 buffers (same shapes, `k`/`v` capacity derived
+/// by [`crate::nn::attn_kv_capacity_bf16`]), `o` stays f32. Needs a TensorOps
+/// device and head dim 64, 256 or 512; anything else is an error, never a
+/// silent fall back to a different precision.
+#[allow(clippy::too_many_arguments)]
+pub fn encoder_attn_bf16(
+    rt: &Arc<GpuRuntime>,
+    q: &GpuBuffer,
+    k: &GpuBuffer,
+    v: &GpuBuffer,
+    o: &GpuBuffer,
+    lens: &GpuBuffer,
+    dims: EncoderAttnDims,
+) -> Result<(), String> {
+    encoder_attn_with(rt, q, k, v, o, lens, dims, EncoderAttnKernel::TiledBf16)
+}
+
 /// [`encoder_attn`] on a named kernel (for the tests and the paired
-/// benchmark that compare the two). The contract and the checks are the same.
+/// benchmark that compare them). The contract and the checks are the same,
+/// except that [`EncoderAttnKernel::TiledBf16`] takes bf16 `q`, `k` and `v`.
 #[allow(clippy::too_many_arguments)]
 pub fn encoder_attn_with(
     rt: &Arc<GpuRuntime>,
@@ -215,13 +256,22 @@ pub fn encoder_attn_with(
         return Err(format!("{WHAT}: scale must be finite"));
     }
     let q_elems = elems(&[dims.batch, dims.seq, dims.heads, dims.head_dim], WHAT)?;
-    require::<f32>(rt, q, q_elems, "encoder_attn q")?;
+    let bf16 = kernel == EncoderAttnKernel::TiledBf16;
+    if bf16 {
+        require::<u16>(rt, q, q_elems, "encoder_attn q (bf16)")?;
+    } else {
+        require::<f32>(rt, q, q_elems, "encoder_attn q")?;
+    }
     require::<f32>(rt, o, q_elems, "encoder_attn o")?;
     require::<u32>(rt, lens, dims.batch as usize, "encoder_attn lens")?;
     if q_elems == 0 {
         return Ok(());
     }
-    let kv_capacity = crate::nn::attn_kv_capacity(k, v, dims.batch, dims.heads_kv, dims.head_dim)?;
+    let kv_capacity = if bf16 {
+        crate::nn::attn_kv_capacity_bf16(k, v, dims.batch, dims.heads_kv, dims.head_dim)?
+    } else {
+        crate::nn::attn_kv_capacity(k, v, dims.batch, dims.heads_kv, dims.head_dim)?
+    };
     if kv_capacity < dims.seq {
         return Err(format!(
             "{WHAT}: K/V hold {kv_capacity} positions per sequence; need at least seq = {}",
@@ -229,13 +279,22 @@ pub fn encoder_attn_with(
         ));
     }
     require_disjoint_writes(WHAT, &[("o", o)], &[("q", q), ("k", k), ("v", v), ("lens", lens)])?;
-    if kernel == EncoderAttnKernel::Tiled {
-        let (entry, bq, sg) = encoder_attn_tiled_entry(dims.head_dim).ok_or_else(|| {
-            format!(
-                "{WHAT}: the tiled kernel is compiled for head dims 256 and 512, not {}",
-                dims.head_dim
-            )
-        })?;
+    if kernel != EncoderAttnKernel::Rows {
+        let (entry, bq, sg) = if bf16 {
+            encoder_attn_tiled_bf16_entry(dims.head_dim).ok_or_else(|| {
+                format!(
+                    "{WHAT}: the bf16 tiled kernel is compiled for head dims 64, 256 and 512, not {}",
+                    dims.head_dim
+                )
+            })?
+        } else {
+            encoder_attn_tiled_entry(dims.head_dim).ok_or_else(|| {
+                format!(
+                    "{WHAT}: the tiled kernel is compiled for head dims 32, 64, 256 and 512, not {}",
+                    dims.head_dim
+                )
+            })?
+        };
         if !rt.has_tensorops() {
             return Err(format!(
                 "{WHAT}: the tiled kernel needs TensorOps, which this device lacks"
@@ -909,6 +968,19 @@ impl EmbedGemma2Model {
                         "EmbedGemma2Model::load_with: bf16 operands need TensorOps, which this device lacks".into(),
                     );
                 }
+                // The attention's operands are bf16 too, and its bf16 kernel
+                // is compiled for these head dims only.
+                if let Some(s) = cfg
+                    .layers
+                    .iter()
+                    .find(|s| encoder_attn_tiled_bf16_entry(s.head_dim).is_none())
+                {
+                    return Err(format!(
+                        "EmbedGemma2Model::load_with: bf16 operands have no attention kernel for head dim {} \
+                         (64, 256 and 512 are compiled)",
+                        s.head_dim
+                    ));
+                }
                 Precision::Bf16
             }
         };
@@ -1346,26 +1418,31 @@ impl EmbedGemma2Model {
                     k_cache: &a.k.buffer,
                     v_cache: &a.v.buffer,
                 },
+                a.q.dtype,
                 0,
                 s.rope_theta,
                 eps,
             )?;
-            encoder_attn(
+            // Q, K and V are in the attention's operand type: f32, or under
+            // `Bf16` the writer above stored them bf16.
+            let attn_dims = EncoderAttnDims {
+                batch: nb,
+                seq,
+                heads: cfg.q_heads,
+                heads_kv: s.kv_heads,
+                head_dim: s.head_dim,
+                window: if s.sliding { cfg.sliding_window } else { 0 },
+                scale: 1.0,
+            };
+            let attend = if bf.is_some() { encoder_attn_bf16 } else { encoder_attn };
+            attend(
                 rt,
                 &a.q.buffer,
                 &a.k.buffer,
                 &a.v.buffer,
                 &a.attn.buffer,
                 &io.lens,
-                EncoderAttnDims {
-                    batch: nb,
-                    seq,
-                    heads: cfg.q_heads,
-                    heads_kv: s.kv_heads,
-                    head_dim: s.head_dim,
-                    window: if s.sliding { cfg.sliding_window } else { 0 },
-                    scale: 1.0,
-                },
+                attn_dims,
             )?;
             let attn_width = cfg.q_heads * s.head_dim;
             let attn = at(&a.attn, attn_width)?;
@@ -1526,9 +1603,12 @@ impl EmbedGemma2Model {
             resid: f32s(&[r, h])?,
             x: f32s(&[r, h])?,
             qkv: f32s(&[r, qkv_w])?,
-            q: f32s(&[r, q_w])?,
-            k: f32s(&[r, kv_w])?,
-            v: f32s(&[r, kv_w])?,
+            // The attention's operands: bf16 under `Bf16`, written so by the
+            // q/k-norm-RoPE kernel (no cast pass, and half the bytes read
+            // back by the attention).
+            q: if bf16 { bf16s(&[r, q_w])? } else { f32s(&[r, q_w])? },
+            k: if bf16 { bf16s(&[r, kv_w])? } else { f32s(&[r, kv_w])? },
+            v: if bf16 { bf16s(&[r, kv_w])? } else { f32s(&[r, kv_w])? },
             // Under `Bf16` the MLP's activation lives in `Bf16Acts::wide`.
             attn: f32s(&[r, if bf16 { q_w } else { q_w.max(inter) }])?,
             y: f32s(&[r, h])?,

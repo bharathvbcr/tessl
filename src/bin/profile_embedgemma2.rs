@@ -641,6 +641,7 @@ fn forward(cx: &Cx<'_>, mask: u32) -> Result<(), String> {
                     k_cache: &a.k.buffer,
                     v_cache: &a.v.buffer,
                 },
+                DType::F32,
                 0,
                 s.rope_theta,
                 eps,

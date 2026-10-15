@@ -130,8 +130,9 @@ bounds below (set `EMBEDGEMMA2_SNAPSHOT`).
 
 | Kernel | File | New? |
 |---|---|---|
-| `encoder_attn_tiled_h256_q32_k32_sg4`, `encoder_attn_tiled_h512_q32_k32_sg8` | `kernels/encoder_attn.metal` over `kernels/attn_tiled.h` | new: bidirectional attention with a symmetric window and per-row lengths on the TensorOps matrix units, the FlashAttention-2 body Qwen3.5's prefill uses (`ENCODER` mode). What `encoder_attn` runs on a device with TensorOps |
-| `encoder_attn_rows_h{256,512,32,64}_*` | `kernels/encoder_attn.metal` over `kernels/attn_rows.h` | new: the same contract, one simdgroup per query row, scalar f32. Head dims 32/64 (BERT), and 256/512 on a device without TensorOps. `encoder_attn_with` names either kernel; every attention test runs on both |
+| `encoder_attn_tiled_h{256_q32_k32_sg4, 512_q32_k32_sg8, 64_q32_k32_sg2, 32_q16_k32_sg1}` | `kernels/encoder_attn.metal` over `kernels/encoder_attn_tiled.h` and `kernels/attn_tiled.h` | new: bidirectional attention with a symmetric window and per-row lengths on the TensorOps matrix units, the FlashAttention-2 body Qwen3.5's prefill uses (`ENCODER` mode). What `encoder_attn` runs on a device with TensorOps, at every head dim (BERT's 32 and 64 and the vision tower's 64 included; the geometry per head dim is the sweep's winner, `bench/results/embedgemma2_attention_m5pro.txt`) |
+| `encoder_attn_tiled_bf16_h{64_q32_k32_sg2, 256_q32_k64_sg4, 512_q32_k128_sg8}` | same | new: the same body with bf16 Q, K, V and probability tiles (scores, softmax, accumulator and output f32). `encoder_attn_bf16`, what the forward runs under `GemmOperands::Bf16` |
+| `encoder_attn_rows_h{256,512,32,64}_*` | `kernels/encoder_attn.metal` over `kernels/attn_rows.h` | new: the same contract, one simdgroup per query row, scalar f32. Every head dim on a device without TensorOps (and the baseline the tiled kernels are timed against). `encoder_attn_with` names a kernel; every attention test runs on the rows and the f32 tiled kernels |
 | `segment_mean_rows_f32`, `l2_normalize_rows_f32` | `kernels/embed_pool.metal` | new: row-range means (the pool here, the option pool in rsi-jev) and the (Matryoshka-prefix) normalize |
 | q/k norm + full RoPE + K/V store, with the weightless V norm | `qwen35_attn_qk_norm_rope` via `qwen35::attn_qk_norm_rope_columns` (`QkvColumns::v_norm`) | reused; the host entry is new (separate K and V column blocks), and so is the V norm inside it. The frequencies are the host table `nn::rope_inv_freq` (torch's formula), not a device `pow` |
 | embedding gather times `sqrt(hidden)` (bf16 table) | `qwen35_embed_rows_bf16_scaled` via `qwen35::embed_rows_scaled` | new: the gather and the scale in one pass |
@@ -277,6 +278,18 @@ Measured on an M5 Pro against the real checkpoint, paired and interleaved
   10-18 % and already at the bandwidth roofline (190-285 GB/s), so only fusing
   them helps. At 16 rows the down, o and per-layer-input GEMMs reach 17-22 % of
   the copy bandwidth where gate|up reaches 84 %.
+* **Attention on the matrix units at every head dim, and in bf16**
+  (`bench_encoder_attn`, `embedgemma2_attention_m5pro.txt`: min of 24 rounds of
+  interleaved A/B, a shared GPU). The vision tower's head dim 64 (12 heads, 2520
+  patches) was the scalar rows kernel; the tiled kernel runs it 2.8x and 2.9x
+  faster at 1 and 4 images (BERT's 32: about 2.3x). With bf16 tiles the kernel
+  runs the text shapes 3.0 to 3.8x faster than the f32 tiled one (4.4 to 56 ms
+  down to 1.5 to 15 ms, 17 to 19 TFLOP/s against 5 to 6) and the vision shapes
+  2.6x. End to end, the bf16 forward (`bench_paired`, 6 rounds, base and new
+  binaries interleaved) takes 171.6 ms against 198.0 at 32x256, 197.6 against
+  301.2 at 8x1024 and 244.2 against 452.8 at 2x4096 (0.87x, 0.66x, 0.53x of the
+  time); the exact-f32 forward is unchanged (0.995x, 0.991x, 0.997x, every
+  range straddling 1).
 * **The device-peak rise, isolated.** One activation set is 736 MiB at 8192 rows
   against 576 MiB at 2a7cb8b (+160: the per-layer-input run buffer is +240, the
   packed gate|up and the dropped normed-V buffer save 80). The table above
@@ -290,8 +303,10 @@ Measured on an M5 Pro against the real checkpoint, paired and interleaved
   noise).
 * **`segment_mean_rows`** stays serial: it is under 0.2 % of an encode on
   every workload (`embedgemma2_segment_mean_share_m5pro.txt`).
-* **No bf16 attention output.** `encoder_attn` writes f32 only; the `out_bf16`
-  argument had no caller and is gone.
+* **No bf16 attention output.** `encoder_attn` writes f32 only, at bf16
+  operands too; the `out_bf16` argument had no caller and is gone. (The
+  shared body still has the flag, so the bf16 forward's per-layer cast of the
+  attention output could be dropped by passing it; not done here.)
 
 ## Precision
 
@@ -322,10 +337,23 @@ precision `src/gemm.rs` already defines for callers that choose per call):
   (`cast_f32_to_bf16_into`) cover the rest: the attention output and the
   residual stream into the per-layer-input gate once per layer, the embeddings
   and the pooled vectors once per forward. `encoder_attn` writes f32 only, so
-  the attention output's cast stays until it gains a bf16 output.
+  the attention output's cast stays until it gains a bf16 output (it could
+  write bf16 through the body's existing flag, which would drop that pass; not
+  done here).
+* **Attention.** Q, K and V are stored bf16 by the q/k-norm-RoPE kernel
+  (`attn_qk_norm_rope_columns(.., DType::BF16, ..)`, rounded to nearest even
+  from its f32 result: no cast pass, and the three activation buffers are half
+  the bytes), and `encoder_attn_bf16` runs the matrix units on bf16 tiles.
+  The probability tile that multiplies V is rounded to bf16 too (kept f32, with
+  bf16 Q, K and V, the kernel gained 1.1 to 1.8x on f32 where bf16 P gains 2.5
+  to 3.8x: `embedgemma2_attention_m5pro.txt`), with the row's sum taken over
+  the rounded weights, so the output is a convex combination of V's rows. Scores, the online softmax and its scale, the accumulator and the
+  output are f32. The error budget is derived in `tests/embedgemma2_kernels.rs`
+  (four first-order sources, 6 sigma per element).
 * **What stays f32.** The residual stream, the norms' arithmetic, the q/k/v
-  norms and RoPE, the attention, the pooling, the normalization, and every
-  GEMM output.
+  norms and RoPE (before their bf16 store), the attention's scores, softmax,
+  accumulation and output, the pooling, the normalization, and every GEMM
+  output.
 * **Relaxed precision.** No f32 GEMM runs, so the runtime's relaxed-f32 switch
   does not touch the forward and `encode` does not refuse it (the exact-f32
   model still does); the embeddings are bit-identical with the switch on.
@@ -340,13 +368,15 @@ the way `tests/qwen35_model.rs` holds Qwen3.5's):
 
 | Check | Bound | Observed |
 |---|---|---|
-| tiny: per-layer residual + final norm vs the f64 forward over the same bf16 weights | `5e-2` x max | `4.9e-3` to `8.4e-3` x max |
-| tiny: embeddings, alone and batched | `1e-2` max abs, cos >= `0.9999` | <= `1.4e-3`, cos >= `0.999987` |
+| tiny: per-layer residual + final norm vs the f64 forward over the same bf16 weights | `5e-2` x max | `5.7e-3` to `1.3e-2` x max (`4.9e-3` to `8.4e-3` before the bf16 attention) |
+| tiny: embeddings, alone and batched | `1e-2` max abs, cos >= `0.9999` | <= `2.0e-3`, cos >= `0.999976` (`1.4e-3`, `0.999987` before) |
 | tiny: batched vs alone, ragged runs of per-layer inputs, sync vs async | `1e-5` | 0 (bit-identical) |
-| real: cos vs fp32, each of 8 texts | >= `0.9999` | `0.99999324` to `0.99999848` (max abs <= `4.3e-4`) |
-| real: mean `1 - cos` vs fp32, against transformers' bf16 forward | <= its | `4.1e-6` against `4.7e-5` |
-| real: cos vs transformers' bf16 (`emb_bf16.npy`) | >= `0.9996` (triangle inequality over two `1e-4` deficits) | `0.99989959` to `0.99997965` |
+| real: cos vs fp32, each of 8 texts | >= `0.9999` | `0.99999337` to `0.99999808` (max abs <= `4.8e-4`; `0.99999324` to `0.99999848`, `4.3e-4` before) |
+| real: mean `1 - cos` vs fp32, against transformers' bf16 forward | <= its | `4.9e-6` against `4.7e-5` (`4.1e-6` before) |
+| real: cos vs transformers' bf16 (`emb_bf16.npy`) | >= `0.9996` (triangle inequality over two `1e-4` deficits) | `0.99989566` to `0.99997993` |
 | real: alone vs one ragged batch (>= 2 forwards) | `1e-5` | 0 (bit-identical) |
+| bf16 attention kernel vs the f64 reference of the exact inputs, 7 cases (D = 64, 256, 512; windows 1 to 512; padding, length 0, device lengths past T) | `6 sigma_x + 2e-5 max` per element, `sigma_x` derived from bf16's roundoff (header of `tests/embedgemma2_kernels.rs`) | worst element at `0.04` to `0.40` of its bound; max abs `6.2e-4` to `1.7e-2` (`5e-4` to `5.8e-3` of max) |
+| bf16 attention kernel vs the f64 reference of the bf16-rounded inputs (P's rounding alone) | `6 sigma_p + 2e-5 max` | worst element at `0.29` to `0.47` of its bound |
 
 transformers' bf16 forward rounds every activation, the residual stream
 included, which is why it sits at cosine `0.99990` to `0.99998` from fp32

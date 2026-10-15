@@ -1376,6 +1376,88 @@ fn per_entry_moment_host_copies_match_the_whole_table() {
 
 // ---- adversarial: per-entry moment host copies ----
 
+fn awkward_bits(n: usize, seed: u32) -> Vec<f32> {
+    const FIXED: [u32; 20] = [
+        0x3f80_8000,
+        0x3f81_8000,
+        0x3f80_8001,
+        0xbf80_8000,
+        0x7f7f_8000,
+        0x7f7f_ffff,
+        0xff7f_8000,
+        0x7f80_0000,
+        0xff80_0000,
+        0x7f80_0001,
+        0xff80_0001,
+        0x7fc0_0001,
+        0xffff_ffff,
+        0x0000_0001,
+        0x0000_8000,
+        0x0001_8000,
+        0x8000_0001,
+        0x0000_0000,
+        0x8000_0000,
+        0x007f_ffff,
+    ];
+    let mut s = seed | 1;
+    (0..n)
+        .map(|i| {
+            f32::from_bits(if i < FIXED.len() {
+                FIXED[i]
+            } else {
+                s ^= s << 13;
+                s ^= s >> 17;
+                s ^= s << 5;
+                s
+            })
+        })
+        .collect()
+}
+
+/// A bf16 moment written on the host stores the bits the GPU
+/// `write_adamw_moment` stores for the same f32 input (ties, overflow, NaN
+/// payloads, subnormals).
+#[test]
+fn bf16_moment_host_write_rounds_like_the_gpu_write_bit_for_bit() {
+    let (rt, model) = load_bf16();
+    let table = model.parameter_table().unwrap();
+    let cfg = AdamWConfig {
+        update: UpdateRule::F32Master,
+        moments: MomentStorage::Bf16,
+    };
+    let mut gpu = AdamW::with_config(&model, cfg).unwrap();
+    let mut host = AdamW::with_config(&model, cfg).unwrap();
+    for which in [Moment::First, Moment::Second] {
+        let vals: Vec<Vec<f32>> = table
+            .iter()
+            .enumerate()
+            .map(|(i, p)| awkward_bits(p.shape.iter().product(), 0x85eb_ca6b ^ i as u32))
+            .collect();
+        let ts = alloc_table(&rt, &table);
+        for (t, v) in ts.iter().zip(&vals) {
+            t.write_f32(v).unwrap();
+        }
+        model.write_adamw_moment(&mut gpu, which, &ts).unwrap();
+        for (i, v) in vals.iter().enumerate() {
+            model.write_adamw_moment_host(&mut host, which, i, v).unwrap();
+            let n = v.len();
+            let (mut a, mut b) = (vec![0.0f32; n], vec![0.0f32; n]);
+            model.read_adamw_moment_host(&gpu, which, i, &mut a).unwrap();
+            model.read_adamw_moment_host(&host, which, i, &mut b).unwrap();
+            let diff: Vec<(usize, u32, u32, u32)> = (0..n)
+                .filter(|&k| a[k].to_bits() != b[k].to_bits())
+                .map(|k| (k, v[k].to_bits(), a[k].to_bits(), b[k].to_bits()))
+                .take(4)
+                .collect();
+            assert!(
+                diff.is_empty(),
+                "{which:?} {}: (index, input, gpu, host) {diff:x?}",
+                table[i].name
+            );
+        }
+    }
+}
+
 /// An unwaited step is waited for by the per-entry reads (parameters and each
 /// moment storage), so they see the stepped values, not stale ones.
 #[test]

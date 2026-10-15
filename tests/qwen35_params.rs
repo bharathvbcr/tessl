@@ -474,6 +474,100 @@ fn per_entry_host_refusals_move_nothing() {
 
 // ---- adversarial: per-entry host writes against the GPU path ----
 
+/// Awkward f32 bit patterns first (bf16 ties both ways, overflow to infinity,
+/// quiet and signalling NaNs with payloads in the dropped bits, subnormals,
+/// signed zeros and infinities), then xorshift noise over all of f32's bits.
+fn awkward(n: usize, seed: u32) -> Vec<f32> {
+    const FIXED: [u32; 24] = [
+        0x3f80_8000,
+        0x3f81_8000,
+        0x3f80_8001,
+        0x3f80_7fff,
+        0xbf80_8000,
+        0xbf81_8000,
+        0x7f7f_8000,
+        0x7f7f_ffff,
+        0xff7f_8000,
+        0x7f80_0000,
+        0xff80_0000,
+        0x7f80_0001,
+        0xff80_0001,
+        0x7fc0_0001,
+        0x7fff_ffff,
+        0xffff_ffff,
+        0x7f80_8000,
+        0x0000_0001,
+        0x0000_8000,
+        0x0001_8000,
+        0x8000_0001,
+        0x0000_0000,
+        0x8000_0000,
+        0x007f_ffff,
+    ];
+    let mut s = seed | 1;
+    (0..n)
+        .map(|i| {
+            f32::from_bits(if i < FIXED.len() {
+                FIXED[i]
+            } else {
+                s ^= s << 13;
+                s ^= s >> 17;
+                s ^= s << 5;
+                s
+            })
+        })
+        .collect()
+}
+
+/// `write_parameter_host` and the GPU `write_parameters` must store the same
+/// bf16 bits for the same f32 input, whatever the input (ties, overflow, NaN
+/// payloads, subnormals): a host write that rounds differently from the
+/// training path would make a restored checkpoint differ from a trained one.
+#[test]
+fn host_write_rounds_like_the_gpu_write_bit_for_bit() {
+    let (rt, model) = load_tower(Precision::Bf16);
+    let table = model.parameter_table().unwrap();
+    let vals: Vec<Vec<f32>> = table
+        .iter()
+        .enumerate()
+        .map(|(i, p)| awkward(numel(p), 0x9e37_79b9 ^ i as u32))
+        .collect();
+    let ts = alloc(&rt, &table);
+    for (t, v) in ts.iter().zip(&vals) {
+        t.write_f32(v).unwrap();
+    }
+    model.write_parameters(&ts).unwrap();
+    let gpu: Vec<Vec<u32>> = table
+        .iter()
+        .enumerate()
+        .map(|(i, p)| {
+            let mut v = vec![0.0f32; numel(p)];
+            model.read_parameter_host(i, &mut v).unwrap();
+            bits(&v)
+        })
+        .collect();
+    // Reset every entry to something else so a no-op host write cannot pass.
+    for (i, p) in table.iter().enumerate() {
+        model.write_parameter_host(i, &vec![0.5; numel(p)]).unwrap();
+    }
+    for (i, p) in table.iter().enumerate() {
+        model.write_parameter_host(i, &vals[i]).unwrap();
+        let mut v = vec![0.0f32; numel(p)];
+        model.read_parameter_host(i, &mut v).unwrap();
+        let host = bits(&v);
+        let diff: Vec<(usize, u32, u32, u32)> = (0..host.len())
+            .filter(|&k| host[k] != gpu[i][k])
+            .map(|k| (k, vals[i][k].to_bits(), gpu[i][k], host[k]))
+            .take(4)
+            .collect();
+        assert!(
+            diff.is_empty(),
+            "{}: (index, input bits, gpu bits, host bits) {diff:x?}",
+            p.name
+        );
+    }
+}
+
 /// A poisoned runtime is an `Err` from every per-entry call, not a panic or a
 /// silent success, and a refused write leaves the parameters unmoved.
 #[test]

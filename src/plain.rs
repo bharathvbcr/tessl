@@ -73,29 +73,23 @@ pub(crate) fn le_to_native<T: PlainScalar>(dst: &mut [T]) {
 ///
 /// `File::open` on a FIFO with no writer blocks forever, and a character
 /// device or directory has no meaningful length to validate a header against.
-/// So the path is stat-ed first (following symlinks) and must be a regular
-/// file *before* the blocking open; the opened handle is then fstat-ed and
-/// must still be a regular file of the same length. Returns the handle and its
-/// length. A path swapped for a FIFO between the stat and the open can still
-/// block: closing that window needs `O_NONBLOCK`, whose constant is not in
-/// `std`, and no libc dependency is added for it.
+/// The open is `O_NONBLOCK`, which returns at once for a FIFO, and the handle
+/// is then fstat-ed and must be a regular file; the check is on the handle that
+/// is read, so no path swap can slip a FIFO past it. There is deliberately no
+/// stat before the open: it would add nothing the fstat does not decide.
+/// `O_NONBLOCK` has no effect on reads of a regular file, which is all that is
+/// kept. Returns the handle and its length.
 pub(crate) fn open_regular_file(path: &std::path::Path) -> Result<(std::fs::File, u64), String> {
+    use std::os::unix::fs::OpenOptionsExt;
     let what = path.display();
-    let before = std::fs::metadata(path).map_err(|e| format!("{what}: {e}"))?;
-    if !before.is_file() {
+    let f = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(path)
+        .map_err(|e| format!("{what}: {e}"))?;
+    let md = f.metadata().map_err(|e| format!("{what}: {e}"))?;
+    if !md.is_file() {
         return Err(format!("{what}: not a regular file"));
     }
-    let f = std::fs::File::open(path).map_err(|e| format!("{what}: {e}"))?;
-    let after = f.metadata().map_err(|e| format!("{what}: {e}"))?;
-    if !after.is_file() {
-        return Err(format!("{what}: not a regular file (replaced while opening)"));
-    }
-    if after.len() != before.len() {
-        return Err(format!(
-            "{what}: length changed while opening ({} then {} bytes)",
-            before.len(),
-            after.len()
-        ));
-    }
-    Ok((f, after.len()))
+    Ok((f, md.len()))
 }

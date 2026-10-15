@@ -1002,6 +1002,43 @@ mod adversarial {
         }
     }
 
+    /// The race the stat-first approach left open: a path that is a FIFO at
+    /// open time. A symlink retargeted from a regular file to a FIFO after a
+    /// reader checked it is the same situation, so this drives the open itself:
+    /// a symlink to a FIFO and a FIFO that replaces a regular file in place
+    /// are both refused without blocking.
+    #[test]
+    fn a_path_that_is_a_fifo_at_open_time_is_refused() {
+        let sc = Scratch::new("adv-fifo-swap");
+        let fifo = sc.0.join("real.fifo");
+        assert!(std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .unwrap()
+            .success());
+        let link = sc.0.join("link.bin");
+        std::os::unix::fs::symlink(&fifo, &link).unwrap();
+        let swapped = sc.write("swapped.bin", &st_seed());
+        std::fs::remove_file(&swapped).unwrap();
+        assert!(std::process::Command::new("mkfifo")
+            .arg(&swapped)
+            .status()
+            .unwrap()
+            .success());
+        for p in [link, swapped] {
+            let p1 = p.clone();
+            let st = timed(move || SafeTensors::open(&p1).map(|_| ()));
+            let p2 = p.clone();
+            let npy = timed(move || read_npy(&p2).map(|_| ()));
+            drop(std::fs::OpenOptions::new().read(true).write(true).open(&fifo));
+            for (name, r) in [("SafeTensors::open", st), ("read_npy", npy)] {
+                let r = r.unwrap_or_else(|| panic!("{name} on {} blocked", p.display()));
+                let e = r.expect_err("a FIFO must be refused");
+                assert!(e.contains("not a regular file"), "{name}: {e}");
+            }
+        }
+    }
+
     /// A header exactly at the cap is read; one byte more is refused, and in
     /// both cases the one big allocation is the header itself.
     #[test]

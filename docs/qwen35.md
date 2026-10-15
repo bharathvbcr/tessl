@@ -363,7 +363,13 @@ float `select`, may be optimised away.
   masked score's weight is zeroed by its mask, not by its value. A row with
   no key saves `FLT_MAX` as its log-sum-exp, and the backward gives that row
   no probability. Plain max reductions seed from the row's own data.
-  `tests/kernel_fast_math.rs` fails on any `INFINITY` left in kernel code.
+  `tests/kernel_fast_math.rs` fails on any `INFINITY`, `NAN`, `HUGE_VAL`,
+  `MAXFLOAT`, `__builtin_inf`/`__builtin_nan`, `numeric_limits` inf/NaN,
+  inf/NaN bit casts, `isunordered` or self-comparison (`v != v`, which fast
+  math folds to a constant) left in kernel code, and `scripts/check_kernel_ir.sh`
+  checks the compiled IR for inf/NaN constants and unordered compares.
+  `isfinite`/`isnan`/`isinf` are allowed: Metal defines them as integer tests
+  on the bit pattern, which fast math cannot fold.
 - **Chunk-local cumulative decay** is summed in fp32, as transformers sums it.
   After a step with a large decay, later small differences `G_i − G_j` lose
   relative precision, in both implementations alike. The token-by-token decode
@@ -612,9 +618,14 @@ past `max_new` is refused, and a step that fails part way leaves the
 session refusing further steps rather than continuing from half-advanced
 state. A session, like a `Staged` prefill, records the model's parameter
 generation and refuses to continue once `write_parameters`,
-`write_parameter_host` or `adamw_step` has moved it, as a pending training step does. `prefill` checks the state
-it will keep against the device's recommended working set before any GPU
-work, as a training step checks its own. One sequence, batch 1.
+`write_parameter_host` or `adamw_step` has moved it, as a pending training step does. Before any GPU work,
+`prefill` checks everything it allocates against the device's recommended
+working set: the state the session keeps, the prefill's own activations for
+every token (with the GDN workspace), the decode activations and the logits.
+`forward` and `begin` make the same check on their activations (decided: all
+three entry points are checked, as a training step checks its own; tests in
+`tests/qwen35_model.rs`, `a_prefill_counts_its_own_activations_against_the_working_set`).
+One sequence, batch 1.
 
 Beyond the fixture, the stress tests in the same file decode 40 random
 shapes (1 to 5 layers in any order, every conv width 2 to 8, grouped GDN

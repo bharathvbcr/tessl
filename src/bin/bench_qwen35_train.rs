@@ -102,7 +102,7 @@ use tessl::qwen35_bwd::{
 };
 use tessl::qwen35_model::{Precision, Qwen35Config, Qwen35Model};
 use tessl::qwen35_train::{Qwen35Grads, Supervise};
-use tessl::safetensors::SafeTensors;
+use tessl::safetensors::CheckpointView;
 use tessl::tensor::{f32_slice_to_bf16, GpuBuffer};
 use tessl::{DType, GpuRuntime, Tensor};
 
@@ -669,7 +669,7 @@ fn load_model(rt: &Arc<GpuRuntime>, precision: Precision, random_config: Option<
 fn load_2b(rt: &Arc<GpuRuntime>, precision: Precision) -> Res<Qwen35Model> {
     let path = std::env::var("QWEN35_2B_SAFETENSORS")
         .map_err(|_| "--step and --batch need QWEN35_2B_SAFETENSORS (the Qwen3.5-2B-Base .safetensors)".to_string())?;
-    let st = SafeTensors::open(std::path::Path::new(&path))?;
+    let st = CheckpointView::open(std::path::Path::new(&path))?;
     let (prefix, cfg) = ("model.language_model.", Qwen35Config::qwen35_2b()?);
     match precision {
         Precision::F32 => Qwen35Model::load(rt, &st, prefix, cfg, precision),

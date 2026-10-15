@@ -22,7 +22,7 @@ mod common;
 
 use tessl::embedgemma2::{EmbedGemma2Config, EmbedGemma2Model};
 use tessl::qwen35_model::{Precision, Qwen35Config, Qwen35Model};
-use tessl::safetensors::SafeTensors;
+use tessl::safetensors::{CheckpointView, SafeTensors};
 use tessl::GpuRuntime;
 
 type Res<T> = Result<T, String>;
@@ -104,7 +104,7 @@ fn main() -> Res<()> {
     let precision = precision.ok_or("pass --bf16 or --f32")?;
 
     let rt = GpuRuntime::new()?;
-    let st = SafeTensors::open(std::path::Path::new(&path))?;
+    let st = CheckpointView::open(std::path::Path::new(&path))?;
     let before = peak_rss()?;
     let dev0 = rt.current_allocated_bytes();
     let cfg = Qwen35Config::qwen35_2b()?;

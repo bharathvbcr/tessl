@@ -32,7 +32,7 @@ use std::path::PathBuf;
 
 use crate::json::{self, Syntax};
 use crate::npy::read_npy;
-use crate::safetensors::{Dtype, SafeTensors};
+use crate::safetensors::{CheckpointView, Dtype, SafeTensors, TensorSource, INDEX_FILE_NAME};
 
 // ---------------------------------------------------------------- allocation
 
@@ -702,6 +702,70 @@ fn safetensors_hostile_headers_are_named_errors() {
         }
         if o.ok {
             f.add("safetensors", &label, "a hostile file was accepted".into());
+        }
+    }
+    f.finish(total);
+}
+
+// ------------------------------------------------------- sharded index
+
+const INDEX_SEED: &str = r#"{"metadata":{"total_size":53},"weight_map":{"a.f32":"s1.safetensors","b.bf16":"s2.safetensors","c.u8":"s1.safetensors","d.i64":"s2.safetensors"}}"#;
+
+/// The two shards `INDEX_SEED` names, written under `dir`: the seed file's
+/// four tensors split in pairs.
+fn write_index_shards(scratch: &Scratch) {
+    let s1 = r#"{"a.f32":{"dtype":"F32","shape":[2,3],"data_offsets":[0,24]},"c.u8":{"dtype":"U8","shape":[5],"data_offsets":[24,29]}}"#;
+    let s2 = r#"{"b.bf16":{"dtype":"BF16","shape":[4],"data_offsets":[0,8]},"d.i64":{"dtype":"I64","shape":[2],"data_offsets":[8,24]}}"#;
+    scratch.write("s1.safetensors", &st_bytes(s1, 29));
+    scratch.write("s2.safetensors", &st_bytes(s2, 24));
+}
+
+/// Open the mutated index over its shards; an accepted checkpoint must read
+/// every tensor back whole through the view.
+fn check_index(bytes: &[u8], scratch: &Scratch) -> Outcome {
+    let input = bytes.to_vec();
+    run(input.len(), || {
+        scratch.write(INDEX_FILE_NAME, &input);
+        let view = CheckpointView::open(&scratch.0)?;
+        let names: Vec<String> = view.names().map(str::to_string).collect();
+        if view.shard_count() > 2 || names.is_empty() {
+            return Err(Fail::Inconsistent(format!(
+                "{} shards, names {names:?}",
+                view.shard_count()
+            )));
+        }
+        for n in names {
+            let bad = |e: String| Fail::Inconsistent(format!("{n}: {e}"));
+            if n == "b.bf16" {
+                view.read_bf16_bits(&n).map_err(bad)?;
+            } else if n == "a.f32" {
+                view.read_f32(&n).map_err(bad)?;
+            } else if n != "c.u8" && n != "d.i64" {
+                return Err(Fail::Inconsistent(format!("unexpected tensor {n:?}")));
+            }
+        }
+        Ok(())
+    })
+}
+
+#[test]
+fn sharded_index_survives_mutation() {
+    let scratch = Scratch::new("index");
+    write_index_shards(&scratch);
+    let seed_bytes = INDEX_SEED.as_bytes();
+    let o = check_index(seed_bytes, &scratch);
+    assert!(o.ok, "the index seed must open: {:?} {:?}", o.err, o.violations);
+    let mut f = Failures::default();
+    let all = mutations(seed_bytes, seed(), cases());
+    let total = all.len();
+    for (label, b) in all {
+        let o = check_index(&b, &scratch);
+        let mut violations = o.violations;
+        if label.starts_with("truncate") && o.ok {
+            violations.push("a strict truncation of the index was accepted".into());
+        }
+        for v in violations {
+            f.add("index", &label, v);
         }
     }
     f.finish(total);

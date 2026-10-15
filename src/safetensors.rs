@@ -374,6 +374,256 @@ impl SafeTensors {
     }
 }
 
+/// What a model loader reads tensors through: one `.safetensors` file
+/// ([`SafeTensors`]) or a sharded checkpoint ([`CheckpointView`]). The strict
+/// per-name checks (dtype, shape, whole-tensor reads) live in the readers;
+/// the loader above adds `refuse_unread` over [`Self::names`], so both apply
+/// per name across every shard.
+pub trait TensorSource {
+    /// Every tensor name, sorted.
+    fn names(&self) -> Box<dyn Iterator<Item = &str> + '_>;
+    /// See [`SafeTensors::read_f32`].
+    fn read_f32(&self, name: &str) -> Result<(Vec<usize>, Vec<f32>), String>;
+    /// See [`SafeTensors::read_bf16_bits`].
+    fn read_bf16_bits(&self, name: &str) -> Result<(Vec<usize>, Vec<u16>), String>;
+    /// [`Self::read_f32`] into `dst`, after checking the dtype and `shape`.
+    fn read_f32_into(&self, name: &str, shape: &[usize], dst: &mut [f32]) -> Result<(), String>;
+    /// [`Self::read_bf16_bits`] into `dst`, after checking the dtype and `shape`.
+    fn read_bf16_bits_into(&self, name: &str, shape: &[usize], dst: &mut [u16]) -> Result<(), String>;
+}
+
+impl TensorSource for SafeTensors {
+    fn names(&self) -> Box<dyn Iterator<Item = &str> + '_> {
+        Box::new(SafeTensors::names(self))
+    }
+    fn read_f32(&self, name: &str) -> Result<(Vec<usize>, Vec<f32>), String> {
+        SafeTensors::read_f32(self, name)
+    }
+    fn read_bf16_bits(&self, name: &str) -> Result<(Vec<usize>, Vec<u16>), String> {
+        SafeTensors::read_bf16_bits(self, name)
+    }
+    fn read_f32_into(&self, name: &str, shape: &[usize], dst: &mut [f32]) -> Result<(), String> {
+        SafeTensors::read_f32_into(self, name, shape, dst)
+    }
+    fn read_bf16_bits_into(&self, name: &str, shape: &[usize], dst: &mut [u16]) -> Result<(), String> {
+        SafeTensors::read_bf16_bits_into(self, name, shape, dst)
+    }
+}
+
+/// The index a sharded Hugging Face checkpoint ships beside its shards.
+pub const INDEX_FILE_NAME: &str = "model.safetensors.index.json";
+
+/// Largest index accepted: a 9B's is about 100 KB.
+const MAX_INDEX_BYTES: u64 = 16 << 20;
+
+/// The index's JSON: `{"metadata": {..}, "weight_map": {name: file}}`, two
+/// container levels, integers only.
+const INDEX_SYNTAX: Syntax = Syntax {
+    what: "index JSON",
+    max_depth: 2,
+    uints_only: true,
+    literals: false,
+};
+
+/// A checkpoint's tensors across one or several `.safetensors` files, each
+/// name resolved through the index's `weight_map`.
+///
+/// [`Self::open`] validates everything before any tensor is read: the index
+/// parses strictly; every shard path is a plain file name that, after
+/// symlinks, stays inside the checkpoint directory; every shard exists and is
+/// a valid `.safetensors` file; every `weight_map` name is in the shard it
+/// names; and every tensor in a shard is in the `weight_map` for that shard
+/// (so a name present in two shards is refused, not shadowed). A single
+/// `.safetensors` file opens as a one-shard view.
+#[derive(Debug)]
+pub struct CheckpointView {
+    what: String,
+    shards: Vec<SafeTensors>,
+    /// Tensor name -> index into `shards`.
+    owner: BTreeMap<String, usize>,
+}
+
+impl CheckpointView {
+    /// Open `path`: a `.safetensors` file, a `model.safetensors.index.json`
+    /// (or any `*.json` index), or a checkpoint directory holding an index
+    /// or, failing that, `model.safetensors`.
+    pub fn open(path: &Path) -> Result<Self, String> {
+        let what = path.display().to_string();
+        let md = std::fs::metadata(path).map_err(|e| format!("{what}: {e}"))?;
+        if md.is_dir() {
+            let index = path.join(INDEX_FILE_NAME);
+            return match std::fs::symlink_metadata(&index) {
+                Ok(_) => Self::open_index(&index),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    Self::open_single(&path.join("model.safetensors"))
+                }
+                Err(e) => Err(format!("{}: {e}", index.display())),
+            };
+        }
+        if path.extension().is_some_and(|e| e == "json") {
+            Self::open_index(path)
+        } else {
+            Self::open_single(path)
+        }
+    }
+
+    /// Number of `.safetensors` files behind the view.
+    pub fn shard_count(&self) -> usize {
+        self.shards.len()
+    }
+
+    fn open_single(path: &Path) -> Result<Self, String> {
+        let st = SafeTensors::open(path)?;
+        let owner = st.names().map(|n| (n.to_string(), 0)).collect();
+        Ok(Self {
+            what: path.display().to_string(),
+            shards: vec![st],
+            owner,
+        })
+    }
+
+    fn open_index(index_path: &Path) -> Result<Self, String> {
+        let what = index_path.display().to_string();
+        let dir = match index_path.parent() {
+            Some(d) if !d.as_os_str().is_empty() => d,
+            _ => Path::new("."),
+        };
+        let dir = std::fs::canonicalize(dir).map_err(|e| format!("{what}: checkpoint directory: {e}"))?;
+        let (f, len) = plain::open_regular_file(index_path)?;
+        if len > MAX_INDEX_BYTES {
+            return Err(format!(
+                "{what}: {len} bytes, above the {MAX_INDEX_BYTES}-byte index cap"
+            ));
+        }
+        let mut text = String::new();
+        f.take(MAX_INDEX_BYTES)
+            .read_to_string(&mut text)
+            .map_err(|e| format!("{what}: {e}"))?;
+        let by_file = parse_index(&text).map_err(|e| format!("{what}: {e}"))?;
+
+        // Resolve and confine every shard before opening any.
+        let mut paths: Vec<(&String, std::path::PathBuf)> = Vec::with_capacity(by_file.len());
+        for (file, names) in &by_file {
+            let resolved = confine(&dir, file, &names[0]).map_err(|e| format!("{what}: {e}"))?;
+            if let Some((other, _)) = paths.iter().find(|(_, p)| *p == resolved) {
+                return Err(format!("{what}: {file:?} and {other:?} are the same file"));
+            }
+            paths.push((file, resolved));
+        }
+
+        let mut shards = Vec::with_capacity(paths.len());
+        let mut owner = BTreeMap::new();
+        for (i, ((file, path), names)) in paths.iter().zip(by_file.values()).enumerate() {
+            let st = SafeTensors::open(path)?;
+            for n in names {
+                if st.info(n).is_err() {
+                    return Err(format!(
+                        "{what}: weight_map puts {n:?} in {file:?}, which has no such tensor"
+                    ));
+                }
+            }
+            for n in st.names() {
+                if names.binary_search_by(|m| m.as_str().cmp(n)).is_err() {
+                    let elsewhere = by_file.iter().find(|(_, ns)| ns.iter().any(|m| m == n));
+                    return Err(match elsewhere {
+                        Some((other, _)) => format!("{what}: tensor {n:?} is in both {file:?} and {other:?}"),
+                        None => format!("{what}: {file:?} holds tensor {n:?}, which the weight_map does not list"),
+                    });
+                }
+                owner.insert(n.to_string(), i);
+            }
+            shards.push(st);
+        }
+        Ok(Self { what, shards, owner })
+    }
+
+    fn shard(&self, name: &str) -> Result<&SafeTensors, String> {
+        match self.owner.get(name) {
+            Some(&i) => Ok(&self.shards[i]),
+            None => Err(format!("{}: no tensor {name:?}", self.what)),
+        }
+    }
+}
+
+impl TensorSource for CheckpointView {
+    fn names(&self) -> Box<dyn Iterator<Item = &str> + '_> {
+        Box::new(self.owner.keys().map(String::as_str))
+    }
+    fn read_f32(&self, name: &str) -> Result<(Vec<usize>, Vec<f32>), String> {
+        self.shard(name)?.read_f32(name)
+    }
+    fn read_bf16_bits(&self, name: &str) -> Result<(Vec<usize>, Vec<u16>), String> {
+        self.shard(name)?.read_bf16_bits(name)
+    }
+    fn read_f32_into(&self, name: &str, shape: &[usize], dst: &mut [f32]) -> Result<(), String> {
+        self.shard(name)?.read_f32_into(name, shape, dst)
+    }
+    fn read_bf16_bits_into(&self, name: &str, shape: &[usize], dst: &mut [u16]) -> Result<(), String> {
+        self.shard(name)?.read_bf16_bits_into(name, shape, dst)
+    }
+}
+
+/// The `weight_map` grouped by shard file: file -> its tensor names, sorted.
+fn parse_index(text: &str) -> Result<BTreeMap<String, Vec<String>>, String> {
+    let Json::Object(top) = json::parse(text, INDEX_SYNTAX)? else {
+        return Err("index is not a JSON object".into());
+    };
+    let mut weight_map = None;
+    for (k, v) in top {
+        match (k.as_str(), v) {
+            ("metadata", Json::Object(_)) => {}
+            ("weight_map", Json::Object(entries)) => weight_map = Some(entries),
+            (k, _) => return Err(format!("unexpected or mistyped field {k:?}")),
+        }
+    }
+    let entries = weight_map.ok_or("no weight_map")?;
+    if entries.is_empty() {
+        return Err("weight_map is empty".into());
+    }
+    let mut by_file: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for (name, file) in entries {
+        let Json::Str(file) = file else {
+            return Err(format!("weight_map entry {name:?} is not a file name"));
+        };
+        by_file.entry(file).or_default().push(name);
+    }
+    for names in by_file.values_mut() {
+        names.sort_unstable();
+    }
+    Ok(by_file)
+}
+
+/// `dir/file` after symlinks, refusing anything but a plain file name (no
+/// absolute path, `..`, `.` or separator) whose target leaves `dir` (already
+/// canonical) or is missing. `tensor` names who asked for the file.
+fn confine(dir: &Path, file: &str, tensor: &str) -> Result<std::path::PathBuf, String> {
+    use std::path::Component;
+    let mut comps = Path::new(file).components();
+    match (comps.next(), comps.next()) {
+        (Some(Component::Normal(c)), None) if c == std::ffi::OsStr::new(file) => {}
+        _ => {
+            return Err(format!(
+                "shard {file:?} (for {tensor:?}) is not a plain file name in the checkpoint directory"
+            ))
+        }
+    }
+    let joined = dir.join(file);
+    let resolved = std::fs::canonicalize(&joined).map_err(|e| {
+        format!(
+            "shard {file:?} (for {tensor:?}) cannot be resolved in {}: {e}",
+            dir.display()
+        )
+    })?;
+    if !resolved.starts_with(dir) {
+        return Err(format!(
+            "shard {file:?} (for {tensor:?}) resolves to {}, outside the checkpoint directory {}",
+            resolved.display(),
+            dir.display()
+        ));
+    }
+    Ok(resolved)
+}
+
 /// Widen the `n` little-endian 16-bit values at `bytes[2n..4n]` into the `n`
 /// native-endian f32s at `bytes[..4n]`, front to back (see
 /// [`SafeTensors::read_f32`] for why that order never overwrites an unread

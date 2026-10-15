@@ -67,7 +67,7 @@ use crate::qwen35_model::{Precision, Qwen35Config, Qwen35Model};
 use crate::qwen35_params::ParamInfo;
 use crate::qwen35_train::{PendingStep, Qwen35Grads, Supervise};
 use crate::runtime::GpuRuntime;
-use crate::safetensors::SafeTensors;
+use crate::safetensors::CheckpointView;
 use crate::tensor::{DType, Tensor};
 
 pub const TESSL_OK: i32 = 0;
@@ -986,7 +986,9 @@ unsafe fn c_str<'a>(s: *const c_char, what: &str) -> Result<&'a str, String> {
 /// with its matrices stored in bf16 ([`TESSL_BF16`]; f32 arithmetic, and its
 /// steps take [`TESSL_OPERANDS_BF16`]).
 ///
-/// `safetensors` is the `.safetensors` file, `config_json` its `config.json`
+/// `safetensors` is the `.safetensors` file, or a sharded checkpoint's
+/// `model.safetensors.index.json` or its directory (every shard is then read
+/// through the index's `weight_map`), `config_json` its `config.json`
 /// (with or without `text_config`), and `prefix` the tensor-name prefix
 /// (`"model.language_model."` in the Qwen3.5 checkpoints). Free the handle
 /// with [`tessl_qwen35_free`], on this thread.
@@ -1025,7 +1027,7 @@ pub unsafe extern "C" fn tessl_qwen35_load(
             let prefix = c_str(prefix, "prefix").map_err(|e| format!("{WHAT}: {e}"))?;
             let precision = parse_precision(precision, WHAT)?;
             let cfg = Qwen35Config::from_config_file(std::path::Path::new(config))?;
-            let st = SafeTensors::open(std::path::Path::new(path))?;
+            let st = CheckpointView::open(std::path::Path::new(path))?;
             // A bf16 model trains as the tower alone: nothing here reads the
             // packed LM head `load` adds.
             let model = match precision {

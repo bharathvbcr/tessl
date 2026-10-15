@@ -229,6 +229,7 @@ pub mod cross_entropy;
 pub mod decode_icb;
 pub mod dispatch;
 pub mod embedgemma2;
+pub mod embedgemma2_audio;
 pub mod gdn_train;
 pub mod gemm;
 pub mod icb_smoke;

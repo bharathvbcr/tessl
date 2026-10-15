@@ -22,6 +22,10 @@ pub mod qwen35;
 /// fixture, and composable into a whole forward.
 pub mod embedgemma2;
 
+/// f64 references for EmbeddingGemma 2's audio tower, written as transformers
+/// writes the chunked attention, and composable into a whole host forward.
+pub mod embedgemma2_audio;
+
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use tessl::tensor::{bf16_bits_to_f32, f32_slice_to_bf16, GpuBuffer};

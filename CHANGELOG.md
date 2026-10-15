@@ -8,6 +8,22 @@ All notable changes to `tessl` are recorded here. The format follows
 
 ### Added
 
+- **EmbeddingGemma 2 vision tower and multimodal embedder**
+  (`tessl::embedgemma2_vision`: `VisionConfig`, `EmbedGemma2VisionModel::{load,
+  encode_images}`, `ImageInput`, `plan_pooling`). The 16-layer ViT
+  (`vision_tower.*`) and `embed_vision.*` map the processor's patches and
+  positions to the 512-wide soft tokens the text encoder consumes: exact-f32,
+  strict loader, ragged batches of images in one forward (padding patches
+  stripped on the host, keys masked), several forwards behind one wait. Three
+  new kernels in `kernels/embedgemma2_vision.metal`
+  (`vision_qkv_norm_rope_f32`: the 2-D axial RoPE with the q/k/v norms and the
+  K/V store; `vision_pos_embed_add_f32`; `vision_pool_members_f32`: the
+  `k x k` average by patch position times `sqrt(hidden)`); everything else is
+  existing kernels (`encoder_attn` at head dim 64, `rms_norm_f32` with a weight
+  of ones for the embedder's weightless norm). Against sentence-transformers
+  (fp32, CPU) at 2520 patches: every layer within `3e-5` of its largest
+  magnitude, pooled and soft tokens within `1e-4`, batched bit-identical to
+  alone. See `docs/embedgemma2.md`.
 - **Per-entry host reads and writes of the Qwen3.5 parameter table**
   (`Qwen35Model::{read_parameter_host, write_parameter_host,
   read_gradient_host, read_adamw_moment_host, write_adamw_moment_host}`).

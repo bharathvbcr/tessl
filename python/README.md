@@ -128,9 +128,15 @@ checks them all before writing any, and accepts any layout, dtype or device.
 An f32 model runs entirely in f32, the tied embedding included, so a write
 is exact and the parameters torch holds are the ones tessl differentiates; a
 bf16 model rounds the matrices it is given to nearest.
-Every read and write
-is a GPU copy of the whole model (about 8 GB of f32 each way on the 2B), and
-torch holds its own copy of the parameters and gradients beside tessl's.
+`parameters()` and
+`load_parameters()` are GPU copies of the whole model (about 8 GB of f32 each
+way on the 2B), and torch holds its own copy of the parameters and gradients
+beside tessl's. To read or set one parameter, use `read_parameter(name)` and
+`write_parameter(name, value)`: they move only that parameter's bytes, on the
+host (`tessl_qwen35_read_parameter_host` / `write_parameter_host`, which are
+`Qwen35Model::read_parameter_host` / `write_parameter_host`), with no GPU copy
+and no wait on torch's queue. `read_parameter` returns a CPU tensor unless you
+pass `device=`; `write_parameter` is refused while a step is pending.
 
 ## Handle ownership, closing and errors
 
@@ -181,11 +187,38 @@ same pointer ATen's `getMTLBufferStorage` bit-casts, and
 checks each view against the storage's size, because the MTLBuffer is larger
 (torch rounds allocations up) and tessl can only see the buffer.
 
-torch's stream and tessl's queue are separate. Each call runs
-`torch.mps.synchronize()` before tessl reads anything and returns only after
-tessl's queue has finished, so the two never touch a buffer at once. That is
-correct, not fast: two GPU waits per call. Sharing an `MTLSharedEvent`
-instead would remove them.
+torch's stream and tessl's queue are separate, and each side's wait is
+there for a reason:
+
+- **torch to tessl.** A call that gives tessl a torch buffer (cross-entropy,
+  GDN, `hidden`, `copy`, and `train_backward` with a `dh`) first runs
+  `torch.mps.synchronize()`, once, so tessl never reads a buffer torch is
+  still writing. Calls that pass only host arrays (`train_step`,
+  `train_forward`, `adamw_step`, `train_backward` without `dh`) do not wait on
+  torch at all. This stays a CPU wait: a shared-event handoff would need
+  torch to signal an `MTLSharedEvent` tessl then waits on, and torch 2.14
+  has no way to do that (`torch.mps.Event` owns an event Python cannot
+  share, and nothing encodes a wait or signal for an external one). Signalling
+  tessl's own event from torch is not an option either; tessl's lifetime
+  decisions read a private event, and `GpuRuntime::shared_event()` is the
+  separate handoff event, so a foreign signal cannot make tessl free memory
+  early.
+- **tessl to torch.** Every call returns only after tessl's queue is idle, on
+  failure as well as on success. The runtime batches a call's kernels
+  (async encode, switched on per runtime by
+  `tessl_runtime_set_async_encode`, ABI 12) and waits **once**, where it used
+  to wait after every kernel. The wait on the failure path is a memory-safety
+  requirement: when a call raises, Python drops its temporaries and torch's
+  MPS allocator may hand their storage to someone else, so tessl work still
+  in flight for the refused call would write into memory that is no longer
+  the caller's. A refused call therefore finishes what it already submitted
+  before the error is raised (a runtime already poisoned refuses the wait;
+  its work is released when the runtime is closed).
+
+The library's own default is synchronous encode (one waited commit per
+kernel); `tessl_torch` turns async encode on for the runtimes it creates.
+Per-call and per-step costs of both settings are in
+`bench/results/capi_*`.
 
 ## Build and test
 

@@ -14,19 +14,20 @@ use std::sync::Arc;
 use common::{random_f32, with_gpu};
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
-use objc2_metal::{MTLBuffer, MTLDevice, MTLResourceOptions};
+use objc2_metal::{MTLBuffer, MTLDevice, MTLResourceOptions, MTLSharedEvent};
 use tessl::capi::{
     tessl_abi_version, tessl_cross_entropy_rows, tessl_gdn_train_backward, tessl_gdn_train_forward,
     tessl_mtl_buffer_length, tessl_qwen35_adamw_free, tessl_qwen35_adamw_init, tessl_qwen35_adamw_set_step_count,
     tessl_qwen35_adamw_step, tessl_qwen35_adamw_step_count, tessl_qwen35_copy, tessl_qwen35_describe,
     tessl_qwen35_free, tessl_qwen35_grad_sq_norm, tessl_qwen35_hidden, tessl_qwen35_load, tessl_qwen35_param_count,
-    tessl_qwen35_param_info, tessl_qwen35_train_backward, tessl_qwen35_train_discard, tessl_qwen35_train_forward,
-    tessl_qwen35_train_step, tessl_runtime_free, tessl_runtime_new, tessl_runtime_poisoned, tessl_synchronize,
-    TesslCeArgs, TesslGdnArgs, TesslParamInfo, TesslQwen35, TesslRuntime, TesslTensorRef, TESSL_ABI_VERSION,
-    TESSL_BF16, TESSL_ERR, TESSL_F16, TESSL_F32, TESSL_MAX_DIMS, TESSL_MOMENTS_BLOCK8, TESSL_MOMENTS_F32, TESSL_OK,
-    TESSL_OPERANDS_BF16, TESSL_OPERANDS_EXACT_F32, TESSL_READ_ADAMW_AUX, TESSL_READ_ADAMW_M, TESSL_READ_ADAMW_V,
-    TESSL_READ_GRADS, TESSL_READ_PARAMS, TESSL_SUPERVISE_CAUSAL, TESSL_SUPERVISE_ROWS, TESSL_UPDATE_BF16_KAHAN,
-    TESSL_UPDATE_F32, TESSL_WRITE_ADAMW_AUX, TESSL_WRITE_ADAMW_M, TESSL_WRITE_ADAMW_V, TESSL_WRITE_PARAMS,
+    tessl_qwen35_param_info, tessl_qwen35_read_parameter_host, tessl_qwen35_train_backward, tessl_qwen35_train_discard,
+    tessl_qwen35_train_forward, tessl_qwen35_train_step, tessl_qwen35_write_parameter_host, tessl_runtime_free,
+    tessl_runtime_new, tessl_runtime_poisoned, tessl_runtime_set_async_encode, tessl_synchronize, TesslCeArgs,
+    TesslGdnArgs, TesslParamInfo, TesslQwen35, TesslRuntime, TesslTensorRef, TESSL_ABI_VERSION, TESSL_BF16, TESSL_ERR,
+    TESSL_F16, TESSL_F32, TESSL_MAX_DIMS, TESSL_MOMENTS_BLOCK8, TESSL_MOMENTS_F32, TESSL_OK, TESSL_OPERANDS_BF16,
+    TESSL_OPERANDS_EXACT_F32, TESSL_READ_ADAMW_AUX, TESSL_READ_ADAMW_M, TESSL_READ_ADAMW_V, TESSL_READ_GRADS,
+    TESSL_READ_PARAMS, TESSL_SUPERVISE_CAUSAL, TESSL_SUPERVISE_ROWS, TESSL_UPDATE_BF16_KAHAN, TESSL_UPDATE_F32,
+    TESSL_WRITE_ADAMW_AUX, TESSL_WRITE_ADAMW_M, TESSL_WRITE_ADAMW_V, TESSL_WRITE_PARAMS,
 };
 use tessl::cross_entropy::{cross_entropy_rows, CeGrads, CeHidden, CeWorkspace, Reduction};
 use tessl::gemm::GemmOperands;
@@ -2561,4 +2562,319 @@ fn hostile_gdn_args_are_refused_and_leave_outputs_untouched() {
         assert_eq!(s, TESSL_OK, "{m}");
         assert!(read(&dq, b * t * h * 128).iter().all(|x| x.is_finite()));
     });
+}
+
+fn set_async(handle: &Handle, on: u32) -> i32 {
+    let mut err = [0 as c_char; ERR_LEN];
+    unsafe { tessl_runtime_set_async_encode(handle.0, on, err.as_mut_ptr(), ERR_LEN) }
+}
+
+/// The runtime's two timelines say nothing is in flight: tessl has seen every
+/// commit it signaled complete, and the handoff event (signaled behind the
+/// lifetime event) has reached the last of them. This is what a torch caller
+/// waits on, so it is the contract `guarded` owes on every return.
+fn assert_idle(rt: &GpuRuntime, what: &str) {
+    let last = rt.last_signaled_value();
+    // Non-blocking: the lifetime event alone says whether tessl still has work out.
+    assert_eq!(rt.last_completed_value(), last, "{what}: tessl work in flight");
+    assert!(
+        rt.shared_event().waitUntilSignaledValue_timeoutMS(last, 5_000),
+        "{what}: the handoff event never reached {last}"
+    );
+}
+
+/// A call that fails after it encoded work returns only after that work is
+/// done. With async encode on the kernels of a call are batched and not waited
+/// one by one, so a failure past the first kernel leaves a batch open or in
+/// flight; a caller that sees the refusal frees the buffers those kernels use
+/// (torch recycles a dropped tensor's storage), so the work must be finished
+/// first.
+#[test]
+fn a_call_that_fails_after_encoding_returns_only_after_its_work_completes() {
+    let handle = Handle::new();
+    assert_eq!(set_async(&handle, 1), TESSL_OK);
+    let rt = unsafe { tessl::capi::test_runtime(handle.0) };
+    assert!(rt.async_encode_enabled());
+    let n = 4096usize;
+    let src = rt.alloc_buffer(n * 4).unwrap();
+    let dst = rt.alloc_buffer(n * 4).unwrap();
+    src.write_f32(&(0..n).map(|i| i as f32 + 1.0).collect::<Vec<_>>());
+    dst.write_f32(&vec![0.0; n]);
+    let pipe = rt.pipeline("copy_f32").unwrap();
+    let mut err = [0 as c_char; ERR_LEN];
+    let status = unsafe {
+        tessl::capi::test_guarded(handle.0, err.as_mut_ptr(), ERR_LEN, |rt| {
+            rt.with_binder(|bnd| {
+                bnd.set_pipeline(&pipe);
+                bnd.bind_gpu_buf(&src, 0);
+                bnd.bind_gpu_buf(&dst, 1);
+                bnd.bind_u32(n as u32, 2);
+                bnd.dispatch(
+                    tessl::runtime::mtl_size(n / 64, 1, 1),
+                    tessl::runtime::mtl_size(64, 1, 1),
+                );
+                Ok(())
+            })?;
+            Err("refused after encoding".to_string())
+        })
+    };
+    assert_eq!(status, TESSL_ERR);
+    assert!(msg(&err).contains("refused after encoding"), "{}", msg(&err));
+    // The copy ran: the failing call did not return with it uncommitted.
+    let got = dst.read_f32();
+    assert_eq!(got[0], 1.0, "the encoded copy had not run when the call returned");
+    assert_eq!(got[n - 1], n as f32);
+    assert_idle(&rt, "a refused call");
+    assert_eq!(rt.handoff_foreign_signal(), None);
+    // A panic after encoding is waited for too.
+    dst.write_f32(&vec![0.0; n]);
+    let status = unsafe {
+        tessl::capi::test_guarded(handle.0, err.as_mut_ptr(), ERR_LEN, |rt| {
+            rt.with_binder(|bnd| {
+                bnd.set_pipeline(&pipe);
+                bnd.bind_gpu_buf(&src, 0);
+                bnd.bind_gpu_buf(&dst, 1);
+                bnd.bind_u32(n as u32, 2);
+                bnd.dispatch(
+                    tessl::runtime::mtl_size(n / 64, 1, 1),
+                    tessl::runtime::mtl_size(64, 1, 1),
+                );
+                Ok(())
+            })?;
+            panic!("bug after encoding")
+        })
+    };
+    assert_eq!(status, tessl::capi::TESSL_PANIC);
+    assert!(msg(&err).contains("bug after encoding"), "{}", msg(&err));
+    assert_eq!(dst.read_f32()[n - 1], n as f32, "the encoded copy had not run");
+    assert_idle(&rt, "a panicking call");
+}
+
+/// The card's scenario through the real entry points: a bad `dh` shape on
+/// `train_backward` after a forward, async encode on. The refusal comes before
+/// any kernel (the arguments are checked first), so this pins that the
+/// runtime is idle on return and the pending step survives; the test above
+/// covers a failure after kernels were encoded.
+#[test]
+fn a_refused_backward_leaves_the_runtime_idle_under_async_encode() {
+    let handle = Handle::new();
+    assert_eq!(set_async(&handle, 1), TESSL_OK);
+    let model = load_model(handle.0);
+    let rt = unsafe { tessl::capi::test_model_runtime(model) };
+    assert!(rt.async_encode_enabled());
+    let ids = fixture_ids();
+    let mut err = [0 as c_char; ERR_LEN];
+    let mut loss = 0.0f64;
+    let s = unsafe {
+        tessl_qwen35_train_forward(
+            model,
+            ids.as_ptr(),
+            ids.len() as u64,
+            TESSL_OPERANDS_EXACT_F32,
+            TESSL_SUPERVISE_CAUSAL,
+            ptr::null(),
+            ptr::null(),
+            0,
+            1.0,
+            &mut loss,
+            err.as_mut_ptr(),
+            ERR_LEN,
+        )
+    };
+    assert_eq!(s, TESSL_OK, "{}", msg(&err));
+    assert_idle(&rt, "a forward");
+    let wrong = shared(&rt, &[0.0; 3]);
+    let dh = tref(&wrong, &[1, 3]);
+    let s = unsafe { tessl_qwen35_train_backward(model, [0u32].as_ptr(), 1, &dh, 0, err.as_mut_ptr(), ERR_LEN) };
+    assert_eq!(s, TESSL_ERR);
+    assert!(msg(&err).contains("dh"), "{}", msg(&err));
+    assert_idle(&rt, "a refused backward");
+    // The refusal kept the step pending: the real backward still runs.
+    let s = unsafe { tessl_qwen35_train_backward(model, ptr::null(), 0, ptr::null(), 0, err.as_mut_ptr(), ERR_LEN) };
+    assert_eq!(s, TESSL_OK, "{}", msg(&err));
+    assert_idle(&rt, "a backward");
+    assert_eq!(unsafe { tessl_qwen35_free(model) }, TESSL_OK);
+}
+
+/// ABI 12's entry: a value other than 0 or 1 is refused and changes nothing;
+/// off waits for the runtime to go idle first.
+#[test]
+fn set_async_encode_validates_and_toggles_the_runtime() {
+    let handle = Handle::new();
+    let rt = unsafe { tessl::capi::test_runtime(handle.0) };
+    assert!(!rt.async_encode_enabled(), "async encode is off by default");
+    assert_eq!(set_async(&handle, 2), TESSL_ERR);
+    assert!(!rt.async_encode_enabled());
+    assert_eq!(set_async(&handle, 1), TESSL_OK);
+    assert!(rt.async_encode_enabled());
+    assert_eq!(set_async(&handle, 0), TESSL_OK);
+    assert!(!rt.async_encode_enabled());
+    assert_eq!(TESSL_ABI_VERSION, 12);
+}
+
+fn param_infos(model: *mut TesslQwen35) -> Vec<TesslParamInfo> {
+    (0..param_count(model))
+        .map(|i| {
+            let mut info: TesslParamInfo = unsafe { std::mem::zeroed() };
+            let mut e = [0 as c_char; ERR_LEN];
+            assert_eq!(
+                unsafe { tessl_qwen35_param_info(model, i as u64, &mut info, e.as_mut_ptr(), ERR_LEN) },
+                TESSL_OK
+            );
+            info
+        })
+        .collect()
+}
+
+fn numel(p: &TesslParamInfo) -> usize {
+    p.shape[..p.ndim as usize].iter().product::<u64>() as usize
+}
+
+/// A parameter read or write through the ABI touches that parameter only: the
+/// bytes moved are the entry's (counted by the handle, and a guard past the
+/// last element is untouched), no GPU copy is encoded, the values are the
+/// whole-model copy's for that entry, and a write moves no other entry.
+#[test]
+fn a_parameter_read_or_write_moves_only_that_parameters_bytes() {
+    let handle = Handle::new();
+    let model = load_model(handle.0);
+    let rt = unsafe { tessl::capi::test_model_runtime(model) };
+    let infos = param_infos(model);
+    let total_bytes: u64 = infos.iter().map(|p| numel(p) as u64 * 4).sum();
+    // The whole-model copy, for the reference values.
+    let bufs: Vec<_> = infos.iter().map(|p| shared(&rt, &vec![0.0; numel(p)])).collect();
+    let refs: Vec<_> = bufs
+        .iter()
+        .zip(&infos)
+        .map(|(b, p)| {
+            let mut shape = p.shape[..p.ndim as usize].to_vec();
+            if p.transposed != 0 {
+                shape.reverse();
+            }
+            tref(b, &shape)
+        })
+        .collect();
+    let mut err = [0 as c_char; ERR_LEN];
+    let s = unsafe {
+        tessl_qwen35_copy(
+            model,
+            TESSL_READ_PARAMS,
+            refs.as_ptr(),
+            refs.len() as u64,
+            err.as_mut_ptr(),
+            ERR_LEN,
+        )
+    };
+    assert_eq!(s, TESSL_OK, "{}", msg(&err));
+    let whole: Vec<Vec<f32>> = bufs.iter().zip(&infos).map(|(b, p)| read(b, numel(p))).collect();
+
+    // Two entries of different sizes: the smallest and the largest.
+    let order = {
+        let mut o: Vec<usize> = (0..infos.len()).collect();
+        o.sort_by_key(|&i| numel(&infos[i]));
+        o
+    };
+    let (small, large) = (order[0], *order.last().unwrap());
+    assert!(numel(&infos[small]) < numel(&infos[large]));
+    let guard = f32::from_bits(0x7FC0_DEAD);
+    let read_entry = |i: usize, err: &mut [c_char; ERR_LEN]| -> (i32, Vec<f32>) {
+        let n = numel(&infos[i]);
+        let mut dst = vec![guard; n + 8];
+        let s = unsafe {
+            tessl_qwen35_read_parameter_host(model, i as u64, dst.as_mut_ptr(), n as u64, err.as_mut_ptr(), ERR_LEN)
+        };
+        (s, dst)
+    };
+    rt.take_dispatch_count();
+    let mut counted = 0u64;
+    for i in [small, large] {
+        let (s, dst) = read_entry(i, &mut err);
+        assert_eq!(s, TESSL_OK, "{}", msg(&err));
+        let n = numel(&infos[i]);
+        assert!(
+            dst[n..].iter().all(|v| v.to_bits() == guard.to_bits()),
+            "wrote past the entry"
+        );
+        assert_eq!(
+            bits(&dst[..n]),
+            bits(&whole[i]),
+            "entry {i} differs from the whole-model copy"
+        );
+        counted += n as u64 * 4;
+        assert_eq!(
+            unsafe { tessl::capi::test_host_param_bytes(model) },
+            counted,
+            "entry {i}"
+        );
+    }
+    assert_eq!(rt.take_dispatch_count(), 0, "a host read encoded a GPU dispatch");
+    assert!(
+        counted < total_bytes,
+        "two entries moved {counted} bytes of the model's {total_bytes}"
+    );
+    // A length that is not the entry's, an index past the table, a null buffer: refused, nothing moved.
+    let n = numel(&infos[large]);
+    let mut dst = vec![guard; n + 8];
+    let bad_len = unsafe {
+        tessl_qwen35_read_parameter_host(
+            model,
+            large as u64,
+            dst.as_mut_ptr(),
+            n as u64 - 1,
+            err.as_mut_ptr(),
+            ERR_LEN,
+        )
+    };
+    assert_eq!(bad_len, TESSL_ERR);
+    assert!(msg(&err).contains("takes"), "{}", msg(&err));
+    let bad_idx = unsafe {
+        tessl_qwen35_read_parameter_host(
+            model,
+            infos.len() as u64,
+            dst.as_mut_ptr(),
+            1,
+            err.as_mut_ptr(),
+            ERR_LEN,
+        )
+    };
+    assert_eq!(bad_idx, TESSL_ERR);
+    assert!(msg(&err).contains("out of range"), "{}", msg(&err));
+    let null = unsafe { tessl_qwen35_read_parameter_host(model, 0, ptr::null_mut(), 1, err.as_mut_ptr(), ERR_LEN) };
+    assert_eq!(null, TESSL_ERR);
+    assert!(
+        dst.iter().all(|v| v.to_bits() == guard.to_bits()),
+        "a refused read wrote"
+    );
+    assert_eq!(unsafe { tessl::capi::test_host_param_bytes(model) }, counted);
+
+    // A write moves its entry and no other.
+    let n = numel(&infos[small]);
+    let new: Vec<f32> = whole[small].iter().map(|v| v + 0.5).collect();
+    let s = unsafe {
+        tessl_qwen35_write_parameter_host(model, small as u64, new.as_ptr(), n as u64, err.as_mut_ptr(), ERR_LEN)
+    };
+    assert_eq!(s, TESSL_OK, "{}", msg(&err));
+    assert_eq!(
+        unsafe { tessl::capi::test_host_param_bytes(model) },
+        counted + n as u64 * 4
+    );
+    for i in 0..infos.len() {
+        let (s, got) = read_entry(i, &mut err);
+        assert_eq!(s, TESSL_OK, "{}", msg(&err));
+        let want = if i == small { &new } else { &whole[i] };
+        assert_eq!(bits(&got[..numel(&infos[i])]), bits(want), "entry {i} after the write");
+    }
+    let short = unsafe {
+        tessl_qwen35_write_parameter_host(
+            model,
+            small as u64,
+            new.as_ptr(),
+            n as u64 + 1,
+            err.as_mut_ptr(),
+            ERR_LEN,
+        )
+    };
+    assert_eq!(short, TESSL_ERR);
+    assert_eq!(rt.take_dispatch_count(), 0, "a host write encoded a GPU dispatch");
+    assert_eq!(unsafe { tessl_qwen35_free(model) }, TESSL_OK);
 }

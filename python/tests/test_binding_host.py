@@ -35,6 +35,11 @@ class FakeLib:
         self.load_status = 0
         self.poisoned = 0
         self.poison_query_status = 0
+        self.async_status = 0
+        self.parameter_status = 0
+        # Values read_parameter_host hands back, in storage order.
+        self.parameter_values = [1.0, 2.0, 3.0, 4.0]
+        self.written = None
 
     def _rec(self, name, *args):
         self.calls.append((name, args[0] if args else None))
@@ -49,6 +54,29 @@ class FakeLib:
     def tessl_runtime_free(self, h):
         self._rec("tessl_runtime_free", h.value)
         return self.free_status
+
+    def tessl_runtime_set_async_encode(self, h, on, err, n):
+        self.calls.append(("tessl_runtime_set_async_encode", on))
+        if self.async_status:
+            err.value = b"async refused"
+        return self.async_status
+
+    def tessl_qwen35_read_parameter_host(self, h, index, dst, count, err, n):
+        self.calls.append(("tessl_qwen35_read_parameter_host", (index, count)))
+        if self.parameter_status:
+            err.value = b"parameter refused"
+            return self.parameter_status
+        for k, v in enumerate(self.parameter_values[:count]):
+            dst[k] = v
+        return 0
+
+    def tessl_qwen35_write_parameter_host(self, h, index, src, count, err, n):
+        self.calls.append(("tessl_qwen35_write_parameter_host", (index, count)))
+        if self.parameter_status:
+            err.value = b"parameter refused"
+            return self.parameter_status
+        self.written = [src[k] for k in range(count)]
+        return 0
 
     def tessl_runtime_poisoned(self, h, out, err, n):
         self._rec("tessl_runtime_poisoned", h.value)
@@ -146,6 +174,57 @@ class Ownership(HostCase):
         second = tessl_torch._runtime()
         self.assertIsNot(first, second)
         self.assertFalse(second.closed)
+
+
+class AsyncEncode(HostCase):
+    def test_a_new_runtime_turns_async_encode_on_before_anything_else(self):
+        tessl_torch._runtime()
+        self.assertEqual([c[0] for c in self.lib.calls[:2]], ["tessl_runtime_new", "tessl_runtime_set_async_encode"])
+        self.assertEqual(self.calls("tessl_runtime_set_async_encode"), [("tessl_runtime_set_async_encode", 1)])
+
+    def test_a_refused_switch_raises_and_frees_the_runtime(self):
+        self.lib.async_status = 1
+        with self.assertRaisesRegex(TesslError, "async refused"):
+            tessl_torch._runtime()
+        self.assertEqual(self.lib.frees(), [("tessl_runtime_free", RUNTIME)])
+
+
+class OneParameter(HostCase):
+    """read_parameter and write_parameter are the per-entry host entries, and
+    touch nothing else: no whole-model copy, no wait on torch's queue."""
+
+    def setUp(self):
+        super().setUp()
+        self.model_ = self.model()
+        sync = mock.patch.object(torch.mps, "synchronize")
+        self.sync = sync.start()
+        self.addCleanup(sync.stop)
+
+    def test_a_read_is_one_entry_in_its_shape_with_no_whole_model_copy(self):
+        t = self.model_.read_parameter("norm.weight")
+        self.assertEqual(t.tolist(), [1.0, 2.0, 3.0, 4.0])
+        self.assertEqual(self.calls("tessl_qwen35_read_parameter_host"), [("tessl_qwen35_read_parameter_host", (0, 4))])
+        self.assertEqual(self.calls("tessl_qwen35_copy"), [])
+        self.sync.assert_not_called()
+
+    def test_a_write_is_one_entry_and_checks_the_shape_first(self):
+        self.model_.write_parameter("norm.weight", torch.tensor([5.0, 6.0, 7.0, 8.0], dtype=torch.bfloat16))
+        self.assertEqual(self.lib.written, [5.0, 6.0, 7.0, 8.0])
+        self.assertEqual(self.calls("tessl_qwen35_write_parameter_host"), [("tessl_qwen35_write_parameter_host", (0, 4))])
+        with self.assertRaisesRegex(TesslError, "must be"):
+            self.model_.write_parameter("norm.weight", torch.zeros(3))
+        self.assertEqual(len(self.calls("tessl_qwen35_write_parameter_host")), 1)
+        self.sync.assert_not_called()
+
+    def test_an_unknown_name_and_a_refusal_are_tessl_errors(self):
+        with self.assertRaisesRegex(TesslError, "no parameter named"):
+            self.model_.read_parameter("nope")
+        with self.assertRaisesRegex(TesslError, "must be a str"):
+            self.model_.write_parameter(0, torch.zeros(4))
+        self.lib.parameter_status = 1
+        with self.assertRaisesRegex(TesslError, "parameter refused"):
+            self.model_.read_parameter("norm.weight")
+        self.assertFalse(self.model_.closed)
 
 
 class Panic(HostCase):

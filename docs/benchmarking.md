@@ -764,8 +764,10 @@ tf32-relaxed lane sits between at 1.5e-3.
 ### Not plotted
 
 - `gemm_align_probe_m5pro.txt` (264 pass/fail runs, all bit-identical),
-  `kernel_coverage_m5pro.json` (imported; 147 entry points covered, none
-missing, on the MLSystemsLab copy) and
+  `kernel_coverage_m5pro.json` (regenerated 2026-10-14 by
+  `bench/kernel_coverage.py --check` against the metallib the binaries embed:
+  266 entry points, 116 dispatched, 150 never dispatched, so `--check` exits
+  non-zero; the old "147 covered, none missing" predated most kernels) and
   `fp_contract.txt` (single-shot, "noise, not a speedup") are correctness
   checks or one-run notes, not benchmarks.
 - `qwen35_train_step_before_m5pro.txt`, `qwen35_decode_token_before_m5pro.txt`

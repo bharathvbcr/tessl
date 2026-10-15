@@ -952,6 +952,36 @@ mod audit_tests {
         }
     }
 
+    /// Adversarial ranges for `execute_icb_ex` on a one-command ICB: past the
+    /// end, overflowing `start + count`, and an in-range one that must work.
+    #[test]
+    fn execute_icb_refuses_out_of_range_and_overflowing_ranges() {
+        for (start, count) in [(0u64, 2u64), (1, 1), (2, 1), (u64::MAX, 1), (1, u64::MAX), (u64::MAX, u64::MAX)] {
+            let rt = GpuRuntime::new().unwrap();
+            let icb = one_command_icb(&rt);
+            rt.register_allocation(ProtocolObject::<dyn MTLAllocation>::from_ref(&*icb));
+            let p = rt.pipeline("copy_f32").unwrap();
+            let err = rt
+                .with_binder(|b| {
+                    b.set_pipeline(&p);
+                    b.execute_icb_ex(&icb, start, count, false);
+                    Ok(())
+                })
+                .unwrap_err();
+            assert!(err.contains("out of bounds"), "({start},{count}): {err}");
+        }
+        let rt = GpuRuntime::new().unwrap();
+        let icb = one_command_icb(&rt);
+        rt.register_allocation(ProtocolObject::<dyn MTLAllocation>::from_ref(&*icb));
+        let p = rt.pipeline("copy_f32").unwrap();
+        rt.with_binder(|b| {
+            b.set_pipeline(&p);
+            b.execute_icb_ex(&icb, 0, 1, false);
+            Ok(())
+        })
+        .expect("the one in-range range is accepted");
+    }
+
     /// The invariant the check above relies on: the residency set holds a
     /// strong reference, so a registered ICB outlives the caller's handle.
     #[test]

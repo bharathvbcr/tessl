@@ -99,7 +99,12 @@ fn fn_body<'a>(src: &'a str, name: &str) -> Option<&'a str> {
             _ => {}
         }
     }
-    None
+    // Braces inside string or char literals can leave the count open. Fall back
+    // to the text up to the next item: a longer span can only add markers, so
+    // the scan stays conservative.
+    let rest = &src[at..];
+    let end = rest[1..].find("\n#[test]").map_or(rest.len(), |i| i + 1);
+    Some(&rest[..end])
 }
 
 /// Every function name defined in `src`.

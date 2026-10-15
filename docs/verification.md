@@ -85,7 +85,7 @@ Its `PASS` line names what it checked (`cargo test --release --test
 audit_gemm_tiles -- --nocapture clean_tree`):
 
 ```
-PASS: tile geometry: @KERNELS@ kernels, @PAIRS@ Rust dispatch pairs; 0 exempt
+PASS: tile geometry: 33 kernels, 34 Rust dispatch pairs; 0 exempt
 ```
 
 The counts move whenever a kernel or a dispatch site is added; the test's own

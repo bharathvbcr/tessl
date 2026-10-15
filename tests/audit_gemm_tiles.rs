@@ -461,7 +461,7 @@ fn rust_tiles(tree: &Tree) -> Rust {
                 pairs.push(Pair {
                     kernel: kernel.to_string(),
                     tile: tile.to_string(),
-                    site: format!("{label}"),
+                    site: (*label).to_string(),
                 });
             }
         }

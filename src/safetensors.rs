@@ -430,7 +430,7 @@ const INDEX_SYNTAX: Syntax = Syntax {
 ///
 /// [`Self::open`] validates everything before any tensor is read: the index
 /// parses strictly; every shard is a bare file name in the checkpoint
-/// directory (no `/`, `\\`, `..` or NUL; a symlink is followed, so a Hugging
+/// directory (no `/`, `\`, `..` or NUL; a symlink is followed, so a Hugging
 /// Face cache snapshot's `../../blobs` links load) that exists, is a regular
 /// file and is a valid `.safetensors` file; every `weight_map` name is in the shard it
 /// names; and every tensor in a shard is in the `weight_map` for that shard

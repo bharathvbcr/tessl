@@ -29,6 +29,8 @@
 //! Only the ratios are meaningful: the inputs are random, and a
 //! contended GPU slows every B alike.
 
+mod common;
+
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -49,27 +51,6 @@ const ITERS: usize = 7;
 
 type Res<T> = Result<T, String>;
 
-fn fill(n: usize, seed: u64, scale: f32, shift: f32) -> Vec<f32> {
-    let mut s = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
-    (0..n)
-        .map(|_| {
-            s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-            let u = ((s >> 32) as u32) as f64 / u32::MAX as f64 * 2.0 - 1.0;
-            u as f32 * scale + shift
-        })
-        .collect()
-}
-
-fn median(mut v: Vec<f64>) -> f64 {
-    v.sort_by(|a, b| a.total_cmp(b));
-    let n = v.len();
-    if n % 2 == 1 {
-        v[n / 2]
-    } else {
-        (v[n / 2 - 1] + v[n / 2]) / 2.0
-    }
-}
-
 /// Median ms of one scan over `batch` sequences of `t` tokens.
 fn scan_ms(rt: &Arc<GpuRuntime>, batch: u32, t: u32, slice: GdnScanSlice) -> Res<f64> {
     let dims = GdnDims {
@@ -85,13 +66,20 @@ fn scan_ms(rt: &Arc<GpuRuntime>, batch: u32, t: u32, slice: GdnScanSlice) -> Res
     let gate_ld = 2 * V_HEADS;
     let out_w = V_HEADS * V_DIM;
     let qkv = rt.alloc_tensor_f32(&[rows, qkv_ld as usize])?;
-    qkv.buffer.write_f32(&fill(rows * qkv_ld as usize, 1, 1.0, 0.0));
+    qkv.buffer
+        .write_f32(&common::fill_affine(rows * qkv_ld as usize, 1, 1.0, 0.0));
     let gates = rt.alloc_tensor_f32(&[rows, gate_ld as usize])?;
-    gates.buffer.write_f32(&fill(rows * gate_ld as usize, 2, 2.0, 0.0));
+    gates
+        .buffer
+        .write_f32(&common::fill_affine(rows * gate_ld as usize, 2, 2.0, 0.0));
     let a_log = rt.alloc_tensor_f32(&[V_HEADS as usize])?;
-    a_log.buffer.write_f32(&fill(V_HEADS as usize, 3, 0.5, 0.0));
+    a_log
+        .buffer
+        .write_f32(&common::fill_affine(V_HEADS as usize, 3, 0.5, 0.0));
     let dt_bias = rt.alloc_tensor_f32(&[V_HEADS as usize])?;
-    dt_bias.buffer.write_f32(&fill(V_HEADS as usize, 4, 1.0, -3.0));
+    dt_bias
+        .buffer
+        .write_f32(&common::fill_affine(V_HEADS as usize, 4, 1.0, -3.0));
     let out = rt.alloc_tensor_f32(&[rows, out_w as usize])?;
     let ws = GdnWorkspace::new(rt, &dims)?.with_scan_slice(slice);
     let q = GdnQkv {
@@ -147,7 +135,7 @@ fn scan_ms(rt: &Arc<GpuRuntime>, batch: u32, t: u32, slice: GdnScanSlice) -> Res
     if !o[..rows * out_w as usize].iter().all(|x| x.is_finite()) {
         return Err(format!("B={batch} T={t}: scan output is not all finite"));
     }
-    Ok(median(samples))
+    common::median(samples)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -221,13 +209,20 @@ fn run_paired(rt: &Arc<GpuRuntime>, batch: u32, ts: &[u32]) -> Res<()> {
         let gate_ld = 2 * V_HEADS;
         let out_w = V_HEADS * V_DIM;
         let qkv = rt.alloc_tensor_f32(&[rows, qkv_ld as usize])?;
-        qkv.buffer.write_f32(&fill(rows * qkv_ld as usize, 1, 1.0, 0.0));
+        qkv.buffer
+            .write_f32(&common::fill_affine(rows * qkv_ld as usize, 1, 1.0, 0.0));
         let gates = rt.alloc_tensor_f32(&[rows, gate_ld as usize])?;
-        gates.buffer.write_f32(&fill(rows * gate_ld as usize, 2, 2.0, 0.0));
+        gates
+            .buffer
+            .write_f32(&common::fill_affine(rows * gate_ld as usize, 2, 2.0, 0.0));
         let a_log = rt.alloc_tensor_f32(&[V_HEADS as usize])?;
-        a_log.buffer.write_f32(&fill(V_HEADS as usize, 3, 0.5, 0.0));
+        a_log
+            .buffer
+            .write_f32(&common::fill_affine(V_HEADS as usize, 3, 0.5, 0.0));
         let dt_bias = rt.alloc_tensor_f32(&[V_HEADS as usize])?;
-        dt_bias.buffer.write_f32(&fill(V_HEADS as usize, 4, 1.0, -3.0));
+        dt_bias
+            .buffer
+            .write_f32(&common::fill_affine(V_HEADS as usize, 4, 1.0, -3.0));
         let out = rt.alloc_tensor_f32(&[rows, out_w as usize])?;
         let state_elems = dims.state_elems_per_row() * batch as usize;
         let state = rt.alloc_buffer(state_elems * 4)?;
@@ -310,7 +305,7 @@ fn run_paired(rt: &Arc<GpuRuntime>, batch: u32, ts: &[u32]) -> Res<()> {
         }
 
         for (name, samples) in [("Cols32", &wide), ("Cols16", &narrow)] {
-            let med = median(samples.clone());
+            let med = common::median(samples.clone())?;
             let lo = samples.iter().copied().fold(f64::INFINITY, f64::min);
             let hi = samples.iter().copied().fold(f64::NEG_INFINITY, f64::max);
             let wins = samples
@@ -326,7 +321,7 @@ fn run_paired(rt: &Arc<GpuRuntime>, batch: u32, ts: &[u32]) -> Res<()> {
                 lo * LAYERS
             );
         }
-        let ratio = median(narrow.clone()) / median(wide.clone());
+        let ratio = common::median(narrow.clone())? / common::median(wide.clone())?;
         println!("PAIRED B={batch} t={t} ratio_cols16_over_cols32={ratio:.4}");
 
         let mut capture = |slice: GdnScanSlice| -> Res<(Vec<u32>, Vec<u32>)> {

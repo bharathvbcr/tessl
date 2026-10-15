@@ -69,37 +69,99 @@ pub(crate) fn env_truthy(names: &[&str]) -> Option<bool> {
     resolve(names, |name| std::env::var(name).ok())
 }
 
-/// -1 = unset (read env), 0 = always-on barriers, 1 = skip auto (hazard mode).
-static HAZARD_BARRIERS: AtomicI8 = AtomicI8::new(-1);
+/// One process-global tri-state flag: unset (env not read yet), off, on, and a
+/// fourth "env unset, follow a default" state. Every `*_enabled()` getter in
+/// the crate is this struct plus its env name list, so the latch and the
+/// override rules live once. A `set` always wins over the env.
+pub(crate) struct TriFlag(AtomicI8);
+
+impl TriFlag {
+    const UNSET: i8 = -1;
+    /// Env had no recognised value; the default decides, re-evaluated per read.
+    const FOLLOW: i8 = 2;
+
+    pub(crate) const fn new() -> Self {
+        Self(AtomicI8::new(Self::UNSET))
+    }
+
+    /// Force on/off, overriding the env.
+    pub(crate) fn set(&self, on: bool) {
+        self.0.store(i8::from(on), Ordering::Relaxed);
+    }
+
+    /// True once forced, or once the env was read.
+    pub(crate) fn is_latched(&self) -> bool {
+        self.0.load(Ordering::Relaxed) >= 0
+    }
+
+    /// Raw state, for a test guard to save and [`Self::restore`].
+    #[cfg(test)]
+    pub(crate) fn raw(&self) -> i8 {
+        self.0.load(Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn restore(&self, raw: i8) {
+        self.0.store(raw, Ordering::Relaxed);
+    }
+
+    /// The forced value, else the first parsing name in `names`, else
+    /// `default()`; the answer is latched on the first read, so `default` runs
+    /// at most once.
+    pub(crate) fn get(&self, names: &[&str], default: impl FnOnce() -> bool) -> bool {
+        let v = self.0.load(Ordering::Relaxed);
+        if v >= 0 && v != Self::FOLLOW {
+            return v == 1;
+        }
+        let on = env_truthy(names).unwrap_or_else(default);
+        self.set(on);
+        on
+    }
+
+    /// Like [`Self::get`], but when no name parses the answer is not latched:
+    /// `default()` is asked on every read, so the flag keeps following whatever
+    /// it follows. "No name parses" itself is latched, so the env is read once.
+    pub(crate) fn get_following(&self, names: &[&str], default: impl Fn() -> bool) -> bool {
+        match self.0.load(Ordering::Relaxed) {
+            0 => return false,
+            1 => return true,
+            Self::FOLLOW => return default(),
+            _ => {}
+        }
+        if let Some(on) = env_truthy(names) {
+            self.set(on);
+            return on;
+        }
+        self.0.store(Self::FOLLOW, Ordering::Relaxed);
+        default()
+    }
+}
+
+/// Unset (read env), off = always-on barriers, on = skip auto (hazard mode).
+static HAZARD_BARRIERS: TriFlag = TriFlag::new();
 
 /// Force skip/enable always-on Device barrier. Call before first encode for decode.
 /// **Must** insert explicit [`crate::dispatch::Binder::barrier`] at RAW edges when
 /// enabling (skip_auto=true).
 pub fn set_hazard_barriers(skip_auto: bool) {
-    HAZARD_BARRIERS.store(if skip_auto { 1 } else { 0 }, Ordering::Relaxed);
+    HAZARD_BARRIERS.set(skip_auto);
 }
 
 /// True once [`set_hazard_barriers`] has been called (or env was read by
 /// [`hazard_barriers`]). Used by GPU init to avoid clobbering an explicit choice.
 pub fn hazard_barriers_explicitly_set() -> bool {
-    HAZARD_BARRIERS.load(Ordering::Relaxed) >= 0
+    HAZARD_BARRIERS.is_latched()
 }
 
 /// Skip always-on Dispatch→Dispatch Device barrier after every `Binder::dispatch`.
 /// Packed multi-dispatch ops still insert explicit barriers. Default: false
 /// (golden-safe). **Do not enable as default** without RAW-edge barriers.
 pub fn hazard_barriers() -> bool {
-    let v = HAZARD_BARRIERS.load(Ordering::Relaxed);
-    if v >= 0 {
-        return v == 1;
-    }
-    let from_env = env_truthy(ENV_HAZARD_BARRIERS).unwrap_or(false);
-    HAZARD_BARRIERS.store(if from_env { 1 } else { 0 }, Ordering::Relaxed);
-    from_env
+    HAZARD_BARRIERS.get(ENV_HAZARD_BARRIERS, || false)
 }
 
-/// -1 unset, 0 fine-grained RAW barriers, 1 phase-coarsened (default when hazard).
-static COARSE_BARRIERS: AtomicI8 = AtomicI8::new(-1);
+/// Unset, off = fine-grained RAW barriers, on = phase-coarsened (default when hazard).
+static COARSE_BARRIERS: TriFlag = TriFlag::new();
 
 /// Default when no `*_COARSE_BARRIERS` name parses: inherit [`hazard_barriers`].
 /// Deliberately not a constant — coarsening is only ever a question in hazard
@@ -116,13 +178,9 @@ fn coarse_default(from_env: Option<bool>, hazard: bool) -> bool {
 /// Override with `TESSL_COARSE_BARRIERS=0|1` (legacy:
 /// `GEMMA_METAL_COARSE_BARRIERS`, `METAL_RUNTIME_COARSE_BARRIERS`).
 pub fn coarse_barriers() -> bool {
-    let v = COARSE_BARRIERS.load(Ordering::Relaxed);
-    if v >= 0 {
-        return v == 1;
-    }
-    let on = coarse_default(env_truthy(ENV_COARSE_BARRIERS), hazard_barriers());
-    COARSE_BARRIERS.store(if on { 1 } else { 0 }, Ordering::Relaxed);
-    on
+    // `get` is latching and its default runs once: coarse inherits the hazard
+    // flag as of this first read (see `need_barrier_from`).
+    COARSE_BARRIERS.get(ENV_COARSE_BARRIERS, || coarse_default(None, hazard_barriers()))
 }
 
 /// Pure core of [`need_barrier`], split out so the truth table can be pinned by
@@ -179,6 +237,34 @@ mod tests {
     // * The two tests that touch the live globals only *read* them, and a read is
     //   idempotent: the first latches, every later one returns the same value, so
     //   they are order-independent with respect to every other test here.
+
+    /// `TriFlag` on private instances, with names no env sets, so nothing here
+    /// touches the real flags or the environment.
+    #[test]
+    fn tri_flag_latches_forces_and_follows() {
+        const NONE: &[&str] = &["TESSL_TRI_FLAG_TEST_UNSET_A", "TESSL_TRI_FLAG_TEST_UNSET_B"];
+        let f = TriFlag::new();
+        assert!(!f.is_latched());
+        assert!(f.get(NONE, || true), "no name parses: the default decides");
+        assert!(f.is_latched());
+        assert!(f.get(NONE, || false), "and the first answer is latched");
+        f.set(false);
+        assert!(!f.get(NONE, || true), "a forced value beats the default");
+
+        let follow = std::cell::Cell::new(false);
+        let g = TriFlag::new();
+        assert!(!g.get_following(NONE, || follow.get()));
+        follow.set(true);
+        assert!(g.get_following(NONE, || follow.get()), "unset env keeps following");
+        g.set(false);
+        assert!(
+            !g.get_following(NONE, || follow.get()),
+            "a forced value stops following"
+        );
+        g.set(true);
+        follow.set(false);
+        assert!(g.get_following(NONE, || follow.get()));
+    }
 
     /// A `resolve` lookup over a fixed table, recording which names it was asked
     /// for so laziness can be asserted.

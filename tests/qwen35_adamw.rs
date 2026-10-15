@@ -1254,3 +1254,268 @@ fn grad_sq_norm_is_the_exact_sum_rounded_once() {
         "a step's grad_sq_norm {got:e} vs {want:e} in f64"
     );
 }
+
+/// Per-entry moment copies are the whole-table copies' bits for each moment
+/// storage, a write of a read is the same state (8-bit included), a write
+/// lands in its entry alone, and a bad index or length or a busy runtime is
+/// refused with nothing written.
+#[test]
+fn per_entry_moment_host_copies_match_the_whole_table() {
+    for moments in [MomentStorage::F32, MomentStorage::Bf16, MomentStorage::Block8] {
+        let (rt, model) = load_bf16();
+        let table = model.parameter_table().unwrap();
+        let wd = model.default_weight_decay(0.1).unwrap();
+        let mut state = AdamW::with_config(
+            &model,
+            AdamWConfig {
+                update: UpdateRule::F32Master,
+                moments,
+            },
+        )
+        .unwrap();
+        for _ in 0..2 {
+            let s = model.train_step(&ids(), GemmOperands::Bf16).unwrap();
+            model.adamw_step(&s.grads, &mut state, &hyper(), &wd).unwrap();
+        }
+        let whole = |state: &AdamW, which: Moment| -> Vec<Vec<u32>> {
+            let ts = alloc_table(&rt, &table);
+            model.read_adamw_moment(state, which, &ts).unwrap();
+            ts.iter()
+                .map(|t| t.read_f32().unwrap().iter().map(|x| x.to_bits()).collect())
+                .collect()
+        };
+        for which in [Moment::First, Moment::Second] {
+            let want = whole(&state, which);
+            assert!(want.iter().any(|v| v.iter().any(|&b| f32::from_bits(b) != 0.0)));
+            for (i, p) in table.iter().enumerate() {
+                let n: usize = p.shape.iter().product();
+                let mut got = vec![0.0f32; n];
+                model.read_adamw_moment_host(&state, which, i, &mut got).unwrap();
+                let got: Vec<u32> = got.iter().map(|x| x.to_bits()).collect();
+                assert_eq!(got, want[i], "{moments:?} {which:?} {}", p.name);
+                // Write of a read: the same state.
+                let vals: Vec<f32> = got.iter().map(|&b| f32::from_bits(b)).collect();
+                model.write_adamw_moment_host(&mut state, which, i, &vals).unwrap();
+                assert_eq!(
+                    whole(&state, which),
+                    want,
+                    "{moments:?} {which:?} {}: rewrite moved state",
+                    p.name
+                );
+            }
+            // New values land in one entry alone (read back through the same codec).
+            let i = table.len() / 2;
+            let n: usize = table[i].shape.iter().product();
+            let new: Vec<f32> = (0..n).map(|k| 1e-3 * (1 + k % 17) as f32).collect();
+            model.write_adamw_moment_host(&mut state, which, i, &new).unwrap();
+            let after = whole(&state, which);
+            for j in 0..table.len() {
+                assert_eq!(after[j] == want[j], j != i, "{moments:?} {which:?}: entry {j}");
+            }
+            let mut back = vec![0.0f32; n];
+            model.read_adamw_moment_host(&state, which, i, &mut back).unwrap();
+            assert_eq!(back.iter().map(|x| x.to_bits()).collect::<Vec<_>>(), after[i]);
+            // f32 is exact; bf16 is within 2^-8 relative and an 8-bit code
+            // within 0.0081 of its block's largest magnitude (here 0.017).
+            let tol = if moments == MomentStorage::F32 {
+                0.0
+            } else {
+                0.0081 * 0.017
+            };
+            for (b, w) in back.iter().zip(&new) {
+                assert!((b - w).abs() <= tol, "{moments:?} {which:?}: {b} vs {w}");
+            }
+        }
+        let n: usize = table[0].shape.iter().product();
+        let e = |r: Result<(), String>, needle: &str| {
+            let m = r.expect_err(needle);
+            assert!(m.contains(needle), "{m:?} lacks {needle:?}");
+        };
+        let before = whole(&state, Moment::First);
+        let len = table.len();
+        e(
+            model.read_adamw_moment_host(&state, Moment::First, len, &mut vec![0.0; n]),
+            "out of range",
+        );
+        e(
+            model.write_adamw_moment_host(&mut state, Moment::First, 0, &vec![1.0; n - 1]),
+            "takes",
+        );
+        e(
+            model.write_adamw_moment_host(&mut state, Moment::First, 0, &[]),
+            "takes",
+        );
+        {
+            let other = rt.alloc_tensor_f32(&[1]).unwrap();
+            let _held = other.buffer.try_contents_f32().unwrap();
+            e(
+                model.read_adamw_moment_host(&state, Moment::First, 0, &mut vec![0.0; n]),
+                "runtime busy",
+            );
+            e(
+                model.write_adamw_moment_host(&mut state, Moment::First, 0, &vec![1.0; n]),
+                "runtime busy",
+            );
+        }
+        let (_, other_model) = load_bf16();
+        let other_state = AdamW::with_config(
+            &other_model,
+            AdamWConfig {
+                update: UpdateRule::F32Master,
+                moments,
+            },
+        )
+        .unwrap();
+        e(
+            model.read_adamw_moment_host(&other_state, Moment::First, 0, &mut vec![0.0; n]),
+            "",
+        );
+        assert_eq!(whole(&state, Moment::First), before, "{moments:?}: a refusal wrote");
+    }
+}
+
+// ---- adversarial: per-entry moment host copies ----
+
+fn awkward_bits(n: usize, seed: u32) -> Vec<f32> {
+    const FIXED: [u32; 20] = [
+        0x3f80_8000,
+        0x3f81_8000,
+        0x3f80_8001,
+        0xbf80_8000,
+        0x7f7f_8000,
+        0x7f7f_ffff,
+        0xff7f_8000,
+        0x7f80_0000,
+        0xff80_0000,
+        0x7f80_0001,
+        0xff80_0001,
+        0x7fc0_0001,
+        0xffff_ffff,
+        0x0000_0001,
+        0x0000_8000,
+        0x0001_8000,
+        0x8000_0001,
+        0x0000_0000,
+        0x8000_0000,
+        0x007f_ffff,
+    ];
+    let mut s = seed | 1;
+    (0..n)
+        .map(|i| {
+            f32::from_bits(if i < FIXED.len() {
+                FIXED[i]
+            } else {
+                s ^= s << 13;
+                s ^= s >> 17;
+                s ^= s << 5;
+                s
+            })
+        })
+        .collect()
+}
+
+/// A bf16 moment written on the host stores the bits the GPU
+/// `write_adamw_moment` stores for the same f32 input (ties, overflow, NaN
+/// payloads, subnormals).
+#[test]
+fn bf16_moment_host_write_rounds_like_the_gpu_write_bit_for_bit() {
+    let (rt, model) = load_bf16();
+    let table = model.parameter_table().unwrap();
+    let cfg = AdamWConfig {
+        update: UpdateRule::F32Master,
+        moments: MomentStorage::Bf16,
+    };
+    let mut gpu = AdamW::with_config(&model, cfg).unwrap();
+    let mut host = AdamW::with_config(&model, cfg).unwrap();
+    for which in [Moment::First, Moment::Second] {
+        let vals: Vec<Vec<f32>> = table
+            .iter()
+            .enumerate()
+            .map(|(i, p)| awkward_bits(p.shape.iter().product(), 0x85eb_ca6b ^ i as u32))
+            .collect();
+        let ts = alloc_table(&rt, &table);
+        for (t, v) in ts.iter().zip(&vals) {
+            t.write_f32(v).unwrap();
+        }
+        model.write_adamw_moment(&mut gpu, which, &ts).unwrap();
+        for (i, v) in vals.iter().enumerate() {
+            model.write_adamw_moment_host(&mut host, which, i, v).unwrap();
+            let n = v.len();
+            let (mut a, mut b) = (vec![0.0f32; n], vec![0.0f32; n]);
+            model.read_adamw_moment_host(&gpu, which, i, &mut a).unwrap();
+            model.read_adamw_moment_host(&host, which, i, &mut b).unwrap();
+            let diff: Vec<(usize, u32, u32, u32)> = (0..n)
+                .filter(|&k| a[k].to_bits() != b[k].to_bits())
+                .map(|k| (k, v[k].to_bits(), a[k].to_bits(), b[k].to_bits()))
+                .collect();
+            assert!(
+                diff.is_empty(),
+                "{which:?} {}: {} of {n} differ; (index, input, gpu, host) {diff:x?}",
+                table[i].name,
+                diff.len()
+            );
+        }
+    }
+}
+
+/// An unwaited step is waited for by the per-entry reads (parameters and each
+/// moment storage), so they see the stepped values, not stale ones.
+#[test]
+fn per_entry_host_reads_wait_for_an_unwaited_step() {
+    for moments in [MomentStorage::F32, MomentStorage::Bf16, MomentStorage::Block8] {
+        let (rt, model) = load_bf16();
+        let table = model.parameter_table().unwrap();
+        let wd = model.default_weight_decay(0.1).unwrap();
+        let cfg = AdamWConfig {
+            update: UpdateRule::F32Master,
+            moments,
+        };
+        let mut state = AdamW::with_config(&model, cfg).unwrap();
+        let s = model.train_step(&ids(), GemmOperands::Bf16).unwrap();
+        let i = table.len() / 2;
+        let n: usize = table[i].shape.iter().product();
+        let mut before = vec![0.0f32; n];
+        model.read_parameter_host(i, &mut before).unwrap();
+        model.adamw_step_unwaited(&s.grads, &mut state, &hyper(), &wd).unwrap();
+        let mut got = vec![0.0f32; n];
+        let mut m = vec![0.0f32; n];
+        // The very first host read after the unwaited encode.
+        model.read_adamw_moment_host(&state, Moment::First, i, &mut m).unwrap();
+        model.read_parameter_host(i, &mut got).unwrap();
+        let ts = alloc_table(&rt, &table);
+        model.read_parameters(&ts).unwrap();
+        let want = ts[i].read_f32().unwrap();
+        assert_ne!(got, before, "{moments:?}: the step did not move the entry");
+        assert_eq!(got, want, "{moments:?}: a host read ran before the step finished");
+        let ms = alloc_table(&rt, &table);
+        model.read_adamw_moment(&state, Moment::First, &ms).unwrap();
+        assert_eq!(m, ms[i].read_f32().unwrap(), "{moments:?}: moment read raced the step");
+    }
+}
+
+/// On a poisoned runtime every per-entry moment call (the 8-bit one
+/// dispatches a kernel) is an `Err`, never a panic, and the state's step
+/// count does not move.
+#[test]
+fn per_entry_moment_host_calls_refuse_on_a_poisoned_runtime() {
+    for moments in [MomentStorage::F32, MomentStorage::Bf16, MomentStorage::Block8] {
+        let (rt, model) = load_bf16();
+        let table = model.parameter_table().unwrap();
+        let cfg = AdamWConfig {
+            update: UpdateRule::F32Master,
+            moments,
+        };
+        let mut state = AdamW::with_config(&model, cfg).unwrap();
+        let n: usize = table[1].shape.iter().product();
+        rt.poison_as_shared_event_timeout_for_test();
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut buf = vec![0.0f32; n];
+            let a = model.read_adamw_moment_host(&state, Moment::First, 1, &mut buf);
+            let b = model.write_adamw_moment_host(&mut state, Moment::Second, 1, &vec![1.0; n]);
+            (a, b)
+        }));
+        let (a, b) = r.unwrap_or_else(|_| panic!("{moments:?}: a poisoned runtime panicked"));
+        assert!(a.is_err(), "{moments:?}: read succeeded on a poisoned runtime");
+        assert!(b.is_err(), "{moments:?}: write succeeded on a poisoned runtime");
+    }
+}

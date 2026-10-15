@@ -123,9 +123,11 @@ fn prefer_tn_splitk(m: usize, n: usize, k: usize) -> bool {
 
 /// Tile sizes for TensorOps kernels (must match matmul_tensorops.metal).
 ///
-/// `scripts/audit_gemm_tiles.py` checks each `TILE_*` against the kernel whose
-/// `pipeline("...")` call it follows, in any file under `src/`, so a dispatch
-/// outside this module takes its geometry from here, not from local constants.
+/// `tests/audit_gemm_tiles.rs` checks each `TILE_*` against the kernel it is
+/// paired with: the arms of `coop_kernel`, `epi_kernel`, the batched `match` and
+/// `SplitKPar::kernel`, and the kernel of every `pipeline("...")` call it
+/// follows, in any file under `src/`. A dispatch outside this module takes its
+/// geometry from here, not from local constants.
 #[derive(Clone, Copy)]
 pub(crate) struct TileGeom {
     pub(crate) sm: usize,

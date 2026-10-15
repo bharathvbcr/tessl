@@ -29,7 +29,7 @@ use tessl::gemm::GemmOperands;
 use tessl::qwen35_adamw::AdamW;
 use tessl::qwen35_model::{Precision, Qwen35Config, Qwen35Model};
 use tessl::qwen35_train::{Qwen35Grads, Supervise};
-use tessl::safetensors::SafeTensors;
+use tessl::safetensors::CheckpointView;
 use tessl::{GpuRuntime, Tensor};
 
 type Res<T> = Result<T, String>;
@@ -112,7 +112,7 @@ fn main() -> Res<()> {
     let mut prev = rt.current_allocated_bytes();
     point(&rt, "runtime", &mut prev, None)?;
 
-    let st = SafeTensors::open(std::path::Path::new(&path))?;
+    let st = CheckpointView::open(std::path::Path::new(&path))?;
     let model = Qwen35Model::load(
         &rt,
         &st,

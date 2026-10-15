@@ -104,6 +104,15 @@ jobs:
           components: clippy
       - uses: Swatinem/rust-cache@v2
 
+      - name: Python for the source-text gates
+        # The device-free tests below drive tools/msl_emu/dialect_lint.py; the
+        # parity harness needs numpy.
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: tools/msl_emu/requirements.txt
+
       - name: Report the toolchain this runner actually has
         # Recorded rather than assumed: the image's default Xcode floats, and
         # GitHub has already announced one move for macOS 26. If a future image
@@ -153,31 +162,58 @@ jobs:
         env:
           RUSTDOCFLAGS: -D warnings
 
-      - name: Host-only unit tests
-        # The `gpu` job is the only place `cargo test` runs, and it skips until a
-        # Metal runner is registered. These tests construct no GpuRuntime — the
-        # JSON parser, the loader's in-place bf16/f16 widen and tiled weight
-        # transpose checked against their plain loops, and AdamW's kernel-name
-        # table — so they run here, on every push, instead of waiting on that
-        # runner.
+      - name: Device-free tests, device hidden
+        # Every cargo test that constructs no GpuRuntime, run on every push
+        # instead of waiting for the gated GPU runner: the whole device-free
+        # integration binaries, plus the device-free tests that live in mixed
+        # files and in the library, listed in scripts/hosted_tests.txt.
         #
-        # The filter is checked to have matched: a filter that selects nothing
-        # also exits 0, and that must not read as a pass.
-        run: |
-          out=$(cargo test --release --lib -- json::tests:: safetensors::tests:: \
-            qwen35::tests::place_linear_part_matches_the_row_by_row_transpose \
-            qwen35_adamw::step_kernel_tests:: 2>&1) || { echo "$out"; exit 1; }
-          echo "$out"
-          grep -Eq 'test result: ok\. [1-9][0-9]* passed' <<<"$out" || { echo "host-only filter matched no tests"; exit 1; }
+        # scripts/hosted_tests.sh is the one guard for every invocation. It fails
+        # on a filter that runs zero tests (cargo exits 0 on that), on an
+        # `--exact` name that matches nothing, and on a malformed list. It runs the
+        # tests under a sandbox profile that denies IOKit, so the Metal device is
+        # invisible even if this runner exposes one: a test that opens a device
+        # fails here, it is never skipped. tests/hosted_selection.rs keeps the
+        # list honest from source, and tests/hosted_tests_script.rs holds the
+        # guard to failing.
+        run: scripts/hosted_tests.sh
 
-      - name: Static tile audit
-        # The one correctness gate on this job that needs no GPU: it parses the
-        # `constexpr int SM/SN` values out of matmul_tensorops.metal and
-        # cross-references every Rust TileGeom against them. A mismatch makes the
-        # host dispatch the wrong threadgroup grid and silently leave output
-        # tiles unwritten — wrong numbers, no error. Source analysis catches that
-        # on any machine.
-        run: python3 scripts/audit_gemm_tiles.py
+      - name: Hosted manifest is complete
+        # Every test that passes with the device hidden must be selected by
+        # scripts/hosted_tests.txt, or hosted CI never runs it (a new test in a
+        # mixed file, a src/bin unit test). tests/hosted_completeness.rs lists
+        # every test binary, runs the unselected tests by name under the same
+        # IOKit-denying sandbox and fails on any that passes. It is an `outside`
+        # entry because it starts those sandboxed children itself and
+        # sandbox-exec does not nest.
+        run: scripts/hosted_tests.sh --outside
+
+      - name: Parity harness, host-only sections
+        # Needs numpy only. The pin is the one tools/msl_emu/requirements.txt
+        # already carries for the oracle, so there is a single place to bump it.
+        # A non-zero exit (an assertion failure, or a required section that did
+        # not run) fails the job; the GPU sections are skipped visibly under
+        # --pure and say so.
+        #
+        # TESSL_HOSTED=1: this runner has Xcode and has just built the release
+        # binaries, so a skipped metallib cross-check (no metal-nm, no binary)
+        # is a misconfiguration and fails here instead of reading as a pass.
+        env:
+          TESSL_HOSTED: "1"
+        run: |
+          python3 -m pip install "$(grep -E '^numpy==' tools/msl_emu/requirements.txt)"
+          python3 -I bench/test_parity_harness.py --pure
+
+      - name: Kernel IR fast-math scan (tune rigs included)
+        # Compiles every kernels/*.metal, tune included (TESSL_GEMM_TUNE adds
+        # kernels/tune/*.metal exactly as build.rs does), to LLVM IR with
+        # build.rs's flags and fails on an inf/NaN constant, an fcmp uno/ord, or
+        # an isfinite site whose bit test did not survive. Exit 77 means "no
+        # Metal compiler"; the step before already proved there is one on this
+        # runner, so a skip here is a misconfiguration and fails like any other
+        # non-zero exit. tests/check_kernel_ir_planted.rs plants a -INFINITY and
+        # holds the script to catching it.
+        run: TESSL_GEMM_TUNE=1 scripts/check_kernel_ir.sh
 
   # ---------------------------------------------------------------------------
   # The GPU suite. Answered by running it, on 2026-08-31.

@@ -95,7 +95,7 @@ use crate::qwen35::{
     LmHead, OutCols, SharedPrefix, StateIn,
 };
 use crate::runtime::{BufferKind, GpuRuntime};
-use crate::safetensors::SafeTensors;
+use crate::safetensors::TensorSource;
 use crate::tensor::{DType, GpuBuffer, Tensor};
 
 const BACKEND: GemmBackend = GemmBackend::TensorOps;
@@ -582,7 +582,7 @@ impl Qwen35Model {
     /// shape is checked against `cfg`; a missing one is an error.
     pub fn load(
         rt: &Arc<GpuRuntime>,
-        st: &SafeTensors,
+        st: &dyn TensorSource,
         prefix: &str,
         cfg: Qwen35Config,
         precision: Precision,
@@ -600,7 +600,7 @@ impl Qwen35Model {
     /// runs on any tower.
     pub fn load_tower(
         rt: &Arc<GpuRuntime>,
-        st: &SafeTensors,
+        st: &dyn TensorSource,
         prefix: &str,
         cfg: Qwen35Config,
         precision: Precision,
@@ -610,7 +610,7 @@ impl Qwen35Model {
 
     fn load_impl(
         rt: &Arc<GpuRuntime>,
-        st: &SafeTensors,
+        st: &dyn TensorSource,
         prefix: &str,
         cfg: Qwen35Config,
         precision: Precision,
@@ -1107,13 +1107,13 @@ impl Qwen35Model {
     }
 
     /// Refuse to continue a prefill or session begun at `since` once the
-    /// weights have been written (write_parameters, adamw_step): its state
+    /// weights have been written (write_parameters, write_parameter_host, adamw_step): its state
     /// is of weights the model no longer has.
     fn check_generation(&self, what: &str, since: u64) -> Result<(), String> {
         if since != self.param_generation() {
             return Err(format!(
-                "{what}: the model's parameters were written after this prefill began (write_parameters \
-                 or adamw_step), so its state is of weights the model no longer has; prefill again"
+                "{what}: the model's parameters were written after this prefill began (write_parameters, \
+                 write_parameter_host or adamw_step), so its state is of weights the model no longer has; prefill again"
             ));
         }
         Ok(())

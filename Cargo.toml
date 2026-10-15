@@ -134,10 +134,6 @@ name = "bench_qwen35_layers"
 path = "src/bin/bench_qwen35_layers.rs"
 
 [[bin]]
-name = "bench_gemm_epi_tile"
-path = "src/bin/bench_gemm_epi_tile.rs"
-
-[[bin]]
 name = "bench_gemm_coop_tile"
 path = "src/bin/bench_gemm_coop_tile.rs"
 

@@ -82,8 +82,9 @@ static inline uint qwen35_sr_bits(constant Qwen35SrKey &k, uint i)
 }
 
 /// `x` rounded to bf16 up or down in magnitude, up with probability equal to
-/// the dropped fraction. The test is on the exponent bits, not isinf/isnan,
-/// which fast math may fold: infinities and NaNs round to nearest.
+/// the dropped fraction. The test is on the exponent bits, which is what
+/// Metal's isfinite compiles to as well (an integer test fast math cannot
+/// fold): infinities and NaNs round to nearest.
 static inline bfloat qwen35_round_stochastic(float x, uint r)
 {
     const uint bits = as_type<uint>(x);

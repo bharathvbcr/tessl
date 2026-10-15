@@ -9,7 +9,7 @@ records about the static audit's retired `BKC` half.
 flowchart TD
     subgraph VHierarchy["tessl Six-Tier Verification Hierarchy"]
         direction TB
-        T1["Tier 1: Static Tile Audit<br/>(audit_gemm_tiles.py · Rust TileGeom vs Metal constexpr)"]
+        T1["Tier 1: Static Tile Audit<br/>(tests/audit_gemm_tiles.rs · Rust TileGeom vs Metal constexpr)"]
         T2["Tier 2: Adversarial Shape Sweeps<br/>(1e30 Sentinel-seeded buffers · 1x1, primes, tile edge boundaries)"]
         T3["Tier 3: Seeded Randomized Shape Fuzzing<br/>(gemm_fuzz_quick [160 cases] · gemm_fuzz_deep [2500 soak])"]
         T4["Tier 4: Hostile NN Input Boundary Suite<br/>(nn_adversarial.rs · overflow dims, capacity check, zero-dispatch)"]
@@ -23,8 +23,11 @@ flowchart TD
 ## 1. Static audit
 
 ```bash
-python3 scripts/audit_gemm_tiles.py
+cargo test --release --test audit_gemm_tiles
 ```
+
+It is a `#[test]` that needs no device, so the hosted CI job runs it on every push
+(`scripts/hosted_tests.sh`, which hides the Metal device from every test it runs).
 
 ```mermaid
 flowchart LR
@@ -32,8 +35,8 @@ flowchart LR
         TileDef["TileGeom Constants<br/>• TILE_COOP_DEFAULT (128x64)<br/>• TILE_COOP_NARROW (64x64)<br/>• TILE_COOP_TN_NT (128x64)<br/>• TILE_F32 (32x32)"]
     end
 
-    subgraph Script["scripts/audit_gemm_tiles.py"]
-        Extractor["Regex Matcher<br/>Cross-checks SM, SN &amp; simdgroups"]
+    subgraph Script["tests/audit_gemm_tiles.rs"]
+        Extractor["Source Reader<br/>Cross-checks SM, SN &amp; simdgroups"]
     end
 
     subgraph MetalLand["Metal Shader Side (kernels/matmul_tensorops.metal)"]
@@ -42,7 +45,7 @@ flowchart LR
 
     RustLand --> Extractor
     MetalLand --> Extractor
-    Extractor --> Pass["Every entry point checked or exempt<br/>Fails if it examined nothing"]
+    Extractor --> Pass["Every entry point checked<br/>Fails if it examined nothing"]
 ```
 
 Cross-checks, mechanically, the relationship Rust's type system cannot express:
@@ -54,38 +57,48 @@ instantiation, or from a helper's template defaults when a kernel calls it with
 no template argument list — `matmul2d_tensorops_bf16_f32`, the production NN
 kernel, is that last case and takes its 128×64/sg4 from `mm_nn_coop_f32acc`.
 
+The Rust side is read from the selectors, not from a hand-kept copy of them (the
+`NN_PAIRS` list the Python script carried drifted from `epi_kernel`/`coop_kernel`
+by construction): the `(kernel, TILE_*)` arms of `coop_kernel`, `epi_kernel`, the
+batched `match` in `gemm_batched` and `SplitKPar::kernel`, plus every literal
+`pipeline("matmul2d_tensorops_...")` call under `src/` paired with the `TILE_*`
+within 12 lines of it.
+
 It fails closed rather than skipping:
 
-- every entry point in `matmul_tensorops.metal` must be checked or named in the
-  script's `EXEMPT` with a reason. None is exempt: `matmul2d_tensorops_i8_f32`
-  was, while `src/nn.rs` dispatched it with local `SM`/`SN` constants; it now
-  takes `TILE_COOP_DEFAULT`, and a kernel both checked and exempt fails;
-- literal `pipeline("matmul2d_tensorops_...")` calls are read from every file
-  under `src/`, not only `gemm.rs`, and one with no `TILE_*` within 12 lines
-  fails, even when its kernel is checked through another site;
-- a `*_KERNEL(` invocation it cannot parse, a pin naming a kernel that no longer
-  exists, and a pinned kernel whose geometry it cannot see each fail the audit;
-- an audit that parsed no kernels, or checked no Rust dispatch pairs, fails.
+- every entry point in `matmul_tensorops.metal` must be reached by a pair; there is
+  no exemption list. `matmul2d_tensorops_i8_f32` was exempt in the Python script
+  while `src/nn.rs` dispatched it with local `SM`/`SN` constants; it now takes
+  `TILE_COOP_DEFAULT`;
+- a selector anchor it cannot find (a renamed `coop_kernel`), or one that pairs no
+  kernel, fails: a selector it cannot see is a selector it did not check;
+- a `pipeline("...")` call with no `TILE_*` within 12 lines fails, even when its
+  kernel is checked through another site;
+- a `*_KERNEL(` invocation it cannot parse, and a kernel whose geometry it cannot see each fail the audit;
+- an audit that parsed no kernels, or checked no Rust dispatch pairs, fails;
+- tessl-arch02 growing its own `matmul_tensorops.metal` fails (it must compile
+  tessl's through `DEP_TESSL_KERNELS`); the check is skipped only when the sibling
+  checkout is absent, as inside a published crate.
 
-Its `PASS` line names what it checked. At `2972027`
-(`python3 scripts/audit_gemm_tiles.py`, exit status 0):
+Its `PASS` line names what it checked (`cargo test --release --test
+audit_gemm_tiles -- --nocapture clean_tree`):
 
 ```
-PASS: tile geometry: 33 kernels, 38 Rust dispatch pairs; 0 exempt (none)
+PASS: tile geometry: 33 kernels, 34 Rust dispatch pairs
 ```
 
-The counts move whenever a kernel or a dispatch site is added; the script's own
+The counts move whenever a kernel or a dispatch site is added; the test's own
 output, not this document, is the current figure.
 
-Paths resolve from the script's own location, so it runs from any directory and
-from inside an extracted `.crate`. `tests/audit_gemm_tiles.rs` runs a copy of the
-script against injected faults under `cargo test`: a tile drift, a drifted
-template default, an unaccounted kernel, an unparseable kernel macro, an empty
-kernel file, an empty `gemm.rs`, a wrong tile at the `src/nn.rs` i8 dispatch,
-and that dispatch with no `TileGeom` at all. The script as it stood at
-`dade8e2` printed `PASS` on the wrong i8 tile. Against the script as it stood at `52c091c`,
-the tile drift failed, the empty `gemm.rs` crashed with a `KeyError`, and the
-other four printed `PASS`.
+The same file runs the audit against injected faults: a tile drift, a wrong tile
+in one arm of each of `coop_kernel`, `epi_kernel`, the batched `match` and
+`SplitKPar::kernel`, a renamed selector, a drifted template default, an
+unaccounted kernel, an unparseable kernel macro, an empty kernel file, an empty
+`src/`, a wrong tile at the `src/nn.rs` i8 dispatch, and that dispatch with no
+`TileGeom` at all. The earlier Python script as it stood at `dade8e2` printed
+`PASS` on the wrong i8 tile. Against the script as it stood at `52c091c`, the tile
+drift failed, the empty `gemm.rs` crashed with a `KeyError`, and the other four
+printed `PASS`.
 
 ### The retired `BKC` check (`GAP-TESSL-AUDIT-BKC-CHECK-DEAD`, closed)
 
@@ -466,6 +479,32 @@ and `|a*b| == |a|*|b|` — that one found redundant code rather than a missing t
 and the redundancy was deleted. Both are recorded because "the test didn't catch
 it" and "there was nothing to catch" look identical in a log.
 
+## 7. Parser mutation tests
+
+`src/json.rs`, `src/safetensors.rs` and `src/npy.rs` are hand-written parsers of
+downloaded files. Besides their hand cases, `src/parser_mutation.rs` drives each
+with seeded mutations of valid seeds (a Qwen3.5-style `config.json`, a four-tensor
+safetensors file, npy v1/v2/v3 files): truncation at every byte, every single-bit
+flip, boundary integers (0, 1, length +-1, `u16/u32/u64::MAX`, the header cap)
+written at every position, and seeded random edits; plus hand-built hostile
+headers (length fields at their extremes, reversed, overlapping and overflowing
+offsets and shapes, bad magic and versions, lone surrogates, 100k-deep nesting,
+huge exponents, duplicate keys, trailing garbage).
+
+Decision (card ft-04c475ac): a dependency-free seeded mutation test, not
+cargo-fuzz or a proptest dev-dependency, so no dependency is added and a failing
+case replays from its seed and label. The property per input: `Ok` or a
+non-empty `Err`, no panic, and no single allocation above `64 * input_len + 8 KiB`
+(a counting global allocator under `cfg(test)`). A strict truncation of a valid
+file must be refused, and `SafeTensors::open` must agree with `from_bytes`.
+
+```bash
+cargo test --release --lib parser_mutation:: -- --test-threads=1
+# replay or widen: PARSER_MUTATION_SEED=0x... PARSER_MUTATION_CASES=20000
+```
+
+It builds no `GpuRuntime`, so the hosted CI `Host-only unit tests` step runs it.
+
 ## Fault injection
 
 The suite is only worth its green tick if it can go red. Six faults injected
@@ -537,7 +576,7 @@ total          349 passing, 0 failing, 1 ignored
 
 ```
 audit          PASS (re-run at 2972027): tile geometry, 33 kernels, 38 Rust
-               dispatch pairs; 0 exempt. Tile geometry is all it checks (section 1)
+               dispatch pairs. Tile geometry is all it checks (section 1)
 GDN mutations  19 of 19 caught (section 6; 2026-10-06 pass, not re-run at 2972027)
 fault tests    NOT RE-RUN at 2972027. Last recorded: 6 of 6 caught
 ```

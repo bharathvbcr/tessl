@@ -801,6 +801,58 @@ fn the_model_through_the_abi_is_the_rust_model() {
     assert_eq!(unsafe { tessl_qwen35_free(model) }, TESSL_OK);
 }
 
+/// `tessl_qwen35_load` takes a checkpoint directory or its index as well as a
+/// `.safetensors` file, and the model is the same one: the fixture's directory
+/// (no index, so `model.safetensors`), and an index over a Hugging Face style
+/// symlinked shard.
+#[test]
+fn a_model_loads_through_the_abi_from_a_directory_or_an_index() {
+    let _g = common::gpu_lock();
+    let handle = Handle::new();
+    let want = load_model(handle.0);
+    let want_n = param_count(want);
+    let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/qwen35_train");
+    let dir = std::env::temp_dir().join(format!("tessl-capi-index-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::os::unix::fs::symlink(
+        src.join("model.safetensors"),
+        dir.join("model-00001-of-00001.safetensors"),
+    )
+    .unwrap();
+    let st = tessl::safetensors::SafeTensors::open(&src.join("model.safetensors")).unwrap();
+    let body: Vec<String> = st
+        .names()
+        .map(|n| format!("{n:?}:\"model-00001-of-00001.safetensors\""))
+        .collect();
+    let index = dir.join("model.safetensors.index.json");
+    std::fs::write(&index, format!("{{\"weight_map\":{{{}}}}}", body.join(","))).unwrap();
+
+    let (cfg, prefix) = (fixture("config.json"), std::ffi::CString::new("model.").unwrap());
+    for path in [src.clone(), dir.clone(), index.clone()] {
+        let path = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
+        let mut out = ptr::null_mut();
+        let mut err = [0 as c_char; ERR_LEN];
+        let s = unsafe {
+            tessl_qwen35_load(
+                handle.0,
+                path.as_ptr(),
+                cfg.as_ptr(),
+                prefix.as_ptr(),
+                TESSL_F32,
+                &mut out,
+                err.as_mut_ptr(),
+                ERR_LEN,
+            )
+        };
+        assert_eq!(s, TESSL_OK, "{path:?}: {}", msg(&err));
+        assert_eq!(param_count(out), want_n);
+        assert_eq!(unsafe { tessl_qwen35_free(out) }, TESSL_OK);
+    }
+    assert_eq!(unsafe { tessl_qwen35_free(want) }, TESSL_OK);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn a_model_load_refuses_bad_arguments() {
     let handle = Handle::new();

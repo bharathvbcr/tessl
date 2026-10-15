@@ -363,7 +363,13 @@ float `select`, may be optimised away.
   masked score's weight is zeroed by its mask, not by its value. A row with
   no key saves `FLT_MAX` as its log-sum-exp, and the backward gives that row
   no probability. Plain max reductions seed from the row's own data.
-  `tests/kernel_fast_math.rs` fails on any `INFINITY` left in kernel code.
+  `tests/kernel_fast_math.rs` fails on any `INFINITY`, `NAN`, `HUGE_VAL`,
+  `MAXFLOAT`, `__builtin_inf`/`__builtin_nan`, `numeric_limits` inf/NaN,
+  inf/NaN bit casts, `isunordered` or self-comparison (`v != v`, which fast
+  math folds to a constant) left in kernel code, and `scripts/check_kernel_ir.sh`
+  checks the compiled IR for inf/NaN constants and unordered compares.
+  `isfinite`/`isnan`/`isinf` are allowed: Metal defines them as integer tests
+  on the bit pattern, which fast math cannot fold.
 - **Chunk-local cumulative decay** is summed in fp32, as transformers sums it.
   After a step with a large decay, later small differences `G_i − G_j` lose
   relative precision, in both implementations alike. The token-by-token decode
@@ -418,10 +424,13 @@ model, the logits move by less than 4e-5.
 
 **Compile risk, without a compiler.** `tools/msl_emu/dialect_lint.py` lists
 the MSL constructs these kernels use that no other tessl kernel uses (the others
-compile on every release build). There are 11: `as_type`, a
-`(device uint *)` cast, `log`, `mem_flags::mem_device`, six `precise::`
-functions and `uint3` (`static_assert` and `fabs` are now used elsewhere too).
-Each is standard MSL and on a reviewed list. An unreviewed one fails CI.
+compile on every release build). There are three: `log`, `mem_flags::mem_device`
+and `uint3`. Each is standard MSL and on a reviewed list. An unreviewed one fails
+CI, and so does a reviewed entry that is no longer new (it used to print a note and
+exit 0, and ten went stale that way). It stays Python, not Rust: it is a stdlib-only
+text lint that ships no code, `tests/dialect_lint_script.rs` holds it to failing on an
+unreviewed construct, a stale entry and an empty tree, and it runs on the Linux
+emulator job and, through that test, on the hosted macOS job.
 
 The `host_contract` case parses `src/qwen35.rs` and the kernel signatures. It
 checks that every `set_*` bind has the kernel's index and kind (buffer, `uint`,
@@ -611,10 +620,15 @@ slots, then `attn_prefix_decode`) and returns that token's logits. A step
 past `max_new` is refused, and a step that fails part way leaves the
 session refusing further steps rather than continuing from half-advanced
 state. A session, like a `Staged` prefill, records the model's parameter
-generation and refuses to continue once `write_parameters` or `adamw_step`
-has moved it, as a pending training step does. `prefill` checks the state
-it will keep against the device's recommended working set before any GPU
-work, as a training step checks its own. One sequence, batch 1.
+generation and refuses to continue once `write_parameters`,
+`write_parameter_host` or `adamw_step` has moved it, as a pending training step does. Before any GPU work,
+`prefill` checks everything it allocates against the device's recommended
+working set: the state the session keeps, the prefill's own activations for
+every token (with the GDN workspace), the decode activations and the logits.
+`forward` and `begin` make the same check on their activations (decided: all
+three entry points are checked, as a training step checks its own; tests in
+`tests/qwen35_model.rs`, `a_prefill_counts_its_own_activations_against_the_working_set`).
+One sequence, batch 1.
 
 Beyond the fixture, the stress tests in the same file decode 40 random
 shapes (1 to 5 layers in any order, every conv width 2 to 8, grouped GDN
@@ -1008,6 +1022,31 @@ every gradient by `clip_grad_norm_`'s coefficient inside the update, with
 no pass over the gradients and the stored ones left unscaled; the caller
 forms the coefficient so gradients outside tessl join the norm.
 
+`adamw_step_scaled` is Rust-only: the C API and `tessl_torch` do not expose it
+(a recorded decision, not a gap).
+
+Parameters, gradients and both AdamW moments also copy one entry at a time on
+the host, so a caller need not allocate a table of GPU tensors the size of the
+model: `read_parameter_host(index, dst)`, `read_gradient_host(grads, index,
+dst)`, `read_adamw_moment_host(state, which, index, dst)` into a `&mut [f32]`,
+and `write_parameter_host(index, src)` and `write_adamw_moment_host(state,
+which, index, src)` from a `&[f32]`. `index` is the position in
+`parameter_table()` and the slice is the entry's `storage_shape` in row-major
+order, the layout the whole-table copies give that entry (a bf16 matrix
+widens exactly on read and rounds to nearest on write). Each call maps only
+that entry's buffer, honouring its window offset and leading dimension, under
+the runtime's exclusive host lease: it waits for earlier GPU work, and while
+another host mapping, encoder or submit is live it fails with the existing
+`runtime busy` error. An f32 or bf16 moment is copied with no GPU dispatch;
+an 8-bit (`Block8`) moment is decoded or encoded by its kernel through a
+scratch tensor of that one entry's size. Index and length are checked first
+(the error names the entry), and `write_parameter_host` bumps the parameter
+generation once the mapping is held and before the first byte lands, so a
+`Decode`, `Staged` or pending training step from before the write refuses to
+continue, naming the write; a moment write changes no forward and does not
+bump it. A packed-head bf16 model refuses `write_parameter_host` as
+`write_parameters` does (`load_tower`).
+
 A step also runs in two halves for a loss outside tessl (a head of the
 caller's own): `train_forward` scores chosen positions against given tokens
 (`Supervise::Rows`: the sum, its gradients scaled by the caller, so a batch
@@ -1347,7 +1386,7 @@ at least 3% faster at T = 1024 and 2048 with no regression at T = 512 or
 decode. It was slower everywhere: the MLP block 1.02x at T = 1 and
 1.05-1.06x at T >= 512, the forward 1.037x at T = 1024 and 1.034x at 2048
 (`--model-forward`, two frozen builds interleaved by
-`bench/paired_bins.sh`). Interior tiles on offset pointers and the 64x64
+`bench_paired --format metrics`). Interior tiles on offset pointers and the 64x64
 tile did no better. Two accumulators per thread double the plain kernel's
 registers, and the saved f32 traffic and dispatch do not pay for that
 (`bench/results/qwen35_fused_swiglu_gemm_m5pro.txt`). Training could not

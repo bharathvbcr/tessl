@@ -44,7 +44,7 @@
 //! `--step=N` also loads the real checkpoint (`QWEN35_2B_SAFETENSORS`) and
 //! times `Qwen35Model::train_step` on N tokens end to end (median of 3 after
 //! one warm-up), which includes allocating every rebuilt activation and
-//! gradient per step. Run it under `/usr/bin/time -l` for its peak memory.
+//! gradient per step. Its peak memory is printed as `METRIC peak_footprint_gb_t{N}` (the figure `/usr/bin/time -l` reports), next to `METRIC train_step_s_t{N}` and `METRIC device_peak_gib_t{N}`, for `bench_paired --format metrics`.
 //! It also prints the device's peak allocation over the steps
 //! ([`GpuRuntime::peak_allocated_bytes`], reset after loading), and one more
 //! untimed step's host waits on the GPU, commits, dispatches and fresh
@@ -82,6 +82,8 @@
 //! wrote nothing would otherwise post the best number. There is no timing
 //! without the gate.
 
+mod common;
+
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -100,7 +102,7 @@ use tessl::qwen35_bwd::{
 };
 use tessl::qwen35_model::{Precision, Qwen35Config, Qwen35Model};
 use tessl::qwen35_train::{Qwen35Grads, Supervise};
-use tessl::safetensors::SafeTensors;
+use tessl::safetensors::CheckpointView;
 use tessl::tensor::{f32_slice_to_bf16, GpuBuffer};
 use tessl::{DType, GpuRuntime, Tensor};
 
@@ -126,35 +128,16 @@ const ITERS: usize = 7;
 
 type Res<T> = Result<T, String>;
 
-fn fill(n: usize, seed: u64, scale: f32) -> Vec<f32> {
-    let mut s = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
-    (0..n)
-        .map(|_| {
-            s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-            ((((s >> 32) as u32) as f64 / (u32::MAX as f64) * 2.0 - 1.0) as f32) * scale
-        })
-        .collect()
-}
-
-fn median(mut v: Vec<f64>) -> f64 {
-    v.sort_by(|a, b| a.partial_cmp(b).unwrap());
-    let n = v.len();
-    if n % 2 == 1 {
-        v[n / 2]
-    } else {
-        (v[n / 2 - 1] + v[n / 2]) / 2.0
-    }
-}
-
 fn tensor(rt: &Arc<GpuRuntime>, shape: &[usize], seed: u64, scale: f32) -> Res<Tensor> {
     let t = rt.alloc_tensor_f32(shape)?;
-    t.buffer.write_f32(&fill(shape.iter().product(), seed, scale));
+    t.buffer
+        .write_f32(&common::fill_affine(shape.iter().product(), seed, scale, 0.0));
     Ok(t)
 }
 
 fn buf(rt: &Arc<GpuRuntime>, n: usize, seed: u64, scale: f32) -> Res<GpuBuffer> {
     let b = rt.alloc_buffer(n.max(1) * 4)?;
-    b.write_f32(&fill(n, seed, scale));
+    b.write_f32(&common::fill_affine(n, seed, scale, 0.0));
     Ok(b)
 }
 
@@ -175,7 +158,7 @@ fn time_ms(rt: &Arc<GpuRuntime>, reps: usize, mut f: impl FnMut() -> Res<()>) ->
         rt.synchronize()?;
         samples.push(t0.elapsed().as_secs_f64() * 1e3 / reps as f64);
     }
-    Ok(median(samples))
+    common::median(samples)
 }
 
 /// One timed op: its name, how to run it, the buffers it writes (each with
@@ -226,14 +209,14 @@ fn bench_t(rt: &Arc<GpuRuntime>, t: usize, check_only: bool, operands: GemmOpera
     );
     let g = rt.alloc_tensor_f32(&[1, t, GDN_HEADS])?;
     g.buffer.write_f32(
-        &fill(t * GDN_HEADS, s(4), 1.0)
+        &common::fill_affine(t * GDN_HEADS, s(4), 1.0, 0.0)
             .iter()
             .map(|x| -0.5 - x.abs())
             .collect::<Vec<_>>(),
     );
     let beta = rt.alloc_tensor_f32(&[1, t, GDN_HEADS])?;
     beta.buffer.write_f32(
-        &fill(t * GDN_HEADS, s(5), 1.0)
+        &common::fill_affine(t * GDN_HEADS, s(5), 1.0, 0.0)
             .iter()
             .map(|x| 0.5 + 0.4 * x)
             .collect::<Vec<_>>(),
@@ -292,7 +275,7 @@ fn bench_t(rt: &Arc<GpuRuntime>, t: usize, check_only: bool, operands: GemmOpera
     let h = tensor(rt, &[t, HIDDEN], s(20), 1.0)?;
     let emb = rt.alloc_tensor_bf16(&[VOCAB, HIDDEN])?;
     emb.buffer.write_bf16_bits(
-        &fill(VOCAB * HIDDEN, s(21), 0.05)
+        &common::fill_affine(VOCAB * HIDDEN, s(21), 0.05, 0.0)
             .iter()
             .map(|x| (x.to_bits() >> 16) as u16)
             .collect::<Vec<_>>(),
@@ -318,7 +301,7 @@ fn bench_t(rt: &Arc<GpuRuntime>, t: usize, check_only: bool, operands: GemmOpera
     // A bf16 layer input, and the f32 it is widened into, normed and copied out of.
     let x16 = rt.alloc_tensor_bf16(&[t, HIDDEN])?;
     x16.buffer
-        .write_bf16_bits(&f32_slice_to_bf16(&fill(t * HIDDEN, s(31), 1.0)));
+        .write_bf16_bits(&f32_slice_to_bf16(&common::fill_affine(t * HIDDEN, s(31), 1.0, 0.0)));
     let (xw, xn, xc) = (
         rt.alloc_tensor_f32(&[t, HIDDEN])?,
         buf(rt, t * HIDDEN, 0, 0.0)?,
@@ -686,7 +669,7 @@ fn load_model(rt: &Arc<GpuRuntime>, precision: Precision, random_config: Option<
 fn load_2b(rt: &Arc<GpuRuntime>, precision: Precision) -> Res<Qwen35Model> {
     let path = std::env::var("QWEN35_2B_SAFETENSORS")
         .map_err(|_| "--step and --batch need QWEN35_2B_SAFETENSORS (the Qwen3.5-2B-Base .safetensors)".to_string())?;
-    let st = SafeTensors::open(std::path::Path::new(&path))?;
+    let st = CheckpointView::open(std::path::Path::new(&path))?;
     let (prefix, cfg) = ("model.language_model.", Qwen35Config::qwen35_2b()?);
     match precision {
         Precision::F32 => Qwen35Model::load(rt, &st, prefix, cfg, precision),
@@ -757,7 +740,8 @@ fn bench_step(rt: &Arc<GpuRuntime>, model: &Qwen35Model, tokens: usize, operands
             return Err("train_step: the loss changed between identical steps".into());
         }
     }
-    let secs = median(samples);
+    let secs = common::median(samples)?;
+    let step_secs = secs;
     println!(
         "train_step, T = {tokens}: {:.3} s ({:.0} tokens/s), loss {:.4}",
         secs,
@@ -775,6 +759,14 @@ fn bench_step(rt: &Arc<GpuRuntime>, model: &Qwen35Model, tokens: usize, operands
         return Err("train_step: the traced step's loss differs".into());
     }
     println!("  one traced step: {secs:.3} s, {}", trace_line(&trace));
+    // For `bench_paired --format metrics`: the three numbers a step A/B reads,
+    // the peak footprint being what `/usr/bin/time -l` prints at exit.
+    println!("METRIC train_step_s_t{tokens} {step_secs:.4}");
+    println!("METRIC device_peak_gib_t{tokens} {:.4}", gib(peak));
+    println!(
+        "METRIC peak_footprint_gb_t{tokens} {:.4}",
+        common::peak_footprint()? as f64 / 1e9
+    );
     Ok(())
 }
 
@@ -820,10 +812,10 @@ fn bench_clip(model: &Qwen35Model, tokens: usize, operands: GemmOperands) -> Res
     }
     println!("clipped optimizer step, T = {tokens} (median of 3; waits from the last run):");
     for (i, name) in ["train_step_into", "grad_sq_norm", "adamw_step"].iter().enumerate() {
-        let ms = median(runs.iter().map(|r| r[i].0 * 1e3).collect());
+        let ms = common::median(runs.iter().map(|r| r[i].0 * 1e3).collect())?;
         println!("  {name:<16} {ms:>10.1} ms, {}", trace_line(&runs[2][i].1));
     }
-    let total = median(runs.iter().map(|r| r.iter().map(|x| x.0).sum::<f64>()).collect());
+    let total = common::median(runs.iter().map(|r| r.iter().map(|x| x.0).sum::<f64>()).collect())?;
     let waits: u64 = runs[2].iter().map(|x| x.1.sync_waits).sum();
     println!("  total            {:>10.1} ms, {waits} waits", total * 1e3);
     Ok(())
@@ -917,7 +909,7 @@ fn bench_batch(rt: &Arc<GpuRuntime>, model: &Qwen35Model, b: BatchShape, operand
         run()?;
         samples.push(t0.elapsed().as_secs_f64());
     }
-    let secs = median(samples);
+    let secs = common::median(samples)?;
     println!(
         "batch {} rows x {} tokens ({} span): {:.3} s per optimizer step, {:.3} s per row ({:.0} tokens/s)",
         b.rows,

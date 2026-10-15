@@ -5,6 +5,12 @@
 //! so no lane hides dispatch cost behind pipelining, median over iters.
 //!
 //! `--dump-parity DIR` writes A/B/C as .npy for the numeric check in the Python lane.
+//!
+//! `--dump-metallib PATH` writes the metallib bytes this binary embeds and exits
+//! without touching the GPU. `bench/kernel_coverage.py` reads the kernel census
+//! from that file, so it audits the library the benchmarks actually run.
+
+mod common;
 
 use std::path::Path;
 use std::time::Instant;
@@ -25,31 +31,6 @@ const SHAPES: &[(usize, usize, usize, &str)] = &[
     (8192, 768, 3072, "mlp_down"),
     (4096, 4096, 1024, "tall_k1024"),
 ];
-
-/// Deterministic LCG fill in u64, mapped to [-1, 1). The Python timing lanes
-/// use constant 0.5 operands instead — GEMM timing is data-independent, so the
-/// lanes only share data where it matters: the parity check reads A/B from the
-/// .npy files this binary dumps.
-fn fill(n: usize, seed: u64) -> Vec<f32> {
-    let mut s = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
-    let mut out = Vec::with_capacity(n);
-    for _ in 0..n {
-        s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-        let u = ((s >> 32) as u32) as f64 / (u32::MAX as f64);
-        out.push((u * 2.0 - 1.0) as f32);
-    }
-    out
-}
-
-fn median(mut v: Vec<f64>) -> f64 {
-    v.sort_by(|a, b| a.partial_cmp(b).unwrap());
-    let n = v.len();
-    if n % 2 == 1 {
-        v[n / 2]
-    } else {
-        (v[n / 2 - 1] + v[n / 2]) / 2.0
-    }
-}
 
 fn time_backend(
     rt: &std::sync::Arc<GpuRuntime>,
@@ -87,18 +68,43 @@ fn shapes_from_env() -> Option<Vec<(usize, usize, usize, String)>> {
     Some(out)
 }
 
-fn main() -> Result<(), String> {
-    let rt = GpuRuntime::new()?;
-    let warmup: usize = std::env::var("BENCH_WARMUP")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(10);
-    let iters: usize = std::env::var("BENCH_ITERS")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(50);
+/// The metallib `build.rs` produced, as the runtime embeds it
+/// (`include_bytes!` of the same artifact in `src/runtime.rs`).
+#[cfg(tessl_embedded_metallib)]
+fn embedded_metallib() -> Result<&'static [u8], String> {
+    Ok(include_bytes!(env!("TESSL_METALLIB")))
+}
 
+#[cfg(not(tessl_embedded_metallib))]
+fn embedded_metallib() -> Result<&'static [u8], String> {
+    Err("this build embeds no metallib (docs.rs-style build)".to_string())
+}
+
+fn dump_metallib(path: &str) -> Result<(), String> {
+    let bytes = embedded_metallib()?;
+    common::atomic_write(Path::new(path), bytes).map_err(|e| format!("--dump-metallib {e}"))
+}
+
+fn main() -> Result<(), String> {
+    // Wrapped so every exit path, an error included, prints the trace.
+    let outcome = run();
+    common::emit_kernel_trace();
+    outcome
+}
+
+fn run() -> Result<(), String> {
     let args: Vec<String> = std::env::args().collect();
+    if let Some(i) = args.iter().position(|a| a == "--dump-metallib") {
+        let path = args.get(i + 1).ok_or("--dump-metallib needs a PATH")?;
+        return dump_metallib(path);
+    }
+
+    // Validated before the GPU is touched: a malformed count must not cost a
+    // device init, and must not silently run the default.
+    let warmup = common::env_usize("BENCH_WARMUP", 10, 0)?;
+    let iters = common::env_usize("BENCH_ITERS", 50, 1)?;
+    let rt = GpuRuntime::new()?;
+
     let dump_dir = args
         .iter()
         .position(|a| a == "--dump-parity")
@@ -122,8 +128,8 @@ fn main() -> Result<(), String> {
         let a = rt.alloc_tensor_f32(&[m, k])?;
         let b = rt.alloc_tensor_f32(&[k, n])?;
         let c = rt.alloc_tensor_f32(&[m, n])?;
-        let a_host = fill(m * k, 1);
-        let b_host = fill(k * n, 2);
+        let a_host = common::fill(m * k, 1);
+        let b_host = common::fill(k * n, 2);
         a.buffer.write_f32(&a_host);
         b.buffer.write_f32(&b_host);
 
@@ -158,7 +164,7 @@ fn main() -> Result<(), String> {
             // kernels never appear in any cross-runtime comparison.
             rt.set_relaxed_precision(bname == "tensorops-tf32");
             let samples = time_backend(&rt, la, lb, &c, backend, warmup, iters)?;
-            let med = median(samples.clone());
+            let med = common::median(samples.clone())?;
             let best = samples.iter().cloned().fold(f64::INFINITY, f64::min);
             let gflops = flop / (med * 1e6);
             eprintln!("{label:<12} {bname:<10} M={m} N={n} K={k}  {med:8.3} ms  {gflops:8.1} GFLOP/s");

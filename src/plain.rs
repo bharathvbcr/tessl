@@ -68,3 +68,28 @@ pub(crate) fn le_to_native<T: PlainScalar>(dst: &mut [T]) {
     #[cfg(target_endian = "little")]
     let _ = dst;
 }
+
+/// Open `path` for a checkpoint reader, refusing anything but a regular file.
+///
+/// `File::open` on a FIFO with no writer blocks forever, and a character
+/// device or directory has no meaningful length to validate a header against.
+/// The open is `O_NONBLOCK`, which returns at once for a FIFO, and the handle
+/// is then fstat-ed and must be a regular file; the check is on the handle that
+/// is read, so no path swap can slip a FIFO past it. There is deliberately no
+/// stat before the open: it would add nothing the fstat does not decide.
+/// `O_NONBLOCK` has no effect on reads of a regular file, which is all that is
+/// kept. Returns the handle and its length.
+pub(crate) fn open_regular_file(path: &std::path::Path) -> Result<(std::fs::File, u64), String> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let what = path.display();
+    let f = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(path)
+        .map_err(|e| format!("{what}: {e}"))?;
+    let md = f.metadata().map_err(|e| format!("{what}: {e}"))?;
+    if !md.is_file() {
+        return Err(format!("{what}: not a regular file"));
+    }
+    Ok((f, md.len()))
+}

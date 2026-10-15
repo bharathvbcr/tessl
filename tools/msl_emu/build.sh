@@ -16,11 +16,25 @@ mkdir -p "$OUT/gen"
 # flash_attn_rows is tessl's existing attention kernel, built here so the
 # model-level check runs the attention the Qwen3.5 kernels actually feed.
 # qwen35_adamw and qwen35_bwd hold the training kernels.
-for k in qwen35_gdn qwen35_attn qwen35_mlp qwen35_score flash_attn_rows qwen35_adamw qwen35_bwd; do
+# embed_pool holds the EmbeddingGemma pooling kernels; encoder_attn the bidirectional
+# attention (see the truncation of its TensorOps half below).
+for k in qwen35_gdn qwen35_attn qwen35_mlp qwen35_score flash_attn_rows qwen35_adamw qwen35_bwd embed_pool encoder_attn; do
   sed -E -e 's/\[\[[^]]*\]\]//g' \
     -e 's/^([[:space:]]*)threadgroup ([A-Za-z_][A-Za-z0-9_]*) ([A-Za-z_][A-Za-z0-9_]*)\[([^];]*)\];/\1static \2 \3[\4]; ::metal::emu::tg_static(\3);/' \
     "$ROOT/kernels/$k.metal" > "$OUT/gen/$k.cpp"
 done
+# encoder_attn.metal's second half (ENCODER_TILED_KERNEL) runs on TensorOps through
+# attn_tiled.h, which the emulator cannot execute. Cut the file at the line that opens it,
+# and its `#include`, so the rows kernels above that line compile as written. Refuse to
+# build if the marker moved: a silent no-op here would compile the TensorOps half or none.
+marker='/// The same contract on the matrix units'
+if ! grep -qF "$marker" "$ROOT/kernels/encoder_attn.metal"; then
+  echo "msl_emu: encoder_attn.metal no longer has the line that opens its TensorOps half" >&2
+  exit 1
+fi
+awk -v m="$marker" 'index($0, m) == 1 { exit } !/^#include "attn_tiled.h"/ { print }' \
+  "$OUT/gen/encoder_attn.cpp" > "$OUT/gen/encoder_attn.rows.cpp"
+mv "$OUT/gen/encoder_attn.rows.cpp" "$OUT/gen/encoder_attn.cpp"
 # Any threadgroup array the rewrite did not take (2-D, several declarators on
 # one line, an initializer) would silently be per-thread: refuse to build
 # instead.

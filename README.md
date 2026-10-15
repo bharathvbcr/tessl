@@ -130,8 +130,8 @@ flowchart TD
 
 ## Performance vs. PyTorch MPS & MLX
 
-Apple M5 Pro, `python3 bench/paired_cross_runtime.py --rounds 5 --lanes torch,mlx`
-against torch 2.13 (MPS) and MLX, re-measured 2026-09-01. The harness interleaves
+Apple M5 Pro, `bench_paired --format rows:shape,backend,gflops` (recipe in
+[docs/benchmarking.md](docs/benchmarking.md)) against torch 2.13 (MPS) and MLX, re-measured 2026-09-01. The harness interleaves
 `tessl` and the baseline round by round so thermal throttling and frequency
 scaling hit both lanes alike — see [Benchmarking](docs/benchmarking.md).
 
@@ -165,7 +165,7 @@ over 50 iterations after 10 warmup:
 > **Benchmarking rigor.**
 > - **Clock drift.** Single-run cross-runtime numbers fluctuate 15–20% on identical
 >   work as the power governor moves. Use the paired sweep
->   (`bench/paired_cross_runtime.py`); for kernel-vs-kernel A/B use
+>   (`bench_paired`, [docs/benchmarking.md](docs/benchmarking.md)); for kernel-vs-kernel A/B use
 >   `bench_gemm_tile_tune` or `bench_gemm_tnnt_tune` behind `TESSL_GEMM_TUNE=1`.
 > - **Dispatch floor.** Below ~2 GFLOP of total work both runtimes sit on a
 >   ~0.25 ms host submit-and-wait floor, which measures driver dispatch latency
@@ -444,7 +444,12 @@ would make the call quietly slower than the unfused code it replaced.
 cargo test --release -- --test-threads=1
 
 # Validate static TileGeom definitions against compiled Metal kernel constants
-python3 scripts/audit_gemm_tiles.py
+# (a #[test]; it is also part of the full suite above)
+cargo test --release --test audit_gemm_tiles
+
+# The device-free selection the hosted CI job runs, with the Metal device hidden
+# from every test (a test in it that opens a device fails)
+scripts/hosted_tests.sh
 
 # Quick shape fuzz (160 cases) runs as part of the ordinary suite:
 cargo test --release --lib -- --test-threads=1 --nocapture gemm_fuzz_quick
@@ -456,8 +461,10 @@ cargo test --release --lib -- --ignored --test-threads=1 --nocapture gemm_fuzz_d
 STRESS_SEED=0xdeadbeef cargo test --release --lib -- --test-threads=1 gemm_fuzz_quick
 ```
 
-**Static tile audit** (`scripts/audit_gemm_tiles.py`) cross-references every Rust
-`TileGeom` struct against the `constexpr int SM/SN` parameters compiled into
+**Static tile audit** (`tests/audit_gemm_tiles.rs`) reads the Rust selectors
+(`coop_kernel`, `epi_kernel`, the batched `match`, `SplitKPar::kernel`) and every
+`pipeline("matmul2d_tensorops_...")` site, and cross-references each `TileGeom`
+they pair a kernel with against the `constexpr int SM/SN` parameters compiled into
 `matmul_tensorops.metal`, including macro-instantiated kernels
 (`NN_COOP_KERNEL`, `TN_NT_COOP_KERNEL`). A mismatch would make the host dispatch
 incorrect threadgroup grids, silently leaving output tiles unwritten.
@@ -495,20 +502,18 @@ TESSL_GEMM_TUNE=1 cargo run --release --bin bench_gemm_tnnt_tune
 |---|---|
 | `bench_gemm_tile_tune` | Exhaustive tile geometry ($SM \times SN$) and $BK$ ladder benchmark. |
 | `bench_gemm_tnnt_tune` | TN/NT tile sweep; the paired, round-interleaved A/B comparison lane. |
-| `bench_gemm_coop_tile` | Paired, interleaved A/B benchmark for cooperative GEMM tile geometries (128×64 vs 64×64). |
-| `bench_gemm_epi_tile` | Paired, interleaved A/B benchmark for fused epilogue tile geometries (128×64 vs 64×64). |
+| `bench_gemm_coop_tile` | Paired, interleaved A/B benchmark for GEMM tile geometries (128×64 vs 64×64); `--family plain` or `--family epilogue`. |
 | `bench_gemm_sweep` | Cross-runtime sweep (`f32`, `tf32`, `bf16`) with JSON telemetry output. |
 | `bench_nn_kernels` | Throughput of the `nn` library, timed both batched and solo so the dispatch floor is visible rather than hidden. |
 | `bench_qwen35_layers` | `Qwen35Model` prefill, per-layer and decode timings at the 2B's shapes (random or `--weights=DIR`); `--paired-attn` times paired prefill attention. |
 | `bench_qwen35_train` | The training step's time at Qwen3.5-2B's shapes, each activation mode alone; `--batch` times a batch run row by row. |
-| `bench_paired` | Rust round-robin runner for paired benchmark lanes with min-of-N telemetry and per-round ratios. |
+| `bench_paired` | Rust round-robin runner for paired benchmark lanes (JSON workloads, `METRIC` lines, or cross-runtime rows) with per-round ratios, per-lane environment, a drift gate and, with `--evidence`, provenance and atomic publication. |
 | `bench_embedgemma2` | EmbeddingGemma 2 benchmark over ragged workloads, measuring peak device allocation and RSS. |
 | `probe_gdn_scan` | Probe of the gated-delta-net scan; `--paired` times paired 32- vs 16-column slice widths. |
 | `probe_gemm_parity` | Bit-exact verification probe comparing TensorOps against the reference SIMD path. |
 | `probe_gemm_bits` | Hashes every production GEMM entry point's output over a fixed shape grid; diff two builds' output to show a refactor kept every bit. |
 | `probe_storage_memory` | Measures parameter and optimizer memory footprint across Qwen3.5 precision variants. |
 | `probe_load_memory` | Measures model load memory and residency behavior. |
-| `bench/paired_cross_runtime.py` | Python harness driving paired `tessl` vs. PyTorch MPS / MLX evaluation. |
 
 ---
 
@@ -574,9 +579,10 @@ below; the rest are capabilities the crate does not have.
 | Gap | Why it matters | Why not yet |
 |---|---|---|
 | **Full decode-graph ICB replay** | Replaying a whole decode step from an indirect command buffer would skip the per-token host encode. | `IcbReplayStub` and `IcbStubPhase` (`tessl::cb_replay`) are a host-side scaffold: `try_allocate` always returns `CbReplayError::NotWired`, and `try_execute` does too until a mini `DecodeIcb` has marked the stub `Allocated`, which says nothing about the full graph. Mini and layer-level `DecodeIcb` replay is real (`PingPongCbReplay::try_replay_icb`, opt-in) but the full decode graph is not migrated: `MTL4CommandBuffer` has no replay-prior-encoding API. `cb_replay_api_gap_summary()` lists the surveyed gaps, including the opt-in ICB bind paths the module records as parked behind direct dispatch with prebuilt argument tables. |
+| **No off-device check for `attn_prefill`** | `attn_prefill` (the TensorOps tiled kernel, `prefill_attn_kernel` always returns `Tiled`) is checked against f64 only on a Metal 4 device. | The CPU emulator in `tools/msl_emu` cannot execute TensorOps, so there is no off-device numeric check; `check_qwen35.py`'s host contract reads its buffer slots and `TILED_ATTN_*` constants from source and nothing more. The same holds for `encoder_attn_tiled_*`; the rows kernels `encoder_attn_rows_*` and `embed_pool.metal` are emulated. |
 | **Int4 TensorOps GEMM** | Half the weight bandwidth of int8. | TensorOps itself accepts `int4b_format` — the block is the shader-side tensor constructor for a sub-byte element type, not the objc2 binding this table used to blame. `nn::gemm_i8_dequant` ships the int8 case. |
 | **No CPU fallback** | Without a Metal 4 device, nothing runs. | Deliberate. This is an Apple-silicon runtime, and a silent CPU path would make every "GPU" benchmark here meaningless. |
-| **GPU CI on hosted runners** | Whether the suite runs unattended, or only on hardware I own. | Measured, not assumed: it does not. On `macos-26` the Metal Toolchain installs and every source under `kernels/` compiles and lints — the `check` job's `cargo build` does exactly that every push — but the device probe fails, so the shaders build there and cannot execute. The suite therefore runs on a gated self-hosted M5 runner. CI covers build, clippy, rustdoc and the static tile audit on every push; the tests do not run unattended. |
+| **GPU CI on hosted runners** | Whether the suite runs unattended, or only on hardware I own. | Measured, not assumed: it does not. On `macos-26` the Metal Toolchain installs and every source under `kernels/` compiles and lints — the `check` job's `cargo build` does exactly that every push — but the device probe fails, so the shaders build there and cannot execute. The suite therefore runs on a gated self-hosted M5 runner. CI covers build, clippy, rustdoc, the device-free cargo tests (run with the Metal device hidden, including the static tile audit), the kernel IR fast-math scan and the parity harness's host-only sections on every push; the GPU tests do not run unattended. |
 | **Benchmark numbers in CI** | The GFLOP/s figures above are reproducible only by hand. | Hosted runners are virtualised and shared, so a timing from one describes the runner. The `bench` job runs the sweep on bare-metal Apple silicon and is gated behind a repository variable until such a runner is registered. |
 
 ---

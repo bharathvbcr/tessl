@@ -336,10 +336,10 @@ builds tensors from raw device pointers.
 
 The Rust `TileGeom` constants (`TILE_COOP_DEFAULT`, `TILE_COOP_NARROW`, `TILE_COOP_TN_NT`, `TILE_COOP_ACCUM`, `TILE_COOP_SPLITK`, `TILE_F32`) must strictly equal the `SM`/`SN` compiled into shader kernels.
 
-Because Rust's type system cannot verify shader constants at compile time, [`scripts/audit_gemm_tiles.py`](../scripts/audit_gemm_tiles.py) verifies:
+Because Rust's type system cannot verify shader constants at compile time, [`tests/audit_gemm_tiles.rs`](../tests/audit_gemm_tiles.rs) (a `#[test]`, device-free, so it runs on the hosted CI job) verifies:
 1. Every Rust `TileGeom` matches the `constexpr int SM/SN`, macro arguments, or helper template defaults in Metal shaders.
-2. Every kernel entry point in `matmul_tensorops.metal` is checked or exempted by name with a reason, so no variable-dispatched pipeline escapes examination.
-3. It fails, rather than passing, when it parsed no kernels or checked no dispatch pairs; its `PASS` line states the counts. `tests/audit_gemm_tiles.rs` injects faults to prove it can fail ([verification.md §1](verification.md#1-static-audit)).
+2. Every kernel entry point in `matmul_tensorops.metal` is reached by a checked pair (there is no exemption list), so no variable-dispatched pipeline escapes examination.
+3. It fails, rather than passing, when it parsed no kernels or checked no dispatch pairs; its `PASS` line states the counts. The same file injects faults (a wrong tile in one arm of each selector, a renamed selector, a drifted kernel) to prove it can fail ([verification.md §1](verification.md#1-static-audit)).
 
 ---
 

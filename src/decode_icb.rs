@@ -14,19 +14,19 @@
 //! tax. Default **OFF** until a product tok/s win.
 //!
 //! **Coarse ranges (v0.5.9):** with range-batch, elide `barrier_after` markers
-//! when the next cmd's large-Buf set is disjoint from the open span (≤64B
-//! scalars + ambient high-frequency pools like `IcbScalarPool` ignored as
-//! read-only during tape execute). Larger `executeCommandsInBuffer` spans;
-//! still OFF by default with freeze/range.
+//! when the next cmd's Buf set is disjoint from the open span (every bound
+//! buffer counts; an Immediate bind may touch anything and keeps the barrier).
+//! Larger `executeCommandsInBuffer` spans; still OFF by default with
+//! freeze/range.
 //!
 //! Wired into [`crate::cb_replay::PingPongCbReplay::try_replay_icb`] so
 //! `try_replay` → `execute_icb` works for an attached mini or E4B Hot graph
 //! (session eligibility is host-side). **31B** decode-graph migration remains
 //! open. Opt-in; default OFF.
 
-use std::sync::atomic::{AtomicI8, Ordering};
-
 use objc2::rc::Retained;
+use std::sync::Weak;
+
 use objc2::runtime::ProtocolObject;
 use objc2_metal::{
     MTL4ArgumentTable, MTL4ArgumentTableDescriptor, MTLAllocation, MTLBuffer, MTLComputePipelineState, MTLDevice,
@@ -34,29 +34,25 @@ use objc2_metal::{
     MTLResourceOptions, MTLSize,
 };
 
-use crate::ab_flags::env_truthy;
+use crate::ab_flags::{env_truthy, TriFlag};
 use crate::runtime::{mtl_size, GpuRuntime};
 use crate::tensor::GpuBuffer;
 
-/// -1 = env, 0 = off, 1 = on.
-static DECODE_ICB: AtomicI8 = AtomicI8::new(-1);
+static DECODE_ICB: TriFlag = TriFlag::new();
 
 /// Force DecodeIcb replay opt-in (tests / harness). Overrides env.
 pub fn set_decode_icb(on: bool) {
-    DECODE_ICB.store(if on { 1 } else { 0 }, Ordering::Relaxed);
+    DECODE_ICB.set(on);
 }
 
 /// Opt-in gate for DecodeIcb replay via ping-pong. Default **OFF**.
 ///
 /// Env: `METAL_RUNTIME_DECODE_ICB=1` or `GEMMA_METAL_DECODE_ICB=1`.
 pub fn decode_icb_enabled() -> bool {
-    let v = DECODE_ICB.load(Ordering::Relaxed);
-    if v >= 0 {
-        return v == 1;
-    }
-    let on = env_truthy(&["TESSL_DECODE_ICB", "METAL_RUNTIME_DECODE_ICB", "GEMMA_METAL_DECODE_ICB"]).unwrap_or(false);
-    DECODE_ICB.store(if on { 1 } else { 0 }, Ordering::Relaxed);
-    on
+    DECODE_ICB.get(
+        &["TESSL_DECODE_ICB", "METAL_RUNTIME_DECODE_ICB", "GEMMA_METAL_DECODE_ICB"],
+        || false,
+    )
 }
 
 /// One argument-table bind for a captured / frozen command.
@@ -227,12 +223,11 @@ fn prebuilt_tables_enabled() -> bool {
     .unwrap_or(true)
 }
 
-/// -1 = env, 0 = off, 1 = on.
-static ICB_FREEZE_BINDS: AtomicI8 = AtomicI8::new(-1);
+static ICB_FREEZE_BINDS: TriFlag = TriFlag::new();
 
 /// Force freeze-binds opt-in (tests / harness). Overrides env.
 pub fn set_icb_freeze_binds(on: bool) {
-    ICB_FREEZE_BINDS.store(if on { 1 } else { 0 }, Ordering::Relaxed);
+    ICB_FREEZE_BINDS.set(on);
 }
 
 /// Opt-in: freeze Buf binds into the ICB via classic `setKernelBuffer`
@@ -241,26 +236,21 @@ pub fn set_icb_freeze_binds(on: bool) {
 ///
 /// Env: `METAL_RUNTIME_ICB_FREEZE_BINDS=1` or `GEMMA_METAL_ICB_FREEZE_BINDS=1`.
 pub fn icb_freeze_binds_enabled() -> bool {
-    let v = ICB_FREEZE_BINDS.load(Ordering::Relaxed);
-    if v >= 0 {
-        return v == 1;
-    }
-    let on = env_truthy(&[
-        "TESSL_ICB_FREEZE_BINDS",
-        "METAL_RUNTIME_ICB_FREEZE_BINDS",
-        "GEMMA_METAL_ICB_FREEZE_BINDS",
-    ])
-    .unwrap_or(false);
-    ICB_FREEZE_BINDS.store(if on { 1 } else { 0 }, Ordering::Relaxed);
-    on
+    ICB_FREEZE_BINDS.get(
+        &[
+            "TESSL_ICB_FREEZE_BINDS",
+            "METAL_RUNTIME_ICB_FREEZE_BINDS",
+            "GEMMA_METAL_ICB_FREEZE_BINDS",
+        ],
+        || false,
+    )
 }
 
-/// -1 = env, 0 = off, 1 = on.
-static ICB_RANGE_BATCH: AtomicI8 = AtomicI8::new(-1);
+static ICB_RANGE_BATCH: TriFlag = TriFlag::new();
 
 /// Force range-batch opt-in (tests / harness). Overrides env.
 pub fn set_icb_range_batch(on: bool) {
-    ICB_RANGE_BATCH.store(if on { 1 } else { 0 }, Ordering::Relaxed);
+    ICB_RANGE_BATCH.set(on);
 }
 
 /// Opt-in: under freeze-binds, batch safe ICB command ranges between captured
@@ -270,26 +260,22 @@ pub fn set_icb_range_batch(on: bool) {
 ///
 /// Env: `METAL_RUNTIME_ICB_RANGE_BATCH=1` or `GEMMA_METAL_ICB_RANGE_BATCH=1`.
 pub fn icb_range_batch_enabled() -> bool {
-    let v = ICB_RANGE_BATCH.load(Ordering::Relaxed);
-    if v >= 0 {
-        return v == 1;
-    }
-    let on = env_truthy(&[
-        "TESSL_ICB_RANGE_BATCH",
-        "METAL_RUNTIME_ICB_RANGE_BATCH",
-        "GEMMA_METAL_ICB_RANGE_BATCH",
-    ])
-    .unwrap_or(false);
-    ICB_RANGE_BATCH.store(if on { 1 } else { 0 }, Ordering::Relaxed);
-    on
+    ICB_RANGE_BATCH.get(
+        &[
+            "TESSL_ICB_RANGE_BATCH",
+            "METAL_RUNTIME_ICB_RANGE_BATCH",
+            "GEMMA_METAL_ICB_RANGE_BATCH",
+        ],
+        || false,
+    )
 }
 
-/// -1 = read env, 0 = off, 1 = on, 2 = env unset: follow range-batch.
-static ICB_COARSE_RANGES: AtomicI8 = AtomicI8::new(-1);
+/// Env unset follows range-batch ([`TriFlag::get_following`]).
+static ICB_COARSE_RANGES: TriFlag = TriFlag::new();
 
 /// Force coarse-range barrier elision (tests / harness). Overrides env.
 pub fn set_icb_coarse_ranges(on: bool) {
-    ICB_COARSE_RANGES.store(if on { 1 } else { 0 }, Ordering::Relaxed);
+    ICB_COARSE_RANGES.set(on);
 }
 
 /// Opt-in: elide non-interfering `barrier_after` markers before range-batch
@@ -298,33 +284,23 @@ pub fn set_icb_coarse_ranges(on: bool) {
 ///
 /// Env: `METAL_RUNTIME_ICB_COARSE_RANGES` / `GEMMA_METAL_ICB_COARSE_RANGES`.
 pub fn icb_coarse_ranges_enabled() -> bool {
-    match ICB_COARSE_RANGES.load(Ordering::Relaxed) {
-        0 => return false,
-        1 => return true,
-        // Follow range-batch: coarsening only pays when spans are coalesced.
-        2 => return icb_range_batch_enabled(),
-        _ => {}
-    }
-    if let Some(on) = env_truthy(&[
-        "TESSL_ICB_COARSE_RANGES",
-        "METAL_RUNTIME_ICB_COARSE_RANGES",
-        "GEMMA_METAL_ICB_COARSE_RANGES",
-    ]) {
-        ICB_COARSE_RANGES.store(if on { 1 } else { 0 }, Ordering::Relaxed);
-        return on;
-    }
-    // Latch "unset" too, so a replay does not re-read three variables every
-    // token; the answer still follows range-batch.
-    ICB_COARSE_RANGES.store(2, Ordering::Relaxed);
-    icb_range_batch_enabled()
+    // Coarsening only pays when spans are coalesced, so an unset env follows
+    // range-batch (and the "unset" answer is latched, not the follow value).
+    ICB_COARSE_RANGES.get_following(
+        &[
+            "TESSL_ICB_COARSE_RANGES",
+            "METAL_RUNTIME_ICB_COARSE_RANGES",
+            "GEMMA_METAL_ICB_COARSE_RANGES",
+        ],
+        icb_range_batch_enabled,
+    )
 }
 
-/// -1 = env, 0 = off, 1 = on.
-static ICB_EXECUTE: AtomicI8 = AtomicI8::new(-1);
+static ICB_EXECUTE: TriFlag = TriFlag::new();
 
 /// Force ICB execution of a replayed tape (tests / harness). Overrides env.
 pub fn set_icb_execute(on: bool) {
-    ICB_EXECUTE.store(if on { 1 } else { 0 }, Ordering::Relaxed);
+    ICB_EXECUTE.set(on);
 }
 
 /// Execute replayed commands through the ICB even without freeze-binds
@@ -334,26 +310,21 @@ pub fn set_icb_execute(on: bool) {
 /// Env: `TESSL_ICB_EXECUTE`, `METAL_RUNTIME_ICB_EXECUTE` or
 /// `GEMMA_METAL_ICB_EXECUTE`.
 pub fn icb_execute_enabled() -> bool {
-    let v = ICB_EXECUTE.load(Ordering::Relaxed);
-    if v >= 0 {
-        return v == 1;
-    }
-    let on = env_truthy(&[
-        "TESSL_ICB_EXECUTE",
-        "METAL_RUNTIME_ICB_EXECUTE",
-        "GEMMA_METAL_ICB_EXECUTE",
-    ])
-    .unwrap_or(false);
-    ICB_EXECUTE.store(if on { 1 } else { 0 }, Ordering::Relaxed);
-    on
+    ICB_EXECUTE.get(
+        &[
+            "TESSL_ICB_EXECUTE",
+            "METAL_RUNTIME_ICB_EXECUTE",
+            "GEMMA_METAL_ICB_EXECUTE",
+        ],
+        || false,
+    )
 }
 
-/// -1 = env, 0 = off, 1 = on.
-static ICB_TRIAGE: AtomicI8 = AtomicI8::new(-1);
+static ICB_TRIAGE: TriFlag = TriFlag::new();
 
 /// Force decode-ICB triage mode (tests / harness). Overrides env.
 pub fn set_icb_triage(on: bool) {
-    ICB_TRIAGE.store(if on { 1 } else { 0 }, Ordering::Relaxed);
+    ICB_TRIAGE.set(on);
 }
 
 /// Triage mode: replay one command per binder scope with a sync after each,
@@ -361,13 +332,7 @@ pub fn set_icb_triage(on: bool) {
 ///
 /// Env: `TESSL_ICB_TRIAGE` or `GEMMA_METAL_ICB_TRIAGE`.
 pub fn icb_triage_enabled() -> bool {
-    let v = ICB_TRIAGE.load(Ordering::Relaxed);
-    if v >= 0 {
-        return v == 1;
-    }
-    let on = env_truthy(&["TESSL_ICB_TRIAGE", "GEMMA_METAL_ICB_TRIAGE"]).unwrap_or(false);
-    ICB_TRIAGE.store(if on { 1 } else { 0 }, Ordering::Relaxed);
-    on
+    ICB_TRIAGE.get(&["TESSL_ICB_TRIAGE", "GEMMA_METAL_ICB_TRIAGE"], || false)
 }
 
 /// Fingerprint of Buf `(index, gpu_addr)` pairs for prebuilt-table dedup.
@@ -395,6 +360,8 @@ fn buf_bind_fingerprint(binds: &[DecodeIcbBind]) -> u64 {
 /// Multi-command decode ICB (inheritBuffers + arg-table execute, or freeze-binds).
 pub struct DecodeIcb {
     icb: Retained<ProtocolObject<dyn MTLIndirectCommandBuffer>>,
+    /// For the release on drop; weak so a tape never keeps its runtime alive.
+    rt: Weak<GpuRuntime>,
     commands: Vec<DecodeIcbCommand>,
     /// Per-command MTL4 argument tables with Buf addresses frozen at capture
     /// (A2 residual: execute switches tables instead of re-`setAddress`).
@@ -446,6 +413,71 @@ pub struct DecodeIcb {
 /// One argument table per encoded command, plus the number of distinct tables
 /// actually built (commands with identical binds share one).
 type PrebuiltTables = (Vec<Retained<ProtocolObject<dyn MTL4ArgumentTable>>>, usize);
+
+/// Pure core of [`DecodeIcb::elide_non_interfering_barriers`]: `sets[i]` is
+/// command `i`'s buffer ids (`None` = may touch anything) and `barriers[i]` its
+/// `barrier_after`. Clears the markers that separate disjoint work and returns
+/// how many it cleared.
+fn elide_barriers(sets: &[Option<Vec<u64>>], barriers: &mut [bool]) -> u64 {
+    debug_assert_eq!(sets.len(), barriers.len());
+    let n = sets.len();
+    if n < 2 {
+        return 0;
+    }
+    let mut elided = 0u64;
+    let mut span: Vec<u64> = Vec::new();
+    // The open span holds an Immediate command, which may touch any buffer.
+    let mut span_any = false;
+    for i in 0..n {
+        match &sets[i] {
+            None => span_any = true,
+            Some(ids) => {
+                for id in ids {
+                    if !span.contains(id) {
+                        span.push(*id);
+                    }
+                }
+            }
+        }
+        if !barriers[i] {
+            continue;
+        }
+        if i + 1 >= n {
+            span.clear();
+            span_any = false;
+            continue;
+        }
+        let keep = span_any
+            || match &sets[i + 1] {
+                None => true,
+                Some(next) => span.iter().any(|w| next.contains(w)),
+            };
+        if keep {
+            span.clear();
+            span_any = false;
+        } else {
+            barriers[i] = false;
+            elided = elided.saturating_add(1);
+        }
+    }
+    elided
+}
+
+/// Hand a dropped tape's ICB to the runtime's deferred release: it leaves the
+/// residency set (and is freed) once every command already submitted or encoded
+/// has completed, because MTL4 command buffers do not retain it. Nothing to do
+/// when the runtime is already gone: its own drop frees the residency set.
+pub(crate) fn release_icb(rt: &Weak<GpuRuntime>, icb: &Retained<ProtocolObject<dyn MTLIndirectCommandBuffer>>) {
+    if let Some(rt) = rt.upgrade() {
+        rt.schedule_release(ProtocolObject::<dyn MTLAllocation>::from_retained(icb.clone()), true);
+    }
+}
+
+impl Drop for DecodeIcb {
+    fn drop(&mut self) {
+        release_icb(&self.rt, &self.icb);
+    }
+}
 
 /// Per-command encode switches. Two adjacent `bool` parameters swap silently at
 /// a call site; named fields do not.
@@ -627,6 +659,7 @@ impl DecodeIcb {
         let all_icb = commands.iter().all(|c| c.pipeline.supportIndirectCommandBuffers());
         let mut this = Self {
             icb,
+            rt: rt.weak_self(),
             commands,
             prebuilt_tables,
             unique_prebuilt_tables,
@@ -659,42 +692,23 @@ impl DecodeIcb {
         buf.metal().gpuAddress()
     }
 
-    /// Formerly: buffers at or below this size were *assumed* read-only and
-    /// excluded from the disjointness test, on the grounds that tiny Hot
-    /// allocations are softcap scalars and lone u32 dims.
+    /// Buffer ids a command touches, or `None` when it binds an Immediate,
+    /// whose operands the tape does not name and which therefore may alias any
+    /// buffer.
     ///
-    /// That is an assumption about what a size is usually used for, not a
-    /// property of the buffer, and the failure it permits is silent. A genuine
-    /// read-after-write through a 16-byte buffer — a token id, a reduction
-    /// scalar — had its barrier elided, and so did a RAW through a shared
-    /// activation buffer that happened to be bound by most commands. Both
-    /// produce wrong output with nothing to notice it.
-    ///
-    /// Retained only so this comment has somewhere to live. Nothing reads it.
-    #[allow(dead_code)]
-    const READONLY_MAX_NBYTES: usize = 64;
-
-    /// Large-Buf ids for a cmd, minus ambient read-only. Immediate → `None`.
-    fn cmd_buf_set(cmd: &DecodeIcbCommand, ambient: &[u64]) -> Option<Vec<u64>> {
+    /// Every bound buffer counts. Buffers were once assumed read-only by size
+    /// (tiny scalars) or by how many commands bind them (pool arenas), and the
+    /// assumption elided real RAW barriers: a token id or reduction scalar in a
+    /// 16-byte buffer, or a shared activation buffer bound by most commands.
+    /// Without knowing which binds are *written*, a shared buffer must be
+    /// treated as a possible dependency. Getting elision back properly means
+    /// tracking writes at bind time, not guessing from size or frequency.
+    fn cmd_buf_set(cmd: &DecodeIcbCommand) -> Option<Vec<u64>> {
         let mut ids = Vec::with_capacity(cmd.binds.len());
         for b in &cmd.binds {
             match b {
                 DecodeIcbBind::Immediate { .. } => return None,
-                DecodeIcbBind::Buf { buf, .. } => {
-                    // Every bound buffer counts. Excluding small ones, or ones
-                    // bound by most commands, elided real RAW barriers — see
-                    // `READONLY_MAX_NBYTES`. Without knowing which binds are
-                    // *written*, a shared buffer must be treated as a possible
-                    // dependency.
-                    //
-                    // This is strictly more conservative than what shipped, so
-                    // fewer barriers are elided and the throughput this feature
-                    // was added for needs re-measuring on a real model. Getting
-                    // it back properly means tracking writes at bind time, not
-                    // guessing from size.
-                    let _ = ambient;
-                    ids.push(Self::buf_id(buf));
-                }
+                DecodeIcbBind::Buf { buf, .. } => ids.push(Self::buf_id(buf)),
             }
         }
         ids.sort_unstable();
@@ -702,80 +716,18 @@ impl DecodeIcb {
         Some(ids)
     }
 
-    /// Buffers bound by ≥ half of cmds (IcbScalarPool u32/f32 arenas, etc.) —
-    /// host-updated between tokens, read-only during a single tape execute.
-    fn ambient_readonly_bufs(commands: &[DecodeIcbCommand]) -> Vec<u64> {
-        let n = commands.len().max(1);
-        let mut freq: Vec<(u64, usize)> = Vec::new();
-        for cmd in commands {
-            let mut seen = Vec::new();
-            for b in &cmd.binds {
-                if let DecodeIcbBind::Buf { buf, .. } = b {
-                    if buf.nbytes() <= Self::READONLY_MAX_NBYTES {
-                        continue;
-                    }
-                    let id = Self::buf_id(buf);
-                    if seen.contains(&id) {
-                        continue;
-                    }
-                    seen.push(id);
-                    if let Some(e) = freq.iter_mut().find(|(k, _)| *k == id) {
-                        e.1 += 1;
-                    } else {
-                        freq.push((id, 1));
-                    }
-                }
-            }
-        }
-        // ≥80% of cmds and at least 8 hits — avoids marking short-tape RAW
-        // buffers (e.g. b in a→b / b→e) as ambient while still catching
-        // IcbScalarPool arenas on mini/E4B graphs.
-        freq.into_iter()
-            .filter(|(_, c)| *c >= 8 && *c * 5 >= n * 4)
-            .map(|(id, _)| id)
-            .collect()
-    }
-
     /// Elide `barrier_after` when the next cmd's Buf set is disjoint from every
     /// Buf touched in the open span. Returns elided count.
+    ///
+    /// A command with an Immediate bind (`None` set) may touch any buffer: it
+    /// makes the open span match everything, so the next barrier is kept, and
+    /// it never closes the span.
     pub fn elide_non_interfering_barriers(commands: &mut [DecodeIcbCommand]) -> u64 {
-        if commands.len() < 2 {
-            return 0;
-        }
-        let ambient = Self::ambient_readonly_bufs(commands);
-        let mut elided = 0u64;
-        let mut span: Vec<u64> = Vec::new();
-        for i in 0..commands.len() {
-            match Self::cmd_buf_set(&commands[i], &ambient) {
-                None => {
-                    span.clear();
-                    continue;
-                }
-                Some(ids) => {
-                    for id in ids {
-                        if !span.contains(&id) {
-                            span.push(id);
-                        }
-                    }
-                }
-            }
-            if !commands[i].barrier_after {
-                continue;
-            }
-            if i + 1 >= commands.len() {
-                span.clear();
-                continue;
-            }
-            let keep = match Self::cmd_buf_set(&commands[i + 1], &ambient) {
-                None => true,
-                Some(next) => span.iter().any(|w| next.iter().any(|n| n == w)),
-            };
-            if keep {
-                span.clear();
-            } else {
-                commands[i].barrier_after = false;
-                elided = elided.saturating_add(1);
-            }
+        let sets: Vec<Option<Vec<u64>>> = commands.iter().map(Self::cmd_buf_set).collect();
+        let mut barriers: Vec<bool> = commands.iter().map(|c| c.barrier_after).collect();
+        let elided = elide_barriers(&sets, &mut barriers);
+        for (cmd, keep) in commands.iter_mut().zip(barriers) {
+            cmd.barrier_after = keep;
         }
         elided
     }
@@ -1164,6 +1116,8 @@ impl DecodeIcb {
         // around encode loops and expect a benign no-op); only the bookkeeping
         // is corrected, and the fact is recorded so a caller can tell.
         if crate::decode_icb::binder_encode_nop() {
+            // A poisoned runtime fails here as it would on a live replay.
+            rt.ensure_not_poisoned()?;
             self.last_execute_was_nop = true;
             return Ok(());
         }
@@ -1322,6 +1276,17 @@ impl DecodeIcb {
                     );
                     execute_icb_calls = execute_icb_calls.saturating_add(icb_n);
                     execute_icb_cmds = execute_icb_cmds.saturating_add(icb_cmds);
+                    // A capture records every barrier the live encode emitted,
+                    // including the lazy hazard-mode ones, so an unmarked edge
+                    // inside the tape is one the capture did not need. The
+                    // binder would otherwise re-add it (`hazard_pending` is set
+                    // by every dispatch under skip-auto), making replay emit
+                    // N-1 barriers whatever the markers say. The last command's
+                    // pending hazard stays, to order it before whatever the
+                    // runtime encodes next.
+                    if !cmd.barrier_after && i + 1 < self.commands.len() {
+                        bnd.forgo_pending_barrier();
+                    }
                 }
                 Ok(())
             })
@@ -1456,6 +1421,9 @@ pub struct DecodeIcbCapture {
     /// How many times `begin_decode_icb_capture` was called while this capture
     /// was already live. Non-zero means a previous capture was never taken.
     pub nested_begins: usize,
+    /// The last scope ended with an unbarriered dispatch. See
+    /// [`capture_take_carried_hazard`].
+    carried_hazard: bool,
 }
 
 impl DecodeIcbCapture {
@@ -1636,6 +1604,36 @@ pub(crate) fn capture_note_dispatch(threadgroups: MTLSize, threads_per_tg: MTLSi
     });
 }
 
+/// While capturing, remember whether a binder scope ended with an unbarriered
+/// dispatch (`pending`), so the next scope can order it even when the runtime
+/// itself dropped that state.
+///
+/// Live execution orders consecutive scopes in one of two ways: the binder's
+/// pending-hazard barrier inside a shared encoder (async encode), or the
+/// command-buffer boundary (sync encode, or a mid-commit), which orders them
+/// for free and so leaves no barrier for capture to see. Replay packs the whole
+/// tape into one encoder, where only a marker orders anything. Carrying the
+/// pending state across scopes while capturing makes every capture record what
+/// the async path would have: the next scope's first dispatch emits the
+/// barrier, and `Binder::barrier` lands it on the previous command.
+pub(crate) fn capture_carry_hazard(pending: bool) {
+    CAPTURE.with(|c| {
+        if let Some(cap) = c.borrow_mut().as_mut() {
+            cap.carried_hazard = pending;
+        }
+    });
+}
+
+/// The state [`capture_carry_hazard`] stored, cleared by the read. `false` when
+/// not capturing.
+pub(crate) fn capture_take_carried_hazard() -> bool {
+    CAPTURE.with(|c| {
+        c.borrow_mut()
+            .as_mut()
+            .is_some_and(|cap| std::mem::take(&mut cap.carried_hazard))
+    })
+}
+
 /// Record that the last captured command needs a Device barrier after it.
 pub(crate) fn capture_note_barrier() {
     CAPTURE.with(|c| {
@@ -1645,26 +1643,22 @@ pub(crate) fn capture_note_barrier() {
     });
 }
 
-/// -1 = env, 0 = off, 1 = on — force ICB-capable pipelines in the cache.
-static ICB_PIPELINES: AtomicI8 = AtomicI8::new(-1);
+/// Force ICB-capable pipelines in the cache.
+static ICB_PIPELINES: TriFlag = TriFlag::new();
 
 pub fn set_icb_pipelines(on: bool) {
-    ICB_PIPELINES.store(if on { 1 } else { 0 }, Ordering::Relaxed);
+    ICB_PIPELINES.set(on);
 }
 
 pub fn icb_pipelines_enabled() -> bool {
-    let v = ICB_PIPELINES.load(Ordering::Relaxed);
-    if v >= 0 {
-        return v == 1;
-    }
-    let on = env_truthy(&[
-        "TESSL_ICB_PIPELINES",
-        "METAL_RUNTIME_ICB_PIPELINES",
-        "GEMMA_METAL_ICB_PIPELINES",
-    ])
-    .unwrap_or(false);
-    ICB_PIPELINES.store(if on { 1 } else { 0 }, Ordering::Relaxed);
-    on
+    ICB_PIPELINES.get(
+        &[
+            "TESSL_ICB_PIPELINES",
+            "METAL_RUNTIME_ICB_PIPELINES",
+            "GEMMA_METAL_ICB_PIPELINES",
+        ],
+        || false,
+    )
 }
 
 // When set, `GpuRuntime::with_binder` is a no-op (no Metal encode).
@@ -1740,13 +1734,13 @@ impl IcbFlagsTestGuard {
         let lock = LOCK.lock().unwrap_or_else(|e| e.into_inner());
         Self {
             saved: [
-                DECODE_ICB.load(Ordering::Relaxed),
-                ICB_FREEZE_BINDS.load(Ordering::Relaxed),
-                ICB_RANGE_BATCH.load(Ordering::Relaxed),
-                ICB_COARSE_RANGES.load(Ordering::Relaxed),
-                ICB_PIPELINES.load(Ordering::Relaxed),
-                ICB_EXECUTE.load(Ordering::Relaxed),
-                ICB_TRIAGE.load(Ordering::Relaxed),
+                DECODE_ICB.raw(),
+                ICB_FREEZE_BINDS.raw(),
+                ICB_RANGE_BATCH.raw(),
+                ICB_COARSE_RANGES.raw(),
+                ICB_PIPELINES.raw(),
+                ICB_EXECUTE.raw(),
+                ICB_TRIAGE.raw(),
             ],
             saved_binder_encode_nop: binder_encode_nop(),
             _lock: lock,
@@ -1757,13 +1751,13 @@ impl IcbFlagsTestGuard {
 #[cfg(test)]
 impl Drop for IcbFlagsTestGuard {
     fn drop(&mut self) {
-        DECODE_ICB.store(self.saved[0], Ordering::Relaxed);
-        ICB_FREEZE_BINDS.store(self.saved[1], Ordering::Relaxed);
-        ICB_RANGE_BATCH.store(self.saved[2], Ordering::Relaxed);
-        ICB_COARSE_RANGES.store(self.saved[3], Ordering::Relaxed);
-        ICB_PIPELINES.store(self.saved[4], Ordering::Relaxed);
-        ICB_EXECUTE.store(self.saved[5], Ordering::Relaxed);
-        ICB_TRIAGE.store(self.saved[6], Ordering::Relaxed);
+        DECODE_ICB.restore(self.saved[0]);
+        ICB_FREEZE_BINDS.restore(self.saved[1]);
+        ICB_RANGE_BATCH.restore(self.saved[2]);
+        ICB_COARSE_RANGES.restore(self.saved[3]);
+        ICB_PIPELINES.restore(self.saved[4]);
+        ICB_EXECUTE.restore(self.saved[5]);
+        ICB_TRIAGE.restore(self.saved[6]);
         set_binder_encode_nop(self.saved_binder_encode_nop);
     }
 }
@@ -1771,6 +1765,7 @@ impl Drop for IcbFlagsTestGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use objc2_metal::MTLResidencySet;
 
     #[test]
     fn decode_icb_flag_default_off() {
@@ -2084,6 +2079,73 @@ mod tests {
         // The destination is untouched, which is what makes the old accounting
         // a lie rather than a rounding difference.
         let _ = out;
+    }
+
+    /// A nop scope on a poisoned runtime reports the poison instead of `Ok`.
+    ///
+    /// Against the pre-fix code `execute` returns `Ok` and flags a nop.
+    #[test]
+    fn a_nop_execute_on_a_poisoned_runtime_fails() {
+        let _flags = IcbFlagsTestGuard::lock();
+        let rt = GpuRuntime::new().expect("GpuRuntime::new");
+        let (mut dec, _out) = DecodeIcb::mini_copy_chain(&rt, 64).expect("mini copy chain");
+        assert!(rt.with_binder(|_| Err("injected encode failure".into())).is_err());
+        let _nop = BinderEncodeNopGuard::enter();
+        assert!(dec.execute(&rt).is_err(), "poison must not be hidden by the nop scope");
+        assert!(rt.with_binder(|_| Ok(())).is_err());
+    }
+
+    /// A dropped tape leaves the residency set: 100 build-and-drops return the
+    /// set to where it started. Against the pre-fix code each leaves its ICB
+    /// registered and the count is 100 higher.
+    #[test]
+    fn dropping_tapes_returns_residency_to_baseline() {
+        let _flags = IcbFlagsTestGuard::lock();
+        let rt = GpuRuntime::new().expect("GpuRuntime::new");
+        rt.synchronize().unwrap();
+        let baseline = rt.metal4.residency.allocationCount();
+        for _ in 0..100 {
+            let (mut dec, out) = DecodeIcb::mini_copy_chain(&rt, 16).expect("mini copy chain");
+            dec.execute(&rt).expect("execute");
+            drop((dec, out));
+        }
+        rt.synchronize().unwrap();
+        assert_eq!(rt.metal4.residency.allocationCount(), baseline);
+    }
+
+    /// A buffer the tape never named may still be touched by an Immediate
+    /// command, so the barrier after it must stay.
+    ///
+    /// `[A write (no barrier), Immediate, B (barrier), A read]`: the barrier
+    /// after B orders the A write before the A read. Against the pre-fix code
+    /// the Immediate cleared the open span, B/A looked disjoint, and the
+    /// barrier was elided.
+    #[test]
+    fn an_immediate_keeps_the_barrier_it_precedes() {
+        const A: u64 = 1;
+        const B: u64 = 2;
+        let sets = [Some(vec![A]), None, Some(vec![B]), Some(vec![A])];
+        let mut barriers = [false, false, true, false];
+        assert_eq!(elide_barriers(&sets, &mut barriers), 0);
+        assert_eq!(barriers, [false, false, true, false]);
+
+        // Without the Immediate the same shape really is disjoint and elided.
+        let sets = [Some(vec![A]), Some(vec![B]), Some(vec![B]), Some(vec![A])];
+        let mut barriers = [false, false, true, false];
+        assert_eq!(elide_barriers(&sets, &mut barriers), 0, "span {{A,B}} meets A");
+        let sets = [Some(vec![B]), Some(vec![B]), Some(vec![B]), Some(vec![A])];
+        let mut barriers = [false, false, true, false];
+        assert_eq!(elide_barriers(&sets, &mut barriers), 1);
+        assert_eq!(barriers, [false; 4]);
+    }
+
+    /// An Immediate command never closes the span or hides its own barrier.
+    #[test]
+    fn elision_keeps_a_barrier_after_an_immediate_command() {
+        let sets = [Some(vec![1]), None, Some(vec![2])];
+        let mut barriers = [true, true, false];
+        assert_eq!(elide_barriers(&sets, &mut barriers), 0);
+        assert_eq!(barriers, [true, true, false]);
     }
 
     /// A second `begin` must not silently discard the first tape.

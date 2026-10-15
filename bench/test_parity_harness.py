@@ -19,6 +19,7 @@ import argparse
 import json
 import os
 import shutil
+import subprocess
 import sys
 import tempfile
 
@@ -552,341 +553,6 @@ def ladder_merge():
           True, "dtype varies")
 
 
-def speed_coverage():
-    """`paired_cross_runtime.missing_coverage` -- the timing sweep's version of
-    the same rule. A geomean over three of eight shapes used to print exactly
-    like a geomean over eight."""
-    import types
-    import paired_cross_runtime
-    from paired_cross_runtime import (
-        missing_coverage,
-        raw_measurements,
-        raw_round_record,
-        summarize_comparison,
-        summarize_throughput,
-    )
-    print("\n-- paired timing sweep: ladder coverage, drift, and robust summaries --")
-    labels = ["512x512x512", "1024x1024x1024", "2048x2048x2048"]
-    full_a = {(s, "tensorops-f32"): 1.0 for s in labels}
-    full_b = {(s, "mps-f32"): 1.0 for s in labels}
-
-    rounds = [(dict(full_a), dict(full_b)) for _ in range(3)]
-    gaps = missing_coverage(rounds, labels, "tensorops-f32", "mps-f32")
-    if gaps:
-        FAILURES.append(f"complete rounds reported gaps: {gaps}")
-        print(f"  FAIL  complete rounds reported gaps: {gaps}")
-    else:
-        print("  ok    complete coverage reports no gaps")
-
-    # torch MPS dropping out mid-sweep: one round returns nothing for a shape.
-    holed = [(dict(full_a), dict(full_b)) for _ in range(3)]
-    del holed[1][1][("1024x1024x1024", "mps-f32")]
-    gaps = missing_coverage(holed, labels, "tensorops-f32", "mps-f32")
-    if gaps != ["1024x1024x1024/mps-f32"]:
-        FAILURES.append(f"a hole in one round was not caught: {gaps}")
-        print(f"  FAIL  hole in one round not caught: {gaps}")
-    else:
-        print(f"  ok    a shape missing from one round is caught: {gaps}")
-
-    # The comparison runtime absent entirely -- every shape, every round.
-    gaps = missing_coverage([(dict(full_a), {}) for _ in range(3)], labels,
-                            "tensorops-f32", "mps-f32")
-    if len(gaps) != len(labels):
-        FAILURES.append(f"a fully absent lane was not fully reported: {gaps}")
-        print(f"  FAIL  fully absent lane: {gaps}")
-    else:
-        print(f"  ok    a fully absent comparison lane names all {len(gaps)} shapes")
-
-    # Paired aggregation must survive through the cross-shape summary. With
-    # crossed ratios, each actual round's geometric mean is sqrt(1.25), while
-    # the geomean of the two independently-computed medians is 1.125.
-    crossed = [
-        (
-            {(labels[0], "tensorops-f32"): 1.0,
-             (labels[1], "tensorops-f32"): 1.25},
-            {(labels[0], "mps-f32"): 1.0, (labels[1], "mps-f32"): 1.0},
-        ),
-        (
-            {(labels[0], "tensorops-f32"): 1.25,
-             (labels[1], "tensorops-f32"): 1.0},
-            {(labels[0], "mps-f32"): 1.0, (labels[1], "mps-f32"): 1.0},
-        ),
-    ]
-    result = summarize_comparison(
-        crossed, labels[:2], "tensorops-f32", "mps-f32", "synthetic", 1.25
-    )
-    paired = result["paired_geomean"]
-    expected = 1.25 ** 0.5
-    if (abs(paired["median"] - expected) < 1e-12
-            and all(
-                abs(value - expected) < 1e-12
-                for value in paired["outer_round_values"]
-            )):
-        print("  ok    aggregate is the median of paired per-round geomeans")
-    else:
-        FAILURES.append(f"paired aggregate lost pairing: {paired}")
-        print(f"  FAIL  paired aggregate: {paired}")
-
-    unstable = [
-        ({(labels[0], "tensorops-f32"): 1.0}, {(labels[0], "mps-f32"): 1.0}),
-        ({(labels[0], "tensorops-f32"): 2.0}, {(labels[0], "mps-f32"): 1.0}),
-    ]
-    try:
-        summarize_comparison(
-            unstable, labels[:1], "tensorops-f32", "mps-f32", "unstable", 1.25
-        )
-    except ValueError as exc:
-        if "exceeds bounded limit" in str(exc):
-            print("  ok    excessive paired ratio drift fails closed")
-        else:
-            FAILURES.append(f"ratio drift raised wrong error: {exc}")
-            print(f"  FAIL  ratio drift raised wrong error: {exc}")
-    else:
-        FAILURES.append("2x paired ratio spread passed a 1.25x drift gate")
-        print("  FAIL  excessive paired ratio drift was accepted")
-
-    # A single 100x outlier must not become the reported peak. Shape B's
-    # repeatable 2 GFLOP/s beats shape A's median of 1 GFLOP/s.
-    throughput_rounds = []
-    for a_value, b_value in ((1.0, 2.0), (1.0, 2.0), (100.0, 2.0)):
-        throughput_rounds.append(({
-            (labels[0], "tensorops-f32"): a_value,
-            (labels[1], "tensorops-f32"): b_value,
-        }, {}))
-    throughput = summarize_throughput(throughput_rounds, labels[:2])
-    if (len(throughput) == 1 and throughput[0]["shape"] == labels[1]
-            and throughput[0]["peak_gflops"] == 2.0
-            and throughput[0]["statistic"] == "max_shape_of_round_medians"):
-        print("  ok    throughput peak is selected from per-shape medians, not maxima")
-    else:
-        FAILURES.append(f"throughput summary selected an outlier: {throughput}")
-        print(f"  FAIL  throughput summary: {throughput}")
-
-    raw = raw_measurements({
-        (labels[0], "tensorops-f32"): 3.0,
-        (labels[1], "tensorops-f32"): 4.0,
-    })
-    if {row["gflops"] for row in raw} == {3.0, 4.0} and len(raw) == 2:
-        print("  ok    outer-round child aggregates retain every lane measurement")
-    else:
-        FAILURES.append(f"raw GEMM measurements were lost: {raw}")
-        print(f"  FAIL  raw GEMM measurements: {raw}")
-    round_record = raw_round_record(
-        2,
-        ["comparison", "tessl"],
-        {(labels[0], "tensorops-f32"): 3.0},
-        {(labels[0], "mps-f32"): 2.0},
-    )
-    if (round_record["round"] == 2
-            and round_record["execution_order"] == ["comparison", "tessl"]
-            and len(round_record["tessl"]) == len(round_record["comparison"]) == 1):
-        print("  ok    outer-round aggregate record retains pairing and execution order")
-    else:
-        FAILURES.append(f"GEMM raw round lost pairing/order: {round_record}")
-        print(f"  FAIL  GEMM raw round record: {round_record}")
-
-    duplicate_rows = [
-        dict(shape=labels[0], backend="tensorops-f32", gflops=1.0),
-        dict(shape=labels[0], backend="tensorops-f32", gflops=2.0),
-    ]
-    real_run = paired_cross_runtime.subprocess.run
-    try:
-        paired_cross_runtime.subprocess.run = lambda *a, **kw: types.SimpleNamespace(
-            returncode=0, stdout=json.dumps(duplicate_rows), stderr=""
-        )
-        try:
-            paired_cross_runtime._run(["synthetic"], {}, "synthetic")
-        except SystemExit as exc:
-            if "duplicate measurement" in str(exc):
-                print("  ok    duplicate GEMM measurements fail instead of overwriting")
-            else:
-                FAILURES.append(f"duplicate GEMM row raised wrong error: {exc}")
-                print(f"  FAIL  duplicate GEMM row raised wrong error: {exc}")
-        else:
-            FAILURES.append("duplicate GEMM rows silently overwrote each other")
-            print("  FAIL  duplicate GEMM rows were accepted")
-    finally:
-        paired_cross_runtime.subprocess.run = real_run
-
-
-def attn_paired_contract():
-    """`attn_paired` -- the same coverage rule, plus the batching guard.
-
-    The batching guard exists because this driver once set BENCH_ATTN_BATCHED
-    for the Python lane and not the Rust one, compared tessl at batch=1 against
-    MLX at batch=32, and printed a perfectly plausible 11.6x. Both lanes now
-    echo the batch they ran and the driver refuses the ratio; that refusal is
-    what is tested here.
-    """
-    import types
-    import attn_paired
-    print("\n-- attn_paired: coverage rule and batching guard --")
-
-    cfgs = ["swa128_decode_1k", "swa128_decode_4k"]
-    a = {(c, "tessl-decode"): 1.0 for c in cfgs}
-    b = {(c, "mlx"): 1.0 for c in cfgs}
-    rounds = [(dict(a), dict(b)) for _ in range(3)]
-    gaps = attn_paired.missing_coverage(rounds, cfgs, ["mlx"], "tessl-decode")
-    if gaps:
-        FAILURES.append(f"attn complete rounds reported gaps: {gaps}")
-        print(f"  FAIL  complete rounds reported gaps: {gaps}")
-    else:
-        print("  ok    complete coverage reports no gaps")
-
-    holed = [(dict(a), dict(b)) for _ in range(3)]
-    del holed[2][1][("swa128_decode_4k", "mlx")]
-    gaps = attn_paired.missing_coverage(holed, cfgs, ["mlx"], "tessl-decode")
-    if gaps != ["swa128_decode_4k/mlx"]:
-        FAILURES.append(f"attn hole in one round not caught: {gaps}")
-        print(f"  FAIL  hole in one round not caught: {gaps}")
-    else:
-        print(f"  ok    a config missing from one round is caught: {gaps}")
-
-    try:
-        attn_paired.validate_requested_configs([cfgs[0], cfgs[0]])
-    except ValueError as exc:
-        if "duplicates" in str(exc):
-            print("  ok    duplicate requested configs cannot weight the aggregate twice")
-        else:
-            FAILURES.append(f"duplicate configs raised wrong error: {exc}")
-            print(f"  FAIL  duplicate configs raised wrong error: {exc}")
-    else:
-        FAILURES.append("duplicate requested configs were accepted")
-        print("  FAIL  duplicate requested configs were accepted")
-
-    stable = [
-        (
-            {(cfgs[0], "tessl-decode"): ours},
-            {(cfgs[0], "mlx"): other},
-        )
-        for ours, other in ((2.0, 1.0), (2.2, 1.0), (2.1, 1.0))
-    ]
-    summary = attn_paired.summarize_comparison(
-        stable, cfgs[:1], "tessl-decode", "mlx", 1.25
-    )
-    row = summary["per_config"][0]
-    if (row["outer_round_values"] == [2.0, 2.2, 2.1]
-            and row["tessl_ms"]["outer_round_values"] == [2.0, 2.2, 2.1]
-            and summary["paired_geomean_tessl_over_other"]["median"] == 2.1):
-        print("  ok    attention evidence retains paired ratios and absolute rounds")
-    else:
-        FAILURES.append(f"attention raw/paired summary incomplete: {summary}")
-        print(f"  FAIL  attention raw/paired summary: {summary}")
-
-    unstable = [
-        ({(cfgs[0], "tessl-decode"): 1.0}, {(cfgs[0], "mlx"): 1.0}),
-        ({(cfgs[0], "tessl-decode"): 1.5}, {(cfgs[0], "mlx"): 1.0}),
-    ]
-    try:
-        attn_paired.summarize_comparison(
-            unstable, cfgs[:1], "tessl-decode", "mlx", 1.25
-        )
-    except ValueError as exc:
-        if "exceeds bounded limit" in str(exc):
-            print("  ok    attention paired drift above the cap fails closed")
-        else:
-            FAILURES.append(f"attention drift raised wrong error: {exc}")
-            print(f"  FAIL  attention drift raised wrong error: {exc}")
-    else:
-        FAILURES.append("attention ratio spread 1.5x passed a 1.25x gate")
-        print("  FAIL  excessive attention ratio drift was accepted")
-
-    def with_rows(rows):
-        def fake_run(cmd, env=None, **kw):
-            return types.SimpleNamespace(returncode=0, stdout=json.dumps(rows), stderr="")
-        return fake_run
-
-    real_run = attn_paired.subprocess.run
-    try:
-        # A lane that ran at a different batch than the driver asked for.
-        attn_paired.subprocess.run = with_rows(
-            [dict(cfg="swa128_decode_1k", runtime="mlx", median_ms=1.0, batched=1)])
-        try:
-            attn_paired._run(["x"], {}, "fake lane", lambda x: x["runtime"], 32)
-        except SystemExit as exc:
-            if "different batching" in str(exc):
-                print("  ok    a lane at the wrong batch refuses to form a ratio")
-            else:
-                FAILURES.append(f"batch mismatch raised the wrong error: {exc}")
-                print(f"  FAIL  wrong error: {exc}")
-        else:
-            FAILURES.append("a batch mismatch was accepted")
-            print("  FAIL  batch mismatch accepted")
-
-        # A lane that reports no batch at all cannot be confirmed, and an
-        # unconfirmable check must not pass like a confirmed one.
-        attn_paired.subprocess.run = with_rows(
-            [dict(cfg="swa128_decode_1k", runtime="mlx", median_ms=1.0)])
-        try:
-            attn_paired._run(["x"], {}, "fake lane", lambda x: x["runtime"], 32)
-        except SystemExit as exc:
-            if "no 'batched' field" in str(exc):
-                print("  ok    a lane that reports no batch is refused, not trusted")
-            else:
-                FAILURES.append(f"missing batch field raised the wrong error: {exc}")
-                print(f"  FAIL  wrong error: {exc}")
-        else:
-            FAILURES.append("a lane reporting no batch was accepted")
-            print("  FAIL  missing batch field accepted")
-
-        # A non-finite or zero median is a failed measurement, not a fast one.
-        for bad in (0.0, float("nan"), -1.0):
-            attn_paired.subprocess.run = with_rows(
-                [dict(cfg="swa128_decode_1k", runtime="mlx", median_ms=bad, batched=1)])
-            try:
-                attn_paired._run(["x"], {}, "fake lane", lambda x: x["runtime"], 1)
-            except SystemExit:
-                pass
-            else:
-                FAILURES.append(f"median_ms={bad} was accepted as a timing")
-                print(f"  FAIL  median_ms={bad} accepted")
-                break
-        else:
-            print("  ok    zero, NaN and negative medians are all refused")
-
-        duplicate_rows = [
-            dict(cfg=cfgs[0], runtime="mlx", median_ms=1.0, batched=1),
-            dict(cfg=cfgs[0], runtime="mlx", median_ms=2.0, batched=1),
-        ]
-        attn_paired.subprocess.run = with_rows(duplicate_rows)
-        try:
-            attn_paired._run(["x"], {}, "fake lane", lambda x: x["runtime"], 1)
-        except SystemExit as exc:
-            if "duplicate measurement" in str(exc):
-                print("  ok    duplicate attention rows fail instead of overwriting")
-            else:
-                FAILURES.append(f"duplicate attention row raised wrong error: {exc}")
-                print(f"  FAIL  duplicate attention row raised wrong error: {exc}")
-        else:
-            FAILURES.append("duplicate attention rows silently overwrote each other")
-            print("  FAIL  duplicate attention rows were accepted")
-
-        raw = attn_paired.raw_measurements({
-            (cfgs[0], "tessl-decode"): 2.0,
-            (cfgs[0], "mlx"): 1.0,
-        })
-        if len(raw) == 2 and {row["median_ms"] for row in raw} == {1.0, 2.0}:
-            print("  ok    outer-round attention aggregates retain both lanes")
-        else:
-            FAILURES.append(f"raw attention measurements were lost: {raw}")
-            print(f"  FAIL  raw attention measurements: {raw}")
-        round_record = attn_paired.raw_round_record(
-            1,
-            ["tessl", "comparison"],
-            {(cfgs[0], "tessl-decode"): 2.0},
-            {(cfgs[0], "mlx"): 1.0},
-        )
-        if (round_record["round"] == 1
-                and round_record["execution_order"] == ["tessl", "comparison"]
-                and len(round_record["tessl"]) == len(round_record["comparison"]) == 1):
-            print("  ok    attention aggregate round retains pairing and execution order")
-        else:
-            FAILURES.append(f"attention raw round lost pairing/order: {round_record}")
-            print(f"  FAIL  attention raw round record: {round_record}")
-    finally:
-        attn_paired.subprocess.run = real_run
-
-
 ATTN_CLI_CASES = [
     ("--dump-parity with no directory", ["--dump-parity"], {}, "requires a directory"),
     ("BENCH_ITERS=0", [], {"BENCH_ITERS": "0"}, "below the minimum"),
@@ -1113,6 +779,38 @@ def attn_cli_contract():
             print(f"  ok    {label}: exit {r.returncode}, names the cause")
 
 
+def coverage_adversarial():
+    """`bench/test_kernel_coverage_adversarial.py`: phantom and missed kernels,
+    exit statuses, stale-binary refusal. A subprocess, so its unittest run is
+    one section here; any failure fails the harness."""
+    print("\n-- kernel coverage adversarial contract --")
+    r = subprocess.run([sys.executable, "-I",
+                        os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                     "test_kernel_coverage_adversarial.py")],
+                       capture_output=True, text=True, timeout=600)
+    tail = r.stderr.strip().splitlines()[-1] if r.stderr.strip() else ""
+    if r.returncode == 0:
+        print(f"  ok    adversarial tests passed ({tail})")
+    else:
+        FAILURES.append(f"kernel coverage adversarial tests failed:\n{r.stderr[-1500:]}")
+        print(f"  FAIL  adversarial tests: exit {r.returncode}\n{r.stderr[-1500:]}")
+
+
+def metallib_unavailable(reason, hosted=None):
+    """The metallib cross-check could not run. Locally that is a visible partial
+    skip. On the hosted macOS job (TESSL_HOSTED=1; the runner has Xcode and has
+    just built the metallib) it is a misconfiguration, so it fails instead of
+    reading as a pass."""
+    if hosted is None:
+        hosted = bool(os.environ.get("TESSL_HOSTED"))
+    if hosted:
+        FAILURES.append(f"{reason} (TESSL_HOSTED is set: a skipped cross-check is a failure)")
+        print(f"  FAIL  {reason}; TESSL_HOSTED is set")
+        return None
+    print(f"  SKIP  {reason}")
+    return PartialSkip("compiled metallib cross-check", reason)
+
+
 def coverage_inventory():
     """`kernel_coverage.inventory` -- the kernel census.
 
@@ -1134,6 +832,8 @@ def coverage_inventory():
             return d
 
         d = write("kernel void alpha(device float* x) {}\n"
+                  "#define NN_COOP_KERNEL(NAME, T, A, B, C, D) kernel void NAME(device T* x) {}\n"
+                  "#define TN_NT_COOP_KERNEL(NAME, T, A, B) kernel void NAME(device T* x) {}\n"
                   "NN_COOP_KERNEL(beta, bfloat, 64, 64, 4, false)\n"
                   "TN_NT_COOP_KERNEL( gamma , float, 128, 64)\n")
         names, _ = inventory(d, metallib="/nonexistent")
@@ -1159,21 +859,56 @@ def coverage_inventory():
             FAILURES.append(f"macro body leaked into the inventory: {sorted(names)}")
             print(f"  FAIL  macro body leaked: {sorted(names)}")
 
-        # A macro whose first argument is not an identifier cannot be parsed
-        # for a kernel name, and must fail rather than be skipped.
+        # A source the preprocessor rejects is a failed census, never a smaller one.
         d = write("kernel void alpha(device float* x) {}\n"
-                  'WEIRD_NEW_KERNEL("delta", bfloat)\n')
+                  'WEIRD_NEW_KERNEL("delta", bfloat)\n#error not a kernel source\n')
         try:
             inventory(d, metallib="/nonexistent")
         except SystemExit as exc:
-            if "not parsed" in str(exc):
-                print("  ok    an unparsed kernel macro fails loudly")
+            if "does not preprocess" in str(exc):
+                print("  ok    a source that does not preprocess fails loudly")
             else:
-                FAILURES.append(f"unparsed macro raised the wrong error: {exc}")
+                FAILURES.append(f"unpreprocessable source raised the wrong error: {exc}")
                 print(f"  FAIL  wrong error: {exc}")
         else:
-            FAILURES.append("an unparsed kernel macro was silently undercounted")
-            print("  FAIL  unparsed macro silently undercounted")
+            FAILURES.append("a source that does not preprocess was silently undercounted")
+            print("  FAIL  unpreprocessable source silently undercounted")
+
+        # Macro families that stamp kernels under names the old pattern could not
+        # see: a name not ending in KERNEL, `##` pasting, and a macro that stamps
+        # through another macro (the shapes of the 29 qwen35 kernels it missed).
+        d = write("#define STAMP(NAME, T) \\\n"
+                  "kernel void NAME(device T* x) {}\n"
+                  "#define STAMP_RULE(R, T) \\\n"
+                  "    STAMP(fam_##R##_a, T) \\\n"
+                  "    STAMP(fam_##R##_b, T)\n"
+                  "STAMP(plain_stamp, float)\n"
+                  "STAMP_RULE(kahan, bfloat)\n"
+                  "STAMP_RULE(sr,\n"
+                  "           float)\n")
+        names, _ = inventory(d, metallib="/nonexistent")
+        want = {"plain_stamp", "fam_kahan_a", "fam_kahan_b", "fam_sr_a", "fam_sr_b"}
+        if names == want:
+            print("  ok    defined macro families are expanded (non-KERNEL names, ##, nesting)")
+        else:
+            FAILURES.append(f"macro expansion got {sorted(names)}")
+            print(f"  FAIL  macro expansion got {sorted(names)}")
+
+        # A binary that cannot dump its metallib (stale, built before
+        # `--dump-metallib`) is a hard failure naming the fix, never a library
+        # with nothing in it.
+        from kernel_coverage import dump_embedded_metallib
+        try:
+            dump_embedded_metallib("/usr/bin/true", tmp)
+        except SystemExit as exc:
+            if "cargo build --release --bins" in str(exc):
+                print("  ok    a binary that dumps no metallib fails, naming the rebuild")
+            else:
+                FAILURES.append(f"stale-binary error does not name the fix: {exc}")
+                print(f"  FAIL  stale-binary error: {exc}")
+        else:
+            FAILURES.append("a binary that dumped no metallib was accepted")
+            print("  FAIL  dump-less binary accepted")
 
         # An empty kernel directory is a broken run, not zero kernels.
         d = tempfile.mkdtemp(dir=tmp)
@@ -1193,7 +928,7 @@ def coverage_inventory():
         try:
             inventory(d, metallib="/definitely/missing.metallib", require_metallib=True)
         except SystemExit as exc:
-            if "metallib missing" in str(exc):
+            if "metallib missing" in str(exc) and getattr(exc, "code", None) == 77:
                 print("  ok    required metallib cross-check fails closed when absent")
             else:
                 FAILURES.append(f"missing metallib raised wrong error: {exc}")
@@ -1207,9 +942,7 @@ def coverage_inventory():
         from kernel_coverage import metallib_symbols
         real = metallib_symbols()
         if real is None:
-            reason = "metal-nm unavailable; metallib cross-check unverified"
-            print(f"  SKIP  {reason}")
-            partial_skip = PartialSkip("compiled metallib cross-check", reason)
+            partial_skip = metallib_unavailable("metal-nm unavailable; metallib cross-check unverified")
         else:
             d = write("kernel void not_a_real_kernel(device float* x) {}\n")
             try:
@@ -1225,6 +958,20 @@ def coverage_inventory():
                 FAILURES.append("a source scan disagreeing with the metallib was accepted")
                 print("  FAIL  metallib disagreement accepted")
 
+        # TESSL_HOSTED turns the metal-nm skip into a failure; without it, a visible skip.
+        before = len(FAILURES)
+        with contextlib.redirect_stdout(io.StringIO()):
+            skipped = metallib_unavailable("probe", hosted=False)
+            failed_quietly = skipped is None or len(FAILURES) != before
+            after_skip = len(FAILURES)
+            hosted_result = metallib_unavailable("probe", hosted=True)
+        if failed_quietly or hosted_result is not None or len(FAILURES) != after_skip + 1:
+            FAILURES.append("metallib_unavailable does not separate a local skip from a hosted failure")
+            print("  FAIL  hosted/local metallib skip policy")
+        else:
+            del FAILURES[after_skip:]
+            print("  ok    a missing metal-nm is a visible skip locally and a failure when TESSL_HOSTED is set")
+
         # The real tree must agree with the union of both declaration forms.
         names, _ = inventory()
         if len(names) >= 80 and "matmul2d_tensorops_bf16_f32_64x64_sg4" in names:
@@ -1235,44 +982,6 @@ def coverage_inventory():
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
     return partial_skip
-
-
-def tile_audit_contract():
-    """The static tile audit must reject missing or unverifiable geometry."""
-    import importlib.util
-
-    path = os.path.join(os.path.dirname(HERE_BENCH), "scripts", "audit_gemm_tiles.py")
-    spec = importlib.util.spec_from_file_location("audit_gemm_tiles", path)
-    audit = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(audit)
-
-    print("\n-- static TileGeom audit fails closed --")
-    kernels = {"matmul_ok": (32, 64, 4, "constexpr")}
-    tiles = {"TILE_OK": (32, 64, 4)}
-    cases = [
-        ("matching geometry", kernels, tiles, "matmul_ok", "TILE_OK", False),
-        ("missing kernel", kernels, tiles, "matmul_missing", "TILE_OK", True),
-        ("missing Rust tile", kernels, tiles, "matmul_ok", "TILE_MISSING", True),
-        ("kernel with no geometry", {"matmul_ok": (None, None, None, "no compile-time SM/SN")},
-         tiles, "matmul_ok", "TILE_OK", True),
-    ]
-    for name, kt, rt, kernel, tile, expect_error in cases:
-        error = audit.geometry_error(kt, rt, kernel, tile)
-        if (error is not None) != expect_error:
-            FAILURES.append(f"tile audit {name}: unexpected result {error!r}")
-            print(f"  FAIL  {name}: {error!r}")
-        else:
-            print(f"  ok    {name}: {error or 'accepted'}")
-    for name, tile, expect_match in [
-        ("agreeing geometry", (32, 64, 4), True),
-        ("different tile rows", (64, 64, 4), False),
-        ("different simdgroups", (32, 64, 2), False),
-    ]:
-        if audit.geometry_matches(kernels["matmul_ok"], tile) != expect_match:
-            FAILURES.append(f"tile audit {name}: wrong verdict")
-            print(f"  FAIL  {name}")
-        else:
-            print(f"  ok    {name}: {'matches' if expect_match else 'refused'}")
 
 
 def execution_policy_contract():
@@ -1352,297 +1061,6 @@ def execution_policy_contract():
         ran.as_dict()["counts"]["ran"] == 1 and ran.verdict() == "PASS",
         "a completed section is counted as ran",
     )
-
-
-def benchmark_evidence_contract():
-    """Pure regressions for drift policy, provenance, and atomic publication."""
-    import subprocess
-
-    from benchmark_evidence import (
-        DEFAULT_MAX_RATIO_SPREAD,
-        DEFAULT_OUTER_ROUNDS,
-        MAX_RATIO_SPREAD,
-        EvidenceOutput,
-        clean_benchmark_env,
-        embedded_metallib_path,
-        finish_provenance,
-        parse_ratio_spread_limit,
-        requested_output_path,
-        start_provenance,
-        validate_evidence_sample_counts,
-    )
-
-    print("\n-- cross-runtime evidence provenance and bounded policy --")
-    if (DEFAULT_MAX_RATIO_SPREAD == 1.10 and MAX_RATIO_SPREAD == 1.25
-            and DEFAULT_OUTER_ROUNDS == 6
-            and parse_ratio_spread_limit("1.25") == 1.25):
-        print("  ok    defaults are 6 balanced rounds/10% drift; override caps at 25%")
-    else:
-        FAILURES.append(
-            f"drift policy is default={DEFAULT_MAX_RATIO_SPREAD}, max={MAX_RATIO_SPREAD}"
-        )
-        print("  FAIL  ratio-spread safety defaults are wrong")
-    for invalid in ("nan", "inf", "0.99", "1.251"):
-        try:
-            parse_ratio_spread_limit(invalid)
-        except ValueError:
-            continue
-        FAILURES.append(f"unbounded ratio-spread limit {invalid!r} accepted")
-        print(f"  FAIL  unbounded ratio-spread limit {invalid!r} accepted")
-        break
-    else:
-        print("  ok    NaN, infinity, sub-unit, and unbounded drift caps are refused")
-    selected = requested_output_path(
-        ["driver.py", "--out", "first.json", "--out=second.json"]
-    )
-    if selected == "second.json":
-        print("  ok    pre-validation output discovery deterministically uses the last value")
-    else:
-        FAILURES.append(f"pre-validation output discovery selected {selected!r}")
-        print(f"  FAIL  pre-validation output discovery selected {selected!r}")
-    old_knob = os.environ.get("TESSL_ATTN_TILED")
-    try:
-        os.environ["TESSL_ATTN_TILED"] = "1"
-        clean_env = clean_benchmark_env({"BENCH_ITERS": "7"})
-    finally:
-        if old_knob is None:
-            os.environ.pop("TESSL_ATTN_TILED", None)
-        else:
-            os.environ["TESSL_ATTN_TILED"] = old_knob
-    if ("TESSL_ATTN_TILED" not in clean_env and clean_env.get("BENCH_ITERS") == "7"
-            and clean_env.get("PATH") == os.environ.get("PATH")):
-        print("  ok    inherited tuning knobs are cleared; only explicit overrides survive")
-    else:
-        FAILURES.append("benchmark environment sanitizer leaked or dropped the wrong values")
-        print("  FAIL  benchmark environment sanitizer")
-    validate_evidence_sample_counts(4, 3)
-    rejected_counts = []
-    invalid_counts = (
-        (0, 3), (1, 3), (2, 3), (3, 3), (5, 3),
-        (4, 0), (4, 1), (4, 2),
-    )
-    for rounds, iters in invalid_counts:
-        try:
-            validate_evidence_sample_counts(rounds, iters)
-        except ValueError:
-            rejected_counts.append((rounds, iters))
-    if rejected_counts == list(invalid_counts):
-        print("  ok    low/odd round counts and sub-median inner samples are refused")
-    else:
-        FAILURES.append(f"insufficient sample counts accepted: {rejected_counts}")
-        print(f"  FAIL  insufficient sample-count gate: {rejected_counts}")
-
-    tmp = tempfile.mkdtemp(prefix="benchmark-evidence-")
-    try:
-        metallib = os.path.join(tmp, "default-synthetic.metallib")
-        binary = os.path.join(tmp, "benchmark")
-        with open(metallib, "wb") as handle:
-            handle.write(b"synthetic metal library")
-        with open(binary, "wb") as handle:
-            handle.write(b"prefix" + metallib.encode() + b"\x00suffix")
-        if embedded_metallib_path(binary) == os.path.realpath(metallib):
-            print("  ok    the exact metallib path embedded in the binary is resolved")
-        else:
-            FAILURES.append("embedded metallib resolver selected the wrong file")
-            print("  FAIL  embedded metallib resolver selected the wrong file")
-
-        hostile_dir = os.path.join(tmp, "checkout @([βeta])")
-        os.makedirs(hostile_dir)
-        hostile_metallib = os.path.join(hostile_dir, "default [tuned]@2.metallib")
-        hostile_binary = os.path.join(tmp, "benchmark-hostile-path")
-        with open(hostile_metallib, "wb") as handle:
-            handle.write(b"synthetic metal library")
-        with open(hostile_binary, "wb") as handle:
-            handle.write(b"prefix" + hostile_metallib.encode() + b"\x00suffix")
-        if embedded_metallib_path(hostile_binary) == os.path.realpath(hostile_metallib):
-            print("  ok    @, parentheses/brackets, and non-ASCII path bytes are resolved")
-        else:
-            FAILURES.append("embedded metallib resolver rejected a valid hostile path")
-            print("  FAIL  embedded metallib resolver rejected a valid hostile path")
-
-        provenance = start_provenance(
-            driver_path=__file__,
-            argv=[__file__, "--synthetic", "value with spaces"],
-            repo_scope=os.path.dirname(HERE_BENCH),
-            executable_inputs={"fixture": __file__, "metal_library": metallib},
-            benchmark_config={"rounds": 6, "synthetic": True, "child_path": __file__},
-            probe_device=False,
-        )
-        finish_provenance(provenance)
-        required = (
-            provenance.get("git", {}).get("revision"),
-            provenance.get("host", {}).get("machine"),
-            provenance.get("os", {}).get("platform"),
-            provenance.get("runtime", {}).get("python"),
-            provenance.get("load", {}).get("start"),
-            provenance.get("load", {}).get("finish"),
-            provenance.get("power", {}).get("thermal_pressure"),
-            provenance.get("power", {}).get("thermal_pressure_finish"),
-            provenance.get("power", {}).get("power_source_finish"),
-            provenance.get("environment_policy"),
-            provenance.get("path_policy"),
-            provenance.get("inputs", {}).get("fixture", {}).get("sha256"),
-            provenance.get("inputs", {}).get("metal_library", {}).get("sha256"),
-            provenance.get("invocation_shell"),
-            provenance.get("finished_at_utc"),
-        )
-        dirty_recorded = isinstance(provenance.get("git", {}).get("dirty"), bool)
-        no_full_environment = "environment" not in provenance
-        serialized_provenance = json.dumps(provenance)
-        home = os.path.abspath(os.path.expanduser("~"))
-        home_redacted = (
-            home == os.path.sep
-            or (home not in serialized_provenance and "$HOME" in serialized_provenance)
-        )
-        if (all(required) and dirty_recorded and no_full_environment
-                and home_redacted and provenance["benchmark_config"]["rounds"] == 6):
-            try:
-                json.dumps(provenance)
-            except (TypeError, ValueError) as exc:
-                FAILURES.append(f"provenance is not JSON serializable: {exc}")
-                print(f"  FAIL  provenance is not JSON serializable: {exc}")
-            else:
-                print("  ok    revision/dirty, host/runtime, power/load, invocation, and hashes persist")
-        else:
-            FAILURES.append(f"provenance is missing required evidence: {required}")
-            print(f"  FAIL  provenance is missing required evidence: {required}")
-
-        output_path = os.path.join(tmp, "result.json")
-        with open(output_path, "w") as handle:
-            json.dump({"generation": "old"}, handle)
-        publisher = EvidenceOutput(
-            output_path, driver_path=__file__, argv=[__file__, "--out", output_path]
-        )
-        publisher.begin()
-        with open(output_path) as handle:
-            preserved = json.load(handle)
-        with open(f"{output_path}.attempt.json") as handle:
-            pending = json.load(handle)
-        serialized_pending = json.dumps(pending)
-        if (preserved == {"generation": "old"}
-                and pending["status"] == "not_published"
-                and pending["prior_output"]["sha256"]
-                and (home == os.path.sep or home not in serialized_pending)):
-            print(
-                "  ok    a new attempt marks an older output stale without "
-                "overwriting it or disclosing the home path"
-            )
-        else:
-            FAILURES.append(f"failed-attempt marker is incomplete: {pending}")
-            print(f"  FAIL  failed-attempt marker is incomplete: {pending}")
-
-        publisher.publish({"generation": "new"})
-        with open(output_path) as handle:
-            published = json.load(handle)
-        with open(f"{output_path}.attempt.json") as handle:
-            marker = json.load(handle)
-        staged_left = [name for name in os.listdir(tmp) if name.startswith(".result.json.")]
-        if (published == {"generation": "new"} and marker["status"] == "published"
-                and marker["published_output"]["sha256"] and not staged_left
-                and os.path.dirname(publisher.marker_path) == os.path.dirname(output_path)):
-            print("  ok    successful evidence publication is atomic and hash-recorded")
-        else:
-            FAILURES.append(
-                f"atomic publication failed: published={published}, marker={marker}, temp={staged_left}"
-            )
-            print("  FAIL  atomic evidence publication contract")
-
-        nonfinite_output = os.path.join(tmp, "nonfinite.json")
-        with open(nonfinite_output, "w") as handle:
-            json.dump({"generation": "old"}, handle)
-        nonfinite_publisher = EvidenceOutput(
-            nonfinite_output,
-            driver_path=__file__,
-            argv=[__file__, "--out", nonfinite_output],
-        )
-        nonfinite_publisher.begin()
-        try:
-            nonfinite_publisher.publish({"ratio": float("nan")})
-        except ValueError:
-            with open(nonfinite_output) as handle:
-                nonfinite_preserved = json.load(handle)
-            with open(f"{nonfinite_output}.attempt.json") as handle:
-                nonfinite_marker = json.load(handle)
-            nonfinite_temps = [
-                name for name in os.listdir(tmp) if name.startswith(".nonfinite.json.")
-            ]
-            if (nonfinite_preserved == {"generation": "old"}
-                    and nonfinite_marker["status"] == "not_published"
-                    and not nonfinite_temps):
-                print("  ok    non-finite JSON cannot replace prior evidence")
-            else:
-                FAILURES.append("non-finite publication damaged the prior artifact")
-                print("  FAIL  non-finite publication damaged the prior artifact")
-        else:
-            FAILURES.append("non-finite JSON was published as evidence")
-            print("  FAIL  non-finite JSON was published as evidence")
-
-        missing_parent = os.path.join(tmp, "missing-parent")
-        missing_output = os.path.join(missing_parent, "result.json")
-        missing_publisher = EvidenceOutput(
-            missing_output,
-            driver_path=__file__,
-            argv=[__file__, "--out", missing_output],
-        )
-        try:
-            missing_publisher.begin()
-        except FileNotFoundError:
-            if not os.path.exists(missing_parent):
-                print("  ok    output parents must pre-exist and are never created implicitly")
-            else:
-                FAILURES.append("missing output parent was partially created")
-                print("  FAIL  missing output parent was partially created")
-        else:
-            FAILURES.append("missing output parent was silently created")
-            print("  FAIL  missing output parent did not fail closed")
-
-        # The marker is created before argparse validates any other option, so
-        # even a malformed rerun makes a preserved older output visibly stale.
-        probes = (
-            ("cap", ["--max-ratio-spread", "9"], "--max-ratio-spread"),
-            ("round3", ["--rounds", "3"], "even integer >= 4"),
-            ("round5", ["--rounds", "5"], "even integer >= 4"),
-        )
-        for script in ("paired_cross_runtime.py", "attn_paired.py"):
-            for probe_name, bad_args, needle in probes:
-                rejected_output = os.path.join(tmp, f"{script}.{probe_name}.json")
-                with open(rejected_output, "w") as handle:
-                    json.dump({"generation": "old"}, handle)
-                proc = subprocess.run(
-                    [
-                        sys.executable,
-                        os.path.join(HERE_BENCH, script),
-                        *bad_args,
-                        "--out",
-                        rejected_output,
-                    ],
-                    capture_output=True,
-                    text=True,
-                )
-                with open(f"{rejected_output}.attempt.json") as handle:
-                    rejected_marker = json.load(handle)
-                with open(rejected_output) as handle:
-                    rejected_preserved = json.load(handle)
-                combined = proc.stdout + proc.stderr
-                if (proc.returncode != 0
-                        and rejected_marker["status"] == "not_published"
-                        and rejected_preserved == {"generation": "old"}
-                        and needle in combined and "round 1/" not in combined):
-                    continue
-                FAILURES.append(
-                    f"{script}/{probe_name}: pre-validation rejection failed: "
-                    f"rc={proc.returncode}, marker={rejected_marker}, output="
-                    f"{rejected_preserved}, text={combined[:120]!r}"
-                )
-                print(f"  FAIL  {script}/{probe_name} did not fail before child launch")
-                break
-            else:
-                continue
-            break
-        else:
-            print("  ok    both drivers mark stale and reject bad/odd policy before child launch")
-    finally:
-        shutil.rmtree(tmp, ignore_errors=True)
 
 
 def parse_mode(argv=None):
@@ -1846,14 +1264,11 @@ def main(argv=None):
 
     run_gpu_section(summary, mode, "bench_gemm_sweep CLI contract", cli_contract)
     run_section(summary, "ladder merge contract", ladder_merge)
-    run_section(summary, "paired timing coverage contract", speed_coverage)
     run_section(summary, "attention semantics contract", attention_semantics)
     run_gpu_section(summary, mode, "bench_flash_attn CLI contract", attn_cli_contract)
-    run_section(summary, "attention paired contract", attn_paired_contract)
     run_section(summary, "attention tuning contract", tune_knob_contract)
     run_section(summary, "kernel inventory contract", coverage_inventory)
-    run_section(summary, "static tile audit contract", tile_audit_contract)
-    run_section(summary, "benchmark evidence contract", benchmark_evidence_contract)
+    run_section(summary, "kernel coverage adversarial contract", coverage_adversarial)
     run_section(summary, "execution policy contract", execution_policy_contract)
 
     print()

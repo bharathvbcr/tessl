@@ -150,7 +150,8 @@
 //! (bf16, 4096³), 16,293 (tf32) and 6,431 (f32 exact).
 //!
 //! Reproduce with `cargo run --release --bin bench_gemm_sweep` and
-//! `python3 bench/paired_cross_runtime.py --rounds 5 --lanes torch,mlx`. Single
+//! `bench_paired --format rows:shape,backend,gflops` (recipe in
+//! `docs/benchmarking.md`). Single
 //! runs on this hardware fluctuate 15–20% as the power governor moves, so
 //! cross-runtime claims come from paired sweeps only.
 //!
@@ -239,6 +240,8 @@ pub mod mtl_tensor;
 pub mod nn;
 pub mod npy;
 pub mod ops;
+#[cfg(test)]
+mod parser_mutation;
 mod plain;
 pub mod qwen35;
 pub mod qwen35_adamw;

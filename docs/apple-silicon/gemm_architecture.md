@@ -105,10 +105,9 @@ already made on numerics grounds.)
 
 ```bash
 # Static: every Rust TileGeom vs the kernel's constexpr SM/SN and simdgroup
-# count. Resolves paths from its own
-# location, so it runs from any directory and survives `cargo package`. It also
-# fails if tessl-arch02 grows a local copy of the kernels again.
-python3 scripts/audit_gemm_tiles.py
+# count, read from the Rust selectors themselves. It also fails if
+# tessl-arch02 grows a local copy of the kernels again.
+cargo test --release --test audit_gemm_tiles
 ```
 
 ```bash
@@ -261,9 +260,9 @@ and exiting 0.
 | `bench/parity_ladder.py` | Drives the above across the whole ladder, one shape at a time, and merges. Use this for the accuracy numbers. |
 | `bench/test_parity_harness.py` | Adversarial cases for every harness, with machine-readable ran/skipped/failed accounting. Use `--pure` on host-only lanes and `--require-gpu` on physical Metal. |
 | `bench_gemm_variants` | TN / NT / accumulate / split-K / batched / epilogue / f16 lanes -- the 18 GEMM kernels the cross-runtime sweep cannot reach. |
-| `bench/kernel_coverage.py` | Measures which kernels the suite dispatches (`TESSL_KERNEL_TRACE`), cross-checked against `metal-nm` on the exact OUT_DIR metallib embedded in the release binary. `--check` gates on 100%; `--metallib` selects an explicit artifact. |
-| `bench_flash_attn` + `bench/attn_paired.py` | The attention kernels, prefill and decode, over 14 configs. Historical runs first measured 11x (torch) / 20.5x (MLX) slower, geomean, worst case 271x. The row-parallel and KV-split rewrites, four throughput changes, and a routing fix followed; later schema-v1 snapshots measured 0.90-0.97x MLX prefill and 0.91-0.97x decode kernel-only. See the tessl README and do not treat those snapshots as current evidence. |
-| `bench/paired_cross_runtime.py` | Alternates the tessl and torch/MLX lanes round by round. Aborts rather than reporting a geomean over part of the ladder; `--out` writes the artifact. |
+| `bench/kernel_coverage.py` | Measures which kernels the suite dispatches (`TESSL_KERNEL_TRACE`), cross-checked against `metal-nm` on the metallib bytes the release binary embeds (`bench_gemm_sweep --dump-metallib`). `--check` gates on 100%; `--metallib` selects an explicit artifact. |
+| `bench_flash_attn` + `bench_paired` | The attention kernels, prefill and decode, over 14 configs. Historical runs first measured 11x (torch) / 20.5x (MLX) slower, geomean, worst case 271x. The row-parallel and KV-split rewrites, four throughput changes, and a routing fix followed; later schema-v1 snapshots measured 0.90-0.97x MLX prefill and 0.91-0.97x decode kernel-only. See the tessl README and do not treat those snapshots as current evidence. |
+| `bench_paired --format rows:...` | Alternates the tessl and torch/MLX lanes round by round. Aborts rather than reporting a geomean over part of the ladder (`--keys`); `--evidence --out` writes the artifact. Recipes in docs/benchmarking.md. |
 
 The canonical numeric summary and evidence status live in the tessl README's
 [latest checked-in result snapshot](../../README.md#latest-checked-in-result-snapshot).
@@ -330,7 +329,7 @@ itself* ranging 0.92x–1.46x.
 
 The same applies across runtimes. Two back-to-back runs of the identical
 cross-runtime sweep disagreed by 16–21% on the torch lane alone, which is why
-`paired_cross_runtime.py` exists and why single-run cross-runtime numbers should
+`bench_paired` exists and why single-run cross-runtime numbers should
 not be quoted.
 
 Below roughly 2 GFLOP of work both runtimes sit on a ~0.25 ms per-GEMM floor
@@ -341,9 +340,11 @@ under this submit-and-wait protocol — tessl's wall time is flat from 4 MFLOP t
 
 1. Compile-time `SM`/`SN` must equal the `TileGeom` the host dispatches with,
    and `constexpr int BKC` must equal `COOP_BKC` (if using explicit K loop blocking).
-2. Pin it in `NN_PAIRS` in `scripts/audit_gemm_tiles.py`. The audit verifies both
-   explicit `kernel void` and macro-instantiated (`NN_COOP_KERNEL`, `TN_NT_COOP_KERNEL`)
-   tiles against Rust constants.
+2. Select it in `coop_kernel` / `epi_kernel` / the batched `match` / `SplitKPar::kernel`
+   (or dispatch it by a literal `pipeline("...")` with its `TILE_*` within 12 lines).
+   `tests/audit_gemm_tiles.rs` reads those selectors and verifies both explicit
+   `kernel void` and macro-instantiated (`NN_COOP_KERNEL`, `TN_NT_COOP_KERNEL`)
+   tiles against Rust constants; a kernel no selector pairs fails it.
 3. Route it through `nn_coop_kernel` / `src/gemm.rs` so tests and benches exercise it.
 4. Verify the net can fail: inject a fault (tile drift, drop store, offset column)
    and confirm the test suite catches it before trusting a pass.

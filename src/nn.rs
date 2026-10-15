@@ -4702,7 +4702,7 @@ pub fn gemm_i8_dequant(
     }
     let p = rt.pipeline("matmul2d_tensorops_i8_f32")?;
     // 128×64 sg4, `mm_i8_dequant_coop`'s template defaults. The tile audit
-    // pairs this `pipeline` call with the TileGeom on the next line.
+    // (tests/audit_gemm_tiles.rs) pairs this `pipeline` call with the TileGeom on the next line.
     let tile = crate::gemm::TILE_COOP_DEFAULT;
     let tiles_n = (n as usize).div_ceil(tile.sn);
     let tiles_m = (m as usize).div_ceil(tile.sm);

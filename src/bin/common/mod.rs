@@ -1,8 +1,19 @@
 //! Shared benchmark utilities.
 //!
-//! `bench_gemm_sweep` and `bench_flash_attn` must draw operands from the same
-//! RNG and honour the same environment contract, or their numbers are not
-//! comparable to each other and a reader has no way to tell. One copy.
+//! One owner for what every benchmark binary must agree on, or their numbers
+//! are not comparable and a reader has no way to tell: the operand RNG
+//! ([`fill`], [`fill_dist`]), the median ([`median`], which refuses an empty or
+//! non-finite sample set), the environment contract ([`env_usize`], which
+//! refuses a malformed or below-minimum count), and the interleaved A/B
+//! statistics ([`run_paired`], [`ratio_stats`], [`self_spread`]). A binary
+//! that needs one adds it here; it does not carry a copy.
+//!
+//! Declared with `mod common;` by (`rg -l '^mod common;' src/bin`):
+//! bench_embedgemma2, bench_flash_attn, bench_gemm_coop_tile,
+//! bench_gemm_routes, bench_gemm_sweep, bench_gemm_tile_tune,
+//! bench_gemm_tnnt_tune, bench_gemm_variants, bench_nn_kernels, bench_paired,
+//! bench_qwen35_layers, bench_qwen35_train, probe_gdn_scan, probe_gemm_bits,
+//! probe_gemm_parity, probe_load_memory.
 //!
 //! Not a `src/bin/*.rs` file: cargo would build it as its own binary. A
 //! directory without `main.rs` is not a target, which is the same trick
@@ -122,6 +133,22 @@ pub fn fill_dist(n: usize, seed: u64, dist: Dist) -> Vec<f32> {
     out
 }
 
+/// The uniform [-1, 1) operand fill every bench draws from: `fill_dist` with
+/// [`Dist::Uniform`], the same LCG stream the per-binary copies used.
+pub fn fill(n: usize, seed: u64) -> Vec<f32> {
+    fill_dist(n, seed, Dist::Uniform)
+}
+
+/// [`fill`] mapped through `x * scale + shift`, for operands that are not
+/// centred on zero or are smaller than one.
+pub fn fill_affine(n: usize, seed: u64, scale: f32, shift: f32) -> Vec<f32> {
+    let mut v = fill(n, seed);
+    for x in &mut v {
+        *x = *x * scale + shift;
+    }
+    v
+}
+
 /// Fails rather than returning a number nothing sampled. An empty sample set
 /// used to index straight off the end of the vector, and `partial_cmp().unwrap()`
 /// panicked on a NaN sample instead of naming it.
@@ -143,8 +170,7 @@ pub fn median(mut v: Vec<f64>) -> Result<f64, String> {
 
 /// Environment integers fail loud. This tree already lost a run to the opposite
 /// policy: a malformed `GEMM_FUZZ_SEED` was silently ignored and one seed ran
-/// eight times while the log claimed eight. `BENCH_WARMUP` and `BENCH_ITERS`
-/// still had that exact `.ok().unwrap_or(default)` shape.
+/// eight times while the log claimed eight. (See [`env_usize`].)
 /// This process's lifetime peak physical footprint in bytes: the figure
 /// `/usr/bin/time -l` prints as `peak memory footprint`. Not `ru_maxrss`,
 /// which under-reads when macOS compresses or reclaims pages
@@ -167,24 +193,35 @@ pub fn peak_footprint() -> Result<u64, String> {
     Ok(unsafe { info.assume_init() }.ri_lifetime_max_phys_footprint)
 }
 
-pub fn env_usize(name: &str, default: usize, min: usize) -> Result<usize, String> {
-    let raw = match std::env::var(name) {
-        Ok(v) => v,
-        Err(std::env::VarError::NotPresent) => return Ok(default),
-        Err(e) => return Err(format!("{name}: {e}")),
-    };
-    parse_usize_env_value(name, &raw, min)
-}
+/// The largest count any benchmark knob (`BENCH_ITERS`, `--rounds`, ...) may
+/// name. No bench runs a million of anything; the bound turns `2^64 - 1`, and a
+/// typo that adds digits, into an error instead of a run that never ends.
+pub const MAX_COUNT: usize = 999_999;
 
-fn parse_usize_env_value(name: &str, raw: &str, min: usize) -> Result<usize, String> {
-    let v: usize = raw
-        .trim()
-        .parse()
-        .map_err(|_| format!("{name}={raw:?} is not a non-negative integer"))?;
+/// The one strict count parser: ASCII digits only (no sign, no surrounding
+/// whitespace), no leading zero unless the whole value is `0`, between `min`
+/// and [`MAX_COUNT`]. `name` is the variable or flag, for the message.
+pub fn parse_count(name: &str, raw: &str, min: usize) -> Result<usize, String> {
+    let digits = !raw.is_empty() && raw.bytes().all(|b| b.is_ascii_digit()) && (raw == "0" || !raw.starts_with('0'));
+    let v = digits.then(|| raw.parse::<usize>().ok()).flatten().ok_or_else(|| {
+        format!("{name}={raw:?} is not a non-negative integer (ASCII digits, no sign or leading zero)")
+    })?;
     if v < min {
         return Err(format!("{name}={v} is below the minimum of {min}"));
     }
+    if v > MAX_COUNT {
+        return Err(format!("{name}={v} is above the maximum of {MAX_COUNT}"));
+    }
     Ok(v)
+}
+
+/// `name` from the environment through [`parse_count`], `default` when unset.
+pub fn env_usize(name: &str, default: usize, min: usize) -> Result<usize, String> {
+    match std::env::var(name) {
+        Ok(v) => parse_count(name, &v, min),
+        Err(std::env::VarError::NotPresent) => Ok(default),
+        Err(e) => Err(format!("{name}: {e}")),
+    }
 }
 
 /// The measurement-only GEMM kernels live in `kernels/tune/` and are linked
@@ -300,6 +337,75 @@ pub fn self_spread(rounds: &[f64]) -> f64 {
 /// more than 10% against itself across the rounds of one shape.
 pub const SELF_SPREAD_LIMIT: f64 = 0.10;
 
+/// A process-unique suffix for a staged file name.
+pub fn unique_stamp() -> String {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos());
+    format!("{:x}-{nanos:x}", std::process::id())
+}
+
+/// Refuse an existing `path` that is not a regular file, without blocking.
+///
+/// The open is `O_NONBLOCK` and the answer comes from `fstat` of that handle,
+/// as `tessl::plain::open_regular_file` does for checkpoints: a FIFO with no
+/// reader or writer must not hang the caller, and a device or directory is not
+/// something to replace. A missing path is fine.
+pub fn refuse_non_regular_target(path: &std::path::Path) -> Result<(), String> {
+    use std::os::unix::fs::OpenOptionsExt;
+    match std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(path)
+    {
+        Ok(f) => {
+            let md = f.metadata().map_err(|e| format!("{}: {e}", path.display()))?;
+            if md.is_file() {
+                Ok(())
+            } else {
+                Err(format!(
+                    "{}: exists and is not a regular file; refusing to replace it",
+                    path.display()
+                ))
+            }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(format!("{}: {e}", path.display())),
+    }
+}
+
+/// Replace `path` with `bytes` durably, exposing no partial content: a staged
+/// file in the same directory is synced, renamed over `path`, and the
+/// directory synced. A non-regular existing target is refused first.
+pub fn atomic_write(path: &std::path::Path, bytes: &[u8]) -> Result<(), String> {
+    let abs = std::path::absolute(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let dir = abs
+        .parent()
+        .ok_or_else(|| format!("{}: no parent directory", abs.display()))?;
+    let name = abs.file_name().and_then(|n| n.to_str()).unwrap_or("out");
+    if !dir.is_dir() {
+        return Err(format!(
+            "{}: parent directory does not exist (never created implicitly)",
+            abs.display()
+        ));
+    }
+    refuse_non_regular_target(&abs)?;
+    let staged = dir.join(format!(".{name}.{}", unique_stamp()));
+    let result = (|| -> std::io::Result<()> {
+        use std::io::Write;
+        let mut f = std::fs::File::create(&staged)?;
+        f.write_all(bytes)?;
+        f.sync_all()?;
+        std::fs::rename(&staged, &abs)?;
+        std::fs::File::open(dir)?.sync_all()
+    })();
+    if let Err(e) = result {
+        let _ = std::fs::remove_file(&staged);
+        return Err(format!("{}: {e}", abs.display()));
+    }
+    Ok(())
+}
+
 /// Print the kernels this process dispatched as one `KERNEL_TRACE a,b,...`
 /// line on stderr, for `bench/kernel_coverage.py`. Prints nothing when
 /// `TESSL_KERNEL_TRACE` is unset, so normal runs are unchanged.
@@ -326,7 +432,7 @@ pub fn exit_if_unstable(bin: &str, unstable: &[String]) {
 
 #[cfg(test)]
 mod tests {
-    use super::{median, parse_usize_env_value, ratio_stats, round_order, run_paired, self_spread, Arm};
+    use super::{fill, fill_affine, median, parse_count, ratio_stats, round_order, run_paired, self_spread, Arm};
 
     #[test]
     fn median_rejects_empty_and_non_finite_samples() {
@@ -392,11 +498,48 @@ mod tests {
     }
 
     #[test]
+    fn fill_is_the_seeded_uniform_stream_every_bench_used() {
+        let v = fill(4096, 7);
+        assert_eq!(v, fill(4096, 7));
+        assert_ne!(v, fill(4096, 8));
+        assert!(v.iter().all(|x| (-1.0..=1.0).contains(x)));
+        assert!(v.iter().any(|x| *x < -0.5) && v.iter().any(|x| *x > 0.5));
+        // The retired per-binary copies: one LCG step, high 32 bits, mapped to [-1, 1].
+        let mut s = 7u64.wrapping_mul(6364136223846793005).wrapping_add(1);
+        s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        let first = (((s >> 32) as u32) as f64 / (u32::MAX as f64) * 2.0 - 1.0) as f32;
+        assert_eq!(v[0], first);
+        let a = fill_affine(16, 7, 0.5, 2.0);
+        assert!(a.iter().zip(fill(16, 7)).all(|(y, x)| *y == x * 0.5 + 2.0));
+    }
+
+    #[test]
     fn benchmark_count_parser_is_strict_and_bounded() {
-        assert_eq!(parse_usize_env_value("N", " 7 ", 1).unwrap(), 7);
-        assert!(parse_usize_env_value("N", "", 1).is_err());
-        assert!(parse_usize_env_value("N", "not-a-count", 1).is_err());
-        assert!(parse_usize_env_value("N", "-1", 1).is_err());
-        assert!(parse_usize_env_value("N", "0", 1).unwrap_err().contains("minimum"));
+        assert_eq!(parse_count("N", "7", 1).unwrap(), 7);
+        assert_eq!(parse_count("N", "0", 0).unwrap(), 0);
+        for bad in [
+            "",
+            " 7",
+            "7 ",
+            " 7 ",
+            "+7",
+            "-1",
+            "007",
+            "00",
+            "0x7",
+            "1e3",
+            "1_0",
+            "\u{661}",
+            "not-a-count",
+            "7\n",
+            "1000000",
+            "18446744073709551615",
+            "18446744073709551616",
+        ] {
+            assert!(parse_count("N", bad, 0).is_err(), "{bad:?} accepted");
+        }
+        assert!(parse_count("N", "0", 1).unwrap_err().contains("minimum"));
+        assert!(parse_count("N", "999999", 1).is_ok());
+        assert!(parse_count("N", "1000000", 1).unwrap_err().contains("maximum"));
     }
 }

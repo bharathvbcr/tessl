@@ -40,9 +40,9 @@ inline bool answer_ok(device const uint *answers, uint a, bool row_ok, uint voca
 /// A slot row `>= rows` or an answer id `>= vocab` scores NaN instead of
 /// reading out of bounds: those indices live in device memory, so the host
 /// cannot check them without a synchronising read. Validity is re-derived
-/// from the indices (`answer_ok`) rather than tested for as NaN, because fast
-/// math may fold `isnan` away, and rather than stored, which would double the
-/// threadgroup memory and cap the answer count at half: an invalid answer is left out of its slot's softmax, so the
+/// from the indices (`answer_ok`) rather than tested for as NaN, because the
+/// indices decide validity exactly, whatever the value's float class, and
+/// rather than stored, which would double the threadgroup memory and cap the answer count at half: an invalid answer is left out of its slot's softmax, so the
 /// valid answers beside it keep their log-probabilities, and gets NaN (as
 /// stored bits) in both outputs. A bad slot row makes the whole row NaN.
 template <typename W>

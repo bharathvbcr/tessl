@@ -27,11 +27,11 @@ use std::sync::Arc;
 use crate::qwen35;
 use crate::qwen35_model::Precision;
 use crate::runtime::GpuRuntime;
-use crate::safetensors::SafeTensors;
+use crate::safetensors::TensorSource;
 use crate::tensor::{GpuBuffer, Tensor};
 
 pub(crate) struct Loader<'a> {
-    st: &'a SafeTensors,
+    st: &'a dyn TensorSource,
     prefix: &'a str,
     rt: &'a Arc<GpuRuntime>,
     /// Every tensor name read so far, for [`Self::refuse_unread`].
@@ -44,7 +44,7 @@ pub(crate) struct Loader<'a> {
 }
 
 impl<'a> Loader<'a> {
-    pub(crate) fn new(rt: &'a Arc<GpuRuntime>, st: &'a SafeTensors, prefix: &'a str) -> Self {
+    pub(crate) fn new(rt: &'a Arc<GpuRuntime>, st: &'a dyn TensorSource, prefix: &'a str) -> Self {
         Self {
             st,
             prefix,
@@ -209,6 +209,7 @@ fn staged<T: Copy + Default>(scratch: &mut Vec<T>, out: usize, in_features: usiz
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::safetensors::SafeTensors;
 
     /// safetensors bytes for `(name, dtype, shape, values)`; bf16 values are
     /// taken as given (they are chosen exactly representable).

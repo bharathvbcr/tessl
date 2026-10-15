@@ -1,8 +1,113 @@
-# BUILD_REPORT — GitPulse backlog, 2026-10-13/14
+# BUILD_REPORT — GitPulse backlog, waves 6–7 (2026-10-14/15)
+
+Base: `main` @ `620939d` (which already held waves 1–5, see the earlier report below). All of this run's work is on **`gp/wave7`** (worktree `../tessl-wave6`): `gp/wave6` (wave 6 plus integration fixes) with the four wave-7 lanes merged on top. That is 56 commits and 96 files (+13.3k / −4.3k, report and CHANGELOG included) ahead of `main`. **Nothing is merged into `main` or pushed**, because that is your call.
+
+## How this run worked
+
+- **GitPulse was read *and* written** through the installed `gitpulse-mcp` over stdio (the MCP server wasn't attached to the session). Every card moved below went `in_progress` → `review` with a summary and `expected_revision`. No card was requested `done`. Done needs the work on `main`, and Manvi gates it.
+- **Fable made the sequencing and judgement calls** (wave picks, the symlink rule, stopping after wave 7). Opus wrote every brief and reviewed every diff. Sonnet implemented each lane in its own worktree, and a *separate* Sonnet attacked it. Every break went back to the implementer before approval.
+- **DevMap:** I rebuilt the index (gen 1359, 293 files) before wave 6, and again in the integration worktree before wave 7. `affected` walks stopped with `walk_incomplete` at depth 2, because 12 files have parse-error regions. I treated every blast radius as a lower bound, not as "safe". GitPulse's in-process DevMap still calls the index "payload obsolete" while the CLI calls it fresh (old report, item 5).
+- **`dev verify`:** DevCouncil's `verification_mode` is `off` here and there is no `.devcouncil/config.yaml`, so `dev verify` gates nothing. `scripts/ci_local.sh` is the gate I ran.
+- **Collisions:** `gitpulse_insights` / `gitpulse_collision_risk` before each wave and after the run found 0 overlapping files and no other live session or dirty worktree in tessl. No task was deferred for a collision.
+- **Machine:** all heavy jobs ran under the `mac_heavy` lock. The disk reached 99% (11 GiB free) mid-run, and the lock refuses jobs below 15 GB free. I removed my merged lane worktrees and a scratch copy of ojas, and later the cargo cache was cleared elsewhere. Free space is now 95 GiB.
+
+## Gate results on `gp/wave7` @ `b104ad4` (M5 Pro, under the lock)
+
+| Gate | Result |
+|---|---|
+| `scripts/ci_local.sh` (full) | **`ci:local OK`** |
+| Full serialized suite (`--no-fail-fast`) + hosted sandbox runs + mtl_tensor | 1877 test executions passed, **0 failed**, 18 ignored |
+| Hosted device-free selection (device hidden by `sandbox-exec`) | OK: 59 invocations, 610 tests |
+| Hosted manifest completeness | OK |
+| fmt, clippy `-D warnings` (default + `quant-prep`), `cargo doc -D warnings` | clean |
+| Dialect lint, kernel IR check (35 kernels), host contract, parity harness `--pure` (also with `TESSL_HOSTED=1`) | pass (harness: PASS WITH SKIPS; the skips are the `--pure` GPU CLI sections) |
+| torch binding host + GPU tests, examples, release-ready, `cargo package --locked`, docs.rs check | pass |
+
+Earlier runs of the same gate on the integration branches, and what each run caught:
+- `gp/wave6`: 1171 passed and 1 failed. The failure was a `host_access_ban` false positive on a `#[cfg(test)]`-declared module. I fixed the scanner in `0949270`, and its new test fails when the module is ungated.
+- `gp/wave7` (three lanes merged): 1227 passed, 0 failed.
+- `gp/wave7` run 1 stopped at `cargo doc`: a public doc linked a private fn (fixed in `b7a2d8d`).
+- `gp/wave7` run 2 stopped at the new hosted manifest's exact-count guard and completeness check. Merging the lanes had added 23 device-free tests that the manifest didn't list (fixed in `b104ad4`). The guards did their job.
+
+## Tasks moved to review (10 cards, evidence in each card log)
+
+| Card | Wave / branch | Result | Adversarial pass found (all fixed before approval) |
+|---|---|---|---|
+| ft-dc1fa0a3 per-entry host reads/writes | 6 / `gp/w6-hostmap` | AC1, AC2, AC4 met. **AC3 (the ojas-qwen35 `state.rs` conversion and the 2B peak measurement) is open** and waits on the merge, because ojas path-depends on tessl `main` | host bf16 writes kept NaN payloads and rounded subnormals where the GPU cast canonicalizes them. Now bit-identical to the GPU path; reads are verified over all 65,536 bf16 patterns |
+| ft-04c475ac parser mutation tests | 6 / `gp/w6-parsers` | all ACs met (no new dependency: seeded splitmix64 harness) | `SafeTensors::open`/`read_npy` **hung forever on a FIFO**, now fixed (`O_NONBLOCK` + fstat). Consistency errors had counted as refusals; and CI could not detect a zero-test match |
+| ft-01dd5d8a bench harness | 6 / `gp/w6-benchharness` | AC1–5 met; AC6 (moving the `tests/common` clones) deferred | duplicate env keys, `--opt=value` parsed as a lane, **no lane timeout**, negative METRIC values, trailing tokens, no per-round re-hash, lost raw-output archive |
+| ft-5dd538e9 fast-math lint | 6 / `gp/w6-closers` | AC1–4 met; AC5 recorded (the four `nn_wiring` tests pass before and after) | the lint missed paren, cast, deref and multi-line self-compares and `isunordered`; the IR script missed bfloat/half/sNaN constants and passed when no IR was written |
+| ft-0693aaa7 GemmOperands contract | 6 (confirm) | all ACs met on `main`; the slot-12 test gained a guard region (it catches a planted write one element past the output) | — |
+| ft-2663702f prefill working set | 6 (confirm + docs) | all ACs met; the AC3 decision is recorded in `docs/qwen35.md` | — |
+| ft-dde0a66a hosted CI (code half) | 7 / `gp/w7-hostedci` | AC1–3, 6, 7, 9 met; AC4/5 kept in Python with a written reason; AC8 partly met (`encoder_attn_tiled` documented) | **150 device-free tests were not selected**; added a completeness check and exact per-entry counts |
+| ft-b7376d2e sharded checkpoints | 7 / `gp/w7-multifile` | AC1–2 met; AC3 is filed in ojas as ft-02256073; AC4 deferred (no 4B/9B weights) | no break. ojas `cargo check --workspace` passes against the branch |
+| ft-9ac2a619 ICB correctness | 7 / `gp/w7-icb` | all 8 ACs met | **replay raced on sync + hazard captures** (40 of 40 replays wrong). Fixed at capture; the 16-cell matrix fails on the pre-fix code. ojas gemma-metal captures with always-on barriers, so it was not exposed (checked by reading the code) |
+| ft-c9057a0d kernel_coverage | 7 / `gp/w7-kcov` | AC1–3 met; AC4 runs end to end and reports 150 of 266 kernels with no bench (filed as ft-6d88defb) | the regex scan invented and missed kernels; replaced by `xcrun metal -E`. "Could not run" and "found gaps" shared an exit code; the dump wasn't atomic and hung on a FIFO |
+
+## Deferred or blocked
+
+| Card | Why |
+|---|---|
+| ft-dc1fa0a3 AC3, ojas ft-02256073 | Need `gp/wave7` on tessl `main` (ojas path-depends on it; building against a worktree would be a pin bump) |
+| ft-2238696a GPU suite + `#[ignore]` tests on an idle GPU | Wants a pushed `main`, plus hours of idle GPU |
+| ft-380e34f4 fault-injection set | GPU-heavy (a metallib rebuild plus a GPU run per fault); queued for wave 8 |
+| ft-51395822 reader bounds (new, P3) | Queued for wave 8 |
+| ft-01dd5d8a AC6 | Touches about 60 test files; after the merge |
+| ft-afb1c42d, ft-c8e7726b, ft-08a87448 | Refactors sequenced to land last |
+| Benchmark cards (d0a49f5d, 62af7c2e, 805b6ea4, f3e14014, 285001b5, c1e556e2, ea33f477, 8f0c2ee3, ba1413a0, fd8bde58) | Need an idle GPU for timing |
+| ft-12c31d56, ft-b7376d2e AC4 | Need 4B/9B weights (only 2B is local) |
+| ft-b8561dbb, ft-2ffbdcd5, ft-376ad5d4, ft-a5491fbb, ft-1a0f8c18 AC2, ft-6d88defb | Owner decisions (below) |
+
+## Benchmarks
+
+No hot path changed, and no timing was taken. These are the only runtime-path changes:
+- the ICB capture carries a hazard flag, which applies only while capturing;
+- replay emits the captured markers, which means *fewer* barriers on tapes with no conflicting edges;
+- host-only per-entry copies and the loader.
+
+The bench-harness lane ran GPU smoke runs only. Statistic changes, documented in `docs/benchmarking.md`:
+- paired metrics are the median of per-round ratios (`paired_bins` used a ratio of mins);
+- `--rounds` must be at least 2;
+- evidence drops `peak_gflops`/`geomean`.
+
+## New tasks filed
+- **ft-51395822** (tessl, P3): checkpoint readers have no payload cap (a sparse 512 GiB file fills memory until memguard kills the process), npy padding is unvalidated, the shape-overflow check depends on dimension order, and a file rewritten after open is read with stale offsets.
+- **ft-6d88defb** (tessl, P3): 150 of 266 kernel entry points are dispatched by no benchmark, so `kernel_coverage.py --check` exits 1. It needs an owner decision on adding lanes or an allowlist.
+- **ft-02256073** (ojas, P2): ojas-qwen35 should load through `CheckpointView` and retire the "one file" `Unsupported` branch at `names.rs:292-296`.
+- Folded into card logs, not filed:
+  - build.rs's Metal flags are now derived in two places (`check_kernel_ir.sh` mirrors them under a drift test; `kernel_coverage.py` parses `build.rs`);
+  - `host_access_ban` still exempts calls by the receiver name `st`;
+  - an uppercase `.JSON` index path is treated as a safetensors file.
+
+## Fable's decisions (this run)
+1. **Wave 6:** dc1fa0a3 (tessl half, additive API), 04c475ac (no-dependency mutation harness, so no ask is needed), 01dd5d8a AC1–5, 5dd538e9 plus confirming 0693aaa7 and 2663702f from a GPU run instead of reimplementing them.
+2. **Wave 7:** dde0a66a, b7376d2e AC1–3, 9ac2a619, c9057a0d. dc1fa0a3 AC3 waits for the merge (pin-bump rule). 2238696a is deferred (idle GPU) and 380e34f4 moves to wave 8 (lock-hungry).
+3. **Sharded checkpoint path rule:** weight_map names are checked *lexically* (a bare file name: no `/`, `\`, `..`, absolute path, or NUL), and symlinks are followed with no containment check. The brief's original rule ("resolves inside the directory") refused every Hugging Face cache snapshot, because their shards are links to `../../blobs/<sha>`. Security impact: the untrusted input, `index.json`, can still only name entries of the checkpoint directory. A symlink there was placed by whoever controls the directory and already controls its bytes.
+4. **Stop after wave 7.** The integration branch already carries 10 cards the owner hasn't reviewed, including two public API additions ojas will build on. The highest-value next work (the ojas halves, the idle-GPU re-run) waits on the merge.
+
+Opus calls during review, recorded in the card logs:
+- the per-entry host API must be bit-identical to the GPU path;
+- the ICB race is fixed in capture, not by making replay conservative again;
+- the coverage census uses the real preprocessor, not a reimplemented one;
+- the evidence enforcement is ported to Rust (so the bench-harness lane is net +1.1k lines rather than the card's expected −1k).
+
+## Owner decisions pending
+1. **Merge `gp/wave7` into `main` and push.** `ci:local OK` at `b104ad4` (plus a CHANGELOG commit). Hosted CI has not seen any of it, and the new hosted job (sandbox-exec, setup-python on macos-26) is unverified until a push.
+2. **ft-6d88defb:** which kernel families need benchmark lanes, and which may be allowlisted.
+3. Carried from before and still open: ft-b8561dbb (GDN golden provenance), ft-2ffbdcd5 (self-hosted M5 runner), ft-376ad5d4 (narrowing the public surface is a breaking change), ft-a5491fbb (env-alias contract), ft-1a0f8c18 AC2 (`Q4MlxRowVariant::Wide` is used by gemma-metal).
+4. **After the merge (queued wave 8):**
+   - dc1fa0a3 AC3 and ojas ft-02256073 (no collision on `state.rs` in any ojas worktree);
+   - ft-2238696a on an idle GPU;
+   - ft-380e34f4;
+   - ft-51395822.
+
+---
+
+# Earlier run: waves 1–5
 
 Base: `main` @ `2972027`. All work is on branch **`gp/wave1`** (worktree `../tessl-wave1`), which merges seven lane branches. **Nothing is merged into `main`**: merging to the default branch is your call.
 
-## How this run differed from the brief
+### How this run differed from the brief
 
 - **GitPulse was read, not written.** The MCP server was not connected to this session, and you said to start without it. I then reached the installed `gitpulse-mcp` directly over stdio, read-only: `list_tasks`, `get_task`, `insights` and `collision_risk`. No card was moved: there are no `in_progress`, `review` or `done` writes. The "Board actions to take" section lists the moves I would make.
 - **No Fable model was available**, so Opus (this session) made the sequencing and judgement calls. They are listed under "Decisions taken in place of Fable".
@@ -10,7 +115,7 @@ Base: `main` @ `2972027`. All work is on branch **`gp/wave1`** (worktree `../tes
 - **The machine-wide `mac_heavy` lock dominated wall time.** Other sessions' ojas jobs held it for long stretches; one LoRA run held it for about 1.5 h. Lanes waited 1–2 h per locked run. No benchmark timing was taken on a contended GPU.
 - **`gitpulse_collision_risk` failed once under load** ("background work is shed"), so that answer was treated as unknown. No other worktree or agent session was active in tessl, per `gitpulse_insights`.
 
-## Full GPU suite, main vs gp/wave1 (M5 Pro, `cargo test --release --no-fail-fast -- --test-threads=1`, under the lock)
+### Full GPU suite, main vs gp/wave1 (M5 Pro, `cargo test --release --no-fail-fast -- --test-threads=1`, under the lock)
 
 | Tree | Passed | Failed | Ignored |
 |---|---|---|---|
@@ -27,7 +132,7 @@ The ft-f78dfed7 triage verdict "fixed on main" was therefore wrong: its own regr
 
 `scripts/ci_local.sh` on gp/wave1: fmt, release build, clippy, clippy with `quant-prep`, `cargo doc -D warnings`, tile audit (33 kernels / 38 pairs), MSL dialect lint, emulator host contract and the parity harness all pass. The suite step stopped at the first failing binary (`attention`); the `--no-fail-fast` run above is the complete picture.
 
-### State of gp/wave1 @ 47f13c2 (waves 1-3)
+#### State of gp/wave1 @ 47f13c2 (waves 1-3)
 
 | Gate | Result |
 |---|---|
@@ -41,7 +146,7 @@ The ft-f78dfed7 triage verdict "fixed on main" was therefore wrong: its own regr
 
 `main` @ 2972027 was 825 passed / 4 failed / 14 ignored on the same machine.
 
-### Final state of gp/wave1 after wave 4 (`scripts/ci_local.sh`, M5 Pro, under the lock)
+#### Final state of gp/wave1 after wave 4 (`scripts/ci_local.sh`, M5 Pro, under the lock)
 
 | Gate | Result |
 |---|---|
@@ -51,7 +156,7 @@ The ft-f78dfed7 triage verdict "fixed on main" was therefore wrong: its own regr
 | release-ready gate, `cargo package --locked`, `DOCS_RS=1 cargo check` | pass |
 | Hosted CI on gp/wave1 (dispatched) | Metal compile: success (run 38506954287). CI: MSRV, fmt, and build + clippy + docs succeed; the CPU-emulator job was still running at the time of writing (run 38506951621). The GPU jobs are skipped because no runner is registered. |
 
-## Board triage at main 2972027 (2026-10-13)
+### Board triage at main 2972027 (2026-10-13)
 
 The board was stale: most "ready" P1 cards were already closed by the 10-08..10-13 merges.
 Verdicts are by reading code and commits (read-only Sonnet triage, 4 lanes); none is backed by a GPU run unless stated.
@@ -85,13 +190,13 @@ Verdicts are by reading code and commits (read-only Sonnet triage, 4 lanes); non
 | ft-a9661824 bf16 default update rule | 7 | Owner decision | default rule and fall criterion |
 | ft-6cd0fa99 objc2#782 | 5 | External | owner approves upstream text |
 
-### Follow-up confirmation (read-only lane W2d, gp/wave1)
+#### Follow-up confirmation (read-only lane W2d, gp/wave1)
 - ft-c2faf159 Staged: every remaining criterion MET (`tests/qwen35_staged.rs:100-112` bit-compares f32 tower logits; `tests/qwen35_model.rs:927-964` asserts `position()` after poisoned steps; docs per brief).
 - ft-b4d2a884 GEMM: MET. `gemm_coop.h` owns walks/views/epilogue, `mm_coop`, `mm_exact_f32`; the six exact-f32 kernels and the tune kernels use it; `bench/results/gemm_coop_header_bits_m5pro.txt` 0/543 lines differ. The MLP up/gate split-K route (0.90-0.95x of one panel-walked dispatch) is a recorded follow-up, because changing it changes exact-f32 bits.
 - ft-c125d853 binding: MET except that re-encoding while an execute is in flight is documented, not refused (`src/icb_smoke.rs:182`). The brief allows that.
 - ft-4dc74fad training waste: PARTIAL. The peak drop is at least the head-gradient tensor on 4B and 2B, `train_step_bytes` is pinned, and `grad_sq_norm` is one wait (`tests/qwen35_train_traffic.rs:579`). Clipped-step waits are committed only for bf16 at T=256; bf16 at T=2048 is missing, and f32 clipped is above memguard's 32 GiB cap.
 
-## Lanes and what landed on gp/wave1
+### Lanes and what landed on gp/wave1
 
 Each lane worked in its own worktree on a branch from `main` or `gp/wave1`. Every lane had an Opus brief and an Opus diff review; lanes that changed behaviour also had a separate Sonnet adversarial pass. Every break or gap found went back to the lane before merge.
 
@@ -114,7 +219,7 @@ Each lane worked in its own worktree on a branch from `main` or `gp/wave1`. Ever
 
 Diff `main..gp/wave1`: see `git diff --stat main..gp/wave1`; the CHANGELOG heading merge alone accounts for about 885 changed lines.
 
-## Board actions to take (GitPulse was not written)
+### Board actions to take (GitPulse was not written)
 
 When you are ready to update the board, these are the moves the evidence supports, with the revision each card had when read:
 - **Move to review now, done after `gp/wave1` merges:** ft-de70a58b (r2, except branch protection), ft-f5d97431 (r3, except the load-time ban scope), ft-6ac668a5 (r2), ft-06dcbdff (r6, except AdamW), ft-e01d19fe (r2, except the poisoned status and the ABI-parsing contract test), ft-9a93d5ae (r2), ft-28a94d60 (r4).
@@ -124,7 +229,7 @@ When you are ready to update the board, these are the moves the evidence support
 - **ft-691a7474 (r5):** stays in progress. The overlay policy, where `python/tests` runs, the Bert goldens and the GDN C-ABI success test remain.
 - **ft-4dc74fad (r7):** stays in review. The clipped-step wait counts for bf16 at T=2048 need an idle GPU.
 
-## Deferred or blocked
+### Deferred or blocked
 
 | Card | Why |
 |---|---|
@@ -135,11 +240,11 @@ When you are ready to update the board, these are the moves the evidence support
 | ft-6cd0fa99 objc2#782 | Already done upstream: reply posted, PR #870 merged on 2026-10-11. Close the card. |
 | ft-de70a58b branch protection | Decided: not enabled (see decision 2). |
 
-## Benchmarks
+### Benchmarks
 
 Waves 1-4 changed no hot path: no kernel, GEMM, attention, training-step or decode-loop code was touched. The only library changes are host-side, in one-off setup paths (`upload_segments` now uses `alloc_buffer_from_u32`, and `mini_copy_chain` is a test/smoke ICB builder) and in C-ABI argument checks. So there is no benchmark delta to report, and none was taken on the contended GPU. Wave 5 changed the GDN training kernels; its paired step bench (`bench/results/qwen35_gdn_windows_m5pro.txt`, frozen binaries, interleaved, 5 rounds, min of medians, AC power) shows 2B r=1 at 0.974-1.004x and 4B-config r=2 at 0.946-0.962x of before, with no regression over 5%. The other new measurement is the clean build: 14.10 s min-of-3, `bench/results/build_time_m5pro.txt`.
 
-## New tasks to file (grouped by concern)
+### New tasks to file (grouped by concern)
 
 1. **GPU tests have no unattended gate.** Four GPU tests stayed red on main for days (since d6a3c02 and 4551470). `scripts/ci_local.sh` stops at the first failing binary. **`--no-fail-fast` done in wave 4.** Still to do: make the GPU suite a required gate before merges until ft-2ffbdcd5's runner exists. Fold into ft-2238696 or ft-2ffbdcd5.
 2. **Done in wave 4:** MLX f32 comparison lane is tf32-class on M5 Pro. A real `--parity-dir` run still aborts on any valid dump wherever `mlx` is installed. Decide whether a comparison-runtime-only breach is fatal, or whether to score MLX on its CPU stream or label it tf32 in `LANE_PRECISION`.
@@ -149,7 +254,7 @@ Waves 1-4 changed no hot path: no kernel, GEMM, attention, training-step or deco
 6. **Documented in wave 4:** Release gate edge cases. A tag pushed before CI finishes is refused (re-run the release job once CI is green). A tag on a commit outside `metal-compile.yml`'s path filter has no Metal-compile run and is refused. Document this or add a bounded wait.
 7. Minor: `metal-compile.yml:86` SC2012 (`ls`) is fixed in wave 4. In W2c's test, the "refusal names the value" assertion is weak (it only checks for `'0'`).
 
-## Decisions taken in place of Fable
+### Decisions taken in place of Fable
 
 - **Board state:** read GitPulse but don't write it, following "start without GitPulse". Record the moves here instead.
 - **Sequencing:** wave 1 took the one open P1 (release gate) plus three non-overlapping P2/P3s. Cards that were already fixed were confirmed by the GPU suite, not reimplemented.
@@ -160,7 +265,7 @@ Waves 1-4 changed no hot path: no kernel, GEMM, attention, training-step or deco
 - **bool in tessl_torch:** refused where an integer is expected, accepted only as a flag (`accumulate`).
 - **Parity harness scope:** fix the test's dependence on installed runtimes in this card, and file the production MLX question separately rather than change budget or fatality semantics.
 
-## Owner decisions, made on delegation ("choose the best", 2026-10-14)
+### Owner decisions, made on delegation ("choose the best", 2026-10-14)
 
 | # | Decision | Choice | Why |
 |---|---|---|---|
@@ -179,7 +284,7 @@ Waves 1-4 changed no hot path: no kernel, GEMM, attention, training-step or deco
 | 13 | Release-gate edge cases | **Document, no added wait.** | A bounded wait would have to cover about 80 min of CI. Re-running the job is the simpler fix. |
 | 14 | objc2#782 reply | **Nothing to do: the card was stale.** Checked read-only: your reply with probe results was posted 2026-10-11, PR #870 (marking `newTensorWithDescriptor*` and `tensorSizeAndAlignWithDescriptor` `unsafe`) merged the same day with madsmtm's approval, and #871 merged too. Close ft-6cd0fa99. Descriptor-level `unsafe` is **not pursued now**. | The maintainer deferred it ("we can consider ... in the future"), and tessl's calls already go through the now-`unsafe` methods. The one loose end is whether `objc2-generated` commit `893ea46c` landed upstream (unchecked). |
 
-### Still open after the decisions
+#### Still open after the decisions
 
 - **ft-a96618241 (bf16 default):** being implemented by another session. Its 348-line diff sits uncommitted in the main checkout and applies cleanly on gp/wave1 (`git apply --check`); a copy is in this session's scratchpad. It is not committed here, because it is not this session's work.
 - **ft-dc1fa0a3:** waits for that session's `src/qwen35_adamw.rs` edits to be committed, and needs its ojas side in the same work.

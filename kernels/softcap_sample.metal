@@ -158,7 +158,9 @@ kernel void softcap_argmax_one_pass(
         if (softcap > 0.0f) {
             v = tessl_apply_softcap(v, softcap);
         }
-        if (!isfinite(v)) continue;
+        // `v` is finite here without a second test: `raw` is finite, and
+        // tessl_apply_softcap returns it unchanged for a cap that is not a
+        // finite positive number, else cap * tanh(clamp(..)), bounded by cap.
         // A lane visits ascending indices, so an equal later value never
         // replaces the one it has.
         if (best_i == ARGMAX_NONE || v > best) {

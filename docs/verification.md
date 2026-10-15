@@ -466,6 +466,32 @@ and `|a*b| == |a|*|b|` — that one found redundant code rather than a missing t
 and the redundancy was deleted. Both are recorded because "the test didn't catch
 it" and "there was nothing to catch" look identical in a log.
 
+## 7. Parser mutation tests
+
+`src/json.rs`, `src/safetensors.rs` and `src/npy.rs` are hand-written parsers of
+downloaded files. Besides their hand cases, `src/parser_mutation.rs` drives each
+with seeded mutations of valid seeds (a Qwen3.5-style `config.json`, a four-tensor
+safetensors file, npy v1/v2/v3 files): truncation at every byte, every single-bit
+flip, boundary integers (0, 1, length +-1, `u16/u32/u64::MAX`, the header cap)
+written at every position, and seeded random edits; plus hand-built hostile
+headers (length fields at their extremes, reversed, overlapping and overflowing
+offsets and shapes, bad magic and versions, lone surrogates, 100k-deep nesting,
+huge exponents, duplicate keys, trailing garbage).
+
+Decision (card ft-04c475ac): a dependency-free seeded mutation test, not
+cargo-fuzz or a proptest dev-dependency, so no dependency is added and a failing
+case replays from its seed and label. The property per input: `Ok` or a
+non-empty `Err`, no panic, and no single allocation above `64 * input_len + 8 KiB`
+(a counting global allocator under `cfg(test)`). A strict truncation of a valid
+file must be refused, and `SafeTensors::open` must agree with `from_bytes`.
+
+```bash
+cargo test --release --lib parser_mutation:: -- --test-threads=1
+# replay or widen: PARSER_MUTATION_SEED=0x... PARSER_MUTATION_CASES=20000
+```
+
+It builds no `GpuRuntime`, so the hosted CI `Host-only unit tests` step runs it.
+
 ## Fault injection
 
 The suite is only worth its green tick if it can go red. Six faults injected

@@ -178,8 +178,7 @@ impl SafeTensors {
     /// Open and validate `path`'s header. No tensor data is read.
     pub fn open(path: &Path) -> Result<Self, String> {
         let what = path.display().to_string();
-        let mut f = File::open(path).map_err(|e| format!("{what}: {e}"))?;
-        let file_len = f.metadata().map_err(|e| format!("{what}: {e}"))?.len();
+        let (mut f, file_len) = plain::open_regular_file(path)?;
         let mut len8 = [0u8; 8];
         f.read_exact(&mut len8)
             .map_err(|e| format!("{what}: header length: {e}"))?;

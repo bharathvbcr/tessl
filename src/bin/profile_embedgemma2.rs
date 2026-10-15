@@ -82,7 +82,7 @@ use tessl::safetensors::SafeTensors;
 use tessl::tensor::{gpu_copy, DType, GpuBuffer, Tensor};
 use tessl::{BufferKind, GpuRuntime};
 
-use common::{env_usize, round_order};
+use common::{env_usize, gpu_utilization, others_running, round_order};
 
 const BACKEND: GemmBackend = GemmBackend::TensorOps;
 const MIB: f64 = (1u64 << 20) as f64;
@@ -945,25 +945,6 @@ fn median_of(v: &[f64]) -> f64 {
     s[s.len() / 2]
 }
 
-/// The device's GPU utilization as `ioreg` reports it, for the machine-state
-/// record (other sessions share this GPU).
-fn gpu_utilization() -> String {
-    let out = std::process::Command::new("ioreg")
-        .args(["-r", "-d", "1", "-c", "IOAccelerator"])
-        .output();
-    match out {
-        Ok(o) => {
-            let s = String::from_utf8_lossy(&o.stdout);
-            s.split("\"Device Utilization %\"=")
-                .nth(1)
-                .and_then(|t| t.split(|c: char| !c.is_ascii_digit()).next())
-                .unwrap_or("unknown")
-                .to_string()
-        }
-        Err(e) => format!("ioreg failed: {e}"),
-    }
-}
-
 fn write_json(path: &str, body: &str) -> Result<(), String> {
     common::atomic_write(std::path::Path::new(path), body.as_bytes())
 }
@@ -990,54 +971,6 @@ struct Variant {
     /// Samples thrown away and retaken because another process appeared.
     resampled: usize,
     dispatches: usize,
-}
-
-/// Other tessl processes that may be using the GPU: test and bench binaries
-/// under a `tessl*` checkout's `target/`, other than this one. Other sessions
-/// share this machine; a sample taken while one runs is flagged, not trusted.
-/// A GPU user this does not see (a display, a browser) stays in the baseline,
-/// which the `ioreg` utilization reading records.
-fn others_running() -> Vec<String> {
-    /// `PROC_ALL_PIDS` of `<sys/proc_info.h>`; the `libc` crate does not export it.
-    const PROC_ALL_PIDS: u32 = 1;
-    let me = std::process::id() as libc::pid_t;
-    // SAFETY: with a null buffer `proc_listpids` only returns the bytes needed.
-    let need = unsafe { libc::proc_listpids(PROC_ALL_PIDS, 0, std::ptr::null_mut(), 0) };
-    if need <= 0 {
-        return vec!["proc_listpids failed".to_string()];
-    }
-    let mut pids = vec![0 as libc::pid_t; need as usize / std::mem::size_of::<libc::pid_t>() + 64];
-    let bytes = (pids.len() * std::mem::size_of::<libc::pid_t>()) as libc::c_int;
-    // SAFETY: `pids` is a live buffer of `bytes` bytes.
-    let got = unsafe { libc::proc_listpids(PROC_ALL_PIDS, 0, pids.as_mut_ptr().cast(), bytes) };
-    if got <= 0 {
-        return vec!["proc_listpids failed".to_string()];
-    }
-    let n = got as usize / std::mem::size_of::<libc::pid_t>();
-    let mut found = Vec::new();
-    for &pid in &pids[..n.min(pids.len())] {
-        if pid <= 0 || pid == me {
-            continue;
-        }
-        let mut buf = [0u8; 4096];
-        // SAFETY: `buf` is a live buffer of the length passed.
-        let len = unsafe { libc::proc_pidpath(pid, buf.as_mut_ptr().cast(), buf.len() as u32) };
-        if len <= 0 {
-            continue;
-        }
-        let path = String::from_utf8_lossy(&buf[..len as usize]).into_owned();
-        let in_target =
-            path.contains("/research/tessl") && (path.contains("/target/release/") || path.contains("/target/debug/"));
-        let file = path.rsplit('/').next().unwrap_or("");
-        let gpu_bin = path.contains("/deps/")
-            || file.starts_with("bench_")
-            || file.starts_with("probe_")
-            || file.starts_with("profile_");
-        if in_target && gpu_bin {
-            found.push(file.to_string());
-        }
-    }
-    found
 }
 
 /// Milliseconds this process has spent waiting for a quiet machine.

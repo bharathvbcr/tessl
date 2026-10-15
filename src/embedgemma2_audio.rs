@@ -77,6 +77,7 @@
 //! are not fused into them. The sinusoidal table, `relative_k_proj` of it and
 //! the query scale are computed once per layer at load.
 
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 
 use objc2_metal::MTLComputePipelineState;
@@ -726,7 +727,6 @@ pub fn sub_conv1_ln_relu(
     )
 }
 
-/// What [`rms_norm`] computes per row: `[resid +] scale * clamp(post)(act(rms_norm(
 /// clamp(pre[1])(clamp(pre[0])(x))) [* weight]))`.
 pub struct RmsNorm<'a> {
     pub eps: f32,
@@ -1125,7 +1125,120 @@ pub struct EmbedGemma2Audio {
     output_proj: Tensor,
     output_bias: GpuBuffer,
     embed_proj: Tensor,
+    /// Which [`AudioStage`]s a forward runs (all, unless a profiler narrowed it).
+    stage_mask: AtomicU32,
 }
+
+/// One dispatch group of the forward, so a profiler can run a stage alone or
+/// leave it out ([`EmbedGemma2Audio::set_stage_mask`]). A fused dispatch
+/// belongs to the stage that names its main work.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u32)]
+pub enum AudioStage {
+    SubConv0,
+    SubConv1,
+    InputProj,
+    FfnNormPre,
+    FfnUp,
+    FfnAct,
+    FfnDown,
+    FfnNormPost,
+    AttnNorm,
+    QkvClamp,
+    QkvGemm,
+    Attention,
+    AttnOutGemm,
+    AttnNormPost,
+    LconvNorm,
+    LconvStart,
+    Glu,
+    Dwconv,
+    LconvConvNorm,
+    LconvEnd,
+    LconvResid,
+    NormOut,
+    OutProj,
+    OutBias,
+    EmbedNorm,
+    EmbedProj,
+}
+
+impl AudioStage {
+    /// Every stage, in forward order.
+    pub const ALL: [AudioStage; 26] = [
+        AudioStage::SubConv0,
+        AudioStage::SubConv1,
+        AudioStage::InputProj,
+        AudioStage::FfnNormPre,
+        AudioStage::FfnUp,
+        AudioStage::FfnAct,
+        AudioStage::FfnDown,
+        AudioStage::FfnNormPost,
+        AudioStage::AttnNorm,
+        AudioStage::QkvClamp,
+        AudioStage::QkvGemm,
+        AudioStage::Attention,
+        AudioStage::AttnOutGemm,
+        AudioStage::AttnNormPost,
+        AudioStage::LconvNorm,
+        AudioStage::LconvStart,
+        AudioStage::Glu,
+        AudioStage::Dwconv,
+        AudioStage::LconvConvNorm,
+        AudioStage::LconvEnd,
+        AudioStage::LconvResid,
+        AudioStage::NormOut,
+        AudioStage::OutProj,
+        AudioStage::OutBias,
+        AudioStage::EmbedNorm,
+        AudioStage::EmbedProj,
+    ];
+
+    /// The mask with every stage set.
+    pub const MASK_ALL: u32 = (1u32 << Self::ALL.len() as u32) - 1;
+
+    /// This stage's bit in a mask.
+    pub const fn bit(self) -> u32 {
+        1u32 << self as u32
+    }
+
+    pub const fn name(self) -> &'static str {
+        match self {
+            AudioStage::SubConv0 => "subsample conv0+ln+relu",
+            AudioStage::SubConv1 => "subsample conv1+ln+relu",
+            AudioStage::InputProj => "input_proj GEMM",
+            AudioStage::FfnNormPre => "ffn pre-norm",
+            AudioStage::FfnUp => "ffn up GEMM (1024->4096)",
+            AudioStage::FfnAct => "ffn clamp+silu",
+            AudioStage::FfnDown => "ffn down GEMM (4096->1024)",
+            AudioStage::FfnNormPost => "ffn post-norm+resid",
+            AudioStage::AttnNorm => "attn pre-norm",
+            AudioStage::QkvClamp => "q/k/v input clamps",
+            AudioStage::QkvGemm => "q/k/v GEMMs",
+            AudioStage::Attention => "attention",
+            AudioStage::AttnOutGemm => "attn out GEMM",
+            AudioStage::AttnNormPost => "attn post-norm+resid",
+            AudioStage::LconvNorm => "lconv pre-norm",
+            AudioStage::LconvStart => "lconv start GEMM (1024->2048)",
+            AudioStage::Glu => "lconv glu",
+            AudioStage::Dwconv => "lconv depthwise conv",
+            AudioStage::LconvConvNorm => "lconv conv-norm+silu",
+            AudioStage::LconvEnd => "lconv end GEMM",
+            AudioStage::LconvResid => "lconv clamp+resid",
+            AudioStage::NormOut => "norm_out",
+            AudioStage::OutProj => "output_proj GEMM",
+            AudioStage::OutBias => "output bias",
+            AudioStage::EmbedNorm => "embedder rms-norm",
+            AudioStage::EmbedProj => "embedding_projection GEMM",
+        }
+    }
+}
+
+/// Set in the stage mask once a profiler has called
+/// [`EmbedGemma2Audio::set_stage_mask`]: the activations are then zeroed on
+/// allocation, even with every stage on, so a profiler's variants all pay the
+/// same allocation.
+const PROFILED: u32 = 1 << 31;
 
 /// One clip: the processor's `input_features` and `input_features_mask`.
 #[derive(Clone, Debug, PartialEq)]
@@ -1333,11 +1446,29 @@ impl EmbedGemma2Audio {
             output_proj,
             output_bias,
             embed_proj,
+            stage_mask: AtomicU32::new(AudioStage::MASK_ALL),
         })
     }
 
     pub fn config(&self) -> &AudioConfig {
         &self.cfg
+    }
+
+    /// A profiler's switch: later forwards run only the [`AudioStage`]s whose
+    /// bits are set in `mask`. The output of a narrowed forward is
+    /// meaningless. From the first call on, activations are zeroed on
+    /// allocation (even with every stage on), so a stage that reads what a
+    /// skipped one would have written reads zeros, not another run's values.
+    #[doc(hidden)]
+    pub fn set_stage_mask(&self, mask: u32) {
+        self.stage_mask
+            .store((mask & AudioStage::MASK_ALL) | PROFILED, Ordering::Release);
+    }
+
+    /// Undo [`Self::set_stage_mask`]: every stage, unzeroed activations.
+    #[doc(hidden)]
+    pub fn clear_stage_mask(&self) {
+        self.stage_mask.store(AudioStage::MASK_ALL, Ordering::Release);
     }
 
     /// Embed a batch of clips into soft tokens. Each clip's output is its own
@@ -1507,7 +1638,14 @@ impl EmbedGemma2Audio {
                 4 * h.max(cfg.out_dims as usize)
             ));
         }
-        let f32s = |shape: &[usize]| rt.alloc_tensor_unzeroed(shape, DType::F32);
+        let narrowed = self.stage_mask.load(Ordering::Acquire) & PROFILED != 0;
+        let f32s = |shape: &[usize]| {
+            if narrowed {
+                rt.alloc_tensor_f32(shape)
+            } else {
+                rt.alloc_tensor_unzeroed(shape, DType::F32)
+            }
+        };
         Ok(Acts {
             mid: f32s(&[mid, mels1 * cfg.sub_channels[0] as usize])?,
             sub: f32s(&[rows, cfg.proj_in() as usize])?,
@@ -1580,147 +1718,195 @@ impl EmbedGemma2Audio {
         let (c0, c1) = (cfg.sub_channels[0], cfg.sub_channels[1]);
         let mels1 = conv_out(mels as usize) as u32;
 
+        let mask = self.stage_mask.load(Ordering::Acquire);
+        let on = |s: AudioStage| mask & s.bit() != 0;
+
         // Subsampling.
         let mid_t = a.mid.try_view(&[mid, (mels1 * c0) as usize], 0)?;
-        sub_conv0_ln_relu(
-            rt,
-            &io.feats,
-            &io.fmask,
-            &self.conv0_w,
-            &self.conv0_norm,
-            &mid_t.buffer,
-            &io.clips,
-            mels,
-            c0,
-            eps,
-        )?;
+        if on(AudioStage::SubConv0) {
+            sub_conv0_ln_relu(
+                rt,
+                &io.feats,
+                &io.fmask,
+                &self.conv0_w,
+                &self.conv0_norm,
+                &mid_t.buffer,
+                &io.clips,
+                mels,
+                c0,
+                eps,
+            )?;
+        }
         let sub_t = at(&a.sub, cfg.proj_in())?;
-        sub_conv1_ln_relu(
-            rt,
-            &mid_t.buffer,
-            &io.fmask,
-            &self.conv1_w,
-            &self.conv1_norm,
-            &sub_t.buffer,
-            &io.clips,
-            mels1,
-            c0,
-            c1,
-            eps,
-        )?;
-        gemm(&sub_t, &self.input_proj, &x, backend)?;
+        if on(AudioStage::SubConv1) {
+            sub_conv1_ln_relu(
+                rt,
+                &mid_t.buffer,
+                &io.fmask,
+                &self.conv1_w,
+                &self.conv1_norm,
+                &sub_t.buffer,
+                &io.clips,
+                mels1,
+                c0,
+                c1,
+                eps,
+            )?;
+        }
+        if on(AudioStage::InputProj) {
+            gemm(&sub_t, &self.input_proj, &x, backend)?;
+        }
         if let Some(t) = io.trace.first() {
             gpu_copy(&x, t)?;
         }
 
         let ffn = |f: &Ffn| -> Result<(), String> {
-            let mut pre = RmsNorm::new(eps, Some(&f.pre_norm));
-            pre.pre = [gc, none];
-            pre.post = f.l1.bounds.input;
-            rms_norm(rt, &x.buffer, &n.buffer, rows_u, h, &pre)?;
-            gemm(&n, &f.l1.w, &big, backend)?;
-            ew(
-                rt,
-                &big.buffer,
-                &big.buffer,
-                rows_u * 4 * h,
-                &Ew {
-                    pre: f.l1.bounds.output,
-                    silu: true,
-                    post: f.l2.bounds.input,
-                    add: EwAdd::None,
-                },
-            )?;
-            gemm(&big, &f.l2.w, &y, backend)?;
-            let mut post = RmsNorm::new(eps, Some(&f.post_norm));
-            post.pre = [f.l2.bounds.output, gc];
-            post.scale = cfg.residual_weight;
-            post.resid = Some(&x.buffer);
-            rms_norm(rt, &y.buffer, &x.buffer, rows_u, h, &post)
+            if on(AudioStage::FfnNormPre) {
+                let mut pre = RmsNorm::new(eps, Some(&f.pre_norm));
+                pre.pre = [gc, none];
+                pre.post = f.l1.bounds.input;
+                rms_norm(rt, &x.buffer, &n.buffer, rows_u, h, &pre)?;
+            }
+            if on(AudioStage::FfnUp) {
+                gemm(&n, &f.l1.w, &big, backend)?;
+            }
+            if on(AudioStage::FfnAct) {
+                ew(
+                    rt,
+                    &big.buffer,
+                    &big.buffer,
+                    rows_u * 4 * h,
+                    &Ew {
+                        pre: f.l1.bounds.output,
+                        silu: true,
+                        post: f.l2.bounds.input,
+                        add: EwAdd::None,
+                    },
+                )?;
+            }
+            if on(AudioStage::FfnDown) {
+                gemm(&big, &f.l2.w, &y, backend)?;
+            }
+            if on(AudioStage::FfnNormPost) {
+                let mut post = RmsNorm::new(eps, Some(&f.post_norm));
+                post.pre = [f.l2.bounds.output, gc];
+                post.scale = cfg.residual_weight;
+                post.resid = Some(&x.buffer);
+                rms_norm(rt, &y.buffer, &x.buffer, rows_u, h, &post)?;
+            }
+            Ok(())
         };
 
         for (li, l) in self.layers.iter().enumerate() {
             ffn(&l.ff1)?;
 
             // Attention.
-            let mut pre = RmsNorm::new(eps, Some(&l.norm_pre_attn));
-            pre.pre = [gc, none];
-            rms_norm(rt, &x.buffer, &n.buffer, rows_u, h, &pre)?;
+            if on(AudioStage::AttnNorm) {
+                let mut pre = RmsNorm::new(eps, Some(&l.norm_pre_attn));
+                pre.pre = [gc, none];
+                rms_norm(rt, &x.buffer, &n.buffer, rows_u, h, &pre)?;
+            }
             for (lin, dst) in [(&l.q, &q), (&l.k, &k), (&l.v, &v)] {
-                ew(
+                if on(AudioStage::QkvClamp) {
+                    ew(
+                        rt,
+                        &n.buffer,
+                        &c.buffer,
+                        rows_u * h,
+                        &Ew {
+                            pre: lin.bounds.input,
+                            silu: false,
+                            post: none,
+                            add: EwAdd::None,
+                        },
+                    )?;
+                }
+                if on(AudioStage::QkvGemm) {
+                    gemm(&c, &lin.w, dst, backend)?;
+                }
+            }
+            if on(AudioStage::Attention) {
+                attention(
                     rt,
+                    &q.buffer,
+                    &k.buffer,
+                    &v.buffer,
+                    &l.rel,
+                    &l.q_mult,
+                    &io.omask,
                     &n.buffer,
-                    &c.buffer,
-                    rows_u * h,
-                    &Ew {
-                        pre: lin.bounds.input,
-                        silu: false,
-                        post: none,
-                        add: EwAdd::None,
+                    &io.clips,
+                    &AttentionSpec {
+                        heads: cfg.heads,
+                        head_dim: hd,
+                        chunk: cfg.chunk,
+                        past: cfg.past(),
+                        k_scale: ((1.0f64 + std::f64::consts::E).ln() / std::f64::consts::LN_2) as f32,
+                        cap: cfg.logit_cap,
+                        invalid: cfg.invalid_logit,
+                        q: l.q.bounds.output,
+                        k: l.k.bounds.output,
+                        v: l.v.bounds.output,
+                        out: l.post.bounds.input,
                     },
                 )?;
-                gemm(&c, &lin.w, dst, backend)?;
             }
-            attention(
-                rt,
-                &q.buffer,
-                &k.buffer,
-                &v.buffer,
-                &l.rel,
-                &l.q_mult,
-                &io.omask,
-                &n.buffer,
-                &io.clips,
-                &AttentionSpec {
-                    heads: cfg.heads,
-                    head_dim: hd,
-                    chunk: cfg.chunk,
-                    past: cfg.past(),
-                    k_scale: ((1.0f64 + std::f64::consts::E).ln() / std::f64::consts::LN_2) as f32,
-                    cap: cfg.logit_cap,
-                    invalid: cfg.invalid_logit,
-                    q: l.q.bounds.output,
-                    k: l.k.bounds.output,
-                    v: l.v.bounds.output,
-                    out: l.post.bounds.input,
-                },
-            )?;
-            gemm(&n, &l.post.w, &y, backend)?;
-            let mut post = RmsNorm::new(eps, Some(&l.norm_post_attn));
-            post.pre = [l.post.bounds.output, gc];
-            post.resid = Some(&x.buffer);
-            rms_norm(rt, &y.buffer, &x.buffer, rows_u, h, &post)?;
+            if on(AudioStage::AttnOutGemm) {
+                gemm(&n, &l.post.w, &y, backend)?;
+            }
+            if on(AudioStage::AttnNormPost) {
+                let mut post = RmsNorm::new(eps, Some(&l.norm_post_attn));
+                post.pre = [l.post.bounds.output, gc];
+                post.resid = Some(&x.buffer);
+                rms_norm(rt, &y.buffer, &x.buffer, rows_u, h, &post)?;
+            }
 
             // Light conv.
-            let mut pre = RmsNorm::new(eps, Some(&l.lc_pre_norm));
-            pre.post = l.lc_start.bounds.input;
-            rms_norm(rt, &x.buffer, &n.buffer, rows_u, h, &pre)?;
-            gemm(&n, &l.lc_start.w, &big2, backend)?;
-            glu(rt, &big2.buffer, &n.buffer, rows_u, h, l.lc_start.bounds.output)?;
-            dwconv1d_causal(rt, &n.buffer, &l.lc_conv, &y.buffer, &io.clips, h, cfg.conv_kernel)?;
-            let mut cn = RmsNorm::new(eps, Some(&l.lc_conv_norm));
-            cn.pre = [gc, none];
-            cn.silu = true;
-            cn.post = l.lc_end.bounds.input;
-            rms_norm(rt, &y.buffer, &n.buffer, rows_u, h, &cn)?;
-            gemm(&n, &l.lc_end.w, &y, backend)?;
-            ew(
-                rt,
-                &y.buffer,
-                &x.buffer,
-                rows_u * h,
-                &Ew {
-                    pre: l.lc_end.bounds.output,
-                    silu: false,
-                    post: none,
-                    add: EwAdd::Residual(&x.buffer),
-                },
-            )?;
+            if on(AudioStage::LconvNorm) {
+                let mut pre = RmsNorm::new(eps, Some(&l.lc_pre_norm));
+                pre.post = l.lc_start.bounds.input;
+                rms_norm(rt, &x.buffer, &n.buffer, rows_u, h, &pre)?;
+            }
+            if on(AudioStage::LconvStart) {
+                gemm(&n, &l.lc_start.w, &big2, backend)?;
+            }
+            if on(AudioStage::Glu) {
+                glu(rt, &big2.buffer, &n.buffer, rows_u, h, l.lc_start.bounds.output)?;
+            }
+            if on(AudioStage::Dwconv) {
+                dwconv1d_causal(rt, &n.buffer, &l.lc_conv, &y.buffer, &io.clips, h, cfg.conv_kernel)?;
+            }
+            if on(AudioStage::LconvConvNorm) {
+                let mut cn = RmsNorm::new(eps, Some(&l.lc_conv_norm));
+                cn.pre = [gc, none];
+                cn.silu = true;
+                cn.post = l.lc_end.bounds.input;
+                rms_norm(rt, &y.buffer, &n.buffer, rows_u, h, &cn)?;
+            }
+            if on(AudioStage::LconvEnd) {
+                gemm(&n, &l.lc_end.w, &y, backend)?;
+            }
+            if on(AudioStage::LconvResid) {
+                ew(
+                    rt,
+                    &y.buffer,
+                    &x.buffer,
+                    rows_u * h,
+                    &Ew {
+                        pre: l.lc_end.bounds.output,
+                        silu: false,
+                        post: none,
+                        add: EwAdd::Residual(&x.buffer),
+                    },
+                )?;
+            }
 
             ffn(&l.ff2)?;
-            let mut out = RmsNorm::new(eps, Some(&l.norm_out));
-            out.pre = [gc, none];
-            rms_norm(rt, &x.buffer, &x.buffer, rows_u, h, &out)?;
+            if on(AudioStage::NormOut) {
+                let mut out = RmsNorm::new(eps, Some(&l.norm_out));
+                out.pre = [gc, none];
+                rms_norm(rt, &x.buffer, &x.buffer, rows_u, h, &out)?;
+            }
             if let Some(t) = io.trace.get(1 + li) {
                 gpu_copy(&x, t)?;
             }
@@ -1728,32 +1914,41 @@ impl EmbedGemma2Audio {
 
         // Output projection (with bias) and the multimodal embedder.
         let tower = at(&a.tower, cfg.out_dims)?;
-        gemm(&x, &self.output_proj, &tower, backend)?;
-        ew(
-            rt,
-            &tower.buffer,
-            &tower.buffer,
-            rows_u * cfg.out_dims,
-            &Ew {
-                pre: none,
-                silu: false,
-                post: none,
-                add: EwAdd::Bias(&self.output_bias, cfg.out_dims),
-            },
-        )?;
+        if on(AudioStage::OutProj) {
+            gemm(&x, &self.output_proj, &tower, backend)?;
+        }
+        if on(AudioStage::OutBias) {
+            ew(
+                rt,
+                &tower.buffer,
+                &tower.buffer,
+                rows_u * cfg.out_dims,
+                &Ew {
+                    pre: none,
+                    silu: false,
+                    post: none,
+                    add: EwAdd::Bias(&self.output_bias, cfg.out_dims),
+                },
+            )?;
+        }
         if let Some(t) = io.trace.last() {
             gpu_copy(&tower, t)?;
         }
         let emb = at(&a.emb, cfg.out_dims)?;
-        rms_norm(
-            rt,
-            &tower.buffer,
-            &emb.buffer,
-            rows_u,
-            cfg.out_dims,
-            &RmsNorm::new(eps, None),
-        )?;
-        gemm(&emb, &self.embed_proj, &io.soft, backend)
+        if on(AudioStage::EmbedNorm) {
+            rms_norm(
+                rt,
+                &tower.buffer,
+                &emb.buffer,
+                rows_u,
+                cfg.out_dims,
+                &RmsNorm::new(eps, None),
+            )?;
+        }
+        if on(AudioStage::EmbedProj) {
+            gemm(&emb, &self.embed_proj, &io.soft, backend)?;
+        }
+        Ok(())
     }
 }
 

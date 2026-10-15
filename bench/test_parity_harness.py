@@ -19,6 +19,7 @@ import argparse
 import json
 import os
 import shutil
+import subprocess
 import sys
 import tempfile
 
@@ -778,6 +779,23 @@ def attn_cli_contract():
             print(f"  ok    {label}: exit {r.returncode}, names the cause")
 
 
+def coverage_adversarial():
+    """`bench/test_kernel_coverage_adversarial.py`: phantom and missed kernels,
+    exit statuses, stale-binary refusal. A subprocess, so its unittest run is
+    one section here; any failure fails the harness."""
+    print("\n-- kernel coverage adversarial contract --")
+    r = subprocess.run([sys.executable, "-I",
+                        os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                     "test_kernel_coverage_adversarial.py")],
+                       capture_output=True, text=True, timeout=600)
+    tail = r.stderr.strip().splitlines()[-1] if r.stderr.strip() else ""
+    if r.returncode == 0:
+        print(f"  ok    adversarial tests passed ({tail})")
+    else:
+        FAILURES.append(f"kernel coverage adversarial tests failed:\n{r.stderr[-1500:]}")
+        print(f"  FAIL  adversarial tests: exit {r.returncode}\n{r.stderr[-1500:]}")
+
+
 def coverage_inventory():
     """`kernel_coverage.inventory` -- the kernel census.
 
@@ -799,6 +817,8 @@ def coverage_inventory():
             return d
 
         d = write("kernel void alpha(device float* x) {}\n"
+                  "#define NN_COOP_KERNEL(NAME, T, A, B, C, D) kernel void NAME(device T* x) {}\n"
+                  "#define TN_NT_COOP_KERNEL(NAME, T, A, B) kernel void NAME(device T* x) {}\n"
                   "NN_COOP_KERNEL(beta, bfloat, 64, 64, 4, false)\n"
                   "TN_NT_COOP_KERNEL( gamma , float, 128, 64)\n")
         names, _ = inventory(d, metallib="/nonexistent")
@@ -824,21 +844,20 @@ def coverage_inventory():
             FAILURES.append(f"macro body leaked into the inventory: {sorted(names)}")
             print(f"  FAIL  macro body leaked: {sorted(names)}")
 
-        # A macro whose first argument is not an identifier cannot be parsed
-        # for a kernel name, and must fail rather than be skipped.
+        # A source the preprocessor rejects is a failed census, never a smaller one.
         d = write("kernel void alpha(device float* x) {}\n"
-                  'WEIRD_NEW_KERNEL("delta", bfloat)\n')
+                  'WEIRD_NEW_KERNEL("delta", bfloat)\n#error not a kernel source\n')
         try:
             inventory(d, metallib="/nonexistent")
         except SystemExit as exc:
-            if "not parsed" in str(exc):
-                print("  ok    an unparsed kernel macro fails loudly")
+            if "does not preprocess" in str(exc):
+                print("  ok    a source that does not preprocess fails loudly")
             else:
-                FAILURES.append(f"unparsed macro raised the wrong error: {exc}")
+                FAILURES.append(f"unpreprocessable source raised the wrong error: {exc}")
                 print(f"  FAIL  wrong error: {exc}")
         else:
-            FAILURES.append("an unparsed kernel macro was silently undercounted")
-            print("  FAIL  unparsed macro silently undercounted")
+            FAILURES.append("a source that does not preprocess was silently undercounted")
+            print("  FAIL  unpreprocessable source silently undercounted")
 
         # Macro families that stamp kernels under names the old pattern could not
         # see: a name not ending in KERNEL, `##` pasting, and a macro that stamps
@@ -894,7 +913,7 @@ def coverage_inventory():
         try:
             inventory(d, metallib="/definitely/missing.metallib", require_metallib=True)
         except SystemExit as exc:
-            if "metallib missing" in str(exc):
+            if "metallib missing" in str(exc) and getattr(exc, "code", None) == 77:
                 print("  ok    required metallib cross-check fails closed when absent")
             else:
                 FAILURES.append(f"missing metallib raised wrong error: {exc}")
@@ -1260,6 +1279,7 @@ def main(argv=None):
     run_gpu_section(summary, mode, "bench_flash_attn CLI contract", attn_cli_contract)
     run_section(summary, "attention tuning contract", tune_knob_contract)
     run_section(summary, "kernel inventory contract", coverage_inventory)
+    run_section(summary, "kernel coverage adversarial contract", coverage_adversarial)
     run_section(summary, "static tile audit contract", tile_audit_contract)
     run_section(summary, "execution policy contract", execution_policy_contract)
 

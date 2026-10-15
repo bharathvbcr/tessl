@@ -82,7 +82,7 @@ fn embedded_metallib() -> Result<&'static [u8], String> {
 
 fn dump_metallib(path: &str) -> Result<(), String> {
     let bytes = embedded_metallib()?;
-    std::fs::write(path, bytes).map_err(|e| format!("--dump-metallib {path}: {e}"))
+    common::atomic_write(Path::new(path), bytes).map_err(|e| format!("--dump-metallib {e}"))
 }
 
 fn main() -> Result<(), String> {

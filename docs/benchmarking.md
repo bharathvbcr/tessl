@@ -224,6 +224,26 @@ The old Python evidence module is gone. Its last helper, `embedded_metallib_path
 scanned binaries for a path none carries; `bench/kernel_coverage.py` now has
 `bench_gemm_sweep --dump-metallib PATH` write the embedded bytes and reads those.
 
+### `kernel_coverage.py` exit status
+
+`python3 bench/kernel_coverage.py --check` (the same table is in `--help`):
+
+| Exit | Meaning |
+|---|---|
+| 0 | Ran, and every kernel entry point is dispatched by a benchmark. |
+| 1 | Ran and found gaps: undispatched kernels (150 of 266 today, ft-6d88defb), a census that disagrees with the metallib, or a traced kernel absent from the census. |
+| 77 | Could not run: no `xcrun metal` / `metal-nm`, no bench binary (under `CARGO_TARGET_DIR` if set, else `target/`), a binary older than `kernels/*.metal`, `kernels/*.h` or `build.rs`, no metallib, a suite that failed or printed no `KERNEL_TRACE`. 77 is the repo's SKIPPED status and never success. |
+| 2 | Bad command line. |
+
+The kernel census is `xcrun metal -E` over each `kernels/*.metal` with the flags
+`build.rs`'s `metal_args` gives every compile (read from build.rs, not copied),
+then the entry points in the preprocessed text, so comments, `#if 0` and
+disabled `#ifdef` blocks do not count, and `[[host_name]]` renames and template
+instantiations resolve. Without the toolchain there is no census and the status
+is 77; nothing falls back to a text scan. `--dump-metallib` refuses an existing
+target that is not a regular file and publishes atomically (staged file, then
+rename).
+
 ## Pitfall 4 — stale binaries
 
 `cargo test --lib` rebuilds the library but **not** the binaries. Two rounds of

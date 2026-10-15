@@ -13,9 +13,26 @@ name passed to `GpuRuntime::pipeline`, which is the single site where a kernel
 is selected; each bench binary prints its trace on exit, on every exit path.
 
   python3 bench/kernel_coverage.py            # report
-  python3 bench/kernel_coverage.py --check    # non-zero if anything is uncovered
+  python3 bench/kernel_coverage.py --check    # gate: see the exit status below
 
-The census is read from the metallib the binaries run. The runtime embeds the
+Exit status (the same on every path; documented in docs/benchmarking.md):
+  0   the check ran and every kernel entry point is dispatched
+  1   the check ran and found gaps (undispatched kernels, a census that
+      disagrees with the metallib, a kernel traced that is not in the census)
+  77  the check could not run: no toolchain (`xcrun metal` / `metal-nm`), no
+      binary, a stale binary, no metallib, a suite that failed or printed no
+      trace. 77 is the repo's SKIPPED status (scripts/check_kernel_ir.sh) and is
+      never success, and never the same status as "ran and found gaps".
+  2   bad command line (argparse)
+
+The kernel census comes from the real preprocessor: `xcrun metal -E`, with the
+flags build.rs's `metal_args` gives every compile, on each kernels/*.metal, and
+the entry points are read from the preprocessed text (comments, `#if 0`, and
+disabled `#ifdef` blocks are gone; macro stamping, `##` pasting, and
+`[[host_name]]` / `template` instantiations are resolved). It is not
+reimplemented here, so a toolchain that is missing is "could not run".
+
+The census is cross-checked against the metallib the binaries run. The runtime embeds the
 library's bytes (`include_bytes!`), so no binary carries a path to look up;
 `target/release/bench_gemm_sweep --dump-metallib PATH` writes those bytes out and
 `metal-nm` reads them. Pass `--metallib PATH` to audit an explicit artifact
@@ -33,14 +50,242 @@ import tempfile
 HERE = os.path.dirname(os.path.abspath(__file__))
 CRATE = os.path.dirname(HERE)
 KDIR = os.path.join(CRATE, "kernels")
-BIN = os.path.join(CRATE, "target", "release")
 
-PLAIN = re.compile(r'^kernel void ([A-Za-z0-9_]+)', re.M)
-MACRO = re.compile(r'^([A-Z][A-Z0-9_]*KERNEL)\(\s*([A-Za-z0-9_]+)', re.M)
-# Any line that looks like a kernel-declaring macro must match MACRO's shape.
-# A new macro family that this does not parse is a silent undercount, which is
-# the bug that produced the original 67-vs-83 error.
-MACROISH = re.compile(r'^([A-Z][A-Z0-9_]*KERNEL)\(', re.M)
+EXIT_GAPS = 1
+EXIT_CANNOT_RUN = 77
+
+
+class CannotRun(SystemExit):
+    """The check could not run. Distinct from a run that found gaps: `main`
+    exits EXIT_CANNOT_RUN for it, where a plain SystemExit(message) is 1."""
+
+    def __init__(self, message):
+        super().__init__(message)
+        self.message = message
+        self.code = EXIT_CANNOT_RUN
+
+
+def bin_dir():
+    """`target/release` of this crate, honouring CARGO_TARGET_DIR."""
+    target = os.environ.get("CARGO_TARGET_DIR")
+    return os.path.join(os.path.abspath(target) if target else os.path.join(CRATE, "target"),
+                        "release")
+
+
+def newest_input(crate=None):
+    """Newest mtime among what the metallib and the binaries are built from."""
+    crate = crate or CRATE
+    paths = [os.path.join(crate, "build.rs")]
+    kdir = os.path.join(crate, "kernels")
+    if os.path.isdir(kdir):
+        paths += [os.path.join(kdir, f) for f in os.listdir(kdir) if f.endswith((".metal", ".h"))]
+    return max((os.path.getmtime(x) for x in paths if os.path.exists(x)), default=0.0)
+
+
+def require_fresh(binary, crate=None):
+    """A bench binary older than the kernel sources or build.rs embeds a metallib
+    (and dispatches kernels) the source tree no longer describes."""
+    if os.path.getmtime(binary) < newest_input(crate):
+        raise CannotRun(
+            f"{binary} is older than kernels/*.metal, kernels/*.h or build.rs, so it "
+            "embeds a stale metallib; rebuild with `cargo build --release --bins`")
+
+
+def metal_toolchain():
+    try:
+        r = subprocess.run(["xcrun", "-f", "metal"], capture_output=True, text=True)
+        sdk = subprocess.run(["xcrun", "--sdk", "macosx", "--show-sdk-path"],
+                             capture_output=True, text=True)
+    except OSError as exc:
+        raise CannotRun(f"kernel census needs `xcrun metal` (Xcode Metal Toolchain): {exc}")
+    if r.returncode != 0 or not r.stdout.strip() or sdk.returncode != 0:
+        raise CannotRun("kernel census needs `xcrun metal` (Xcode Metal Toolchain); "
+                        "no kernel source was preprocessed")
+    return r.stdout.strip(), sdk.stdout.strip()
+
+
+def build_rs_flags(sdk):
+    """The flag list build.rs's `metal_args` gives every compile, read from
+    build.rs itself (no second copy to drift). `-std` is chosen by the caller."""
+    with open(os.path.join(CRATE, "build.rs")) as fh:
+        text = fh.read()
+    m = re.search(r"fn metal_args\(.*?let mut args: Vec<String> = \[(.*?)\]\s*\.iter\(\)",
+                  text, re.S)
+    if not m:
+        raise CannotRun("could not read build.rs `metal_args`; the preprocessor flags are unknown")
+    flags = []
+    for lit, ident in re.findall(r'"([^"]*)"|\b(sdk)\b', m.group(1)):
+        if ident:
+            flags.append(sdk)
+        elif "{" not in lit:  # `-std={metal_std}` is chosen per compile
+            flags.append(lit)
+    if "-isysroot" not in flags or sdk not in flags:
+        raise CannotRun(f"build.rs metal_args parsed to {flags}, with no -isysroot SDK")
+    return flags
+
+
+ENTRY = re.compile(
+    r"(template\s*(?:<[^<>]*>)?\s*)?((?:\[\[[^\]]*\]\]\s*)*)"
+    r"\bkernel\s+void\s+([A-Za-z_][A-Za-z0-9_]*)")
+HOST_NAME = re.compile(r'host_name\(\s*"([^"]+)"\s*\)')
+
+
+def entry_points(preprocessed, where="<source>"):
+    """Exported kernel names in preprocessed MSL.
+
+    An entry point is `kernel void NAME`; `[[host_name("x")]]` renames it to x
+    (what the metallib exports). A `template <params>` kernel is a generic
+    definition, not an entry point, until an explicit instantiation
+    (`template [[host_name("x")]] kernel void f<...>`) names it.
+    """
+    out = set()
+    for m in ENTRY.finditer(preprocessed):
+        tmpl, attrs, name = m.group(1), m.group(2), m.group(3)
+        host = HOST_NAME.search(attrs)
+        if tmpl and re.search(r"<\s*[^>\s]", tmpl):
+            continue  # generic definition
+        if tmpl and not host:
+            raise SystemExit(f"{where}: template instantiation of `{name}` has no "
+                             "[[host_name]], so its exported name cannot be derived")
+        out.add(host.group(1) if host else name)
+    return out
+
+
+def preprocess(metal, flags, src):
+    """`metal -E` of one source, with build.rs's std fallback (metal4.0 then
+    metal3.2). Returns the preprocessed text."""
+    errs = []
+    with tempfile.TemporaryDirectory(prefix="kernel-census-") as d:
+        out = os.path.join(d, "pp.i")
+        for std in ("metal4.0", "metal3.2"):
+            try:
+                r = subprocess.run([metal, "-E", f"-std={std}", *flags, src, "-o", out],
+                                   capture_output=True, text=True, timeout=120)
+            except (OSError, subprocess.TimeoutExpired) as exc:
+                raise CannotRun(f"could not run {metal} -E on {src}: {exc}")
+            if r.returncode == 0 and os.path.isfile(out):
+                with open(out, errors="replace") as fh:
+                    return fh.read()
+            errs.append(f"{std}: {r.stderr.strip()[:300]}")
+    raise SystemExit(f"{os.path.basename(src)} does not preprocess ({'; '.join(errs)})")
+
+
+def inventory(kdir=None, metallib=None, require_metallib=False):
+    """Every kernel entry point in the shipped kernel sources.
+
+    Read from the real preprocessor's output, so the set is right by
+    construction and needs no cross-check to be trusted. `metallib` is still
+    compared when it can be read (the library is what the runtime looks a
+    pipeline up in), and `require_metallib` makes an unreadable library a
+    failure; `--check` always sets it. Raises CannotRun when the toolchain is
+    absent: that is never answered with a different scan.
+    """
+    kdir = kdir or KDIR
+    sources = sorted(f for f in os.listdir(kdir) if f.endswith(".metal"))
+    if not sources:
+        raise SystemExit(f"no kernels found under {kdir}")
+    metal, sdk = metal_toolchain()
+    flags = build_rs_flags(sdk)
+    names, by_file = set(), {}
+    for f in sources:
+        found = entry_points(preprocess(metal, flags, os.path.join(kdir, f)), f)
+        names |= found
+        by_file[f[:-6]] = found
+    if not names:
+        raise SystemExit(f"no kernels found under {kdir}")
+
+    # Cross-check against the compiled metallib, which is ground truth for what
+    # the runtime can look up. Any disagreement means the census is wrong.
+    exported = metallib_symbols(metallib, required=require_metallib)
+    if exported is not None:
+        only_lib = sorted(exported - names)
+        only_src = sorted(names - exported)
+        if only_lib or only_src:
+            raise SystemExit(
+                "kernel inventory disagrees with the compiled metallib.\n"
+                f"  in metallib, missed by the census ({len(only_lib)}): {only_lib[:8]}\n"
+                f"  in census, absent from metallib ({len(only_src)}): {only_src[:8]}\n"
+                "The census is wrong; fix it rather than measuring coverage against it.")
+    return names, by_file
+
+
+def metallib_symbols(path=None, required=False):
+    """Exported kernel names from the built metallib, or None if unavailable.
+
+    `None` and `set()` are deliberately different: a toolchain without
+    `metal-nm` must not read as a library with no kernels in it. Set `required`
+    for a coverage measurement: a cross-check that could not run is then a
+    CannotRun rather than the same PASS as one that actually verified the binary.
+    """
+    if path is None:
+        # The runtime embeds the library's bytes, so the census is read from
+        # those bytes, dumped by the binary being measured.
+        binary = os.path.join(bin_dir(), "bench_gemm_sweep")
+        if not os.path.isfile(binary):
+            if required:
+                raise CannotRun(
+                    f"benchmark binary missing at {binary}; run "
+                    "`cargo build --release --bins` before measuring kernel coverage")
+            return None
+        with tempfile.TemporaryDirectory(prefix="kernel-coverage-lib-") as d:
+            try:
+                require_fresh(binary)
+                return metallib_symbols(dump_embedded_metallib(binary, d), required)
+            except SystemExit:
+                if required:
+                    raise
+                return None
+    if not os.path.exists(path):
+        if required:
+            raise CannotRun(
+                f"compiled metallib missing at {path}; build the release binaries "
+                "before measuring kernel coverage")
+        return None
+    try:
+        r = subprocess.run(["xcrun", "metal-nm", path], capture_output=True, text=True)
+    except OSError as exc:
+        if required:
+            raise CannotRun(f"could not execute xcrun metal-nm: {exc}")
+        return None
+    if r.returncode != 0:
+        if required:
+            detail = r.stderr.strip()[:400] or "no diagnostic"
+            raise CannotRun(f"metal-nm failed for {path}: {detail}")
+        return None
+    out = set()
+    for line in r.stdout.splitlines():
+        parts = line.split()
+        # `<addr> T <name>` marks an exported kernel entry point.
+        if len(parts) == 3 and parts[1] == "T":
+            out.add(parts[2])
+    if not out and required:
+        raise CannotRun(
+            f"metal-nm exported no kernel entry points from {path}; refusing to "
+            "treat an unreadable or empty library as verified")
+    return out or None
+
+
+def dump_embedded_metallib(binary, directory):
+    """Write the metallib `binary` embeds into `directory`; return its path.
+
+    Raises CannotRun naming the fix when the binary cannot produce it, so a
+    stale binary (built before `--dump-metallib` existed) is not mistaken for
+    a library with nothing in it.
+    """
+    out = os.path.join(directory, "embedded.metallib")
+    fix = "rebuild with `cargo build --release --bins`"
+    try:
+        r = subprocess.run([binary, "--dump-metallib", out], capture_output=True,
+                           text=True, timeout=60)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise CannotRun(f"could not run {binary} --dump-metallib: {exc}; {fix}")
+    if r.returncode != 0 or not os.path.isfile(out) or os.path.getsize(out) == 0:
+        detail = r.stderr.strip()[:400] or "no diagnostic"
+        raise CannotRun(
+            f"{binary} --dump-metallib exited {r.returncode} without a library "
+            f"({detail}); the binary is stale or embeds no metallib: {fix}")
+    return out
+
 
 # Benchmarks to run, and the arguments that make them cover their own breadth.
 # Kept small: this is a coverage probe, not a measurement.
@@ -96,254 +341,18 @@ SUITES = [
 ]
 
 
-def strip_macro_bodies(text):
-    """Blank out `#define` continuation blocks, keeping line count stable."""
-    out, in_define = [], False
-    for line in text.splitlines():
-        starts = line.lstrip().startswith("#define")
-        if starts or in_define:
-            out.append("")
-            in_define = line.rstrip().endswith("\\")
-        else:
-            out.append(line)
-    return "\n".join(out)
-
-
-DEFINE = re.compile(r'^[ \t]*#[ \t]*define[ \t]+([A-Za-z_][A-Za-z0-9_]*)\(([^)]*)\)(.*)$')
-CALL = re.compile(r'\b([A-Za-z_][A-Za-z0-9_]*)\(')
-KERNEL_DECL = re.compile(r'\bkernel\s+void\s+([A-Za-z_][A-Za-z0-9_]*)')
-MAX_EXPANSION_DEPTH = 8
-
-
-def function_macros(kdir):
-    """Every function-like `#define NAME(params) body` in the kernel sources.
-
-    Headers count: a family can be defined in a `.h` and stamped in a `.metal`.
-    Continuation lines are joined, so `body` is the whole definition.
-    """
-    defs = {}
-    for f in sorted(os.listdir(kdir)):
-        if not f.endswith((".metal", ".h")):
-            continue
-        lines = open(os.path.join(kdir, f)).read().splitlines()
-        i = 0
-        while i < len(lines):
-            joined = lines[i]
-            while joined.rstrip().endswith("\\") and i + 1 < len(lines):
-                i += 1
-                joined = joined.rstrip()[:-1] + " " + lines[i]
-            i += 1
-            m = DEFINE.match(joined)
-            if m:
-                params = [p.strip() for p in m.group(2).split(",") if p.strip()]
-                defs[m.group(1)] = (params, m.group(3))
-    return defs
-
-
-def call_args(text, open_paren):
-    """Top-level arguments of the call whose `(` is at `open_paren`, and the
-    index after its `)`. Brackets nest; a call that never closes is an error."""
-    depth, args, start = 0, [], open_paren + 1
-    for i in range(open_paren, len(text)):
-        c = text[i]
-        if c in "([{":
-            depth += 1
-        elif c in ")]}":
-            depth -= 1
-            if depth == 0:
-                tail = text[start:i].strip()
-                if tail or args:
-                    args.append(tail)
-                return args, i + 1
-        elif c == "," and depth == 1:
-            args.append(text[start:i].strip())
-            start = i + 1
-    raise SystemExit(f"unterminated macro call near {text[open_paren - 40:open_paren]!r}")
-
-
-def expand_kernels(name, args, defs, depth=0):
-    """Kernel names a call to the function-like macro `name` declares.
-
-    Substitutes the arguments, resolves `##` token pasting, reads every
-    `kernel void NAME`, and follows calls to other macros in the result, which
-    is how `QWEN35_ADAMW_BF16_RULE` reaches `QWEN35_ADAMW_STORED`.
-    """
-    params, body = defs[name]
-    if len(args) != len(params):
-        raise SystemExit(f"macro {name} takes {len(params)} argument(s), called with {len(args)}")
-    if depth > MAX_EXPANSION_DEPTH:
-        raise SystemExit(f"macro {name} expands more than {MAX_EXPANSION_DEPTH} levels deep")
-    if params:
-        sub = dict(zip(params, args))
-        body = re.sub(r"\b(" + "|".join(map(re.escape, params)) + r")\b",
-                      lambda m: sub[m.group(1)], body)
-    body = re.sub(r"\s*##\s*", "", body)
-    found = set(KERNEL_DECL.findall(body))
-    for m in CALL.finditer(body):
-        if m.group(1) in defs:
-            inner, _ = call_args(body, m.end() - 1)
-            found |= expand_kernels(m.group(1), inner, defs, depth + 1)
-    return found
-
-
-def macro_declared(text, defs):
-    """Kernels stamped by line-start invocations of defined function macros.
-
-    Returns (names, handled): `handled` is the macro names that were defined
-    and so expanded, whether or not they declared a kernel.
-    """
-    names, handled = set(), set()
-    for m in re.finditer(r"^([A-Za-z_][A-Za-z0-9_]*)\(", text, re.M):
-        if m.group(1) in defs:
-            args, _ = call_args(text, m.end() - 1)
-            names |= expand_kernels(m.group(1), args, defs)
-            handled.add(m.group(1))
-    return names, handled
-
-
-def inventory(kdir=None, metallib=None, require_metallib=False):
-    """Every kernel entry point declared in the shipped kernel sources.
-
-    `kdir` is a parameter so the guard below is testable: a macro family this
-    does not parse must fail loudly, and that is the single behaviour standing
-    between a correct inventory and the silent 67-vs-83 undercount.
-    """
-    kdir = kdir or KDIR
-    names, by_file = set(), {}
-    defs = function_macros(kdir)
-    for f in sorted(os.listdir(kdir)):
-        if not f.endswith(".metal"):
-            continue
-        text = open(os.path.join(kdir, f)).read()
-        # A macro *body* can contain `kernel void NAME(` at line start, where
-        # NAME is the macro parameter rather than a kernel. Scanning it yields a
-        # phantom entry point that exists in no metallib. Strip `#define` blocks
-        # -- which continue while lines end in a backslash -- before scanning;
-        # the invocations below the block are what name the real kernels.
-        text = strip_macro_bodies(text)
-        # Macros defined in the sources are expanded, whatever their name;
-        # that is what reaches `QWEN35_ADAMW_STORED` and `TILED_ATTN_KERNEL_IMPL`.
-        # A `*KERNEL(` macro defined nowhere in `kdir` falls back to its first
-        # argument, and one whose first argument is no identifier is refused.
-        expanded, handled = macro_declared(text, defs)
-        found = (set(PLAIN.findall(text)) | expanded
-                 | {m[1] for m in MACRO.findall(text) if m[0] not in handled})
-        seen_macro = {m for m in MACROISH.findall(text)} - handled
-        parsed_macro = {m[0] for m in MACRO.findall(text)}
-        unparsed = seen_macro - parsed_macro
-        if unparsed:
-            raise SystemExit(
-                f"{f}: kernel-declaring macro(s) {sorted(unparsed)} present but not "
-                "parsed by MACRO. Extend the pattern rather than undercounting -- "
-                "a missed macro family silently shrinks the inventory.")
-        names |= found
-        by_file[f[:-6]] = found
-    if not names:
-        raise SystemExit(f"no kernels found under {kdir}")
-
-    # Cross-check against the compiled metallib, which is ground truth: it is
-    # what the runtime can actually look a pipeline up in. The source scan is
-    # kept because it attributes each kernel to a file, but any disagreement
-    # means the scan is wrong -- a macro form it cannot parse, or one whose
-    # first argument is not the kernel name.
-    exported = metallib_symbols(metallib, required=require_metallib)
-    if exported is not None:
-        only_lib = sorted(exported - names)
-        only_src = sorted(names - exported)
-        if only_lib or only_src:
-            raise SystemExit(
-                "kernel inventory disagrees with the compiled metallib.\n"
-                f"  in metallib, missed by the source scan ({len(only_lib)}): {only_lib[:8]}\n"
-                f"  in source scan, absent from metallib ({len(only_src)}): {only_src[:8]}\n"
-                "The scan is wrong; fix it rather than measuring coverage against it.")
-    return names, by_file
-
-
-def dump_embedded_metallib(binary, directory):
-    """Write the metallib `binary` embeds into `directory`; return its path.
-
-    Raises SystemExit naming the fix when the binary cannot produce it, so a
-    stale binary (built before `--dump-metallib` existed) is not mistaken for
-    a library with nothing in it.
-    """
-    out = os.path.join(directory, "embedded.metallib")
-    fix = "rebuild with `cargo build --release --bins`"
-    try:
-        r = subprocess.run([binary, "--dump-metallib", out], capture_output=True,
-                           text=True, timeout=60)
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        raise SystemExit(f"could not run {binary} --dump-metallib: {exc}; {fix}")
-    if r.returncode != 0 or not os.path.isfile(out) or os.path.getsize(out) == 0:
-        detail = r.stderr.strip()[:400] or "no diagnostic"
-        raise SystemExit(
-            f"{binary} --dump-metallib exited {r.returncode} without a library "
-            f"({detail}); the binary is stale or embeds no metallib: {fix}")
-    return out
-
-
-def metallib_symbols(path=None, required=False):
-    """Exported kernel names from the built metallib, or None if unavailable.
-
-    `None` and `set()` are deliberately different: a toolchain without
-    `metal-nm` must not read as a library with no kernels in it. Set `required`
-    for a coverage measurement: a cross-check that could not run is then a hard
-    failure rather than the same PASS as one that actually verified the binary.
-    """
-    if path is None:
-        # The runtime embeds the library's bytes, so the census is read from
-        # those bytes, dumped by the binary being measured. Nothing is resolved
-        # from the source tree, and a stale `default.metallib` copy is not read.
-        binary = os.path.join(BIN, "bench_gemm_sweep")
-        if not os.path.isfile(binary):
-            if required:
-                raise SystemExit(
-                    f"benchmark binary missing at {binary}; run "
-                    "`cargo build --release --bins` before measuring kernel coverage")
-            return None
-        with tempfile.TemporaryDirectory(prefix="kernel-coverage-lib-") as d:
-            try:
-                return metallib_symbols(dump_embedded_metallib(binary, d), required)
-            except SystemExit:
-                if required:
-                    raise
-                return None
-    if not os.path.exists(path):
-        if required:
-            raise SystemExit(
-                f"compiled metallib missing at {path}; build the release binaries "
-                "before measuring kernel coverage")
-        return None
-    try:
-        r = subprocess.run(["xcrun", "metal-nm", path], capture_output=True, text=True)
-    except OSError as exc:
-        if required:
-            raise SystemExit(f"could not execute xcrun metal-nm: {exc}")
-        return None
-    if r.returncode != 0:
-        if required:
-            detail = r.stderr.strip()[:400] or "no diagnostic"
-            raise SystemExit(f"metal-nm failed for {path}: {detail}")
-        return None
-    out = set()
-    for line in r.stdout.splitlines():
-        parts = line.split()
-        # `<addr> T <name>` marks an exported kernel entry point.
-        if len(parts) == 3 and parts[1] == "T":
-            out.add(parts[2])
-    if not out and required:
-        raise SystemExit(
-            f"metal-nm exported no kernel entry points from {path}; refusing to "
-            "treat an unreadable or empty library as verified")
-    return out or None
-
-
 def run_suites(tmp):
     """Union of the kernels every suite dispatched, plus the per-suite split."""
     traced, per_suite, failures = set(), {}, []
     for name, argv, env in SUITES:
-        binary = os.path.join(BIN, name)
+        binary = os.path.join(bin_dir(), name)
         if not os.path.exists(binary):
             failures.append(f"{name}: not built (cargo build --release --bins)")
+            continue
+        try:
+            require_fresh(binary)
+        except CannotRun as exc:
+            failures.append(exc.message)
             continue
         argv = [a.replace("{tmp}", tmp) for a in argv]
         e = dict(os.environ, TESSL_KERNEL_TRACE="1", **env)
@@ -370,9 +379,21 @@ def run_suites(tmp):
 
 
 def main():
-    ap = argparse.ArgumentParser()
+    try:
+        run()
+    except CannotRun as exc:
+        print(f"COULD NOT RUN: {exc.message}", file=sys.stderr)
+        sys.exit(EXIT_CANNOT_RUN)
+
+
+def run():
+    ap = argparse.ArgumentParser(
+        epilog="exit status: 0 ran and every kernel is dispatched; 1 ran and found "
+               "gaps (or a census/metallib disagreement); 77 could not run (no "
+               "toolchain, binary, metallib or trace, a stale binary, or a failed "
+               "suite); 2 bad command line.")
     ap.add_argument("--check", action="store_true",
-                    help="exit non-zero if any kernel is never dispatched")
+                    help="exit 1 if any kernel is never dispatched (77 if the check cannot run)")
     ap.add_argument(
         "--metallib",
         help="explicit compiled metallib to inventory (default: the library bench_gemm_sweep embeds, via --dump-metallib)",
@@ -393,8 +414,8 @@ def main():
     if failures:
         for f in failures:
             print(f"ERROR  {f}", file=sys.stderr)
-        raise SystemExit("coverage run incomplete; refusing to report a partial "
-                         "sweep as a coverage measurement")
+        raise CannotRun("coverage run incomplete; refusing to report a partial "
+                        "sweep as a coverage measurement")
 
     # A traced name absent from the inventory means the inventory is wrong --
     # exactly the failure this tool exists to prevent.
@@ -425,7 +446,7 @@ def main():
         with open(args.out, "w") as f:
             f.write(json.dumps(doc, indent=2))
     if args.check and missing:
-        raise SystemExit(f"\n{len(missing)} kernel(s) have no timing lane")
+        raise SystemExit(f"\n{len(missing)} kernel(s) have no timing lane")  # EXIT_GAPS
     print("\nPASS: every kernel entry point is dispatched by a benchmark"
           if not missing else "")
 

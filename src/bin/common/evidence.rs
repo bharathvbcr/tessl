@@ -17,7 +17,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-use crate::common::median;
+use crate::common::{median, unique_stamp};
 use crate::json::{Json, Syntax};
 
 /// Default and ceiling for a paired ratio's max/min spread.
@@ -338,14 +338,6 @@ pub fn redact_text(value: &str) -> String {
 fn display_path(path: &Path) -> String {
     let abs = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
     redact_text(&abs.to_string_lossy())
-}
-
-/// `pid-nanoseconds`, unique per call within a process.
-fn unique_stamp() -> String {
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_nanos());
-    format!("{:x}-{nanos:x}", std::process::id())
 }
 
 /// This executable and `argv`, with the home directory redacted.
@@ -822,34 +814,7 @@ pub fn finish_provenance(prov: &mut Jv) {
 
 // ------------------------------------------------------------- publication
 
-/// Replace `path` with `bytes` durably, exposing no partial content.
-pub fn atomic_write(path: &Path, bytes: &[u8]) -> Res<()> {
-    let abs = std::path::absolute(path).map_err(|e| format!("{}: {e}", path.display()))?;
-    let dir = abs
-        .parent()
-        .ok_or_else(|| format!("{}: no parent directory", abs.display()))?;
-    let name = abs.file_name().and_then(|n| n.to_str()).unwrap_or("out");
-    if !dir.is_dir() {
-        return Err(format!(
-            "{}: parent directory does not exist (never created implicitly)",
-            abs.display()
-        ));
-    }
-    let staged = dir.join(format!(".{name}.{}", unique_stamp()));
-    let result = (|| -> std::io::Result<()> {
-        use std::io::Write;
-        let mut f = std::fs::File::create(&staged)?;
-        f.write_all(bytes)?;
-        f.sync_all()?;
-        std::fs::rename(&staged, &abs)?;
-        std::fs::File::open(dir)?.sync_all()
-    })();
-    if let Err(e) = result {
-        let _ = std::fs::remove_file(&staged);
-        return Err(format!("{}: {e}", abs.display()));
-    }
-    Ok(())
-}
+pub use crate::common::atomic_write;
 
 /// Atomic publication plus a fail-closed marker for the latest attempt. An
 /// older valid output survives a failed rerun, but the sidecar starts in

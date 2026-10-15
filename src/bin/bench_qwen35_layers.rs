@@ -31,7 +31,7 @@
 //! * **tower** — `begin` + `advance_to(all layers)` + `final_norm_f32`: the
 //!   prefill without the LM head, the figure earlier reports called the layer
 //!   bench's forward (`tower tok/s`). Also printed as `METRIC
-//!   model_forward_ms_t{T}` (median), the name `bench/paired_bins.sh` users
+//!   model_forward_ms_t{T}` (median), the name `bench_paired --format metrics` users
 //!   compare across builds.
 //! * **layers** — the same with `begin` outside the timed span: all layers and
 //!   the final norm on preallocated activations, comparable to the earlier
@@ -56,7 +56,7 @@
 //! steps, and `Decode::step`'s per-token host waits, command buffer commits,
 //! dispatches and cold allocations from `infer_trace` over separate traced
 //! steps: the baseline for a GPU-resident decode loop. Every figure is a
-//! `METRIC` line for `bench/paired_bins.sh`. Each step is the token's layers,
+//! `METRIC` line for `bench_paired --format metrics`. Each step is the token's layers,
 //! the LM head and the 1 MB logits read; the sampler is not included
 //! (`bench_nn_kernels` times the samplers).
 //!

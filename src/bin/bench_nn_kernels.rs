@@ -30,7 +30,7 @@
 //! directly, and a **decode-style sample loop**: one sampler call per token,
 //! encoded with async encode on and the token read back, as a GPU-resident
 //! decode loop would. Every figure there is also printed as a `METRIC name
-//! value` line so `bench/paired_bins.sh` can take an interleaved min-of-N
+//! value` line so `bench_paired --format metrics` can take interleaved rounds
 //! across two frozen binaries. `--host-only` skips the kernel table.
 //!
 //! Every kernel is checked for a plausible result before being timed. A kernel

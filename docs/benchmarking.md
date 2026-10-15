@@ -11,26 +11,22 @@ you changed in the kernel.**
 | --- | --- |
 | `bench_gemm_tnnt_tune` | Interleaved TN/NT/accumulate kernel A/B against the production API. Use this for kernel comparisons. |
 | `bench_gemm_tile_tune` | Broad NN tile/BK ladder (bf16 and exact f32), interleaved the same way. |
-| `bench_gemm_coop_tile` | Paired, interleaved cooperative GEMM tile A/B (128×64 vs 64×64). |
-| `bench_gemm_epi_tile` | Paired, interleaved fused epilogue tile A/B (128×64 vs 64×64). |
+| `bench_gemm_coop_tile` | Paired, interleaved GEMM tile A/B (128×64 vs 64×64). `--family plain` (default) is the GDN fused in-projection through `gemm_tiled`; `--family epilogue` is the output projection's residual-add through `gemm_epilogue_tiled`, which also checks the two tiles agree. |
 | `bench_gemm_routes` | Paired A/B of the bf16 GEMM routing rules at the shapes they gate on: the split-K lanes of the gated TN dW shapes, and the 128×64 vs 64×64 coop tile on the plain, batched and epilogue paths (`BENCH_LANES=splitk,smallm,batched,epi`). |
 | `bench_gemm_sweep` | Cross-runtime lane (f32 exact / tf32 / bf16), JSON out. |
 | `bench_qwen35_layers` | `Qwen35Model` prefill and decode timings at the 2B's shapes (random bf16 weights, or `--weights=DIR` for a real checkpoint; library-default GDN scan, `--gdn-scan32` for the other): tower, `forward_rows`, `prefill`, and per-layer and per-part tables through `Staged::encode_part`. `--decode[=P]` times `prefill` then `Decode::step` per token with its waits and allocations per token, `--model-forward` the tower as `METRIC` lines. `--paired-attn` times paired prefill attention, `--paired-gdn-recurrent` the 32- vs 16-column decode recurrence and `--paired-gate-up` two gate/up GEMMs vs one packed (async and sync encode). |
 | `bench_nn_kernels` | `nn` kernels batched and solo, with each one's host encode per dispatch; then the host path: pipeline cache hits and a decode-style sample loop. `--host-only` skips the kernel table. |
-| `bench/paired_bins.sh` | Interleaved min-of-N across frozen binaries (`BENCH_BINS="before=.. after=.."`) for any bench printing `METRIC` lines. |
 | `probe_gdn_scan` | Gated delta net chunk scan probe; `--paired` times paired 32- vs 16-col widths. |
 | `probe_gemm_bits` | Bit snapshot of every production GEMM entry point (FNV-1a per output); diff two builds' snapshots before claiming a kernel change is bit-identical (`bench/results/gemm_coop_header_bits_m5pro.txt`). |
-| `bench/paired_cross_runtime.py` | Alternates the tessl and PyTorch/MLX lanes round by round. |
 | `bench_embedgemma2` | EmbeddingGemma 2 `encode` latency and device/process peak memory on the real checkpoint, uniform and ragged batches, JSON out. |
-| `bench_paired` | Alternates any lanes that print `bench_embedgemma2`'s JSON round by round: tessl against `bench/embedgemma2_torch.py` (sentence-transformers on MPS), or two builds of `bench_embedgemma2` for a before/after A/B. |
+| `bench_paired` | The one paired-round driver. Alternates any lanes round by round and reports per-round ratios with their spread: `bench_embedgemma2`'s JSON (`--format workloads`), `METRIC name value` lines (`--format metrics`: frozen before/after binaries, `bench_qwen35_train --step` configurations), or JSON rows compared across processes (`--format rows:KEY,VARIANT,VALUE`: tessl against PyTorch MPS / MLX). `--evidence` adds the drift gate, provenance and atomic publication for a quotable artifact. See "Paired rounds" below. |
 | `bench_qwen35_train` | Qwen3.5-2B training ops, and with the checkpoint one whole `train_step` (`--step`, `--async`, `--storage=bf16` for the bf16 tower), a clipped optimizer step (`--clip`), or a row-by-row batch (`--batch`), each with its host waits and device peak. |
-| `bench/paired_qwen35_step.sh` | Interleaves `bench_qwen35_train --step` configurations (T, `TESSL_MID_COMMIT`, encode mode) one process each, and with `BENCH_BINS` a before and an after binary, round by round; min-of-N with peak memory. |
 
 ```mermaid
 flowchart TD
     subgraph Suite["tessl Benchmarking Suite"]
         Sweep["bench_gemm_sweep<br/>(f32, tf32, bf16 sweep · JSON telemetry)"]
-        TileAB["bench_gemm_coop_tile &amp; bench_gemm_epi_tile<br/>(Paired 128x64 vs 64x64 coop &amp; epilogue A/B)"]
+        TileAB["bench_gemm_coop_tile<br/>(Paired 128x64 vs 64x64, --family plain|epilogue)"]
         QwenBench["bench_qwen35_layers &amp; probe_gdn_scan<br/>(Layer benchmarks &amp; paired attention / GDN sweeps)"]
         NnBench["bench_nn_kernels<br/>(62 nn entry points · batched vs solo)"]
         Parity["probe_gemm_parity<br/>(Bit-exact TensorOps vs SIMD verification)"]
@@ -42,7 +38,7 @@ flowchart TD
     end
 
     subgraph CrossRuntime["Cross-Runtime Evaluation"]
-        PyHarness["paired_cross_runtime.py<br/>(Python 3 driver)"]
+        PyHarness["bench_paired<br/>(Rust driver, --format rows)"]
         TorchMPS["PyTorch 2.13 (MPS)"]
         MLX["Apple MLX"]
     end
@@ -92,7 +88,7 @@ this page called it interleaved. The panel-walk gates in
 Any single-run conclusion from those rigs is inside their own noise. Both now
 interleave round by round, every arm once per round with the order reversed
 every other round, and report the median of the per-round ratios. The paired
-lanes (`bench_gemm_coop_tile`, `bench_gemm_epi_tile`) do the same, and that
+lane (`bench_gemm_coop_tile`, both families) does the same, and that
 brought their spread to roughly ±5%.
 
 > [!NOTE]
@@ -127,7 +123,7 @@ the drift between them into the ratio. Two back-to-back runs of the *identical*
 benchmark disagreed by **16–21% on the PyTorch lane alone** — larger than most
 differences being reported.
 
-`bench/paired_cross_runtime.py` alternates the lanes round by round and reports
+`bench_paired --format rows:...` (the recipe is under "Paired rounds") alternates the lanes round by round and reports
 the median of per-round ratios plus the spread. **Single-run cross-runtime
 numbers should not be quoted**, including earlier ones from this project: a
 "1.07× ahead of PyTorch on bf16" claim did not survive the paired protocol and
@@ -136,7 +132,7 @@ became 1.00×.
 ```mermaid
 sequenceDiagram
     autonumber
-    participant Py as paired_cross_runtime.py
+    participant Py as bench_paired
     participant Tessl as tessl (subprocess)
     participant MPS as PyTorch MPS
     participant MLX as Apple MLX
@@ -159,6 +155,50 @@ sequenceDiagram
 
     Note over Py: Compute per-round ratio medians &amp; flag spread &gt; 10%
 ```
+
+## Paired rounds: `bench_paired`
+
+One Rust driver replaced the retired `paired_bins.sh`, `paired_qwen35_step.sh`,
+`paired_cross_runtime.py` and `attn_paired.py` scripts (they lived in `bench/`). A lane is
+`NAME=COMMAND`, or `NAME:ENV=V,ENV=V=COMMAND` for per-lane environment (an empty
+value unsets; quote a value that holds `,` or `=`). `--clean-env` drops every
+inherited `BENCH_*`, `TESSL_*`, `METAL_*`, `MTL_*`, `MLX_*`, `PYTORCH_*`, `OMP_*`,
+`MKL_*`, `VECLIB_*` and `ACCELERATE_*` variable first, so only what the lane lines
+name reaches a lane. Every round runs every lane once, forward on even rounds and
+reversed on odd ones; the report is the median per workload and the median of the
+per-round ratios against the base lane, with the lowest and highest round beside
+it. `--max-spread X` (1 to 1.25) turns a ratio series whose max/min exceeds `X`
+into exit 3 with nothing reported.
+
+| replaces | run |
+| --- | --- |
+| `paired_bins.sh ROUNDS OUT ARGS` with `BENCH_BINS="before=A after=B"` | `bench_paired --format metrics --rounds N --out OUT.json "before=A ARGS" "after=B ARGS"` |
+| `paired_qwen35_step.sh ROUNDS OUT T:MID:MODE[:EXTRA]` | `bench_paired --format metrics --rounds N "cfg1:TESSL_MID_COMMIT=3,METAL_RUNTIME_MID_COMMIT==bench_qwen35_train T --step-only --step=T --async EXTRA" "cfg2:..."`. `--step` prints `METRIC train_step_s_t{T}`, `device_peak_gib_t{T}` and `peak_footprint_gb_t{T}` (the process's lifetime peak footprint, the figure `/usr/bin/time -l` printed). Name a frozen build by its path in the command. |
+| `paired_cross_runtime.py --lanes torch,mlx` | `bench_paired --format rows:shape,backend,gflops --evidence --clean-env --keys "$LADDER" --compare tensorops-f32:mps-f32 --compare tensorops-tf32:mps-f32 --compare tensorops-bf16:mps-bf16 --compare tensorops-f32:mlx-f32 --compare tensorops-tf32:mlx-f32 --compare tensorops-bf16:mlx-bf16 --out bench/results/gemm_speed_ladder.json "tessl:BENCH_SHAPES=\"$SHAPES\",BENCH_ITERS=30,BENCH_WARMUP=10=target/release/bench_gemm_sweep" "py:BENCH_SHAPES=\"$SHAPES\"=python3 bench/gemm_sweep_mlx.py --lanes torch,mlx --dtypes f32,bf16 --iters 30 --warmup 10"` (`$SHAPES` is the comma list, `$LADDER` the same list as `--keys`). A ratio is tessl GFLOP/s over the other's, so above 1 tessl is faster. |
+| `attn_paired.py --impl tessl-decode --batched 1` | `bench_paired --format rows:cfg,runtime,median_ms --require batched=1 --evidence --clean-env --keys "$CFGS" --compare tessl-decode:torch-mps --compare tessl-decode:mlx --out OUT.json "tessl:BENCH_ATTN_CFGS=\"$CFGS\",BENCH_ITERS=20,BENCH_WARMUP=5,BENCH_ATTN_BATCHED=1=target/release/bench_flash_attn" "py:BENCH_ATTN_BATCHED=1=python3 bench/flash_attn_torch_mlx.py --cfgs $CFGS --lanes torch,mlx --iters 20 --warmup 5"`. A ratio is tessl ms over the other's, so above 1 tessl is slower. `--impl tessl|tessl-tiled|tessl-rows` is a different first variant in `--compare`. The decode path is `Tq == 1` only, so `$CFGS` holds the decode configs; the old driver dropped the prefill ones itself, now the caller names them. |
+
+What each script did, and where it went:
+
+| behaviour | now |
+| --- | --- |
+| Min-of-N over rounds with the max as spread (`paired_bins`, `paired_qwen35_step`) | The JSON keeps `value_min`, `value_max` and `value_all` per lane; the table is the median plus the ratio's `[lo, hi]`. The ratio of medians of rounds replaces the ratio of mins. Two lanes give the same `vs base` column the old `b/a` column was. |
+| `ROUNDS >= 1` (`paired_bins`) | `--rounds` is at least 2 (a single round has no spread), at least 4 and even with `--evidence`; digits only, no sign or leading zero. |
+| Frozen binaries `BENCH_BINS`, paths with spaces | One lane per binary; quote a path that holds spaces. |
+| `/usr/bin/time -l` peak footprint, device peak | `METRIC` lines from `bench_qwen35_train --step`; `bench_embedgemma2`'s JSON extras (`device_peak_mib`, `peak_footprint_mib`, `forwards`) are carried as before. |
+| A lane that prints no `METRIC` line fails the run | Same (exit 1), as does a metric a lane stops reporting in a later round. |
+| Same shape ladder for both runtimes, never a geomean over part of it | `--keys` names the ladder; a (key, variant) absent from any round is an error naming it. |
+| Same batching on both sides (`attn_paired`) | `--require FIELD=VALUE`: a row that lacks the field, or carries another value, is refused. |
+| Spread gate per shape and on the per-round geomean, default 1.10, cap 1.25 | `--max-spread`, default 1.10 under `--evidence`; the per-key series and the paired geomean are both gated, and nothing is printed or published when one fails. |
+| Inherited tuning knobs cleared | `--clean-env`. |
+| Provenance: git revision, dirty flag, diff hash, input hashes, host, power, load, device | `--evidence` writes the same block under `provenance`. The shader hash is the lane executable's hash: the runtime embeds the metallib bytes (`include_bytes!`), where the old driver resolved a metallib path no current binary carries. |
+| `--out` published atomically, an `.attempt.json` marker that makes an older output stale | Same; the marker is written before any other option is validated. |
+| Non-finite numbers cannot reach the artifact | The renderer refuses them. |
+| Artifact fields `peak_gflops`, `schema_version: 2` compatibility keys (`geomean`, `geomean_tessl_over_other`) | Not emitted. Per-key medians of each variant are under `per_key[].a_value` and `b_value`, the canonical aggregate is `paired_geomean`. Old result files keep their old schema. |
+| `bench/attn_tune.py` knob sweeps | Unchanged, not replaced: it sweeps knobs through `bench_flash_attn`, it does not pair runtimes. |
+
+`bench/benchmark_evidence.py` shrank to `embedded_metallib_path`, the one helper
+`bench/kernel_coverage.py` imports. The helper resolves a path no current binary
+embeds (it returns "found []"), which is `kernel_coverage.py`'s to settle.
 
 ## Pitfall 4 — stale binaries
 
@@ -240,8 +280,11 @@ per-GEMM.
 cargo run --release --bin bench_gemm_sweep
 BENCH_SHAPES="2048x2048x2048,4096x4096x1024" cargo run --release --bin bench_gemm_sweep
 
-# Paired cross-runtime (needs torch and/or mlx importable)
-python3 bench/paired_cross_runtime.py --rounds 5 --lanes torch,mlx
+# Paired cross-runtime (needs torch and/or mlx importable; recipe under "Paired rounds")
+target/release/bench_paired --format rows:shape,backend,gflops --compare tensorops-f32:mps-f32 \
+  --keys 1024x1024x1024 --rounds 6 --clean-env \
+  'tessl:BENCH_SHAPES=1024x1024x1024,BENCH_ITERS=30,BENCH_WARMUP=10=target/release/bench_gemm_sweep' \
+  'py:BENCH_SHAPES=1024x1024x1024=python3 bench/gemm_sweep_mlx.py --lanes torch --dtypes f32 --iters 30 --warmup 10'
 
 # Tile-geometry and TN/NT A/B lanes. These live behind TESSL_GEMM_TUNE because
 # the 71 measurement kernels are excluded from the default metallib; the
@@ -514,7 +557,7 @@ was checked.
 
 ## Measured — tessl against PyTorch MPS, M5 Pro
 
-`bench/paired_cross_runtime.py --rounds 5 --lanes torch,mlx`, alternating the
+`bench_paired --format rows:shape,backend,gflops` (the `paired_cross_runtime.py` driver that produced these files was replaced by it; see "Paired rounds"), alternating the
 lanes round by round per the protocol above. Raw data:
 `bench/results/gemm_speed_ladder_m5pro.json` (run 1, top panel),
 `gemm_speed_ladder_m5pro_b.json` (run 2) and
@@ -535,7 +578,7 @@ copy's measurements, not a run of this tree's kernels.
   like-for-like win.
 
 The attention files store a time ratio (`tessl_ms / other_ms`,
-`bench/attn_paired.py:130`), the inverse of this axis. They are imported and
+the retired `attn_paired.py`), the inverse of this axis. They are imported and
 their ratios are not quoted here (see Attention below).
 
 ## Measured — step-waste and dispatch host-overhead, M5 Pro, 2026-10-08
@@ -653,8 +696,8 @@ whose attention kernels differ from this tree's) hold tessl-against-PyTorch-MPS
 and tessl-against-MLX attention timings. No attention ratio against MLX or
 PyTorch is quoted here, and their two figures (`img/attention_speed_history.svg`,
 `img/attention_speed_per_config.svg`) are not embedded, because those ratios are
-unverified for this tree. They become quotable when `bench/attn_paired.py` is
-re-run on this tree.
+unverified for this tree. They become quotable when the attention ladder is
+re-run on this tree with `bench_paired` (recipe under "Paired rounds").
 
 ![Attention tuning knobs](img/attention_tuning.svg)
 

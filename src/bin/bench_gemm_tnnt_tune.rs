@@ -135,7 +135,7 @@ enum Lane {
 }
 
 /// Time `nn::gemm_i8_dequant` (`C[M,N] = (A[M,K] · B[K,N]) · a_scale ·
-/// b_scale[n]`, int8 operands filled from [`fill`]) without and with the
+/// b_scale[n]`, int8 operands filled from [`common::fill`]) without and with the
 /// per-column `b_scale`, as two arms of one interleaved A/B, after checking
 /// both outputs exactly against an integer reference at sampled elements
 /// (the edges of C and a spread of interior ones): int8 products accumulate

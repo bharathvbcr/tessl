@@ -44,7 +44,7 @@
 //! `--step=N` also loads the real checkpoint (`QWEN35_2B_SAFETENSORS`) and
 //! times `Qwen35Model::train_step` on N tokens end to end (median of 3 after
 //! one warm-up), which includes allocating every rebuilt activation and
-//! gradient per step. Run it under `/usr/bin/time -l` for its peak memory.
+//! gradient per step. Its peak memory is printed as `METRIC peak_footprint_gb_t{N}` (the figure `/usr/bin/time -l` reports), next to `METRIC train_step_s_t{N}` and `METRIC device_peak_gib_t{N}`, for `bench_paired --format metrics`.
 //! It also prints the device's peak allocation over the steps
 //! ([`GpuRuntime::peak_allocated_bytes`], reset after loading), and one more
 //! untimed step's host waits on the GPU, commits, dispatches and fresh
@@ -741,6 +741,7 @@ fn bench_step(rt: &Arc<GpuRuntime>, model: &Qwen35Model, tokens: usize, operands
         }
     }
     let secs = common::median(samples)?;
+    let step_secs = secs;
     println!(
         "train_step, T = {tokens}: {:.3} s ({:.0} tokens/s), loss {:.4}",
         secs,
@@ -758,6 +759,14 @@ fn bench_step(rt: &Arc<GpuRuntime>, model: &Qwen35Model, tokens: usize, operands
         return Err("train_step: the traced step's loss differs".into());
     }
     println!("  one traced step: {secs:.3} s, {}", trace_line(&trace));
+    // For `bench_paired --format metrics`: the three numbers a step A/B reads,
+    // the peak footprint being what `/usr/bin/time -l` prints at exit.
+    println!("METRIC train_step_s_t{tokens} {step_secs:.4}");
+    println!("METRIC device_peak_gib_t{tokens} {:.4}", gib(peak));
+    println!(
+        "METRIC peak_footprint_gb_t{tokens} {:.4}",
+        common::peak_footprint()? as f64 / 1e9
+    );
     Ok(())
 }
 

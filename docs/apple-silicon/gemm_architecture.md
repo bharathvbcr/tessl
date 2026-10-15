@@ -262,8 +262,8 @@ and exiting 0.
 | `bench/test_parity_harness.py` | Adversarial cases for every harness, with machine-readable ran/skipped/failed accounting. Use `--pure` on host-only lanes and `--require-gpu` on physical Metal. |
 | `bench_gemm_variants` | TN / NT / accumulate / split-K / batched / epilogue / f16 lanes -- the 18 GEMM kernels the cross-runtime sweep cannot reach. |
 | `bench/kernel_coverage.py` | Measures which kernels the suite dispatches (`TESSL_KERNEL_TRACE`), cross-checked against `metal-nm` on the exact OUT_DIR metallib embedded in the release binary. `--check` gates on 100%; `--metallib` selects an explicit artifact. |
-| `bench_flash_attn` + `bench/attn_paired.py` | The attention kernels, prefill and decode, over 14 configs. Historical runs first measured 11x (torch) / 20.5x (MLX) slower, geomean, worst case 271x. The row-parallel and KV-split rewrites, four throughput changes, and a routing fix followed; later schema-v1 snapshots measured 0.90-0.97x MLX prefill and 0.91-0.97x decode kernel-only. See the tessl README and do not treat those snapshots as current evidence. |
-| `bench/paired_cross_runtime.py` | Alternates the tessl and torch/MLX lanes round by round. Aborts rather than reporting a geomean over part of the ladder; `--out` writes the artifact. |
+| `bench_flash_attn` + `bench_paired` | The attention kernels, prefill and decode, over 14 configs. Historical runs first measured 11x (torch) / 20.5x (MLX) slower, geomean, worst case 271x. The row-parallel and KV-split rewrites, four throughput changes, and a routing fix followed; later schema-v1 snapshots measured 0.90-0.97x MLX prefill and 0.91-0.97x decode kernel-only. See the tessl README and do not treat those snapshots as current evidence. |
+| `bench_paired --format rows:...` | Alternates the tessl and torch/MLX lanes round by round. Aborts rather than reporting a geomean over part of the ladder (`--keys`); `--evidence --out` writes the artifact. Recipes in docs/benchmarking.md. |
 
 The canonical numeric summary and evidence status live in the tessl README's
 [latest checked-in result snapshot](../../README.md#latest-checked-in-result-snapshot).
@@ -330,7 +330,7 @@ itself* ranging 0.92x–1.46x.
 
 The same applies across runtimes. Two back-to-back runs of the identical
 cross-runtime sweep disagreed by 16–21% on the torch lane alone, which is why
-`paired_cross_runtime.py` exists and why single-run cross-runtime numbers should
+`bench_paired` exists and why single-run cross-runtime numbers should
 not be quoted.
 
 Below roughly 2 GFLOP of work both runtimes sit on a ~0.25 ms per-GEMM floor

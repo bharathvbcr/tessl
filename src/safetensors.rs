@@ -550,7 +550,8 @@ impl TensorSource for CheckpointView {
         Box::new(self.owner.keys().map(String::as_str))
     }
     fn read_f32(&self, name: &str) -> Result<(Vec<usize>, Vec<f32>), String> {
-        self.shard(name)?.read_f32(name)
+        let st = self.shard(name)?;
+        st.read_f32(name)
     }
     fn read_bf16_bits(&self, name: &str) -> Result<(Vec<usize>, Vec<u16>), String> {
         self.shard(name)?.read_bf16_bits(name)

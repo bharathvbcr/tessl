@@ -726,20 +726,20 @@ fn check_index(bytes: &[u8], scratch: &Scratch) -> Outcome {
     let input = bytes.to_vec();
     run(input.len(), || {
         scratch.write(INDEX_FILE_NAME, &input);
-        let view = CheckpointView::open(&scratch.0)?;
-        let names: Vec<String> = view.names().map(str::to_string).collect();
-        if view.shard_count() > 2 || names.is_empty() {
+        let st = CheckpointView::open(&scratch.0)?;
+        let names: Vec<String> = st.names().map(str::to_string).collect();
+        if st.shard_count() > 2 || names.is_empty() {
             return Err(Fail::Inconsistent(format!(
                 "{} shards, names {names:?}",
-                view.shard_count()
+                st.shard_count()
             )));
         }
         for n in names {
             let bad = |e: String| Fail::Inconsistent(format!("{n}: {e}"));
             if n == "b.bf16" {
-                view.read_bf16_bits(&n).map_err(bad)?;
+                st.read_bf16_bits(&n).map_err(bad)?;
             } else if n == "a.f32" {
-                view.read_f32(&n).map_err(bad)?;
+                st.read_f32(&n).map_err(bad)?;
             } else if n != "c.u8" && n != "d.i64" {
                 return Err(Fail::Inconsistent(format!("unexpected tensor {n:?}")));
             }

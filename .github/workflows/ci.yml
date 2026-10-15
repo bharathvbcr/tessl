@@ -241,10 +241,21 @@ jobs:
   # Settings -> Secrets and variables -> Actions -> Variables once an M5-class
   # runner is registered; until then this skips, and the README's Known Gaps
   # table says so rather than implying the suite runs unattended.
+  #
+  # Fork safety: this is a public-repository workflow, and GitHub advises that
+  # self-hosted runners "should almost never be used for public repositories",
+  # because any user can open a pull request that runs code on the runner
+  # (docs.github.com, "Secure use reference"). So the `if` also refuses a
+  # pull_request whose head repo is not this repository: a fork's PR never
+  # reaches the runner. The owner must additionally set, under Settings ->
+  # Actions -> General, "Approval for running fork pull request workflows from
+  # contributors" (docs.github.com, "Managing GitHub Actions settings for a
+  # repository"). That setting is not asserted to be set by anything here.
+  # tests/ci_workflow_gates.rs holds every self-hosted job to this guard.
   # ---------------------------------------------------------------------------
   gpu:
     name: GPU suite on bare metal
-    if: ${{ vars.HAS_METAL_RUNNER == 'true' }}
+    if: ${{ vars.HAS_METAL_RUNNER == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) }}
     runs-on: [self-hosted, macOS, ARM64]
     steps:
       - uses: actions/checkout@v4
@@ -348,10 +359,13 @@ jobs:
   # of skipping. Set HAS_METAL_RUNNER to `true` under
   # Settings -> Secrets and variables -> Actions -> Variables once a runner
   # exists.
+  #
+  # Same fork guard as the `gpu` job (see the comment there, including the
+  # repository setting the owner must also set).
   # ---------------------------------------------------------------------------
   bench:
     name: GEMM sweep on bare metal
-    if: ${{ vars.HAS_METAL_RUNNER == 'true' }}
+    if: ${{ vars.HAS_METAL_RUNNER == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) }}
     runs-on: [self-hosted, macOS, ARM64]
     steps:
       - uses: actions/checkout@v4

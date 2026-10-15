@@ -105,6 +105,49 @@ GEMMs. Fusing norm-into-GEMM prologue or gate-into-GEMM epilogue
 (`gemm_epilogue` exists) would cut dispatches and activation traffic.
 Value **unverified** until G5 ranks it.
 
+### G8. Two thirds of the checkpoint are not implemented: the vision and audio towers
+
+`google/embeddinggemma-2` is a 744.4M-parameter multimodal embedder, all
+bf16 (safetensors header census, `tools`-free: summed shapes per prefix).
+tessl loads only `language_model.*`, the text encoder:
+
+| Part | Parameters | In tessl |
+|---|---|---|
+| `language_model` (text encoder; 134.2M of it the token table) | ~271M | yes |
+| `vision_tower` (16-layer ViT, hidden 768, 12 heads of 64, patch 16) | ~167M | no |
+| `audio_tower` (12-layer conformer, hidden 1024, 8 heads of 128) | ~305M | no |
+| `embed_vision`, `embed_audio` (weightless RMSNorm + projection to 512) | 1.2M | no |
+
+**verified** (header census, config). How transformers 5.19 composes them
+(`EmbeddingGemma2Model.forward`): each tower's output goes through its
+embedder to 512 columns, and those soft tokens replace the rows of the
+`image_token_id` (258880) / `audio_token_id` (258881) placeholders in the
+text sequence. The placeholders are gathered as `pad_token_id` and then
+overwritten, and the soft tokens are not scaled by `sqrt(hidden)`. The text
+encoder then runs unchanged on the merged embeddings, the per-layer inputs
+included, followed by sentence-transformers' mean pool and normalize.
+
+Vision tower: `pixel_values` (patches of `3*16*16`) mapped by `2x - 1`, a
+projection, plus a 2-D position embedding (x and y tables summed, zero on
+padding); 16 layers of RMSNorm (`x * w`), q/k RMSNorm with weights and a
+weightless v norm, 2-D axial RoPE (theta 100; the head's halves rotate by x
+and by y), bidirectional attention at scale 1.0, gated GELU-tanh MLP, the
+same four norms as the text layers; then a 3x3 average pool by patch
+position to at most 280 soft tokens, times `sqrt(768)`.
+
+Audio tower: 128-bin log-mel `input_features` through two
+`Conv2d(3x3, stride 2)` + LayerNorm (no bias) + ReLU (1 → 128 → 32
+channels), a projection to 1024; 12 conformer layers (half-weighted FFN,
+chunked local attention with chunk 12, 12 frames of left context, no right
+context, Transformer-XL relative position logits, a per-dimension softplus
+query scale, a 50 logit softcap, a GLU + depthwise causal conv(5) block,
+a second FFN), every linear clamped to scalar input/output bounds stored in
+the checkpoint; then `output_proj` (1024 → 1536, with bias).
+
+Preprocessing (image resize and patchify, the audio log-mel front end) stays
+the caller's, as tokenization does; tessl starts from the processor's
+tensors. The goldens are `tools/embedgemma2_ref/make_mm_reference.py`.
+
 ### Already on the board (referenced, not re-filed)
 
 * ft-d0a49f5d: re-measure `attn_tiled.h` for the EG2 encoder after 4e5faac.
@@ -132,6 +175,11 @@ partitioned so no two lanes edit the same region:
 | B | G2 bf16 path | `src/embedgemma2.rs` load/Layer/forward, tests, bench flag |
 | C | G3 C ABI + Python | new `src/capi_embedgemma2.rs`, `python/tessl_torch/embedgemma2.py`, tests |
 | D | G5 + G6 measurement | `bench/results/`, a profiling bench binary |
+
+Then, as lanes free up (at most four agents at once): M1 the vision tower
+and M2 the audio tower, each held layer by layer to the multimodal goldens,
+and M3 the merge (placeholder rows overwritten by soft tokens before the
+text encoder), held to sentence-transformers' image and audio embeddings.
 
 G4 waits for the owner's decision on a tokenizer dependency. G7 waits for
 G5's ranking. GPU benchmarks run one at a time, paired and interleaved

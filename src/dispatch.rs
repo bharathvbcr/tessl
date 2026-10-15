@@ -484,6 +484,14 @@ impl<'a> Binder<'a> {
         }
     }
 
+    /// Drop the pending hazard barrier: the dispatch just encoded needs no
+    /// barrier before the next one. Only for a caller that already knows the
+    /// edge, such as tape replay between two commands whose capture recorded no
+    /// barrier; otherwise the next dispatch orders it, as it must.
+    pub(crate) fn forgo_pending_barrier(&mut self) {
+        self.hazard_pending = false;
+    }
+
     /// Explicit producer→consumer barrier inside a packed encoder
     /// (Dispatch→Dispatch Device).
     pub fn barrier(&mut self) {
@@ -530,13 +538,11 @@ impl<'a> Binder<'a> {
         // A range past the end of the ICB is caller data, not a Metal detail.
         // `executeCommandsInBuffer` with an out-of-range range is undefined,
         // and `start`/`count` reach here straight from the caller.
-        let icb_len = icb.size();
-        match start.checked_add(count) {
-            Some(end) if end <= icb_len as u64 => {}
-            _ => {
-                self.fail("ICB execute range out of bounds");
-                return;
-            }
+        // The same validation `optimize_icb` applies, so the two ICB entry
+        // points agree on what a range is (an empty one is refused).
+        if let Err(error) = validate_icb_range(icb.size(), start, count) {
+            self.fail(format!("ICB execute {error}"));
+            return;
         }
         // MTL4 command buffers do not retain the ICB, and this borrow ends with
         // the call. Residency is what keeps it valid and alive until the batch
@@ -923,6 +929,27 @@ mod audit_tests {
             })
             .unwrap_err();
         assert!(err.contains("residency"), "{err}");
+    }
+
+    /// `execute_icb_ex` validates its range as `optimize_icb` does, so an empty
+    /// range is refused. Against the pre-fix code it was encoded.
+    #[test]
+    fn execute_icb_refuses_an_empty_range() {
+        // A refusal poisons the runtime like any binder error, so one each.
+        for (start, count) in [(0u64, 0u64), (1, 0)] {
+            let rt = GpuRuntime::new().unwrap();
+            let icb = one_command_icb(&rt);
+            rt.register_allocation(ProtocolObject::<dyn MTLAllocation>::from_ref(&*icb));
+            let p = rt.pipeline("copy_f32").unwrap();
+            let err = rt
+                .with_binder(|b| {
+                    b.set_pipeline(&p);
+                    b.execute_icb_ex(&icb, start, count, false);
+                    Ok(())
+                })
+                .unwrap_err();
+            assert!(err.contains("at least one command"), "{err}");
+        }
     }
 
     /// The invariant the check above relies on: the residency set holds a

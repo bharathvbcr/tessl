@@ -15,41 +15,32 @@
 //! themselves do not require the flag (tests call them directly); the flag is
 //! the opt-in gate for any future session wiring.
 
-use std::sync::atomic::{AtomicI8, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
-use objc2::ClassType;
-use objc2_foundation::NSString;
 use objc2_metal::{
-    MTL4Compiler, MTL4CompilerDescriptor, MTL4ComputePipelineDescriptor, MTL4IndirectCommandBufferSupportState,
-    MTL4LibraryFunctionDescriptor, MTLAllocation, MTLBuffer, MTLComputePipelineState, MTLDevice,
-    MTLIndirectCommandBuffer, MTLIndirectCommandBufferDescriptor, MTLIndirectCommandType, MTLIndirectComputeCommand,
-    MTLResourceOptions,
+    MTLAllocation, MTLBuffer, MTLComputePipelineState, MTLDevice, MTLIndirectCommandBuffer,
+    MTLIndirectCommandBufferDescriptor, MTLIndirectCommandType, MTLIndirectComputeCommand, MTLResourceOptions,
 };
 
-use crate::ab_flags::env_truthy;
+use crate::ab_flags::TriFlag;
 use crate::runtime::{mtl_size, GpuRuntime};
 use crate::tensor::GpuBuffer;
 
-/// -1 = read env once, 0 = off, 1 = on.
-static ICB_SMOKE: AtomicI8 = AtomicI8::new(-1);
+static ICB_SMOKE: TriFlag = TriFlag::new();
 
 /// Force ICB-smoke opt-in on/off (tests / harness). Overrides env.
 pub fn set_icb_smoke(on: bool) {
-    ICB_SMOKE.store(if on { 1 } else { 0 }, Ordering::Relaxed);
+    ICB_SMOKE.set(on);
 }
 
 /// Opt-in gate for ICB smoke wiring. Default OFF.
 pub fn icb_smoke_enabled() -> bool {
-    let v = ICB_SMOKE.load(Ordering::Relaxed);
-    if v >= 0 {
-        return v == 1;
-    }
-    let on = env_truthy(&["TESSL_ICB_SMOKE", "METAL_RUNTIME_ICB_SMOKE", "GEMMA_METAL_ICB_SMOKE"]).unwrap_or(false);
-    ICB_SMOKE.store(if on { 1 } else { 0 }, Ordering::Relaxed);
-    on
+    ICB_SMOKE.get(
+        &["TESSL_ICB_SMOKE", "METAL_RUNTIME_ICB_SMOKE", "GEMMA_METAL_ICB_SMOKE"],
+        || false,
+    )
 }
 
 /// Bind bridge mode for the mini ICB smoke.
@@ -72,6 +63,8 @@ pub struct IcbCopySmoke {
     n: usize,
     /// Address of the creating runtime, compared against each buffer's owner.
     rt_addr: usize,
+    /// For the release on drop; weak so a smoke never keeps its runtime alive.
+    rt: Weak<GpuRuntime>,
     bridge: IcbBindBridge,
     /// Retained for classic-bridge re-encode / inherit execute binds.
     src: Option<GpuBuffer>,
@@ -79,6 +72,14 @@ pub struct IcbCopySmoke {
     encoded: bool,
     optimized: bool,
     execute_count: u64,
+    /// Whether the most recent `execute` was suppressed by binder-encode-nop.
+    last_execute_was_nop: bool,
+}
+
+impl Drop for IcbCopySmoke {
+    fn drop(&mut self) {
+        crate::decode_icb::release_icb(&self.rt, &self.icb);
+    }
 }
 
 impl IcbCopySmoke {
@@ -95,7 +96,7 @@ impl IcbCopySmoke {
         if u32::try_from(n).is_err() || n.checked_mul(4).is_none() {
             return Err(format!("icb smoke: n = {n} does not fit the kernel's u32 length"));
         }
-        let pipeline = pipeline_copy_f32_icb(rt)?;
+        let pipeline = crate::decode_icb::pipeline_icb(rt, "copy_f32")?;
         let n_buf = rt.alloc_buffer_hot(4)?;
         // SAFETY: `n_buf` is a 4-byte Hot buffer allocated on the line above
         // with no other handle to it, so this single `u32` write is unaliased
@@ -141,12 +142,14 @@ impl IcbCopySmoke {
             n_buf,
             n,
             rt_addr: rt as *const GpuRuntime as usize,
+            rt: rt.weak_self(),
             bridge,
             src: None,
             dst: None,
             encoded: false,
             optimized: false,
             execute_count: 0,
+            last_execute_was_nop: false,
         })
     }
 
@@ -164,6 +167,12 @@ impl IcbCopySmoke {
 
     pub fn execute_count(&self) -> u64 {
         self.execute_count
+    }
+
+    /// Whether the most recent [`Self::execute`] was a no-op because
+    /// binder-encode-nop was in force: nothing was encoded and no counter moved.
+    pub fn last_execute_was_nop(&self) -> bool {
+        self.last_execute_was_nop
     }
 
     pub fn status_line(&self) -> String {
@@ -222,6 +231,15 @@ impl IcbCopySmoke {
         if !self.encoded {
             return Err("icb smoke: encode_copy before execute".into());
         }
+        // Under binder-encode-nop `with_binder` skips its body and returns `Ok`,
+        // so counting an execute here would report work that never happened.
+        // Mirrors `DecodeIcb::execute`: refuse only on a poisoned runtime.
+        if crate::decode_icb::binder_encode_nop() {
+            rt.ensure_not_poisoned()?;
+            self.last_execute_was_nop = true;
+            return Ok(());
+        }
+        self.last_execute_was_nop = false;
         let need_opt = !self.optimized;
         let icb = self.icb.clone();
         let pipe = self.pipeline.clone();
@@ -261,32 +279,6 @@ impl IcbCopySmoke {
         self.execute_count = self.execute_count.saturating_add(1);
         Ok(())
     }
-}
-
-fn pipeline_copy_f32_icb(rt: &GpuRuntime) -> Result<Retained<ProtocolObject<dyn MTLComputePipelineState>>, String> {
-    // MTL4 encoder + executeCommandsInBuffer needs an MTL4 pipeline with ICB
-    // support enabled (classic MTLComputePipelineDescriptor is insufficient).
-    let compiler_desc = MTL4CompilerDescriptor::new();
-    let compiler = rt
-        .device
-        .newCompilerWithDescriptor_error(&compiler_desc)
-        .map_err(|e| format!("MTL4Compiler: {e}"))?;
-
-    let func_desc = MTL4LibraryFunctionDescriptor::new();
-    func_desc.setName(Some(&NSString::from_str("copy_f32")));
-    func_desc.setLibrary(Some(&rt.library));
-
-    let pipe_desc = MTL4ComputePipelineDescriptor::new();
-    pipe_desc.setComputeFunctionDescriptor(Some(func_desc.as_super()));
-    pipe_desc.setSupportIndirectCommandBuffers(MTL4IndirectCommandBufferSupportState::Enabled);
-
-    let pipe = compiler
-        .newComputePipelineStateWithDescriptor_compilerTaskOptions_error(&pipe_desc, None)
-        .map_err(|e| format!("ICB MTL4 copy_f32 pipeline: {e}"))?;
-    if !pipe.supportIndirectCommandBuffers() {
-        return Err("ICB pipeline supportIndirectCommandBuffers=false".into());
-    }
-    Ok(pipe)
 }
 
 /// End-to-end smoke: encode once, execute twice, verify `dst == src`.
@@ -368,6 +360,7 @@ fn verify_copy(dst: &GpuBuffer, n: usize, label: &str) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use objc2_metal::MTLResidencySet;
 
     #[test]
     fn icb_smoke_flag_default_off() {
@@ -416,6 +409,66 @@ mod tests {
             .encode_copy(&big, &big.clone())
             .expect("exactly-sized buffers encode");
         assert!(smoke.encoded());
+    }
+
+    /// Under binder-encode-nop `with_binder` skips its body and returns `Ok`;
+    /// `execute` must not count that as an execute (or as an optimize).
+    ///
+    /// Against the pre-fix code `execute_count()` is 1.
+    #[test]
+    fn a_nop_execute_is_not_counted() {
+        let _flags = crate::decode_icb::IcbFlagsTestGuard::lock();
+        let rt = GpuRuntime::new().expect("runtime");
+        let src = rt.alloc_buffer(64 * 4).unwrap();
+        let dst = rt.alloc_buffer(64 * 4).unwrap();
+        let mut smoke = IcbCopySmoke::new(&rt, 64).expect("smoke");
+        smoke.encode_copy(&src, &dst).expect("encode");
+        {
+            let _nop = crate::BinderEncodeNopGuard::enter();
+            smoke.execute(&rt).expect("a nop execute stays benign");
+        }
+        assert!(smoke.last_execute_was_nop());
+        assert_eq!(smoke.execute_count(), 0);
+        smoke.execute(&rt).expect("a live execute");
+        rt.synchronize().unwrap();
+        assert!(!smoke.last_execute_was_nop());
+        assert_eq!(smoke.execute_count(), 1);
+    }
+
+    /// A nop scope on a poisoned runtime reports the poison instead of `Ok`.
+    ///
+    /// Against the pre-fix code `execute` returns `Ok` and counts.
+    #[test]
+    fn a_nop_execute_on_a_poisoned_runtime_fails() {
+        let _flags = crate::decode_icb::IcbFlagsTestGuard::lock();
+        let rt = GpuRuntime::new().expect("runtime");
+        let src = rt.alloc_buffer(64 * 4).unwrap();
+        let dst = rt.alloc_buffer(64 * 4).unwrap();
+        let mut smoke = IcbCopySmoke::new(&rt, 64).expect("smoke");
+        smoke.encode_copy(&src, &dst).expect("encode");
+        assert!(rt.with_binder(|_| Err("injected encode failure".into())).is_err());
+        let _nop = crate::BinderEncodeNopGuard::enter();
+        assert!(
+            smoke.execute(&rt).is_err(),
+            "poison must not be hidden by the nop scope"
+        );
+        assert!(rt.with_binder(|_| Ok(())).is_err());
+        assert_eq!(smoke.execute_count(), 0);
+    }
+
+    /// A dropped smoke leaves the residency set: 100 build-and-drops return the
+    /// set to where it started. Against the pre-fix code each leaves its ICB
+    /// registered and the count is 100 higher.
+    #[test]
+    fn dropping_smokes_returns_residency_to_baseline() {
+        let rt = GpuRuntime::new().expect("runtime");
+        rt.synchronize().unwrap();
+        let baseline = rt.metal4.residency.allocationCount();
+        for _ in 0..100 {
+            let _smoke = IcbCopySmoke::new(&rt, 16).expect("smoke");
+        }
+        rt.synchronize().unwrap();
+        assert_eq!(rt.metal4.residency.allocationCount(), baseline);
     }
 
     #[test]

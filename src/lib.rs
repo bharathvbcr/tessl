@@ -82,6 +82,7 @@
 //! | [`qwen35_train`] | One training step of the Qwen3.5 text model: loss and every parameter's gradient |
 //! | [`qwen35_adamw`] | AdamW over a Qwen3.5 model's own parameters, in place (torch.optim.AdamW's update) |
 //! | [`capi`] | The C ABI (`libtessl.dylib`) that `python/tessl_torch` calls through `ctypes` |
+//! | [`capi_embedgemma2`] | The C ABI's EmbeddingGemma 2 entries: load a snapshot, embed token ids |
 //!
 //! # Encode model
 //!
@@ -224,6 +225,7 @@ pub mod ab_flags;
 pub mod attn_train;
 pub mod bert;
 pub mod capi;
+pub mod capi_embedgemma2;
 pub mod cb_replay;
 pub mod cross_entropy;
 pub mod decode_icb;

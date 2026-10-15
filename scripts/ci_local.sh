@@ -62,7 +62,7 @@ echo "==> parity harness, host-only (adversarial scorer, ladder and evidence con
 echo "==> torch binding host tests (python/tests/test_binding_host.py; no GPU, needs the torch oracle)"
 # The same oracle python as above: a missing torch already stopped the script, so this
 # cannot be skipped silently. The recording stand-in replaces libtessl; nothing is built.
-"$ORACLE_PY" -m unittest python/tests/test_binding_host.py -v
+"$ORACLE_PY" -m unittest python/tests/test_binding_host.py python/tests/test_embedgemma2_host.py -v
 
 echo "==> torch binding GPU tests (python/tests: test_cross_entropy, test_gdn, test_qwen35)"
 # These load target/release/libtessl.dylib (built above) and run on MPS next to the Metal

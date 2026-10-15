@@ -132,6 +132,27 @@ Every read and write
 is a GPU copy of the whole model (about 8 GB of f32 each way on the 2B), and
 torch holds its own copy of the parameters and gradients beside tessl's.
 
+## Embedding text with EmbeddingGemma 2
+
+`tessl_torch.embedgemma2.EmbedGemma2` runs `tessl::embedgemma2`'s text encoder
+on a local `google/embeddinggemma-2` snapshot directory. It reads no torch
+tensor: ids go in as Python ints, embeddings come back as a float32 numpy
+array, rows L2-normalized.
+
+```python
+from tessl_torch.embedgemma2 import EmbedGemma2
+
+model = EmbedGemma2.from_pretrained(snapshot_dir)
+emb = model.encode([[2, 4521, 1], [2, 17, 99, 1]], truncate_dim=256)  # ids from your tokenizer
+emb = model.encode_texts(["how do I ...?"], tokenizer, prompt_name="query")
+```
+
+`encode_texts` takes a `tokenizers.Tokenizer` or a transformers tokenizer you
+built (neither package is imported or required here), prepends the snapshot's
+prompt from `config_sentence_transformers.json`, and tokenizes with special
+tokens. See `docs/embedgemma2.md` ("From Python / C") for the limits and the C
+entries.
+
 ## Handle ownership, closing and errors
 
 A `Qwen35` (and the per-thread runtime behind every call) owns a C handle

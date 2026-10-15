@@ -8,6 +8,49 @@ All notable changes to `tessl` are recorded here. The format follows
 
 ### Added
 
+- **Per-entry host reads and writes of the Qwen3.5 parameter table**
+  (`Qwen35Model::{read_parameter_host, write_parameter_host,
+  read_gradient_host, read_adamw_moment_host, write_adamw_moment_host}`).
+  Each copies one `parameter_table()` entry through a host mapping, with no
+  table-sized shadow tensor, and refuses a bad index, a bad length, a busy
+  runtime or a packed-head model before anything moves. A parameter write
+  bumps the parameter generation before its first byte, so live `Decode` and
+  `Staged` sessions refuse to continue. bf16 writes store exactly the bits the
+  GPU copy stores (`tensor::f32_to_bf16_bits_gpu`: NaN → `0x7fc0`, f32
+  subnormals flush to zero). `adamw_step_scaled` is documented as Rust-only.
+- **Sharded checkpoints** (`safetensors::CheckpointView`, `TensorSource`).
+  `Qwen35Model::load`/`load_tower` take `&dyn TensorSource`, so a
+  `model.safetensors.index.json` checkpoint loads through the same strict
+  loader (existing `&SafeTensors` callers are unchanged). Shard names must be
+  bare file names; symlinks are followed, so Hugging Face cache snapshots load.
+  Duplicate, missing and unlisted tensors and missing shards are refused at
+  open. `tessl_qwen35_load` and the Qwen bench/probe binaries accept a file,
+  an index or a directory.
+- **`bench_paired` replaces the four paired-round drivers** (`paired_bins.sh`,
+  `paired_qwen35_step.sh`, `paired_cross_runtime.py`, `attn_paired.py`):
+  `--format metrics|rows:…`, per-lane env (`NAME:ENV=V,…=COMMAND`),
+  `--lane-timeout`, `--clean-env`, `--max-spread`, `--evidence` (provenance and
+  spread enforcement ported from `benchmark_evidence.py` to Rust, executables
+  re-hashed every round) and a per-round raw-output archive under
+  `OUT.lanes/`. Benches share `common::{median, fill, parse_count}`; a malformed
+  or zero `BENCH_ITERS` exits non-zero naming it. `bench_gemm_epi_tile` is
+  `bench_gemm_coop_tile --family epilogue`.
+- **Hosted CI runs every device-free test** (`scripts/hosted_tests.sh`,
+  `scripts/hosted_tests.txt`: exact per-entry counts, the Metal device hidden
+  by `sandbox-exec`), plus a completeness check that fails when a test passes
+  without a device but is not selected, the parity harness (a skipped metallib
+  cross-check fails under `TESSL_HOSTED=1`) and the kernel IR scan.
+- **Kernel IR fast-math check** (`scripts/check_kernel_ir.sh`): every kernel is
+  compiled with `build.rs`'s flags and refused on an inf/NaN constant of any
+  width, an unordered compare, missing IR, or an `isfinite` that is no longer a
+  bit test; exit 77 is a visible SKIPPED. `tests/kernel_fast_math.rs` also bans
+  `NAN`, `HUGE_VAL`, `MAXFLOAT`, `isunordered`, inf/NaN builtins and bit casts,
+  and self-compares; `isfinite`/`isnan`/`isinf` stay allowed.
+- **Seeded mutation tests for the checkpoint parsers** (`src/parser_mutation.rs`;
+  dependency-free): JSON, safetensors (including sharded indexes) and npy are
+  truncated at every byte, bit-flipped and given boundary integers; every input
+  must be `Ok` or a named error with a bounded allocation.
+
 - **bf16 storage's documented default update rule is stochastic rounding**
   (`UpdateRule::bf16_default`). On the 2B loss curve it was the only rule
   inside the 2% per-step bound (worst 0.74%; round-to-nearest worst 4.6%
@@ -1241,6 +1284,29 @@ All notable changes to `tessl` are recorded here. The format follows
   PyTorch from that data.
 
 ### Fixed
+
+- **ICB replay.** Tape replay emits exactly the captured barrier markers, and
+  capture now records the ordering a command-buffer boundary gave live
+  execution (sync encode in hazard mode previously captured no edges). A no-op
+  execute is no longer counted as a replay; a no-op scope on a poisoned runtime
+  reports the poison; `execute_icb_ex` refuses empty and overflowing ranges;
+  barrier elision keeps the barrier after an Immediate command; dropped
+  `DecodeIcb`/`IcbCopySmoke` ICBs leave the residency set. The tri-state flag
+  getters share one `TriFlag` helper (no env name changed).
+- **Checkpoint readers refuse non-regular files** (`plain::open_regular_file`,
+  `O_NONBLOCK` + fstat): `SafeTensors::open` and `read_npy` no longer block
+  forever on a FIFO.
+- **`bench/kernel_coverage.py --check` runs.** It reads the metallib the
+  benches embed (`bench_gemm_sweep --dump-metallib`), takes its census from
+  `xcrun metal -E` (266 entry points, matching `metal-nm`), and exits 77 when
+  it cannot run. `bench_gemm_sweep`/`bench_nn_kernels` emit `KERNEL_TRACE`, and
+  `bench_nn_kernels` runs at `BENCH_WARMUP=0`. `bench/benchmark_evidence.py` is
+  removed.
+- `softcap_sample` drops a redundant `!isfinite(v)`; two kernel comments no
+  longer claim fast math folds `isnan`/`isinf`.
+- The tile audit is a Rust test (`tests/audit_gemm_tiles.rs`);
+  `scripts/audit_gemm_tiles.py` is removed. `dialect_lint.py` fails on a stale
+  allowlist entry.
 
 - **C ABI: the owning thread is checked before any reference to a handle is
   formed.** `guarded` and `free_handle` formed `&mut *handle` and then compared

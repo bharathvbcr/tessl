@@ -96,7 +96,10 @@
 //! [`runtime::GpuRuntime::set_async_encode`] with `true` and dispatches
 //! accumulate into one command buffer until [`runtime::GpuRuntime::synchronize`].
 //! On an elementwise kernel at n=4096 that is 203 µs against 4.1 µs, a factor
-//! of about 49.
+//! of about 49. A library call that owns its wait opens
+//! [`runtime::GpuRuntime::async_scope`] instead, which batches the same way
+//! without changing the caller's flag; the model `encode` calls
+//! (`embedgemma2`, `bert`) do.
 //!
 //! # Kernels
 //!

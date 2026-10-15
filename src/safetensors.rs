@@ -429,8 +429,8 @@ const INDEX_SYNTAX: Syntax = Syntax {
 /// name resolved through the index's `weight_map`.
 ///
 /// [`Self::open`] validates everything before any tensor is read: the index
-/// parses strictly; every shard path is a plain file name that, after
-/// symlinks, stays inside the checkpoint directory; every shard exists and is
+/// parses strictly; every shard is a bare file name in the checkpoint
+/// directory (symlinks followed: see [`shard_path`]) that exists and is
 /// a valid `.safetensors` file; every `weight_map` name is in the shard it
 /// names; and every tensor in a shard is in the `weight_map` for that shard
 /// (so a name present in two shards is refused, not shadowed). A single
@@ -488,7 +488,6 @@ impl CheckpointView {
             Some(d) if !d.as_os_str().is_empty() => d,
             _ => Path::new("."),
         };
-        let dir = std::fs::canonicalize(dir).map_err(|e| format!("{what}: checkpoint directory: {e}"))?;
         let (f, len) = plain::open_regular_file(index_path)?;
         if len > MAX_INDEX_BYTES {
             return Err(format!(
@@ -501,14 +500,13 @@ impl CheckpointView {
             .map_err(|e| format!("{what}: {e}"))?;
         let by_file = parse_index(&text).map_err(|e| format!("{what}: {e}"))?;
 
-        // Resolve and confine every shard before opening any.
+        // Validate every shard name before opening any.
         let mut paths: Vec<(&String, std::path::PathBuf)> = Vec::with_capacity(by_file.len());
         for (file, names) in &by_file {
-            let resolved = confine(&dir, file, &names[0]).map_err(|e| format!("{what}: {e}"))?;
-            if let Some((other, _)) = paths.iter().find(|(_, p)| *p == resolved) {
-                return Err(format!("{what}: {file:?} and {other:?} are the same file"));
-            }
-            paths.push((file, resolved));
+            paths.push((
+                file,
+                shard_path(dir, file, &names[0]).map_err(|e| format!("{what}: {e}"))?,
+            ));
         }
 
         let mut shards = Vec::with_capacity(paths.len());
@@ -594,35 +592,24 @@ fn parse_index(text: &str) -> Result<BTreeMap<String, Vec<String>>, String> {
     Ok(by_file)
 }
 
-/// `dir/file` after symlinks, refusing anything but a plain file name (no
-/// absolute path, `..`, `.` or separator) whose target leaves `dir` (already
-/// canonical) or is missing. `tensor` names who asked for the file.
-fn confine(dir: &Path, file: &str, tensor: &str) -> Result<std::path::PathBuf, String> {
-    use std::path::Component;
-    let mut comps = Path::new(file).components();
-    match (comps.next(), comps.next()) {
-        (Some(Component::Normal(c)), None) if c == std::ffi::OsStr::new(file) => {}
-        _ => {
-            return Err(format!(
-                "shard {file:?} (for {tensor:?}) is not a plain file name in the checkpoint directory"
-            ))
-        }
-    }
-    let joined = dir.join(file);
-    let resolved = std::fs::canonicalize(&joined).map_err(|e| {
-        format!(
-            "shard {file:?} (for {tensor:?}) cannot be resolved in {}: {e}",
-            dir.display()
-        )
-    })?;
-    if !resolved.starts_with(dir) {
+/// `dir/file`, for a `weight_map` value that is lexically a bare file name:
+/// non-empty, no NUL, no `/` or `\\`, not `.` or `..` (so never absolute and
+/// never a path out of `dir`). `tensor` names who asked for the file.
+///
+/// Symlinks are deliberately followed with no containment check: Hugging Face
+/// snapshot directories hold every file as a symlink into the cache's
+/// `../../blobs`. The index is the only untrusted input, and with a bare name
+/// it cannot steer the path anywhere but an entry of the checkpoint directory;
+/// what such an entry is (a FIFO, a directory) is decided by
+/// [`plain::open_regular_file`] on the handle that is read.
+fn shard_path(dir: &Path, file: &str, tensor: &str) -> Result<std::path::PathBuf, String> {
+    let bare = !file.is_empty() && !file.contains(['/', '\\', '\0']) && file != "." && file != "..";
+    if !bare {
         return Err(format!(
-            "shard {file:?} (for {tensor:?}) resolves to {}, outside the checkpoint directory {}",
-            resolved.display(),
-            dir.display()
+            "shard {file:?} (for {tensor:?}) is not a bare file name in the checkpoint directory"
         ));
     }
-    Ok(resolved)
+    Ok(dir.join(file))
 }
 
 /// Widen the `n` little-endian 16-bit values at `bytes[2n..4n]` into the `n`

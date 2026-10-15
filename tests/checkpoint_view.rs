@@ -189,11 +189,11 @@ fn a_weight_map_file_that_is_missing_is_refused_at_open() {
     std::fs::remove_file(sc.0.join("model-00002-of-00002.safetensors")).unwrap();
     let err = open_err(&sc.0);
     assert!(err.contains("model-00002-of-00002.safetensors"), "{err}");
-    assert!(err.contains("cannot be resolved"), "{err}");
+    assert!(err.contains("No such file"), "{err}");
 }
 
 #[test]
-fn shard_paths_that_leave_the_checkpoint_directory_are_refused() {
+fn shard_names_that_are_not_bare_file_names_are_refused() {
     let sc = Scratch::new("escape");
     let dir = sc.0.join("ckpt");
     std::fs::create_dir_all(dir.join("sub")).unwrap();
@@ -201,34 +201,98 @@ fn shard_paths_that_leave_the_checkpoint_directory_are_refused() {
     let outside = sc.0.join("outside.safetensors");
     write_st(&outside, &all);
     write_st(&dir.join("inside.safetensors"), &all);
-    let n = all[0].0.as_str();
-    let write_index = |file: &str| std::fs::write(dir.join(INDEX_FILE_NAME), index_text(&[(n, file)])).unwrap();
-
+    write_st(&dir.join("sub/inside.safetensors"), &all);
+    let n = all[0].0.clone();
     for hostile in [
         "../outside.safetensors".to_string(),
+        "/".to_string(),
         outside.display().to_string(),
         "sub/../inside.safetensors".to_string(),
         "sub/inside.safetensors".to_string(),
         "./inside.safetensors".to_string(),
+        "..".to_string(),
+        ".".to_string(),
+        "a\\b".to_string(),
         String::new(),
+        "inside.safetensors\0".to_string(),
     ] {
-        write_index(&hostile);
+        let body = format!(
+            "{{\"weight_map\":{{{n:?}:{}}}}}",
+            // `{:?}` renders NUL as \0, which is not JSON; spell it as \u0000.
+            format!("{hostile:?}").replace("\\0", "\\u0000")
+        );
+        std::fs::write(dir.join(INDEX_FILE_NAME), body).unwrap();
         let err = open_err(&dir);
-        assert!(err.contains("not a plain file name"), "{hostile:?}: {err}");
+        assert!(err.contains("not a bare file name"), "{hostile:?}: {err}");
     }
+}
 
-    // A symlink inside the directory whose target is outside it.
-    std::os::unix::fs::symlink(&outside, dir.join("link.safetensors")).unwrap();
-    write_index("link.safetensors");
-    let err = open_err(&dir);
-    assert!(err.contains("outside the checkpoint directory"), "{err}");
+/// Hugging Face's layout: each shard in the snapshot directory is a symlink
+/// to `../../blobs/<sha>`, outside it. It opens and reads back the same bytes.
+#[test]
+fn a_symlinked_shard_outside_the_directory_loads() {
+    let sc = Scratch::new("hf");
+    let blobs = sc.0.join("blobs");
+    let snap = sc.0.join("snapshots/rev");
+    std::fs::create_dir_all(&blobs).unwrap();
+    std::fs::create_dir_all(&snap).unwrap();
+    let all = fixture_entries();
+    write_st(&blobs.join("sha1"), &all[..all.len() / 2]);
+    write_st(&blobs.join("sha2"), &all[all.len() / 2..]);
+    std::os::unix::fs::symlink("../../blobs/sha1", snap.join("model-00001-of-00002.safetensors")).unwrap();
+    std::os::unix::fs::symlink("../../blobs/sha2", snap.join("model-00002-of-00002.safetensors")).unwrap();
+    let map: Vec<(&str, &str)> = all
+        .iter()
+        .enumerate()
+        .map(|(i, e)| {
+            let f = if i < all.len() / 2 {
+                "model-00001-of-00002.safetensors"
+            } else {
+                "model-00002-of-00002.safetensors"
+            };
+            (e.0.as_str(), f)
+        })
+        .collect();
+    std::fs::write(snap.join(INDEX_FILE_NAME), index_text(&map)).unwrap();
+    let view = CheckpointView::open(&snap).unwrap();
+    assert_eq!(view.shard_count(), 2);
+    let single = SafeTensors::open(&fixture().join("model.safetensors")).unwrap();
+    for e in &all {
+        let (_, want) = single.read_f32(&e.0).unwrap();
+        let (_, got) = view.read_f32(&e.0).unwrap();
+        assert!(
+            want.iter().zip(&got).all(|(a, b)| a.to_bits() == b.to_bits()),
+            "{}",
+            e.0
+        );
+    }
+}
 
-    // A symlink to a file inside the directory is fine only if it is whole:
-    // the index below names every tensor, so it opens.
-    std::os::unix::fs::symlink(dir.join("inside.safetensors"), dir.join("alias.safetensors")).unwrap();
-    let all_names: Vec<(&str, &str)> = all.iter().map(|e| (e.0.as_str(), "alias.safetensors")).collect();
-    std::fs::write(dir.join(INDEX_FILE_NAME), index_text(&all_names)).unwrap();
-    assert_eq!(CheckpointView::open(&dir).unwrap().shard_count(), 1);
+/// A FIFO or a directory named by the index is refused, and the open returns
+/// (a plain `File::open` on a FIFO with no writer blocks forever).
+#[test]
+fn a_fifo_or_directory_shard_is_refused_without_blocking() {
+    let sc = Scratch::new("special");
+    let all = fixture_entries();
+    std::fs::create_dir(sc.0.join("adir")).unwrap();
+    let ok = std::process::Command::new("mkfifo")
+        .arg(sc.0.join("afifo"))
+        .status()
+        .unwrap();
+    assert!(ok.success());
+    for special in ["adir", "afifo"] {
+        std::fs::write(sc.0.join(INDEX_FILE_NAME), index_text(&[(all[0].0.as_str(), special)])).unwrap();
+        let dir = sc.0.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(CheckpointView::open(&dir).map(|_| ()));
+        });
+        let r = rx
+            .recv_timeout(std::time::Duration::from_secs(20))
+            .unwrap_or_else(|_| panic!("{special}: open blocked"));
+        let err = r.expect_err("a non-regular shard must be refused");
+        assert!(err.contains("not a regular file"), "{special}: {err}");
+    }
 }
 
 #[test]

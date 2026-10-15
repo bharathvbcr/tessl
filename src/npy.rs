@@ -69,8 +69,7 @@ pub const MAX_NPY_HEADER_BYTES: usize = 1 << 20;
 
 pub fn read_npy(path: &Path) -> Result<NpyArray, String> {
     let what = path.display();
-    let mut f = File::open(path).map_err(|e| format!("open {what}: {e}"))?;
-    let file_len = f.metadata().map_err(|e| format!("{what}: {e}"))?.len();
+    let (mut f, file_len) = plain::open_regular_file(path)?;
     let mut magic = [0u8; 6];
     f.read_exact(&mut magic).map_err(|e| format!("read magic: {e}"))?;
     if &magic != b"\x93NUMPY" {

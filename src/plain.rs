@@ -68,3 +68,34 @@ pub(crate) fn le_to_native<T: PlainScalar>(dst: &mut [T]) {
     #[cfg(target_endian = "little")]
     let _ = dst;
 }
+
+/// Open `path` for a checkpoint reader, refusing anything but a regular file.
+///
+/// `File::open` on a FIFO with no writer blocks forever, and a character
+/// device or directory has no meaningful length to validate a header against.
+/// So the path is stat-ed first (following symlinks) and must be a regular
+/// file *before* the blocking open; the opened handle is then fstat-ed and
+/// must still be a regular file of the same length. Returns the handle and its
+/// length. A path swapped for a FIFO between the stat and the open can still
+/// block: closing that window needs `O_NONBLOCK`, whose constant is not in
+/// `std`, and no libc dependency is added for it.
+pub(crate) fn open_regular_file(path: &std::path::Path) -> Result<(std::fs::File, u64), String> {
+    let what = path.display();
+    let before = std::fs::metadata(path).map_err(|e| format!("{what}: {e}"))?;
+    if !before.is_file() {
+        return Err(format!("{what}: not a regular file"));
+    }
+    let f = std::fs::File::open(path).map_err(|e| format!("{what}: {e}"))?;
+    let after = f.metadata().map_err(|e| format!("{what}: {e}"))?;
+    if !after.is_file() {
+        return Err(format!("{what}: not a regular file (replaced while opening)"));
+    }
+    if after.len() != before.len() {
+        return Err(format!(
+            "{what}: length changed while opening ({} then {} bytes)",
+            before.len(),
+            after.len()
+        ));
+    }
+    Ok((f, after.len()))
+}

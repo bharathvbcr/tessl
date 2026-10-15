@@ -234,10 +234,27 @@ struct Outcome {
     violations: Vec<String>,
 }
 
+/// Why a checked closure stopped. A parser refusing its input is expected;
+/// two parser entry points disagreeing, or a read-back contradicting the
+/// header the parser accepted, is a defect and must fail the test rather than
+/// pass as one more refusal.
+enum Fail {
+    /// The parser returned a named `Err` for the input.
+    Refused(String),
+    /// An internal-consistency check failed on an input the parser accepted.
+    Inconsistent(String),
+}
+
+impl From<String> for Fail {
+    fn from(e: String) -> Self {
+        Fail::Refused(e)
+    }
+}
+
 /// Run `f` on `input` under catch_unwind and the allocation tracker.
-fn run(input_len: usize, f: impl FnOnce() -> Result<(), String>) -> Outcome {
+fn run<E: Into<Fail>>(input_len: usize, f: impl FnOnce() -> Result<(), E>) -> Outcome {
     MAX_ALLOC.with(|m| m.set(0));
-    let r = catch_unwind(AssertUnwindSafe(f));
+    let r = catch_unwind(AssertUnwindSafe(|| f().map_err(Into::into)));
     let max = MAX_ALLOC.with(Cell::get);
     let mut violations = Vec::new();
     let mut err = None;
@@ -252,7 +269,11 @@ fn run(input_len: usize, f: impl FnOnce() -> Result<(), String>) -> Outcome {
             false
         }
         Ok(Ok(())) => true,
-        Ok(Err(e)) => {
+        Ok(Err(Fail::Inconsistent(msg))) => {
+            violations.push(format!("inconsistent: {msg}"));
+            false
+        }
+        Ok(Err(Fail::Refused(e))) => {
             if e.trim().is_empty() {
                 violations.push("Err with an empty message".into());
             }
@@ -357,7 +378,7 @@ fn check_json(input: &[u8], full_len: Option<usize>) -> Outcome {
         for syntax in [CONFIG_SYNTAX, HEADER_SYNTAX] {
             json::parse(&text, syntax)?;
         }
-        Ok(())
+        Ok::<(), String>(())
     });
     // A strict truncation of a document whose root is an object is not itself
     // a document (the closing brace is last), under either syntax.
@@ -487,29 +508,31 @@ fn check_safetensors(bytes: &[u8], scratch: &Scratch) -> Outcome {
         let path = scratch.write("m.safetensors", &input);
         let from_file = SafeTensors::open(&path);
         if from_mem.is_ok() != from_file.is_ok() {
-            return Err(format!(
+            return Err(Fail::Inconsistent(format!(
                 "from_bytes ok={} but open ok={} (mem: {:?}; file: {:?})",
                 from_mem.is_ok(),
                 from_file.is_ok(),
                 from_mem.as_ref().err(),
                 from_file.as_ref().err()
-            ));
+            )));
         }
         let (st, file_st) = match (from_mem, from_file) {
             (Ok(a), Ok(b)) => (a, b),
-            (Err(e), Err(_)) => return Err(e),
+            (Err(e), Err(_)) => return Err(Fail::Refused(e)),
             _ => unreachable!(),
         };
         for s in [&st, &file_st] {
             let names: Vec<String> = s.names().map(str::to_string).collect();
             for n in names {
-                let info = s.info(&n)?.clone();
-                let (info2, raw) = s.read_raw(&n)?;
+                // The header was accepted, so every listed tensor reads back whole.
+                let bad = |e: String| Fail::Inconsistent(format!("{n}: {e}"));
+                let info = s.info(&n).map_err(bad)?.clone();
+                let (info2, raw) = s.read_raw(&n).map_err(bad)?;
                 if info2 != info || raw.len() as u64 != info.end - info.begin {
-                    return Err(format!("{n}: read_raw disagrees with its header entry"));
+                    return Err(bad("read_raw disagrees with its header entry".into()));
                 }
                 if raw.len() as u64 != info.numel() as u64 * info.dtype.size() {
-                    return Err(format!("{n}: byte length is not numel x dtype size"));
+                    return Err(bad("byte length is not numel x dtype size".into()));
                 }
                 // The typed readers may refuse a dtype; they must not panic.
                 let _ = s.read_f32(&n);
@@ -729,7 +752,7 @@ fn check_npy(bytes: &[u8], scratch: &Scratch) -> Outcome {
     let input = bytes.to_vec();
     run(input.len(), || {
         let path = scratch.write("m.npy", &input);
-        let a = read_npy(&path)?;
+        let a = read_npy(&path).map_err(Fail::Refused)?;
         let numel: usize = a.shape.iter().product();
         let len = a
             .data_f32
@@ -738,7 +761,10 @@ fn check_npy(bytes: &[u8], scratch: &Scratch) -> Outcome {
             .or(a.data_f64.as_ref().map(Vec::len))
             .or(a.data_i64.as_ref().map(Vec::len));
         if len != Some(numel) {
-            return Err(format!("shape {:?} but payload of {len:?} elements", a.shape));
+            return Err(Fail::Inconsistent(format!(
+                "shape {:?} but payload of {len:?} elements",
+                a.shape
+            )));
         }
         Ok(())
     })
@@ -949,12 +975,10 @@ mod adversarial {
         assert!(s.read_raw("a.f32").is_err());
     }
 
-    /// KNOWN BREAK (fails on e6188ee): opening a FIFO with no writer blocks
-    /// forever in `File::open`, in both `SafeTensors::open` and `read_npy`.
-    /// A caller handed a FIFO path hangs instead of getting an `Err`. Fix
-    /// shape: stat first and refuse non-regular files, or open `O_NONBLOCK`.
+    /// Opening a FIFO with no writer used to block forever in `File::open`, in
+    /// both `SafeTensors::open` and `read_npy`; both now refuse a non-regular
+    /// file with a named error before any blocking open.
     #[test]
-    #[ignore = "known break: FIFO open blocks forever (run with --ignored to see it fail)"]
     fn file_entry_points_do_not_block_on_a_fifo() {
         let sc = Scratch::new("adv-fifo");
         let fifo = sc.0.join("f.bin");
@@ -964,15 +988,18 @@ mod adversarial {
             .unwrap()
             .success());
         let p1 = fifo.clone();
-        let st = timed(move || SafeTensors::open(&p1).is_err());
+        let st = timed(move || SafeTensors::open(&p1).map(|_| ()));
         let p2 = fifo.clone();
-        let npy = timed(move || read_npy(&p2).is_err());
-        // Release any blocked readers so the process can exit cleanly.
-        for _ in 0..2 {
-            drop(std::fs::OpenOptions::new().write(true).open(&fifo));
+        let npy = timed(move || read_npy(&p2).map(|_| ()));
+        // Release any blocked readers so the process can exit cleanly. A
+        // read+write open of a FIFO never blocks, and one open releases every
+        // blocked reader (a write-only open would block with none left).
+        drop(std::fs::OpenOptions::new().read(true).write(true).open(&fifo));
+        for (name, r) in [("SafeTensors::open", st), ("read_npy", npy)] {
+            let r = r.unwrap_or_else(|| panic!("{name} on a FIFO blocked"));
+            let e = r.expect_err("a FIFO must be refused");
+            assert!(e.contains("not a regular file"), "{name}: {e}");
         }
-        assert_eq!(st, Some(true), "SafeTensors::open on a FIFO blocked");
-        assert_eq!(npy, Some(true), "read_npy on a FIFO blocked");
     }
 
     /// A header exactly at the cap is read; one byte more is refused, and in

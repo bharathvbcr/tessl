@@ -164,12 +164,19 @@ jobs:
         #
         # The filter is checked to have matched: a filter that selects nothing
         # also exits 0, and that must not read as a pass.
+        #
+        # parser_mutation:: runs as its own invocation with its own check, so a
+        # rename that makes it match nothing fails here instead of hiding behind
+        # the other filters' passing tests.
         run: |
-          out=$(cargo test --release --lib -- json::tests:: safetensors::tests:: parser_mutation:: \
+          out=$(cargo test --release --lib -- json::tests:: safetensors::tests:: \
             qwen35::tests::place_linear_part_matches_the_row_by_row_transpose \
             qwen35_adamw::step_kernel_tests:: 2>&1) || { echo "$out"; exit 1; }
           echo "$out"
           grep -Eq 'test result: ok\. [1-9][0-9]* passed' <<<"$out" || { echo "host-only filter matched no tests"; exit 1; }
+          out=$(cargo test --release --lib -- parser_mutation:: 2>&1) || { echo "$out"; exit 1; }
+          echo "$out"
+          grep -Eq 'test result: ok\. [1-9][0-9]* passed' <<<"$out" || { echo "parser_mutation filter matched no tests"; exit 1; }
 
       - name: Static tile audit
         # The one correctness gate on this job that needs no GPU: it parses the

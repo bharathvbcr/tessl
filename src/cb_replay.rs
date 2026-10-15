@@ -499,6 +499,11 @@ impl PingPongCbReplay {
             .as_mut()
             .ok_or_else(|| "execute_decode_icb: no DecodeIcb attached".to_string())?;
         icb.execute(rt)?;
+        // Under binder-encode-nop the call succeeded without encoding anything:
+        // it is not a replay, and must not advance the counter or the phase.
+        if icb.last_execute_was_nop() {
+            return Ok(());
+        }
         self.icb_replays = self.icb_replays.saturating_add(1);
         self.icb.mark_mini_execute_ok();
         Ok(())
@@ -525,6 +530,12 @@ impl PingPongCbReplay {
             self.slots[slot.index()].phase = CbReplayPhase::Ready;
             self.icb_execute_failures = self.icb_execute_failures.saturating_add(1);
             return Err(CbReplayError::IcbExecuteFailed(e));
+        }
+        // A nop'd execute submitted nothing, so the claim made above has no
+        // command buffer behind it: give the slot back instead of leaving it
+        // InFlight with no completion to clear it.
+        if self.decode_icb.as_ref().is_some_and(|d| d.last_execute_was_nop()) {
+            self.slots[slot.index()].phase = CbReplayPhase::Ready;
         }
         Ok(())
     }
@@ -893,6 +904,37 @@ mod tests {
         }
         assert_eq!(pp.icb_replays(), 2);
         eprintln!("decode_icb_mini_replay: {}", pp.status_line());
+    }
+
+    /// Under binder-encode-nop `DecodeIcb::execute` succeeds without encoding
+    /// anything. That is not a replay: the counters, the stub's execute count
+    /// and the claimed slot must be as they were.
+    ///
+    /// Against the pre-fix code `icb_replays()` is 1 and the slot stays InFlight.
+    #[test]
+    fn a_nop_execute_is_not_counted_as_a_replay() {
+        let _flags = crate::decode_icb::IcbFlagsTestGuard::lock();
+        crate::set_decode_icb(true);
+        let rt = crate::GpuRuntime::new().expect("runtime");
+        let (dicb, _out) = crate::DecodeIcb::mini_copy_chain(&rt, 32).expect("mini DecodeIcb");
+        let mut pp = PingPongCbReplay::new();
+        pp.attach_decode_icb(dicb);
+        pp.mark_live_step("capture0").unwrap();
+        let attempts = pp.icb_stub().execute_attempts;
+        let _nop = crate::BinderEncodeNopGuard::enter();
+
+        pp.execute_decode_icb(&rt).expect("a nop execute stays benign");
+        assert_eq!(pp.icb_replays(), 0, "nothing ran, so nothing was replayed");
+        assert_eq!(pp.icb_stub().execute_attempts, attempts);
+
+        pp.try_replay_icb(CbSlot::A, &rt).expect("a nop replay stays benign");
+        assert_eq!(pp.icb_replays(), 0);
+        assert_eq!(pp.icb_stub().execute_attempts, attempts);
+        assert_eq!(
+            pp.slot(CbSlot::A).phase,
+            CbReplayPhase::Ready,
+            "no command buffer was submitted, so the claim must be given back"
+        );
     }
 
     /// Defect 1: `try_replay` takes no runtime, so an attached tape does not

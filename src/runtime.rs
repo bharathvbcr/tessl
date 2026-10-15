@@ -1346,7 +1346,6 @@ impl GpuRuntime {
 
     /// Hold `alloc` until submitted work has completed, then release it,
     /// removing it from the residency set first when `resident`.
-    #[cfg(feature = "quant-prep")]
     pub(crate) fn schedule_release(&self, alloc: Retained<ProtocolObject<dyn MTLAllocation>>, resident: bool) {
         // A poisoned lock still holds the queue; dropping `alloc` here instead
         // would free it under in-flight work.
@@ -1935,8 +1934,14 @@ impl GpuRuntime {
     {
         // DecodeIcb replay prep: skip Metal encode; caller still runs push_u32 /
         // KV host bookkeeping outside the binder closure.
+        //
+        // Nothing is encoded, so a busy runtime (a live host mapping, another
+        // encoder) is not contended and is not reported. A poisoned runtime is:
+        // a replay prep step must fail the way a live one does, not look like
+        // it succeeded. Callers that count work done must read
+        // `DecodeIcb::last_execute_was_nop` / `binder_encode_nop`.
         if crate::decode_icb::binder_encode_nop() {
-            return Ok(());
+            return self.ensure_not_poisoned();
         }
         let _access = self.acquire_access()?;
         // No residency flush here: `commit_m4` commits every add made since the
@@ -1957,6 +1962,14 @@ impl GpuRuntime {
             self.poison_on_failure(error.as_str());
         }
         result
+    }
+
+    /// The poison error if this runtime is poisoned, else `Ok`.
+    pub(crate) fn ensure_not_poisoned(&self) -> Result<(), String> {
+        if self.poison.is_set() {
+            return Err(self.poison.error());
+        }
+        Ok(())
     }
 
     fn ensure_m4_cb_open(&self, batch: &mut Option<ActiveMetal4Batch>) -> Result<(), String> {
@@ -2059,7 +2072,10 @@ impl GpuRuntime {
                 );
                 batch.encoder = Some(e);
             }
-            let pending_edge = std::mem::take(&mut batch.hazard_pending);
+            // A capture also carries the state across a command-buffer boundary
+            // (sync encode, mid-commit), which the batch does not.
+            let pending_edge =
+                std::mem::take(&mut batch.hazard_pending) | crate::decode_icb::capture_take_carried_hazard();
             let enc = batch
                 .encoder
                 .as_ref()
@@ -2100,7 +2116,9 @@ impl GpuRuntime {
                     std::panic::resume_unwind(panic);
                 }
             }
-            binder.hazard_pending()
+            let pending = binder.hazard_pending();
+            crate::decode_icb::capture_carry_hazard(pending);
+            pending
         };
         let hit_mid = {
             let mut guard = self.active_m4.lock().map_err(|e| e.to_string())?;

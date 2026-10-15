@@ -823,19 +823,43 @@ fn embedgemma2_audio_offsets_are_widened() {
             "first conv output row",
         ),
         (
-            "device const float *xin = mid + ((ulong)(mid0 + (uint)r1) * mels1 + (uint)f) * c0;",
+            "const ulong row_base = (ulong)(mid0 + (uint)r1) * mels1;",
             "second conv input row",
         ),
+        ("mid[(row_base + (uint)f) * c0 + ci]", "second conv input read"),
+        (
+            "device const float *wk = w + (ulong)(kh * 3u + kw) * c0 * c1;",
+            "second conv tap weights",
+        ),
+        ("wk + (ulong)kt * c1 + n * 8u", "second conv weight tile"),
+        ("wk[(ulong)kk * c1 + co]", "second conv weight edge tile"),
         (
             "device float *o = out + ((ulong)(row0 + t2) * mels2 + f2) * c1;",
             "second conv output row",
         ),
         ("const ulong base = (ulong)row * p.dim;", "norm row"),
-        ("const ulong r = i / hidden;", "GLU row"),
-        ("out[(ulong)(row0 + t) * hidden + ch] = acc;", "depthwise conv store"),
+        (
+            "device const float *g = x + (ulong)(row0 + (uint)s) * 2u * hidden;",
+            "light conv GLU input row",
+        ),
+        (
+            "device float *o = out + (ulong)(row0 + t) * hidden;",
+            "light conv output row",
+        ),
+        ("w[(ulong)ch * p.taps + j]", "light conv tap weight"),
         ("const ulong col0 = (ulong)h * p.head_dim;", "attention head column"),
-        ("q[(ulong)(row0 + t) * hidden + col0 + d]", "attention query row"),
-        ("k + (ulong)(row0 + (uint)kp) * hidden + col0", "attention key row"),
+        (
+            "q[(ulong)(row0 + t) * p.stride + p.q_off + col0 + d]",
+            "attention query row",
+        ),
+        (
+            "k + (ulong)(row0 + (uint)kp) * p.stride + p.k_off + col0",
+            "attention key row",
+        ),
+        (
+            "v + (ulong)(row0 + kp) * p.stride + p.v_off + col0",
+            "attention value row",
+        ),
         ("rel + (ulong)(j - i) * hidden + col0", "relative key row"),
         (
             "device float *o = out + (ulong)(row0 + t) * hidden + col0;",

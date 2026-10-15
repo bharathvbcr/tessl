@@ -70,12 +70,17 @@
 //!
 //! New, in `kernels/embedgemma2_audio.metal`: [`sub_conv0_ln_relu`] and
 //! [`sub_conv1_ln_relu`] (the strided convs with the frame mask, channel
-//! LayerNorm and ReLU), [`rms_norm`] and [`ew`] (the norms and elementwise
-//! passes with the clipped linears' and the gradient clamps folded in),
-//! [`glu`], [`dwconv1d_causal`] and [`attention`]. The matmuls are tessl's
-//! exact-f32 [`gemm`]; `gemm_epilogue` has no exact-f32 path, so the clamps
-//! are not fused into them. The sinusoidal table, `relative_k_proj` of it and
-//! the query scale are computed once per layer at load.
+//! LayerNorm and ReLU; the second on 8x8 simdgroup tiles), [`rms_norm`] and
+//! [`rms_norm_then`] (the row passes, one or two per launch, with the clipped
+//! linears' and the gradient clamps folded in: a layer's residual add and the
+//! norm after it are one launch), [`ew`] (the clamp, SiLU and clamp between a
+//! feed-forward's linears), [`lconv`] (the GLU, the depthwise conv and the
+//! conv norm of the light conv in one pass) and [`attention`]. The matmuls are
+//! tessl's exact-f32 [`gemm`]; `gemm_epilogue` has no exact-f32 path, so the
+//! clamps are not fused into them. q, k and v are one `[hidden, 3 * hidden]`
+//! GEMM on one clamped input whenever their input clamps are equal (every layer
+//! of the checkpoint). The sinusoidal table, `relative_k_proj` of it and the
+//! query scale are computed once per layer at load.
 
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
@@ -88,7 +93,7 @@ use crate::json::{self, Json, Syntax};
 use crate::loader::Loader;
 use crate::nn::{dispatch_tg_1d, reduce_tptg, require, require_disjoint_writes};
 use crate::qwen35_model::Precision;
-use crate::runtime::GpuRuntime;
+use crate::runtime::{mtl_size, GpuRuntime};
 use crate::safetensors::SafeTensors;
 use crate::tensor::{gpu_copy, DType, GpuBuffer, Tensor};
 
@@ -108,6 +113,9 @@ const MAX_C0: u32 = 512;
 const MAX_C1: u32 = 128;
 const MAX_CTX: u32 = 64;
 const MAX_HEAD_DIM: u32 = 256;
+/// Frequency positions one simdgroup of the second subsampling conv holds
+/// (`EGA_CONV1_P`).
+const CONV1_POSITIONS: usize = 8;
 
 const PREFIX_TOWER: &str = "audio_tower.";
 const PREFIX_EMBED: &str = "embed_audio.";
@@ -450,6 +458,23 @@ impl AudioConfig {
         if !(self.residual_weight.is_finite() && self.invalid_logit.is_finite()) {
             return bad("residual_weight and attention_invalid_logits_value must be finite".into());
         }
+        if self.past() > MAX_PAST {
+            return bad(format!(
+                "attention_context_left {} means {} past frames; the kernel holds {MAX_PAST}",
+                self.context_left,
+                self.past()
+            ));
+        }
+        // A masked logit's softmax weight must be exactly 0 beside any unmasked
+        // one (the softcap keeps those within +-cap), which `exp` gives from
+        // 104 below; the kernel computes only the unmasked slots.
+        if self.invalid_logit > -(self.logit_cap + 104.0) {
+            return bad(format!(
+                "attention_invalid_logits_value {} must be at most -(attention_logit_cap + 104) = {}",
+                self.invalid_logit,
+                -(self.logit_cap + 104.0)
+            ));
+        }
         Ok(())
     }
 }
@@ -665,7 +690,7 @@ pub fn sub_conv0_ln_relu(
 /// [mid rows, mels1 * c0]` is [`sub_conv0_ln_relu`]'s output, `fmask [frames]`
 /// the frame mask (read at every other frame), `w [9, c0, c1]` (tap, input
 /// channel, output channel), `gamma [c1]`, `out [rows, mels2 * c1]` with
-/// `mels2 = ceil(mels1 / 2)`. `c1 <= 128`.
+/// `mels2 = ceil(mels1 / 2)`. `c0 <= 512`, `c1 <= 128`.
 #[allow(clippy::too_many_arguments)]
 pub fn sub_conv1_ln_relu(
     rt: &Arc<GpuRuntime>,
@@ -681,9 +706,9 @@ pub fn sub_conv1_ln_relu(
     eps: f32,
 ) -> Result<(), String> {
     const E: &str = "embedgemma2_audio::sub_conv1_ln_relu";
-    if mels1 == 0 || c0 == 0 || c1 == 0 || c1 > MAX_C1 || !(eps > 0.0 && eps.is_finite()) {
+    if mels1 == 0 || c0 == 0 || c0 > MAX_C0 || c1 == 0 || c1 > MAX_C1 || !(eps > 0.0 && eps.is_finite()) {
         return Err(format!(
-            "{E}: need mels1, c0 > 0, 1 <= c1 <= {MAX_C1}, eps > 0 (got {mels1}, {c0}, {c1}, {eps})"
+            "{E}: need mels1 > 0, 1 <= c0 <= {MAX_C0}, 1 <= c1 <= {MAX_C1}, eps > 0 (got {mels1}, {c0}, {c1}, {eps})"
         ));
     }
     let mels2 = conv_out(mels1 as usize) as u32;
@@ -705,29 +730,39 @@ pub fn sub_conv1_ln_relu(
         ],
     )?;
     let p = rt.pipeline("eg2a_sub_conv1_ln_relu")?;
-    dispatch_2d_tg(
-        rt,
-        &p,
-        clips.max_rows() * mels2 as usize,
-        clips.clips.len(),
-        32,
-        |bnd| {
-            set_gpu_buf(bnd, mid, 0);
-            set_gpu_buf(bnd, fmask, 1);
-            set_gpu_buf(bnd, w, 2);
-            set_gpu_buf(bnd, gamma, 3);
-            set_gpu_buf(bnd, out, 4);
-            set_gpu_buf(bnd, &clips.buffer, 5);
-            set_u32(bnd, mels1, 6);
-            set_u32(bnd, mels2, 7);
-            set_u32(bnd, c0, 8);
-            set_u32(bnd, c1, 9);
-            crate::dispatch::set_f32(bnd, eps, 10);
-        },
-    )
+    // One simdgroup per (row, block of CONV1_POSITIONS frequency positions);
+    // threadgroup memory 0: the staged input patch, the accumulators, and an
+    // 8x8 weight-edge tile (`kernels/embedgemma2_audio.metal`).
+    let groups_x = clips.max_rows() * (mels2 as usize).div_ceil(CONV1_POSITIONS);
+    let tg_bytes = 4 * (CONV1_POSITIONS * c0.next_multiple_of(8) as usize + 8 * c1.next_multiple_of(8) as usize + 64);
+    if groups_x == 0 {
+        return Ok(());
+    }
+    crate::dispatch::check_threadgroup_limit(rt, &p, 32)?;
+    rt.with_binder(|bnd| {
+        bnd.set_pipeline(&p);
+        set_gpu_buf(bnd, mid, 0);
+        set_gpu_buf(bnd, fmask, 1);
+        set_gpu_buf(bnd, w, 2);
+        set_gpu_buf(bnd, gamma, 3);
+        set_gpu_buf(bnd, out, 4);
+        set_gpu_buf(bnd, &clips.buffer, 5);
+        set_u32(bnd, mels1, 6);
+        set_u32(bnd, mels2, 7);
+        set_u32(bnd, c0, 8);
+        set_u32(bnd, c1, 9);
+        crate::dispatch::set_f32(bnd, eps, 10);
+        bnd.set_threadgroup_memory(0, tg_bytes);
+        bnd.dispatch(mtl_size(groups_x, clips.clips.len(), 1), mtl_size(32, 1, 1));
+        Ok(())
+    })
 }
 
-/// clamp(pre[1])(clamp(pre[0])(x))) [* weight]))`.
+/// What [`rms_norm`] computes per row: `[resid | bias +] scale * clamp(post)(
+/// act(rms_norm(clamp(pre[1])(clamp(pre[0])(x))) [* weight]))`. With `norm`
+/// false there is no normalization: the clamped value goes on to the
+/// activation, the scale and the add (the residual add after a clipped
+/// linear's output clamp; the output projection's bias).
 pub struct RmsNorm<'a> {
     pub eps: f32,
     /// `None`: the weightless norm of the multimodal embedder.
@@ -738,9 +773,13 @@ pub struct RmsNorm<'a> {
     pub silu: bool,
     /// The next clipped linear's input bounds.
     pub post: Clamp,
-    /// Multiplies the normed value before the residual is added.
+    /// Multiplies the normed value before the add.
     pub scale: f32,
+    /// `+ resid[row, d]`: a buffer of the input's size.
     pub resid: Option<&'a GpuBuffer>,
+    /// `+ bias[d]`: a buffer of one row. At most one of `resid` and `bias`.
+    pub bias: Option<&'a GpuBuffer>,
+    pub norm: bool,
 }
 
 impl<'a> RmsNorm<'a> {
@@ -754,8 +793,66 @@ impl<'a> RmsNorm<'a> {
             post: Clamp::NONE,
             scale: 1.0,
             resid: None,
+            bias: None,
+            norm: true,
         }
     }
+}
+
+/// Words of the kernel's `EgaRowStage`.
+const STAGE_WORDS: usize = 13;
+
+/// A stage's checked kernel words, for an input of `n` elements in rows of
+/// `dim`; `posts` are the clamps of its outputs (one to three).
+fn stage_words(
+    rt: &GpuRuntime,
+    spec: &RmsNorm<'_>,
+    posts: &[Clamp],
+    n: usize,
+    dim: u32,
+    e: &str,
+) -> Result<[u32; STAGE_WORDS], String> {
+    if dim == 0 || !(spec.eps > 0.0 && spec.eps.is_finite()) || !spec.scale.is_finite() {
+        return Err(format!("{e}: need dim > 0, eps > 0 and a finite scale"));
+    }
+    let mut flags = 0u32;
+    if let Some(w) = spec.weight {
+        require::<f32>(rt, w, dim as usize, "rms_norm weight")?;
+        flags |= 1;
+    }
+    if spec.silu {
+        flags |= 2;
+    }
+    match (spec.resid, spec.bias) {
+        (Some(_), Some(_)) => return Err(format!("{e}: a stage adds a residual or a bias, not both")),
+        (Some(r), None) => {
+            require::<f32>(rt, r, n, "rms_norm resid")?;
+            flags |= 4;
+        }
+        (None, Some(b)) => {
+            require::<f32>(rt, b, dim as usize, "rms_norm bias")?;
+            flags |= 16;
+        }
+        (None, None) => {}
+    }
+    if !spec.norm {
+        flags |= 8;
+    }
+    let mut w = [0u32; STAGE_WORDS];
+    w[..5].copy_from_slice(&[
+        word(spec.eps),
+        word(spec.pre[0].lo),
+        word(spec.pre[0].hi),
+        word(spec.pre[1].lo),
+        word(spec.pre[1].hi),
+    ]);
+    // Unused outputs hold an empty clamp; the kernel never reads them.
+    for i in 0..3 {
+        let c = posts.get(i).copied().unwrap_or(Clamp::NONE);
+        (w[5 + i], w[8 + i]) = (word(c.lo), word(c.hi));
+    }
+    (w[11], w[12]) = (word(spec.scale), flags);
+    Ok(w)
 }
 
 /// [`RmsNorm`] over `rows` rows of `dim` each, `x` into `out` (`out` may be `x`,
@@ -768,154 +865,193 @@ pub fn rms_norm(
     dim: u32,
     spec: &RmsNorm<'_>,
 ) -> Result<(), String> {
-    const E: &str = "embedgemma2_audio::rms_norm";
-    if dim == 0 || !(spec.eps > 0.0 && spec.eps.is_finite()) || !spec.scale.is_finite() {
-        return Err(format!("{E}: need dim > 0, eps > 0 and a finite scale"));
-    }
-    let n = elems(&[rows, dim], E)?;
+    norm_launch(rt, "embedgemma2_audio::rms_norm", x, out, rows, dim, spec, None)
+}
+
+/// A second row stage chained after [`rms_norm`]'s, and where it writes.
+pub struct NormThen<'a> {
+    /// The second stage. Its `post` clamp, `scale`, `resid` and `bias` are
+    /// refused (they stay at `new`'s values): the outputs carry the clamps.
+    pub spec: RmsNorm<'a>,
+    /// One to three outputs: the second stage's value under each output's
+    /// clamp, in its own buffer. `outs[0]` may be the first stage's `out`
+    /// (the norm in place); the others are disjoint from every other buffer.
+    pub outs: Vec<(&'a GpuBuffer, Clamp)>,
+}
+
+/// Two row stages in one launch, one threadgroup per row: `first` reads `x`
+/// and writes `out`, exactly as [`rms_norm`] does, and `then.spec` reads
+/// `out` (what `first` just wrote) and writes `then.outs`. The row is read
+/// from memory once; the result is `rms_norm` twice, in sequence, to the last
+/// bit (the reductions have the same shape). The layer's residual add and
+/// the norm that follows it; the attention norm into the three clamped
+/// copies q, k and v read.
+pub fn rms_norm_then(
+    rt: &Arc<GpuRuntime>,
+    x: &GpuBuffer,
+    out: &GpuBuffer,
+    rows: u32,
+    dim: u32,
+    first: &RmsNorm<'_>,
+    then: &NormThen<'_>,
+) -> Result<(), String> {
+    norm_launch(
+        rt,
+        "embedgemma2_audio::rms_norm_then",
+        x,
+        out,
+        rows,
+        dim,
+        first,
+        Some(then),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn norm_launch(
+    rt: &Arc<GpuRuntime>,
+    e: &str,
+    x: &GpuBuffer,
+    out: &GpuBuffer,
+    rows: u32,
+    dim: u32,
+    first: &RmsNorm<'_>,
+    then: Option<&NormThen<'_>>,
+) -> Result<(), String> {
+    let n = elems(&[rows, dim], e)?;
     require::<f32>(rt, x, n, "rms_norm x")?;
     require::<f32>(rt, out, n, "rms_norm out")?;
-    let mut flags = 0u32;
-    if let Some(w) = spec.weight {
-        require::<f32>(rt, w, dim as usize, "rms_norm weight")?;
-        flags |= 1;
-    }
-    if spec.silu {
-        flags |= 2;
-    }
-    if let Some(r) = spec.resid {
-        require::<f32>(rt, r, n, "rms_norm resid")?;
-        flags |= 4;
-    }
+    let a = stage_words(rt, first, &[first.post], n, dim, e)?;
+    let (b, outs) = match then {
+        None => ([0u32; STAGE_WORDS], &[][..]),
+        Some(t) => {
+            let s = &t.spec;
+            if t.outs.is_empty() || t.outs.len() > 3 {
+                return Err(format!("{e}: {} outputs; need 1..=3", t.outs.len()));
+            }
+            if s.post != Clamp::NONE || s.scale != 1.0 || s.resid.is_some() || s.bias.is_some() {
+                return Err(format!(
+                    "{e}: the second stage's clamp, scale and add belong to the first stage and the outputs"
+                ));
+            }
+            for &(o, _) in &t.outs {
+                require::<f32>(rt, o, n, "rms_norm_then output")?;
+            }
+            let posts: Vec<Clamp> = t.outs.iter().map(|&(_, c)| c).collect();
+            (stage_words(rt, s, &posts, n, dim, e)?, &t.outs[..])
+        }
+    };
     if rows == 0 {
         return Ok(());
     }
     // `out` is written element by element after a barrier-separated read of
     // the same element by the same thread, so it may be `x` or `resid`.
-    if let Some(w) = spec.weight {
-        require_disjoint_writes(E, &[("out", out)], &[("weight", w)])?;
+    let mut reads: Vec<(&str, &GpuBuffer)> = Vec::new();
+    if let Some(w) = first.weight {
+        reads.push(("weight", w));
     }
+    if let Some(b) = first.bias {
+        reads.push(("bias", b));
+    }
+    if let Some(t) = then {
+        if let Some(w) = t.spec.weight {
+            reads.push(("weight_b", w));
+        }
+        // The extra outputs overlap nothing; output 0 may be `out` (the second
+        // stage's norm in place) but not a weight.
+        const NAMES: [&str; 3] = ["output 0", "output 1", "output 2"];
+        for (k, &(o, _)) in t.outs.iter().enumerate().skip(1) {
+            let mut others = reads.clone();
+            others.extend([("x", x), ("out", out)]);
+            others.extend(
+                t.outs
+                    .iter()
+                    .enumerate()
+                    .filter(|&(j, _)| j != k)
+                    .map(|(j, &(b, _))| (NAMES[j], b)),
+            );
+            require_disjoint_writes(e, &[(NAMES[k], o)], &others)?;
+        }
+        let mut others = reads.clone();
+        others.extend(t.outs.iter().enumerate().skip(1).map(|(j, &(b, _))| (NAMES[j], b)));
+        require_disjoint_writes(e, &[(NAMES[0], t.outs[0].0)], &others)?;
+    }
+    require_disjoint_writes(e, &[("out", out)], &reads)?;
     let p = rt.pipeline("eg2a_rms_norm")?;
     let tptg = reduce_tptg(p.maxTotalThreadsPerThreadgroup(), dim as usize);
-    let params = bytes(&[
-        rows,
-        dim,
-        word(spec.eps),
-        word(spec.pre[0].lo),
-        word(spec.pre[0].hi),
-        word(spec.pre[1].lo),
-        word(spec.pre[1].hi),
-        word(spec.post.lo),
-        word(spec.post.hi),
-        word(spec.scale),
-        flags,
-    ]);
+    let mut words = vec![rows, dim, outs.len() as u32];
+    words.extend_from_slice(&a);
+    words.extend_from_slice(&b);
+    let params = bytes(&words);
+    // Unused slots bind a buffer that exists; the kernel never touches them.
+    let slot = |i: usize| outs.get(i).map_or(out, |&(o, _)| o);
     dispatch_tg_1d(rt, &p, rows as usize, tptg, None, |bnd| {
         set_gpu_buf(bnd, x, 0);
-        set_gpu_buf(bnd, spec.weight.unwrap_or(x), 1);
-        set_gpu_buf(bnd, spec.resid.unwrap_or(x), 2);
+        set_gpu_buf(bnd, first.weight.unwrap_or(x), 1);
+        set_gpu_buf(bnd, first.resid.or(first.bias).unwrap_or(x), 2);
         set_gpu_buf(bnd, out, 3);
         bnd.bind_bytes(&params, 4);
+        set_gpu_buf(bnd, then.and_then(|t| t.spec.weight).unwrap_or(x), 5);
+        set_gpu_buf(bnd, slot(0), 6);
+        set_gpu_buf(bnd, slot(1), 7);
+        set_gpu_buf(bnd, slot(2), 8);
     })
 }
 
-/// What [`ew`] adds after its clamps.
-pub enum EwAdd<'a> {
-    None,
-    /// `+ aux[i]`: a residual of the same size.
-    Residual(&'a GpuBuffer),
-    /// `+ aux[i % cols]`: a per-column bias.
-    Bias(&'a GpuBuffer, u32),
-}
-
-/// What [`ew`] computes per element: `clamp(post)(act(clamp(pre)(x))) + add`.
-pub struct Ew<'a> {
+/// What [`ew`] computes per element: `clamp(post)(act(clamp(pre)(x)))`.
+pub struct Ew {
     pub pre: Clamp,
     pub silu: bool,
     pub post: Clamp,
-    pub add: EwAdd<'a>,
 }
 
 /// [`Ew`] over `n` elements, `x` into `out` (`out` may be `x`).
-pub fn ew(rt: &Arc<GpuRuntime>, x: &GpuBuffer, out: &GpuBuffer, n: u32, spec: &Ew<'_>) -> Result<(), String> {
-    const E: &str = "embedgemma2_audio::ew";
+pub fn ew(rt: &Arc<GpuRuntime>, x: &GpuBuffer, out: &GpuBuffer, n: u32, spec: &Ew) -> Result<(), String> {
     require::<f32>(rt, x, n as usize, "ew x")?;
     require::<f32>(rt, out, n as usize, "ew out")?;
-    let (mut flags, mut cols, mut aux) = (if spec.silu { 2u32 } else { 0 }, 1u32, x);
-    match spec.add {
-        EwAdd::None => {}
-        EwAdd::Residual(r) => {
-            require::<f32>(rt, r, n as usize, "ew residual")?;
-            (flags, aux) = (flags | 4, r);
-        }
-        EwAdd::Bias(b, c) => {
-            if c == 0 || n % c != 0 {
-                return Err(format!("{E}: bias of {c} columns for {n} elements"));
-            }
-            require::<f32>(rt, b, c as usize, "ew bias")?;
-            (flags, cols, aux) = (flags | 8, c, b);
-        }
-    }
     if n == 0 {
         return Ok(());
-    }
-    if let EwAdd::Bias(b, _) = spec.add {
-        require_disjoint_writes(E, &[("out", out)], &[("bias", b)])?;
     }
     let p = rt.pipeline("eg2a_ew")?;
     let params = bytes(&[
         n,
-        cols,
         word(spec.pre.lo),
         word(spec.pre.hi),
         word(spec.post.lo),
         word(spec.post.hi),
-        flags,
+        if spec.silu { 2 } else { 0 },
     ]);
     dispatch_1d(rt, &p, n as usize, |bnd| {
         set_gpu_buf(bnd, x, 0);
-        set_gpu_buf(bnd, aux, 1);
-        set_gpu_buf(bnd, out, 2);
-        bnd.bind_bytes(&params, 3);
-    })
-}
-
-/// `glu(x)` after a clamp: `out[r, c] = clamp(x[r, c]) * sigmoid(clamp(x[r,
-/// hidden + c]))`, `x [rows, 2 * hidden]`, `out [rows, hidden]`.
-pub fn glu(
-    rt: &Arc<GpuRuntime>,
-    x: &GpuBuffer,
-    out: &GpuBuffer,
-    rows: u32,
-    hidden: u32,
-    clamp: Clamp,
-) -> Result<(), String> {
-    const E: &str = "embedgemma2_audio::glu";
-    let n = elems(&[rows, hidden], E)?;
-    require::<f32>(rt, x, elems(&[rows, hidden, 2], E)?, "glu x")?;
-    require::<f32>(rt, out, n, "glu out")?;
-    if n == 0 {
-        return Ok(());
-    }
-    if n > u32::MAX as usize {
-        return Err(format!("{E}: {n} elements exceed u32"));
-    }
-    require_disjoint_writes(E, &[("out", out)], &[("x", x)])?;
-    let p = rt.pipeline("eg2a_glu")?;
-    dispatch_1d(rt, &p, n, |bnd| {
-        set_gpu_buf(bnd, x, 0);
         set_gpu_buf(bnd, out, 1);
-        set_u32(bnd, n as u32, 2);
-        set_u32(bnd, hidden, 3);
-        crate::dispatch::set_f32(bnd, clamp.lo, 4);
-        crate::dispatch::set_f32(bnd, clamp.hi, 5);
+        bnd.bind_bytes(&params, 2);
     })
 }
 
-/// The depthwise causal convolution of `Gemma4AudioLightConv1d` over every
-/// clip: `out[t, c] = sum_j w[c, j] * x[t - (taps - 1) + j, c]`, rows before a
-/// clip's first reading as 0. `x`, `out [rows, hidden]`, `w [hidden, taps]`.
-pub fn dwconv1d_causal(
+/// Hidden width [`lconv`] holds in a threadgroup (`EGA_MAX_HIDDEN`).
+const MAX_HIDDEN: u32 = 4096;
+
+/// What [`lconv`] needs besides its buffers.
+pub struct Lconv<'a> {
+    pub eps: f32,
+    /// The conv norm's weight, `[hidden]`.
+    pub norm_weight: &'a GpuBuffer,
+    /// `linear_start`'s output clamp, applied to both halves of the GLU.
+    pub glu: Clamp,
+    /// `+-gradient_clipping`, applied to the conv output before the norm.
+    pub pre: Clamp,
+    /// The next clipped linear's input clamp, applied last.
+    pub post: Clamp,
+}
+
+/// The light conv's middle in one pass: for every clip's tower rows,
+/// `out[t] = clamp(post)(silu(rms_norm(clamp(pre)(conv[t])) * norm_weight))`
+/// with `conv[t, c] = sum_j w[c, j] * glu[t - (taps - 1) + j, c]` (rows before
+/// the clip's first read 0) and `glu[s, c] = clamp(x[s, c]) * sigmoid(clamp(
+/// x[s, hidden + c]))`. `x [rows, 2 * hidden]`, `w [hidden, taps]`,
+/// `out [rows, hidden]`.
+#[allow(clippy::too_many_arguments)]
+pub fn lconv(
     rt: &Arc<GpuRuntime>,
     x: &GpuBuffer,
     w: &GpuBuffer,
@@ -923,26 +1059,51 @@ pub fn dwconv1d_causal(
     clips: &ClipTable,
     hidden: u32,
     taps: u32,
+    spec: &Lconv<'_>,
 ) -> Result<(), String> {
-    const E: &str = "embedgemma2_audio::dwconv1d_causal";
-    if hidden == 0 || taps == 0 {
-        return Err(format!("{E}: need hidden > 0 and taps > 0"));
+    const E: &str = "embedgemma2_audio::lconv";
+    if hidden == 0 || hidden > MAX_HIDDEN || taps == 0 || !(spec.eps > 0.0 && spec.eps.is_finite()) {
+        return Err(format!(
+            "{E}: need 1 <= hidden <= {MAX_HIDDEN}, taps > 0 and eps > 0 (got {hidden}, {taps}, {})",
+            spec.eps
+        ));
     }
     check_table(rt, clips, E)?;
-    let n = elems(&[clips.rows as u32, hidden], E)?;
-    require::<f32>(rt, x, n, "dwconv x")?;
-    require::<f32>(rt, out, n, "dwconv out")?;
-    require::<f32>(rt, w, elems(&[hidden, taps], E)?, "dwconv w")?;
-    require_disjoint_writes(E, &[("out", out)], &[("x", x), ("w", w), ("clips", &clips.buffer)])?;
-    let p = rt.pipeline("eg2a_dwconv1d_causal")?;
-    let groups_x = clips.max_rows() * (hidden as usize).div_ceil(32);
-    dispatch_2d_tg(rt, &p, groups_x, clips.clips.len(), 32, |bnd| {
+    let rows = clips.rows as u32;
+    require::<f32>(rt, x, elems(&[rows, hidden, 2], E)?, "lconv x")?;
+    require::<f32>(rt, out, elems(&[rows, hidden], E)?, "lconv out")?;
+    require::<f32>(rt, w, elems(&[hidden, taps], E)?, "lconv w")?;
+    require::<f32>(rt, spec.norm_weight, hidden as usize, "lconv norm weight")?;
+    require_disjoint_writes(
+        E,
+        &[("out", out)],
+        &[
+            ("x", x),
+            ("w", w),
+            ("norm_weight", spec.norm_weight),
+            ("clips", &clips.buffer),
+        ],
+    )?;
+    let p = rt.pipeline("eg2a_lconv")?;
+    let tptg = reduce_tptg(p.maxTotalThreadsPerThreadgroup(), hidden as usize);
+    let params = bytes(&[
+        hidden,
+        taps,
+        word(spec.eps),
+        word(spec.glu.lo),
+        word(spec.glu.hi),
+        word(spec.pre.lo),
+        word(spec.pre.hi),
+        word(spec.post.lo),
+        word(spec.post.hi),
+    ]);
+    dispatch_2d_tg(rt, &p, clips.max_rows(), clips.clips.len(), tptg, |bnd| {
         set_gpu_buf(bnd, x, 0);
         set_gpu_buf(bnd, w, 1);
-        set_gpu_buf(bnd, out, 2);
-        set_gpu_buf(bnd, &clips.buffer, 3);
-        set_u32(bnd, hidden, 4);
-        set_u32(bnd, taps, 5);
+        set_gpu_buf(bnd, spec.norm_weight, 2);
+        set_gpu_buf(bnd, out, 3);
+        set_gpu_buf(bnd, &clips.buffer, 4);
+        bnd.bind_bytes(&params, 5);
     })
 }
 
@@ -957,6 +1118,10 @@ pub struct AttentionSpec {
     /// `ln(1 + e) / ln 2`.
     pub k_scale: f32,
     pub cap: f32,
+    /// `attention_invalid_logits_value`, the logit of a masked slot. It must
+    /// be at most `-(cap + 104)`, so that every masked slot's softmax weight
+    /// is exactly 0 beside any unmasked one (the real value is `-1e9`); the
+    /// kernel relies on that and does not read it.
     pub invalid: f32,
     /// Output clamps of the q, k and v projections, applied as the kernel
     /// loads them, and the input clamp of the output projection, applied as
@@ -965,11 +1130,23 @@ pub struct AttentionSpec {
     pub k: Clamp,
     pub v: Clamp,
     pub out: Clamp,
+    /// Elements between the rows of `q`, `k` and `v`, and the column each
+    /// starts at: `heads * head_dim` and 0 for three buffers of their own,
+    /// `3 * heads * head_dim` and `0, h, 2h` (`h = heads * head_dim`) for one
+    /// fused q|k|v projection passed three times.
+    pub stride: u32,
+    pub q_off: u32,
+    pub k_off: u32,
+    pub v_off: u32,
 }
+
+/// Past frames the attention kernel carries partial logits for
+/// (`EGA_MAX_PAST`).
+const MAX_PAST: u32 = 16;
 
 /// The chunked local relative-position attention of `Gemma4AudioAttention`
 /// after its projections, for every clip; see `kernels/embedgemma2_audio.metal`
-/// (`eg2a_attn`) for the exact rule. `q`, `k`, `v`, `out [rows, heads *
+/// (`eg2a_attn`) for the exact rule. `q`, `k`, `v` (read at the spec's stride and offsets), `out [rows, heads *
 /// head_dim]`; `rel [ctx / 2 + 1, heads * head_dim]` is `relative_k_proj` of
 /// [`rel_position_table`]; `q_mult [head_dim]` is `head_dim^-0.5 / ln 2 *
 /// softplus(per_dim_scale)`; `omask [rows]` (u32 0/1) is the tower's mask.
@@ -994,19 +1171,32 @@ pub fn attention(
         || spec.head_dim > MAX_HEAD_DIM
         || spec.chunk == 0
         || spec.past == 0
+        || spec.past > MAX_PAST
         || ctx > MAX_CTX
         || ctx + 2 < spec.chunk + rel_rows
         || !(spec.cap > 0.0 && spec.cap.is_finite())
         || !(spec.k_scale.is_finite() && spec.invalid.is_finite())
+        || spec.invalid > -(spec.cap + 104.0)
     {
         return Err(format!("{E}: unsupported shape or constants {spec:?}"));
     }
     check_table(rt, clips, E)?;
     let hidden = spec.heads * spec.head_dim;
     let n = elems(&[clips.rows as u32, hidden], E)?;
-    for (b, name) in [(q, "q"), (k, "k"), (v, "v"), (out, "out")] {
-        require::<f32>(rt, b, n, name)?;
+    // Each of q, k, v is read at `row * stride + off + column`.
+    let n_in = elems(&[clips.rows as u32, spec.stride], E)?;
+    for (off, name) in [(spec.q_off, "q"), (spec.k_off, "k"), (spec.v_off, "v")] {
+        if u64::from(off) + u64::from(hidden) > u64::from(spec.stride) {
+            return Err(format!(
+                "{E}: {name} at column {off} of {hidden} does not fit a row stride of {}",
+                spec.stride
+            ));
+        }
     }
+    for (b, name) in [(q, "q"), (k, "k"), (v, "v")] {
+        require::<f32>(rt, b, n_in, name)?;
+    }
+    require::<f32>(rt, out, n, "out")?;
     require::<f32>(rt, rel, elems(&[rel_rows, hidden], E)?, "rel")?;
     require::<f32>(rt, q_mult, spec.head_dim as usize, "q_mult")?;
     require::<u32>(rt, omask, clips.rows, "omask")?;
@@ -1033,7 +1223,6 @@ pub fn attention(
         ctx,
         word(spec.k_scale),
         word(spec.cap),
-        word(spec.invalid),
         word(spec.q.lo),
         word(spec.q.hi),
         word(spec.k.lo),
@@ -1042,6 +1231,10 @@ pub fn attention(
         word(spec.v.hi),
         word(spec.out.lo),
         word(spec.out.hi),
+        spec.stride,
+        spec.q_off,
+        spec.k_off,
+        spec.v_off,
     ]);
     dispatch_2d_tg(
         rt,
@@ -1080,6 +1273,23 @@ struct Linear {
     bounds: Bounds,
 }
 
+/// The attention's q, k and v projections: three clipped linears over one
+/// input.
+struct Qkv {
+    /// q's, k's and v's bounds.
+    bounds: [Bounds; 3],
+    w: QkvWeights,
+}
+
+enum QkvWeights {
+    /// One `[hidden, 3 * hidden]` weight (q | k | v): the input clamps are
+    /// equal, so one clamped copy of the normed input feeds one GEMM.
+    Fused(Tensor),
+    /// Three `[hidden, hidden]` weights, for input clamps that differ: each
+    /// reads its own clamped copy.
+    Split([Tensor; 3]),
+}
+
 struct Ffn {
     pre_norm: GpuBuffer,
     post_norm: GpuBuffer,
@@ -1093,9 +1303,7 @@ struct Layer {
     norm_pre_attn: GpuBuffer,
     norm_post_attn: GpuBuffer,
     norm_out: GpuBuffer,
-    q: Linear,
-    k: Linear,
-    v: Linear,
+    qkv: Qkv,
     post: Linear,
     /// `relative_k_proj(table)`, `[rel_rows, hidden]`.
     rel: GpuBuffer,
@@ -1125,47 +1333,53 @@ pub struct EmbedGemma2Audio {
     output_proj: Tensor,
     output_bias: GpuBuffer,
     embed_proj: Tensor,
+    /// Some layer's q, k and v have different input clamps, so the forward
+    /// keeps three projection outputs and three clamped inputs.
+    split_qkv: bool,
     /// Which [`AudioStage`]s a forward runs (all, unless a profiler narrowed it).
     stage_mask: AtomicU32,
 }
 
 /// One dispatch group of the forward, so a profiler can run a stage alone or
 /// leave it out ([`EmbedGemma2Audio::set_stage_mask`]). A fused dispatch
-/// belongs to the stage that names its main work.
+/// belongs to the stage named for its main work, and says what else it does.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u32)]
 pub enum AudioStage {
     SubConv0,
     SubConv1,
     InputProj,
+    /// The first feed-forward's pre-norm (the second's is in `LconvResid`).
     FfnNormPre,
     FfnUp,
     FfnAct,
     FfnDown,
+    /// The feed-forward's post-norm and residual add, and the norm after it:
+    /// the attention norm (into q's, k's and v's clamped inputs) after the
+    /// first feed-forward, `norm_out` after the second.
     FfnNormPost,
-    AttnNorm,
-    QkvClamp,
     QkvGemm,
     Attention,
     AttnOutGemm,
+    /// The attention's post-norm and residual add, and the light conv's
+    /// pre-norm.
     AttnNormPost,
-    LconvNorm,
     LconvStart,
-    Glu,
-    Dwconv,
-    LconvConvNorm,
+    /// The GLU, the depthwise conv and the conv norm with its SiLU.
+    Lconv,
     LconvEnd,
+    /// `linear_end`'s output clamp and the residual add, and the second
+    /// feed-forward's pre-norm.
     LconvResid,
-    NormOut,
     OutProj,
+    /// The output bias, and the embedder's weightless norm after it.
     OutBias,
-    EmbedNorm,
     EmbedProj,
 }
 
 impl AudioStage {
     /// Every stage, in forward order.
-    pub const ALL: [AudioStage; 26] = [
+    pub const ALL: [AudioStage; 19] = [
         AudioStage::SubConv0,
         AudioStage::SubConv1,
         AudioStage::InputProj,
@@ -1174,23 +1388,16 @@ impl AudioStage {
         AudioStage::FfnAct,
         AudioStage::FfnDown,
         AudioStage::FfnNormPost,
-        AudioStage::AttnNorm,
-        AudioStage::QkvClamp,
         AudioStage::QkvGemm,
         AudioStage::Attention,
         AudioStage::AttnOutGemm,
         AudioStage::AttnNormPost,
-        AudioStage::LconvNorm,
         AudioStage::LconvStart,
-        AudioStage::Glu,
-        AudioStage::Dwconv,
-        AudioStage::LconvConvNorm,
+        AudioStage::Lconv,
         AudioStage::LconvEnd,
         AudioStage::LconvResid,
-        AudioStage::NormOut,
         AudioStage::OutProj,
         AudioStage::OutBias,
-        AudioStage::EmbedNorm,
         AudioStage::EmbedProj,
     ];
 
@@ -1207,28 +1414,21 @@ impl AudioStage {
             AudioStage::SubConv0 => "subsample conv0+ln+relu",
             AudioStage::SubConv1 => "subsample conv1+ln+relu",
             AudioStage::InputProj => "input_proj GEMM",
-            AudioStage::FfnNormPre => "ffn pre-norm",
+            AudioStage::FfnNormPre => "ffn1 pre-norm",
             AudioStage::FfnUp => "ffn up GEMM (1024->4096)",
             AudioStage::FfnAct => "ffn clamp+silu",
             AudioStage::FfnDown => "ffn down GEMM (4096->1024)",
-            AudioStage::FfnNormPost => "ffn post-norm+resid",
-            AudioStage::AttnNorm => "attn pre-norm",
-            AudioStage::QkvClamp => "q/k/v input clamps",
+            AudioStage::FfnNormPost => "ffn post-norm+resid (+next norm)",
             AudioStage::QkvGemm => "q/k/v GEMMs",
             AudioStage::Attention => "attention",
             AudioStage::AttnOutGemm => "attn out GEMM",
-            AudioStage::AttnNormPost => "attn post-norm+resid",
-            AudioStage::LconvNorm => "lconv pre-norm",
+            AudioStage::AttnNormPost => "attn post-norm+resid (+lconv norm)",
             AudioStage::LconvStart => "lconv start GEMM (1024->2048)",
-            AudioStage::Glu => "lconv glu",
-            AudioStage::Dwconv => "lconv depthwise conv",
-            AudioStage::LconvConvNorm => "lconv conv-norm+silu",
+            AudioStage::Lconv => "lconv glu+dwconv+norm+silu",
             AudioStage::LconvEnd => "lconv end GEMM",
-            AudioStage::LconvResid => "lconv clamp+resid",
-            AudioStage::NormOut => "norm_out",
+            AudioStage::LconvResid => "lconv resid (+ffn2 pre-norm)",
             AudioStage::OutProj => "output_proj GEMM",
-            AudioStage::OutBias => "output bias",
-            AudioStage::EmbedNorm => "embedder rms-norm",
+            AudioStage::OutBias => "output bias (+embedder norm)",
             AudioStage::EmbedProj => "embedding_projection GEMM",
         }
     }
@@ -1296,12 +1496,13 @@ struct Acts {
     x: Tensor,
     /// The norms' outputs, then the attention's and the GLU's.
     n: Tensor,
-    /// A clamped copy of a q/k/v projection's input.
+    /// The attention norm, clamped for q's input (k's and v's are in `tower` and
+    /// `emb`, free until the tail of the forward).
     c: Tensor,
     y: Tensor,
-    q: Tensor,
-    k: Tensor,
-    v: Tensor,
+    /// q, k and v of a split projection (see [`QkvWeights`]); `None` when
+    /// every layer fuses them, which then land in a prefix of `big`.
+    split: Option<[Tensor; 3]>,
     /// The feed-forward's `[rows, 4 * hidden]`; the GLU's input is its
     /// `[rows, 2 * hidden]` prefix.
     big: Tensor,
@@ -1323,6 +1524,25 @@ struct ForwardIo {
     /// With `trace`: the subsample output, each layer's residual, then the
     /// tower output, each `[rows, width]`.
     trace: Vec<Tensor>,
+}
+
+/// A feed-forward's pre-norm: `clip` of the residual stream, the norm, then
+/// the first linear's input clamp.
+fn ffn_pre_norm(f: &Ffn, eps: f32, gc: Clamp) -> RmsNorm<'_> {
+    let mut pre = RmsNorm::new(eps, Some(&f.pre_norm));
+    pre.pre = [gc, Clamp::NONE];
+    pre.post = f.l1.bounds.input;
+    pre
+}
+
+/// A feed-forward's post-norm and residual add (`resid` is the residual
+/// stream, which the pass writes in place).
+fn ffn_post_norm<'a>(f: &'a Ffn, eps: f32, gc: Clamp, scale: f32, resid: &'a GpuBuffer) -> RmsNorm<'a> {
+    let mut post = RmsNorm::new(eps, Some(&f.post_norm));
+    post.pre = [f.l2.bounds.output, gc];
+    post.scale = scale;
+    post.resid = Some(resid);
+    post
 }
 
 impl EmbedGemma2Audio {
@@ -1383,6 +1603,24 @@ impl EmbedGemma2Audio {
             })
         };
 
+        // q, k and v read one tensor, so with equal input clamps (every layer
+        // of the checkpoint) they are one clamped input and one GEMM.
+        let qkv = |base: &str| -> Result<Qkv, String> {
+            let names = ["q_proj", "k_proj", "v_proj"].map(|n| format!("{base}.{n}"));
+            let bounds = [bound(&names[0])?, bound(&names[1])?, bound(&names[2])?];
+            let [wq, wk, wv] = names.map(|n| format!("{n}.linear.weight"));
+            let w = if bounds[0].input == bounds[1].input && bounds[1].input == bounds[2].input {
+                QkvWeights::Fused(ld.linear(&[(&wq, h), (&wk, h), (&wv, h)], h, f32p)?)
+            } else {
+                QkvWeights::Split([
+                    ld.linear(&[(&wq, h)], h, f32p)?,
+                    ld.linear(&[(&wk, h)], h, f32p)?,
+                    ld.linear(&[(&wv, h)], h, f32p)?,
+                ])
+            };
+            Ok(Qkv { bounds, w })
+        };
+
         let ctx = cfg.ctx() as usize;
         let rel_rows = cfg.rel_rows() as usize;
         let table = rel_position_table(h, ctx);
@@ -1410,9 +1648,7 @@ impl EmbedGemma2Audio {
                 norm_pre_attn: ld.norm(&p("norm_pre_attn.weight"), h)?,
                 norm_post_attn: ld.norm(&p("norm_post_attn.weight"), h)?,
                 norm_out: ld.norm(&p("norm_out.weight"), h)?,
-                q: clipped(&p("self_attn.q_proj"), h, h)?,
-                k: clipped(&p("self_attn.k_proj"), h, h)?,
-                v: clipped(&p("self_attn.v_proj"), h, h)?,
+                qkv: qkv(&p("self_attn"))?,
                 post: clipped(&p("self_attn.post"), h, h)?,
                 rel: ld.buf(&relative_keys(&table, &rel_w, rel_rows, h))?,
                 q_mult: ld.buf(&q_mult)?,
@@ -1434,6 +1670,7 @@ impl EmbedGemma2Audio {
         ld.refuse_unread()?;
         le.refuse_unread()?;
         rt.synchronize()?;
+        let split_qkv = layers.iter().any(|l| matches!(l.qkv.w, QkvWeights::Split(_)));
         Ok(Self {
             cfg,
             rt: Arc::clone(rt),
@@ -1446,6 +1683,7 @@ impl EmbedGemma2Audio {
             output_proj,
             output_bias,
             embed_proj,
+            split_qkv,
             stage_mask: AtomicU32::new(AudioStage::MASK_ALL),
         })
     }
@@ -1463,6 +1701,17 @@ impl EmbedGemma2Audio {
     pub fn set_stage_mask(&self, mask: u32) {
         self.stage_mask
             .store((mask & AudioStage::MASK_ALL) | PROFILED, Ordering::Release);
+    }
+
+    /// Layers whose q, k and v run as one fused GEMM on one clamped input
+    /// (their input clamps are equal, as in every layer of the checkpoint);
+    /// the others project each of q, k, v on its own.
+    #[doc(hidden)]
+    pub fn fused_qkv_layers(&self) -> usize {
+        self.layers
+            .iter()
+            .filter(|l| matches!(l.qkv.w, QkvWeights::Fused(_)))
+            .count()
     }
 
     /// Undo [`Self::set_stage_mask`]: every stage, unzeroed activations.
@@ -1638,6 +1887,8 @@ impl EmbedGemma2Audio {
                 4 * h.max(cfg.out_dims as usize)
             ));
         }
+        // `tower` and `emb` also hold k's and v's clamped input, `hidden` wide.
+        let tail_w = (cfg.out_dims as usize).max(h);
         let narrowed = self.stage_mask.load(Ordering::Acquire) & PROFILED != 0;
         let f32s = |shape: &[usize]| {
             if narrowed {
@@ -1653,12 +1904,14 @@ impl EmbedGemma2Audio {
             n: f32s(&[rows, h])?,
             c: f32s(&[rows, h])?,
             y: f32s(&[rows, h])?,
-            q: f32s(&[rows, h])?,
-            k: f32s(&[rows, h])?,
-            v: f32s(&[rows, h])?,
+            split: if self.split_qkv {
+                Some([f32s(&[rows, h])?, f32s(&[rows, h])?, f32s(&[rows, h])?])
+            } else {
+                None
+            },
             big: f32s(&[rows, 4 * h])?,
-            tower: f32s(&[rows, cfg.out_dims as usize])?,
-            emb: f32s(&[rows, cfg.out_dims as usize])?,
+            tower: f32s(&[rows, tail_w])?,
+            emb: f32s(&[rows, tail_w])?,
         })
     }
 
@@ -1708,8 +1961,17 @@ impl EmbedGemma2Audio {
         let (h, rows_u) = (cfg.hidden, rows as u32);
         let (eps, hd) = (cfg.eps, cfg.head_dim());
         let at = |t: &Tensor, cols: u32| t.try_view(&[rows, cols as usize], 0);
-        let (x, n, c, y) = (at(&a.x, h)?, at(&a.n, h)?, at(&a.c, h)?, at(&a.y, h)?);
-        let (q, k, v) = (at(&a.q, h)?, at(&a.k, h)?, at(&a.v, h)?);
+        let (x, n, y) = (at(&a.x, h)?, at(&a.n, h)?, at(&a.y, h)?);
+        // The attention norm, clamped for q's input; a split projection also
+        // has k's and v's (in `tower` and `emb`, free until the tail).
+        let (cq, ck, cv) = (at(&a.c, h)?, at(&a.tower, h)?, at(&a.emb, h)?);
+        // The fused projection's output q | k | v lands in a prefix of `big`;
+        // a split one's in three buffers of their own.
+        let qkv_fused = at(&a.big, 3 * h)?;
+        let split = match &a.split {
+            Some([q, k, v]) => Some([at(q, h)?, at(k, h)?, at(v, h)?]),
+            None => None,
+        };
         let big = at(&a.big, 4 * h)?;
         let big2 = at(&a.big, 2 * h)?;
         let gc = Clamp::symmetric(cfg.gradient_clip);
@@ -1760,13 +2022,9 @@ impl EmbedGemma2Audio {
             gpu_copy(&x, t)?;
         }
 
-        let ffn = |f: &Ffn| -> Result<(), String> {
-            if on(AudioStage::FfnNormPre) {
-                let mut pre = RmsNorm::new(eps, Some(&f.pre_norm));
-                pre.pre = [gc, none];
-                pre.post = f.l1.bounds.input;
-                rms_norm(rt, &x.buffer, &n.buffer, rows_u, h, &pre)?;
-            }
+        // The feed-forward between its norms: the two linears and the clamp,
+        // SiLU and clamp between them.
+        let ffn_mid = |f: &Ffn| -> Result<(), String> {
             if on(AudioStage::FfnUp) {
                 gemm(&n, &f.l1.w, &big, backend)?;
             }
@@ -1780,57 +2038,76 @@ impl EmbedGemma2Audio {
                         pre: f.l1.bounds.output,
                         silu: true,
                         post: f.l2.bounds.input,
-                        add: EwAdd::None,
                     },
                 )?;
             }
             if on(AudioStage::FfnDown) {
                 gemm(&big, &f.l2.w, &y, backend)?;
             }
-            if on(AudioStage::FfnNormPost) {
-                let mut post = RmsNorm::new(eps, Some(&f.post_norm));
-                post.pre = [f.l2.bounds.output, gc];
-                post.scale = cfg.residual_weight;
-                post.resid = Some(&x.buffer);
-                rms_norm(rt, &y.buffer, &x.buffer, rows_u, h, &post)?;
-            }
             Ok(())
         };
 
         for (li, l) in self.layers.iter().enumerate() {
-            ffn(&l.ff1)?;
+            if on(AudioStage::FfnNormPre) {
+                rms_norm(rt, &x.buffer, &n.buffer, rows_u, h, &ffn_pre_norm(&l.ff1, eps, gc))?;
+            }
+            ffn_mid(&l.ff1)?;
+
+            // The first feed-forward's post-norm, then the attention's norm into
+            // the clamped input(s) q, k and v read: one when their clamps are
+            // equal, else one each.
+            let fused = matches!(l.qkv.w, QkvWeights::Fused(_));
+            if on(AudioStage::FfnNormPost) {
+                let mut attn_norm = RmsNorm::new(eps, Some(&l.norm_pre_attn));
+                attn_norm.pre = [gc, none];
+                let mut outs = vec![(&cq.buffer, l.qkv.bounds[0].input)];
+                if !fused {
+                    outs.push((&ck.buffer, l.qkv.bounds[1].input));
+                    outs.push((&cv.buffer, l.qkv.bounds[2].input));
+                }
+                rms_norm_then(
+                    rt,
+                    &y.buffer,
+                    &x.buffer,
+                    rows_u,
+                    h,
+                    &ffn_post_norm(&l.ff1, eps, gc, cfg.residual_weight, &x.buffer),
+                    &NormThen { spec: attn_norm, outs },
+                )?;
+            }
 
             // Attention.
-            if on(AudioStage::AttnNorm) {
-                let mut pre = RmsNorm::new(eps, Some(&l.norm_pre_attn));
-                pre.pre = [gc, none];
-                rms_norm(rt, &x.buffer, &n.buffer, rows_u, h, &pre)?;
-            }
-            for (lin, dst) in [(&l.q, &q), (&l.k, &k), (&l.v, &v)] {
-                if on(AudioStage::QkvClamp) {
-                    ew(
-                        rt,
-                        &n.buffer,
-                        &c.buffer,
-                        rows_u * h,
-                        &Ew {
-                            pre: lin.bounds.input,
-                            silu: false,
-                            post: none,
-                            add: EwAdd::None,
-                        },
-                    )?;
-                }
-                if on(AudioStage::QkvGemm) {
-                    gemm(&c, &lin.w, dst, backend)?;
+            if on(AudioStage::QkvGemm) {
+                match (&l.qkv.w, &split) {
+                    (QkvWeights::Fused(w), _) => gemm(&cq, w, &qkv_fused, backend)?,
+                    (QkvWeights::Split(ws), Some(outs)) => {
+                        for ((src, w), dst) in [&cq, &ck, &cv].into_iter().zip(ws).zip(outs) {
+                            gemm(src, w, dst, backend)?;
+                        }
+                    }
+                    (QkvWeights::Split(_), None) => {
+                        return Err("EmbedGemma2Audio: a split q/k/v projection without its activations".into())
+                    }
                 }
             }
             if on(AudioStage::Attention) {
+                // The fused projection's output is read three times, at q's, k's
+                // and v's columns of its rows.
+                let (q, k, v, stride, offs) = match &split {
+                    Some([q, k, v]) if !fused => (&q.buffer, &k.buffer, &v.buffer, h, [0, 0, 0]),
+                    _ => (
+                        &qkv_fused.buffer,
+                        &qkv_fused.buffer,
+                        &qkv_fused.buffer,
+                        3 * h,
+                        [0, h, 2 * h],
+                    ),
+                };
                 attention(
                     rt,
-                    &q.buffer,
-                    &k.buffer,
-                    &v.buffer,
+                    q,
+                    k,
+                    v,
                     &l.rel,
                     &l.q_mult,
                     &io.omask,
@@ -1844,68 +2121,109 @@ impl EmbedGemma2Audio {
                         k_scale: ((1.0f64 + std::f64::consts::E).ln() / std::f64::consts::LN_2) as f32,
                         cap: cfg.logit_cap,
                         invalid: cfg.invalid_logit,
-                        q: l.q.bounds.output,
-                        k: l.k.bounds.output,
-                        v: l.v.bounds.output,
+                        q: l.qkv.bounds[0].output,
+                        k: l.qkv.bounds[1].output,
+                        v: l.qkv.bounds[2].output,
                         out: l.post.bounds.input,
+                        stride,
+                        q_off: offs[0],
+                        k_off: offs[1],
+                        v_off: offs[2],
                     },
                 )?;
             }
             if on(AudioStage::AttnOutGemm) {
                 gemm(&n, &l.post.w, &y, backend)?;
             }
+
+            // The attention's post-norm, then the light conv's pre-norm.
             if on(AudioStage::AttnNormPost) {
                 let mut post = RmsNorm::new(eps, Some(&l.norm_post_attn));
                 post.pre = [l.post.bounds.output, gc];
                 post.resid = Some(&x.buffer);
-                rms_norm(rt, &y.buffer, &x.buffer, rows_u, h, &post)?;
-            }
-
-            // Light conv.
-            if on(AudioStage::LconvNorm) {
-                let mut pre = RmsNorm::new(eps, Some(&l.lc_pre_norm));
-                pre.post = l.lc_start.bounds.input;
-                rms_norm(rt, &x.buffer, &n.buffer, rows_u, h, &pre)?;
-            }
-            if on(AudioStage::LconvStart) {
-                gemm(&n, &l.lc_start.w, &big2, backend)?;
-            }
-            if on(AudioStage::Glu) {
-                glu(rt, &big2.buffer, &n.buffer, rows_u, h, l.lc_start.bounds.output)?;
-            }
-            if on(AudioStage::Dwconv) {
-                dwconv1d_causal(rt, &n.buffer, &l.lc_conv, &y.buffer, &io.clips, h, cfg.conv_kernel)?;
-            }
-            if on(AudioStage::LconvConvNorm) {
-                let mut cn = RmsNorm::new(eps, Some(&l.lc_conv_norm));
-                cn.pre = [gc, none];
-                cn.silu = true;
-                cn.post = l.lc_end.bounds.input;
-                rms_norm(rt, &y.buffer, &n.buffer, rows_u, h, &cn)?;
-            }
-            if on(AudioStage::LconvEnd) {
-                gemm(&n, &l.lc_end.w, &y, backend)?;
-            }
-            if on(AudioStage::LconvResid) {
-                ew(
+                let mut lc_norm = RmsNorm::new(eps, Some(&l.lc_pre_norm));
+                lc_norm.pre = [none, none];
+                rms_norm_then(
                     rt,
                     &y.buffer,
                     &x.buffer,
-                    rows_u * h,
-                    &Ew {
-                        pre: l.lc_end.bounds.output,
-                        silu: false,
-                        post: none,
-                        add: EwAdd::Residual(&x.buffer),
+                    rows_u,
+                    h,
+                    &post,
+                    &NormThen {
+                        spec: lc_norm,
+                        outs: vec![(&n.buffer, l.lc_start.bounds.input)],
                     },
                 )?;
             }
 
-            ffn(&l.ff2)?;
-            if on(AudioStage::NormOut) {
-                let mut out = RmsNorm::new(eps, Some(&l.norm_out));
-                out.pre = [gc, none];
-                rms_norm(rt, &x.buffer, &x.buffer, rows_u, h, &out)?;
+            // Light conv.
+            if on(AudioStage::LconvStart) {
+                gemm(&n, &l.lc_start.w, &big2, backend)?;
+            }
+            if on(AudioStage::Lconv) {
+                lconv(
+                    rt,
+                    &big2.buffer,
+                    &l.lc_conv,
+                    &n.buffer,
+                    &io.clips,
+                    h,
+                    cfg.conv_kernel,
+                    &Lconv {
+                        eps,
+                        norm_weight: &l.lc_conv_norm,
+                        glu: l.lc_start.bounds.output,
+                        pre: gc,
+                        post: l.lc_end.bounds.input,
+                    },
+                )?;
+            }
+            if on(AudioStage::LconvEnd) {
+                gemm(&n, &l.lc_end.w, &y, backend)?;
+            }
+
+            // `linear_end`'s output clamp and the residual add, then the second
+            // feed-forward's pre-norm.
+            if on(AudioStage::LconvResid) {
+                let mut add = RmsNorm::new(eps, None);
+                add.norm = false;
+                add.pre = [l.lc_end.bounds.output, none];
+                add.resid = Some(&x.buffer);
+                rms_norm_then(
+                    rt,
+                    &y.buffer,
+                    &x.buffer,
+                    rows_u,
+                    h,
+                    &add,
+                    &NormThen {
+                        spec: RmsNorm {
+                            pre: [gc, none],
+                            ..RmsNorm::new(eps, Some(&l.ff2.pre_norm))
+                        },
+                        outs: vec![(&n.buffer, l.ff2.l1.bounds.input)],
+                    },
+                )?;
+            }
+
+            ffn_mid(&l.ff2)?;
+            // The second feed-forward's post-norm, then `norm_out`, in place.
+            if on(AudioStage::FfnNormPost) {
+                let mut norm_out = RmsNorm::new(eps, Some(&l.norm_out));
+                norm_out.pre = [gc, none];
+                rms_norm_then(
+                    rt,
+                    &y.buffer,
+                    &x.buffer,
+                    rows_u,
+                    h,
+                    &ffn_post_norm(&l.ff2, eps, gc, cfg.residual_weight, &x.buffer),
+                    &NormThen {
+                        spec: norm_out,
+                        outs: vec![(&x.buffer, none)],
+                    },
+                )?;
             }
             if let Some(t) = io.trace.get(1 + li) {
                 gpu_copy(&x, t)?;
@@ -1917,33 +2235,28 @@ impl EmbedGemma2Audio {
         if on(AudioStage::OutProj) {
             gemm(&x, &self.output_proj, &tower, backend)?;
         }
+        let emb = at(&a.emb, cfg.out_dims)?;
         if on(AudioStage::OutBias) {
-            ew(
+            // The bias in place on `tower` (the tower's output, traced below),
+            // then the embedder's weightless norm of it.
+            let mut bias = RmsNorm::new(eps, None);
+            bias.norm = false;
+            bias.bias = Some(&self.output_bias);
+            rms_norm_then(
                 rt,
                 &tower.buffer,
                 &tower.buffer,
-                rows_u * cfg.out_dims,
-                &Ew {
-                    pre: none,
-                    silu: false,
-                    post: none,
-                    add: EwAdd::Bias(&self.output_bias, cfg.out_dims),
+                rows_u,
+                cfg.out_dims,
+                &bias,
+                &NormThen {
+                    spec: RmsNorm::new(eps, None),
+                    outs: vec![(&emb.buffer, none)],
                 },
             )?;
         }
         if let Some(t) = io.trace.last() {
             gpu_copy(&tower, t)?;
-        }
-        let emb = at(&a.emb, cfg.out_dims)?;
-        if on(AudioStage::EmbedNorm) {
-            rms_norm(
-                rt,
-                &tower.buffer,
-                &emb.buffer,
-                rows_u,
-                cfg.out_dims,
-                &RmsNorm::new(eps, None),
-            )?;
         }
         if on(AudioStage::EmbedProj) {
             gemm(&emb, &self.embed_proj, &io.soft, backend)?;
@@ -2037,6 +2350,16 @@ mod tests {
                 "\"attention_context_left\":13",
                 "\"attention_context_left\":1",
                 "no past",
+            ),
+            (
+                "\"attention_context_left\":13",
+                "\"attention_context_left\":18",
+                "more past frames than the kernel holds",
+            ),
+            (
+                "\"attention_invalid_logits_value\":-1000000000.0",
+                "\"attention_invalid_logits_value\":-100.0",
+                "a masked logit that is not far enough below",
             ),
             ("\"rms_norm_eps\":1e-06", "\"rms_norm_eps\":0.0", "zero eps"),
             ("\"use_clipped_linears\":true", "\"use_clipped_linears\":1", "non-bool"),

@@ -19,6 +19,7 @@ bin capi_contract 76
 bin check_kernel_ir_planted 6
 bin dialect_lint_script 5
 bin docs_name_real_tools 6
+bin embedgemma2_audio_fixtures 2
 bin gdn_fixtures 11
 bin gdn_gates 22
 bin gdn_state 10
@@ -32,7 +33,7 @@ bin parser_mutation 13
 bin qwen35_config 5
 bin relaxed_predicate 1
 bin safetensors 12
-bin shader_index_arithmetic 21
+bin shader_index_arithmetic 22
 bin icb_flag_env 4
 bin bench_gemm_sweep_metallib 5
 
@@ -44,6 +45,7 @@ exact bench_qwen35_layers_cli a_later_bad_weights_flag_wins_over_nothing_and_a_l
 exact bert_kernels the_config_parser_reads_both_families_and_refuses_what_it_cannot_run the_erfc_reference_matches_known_values
 exact capi_embedgemma2 a_null_model_handle_is_refused_by_every_entry freeing_a_null_handle_is_a_no_op loading_on_a_null_runtime_is_refused_and_leaves_out_null
 exact embedgemma2_kernels attention_reference_matches_transformers config_reads_the_checkpoint config_refuses_what_the_forward_does_not_implement ple_reference_matches_transformers pool_reference_matches_transformers qkv_norm_rope_reference_matches_transformers rope_inv_freq_matches_the_models_tables
+exact embedgemma2_audio_tiny the_bounds_bite
 exact embedgemma2_mm_tiny config_keeps_the_ids_and_the_builders_lay_out_the_processor_ids
 exact embedgemma2_vision_kernels plan_pooling_matches_the_dense_reference
 exact embedgemma2_vision_tiny config_reads_the_checkpoint config_refuses_what_the_forward_does_not_implement
@@ -70,6 +72,7 @@ bins 156
 lib ab_flags::tests:: 10
 lib embedgemma2::tests:: 12
 lib embedgemma2_vision::tests:: 4
+lib embedgemma2_audio::tests:: 8
 lib gemm::coop_tile_select:: 4
 lib json::tests:: 4
 lib parser_mutation:: 15

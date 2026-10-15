@@ -1,0 +1,27 @@
+{
+ "text_config": {
+  "hidden_size": 8
+ },
+ "audio_config": {
+  "hidden_size": 32,
+  "num_hidden_layers": 1,
+  "num_attention_heads": 2,
+  "subsampling_conv_channels": [
+   16,
+   8
+  ],
+  "output_proj_dims": 24,
+  "use_clipped_linears": true,
+  "attention_chunk_size": 12,
+  "attention_context_left": 13,
+  "attention_context_right": 0,
+  "conv_kernel_size": 5,
+  "residual_weight": 0.5,
+  "attention_logit_cap": 5.0,
+  "attention_invalid_logits_value": -1000000000.0,
+  "gradient_clipping": 4.0,
+  "rms_norm_eps": 1e-06,
+  "hidden_act": "silu",
+  "model_type": "gemma4_audio"
+ }
+}

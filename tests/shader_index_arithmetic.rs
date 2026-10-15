@@ -40,6 +40,7 @@ const ENCODER_ATTN: &str = include_str!("../kernels/encoder_attn.metal");
 const ATTN_ROWS_H: &str = include_str!("../kernels/attn_rows.h");
 const EMBED_POOL: &str = include_str!("../kernels/embed_pool.metal");
 const EMBEDGEMMA2_VISION: &str = include_str!("../kernels/embedgemma2_vision.metal");
+const EMBEDGEMMA2_AUDIO: &str = include_str!("../kernels/embedgemma2_audio.metal");
 const MTL_TENSOR: &str = include_str!("../kernels/mtl_tensor.metal");
 const BERT: &str = include_str!("../kernels/bert.metal");
 const QWEN35_TRAIN_STORAGE: &str = include_str!("../kernels/qwen35_train_storage.metal");
@@ -55,6 +56,7 @@ const INSPECTED_KERNELS: &[&str] = &[
     "embed_lookup.metal",
     "embed_pool.metal",
     "embedgemma2_vision.metal",
+    "embedgemma2_audio.metal",
     "encoder_attn.metal",
     "flash_attn_decode.metal",
     "flash_attn_global_h512.metal",
@@ -801,6 +803,46 @@ fn embedgemma2_vision_offsets_are_widened() {
         ("out[(ulong)s * D + c] = acc * scale;", "pooled store"),
     ] {
         require(EMBEDGEMMA2_VISION, needle, what);
+    }
+}
+
+/// The audio tower's kernels address rows of up to 16384 frames, 64 mel
+/// positions and 512 channels (`MAX_FRAMES_PER_FORWARD`, the first conv's
+/// output), so every row base is formed in 64 bits before it is multiplied by
+/// a width, and the clip table is indexed by a widened clip.
+#[test]
+fn embedgemma2_audio_offsets_are_widened() {
+    for (needle, what) in [
+        (
+            "device const uint *c = clips + (ulong)tg.y * EGA_CLIP_WORDS;",
+            "clip table row",
+        ),
+        ("feats[(ulong)(frame0 + (uint)r) * mels + (uint)col]", "frame read"),
+        (
+            "device float *o = out + ((ulong)(mid0 + t1) * mels1 + f1) * channels;",
+            "first conv output row",
+        ),
+        (
+            "device const float *xin = mid + ((ulong)(mid0 + (uint)r1) * mels1 + (uint)f) * c0;",
+            "second conv input row",
+        ),
+        (
+            "device float *o = out + ((ulong)(row0 + t2) * mels2 + f2) * c1;",
+            "second conv output row",
+        ),
+        ("const ulong base = (ulong)row * p.dim;", "norm row"),
+        ("const ulong r = i / hidden;", "GLU row"),
+        ("out[(ulong)(row0 + t) * hidden + ch] = acc;", "depthwise conv store"),
+        ("const ulong col0 = (ulong)h * p.head_dim;", "attention head column"),
+        ("q[(ulong)(row0 + t) * hidden + col0 + d]", "attention query row"),
+        ("k + (ulong)(row0 + (uint)kp) * hidden + col0", "attention key row"),
+        ("rel + (ulong)(j - i) * hidden + col0", "relative key row"),
+        (
+            "device float *o = out + (ulong)(row0 + t) * hidden + col0;",
+            "attention output row",
+        ),
+    ] {
+        require(EMBEDGEMMA2_AUDIO, needle, what);
     }
 }
 

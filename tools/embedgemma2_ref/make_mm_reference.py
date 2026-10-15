@@ -10,7 +10,14 @@ target/embedgemma2_mm_ref/ (override with EMBEDGEMMA2_MM_REF_DIR).
 The inputs are synthetic and deterministic (no downloaded media): two images
 of different sizes and aspect ratios, and two audio clips of different
 lengths. Each runs alone through sentence-transformers (batch size 1), fp32,
-eager attention, on the CPU. The processor's own outputs are saved as the
+on the CPU, with sdpa attention: sentence-transformers' default, and the
+implementation whose audio mask is right. EMBEDGEMMA2_MM_ATTN=eager selects
+eager instead, which in transformers 5.19 inverts the audio tower's chunked
+local-attention mask (create_bidirectional_mask returns a float additive mask
+under eager, and Gemma4AudioAttention.forward fills mask.logical_not(), so
+the visible keys are the ones blanked); tests/embedgemma2_audio_model.rs pins
+that disagreement against an eager directory. Text and vision differ between
+the two only by rounding. The processor's own outputs are saved as the
 model received them, so tessl's towers start from exactly those tensors
 (preprocessing stays the caller's, as tokenization does).
 
@@ -60,6 +67,9 @@ from make_reference import provenance, snapshot  # noqa: E402
 HERE = os.path.dirname(os.path.abspath(__file__))
 OUT = os.environ.get("EMBEDGEMMA2_MM_REF_DIR", os.path.join(HERE, "..", "..", "target", "embedgemma2_mm_ref"))
 SR = 16000
+ATTN = os.environ.get("EMBEDGEMMA2_MM_ATTN", "sdpa")
+if ATTN not in ("sdpa", "eager"):
+    sys.exit(f"EMBEDGEMMA2_MM_ATTN must be sdpa or eager, not {ATTN!r}")
 
 
 def make_image(w, h, seed):
@@ -161,7 +171,7 @@ def main():
                 {"seconds": sec, "seed": s, "sampling_rate": SR}) for n, (sec, s) in enumerate(AUDIOS)]
 
     m32 = SentenceTransformer(path, device="cpu",
-                              model_kwargs={"attn_implementation": "eager", "dtype": torch.float32})
+                              model_kwargs={"attn_implementation": ATTN, "dtype": torch.float32})
     record = []
     with torch.no_grad():
         for kind, n, item, desc in inputs:
@@ -202,7 +212,7 @@ def main():
             print(prefix, record[-1])
 
     del m32
-    m16 = SentenceTransformer(path, device="cpu", model_kwargs={"attn_implementation": "eager"})
+    m16 = SentenceTransformer(path, device="cpu", model_kwargs={"attn_implementation": ATTN})
     with torch.no_grad():
         for kind, n, item, _ in inputs:
             emb, _ = run(m16, item)
@@ -213,6 +223,8 @@ def main():
     with open(os.path.join(OUT, "provenance.json"), "w") as f:
         prov = provenance(path)
         prov["versions"]["pillow"] = importlib.metadata.version("pillow")
+        prov["attn_implementation"] = ATTN
+        prov["generator"] = "tools/embedgemma2_ref/make_mm_reference.py"
         json.dump(prov, f, indent=1)
         f.write("\n")
     print("wrote", OUT)

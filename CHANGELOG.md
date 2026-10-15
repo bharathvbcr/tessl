@@ -71,6 +71,18 @@ All notable changes to `tessl` are recorded here. The format follows
   (fp32, CPU) at 2520 patches: every layer within `3e-5` of its largest
   magnitude, pooled and soft tokens within `1e-4`, batched bit-identical to
   alone. See `docs/embedgemma2.md`.
+- **EmbeddingGemma 2's audio tower and multimodal embedder**
+  (`tessl::embedgemma2_audio`: `AudioConfig`, `EmbedGemma2Audio::{load,
+  encode_audio}`, `kernels/embedgemma2_audio.metal`). The 12-layer conformer
+  (strided-conv subsampling, clipped linears, chunked local attention with
+  Transformer-XL relative positions, light conv) and the 1536 → 512 embedder,
+  exact f32, batched over clips of any length with one host wait. It
+  implements the intended (bool, sdpa) attention mask: transformers 5.19's
+  eager path inverts it (`logical_not()` of a float mask), so
+  `tools/embedgemma2_ref/make_mm_reference.py` now runs sdpa by default
+  (`EMBEDGEMMA2_MM_ATTN=eager` keeps the old references, which disagree from
+  layer 0; text and vision change only by rounding).
+  See `docs/embedgemma2.md`.
 - **Per-entry host reads and writes of the Qwen3.5 parameter table**
   (`Qwen35Model::{read_parameter_host, write_parameter_host,
   read_gradient_host, read_adamw_moment_host, write_adamw_moment_host}`).

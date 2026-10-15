@@ -1383,7 +1383,7 @@ at least 3% faster at T = 1024 and 2048 with no regression at T = 512 or
 decode. It was slower everywhere: the MLP block 1.02x at T = 1 and
 1.05-1.06x at T >= 512, the forward 1.037x at T = 1024 and 1.034x at 2048
 (`--model-forward`, two frozen builds interleaved by
-`bench/paired_bins.sh`). Interior tiles on offset pointers and the 64x64
+`bench_paired --format metrics`). Interior tiles on offset pointers and the 64x64
 tile did no better. Two accumulators per thread double the plain kernel's
 registers, and the saved f32 traffic and dispatch do not pay for that
 (`bench/results/qwen35_fused_swiglu_gemm_m5pro.txt`). Training could not

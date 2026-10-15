@@ -162,16 +162,6 @@ const SHAPES: &[(usize, usize, usize, &str)] = &[
     (1024, 256, 1024, "narrow_n256"),
 ];
 
-fn fill(n: usize, seed: u64) -> Vec<f32> {
-    let mut s = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
-    (0..n)
-        .map(|_| {
-            s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-            ((((s >> 32) as u32) as f64 / u32::MAX as f64) * 2.0 - 1.0) as f32
-        })
-        .collect()
-}
-
 fn run_variant(
     rt: &std::sync::Arc<GpuRuntime>,
     v: &Variant,
@@ -258,8 +248,8 @@ fn main() -> Result<(), String> {
         }
         let a = rt.alloc_tensor_f32(&[m, k])?;
         let b = rt.alloc_tensor_f32(&[k, n])?;
-        a.buffer.write_f32(&fill(m * k, 1));
-        b.buffer.write_f32(&fill(k * n, 2));
+        a.buffer.write_f32(&common::fill(m * k, 1));
+        b.buffer.write_f32(&common::fill(k * n, 2));
         if lanes.split(',').any(|l| l == "bf16") {
             let a_bf = cast_f32_to_bf16(&a)?;
             let b_bf = cast_f32_to_bf16(&b)?;

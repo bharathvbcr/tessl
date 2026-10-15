@@ -19,24 +19,17 @@
 //! disappears shows in the diff too. bench/results/gemm_coop_header_bits_m5pro.txt
 //! records the runs that held the shared-header and walk commits to their
 //! parents' bits.
+mod common;
+
 use std::sync::Arc;
 use tessl::gemm::*;
 use tessl::nn::gemm_i8_dequant;
 use tessl::runtime::{GpuRuntime, PrecisionMode};
 use tessl::tensor::Tensor;
 
-fn fill(n: usize, seed: u64) -> Vec<f32> {
-    let mut s = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
-    (0..n)
-        .map(|_| {
-            s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-            ((((s >> 32) as u32) as f64 / u32::MAX as f64) * 2.0 - 1.0) as f32
-        })
-        .collect()
-}
 fn f32t(rt: &Arc<GpuRuntime>, shape: &[usize], seed: u64) -> Tensor {
     let t = rt.alloc_tensor_f32(shape).unwrap();
-    t.buffer.write_f32(&fill(shape.iter().product(), seed));
+    t.buffer.write_f32(&common::fill(shape.iter().product(), seed));
     t
 }
 fn hash(c: &Tensor, n: usize) -> u64 {
@@ -321,7 +314,7 @@ fn main() {
         (130, 97, 70),
     ] {
         let i8v = |len: usize, s: u64| -> Vec<u8> {
-            fill(len, s)
+            common::fill(len, s)
                 .iter()
                 .map(|&x| ((x * 127.0).round() as i8) as u8)
                 .collect()

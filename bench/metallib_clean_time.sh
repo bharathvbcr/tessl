@@ -5,10 +5,10 @@
 #
 #   bench/metallib_clean_time.sh BUILD_SCRIPT_BIN MANIFEST_DIR
 #
-# Prints the METRIC lines bench/paired_bins.sh consumes. Build the script with
+# Prints the METRIC lines `bench_paired --format metrics` consumes. Build the script with
 #   rustc --edition 2021 -O MANIFEST_DIR/build.rs -o BUILD_SCRIPT_BIN
-# then pair arms by wrapping this script per arm (paired_bins.sh hands every
-# binary the same ARGS). Pairing a build.rs with a different tree's kernels
+# then pair arms by wrapping this script per arm (one `bench_paired` lane per
+# arm, each `NAME=bench/metallib_clean_time.sh BUILD_SCRIPT_BIN MANIFEST_DIR`). Pairing a build.rs with a different tree's kernels
 # (BUILD_SCRIPT_BIN from one commit, MANIFEST_DIR from another) is the control
 # that separates the build script's change from the kernel sources' change.
 #

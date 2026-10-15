@@ -130,8 +130,8 @@ flowchart TD
 
 ## Performance vs. PyTorch MPS & MLX
 
-Apple M5 Pro, `python3 bench/paired_cross_runtime.py --rounds 5 --lanes torch,mlx`
-against torch 2.13 (MPS) and MLX, re-measured 2026-09-01. The harness interleaves
+Apple M5 Pro, `bench_paired --format rows:shape,backend,gflops` (recipe in
+[docs/benchmarking.md](docs/benchmarking.md)) against torch 2.13 (MPS) and MLX, re-measured 2026-09-01. The harness interleaves
 `tessl` and the baseline round by round so thermal throttling and frequency
 scaling hit both lanes alike — see [Benchmarking](docs/benchmarking.md).
 
@@ -165,7 +165,7 @@ over 50 iterations after 10 warmup:
 > **Benchmarking rigor.**
 > - **Clock drift.** Single-run cross-runtime numbers fluctuate 15–20% on identical
 >   work as the power governor moves. Use the paired sweep
->   (`bench/paired_cross_runtime.py`); for kernel-vs-kernel A/B use
+>   (`bench_paired`, [docs/benchmarking.md](docs/benchmarking.md)); for kernel-vs-kernel A/B use
 >   `bench_gemm_tile_tune` or `bench_gemm_tnnt_tune` behind `TESSL_GEMM_TUNE=1`.
 > - **Dispatch floor.** Below ~2 GFLOP of total work both runtimes sit on a
 >   ~0.25 ms host submit-and-wait floor, which measures driver dispatch latency
@@ -495,20 +495,18 @@ TESSL_GEMM_TUNE=1 cargo run --release --bin bench_gemm_tnnt_tune
 |---|---|
 | `bench_gemm_tile_tune` | Exhaustive tile geometry ($SM \times SN$) and $BK$ ladder benchmark. |
 | `bench_gemm_tnnt_tune` | TN/NT tile sweep; the paired, round-interleaved A/B comparison lane. |
-| `bench_gemm_coop_tile` | Paired, interleaved A/B benchmark for cooperative GEMM tile geometries (128×64 vs 64×64). |
-| `bench_gemm_epi_tile` | Paired, interleaved A/B benchmark for fused epilogue tile geometries (128×64 vs 64×64). |
+| `bench_gemm_coop_tile` | Paired, interleaved A/B benchmark for GEMM tile geometries (128×64 vs 64×64); `--family plain` or `--family epilogue`. |
 | `bench_gemm_sweep` | Cross-runtime sweep (`f32`, `tf32`, `bf16`) with JSON telemetry output. |
 | `bench_nn_kernels` | Throughput of the `nn` library, timed both batched and solo so the dispatch floor is visible rather than hidden. |
 | `bench_qwen35_layers` | `Qwen35Model` prefill, per-layer and decode timings at the 2B's shapes (random or `--weights=DIR`); `--paired-attn` times paired prefill attention. |
 | `bench_qwen35_train` | The training step's time at Qwen3.5-2B's shapes, each activation mode alone; `--batch` times a batch run row by row. |
-| `bench_paired` | Rust round-robin runner for paired benchmark lanes with min-of-N telemetry and per-round ratios. |
+| `bench_paired` | Rust round-robin runner for paired benchmark lanes (JSON workloads, `METRIC` lines, or cross-runtime rows) with per-round ratios, per-lane environment, a drift gate and, with `--evidence`, provenance and atomic publication. |
 | `bench_embedgemma2` | EmbeddingGemma 2 benchmark over ragged workloads, measuring peak device allocation and RSS. |
 | `probe_gdn_scan` | Probe of the gated-delta-net scan; `--paired` times paired 32- vs 16-column slice widths. |
 | `probe_gemm_parity` | Bit-exact verification probe comparing TensorOps against the reference SIMD path. |
 | `probe_gemm_bits` | Hashes every production GEMM entry point's output over a fixed shape grid; diff two builds' output to show a refactor kept every bit. |
 | `probe_storage_memory` | Measures parameter and optimizer memory footprint across Qwen3.5 precision variants. |
 | `probe_load_memory` | Measures model load memory and residency behavior. |
-| `bench/paired_cross_runtime.py` | Python harness driving paired `tessl` vs. PyTorch MPS / MLX evaluation. |
 
 ---
 

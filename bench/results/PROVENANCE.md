@@ -45,3 +45,5 @@ relative to its first parent (`ff0d954^1`):
 `bf16_smallm_coop_m5pro.txt` and `splitk_gate_m5pro.txt` also carry the label
 in their own header, and were re-measured on this tree's kernels in
 `bf16_smallm_coop_reconciled_m5pro.txt` and `splitk_par_bf16_m5pro.txt`.
+
+Result files and notes recorded before the gp/w6-benchharness change name `bench/paired_bins.sh`, `bench/paired_qwen35_step.sh`, `bench/paired_cross_runtime.py`, `bench/attn_paired.py` and `bench_gemm_epi_tile`. Those drivers were replaced by `bench_paired` (and `bench_gemm_coop_tile --family epilogue`) in that change; the files keep their original text and schema. `docs/benchmarking.md` ("Paired rounds") lists the `bench_paired` command that replaces each.

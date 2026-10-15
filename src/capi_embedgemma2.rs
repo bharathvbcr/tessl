@@ -80,8 +80,8 @@ pub const TESSL_EMBEDGEMMA2_MAX_PATH_BYTES: u64 = 4096;
 /// What a [`tessl_embedgemma2_load`] pointer holds: the text encoder alone, or
 /// it with both towers.
 enum Engine {
-    Text(EmbedGemma2Model),
-    Multimodal(EmbedGemma2Multimodal),
+    Text(Box<EmbedGemma2Model>),
+    Multimodal(Box<EmbedGemma2Multimodal>),
 }
 
 impl Engine {
@@ -139,7 +139,12 @@ fn load_text(rt: &Arc<GpuRuntime>, dir: &Path) -> Result<Engine, String> {
     let text = read_config_text(&config)?;
     let cfg = EmbedGemma2Config::from_config_json(&text).map_err(|e| format!("{}: {e}", config.display()))?;
     let st = SafeTensors::open(&dir.join("model.safetensors"))?;
-    Ok(Engine::Text(EmbedGemma2Model::load(rt, &st, TEXT_PREFIX, cfg)?))
+    Ok(Engine::Text(Box::new(EmbedGemma2Model::load(
+        rt,
+        &st,
+        TEXT_PREFIX,
+        cfg,
+    )?)))
 }
 
 /// The body of both load entries: the arguments checked, the snapshot
@@ -280,7 +285,9 @@ pub unsafe extern "C" fn tessl_embedgemma2_load_multimodal(
             err_len,
             |rt, dir| {
                 let operands = parse_operands(operands, WHAT)?;
-                Ok(Engine::Multimodal(EmbedGemma2Multimodal::load(rt, dir, operands)?))
+                Ok(Engine::Multimodal(Box::new(EmbedGemma2Multimodal::load(
+                    rt, dir, operands,
+                )?)))
             },
         )
     }

@@ -238,7 +238,8 @@ Measured on an M5 Pro against the real checkpoint, paired and interleaved
   time (1.2x to 2.9x faster) in the default runtime, uniform and ragged
   workloads alike. The loader's peak physical footprint fell from 1156 MB to
   871 MB (77d8732) and 845 MB (0055612). The device peak of the single-forward
-  workloads rose 29 % (1283 to 1652 MiB at 8x1024). Numbers:
+  workloads rose 29 % (1283 to 1652 MiB at 8x1024; "The device-peak rise,
+  isolated" below says why). Numbers:
   `embedgemma2_before_after_m5pro.txt`, `embedgemma2_load_footprint_m5pro.txt`.
 * **One host wait per `encode`.** The forwards of one `encode` are queued back
   to back and the host waits once; each keeps its own small ids, lengths,
@@ -264,6 +265,29 @@ Measured on an M5 Pro against the real checkpoint, paired and interleaved
   (`set_serialized_dispatch`, a reference mode in which every dispatch
   commits and waits; the tests use it as the oracle that queuing changes no
   bit).
+* **Where a forward's time goes** (`profile_embedgemma2`,
+  `embedgemma2_stage_profile_m5pro.txt`; a replica of `forward` that is bit-equal
+  to `encode`, stages timed alone in async mode, min over three passes, about
+  +-10 %). Exact-f32 GEMMs are 52-88 % of a forward (gate|up alone 14-32 %), and
+  run at 75-98 % of the 7.4 TFLOP/s a 4096^3 f32 GEMM reaches, so they are
+  compute-bound; the same shapes with bf16 operands run 3.8-4.6x faster at
+  >= 2048 rows (1.9-2.2x at 16 rows). Attention is 3.5 % of a forward at 32
+  tokens per sequence and 24 % / 43 % at 8x1024 / 2x4096 (the four global layers
+  alone are 27 % at 2x4096), at the f32 matrix rate. The elementwise stages are
+  10-18 % and already at the bandwidth roofline (190-285 GB/s), so only fusing
+  them helps. At 16 rows the down, o and per-layer-input GEMMs reach 17-22 % of
+  the copy bandwidth where gate|up reaches 84 %.
+* **The device-peak rise, isolated.** One activation set is 736 MiB at 8192 rows
+  against 576 MiB at 2a7cb8b (+160: the per-layer-input run buffer is +240, the
+  packed gate|up and the dropped normed-V buffer save 80). The table above
+  doubles it: `encode` drops its activations after its last wait, the pool
+  recycles them at the next commit, and the next `encode` allocates first, so
+  two sets are live (1472 MiB; 736 with an `rt.synchronize()` between calls). The
+  bench's three rows at 32x256 / 8x1024 / 2x4096 are one number: the peak
+  restarts from the freelist cache of the workloads before it
+  (1652.4 = 436.3 cached + 2 x 608.1). `set_ple_run_bytes(16 MiB)` takes 240 MiB
+  off each set at no measurable time (encode 32x256 +5 %, 8x1024 -2 %, inside the
+  noise).
 * **`segment_mean_rows`** stays serial: it is under 0.2 % of an encode on
   every workload (`embedgemma2_segment_mean_share_m5pro.txt`).
 * **No bf16 attention output.** `encoder_attn` writes f32 only; the `out_bf16`

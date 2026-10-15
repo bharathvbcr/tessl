@@ -13,7 +13,7 @@
 //! bench_gemm_routes, bench_gemm_sweep, bench_gemm_tile_tune,
 //! bench_gemm_tnnt_tune, bench_gemm_variants, bench_nn_kernels, bench_paired,
 //! bench_qwen35_layers, bench_qwen35_train, probe_gdn_scan, probe_gemm_bits,
-//! probe_gemm_parity, probe_load_memory.
+//! probe_gemm_parity, probe_load_memory, profile_embedgemma2.
 //!
 //! Not a `src/bin/*.rs` file: cargo would build it as its own binary. A
 //! directory without `main.rs` is not a target, which is the same trick

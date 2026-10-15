@@ -7,6 +7,10 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 
+# Every step that does not run is named here and in the last line, so a run with skips
+# never ends with the same words as a run that checked everything.
+SKIPS=()
+
 echo "==> fmt"
 cargo fmt --all --check
 
@@ -54,6 +58,20 @@ fi
 # -k host_contract selects both the parser self-test and the src/qwen35.rs binds/constants case.
 "$ORACLE_PY" tools/msl_emu/check_qwen35.py -k host_contract
 
+echo "==> emulator kernel cases (CI: kernel-emulator job; exact math, whole model, fast-math bounds)"
+# The same three runs as the hosted job's non-sanitizer steps. A case added here but never run
+# locally is how a wave-7 tolerance first failed on main, so they run by default. They take long
+# on a loaded machine; TESSL_CI_SKIP_EMULATOR=1 skips them, and the last line says so.
+if [[ "${TESSL_CI_SKIP_EMULATOR:-}" == 1 ]]; then
+  echo "SKIPPED: emulator kernel cases (TESSL_CI_SKIP_EMULATOR=1)"
+  SKIPS+=("emulator kernel cases")
+else
+  EMU_OUT="$ROOT/target/msl_emu"
+  MSL_EMU_OUT="$EMU_OUT/exact" "$ORACLE_PY" tools/msl_emu/check_qwen35.py
+  MSL_EMU_OUT="$EMU_OUT/exact" "$ORACLE_PY" tools/msl_emu/check_qwen35_model.py
+  MSL_EMU_OUT="$EMU_OUT/fast" "$ORACLE_PY" tools/msl_emu/check_qwen35.py --fast-math
+fi
+
 echo "==> parity harness, host-only (adversarial scorer, ladder and evidence contracts)"
 # Needs numpy, which the oracle environment carries. A non-zero exit (any assertion failure,
 # or a required section that did not run) stops the script; GPU sections are skipped visibly.
@@ -72,6 +90,7 @@ if [[ -n "${MAC_HEAVY_LABEL:-}" ]]; then
   "$ORACLE_PY" -m unittest discover -s python/tests -v
 else
   echo "SKIPPED: python/tests GPU tests (MAC_HEAVY_LABEL unset; rerun under tools/mac_heavy.sh to run them)"
+  SKIPS+=("python/tests GPU tests")
 fi
 
 echo "==> test (release, serialized, every binary even after a failure)"
@@ -92,7 +111,8 @@ cargo run --release --example epilogue_cost
 
 echo "==> release-ready gate (requires clean tree + version triad)"
 if [[ -n "$(git status --porcelain)" ]]; then
-  echo "note: skipping check_release_ready.sh while tree is dirty"
+  echo "SKIPPED: check_release_ready.sh (tree is dirty)"
+  SKIPS+=("release-ready gate")
 else
   ./scripts/check_release_ready.sh
 fi
@@ -101,4 +121,9 @@ if [[ "$TEST_FAILED" -ne 0 ]]; then
   echo "ci:local FAILED: one or more cargo test binaries failed (see the full run above)" >&2
   exit 1
 fi
-echo "ci:local OK"
+if [[ ${#SKIPS[@]} -gt 0 ]]; then
+  joined=$(printf '%s; ' "${SKIPS[@]}")
+  echo "ci:local OK WITH SKIPS (not run: ${joined%; })"
+else
+  echo "ci:local OK"
+fi

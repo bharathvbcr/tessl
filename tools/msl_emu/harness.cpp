@@ -105,8 +105,7 @@ int main(int argc, char **argv) {
                     PREFIX_ATTN_SGT, PREFIX_DECODE_CHUNK, PREFIX_DECODE_R);
         return 0;
     }
-    // A barrier deadlock is a failure, not a hang.
-    alarm(600);
+    emu::start_watchdog();
     dir = argv[1];
     std::ifstream pf(dir + "/params.txt");
     std::string line;

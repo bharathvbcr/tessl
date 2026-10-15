@@ -95,16 +95,40 @@ void tg_static_probe() {
     }
 }
 
+// Healthy but slow: four barrier phases a second apart. Run with
+// MSL_EMU_STALL_S=1 and a run longer than that, it must pass, because each
+// phase moves the watchdog's progress count.
+void slow() {
+    launch(uint3(1, 1, 1), uint3(64, 1, 1), 0, [&](const Ids &id, float *) {
+        for (int r = 0; r < 4; ++r) {
+            if (id.lid == 0) std::this_thread::sleep_for(std::chrono::milliseconds(700));
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+    });
+}
+
+// A real deadlock: lane 0 waits in its simdgroup's barrier for 31 lanes that
+// wait in the threadgroup barrier for lane 0. The watchdog must end it.
+void deadlock() {
+    launch(uint3(1, 1, 1), uint3(64, 1, 1), 0, [&](const Ids &id, float *) {
+        if (id.lid == 0) simdgroup_barrier(mem_flags::mem_threadgroup);
+        else threadgroup_barrier(mem_flags::mem_threadgroup);
+    });
+}
+
 } // namespace
 
 int main(int argc, char **argv) {
-    const char *modes[] = {"tg", "tg_missing", "simd", "simd_missing", "drop", "tg_static"};
+    const char *modes[] = {"tg", "tg_missing", "simd", "simd_missing", "drop", "tg_static", "slow", "deadlock"};
     if (argc != 2 || std::find_if(std::begin(modes), std::end(modes),
                                   [&](const char *m) { return std::strcmp(m, argv[1]) == 0; }) == std::end(modes)) {
-        std::fprintf(stderr, "usage: barrier_probe tg|tg_missing|simd|simd_missing|drop|tg_static\n");
+        std::fprintf(stderr, "usage: barrier_probe tg|tg_missing|simd|simd_missing|drop|tg_static|slow|deadlock\n");
         return 2;
     }
-    if (std::strcmp(argv[1], "drop") == 0) drop();
+    metal::emu::start_watchdog();
+    if (std::strcmp(argv[1], "slow") == 0) slow();
+    else if (std::strcmp(argv[1], "deadlock") == 0) deadlock();
+    else if (std::strcmp(argv[1], "drop") == 0) drop();
     else if (std::strcmp(argv[1], "tg_static") == 0) tg_static_probe();
     else run(argv[1]);
     return 0;

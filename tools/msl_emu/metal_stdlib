@@ -37,6 +37,7 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <chrono>
 #include <thread>
 #include <vector>
 // Pulled in here, before the qualifier macros at the bottom of this file, so no
@@ -208,6 +209,10 @@ namespace emu {
 
 constexpr uint SIMD = 32;
 
+/// Barrier arrivals plus finished kernel threads, so far. Relaxed: it only
+/// tells the watchdog that something moved, and adds no edge TSan could see.
+inline std::atomic<uint64_t> progress{0};
+
 /// A reusable barrier with `std::barrier`'s arrive_and_wait / arrive_and_drop,
 /// built on acq_rel atomics so ThreadSanitizer sees its happens-before edges.
 /// libc++'s `std::barrier` (macOS) synchronises in a way TSan does not model,
@@ -243,6 +248,7 @@ class Barrier {
   private:
     /// Count this thread in; true if it completed the phase.
     bool arrive() {
+        progress.fetch_add(1, std::memory_order_relaxed);
         // acq_rel: the completing arrival acquires every earlier one's writes.
         if (count_.fetch_sub(1, std::memory_order_acq_rel) != 1) return false;
         count_.store(expected_.load(std::memory_order_relaxed), std::memory_order_relaxed);
@@ -285,6 +291,47 @@ inline void fail(const char *msg) {
     std::fprintf(stderr, "msl_emu: %s\n", msg);
     std::fflush(stderr);
     std::abort();
+}
+
+/// A positive whole number of seconds from `name`, or `fallback` when unset.
+inline unsigned env_seconds(const char *name, unsigned fallback) {
+    const char *v = std::getenv(name);
+    if (!v) return fallback;
+    char *end = nullptr;
+    const unsigned long n = std::strtoul(v, &end, 10);
+    if (*v == '\0' || *end != '\0' || n == 0 || n > 86400) {
+        std::fprintf(stderr, "msl_emu: %s=%s is not a whole number of seconds in 1..86400\n", name, v);
+        std::exit(2);
+    }
+    return unsigned(n);
+}
+
+/// A barrier deadlock is a failure, not a hang. A deadlocked group sleeps in
+/// its barriers, so nothing moves: fail once `progress` has stood still for
+/// MSL_EMU_STALL_S seconds (default 300). A wall-clock alarm cannot tell that
+/// from a slow run, and killed healthy cases on a loaded machine. SIGALRM after
+/// MSL_EMU_WALL_S (default 14400) still bounds a run that keeps moving forever.
+inline void start_watchdog() {
+    const unsigned stall = env_seconds("MSL_EMU_STALL_S", 300);
+    alarm(env_seconds("MSL_EMU_WALL_S", 14400));
+    std::thread([stall] {
+        uint64_t seen = progress.load(std::memory_order_relaxed);
+        auto since = std::chrono::steady_clock::now();
+        for (;;) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(200));
+            const uint64_t now = progress.load(std::memory_order_relaxed);
+            const auto t = std::chrono::steady_clock::now();
+            if (now != seen) {
+                seen = now;
+                since = t;
+            } else if (t - since >= std::chrono::seconds(stall)) {
+                char msg[160];
+                std::snprintf(msg, sizeof msg,
+                              "no barrier arrival or thread exit in %u s: a barrier deadlock (MSL_EMU_STALL_S)", stall);
+                fail(msg);
+            }
+        }
+    }).detach();
 }
 
 /// Kernel-scope `threadgroup T name[N];` arrays. The build rewrites each one
@@ -383,6 +430,7 @@ inline void launch(uint3 grid, uint3 tpg, size_t tg_floats,
                         ctx.simd = group.simds[id.sg].get();
                         ctx.lane = id.lane;
                         body(id, tgm.data());
+                        progress.fetch_add(1, std::memory_order_relaxed);
                         // Leave both barriers so an early-returning simdgroup
                         // cannot deadlock the rest; `threadgroup_barrier`
                         // reports it if anyone still needed this thread.

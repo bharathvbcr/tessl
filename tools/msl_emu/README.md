@@ -58,6 +58,12 @@ moves those logits by O(1). Each of those was injected and caught.
   race. Under TSan, `build.sh` first runs `barrier_probe.cpp`, which must run
   clean with each barrier and report a race without it, so neither a barrier
   TSan cannot see nor one that hides a missing barrier gets as far as a kernel.
+- A barrier deadlock fails the case instead of hanging it: a watchdog aborts
+  once no barrier arrival or thread exit has happened for `MSL_EMU_STALL_S`
+  seconds (default 300), and `MSL_EMU_WALL_S` (default 14400) bounds a run that
+  keeps moving. It watches progress, not the clock, so a slow run on a loaded
+  machine passes. `build.sh` holds it to both with `barrier_probe`'s `slow` and
+  `deadlock` modes.
   TSan runs on macOS (Apple clang) and Linux (g++).
 - `harness.cpp` launches each kernel with exactly the grid, threadgroup size
   and threadgroup memory that `src/qwen35.rs` uses. `harness --constants`

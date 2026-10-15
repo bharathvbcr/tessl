@@ -15,8 +15,13 @@
 //!
 //! `BENCH_ITERS` (default 10) and `BENCH_WARMUP` (default 3) are per workload.
 //! Prints one JSON array on stdout, one object per workload: `{workload,
-//! backend, ms_min, ms_median, iters, forwards, weight_mib, device_peak_mib,
+//! backend, ms_min, ms_median, iters, forwards, loaded_mib, device_peak_mib,
 //! peak_footprint_mib}`, the format `bench_paired --format workloads` reads.
+//! `loaded_mib` is the device bytes allocated once the model is loaded (the
+//! weights, the position table and the norms' buffers; no activations).
+//! stderr carries `HASH <workload> <fnv1a64>` per workload, over the bits of
+//! every soft value in call order: two builds with equal hashes produced
+//! bit-identical outputs.
 //!
 //! What is timed: one `encode_images` call from the host's pixel values to the
 //! host's soft tokens: the pixel scaling and upload, every forward, the wait
@@ -93,7 +98,7 @@ fn main() -> Result<(), String> {
     let model = EmbedGemma2VisionModel::load(&rt, &st, cfg)?;
     let backend = "tessl-f32";
     let loaded = rt.current_allocated_bytes();
-    let weight_mib = loaded as f64 / MIB;
+    let loaded_mib = loaded as f64 / MIB;
 
     let mut rows = Vec::new();
     for &n in &counts {
@@ -116,6 +121,15 @@ fn main() -> Result<(), String> {
         {
             return Err(format!("{n} images: image {i}'s soft tokens are empty or not finite"));
         }
+        // FNV-1a over every soft value's bits, images in call order: equal
+        // hashes across two builds are bit-identical outputs.
+        let mut hash = 0xcbf2_9ce4_8422_2325u64;
+        for v in out.soft.iter().flatten() {
+            for byte in v.to_bits().to_le_bytes() {
+                hash = (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3);
+            }
+        }
+        eprintln!("HASH {n}img {hash:016x}");
         for _ in 0..warmup {
             model.encode_images(&batch, false)?;
         }
@@ -128,7 +142,7 @@ fn main() -> Result<(), String> {
         ms.sort_by(f64::total_cmp);
         let device_peak = rt.peak_allocated_bytes().saturating_sub(loaded);
         rows.push(format!(
-            "{{\"workload\":\"{n}img\",\"backend\":\"{backend}\",\"ms_min\":{:.4},\"ms_median\":{:.4},\"iters\":{iters},\"forwards\":{},\"weight_mib\":{weight_mib:.1},\"device_peak_mib\":{:.1},\"peak_footprint_mib\":{:.1}}}",
+            "{{\"workload\":\"{n}img\",\"backend\":\"{backend}\",\"ms_min\":{:.4},\"ms_median\":{:.4},\"iters\":{iters},\"forwards\":{},\"loaded_mib\":{loaded_mib:.1},\"device_peak_mib\":{:.1},\"peak_footprint_mib\":{:.1}}}",
             ms[0],
             ms[ms.len() / 2],
             out.forwards,

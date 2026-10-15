@@ -239,6 +239,8 @@ pub mod mtl_tensor;
 pub mod nn;
 pub mod npy;
 pub mod ops;
+#[cfg(test)]
+mod parser_mutation;
 mod plain;
 pub mod qwen35;
 pub mod qwen35_adamw;

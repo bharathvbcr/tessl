@@ -106,7 +106,7 @@ pub const MAX_IMAGES: usize = 256;
 /// Padded patches (`images * longest`) per forward, and the most real patches
 /// one image may have. Bounds the activations: at this size the widest
 /// buffer, the gate|up projection (`2 * 3072` columns), is 384 MiB, and all of
-/// them about 1.1 GiB. `encode_images` splits a call into as many forwards as
+/// them about 1 GiB (the sum of the activation buffers' sizes). `encode_images` splits a call into as many forwards as
 /// this needs, so it bounds memory, not what a caller may pass.
 pub const MAX_BATCH_PATCHES: usize = 16_384;
 

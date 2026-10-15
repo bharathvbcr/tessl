@@ -479,6 +479,11 @@ fn encode_images_refuses_what_it_cannot_run() {
         let mut nan = Image::new(4, 4, 4, pd, 37);
         nan.pixels[7] = f32::NAN;
         bad_cases.push(("NaN pixel", nan));
+        // More real patches than one forward may hold (the limit is checked
+        // before the positions, which here also run past the 128-row table).
+        let too_many = Image::new(128, 129, 0, pd, 39);
+        let err = model.encode_images(&[too_many.input()], false).unwrap_err();
+        assert!(err.contains("the limit is 16384"), "{err}");
         // A cell past the output length: P = 20 gives 5 cells, and a patch
         // at x = 127 (inside the table) pools to cell 63.
         let mut cell = Image::new(4, 4, 4, pd, 38);

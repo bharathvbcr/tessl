@@ -249,7 +249,9 @@ and any `rope_type` but `axial`).
 **Padding and batching.** Padding patches are a suffix of `(-1, -1)` and never
 reach a real one (keys are masked and the pooler gives them zero hidden state),
 so the host strips them: only a suffix is accepted (anything else is refused),
-and `P` only sizes the pool's output (`P / k²` cells, `k² * (P / k²) == P`, as
+and so is a real patch with one negative coordinate, which transformers would
+treat as real and clamp to 0 (deliberately stricter than the reference). `P`
+only sizes the pool's output (`P / k²` cells, `k² * (P / k²) == P`, as
 `_avg_pool_by_positions` checks). Images of different real-patch counts run in
 one forward padded to the longest, with a per-image length for attention
 (`encoder_attn`, window 0, scale 1.0; its K/V layout `[batch, capacity, heads,
@@ -272,7 +274,7 @@ the kernel sums each cell's rows in patch order.
 | Kernel | File | New? |
 |---|---|---|
 | `vision_qkv_norm_rope_f32` | `kernels/embedgemma2_vision.metal` | new: q/k RMSNorm (`* w`), the two-axis RoPE, the weightless v norm and the K/V store, one simdgroup per (patch, head). Its own kernel, not a mode of `qwen35_attn_qk_norm_rope`: that one rotates a head by one position per token and its row routine is mirrored by the training backward, whose inverse rotation must stay its exact transpose |
-| `vision_pos_embed_add_f32` | same | new: `proj + (x_emb + y_emb)` from the bf16 table, exactly `+0` on padding |
+| `vision_pos_embed_add_f32` | same | new: `proj + (x_emb + y_emb)` from the bf16 table, exactly `+0` on padding. The `+0` guarantee lives here and at the pool's output; the rope kernel does not special-case padding (a zero row rotated by -1 may come out `-0.0`), and its padded q/k/v slots are masked or overwritten by `encoder_attn` |
 | `vision_pool_members_f32` | same | new: the pooler's cell sums, weighted `1/k²`, times `sqrt(hidden)` |
 | weightless RMSNorm | `nn::rms_norm_f32` with a hot `[768]` buffer of ones | reused (the multiply by `1.0` is exact) |
 | attention | `embedgemma2::encoder_attn`, rows kernel `encoder_attn_rows_h64_r4_g16` | reused |
@@ -325,7 +327,7 @@ norms do not bound it), so the layer-15 absolute error of `3e-2` is the same
 **Speed follow-ups, not done.** (1) Attention at 2520 patches runs the scalar
 rows kernel (`encoder_attn_rows_h64_r4_g16`), one simdgroup per query row: about
 17 GFLOP of QK and PV per layer per image at 12 heads (2376 x 2376 x 64 x 4
-flops per head), all through scalar f32.
+flops per head: arithmetic, inferred, not measured), all through scalar f32.
 A tiled TensorOps kernel for head dim 64 (the h256/h512 tiled kernels'
 FlashAttention-2 body with a 64-wide tile) is the next step; no timing was
 taken here. (2) The 16 layers' f32 weights are 600 MiB resident; a bf16

@@ -26,11 +26,6 @@ use std::path::{Path, PathBuf};
 /// fails the audit.
 const PAIR_WINDOW: usize = 12;
 
-/// Kernels this audit deliberately does not check, each with the reason. An
-/// entry whose kernel no longer exists fails the audit, so this cannot rot
-/// into a list of names that once meant something.
-const EXEMPT: &[(&str, &str)] = &[];
-
 /// Where a kernel's geometry came from, and the numbers: `(SM, SN, simdgroups)`
 /// with `None` where the source does not state one.
 type KernelGeom = (Option<usize>, Option<usize>, Option<usize>, String);
@@ -603,29 +598,19 @@ fn audit(tree: &Tree) -> Audit {
         );
     }
 
-    // Every entry point is checked or exempt. Kernels the host selects through
-    // a variable never sit next to a pipeline("literal"), so without this they
-    // would escape the audit entirely.
+    // Every entry point must be reached by a pair. Kernels the host selects
+    // through a variable never sit next to a pipeline("literal"), so without
+    // this they would escape the audit entirely. There is no exemption list: a
+    // kernel this audit cannot check is a kernel it fails on.
     let mut names: Vec<&str> = kt.iter().map(|(k, _)| k.as_str()).collect();
     names.sort_unstable();
     for kern in &names {
-        match EXEMPT.iter().find(|(k, _)| k == kern) {
-            Some((_, why)) if checked.contains(kern) => {
-                say(true, format!("  FAIL  {kern:<44} both checked and EXEMPT ({why}); drop the exemption"))
-            }
-            Some((_, why)) => say(false, format!("  EXEMPT  {kern:<42} {why}")),
-            None if !checked.contains(kern) => say(
-                true,
-                format!("  FAIL  {kern:<44} not checked: no Rust selector pairs it with a TILE_* (anchor it in ANCHORS or EXEMPT it with a reason)"),
-            ),
-            None => {}
-        }
-    }
-    for (kern, _) in EXEMPT {
-        if !names.contains(kern) {
+        if !checked.contains(kern) {
             say(
                 true,
-                format!("  FAIL  {kern:<44} EXEMPT names a kernel that no longer exists"),
+                format!(
+                    "  FAIL  {kern:<44} not checked: no Rust selector pairs it with a TILE_* (anchor it in ANCHORS)"
+                ),
             );
         }
     }
@@ -637,9 +622,8 @@ fn audit(tree: &Tree) -> Audit {
     }
 
     let coverage = format!(
-        "tile geometry: {} kernels, {n_pairs} Rust dispatch pairs; {} exempt",
-        checked.len(),
-        EXEMPT.len()
+        "tile geometry: {} kernels, {n_pairs} Rust dispatch pairs",
+        checked.len()
     );
     report.push_str(&if bad > 0 {
         format!("\nFAIL: {bad} problem(s); {coverage}\n")
@@ -883,7 +867,7 @@ fn dispatch_without_a_tile_geom_fails() {
     assert!(run.report.contains("src/nn.rs:"), "{}", run.report);
 }
 
-/// An EXEMPT entry for a kernel that does not exist must fail rather than rot.
+/// Missing or unverifiable data is an error, never an unaudited row.
 #[test]
 fn geometry_error_rejects_missing_or_unverifiable_data() {
     let kernels = vec![

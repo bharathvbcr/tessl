@@ -778,6 +778,21 @@ def attn_cli_contract():
             print(f"  ok    {label}: exit {r.returncode}, names the cause")
 
 
+def metallib_unavailable(reason, hosted=None):
+    """The metallib cross-check could not run. Locally that is a visible partial
+    skip. On the hosted macOS job (TESSL_HOSTED=1; the runner has Xcode and has
+    just built the metallib) it is a misconfiguration, so it fails instead of
+    reading as a pass."""
+    if hosted is None:
+        hosted = bool(os.environ.get("TESSL_HOSTED"))
+    if hosted:
+        FAILURES.append(f"{reason} (TESSL_HOSTED is set: a skipped cross-check is a failure)")
+        print(f"  FAIL  {reason}; TESSL_HOSTED is set")
+        return None
+    print(f"  SKIP  {reason}")
+    return PartialSkip("compiled metallib cross-check", reason)
+
+
 def coverage_inventory():
     """`kernel_coverage.inventory` -- the kernel census.
 
@@ -872,9 +887,7 @@ def coverage_inventory():
         from kernel_coverage import metallib_symbols
         real = metallib_symbols()
         if real is None:
-            reason = "metal-nm unavailable; metallib cross-check unverified"
-            print(f"  SKIP  {reason}")
-            partial_skip = PartialSkip("compiled metallib cross-check", reason)
+            partial_skip = metallib_unavailable("metal-nm unavailable; metallib cross-check unverified")
         else:
             d = write("kernel void not_a_real_kernel(device float* x) {}\n")
             try:
@@ -889,6 +902,20 @@ def coverage_inventory():
             else:
                 FAILURES.append("a source scan disagreeing with the metallib was accepted")
                 print("  FAIL  metallib disagreement accepted")
+
+        # TESSL_HOSTED turns the metal-nm skip into a failure; without it, a visible skip.
+        before = len(FAILURES)
+        with contextlib.redirect_stdout(io.StringIO()):
+            skipped = metallib_unavailable("probe", hosted=False)
+            failed_quietly = skipped is None or len(FAILURES) != before
+            after_skip = len(FAILURES)
+            hosted_result = metallib_unavailable("probe", hosted=True)
+        if failed_quietly or hosted_result is not None or len(FAILURES) != after_skip + 1:
+            FAILURES.append("metallib_unavailable does not separate a local skip from a hosted failure")
+            print("  FAIL  hosted/local metallib skip policy")
+        else:
+            del FAILURES[after_skip:]
+            print("  ok    a missing metal-nm is a visible skip locally and a failure when TESSL_HOSTED is set")
 
         # The real tree must agree with the union of both declaration forms.
         names, _ = inventory()

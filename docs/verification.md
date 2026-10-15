@@ -45,7 +45,7 @@ flowchart LR
 
     RustLand --> Extractor
     MetalLand --> Extractor
-    Extractor --> Pass["Every entry point checked or exempt<br/>Fails if it examined nothing"]
+    Extractor --> Pass["Every entry point checked<br/>Fails if it examined nothing"]
 ```
 
 Cross-checks, mechanically, the relationship Rust's type system cannot express:
@@ -66,16 +66,15 @@ within 12 lines of it.
 
 It fails closed rather than skipping:
 
-- every entry point in `matmul_tensorops.metal` must be reached by a pair or named
-  in the test's `EXEMPT` with a reason. None is exempt: `matmul2d_tensorops_i8_f32`
-  was, while `src/nn.rs` dispatched it with local `SM`/`SN` constants; it now
-  takes `TILE_COOP_DEFAULT`, and a kernel both checked and exempt fails;
+- every entry point in `matmul_tensorops.metal` must be reached by a pair; there is
+  no exemption list. `matmul2d_tensorops_i8_f32` was exempt in the Python script
+  while `src/nn.rs` dispatched it with local `SM`/`SN` constants; it now takes
+  `TILE_COOP_DEFAULT`;
 - a selector anchor it cannot find (a renamed `coop_kernel`), or one that pairs no
   kernel, fails: a selector it cannot see is a selector it did not check;
 - a `pipeline("...")` call with no `TILE_*` within 12 lines fails, even when its
   kernel is checked through another site;
-- a `*_KERNEL(` invocation it cannot parse, an exemption naming a kernel that no
-  longer exists, and a kernel whose geometry it cannot see each fail the audit;
+- a `*_KERNEL(` invocation it cannot parse, and a kernel whose geometry it cannot see each fail the audit;
 - an audit that parsed no kernels, or checked no Rust dispatch pairs, fails;
 - tessl-arch02 growing its own `matmul_tensorops.metal` fails (it must compile
   tessl's through `DEP_TESSL_KERNELS`); the check is skipped only when the sibling
@@ -85,7 +84,7 @@ Its `PASS` line names what it checked (`cargo test --release --test
 audit_gemm_tiles -- --nocapture clean_tree`):
 
 ```
-PASS: tile geometry: 33 kernels, 34 Rust dispatch pairs; 0 exempt
+PASS: tile geometry: 33 kernels, 34 Rust dispatch pairs
 ```
 
 The counts move whenever a kernel or a dispatch site is added; the test's own
@@ -577,7 +576,7 @@ total          349 passing, 0 failing, 1 ignored
 
 ```
 audit          PASS (re-run at 2972027): tile geometry, 33 kernels, 38 Rust
-               dispatch pairs; 0 exempt. Tile geometry is all it checks (section 1)
+               dispatch pairs. Tile geometry is all it checks (section 1)
 GDN mutations  19 of 19 caught (section 6; 2026-10-06 pass, not re-run at 2972027)
 fault tests    NOT RE-RUN at 2972027. Last recorded: 6 of 6 caught
 ```

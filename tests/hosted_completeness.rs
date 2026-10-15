@@ -1,19 +1,21 @@
-//! ADVERSARIAL REGRESSION TEST (wave-7 hosted-CI tester). This test FAILS on
-//! the current manifest: it lists every omission.
+//! Completeness of `scripts/hosted_tests.txt`: every test that passes with the
+//! Metal device hidden must be selected by it.
 //!
-//! `scripts/hosted_tests.txt` is a hand-kept list, and nothing else notices a
-//! device-free test that is not on it: a new test in a mixed file, a renamed
-//! one, or a whole `src/bin` unit-test binary. Such a test just never runs on
-//! hosted CI. This check derives the truth the way the manifest was derived:
-//! list every test of every test binary cargo builds (integration tests, the
-//! library, and the `src/bin` unit tests), run the ones the manifest does not
-//! select under the same IOKit-denying sandbox, and require that none of them
-//! passes. A test that passes with the device hidden is device-free and
-//! belongs on the manifest.
+//! The manifest is a hand-kept list, and nothing else notices a device-free test
+//! that is not on it: a new test in a mixed file, a renamed one, or a `src/bin`
+//! unit-test binary. Such a test just never runs on hosted CI. This check
+//! derives the truth the way the manifest was derived: list every test of every
+//! test binary cargo builds (integration tests, the library, the `src/bin` unit
+//! tests), run the ones the manifest does not select under the IOKit-denying
+//! sandbox, and require that none of them passes.
 //!
-//! It runs nested `cargo test --no-run` (already built, so a few seconds) and
-//! every binary once under the sandbox (about a minute), so it must not be
-//! listed in the manifest itself: `sandbox-exec` does not nest.
+//! It is `#[ignore]`d and run explicitly, as the `outside` entry of the manifest
+//! (`scripts/hosted_tests.sh --outside`, after the sandboxed step, in ci_local
+//! and in hosted CI): it starts sandboxed children itself and `sandbox-exec`
+//! does not nest, so it cannot be one of the sandboxed entries. It runs only the
+//! unselected tests, by exact name, reusing the binaries cargo already built.
+//! It never runs its own binary, and `TESSL_COMPLETENESS_CHILD` (set on every
+//! child) makes a second level of it refuse to start.
 #![cfg(target_os = "macos")]
 
 use std::collections::BTreeSet;
@@ -40,7 +42,18 @@ fn test_binaries() -> Vec<(String, String, PathBuf)> {
     assert!(out.status.success(), "cargo test --no-run failed");
     let mut found = Vec::new();
     for line in String::from_utf8_lossy(&out.stdout).lines() {
-        if !line.contains("\"compiler-artifact\"") || !line.contains("\"test\":true") {
+        if !line.contains("\"compiler-artifact\"") {
+            continue;
+        }
+        // The test-harness build of a target, not the ordinary build of a bin
+        // (whose `target.test` is also true: running that executes the bench).
+        let in_test_profile = line.find("\"profile\":{").is_some_and(|at| {
+            line[at..]
+                .split('}')
+                .next()
+                .is_some_and(|p| p.contains("\"test\":true"))
+        });
+        if !in_test_profile {
             continue;
         }
         let field = |key: &str| -> Option<String> {
@@ -79,6 +92,7 @@ fn run(exe: &PathBuf, args: &[&str], sandboxed: bool) -> String {
     let out = c
         .current_dir(env!("CARGO_MANIFEST_DIR"))
         .env("TESSL_HOSTED_NO_DEVICE", "1")
+        .env("TESSL_COMPLETENESS_CHILD", "1")
         .args(args)
         .output()
         .expect("run test binary");
@@ -93,8 +107,9 @@ fn selected(all: &BTreeSet<(String, String, String)>) -> BTreeSet<(String, Strin
     for raw in MANIFEST.lines() {
         let f: Vec<&str> = raw.split('#').next().unwrap().split_whitespace().collect();
         match f.as_slice() {
-            ["bin", n] => sel.extend(all.iter().filter(|(k, t, _)| k == "test" && t == n).cloned()),
-            ["lib", prefix] => sel.extend(
+            ["bin", n, _count] => sel.extend(all.iter().filter(|(k, t, _)| k == "test" && t == n).cloned()),
+            ["bins", _count] => sel.extend(all.iter().filter(|(k, _, _)| k == "bin").cloned()),
+            ["lib", prefix, _count] => sel.extend(
                 all.iter()
                     .filter(|(k, _, t)| k == "lib" && t.starts_with(prefix))
                     .cloned(),
@@ -118,25 +133,59 @@ fn selected(all: &BTreeSet<(String, String, String)>) -> BTreeSet<(String, Strin
 }
 
 #[test]
+#[ignore = "run by `scripts/hosted_tests.sh --outside` (the manifest's `outside` entry): it launches sandboxed children, and sandbox-exec does not nest"]
 fn every_device_free_test_is_on_the_hosted_manifest() {
+    assert!(
+        std::env::var_os("TESSL_COMPLETENESS_CHILD").is_none(),
+        "the completeness check started inside one of its own children; refusing to recurse"
+    );
+    let started = std::time::Instant::now();
     let mut all = BTreeSet::new();
-    let mut passing = BTreeSet::new();
+    let mut by_binary = Vec::new();
     for (kind, name, exe) in test_binaries() {
-        for line in run(&exe, &["--list"], false).lines() {
+        let mut names = Vec::new();
+        let t0 = std::time::Instant::now();
+        let listing = run(&exe, &["--list"], false);
+        if t0.elapsed().as_secs() >= 2 {
+            eprintln!("completeness: listing {name} took {:?}", t0.elapsed());
+        }
+        for line in listing.lines() {
             if let Some(t) = line.strip_suffix(": test") {
                 all.insert((kind.clone(), name.clone(), t.to_string()));
+                names.push(t.to_string());
             }
         }
-        for line in run(&exe, &["--test-threads=4"], true).lines() {
-            let ok = line.strip_prefix("test ").and_then(|l| l.strip_suffix(" ... ok"));
-            // A #[should_panic] test prints `name - should panic ... ok`.
-            if let Some(t) = ok.map(|t| t.strip_suffix(" - should panic").unwrap_or(t)) {
-                passing.insert((kind.clone(), name.clone(), t.to_string()));
+        by_binary.push((kind, name, exe, names));
+    }
+    eprintln!("completeness: listed {} tests in {:?}", all.len(), started.elapsed());
+    let sel = selected(&all);
+    assert!(
+        !sel.is_empty(),
+        "the manifest selects nothing; the parser is out of sync with its syntax"
+    );
+    let mut passing = BTreeSet::new();
+    for (kind, name, exe, names) in &by_binary {
+        let unselected: Vec<&String> = names
+            .iter()
+            .filter(|n| !sel.contains(&(kind.clone(), name.clone(), (*n).clone())))
+            .collect();
+        for chunk in unselected.chunks(100) {
+            let mut args = vec!["--test-threads=4", "--exact"];
+            args.extend(chunk.iter().map(|n| n.as_str()));
+            for line in run(exe, &args, true).lines() {
+                let ok = line.strip_prefix("test ").and_then(|l| l.strip_suffix(" ... ok"));
+                // A #[should_panic] test prints `name - should panic ... ok`.
+                if let Some(t) = ok.map(|t| t.strip_suffix(" - should panic").unwrap_or(t)) {
+                    passing.insert((kind.clone(), name.clone(), t.to_string()));
+                }
             }
         }
     }
-    let sel = selected(&all);
-    let omitted: Vec<_> = passing.difference(&sel).collect();
+    eprintln!(
+        "completeness: ran the unselected tests, done at {:?}",
+        started.elapsed()
+    );
+    let omitted: Vec<_> = passing.iter().collect();
     assert!(
         omitted.is_empty(),
         "{} test(s) pass with the Metal device hidden but are not selected by scripts/hosted_tests.txt, \

@@ -1,35 +1,38 @@
 # Device-free cargo tests the hosted macOS job runs (scripts/hosted_tests.sh).
 # Derived by running the whole suite with the Metal device hidden (sandbox-exec denying
 # iokit-open) and keeping what passed; tests/hosted_selection.rs re-checks every `exact`
-# name from source. Kinds: bin NAME | lib FILTER | exact lib|BIN NAME... | ignored BIN NAME.
+# name from source. Kinds: bin NAME COUNT | bins COUNT | lib FILTER COUNT | exact lib|BIN NAME... |
+# ignored BIN NAME | outside BIN NAME. COUNT is the exact number of tests that must run; a
+# drop or an addition fails, and tests/hosted_completeness.rs (run by `outside`) finds the
+# tests this list does not select.
 
 # The sandbox must really hide the device before anything is trusted to run under it.
 ignored hosted_selection hosted_selection_has_no_device
 
 # Whole integration binaries: every test in them is device-free.
-bin audit_gemm_tiles
-bin bench_clip_2048_result
-bin bench_env_validation
-bin bench_paired_cli
-bin build_artifact_contract
-bin capi_contract
-bin check_kernel_ir_planted
-bin dialect_lint_script
-bin docs_name_real_tools
-bin gdn_fixtures
-bin gdn_gates
-bin gdn_state
-bin host_access_ban
-bin hosted_selection
-bin hosted_tests_script
-bin kernel_fast_math
-bin metallib_clean_time_script
-bin npy_hardening
-bin parser_mutation
-bin qwen35_config
-bin relaxed_predicate
-bin safetensors
-bin shader_index_arithmetic
+bin audit_gemm_tiles 17
+bin bench_clip_2048_result 11
+bin bench_env_validation 2
+bin bench_paired_cli 29
+bin build_artifact_contract 2
+bin capi_contract 73
+bin check_kernel_ir_planted 6
+bin dialect_lint_script 5
+bin docs_name_real_tools 6
+bin gdn_fixtures 11
+bin gdn_gates 22
+bin gdn_state 10
+bin host_access_ban 4
+bin hosted_selection 6
+bin hosted_tests_script 9
+bin kernel_fast_math 13
+bin metallib_clean_time_script 18
+bin npy_hardening 4
+bin parser_mutation 13
+bin qwen35_config 5
+bin relaxed_predicate 1
+bin safetensors 12
+bin shader_index_arithmetic 20
 
 # Device-free tests inside mixed files (the rest of each file needs a device).
 exact attention decode_chunk_constant_matches_the_shader every_attention_shader_binds_and_applies_the_fixed_kv_capacity every_rows_kernel_the_host_can_ask_for_exists every_single_query_dispatch_takes_the_kv_split exact_comparison_rejects_one_sided_nan_and_length_mismatch the_head_block_width_always_divides_the_head_count
@@ -52,15 +55,23 @@ exact qwen35_model mamba_ssm_dtype_other_than_float32_is_refused_at_the_config n
 exact qwen35_train loss_curve_bound_ignores_whether_the_f32_held_out_falls
 exact tune_rigs_refuse_missing_variants every_rig_that_flags_drift_exits_3
 
+# Unit tests of the src/bin targets (bench drivers, probes, and bench common::tests):
+# every one of them is device-free. One cargo invocation, counted as a total.
+bins 145
+
 # Library tests.
-lib ab_flags::tests::
-lib embedgemma2::tests::
-lib gemm::coop_tile_select::
-lib json::tests::
-lib parser_mutation::
-lib qwen35::tests::
-lib qwen35_adamw::step_kernel_tests::
-lib runtime::drop_wait_tests::
-lib runtime::timestamp_decode_tests::
-lib safetensors::tests::
+lib ab_flags::tests:: 9
+lib embedgemma2::tests:: 10
+lib gemm::coop_tile_select:: 4
+lib json::tests:: 4
+lib parser_mutation:: 14
+lib qwen35::tests:: 7
+lib qwen35_adamw::step_kernel_tests:: 3
+lib runtime::drop_wait_tests:: 1
+lib runtime::timestamp_decode_tests:: 2
+lib safetensors::tests:: 1
 exact lib cb_replay::tests::allocated_phase_comes_from_mini_execute_not_from_try_allocate cb_replay::tests::api_gap_survey_names_mtl4_and_icb cb_replay::tests::icb_stub_allocate_stays_not_wired cb_replay::tests::ledger_recycles_an_in_flight_slot_instead_of_wedging cb_replay::tests::mark_live_step_advances_ping_pong cb_replay::tests::not_wired_message_names_every_surveyed_gap cb_replay::tests::note_layer_live_replay_is_not_counted_as_a_tape_replay cb_replay::tests::on_gpu_complete_does_not_discard_an_open_recording cb_replay::tests::ping_pong_record_ready_dry_replay cb_replay::tests::try_replay_not_wired_by_default cb_replay::tests::try_replay_ready_not_wired_after_live decode_icb::tests::a_nested_nop_guard_restores_its_parent decode_icb::tests::binder_encode_nop_does_not_cross_thread_boundaries decode_icb::tests::decode_icb_flag_default_off gemm::tests::bf16_parallel_split_k_width_follows_the_threadgroup_count gemm::tests::few_tile_long_k_tn_takes_parallel_partitions gemm::tests::long_k_nn_with_a_large_b_takes_k_partitions gemm::tests::parity_metric_rejects_nonfinite_and_length_mismatch icb_smoke::tests::icb_smoke_flag_default_off nn::tests::static_attention_entry_names_match_the_kernel_naming_scheme runtime::lifetime_event_tests::a_lifetime_event_above_what_was_submitted_is_a_violation runtime::tests::feedback_wait_returns_at_once_when_the_callback_already_ran runtime::tests::feedback_wait_sees_a_failure_reported_from_another_thread runtime::tests::feedback_wait_wakes_on_the_callback_not_on_a_poll_tick runtime::tests::feedback_wait_without_a_callback_gives_up_at_the_limit tensor::contract_tests::bf16_preserves_special_values_and_ties tensor::contract_tests::gpu_matching_bf16_cast_canonicalises_nan_and_flushes_subnormals
+
+# Runs after the sandboxed entries, without the sandbox (it launches sandboxed children
+# itself): every test that passes with the device hidden must be selected above.
+outside hosted_completeness every_device_free_test_is_on_the_hosted_manifest

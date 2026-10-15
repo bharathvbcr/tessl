@@ -36,7 +36,9 @@ const DEVICE_MARKERS: &[&str] = &[
 #[derive(Debug, PartialEq)]
 enum Entry {
     Bin(String),
+    Bins,
     Lib(String),
+    Outside { bin: String, name: String },
     Exact { target: String, names: Vec<String> },
     Ignored { bin: String, name: String },
 }
@@ -49,8 +51,13 @@ fn parse(manifest: &str) -> Vec<Entry> {
         let Some(kind) = f.first() else { continue };
         let at = i + 1;
         out.push(match (*kind, f.len()) {
-            ("bin", 2) => Entry::Bin(f[1].into()),
-            ("lib", 2) => Entry::Lib(f[1].into()),
+            ("bin", 3) if f[2].parse::<usize>().is_ok_and(|n| n > 0) => Entry::Bin(f[1].into()),
+            ("bins", 2) if f[1].parse::<usize>().is_ok_and(|n| n > 0) => Entry::Bins,
+            ("lib", 3) if f[2].parse::<usize>().is_ok_and(|n| n > 0) => Entry::Lib(f[1].into()),
+            ("outside", 3) => Entry::Outside {
+                bin: f[1].into(),
+                name: f[2].into(),
+            },
             ("exact", n) if n >= 3 => Entry::Exact {
                 target: f[1].into(),
                 names: f[2..].iter().map(|s| s.to_string()).collect(),
@@ -184,8 +191,8 @@ fn every_name() -> Vec<(String, String, bool)> {
                     out.push((target.clone(), n, false));
                 }
             }
-            Entry::Ignored { bin, name } => out.push((bin, name, true)),
-            Entry::Bin(_) | Entry::Lib(_) => {}
+            Entry::Ignored { bin, name } | Entry::Outside { bin, name } => out.push((bin, name, true)),
+            Entry::Bin(_) | Entry::Bins | Entry::Lib(_) => {}
         }
     }
     out
@@ -286,11 +293,19 @@ fn the_scanner_flags_a_planted_device_test() {
 
 #[test]
 fn the_manifest_parser_refuses_a_malformed_line() {
-    let result = std::panic::catch_unwind(|| parse("exact tests_only_a_target\n"));
-    assert!(result.is_err(), "a malformed manifest line was accepted");
+    for bad in [
+        "exact tests_only_a_target\n",
+        "bin gdn_gates\n",
+        "bin gdn_gates 0\n",
+        "lib a::\n",
+        "bins\n",
+    ] {
+        let result = std::panic::catch_unwind(|| parse(bad));
+        assert!(result.is_err(), "a malformed manifest line was accepted: {bad:?}");
+    }
     assert_eq!(
-        parse("# comment\n\nbin gdn_gates # trailing\n"),
-        vec![Entry::Bin("gdn_gates".into())]
+        parse("# comment\n\nbin gdn_gates 3 # trailing\nbins 4\n"),
+        vec![Entry::Bin("gdn_gates".into()), Entry::Bins]
     );
 }
 

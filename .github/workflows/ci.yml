@@ -178,12 +178,28 @@ jobs:
         # guard to failing.
         run: scripts/hosted_tests.sh
 
+      - name: Hosted manifest is complete
+        # Every test that passes with the device hidden must be selected by
+        # scripts/hosted_tests.txt, or hosted CI never runs it (a new test in a
+        # mixed file, a src/bin unit test). tests/hosted_completeness.rs lists
+        # every test binary, runs the unselected tests by name under the same
+        # IOKit-denying sandbox and fails on any that passes. It is an `outside`
+        # entry because it starts those sandboxed children itself and
+        # sandbox-exec does not nest.
+        run: scripts/hosted_tests.sh --outside
+
       - name: Parity harness, host-only sections
         # Needs numpy only. The pin is the one tools/msl_emu/requirements.txt
         # already carries for the oracle, so there is a single place to bump it.
         # A non-zero exit (an assertion failure, or a required section that did
         # not run) fails the job; the GPU sections are skipped visibly under
         # --pure and say so.
+        #
+        # TESSL_HOSTED=1: this runner has Xcode and has just built the release
+        # binaries, so a skipped metallib cross-check (no metal-nm, no binary)
+        # is a misconfiguration and fails here instead of reading as a pass.
+        env:
+          TESSL_HOSTED: "1"
         run: |
           python3 -m pip install "$(grep -E '^numpy==' tools/msl_emu/requirements.txt)"
           python3 -I bench/test_parity_harness.py --pure

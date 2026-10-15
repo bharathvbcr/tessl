@@ -27,6 +27,9 @@ echo "==> device-free selection with the device hidden (CI: check job; includes 
 # denies IOKit, every filter guarded to have run tests. Any test in it that opens a device fails.
 ./scripts/hosted_tests.sh
 
+echo "==> hosted manifest completeness (every test that passes with the device hidden is selected)"
+./scripts/hosted_tests.sh --outside
+
 echo "==> MSL dialect lint (CI: kernel-emulator job)"
 python3 tools/msl_emu/dialect_lint.py
 

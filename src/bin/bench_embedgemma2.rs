@@ -24,9 +24,14 @@
 //! return before the GPU finishes it, so the forwards of one `encode` queue
 //! back to back and the host waits once; with it off every dispatch commits
 //! and waits and the forwards cannot overlap. Each object carries
-//! `"async":0|1`. Prints one JSON array on stdout, one object per workload:
-//! `{workload, backend, ms_min, ms_median, iters, async, forwards,
-//! device_peak_mib, peak_footprint_mib}`. `device_peak_mib` is the device's peak allocation
+//! `"async":0|1`. `BENCH_PRECISION=f32|bf16` (default `f32`) picks the
+//! operand precision the model is loaded with
+//! ([`EmbedGemma2Model::load_with`]: `GemmOperands::ExactF32` or `Bf16`); the
+//! object's `backend` says which (`tessl-f32`, `tessl-bf16`) and `weight_mib`
+//! is the model's weight bytes on the device. Prints one JSON array on stdout,
+//! one object per workload: `{workload, backend, ms_min, ms_median, iters,
+//! async, forwards, weight_mib, device_peak_mib, peak_footprint_mib}`.
+//! `device_peak_mib` is the device's peak allocation
 //! during that workload above the loaded model
 //! ([`GpuRuntime::peak_allocated_bytes`]); `peak_footprint_mib` is the
 //! process's lifetime peak physical footprint so far (what `/usr/bin/time -l`
@@ -50,6 +55,7 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 use tessl::embedgemma2::{EmbedGemma2Config, EmbedGemma2Model};
+use tessl::gemm::GemmOperands;
 use tessl::safetensors::SafeTensors;
 use tessl::GpuRuntime;
 
@@ -120,7 +126,13 @@ fn main() -> Result<(), String> {
         Ok(other) => return Err(format!("BENCH_ASYNC={other:?}: expected 0 or 1")),
     };
     rt.set_async_encode(async_encode)?;
-    let model = EmbedGemma2Model::load(&rt, &st, "language_model.", cfg.clone())?;
+    let (operands, backend) = match std::env::var("BENCH_PRECISION").as_deref() {
+        Err(_) | Ok("f32") => (GemmOperands::ExactF32, "tessl-f32"),
+        Ok("bf16") => (GemmOperands::Bf16, "tessl-bf16"),
+        Ok(other) => return Err(format!("BENCH_PRECISION={other:?}: expected f32 or bf16")),
+    };
+    let model = EmbedGemma2Model::load_with(&rt, &st, "language_model.", cfg.clone(), operands)?;
+    let weight_mib = model.weight_bytes() as f64 / MIB;
     let dim = cfg.embedding_dim as usize;
     let loaded = rt.current_allocated_bytes();
 
@@ -152,7 +164,7 @@ fn main() -> Result<(), String> {
         ms.sort_by(f64::total_cmp);
         let device_peak = rt.peak_allocated_bytes().saturating_sub(loaded);
         rows.push(format!(
-            "{{\"workload\":\"{name}\",\"backend\":\"tessl-f32\",\"ms_min\":{:.4},\"ms_median\":{:.4},\"iters\":{iters},\"async\":{},\"forwards\":{},\"device_peak_mib\":{:.1},\"peak_footprint_mib\":{:.1}}}",
+            "{{\"workload\":\"{name}\",\"backend\":\"{backend}\",\"ms_min\":{:.4},\"ms_median\":{:.4},\"iters\":{iters},\"async\":{},\"forwards\":{},\"weight_mib\":{weight_mib:.1},\"device_peak_mib\":{:.1},\"peak_footprint_mib\":{:.1}}}",
             ms[0],
             ms[ms.len() / 2],
             u8::from(async_encode),

@@ -8,6 +8,16 @@ All notable changes to `tessl` are recorded here. The format follows
 
 ### Added
 
+- **A bf16-operand EmbeddingGemma 2** (`EmbedGemma2Model::load_with(.., GemmOperands::Bf16)`,
+  `operands`, `weight_bytes`; `load` stays `ExactF32`, bit-for-bit unchanged).
+  The projections stay bf16 on the device (517 MiB of weights against 778 MiB
+  widened to f32) and all eight GEMMs run bf16 x bf16 with f32 accumulation;
+  the residual stream, norms, attention and pooling stay f32. Held to
+  transformers' bf16 forward (cosine 0.9999 or better against fp32, no worse
+  than its mean) in `tests/embedgemma2_model.rs`, and to an f64 forward over
+  the same bf16 weights in `tests/embedgemma2_tiny.rs`. `encode` does not
+  refuse the runtime's relaxed-f32 switch at `Bf16`, since no f32 GEMM runs.
+  `bench_embedgemma2` takes `BENCH_PRECISION=f32|bf16`.
 - **Per-entry host reads and writes of the Qwen3.5 parameter table**
   (`Qwen35Model::{read_parameter_host, write_parameter_host,
   read_gradient_host, read_adamw_moment_host, write_adamw_moment_host}`).

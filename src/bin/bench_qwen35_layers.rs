@@ -351,7 +351,7 @@ fn run_paired_attn(rt: &Arc<GpuRuntime>, ts: &[usize]) -> Res<()> {
 /// binary round by round.
 fn run_attn_tiles(rt: &Arc<GpuRuntime>, ts: &[usize]) -> Res<()> {
     const WARMUP_ROUNDS: usize = 3;
-    const ROUNDS: usize = 8;
+    const ROUNDS: usize = 9;
     let tiles = qwen35::AttnTile::ALL;
     println!(
         "attn_prefill_with_tile, every tile: batch 1, heads {Q_HEADS}q/{KV_HEADS}kv x {HEAD_DIM}, causal from 0; \

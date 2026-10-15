@@ -358,3 +358,271 @@ fn evidence_publishes_provenance_atomically_and_hashes_every_lane_input() {
     let marker = fs::read_to_string(format!("{}.attempt.json", out_json.display())).unwrap();
     assert!(marker.contains("\"status\": \"published\""), "{marker}");
 }
+
+// ---------------------------------------------------------------------------
+// Adversarial-review regression tests. Tests marked `#[ignore = "KNOWN BREAK"]`
+// pin a defect in the implementation as reviewed (commit 6f9d1f3): they FAIL
+// today (`cargo test --test bench_paired_cli -- --ignored`) and should be
+// un-ignored by the commit that fixes the defect.
+// ---------------------------------------------------------------------------
+
+fn counter_lane(dir: &Path, name: &str, body_after_count: &str) -> PathBuf {
+    let cnt = dir.join(format!("{name}.cnt"));
+    fs::write(&cnt, "0").unwrap();
+    script(
+        dir,
+        name,
+        &format!(
+            "n=$(cat '{c}'); n=$((n+1)); echo $n > '{c}'\n{body_after_count}",
+            c = cnt.display()
+        ),
+    )
+}
+
+#[test]
+fn a_lane_killed_by_a_signal_fails_the_run_and_names_it() {
+    let d = scratch("sigkill");
+    let k = script(&d, "k", "echo METRIC m 1\nkill -9 $$");
+    let ok = metric_bin(&d, "ok", "1");
+    let out = run(&strs(&[
+        "--format",
+        "metrics",
+        &format!("k={}", k.display()),
+        &format!("o={}", ok.display()),
+    ]));
+    assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
+    assert!(stderr(&out).contains("signal"), "{}", stderr(&out));
+    assert!(
+        !stdout(&out).contains("vs base"),
+        "a result was printed: {}",
+        stdout(&out)
+    );
+}
+
+#[test]
+fn non_utf8_lane_output_is_refused() {
+    let d = scratch("nonutf8");
+    let bad = script(&d, "bad", "printf 'METRIC m 1\\n\\377\\376\\n'");
+    let ok = metric_bin(&d, "ok", "1");
+    let out = run(&strs(&[
+        "--format",
+        "metrics",
+        &format!("b={}", bad.display()),
+        &format!("o={}", ok.display()),
+    ]));
+    assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
+    assert!(!stdout(&out).contains("vs base"));
+}
+
+#[test]
+fn a_metric_dropped_in_one_later_round_refuses_the_statistic() {
+    let d = scratch("dropped");
+    let flaky = counter_lane(
+        &d,
+        "flaky",
+        "echo METRIC m 1\nif [ \"$n\" -ne 3 ]; then echo METRIC extra 1; fi",
+    );
+    let ok = script(&d, "ok", "echo METRIC m 1\necho METRIC extra 1");
+    let out = run(&strs(&[
+        "--format",
+        "metrics",
+        "--rounds",
+        "4",
+        &format!("ok={}", ok.display()),
+        &format!("f={}", flaky.display()),
+    ]));
+    assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
+    assert!(
+        stderr(&out).contains("extra") && stderr(&out).contains("round"),
+        "{}",
+        stderr(&out)
+    );
+    assert!(!stdout(&out).contains("vs base"), "partial data produced a number");
+}
+
+#[test]
+fn a_spread_exactly_at_the_limit_passes_and_one_ulp_past_it_exits_3() {
+    // Ratios b/a are 2.0 and 2.2 alternately: max/min is exactly 1.1.
+    let run_with = |hi: &str| {
+        let d = scratch(&format!("bound-{hi}"));
+        let a = metric_bin(&d, "a", "1");
+        let b = counter_lane(
+            &d,
+            "b",
+            &format!("if [ $((n % 2)) -eq 1 ]; then echo METRIC m 2.0; else echo METRIC m {hi}; fi"),
+        );
+        run(&strs(&[
+            "--format",
+            "metrics",
+            "--rounds",
+            "4",
+            "--max-spread",
+            "1.10",
+            &format!("a={}", a.display()),
+            &format!("b={}", b.display()),
+        ]))
+    };
+    let at = run_with("2.2");
+    assert!(at.status.success(), "exactly at the limit must pass: {}", stderr(&at));
+    let past = run_with("2.2000001");
+    assert_eq!(past.status.code(), Some(3), "{}", stderr(&past));
+    assert!(!stdout(&past).contains("vs base"));
+}
+
+#[test]
+fn evidence_paths_with_spaces_and_unicode_publish_and_overwrite_atomically() {
+    let d = scratch("unicode").join("dir \u{fc} \u{65e5}\u{672c}");
+    fs::create_dir_all(&d).unwrap();
+    let (a, b) = (metric_bin(&d, "a", "1"), metric_bin(&d, "b", "2"));
+    let out_path = d.join("e v.json");
+    for _ in 0..2 {
+        let o = run(&strs(&[
+            "--format",
+            "metrics",
+            "--evidence",
+            "--rounds",
+            "4",
+            "--out",
+            out_path.to_str().unwrap(),
+            &format!("a=\"{}\"", a.display()),
+            &format!("b='{}'", b.display()),
+        ]));
+        assert!(o.status.success(), "{}", stderr(&o));
+    }
+    let marker = fs::read_to_string(format!("{}.attempt.json", out_path.display())).unwrap();
+    assert!(marker.contains("\"published\""), "{marker}");
+    let leftovers: Vec<_> = fs::read_dir(&d)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|n| n.starts_with(".e v.json."))
+        .collect();
+    assert!(leftovers.is_empty(), "staging files left behind: {leftovers:?}");
+}
+
+#[test]
+#[ignore = "KNOWN BREAK: a negative METRIC value is accepted and a ratio of two negatives is reported as a result"]
+fn a_negative_metric_is_refused_not_ratioed() {
+    let d = scratch("negmetric");
+    let a = metric_bin(&d, "a", "-1");
+    let b = metric_bin(&d, "b", "-2");
+    let out = run(&strs(&[
+        "--format",
+        "metrics",
+        &format!("a={}", a.display()),
+        &format!("b={}", b.display()),
+    ]));
+    assert!(!out.status.success(), "reported {}", stdout(&out));
+    assert!(!stdout(&out).contains("2.000x"));
+}
+
+#[test]
+#[ignore = "KNOWN BREAK: trailing tokens on a METRIC line are silently dropped (`METRIC x 1 2 3` means x=1)"]
+fn a_metric_line_with_trailing_tokens_is_malformed() {
+    let d = scratch("trailing");
+    let a = script(&d, "a", "echo METRIC m 1 2 3");
+    let b = metric_bin(&d, "b", "2");
+    let out = run(&strs(&[
+        "--format",
+        "metrics",
+        &format!("a={}", a.display()),
+        &format!("b={}", b.display()),
+    ]));
+    assert!(!out.status.success(), "accepted: {}", stdout(&out));
+}
+
+#[test]
+#[ignore = "KNOWN BREAK: no per-lane timeout; a hung lane hangs the run forever (src/bin/bench_paired.rs run_lane uses Command::output)"]
+fn a_hung_lane_is_bounded_by_a_timeout() {
+    let d = scratch("hang");
+    let hang = script(&d, "hang", "exec sleep 40");
+    let ok = metric_bin(&d, "ok", "1");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_bench_paired"))
+        .args(["--format", "metrics"])
+        .arg(format!("h={}", hang.display()))
+        .arg(format!("o={}", ok.display()))
+        .stderr(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let start = std::time::Instant::now();
+    let finished = loop {
+        if let Some(st) = child.try_wait().unwrap() {
+            break Some(st);
+        }
+        if start.elapsed().as_secs() >= 15 {
+            break None;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    };
+    if finished.is_none() {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+    let st = finished.expect("bench_paired was still waiting on a hung lane after 15 s");
+    assert_eq!(st.code(), Some(1));
+}
+
+#[test]
+#[ignore = "KNOWN BREAK: `--rounds=N` / `--out=PATH` are parsed as lanes named `--rounds` / `--out`, though the evidence marker code accepts `--out=`"]
+fn equals_style_options_are_options_or_usage_errors_never_lanes() {
+    let d = scratch("eqopt");
+    let (a, b) = (metric_bin(&d, "a", "1"), metric_bin(&d, "b", "2"));
+    let lanes = [format!("a={}", a.display()), format!("b={}", b.display())];
+    let o = run(&[strs(&["--format", "metrics", "--rounds=3"]), lanes.to_vec()].concat());
+    assert_eq!(
+        o.status.code(),
+        Some(2),
+        "--rounds=3 must be a usage error or work: {}",
+        stderr(&o)
+    );
+    let out_path = d.join("o.json");
+    let o = run(&[
+        strs(&[
+            "--format",
+            "metrics",
+            "--rounds",
+            "2",
+            &format!("--out={}", out_path.display()),
+        ]),
+        lanes.to_vec(),
+    ]
+    .concat());
+    assert!(
+        o.status.success() && out_path.exists(),
+        "--out= ignored or misparsed: {}",
+        stderr(&o)
+    );
+}
+
+#[test]
+#[ignore = "KNOWN BREAK: lane executables are hashed once before round 1; one rewritten mid-run is published under the stale hash"]
+fn evidence_refuses_a_lane_executable_that_changes_between_rounds() {
+    let d = scratch("swap");
+    let swap = d.join("swap");
+    fs::write(&swap, "0").unwrap();
+    let body = format!(
+        "n=$(cat '{c}'); n=$((n+1)); echo $n > '{c}'\n\
+         if [ $n -eq 3 ]; then printf '#!/bin/sh\\necho METRIC m 1\\n# swapped\\n' > '{s}'; fi\necho METRIC m 1",
+        c = d.join("swap.cnt").display(),
+        s = swap.display()
+    );
+    fs::write(d.join("swap.cnt"), "0").unwrap();
+    script(&d, "swap", &body);
+    let ok = metric_bin(&d, "ok", "2");
+    let out_path = d.join("ev.json");
+    let o = run(&strs(&[
+        "--format",
+        "metrics",
+        "--evidence",
+        "--rounds",
+        "4",
+        "--out",
+        out_path.to_str().unwrap(),
+        &format!("a={}", swap.display()),
+        &format!("b={}", ok.display()),
+    ]));
+    assert!(
+        !o.status.success() && !out_path.exists(),
+        "published evidence for a binary that changed mid-run"
+    );
+}

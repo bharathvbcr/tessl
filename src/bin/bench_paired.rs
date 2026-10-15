@@ -1440,4 +1440,98 @@ mod tests {
         assert_eq!((ev.rounds, ev.max_spread), (6, Some(1.10)));
         assert!(parse_args(&args(&["a=x", "a=y"])).is_err(), "duplicate lane name");
     }
+
+    /// Dependency-free xorshift, seeded: the same inputs every run.
+    struct Rng(u64);
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+        fn pick<'a>(&mut self, xs: &[&'a str]) -> &'a str {
+            xs[(self.next() % xs.len() as u64) as usize]
+        }
+    }
+
+    #[test]
+    fn fuzz_lane_specs_never_panic_and_round_trip_the_grammar() {
+        let junk = [
+            "=",
+            ":",
+            ",",
+            "\"",
+            "'",
+            " ",
+            "a",
+            "K",
+            "_",
+            "1",
+            "\u{e9}",
+            "\u{65e5}",
+            "\u{1f600}",
+            "\n",
+            "\t",
+            "x=y",
+            "A:B",
+            "--",
+        ];
+        let mut rng = Rng(0x9e37_79b9_7f4a_7c15);
+        // 1. Arbitrary strings: Ok or Err, never a panic or a lane with nothing to run.
+        for _ in 0..20_000 {
+            let n = rng.next() % 24;
+            let spec: String = (0..n).map(|_| rng.pick(&junk)).collect();
+            if let Ok(l) = parse_lane(&spec) {
+                assert!(!l.name.is_empty() && !l.argv.is_empty(), "{spec:?} -> {l:?}");
+                assert!(l.env.iter().all(|(k, _)| valid_env_name(k)), "{spec:?} -> {l:?}");
+            }
+        }
+        // 2. Specs built from the documented grammar parse to what built them.
+        let names = ["a", "tessl", "mlx-f32", "caf\u{e9}", "\u{65e5}\u{672c}", "n 1", "x.y/z"];
+        let keys = ["K", "BENCH_ITERS", "_x", "A1"];
+        let values = ["", "1", "a b", "1x1,2x2", "a=b", "x:y", "\u{e9}"];
+        let words = ["bin", "--flag", "a=b", "p:q", "/a/b", "x,y", "k=v:w"];
+        for _ in 0..5_000 {
+            let name = rng.pick(&names);
+            let mut env = Vec::new();
+            for _ in 0..(rng.next() % 4) {
+                let k = rng.pick(&keys);
+                if env.iter().any(|(e, _): &(String, String)| e == k) {
+                    continue;
+                }
+                env.push((k.to_string(), rng.pick(&values).to_string()));
+            }
+            let argv: Vec<String> = (0..1 + rng.next() % 4).map(|_| rng.pick(&words).to_string()).collect();
+            let envs = env
+                .iter()
+                .map(|(k, v)| match v.contains([',', '=']) {
+                    true => format!("{k}=\"{v}\""),
+                    false => format!("{k}={v}"),
+                })
+                .collect::<Vec<_>>()
+                .join(",");
+            let spec = if env.is_empty() {
+                format!("{name}={}", argv.join(" "))
+            } else {
+                format!("{name}:{envs}={}", argv.join(" "))
+            };
+            let l = parse_lane(&spec).unwrap_or_else(|e| panic!("{spec:?} refused: {e}"));
+            assert_eq!((l.name.as_str(), &l.env, &l.argv), (name, &env, &argv), "{spec:?}");
+        }
+        // 3. A very long spec is linear, not a panic or a hang.
+        let long = format!("n={}", "w ".repeat(500_000));
+        assert_eq!(parse_lane(&long).unwrap().argv.len(), 500_000);
+        let long_env = format!(
+            "n:{}=bin",
+            (0..50_000).map(|i| format!("K{i}=v")).collect::<Vec<_>>().join(",")
+        );
+        assert_eq!(parse_lane(&long_env).unwrap().env.len(), 50_000);
+    }
+
+    #[test]
+    #[ignore = "KNOWN BREAK: a repeated ENV key in one lane is accepted (last wins, both recorded) instead of refused"]
+    fn a_repeated_env_key_in_one_lane_is_refused() {
+        assert!(parse_lane("x:K=1,K=2=bin").is_err());
+    }
 }

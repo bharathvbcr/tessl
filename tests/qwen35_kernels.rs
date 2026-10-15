@@ -1911,30 +1911,43 @@ fn gdn_gates_kernel_matches_the_transformers_module_golden() {
         .unwrap();
         // The bound is derived per element from an ulp budget over the op chain, not fitted
         // to a run. One ulp is taken as 2^-23 of the value (the worst case; the ulp of a
-        // value is between 2^-24 and 2^-23 relative to it). The kernel-side figures are
-        // Metal's documented accuracies (the kernel's own comments quote fast `exp` as
-        // 3 + floor(2|x|) ulp; precise `exp`/`log` are taken as 3 ulp and the fast divide
-        // as 2.5 ulp, from the MSL spec table, which this test does not re-measure). The
-        // golden side is torch's f32 CPU `exp`/`softplus`/`sigmoid`, budgeted 2/3/3 ulp.
-        // `a + dt_bias` is the same IEEE f32 add on both sides, so it adds nothing.
+        // value is between 2^-24 and 2^-23 relative to it). Each figure and where it
+        // comes from:
+        //
+        //  - fast `exp`: 3 + floor(2|x|) ulp. Sourced: `tools/msl_emu/metal_stdlib:151-155`
+        //    (Metal's documented bound, as the emulator models it), `docs/qwen35.md:397`,
+        //    `kernels/qwen35_act.h:44`.
+        //  - softplus' `1 + e` rounding on the `log` branch (x in [-3, 20]): at most 1.2e-6
+        //    relative. Sourced: `kernels/qwen35_act.h:39-40`. `precise::log` adds half an
+        //    ulp: the same lines. The series branch (x < -3) is exact to f32 (`:38-39`).
+        //  - precise `exp` (inside softplus): 3 ulp, attenuated by at most 1 into the
+        //    result. UNVERIFIED: from the MSL spec, not checked here; the emulator models
+        //    `precise::` as exact (`metal_stdlib:171-175`) and states no ulp figure.
+        //  - the fast divide in the sigmoid, 2.5 ulp; and the multiply / add roundings,
+        //    0.5 ulp each (IEEE, standard). The divide is UNVERIFIED: from the MSL spec,
+        //    not checked here; nothing in the repo states it.
+        //  - the golden's own error, torch's f32 CPU `exp` 2, `softplus` 3, `sigmoid` 3 ulp.
+        //    UNVERIFIED: a budget chosen here, not a torch-documented figure.
+        //  - `a + dt_bias` is the same IEEE f32 add on both sides, so it adds nothing.
         //
         //   g    = -exp(A_log) * softplus(a + dt_bias)
-        //        = fast exp 3+floor(2|A_log|) + golden exp 2 + softplus (precise log branch:
-        //          0.5 rounding of 1+e, 3 log, 3 exp attenuated to <= 3) 6.5 + golden
-        //          softplus 3 + multiply 0.5                 [per head; <= 7 ulp of exp]
+        //        = fast exp 3+floor(2|A_log|) + golden exp 2 + softplus (1.2e-6/2^-23 = 10.3
+        //          for the rounded `1 + e`, + 0.5 log, + 3 precise exp) 13.8 + golden softplus
+        //          3 + multiply 0.5                           [per head]
         //   beta = sigmoid(b): worst at b < 0, where beta = e * r and e = fast exp(-|b|)
         //          enters unattenuated: 3+floor(2|b|) (43 ulp at b = -20) + divide 2.5 +
         //          multiply 0.5 + add 0.5 + golden sigmoid 3  [per element]
         //
-        // At this fixture's worst inputs that is 3+4+2+6.5+3+0.5 = 19 ulp (2.3e-6) for g
+        // At this fixture's worst inputs that is 7+2+13.8+3+0.5 = 26.3 ulp (3.1e-6) for g
         // and 43+6.5 = 49.5 ulp (5.9e-6) for beta. A kernel outside its element's budget is
         // a finding, not a tolerance to loosen.
         let ulp = 2f64.powi(-23);
         let fast_exp_ulps = |x: f32| 3.0 + (2.0 * f64::from(x).abs()).floor();
+        let softplus_kernel_ulps = 1.2e-6 / ulp + 0.5 + 3.0;
         let (got_g, got_beta) = (g.read_f32(), beta.read_f32());
         let n = rows * heads;
         let g_budget: Vec<f64> = (0..n)
-            .map(|i| fast_exp_ulps(a_log[i % heads]) + 2.0 + 6.5 + 3.0 + 0.5)
+            .map(|i| fast_exp_ulps(a_log[i % heads]) + 2.0 + softplus_kernel_ulps + 3.0 + 0.5)
             .collect();
         let beta_budget: Vec<f64> = (0..n).map(|i| fast_exp_ulps(b[i]) + 2.5 + 0.5 + 0.5 + 3.0).collect();
         let mut report = String::new();

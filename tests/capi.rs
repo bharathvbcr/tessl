@@ -2601,53 +2601,61 @@ fn a_call_that_fails_after_encoding_returns_only_after_its_work_completes() {
     src.write_f32(&(0..n).map(|i| i as f32 + 1.0).collect::<Vec<_>>());
     dst.write_f32(&vec![0.0; n]);
     let pipe = rt.pipeline("copy_f32").unwrap();
+    // The destination's bytes without the buffer's own accessors: those wait
+    // for the GPU themselves, which would hide an unfinished copy.
+    let raw = |b: &tessl::tensor::GpuBuffer| -> Vec<f32> {
+        // SAFETY: a shared-storage buffer of `n` f32s that nothing else writes.
+        unsafe { std::slice::from_raw_parts(b.metal().contents().as_ptr().cast::<f32>(), n) }.to_vec()
+    };
+    let encode = |rt: &Arc<GpuRuntime>| {
+        rt.with_binder(|bnd| {
+            bnd.set_pipeline(&pipe);
+            bnd.bind_gpu_buf(&src, 0);
+            bnd.bind_gpu_buf(&dst, 1);
+            bnd.bind_u32(n as u32, 2);
+            bnd.dispatch(
+                tessl::runtime::mtl_size(n / 64, 1, 1),
+                tessl::runtime::mtl_size(64, 1, 1),
+            );
+            Ok(())
+        })
+    };
     let mut err = [0 as c_char; ERR_LEN];
-    let status = unsafe {
-        tessl::capi::test_guarded(handle.0, err.as_mut_ptr(), ERR_LEN, |rt| {
-            rt.with_binder(|bnd| {
-                bnd.set_pipeline(&pipe);
-                bnd.bind_gpu_buf(&src, 0);
-                bnd.bind_gpu_buf(&dst, 1);
-                bnd.bind_u32(n as u32, 2);
-                bnd.dispatch(
-                    tessl::runtime::mtl_size(n / 64, 1, 1),
-                    tessl::runtime::mtl_size(64, 1, 1),
-                );
-                Ok(())
-            })?;
-            Err("refused after encoding".to_string())
-        })
-    };
-    assert_eq!(status, TESSL_ERR);
-    assert!(msg(&err).contains("refused after encoding"), "{}", msg(&err));
-    // The copy ran: the failing call did not return with it uncommitted.
-    let got = dst.read_f32();
-    assert_eq!(got[0], 1.0, "the encoded copy had not run when the call returned");
-    assert_eq!(got[n - 1], n as f32);
-    assert_idle(&rt, "a refused call");
-    assert_eq!(rt.handoff_foreign_signal(), None);
-    // A panic after encoding is waited for too.
-    dst.write_f32(&vec![0.0; n]);
-    let status = unsafe {
-        tessl::capi::test_guarded(handle.0, err.as_mut_ptr(), ERR_LEN, |rt| {
-            rt.with_binder(|bnd| {
-                bnd.set_pipeline(&pipe);
-                bnd.bind_gpu_buf(&src, 0);
-                bnd.bind_gpu_buf(&dst, 1);
-                bnd.bind_u32(n as u32, 2);
-                bnd.dispatch(
-                    tessl::runtime::mtl_size(n / 64, 1, 1),
-                    tessl::runtime::mtl_size(64, 1, 1),
-                );
-                Ok(())
-            })?;
-            panic!("bug after encoding")
-        })
-    };
-    assert_eq!(status, tessl::capi::TESSL_PANIC);
-    assert!(msg(&err).contains("bug after encoding"), "{}", msg(&err));
-    assert_eq!(dst.read_f32()[n - 1], n as f32, "the encoded copy had not run");
-    assert_idle(&rt, "a panicking call");
+    for panics in [false, true] {
+        dst.write_f32(&vec![0.0; n]);
+        let before = rt.last_signaled_value();
+        let status = unsafe {
+            tessl::capi::test_guarded(handle.0, err.as_mut_ptr(), ERR_LEN, |rt| {
+                encode(rt)?;
+                if panics {
+                    panic!("bug after encoding");
+                }
+                Err("refused after encoding".to_string())
+            })
+        };
+        let (want_status, want_text) = if panics {
+            (tessl::capi::TESSL_PANIC, "bug after encoding")
+        } else {
+            (TESSL_ERR, "refused after encoding")
+        };
+        assert_eq!(status, want_status);
+        assert!(msg(&err).contains(want_text), "{}", msg(&err));
+        // Checked before anything else touches the runtime: the open batch was
+        // committed (the signaled timeline moved) and finished (the copy's
+        // bytes are there), though the call failed.
+        assert!(
+            rt.last_signaled_value() > before,
+            "panics={panics}: the encoded work was never committed"
+        );
+        assert_idle(&rt, "a failed call");
+        let got = raw(&dst);
+        assert_eq!(
+            (got[0], got[n - 1]),
+            (1.0, n as f32),
+            "panics={panics}: the encoded copy had not run"
+        );
+        assert_eq!(rt.handoff_foreign_signal(), None);
+    }
 }
 
 /// The card's scenario through the real entry points: a bad `dh` shape on
@@ -2687,7 +2695,7 @@ fn a_refused_backward_leaves_the_runtime_idle_under_async_encode() {
     let dh = tref(&wrong, &[1, 3]);
     let s = unsafe { tessl_qwen35_train_backward(model, [0u32].as_ptr(), 1, &dh, 0, err.as_mut_ptr(), ERR_LEN) };
     assert_eq!(s, TESSL_ERR);
-    assert!(msg(&err).contains("dh"), "{}", msg(&err));
+    assert!(msg(&err).contains("src must be f32 [1, 64]"), "{}", msg(&err));
     assert_idle(&rt, "a refused backward");
     // The refusal kept the step pending: the real backward still runs.
     let s = unsafe { tessl_qwen35_train_backward(model, ptr::null(), 0, ptr::null(), 0, err.as_mut_ptr(), ERR_LEN) };

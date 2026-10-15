@@ -1,0 +1,237 @@
+{
+  "rounds": 8,
+  "format": "Metrics",
+  "lanes": [
+    {
+      "name": "sync",
+      "argv": [
+        "target/release/bench_capi"
+      ],
+      "env": {}
+    },
+    {
+      "name": "async",
+      "argv": [
+        "target/release/bench_capi",
+        "--async"
+      ],
+      "env": {}
+    }
+  ],
+  "env": {},
+  "summary": [
+    {
+      "workload": "capi_idle_sync_us",
+      "sync": {
+        "value_median": 0.083,
+        "value_min": 0.083,
+        "value_max": 0.125,
+        "value_all": [
+          0.125,
+          0.084,
+          0.083,
+          0.083,
+          0.083,
+          0.083,
+          0.083,
+          0.083
+        ]
+      },
+      "async": {
+        "value_median": 0.083,
+        "value_min": 0.083,
+        "value_max": 0.084,
+        "value_all": [
+          0.084,
+          0.084,
+          0.083,
+          0.083,
+          0.083,
+          0.083,
+          0.083,
+          0.083
+        ],
+        "vs_base": {
+          "median": 1,
+          "lo": 0.672,
+          "hi": 1
+        }
+      }
+    },
+    {
+      "workload": "capi_forward_us_tiny",
+      "sync": {
+        "value_median": 7243.4375,
+        "value_min": 6541.417,
+        "value_max": 15669.625,
+        "value_all": [
+          15669.625,
+          7606.791,
+          7245.875,
+          8539.167,
+          6931.458,
+          6541.417,
+          7241,
+          6643.917
+        ]
+      },
+      "async": {
+        "value_median": 691.1875,
+        "value_min": 596.417,
+        "value_max": 1640.917,
+        "value_all": [
+          683.625,
+          698.75,
+          1584.959,
+          596.417,
+          1640.917,
+          639.208,
+          1601.875,
+          646.667
+        ],
+        "vs_base": {
+          "median": 0.09752462275362599,
+          "lo": 0.043627400145185354,
+          "hi": 0.23673475335203648
+        }
+      }
+    },
+    {
+      "workload": "capi_train_step_ms_tiny",
+      "sync": {
+        "value_median": 23.89935,
+        "value_min": 19.7948,
+        "value_max": 25.1808,
+        "value_all": [
+          19.7948,
+          25.1808,
+          24.775,
+          24.3681,
+          23.3035,
+          23.9046,
+          23.655,
+          23.8941
+        ]
+      },
+      "async": {
+        "value_median": 2.17105,
+        "value_min": 2.0958,
+        "value_max": 2.4699,
+        "value_all": [
+          2.2631,
+          2.3426,
+          2.0958,
+          2.118,
+          2.1289,
+          2.1356,
+          2.4699,
+          2.2065
+        ],
+        "vs_base": {
+          "median": 0.0918501739958528,
+          "lo": 0.08459334006054492,
+          "hi": 0.11432800533473439
+        }
+      }
+    }
+  ],
+  "raw": [
+    {
+      "sync": {
+        "capi_idle_sync_us": 0.125,
+        "capi_forward_us_tiny": 15669.625,
+        "capi_train_step_ms_tiny": 19.7948
+      },
+      "async": {
+        "capi_idle_sync_us": 0.084,
+        "capi_forward_us_tiny": 683.625,
+        "capi_train_step_ms_tiny": 2.2631
+      }
+    },
+    {
+      "sync": {
+        "capi_idle_sync_us": 0.084,
+        "capi_forward_us_tiny": 7606.791,
+        "capi_train_step_ms_tiny": 25.1808
+      },
+      "async": {
+        "capi_idle_sync_us": 0.084,
+        "capi_forward_us_tiny": 698.75,
+        "capi_train_step_ms_tiny": 2.3426
+      }
+    },
+    {
+      "sync": {
+        "capi_idle_sync_us": 0.083,
+        "capi_forward_us_tiny": 7245.875,
+        "capi_train_step_ms_tiny": 24.775
+      },
+      "async": {
+        "capi_idle_sync_us": 0.083,
+        "capi_forward_us_tiny": 1584.959,
+        "capi_train_step_ms_tiny": 2.0958
+      }
+    },
+    {
+      "sync": {
+        "capi_idle_sync_us": 0.083,
+        "capi_forward_us_tiny": 8539.167,
+        "capi_train_step_ms_tiny": 24.3681
+      },
+      "async": {
+        "capi_idle_sync_us": 0.083,
+        "capi_forward_us_tiny": 596.417,
+        "capi_train_step_ms_tiny": 2.118
+      }
+    },
+    {
+      "sync": {
+        "capi_idle_sync_us": 0.083,
+        "capi_forward_us_tiny": 6931.458,
+        "capi_train_step_ms_tiny": 23.3035
+      },
+      "async": {
+        "capi_idle_sync_us": 0.083,
+        "capi_forward_us_tiny": 1640.917,
+        "capi_train_step_ms_tiny": 2.1289
+      }
+    },
+    {
+      "sync": {
+        "capi_idle_sync_us": 0.083,
+        "capi_forward_us_tiny": 6541.417,
+        "capi_train_step_ms_tiny": 23.9046
+      },
+      "async": {
+        "capi_idle_sync_us": 0.083,
+        "capi_forward_us_tiny": 639.208,
+        "capi_train_step_ms_tiny": 2.1356
+      }
+    },
+    {
+      "sync": {
+        "capi_idle_sync_us": 0.083,
+        "capi_forward_us_tiny": 7241,
+        "capi_train_step_ms_tiny": 23.655
+      },
+      "async": {
+        "capi_idle_sync_us": 0.083,
+        "capi_forward_us_tiny": 1601.875,
+        "capi_train_step_ms_tiny": 2.4699
+      }
+    },
+    {
+      "sync": {
+        "capi_idle_sync_us": 0.083,
+        "capi_forward_us_tiny": 6643.917,
+        "capi_train_step_ms_tiny": 23.8941
+      },
+      "async": {
+        "capi_idle_sync_us": 0.083,
+        "capi_forward_us_tiny": 646.667,
+        "capi_train_step_ms_tiny": 2.2065
+      }
+    }
+  ],
+  "lane_archive": "bench/results/capi_sync_vs_async_tiny_m5pro.json.lanes"
+}

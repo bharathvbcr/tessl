@@ -8,6 +8,37 @@ All notable changes to `tessl` are recorded here. The format follows
 
 ### Added
 
+- **EmbeddingGemma 2, text, images and audio in one call, from Rust, C and
+  Python** (`tessl::embedgemma2_mm`: `EmbedGemma2Multimodal::{load, load_from,
+  from_parts, encode, text, vision, audio}`, `MmItem`; audit gaps G3, G8). One
+  `config.json` read and one safetensors open load the text encoder and both
+  towers; `encode` embeds a batch of text ids, images, clips and caller ids
+  with placeholders (`MmItem::Media`, the `j`-th image or audio placeholder
+  takes the `j`-th soft row of that modality) in one call, with every refusal
+  before any allocation or wait. It is a composition of the existing owners:
+  the towers gain `check_images` / `check_clips` (their pre-GPU checks, as a
+  soft-token count per item), `queue_images` / `queue_audio` (no wait;
+  `PendingImages` / `PendingAudio` hold the buffers, wait on drop, and
+  `collect`) and `encode_images` / `encode_audio` become queue + wait +
+  collect, now queued under a `GpuRuntime::async_scope` (before, a runtime in
+  its default mode committed and waited per dispatch);
+  `EmbedGemma2Model::check_sequences` is `encode`'s id checks, shared. A call
+  with media waits twice (the towers, then the text encoder: the soft tokens
+  cross the host), a call of texts once, three for the by-hand composition;
+  the GPU-resident hand-off that would make it one is not done. `GemmOperands`
+  applies to the text encoder; the towers stay exact f32 (no tower bf16 mode).
+  C ABI, additive (ABI 11 unchanged): `tessl_embedgemma2_load_multimodal` and
+  `tessl_embedgemma2_{encode_images, encode_audio}` take a processor's
+  `pixel_values` / `image_position_ids` / `input_features` / mask as flat
+  arrays with CSR offsets, bound every length before it sizes a slice, and
+  write the output only on success; `tests/capi_contract.rs` holds them to the
+  signature rules (it learned `c_uint8`). Python: `EmbedGemma2.from_pretrained(dir,
+  multimodal=True)`, `encode_images`, `encode_audio` (numpy or torch, duck-typed,
+  never imported) and `embed_images` / `embed_audio` (a processor you pass in);
+  no new dependency. Bit for bit the by-hand composition on a tiny checkpoint;
+  on the real one (opt-in) texts, images and clips in one call within 3.8e-7 of
+  sentence-transformers, cosine 1.000000000, in Rust and Python. See
+  `docs/embedgemma2.md`, One call.
 - **EmbeddingGemma 2's multimodal merge** (`EmbedGemma2Model::encode_multimodal`,
   `MmSequence`, `EmbedGemma2Config::{image_sequence, audio_sequence,
   special_tokens}`, `SpecialTokens`, `MmTokens`; audit gap G8, the part that
@@ -28,7 +59,8 @@ All notable changes to `tessl` are recorded here. The format follows
   better against fp32) and to an f64 forward with an `inputs_embeds`
   override (`tests/embedgemma2_mm_tiny.rs`). The f64 host forward and its
   bounds moved from `tests/embedgemma2_tiny.rs` to `tests/common/embedgemma2.rs`
-  to be shared. The C and Python entries still embed text only.
+  to be shared. (The C and Python entries then embedded text only; see the
+  entry above.)
 - **A bf16-operand EmbeddingGemma 2** (`EmbedGemma2Model::load_with(.., GemmOperands::Bf16)`,
   `operands`, `weight_bytes`; `load` stays `ExactF32`, bit-for-bit unchanged).
   The projections stay bf16 on the device (517 MiB of weights against 778 MiB

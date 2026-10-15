@@ -399,6 +399,10 @@ fn a_batch_of_several_text_forwards_agrees_within_the_batch_bound() {
             for (k, item) in items.iter().enumerate() {
                 let alone = m.encode(std::slice::from_ref(item), None).unwrap();
                 let d = drift(&batch.embeddings[k * dim..(k + 1) * dim], &alone.embeddings);
+                eprintln!(
+                    "{operands:?}: item {k} in a {}-forward batch vs alone: {d:.3e}",
+                    batch.forwards
+                );
                 assert!(d <= BATCH_ABS, "{operands:?}: item {k}: {d:.3e}");
             }
         });

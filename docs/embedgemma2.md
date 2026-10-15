@@ -4,7 +4,9 @@
 encoder) on tessl's kernels, from the checkpoint's own `model.safetensors`.
 The vision tower and its embedder are `tessl::embedgemma2_vision`
 ([below](#vision-tower)); the audio tower and its embedder are
-`tessl::embedgemma2_audio` ([Audio tower](#audio-tower)).
+`tessl::embedgemma2_audio` ([Audio tower](#audio-tower)). All three behind one
+snapshot and one call, from Rust, C and Python, are `tessl::embedgemma2_mm`
+([One call: text, images and audio](#one-call-text-images-and-audio)).
 
 > **Status: run on the GPU against sentence-transformers** (Apple M5 Pro,
 > 2026-10-08, branch `fix/embedgemma2-kv-and-e2e` on base `163b28d`, snapshot
@@ -128,6 +130,64 @@ a successful call equals `EmbedGemma2Model::encode` bit for bit on the same
 weights; `python/tests/test_embedgemma2.py` holds the real checkpoint to the
 bounds below (set `EMBEDGEMMA2_SNAPSHOT`).
 
+### Images and audio
+
+Three further entries, in the same module, take what a transformers processor
+returns. They are additive: no existing signature or `#[repr(C)]` layout
+changed, so the ABI version (11) did not, and a library built before them is
+named as such by the Python binding.
+
+| Entry | Does |
+|---|---|
+| `tessl_embedgemma2_load_multimodal(runtime, dir, dir_len, operands, &out, err, err_len)` | `tessl_embedgemma2_load` with the vision and audio towers as well: one read of `config.json`, one open of `model.safetensors`. `operands` is `TESSL_OPERANDS_EXACT_F32` (0) or `TESSL_OPERANDS_BF16` (1) and applies to the **text encoder only**; the towers are exact f32 under either (they have no bf16 mode). The handle takes every text entry too, and `_free` |
+| `tessl_embedgemma2_encode_images(model, pixel_values, pixel_values_len, position_ids, position_ids_len, offsets, n_images, truncate_dim, out, out_len, err, err_len)` | `pixel_values` f32 `[offsets[n_images], patch_dim]` and `position_ids` i32 `[offsets[n_images], 2]`, the processor's `pixel_values` and `image_position_ids` with the images laid end to end (padding patches `(-1, -1)` included), `offsets` CSR-style `u64` over patch rows; `out` is f32 `[n_images, dim]`, one row per image |
+| `tessl_embedgemma2_encode_audio(model, input_features, input_features_len, input_features_mask, mask_len, offsets, n_clips, truncate_dim, out, out_len, err, err_len)` | `input_features` f32 `[offsets[n_clips], mel_bins]` and the mask one byte per frame (0 or 1; any other byte is refused), `offsets` over frames; one row per clip |
+
+Each row is the embedding of the processor's sequence for that item
+(`image_sequence` / `audio_sequence` of the tower's soft-token count) with the
+tower's soft tokens in place of the placeholders, so it equals sentence-transformers'
+`encode(image_or_audio)`. Every pointer and length is checked before any
+allocation or GPU work and the output is written only on success, as for
+`encode`, and the lengths are bounded before they size a slice: `n_images` by
+256 and an image's patch rows by 16,384 (`MAX_BATCH_PATCHES`; the processor's
+`P` is 2520), `n_clips` by 256 and a clip's frames by 16,384
+(`MAX_FRAMES_PER_FORWARD`), each array length must be exactly what the offsets
+imply, `out_len` exactly `n * dim`. A clip's features are copied into the owned
+form the audio tower takes (`AudioInput`) after its length was bounded. A
+text-only handle refuses both entries, naming `load_multimodal`.
+`tests/capi_embedgemma2_multimodal.rs` pins each refusal (the over-limit cases
+declare lengths far past tiny buffers, so an entry that read first would
+fault) and that a successful call equals `EmbedGemma2Multimodal::encode` bit
+for bit; `tests/capi_contract.rs` holds the new entries and
+`python/tessl_torch/embedgemma2.py` to the same signature rules, injected faults
+included (it learned `c_uint8` for the mask).
+
+From Python (needs only numpy and the built library; `transformers` is not
+imported and not a dependency):
+
+```python
+model = EmbedGemma2.from_pretrained(snapshot_dir, multimodal=True)    # operands="bf16" for the text encoder
+out = processor(images=images, return_tensors="np")                   # your transformers processor
+emb = model.encode_images(out["pixel_values"], out["image_position_ids"])   # float32 [n, 768]
+emb = model.embed_images(images, processor)                           # the same two lines in one call
+emb = model.embed_audio(waveforms, processor)                         # or encode_audio(input_features, input_features_mask)
+```
+
+`encode_images` / `encode_audio` take the processor's arrays or tensors
+(`[N, P, 768]` / `[N, F, 128]`, one item without the leading axis, or a list of
+per-item arrays of different lengths; numpy or torch, recognised by their
+methods and never imported; bf16 widened first), check dtype, shape, counts and
+the int32 and 0/1 ranges, and hand flat arrays to the library.
+`embed_images` / `embed_audio` call a processor you pass in with
+`processor(images=list(images), return_tensors="np")` /
+`processor(audio=list(clips), return_tensors="np")` (checked against
+transformers 5.19: a list of images is one sample of several images, so only
+`pixel_values` are used, one embedding per image) and require the two output
+keys. `python/tests/test_embedgemma2_mm_host.py` holds the argument handling to
+a recording stand-in library; `python/tests/test_embedgemma2_mm.py` runs the
+tiny checkpoint, and with `EMBEDGEMMA2_SNAPSHOT` and `EMBEDGEMMA2_MM_REF_DIR`
+the real one (see Observed below).
+
 ## Multimodal input
 
 The vision and audio towers are other modules (`embedgemma2_vision`,
@@ -204,8 +264,8 @@ before the first run, the text tests'; observed on an Apple M5 Pro, 2026-10-15, 
 | tiny: one-forward batch vs alone | `1e-5` first, made bit-exact after the first run measured 0 | 0 |
 
 Not covered: video (the placeholder id is handled like the other two, but no
-video tower or reference exists here), and the C and Python entries, which
-embed text only.
+video tower or reference exists here). The towers' output reaches this entry
+as host rows; [One call](#one-call-text-images-and-audio) does that composition.
 
 The table above was observed against goldens written under eager attention;
 the same test passes against the sdpa goldens `make_mm_reference.py` now
@@ -219,6 +279,99 @@ one call. The towers' soft-token counts equal the placeholders of `ids.npy`,
 and the builders lay out exactly `ids.npy`. Against sentence-transformers'
 `emb_f32` (bounds `1e-4` max abs and cosine `0.99999`, fixed before the run):
 max abs 2.2e-7 to 3.8e-7, cosine 1.000000000 for both images and both clips.
+
+## One call: text, images and audio
+
+`tessl::embedgemma2_mm::EmbedGemma2Multimodal` owns the three models of one
+snapshot and embeds a batch of mixed items in one call. It is a composition of
+the existing owners, not a fourth implementation: the towers do the towers'
+work, `EmbedGemma2Model::encode_multimodal` does the text encoder's, and the
+facade does only what neither can see, the layout (how many placeholders an
+item has, which soft row goes under which placeholder id, in what order across
+modalities) and the waits. It sits beside `embedgemma2` rather than inside it
+because that module stays text-only (the C ABI's text entries should not load
+1.2 GB of towers) and is named as the tests are (`embedgemma2_mm_*`).
+
+```rust
+let m = EmbedGemma2Multimodal::load(&rt, &snapshot_dir, GemmOperands::ExactF32)?; // one config read, one open
+let items = [
+    MmItem::Text(&ids),                       // tokenizer ids, no placeholders
+    MmItem::Image(ImageInput { pixel_values, position_ids }),   // the processor's tensors
+    MmItem::Audio(&clip),                     // AudioInput { input_features, mask }
+    MmItem::Media { ids: &my_ids, images: &[img], audio: &[clip] },  // caller ids with placeholders
+];
+let out = m.encode(&items, Some(256))?;       // EncodeOutput: one row per item, in order
+```
+
+* `load(rt, dir, operands)` / `load_from(rt, &SafeTensors, config_json, operands)`
+  parse the text, vision and audio configs from the same `config.json` text,
+  read `language_model.*`, the towers' tensors and refuse a config without the
+  multimodal ids before reading weights; `from_parts(text, vision, audio)`
+  composes loaded models and refuses a width mismatch between a tower's soft
+  tokens and the text hidden size, or models of two runtimes.
+* `MmItem::Image` / `Audio` lay out the processor's sequence
+  (`image_sequence` / `audio_sequence` of the tower's soft-token count).
+  `MmItem::Media` takes caller ids: the `j`-th image placeholder takes the
+  `j`-th soft row of the item's images laid end to end, the audio placeholders
+  likewise from its clips, which is `masked_scatter` per modality, so image and
+  audio placeholders may interleave and a run need not line up with an image's
+  end. The counts must match exactly; a video placeholder is refused (no video
+  tower); a `MmItem::Text` holding a placeholder id is refused (in a
+  multimodal call it would be replaced by a soft token it does not have).
+* `queue_images` / `queue_audio` on the towers (new) return a `PendingImages` /
+  `PendingAudio` that holds every buffer the queued forwards bind and waits for
+  them on drop; `collect()` reads the soft tokens. `encode_images` /
+  `encode_audio` are `queue` + `synchronize` + `collect` and now queue under a
+  `GpuRuntime::async_scope`, so they wait once whatever the runtime's
+  `async_encode` flag says (before, a runtime in the default mode committed and
+  waited per dispatch: with the vision scope removed, the by-hand composition of
+  `tests/embedgemma2_multimodal_tiny.rs` made 29 waits instead of 3). `check_images` / `check_clips` are their pre-GPU
+  checks as a soft-token count per item, and `EmbedGemma2Model::check_sequences`
+  is `encode`'s id checks, so the facade refuses before any tower is queued.
+* **Waits.** A call with media waits for the GPU **twice**, a call of texts
+  once. Both towers' forwards are queued under one scope behind one wait; the
+  soft tokens are read back; the text encoder's forwards (however many) are
+  queued behind its own wait. The by-hand composition waits three times
+  (vision, audio, text). One wait would need the text encoder to take the
+  towers' device buffers instead of host rows; that GPU-resident hand-off is not
+  done here (follow-up below).
+* **Precision.** `GemmOperands` applies to the text encoder (`ExactF32` or
+  `Bf16`). The towers are exact f32 under both; there is no tower bf16 mode and
+  none was invented. The call refuses a runtime with relaxed f32 GEMMs on.
+* **Refusals** come before any allocation or wait: the batch size, each
+  tower's input checks, the text checks, the placeholder counts. A refused call
+  leaves the facade usable.
+
+Tests and bounds, fixed before the first run. `tests/embedgemma2_multimodal_tiny.rs`
+(tiny random checkpoint of `tests/common/embedgemma2_mm.rs`; the oracle is the
+composition done by hand, since the pieces are held to f64 references in their
+own tests): every item bit for bit the by-hand composition in both text modes
+(observed: 0), a text item bit for bit `EmbedGemma2Model::encode` (0), a mixed
+batch of text, images and clips bit for bit each item alone when the text side
+packs one forward (0, one forward) and within `1e-5` across forwards (0
+observed, 2 text forwards, both text modes), waits exactly 1 / 2 / 3 for text, media
+and by hand, every refusal `(allocations, waits) == (0, 0)`, every unzeroed
+activation poisoned with NaN changing no bit. `tests/embedgemma2_multimodal_model.rs`
+(real checkpoint, opt-in) and `python/tests/test_embedgemma2_mm.py`, Apple M5
+Pro, 2026-10-15, sdpa goldens, snapshot `914f7f89`:
+
+| Check | Bound | Observed |
+|---|---|---|
+| 8 texts (10 to 6147 tokens), 2 images, 2 clips in one call, vs `emb_f32` | max abs `1e-4`, cosine `>= 0.99999` | texts `1.2e-7` to `3.0e-7`, images `2.2e-7` / `3.8e-7`, clips `3.0e-7` / `2.5e-7`; cosine 1.000000000; 5 text forwards, 2 waits |
+| each image and clip alone vs inside that call | `1e-5` | 0 (bit for bit) |
+| media alone: 2 waits; texts alone: 1 wait | exact | 2; 1 |
+| text encoder `Bf16`, towers exact, 4 media rows vs fp32 | cosine `>= 0.9999` | 0.999994 to 0.999999 |
+| Python, `encode_images` / `encode_audio`, alone and in one call | `1e-4`, `0.99999`; alone vs batch `1e-5` | `2.2e-7` to `3.8e-7`, cosine 1.000000000; alone vs batch 0 |
+| Python, `embed_images` / `embed_audio` with transformers 5.19's processor on the generator's inputs | processor tensors vs saved `1e-6`, then the same embedding bounds | tensors identical (0), `3.8e-7` and `3.0e-7`, cosine 1.000000000 |
+
+Follow-ups: (1) the GPU-resident soft-token hand-off (the towers' `io.soft`
+buffers copied into the text encoder's embeddings with `copy_cols`, no host
+round trip, one wait for a mixed call). (2) A `Media` entry in the C ABI and
+Python for caller ids with placeholders; the C entries take pure images and
+clips. (3) The tower tiny-checkpoint generators exist in four test files
+(`tests/common/embedgemma2_mm.rs`, `embedgemma2_vision_tiny.rs`,
+`embedgemma2_audio_tiny.rs`, and the text one in `common`); the last two carry
+f64 references and were left alone, but converge on `common`.
 
 ## Kernels
 
@@ -501,9 +654,9 @@ one forward padded to the longest, with a per-image length for attention
 (`encoder_attn`, window 0, scale 1.0; its K/V layout `[batch, capacity, heads,
 64]` is exactly what the new rope kernel writes). A call is cut into forwards
 of at most 16,384 padded patches (`MAX_BATCH_PATCHES`) and 256 images,
-longest first, queued behind one `synchronize`. `GpuRuntime::async_scope()` is
-not on this base; when it lands, `encode_images` is where it replaces that
-call.
+longest first, queued under a `GpuRuntime::async_scope` behind one
+`synchronize` (`queue_images` is the call up to the wait, for a caller that
+queues more behind it: [One call](#one-call-text-images-and-audio)).
 
 **Pooling.** A patch at `(x, y)` goes to cell `x/k + (max_x/k) * (y/k)`,
 `max_x = max(x) + 1` of its own image, which collides cells when the grid width
@@ -601,9 +754,9 @@ let out = model.encode_audio(&[AudioInput { input_features, mask }, ...], false)
 
 > **Status** (Apple M5 Pro, 2026-10-15, branch
 > `worktree-agent-a975c42e7f8ed0908` on base `60a6240`, snapshot
-> `914f7f89`; torch 2.14.1, transformers 5.19.0): every bound below holds. The
-> runtime has no `async_scope` on this base, so `encode_audio` queues its
-> forwards and ends with one `synchronize()`.
+> `914f7f89`; torch 2.14.1, transformers 5.19.0): every bound below holds.
+> `encode_audio` queues its forwards under a `GpuRuntime::async_scope` and ends
+> with one `synchronize()` (`queue_audio` is the call up to the wait).
 
 ### What it computes
 

@@ -74,6 +74,14 @@ who hold the tokenizer, cannot reach the encoder. **verified**.
 In flight beside it: `gp/w9-capi` (ABI 12, async entry, ft-ba1413a0)
 changes `capi.rs`, so new exports belong in their own module.
 
+**Resolved** (lane C, text; lane F, images and audio): `src/capi_embedgemma2.rs`
+and `python/tessl_torch/embedgemma2.py` carry the text entries
+(`tessl_embedgemma2_{load,free,embedding_dim,max_tokens,set_max_tokens,encode}`)
+and the multimodal ones (`tessl_embedgemma2_{load_multimodal,encode_images,encode_audio}`),
+additive at ABI 11; see `docs/embedgemma2.md`, From Python / C. The towers
+(G8) are in `tessl::embedgemma2_vision` / `embedgemma2_audio` and compose with
+the text encoder in `tessl::embedgemma2_mm`.
+
 ### G4. Tokenization is the caller's
 
 There is no tokenizer in tessl (`rg -l tokeniz src` finds only doc comments).

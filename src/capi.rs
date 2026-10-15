@@ -47,6 +47,13 @@
 //! (ABI 12) batches a call's kernels into one command buffer instead; the call
 //! still returns idle, on success *and* on failure (see `guarded`'s error-path
 //! wait), so a caller may recycle its buffers the moment any call returns.
+//! The one exception is a poisoned runtime: it refuses the wait, so a failing
+//! call returns without it. [`tessl_runtime_poisoned`] reports that state, and
+//! a caller that passed external buffers must then keep them alive until the
+//! runtime is freed (its drop waits, bounded by
+//! [`GpuRuntime::event_wait_ms`]). A wait that fails on a healthy runtime (the
+//! budget ran out) is appended to the call's message; work may then still be
+//! in flight.
 
 use std::ffi::{c_char, c_void};
 use std::panic::{catch_unwind, AssertUnwindSafe};
@@ -328,7 +335,10 @@ pub unsafe extern "C" fn tessl_synchronize(handle: *mut TesslRuntime, err: *mut 
 /// default of [`tessl_runtime_new`]: every kernel is its own waited commit.
 /// On batches each call's kernels into command buffers that are committed
 /// without a wait per kernel; the call still waits once before it returns,
-/// success or failure, so no call leaves work in flight. ABI 12.
+/// success or failure, so no call leaves work in flight. Turning it off waits
+/// for everything submitted so far before the mode changes. Either switch
+/// leaves a pending [`tessl_qwen35_train_forward`] step usable: the mode only
+/// decides how later kernels are committed, never what they compute. ABI 12.
 ///
 /// # Safety
 /// As [`tessl_cross_entropy_rows`] for `handle`, `err` and `err_len`.
@@ -690,7 +700,7 @@ unsafe fn refuse_unowned<H: Handle>(handle: *mut H, err: *mut c_char, err_len: u
 
 /// Run `f` on the handle with every failure turned into a status: a null or
 /// foreign-thread handle, an `Err`, or a panic. The runtime is idle when this
-/// returns, whatever the outcome.
+/// returns, **unless it is poisoned** (see below).
 ///
 /// A successful call ends with a synchronize. A failed one ends with one too:
 /// with async encode on, `f` may have committed kernels (or left an open
@@ -698,11 +708,16 @@ unsafe fn refuse_unowned<H: Handle>(handle: *mut H, err: *mut c_char, err_len: u
 /// external buffers. A caller that sees the refusal frees or recycles those
 /// buffers (torch's MPS allocator reuses a dropped tensor's storage without
 /// releasing the `MTLBuffer`), so returning with work in flight would let the
-/// GPU touch memory that already belongs to someone else. The wait is skipped
-/// on a poisoned runtime, which refuses it; the poison is reported by
-/// [`tessl_runtime_poisoned`] and its in-flight work is released only by the
-/// runtime's bounded drop wait. A wait that fails on a healthy runtime is
-/// appended to the original message rather than hiding it.
+/// GPU touch memory that already belongs to someone else.
+///
+/// On a poisoned runtime the wait is skipped, because the runtime refuses it:
+/// work already submitted may still be running when the call returns.
+/// [`tessl_runtime_poisoned`] reports the state, and the caller must keep every
+/// external buffer it passed alive until the runtime is freed, whose drop
+/// waits for the GPU (bounded by [`GpuRuntime::event_wait_ms`]). A wait that
+/// fails on a healthy runtime (a timeout; it does not poison) is appended to
+/// the original message instead of hiding it, and work may still be in flight
+/// then too.
 ///
 /// # Safety
 /// `handle` is null or a live handle from its constructor with no other call
@@ -1020,9 +1035,6 @@ pub struct TesslQwen35 {
     bank: BankState,
     pending: Option<PendingStep>,
     adamw: Option<AdamW>,
-    /// Bytes the per-parameter host entries have moved, for
-    /// [`test_host_param_bytes`].
-    host_param_bytes: u64,
     owner: ThreadId,
 }
 
@@ -1034,6 +1046,36 @@ impl TesslQwen35 {
             self.bank = BankState::Empty;
         }
         self.grads.as_ref().ok_or_else(|| "no gradient bank".to_string())
+    }
+
+    /// Refuse a host write to entry `index` when the optimizer keeps auxiliary
+    /// state for it (a bf16 entry under [`UpdateRule::F32Master`] or
+    /// [`UpdateRule::Bf16Kahan`]): the next step reads that state, not the
+    /// weight, so the write would be lost. An index past the table is left to
+    /// the write's own range check.
+    fn refuse_stale_aux(&self, what: &str, index: usize) -> Result<(), String> {
+        let Some(state) = &self.adamw else {
+            return Ok(());
+        };
+        let rule = match state.config().update {
+            UpdateRule::F32Master => "f32-master",
+            UpdateRule::Bf16Kahan => "bf16-kahan",
+            _ => return Ok(()),
+        };
+        let slots = crate::qwen35_params::slots(&self.model, None)?;
+        let (Some(slot), Some(info)) = (slots.get(index), self.table.get(index)) else {
+            return Ok(());
+        };
+        if slot.param_window().dtype != DType::BF16 {
+            return Ok(());
+        }
+        Err(format!(
+            "{what}: {} (index {index}) has auxiliary optimizer state under the {rule} rule, which \
+             the next tessl_qwen35_adamw_step would rebuild the weight from, losing this write; write \
+             the parameters and the auxiliary state together with tessl_qwen35_copy \
+             (TESSL_WRITE_PARAMS, then TESSL_WRITE_ADAMW_AUX), or write before tessl_qwen35_adamw_init",
+            info.name
+        ))
     }
 
     fn no_pending(&self, what: &str) -> Result<(), String> {
@@ -1155,7 +1197,6 @@ pub unsafe extern "C" fn tessl_qwen35_load(
                 bank: BankState::Empty,
                 pending: None,
                 adamw: None,
-                host_param_bytes: 0,
                 owner: h.owner,
             }));
             if POISON_AFTER_LOAD.load(Ordering::Relaxed) {
@@ -1661,7 +1702,6 @@ pub unsafe extern "C" fn tessl_qwen35_read_parameter_host(
             }
             let dst = checked_slice_mut(dst, n, WHAT, "dst")?;
             h.model.read_parameter_host(index, dst)?;
-            h.host_param_bytes += std::mem::size_of_val(&*dst) as u64;
             Ok(())
         })
     }
@@ -1671,8 +1711,17 @@ pub unsafe extern "C" fn tessl_qwen35_read_parameter_host(
 /// out as [`tessl_qwen35_read_parameter_host`] reads them (a bf16 matrix takes
 /// each value rounded as the GPU copy rounds it). Only that entry is written
 /// ([`Qwen35Model::write_parameter_host`]), refused while a step is pending as
-/// [`TESSL_WRITE_PARAMS`] is. An optimizer's f32 master is its own state and
-/// is not moved.
+/// [`TESSL_WRITE_PARAMS`] is.
+///
+/// Refused too, before anything moves, when the handle's AdamW state keeps
+/// auxiliary state for the entry (a bf16 entry under the f32-master or
+/// bf16-kahan rule): the next [`tessl_qwen35_adamw_step`] rebuilds the weight
+/// from that state and would silently overwrite this write. There is no
+/// per-entry auxiliary write; write the parameters and the auxiliary state
+/// together with [`tessl_qwen35_copy`] ([`TESSL_WRITE_PARAMS`] and
+/// [`TESSL_WRITE_ADAMW_AUX`]), or write this entry before
+/// [`tessl_qwen35_adamw_init`]. An f32 entry, a model with no AdamW state and
+/// the other update rules are written as asked.
 ///
 /// # Safety
 /// As [`tessl_qwen35_param_count`]; `src` points to `n` readable f32s.
@@ -1696,24 +1745,11 @@ pub unsafe extern "C" fn tessl_qwen35_write_parameter_host(
             }
             let src = checked_slice(src, n, WHAT, "src")?;
             h.no_pending(WHAT)?;
+            h.refuse_stale_aux(WHAT, index)?;
             h.model.write_parameter_host(index, src)?;
-            h.host_param_bytes += std::mem::size_of_val(src) as u64;
             Ok(())
         })
     }
-}
-
-/// Test hook: bytes the per-parameter host entries
-/// ([`tessl_qwen35_read_parameter_host`], [`tessl_qwen35_write_parameter_host`])
-/// have moved on this model, so a test can tell that one entry's read moved
-/// one entry's bytes.
-///
-/// # Safety
-/// `model` is a live handle from [`tessl_qwen35_load`].
-#[doc(hidden)]
-pub unsafe fn test_host_param_bytes(model: *const TesslQwen35) -> u64 {
-    // SAFETY: live by the contract.
-    unsafe { &*model }.host_param_bytes
 }
 
 /// Make the handle's AdamW state ([`AdamW::with_config`]): `update`

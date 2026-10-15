@@ -430,7 +430,17 @@ class _Runtime(_Owned):
 
     def _close_poisoned(self) -> None:
         """Close the models bound to this runtime and then the runtime, and
-        drop it as the thread's runtime so the next call builds a fresh one."""
+        drop it as the thread's runtime so the next call builds a fresh one.
+
+        This is also what keeps torch's buffers safe after a poisoned call. A
+        poisoned runtime refuses the wait a failing call otherwise ends with,
+        so tessl work for that call may still be in flight; freeing the runtime
+        waits for the GPU (bounded by the library's event-wait budget, 30 s by
+        default). The call's tensors are locals of the frames the exception is
+        still unwinding through, so they outlive this close and torch cannot
+        recycle their storage before it returns. A caller that catches the
+        exception and drops its buffers does so after the wait; one that
+        sees ``TesslPoisoned`` need keep nothing alive."""
         for model in list(self._models):
             model._close_after_panic()
         self._close_after_panic()
@@ -1082,7 +1092,13 @@ class Qwen35(_Owned):
     def load_parameters(self, params) -> None:
         """Set every parameter from ``params`` (name -> tensor of the
         parameter's shape, any dtype, device and layout). All of them are
-        required, and all are checked before any is written."""
+        required, and all are checked before any is written.
+
+        Under an AdamW state that keeps auxiliary state (``update="f32-master"``
+        or ``"bf16-kahan"``) the written weights are not what the next
+        ``adamw_step`` starts from: it rebuilds each bf16 matrix from the
+        master (or compensation), so a write that must stick needs that state
+        restored with it (``load_adamw_state`` with its ``"aux"``)."""
         self._copy(_WRITE_PARAMS, self._staged("load_parameters", params))
 
     def _entry(self, what: str, name: str):
@@ -1114,7 +1130,17 @@ class Qwen35(_Owned):
     def write_parameter(self, name: str, value: torch.Tensor) -> None:
         """Set one parameter from ``value`` (the parameter's shape; any dtype,
         device and layout). Only that parameter is written, on the host, as
-        ``load_parameters`` would write it. Refused while a step is pending."""
+        ``load_parameters`` would write it. Refused while a step is pending.
+
+        Also refused, before anything moves, for a bf16 matrix whose AdamW
+        state keeps auxiliary state (``update="f32-master"`` or
+        ``"bf16-kahan"``): the next ``adamw_step`` rebuilds the weight from the
+        master (or the Kahan compensation) and would silently overwrite this
+        write. There is no per-parameter write of that state: restore the
+        parameters and the state together (``load_parameters`` then
+        ``load_adamw_state``, which carries ``"aux"``), or write before
+        ``adamw_init``. f32 parameters, the other update rules and a model with
+        no AdamW state take the write as asked."""
         i, shape, tr = self._entry("write_parameter", name)
         if tuple(value.shape) != shape:
             raise TesslError(f"write_parameter: {name} must be {shape}, got {tuple(value.shape)}")

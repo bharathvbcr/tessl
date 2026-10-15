@@ -136,7 +136,14 @@ beside tessl's. To read or set one parameter, use `read_parameter(name)` and
 host (`tessl_qwen35_read_parameter_host` / `write_parameter_host`, which are
 `Qwen35Model::read_parameter_host` / `write_parameter_host`), with no GPU copy
 and no wait on torch's queue. `read_parameter` returns a CPU tensor unless you
-pass `device=`; `write_parameter` is refused while a step is pending.
+pass `device=`; `write_parameter` is refused while a step is pending, and
+refused for a bf16 matrix whose AdamW state keeps auxiliary state
+(`update="f32-master"` or `"bf16-kahan"`): the next `adamw_step` rebuilds the
+weight from the master or the compensation and would overwrite the write, and
+there is no per-parameter write of that state. Restore the parameters and the
+state together (`load_parameters` then `load_adamw_state`, whose `"aux"` carries
+it), or write before `adamw_init`; `load_parameters` has the same caveat (the
+state must be restored with it for the write to stick).
 
 ## Handle ownership, closing and errors
 
@@ -212,8 +219,18 @@ there for a reason:
   MPS allocator may hand their storage to someone else, so tessl work still
   in flight for the refused call would write into memory that is no longer
   the caller's. A refused call therefore finishes what it already submitted
-  before the error is raised (a runtime already poisoned refuses the wait;
-  its work is released when the runtime is closed).
+  before the error is raised.
+- **A poisoned runtime is the exception.** It refuses the wait, so a call that
+  poisons it can return with tessl work still running. The binding handles
+  that: it frees the poisoned runtime (`TesslPoisoned`; the free waits for the
+  GPU, bounded by the library's event-wait budget, 30 s by default) before the
+  exception reaches your code, while the failed call's tensors are still held
+  by the frames it unwinds through, so torch cannot recycle their storage
+  first. A caller of the C ABI has no such guarantee: after
+  `tessl_runtime_poisoned` reports 1 it must keep every external buffer it
+  passed alive until the runtime is freed. A wait that merely times out on a
+  healthy runtime is reported in the error message, and work may still be in
+  flight then.
 
 The library's own default is synchronous encode (one waited commit per
 kernel); `tessl_torch` turns async encode on for the runtimes it creates.

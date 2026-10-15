@@ -938,6 +938,7 @@ fn random_config(r: &mut Rng) -> Qwen35Config {
         rotary_dim: r.pick(&[2u32, 64, 128, 256]),
         rope_theta: r.pick(&[1e4f32, 1e7]),
         rms_norm_eps: 1e-6,
+        tie_word_embeddings: true,
     }
 }
 
@@ -1397,5 +1398,209 @@ fn sessions_refuse_to_continue_across_a_per_entry_host_write() {
         assert_eq!(rt.take_dispatch_count(), 0, "a refused call encoded work");
         let (mut dec, _) = model.prefill(&ids[..4], 2).unwrap();
         dec.step(ids[4]).unwrap();
+    });
+}
+
+// ------------------------------------------------------------ untied head ---
+
+/// `make_train_fixture.py tiny --untied`: the tiny model with
+/// `tie_word_embeddings: false`, a separate `lm_head.weight` at the
+/// checkpoint root, and transformers' float32 logits (`logits.npy`).
+fn untied_fixture() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/qwen35_train_untied")
+}
+
+fn untied_config() -> Qwen35Config {
+    let cfg = Qwen35Config::from_config_file(&untied_fixture().join("config.json")).unwrap();
+    assert!(!cfg.tie_word_embeddings);
+    cfg
+}
+
+fn untied_ids() -> Vec<u32> {
+    let a = read_npy(&untied_fixture().join("ids.npy")).unwrap();
+    a.i64_slice().unwrap().iter().map(|&x| x as u32).collect()
+}
+
+fn untied_logits() -> Vec<f32> {
+    let a = read_npy(&untied_fixture().join("logits.npy")).unwrap();
+    assert_eq!(a.shape, [untied_ids().len(), 64]);
+    a.f32_slice().unwrap().to_vec()
+}
+
+fn untied_checkpoint() -> SafeTensors {
+    SafeTensors::open(&untied_fixture().join("model.safetensors")).unwrap()
+}
+
+/// An untied checkpoint's logits are transformers' (f32 to the existing
+/// bound, bf16 to its own), through the head GEMM over `lm_head.weight`, not
+/// the embedding: the fixture's head and embedding differ everywhere.
+#[test]
+fn untied_forward_matches_transformers_logits() {
+    let st = untied_checkpoint();
+    let ids = untied_ids();
+    let want: Vec<f32> = untied_logits();
+    with_gpu(|rt| {
+        for precision in [Precision::F32, Precision::Bf16] {
+            let model = Qwen35Model::load(rt, &st, "model.", untied_config(), precision).unwrap();
+            let got = model.forward(&ids, false).unwrap().logits;
+            let r = rel32(&got, &want);
+            let b = bound(precision);
+            eprintln!("untied {precision:?}: logits rel err {r:.3e} (bound {b:.0e})");
+            assert!(r <= b, "untied {precision:?}: logits rel err {r:.3e} > {b:.0e}");
+            assert!(
+                model.describe().contains(match precision {
+                    Precision::F32 => "untied",
+                    Precision::Bf16 => "packed bf16 copy",
+                }),
+                "{}",
+                model.describe()
+            );
+        }
+    });
+}
+
+/// Every head consumer reads `lm_head.weight`: prefill then decode (the
+/// decode step's head), chosen rows, `Staged::logits`, and `score_answers`
+/// on a full model and on a tower, each against `forward`'s transformers-
+/// checked logits.
+#[test]
+fn untied_decode_rows_and_answers_use_the_own_head() {
+    let st = untied_checkpoint();
+    let ids = untied_ids();
+    let want = untied_logits();
+    let (v, t) = (64usize, ids.len());
+    let n_layers = untied_config().layers.len();
+    let answers = [3u32, 17, 42, 63];
+    with_gpu(|rt| {
+        for precision in [Precision::F32, Precision::Bf16] {
+            let b = bound(precision);
+            let model = Qwen35Model::load(rt, &st, "model.", untied_config(), precision).unwrap();
+            let tower = Qwen35Model::load_tower(rt, &st, "model.", untied_config(), precision).unwrap();
+            // prefill N, then decode: the last row of forward(N + k).
+            let n = t - 3;
+            let (mut dec, first) = model.prefill(&ids[..n], 3).unwrap();
+            let mut got = vec![first];
+            for k in 0..3 {
+                got.push(dec.step(ids[n + k]).unwrap());
+            }
+            for (k, row) in got.iter().enumerate() {
+                let p = n + k - 1;
+                let r = rel32(row, &want[p * v..(p + 1) * v]);
+                assert!(r <= b, "untied {precision:?}: decoded {k}: rel err {r:.3e} > {b:.0e}");
+            }
+            // chosen rows and Staged::logits.
+            let picks = [t as u32 - 1, 0, 30];
+            let rows = model.forward_rows(&ids, LogitRows::Rows(&picks), false).unwrap().logits;
+            let expect: Vec<f32> = picks
+                .iter()
+                .flat_map(|&p| want[p as usize * v..(p as usize + 1) * v].to_vec())
+                .collect();
+            let r = rel32(&rows, &expect);
+            assert!(r <= b, "untied {precision:?}: forward_rows rel err {r:.3e}");
+            let mut s = model.begin(&ids).unwrap();
+            s.advance_to(n_layers).unwrap();
+            let staged = s.logits(LogitRows::Last).unwrap();
+            assert!(
+                rel32(&staged, &want[(t - 1) * v..]) <= b,
+                "untied {precision:?}: Staged::logits"
+            );
+            // score_answers, full and tower.
+            for m in [&model, &tower] {
+                let mut s = m.begin(&ids).unwrap();
+                s.advance_to(n_layers).unwrap();
+                let sc = s.score_answers(&[t as u32 - 1, 0], &answers).unwrap();
+                for (i, &p) in [t - 1, 0].iter().enumerate() {
+                    let row = &want[p * v..(p + 1) * v];
+                    let peak = row.iter().fold(0.0f64, |m, &x| m.max(f64::from(x).abs()));
+                    for (j, &a) in answers.iter().enumerate() {
+                        let err = (f64::from(sc.logits[i * answers.len() + j]) - f64::from(row[a as usize])).abs();
+                        assert!(
+                            err <= b * peak,
+                            "untied {precision:?}: score_answers [{p}, {a}]: {err:.3e}"
+                        );
+                    }
+                }
+            }
+        }
+    });
+}
+
+/// A checkpoint and its config must agree on the head, in both directions:
+/// an untied config needs `lm_head.weight`; a tied config refuses a
+/// checkpoint carrying one (nothing would read it). Neither loads anything.
+#[test]
+fn head_and_config_must_agree() {
+    let tied_st = SafeTensors::open(&fixture().join("model.safetensors")).unwrap();
+    let untied_st = untied_checkpoint();
+    with_gpu(|rt| {
+        for precision in [Precision::F32, Precision::Bf16] {
+            let e = Qwen35Model::load(rt, &tied_st, "model.", untied_config(), precision)
+                .err()
+                .expect("an untied config over a checkpoint with no lm_head.weight");
+            assert!(e.contains("lm_head.weight"), "{e}");
+            let e = Qwen35Model::load(rt, &untied_st, "model.", tiny_config(), precision)
+                .err()
+                .expect("a tied config over a checkpoint with lm_head.weight");
+            assert!(e.contains("lm_head.weight") && e.contains("ties"), "{e}");
+            let e = Qwen35Model::load_tower(rt, &untied_st, "model.", tiny_config(), precision)
+                .err()
+                .expect("the same through load_tower");
+            assert!(e.contains("lm_head.weight"), "{e}");
+        }
+        // A head of the wrong shape is refused by name and shape.
+        let mut cfg = untied_config();
+        cfg.vocab = 63;
+        let e = Qwen35Model::load(rt, &untied_st, "model.", cfg, Precision::F32)
+            .err()
+            .unwrap();
+        assert!(e.contains("shape"), "{e}");
+        // The tied layout is untouched: the same fixture loads tied as before.
+        Qwen35Model::load(rt, &tied_st, "model.", tiny_config(), Precision::F32).unwrap();
+    });
+}
+
+/// `random`'s untied head is its own table, drawn after the tower: the
+/// tower's weights are the tied model's, the logits are not, and the bf16
+/// packed head (from `lm_head`) agrees with the f32 model's.
+#[test]
+fn random_untied_model_has_its_own_head() {
+    with_gpu(|rt| {
+        let tied = grouped_config();
+        let untied = Qwen35Config {
+            tie_word_embeddings: false,
+            ..grouped_config()
+        };
+        let ids = seq(9);
+        let a = Qwen35Model::random(rt, tied.clone(), Precision::F32, 11).unwrap();
+        let b = Qwen35Model::random(rt, untied.clone(), Precision::F32, 11).unwrap();
+        let tower = Qwen35Model::random_tower(rt, untied.clone(), Precision::F32, 11).unwrap();
+        let (fa, fb) = (a.forward(&ids, true).unwrap(), b.forward(&ids, true).unwrap());
+        // The same tower: the traces (every layer and the final norm) are bit-equal.
+        assert_eq!(fa.trace.len(), fb.trace.len());
+        for (x, y) in fa.trace.iter().zip(&fb.trace) {
+            assert!(
+                x.iter().zip(y).all(|(p, q)| p.to_bits() == q.to_bits()),
+                "tower differs"
+            );
+        }
+        assert!(
+            rel32(&fa.logits, &fb.logits) > 0.1,
+            "an untied head is not the embedding"
+        );
+        let mut s = tower.begin(&ids).unwrap();
+        s.advance_to(untied.layers.len()).unwrap();
+        let sc = s.score_answers(&[8], &[1, 2, 3]).unwrap();
+        let v = untied.vocab as usize;
+        for (j, &id) in [1usize, 2, 3].iter().enumerate() {
+            let want = fb.logits[8 * v + id];
+            assert!(
+                (sc.logits[j] - want).abs() <= 1e-4 * want.abs().max(1.0),
+                "score {j}: {} vs {want}",
+                sc.logits[j]
+            );
+        }
+        let bf = Qwen35Model::random(rt, untied, Precision::Bf16, 11).unwrap();
+        let fbf = bf.forward(&ids, false).unwrap();
+        assert!(rel32(&fbf.logits, &fb.logits) <= 2e-2, "bf16 packed head vs f32");
     });
 }

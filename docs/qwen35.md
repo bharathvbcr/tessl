@@ -1470,10 +1470,14 @@ span ±8% on this machine under load.
   32, are rejected on the host.
 - **Other model sizes are parsed, not validated.**
   `Qwen35Config::from_config_json` reads any Qwen3.5 text `config.json` and
-  refuses by name what the forward lacks (untied embeddings, MoE, attention
+  refuses by name what the forward lacks (MoE, attention
   bias, an ungated output, non-SiLU activations, `mlp_only_layers`,
   non-default RoPE, a key head dim other than 128, an attention head dim
-  other than 256). The published 2B config parses to exactly the config
+  other than 256). `tie_word_embeddings: false` (the 9B's layout) gives the
+  model its own `lm_head.weight`, read from the checkpoint root; it is checked
+  against transformers on a tiny untied fixture
+  (`tests/fixtures/qwen35_train_untied/`), never on the 9B itself. The
+  published 2B config parses to exactly the config
   `tests/qwen35_model.rs` checks. No other size has been run against
   transformers with its weights, so for those sizes only parsing is checked,
   not the forward.

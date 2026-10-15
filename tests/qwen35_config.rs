@@ -103,13 +103,45 @@ fn layer_types_default_from_the_interval_and_other_sizes_parse() {
     assert_eq!(c.layers.iter().filter(|&&k| k == LayerKind::FullAttention).count(), 6);
 }
 
+/// `tie_word_embeddings` is read, not refused: false is the 9B's layout (its
+/// own `lm_head.weight`); the root and `text_config` must agree, and one must
+/// say.
+#[test]
+fn tie_word_embeddings_is_read_and_must_be_consistent() {
+    assert!(Qwen35Config::from_config_json(REAL).unwrap().tie_word_embeddings);
+    let both = |from: &str, to: &str| -> String {
+        REAL.replace(
+            &format!("\"tie_word_embeddings\": {from}"),
+            &format!("\"tie_word_embeddings\": {to}"),
+        )
+    };
+    assert_eq!(
+        REAL.matches("\"tie_word_embeddings\": true").count(),
+        2,
+        "root and text_config"
+    );
+    let untied = Qwen35Config::from_config_json(&both("true", "false")).unwrap();
+    assert!(!untied.tie_word_embeddings);
+    assert_eq!(
+        Qwen35Config {
+            tie_word_embeddings: true,
+            ..untied
+        },
+        Qwen35Config::qwen35_2b().unwrap()
+    );
+    // Only text_config flipped: the two disagree.
+    refused(
+        &edited(&[(
+            "\"rms_norm_eps\": 1e-06,\n        \"tie_word_embeddings\": true",
+            "\"rms_norm_eps\": 1e-06,\n        \"tie_word_embeddings\": false",
+        )]),
+        "disagrees",
+    );
+    refused(&both("true", "\"yes\""), "must be true or false");
+}
+
 #[test]
 fn features_the_forward_lacks_are_refused_by_name() {
-    let untied_text = edited(&[(
-        "\"rms_norm_eps\": 1e-06,\n        \"tie_word_embeddings\": true",
-        "\"rms_norm_eps\": 1e-06,\n        \"tie_word_embeddings\": false",
-    )]);
-    refused(&untied_text, "untied embeddings");
     refused(
         &edited(&[("\"attention_bias\": false", "\"attention_bias\": true")]),
         "attention_bias",

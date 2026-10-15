@@ -85,6 +85,10 @@ fn named(cfg: &Qwen35Config, g: &Qwen35Grads, prefix: &str, part: Option<usize>)
     if part.is_none() || part == Some(usize::MAX) {
         out.push((format!("{prefix}embed_tokens.weight"), read_t(&g.embed).2));
         out.push((format!("{prefix}norm.weight"), read(&g.final_norm, h)));
+        // An untied model's head sits at the checkpoint root, not under the tower.
+        if let Some(head) = &g.lm_head {
+            out.push(("lm_head.weight".to_string(), read_t(head).2));
+        }
     }
     for (l, lg) in g.layers.iter().enumerate() {
         if part.is_some_and(|p| p != l) {
@@ -499,6 +503,9 @@ fn widened(t: &Tensor) -> Vec<f32> {
 /// Every bank tensor of `g` and the f32 gradient it should hold, by name.
 fn bank_pairs<'a>(bank: &'a Qwen35Grads, fresh: &'a Qwen35Grads) -> Vec<(String, &'a Tensor, &'a Tensor)> {
     let mut out = vec![("embed".to_string(), &bank.embed, &fresh.embed)];
+    if let (Some(b), Some(f)) = (&bank.lm_head, &fresh.lm_head) {
+        out.push(("lm_head".to_string(), b, f));
+    }
     for (l, (b, f)) in bank.layers.iter().zip(&fresh.layers).enumerate() {
         for (n, x, y) in [
             ("gate", &b.gate, &f.gate),
@@ -2089,4 +2096,307 @@ fn real_2b_bank_accumulates_within_the_bound() {
         }
     }
     eprintln!("worst accumulated deviation: {worst:.2} u of the tensor's largest |x| + |y|");
+}
+
+// ------------------------------------------------------------ untied head ---
+
+fn untied_dir() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/qwen35_train_untied")
+}
+
+fn untied_config() -> Qwen35Config {
+    let cfg = Qwen35Config::from_config_file(&untied_dir().join("config.json")).unwrap();
+    assert!(!cfg.tie_word_embeddings);
+    cfg
+}
+
+/// An untied model (`make_train_fixture.py tiny --untied`, the 9B's layout)
+/// against transformers' autograd: the loss, the `lm_head.weight` gradient
+/// and the embedding's (the gather's alone, since the head no longer reads
+/// the embedding), and every other gradient, at the tied fixture's bounds
+/// (loss 1e-5, gradients 1e-4 of their peaks). `compare` also asserts that
+/// every reference gradient file, `grad.lm_head.weight.npy` included, was
+/// compared.
+#[test]
+fn untied_step_matches_transformers_autograd() {
+    let dir = untied_dir();
+    let cfg = untied_config();
+    let model = load(&dir, "model.", cfg.clone(), Precision::F32);
+    let ids = ids(&dir);
+    let step = model.train_step(&ids, GemmOperands::ExactF32).unwrap();
+    let head = step
+        .grads
+        .lm_head
+        .as_ref()
+        .expect("an untied model's gradients carry the head's");
+    assert_eq!(head.shape(), step.grads.embed.shape());
+    let worst = compare(&dir, "model.", &cfg, &step, 1e-5, 1e-4);
+    eprintln!("untied: worst parameter gradient {worst:.2e}");
+    assert!(dir.join("grad.lm_head.weight.npy").exists());
+    // Two separate gradients: nothing sums the head's use into the embedding.
+    let (e, hd) = (widened(&step.grads.embed), widened(head));
+    assert!(e.iter().zip(&hd).any(|(a, b)| a.to_bits() != b.to_bits()));
+
+    let ce = inference_loss(&model, &ids);
+    assert!(
+        (ce - step.loss).abs() <= 1e-5 * ce.abs(),
+        "inference loss {ce} vs training loss {}",
+        step.loss
+    );
+    let again = model.train_step(&ids, GemmOperands::ExactF32).unwrap();
+    assert_eq!(again.loss.to_bits(), step.loss.to_bits(), "loss changed on a rerun");
+
+    // The bf16-stored tower, on bf16 operands, at the tied fixture's bf16 bounds.
+    let (_, bf16) = load_tower(&dir, cfg.clone(), Precision::Bf16);
+    let step = bf16.train_step(&ids, GemmOperands::Bf16).unwrap();
+    let worst = compare(&dir, "model.", &cfg, &step, 2f64.powi(-7), 2f64.powi(-4));
+    eprintln!("untied, bf16 storage: worst parameter gradient {worst:.2e}");
+}
+
+/// Every way a step reaches a bank puts an untied head's gradient in the
+/// head's matrix and the gather's alone in the embedding's: in place into an
+/// f32 bank, a vocabulary chunk at a time into a bf16 one (each element
+/// rounded once, as a tied embedding's are), scored rows, a step with no
+/// supervised position (a head gradient of zero over what the bank held,
+/// bit for bit, in both dtypes), a split `train_forward` and
+/// `train_backward_into`, and accumulation.
+#[test]
+fn untied_bank_takes_the_head_and_the_gather_separately() {
+    let dir = untied_dir();
+    let cfg = untied_config();
+    let ids = ids(&dir);
+    let other: Vec<u32> = ids.iter().rev().copied().collect();
+    let none = Supervise::Rows {
+        positions: &[],
+        targets: &[],
+        scale: 1.0,
+    };
+    for precision in [Precision::F32, Precision::Bf16] {
+        let mm = if precision == Precision::F32 {
+            GemmOperands::ExactF32
+        } else {
+            GemmOperands::Bf16
+        };
+        let (_, model) = load_tower(&dir, cfg.clone(), precision);
+        let a = model.train_step(&ids, mm).unwrap();
+        let b = model.train_step(&other, mm).unwrap();
+        let bank = Qwen35Grads::zeros_like(&model).unwrap();
+        let head = bank
+            .lm_head
+            .as_ref()
+            .expect("a bank for an untied model carries a head");
+        assert_eq!((head.dtype, head.shape()), (bank.embed.dtype, bank.embed.shape()));
+        // The bank's matrices are the fresh step's, rounded once into the bank's dtype.
+        let rounded = |t: &Tensor, f: &Tensor| -> (Vec<u32>, Vec<u32>) {
+            let want = widened(f);
+            let want: Vec<u32> = if t.dtype == DType::BF16 {
+                want.iter()
+                    .map(|&x| bf16_bits_to_f32(f32_to_bf16_bits(x)).to_bits())
+                    .collect()
+            } else {
+                want.iter().map(|x| x.to_bits()).collect()
+            };
+            (widened(t).iter().map(|x| x.to_bits()).collect(), want)
+        };
+        let check = |bank: &Qwen35Grads, fresh: &Qwen35Grads, what: &str| {
+            for (name, got, want) in bank_pairs(bank, fresh)
+                .into_iter()
+                .filter(|(n, ..)| !n.starts_with("layers"))
+            {
+                let (g, w) = rounded(got, want);
+                assert!(g == w, "{precision:?} {what}: {name} is not the fresh step's gradient");
+            }
+        };
+        model
+            .train_step_into(&ids, mm, Supervise::Causal, &bank, false)
+            .unwrap();
+        check(&bank, &a.grads, "causal step into the bank");
+        let (e, hd) = (widened(&bank.embed), widened(bank.lm_head.as_ref().unwrap()));
+        assert!(
+            e.iter().zip(&hd).any(|(x, y)| x.to_bits() != y.to_bits()),
+            "head and embedding gradients are one"
+        );
+
+        // Accumulating adds each matrix's own gradient: bf16(bank + g) (f32 add) per element.
+        model
+            .train_step_into(&other, mm, Supervise::Causal, &bank, true)
+            .unwrap();
+        for (name, got, g2) in bank_pairs(&bank, &b.grads)
+            .into_iter()
+            .filter(|(n, ..)| !n.starts_with("layers"))
+        {
+            let first = bank_pairs(&a.grads, &a.grads)
+                .into_iter()
+                .find(|(n, ..)| *n == name)
+                .map(|(_, t, _)| widened(t))
+                .unwrap();
+            let want: Vec<u32> = first
+                .iter()
+                .zip(widened(g2))
+                .map(|(&r, g)| {
+                    let r = if got.dtype == DType::BF16 {
+                        bf16_bits_to_f32(f32_to_bf16_bits(r))
+                    } else {
+                        r
+                    };
+                    let s = r + g;
+                    if got.dtype == DType::BF16 {
+                        bf16_bits_to_f32(f32_to_bf16_bits(s)).to_bits()
+                    } else {
+                        s.to_bits()
+                    }
+                })
+                .collect();
+            let have: Vec<u32> = widened(got).iter().map(|x| x.to_bits()).collect();
+            assert!(
+                have == want,
+                "{precision:?}: {name}: the accumulated bank is not bank + g"
+            );
+        }
+
+        // No supervised position: the head's gradient is zero, over a non-zero
+        // bank when not accumulating, and unchanged when accumulating.
+        let before: Vec<u32> = widened(bank.lm_head.as_ref().unwrap())
+            .iter()
+            .map(|x| x.to_bits())
+            .collect();
+        assert!(before.iter().any(|&x| f32::from_bits(x) != 0.0));
+        model.train_step_into(&ids, mm, none, &bank, true).unwrap();
+        let after: Vec<u32> = widened(bank.lm_head.as_ref().unwrap())
+            .iter()
+            .map(|x| x.to_bits())
+            .collect();
+        assert!(
+            after == before,
+            "{precision:?}: an unscored accumulated step moved the head's gradient"
+        );
+        model.train_step_into(&ids, mm, none, &bank, false).unwrap();
+        assert!(
+            widened(bank.lm_head.as_ref().unwrap()).iter().all(|&x| x == 0.0),
+            "{precision:?}: an unscored step left the previous head gradient in the bank"
+        );
+        assert!(
+            widened(&bank.embed).iter().all(|&x| x == 0.0),
+            "{precision:?}: the gather of a zero gradient is not zero"
+        );
+
+        // A scored subset of rows, into the bank in place or by chunk, against the
+        // split forward and backward (which holds the head's gradient as a fresh
+        // tensor and delivers it).
+        let rows = Supervise::Rows {
+            positions: &[5, 40, 69],
+            targets: &[ids[6], ids[41], ids[0]],
+            scale: 0.5,
+        };
+        let split = Qwen35Grads::zeros_like(&model).unwrap();
+        let p = model.train_forward(&ids, mm, rows).unwrap();
+        model.train_backward_into(p, None, &split, false).unwrap();
+        model.train_step_into(&ids, mm, rows, &bank, true).unwrap();
+        model.train_step_into(&ids, mm, rows, &bank, false).unwrap();
+        check(&bank, &split, "scored rows");
+
+        // train_forward, then the backward into a bank.
+        let p = model.train_forward(&ids, mm, Supervise::Causal).unwrap();
+        model.train_backward_into(p, None, &bank, false).unwrap();
+        check(&bank, &a.grads, "train_backward_into");
+    }
+
+    // A bank of the other layout is refused before anything runs.
+    let (_, model) = load_tower(&dir, cfg.clone(), Precision::F32);
+    let tied_model = load(&fixture(), "model.", tiny_config(), Precision::F32);
+    let tied_bank = Qwen35Grads::zeros_like(&tied_model).unwrap();
+    assert!(tied_bank.lm_head.is_none());
+    let e = model
+        .train_step_into(&ids, GemmOperands::ExactF32, Supervise::Causal, &tied_bank, false)
+        .unwrap_err();
+    assert!(e.contains("lm_head"), "{e}");
+    let untied_bank = Qwen35Grads::zeros_like(&model).unwrap();
+    let e = tied_model
+        .train_step_into(&ids, GemmOperands::ExactF32, Supervise::Causal, &untied_bank, false)
+        .unwrap_err();
+    assert!(e.contains("lm_head") && e.contains("tied"), "{e}");
+}
+
+/// The parameter table, the host copies and AdamW carry the head as an entry
+/// of its own, after the tied layout's entries (so every tied index is the
+/// same): `lm_head.weight` reads, writes and updates apart from
+/// `embed_tokens.weight`, with its own moments, the first AdamW step being
+/// `w - lr * g / (|g| + eps)` per element (zero decay, bias-corrected first
+/// step) for each.
+#[test]
+fn untied_head_is_its_own_parameter_gradient_and_adamw_entry() {
+    let dir = untied_dir();
+    let cfg = untied_config();
+    let ids = ids(&dir);
+    let (rt, model) = load_rt(&dir, "model.", cfg.clone(), Precision::F32);
+    let tied = load(&fixture(), "model.", tiny_config(), Precision::F32);
+    let (table, tied_table) = (model.parameter_table().unwrap(), tied.parameter_table().unwrap());
+    assert_eq!(table.len(), tied_table.len() + 1);
+    assert_eq!(table[..tied_table.len()], tied_table[..], "the tied layout moved");
+    let hi = table.len() - 1;
+    assert_eq!(table[hi].name, "lm_head.weight");
+    assert_eq!(table[hi].shape, [cfg.vocab as usize, cfg.hidden as usize]);
+    let n = table[hi].shape.iter().product::<usize>();
+
+    // Writes are separate: doubling the head doubles every logit exactly; the
+    // embedding does not move it by itself (it changes the hidden states instead).
+    let logits = model.forward(&ids, false).unwrap().logits;
+    let mut head = vec![0.0f32; n];
+    model.read_parameter_host(hi, &mut head).unwrap();
+    let mut embed = vec![0.0f32; n];
+    model.read_parameter_host(0, &mut embed).unwrap();
+    assert!(
+        head.iter().zip(&embed).any(|(a, b)| a != b),
+        "the fixture's head is its embedding"
+    );
+    model
+        .write_parameter_host(hi, &head.iter().map(|x| x * 2.0).collect::<Vec<_>>())
+        .unwrap();
+    let doubled = model.forward(&ids, false).unwrap().logits;
+    assert!(
+        logits
+            .iter()
+            .zip(&doubled)
+            .all(|(a, b)| (a * 2.0 - b).abs() <= 1e-6 * a.abs().max(1e-3)),
+        "head write"
+    );
+    model.write_parameter_host(hi, &head).unwrap();
+    assert_eq!(
+        model.forward(&ids, false).unwrap().logits,
+        logits,
+        "restoring the head restores the logits"
+    );
+
+    let step = model.train_step(&ids, GemmOperands::ExactF32).unwrap();
+    let hyper = AdamWHyper::default();
+    let mut state = AdamW::new(&model).unwrap();
+    let wd = model.default_weight_decay(0.0).unwrap();
+    assert_eq!(wd.len(), table.len());
+    let mut grads = [(0usize, vec![0.0f32; n]), (hi, vec![0.0f32; n])];
+    for (i, g) in &mut grads {
+        model.read_gradient_host(&step.grads, *i, g).unwrap();
+        assert!(g.iter().any(|&x| x != 0.0), "entry {i} has a zero gradient");
+    }
+    model.adamw_step(&step.grads, &mut state, &hyper, &wd).unwrap();
+    for ((i, g), before) in grads.iter().zip([&embed, &head]) {
+        let mut after = vec![0.0f32; n];
+        model.read_parameter_host(*i, &mut after).unwrap();
+        let mut m = vec![0.0f32; n];
+        model
+            .read_adamw_moment_host(&state, tessl::qwen35_adamw::Moment::First, *i, &mut m)
+            .unwrap();
+        let mut worst = 0.0f64;
+        for k in 0..n {
+            let want = f64::from(before[k]) - hyper.lr * f64::from(g[k]) / (f64::from(g[k]).abs() + hyper.eps);
+            worst = worst.max((f64::from(after[k]) - want).abs());
+            let want_m = (1.0 - hyper.beta1) * f64::from(g[k]);
+            assert!(
+                (f64::from(m[k]) - want_m).abs() <= 1e-6 * want_m.abs().max(1e-6),
+                "entry {i} first moment [{k}]"
+            );
+        }
+        assert!(worst <= 2e-6, "entry {i}: AdamW update off by {worst:.2e}");
+        assert!(before.iter().zip(&after).any(|(a, b)| a != b), "entry {i} did not move");
+    }
+    let _ = rt;
 }

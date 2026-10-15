@@ -109,8 +109,13 @@ pub struct LayerGrads {
 
 /// Every parameter's gradient.
 pub struct Qwen35Grads {
-    /// `[vocab, hidden]`: the tied embedding and LM head, both uses summed.
+    /// `[vocab, hidden]`: the embedding's gradient. Tied, the embedding is
+    /// also the LM head and this holds both uses summed.
     pub embed: Tensor,
+    /// `[vocab, hidden]`: an untied model's LM head gradient (`Some` exactly
+    /// when [`Qwen35Model`] has its own `lm_head`); the embedding's is then
+    /// the gather's alone.
+    pub lm_head: Option<Tensor>,
     pub final_norm: GpuBuffer,
     pub layers: Vec<LayerGrads>,
 }
@@ -232,6 +237,7 @@ impl Qwen35Grads {
         }
         Ok(Self {
             embed: zeros_tensor(&model.embed)?,
+            lm_head: model.lm_head.as_ref().map(zeros_tensor).transpose()?,
             final_norm: zeros_buf(model, &model.final_norm)?,
             layers,
         })
@@ -315,12 +321,15 @@ pub struct PendingStep {
     resid: Tensor,
     xf: Tensor,
     dxf: Tensor,
-    /// The LM head's weight gradient; none when the step scores nothing in
-    /// tessl, whose embedding gradient is then the gather's alone, or when
-    /// the head went straight into the bank (`head_in_bank`, `token_rows`).
+    /// The LM head's weight gradient (tied: the embedding's, which the
+    /// gather adds onto; untied: the head's own, which the gather never
+    /// touches); none when the step scores nothing in tessl, whose embedding
+    /// gradient is then the gather's alone, or when the head went straight
+    /// into the bank (`head_in_bank`, `token_rows`).
     d_embed: Option<Tensor>,
-    /// The cross-entropy wrote (or added) the head gradient into the bank's
-    /// f32 embedding itself, which the gather then adds onto.
+    /// The cross-entropy wrote (or added) the head gradient into the bank
+    /// itself: tied, into the f32 embedding the gather then adds onto;
+    /// untied, into the head's matrix (in place or a chunk at a time).
     head_in_bank: bool,
     /// The cross-entropy delivered the head gradient into a bank embedding
     /// a chunk at a time ([`Head::ByChunk`]), all but these rows, the
@@ -396,6 +405,38 @@ fn zero_part(rt: &Arc<GpuRuntime>, (b, off, n, dtype): Part<'_>) -> Result<(), S
         set_gpu_buf_offset(bnd, b, off, 0);
         set_u32(bnd, n32, 1);
     })
+}
+
+/// Rows `[v0, v0 + w)` of the `[vocab, hidden]` matrix `t`, as a [`Part`].
+fn matrix_rows_part(t: &Tensor, v0: usize, w: usize) -> Part<'_> {
+    let hidden = t.shape()[1];
+    let elem = if t.dtype == DType::BF16 { 2 } else { 4 };
+    (&t.buffer, t.byte_offset() + v0 * hidden * elem, w * hidden, t.dtype)
+}
+
+/// Zero a `[vocab, hidden]` bank matrix: f32 in one dispatch, bf16 (which
+/// [`zero_part`] does not write) from a zeroed f32 chunk delivered over each
+/// run of rows, so no `[vocab, hidden]` f32 tensor is made.
+fn zero_matrix(rt: &Arc<GpuRuntime>, t: &Tensor) -> Result<(), String> {
+    if t.dtype != DType::BF16 {
+        return zero_part(rt, tensor_part(t));
+    }
+    let (vocab, hidden) = (t.shape()[0], t.shape()[1]);
+    let chunk = CE_CHUNK.min(vocab as u32) as usize;
+    let zeros = tensor(rt, &[chunk, hidden])?;
+    zero_part(rt, tensor_part(&zeros))?;
+    let mut v0 = 0;
+    while v0 < vocab {
+        let w = chunk.min(vocab - v0);
+        deliver(
+            rt,
+            &[matrix_rows_part(&zeros, 0, w)],
+            &[matrix_rows_part(t, v0, w)],
+            false,
+        )?;
+        v0 += w;
+    }
+    Ok(())
 }
 
 /// Whether a bank's embedding gradient takes the head's and the gather's
@@ -724,10 +765,20 @@ impl Qwen35Model {
                 self.layers.len()
             ));
         }
-        let top = [
+        let mut top = vec![
             ("embed", tensor_part(&bank.embed), tensor_part(&self.embed)),
             ("final_norm", buf_part(&bank.final_norm), buf_part(&self.final_norm)),
         ];
+        match (&bank.lm_head, &self.lm_head) {
+            (Some(g), Some(w)) => top.push(("lm_head", tensor_part(g), tensor_part(w))),
+            (None, None) => {}
+            (Some(_), None) => return Err(format!("{what}: the bank has an lm_head gradient, the model is tied")),
+            (None, Some(_)) => {
+                return Err(format!(
+                    "{what}: the model has an untied lm_head and the bank none (Qwen35Grads::zeros_like of this model)"
+                ))
+            }
+        }
         let dtype_ok = |d: DType| matches!(d, DType::F32 | DType::BF16);
         for (name, (b, _, n, d), (_, _, want, _)) in top {
             require_runtime(&self.rt, b, format_args!("{what}: the bank's {name}"))?;
@@ -764,8 +815,16 @@ impl Qwen35Model {
     ) -> Result<(f64, Option<Qwen35Grads>), String> {
         let head = match bank {
             None => Head::Fresh,
-            Some((b, add)) if embed_in_place(&b.embed) => Head::InPlace(&b.embed, add),
-            Some((b, add)) => Head::ByChunk(&b.embed, add),
+            // The bank matrix that takes the head's gradient: an untied
+            // model's own, else the embedding's.
+            Some((b, add)) => {
+                let target = b.lm_head.as_ref().unwrap_or(&b.embed);
+                if embed_in_place(target) {
+                    Head::InPlace(target, add)
+                } else {
+                    Head::ByChunk(target, add)
+                }
+            }
         };
         let p = self.step_forward(ids, operands, sup, bank.is_none(), head)?;
         let loss = p.loss;
@@ -927,7 +986,10 @@ impl Qwen35Model {
         } else {
             None
         };
-        let token_rows = if scores && head.kind() == HeadKind::ByChunk {
+        let untied = self.lm_head.is_some();
+        // Tied, the head's by-chunk rows wait for the gather on the token
+        // rows; an untied head's go straight into its own bank matrix.
+        let token_rows = if scores && head.kind() == HeadKind::ByChunk && !untied {
             Some(TokenRows::new(rt, ids, h)?)
         } else {
             None
@@ -943,53 +1005,39 @@ impl Qwen35Model {
             }
             _ => zero_part(rt, tensor_part(&dxf))?,
         }
+        let head_w = self.head_table();
         let ce = |rows: &[u32], targets: &[u32], reduction, dh: &Tensor, scale| {
             let chunk = CE_CHUNK.min(cfg.vocab);
-            let ws = CeWorkspace::new(rt, rows.len() as u32, cfg.hidden, chunk, self.embed.dtype, operands)?;
+            let ws = CeWorkspace::new(rt, rows.len() as u32, cfg.hidden, chunk, head_w.dtype, operands)?;
             let hidden = CeHidden { rows: &xf, off: 0 };
             let (dw, add) = match (head, &d_embed) {
                 (Head::InPlace(bank, add), _) => (bank, add),
                 (Head::Fresh, Some(d)) => (d, false),
                 (Head::ByChunk(bank, add), _) => {
-                    let tr = token_rows.as_ref().ok_or("a scored step has its token rows")?;
                     // Each chunk's rows, written by its GEMM and delivered
                     // before the next chunk's overwrites them.
                     let scratch = tensor(rt, &[chunk as usize, h])?;
-                    let mut sink = |v0: usize, rows: &Tensor| {
-                        head_rows_to_bank(rt, bank, add, tr, v0, rows.shape()[0], Some(rows))
+                    let mut sink = |v0: usize, rows: &Tensor| match token_rows.as_ref() {
+                        Some(tr) => head_rows_to_bank(rt, bank, add, tr, v0, rows.shape()[0], Some(rows)),
+                        // Untied: the rows are the head's alone.
+                        None => deliver(
+                            rt,
+                            &[tensor_part(rows)],
+                            &[matrix_rows_part(bank, v0, rows.shape()[0])],
+                            add,
+                        ),
                     };
                     return cross_entropy_rows_chunked(
-                        rt,
-                        hidden,
-                        &self.embed,
-                        rows,
-                        targets,
-                        reduction,
-                        operands,
-                        &ws,
-                        dh,
-                        scale,
-                        &scratch,
-                        &mut sink,
+                        rt, hidden, head_w, rows, targets, reduction, operands, &ws, dh, scale, &scratch, &mut sink,
                     );
                 }
                 (Head::Fresh, None) => return Err("a scored step has a head gradient".to_string()),
             };
             let grads = CeGrads { dh, dw, scale };
             if add {
-                cross_entropy_rows_accumulating(rt, hidden, &self.embed, rows, targets, reduction, operands, &ws, grads)
+                cross_entropy_rows_accumulating(rt, hidden, head_w, rows, targets, reduction, operands, &ws, grads)
             } else {
-                cross_entropy_rows(
-                    rt,
-                    hidden,
-                    &self.embed,
-                    rows,
-                    targets,
-                    reduction,
-                    operands,
-                    &ws,
-                    Some(grads),
-                )
+                cross_entropy_rows(rt, hidden, head_w, rows, targets, reduction, operands, &ws, Some(grads))
             }
         };
         let loss = match sup {
@@ -1021,7 +1069,14 @@ impl Qwen35Model {
             xf,
             dxf,
             d_embed,
-            head_in_bank: scores && head.kind() == HeadKind::InPlace,
+            // Tied: the head went in place into the embedding bank. Untied:
+            // into the head's bank matrix, in place or by chunk.
+            head_in_bank: scores
+                && match head.kind() {
+                    HeadKind::Fresh => false,
+                    HeadKind::InPlace => true,
+                    HeadKind::ByChunk => untied,
+                },
             token_rows,
             loss,
             attn_ws,
@@ -1160,6 +1215,40 @@ impl Qwen35Model {
             }
         }
         layers.reverse();
+        // An untied head's gradient is settled here, and the gather then
+        // proceeds as a step with no head gradient: onto nothing, into the
+        // embedding alone.
+        let (mut d_embed, mut head_in_bank, mut token_rows) = (d_embed, head_in_bank, token_rows);
+        let mut head_fresh = None;
+        if self.lm_head.is_some() {
+            match bank {
+                Some((b, add)) => {
+                    let hb = b
+                        .lm_head
+                        .as_ref()
+                        .ok_or("Qwen35Model::train_step: the bank has no lm_head for an untied model")?;
+                    match d_embed.take() {
+                        Some(d) => deliver(rt, &[tensor_part(&d)], &[tensor_part(hb)], add)?,
+                        // Written in the bank already by the cross-entropy.
+                        None if head_in_bank => {}
+                        // Nothing scored: the bank's head gradient is zero.
+                        None if !add => zero_matrix(rt, hb)?,
+                        None => {}
+                    }
+                }
+                None => {
+                    head_fresh = Some(match d_embed.take() {
+                        Some(d) => d,
+                        None => {
+                            let d = tensor(rt, &[cfg.vocab as usize, h])?;
+                            zero_part(rt, tensor_part(&d))?;
+                            d
+                        }
+                    });
+                }
+            }
+            (head_in_bank, token_rows) = (false, None);
+        }
         // The gather's gradient adds onto the head's. Into an f32 bank whose
         // embedding is a whole buffer it adds straight into the bank: onto
         // the head gradient the cross-entropy already wrote there, or, with
@@ -1222,6 +1311,7 @@ impl Qwen35Model {
         rt.synchronize()?;
         Ok(Some(Qwen35Grads {
             embed: dw,
+            lm_head: head_fresh,
             final_norm,
             layers,
         }))
@@ -1359,7 +1449,8 @@ impl Qwen35Model {
         };
         // At most `t` distinct tokens: their f32 rows and their ids.
         let head_held = match head {
-            HeadKind::Fresh => f(v * h),
+            // Untied, the gather's gradient is a second [vocab, hidden] tensor.
+            HeadKind::Fresh => f(v * h).saturating_mul(1 + u64::from(self.lm_head.is_some())),
             HeadKind::InPlace => 0,
             HeadKind::ByChunk => sum(&[th, f(tu)]),
         };

@@ -225,7 +225,7 @@ let out = model.encode_audio(&[AudioInput { input_features, mask }, ...], false)
 
 > **Status** (Apple M5 Pro, 2026-10-15, branch
 > `worktree-agent-a975c42e7f8ed0908` on base `60a6240`, snapshot
-> `914f7f89`; torch 2.12.1, transformers 5.19.0): every bound below holds. The
+> `914f7f89`; torch 2.14.1, transformers 5.19.0): every bound below holds. The
 > runtime has no `async_scope` on this base, so `encode_audio` queues its
 > forwards and ends with one `synchronize()`.
 

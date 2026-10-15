@@ -286,7 +286,9 @@ fn eager_references_encode_the_inverted_mask() {
                 first_bad = Some((name, err / scale));
             }
         }
-        let (name, rel) = first_bad.expect("the eager references agree: the bug is fixed upstream, retire this test");
+        let (name, rel) = first_bad.expect(
+            "the eager references agree: the transformers 5.19.0 eager mask bug is fixed upstream, retire this test",
+        );
         assert_eq!(name, "layer0", "the eager references first disagree at {name}");
         assert!(rel > 1e-2, "layer0 differs by only {rel:.3e}");
     });

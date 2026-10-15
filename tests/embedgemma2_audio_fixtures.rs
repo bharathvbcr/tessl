@@ -126,6 +126,7 @@ fn transformers_eager_differs_from_the_specified_mask() {
     eprintln!("eager vs specified tower output: {rel:.2e} of max |ref|");
     assert!(
         rel > 1e-2,
-        "eager agrees with the specified mask ({rel:.2e}): retire this test"
+        "eager agrees with the specified mask ({rel:.2e}): the transformers 5.19.0 eager mask bug is fixed upstream, \
+         so retire this test and the eager notes in docs/embedgemma2.md"
     );
 }

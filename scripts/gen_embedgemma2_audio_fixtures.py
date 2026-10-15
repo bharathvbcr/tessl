@@ -29,6 +29,7 @@ tensor: name, then its dims; names as in the checkpoint), and per clip `c{n}_`:
 Deterministic: rerunning rewrites identical files.
 """
 
+import importlib.metadata
 import json
 import os
 from types import SimpleNamespace
@@ -134,6 +135,11 @@ def main():
         if n == 1:
             save(f"c{n}_eager_tower", e.last_hidden_state[0].numpy())
         print(f"clip {n}: {frames} frames, {int(mask.sum())} valid, tower rows {om.shape[0]}, kept {int(om.sum())}")
+
+    with open(os.path.join(OUT, "eg2a_audio_provenance.json"), "w") as f:
+        json.dump({"versions": {p: importlib.metadata.version(p) for p in ("torch", "numpy", "transformers")},
+                   "generator": "scripts/gen_embedgemma2_audio_fixtures.py"}, f, indent=1)
+        f.write("\n")
 
 
 if __name__ == "__main__":

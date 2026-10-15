@@ -2042,8 +2042,11 @@ fn global_h512_with_scalars_pins_out_bf16_after_the_callback() {
         // tiled kernel that `_with_scalars` dispatches.
         nn::flash_attn_global_h512_tiled(rt, &qb, &kb, &vb, &reference, &tkv, &zero, &zero, dims, true).unwrap();
 
-        let o = rt.alloc_buffer(n * 2).unwrap();
-        o.zero();
+        // `o` is bf16-sized plus an equal guard region after it, filled with a
+        // sentinel: an f32 write (slot 12 left at 0) would run into the guard.
+        const GUARD: u32 = 0xA5A5_A5A5;
+        let o = rt.alloc_buffer(n * 4).unwrap();
+        o.write_u32(&vec![GUARD; n]);
         // SAFETY: the callback binds only documented scalar slots (and slot
         // 12 to the wrong value, which the wrapper overrides).
         unsafe {
@@ -2076,6 +2079,10 @@ fn global_h512_with_scalars_pins_out_bf16_after_the_callback() {
             o.read_u32()[..n / 2],
             reference.read_u32()[..n / 2],
             "bf16 output differs"
+        );
+        assert!(
+            o.read_u32()[n / 2..n].iter().all(|&w| w == GUARD),
+            "the kernel wrote past the bf16-sized output"
         );
     });
 }

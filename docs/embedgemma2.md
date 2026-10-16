@@ -1588,3 +1588,34 @@ about 1 % of the forward at
 of the stage sum, and about 8 % at `Bf16` (15.6 ms of 201 ms), where the casts and the
 row passes together were a fifth of it. The `Bf16` forward rests more on elementwise
 passes because its GEMMs are 4.2x faster at 8x1024 (82 ms against 342 ms).
+
+### Speed (text-encoder fusion)
+
+No end-to-end speedup is claimed. `bench_paired --evidence --rounds 6 --max-spread 1.25
+--clean-env` (lanes: `5229a1c` at `ExactF32` and `Bf16`, a byte copy of the `5229a1c`
+binary as the control, and this change at both precisions; the eight workloads of
+`bench/results/embedgemma2_final_m5pro.txt`) was refused by its own drift gate twice, on a
+host whose 1-minute load average stayed between 66 and 108 (other jobs on the same GPU):
+
+| attempt | finished | series over the 1.25x limit | spread range |
+|---|---|---|---|
+| 1 | 10:12 | 51 | 1.316x to 6.541x |
+| 2 | 11:24 | 55 | 1.292x to 19.254x |
+
+Nothing from either attempt is published (the control lane's own ratio against the base
+moved 1.6x to 5.3x). The 10-minute-apart third attempt was not made in this session. What
+stands instead is the dispatch count (exact, pinned by test) and the profile above, which
+is itself taken on the shared GPU: about 1 % of the `ExactF32` forward and about 8 % of the
+`Bf16` forward at 8x1024 are the most the row passes can give (inferred from the stage
+sums, not measured end to end). `bench_paired --evidence --rounds 6 --max-spread 1.25`
+on an idle host is the run that settles it.
+
+### What is left (text-encoder fusion)
+
+- `gelu(gate) * up` (5 to 6 % of the stage sum at `ExactF32`, 12 to 15 % at `Bf16`) into the
+  `gate|up` GEMM: a new GEMM kernel with its own bit-identity question, see above.
+- The f32 `a.attn` buffer is dead at `Bf16` apart from its role as split-K scratch; dropping
+  it changes the itemised bytes `tests/embedgemma2_memory.rs` and
+  `tests/embedgemma2_small_m.rs` assert.
+- GEMMs that write bf16 directly would drop the remaining casts but change the bits the
+  `Bf16` hashes pin, so they need their own bound.

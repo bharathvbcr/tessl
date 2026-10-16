@@ -193,6 +193,36 @@ fn tie_word_embeddings_refusals_name_the_key() {
     }
 }
 
+/// An absent `attn_output_gate` or `mamba_ssm_dtype` takes the value the code
+/// implements (gated attention, a float32 GDN state), and a present key with a
+/// different value is refused (tessl ft-b8561dbb's rule). transformers 5.17.0
+/// applies the gate unconditionally and casts the GDN rules to float32
+/// (`modeling_qwen3_5.py`), so a config that omits either key describes this
+/// model.
+#[test]
+fn absent_gate_and_state_dtype_keys_take_the_implemented_values() {
+    let want = Qwen35Config::qwen35_2b().unwrap();
+    for (key, text) in [
+        ("attn_output_gate", edited(&[("\"attn_output_gate\": true,", "")])),
+        ("mamba_ssm_dtype", edited(&[("\"mamba_ssm_dtype\": \"float32\",", "")])),
+        (
+            "both",
+            edited(&[
+                ("\"attn_output_gate\": true,", ""),
+                ("\"mamba_ssm_dtype\": \"float32\",", ""),
+            ]),
+        ),
+    ] {
+        assert!(!text.contains(key) || key == "both", "the edit removed {key}");
+        let got = Qwen35Config::from_config_json(&text).unwrap_or_else(|e| panic!("absent {key}: {e}"));
+        assert_eq!(got, want, "absent {key}");
+    }
+    refused(
+        &edited(&[("\"mamba_ssm_dtype\": \"float32\"", "\"mamba_ssm_dtype\": \"bfloat16\"")]),
+        "mamba_ssm_dtype",
+    );
+}
+
 #[test]
 fn features_the_forward_lacks_are_refused_by_name() {
     refused(

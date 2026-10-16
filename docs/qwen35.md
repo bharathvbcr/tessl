@@ -286,8 +286,8 @@ each is ~1e-6 from an f64 reference (details under Verification).
 `dims.window` must be 0.
 
 `attn_prefill_by_length` selects `attn_prefill` (`ATTN_PREFILL_TILE`) across
-every query length $t_q$ (`prefill_attn_kernel` returns
-`PrefillAttnKernel::Tiled` with no length cutoff). Paired and interleaved in
+every query length $t_q$ (a direct call: there is no length cutoff, so the
+former `PrefillAttnKernel` selector was removed). Paired and interleaved in
 one process on an M5 Pro (`bench_qwen35_layers --paired-attn`, same Q/K/V,
 ABBA, 9 rounds), `attn_prefill` beat `nn::flash_attn_rows` at both lengths with
 non-overlapping sample ranges (per launch, median / min: $T = 200$,

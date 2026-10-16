@@ -249,9 +249,14 @@ Two files, neither of which touches the GPU, so both run on any host:
   is an independent golden, because the first is the output of the algorithm
   under test. Agreement is held to `64 * u_f32`, derived from a worst observed
   1.473e-6 (24.7 u) on `L127c64`.
-- **`gdn_gates.rs`** — **K7**, gate production. The fixtures store *post*-gate
-  `alpha`/`beta`, so the corpus cannot test K7 at all: it is the one kernel in
-  the set with no golden. This file is that golden.
+- **`gdn_gates.rs`** — **K7**, gate production in the *nanolab sigmoid-gate*
+  form. The fixtures store *post*-gate `alpha`/`beta`, so the corpus cannot test
+  K7 at all; this file is the golden for that operator only. It is not Qwen3.5's
+  gate: the `qwen35_gdn_gates_f32` kernel (the `A_log`/softplus/`dt_bias` form)
+  is held to `qwen35_gates_*` in `tests/fixtures/qwen35/`, captured from
+  transformers' own module, by
+  `gdn_gates_kernel_matches_the_transformers_module_golden` in
+  `tests/qwen35_kernels.rs`.
 - **`gdn_state.rs`** — **K3**, the state update, and the bound it must be judged
   by rather than the one the corpus currently uses.
 
@@ -564,7 +569,13 @@ fails if there is none). It runs the GPU and MPS tests (`test_cross_entropy.py`,
 under Lappi-decision's `tools/mac_heavy.sh` (a script in that repository, not
 this one); otherwise it prints a `SKIPPED` line. The script
 also runs `cargo test` with `--no-fail-fast` and exits non-zero if any test
-binary failed.
+binary failed. It runs the CI kernel-emulator job's steps too: the MSL dialect
+lint, the emulator host contract (`tools/msl_emu/check_qwen35.py -k
+host_contract`) and the emulator kernel cases, exact and `--fast-math`. A step
+that cannot run is named in the final line, `ci:local OK WITH SKIPS (not run:
+...)`, never reported as a plain `OK`. The emulator kills a case that makes no
+progress for `MSL_EMU_STALL_S` seconds (default 300) or runs past
+`MSL_EMU_WALL_S` (default 14400).
 
 GPU suite record (2026-10-15, commit 60a6240; hosted CI run 38739221987 ran on
 that commit and its Rust jobs were green). Machine: Apple M5 Pro (hw.model

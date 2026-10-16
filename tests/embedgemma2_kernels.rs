@@ -1512,6 +1512,81 @@ fn config_reads_the_checkpoint() {
     }
 }
 
+// ---------------------------------------------------------------------------
+// 7. The fused row passes and the bf16-output attention (G7)
+//
+// Each fused kernel is the composition of the kernels it replaced, and the
+// forward's exact-f32 result must not move a bit, so the bound is equality:
+// every output element is compared by its bit pattern with the unfused kernels
+// run on the same inputs, over widths that are and are not powers of two (1,
+// 33, 1000, 768), rows from 1 up, and a layer scale of exactly 1 (the plain
+// add) and not. Outputs are poisoned with NaN first, so an element a kernel
+// does not write cannot match.
+//
+// This block sits above `config_refuses_what_the_forward_does_not_implement`,
+// not at the end of the file: that test's string literals leave its braces
+// unbalanced, so `tests/hosted_selection.rs` reads it up to the next
+// `#[test]`, and a helper mentioning `GpuRuntime` in between would make the
+// device-free hosted test look like a device one.
+// ---------------------------------------------------------------------------
+
+use tessl::embedgemma2::{
+    encoder_attn_bf16_out, resid_add_bf16_copy, resid_add_norm_bf16, resid_add_norm_f32, scale_rms_norm_inplace,
+};
+use tessl::nn::rms_norm_bf16;
+
+const FUSED_EPS: f32 = 1e-6;
+/// `(rows, dim)`: width 1 and 33 (a ragged simdgroup), 1000 (not a power of
+/// two), the checkpoint's 512 and the 768 of its vision tower, and 2048 and
+/// 4096, where the threadgroup is as wide as the launch allows.
+const FUSED_SHAPES: [(u32, u32); 9] = [
+    (1, 1),
+    (1, 8),
+    (9, 33),
+    (3, 64),
+    (5, 512),
+    (4, 1000),
+    (7, 768),
+    (2, 2048),
+    (3, 4096),
+];
+/// Layer scales: exactly 1 (the plain add) and two that are not.
+const FUSED_LAYER_SCALES: [f32; 3] = [1.0, 0.37, 1.75];
+
+fn rand32(n: usize, seed: u64, scale: f64) -> Vec<f32> {
+    f32s(&random(n, seed, scale))
+}
+
+/// A checkpoint-like norm weight: around 1, not all equal.
+fn norm_weight(dim: usize, seed: u64) -> Vec<f32> {
+    random(dim, seed, 0.8).iter().map(|&x| (1.0 + x) as f32).collect()
+}
+
+fn bits32(v: &[f32]) -> Vec<u32> {
+    v.iter().map(|x| x.to_bits()).collect()
+}
+
+fn poisoned_f32(rt: &Arc<GpuRuntime>, n: usize) -> GpuBuffer {
+    buf_f32(rt, &vec![f32::NAN; n])
+}
+
+/// A bf16 buffer of `n` elements filled with the NaN pattern.
+fn poisoned_bf16(rt: &Arc<GpuRuntime>, n: usize) -> GpuBuffer {
+    let b = rt.alloc_buffer(n.max(1) * 2).unwrap();
+    b.write_bf16_bits(&vec![0x7fc0u16; n.max(1)]);
+    b
+}
+
+fn read_bf16_bits(rt: &Arc<GpuRuntime>, b: &GpuBuffer, n: usize) -> Vec<u16> {
+    rt.synchronize().unwrap();
+    b.try_contents_u16().unwrap()[..n].to_vec()
+}
+
+/// `bf16_rne(x)` as the 16 stored bits.
+fn bf16_bits_of(x: f32) -> u16 {
+    (bf16_rne(x).to_bits() >> 16) as u16
+}
+
 #[test]
 fn config_refuses_what_the_forward_does_not_implement() {
     let cases = [
@@ -1543,4 +1618,319 @@ fn config_refuses_what_the_forward_does_not_implement() {
             "{from} -> {to}: accepted"
         );
     }
+}
+
+#[test]
+fn the_fused_row_passes_launch_as_wide_as_the_kernels_they_replace() {
+    // The fused passes reduce a row in the lane order the unfused norms do only
+    // if both launch the same number of lanes per row; the host picks that from
+    // each pipeline's limit (`nn::reduce_tptg`), so the limits must agree.
+    use objc2_metal::MTLComputePipelineState;
+    with_gpu(|rt| {
+        let max = |name: &str| rt.pipeline(name).unwrap().maxTotalThreadsPerThreadgroup().min(1024);
+        for (fused, unfused) in [
+            ("eg2t_resid_norm_f32", "rms_norm_residual_add_f32"),
+            ("eg2t_resid_norm_f32", "rms_norm_f32"),
+            ("eg2t_resid_norm_bf16", "rms_norm_bf16"),
+            ("eg2t_resid_add_bf16_copy", "rms_norm_residual_add_f32"),
+            ("eg2t_scale_rms_norm_f32", "rms_norm_f32"),
+        ] {
+            assert_eq!(max(fused), max(unfused), "{fused} against {unfused}");
+        }
+    });
+}
+
+#[test]
+fn resid_add_norm_f32_is_the_unfused_pair_bit_for_bit() {
+    with_gpu(|rt| {
+        for (rows, dim) in FUSED_SHAPES {
+            for s in FUSED_LAYER_SCALES {
+                let n = (rows * dim) as usize;
+                let seed = 700 + u64::from(rows) * 31 + u64::from(dim);
+                let y = buf_f32(rt, &rand32(n, seed, 3.0));
+                let resid0 = rand32(n, seed + 1, 5.0);
+                let w_post = buf_f32(rt, &norm_weight(dim as usize, seed + 2));
+                let w_next = buf_f32(rt, &norm_weight(dim as usize, seed + 3));
+                let (resid_u, out_u) = (buf_f32(rt, &resid0), poisoned_f32(rt, n));
+                rms_norm_residual_add_f32(rt, &y, &w_post, &resid_u, rows, dim, FUSED_EPS, s).unwrap();
+                rms_norm_f32(rt, &resid_u, &w_next, &out_u, rows, dim, FUSED_EPS).unwrap();
+                let (resid_f, out_f) = (buf_f32(rt, &resid0), poisoned_f32(rt, n));
+                resid_add_norm_f32(rt, &y, &w_post, &resid_f, &w_next, &out_f, rows, dim, FUSED_EPS, s).unwrap();
+                rt.synchronize().unwrap();
+                let what = format!("{rows}x{dim} layer_scale {s}");
+                assert_eq!(
+                    bits32(&resid_f.read_f32()[..n]),
+                    bits32(&resid_u.read_f32()[..n]),
+                    "residual, {what}"
+                );
+                assert_eq!(
+                    bits32(&out_f.read_f32()[..n]),
+                    bits32(&out_u.read_f32()[..n]),
+                    "normed output, {what}"
+                );
+            }
+        }
+    });
+}
+
+#[test]
+fn resid_add_norm_bf16_is_the_unfused_pair_bit_for_bit() {
+    with_gpu(|rt| {
+        for (rows, dim) in FUSED_SHAPES {
+            for s in FUSED_LAYER_SCALES {
+                let n = (rows * dim) as usize;
+                let seed = 900 + u64::from(rows) * 31 + u64::from(dim);
+                let y = buf_f32(rt, &rand32(n, seed, 3.0));
+                let resid0 = rand32(n, seed + 1, 5.0);
+                let w_post = buf_f32(rt, &norm_weight(dim as usize, seed + 2));
+                let w_next = buf_f32(rt, &norm_weight(dim as usize, seed + 3));
+                let (resid_u, out_u) = (buf_f32(rt, &resid0), poisoned_bf16(rt, n));
+                rms_norm_residual_add_f32(rt, &y, &w_post, &resid_u, rows, dim, FUSED_EPS, s).unwrap();
+                rms_norm_bf16(rt, &resid_u, &w_next, &out_u, rows, dim, FUSED_EPS).unwrap();
+                let (resid_f, out_f) = (buf_f32(rt, &resid0), poisoned_bf16(rt, n));
+                resid_add_norm_bf16(rt, &y, &w_post, &resid_f, &w_next, &out_f, rows, dim, FUSED_EPS, s).unwrap();
+                rt.synchronize().unwrap();
+                let what = format!("{rows}x{dim} layer_scale {s}");
+                assert_eq!(
+                    bits32(&resid_f.read_f32()[..n]),
+                    bits32(&resid_u.read_f32()[..n]),
+                    "residual, {what}"
+                );
+                assert_eq!(
+                    read_bf16_bits(rt, &out_f, n),
+                    read_bf16_bits(rt, &out_u, n),
+                    "bf16 normed output, {what}"
+                );
+            }
+        }
+    });
+}
+
+#[test]
+fn resid_add_bf16_copy_is_the_unfused_add_and_cast_bit_for_bit() {
+    with_gpu(|rt| {
+        for (rows, dim) in FUSED_SHAPES {
+            for s in FUSED_LAYER_SCALES {
+                let n = (rows * dim) as usize;
+                let seed = 1100 + u64::from(rows) * 31 + u64::from(dim);
+                let y = buf_f32(rt, &rand32(n, seed, 3.0));
+                let resid0 = rand32(n, seed + 1, 5.0);
+                let w_post = buf_f32(rt, &norm_weight(dim as usize, seed + 2));
+                let resid_u = buf_f32(rt, &resid0);
+                rms_norm_residual_add_f32(rt, &y, &w_post, &resid_u, rows, dim, FUSED_EPS, s).unwrap();
+                let (resid_f, copy_f) = (buf_f32(rt, &resid0), poisoned_bf16(rt, n));
+                resid_add_bf16_copy(rt, &y, &w_post, &resid_f, &copy_f, rows, dim, FUSED_EPS, s).unwrap();
+                rt.synchronize().unwrap();
+                let what = format!("{rows}x{dim} layer_scale {s}");
+                let want = resid_u.read_f32();
+                assert_eq!(bits32(&resid_f.read_f32()[..n]), bits32(&want[..n]), "residual, {what}");
+                // The cast is the GPU's round to nearest even, `bf16_rne` on the host.
+                let want_bits: Vec<u16> = want[..n].iter().map(|&x| bf16_bits_of(x)).collect();
+                assert_eq!(read_bf16_bits(rt, &copy_f, n), want_bits, "bf16 copy, {what}");
+            }
+        }
+    });
+}
+
+#[test]
+fn scale_rms_norm_inplace_is_the_unfused_pair_bit_for_bit() {
+    with_gpu(|rt| {
+        // 512^-0.5 (the checkpoint's: not a power of two, so the scale rounds),
+        // 1, and a scale that makes some rows' squares large.
+        for scale in [512f32.powf(-0.5), 1.0, 3.5] {
+            for (rows, dim) in FUSED_SHAPES {
+                let n = (rows * dim) as usize;
+                let seed = 1300 + u64::from(rows) * 31 + u64::from(dim);
+                let x0 = rand32(n, seed, 4.0);
+                let w = buf_f32(rt, &norm_weight(dim as usize, seed + 1));
+                let xu = buf_f32(rt, &x0);
+                scale_f32_inplace(rt, &xu, scale, rows * dim).unwrap();
+                rms_norm_f32(rt, &xu, &w, &xu, rows, dim, FUSED_EPS).unwrap();
+                let xf = buf_f32(rt, &x0);
+                scale_rms_norm_inplace(rt, &xf, &w, rows, dim, FUSED_EPS, scale).unwrap();
+                rt.synchronize().unwrap();
+                assert_eq!(
+                    bits32(&xf.read_f32()[..n]),
+                    bits32(&xu.read_f32()[..n]),
+                    "{rows}x{dim} scale {scale}"
+                );
+            }
+        }
+    });
+}
+
+#[test]
+fn the_fused_row_passes_refuse_what_they_cannot_run() {
+    with_gpu(|rt| {
+        let (rows, dim) = (4u32, 64u32);
+        let n = (rows * dim) as usize;
+        let (y, resid) = (buf_f32(rt, &rand32(n, 1, 1.0)), buf_f32(rt, &rand32(n, 2, 1.0)));
+        let (w1, w2) = (buf_f32(rt, &norm_weight(64, 3)), buf_f32(rt, &norm_weight(64, 4)));
+        let out = poisoned_f32(rt, n);
+        resid_add_norm_f32(rt, &y, &w1, &resid, &w2, &out, rows, dim, FUSED_EPS, 1.0).expect("the valid call");
+        rt.synchronize().unwrap();
+        let before = out.read_f32();
+        let short_w = buf_f32(rt, &norm_weight(63, 5));
+        let (bf_out, bf_short) = (poisoned_bf16(rt, n), poisoned_bf16(rt, n - 1));
+        let results = [
+            (
+                "dim 0",
+                resid_add_norm_f32(rt, &y, &w1, &resid, &w2, &out, rows, 0, FUSED_EPS, 1.0),
+            ),
+            (
+                "eps 0",
+                resid_add_norm_f32(rt, &y, &w1, &resid, &w2, &out, rows, dim, 0.0, 1.0),
+            ),
+            (
+                "a NaN layer scale",
+                resid_add_norm_f32(rt, &y, &w1, &resid, &w2, &out, rows, dim, FUSED_EPS, f32::NAN),
+            ),
+            (
+                "out aliasing resid",
+                resid_add_norm_f32(rt, &y, &w1, &resid, &w2, &resid, rows, dim, FUSED_EPS, 1.0),
+            ),
+            (
+                "a weight one element short",
+                resid_add_norm_f32(rt, &y, &short_w, &resid, &w2, &out, rows, dim, FUSED_EPS, 1.0),
+            ),
+            (
+                "an f32 out given bf16 storage",
+                resid_add_norm_f32(rt, &y, &w1, &resid, &w2, &bf_out, rows, dim, FUSED_EPS, 1.0),
+            ),
+            (
+                "a bf16 out one element short",
+                resid_add_norm_bf16(rt, &y, &w1, &resid, &w2, &bf_short, rows, dim, FUSED_EPS, 1.0),
+            ),
+            (
+                "a bf16 copy one element short",
+                resid_add_bf16_copy(rt, &y, &w1, &resid, &bf_short, rows, dim, FUSED_EPS, 1.0),
+            ),
+            (
+                "scale_rms_norm with an infinite scale",
+                scale_rms_norm_inplace(rt, &resid, &w1, rows, dim, FUSED_EPS, f32::INFINITY),
+            ),
+            (
+                "scale_rms_norm with the weight aliasing x",
+                scale_rms_norm_inplace(rt, &w1, &w1, 1, dim, FUSED_EPS, 1.0),
+            ),
+        ];
+        for (what, r) in results {
+            assert!(r.is_err(), "{what}: accepted");
+        }
+        // A refused call writes nothing.
+        rt.synchronize().unwrap();
+        assert_eq!(
+            bits32(&out.read_f32()[..n]),
+            bits32(&before[..n]),
+            "a refusal wrote to out"
+        );
+        // Zero rows is a no-op, not an error.
+        resid_add_norm_f32(rt, &y, &w1, &resid, &w2, &out, 0, dim, FUSED_EPS, 1.0).expect("0 rows");
+        scale_rms_norm_inplace(rt, &resid, &w1, 0, dim, FUSED_EPS, 1.0).expect("0 rows");
+    });
+}
+
+/// `bf16o` (bf16 operands, bf16 output) against `TiledBf16` (f32 output) on
+/// the same bf16 operands: the output is the f32 result rounded to nearest
+/// even, every element, padding rows as +0, at the text encoder's head dims
+/// (256, 512) and the vision tower's (64), with a window, ragged lengths and a
+/// length past `seq`.
+#[test]
+fn the_bf16_output_attention_is_the_bf16_kernel_rounded_bit_for_bit() {
+    with_gpu(|rt| {
+        let cases = [
+            // (batch, seq, heads, heads_kv, head_dim, window, lens)
+            (3usize, 37usize, 4usize, 2usize, 256usize, 3usize, vec![37usize, 20, 1]),
+            (2, 70, 4, 1, 512, 0, vec![70, 33]),
+            (2, 40, 6, 2, 64, 5, vec![40, 17]),
+            (1, 129, 4, 2, 256, 0, vec![129]),
+        ];
+        for (ci, (b, t, h, hkv, d, window, lens)) in cases.into_iter().enumerate() {
+            let a = Attn {
+                b,
+                t,
+                h,
+                hkv,
+                d,
+                window,
+                lens,
+            };
+            let q = rand32(b * t * h * d, 40 + ci as u64, 0.25);
+            let k = rand32(b * t * hkv * d, 50 + ci as u64, 0.25);
+            let v = rand32(b * t * hkv * d, 60 + ci as u64, 1.0);
+            let lens: Vec<u32> = a.lens.iter().map(|&l| l as u32).collect();
+            // The f32-output kernel on these operands, as the unfused forward ran it.
+            let f32_out = run_attn(rt, EncoderAttnKernel::TiledBf16, &a, &q, &k, &v, &lens);
+            // The bf16-output kernel on the very same operands.
+            let n = q.len();
+            let o = poisoned_bf16(rt, n);
+            encoder_attn_bf16_out(
+                rt,
+                &bf16_buf(rt, &q),
+                &bf16_buf(rt, &k),
+                &bf16_buf(rt, &v),
+                &o,
+                &buf_u32(rt, &lens),
+                EncoderAttnDims {
+                    batch: b as u32,
+                    seq: t as u32,
+                    heads: h as u32,
+                    heads_kv: hkv as u32,
+                    head_dim: d as u32,
+                    window: window as u32,
+                    scale: 1.0,
+                },
+            )
+            .unwrap_or_else(|e| panic!("D={d}: {e}"));
+            let got = read_bf16_bits(rt, &o, n);
+            let want: Vec<u16> = f32_out.iter().map(|&x| bf16_bits_of(x as f32)).collect();
+            let wrong = got.iter().zip(&want).position(|(g, w)| g != w);
+            assert!(
+                wrong.is_none(),
+                "D={d} window={window}: element {:?} is {:#06x}, the rounded f32-output kernel gives {:#06x}",
+                wrong,
+                wrong.map_or(0, |i| got[i]),
+                wrong.map_or(0, |i| want[i])
+            );
+            // The padding rows are +0 in bf16 too (bits 0).
+            for bi in 0..b {
+                for ti in a.lens[bi].min(t)..t {
+                    let base = (bi * t + ti) * h * d;
+                    assert!(
+                        got[base..base + h * d].iter().all(|&x| x == 0),
+                        "D={d}: padding row b={bi} t={ti} is not +0"
+                    );
+                }
+            }
+        }
+        // Refusals: head dim 32 has no bf16o kernel, and `o` must hold bf16
+        // for every element.
+        let dims = EncoderAttnDims {
+            batch: 1,
+            seq: 8,
+            heads: 2,
+            heads_kv: 1,
+            head_dim: 64,
+            window: 0,
+            scale: 1.0,
+        };
+        let lens = buf_u32(rt, &[8]);
+        let (q, k, v) = (
+            rt.alloc_buffer(8 * 2 * 64 * 2).unwrap(),
+            rt.alloc_buffer(8 * 64 * 2).unwrap(),
+            rt.alloc_buffer(8 * 64 * 2).unwrap(),
+        );
+        let o = rt.alloc_buffer(8 * 2 * 64 * 2).unwrap();
+        encoder_attn_bf16_out(rt, &q, &k, &v, &o, &lens, dims).expect("the valid call");
+        let short = rt.alloc_buffer(8 * 2 * 64 * 2 - 2).unwrap();
+        assert!(
+            encoder_attn_bf16_out(rt, &q, &k, &v, &short, &lens, dims).is_err(),
+            "a bf16 o one element short: accepted"
+        );
+        let d32 = EncoderAttnDims { head_dim: 32, ..dims };
+        assert!(
+            encoder_attn_bf16_out(rt, &q, &k, &v, &o, &lens, d32).is_err(),
+            "the bf16 output kernel at head dim 32: accepted"
+        );
+    });
 }

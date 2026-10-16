@@ -68,6 +68,17 @@
 //! (display, browsers, other repositories) remain, and the `ioreg` GPU
 //! utilization at the start and end of each workload records them.
 //!
+//! `stages` (and `ledger`) replicate the text encoder at `PROFILE_OPERANDS=f32|bf16`
+//! (default `f32`; `GemmOperands::ExactF32` or `Bf16`) in one of two dispatch
+//! sequences: `PROFILE_FUSED=1` (default) is `EmbedGemma2Model::forward` as it
+//! stands, with the fused row passes of `kernels/embedgemma2_text.metal`
+//! (a residual add and the norm after it are one launch, the per-layer inputs'
+//! scale rides their norm, the bf16 attention stores bf16); `PROFILE_FUSED=0`
+//! is the sequence before them (separate norms, adds, scale and casts, built
+//! from the same public kernels), so the cost of the elementwise stages
+//! before and after the fusion are two runs of one binary. Both replicas are
+//! checked against `encode` (bit-equal in the fused sequence).
+//!
 //! `BENCH_WORKLOADS` (default `1x16,64x32,32x256,8x1024,2x4096`) lists `BxT`
 //! uniform workloads (the grammar of `bench_embedgemma2`, uniform terms only);
 //! `PROFILE_JSON` names the output file. Nothing here changes library code.
@@ -80,10 +91,12 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use tessl::embedgemma2::{
-    l2_normalize_rows, segment_mean_rows, EmbedGemma2Config, EmbedGemma2Model, EncoderAttnDims, LayerSpec,
+    encoder_attn_bf16, encoder_attn_bf16_out, l2_normalize_rows, resid_add_bf16_copy, resid_add_norm_bf16,
+    resid_add_norm_f32, scale_rms_norm_inplace, segment_mean_rows, EmbedGemma2Config, EmbedGemma2Model,
+    EncoderAttnDims, LayerSpec,
 };
-use tessl::gemm::{gemm, gemm_bf16, gemm_nt_f32, GemmBackend, GemmOperands};
-use tessl::nn::{rms_norm_f32, rms_norm_residual_add_f32, scale_f32_inplace};
+use tessl::gemm::{cast_f32_to_bf16_into, gemm, gemm_bf16, gemm_nt_f32, gemm_small_m, GemmBackend, GemmOperands};
+use tessl::nn::{rms_norm_bf16, rms_norm_f32, rms_norm_residual_add_f32, scale_f32_inplace};
 use tessl::qwen35::{self, AttnShape, AttnTargets, Cols, GatedAct, LmHead, OutCols, QkvColumns};
 use tessl::safetensors::SafeTensors;
 use tessl::tensor::{gpu_copy, DType, GpuBuffer, Tensor};
@@ -126,11 +139,12 @@ enum C {
     PleOut,
     NormResidPle,
     Tail,
+    Cast,
 }
 
-const NAMES: [&str; 21] = [
+const NAMES: [&str; 22] = [
     "gather+copy",
-    "rms_norm (input, pre-ffn)",
+    "rms_norm, standalone",
     "qkv GEMM sliding",
     "qkv GEMM global",
     "qk-norm+rope+kv store",
@@ -138,18 +152,19 @@ const NAMES: [&str; 21] = [
     "attention global (hd512)",
     "o GEMM sliding",
     "o GEMM global",
-    "norm+residual (post-attn)",
+    "residual add post-attn (+ pre-ffn norm)",
     "gate|up GEMM",
     "gelu*up (mlp)",
     "down GEMM",
-    "norm+residual (post-ffn)",
+    "residual add post-ffn (+ bf16 copy)",
     "PLE projection GEMM (NT)",
     "PLE scale+norm",
     "ple_gate GEMM",
     "ple gelu*input",
     "ple_out GEMM",
-    "norm+residual*scalar (post-ple)",
+    "residual add*scalar post-ple (+ next norm)",
     "tail (final norm, pool, proj, l2)",
+    "bf16 casts",
 ];
 const N_CLASSES: usize = NAMES.len();
 const ALL: u32 = (1u32 << N_CLASSES) - 1;
@@ -199,14 +214,36 @@ fn norm_buf(rt: &Arc<GpuRuntime>, st: &SafeTensors, name: &str, dim: usize) -> R
     Ok(b)
 }
 
-/// `nn.Linear` weights `[out_i, in]` packed side by side into `[in, sum(out_i)]`.
+/// `nn.Linear` weights `[out_i, in]` packed side by side into `[in, sum(out_i)]`:
+/// f32 (widened from the checkpoint's bf16), or with `bf16` the checkpoint's own
+/// bits, as `Loader::linear` packs them under each `GemmOperands`.
 fn pack_linear(
     rt: &Arc<GpuRuntime>,
     st: &SafeTensors,
     parts: &[(String, usize)],
     inf: usize,
+    bf16: bool,
 ) -> Result<Tensor, String> {
     let total: usize = parts.iter().map(|p| p.1).sum();
+    if bf16 {
+        let t = rt.alloc_tensor_bf16_hot(&[inf, total])?;
+        let mut dst = t.buffer.try_contents_u16()?;
+        let mut col0 = 0;
+        for (name, out) in parts {
+            let (shape, w) = st.read_bf16_bits(&format!("{PREFIX}{name}"))?;
+            if shape != [*out, inf] {
+                return Err(format!("{name}: shape {shape:?}, expected [{out}, {inf}]"));
+            }
+            for o in 0..*out {
+                for i in 0..inf {
+                    dst[i * total + col0 + o] = w[o * inf + i];
+                }
+            }
+            col0 += out;
+        }
+        drop(dst);
+        return Ok(t);
+    }
     let t = rt.alloc_tensor_f32_hot(&[inf, total])?;
     let mut dst = t.buffer.try_contents_f32()?;
     let mut col0 = 0;
@@ -227,7 +264,7 @@ fn pack_linear(
 }
 
 impl Weights {
-    fn load(rt: &Arc<GpuRuntime>, st: &SafeTensors, cfg: &EmbedGemma2Config) -> Result<Self, String> {
+    fn load(rt: &Arc<GpuRuntime>, st: &SafeTensors, cfg: &EmbedGemma2Config, bf16: bool) -> Result<Self, String> {
         let (h, ple, inter, vocab) = (
             cfg.hidden as usize,
             cfg.ple_dim as usize,
@@ -242,13 +279,24 @@ impl Weights {
         }
         embed.buffer.try_contents_u16()?.copy_from_slice(&bits);
         drop(bits);
-        let ple_w = rt.alloc_tensor_f32_hot(&[n_layers * ple, h])?;
-        let (shape, data) = st.read_f32(&format!("{PREFIX}ple.per_layer_model_projection.weight"))?;
-        if shape != [n_layers * ple, h] {
-            return Err(format!("ple projection: shape {shape:?}"));
-        }
-        ple_w.buffer.try_contents_f32()?.copy_from_slice(&data);
-        drop(data);
+        let ple_name = format!("{PREFIX}ple.per_layer_model_projection.weight");
+        let ple_w = if bf16 {
+            let t = rt.alloc_tensor_bf16_hot(&[n_layers * ple, h])?;
+            let (shape, bits) = st.read_bf16_bits(&ple_name)?;
+            if shape != [n_layers * ple, h] {
+                return Err(format!("ple projection: shape {shape:?}"));
+            }
+            t.buffer.try_contents_u16()?.copy_from_slice(&bits);
+            t
+        } else {
+            let t = rt.alloc_tensor_f32_hot(&[n_layers * ple, h])?;
+            let (shape, data) = st.read_f32(&ple_name)?;
+            if shape != [n_layers * ple, h] {
+                return Err(format!("ple projection: shape {shape:?}"));
+            }
+            t.buffer.try_contents_f32()?.copy_from_slice(&data);
+            t
+        };
         let ple_norm = norm_buf(rt, st, "ple.per_layer_projection_norm.weight", ple)?;
         let final_norm = norm_buf(rt, st, "norm.weight", h)?;
         let projection = pack_linear(
@@ -256,6 +304,7 @@ impl Weights {
             st,
             &[("embedding_projection.weight".to_string(), cfg.embedding_dim as usize)],
             h,
+            bf16,
         )?;
         let mut layers = Vec::with_capacity(n_layers);
         for (i, &spec) in cfg.layers.iter().enumerate() {
@@ -280,8 +329,9 @@ impl Weights {
                         (p("self_attn.v_proj.weight"), kv * d),
                     ],
                     h,
+                    bf16,
                 )?,
-                w_o: pack_linear(rt, st, &[(p("self_attn.o_proj.weight"), h)], q * d)?,
+                w_o: pack_linear(rt, st, &[(p("self_attn.o_proj.weight"), h)], q * d, bf16)?,
                 q_norm: norm_buf(rt, st, &p("self_attn.q_norm.weight"), d)?,
                 k_norm: norm_buf(rt, st, &p("self_attn.k_norm.weight"), d)?,
                 gate_up: pack_linear(
@@ -289,10 +339,11 @@ impl Weights {
                     st,
                     &[(p("mlp.gate_proj.weight"), inter), (p("mlp.up_proj.weight"), inter)],
                     h,
+                    bf16,
                 )?,
-                down: pack_linear(rt, st, &[(p("mlp.down_proj.weight"), h)], inter)?,
-                ple_gate: pack_linear(rt, st, &[(p("ple_block.per_layer_input_gate.weight"), ple)], h)?,
-                ple_out: pack_linear(rt, st, &[(p("ple_block.per_layer_projection.weight"), h)], ple)?,
+                down: pack_linear(rt, st, &[(p("mlp.down_proj.weight"), h)], inter, bf16)?,
+                ple_gate: pack_linear(rt, st, &[(p("ple_block.per_layer_input_gate.weight"), ple)], h, bf16)?,
+                ple_out: pack_linear(rt, st, &[(p("ple_block.per_layer_projection.weight"), h)], ple, bf16)?,
                 post_ple_norm: norm_buf(rt, st, &p("ple_block.post_per_layer_input_norm.weight"), h)?,
                 layer_scalar: scalar[0],
             });
@@ -400,10 +451,21 @@ fn acts_layout_2a7cb8b(cfg: &EmbedGemma2Config, nb: usize, rows: usize) -> Vec<(
     v
 }
 
+/// The bf16 stagings `Acts::bf16` holds under `GemmOperands::Bf16`.
+struct Bf16R {
+    x: Tensor,
+    wide: Tensor,
+    embeds: Tensor,
+    pooled: Tensor,
+}
+
 struct ActsR {
     embeds: Tensor,
     resid: Tensor,
     x: Tensor,
+    /// The q|k|v GEMM's output, then the MLP's gate|up: one buffer, as the
+    /// library's `Acts::qkv` is a clone of `Acts::gate_up` (the split-K
+    /// scratch sizes depend on it).
     qkv: Tensor,
     q: Tensor,
     k: Tensor,
@@ -415,6 +477,7 @@ struct ActsR {
     ple_gate: Tensor,
     ple_mid: Tensor,
     pooled: Tensor,
+    bf16: Option<Bf16R>,
 }
 
 impl ActsR {
@@ -425,6 +488,7 @@ impl ActsR {
         rows: usize,
         ple_run_bytes: usize,
         zeroed: bool,
+        bf16: bool,
     ) -> Result<Self, String> {
         let lay = acts_layout(cfg, nb, rows, ple_run_bytes);
         let (h, ple, inter) = (cfg.hidden as usize, cfg.ple_dim as usize, cfg.intermediate as usize);
@@ -436,6 +500,7 @@ impl ActsR {
             kv_w = kv_w.max(kv * d);
         }
         let r = rows.max(1);
+        let nb = nb.max(1);
         // Zeroed by default, unlike the library's: a skipped stage must leave finite data.
         let f = |shape: &[usize]| {
             if zeroed {
@@ -444,22 +509,40 @@ impl ActsR {
                 rt.alloc_tensor_unzeroed(shape, DType::F32)
             }
         };
+        let b = |shape: &[usize]| {
+            if zeroed {
+                rt.alloc_tensor_bf16(shape)
+            } else {
+                rt.alloc_tensor_unzeroed(shape, DType::BF16)
+            }
+        };
         let ple_n = lay.iter().find(|(n, _)| *n == "ple run").map_or(0, |p| p.1);
+        let gate_up = f(&[r, qkv_w.max(2 * inter)])?;
         Ok(Self {
             embeds: f(&[r, h])?,
             resid: f(&[r, h])?,
             x: f(&[r, h])?,
-            qkv: f(&[r, qkv_w])?,
-            q: f(&[r, q_w])?,
-            k: f(&[r, kv_w])?,
-            v: f(&[r, kv_w])?,
-            attn: f(&[r, q_w.max(inter)])?,
+            qkv: gate_up.clone(),
+            q: if bf16 { b(&[r, q_w])? } else { f(&[r, q_w])? },
+            k: if bf16 { b(&[r, kv_w])? } else { f(&[r, kv_w])? },
+            v: if bf16 { b(&[r, kv_w])? } else { f(&[r, kv_w])? },
+            attn: f(&[r, if bf16 { q_w } else { q_w.max(inter) }])?,
             y: f(&[r, h])?,
-            gate_up: f(&[r, 2 * inter])?,
+            gate_up,
             ple: f(&[ple_n])?,
             ple_gate: f(&[r, ple])?,
-            ple_mid: f(&[r, ple])?,
-            pooled: f(&[nb.max(1), h])?,
+            ple_mid: if bf16 { b(&[r, ple])? } else { f(&[r, ple])? },
+            pooled: f(&[nb, h])?,
+            bf16: if bf16 {
+                Some(Bf16R {
+                    x: b(&[r, h])?,
+                    wide: b(&[r, q_w.max(inter)])?,
+                    embeds: b(&[r, h])?,
+                    pooled: b(&[nb, h])?,
+                })
+            } else {
+                None
+            },
         })
     }
 }
@@ -507,8 +590,46 @@ struct Ledger {
     start: u64,
 }
 
+/// Which sequence the replica runs: the operand precision and whether the row
+/// passes are fused (the library's) or not (what ran before the fusion).
+#[derive(Clone, Copy)]
+struct Mode {
+    operands: GemmOperands,
+    fused: bool,
+}
+
+impl Mode {
+    /// `PROFILE_OPERANDS=f32|bf16` (default f32) and `PROFILE_FUSED=0|1` (default 1).
+    fn from_env() -> Result<Self, String> {
+        let operands = match std::env::var("PROFILE_OPERANDS").as_deref() {
+            Ok("f32") | Err(_) => GemmOperands::ExactF32,
+            Ok("bf16") => GemmOperands::Bf16,
+            Ok(other) => return Err(format!("PROFILE_OPERANDS={other:?}: expected f32 or bf16")),
+        };
+        let fused = match std::env::var("PROFILE_FUSED").as_deref() {
+            Ok("1") | Err(_) => true,
+            Ok("0") => false,
+            Ok(other) => return Err(format!("PROFILE_FUSED={other:?}: expected 0 or 1")),
+        };
+        Ok(Self { operands, fused })
+    }
+
+    fn bf16(self) -> bool {
+        self.operands == GemmOperands::Bf16
+    }
+
+    fn label(self) -> String {
+        format!(
+            "{} {}",
+            if self.bf16() { "bf16" } else { "f32" },
+            if self.fused { "fused" } else { "unfused" }
+        )
+    }
+}
+
 struct Cx<'a> {
     rt: &'a Arc<GpuRuntime>,
+    mode: Mode,
     cfg: &'a EmbedGemma2Config,
     w: &'a Weights,
     a: &'a ActsR,
@@ -561,6 +682,7 @@ macro_rules! stage {
 fn cx_copy<'a>(cx: &Cx<'a>) -> Cx<'a> {
     Cx {
         rt: cx.rt,
+        mode: cx.mode,
         cfg: cx.cfg,
         w: cx.w,
         a: cx.a,
@@ -575,22 +697,74 @@ fn view(t: &Tensor, rows: u32, cols: u32) -> Result<Tensor, String> {
     t.try_view(&[rows as usize, cols as usize], 0)
 }
 
-/// Queue one forward (src/embedgemma2.rs `forward`, op for op) over the
-/// classes in `mask`; does not wait.
+/// Queue one forward over the classes in `mask`; does not wait. With
+/// `cx.mode.fused` this is `src/embedgemma2.rs`'s `forward`, op for op (so its
+/// embeddings are `encode`'s, bit for bit); without it, the sequence before the
+/// row passes were fused: a norm after every residual add, the per-layer
+/// inputs' scale and norm as two launches, the attention writing f32 and a
+/// cast of its output and of the residual stream at `Bf16`.
 fn forward(cx: &Cx<'_>, mask: u32) -> Result<(), String> {
     let (rt, cfg, w, a, io) = (cx.rt, cx.cfg, cx.w, cx.a, cx.io);
     let (nb, seq) = (cx.nb, cx.seq);
+    let Mode { operands, fused } = cx.mode;
     let rows = nb as usize * seq as usize;
     let (h, rows_u) = (cfg.hidden, rows as u32);
     let eps = cfg.rms_norm_eps;
     let at = |t: &Tensor, cols: u32| view(t, rows_u, cols);
     let (embeds, resid, x, y) = (at(&a.embeds, h)?, at(&a.resid, h)?, at(&a.x, h)?, at(&a.y, h)?);
     let inter = cfg.intermediate;
-    let (gate_up, mid) = (at(&a.gate_up, 2 * inter)?, at(&a.attn, inter)?);
+    let bf = a.bf16.as_ref();
+    let (x_in, embeds_in) = match bf {
+        Some(b) => (at(&b.x, h)?, at(&b.embeds, h)?),
+        None => (x.clone(), embeds.clone()),
+    };
+    let gate_up = at(&a.gate_up, 2 * inter)?;
+    let mid = match bf {
+        Some(b) => view(&b.wide, rows_u, inter)?,
+        None => at(&a.attn, inter)?,
+    };
     let (ple_gate, ple_mid) = (at(&a.ple_gate, cfg.ple_dim)?, at(&a.ple_mid, cfg.ple_dim)?);
     let (n_layers, pd) = (w.layers.len(), cfg.ple_dim as usize);
     let run = (a.ple.numel() / (rows * pd)).clamp(1, n_layers);
     let mut ple_ld = 0u32;
+    // `EmbedGemma2Model::project`: the small-M split-K at exact f32 (with the
+    // forward's idle buffer as its scratch), the bf16 GEMM otherwise.
+    let project = |a_in: &Tensor, wt: &Tensor, out: &Tensor, scratch: &Tensor| match operands {
+        GemmOperands::ExactF32 => gemm_small_m(a_in, wt, out, BACKEND, Some(scratch)),
+        GemmOperands::Bf16 => GemmOperands::Bf16.nn(a_in, wt, out),
+    };
+    // A standalone norm into `x_in`: bf16 straight from the norm under `Bf16`.
+    let norm_x_in = |weight: &GpuBuffer| match bf {
+        Some(_) => rms_norm_bf16(rt, &resid.buffer, weight, &x_in.buffer, rows_u, h, eps),
+        None => rms_norm_f32(rt, &resid.buffer, weight, &x_in.buffer, rows_u, h, eps),
+    };
+    // A residual add and the norm after it, in one launch.
+    let add_norm = |w_post: &GpuBuffer, w_next: &GpuBuffer, scale: f32| match bf {
+        Some(_) => resid_add_norm_bf16(
+            rt,
+            &y.buffer,
+            w_post,
+            &resid.buffer,
+            w_next,
+            &x_in.buffer,
+            rows_u,
+            h,
+            eps,
+            scale,
+        ),
+        None => resid_add_norm_f32(
+            rt,
+            &y.buffer,
+            w_post,
+            &resid.buffer,
+            w_next,
+            &x_in.buffer,
+            rows_u,
+            h,
+            eps,
+            scale,
+        ),
+    };
     stage!(cx, mask, C::Gather, {
         qwen35::embed_rows_scaled(
             rt,
@@ -607,6 +781,16 @@ fn forward(cx: &Cx<'_>, mask: u32) -> Result<(), String> {
         )?;
         gpu_copy(&embeds, &resid)?;
     });
+    stage!(cx, mask, C::Cast, {
+        if bf.is_some() {
+            cast_f32_to_bf16_into(&embeds, &embeds_in)?;
+        }
+    });
+    // Layer 0's input norm; every later layer's rides the previous layer's last
+    // residual add when fused.
+    stage!(cx, mask, C::RmsNorm, {
+        norm_x_in(&w.layers[0].input_norm)?;
+    });
     let ple_scale = (h as f32).powf(-0.5);
     for (i, layer) in w.layers.iter().enumerate() {
         let s = layer.spec;
@@ -615,13 +799,15 @@ fn forward(cx: &Cx<'_>, mask: u32) -> Result<(), String> {
         } else {
             (C::QkvGlobal, C::AttnGlobal, C::OGlobal)
         };
-        stage!(cx, mask, C::RmsNorm, {
-            rms_norm_f32(rt, &resid.buffer, &layer.input_norm, &x.buffer, rows_u, h, eps)?;
-        });
+        if !fused && i > 0 {
+            stage!(cx, mask, C::RmsNorm, {
+                norm_x_in(&layer.input_norm)?;
+            });
+        }
         let qkv_width = (cfg.q_heads + 2 * s.kv_heads) * s.head_dim;
         let qkv = at(&a.qkv, qkv_width)?;
         stage!(cx, mask, c_qkv, {
-            gemm(&x, &layer.w_qkv, &qkv, BACKEND)?;
+            project(&x_in, &layer.w_qkv, &qkv, &a.attn)?;
         });
         stage!(cx, mask, C::QkNormRope, {
             qwen35::attn_qk_norm_rope_columns(
@@ -649,43 +835,76 @@ fn forward(cx: &Cx<'_>, mask: u32) -> Result<(), String> {
                     k_cache: &a.k.buffer,
                     v_cache: &a.v.buffer,
                 },
-                DType::F32,
+                a.q.dtype,
                 0,
                 s.rope_theta,
                 eps,
             )?;
         });
+        let attn_width = cfg.q_heads * s.head_dim;
+        let attn = at(&a.attn, attn_width)?;
+        let attn_in = match bf {
+            Some(b) => Some(view(&b.wide, rows_u, attn_width)?),
+            None => None,
+        };
         stage!(cx, mask, c_attn, {
-            tessl::embedgemma2::encoder_attn(
-                rt,
-                &a.q.buffer,
-                &a.k.buffer,
-                &a.v.buffer,
-                &a.attn.buffer,
-                &io.lens,
-                EncoderAttnDims {
-                    batch: nb,
-                    seq,
-                    heads: cfg.q_heads,
-                    heads_kv: s.kv_heads,
-                    head_dim: s.head_dim,
-                    window: if s.sliding { cfg.sliding_window } else { 0 },
-                    scale: 1.0,
-                },
-            )?;
+            let dims = EncoderAttnDims {
+                batch: nb,
+                seq,
+                heads: cfg.q_heads,
+                heads_kv: s.kv_heads,
+                head_dim: s.head_dim,
+                window: if s.sliding { cfg.sliding_window } else { 0 },
+                scale: 1.0,
+            };
+            match (&attn_in, fused) {
+                (Some(o), true) => {
+                    encoder_attn_bf16_out(rt, &a.q.buffer, &a.k.buffer, &a.v.buffer, &o.buffer, &io.lens, dims)?
+                }
+                (Some(_), false) => encoder_attn_bf16(
+                    rt,
+                    &a.q.buffer,
+                    &a.k.buffer,
+                    &a.v.buffer,
+                    &a.attn.buffer,
+                    &io.lens,
+                    dims,
+                )?,
+                (None, _) => tessl::embedgemma2::encoder_attn(
+                    rt,
+                    &a.q.buffer,
+                    &a.k.buffer,
+                    &a.v.buffer,
+                    &a.attn.buffer,
+                    &io.lens,
+                    dims,
+                )?,
+            }
         });
-        let attn = at(&a.attn, cfg.q_heads * s.head_dim)?;
+        if !fused {
+            stage!(cx, mask, C::Cast, {
+                if let Some(o) = &attn_in {
+                    cast_f32_to_bf16_into(&attn, o)?;
+                }
+            });
+        }
         stage!(cx, mask, c_o, {
-            gemm(&attn, &layer.w_o, &y, BACKEND)?;
+            project(attn_in.as_ref().unwrap_or(&attn), &layer.w_o, &y, &a.qkv)?;
         });
         stage!(cx, mask, C::NormResidAttn, {
-            rms_norm_residual_add_f32(rt, &y.buffer, &layer.post_attn_norm, &resid.buffer, rows_u, h, eps, 1.0)?;
+            if fused {
+                add_norm(&layer.post_attn_norm, &layer.pre_ffn_norm, 1.0)?;
+            } else {
+                rms_norm_residual_add_f32(rt, &y.buffer, &layer.post_attn_norm, &resid.buffer, rows_u, h, eps, 1.0)?;
+            }
         });
-        stage!(cx, mask, C::RmsNorm, {
-            rms_norm_f32(rt, &resid.buffer, &layer.pre_ffn_norm, &x.buffer, rows_u, h, eps)?;
-        });
+        if !fused {
+            stage!(cx, mask, C::RmsNorm, {
+                norm_x_in(&layer.pre_ffn_norm)?;
+            });
+        }
         stage!(cx, mask, C::GateUp, {
-            gemm(&x, &layer.gate_up, &gate_up, BACKEND)?;
+            project(&x_in, &layer.gate_up, &gate_up, &a.attn)?;
         });
         let window = |off: u32| Cols {
             buf: &gate_up.buffer,
@@ -700,17 +919,31 @@ fn forward(cx: &Cx<'_>, mask: u32) -> Result<(), String> {
                 window(inter),
                 OutCols {
                     cols: Cols::dense(&mid.buffer, inter),
-                    dtype: DType::F32,
+                    dtype: mid.dtype,
                 },
                 rows_u,
                 inter,
             )?;
         });
         stage!(cx, mask, C::Down, {
-            gemm(&mid, &layer.down, &y, BACKEND)?;
+            project(&mid, &layer.down, &y, &a.qkv)?;
         });
         stage!(cx, mask, C::NormResidFfn, {
-            rms_norm_residual_add_f32(rt, &y.buffer, &layer.post_ffn_norm, &resid.buffer, rows_u, h, eps, 1.0)?;
+            if fused && bf.is_some() {
+                resid_add_bf16_copy(
+                    rt,
+                    &y.buffer,
+                    &layer.post_ffn_norm,
+                    &resid.buffer,
+                    &x_in.buffer,
+                    rows_u,
+                    h,
+                    eps,
+                    1.0,
+                )?;
+            } else {
+                rms_norm_residual_add_f32(rt, &y.buffer, &layer.post_ffn_norm, &resid.buffer, rows_u, h, eps, 1.0)?;
+            }
         });
         if i % run == 0 {
             let k = run.min(n_layers - i);
@@ -718,23 +951,50 @@ fn forward(cx: &Cx<'_>, mask: u32) -> Result<(), String> {
             let wv = w.ple_w.try_view(&[k * pd, h as usize], i * pd * h as usize)?;
             let out = at(&a.ple, ple_ld)?;
             stage!(cx, mask, C::PleProj, {
-                gemm_nt_f32(&embeds, &wv, &out, BACKEND)?;
+                match operands {
+                    GemmOperands::ExactF32 => gemm_nt_f32(&embeds_in, &wv, &out, BACKEND)?,
+                    GemmOperands::Bf16 => GemmOperands::Bf16.nt(&embeds_in, &wv, &out)?,
+                }
             });
             stage!(cx, mask, C::PleScaleNorm, {
-                scale_f32_inplace(rt, &out.buffer, ple_scale, rows_u * ple_ld)?;
-                rms_norm_f32(
-                    rt,
-                    &out.buffer,
-                    &w.ple_norm,
-                    &out.buffer,
-                    rows_u * k as u32,
-                    cfg.ple_dim,
-                    eps,
-                )?;
+                if fused {
+                    scale_rms_norm_inplace(
+                        rt,
+                        &out.buffer,
+                        &w.ple_norm,
+                        rows_u * k as u32,
+                        cfg.ple_dim,
+                        eps,
+                        ple_scale,
+                    )?;
+                } else {
+                    scale_f32_inplace(rt, &out.buffer, ple_scale, rows_u * ple_ld)?;
+                    rms_norm_f32(
+                        rt,
+                        &out.buffer,
+                        &w.ple_norm,
+                        &out.buffer,
+                        rows_u * k as u32,
+                        cfg.ple_dim,
+                        eps,
+                    )?;
+                }
+            });
+        }
+        if !fused {
+            stage!(cx, mask, C::Cast, {
+                if bf.is_some() {
+                    cast_f32_to_bf16_into(&resid, &x_in)?;
+                }
             });
         }
         stage!(cx, mask, C::PleGate, {
-            gemm(&resid, &layer.ple_gate, &ple_gate, BACKEND)?;
+            project(
+                if bf.is_some() { &x_in } else { &resid },
+                &layer.ple_gate,
+                &ple_gate,
+                &a.qkv,
+            )?;
         });
         stage!(cx, mask, C::PleGelu, {
             qwen35::gated_act(
@@ -748,33 +1008,63 @@ fn forward(cx: &Cx<'_>, mask: u32) -> Result<(), String> {
                 },
                 OutCols {
                     cols: Cols::dense(&ple_mid.buffer, cfg.ple_dim),
-                    dtype: DType::F32,
+                    dtype: ple_mid.dtype,
                 },
                 rows_u,
                 cfg.ple_dim,
             )?;
         });
         stage!(cx, mask, C::PleOut, {
-            gemm(&ple_mid, &layer.ple_out, &y, BACKEND)?;
+            project(&ple_mid, &layer.ple_out, &y, &a.qkv)?;
         });
         stage!(cx, mask, C::NormResidPle, {
-            rms_norm_residual_add_f32(
-                rt,
-                &y.buffer,
-                &layer.post_ple_norm,
-                &resid.buffer,
-                rows_u,
-                h,
-                eps,
-                layer.layer_scalar,
-            )?;
+            if !fused {
+                rms_norm_residual_add_f32(
+                    rt,
+                    &y.buffer,
+                    &layer.post_ple_norm,
+                    &resid.buffer,
+                    rows_u,
+                    h,
+                    eps,
+                    layer.layer_scalar,
+                )?;
+            } else if let Some(next) = w.layers.get(i + 1) {
+                add_norm(&layer.post_ple_norm, &next.input_norm, layer.layer_scalar)?;
+            } else {
+                resid_add_norm_f32(
+                    rt,
+                    &y.buffer,
+                    &layer.post_ple_norm,
+                    &resid.buffer,
+                    &w.final_norm,
+                    &x.buffer,
+                    rows_u,
+                    h,
+                    eps,
+                    layer.layer_scalar,
+                )?;
+            }
         });
     }
+    let (pooled, out) = (view(&a.pooled, nb, h)?, view(&io.out, nb, cfg.embedding_dim)?);
     stage!(cx, mask, C::Tail, {
-        let (pooled, out) = (view(&a.pooled, nb, h)?, view(&io.out, nb, cfg.embedding_dim)?);
-        rms_norm_f32(rt, &resid.buffer, &w.final_norm, &x.buffer, rows_u, h, eps)?;
+        if !fused {
+            rms_norm_f32(rt, &resid.buffer, &w.final_norm, &x.buffer, rows_u, h, eps)?;
+        }
         segment_mean_rows(rt, &x.buffer, &io.segments, &pooled.buffer, nb, rows_u, h)?;
-        gemm(&pooled, &w.projection, &out, BACKEND)?;
+    });
+    let pooled_in = match &a.bf16 {
+        Some(b) => view(&b.pooled, nb, h)?,
+        None => pooled.clone(),
+    };
+    stage!(cx, mask, C::Cast, {
+        if bf.is_some() {
+            cast_f32_to_bf16_into(&pooled, &pooled_in)?;
+        }
+    });
+    stage!(cx, mask, C::Tail, {
+        project(&pooled_in, &w.projection, &out, &a.qkv)?;
         l2_normalize_rows(rt, &out.buffer, nb, cfg.embedding_dim, cfg.embedding_dim)?;
     });
     Ok(())
@@ -809,7 +1099,11 @@ fn pairs(seq: usize, window: usize) -> f64 {
         .sum::<usize>() as f64
 }
 
-fn class_costs(cfg: &EmbedGemma2Config, nb: usize, seq: usize, run: usize) -> [Cost; N_CLASSES] {
+/// The bytes a class moves at its minimum (each operand once, f32 unless noted),
+/// in the sequence `mode` replicates. The GEMM rows count 4-byte operands at
+/// both precisions (a lower-bound figure for the row passes, which this model is
+/// for).
+fn class_costs(cfg: &EmbedGemma2Config, nb: usize, seq: usize, run: usize, mode: Mode) -> [Cost; N_CLASSES] {
     let rows = nb * seq;
     let (h, inter, pd) = (cfg.hidden as usize, cfg.intermediate as usize, cfg.ple_dim as usize);
     let l = cfg.layers.len();
@@ -820,9 +1114,11 @@ fn class_costs(cfg: &EmbedGemma2Config, nb: usize, seq: usize, run: usize) -> [C
         flops: 0.0,
         bytes: (rows * h) as f64 * (2.0 + 4.0 + 8.0),
     };
+    // Unfused: an input norm and a pre-feed-forward norm every layer, each
+    // reading the row and writing it; fused: layer 0's input norm alone.
     c[C::RmsNorm as usize] = Cost {
         flops: 0.0,
-        bytes: 2.0 * l as f64 * el(2 * rows * h),
+        bytes: if mode.fused { 1.0 } else { 2.0 * l as f64 } * el(2 * rows * h),
     };
     for s in &cfg.layers {
         let (d, kv) = (s.head_dim as usize, s.kv_heads as usize);
@@ -853,9 +1149,12 @@ fn class_costs(cfg: &EmbedGemma2Config, nb: usize, seq: usize, run: usize) -> [C
             },
         );
     }
+    // Unfused, an add reads y and the residual and writes the residual (3
+    // rows); fused with the norm after it, it also writes the normed row (4).
+    let add_rows = if mode.fused { 4 } else { 3 };
     c[C::NormResidAttn as usize] = Cost {
         flops: 0.0,
-        bytes: l as f64 * el(3 * rows * h),
+        bytes: l as f64 * el(add_rows * rows * h),
     };
     c[C::GateUp as usize] = gemm_cost(rows, h, 2 * inter, l);
     c[C::GeluMlp as usize] = Cost {
@@ -863,15 +1162,28 @@ fn class_costs(cfg: &EmbedGemma2Config, nb: usize, seq: usize, run: usize) -> [C
         bytes: l as f64 * el(rows * 3 * inter),
     };
     c[C::Down as usize] = gemm_cost(rows, inter, h, l);
-    c[C::NormResidFfn as usize] = c[C::NormResidAttn as usize];
+    // The feed-forward add stays 3 rows (at bf16 fused it also writes the rounded
+    // copy, half a row more).
+    c[C::NormResidFfn as usize] = Cost {
+        flops: 0.0,
+        bytes: l as f64
+            * (el(3 * rows * h)
+                + if mode.fused && mode.bf16() {
+                    el(rows * h) / 2.0
+                } else {
+                    0.0
+                }),
+    };
     let runs = l.div_ceil(run);
     c[C::PleProj as usize] = Cost {
         flops: 2.0 * (rows * h * l * pd) as f64,
         bytes: el(l * pd * h) + runs as f64 * el(rows * h) + el(rows * l * pd),
     };
+    // Unfused, a scale pass and a norm pass each read and write the inputs
+    // (4 reads and writes); fused, one read and one write.
     c[C::PleScaleNorm as usize] = Cost {
         flops: 0.0,
-        bytes: el(4 * rows * l * pd),
+        bytes: el(if mode.fused { 2 } else { 4 } * rows * l * pd),
     };
     c[C::PleGate as usize] = gemm_cost(rows, h, pd, l);
     c[C::PleGelu as usize] = Cost {
@@ -880,10 +1192,25 @@ fn class_costs(cfg: &EmbedGemma2Config, nb: usize, seq: usize, run: usize) -> [C
     };
     c[C::PleOut as usize] = gemm_cost(rows, pd, h, l);
     c[C::NormResidPle as usize] = c[C::NormResidAttn as usize];
+    // The final norm (2 rows) is the tail's only when unfused.
     c[C::Tail as usize] = Cost {
         flops: 2.0 * (nb * h * cfg.embedding_dim as usize) as f64,
-        bytes: el(2 * rows * h) + el(rows * h) + el(h * cfg.embedding_dim as usize),
+        bytes: if mode.fused { 0.0 } else { el(2 * rows * h) } + el(rows * h) + el(h * cfg.embedding_dim as usize),
     };
+    // The casts (f32 read, bf16 write): the embeddings once; unfused, also the
+    // attention output and the residual stream every layer.
+    if mode.bf16() {
+        let cast = |n: usize| 6.0 * n as f64;
+        c[C::Cast as usize] = Cost {
+            flops: 0.0,
+            bytes: cast(rows * h)
+                + if mode.fused {
+                    0.0
+                } else {
+                    l as f64 * (cast(rows * h) + cast(rows * q * 256))
+                },
+        };
+    }
     c
 }
 
@@ -1062,10 +1389,11 @@ fn mode_stages() -> Result<(), String> {
     let st = SafeTensors::open(&snap.join("model.safetensors"))?;
     let rt = GpuRuntime::new_inference()?;
     rt.set_async_encode(true)?;
-    let model = EmbedGemma2Model::load(&rt, &st, PREFIX, cfg.clone())?;
-    let weights = Weights::load(&rt, &st, &cfg)?;
+    let mode = Mode::from_env()?;
+    let model = EmbedGemma2Model::load_with(&rt, &st, PREFIX, cfg.clone(), mode.operands)?;
+    let weights = Weights::load(&rt, &st, &cfg, mode.bf16())?;
     let util0 = gpu_utilization();
-    eprintln!("gpu utilization at start: {util0}%");
+    eprintln!("replica: {}; gpu utilization at start: {util0}%", mode.label());
 
     let mut json_wl = Vec::new();
     for &(b, t) in &workloads {
@@ -1073,10 +1401,11 @@ fn mode_stages() -> Result<(), String> {
         let seqs: Vec<Vec<u32>> = (0..b).map(|s| ids(s, t)).collect();
         let batch: Vec<&[u32]> = seqs.iter().map(Vec::as_slice).collect();
         let rows = b * t;
-        let acts = ActsR::new(&rt, &cfg, b, rows, tessl::embedgemma2::PLE_RUN_BYTES, true)?;
+        let acts = ActsR::new(&rt, &cfg, b, rows, tessl::embedgemma2::PLE_RUN_BYTES, true, mode.bf16())?;
         let io = IoR::new(&rt, &cfg, &seqs)?;
         let cx = Cx {
             rt: &rt,
+            mode,
             cfg: &cfg,
             w: &weights,
             a: &acts,
@@ -1086,7 +1415,7 @@ fn mode_stages() -> Result<(), String> {
             ledger: None,
         };
         let run = (acts.ple.numel() / (rows * cfg.ple_dim as usize)).clamp(1, cfg.layers.len());
-        let costs = class_costs(&cfg, b, t, run);
+        let costs = class_costs(&cfg, b, t, run, mode);
 
         // Validation: the replica reproduces the library's embeddings.
         let lib = model.encode(&batch, None, false)?;
@@ -1199,6 +1528,7 @@ fn mode_stages() -> Result<(), String> {
                                 rows,
                                 tessl::embedgemma2::PLE_RUN_BYTES,
                                 kind == "fresh_zeroed",
+                                mode.bf16(),
                             )?;
                             let cx2 = Cx { a: &a2, ..cx_copy(&cx) };
                             forward(&cx2, ALL)?;
@@ -1236,7 +1566,7 @@ fn mode_stages() -> Result<(), String> {
         let full = min_of(&variants[0].samples_ms);
         let none = min_of(&variants[1].samples_ms);
         let enc_min = min_of(&encode_samples);
-        println!("== workload {name} ({rows} rows, {dispatch_full} dispatches/forward, {reps} forwards per wait, {rounds} rounds)");
+        println!("== workload {name} ({rows} rows, replica {}, {dispatch_full} dispatches/forward, {reps} forwards per wait, {rounds} rounds)", mode.label());
         println!(
             "   full replica {full:.3} ms (min) / {:.3} (median); encode() {enc_min:.3} ms (min); empty wait {none:.3} ms; host encode time of full {:.3} ms",
             median_of(&variants[0].samples_ms),
@@ -1356,7 +1686,8 @@ fn mode_stages() -> Result<(), String> {
         ));
     }
     let body = format!(
-        "{{\"mode\":\"stages\",\"classes\":[{}],\"workloads\":[{}]}}",
+        "{{\"mode\":\"stages\",\"replica\":{},\"classes\":[{}],\"workloads\":[{}]}}",
+        jstr(&mode.label()),
         NAMES.iter().map(|n| jstr(n)).collect::<Vec<_>>().join(","),
         json_wl.join(",")
     );
@@ -1778,14 +2109,16 @@ fn mode_ledger() -> Result<(), String> {
     let cfg = EmbedGemma2Config::from_config_file(&snap.join("config.json"))?;
     let st = SafeTensors::open(&snap.join("model.safetensors"))?;
     let rt = GpuRuntime::new_inference()?;
-    let weights = Weights::load(&rt, &st, &cfg)?;
+    let mode = Mode::from_env()?;
+    let weights = Weights::load(&rt, &st, &cfg, mode.bf16())?;
     let rows = b * t;
     let seqs: Vec<Vec<u32>> = (0..b).map(|s| ids(s, t)).collect();
-    let acts = ActsR::new(&rt, &cfg, b, rows, tessl::embedgemma2::PLE_RUN_BYTES, true)?;
+    let acts = ActsR::new(&rt, &cfg, b, rows, tessl::embedgemma2::PLE_RUN_BYTES, true, mode.bf16())?;
     let io = IoR::new(&rt, &cfg, &seqs)?;
     rt.synchronize()?;
     let cx = Cx {
         rt: &rt,
+        mode,
         cfg: &cfg,
         w: &weights,
         a: &acts,

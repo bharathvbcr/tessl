@@ -1326,3 +1326,148 @@ influences a kept one is the subsampling's zeroing, so trailing masked rows feed
 no kept row; not implemented); the attention could use
 `simdgroup_float8x8` tiles for the 12-query blocks; the first conv and the
 second could share one launch.
+
+## Preprocessing
+
+`tessl::embedgemma2_pre` makes the towers' inputs from raw data on the CPU, with
+no Python processor: an image (RGB, RGBA, gray or gray+alpha bytes), mono f32 PCM
+at 16 kHz, or decoded video frames become `ImageInput` / `AudioInput` (what
+`EmbedGemma2Multimodal::encode` takes) and, for video, the per-frame patch tensors
+with the sampled indices and timestamps. Its parameters are read from the
+snapshot's `processor_config.json` through the crate's strict JSON parser
+(`PreConfig::from_snapshot`); a setting it does not implement (normalisation,
+another resample filter, pre-emphasis, dither, `per_bin_mean`, left padding, a
+frame or FFT length that disagrees with the one transformers derives) is refused by
+name, not ignored.
+
+```rust
+let cfg = PreConfig::from_snapshot(&snapshot)?;
+let img = preprocess_image(&cfg.image, &RawImage::rgb(w, h, &bytes))?;     // PreparedImage
+let clip = preprocess_audio(&cfg.audio, &pcm, 16_000)?;                    // AudioInput
+let out = model.encode(&[MmItem::Image(img.input()), MmItem::Audio(&clip)], None)?;
+let video = preprocess_video(&cfg.video, &frames, source_fps)?;            // PreparedVideo
+```
+
+### Which transformers path
+
+`AutoProcessor.from_pretrained(snapshot)` builds `Gemma4ImageProcessor`, the
+torchvision ("fast") processor, and sentence-transformers calls that processor;
+`Gemma4ImageProcessorPil` is not what either uses (checked: the object's type, and
+`image0_pixel_values.npy` of `tools/embedgemma2_ref/make_mm_reference.py`, which is
+sentence-transformers' own input, equals this module's output bit for bit). The two
+differ in the resize, so the choice matters: on a uint8 CPU tensor
+`tvF.resize(..., bicubic, antialias=True)` runs ATen's fixed-point kernel, not PIL's.
+Measured against `Image.resize(BICUBIC)` on the 17 fixture inputs at the checkpoint
+geometry: at most 2 grey levels apart, 0.1 % to 0.8 % of the bytes differ. A
+float32 resize without ATen's rounding between the two passes is much further off
+(up to 18 grey levels on noise), which is why the kernel is reproduced rather than
+approximated.
+
+**Image**, in order: `do_convert_rgb` (PIL's `convert("RGB")`: gray replicated,
+alpha dropped, no compositing; transformers applies it to PIL input only, a numpy
+RGBA array is passed on with four channels, which the tower cannot take, so this
+module converts whatever it is given); the target size, the largest multiple of
+`patch_size * pooling_kernel` per side within `max_soft_tokens * pooling_kernel² *
+patch_size²` pixels (an extreme aspect ratio clamps the long side: 1x2000 becomes
+48x13440); the resize; `f32(u8) * f32(rescale_factor)`; patches of `patch_size² * 3`
+values in (row, column, channel) order; `(x, y)` positions row-major; zero padding
+and `(-1, -1)` positions to `max_soft_tokens * pooling_kernel²` patches. The resize
+(`resize_rgb_u8`): per axis the antialiased bicubic taps (`a = -0.5`, support
+`2 * max(scale, 1)`) are computed in f64 and normalised, converted to integers at
+the largest precision `p` (at most 22) for which `2^(p+1) * max weight < 2^15`, and
+applied as `(sum + 2^(p-1)) >> p` clamped to a byte, the width pass first and
+rounded to uint8, then the height pass. This was recovered by experiment against
+`torch.nn.functional.interpolate` and then matched bit for bit; it is arm64's generic
+ATen kernel. **Unverified:** ATen's x86 AVX2 uint8 kernel implements the same scheme
+separately and was not available here.
+
+**Audio**: described in the module docs; the frames, mask and frame count equal the
+extractor's (`(padded + 160 - 321) / 160 + 1` frames, where the clip is cut to
+`max_length` rounded up to 128, padded to a multiple of 128, and frame `i` is real
+when sample `i * 160 + 160` exists), a clip too short for a frame has none, and
+the features are `ln(mel + 1e-3)` of the HTK filterbank applied to the magnitudes of
+an f64 radix-2 real FFT of the f32-windowed frame. transformers' FFT is numpy's
+float32 one, so the features agree to f32 rounding rather than bit for bit. The
+lowest mel filter falls between FFT bins and is all zero (transformers warns about
+it): its feature is exactly `ln(1e-3)`. A different sampling rate is refused
+(transformers ignores `sampling_rate` and would silently compute on the wrong
+rate), as is a non-finite sample (transformers propagates NaN into every frame).
+Soft tokens per clip are the true entries of the tower's mask
+(`embedgemma2_audio::out_mask`): 750 for a 30 s clip; `audio_seq_length` (280 in
+`processor_config.json`) caps only `_get_num_multimodal_tokens`, not the
+placeholders `replace_audio_token` writes, so the processor's `input_ids` of a 31 s
+clip hold 750 audio tokens.
+
+**Video**: `sample_frame_indices` is `EmbeddingGemma2VideoProcessor.sample_frames`:
+with `fps` (1) it takes `max(1, int(duration * fps))` frames at `min(total - 1,
+int(i * source_fps / fps))`, then, above `max_frames` (32), `np.linspace(0, n - 1,
+32, dtype=int)` of them (`uniform`, numpy's own `i * step`, last element forced) or
+the first 32 (`truncate`). `duration` is `frames / source_fps`, as transformers'
+loaders set it; without a duration transformers skips fps sampling and keeps every
+frame (that is the config `fps: null`, or `do_sample_frames: false` for no sampling
+at all). Each sampled frame goes through the image path at `max_soft_tokens` 140
+(1260 patches). `PreparedVideo` carries the frames, their source indices and the
+timestamps `index / source_fps`; `timestamp_label` is the processor's `mm:ss`.
+Placing the video in a sequence, and the frames through the tower, are the
+multimodal model's.
+
+### Parity with transformers
+
+`scripts/gen_embedgemma2_pre_fixtures.py` runs the snapshot's own processors and
+saves inputs and outputs under `tests/fixtures/embedgemma2/` (`eg2p_*`, 3.9 MB,
+deterministic); `tests/embedgemma2_pre.rs` holds this module to them, without a
+device. Measured:
+
+| What | Cases | Result |
+|---|---|---|
+| Image pixels and positions, small geometry (patch 4, pooling 2, 70 tokens), stored whole | 13 inputs: 1x1, 1x2000, 2000x1, an exact-target size, gray, gray+alpha, RGBA, a photo, noise, tall, down- and up-scales | bit for bit |
+| Image pixels, the checkpoint's geometry (16, 3, 280), CRC-32 of 7.7 MB | the same 13 | equal |
+| Same, full arrays (`EMBEDGEMMA2_PRE_BIG_DIR`, `#[ignore]`) | those 13 and a 2000x1500 photo, the 768x768 exact target, 3000x200, noise 1024², RGBA 640x360 | bit for bit |
+| Image pixels of `make_mm_reference.py`'s two images (224², 640x360), from the raw bytes | 2 | bit for bit (0 of 1,935,360 values differ) |
+| Log-mel features, mask and frame count | 15 clips: silence, sweep, noise, shorter than a frame (0 frames), 150 samples (1 frame, not real), exactly 161, 320, odd lengths, DC, Nyquist, loud, near silent, cut at a limit; plus a 30 s and a 35 s clip | mask equal; max abs 4.77e-7 (one f32 ulp at magnitude 4 to 8), max relative 2.35e-7; bound 2e-6 |
+| Sampled frame indices | 36 frame counts (1 to 5000) x 21 source rates (NTSC, 1/10, 7/3, 120 among them), uniform cap; truncate; no fps; max_frames 1 | 778 lists equal |
+| Videos: indices, timestamps (exact f64), pixels, positions | 7 (3 to 70 frames; 33 and 40 frames capped to 32; 1 frame; both geometries), and 100- and 600-frame ones in the big set | bit for bit |
+| Raw image / clip to embedding, real checkpoint (`tests/embedgemma2_pre_model.rs`, ignored) | 2 images, 2 clips vs sentence-transformers fp32 | max abs 1.3e-7 to 2.3e-7, cosine 1.000000000 |
+
+Mutation check: capping the resize's weight precision at 12 bits instead of 22
+fails the image and video tests at the first pixel.
+
+### Bounds and speed
+
+Bounds, each fixed by what was measured above: pixels, positions, sampled indices
+and timestamps exact; log-mel features 2e-6 absolute (measured 4.77e-7); the
+embedding of a raw input within `1e-4` max abs and cosine `0.99999` of
+sentence-transformers' (the bound of `tests/embedgemma2_e2e_model.rs`; measured
+2.3e-7 and 1.000000000).
+
+Speed, CPU, Apple M5 Pro, `bench_embedgemma2_pre` against
+`bench/embedgemma2_pre_hf.py` (transformers' processors on the same inputs,
+CRC-equal) under `bench_paired`, 8 interleaved rounds, min of 15 per process
+(`bench/results/embedgemma2_pre_m5pro.{txt,json,png}`). The host was shared (1-minute
+load average 72 to 146 on 18 cores), so only the ratios and their spread are
+claimed: tessl is faster by the median per-round ratio, 2.4x to 4.6x on images, 10 s
+and 30 s of audio and video (single-round ranges 1.4x to 7.4x, never below 1), and
+a 1 s clip, where both take about 0.2 ms, is not distinguished (0.14x to 2.34x).
+
+| workload | tessl ms | transformers ms | median ratio [lowest, highest round] |
+|---|---|---|---|
+| image 224x224 | 0.75 | 2.26 | 3.32x [2.02, 4.52] |
+| image 640x480 | 1.15 | 3.10 | 2.72x [1.72, 4.94] |
+| image 1920x1080 | 2.64 | 6.53 | 2.68x [1.43, 3.63] |
+| image 4000x3000 | 4.77 | 21.72 | 4.62x [2.70, 7.19] |
+| audio 1 s | 0.17 | 0.23 | 1.38x [0.14, 2.34], inconclusive |
+| audio 10 s | 0.85 | 2.59 | 3.02x [2.09, 3.56] |
+| audio 30 s | 2.37 | 7.98 | 3.16x [2.28, 4.97] |
+| video 40 frames 640x360 (32 sampled, 140 tokens) | 29.2 | 80.9 | 2.38x [1.64, 6.35] |
+| video 40 frames 1280x720 | 55.0 | 193.3 | 3.97x [1.37, 7.38] |
+
+Both lanes use their own default threads (tessl at most 8, transformers torch's
+pool); single-thread speed, x86 and speed beside other work on the same cores were
+not measured. Before the front end split short clips across threads, a 1 s clip took
+0.38 ms (one process of an earlier, abandoned run, not part of the run above).
+
+Reproduce: `scripts/gen_embedgemma2_pre_fixtures.py` (fixtures; with
+`EMBEDGEMMA2_PRE_BIG_DIR=target/embedgemma2_pre_big` the big cases),
+`cargo test --release --test embedgemma2_pre`, and with the checkpoint
+`tools/embedgemma2_ref/make_mm_reference.py` (now also saves `*_raw.npy`) then
+`cargo test --release --test embedgemma2_pre_model -- --ignored --test-threads=1`.

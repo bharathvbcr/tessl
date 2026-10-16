@@ -124,7 +124,9 @@
 //! normalization) is [`embedgemma2`], and its vision tower and multimodal
 //! embedder (image patches to soft tokens) are [`embedgemma2_vision`], and the
 //! text encoder and both towers behind one snapshot and one call are
-//! [`embedgemma2_mm`].
+//! [`embedgemma2_mm`]. The towers' inputs from raw data (an image, 16 kHz audio,
+//! decoded video frames) are made on the CPU, with no Python processor, by
+//! [`embedgemma2_pre`].
 //!
 //! 44 of these were promoted out of `gemma-metal`, where they were reachable
 //! only as raw pipeline-name strings through an overlay metallib. All 44 now

@@ -1176,14 +1176,13 @@ impl AudioFrontEnd {
                 }
             }
         };
-        let threads = if frames * mels < 1 << 14 {
-            1
-        } else {
+        // About 4 microseconds a frame against tens for a thread: one thread per 24 frames.
+        let threads = (frames / 24).clamp(
+            1,
             std::thread::available_parallelism()
                 .map_or(1, std::num::NonZeroUsize::get)
-                .min(8)
-                .min(frames)
-        };
+                .min(8),
+        );
         if threads <= 1 || frames == 0 {
             work(0, &mut features);
         } else {
@@ -1498,6 +1497,48 @@ mod tests {
         }
         assert!(resize_rgb_u8(&img, 7, 5, 0, 5).is_err());
         assert!(resize_rgb_u8(&img[1..], 7, 5, 3, 3).is_err());
+    }
+
+    /// Inputs past the bounds are refused before any buffer is sized from them.
+    #[test]
+    fn oversized_inputs_are_refused_before_work() {
+        let cfg = PreConfig::from_json(SNAPSHOT_CONFIG).unwrap();
+        // An image with more than MAX_IMAGE_PIXELS pixels, whatever its data.
+        let too_big = RawImage {
+            width: 1 << 20,
+            height: (MAX_IMAGE_PIXELS >> 20) + 1,
+            channels: 3,
+            data: &[],
+        };
+        assert!(preprocess_image(&cfg.image, &too_big).unwrap_err().contains("exceeds"));
+        // A width pass that would need more than MAX_INTERMEDIATE_BYTES: 2^19 rows of a
+        // 1-pixel-wide image grown to the extreme 13440-wide target.
+        let across = AxisWeights::new(1, 13440);
+        let down = AxisWeights::new(1 << 19, 48);
+        let err = resize_with(&[], 1 << 19, 1, 48, 13440, &across, &down).unwrap_err();
+        assert!(err.contains("width pass"), "{err}");
+        // More decoded frames than MAX_VIDEO_FRAMES.
+        let px = [0u8; 3];
+        let frames = vec![RawImage::rgb(1, 1, &px); MAX_VIDEO_FRAMES + 1];
+        assert!(preprocess_video(&cfg.video, &frames, 30.0)
+            .unwrap_err()
+            .contains("frames exceeds"));
+        // Degenerate sizes.
+        assert!(AudioFrontEnd::new(&AudioFeatureConfig {
+            fft_length: 300,
+            ..cfg.audio.clone()
+        })
+        .is_err());
+        assert!(AudioFrontEnd::new(&AudioFeatureConfig {
+            max_frequency: 9000.0,
+            ..cfg.audio.clone()
+        })
+        .is_err());
+        assert!(AudioFrontEnd::new(&AudioFeatureConfig {
+            mel_floor: 0.0,
+            ..cfg.audio.clone()
+        })
+        .is_err());
     }
 
     #[test]

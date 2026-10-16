@@ -54,7 +54,7 @@ use objc2_metal::MTLComputePipelineState;
 use crate::dispatch::{dispatch_1d, set_f32, set_gpu_buf, set_u32};
 use crate::embedgemma2::{encoder_attn, EncoderAttnDims};
 use crate::gemm::{gemm, gemm_nt_f32, GemmBackend};
-use crate::json::{self, Json, Syntax};
+use crate::json::{self, Json, NumForm, Syntax};
 use crate::loader::Loader;
 use crate::nn::{dispatch_tg_1d, reduce_tptg, require, require_disjoint_writes};
 use crate::qwen35;
@@ -451,9 +451,11 @@ impl BertConfig {
         }
         let uint = |k: &str| -> Result<u32, String> {
             match c.get(k) {
-                Some(Json::Num { uint: Some(n), .. }) => {
-                    u32::try_from(*n).map_err(|_| format!("config.json: {k} = {n} exceeds u32"))
-                }
+                Some(Json::Num {
+                    form: NumForm::Uint,
+                    int: n,
+                    ..
+                }) => u32::try_from(*n).map_err(|_| format!("config.json: {k} = {n} exceeds u32")),
                 Some(v) => Err(format!("config.json: {k} must be a non-negative integer, got {v:?}")),
                 None => Err(format!("config.json: missing {k:?}")),
             }

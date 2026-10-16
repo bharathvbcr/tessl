@@ -10,7 +10,7 @@
 //! empty list), these return `Err` and the tool exits 1 with the message, so
 //! a malformed input stops the run rather than writing a wrong table.
 
-use crate::json::Json;
+use crate::json::{Json, NumForm};
 use std::cmp::Ordering;
 use std::path::Path;
 
@@ -479,14 +479,11 @@ fn convert(j: &Json) -> R<Val> {
         Json::Bool(b) => Val::Bool(*b),
         Json::Str(s) => Val::Str(s.clone()),
         Json::Num {
-            value, integral, int, ..
-        } => {
-            if *integral {
-                Val::Num(I(int.ok_or("an integer too large for this tool")?))
-            } else {
-                Val::Num(F(*value))
-            }
-        }
+            form: NumForm::Float,
+            value,
+            ..
+        } => Val::Num(F(*value)),
+        Json::Num { .. } => Val::Num(I(j.exact_int().ok_or("an integer too large for this tool")?)),
         Json::Array(items) => Val::Arr(items.iter().map(convert).collect::<R<_>>()?),
         Json::Object(fields) => Val::Obj(
             fields

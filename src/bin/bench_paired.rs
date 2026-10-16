@@ -76,7 +76,7 @@ use std::time::Duration;
 
 use common::median;
 use evidence::{Jv, Summary};
-use json::{Json, Syntax};
+use json::{Json, NumForm, Syntax};
 
 type Res<T> = Result<T, String>;
 
@@ -367,7 +367,10 @@ fn scalar_text(v: &Json) -> Option<String> {
     match v {
         Json::Str(s) => Some(s.clone()),
         Json::Num {
-            value, uint: Some(u), ..
+            value,
+            form: NumForm::Uint,
+            int: u,
+            ..
         } if value.is_finite() => Some(u.to_string()),
         Json::Num { value, .. } if value.is_finite() => Some(value.to_string()),
         _ => None,

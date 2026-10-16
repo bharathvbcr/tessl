@@ -191,7 +191,7 @@ fn write_json(v: &Json, out: &mut String) {
     match v {
         Json::Null => out.push_str("null"),
         Json::Bool(b) => out.push_str(&b.to_string()),
-        Json::Num { int: Some(i), .. } => out.push_str(&i.to_string()),
+        Json::Num { .. } if v.exact_int().is_some() => out.push_str(&v.exact_int().unwrap_or_default().to_string()),
         Json::Num { value, .. } => out.push_str(&format!("{value:?}")),
         Json::Str(t) => {
             out.push('"');

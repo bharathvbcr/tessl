@@ -87,7 +87,7 @@ use std::path::Path;
 use crate::embedgemma2_audio::AudioInput;
 use crate::embedgemma2_mm::read_config_text;
 use crate::embedgemma2_vision::ImageInput;
-use crate::json::{self, Json, Syntax};
+use crate::json::{self, Json, NumForm, Syntax};
 
 /// Most pixels (`width * height`) of one input image.
 pub const MAX_IMAGE_PIXELS: usize = 1 << 28;
@@ -275,7 +275,11 @@ impl Section<'_> {
     fn uint(&self, key: &str, default: u64) -> Result<u64, String> {
         match self.obj.get(key) {
             None => Ok(default),
-            Some(Json::Num { uint: Some(n), .. }) => Ok(*n),
+            Some(Json::Num {
+                form: NumForm::Uint,
+                int: n,
+                ..
+            }) => Ok(*n),
             Some(v) => Err(self.err(key, "a non-negative integer", v)),
         }
     }

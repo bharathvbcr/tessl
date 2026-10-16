@@ -32,7 +32,7 @@ use std::io::Read;
 use std::os::unix::fs::FileExt;
 use std::path::Path;
 
-use crate::json::{self, Json, Syntax};
+use crate::json::{self, Json, NumForm, Syntax};
 use crate::plain::{self, PlainScalar};
 
 /// Largest header accepted. The format's reference implementation caps it at
@@ -738,16 +738,26 @@ fn tensor_info(name: &str, v: Json) -> Result<TensorInfo, String> {
                 let dims = a
                     .into_iter()
                     .map(|d| match d {
-                        Json::Num { uint: Some(n), .. } => {
-                            usize::try_from(n).map_err(|_| format!("{name}: dimension {n} overflows usize"))
-                        }
+                        Json::Num {
+                            form: NumForm::Uint,
+                            int: n,
+                            ..
+                        } => usize::try_from(n).map_err(|_| format!("{name}: dimension {n} overflows usize")),
                         _ => Err(format!("{name}: shape holds a non-integer")),
                     })
                     .collect::<Result<Vec<_>, _>>()?;
                 shape = Some(dims);
             }
             ("data_offsets", Json::Array(a)) => match a.as_slice() {
-                [Json::Num { uint: Some(b), .. }, Json::Num { uint: Some(e), .. }] => offsets = Some((*b, *e)),
+                [Json::Num {
+                    form: NumForm::Uint,
+                    int: b,
+                    ..
+                }, Json::Num {
+                    form: NumForm::Uint,
+                    int: e,
+                    ..
+                }] => offsets = Some((*b, *e)),
                 _ => return Err(format!("{name}: data_offsets is not [begin, end]")),
             },
             (k, _) => return Err(format!("{name}: unexpected or mistyped field {k:?}")),

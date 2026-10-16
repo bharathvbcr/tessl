@@ -101,7 +101,7 @@ use objc2_metal::MTLComputePipelineState;
 use crate::dispatch::{dispatch_1d, dispatch_2d_tg, set_gpu_buf, set_u32};
 use crate::embedgemma2_tok::Tokenizer;
 use crate::gemm::{cast_f32_to_bf16_into, gemm, gemm_nt_f32, gemm_small_m, GemmBackend, GemmOperands};
-use crate::json::{self, Json, Syntax};
+use crate::json::{self, Json, NumForm, Syntax};
 use crate::loader::Loader;
 use crate::nn::{
     dispatch_tg_1d, reduce_tptg, require, require_disjoint_writes, rms_norm_bf16, rms_norm_f32,
@@ -987,9 +987,11 @@ impl EmbedGemma2Config {
         let c = root.get("text_config").unwrap_or(&root);
         let uint_in = |obj: &Json, k: &str| -> Result<u32, String> {
             match obj.get(k) {
-                Some(Json::Num { uint: Some(n), .. }) => {
-                    u32::try_from(*n).map_err(|_| format!("config.json: {k} = {n} exceeds u32"))
-                }
+                Some(Json::Num {
+                    form: NumForm::Uint,
+                    int: n,
+                    ..
+                }) => u32::try_from(*n).map_err(|_| format!("config.json: {k} = {n} exceeds u32")),
                 Some(v) => Err(format!("config.json: {k} must be a non-negative integer, got {v:?}")),
                 None => Err(format!("config.json: missing {k:?}")),
             }

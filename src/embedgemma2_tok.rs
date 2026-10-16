@@ -63,7 +63,7 @@ use std::collections::BinaryHeap;
 use std::io::Read;
 use std::path::Path;
 
-use crate::json::{self, Json, Syntax};
+use crate::json::{self, Json, NumForm, Syntax};
 
 /// Largest `tokenizer.json` read, in bytes (the checkpoint's is 32 MB).
 pub const MAX_TOKENIZER_BYTES: u64 = 256 << 20;
@@ -293,7 +293,11 @@ fn as_bool(j: Option<&Json>, what: &str) -> Result<bool, String> {
 
 fn as_u32(j: &Json, what: &str) -> Result<u32, String> {
     match j {
-        Json::Num { uint: Some(v), .. } if *v < u64::from(u32::MAX) => Ok(*v as u32),
+        Json::Num {
+            form: NumForm::Uint,
+            int: v,
+            ..
+        } if *v < u64::from(u32::MAX) => Ok(*v as u32),
         _ => Err(format!("tokenizer.json: {what} is not an integer below 2^32 - 1")),
     }
 }

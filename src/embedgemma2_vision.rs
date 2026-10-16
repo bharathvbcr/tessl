@@ -116,7 +116,7 @@ use crate::embedgemma2::{
     encoder_attn, encoder_attn_bf16, encoder_attn_bf16_supports, project, EncoderAttnDims, SoftSegment,
 };
 use crate::gemm::{cast_f32_to_bf16_into, GemmOperands};
-use crate::json::{self, Json, Syntax};
+use crate::json::{self, Json, NumForm, Syntax};
 use crate::loader::Loader;
 use crate::nn::{
     attn_kv_capacity, attn_kv_capacity_bf16, bind_rope_inv_freq, require, require_disjoint_writes, rms_norm_bf16,
@@ -491,9 +491,11 @@ impl VisionConfig {
         let text_cfg = root.get("text_config").ok_or("config.json: missing \"text_config\"")?;
         let uint_of = |obj: &Json, k: &str| -> Result<u32, String> {
             match obj.get(k) {
-                Some(Json::Num { uint: Some(n), .. }) => {
-                    u32::try_from(*n).map_err(|_| format!("config.json: {k} = {n} exceeds u32"))
-                }
+                Some(Json::Num {
+                    form: NumForm::Uint,
+                    int: n,
+                    ..
+                }) => u32::try_from(*n).map_err(|_| format!("config.json: {k} = {n} exceeds u32")),
                 Some(v) => Err(format!("config.json: {k} must be a non-negative integer, got {v:?}")),
                 None => Err(format!("config.json: missing {k:?}")),
             }

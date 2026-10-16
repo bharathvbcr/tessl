@@ -28,6 +28,9 @@ pub mod embedgemma2_audio;
 /// The tiny multimodal checkpoint (text, vision and audio in one file) and the
 /// processor-shaped inputs for `EmbedGemma2Multimodal` and its C ABI entries.
 pub mod embedgemma2_mm;
+/// The (text, ids) corpora of `scripts/gen_embedgemma2_tok_fixtures.py` and a
+/// per-group tally for the tokenizer parity tests.
+pub mod embedgemma2_tok;
 /// f64 references for EmbeddingGemma 2's vision tower: the axial RoPE, the
 /// pooler as transformers writes it, and a whole host forward.
 pub mod embedgemma2_vision;

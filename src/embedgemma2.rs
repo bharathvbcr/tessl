@@ -91,6 +91,7 @@ use std::sync::Arc;
 use objc2_metal::MTLComputePipelineState;
 
 use crate::dispatch::{dispatch_1d, dispatch_2d_tg, set_gpu_buf, set_u32};
+use crate::embedgemma2_tok::Tokenizer;
 use crate::gemm::{cast_f32_to_bf16_into, gemm, gemm_nt_f32, gemm_small_m, GemmBackend, GemmOperands};
 use crate::json::{self, Json, Syntax};
 use crate::loader::Loader;
@@ -1551,6 +1552,26 @@ impl EmbedGemma2Model {
             })
             .collect();
         self.encode_impl("EmbedGemma2Model::encode", &seqs, None, truncate_dim, trace)
+    }
+
+    /// Tokenize `texts` with `tokenizer` and embed them: the tokenizer's ids
+    /// ([`Tokenizer::encode_batch_with_prompt`]: the `<bos>`/`<eos>` and the
+    /// task prompt `prompt_name` names, as sentence-transformers feeds them),
+    /// then [`Self::encode`]. A text the tokenizer refuses or an id past this
+    /// model's vocabulary is an error before any GPU work; `truncate_dim` and
+    /// the rest are [`Self::encode`]'s.
+    pub fn encode_texts(
+        &self,
+        tokenizer: &Tokenizer,
+        prompt_name: Option<&str>,
+        texts: &[&str],
+        truncate_dim: Option<u32>,
+    ) -> Result<EncodeOutput, String> {
+        let ids = tokenizer
+            .encode_batch_with_prompt(prompt_name, texts)
+            .map_err(|e| format!("EmbedGemma2Model::encode_texts: {e}"))?;
+        let batch: Vec<&[u32]> = ids.iter().map(Vec::as_slice).collect();
+        self.encode(&batch, truncate_dim, false)
     }
 
     /// [`Self::encode`] for sequences whose placeholder ids (`image_token_id`,

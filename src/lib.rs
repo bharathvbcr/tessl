@@ -81,6 +81,7 @@
 //! | [`attn_train`] | Full attention for training: the forward with its log-sum-exp, and the backward |
 //! | [`qwen35_train`] | One training step of the Qwen3.5 text model: loss and every parameter's gradient |
 //! | [`qwen35_adamw`] | AdamW over a Qwen3.5 model's own parameters, in place (torch.optim.AdamW's update) |
+//! | [`embedgemma2_tok`] | EmbeddingGemma 2's tokenizer in Rust: the snapshot's BPE `tokenizer.json`, the ids sentence-transformers feeds the model, decode |
 //! | [`capi`] | The C ABI (`libtessl.dylib`) that `python/tessl_torch` calls through `ctypes` |
 //! | [`capi_embedgemma2`] | The C ABI's EmbeddingGemma 2 entries: load a snapshot, embed token ids |
 //!
@@ -124,7 +125,8 @@
 //! normalization) is [`embedgemma2`], and its vision tower and multimodal
 //! embedder (image patches to soft tokens) are [`embedgemma2_vision`], and the
 //! text encoder and both towers behind one snapshot and one call are
-//! [`embedgemma2_mm`].
+//! [`embedgemma2_mm`], and the tokenizer that turns a text into the encoder's
+//! ids (no Python) is [`embedgemma2_tok`].
 //!
 //! 44 of these were promoted out of `gemma-metal`, where they were reachable
 //! only as raw pipeline-name strings through an overlay metallib. All 44 now
@@ -239,6 +241,7 @@ pub mod dispatch;
 pub mod embedgemma2;
 pub mod embedgemma2_audio;
 pub mod embedgemma2_mm;
+pub mod embedgemma2_tok;
 pub mod embedgemma2_vision;
 pub mod gdn_train;
 pub mod gemm;

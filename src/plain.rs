@@ -93,3 +93,53 @@ pub(crate) fn open_regular_file(path: &std::path::Path) -> Result<(std::fs::File
     }
     Ok((f, md.len()))
 }
+
+/// The element count of `shape`, or `None` if it does not fit in `usize`.
+///
+/// A zero dimension makes the count zero whatever the other dimensions are, so
+/// the verdict does not depend on the order of the dims: a left-to-right
+/// `checked_mul` fold would collapse `[0, 2^32, 2^32]` to 0 before reaching the
+/// overflow and refuse `[2^32, 2^32, 0]`, though both name the same empty
+/// tensor. The one owner of this product for the `.npy` and `.safetensors`
+/// readers.
+pub(crate) fn checked_numel(shape: &[usize]) -> Option<usize> {
+    if shape.contains(&0) {
+        return Some(0);
+    }
+    shape.iter().try_fold(1usize, |acc, &d| acc.checked_mul(d))
+}
+
+/// This machine's physical memory in bytes: the default payload budget of the
+/// CPU-side checkpoint readers, which hold a tensor in host memory.
+fn physical_memory_bytes() -> Result<u64, String> {
+    // SAFETY: `sysconf` takes an integer name and has no memory preconditions;
+    // a failure is reported as -1.
+    let (pages, page) = unsafe { (libc::sysconf(libc::_SC_PHYS_PAGES), libc::sysconf(libc::_SC_PAGESIZE)) };
+    match (u64::try_from(pages), u64::try_from(page)) {
+        (Ok(pages), Ok(page)) if pages > 0 && page > 0 => pages
+            .checked_mul(page)
+            .ok_or_else(|| "physical memory size overflows u64".to_string()),
+        _ => Err("cannot determine physical memory for the default payload budget".to_string()),
+    }
+}
+
+/// Refuse, before any payload allocation, a checkpoint whose declared tensor
+/// bytes exceed the budget: `limit` when the caller gave one, else
+/// [`physical_memory_bytes`]. The one place that budget is computed and
+/// compared, so no reader keeps its own check. A budget that cannot be
+/// determined is an error, never "no limit".
+pub(crate) fn check_payload_budget(what: &str, declared: u64, limit: Option<u64>) -> Result<(), String> {
+    let (budget, source) = match limit {
+        Some(l) => (l, "the caller's limit"),
+        None => (
+            physical_memory_bytes().map_err(|e| format!("{what}: {e}"))?,
+            "physical memory",
+        ),
+    };
+    if declared > budget {
+        return Err(format!(
+            "{what}: payload budget exceeded: the file declares {declared} tensor bytes, above {source} of {budget} bytes"
+        ));
+    }
+    Ok(())
+}

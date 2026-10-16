@@ -709,6 +709,83 @@ fn safetensors_hostile_headers_are_named_errors() {
 
 // ------------------------------------------------------- sharded index
 
+/// Property (card ft-51395822): the shape check's verdict is a function of the
+/// dims as a multiset, never of their order. A left-to-right `checked_mul`
+/// fold used to collapse `[0, 2^32, 2^32]` to 0 before reaching the overflow
+/// and refuse `[2^32, 2^32, 0]`. Checked against an exact oracle over every
+/// 1- to 4-dim tuple drawn from boundary values, in every permutation: a zero
+/// dim means an empty tensor (accepted with `data_offsets [0, 0]`); otherwise
+/// a product past `usize` is "overflows" and any other is a byte-size mismatch
+/// (the offsets claim 0 bytes for a non-empty U8 tensor).
+#[test]
+fn safetensors_shape_verdict_is_independent_of_dimension_order() {
+    fn permutations(v: &[u64]) -> Vec<Vec<u64>> {
+        if v.len() <= 1 {
+            return vec![v.to_vec()];
+        }
+        let mut out = Vec::new();
+        for i in 0..v.len() {
+            let mut rest = v.to_vec();
+            let x = rest.remove(i);
+            for mut p in permutations(&rest) {
+                p.insert(0, x);
+                out.push(p);
+            }
+        }
+        out
+    }
+    #[derive(Debug, PartialEq, Eq)]
+    enum Verdict {
+        Accepted,
+        Overflow,
+        Mismatch,
+    }
+    fn verdict(dims: &[u64]) -> Verdict {
+        let shape = dims.iter().map(u64::to_string).collect::<Vec<_>>().join(",");
+        let header = format!(r#"{{"t":{{"dtype":"U8","shape":[{shape}],"data_offsets":[0,0]}}}}"#);
+        match SafeTensors::from_bytes("shape", st_bytes(&header, 0)) {
+            Ok(_) => Verdict::Accepted,
+            Err(e) if e.contains("overflows") => Verdict::Overflow,
+            Err(e) if e.contains("bytes in data_offsets") => Verdict::Mismatch,
+            Err(e) => panic!("{dims:?}: unexpected refusal {e}"),
+        }
+    }
+    fn oracle(dims: &[u64]) -> Verdict {
+        if dims.contains(&0) {
+            return Verdict::Accepted;
+        }
+        let exact = dims.iter().try_fold(1u128, |a, &d| a.checked_mul(d as u128));
+        match exact {
+            Some(n) if n <= usize::MAX as u128 => Verdict::Mismatch,
+            _ => Verdict::Overflow,
+        }
+    }
+    let pool = [0u64, 1, 2, 1 << 31, 1 << 32, 1 << 63, u64::MAX];
+    let mut tuples: Vec<Vec<u64>> = pool.iter().map(|&a| vec![a]).collect();
+    for n in 2..=4usize {
+        let mut next = Vec::new();
+        for t in &tuples {
+            if t.len() == n - 1 {
+                for &d in &pool {
+                    let mut u = t.clone();
+                    u.push(d);
+                    next.push(u);
+                }
+            }
+        }
+        tuples.extend(next);
+    }
+    let mut checked = 0usize;
+    for t in tuples.iter().filter(|t| t.len() <= 4) {
+        let want = oracle(t);
+        for p in permutations(t) {
+            assert_eq!(verdict(&p), want, "dims {p:?} (a permutation of {t:?})");
+            checked += 1;
+        }
+    }
+    assert!(checked > 5000, "only {checked} cases ran");
+}
+
 const INDEX_SEED: &str = r#"{"metadata":{"total_size":53},"weight_map":{"a.f32":"s1.safetensors","b.bf16":"s2.safetensors","c.u8":"s1.safetensors","d.i64":"s2.safetensors"}}"#;
 
 /// The two shards `INDEX_SEED` names, written under `dir`: the seed file's

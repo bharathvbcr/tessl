@@ -532,7 +532,9 @@ fn a_file_truncated_after_open_fails_the_read_not_silently() {
         .unwrap();
     let e = st.read_f32("a").unwrap_err();
     std::fs::remove_file(&p).unwrap();
-    assert!(e.contains("data"), "{e}");
+    // Caught by the identity re-check on the open handle (size changed), which
+    // runs before the read that would have come up short.
+    assert!(e.contains("file changed since it was opened"), "{e}");
 }
 
 /// The real checkpoint. Opt-in because it needs the ~4.5 GB file from the

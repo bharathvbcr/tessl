@@ -251,6 +251,12 @@ fn f32_and_i64_survive_a_round_trip_through_the_reader() {
         "{{'descr': '<i8', 'fortran_order': False, 'shape': ({},), }}\n",
         ints.len()
     );
+    // Pad per the npy spec: spaces to a 64-byte data start, then the newline.
+    let mut header = header.trim_end_matches('\n').to_string();
+    while (10 + header.len() + 1) % 64 != 0 {
+        header.push(' ');
+    }
+    header.push('\n');
     let mut bytes = Vec::new();
     bytes.extend_from_slice(b"\x93NUMPY\x01\x00");
     bytes.extend_from_slice(&u16::try_from(header.len()).expect("header fits").to_le_bytes());
@@ -275,6 +281,12 @@ fn an_unsupported_dtype_is_still_refused_and_named() {
     let path = dir.join("bad.npy");
 
     let header = "{'descr': '<c16', 'fortran_order': False, 'shape': (1,), }\n";
+    // Pad per the npy spec: spaces to a 64-byte data start, then the newline.
+    let mut header = header.trim_end_matches('\n').to_string();
+    while (10 + header.len() + 1) % 64 != 0 {
+        header.push(' ');
+    }
+    header.push('\n');
     let mut bytes = Vec::new();
     bytes.extend_from_slice(b"\x93NUMPY\x01\x00");
     bytes.extend_from_slice(&u16::try_from(header.len()).expect("header fits").to_le_bytes());

@@ -133,15 +133,64 @@ impl TensorInfo {
     /// Product of `shape` (1 for a scalar).
     pub fn numel(&self) -> usize {
         // `open` checked this product fits.
-        self.shape.iter().product()
+        plain::checked_numel(&self.shape).expect("open checked the element count fits")
+    }
+}
+
+/// What identifies a file's contents at one moment: size, modification time
+/// (to the nanosecond), inode and device.
+///
+/// Decision (card ft-51395822): `open` records it and every read re-checks it
+/// on the same handle (`fstat`, so no path swap matters), and a mismatch is a
+/// "changed since it was opened" error. A file rewritten in place after `open`
+/// would otherwise be read with the old header's offsets and yield plausible
+/// wrong weights. Limits and consequences, by design:
+///
+/// * a rename-replace at the path is not detected: the handle still names the
+///   old inode, so reads keep serving that file's own consistent bytes;
+/// * a metadata-only change (`touch`) changes the mtime and so refuses the next
+///   read: it fails closed rather than guessing the contents are unchanged;
+/// * a rewrite that restores the mtime (`utimes`) is not detected;
+/// * the stamp is checked both before and after each read, which narrows a
+///   rewrite racing a read to one entirely inside one nanosecond tick.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct FileStamp {
+    len: u64,
+    mtime: (i64, i64),
+    ino: u64,
+    dev: u64,
+}
+
+impl FileStamp {
+    fn of(f: &File) -> std::io::Result<Self> {
+        use std::os::unix::fs::MetadataExt;
+        let md = f.metadata()?;
+        Ok(Self {
+            len: md.len(),
+            mtime: (md.mtime(), md.mtime_nsec()),
+            ino: md.ino(),
+            dev: md.dev(),
+        })
+    }
+
+    /// Err if `f` no longer matches `self`.
+    fn recheck(&self, f: &File, what: &str) -> Result<(), String> {
+        let now = Self::of(f).map_err(|e| format!("{what}: {e}"))?;
+        if now != *self {
+            return Err(format!(
+                "{what}: file changed since it was opened (was {self:?}, now {now:?}); refusing to read it with the old header's offsets"
+            ));
+        }
+        Ok(())
     }
 }
 
 /// Where a [`SafeTensors`]' bytes live.
 #[derive(Debug)]
 enum Source {
-    /// The handle whose header was validated; every read goes through it.
-    File(File),
+    /// The handle whose header was validated, and its identity at `open`;
+    /// every read goes through the handle after re-checking the identity.
+    File(File, FileStamp),
     /// The whole serialized form, header included.
     Bytes(Vec<u8>),
 }
@@ -155,6 +204,11 @@ pub struct SafeTensors {
     what: String,
     source: Source,
     data_start: u64,
+    /// Bytes after the header: exactly the tensors' total, as they tile it.
+    data_len: u64,
+    /// The caller's payload limit (`None`: physical memory), applied again to
+    /// each read's own allocation.
+    limit: Option<u64>,
     tensors: BTreeMap<String, TensorInfo>,
     metadata: BTreeMap<String, String>,
 }
@@ -176,9 +230,27 @@ fn header_len(what: &str, len8: [u8; 8], total: u64) -> Result<u64, String> {
 
 impl SafeTensors {
     /// Open and validate `path`'s header. No tensor data is read.
+    ///
+    /// The payload budget defaults to this machine's physical memory
+    /// (`sysconf(_SC_PHYS_PAGES) * _SC_PAGESIZE`): a file declaring more
+    /// tensor bytes is refused at open, before any payload allocation. To use
+    /// another budget, call [`Self::open_with_limit`] with `Some(bytes)`.
     pub fn open(path: &Path) -> Result<Self, String> {
+        Self::open_with_limit(path, None)
+    }
+
+    /// [`Self::open`], refusing before any payload allocation a file whose
+    /// declared tensor bytes exceed `limit`, or physical memory when `None`.
+    pub fn open_with_limit(path: &Path, limit: Option<u64>) -> Result<Self, String> {
         let what = path.display().to_string();
-        let (mut f, file_len) = plain::open_regular_file(path)?;
+        // `open_regular_file` checks the handle is a regular file; its length
+        // is not used. The stamp's single fstat is the one source of both the
+        // length the header is validated against and the identity every read
+        // rechecks, so a rewrite between two fstats cannot leave them
+        // disagreeing.
+        let (mut f, _) = plain::open_regular_file(path)?;
+        let stamp = FileStamp::of(&f).map_err(|e| format!("{what}: {e}"))?;
+        let file_len = stamp.len;
         let mut len8 = [0u8; 8];
         f.read_exact(&mut len8)
             .map_err(|e| format!("{what}: header length: {e}"))?;
@@ -186,11 +258,15 @@ impl SafeTensors {
         let mut header = vec![0u8; n as usize];
         f.read_exact(&mut header).map_err(|e| format!("{what}: header: {e}"))?;
         let data_start = 8 + n;
-        let (tensors, metadata) = parse_header(&header, file_len - data_start).map_err(|e| format!("{what}: {e}"))?;
+        let data_len = file_len - data_start;
+        let (tensors, metadata) = parse_header(&header, data_len).map_err(|e| format!("{what}: {e}"))?;
+        plain::check_payload_budget(&what, data_len, limit)?;
         Ok(Self {
             what,
-            source: Source::File(f),
+            source: Source::File(f, stamp),
             data_start,
+            data_len,
+            limit,
             tensors,
             metadata,
         })
@@ -216,6 +292,8 @@ impl SafeTensors {
             what: what.to_string(),
             source: Source::Bytes(bytes),
             data_start,
+            data_len: total - data_start,
+            limit: None,
             tensors,
             metadata,
         })
@@ -237,6 +315,16 @@ impl SafeTensors {
             .ok_or_else(|| format!("{}: no tensor {name:?}", self.what))
     }
 
+    /// Refuse, before it is made, an allocation of `elems` elements of
+    /// `elem_size` bytes that exceeds the payload budget. `open` bounds the
+    /// file's declared bytes; a read can allocate more than that (a 16-bit
+    /// tensor widened to f32 takes twice the file's bytes), so each read
+    /// checks its own allocation through the same owner.
+    fn check_alloc(&self, name: &str, elems: usize, elem_size: usize) -> Result<(), String> {
+        let bytes = (elems as u64).saturating_mul(elem_size as u64);
+        plain::check_payload_budget(&format!("{}: {name}: read allocation", self.what), bytes, self.limit)
+    }
+
     /// Fill `dst` with `info`'s bytes from one positioned read into `dst`'s
     /// own storage: no staging copy, whatever the tensor's size.
     fn read_into<T: PlainScalar>(&self, name: &str, info: &TensorInfo, dst: &mut [T]) -> Result<(), String> {
@@ -254,9 +342,12 @@ impl SafeTensors {
             // replaced at that path since would be read with this header's
             // offsets. A truncation of this same file fails here, not as
             // short data.
-            Source::File(f) => f
-                .read_exact_at(bytes, start)
-                .map_err(|e| format!("{name}: data: {e}"))?,
+            Source::File(f, stamp) => {
+                stamp.recheck(f, &self.what)?;
+                f.read_exact_at(bytes, start)
+                    .map_err(|e| format!("{name}: data: {e}"))?;
+                stamp.recheck(f, &self.what)?;
+            }
             // `from_bytes` checked that every tensor lies inside the buffer.
             Source::Bytes(b) => {
                 let src = usize::try_from(start)
@@ -276,6 +367,7 @@ impl SafeTensors {
         if info.dtype != want {
             return Err(format!("{name}: expected {want:?}, found {:?}", info.dtype));
         }
+        self.check_alloc(name, info.numel(), std::mem::size_of::<T>())?;
         let mut data = vec![T::default(); info.numel()];
         self.read_into(name, info, &mut data)?;
         Ok((info.shape.clone(), data))
@@ -288,6 +380,7 @@ impl SafeTensors {
         let info = self.info(name)?;
         let len =
             usize::try_from(info.end - info.begin).map_err(|_| format!("{name}: tensor too large for this host"))?;
+        self.check_alloc(name, len, 1)?;
         let mut bytes = vec![0u8; len];
         self.read_into(name, info, &mut bytes)?;
         Ok((info.clone(), bytes))
@@ -338,6 +431,7 @@ impl SafeTensors {
     /// every `i < n`, so no write lands on a value not yet read.
     pub fn read_f32(&self, name: &str) -> Result<(Vec<usize>, Vec<f32>), String> {
         let info = self.info(name)?;
+        self.check_alloc(name, info.numel(), 4)?;
         let mut data = vec![0f32; info.numel()];
         self.read_f32_into(name, &info.shape, &mut data)?;
         Ok((info.shape.clone(), data))
@@ -448,23 +542,39 @@ impl CheckpointView {
     /// Open `path`: a `.safetensors` file, a `model.safetensors.index.json`
     /// (or any `*.json` index), or a checkpoint directory holding an index
     /// or, failing that, `model.safetensors`.
+    ///
+    /// The payload budget defaults to this machine's physical memory
+    /// (`sysconf(_SC_PHYS_PAGES) * _SC_PAGESIZE`) and applies to the shards'
+    /// declared tensor bytes in total: a larger checkpoint is refused at open.
+    /// To use another budget, call [`Self::open_with_limit`] with
+    /// `Some(bytes)`.
     pub fn open(path: &Path) -> Result<Self, String> {
+        Self::open_with_limit(path, None)
+    }
+
+    /// [`Self::open`], refusing, before any payload allocation, a checkpoint
+    /// whose shards together declare more tensor bytes than `limit` (physical
+    /// memory when `None`). The sum is checked as each shard opens, so an
+    /// oversized shard is named before the rest are touched. The budget is
+    /// computed by `plain::check_payload_budget`, the one owner shared with
+    /// the `.npy` reader.
+    pub fn open_with_limit(path: &Path, limit: Option<u64>) -> Result<Self, String> {
         let what = path.display().to_string();
         let md = std::fs::metadata(path).map_err(|e| format!("{what}: {e}"))?;
         if md.is_dir() {
             let index = path.join(INDEX_FILE_NAME);
             return match std::fs::symlink_metadata(&index) {
-                Ok(_) => Self::open_index(&index),
+                Ok(_) => Self::open_index(&index, limit),
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                    Self::open_single(&path.join("model.safetensors"))
+                    Self::open_single(&path.join("model.safetensors"), limit)
                 }
                 Err(e) => Err(format!("{}: {e}", index.display())),
             };
         }
         if path.extension().is_some_and(|e| e == "json") {
-            Self::open_index(path)
+            Self::open_index(path, limit)
         } else {
-            Self::open_single(path)
+            Self::open_single(path, limit)
         }
     }
 
@@ -473,8 +583,8 @@ impl CheckpointView {
         self.shards.len()
     }
 
-    fn open_single(path: &Path) -> Result<Self, String> {
-        let st = SafeTensors::open(path)?;
+    fn open_single(path: &Path, limit: Option<u64>) -> Result<Self, String> {
+        let st = SafeTensors::open_with_limit(path, limit)?;
         let owner = st.names().map(|n| (n.to_string(), 0)).collect();
         Ok(Self {
             what: path.display().to_string(),
@@ -483,7 +593,7 @@ impl CheckpointView {
         })
     }
 
-    fn open_index(index_path: &Path) -> Result<Self, String> {
+    fn open_index(index_path: &Path, limit: Option<u64>) -> Result<Self, String> {
         let what = index_path.display().to_string();
         let dir = match index_path.parent() {
             Some(d) if !d.as_os_str().is_empty() => d,
@@ -512,8 +622,11 @@ impl CheckpointView {
 
         let mut shards = Vec::with_capacity(paths.len());
         let mut owner = BTreeMap::new();
+        let mut declared = 0u64;
         for (i, ((file, path), names)) in paths.iter().zip(by_file.values()).enumerate() {
-            let st = SafeTensors::open(path)?;
+            let st = SafeTensors::open_with_limit(path, limit)?;
+            declared = declared.saturating_add(st.data_len);
+            plain::check_payload_budget(&what, declared, limit)?;
             for n in names {
                 if st.info(n).is_err() {
                     return Err(format!(
@@ -534,6 +647,12 @@ impl CheckpointView {
             shards.push(st);
         }
         Ok(Self { what, shards, owner })
+    }
+
+    /// `name`'s dtype and shape (and byte range within its shard), from the
+    /// header alone: no tensor data is read. `None` if no shard has `name`.
+    pub fn tensor_info(&self, name: &str) -> Option<&TensorInfo> {
+        self.shard(name).ok()?.info(name).ok()
     }
 
     fn shard(&self, name: &str) -> Result<&SafeTensors, String> {
@@ -688,12 +807,7 @@ fn parse_header(bytes: &[u8], data_len: u64) -> Result<Header, String> {
                 t.begin, t.end
             ));
         }
-        let numel = t
-            .shape
-            .iter()
-            .try_fold(1u64, |acc, &d| acc.checked_mul(d as u64))
-            .ok_or_else(|| format!("{name}: element count overflows"))?;
-        usize::try_from(numel).map_err(|_| format!("{name}: element count overflows usize"))?;
+        let numel = plain::checked_numel(&t.shape).ok_or_else(|| format!("{name}: element count overflows"))? as u64;
         let want = numel
             .checked_mul(t.dtype.size())
             .ok_or_else(|| format!("{name}: byte size overflows"))?;

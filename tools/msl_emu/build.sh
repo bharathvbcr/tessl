@@ -75,5 +75,15 @@ if [[ "${MSL_EMU_SANITIZE:-}" == thread ]]; then
 else
   "$OUT/barrier_probe" drop
   "$OUT/barrier_probe" tg_static
+  # The deadlock watchdog: a slow run that keeps moving passes a 1 s stall
+  # limit, and a deadlock is ended by a 2 s one instead of hanging.
+  MSL_EMU_STALL_S=1 "$OUT/barrier_probe" slow
+  got=0
+  MSL_EMU_STALL_S=2 MSL_EMU_WALL_S=60 "$OUT/barrier_probe" deadlock 2> "$OUT/barrier_probe.deadlock.log" || got=$?
+  if [[ "$got" == 0 ]] || ! grep -q 'barrier deadlock' "$OUT/barrier_probe.deadlock.log"; then
+    cat "$OUT/barrier_probe.deadlock.log" >&2
+    echo "msl_emu: barrier_probe deadlock exited $got without the watchdog's report" >&2
+    exit 1
+  fi
 fi
 echo "$OUT/harness"

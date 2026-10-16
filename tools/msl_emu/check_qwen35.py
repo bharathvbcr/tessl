@@ -676,7 +676,11 @@ def case_encoder_attn_rows(seed, D, window):
             hi = n if window == 0 else min(n, t + window + 1)
             sc = torch.einsum("hd,shd->hs", q[b, t].double(), kk[lo:hi]) * scale
             want[b, t] = torch.einsum("hs,shd->hd", sc.softmax(-1), vv[lo:hi])
-    check(f"encoder_attn_rows D{D} window{window}", got, want, atol=2e-6)
+    # Exact math holds the f64 softmax to 2e-6; under --fast-math the kernel's perturbed `exp`
+    # is held to tests/embedgemma2_kernels.rs's on-device bound instead (KERNEL_REL, 2e-5 of
+    # max|o|), which no perturbed kernel can beat by the exact-math margin.
+    atol = 2e-5 * want.abs().max().item() if FAST_MATH else 2e-6
+    check(f"encoder_attn_rows D{D} window{window}", got, want, atol=atol)
     pad = got[1, int(lens[1]):]
     ok = bool((pad == 0).all())
     print(f"  [{'ok  ' if ok else 'FAIL'}] encoder_attn_rows D{D} window{window}: padded queries are exactly zero")

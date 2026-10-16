@@ -518,9 +518,21 @@ fn the_host_refuses_what_the_kernels_cannot_run() {
             GdnTrainWorkspace::new(rt, GdnTrainDims { heads: 0, ..dims }).map(|_| ()),
             "non-zero",
         );
+        // The production (chunked) workspace for B = 1, T = 5 (one padded
+        // chunk of 64 rows), H = 2, Dv = 32 (two slices): kh, qh; gc, bt; wm,
+        // aq; dsbuf; dbuf, drbuf, dop; dscore, das, gtot, dbs; dgpart, dbpart;
+        // dqh, dkh.
+        let (bh, tp, ns) = (2usize, 64usize, 2usize);
         assert_eq!(
             GdnTrainWorkspace::bytes_for(dims),
-            4 * (2 * 2 * 64 * 128 * 16 + 2 * 2 * 10 * 128 + 2 * 2 * 10)
+            4 * (2 * bh * tp * 128
+                + 2 * bh * tp
+                + 2 * bh * 64 * 64
+                + bh * 128 * 32
+                + 3 * bh * tp * 32
+                + 4 * bh * 64 * 64
+                + 2 * ns * bh * tp
+                + 2 * 10 * 128)
         );
     });
 }

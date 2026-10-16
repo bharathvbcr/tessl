@@ -566,13 +566,257 @@ this one); otherwise it prints a `SKIPPED` line. The script
 also runs `cargo test` with `--no-fail-fast` and exits non-zero if any test
 binary failed.
 
+GPU suite record (2026-10-15, commit 60a6240; hosted CI run 38739221987 ran on
+that commit and its Rust jobs were green). Machine: Apple M5 Pro (hw.model
+Mac17,8), macOS 27.0.1 (26A434). Run under Lappi-decision's `mac_heavy.sh` lock
+(`MAC_HEAVY_MAX_LOAD=60`): the lock started the run at load average 59 and no peer held
+it while it ran; no device-utilisation counter is read without sudo, so
+idleness is evidenced by the lock alone.
+
 ```
-(2026-09-19 run; NOT re-run at 2972027, where 800 #[test] functions exist)
-lib tests      95 (94 passing, 1 #[ignore]d deep soak)
-integration    251 across 33 files
-doc tests      4
-total          349 passing, 0 failing, 1 ignored
+cargo test --release --no-fail-fast -- --test-threads=1     exit 0
+  1255 passed, 0 failed, 16 ignored, over 112 test binaries (per binary below)
+cargo test --release --features quant-prep --lib mtl_tensor:: -- --test-threads=1
+  11 passed, 0 failed (190 filtered out); exit 0, the filter matched
 ```
+
+```
+src/lib.rs                                    187 passed 0 failed 3 ignored
+src/bin/bench_embedgemma2.rs                    8 passed 0 failed 0 ignored
+src/bin/bench_flash_attn.rs                    11 passed 0 failed 0 ignored
+src/bin/bench_gemm_coop_tile.rs                 7 passed 0 failed 0 ignored
+src/bin/bench_gemm_routes.rs                    7 passed 0 failed 0 ignored
+src/bin/bench_gemm_sweep.rs                     7 passed 0 failed 0 ignored
+src/bin/bench_gemm_tile_tune.rs                 7 passed 0 failed 0 ignored
+src/bin/bench_gemm_tnnt_tune.rs                 7 passed 0 failed 0 ignored
+src/bin/bench_gemm_variants.rs                  7 passed 0 failed 0 ignored
+src/bin/bench_nn_kernels.rs                     9 passed 0 failed 0 ignored
+src/bin/bench_paired.rs                        35 passed 0 failed 0 ignored
+src/bin/bench_qwen35_layers.rs                  7 passed 0 failed 0 ignored
+src/bin/bench_qwen35_train.rs                   7 passed 0 failed 0 ignored
+src/bin/probe_gdn_scan.rs                       7 passed 0 failed 0 ignored
+src/bin/probe_gemm_bits.rs                      7 passed 0 failed 0 ignored
+src/bin/probe_gemm_parity.rs                    7 passed 0 failed 0 ignored
+src/bin/probe_load_memory.rs                    7 passed 0 failed 0 ignored
+src/bin/probe_storage_memory.rs                 0 passed 0 failed 0 ignored
+src/bin/probe_train_memory.rs                   0 passed 0 failed 0 ignored
+tests/adamw_step.rs                             6 passed 0 failed 0 ignored
+tests/attention.rs                             29 passed 0 failed 0 ignored
+tests/attn_train.rs                             6 passed 0 failed 0 ignored
+tests/audit_gemm_tiles.rs                      17 passed 0 failed 0 ignored
+tests/bench_clip_2048_result.rs                11 passed 0 failed 0 ignored
+tests/bench_env_validation.rs                   2 passed 0 failed 0 ignored
+tests/bench_gemm_sweep_metallib.rs              5 passed 0 failed 0 ignored
+tests/bench_paired_cli.rs                      29 passed 0 failed 0 ignored
+tests/bench_qwen35_layers_cli.rs               14 passed 0 failed 0 ignored
+tests/bert_kernels.rs                           9 passed 0 failed 0 ignored
+tests/bert_model.rs                             3 passed 0 failed 0 ignored
+tests/bert_tiny.rs                              4 passed 0 failed 0 ignored
+tests/bf16_cast.rs                              2 passed 0 failed 0 ignored
+tests/build_artifact_contract.rs                2 passed 0 failed 0 ignored
+tests/capi.rs                                  21 passed 0 failed 0 ignored
+tests/capi_contract.rs                         73 passed 0 failed 0 ignored
+tests/capi_oversized.rs                         2 passed 0 failed 0 ignored
+tests/check_kernel_ir_planted.rs                6 passed 0 failed 0 ignored
+tests/checkpoint_view.rs                       15 passed 0 failed 0 ignored
+tests/cross_entropy.rs                          8 passed 0 failed 0 ignored
+tests/dialect_lint_script.rs                    5 passed 0 failed 0 ignored
+tests/docs_name_real_tools.rs                   6 passed 0 failed 0 ignored
+tests/embedded_metallib.rs                      1 passed 0 failed 0 ignored
+tests/embedgemma2_kernels.rs                   20 passed 0 failed 0 ignored
+tests/embedgemma2_model.rs                      0 passed 0 failed 1 ignored
+tests/embedgemma2_tiny.rs                       9 passed 0 failed 0 ignored
+tests/f16.rs                                    6 passed 0 failed 0 ignored
+tests/flash_attn_rows_h64.rs                    1 passed 0 failed 0 ignored
+tests/gdn_fixtures.rs                          11 passed 0 failed 0 ignored
+tests/gdn_gates.rs                             22 passed 0 failed 0 ignored
+tests/gdn_state.rs                             10 passed 0 failed 0 ignored
+tests/gdn_train.rs                              7 passed 0 failed 0 ignored
+tests/gemm_batched.rs                           9 passed 0 failed 0 ignored
+tests/gemm_correctness.rs                      15 passed 0 failed 0 ignored
+tests/gemm_determinism.rs                       0 passed 0 failed 0 ignored
+tests/gemm_determinism.rs                       0 passed 0 failed 0 ignored
+tests/gemm_determinism.rs                       8 passed 0 failed 0 ignored
+tests/gemm_epilogue.rs                         10 passed 0 failed 0 ignored
+tests/gemm_flag_paths.rs                        3 passed 0 failed 0 ignored
+tests/gemm_i8.rs                                8 passed 0 failed 0 ignored
+tests/gemm_operands_accumulate.rs               3 passed 0 failed 0 ignored
+tests/gemm_ragged_shapes.rs                    19 passed 0 failed 0 ignored
+tests/gemm_short_m_attack.rs                    5 passed 0 failed 0 ignored
+tests/host_access_ban.rs                        4 passed 0 failed 0 ignored
+tests/host_access_fallible.rs                  13 passed 0 failed 0 ignored
+tests/host_access_load.rs                       2 passed 0 failed 0 ignored
+tests/host_path_allocs.rs                       2 passed 0 failed 0 ignored
+tests/hosted_completeness.rs                    0 passed 0 failed 1 ignored
+tests/hosted_selection.rs                       6 passed 0 failed 1 ignored
+tests/hosted_tests_script.rs                    9 passed 0 failed 0 ignored
+tests/icb_adversarial.rs                        4 passed 0 failed 0 ignored
+tests/icb_adversarial_lifecycle.rs              4 passed 0 failed 0 ignored
+tests/icb_capture_matrix.rs                    16 passed 0 failed 0 ignored
+tests/icb_flag_env.rs                           4 passed 0 failed 0 ignored
+tests/icb_replay_barriers.rs                    2 passed 0 failed 0 ignored
+tests/interop_mtl_buffer.rs                     5 passed 0 failed 0 ignored
+tests/kernel_fast_math.rs                      13 passed 0 failed 0 ignored
+tests/kv_safety.rs                              6 passed 0 failed 0 ignored
+tests/metallib_clean_time_script.rs            18 passed 0 failed 0 ignored
+tests/nn_adversarial.rs                         9 passed 0 failed 0 ignored
+tests/nn_aliasing.rs                            7 passed 0 failed 0 ignored
+tests/nn_decode_hazards.rs                      3 passed 0 failed 0 ignored
+tests/nn_kernels.rs                            16 passed 0 failed 0 ignored
+tests/nn_runtime_ownership.rs                   4 passed 0 failed 0 ignored
+tests/nn_wiring.rs                             21 passed 0 failed 0 ignored
+tests/npy_hardening.rs                          4 passed 0 failed 0 ignored
+tests/parser_mutation.rs                       13 passed 0 failed 0 ignored
+tests/promoted_kernels.rs                       5 passed 0 failed 0 ignored
+tests/promoted_numeric.rs                       8 passed 0 failed 0 ignored
+tests/public_api_errors.rs                     11 passed 0 failed 0 ignored
+tests/q4_interleaved.rs                         7 passed 0 failed 0 ignored
+tests/q4_shape_domain.rs                        3 passed 0 failed 0 ignored
+tests/qk_norm_half_rope.rs                      2 passed 0 failed 0 ignored
+tests/qkv_rope.rs                               7 passed 0 failed 0 ignored
+tests/quantized_gemv.rs                         2 passed 0 failed 0 ignored
+tests/qwen35_adamw.rs                          22 passed 0 failed 0 ignored
+tests/qwen35_bwd.rs                            21 passed 0 failed 0 ignored
+tests/qwen35_config.rs                          5 passed 0 failed 0 ignored
+tests/qwen35_kernels.rs                        46 passed 0 failed 0 ignored
+tests/qwen35_model.rs                          28 passed 0 failed 3 ignored
+tests/qwen35_params.rs                         12 passed 0 failed 0 ignored
+tests/qwen35_staged.rs                          4 passed 0 failed 0 ignored
+tests/qwen35_train.rs                          23 passed 0 failed 6 ignored
+tests/qwen35_train_traffic.rs                  13 passed 0 failed 0 ignored
+tests/qwen35_weights_release.rs                 1 passed 0 failed 0 ignored
+tests/reductions.rs                             7 passed 0 failed 0 ignored
+tests/relaxed_predicate.rs                      1 passed 0 failed 0 ignored
+tests/runtime_lifecycle.rs                     23 passed 0 failed 0 ignored
+tests/safetensors.rs                           12 passed 0 failed 1 ignored
+tests/shader_index_arithmetic.rs               20 passed 0 failed 0 ignored
+tests/softcap_finite_adversarial.rs             1 passed 0 failed 0 ignored
+tests/tune_rigs_refuse_missing_variants.rs      2 passed 0 failed 0 ignored
+doc tests                                       8 passed 0 failed 0 ignored
+```
+
+Tests the cards asked to see by name, all `ok` in that run:
+`prefill_then_decode_matches_forward_at_the_last_row` (tests/qwen35_model.rs:379),
+`train_forward_hidden_states_are_the_inference_forwards` (tests/qwen35_train.rs:360),
+`tiny_step_matches_transformers_autograd` (tests/qwen35_train.rs:284),
+`stress_decode_matches_forward_on_random_shapes` (:964),
+`stress_long_decode_stays_on_the_forward` (:1019),
+`stress_interleaved_sessions_keep_their_own_state` (:1049),
+`stress_relaxed_precision_mid_session_is_refused_not_fatal` (:1077),
+`stress_hostile_rows_and_answers` (:1150) (all tests/qwen35_model.rs),
+`async_encode_past_the_constant_arena_without_a_synchronize_stays_healthy`
+(tests/runtime_lifecycle.rs:442), and in tests/nn_wiring.rs
+`softcap_sample_rejects_an_all_nan_row`, `every_sampler_refuses_a_row_of_nan_and_negative_infinity`,
+`argmax_f32_pass_refuses_a_nonfinite_row`,
+`multi_pass_argmax_skips_a_group_with_no_finite_logit`.
+
+The 16 `#[ignore]` tests, each run on its own with `--ignored --nocapture` and the
+environment its doc comment names (`QWEN35_2B_SAFETENSORS` = the Qwen3.5-2B-Base
+snapshot's `model.safetensors-00001-of-00001.safetensors`; `QWEN35_TRAIN_REF_DIR`
+= a `make_train_fixture.py 2b --tokens 128` reference generated earlier that
+day from the same snapshot; the other references generated in this worktree
+with `make_reference.py`, `make_train_fixture.py tiny --layers 24` and
+`embedgemma2_ref/make_reference.py`):
+
+```
+gemm_fuzz_deep                                             PASS (worst_err in the 1e-5 range)
+alignment_probe_report                                     PASS (prints its table)
+opens_the_qwen35_2b_checkpoint                             PASS
+embedgemma2_matches_sentence_transformers                  PASS (traces ~1e-6 of max |ref|)
+f32_forward_matches_transformers_fp32_layer_by_layer       PASS (final norm 2.62e-6, logits 1.92e-6, top-1 0/155)
+bf16_forward_is_no_worse_than_transformers_bf16            PASS
+f32_staged_and_decode_match_forward_on_the_real_2b         PASS
+deep_tiny_step_matches_transformers                        PASS (worst 2.64e-5; A_log/dt_bias 9.35e-4)
+real_2b_step_matches_transformers                          PASS (every parameter below)
+real_2b_step_on_bf16_operands_stays_near_transformers      PASS (loss rel 3.72e-4, worst gradient 5.39e-2)
+real_2b_step_on_bf16_storage_stays_near_the_f32_step       NOT COMPLETED: killed by SIGTERM (signal 15, the
+    32 GiB memguard cap) after printing "loss: bf16 storage 2.744981, f32 2.745267 (rel 1.04e-4)"
+real_2b_loss_curve_tracks_the_f32_step                     NOT COMPLETED: SIGTERM (signal 15) at seed 2, step 30,
+    before its assertions; the f32 side is ft-a9661824's open question
+real_2b_bank_accumulates_within_the_bound                  NOT COMPLETED: SIGTERM (signal 15), no output
+real_2b_gradients_are_those_of_tessls_forward              NOT RUN: it reads target/qwen35_train_ref from
+    CARGO_MANIFEST_DIR (src/qwen35_train.rs:2276) with no QWEN35_TRAIN_REF_DIR override, and the fixture was not
+    in this worktree: panicked on a missing ids.npy
+hosted_selection_has_no_device                             not run directly (needs the hosted sandbox)
+every_device_free_test_is_on_the_hosted_manifest           PASS via scripts/hosted_tests.sh --outside
+```
+
+The three SIGTERM exits are the memguard cap, not a test assertion; they are
+recorded as not completed, not as passes. The signal is the evidence: no
+memguard log was read.
+
+`real_2b_step_matches_transformers` (loss: train 3.81033944, inference 3.81033982,
+transformers 3.81016612; train vs transformers 4.55e-5), the worst
+|got - want| / max|want| of each of its 149 parameters (worst 4.05e-3,
+layers.20.linear_attn.conv1d). The test's bound is 1e-2 of the parameter's
+peak, 2.5x the observed worst:
+
+```
+embed_tokens-rows 3.22e-4;  norm 2.16e-3;  L0.input_layernorm 1.05e-3;  
+L0.post_attention_layernorm 1.28e-3;  L0.mlp.gate_proj 1.75e-3;  L0.mlp.up_proj 1.08e-3;  
+L0.mlp.down_proj 6.32e-4;  L0.gdn.in_proj_qkv 1.19e-3;  L0.gdn.in_proj_z 1.04e-3;  
+L0.gdn.in_proj_b 5.82e-4;  L0.gdn.in_proj_a 6.80e-4;  L0.gdn.out_proj 7.30e-4;  
+L0.gdn.conv1d 7.25e-4;  L0.gdn.A_log 1.27e-3;  L0.gdn.dt_bias 1.12e-3;  
+L0.gdn.norm 1.03e-3;  L1.input_layernorm 2.28e-3;  L1.post_attention_layernorm 9.31e-4;  
+L1.gdn.conv1d 7.55e-4;  L1.gdn.A_log 6.72e-4;  L1.gdn.dt_bias 4.09e-4;  
+L1.gdn.norm 4.74e-4;  L2.input_layernorm 7.10e-4;  L2.post_attention_layernorm 6.57e-4;  
+L2.gdn.conv1d 1.35e-3;  L2.gdn.A_log 1.05e-3;  L2.gdn.dt_bias 9.12e-4;  
+L2.gdn.norm 5.61e-4;  L3.input_layernorm 3.40e-4;  L3.post_attention_layernorm 3.74e-4;  
+L3.mlp.gate_proj 1.13e-3;  L3.mlp.up_proj 7.83e-4;  L3.mlp.down_proj 4.16e-4;  
+L3.attn.q_proj 1.12e-3;  L3.attn.k_proj 5.44e-4;  L3.attn.v_proj 8.19e-4;  
+L3.attn.o_proj 8.79e-4;  L3.attn.q_norm 7.01e-4;  L3.attn.k_norm 3.82e-4;  
+L4.input_layernorm 7.98e-4;  L4.post_attention_layernorm 2.34e-4;  L4.gdn.conv1d 8.99e-4;  
+L4.gdn.A_log 8.97e-4;  L4.gdn.dt_bias 9.48e-4;  L4.gdn.norm 5.00e-4;  
+L5.input_layernorm 8.74e-4;  L5.post_attention_layernorm 1.66e-3;  L5.gdn.conv1d 3.28e-4;  
+L5.gdn.A_log 1.99e-4;  L5.gdn.dt_bias 2.59e-4;  L5.gdn.norm 6.36e-4;  
+L6.input_layernorm 3.09e-3;  L6.post_attention_layernorm 5.55e-4;  L6.gdn.conv1d 2.60e-4;  
+L6.gdn.A_log 2.83e-4;  L6.gdn.dt_bias 2.87e-4;  L6.gdn.norm 1.43e-3;  
+L7.input_layernorm 4.43e-4;  L7.post_attention_layernorm 5.73e-4;  L7.attn.q_norm 5.44e-4;  
+L7.attn.k_norm 5.53e-4;  L8.input_layernorm 9.56e-4;  L8.post_attention_layernorm 3.05e-3;  
+L8.gdn.conv1d 6.30e-4;  L8.gdn.A_log 2.24e-3;  L8.gdn.dt_bias 2.56e-3;  
+L8.gdn.norm 1.36e-3;  L9.input_layernorm 2.03e-4;  L9.post_attention_layernorm 8.72e-4;  
+L9.gdn.conv1d 8.88e-4;  L9.gdn.A_log 6.86e-4;  L9.gdn.dt_bias 3.32e-4;  
+L9.gdn.norm 5.06e-4;  L10.input_layernorm 1.06e-3;  L10.post_attention_layernorm 2.91e-4;  
+L10.gdn.conv1d 3.90e-4;  L10.gdn.A_log 4.06e-4;  L10.gdn.dt_bias 4.04e-4;  
+L10.gdn.norm 7.96e-4;  L11.input_layernorm 7.45e-4;  L11.post_attention_layernorm 5.24e-4;  
+L11.attn.q_norm 1.10e-3;  L11.attn.k_norm 4.80e-4;  L12.input_layernorm 2.80e-4;  
+L12.post_attention_layernorm 7.89e-4;  L12.gdn.conv1d 1.13e-3;  L12.gdn.A_log 3.87e-4;  
+L12.gdn.dt_bias 4.51e-4;  L12.gdn.norm 8.06e-4;  L13.input_layernorm 1.12e-3;  
+L13.post_attention_layernorm 2.54e-4;  L13.gdn.conv1d 1.29e-3;  L13.gdn.A_log 3.01e-4;  
+L13.gdn.dt_bias 2.35e-4;  L13.gdn.norm 8.97e-4;  L14.input_layernorm 1.01e-3;  
+L14.post_attention_layernorm 3.80e-4;  L14.gdn.conv1d 1.01e-3;  L14.gdn.A_log 8.70e-4;  
+L14.gdn.dt_bias 9.11e-4;  L14.gdn.norm 9.09e-4;  L15.input_layernorm 1.27e-3;  
+L15.post_attention_layernorm 4.84e-4;  L15.attn.q_norm 1.91e-4;  L15.attn.k_norm 4.02e-4;  
+L16.input_layernorm 1.30e-3;  L16.post_attention_layernorm 7.06e-4;  L16.gdn.conv1d 1.34e-3;  
+L16.gdn.A_log 2.88e-4;  L16.gdn.dt_bias 2.60e-4;  L16.gdn.norm 1.58e-3;  
+L17.input_layernorm 1.77e-3;  L17.post_attention_layernorm 5.56e-4;  L17.gdn.conv1d 1.20e-3;  
+L17.gdn.A_log 5.59e-4;  L17.gdn.dt_bias 5.08e-4;  L17.gdn.norm 6.47e-4;  
+L18.input_layernorm 8.80e-4;  L18.post_attention_layernorm 5.41e-4;  L18.gdn.conv1d 1.04e-3;  
+L18.gdn.A_log 2.55e-4;  L18.gdn.dt_bias 2.40e-4;  L18.gdn.norm 7.88e-4;  
+L19.input_layernorm 3.07e-4;  L19.post_attention_layernorm 5.86e-4;  L19.attn.q_norm 2.96e-4;  
+L19.attn.k_norm 2.96e-4;  L20.input_layernorm 1.95e-3;  L20.post_attention_layernorm 1.01e-3;  
+L20.gdn.conv1d 4.05e-3;  L20.gdn.A_log 2.04e-4;  L20.gdn.dt_bias 2.71e-4;  
+L20.gdn.norm 2.71e-3;  L21.input_layernorm 1.49e-3;  L21.post_attention_layernorm 1.40e-3;  
+L21.gdn.conv1d 3.09e-4;  L21.gdn.A_log 3.45e-4;  L21.gdn.dt_bias 4.43e-4;  
+L21.gdn.norm 4.28e-4;  L22.input_layernorm 2.53e-3;  L22.post_attention_layernorm 1.86e-3;  
+L22.gdn.conv1d 1.27e-3;  L22.gdn.A_log 1.01e-3;  L22.gdn.dt_bias 7.68e-4;  
+L22.gdn.norm 1.37e-3;  L23.input_layernorm 3.21e-3;  L23.post_attention_layernorm 2.97e-3;  
+L23.attn.q_norm 6.84e-4;  L23.attn.k_norm 7.41e-4;
+```
+
+Leak soak (src/bin/probe_soak.rs, the committed tiny fixture, under
+`MallocStackLogging=1 leaks --atExit`): 16000 train steps (train_step_into plus a
+waited AdamW step) and 160 decode sessions of 512 tokens (81920 decoded
+tokens, each a prefill, 512 steps and a drop). `leaks` reports 0 leaks for 0
+bytes at exit in both. The device's `currentAllocatedSize` is flat from
+the first iteration (train 30900224 bytes) or the second session (decode
+21282816 bytes; the first session's 19922944 is before the buffers recycle)
+to the end. The process RSS is not monotonic: train 27 MB at the start,
+177 MB at step 14000, 113 MB at the end; decode 25 MB, 222 MB at session 140, 31 MB
+at the end, with a maximum resident set of 117 and 123 MB. Autorelease growth
+under commit/synchronize is therefore bounded here; the sampling (every 2000
+steps or 20 sessions) is coarse: RSS is read with `ps`, so these are samples of
+a bounded range, not a per-step measurement.
 
 ```
 audit          PASS (re-run at 2972027): tile geometry, 33 kernels, 38 Rust

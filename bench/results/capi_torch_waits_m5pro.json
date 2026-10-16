@@ -1,0 +1,239 @@
+{
+  "rounds": 8,
+  "format": "Metrics",
+  "lanes": [
+    {
+      "name": "sync",
+      "argv": [
+        "/Users/bharath/.venvs/ml-2026-10/bin/python",
+        "bench/capi_torch_overhead.py"
+      ],
+      "env": {}
+    },
+    {
+      "name": "async",
+      "argv": [
+        "/Users/bharath/.venvs/ml-2026-10/bin/python",
+        "bench/capi_torch_overhead.py",
+        "--async"
+      ],
+      "env": {}
+    }
+  ],
+  "env": {},
+  "summary": [
+    {
+      "workload": "torch_mps_sync_idle_us",
+      "sync": {
+        "value_median": 0.083,
+        "value_min": 0.083,
+        "value_max": 0.083,
+        "value_all": [
+          0.083,
+          0.083,
+          0.083,
+          0.083,
+          0.083,
+          0.083,
+          0.083,
+          0.083
+        ]
+      },
+      "async": {
+        "value_median": 0.083,
+        "value_min": 0.083,
+        "value_max": 0.083,
+        "value_all": [
+          0.083,
+          0.083,
+          0.083,
+          0.083,
+          0.083,
+          0.083,
+          0.083,
+          0.083
+        ],
+        "vs_base": {
+          "median": 1,
+          "lo": 1,
+          "hi": 1
+        }
+      }
+    },
+    {
+      "workload": "tessl_sync_idle_us",
+      "sync": {
+        "value_median": 0.542,
+        "value_min": 0.541,
+        "value_max": 0.708,
+        "value_all": [
+          0.542,
+          0.708,
+          0.542,
+          0.542,
+          0.708,
+          0.542,
+          0.541,
+          0.542
+        ]
+      },
+      "async": {
+        "value_median": 0.542,
+        "value_min": 0.541,
+        "value_max": 0.542,
+        "value_all": [
+          0.542,
+          0.542,
+          0.542,
+          0.542,
+          0.542,
+          0.541,
+          0.542,
+          0.542
+        ],
+        "vs_base": {
+          "median": 1,
+          "lo": 0.7655367231638419,
+          "hi": 1.0018484288354899
+        }
+      }
+    },
+    {
+      "workload": "ce_call_us",
+      "sync": {
+        "value_median": 1396.5725,
+        "value_min": 1298.938,
+        "value_max": 1723.251,
+        "value_all": [
+          1723.251,
+          1591.771,
+          1598.334,
+          1323.501,
+          1463.687,
+          1323.084,
+          1298.938,
+          1329.458
+        ]
+      },
+      "async": {
+        "value_median": 759.9685,
+        "value_min": 720.563,
+        "value_max": 812.167,
+        "value_all": [
+          792.458,
+          777.605,
+          764.916,
+          755.021,
+          720.563,
+          812.167,
+          727.792,
+          751.209
+        ],
+        "vs_base": {
+          "median": 0.5262954064273775,
+          "lo": 0.4598622023141144,
+          "hi": 0.6138438678118698
+        }
+      }
+    }
+  ],
+  "raw": [
+    {
+      "sync": {
+        "torch_mps_sync_idle_us": 0.083,
+        "tessl_sync_idle_us": 0.542,
+        "ce_call_us": 1723.251
+      },
+      "async": {
+        "torch_mps_sync_idle_us": 0.083,
+        "tessl_sync_idle_us": 0.542,
+        "ce_call_us": 792.458
+      }
+    },
+    {
+      "sync": {
+        "torch_mps_sync_idle_us": 0.083,
+        "tessl_sync_idle_us": 0.708,
+        "ce_call_us": 1591.771
+      },
+      "async": {
+        "torch_mps_sync_idle_us": 0.083,
+        "tessl_sync_idle_us": 0.542,
+        "ce_call_us": 777.605
+      }
+    },
+    {
+      "sync": {
+        "torch_mps_sync_idle_us": 0.083,
+        "tessl_sync_idle_us": 0.542,
+        "ce_call_us": 1598.334
+      },
+      "async": {
+        "torch_mps_sync_idle_us": 0.083,
+        "tessl_sync_idle_us": 0.542,
+        "ce_call_us": 764.916
+      }
+    },
+    {
+      "sync": {
+        "torch_mps_sync_idle_us": 0.083,
+        "tessl_sync_idle_us": 0.542,
+        "ce_call_us": 1323.501
+      },
+      "async": {
+        "torch_mps_sync_idle_us": 0.083,
+        "tessl_sync_idle_us": 0.542,
+        "ce_call_us": 755.021
+      }
+    },
+    {
+      "sync": {
+        "torch_mps_sync_idle_us": 0.083,
+        "tessl_sync_idle_us": 0.708,
+        "ce_call_us": 1463.687
+      },
+      "async": {
+        "torch_mps_sync_idle_us": 0.083,
+        "tessl_sync_idle_us": 0.542,
+        "ce_call_us": 720.563
+      }
+    },
+    {
+      "sync": {
+        "torch_mps_sync_idle_us": 0.083,
+        "tessl_sync_idle_us": 0.542,
+        "ce_call_us": 1323.084
+      },
+      "async": {
+        "torch_mps_sync_idle_us": 0.083,
+        "tessl_sync_idle_us": 0.541,
+        "ce_call_us": 812.167
+      }
+    },
+    {
+      "sync": {
+        "torch_mps_sync_idle_us": 0.083,
+        "tessl_sync_idle_us": 0.541,
+        "ce_call_us": 1298.938
+      },
+      "async": {
+        "torch_mps_sync_idle_us": 0.083,
+        "tessl_sync_idle_us": 0.542,
+        "ce_call_us": 727.792
+      }
+    },
+    {
+      "sync": {
+        "torch_mps_sync_idle_us": 0.083,
+        "tessl_sync_idle_us": 0.542,
+        "ce_call_us": 1329.458
+      },
+      "async": {
+        "torch_mps_sync_idle_us": 0.083,
+        "tessl_sync_idle_us": 0.542,
+        "ce_call_us": 751.209
+      }
+    }
+  ],
+  "lane_archive": "bench/results/capi_torch_waits_m5pro.json.lanes"
+}

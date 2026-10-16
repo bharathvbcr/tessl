@@ -20,7 +20,7 @@ bin check_kernel_ir_planted 6
 bin dialect_lint_script 5
 bin docs_name_real_tools 6
 bin embedgemma2_audio_fixtures 2
-bin embedgemma2_tok_tiny 11
+bin embedgemma2_tok_tiny 12
 bin gdn_fixtures 11
 bin gdn_gates 22
 bin gdn_state 10

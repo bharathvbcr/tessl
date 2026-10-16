@@ -70,6 +70,9 @@ pub const MAX_TOKENIZER_BYTES: u64 = 256 << 20;
 /// Largest sidecar config (`tokenizer_config.json`,
 /// `config_sentence_transformers.json`) read, in bytes.
 pub const MAX_CONFIG_BYTES: u64 = 1 << 20;
+/// Texts of this many bytes or more are refused ([`Tokenizer::encode_with_prompt`])
+/// or panic ([`Tokenizer::encode_raw`]): the model's context is 8192 tokens.
+pub const MAX_TEXT_BYTES: usize = 1 << 28;
 
 const NONE: u32 = u32::MAX;
 
@@ -776,7 +779,18 @@ impl Tokenizer {
     /// top: the added tokens in `text` are matched, the rest is normalized,
     /// pre-tokenized and merged, and the post-processor's template wraps it
     /// when `add_special_tokens`.
+    ///
+    /// # Panics
+    ///
+    /// On a `text` of [`MAX_TEXT_BYTES`] bytes or more (the merge list's
+    /// positions are 32-bit); [`Self::encode_with_prompt`] refuses it as an
+    /// error instead.
     pub fn encode_raw(&self, text: &str, add_special_tokens: bool) -> Vec<u32> {
+        assert!(
+            text.len() < MAX_TEXT_BYTES,
+            "encode_raw: a text of {} bytes is past the {MAX_TEXT_BYTES}-byte limit",
+            text.len()
+        );
         let mut body: Vec<u32> = Vec::with_capacity(text.len() / 3 + 4);
         let mut scratch = Scratch::default();
         let bytes = text.as_bytes();
@@ -964,6 +978,12 @@ impl Tokenizer {
     /// [`Self::prompt_names`] (`encode(prompt_name=...)`); `None` is no prompt.
     pub fn encode_with_prompt(&self, prompt_name: Option<&str>, text: &str) -> Result<Vec<u32>, String> {
         let rendered = self.render(prompt_name, text)?;
+        if rendered.len() >= MAX_TEXT_BYTES {
+            return Err(format!(
+                "a text of {} bytes (with its prompt) is past the {MAX_TEXT_BYTES}-byte limit",
+                rendered.len()
+            ));
+        }
         for p in &self.placeholders {
             if rendered.contains(p.as_str()) {
                 return Err(format!(

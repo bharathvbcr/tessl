@@ -428,6 +428,22 @@ fn hostile_texts_are_encoded_not_crashed_on() {
 }
 
 #[test]
+fn a_text_past_the_size_limit_is_an_error_and_a_panic_at_the_raw_call() {
+    use tessl::embedgemma2_tok::MAX_TEXT_BYTES;
+    let t = configured();
+    let big = "a".repeat(MAX_TEXT_BYTES);
+    let err = t.encode(&big).unwrap_err();
+    assert!(err.contains("byte limit"), "{err}");
+    // Under the limit by less than the prompt's length: the prompt counts.
+    let near = "a".repeat(MAX_TEXT_BYTES - 3);
+    assert!(t
+        .encode_with_prompt(Some("query"), &near)
+        .unwrap_err()
+        .contains("with its prompt"));
+    assert!(std::panic::catch_unwind(|| load("tiny_gemma").encode_raw(&big, true)).is_err());
+}
+
+#[test]
 fn the_tokenizer_is_shared_across_threads() {
     fn assert_send_sync<T: Send + Sync>() {}
     assert_send_sync::<Tokenizer>();

@@ -1328,3 +1328,263 @@ influences a kept one is the subsampling's zeroing, so trailing masked rows feed
 no kept row; not implemented); the attention could use
 `simdgroup_float8x8` tiles for the 12-query blocks; the first conv and the
 second could share one launch.
+
+## Text-encoder fusion (G7)
+
+The text encoder's elementwise passes between its GEMMs are fused where the arithmetic
+can be kept bit for bit (`docs/embedgemma2_audit.md`, G7; the audio tower's version of the
+same work is "Kernels" and "Speed" under "Audio tower"). `ExactF32` embeddings are
+unchanged to the bit on the tiny and the real checkpoint (hashes below), `Bf16` ones too,
+so every bound of "Bounds and observed errors" and "Precision" holds as it was. What
+changed is the dispatch count (15 to 13 per layer at `ExactF32`, 17 to 13 at `Bf16`, and
+369 to 320 per forward at 1x16 `ExactF32`, 419 to 322 at `Bf16`), the bytes the row passes
+move, and the bf16 casts, which are gone but for two per forward. How much of that is
+time is "Speed (text-encoder fusion)" below, and it is small at `ExactF32`.
+
+### What a layer dispatched, and what the elementwise passes cost
+
+One layer before (`5229a1c`), in dispatch order. "GEMM" is one launch at the exact-f32
+GEMM's default route, plus a zero fill that route starts from, and a K-partition reduction
+where `gemm_small_m` takes the few-tile shapes at 16 rows (those two are counted in the
+measured totals, not in the list):
+
+```text
+rms_norm_f32              input norm               *
+GEMM                      q|k|v
+qwen35_attn_qk_norm_rope  q/k norm, RoPE, K/V store
+encoder_attn_tiled        attention                               (Bf16: f32 output)
+cast_f32_to_bf16          attention output         Bf16 only      *
+GEMM                      o
+rms_norm_residual_add_f32 post-attention add       *
+rms_norm_f32              pre-feed-forward norm    *
+GEMM                      gate|up
+qwen35_gelu_tanh_glu      gelu(gate) * up
+GEMM                      down
+rms_norm_residual_add_f32 post-feed-forward add    *
+cast_f32_to_bf16          residual stream          Bf16 only      *
+GEMM                      per-layer-input gate
+qwen35_gelu_tanh_glu      gelu(gate) * per-layer input
+GEMM                      per-layer-input output
+rms_norm_residual_add_f32 post-per-layer-block add, times the layer scalar   *
+```
+
+15 launches at `ExactF32` (6 GEMMs), 17 at `Bf16`. Per run of per-layer inputs (all 24
+layers up to 341 rows, one layer per run from 8192 rows): the NT GEMM, `scale_f32_inplace`
+and `rms_norm_f32`. Per forward: the gather, a copy, the final norm, the pooling, the
+projection GEMM and the normalize, and at `Bf16` the casts of the embeddings and the pooled
+vectors. The starred passes are what the fusion touches.
+
+One layer after, in dispatch order:
+
+```text
+(layer 0 only) rms_norm_f32     input norm
+GEMM                            q|k|v
+qwen35_attn_qk_norm_rope        q/k norm, RoPE, K/V store
+encoder_attn_tiled              attention        (Bf16: encoder_attn_tiled_bf16o, bf16 output)
+GEMM                            o
+eg2t_resid_norm_{f32,bf16}      post-attention add + pre-feed-forward norm
+GEMM                            gate|up
+qwen35_gelu_tanh_glu            gelu(gate) * up
+GEMM                            down
+rms_norm_residual_add_f32       post-feed-forward add         (Bf16: eg2t_resid_add_bf16_copy,
+                                                                add and the residual's bf16 copy)
+GEMM                            per-layer-input gate
+qwen35_gelu_tanh_glu            gelu(gate) * per-layer input
+GEMM                            per-layer-input output
+eg2t_resid_norm_{f32,bf16}      post-per-layer-block add, times the layer scalar, + the NEXT
+                                layer's input norm (after the last layer: the final norm)
+```
+
+13 launches at both precisions (6 GEMMs, 7 others), where it was 15 and 17: the pre-feed-forward
+norm rides on the post-attention add, the input norm of layer N+1 rides on layer N's last
+add and the final norm on the last layer's, and at `Bf16` the two casts are gone (the
+attention writes bf16 straight into the buffer the o GEMM reads, and the feed-forward add
+writes the bf16 copy of the stream as it adds). Per run of per-layer inputs the scale and
+the norm are one `eg2t_scale_rms_norm_f32`. That is exactly 2 launches per layer plus 1 per
+run of per-layer inputs at `ExactF32`, and 4 per layer plus 1 per run at `Bf16`.
+
+Per forward on the real checkpoint (`profile_embedgemma2`'s replica, `PROFILE_MODE=stages`,
+which prints `dispatches_full`; the replica is checked against `encode` below):
+
+| workload (batch x tokens) | `ExactF32` before | `ExactF32` after | `Bf16` before | `Bf16` after |
+|---|---|---|---|---|
+| 1x16 | 369 | 320 | 419 | 322 |
+| 64x32 | 384 | 330 | 434 | 332 |
+| 8x1024 | 438 | 366 | 488 | 368 |
+
+`tests/embedgemma2_tiny.rs` pins the layer: `a_layer_runs_the_pinned_kernels` and
+`bf16_a_layer_runs_the_pinned_kernels` encode tiny models of 1, 2 and 3 layers under the
+kernel trace (`TESSL_KERNEL_TRACE`) and require that each added layer adds exactly seven
+kernels outside the GEMMs, and these by name: two `eg2t_resid_norm_*`, one feed-forward
+add (`rms_norm_residual_add_f32`, or `eg2t_resid_add_bf16_copy` at `Bf16`), two
+`qwen35_gelu_tanh_glu_*`, one `qwen35_attn_qk_norm_rope*` and one attention kernel
+(`encoder_attn_tiled_bf16o_h256_q32_k64_sg4` at `Bf16`). The whole forward has one standalone
+`rms_norm_*` (layer 0's input norm), no `scale_f32_inplace`, one `eg2t_scale_rms_norm_f32`,
+and no `cast_f32_to_bf16` at `ExactF32` and two at `Bf16` (the embeddings and the pooled
+vectors). The exact-f32 GEMMs launch a zero fill and, at small M, a partition reduction of
+their own, so the all-in count per layer at `ExactF32` is not pinned, only the non-GEMM
+part, which is where the fusion acts. Both tests fail at `5229a1c`, where a layer has 9
+(`ExactF32`) and 11 (`Bf16`) non-GEMM kernels against 7.
+
+### What is fused, and how it stays bit for bit
+
+`kernels/embedgemma2_text.metal` holds four kernels (the rows of "Kernels" above name them):
+
+- `eg2t_resid_norm_f32` / `eg2t_resid_norm_bf16`: `resid = s * (resid + rms_norm(y) * w_post)`
+  (a plain `+=` when the layer scalar `s` is 1), then `out = rms_norm(resid) * w_next`, one
+  threadgroup per row. The second norm reads the row it has just written, from the same
+  threadgroup. The `_bf16` one writes `out` as bf16 (the next GEMM's operand).
+- `eg2t_resid_add_bf16_copy`: the feed-forward add, which also writes `bfloat(resid)`.
+- `eg2t_scale_rms_norm_f32`: the per-layer inputs' scale and norm, in place.
+
+Both reductions are `rms_norm.metal`'s, copied, not re-derived: each lane sums
+`d = lid, lid + tptg, ...` and the lanes fold with `reduce_row_add`, and the host picks the
+threadgroup width with the same `reduce_tptg(maxTotalThreadsPerThreadgroup, dim)`, so a
+fused kernel's pipeline limit must equal that of the norm it replaces (a test pins the
+equality, since the limits depend on each kernel's register use and could differ).
+The per-element expressions are the unfused ones in the same order. The Metal compiler
+runs with fast-math, which may reassociate, and `(y * inv) * w` and `y * (inv * w)`
+compile to the same code, so the bit identity is shown by test and by hash, not argued.
+
+Tests in `tests/embedgemma2_kernels.rs` (section 7), each comparing against the unfused
+kernels' bits (outputs poisoned first) at `(rows, dim)` of (1,1), (1,8), (9,33), (3,64),
+(5,512), (4,1000), (7,768), (2,2048) and (3,4096) with layer scalars 1.0, 0.37 and 1.75:
+`resid_add_norm_f32_is_the_unfused_pair_bit_for_bit`,
+`resid_add_norm_bf16_is_the_unfused_pair_bit_for_bit`,
+`resid_add_bf16_copy_is_the_unfused_add_and_cast_bit_for_bit`,
+`scale_rms_norm_inplace_is_the_unfused_pair_bit_for_bit`,
+`the_fused_row_passes_launch_as_wide_as_the_kernels_they_replace`,
+`the_fused_row_passes_refuse_what_they_cannot_run` (dim 0, eps 0, a NaN or infinite
+scale, an output aliasing the residual, short weights or outputs, bf16 storage handed
+to an f32 output; a refused call writes nothing) and `the_bf16_output_attention_is_the_bf16_kernel_rounded_bit_for_bit` (head dims
+64, 256 and 512). The four row-pass tests fail if an element of the fused kernel is scaled
+by one ulp (`* 1.0000001f`, or `* 1.01f` on the bf16 copy), which was checked by mutating
+the kernel and restoring it.
+
+Kept unfused, deliberately:
+
+- `qwen35_gelu_tanh_glu` (the two gated activations per layer). It is 5 to 13 % of the
+  stage sum (5 to 6 % at `ExactF32`, 12 to 15 % at `Bf16` on the two larger workloads,
+  below), so it is not nothing. The way to fuse it is into the
+  GEMM that produces `gate|up`: but `gemm_epilogue` refuses the exact-f32 GEMM, and an
+  epilogue applies one activation to each output on its own, whereas this one forms
+  `gelu(gate) * up` across the two halves of the packed columns. That is a new GEMM
+  kernel (a column-pair epilogue), not a fusion of existing launches, and it has its own
+  bit-identity question (the exact-f32 GEMM's accumulation order). Left open.
+- `rms_norm_f32` for layer 0's input norm, `rms_norm_residual_add_f32` for the f32 feed-forward
+  add (it already is an add and a norm in one pass; the per-layer-input gate GEMM
+  follows it, and a GEMM's input is not a row pass), the GEMMs, the qk norm with RoPE,
+  the attention.
+
+### The bf16 attention output
+
+The follow-up "No bf16 attention output" is done: the shared attention body
+(`attn_tiled_core` in `kernels/attn_tiled.h`) already had a runtime flag that makes it
+store bf16 (`out_bf16`); `kernels/encoder_attn_tiled.h` passed it as 0. The three `encoder_attn_tiled_bf16o_*`
+entries (`kernels/encoder_attn.metal`) pass the literal flag `1u` and a `bfloat` output
+type, so the stored value is the f32 result rounded exactly as `cast_f32_to_bf16` rounded
+it (tested bit for bit). At `Bf16` the attention writes straight into the buffer the o GEMM
+reads, and the f32 `a.attn` buffer is no longer written (it is still allocated, as the
+split-K scratch the exact-f32 GEMM wants and `Bf16` ignores; removing it would save
+`rows * q_width * 4` bytes and rewrite the itemised-bytes assertions of
+`tests/embedgemma2_memory.rs` and `tests/embedgemma2_small_m.rs`, which is its own change).
+
+### Embeddings are unchanged: the hashes
+
+An FNV-1a hash over the bits of every embedding, `5229a1c` against this change, same
+inputs, same process settings. The tools are `PROFILE_MODE=hash cargo run --release --bin
+profile_embedgemma2` (the real checkpoint, six workloads at both precisions, and with
+`PROFILE_PLE_BYTES=1`, which forces one layer per run of per-layer inputs) and the ignored
+test `tiny_embedding_hashes` in `tests/embedgemma2_memory.rs` (the tiny checkpoint, three
+cases at both precisions). Every digest is identical, 12 + 8 + 6 of 26:
+
+| real checkpoint | `ExactF32` | `Bf16` |
+|---|---|---|
+| 1x16 | `e509a29307bb3de2` | `ce9fe1d156897056` |
+| 64x32 | `ab2f8973d25ec584` | `899de415b7e967ca` |
+| 32x256 | `a37be16381616af5` | `7e0e2b608c46942f` |
+| 8x1024 | `bfa1432d66775a24` | `274f02bf9af7dcdc` |
+| 2x4096 | `87452f717e79b313` | `542773be4bc27c88` |
+| 1x4096 + 63x32 | `64b78e28e233bbc5` | `b5c029be1653df84` |
+
+| tiny checkpoint | `ExactF32` | `Bf16` |
+|---|---|---|
+| three | `144c75402e5d10cc` | `82a22b39f0392f8e` |
+| ragged | `559743a0812c82ea` | `6e9c7c3abf39976b` |
+| three, truncated to 48 | `ea88c028d86ad065` | `6b8f6505f013e97b` |
+
+The `PLE_BYTES=1` run repeats the 1x16, 64x32, 8x1024 and mixed rows at both precisions, all
+equal to the rows above. Each digest was also stable across a repeat run
+(`repeat_stable=true`). Because the bits are the same, the bf16 bounds of "Precision" and
+the exact-f32 bounds of "Bounds and observed errors" are not re-derived; the ignored
+real-checkpoint tests (`embedgemma2_model`, `embedgemma2_e2e_model`, `embedgemma2_mm_model`)
+check them again at this head (results in the report of the change, not here).
+
+### The profiler's replica
+
+`src/bin/profile_embedgemma2.rs` runs a hand-written replica of the layer to time its stages
+one at a time, and it was stale: against `encode` the `5229a1c` replica reproduced 8 of the
+768 embedding values at 1x16, because lane G's small-M split-K GEMM had not been mirrored.
+It now mirrors both dispatch sequences: `PROFILE_FUSED=0` is the old sequence, `1` the fused
+one, and `PROFILE_OPERANDS=f32|bf16` picks the precision (including the bf16 weights, the
+casts and the bf16 attention output). The replica equals `encode` bit for bit, 768 of 768
+values at 1x16 and 49152 of 49152 at 64x32, in all four modes, and the stage classes are
+renamed for the fused passes ("residual add post-attn (+ pre-ffn norm)" and so on).
+`bench/results/embedgemma2_text_fusion_profile_report.py` tabulates its output and
+`bench/results/embedgemma2_text_fusion_profile_plot.py` plots it.
+
+### Profile (text-encoder fusion)
+
+`profile_embedgemma2` with `PROFILE_MODE=stages` times each class of dispatch alone (every
+other dispatch of the forward skipped) in the replica above, on the real checkpoint, at
+1x16, 64x32 and 8x1024, in the four modes, three passes each (pass 3 in reverse order of
+the modes), and a class's time is its minimum over all of them. The tables are in
+`bench/results/embedgemma2_text_fusion_profile_tables.txt`, the data in
+`bench/results/embedgemma2_text_fusion_profile_m5pro.json`, the plot in
+`bench/results/embedgemma2_text_fusion_profile_m5pro.png`.
+
+**These are not clean timings.** The GPU was shared with other jobs throughout (1-minute
+load average 77 to 97, `ioreg` utilisation 82 to 99 % at every workload's start and end),
+and the harness flagged 130 of 130 samples of every `ExactF32` run, and of the unfused
+`Bf16` ones, as taken with another tessl GPU process present (the pass-1 fused `Bf16`
+runs read 0 of 130, which is the luck of the draw, not a quiet machine). The per-pass sums
+of the row-pass classes differ several-fold within one mode (for example `ExactF32` unfused
+at 1x16 reads 0.54 to 2.44 ms, `ExactF32` fused 1.04 to 6.51 ms), and the 1x16
+`ExactF32` rows are unusable: the fused one reads slower than the unfused one in every
+class, which is contention, not the kernels. Dispatch counts do not depend on any of this.
+
+What the counts and the byte model say first. Counting traffic in units of one rows x dim
+f32 tensor, the row passes of one layer at `ExactF32` moved 13 before (input norm 2, post-
+attention add 3, pre-feed-forward norm 2, post-feed-forward add 3, post-per-layer-block add
+3) and 11 after (the add with its norm: y and the residual in, the residual and the norm
+output out, 4, twice, and the feed-forward add 3). That is a 15 % cut of that traffic
+(inferred from the kernels' loads and stores, not measured), and fewer launches
+(dispatch table above).
+
+Row passes (every norm and residual add, the per-layer inputs' scale and norm, the `Bf16`
+casts), ms per forward, minimum over the passes, with their share of the sum of all
+stages. The classes are not like for like (a fused add now carries a norm), so only the
+total of the group is comparable:
+
+| workload | mode | row passes before | row passes after | share before | share after |
+|---|---|---|---|---|---|
+| 64x32 | `ExactF32` | 8.29 ms | 6.65 ms | 7.0 % | 5.6 % |
+| 8x1024 | `ExactF32` | 30.38 ms | 24.76 ms | 5.5 % | 4.4 % |
+| 64x32 | `Bf16` | 8.56 ms | 4.54 ms | 19.5 % | 12.1 % |
+| 8x1024 | `Bf16` | 38.43 ms | 22.80 ms | 19.1 % | 12.7 % |
+| 1x16 | `Bf16` | 1.38 ms | 1.01 ms | 19.1 % | 14.0 % |
+
+At 8x1024 `Bf16` the two bf16 casts per layer were 9.43 ms of the 38.43 and are 0.44 ms
+(the casts that remain), and `rms_norm` standing alone fell from 6.39 ms to 0.45 ms
+(layer 0's input norm). At `ExactF32` the group fell by 18 % at 8x1024, close to the 15 %
+the traffic model gives, and the rest of the stages did not move (the GEMMs, the
+attention and `gelu*up` read the same in both modes to within the noise: 342 and 347 ms,
+138 and 141 ms, 28 and 30 ms at 8x1024). Whole-forward figures of the replica
+(`full ms`, min of 3 passes): `ExactF32` 5.14 and 5.11 ms at 1x16, 104.8 and 105.3 ms at
+64x32, 549.6 and 546.1 ms at 8x1024; `Bf16` 5.27 and 4.36 ms, 46.5 and 35.1 ms, 191.0 and
+173.5 ms. What the fusion can be worth in the whole forward, from the group alone (inferred):
+about 1 % of the forward at
+`ExactF32` (5.6 ms of 550 ms at 8x1024), where the GEMMs are 62 % and the attention 25 %
+of the stage sum, and about 8 % at `Bf16` (15.6 ms of 201 ms), where the casts and the
+row passes together were a fifth of it. The `Bf16` forward rests more on elementwise
+passes because its GEMMs are 4.2x faster at 8x1024 (82 ms against 342 ms).

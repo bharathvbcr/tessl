@@ -1,8 +1,8 @@
 """Plot bench/results/embedgemma2_text_fusion_profile_m5pro.json (analysis only; ships nothing).
 
 The JSON is `embedgemma2_text_fusion_profile_report.py`'s merge of `profile_embedgemma2`
-stage runs of the text encoder at 1x16, 64x32 and 8x1024 on the real checkpoint, one run
-per label: `f32 unfused`, `f32 fused`, `bf16 unfused`, `bf16 fused` (the replica of
+stage runs of the text encoder at 1x16, 64x32 and 8x1024 on the real checkpoint, three
+passes per label (a class's time is its minimum over the passes): `f32 unfused`, `f32 fused`, `bf16 unfused`, `bf16 fused` (the replica of
 `EmbedGemma2Model::forward` with and without the fused row passes). Each bar stacks the
 stage-alone time of every class (min over the run's samples), grouped as the report
 groups them; the row passes and the casts are the stages the fusion changed. Left
@@ -55,13 +55,22 @@ def category(cls):
     raise KeyError(cls)
 
 
-def per_category(run, wl):
-    w = next(x for x in run["workloads"] if x["workload"] == wl)
+def per_category(label, wl):
+    """Each class's stage-alone time is the minimum over every pass of the label (the
+    house min-of-N method); a category sums its classes."""
+    best = {}
+    dispatches = None
+    for run in doc["passes"][label]:
+        w = next(x for x in run["workloads"] if x["workload"] == wl)
+        dispatches = w["dispatches_full"]
+        for v in w["variants"]:
+            if v["kind"] == "only":
+                cls = v["name"].split(":", 1)[1]
+                best[cls] = min(best.get(cls, float("inf")), min(v["ms_per_forward"]))
     ms = {c: 0.0 for c in cats}
-    for v in w["variants"]:
-        if v["kind"] == "only":
-            ms[category(v["name"].split(":", 1)[1])] += min(v["ms_per_forward"])
-    return ms, w["dispatches_full"]
+    for cls, t in best.items():
+        ms[category(cls)] += t
+    return ms, dispatches
 
 
 fig, axes = plt.subplots(2, len(workloads), figsize=(15, 8.2))
@@ -69,17 +78,17 @@ for j, wl in enumerate(workloads):
     ax_t, ax_d = axes[0][j], axes[1][j]
     bottoms = [0.0] * len(labels)
     for c in cats:
-        vals = [per_category(runs[l], wl)[0][c] for l in labels]
+        vals = [per_category(l, wl)[0][c] for l in labels]
         ax_t.bar(range(len(labels)), vals, bottom=bottoms, color=COLORS[c], label=c, width=0.7)
         bottoms = [b + v for b, v in zip(bottoms, vals)]
     for k, b in enumerate(bottoms):
         ax_t.text(k, b, f"{b:.1f}", ha="center", va="bottom", fontsize=8, color=INK)
     ax_t.set_xticks(range(len(labels)), labels, fontsize=8.5, color=MUTED, rotation=20, ha="right")
     ax_t.set_title(f"{wl}: stage time per forward (ms, sum of stages alone)", loc="left", fontsize=10, color=INK)
-    ax_d.bar(range(len(labels)), [per_category(runs[l], wl)[1] for l in labels],
+    ax_d.bar(range(len(labels)), [per_category(l, wl)[1] for l in labels],
              color=["#8a8985", "#eb6834", "#8a8985", "#eb6834"][: len(labels)], width=0.7)
     for k, l in enumerate(labels):
-        d = per_category(runs[l], wl)[1]
+        d = per_category(l, wl)[1]
         ax_d.text(k, d, str(d), ha="center", va="bottom", fontsize=8, color=INK)
     ax_d.set_xticks(range(len(labels)), labels, fontsize=8.5, color=MUTED, rotation=20, ha="right")
     ax_d.set_title(f"{wl}: dispatches per forward", loc="left", fontsize=10, color=INK)
@@ -89,9 +98,10 @@ for j, wl in enumerate(workloads):
         ax.set_axisbelow(True)
         for s in ("top", "right"):
             ax.spines[s].set_visible(False)
-axes[0][0].legend(fontsize=8, frameon=False, loc="upper right")
-fig.suptitle("EmbeddingGemma 2 text encoder, stage profile before and after the row-pass fusion (M5 Pro, shared GPU)",
+handles, names = axes[0][0].get_legend_handles_labels()
+fig.legend(handles, names, fontsize=8.5, frameon=False, loc="lower center", ncol=len(names), bbox_to_anchor=(0.5, 0.0))
+fig.suptitle("EmbeddingGemma 2 text encoder, stage profile before and after the row-pass fusion (M5 Pro, shared GPU, min over 3 passes)",
              x=0.01, ha="left", fontsize=12, color=INK)
-fig.tight_layout(rect=(0, 0, 1, 0.96))
+fig.tight_layout(rect=(0, 0.04, 1, 0.96))
 fig.savefig(root / "embedgemma2_text_fusion_profile_m5pro.png", dpi=140, facecolor="#fcfcfb")
 print("wrote", root / "embedgemma2_text_fusion_profile_m5pro.png")

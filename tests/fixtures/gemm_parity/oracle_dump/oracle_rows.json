@@ -1,0 +1,154 @@
+[
+  {
+    "lane": "tensorops-f32",
+    "out_dtype": "f32",
+    "seeds": 2,
+    "max_rel_err": 1.2358467648895363e-07,
+    "median_rel_err": 1.1732127697107677e-07,
+    "min_rel_err": 1.1105787745319991e-07,
+    "max_abs_err": 0.004088328558282228,
+    "mean_abs_err": 0.0002359216946387498,
+    "max_elem_rel_err": 2.4945091919939235e-07,
+    "max_higham_ratio": 0.061836992354996755,
+    "per_seed_rel_err": [
+      1.1105787745319991e-07,
+      1.2358467648895363e-07
+    ],
+    "per_seed_higham": [
+      0.05855007167035307,
+      0.061836992354996755
+    ],
+    "external_lanes_scored": 3
+  },
+  {
+    "lane": "simdgroup-f32",
+    "out_dtype": "f32",
+    "seeds": 2,
+    "max_rel_err": 2.0358836927078343e-07,
+    "median_rel_err": 1.8369483882010233e-07,
+    "min_rel_err": 1.6380130836942122e-07,
+    "max_abs_err": 0.006734946175129153,
+    "mean_abs_err": 0.00033600418288829933,
+    "max_elem_rel_err": 3.437441288197911e-07,
+    "max_higham_ratio": 0.09685946341328247,
+    "per_seed_rel_err": [
+      1.6380130836942122e-07,
+      2.0358836927078343e-07
+    ],
+    "per_seed_higham": [
+      0.09685946341328247,
+      0.08980223508338891
+    ],
+    "external_lanes_scored": 3
+  },
+  {
+    "lane": "tensorops-bf16",
+    "out_dtype": "f32",
+    "seeds": 2,
+    "max_rel_err": 0.003408111152579505,
+    "median_rel_err": 0.0027115641435698345,
+    "min_rel_err": 0.0020150171345601642,
+    "max_abs_err": 112.74438345223462,
+    "mean_abs_err": 5.010435891823107,
+    "max_elem_rel_err": 0.35836224783482834,
+    "max_higham_ratio": 0.7439456180838281,
+    "per_seed_rel_err": [
+      0.0020150171345601642,
+      0.003408111152579505
+    ],
+    "per_seed_higham": [
+      0.7439456180838281,
+      0.5045670568497067
+    ],
+    "external_lanes_scored": 3
+  },
+  {
+    "lane": "tensorops-tf32",
+    "out_dtype": "f32",
+    "seeds": 2,
+    "max_rel_err": 0.0002621801282311053,
+    "median_rel_err": 0.0002432945167209934,
+    "min_rel_err": 0.0002244089052108815,
+    "max_abs_err": 8.673231472650514,
+    "mean_abs_err": 0.5873265814457007,
+    "max_elem_rel_err": 0.11562936825536578,
+    "max_higham_ratio": 0.07606884266556409,
+    "per_seed_rel_err": [
+      0.0002244089052108815,
+      0.0002621801282311053
+    ],
+    "per_seed_higham": [
+      0.07606884266556409,
+      0.06754369643130817
+    ],
+    "external_lanes_scored": 3
+  },
+  {
+    "lane": "mlx-f32",
+    "out_dtype": "f32",
+    "seeds": 2,
+    "max_rel_err": 0.0002621801282311053,
+    "median_rel_err": 0.0002432945167209934,
+    "min_rel_err": 0.0002244089052108815,
+    "max_abs_err": 8.673231472650514,
+    "mean_abs_err": 0.5873265814457007,
+    "max_elem_rel_err": 0.11562936825536578,
+    "max_higham_ratio": 0.07606884266556409,
+    "per_seed_rel_err": [
+      0.0002244089052108815,
+      0.0002621801282311053
+    ],
+    "per_seed_higham": [
+      0.07606884266556409,
+      0.06754369643130817
+    ],
+    "external_lanes_scored": 3
+  },
+  {
+    "lane": "mlx-bf16",
+    "out_dtype": "bf16",
+    "seeds": 2,
+    "max_rel_err": 0.006009662609032454,
+    "median_rel_err": 0.0047109403024288045,
+    "min_rel_err": 0.0034122179958251554,
+    "max_abs_err": 198.80680977745942,
+    "mean_abs_err": 6.385737807729228,
+    "max_elem_rel_err": 0.3591897797294844,
+    "max_higham_ratio": 0.5266442266456591,
+    "per_seed_rel_err": [
+      0.0034122179958251554,
+      0.006009662609032454
+    ],
+    "per_seed_higham": [
+      0.5129440551645789,
+      0.5266442266456591
+    ],
+    "external_lanes_scored": 3
+  },
+  {
+    "lane": "torch-mps-f32",
+    "out_dtype": "f32",
+    "seeds": 2,
+    "max_rel_err": 5.3927091756368105e-08,
+    "median_rel_err": 4.262955630120184e-08,
+    "min_rel_err": 3.133202084603558e-08,
+    "max_abs_err": 0.0017839725405792706,
+    "mean_abs_err": 5.227946705485033e-05,
+    "max_elem_rel_err": 5.5791395235499693e-08,
+    "max_higham_ratio": 0.015628872975954288,
+    "per_seed_rel_err": [
+      3.133202084603558e-08,
+      5.3927091756368105e-08
+    ],
+    "per_seed_higham": [
+      0.015628872975954288,
+      0.015607191453832428
+    ],
+    "external_lanes_scored": 3
+  },
+  {
+    "lane": "torch-mps-bf16",
+    "skipped": "stub boom",
+    "seeds": 0
+  }
+]

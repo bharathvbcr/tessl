@@ -1,0 +1,1 @@
+{"shape": "oracle", "dist": "heavy_tail", "m": 24, "n": 20, "k": 48, "lanes": ["tensorops-f32", "simdgroup-f32", "tensorops-bf16", "tensorops-tf32"], "seeds": ["seed_00", "seed_01"]}

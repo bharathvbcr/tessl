@@ -57,6 +57,7 @@ fi
 echo "==> parity harness, host-only (adversarial scorer, ladder and evidence contracts)"
 # Needs numpy, which the oracle environment carries. A non-zero exit (any assertion failure,
 # or a required section that did not run) stops the script; GPU sections are skipped visibly.
+"$ORACLE_PY" -I bench/test_comparator_lanes.py
 "$ORACLE_PY" -I bench/test_parity_harness.py --pure
 
 echo "==> torch binding host tests (python/tests/test_binding_host.py; no GPU, needs the torch oracle)"

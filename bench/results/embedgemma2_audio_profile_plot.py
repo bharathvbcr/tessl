@@ -84,7 +84,7 @@ for ax, wl in zip(axes, workloads):
     ax.set_xlim(0, ax.get_xlim()[1] * 1.28)
 axes[0].legend(ncol=4, fontsize=8.5, frameon=False, loc="lower left", bbox_to_anchor=(0, 1.22))
 fig.suptitle("EmbeddingGemma 2 audio tower, per-stage GPU time (Apple M5 Pro, shared GPU)\n"
-             "the GEMMs did not change: read the other bars against the GEMM bar of the same row",
+             "the GEMM kernels did not change (q|k|v is one wider GEMM): read the other bars against the GEMM bar of the same row",
              x=0.01, ha="left", fontsize=10)
 fig.tight_layout(rect=(0, 0, 1, 0.95))
 fig.savefig(root / "embedgemma2_audio_profile_m5pro.png", dpi=160)

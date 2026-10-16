@@ -816,7 +816,8 @@ ratios range from 0.2x to 2.2x. Within the noise: no end-to-end speedup is claim
 from the benchmark. With `--evidence --max-spread 1.25` the drift gate refused all
 nine series of an 8-round run (spreads 1.9x to 3.7x), and no quiet window came in
 nine minutes of waiting. What the profile does show inside a run, where load
-touches the unchanged GEMMs and the changed stages alike: the time of everything
+touches the GEMM kernels (unchanged; q, k and v are one wider GEMM, which makes
+the ratio below slightly conservative) and the changed stages alike: the time of everything
 but the GEMMs, per millisecond of GEMM time, went from 0.28, 0.42 and 0.41 (1.0 s,
 3.3 s, batch) to 0.25, 0.25 and 0.21, so on the batch, where the GEMMs are 71-83 %
 of the forward, the passes outside the GEMMs went from about 29 % to 17 % of the

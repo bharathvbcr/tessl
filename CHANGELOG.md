@@ -87,7 +87,8 @@ All notable changes to `tessl` are recorded here. The format follows
   (`profile_embedgemma2_audio`, `bench_embedgemma2_audio`; `AudioStage` and
   `EmbedGemma2Audio::{set_stage_mask, clear_stage_mask}` are `#[doc(hidden)]`
   for the profiler). The second subsampling conv is an 8x8 simdgroup-MMA kernel
-  (64 → 14 ms on a batch of 8 clips of 30 s, stage alone); the residual adds and
+  (64 → 14 ms on a batch of 8 clips of 30 s, stage alone, two profile runs that
+  were not interleaved); the residual adds and
   norms, the GLU with the depthwise conv, norm and SiLU, and the q/k/v input
   clamps are fused (`eg2a_rms_norm` takes two row stages, `eg2a_lconv` replaces
   `eg2a_glu` and `eg2a_dwconv1d_causal`); q, k and v are one GEMM when their

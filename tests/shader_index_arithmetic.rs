@@ -882,10 +882,7 @@ fn embedgemma2_audio_offsets_are_widened() {
             "device const float *g = x + (ulong)(row0 + (uint)s) * 2u * hidden;",
             "light conv GLU input row",
         ),
-        (
-            "device float *o = out + (ulong)(row0 + t) * hidden;",
-            "light conv output row",
-        ),
+        ("const ulong o = (ulong)(row0 + t) * hidden;", "light conv output row"),
         ("w[(ulong)ch * p.taps + j]", "light conv tap weight"),
         ("const ulong col0 = (ulong)h * p.head_dim;", "attention head column"),
         (
@@ -902,7 +899,7 @@ fn embedgemma2_audio_offsets_are_widened() {
         ),
         ("rel + (ulong)(j - i) * hidden + col0", "relative key row"),
         (
-            "device float *o = out + (ulong)(row0 + t) * hidden + col0;",
+            "const ulong o = (ulong)(row0 + t) * hidden + col0;",
             "attention output row",
         ),
     ] {

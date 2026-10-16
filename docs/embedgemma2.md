@@ -372,6 +372,33 @@ Measured on an M5 Pro against the real checkpoint, paired and interleaved
   10-18 % and already at the bandwidth roofline (190-285 GB/s), so only fusing
   them helps. At 16 rows the down, o and per-layer-input GEMMs reach 17-22 % of
   the copy bandwidth where gate|up reaches 84 %.
+* **Small-M GEMMs: parallel K-partitions** (`gemm`, `gemm_bf16`; lane G,
+  `embedgemma2_small_m_m5pro.txt`). The four GEMMs that ran at 17-22 % of the copy
+  bandwidth at 16 rows (down, o, the two per-layer-input ones) have a C of 16
+  tiles of 32x32: one dispatch gave them 16 single-simdgroup threadgroups, each
+  walking all of K, so their time was that walk's latency. Below 97 rows at
+  N = 512 (a C of under 64 tiles of 32x32, or under 16 of 64x64 for bf16) the
+  K is cut into about 128 (64 for bf16) partitions' worth of threadgroups,
+  `matmul2d_tensorops_nn_splitk_par_f32` (bf16:
+  `..._nn_splitk_par_bf16_f32`) into a scratch with one slice per partition and
+  `reduce_partitions_f32` adding the slices in partition order: the TN lane's
+  design, for the NN layout. No change in `src/embedgemma2.rs`: its `project`
+  already goes through `gemm` / `GemmOperands::Bf16.nn`. Per GEMM at 16 rows,
+  interleaved against the single dispatch: down 2.0x, o 1.8-2.2x, ple 1.35x
+  (exact f32); down 1.1x, o 1.4-1.7x, ple 1.16x (bf16; medians of per-round
+  ratios, GPU shared). Whole `encode`
+  (`bench_paired`, before = `df5d329`): 1x16 0.63x of the time in clean rounds
+  (f32, 1.6x faster) and 0.79x (bf16); 1x64 0.81x and 0.85x; 64x32 and 8x1024
+  take the same kernels as before (the gate returns none at 2048 and 8192 rows)
+  and moved inside the machine's noise. The arithmetic stays exact f32 (bf16
+  operands, f32 accumulate, under `Bf16`): only the summation order changes, K
+  in partitions summed in order, and the lane is held to the f32 dot-product
+  bound `gamma_(K+8) * sum|a.b|` that every exact-f32 GEMM meets (worst result
+  `0.0039` of it; `tests/gemm_small_m.rs`, `tests/gemm_small_m_bf16.rs`), and
+  the forward to the same `1e-4` of fp32 as before. A row's bits now depend on M across
+  the gate (M up to 96 and M of 97 or more at N 512 sum K in different orders). This is less than the 1.8x
+  the stage profile's bandwidth estimate allowed: the lane reaches about 55 %
+  of the copy ceiling, not 70 %, and pays a reduce dispatch per GEMM.
 * **The device-peak rise, isolated.** One activation set is 736 MiB at 8192 rows
   against 576 MiB at 2a7cb8b (+160: the per-layer-input run buffer is +240, the
   packed gate|up and the dropped normed-V buffer save 80). The table above

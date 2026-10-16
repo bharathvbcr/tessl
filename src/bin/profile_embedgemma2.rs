@@ -34,6 +34,7 @@
 //!   cycled so the weights are not cache-resident, in exact f32 and with bf16
 //!   operands (`gemm_bf16`, f32 accumulation): the measured upper bound of a bf16
 //!   path, plus measured machine ceilings (copy bandwidth, large-GEMM rate).
+//!   `PROFILE_ROWS` (comma-separated, default `16,2048,8192`) picks the row counts.
 //! * `memory`: one fresh process's device-memory trace for one workload:
 //!   `PROFILE_STEPS` is a comma list of `E` (encode), `S` (synchronize), `A` (allocate the
 //!   activation set `acts()` makes, by the same formulas), `O` (the same for
@@ -1536,12 +1537,21 @@ fn mode_gemm() -> Result<(), String> {
         ("ple_out", 512, 512),
     ];
     let layers = 24usize;
+    // `PROFILE_ROWS`: comma-separated row counts (default 16,2048,8192).
+    let gemm_rows = match std::env::var("PROFILE_ROWS") {
+        Ok(v) => v
+            .split(',')
+            .map(|r| r.trim().parse::<usize>().ok().filter(|&r| r > 0))
+            .collect::<Option<Vec<_>>>()
+            .ok_or_else(|| format!("PROFILE_ROWS={v:?}: expected positive integers separated by commas"))?,
+        Err(_) => vec![16usize, 2048, 8192],
+    };
     let mut rows_json = Vec::new();
     println!(
         "{:<12} {:>6} {:>5} {:>5} | {:>9} {:>7} {:>7} | {:>9} {:>7} {:>7} | {:>6}",
         "gemm", "rows", "k", "n", "f32 us", "TFLOP/s", "GB/s", "bf16 us", "TFLOP/s", "GB/s", "f32/bf16"
     );
-    for &rows in &[16usize, 2048, 8192] {
+    for &rows in &gemm_rows {
         for (si, &(name, k, nn)) in shapes.iter().enumerate() {
             let a32 = rand_f32(&rt, &[rows, k], 10 + si as u64)?;
             let abf = rand_bf16(&rt, &[rows, k], 20 + si as u64)?;

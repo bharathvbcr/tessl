@@ -8,6 +8,36 @@ All notable changes to `tessl` are recorded here. The format follows
 
 ### Added
 
+- **A small-M NN GEMM lane: parallel K-partitions** (`gemm_nn_splitk_par_f32`,
+  `gemm_nn_splitk_par_bf16`, kernels `matmul2d_tensorops_nn_splitk_par_f32` and
+  `matmul2d_tensorops_nn_splitk_par_bf16_f32`, `bench_gemm_routes` lane
+  `nnsmall`, `profile_embedgemma2` `PROFILE_ROWS`). An NN GEMM whose C is a
+  few tiles (exact f32: under 64 tiles of 32x32, M up to 96 at N 512; bf16:
+  under 16 tiles of 64x64) over a K of two or more partitions used to run one
+  single-simdgroup threadgroup per tile, each walking all of K, so its time
+  was that walk's latency (EmbeddingGemma 2 at 1x16: the down, o and
+  per-layer-input GEMMs at 17-22 % of the copy bandwidth). It now runs every
+  K-partition's tiles in one dispatch into an unzeroed scratch of one slice
+  per partition and `reduce_partitions_f32` adds the slices in partition
+  order: the parallel TN split-K's design (whose binder it shares, now
+  `splitk_par` over `par_shape`, the one owner of its `u32` and scratch
+  limits) for the NN layout, in `gemm` for exact f32 and in `gemm` /
+  `gemm_bf16` / `GemmOperands::Bf16.nn` for bf16. The long-K split-K keeps the
+  shapes it had (`nn_f32_route` asks it first); f16, relaxed f32, a forced
+  tile, TN, NT and every shape with 64 or more tiles are unchanged. The sum
+  is rounded in another order than the single dispatch (so the bits differ at
+  these shapes, and a row's bits depend on M across the gate: M up to 96 and M of
+  97 or more at N 512; the result is deterministic), within the f32 dot-product bound
+  `gamma_(K+8) * sum|a.b|` every exact-f32 GEMM is held to: the worst of the
+  tests' results used 0.0039 of it (exact f32) and 0.0015 (bf16)
+  (`tests/gemm_small_m.rs`, `tests/gemm_small_m_bf16.rs`: M in {1, 7, 16, 63,
+  64} at K/N of 2048/512, 1024/512 and 512/512, ragged and offset views, a
+  poisoned scratch, bit-for-bit repeats, rank-one operands, the route by
+  traced kernel). Measured on an M5 Pro with the interleaved `bench_paired`
+  (`bench/results/embedgemma2_small_m_m5pro.txt`): EmbeddingGemma 2's 1x16
+  encode takes 0.63x of the time in clean rounds (f32) and 0.79x (bf16), 1x64
+  0.81x and 0.85x; 64x32 and 8x1024 are unchanged within the machine's noise.
+
 - **EmbeddingGemma 2's multimodal merge** (`EmbedGemma2Model::encode_multimodal`,
   `MmSequence`, `EmbedGemma2Config::{image_sequence, audio_sequence,
   special_tokens}`, `SpecialTokens`, `MmTokens`; audit gap G8, the part that

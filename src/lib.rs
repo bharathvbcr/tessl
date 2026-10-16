@@ -104,7 +104,7 @@
 //!
 //! # Kernels
 //!
-//! 37 Metal sources compile to 276 kernel entry points: RMSNorm, gated MLP
+//! 37 Metal sources compile to 278 kernel entry points: RMSNorm, gated MLP
 //! activations, flash attention (sliding-window and global), fused
 //! RMSNorm+QKV+RoPE, MLX-format Q4 GEMV/GEMM, Q8 GEMV, an exact int8 GEMM, KV
 //! cache stores, embedding lookup, row-wise softmax/sum/max, and softcap

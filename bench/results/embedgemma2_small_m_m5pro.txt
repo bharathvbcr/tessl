@@ -1,0 +1,169 @@
+EmbedGemma2 small-M GEMMs (lane G): parallel K-partitions for the few-tile NN GEMMs
+====================================================================================
+Machine: Apple M5 Pro, 64 GB, macOS 27, 2026-10-15. Before = eg2/integrate df5d329 built in its own
+worktree and target dir; after = the same tree plus this change (branch worktree-agent-a17ffa3c9da42a5f0).
+Data: embedgemma2_small_m_m5pro.json (every round of every lane, the merged statistics, the per-GEMM rows).
+Plot: embedgemma2_small_m_m5pro.png (embedgemma2_small_m_plot.py). Merge: embedgemma2_small_m_report.py.
+Tools: target/release/bench_paired over bench_embedgemma2 (whole encode); bench_gemm_routes lane nnsmall
+(one GEMM). EMBEDGEMMA2_SNAPSHOT = google/embeddinggemma-2 snapshot 914f7f89142e.
+
+Verified = measured here and in the JSON. Inferred = follows from measured numbers by the argument given.
+Unverified = not measured.
+
+WHAT CHANGED
+  An NN GEMM whose C is a few tiles over a long K ran one single-simdgroup threadgroup per 32x32 tile, each
+  walking all of K (down, o, ple at 16 rows: 16 threadgroups), so its time was that walk's latency, 17-22 % of
+  the copy bandwidth. It now runs every K-partition's tiles in one dispatch into a scratch slice per partition
+  and reduce_partitions_f32 adds the slices in order (the TN split-K's design). Exact f32:
+  matmul2d_tensorops_nn_splitk_par_f32; bf16: matmul2d_tensorops_nn_splitk_par_bf16_f32. Gate
+  (src/gemm.rs nn_small_par_k_tile): under 64 tiles of 32x32 (exact f32) or under 16 tiles of 64x64 (bf16), a
+  K of two or more partitions of 128 or more, about 128 (exact f32) or 64 (bf16) threadgroups in all. At the
+  forward's shapes: down and o global (K 2048, N 512): 8 partitions of 256 at M <= 32; o sliding (K 1024): 8
+  of 128; ple_gate / ple_out (K 512): 4 of 128. qkv (64-96 tiles) and gate|up (128) keep the single dispatch.
+  Accuracy: only the summation order moves (K in partitions summed in order, deterministic); tests hold every
+  result to gamma_(K+8) * sum|a.b| (the bound all exact-f32 GEMMs meet), worst 0.0039 of it (exact f32), 0.0015
+  (bf16). src/embedgemma2.rs is unchanged: project() goes through gemm / GemmOperands::Bf16.nn.
+
+MACHINE STATE AND NOISE (the limit of every number below)
+  Other sessions shared this GPU for the whole of the work: ioreg "Device Utilization %" read 0-100 % between
+  and during runs (97-99 % at the start and end of the per-GEMM runs), from other worktrees' test and bench
+  processes and from other users' sessions; the stage profiler's wait-for-quiet never saw a quiet window and
+  was stopped, so no stage profile of the new build exists. Absolute times are therefore inflated and
+  unstable: the 1x16 f32 encode, 7.3 ms in the committed stage profile, reads 9.4 ms at its best round here, and
+  per-round ratios between lanes run from 0.15 to 4.8. Each paired run carries a control lane, the before binary run a
+  second time, whose ratio to the first lane is what noise looks like. A delta inside the control's spread is
+  noise; the statistics under each table say which.
+
+METHOD
+  bench_paired, three lanes per run (before df5d329, after, control = before again), a fresh process per
+  lane per round, lane order reversed on odd rounds, BENCH_ITERS encodes per process and the process's
+  min-of-N reported; per workload the figure is per round. Runs: 1x16 and 1x64, 40 rounds x 20 iterations
+  (warmup 5); 64x32, 30 rounds x 10; 8x1024, 16 rounds x 3 (warmup 1); each in exact f32 (default) and with
+  BENCH_PRECISION=bf16. "clean rounds" are rounds in which the control lane is within 10 % of the before lane
+  on that workload. The one-GEMM figures come from bench_gemm_routes lane nnsmall: the plain single dispatch
+  (raw), production (gemm), and forced widths, interleaved, 12 rounds x 8 calls x 24 GEMMs, weights cycled
+  over 24 copies as in a forward, every arm's output checked against the plain one first (<= 2.1e-6 of the
+  output's scale).
+
+RESULTS
+  Whole encode, after / before (< 1 is faster). "min of rounds" is the house min-of-N over rounds; "median
+  ratio" the median over rounds of the per-round ratio with its lowest and highest round, and the control's
+  same figures; "clean" the rounds the control agrees with the before lane.
+
+WHOLE ENCODE: after / before (ms = min of rounds' min-of-N)
+prec  workload rounds    before     after  min-of-rounds     median ratio [lo,hi]        control [lo,hi]  clean n  clean median
+f32   1x16         40     9.393     6.725          0.716    0.669 [0.16,2.29]    1.062 [0.22,4.06]       13         0.633
+f32   1x64         40     9.773     7.971          0.816    0.826 [0.21,3.01]    0.998 [0.24,4.34]       17         0.808
+f32   64x32        30   219.869   104.945          0.477    0.939 [0.34,1.92]    1.037 [0.39,1.91]        5         0.957
+f32   8x1024       16   651.615  1111.377          1.706    1.004 [0.82,2.08]    0.985 [0.62,2.01]        9         0.970
+bf16  1x16         40     4.992     3.549          0.711    0.777 [0.15,2.59]    1.011 [0.19,4.78]       14         0.792
+bf16  1x64         40     5.454     4.504          0.826    0.850 [0.25,1.46]    1.038 [0.20,1.99]       14         0.851
+bf16  64x32        30    40.589    45.027          1.109    0.978 [0.25,2.88]    1.029 [0.50,4.85]        8         0.961
+bf16  8x1024       16   625.601   619.533          0.990    1.026 [0.45,2.06]    1.073 [0.43,2.23]        6         1.070
+
+ONE GEMM, us per call (median of interleaved rounds); plain / this = median of per-round ratios [lo, hi]
+f32   down           M=1   K=2048  N=512   plain 763.4  production 363.3 (2.08x [1.80,2.54])  par_splitk_128 334.3 (2.05x [1.68,2.43])  par_splitk_256 351.9 (1.97x [1.30,2.29])  par_splitk_512 459.4 (1.61x [1.26,1.72])
+f32   down           M=16  K=2048  N=512   plain 414.4  production 208.6 (1.98x [1.64,2.74])  par_splitk_128 188.6 (2.14x [1.64,2.61])  par_splitk_256 208.4 (1.99x [1.57,2.60])  par_splitk_512 235.2 (1.79x [1.48,2.14])
+f32   down           M=64  K=2048  N=512   plain 412.1  production 302.2 (1.37x [1.16,1.56])  par_splitk_128 292.9 (1.36x [1.06,1.52])  par_splitk_256 278.0 (1.45x [0.94,1.69])  par_splitk_512 313.5 (1.50x [1.10,1.61])
+f32   o global       M=1   K=2048  N=512   plain 559.9  production 281.1 (1.94x [1.75,2.31])  par_splitk_128 282.9 (1.99x [1.49,2.48])  par_splitk_256 290.2 (1.89x [1.51,2.36])  par_splitk_512 306.1 (1.83x [1.46,2.19])
+f32   o global       M=16  K=2048  N=512   plain 531.7  production 301.8 (1.78x [1.51,2.11])  par_splitk_128 289.3 (1.93x [1.65,2.42])  par_splitk_256 290.2 (1.92x [1.50,2.24])  par_splitk_512 302.6 (1.71x [1.43,2.04])
+f32   o global       M=64  K=2048  N=512   plain 786.0  production 382.8 (1.58x [1.28,2.78])  par_splitk_128 384.0 (1.78x [1.20,2.60])  par_splitk_256 345.0 (1.87x [1.36,3.41])  par_splitk_512 396.2 (1.50x [1.10,2.86])
+f32   o sliding      M=1   K=1024  N=512   plain 292.2  production 147.8 (2.00x [1.51,2.41])  par_splitk_128 142.9 (2.08x [1.97,2.85])  par_splitk_256 167.4 (1.75x [1.26,2.00])  par_splitk_512 208.1 (1.43x [1.15,1.80])
+f32   o sliding      M=16  K=1024  N=512   plain 292.9  production 132.9 (2.17x [1.35,2.86])  par_splitk_128 156.1 (1.97x [1.13,3.15])  par_splitk_256 165.3 (1.83x [1.31,2.23])  par_splitk_512 205.1 (1.49x [1.18,1.76])
+f32   o sliding      M=64  K=1024  N=512   plain 335.1  production 259.0 (1.41x [1.12,2.46])  par_splitk_128 260.3 (1.35x [1.01,3.24])  par_splitk_256 269.1 (1.27x [0.48,1.69])  par_splitk_512 322.3 (1.11x [0.91,1.54])
+f32   ple_gate/out   M=1   K=512   N=512   plain 276.5  production 189.3 (1.34x [1.01,1.96])  par_splitk_128 186.4 (1.40x [0.91,1.94])  par_splitk_256 228.5 (1.17x [1.02,1.71])
+f32   ple_gate/out   M=16  K=512   N=512   plain 280.3  production 203.4 (1.35x [1.07,1.70])  par_splitk_128 204.6 (1.36x [1.14,1.78])  par_splitk_256 229.3 (1.20x [1.04,1.47])
+f32   ple_gate/out   M=64  K=512   N=512   plain 269.0  production 207.1 (1.34x [0.94,2.03])  par_splitk_128 207.9 (1.29x [1.10,1.98])  par_splitk_256 224.3 (1.23x [1.01,1.74])
+f32   qkv sliding    M=1   K=512   N=2048  plain 323.7  production 332.3 (0.97x [0.52,1.67])  par_splitk_128 271.9 (1.20x [0.90,3.29])  par_splitk_256 299.1 (1.14x [0.94,2.42])
+f32   qkv sliding    M=16  K=512   N=2048  plain 289.9  production 305.5 (0.94x [0.70,1.55])  par_splitk_128 217.0 (1.31x [0.95,7.65])  par_splitk_256 267.0 (1.13x [0.89,2.82])
+f32   qkv sliding    M=64  K=512   N=2048  plain 290.8  production 301.2 (0.96x [0.92,1.07])  par_splitk_128 290.4 (1.00x [0.87,1.25])  par_splitk_256 302.8 (0.95x [0.71,1.33])
+f32   qkv global     M=1   K=512   N=3072  plain 254.5  production 287.0 (0.89x [0.72,1.26])  par_splitk_128 271.0 (0.98x [0.82,1.29])  par_splitk_256 266.3 (0.95x [0.77,1.38])
+f32   qkv global     M=16  K=512   N=3072  plain 353.4  production 336.5 (1.03x [0.95,1.22])  par_splitk_128 339.6 (1.01x [0.91,1.14])  par_splitk_256 332.5 (1.09x [0.91,1.28])
+f32   qkv global     M=64  K=512   N=3072  plain 446.3  production 449.1 (0.95x [0.81,1.23])  par_splitk_128 518.9 (0.88x [0.74,1.26])  par_splitk_256 438.7 (1.01x [0.79,1.50])
+f32   gate|up        M=1   K=512   N=4096  plain 411.0  production 486.2 (0.96x [0.68,1.61])  par_splitk_128 355.7 (1.30x [0.37,2.22])  par_splitk_256 361.4 (1.21x [0.42,2.45])
+f32   gate|up        M=16  K=512   N=4096  plain 560.0  production 498.7 (1.13x [0.79,1.50])  par_splitk_128 451.4 (1.33x [0.67,2.22])  par_splitk_256 478.9 (1.17x [0.67,1.76])
+f32   gate|up        M=64  K=512   N=4096  plain 646.4  production 659.4 (0.98x [0.84,1.17])  par_splitk_128 668.8 (0.93x [0.72,1.06])  par_splitk_256 665.9 (0.99x [0.81,1.15])
+bf16  down           M=1   K=2048  N=512   plain 388.6  production 300.2 (1.30x [1.12,2.41])  par_splitk_128 320.3 (1.28x [0.99,3.26])  par_splitk_256 321.5 (1.22x [1.07,5.24])  par_splitk_512 305.0 (1.28x [1.12,3.76])
+bf16  down           M=16  K=2048  N=512   plain 377.1  production 334.1 (1.11x [0.78,1.51])  par_splitk_128 331.0 (1.11x [0.93,1.83])  par_splitk_256 334.7 (1.16x [1.03,1.44])  par_splitk_512 333.0 (1.13x [0.75,1.55])
+bf16  down           M=64  K=2048  N=512   plain 332.2  production 272.2 (1.14x [0.85,2.11])  par_splitk_128 305.9 (1.00x [0.76,1.49])  par_splitk_256 291.7 (1.01x [0.84,1.99])  par_splitk_512 301.4 (1.17x [0.85,1.75])
+bf16  o global       M=1   K=2048  N=512   plain 297.0  production 166.9 (1.57x [1.01,2.46])  par_splitk_128 222.0 (1.31x [1.02,2.32])  par_splitk_256 187.8 (1.46x [1.03,1.82])  par_splitk_512 177.9 (1.47x [0.98,2.72])
+bf16  o global       M=16  K=2048  N=512   plain 547.7  production 334.0 (1.69x [1.02,2.07])  par_splitk_128 324.2 (1.59x [1.05,2.05])  par_splitk_256 327.8 (1.54x [0.99,2.56])  par_splitk_512 350.2 (1.60x [0.88,1.92])
+bf16  o global       M=64  K=2048  N=512   plain 615.5  production 433.8 (1.38x [1.10,1.90])  par_splitk_128 396.1 (1.43x [0.88,2.16])  par_splitk_256 375.6 (1.43x [0.70,2.41])  par_splitk_512 514.7 (1.15x [0.84,2.22])
+bf16  o sliding      M=1   K=1024  N=512   plain 344.6  production 272.5 (1.34x [1.01,2.37])  par_splitk_128 265.7 (1.22x [0.94,2.67])  par_splitk_256 272.1 (1.40x [0.55,2.34])  par_splitk_512 326.0 (1.10x [0.68,1.59])
+bf16  o sliding      M=16  K=1024  N=512   plain 210.2  production 148.1 (1.41x [0.75,3.70])  par_splitk_128 151.1 (1.52x [0.89,2.60])  par_splitk_256 154.9 (1.41x [0.93,1.96])  par_splitk_512 198.2 (1.12x [0.74,2.10])
+bf16  o sliding      M=64  K=1024  N=512   plain 124.5  production 64.2 (1.28x [0.91,4.27])  par_splitk_128 88.6 (1.27x [0.98,2.43])  par_splitk_256 71.7 (1.46x [1.00,2.34])  par_splitk_512 98.3 (1.22x [0.89,1.50])
+bf16  ple_gate/out   M=1   K=512   N=512   plain 20.6  production 17.0 (1.21x [1.12,1.34])  par_splitk_128 17.6 (1.16x [1.07,1.33])  par_splitk_256 19.0 (1.12x [1.01,1.29])
+bf16  ple_gate/out   M=16  K=512   N=512   plain 19.0  production 16.5 (1.16x [1.05,1.28])  par_splitk_128 16.3 (1.16x [0.93,1.25])  par_splitk_256 17.0 (1.13x [0.89,1.32])
+bf16  ple_gate/out   M=64  K=512   N=512   plain 18.7  production 19.1 (0.99x [0.91,1.11])  par_splitk_128 19.4 (0.98x [0.87,1.15])  par_splitk_256 19.7 (0.94x [0.86,1.08])
+bf16  qkv sliding    M=1   K=512   N=2048  plain 55.3  production 53.6 (1.02x [0.83,1.39])  par_splitk_128 51.5 (1.02x [0.84,1.59])  par_splitk_256 58.9 (1.00x [0.49,1.47])
+bf16  qkv sliding    M=16  K=512   N=2048  plain 101.4  production 106.3 (0.91x [0.43,1.14])  par_splitk_128 109.0 (0.87x [0.62,1.12])  par_splitk_256 129.4 (0.80x [0.28,0.98])
+bf16  qkv sliding    M=64  K=512   N=2048  plain 137.4  production 132.6 (1.01x [0.59,2.30])  par_splitk_128 173.6 (0.72x [0.43,2.56])  par_splitk_256 208.9 (0.68x [0.33,3.47])
+bf16  qkv global     M=1   K=512   N=3072  plain 132.7  production 140.9 (0.95x [0.78,1.91])  par_splitk_128 116.0 (1.09x [0.77,1.64])  par_splitk_256 129.7 (1.06x [0.69,2.20])
+bf16  qkv global     M=16  K=512   N=3072  plain 140.3  production 140.5 (0.99x [0.58,2.77])  par_splitk_128 163.1 (0.90x [0.35,1.33])  par_splitk_256 163.3 (0.85x [0.42,1.29])
+bf16  qkv global     M=64  K=512   N=3072  plain 142.1  production 135.4 (1.03x [0.86,1.38])  par_splitk_128 229.1 (0.64x [0.53,1.37])  par_splitk_256 225.8 (0.66x [0.48,0.73])
+bf16  gate|up        M=1   K=512   N=4096  plain 136.3  production 142.5 (0.96x [0.75,1.96])  par_splitk_128 161.1 (0.87x [0.71,1.85])  par_splitk_256 162.5 (0.86x [0.64,1.72])
+bf16  gate|up        M=16  K=512   N=4096  plain 127.8  production 138.1 (0.94x [0.49,1.90])  par_splitk_128 167.6 (0.72x [0.29,1.46])  par_splitk_256 171.4 (0.78x [0.40,1.05])
+bf16  gate|up        M=64  K=512   N=4096  plain 132.3  production 129.5 (0.94x [0.58,2.31])  par_splitk_128 276.9 (0.46x [0.23,0.81])  par_splitk_256 277.1 (0.48x [0.23,0.69])
+
+READING THE RESULTS
+  1x16 (the latency workload): exact f32 0.63x of the time in the 13 clean rounds (all-round median 0.669,
+  min of rounds 0.716, i.e. 1.4-1.6x faster); bf16 0.79x (0.777, 0.711). 1x64: 0.81x / 0.85x. The control
+  lane's median is 0.998-1.06 on the same rounds, its range as wide as the lane under test's, so the claim
+  rests on the medians of 40 interleaved rounds and on the clean-round subsets agreeing with them, not on any
+  one round.
+  64x32 and 8x1024 must not regress: those workloads' GEMMs are all past the gate (M = 2048 and 8192 rows;
+  src/gemm.rs small_m_select tests assert the gate returns none there, tests/gemm_small_m*.rs routing_by_shape
+  asserts the traced kernel is the single dispatch), so the kernels dispatched are the ones df5d329 dispatches
+  and the only code added on those paths is a gate call. Measured: medians 0.94-1.03 against a control of
+  0.99-1.07 with ranges of 0.3-4.9 (too wide for a 5 % claim; the clean-round medians are 0.957 and 0.970 in
+  f32, 0.961 and 1.07 in bf16, on 5-9 clean rounds each). Inside the noise: no regression is shown and none
+  could be resolved at this machine's noise. (The min-of-rounds column for these workloads, 0.48-1.7, is the
+  noise itself: the control lane's own minima differ from the before lane's by the same factors.)
+  One GEMM (committed table above, plain / production, medians of per-round ratios): exact f32 down 2.1x at 1
+  row, 2.0x at 16, 1.4x at 64; o global 1.9x, 1.8x, 1.6x; o sliding 2.0x, 2.2x, 1.4x; ple_gate / ple_out 1.3x
+  at each. (A second 16-row run in the same loaded window, nnsmall16_f32.txt, not committed: down 2.7x, o global
+  3.1x, o sliding 2.2x, ple 1.85x. In the quieter minutes of development the stage profiler's gemm mode read
+  down 97 us -> 35 us at 16 rows: 4.2 MiB in 35 us = 120 GB/s, about 55 % of the 220 GB/s copy ceiling, short of
+  the 70 % the stage profile's estimate assumed, since the lane pays a reduce dispatch and a barrier per GEMM.)
+  bf16 down 1.3x, 1.1x, 1.1x; o global 1.6x, 1.7x, 1.4x; o sliding 1.3x, 1.4x, 1.3x; ple 1.2x, 1.16x, 1.0x.
+  qkv and gate|up are not routed and read 0.9-1.1x of themselves (production = the plain kernel there; the forced split measured 0.7-1.3x, a loss as
+  often as a gain, which is why the gate stops at 64 tiles). bf16 down is the weakest lane: its 64x64 tile gives
+  only 8 tiles x 8 partitions of four simdgroups, and under this load its rounds spread [0.78, 1.51].
+  Predicted against measured: the stage profile's recommendation 3 estimated 7.3 -> 4.1 ms (1.8x) for 70 % of
+  the copy ceiling on the four shapes. Measured 1.4-1.6x with 55 %. Inferred, not measured: that the rest is the
+  per-GEMM reduce + barrier (a fused reduce, or the reduce folded into the following norm + residual kernel,
+  would remove it) and the unchanged qkv / gate|up / PLE-projection stages.
+
+VERIFIED / INFERRED / UNVERIFIED
+  Verified: the lane's results against an f64 reference at M in {1, 7, 16, 63, 64} and the real K / N, through
+  gemm, ExactF32.nn, gemm_bf16, Bf16.nn and the forced entries (tests/gemm_small_m.rs, gemm_small_m_bf16.rs;
+  mutation-checked: dropping the A partition offset, or skipping one tile of one partition, fails 4 of 7 /
+  3 of 6 tests with errors of 500-1000x the budget, and a poisoned scratch turns an unwritten element into a
+  NaN); bit-for-bit repeats over 48 runs; the route per shape; the 160-case and 2500-case GEMM fuzz
+  (gemm_fuzz_deep, seed 0xdeadbeef) unchanged and green with the lane in the sampled shapes; the encode
+  speedups above and the per-GEMM ratios.
+  Inferred: that the 64x32 and 8x1024 kernels are the same as df5d329's (from the gate's tests and the routing
+  test, not from a dispatch trace of the benchmark's own forward); that the fuzz reaches the lane often
+  (m, n <= ~190 and K to 2049 put many f32 NN cases under 64 tiles; not counted).
+  Unverified: a stage profile of the new build (no quiet window); the lane on f16 and relaxed f32 (not routed);
+  other consumers' (ojas, qd-metal, MLSystemsLab) bit-level expectations at small-M f32 NN shapes. The bits
+  differ from df5d329's there, inside the bound above, and a row's bits now depend on M across the gate (M <= 96
+  and M >= 97 at N 512 sum K in different orders; one dispatch computed a row the same at any M). rg over
+  ojas, Lappi-decision, MLSystemsLab, sparsl found no golden that pins small-M GEMM bits, but qd-metal's
+  tests/gpu.rs and ledger_rows.rs assert logits "bit identical" between two arms of a decision, which holds only
+  while both arms take the same side of the gate at every GEMM; not run here.
+  Not changed, and not a latency-bound shape: the NT per-layer-input projection (131-176 us, one dispatch per
+  forward, 384 tiles).
+  (Inferred, not tested: that one dispatch computed a row the same at any M.)
+
+REPRODUCE
+  cargo build --release --bin bench_embedgemma2 --bin bench_paired --bin bench_gemm_routes
+  (before: git worktree add --detach target/before df5d329, built with its own target dir)
+  EMBEDGEMMA2_SNAPSHOT=<snapshot> BENCH_WORKLOADS=1x16,1x64 BENCH_ITERS=20 BENCH_WARMUP=5 \
+    target/release/bench_paired --rounds 40 --out paired_lat_f32.json before-df5d329=<before>/bench_embedgemma2 \
+    after=target/release/bench_embedgemma2 control-before-again=<before>/bench_embedgemma2
+  (BENCH_PRECISION=bf16 for the bf16 runs; BENCH_WORKLOADS=64x32 / 8x1024 for the others)
+  BENCH_LANES=nnsmall BENCH_DTYPE=f32|bf16 BENCH_ROWS=1,16,64 BENCH_ROUNDS=12 BENCH_WIDTHS=128,256,512 \
+    target/release/bench_gemm_routes
+  python embedgemma2_small_m_report.py <results dir> <raw dir> before-df5d329 after control-before-again
+  uv run --with matplotlib python embedgemma2_small_m_plot.py <results dir>

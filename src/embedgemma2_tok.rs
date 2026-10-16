@@ -126,11 +126,24 @@ fn hash_bytes(b: &[u8]) -> u64 {
     h ^ (h >> 29)
 }
 
-/// The merge table: `(left id, right id) -> (rank, merged id)`.
+/// One slot of the merge table: the pair, its rank, and the merged token.
+#[derive(Clone, Copy)]
+struct MergeSlot {
+    key: u64,
+    rank: u32,
+    new: u32,
+}
+
+/// The merge table: `(left id, right id) -> (rank, merged id)`, in open
+/// addressing with the key and value in one slot (one cache line per probe),
+/// behind a bit filter small enough for the cache that answers most absent
+/// pairs (nearly every adjacent pair of a text is absent) without touching the
+/// table.
 struct MergeTable {
-    keys: Vec<u64>,
-    vals: Vec<(u32, u32)>,
+    slots: Vec<MergeSlot>,
     shift: u32,
+    filter: Vec<u64>,
+    filter_shift: u32,
 }
 
 const EMPTY_KEY: u64 = u64::MAX;
@@ -138,16 +151,31 @@ const EMPTY_KEY: u64 = u64::MAX;
 impl MergeTable {
     fn with_capacity(entries: usize) -> Self {
         let slots = (entries.max(1) * 2).next_power_of_two().max(16);
+        // 16 bits per entry, at least 64.
+        let bits = (entries.max(1) * 16).next_power_of_two().max(64);
         MergeTable {
-            keys: vec![EMPTY_KEY; slots],
-            vals: vec![(0, 0); slots],
+            slots: vec![
+                MergeSlot {
+                    key: EMPTY_KEY,
+                    rank: 0,
+                    new: 0
+                };
+                slots
+            ],
             shift: 64 - slots.trailing_zeros(),
+            filter: vec![0; bits / 64],
+            filter_shift: 64 - bits.trailing_zeros(),
         }
     }
 
     #[inline]
     fn slot(&self, key: u64) -> usize {
         (key.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> self.shift) as usize
+    }
+
+    #[inline]
+    fn filter_bit(&self, key: u64) -> usize {
+        (key.wrapping_mul(0xD6E8_FEB8_6659_FD93) >> self.filter_shift) as usize
     }
 
     #[inline]
@@ -159,12 +187,14 @@ impl MergeTable {
     /// `HashMap` collect does (the later merge line wins).
     fn insert(&mut self, a: u32, b: u32, rank: u32, new: u32) {
         let key = Self::key(a, b);
-        let mask = self.keys.len() - 1;
+        let bit = self.filter_bit(key);
+        self.filter[bit / 64] |= 1 << (bit % 64);
+        let mask = self.slots.len() - 1;
         let mut i = self.slot(key);
         loop {
-            if self.keys[i] == EMPTY_KEY || self.keys[i] == key {
-                self.keys[i] = key;
-                self.vals[i] = (rank, new);
+            let s = &mut self.slots[i];
+            if s.key == EMPTY_KEY || s.key == key {
+                *s = MergeSlot { key, rank, new };
                 return;
             }
             i = (i + 1) & mask;
@@ -174,14 +204,18 @@ impl MergeTable {
     #[inline]
     fn get(&self, a: u32, b: u32) -> Option<(u32, u32)> {
         let key = Self::key(a, b);
-        let mask = self.keys.len() - 1;
+        let bit = self.filter_bit(key);
+        if self.filter[bit / 64] & (1 << (bit % 64)) == 0 {
+            return None;
+        }
+        let mask = self.slots.len() - 1;
         let mut i = self.slot(key);
         loop {
-            let k = self.keys[i];
-            if k == key {
-                return Some(self.vals[i]);
+            let s = self.slots[i];
+            if s.key == key {
+                return Some((s.rank, s.new));
             }
-            if k == EMPTY_KEY {
+            if s.key == EMPTY_KEY {
                 return None;
             }
             i = (i + 1) & mask;

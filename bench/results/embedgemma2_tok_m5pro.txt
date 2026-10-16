@@ -1,0 +1,60 @@
+embedgemma2_tok vs Hugging Face tokenizers 0.23.2 (Python), Apple M5 Pro, 2026-10-16.
+
+Measured on this tree (branch of commit 5229a1c plus the embedgemma2_tok commits), on a
+SHARED, HEAVILY LOADED machine (load average 110 to 135 on 18 cores during the runs; other
+sessions were building and benchmarking). Read the minima, not the medians, and treat the
+spread as the result: a round's number moved by up to 5x between rounds of one run.
+
+Command (12 interleaved rounds, the lane order reversed on odd rounds, every lane a fresh
+process; each lane's number for a round is the fastest of 7 passes; load: of 5 loads):
+
+  ~/.venvs/ml-2026-10/bin/python bench/embedgemma2_tok_hf.py corpus target/embedgemma2_tok_bench_corpus.bin
+  EMBEDGEMMA2_SNAPSHOT=<snapshot> BENCH_TOK_CORPUS=target/embedgemma2_tok_bench_corpus.bin BENCH_ITERS=7 \
+    target/release/bench_paired --rounds 12 --out bench/results/embedgemma2_tok_m5pro.json \
+    tessl=target/release/bench_embedgemma2_tok \
+    hf_loop="~/.venvs/ml-2026-10/bin/python bench/embedgemma2_tok_hf.py" \
+    hf_batch:BENCH_TOK_HF_MODE=batch="~/.venvs/ml-2026-10/bin/python bench/embedgemma2_tok_hf.py"
+  uv run --no-project --with matplotlib python bench/results/embedgemma2_tok_plot.py bench/results
+
+(`~` written out as an absolute path in the real command: bench_paired splits on whitespace and
+does not expand it.) The corpus is the file the first command writes (2701 records, 770900 bytes,
+seeded). Both lanes read it, tokenize every text of a workload alone with special tokens, and
+return the FNV-1a hash of all ids; the hashes are equal on every workload
+(embedgemma2_tok_m5pro_tessl_lane.json vs embedgemma2_tok_m5pro_hf_lane.json: 2003484812,
+641024712, 337202411, 1401142627), and the plot refuses to draw otherwise.
+
+Lanes:
+  tessl     bench_embedgemma2_tok: Tokenizer::encode_raw(text, true), one thread
+  hf_loop   Tokenizer.encode(text) in a Python loop, one text at a time (the like-for-like lane)
+  hf_batch  Tokenizer.encode_batch(texts): the library's own rayon parallelism on all cores
+            (a reference for what the library gives when it may use the machine; tessl's
+            encode_batch is sequential, so it is not compared against this one like for like)
+
+Best round (min over 12 rounds of each round's min of 7 passes), ms, and tokens per second:
+
+  workload        tokens  tessl ms    hf_loop ms   hf_batch ms | tessl tok/s  hf_loop tok/s  hf_batch tok/s
+  short_queries    25097      6.621       17.198        9.559 |   3.79 M        1.46 M         2.63 M
+  documents        83746     39.309       86.939       12.658 |   2.13 M        0.96 M         6.62 M
+  multilingual     16016      4.021       14.689        4.237 |   3.98 M        1.09 M         3.78 M
+  long_100k        39306      7.676       25.411       25.286 |   5.12 M        1.55 M         1.55 M
+  load (32 MB json)          481.613      682.009      645.392 |   (ms)
+
+Median over rounds of the per-round ratio hf_loop / tessl (from bench_paired; [lowest, highest]
+round): short_queries 2.66 [2.10, 7.13], documents 2.36 [0.83, 8.17], multilingual 3.49
+[2.83, 22.3], long_100k 3.56 [1.22, 16.5], load 1.30 [0.97, 1.99]. A spread that straddles
+1.0 is not a result: documents and load do, in their lowest round.
+
+What the numbers support:
+  * One tessl thread encodes 2.2x to 3.7x the tokens per second of one tokenizers thread at the
+    best round on all four workloads, and the median ratio is above 2.3 on all four; the
+    load-straddling rounds are the noise of a loaded host, not a loss.
+  * Against tokenizers' all-core encode_batch, tessl's one thread is ahead on short_queries
+    (1.4x) and long_100k (3.3x: one 100k-character word cannot be split across cores), level on
+    multilingual (1.05x, inside the noise) and behind on documents (0.32x: 200 independent
+    documents parallelise).
+  * Load: tessl 482 ms against 645 to 682 ms at the best round (1.3x to 1.4x); the medians
+    (2.5 s against 3.0 to 3.4 s) are dominated by the host's load. On a quiet moment during
+    development one load measured 379 ms (216 ms strict JSON parse, 147 ms building the tables).
+  * Not claimed: any number on an idle machine, any comparison with another tokenizer, or that
+    the ratios hold for text unlike this corpus. The corpus is synthetic (word lists, a few
+    scripts, code lines), not a sample of a real workload.

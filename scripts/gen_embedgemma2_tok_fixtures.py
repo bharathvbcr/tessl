@@ -44,7 +44,7 @@ the offsets say how long each really is):
   status                    0 ok; 1 the processor refuses the text
   st_ids, st_ids_offsets    the ids the model receives (status 1: the library's, with the rule)
   raw_ids, raw_ids_offsets  `Tokenizer.encode(rendered, add_special_tokens=True)`
-  plain_ids, plain_ids_offsetsthe same with add_special_tokens=False
+  plain_ids, plain_ids_offsets  the same with add_special_tokens=False
   dec_ids, dec_id_offsets, dec_skip   decode inputs and skip_special_tokens
   dec_out.bin, dec_out_offsets        the library's decoded strings
   dec_groups.txt, dec_group_idx       decode corpus names

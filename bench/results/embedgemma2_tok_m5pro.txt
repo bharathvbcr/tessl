@@ -23,8 +23,12 @@ return the FNV-1a hash of all ids; the hashes are equal on every workload
 (embedgemma2_tok_m5pro_tessl_lane.json vs embedgemma2_tok_m5pro_hf_lane.json: 2003484812,
 641024712, 337202411, 1401142627), and the plot refuses to draw otherwise.
 
+embedgemma2_tok_m5pro_tessl_lane.json and embedgemma2_tok_m5pro_hf_lane.json are one extra run of each
+lane for the token counts, byte counts and id hashes the plot reads. The HF one was made with --check,
+which does not time, so its ms_min is 0.0 by design (iters 5 is the setting, not a measurement).
+
 Lanes:
-  tessl     bench_embedgemma2_tok: Tokenizer::encode_raw(text, true), one thread
+  tessl    bench_embedgemma2_tok: Tokenizer::encode_raw(text, true), one thread
   hf_loop   Tokenizer.encode(text) in a Python loop, one text at a time (the like-for-like lane)
   hf_batch  Tokenizer.encode_batch(texts): the library's own rayon parallelism on all cores
             (a reference for what the library gives when it may use the machine; tessl's

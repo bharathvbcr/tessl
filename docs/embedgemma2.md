@@ -1406,7 +1406,7 @@ a media extension, a `data:image/` URI, or the path of an existing media file
 | `Tokenizer::from_snapshot(dir)`, `from_file(path)`, `from_json(text)` | a tokenizer; `with_tokenizer_config(text)` and `with_prompts(text)` add the sidecars |
 | `encode(text)`, `encode_with_prompt(Some(name), text)` | the ids the model receives (one text, as above); `Err` for a refused placeholder or an unknown prompt name |
 | `encode_batch(texts)`, `encode_batch_with_prompt(name, texts)` | each text as `encode` has it; an `Err` names the text's position |
-| `encode_raw(text, add_special_tokens)` | `Tokenizer.encode(text, add_special_tokens).ids` of the library, no sentence-transformers rule |
+| `encode_raw(text, add_special_tokens)` | `Tokenizer.encode(text, add_special_tokens).ids` of the library, no sentence-transformers rule. A text (with its prompt) of `MAX_TEXT_BYTES` (256 MiB) or more is an `Err` from `encode`/`encode_with_prompt` and a panic here: the merge list's positions are 32-bit |
 | `decode(ids)`, `decode_with(ids, skip_special_tokens)` | `Tokenizer.decode`: special tokens skipped by default, as that method does (transformers' `decode` defaults to keeping them); an id with no token is skipped, as the library does |
 | `prompt(name)`, `prompt_names()`, `token_to_id`, `id_to_token`, `vocab_size` | lookups |
 | `EmbedGemma2Model::encode_texts(&tok, prompt, texts, truncate_dim)` | tokenize, then `encode` (one prompt for the call) |
@@ -1435,7 +1435,7 @@ format (non-negative integers, `null` and booleans, containers four deep), so
 `Syntax` is **unchanged** and no other caller's check was touched. The tree is
 then reduced to the token text in one arena, an open-addressing index from text
 to id, a table of the one-character tokens, and an open-addressing table of the
-514906 merge ranks (key and value in one 16-byte slot, behind a 1 MiB bit
+514906 merge ranks (key and value in one 16-byte slot, behind a 2 MiB bit
 filter that answers most absent pairs from cache), and dropped. Encoding never
 reads the JSON again, allocates only its working buffers, and the value is
 `Send + Sync`. The files are read through the crate's regular-file open with a

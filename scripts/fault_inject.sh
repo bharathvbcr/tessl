@@ -234,7 +234,7 @@ if [ "${TESSL_FAULT_ALLOW_DIRTY:-0}" != 1 ] && ! git diff --quiet HEAD -- kernel
 fi
 pre_hash=$(kernel_hashes)
 
-lock_dir=${MAC_HEAVY_LOCK:-/Users/bharath/Code/research/tessl/build/mac-heavy.lock.d}
+lock_dir=${MAC_HEAVY_LOCK:-/Users/bharath/Code/research/Lappi-decision/build/mac-heavy.lock.d}
 {
   echo "date        $(stamp)"
   echo "commit      $(git rev-parse HEAD)  (branch $(git rev-parse --abbrev-ref HEAD))"

@@ -549,6 +549,17 @@ and the 6147-token embedding moved from `9.2e-7` to `2.1e-7`.
 Measured on an M5 Pro against the real checkpoint, paired and interleaved
 (`bench_paired` over `bench_embedgemma2`; `bench/results/embedgemma2_*_m5pro.*`).
 
+* **The 2026-10-15 work as a whole** (60a6240 in its best mode, `BENCH_ASYNC=1`,
+  against `eg2/integrate` at 7459e16, with a control lane at 0.995x to 1.002x;
+  `embedgemma2_final_m5pro.{txt,json,png}`). ExactF32, the default: 1x16 0.60x
+  of the time (lane G's opt-in split-K), every other workload unchanged within
+  2 % (its f32 GEMMs are compute-bound on the exact-f32 matrix rate). Bf16:
+  0.53x at 1x16 and 0.335x to 0.363x from 64x32 up (2.75x to 3.0x faster).
+  Device peak above the model 3.0x to 3.9x lower in both modes (1652 to 466 MiB
+  ExactF32 and 424 MiB Bf16 at 32x256 / 8x1024 / 2x4096). 60a6240's default
+  mode, which waited on every dispatch, is not a lane: its 1x16 series failed
+  the spread gate in a first attempt, and its cost is the G1 figure below.
+
 * **Whole encode, before and after the nine landed changes** (2a7cb8b against
   0055612, combined, not per commit): an encode takes 0.35x to 0.84x of the
   time (1.2x to 2.9x faster) in the default runtime, uniform and ragged

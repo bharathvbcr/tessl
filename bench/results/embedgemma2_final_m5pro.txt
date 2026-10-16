@@ -1,0 +1,66 @@
+EmbeddingGemma 2 text encode: 60a6240 (session start) against eg2/integrate (lanes A-K merged)
+Apple M5 Pro, 2026-10-16. Snapshot google/embeddinggemma-2 914f7f89142e33e77833254d9c9b90c3cef7303b.
+
+What ran
+  bench_paired --rounds 6 --evidence --max-spread 1.25 --clean-env, BENCH_ITERS=10, BENCH_WARMUP=3,
+  lane order reversed on odd rounds, one fresh process per lane per round, min-of-N per process.
+  Lanes (the script is target/run_final_bench.sh in the integration worktree):
+    before_async  60a6240's bench_embedgemma2, BENCH_ASYNC=1 (its best mode; the base)
+    control       a byte copy of that binary, BENCH_ASYNC=1 (the run's own noise)
+    after_f32     eg2/integrate at 7459e16, BENCH_PRECISION=f32 (GemmOperands::ExactF32, the default)
+    after_bf16    the same binary, BENCH_PRECISION=bf16 (GemmOperands::Bf16)
+  Published by the drift gate on its first attempt with these lanes; the provenance block
+  (revision, lane binary hashes, host, load) is in embedgemma2_final_m5pro.json.
+
+  A first attempt also had a lane for 60a6240's default mode (every dispatch committed and waited,
+  what a library caller got before lane A's async_scope). It was refused, nothing published: its
+  1x16 ratio series spread 1.47x and 1.58x against the 1.25 gate, and after_f32's vs-previous at 1x16
+  (against that lane) 1.47x. That lane's cost is the committed G1 measurement
+  (embedgemma2_before_after_m5pro.txt: 1x16 84.9 ms synchronous against 7.4 queued). The refused
+  attempt's archive is kept out of the repository.
+
+  Machine: other sessions ran Go test suites throughout (1-minute load 27 at the start, 46 at the
+  end, 18 cores). The control lane is the check on that: 0.995x to 1.002x against before_async on
+  every workload, with its widest round range [0.961, 1.038] at 1x16.
+
+Result (median over rounds of each process's min-of-10, ms; ratio = median of per-round lane/base,
+[lowest, highest round])
+
+  workload               before_async  control          after_f32                after_bf16
+  1x16                      7.371      0.997 [0.961,1.038]   4.442 0.601 [0.580,0.634]   3.903 0.530 [0.510,0.572]
+  64x32                   102.174      0.999 [0.997,1.007] 101.733 0.997 [0.993,0.998]  37.058 0.363 [0.361,0.376]
+  32x256                  430.745      1.002 [0.998,1.011] 431.515 1.002 [0.995,1.003] 156.277 0.362 [0.359,0.391]
+  8x1024                  520.024      1.000 [0.996,1.025] 527.055 1.008 [0.993,1.025] 184.928 0.353 [0.334,0.377]
+  2x4096                  670.686      0.998 [0.989,1.010] 673.839 1.005 [0.980,1.020] 228.867 0.341 [0.327,0.346]
+  128x8-512              1814.455      1.000 [0.991,1.009] 1803.61 0.997 [0.982,1.006] 656.624 0.361 [0.357,0.371]
+  1x4096+63x32            438.803      0.995 [0.989,1.007] 431.231 0.984 [0.945,1.012] 150.793 0.344 [0.337,0.348]
+  1x6147+1x1658+6x10-42   706.773      0.997 [0.986,1.000] 695.893 0.988 [0.965,1.016] 236.412 0.335 [0.327,0.339]
+
+  Device peak above the loaded model, MiB (max over rounds)
+  workload               before_async  after_f32  after_bf16
+  1x16                        4.2        2.0        2.0
+  64x32                     436.2      114.2      112.2
+  32x256                   1652.4      466.3      424.4
+  8x1024                   1652.4      466.3      424.4
+  2x4096                   1652.4      466.3      424.4
+  128x8-512                2478.5      650.6      605.0
+  1x4096+63x32             2638.5      746.6      605.0
+  1x6147+1x1658+6x10-42    3120.3     1034.9      887.2
+
+Reading
+  * ExactF32 (the default) is 1.66x faster at 1x16 (lane G's opt-in split-K for few-tile GEMMs)
+    and unchanged elsewhere: every other ratio's range contains 1.0 or sits within 2 % of it. Its
+    GEMMs are compute-bound on the exact-f32 matrix rate (lane D), which no lane changed.
+  * Bf16 is 2.75x to 3.0x faster than 60a6240 from 64x32 up and 1.89x at 1x16 (lane B's bf16
+    GEMMs, lane E's bf16 attention tiles). Accuracy: cosine 0.99999 or better against fp32 on the
+    real checkpoint, mean 1-cos about 10x smaller than transformers' own bf16 forward
+    (tests/embedgemma2_model.rs).
+  * Device peak above the model is 3.0x to 3.9x lower in both modes (lane H: activations released
+    before the wait, a 16 MiB per-layer-input run, q|k|v sharing gate|up's buffer). The timed
+    workloads run back to back in one process, so the before figures include the second activation
+    set that 60a6240 kept across consecutive encodes.
+  * Not in this bench: the vision and audio towers and the multimodal facade (their own results:
+    embedgemma2_vision_speed_m5pro, embedgemma2_audio_speed_m5pro, embedgemma2_mm_onewait_m5pro).
+
+Plot: embedgemma2_final_m5pro.png (embedgemma2_final_plot.py; matplotlib through
+`uv run --no-project --with matplotlib`, not a repository dependency).

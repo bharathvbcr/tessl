@@ -2787,7 +2787,10 @@ fn write_entry(model: *mut TesslQwen35, i: usize, src: &[f32]) -> (i32, String) 
     (s, msg(&err))
 }
 
-const GUARD: f32 = f32::from_bits(0x7FC0_DEAD);
+/// A NaN payload no read produces; a fn because `f32::from_bits` is const only from 1.83 (MSRV 1.82).
+fn guard() -> f32 {
+    f32::from_bits(0x7FC0_DEAD)
+}
 
 /// A parameter read through the ABI is that entry: bitwise the whole-model
 /// copy's values, written into exactly `n` elements (a guard past the end is
@@ -2806,10 +2809,10 @@ fn a_parameter_read_or_write_is_that_entry_and_encodes_nothing() {
     rt.take_dispatch_count();
     for i in [small, large] {
         let n = numel(&infos[i]);
-        let (s, dst, m) = read_entry(model, i, n, GUARD);
+        let (s, dst, m) = read_entry(model, i, n, guard());
         assert_eq!(s, TESSL_OK, "{m}");
         assert!(
-            dst[n..].iter().all(|v| v.to_bits() == GUARD.to_bits()),
+            dst[n..].iter().all(|v| v.to_bits() == guard().to_bits()),
             "wrote past entry {i}"
         );
         assert_eq!(
@@ -2824,7 +2827,7 @@ fn a_parameter_read_or_write_is_that_entry_and_encodes_nothing() {
     let (s, m) = write_entry(model, small, &new);
     assert_eq!(s, TESSL_OK, "{m}");
     for i in 0..infos.len() {
-        let (s, got, m) = read_entry(model, i, numel(&infos[i]), GUARD);
+        let (s, got, m) = read_entry(model, i, numel(&infos[i]), guard());
         assert_eq!(s, TESSL_OK, "{m}");
         let want = if i == small { &new } else { &whole[i] };
         assert_eq!(bits(&got[..numel(&infos[i])]), bits(want), "entry {i} after the write");
@@ -2850,21 +2853,21 @@ fn per_parameter_host_entries_refuse_hostile_arguments_without_moving_anything()
     let mut err = [0 as c_char; ERR_LEN];
     let unchanged = |what: &str| {
         for (j, p) in infos.iter().enumerate() {
-            let (s, got, m) = read_entry(model, j, numel(p), GUARD);
+            let (s, got, m) = read_entry(model, j, numel(p), guard());
             assert_eq!(s, TESSL_OK, "{m}");
             assert_eq!(bits(&got[..numel(p)]), bits(&whole[j]), "{what}: entry {j} moved");
         }
     };
     // Reads: a refused read writes nothing into the destination.
     for len in [n - 1, n + 1, 0] {
-        let mut dst = vec![GUARD; n + 8];
+        let mut dst = vec![guard(); n + 8];
         let s = unsafe {
             tessl_qwen35_read_parameter_host(model, i as u64, dst.as_mut_ptr(), len as u64, err.as_mut_ptr(), ERR_LEN)
         };
         assert_eq!(s, TESSL_ERR, "read n={len}");
         assert!(msg(&err).contains("takes"), "n={len}: {}", msg(&err));
         assert!(
-            dst.iter().all(|v| v.to_bits() == GUARD.to_bits()),
+            dst.iter().all(|v| v.to_bits() == guard().to_bits()),
             "a refused read (n={len}) wrote"
         );
     }
@@ -2875,12 +2878,12 @@ fn per_parameter_host_entries_refuse_hostile_arguments_without_moving_anything()
         assert_eq!(s, TESSL_ERR, "null dst, n={len}");
         assert!(msg(&err).contains("null dst"), "{}", msg(&err));
     }
-    let mut dst = vec![GUARD; 16];
+    let mut dst = vec![guard(); 16];
     let s =
         unsafe { tessl_qwen35_read_parameter_host(model, u64::MAX, dst.as_mut_ptr(), 1, err.as_mut_ptr(), ERR_LEN) };
     assert_eq!(s, TESSL_ERR);
     assert!(msg(&err).contains("out of range"), "{}", msg(&err));
-    assert!(dst.iter().all(|v| v.to_bits() == GUARD.to_bits()));
+    assert!(dst.iter().all(|v| v.to_bits() == guard().to_bits()));
     // Writes: nothing lands.
     let new = vec![7.0f32; n + 1];
     for len in [n - 1, n + 1, 0] {
@@ -2940,14 +2943,14 @@ fn per_parameter_host_entries_are_refused_on_a_poisoned_runtime() {
     let rt = unsafe { tessl::capi::test_model_runtime(model) };
     let infos = param_infos(model);
     let n = numel(&infos[0]);
-    let (s, before, m) = read_entry(model, 0, n, GUARD);
+    let (s, before, m) = read_entry(model, 0, n, guard());
     assert_eq!(s, TESSL_OK, "{m}");
     rt.poison_as_shared_event_timeout_for_test();
     assert_eq!(poisoned(handle.0), 1);
-    let (s, dst, _) = read_entry(model, 0, n, GUARD);
+    let (s, dst, _) = read_entry(model, 0, n, guard());
     assert_eq!(s, TESSL_ERR, "a read on a poisoned runtime");
     assert!(
-        dst.iter().all(|v| v.to_bits() == GUARD.to_bits()),
+        dst.iter().all(|v| v.to_bits() == guard().to_bits()),
         "a refused read wrote"
     );
     let new: Vec<f32> = before[..n].iter().map(|v| v + 1.0).collect();
@@ -3086,6 +3089,7 @@ fn a_host_write_that_the_optimizer_would_overwrite_is_refused() {
         let weights = read_all(model, &rt, &infos, TESSL_READ_PARAMS);
         let aux = keeps_aux.then(|| read_all(model, &rt, &infos, TESSL_READ_ADAMW_AUX));
         let (mut refused, mut accepted) = (0, 0);
+        let mut refused_at = Vec::new();
         for (i, p) in infos.iter().enumerate() {
             let changed: Vec<f32> = weights[i].iter().map(|v| v + 1.0).collect();
             let (s, m) = write_entry(model, i, &changed);
@@ -3094,12 +3098,13 @@ fn a_host_write_that_the_optimizer_would_overwrite_is_refused() {
                 continue;
             }
             refused += 1;
+            refused_at.push(i);
             assert_eq!(s, TESSL_ERR);
             assert!(
                 m.contains(&format!("index {i}")) && m.contains(name) && m.contains("TESSL_WRITE_ADAMW_AUX"),
                 "entry {i}: {m}"
             );
-            let (s, got, e) = read_entry(model, i, numel(p), GUARD);
+            let (s, got, e) = read_entry(model, i, numel(p), guard());
             assert_eq!(s, TESSL_OK, "{e}");
             assert_eq!(
                 bits(&got[..numel(p)]),
@@ -3111,7 +3116,9 @@ fn a_host_write_that_the_optimizer_would_overwrite_is_refused() {
             assert!(refused > 0, "{rule}: no write was refused");
             assert!(accepted > 0, "{rule}: the f32 entries (no aux state) were refused too");
             let after = read_all(model, &rt, &infos, TESSL_READ_ADAMW_AUX);
-            for i in 0..infos.len() {
+            // Only refused entries are compared: an f32 entry has no aux state, so
+            // the aux read returns its parameter (master) and its accepted write shows.
+            for &i in &refused_at {
                 assert_eq!(
                     bits(&after[i]),
                     bits(&aux[i]),

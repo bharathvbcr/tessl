@@ -1,0 +1,13 @@
+diff --git a/kernels/attn_tiled.h b/kernels/attn_tiled.h
+index 88c95ad..3a4b0fd 100644
+--- a/kernels/attn_tiled.h
++++ b/kernels/attn_tiled.h
+@@ -163,7 +163,7 @@ inline void attn_tiled_body(
+         if (oT.is_valid_element(i)) {
+             const auto idx = oT.get_multidimensional_index(i);
+             const float l = l_row[idx[1]];
+-            oT[i] *= (l > 0.0f) ? (1.0f / l) : 0.0f;
++            oT[i] *= 1.0f / l;
+         }
+     }
+     // The training forward also keeps each row's log-sum-exp of the scaled

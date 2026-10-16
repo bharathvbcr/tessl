@@ -1,0 +1,13 @@
+diff --git a/kernels/matmul_tensorops.metal b/kernels/matmul_tensorops.metal
+index 3c78a46..e931285 100644
+--- a/kernels/matmul_tensorops.metal
++++ b/kernels/matmul_tensorops.metal
+@@ -238,7 +238,7 @@ kernel void matmul2d_tensorops_nn_splitk_f32(
+         const uint p = tgpig / tiles;                                          \
+         if (p >= partitions) return;                                           \
+         const ulong k0 = (ulong)p * k_tile;                                    \
+-        if (k0 >= K) return;                                                   \
++        if (k0 + k_tile > K) return;                                           \
+         const uint k_len = (uint)min((ulong)k_tile, (ulong)K - k0);            \
+         mm_coop<ELEM, SM, SN, NSG, true, false, RELAXED, false, false,         \
+                 walk_by_b>(A + k0 * M, B + k0 * N, S + (ulong)p * slice, M, N, \

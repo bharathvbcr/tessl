@@ -1,0 +1,13 @@
+diff --git a/kernels/gemm_coop.h b/kernels/gemm_coop.h
+index 4c884c8..9e3db22 100644
+--- a/kernels/gemm_coop.h
++++ b/kernels/gemm_coop.h
+@@ -57,7 +57,7 @@ inline uint2 tile_from_linear_panel(uint linear, uint tiles_n, uint tiles_m, uin
+     if (linear >= tiles_n * tiles_m) return uint2(tiles_n, tiles_m);
+     uint band = linear / (ph * tiles_n);
+     uint rem = linear - band * ph * tiles_n;
+-    uint local_h = min(ph, tiles_m - band * ph);
++    uint local_h = ph;
+     return uint2(rem / local_h, band * ph + rem % local_h);
+ }
+ 

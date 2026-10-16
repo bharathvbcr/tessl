@@ -1,0 +1,13 @@
+diff --git a/kernels/matmul_tensorops.metal b/kernels/matmul_tensorops.metal
+index 3c78a46..0a1b589 100644
+--- a/kernels/matmul_tensorops.metal
++++ b/kernels/matmul_tensorops.metal
+@@ -497,7 +497,7 @@ template <int SM, int SN, int NSG, bool ACCUM>
+ inline void mm_nt_coop_bf16(device bfloat *A, device bfloat *B, device float *C,
+                             uint M, uint N, uint K, uint tiles_n, uint tiles_m,
+                             uint tgpig) {
+-    mm_coop<bfloat, SM, SN, NSG, false, true, false, ACCUM, false, walk_by_b>(
++    mm_coop<bfloat, SM, SN, NSG, false, false, false, ACCUM, false, walk_by_b>(
+         A, B, C, M, N, K, tiles_n, tiles_m, tgpig, nullptr, 1.0f, 0.0f, 0u);
+ }
+ 

@@ -1,0 +1,8 @@
+diff --git a/kernels/gemm_coop.h b/kernels/gemm_coop.h
+--- a/kernels/gemm_coop.h
++++ b/kernels/gemm_coop.h
+@@ -1,3 +1,3 @@
+ #ifndef TESSL_GEMM_COOP_H
+-// this context line does not exist in the file, so the patch is stale by construction
++// (never applied)
+ #define TESSL_GEMM_COOP_H

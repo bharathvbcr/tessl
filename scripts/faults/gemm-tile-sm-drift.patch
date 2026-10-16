@@ -1,0 +1,13 @@
+diff --git a/kernels/matmul_tensorops.metal b/kernels/matmul_tensorops.metal
+index 3c78a46..aca9d11 100644
+--- a/kernels/matmul_tensorops.metal
++++ b/kernels/matmul_tensorops.metal
+@@ -309,7 +309,7 @@ kernel void matmul2d_tensorops_bf16_f32(
+     mm_nn_coop_f32acc(A, B, C, M, N, K, tiles_n, tiles_m, tgpig, nullptr, 1.0f,
+                       0.0f, 0u);
+ }
+-NN_COOP_KERNEL(matmul2d_tensorops_bf16_f32_64x64_sg4,  bfloat,  64, 64, 4, false)
++NN_COOP_KERNEL(matmul2d_tensorops_bf16_f32_64x64_sg4,  bfloat,  32, 64, 4, false)
+ NN_COOP_KERNEL(matmul2d_tensorops_f32_relaxed,            float, 128, 64, 4, true)
+ NN_COOP_KERNEL(matmul2d_tensorops_f32_relaxed_64x64_sg4,  float,  64, 64, 4, true)
+ 

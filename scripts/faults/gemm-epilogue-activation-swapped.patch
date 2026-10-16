@@ -1,0 +1,13 @@
+diff --git a/kernels/gemm_coop.h b/kernels/gemm_coop.h
+index 4c884c8..d0f0a73 100644
+--- a/kernels/gemm_coop.h
++++ b/kernels/gemm_coop.h
+@@ -262,7 +262,7 @@ static inline float gemm_apply_activation(float v, GemmActivation act) {
+         case GEMM_ACT_GELU_TANH: return tessl_gelu_pytorch_tanh(v);
+         // The crate's one SiLU (act.h), shared with mlp_silu and the Qwen3.5
+         // kernels. A textbook local copy here once divided by exp(-v) = inf.
+-        case GEMM_ACT_SILU: return tessl_silu(v);
++        case GEMM_ACT_SILU: return tessl_gelu_pytorch_tanh(v);
+         default: return v;
+     }
+ }

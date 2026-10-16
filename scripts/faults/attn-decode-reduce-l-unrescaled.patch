@@ -1,0 +1,13 @@
+diff --git a/kernels/flash_attn_decode.metal b/kernels/flash_attn_decode.metal
+index 7c1b9f0..fd8c328 100644
+--- a/kernels/flash_attn_decode.metal
++++ b/kernels/flash_attn_decode.metal
+@@ -305,7 +305,7 @@ kernel void NAME(                                                             \
+     for (uint c = 0; c < n_chunks; ++c) {                                     \
+         const float l_c = partials[(chunk0 + c) * stride + 1u];               \
+         if (l_c > 0.0f) {                                                     \
+-            l_all += l_c * exp(partials[(chunk0 + c) * stride] - m_all);      \
++            l_all += l_c;                                                     \
+         }                                                                     \
+     }                                                                         \
+     const float inv_l = (l_all > 0.0f) ? (1.0f / l_all) : 0.0f;               \

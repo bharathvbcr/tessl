@@ -1,0 +1,13 @@
+diff --git a/kernels/attn_tiled.h b/kernels/attn_tiled.h
+index 88c95ad..b4d4203 100644
+--- a/kernels/attn_tiled.h
++++ b/kernels/attn_tiled.h
+@@ -140,7 +140,7 @@ inline void attn_tiled_body(
+         }
+         threadgroup_barrier(mem_flags::mem_threadgroup);
+         if (part == 0u) {
+-            l_row[r] = l_row[r] * alpha + sum;
++            l_row[r] = l_row[r] + sum;
+             m_row[r] = m_new;
+             a_row[r] = alpha;
+         }

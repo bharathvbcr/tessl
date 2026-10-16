@@ -1,0 +1,13 @@
+diff --git a/kernels/matmul_tensorops.metal b/kernels/matmul_tensorops.metal
+index 3c78a46..9ca09c9 100644
+--- a/kernels/matmul_tensorops.metal
++++ b/kernels/matmul_tensorops.metal
+@@ -154,7 +154,7 @@ kernel void matmul2d_tensorops_tn_splitk_par_f32(
+     uint k_len = (uint)min((ulong)k_tile, (ulong)K - k0);
+     auto mA = tensor(A + k0 * M, dextents<int, 2>{(int)M, (int)k_len}, array<int, 2>{1, (int)M});
+     auto mB = tensor(B + k0 * N, dextents<int, 2>{(int)N, (int)k_len}, array<int, 2>{1, (int)N});
+-    auto mS = tensor(S + (ulong)p * slice, dextents<int, 2>{(int)N, (int)M}, array<int, 2>{1, (int)N});
++    auto mS = tensor(S + (ulong)(p > 0u ? p - 1u : 0u) * slice, dextents<int, 2>{(int)N, (int)M}, array<int, 2>{1, (int)N});
+ 
+     auto tA = mA.slice(ty, 0);
+     auto tB = mB.slice(tx, 0);

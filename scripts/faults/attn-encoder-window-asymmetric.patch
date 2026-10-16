@@ -1,0 +1,13 @@
+diff --git a/kernels/attn_tiled.h b/kernels/attn_tiled.h
+index 88c95ad..0354ea3 100644
+--- a/kernels/attn_tiled.h
++++ b/kernels/attn_tiled.h
+@@ -114,7 +114,7 @@ inline void attn_tiled_body(
+             if (ENCODER) {
+                 live[j] = row_live && t < t_end && q_abs < (ulong)Tkv
+                     && (window == 0u
+-                        || ((ulong)t + window >= q_abs && (ulong)t <= q_abs + window));
++                        || ((ulong)t + window >= q_abs && (ulong)t <= q_abs));
+             } else {
+                 live[j] = row_live && t < t_end && kv_off + (ulong)t <= q_abs;
+             }

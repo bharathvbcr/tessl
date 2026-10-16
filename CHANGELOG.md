@@ -8,6 +8,44 @@ All notable changes to `tessl` are recorded here. The format follows
 
 ### Added
 
+- **C ABI 12** (additive; `TESSL_ABI_VERSION` 11 → 12):
+  `tessl_runtime_set_async_encode`, and `tessl_qwen35_read_parameter_host` /
+  `tessl_qwen35_write_parameter_host` for one parameter-table entry. A per-entry
+  write is refused when the entry carries AdamW aux state (an `F32Master` or
+  `Bf16Kahan` buffer), which the next optimizer step would copy back over it;
+  the message points to `TESSL_WRITE_ADAMW_AUX` or to writing before the
+  optimizer exists. `TESSL_WRITE_PARAMS` is unchanged. `tessl_torch` turns async
+  encode on, finishes torch's queue before handing buffers over, and gains
+  `read_parameter` / `write_parameter`. `bench_capi` and
+  `bench/capi_torch_overhead.py` measure the waits (2B `train_step` 1660 →
+  1507 ms, `bench/results/capi_*`).
+- **Untied Qwen3.5 LM head** (`tie_word_embeddings: false`): `lm_head.weight` is
+  its own parameter, read by the same loader as the embedding. A tied config
+  whose checkpoint carries `lm_head.weight`, disagreeing root and `text_config`
+  flags, and a config silent on the key are refused.
+- **Checkpoint reader bounds.** `SafeTensors::open_with_limit`,
+  `CheckpointView::open_with_limit` and `npy::read_npy_with_limit` refuse,
+  before allocating, a declared payload above the caller's limit (default:
+  physical memory); each read's own allocation (an f32 widening of a 16-bit
+  tensor) is budgeted too. `CheckpointView::tensor_info` gives a tensor's dtype
+  and shape across shards.
+- **Fixture manifests.** `tests/fixtures/qwen35/`, `qwen35_train/`,
+  `qwen35_train_grouped/` and `qwen35_train_untied/` carry `MANIFEST.json`
+  (torch / transformers / numpy versions, generator and commit, input source,
+  per-file `published`); `tests/fixture_manifests.rs` fails for a fixture
+  directory without one. The Qwen3.5 gate kernel has a golden captured from
+  transformers' own module (`qwen35_gates_*`).
+- **Bench lanes.** `bench_qwen35_layers --attn-tiles`, `bench_qwen35_train
+  --op=NAME` (validated before the runtime; METRIC names
+  `op_KEY_{f32|bf16}_ms_tT`), `bench_embedgemma2 --attn-kernel=rows|tiled`
+  (shapes validated up front, tiled checked against rows before timing);
+  each prints `METRIC_INCOMPLETE` if it fails after starting.
+  `bench/results/attn_tiled_rebench_2026-10-15_m5pro.json`: no regression in
+  any `attn_tiled.h` user.
+- `src/bin/probe_soak.rs` (the leak-soak driver behind the GPU re-run record in
+  `docs/verification.md`), and a fork-safe gate on every self-hosted CI job
+  (`tests/ci_workflow_gates.rs`).
+
 - **Per-entry host reads and writes of the Qwen3.5 parameter table**
   (`Qwen35Model::{read_parameter_host, write_parameter_host,
   read_gradient_host, read_adamw_moment_host, write_adamw_moment_host}`).
@@ -470,6 +508,27 @@ All notable changes to `tessl` are recorded here. The format follows
 
 ### Changed (breaking)
 
+- **ICB stub scaffold removed**: `IcbReplayStub`, `IcbStubPhase`,
+  `ArgTableSlotPlan`, `ArgTableSlot`, `IcbCommandTypeHint`,
+  `PingPongCbReplay::{icb_stub, icb_stub_mut}`, `from_commands_ex`,
+  `mini_copy_chain_ex`, ICB barrier elision and the parked freeze / range-batch
+  / coarse ICB flags with their getters. `CbReplayError::NotWired`,
+  `survey_cb_replay_api_gaps`, `decode_icb_wired()` and the replay counters are
+  unchanged. `PrefillAttnKernel` / `prefill_attn_kernel` are gone:
+  `attn_prefill_by_length` calls the tiled kernel directly (same signature).
+- **Environment names removed**: `METAL_NATIVE_HAZARD_BARRIERS` no longer
+  decides anything (set `TESSL_HAZARD_BARRIERS` or
+  `METAL_RUNTIME_HAZARD_BARRIERS`), and `TESSL_COARSE_BARRIERS`,
+  `GEMMA_METAL_COARSE_BARRIERS` and `METAL_RUNTIME_COARSE_BARRIERS` went with
+  the parked coarse-barrier flag, as did the freeze and range-batch flags. An
+  `rg -uu` over the consuming repositories found no setter. gemma-metal follows
+  in the same change.
+- **npy header framing is enforced**: space padding to a 16-byte data start
+  (NumPy writes 64; pre-1.9 NumPy wrote 16), a trailing newline and a closed
+  dict, ASCII before v3. A `SafeTensors` read after the file was rewritten in
+  place since `open` is refused ("file changed since it was opened"); a
+  metadata-only change refuses too.
+
 - **`GpuRuntime::shared_event()` returns a handoff event, not the lifetime
   event.** The allocator reset, const-arena rewind, pool recycling and the
   drop wait now read a crate-private event only tessl's queue signals;
@@ -689,6 +748,18 @@ All notable changes to `tessl` are recorded here. The format follows
   for encoded work and fail with "runtime busy" inside an encoder closure.
 
 ### Changed
+
+- The `tinyalpha` GDN fixture is renamed `..._alpha_preclamp` and says it stores
+  the pre-clamp alpha; `GateClamp::PUBLISHED` is documented as a deviation from
+  transformers / FLA. `scripts/gen_qwen35_fixtures.py` reads stored inputs
+  instead of seeded draws (goldens moved by at most 2.6e-7).
+- An absent `attn_output_gate` or `mamba_ssm_dtype` takes the implemented value
+  (gated, float32); a different value is refused.
+- The safetensors shape-overflow check gives the same verdict in any dimension
+  order (`plain::checked_numel`).
+- `scripts/ci_local.sh` runs the kernel-emulator job's steps and names every
+  step it could not run (`ci:local OK WITH SKIPS (not run: ...)`); the emulator
+  stops a case that makes no progress for `MSL_EMU_STALL_S` seconds.
 
 - **GDN training reads q/k/v where the model keeps them.**
   `gdn_train_forward_windowed` / `gdn_train_backward_windowed` take `(ld, off)`
@@ -1284,6 +1355,10 @@ All notable changes to `tessl` are recorded here. The format follows
   PyTorch from that data.
 
 ### Fixed
+
+- The emulator's `--fast-math` bound for `encoder_attn_rows` is the on-device
+  bound (`2e-5·max|want|`); hosted run 38739221987 failed on the old 2e-6.
+- The CI workflow gate is an allowlist, and every self-hosted job carries it.
 
 - **ICB replay.** Tape replay emits exactly the captured barrier markers, and
   capture now records the ordering a command-buffer boundary gave live

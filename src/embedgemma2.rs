@@ -46,9 +46,9 @@
 //! projection as the checkpoint stores it, bf16, on the device (no f32 copy),
 //! and runs every GEMM with bf16 operands and f32 accumulation. The inputs of
 //! the GEMMs are rounded to bf16 where they are produced when a kernel can
-//! write bf16 (the norms, the GELU gates) and by a cast pass where one cannot
-//! (the attention output, the residual stream into the per-layer-input gate,
-//! the embeddings once per forward, the pooled vector); the residual stream,
+//! write bf16 (the norms, the attention, the feed-forward residual add, the
+//! GELU gates) and by a cast pass where one cannot (the embeddings once per
+//! forward, the pooled vector); the residual stream,
 //! the norms, the attention, the pooling and the outputs of every GEMM stay f32.
 //! The embedding table is bf16 under both modes, so it does not change. No f32
 //! GEMM runs, so the runtime's relaxed-f32 switch does not matter and `encode`
@@ -74,12 +74,19 @@
 //!
 //! New for this model: [`encoder_attn`] (`kernels/encoder_attn.metal`: the
 //! TensorOps tiled kernel of `kernels/attn_tiled.h` (head dims 32 to 512; bf16 operand tiles at 64, 256 and 512),
-//! or one simdgroup per query row), [`segment_mean_rows`] and
-//! [`l2_normalize_rows`] (`kernels/embed_pool.metal`). The rest are tessl's:
-//! GEMMs, exact f32 or bf16 (NN, and NT for the per-layer-input projection),
-//! `nn::rms_norm_f32` (`nn::rms_norm_bf16` into a bf16 GEMM's input),
-//! `nn::rms_norm_residual_add_f32` (the post-norms and the layer scalar),
-//! `nn::scale_f32_inplace`, `qwen35::embed_rows_scaled` (the
+//! or one simdgroup per query row; [`encoder_attn_bf16_out`] stores bf16),
+//! [`segment_mean_rows`] and [`l2_normalize_rows`] (`kernels/embed_pool.metal`),
+//! and the fused row passes of `kernels/embedgemma2_text.metal`
+//! ([`resid_add_norm_f32`] and [`resid_add_norm_bf16`]: a post-norm residual
+//! add with the layer scalar and the norm after it, in one launch;
+//! [`resid_add_bf16_copy`]: the add and its rounded bf16 copy;
+//! [`scale_rms_norm_inplace`]: the per-layer inputs' scale and norm), each the
+//! composition of the tessl kernels it replaced, bit for bit. The rest are
+//! tessl's: GEMMs, exact f32 or bf16 (NN, and NT for the per-layer-input
+//! projection), `nn::rms_norm_f32` (`nn::rms_norm_bf16` into a bf16 GEMM's
+//! input: layer 0's input norm, the only one that stands alone),
+//! `nn::rms_norm_residual_add_f32` (the exact-f32 feed-forward add),
+//! `qwen35::embed_rows_scaled` (the
 //! gather and the `sqrt(hidden)` scale), `qwen35::gated_act` (GELU-tanh over
 //! column windows), `qwen35::attn_qk_norm_rope_columns` (`* w` norms,
 //! full-width RoPE, and the weightless V norm) and `qwen35_bwd::copy_cols`
@@ -1405,14 +1412,15 @@ struct Acts {
 }
 
 /// What [`GemmOperands::Bf16`] adds to [`Acts`]: the bf16 form of each GEMM
-/// input that no kernel writes in bf16 itself (a norm and the GELU gate do,
-/// into `x` and `wide`/`ple_mid`; the attention output, the residual stream,
-/// the embeddings and the pooled vector are cast). Persistent and unzeroed
-/// like the rest, so a GEMM never allocates its own rounded copy of an operand.
+/// input that no kernel writes in bf16 itself (the fused row passes, the
+/// attention and the GELU gate do, into `x`, `wide` and `ple_mid`; only the
+/// embeddings and the pooled vector are cast). Persistent and unzeroed like the
+/// rest, so a GEMM never allocates its own rounded copy of an operand.
 struct Bf16Acts {
     /// `[rows, hidden]`: the normed input of the `q|k|v` and `gate|up` GEMMs
-    /// (the norms write bf16 into it), then the rounded residual stream that
-    /// feeds the per-layer-input gate once those have read it.
+    /// (the fused residual-add-and-norm passes write bf16 into it), then the
+    /// rounded residual stream that feeds the per-layer-input gate (the
+    /// feed-forward add writes it) once those have read it.
     x: Tensor,
     /// `[rows, max(q_heads * head_dim, intermediate)]`: the rounded attention
     /// output, then, once the output projection has read it, the MLP's

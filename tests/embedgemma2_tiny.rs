@@ -850,3 +850,183 @@ at_both_precisions! {
     rejected_encode_leaves_the_async_model_usable, bf16_rejected_encode_leaves_the_async_model_usable
         => rejected_encode_leaves_the_async_model_usable_at;
 }
+
+/// The tiny config cut to its first `layers` layers (1 to 3): the layer types
+/// and per-layer overrides that name layers past it are dropped.
+fn config_with_layers(layers: usize) -> EmbedGemma2Config {
+    let types = ["full_attention", "sliding_attention", "sliding_attention"];
+    let list = types[..layers]
+        .iter()
+        .map(|t| format!("\"{t}\""))
+        .collect::<Vec<_>>()
+        .join(",");
+    let overrides = if layers == 3 {
+        "{\"00\":{\"head_dim\":512},\"02\":{\"num_key_value_heads\":2}}"
+    } else {
+        "{\"00\":{\"head_dim\":512}}"
+    };
+    let text = CONFIG
+        .replace("\"num_hidden_layers\":3", &format!("\"num_hidden_layers\":{layers}"))
+        .replace(
+            "\"layer_types\":[\"full_attention\",\"sliding_attention\",\"sliding_attention\"]",
+            &format!("\"layer_types\":[{list}]"),
+        )
+        .replace(
+            "\"per_layer_config\":{\"00\":{\"head_dim\":512},\"02\":{\"num_key_value_heads\":2}}",
+            &format!("\"per_layer_config\":{overrides}"),
+        );
+    assert!(
+        text.contains(&list) && text.contains(overrides),
+        "test bug: config edit"
+    );
+    EmbedGemma2Config::from_config_json(&text).unwrap()
+}
+
+/// Whether a kernel belongs to a GEMM (its matrix kernel, the zero fill the
+/// exact-f32 lane starts from, the split-K reduction) rather than to the
+/// row passes between the GEMMs this test counts.
+fn is_gemm_kernel(name: &str) -> bool {
+    name.starts_with("matmul2d_") || name == "zero_f32" || name == "reduce_partitions_f32"
+}
+
+/// What one single-forward `encode` of a 12-token sequence dispatched on the
+/// tiny model cut to `layers` layers, as `(every kernel, every kernel outside
+/// the GEMMs)` with the per-kernel counts of the latter. Run inside a traced
+/// child: it reads the kernel trace.
+fn encode_kernels(operands: GemmOperands, layers: usize) -> (u64, std::collections::BTreeMap<String, u64>) {
+    use tessl::runtime::{traced_kernel_count, traced_kernels};
+    let cfg = config_with_layers(layers);
+    let w = weights_for(&cfg, 41, operands);
+    let st = open("dispatch_count", safetensors_bytes(&w, &[]));
+    let ids: Vec<u32> = (0..12).map(|i| (i * 5 + 1) % cfg.vocab).collect();
+    with_gpu(|rt| {
+        let model = EmbedGemma2Model::load_with(rt, &st, PREFIX, cfg.clone(), operands).unwrap();
+        let _ = model.encode(&[&ids], None, false).unwrap(); // warm the pipelines
+        let names = traced_kernels();
+        let before: Vec<u64> = names.iter().map(|n| traced_kernel_count(n)).collect();
+        let (out, t) = traced(|| model.encode(&[&ids], None, false).unwrap());
+        assert_eq!(out.forwards, 1, "test bug: {} forwards", out.forwards);
+        // Kernels first requested by the second encode are not in `names`.
+        assert_eq!(traced_kernels(), names, "test bug: the warm-up missed a kernel");
+        let counts = names
+            .iter()
+            .zip(before)
+            .map(|(n, b)| (n.clone(), traced_kernel_count(n) - b))
+            .filter(|(n, c)| *c > 0 && !is_gemm_kernel(n))
+            .collect();
+        (t.dispatches, counts)
+    })
+}
+
+/// How many dispatches a forward makes, per layer, pinned. The six GEMMs of a
+/// layer (q|k|v, o, gate|up, down, per-layer gate and output) are launches of
+/// their own (the exact-f32 lane starts each from a zero fill, and splits
+/// some across K at small M: `is_gemm_kernel`); between them a layer runs
+/// seven kernels: the q/k-norm-RoPE-and-store, the attention, the two GELU
+/// gates and three row passes (the attention's residual add with the
+/// pre-feed-forward norm, the feed-forward add, the per-layer block's add with
+/// the next layer's norm). Before the fusion it was nine at `ExactF32` (two
+/// separate norms and three adds) and eleven at `Bf16` (and a cast of the
+/// attention output and of the residual stream). A run of per-layer inputs is
+/// one scale-and-norm launch (it was two). The rest is per forward: the gather
+/// and its copy, layer 0's norm, the pooling, the normalize, and at `Bf16`
+/// the casts of the embeddings and the pooled vectors.
+///
+/// A count that creeps back up (an unfused pass, a cast) fails here with the
+/// kernel that does it.
+fn a_layer_runs_the_pinned_kernels_at(operands: GemmOperands) {
+    let bf16 = operands == GemmOperands::Bf16;
+    let tag = if bf16 { "bf16" } else { "f32" };
+    let name = if bf16 {
+        "bf16_a_layer_runs_the_pinned_kernels"
+    } else {
+        "a_layer_runs_the_pinned_kernels"
+    };
+    let _ = common::in_traced_child(name, || {
+        let runs: Vec<_> = (1..=3).map(|l| encode_kernels(operands, l)).collect();
+        for (l, (total, counts)) in runs.iter().enumerate() {
+            eprintln!(
+                "{operands:?}, {} layers: {total} dispatches; outside the GEMMs {counts:?}",
+                l + 1
+            );
+        }
+        let non_gemm = |l: usize| runs[l].1.values().sum::<u64>();
+        // The second and third layers each add exactly seven kernels outside the GEMMs.
+        assert_eq!(non_gemm(1) - non_gemm(0), 7, "{tag}: the second layer");
+        assert_eq!(non_gemm(2) - non_gemm(1), 7, "{tag}: the third layer");
+        // And exactly these, by name: two residual-add-and-norm passes, and
+        // one of the feed-forward add (a plain add at f32, an add with the
+        // rounded copy at bf16); the first layer's input norm is the only
+        // standalone norm.
+        let per_layer = |n: &str| runs[2].1.get(n).copied().unwrap_or(0) - runs[1].1.get(n).copied().unwrap_or(0);
+        let norm_pass = if bf16 {
+            "eg2t_resid_norm_bf16"
+        } else {
+            "eg2t_resid_norm_f32"
+        };
+        let ffn_add = if bf16 {
+            "eg2t_resid_add_bf16_copy"
+        } else {
+            "rms_norm_residual_add_f32"
+        };
+        let glu = if bf16 {
+            "qwen35_gelu_tanh_glu_bf16"
+        } else {
+            "qwen35_gelu_tanh_glu_f32"
+        };
+        let qkr = if bf16 {
+            "qwen35_attn_qk_norm_rope_bf16"
+        } else {
+            "qwen35_attn_qk_norm_rope"
+        };
+        // Layer 3 is sliding at head dim 256: its attention kernel.
+        let attn = if bf16 {
+            "encoder_attn_tiled_bf16o_h256_q32_k64_sg4"
+        } else {
+            "encoder_attn_tiled_h256_q32_k32_sg4"
+        };
+        for (kernel, want) in [(norm_pass, 2), (ffn_add, 1), (glu, 2), (qkr, 1), (attn, 1)] {
+            assert_eq!(per_layer(kernel), want, "{tag}: {kernel} per layer");
+        }
+        // The kernels the fusion removed from the layer are gone from it: layer
+        // 0's norm is the one `rms_norm_f32`/`rms_norm_bf16`, the last layer's
+        // add ends in the final norm (`eg2t_resid_norm_f32`), no cast of the
+        // attention output or the residual stream, and no separate scale.
+        let all = &runs[2].1;
+        let count = |n: &str| all.get(n).copied().unwrap_or(0);
+        let first_norm = if bf16 { "rms_norm_bf16" } else { "rms_norm_f32" };
+        assert_eq!(count(first_norm), 1, "{tag}: only layer 0's input norm stands alone");
+        assert_eq!(
+            count("scale_f32_inplace"),
+            0,
+            "{tag}: the per-layer scale rides the norm"
+        );
+        assert_eq!(
+            count("eg2t_scale_rms_norm_f32"),
+            1,
+            "{tag}: one run of per-layer inputs"
+        );
+        assert_eq!(
+            count("cast_f32_to_bf16"),
+            if bf16 { 2 } else { 0 },
+            "{tag}: casts (the embeddings and the pooled vectors at bf16, none at f32)"
+        );
+        if bf16 {
+            // Every layer's residual add but the last lands in the bf16 norm; the last in the final f32 one.
+            assert_eq!(count("eg2t_resid_norm_f32"), 1, "{tag}: the final norm");
+            assert_eq!(
+                count("eg2t_resid_norm_bf16"),
+                5,
+                "{tag}: 2 per layer, less the final one"
+            );
+            // One dispatch per kernel outside the GEMMs: 13 a layer in all.
+            assert_eq!(runs[2].0 - runs[1].0, 13, "{tag}: bf16 dispatches per layer");
+        } else {
+            assert_eq!(count("eg2t_resid_norm_f32"), 6, "{tag}: 2 per layer");
+        }
+    });
+}
+
+at_both_precisions! {
+    a_layer_runs_the_pinned_kernels, bf16_a_layer_runs_the_pinned_kernels => a_layer_runs_the_pinned_kernels_at;
+}

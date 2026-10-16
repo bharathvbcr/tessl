@@ -24,6 +24,13 @@
 //! * a video, an image, a clip, caller-built ids and two texts in one call each
 //!   equal themselves alone bit for bit when the text side packs one forward,
 //!   and the call waits for the GPU once (3 for the by-hand composition);
+//! * `add_timestamps` is read from the config, and `MmItem::TimestampedVideo`
+//!   lays the ids out as the processor's string does: the ids are the
+//!   tokenizer's `encode_raw` of `"mm:ss <boi><video>..<eoi> mm:ss ..."`
+//!   (a tiny tokenizer with merges, so a space gluing to a digit is in play),
+//!   and the item equals the by-hand composition and the `Media` item with
+//!   those ids bit for bit, in one wait; the real processor's is
+//!   `embedgemma2_video_model`;
 //! * a refused call (no frames, frames of different sizes, a placeholder count
 //!   that is not the frames' soft tokens, more frames than the tower's batch,
 //!   a sequence past the limit) allocates nothing and waits for nothing, and
@@ -34,13 +41,18 @@ mod common;
 use std::sync::Arc;
 
 use common::embedgemma2::{open, PREFIX};
-use common::embedgemma2_mm::{checkpoint_bytes, clip, config_json, config_json_without_ids, configs, Configs, Image};
+use common::embedgemma2_mm::{
+    checkpoint_bytes, clip, config_json, config_json_without_ids, configs, timestamp_tokenizer_json, Configs, Image,
+};
 use common::{with_gpu, SplitMix};
-use tessl::embedgemma2::{EmbedGemma2Model, MmSequence};
-use tessl::embedgemma2_audio::AudioInput;
+use tessl::embedgemma2::{EmbedGemma2Model, MmSequence, MAX_BATCH, MAX_TIMESTAMP_SECONDS};
+use tessl::embedgemma2_audio::{AudioInput, MAX_CALL_CLIPS, MAX_CALL_FRAMES, MAX_CLIPS, MAX_FRAMES_PER_FORWARD};
 use tessl::embedgemma2_mm::{EmbedGemma2Multimodal, MmItem};
-use tessl::embedgemma2_pre::PreConfig;
-use tessl::embedgemma2_vision::{EmbedGemma2VisionModel, ImageInput, MAX_IMAGES};
+use tessl::embedgemma2_pre::{timestamp_label, PreConfig, VideoConfig};
+use tessl::embedgemma2_tok::Tokenizer;
+use tessl::embedgemma2_vision::{
+    EmbedGemma2VisionModel, ImageInput, MAX_BATCH_PATCHES, MAX_CALL_IMAGES, MAX_CALL_PATCHES, MAX_IMAGES,
+};
 use tessl::gemm::GemmOperands;
 use tessl::infer_trace;
 use tessl::safetensors::SafeTensors;
@@ -241,17 +253,164 @@ fn processor_config(add_timestamps: &str) -> String {
     )
 }
 
-/// `add_timestamps` puts `mm:ss` text in the ids, which takes the tokenizer; the
-/// layout `video_sequence` builds is the one without, so a config asking for
-/// timestamps is refused by name instead of read as if it did not.
+/// `add_timestamps` is read, not refused: it changes only the sequence layout
+/// (the `mm:ss` text in the ids, built with the tokenizer), never the frames'
+/// preprocessing, and a value that is not a boolean is still an error.
 #[test]
-fn a_config_with_timestamps_on_is_refused_by_name() {
-    PreConfig::from_json(&processor_config("false")).expect("the snapshot's own setting");
-    let e = PreConfig::from_json(&processor_config("true")).expect_err("timestamps on were read as off");
-    assert!(
-        e.contains("video_processor.add_timestamps") && e.contains("not supported"),
-        "{e}"
+fn a_config_with_timestamps_on_is_read() {
+    let off = PreConfig::from_json(&processor_config("false")).expect("the snapshot's own setting");
+    assert!(!off.video.add_timestamps);
+    let on = PreConfig::from_json(&processor_config("true")).expect("timestamps on");
+    assert!(on.video.add_timestamps, "timestamps on were read as off");
+    // Nothing else moves with the flag.
+    assert_eq!(
+        VideoConfig {
+            add_timestamps: false,
+            ..on.video.clone()
+        },
+        off.video
     );
+    assert_eq!((&on.image, &on.audio), (&off.image, &off.audio));
+    // Absent is the class default, off.
+    let absent = processor_config("false").replace(r#""add_timestamps": false, "#, "");
+    assert!(!absent.contains("add_timestamps"), "test bug: the key stayed");
+    assert!(!PreConfig::from_json(&absent).unwrap().video.add_timestamps);
+    let e = PreConfig::from_json(&processor_config("1")).expect_err("a number was read as a boolean");
+    assert!(e.contains("add_timestamps") && e.contains("boolean"), "{e}");
+}
+
+/// The processor's string for a video under `add_timestamps = true`
+/// (`replace_video_token`), written as the processor writes it.
+fn processor_text(tok: &Tokenizer, stamps: &[f64], soft: &[usize]) -> String {
+    let (boi, video, eoi) = (
+        tok.id_to_token(BOI).unwrap(),
+        tok.id_to_token(VIDEO).unwrap(),
+        tok.id_to_token(EOI).unwrap(),
+    );
+    stamps
+        .iter()
+        .zip(soft)
+        .map(|(&t, &n)| format!("{} {boi}{}{eoi}", timestamp_label(t), video.repeat(n)))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// The timestamped layout is the tokenizer's ids of the processor's whole
+/// string, `<bos>`/`<eos>` from its post-processor, without ever building that
+/// string (the labels' stretches are tokenized and the blocks spliced from the
+/// config's ids). The tokenizer has merges that make the spaces matter (`0 0`,
+/// then a space glued to a following `0`), the stamps cross every `mm:ss`
+/// carry (59.9, 60, 3725.5, three-digit minutes), and the ids are also written
+/// out for one case so the oracle is not only itself.
+#[test]
+fn timestamped_video_sequence_is_the_tokenizers_ids_of_the_processors_text() {
+    let cfg = configs().text;
+    let tok = Tokenizer::from_json(&timestamp_tokenizer_json()).unwrap();
+    let cases: [(&[f64], &[usize]); 5] = [
+        (&[0.0], &[1]),
+        (&[0.0, 1.0, 2.0], &[2, 2, 2]),
+        (&[0.5, 1.5], &[3, 1]),
+        (
+            &[0.0, 59.9, 60.0, 125.5, 300.0, 600.0, 3725.5, 6000.0, 360_000.0],
+            &[1; 9],
+        ),
+        (&[3.0; 32], &[140; 32]),
+    ];
+    for (stamps, soft) in cases {
+        let got = cfg.video_sequence_with_timestamps(&tok, stamps, soft).unwrap();
+        let want = tok.encode_raw(&processor_text(&tok, stamps, soft), true);
+        assert_eq!(got, want, "stamps {stamps:?}");
+        // The video's block ids are the plain layout's, in the same places.
+        let blocks = |ids: &[u32]| ids.iter().filter(|&&t| matches!(t, BOI | VIDEO | EOI)).count();
+        assert_eq!(
+            blocks(&got),
+            blocks(&cfg.video_sequence(soft).unwrap()),
+            "stamps {stamps:?}"
+        );
+        assert_eq!((got[0], *got.last().unwrap()), (BOS, EOS));
+    }
+    // Written out: "00:00 " is `00`, `:`, `00`, `▁`; " 00:01 " is `▁`, `00`, `:`,
+    // `0`, `1`, `▁` (the merge `0 0` runs first, so the space stays alone).
+    assert_eq!(
+        cfg.video_sequence_with_timestamps(&tok, &[0.0, 1.0], &[1, 1]).unwrap(),
+        [BOS, 16, 14, 16, 15, BOI, VIDEO, EOI, 15, 16, 14, 4, 5, 15, BOI, VIDEO, EOI, EOS]
+    );
+    // " 05:00 ": the space glues to the `0` (`▁0`), then `5`, `:`, `00`, `▁`.
+    assert_eq!(
+        cfg.video_sequence_with_timestamps(&tok, &[0.0, 300.0], &[1, 1])
+            .unwrap()[8..],
+        [17, 9, 14, 16, 15, BOI, VIDEO, EOI, EOS]
+    );
+    // The labels are the only difference from the layout without them.
+    let plain = cfg.video_sequence(&[2, 2]).unwrap();
+    let stamped = cfg.video_sequence_with_timestamps(&tok, &[0.0, 1.0], &[2, 2]).unwrap();
+    assert_ne!(plain, stamped);
+    let without_labels: Vec<u32> = stamped
+        .iter()
+        .copied()
+        .filter(|t| matches!(*t, BOS | BOI | VIDEO | EOI | EOS))
+        .collect();
+    assert_eq!(without_labels, plain);
+}
+
+#[test]
+fn timestamped_video_sequences_are_refused_by_name() {
+    let cfg = configs().text;
+    let tok = Tokenizer::from_json(&timestamp_tokenizer_json()).unwrap();
+    for (what, stamps, soft, want) in [
+        (
+            "fewer timestamps than frames",
+            &[0.0][..],
+            &[2usize, 2][..],
+            "1 timestamps for 2 frames",
+        ),
+        (
+            "more timestamps than frames",
+            &[0.0, 1.0][..],
+            &[2][..],
+            "2 timestamps for 1 frames",
+        ),
+        ("a NaN", &[0.0, f64::NAN][..], &[2, 2][..], "frame 1's timestamp NaN"),
+        ("an infinity", &[f64::INFINITY][..], &[2][..], "frame 0's timestamp inf"),
+        (
+            "a negative time",
+            &[0.0, 1.0, -0.5][..],
+            &[2, 2, 2][..],
+            "frame 2's timestamp -0.5",
+        ),
+        (
+            "a time past the limit",
+            &[MAX_TIMESTAMP_SECONDS * 2.0][..],
+            &[2][..],
+            "is not a time in 0..=",
+        ),
+        ("no frames", &[][..], &[][..], "the video has no frames"),
+        (
+            "a frame without soft tokens",
+            &[0.0, 1.0][..],
+            &[2, 0][..],
+            "frame 1 has no soft tokens",
+        ),
+    ] {
+        let e = cfg
+            .video_sequence_with_timestamps(&tok, stamps, soft)
+            .err()
+            .unwrap_or_else(|| panic!("{what}: accepted"));
+        assert!(e.contains(want), "{what}: {e}");
+        assert!(
+            e.starts_with("video_sequence_with_timestamps"),
+            "{what}: names its entry: {e}"
+        );
+    }
+    // The largest time allowed is labelled.
+    cfg.video_sequence_with_timestamps(&tok, &[MAX_TIMESTAMP_SECONDS], &[1])
+        .unwrap();
+    // A config without the ids names what is missing.
+    let bare = tessl::embedgemma2::EmbedGemma2Config::from_config_json(&config_json_without_ids()).unwrap();
+    let e = bare
+        .video_sequence_with_timestamps(&tok, &[0.0], &[2])
+        .expect_err("accepted");
+    assert!(e.contains("boi_token_id") && e.contains("video_token_id"), "{e}");
 }
 
 // ---------------------------------------------------------------------------
@@ -316,6 +475,188 @@ fn a_video_item_equals_the_by_hand_composition() {
             assert_eq!(bits(&pre.embeddings), bits(&full.embeddings), "{operands:?}: prefix");
         });
     }
+}
+
+/// `MmItem::TimestampedVideo` builds the ids of the processor's string with the
+/// tokenizer, and the item is then the by-hand composition (ids by the string
+/// oracle, the tower's rows on the host) and the `Media` item with those ids,
+/// bit for bit, in one wait. The labels are observable: the plain video, other
+/// times and another frame order each give another embedding.
+#[test]
+fn a_timestamped_video_item_equals_the_by_hand_composition() {
+    let tok = Tokenizer::from_json(&timestamp_tokenizer_json()).unwrap();
+    for operands in MODES {
+        let f = fixture("video_stamped", operands);
+        let vid = frames(&f.c, 4, (6, 4), 8, 500);
+        let fr = inputs(&vid);
+        let stamps = [0.0, 1.0, 2.5, 61.0];
+        with_gpu(|rt| {
+            let m = f.facade(rt, operands);
+            let by_hand = ByHand::new(&f, rt, operands);
+            let counts = by_hand.vision.check_images(&fr).unwrap();
+            assert_eq!(counts, [6; 4], "test bug: 6x4 patches pooled 2x2");
+            let ids = tok.encode_raw(&processor_text(&tok, &stamps, &counts), true);
+            assert_eq!(
+                m.text()
+                    .config()
+                    .video_sequence_with_timestamps(&tok, &stamps, &counts)
+                    .unwrap(),
+                ids
+            );
+            let want = by_hand.embed(&ids, &[], &fr);
+
+            let item = MmItem::TimestampedVideo {
+                frames: &fr,
+                timestamps: &stamps,
+                tokenizer: &tok,
+            };
+            let (got, t) = traced(|| m.encode(&[item], None).unwrap());
+            assert_eq!(bits(&got.embeddings), bits(&want), "{operands:?}");
+            assert_eq!(
+                t.sync_waits, 1,
+                "{operands:?}: the tower and the text encoder wait once"
+            );
+
+            // The same ids and frames through a Media item.
+            let videos: [&[ImageInput<'_>]; 1] = [&fr];
+            let media = m
+                .encode(
+                    &[MmItem::Media {
+                        ids: &ids,
+                        images: &[],
+                        audio: &[],
+                        videos: &videos,
+                    }],
+                    None,
+                )
+                .unwrap();
+            assert_eq!(bits(&media.embeddings), bits(&got.embeddings), "{operands:?}: Media");
+
+            // The labels, their values and the frame order are observable.
+            let plain = m.encode(&[MmItem::Video(&fr)], None).unwrap();
+            assert_ne!(
+                bits(&plain.embeddings),
+                bits(&got.embeddings),
+                "{operands:?}: no labels"
+            );
+            let later = [0.0, 1.0, 2.5, 62.0];
+            let other = m
+                .encode(
+                    &[MmItem::TimestampedVideo {
+                        frames: &fr,
+                        timestamps: &later,
+                        tokenizer: &tok,
+                    }],
+                    None,
+                )
+                .unwrap();
+            assert_ne!(
+                bits(&other.embeddings),
+                bits(&got.embeddings),
+                "{operands:?}: other times"
+            );
+
+            // Beside other items, and alone, with the Matryoshka prefix.
+            let text = [BOS, 5, 6, 7, EOS];
+            let mixed = m
+                .encode(&[MmItem::Text(&text), item, MmItem::Video(&fr)], None)
+                .unwrap();
+            let dim = mixed.embeddings.len() / 3;
+            assert!(
+                drift(&mixed.embeddings[dim..2 * dim], &got.embeddings) <= BATCH_ABS,
+                "{operands:?}: in a mixed call"
+            );
+            let pre = m.encode(&[item], Some(40)).unwrap();
+            assert_eq!(pre.embeddings.len(), 40);
+        });
+    }
+}
+
+/// A timestamped video that is wrong is refused before any GPU work, naming
+/// the item, and the facade works afterwards.
+#[test]
+fn timestamped_video_items_are_refused_before_any_gpu_work() {
+    let tok = Tokenizer::from_json(&timestamp_tokenizer_json()).unwrap();
+    let f = fixture("video_stamped_refuse", GemmOperands::ExactF32);
+    let good = frames(&f.c, 3, (6, 4), 8, 600);
+    let fg = inputs(&good);
+    let other_size = frames(&f.c, 1, (5, 4), 0, 605);
+    let mixed_sizes: Vec<ImageInput<'_>> = fg.iter().copied().chain(inputs(&other_size)).collect();
+    let no_frames: [ImageInput<'_>; 0] = [];
+    with_gpu(|rt| {
+        let mut m = f.facade(rt, GemmOperands::ExactF32);
+        let stamped = |stamps: &'static [f64]| MmItem::TimestampedVideo {
+            frames: &fg,
+            timestamps: stamps,
+            tokenizer: &tok,
+        };
+        let ok = [stamped(&[0.0, 1.0, 2.0])];
+        let want = m.encode(&ok, None).unwrap();
+        let cases: Vec<(&str, Vec<MmItem<'_>>, &str)> = vec![
+            (
+                "too few timestamps",
+                vec![stamped(&[0.0, 1.0])],
+                "2 timestamps for 3 frames",
+            ),
+            (
+                "too many timestamps",
+                vec![stamped(&[0.0, 1.0, 2.0, 3.0])],
+                "4 timestamps for 3 frames",
+            ),
+            (
+                "a NaN time",
+                vec![stamped(&[0.0, f64::NAN, 2.0])],
+                "frame 1's timestamp NaN",
+            ),
+            (
+                "a negative time",
+                vec![stamped(&[0.0, 1.0, -2.0])],
+                "frame 2's timestamp -2",
+            ),
+            (
+                "no frames",
+                vec![MmItem::TimestampedVideo {
+                    frames: &no_frames,
+                    timestamps: &[],
+                    tokenizer: &tok,
+                }],
+                "the video has no frames",
+            ),
+            (
+                "frames of different sizes",
+                vec![MmItem::TimestampedVideo {
+                    frames: &mixed_sizes,
+                    timestamps: &[0.0, 1.0, 2.0, 3.0],
+                    tokenizer: &tok,
+                }],
+                "frame 3 makes",
+            ),
+            ("a bad item after a good one", vec![ok[0], stamped(&[0.0])], "item 1"),
+        ];
+        for (what, items, want_msg) in cases {
+            let (res, t) = traced(|| m.encode(&items, None));
+            let e = res.err().unwrap_or_else(|| panic!("{what}: accepted"));
+            assert!(e.contains(want_msg), "{what}: {e:?} does not mention {want_msg:?}");
+            assert!(
+                e.starts_with("EmbedGemma2Multimodal::encode"),
+                "{what}: names its entry: {e}"
+            );
+            assert_eq!(
+                (t.cold_allocs, t.sync_waits),
+                (0, 0),
+                "{what}: did GPU work before refusing"
+            );
+        }
+        let again = m.encode(&ok, None).unwrap();
+        assert_eq!(bits(&again.embeddings), bits(&want.embeddings));
+        // The labels count toward the sequence limit: 3 blocks of 6 soft
+        // tokens plus markers and labels is more than 40 ids.
+        m.text_mut().set_max_tokens(40).unwrap();
+        let (res, t) = traced(|| m.encode(&ok, None));
+        let e = res.err().expect("accepted");
+        assert!(e.contains("the limit is"), "{e}");
+        assert_eq!((t.cold_allocs, t.sync_waits), (0, 0));
+    });
 }
 
 /// More frames than one tower forward holds: the soft rows sit in two output
@@ -556,7 +897,9 @@ fn video_items_are_refused_before_any_gpu_work() {
     let fg = inputs(&good);
     let mixed_sizes: Vec<ImageInput<'_>> = fg.iter().copied().chain(inputs(&other_size)).collect();
     let pd = f.c.vision.patch_dim() as usize;
-    let many: Vec<Image> = (0..MAX_IMAGES as u64 + 1).map(|k| Image::new(1, 1, 3, pd, k)).collect();
+    let many: Vec<Image> = (0..MAX_CALL_IMAGES as u64 + 1)
+        .map(|k| Image::new(1, 1, 3, pd, k))
+        .collect();
     let many_in = inputs(&many);
     let mut bad_pos = Image::new(2, 2, 0, pd, 7);
     bad_pos.position_ids[2] = 999;
@@ -592,9 +935,9 @@ fn video_items_are_refused_before_any_gpu_work() {
                 &different,
             ),
             (
-                "more frames than the tower's batch",
+                "more frames than a call holds",
                 vec![MmItem::Video(&many_in)],
-                "exceeds the batch limit",
+                "MAX_CALL_IMAGES",
             ),
             (
                 "a bad frame after good ones",
@@ -660,5 +1003,178 @@ fn video_items_are_refused_before_any_gpu_work() {
         let e = res.err().expect("accepted");
         assert!(e.contains("the limit is"), "{e}");
         assert_eq!((t.cold_allocs, t.sync_waits), (0, 0));
+    });
+}
+
+// ---------------------------------------------------------------------------
+// More pictures and clips than one tower forward holds.
+// ---------------------------------------------------------------------------
+
+const BOA: u32 = 42;
+const EOA: u32 = 43;
+const AUDIO: u32 = 61;
+
+/// 300 pictures and 300 clips (past the 256 of a tower forward) in 150 items of
+/// two images and two clips each, in one call, equal the same items in two
+/// calls of 75, bit for bit: both towers run as two forwards behind the call's
+/// one wait, their soft rows stay on the device, and the text encoder reads
+/// them where they were written.
+#[test]
+fn a_call_with_more_pictures_and_clips_than_a_forward_equals_smaller_calls() {
+    for operands in MODES {
+        let f = fixture("many_pictures", operands);
+        let pd = f.c.vision.patch_dim() as usize;
+        const ITEMS: usize = 150;
+        const _: () = assert!(2 * ITEMS > MAX_IMAGES && 2 * ITEMS > MAX_CLIPS && ITEMS <= MAX_BATCH);
+        // 2x2 patches pool to one soft token; 12 frames of audio to three.
+        let images: Vec<Image> = (0..2 * ITEMS)
+            .map(|k| Image::new(2, 2, 0, pd, 700 + k as u64))
+            .collect();
+        let clips: Vec<AudioInput> = (0..2 * ITEMS)
+            .map(|k| clip(&f.c.audio, 12, 900 + k as u64, |_| true))
+            .collect();
+        let imgs = inputs(&images);
+        with_gpu(|rt| {
+            let m = f.facade(rt, operands);
+            let (ti, ta) = (
+                m.vision().check_images(&imgs).unwrap(),
+                m.audio().check_clips(&clips).unwrap(),
+            );
+            assert!(
+                ti.iter().all(|&n| n == ti[0]) && ta.iter().all(|&n| n == ta[0]),
+                "test bug: counts"
+            );
+            assert_eq!(ti[0], 1, "test bug: one soft token an image");
+            // [bos, (boi, image, eoi) x 2, (boa, audio x n, eoa) x 2, eos]
+            let mut ids = vec![BOS];
+            ids.extend(std::iter::repeat_n([BOI, IMAGE, EOI], 2).flatten());
+            for _ in 0..2 {
+                ids.push(BOA);
+                ids.extend(std::iter::repeat_n(AUDIO, ta[0]));
+                ids.push(EOA);
+            }
+            ids.push(EOS);
+            let item = |k: usize| MmItem::Media {
+                ids: &ids,
+                images: &imgs[2 * k..2 * k + 2],
+                audio: &clips[2 * k..2 * k + 2],
+                videos: &[],
+            };
+            let items: Vec<MmItem<'_>> = (0..ITEMS).map(item).collect();
+            let (all, t) = traced(|| m.encode(&items, None).unwrap());
+            assert_eq!(t.sync_waits, 1, "{operands:?}: 300 pictures and 300 clips, one wait");
+            let dim = all.embeddings.len() / ITEMS;
+            let (a, b) = (
+                m.encode(&items[..ITEMS / 2], None).unwrap(),
+                m.encode(&items[ITEMS / 2..], None).unwrap(),
+            );
+            let halves = [a.embeddings, b.embeddings].concat();
+            assert_eq!(bits(&all.embeddings), bits(&halves), "{operands:?}: one call vs two");
+            // And a few of them alone: the towers' rows are the same bits, the
+            // text encoder's GEMMs tile 14 rows differently from 2100, which
+            // is the text side's batch bound, not the towers'.
+            for k in [0, 1, 127, 128, 149] {
+                let alone = m.encode(&[item(k)], None).unwrap();
+                let d = drift(&alone.embeddings, &all.embeddings[k * dim..(k + 1) * dim]);
+                assert!(d <= BATCH_ABS, "{operands:?}: item {k} alone: {d:.3e}");
+            }
+            // The towers really did split: the same pictures through the tower
+            // on its own are two forwards.
+            assert_eq!(m.vision().encode_images(&imgs, false).unwrap().forwards, 2);
+            assert_eq!(m.audio().encode_audio(&clips, false).unwrap().forwards, 2);
+        });
+    }
+}
+
+/// A video of 300 frames (past a forward's 256) equals the by-hand
+/// composition with the frames run as two tower calls of 150, bit for bit, in
+/// one wait.
+#[test]
+fn a_video_of_more_frames_than_a_forward_equals_two_tower_calls() {
+    for operands in MODES {
+        let f = fixture("many_frames", operands);
+        let vid = frames(&f.c, 300, (2, 2), 0, 1300);
+        let fr = inputs(&vid);
+        with_gpu(|rt| {
+            let m = f.facade(rt, operands);
+            let by_hand = ByHand::new(&f, rt, operands);
+            let counts = by_hand.vision.check_images(&fr).unwrap();
+            assert_eq!(counts, [1; 300], "test bug: one soft token a frame");
+            let ids = hand_ids(&counts);
+            let mut soft = Vec::new();
+            for half in fr.chunks(150) {
+                soft.extend(by_hand.vision.encode_images(half, false).unwrap().soft.concat());
+            }
+            let want = by_hand
+                .text
+                .encode_multimodal(&[MmSequence { ids: &ids, soft: &soft }], None, false)
+                .unwrap()
+                .embeddings;
+            let (got, t) = traced(|| m.encode(&[MmItem::Video(&fr)], None).unwrap());
+            assert_eq!(bits(&got.embeddings), bits(&want), "{operands:?}");
+            assert_eq!(t.sync_waits, 1, "{operands:?}: 300 frames, one wait");
+            assert_eq!(by_hand.vision.encode_images(&fr, false).unwrap().forwards, 2);
+        });
+    }
+}
+
+/// The per-call bounds are refused by name before any GPU work, at the
+/// facade: padded patches, frames and clips. The boundary itself is accepted
+/// by the towers' checks.
+#[test]
+fn calls_past_the_per_call_bounds_are_refused_before_any_gpu_work() {
+    let f = fixture("per_call_bounds", GemmOperands::ExactF32);
+    let pd = f.c.vision.patch_dim() as usize;
+    // One 128 x 128 image is 16,384 patches, a whole forward.
+    let big = Image::new(128, 128, 0, pd, 5);
+    let big_frames = vec![big.input(); MAX_CALL_PATCHES / MAX_BATCH_PATCHES + 1];
+    let long = clip(&f.c.audio, MAX_FRAMES_PER_FORWARD, 6, |_| true);
+    let long_items: Vec<MmItem<'_>> = (0..MAX_CALL_FRAMES / MAX_FRAMES_PER_FORWARD + 1)
+        .map(|_| MmItem::Audio(&long))
+        .collect();
+    let short: Vec<AudioInput> = (0..MAX_CALL_CLIPS + 1)
+        .map(|k| clip(&f.c.audio, 8, k as u64, |_| true))
+        .collect();
+    let one_clip_ids = [BOS, BOA, AUDIO, EOA, EOS];
+    with_gpu(|rt| {
+        let m = f.facade(rt, GemmOperands::ExactF32);
+        m.vision()
+            .check_images(&big_frames[..big_frames.len() - 1])
+            .expect("a call at the patch bound");
+        m.audio()
+            .check_clips(&vec![&long; MAX_CALL_FRAMES / MAX_FRAMES_PER_FORWARD])
+            .expect("a call at the frame bound");
+        let cases: Vec<(&str, Vec<MmItem<'_>>, &str)> = vec![
+            (
+                "frames past the patch bound",
+                vec![MmItem::Video(&big_frames)],
+                "MAX_CALL_PATCHES",
+            ),
+            ("clips past the frame bound", long_items, "MAX_CALL_FRAMES"),
+            (
+                "clips past the clip bound",
+                vec![MmItem::Media {
+                    ids: &one_clip_ids,
+                    images: &[],
+                    audio: &short,
+                    videos: &[],
+                }],
+                "MAX_CALL_CLIPS",
+            ),
+        ];
+        for (what, items, want_msg) in cases {
+            let (res, t) = traced(|| m.encode(&items, None));
+            let e = res.err().unwrap_or_else(|| panic!("{what}: accepted"));
+            assert!(e.contains(want_msg), "{what}: {e:?} does not mention {want_msg:?}");
+            assert!(
+                e.starts_with("EmbedGemma2Multimodal::encode"),
+                "{what}: names its entry: {e}"
+            );
+            assert_eq!(
+                (t.cold_allocs, t.sync_waits),
+                (0, 0),
+                "{what}: did GPU work before refusing"
+            );
+        }
     });
 }

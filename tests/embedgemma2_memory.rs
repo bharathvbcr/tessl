@@ -3,10 +3,19 @@
 //! bytes one call's activations take, and that consecutive calls reuse them.
 //! The real-checkpoint figures are `bench/results/embedgemma2_memory_m5pro.txt`.
 //!
-//! Bounds, fixed before the changes under test were written: a second
-//! `encode` of the same batch makes no fresh device allocation but its own
-//! small output buffer (`ForwardIo::out`); a third and a fourth make none
-//! beyond that; the bytes one call allocates equal the itemized set the
+//! Bounds: a second, third and fourth `encode` of the same batch make no fresh
+//! device allocation at all (`extra == 0`): since the pool recycles a dropped
+//! buffer at the next allocation when the GPU is idle (`recycle_if_idle`), the
+//! previous call's output buffer (`ForwardIo::out`, dropped after its wait) is
+//! reused too. It was one output above the first call's peak before that, a
+//! bound these tests used to allow (`extra <= out_bucket`), and with the
+//! recycle stubbed out every consecutive-call test here fails by exactly one
+//! output buffer. The outputs are made larger than 16 KiB, from which the
+//! device charges a buffer's own length, so that one output is visible in
+//! `current_allocated_bytes`. A call that starts beside open work, where the
+//! pool cannot recycle, still reuses everything the hand-back returned before
+//! the previous wait (`an_encode_beside_open_work_reuses_the_previous_calls_set`).
+//! The bytes one call allocates equal the itemized set the
 //! `Acts` documentation lists (exact, from [`GpuRuntime::allocated_bytes_for`])
 //! plus the call's own inputs and output, with `q|k|v` and `gate|up` sharing a
 //! buffer.
@@ -27,7 +36,12 @@ const MODES: [GemmOperands; 2] = [GemmOperands::ExactF32, GemmOperands::Bf16];
 
 /// Three sequences of 40 tokens: one forward of 120 rows.
 fn batch(vocab: u32) -> Vec<Vec<u32>> {
-    (0..3u32)
+    batch_of(vocab, 3)
+}
+
+/// `n` sequences of 40 tokens.
+fn batch_of(vocab: u32, n: u32) -> Vec<Vec<u32>> {
+    (0..n)
         .map(|s| (0..40u32).map(|i| (i * 5 + s * 3 + 1) % vocab).collect())
         .collect()
 }
@@ -53,9 +67,16 @@ fn consecutive_encodes_hold_one_activation_set() {
 
 fn consecutive_encodes_hold_one_activation_set_in_process() {
     let cfg = EmbedGemma2Config::from_config_json(CONFIG).unwrap();
-    let seqs = batch(cfg.vocab);
+    // 40 sequences: the output (40 x 128 x 4 bytes) is past the 16 KiB from
+    // which the device charges a buffer's own length, so a second output that
+    // was not reused would move the figure this test reads.
+    let seqs = batch_of(cfg.vocab, 40);
     let refs: Vec<&[u32]> = seqs.iter().map(Vec::as_slice).collect();
     let out_bucket = cold(refs.len() * cfg.embedding_dim as usize * 4);
+    assert!(
+        out_bucket >= 16 << 10,
+        "test bug: the output is under the 16 KiB charge threshold"
+    );
     for operands in MODES {
         let w = weights_for(&cfg, 41, operands);
         let st = open("memory_consecutive", safetensors_bytes(&w, &[]));
@@ -80,13 +101,85 @@ fn consecutive_encodes_hold_one_activation_set_in_process() {
                     "{operands:?}: call {call} changed a bit"
                 );
             }
-            // The one fresh allocation a repeated call may need: its output,
-            // while the previous call's is still waiting for a commit.
+            // None: the pool recycles the previous call's dropped output at
+            // the next call's first allocation (`recycle_if_idle`), so a
+            // repeated call reuses the whole set, its output included. Before
+            // that, the previous output waited for a commit and a repeated call
+            // reached one more `out_bucket` bytes.
             let extra = rt.peak_allocated_bytes() - after_first;
+            assert_eq!(
+                extra, 0,
+                "{operands:?}: three more calls reached {extra} bytes above the first ({set} bytes of activations, \
+                 one {out_bucket}-byte output); a repeated call must reuse the first call's buffers exactly"
+            );
+        });
+    }
+}
+
+/// The pool recycles a dropped buffer at the next allocation only when no
+/// command buffer is open and the GPU has caught up (`recycle_if_idle`). A call
+/// that starts while its caller has work open in an `async_scope` gets neither,
+/// so a set that was only *dropped* after the previous call's wait would not be
+/// reused, and the call would allocate a second set. `encode` hands its set back
+/// before its wait instead, so the wait returns it to the freelist and the next
+/// call reuses it whatever the caller has open: it reaches at most one fresh
+/// output above the first call's peak, not a second set. (This is why the
+/// hand-back stays beside the pool's recycle-at-allocation: with the pool fix
+/// alone, back-to-back calls are the same, and this case is not.)
+#[test]
+fn an_encode_beside_open_work_reuses_the_previous_calls_set() {
+    in_child(
+        "an_encode_beside_open_work_reuses_the_previous_calls_set",
+        &[],
+        an_encode_beside_open_work_reuses_the_previous_calls_set_in_process,
+    );
+}
+
+fn an_encode_beside_open_work_reuses_the_previous_calls_set_in_process() {
+    let cfg = EmbedGemma2Config::from_config_json(CONFIG).unwrap();
+    let seqs = batch_of(cfg.vocab, 40);
+    let refs: Vec<&[u32]> = seqs.iter().map(Vec::as_slice).collect();
+    let out_bucket = cold(refs.len() * cfg.embedding_dim as usize * 4);
+    for operands in MODES {
+        let w = weights_for(&cfg, 41, operands);
+        let st = open("memory_beside_open_work", safetensors_bytes(&w, &[]));
+        with_gpu(|rt| {
+            let model = EmbedGemma2Model::load_with(rt, &st, PREFIX, cfg.clone(), operands).unwrap();
+            let (src, dst) = (
+                rt.alloc_tensor_f32(&[1024]).unwrap(),
+                rt.alloc_tensor_f32(&[1024]).unwrap(),
+            );
+            rt.synchronize().unwrap();
+            let base = rt.current_allocated_bytes();
+            let first = model.encode(&refs, None, false).unwrap();
+            let after_first = rt.current_allocated_bytes();
+            let set = after_first - base;
             assert!(
-                extra <= out_bucket,
-                "{operands:?}: three more calls reached {extra} bytes above the first ({set} bytes of activations); \
-                 more than one {out_bucket}-byte output means a second set was live"
+                set > 100 * out_bucket,
+                "{operands:?}: the first call allocated {set} bytes"
+            );
+            rt.reset_peak_allocated_bytes();
+            // Open work: a copy encoded into an open scope's command buffer, not
+            // yet waited for, when the second call allocates.
+            let scope = rt.async_scope();
+            tessl::tensor::gpu_copy(&src, &dst).unwrap();
+            let again = model.encode(&refs, None, false).unwrap();
+            drop(scope);
+            rt.synchronize().unwrap();
+            assert_eq!(
+                bits_of(&again.embeddings),
+                bits_of(&first.embeddings),
+                "{operands:?}: the second call changed a bit"
+            );
+            let extra = rt.peak_allocated_bytes() - after_first;
+            // Exactly one fresh output: the first call's output is dropped
+            // after its wait, and with a command buffer open the allocation
+            // cannot recycle it. Everything handed back before the wait is
+            // reused; without the hand-back this is the whole set again.
+            assert_eq!(
+                extra, out_bucket,
+                "{operands:?}: a call beside open work reached {extra} bytes above the first ({set} bytes of \
+                 activations, one {out_bucket}-byte output): exactly the output is fresh; more is a second set"
             );
         });
     }
@@ -238,12 +331,11 @@ fn one_encode_allocates_the_itemized_set_in_process() {
 // The towers and the facade (tiny checkpoint of `tests/common/embedgemma2_mm.rs`)
 // ---------------------------------------------------------------------------
 //
-// Bounds, fixed before the towers' lifetime change was written: consecutive
-// tower calls of one forward each hold one activation set, so calls 2 to 4
-// reach at most one fresh `soft` output above the first call's peak (the
-// previous call's is still waiting for a commit when the next allocates); the
-// facade's consecutive mixed calls reach at most one fresh text-encoder output
-// above the first call's.
+// Bounds: consecutive tower calls of one forward each hold one activation set,
+// and calls 2 to 4 reach exactly the first call's peak (`extra == 0`): the
+// previous call's `soft` output is recycled at the next allocation, as is the
+// facade's text-encoder output. (Before the pool recycled at allocation, each
+// reached one output above; the bound was `extra <= out_bucket`.)
 
 fn tower_media(c: &Configs) -> (Vec<Image>, Vec<AudioInput>) {
     let pd = c.vision.patch_dim() as usize;
@@ -283,7 +375,9 @@ fn consecutive_vision_calls_hold_one_activation_set() {
 fn consecutive_vision_calls_hold_one_activation_set_in_process() {
     let c = configs();
     let (images, _) = tower_media(&c);
-    let inputs: Vec<ImageInput<'_>> = images.iter().map(Image::input).collect();
+    // The four images four times over: the soft output is past the 16 KiB from
+    // which the device charges a buffer's own length (see the text test).
+    let inputs: Vec<ImageInput<'_>> = (0..4).flat_map(|_| images.iter().map(Image::input)).collect();
     for operands in MODES {
         let st = open("memory_vision", checkpoint_bytes(&c, 17, operands));
         with_gpu(|rt| {
@@ -291,6 +385,10 @@ fn consecutive_vision_calls_hold_one_activation_set_in_process() {
             rt.synchronize().unwrap();
             let soft_rows: usize = model.check_images(&inputs).unwrap().iter().sum();
             let out_bucket = cold(soft_rows * c.vision.text_hidden as usize * 4);
+            assert!(
+                out_bucket >= 16 << 10,
+                "test bug: the output is under the 16 KiB charge threshold"
+            );
             let base = rt.current_allocated_bytes();
             let first = model.encode_images(&inputs, false).unwrap();
             assert_eq!(first.forwards, 1, "test bug: the call split");
@@ -308,10 +406,10 @@ fn consecutive_vision_calls_hold_one_activation_set_in_process() {
                 }
             }
             let extra = rt.peak_allocated_bytes() - after_first;
-            assert!(
-                extra <= out_bucket,
+            assert_eq!(
+                extra, 0,
                 "{operands:?}: three more vision calls reached {extra} bytes above the first ({set} bytes of \
-                 activations); more than one {out_bucket}-byte output means a second set was live"
+                 activations, one {out_bucket}-byte output); a repeated call must reuse the first call's buffers exactly"
             );
         });
     }
@@ -356,10 +454,10 @@ fn consecutive_audio_calls_hold_one_activation_set_in_process() {
                 }
             }
             let extra = rt.peak_allocated_bytes() - after_first;
-            assert!(
-                extra <= out_bucket,
+            assert_eq!(
+                extra, 0,
                 "{operands:?}: three more audio calls reached {extra} bytes above the first ({set} bytes of \
-                 activations); more than one {out_bucket}-byte output means a second set was live"
+                 activations, one {out_bucket}-byte output); a repeated call must reuse the first call's buffers exactly"
             );
         });
     }
@@ -396,7 +494,7 @@ fn consecutive_facade_calls_hold_one_activation_set_in_process() {
             ids.extend(std::iter::repeat_n(IMAGE, tokens_i[0] + tokens_i[1]));
             ids.extend(std::iter::repeat_n(AUDIO, tokens_a));
             ids.push(2);
-            let items = [
+            let mut items = vec![
                 MmItem::Text(&text_ids),
                 MmItem::Image(images[2].input()),
                 MmItem::Audio(&clips[1]),
@@ -407,7 +505,14 @@ fn consecutive_facade_calls_hold_one_activation_set_in_process() {
                     videos: &[],
                 },
             ];
+            // Forty more texts: the output (44 x 128 x 4 bytes) is past the
+            // 16 KiB from which the device charges a buffer's own length.
+            items.extend((0..40).map(|_| MmItem::Text(&text_ids)));
             let out_bucket = cold(items.len() * m.text().config().embedding_dim as usize * 4);
+            assert!(
+                out_bucket >= 16 << 10,
+                "test bug: the output is under the 16 KiB charge threshold"
+            );
             rt.synchronize().unwrap();
             let base = rt.current_allocated_bytes();
             let first = m.encode(&items, None).unwrap();
@@ -427,10 +532,10 @@ fn consecutive_facade_calls_hold_one_activation_set_in_process() {
                 );
             }
             let extra = rt.peak_allocated_bytes() - after_first;
-            assert!(
-                extra <= out_bucket,
+            assert_eq!(
+                extra, 0,
                 "{operands:?}: three more facade calls reached {extra} bytes above the first ({set} bytes of \
-                 activations); more than one {out_bucket}-byte output means a second set was live"
+                 activations, one {out_bucket}-byte output); a repeated call must reuse the first call's buffers exactly"
             );
         });
     }

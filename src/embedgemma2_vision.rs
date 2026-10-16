@@ -49,6 +49,13 @@
 //! encoder's scheme); the padded rows are exactly zero through the patch
 //! embedder and their keys are masked.
 //!
+//! A call is cut into as many forwards as it needs (longest images first, at
+//! most [`MAX_BATCH_PATCHES`] padded patches and [`MAX_IMAGES`] images each), all
+//! queued behind its one wait; an image's soft tokens do not depend on which
+//! forward ran it. What bounds a call is the memory its forwards' inputs and
+//! outputs hold until that wait: [`MAX_CALL_PATCHES`] padded patches and
+//! [`MAX_CALL_IMAGES`] images, refused by name before any allocation.
+//!
 //! # Pooling
 //!
 //! A patch at `(x, y)` goes to cell `x/k + (max_x/k) * (y/k)` with
@@ -128,8 +135,28 @@ use crate::runtime::GpuRuntime;
 use crate::safetensors::SafeTensors;
 use crate::tensor::{f32_to_bf16_bits_gpu, DType, GpuBuffer, Tensor};
 
-/// Images per [`EmbedGemma2VisionModel::encode_images`] call.
+/// Images per forward, and so the most one tower batch holds. A call may hold
+/// more ([`MAX_CALL_IMAGES`], [`MAX_CALL_PATCHES`]): it runs as several
+/// forwards behind its one wait.
 pub const MAX_IMAGES: usize = 256;
+/// Images per [`EmbedGemma2VisionModel::encode_images`] /
+/// [`EmbedGemma2VisionModel::queue_images`] call (4096, sixteen forwards of
+/// [`MAX_IMAGES`]): a sanity bound beside [`MAX_CALL_PATCHES`], which is the
+/// memory one. A call over it is refused naming it.
+pub const MAX_CALL_IMAGES: usize = 4096;
+/// Padded patches (the sum over the call's forwards of `images * longest`)
+/// per call: the memory bound of a call that is cut into several forwards.
+/// Every forward's uploaded inputs (3 KiB a patch under `ExactF32`, 1.5 KiB
+/// under `Bf16`: the scaled pixels, plus 8 bytes of positions and the pooling
+/// plan) and its soft tokens (`text_hidden` f32 per pooled row, a ninth of a
+/// patch's rows at the checkpoint's pooling) are held until the call's one
+/// wait, so a call holds up to this many patches' worth beside one activation
+/// set of at most [`MAX_BATCH_PATCHES`] rows: about 3.4 GiB at the bound under
+/// `ExactF32` with the checkpoint's widths, 1.9 GiB under `Bf16`. A call over it
+/// is refused naming it, before any allocation; split the call (each call waits
+/// once) to go past it. 2^20 is 64 full forwards, and above the 645,120 padded
+/// patches that the previous cap of 256 images of 2,520 patches reached.
+pub const MAX_CALL_PATCHES: usize = 1 << 20;
 /// Padded patches (`images * longest`) per forward, and the most real patches
 /// one image may have. Bounds the activations: at this size the widest
 /// buffer, the gate|up projection (`2 * 3072` columns), is 384 MiB, and all of
@@ -774,6 +801,15 @@ fn pack_images(valid: &[usize]) -> Vec<Vec<usize>> {
     runs
 }
 
+/// The padded patches of a call: the sum over [`pack_images`]' forwards of
+/// `images * longest` (what the forwards' uploaded inputs are sized by), which
+/// is what [`MAX_CALL_PATCHES`] bounds. Saturates rather than wraps.
+fn padded_patches(valid: &[usize]) -> usize {
+    pack_images(valid).iter().fold(0usize, |acc, run| {
+        acc.saturating_add(run.len().saturating_mul(valid[run[0]]))
+    })
+}
+
 // ---------------------------------------------------------------------------
 // Model
 // ---------------------------------------------------------------------------
@@ -1268,7 +1304,9 @@ impl EmbedGemma2VisionModel {
 
     /// Everything [`Self::encode_images`] checks before it touches the device,
     /// without doing any GPU work, no allocation and no wait: the batch is
-    /// non-empty and within [`MAX_IMAGES`], the runtime's f32 GEMMs are exact,
+    /// non-empty and within [`MAX_CALL_IMAGES`] and [`MAX_CALL_PATCHES`] (a call
+    /// of more than [`MAX_IMAGES`] images is cut into several forwards behind its
+    /// one wait), the runtime's f32 GEMMs are exact,
     /// and each image is well formed ([`ImageInput`]). Returns the number of soft
     /// tokens each image will produce, which is what a caller needs to lay out
     /// the placeholders of its text sequence before the towers have run.
@@ -1282,9 +1320,9 @@ impl EmbedGemma2VisionModel {
         if images.is_empty() {
             return Err(format!("{what}: empty batch"));
         }
-        if images.len() > MAX_IMAGES {
+        if images.len() > MAX_CALL_IMAGES {
             return Err(format!(
-                "{what}: {} images exceeds the batch limit {MAX_IMAGES}",
+                "{what}: {} images exceeds the per-call limit MAX_CALL_IMAGES = {MAX_CALL_IMAGES}",
                 images.len()
             ));
         }
@@ -1295,7 +1333,22 @@ impl EmbedGemma2VisionModel {
                 "{what}: the forward needs exact-f32 GEMMs; switch the runtime's relaxed precision off"
             ));
         }
-        images.iter().enumerate().map(|(i, img)| self.prepare(i, img)).collect()
+        let prepared = images
+            .iter()
+            .enumerate()
+            .map(|(i, img)| self.prepare(i, img))
+            .collect::<Result<Vec<_>, _>>()?;
+        let valid: Vec<usize> = prepared.iter().map(|p| p.n).collect();
+        let padded = padded_patches(&valid);
+        if padded > MAX_CALL_PATCHES {
+            return Err(format!(
+                "{what}: {} images make {padded} padded patches in {} forwards; the per-call memory bound \
+                 MAX_CALL_PATCHES is {MAX_CALL_PATCHES} (split the call)",
+                images.len(),
+                pack_images(&valid).len()
+            ));
+        }
+        Ok(prepared)
     }
 
     /// Encode a batch of images to soft tokens. Each [`ImageInput`] is one

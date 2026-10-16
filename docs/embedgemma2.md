@@ -846,7 +846,12 @@ one forward padded to the longest, with a per-image length for attention
 of at most 16,384 padded patches (`MAX_BATCH_PATCHES`) and 256 images,
 longest first, queued under a `GpuRuntime::async_scope` behind one
 `synchronize` (`queue_images` is the call up to the wait, for a caller that
-queues more behind it: [One call](#one-call-text-images-and-audio)).
+queues more behind it: [One call](#one-call-text-images-and-audio)). A call may
+hold more than one forward's worth of images: it is bounded by `MAX_CALL_IMAGES`
+(4096) and by `MAX_CALL_PATCHES` (2^20 padded patches, the memory the forwards'
+uploaded inputs and soft tokens hold until the wait: about 3.4 GiB at the bound under
+`ExactF32`, 1.9 GiB under `Bf16`, beside one activation set), each refused by name
+before any allocation.
 
 **Pooling.** A patch at `(x, y)` goes to cell `x/k + (max_x/k) * (y/k)`,
 `max_x = max(x) + 1` of its own image, which collides cells when the grid width
@@ -1214,10 +1219,13 @@ sums its five taps as before but from the GLU recomputed in registers.
 
 ### Batches and limits
 
-`encode_audio` takes up to 256 clips of any lengths. They are laid end to end
-in each row space and run as one forward up to 16,384 frames (`MAX_FRAMES_PER_FORWARD`;
-a clip above that is refused, more clips are more forwards, all queued before the
-one wait). Clips never read each other's rows: the convolutions and the attention
+`encode_audio` takes up to 4096 clips (`MAX_CALL_CLIPS`) of 2^21 frames in all (`MAX_CALL_FRAMES`) of any lengths. They are laid end to end
+in each row space and run as one forward up to 16,384 frames (`MAX_FRAMES_PER_FORWARD`)
+and 256 clips (`MAX_CLIPS`, the clip table's size); a clip above the frame limit is
+refused, more clips are more forwards, all queued before the one wait. What bounds a
+call is the memory its forwards' inputs and soft tokens hold until that wait (about
+1.25 KiB a frame, 2.5 GiB at `MAX_CALL_FRAMES`): a call over either bound is refused
+by name before any allocation. Clips never read each other's rows: the convolutions and the attention
 work in clip-local indices through a clip table, and everything else is row-wise,
 so a clip is bit for bit the same alone or in any batch. Padding (masked)
 frames are defined everywhere: the only place a masked frame influences a kept
@@ -1418,6 +1426,9 @@ frame (that is the config `fps: null`, or `do_sample_frames: false` for no sampl
 at all). Each sampled frame goes through the image path at `max_soft_tokens` 140
 (1260 patches). `PreparedVideo` carries the frames, their source indices and the
 timestamps `index / source_fps`; `timestamp_label` is the processor's `mm:ss`.
+`add_timestamps` (`VideoConfig::add_timestamps`, `false` in the snapshot) is read
+like any other setting and changes nothing here: the frames are preprocessed the
+same either way, and the flag is the sequence layout's (see [Video](#video)).
 Placing the video in a sequence, and the frames through the tower, are the
 multimodal model's.
 
@@ -2165,7 +2176,25 @@ verified by reading them and against the `ids.npy` of the reference run):
 
   `EmbedGemma2Config::video_sequence(&[S; F])` builds it from `config.json`'s ids
   (`boi_token_id` 255999, `eoi_token_id` 258882, `video_token_id` 258884); `S` may
-  differ per frame there, `MmItem::Video` requires the processor's one `S`. The
+  differ per frame there, `MmItem::Video` requires the processor's one `S`.
+
+  Under `add_timestamps` the processor's string is `"00:00 <boi><video>*S<eoi>
+  00:01 <boi>..."`: `f"{int(s // 60):02d}:{int(s % 60):02d}"` per frame (the
+  existing `timestamp_label`; truncation, not rounding, so 59.9 s is `00:59`, and a
+  minutes count past 99 has three digits), then the blocks joined by one space.
+  The added tokens split that text, so the stretches between them are tokenized on
+  their own: `"mm:ss "` before the first block and `" mm:ss "` before each later
+  one, which the snapshot's tokenizer makes `00:00` as five single-digit and colon
+  tokens and a `▁` (six ids), and `▁`, five, `▁` (seven) for the others.
+  `EmbedGemma2Config::video_sequence_with_timestamps(&tokenizer, &timestamps, &[S; F])`
+  builds `[<bos>, label ids, block, label ids, block, ..., <eos>]` that way, through
+  `Tokenizer::encode_raw(stretch, false)` and not by building the string, and
+  refuses (naming the frame) a timestamp count other than the frame count and a time
+  that is not finite, is negative or is past `MAX_TIMESTAMP_SECONDS` (10^9, about 31
+  years). The tiny test holds it to `encode_raw` of the whole processor string on a
+  tokenizer with merges, so the equivalence of "tokenize the stretches" with
+  "tokenize the string" is checked on that tokenizer and, for the real one, by the
+  ids below. The
   placeholder is its own id, not the image's. (The processor adds `<|video|>` to the
   tokenizer itself, processing:88-89, with a FIXME to put it in the config; the
   generator asserts that its id is the config's `video_token_id`, which is the one
@@ -2202,17 +2231,25 @@ verified by reading them and against the `ids.npy` of the reference run):
   one per frame; inferred, the dispatches were not counted).
 * `MmItem::Media { ids, images, audio, videos }`: `videos` is one frame list per
   video; the video placeholders of `ids` take the frames of all the videos laid end
-  to end, as image placeholders take the images'. This is the entry for the
-  `add_timestamps` layout: this crate has no tokenizer, so the caller tokenizes
-  `mm:ss ` text and puts it between the blocks (the golden of that layout is below).
-  `PreConfig` refuses `add_timestamps: true` by name, as it refuses every setting it
-  does not implement, so a config asking for timestamps is not read as asking for
-  none. A video placeholder with no frames, or frames with no placeholder, is
-  refused as a count mismatch (before, any video placeholder was refused: there was
-  no tower).
-* Limits: the vision tower's batch limit, 256 pictures, counts the frames of all the
-  call's videos with its images (a call of nine 32-frame videos is refused naming it).
-  Frames are numbered with the images in the tower's messages. The text limit
+  to end, as image placeholders take the images'. This is the entry for ids of your
+  own (a prompt, other text between the blocks, several videos in a row). A video
+  placeholder with no frames, or frames with no placeholder, is refused as a count
+  mismatch (before, any video placeholder was refused: there was no tower).
+* `MmItem::TimestampedVideo { frames, timestamps, tokenizer }`: the same video under
+  `add_timestamps = true`. The item carries each frame's time in seconds
+  (`PreparedVideo::timestamps`) and the snapshot's `&Tokenizer`, and the facade builds
+  the ids with `video_sequence_with_timestamps`; the frames are numbered, counted and
+  limited as `Video`'s are, and the one-count rule holds. A wrong timestamp count or
+  time is refused with 0 allocations and 0 waits, as every refusal is. `PreConfig`
+  now reads `video.add_timestamps` (it refused `true` by name while this crate had
+  no tokenizer), so a caller picks the item by the flag: `TimestampedVideo` when it
+  is on, `Video` when it is off. `MmItem::Video(&[ImageInput])` is unchanged.
+* Limits: the frames of all the call's videos count with its images toward the
+  vision tower's per-call bounds, `MAX_CALL_IMAGES` (4096) and `MAX_CALL_PATCHES`
+  (2^20 padded patches: 800 full 1260-patch frames), not toward the 256 of one tower
+  forward: a call past 256 pictures is cut into several tower forwards inside the call
+  (see [Pictures and clips past a forward](#facade-follow-ups)). Frames are numbered
+  with the images in the tower's messages. The text limit
   (`max_tokens`, 8192) refuses a sequence past it: 32 frames of 140 tokens is 4546 ids.
 * Both operand modes, as images: `GemmOperands::Bf16` runs the vision tower and the
   text encoder in bf16, so the video's frames do too.
@@ -2252,9 +2289,11 @@ first measurement:
 | Native preprocessing: every frame's pixels and positions vs the processor's | bit for bit | 0 of 5,806,080 and 0 of 30,965,760 values differ |
 | `video_sequence` vs `ids.npy` | equal | equal (782 and 4098 ids) |
 | `video0t`: ids = the golden's labels + the plain blocks | equal | equal |
+| `video0t`: `video_sequence_with_timestamps` (snapshot tokenizer; this crate's timestamps, and the golden's) vs `ids.npy` | equal | equal (823 ids, both) |
 | Tower soft tokens per frame vs captured (`video1`: 32 frames, 3 tower forwards) | 1e-4 of the largest magnitude | 1.25e-5 and 1.51e-5 |
 | Raw frames to embedding, both videos in one call, ExactF32 | max abs `1e-4`, cosine `>= 0.99999` | max abs 3.7e-7 and 1.5e-7, cosine 1.000000000 |
 | `video0t` through `Media` with the golden's ids | same | max abs 2.1e-7, cosine 1.000000000 |
+| `video0t` through `MmItem::TimestampedVideo` (a config with `add_timestamps` on, native frames and timestamps, the snapshot's tokenizer) | same | max abs 2.1e-7, cosine 1.000000000; vs the `Media` item 0 (bit for bit) |
 | Each video alone vs in the call | `1e-5` | 0 (bit for bit) |
 | Mixed call: 2 videos, an image, a clip, ExactF32 | same | 1.5e-7 to 3.7e-7, cosine 1.000000000, alone vs in the call 0 |
 | Bf16 video vs fp32 | cosine `>= 0.99997` | 0.9999930 and 0.9999968 |
@@ -2274,11 +2313,21 @@ composition; a mixed batch of a text, a video, an image, a clip, caller-built id
 second video and a text equals each item alone (bit for bit, one forward, poisoned
 activations change nothing) and agrees within 1e-5 across several text forwards; one
 wait per call; every refusal (no frames, frames of different sizes, a placeholder
-count that is not the frames' soft tokens, 257 frames, a bad frame after good ones, a
+count that is not the frames' soft tokens, 4097 frames, a bad frame after good ones, a
 sequence past the limit) is raised with 0 allocations and 0 waits and leaves the
-facade usable. Mutation checks, each failing the tests that should: frames taken in
+facade usable. Timestamps: `PreConfig` reads `add_timestamps` (on, off, absent, not
+a boolean); on a tiny tokenizer with merges (`0 0`, then a space glued to a following
+`0`, built by `tests/common/embedgemma2_mm.rs::timestamp_tokenizer_json`)
+`video_sequence_with_timestamps` equals the tokenizer's ids of the processor's whole
+string for stamps crossing every `mm:ss` carry (59.9, 60, 3725.5, three-digit minutes)
+and a 32-frame video, and is written out for two cases; `MmItem::TimestampedVideo`
+equals the by-hand composition and the `Media` item with those ids bit for bit in both
+modes, in one wait, and its labels, times and frame order are observable; its
+refusals (wrong timestamp count, NaN, negative, no frames, frames of different sizes,
+a bad item after a good one, a sequence past the limit) make 0 allocations and 0
+waits. Mutation checks, each failing the tests that should: frames taken in
 reverse in the segment walk (4 of 8 tests), no `<eoi>` in the builder (5 of 8), and
-`PreConfig` not refusing `add_timestamps` (its test).
+no leading space before the later frames' labels (3 of 12 tests of the file).
 
 ### Speed
 
@@ -2302,12 +2351,8 @@ tokens); in bf16 the runs are too disturbed to say.
 
 ### Not done
 
-* Timestamps are the caller's: no tokenizer here, so `add_timestamps` is reached
-  through `MmItem::Media` (tested against `video0t`), not by a flag.
 * No `Video` entry in the C ABI or Python (`capi*.rs` and `python/` are another
   piece of work); `MmItem::Video` is Rust-only for now.
-* Pictures per call are capped at the tower's 256 (images and frames together); the
-  facade does not split a larger call into several tower batches.
 * x86 / AVX2 behaviour of the native resize is as unverified as [Preprocessing](#preprocessing) says.
 
 ## Pool recycle at allocation
@@ -2351,3 +2396,108 @@ to the next allocation with no commit between, with the same buffers and the
 same device bytes, and the in-flight cases above hold. The decision logic
 under a hand-set lifetime event and under a held `active_m4` lock is in
 `runtime::alloc_recycle_tests`.
+
+## Facade follow-ups
+
+Three loose ends of the multimodal facade, closed together. Navigation was by `rg`
+(the DevMap index is not built for this checkout).
+
+### Timestamped video
+
+`add_timestamps` is native: `PreConfig` reads `video.add_timestamps`,
+`EmbedGemma2Config::video_sequence_with_timestamps(&tokenizer, &timestamps, &soft)`
+builds the processor's ids with the snapshot's tokenizer, and
+`MmItem::TimestampedVideo { frames, timestamps, tokenizer }` embeds the video in one
+item. The layout, the exact ids of `video0t` and the embedding against
+sentence-transformers are in [Video](#video) (ids equal to `ids.npy`, 823 of 823;
+embedding max abs 2.1e-7, cosine 1.000000000, bit for bit the `Media` item with the
+golden's ids).
+
+### Pictures and clips past a forward
+
+A tower call used to be refused above 256 images or clips, though both towers already
+cut a call into forwards (images by padded patches and `MAX_IMAGES`, clips by frames)
+queued behind its one wait. The cap was `check_call`'s, the one place both the
+facade and `encode_images` / `encode_audio` pass, so it is lifted there and not
+worked around in the facade: `queue_images` / `queue_audio` are still one call, one
+`async_scope` and one wait, the soft rows are still the forwards' output buffers read by
+the text encoder's scatter on the device, and `PendingImages::into_device` and
+`PendingAudio::into_device` already handled many forwards. The audio plan also cuts a
+forward at `MAX_CLIPS` clips now (the clip table's size, which a call of 300 short
+clips would otherwise exceed in one forward).
+
+What a longer call costs is memory: every forward's uploaded inputs and its soft tokens
+are held until the call's wait (the one-wait rule), so a call is bounded by the bytes
+they take, refused by name before any allocation:
+
+| Bound | Value | Memory at the bound |
+|---|---|---|
+| `MAX_CALL_IMAGES` (pictures: images and video frames) | 4096 | a sanity bound beside the next one |
+| `MAX_CALL_PATCHES` (padded patches, summed over the forwards) | 2^20 | about 3.4 GiB (`ExactF32`; 3 KiB a patch of pixels, 8 bytes of positions, soft tokens a ninth of the rows) or 1.9 GiB (`Bf16`), beside one activation set |
+| `MAX_CALL_CLIPS` | 4096 | a sanity bound beside the next one |
+| `MAX_CALL_FRAMES` (summed over the clips) | 2^21 (5.8 h) | about 2.5 GiB (1.25 KiB a frame: 512 bytes of features, 768 of soft tokens) beside one activation set |
+
+`MAX_IMAGES` (256) and `MAX_CLIPS` (256) now name what they always bounded, the size
+of one forward; the C ABI (`capi_embedgemma2.rs`) still applies them to `n_images` and
+`n_clips` of its own entries, which is the binding lane's to lift. The bounds are above what
+the old cap admitted in practice (256 images of 2520 patches are 645,120 padded
+patches; 256 clips of 30 s are 768,000 frames), but not above its worst case (256
+images of 16,384 patches, 256 clips of 16,384 frames): those calls are now refused
+naming the bound, and a caller splits them (each call waits once).
+
+Measured, tiny checkpoint (`tests/embedgemma2_vision_tiny.rs`,
+`embedgemma2_audio_tiny.rs`, `embedgemma2_video_tiny.rs`, both operand modes where
+stated), all bit for bit unless said:
+
+| Check | Result |
+|---|---|
+| 300 images in one `encode_images` call (2 forwards: 256 + 44; asynchronous runtime, poisoned activations) vs two calls of 150 | equal, `ExactF32` and `Bf16`; 5 of them vs alone equal |
+| 300 clips (ragged lengths, prefix and gapped masks; 2 forwards cut by the clip table) vs two calls of 150 | equal; 5 vs alone equal |
+| Facade: 150 items of 2 images and 2 clips (300 pictures, 300 clips) in one call vs two calls of 75 | equal, both modes; 1 wait; 5 items vs alone within the text side's batch bound 1e-5 (the towers' rows are the same bits; the text GEMMs tile 14 rows differently from 2100) |
+| Facade: one video of 300 frames vs the by-hand composition with the frames in two tower calls of 150 | equal, both modes; 1 wait |
+| Refusals: 4097 images (`MAX_CALL_IMAGES`), 65 images of 16,384 patches (`MAX_CALL_PATCHES`), 4097 clips, 129 clips of 16,384 frames; the boundary itself passes `check_images` / `check_clips` | refused naming the bound; through the facade 0 allocations, 0 waits |
+
+Mutation check: dropping the clip-table cut from the audio plan fails the 300-clip test
+(`300 clips; need 1..=256`).
+
+### Memory of consecutive calls, and the hand-back
+
+After lane R the pool recycles a dropped buffer at the next allocation when the GPU is
+idle, so consecutive `encode`, vision, audio and facade calls hold exactly one call's
+set, the previous call's output buffer included. `tests/embedgemma2_memory.rs` allowed
+one output buffer above the first call's peak (`extra <= out_bucket`); it now asserts
+`extra == 0` for calls 2 to 4 in both modes. The tiny outputs were under 16 KiB, below
+which the device does not charge a buffer's own length, so the tests would not have
+seen a missed output at all; they now use batches whose output is 16 KiB or more, and
+assert it.
+
+With `recycle_if_idle` stubbed to a no-op (temporarily, in `src/runtime.rs`, reverted),
+the tightened tests fail, each by exactly one output buffer (`ExactF32`; the first
+mode's failure ends a test):
+
+| Test | Peak above the first call, stubbed | Now | One call's set |
+|---|---|---|---|
+| `consecutive_encodes_hold_one_activation_set` | 16,384 B | 0 | 36,732,928 B |
+| `consecutive_vision_calls_hold_one_activation_set` | 32,768 B | 0 | 6,520,832 B |
+| `consecutive_audio_calls_hold_one_activation_set` | 16,384 B | 0 | 802,816 B |
+| `consecutive_facade_calls_hold_one_activation_set` | 32,768 B | 0 | 26,181,632 B |
+
+(`Bf16` is 0 now, measured; its stubbed figure was not taken.) The old bound
+`extra <= out_bucket` passes the stubbed build, which is why it was loose.
+
+**The hand-back stays.** `encode`, the towers and the facade hand their activations and
+uploaded inputs to the runtime before their wait. With the pool fix that is redundant
+for back-to-back calls: measured by holding the text encoder's set until after the wait
+(the pre-R behaviour of `encode`), `consecutive_encodes_hold_one_activation_set` passes
+at `extra == 0`. It is not redundant for a call that starts while its caller has work
+open: `recycle_if_idle` does nothing while a command buffer is open or the GPU has
+not caught up, so a set that was only dropped after the previous wait is not reused
+then. `an_encode_beside_open_work_reuses_the_previous_calls_set` encodes a copy in an
+open `async_scope`, then calls `encode`: with the hand-back the call reaches exactly
+one fresh output (16,384 B) above the first call's peak; with the set held until the
+wait instead, the same test reached 36,470,784 B, a whole second set. So the
+hand-back is defence the pool fix does not replace, it costs nothing, and it is kept
+(`src/embedgemma2.rs` `queue_impl`, `embedgemma2_vision.rs` and
+`embedgemma2_audio.rs` `queue_impl`, the facade's `drop((image_soft, clip_soft))`). The
+open-work case was measured for the text encoder only; the towers and the facade use
+the same pattern and were not measured held-back.

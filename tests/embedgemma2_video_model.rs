@@ -26,14 +26,17 @@
 //!   the processor's bit for bit.
 //! * `video_ids_equal_the_processors`: `video_sequence` of the soft-token counts
 //!   is `ids.npy`; the timestamped sequence is the processor's with the
-//!   tokenizer's text between the frames' blocks.
+//!   tokenizer's text between the frames' blocks, and
+//!   `video_sequence_with_timestamps` (the snapshot's tokenizer, this crate's
+//!   timestamps and the golden's) builds `video0t`'s `ids.npy` exactly.
 //! * `the_vision_tower_makes_the_processors_soft_tokens`: the frames' soft
 //!   tokens against the captured ones, frame by frame.
 //! * `raw_video_to_embedding_matches_sentence_transformers`: raw frames to
 //!   embedding in one call of both videos, within `1e-4` max abs of
 //!   `emb_f32.npy` and cosine `0.99999` (the bounds of
-//!   `tests/embedgemma2_e2e_model.rs`), and the timestamped sequence through
-//!   `MmItem::Media`.
+//!   `tests/embedgemma2_e2e_model.rs`), and `video0t` through `MmItem::Media`
+//!   (the golden's ids) and through `MmItem::TimestampedVideo` (a config with
+//!   `add_timestamps` on, native timestamps, the snapshot's tokenizer).
 //! * `bf16_video_stays_near_the_fp32_embedding`: the same with both models in
 //!   `GemmOperands::Bf16`.
 //! * `a_mixed_call_gives_each_item_its_own_embedding`: two videos, an image and
@@ -49,6 +52,7 @@ use tessl::embedgemma2_mm::{EmbedGemma2Multimodal, MmItem};
 use tessl::embedgemma2_pre::{
     preprocess_audio, preprocess_image, preprocess_video, PreConfig, PreparedImage, PreparedVideo, RawImage,
 };
+use tessl::embedgemma2_tok::Tokenizer;
 use tessl::embedgemma2_vision::ImageInput;
 use tessl::gemm::GemmOperands;
 use tessl::npy::read_npy;
@@ -106,6 +110,18 @@ fn snapshot() -> PathBuf {
 
 fn config() -> PreConfig {
     PreConfig::from_snapshot(&snapshot()).expect("the snapshot's processor_config.json")
+}
+
+/// The snapshot's `processor_config.json` with `add_timestamps` switched on, as
+/// the reference run of `video0t` does to its processor.
+fn timestamped_config() -> PreConfig {
+    let text = std::fs::read_to_string(snapshot().join("processor_config.json")).unwrap();
+    assert_eq!(
+        text.matches(r#""add_timestamps": false"#).count(),
+        1,
+        "the snapshot's setting"
+    );
+    PreConfig::from_json(&text.replace(r#""add_timestamps": false"#, r#""add_timestamps": true"#)).unwrap()
 }
 
 /// The raw frames of reference video `prefix`, preprocessed natively.
@@ -267,6 +283,29 @@ fn video_ids_equal_the_processors() {
         rebuilt.push(eos);
         assert_eq!(rebuilt, ids, "timestamped ids = labels + the plain blocks");
         assert_ne!(ids, plain);
+
+        // Natively: the tokenizer's `mm:ss ` ids and the config's blocks make
+        // the golden's ids exactly, from the timestamps of this crate's own
+        // preprocessing and from the golden's.
+        let tok = Tokenizer::from_snapshot(&snapshot()).unwrap();
+        let stamped_cfg = timestamped_config();
+        assert!(stamped_cfg.video.add_timestamps && !cfg.video.add_timestamps);
+        let v0 = native_video(&stamped_cfg, "video0_");
+        let counts = vec![v0.soft_tokens_per_frame; v0.frames.len()];
+        for (what, stamps) in [
+            ("native timestamps", v0.timestamps.clone()),
+            (
+                "golden timestamps",
+                npy("video0_timestamps.npy").f64_slice().unwrap().to_vec(),
+            ),
+        ] {
+            let built = tc.video_sequence_with_timestamps(&tok, &stamps, &counts).unwrap();
+            assert_eq!(built, ids, "video0t: {what}: video_sequence_with_timestamps vs ids.npy");
+        }
+        eprintln!(
+            "video0t: {} ids built through the tokenizer, equal to ids.npy",
+            ids.len()
+        );
         eprintln!(
             "video0t: labels of {:?} ids before each of {frames} blocks",
             prefixes.iter().map(Vec::len).collect::<Vec<_>>()
@@ -365,7 +404,40 @@ fn raw_video_to_embedding_matches_sentence_transformers() {
                 None,
             )
             .unwrap();
-        check_embeddings("timestamped", &["video0t_"], &stamped.embeddings, dim, &mut failures);
+        check_embeddings(
+            "timestamped (Media)",
+            &["video0t_"],
+            &stamped.embeddings,
+            dim,
+            &mut failures,
+        );
+
+        // And natively: the config with `add_timestamps` on, this crate's own
+        // timestamps and the snapshot's tokenizer, in one item.
+        let tok = Tokenizer::from_snapshot(&snapshot()).unwrap();
+        let stamped_cfg = timestamped_config();
+        let v0t = native_video(&stamped_cfg, "video0_");
+        let f0t = inputs(&v0t);
+        assert!(
+            stamped_cfg.video.add_timestamps,
+            "test bug: the config must ask for timestamps"
+        );
+        let item = MmItem::TimestampedVideo {
+            frames: &f0t,
+            timestamps: &v0t.timestamps,
+            tokenizer: &tok,
+        };
+        let native = m.encode(&[item], None).unwrap();
+        check_embeddings(
+            "timestamped (TimestampedVideo)",
+            &["video0t_"],
+            &native.embeddings,
+            dim,
+            &mut failures,
+        );
+        let d = max_abs(&native.embeddings, &stamped.embeddings);
+        eprintln!("TimestampedVideo vs Media with the golden's ids: max abs {d:.3e}");
+        assert!(d <= 1e-5, "TimestampedVideo vs Media: {d:.3e}");
         assert!(
             failures.is_empty(),
             "raw video to embedding out of bounds:\n{}",

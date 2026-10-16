@@ -236,6 +236,12 @@ pub struct VideoConfig {
     pub overflow: Overflow,
     /// `do_sample_frames`: when false every given frame is processed.
     pub do_sample_frames: bool,
+    /// `add_timestamps`: the processor writes each frame's `mm:ss` time in
+    /// front of its block. Preprocessing is the same either way; the setting
+    /// is the sequence layout's, read by the caller (or by a facade item that
+    /// carries the timestamps: `MmItem::TimestampedVideo`) and applied by
+    /// [`crate::embedgemma2::EmbedGemma2Config::video_sequence_with_timestamps`].
+    pub add_timestamps: bool,
 }
 
 /// Everything `processor_config.json` configures.
@@ -442,11 +448,6 @@ fn audio_config(s: &Section<'_>) -> Result<AudioFeatureConfig, String> {
 }
 
 fn video_config(s: &Section<'_>) -> Result<VideoConfig, String> {
-    // `add_timestamps` puts `mm:ss` text before every frame's block in the
-    // token ids, which takes the tokenizer; the id layout this crate builds
-    // (`EmbedGemma2Config::video_sequence`) is the one without. A caller who
-    // wants timestamps lays the ids out itself (`MmItem::Media`).
-    s.require_flag("add_timestamps", false, false)?;
     let image = image_config(s, 70)?;
     // The base class's `fps` is None-able; the EmbeddingGemma2 class defaults 1.
     let fps = match s.obj.get("fps") {
@@ -474,6 +475,8 @@ fn video_config(s: &Section<'_>) -> Result<VideoConfig, String> {
         max_frames,
         overflow,
         do_sample_frames: s.flag("do_sample_frames", true)?,
+        // `False` in the class (video processor:194) and in the snapshot.
+        add_timestamps: s.flag("add_timestamps", false)?,
     })
 }
 

@@ -67,7 +67,9 @@ use common::embedgemma2::{pack_safetensors, RawTensor};
 use common::embedgemma2_mm::{vision_weights, TowerWeight, VisionStorage};
 use common::embedgemma2_vision::{vision_forward, VisionDims, VisionRef};
 use common::{with_gpu, SplitMix};
-use tessl::embedgemma2_vision::{EmbedGemma2VisionModel, ImageInput, VisionConfig, MAX_BATCH_PATCHES};
+use tessl::embedgemma2_vision::{
+    EmbedGemma2VisionModel, ImageInput, VisionConfig, MAX_BATCH_PATCHES, MAX_CALL_IMAGES, MAX_CALL_PATCHES, MAX_IMAGES,
+};
 use tessl::gemm::GemmOperands;
 use tessl::safetensors::SafeTensors;
 
@@ -603,8 +605,90 @@ fn refuses_what_it_cannot_run(operands: GemmOperands) {
         };
         assert!(model.encode_images(&[odd_positions], false).is_err(), "odd positions");
         assert!(model.encode_images(&[], false).is_err(), "empty batch");
-        let many = vec![good.input(); 257];
-        assert!(model.encode_images(&many, false).is_err(), "257 images");
+        // The per-call bounds, by name: images, and padded patches.
+        let many = vec![good.input(); MAX_CALL_IMAGES + 1];
+        let e = model.encode_images(&many, false).expect_err("one image too many");
+        assert!(e.contains("MAX_CALL_IMAGES"), "{e}");
+        let big = Image::new(128, 128, 0, pd, 34); // 16384 patches: a whole forward
+        let full = vec![big.input(); MAX_CALL_PATCHES / MAX_BATCH_PATCHES];
+        let over = vec![big.input(); MAX_CALL_PATCHES / MAX_BATCH_PATCHES + 1];
+        model.check_images(&full).expect("a call at the patch bound");
+        for call in [
+            model.check_images(&over).map(|_| ()),
+            model.encode_images(&over, false).map(|_| ()),
+            model.queue_images(&over, false).map(|_| ()),
+        ] {
+            let e = call.expect_err("past the patch bound");
+            assert!(e.contains("MAX_CALL_PATCHES") && e.contains("padded patches"), "{e}");
+        }
+        // Refused, and nothing was queued: the model works.
+        let again = model.encode_images(&[good.input()], false).unwrap();
+        assert_eq!(bits(&again.soft[0]), bits(&ok.soft[0]), "after the bounds");
+    });
+}
+
+/// 300 images (past the 256 a forward holds) in one call equal the same images
+/// in two calls of 150, bit for bit, each also equal to itself alone: the call
+/// runs as two forwards behind one wait, with the activations poisoned and the
+/// runtime asynchronous.
+#[test]
+fn a_call_past_the_forward_cap_matches_smaller_calls() {
+    a_call_past_the_forward_cap(GemmOperands::ExactF32);
+}
+
+#[test]
+fn a_call_past_the_forward_cap_matches_smaller_calls_at_bf16() {
+    a_call_past_the_forward_cap(GemmOperands::Bf16);
+}
+
+fn a_call_past_the_forward_cap(operands: GemmOperands) {
+    let (cfg, w) = setup(operands, 13);
+    let st = open("many", safetensors_bytes(&w, &[], &[]));
+    let pd = cfg.patch_dim() as usize;
+    const N: usize = 300;
+    const _: () = assert!(N > MAX_IMAGES && N <= MAX_CALL_IMAGES);
+    // Four shapes with and without padding, each image with pixels of its own.
+    let shapes = [(2, 2, 4), (4, 2, 0), (2, 4, 4), (4, 4, 0)];
+    let imgs: Vec<Image> = (0..N)
+        .map(|k| {
+            let (w, h, pad) = shapes[k % shapes.len()];
+            Image::new(w, h, pad, pd, 100 + k as u64)
+        })
+        .collect();
+    let all: Vec<ImageInput<'_>> = imgs.iter().map(Image::input).collect();
+    with_gpu(|rt| {
+        let model = EmbedGemma2VisionModel::load_with(rt, &st, cfg.clone(), operands).unwrap();
+        let (first, second) = (
+            model.encode_images(&all[..N / 2], false).unwrap(),
+            model.encode_images(&all[N / 2..], false).unwrap(),
+        );
+        assert_eq!(
+            (first.forwards, second.forwards),
+            (1, 1),
+            "test bug: 150 images fit a forward"
+        );
+        assert_eq!(
+            model.check_images(&all).unwrap(),
+            [first.tokens.clone(), second.tokens.clone()].concat(),
+            "the soft-token counts of a call past the cap"
+        );
+
+        rt.set_async_encode(true).unwrap();
+        rt.set_poison_unzeroed(true);
+        let big = model.encode_images(&all, false);
+        rt.set_poison_unzeroed(false);
+        rt.set_async_encode(false).unwrap();
+        let big = big.unwrap();
+        assert_eq!(big.forwards, 2, "{N} images are two forwards of at most {MAX_IMAGES}");
+        let small: Vec<&Vec<f32>> = first.soft.iter().chain(&second.soft).collect();
+        for (i, (got, want)) in big.soft.iter().zip(&small).enumerate() {
+            assert_eq!(bits(got), bits(want), "image {i}: one call of {N} vs two of {}", N / 2);
+        }
+        for i in [0, 1, 255, 256, 299] {
+            let alone = model.encode_images(&[all[i]], false).unwrap();
+            assert_eq!(bits(&big.soft[i]), bits(&alone.soft[0]), "image {i}: vs alone");
+        }
+        assert_eq!(big.tokens, [first.tokens, second.tokens].concat());
     });
 }
 

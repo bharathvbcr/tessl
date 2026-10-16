@@ -32,6 +32,11 @@
 //!   of both clips (99 frames: 25 rows; 330 frames of which 329 are valid: 83);
 //! * the soft tokens within `1e-4` of their largest magnitude too;
 //! * each clip alone and inside one batch bit for bit equal.
+//!
+//! `GemmOperands::Bf16` has its own two tests below (the tower alone against the
+//! fp32 goldens by cosine, batch-independent; the clip embeddings end to end
+//! against fp32 and transformers' bf16 forward), with the floors measured on
+//! this checkpoint and recorded beside the constants.
 
 mod common;
 
@@ -53,6 +58,11 @@ const LAYER_REL: f64 = 1e-4;
 // the soft tokens about 4x further from 1 than the worst clip, the embeddings the floors
 // `tests/embedgemma2_mm_model.rs` and the vision test hold a bf16 forward to.
 const SOFT_COS_FLOOR: f64 = 0.9997;
+// Two 90 s clips (2250 tokens each), bf16 against the exact forward, token by
+// token: whole clips at cosine 0.999904 and 0.999911, the worst single token
+// at 0.994434 and 0.996582. The floor leaves the worst token's distance from 1
+// a factor of 1.8 of room.
+const LONG_TOKEN_COS_FLOOR: f64 = 0.99;
 const EMB_COS_FLOOR: f64 = 0.9999;
 const HF_COS_FLOOR: f64 = 0.9996;
 const BATCH_ABS: f64 = 1e-5;
@@ -345,6 +355,53 @@ fn embedgemma2_audio_bf16_is_batch_independent_and_close_to_fp32() {
             }
             if bits(a) != bits(&r.soft_tokens[1 - i]) {
                 failures.push(format!("{}: reversed call differs from alone", CLIPS[i]));
+            }
+        }
+
+        // Long clips, which the goldens are not: 90 s of frames (hundreds of
+        // attention blocks), two of them, which together pass the frame budget
+        // of one forward (two forwards). Each token of the bf16 forward against
+        // the same token of the exact one.
+        let exact = EmbedGemma2Audio::load(rt, &st, "", cfg.clone()).unwrap();
+        let long = |frames: usize, shift: usize| {
+            let (base, mels) = (&inputs[1], cfg.mel_bins() as usize);
+            let mut f = Vec::with_capacity(frames * mels);
+            for r in 0..frames {
+                let src = (r + shift) % base.mask.len();
+                f.extend_from_slice(&base.input_features[src * mels..(src + 1) * mels]);
+            }
+            AudioInput {
+                input_features: f,
+                mask: vec![true; frames],
+            }
+        };
+        let clips = [long(9000, 0), long(9000, 41)];
+        let (want, got) = (
+            exact.encode_audio(&clips, false).unwrap(),
+            model.encode_audio(&clips, false).unwrap(),
+        );
+        assert_eq!(
+            (want.forwards, got.forwards),
+            (2, 2),
+            "18,000 frames pass one forward's budget"
+        );
+        let width = cfg.embed_dim as usize;
+        for (i, (w, g)) in want.soft_tokens.iter().zip(&got.soft_tokens).enumerate() {
+            assert_eq!(w.len(), g.len(), "long clip {i}: tokens");
+            let worst = w
+                .chunks(width)
+                .zip(g.chunks(width))
+                .map(|(a, b)| cosine(a, b))
+                .fold(f64::INFINITY, f64::min);
+            let whole = cosine(g, w);
+            eprintln!(
+                "long clip {i} ({} tokens): bf16 vs exact cosine {whole:.9}, worst token {worst:.9}",
+                w.len() / width
+            );
+            if worst < LONG_TOKEN_COS_FLOOR {
+                failures.push(format!(
+                    "long clip {i}: a token is at cosine {worst:.9} from the exact forward's (floor {LONG_TOKEN_COS_FLOOR})"
+                ));
             }
         }
         assert!(

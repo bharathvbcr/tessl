@@ -24,6 +24,12 @@
 //! `1e-4` of their largest magnitude; the soft tokens within `1e-4` max abs
 //! (they are RMS-normalized then projected: unit scale); a clip alone and
 //! inside the batch bit for bit equal.
+//!
+//! `GemmOperands::Bf16` runs the same checkpoints and clips against the same f64
+//! forward within the looser bounds of [`BF16`] (measured, then set at twice the
+//! worst), with the same batch-independence and poisoned-activation checks, and
+//! `bf16_mode_is_not_the_exact_forward` shows the mode is not the exact forward
+//! under another name.
 
 mod common;
 

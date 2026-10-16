@@ -223,7 +223,10 @@ fn one_call_over_texts_images_and_clips_matches_sentence_transformers() {
         assert!(max_abs(&cut.embeddings, &want) <= BATCH_ABS, "truncate_dim 256");
     });
 
-    // The text encoder and both towers in bf16.
+    // The text encoder and both towers in bf16. Measured (Apple M5 Pro, sdpa
+    // goldens, snapshot 914f7f89), cosine against the fp32 reference: image 0
+    // 0.999987688, image 1 0.999988499, clip 0 0.999993428, clip 1 0.999985708;
+    // with the audio tower exact the clips were 0.999995 and 0.999994.
     with_gpu(|rt| {
         let m = EmbedGemma2Multimodal::load(rt, &snap, GemmOperands::Bf16).unwrap();
         assert_eq!(m.text().operands(), GemmOperands::Bf16);

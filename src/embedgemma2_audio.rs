@@ -100,8 +100,9 @@
 //! a GEMM take the type of their output from the host ([`ActStore`]) in the
 //! same entry, so the bf16 mode adds no kernel entry. q, k and v are one
 //! `[hidden, 3 * hidden]` GEMM on one clamped input whenever their input clamps
-//! are equal (every layer of the checkpoint). The sinusoidal table, `relative_k_proj` of it and the
-//! query scale are computed once per layer at load.
+//! are equal (every layer of the checkpoint). The sinusoidal table,
+//! `relative_k_proj` of it and the query scale are computed once per layer at
+//! load.
 
 use std::borrow::Borrow;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -1746,8 +1747,8 @@ struct Bf16Acts {
     /// linears), and at the ends of the forward the input projection's (the
     /// subsampling's output cast) and the output projection's (the residual
     /// stream cast) and the embedder's (the weightless norm's output).
-    /// Each is read by its GEMM before the next is written: the GPU runs the
-    /// dispatches of a forward in order.
+    /// Each is read by its GEMM before the next is written: the runtime separates
+    /// dispatches with barriers, and the f32 forward reuses its `n` the same way.
     n: Tensor,
     /// q's clamped attention input; a split projection's k's and v's are `ck`
     /// and `cv` (`None` when every layer fuses them).

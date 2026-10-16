@@ -152,7 +152,7 @@ named as such by the Python binding.
 
 | Entry | Does |
 |---|---|
-| `tessl_embedgemma2_load_multimodal(runtime, dir, dir_len, operands, &out, err, err_len)` | `tessl_embedgemma2_load` with the vision and audio towers as well: one read of `config.json`, one open of `model.safetensors`. `operands` is `TESSL_OPERANDS_EXACT_F32` (0) or `TESSL_OPERANDS_BF16` (1) and applies to the **text encoder and the vision tower**; the audio tower is exact f32 under either (it has no bf16 mode). The handle takes every text entry too, and `_free` |
+| `tessl_embedgemma2_load_multimodal(runtime, dir, dir_len, operands, &out, err, err_len)` | `tessl_embedgemma2_load` with the vision and audio towers as well: one read of `config.json`, one open of `model.safetensors`. `operands` is `TESSL_OPERANDS_EXACT_F32` (0) or `TESSL_OPERANDS_BF16` (1) and applies to the **text encoder and both towers** (the audio tower since [Audio tower bf16 and speed](#audio-tower-bf16-and-speed)). The handle takes every text entry too, and `_free` |
 | `tessl_embedgemma2_encode_images(model, pixel_values, pixel_values_len, position_ids, position_ids_len, offsets, n_images, truncate_dim, out, out_len, err, err_len)` | `pixel_values` f32 `[offsets[n_images], patch_dim]` and `position_ids` i32 `[offsets[n_images], 2]`, the processor's `pixel_values` and `image_position_ids` with the images laid end to end (padding patches `(-1, -1)` included), `offsets` CSR-style `u64` over patch rows; `out` is f32 `[n_images, dim]`, one row per image |
 | `tessl_embedgemma2_encode_audio(model, input_features, input_features_len, input_features_mask, mask_len, offsets, n_clips, truncate_dim, out, out_len, err, err_len)` | `input_features` f32 `[offsets[n_clips], mel_bins]` and the mask one byte per frame (0 or 1; any other byte is refused), `offsets` over frames; one row per clip |
 
@@ -389,13 +389,13 @@ let out = m.encode(&items, Some(256))?;       // EncodeOutput: one row per item,
   finite pixels that overflow the patch projection). The check cannot name the
   tower row or column.
 * **Precision.** One `GemmOperands` (`ExactF32` or `Bf16`) configures the text
-  encoder and the vision tower alike (`EmbedGemma2VisionModel::load_with`, [Vision
-  tower](#vision-tower)): it is one flag because both make one precision claim to
-  the caller, and a caller composing the models by hand (`from_parts`) can still
-  mix them. The audio tower is exact f32 under both: it has no bf16 mode (lane I
-  owns it). The call refuses a runtime with relaxed f32 GEMMs on when it holds
-  clips or the mode is `ExactF32`; a `Bf16` call of text and images runs no f32
-  GEMM and accepts it.
+  encoder and both towers alike (`EmbedGemma2VisionModel::load_with`, [Vision
+  tower](#vision-tower); `EmbedGemma2Audio::load_with`, [Audio tower bf16 and
+  speed](#audio-tower-bf16-and-speed)): it is one flag because they make one
+  precision claim to the caller, and a caller composing the models by hand
+  (`from_parts`) can still mix them. The call refuses a runtime with relaxed f32
+  GEMMs on when the mode is `ExactF32`; a `Bf16` call runs no f32 GEMM in any of
+  the three models and accepts it.
 * **Refusals** come before any allocation or wait: the batch size, each
   tower's input checks, the text checks, the placeholder counts. A refused call
   leaves the facade usable.
@@ -425,7 +425,7 @@ Pro, 2026-10-15, sdpa goldens, snapshot `914f7f89`:
 | 8 texts (10 to 6147 tokens), 2 images, 2 clips in one call, vs `emb_f32` | max abs `1e-4`, cosine `>= 0.99999` | texts `1.2e-7` to `3.0e-7`, images `1.3e-7` / `2.1e-7`, clips `2.2e-7` / `2.5e-7`; cosine 1.000000000; 5 text forwards, 1 wait (27a0407: the same errors digit for digit, 2 waits) |
 | each image and clip alone vs inside that call | `1e-5` | 0 (bit for bit) |
 | media alone, mixed call, texts alone: waits | exact | 1; 1; 1 (media alone and mixed were 2) |
-| text encoder and vision tower `Bf16`, audio tower exact, 4 media rows vs fp32 | cosine `>= 0.9999` | 0.999987 to 0.999995 (images 0.999988, 0.999988; clips 0.999995, 0.999994) |
+| text encoder and both towers `Bf16`, 4 media rows vs fp32 | cosine `>= 0.9999` | 0.999986 to 0.999993 (images 0.999988, 0.999988; clips 0.999993, 0.999986; the clips were 0.999995, 0.999994 with the audio tower exact) |
 | Python, `encode_images` / `encode_audio`, alone and in one call | `1e-4`, `0.99999`; alone vs batch `1e-5` | `2.2e-7` to `3.8e-7`, cosine 1.000000000; alone vs batch 0 |
 | Python, `embed_images` / `embed_audio` with transformers 5.19's processor on the generator's inputs | processor tensors vs saved `1e-6`, then the same embedding bounds | tensors identical (0), `3.8e-7` and `3.0e-7`, cosine 1.000000000 |
 
@@ -904,12 +904,11 @@ norms do not bound it), so the layer-15 absolute error of `3e-2` is the same
 
 `EmbedGemma2VisionModel::load_with(rt, st, cfg, operands)` takes the text
 encoder's `GemmOperands`; `load` is `load_with(.., ExactF32)`. One flag covers
-the text encoder and the vision tower of the facade
+the text encoder and both towers of the facade
 (`EmbedGemma2Multimodal::load(.., operands)`, `tessl_embedgemma2_load_multimodal`'s
 `operands`, `EmbedGemma2.from_pretrained(.., multimodal=True, operands="bf16")`).
-The audio tower stays exact f32 under either flag: its bf16 mode belongs to its
-own lane (the audio tower's section below), and until it lands a `Bf16` load
-runs the audio tower exactly as `ExactF32` does.
+The audio tower follows it too since its bf16 mode ([Audio tower bf16 and
+speed](#audio-tower-bf16-and-speed)).
 
 **`ExactF32` is bit for bit what it was.** Checked by hashing the output bits
 (FNV-1a over the soft tokens) before and after on the same inputs: the tiny

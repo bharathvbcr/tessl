@@ -256,23 +256,35 @@ tensors. The goldens are `tools/embedgemma2_ref/make_mm_reference.py`.
   **verified** (code).
 * Pooling cost: < 0.2 % of an encode. **verified** (committed result).
 
-## Work plan (this session)
+## Status at close (2026-10-16)
 
-Four lanes, each in its own worktree and target directory, with files
-partitioned so no two lanes edit the same region:
+All work is on the local branch `eg2/integrate` (not pushed; `main` is still
+60a6240). Every merge was verified on the merged tree: fmt, clippy and rustdoc
+with `-D warnings`, the device test binaries, the six real-checkpoint suites
+(`--ignored`), `scripts/hosted_tests.sh` and `--outside`, and the Python
+binding tests. Whole-encode result: `bench/results/embedgemma2_final_m5pro.*`.
 
-| Lane | Gap | Files |
-|---|---|---|
-| A | G1 scoped batch | `src/runtime.rs` (scope API), `src/embedgemma2.rs` `encode()` only, tests |
-| B | G2 bf16 path | `src/embedgemma2.rs` load/Layer/forward, tests, bench flag |
-| C | G3 C ABI + Python | new `src/capi_embedgemma2.rs`, `python/tessl_torch/embedgemma2.py`, tests |
-| D | G5 + G6 measurement | `bench/results/`, a profiling bench binary |
+| Gap | Status | Merge | Evidence |
+|---|---|---|---|
+| G1 per-dispatch waits | resolved: `GpuRuntime::async_scope`; `encode` waits once | d13d1d3 (A) | `tests/async_scope.rs`; 1x16 84.9 -> 7.4 ms (`embedgemma2_before_after_m5pro.txt`) |
+| G2 no bf16 path | resolved: `GemmOperands::Bf16` (B), bf16 attention tiles (E), vision tower bf16 (J); audio tower stays exact f32 | e5be45e, 16f5190, 224be3f | `tests/embedgemma2_model.rs`; 2.75x to 3.0x faster than 60a6240 from 64x32 up (`embedgemma2_final_m5pro.txt`) |
+| G3 no C ABI / Python | resolved: text (C), multimodal (F) | ac5364a, 433e659 | `tests/capi_embedgemma2*.rs`, `tests/capi_contract.rs`, `python/tests/test_embedgemma2*.py` |
+| G4 tokenizer | open: needs the owner's decision on a dependency (Python callers pass a tokenizer today) | - | - |
+| G5 stage profile | resolved (D); towers profiled (I, J) | 2e7ba35 | `embedgemma2_stage_profile_m5pro.txt`, `embedgemma2_{audio,vision}_profile_m5pro.txt` |
+| G6 device peak | resolved: 1652 -> 466 MiB above the model (H); towers release before their wait (K) | 27a0407, 03dae0f | `tests/embedgemma2_memory.rs`, `embedgemma2_memory_m5pro.txt` |
+| G7 elementwise dispatches | partly: audio tower 28 -> 17 dispatches per layer (I), vision RoPE table (J); text-encoder fusion not done | ae11582, 224be3f | `embedgemma2_audio_profile_m5pro.txt` (end-to-end audio speed-up not shown: noise) |
+| G8 vision and audio towers | resolved: towers (M1, M2), merge (M3), facade (F), one host wait per media call (K) | 6eedd5a, 06465a9, 908c3a2, 433e659, 03dae0f | `tests/embedgemma2_e2e_model.rs`: max abs 3.8e-7 against sentence-transformers |
+| 1x16 latency (from G5) | resolved for ExactF32: opt-in split-K for the text encoder only (G) | f1a8677 | 1x16 0.60x (`embedgemma2_small_m_m5pro.txt`, `embedgemma2_final_m5pro.txt`) |
 
-Then, as lanes free up (at most four agents at once): M1 the vision tower
-and M2 the audio tower, each held layer by layer to the multimodal goldens,
-and M3 the merge (placeholder rows overwritten by soft tokens before the
-text encoder), held to sentence-transformers' image and audio embeddings.
+Found on the way:
 
-G4 waits for the owner's decision on a tokenizer dependency. G7 waits for
-G5's ranking. GPU benchmarks run one at a time, paired and interleaved
-(`bench_paired`), because run-to-run noise on this machine is about ±30 %.
+* transformers 5.19's eager attention inverts the audio tower's mask
+  (`logical_not()` of a float mask); the multimodal goldens are now sdpa, and
+  `eager_references_encode_the_inverted_mask` pins the disagreement (06465a9).
+* `embedgemma2_memory` read a process-wide device figure, so its result
+  depended on test order; device-byte tests now run in a child process (7459e16).
+
+Still open: G4; text-encoder elementwise fusion (G7); an audio tower bf16 mode;
+video; a C/Python entry for caller-built ids with media (`MmItem::Media`); the
+pool-level recycle at allocation time; the audio tower's end-to-end speed-up on
+a quiet machine.

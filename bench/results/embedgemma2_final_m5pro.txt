@@ -58,7 +58,8 @@ Reading
   * Device peak above the model is 3.0x to 3.9x lower in both modes (lane H: activations released
     before the wait, a 16 MiB per-layer-input run, q|k|v sharing gate|up's buffer). The timed
     workloads run back to back in one process, so the before figures include the second activation
-    set that 60a6240 kept across consecutive encodes.
+    set that 60a6240 kept across consecutive encodes (lane D's accounting, reconciled to 0.01 MiB in
+    embedgemma2_stage_profile_m5pro.txt).
   * Not in this bench: the vision and audio towers and the multimodal facade (their own results:
     embedgemma2_vision_speed_m5pro, embedgemma2_audio_speed_m5pro, embedgemma2_mm_onewait_m5pro).
 

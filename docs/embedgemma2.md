@@ -2396,3 +2396,108 @@ to the next allocation with no commit between, with the same buffers and the
 same device bytes, and the in-flight cases above hold. The decision logic
 under a hand-set lifetime event and under a held `active_m4` lock is in
 `runtime::alloc_recycle_tests`.
+
+## Facade follow-ups
+
+Three loose ends of the multimodal facade, closed together. Navigation was by `rg`
+(the DevMap index is not built for this checkout).
+
+### Timestamped video
+
+`add_timestamps` is native: `PreConfig` reads `video.add_timestamps`,
+`EmbedGemma2Config::video_sequence_with_timestamps(&tokenizer, &timestamps, &soft)`
+builds the processor's ids with the snapshot's tokenizer, and
+`MmItem::TimestampedVideo { frames, timestamps, tokenizer }` embeds the video in one
+item. The layout, the exact ids of `video0t` and the embedding against
+sentence-transformers are in [Video](#video) (ids equal to `ids.npy`, 823 of 823;
+embedding max abs 2.1e-7, cosine 1.000000000, bit for bit the `Media` item with the
+golden's ids).
+
+### Pictures and clips past a forward
+
+A tower call used to be refused above 256 images or clips, though both towers already
+cut a call into forwards (images by padded patches and `MAX_IMAGES`, clips by frames)
+queued behind its one wait. The cap was `check_call`'s, the one place both the
+facade and `encode_images` / `encode_audio` pass, so it is lifted there and not
+worked around in the facade: `queue_images` / `queue_audio` are still one call, one
+`async_scope` and one wait, the soft rows are still the forwards' output buffers read by
+the text encoder's scatter on the device, and `PendingImages::into_device` and
+`PendingAudio::into_device` already handled many forwards. The audio plan also cuts a
+forward at `MAX_CLIPS` clips now (the clip table's size, which a call of 300 short
+clips would otherwise exceed in one forward).
+
+What a longer call costs is memory: every forward's uploaded inputs and its soft tokens
+are held until the call's wait (the one-wait rule), so a call is bounded by the bytes
+they take, refused by name before any allocation:
+
+| Bound | Value | Memory at the bound |
+|---|---|---|
+| `MAX_CALL_IMAGES` (pictures: images and video frames) | 4096 | a sanity bound beside the next one |
+| `MAX_CALL_PATCHES` (padded patches, summed over the forwards) | 2^20 | about 3.4 GiB (`ExactF32`; 3 KiB a patch of pixels, 8 bytes of positions, soft tokens a ninth of the rows) or 1.9 GiB (`Bf16`), beside one activation set |
+| `MAX_CALL_CLIPS` | 4096 | a sanity bound beside the next one |
+| `MAX_CALL_FRAMES` (summed over the clips) | 2^21 (5.8 h) | about 2.5 GiB (1.25 KiB a frame: 512 bytes of features, 768 of soft tokens) beside one activation set |
+
+`MAX_IMAGES` (256) and `MAX_CLIPS` (256) now name what they always bounded, the size
+of one forward; the C ABI (`capi_embedgemma2.rs`) still applies them to `n_images` and
+`n_clips` of its own entries, which is the binding lane's to lift. The bounds are above what
+the old cap admitted in practice (256 images of 2520 patches are 645,120 padded
+patches; 256 clips of 30 s are 768,000 frames), but not above its worst case (256
+images of 16,384 patches, 256 clips of 16,384 frames): those calls are now refused
+naming the bound, and a caller splits them (each call waits once).
+
+Measured, tiny checkpoint (`tests/embedgemma2_vision_tiny.rs`,
+`embedgemma2_audio_tiny.rs`, `embedgemma2_video_tiny.rs`, both operand modes where
+stated), all bit for bit unless said:
+
+| Check | Result |
+|---|---|
+| 300 images in one `encode_images` call (2 forwards: 256 + 44; asynchronous runtime, poisoned activations) vs two calls of 150 | equal, `ExactF32` and `Bf16`; 5 of them vs alone equal |
+| 300 clips (ragged lengths, prefix and gapped masks; 2 forwards cut by the clip table) vs two calls of 150 | equal; 5 vs alone equal |
+| Facade: 150 items of 2 images and 2 clips (300 pictures, 300 clips) in one call vs two calls of 75 | equal, both modes; 1 wait; 5 items vs alone within the text side's batch bound 1e-5 (the towers' rows are the same bits; the text GEMMs tile 14 rows differently from 2100) |
+| Facade: one video of 300 frames vs the by-hand composition with the frames in two tower calls of 150 | equal, both modes; 1 wait |
+| Refusals: 4097 images (`MAX_CALL_IMAGES`), 65 images of 16,384 patches (`MAX_CALL_PATCHES`), 4097 clips, 129 clips of 16,384 frames; the boundary itself passes `check_images` / `check_clips` | refused naming the bound; through the facade 0 allocations, 0 waits |
+
+Mutation check: dropping the clip-table cut from the audio plan fails the 300-clip test
+(`300 clips; need 1..=256`).
+
+### Memory of consecutive calls, and the hand-back
+
+After lane R the pool recycles a dropped buffer at the next allocation when the GPU is
+idle, so consecutive `encode`, vision, audio and facade calls hold exactly one call's
+set, the previous call's output buffer included. `tests/embedgemma2_memory.rs` allowed
+one output buffer above the first call's peak (`extra <= out_bucket`); it now asserts
+`extra == 0` for calls 2 to 4 in both modes. The tiny outputs were under 16 KiB, below
+which the device does not charge a buffer's own length, so the tests would not have
+seen a missed output at all; they now use batches whose output is 16 KiB or more, and
+assert it.
+
+With `recycle_if_idle` stubbed to a no-op (temporarily, in `src/runtime.rs`, reverted),
+the tightened tests fail, each by exactly one output buffer (`ExactF32`; the first
+mode's failure ends a test):
+
+| Test | Peak above the first call, stubbed | Now | One call's set |
+|---|---|---|---|
+| `consecutive_encodes_hold_one_activation_set` | 16,384 B | 0 | 36,732,928 B |
+| `consecutive_vision_calls_hold_one_activation_set` | 32,768 B | 0 | 6,520,832 B |
+| `consecutive_audio_calls_hold_one_activation_set` | 16,384 B | 0 | 802,816 B |
+| `consecutive_facade_calls_hold_one_activation_set` | 32,768 B | 0 | 26,181,632 B |
+
+(`Bf16` is 0 now, measured; its stubbed figure was not taken.) The old bound
+`extra <= out_bucket` passes the stubbed build, which is why it was loose.
+
+**The hand-back stays.** `encode`, the towers and the facade hand their activations and
+uploaded inputs to the runtime before their wait. With the pool fix that is redundant
+for back-to-back calls: measured by holding the text encoder's set until after the wait
+(the pre-R behaviour of `encode`), `consecutive_encodes_hold_one_activation_set` passes
+at `extra == 0`. It is not redundant for a call that starts while its caller has work
+open: `recycle_if_idle` does nothing while a command buffer is open or the GPU has
+not caught up, so a set that was only dropped after the previous wait is not reused
+then. `an_encode_beside_open_work_reuses_the_previous_calls_set` encodes a copy in an
+open `async_scope`, then calls `encode`: with the hand-back the call reaches exactly
+one fresh output (16,384 B) above the first call's peak; with the set held until the
+wait instead, the same test reached 36,470,784 B, a whole second set. So the
+hand-back is defence the pool fix does not replace, it costs nothing, and it is kept
+(`src/embedgemma2.rs` `queue_impl`, `embedgemma2_vision.rs` and
+`embedgemma2_audio.rs` `queue_impl`, the facade's `drop((image_soft, clip_soft))`). The
+open-work case was measured for the text encoder only; the towers and the facade use
+the same pattern and were not measured held-back.

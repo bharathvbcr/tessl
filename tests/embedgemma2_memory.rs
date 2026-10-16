@@ -15,7 +15,7 @@ mod common;
 
 use common::embedgemma2::{open, safetensors_bytes, weights_for, CONFIG, PREFIX};
 use common::embedgemma2_mm::{checkpoint_bytes, clip, config_json, configs, Configs, Image, AUDIO, IMAGE};
-use common::with_gpu;
+use common::{in_child, with_gpu};
 use tessl::embedgemma2::{EmbedGemma2Config, EmbedGemma2Model, PLE_RUN_BYTES};
 use tessl::embedgemma2_audio::{AudioInput, EmbedGemma2Audio};
 use tessl::embedgemma2_mm::{EmbedGemma2Multimodal, MmItem};
@@ -44,6 +44,14 @@ fn cold(n: usize) -> u64 {
 /// rows). `encode` now releases them before its wait, so the wait recycles them.
 #[test]
 fn consecutive_encodes_hold_one_activation_set() {
+    in_child(
+        "consecutive_encodes_hold_one_activation_set",
+        &[],
+        consecutive_encodes_hold_one_activation_set_in_process,
+    );
+}
+
+fn consecutive_encodes_hold_one_activation_set_in_process() {
     let cfg = EmbedGemma2Config::from_config_json(CONFIG).unwrap();
     let seqs = batch(cfg.vocab);
     let refs: Vec<&[u32]> = seqs.iter().map(Vec::as_slice).collect();
@@ -144,6 +152,14 @@ fn tiny_embedding_hashes() {
 /// buffer added to the set, or one that stops sharing, moves the total.
 #[test]
 fn one_encode_allocates_the_itemized_set() {
+    in_child(
+        "one_encode_allocates_the_itemized_set",
+        &[],
+        one_encode_allocates_the_itemized_set_in_process,
+    );
+}
+
+fn one_encode_allocates_the_itemized_set_in_process() {
     let cfg = EmbedGemma2Config::from_config_json(CONFIG).unwrap();
     let seqs = batch(cfg.vocab);
     let refs: Vec<&[u32]> = seqs.iter().map(Vec::as_slice).collect();
@@ -194,6 +210,15 @@ fn one_encode_allocates_the_itemized_set() {
         let (want, slack) = (big.iter().sum::<u64>(), small.iter().sum::<u64>());
         let w = weights_for(&cfg, 43, operands);
         let st = open("memory_itemized", safetensors_bytes(&w, &[]));
+        // Pipelines are compiled on a kernel's first use and charged to the
+        // device outside the pool (256 KiB here), once per process. Whether an
+        // earlier test in this binary paid that depended on test order, so one
+        // warm-up encode on a runtime of its own pays it first; the bytes
+        // asserted are the second runtime's.
+        with_gpu(|rt| {
+            let model = EmbedGemma2Model::load_with(rt, &st, PREFIX, cfg.clone(), operands).unwrap();
+            model.encode(&refs, None, false).unwrap();
+        });
         with_gpu(|rt| {
             let model = EmbedGemma2Model::load_with(rt, &st, PREFIX, cfg.clone(), operands).unwrap();
             rt.synchronize().unwrap();
@@ -248,6 +273,14 @@ fn bits_of(v: &[f32]) -> Vec<u32> {
 /// releases them before the wait, so the wait recycles them.
 #[test]
 fn consecutive_vision_calls_hold_one_activation_set() {
+    in_child(
+        "consecutive_vision_calls_hold_one_activation_set",
+        &[],
+        consecutive_vision_calls_hold_one_activation_set_in_process,
+    );
+}
+
+fn consecutive_vision_calls_hold_one_activation_set_in_process() {
     let c = configs();
     let (images, _) = tower_media(&c);
     let inputs: Vec<ImageInput<'_>> = images.iter().map(Image::input).collect();
@@ -287,6 +320,14 @@ fn consecutive_vision_calls_hold_one_activation_set() {
 /// The same for the audio tower (exact f32 under either text mode).
 #[test]
 fn consecutive_audio_calls_hold_one_activation_set() {
+    in_child(
+        "consecutive_audio_calls_hold_one_activation_set",
+        &[],
+        consecutive_audio_calls_hold_one_activation_set_in_process,
+    );
+}
+
+fn consecutive_audio_calls_hold_one_activation_set_in_process() {
     let c = configs();
     let (_, clips) = tower_media(&c);
     let st = open("memory_audio", checkpoint_bytes(&c, 17, GemmOperands::ExactF32));
@@ -329,6 +370,14 @@ fn consecutive_audio_calls_hold_one_activation_set() {
 /// before the call's one wait.
 #[test]
 fn consecutive_facade_calls_hold_one_activation_set() {
+    in_child(
+        "consecutive_facade_calls_hold_one_activation_set",
+        &[],
+        consecutive_facade_calls_hold_one_activation_set_in_process,
+    );
+}
+
+fn consecutive_facade_calls_hold_one_activation_set_in_process() {
     let c = configs();
     let (images, clips) = tower_media(&c);
     let text_ids: Vec<u32> = (0..24u32).map(|i| 3 + i % 40).collect();

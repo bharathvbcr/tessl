@@ -104,9 +104,10 @@ All notable changes to `tessl` are recorded here. The format follows
   collect, now queued under a `GpuRuntime::async_scope` (before, a runtime in
   its default mode committed and waited per dispatch);
   `EmbedGemma2Model::check_sequences` is `encode`'s id checks, shared. A call
-  with media waits twice (the towers, then the text encoder: the soft tokens
-  cross the host), a call of texts once, three for the by-hand composition;
-  the GPU-resident hand-off that would make it one is not done. `GemmOperands`
+  with media waited twice (the towers, then the text encoder: the soft tokens
+  crossed the host), a call of texts once, three for the by-hand composition;
+  the GPU-resident hand-off that made it one was a later change, recorded in
+  Changed above. `GemmOperands`
   applies to the text encoder and, from the vision-tower bf16 entry below, the vision tower; the audio tower stays exact f32.
   C ABI, additive (ABI 11 unchanged): `tessl_embedgemma2_load_multimodal` and
   `tessl_embedgemma2_{encode_images, encode_audio}` take a processor's

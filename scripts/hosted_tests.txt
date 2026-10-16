@@ -17,7 +17,7 @@ bin bench_paired_cli 29
 bin build_artifact_contract 2
 bin capi_contract 77
 bin check_kernel_ir_planted 6
-bin dialect_lint_script 5
+bin dialect_lint_script 12
 bin docs_name_real_tools 6
 bin embedgemma2_audio_fixtures 2
 bin embedgemma2_pre 5
@@ -34,6 +34,8 @@ bin npy_hardening 4
 bin parser_mutation 13
 bin qwen35_config 5
 bin relaxed_predicate 1
+bin results_report 17
+bin release_check 14
 bin safetensors 12
 bin shader_index_arithmetic 23
 bin icb_flag_env 4
@@ -55,6 +57,7 @@ exact capi_embedgemma2_multimodal a_null_handle_is_refused_by_the_multimodal_ent
 exact embedgemma2_kernels attention_reference_matches_transformers config_reads_the_checkpoint config_refuses_what_the_forward_does_not_implement ple_reference_matches_transformers pool_reference_matches_transformers qkv_norm_rope_reference_matches_transformers rope_inv_freq_matches_the_models_tables
 exact embedgemma2_audio_tiny the_bounds_bite
 exact embedgemma2_mm_tiny config_keeps_the_ids_and_the_builders_lay_out_the_processor_ids
+exact embedgemma2_video_tiny a_config_with_timestamps_on_is_refused_by_name video_sequence_is_the_processors_layout
 exact embedgemma2_vision_kernels plan_pooling_matches_the_dense_reference
 exact embedgemma2_vision_tiny config_reads_the_checkpoint config_refuses_what_the_forward_does_not_implement
 exact f16 f16_and_bf16_are_not_interchangeable host_conversion_round_trips_and_matches_known_bit_patterns host_round_trip_is_exact_for_representable_values
@@ -74,7 +77,7 @@ exact tune_rigs_refuse_missing_variants every_rig_that_flags_drift_exits_3
 
 # Unit tests of the src/bin targets (bench drivers, probes, and bench common::tests):
 # every one of them is device-free. One cargo invocation, counted as a total.
-bins 198
+bins 209
 
 # Library tests.
 lib ab_flags::tests:: 10

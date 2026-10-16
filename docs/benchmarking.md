@@ -682,6 +682,29 @@ and the attention kernels differ between the copies. They are listed in
 [`bench/results/PROVENANCE.md`](../bench/results/PROVENANCE.md). Wherever this
 document presents one of them, it says "imported".
 
+### Rebuilding the EmbedGemma 2 results: `results_report`
+
+The EmbedGemma 2 memory, small-M, stage-profile, vision-profile and
+text-fusion result files in `bench/results/` are written by one tool,
+`cargo run --release --bin results_report -- SUBCOMMAND ...`
+(`src/bin/results_report/`; the module docs of each subcommand name its
+inputs):
+
+| subcommand | writes | from |
+| --- | --- | --- |
+| `memory RAW OUT` | `embedgemma2_memory_m5pro.{json,txt}` | `profile_embedgemma2` memory tables and hashes, `bench_paired --out` lane directories, `bounds.txt` |
+| `small-m RESULTS RAW BEFORE AFTER CONTROL` | `embedgemma2_small_m_m5pro.json` and the printed tables | three `bench_paired` runs and `bench_gemm_routes` lane `nnsmall` |
+| `stage OUT PASS.json... [--gemm ...] [--contended STEM...]` | `embedgemma2_stage_profile_m5pro.json`, `..._tables.txt` | `profile_embedgemma2 PROFILE_MODE=stages` passes and the other modes' files |
+| `vision OUT LABEL=PASS.json...` | `embedgemma2_vision_profile_m5pro.json` and the printed tables | `profile_embedgemma2_vision` passes |
+| `text-fusion OUT LABEL=FILE.json...` | `embedgemma2_text_fusion_profile_m5pro.json`, `..._tables.txt` | `profile_embedgemma2 PROFILE_MODE=stages` runs of the text encoder |
+
+It replaced five stdlib-only Python scripts and reproduces their output byte
+for byte, including Python's `int`/`float` distinction, `repr` of floats and
+`json.dumps` (`tests/results_report.rs` rebuilds the committed JSON files from
+the passes they embed, and checks golden outputs the scripts wrote). The
+`*_plot.py` scripts read the JSON it writes. It stops with a named error where
+a script raised (a missing key, a division by zero).
+
 ## Every recorded result, plotted
 
 One figure per family of files in `bench/results/`. Blue always means the new

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Fail closed before tag / cargo publish / GitHub Release.
 # Catches version triad drift, dirty trees, and oversized/stale package contents.
-# Portable: uses python3 + grep/sed only (no ripgrep) so GitHub runners work.
+# Portable: uses rustc + grep/sed only (no ripgrep, no Python) so GitHub runners work.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -20,31 +20,15 @@ if [[ -n "$(git status --porcelain)" ]]; then
   exit 1
 fi
 
-readme_ver="$(
-  python3 - <<'PY'
-import pathlib, re, sys
-text = pathlib.Path("README.md").read_text()
-m = re.search(r"\*\*Status\*\* \| \[`([0-9]+\.[0-9]+\.[0-9]+)`\]", text)
-sys.stdout.write(m.group(1) if m else "")
-PY
-)"
-if [[ "$readme_ver" != "$version" ]]; then
-  echo "error: README Status is '${readme_ver:-<missing>}' but Cargo.toml is '$version'" >&2
-  exit 1
-fi
+# The README / CHANGELOG / Cargo.lock text checks are src/bin/release_check.rs,
+# built here with a bare rustc: it is std-only, so it needs neither the crate's
+# dependencies nor the Metal toolchain, and it runs before either is built.
+RC_DIR="$(mktemp -d)"
+trap 'rm -rf "$RC_DIR"' EXIT
+rustc --edition 2021 -O -o "$RC_DIR/release_check" src/bin/release_check.rs
 
-changelog_ver="$(
-  python3 - <<'PY'
-import pathlib, re, sys
-text = pathlib.Path("CHANGELOG.md").read_text()
-m = re.search(r"^## \[([0-9]+\.[0-9]+\.[0-9]+)\]", text, re.M)
-sys.stdout.write(m.group(1) if m else "")
-PY
-)"
-if [[ "$changelog_ver" != "$version" ]]; then
-  echo "error: newest CHANGELOG version is '${changelog_ver:-<missing>}' but Cargo.toml is '$version'" >&2
-  exit 1
-fi
+"$RC_DIR/release_check" readme README.md "$version"
+"$RC_DIR/release_check" changelog CHANGELOG.md "$version"
 
 if ! grep -q "^\[${version}\]:" CHANGELOG.md; then
   echo "error: CHANGELOG.md missing footer link [$version]:" >&2
@@ -52,19 +36,7 @@ if ! grep -q "^\[${version}\]:" CHANGELOG.md; then
 fi
 
 if [[ -f Cargo.lock ]]; then
-  lock_ver="$(
-    CRATE="$crate" python3 - <<'PY'
-import os, pathlib, re, sys
-text = pathlib.Path("Cargo.lock").read_text()
-crate = os.environ["CRATE"]
-m = re.search(rf'^name = "{re.escape(crate)}"\nversion = "([^"]+)"', text, re.M)
-sys.stdout.write(m.group(1) if m else "")
-PY
-  )"
-  if [[ -n "$lock_ver" && "$lock_ver" != "$version" ]]; then
-    echo "error: Cargo.lock has $crate $lock_ver but Cargo.toml is $version" >&2
-    exit 1
-  fi
+  "$RC_DIR/release_check" lock Cargo.lock "$crate" "$version"
 fi
 
 echo "==> cargo package --locked --list ($crate $version)"

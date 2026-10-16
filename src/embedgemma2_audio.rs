@@ -113,7 +113,7 @@ use objc2_metal::MTLComputePipelineState;
 use crate::dispatch::{dispatch_1d, dispatch_2d_tg, set_gpu_buf, set_u32};
 use crate::embedgemma2::SoftSegment;
 use crate::gemm::{cast_f32_to_bf16_into, gemm, select_backend, GemmBackend, GemmOperands};
-use crate::json::{self, Json, Syntax};
+use crate::json::{self, Json, NumForm, Syntax};
 use crate::loader::Loader;
 use crate::nn::{dispatch_tg_1d, reduce_tptg, require, require_disjoint_writes};
 use crate::qwen35_model::Precision;
@@ -325,9 +325,11 @@ impl AudioConfig {
             .ok_or("config.json: missing \"audio_config\"")?;
         let uint_in = |obj: &Json, k: &str| -> Result<u32, String> {
             match obj.get(k) {
-                Some(Json::Num { uint: Some(n), .. }) => {
-                    u32::try_from(*n).map_err(|_| format!("config.json: {k} = {n} exceeds u32"))
-                }
+                Some(Json::Num {
+                    form: NumForm::Uint,
+                    int: n,
+                    ..
+                }) => u32::try_from(*n).map_err(|_| format!("config.json: {k} = {n} exceeds u32")),
                 Some(v) => Err(format!("config.json: {k} must be a non-negative integer, got {v:?}")),
                 None => Err(format!("config.json: missing {k:?}")),
             }
@@ -367,9 +369,11 @@ impl AudioConfig {
             Some(Json::Array(a)) => a
                 .iter()
                 .map(|v| match v {
-                    Json::Num { uint: Some(n), .. } => {
-                        u32::try_from(*n).map_err(|_| "config.json: a subsampling channel exceeds u32".to_string())
-                    }
+                    Json::Num {
+                        form: NumForm::Uint,
+                        int: n,
+                        ..
+                    } => u32::try_from(*n).map_err(|_| "config.json: a subsampling channel exceeds u32".to_string()),
                     v => Err(format!("config.json: subsampling_conv_channels entry {v:?}")),
                 })
                 .collect::<Result<_, _>>()?,

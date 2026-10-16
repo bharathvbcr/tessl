@@ -1,0 +1,223 @@
+{
+ "mode": "ple",
+ "workloads": [
+  {
+   "workload": "32x256",
+   "runs": [
+    {
+     "ple_run_bytes": 268435456,
+     "label": "256 MiB (default)",
+     "ms": [
+      442.808958,
+      492.221209,
+      489.480667,
+      498.305208,
+      541.412333,
+      499.968,
+      483.0075,
+      497.138917,
+      483.790916
+     ],
+     "contended": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false
+     ]
+    },
+    {
+     "ple_run_bytes": 67108864,
+     "label": "64 MiB",
+     "ms": [
+      443.792083,
+      512.90725,
+      480.303625,
+      488.574583,
+      485.64225,
+      476.706875,
+      472.347833,
+      490.30225,
+      479.85725
+     ],
+     "contended": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false
+     ]
+    },
+    {
+     "ple_run_bytes": 16777216,
+     "label": "16 MiB",
+     "ms": [
+      466.51675,
+      501.142583,
+      468.350459,
+      472.777208,
+      484.946417,
+      480.58575,
+      480.527042,
+      494.565625,
+      490.401333
+     ],
+     "contended": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false
+     ]
+    },
+    {
+     "ple_run_bytes": 1,
+     "label": "one layer per run",
+     "ms": [
+      487.734084,
+      480.967834,
+      481.818875,
+      472.208791,
+      512.570792,
+      474.994167,
+      466.918667,
+      482.603958,
+      485.271333
+     ],
+     "contended": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false
+     ]
+    }
+   ]
+  },
+  {
+   "workload": "8x1024",
+   "runs": [
+    {
+     "ple_run_bytes": 268435456,
+     "label": "256 MiB (default)",
+     "ms": [
+      594.78375,
+      578.76175,
+      594.218542,
+      586.684166,
+      583.770209,
+      605.648958,
+      584.319459,
+      603.010958,
+      567.991417
+     ],
+     "contended": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false
+     ]
+    },
+    {
+     "ple_run_bytes": 67108864,
+     "label": "64 MiB",
+     "ms": [
+      593.458792,
+      606.868625,
+      603.415958,
+      574.274583,
+      574.422,
+      583.957875,
+      573.718875,
+      593.436959,
+      556.193875
+     ],
+     "contended": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false
+     ]
+    },
+    {
+     "ple_run_bytes": 16777216,
+     "label": "16 MiB",
+     "ms": [
+      571.7285,
+      585.38175,
+      610.106,
+      602.869791,
+      556.003583,
+      561.41475,
+      560.5315,
+      609.127333,
+      578.171458
+     ],
+     "contended": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false
+     ]
+    },
+    {
+     "ple_run_bytes": 1,
+     "label": "one layer per run",
+     "ms": [
+      587.842709,
+      562.087,
+      571.576917,
+      587.599,
+      567.712167,
+      579.832917,
+      578.560042,
+      597.62375,
+      578.595459
+     ],
+     "contended": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false
+     ]
+    }
+   ]
+  }
+ ]
+}

@@ -30,8 +30,10 @@ echo "==> device-free selection with the device hidden (CI: check job; includes 
 echo "==> hosted manifest completeness (every test that passes with the device hidden is selected)"
 ./scripts/hosted_tests.sh --outside
 
-echo "==> MSL dialect lint (CI: kernel-emulator job)"
-python3 tools/msl_emu/dialect_lint.py
+echo "==> MSL dialect lint (CI: kernel-emulator job, which compiles it with a bare rustc as here)"
+mkdir -p target
+rustc --edition 2021 -O -o target/dialect_lint src/bin/dialect_lint.rs
+target/dialect_lint
 
 echo "==> kernel IR check (fast-math: no inf/NaN constants, no fcmp uno/ord, isfinite stays a bit test)"
 # Exit 77 means no Metal toolchain: SKIPPED is printed and the run still fails, because the

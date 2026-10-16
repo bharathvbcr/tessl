@@ -2,7 +2,7 @@ EmbeddingGemma 2 vision tower: per-stage GPU time of encode_images on the real c
 =========================================================================================
 Machine: Apple M5 Pro, 2026-10-15, a GPU other sessions share (see the sample counts below).
 Data: embedgemma2_vision_profile_m5pro.json (every pass's raw document under its label: every
-sample of every variant). Table builder: embedgemma2_vision_profile_report.py.
+sample of every variant). Table builder: `results_report vision` (src/bin/results_report).
 Tool: src/bin/profile_embedgemma2_vision.rs, one pass per label, 5 rounds, default workloads
 "1,8" (BENCH_WORKLOADS): the two goldens' real processor outputs, image 0 (2304 real patches,
 2520 padded) alone, and 8 images (cycling the goldens: 2 forwards, 18864 padded rows).

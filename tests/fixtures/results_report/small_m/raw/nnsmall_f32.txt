@@ -1,0 +1,54 @@
+banner line before the cases
+nnsmall f32 down M=1 N=512 K=2048  (16 tiles of 32x32; arms agree within 1.6e-6)  (self-spread of plain 4.8%)
+  plain                       88.9 us   plain/this 1.00 [1.00–1.00]
+  production                  28.4 us   plain/this 3.11 [2.91–3.25]
+  par_splitk_64               34.5 us   plain/this 2.57 [2.47–2.75]
+  par_splitk_128              29.5 us   plain/this 2.99 [2.95–3.11]
+  par_splitk_256              29.2 us   plain/this 3.05 [2.92–3.23]
+  par_splitk_512              34.2 us   plain/this 2.56 [2.51–2.68]
+  par_splitk_1024             51.1 us   plain/this 1.72 [1.59–1.76]
+
+nnsmall f32 down M=16 N=512 K=2048  (16 tiles of 32x32; arms agree within 2.1e-6)  (self-spread of plain 4.2%)
+  plain                       89.9 us   plain/this 1.00 [1.00–1.00]
+  production                  29.7 us   plain/this 3.03 [2.99–3.10]
+  par_splitk_64               38.8 us   plain/this 2.32 [2.27–2.40]
+  par_splitk_128              32.4 us   plain/this 2.78 [2.72–2.83]
+  par_splitk_256              30.3 us   plain/this 2.97 [2.94–3.01]
+  par_splitk_512              35.9 us   plain/this 2.50 [2.44–2.56]
+  par_splitk_1024             52.2 us   plain/this 1.72 [1.70–1.76]
+
+nnsmall f32 o global M=1 N=512 K=2048  (16 tiles of 32x32; arms agree within 1.6e-6)  (self-spread of plain 3.2%)
+  plain                       89.6 us   plain/this 1.00 [1.00–1.00]
+  production                  28.9 us   plain/this 3.13 [2.96–3.17]
+  par_splitk_64               34.3 us   plain/this 2.61 [2.55–2.73]
+  par_splitk_128              29.9 us   plain/this 3.03 [2.78–3.07]
+  par_splitk_256              29.1 us   plain/this 3.10 [2.99–3.17]
+  par_splitk_512              34.6 us   plain/this 2.61 [2.54–2.66]
+  par_splitk_1024             51.6 us   plain/this 1.74 [1.71–1.79]
+
+nnsmall f32 o global M=16 N=512 K=2048  (16 tiles of 32x32; arms agree within 2.1e-6)  (self-spread of plain 2.8%)
+  plain                       89.4 us   plain/this 1.00 [1.00–1.00]
+  production                  29.7 us   plain/this 2.99 [2.98–3.09]
+  par_splitk_64               37.9 us   plain/this 2.36 [2.21–2.43]
+  par_splitk_128              32.4 us   plain/this 2.77 [2.71–2.87]
+  par_splitk_256              30.1 us   plain/this 3.00 [2.90–3.08]
+  par_splitk_512              34.9 us   plain/this 2.57 [2.49–2.61]
+  par_splitk_1024             51.9 us   plain/this 1.72 [1.70–1.77]
+
+nnsmall f32 o sliding M=1 N=512 K=1024  (16 tiles of 32x32; arms agree within 7.8e-7)  (self-spread of plain 0.6%)
+  plain                       48.2 us   plain/this 1.00 [1.00–1.00]
+  production                  19.4 us   plain/this 2.48 [2.43–2.56]
+  par_splitk_64               21.4 us   plain/this 2.26 [2.23–2.31]
+  par_splitk_128              19.6 us   plain/this 2.46 [2.35–2.54]
+  par_splitk_256              21.4 us   plain/this 2.25 [2.20–2.27]
+  par_splitk_512              30.1 us   plain/this 1.60 [1.53–1.61]
+
+nnsmall f32 o sliding M=16 N=512 K=1024  (16 tiles of 32x32; arms agree within 1.0e-6)  (self-spread of plain 3.4%)
+  plain                       48.8 us   plain/this 1.00 [1.00–1.00]
+  production                  20.8 us   plain/this 2.35 [2.20–2.37]
+  par_splitk_64               23.3 us   plain/this 2.12 [2.03–2.16]
+  par_splitk_128              20.9 us   plain/this 2.34 [2.25–2.40]
+  par_splitk_256              23.1 us   plain/this 2.12 [2.08–2.17]
+  par_splitk_512              31.6 us   plain/this 1.56 [1.54–1.57]
+
+trailing noise

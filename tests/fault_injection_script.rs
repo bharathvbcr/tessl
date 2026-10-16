@@ -63,6 +63,16 @@ fn the_driver_refuses_a_stale_patch_and_never_counts_a_run_that_did_not_run() {
     assert!(out.status.success(), "driver self-test failed:\n{text}");
     assert!(text.contains("a stale patch is refused"), "{text}");
     assert!(text.contains("is NOT FOUND, not a pass"), "{text}");
+    for needle in [
+        "killed and exits 124",
+        "two empty hashes are a failure",
+        "an empty post-run hash is a failure",
+        "an untracked file in kernels/ counts as dirty",
+        "an unwrapped dispatch Err is non-assert",
+        "restore bumps",
+    ] {
+        assert!(text.contains(needle), "self-test did not report `{needle}`:\n{text}");
+    }
 }
 
 #[test]

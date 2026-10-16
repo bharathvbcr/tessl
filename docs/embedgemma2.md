@@ -69,6 +69,19 @@ every element a forward reads, an earlier kernel of that forward wrote, which
 NaN (and by asserting an encode zeroes no host bytes and allocates the same
 whether it runs one forward or two).
 
+The set is 400 MiB at 8192 rows (`tests/embedgemma2_memory.rs` itemizes it to
+the byte on the tiny model), and consecutive `encode`s hold one set, not two:
+`encode` hands its activations and each forward's uploaded inputs back to the
+runtime before its one wait, and the runtime keeps them alive until that wait
+has finished and then returns them to the pool, where the next call's
+allocations find them. (The pool recycles a dropped buffer at the first commit
+after the drop; dropped after the wait, the buffers were recycled only at the
+next call's wait, which comes after that call has allocated.) The `q|k|v`
+GEMM's output and the MLP's `gate | up` are one buffer: the q/k-norm-RoPE kernel
+is the last reader of the first, and the second is written after the attention,
+so their lifetimes within a layer never overlap, in either `GemmOperands`
+mode.
+
 One K/V pair, sized for the widest layer, serves every layer and forward. The
 K/V writer and the attention both derive the per-sequence capacity from the
 buffers' size, so they agree on the stride whatever the layer's width or the
@@ -404,7 +417,8 @@ The per-layer inputs do not depend on the layer, so one NT GEMM forms a run
 of layers' at once, straight from the checkpoint's `[24 * 512, 512]`
 projection, followed by one scale and one in-place norm; each layer's gate
 reads its column window. A run is as many layers as fit in `PLE_RUN_BYTES`
-(256 MiB): all 24 up to 5461 rows, 6 runs of 4 at 32,768 rows.
+(16 MiB; it was 256): all 24 up to 341 rows, 4 per run at 2048 rows, one per
+run from 8192 rows (never fewer than one layer's inputs, 64 MiB at 32,768 rows).
 
 ## Bounds and observed errors
 
@@ -493,7 +507,7 @@ Measured on an M5 Pro against the real checkpoint, paired and interleaved
   workloads alike. The loader's peak physical footprint fell from 1156 MB to
   871 MB (77d8732) and 845 MB (0055612). The device peak of the single-forward
   workloads rose 29 % (1283 to 1652 MiB at 8x1024; "The device-peak rise,
-  isolated" below says why). Numbers:
+  isolated" below says why, and "fixed" that it is now 400 MiB). Numbers:
   `embedgemma2_before_after_m5pro.txt`, `embedgemma2_load_footprint_m5pro.txt`.
 * **One host wait per `encode`.** The forwards of one `encode` are queued back
   to back and the host waits once; each keeps its own small ids, lengths,
@@ -554,6 +568,22 @@ Measured on an M5 Pro against the real checkpoint, paired and interleaved
   (1652.4 = 436.3 cached + 2 x 608.1). `set_ple_run_bytes(16 MiB)` takes 240 MiB
   off each set at no measurable time (encode 32x256 +5 %, 8x1024 -2 %, inside the
   noise).
+* **The device-peak rise, fixed** (`embedgemma2_memory_m5pro.{txt,json,png}`,
+  against 16f5190, fresh process per cell, identical on a second run). Four
+  `encode`s back to back peak at 400.6 / 400.4 / 400.3 MiB above the model at
+  32x256 / 8x1024 / 2x4096 (1472.7 / 1472.4 / 1472.3 before; Bf16 1456.4 to
+  392.4 at 8x1024), 112.9 MiB at 64x32 (433.0) and 2.0 MiB at 1x16 (4.25). One
+  encode peaks at the same figures: consecutive calls hold one set. The three
+  changes: `encode` hands its activations and uploads back to the runtime
+  before its wait (the wait then recycles them; they were recycled one call
+  late), `PLE_RUN_BYTES` is 16 MiB (-240 MiB), and the `q|k|v` GEMM output
+  shares a buffer with `gate | up` (-96 MiB, as inferred). Every embedding hash
+  is unchanged on the real checkpoint and the tiny model, in both modes. Time:
+  the min-of-N ratio against 16f5190 is 0.86 to 1.05 over three paired series
+  (the machine was shared and its round-to-round spread 1.2 to 28, so a 3 %
+  bound is not verifiable there; the file says so), and the 16 MiB
+  per-layer-input bound alone, measured as one binary at 16 against 256 MiB,
+  is 0.96 to 1.03 (median of rounds) and 0.90 to 1.00 (min-of-N).
 * **`segment_mean_rows`** stays serial: it is under 0.2 % of an encode on
   every workload (`embedgemma2_segment_mean_share_m5pro.txt`).
 * **No bf16 attention output.** `encoder_attn` writes f32 only, at bf16

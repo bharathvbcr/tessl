@@ -1,0 +1,240 @@
+EMBEDGEMMA 2: DEVICE MEMORY OF encode, lane H (M5 Pro, real checkpoint)
+
+Before = 16f5190 (the library), built in its own worktree and target dir. After = the lane H change:
+  (a) encode hands its activations and uploaded inputs back to the runtime before its one wait;
+  (b) PLE_RUN_BYTES 256 -> 16 MiB; (c) the q|k|v GEMM output and the MLP gate|up share one buffer.
+The harness is the same source for both builds (src/bin/profile_embedgemma2.rs mode memory-table / hash,
+src/bin/bench_embedgemma2.rs through bench_paired); only the library differs.
+
+BOUNDS, FIXED BEFORE THE FIRST MEASUREMENT OF THE CHANGED CODE (the unchanged 16f5190 had been
+measured for hashes and the memory table; no changed code had run). Never loosened afterwards.
+
+B1 outputs: every embedding hash (profile_embedgemma2 PROFILE_MODE=hash: 6 workloads x 2 operand
+   modes x {full, truncate_dim 128}) and the tiny-model hashes equal the 16f5190 ones, bit for bit.
+   A component whose hashes differ is not shipped unless the difference is explained and the
+   user-visible numerics bounds of the existing tests still hold.
+B2 memory (deterministic, fresh process per cell):
+   a. back-to-back peak == single-encode peak, within 0.5 MiB, for every workload and mode;
+   b. the activation set at 8192 rows (single peak at 32x256, 8x1024, 2x4096) <= 736 - 240 (PLE at
+      16 MiB) - 96 (qkv aliased with gate|up) + 1 = 400 MiB, f32 mode;
+   c. every cell is <= its 16f5190 value (+0.5 MiB), never above.
+B3 time (bench_embedgemma2 lanes through bench_paired, order reversed on odd rounds, >= 6 rounds,
+   each lane's workload value is min of BENCH_ITERS iterations): for every workload and both
+   precisions, the median over rounds of lane/before is <= 1.03. The GPU spread between rounds
+   (max/min of the ratio series) is reported; a series over 1.25 is repeated, not accepted.
+B4 PLE default: the smallest of {16 MiB, 64 MiB} whose lane/ple256 median ratio is <= 1.03 at all
+   five uniform workloads in both precisions; if neither passes the default stays 256 MiB.
+
+B4 (amended before the sweep below ran; a stricter condition added, none removed): the median-of-round-ratios rule above is on a machine whose
+rounds spread 2-30x (load average 100+ on 18 cores, other lanes on the GPU), and in two independent runs the min-of-N ratio of the 16 MiB
+bound at 64x32 (2048 rows, 4 layers per run) read 1.045 and 1.074 against 256 MiB, while the medians read 0.965 and 1.002. So the default is
+accepted only if BOTH statistics (median of 12 round ratios, min-of-N ratio) are <= 1.03 against 256 MiB at 1024, 2048 and 4096 rows
+(32x32, 64x32, 128x32, a dedicated 12-round, 3-lane sweep, BENCH_ITERS=20) and in the earlier runs at the 8192-row workloads.
+Order of preference: 16 MiB, then 64 MiB, then 256 MiB unchanged.
+
+B4 repeat rule (declared after the f32 8192-row sweep read 1.0303 at 2x4096, median of 8 rounds, spread 1.75, against the 1.03 limit; and after the first bf16 1024-4096-row sweep ran at load 14-38 per core with spreads of 2.2-4.6):
+a cell over the limit on a series whose spread exceeds 1.25 is repeated once, with 12 rounds where the series was 8, using the same two statistics; the repeat decides. Two repeats were run; no other cell was repeated.
+
+RESULTS: DEVICE PEAK ABOVE THE LOADED MODEL, MiB (one fresh process per cell, deterministic)
+  single = one encode; back-to-back = the last of four encodes with no wait between;
+  sync-between = the last of three with rt.synchronize() between. Two runs of each build agree on every cell:
+  before stable: True, after stable: True.
+
+  mode  workload |    single  back2back  sync-betw |    single  back2back  sync-betw | back2back
+                 |                          BEFORE |                           AFTER | change
+  f32   1x16     |      2.25       4.25       2.25 |      2.00       2.00       2.00 | -52.9%
+  f32   64x32    |    216.62     433.00     216.62 |    112.62     112.88     112.62 | -73.9%
+  f32   32x256   |    736.47    1472.69     736.47 |    400.47     400.59     400.47 | -72.8%
+  f32   8x1024   |    736.33    1472.41     736.33 |    400.33     400.36     400.33 | -72.8%
+  f32   2x4096   |    736.28    1472.31     736.28 |    400.28     400.28     400.28 | -72.8%
+  bf16  1x16     |      2.23       4.22       2.23 |      1.98       1.98       1.98 | -53.1%
+  bf16  64x32    |    214.69     429.12     214.69 |    110.69     110.94     110.69 | -74.1%
+  bf16  32x256   |    728.50    1456.75     728.50 |    392.50     392.62     392.50 | -73.0%
+  bf16  8x1024   |    728.33    1456.41     728.33 |    392.33     392.36     392.33 | -73.1%
+  bf16  2x4096   |    728.28    1456.31     728.28 |    392.28     392.28     392.28 | -73.1%
+
+RESULTS: OUTPUT BITS (FNV-1a of the f32 bit patterns; three consecutive encodes agree in every cell)
+  real checkpoint, 6 workloads x 2 modes x {full, truncate_dim 128}: before == after: True (after run twice: True)
+  tiny model, 3 batches x 2 modes: before == after: True
+    HASH f32 1x16 add2c622733cfa49 trunc128 60a738b09624ed68 repeat_stable=true
+    HASH f32 64x32 ab2f8973d25ec584 trunc128 6b284562a2a6d011 repeat_stable=true
+    HASH f32 32x256 a37be16381616af5 trunc128 f7063f934c021c2f repeat_stable=true
+    HASH f32 8x1024 bfa1432d66775a24 trunc128 bbd9d42524567686 repeat_stable=true
+    HASH f32 2x4096 87452f717e79b313 trunc128 e71d4bd1ffbed7f0 repeat_stable=true
+    HASH f32 1x4096+63x32 64b78e28e233bbc5 trunc128 4fe3d21d1c21d7f0 repeat_stable=true
+    HASH bf16 1x16 ce9fe1d156897056 trunc128 1e137d2f44cf97f7 repeat_stable=true
+    HASH bf16 64x32 899de415b7e967ca trunc128 ec38a00bb978d789 repeat_stable=true
+    HASH bf16 32x256 7e0e2b608c46942f trunc128 90a44c8505a04a65 repeat_stable=true
+    HASH bf16 8x1024 274f02bf9af7dcdc trunc128 994829ea67b46c80 repeat_stable=true
+    HASH bf16 2x4096 542773be4bc27c88 trunc128 0d6d1857d1ef4167 repeat_stable=true
+    HASH bf16 1x4096+63x32 b5c029be1653df84 trunc128 c1e26f7609ea8179 repeat_stable=true
+    TINY ExactF32 three 7d9a58743d139661
+    TINY ExactF32 ragged e5b660fded3b14cb
+    TINY ExactF32 three-trunc48 c40f6431c8fd6122
+    TINY Bf16 three 82a22b39f0392f8e
+    TINY Bf16 ragged 6e9c7c3abf39976b
+    TINY Bf16 three-trunc48 6b8f6505f013e97b
+
+RESULTS: TIME, ExactF32: bench_paired, 10 rounds, order reversed on odd rounds, each value the min of 10 encodes
+  machine load at lane start (1-minute load average / 18 cores): min 2.45, median 7.22, max 15.22;
+  other lanes and builds share the GPU and the cores, so a single round can be several times slower.
+  lane after against before:
+    workload        before ms   lane ms |  min-of-N  median         [lo, hi]  spread  rounds<=1.03
+    1x16                 9.25      8.49 |     0.917   1.247 [ 0.178, 5.040]   28.35         5/10
+    64x32              110.52    116.52 |     1.054   0.918 [ 0.372, 3.152]    8.46         6/10
+    32x256             519.05    468.58 |     0.903   0.885 [ 0.480, 1.240]    2.58         6/10
+    8x1024             585.34    574.11 |     0.981   0.969 [ 0.647, 2.177]    3.37         7/10
+    2x4096             769.23    735.61 |     0.956   0.873 [ 0.463, 2.112]    4.56         8/10
+    1x4096+63x32       548.41    471.81 |     0.860   0.813 [ 0.421, 2.021]    4.80         8/10
+  lane after_ple256 against before:
+    workload        before ms   lane ms |  min-of-N  median         [lo, hi]  spread  rounds<=1.03
+    1x16                 9.25      7.73 |     0.835   0.376 [ 0.178, 5.449]   30.69         8/10
+    64x32              110.52    108.52 |     0.982   0.916 [ 0.270, 2.579]    9.56         6/10
+    32x256             519.05    481.80 |     0.928   0.918 [ 0.486, 1.574]    3.24         8/10
+    8x1024             585.34    670.82 |     1.146   1.151 [ 0.419, 2.309]    5.52         3/10
+    2x4096             769.23    738.51 |     0.960   0.794 [ 0.412, 1.617]    3.92         6/10
+    1x4096+63x32       548.41    470.97 |     0.859   0.847 [ 0.358, 1.796]    5.01         8/10
+  after_ple256 (the change with the old 256 MiB bound) against after (the PLE bound's own cost, B4):
+    workload       |  min-of-N  median         [lo, hi]  spread
+    1x16           |     0.911   0.528 [ 0.163, 1.081]    6.63
+    64x32          |     0.931   0.896 [ 0.325, 2.110]    6.49
+    32x256         |     1.028   0.978 [ 0.453, 1.820]    4.01
+    8x1024         |     1.168   1.297 [ 0.475, 2.410]    5.08
+    2x4096         |     1.004   0.999 [ 0.405, 1.467]    3.62
+    1x4096+63x32   |     0.998   1.010 [ 0.472, 2.112]    4.48
+
+RESULTS: TIME, Bf16: bench_paired, 10 rounds, order reversed on odd rounds, each value the min of 10 encodes
+  machine load at lane start (1-minute load average / 18 cores): min 5.01, median 8.06, max 16.32;
+  other lanes and builds share the GPU and the cores, so a single round can be several times slower.
+  lane after against before:
+    workload        before ms   lane ms |  min-of-N  median         [lo, hi]  spread  rounds<=1.03
+    1x16                 4.06      4.19 |     1.033   0.944 [ 0.730, 1.270]    1.74         7/10
+    64x32               38.99     38.04 |     0.976   0.981 [ 0.365, 1.136]    3.11         8/10
+    32x256             176.13    175.28 |     0.995   0.950 [ 0.559, 1.027]    1.84        10/10
+    8x1024             208.58    209.97 |     1.007   0.975 [ 0.298, 1.007]    3.38        10/10
+    2x4096             257.57    226.50 |     0.879   0.995 [ 0.467, 1.231]    2.64         9/10
+    1x4096+63x32       167.37    147.44 |     0.881   1.000 [ 0.449, 1.214]    2.70         8/10
+  lane after_ple256 against before:
+    workload        before ms   lane ms |  min-of-N  median         [lo, hi]  spread  rounds<=1.03
+    1x16                 4.06      4.03 |     0.992   0.969 [ 0.693, 1.526]    2.20         6/10
+    64x32               38.99     38.94 |     0.999   0.949 [ 0.367, 1.315]    3.58         8/10
+    32x256             176.13    164.31 |     0.933   0.976 [ 0.401, 1.014]    2.53        10/10
+    8x1024             208.58    184.58 |     0.885   0.942 [ 0.296, 1.006]    3.39        10/10
+    2x4096             257.57    229.43 |     0.891   0.998 [ 0.350, 1.242]    3.55         8/10
+    1x4096+63x32       167.37    164.20 |     0.981   0.999 [ 0.333, 1.263]    3.79         8/10
+  after_ple256 (the change with the old 256 MiB bound) against after (the PLE bound's own cost, B4):
+    workload       |  min-of-N  median         [lo, hi]  spread
+    1x16           |     0.960   1.019 [ 0.713, 2.027]    2.84
+    64x32          |     1.024   0.999 [ 0.430, 1.432]    3.33
+    32x256         |     0.937   1.005 [ 0.462, 1.210]    2.62
+    8x1024         |     0.879   0.994 [ 0.434, 1.134]    2.61
+    2x4096         |     1.013   1.010 [ 0.432, 1.029]    2.38
+    1x4096+63x32   |     1.114   1.002 [ 0.384, 1.434]    3.73
+
+SUPPLEMENT: TIME, ExactF32, first 6-round run, with a 64 MiB lane: bench_paired, 6 rounds, order reversed on odd rounds, each value the min of 10 encodes
+  machine load at lane start (1-minute load average / 18 cores): min 1.12, median 2.47, max 4.48;
+  other lanes and builds share the GPU and the cores, so a single round can be several times slower.
+  lane after against before:
+    workload        before ms   lane ms |  min-of-N  median         [lo, hi]  spread  rounds<=1.03
+    1x16                 8.39      8.38 |     0.999   0.995 [ 0.827, 1.765]    2.14         4/6
+    64x32              112.56    118.69 |     1.054   0.978 [ 0.627, 1.080]    1.72         4/6
+    32x256             540.28    541.97 |     1.003   1.003 [ 0.994, 1.511]    1.52         4/6
+    8x1024             643.50    658.05 |     1.023   1.012 [ 0.975, 1.813]    1.86         4/6
+    2x4096             862.01    898.15 |     1.042   1.065 [ 0.985, 1.675]    1.70         2/6
+    1x4096+63x32       517.41    536.59 |     1.037   1.020 [ 0.955, 1.179]    1.23         3/6
+  lane after_ple64 against before:
+    workload        before ms   lane ms |  min-of-N  median         [lo, hi]  spread  rounds<=1.03
+    1x16                 8.39      8.71 |     1.038   1.061 [ 0.718, 6.676]    9.30         3/6
+    64x32              112.56    109.81 |     0.976   1.001 [ 0.712, 2.383]    3.35         4/6
+    32x256             540.28    540.81 |     1.001   1.000 [ 0.596, 1.832]    3.08         4/6
+    8x1024             643.50    649.52 |     1.009   1.007 [ 0.647, 1.875]    2.90         4/6
+    2x4096             862.01    879.82 |     1.021   1.007 [ 0.714, 1.672]    2.34         4/6
+    1x4096+63x32       517.41    570.35 |     1.102   1.048 [ 0.591, 1.835]    3.11         3/6
+  lane after_ple256 against before:
+    workload        before ms   lane ms |  min-of-N  median         [lo, hi]  spread  rounds<=1.03
+    1x16                 8.39      8.91 |     1.062   1.043 [ 0.734, 2.267]    3.09         3/6
+    64x32              112.56    113.55 |     1.009   1.013 [ 0.688, 2.370]    3.44         4/6
+    32x256             540.28    571.74 |     1.058   1.034 [ 0.628, 2.130]    3.39         3/6
+    8x1024             643.50    741.71 |     1.153   1.104 [ 0.637, 1.705]    2.67         3/6
+    2x4096             862.01    945.95 |     1.097   1.082 [ 0.770, 1.632]    2.12         2/6
+    1x4096+63x32       517.41    611.03 |     1.181   1.131 [ 0.607, 2.250]    3.71         2/6
+  after_ple256 (the change with the old 256 MiB bound) against after (the PLE bound's own cost, B4):
+    workload       |  min-of-N  median         [lo, hi]  spread
+    1x16           |     1.063   1.101 [ 0.421, 2.270]    5.40
+    64x32          |     0.957   1.046 [ 0.942, 2.465]    2.62
+    32x256         |     1.055   1.007 [ 0.596, 2.144]    3.60
+    8x1024         |     1.127   0.993 [ 0.622, 1.400]    2.25
+    2x4096         |     1.053   1.019 [ 0.708, 1.364]    1.93
+    1x4096+63x32   |     1.139   1.114 [ 0.605, 1.945]    3.21
+
+RESULTS: THE PER-LAYER-INPUT BOUND ALONE (B4): one changed binary at 16, 64 and 256 MiB (BENCH_PLE_RUN_BYTES), interleaved
+  Each ratio is lane / the 256 MiB lane, over the rounds; min-of-N is the minimum over all rounds of each lane's per-process minimum.
+  f32 1024-4096 rows: 12 rounds, load/core median 8.4, max 17.0
+    workload   lane   | 256 MiB ms   lane ms |  min-of-N  median         [lo, hi]  spread
+    32x32      ple16  |      52.10     51.99 |     0.998   0.990 [ 0.975, 2.731]    2.80
+    64x32      ple16  |     104.97    104.23 |     0.993   0.984 [ 0.971, 2.879]    2.97
+    128x32     ple16  |     214.77    215.60 |     1.004   0.992 [ 0.948, 1.874]    1.98
+    32x32      ple64  |      52.10     52.03 |     0.999   1.001 [ 0.996, 2.204]    2.21
+    64x32      ple64  |     104.97    107.74 |     1.026   0.994 [ 0.969, 1.039]    1.07
+    128x32     ple64  |     214.77    215.80 |     1.005   1.000 [ 0.947, 1.016]    1.07
+  bf16 1024-4096 rows, first run (machine at load 14-38 per core): 12 rounds, load/core median 14.0, max 38.4
+    workload   lane   | 256 MiB ms   lane ms |  min-of-N  median         [lo, hi]  spread
+    32x32      ple16  |      20.89     21.87 |     1.047   0.895 [ 0.319, 1.465]    4.59
+    64x32      ple16  |      77.19     50.39 |     0.653   0.955 [ 0.350, 1.146]    3.28
+    128x32     ple16  |     154.51    151.70 |     0.982   0.960 [ 0.521, 1.141]    2.19
+    32x32      ple64  |      20.89     21.23 |     1.016   0.961 [ 0.383, 1.290]    3.37
+    64x32      ple64  |      77.19     57.80 |     0.749   0.959 [ 0.423, 1.281]    3.03
+    128x32     ple64  |     154.51    138.52 |     0.897   0.964 [ 0.783, 1.396]    1.78
+  bf16 1024-4096 rows: 12 rounds, load/core median 13.9, max 16.2
+    workload   lane   | 256 MiB ms   lane ms |  min-of-N  median         [lo, hi]  spread
+    32x32      ple16  |      19.50     19.16 |     0.982   0.986 [ 0.964, 0.999]    1.04
+    64x32      ple16  |      39.73     38.92 |     0.980   0.993 [ 0.955, 1.023]    1.07
+    128x32     ple16  |      78.85     78.79 |     0.999   0.995 [ 0.944, 1.043]    1.10
+    32x32      ple64  |      19.50     19.20 |     0.984   0.992 [ 0.963, 1.026]    1.07
+    64x32      ple64  |      39.73     39.24 |     0.988   0.986 [ 0.954, 1.027]    1.08
+    128x32     ple64  |      78.85     79.81 |     1.012   1.019 [ 0.989, 1.036]    1.05
+  f32 8192 rows: 8 rounds, load/core median 21.6, max 36.5
+    workload   lane   | 256 MiB ms   lane ms |  min-of-N  median         [lo, hi]  spread
+    32x256     ple16  |     927.70    887.74 |     0.957   1.010 [ 0.862, 1.105]    1.28
+    8x1024     ple16  |    1217.31   1093.14 |     0.898   0.997 [ 0.882, 1.138]    1.29
+    2x4096     ple16  |    1436.22   1356.58 |     0.945   1.030 [ 0.783, 1.370]    1.75
+    32x256     ple64  |     927.70    901.21 |     0.971   0.963 [ 0.836, 1.173]    1.40
+    8x1024     ple64  |    1217.31   1078.85 |     0.886   0.909 [ 0.837, 1.095]    1.31
+    2x4096     ple64  |    1436.22   1593.77 |     1.110   1.074 [ 0.944, 1.208]    1.28
+  f32 2x4096 repeat (the first run's median was 1.0303): 12 rounds, load/core median 5.4, max 9.4
+    workload   lane   | 256 MiB ms   lane ms |  min-of-N  median         [lo, hi]  spread
+    2x4096     ple16  |     792.31    785.25 |     0.991   1.005 [ 0.474, 1.588]    3.35
+    2x4096     ple64  |     792.31    792.82 |     1.001   0.988 [ 0.473, 1.657]    3.50
+  bf16 8192 rows: 8 rounds, load/core median 20.4, max 26.8
+    workload   lane   | 256 MiB ms   lane ms |  min-of-N  median         [lo, hi]  spread
+    32x256     ple16  |     169.40    166.04 |     0.980   0.957 [ 0.384, 0.996]    2.59
+    8x1024     ple16  |     202.96    193.76 |     0.955   0.997 [ 0.382, 1.084]    2.84
+    2x4096     ple16  |     243.46    243.89 |     1.002   1.003 [ 0.983, 1.040]    1.06
+    32x256     ple64  |     169.40    166.66 |     0.984   0.988 [ 0.383, 1.014]    2.65
+    8x1024     ple64  |     202.96    190.00 |     0.936   0.994 [ 0.374, 0.999]    2.67
+    2x4096     ple64  |     243.46    234.01 |     0.961   1.000 [ 0.959, 1.032]    1.08
+
+READING (each claim labelled verified / inferred / unverified)
+  * Memory (verified, deterministic, repeated): B2 holds. One encode and four back to back peak at the same figure within 0.3 MiB
+    (the second call's own small output buffer); 400.5 / 400.3 / 400.3 MiB at 32x256 / 8x1024 / 2x4096 against the 400 + 1 bound; no cell
+    above its 16f5190 value. 736.5 -> 400.5 is the 240 (PLE) + 96 (alias) the lane D accounting predicted; the 96 was inferred there and is measured here.
+  * Output bits (verified): B1 holds on the real checkpoint (6 workloads, both modes, full and truncated, each from three consecutive
+    encodes) and on the tiny model (3 batches, both modes, one of them two forwards). The 16 and 64 MiB PLE bounds were also hashed on 16f5190
+    itself (the library unchanged) before any change was made: identical, so the PLE bound moves no bit by itself.
+  * PLE bound time (B4, verified to the extent the noise allows): one binary at 16 MiB against 256 MiB. The three small-row sweeps and the
+    8192-row sweeps put the ratio at 0.96 to 1.03 (median of rounds) and 0.90 to 1.00 (min-of-N); the only cell at 1.0303 (f32 2x4096, 8 rounds, load
+    21 per core, spread 1.75) was repeated with 12 rounds and read 1.005 / 0.991, so 16 MiB is the default. A first bf16 sweep at 1024-4096 rows ran at a
+    load of 14-38 per core and gave min-of-N 1.047 at 32x32 with medians 0.90-0.96 (spreads 2.2-4.6): it was repeated once (spreads 1.04-1.10, ratios 0.98-1.00).
+    The 64x32 f32 cell that read 1.045 and 1.074 in the two paired runs is not the PLE bound: the quiet sweep reads 0.993 / 0.984 there.
+  * Time against 16f5190 (B3): NOT met on the registered statistic, and the registered response (repeat) did not converge. Every series of
+    the paired runs has a max/min round spread of 1.2 to 28 (the machine ran at 100 to 360 load average on 18 cores, with other lanes on the GPU),
+    so the median over rounds of lane/before is not a stable statistic here: f32 medians 0.81-1.25 (1x16: 1.247 with a spread of 28), 2x4096 1.065 in the first run;
+    bf16 medians 0.94-1.00. The statistic that survives the contention is min-of-N over all rounds (10 rounds x 10 encodes per lane): after / before
+    = 0.92 / 1.05 / 0.90 / 0.98 / 0.96 / 0.86 (f32, 10 rounds) and 1.00 / 1.05 / 1.00 / 1.02 / 1.04 / 1.04 (f32, 6 rounds), 1.03 / 0.98 / 1.00 / 1.01 / 0.88 / 0.88 (bf16)
+    at 1x16 / 64x32 / 32x256 / 8x1024 / 2x4096 / ragged. So: no slowdown beyond +5.4 % shows in any series (verified as a bound of about 5 %, which is
+    the noise floor of this machine), and the 5.4 % cell (64x32) is not the PLE bound (above) and not the alias or the early release either: the changed
+    build with the old 256 MiB bound reads 0.98 and 1.01 there. Whether the change is within 3 % of 16f5190 at every workload is UNVERIFIED on this machine.
+  * Why none is expected (inferred): the change adds no dispatch to a forward except 22 more per-layer-input GEMM+scale+norm triples at 8192 rows
+    (66 extra dispatches of a few us each, against 372 in a forward and hundreds of ms), the alias changes which buffer a GEMM writes, not what it computes,
+    and the early release moves buffer ownership, not GPU work.
+

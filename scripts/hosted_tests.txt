@@ -71,7 +71,7 @@ bins 191
 
 # Library tests.
 lib ab_flags::tests:: 10
-lib embedgemma2::tests:: 12
+lib embedgemma2::tests:: 13
 lib embedgemma2_vision::tests:: 4
 lib embedgemma2_audio::tests:: 8
 lib gemm::coop_tile_select:: 4

@@ -1567,9 +1567,7 @@ fn a_busy_or_poisoned_runtime_is_an_error_from_every_training_entry_point() {
 /// The 2B reference directory (`make_train_fixture.py 2b`), the model loaded
 /// in f32 from `QWEN35_2B_SAFETENSORS`, and its config.
 fn real_2b() -> (PathBuf, Qwen35Config, Qwen35Model) {
-    let dir = std::env::var_os("QWEN35_TRAIN_REF_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| Path::new(env!("CARGO_MANIFEST_DIR")).join("target/qwen35_train_ref"));
+    let dir = tessl::qwen35_train::train_reference_dir().unwrap_or_else(|e| panic!("{e}"));
     let st_path = PathBuf::from(
         std::env::var("QWEN35_2B_SAFETENSORS")
             .expect("set QWEN35_2B_SAFETENSORS to the Qwen3.5-2B-Base .safetensors file"),
@@ -1658,6 +1656,11 @@ fn real_2b_step_matches_transformers() {
     }
 }
 
+/// memguard's footprint cap (`~/.local/bin/memguard -cap-gib 32`): a process
+/// past it is SIGTERMed (exit 143). Metal buffers count toward the footprint.
+const MEMGUARD_CAP_BYTES: u64 = 32 << 30;
+const GIB: f64 = (1u64 << 30) as f64;
+
 /// The real 2B checkpoint, in `precision` as `load_tower` loads it (bf16 is
 /// how a bf16 model trains).
 fn real_2b_tower(rt: &Arc<GpuRuntime>, precision: Precision) -> Qwen35Model {
@@ -1726,8 +1729,23 @@ fn streamed_rel(cfg: &Qwen35Config, got: &Qwen35Grads, want: &Qwen35Grads) -> Ve
 fn real_2b_step_on_bf16_storage_stays_near_the_f32_step() {
     let rt = GpuRuntime::new().unwrap();
     let ids = text_ids();
+    // Stage 1 holds the f32 model and the two f32 gradient sets (exact and
+    // bf16-operand); stage 2 releases the f32 model and the operand
+    // gradients before the bf16 model and its step are built. A live f32
+    // model, bf16 model and three gradient sets together are 4.5 f32
+    // parameter sets, past memguard's 32 GiB footprint cap on the 2B (the
+    // SIGTERM ft-02b223f0 recorded); no more than three are ever live here.
+    // The f32 model's bf16-operand step is printed beside each storage
+    // figure: how much of the gap operand rounding alone makes on these ids.
     let f32_model = real_2b_tower(&rt, Precision::F32);
+    let cfg = f32_model.config().clone();
     let exact = f32_model.train_step(&ids, GemmOperands::ExactF32).unwrap();
+    let op = {
+        let operands = f32_model.train_step(&ids, GemmOperands::Bf16).unwrap();
+        streamed_rel(&cfg, &operands.grads, &exact.grads)
+    };
+    drop(f32_model);
+    rt.synchronize().unwrap();
     let bf16_model = real_2b_tower(&rt, Precision::Bf16);
     let step = bf16_model.train_step(&ids, GemmOperands::Bf16).unwrap();
     let r_loss = (step.loss - exact.loss).abs() / exact.loss;
@@ -1735,14 +1753,7 @@ fn real_2b_step_on_bf16_storage_stays_near_the_f32_step() {
         "loss: bf16 storage {:.6}, f32 {:.6} (rel {r_loss:.2e})",
         step.loss, exact.loss
     );
-    // Both gradient sets are f32 tensors of the same layouts. The f32
-    // model's bf16-operand step is printed beside each: how much of the gap
-    // operand rounding alone makes on these ids.
-    let operands = f32_model.train_step(&ids, GemmOperands::Bf16).unwrap();
-    let cfg = f32_model.config();
-    let results = streamed_rel(cfg, &step.grads, &exact.grads);
-    let op = streamed_rel(cfg, &operands.grads, &exact.grads);
-    drop(operands);
+    let results = streamed_rel(&cfg, &step.grads, &exact.grads);
     let worst = results.iter().map(|r| r.1).fold(0.0, f64::max);
     for ((name, r), (_, o)) in results.iter().zip(&op) {
         eprintln!("{name}: storage {r:.2e}, operands alone {o:.2e}");
@@ -1911,6 +1922,7 @@ fn real_2b_loss_curve_tracks_the_f32_step() {
     const STEPS: usize = 30;
     const EVERY: usize = 5;
     const SEEDS: [u64; 3] = [1, 2, 3];
+    let rt = GpuRuntime::new().unwrap();
     let ids = curve_ids();
     let chunks: Vec<Vec<u32>> = ids.chunks(128).map(<[u32]>::to_vec).collect();
     assert_eq!(chunks.len(), STEPS + 4);
@@ -1933,9 +1945,25 @@ fn real_2b_loss_curve_tracks_the_f32_step() {
     };
     // Each step's training loss, and the held-out mean before training and
     // after every EVERY steps.
-    let curve = |precision: Precision, config: AdamWConfig, seed: u64| -> (Vec<f64>, Vec<f64>) {
-        let rt = GpuRuntime::new().unwrap();
+    // `Err` names an arm whose live device memory, counted before it starts,
+    // is past memguard's footprint cap: the test then reports SKIPPED rather
+    // than being SIGTERMed mid-run or passing without its bound.
+    let curve = |precision: Precision, config: AdamWConfig, seed: u64| -> Result<(Vec<f64>, Vec<f64>), String> {
         let model = real_2b_tower(&rt, precision);
+        let bank_bytes: u64 = model
+            .parameter_table()
+            .unwrap()
+            .iter()
+            .map(|p| p.shape.iter().product::<usize>() as u64 * 4)
+            .sum();
+        let need = rt.current_allocated_bytes() + bank_bytes + AdamW::allocated_bytes_for(&model, config).unwrap();
+        if need > MEMGUARD_CAP_BYTES {
+            return Err(format!(
+                "{precision:?} model, f32 bank and {config} state need {:.1} GiB, over memguard's {} GiB cap",
+                need as f64 / GIB,
+                MEMGUARD_CAP_BYTES / (1 << 30)
+            ));
+        }
         let operands = if precision == Precision::F32 {
             GemmOperands::ExactF32
         } else {
@@ -1964,7 +1992,16 @@ fn real_2b_loss_curve_tracks_the_f32_step() {
             }
         }
         eprintln!("seed {seed}: {}: {}", state.describe(), model.describe());
-        (losses, helds)
+        drop(state);
+        drop(bank);
+        drop(model);
+        rt.synchronize().unwrap();
+        eprintln!(
+            "seed {seed}: device bytes held after the arm: {:.2} GiB, peak {:.2} GiB",
+            rt.current_allocated_bytes() as f64 / GIB,
+            rt.peak_allocated_bytes() as f64 / GIB
+        );
+        Ok((losses, helds))
     };
     let configs = |seed: u64| {
         [
@@ -1988,9 +2025,20 @@ fn real_2b_loss_curve_tracks_the_f32_step() {
     };
     let mut failures = Vec::new();
     for seed in SEEDS {
-        let (base, base_held) = curve(Precision::F32, AdamWConfig::F32, seed);
+        let skipped = |why: String| eprintln!("SKIPPED real_2b_loss_curve_tracks_the_f32_step (seed {seed}): {why}");
+        let (base, base_held) = match curve(Precision::F32, AdamWConfig::F32, seed) {
+            Ok(r) => r,
+            Err(why) => return skipped(why),
+        };
         let cs = configs(seed);
-        let runs: Vec<(Vec<f64>, Vec<f64>)> = cs.iter().map(|&c| curve(Precision::Bf16, c, seed)).collect();
+        let runs = match cs
+            .iter()
+            .map(|&c| curve(Precision::Bf16, c, seed))
+            .collect::<Result<Vec<_>, _>>()
+        {
+            Ok(r) => r,
+            Err(why) => return skipped(why),
+        };
         println!("seed {seed}");
         println!(
             "step,f32,{}",
@@ -2057,8 +2105,14 @@ fn real_2b_step_on_bf16_operands_stays_near_transformers() {
 /// [`ACCUMULATE_BOUND`] at the 2B's sizes: two sequences of 256 and 200
 /// tokens into an f32 bank, against the f32 sum of their fresh gradients,
 /// one weight matrix at a time (the embedding's sum spans 248320 rows and
-/// the cross-entropy's vocabulary chunks). Needs `QWEN35_2B_SAFETENSORS` and
-/// ~30 GB of device memory (the model, two fresh steps' gradients, a bank).
+/// the cross-entropy's vocabulary chunks). Needs `QWEN35_2B_SAFETENSORS`.
+///
+/// The model, both fresh gradient sets and the bank together are four f32
+/// parameter sets, past memguard's 32 GiB footprint cap once the step's
+/// workspaces are added (ft-02b223f0). So the reference is built first and
+/// kept on the host as each tensor's f32 sum and its scale, the fresh sets
+/// released one at a time, and the bank built last: three sets are live at
+/// most. Every bound is the one the four-set form held.
 #[test]
 #[ignore]
 fn real_2b_bank_accumulates_within_the_bound() {
@@ -2067,28 +2121,45 @@ fn real_2b_bank_accumulates_within_the_bound() {
     let a: Vec<u32> = (0..256u32).map(|i| (i * 104_729 + 17) % vocab).collect();
     let b: Vec<u32> = (0..200u32).map(|i| (i * 7_919 + 3) % vocab).collect();
     let mm = GemmOperands::ExactF32;
-    let fa = model.train_step(&a, mm).unwrap();
-    let fb = model.train_step(&b, mm).unwrap();
+    // Per tensor: a's gradient, then (after b's) its f32 sum with b's.
+    let mut sums: Vec<Vec<f32>> = {
+        let fa = model.train_step(&a, mm).unwrap();
+        bank_pairs(&fa.grads, &fa.grads)
+            .into_iter()
+            .map(|(_, x, _)| widened(x))
+            .collect()
+    };
+    let mut scales = Vec::with_capacity(sums.len());
+    {
+        let fb = model.train_step(&b, mm).unwrap();
+        for ((_, y, _), sum) in bank_pairs(&fb.grads, &fb.grads).into_iter().zip(sums.iter_mut()) {
+            let y = widened(y);
+            assert_eq!(y.len(), sum.len());
+            scales.push(
+                sum.iter()
+                    .zip(&y)
+                    .map(|(p, q)| f64::from(p.abs() + q.abs()))
+                    .fold(0.0, f64::max),
+            );
+            for (s, q) in sum.iter_mut().zip(&y) {
+                *s += q;
+            }
+        }
+    }
     let bank = Qwen35Grads::zeros_like(&model).unwrap();
     model.train_step_into(&a, mm, Supervise::Causal, &bank, false).unwrap();
     model.train_step_into(&b, mm, Supervise::Causal, &bank, true).unwrap();
     let mut worst = 0.0f64;
-    for ((name, got, x), (_, _, y)) in bank_pairs(&bank, &fa.grads)
-        .into_iter()
-        .zip(bank_pairs(&bank, &fb.grads))
-    {
-        let (got, x, y) = (widened(got), widened(x), widened(y));
-        let scale = x
-            .iter()
-            .zip(&y)
-            .map(|(p, q)| f64::from(p.abs() + q.abs()))
-            .fold(0.0, f64::max);
-        for (k, ((&g, &p), &q)) in got.iter().zip(&x).zip(&y).enumerate() {
-            let err = (f64::from(g) - f64::from(p + q)).abs();
+    let got = bank_pairs(&bank, &bank);
+    assert_eq!(got.len(), sums.len());
+    for (((name, got, _), sum), scale) in got.into_iter().zip(&sums).zip(scales) {
+        let got = widened(got);
+        assert_eq!(got.len(), sum.len(), "{name}");
+        for (k, (&g, &want)) in got.iter().zip(sum).enumerate() {
+            let err = (f64::from(g) - f64::from(want)).abs();
             assert!(
                 err <= ACCUMULATE_BOUND * U * scale,
-                "{name}[{k}]: {g} is {err:.3e} from {}, over {ACCUMULATE_BOUND} u of {scale:.3e}",
-                p + q
+                "{name}[{k}]: {g} is {err:.3e} from {want}, over {ACCUMULATE_BOUND} u of {scale:.3e}"
             );
             if scale > 0.0 {
                 worst = worst.max(err / (U * scale));

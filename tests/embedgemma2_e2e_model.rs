@@ -29,14 +29,29 @@
 //!   text test's bounds. The towers' soft tokens are within `3.3e-5` of their
 //!   largest magnitude of the goldens, and the text encoder is held to the same
 //!   bound from golden soft tokens, so the composition is expected inside it.
+//!
+//! The text path from a string, with no Python tokenizer, is held to the text
+//! goldens of `tools/embedgemma2_ref/make_reference.py` (`EMBEDGEMMA2_REF_DIR`,
+//! default `target/embedgemma2_ref`; its eight texts, each with its prompt
+//! name):
+//!
+//! * `the_rust_tokenizer_reproduces_the_reference_ids`: `ids.npy` and
+//!   `offsets.npy` (what sentence-transformers fed the model) equal
+//!   [`Tokenizer::encode_with_prompt`]'s ids exactly;
+//! * `text_to_embedding_with_no_python_matches_sentence_transformers`:
+//!   [`EmbedGemma2Model::encode_texts`] (tokenize, then encode) within the same
+//!   `1e-4` and cosine `0.99999` of `emb_f32.npy`, each text alone, and the
+//!   same call equals `encode` of the reference ids bit for bit.
 
 mod common;
 
 use std::path::PathBuf;
 
+use common::embedgemma2_tok::{brief, first_diff, reference_texts};
 use common::with_gpu;
 use tessl::embedgemma2::{EmbedGemma2Config, EmbedGemma2Model, MmSequence};
 use tessl::embedgemma2_audio::{AudioConfig, AudioInput, EmbedGemma2Audio};
+use tessl::embedgemma2_tok::Tokenizer;
 use tessl::embedgemma2_vision::{EmbedGemma2VisionModel, ImageInput, VisionConfig};
 use tessl::npy::read_npy;
 use tessl::safetensors::SafeTensors;
@@ -195,5 +210,114 @@ fn pixels_and_features_through_tessl_match_sentence_transformers() {
             "end to end out of bounds:\n{}",
             failures.join("\n")
         );
+    });
+}
+
+fn text_ref_dir() -> PathBuf {
+    std::env::var_os("EMBEDGEMMA2_REF_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/embedgemma2_ref"))
+}
+
+fn text_npy(name: &str) -> tessl::npy::NpyArray {
+    let p = text_ref_dir().join(name);
+    read_npy(&p).unwrap_or_else(|e| panic!("{}: {e} (run tools/embedgemma2_ref/make_reference.py)", p.display()))
+}
+
+/// The reference texts with their prompt names, and the ids sentence-transformers fed the model.
+fn reference_inputs() -> Vec<(String, String, Vec<u32>)> {
+    let json = std::fs::read_to_string(text_ref_dir().join("texts.json"))
+        .unwrap_or_else(|e| panic!("texts.json: {e} (run tools/embedgemma2_ref/make_reference.py)"));
+    let texts = reference_texts(&json);
+    let ids = text_npy("ids.npy").i64_slice().expect("i64 ids").to_vec();
+    let off = text_npy("offsets.npy").i64_slice().expect("i64 offsets").to_vec();
+    assert_eq!(off.len(), texts.len() + 1, "offsets vs texts");
+    texts
+        .into_iter()
+        .zip(off.windows(2))
+        .map(|((prompt, text), w)| {
+            let row = ids[w[0] as usize..w[1] as usize]
+                .iter()
+                .map(|&i| u32::try_from(i).unwrap())
+                .collect();
+            (prompt, text, row)
+        })
+        .collect()
+}
+
+#[test]
+#[ignore]
+fn the_rust_tokenizer_reproduces_the_reference_ids() {
+    let tok = Tokenizer::from_snapshot(&snapshot()).unwrap();
+    let inputs = reference_inputs();
+    assert_eq!(inputs.len(), 8);
+    for (n, (prompt, text, want)) in inputs.iter().enumerate() {
+        let got = tok.encode_with_prompt(Some(prompt), text).unwrap();
+        eprintln!("text {n} ({prompt}): {} ids, {}", got.len(), brief(text));
+        assert_eq!(&got, want, "text {n} ({prompt}): {}", first_diff(&got, want));
+    }
+    // And as one batch of the eight, grouped by prompt as the facade takes them.
+    for prompt in ["query", "document", "CodeRetrieval", "Classification"] {
+        let members: Vec<&(String, String, Vec<u32>)> = inputs.iter().filter(|i| i.0 == prompt).collect();
+        let texts: Vec<&str> = members.iter().map(|m| m.1.as_str()).collect();
+        let got = tok.encode_batch_with_prompt(Some(prompt), &texts).unwrap();
+        for (g, m) in got.iter().zip(&members) {
+            assert_eq!(g, &m.2, "batched {prompt}");
+        }
+    }
+}
+
+#[test]
+#[ignore]
+fn text_to_embedding_with_no_python_matches_sentence_transformers() {
+    let snap = snapshot();
+    let cfg = EmbedGemma2Config::from_config_file(&snap.join("config.json")).unwrap();
+    let st = SafeTensors::open(&snap.join("model.safetensors")).unwrap();
+    let tok = Tokenizer::from_snapshot(&snap).unwrap();
+    let inputs = reference_inputs();
+    let dim = cfg.embedding_dim as usize;
+    let want = text_npy("emb_f32.npy");
+    assert_eq!(want.shape, [inputs.len(), dim], "emb_f32 shape");
+    let want = want.f32_slice().unwrap().to_vec();
+
+    with_gpu(|rt| {
+        let model = EmbedGemma2Model::load(rt, &st, PREFIX, cfg.clone()).unwrap();
+        let mut failures = Vec::new();
+        for (n, (prompt, text, ids)) in inputs.iter().enumerate() {
+            let got = model
+                .encode_texts(&tok, Some(prompt), &[text], None)
+                .unwrap()
+                .embeddings;
+            let reference = &want[n * dim..(n + 1) * dim];
+            let (err, cos) = (max_abs(&got, reference), cosine(&got, reference));
+            eprintln!(
+                "text {n} ({prompt}): {} tokens, max abs {err:.3e}, cosine {cos:.9}",
+                ids.len()
+            );
+            if err > EMB_ABS || cos < EMB_COS {
+                failures.push(format!(
+                    "text {n}: max abs {err:.3e} (bound {EMB_ABS:e}), cosine {cos:.9} (bound {EMB_COS})"
+                ));
+            }
+            // The same ids through `encode` are the same forward: the facade adds nothing.
+            let direct = model.encode(&[ids.as_slice()], None, false).unwrap().embeddings;
+            assert_eq!(got, direct, "text {n}: encode_texts vs encode of the reference ids");
+        }
+        assert!(failures.is_empty(), "text path out of bounds:\n{}", failures.join("\n"));
+
+        // A Matryoshka prefix goes through the same call.
+        let short = model.encode_texts(&tok, Some("query"), &["x"], Some(128)).unwrap();
+        assert_eq!(short.embeddings.len(), 128);
+        // A text the tokenizer refuses is an error before any GPU work, naming the text.
+        let err = model
+            .encode_texts(&tok, None, &["fine", "has <|image|> in it"], None)
+            .err()
+            .expect("refused");
+        assert!(err.contains("encode_texts") && err.contains("text 1"), "{err}");
+        let err = model
+            .encode_texts(&tok, Some("no such prompt"), &["x"], None)
+            .err()
+            .expect("refused");
+        assert!(err.contains("no prompt named"), "{err}");
     });
 }

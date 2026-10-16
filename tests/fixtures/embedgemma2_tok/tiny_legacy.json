@@ -1,0 +1,22 @@
+{
+ "version": "1.0",
+ "truncation": null,
+ "padding": null,
+ "added_tokens": [{"id": 9, "content": "<end>", "single_word": false, "lstrip": false, "rstrip": false, "normalized": false, "special": true}, {"id": 10, "content": "[X]", "single_word": false, "lstrip": false, "rstrip": false, "normalized": false, "special": false}],
+ "normalizer": null,
+ "pre_tokenizer": {"type": "Split", "pattern": {"String": " "}, "behavior": "MergedWithPrevious", "invert": false},
+ "post_processor": {"type": "TemplateProcessing", "single": [{"Sequence": {"id": "A", "type_id": 0}}, {"SpecialToken": {"id": "<end>", "type_id": 0}}], "pair": [{"Sequence": {"id": "A", "type_id": 0}}, {"Sequence": {"id": "B", "type_id": 1}}], "special_tokens": {"<end>": {"id": "<end>", "ids": [9], "tokens": ["<end>"]}}},
+ "decoder": {"type": "Sequence", "decoders": [{"type": "Fuse"}]},
+ "model": {
+  "type": "BPE",
+  "dropout": null,
+  "unk_token": "<unk>",
+  "continuing_subword_prefix": null,
+  "end_of_word_suffix": null,
+  "fuse_unk": true,
+  "byte_fallback": false,
+  "ignore_merges": true,
+  "vocab": {"<unk>": 0, " ": 1, "a": 2, "b": 3, "c": 4, "ab": 5, "abc": 6, "ba": 7, "aa": 8, "<end>": 9, "[X]": 10},
+  "merges": ["a a", "a b", "b a", "a a", "ab c"]
+ }
+}

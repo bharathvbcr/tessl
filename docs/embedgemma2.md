@@ -25,8 +25,10 @@ attention scale 1.0, weighted q/k norms and a weightless v norm, norms that
 multiply by `w` (not `1 + w`), projection-only per-layer inputs, and a
 symmetric inclusive sliding window `|i - j| <= 512`.
 
-Tokenization is the caller's (the tokenizer adds `<bos>` and `<eos>`;
-prompts such as `"task: search result | query: "` are part of the text).
+`encode` takes token ids (the tokenizer adds `<bos>` and `<eos>`; prompts such
+as `"task: search result | query: "` are part of the text). The ids can come
+from `tessl::embedgemma2_tok` ([Tokenizer](#tokenizer)), which reads the
+snapshot's `tokenizer.json` in Rust, or from any tokenizer the caller holds.
 sentence-transformers applies no length limit to this checkpoint; tessl
 refuses sequences past `max_tokens` (default 8192, the model card's context)
 rather than truncating, so a caller that wants truncation does it visibly.
@@ -1471,3 +1473,203 @@ Reproduce: `scripts/gen_embedgemma2_pre_fixtures.py` (fixtures; with
 `cargo test --release --test embedgemma2_pre`, and with the checkpoint
 `tools/embedgemma2_ref/make_mm_reference.py` (now also saves `*_raw.npy`) then
 `cargo test --release --test embedgemma2_pre_model -- --ignored --test-threads=1`.
+## Tokenizer
+
+`tessl::embedgemma2_tok` turns a text into the ids the encoder takes, from the
+snapshot's own `tokenizer.json`, in Rust: no Python tokenizer, no new
+dependency. `Tokenizer::from_snapshot(dir)` reads `tokenizer.json`,
+`tokenizer_config.json` and `config_sentence_transformers.json`;
+`Tokenizer::from_file(path)` reads a `tokenizer.json` alone.
+
+```rust
+let tok = Tokenizer::from_snapshot(&snapshot_dir)?;           // once: ~0.4 s, see Speed
+let ids = tok.encode_with_prompt(Some("query"), "how do I speed up attention?")?;
+let out = model.encode_texts(&tok, Some("document"), &["a text", "another"], None)?;
+let text = tok.decode(&ids);                                    // tokenizers' decode
+```
+
+### What the format is (read from the snapshot, `tokenizers` 0.23.2)
+
+`tokenizer.json` (version 1.0, no truncation, no padding):
+
+| piece | what it is | effect |
+| --- | --- | --- |
+| model | `BPE`, 262144 tokens (ids dense, `0..262144`), 514906 merges as `[left, right]` pairs with no repeat, `byte_fallback: true` with all 256 `<0xHH>` tokens, `unk_token: <unk>`, `fuse_unk: true`, `ignore_merges: false`, `dropout: null` | a character with no vocabulary entry becomes its UTF-8 bytes |
+| normalizer | `Replace` the literal `" "` with `U+2581` | no other normalization: no lower-casing, no Unicode normalization, no strip |
+| pre-tokenizer | `Split` on the literal `" "`, `MergedWithPrevious` | **inert**: after the normalizer no space is left (`normalize_str("a b  c")` is `a▁b▁▁c` and it pre-tokenizes to one piece), so the BPE merges run over each stretch of text between added tokens as one word, 100k characters included |
+| added tokens | 24, all `special: true`, `normalized: false`, no `lstrip`/`rstrip`/`single_word`: `<pad>` 0, `<eos>` 1, `<bos>` 2, `<unk>` 3, `<mask>` 4, `<\|tool>` 46, `<tool\|>` 47, `<\|tool_call>` 48, `<tool_call\|>` 49, `<\|tool_response>` 50, `<tool_response\|>` 51, `<\|"\|>` 52, `<\|think\|>` 98, `<\|channel>` 100, `<channel\|>` 101, `<\|turn>` 105, `<turn\|>` 106, `<\|image>` 255999, `<\|audio>` 256000, `<\|image\|>` 258880, `<\|audio\|>` 258881, `<image\|>` 258882, `<audio\|>` 258883, `<\|video\|>` 258884 | matched in the **raw** text before the normalizer, leftmost then longest; `<bo`, `<BOS>`, `< bos>` and the 6227 `<unusedN>` tokens (in the vocabulary but not added tokens) are ordinary text |
+| post-processor | `TemplateProcessing`, single: `<bos> $A <eos>` | `[2, ..., 1]` |
+| decoder | `Replace` `U+2581` with `" "`, `ByteFallback`, `Fuse` | a run of `<0xHH>` tokens is one UTF-8 string, or one `U+FFFD` per byte if the run is not valid UTF-8 |
+
+`tokenizer_config.json`: `bos_token` `<bos>`, `image_token` `<|image|>`,
+`audio_token` `<|audio|>`, `video_token` `<|video|>`, `model_max_length` 1e30 (so
+nothing truncates). `config_sentence_transformers.json`: 20 named prompts
+(`query` is `"task: search result | query: "`, `document` is `"title: none |
+text: "`, ...), `default_prompt_name: null`.
+
+### The ids sentence-transformers feeds the model
+
+They are not `Tokenizer.encode(text)`. Read from sentence-transformers 6.1 and
+transformers 5.19 (`base/modules/transformer.py` `preprocess`,
+`processing_utils.py` `apply_chat_template`) and confirmed by probing:
+
+* the model's `modules.json` declares a `message` modality, so a text is routed
+  through the chat template (`chat_template.jinja`), and a prompt is a **system
+  message** that the template writes in front of the text with nothing between:
+  the tokenizer sees `prompt + text`, exactly;
+* `<bos>`/`<eos>` come from the post-processor, **except** that
+  `apply_chat_template` passes `add_special_tokens=False` when the rendered
+  string starts with `tokenizer.bos_token`. So `"<bos>hi"` is `[2, 2202]`: the text's
+  own `<bos>` is the only one and there is **no `<eos>`**. `"a<bos>b"` is wrapped
+  as usual, and a prompt never starts with `<bos>`, so a prompted text is always wrapped;
+* `validate_inputs` raises `ValueError` for a text containing `<|image|>`,
+  `<|video|>` or `<|audio|>` (no media to fill the placeholder). The other added
+  tokens in a text are encoded as their ids (`<|image>` is 255999);
+* nothing is stripped, normalized or truncated (`max_seq_length` is 1e30);
+* **batch quirk**: that `startswith` test is made on the **first** text of the
+  batch (`single_prompt = prompt[0]`) and applied to the whole batch.
+  `["<bos>hi", "plain"]` gives `plain` the ids `[30448]` (neither `<bos>` nor
+  `<eos>`), `["plain", "<bos>hi"]` gives `<bos>hi` `[2, 2, 2202, 1]`. A text's ids
+  depending on its neighbours is a bug, so `Tokenizer::encode_batch` applies the
+  rule to each text alone: it returns what `encode` returns for each, which is
+  what sentence-transformers gives for a batch of one. **This is a deliberate
+  difference** from `SentenceTransformer.encode` for a batch whose first text starts
+  with `<bos>` (and only then). `scripts/gen_embedgemma2_tok_fixtures.py real`
+  asserts the quirk against the installed transformers, so a fix upstream is
+  noticed.
+
+Not reproduced: `SentenceTransformer.encode` classifies a string as an image,
+audio or video (not text) when it is an `http(s)` URL without spaces ending in
+a media extension, a `data:image/` URI, or the path of an existing media file
+(`base/modality.py` `infer_modality`). `Tokenizer` treats every `&str` as text.
+
+### API
+
+| call | returns |
+| --- | --- |
+| `Tokenizer::from_snapshot(dir)`, `from_file(path)`, `from_json(text)` | a tokenizer; `with_tokenizer_config(text)` and `with_prompts(text)` add the sidecars |
+| `encode(text)`, `encode_with_prompt(Some(name), text)` | the ids the model receives (one text, as above); `Err` for a refused placeholder or an unknown prompt name |
+| `encode_batch(texts)`, `encode_batch_with_prompt(name, texts)` | each text as `encode` has it; an `Err` names the text's position |
+| `encode_raw(text, add_special_tokens)` | `Tokenizer.encode(text, add_special_tokens).ids` of the library, no sentence-transformers rule. A text (with its prompt) of `MAX_TEXT_BYTES` (256 MiB) or more is an `Err` from `encode`/`encode_with_prompt` and a panic here: the merge list's positions are 32-bit |
+| `decode(ids)`, `decode_with(ids, skip_special_tokens)` | `Tokenizer.decode`: special tokens skipped by default, as that method does (transformers' `decode` defaults to keeping them); an id with no token is skipped, as the library does |
+| `prompt(name)`, `prompt_names()`, `token_to_id`, `id_to_token`, `vocab_size` | lookups |
+| `EmbedGemma2Model::encode_texts(&tok, prompt, texts, truncate_dim)` | tokenize, then `encode` (one prompt for the call) |
+
+A format feature this tokenizer does not implement is refused by name when the
+file loads, never approximated: a dropout, a continuing-subword prefix or
+end-of-word suffix, a regex pattern, a `Split` that is not `MergedWithPrevious`,
+`ByteLevel`/`Metaspace`/`Strip` steps, any added token with `lstrip`, `rstrip`,
+`single_word` or `normalized`, an added token that is not the vocabulary's
+entry for its text, a non-`TemplateProcessing` post-processor, a null decoder,
+a truncation or padding block, sparse or repeated vocabulary ids, a merge
+naming a token the vocabulary lacks. `tests/embedgemma2_tok_tiny.rs` makes each
+edit to a real file and checks the error.
+
+Two behaviours of the library are reproduced because the fixtures showed them,
+not because they are sensible: a repeated merge keeps the **later** rank, and
+an unknown-character run is written after the byte-fallback tokens that follow
+it (`merge_word` only flushes it at the next known character).
+
+### Load and the JSON parser
+
+`tokenizer.json` is 32 MB. It goes through `src/json.rs` (the crate's strict
+parser: unique keys, valid UTF-8, RFC escapes, no trailing bytes) with `Syntax {
+uints_only: true, literals: true, max_depth: 6 }`: that set already fits the
+format (non-negative integers, `null` and booleans, containers four deep), so
+`Syntax` is **unchanged** and no other caller's check was touched. The tree is
+then reduced to the token text in one arena, an open-addressing index from text
+to id, a table of the one-character tokens, and an open-addressing table of the
+514906 merge ranks (key and value in one 16-byte slot, behind a 2 MiB bit
+filter that answers most absent pairs from cache), and dropped. Encoding never
+reads the JSON again, allocates only its working buffers, and the value is
+`Send + Sync`. The files are read through the crate's regular-file open with a
+byte cap (256 MiB for `tokenizer.json`, 1 MiB for the sidecars).
+
+The BPE is the library's `merge_word` and `Word::merge_all`: a min-heap on
+(rank, position) over a linked list of symbols, so a 100k-character word is
+O(n log n). I could not fetch the library's Rust source (the GitHub URLs tried
+returned 404), so those two routines are written from the algorithm as I know it
+and held to the library by the corpora below, not by reading its code.
+
+### Checked against
+
+Exact id equality, no tolerance. Tiny fixtures (committed, device-free,
+`tests/embedgemma2_tok_tiny.rs`): three hand-written tokenizers
+(`tests/fixtures/embedgemma2_tok/tiny_*.json`: the snapshot's shape with an
+added-token prefix pair `<a>`/`<a><b>`; a real space split with `"a b"` merges, a
+repeated merge, `ignore_merges`, `fuse_unk` and a plain added token; a byte table
+with gaps and a two-step normalizer), each with 663 texts (with and without
+specials) and 800 decode cases from the library, all equal. The real snapshot
+(`tests/embedgemma2_tok_real.rs`, `#[ignore]`, corpus from
+`scripts/gen_embedgemma2_tok_fixtures.py real` into `target/`, 11 MB, not
+committed): 4671 texts through sentence-transformers' own `preprocess`, one at a
+time, and through the library alone:
+
+| corpus | texts | encode vs sentence-transformers | encode_raw vs `tokenizers` (with and without specials) |
+| --- | --- | --- | --- |
+| every prompt x 6 samples, empty, `<bos>` after a prompt | 121 | 121/121 | 242/242 |
+| plain (no prompt) | 7 | 7/7 | 14/14 |
+| whitespace (runs to 200, tabs, newlines, CRLF, NBSP, ideographic space, leading/trailing) | 36 | 36/36 | 72/72 |
+| CJK, Devanagari, Arabic, Thai, other scripts | 10, 6, 6, 5, 7 | all | all |
+| combining marks | 15 | 15/15 | 30/30 |
+| emoji (ZWJ sequences, flags, keycaps, tag sequences) | 19 | 19/19 | 38/38 |
+| control characters (all C0, DEL, all C1) | 69 | 69/69 | 138/138 |
+| private use | 9 | 9/9 | 18/18 |
+| byte fallback (characters with no vocabulary entry) | 124 | 124/124 | 248/248 |
+| special-token strings (every added token, doubled, adjacent to text, partial) | 190 | 190/190 | 380/380 |
+| `<\|image\|>`, `<\|video\|>`, `<\|audio\|>` (refused by sentence-transformers) | 9 | refused, and the library's ids equal | 18/18 |
+| digits, code | 20, 14 | all | all |
+| long (100000 characters, `word ` x 20000, `x` x 50000, `日本語` x 10000) | 4 | 4/4 | 8/8 |
+| 4000 seeded random strings over all of the above | 4000 | 4000/4000 | 8000/8000 |
+| **total** | **4671** | **4680/4680** (4671 texts, the 9 refused counted twice) | **9342/9342** |
+
+15255 of the fuzz tokens and 642 of the byte-fallback group's are `<0xHH>`
+bytes, so the fallback is exercised. Decode: 3533 cases, 3533 equal to the
+library's string: 1000 round trips of the corpus's own ids with
+`skip_special_tokens` on and off, 2500 random id sequences (ordinary ids, byte
+tokens, special tokens, ids past the vocabulary, `u32::MAX - 1`) and 33 byte
+sequences (valid 2-, 3- and 4-byte, truncated, stray continuation, overlong,
+surrogate, too large, `0xFF`, all 256).
+
+I checked that the corpora bite: reversing the merge heap's position tie-break
+fails 7 of the 11 tiny tests, and ordering the added tokens shortest first fails
+the tiny parity test (26 of 2126 `tiny_gemma` records differ).
+
+The text path from a string: `tests/embedgemma2_e2e_model.rs`
+(`#[ignore]`, `EMBEDGEMMA2_REF_DIR` the text references) holds the Rust
+tokenizer to `ids.npy` for the eight reference texts (exact) and
+`EmbedGemma2Model::encode_texts` to `emb_f32.npy` with the bounds of that file
+(`1e-4` max abs, cosine `0.99999`): observed max abs `1.3e-7` to `2.4e-7`,
+cosine `1.000000000`, on all eight (10 to 6147 tokens), and bit-identical to
+`encode` on the reference ids.
+
+### Speed
+
+`bench_embedgemma2_tok` (load time, tokens per second on a seeded corpus)
+against `bench/embedgemma2_tok_hf.py` (the same corpus through `tokenizers`),
+alternated by `bench_paired`; the results and the plot are
+`bench/results/embedgemma2_tok_m5pro.{txt,json,png}`. On a heavily loaded
+machine (load average 110 to 135), best of 12 interleaved rounds: one tessl
+thread is 2.2x to 3.7x one `tokenizers` thread (3.8, 2.1, 4.0 and 5.1 M tokens/s
+on short queries, documents, multilingual text and a 100k-character text, against
+1.5, 1.0, 1.1 and 1.6 M), ahead of `encode_batch` on all cores on three of the four
+workloads and behind on the documents (0.3x), and loads in 0.48 s against 0.65
+to 0.68 s. The spread between rounds is a factor of two to five, so these are
+ratios of minima, not predictions. The hash of all ids is equal in both lanes
+on every workload.
+
+### Regenerating, and what is not covered
+
+```text
+~/.venvs/ml-2026-10/bin/python scripts/gen_embedgemma2_tok_fixtures.py tiny   # rewrites tests/fixtures/embedgemma2_tok/tiny_*/
+~/.venvs/ml-2026-10/bin/python scripts/gen_embedgemma2_tok_fixtures.py real   # target/embedgemma2_tok_ref/
+EMBEDGEMMA2_SNAPSHOT=... cargo test --release --test embedgemma2_tok_real -- --ignored --test-threads=1
+```
+
+Verified only for snapshot `914f7f89...` with tokenizers 0.23.2, transformers
+5.19.0 and sentence-transformers 6.1.0; another revision with a different
+`tokenizer.json` is loaded by the same code and checked by the tiny fixtures'
+features, not by this corpus. The Python binding's `encode_texts`
+(`python/tessl_torch/embedgemma2.py`) and the C ABI are not changed by this
+module: the Python one asks its tokenizer for special tokens unconditionally,
+which differs from sentence-transformers for a text starting with `<bos>`.

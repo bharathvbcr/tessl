@@ -1,0 +1,474 @@
+{
+  "rounds": 12,
+  "format": "Workloads",
+  "lanes": [
+    {
+      "name": "tessl",
+      "argv": [
+        "target/release/bench_embedgemma2_tok"
+      ],
+      "env": {}
+    },
+    {
+      "name": "hf_loop",
+      "argv": [
+        "/Users/bharath/.venvs/ml-2026-10/bin/python",
+        "bench/embedgemma2_tok_hf.py"
+      ],
+      "env": {}
+    },
+    {
+      "name": "hf_batch",
+      "argv": [
+        "/Users/bharath/.venvs/ml-2026-10/bin/python",
+        "bench/embedgemma2_tok_hf.py"
+      ],
+      "env": {
+        "BENCH_TOK_HF_MODE": "batch"
+      }
+    }
+  ],
+  "env": {
+    "BENCH_ITERS": "7"
+  },
+  "summary": [
+    {
+      "workload": "load",
+      "tessl": {
+        "ms_min_median": 2515.5586255,
+        "ms_min_min": 481.612959,
+        "ms_min_max": 3428.7015,
+        "ms_min_all": [
+          3428.7015,
+          2915.746208,
+          2881.123167,
+          2878.217334,
+          2112.16125,
+          3184.395375,
+          3068.981041,
+          2152.899917,
+          1700.735792,
+          481.612959,
+          571.443583,
+          506.435958
+        ]
+      },
+      "hf_loop": {
+        "ms_min_median": 3406.3136454788037,
+        "ms_min_min": 682.0091669796966,
+        "ms_min_max": 4621.293167001568,
+        "ms_min_all": [
+          4129.334249999374,
+          4621.293167001568,
+          3842.921874951571,
+          4356.4350419910625,
+          4207.844374992419,
+          3843.8916669692844,
+          2969.705416006036,
+          2736.7515419609845,
+          1919.2955420003273,
+          772.9707920225337,
+          682.0091669796966,
+          710.8587910188362
+        ],
+        "vs_base": {
+          "median": 1.3025104030854584,
+          "lo": 0.9676519262687866,
+          "hi": 1.9921984531211425
+        }
+      },
+      "hf_batch": {
+        "ms_min_median": 3006.081791507313,
+        "ms_min_min": 645.3924590023234,
+        "ms_min_max": 5629.056083038449,
+        "ms_min_all": [
+          3382.4219580274075,
+          4089.4290839787573,
+          5629.056083038449,
+          4796.076500031631,
+          3876.9475410226732,
+          3932.8357499907725,
+          2463.4657080168836,
+          2629.7416249872185,
+          1082.3178330319934,
+          814.4176659989171,
+          645.3924590023234,
+          647.0079169957899
+        ],
+        "vs_base": {
+          "median": 1.2563023965943656,
+          "lo": 0.6363821106858868,
+          "hi": 1.9537714137017486
+        },
+        "vs_prev": {
+          "median": 0.9338362232746382,
+          "lo": 0.5639141077272448,
+          "hi": 1.464785459139574
+        }
+      }
+    },
+    {
+      "workload": "short_queries",
+      "tessl": {
+        "ms_min_median": 8.005312499999999,
+        "ms_min_min": 6.621167,
+        "ms_min_max": 8.993208,
+        "ms_min_all": [
+          7.341292,
+          6.899167,
+          8.099666,
+          8.368375,
+          8.467291,
+          8.593541,
+          7.718416,
+          6.621167,
+          6.630917,
+          7.910959,
+          8.143416,
+          8.993208
+        ]
+      },
+      "hf_loop": {
+        "ms_min_median": 18.788041517836973,
+        "ms_min_min": 17.19754101941362,
+        "ms_min_max": 55.04391697468236,
+        "ms_min_all": [
+          17.19754101941362,
+          21.734583016950637,
+          18.421499989926815,
+          18.08662503026426,
+          19.15458304574713,
+          18.010917003266513,
+          55.04391697468236,
+          17.70620798924938,
+          18.061582988593727,
+          21.332832984626293,
+          25.845666998066008,
+          23.79904204281047
+        ],
+        "vs_base": {
+          "median": 2.6602587324650804,
+          "lo": 2.095866768223543,
+          "hi": 7.131504310558327
+        }
+      },
+      "hf_batch": {
+        "ms_min_median": 14.240895514376462,
+        "ms_min_min": 9.558833029586822,
+        "ms_min_max": 22.714833030477166,
+        "ms_min_all": [
+          15.351459034718573,
+          15.606625005602837,
+          14.05729103134945,
+          18.24620901606977,
+          11.884083971381187,
+          9.845666994806379,
+          14.424499997403473,
+          11.126875004265457,
+          22.13333296822384,
+          22.714833030477166,
+          9.558833029586822,
+          11.515291000250727
+        ],
+        "vs_base": {
+          "median": 1.8021907965962796,
+          "lo": 1.1457054774983186,
+          "hi": 3.337899263137186
+        },
+        "vs_prev": {
+          "median": 0.6732357763915297,
+          "lo": 0.26205438839023887,
+          "hi": 1.2254370495765243
+        }
+      }
+    },
+    {
+      "workload": "documents",
+      "tessl": {
+        "ms_min_median": 62.4437915,
+        "ms_min_min": 39.309417,
+        "ms_min_max": 201.82025,
+        "ms_min_all": [
+          113.6255,
+          41.568958,
+          201.82025,
+          48.810875,
+          62.606208,
+          177.382709,
+          105.116542,
+          39.309417,
+          121.054042,
+          62.281375,
+          48.503125,
+          53.028875
+        ]
+      },
+      "hf_loop": {
+        "ms_min_median": 228.93027050304227,
+        "ms_min_min": 86.93854097509757,
+        "ms_min_max": 474.6784159797244,
+        "ms_min_all": [
+          269.40670801559463,
+          100.38333298871294,
+          474.6784159797244,
+          335.83708299556747,
+          342.0609169988893,
+          333.8605830213055,
+          86.93854097509757,
+          321.2439169874415,
+          188.4538329904899,
+          118.83175000548363,
+          121.22795800678432,
+          124.25337499007583
+        ],
+        "vs_base": {
+          "median": 2.3614958826955066,
+          "lo": 0.827068121924117,
+          "hi": 8.17218726463029
+        }
+      },
+      "hf_batch": {
+        "ms_min_median": 19.36077099526301,
+        "ms_min_min": 12.657875020522624,
+        "ms_min_max": 26.71879099216312,
+        "ms_min_all": [
+          18.630458042025566,
+          26.71879099216312,
+          23.34237500326708,
+          24.970124999526888,
+          15.311375027522445,
+          18.87645898386836,
+          19.273500016424805,
+          19.448041974101216,
+          23.37487501790747,
+          20.596624992322177,
+          12.657875020522624,
+          13.04024999262765
+        ],
+        "vs_base": {
+          "median": 0.24523744043680895,
+          "lo": 0.10641656726455993,
+          "hi": 0.6427582570668026
+        },
+        "vs_prev": {
+          "median": 0.08938286312565855,
+          "lo": 0.044762129394549224,
+          "hi": 0.2661676016990527
+        }
+      }
+    },
+    {
+      "workload": "multilingual",
+      "tessl": {
+        "ms_min_median": 4.6199165,
+        "ms_min_min": 4.021166,
+        "ms_min_max": 6.714792,
+        "ms_min_all": [
+          5.591,
+          4.349667,
+          4.417541,
+          4.598583,
+          5.369667,
+          5.991834,
+          4.270042,
+          4.30475,
+          4.021166,
+          6.714792,
+          4.64125,
+          5.198666
+        ]
+      },
+      "hf_loop": {
+        "ms_min_median": 18.904041993664578,
+        "ms_min_min": 14.689332980196923,
+        "ms_min_max": 95.8029159810394,
+        "ms_min_all": [
+          18.839584023226053,
+          14.689332980196923,
+          15.28104196768254,
+          15.445416036527604,
+          20.485541957896203,
+          19.465000019408762,
+          15.007916023023427,
+          95.8029159810394,
+          14.93212505010888,
+          18.968499964103103,
+          19.364041974768043,
+          22.109791985712945
+        ],
+        "vs_base": {
+          "median": 3.486936816825759,
+          "lo": 2.824882731155798,
+          "hi": 22.255163710096845
+        }
+      },
+      "hf_batch": {
+        "ms_min_median": 6.938124977750704,
+        "ms_min_min": 4.2369170114398,
+        "ms_min_max": 11.837291007395834,
+        "ms_min_all": [
+          8.995374955702573,
+          5.216040997765958,
+          7.850708963815123,
+          7.665333978366107,
+          4.955834010615945,
+          6.210915977135301,
+          4.75149997510016,
+          11.410042003262788,
+          11.837291007395834,
+          7.687583041843027,
+          4.2369170114398,
+          5.124959046952426
+        ],
+        "vs_base": {
+          "median": 1.1720272660647582,
+          "lo": 0.9128827387966173,
+          "hi": 2.9437459203116294
+        },
+        "vs_prev": {
+          "median": 0.33708580632169854,
+          "lo": 0.11909910973399784,
+          "hi": 0.7927398791312372
+        }
+      }
+    },
+    {
+      "workload": "long_100k",
+      "tessl": {
+        "ms_min_median": 8.1325,
+        "ms_min_min": 7.676083,
+        "ms_min_max": 23.533583,
+        "ms_min_all": [
+          23.533583,
+          7.676083,
+          8.009833,
+          7.996833,
+          10.00825,
+          10.130333,
+          7.710375,
+          7.880292,
+          7.766459,
+          9.930041,
+          8.255167,
+          9.526
+        ]
+      },
+      "hf_loop": {
+        "ms_min_median": 31.24554199166596,
+        "ms_min_min": 25.41108400328085,
+        "ms_min_max": 129.70741599565372,
+        "ms_min_all": [
+          28.75083399703726,
+          25.77850001398474,
+          26.154708000831306,
+          29.239125025924295,
+          90.75320803094655,
+          38.712750014383346,
+          82.26341602858156,
+          129.70741599565372,
+          25.41108400328085,
+          31.855000008363277,
+          30.636083974968642,
+          33.01800001645461
+        ],
+        "vs_base": {
+          "median": 3.561215440731015,
+          "lo": 1.2216938660397467,
+          "hi": 16.459722050357236
+        }
+      },
+      "hf_batch": {
+        "ms_min_median": 30.619229015428573,
+        "ms_min_min": 25.286082993261516,
+        "ms_min_max": 39.61608401732519,
+        "ms_min_all": [
+          25.938792037777603,
+          27.30054099811241,
+          31.003541022073478,
+          25.422834034543484,
+          30.419457994867116,
+          32.0151670021005,
+          25.980832986533642,
+          25.286082993261516,
+          35.25229200022295,
+          39.61608401732519,
+          30.81900003599003,
+          33.53600000264123
+        ],
+        "vs_base": {
+          "median": 3.445032123279503,
+          "lo": 1.1022032657661012,
+          "hi": 4.539043082596966
+        },
+        "vs_prev": {
+          "median": 0.9540816452853574,
+          "lo": 0.19494708763690743,
+          "hi": 1.3872801331761957
+        }
+      }
+    }
+  ],
+  "raw": [
+    {
+      "tessl": [{"workload":"load","ms_min":3428.701500,"ms_median":3612.650583,"iters":5,"tokens":262144,"bytes":32170510,"ids_fnv32":0},{"workload":"short_queries","ms_min":7.341292,"ms_median":8.485291,"iters":7,"tokens":25097,"bytes":88823,"ids_fnv32":2003484812},{"workload":"documents","ms_min":113.625500,"ms_median":298.943125,"iters":7,"tokens":83746,"bytes":382352,"ids_fnv32":641024712},{"workload":"multilingual","ms_min":5.591000,"ms_median":7.403833,"iters":7,"tokens":16016,"bytes":112944,"ids_fnv32":337202411},{"workload":"long_100k","ms_min":23.533583,"ms_median":33.922958,"iters":7,"tokens":39306,"bytes":147571,"ids_fnv32":1401142627}],
+      "hf_loop": [{"workload":"load","ms_min":4129.334249999374,"ms_median":4863.133958016988,"iters":5,"tokens":262144,"bytes":32170510,"ids_fnv32":0},{"workload":"short_queries","ms_min":17.19754101941362,"ms_median":28.246209025382996,"iters":7,"tokens":25097,"bytes":88823,"ids_fnv32":2003484812},{"workload":"documents","ms_min":269.40670801559463,"ms_median":484.35020801844075,"iters":7,"tokens":83746,"bytes":382352,"ids_fnv32":641024712},{"workload":"multilingual","ms_min":18.839584023226053,"ms_median":128.3862090203911,"iters":7,"tokens":16016,"bytes":112944,"ids_fnv32":337202411},{"workload":"long_100k","ms_min":28.75083399703726,"ms_median":36.189000005833805,"iters":7,"tokens":39306,"bytes":147571,"ids_fnv32":1401142627}],
+      "hf_batch": [{"workload":"load","ms_min":3382.4219580274075,"ms_median":4522.669250029139,"iters":5,"tokens":262144,"bytes":32170510,"ids_fnv32":0},{"workload":"short_queries","ms_min":15.351459034718573,"ms_median":24.220541992690414,"iters":7,"tokens":25097,"bytes":88823,"ids_fnv32":2003484812},{"workload":"documents","ms_min":18.630458042025566,"ms_median":22.643374977633357,"iters":7,"tokens":83746,"bytes":382352,"ids_fnv32":641024712},{"workload":"multilingual","ms_min":8.995374955702573,"ms_median":26.19141701143235,"iters":7,"tokens":16016,"bytes":112944,"ids_fnv32":337202411},{"workload":"long_100k","ms_min":25.938792037777603,"ms_median":136.06541702756658,"iters":7,"tokens":39306,"bytes":147571,"ids_fnv32":1401142627}]
+    },
+    {
+      "tessl": [{"workload":"load","ms_min":2915.746208,"ms_median":4297.768750,"iters":5,"tokens":262144,"bytes":32170510,"ids_fnv32":0},{"workload":"short_queries","ms_min":6.899167,"ms_median":7.041708,"iters":7,"tokens":25097,"bytes":88823,"ids_fnv32":2003484812},{"workload":"documents","ms_min":41.568958,"ms_median":246.585792,"iters":7,"tokens":83746,"bytes":382352,"ids_fnv32":641024712},{"workload":"multilingual","ms_min":4.349667,"ms_median":4.424458,"iters":7,"tokens":16016,"bytes":112944,"ids_fnv32":337202411},{"workload":"long_100k","ms_min":7.676083,"ms_median":8.040083,"iters":7,"tokens":39306,"bytes":147571,"ids_fnv32":1401142627}],
+      "hf_loop": [{"workload":"load","ms_min":4621.293167001568,"ms_median":4722.145625040866,"iters":5,"tokens":262144,"bytes":32170510,"ids_fnv32":0},{"workload":"short_queries","ms_min":21.734583016950637,"ms_median":167.6617919583805,"iters":7,"tokens":25097,"bytes":88823,"ids_fnv32":2003484812},{"workload":"documents","ms_min":100.38333298871294,"ms_median":513.5069999960251,"iters":7,"tokens":83746,"bytes":382352,"ids_fnv32":641024712},{"workload":"multilingual","ms_min":14.689332980196923,"ms_median":144.5532919606194,"iters":7,"tokens":16016,"bytes":112944,"ids_fnv32":337202411},{"workload":"long_100k","ms_min":25.77850001398474,"ms_median":179.68912498326972,"iters":7,"tokens":39306,"bytes":147571,"ids_fnv32":1401142627}],
+      "hf_batch": [{"workload":"load","ms_min":4089.4290839787573,"ms_median":4376.828792039305,"iters":5,"tokens":262144,"bytes":32170510,"ids_fnv32":0},{"workload":"short_queries","ms_min":15.606625005602837,"ms_median":45.444375020451844,"iters":7,"tokens":25097,"bytes":88823,"ids_fnv32":2003484812},{"workload":"documents","ms_min":26.71879099216312,"ms_median":54.35154197039083,"iters":7,"tokens":83746,"bytes":382352,"ids_fnv32":641024712},{"workload":"multilingual","ms_min":5.216040997765958,"ms_median":10.746459010988474,"iters":7,"tokens":16016,"bytes":112944,"ids_fnv32":337202411},{"workload":"long_100k","ms_min":27.30054099811241,"ms_median":28.17295800196007,"iters":7,"tokens":39306,"bytes":147571,"ids_fnv32":1401142627}]
+    },
+    {
+      "tessl": [{"workload":"load","ms_min":2881.123167,"ms_median":3674.107791,"iters":5,"tokens":262144,"bytes":32170510,"ids_fnv32":0},{"workload":"short_queries","ms_min":8.099666,"ms_median":8.324375,"iters":7,"tokens":25097,"bytes":88823,"ids_fnv32":2003484812},{"workload":"documents","ms_min":201.820250,"ms_median":383.524417,"iters":7,"tokens":83746,"bytes":382352,"ids_fnv32":641024712},{"workload":"multilingual","ms_min":4.417541,"ms_median":4.620750,"iters":7,"tokens":16016,"bytes":112944,"ids_fnv32":337202411},{"workload":"long_100k","ms_min":8.009833,"ms_median":54.021875,"iters":7,"tokens":39306,"bytes":147571,"ids_fnv32":1401142627}],
+      "hf_loop": [{"workload":"load","ms_min":3842.921874951571,"ms_median":5592.699708009604,"iters":5,"tokens":262144,"bytes":32170510,"ids_fnv32":0},{"workload":"short_queries","ms_min":18.421499989926815,"ms_median":74.00729204528034,"iters":7,"tokens":25097,"bytes":88823,"ids_fnv32":2003484812},{"workload":"documents","ms_min":474.6784159797244,"ms_median":665.9032499883324,"iters":7,"tokens":83746,"bytes":382352,"ids_fnv32":641024712},{"workload":"multilingual","ms_min":15.28104196768254,"ms_median":48.1688340078108,"iters":7,"tokens":16016,"bytes":112944,"ids_fnv32":337202411},{"workload":"long_100k","ms_min":26.154708000831306,"ms_median":230.244959006086,"iters":7,"tokens":39306,"bytes":147571,"ids_fnv32":1401142627}],
+      "hf_batch": [{"workload":"load","ms_min":5629.056083038449,"ms_median":6659.474957967177,"iters":5,"tokens":262144,"bytes":32170510,"ids_fnv32":0},{"workload":"short_queries","ms_min":14.05729103134945,"ms_median":21.606000023894012,"iters":7,"tokens":25097,"bytes":88823,"ids_fnv32":2003484812},{"workload":"documents","ms_min":23.34237500326708,"ms_median":70.39879204239696,"iters":7,"tokens":83746,"bytes":382352,"ids_fnv32":641024712},{"workload":"multilingual","ms_min":7.850708963815123,"ms_median":37.98729198751971,"iters":7,"tokens":16016,"bytes":112944,"ids_fnv32":337202411},{"workload":"long_100k","ms_min":31.003541022073478,"ms_median":140.89416695060208,"iters":7,"tokens":39306,"bytes":147571,"ids_fnv32":1401142627}]
+    },
+    {
+      "tessl": [{"workload":"load","ms_min":2878.217334,"ms_median":3232.621666,"iters":5,"tokens":262144,"bytes":32170510,"ids_fnv32":0},{"workload":"short_queries","ms_min":8.368375,"ms_median":8.755291,"iters":7,"tokens":25097,"bytes":88823,"ids_fnv32":2003484812},{"workload":"documents","ms_min":48.810875,"ms_median":266.732708,"iters":7,"tokens":83746,"bytes":382352,"ids_fnv32":641024712},{"workload":"multilingual","ms_min":4.598583,"ms_median":4.781792,"iters":7,"tokens":16016,"bytes":112944,"ids_fnv32":337202411},{"workload":"long_100k","ms_min":7.996833,"ms_median":8.092625,"iters":7,"tokens":39306,"bytes":147571,"ids_fnv32":1401142627}],
+      "hf_loop": [{"workload":"load","ms_min":4356.4350419910625,"ms_median":4777.453583024908,"iters":5,"tokens":262144,"bytes":32170510,"ids_fnv32":0},{"workload":"short_queries","ms_min":18.08662503026426,"ms_median":31.800792028661817,"iters":7,"tokens":25097,"bytes":88823,"ids_fnv32":2003484812},{"workload":"documents","ms_min":335.83708299556747,"ms_median":411.47612500935793,"iters":7,"tokens":83746,"bytes":382352,"ids_fnv32":641024712},{"workload":"multilingual","ms_min":15.445416036527604,"ms_median":56.7218330106698,"iters":7,"tokens":16016,"bytes":112944,"ids_fnv32":337202411},{"workload":"long_100k","ms_min":29.239125025924295,"ms_median":234.83024997403845,"iters":7,"tokens":39306,"bytes":147571,"ids_fnv32":1401142627}],
+      "hf_batch": [{"workload":"load","ms_min":4796.076500031631,"ms_median":5037.49295900343,"iters":5,"tokens":262144,"bytes":32170510,"ids_fnv32":0},{"workload":"short_queries","ms_min":18.24620901606977,"ms_median":25.49304103013128,"iters":7,"tokens":25097,"bytes":88823,"ids_fnv32":2003484812},{"workload":"documents","ms_min":24.970124999526888,"ms_median":32.63779199915007,"iters":7,"tokens":83746,"bytes":382352,"ids_fnv32":641024712},{"workload":"multilingual","ms_min":7.665333978366107,"ms_median":11.575291980989277,"iters":7,"tokens":16016,"bytes":112944,"ids_fnv32":337202411},{"workload":"long_100k","ms_min":25.422834034543484,"ms_median":26.229040988255292,"iters":7,"tokens":39306,"bytes":147571,"ids_fnv32":1401142627}]
+    },
+    {
+      "tessl": [{"workload":"load","ms_min":2112.161250,"ms_median":3282.005166,"iters":5,"tokens":262144,"bytes":32170510,"ids_fnv32":0},{"workload":"short_queries","ms_min":8.467291,"ms_median":9.254625,"iters":7,"tokens":25097,"bytes":88823,"ids_fnv32":2003484812},{"workload":"documents","ms_min":62.606208,"ms_median":343.218792,"iters":7,"tokens":83746,"bytes":382352,"ids_fnv32":641024712},{"workload":"multilingual","ms_min":5.369667,"ms_median":6.138375,"iters":7,"tokens":16016,"bytes":112944,"ids_fnv32":337202411},{"workload":"long_100k","ms_min":10.008250,"ms_median":53.839333,"iters":7,"tokens":39306,"bytes":147571,"ids_fnv32":1401142627}],
+      "hf_loop": [{"workload":"load","ms_min":4207.844374992419,"ms_median":6025.7132499828,"iters":5,"tokens":262144,"bytes":32170510,"ids_fnv32":0},{"workload":"short_queries","ms_min":19.15458304574713,"ms_median":32.08591602742672,"iters":7,"tokens":25097,"bytes":88823,"ids_fnv32":2003484812},{"workload":"documents","ms_min":342.0609169988893,"ms_median":584.7059999941848,"iters":7,"tokens":83746,"bytes":382352,"ids_fnv32":641024712},{"workload":"multilingual","ms_min":20.485541957896203,"ms_median":75.88691596174613,"iters":7,"tokens":16016,"bytes":112944,"ids_fnv32":337202411},{"workload":"long_100k","ms_min":90.75320803094655,"ms_median":200.4933340358548,"iters":7,"tokens":39306,"bytes":147571,"ids_fnv32":1401142627}],
+      "hf_batch": [{"workload":"load","ms_min":3876.9475410226732,"ms_median":4143.626625009347,"iters":5,"tokens":262144,"bytes":32170510,"ids_fnv32":0},{"workload":"short_queries","ms_min":11.884083971381187,"ms_median":18.313792010303587,"iters":7,"tokens":25097,"bytes":88823,"ids_fnv32":2003484812},{"workload":"documents","ms_min":15.311375027522445,"ms_median":40.68345803534612,"iters":7,"tokens":83746,"bytes":382352,"ids_fnv32":641024712},{"workload":"multilingual","ms_min":4.955834010615945,"ms_median":8.652291027829051,"iters":7,"tokens":16016,"bytes":112944,"ids_fnv32":337202411},{"workload":"long_100k","ms_min":30.419457994867116,"ms_median":273.8236250006594,"iters":7,"tokens":39306,"bytes":147571,"ids_fnv32":1401142627}]
+    },
+    {
+      "tessl": [{"workload":"load","ms_min":3184.395375,"ms_median":3509.554042,"iters":5,"tokens":262144,"bytes":32170510,"ids_fnv32":0},{"workload":"short_queries","ms_min":8.593541,"ms_median":8.897250,"iters":7,"tokens":25097,"bytes":88823,"ids_fnv32":2003484812},{"workload":"documents","ms_min":177.382709,"ms_median":303.758167,"iters":7,"tokens":83746,"bytes":382352,"ids_fnv32":641024712},{"workload":"multilingual","ms_min":5.991834,"ms_median":6.156459,"iters":7,"tokens":16016,"bytes":112944,"ids_fnv32":337202411},{"workload":"long_100k","ms_min":10.130333,"ms_median":10.390791,"iters":7,"tokens":39306,"bytes":147571,"ids_fnv32":1401142627}],
+      "hf_loop": [{"workload":"load","ms_min":3843.8916669692844,"ms_median":4483.545458002482,"iters":5,"tokens":262144,"bytes":32170510,"ids_fnv32":0},{"workload":"short_queries","ms_min":18.010917003266513,"ms_median":39.94033404160291,"iters":7,"tokens":25097,"bytes":88823,"ids_fnv32":2003484812},{"workload":"documents","ms_min":333.8605830213055,"ms_median":421.23774997889996,"iters":7,"tokens":83746,"bytes":382352,"ids_fnv32":641024712},{"workload":"multilingual","ms_min":19.465000019408762,"ms_median":24.952207983005792,"iters":7,"tokens":16016,"bytes":112944,"ids_fnv32":337202411},{"workload":"long_100k","ms_min":38.712750014383346,"ms_median":259.67387499986216,"iters":7,"tokens":39306,"bytes":147571,"ids_fnv32":1401142627}],
+      "hf_batch": [{"workload":"load","ms_min":3932.8357499907725,"ms_median":4668.892458023038,"iters":5,"tokens":262144,"bytes":32170510,"ids_fnv32":0},{"workload":"short_queries","ms_min":9.845666994806379,"ms_median":33.86475000297651,"iters":7,"tokens":25097,"bytes":88823,"ids_fnv32":2003484812},{"workload":"documents","ms_min":18.87645898386836,"ms_median":28.12116697896272,"iters":7,"tokens":83746,"bytes":382352,"ids_fnv32":641024712},{"workload":"multilingual","ms_min":6.210915977135301,"ms_median":61.01708399364725,"iters":7,"tokens":16016,"bytes":112944,"ids_fnv32":337202411},{"workload":"long_100k","ms_min":32.0151670021005,"ms_median":36.50879196356982,"iters":7,"tokens":39306,"bytes":147571,"ids_fnv32":1401142627}]
+    },
+    {
+      "tessl": [{"workload":"load","ms_min":3068.981041,"ms_median":3185.921375,"iters":5,"tokens":262144,"bytes":32170510,"ids_fnv32":0},{"workload":"short_queries","ms_min":7.718416,"ms_median":8.253708,"iters":7,"tokens":25097,"bytes":88823,"ids_fnv32":2003484812},{"workload":"documents","ms_min":105.116542,"ms_median":310.925125,"iters":7,"tokens":83746,"bytes":382352,"ids_fnv32":641024712},{"workload":"multilingual","ms_min":4.270042,"ms_median":4.538209,"iters":7,"tokens":16016,"bytes":112944,"ids_fnv32":337202411},{"workload":"long_100k","ms_min":7.710375,"ms_median":18.832500,"iters":7,"tokens":39306,"bytes":147571,"ids_fnv32":1401142627}],
+      "hf_loop": [{"workload":"load","ms_min":2969.705416006036,"ms_median":3037.615291948896,"iters":5,"tokens":262144,"bytes":32170510,"ids_fnv32":0},{"workload":"short_queries","ms_min":55.04391697468236,"ms_median":116.2366250064224,"iters":7,"tokens":25097,"bytes":88823,"ids_fnv32":2003484812},{"workload":"documents","ms_min":86.93854097509757,"ms_median":378.44062503427267,"iters":7,"tokens":83746,"bytes":382352,"ids_fnv32":641024712},{"workload":"multilingual","ms_min":15.007916023023427,"ms_median":15.62483300222084,"iters":7,"tokens":16016,"bytes":112944,"ids_fnv32":337202411},{"workload":"long_100k","ms_min":82.26341602858156,"ms_median":179.22095803078264,"iters":7,"tokens":39306,"bytes":147571,"ids_fnv32":1401142627}],
+      "hf_batch": [{"workload":"load","ms_min":2463.4657080168836,"ms_median":3294.29320897907,"iters":5,"tokens":262144,"bytes":32170510,"ids_fnv32":0},{"workload":"short_queries","ms_min":14.424499997403473,"ms_median":29.33670795755461,"iters":7,"tokens":25097,"bytes":88823,"ids_fnv32":2003484812},{"workload":"documents","ms_min":19.273500016424805,"ms_median":26.196916995104402,"iters":7,"tokens":83746,"bytes":382352,"ids_fnv32":641024712},{"workload":"multilingual","ms_min":4.75149997510016,"ms_median":18.49891699384898,"iters":7,"tokens":16016,"bytes":112944,"ids_fnv32":337202411},{"workload":"long_100k","ms_min":25.980832986533642,"ms_median":146.78308297879994,"iters":7,"tokens":39306,"bytes":147571,"ids_fnv32":1401142627}]
+    },
+    {
+      "tessl": [{"workload":"load","ms_min":2152.899917,"ms_median":2520.339833,"iters":5,"tokens":262144,"bytes":32170510,"ids_fnv32":0},{"workload":"short_queries","ms_min":6.621167,"ms_median":6.781792,"iters":7,"tokens":25097,"bytes":88823,"ids_fnv32":2003484812},{"workload":"documents","ms_min":39.309417,"ms_median":342.903875,"iters":7,"tokens":83746,"bytes":382352,"ids_fnv32":641024712},{"workload":"multilingual","ms_min":4.304750,"ms_median":4.459708,"iters":7,"tokens":16016,"bytes":112944,"ids_fnv32":337202411},{"workload":"long_100k","ms_min":7.880292,"ms_median":72.570125,"iters":7,"tokens":39306,"bytes":147571,"ids_fnv32":1401142627}],
+      "hf_loop": [{"workload":"load","ms_min":2736.7515419609845,"ms_median":3018.218459037598,"iters":5,"tokens":262144,"bytes":32170510,"ids_fnv32":0},{"workload":"short_queries","ms_min":17.70620798924938,"ms_median":61.40166596742347,"iters":7,"tokens":25097,"bytes":88823,"ids_fnv32":2003484812},{"workload":"documents","ms_min":321.2439169874415,"ms_median":414.4087079912424,"iters":7,"tokens":83746,"bytes":382352,"ids_fnv32":641024712},{"workload":"multilingual","ms_min":95.8029159810394,"ms_median":119.477582979016,"iters":7,"tokens":16016,"bytes":112944,"ids_fnv32":337202411},{"workload":"long_100k","ms_min":129.70741599565372,"ms_median":207.97437499277294,"iters":7,"tokens":39306,"bytes":147571,"ids_fnv32":1401142627}],
+      "hf_batch": [{"workload":"load","ms_min":2629.7416249872185,"ms_median":3132.9597090370953,"iters":5,"tokens":262144,"bytes":32170510,"ids_fnv32":0},{"workload":"short_queries","ms_min":11.126875004265457,"ms_median":18.951374979224056,"iters":7,"tokens":25097,"bytes":88823,"ids_fnv32":2003484812},{"workload":"documents","ms_min":19.448041974101216,"ms_median":29.652917000930756,"iters":7,"tokens":83746,"bytes":382352,"ids_fnv32":641024712},{"workload":"multilingual","ms_min":11.410042003262788,"ms_median":30.5695419665426,"iters":7,"tokens":16016,"bytes":112944,"ids_fnv32":337202411},{"workload":"long_100k","ms_min":25.286082993261516,"ms_median":128.5652500228025,"iters":7,"tokens":39306,"bytes":147571,"ids_fnv32":1401142627}]
+    },
+    {
+      "tessl": [{"workload":"load","ms_min":1700.735792,"ms_median":2133.597333,"iters":5,"tokens":262144,"bytes":32170510,"ids_fnv32":0},{"workload":"short_queries","ms_min":6.630917,"ms_median":27.137666,"iters":7,"tokens":25097,"bytes":88823,"ids_fnv32":2003484812},{"workload":"documents","ms_min":121.054042,"ms_median":217.476417,"iters":7,"tokens":83746,"bytes":382352,"ids_fnv32":641024712},{"workload":"multilingual","ms_min":4.021166,"ms_median":15.906875,"iters":7,"tokens":16016,"bytes":112944,"ids_fnv32":337202411},{"workload":"long_100k","ms_min":7.766459,"ms_median":7.983083,"iters":7,"tokens":39306,"bytes":147571,"ids_fnv32":1401142627}],
+      "hf_loop": [{"workload":"load","ms_min":1919.2955420003273,"ms_median":2279.2125830310397,"iters":5,"tokens":262144,"bytes":32170510,"ids_fnv32":0},{"workload":"short_queries","ms_min":18.061582988593727,"ms_median":18.64533399930224,"iters":7,"tokens":25097,"bytes":88823,"ids_fnv32":2003484812},{"workload":"documents","ms_min":188.4538329904899,"ms_median":297.46608302230015,"iters":7,"tokens":83746,"bytes":382352,"ids_fnv32":641024712},{"workload":"multilingual","ms_min":14.93212505010888,"ms_median":72.20733299618587,"iters":7,"tokens":16016,"bytes":112944,"ids_fnv32":337202411},{"workload":"long_100k","ms_min":25.41108400328085,"ms_median":38.459167000837624,"iters":7,"tokens":39306,"bytes":147571,"ids_fnv32":1401142627}],
+      "hf_batch": [{"workload":"load","ms_min":1082.3178330319934,"ms_median":1264.1909170197323,"iters":5,"tokens":262144,"bytes":32170510,"ids_fnv32":0},{"workload":"short_queries","ms_min":22.13333296822384,"ms_median":25.922333996277303,"iters":7,"tokens":25097,"bytes":88823,"ids_fnv32":2003484812},{"workload":"documents","ms_min":23.37487501790747,"ms_median":33.00741600105539,"iters":7,"tokens":83746,"bytes":382352,"ids_fnv32":641024712},{"workload":"multilingual","ms_min":11.837291007395834,"ms_median":25.88354196632281,"iters":7,"tokens":16016,"bytes":112944,"ids_fnv32":337202411},{"workload":"long_100k","ms_min":35.25229200022295,"ms_median":42.84549999283627,"iters":7,"tokens":39306,"bytes":147571,"ids_fnv32":1401142627}]
+    },
+    {
+      "tessl": [{"workload":"load","ms_min":481.612959,"ms_median":539.953083,"iters":5,"tokens":262144,"bytes":32170510,"ids_fnv32":0},{"workload":"short_queries","ms_min":7.910959,"ms_median":8.280125,"iters":7,"tokens":25097,"bytes":88823,"ids_fnv32":2003484812},{"workload":"documents","ms_min":62.281375,"ms_median":79.478042,"iters":7,"tokens":83746,"bytes":382352,"ids_fnv32":641024712},{"workload":"multilingual","ms_min":6.714792,"ms_median":8.703042,"iters":7,"tokens":16016,"bytes":112944,"ids_fnv32":337202411},{"workload":"long_100k","ms_min":9.930041,"ms_median":12.179583,"iters":7,"tokens":39306,"bytes":147571,"ids_fnv32":1401142627}],
+      "hf_loop": [{"workload":"load","ms_min":772.9707920225337,"ms_median":853.2834579818882,"iters":5,"tokens":262144,"bytes":32170510,"ids_fnv32":0},{"workload":"short_queries","ms_min":21.332832984626293,"ms_median":28.404375014360994,"iters":7,"tokens":25097,"bytes":88823,"ids_fnv32":2003484812},{"workload":"documents","ms_min":118.83175000548363,"ms_median":154.2175420327112,"iters":7,"tokens":83746,"bytes":382352,"ids_fnv32":641024712},{"workload":"multilingual","ms_min":18.968499964103103,"ms_median":22.572958027012646,"iters":7,"tokens":16016,"bytes":112944,"ids_fnv32":337202411},{"workload":"long_100k","ms_min":31.855000008363277,"ms_median":34.95775000192225,"iters":7,"tokens":39306,"bytes":147571,"ids_fnv32":1401142627}],
+      "hf_batch": [{"workload":"load","ms_min":814.4176659989171,"ms_median":834.0799169964157,"iters":5,"tokens":262144,"bytes":32170510,"ids_fnv32":0},{"workload":"short_queries","ms_min":22.714833030477166,"ms_median":31.26566600985825,"iters":7,"tokens":25097,"bytes":88823,"ids_fnv32":2003484812},{"workload":"documents","ms_min":20.596624992322177,"ms_median":33.58858299907297,"iters":7,"tokens":83746,"bytes":382352,"ids_fnv32":641024712},{"workload":"multilingual","ms_min":7.687583041843027,"ms_median":12.380749976728112,"iters":7,"tokens":16016,"bytes":112944,"ids_fnv32":337202411},{"workload":"long_100k","ms_min":39.61608401732519,"ms_median":43.51545899407938,"iters":7,"tokens":39306,"bytes":147571,"ids_fnv32":1401142627}]
+    },
+    {
+      "tessl": [{"workload":"load","ms_min":571.443583,"ms_median":586.147541,"iters":5,"tokens":262144,"bytes":32170510,"ids_fnv32":0},{"workload":"short_queries","ms_min":8.143416,"ms_median":8.217667,"iters":7,"tokens":25097,"bytes":88823,"ids_fnv32":2003484812},{"workload":"documents","ms_min":48.503125,"ms_median":49.531333,"iters":7,"tokens":83746,"bytes":382352,"ids_fnv32":641024712},{"workload":"multilingual","ms_min":4.641250,"ms_median":5.154459,"iters":7,"tokens":16016,"bytes":112944,"ids_fnv32":337202411},{"workload":"long_100k","ms_min":8.255167,"ms_median":8.647709,"iters":7,"tokens":39306,"bytes":147571,"ids_fnv32":1401142627}],
+      "hf_loop": [{"workload":"load","ms_min":682.0091669796966,"ms_median":752.5833750260063,"iters":5,"tokens":262144,"bytes":32170510,"ids_fnv32":0},{"workload":"short_queries","ms_min":25.845666998066008,"ms_median":28.36266701342538,"iters":7,"tokens":25097,"bytes":88823,"ids_fnv32":2003484812},{"workload":"documents","ms_min":121.22795800678432,"ms_median":136.51962496805936,"iters":7,"tokens":83746,"bytes":382352,"ids_fnv32":641024712},{"workload":"multilingual","ms_min":19.364041974768043,"ms_median":19.975790986791253,"iters":7,"tokens":16016,"bytes":112944,"ids_fnv32":337202411},{"workload":"long_100k","ms_min":30.636083974968642,"ms_median":32.2901249746792,"iters":7,"tokens":39306,"bytes":147571,"ids_fnv32":1401142627}],
+      "hf_batch": [{"workload":"load","ms_min":645.3924590023234,"ms_median":714.5776249817573,"iters":5,"tokens":262144,"bytes":32170510,"ids_fnv32":0},{"workload":"short_queries","ms_min":9.558833029586822,"ms_median":10.595667001325637,"iters":7,"tokens":25097,"bytes":88823,"ids_fnv32":2003484812},{"workload":"documents","ms_min":12.657875020522624,"ms_median":13.705040968488902,"iters":7,"tokens":83746,"bytes":382352,"ids_fnv32":641024712},{"workload":"multilingual","ms_min":4.2369170114398,"ms_median":4.437165975105017,"iters":7,"tokens":16016,"bytes":112944,"ids_fnv32":337202411},{"workload":"long_100k","ms_min":30.81900003599003,"ms_median":31.724207976367325,"iters":7,"tokens":39306,"bytes":147571,"ids_fnv32":1401142627}]
+    },
+    {
+      "tessl": [{"workload":"load","ms_min":506.435958,"ms_median":524.961125,"iters":5,"tokens":262144,"bytes":32170510,"ids_fnv32":0},{"workload":"short_queries","ms_min":8.993208,"ms_median":9.991417,"iters":7,"tokens":25097,"bytes":88823,"ids_fnv32":2003484812},{"workload":"documents","ms_min":53.028875,"ms_median":56.000250,"iters":7,"tokens":83746,"bytes":382352,"ids_fnv32":641024712},{"workload":"multilingual","ms_min":5.198666,"ms_median":6.294750,"iters":7,"tokens":16016,"bytes":112944,"ids_fnv32":337202411},{"workload":"long_100k","ms_min":9.526000,"ms_median":9.611292,"iters":7,"tokens":39306,"bytes":147571,"ids_fnv32":1401142627}],
+      "hf_loop": [{"workload":"load","ms_min":710.8587910188362,"ms_median":774.8697499628179,"iters":5,"tokens":262144,"bytes":32170510,"ids_fnv32":0},{"workload":"short_queries","ms_min":23.79904204281047,"ms_median":24.035290989559144,"iters":7,"tokens":25097,"bytes":88823,"ids_fnv32":2003484812},{"workload":"documents","ms_min":124.25337499007583,"ms_median":128.45566601026803,"iters":7,"tokens":83746,"bytes":382352,"ids_fnv32":641024712},{"workload":"multilingual","ms_min":22.109791985712945,"ms_median":23.965833010151982,"iters":7,"tokens":16016,"bytes":112944,"ids_fnv32":337202411},{"workload":"long_100k","ms_min":33.01800001645461,"ms_median":35.23945796769112,"iters":7,"tokens":39306,"bytes":147571,"ids_fnv32":1401142627}],
+      "hf_batch": [{"workload":"load","ms_min":647.0079169957899,"ms_median":663.2189999800175,"iters":5,"tokens":262144,"bytes":32170510,"ids_fnv32":0},{"workload":"short_queries","ms_min":11.515291000250727,"ms_median":14.364875038154423,"iters":7,"tokens":25097,"bytes":88823,"ids_fnv32":2003484812},{"workload":"documents","ms_min":13.04024999262765,"ms_median":14.947000017855316,"iters":7,"tokens":83746,"bytes":382352,"ids_fnv32":641024712},{"workload":"multilingual","ms_min":5.124959046952426,"ms_median":6.2879169709049165,"iters":7,"tokens":16016,"bytes":112944,"ids_fnv32":337202411},{"workload":"long_100k","ms_min":33.53600000264123,"ms_median":34.490875026676804,"iters":7,"tokens":39306,"bytes":147571,"ids_fnv32":1401142627}]
+    }
+  ],
+  "lane_archive": "bench/results/embedgemma2_tok_m5pro.json.lanes"
+}

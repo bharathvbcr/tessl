@@ -28,8 +28,6 @@
 //! The scorer is `common/parity.rs`; `tests/gemm_parity.rs` holds its contract.
 //! Exit status: 0 clean, 1 a check failed or could not run, 2 usage.
 
-mod common;
-
 #[path = "../json.rs"]
 #[allow(dead_code)]
 mod json;
@@ -38,7 +36,6 @@ mod parity;
 #[path = "common/pyjson.rs"]
 mod pyjson;
 
-use common::Dist;
 use parity::{CellRow, LaneMerge, Precision, Scratch};
 use pyjson::{fmt_e, obj, Doc};
 use std::path::{Path, PathBuf};
@@ -59,6 +56,11 @@ const LADDER: &[(usize, usize, usize, &str)] = &[
     (8192, 768, 3072, "mlp_down"),
     (4096, 4096, 1024, "tall_k1024"),
 ];
+
+/// The operand distributions `bench_gemm_sweep` can dump (`BENCH_PARITY_DIST`), in
+/// the order the ladder walks them. A third hand-kept copy, of `common::Dist`;
+/// `tests/gemm_parity.rs` compares them.
+const DISTS: &[&str] = &["uniform", "normal", "log_uniform", "near_cancel", "heavy_tail"];
 
 const USAGE: &str = "usage:\n  gemm_parity score DIR [--out PATH]\n  gemm_parity ladder [--seeds N] \
     [--shapes LABELS|all] [--dists NAMES|all] [--binary PATH] [--external auto|none] [--python PATH] [--out PATH]";
@@ -277,7 +279,7 @@ fn ladder_cmd(mut args: Vec<String>) -> Result<(), String> {
 
     let known: Vec<String> = LADDER.iter().map(|s| s.3.to_string()).collect();
     let labels = names(shapes, known, "ladder label")?;
-    let all_dists: Vec<String> = Dist::ALL.iter().map(|d| d.name().to_string()).collect();
+    let all_dists: Vec<String> = DISTS.iter().map(|d| d.to_string()).collect();
     let dist_names = names(dists.or_else(|| Some("uniform".to_string())), all_dists, "distribution")?;
 
     let cells: Vec<parity::Cell> = labels

@@ -25,6 +25,8 @@
 
 #[path = "common/kcov.rs"]
 mod kcov;
+#[path = "common/proc.rs"]
+mod proc;
 #[path = "common/pyjson.rs"]
 mod pyjson;
 

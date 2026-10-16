@@ -997,8 +997,8 @@ fn fsum_and_median_are_pythons() {
         let got = parity::fsum(&s) / n as f64;
         assert_eq!(got.to_bits(), bits, "fmean of {n}: {got:e}");
     }
-    assert_eq!(parity::median(&series(9)).to_bits(), 0xbf26c67d028f5c29);
-    assert_eq!(parity::median(&series(10)).to_bits(), 0x3f407de4a8000000);
+    assert_eq!(pyjson::median(&series(9)).to_bits(), 0xbf26c67d028f5c29);
+    assert_eq!(pyjson::median(&series(10)).to_bits(), 0x3f407de4a8000000);
 }
 
 #[test]
@@ -1426,11 +1426,31 @@ fn the_shape_ladder_is_the_same_in_the_sweep_the_scorer_and_the_python_lanes() {
 
 #[test]
 fn the_distribution_names_are_the_dumpers() {
-    // gemm_parity walks `Dist::ALL`; the dumper parses the same names.
+    // gemm_parity walks its own DISTS; the dumper parses `common::Dist`'s names.
+    // Same five, in the same order.
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let parity = std::fs::read_to_string(root.join("src/bin/gemm_parity.rs")).unwrap();
+    let listed: Vec<&str> = between(&parity, "const DISTS: &[&str] = &[", "];")
+        .split(',')
+        .map(|s| s.trim().trim_matches('"'))
+        .filter(|s| !s.is_empty())
+        .collect();
     let common = std::fs::read_to_string(root.join("src/bin/common/mod.rs")).unwrap();
-    let names = between(&common, "pub const ALL: [Dist; 5] = [", "];");
-    for variant in ["Uniform", "Normal", "LogUniform", "NearCancel", "HeavyTail"] {
-        assert!(names.contains(&format!("Dist::{variant}")), "Dist::ALL lacks {variant}");
+    let names = between(&common, "pub fn name(self) -> &'static str {", "\n    }");
+    let named: Vec<&str> = names
+        .lines()
+        .filter_map(|l| l.split_once("=> \"").map(|(_, r)| r.trim_end_matches([',', '"'])))
+        .collect();
+    assert_eq!(
+        listed,
+        ["uniform", "normal", "log_uniform", "near_cancel", "heavy_tail"]
+    );
+    assert_eq!(listed, named, "gemm_parity's DISTS drifted from common::Dist");
+    let parse = between(&common, "pub fn parse(name: &str)", "other =>");
+    for d in &listed {
+        assert!(
+            parse.contains(&format!("\"{d}\" =>")),
+            "Dist::parse does not accept {d}"
+        );
     }
 }

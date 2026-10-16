@@ -1,4 +1,5 @@
-//! Output text that matches what Python printed for the same data.
+//! Output text that matches what Python printed for the same data, and the one
+//! statistic those scripts reported.
 //!
 //! The result files under `bench/results/` were written by `json.dumps(doc,
 //! indent=2)` and by `%`-formatting, and the tools that replaced those scripts
@@ -86,6 +87,19 @@ impl Doc {
             }
         }
         Ok(())
+    }
+}
+
+/// `statistics.median` of a non-empty list: the middle value, or the mean of the
+/// two middle ones.
+pub fn median(xs: &[f64]) -> f64 {
+    let mut v = xs.to_vec();
+    v.sort_by(f64::total_cmp);
+    let n = v.len();
+    if n % 2 == 1 {
+        v[n / 2]
+    } else {
+        (v[n / 2 - 1] + v[n / 2]) / 2.0
     }
 }
 

@@ -24,7 +24,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use crate::json::{self, Json, Syntax};
-use crate::pyjson::{float_str, fmt_e, obj, quote, quote_list, Doc};
+use crate::pyjson::{float_str, fmt_e, median, obj, quote, quote_list, Doc};
 
 // ------------------------------------------------------------------ precision
 
@@ -496,18 +496,6 @@ pub fn fsum(xs: &[f64]) -> f64 {
         }
     }
     hi
-}
-
-/// `statistics.median` of a non-empty list.
-pub fn median(xs: &[f64]) -> f64 {
-    let mut v = xs.to_vec();
-    v.sort_by(f64::total_cmp);
-    let n = v.len();
-    if n % 2 == 1 {
-        v[n / 2]
-    } else {
-        (v[n / 2 - 1] + v[n / 2]) / 2.0
-    }
 }
 
 // -------------------------------------------------------------------- scoring

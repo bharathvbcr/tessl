@@ -53,15 +53,6 @@ pub enum Dist {
 }
 
 impl Dist {
-    /// Every distribution, in the order the parity ladder walks them.
-    pub const ALL: [Dist; 5] = [
-        Dist::Uniform,
-        Dist::Normal,
-        Dist::LogUniform,
-        Dist::NearCancel,
-        Dist::HeavyTail,
-    ];
-
     pub fn parse(name: &str) -> Result<Self, String> {
         Ok(match name {
             "uniform" => Dist::Uniform,

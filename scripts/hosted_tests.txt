@@ -17,7 +17,7 @@ bin bench_paired_cli 29
 bin build_artifact_contract 2
 bin capi_contract 77
 bin check_kernel_ir_planted 6
-bin dialect_lint_script 5
+bin dialect_lint_script 12
 bin docs_name_real_tools 6
 bin embedgemma2_audio_fixtures 2
 bin embedgemma2_pre 5

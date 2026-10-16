@@ -36,8 +36,8 @@
 //! An older revision, which has `load` and no operand choice, is benchmarked
 //! with this file's one `load_with(.., operands)` call replaced by `load(..)` (its
 //! `precision` field is then not a measurement: run it at `f32`);
-//! `bench/results/embedgemma2_audio_bf16_m5pro.txt` says how the before lane
-//! was built.
+//! `docs/embedgemma2.md` (the audio tower bf16 and speed section) says how the
+//! before lane was built.
 
 mod common;
 

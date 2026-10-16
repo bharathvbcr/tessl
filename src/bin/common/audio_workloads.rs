@@ -16,7 +16,7 @@
 //!   4 clips of 500 frames, 8 of 1000 and one of `MAX_FRAMES_PER_FORWARD`
 //!   (16,384 frames, 163.84 s: the longest clip the tower accepts), named
 //!   only; they and `clip_1.0s` (1 s) are the paired speed benchmark's four
-//!   workloads (`bench/results/embedgemma2_audio_bf16_m5pro.txt`).
+//!   workloads (`docs/embedgemma2.md`, the audio tower bf16 and speed section).
 
 #![allow(dead_code)]
 
@@ -27,8 +27,8 @@ use tessl::npy::read_npy;
 
 /// The workloads a run without a list covers.
 pub const WORKLOAD_NAMES: [&str; 3] = ["clip_1.0s", "clip_3.3s", "batch_8x30s"];
-/// Named only: the batches of the paired speed benchmark (`bench/results/
-/// embedgemma2_audio_bf16_m5pro.txt`), each `clips x frames` synthetic like
+/// Named only: the batches of the paired speed benchmark (`docs/embedgemma2.md`, the audio tower bf16 and speed
+/// section), each `clips x frames` synthetic like
 /// `batch_8x30s`: `batch_4x5s` (4 clips of 5 s), `batch_8x10s` (8 of 10 s) and
 /// `clip_max` (one clip of `MAX_FRAMES_PER_FORWARD` frames, the most a forward
 /// holds: 163.84 s).

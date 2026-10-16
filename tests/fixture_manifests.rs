@@ -134,6 +134,13 @@ fn files_in(dir: &Path) -> BTreeSet<String> {
         .collect()
 }
 
+fn has_entry_named(dir: &Path, name: &str) -> bool {
+    std::fs::read_dir(dir)
+        .unwrap_or_else(|e| panic!("{}: {e}", dir.display()))
+        .map(|e| e.expect("readable entry"))
+        .any(|e| e.file_name() == name && e.path().is_file())
+}
+
 #[test]
 fn every_fixture_directory_has_a_manifest_that_lists_every_file() {
     let repo = Path::new(env!("CARGO_MANIFEST_DIR"));
@@ -151,7 +158,10 @@ fn every_fixture_directory_has_a_manifest_that_lists_every_file() {
     for d in &dirs {
         let dir = fixtures().join(d);
         let manifest = dir.join("MANIFEST.json");
-        if manifest.is_file() {
+        // By the directory's own entry name, not `is_file()`: on a
+        // case-insensitive volume (APFS's default) `MANIFEST.json` would find
+        // bert_tiny's `manifest.json`, its own record in another format.
+        if has_entry_named(&dir, "MANIFEST.json") {
             let text =
                 std::fs::read_to_string(&manifest).unwrap_or_else(|e| panic!("tests/fixtures/{d}/MANIFEST.json: {e}"));
             if let Err(e) = check_manifest(&text, &files_in(&dir), repo) {

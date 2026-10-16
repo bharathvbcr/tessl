@@ -34,8 +34,8 @@
 //! # The clamp is part of the operator
 //!
 //! `alpha` and `beta` are clamped before they enter the recurrence, and on the
-//! `L65_tinyalpha` fixture that is not cosmetic: the stored `alpha.npy` holds
-//! `1e-8` while the golden was generated with it clamped up to the `1e-4` floor.
+//! `L65_tinyalpha` fixture that is not cosmetic: the stored `alpha_preclamp.npy`
+//! holds `1e-8` (the pre-clamp gate, which is why the file says so) while the golden was generated with it clamped up to the `1e-4` floor.
 //! Running the recurrence on the stored gate reproduces the golden to only
 //! `8.4e-5` relative; clamping first reproduces it to `1.9e-16`. The clamp is
 //! therefore applied *here*, not left to the caller, because a caller who forgets
@@ -68,6 +68,23 @@ pub struct GateClamp {
 impl GateClamp {
     /// The clamp every published fixture manifest declares. Held to that claim
     /// by a test, so a manifest that changes cannot leave this stale.
+    ///
+    /// **A deviation from transformers and FLA, recorded as such.** Neither
+    /// computes it: transformers' `Qwen3_5GatedDeltaNet.forward` takes
+    /// `g = -exp(A_log) * softplus(a + dt_bias)` and uses `exp(g)` unclamped,
+    /// and FLA's kernels do the same. The bounds are nanolab's published rule
+    /// (`mixers.py`), applied to the sigmoid gates of that operator.
+    ///
+    /// What it clamps: `alpha` (the per-step state decay) to `[1e-4, 1]` and
+    /// `beta` (the write strength) to `[0, 1]`. Only the `alpha` floor can
+    /// change a value, because a sigmoid already lies in `[0, 1]`: it engages
+    /// when the pre-activation is below `ln(1e-4 / (1 - 1e-4))`, about -9.21.
+    /// Why: nanolab bounds the decay away from zero so a fully-forgotten state
+    /// cannot feed `log(alpha)` or a divide in the chunked form. It is
+    /// therefore part of the nanolab operator and absent from the Qwen3.5 one;
+    /// the Qwen3.5 gate is checked against transformers' own module instead
+    /// (`qwen35_gates_*` in `tests/fixtures/qwen35/`, asserted against the kernel by
+    /// `tests/qwen35_kernels.rs`).
     pub const PUBLISHED: Self = Self {
         alpha: (1e-4, 1.0),
         beta: (0.0, 1.0),
@@ -365,6 +382,16 @@ pub fn load_case(name: &str) -> Case {
         let path = fixture_dir().join(format!("gdn_published_{name}_{suffix}.npy"));
         read_npy(&path).unwrap_or_else(|e| panic!("load {name}_{suffix}: {e}"))
     };
+    // A case whose stored gate is the value *before* the clamp names its file
+    // `alpha_preclamp`; every other case stores the post-clamp `alpha`.
+    let alpha_suffix = if fixture_dir()
+        .join(format!("gdn_published_{name}_alpha_preclamp.npy"))
+        .exists()
+    {
+        "alpha_preclamp"
+    } else {
+        "alpha"
+    };
 
     let q = load("q");
     // [B, H, L, D] for q/k/v, [B, H, L] for the gates.
@@ -378,7 +405,7 @@ pub fn load_case(name: &str) -> Case {
 
     let k = load("k");
     let v = load("v");
-    let alpha = load("alpha");
+    let alpha = load(alpha_suffix);
     let beta = load("beta");
     let golden = load("y_seq_f64");
     assert_eq!(alpha.shape, vec![dims.b, dims.h, dims.l], "{name}: alpha shape");

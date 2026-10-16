@@ -120,6 +120,11 @@ impl GdnData {
         }
     }
 
+    /// The `qwen35_gdn_*` arrays in `tests/fixtures/qwen35/`. They are marked
+    /// `published: false` in that directory's `MANIFEST.json` (ft-b8561dbb): kept
+    /// for the tests that read them today, and nothing new uses them as a golden.
+    /// The model-level golden is `tests/fixtures/qwen35_train*`; the gate golden is
+    /// `qwen35_gates_*`.
     fn fixture() -> Self {
         let (qs, q) = load_f32("gdn_q");
         let (vs, v) = load_f32("gdn_v");
@@ -166,6 +171,7 @@ impl GdnData {
     }
 }
 
+// The `qwen35_gdn_*` goldens below are `published: false` (see `GdnData::fixture`).
 #[test]
 fn gdn_reference_matches_transformers() {
     let d = GdnData::fixture();
@@ -1846,6 +1852,141 @@ fn fused_projection_equals_the_separate_linears() {
 }
 
 // ------------------------------------------------------------ host contract ---
+
+/// `qwen35_gdn_gates_f32` against the golden captured from transformers' own
+/// `Qwen3_5GatedDeltaNet.forward` (`qwen35_gates_*`, written by
+/// `scripts/gen_qwen35_fixtures.py::gates`): `g = -exp(A_log) * softplus(a +
+/// dt_bias)` and `beta = sigmoid(b)`, B x T = 2 x 37 rows over the 4B's 32 value
+/// heads, with logits past softplus' linear threshold either side and `b` at
+/// +-20. The logits sit inside a wider fused row at an offset, with junk in the
+/// columns between, so a kernel that read the wrong columns or the wrong stride
+/// reads junk, not the right answer.
+///
+/// `tests/gdn_gates.rs` is not this test's golden: it holds the nanolab sigmoid
+/// operator, a different gate (`alpha = sigmoid(a + decay_bias)`), which
+/// the Qwen3.5 forward never computes.
+#[test]
+fn gdn_gates_kernel_matches_the_transformers_module_golden() {
+    let (sh, a) = load_f32("gates_a");
+    let (_, b) = load_f32("gates_b");
+    let (_, a_log) = load_f32("gates_a_log");
+    let (_, dt_bias) = load_f32("gates_dt_bias");
+    let (gsh, g_want) = load("gates_g");
+    let (_, beta_want) = load("gates_beta");
+    assert_eq!(sh.len(), 3, "gates_a is [B, T, H]");
+    assert_eq!(gsh, sh, "the golden has the inputs' shape");
+    let (rows, heads) = (sh[0] * sh[1], sh[2]);
+    assert_eq!((a_log.len(), dt_bias.len()), (heads, heads));
+
+    with_gpu(|rt| {
+        // One fused row per token: `a` at column 3, `b` after a 2-column gap.
+        let (a_off, b_off) = (3usize, 3 + heads + 2);
+        let ld = b_off + heads + 2;
+        let mut fused = vec![777.0f32; rows * ld];
+        for r in 0..rows {
+            fused[r * ld + a_off..r * ld + a_off + heads].copy_from_slice(&a[r * heads..(r + 1) * heads]);
+            fused[r * ld + b_off..r * ld + b_off + heads].copy_from_slice(&b[r * heads..(r + 1) * heads]);
+        }
+        let logits = buf(rt, &fused);
+        let (alb, dtb) = (buf(rt, &a_log), buf(rt, &dt_bias));
+        let g = seeded(rt, rows * heads, SENTINEL);
+        let beta = seeded(rt, rows * heads, SENTINEL);
+        qwen35::gdn_gates(
+            rt,
+            &GdnGateLogits {
+                buf: &logits,
+                ld: ld as u32,
+                a_off: a_off as u32,
+                b_off: b_off as u32,
+            },
+            &GdnParams {
+                a_log: &alb,
+                dt_bias: &dtb,
+            },
+            &g,
+            &beta,
+            rows as u32,
+            heads as u32,
+        )
+        .unwrap();
+        // The bound is derived per element from an ulp budget over the op chain, not fitted
+        // to a run. One ulp is taken as 2^-23 of the value (the worst case; the ulp of a
+        // value is between 2^-24 and 2^-23 relative to it). Each figure and where it
+        // comes from:
+        //
+        //  - fast `exp`: 3 + floor(2|x|) ulp. Sourced: `tools/msl_emu/metal_stdlib:151-155`
+        //    (Metal's documented bound, as the emulator models it), `docs/qwen35.md:397`,
+        //    `kernels/qwen35_act.h:44`.
+        //  - softplus' `1 + e` rounding on the `log` branch (x in [-3, 20]): at most 1.2e-6
+        //    relative. Sourced: `kernels/qwen35_act.h:39-40`. `precise::log` adds half an
+        //    ulp: the same lines. The series branch (x < -3) is exact to f32 (`:38-39`).
+        //  - precise `exp` (inside softplus): 3 ulp, attenuated by at most 1 into the
+        //    result. UNVERIFIED: from the MSL spec, not checked here; the emulator models
+        //    `precise::` as exact (`metal_stdlib:171-175`) and states no ulp figure.
+        //  - the fast divide in the sigmoid, 2.5 ulp; and the multiply / add roundings,
+        //    0.5 ulp each (IEEE, standard). The divide is UNVERIFIED: from the MSL spec,
+        //    not checked here; nothing in the repo states it.
+        //  - the golden's own error, torch's f32 CPU `exp` 2, `softplus` 3, `sigmoid` 3 ulp.
+        //    UNVERIFIED: a budget chosen here, not a torch-documented figure.
+        //  - `a + dt_bias` is the same IEEE f32 add on both sides, so it adds nothing.
+        //
+        //   g    = -exp(A_log) * softplus(a + dt_bias)
+        //        = fast exp 3+floor(2|A_log|) + golden exp 2 + softplus (1.2e-6/2^-23 = 10.3
+        //          for the rounded `1 + e`, + 0.5 log, + 3 precise exp) 13.8 + golden softplus
+        //          3 + multiply 0.5                           [per head]
+        //   beta = sigmoid(b): worst at b < 0, where beta = e * r and e = fast exp(-|b|)
+        //          enters unattenuated: 3+floor(2|b|) (43 ulp at b = -20) + divide 2.5 +
+        //          multiply 0.5 + add 0.5 + golden sigmoid 3  [per element]
+        //
+        // At this fixture's worst inputs that is 7+2+13.8+3+0.5 = 26.3 ulp (3.1e-6) for g
+        // and 43+6.5 = 49.5 ulp (5.9e-6) for beta. A kernel outside its element's budget is
+        // a finding, not a tolerance to loosen.
+        let ulp = 2f64.powi(-23);
+        let fast_exp_ulps = |x: f32| 3.0 + (2.0 * f64::from(x).abs()).floor();
+        let softplus_kernel_ulps = 1.2e-6 / ulp + 0.5 + 3.0;
+        let (got_g, got_beta) = (g.read_f32(), beta.read_f32());
+        let n = rows * heads;
+        let g_budget: Vec<f64> = (0..n)
+            .map(|i| fast_exp_ulps(a_log[i % heads]) + 2.0 + softplus_kernel_ulps + 3.0 + 0.5)
+            .collect();
+        let beta_budget: Vec<f64> = (0..n).map(|i| fast_exp_ulps(b[i]) + 2.5 + 0.5 + 0.5 + 3.0).collect();
+        let mut report = String::new();
+        for (what, got, want, budget) in [
+            ("g", &got_g[..n], &g_want, &g_budget),
+            ("beta", &got_beta[..n], &beta_want, &beta_budget),
+        ] {
+            let mut worst_rel = (0.0f64, 0usize);
+            let mut worst_used = (0.0f64, 0usize);
+            for (i, (&x, &w)) in got.iter().zip(want).enumerate() {
+                assert!(x != SENTINEL, "gdn_gates {what}[{i}]: never written");
+                assert!(x.is_finite(), "gdn_gates {what}[{i}]: non-finite {x}");
+                let rel = (f64::from(x) - w).abs() / w.abs();
+                let used = rel / (budget[i] * ulp);
+                assert!(
+                    used <= 1.0,
+                    "gdn_gates {what}[{i}]: got {x} want {w}: relative error {rel:.3e} is over the \
+                     {:.1}-ulp budget ({:.3e})",
+                    budget[i],
+                    budget[i] * ulp
+                );
+                if rel > worst_rel.0 {
+                    worst_rel = (rel, i);
+                }
+                if used > worst_used.0 {
+                    worst_used = (used, i);
+                }
+            }
+            report += &format!(
+                "{what}: worst relative error {:.3e} (element {}); most of its budget used {:.1}% (element {})\n",
+                worst_rel.0,
+                worst_rel.1,
+                100.0 * worst_used.0,
+                worst_used.1
+            );
+        }
+        println!("gdn_gates vs transformers:\n{report}");
+    });
+}
 
 #[test]
 fn every_qwen35_kernel_is_in_the_metallib() {

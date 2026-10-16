@@ -380,7 +380,7 @@ fn the_repo_rule_is_a_different_operator_and_does_not_reproduce_the_golden() {
 ///
 /// [`GateClamp::PUBLISHED`] is a constant, so without this it could silently go
 /// stale against a regenerated corpus. That matters more than it looks: on
-/// `L65_tinyalpha` the stored `alpha.npy` is `1e-8`, below the declared `1e-4`
+/// `L65_tinyalpha` the stored `alpha_preclamp.npy` is `1e-8`, below the declared `1e-4`
 /// floor, and the golden was generated with the clamp applied. Get the clamp
 /// wrong and that one case reproduces to 8.4e-5 instead of 1.9e-16 -- close
 /// enough to look like rounding, far too large to be it.
@@ -448,5 +448,58 @@ fn the_alpha_clamp_changes_the_answer_on_the_case_built_to_probe_it() {
         "skipping the alpha clamp changed nothing ({:.3e} relative); the corpus no \
          longer probes it",
         err / mag
+    );
+}
+
+/// A stored gate that sits below the clamp floor is named for what it is.
+///
+/// `L65_tinyalpha` stores `alpha` before the clamp (every value `1e-8`) while its
+/// goldens were generated with it clamped to `1e-4`. A file called plain `alpha`
+/// invites a consumer to treat it as the gate the golden used, which reproduces
+/// the golden to only 8.4e-5; `alpha_preclamp` and a manifest field say it is the
+/// input to the clamp. This holds the corpus to that for every case: whichever
+/// stored `alpha` array has a value under the floor must be the `alpha_preclamp`
+/// file and its per-case manifest must declare `"alpha_array": "pre_clamp"`; and a
+/// file named `alpha_preclamp` must really hold such a value, so the name cannot
+/// drift onto a case the clamp does not touch.
+#[test]
+fn a_gate_stored_below_the_clamp_floor_is_named_and_declared_preclamp() {
+    let dir = fixture_dir();
+    let floor = GateClamp::PUBLISHED.alpha.0;
+    let mut preclamp = Vec::new();
+    for name in case_names() {
+        let plain = dir.join(format!("gdn_published_{name}_alpha.npy"));
+        let pre = dir.join(format!("gdn_published_{name}_alpha_preclamp.npy"));
+        assert!(
+            plain.exists() != pre.exists(),
+            "{name}: exactly one of alpha.npy and alpha_preclamp.npy must exist"
+        );
+        let stored = read_npy(if pre.exists() { &pre } else { &plain }).expect("alpha loads");
+        let below = stored
+            .f32_slice()
+            .expect("alpha is f32")
+            .iter()
+            .any(|a| f64::from(*a) < floor);
+        let meta = std::fs::read_to_string(dir.join(format!("gdn_published_{name}_meta.json"))).expect("per-case meta");
+        let declared = meta.contains("\"alpha_array\": \"pre_clamp\"");
+        assert_eq!(
+            pre.exists(),
+            below,
+            "{name}: the stored alpha {} a value under the clamp floor {floor:e}, so the file {} be named alpha_preclamp",
+            if below { "holds" } else { "holds no" },
+            if below { "must" } else { "must not" },
+        );
+        assert_eq!(
+            declared, below,
+            "{name}: its meta must declare alpha_array pre_clamp exactly when the stored alpha is below the floor"
+        );
+        if below {
+            preclamp.push(name);
+        }
+    }
+    assert_eq!(
+        preclamp,
+        ["L65_tinyalpha"],
+        "the corpus is built to hold exactly one pre-clamp case; a change here changes what the clamp tests probe"
     );
 }

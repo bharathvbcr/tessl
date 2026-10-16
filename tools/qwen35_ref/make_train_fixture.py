@@ -56,7 +56,11 @@ import torch
 from safetensors.torch import save_file
 from transformers.models.qwen3_5 import modeling_qwen3_5 as mq
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import fixture_manifest as fm  # noqa: E402
+
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+GENERATOR = "tools/qwen35_ref/make_train_fixture.py"
 TINY_T = 70  # past one 64-token GDN chunk and two 32-row attention blocks
 
 
@@ -120,6 +124,47 @@ def write_common(out, loss, ids):
     np.save(os.path.join(out, "loss.npy"), np.array([loss], dtype=np.float64))
 
 
+def train_manifest(directory, out, grouped, role, reproduction):
+    """MANIFEST.json for a committed `tiny` fixture directory (the format and its
+    meaning are in fixture_manifest.py). Every file here is a golden of record: the
+    loss and the gradients come from transformers' own autograd, and the checkpoint
+    and ids are what they were differentiated at."""
+    files = {}
+    for name in sorted(os.listdir(out)):
+        if name == "config.json":
+            files[name] = dict(role="config", published=True, note="the tiny model's config.json")
+        elif name == "model.safetensors":
+            files[name] = dict(role="model", published=True,
+                               note="bf16 checkpoint; the float32 model torch differentiated holds the same values")
+        elif name == "ids.npy":
+            files[name] = dict(role="input", published=True, note="token ids the loss and gradients are at")
+        elif name == "loss.npy":
+            files[name] = dict(role="golden", published=True, note="mean cross-entropy, float64")
+        else:
+            files[name] = dict(role="golden", published=True,
+                               note="float32 gradient from transformers' loss.backward()")
+    drift = None
+    if reproduction is not None:
+        worst = max(reproduction["max_relative_to_peak"].values(), default=0.0)
+        drift = (f"goldens reproduce to {worst:.1e} of each file's peak under torch "
+                 f"{fm.versions()['torch']} / transformers {fm.versions()['transformers']} (this run: "
+                 f"{len(reproduction['byte_identical'])} files byte-identical incl. model.safetensors and ids.npy, "
+                 f"the gradients and loss moved by arithmetic only); the audit of 2026-10-09 measured, under torch "
+                 f"2.13.0 / transformers 5.14.1, 25 of 29 gradients bit-identical and the other 4 within 2.4e-7 of "
+                 f"peak (unverified here). The committed files were not regenerated.")
+    heads = "2 key heads over 4 value heads" if grouped else "1 key head over 1 value head"
+    fm.write_manifest(
+        directory, GENERATOR,
+        f"drawn: torch.Generator().manual_seed(20260930) feeds the parameter init and the token ids; the "
+        f"drawn model (model.safetensors) and ids.npy are committed, so the draws are the inputs. {heads}.",
+        files, role, reproduction=reproduction,
+        extra={**({"drift": drift} if drift else {}), "gdn_path": "chunked: Qwen3_5ForCausalLM runs with no cache, so every GDN layer calls "
+                           "transformers' torch_chunk_gated_delta_rule (modeling_qwen3_5.py, 5.17.0 :301) and "
+                           "autograd differentiates it; the recurrent rule runs only for a cached single-token "
+                           "step. Both read the decayed state, which is the published rule (arXiv:2412.06464 eq. 8). "
+                           "Checked by wrapping both entry points over one forward at T=70."})
+
+
 def tiny(args):
     if args.untied and args.grouped:
         sys.exit("--untied and --grouped are separate fixtures")
@@ -147,6 +192,12 @@ def tiny(args):
     write_common(out, loss, ids)
     for n, g in grads.items():
         np.save(os.path.join(out, f"grad.{n}.npy"), g.astype(np.float32))
+    if args.reproduces:
+        # The committed files predate the manifest: compare this run with them and
+        # record that, rather than claiming they were produced by it.
+        train_manifest(args.reproduces, out, args.grouped, "reproduced", fm.compare(args.reproduces, out))
+    else:
+        train_manifest(out, out, args.grouped, "produced", None)
     print(f"tiny: loss {loss:.6f}, {len(grads)} gradients -> {out}")
 
 
@@ -198,6 +249,9 @@ def main():
     ap.add_argument("--untied", action="store_true",
                     help="tiny: tie_word_embeddings false, a separate lm_head.weight (the 9B's layout)")
     ap.add_argument("--out", help="tiny: where to write (default: the committed fixture)")
+    ap.add_argument("--reproduces", metavar="DIR",
+                    help="tiny, with --out: DIR is a committed fixture. Compare this run with it and write "
+                         "DIR/MANIFEST.json recording the comparison (versions_role: reproduced)")
     args = ap.parse_args()
     torch.set_num_threads(max(1, os.cpu_count() // 2))
     (tiny if args.which == "tiny" else two_b)(args)

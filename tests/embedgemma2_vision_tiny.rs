@@ -836,7 +836,9 @@ fn relaxed_precision_is_refused_by_exact_f32_and_moves_nothing_at_bf16() {
             rt.set_relaxed_precision(false);
             match operands {
                 GemmOperands::ExactF32 => {
-                    let err = relaxed.err().expect("ExactF32 ran with relaxed precision on");
+                    let Err(err) = relaxed else {
+                        panic!("ExactF32 ran with relaxed precision on");
+                    };
                     assert!(err.contains("exact-f32"), "{err}");
                 }
                 GemmOperands::Bf16 => assert_eq!(

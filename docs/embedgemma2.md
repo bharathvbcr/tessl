@@ -782,7 +782,8 @@ let out = model.encode_audio(&[AudioInput { input_features, mask }, ...], false)
 ```
 
 > **Status** (Apple M5 Pro, 2026-10-15, branch
-> `worktree-agent-a975c42e7f8ed0908` on base `60a6240`, snapshot
+> `worktree-agent-a975c42e7f8ed0908` on base `60a6240`, then lane I's kernels
+> ("Speed"; `worktree-agent-a52c15ece0674d300` on `df5d329`), snapshot
 > `914f7f89`; torch 2.14.1, transformers 5.19.0): every bound below holds.
 > `encode_audio` queues its forwards under a `GpuRuntime::async_scope` and ends
 > with one `synchronize()` (`queue_audio` is the call up to the wait).
@@ -851,20 +852,47 @@ layer 10 `4.8e-1`, tower output `6.8e-1`
 
 New, `kernels/embedgemma2_audio.metal`; the matmuls are the exact-f32 `gemm`.
 `gemm_epilogue` has no exact-f32 path (its contract needs bf16 or relaxed f32),
-so no clamp rides on a GEMM; each is folded into the elementwise pass beside it.
+so no clamp rides on a GEMM; each is folded into the row pass beside it. A layer
+is 17 dispatches, 19 when q, k and v need different input clamps (it was 28; see
+"Speed").
 
 | Kernel | Does |
 |---|---|
-| `eg2a_sub_conv0_ln_relu`, `eg2a_sub_conv1_ln_relu` | the strided conv with the frame mask, the channel LayerNorm and ReLU in one pass; threadgroup per output position (channels across threads), simdgroup per position for the 32-channel layer. Output channels-last, so the second layer's flatten order is its store order |
-| `eg2a_rms_norm` | `[resid +] scale * clamp(act(rms_norm(clamp(clamp(x))) [* w]))`: a linear's output clamp and the gradient clamp before, SiLU and the next linear's input clamp after, the residual add; in place allowed. The weightless embedder norm is `weight = None` |
-| `eg2a_ew` | `clamp(act(clamp(x))) + residual \| bias`: between the feed-forward's linears, a linear's output clamp plus the residual, an input clamp, the output bias |
-| `eg2a_glu` | the GLU with the linear's output clamp |
-| `eg2a_dwconv1d_causal` | the depthwise causal conv over clips (rows before a clip's start read 0) |
-| `eg2a_attn` | the chunked local attention, one simdgroup per (query, head); the q/k/v output clamps are applied as it loads, the output projection's input clamp as it stores |
+| `eg2a_sub_conv0_ln_relu` | the strided conv with the frame mask, the channel LayerNorm and ReLU in one pass; threadgroup per output position (channels across threads). Output channels-last, so the second layer's flatten order is its store order |
+| `eg2a_sub_conv1_ln_relu` | the second strided conv, LayerNorm and ReLU: one simdgroup per (row, 8 frequency positions); each of the nine taps stages its 8-position input patch in threadgroup memory (zero where the tap leaves the frequency range, the rows or the mask) and multiplies it by that tap's `[C0, C1]` weights in 8x8 `simdgroup_float8x8` tiles, ragged edge tiles through a zero-padded stage; the LayerNorm statistics are `simd_sum`s. The per-position kernel it replaced re-read all 147 KB of weights for every output position |
+| `eg2a_rms_norm` | one or two row stages per threadgroup, one row each. A stage is `[resid + \| bias +] scale * clamp(act(rms_norm(clamp(clamp(x))) [* w]))` (a linear's output clamp and the gradient clamp before, SiLU and the next linear's input clamp after; the norm and the weight are each optional: without the norm it is the output clamp plus the residual, or plus the output bias). With two stages the second reads what the first wrote and writes one to three outputs, the same normed value under their own clamps: the layer's residual add and the norm after it are one launch, the attention norm writes the clamped input q, k and v read, `norm_out` runs in place on the stream. In place allowed |
+| `eg2a_ew` | `clamp(act(clamp(x)))`, between the feed-forward's linears |
+| `eg2a_lconv` | the light conv's middle in one pass per row: the GLU (after the linear's output clamp), the depthwise causal conv over clips (rows before a clip's start read 0), the conv norm with its gradient clamp and SiLU, and the next linear's input clamp. The GLU is recomputed for the 5 rows a row's conv reads (the neighbours' rows, from cache), which beats writing the GLU's and the conv's output |
+| `eg2a_attn` | the chunked local attention, one simdgroup per (query, head); the q/k/v output clamps are applied as it loads, the output projection's input clamp as it stores. q, k, v are read at a row stride and column offset, so a fused q\|k\|v projection output serves all three. Only the `past` candidate keys (`j = i + 1 .. i + past`) are computed: each lane holds its share of `ac + bd` for each, one butterfly reduce-scatter (`ega_scatter_sum16`) sums all 16 candidate slots across the lanes, and the softcap, maximum and exponentials are one value per lane pair |
+
+The attention drops the masked slots' `exp` instead of computing it: a masked
+logit is `-1e9`, whose weight is exactly 0 beside any unmasked logit (the softcap
+keeps those within `+-cap`), so the host requires `attention_invalid_logits_value
+<= -(cap + 104)` (`AudioConfig::validate` and `attention` refuse otherwise) and
+requires at most 16 past frames (the real config has 12). When nothing in the
+window is visible the logits are all equal and the row takes the uniform `1/ctx`
+over the window, values included, as before; that is the kernel's second loop.
+
+q, k and v are one `[hidden, 3 * hidden]` GEMM on one clamped copy of the
+attention norm whenever their three input clamps are equal. They are in every
+layer of the checkpoint (read from the safetensors header for all 12 layers: for
+each, q, k and v have identical `input_min/max` and `output_min/max`, e.g. layer
+0 `[-20.375, 20.25]` in and `[-34.5, 34.25]` out, layer 11 `[-9.375, 9.25]` and
+`[-17.125, 17.0]`). The first version of this module and its notes said they
+differ, which is not so. A checkpoint whose clamps differ takes the three-GEMM
+path with three clamped copies; `tests/embedgemma2_audio_tiny.rs` runs both
+(random per-linear clamps: all layers split; q's copied to k and v: all layers
+fused, and one fused beside one split layer) against the f64 forward.
 
 SiLU and the sigmoid are `kernels/act.h`'s overflow-free forms. A clip bound of
 infinity (the module's untrained default) is held as `+-f32::MAX`, since the
 kernels are compiled with fast math.
+
+Sums reordered against transformers' (each held to the bounds below, with the
+observed errors in the table): the attention logit is one per-lane partial of
+`ac + bd` finished by the butterfly (it was `simd_sum(ac) + simd_sum(bd)`), the
+second conv accumulates its `9 * C0` terms in 8x8 tiles, and the light conv
+sums its five taps as before but from the GLU recomputed in registers.
 
 ### Batches and limits
 
@@ -877,7 +905,10 @@ so a clip is bit for bit the same alone or in any batch. Padding (masked)
 frames are defined everywhere: the only place a masked frame influences a kept
 one is the subsampling's zeroing before each conv. Rows of masked frames are
 computed exactly as transformers computes them (a query with no visible key
-softmaxes to the uniform `1/24` over its window), and then dropped.
+softmaxes to the uniform `1/24` over its window), and then dropped. The attention
+kernel takes at most 16 past frames (`attention_context_left - 1`; the real config
+has 12) and an `attention_invalid_logits_value` of at most `-(cap + 104)`;
+`AudioConfig::validate` refuses a config outside either.
 `trace` returns each clip's subsample output, per-layer residuals and tower
 output. The activations are unzeroed, as the text encoder's are; the tests
 poison every one with NaN.
@@ -890,20 +921,25 @@ Fixed before the first run (the real-checkpoint bounds are the ones
 | Check | Bound | Observed |
 |---|---|---|
 | the f64 reference vs transformers (`tests/embedgemma2_audio_fixtures.rs`: tiny random tower, 3 clips, trailing and interior padding, bounds that bite) | `1e-5` × max | ≤ `5.7e-7` |
-| each kernel vs the f64 reference, small and real shapes (`tests/embedgemma2_audio_kernels.rs`) | `2e-5` × max | ≤ `1.4e-6` (second conv, 128 -> 32 channels) |
-| tiny tower, 2 layers (`tests/embedgemma2_audio_tiny.rs`): subsample, each layer, tower output | `1e-4` × max | ≤ `1.7e-6` |
-| tiny tower, soft tokens | `1e-4` max abs | ≤ `2.4e-6` |
-| same at the checkpoint's attention geometry (hidden 256, head dim 128, chunk 12) | as above | ≤ `1.4e-6`, soft ≤ `2.2e-6` |
+| each kernel vs the f64 reference, small and real shapes (`tests/embedgemma2_audio_kernels.rs`) | `2e-5` × max | ≤ `1.4e-6` (attention, 8 heads of 128), second conv `1.3e-6` (128 -> 32 channels), light conv `5.9e-7`; the new kernels have cases that fail under a one-tap, one-pixel or one-lane-mask mutation (see below) |
+| tiny tower, 2 layers (`tests/embedgemma2_audio_tiny.rs`): subsample, each layer, tower output; fused and split q/k/v | `1e-4` × max | ≤ `1.4e-6` |
+| tiny tower, soft tokens | `1e-4` max abs | ≤ `3.0e-6` |
+| same at the checkpoint's attention geometry (hidden 256, head dim 128, chunk 12) | as above | within the two rows above |
 | clip alone vs inside any batch, reordered, traced, with every unzeroed activation poisoned, across a split into two forwards | bit-identical | bit-identical |
-| real checkpoint, clip 0 (99 frames, 25 tokens), subsample, 12 layers, tower output | `1e-4` × max | ≤ `2.9e-6` (layer 11), tower `3.9e-6` |
-| real checkpoint, clip 1 (330 frames, 329 valid, 83 tokens) | `1e-4` × max | ≤ `5.1e-6` (layer 11), tower `1.0e-5` |
-| real checkpoint, soft tokens | `1e-4` × max | `5.7e-6` and `2.1e-5` (max abs `2.9e-5`, `1.1e-4` on values up to 5.5); cosine 1.000000000 |
+| real checkpoint, clip 0 (99 frames, 25 tokens), subsample, 12 layers, tower output | `1e-4` × max | ≤ `1.9e-6` (layer 11), tower `2.7e-6` |
+| real checkpoint, clip 1 (330 frames, 329 valid, 83 tokens) | `1e-4` × max | ≤ `4.7e-6` (layer 11), tower `1.1e-5` |
+| real checkpoint, soft tokens | `1e-4` × max | `3.8e-6` and `2.3e-5` (max abs `1.9e-5`, `1.2e-4` on values up to 5.5); cosine 1.000000000 |
 | both clips in one batch vs alone | bit-identical | bit-identical |
 
 The tiny test's bounds bite: with the clip bounds, the gradient clip or the
 softcap relaxed in the reference, the tower output moves by `74 %`, `30 %`
 and `3.7 %` of its maximum. Two mutations of the attention kernel (the window
-one frame wider, the relative index off by one) each fail it at `1e-1`.
+one frame wider, the relative index off by one) each fail it at `1e-1`. The
+kernels added for speed were each mutated once in the shader and run against
+`tests/embedgemma2_audio_kernels.rs`, then restored: the light conv's tap window one
+row off fails `lconv_matches_the_f64_reference`, the second conv's frequency padding
+dropped fails `sub_conv1_matches_the_f64_reference`, the attention's last butterfly
+mask 1 changed to 2 fails `attention_matches_the_f64_reference`.
 
 The first run of the real-checkpoint test failed its soft-token check at
 `1.14e-4` max abs because the check had been written as an absolute `1e-4`
@@ -911,14 +947,74 @@ where the other stages (and the task) bound by `1e-4` of the largest
 magnitude; the stated bound is the relative one, and the soft tokens are within
 `2.1e-5` of it. Nothing else was changed. The reference there is the sdpa one.
 
-### Speed follow-ups (not measured; no timing was run)
+### Speed
 
-About 28 dispatches per layer, most of them elementwise, and 48 MFLOP per row
-per layer in the GEMMs (two feed-forwards 33.6, attention projections 8.4,
-light-conv linears 6.3; inferred from the shapes). Candidates, each needing a
-benchmark before it is believed: one packed q|k|v GEMM (the three input bounds
-differ in the checkpoint, so it needs a clamping prologue or one clamped copy per
-distinct bound); clamps on the exact-f32 GEMM path; fusing the GLU into the
-depthwise conv and the conv-norm; sharing K/V loads across the 12 queries of a
-block in the attention (each (query, head) reloads its 12 keys and values); the
-bf16 mode.
+`profile_embedgemma2_audio` times each stage of `encode_audio` on the real
+checkpoint (stage-mask variants on zeroed activations, interleaved rounds, min
+over rounds; `bench/results/embedgemma2_audio_profile_m5pro.{txt,json,png}`), for
+the 1.0 s and 3.3 s golden clips and a synthetic batch of 8 clips of 30 s (24,000
+frames, two forwards). `bench_embedgemma2_audio` times the whole call and is what
+`bench_paired` runs (`bench/results/embedgemma2_audio_speed_m5pro.{txt,json,png}`).
+
+**Where the time was** (`df5d329`'s kernels, sum of the stages run alone): the
+exact-f32 GEMMs are 70-78 % of it (the feed-forward pair is 44 % on the batch and
+the 1.0 s clip and 42 % on the 3.3 s clip; the batch GEMMs reach 4.6-7.2 TFLOP/s,
+the one-clip GEMMs 0.2-4.5: with 25-83 rows the 4096-wide feed-forward matrices
+are streamed for almost no reuse). Next on the batch was the second subsampling conv, 8.0 % (64 ms: one
+threadgroup per output position re-read all 147 KB of its weights), then the
+q/k/v clamps and pre-norms, the depthwise conv, the GLU and the other row passes
+at 1-3 % each, 28 dispatches a layer. On the 1.0 s clip the forward is
+launch-bound as much as GEMM-bound. The GEMMs are `gemm`'s (not this module's);
+the stage ranking after the work below is the same, led by the feed-forward
+GEMMs at 54 % of the batch and 50 % of the 1.0 s clip.
+
+**What changed** (kernels in "Kernels"; each is held to the f64 reference by
+`tests/embedgemma2_audio_kernels.rs` and the tiny-tower tests, bounds in the table
+above):
+
+* the second conv is an 8x8 `simdgroup_float8x8` tiled kernel: 64.1 to 13.9 ms on
+  the batch, 1.07 to 0.51 ms on the 3.3 s clip (stage alone, in two profile runs
+  that were not equally loaded; see below);
+* the row passes are fused: the residual add and the next norm are one launch,
+  the attention norm writes the clamped input q, k and v read (the three input
+  clamps are equal in all 12 layers of the checkpoint, so q|k|v is one GEMM
+  instead of three), the GLU, depthwise conv, conv norm and SiLU are one launch:
+  28 to 17 dispatches a layer, 343 to 210 per one-clip forward;
+* the attention computes only the `past` candidate keys, finishes all their logits
+  with one butterfly reduce-scatter instead of two `simd_sum`s per key, and reads
+  q, k, v at a row stride so the fused projection output is read in place.
+
+`eg2a_glu` and `eg2a_dwconv1d_causal` are gone (`eg2a_lconv` is in their place).
+The results stay inside the bounds above, and a clip is still bit for bit the same
+alone or in a batch.
+
+**Measured, with its spread.** The GPU was shared with other jobs (1-minute load
+average 45 to 220; the profiler printed 90 to 100 % utilisation), and this is the
+limit of the result. `bench_paired` with three lanes (`df5d329`, the head, and the
+`df5d329` binary again as a control), 12 rounds, min of 8 per process: after/before
+median 0.84x (1.0 s clip), 0.84x (3.3 s clip), 0.95x (batch), but the control,
+which is the same code as before, reads 1.08x, 1.03x, 1.04x, and single-round
+ratios range from 0.2x to 2.2x. Within the noise: no end-to-end speedup is claimed
+from the benchmark. With `--evidence --max-spread 1.25` the drift gate refused all
+nine series of an 8-round run (spreads 1.9x to 3.7x), and no quiet window came in
+nine minutes of waiting. What the profile does show inside a run, where load
+touches the GEMM kernels (unchanged; q, k and v are one wider GEMM, which makes
+the ratio below slightly conservative) and the changed stages alike: the time of everything
+but the GEMMs, per millisecond of GEMM time, went from 0.28, 0.42 and 0.41 (1.0 s,
+3.3 s, batch) to 0.25, 0.25 and 0.21, so on the batch, where the GEMMs are 71-83 %
+of the forward, the passes outside the GEMMs went from about 29 % to 17 % of the
+forward. The end-to-end gain that implies, if the stage sum is the forward and the
+GEMMs are unchanged (inferred, not measured): about 14 % on the batch, 12 % on the
+3.3 s clip, 2 % on the 1.0 s clip. `bench_paired --evidence
+--rounds 8 --max-spread 1.25` on an idle host is the run that replaces this one.
+
+**Still open** (each needs its own benchmark): the feed-forward GEMMs are most of
+what is left; at 25-83 rows the 4096 -> 1024 GEMM is under-parallelised (a split-K
+or small-M route belongs in `gemm`), and a bf16-weight, f32-activation exact GEMM
+would halve the weight traffic (the weights are bf16 in the checkpoint; the
+kernels widen them exactly to f32 today); the trailing masked rows of a padded
+clip are computed and dropped, and could be skipped (the only place a masked frame
+influences a kept one is the subsampling's zeroing, so trailing masked rows feed
+no kept row; not implemented); the attention could use
+`simdgroup_float8x8` tiles for the 12-query blocks; the first conv and the
+second could share one launch.

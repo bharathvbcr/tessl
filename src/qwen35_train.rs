@@ -107,6 +107,41 @@ pub struct LayerGrads {
     pub down: Tensor,
 }
 
+/// The directory `tools/qwen35_ref/make_train_fixture.py 2b` writes the real
+/// 2B's reference gradients to: `QWEN35_TRAIN_REF_DIR`, else
+/// `target/qwen35_train_ref` under this crate. The one owner of that
+/// resolution for the ignored real-2B tests (`tests/qwen35_train.rs` and this
+/// file's), so a missing reference is named in one place. Test support, not
+/// API.
+///
+/// # Errors
+/// The directory has no `ids.npy`: the message names the variable to set and
+/// the path tried.
+#[doc(hidden)]
+pub fn train_reference_dir() -> Result<std::path::PathBuf, String> {
+    reference_dir_from(std::env::var_os("QWEN35_TRAIN_REF_DIR"))
+}
+
+/// [`train_reference_dir`] with the variable's value passed in.
+fn reference_dir_from(var: Option<std::ffi::OsString>) -> Result<std::path::PathBuf, String> {
+    let (dir, from) = match var {
+        Some(d) => (std::path::PathBuf::from(d), "QWEN35_TRAIN_REF_DIR"),
+        None => (
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/qwen35_train_ref"),
+            "the default target/qwen35_train_ref",
+        ),
+    };
+    if dir.join("ids.npy").is_file() {
+        Ok(dir)
+    } else {
+        Err(format!(
+            "no 2B reference at {} (from {from}): set QWEN35_TRAIN_REF_DIR to the directory \
+             `tools/qwen35_ref/make_train_fixture.py 2b` wrote (it holds ids.npy)",
+            dir.display()
+        ))
+    }
+}
+
 /// Every parameter's gradient.
 pub struct Qwen35Grads {
     /// `[vocab, hidden]`: the embedding's gradient. Tied, the embedding is
@@ -2367,7 +2402,7 @@ mod tests {
     //! forward, where they differ from transformers': central differences of
     //! the loss along the direction in which the two gradients disagree.
 
-    use std::path::{Path, PathBuf};
+    use std::path::Path;
 
     use super::*;
     use crate::npy::read_npy;
@@ -2412,6 +2447,23 @@ mod tests {
         ce / (ids.len() - 1) as f64
     }
 
+    /// The reference directory is `QWEN35_TRAIN_REF_DIR` when set, and a
+    /// directory without `ids.npy` is refused naming the variable and the
+    /// path (ft-19f4bd16: the in-crate 2B test once read a fixed path and
+    /// panicked on a missing `ids.npy`).
+    #[test]
+    fn reference_dir_honours_the_variable_and_names_it_when_missing() {
+        let root = std::env::temp_dir().join(format!("tessl_ref_dir_{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let missing = reference_dir_from(Some(root.clone().into_os_string())).unwrap_err();
+        assert!(missing.contains("QWEN35_TRAIN_REF_DIR"), "{missing}");
+        assert!(missing.contains(&root.display().to_string()), "{missing}");
+        std::fs::write(root.join("ids.npy"), b"").unwrap();
+        let found = reference_dir_from(Some(root.clone().into_os_string())).unwrap();
+        assert_eq!(found, root);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
     /// Qwen3.5-2B-Base against `make_train_fixture.py 2b`'s gradients.
     ///
     /// tessl's and transformers' f32 forwards differ (logits by 1.9e-6 of
@@ -2423,7 +2475,7 @@ mod tests {
     #[test]
     #[ignore]
     fn real_2b_gradients_are_those_of_tessls_forward() {
-        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/qwen35_train_ref");
+        let dir = train_reference_dir().unwrap_or_else(|e| panic!("{e}"));
         let st = SafeTensors::open(Path::new(
             &std::env::var("QWEN35_2B_SAFETENSORS").expect("QWEN35_2B_SAFETENSORS"),
         ))

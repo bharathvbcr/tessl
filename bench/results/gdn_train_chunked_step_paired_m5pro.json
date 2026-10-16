@@ -1,0 +1,170 @@
+{
+  "rounds": 4,
+  "format": "Metrics",
+  "lanes": [
+    {
+      "name": "before",
+      "argv": [
+        "/private/tmp/claude-501/-Users-bharath-Code-research-tessl/b46d2477-9b7a-48b0-aeac-9034ece344e6/scratchpad/w10a_out/bench_before",
+        "2048",
+        "--step-only",
+        "--step=2048"
+      ],
+      "env": {}
+    },
+    {
+      "name": "after",
+      "argv": [
+        "/private/tmp/claude-501/-Users-bharath-Code-research-tessl/b46d2477-9b7a-48b0-aeac-9034ece344e6/scratchpad/w10a_out/bench_after",
+        "2048",
+        "--step-only",
+        "--step=2048"
+      ],
+      "env": {}
+    }
+  ],
+  "env": {},
+  "summary": [
+    {
+      "workload": "train_step_s_t2048",
+      "before": {
+        "value_median": 5.2919,
+        "value_min": 5.2824,
+        "value_max": 5.3415,
+        "value_all": [
+          5.3415,
+          5.2932,
+          5.2906,
+          5.2824
+        ]
+      },
+      "after": {
+        "value_median": 5.046749999999999,
+        "value_min": 5.0329,
+        "value_max": 5.0692,
+        "value_all": [
+          5.0552,
+          5.0692,
+          5.0383,
+          5.0329
+        ],
+        "vs_base": {
+          "median": 0.9525396642145623,
+          "lo": 0.9464008237386502,
+          "hi": 0.9576815536915289
+        }
+      }
+    },
+    {
+      "workload": "device_peak_gib_t2048",
+      "before": {
+        "value_median": 15.3472,
+        "value_min": 15.3472,
+        "value_max": 15.3472,
+        "value_all": [
+          15.3472,
+          15.3472,
+          15.3472,
+          15.3472
+        ]
+      },
+      "after": {
+        "value_median": 15.2382,
+        "value_min": 15.2382,
+        "value_max": 15.2382,
+        "value_all": [
+          15.2382,
+          15.2382,
+          15.2382,
+          15.2382
+        ],
+        "vs_base": {
+          "median": 0.9928977272727273,
+          "lo": 0.9928977272727273,
+          "hi": 0.9928977272727273
+        }
+      }
+    },
+    {
+      "workload": "peak_footprint_gb_t2048",
+      "before": {
+        "value_median": 19.71495,
+        "value_min": 19.7149,
+        "value_max": 19.715,
+        "value_all": [
+          19.7149,
+          19.715,
+          19.7149,
+          19.715
+        ]
+      },
+      "after": {
+        "value_median": 19.5981,
+        "value_min": 19.598,
+        "value_max": 19.5983,
+        "value_all": [
+          19.598,
+          19.5983,
+          19.5981,
+          19.5981
+        ],
+        "vs_base": {
+          "median": 0.9940730258066115,
+          "lo": 0.994070474615646,
+          "hi": 0.9940806492518386
+        }
+      }
+    }
+  ],
+  "raw": [
+    {
+      "before": {
+        "train_step_s_t2048": 5.3415,
+        "device_peak_gib_t2048": 15.3472,
+        "peak_footprint_gb_t2048": 19.7149
+      },
+      "after": {
+        "train_step_s_t2048": 5.0552,
+        "device_peak_gib_t2048": 15.2382,
+        "peak_footprint_gb_t2048": 19.598
+      }
+    },
+    {
+      "before": {
+        "train_step_s_t2048": 5.2932,
+        "device_peak_gib_t2048": 15.3472,
+        "peak_footprint_gb_t2048": 19.715
+      },
+      "after": {
+        "train_step_s_t2048": 5.0692,
+        "device_peak_gib_t2048": 15.2382,
+        "peak_footprint_gb_t2048": 19.5983
+      }
+    },
+    {
+      "before": {
+        "train_step_s_t2048": 5.2906,
+        "device_peak_gib_t2048": 15.3472,
+        "peak_footprint_gb_t2048": 19.7149
+      },
+      "after": {
+        "train_step_s_t2048": 5.0383,
+        "device_peak_gib_t2048": 15.2382,
+        "peak_footprint_gb_t2048": 19.5981
+      }
+    },
+    {
+      "before": {
+        "train_step_s_t2048": 5.2824,
+        "device_peak_gib_t2048": 15.3472,
+        "peak_footprint_gb_t2048": 19.715
+      },
+      "after": {
+        "train_step_s_t2048": 5.0329,
+        "device_peak_gib_t2048": 15.2382,
+        "peak_footprint_gb_t2048": 19.5981
+      }
+    }
+  ],
+  "lane_archive": "/private/tmp/claude-501/-Users-bharath-Code-research-tessl/b46d2477-9b7a-48b0-aeac-9034ece344e6/scratchpad/w10a_out/step_paired.json.lanes"
+}

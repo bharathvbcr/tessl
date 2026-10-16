@@ -557,6 +557,43 @@ Measured on an M5 Pro against the real checkpoint, paired and interleaved
   301.2 at 8x1024 and 244.2 against 452.8 at 2x4096 (0.87x, 0.66x, 0.53x of the
   time); the exact-f32 forward is unchanged (0.995x, 0.991x, 0.997x, every
   range straddling 1).
+* **Small-M GEMMs: an opt-in parallel K-partition path** (`gemm_small_m`,
+  exact f32; lane G, `embedgemma2_small_m_m5pro.txt`). The four GEMMs that ran
+  at 17-22 % of the copy bandwidth at 16 rows (down, o, the two per-layer-input
+  ones) have a C of 16 tiles of 32x32: one dispatch gave them 16
+  single-simdgroup threadgroups, each walking all of K, so their time was that
+  walk's latency. A call that opts in, at N up to 512, K of 512 or more and
+  under 64 tiles (M up to 96 at N 512), cuts K into about 128 threadgroups'
+  worth of partitions, `matmul2d_tensorops_nn_splitk_par_f32`, into a scratch
+  with one slice per partition and `reduce_partitions_f32` adding the slices in
+  partition order: the TN lane's design, for the NN layout. **The opt-in is the
+  call's**: `gemm`, `ExactF32.nn`, the vision and audio towers (through the
+  shared `project`), Qwen3.5 and external consumers keep the route and the bits
+  they had, and `Bf16` is untouched. Only the text encoder's own `project`
+  opts in, with the forward's idle `qkv | gate_up` buffer as the scratch, so a
+  forward adds no device memory (`tests/embedgemma2_small_m.rs` holds one
+  forward's bytes to the itemized set exactly; the real checkpoint's device peak
+  is unchanged, 2 MiB at 1x16). Per GEMM at 16 rows, interleaved against the
+  single dispatch: down 3.0x (89.9 to 29.7 us, 64 % of the copy bandwidth), o
+  2.4-3.0x, ple 1.8x. Whole `encode` (`bench_paired`, before = `27a0407`,
+  a quiet machine, control 0.997): 1x16 0.60x of the time (1.66x faster), 1x64
+  0.70x; 64x32 and 8x1024 take the same kernels as before (the gate returns
+  none at 2048 and 8192 rows) and read 1.000x. The arithmetic stays exact f32:
+  only the summation order changes, K in partitions summed in order, and the
+  lane is held to the f32 dot-product bound `gamma_(K+8) * sum|a.b|` that every
+  exact-f32 GEMM meets (worst result `0.0039` of it; `tests/gemm_small_m.rs`).
+  This is less than the 1.8x the stage profile's bandwidth estimate allowed:
+  the lane reaches about 64 % of the copy ceiling, not 70 %, and pays a reduce
+  dispatch per GEMM. **The text encoder's bits now depend on M across the
+  gate**: a text alone (up to 96 padded rows, the lane) and the same text in a
+  larger batch (the single dispatch) sum K in different orders. Observed, all
+  inside the existing bounds: alone against batched 0 to 1.7e-7 on the real
+  checkpoint (`BATCH_ABS` 1e-5; bf16 exactly 0), 8.9e-8 to 1.3e-7 at the real
+  GEMM shapes with synthetic weights (`tests/embedgemma2_small_m.rs`, bound
+  fixed before the first run), a mixed multimodal call against alone 1.2e-7 to
+  3.0e-7, the vision and audio towers bit-identical alone against batched. A
+  bf16 form of the lane (1x16 0.79x) was built and removed: it moved the bf16
+  text check by 2.4e-4 to 5.7e-4 (commit `b85f5e1`).
 * **The device-peak rise, isolated.** One activation set is 736 MiB at 8192 rows
   against 576 MiB at 2a7cb8b (+160: the per-layer-input run buffer is +240, the
   packed gate|up and the dropped normed-V buffer save 80). The table above

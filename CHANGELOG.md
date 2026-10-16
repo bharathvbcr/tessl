@@ -71,6 +71,48 @@ All notable changes to `tessl` are recorded here. The format follows
   on the real one (opt-in) texts, images and clips in one call within 3.8e-7 of
   sentence-transformers, cosine 1.000000000, in Rust and Python. See
   `docs/embedgemma2.md`, One call.
+- **An opt-in small-M exact-f32 NN GEMM path: parallel K-partitions**
+  (`gemm_small_m`, `gemm_nn_splitk_par_f32`, kernel
+  `matmul2d_tensorops_nn_splitk_par_f32`, `bench_gemm_routes` lane `nnsmall`,
+  `profile_embedgemma2` `PROFILE_ROWS`). An exact-f32 NN GEMM whose C is a few
+  tiles (N up to 512, K of 512 or more, under 64 tiles of 32x32: M up to 96 at
+  N 512) used to run one single-simdgroup threadgroup per tile, each walking
+  all of K, so its time was that walk's latency (EmbeddingGemma 2 at 1x16: the
+  down, o and per-layer-input GEMMs at 17-22 % of the copy bandwidth). A call
+  to `gemm_small_m` now runs every K-partition's tiles in one dispatch into a
+  scratch of one slice per partition and `reduce_partitions_f32` adds the
+  slices in partition order: the parallel TN split-K's design (whose binder it
+  shares, now `splitk_par` over `par_shape`, the one owner of its `u32` and
+  scratch limits) for the NN layout. The width is sized from one tile row, so
+  it does not move with M inside the gate. **The opt-in is the call's**, a
+  parameter and not a setting of the runtime or the process: `gemm`,
+  `gemm_tiled`, `GemmOperands::ExactF32.nn`, bf16, f16, relaxed f32, TN, NT and
+  every other entry are unchanged and compute the bits they did, so the vision
+  and audio towers (through the shared `embedgemma2::project`), Qwen3.5 and
+  external consumers are untouched. The scratch is the caller's
+  (`scratch: Some(tensor)`, an idle f32 tensor of at least `ceil(K / k_tile) *
+  M * N` elements; one too small keeps the single dispatch) or, with `None`, a
+  pool allocation. `EmbedGemma2Model`'s text encoder is the one caller that
+  opts in (`ExactF32` only), with its idle `qkv | gate_up` buffer as the
+  scratch, so a forward allocates nothing more
+  (`tests/embedgemma2_small_m.rs`). The sum is rounded in another order than
+  the single dispatch, so **the text encoder's bits at these shapes depend on
+  M across the gate** (M up to 96 and M of 97 or more at N 512; the result is
+  deterministic), within the f32 dot-product bound `gamma_(K+8) * sum|a.b|`
+  every exact-f32 GEMM is held to (worst result 0.0039 of it,
+  `tests/gemm_small_m.rs`: M in {1, 7, 16, 63, 64} at K/N of 2048/512,
+  1024/512 and 512/512, ragged and offset views, a poisoned scratch, a
+  caller's scratch, bit-for-bit repeats, rank-one operands, the route by
+  traced kernel with and without the opt-in) and within the existing
+  alone-against-batched bounds (a text alone against batched: 0 to 1.7e-7 on
+  the real checkpoint, 8.9e-8 to 1.3e-7 at the real GEMM shapes with synthetic
+  weights, against `BATCH_ABS` 1e-5). Measured on an M5 Pro with the
+  interleaved `bench_paired` (`bench/results/embedgemma2_small_m_m5pro.txt`):
+  EmbeddingGemma 2's 1x16 encode takes 0.60x of the time (1.66x faster), 1x64
+  0.70x; 64x32 and 8x1024 are unchanged (1.000x), the real checkpoint's device
+  peak too. A bf16 form of the lane was built and removed (it moved the bf16
+  text alone-against-batched check by 2.4e-4 to 5.7e-4; commit `b85f5e1`).
+
 - **EmbeddingGemma 2's multimodal merge** (`EmbedGemma2Model::encode_multimodal`,
   `MmSequence`, `EmbedGemma2Config::{image_sequence, audio_sequence,
   special_tokens}`, `SpecialTokens`, `MmTokens`; audit gap G8, the part that

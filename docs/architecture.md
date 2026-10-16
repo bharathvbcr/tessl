@@ -31,6 +31,7 @@ flowchart TD
 
     LayoutCheck -- "NN Layout" --> PrecisionCheck{"Precision Mode"}
     
+    PrecisionCheck -- "f32 exact, call opted in (gemm_small_m), N up to 512, K of 512+, C under 64 tiles of 32x32" --> ParNN["matmul2d_tensorops_nn_splitk_par_f32<br/>+ reduce_partitions_f32<br/>(small M: all K partitions in one dispatch)"]
     PrecisionCheck -- "f32 exact" --> F32Exact["matmul2d_tensorops_f32<br/>• Tile: 32x32, 1 simdgroup<br/>• Packed C-zero + matmul binder"]
     
     PrecisionCheck -- "bf16 / f16 / tf32-relaxed" --> NNTable{"nn_coop_kernel() / coop_narrow()<br/>N &lt;= 512, or bf16 with M &lt; 128<br/>or under 64 tiles of 128x64?"}
@@ -108,6 +109,7 @@ In Round 2 optimization, cooperative destination registers were extended across 
 | **NT bf16 ($dX$ Backward)** | $128 \times 64$, 4 sg | `matmul2d_tensorops_nt_bf16_f32` | 2.00–2.03× speedup at scale |
 | **Accumulate Paths** | $64 \times 64$, 4 sg | Zero $\to$ Run $\to$ Load-Add-Store (`TILE_COOP_ACCUM`) | 1.38–1.49× over `multiply_accumulate` |
 | **Parallel split-K TN, bf16** | $64 \times 64$, 4 sg cooperative | `matmul2d_tensorops_tn_splitk_par_bf16_f32` + `reduce_partitions_f32` (`_add_f32` for `C +=`) | Tall-$K$ / small-$MN$ (`prefer_tn_splitk`), overwriting and accumulating: 2.4–19× over the sequential 64×32 lane it replaced (`bench/results/splitk_par_bf16_m5pro.txt`) |
+| **Parallel split-K NN, small M** | exact f32 $32 \times 32$, 1 sg | `matmul2d_tensorops_nn_splitk_par_f32` + `reduce_partitions_f32` | A call that opted in (`gemm_small_m`; `gemm` never takes it): a skinny A over a C of few tiles (N ≤ 512, K ≥ 512, under 64 tiles of 32×32, M up to 96 at N 512; `nn_small_par_k_tile`): about 128 threadgroups of K partitions in one dispatch into an unzeroed scratch, added in order. EmbeddingGemma 2 at 16 rows, interleaved against the single dispatch: down and o GEMMs (K 2048, N 512) 3.0× (`bench/results/embedgemma2_small_m_m5pro.txt`) |
 | **Split-K $dW$, exact f32 `C +=`** | $32 \times 32$, 1 sg | `matmul2d_tensorops_tn_splitk_f32` | Tall-$K$ / small-$MN$ (`prefer_tn_splitk`), exact f32 accumulating: one dispatch per 256 of K, in order |
 | **Parallel split-K TN, exact f32** | $32 \times 32$, 1 sg | `matmul2d_tensorops_tn_splitk_par_f32` + `reduce_partitions_f32` | Every TN whose C has under 128 tiles over a K of ≥ 2 partitions (`tn_par_k_tile`): all partitions in one dispatch into a scratch, added in order. Gate $dW$ (12×768×4096): 225 → 45 µs; attention $dW$ (128×128×4096): 186 µs sequential → 31 µs on M5 Pro |
 | **Split-K NN, exact f32** | $32 \times 32$, 1 sg | `matmul2d_tensorops_nn_splitk_f32` | Long $K$ with $K \times N \ge 2^{23}$: partitions of $2^{21}/N$ rows of B keep each slice of B in cache. LM-head $dX$ (4096×768×50304): 99.8 → 45.4 ms on M5 Pro |

@@ -91,7 +91,7 @@ use std::sync::Arc;
 use objc2_metal::MTLComputePipelineState;
 
 use crate::dispatch::{dispatch_1d, dispatch_2d_tg, set_gpu_buf, set_u32};
-use crate::gemm::{cast_f32_to_bf16_into, gemm, gemm_nt_f32, GemmBackend, GemmOperands};
+use crate::gemm::{cast_f32_to_bf16_into, gemm, gemm_nt_f32, gemm_small_m, GemmBackend, GemmOperands};
 use crate::json::{self, Json, Syntax};
 use crate::loader::Loader;
 use crate::nn::{
@@ -1868,7 +1868,7 @@ impl EmbedGemma2Model {
             norm_x_in(&layer.input_norm)?;
             let qkv_width = (cfg.q_heads + 2 * s.kv_heads) * s.head_dim;
             let qkv = at(&a.qkv, qkv_width)?;
-            self.project(&x_in, &layer.w_qkv, &qkv)?;
+            self.project(&x_in, &layer.w_qkv, &qkv, &a.attn)?;
             qwen35::attn_qk_norm_rope_columns(
                 rt,
                 &AttnShape {
@@ -1926,15 +1926,15 @@ impl EmbedGemma2Model {
                 Some(b) => {
                     let attn_in = view(&b.wide, rows_u, attn_width)?;
                     cast_f32_to_bf16_into(&attn, &attn_in)?;
-                    self.project(&attn_in, &layer.w_o, &y)?;
+                    self.project(&attn_in, &layer.w_o, &y, &a.qkv)?;
                 }
-                None => self.project(&attn, &layer.w_o, &y)?,
+                None => self.project(&attn, &layer.w_o, &y, &a.qkv)?,
             }
             rms_norm_residual_add_f32(rt, &y.buffer, &layer.post_attn_norm, &resid.buffer, rows_u, h, eps, 1.0)?;
 
             // MLP.
             norm_x_in(&layer.pre_ffn_norm)?;
-            self.project(&x_in, &layer.gate_up, &gate_up)?;
+            self.project(&x_in, &layer.gate_up, &gate_up, &a.attn)?;
             let window = |off: u32| Cols {
                 buf: &gate_up.buffer,
                 ld: 2 * inter,
@@ -1952,7 +1952,7 @@ impl EmbedGemma2Model {
                 rows_u,
                 inter,
             )?;
-            self.project(&mid, &layer.down, &y)?;
+            self.project(&mid, &layer.down, &y, &a.qkv)?;
             rms_norm_residual_add_f32(rt, &y.buffer, &layer.post_ffn_norm, &resid.buffer, rows_u, h, eps, 1.0)?;
 
             // Per-layer input: at the first layer of each run, one GEMM over
@@ -1985,9 +1985,9 @@ impl EmbedGemma2Model {
                 // rounded copy the gate projection reads.
                 Some(_) => {
                     cast_f32_to_bf16_into(&resid, &x_in)?;
-                    self.project(&x_in, &layer.ple_gate, &ple_gate)?;
+                    self.project(&x_in, &layer.ple_gate, &ple_gate, &a.qkv)?;
                 }
-                None => self.project(&resid, &layer.ple_gate, &ple_gate)?,
+                None => self.project(&resid, &layer.ple_gate, &ple_gate, &a.qkv)?,
             }
             qwen35::gated_act(
                 rt,
@@ -2005,7 +2005,7 @@ impl EmbedGemma2Model {
                 rows_u,
                 cfg.ple_dim,
             )?;
-            self.project(&ple_mid, &layer.ple_out, &y)?;
+            self.project(&ple_mid, &layer.ple_out, &y, &a.qkv)?;
             rms_norm_residual_add_f32(
                 rt,
                 &y.buffer,
@@ -2029,9 +2029,9 @@ impl EmbedGemma2Model {
             Some(b) => {
                 let pooled_in = view(&b.pooled, nb, h)?;
                 cast_f32_to_bf16_into(&pooled, &pooled_in)?;
-                self.project(&pooled_in, &self.projection, &out)?;
+                self.project(&pooled_in, &self.projection, &out, &a.qkv)?;
             }
-            None => self.project(&pooled, &self.projection, &out)?,
+            None => self.project(&pooled, &self.projection, &out, &a.qkv)?,
         }
         // A Matryoshka prefix normalizes its own columns; the rest are not read.
         l2_normalize_rows(rt, &out.buffer, nb, dim_out, cfg.embedding_dim)?;
@@ -2045,8 +2045,25 @@ impl EmbedGemma2Model {
     /// `out = a @ w` at the model's operand precision. `a` is in the mode's
     /// activation dtype (f32, or bf16 under `Bf16`, as `forward` stages it), so
     /// neither lane rounds or allocates anything of its own here.
-    fn project(&self, a: &Tensor, w: &Tensor, out: &Tensor) -> Result<(), String> {
-        project(self.operands, a, w, out)
+    ///
+    /// This is the text encoder's own entry and the only caller that opts in
+    /// to the small-M split-K ([`gemm_small_m`]): at 16 rows the down, o and
+    /// per-layer-input GEMMs run 2-3x faster, and the exact-f32 sum moves only
+    /// in its order (alone against batched, within `BATCH_ABS` of
+    /// `tests/embedgemma2_model.rs`). The free [`project`] the vision tower
+    /// calls keeps the default route, so its clips stay bit for bit what they
+    /// are alone. `Bf16` takes the route it always had.
+    ///
+    /// `scratch` is a buffer of the forward's activations that is idle at this
+    /// GEMM (neither its input nor its output, and nothing reads it after):
+    /// the lane's K-partition slices go there, so a forward holds no device
+    /// memory beyond [`Acts`]. One too small for the shape's partitions keeps
+    /// the single dispatch.
+    fn project(&self, a: &Tensor, w: &Tensor, out: &Tensor, scratch: &Tensor) -> Result<(), String> {
+        match self.operands {
+            GemmOperands::ExactF32 => gemm_small_m(a, w, out, BACKEND, Some(scratch)),
+            GemmOperands::Bf16 => project(self.operands, a, w, out),
+        }
     }
 
     /// [`Acts`] for forwards of up to `rows` padded rows over up to `nb`

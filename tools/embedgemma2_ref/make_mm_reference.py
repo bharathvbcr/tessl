@@ -8,8 +8,11 @@ google/embeddinggemma-2; default: the Hugging Face cache. Writes into
 target/embedgemma2_mm_ref/ (override with EMBEDGEMMA2_MM_REF_DIR).
 
 The inputs are synthetic and deterministic (no downloaded media): two images
-of different sizes and aspect ratios, and two audio clips of different
-lengths. Each runs alone through sentence-transformers (batch size 1), fp32,
+of different sizes and aspect ratios, two audio clips of different
+lengths, and two videos (different frame counts, sizes and source frame
+rates; the second has more sampled frames than the processor's 32-frame cap)
+plus the first video again with `add_timestamps` on. Each runs alone through
+sentence-transformers (batch size 1), fp32,
 on the CPU, with sdpa attention: sentence-transformers' default, and the
 implementation whose audio mask is right. EMBEDGEMMA2_MM_ATTN=eager selects
 eager instead, which in transformers 5.19 inverts the audio tower's chunked
@@ -23,7 +26,8 @@ raw inputs are saved beside them, so tessl's own preprocessing
 (src/embedgemma2_pre.rs) can be checked against the processor's outputs and
 carried through the towers to the embedding.
 
-For input n of kind k (image or audio), prefix `{k}{n}_`:
+For input n of kind k (image, audio or video), prefix `{k}{n}_` (`video0t_` is
+video 0 with timestamps):
 
   ids.npy              the token ids the model received, placeholders included
   attention_mask.npy   the text attention mask
@@ -43,6 +47,16 @@ For input n of kind k (image or audio), prefix `{k}{n}_`:
           layer{i}.npy     [T, 1024] conformer output after layer i
           tower_out.npy    [T, 1536] after output_proj
           out_mask.npy     [T]       the tower's output mask (True = valid)
+  video:  raw.npy [T, H, W, 3] RGB bytes as int64 (every decoded frame),
+          fps.npy f64 scalar (the source frame rate; the metadata passed in
+          is {fps, duration = T / fps, total_num_frames = T}, without which the
+          video processor keeps every frame and skips fps sampling),
+          indices.npy [F] int64 the sampled frames' indices in the source,
+          timestamps.npy [F] f64 (index / fps),
+          pixel_values_videos.npy [F, P, 768], video_position_ids.npy
+          [F, P, 2] (the processor's tensors, frames concatenated, P = 1260),
+          soft_per_frame.npy [1] int64; soft.npy is [F * S, 512], frame by
+          frame
   soft.npy             [S, 512]  soft tokens after the multimodal embedder
                                  (weightless RMSNorm + projection), valid
                                  rows only, in the order they are scattered
@@ -104,8 +118,28 @@ def make_audio(seconds, seed):
     return (0.5 * a / np.abs(a).max()).astype(np.float32)
 
 
+def make_video(t, h, w, seed):
+    """Frames that differ: a gradient photo with a moving disc and per-frame noise, [t, h, w, 3] uint8."""
+    rng = np.random.default_rng(seed)
+    base = np.asarray(make_image(w, h, seed), dtype=np.float64)
+    yy, xx = np.mgrid[0:h, 0:w]
+    frames = []
+    for f in range(t):
+        fr = base.copy()
+        cx = (3 * f) % w
+        fr[(xx - cx) ** 2 + (yy - h // 2) ** 2 < (min(h, w) // 4) ** 2] = [250.0, 250.0, 20.0]
+        fr += rng.normal(0, 3.0, fr.shape)
+        frames.append(np.clip(fr, 0, 255).astype(np.uint8))
+    return np.stack(frames)
+
+
 IMAGES = [(224, 224, 1), (640, 360, 2)]
 AUDIOS = [(1.0, 3), (3.3, 4)]
+# (frames, height, width, source fps, seed). Sampling at the processor's 1 fps:
+# video 0 is 6 s, so 6 frames (source indices 0, 4, ..., 20); video 1 is 40 s,
+# so 40 sampled frames, which the 32-frame cap cuts to 32 (uniform).
+VIDEOS = [(24, 96, 176, 4.0, 5), (100, 72, 104, 2.5, 6)]
+PROCESSOR_FPS, MAX_FRAMES = 1, 32
 
 
 def save(prefix, name, arr):
@@ -166,39 +200,107 @@ def run(model, item):
     return emb, cap
 
 
+def expected_indices(n_frames, fps):
+    """The frames the video processor keeps, from its rules written out: `int(duration * 1)` frames at
+    `int(i * fps)`, then `np.linspace(0, n - 1, 32, dtype=int)` of them if more than 32."""
+    sampled = max(1, int((n_frames / fps) * PROCESSOR_FPS))
+    idx = [min(n_frames - 1, int(i * fps / PROCESSOR_FPS)) for i in range(sampled)]
+    if len(idx) > MAX_FRAMES:
+        idx = [idx[i] for i in np.linspace(0, len(idx) - 1, MAX_FRAMES, dtype=int)]
+    return idx
+
+
+def set_timestamps(model, on):
+    """`add_timestamps` of the processor's video processor (what `replace_video_token` reads)."""
+    model[0].processor.video_processor.add_timestamps = bool(on)
+
+
+def save_video(model, prefix, kw, cap, desc, ids, snapshot_dir):
+    """A video's processor tensors, sampled indices and timestamps; checks the golden is the fps-sampled
+    path and that ids have the layout the Rust builder reproduces. Returns what inputs.json records."""
+    from transformers.video_utils import VideoMetadata
+
+    n_frames = int(kw["num_frames_per_video"].sum())
+    want = expected_indices(desc["frames"], desc["fps"])
+    # The golden must be the fps-sampled path, not "every frame".
+    assert n_frames == len(want), (prefix, n_frames, len(want))
+    meta = VideoMetadata(total_num_frames=desc["frames"], fps=desc["fps"], duration=desc["frames"] / desc["fps"])
+    idx = [int(i) for i in model[0].processor.video_processor.sample_frames(
+        meta, fps=PROCESSOR_FPS, max_frames=MAX_FRAMES, overflow_strategy="uniform")]
+    assert idx == want, (prefix, idx, want)
+    save(prefix, "fps", np.array(desc["fps"], dtype=np.float64))
+    save(prefix, "indices", np.array(idx, dtype=np.int64))
+    save(prefix, "timestamps", np.array(idx, dtype=np.float64) / desc["fps"])
+    save(prefix, "pixel_values_videos", f32(kw["pixel_values_videos"]))
+    save(prefix, "video_position_ids", kw["video_position_ids"].cpu().numpy().astype(np.int64))
+    soft = cap["soft_v"].reshape(-1, cap["soft_v"].shape[-1])
+    per_frame = soft.shape[0] // n_frames
+    assert per_frame * n_frames == soft.shape[0], (prefix, tuple(soft.shape), n_frames)
+    save(prefix, "soft_per_frame", np.array([per_frame], dtype=np.int64))
+    with open(os.path.join(snapshot_dir, "config.json")) as f:
+        config = json.load(f)
+    bos, eos = config["text_config"]["bos_token_id"], config["text_config"]["eos_token_id"]
+    boi, eoi, vid = config["boi_token_id"], config["eoi_token_id"], config["video_token_id"]
+    assert model[0].processor.video_token_id == vid, (model[0].processor.video_token_id, vid)
+    if not desc.get("add_timestamps"):
+        want_ids = [bos] + ([boi] + [vid] * per_frame + [eoi]) * n_frames + [eos]
+        assert ids.tolist() == want_ids, (prefix, ids.tolist()[:20], want_ids[:20])
+    return {"frames_sampled": n_frames, "soft_per_frame": per_frame, "indices": idx}
+
+
 def main():
     path = snapshot()
     os.makedirs(OUT, exist_ok=True)
     torch.manual_seed(0)
-    inputs = [("image", n, make_image(w, h, s), {"width": w, "height": h, "seed": s})
+    # (kind, n, tag, item, description); `tag` names a variant of the same input.
+    inputs = [("image", n, "", make_image(w, h, s), {"width": w, "height": h, "seed": s})
               for n, (w, h, s) in enumerate(IMAGES)]
-    inputs += [("audio", n, {"array": make_audio(sec, s), "sampling_rate": SR},
+    inputs += [("audio", n, "", {"array": make_audio(sec, s), "sampling_rate": SR},
                 {"seconds": sec, "seed": s, "sampling_rate": SR}) for n, (sec, s) in enumerate(AUDIOS)]
+    for n, (t, h, w, fps, s) in enumerate(VIDEOS):
+        # The metadata is what makes the processor sample at its fps: without a
+        # frame rate and duration it keeps every frame (sentence-transformers
+        # fills in fps None for a bare array, which is that path).
+        item = {"array": make_video(t, h, w, s),
+                "video_metadata": {"total_num_frames": t, "fps": fps, "duration": t / fps,
+                                   "frames_indices": list(range(t))}}
+        desc = {"frames": t, "height": h, "width": w, "fps": fps, "seed": s}
+        inputs.append(("video", n, "", item, desc))
+        if n == 0:
+            inputs.append(("video", n, "t", item, {**desc, "add_timestamps": True}))
 
     m32 = SentenceTransformer(path, device="cpu",
                               model_kwargs={"attn_implementation": ATTN, "dtype": torch.float32})
     record = []
     with torch.no_grad():
-        for kind, n, item, desc in inputs:
-            prefix = f"{kind}{n}_"
+        for kind, n, tag, item, desc in inputs:
+            prefix = f"{kind}{n}{tag}_"
+            set_timestamps(m32, desc.get("add_timestamps", False))
             emb, cap = run(m32, item)
             kw = cap["kwargs"]
             # Only the tower this input runs fires its layer hooks.
-            expect = len(m32_eg(m32).vision_tower.encoder.layers if kind == "image"
-                         else m32_eg(m32).audio_tower.layers)
+            expect = len(m32_eg(m32).audio_tower.layers if kind == "audio"
+                         else m32_eg(m32).vision_tower.encoder.layers)
             assert len(cap["layers"]) == expect, (prefix, len(cap["layers"]), expect)
-            save(prefix, "ids", kw["input_ids"][0].cpu().numpy().astype(np.int64))
+            ids = kw["input_ids"][0].cpu().numpy().astype(np.int64)
+            save(prefix, "ids", ids)
             save(prefix, "attention_mask", kw["attention_mask"][0].cpu().numpy().astype(np.int64))
             # The raw input the processor received, for tessl's native preprocessing
             # (src/embedgemma2_pre.rs): the image as HWC RGB bytes (stored as int64,
             # the one integer dtype tessl's npy reader takes), the clip as mono
-            # float32 at 16 kHz.
+            # float32 at 16 kHz, the video as THWC bytes the same way.
             if kind == "image":
                 save(prefix, "raw", np.asarray(item.convert("RGB"), dtype=np.uint8).astype(np.int64))
+            elif kind == "video":
+                save(prefix, "raw", item["array"].astype(np.int64))
             else:
                 assert item["sampling_rate"] == SR
                 save(prefix, "raw", np.asarray(item["array"], dtype=np.float32))
-            if kind == "image":
+            extra = {}
+            if kind == "video":
+                extra = save_video(m32, prefix, kw, cap, desc, ids, path)
+                soft = cap["soft_v"]
+            elif kind == "image":
                 save(prefix, "pixel_values", f32(kw["pixel_values"]))
                 save(prefix, "image_position_ids", kw["image_position_ids"].cpu().numpy().astype(np.int64))
                 save(prefix, "patch_embed", f32(cap["patch_embed"][0]))
@@ -220,17 +322,19 @@ def main():
             save(prefix, "soft", f32(soft))
             save(prefix, "lm_final", f32(cap["lm_final"][0]))
             save(prefix, "emb_f32", f32(emb))
-            record.append({"kind": kind, "index": n, "prefix": prefix, **desc,
+            record.append({"kind": kind, "index": n, "prefix": prefix, **desc, **extra,
                            "tokens": int(kw["input_ids"].shape[1]), "soft_tokens": int(soft.shape[0]),
                            "layers_captured": len(cap["layers"])})
             print(prefix, record[-1])
+        set_timestamps(m32, False)
 
     del m32
     m16 = SentenceTransformer(path, device="cpu", model_kwargs={"attn_implementation": ATTN})
     with torch.no_grad():
-        for kind, n, item, _ in inputs:
+        for kind, n, tag, item, desc in inputs:
+            set_timestamps(m16, desc.get("add_timestamps", False))
             emb, _ = run(m16, item)
-            save(f"{kind}{n}_", "emb_bf16", f32(emb))
+            save(f"{kind}{n}{tag}_", "emb_bf16", f32(emb))
     with open(os.path.join(OUT, "inputs.json"), "w") as f:
         json.dump({"snapshot": path, "inputs": record}, f, indent=1)
         f.write("\n")

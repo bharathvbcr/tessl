@@ -1,0 +1,27 @@
+bench_embedgemma2_video, Apple M5 Pro (18 cores), 2026-10-16, branch worktree-agent-a7751fb151981d840
+on f8ce932 (lane V), release build, real checkpoint google/embeddinggemma-2 snapshot 914f7f89.
+
+One video: 32 synthetic 640x360 frames (the processor's frame cap), resized to 384x720
+(24 x 45 patches), 120 soft tokens a frame, 3906 ids.
+Three consecutive runs of
+  EMBEDGEMMA2_SNAPSHOT=... BENCH_ITERS=15 BENCH_WARMUP=3 target/release/bench_embedgemma2_video
+each min and median of 15 calls after 3 warmup calls. The machine was shared with other work the
+whole time: the one-minute load average at the start of each workload (bench_embedgemma2_video's
+load_avg_1m, in the JSON) ranged from 30 to 110 on 18 cores, and the GPU is shared too, so the
+numbers are INDICATIVE ONLY: the same workload's min-of-15 moved by up to 2.7x between runs.
+
+min ms of 15 calls (median in parentheses), by run, and the best run:
+
+workload                      run 1            run 2            run 3            best
+preprocess_video (CPU)        50.3 (86.1)      114.9 (213.3)    66.3 (146.9)     50.3
+vision tower, f32             3453.8 (4762)    2773.7 (3922)    2423.1 (3977)    2423.1
+whole call,   f32             3817.0 (5200)    4033.6 (6036)    3731.8 (5067)    3731.8
+vision tower, bf16            1499.1 (1639)    1685.2 (2175)    791.3 (1795)     791.3
+whole call,   bf16            1488.1 (2546)    1648.9 (2403)    2052.2 (2604)    1488.1
+
+Every whole call waited for the GPU once (sync_waits 1). The whole call includes the tower, so in
+a quiet machine it is the larger of the two; here the bf16 tower's best run (791 ms) and the bf16
+call's best run (1488 ms) were not taken in equally loaded periods (load 80 against 98), and the
+difference between them is not the text encoder's cost.
+
+Figure: embedgemma2_video_m5pro.png (embedgemma2_video_plot.py). Data: embedgemma2_video_m5pro.json.

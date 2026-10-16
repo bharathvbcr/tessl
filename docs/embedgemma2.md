@@ -287,9 +287,9 @@ before the first run, the text tests'; observed on an Apple M5 Pro, 2026-10-15, 
 | tiny checkpoint vs f64 forward, Bf16 | layers `5e-2`, embedding `1e-2` / `0.9999` | layers 1.2e-2 of scale at worst, embedding max abs 2.1e-3, cosine 0.999977 |
 | tiny: one-forward batch vs alone | `1e-5` first, made bit-exact after the first run measured 0 | 0 |
 
-Not covered: video (the placeholder id is handled like the other two, but no
-video tower or reference exists here). The towers' output reaches this entry
-as host rows; [One call](#one-call-text-images-and-audio) does that composition.
+Video is not in this table (the entry handles its placeholder id like the other
+two; the video layout and its reference are in [Video](#video)). The towers'
+output reaches this entry as host rows; [One call](#one-call-text-images-and-audio) does that composition.
 
 The table above was observed against goldens written under eager attention;
 the same test passes against the sdpa goldens `make_mm_reference.py` now
@@ -339,8 +339,8 @@ let out = m.encode(&items, Some(256))?;       // EncodeOutput: one row per item,
   `j`-th soft row of the item's images laid end to end, the audio placeholders
   likewise from its clips, which is `masked_scatter` per modality, so image and
   audio placeholders may interleave and a run need not line up with an image's
-  end. The counts must match exactly; a video placeholder is refused (no video
-  tower); a `MmItem::Text` holding a placeholder id is refused (in a
+  end. The counts must match exactly (the video placeholders likewise take the
+  frames of its `videos`, [Video](#video)); a `MmItem::Text` holding a placeholder id is refused (in a
   multimodal call it would be replaced by a soft token it does not have).
 * `queue_images` / `queue_audio` on the towers (new) return a `PendingImages` /
   `PendingAudio` that holds each forward's output and waits for the queued work
@@ -434,10 +434,14 @@ buffers read by the text encoder's `copy_cols`, no host round trip, one wait for
 a mixed call; speed: `bench/results/embedgemma2_mm_onewait_m5pro.txt`). (2) A
 `Media` entry in the C ABI and
 Python for caller ids with placeholders; the C entries take pure images and
-clips. (3) The tower tiny-checkpoint generators exist in four test files
+clips. (3) done: the tower tiny-checkpoint generators were in four test files
 (`tests/common/embedgemma2_mm.rs`, `embedgemma2_vision_tiny.rs`,
-`embedgemma2_audio_tiny.rs`, and the text one in `common`); the last two carry
-f64 references and were left alone, but converge on `common`.
+`embedgemma2_audio_tiny.rs`, and the text one in `common`); the vision and audio
+tower tests now draw their weights from `common::embedgemma2_mm`
+(`vision_weights`, `audio_weights`: the stored values as f64 for the f64
+references, and their safetensors entries), with the stored dtype a parameter
+(`VisionStorage`). The four suites' output, `--nocapture`, is byte-identical to
+before (same seeds, same values, same bounds).
 
 ## Kernels
 
@@ -1471,3 +1475,183 @@ Reproduce: `scripts/gen_embedgemma2_pre_fixtures.py` (fixtures; with
 `cargo test --release --test embedgemma2_pre`, and with the checkpoint
 `tools/embedgemma2_ref/make_mm_reference.py` (now also saves `*_raw.npy`) then
 `cargo test --release --test embedgemma2_pre_model -- --ignored --test-threads=1`.
+
+## Video
+
+`MmItem::Video` embeds a video: its sampled frames (what
+`embedgemma2_pre::preprocess_video` makes, or the processor's tensors) go through
+the vision tower in the call's one batch of pictures, and their soft tokens fill
+the video placeholders of the processor's sequence. Raw frames to embedding:
+
+```rust
+let cfg = PreConfig::from_snapshot(&snapshot)?;
+let video = preprocess_video(&cfg.video, &frames, source_fps)?;            // PreparedVideo
+let frames: Vec<ImageInput<'_>> = video.frames.iter().map(PreparedImage::input).collect();
+let out = model.encode(&[MmItem::Video(&frames)], None)?;                  // one row, one wait
+```
+
+### The token layout
+
+Transformers 5.19 (`embedding_gemma2/processing_embedding_gemma2.py`,
+`modeling_embedding_gemma2.py`, `video_processing_embedding_gemma2.py`;
+verified by reading them and against the `ids.npy` of the reference run):
+
+* The processor expands each `<|video|>` of the text to one block per sampled frame,
+  `<boi> <|video|> x S <eoi>` (`replace_video_token`, processing:244-253), with `S`
+  the single `num_soft_tokens_per_video` of the video (video processor:286, the same
+  for every frame) and no separator between blocks (`"".join`, processing:253), then
+  the tokenizer wraps the text in `<bos>` and `<eos>`. With `add_timestamps` on
+  (`False` in the class, video processor:194, and in the snapshot's
+  `processor_config.json`) every block is preceded by its `mm:ss` timestamp and the
+  blocks are joined by spaces (processing:265-268). So
+
+  ```text
+  [<bos>, (<boi>, <video> x S, <eoi>) x F, <eos>]        2 + F * (S + 2) ids
+  ```
+
+  `EmbedGemma2Config::video_sequence(&[S; F])` builds it from `config.json`'s ids
+  (`boi_token_id` 255999, `eoi_token_id` 258882, `video_token_id` 258884); `S` may
+  differ per frame there, `MmItem::Video` requires the processor's one `S`. The
+  placeholder is its own id, not the image's. (The processor adds `<|video|>` to the
+  tokenizer itself, processing:88-89, with a FIXME to put it in the config; the
+  generator asserts that its id is the config's `video_token_id`, which is the one
+  the model masks on, modeling:717.)
+* The model embeds the ids with every placeholder as `pad_token_id`, then
+  `masked_scatter`s the tower's rows over the video placeholders in order and
+  unscaled (modeling:802-817), as for images and clips; the tower's rows for all
+  videos are split back per video by `num_frames_per_video` (modeling:884-929) and
+  `torch.cat`ed, so the `j`-th video placeholder takes the `j`-th soft row of the
+  frames laid end to end. Pooling is the mean over every token, soft and boundary
+  tokens included, then normalize.
+* Frames reach the tower as images do: `pixel_values_videos [F_total, P, 768]`,
+  `video_position_ids [F_total, P, 2]` with `P = max_soft_tokens * 9 = 1260`
+  (140 tokens a frame at most; a 640x360 frame is resized to 384x720 and makes
+  120). The frames of all the videos in a batch are concatenated on one axis. The
+  tower runs on all of them at once under padding; tessl cuts them into forwards
+  of at most 16,384 padded patches (13 to 15 frames at the sizes below), which
+  changes nothing but the GEMM tiling (`video1`'s 32 frames are 3 forwards).
+* Which frames: the sampler is `embedgemma2_pre::sample_frame_indices` (see
+  [Preprocessing](#preprocessing)). A video of `T` frames at `fps` is
+  `int(T / fps)` frames at 1 fps, cut to 32 (uniform) above that. A bare frame array
+  with no metadata keeps every frame (sentence-transformers fills in `fps: None`
+  for it; the reference generator passes `fps`, `duration` and `total_num_frames`
+  and asserts the sampled count).
+
+### The facade
+
+* `MmItem::Video(&[ImageInput])`: the processor's sequence of the frames' soft-token
+  counts, which must all be equal (refused naming the first frame that differs).
+  No frames is refused. The frames join the call's images in the vision tower's one
+  batch, so a call queues one tower call and still waits once, and a video's soft
+  rows stay on the device, read by the text encoder's scatter where the tower
+  wrote them (by the scatter's rule of one copy per maximal run of placeholder rows,
+  one per frame; inferred, the dispatches were not counted).
+* `MmItem::Media { ids, images, audio, videos }`: `videos` is one frame list per
+  video; the video placeholders of `ids` take the frames of all the videos laid end
+  to end, as image placeholders take the images'. This is the entry for the
+  `add_timestamps` layout: this crate has no tokenizer, so the caller tokenizes
+  `mm:ss ` text and puts it between the blocks (the golden of that layout is below).
+  `PreConfig` refuses `add_timestamps: true` by name, as it refuses every setting it
+  does not implement, so a config asking for timestamps is not read as asking for
+  none. A video placeholder with no frames, or frames with no placeholder, is
+  refused as a count mismatch (before, any video placeholder was refused: there was
+  no tower).
+* Limits: the vision tower's batch limit, 256 pictures, counts the frames of all the
+  call's videos with its images (a call of nine 32-frame videos is refused naming it).
+  Frames are numbered with the images in the tower's messages. The text limit
+  (`max_tokens`, 8192) refuses a sequence past it: 32 frames of 140 tokens is 4546 ids.
+* Both operand modes, as images: `GemmOperands::Bf16` runs the vision tower and the
+  text encoder in bf16, so the video's frames do too.
+
+### The oracle
+
+`tools/embedgemma2_ref/make_mm_reference.py` now also runs two synthetic videos alone
+through sentence-transformers (fp32, sdpa, CPU) with the metadata that makes the
+processor sample at 1 fps, and saves (prefix `video{n}_`) the raw frames, source fps,
+sampled indices and timestamps, `pixel_values_videos`, `video_position_ids`, ids, the
+soft tokens, `lm_final`, and the fp32 and bf16 embeddings:
+
+| | frames | size | source fps | sampled | soft tokens a frame | ids |
+|---|---|---|---|---|---|---|
+| `video0` | 24 | 96x176 | 4 | 6 (indices 0, 4, ..., 20) | 128 | 782 |
+| `video1` | 100 | 72x104 | 2.5 | 40, cut to 32 by the cap (0, 2, 5, 7, 12, ..., 97) | 126 | 4098 |
+| `video0t` | as `video0`, `add_timestamps` on | | | | 128 | 823 |
+
+`video0t`'s ids are `<bos>`, then per frame the tokenizer's ids of `mm:ss`
+(`00:00` ... `00:05`, the digits and `:` as single tokens) and `▁` before the block,
+then `<eos>`: 6 ids before the first block and 7 before each other one (the space
+between blocks is a `▁` in front of the next label). The 102 image and audio `.npy`
+files the generator already wrote are array-for-array identical on regeneration
+(`np.array_equal` against the shared reference directory).
+
+### Parity with transformers
+
+On the real checkpoint (`tests/embedgemma2_video_model.rs`, opt-in, same environment
+as `embedgemma2_e2e_model`; Apple M5 Pro, 2026-10-16, sdpa goldens, snapshot
+`914f7f89`). Bounds are the existing tests' (embedding 1e-4 and cosine 0.99999,
+the tower's soft tokens `1e-4` of the largest magnitude) and bf16's, fixed from the
+first measurement:
+
+| Check | Bound | Observed |
+|---|---|---|
+| Native sampling: indices, timestamps (f64) | exact | equal, both videos |
+| Native preprocessing: every frame's pixels and positions vs the processor's | bit for bit | 0 of 5,806,080 and 0 of 30,965,760 values differ |
+| `video_sequence` vs `ids.npy` | equal | equal (782 and 4098 ids) |
+| `video0t`: ids = the golden's labels + the plain blocks | equal | equal |
+| Tower soft tokens per frame vs captured (`video1`: 32 frames, 3 tower forwards) | 1e-4 of the largest magnitude | 1.25e-5 and 1.51e-5 |
+| Raw frames to embedding, both videos in one call, ExactF32 | max abs `1e-4`, cosine `>= 0.99999` | max abs 3.7e-7 and 1.5e-7, cosine 1.000000000 |
+| `video0t` through `Media` with the golden's ids | same | max abs 2.1e-7, cosine 1.000000000 |
+| Each video alone vs in the call | `1e-5` | 0 (bit for bit) |
+| Mixed call: 2 videos, an image, a clip, ExactF32 | same | 1.5e-7 to 3.7e-7, cosine 1.000000000, alone vs in the call 0 |
+| Bf16 video vs fp32 | cosine `>= 0.99997` | 0.9999930 and 0.9999968 |
+| Bf16 video vs transformers bf16 | cosine `>= 0.9996` | 0.999968 and 0.999986 (transformers' own bf16 vs its fp32: 0.999970 and 0.999986) |
+| Bf16 mixed call vs fp32 | cosine `>= 0.99997` | 0.9999885 to 0.9999968; alone vs in the call 0 |
+
+The bf16 bound is 2.6x the worst measured `1 - cos` over the videos, image and clip
+(1.2e-5), as the earlier bf16 bounds are derived from the measured values.
+
+Tiny checkpoint (`tests/embedgemma2_video_tiny.rs`, device, no checkpoint): the
+facade's video item equals the by-hand composition (`encode_images` of the frames,
+the ids written out in the test, `encode_multimodal`) bit for bit in both modes, for
+a 5-frame video and a 25-frame one the tower cuts into 2 forwards; reversed frames
+and swapped videos change the embedding; a `Media` item with text between the
+frames' blocks, an image and two videos of different frame sizes equals the by-hand
+composition; a mixed batch of a text, a video, an image, a clip, caller-built ids, a
+second video and a text equals each item alone (bit for bit, one forward, poisoned
+activations change nothing) and agrees within 1e-5 across several text forwards; one
+wait per call; every refusal (no frames, frames of different sizes, a placeholder
+count that is not the frames' soft tokens, 257 frames, a bad frame after good ones, a
+sequence past the limit) is raised with 0 allocations and 0 waits and leaves the
+facade usable. Mutation checks, each failing the tests that should: frames taken in
+reverse in the segment walk (4 of 8 tests), no `<eoi>` in the builder (5 of 8), and
+`PreConfig` not refusing `add_timestamps` (its test).
+
+### Speed
+
+`bench_embedgemma2_video`: 32 synthetic 640x360 frames (resized to 384x720, 120
+soft tokens a frame, 3906 ids), min of 15 calls, three consecutive runs
+(`bench/results/embedgemma2_video_m5pro.{txt,json,png}`). **Indicative only:** the
+machine was shared with other work, the one-minute load average at the workloads'
+starts was 30 to 110 on 18 cores (and the GPU is shared too), and the same workload
+moved by up to 2.7x between runs. Best of the three runs, ms:
+
+| | preprocess (CPU) | vision tower | whole call (tower + text encoder, 1 wait) |
+|---|---|---|---|
+| f32 | 50 | 2423 | 3732 |
+| bf16 | (same) | 791 | 1488 |
+
+The bf16 tower and call minima were taken in unequally loaded periods (load 80 and
+98), so the gap between the two is not the text encoder's cost; the runs' spread is in
+the figure. The wait count is 1 in both modes. The tower is the larger part in f32 (best
+runs 2423 of 3732 ms; it runs 32 x 1080 patches against the text encoder's 3906
+tokens); in bf16 the runs are too disturbed to say.
+
+### Not done
+
+* Timestamps are the caller's: no tokenizer here, so `add_timestamps` is reached
+  through `MmItem::Media` (tested against `video0t`), not by a flag.
+* No `Video` entry in the C ABI or Python (`capi*.rs` and `python/` are another
+  piece of work); `MmItem::Video` is Rust-only for now.
+* Pictures per call are capped at the tower's 256 (images and frames together); the
+  facade does not split a larger call into several tower batches.
+* x86 / AVX2 behaviour of the native resize is as unverified as [Preprocessing](#preprocessing) says.

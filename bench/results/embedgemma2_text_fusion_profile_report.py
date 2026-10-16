@@ -3,14 +3,17 @@ the row-pass fusion (G7). Analysis only; ships nothing.
 
     python3 embedgemma2_text_fusion_profile_report.py OUT_DIR LABEL=FILE.json [LABEL=FILE.json ...]
 
-Each FILE is one `PROFILE_MODE=stages` run (`PROFILE_JSON`). A class's time is the
-minimum over the kept samples of its `only:` variant (the stage alone, every other
-dispatch skipped); a category sums its classes; the share is of the sum of all
-classes (the stages add up to the whole forward to within the run-to-run noise,
-as `embedgemma2_stage_profile_m5pro.txt` showed). The classes are grouped as:
+Each FILE is one `PROFILE_MODE=stages` run (`PROFILE_JSON`); a LABEL may be given for
+several files (passes), and its numbers are then the minimum over all of them (the
+house method: min-of-N over every kept sample of every pass), with the range of the
+per-pass minima next to it. A class's time is the minimum over a pass's samples of its
+`only:` variant (the stage alone, every other dispatch skipped); a category sums its
+classes; the share is of the sum of all classes (the stages add up to the whole forward
+to within the run-to-run noise, as `embedgemma2_stage_profile_m5pro.txt` showed). The
+classes are grouped as:
 
   GEMM              every exact-f32 or bf16 GEMM (qkv, o, gate|up, down, the three
-                    per-layer-input ones, and the tail's projection is in `tail`)
+                    per-layer-input ones; the tail's projection is in `tail`)
   attention         sliding and global
   row passes        every norm and residual add, the per-layer inputs' scale+norm
                     and (bf16) the casts: the classes the fusion changed
@@ -25,13 +28,15 @@ OUT_DIR/embedgemma2_text_fusion_profile_tables.txt.
 
 import json
 import sys
+from collections import defaultdict
 from pathlib import Path
 
 out_dir = Path(sys.argv[1])
-runs = {}
+passes = defaultdict(list)  # label -> [doc, ...] in argument order
 for arg in sys.argv[2:]:
     label, path = arg.split("=", 1)
-    runs[label] = json.loads(Path(path).read_text())
+    passes[label].append(json.loads(Path(path).read_text()))
+labels = list(passes)
 
 CATEGORIES = [
     ("GEMM", ["qkv GEMM", "o GEMM", "gate|up GEMM", "down GEMM", "PLE projection", "ple_gate", "ple_out"]),
@@ -52,74 +57,102 @@ def category(cls):
     raise KeyError(cls)
 
 
-def workload_key(w):
-    return (w["rows"], w["seq"])
+def stages(label, wl):
+    """{class: ([per-pass min ms], dispatches)} for one label and workload, plus the
+    per-pass `full` minima and the workload record of the first pass."""
+    per = defaultdict(list)
+    disp = {}
+    full = []
+    first = None
+    for doc in passes[label]:
+        w = next((x for x in doc["workloads"] if x["workload"] == wl), None)
+        if w is None:
+            continue
+        first = first or w
+        for v in w["variants"]:
+            if v["kind"] == "only":
+                cls = v["name"].split(":", 1)[1]
+                per[cls].append(min(v["ms_per_forward"]))
+                disp[cls] = v["dispatches"]
+            elif v["kind"] == "full":
+                full.append(min(v["ms_per_forward"]))
+    return per, disp, full, first
 
 
 lines = []
 P = lines.append
+workloads = sorted(
+    {w["workload"] for docs in passes.values() for d in docs for w in d["workloads"]},
+    key=lambda s: (int(s.split("x")[0]) * int(s.split("x")[1]), s),
+)
 summary = {}
-labels = list(runs)
-workloads = sorted({w["workload"] for d in runs.values() for w in d["workloads"]}, key=lambda s: (int(s.split("x")[0]) * int(s.split("x")[1]), s))
-
 for wl in workloads:
-    P(f"== workload {wl}")
-    hdr = f"  {'run':<18} {'disp':>5} {'full ms':>9} {'sum(only)':>10} " + "".join(f"{c:>19}" for c, _ in CATEGORIES)
-    P(hdr)
     for label in labels:
-        w = next((x for x in runs[label]["workloads"] if x["workload"] == wl), None)
-        if w is None:
+        per, disp, full, first = stages(label, wl)
+        if not per:
             continue
-        only = {}
-        for v in w["variants"]:
-            if v["kind"] == "only":
-                only[v["name"].split(":", 1)[1]] = (min(v["ms_per_forward"]), v["dispatches"])
-        full = next(v for v in w["variants"] if v["kind"] == "full")
-        full_ms = min(full["ms_per_forward"])
-        total = sum(ms for ms, _ in only.values())
+        best = {c: min(v) for c, v in per.items()}
+        total = sum(best.values())
         cat_ms = {c: 0.0 for c, _ in CATEGORIES}
         cat_disp = {c: 0 for c, _ in CATEGORIES}
-        for cls, (ms, d) in only.items():
+        for cls, ms in best.items():
             cat_ms[category(cls)] += ms
-            cat_disp[category(cls)] += d
+            cat_disp[category(cls)] += disp[cls]
+        # The same sum per pass, to show how far the passes disagree.
+        n_pass = len(passes[label])
+        pass_sums = [
+            sum(v[i] for v in per.values() if len(v) > i)
+            for i in range(max(len(v) for v in per.values()))
+        ]
         summary[(label, wl)] = dict(
-            full_ms=full_ms, sum_only=total, cat_ms=cat_ms, cat_disp=cat_disp, dispatches=w["dispatches_full"],
-            util=(w["gpu_util_start_pct"], w["gpu_util_end_pct"]), contended=(w["samples_contended"], w["samples_total"]),
+            best=best, disp=disp, total=total, cat_ms=cat_ms, cat_disp=cat_disp, full=full,
+            pass_sums=pass_sums, dispatches=first["dispatches_full"], n_pass=n_pass,
         )
-        cells = "".join(f"{cat_ms[c]:>10.3f} {100 * cat_ms[c] / total:>5.1f}% " for c, _ in CATEGORIES)
-        P(f"  {label:<18} {w['dispatches_full']:>5} {full_ms:>9.3f} {total:>10.3f} {cells}")
+
+for wl in workloads:
+    P(f"== workload {wl}   (ms per forward; stage alone, min over {max(s['n_pass'] for (l, w), s in summary.items() if w == wl)} pass(es))")
+    P(f"  {'run':<30} {'disp':>5} {'full ms':>9} {'sum(only)':>10} " + "".join(f"{c:>19}" for c, _ in CATEGORIES))
+    for label in labels:
+        s = summary.get((label, wl))
+        if s is None:
+            continue
+        cells = "".join(f"{s['cat_ms'][c]:>10.3f} {100 * s['cat_ms'][c] / s['total']:>5.1f}% " for c, _ in CATEGORIES)
+        P(f"  {label:<30} {s['dispatches']:>5} {min(s['full']):>9.3f} {s['total']:>10.3f} {cells}")
     P("")
 
-P("Row passes (the classes the fusion changed): ms, dispatches, share of the sum of stages")
-P(f"  {'workload':<9} {'run':<18} {'disp':>5} {'ms':>9} {'share':>7}   classes (ms)")
+P("Row passes (the classes the fusion changed): dispatches, ms (min over passes) and [range of the per-pass sums], share of the sum of stages")
+P(f"  {'workload':<9} {'run':<30} {'disp':>5} {'ms':>9} {'passes':>16} {'share':>7}   classes (ms)")
 for wl in workloads:
     for label in labels:
         s = summary.get((label, wl))
         if s is None:
             continue
-        w = next(x for x in runs[label]["workloads"] if x["workload"] == wl)
-        parts = []
-        for v in w["variants"]:
-            if v["kind"] == "only":
-                cls = v["name"].split(":", 1)[1]
-                if category(cls) == "row passes":
-                    parts.append(f"{cls.split(' (')[0]} {min(v['ms_per_forward']):.3f}")
+        rp = [c for c in s["best"] if category(c) == "row passes"]
+        passes_rp = []
+        per, _, _, _ = stages(label, wl)
+        for i in range(s["n_pass"]):
+            passes_rp.append(sum(per[c][i] for c in rp if len(per[c]) > i))
         P(
-            f"  {wl:<9} {label:<18} {s['cat_disp']['row passes']:>5} {s['cat_ms']['row passes']:>9.3f} "
-            f"{100 * s['cat_ms']['row passes'] / s['sum_only']:>6.1f}%   " + "; ".join(parts)
+            f"  {wl:<9} {label:<30} {s['cat_disp']['row passes']:>5} {s['cat_ms']['row passes']:>9.3f} "
+            f"{min(passes_rp):>7.2f}-{max(passes_rp):<7.2f} {100 * s['cat_ms']['row passes'] / s['total']:>6.1f}%   "
+            + "; ".join(f"{c.split(' (')[0]} {s['best'][c]:.3f}" for c in rp)
         )
 P("")
-P("Machine: GPU utilization at the start and end of each workload (ioreg, %), and samples taken with another tessl GPU process seen")
+P("Machine: GPU utilization at the start and end of each workload (ioreg, %, first pass), and samples taken with another tessl GPU process seen")
 for wl in workloads:
     for label in labels:
         s = summary.get((label, wl))
-        if s:
-            P(f"  {wl:<9} {label:<18} util {s['util'][0]}% -> {s['util'][1]}%   contended samples {s['contended'][0]} of {s['contended'][1]}")
+        if s is None:
+            continue
+        _, _, _, first = stages(label, wl)
+        P(
+            f"  {wl:<9} {label:<30} util {first['gpu_util_start_pct']}% -> {first['gpu_util_end_pct']}%   "
+            f"contended samples {first['samples_contended']} of {first['samples_total']}"
+        )
 
 text = "\n".join(lines)
 print(text)
 (out_dir / "embedgemma2_text_fusion_profile_tables.txt").write_text(text + "\n")
-(out_dir / "embedgemma2_text_fusion_profile_m5pro.json").write_text(
-    json.dumps({"runs": runs, "categories": [c for c, _ in CATEGORIES]}, separators=(",", ":"))
-)
+merged = {"runs": {l: passes[l][-1] for l in labels}, "passes": {l: passes[l] for l in labels}, "categories": [c for c, _ in CATEGORIES]}
+(out_dir / "embedgemma2_text_fusion_profile_m5pro.json").write_text(json.dumps(merged, separators=(",", ":")))
 print("wrote", out_dir / "embedgemma2_text_fusion_profile_m5pro.json", file=sys.stderr)

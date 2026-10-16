@@ -451,7 +451,9 @@ f64 references and were left alone, but converge on `common`.
 | embedding gather times `sqrt(hidden)` (bf16 table) | `qwen35_embed_rows_bf16_scaled` via `qwen35::embed_rows_scaled` | new: the gather and the scale in one pass |
 | GELU-tanh gate over column windows (`gate \| up` from one GEMM; each layer's slice of the per-layer inputs) | `qwen35_gelu_tanh_glu_f32` via `qwen35::gated_act` | new: `qwen35_swiglu`'s kernel with the activation as a parameter |
 | soft tokens over the placeholder rows (`encode_multimodal`) | `qwen35_copy_cols_f32` via `qwen35_bwd::copy_cols` | reused: a flat copy per run of consecutive rows |
-| RMSNorm, post-norm residual add with layer scale, scale | `nn::rms_norm_f32`, `nn::rms_norm_residual_add_f32`, `nn::scale_f32_inplace` | reused |
+| RMSNorm (layer 0's input norm), the exact-f32 feed-forward residual add | `nn::rms_norm_f32`, `nn::rms_norm_bf16`, `nn::rms_norm_residual_add_f32` | reused |
+| a post-norm residual add with the layer scalar and the norm after it (pre-feed-forward, next layer's input, final); the feed-forward add with its bf16 copy; the per-layer inputs' scale and norm | `eg2t_resid_norm_f32`, `eg2t_resid_norm_bf16`, `eg2t_resid_add_bf16_copy`, `eg2t_scale_rms_norm_f32` (`kernels/embedgemma2_text.metal`) | new: "Text-encoder fusion (G7)" below |
+| bf16-output attention | `encoder_attn_tiled_bf16o_h{64_q32_k32_sg2, 256_q32_k64_sg4, 512_q32_k128_sg8}` (`kernels/encoder_attn.metal`) | new: the bf16-operand kernel storing O as bf16 (`encoder_attn_bf16_out`) |
 | GEMM | exact f32, or bf16 operands with f32 accumulation (`load_with`), TensorOps (NN, and NT for the per-layer-input projection) | reused |
 
 The rows encoder attention is its own kernel rather than a mode of
@@ -693,10 +695,11 @@ Measured on an M5 Pro against the real checkpoint, paired and interleaved
   the device peak of the mixed call before and after.
 * **`segment_mean_rows`** stays serial: it is under 0.2 % of an encode on
   every workload (`embedgemma2_segment_mean_share_m5pro.txt`).
-* **No bf16 attention output.** `encoder_attn` writes f32 only, at bf16
-  operands too; the `out_bf16` argument had no caller and is gone. (The
-  shared body still has the flag, so the bf16 forward's per-layer cast of the
-  attention output could be dropped by passing it; not done here.)
+* **No bf16 attention output** (until "Text-encoder fusion (G7)" below).
+  `encoder_attn` writes f32 only, at bf16 operands too; the `out_bf16`
+  argument had no caller and is gone. The bf16 forward's per-layer cast of the
+  attention output is gone too: `encoder_attn_bf16_out` stores bf16 through
+  the shared body's existing flag.
 
 ## Precision
 
@@ -722,14 +725,13 @@ precision `src/gemm.rs` already defines for callers that choose per call):
   the NT one). A GEMM taking an f32 A and a bf16 B does not exist (`gemm`
   requires matching operand dtypes), so A is staged in bf16, in buffers
   allocated once per `encode` like the other activations: the norms
-  (`rms_norm_bf16`) and the GELU gates (`qwen35_gelu_tanh_glu_bf16`) write
-  bf16 directly, at no extra dispatch, and four cast passes
-  (`cast_f32_to_bf16_into`) cover the rest: the attention output and the
-  residual stream into the per-layer-input gate once per layer, the embeddings
-  and the pooled vectors once per forward. `encoder_attn` writes f32 only, so
-  the attention output's cast stays until it gains a bf16 output (it could
-  write bf16 through the body's existing flag, which would drop that pass; not
-  done here).
+  (`rms_norm_bf16`, `eg2t_resid_norm_bf16`), the feed-forward residual add
+  (`eg2t_resid_add_bf16_copy`), the attention (`encoder_attn_bf16_out`) and the
+  GELU gates (`qwen35_gelu_tanh_glu_bf16`) write bf16 directly, at no extra
+  dispatch, and two cast passes (`cast_f32_to_bf16_into`) cover the rest: the
+  embeddings and the pooled vectors once per forward. (Before the fusion of
+  "Text-encoder fusion (G7)" the attention output and the residual stream into
+  the per-layer-input gate were cast every layer too: four cast passes.)
 * **Attention.** Q, K and V are stored bf16 by the q/k-norm-RoPE kernel
   (`attn_qk_norm_rope_columns(.., DType::BF16, ..)`, rounded to nearest even
   from its f32 result: no cast pass, and the three activation buffers are half

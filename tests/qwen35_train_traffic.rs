@@ -646,16 +646,15 @@ fn a_gdn_step_copies_no_columns() {
                     Precision::F32 => Qwen35Model::load(&rt, &st, "model.", cfg.clone(), precision).unwrap(),
                     Precision::Bf16 => Qwen35Model::load_tower(&rt, &st, "model.", cfg.clone(), precision).unwrap(),
                 };
-                let (copies, gdn) = (count("qwen35_copy_cols_f32"), count("gdn_train_bwd"));
+                // Whichever GDN backward production runs: the token-sequential kernel or the chunked one.
+                let gdn_bwd = || count("gdn_train_bwd") + count("gdn_train_c_bwd_a");
+                let (copies, gdn) = (count("qwen35_copy_cols_f32"), gdn_bwd());
                 let bank = Qwen35Grads::zeros_like(&model).unwrap();
                 model
                     .train_step_into(&ids, op, Supervise::Causal, &bank, false)
                     .unwrap();
                 rt.synchronize().unwrap();
-                assert!(
-                    count("gdn_train_bwd") > gdn,
-                    "{dir}, {lane}: the step ran no GDN backward"
-                );
+                assert!(gdn_bwd() > gdn, "{dir}, {lane}: the step ran no GDN backward");
                 assert_eq!(
                     count("qwen35_copy_cols_f32"),
                     copies,

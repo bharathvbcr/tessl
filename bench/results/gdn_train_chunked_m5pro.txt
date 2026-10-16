@@ -1,0 +1,33 @@
+# Chunked (WY) GDN training kernels vs the token-sequential ones, Qwen3.5-2B shapes — M5 Pro, 2026-10-16
+#
+# Per-op (T = 2048, B = 1, 16 key and value heads of 128, Dv 128), bench_paired, 10 interleaved rounds
+# (forward on even rounds, reversed on odd), each lane value the median of 7 runs inside one process
+# (bench_qwen35_train's own timing); the ratio is the median of per-round ratios with [lowest, highest] round:
+#
+#   target/release/bench_paired --format metrics --rounds 10 --out gdn_ops_paired.json \
+#     "sequential:BENCH_GDN_KERNEL=sequential=target/release/bench_qwen35_train 2048 --op=gdn_train_forward --op=gdn_train_backward" \
+#     "chunked:BENCH_GDN_KERNEL=chunked=target/release/bench_qwen35_train 2048 --op=gdn_train_forward --op=gdn_train_backward"
+#
+# Whole step (real 2B checkpoint, T = 2048, 4 rounds), before = production routed to the sequential kernel,
+# after = chunked (two release builds differing only in GDN_TRAIN_PRODUCTION):
+#
+#   bench_paired --format metrics --rounds 4 "before=BIN_BEFORE 2048 --step-only --step=2048" "after=BIN_AFTER 2048 --step-only --step=2048"
+#
+# Conditions: shared machine under the Lappi mac_heavy lock, one job at a time, load average ~27 at start.
+# Not run with --evidence (dirty-tree provenance not recorded); the lane stdout/stderr are under the .lanes dirs
+# in the session scratchpad, not committed.
+#
+# Result: the chunked kernels win on every lane, with the round spread nowhere near 1.0 (noise band: the
+# [lo, hi] columns). Production is routed to them.
+#
+#                 workload             sequential                chunked       vs base [lo, hi]
+# op_gdn_train_forward_ms_t2048                  6.348                  3.173  0.500x [0.493, 0.504]
+# op_gdn_train_backward_ms_t2048                 19.662                 11.899  0.605x [0.588, 0.622]
+#
+#                 workload                 before                  after       vs base [lo, hi]
+#       train_step_s_t2048                  5.292                  5.047  0.953x [0.946, 0.958]
+#    device_peak_gib_t2048                 15.347                 15.238  0.993x [0.993, 0.993]
+#  peak_footprint_gb_t2048                 19.715                 19.598  0.994x [0.994, 0.994]
+#
+# Memory: step peak footprint 19.715 GB before, 19.598 GB after (device peak 15.347 / 15.238 GiB), both far
+# under memguard's 32 GiB. The GDN workspace is smaller (no per-slice dq/dk partials): see docs text in the report.

@@ -78,8 +78,11 @@
 //!
 //! A batch is its clips laid end to end in each row space (frames, the first
 //! conv's rows, tower rows) and run as one forward, up to
-//! [`MAX_FRAMES_PER_FORWARD`] frames (more clips are more forwards, all queued
-//! before the one wait). A clip's rows never read another's: the convolutions
+//! [`MAX_FRAMES_PER_FORWARD`] frames and [`MAX_CLIPS`] clips (more clips are
+//! more forwards, all queued before the one wait; a call's total is bounded by
+//! [`MAX_CALL_FRAMES`] and [`MAX_CALL_CLIPS`], the memory its forwards' inputs
+//! and outputs hold until that wait, refused by name before any allocation). A
+//! clip's rows never read another's: the convolutions
 //! and the attention work in clip-local indices and the GEMMs and norms are
 //! row-wise, so a clip's output does not depend on what it is batched with. The
 //! one place a padded (masked) frame influences a kept one is the subsampling's
@@ -127,8 +130,26 @@ use crate::tensor::{gpu_copy, DType, GpuBuffer, Tensor};
 /// many forwards as this needs, so it bounds memory, not what a caller may
 /// pass; a single clip above it is refused.
 pub const MAX_FRAMES_PER_FORWARD: usize = 16_384;
-/// Clips per [`EmbedGemma2Audio::encode_audio`] call.
+/// Clips per forward (the clip table's size). A call may hold more
+/// ([`MAX_CALL_CLIPS`], [`MAX_CALL_FRAMES`]): it runs as several forwards
+/// behind its one wait.
 pub const MAX_CLIPS: usize = 256;
+/// Clips per [`EmbedGemma2Audio::encode_audio`] /
+/// [`EmbedGemma2Audio::queue_audio`] call (4096, sixteen forwards of
+/// [`MAX_CLIPS`]): a sanity bound beside [`MAX_CALL_FRAMES`], which is the
+/// memory one. A call over it is refused naming it.
+pub const MAX_CALL_CLIPS: usize = 4096;
+/// Frames (rows of `input_features`) per call: the memory bound of a call that
+/// is cut into several forwards. Every forward's uploaded inputs (the features,
+/// 512 bytes a frame at the checkpoint's 128 mel bins, and the masks) and its
+/// soft tokens (`embed_dim` f32 per tower row, a quarter of a frame's rows) are
+/// held until the call's one wait, about 1.25 KiB a frame, so a call holds up to
+/// 2.5 GiB of them at this bound, beside one activation set of at most
+/// [`MAX_FRAMES_PER_FORWARD`] frames. A call over it is refused naming it,
+/// before any allocation; split the call (each call waits once) to go past it.
+/// 2^21 frames is 128 full forwards, 5.8 hours of audio at 10 ms a frame, and 2.7
+/// times the 768,000 frames of 256 clips of 30 s.
+pub const MAX_CALL_FRAMES: usize = 1 << 21;
 
 /// Words per clip in the table the kernels read (`EGA_CLIP_WORDS`).
 const CLIP_WORDS: usize = 8;
@@ -2216,7 +2237,9 @@ impl EmbedGemma2Audio {
 
     /// Everything [`Self::encode_audio`] checks before it touches the device,
     /// with no allocation and no wait: the batch is non-empty and within
-    /// [`MAX_CLIPS`], the runtime's f32 GEMMs are exact (under
+    /// [`MAX_CALL_CLIPS`] and [`MAX_CALL_FRAMES`] (a call of more than
+    /// [`MAX_CLIPS`] clips is cut into several forwards behind its one wait),
+    /// the runtime's f32 GEMMs are exact (under
     /// [`GemmOperands::ExactF32`]; a bf16 forward runs none), and each clip has
     /// frames (at most [`MAX_FRAMES_PER_FORWARD`]), `frames * mel_bins` finite
     /// features. Returns the number of soft tokens each clip will produce (the
@@ -2237,9 +2260,17 @@ impl EmbedGemma2Audio {
         if clips.is_empty() {
             return Err(format!("{what}: empty batch"));
         }
-        if clips.len() > MAX_CLIPS {
+        if clips.len() > MAX_CALL_CLIPS {
             return Err(format!(
-                "{what}: {} clips exceeds the batch limit {MAX_CLIPS}",
+                "{what}: {} clips exceeds the per-call limit MAX_CALL_CLIPS = {MAX_CALL_CLIPS}",
+                clips.len()
+            ));
+        }
+        let total_frames = clips.iter().fold(0usize, |acc, c| acc.saturating_add(c.mask.len()));
+        if total_frames > MAX_CALL_FRAMES {
+            return Err(format!(
+                "{what}: {} clips make {total_frames} frames; the per-call memory bound MAX_CALL_FRAMES is \
+                 {MAX_CALL_FRAMES} (split the call)",
                 clips.len()
             ));
         }
@@ -2308,13 +2339,14 @@ impl EmbedGemma2Audio {
     fn queue_impl(&self, what: &str, clips: &[&AudioInput], trace: bool) -> Result<PendingAudio, String> {
         self.check_call(what, clips)?;
 
-        // Clips in order, cut where a forward would pass the frame budget.
+        // Clips in order, cut where a forward would pass the frame budget or
+        // the clip table's size.
         let mut plan: Vec<Vec<usize>> = Vec::new();
         let mut used = 0usize;
         for (i, c) in clips.iter().enumerate() {
             let f = c.mask.len();
             match plan.last_mut() {
-                Some(g) if used + f <= MAX_FRAMES_PER_FORWARD => {
+                Some(g) if g.len() < MAX_CLIPS && used + f <= MAX_FRAMES_PER_FORWARD => {
                     g.push(i);
                     used += f;
                 }

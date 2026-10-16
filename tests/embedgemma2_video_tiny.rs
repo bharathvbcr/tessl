@@ -45,12 +45,14 @@ use common::embedgemma2_mm::{
     checkpoint_bytes, clip, config_json, config_json_without_ids, configs, timestamp_tokenizer_json, Configs, Image,
 };
 use common::{with_gpu, SplitMix};
-use tessl::embedgemma2::{EmbedGemma2Model, MmSequence, MAX_TIMESTAMP_SECONDS};
-use tessl::embedgemma2_audio::AudioInput;
+use tessl::embedgemma2::{EmbedGemma2Model, MmSequence, MAX_BATCH, MAX_TIMESTAMP_SECONDS};
+use tessl::embedgemma2_audio::{AudioInput, MAX_CALL_CLIPS, MAX_CALL_FRAMES, MAX_CLIPS, MAX_FRAMES_PER_FORWARD};
 use tessl::embedgemma2_mm::{EmbedGemma2Multimodal, MmItem};
 use tessl::embedgemma2_pre::{timestamp_label, PreConfig, VideoConfig};
 use tessl::embedgemma2_tok::Tokenizer;
-use tessl::embedgemma2_vision::{EmbedGemma2VisionModel, ImageInput, MAX_IMAGES};
+use tessl::embedgemma2_vision::{
+    EmbedGemma2VisionModel, ImageInput, MAX_BATCH_PATCHES, MAX_CALL_IMAGES, MAX_CALL_PATCHES, MAX_IMAGES,
+};
 use tessl::gemm::GemmOperands;
 use tessl::infer_trace;
 use tessl::safetensors::SafeTensors;
@@ -895,7 +897,9 @@ fn video_items_are_refused_before_any_gpu_work() {
     let fg = inputs(&good);
     let mixed_sizes: Vec<ImageInput<'_>> = fg.iter().copied().chain(inputs(&other_size)).collect();
     let pd = f.c.vision.patch_dim() as usize;
-    let many: Vec<Image> = (0..MAX_IMAGES as u64 + 1).map(|k| Image::new(1, 1, 3, pd, k)).collect();
+    let many: Vec<Image> = (0..MAX_CALL_IMAGES as u64 + 1)
+        .map(|k| Image::new(1, 1, 3, pd, k))
+        .collect();
     let many_in = inputs(&many);
     let mut bad_pos = Image::new(2, 2, 0, pd, 7);
     bad_pos.position_ids[2] = 999;
@@ -931,9 +935,9 @@ fn video_items_are_refused_before_any_gpu_work() {
                 &different,
             ),
             (
-                "more frames than the tower's batch",
+                "more frames than a call holds",
                 vec![MmItem::Video(&many_in)],
-                "exceeds the batch limit",
+                "MAX_CALL_IMAGES",
             ),
             (
                 "a bad frame after good ones",
@@ -999,5 +1003,178 @@ fn video_items_are_refused_before_any_gpu_work() {
         let e = res.err().expect("accepted");
         assert!(e.contains("the limit is"), "{e}");
         assert_eq!((t.cold_allocs, t.sync_waits), (0, 0));
+    });
+}
+
+// ---------------------------------------------------------------------------
+// More pictures and clips than one tower forward holds.
+// ---------------------------------------------------------------------------
+
+const BOA: u32 = 42;
+const EOA: u32 = 43;
+const AUDIO: u32 = 61;
+
+/// 300 pictures and 300 clips (past the 256 of a tower forward) in 150 items of
+/// two images and two clips each, in one call, equal the same items in two
+/// calls of 75, bit for bit: both towers run as two forwards behind the call's
+/// one wait, their soft rows stay on the device, and the text encoder reads
+/// them where they were written.
+#[test]
+fn a_call_with_more_pictures_and_clips_than_a_forward_equals_smaller_calls() {
+    for operands in MODES {
+        let f = fixture("many_pictures", operands);
+        let pd = f.c.vision.patch_dim() as usize;
+        const ITEMS: usize = 150;
+        const _: () = assert!(2 * ITEMS > MAX_IMAGES && 2 * ITEMS > MAX_CLIPS && ITEMS <= MAX_BATCH);
+        // 2x2 patches pool to one soft token; 12 frames of audio to three.
+        let images: Vec<Image> = (0..2 * ITEMS)
+            .map(|k| Image::new(2, 2, 0, pd, 700 + k as u64))
+            .collect();
+        let clips: Vec<AudioInput> = (0..2 * ITEMS)
+            .map(|k| clip(&f.c.audio, 12, 900 + k as u64, |_| true))
+            .collect();
+        let imgs = inputs(&images);
+        with_gpu(|rt| {
+            let m = f.facade(rt, operands);
+            let (ti, ta) = (
+                m.vision().check_images(&imgs).unwrap(),
+                m.audio().check_clips(&clips).unwrap(),
+            );
+            assert!(
+                ti.iter().all(|&n| n == ti[0]) && ta.iter().all(|&n| n == ta[0]),
+                "test bug: counts"
+            );
+            assert_eq!(ti[0], 1, "test bug: one soft token an image");
+            // [bos, (boi, image, eoi) x 2, (boa, audio x n, eoa) x 2, eos]
+            let mut ids = vec![BOS];
+            ids.extend(std::iter::repeat_n([BOI, IMAGE, EOI], 2).flatten());
+            for _ in 0..2 {
+                ids.push(BOA);
+                ids.extend(std::iter::repeat_n(AUDIO, ta[0]));
+                ids.push(EOA);
+            }
+            ids.push(EOS);
+            let item = |k: usize| MmItem::Media {
+                ids: &ids,
+                images: &imgs[2 * k..2 * k + 2],
+                audio: &clips[2 * k..2 * k + 2],
+                videos: &[],
+            };
+            let items: Vec<MmItem<'_>> = (0..ITEMS).map(item).collect();
+            let (all, t) = traced(|| m.encode(&items, None).unwrap());
+            assert_eq!(t.sync_waits, 1, "{operands:?}: 300 pictures and 300 clips, one wait");
+            let dim = all.embeddings.len() / ITEMS;
+            let (a, b) = (
+                m.encode(&items[..ITEMS / 2], None).unwrap(),
+                m.encode(&items[ITEMS / 2..], None).unwrap(),
+            );
+            let halves = [a.embeddings, b.embeddings].concat();
+            assert_eq!(bits(&all.embeddings), bits(&halves), "{operands:?}: one call vs two");
+            // And a few of them alone: the towers' rows are the same bits, the
+            // text encoder's GEMMs tile 14 rows differently from 2100, which
+            // is the text side's batch bound, not the towers'.
+            for k in [0, 1, 127, 128, 149] {
+                let alone = m.encode(&[item(k)], None).unwrap();
+                let d = drift(&alone.embeddings, &all.embeddings[k * dim..(k + 1) * dim]);
+                assert!(d <= BATCH_ABS, "{operands:?}: item {k} alone: {d:.3e}");
+            }
+            // The towers really did split: the same pictures through the tower
+            // on its own are two forwards.
+            assert_eq!(m.vision().encode_images(&imgs, false).unwrap().forwards, 2);
+            assert_eq!(m.audio().encode_audio(&clips, false).unwrap().forwards, 2);
+        });
+    }
+}
+
+/// A video of 300 frames (past a forward's 256) equals the by-hand
+/// composition with the frames run as two tower calls of 150, bit for bit, in
+/// one wait.
+#[test]
+fn a_video_of_more_frames_than_a_forward_equals_two_tower_calls() {
+    for operands in MODES {
+        let f = fixture("many_frames", operands);
+        let vid = frames(&f.c, 300, (2, 2), 0, 1300);
+        let fr = inputs(&vid);
+        with_gpu(|rt| {
+            let m = f.facade(rt, operands);
+            let by_hand = ByHand::new(&f, rt, operands);
+            let counts = by_hand.vision.check_images(&fr).unwrap();
+            assert_eq!(counts, [1; 300], "test bug: one soft token a frame");
+            let ids = hand_ids(&counts);
+            let mut soft = Vec::new();
+            for half in fr.chunks(150) {
+                soft.extend(by_hand.vision.encode_images(half, false).unwrap().soft.concat());
+            }
+            let want = by_hand
+                .text
+                .encode_multimodal(&[MmSequence { ids: &ids, soft: &soft }], None, false)
+                .unwrap()
+                .embeddings;
+            let (got, t) = traced(|| m.encode(&[MmItem::Video(&fr)], None).unwrap());
+            assert_eq!(bits(&got.embeddings), bits(&want), "{operands:?}");
+            assert_eq!(t.sync_waits, 1, "{operands:?}: 300 frames, one wait");
+            assert_eq!(by_hand.vision.encode_images(&fr, false).unwrap().forwards, 2);
+        });
+    }
+}
+
+/// The per-call bounds are refused by name before any GPU work, at the
+/// facade: padded patches, frames and clips. The boundary itself is accepted
+/// by the towers' checks.
+#[test]
+fn calls_past_the_per_call_bounds_are_refused_before_any_gpu_work() {
+    let f = fixture("per_call_bounds", GemmOperands::ExactF32);
+    let pd = f.c.vision.patch_dim() as usize;
+    // One 128 x 128 image is 16,384 patches, a whole forward.
+    let big = Image::new(128, 128, 0, pd, 5);
+    let big_frames = vec![big.input(); MAX_CALL_PATCHES / MAX_BATCH_PATCHES + 1];
+    let long = clip(&f.c.audio, MAX_FRAMES_PER_FORWARD, 6, |_| true);
+    let long_items: Vec<MmItem<'_>> = (0..MAX_CALL_FRAMES / MAX_FRAMES_PER_FORWARD + 1)
+        .map(|_| MmItem::Audio(&long))
+        .collect();
+    let short: Vec<AudioInput> = (0..MAX_CALL_CLIPS + 1)
+        .map(|k| clip(&f.c.audio, 8, k as u64, |_| true))
+        .collect();
+    let one_clip_ids = [BOS, BOA, AUDIO, EOA, EOS];
+    with_gpu(|rt| {
+        let m = f.facade(rt, GemmOperands::ExactF32);
+        m.vision()
+            .check_images(&big_frames[..big_frames.len() - 1])
+            .expect("a call at the patch bound");
+        m.audio()
+            .check_clips(&vec![&long; MAX_CALL_FRAMES / MAX_FRAMES_PER_FORWARD])
+            .expect("a call at the frame bound");
+        let cases: Vec<(&str, Vec<MmItem<'_>>, &str)> = vec![
+            (
+                "frames past the patch bound",
+                vec![MmItem::Video(&big_frames)],
+                "MAX_CALL_PATCHES",
+            ),
+            ("clips past the frame bound", long_items, "MAX_CALL_FRAMES"),
+            (
+                "clips past the clip bound",
+                vec![MmItem::Media {
+                    ids: &one_clip_ids,
+                    images: &[],
+                    audio: &short,
+                    videos: &[],
+                }],
+                "MAX_CALL_CLIPS",
+            ),
+        ];
+        for (what, items, want_msg) in cases {
+            let (res, t) = traced(|| m.encode(&items, None));
+            let e = res.err().unwrap_or_else(|| panic!("{what}: accepted"));
+            assert!(e.contains(want_msg), "{what}: {e:?} does not mention {want_msg:?}");
+            assert!(
+                e.starts_with("EmbedGemma2Multimodal::encode"),
+                "{what}: names its entry: {e}"
+            );
+            assert_eq!(
+                (t.cold_allocs, t.sync_waits),
+                (0, 0),
+                "{what}: did GPU work before refusing"
+            );
+        }
     });
 }

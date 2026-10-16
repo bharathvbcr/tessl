@@ -65,8 +65,15 @@
 //! nothing. Media are numbered across the call in item order in the towers'
 //! messages (`image 2` is the third image of the call, not of its item), and a
 //! video's frames are images to the vision tower: they are numbered with the
-//! images, in the order of the items, and count toward its batch limit
-//! ([`crate::embedgemma2_vision::MAX_IMAGES`], 256 images and frames per call).
+//! images, in the order of the items, and count toward its per-call bounds
+//! ([`crate::embedgemma2_vision::MAX_CALL_IMAGES`] pictures and
+//! [`crate::embedgemma2_vision::MAX_CALL_PATCHES`] padded patches; the clips
+//! likewise toward [`crate::embedgemma2_audio::MAX_CALL_CLIPS`] and
+//! [`crate::embedgemma2_audio::MAX_CALL_FRAMES`]). A call of more than one
+//! tower forward's worth of pictures (256, [`crate::embedgemma2_vision::MAX_IMAGES`])
+//! or clips ([`crate::embedgemma2_audio::MAX_CLIPS`]) is cut into several
+//! forwards inside the same call, behind the same one wait, with the soft rows
+//! still read from the device by the text encoder's scatter.
 //!
 //! # Waiting
 //!

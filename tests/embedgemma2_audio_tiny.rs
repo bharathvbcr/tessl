@@ -37,7 +37,8 @@ use common::embedgemma2_audio::{audio_forward, AudioRef, Weights};
 use common::embedgemma2_mm::{audio_weights as random_weights, TowerWeight as Weight};
 use common::{with_gpu, SplitMix};
 use tessl::embedgemma2_audio::{
-    sub_rows, AudioConfig, AudioInput, AudioOutput, EmbedGemma2Audio, MAX_FRAMES_PER_FORWARD,
+    sub_rows, AudioConfig, AudioInput, AudioOutput, EmbedGemma2Audio, MAX_CALL_CLIPS, MAX_CALL_FRAMES, MAX_CLIPS,
+    MAX_FRAMES_PER_FORWARD,
 };
 use tessl::gemm::GemmOperands;
 use tessl::safetensors::SafeTensors;
@@ -595,6 +596,61 @@ fn a_batch_past_the_frame_budget_splits_into_forwards() {
     });
 }
 
+/// 300 clips (past the 256 a forward's clip table holds) in one call equal the
+/// same clips in two calls of 150, bit for bit, and a few of them alone: the
+/// call is two forwards behind one wait, cut by the table and not by frames.
+#[test]
+fn a_call_past_the_clip_table_matches_smaller_calls() {
+    let cfg = AudioConfig::from_config_json(TINY).unwrap();
+    let w = random_weights(&cfg, 17);
+    let st = open("many_clips", safetensors_bytes(&w, &[]));
+    const N: usize = 300;
+    const _: () = assert!(N > MAX_CLIPS && N <= MAX_CALL_CLIPS && N * 40 < MAX_FRAMES_PER_FORWARD);
+    // Ragged lengths and masks, a prefix mask for some, a gap for others.
+    let batch: Vec<AudioInput> = (0..N)
+        .map(|k| {
+            let frames = 6 + k % 35;
+            clip(&cfg, frames, 200 + k as u64, |f| {
+                if k % 3 == 0 {
+                    f % 7 != 3
+                } else {
+                    f + k % 4 < frames
+                }
+            })
+        })
+        .collect();
+    with_gpu(|rt| {
+        let model = EmbedGemma2Audio::load(rt, &st, "", cfg.clone()).unwrap();
+        let first = model.encode_audio(&batch[..N / 2], false).unwrap();
+        let second = model.encode_audio(&batch[N / 2..], false).unwrap();
+        assert_eq!(
+            (first.forwards, second.forwards),
+            (1, 1),
+            "test bug: 150 clips fit a forward"
+        );
+        rt.set_poison_unzeroed(true);
+        let all = model.encode_audio(&batch, false);
+        rt.set_poison_unzeroed(false);
+        let all = all.unwrap();
+        assert_eq!(all.forwards, 2, "{N} clips are two forwards of at most {MAX_CLIPS}");
+        for i in 0..N {
+            let (half, j) = if i < N / 2 { (&first, i) } else { (&second, i - N / 2) };
+            assert_bit_equal(&format!("clip {i}: one call of {N} vs two"), half, j, &all, i);
+        }
+        for i in [0, 1, 255, 256, 299] {
+            let alone = model.encode_audio(std::slice::from_ref(&batch[i]), false).unwrap();
+            assert_bit_equal(&format!("clip {i} alone"), &alone, 0, &all, i);
+        }
+        assert_eq!(
+            model.check_clips(&batch).unwrap(),
+            all.out_masks
+                .iter()
+                .map(|m| m.iter().filter(|&&k| k).count())
+                .collect::<Vec<_>>()
+        );
+    });
+}
+
 #[test]
 fn encode_audio_refuses_what_it_cannot_run() {
     let cfg = AudioConfig::from_config_json(TINY).unwrap();
@@ -620,8 +676,21 @@ fn encode_audio_refuses_what_it_cannot_run() {
         assert!(err(&[bad]).contains("not finite"));
         let too_long = clip(&cfg, MAX_FRAMES_PER_FORWARD + 1, 2, |_| true);
         assert!(err(&[too_long]).contains("split it"));
-        let many = vec![good.clone(); tessl::embedgemma2_audio::MAX_CLIPS + 1];
-        assert!(err(&many).contains("batch limit"));
+        // The per-call bounds, by name: clips, and frames. (Frames by
+        // reference: 129 clips of a forward's worth are 129 x 8 MiB owned.)
+        let many = vec![good.clone(); MAX_CALL_CLIPS + 1];
+        assert!(err(&many).contains("MAX_CALL_CLIPS"));
+        let long = clip(&cfg, MAX_FRAMES_PER_FORWARD, 3, |_| true);
+        let full = vec![&long; MAX_CALL_FRAMES / MAX_FRAMES_PER_FORWARD];
+        let over = vec![&long; MAX_CALL_FRAMES / MAX_FRAMES_PER_FORWARD + 1];
+        model.check_clips(&full).expect("a call at the frame bound");
+        for call in [
+            model.check_clips(&over).map(|_| ()),
+            model.queue_audio(&over, false).map(|_| ()),
+        ] {
+            let e = call.expect_err("past the frame bound");
+            assert!(e.contains("MAX_CALL_FRAMES") && e.contains("split the call"), "{e}");
+        }
         // A different mel width than the first conv's channels.
         let mut bad = good.clone();
         bad.input_features.extend([0.0; 7]);

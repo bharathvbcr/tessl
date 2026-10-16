@@ -846,7 +846,12 @@ one forward padded to the longest, with a per-image length for attention
 of at most 16,384 padded patches (`MAX_BATCH_PATCHES`) and 256 images,
 longest first, queued under a `GpuRuntime::async_scope` behind one
 `synchronize` (`queue_images` is the call up to the wait, for a caller that
-queues more behind it: [One call](#one-call-text-images-and-audio)).
+queues more behind it: [One call](#one-call-text-images-and-audio)). A call may
+hold more than one forward's worth of images: it is bounded by `MAX_CALL_IMAGES`
+(4096) and by `MAX_CALL_PATCHES` (2^20 padded patches, the memory the forwards'
+uploaded inputs and soft tokens hold until the wait: about 3.4 GiB at the bound under
+`ExactF32`, 1.9 GiB under `Bf16`, beside one activation set), each refused by name
+before any allocation.
 
 **Pooling.** A patch at `(x, y)` goes to cell `x/k + (max_x/k) * (y/k)`,
 `max_x = max(x) + 1` of its own image, which collides cells when the grid width
@@ -1214,10 +1219,13 @@ sums its five taps as before but from the GLU recomputed in registers.
 
 ### Batches and limits
 
-`encode_audio` takes up to 256 clips of any lengths. They are laid end to end
-in each row space and run as one forward up to 16,384 frames (`MAX_FRAMES_PER_FORWARD`;
-a clip above that is refused, more clips are more forwards, all queued before the
-one wait). Clips never read each other's rows: the convolutions and the attention
+`encode_audio` takes up to 4096 clips (`MAX_CALL_CLIPS`) of 2^21 frames in all (`MAX_CALL_FRAMES`) of any lengths. They are laid end to end
+in each row space and run as one forward up to 16,384 frames (`MAX_FRAMES_PER_FORWARD`)
+and 256 clips (`MAX_CLIPS`, the clip table's size); a clip above the frame limit is
+refused, more clips are more forwards, all queued before the one wait. What bounds a
+call is the memory its forwards' inputs and soft tokens hold until that wait (about
+1.25 KiB a frame, 2.5 GiB at `MAX_CALL_FRAMES`): a call over either bound is refused
+by name before any allocation. Clips never read each other's rows: the convolutions and the attention
 work in clip-local indices through a clip table, and everything else is row-wise,
 so a clip is bit for bit the same alone or in any batch. Padding (masked)
 frames are defined everywhere: the only place a masked frame influences a kept
@@ -2236,9 +2244,12 @@ verified by reading them and against the `ids.npy` of the reference run):
   now reads `video.add_timestamps` (it refused `true` by name while this crate had
   no tokenizer), so a caller picks the item by the flag: `TimestampedVideo` when it
   is on, `Video` when it is off. `MmItem::Video(&[ImageInput])` is unchanged.
-* Limits: the vision tower's batch limit, 256 pictures, counts the frames of all the
-  call's videos with its images (a call of nine 32-frame videos is refused naming it).
-  Frames are numbered with the images in the tower's messages. The text limit
+* Limits: the frames of all the call's videos count with its images toward the
+  vision tower's per-call bounds, `MAX_CALL_IMAGES` (4096) and `MAX_CALL_PATCHES`
+  (2^20 padded patches: 800 full 1260-patch frames), not toward the 256 of one tower
+  forward: a call past 256 pictures is cut into several tower forwards inside the call
+  (see [Pictures and clips past a forward](#facade-follow-ups)). Frames are numbered
+  with the images in the tower's messages. The text limit
   (`max_tokens`, 8192) refuses a sequence past it: 32 frames of 140 tokens is 4546 ids.
 * Both operand modes, as images: `GemmOperands::Bf16` runs the vision tower and the
   text encoder in bf16, so the video's frames do too.
@@ -2302,7 +2313,7 @@ composition; a mixed batch of a text, a video, an image, a clip, caller-built id
 second video and a text equals each item alone (bit for bit, one forward, poisoned
 activations change nothing) and agrees within 1e-5 across several text forwards; one
 wait per call; every refusal (no frames, frames of different sizes, a placeholder
-count that is not the frames' soft tokens, 257 frames, a bad frame after good ones, a
+count that is not the frames' soft tokens, 4097 frames, a bad frame after good ones, a
 sequence past the limit) is raised with 0 allocations and 0 waits and leaves the
 facade usable. Timestamps: `PreConfig` reads `add_timestamps` (on, off, absent, not
 a boolean); on a tiny tokenizer with merges (`0 0`, then a space glued to a following
@@ -2342,8 +2353,6 @@ tokens); in bf16 the runs are too disturbed to say.
 
 * No `Video` entry in the C ABI or Python (`capi*.rs` and `python/` are another
   piece of work); `MmItem::Video` is Rust-only for now.
-* Pictures per call are capped at the tower's 256 (images and frames together); the
-  facade does not split a larger call into several tower batches.
 * x86 / AVX2 behaviour of the native resize is as unverified as [Preprocessing](#preprocessing) says.
 
 ## Pool recycle at allocation

@@ -21,8 +21,13 @@ use common::gdn_train::{gdn_train_bwd_f64, gdn_train_f64, Inputs, Shape};
 use common::qwen35::{gdn_f64, sigmoid, softplus, GdnProblem, GdnShape};
 use common::{random_f32, with_gpu};
 use tessl::gdn_train::{
-    gdn_train_backward, gdn_train_forward, GdnTrainDims, GdnTrainGrads, GdnTrainInputs, GdnTrainWorkspace,
+    gdn_train_backward, gdn_train_forward, gdn_train_forward_with, GdnTrainDims, GdnTrainGrads, GdnTrainInputs,
+    GdnTrainKernel, GdnTrainWorkspace,
 };
+
+/// Both kernels, each held to the f64 reference: the token-sequential one is
+/// the oracle the chunked one is also compared with.
+const KERNELS: [GdnTrainKernel; 2] = [GdnTrainKernel::Sequential, GdnTrainKernel::Chunked];
 use tessl::{GpuRuntime, Tensor};
 
 fn f64s(v: &[f32]) -> Vec<f64> {
@@ -250,10 +255,10 @@ fn assert_close(label: &str, got: &[f32], want: &[f64]) -> f64 {
 
 /// Run the forward and backward on the GPU and check both against f64.
 /// Returns the worst relative error seen.
-fn check(rt: &Arc<GpuRuntime>, c: &Case) -> f64 {
+fn check(rt: &Arc<GpuRuntime>, c: &Case, kernel: GdnTrainKernel) -> f64 {
     let Shape { b, t, h, dv, .. } = c.s;
     let label = format!(
-        "B={b} T={t} H={h} Dv={dv} s0={} dfin={}",
+        "{kernel:?} B={b} T={t} H={h} Dv={dv} s0={} dfin={}",
         c.s0.is_some(),
         c.dfin.is_some()
     );
@@ -281,7 +286,7 @@ fn check(rt: &Arc<GpuRuntime>, c: &Case) -> f64 {
     let o = sentinel(rt, &[b, t, h, dv]);
     let sfin = sentinel(rt, &[b, h, 128, dv]);
     let ckpt = sentinel(rt, &dims.checkpoint_shape());
-    gdn_train_forward(rt, dims, x, &o, Some(&sfin), &ckpt).unwrap_or_else(|e| panic!("{label}: {e}"));
+    gdn_train_forward_with(kernel, rt, dims, x, &o, Some(&sfin), &ckpt).unwrap_or_else(|e| panic!("{label}: {e}"));
 
     let (q64, k64, v64, g64, b64) = (f64s(&c.q), f64s(&c.k), f64s(&c.v), f64s(&c.g), f64s(&c.beta));
     let s064 = c.s0.as_ref().map(|s| f64s(s));
@@ -305,7 +310,7 @@ fn check(rt: &Arc<GpuRuntime>, c: &Case) -> f64 {
 
     let d_o = tensor(rt, &[b, t, h, dv], &c.d_o);
     let dfin = c.dfin.as_ref().map(|d| tensor(rt, &[b, h, 128, dv], d));
-    let ws = GdnTrainWorkspace::new(rt, dims).unwrap();
+    let ws = GdnTrainWorkspace::new_for(rt, dims, kernel).unwrap();
     let (dq, dk, dvv) = (
         sentinel(rt, &[b, t, h, 128]),
         sentinel(rt, &[b, t, h, 128]),
@@ -369,7 +374,9 @@ fn the_kernels_match_the_reference_across_chunk_edges() {
             (65, true, true),
             (130, true, true),
         ] {
-            check(rt, &Case::new(2, t, 3, 32, 100 + t as u64, s0, dfin));
+            for kernel in KERNELS {
+                check(rt, &Case::new(2, t, 3, 32, 100 + t as u64, s0, dfin), kernel);
+            }
         }
     });
 }
@@ -377,7 +384,9 @@ fn the_kernels_match_the_reference_across_chunk_edges() {
 #[test]
 fn the_kernels_match_the_reference_at_qwen35_2b_heads() {
     with_gpu(|rt| {
-        check(rt, &Case::new(1, 200, 16, 128, 7, false, false));
+        for kernel in KERNELS {
+            check(rt, &Case::new(1, 200, 16, 128, 7, false, false), kernel);
+        }
     });
 }
 
@@ -827,5 +836,338 @@ fn the_host_refuses_bad_windows() {
             bwd(w!(&conv, 0), w!(&dconv, 128), w!(&dconv, 256)),
             "output dq overlaps input",
         );
+    });
+}
+
+// ---------------------------------------------------------------------------
+// The chunked kernels against the token-sequential ones
+// ---------------------------------------------------------------------------
+
+/// The tolerance between the two kernels, as a fraction of the sequential
+/// output's largest magnitude. Both are f32 with `precise::` exponentials and
+/// square roots; they differ only in summation order and association. The
+/// sequential kernel adds a value column's 128 key-row products one simdgroup
+/// at a time and walks 64 dependent steps per chunk; the chunked one forms the
+/// same sums as 8-wide matrix products over a 64-row triangular solve. A sum
+/// of n terms in f32 is off by at most n/2 ulp (6e-8 relative to the sum of
+/// magnitudes), and the longest chain here is the solve's 63 forward
+/// substitutions of 128-term dot products, so about 1e-5 worst case and
+/// 1e-6 typically (the CPU emulator measured 1.8e-6 over every output and
+/// shape below). 1e-5 is that worst case: a defect in either kernel's algebra
+/// moves outputs by O(1e-2) of their magnitude or more, and the f64 checks
+/// above hold each kernel to 1e-4 independently.
+const PARITY_TOL: f64 = 1e-5;
+
+fn parity(label: &str, chunked: &[f32], oracle: &[f32]) -> f64 {
+    assert_eq!(chunked.len(), oracle.len(), "{label}: length");
+    let peak = oracle.iter().fold(0.0f64, |m, x| m.max(f64::from(x.abs()))).max(1e-30);
+    let mut worst = (0.0f64, 0usize);
+    for (i, (&c, &o)) in chunked.iter().zip(oracle).enumerate() {
+        assert!(c.is_finite() && c != SENTINEL, "{label}[{i}]: chunked wrote {c}");
+        let e = (f64::from(c) - f64::from(o)).abs();
+        if e > worst.0 {
+            worst = (e, i);
+        }
+    }
+    let rel = worst.0 / peak;
+    assert!(
+        rel <= PARITY_TOL,
+        "{label}: chunked and sequential differ by {:.3e} at {} (chunked {} sequential {}), {rel:.2e} of max|seq| {peak:.3e}",
+        worst.0,
+        worst.1,
+        chunked[worst.1],
+        oracle[worst.1]
+    );
+    rel
+}
+
+/// Every output of one forward and backward, in a fixed order.
+struct Outputs {
+    names: Vec<&'static str>,
+    data: Vec<Vec<f32>>,
+}
+
+/// Forward on `fwd_kernel`, backward on `bwd_kernel` (the checkpoints are the
+/// same layout and content, so the two compose), dense operands.
+fn run_dense(rt: &Arc<GpuRuntime>, c: &Case, fwd_kernel: GdnTrainKernel, bwd_kernel: GdnTrainKernel) -> Outputs {
+    let Shape { b, t, h, dv, .. } = c.s;
+    let dims = GdnTrainDims {
+        batch: b as u32,
+        seq: t as u32,
+        heads: h as u32,
+        v_dim: dv as u32,
+    };
+    let (q, k, v) = (
+        tensor(rt, &[b, t, h, 128], &c.q),
+        tensor(rt, &[b, t, h, 128], &c.k),
+        tensor(rt, &[b, t, h, dv], &c.v),
+    );
+    let (g, beta) = (tensor(rt, &[b, t, h], &c.g), tensor(rt, &[b, t, h], &c.beta));
+    let s0 = c.s0.as_ref().map(|s| tensor(rt, &[b, h, 128, dv], s));
+    let x = GdnTrainInputs {
+        q: &q,
+        k: &k,
+        v: &v,
+        g: &g,
+        beta: &beta,
+        s0: s0.as_ref(),
+    };
+    let (o, sfin, ckpt) = (
+        sentinel(rt, &[b, t, h, dv]),
+        sentinel(rt, &[b, h, 128, dv]),
+        sentinel(rt, &dims.checkpoint_shape()),
+    );
+    gdn_train_forward_with(fwd_kernel, rt, dims, x, &o, Some(&sfin), &ckpt).unwrap();
+    let d_o = tensor(rt, &[b, t, h, dv], &c.d_o);
+    let dfin = c.dfin.as_ref().map(|d| tensor(rt, &[b, h, 128, dv], d));
+    let ws = GdnTrainWorkspace::new_for(rt, dims, bwd_kernel).unwrap();
+    let (dq, dk, dvv) = (
+        sentinel(rt, &[b, t, h, 128]),
+        sentinel(rt, &[b, t, h, 128]),
+        sentinel(rt, &[b, t, h, dv]),
+    );
+    let (dg, db) = (sentinel(rt, &[b, t, h]), sentinel(rt, &[b, t, h]));
+    let ds0 = c.s0.as_ref().map(|_| sentinel(rt, &[b, h, 128, dv]));
+    gdn_train_backward(
+        rt,
+        dims,
+        x,
+        &ckpt,
+        &d_o,
+        dfin.as_ref(),
+        &ws,
+        GdnTrainGrads {
+            dq: &dq,
+            dk: &dk,
+            dv: &dvv,
+            dg: &dg,
+            dbeta: &db,
+            ds0: ds0.as_ref(),
+        },
+    )
+    .unwrap();
+    let mut out = Outputs {
+        names: vec!["o", "final state", "ckpt", "dq", "dk", "dv", "dg", "dbeta"],
+        data: [&o, &sfin, &ckpt, &dq, &dk, &dvv, &dg, &db]
+            .iter()
+            .map(|t| t.read_f32().unwrap())
+            .collect(),
+    };
+    if let Some(ds0) = ds0 {
+        out.names.push("ds0");
+        out.data.push(ds0.read_f32().unwrap());
+    }
+    out
+}
+
+fn assert_parity(label: &str, chunked: &Outputs, oracle: &Outputs) -> f64 {
+    let mut worst = 0.0f64;
+    for ((name, c), o) in chunked.names.iter().zip(&chunked.data).zip(&oracle.data) {
+        worst = worst.max(parity(&format!("{label} {name}"), c, o));
+    }
+    eprintln!("{label}: chunked vs sequential worst {worst:.2e} of max|seq|");
+    worst
+}
+
+/// The chunked kernels' every output (o, final state, checkpoints, dq, dk, dv,
+/// dg, dbeta, ds0) equals the sequential kernels' within `PARITY_TOL`, across
+/// the chunk edges, with and without an initial state and a final-state
+/// gradient, at Qwen3.5-2B's shapes (16 heads of 128 by 128, T = 2048, B = 1),
+/// and with the two kernels mixed across the forward/backward seam.
+#[test]
+fn the_chunked_kernels_match_the_sequential_ones() {
+    use GdnTrainKernel::{Chunked, Sequential};
+    with_gpu(|rt| {
+        for (b, t, h, dv, s0, dfin) in [
+            (1, 1, 2, 16, false, false),
+            (2, 63, 3, 32, true, false),
+            (1, 64, 2, 48, false, true),
+            (2, 65, 3, 32, true, true),
+            (1, 130, 4, 16, true, true),
+            (1, 2048, 16, 128, false, false),
+            (1, 2048, 16, 128, true, true),
+        ] {
+            let c = Case::new(b, t, h, dv, 900 + t as u64, s0, dfin);
+            let label = format!("B={b} T={t} H={h} Dv={dv} s0={s0} dfin={dfin}");
+            let oracle = run_dense(rt, &c, Sequential, Sequential);
+            assert_parity(&label, &run_dense(rt, &c, Chunked, Chunked), &oracle);
+            if t <= 130 {
+                assert_parity(
+                    &format!("{label} (chunked fwd, sequential bwd)"),
+                    &run_dense(rt, &c, Chunked, Sequential),
+                    &oracle,
+                );
+                assert_parity(
+                    &format!("{label} (sequential fwd, chunked bwd)"),
+                    &run_dense(rt, &c, Sequential, Chunked),
+                    &oracle,
+                );
+            }
+        }
+    });
+}
+
+/// Grouped heads (several value heads per key head), through windows of one
+/// conv-layout matrix: the chunked forward and backward equal the sequential
+/// ones within `PARITY_TOL`, dq and dk (summed over each key head's value
+/// heads) included.
+#[test]
+fn the_chunked_kernels_match_the_sequential_ones_on_grouped_windows() {
+    use tessl::gdn_train::{
+        gdn_train_backward_windowed, gdn_train_forward_windowed_with, GdnTrainWindowedGrads, GdnTrainWindowedInputs,
+        GdnWindow,
+    };
+    const PAD: usize = 8;
+    with_gpu(|rt| {
+        for (hk, hv, t) in [(2usize, 4usize, 130usize), (1, 3, 65), (4, 16, 200)] {
+            let (b, dv, dk) = (2usize, 32usize, 128usize);
+            let (tokens, qw, vw) = (b * t, hk * dk, hv * dv);
+            let ld = PAD + 2 * qw + vw;
+            let seed = 700 + hv as u64;
+            let conv = tensor(rt, &[tokens, ld], &random_f32(tokens * ld, seed));
+            let n = tokens * hv;
+            let g: Vec<f32> = random_f32(n, seed + 1)
+                .iter()
+                .map(|&x| -0.75 * (x + 1.0) - 1e-3)
+                .collect();
+            let beta: Vec<f32> = random_f32(n, seed + 2).iter().map(|&x| 0.5 + 0.45 * x).collect();
+            let (gt, bt) = (tensor(rt, &[b, t, hv], &g), tensor(rt, &[b, t, hv], &beta));
+            let s0 = tensor(rt, &[b, hv, dk, dv], &random_f32(b * hv * dk * dv, seed + 3));
+            let d_o = tensor(rt, &[b, t, hv, dv], &random_f32(n * dv, seed + 4));
+            let dfin = tensor(rt, &[b, hv, dk, dv], &random_f32(b * hv * dk * dv, seed + 5));
+            let dims = GdnTrainDims {
+                batch: b as u32,
+                seq: t as u32,
+                heads: hv as u32,
+                v_dim: dv as u32,
+            };
+            macro_rules! win {
+                ($t:expr, $off:expr) => {
+                    GdnWindow {
+                        tensor: $t,
+                        ld: ld as u32,
+                        off: $off as u32,
+                    }
+                };
+            }
+            let xw = GdnTrainWindowedInputs {
+                q: win!(&conv, PAD),
+                k: win!(&conv, PAD + qw),
+                v: win!(&conv, PAD + 2 * qw),
+                key_heads: hk as u32,
+                g: &gt,
+                beta: &bt,
+                s0: Some(&s0),
+            };
+            let run = |kernel: GdnTrainKernel| {
+                let (o, sf, ck) = (
+                    sentinel(rt, &[b, t, hv, dv]),
+                    sentinel(rt, &[b, hv, dk, dv]),
+                    sentinel(rt, &dims.checkpoint_shape()),
+                );
+                gdn_train_forward_windowed_with(kernel, rt, dims, xw, &o, Some(&sf), &ck).unwrap();
+                let dconv = sentinel(rt, &[tokens, ld]);
+                let (dg, db, ds0) = (
+                    sentinel(rt, &[b, t, hv]),
+                    sentinel(rt, &[b, t, hv]),
+                    sentinel(rt, &[b, hv, dk, dv]),
+                );
+                let ws = GdnTrainWorkspace::new_for(rt, dims, kernel).unwrap();
+                gdn_train_backward_windowed(
+                    rt,
+                    dims,
+                    xw,
+                    &ck,
+                    &d_o,
+                    Some(&dfin),
+                    &ws,
+                    GdnTrainWindowedGrads {
+                        dq: win!(&dconv, PAD),
+                        dk: win!(&dconv, PAD + qw),
+                        dv: win!(&dconv, PAD + 2 * qw),
+                        dg: &dg,
+                        dbeta: &db,
+                        ds0: Some(&ds0),
+                    },
+                )
+                .unwrap();
+                // The window columns only: the pad is never written.
+                let dc = dconv.read_f32().unwrap();
+                let cols = |from: usize, to: usize| -> Vec<f32> {
+                    (0..tokens)
+                        .flat_map(|r| dc[r * ld + from..r * ld + to].to_vec())
+                        .collect()
+                };
+                assert!(
+                    (0..tokens).all(|r| dc[r * ld..r * ld + PAD].iter().all(|&x| x == SENTINEL)),
+                    "{kernel:?}: the pad columns were written"
+                );
+                Outputs {
+                    names: vec!["o", "final state", "ckpt", "dq", "dk", "dv", "dg", "dbeta", "ds0"],
+                    data: vec![
+                        o.read_f32().unwrap(),
+                        sf.read_f32().unwrap(),
+                        ck.read_f32().unwrap(),
+                        cols(PAD, PAD + qw),
+                        cols(PAD + qw, PAD + 2 * qw),
+                        cols(PAD + 2 * qw, ld),
+                        dg.read_f32().unwrap(),
+                        db.read_f32().unwrap(),
+                        ds0.read_f32().unwrap(),
+                    ],
+                }
+            };
+            let oracle = run(GdnTrainKernel::Sequential);
+            assert_parity(
+                &format!("hk={hk} hv={hv} T={t}"),
+                &run(GdnTrainKernel::Chunked),
+                &oracle,
+            );
+        }
+    });
+}
+
+/// q and k are l2-normalized once per (token, key head): one `gdn_train_c_norm`
+/// dispatch per forward and one per backward, over a grid of chunks x batch x
+/// *key* heads, however many value heads and 16-column slices share them. The
+/// token-sequential kernels normalize inside every one of the Dv / 16 slices'
+/// threadgroups (and the backward again in its finish pass), and never
+/// dispatch it.
+#[test]
+fn q_and_k_are_normalized_once_per_key_head() {
+    common::in_traced_child("q_and_k_are_normalized_once_per_key_head", || {
+        let count = tessl::runtime::traced_kernel_count;
+        with_gpu(|rt| {
+            for (hv, dv) in [(1usize, 16usize), (4, 128), (3, 64)] {
+                let c = Case::new(1, 100, hv, dv, 11, false, false);
+                let norm = count("gdn_train_c_norm");
+                let before = |n: &str| count(n);
+                let (prep, fwd, bwd) = (
+                    before("gdn_train_c_prep"),
+                    before("gdn_train_c_fwd"),
+                    before("gdn_train_c_bwd_a"),
+                );
+                run_dense(rt, &c, GdnTrainKernel::Chunked, GdnTrainKernel::Chunked);
+                assert_eq!(
+                    count("gdn_train_c_norm") - norm,
+                    2,
+                    "hv={hv} dv={dv}: one norm per forward and per backward"
+                );
+                assert_eq!(
+                    count("gdn_train_c_prep") - prep,
+                    2,
+                    "hv={hv} dv={dv}: prep per forward and per backward"
+                );
+                assert_eq!(count("gdn_train_c_fwd") - fwd, 1);
+                assert_eq!(count("gdn_train_c_bwd_a") - bwd, 1);
+                let norm = count("gdn_train_c_norm");
+                run_dense(rt, &c, GdnTrainKernel::Sequential, GdnTrainKernel::Sequential);
+                assert_eq!(
+                    count("gdn_train_c_norm"),
+                    norm,
+                    "the sequential kernels dispatch no norm stage"
+                );
+            }
+        });
     });
 }

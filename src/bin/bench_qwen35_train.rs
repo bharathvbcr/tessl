@@ -21,7 +21,10 @@
 //! random and bounded.
 //!
 //! Every timed op also prints `METRIC op_NAME_ms_t{T} MS` (spaces and `-` in
-//! the name become `_`), for `bench_paired --format metrics`. `--op=NAME`
+//! the name become `_`), for `bench_paired --format metrics`. The `gdn_train`
+//! ops run the production GDN kernel, or with `BENCH_GDN_KERNEL=sequential` /
+//! `chunked` that one (the paired before/after lanes of the chunked-GDN
+//! measurement differ only in this variable). `--op=NAME`
 //! (repeatable, the name as the table prints it, with `_` for spaces) times
 //! only the named ops, after the gate has run on all of them:
 //! `--op=attn_train_forward` is the training attention forward's lane.
@@ -96,7 +99,8 @@ use std::time::Instant;
 use tessl::attn_train::{attn_train_backward, attn_train_forward, AttnTrainDims, AttnTrainGrads, AttnTrainWorkspace};
 use tessl::cross_entropy::{cross_entropy_rows, CeGrads, CeHidden, CeWorkspace, Reduction};
 use tessl::gdn_train::{
-    gdn_train_backward, gdn_train_forward, GdnTrainDims, GdnTrainGrads, GdnTrainInputs, GdnTrainWorkspace,
+    gdn_train_backward, gdn_train_forward_with, GdnTrainDims, GdnTrainGrads, GdnTrainInputs, GdnTrainKernel,
+    GdnTrainWorkspace, GDN_TRAIN_PRODUCTION,
 };
 use tessl::gemm::{cast_bf16_to_f32_into, GemmOperands};
 use tessl::qwen35::{rms_norm, AttnShape, Cols, GdnGateLogits, GdnParams};
@@ -196,6 +200,21 @@ fn gate(rt: &Arc<GpuRuntime>, op: &mut Op<'_>) -> Res<()> {
     Ok(())
 }
 
+/// The GDN kernel the `gdn_train` ops time: `BENCH_GDN_KERNEL=sequential` or
+/// `chunked`, else what production runs ([`GDN_TRAIN_PRODUCTION`]). The paired
+/// before/after lanes differ only in this variable, so both print the same
+/// metric names.
+fn gdn_kernel_from_env() -> Res<GdnTrainKernel> {
+    match std::env::var("BENCH_GDN_KERNEL").as_deref() {
+        Err(std::env::VarError::NotPresent) => Ok(GDN_TRAIN_PRODUCTION),
+        Ok("sequential") => Ok(GdnTrainKernel::Sequential),
+        Ok("chunked") => Ok(GdnTrainKernel::Chunked),
+        other => Err(format!(
+            "BENCH_GDN_KERNEL must be `sequential` or `chunked`, got {other:?}"
+        )),
+    }
+}
+
 /// An op's name as `--op=` and its `METRIC` line spell it: no spaces or `-`.
 fn op_key(name: &str) -> String {
     name.replace([' ', '-'], "_")
@@ -237,7 +256,8 @@ fn bench_t(rt: &Arc<GpuRuntime>, t: usize, check_only: bool, operands: GemmOpera
         rt.alloc_tensor_f32(&gd.checkpoint_shape())?,
     );
     let d_o = tensor(rt, &[1, t, GDN_HEADS, GDN_DV], s(6), 1.0)?;
-    let gws = GdnTrainWorkspace::new(rt, gd)?;
+    let gdn_kernel = gdn_kernel_from_env()?;
+    let gws = GdnTrainWorkspace::new_for(rt, gd, gdn_kernel)?;
     let (dq, dk, dv) = (
         rt.alloc_tensor_f32(&[1, t, GDN_HEADS, GDN_DK])?,
         rt.alloc_tensor_f32(&[1, t, GDN_HEADS, GDN_DK])?,
@@ -385,7 +405,7 @@ fn bench_t(rt: &Arc<GpuRuntime>, t: usize, check_only: bool, operands: GemmOpera
     let mut ops: Vec<Op<'_>> = vec![
         Op {
             name: "gdn_train forward",
-            run: Box::new(|| gdn_train_forward(rt, gd, inputs(), &o, None, &ckpt)),
+            run: Box::new(|| gdn_train_forward_with(gdn_kernel, rt, gd, inputs(), &o, None, &ckpt)),
             outputs: vec![("o", &o.buffer, t * vd)],
             reps: REPS,
         },

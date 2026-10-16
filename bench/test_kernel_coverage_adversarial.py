@@ -143,5 +143,61 @@ class Census(unittest.TestCase):
         self.assertIn("host_name", str(cm.exception))
 
 
+class Allowlist(unittest.TestCase):
+    """The committed allowlist stands in for a bench lane only while it is true."""
+
+    def crate(self, allowlist_text):
+        d = tempfile.mkdtemp()
+        os.makedirs(os.path.join(d, "tests"))
+        with open(os.path.join(d, "tests", "t.rs"), "w") as f:
+            f.write("// the kernel's only caller\n")
+        path = os.path.join(d, "allow.txt")
+        with open(path, "w") as f:
+            f.write(allowlist_text)
+        return d, path
+
+    def load(self, text):
+        d, path = self.crate(text)
+        return kernel_coverage.load_allowlist(path, d)
+
+    def test_an_entry_names_its_class_and_an_existing_file(self):
+        got = self.load("# comment\nk_one: test-only: tests/t.rs the only caller\n\n"
+                        "k_two: probe: tests/t.rs  # trailing comment\n")
+        self.assertEqual(got, {"k_one": "test-only: tests/t.rs the only caller",
+                               "k_two": "probe: tests/t.rs"})
+
+    def test_a_bare_class_is_not_a_reason(self):
+        for line in ("k: test-only\n", "k: test-only:\n", "k:\n", "k\n"):
+            with self.assertRaises(SystemExit, msg=line):
+                self.load(line)
+
+    def test_a_reason_must_name_a_file_that_exists(self):
+        with self.assertRaises(SystemExit) as cm:
+            self.load("k: test-only: tests/gone.rs it used to be here\n")
+        self.assertIn("exist", str(cm.exception))
+
+    def test_an_unknown_class_is_refused(self):
+        with self.assertRaises(SystemExit) as cm:
+            self.load("k: whim: tests/t.rs\n")
+        self.assertIn("class", str(cm.exception))
+
+    def test_a_kernel_listed_twice_is_refused(self):
+        with self.assertRaises(SystemExit) as cm:
+            self.load("k: probe: tests/t.rs\nk: probe: tests/t.rs\n")
+        self.assertIn("twice", str(cm.exception))
+
+    def test_a_missing_file_is_an_empty_allowlist(self):
+        self.assertEqual(kernel_coverage.load_allowlist("/nonexistent/allow.txt"), {})
+
+    def test_stale_and_redundant_entries_are_found(self):
+        names = {"a", "b", "c"}
+        allowed = {"gone": "x", "b": "x", "c": "x"}
+        stale, redundant = kernel_coverage.audit_allowlist(allowed, names, traced={"a", "c"})
+        self.assertEqual((stale, redundant), (["gone"], ["c"]))
+
+    def test_a_consistent_allowlist_has_nothing_to_report(self):
+        self.assertEqual(kernel_coverage.audit_allowlist({"b": "x"}, {"a", "b"}, {"a"}), ([], []))
+
+
 if __name__ == "__main__":
     unittest.main()

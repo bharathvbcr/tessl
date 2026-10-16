@@ -67,6 +67,14 @@
 //! weights, e.g. the 4B's r = 2 grouped heads; use `--storage=bf16`). The
 //! per-op gate still runs at the 2B's shapes.
 //!
+//! `--adamw-matrix` (with `--random-config=PATH`, no checkpoint) runs one AdamW
+//! step of every update rule x moment storage x gradient dtype combination
+//! `qwen35_adamw` has a kernel for, on a random tower at that config's shapes:
+//! an f32 tower under `UpdateRule::F32`, and a bf16 tower under each bf16 rule
+//! with a fresh f32 gradient set and with a bf16 bank. It is what puts every
+//! step kernel in `bench/kernel_coverage.py`'s trace; it times nothing the
+//! `--clip` lane does not.
+//!
 //! `--async` runs the step under [`GpuRuntime::set_async_encode`] (one command
 //! buffer between the waits the step itself makes); without it every
 //! dispatch is a waited commit, as on a runtime nobody switched (ojas-qwen35's
@@ -905,6 +913,79 @@ fn bench_clip(model: &Qwen35Model, tokens: usize, operands: GemmOperands) -> Res
     Ok(())
 }
 
+/// The gradient sets one AdamW step of `model` can take: a fresh f32 set from
+/// `train_step`, and on a bf16 tower also the bf16 bank `train_step_into` fills.
+fn adamw_gradients(model: &Qwen35Model, ids: &[u32], operands: GemmOperands) -> Res<Vec<(&'static str, Qwen35Grads)>> {
+    let mut sets = vec![("gf32", model.train_step(ids, operands)?.grads)];
+    if model.precision() == Precision::Bf16 {
+        let bank = Qwen35Grads::zeros_like(model)?;
+        model.train_step_into(ids, operands, Supervise::Causal, &bank, false)?;
+        sets.push(("gbf16", bank));
+    }
+    Ok(sets)
+}
+
+/// One AdamW step under every [`AdamWConfig`] a tower of each precision
+/// accepts, with every gradient set it takes (see `--adamw-matrix`). Each step
+/// must leave a finite, non-zero gradient norm behind it and advance its
+/// state's step count.
+fn bench_adamw_matrix(rt: &Arc<GpuRuntime>, config_path: &str) -> Res<()> {
+    let moments = [
+        (MomentStorage::F32, "f32"),
+        (MomentStorage::Bf16, "bf16"),
+        (MomentStorage::Block8, "q8"),
+    ];
+    let bf16_rules = [
+        (UpdateRule::F32Master, "master"),
+        (UpdateRule::Bf16Kahan, "kahan"),
+        (UpdateRule::Bf16Stochastic { seed: 7 }, "sr"),
+    ];
+    for (precision, operands, rules) in [
+        (
+            Precision::F32,
+            GemmOperands::ExactF32,
+            &[(UpdateRule::F32, "plain")][..],
+        ),
+        (Precision::Bf16, GemmOperands::Bf16, &bf16_rules[..]),
+    ] {
+        let cfg = Qwen35Config::from_config_file(std::path::Path::new(config_path))?;
+        let ids: Vec<u32> = (0..16u32).map(|i| (i * 7 + 3) % cfg.vocab).collect();
+        let model = Qwen35Model::random_tower(rt, cfg, precision, 1)?;
+        let wd = model.default_weight_decay(0.01)?;
+        for (gname, grads) in adamw_gradients(&model, &ids, operands)? {
+            let sq = model.grad_sq_norm(&grads)?;
+            if !(sq.is_finite() && sq > 0.0) {
+                return Err(format!("--adamw-matrix: {precision:?} {gname} gradient norm^2 is {sq}"));
+            }
+            for &(update, rule) in rules {
+                for &(moments, mom) in &moments {
+                    let mut state = AdamW::with_config(&model, AdamWConfig { update, moments })?;
+                    let hyper = AdamWHyper {
+                        lr: 1e-9,
+                        beta1: 0.9,
+                        beta2: 0.999,
+                        eps: 1e-8,
+                        grad_scale: 1.0,
+                    };
+                    let t0 = Instant::now();
+                    model.adamw_step(&grads, &mut state, &hyper, &wd)?;
+                    if state.step_count() != 1 {
+                        return Err(format!(
+                            "--adamw-matrix: {precision:?} {rule} {gname} m{mom}: step count {}",
+                            state.step_count()
+                        ));
+                    }
+                    println!(
+                        "adamw {precision:?} {rule} {gname} m{mom}: {:.2} ms",
+                        t0.elapsed().as_secs_f64() * 1e3
+                    );
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 /// One `--batch` shape: `rows` sequences of `len` tokens; `span` of them (the
 /// last ones) take a loss outside tessl instead of a supervised position.
 #[derive(Clone, Copy, Debug)]
@@ -1026,10 +1107,19 @@ fn bench_batch(rt: &Arc<GpuRuntime>, model: &Qwen35Model, b: BatchShape, operand
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Every exit path, an error included, prints the kernel trace (a no-op
+    // unless `TESSL_KERNEL_TRACE` is set; `bench/kernel_coverage.py` reads it).
+    let outcome = run();
+    common::emit_kernel_trace();
+    outcome
+}
+
+fn run() -> Result<(), Box<dyn std::error::Error>> {
     let (mut check_only, mut step, mut ts, mut operands) = (false, None, Vec::new(), GemmOperands::ExactF32);
     let (mut batches, mut step_only, mut async_encode, mut clip) = (Vec::new(), false, false, None);
     let (mut storage, mut random_config) = (Precision::F32, None::<String>);
     let mut raw_only: Vec<String> = Vec::new();
+    let mut adamw_matrix = false;
     for arg in std::env::args().skip(1) {
         if arg == "--bf16" {
             operands = GemmOperands::Bf16;
@@ -1045,6 +1135,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             check_only = true;
         } else if let Some(v) = arg.strip_prefix("--op=") {
             raw_only.push(v.to_string());
+        } else if arg == "--adamw-matrix" {
+            adamw_matrix = true;
         } else if arg == "--step-only" {
             step_only = true;
         } else if arg == "--async" {
@@ -1067,7 +1159,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let t: usize = arg.parse().map_err(|_| {
                 format!(
                     "expected a token count, --check-only, --step-only, --bf16, --storage=f32|bf16, --async, \
-                     --random-config=PATH, --op=NAME, --step=N, --clip=N or --batch=B,L[,S], got {arg:?}"
+                     --adamw-matrix, --random-config=PATH, --op=NAME, --step=N, --clip=N or --batch=B,L[,S], got {arg:?}"
                 )
             })?;
             if t < 2 {
@@ -1082,6 +1174,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         if !batches.is_empty() {
             return Err("--batch runs on f32 storage only".into());
         }
+    }
+    if adamw_matrix && random_config.is_none() {
+        return Err("--adamw-matrix needs --random-config=PATH (a tower at that config's shapes)".into());
     }
     let only = parse_op_filters(&raw_only)?;
     // The per-op gate runs first whatever else is asked: no timing without it.
@@ -1098,6 +1193,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("device: {}", rt.device_name());
         for t in ts {
             bench_t(&rt, t, check_only || step_only, operands, &only)?;
+        }
+        if adamw_matrix && !check_only {
+            if let Some(path) = random_config.as_deref() {
+                bench_adamw_matrix(&rt, path)?;
+            }
         }
         let model_runs = step.is_some() || clip.is_some() || !batches.is_empty();
         if check_only || !model_runs {

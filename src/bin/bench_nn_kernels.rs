@@ -394,6 +394,10 @@ fn kernel_table(rt: &Arc<GpuRuntime>, warmup: usize, iters: usize) -> Result<(),
         rows.push(row);
     }
 
+    decode_lanes(&rt, &mut rows, warmup, iters)?;
+    q4_mlx_lanes(&rt, &mut rows, warmup, iters)?;
+    encoder_lanes(&rt, &mut rows, warmup, iters)?;
+
     println!(
         "{:<38} {:>16} {:>12} {:>10} {:>12} {:>10}",
         "kernel", "shape", "batched us", "host us", "solo us", "GB/s"
@@ -422,6 +426,912 @@ fn kernel_table(rt: &Arc<GpuRuntime>, warmup: usize, iters: usize) -> Result<(),
          alone."
     );
     Ok(())
+}
+
+// ======================================================================
+// Coverage lanes: the public `nn::`, `bert::` and `embedgemma2::` ops a
+// consumer calls that the table above did not time. `bench/kernel_coverage.py`
+// reads which kernels this binary dispatched, so each lane is an entry point's
+// reason to be in the metallib. Shapes are a model's own (a decode step's, a
+// 4096 x 2048 projection, BERT-base's 768); correctness is checked by the
+// tests, so a lane only asserts that its kernel wrote finite output.
+// ======================================================================
+
+/// Elements of `buf` read back as f32, which must all be finite.
+fn assert_finite(what: &str, got: &[f32]) {
+    assert!(got.iter().all(|v| v.is_finite()), "{what}: produced a non-finite value");
+}
+
+/// For an op that rewrites its operand: seed `buf` with `seed`, run the op once
+/// and require finite output that differs from the seed somewhere (an op that
+/// wrote nothing leaves the seed). `reset` is not needed between timed calls:
+/// every in-place lane here is stable under repetition.
+fn verify_inplace(
+    rt: &Arc<GpuRuntime>,
+    what: &str,
+    buf_: &GpuBuffer,
+    seed: &[f32],
+    mut f: impl FnMut() -> Result<(), String>,
+) -> Result<(), String> {
+    buf_.write_f32(seed);
+    f()?;
+    rt.synchronize()?;
+    let got = buf_.read_f32();
+    assert_finite(what, &got);
+    assert!(
+        got.iter().zip(seed).any(|(g, s)| g != s),
+        "{what}: the operand was not rewritten"
+    );
+    Ok(())
+}
+
+/// [`verify`] for a bf16 output: seeded with 0xFFFF (a NaN), so every element
+/// must have been written, and written finite.
+fn verify_bf16(
+    rt: &Arc<GpuRuntime>,
+    what: &str,
+    out: &GpuBuffer,
+    elems: usize,
+    mut f: impl FnMut() -> Result<(), String>,
+) -> Result<(), String> {
+    out.write_bytes(&vec![0xFF; elems * 2]);
+    f()?;
+    rt.synchronize()?;
+    let got = out.contents_u16().to_vec();
+    let finite = |h: u16| h & 0x7F80 != 0x7F80;
+    assert!(
+        got[..elems].iter().all(|&h| finite(h)),
+        "{what}: bf16 output has a NaN, Inf, or element that was never written"
+    );
+    Ok(())
+}
+
+/// Seed `out`, run, and require that the kernel wrote some elements and left
+/// every element either unwritten or finite: for a kernel that writes only a
+/// live part of a larger buffer.
+fn verify_partial(
+    rt: &Arc<GpuRuntime>,
+    what: &str,
+    out: &GpuBuffer,
+    elems: usize,
+    mut f: impl FnMut() -> Result<(), String>,
+) -> Result<(), String> {
+    out.write_f32(&vec![UNWRITTEN; elems]);
+    f()?;
+    rt.synchronize()?;
+    let got = out.read_f32();
+    assert_finite(what, &got);
+    assert!(got.iter().any(|v| *v != UNWRITTEN), "{what}: wrote nothing");
+    Ok(())
+}
+
+/// Time `f` into `rows` once its checker has passed.
+#[allow(clippy::too_many_arguments)]
+fn lane(
+    rt: &Arc<GpuRuntime>,
+    rows: &mut Vec<Row>,
+    name: &str,
+    shape: &str,
+    bytes: f64,
+    warmup: usize,
+    iters: usize,
+    f: impl FnMut() -> Result<(), String>,
+) -> Result<(), String> {
+    rows.push(measure(rt, name, shape, bytes, warmup, iters, f)?);
+    Ok(())
+}
+
+fn u32_buf(rt: &Arc<GpuRuntime>, data: &[u32]) -> Result<GpuBuffer, String> {
+    let b = rt.alloc_buffer(data.len().max(1) * 4)?;
+    b.write_u32(data);
+    Ok(b)
+}
+
+fn bf16_buf(rt: &Arc<GpuRuntime>, n: usize, seed: u64) -> Result<GpuBuffer, String> {
+    let b = rt.alloc_buffer(n * 2)?;
+    b.write_bf16_bits(&tessl::tensor::f32_slice_to_bf16(&common::fill(n, seed)));
+    Ok(b)
+}
+
+/// An MLX Q4 bank of `rows x cols` weights in `group`-sized groups, stored
+/// padded to a multiple of `tile` rows: random nibbles, and a finite bf16
+/// (scale, bias) pair per group.
+fn mlx_bank(
+    rt: &Arc<GpuRuntime>,
+    rows: usize,
+    cols: usize,
+    group: usize,
+    tile: usize,
+) -> Result<(GpuBuffer, GpuBuffer), String> {
+    let stored = rows.next_multiple_of(tile);
+    let packed = rt.alloc_buffer(stored * cols / 2)?;
+    packed.write_bytes(&(0..stored * cols / 2).map(|i| (i % 251) as u8).collect::<Vec<u8>>());
+    let groups = stored * (cols / group);
+    let word =
+        u32::from(tessl::tensor::f32_to_bf16_bits(0.02)) | (u32::from(tessl::tensor::f32_to_bf16_bits(-0.1)) << 16);
+    let sb = u32_buf(rt, &vec![word; groups])?;
+    Ok((packed, sb))
+}
+
+/// The decode step's elementwise, KV-cache, RoPE, sampler and attention ops.
+fn decode_lanes(rt: &Arc<GpuRuntime>, rows: &mut Vec<Row>, warmup: usize, iters: usize) -> Result<(), String> {
+    // ---- bf16-output norm and MLP gate, the residual-fused norm, scale ----
+    for &(r, d) in &[(1usize, 4096usize), (512, 4096)] {
+        let x = buf(rt, &common::fill(r * d, 0x71));
+        let w = buf(rt, &common::fill(d, 0x72));
+        let o = rt.alloc_buffer(r * d * 2)?;
+        let run = || nn::rms_norm_bf16(rt, &x, &w, &o, r as u32, d as u32, 1e-6);
+        verify_bf16(rt, "rms_norm_bf16", &o, r * d, run)?;
+        lane(
+            rt,
+            rows,
+            "rms_norm_bf16",
+            &format!("{r}x{d}"),
+            ((r * d * 6) + d * 4) as f64,
+            warmup,
+            iters,
+            run,
+        )?;
+
+        let resid = buf(rt, &common::fill(r * d, 0x73));
+        let seed = common::fill(r * d, 0x73);
+        let run = || nn::rms_norm_residual_add_f32(rt, &x, &w, &resid, r as u32, d as u32, 1e-6, 0.01);
+        verify_inplace(rt, "rms_norm_residual_add_f32", &resid, &seed, run)?;
+        lane(
+            rt,
+            rows,
+            "rms_norm_residual_add_f32",
+            &format!("{r}x{d}"),
+            ((3 * r * d + d) * 4) as f64,
+            warmup,
+            iters,
+            run,
+        )?;
+    }
+    let n = 1usize << 20;
+    let g = buf(rt, &common::fill(n, 0x74));
+    let u = buf(rt, &common::fill(n, 0x75));
+    let o = rt.alloc_buffer(n * 2)?;
+    let run = || nn::mlp_gelu_tanh_bf16(rt, &g, &u, &o, n as u32);
+    verify_bf16(rt, "mlp_gelu_tanh_bf16", &o, n, run)?;
+    lane(
+        rt,
+        rows,
+        "mlp_gelu_tanh_bf16",
+        &format!("n={n}"),
+        (n * 10) as f64,
+        warmup,
+        iters,
+        run,
+    )?;
+
+    let x = buf(rt, &common::fill(n, 0x76));
+    let seed = common::fill(n, 0x76);
+    let run = || nn::scale_f32_inplace(rt, &x, 0.999, n as u32);
+    verify_inplace(rt, "scale_f32_inplace", &x, &seed, run)?;
+    lane(
+        rt,
+        rows,
+        "scale_f32_inplace",
+        &format!("n={n}"),
+        (n * 8) as f64,
+        warmup,
+        iters,
+        run,
+    )?;
+
+    // ---- KV cache: one timestep in, a ring read back dense ----
+    let (n_kv, cap) = (1024usize, 1024usize * 64);
+    let src_k = buf(rt, &common::fill(n_kv, 0x77));
+    let src_v = buf(rt, &common::fill(n_kv, 0x78));
+    let dst_k = out_buf(rt, cap);
+    let dst_v = out_buf(rt, cap);
+    let at = 1024usize * 3;
+    let off = u32_buf(rt, &[at as u32])?;
+    let want_k = src_k.read_f32();
+    let want_v = src_v.read_f32();
+    dst_k.write_f32(&vec![UNWRITTEN; cap]);
+    nn::kv_store_timestep(rt, &src_k, &dst_k, &off, n_kv as u32, cap as u32)?;
+    rt.synchronize()?;
+    assert_eq!(
+        &dst_k.read_f32()[at..at + n_kv],
+        &want_k[..],
+        "kv_store_timestep: wrong timestep"
+    );
+    lane(
+        rt,
+        rows,
+        "kv_store_timestep",
+        &format!("n={n_kv}"),
+        (n_kv * 8) as f64,
+        warmup,
+        iters,
+        || nn::kv_store_timestep(rt, &src_k, &dst_k, &off, n_kv as u32, cap as u32),
+    )?;
+    dst_k.write_f32(&vec![UNWRITTEN; cap]);
+    dst_v.write_f32(&vec![UNWRITTEN; cap]);
+    nn::kv_store_timestep_pair(rt, &src_k, &src_v, &dst_k, &dst_v, &off, n_kv as u32, cap as u32)?;
+    rt.synchronize()?;
+    assert_eq!(
+        &dst_k.read_f32()[at..at + n_kv],
+        &want_k[..],
+        "kv_store_timestep_pair: wrong K"
+    );
+    assert_eq!(
+        &dst_v.read_f32()[at..at + n_kv],
+        &want_v[..],
+        "kv_store_timestep_pair: wrong V"
+    );
+    lane(
+        rt,
+        rows,
+        "kv_store_timestep_pair",
+        &format!("n={n_kv}"),
+        (n_kv * 16) as f64,
+        warmup,
+        iters,
+        || nn::kv_store_timestep_pair(rt, &src_k, &src_v, &dst_k, &dst_v, &off, n_kv as u32, cap as u32),
+    )?;
+
+    let (slot, ring) = (1024usize, 64usize);
+    let ring_src = buf(rt, &common::fill(slot * ring, 0x79));
+    let dense = out_buf(rt, slot * ring);
+    let filled = u32_buf(rt, &[48])?;
+    let start = u32_buf(rt, &[20])?;
+    let run = || nn::kv_ring_densify(rt, &ring_src, &dense, &filled, &start, slot as u32, ring as u32);
+    verify_partial(rt, "kv_ring_densify", &dense, slot * ring, run)?;
+    lane(
+        rt,
+        rows,
+        "kv_ring_densify",
+        &format!("{ring}x{slot}"),
+        (slot * 48 * 8) as f64,
+        warmup,
+        iters,
+        run,
+    )?;
+
+    // ---- fused per-head RMSNorm + RoPE, the three entry points ----
+    let dims = nn::QkvRopeDims {
+        t: 1,
+        heads_q: 8,
+        heads_kv: 2,
+        head_dim: 256,
+        rotary_dim: 64,
+        theta: 10_000.0,
+        eps: 1e-6,
+    };
+    let (q_n, kv_n) = (8 * 256, 2 * 256);
+    let q = buf(rt, &common::fill(q_n, 0x7A));
+    let k = buf(rt, &common::fill(kv_n, 0x7B));
+    let v = buf(rt, &common::fill(kv_n, 0x7C));
+    let (qw, kw, vw) = (
+        buf(rt, &common::fill(256, 0x7D)),
+        buf(rt, &common::fill(256, 0x7E)),
+        buf(rt, &common::fill(256, 0x7F)),
+    );
+    let pos = u32_buf(rt, &[5])?;
+    let kcap = kv_n * 16;
+    let (ck, cv) = (out_buf(rt, kcap), out_buf(rt, kcap));
+    let kv_at = u32_buf(rt, &[kv_n as u32])?;
+    let seed_q = common::fill(q_n, 0x7A);
+    for (variant, name) in [
+        (nn::QkvRopeVariant::PosConst, "rms_qkv_rope"),
+        (nn::QkvRopeVariant::PosBuffer, "rms_qkv_rope_posbuf"),
+        (nn::QkvRopeVariant::PosBufferKvStore, "rms_qkv_rope_kv_store"),
+    ] {
+        let run = || {
+            nn::rms_qkv_rope(
+                rt,
+                variant,
+                nn::QkvBuffers {
+                    q: &q,
+                    k: &k,
+                    v: &v,
+                    q_weight: &qw,
+                    k_weight: &kw,
+                    v_weight: &vw,
+                },
+                dims,
+                5,
+                (variant != nn::QkvRopeVariant::PosConst).then_some(&pos),
+                (variant == nn::QkvRopeVariant::PosBufferKvStore).then_some(nn::KvStoreTarget {
+                    dst_k: &ck,
+                    dst_v: &cv,
+                    dst_offset: &kv_at,
+                    capacity: kcap as u32,
+                }),
+                false,
+            )
+        };
+        verify_inplace(rt, name, &q, &seed_q, run)?;
+        lane(
+            rt,
+            rows,
+            name,
+            "1 pos, 8q/2kv x 256",
+            ((q_n + 2 * kv_n) * 8) as f64,
+            warmup,
+            iters,
+            run,
+        )?;
+    }
+
+    // ---- samplers over the vocabulary ----
+    let logits = buf(rt, &common::fill(VOCAB, 0x81));
+    let cap_buf = buf(rt, &[30.0]);
+    let seed_logits = common::fill(VOCAB, 0x81);
+    let run = || nn::softcap_logits(rt, &logits, &cap_buf, VOCAB as u32);
+    verify_inplace(rt, "softcap_logits", &logits, &seed_logits, run)?;
+    lane(
+        rt,
+        rows,
+        "softcap_logits",
+        &format!("n={VOCAB}"),
+        (VOCAB * 8) as f64,
+        warmup,
+        iters,
+        run,
+    )?;
+    logits.write_f32(&seed_logits);
+    let tok = u32_buf(rt, &[u32::MAX])?;
+    let run = || nn::softcap_sample(rt, &logits, &tok, &cap_buf, VOCAB as u32);
+    run()?;
+    rt.synchronize()?;
+    let t = nn::check_argmax_result(&tok)?;
+    assert!(
+        (t as usize) < VOCAB,
+        "softcap_sample: token {t} is outside the vocabulary"
+    );
+    lane(
+        rt,
+        rows,
+        "softcap_sample",
+        &format!("n={VOCAB}"),
+        (VOCAB * 4) as f64,
+        warmup,
+        iters,
+        run,
+    )?;
+
+    // ---- D=64 row-parallel attention: the one head dim bench_flash_attn has no config for ----
+    let (tq, h, hkv, d) = (128usize, 8usize, 2usize, 64usize);
+    let dims = nn::AttnDims {
+        batch: 1,
+        tq: tq as u32,
+        heads: h as u32,
+        heads_kv: hkv as u32,
+        window: 0,
+        scale: 0.125,
+    };
+    let aq = buf(rt, &common::fill_affine(tq * h * d, 0x91, 0.125, 0.0));
+    let ak = buf(rt, &common::fill_affine(tq * hkv * d, 0x92, 0.125, 0.0));
+    let av = buf(rt, &common::fill(tq * hkv * d, 0x93));
+    let ao = out_buf(rt, tq * h * d);
+    let (tkv, zero) = (u32_buf(rt, &[tq as u32])?, u32_buf(rt, &[0])?);
+    let run = || nn::flash_attn_rows(rt, &aq, &ak, &av, &ao, &tkv, &zero, &zero, dims, d as u32, false);
+    verify(rt, "flash_attn_rows d=64", &ao, tq * h * d, run)?;
+    lane(
+        rt,
+        rows,
+        "flash_attn_rows",
+        &format!("d={d} tq={tq}"),
+        ((2 * tq * h + 2 * tq * hkv) * d * 4) as f64,
+        warmup,
+        iters,
+        run,
+    )?;
+    Ok(())
+}
+
+/// MLX Q4 projections, the embedding lookups, and the Q4 GEMM.
+fn q4_mlx_lanes(rt: &Arc<GpuRuntime>, rows: &mut Vec<Row>, warmup: usize, iters: usize) -> Result<(), String> {
+    use nn::{GateUpDispatch, Q4MlxBank, Q4MlxLayout, Q4MlxRowVariant};
+    let (r, c, group) = (4096usize, 2048usize, 64usize);
+    let shape = nn::QuantShape {
+        rows: r as u32,
+        cols: c as u32,
+        group_size: group as u32,
+    };
+    let x_f32 = buf(rt, &common::fill(c, 0xA1));
+    let x_bf16 = bf16_buf(rt, c, 0xA1)?;
+    let y = out_buf(rt, r);
+    let weight_bytes = (r * c / 2 + r * (c / group) * 4 + c * 4 + r * 4) as f64;
+    let sh = format!("{r}x{c}");
+
+    // Row-major bank: the three one-thread-per-row variants and the simdgroup kernel.
+    let (packed, sb) = mlx_bank(rt, r, c, group, 1)?;
+    let bank = Q4MlxBank {
+        packed: &packed,
+        scales_biases: &sb,
+    };
+    for (variant, name) in [
+        (Q4MlxRowVariant::Standard, "gemv_q4_mlx"),
+        (Q4MlxRowVariant::Wide, "gemv_q4_mlx_wide"),
+        (Q4MlxRowVariant::Tiled, "gemv_q4_mlx_tiled"),
+    ] {
+        let run = || nn::gemv_q4_mlx(rt, bank, &x_f32, &y, shape, variant);
+        verify(rt, name, &y, r, run)?;
+        lane(rt, rows, name, &sh, weight_bytes, warmup, iters, run)?;
+    }
+    let run = || nn::gemv_q4_mlx_simd(rt, bank, &x_bf16, &y, shape, Q4MlxLayout::RowMajor, None);
+    verify(rt, "gemv_q4_mlx_simd", &y, r, run)?;
+    lane(rt, rows, "gemv_q4_mlx_simd", &sh, weight_bytes, warmup, iters, run)?;
+    // The residual-adding form accumulates into `y`, so it starts from finite values.
+    let seed_y = common::fill(r, 0xA2);
+    let run = || nn::gemv_q4_mlx_simd(rt, bank, &x_bf16, &y, shape, Q4MlxLayout::RowMajor, Some(&y));
+    verify_inplace(rt, "gemv_q4_mlx_simd_add", &y, &seed_y, run)?;
+    lane(rt, rows, "gemv_q4_mlx_simd_add", &sh, weight_bytes, warmup, iters, run)?;
+
+    // Block-interleaved (16-row tile) bank for the blocked kernels, f32 activations.
+    let (bpacked, bsb) = mlx_bank(rt, r, c, group, 16)?;
+    let blocked = Q4MlxBank {
+        packed: &bpacked,
+        scales_biases: &bsb,
+    };
+    let run = || nn::gemv_q4_mlx_blocked(rt, blocked, &x_f32, &y, shape);
+    verify(rt, "gemv_q4_mlx_blocked", &y, r, run)?;
+    lane(rt, rows, "gemv_q4_mlx_blocked", &sh, weight_bytes, warmup, iters, run)?;
+
+    // 4-row interleaved bank: the `_i4` entry points.
+    let (ipacked, isb) = mlx_bank(rt, r, c, group, 4)?;
+    let i4 = Q4MlxBank {
+        packed: &ipacked,
+        scales_biases: &isb,
+    };
+    let run = || nn::gemv_q4_mlx_simd(rt, i4, &x_bf16, &y, shape, Q4MlxLayout::Interleaved4, None);
+    verify(rt, "gemv_q4_mlx_simd_i4", &y, r, run)?;
+    lane(rt, rows, "gemv_q4_mlx_simd_i4", &sh, weight_bytes, warmup, iters, run)?;
+    let run = || nn::gemv_q4_mlx_simd(rt, i4, &x_bf16, &y, shape, Q4MlxLayout::Interleaved4, Some(&y));
+    verify_inplace(rt, "gemv_q4_mlx_simd_add_i4", &y, &seed_y, run)?;
+    lane(
+        rt,
+        rows,
+        "gemv_q4_mlx_simd_add_i4",
+        &sh,
+        weight_bytes,
+        warmup,
+        iters,
+        run,
+    )?;
+
+    // Fused gate/up GELU: simdgroup (both layouts) and blocked.
+    let mid = out_buf(rt, r);
+    let (gpacked, gsb) = mlx_bank(rt, r, c, group, 1)?;
+    let gate_rm = Q4MlxBank {
+        packed: &gpacked,
+        scales_biases: &gsb,
+    };
+    let (gi_packed, gi_sb) = mlx_bank(rt, r, c, group, 4)?;
+    let gate_i4 = Q4MlxBank {
+        packed: &gi_packed,
+        scales_biases: &gi_sb,
+    };
+    let (bg_packed, bg_sb) = mlx_bank(rt, r, c, group, 16)?;
+    let gate_blocked = Q4MlxBank {
+        packed: &bg_packed,
+        scales_biases: &bg_sb,
+    };
+    for (dispatch, gate, up, x, name) in [
+        (
+            GateUpDispatch::Simd(Q4MlxLayout::RowMajor),
+            gate_rm,
+            bank,
+            &x_bf16,
+            "gemv_q4_mlx_simd_gate_up_gelu",
+        ),
+        (
+            GateUpDispatch::Simd(Q4MlxLayout::Interleaved4),
+            gate_i4,
+            i4,
+            &x_bf16,
+            "gemv_q4_mlx_simd_gate_up_gelu_i4",
+        ),
+        (
+            GateUpDispatch::Blocked,
+            gate_blocked,
+            blocked,
+            &x_f32,
+            "gemv_q4_mlx_blocked_gate_up_gelu",
+        ),
+    ] {
+        let run = || nn::gemv_q4_mlx_gate_up_gelu(rt, gate, up, x, &mid, shape, dispatch, false);
+        verify(rt, name, &mid, r, run)?;
+        lane(rt, rows, name, &sh, 2.0 * weight_bytes, warmup, iters, run)?;
+    }
+
+    // Fused K+V and Q+K+V projections, both layouts.
+    let rows_kv = 1024usize;
+    let kv_shape = nn::QuantShape {
+        rows: rows_kv as u32,
+        cols: c as u32,
+        group_size: group as u32,
+    };
+    let (k_out, v_out) = (out_buf(rt, rows_kv), out_buf(rt, rows_kv));
+    for (layout, tile, name) in [
+        (Q4MlxLayout::RowMajor, 1usize, "gemv_q4_mlx_simd_kv"),
+        (Q4MlxLayout::Interleaved4, 4, "gemv_q4_mlx_simd_kv_i4"),
+    ] {
+        let (kp, ks) = mlx_bank(rt, rows_kv, c, group, tile)?;
+        let (vp, vs) = mlx_bank(rt, rows_kv, c, group, tile)?;
+        let (kb, vb) = (
+            Q4MlxBank {
+                packed: &kp,
+                scales_biases: &ks,
+            },
+            Q4MlxBank {
+                packed: &vp,
+                scales_biases: &vs,
+            },
+        );
+        v_out.write_f32(&vec![UNWRITTEN; rows_kv]);
+        let run = || nn::gemv_q4_mlx_kv(rt, kb, vb, &x_bf16, &k_out, &v_out, kv_shape, layout);
+        verify(rt, name, &k_out, rows_kv, run)?;
+        assert_wrote_everything(name, &v_out, rows_kv);
+        lane(
+            rt,
+            rows,
+            name,
+            &format!("2x{rows_kv}x{c}"),
+            weight_bytes / 2.0,
+            warmup,
+            iters,
+            run,
+        )?;
+
+        let (qp, qs) = mlx_bank(rt, r, c, group, tile)?;
+        let qb = Q4MlxBank {
+            packed: &qp,
+            scales_biases: &qs,
+        };
+        let name = if tile == 1 {
+            "gemv_q4_mlx_simd_qkv"
+        } else {
+            "gemv_q4_mlx_simd_qkv_i4"
+        };
+        let q_out = out_buf(rt, r);
+        let run = || {
+            nn::gemv_q4_mlx_qkv(
+                rt,
+                qb,
+                kb,
+                vb,
+                &x_bf16,
+                nn::QkvOutputs {
+                    q_out: &q_out,
+                    k_out: &k_out,
+                    v_out: &v_out,
+                },
+                r as u32,
+                rows_kv as u32,
+                c as u32,
+                group as u32,
+                layout,
+            )
+        };
+        k_out.write_f32(&vec![UNWRITTEN; rows_kv]);
+        v_out.write_f32(&vec![UNWRITTEN; rows_kv]);
+        verify(rt, name, &q_out, r, run)?;
+        assert_wrote_everything(name, &k_out, rows_kv);
+        assert_wrote_everything(name, &v_out, rows_kv);
+        lane(
+            rt,
+            rows,
+            name,
+            &format!("{r}+2x{rows_kv}x{c}"),
+            weight_bytes * 1.5,
+            warmup,
+            iters,
+            run,
+        )?;
+    }
+
+    // The Q4 GEMM, a few activation rows at a time (a speculative-decode or tiny-batch step).
+    let m = 4usize;
+    let xm = bf16_buf(rt, m * c, 0xA3)?;
+    let ym = out_buf(rt, m * r);
+    let seed_ym = common::fill(m * r, 0xA4);
+    for (layout, b_, tag) in [
+        (Q4MlxLayout::RowMajor, bank, ""),
+        (Q4MlxLayout::Interleaved4, i4, "_i4"),
+    ] {
+        let name = format!("gemm_q4_mlx_simd{tag}");
+        let run = || nn::gemm_q4_mlx(rt, b_, &xm, &ym, shape, m as u32, layout, None);
+        verify(rt, &name, &ym, m * r, run)?;
+        lane(
+            rt,
+            rows,
+            &name,
+            &format!("m={m} {sh}"),
+            weight_bytes,
+            warmup,
+            iters,
+            run,
+        )?;
+        let name = format!("gemm_q4_mlx_simd_add{tag}");
+        let run = || nn::gemm_q4_mlx(rt, b_, &xm, &ym, shape, m as u32, layout, Some(&ym));
+        verify_inplace(rt, &name, &ym, &seed_ym, run)?;
+        lane(
+            rt,
+            rows,
+            &name,
+            &format!("m={m} {sh}"),
+            weight_bytes,
+            warmup,
+            iters,
+            run,
+        )?;
+    }
+
+    // Embedding lookups: the f32-scale/zero bank and the MLX bank.
+    let (vocab, hidden, n_tok) = (32_768usize, 2048usize, 8usize);
+    let ids = u32_buf(
+        rt,
+        &(0..n_tok as u32).map(|i| i * 4001 % vocab as u32).collect::<Vec<_>>(),
+    )?;
+    let out = out_buf(rt, n_tok * hidden);
+    let gs = 64usize;
+    let epacked = rt.alloc_buffer(vocab * hidden / 2)?;
+    epacked.write_bytes(&(0..vocab * hidden / 2).map(|i| (i % 251) as u8).collect::<Vec<u8>>());
+    let groups = vocab * (hidden / gs);
+    let escales = buf(rt, &vec![0.02f32; groups]);
+    let ezeros = buf(rt, &vec![7.0f32; groups]);
+    let run = || {
+        nn::embed_lookup_q4(
+            rt,
+            nn::Q4Bank {
+                packed: &epacked,
+                scales: &escales,
+                zeros: &ezeros,
+            },
+            &ids,
+            &out,
+            vocab as u32,
+            hidden as u32,
+            gs as u32,
+            n_tok as u32,
+        )
+    };
+    verify(rt, "embed_lookup_q4", &out, n_tok * hidden, run)?;
+    lane(
+        rt,
+        rows,
+        "embed_lookup_q4",
+        &format!("{n_tok}x{hidden}"),
+        (n_tok * hidden * 5) as f64,
+        warmup,
+        iters,
+        run,
+    )?;
+    let (mp, ms) = mlx_bank(rt, vocab, hidden, gs, 1)?;
+    let run = || {
+        nn::embed_lookup_q4_mlx(
+            rt,
+            Q4MlxBank {
+                packed: &mp,
+                scales_biases: &ms,
+            },
+            &ids,
+            &out,
+            vocab as u32,
+            hidden as u32,
+            gs as u32,
+            n_tok as u32,
+        )
+    };
+    verify(rt, "embed_lookup_q4_mlx", &out, n_tok * hidden, run)?;
+    lane(
+        rt,
+        rows,
+        "embed_lookup_q4_mlx",
+        &format!("{n_tok}x{hidden}"),
+        (n_tok * hidden * 5) as f64,
+        warmup,
+        iters,
+        run,
+    )
+}
+
+/// The encoder ops: BERT's layer norms, biases and sparse pooling, and
+/// EmbedGemma2's attention, mean pooling and normalization.
+fn encoder_lanes(rt: &Arc<GpuRuntime>, rows: &mut Vec<Row>, warmup: usize, iters: usize) -> Result<(), String> {
+    use tessl::{bert, embedgemma2};
+    let (batch, seq, dim) = (4usize, 128usize, 768usize);
+    let n_rows = batch * seq;
+    let eps = 1e-12;
+    let (w, b) = (buf(rt, &common::fill(dim, 0xB1)), buf(rt, &common::fill(dim, 0xB2)));
+    let bias = buf(rt, &common::fill_affine(dim, 0xB3, 0.001, 0.0));
+
+    let (vocab, positions) = (30_522usize, 512usize);
+    let ids = u32_buf(
+        rt,
+        &(0..n_rows as u32).map(|i| i * 7919 % vocab as u32).collect::<Vec<_>>(),
+    )?;
+    let (word, pos) = (
+        buf(rt, &common::fill(vocab * dim, 0xB4)),
+        buf(rt, &common::fill(positions * dim, 0xB5)),
+    );
+    let tables = bert::EmbedTables {
+        word: &word,
+        vocab: vocab as u32,
+        pos: &pos,
+        positions: positions as u32,
+        type_row: &b,
+        ln_w: &w,
+        ln_b: &b,
+    };
+    let out = out_buf(rt, n_rows * dim);
+    let run = || bert::embed_layer_norm(rt, &ids, tables, &out, n_rows as u32, dim as u32, seq as u32, eps);
+    verify(rt, "bert_embed_layer_norm_f32", &out, n_rows * dim, run)?;
+    let sh = format!("{n_rows}x{dim}");
+    let act = (n_rows * dim * 8) as f64;
+    lane(rt, rows, "bert_embed_layer_norm_f32", &sh, act, warmup, iters, run)?;
+
+    let x = buf(rt, &common::fill(n_rows * dim, 0xB6));
+    let run = || bert::layer_norm(rt, &x, &w, &b, &out, n_rows as u32, dim as u32, eps);
+    verify(rt, "bert_layer_norm_f32", &out, n_rows * dim, run)?;
+    lane(rt, rows, "bert_layer_norm_f32", &sh, act, warmup, iters, run)?;
+
+    let seed = common::fill(n_rows * dim, 0xB7);
+    let resid = buf(rt, &seed);
+    let run = || bert::bias_residual_layer_norm(rt, &x, &bias, &resid, &w, &b, n_rows as u32, dim as u32, eps);
+    verify_inplace(rt, "bert_bias_residual_layer_norm_f32", &resid, &seed, run)?;
+    lane(
+        rt,
+        rows,
+        "bert_bias_residual_layer_norm_f32",
+        &sh,
+        act * 1.5,
+        warmup,
+        iters,
+        run,
+    )?;
+
+    let ffn = 4 * dim;
+    let seed = common::fill(n_rows * ffn, 0xB8);
+    let h = buf(rt, &seed);
+    let fb = buf(rt, &common::fill_affine(ffn, 0xB9, 0.001, 0.0));
+    let sh_ffn = format!("{n_rows}x{ffn}");
+    let run = || bert::bias_add(rt, &h, &fb, n_rows as u32, ffn as u32);
+    verify_inplace(rt, "bert_bias_add_f32", &h, &seed, run)?;
+    lane(
+        rt,
+        rows,
+        "bert_bias_add_f32",
+        &sh_ffn,
+        (n_rows * ffn * 8) as f64,
+        warmup,
+        iters,
+        run,
+    )?;
+    let run = || bert::bias_gelu_erf(rt, &h, &fb, n_rows as u32, ffn as u32);
+    verify_inplace(rt, "bert_bias_gelu_erf_f32", &h, &seed, run)?;
+    lane(
+        rt,
+        rows,
+        "bert_bias_gelu_erf_f32",
+        &sh_ffn,
+        (n_rows * ffn * 8) as f64,
+        warmup,
+        iters,
+        run,
+    )?;
+
+    // Sparse pooling over a masked-LM head's logits: one segment per sequence.
+    let segments: Vec<(u32, u32)> = (0..batch as u32)
+        .map(|i| (i * seq as u32, (i + 1) * seq as u32))
+        .collect();
+    let seg = bert::upload_segments(rt, &segments, n_rows as u32)?;
+    let logits = buf(rt, &common::fill(n_rows * vocab, 0xBA));
+    let pbias = buf(rt, &vec![0.5f32; vocab]);
+    let pooled = buf(rt, &vec![0.0f32; batch * vocab]);
+    let run = || {
+        bert::segment_sparse_max(
+            rt,
+            &logits,
+            &pbias,
+            &seg,
+            &pooled,
+            batch as u32,
+            n_rows as u32,
+            vocab as u32,
+        )
+    };
+    verify_inplace(
+        rt,
+        "bert_segment_sparse_max_f32",
+        &pooled,
+        &vec![0.0f32; batch * vocab],
+        run,
+    )?;
+    lane(
+        rt,
+        rows,
+        "bert_segment_sparse_max_f32",
+        &format!("{n_rows}x{vocab}"),
+        (n_rows * vocab * 4) as f64,
+        warmup,
+        iters,
+        run,
+    )?;
+
+    // EmbedGemma2 encoder attention: every instantiated head dim on the rows
+    // kernel, and the TensorOps kernel where the device has it.
+    let (ab, at, heads, heads_kv) = (2usize, 128usize, 8usize, 4usize);
+    let lens = u32_buf(rt, &vec![at as u32; ab])?;
+    for d in [32usize, 64, 256, 512] {
+        let scale = 1.0 / (d as f32).sqrt();
+        let q = buf(rt, &common::fill_affine(ab * at * heads * d, 0xC1, scale, 0.0));
+        let k = buf(rt, &common::fill_affine(ab * at * heads_kv * d, 0xC2, scale, 0.0));
+        let v = buf(rt, &common::fill_affine(ab * at * heads_kv * d, 0xC3, scale, 0.0));
+        let o = out_buf(rt, ab * at * heads * d);
+        let dims = embedgemma2::EncoderAttnDims {
+            batch: ab as u32,
+            seq: at as u32,
+            heads: heads as u32,
+            heads_kv: heads_kv as u32,
+            head_dim: d as u32,
+            window: if d == 256 { 64 } else { 0 },
+            scale: 1.0,
+        };
+        let kernels: &[(embedgemma2::EncoderAttnKernel, &str)] = if d >= 256 && rt.has_tensorops() {
+            &[
+                (embedgemma2::EncoderAttnKernel::Rows, "rows"),
+                (embedgemma2::EncoderAttnKernel::Tiled, "tiled"),
+            ]
+        } else {
+            &[(embedgemma2::EncoderAttnKernel::Rows, "rows")]
+        };
+        for &(kernel, tag) in kernels {
+            let name = format!("encoder_attn_{tag}_h{d}");
+            let run = || embedgemma2::encoder_attn_with(rt, &q, &k, &v, &o, &lens, dims, kernel);
+            verify(rt, &name, &o, ab * at * heads * d, run)?;
+            lane(
+                rt,
+                rows,
+                &name,
+                &format!("{ab}x{at} h{heads}/{heads_kv}"),
+                (ab * at * (2 * heads + 2 * heads_kv) * d * 4) as f64,
+                warmup,
+                iters,
+                run,
+            )?;
+        }
+    }
+
+    // Mean pooling and L2 normalization of the encoder output.
+    let (e_rows, e_dim, n_seg) = (2048usize, 1024usize, 8usize);
+    let ex = buf(rt, &common::fill(e_rows * e_dim, 0xC4));
+    let per = (e_rows / n_seg) as u32;
+    let segs: Vec<(u32, u32)> = (0..n_seg as u32).map(|i| (i * per, (i + 1) * per)).collect();
+    let eseg = embedgemma2::upload_segments(rt, &segs, e_rows as u32)?;
+    let pooled = out_buf(rt, n_seg * e_dim);
+    let run = || embedgemma2::segment_mean_rows(rt, &ex, &eseg, &pooled, n_seg as u32, e_rows as u32, e_dim as u32);
+    verify(rt, "segment_mean_rows_f32", &pooled, n_seg * e_dim, run)?;
+    lane(
+        rt,
+        rows,
+        "segment_mean_rows_f32",
+        &format!("{e_rows}x{e_dim}"),
+        (e_rows * e_dim * 4) as f64,
+        warmup,
+        iters,
+        run,
+    )?;
+    let seed = common::fill(512 * e_dim, 0xC5);
+    let nx = buf(rt, &seed);
+    let run = || embedgemma2::l2_normalize_rows(rt, &nx, 512, e_dim as u32, e_dim as u32);
+    verify_inplace(rt, "l2_normalize_rows_f32", &nx, &seed, run)?;
+    lane(
+        rt,
+        rows,
+        "l2_normalize_rows_f32",
+        &format!("512x{e_dim}"),
+        (512 * e_dim * 8) as f64,
+        warmup,
+        iters,
+        run,
+    )
 }
 
 /// Qwen3.5's vocabulary: the row a decode sampler reduces each token.

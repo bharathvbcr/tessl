@@ -76,6 +76,8 @@
 //! four tiles on the same Q/K/V (default T = 2048) and prints one `METRIC
 //! attn_prefill_q{BQ}_k{BK}_sg{NSG}_ms_t{T}` per tile: the lane
 //! `bench_paired --format metrics` alternates between two builds of this binary.
+//! The lane has its own fixed rounds, so `--iters` is refused with it; a GPU
+//! failure after the run began ends stdout with `METRIC_INCOMPLETE reason`.
 //!
 //! `--model-forward [T...]` runs the tower lane alone and prints its METRIC
 //! lines. Default T is 1024 and 2048.
@@ -1302,6 +1304,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         iters: ITERS,
     };
     let mut ts = Vec::new();
+    let mut iters_given = false;
     for arg in std::env::args().skip(1) {
         if arg == "--paired-gdn-recurrent" {
             paired_rec = true;
@@ -1328,6 +1331,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         } else if arg == "--gdn-scan32" {
             opts.scan = qwen35::GdnScanSlice::Cols32;
         } else if let Some(n) = arg.strip_prefix("--iters=") {
+            iters_given = true;
             opts.iters = n
                 .parse()
                 .ok()
@@ -1353,6 +1357,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     if attn_tiles && (check_only || paired_attn || paired_rec || paired_gate_up || model_forward || decode.is_some()) {
         return Err("--attn-tiles takes token counts only".into());
+    }
+    if attn_tiles && iters_given {
+        return Err("--attn-tiles runs its own fixed rounds (3 warmup + 9 timed); --iters does not apply".into());
     }
     if paired_attn && check_only {
         return Err("--paired-attn times both kernels; it does not combine with --check-only".into());
@@ -1393,10 +1400,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     println!("device: {}", rt.device_name());
     if attn_tiles {
-        rt.set_async_encode(true)?;
-        run_attn_tiles(&rt, if ts.is_empty() { &[2048] } else { &ts })?;
-        rt.set_async_encode(false)?;
-        return Ok(());
+        // Everything that can be refused was refused above; a failure from
+        // here on ends stdout with METRIC_INCOMPLETE.
+        return common::mark_incomplete_on_error((|| -> Result<(), Box<dyn std::error::Error>> {
+            rt.set_async_encode(true)?;
+            run_attn_tiles(&rt, if ts.is_empty() { &[2048] } else { &ts })?;
+            rt.set_async_encode(false)?;
+            Ok(())
+        })());
     }
     if paired_attn {
         rt.set_async_encode(true)?;

@@ -102,28 +102,110 @@ fn parse_workload(w: &str) -> Result<Vec<usize>, String> {
     Ok(lens)
 }
 
-/// Uniform workloads `--attn-kernel` times by default: the `encode` defaults'
-/// uniform shapes above the window (512) and the long document of `1x4096+63x32`.
-const DEFAULT_ATTN_SHAPES: &str = "64x32,32x256,8x1024,2x4096,1x6147";
+/// Workloads `--attn-kernel` times by default: the `encode` defaults' uniform
+/// shapes above the window (512), the long document of `1x4096+63x32`, and
+/// `8x64-1024`, whose row lengths run from 64 to 1024 under a padded length of
+/// 1024, so padding queries are exercised.
+const DEFAULT_ATTN_SHAPES: &str = "64x32,32x256,8x1024,2x4096,1x6147,8x64-1024";
+
+/// The tiled kernel must match the rows kernel on the same inputs to within
+/// this fraction of the largest rows output before it is timed. Both are f32
+/// kernels that agree with the f64 reference to 2e-5 (`tests/embedgemma2_kernels.rs`
+/// `KERNEL_REL`); five times that is the allowance for their difference.
+const ATTN_PARITY_REL: f64 = 1e-4;
+
+/// One `BENCH_ATTN_SHAPES` entry: `lens.len()` sequences padded to `t`.
+#[derive(Debug, PartialEq)]
+struct AttnShape {
+    /// The metric-name part: `b{B}_t{T}`, plus `_len{sum of lengths}` when ragged.
+    key: String,
+    t: usize,
+    lens: Vec<usize>,
+}
+
+/// All of `BENCH_ATTN_SHAPES` before anything runs: each entry a workload of
+/// [`parse_workload`], the padded length its longest row, no two entries the
+/// same metric name.
+fn parse_attn_shapes(spec: &str) -> Result<Vec<AttnShape>, String> {
+    let mut shapes: Vec<AttnShape> = Vec::new();
+    for entry in spec.split(',') {
+        let lens = parse_workload(entry.trim()).map_err(|e| format!("BENCH_ATTN_SHAPES: {e}"))?;
+        let t = lens.iter().copied().max().unwrap_or(0);
+        let ragged = lens.iter().any(|&l| l != t);
+        let key = if ragged {
+            format!("b{}_t{t}_len{}", lens.len(), lens.iter().sum::<usize>())
+        } else {
+            format!("b{}_t{t}", lens.len())
+        };
+        if shapes.iter().any(|s| s.key == key) {
+            return Err(format!(
+                "BENCH_ATTN_SHAPES: {entry:?} repeats an earlier entry (metric {key})"
+            ));
+        }
+        shapes.push(AttnShape { key, t, lens });
+    }
+    Ok(shapes)
+}
+
+/// The output `got` of the tiled kernel against `want` of the rows kernel for
+/// `lens.len()` sequences of `t` positions (`[B, T, H*D]`, `row` = `H*D`
+/// floats per position). Every element must be finite, a padding position
+/// (`pos >= lens[b]`) must be `+0.0` in both, and the largest absolute
+/// difference must be within [`ATTN_PARITY_REL`] of the largest `want`.
+/// Returns that difference.
+fn attn_parity(want: &[f32], got: &[f32], lens: &[usize], t: usize, row: usize) -> Result<f64, String> {
+    let n = lens.len() * t * row;
+    if want.len() != n || got.len() != n {
+        return Err(format!("output lengths {} and {}, expected {n}", want.len(), got.len()));
+    }
+    let (mut worst, mut scale) = (0.0f64, 0.0f64);
+    for (i, (&w, &g)) in want.iter().zip(got).enumerate() {
+        let (b, pos) = (i / (t * row), i / row % t);
+        if !w.is_finite() || !g.is_finite() {
+            return Err(format!("element {i}: rows {w}, tiled {g} is not finite"));
+        }
+        if pos >= lens[b] && !(w == 0.0 && w.is_sign_positive() && g == 0.0 && g.is_sign_positive()) {
+            return Err(format!(
+                "padding position {pos} of sequence {b}: rows {w}, tiled {g}, expected +0"
+            ));
+        }
+        worst = worst.max((f64::from(w) - f64::from(g)).abs());
+        scale = scale.max(f64::from(w).abs());
+    }
+    if scale == 0.0 {
+        return Err("the rows output is all zero".into());
+    }
+    if worst > ATTN_PARITY_REL * scale {
+        return Err(format!(
+            "tiled differs from rows by {worst:.3e}, over {ATTN_PARITY_REL:.0e} of the largest output {scale:.3e}"
+        ));
+    }
+    Ok(worst)
+}
 
 /// `--attn-kernel=rows|tiled`: the encoder attention kernel alone, per
 /// distinct layer kind of the checkpoint's `config.json` (no weights are
-/// read), at each uniform `BxT` of `BENCH_ATTN_SHAPES`. One `METRIC
-/// encoder_attn_{sliding|global}_h{D}_b{B}_t{T}_ms` per kind per shape, the
-/// median of `BENCH_ITERS` buffers of `BENCH_ATTN_REPS` launches; the metric
-/// names carry no kernel, so `bench_paired --format metrics` lanes `rows` and
-/// `tiled` (or two builds) compare name for name. Before any timing the
-/// output must be finite and not all zero.
-fn run_attn_kernel(snap: &std::path::Path, kernel: EncoderAttnKernel) -> Result<(), String> {
+/// read), at each shape of `BENCH_ATTN_SHAPES` (`shapes`, already parsed).
+/// One `METRIC encoder_attn_{sliding|global}_h{D}_{shape key}_ms` per kind
+/// per shape, the median of `BENCH_ITERS` buffers of `BENCH_ATTN_REPS`
+/// launches; the metric names carry no kernel, so `bench_paired --format
+/// metrics` lanes `rows` and `tiled` (or two builds) compare name for name.
+/// Before timing, the kernel's output must be finite and not all zero, and for
+/// `tiled` it must match the rows kernel on the same inputs ([`attn_parity`]):
+/// a mismatch is an error, nothing more is timed.
+fn run_attn_kernel(
+    snap: &std::path::Path,
+    kernel: EncoderAttnKernel,
+    shapes: &[AttnShape],
+    iters: usize,
+    warmup: usize,
+    reps: usize,
+) -> Result<(), String> {
     let cfg = EmbedGemma2Config::from_config_file(&snap.join("config.json"))?;
     let rt = GpuRuntime::new_inference()?;
     if kernel == EncoderAttnKernel::Tiled && !rt.has_tensorops() {
         return Err("--attn-kernel=tiled needs a device with TensorOps".into());
     }
-    let shapes = std::env::var("BENCH_ATTN_SHAPES").unwrap_or_else(|_| DEFAULT_ATTN_SHAPES.into());
-    let iters = env_usize("BENCH_ITERS", 10, 1)?;
-    let warmup = env_usize("BENCH_WARMUP", 3, 0)?;
-    let reps = env_usize("BENCH_ATTN_REPS", 8, 1)?;
     let mut kinds: Vec<(bool, u32, u32)> = Vec::new();
     for l in &cfg.layers {
         if !kinds.contains(&(l.sliding, l.head_dim, l.kv_heads)) {
@@ -134,12 +216,8 @@ fn run_attn_kernel(snap: &std::path::Path, kernel: EncoderAttnKernel) -> Result<
         "encoder attention kernel {kernel:?}, heads {}, window {}",
         cfg.q_heads, cfg.sliding_window
     );
-    for shape in shapes.split(',') {
-        let lens = parse_workload(shape.trim())?;
-        let (b, t) = match lens.as_slice() {
-            [first, rest @ ..] if rest.iter().all(|l| l == first) => (lens.len(), *first),
-            _ => return Err(format!("BENCH_ATTN_SHAPES: {shape:?} is not a uniform BxT")),
-        };
+    for shape in shapes {
+        let (b, t) = (shape.lens.len(), shape.t);
         for &(sliding, d, kv_heads) in &kinds {
             let (h, hkv, d) = (cfg.q_heads as usize, kv_heads as usize, d as usize);
             let dims = EncoderAttnDims {
@@ -161,13 +239,22 @@ fn run_attn_kernel(snap: &std::path::Path, kernel: EncoderAttnKernel) -> Result<
             let v = mk(b * t * hkv * d, 23)?;
             let o = rt.alloc_buffer(b * t * h * d * 4)?;
             let len_buf = rt.alloc_buffer(b * 4)?;
-            len_buf.write_u32(&vec![t as u32; b]);
-            o.write_f32(&vec![f32::NAN; b * t * h * d]);
-            encoder_attn_with(&rt, &q, &k, &v, &o, &len_buf, dims, kernel)?;
-            rt.synchronize()?;
-            let out = o.read_f32();
+            len_buf.write_u32(&shape.lens.iter().map(|&l| l as u32).collect::<Vec<_>>());
+            let out_of = |which: EncoderAttnKernel| -> Result<Vec<f32>, String> {
+                o.write_f32(&vec![f32::NAN; b * t * h * d]);
+                encoder_attn_with(&rt, &q, &k, &v, &o, &len_buf, dims, which)?;
+                rt.synchronize()?;
+                Ok(o.read_f32())
+            };
+            let what = format!("{} d={d}", shape.key);
+            let out = out_of(kernel)?;
             if out.iter().any(|x| !x.is_finite()) || out.iter().all(|&x| x == 0.0) {
-                return Err(format!("{shape} d={d}: the output is not finite and non-zero"));
+                return Err(format!("{what}: the output is not finite and non-zero"));
+            }
+            if kernel == EncoderAttnKernel::Tiled {
+                let rows = out_of(EncoderAttnKernel::Rows)?;
+                let err = attn_parity(&rows, &out, &shape.lens, t, h * d).map_err(|e| format!("{what}: {e}"))?;
+                println!("parity {what}: tiled vs rows max abs error {err:.3e} (limit {ATTN_PARITY_REL:.0e} of the largest output)");
             }
             let mut ms = Vec::with_capacity(iters);
             for round in 0..warmup + iters {
@@ -183,7 +270,7 @@ fn run_attn_kernel(snap: &std::path::Path, kernel: EncoderAttnKernel) -> Result<
             }
             let med = common::median(ms)?;
             let kind = if sliding { "sliding" } else { "global" };
-            println!("METRIC encoder_attn_{kind}_h{d}_b{b}_t{t}_ms {med:.4}");
+            println!("METRIC encoder_attn_{kind}_h{d}_{}_ms {med:.4}", shape.key);
         }
     }
     Ok(())
@@ -203,7 +290,21 @@ fn main() -> Result<(), String> {
         if let Some(extra) = args.next() {
             return Err(format!("unexpected argument {extra:?}"));
         }
-        return run_attn_kernel(&snap, kernel);
+        // Everything that can be refused is, before the runtime exists or any
+        // METRIC line is printed.
+        if std::env::var_os("BENCH_WORKLOADS").is_some() {
+            return Err("BENCH_WORKLOADS does not apply to --attn-kernel; its shapes are BENCH_ATTN_SHAPES".into());
+        }
+        let spec = match std::env::var("BENCH_ATTN_SHAPES") {
+            Ok(v) => v,
+            Err(std::env::VarError::NotPresent) => DEFAULT_ATTN_SHAPES.into(),
+            Err(e) => return Err(format!("BENCH_ATTN_SHAPES: {e}")),
+        };
+        let shapes = parse_attn_shapes(&spec)?;
+        let iters = env_usize("BENCH_ITERS", 10, 1)?;
+        let warmup = env_usize("BENCH_WARMUP", 3, 0)?;
+        let reps = env_usize("BENCH_ATTN_REPS", 8, 1)?;
+        return common::mark_incomplete_on_error(run_attn_kernel(&snap, kernel, &shapes, iters, warmup, reps));
     }
     let spec = std::env::var("BENCH_WORKLOADS").unwrap_or_else(|_| DEFAULT_WORKLOADS.into());
     let workloads = spec
@@ -269,7 +370,7 @@ fn main() -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_workload;
+    use super::{attn_parity, parse_attn_shapes, parse_workload, DEFAULT_ATTN_SHAPES};
 
     #[test]
     fn workload_grammar() {
@@ -281,5 +382,52 @@ mod tests {
         for bad in ["0x5", "2x1", "2x9-3", "2", "x5", "2x5+"] {
             assert!(parse_workload(bad).is_err(), "{bad}");
         }
+    }
+
+    #[test]
+    fn default_attn_shapes_parse_and_include_padding() {
+        let shapes = parse_attn_shapes(DEFAULT_ATTN_SHAPES).unwrap();
+        assert!(
+            shapes.iter().any(|s| s.lens.iter().any(|&l| l < s.t)),
+            "no default shape has a row shorter than T: {shapes:?}"
+        );
+        let keys: Vec<&str> = shapes.iter().map(|s| s.key.as_str()).collect();
+        assert!(keys.contains(&"b64_t32") && keys.contains(&"b1_t6147"), "{keys:?}");
+    }
+
+    #[test]
+    fn attn_shapes_refuse_any_bad_entry_and_repeats() {
+        for bad in ["", "64x32,", "0x5", "64x32,2", "3x5,3x5", "2x9-3"] {
+            assert!(parse_attn_shapes(bad).is_err(), "{bad:?}");
+        }
+        let ragged = parse_attn_shapes("4x10-42").unwrap();
+        assert_eq!((ragged[0].t, ragged[0].key.as_str()), (40, "b4_t40_len100"));
+    }
+
+    #[test]
+    fn parity_accepts_a_match_and_refuses_each_kind_of_mismatch() {
+        // 2 sequences of 3 positions, 2 floats per position; sequence 1 has 2 live positions.
+        let lens = [3, 2];
+        let want: Vec<f32> = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 1.0, 1.0, 2.0, 2.0, 0.0, 0.0];
+        assert!(attn_parity(&want, &want, &lens, 3, 2).unwrap() == 0.0);
+        let near: Vec<f32> = want.iter().map(|x| x * (1.0 + 1e-6)).collect();
+        assert!(attn_parity(&want, &near, &lens, 3, 2).is_ok());
+        let mut far = want.clone();
+        far[0] += 0.01;
+        assert!(attn_parity(&want, &far, &lens, 3, 2).unwrap_err().contains("differs"));
+        let mut pad = want.clone();
+        pad[10] = 1e-9;
+        assert!(attn_parity(&want, &pad, &lens, 3, 2).unwrap_err().contains("padding"));
+        let mut nan = want.clone();
+        nan[3] = f32::NAN;
+        assert!(attn_parity(&want, &nan, &lens, 3, 2)
+            .unwrap_err()
+            .contains("not finite"));
+        assert!(attn_parity(&want, &want[1..], &lens, 3, 2)
+            .unwrap_err()
+            .contains("lengths"));
+        assert!(attn_parity(&[0.0; 12], &[0.0; 12], &[3, 3], 3, 2)
+            .unwrap_err()
+            .contains("all zero"));
     }
 }

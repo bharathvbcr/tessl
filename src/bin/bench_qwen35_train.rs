@@ -20,11 +20,17 @@
 //! accumulation under `--bf16`. Inputs are
 //! random and bounded.
 //!
-//! Every timed op also prints `METRIC op_NAME_ms_t{T} MS` (spaces and `-` in
-//! the name become `_`), for `bench_paired --format metrics`. `--op=NAME`
-//! (repeatable, the name as the table prints it, with `_` for spaces) times
-//! only the named ops, after the gate has run on all of them:
-//! `--op=attn_train_forward` is the training attention forward's lane.
+//! Every timed op also prints `METRIC op_KEY_LANE_ms_t{T} MS`, for
+//! `bench_paired --format metrics`: KEY is the op's name as the table prints
+//! it, lowercased, every other run of characters becoming one `_` (so `[a-z0-9_]`
+//! only), and LANE is `f32` or `bf16` (`--bf16`, `--storage=bf16`), so the two
+//! lanes never share a metric name. `--op=NAME` (repeatable) times only the
+//! named ops, after the gate has run on all of them: `--op=attn_train_forward`
+//! is the training attention forward's lane. An unknown or repeated NAME is
+//! refused before the GPU runtime starts, whatever else is asked (including
+//! `--check-only` and `--step-only`). A GPU failure after the run began ends
+//! stdout with `METRIC_INCOMPLETE reason`: METRIC lines before it are not a
+//! finished run.
 //!
 //! Per op, the time of one call at the given T: the median of 7 runs after 2
 //! warm-ups, each run `REPS` calls encoded into one command buffer and
@@ -196,9 +202,66 @@ fn gate(rt: &Arc<GpuRuntime>, op: &mut Op<'_>) -> Res<()> {
     Ok(())
 }
 
-/// An op's name as `--op=` and its `METRIC` line spell it: no spaces or `-`.
+/// The ops `bench_t` times, in table order: the names `Op { name, .. }` carries
+/// there (`bench_t` refuses to start when the two differ). `--op=` is checked
+/// against this list before the GPU runtime exists.
+const OP_NAMES: [&str; 15] = [
+    "gdn_train forward",
+    "gdn_train backward",
+    "attn_train forward",
+    "attn_train backward",
+    "cross-entropy + grads",
+    "rms_norm_bwd",
+    "widen bf16 layer input",
+    "rms_norm (f32 input)",
+    "residual copy (f32)",
+    "gated_rms_norm_bwd",
+    "swiglu_bwd",
+    "conv1d_silu_bwd",
+    "attn_qk_norm_rope_bwd",
+    "gdn_gates_bwd",
+    "embed_rows_bwd",
+];
+
+/// An op's name as `--op=` and its `METRIC` line spell it: lowercase ASCII
+/// letters and digits with every other run of characters (spaces, `-`, `+`,
+/// parentheses) collapsed to one `_`, so the result is `[a-z0-9_]` only.
 fn op_key(name: &str) -> String {
-    name.replace([' ', '-'], "_")
+    let mut key = String::with_capacity(name.len());
+    for c in name.chars() {
+        if c.is_ascii_alphanumeric() {
+            key.push(c.to_ascii_lowercase());
+        } else if !key.ends_with('_') {
+            key.push('_');
+        }
+    }
+    key.trim_matches('_').to_string()
+}
+
+/// The `--op=` filters, each resolved to the op key it names. An unknown name,
+/// an empty one or a repeat is refused, with the valid keys listed.
+fn parse_op_filters(raw: &[String]) -> Res<Vec<String>> {
+    let keys: Vec<String> = OP_NAMES.iter().map(|n| op_key(n)).collect();
+    let mut only: Vec<String> = Vec::new();
+    for r in raw {
+        let key = op_key(r);
+        if !keys.contains(&key) {
+            return Err(format!("--op={r}: no such op; the ops are {}", keys.join(", ")));
+        }
+        if only.contains(&key) {
+            return Err(format!("--op={r}: given twice (as {key})"));
+        }
+        only.push(key);
+    }
+    Ok(only)
+}
+
+/// The lane a `METRIC` name carries, so an f32 and a bf16 run never share one.
+fn lane_key(operands: GemmOperands) -> &'static str {
+    match operands {
+        GemmOperands::ExactF32 => "f32",
+        GemmOperands::Bf16 => "bf16",
+    }
 }
 
 fn bench_t(rt: &Arc<GpuRuntime>, t: usize, check_only: bool, operands: GemmOperands, only: &[String]) -> Res<()> {
@@ -626,6 +689,9 @@ fn bench_t(rt: &Arc<GpuRuntime>, t: usize, check_only: bool, operands: GemmOpera
             reps: 1,
         },
     ];
+    if !ops.iter().map(|op| op.name).eq(OP_NAMES) {
+        return Err("the op table of bench_t differs from OP_NAMES; update OP_NAMES".into());
+    }
     for op in &mut ops {
         gate(rt, op)?;
     }
@@ -645,12 +711,6 @@ fn bench_t(rt: &Arc<GpuRuntime>, t: usize, check_only: bool, operands: GemmOpera
     if check_only {
         return Ok(());
     }
-    if let Some(missing) = only.iter().find(|f| !ops.iter().any(|op| op_key(op.name) == **f)) {
-        return Err(format!(
-            "--op={missing}: no such op; the ops are {}",
-            ops.iter().map(|op| op_key(op.name)).collect::<Vec<_>>().join(", ")
-        ));
-    }
     println!("{:<24} {:>10}", "op", "ms / call");
     let mut times = Vec::new();
     for op in &mut ops {
@@ -659,7 +719,7 @@ fn bench_t(rt: &Arc<GpuRuntime>, t: usize, check_only: bool, operands: GemmOpera
         }
         let ms = time_ms(rt, op.reps, &mut op.run)?;
         println!("{:<24} {:>10.3}", op.name, ms);
-        println!("METRIC op_{}_ms_t{t} {ms:.4}", op_key(op.name));
+        println!("METRIC op_{}_{}_ms_t{t} {ms:.4}", op_key(op.name), lane_key(operands));
         times.push((op.name, ms));
     }
     if !only.is_empty() {
@@ -969,7 +1029,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (mut check_only, mut step, mut ts, mut operands) = (false, None, Vec::new(), GemmOperands::ExactF32);
     let (mut batches, mut step_only, mut async_encode, mut clip) = (Vec::new(), false, false, None);
     let (mut storage, mut random_config) = (Precision::F32, None::<String>);
-    let mut only: Vec<String> = Vec::new();
+    let mut raw_only: Vec<String> = Vec::new();
     for arg in std::env::args().skip(1) {
         if arg == "--bf16" {
             operands = GemmOperands::Bf16;
@@ -984,7 +1044,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         } else if arg == "--check-only" {
             check_only = true;
         } else if let Some(v) = arg.strip_prefix("--op=") {
-            only.push(v.replace([' ', '-'], "_"));
+            raw_only.push(v.to_string());
         } else if arg == "--step-only" {
             step_only = true;
         } else if arg == "--async" {
@@ -1023,62 +1083,108 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             return Err("--batch runs on f32 storage only".into());
         }
     }
+    let only = parse_op_filters(&raw_only)?;
     // The per-op gate runs first whatever else is asked: no timing without it.
     if ts.is_empty() {
         ts.push(2048);
     }
-    let rt = GpuRuntime::new()?;
-    if rt.relaxed_precision() {
-        return Err("the training path needs exact-f32 GEMMs; switch relaxed precision off".into());
-    }
-    println!("device: {}", rt.device_name());
-    for t in ts {
-        bench_t(&rt, t, check_only || step_only, operands, &only)?;
-    }
-    let model_runs = step.is_some() || clip.is_some() || !batches.is_empty();
-    if check_only || !model_runs {
-        if check_only && model_runs {
-            println!("--check-only: the per-op gate ran; --step, --clip and --batch were not run");
+    // Every argument is validated above; a failure from here on ends stdout with
+    // METRIC_INCOMPLETE, so partial METRIC lines are never read as a finished run.
+    common::mark_incomplete_on_error((|| -> Result<(), Box<dyn std::error::Error>> {
+        let rt = GpuRuntime::new()?;
+        if rt.relaxed_precision() {
+            return Err("the training path needs exact-f32 GEMMs; switch relaxed precision off".into());
         }
-        return Ok(());
-    }
-    let model = load_model(&rt, storage, random_config.as_deref())?;
-    rt.set_async_encode(async_encode)?;
-    println!(
-        "storage: {}; operands: {operands:?}",
-        match storage {
-            Precision::F32 => "f32",
-            Precision::Bf16 => "bf16 (steps into a bf16 bank)",
+        println!("device: {}", rt.device_name());
+        for t in ts {
+            bench_t(&rt, t, check_only || step_only, operands, &only)?;
         }
-    );
-    println!(
-        "encode: {}; TESSL_MID_COMMIT={}",
-        if async_encode {
-            "async (--async)"
-        } else {
-            "every dispatch waited"
-        },
-        std::env::var("TESSL_MID_COMMIT").unwrap_or_else(|_| "unset".into())
-    );
-    if let Some(n) = step {
-        bench_step(&rt, &model, n, operands)?;
-    }
-    if let Some(n) = clip {
-        bench_clip(&model, n, operands)?;
-    }
-    for b in batches {
-        bench_batch(&rt, &model, b, operands)?;
-    }
-    Ok(())
+        let model_runs = step.is_some() || clip.is_some() || !batches.is_empty();
+        if check_only || !model_runs {
+            if check_only && model_runs {
+                println!("--check-only: the per-op gate ran; --step, --clip and --batch were not run");
+            }
+            return Ok(());
+        }
+        let model = load_model(&rt, storage, random_config.as_deref())?;
+        rt.set_async_encode(async_encode)?;
+        println!(
+            "storage: {}; operands: {operands:?}",
+            match storage {
+                Precision::F32 => "f32",
+                Precision::Bf16 => "bf16 (steps into a bf16 bank)",
+            }
+        );
+        println!(
+            "encode: {}; TESSL_MID_COMMIT={}",
+            if async_encode {
+                "async (--async)"
+            } else {
+                "every dispatch waited"
+            },
+            std::env::var("TESSL_MID_COMMIT").unwrap_or_else(|_| "unset".into())
+        );
+        if let Some(n) = step {
+            bench_step(&rt, &model, n, operands)?;
+        }
+        if let Some(n) = clip {
+            bench_clip(&model, n, operands)?;
+        }
+        for b in batches {
+            bench_batch(&rt, &model, b, operands)?;
+        }
+        Ok(())
+    })())
 }
 
 #[cfg(test)]
 mod tests {
-    use super::op_key;
+    use super::{lane_key, op_key, parse_op_filters, GemmOperands, OP_NAMES};
 
     #[test]
-    fn op_keys_have_no_spaces_or_dashes() {
+    fn op_keys_are_lowercase_alphanumeric_and_underscore_only() {
         assert_eq!(op_key("attn_train forward"), "attn_train_forward");
         assert_eq!(op_key("rms-norm bwd"), "rms_norm_bwd");
+        assert_eq!(op_key("cross-entropy + grads"), "cross_entropy_grads");
+        assert_eq!(op_key("rms_norm (f32 input)"), "rms_norm_f32_input");
+        assert_eq!(op_key("residual copy (f32)"), "residual_copy_f32");
+        let keys: Vec<String> = OP_NAMES.iter().map(|n| op_key(n)).collect();
+        for k in &keys {
+            assert!(
+                !k.is_empty() && k.bytes().all(|b| matches!(b, b'a'..=b'z' | b'0'..=b'9' | b'_')),
+                "{k}"
+            );
+        }
+        let mut sorted = keys.clone();
+        sorted.sort();
+        sorted.dedup();
+        assert_eq!(sorted.len(), keys.len(), "two ops share a key: {keys:?}");
+    }
+
+    #[test]
+    fn op_names_are_the_names_bench_t_builds() {
+        let src = include_str!("bench_qwen35_train.rs");
+        let in_table: Vec<&str> = src
+            .lines()
+            .filter_map(|l| l.trim().strip_prefix("name: \""))
+            .filter_map(|l| l.strip_suffix("\","))
+            .collect();
+        assert_eq!(in_table, OP_NAMES);
+    }
+
+    #[test]
+    fn op_filters_refuse_unknown_empty_and_repeated_names() {
+        let ok = parse_op_filters(&["attn_train forward".into(), "swiglu_bwd".into()]).unwrap();
+        assert_eq!(ok, ["attn_train_forward", "swiglu_bwd"]);
+        assert!(parse_op_filters(&[]).unwrap().is_empty());
+        assert!(parse_op_filters(&["nope".into()]).unwrap_err().contains("no such op"));
+        assert!(parse_op_filters(&["".into()]).unwrap_err().contains("no such op"));
+        let dup = parse_op_filters(&["swiglu_bwd".into(), "swiglu-bwd".into()]).unwrap_err();
+        assert!(dup.contains("given twice"), "{dup}");
+    }
+
+    #[test]
+    fn metric_lanes_are_told_apart() {
+        assert_ne!(lane_key(GemmOperands::ExactF32), lane_key(GemmOperands::Bf16));
     }
 }

@@ -62,9 +62,58 @@ fn bad_flags_are_refused_before_any_gpu_work() {
     assert_refused_before_gpu(&["--iters=0", "16"], "--iters");
     assert_refused_before_gpu(&["--bogus"], "expected a token count");
     assert_refused_before_gpu(&["0"], "T must be positive");
-    assert_refused_before_gpu(&["--attn-tiles", "--check-only"], "--attn-tiles takes token counts only");
-    assert_refused_before_gpu(&["--attn-tiles", "--paired-attn"], "--attn-tiles takes token counts only");
-    assert_refused_before_gpu(&["--attn-tiles", "--weights=/tmp"], "--weights");
+    assert_refused_before_gpu(
+        &["--attn-tiles", "--check-only"],
+        "--attn-tiles takes token counts only",
+    );
+    assert_refused_before_gpu(
+        &["--attn-tiles", "--paired-attn"],
+        "--attn-tiles takes token counts only",
+    );
+}
+
+/// A `--weights` directory that passes `checkpoint()`: the fixture config and a
+/// safetensors file with an empty header, so the later guards are reached.
+fn parsing_weights_dir(name: &str) -> Scratch {
+    let d = valid_config_dir(name);
+    std::fs::write(d.0.join("m.safetensors"), b"\x02\0\0\0\0\0\0\0{}").unwrap();
+    d
+}
+
+#[test]
+fn attn_tiles_refuses_every_other_lane_and_the_model_options() {
+    // The `--weights` and `--gdn-scan32` cases must get past the checkpoint
+    // parse to the `--paired-*` guard, so the directory is one that parses.
+    let d = parsing_weights_dir("bq35_tiles_weights");
+    let p = d.0.to_str().unwrap();
+    assert_refused_before_gpu(
+        &["--attn-tiles", &format!("--weights={p}")],
+        "--weights and --gdn-scan32 apply to the model lanes",
+    );
+    assert_refused_before_gpu(
+        &["--attn-tiles", "--gdn-scan32"],
+        "--weights and --gdn-scan32 apply to the model lanes",
+    );
+    for lane in [
+        "--check-only",
+        "--paired-attn",
+        "--model-forward",
+        "--decode",
+        "--decode=16",
+        "--paired-gdn-recurrent",
+        "--paired-gate-up",
+    ] {
+        assert_refused_before_gpu(&["--attn-tiles", lane], "--attn-tiles takes token counts only");
+        assert_refused_before_gpu(&[lane, "--attn-tiles"], "--attn-tiles takes token counts only");
+    }
+}
+
+#[test]
+fn attn_tiles_refuses_iters_it_would_not_honour() {
+    for args in [["--attn-tiles", "--iters=3"], ["--iters=3", "--attn-tiles"]] {
+        assert_refused_before_gpu(&args, "--iters does not apply");
+    }
+    assert_refused_before_gpu(&["--attn-tiles", "--iters=0"], "--iters");
 }
 
 /// GPU: the per-layer table's header reports the sample count that ran.

@@ -20,10 +20,15 @@
 //!   encoder packs both calls into one forward (the towers are bit-for-bit
 //!   batch-independent), and within `1e-5` max abs otherwise (the text
 //!   encoder's own batch bound, `embedgemma2_mm_tiny.rs`);
-//! * host waits (`infer_trace`): a call of text items makes exactly 1, a call
-//!   with media exactly 2 (one for both towers' queued forwards, one for the
-//!   text encoder's), against 3 for the by-hand composition (vision, audio,
+//! * host waits (`infer_trace`): a call of text items makes exactly 1, and so
+//!   does a call with media: the towers' and the text encoder's forwards are
+//!   queued behind one wait, the towers' soft rows staying on the device (this
+//!   was 2 until the GPU-resident hand-off; the bound changed because the
+//!   behaviour did), against 3 for the by-hand composition (vision, audio,
 //!   text each wait on their own);
+//! * the one-wait path equals the by-hand (two-wait) path bit for bit, in both
+//!   modes, including a clip whose mask has a hole (two device segments) and
+//!   caller-built ids that interleave images and clips;
 //! * a refused call allocates nothing and waits for nothing, and the facade
 //!   works afterwards.
 
@@ -208,8 +213,8 @@ fn image_and_audio_items_equal_the_by_hand_composition() {
                 let (got, t) = traced(|| m.encode(&[MmItem::Image(img.input())], None).unwrap());
                 assert_eq!(bits(&got.embeddings), bits(&want), "{operands:?}: image {k}");
                 assert_eq!(
-                    t.sync_waits, 2,
-                    "{operands:?}: image {k}: towers wait once, the text encoder once"
+                    t.sync_waits, 1,
+                    "{operands:?}: image {k}: the tower and the text encoder wait once together"
                 );
             }
             for (k, c) in md.clips.iter().enumerate() {
@@ -224,7 +229,7 @@ fn image_and_audio_items_equal_the_by_hand_composition() {
                 let want = by_hand.embed(&ids, &[], std::slice::from_ref(c));
                 let (got, t) = traced(|| m.encode(&[MmItem::Audio(c)], None).unwrap());
                 assert_eq!(bits(&got.embeddings), bits(&want), "{operands:?}: clip {k}");
-                assert_eq!(t.sync_waits, 2, "{operands:?}: clip {k}");
+                assert_eq!(t.sync_waits, 1, "{operands:?}: clip {k}");
             }
         });
     }
@@ -269,7 +274,7 @@ fn media_items_take_each_modality_in_placeholder_order() {
             };
             let (got, t) = traced(|| m.encode(&[item], None).unwrap());
             assert_eq!(bits(&got.embeddings), bits(&want), "{operands:?}");
-            assert_eq!(t.sync_waits, 2);
+            assert_eq!(t.sync_waits, 1);
 
             // The order is observable: the same ids with the images swapped
             // give a different embedding.
@@ -344,7 +349,7 @@ fn a_mixed_batch_equals_each_item_alone() {
                 MmItem::Audio(&md.clips[1]),
             ];
             let (batch, t) = traced(|| m.encode(&items, None).unwrap());
-            assert_eq!(t.sync_waits, 2, "{operands:?}: a mixed call waits twice");
+            assert_eq!(t.sync_waits, 1, "{operands:?}: a mixed call waits once");
             assert_eq!(
                 batch.forwards, 1,
                 "test bug: pick a batch the packer runs as one forward"
@@ -374,7 +379,7 @@ fn a_mixed_batch_equals_each_item_alone() {
 
 /// A batch whose text side needs several forwards: the long item runs alone,
 /// every item agrees with itself alone within the text encoder's batch bound,
-/// and the call still waits twice.
+/// and the call still waits once.
 #[test]
 fn a_batch_of_several_text_forwards_agrees_within_the_batch_bound() {
     for operands in MODES {
@@ -394,7 +399,7 @@ fn a_batch_of_several_text_forwards_agrees_within_the_batch_bound() {
             ];
             let (batch, t) = traced(|| m.encode(&items, None).unwrap());
             assert!(batch.forwards >= 2, "test bug: {} text forwards", batch.forwards);
-            assert_eq!(t.sync_waits, 2, "{operands:?}: several forwards, still two waits");
+            assert_eq!(t.sync_waits, 1, "{operands:?}: several forwards, still one wait");
             let dim = m.text().config().embedding_dim as usize;
             for (k, item) in items.iter().enumerate() {
                 let alone = m.encode(std::slice::from_ref(item), None).unwrap();
@@ -409,11 +414,11 @@ fn a_batch_of_several_text_forwards_agrees_within_the_batch_bound() {
     }
 }
 
-/// The waits and the allocations: one tower call is not two, the facade saves
-/// the by-hand composition's third wait, and a text call allocates what
-/// `encode` does.
+/// The waits and the allocations: one tower call is not two, the facade makes
+/// one wait where the by-hand composition makes three, and a text call
+/// allocates what `encode` does.
 #[test]
-fn waits_are_one_for_text_and_two_with_media_against_three_by_hand() {
+fn waits_are_one_for_text_and_for_media_against_three_by_hand() {
     let f = fixture("mm_waits", GemmOperands::ExactF32);
     let md = media(&f.c);
     let mut r = SplitMix::new(2);
@@ -432,7 +437,7 @@ fn waits_are_one_for_text_and_two_with_media_against_three_by_hand() {
         // Warm every pool, then count.
         m.encode(&items, None).unwrap();
         let (_, t) = traced(|| m.encode(&items, None).unwrap());
-        assert_eq!(t.sync_waits, 2, "facade, text + image + audio");
+        assert_eq!(t.sync_waits, 1, "facade, text + image + audio");
         let (_, t) = traced(|| {
             let v = by_hand.vision.encode_images(&[md.images[0].input()], false).unwrap();
             let a = by_hand
@@ -475,7 +480,7 @@ fn waits_are_one_for_text_and_two_with_media_against_three_by_hand() {
             });
             assert_eq!(t.sync_waits, 1, "encode_audio, async_encode {async_on}");
             let (_, t) = traced(|| m.encode(&items, None).unwrap());
-            assert_eq!(t.sync_waits, 2, "facade, async_encode {async_on}");
+            assert_eq!(t.sync_waits, 1, "facade, async_encode {async_on}");
         }
         rt.set_async_encode(false).unwrap();
         let flag = rt.async_encode_enabled();
@@ -737,6 +742,37 @@ fn refusals_do_no_gpu_work_and_leave_the_facade_usable() {
             .err()
             .expect("accepted");
         assert!(e.contains("the limit is"), "{e}");
+    });
+}
+
+/// The towers' soft rows stay on the device, so the host-side check that a
+/// soft value is finite (`encode_multimodal` makes it for host rows) cannot run
+/// on them before the text encoder reads them. A finite input that overflows a
+/// tower is instead refused after the wait, naming the item, and it does not
+/// poison the facade or the items beside it. Bound (fixed before the first
+/// run): the call with the overflowing image returns an error naming `item 1`
+/// and `not finite`; the same call without it returns the first item's
+/// embedding bit for bit; the facade is usable afterwards.
+#[test]
+fn a_tower_overflow_is_refused_after_the_wait_naming_the_item() {
+    let f = fixture("mm_overflow", GemmOperands::ExactF32);
+    let md = media(&f.c);
+    let mut r = SplitMix::new(6);
+    let t0 = text_ids(&mut r, 8);
+    with_gpu(|rt| {
+        let m = f.facade(rt, GemmOperands::ExactF32);
+        // Finite pixels (checked up front) whose scaled values the patch
+        // projection overflows.
+        let mut huge = Image::new(2, 2, 0, m.vision().config().patch_dim() as usize, 9);
+        huge.pixel_values.iter_mut().for_each(|v| *v = 1.0e38);
+        let ok = [MmItem::Text(&t0), MmItem::Image(md.images[0].input())];
+        let want = m.encode(&ok, None).unwrap();
+        let bad = [MmItem::Text(&t0), MmItem::Image(huge.input())];
+        let e = m.encode(&bad, None).err().expect("accepted an overflowing image");
+        assert!(e.contains("item 1") && e.contains("not finite"), "{e}");
+        let again = m.encode(&ok, None).unwrap();
+        assert_eq!(bits(&again.embeddings), bits(&want.embeddings));
+        assert_eq!(rt.async_scope_depth(), 0);
     });
 }
 

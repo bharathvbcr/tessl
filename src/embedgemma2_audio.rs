@@ -89,6 +89,7 @@ use std::sync::Arc;
 use objc2_metal::MTLComputePipelineState;
 
 use crate::dispatch::{dispatch_1d, dispatch_2d_tg, set_gpu_buf, set_u32};
+use crate::embedgemma2::SoftSegment;
 use crate::gemm::{gemm, select_backend, GemmBackend};
 use crate::json::{self, Json, Syntax};
 use crate::loader::Loader;
@@ -1532,12 +1533,25 @@ fn refs<C: Borrow<AudioInput>>(clips: &[C]) -> Vec<&AudioInput> {
     clips.iter().map(Borrow::borrow).collect()
 }
 
-/// What a queued [`EmbedGemma2Audio::queue_audio`] call keeps alive: the
-/// activations, each forward's host-written inputs and device-written
-/// outputs, and the clips' frame masks the host splits the output by.
+/// What a forward leaves for the host once it has run: its output and, with
+/// `trace`, the traced tensors, and where each clip's rows sit in them. The
+/// rest of [`ForwardIo`] (the features, masks and clip table the GPU reads) is
+/// not kept.
+struct ForwardOut {
+    /// `[rows, embed_dim]`.
+    soft: Tensor,
+    trace: Vec<Tensor>,
+    clips: Vec<ClipRows>,
+}
+
+/// What a queued [`EmbedGemma2Audio::queue_audio`] call keeps alive: each
+/// forward's device-written outputs, and the clips' frame masks the host
+/// splits the output by. The activations and each forward's host-written
+/// inputs are not here: they were handed to the runtime's deferred release when
+/// the call was queued, so the caller's wait recycles them.
 struct AudioPendingState {
-    _acts: Acts,
-    pending: Vec<(Vec<usize>, ForwardIo)>,
+    /// Per forward: the clips it ran (indices into the call) and its outputs.
+    outs: Vec<(Vec<usize>, ForwardOut)>,
     /// Each clip's `[frames]` mask.
     masks: Vec<Vec<bool>>,
     trace: bool,
@@ -1547,7 +1561,9 @@ struct AudioPendingState {
 /// yet waited for. [`Self::collect`] waits for them (if the caller has not) and
 /// reads the soft tokens; dropping it without collecting waits for the queued
 /// work and discards the result, since Metal 4 command buffers do not retain
-/// the buffers they bind.
+/// the buffers they bind. It holds only each forward's outputs: the
+/// activations and the forwards' uploaded inputs are the runtime's, released at
+/// the wait, so a call followed by another holds one activation set.
 pub struct PendingAudio {
     rt: Arc<GpuRuntime>,
     hidden: usize,
@@ -1560,20 +1576,42 @@ pub struct PendingAudio {
 impl PendingAudio {
     /// How many forwards were queued.
     pub fn forwards(&self) -> u32 {
-        self.state.as_ref().map_or(0, |s| s.pending.len() as u32)
+        self.state.as_ref().map_or(0, |s| s.outs.len() as u32)
+    }
+
+    /// Hand the call's soft tokens to a caller that keeps them on the device:
+    /// per clip, in the order of the call, the rows of its forward's output
+    /// that its tower mask keeps ([`out_mask`]), as one segment per maximal run
+    /// of kept rows (a clip whose mask is a prefix, as a processor's is, has
+    /// one; a clip with nothing kept has none). The rows are not compacted:
+    /// the consumer reads them where the tower wrote them. Consumes the call
+    /// **without waiting** (so the caller owes the one wait, after queuing
+    /// whatever reads these rows); the segments hold the output buffers, which
+    /// the runtime keeps until that wait has seen the GPU finish.
+    pub(crate) fn into_device(mut self) -> Vec<Vec<SoftSegment>> {
+        let state = self.state.take().expect("into_device consumes the pending call");
+        let mut clips: Vec<Vec<SoftSegment>> = vec![Vec::new(); state.masks.len()];
+        for (g, out) in &state.outs {
+            debug_assert_eq!(out.soft.byte_offset(), 0, "a forward's soft tokens start their buffer");
+            for (&i, cr) in g.iter().zip(&out.clips) {
+                let omask = out_mask(&state.masks[i]);
+                debug_assert_eq!(omask.len(), cr.rows);
+                clips[i].extend(kept_runs(&omask).into_iter().map(|r| SoftSegment {
+                    buf: out.soft.buffer.clone(),
+                    row: (cr.row0 + r.start) as u32,
+                    rows: r.len() as u32,
+                }));
+            }
+        }
+        clips
     }
 
     /// The call's [`AudioOutput`]. Waits for the queued forwards first if
     /// nothing has (the wait is a no-op when the caller already waited).
     pub fn collect(mut self) -> Result<AudioOutput, String> {
         let state = self.state.take().expect("collect consumes the pending call");
-        let AudioPendingState {
-            _acts,
-            pending,
-            masks,
-            trace,
-        } = state;
-        // The buffers in `pending` must outlive the queued work, so a failed
+        let AudioPendingState { outs, masks, trace } = state;
+        // The buffers in `outs` must outlive the queued work, so a failed
         // wait still holds them until the end of this function.
         self.rt.synchronize()?;
         let n_clips = masks.len();
@@ -1593,23 +1631,20 @@ impl PendingAudio {
             } else {
                 Vec::new()
             },
-            forwards: pending.len() as u32,
+            forwards: outs.len() as u32,
         };
-        for (g, io) in &pending {
+        for (g, io) in &outs {
             // One host mapping at a time (the runtime's access is exclusive).
             let read =
                 |t: &Tensor| -> Result<Vec<f32>, String> { Ok(t.buffer.try_contents_f32()?[..t.numel()].to_vec()) };
             let soft = read(&io.soft)?;
             let traced: Vec<Vec<f32>> = io.trace.iter().map(read).collect::<Result<_, _>>()?;
-            for (&i, cr) in g.iter().zip(&io.clips.clips) {
+            for (&i, cr) in g.iter().zip(&io.clips) {
                 let omask = out_mask(&masks[i]);
                 debug_assert_eq!(omask.len(), cr.rows);
                 let mut tokens = Vec::new();
-                for (t, &keep) in omask.iter().enumerate() {
-                    if keep {
-                        let r = cr.row0 + t;
-                        tokens.extend_from_slice(&soft[r * embed..(r + 1) * embed]);
-                    }
+                for run in kept_runs(&omask) {
+                    tokens.extend_from_slice(&soft[(cr.row0 + run.start) * embed..(cr.row0 + run.end) * embed]);
                 }
                 out.soft_tokens[i] = tokens;
                 out.out_masks[i] = omask;
@@ -1970,6 +2005,30 @@ impl EmbedGemma2Audio {
             }
             Ok(())
         })();
+        // Hand everything the GPU only reads to the runtime *before* the wait:
+        // the activations and each forward's uploaded inputs and clip table. A
+        // dropped pooled buffer is parked in the runtime's deferred-release
+        // queue, which holds it until a waiting commit has seen the GPU finish
+        // and that wait then returns it to the pool's freelist (see
+        // `EmbedGemma2Model::encode`). Held until `collect` instead, they
+        // reached the freelist only at the next commit, after the next call had
+        // allocated its own set. Only each forward's outputs stay; a forward
+        // that failed midway is released the same way.
+        let outs: Vec<(Vec<usize>, ForwardOut)> = pending
+            .into_iter()
+            .map(|(g, io)| {
+                let ForwardIo { clips, soft, trace, .. } = io;
+                (
+                    g,
+                    ForwardOut {
+                        soft,
+                        trace,
+                        clips: clips.clips,
+                    },
+                )
+            })
+            .collect();
+        drop(acts);
         let out = PendingAudio {
             rt: Arc::clone(&self.rt),
             hidden: self.cfg.hidden as usize,
@@ -1977,8 +2036,7 @@ impl EmbedGemma2Audio {
             out_dims: self.cfg.out_dims as usize,
             embed: self.cfg.embed_dim as usize,
             state: Some(AudioPendingState {
-                _acts: acts,
-                pending,
+                outs,
                 masks: clips.iter().map(|c| c.mask.clone()).collect(),
                 trace,
             }),
@@ -2397,9 +2455,51 @@ pub fn out_mask(mask: &[bool]) -> Vec<bool> {
         .collect()
 }
 
+/// The maximal runs of consecutive `true` entries of a tower mask, as row
+/// ranges: the pieces of a clip's tower output that are its soft tokens. A
+/// processor's mask is a prefix (one run, or none); any other pattern is
+/// defined and gives one run per stretch.
+fn kept_runs(omask: &[bool]) -> Vec<std::ops::Range<usize>> {
+    let mut runs = Vec::new();
+    let mut t = 0usize;
+    while t < omask.len() {
+        if !omask[t] {
+            t += 1;
+            continue;
+        }
+        let start = t;
+        while t < omask.len() && omask[t] {
+            t += 1;
+        }
+        runs.push(start..t);
+    }
+    runs
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A clip's soft rows are the maximal runs of its tower mask, so a hole in
+    /// the mask is two segments and the rows between them are never read.
+    #[test]
+    fn kept_rows_are_the_masks_maximal_runs() {
+        let runs = |m: &[bool]| -> Vec<(usize, usize)> { kept_runs(m).into_iter().map(|r| (r.start, r.end)).collect() };
+        assert!(runs(&[]).is_empty());
+        assert!(runs(&[false, false]).is_empty(), "nothing kept");
+        assert_eq!(runs(&[true; 5]), [(0, 5)], "a full clip is one run");
+        assert_eq!(runs(&[true, true, false, false]), [(0, 2)], "a processor's prefix");
+        assert_eq!(
+            runs(&[true, false, true, true, false, true]),
+            [(0, 1), (2, 4), (5, 6)],
+            "a hole splits the run"
+        );
+        // The tower mask is `mask[::4]`: frames 8..16 masked drop rows 2 and 3.
+        let mask: Vec<bool> = (0..30).map(|f| !(8..16).contains(&f)).collect();
+        let om = out_mask(&mask);
+        assert_eq!(om.len(), 8);
+        assert_eq!(runs(&om), [(0, 2), (4, 8)]);
+    }
 
     /// The audio_config of google/embeddinggemma-2's config.json.
     const REAL: &str = r#"{"text_config":{"hidden_size":512},"audio_config":{

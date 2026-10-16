@@ -112,7 +112,9 @@
 use std::sync::Arc;
 
 use crate::dispatch::{dispatch_2d, dispatch_2d_tg, set_f32, set_gpu_buf, set_u32};
-use crate::embedgemma2::{encoder_attn, encoder_attn_bf16, encoder_attn_bf16_supports, project, EncoderAttnDims};
+use crate::embedgemma2::{
+    encoder_attn, encoder_attn_bf16, encoder_attn_bf16_supports, project, EncoderAttnDims, SoftSegment,
+};
 use crate::gemm::{cast_f32_to_bf16_into, GemmOperands};
 use crate::json::{self, Json, Syntax};
 use crate::loader::Loader;
@@ -914,11 +916,15 @@ struct RawTrace {
 }
 
 /// What a queued [`EmbedGemma2VisionModel::queue_images`] call keeps alive:
-/// the activations, each forward's host-written inputs and device-written
-/// output, and what the host needs to split that output per image.
+/// each forward's device-written output (its soft tokens), and what the host
+/// needs to split that output per image. The activations and each forward's
+/// host-written inputs are not here: they were handed to the runtime's
+/// deferred release when the call was queued, so the caller's wait recycles
+/// them.
 struct PendingState {
-    _acts: Acts,
-    pending: Vec<(Vec<usize>, ForwardIo)>,
+    /// Per forward: the images it ran (indices into the call) and its soft
+    /// tokens, `[pooled_rows, text_hidden]`, the images' rows end to end.
+    outs: Vec<(Vec<usize>, Tensor)>,
     raw: Vec<Option<RawTrace>>,
     prepared: Vec<Prepared>,
     valid: Vec<usize>,
@@ -929,7 +935,9 @@ struct PendingState {
 /// and not yet waited for. [`Self::collect`] waits for them (if the caller has
 /// not) and reads the soft tokens; dropping it without collecting waits for the
 /// queued work and discards the result, since Metal 4 command buffers do not
-/// retain the buffers they bind.
+/// retain the buffers they bind. It holds only each forward's output: the
+/// activations and the forwards' uploaded inputs are the runtime's, released at
+/// the wait, so a call followed by another holds one activation set.
 pub struct PendingImages {
     rt: Arc<GpuRuntime>,
     hidden: usize,
@@ -941,7 +949,36 @@ pub struct PendingImages {
 impl PendingImages {
     /// How many forwards were queued.
     pub fn forwards(&self) -> u32 {
-        self.state.as_ref().map_or(0, |s| s.pending.len() as u32)
+        self.state.as_ref().map_or(0, |s| s.outs.len() as u32)
+    }
+
+    /// Hand the call's soft tokens to a caller that keeps them on the device:
+    /// per image, in the order of the call, the rows of its forward's output
+    /// that are its soft tokens (one segment, since the pooler writes an
+    /// image's rows end to end and nothing else). Consumes the call **without
+    /// waiting** (so the caller owes the one wait, after queuing whatever
+    /// reads these rows); the segments hold the output buffers, which the
+    /// runtime keeps until that wait has seen the GPU finish.
+    pub(crate) fn into_device(mut self) -> Vec<SoftSegment> {
+        let state = self.state.take().expect("into_device consumes the pending call");
+        let mut segments: Vec<Option<SoftSegment>> = vec![None; state.valid.len()];
+        for (chunk, soft) in &state.outs {
+            debug_assert_eq!(soft.byte_offset(), 0, "a forward's soft tokens start their buffer");
+            let mut row = 0u32;
+            for &i in chunk {
+                let rows = state.prepared[i].rows_out() as u32;
+                segments[i] = Some(SoftSegment {
+                    buf: soft.buffer.clone(),
+                    row,
+                    rows,
+                });
+                row += rows;
+            }
+        }
+        segments
+            .into_iter()
+            .map(|s| s.expect("every image is in one forward"))
+            .collect()
     }
 
     /// The call's [`VisionOutput`]. Waits for the queued forwards first if
@@ -949,14 +986,13 @@ impl PendingImages {
     pub fn collect(mut self) -> Result<VisionOutput, String> {
         let state = self.state.take().expect("collect consumes the pending call");
         let PendingState {
-            _acts,
-            pending,
+            outs,
             raw,
             prepared,
             valid,
             trace,
         } = state;
-        // The buffers in `pending` must outlive the queued work, so a failed
+        // The buffers in `outs` must outlive the queued work, so a failed
         // wait still holds them until the end of this function.
         self.rt.synchronize()?;
         let (text_h, h) = (self.text_hidden, self.hidden);
@@ -968,9 +1004,9 @@ impl PendingImages {
             layers: vec![vec![Vec::new(); if trace { n_images } else { 0 }]; if trace { n_layers } else { 0 }],
             pooled: vec![Vec::new(); if trace { n_images } else { 0 }],
         };
-        for (c, (chunk, io)) in pending.iter().enumerate() {
+        for (c, (chunk, soft_out)) in outs.iter().enumerate() {
             let seq = valid[chunk[0]];
-            let all_soft = io.soft.buffer.try_contents_f32()?;
+            let all_soft = soft_out.buffer.try_contents_f32()?;
             let mut out_row = 0usize;
             for (b, &i) in chunk.iter().enumerate() {
                 let s = prepared[i].rows_out();
@@ -991,7 +1027,7 @@ impl PendingImages {
             patches: valid,
             soft,
             trace: out_trace,
-            forwards: pending.len() as u32,
+            forwards: outs.len() as u32,
         })
     }
 }
@@ -1282,7 +1318,8 @@ impl EmbedGemma2VisionModel {
 
     /// [`Self::encode_images`] up to the wait: the call is checked, its forwards
     /// are queued, and the host does not wait for them. The returned
-    /// [`PendingImages`] holds every buffer the queued work binds; a caller that
+    /// [`PendingImages`] holds the forwards' outputs, and the runtime holds
+    /// every other buffer the queued work binds until the wait; a caller that
     /// has other work to queue behind it (the text encoder, another tower) does
     /// so, waits once, and then [`PendingImages::collect`]s. Nothing is queued
     /// when the call is refused, and a call that fails while queuing waits for
@@ -1333,9 +1370,19 @@ impl EmbedGemma2VisionModel {
                 }
             }
         }
+        // Hand everything the GPU only reads to the runtime *before* the wait:
+        // the activations and each forward's uploaded inputs. A dropped pooled
+        // buffer is parked in the runtime's deferred-release queue, which holds
+        // it until a waiting commit has seen the GPU finish and that wait then
+        // returns it to the pool's freelist (see `EmbedGemma2Model::encode`).
+        // Held until `collect` instead, they reached the freelist only at the
+        // next commit, after the next call had allocated its own set. Only
+        // each forward's soft tokens stay, to be read (or copied from) after
+        // the wait; a forward that failed midway is released the same way.
+        let outs: Vec<(Vec<usize>, Tensor)> = pending.into_iter().map(|(chunk, io)| (chunk, io.soft)).collect();
+        drop(acts);
         let state = PendingState {
-            _acts: acts,
-            pending,
+            outs,
             raw,
             prepared,
             valid,

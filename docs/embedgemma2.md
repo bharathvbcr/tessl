@@ -173,7 +173,9 @@ declare lengths far past tiny buffers, so an entry that read first would
 fault) and that a successful call equals `EmbedGemma2Multimodal::encode` bit
 for bit; `tests/capi_contract.rs` holds the new entries and
 `python/tessl_torch/embedgemma2.py` to the same signature rules, injected faults
-included (it learned `c_uint8` for the mask).
+included (it learned `c_uint8` for the mask). Each entry is one
+`EmbedGemma2Multimodal::encode` call, so it makes one host wait (two until the
+GPU-resident hand-off; no signature or layout changed).
 
 From Python (needs only numpy and the built library; `transformers` is not
 imported and not a dependency):
@@ -247,16 +249,25 @@ let out = model.encode_multimodal(&[MmSequence { ids: &ids, soft: &soft }], None
   packing (longest first), the activation reuse, the single host wait and the
   async queueing are shared code, not a copy.
 
-The soft rows are uploaded with the forward's ids (`alloc_buffer_from_u32` on the
-f32 bits: no wait, and a forward with no soft rows allocates nothing extra), and
-land in `embeds` after the scaled gather and before anything reads it: the
-residual stream, the bf16 copy and the per-layer-input GEMM all see the merged
-rows, so the rest of the forward is unchanged. The write is `qwen35_bwd::copy_cols`
-(one flat copy per maximal run of consecutive placeholder rows of the padded
-forward, a single row of the run's whole width): no new kernel. One image or clip
-is one run; an adversarial layout of alternating placeholder and text tokens is
-one dispatch per placeholder, at most `(rows + 1) / 2` of a forward's (32,768
-padded rows at most).
+The soft rows have two sources and one path. A host caller's rows
+(`MmSequence::soft`) are uploaded with the forward's ids (`alloc_buffer_from_u32`
+on the f32 bits: no wait, and a forward with no soft rows allocates nothing
+extra) as one device buffer; the multimodal facade's rows are the towers' own
+output buffers, described as `SoftSegment { buffer, first row, rows }` and read
+where the towers wrote them (next section). Either way each sequence's soft rows
+are a list of segments in placeholder order, `soft_runs` pairs them with the
+placeholder rows of the padded forward, and the rows land in `embeds` after the
+scaled gather and before anything reads it: the residual stream, the bf16 copy
+and the per-layer-input GEMM all see the merged rows, so the rest of the forward
+is unchanged. The write is `qwen35_bwd::copy_cols` (one flat copy per maximal run
+of consecutive placeholder rows whose soft rows are consecutive in one buffer, a
+single row of the run's whole width): no new kernel. One image or clip is one
+run; an adversarial layout of alternating placeholder and text tokens is one
+dispatch per placeholder, at most `(rows + 1) / 2` of a forward's (32,768 padded
+rows at most). The host path's finiteness check (a non-finite soft value is
+refused with its row and column) applies to host rows only: device rows are not
+read back before the text encoder runs, so the facade checks the embeddings it
+returns instead (below).
 
 Checked with the towers out of the loop (their golden soft tokens,
 `tools/embedgemma2_ref/make_mm_reference.py`), `tests/embedgemma2_mm_model.rs`
@@ -332,8 +343,14 @@ let out = m.encode(&items, Some(256))?;       // EncodeOutput: one row per item,
   tower); a `MmItem::Text` holding a placeholder id is refused (in a
   multimodal call it would be replaced by a soft token it does not have).
 * `queue_images` / `queue_audio` on the towers (new) return a `PendingImages` /
-  `PendingAudio` that holds every buffer the queued forwards bind and waits for
-  them on drop; `collect()` reads the soft tokens. `encode_images` /
+  `PendingAudio` that holds each forward's output and waits for the queued work
+  on drop; `collect()` reads the soft tokens. The activations and each forward's
+  uploaded inputs are not held: they are handed to the runtime's deferred
+  release before `queue_*` returns, so the wait recycles them, and a tower call
+  followed by another holds one activation set
+  (`consecutive_{vision,audio}_calls_hold_one_activation_set`; before, a call
+  dropped them at `collect`, after its wait, and the pool recycled them at the
+  next call's first commit, after that call had allocated). `encode_images` /
   `encode_audio` are `queue` + `synchronize` + `collect` and now queue under a
   `GpuRuntime::async_scope`, so they wait once whatever the runtime's
   `async_encode` flag says (before, a runtime in the default mode committed and
@@ -341,13 +358,36 @@ let out = m.encode(&items, Some(256))?;       // EncodeOutput: one row per item,
   `tests/embedgemma2_multimodal_tiny.rs` made 29 waits instead of 3). `check_images` / `check_clips` are their pre-GPU
   checks as a soft-token count per item, and `EmbedGemma2Model::check_sequences`
   is `encode`'s id checks, so the facade refuses before any tower is queued.
-* **Waits.** A call with media waits for the GPU **twice**, a call of texts
-  once. Both towers' forwards are queued under one scope behind one wait; the
-  soft tokens are read back; the text encoder's forwards (however many) are
-  queued behind its own wait. The by-hand composition waits three times
-  (vision, audio, text). One wait would need the text encoder to take the
-  towers' device buffers instead of host rows; that GPU-resident hand-off is not
-  done here (follow-up below).
+* **Waits.** Every call waits for the GPU **once**, with or without media. The
+  towers' forwards and then the text encoder's (however many) are queued under
+  one scope behind one `synchronize`, and the towers' soft tokens never reach
+  the host: the text encoder's scatter reads them from the towers' output
+  buffers. (Until the GPU-resident hand-off a call with media waited twice: the
+  towers' soft tokens were read back, concatenated per item on the host and
+  uploaded again as host rows for the text encoder.) The by-hand composition
+  waits three times (vision, audio, text). The sequences' layout is planned
+  before the towers run, since `check_images` / `check_clips` return the
+  placeholder counts; the soft rows themselves are described after the towers
+  are queued (`PendingImages::into_device`, `PendingAudio::into_device`: the
+  buffers, which the runtime keeps until the wait) and assigned to placeholders
+  in id order, so image and audio placeholders interleave as `masked_scatter`
+  per modality has them.
+* **The towers' valid rows are not contiguous; the hand-off keeps them in place.**
+  A vision image's soft tokens are one run of rows of its forward's output (the
+  pooler writes only real cells, end to end); an audio clip's are the rows its
+  tower mask keeps (`mask[::4]`), one run per maximal stretch of kept rows, which
+  is one run for a processor's prefix mask and several for a mask with a hole.
+  Compacting them into a dense buffer would add a kernel and a buffer to handle
+  what `copy_cols` already takes, runs of rows, so the text encoder's scatter is
+  given runs (`SoftSegment`) and nothing is compacted: a clip with a hole costs one
+  more copy dispatch, not a pass over its rows. Consecutive rows of one buffer
+  are one segment however the item's placeholders interleave with text.
+* **Finiteness.** A host caller's soft rows are checked finite before any GPU
+  work; the towers' are on the device and are not read back first. A media item's
+  returned embedding is checked finite after the wait instead, and a non-finite
+  one is an error naming the item (`a_tower_overflow_is_refused_after_the_wait_naming_the_item`:
+  finite pixels that overflow the patch projection). The check cannot name the
+  tower row or column.
 * **Precision.** One `GemmOperands` (`ExactF32` or `Bf16`) configures the text
   encoder and the vision tower alike (`EmbedGemma2VisionModel::load_with`, [Vision
   tower](#vision-tower)): it is one flag because both make one precision claim to
@@ -367,24 +407,32 @@ own tests): every item bit for bit the by-hand composition in both text modes
 (observed: 0), a text item bit for bit `EmbedGemma2Model::encode` (0), a mixed
 batch of text, images and clips bit for bit each item alone when the text side
 packs one forward (0, one forward) and within `1e-5` across forwards (0
-observed, 2 text forwards, both text modes), waits exactly 1 / 2 / 3 for text, media
-and by hand, every refusal `(allocations, waits) == (0, 0)`, every unzeroed
-activation poisoned with NaN changing no bit. `tests/embedgemma2_multimodal_model.rs`
+observed, 2 text forwards, both text modes), waits exactly 1 / 1 / 3 for text,
+media and by hand (media was 2 until the GPU-resident hand-off, and the bound
+changed because the behaviour did; the by-hand composition's bits are the
+two-wait path's, so equality with it is the one-wait path equalling the two-wait
+one, in both modes, for a clip whose mask has a hole and for caller-built ids
+that interleave images and clips), every refusal `(allocations, waits) == (0, 0)`,
+every unzeroed activation poisoned with NaN changing no bit, and consecutive
+calls holding one activation set (`tests/embedgemma2_memory.rs`: calls 2 to 4 of
+a tower, or of the facade, reach at most one fresh output above the first).
+`tests/embedgemma2_multimodal_model.rs`
 (real checkpoint, opt-in) and `python/tests/test_embedgemma2_mm.py`, Apple M5
 Pro, 2026-10-15, sdpa goldens, snapshot `914f7f89`:
 
 | Check | Bound | Observed |
 |---|---|---|
-| 8 texts (10 to 6147 tokens), 2 images, 2 clips in one call, vs `emb_f32` | max abs `1e-4`, cosine `>= 0.99999` | texts `1.2e-7` to `3.0e-7`, images `2.2e-7` / `3.8e-7`, clips `3.0e-7` / `2.5e-7`; cosine 1.000000000; 5 text forwards, 2 waits |
+| 8 texts (10 to 6147 tokens), 2 images, 2 clips in one call, vs `emb_f32` | max abs `1e-4`, cosine `>= 0.99999` | texts `1.2e-7` to `3.0e-7`, images `1.3e-7` / `2.1e-7`, clips `2.2e-7` / `2.5e-7`; cosine 1.000000000; 5 text forwards, 1 wait (27a0407: the same errors digit for digit, 2 waits) |
 | each image and clip alone vs inside that call | `1e-5` | 0 (bit for bit) |
-| media alone: 2 waits; texts alone: 1 wait | exact | 2; 1 |
+| media alone, mixed call, texts alone: waits | exact | 1; 1; 1 (media alone and mixed were 2) |
 | text encoder and vision tower `Bf16`, audio tower exact, 4 media rows vs fp32 | cosine `>= 0.9999` | 0.999987 to 0.999995 (images 0.999988, 0.999988; clips 0.999995, 0.999994) |
 | Python, `encode_images` / `encode_audio`, alone and in one call | `1e-4`, `0.99999`; alone vs batch `1e-5` | `2.2e-7` to `3.8e-7`, cosine 1.000000000; alone vs batch 0 |
 | Python, `embed_images` / `embed_audio` with transformers 5.19's processor on the generator's inputs | processor tensors vs saved `1e-6`, then the same embedding bounds | tensors identical (0), `3.8e-7` and `3.0e-7`, cosine 1.000000000 |
 
-Follow-ups: (1) the GPU-resident soft-token hand-off (the towers' `io.soft`
-buffers copied into the text encoder's embeddings with `copy_cols`, no host
-round trip, one wait for a mixed call). (2) A `Media` entry in the C ABI and
+Follow-ups: (1) done: the GPU-resident soft-token hand-off (the towers' output
+buffers read by the text encoder's `copy_cols`, no host round trip, one wait for
+a mixed call; speed: `bench/results/embedgemma2_mm_onewait_m5pro.txt`). (2) A
+`Media` entry in the C ABI and
 Python for caller ids with placeholders; the C entries take pure images and
 clips. (3) The tower tiny-checkpoint generators exist in four test files
 (`tests/common/embedgemma2_mm.rs`, `embedgemma2_vision_tiny.rs`,
@@ -621,6 +669,17 @@ Measured on an M5 Pro against the real checkpoint, paired and interleaved
   bound is not verifiable there; the file says so), and the 16 MiB
   per-layer-input bound alone, measured as one binary at 16 against 256 MiB,
   is 0.96 to 1.03 (median of rounds) and 0.90 to 1.00 (min-of-N).
+* **The towers, the same fix.** `queue_images` / `queue_audio` kept their
+  activations and uploaded inputs until `collect`, after their wait, so a tower
+  call followed by another had two sets live. They now hand them to the runtime
+  before returning, keeping each forward's output only
+  (`tests/embedgemma2_memory.rs`, tiny checkpoint, calls 2 to 4 above the
+  first: vision 1,769,472 bytes against a bound of one 8,192-byte output before,
+  within the bound after; audio 540,672 against 16,384, within the bound after).
+  A facade call holds a tower's set and the text encoder's at once, as before
+  (the towers' buffers cannot be recycled until the wait, which now follows the
+  text encoder's queuing): `bench/results/embedgemma2_mm_onewait_m5pro.txt` has
+  the device peak of the mixed call before and after.
 * **`segment_mean_rows`** stays serial: it is under 0.2 % of an encode on
   every workload (`embedgemma2_segment_mean_share_m5pro.txt`).
 * **No bf16 attention output.** `encoder_attn` writes f32 only, at bf16

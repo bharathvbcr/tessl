@@ -938,6 +938,48 @@ pub struct EncodeOutput {
     pub forwards: u32,
 }
 
+/// A text-encoder call whose forwards are queued and not yet waited for: only
+/// each forward's output is held (everything else was released to the runtime
+/// before this was returned). The caller waits, whatever
+/// [`EmbedGemma2Model::queue_multimodal`] returned, and passes the result of
+/// its wait to [`Self::finish`].
+pub(crate) struct PendingEncode {
+    outs: Vec<(Vec<usize>, Tensor)>,
+    /// How queuing ended: a failure is reported by [`Self::finish`], after the
+    /// caller's wait.
+    queued: Result<(), String>,
+    len: usize,
+    /// Columns returned per sequence, and columns of the output buffer.
+    dim: usize,
+    full: usize,
+    trace: Vec<Vec<f32>>,
+    forwards: u32,
+}
+
+impl PendingEncode {
+    /// The call's [`EncodeOutput`], once the caller has waited (`waited` is
+    /// that wait's result). A queuing failure is returned before a wait
+    /// failure.
+    pub(crate) fn finish(self, waited: Result<(), String>) -> Result<EncodeOutput, String> {
+        self.queued?;
+        waited?;
+        let mut embeddings = vec![0.0f32; self.len * self.dim];
+        for (chunk, out) in &self.outs {
+            // Read the prefix columns straight from the mapping: one copy.
+            let out = out.buffer.try_contents_f32()?;
+            for (n, &i) in chunk.iter().enumerate() {
+                embeddings[i * self.dim..(i + 1) * self.dim]
+                    .copy_from_slice(&out[n * self.full..n * self.full + self.dim]);
+            }
+        }
+        Ok(EncodeOutput {
+            embeddings,
+            trace: self.trace,
+            forwards: self.forwards,
+        })
+    }
+}
+
 /// Bytes of per-layer inputs one GEMM forms: every layer's at once would be
 /// `rows * n_layers * ple_dim` floats, 1.5 GiB at [`MAX_BATCH_TOKENS`] with
 /// the checkpoint's 24 layers of 512. A layer's inputs are 2 KiB a row, so
@@ -1156,38 +1198,106 @@ pub struct MmSequence<'a> {
     pub soft: &'a [f32],
 }
 
-/// A forward's soft tokens: its sequences' rows in chunk order, and where
-/// each run of them lands.
-struct SoftIo {
-    /// `[n, hidden]` f32, uploaded without a wait.
-    rows: GpuBuffer,
-    n: u32,
-    /// `(first soft row, first padded row, row count)`: each maximal run of
-    /// consecutive padded rows, one flat copy each.
-    runs: Vec<(u32, u32, u32)>,
+/// A run of `rows` consecutive soft-token rows (`hidden` f32 each) of a device
+/// buffer, from row `row`. The towers describe their output this way: a vision
+/// image's rows are one segment, an audio clip's are one segment per maximal
+/// run of rows its output mask keeps. Nothing is copied or compacted; the
+/// text encoder's scatter reads the rows where the tower wrote them.
+#[derive(Clone)]
+pub(crate) struct SoftSegment {
+    pub(crate) buf: GpuBuffer,
+    pub(crate) row: u32,
+    pub(crate) rows: u32,
 }
 
-/// Where the soft tokens of `chunk` land in a forward padded to `seq`:
-/// maximal runs of consecutive padded rows, `(first soft row, first padded
-/// row, row count)` with the soft rows numbered in chunk order. The count is
-/// what [`EmbedGemma2Model::encode_multimodal`] checked each sequence against.
-fn soft_runs(chunk: &[MmSequence<'_>], seq: usize, tokens: &MmTokens) -> Vec<(u32, u32, u32)> {
-    let mut runs: Vec<(u32, u32, u32)> = Vec::new();
-    let mut next = 0u32;
-    for (b, s) in chunk.iter().enumerate() {
-        for (t, &id) in s.ids.iter().enumerate() {
+/// Where one sequence's soft rows come from, in the order of its placeholder
+/// ids: a host slice (what [`MmSequence`] carries) or device segments (what
+/// the towers' queued forwards produced).
+#[derive(Clone, Copy)]
+pub(crate) enum SoftSource<'a> {
+    /// `[n, hidden]` row-major.
+    Host(&'a [f32]),
+    Device(&'a [SoftSegment]),
+}
+
+impl SoftSource<'_> {
+    /// Soft rows, given the row width.
+    fn rows(&self, hidden: usize) -> usize {
+        match self {
+            SoftSource::Host(v) => v.len() / hidden,
+            SoftSource::Device(segs) => segs.iter().map(|s| s.rows as usize).sum(),
+        }
+    }
+}
+
+/// One input sequence of [`EmbedGemma2Model::encode_impl`]: ids and where its
+/// soft rows come from. [`MmSequence`] is the public form, with host rows.
+#[derive(Clone, Copy)]
+pub(crate) struct Seq<'a> {
+    pub(crate) ids: &'a [u32],
+    pub(crate) soft: SoftSource<'a>,
+}
+
+impl<'a> From<MmSequence<'a>> for Seq<'a> {
+    fn from(s: MmSequence<'a>) -> Self {
+        Seq {
+            ids: s.ids,
+            soft: SoftSource::Host(s.soft),
+        }
+    }
+}
+
+/// One flat copy of the scatter: `(source, first source row, first padded
+/// row, row count)`, the source an index into [`SoftIo::sources`].
+type SoftRun = (usize, u32, u32, u32);
+
+/// A forward's soft tokens: the device buffers they sit in, and where each run
+/// of them lands. Host rows are uploaded (without a wait) into one buffer;
+/// device rows are the towers' own. Either way the scatter is the same.
+struct SoftIo {
+    sources: Vec<GpuBuffer>,
+    runs: Vec<SoftRun>,
+}
+
+/// Where the soft tokens of a chunk land in a forward padded to `seq`: one
+/// run per maximal stretch of consecutive padded rows whose soft rows are also
+/// consecutive in one source. `ids[b]` is sequence `b`'s ids and `segs[b]` its
+/// soft rows in placeholder order as `(source, first row, row count)`; a run
+/// is cut by a non-placeholder row, by padding, and by a change of source or a
+/// gap between two segments, and is continued across a sequence boundary when
+/// the last row of one and the first of the next are both placeholders and
+/// their sources line up. A sequence whose placeholders and soft rows differ in
+/// number is an error ([`EmbedGemma2Model::encode_impl`] checked the counts).
+fn soft_runs(
+    ids: &[&[u32]],
+    segs: &[Vec<(usize, u32, u32)>],
+    seq: usize,
+    tokens: &MmTokens,
+) -> Result<Vec<SoftRun>, String> {
+    const WHAT: &str = "EmbedGemma2Model::forward";
+    let mut runs: Vec<SoftRun> = Vec::new();
+    for (b, (seq_ids, seq_segs)) in ids.iter().zip(segs).enumerate() {
+        let mut rows = seq_segs
+            .iter()
+            .flat_map(|&(src, row, n)| (row..row + n).map(move |r| (src, r)));
+        for (t, &id) in seq_ids.iter().enumerate() {
             if !tokens.is_placeholder(id) {
                 continue;
             }
-            let row = (b * seq + t) as u32;
+            let (src, src_row) = rows
+                .next()
+                .ok_or_else(|| format!("{WHAT}: sequence {b} has more placeholder ids than soft rows"))?;
+            let dst = (b * seq + t) as u32;
             match runs.last_mut() {
-                Some((_, dst, len)) if *dst + *len == row => *len += 1,
-                _ => runs.push((next, row, 1)),
+                Some((s, sr, dr, n)) if *s == src && *sr + *n == src_row && *dr + *n == dst => *n += 1,
+                _ => runs.push((src, src_row, dst, 1)),
             }
-            next += 1;
+        }
+        if rows.next().is_some() {
+            return Err(format!("{WHAT}: sequence {b} has more soft rows than placeholder ids"));
         }
     }
-    runs
+    Ok(runs)
 }
 
 impl EmbedGemma2Model {
@@ -1433,7 +1543,13 @@ impl EmbedGemma2Model {
     /// ([`GpuRuntime::set_serialized_dispatch`]) still commits and waits for
     /// each.
     pub fn encode(&self, batch: &[&[u32]], truncate_dim: Option<u32>, trace: bool) -> Result<EncodeOutput, String> {
-        let seqs: Vec<MmSequence<'_>> = batch.iter().map(|&ids| MmSequence { ids, soft: &[] }).collect();
+        let seqs: Vec<Seq<'_>> = batch
+            .iter()
+            .map(|&ids| Seq {
+                ids,
+                soft: SoftSource::Host(&[]),
+            })
+            .collect();
         self.encode_impl("EmbedGemma2Model::encode", &seqs, None, truncate_dim, trace)
     }
 
@@ -1464,7 +1580,25 @@ impl EmbedGemma2Model {
     ) -> Result<EncodeOutput, String> {
         const WHAT: &str = "EmbedGemma2Model::encode_multimodal";
         let tokens = self.cfg.special_tokens.multimodal(WHAT)?;
-        self.encode_impl(WHAT, batch, Some(tokens), truncate_dim, trace)
+        let seqs: Vec<Seq<'_>> = batch.iter().map(|&s| Seq::from(s)).collect();
+        self.encode_impl(WHAT, &seqs, Some(tokens), truncate_dim, trace)
+    }
+
+    /// [`Self::encode_multimodal`] for soft rows that are already on the
+    /// device, up to the wait: the call is checked and its forwards are
+    /// queued, and the host does not wait for them. The multimodal
+    /// composition ([`crate::embedgemma2_mm`]) queues the towers, then this,
+    /// then waits once, and [`PendingEncode::finish`]es. A call that fails
+    /// while queuing still has its buffers held by the runtime until the
+    /// caller's wait, which the caller must make whatever this returns.
+    pub(crate) fn queue_multimodal(
+        &self,
+        what: &'static str,
+        batch: &[Seq<'_>],
+        truncate_dim: Option<u32>,
+    ) -> Result<PendingEncode, String> {
+        let tokens = self.cfg.special_tokens.multimodal(what)?;
+        self.queue_impl(what, batch, Some(tokens), truncate_dim, false)
     }
 
     /// Everything about a batch of id sequences that [`Self::encode`] and
@@ -1542,53 +1676,72 @@ impl EmbedGemma2Model {
     /// The batching, packing and queueing of [`Self::encode`] and
     /// [`Self::encode_multimodal`] (`tokens`: `Some` for the latter, whose
     /// placeholders and soft rows it then checks and applies; `None` for the
-    /// former, whose `soft` is always empty).
+    /// former, whose `soft` is always empty), and the one wait.
     fn encode_impl(
         &self,
         what: &'static str,
-        batch: &[MmSequence<'_>],
+        batch: &[Seq<'_>],
         tokens: Option<MmTokens>,
         truncate_dim: Option<u32>,
         trace: bool,
     ) -> Result<EncodeOutput, String> {
+        let pending = self.queue_impl(what, batch, tokens, truncate_dim, trace)?;
+        // Wait even when queuing failed: the runtime holds the buffers of
+        // what was queued until the wait ends (see `queue_impl`).
+        let waited = self.rt.synchronize();
+        pending.finish(waited)
+    }
+
+    /// [`Self::encode_impl`] up to the wait. The returned [`PendingEncode`]
+    /// holds only what the host reads after it: each forward's output.
+    fn queue_impl(
+        &self,
+        what: &'static str,
+        batch: &[Seq<'_>],
+        tokens: Option<MmTokens>,
+        truncate_dim: Option<u32>,
+        trace: bool,
+    ) -> Result<PendingEncode, String> {
         let cfg = &self.cfg;
         let hidden = cfg.hidden as usize;
         let ids: Vec<&[u32]> = batch.iter().map(|s| s.ids).collect();
         let placeholders = self.check_sequences(what, &ids, tokens, truncate_dim, trace)?;
         let dim_out = truncate_dim.unwrap_or(cfg.embedding_dim);
         for (b, s) in batch.iter().enumerate() {
-            if s.soft.len() % hidden != 0 {
-                return Err(format!(
-                    "{what}: sequence {b}: {} soft values is not a multiple of hidden {hidden}",
-                    s.soft.len()
-                ));
+            if let SoftSource::Host(soft) = s.soft {
+                if soft.len() % hidden != 0 {
+                    return Err(format!(
+                        "{what}: sequence {b}: {} soft values is not a multiple of hidden {hidden}",
+                        soft.len()
+                    ));
+                }
+                if let Some(i) = soft.iter().position(|v| !v.is_finite()) {
+                    return Err(format!(
+                        "{what}: sequence {b}: soft value {} (row {}, column {}) is not finite",
+                        soft[i],
+                        i / hidden,
+                        i % hidden
+                    ));
+                }
             }
-            if let Some(i) = s.soft.iter().position(|v| !v.is_finite()) {
+            // Device rows are not read back to be checked for finiteness: a
+            // caller that needs that checks what the forward returns.
+            let have = s.soft.rows(hidden);
+            if placeholders[b] != have {
                 return Err(format!(
-                    "{what}: sequence {b}: soft value {} (row {}, column {}) is not finite",
-                    s.soft[i],
-                    i / hidden,
-                    i % hidden
-                ));
-            }
-            if placeholders[b] != s.soft.len() / hidden {
-                return Err(format!(
-                    "{what}: sequence {b} has {} placeholder ids but {} soft rows",
+                    "{what}: sequence {b} has {} placeholder ids but {have} soft rows",
                     placeholders[b],
-                    s.soft.len() / hidden
                 ));
             }
         }
 
         let dim = dim_out as usize;
-        let full = cfg.embedding_dim as usize;
-        let mut embeddings = vec![0.0f32; batch.len() * dim];
         let mut out_trace = Vec::new();
         let mut forwards = 0u32;
-        // Queue every dispatch and wait once, whatever the caller set
+        // Queue every dispatch, whatever the caller set
         // ([`GpuRuntime::async_scope`] leaves the runtime's `async_encode`
         // flag alone). Opened before the cost is chosen, which is what a
-        // dispatch costs under it. It ends after the wait below, so a failed
+        // dispatch costs under it. It ends when this returns, so a failed
         // forward or a panic ends it too.
         let scope = self.rt.async_scope();
         let cost = if self.rt.dispatch_batching() {
@@ -1619,7 +1772,7 @@ impl EmbedGemma2Model {
             chunks,
             &mut pending,
             |chunk| {
-                let seqs: Vec<MmSequence<'_>> = chunk.iter().map(|&i| batch[i]).collect();
+                let seqs: Vec<Seq<'_>> = chunk.iter().map(|&i| batch[i]).collect();
                 self.forward_io(&seqs, tokens.as_ref())
             },
             |chunk, io| {
@@ -1630,7 +1783,8 @@ impl EmbedGemma2Model {
             },
         );
         // Hand everything the GPU only reads back to the runtime *before* the
-        // wait: `acts` and each forward's uploaded inputs. A dropped pooled
+        // wait: `acts` and each forward's uploaded inputs (and the soft rows
+        // they hold, which the towers' device buffers are). A dropped pooled
         // buffer is parked in the runtime's deferred-release queue, which holds
         // it (the buffer outlives every queued command, though Metal 4 command
         // buffers do not retain what they bind) until a waiting commit has seen
@@ -1639,25 +1793,19 @@ impl EmbedGemma2Model {
         // freelist only at the *next* commit, which the next `encode` comes
         // after its `acts()` allocation: two sets of activations were live
         // across consecutive calls (1472 MiB at 8192 rows, 736 with a wait in
-        // between). Only the output of each forward stays, to be read below.
+        // between). Only the output of each forward stays, to be read after
+        // the wait. A failed forward's io (which `queue_forwards` registers
+        // before running it) is held by the runtime the same way, so the
+        // caller waits even when this reports a failure ([`PendingEncode`]).
         let outs: Vec<(Vec<usize>, Tensor)> = pending.into_iter().map(|(chunk, io)| (chunk, io.out)).collect();
         drop(acts);
-        // Wait even when queuing failed: the failed forward's io (which
-        // `queue_forwards` registers before running it) and `acts` are held by
-        // the runtime as above until the wait ends or the runtime is dropped.
-        let waited = self.rt.synchronize();
         drop(scope);
-        queued?;
-        waited?;
-        for (chunk, out) in &outs {
-            // Read the prefix columns straight from the mapping: one copy.
-            let out = out.buffer.try_contents_f32()?;
-            for (n, &i) in chunk.iter().enumerate() {
-                embeddings[i * dim..(i + 1) * dim].copy_from_slice(&out[n * full..n * full + dim]);
-            }
-        }
-        Ok(EncodeOutput {
-            embeddings,
+        Ok(PendingEncode {
+            outs,
+            queued,
+            len: batch.len(),
+            dim,
+            full: cfg.embedding_dim as usize,
             trace: out_trace,
             forwards,
         })
@@ -1675,7 +1823,7 @@ impl EmbedGemma2Model {
     /// too, as raw f32 bits through the same no-wait path (the runtime has no
     /// f32 twin of `alloc_buffer_from_u32`). A forward with no soft rows
     /// allocates nothing for them.
-    fn forward_io(&self, batch: &[MmSequence<'_>], tokens: Option<&MmTokens>) -> Result<ForwardIo, String> {
+    fn forward_io(&self, batch: &[Seq<'_>], tokens: Option<&MmTokens>) -> Result<ForwardIo, String> {
         const WHAT: &str = "EmbedGemma2Model::forward";
         let rt = &self.rt;
         let seq = batch.iter().map(|s| s.ids.len()).max().unwrap_or(0);
@@ -1704,16 +1852,9 @@ impl EmbedGemma2Model {
             .enumerate()
             .flat_map(|(b, s)| [(b * seq) as u32, (b * seq + s.ids.len()) as u32])
             .collect();
+        let hidden = self.cfg.hidden as usize;
         let soft = match tokens {
-            Some(t) if batch.iter().any(|s| !s.soft.is_empty()) => {
-                let bits: Vec<u32> = batch.iter().flat_map(|s| s.soft.iter().map(|v| v.to_bits())).collect();
-                let n = bits.len() / self.cfg.hidden as usize;
-                Some(SoftIo {
-                    rows: rt.alloc_buffer_from_u32(&bits)?,
-                    n: u32::try_from(n).map_err(|_| format!("{WHAT}: {n} soft rows exceed u32"))?,
-                    runs: soft_runs(batch, seq, t),
-                })
-            }
+            Some(t) if batch.iter().any(|s| s.soft.rows(hidden) > 0) => Some(self.soft_io(batch, seq, t)?),
             _ => None,
         };
         Ok(ForwardIo {
@@ -1725,11 +1866,70 @@ impl EmbedGemma2Model {
         })
     }
 
+    /// The soft rows of a forward's `batch` as device buffers and the runs
+    /// that copy them over the placeholder rows. Host rows are uploaded, all
+    /// of the forward's into one buffer, as raw f32 bits through the same
+    /// no-wait path as the ids (the runtime has no f32 twin of
+    /// `alloc_buffer_from_u32`); device segments are used where they are, so
+    /// nothing is uploaded or copied for them. This is the one place the two
+    /// sources meet: after it the scatter does not know which it has.
+    fn soft_io(&self, batch: &[Seq<'_>], seq: usize, tokens: &MmTokens) -> Result<SoftIo, String> {
+        const WHAT: &str = "EmbedGemma2Model::forward";
+        let hidden = self.cfg.hidden as usize;
+        let bits: Vec<u32> = batch
+            .iter()
+            .flat_map(|s| match s.soft {
+                SoftSource::Host(v) => v.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+                SoftSource::Device(_) => Vec::new(),
+            })
+            .collect();
+        let mut sources: Vec<GpuBuffer> = Vec::new();
+        if !bits.is_empty() {
+            sources.push(self.rt.alloc_buffer_from_u32(&bits)?);
+        }
+        let mut host_row = 0u32;
+        let mut segs: Vec<Vec<(usize, u32, u32)>> = Vec::with_capacity(batch.len());
+        for s in batch {
+            let mut mine = Vec::new();
+            match s.soft {
+                SoftSource::Host(v) => {
+                    let n = u32::try_from(v.len() / hidden)
+                        .map_err(|_| format!("{WHAT}: {} soft rows exceed u32", v.len() / hidden))?;
+                    if n > 0 {
+                        mine.push((0, host_row, n));
+                    }
+                    host_row = host_row
+                        .checked_add(n)
+                        .ok_or_else(|| format!("{WHAT}: soft rows exceed u32"))?;
+                }
+                SoftSource::Device(device) => {
+                    for seg in device.iter().filter(|g| g.rows > 0) {
+                        let at = match sources.iter().position(|b| b.aliases(&seg.buf)) {
+                            Some(i) => i,
+                            None => {
+                                sources.push(seg.buf.clone());
+                                sources.len() - 1
+                            }
+                        };
+                        mine.push((at, seg.row, seg.rows));
+                    }
+                }
+            }
+            segs.push(mine);
+        }
+        let ids: Vec<&[u32]> = batch.iter().map(|s| s.ids).collect();
+        Ok(SoftIo {
+            sources,
+            runs: soft_runs(&ids, &segs, seq, tokens)?,
+        })
+    }
+
     /// Overwrite the placeholder rows of `embeds` (`rows` rows of `hidden`,
     /// just gathered as the pad id) with the forward's soft rows, unscaled:
-    /// one flat [`copy_cols`] per run of consecutive placeholder rows, a
-    /// single row of the run's whole width. A document with one image or
-    /// clip has one run; the runs number at most `(rows + 1) / 2`.
+    /// one flat [`copy_cols`] per run of consecutive placeholder rows whose
+    /// soft rows are consecutive in one source, a single row of the run's
+    /// whole width. A document with one image or clip has one run; the runs
+    /// number at most `(rows + 1) / 2`.
     fn scatter_soft(&self, soft: &SoftIo, embeds: &GpuBuffer, rows: u32) -> Result<(), String> {
         const WHAT: &str = "EmbedGemma2Model::forward";
         let h = self.cfg.hidden;
@@ -1738,32 +1938,31 @@ impl EmbedGemma2Model {
                 .checked_mul(h)
                 .ok_or_else(|| format!("{WHAT}: {what} ({count} rows of {h}) exceeds u32 indexing"))
         };
-        let (soft_len, embeds_len) = (flat(soft.n, "soft rows")?, flat(rows, "padded rows")?);
-        let covered: u32 = soft.runs.iter().map(|&(_, _, len)| len).sum();
-        if covered != soft.n {
-            return Err(format!(
-                "{WHAT}: the placeholder runs cover {covered} rows, the forward has {} soft rows",
-                soft.n
-            ));
-        }
-        for &(src, dst, len) in &soft.runs {
-            if src + len > soft.n || dst + len > rows {
+        let embeds_len = flat(rows, "padded rows")?;
+        for &(source, src_row, dst_row, len) in &soft.runs {
+            let buf = soft
+                .sources
+                .get(source)
+                .ok_or_else(|| format!("{WHAT}: soft run names source {source} of {}", soft.sources.len()))?;
+            let end = src_row
+                .checked_add(len)
+                .ok_or_else(|| format!("{WHAT}: soft run (src {src_row}, len {len}) exceeds u32"))?;
+            if dst_row.checked_add(len).is_none_or(|e| e > rows) {
                 return Err(format!(
-                    "{WHAT}: soft run (src {src}, dst {dst}, len {len}) exceeds {} soft rows or {rows} padded rows",
-                    soft.n
+                    "{WHAT}: soft run (dst {dst_row}, len {len}) exceeds {rows} padded rows"
                 ));
             }
             copy_cols(
                 &self.rt,
                 Cols {
-                    buf: &soft.rows,
-                    ld: soft_len,
-                    off: src * h,
+                    buf,
+                    ld: flat(end, "soft rows")?,
+                    off: src_row * h,
                 },
                 Cols {
                     buf: embeds,
                     ld: embeds_len,
-                    off: dst * h,
+                    off: dst_row * h,
                 },
                 1,
                 len * h,
@@ -2133,7 +2332,7 @@ fn view(t: &Tensor, rows: u32, cols: u32) -> Result<Tensor, String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        encoder_attn_tiled_entry, pack_forwards, queue_forwards, soft_runs, MmSequence, MmTokens, SpecialTokens,
+        encoder_attn_tiled_entry, pack_forwards, queue_forwards, soft_runs, MmTokens, SpecialTokens,
         FORWARD_COST_ROWS_ASYNC, FORWARD_COST_ROWS_SYNC, MAX_BATCH,
     };
 
@@ -2149,26 +2348,102 @@ mod tests {
             video: 91,
             audio: 92,
         };
-        let seq = |ids: &'static [u32]| MmSequence { ids, soft: &[] };
-        let run = |chunk: &[MmSequence<'_>], seq: usize| soft_runs(chunk, seq, &tokens);
-        assert!(run(&[seq(&[1, 2, 3])], 3).is_empty(), "no placeholders");
+        // The host form: one source (0), each sequence's rows one segment,
+        // numbered in chunk order. Runs are `(source, first soft row, first
+        // padded row, count)`.
+        let run = |chunk: &[&[u32]], seq: usize| {
+            let mut next = 0u32;
+            let segs: Vec<Vec<(usize, u32, u32)>> = chunk
+                .iter()
+                .map(|ids| {
+                    let n = ids.iter().filter(|&&id| tokens.is_placeholder(id)).count() as u32;
+                    next += n;
+                    if n == 0 {
+                        Vec::new()
+                    } else {
+                        vec![(0, next - n, n)]
+                    }
+                })
+                .collect();
+            soft_runs(chunk, &segs, seq, &tokens).unwrap()
+        };
+        assert!(run(&[&[1, 2, 3]], 3).is_empty(), "no placeholders");
         // One image: a single run over the placeholders.
-        assert_eq!(run(&[seq(&[1, 90, 90, 90, 2])], 5), [(0, 1, 3)]);
+        assert_eq!(run(&[&[1, 90, 90, 90, 2]], 5), [(0, 0, 1, 3)]);
         // Three kinds, scattered: runs split at text, kinds merge when adjacent.
         assert_eq!(
-            run(&[seq(&[90, 91, 5, 92, 5, 5, 90])], 7),
-            [(0, 0, 2), (2, 3, 1), (3, 6, 1)]
+            run(&[&[90, 91, 5, 92, 5, 5, 90]], 7),
+            [(0, 0, 0, 2), (0, 2, 3, 1), (0, 3, 6, 1)]
         );
         // Padding separates: a sequence of 2 padded to 3 ends a run at its last token.
-        assert_eq!(run(&[seq(&[5, 90]), seq(&[90, 5, 5])], 3), [(0, 1, 1), (1, 3, 1)]);
+        assert_eq!(run(&[&[5, 90], &[90, 5, 5]], 3), [(0, 0, 1, 1), (0, 1, 3, 1)]);
         // Full-length sequences touch: rows 2 and 3 are one run, its soft rows
         // are consecutive.
         assert_eq!(
-            run(&[seq(&[5, 5, 90]), seq(&[90, 90, 5]), seq(&[5, 5, 90])], 3),
-            [(0, 2, 3), (3, 8, 1)]
+            run(&[&[5, 5, 90], &[90, 90, 5], &[5, 5, 90]], 3),
+            [(0, 0, 2, 3), (0, 3, 8, 1)]
         );
         // A second sequence's rows continue the numbering.
-        assert_eq!(run(&[seq(&[90, 5]), seq(&[5, 91])], 2), [(0, 0, 1), (1, 3, 1)]);
+        assert_eq!(run(&[&[90, 5], &[5, 91]], 2), [(0, 0, 0, 1), (0, 1, 3, 1)]);
+    }
+
+    /// Device sources: one placeholder run is cut wherever its soft rows are
+    /// not consecutive in one source, and a run continues where they are.
+    /// `segs[b]` is sequence `b`'s rows `(source, first row, count)` in
+    /// placeholder order.
+    #[test]
+    fn soft_runs_split_where_the_sources_do() {
+        let tokens = MmTokens {
+            pad: 0,
+            image: 90,
+            video: 91,
+            audio: 92,
+        };
+        let run = |ids: &[&[u32]], segs: &[&[(usize, u32, u32)]], seq: usize| {
+            let segs: Vec<Vec<(usize, u32, u32)>> = segs.iter().map(|s| s.to_vec()).collect();
+            soft_runs(ids, &segs, seq, &tokens)
+        };
+        // Two adjacent images in one buffer, back to back: one copy.
+        assert_eq!(
+            run(&[&[1, 90, 90, 90, 90, 2]], &[&[(0, 0, 2), (0, 2, 2)]], 6).unwrap(),
+            [(0, 0, 1, 4)]
+        );
+        // The same two images in two buffers: one placeholder run, two copies.
+        assert_eq!(
+            run(&[&[1, 90, 90, 90, 90, 2]], &[&[(0, 0, 2), (1, 0, 2)]], 6).unwrap(),
+            [(0, 0, 1, 2), (1, 0, 3, 2)]
+        );
+        // Two images in one buffer with a gap between (rows 2 and 3 not kept):
+        // a clip whose output mask has a hole.
+        assert_eq!(
+            run(&[&[90, 90, 90, 90]], &[&[(0, 4, 2), (0, 8, 2)]], 4).unwrap(),
+            [(0, 4, 0, 2), (0, 8, 2, 2)]
+        );
+        // Image and audio placeholders interleaved, each taking its next row
+        // from its own tower's buffer, the way the facade orders them.
+        assert_eq!(
+            run(
+                &[&[90, 92, 90, 5, 92]],
+                &[&[(0, 0, 1), (1, 0, 1), (0, 1, 1), (1, 1, 1)]],
+                5
+            )
+            .unwrap(),
+            [(0, 0, 0, 1), (1, 0, 1, 1), (0, 1, 2, 1), (1, 1, 4, 1)]
+        );
+        // A run continues across a sequence boundary when the sources line up.
+        assert_eq!(
+            run(&[&[5, 90], &[90, 5]], &[&[(0, 3, 1)], &[(0, 4, 1)]], 2).unwrap(),
+            [(0, 3, 1, 2)]
+        );
+        // Sequences with no soft rows contribute nothing.
+        assert_eq!(
+            run(&[&[5, 5], &[90, 90]], &[&[], &[(0, 0, 2)]], 2).unwrap(),
+            [(0, 0, 2, 2)]
+        );
+        // A count that does not match the placeholders is an error, not a
+        // short or long copy.
+        assert!(run(&[&[90, 90]], &[&[(0, 0, 1)]], 2).is_err());
+        assert!(run(&[&[90]], &[&[(0, 0, 2)]], 1).is_err());
     }
 
     /// The special tokens: every key named when missing, the multimodal set

@@ -97,7 +97,7 @@ impl ByHand {
     fn new(f: &Fixture, rt: &std::sync::Arc<tessl::GpuRuntime>, operands: GemmOperands) -> Self {
         Self {
             text: EmbedGemma2Model::load_with(rt, &f.st, PREFIX, f.c.text.clone(), operands).unwrap(),
-            vision: EmbedGemma2VisionModel::load(rt, &f.st, f.c.vision.clone()).unwrap(),
+            vision: EmbedGemma2VisionModel::load_with(rt, &f.st, f.c.vision.clone(), operands).unwrap(),
             audio: EmbedGemma2Audio::load(rt, &f.st, "", f.c.audio.clone()).unwrap(),
         }
     }

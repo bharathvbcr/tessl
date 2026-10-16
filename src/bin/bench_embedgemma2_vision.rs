@@ -14,11 +14,17 @@
 //! `encode_images` cuts into two forwards (`forwards` in the output).
 //!
 //! `BENCH_ITERS` (default 10) and `BENCH_WARMUP` (default 3) are per workload.
+//! `BENCH_PRECISION=f32|bf16` (default `f32`) picks the operand precision the
+//! tower is loaded with ([`EmbedGemma2VisionModel::load_with`]: `GemmOperands::ExactF32`
+//! or `Bf16`); the object's `backend` says which (`tessl-f32`, `tessl-bf16`).
 //! Prints one JSON array on stdout, one object per workload: `{workload,
-//! backend, ms_min, ms_median, iters, forwards, loaded_mib, device_peak_mib,
+//! backend, ms_min, ms_median, iters, forwards, weight_mib, loaded_mib, device_peak_mib,
 //! peak_footprint_mib}`, the format `bench_paired --format workloads` reads.
-//! `loaded_mib` is the device bytes allocated once the model is loaded (the
-//! weights, the position table and the norms' buffers; no activations).
+//! `weight_mib` is the model's weight bytes ([`EmbedGemma2VisionModel::weight_bytes`]);
+//! `loaded_mib` is the device bytes allocated once it is loaded (those, and the
+//! pool's rounding; no activations). The base build (433e659), which has neither
+//! `load_with` nor `weight_bytes`, runs this file as of f4a9ece, which differs
+//! from this one in those two lines and the `BENCH_PRECISION` knob only.
 //! stderr carries `HASH <workload> <fnv1a64>` per workload, over the bits of
 //! every soft value in call order: two builds with equal hashes produced
 //! bit-identical outputs.
@@ -37,6 +43,7 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 use tessl::embedgemma2_vision::{EmbedGemma2VisionModel, ImageInput, VisionConfig};
+use tessl::gemm::GemmOperands;
 use tessl::npy::read_npy;
 use tessl::safetensors::SafeTensors;
 use tessl::GpuRuntime;
@@ -95,8 +102,13 @@ fn main() -> Result<(), String> {
     let st = SafeTensors::open(&snap.join("model.safetensors"))?;
     let goldens = [golden(&refs, 0)?, golden(&refs, 1)?];
     let rt = GpuRuntime::new_inference()?;
-    let model = EmbedGemma2VisionModel::load(&rt, &st, cfg)?;
-    let backend = "tessl-f32";
+    let (operands, backend) = match std::env::var("BENCH_PRECISION").as_deref() {
+        Err(_) | Ok("f32") => (GemmOperands::ExactF32, "tessl-f32"),
+        Ok("bf16") => (GemmOperands::Bf16, "tessl-bf16"),
+        Ok(other) => return Err(format!("BENCH_PRECISION={other:?}: expected f32 or bf16")),
+    };
+    let model = EmbedGemma2VisionModel::load_with(&rt, &st, cfg, operands)?;
+    let weight_mib = model.weight_bytes() as f64 / MIB;
     let loaded = rt.current_allocated_bytes();
     let loaded_mib = loaded as f64 / MIB;
 
@@ -142,7 +154,7 @@ fn main() -> Result<(), String> {
         ms.sort_by(f64::total_cmp);
         let device_peak = rt.peak_allocated_bytes().saturating_sub(loaded);
         rows.push(format!(
-            "{{\"workload\":\"{n}img\",\"backend\":\"{backend}\",\"ms_min\":{:.4},\"ms_median\":{:.4},\"iters\":{iters},\"forwards\":{},\"loaded_mib\":{loaded_mib:.1},\"device_peak_mib\":{:.1},\"peak_footprint_mib\":{:.1}}}",
+            "{{\"workload\":\"{n}img\",\"backend\":\"{backend}\",\"ms_min\":{:.4},\"ms_median\":{:.4},\"iters\":{iters},\"forwards\":{},\"weight_mib\":{weight_mib:.1},\"loaded_mib\":{loaded_mib:.1},\"device_peak_mib\":{:.1},\"peak_footprint_mib\":{:.1}}}",
             ms[0],
             ms[ms.len() / 2],
             out.forwards,

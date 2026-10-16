@@ -26,10 +26,10 @@ pub const IMAGE: u32 = 60;
 pub const AUDIO: u32 = 61;
 pub const VIDEO: u32 = 62;
 
-/// Two layers of three heads of 32, hidden 96, patch 4 (patch width 48), a 2x2
+/// Two layers of two heads of 64 (the head size the bf16 attention kernel is compiled for, so one checkpoint serves both modes), hidden 96, patch 4 (patch width 48), a 2x2
 /// pooling cell, a 128-row position table.
 pub const VISION_JSON: &str = r#"{"model_type":"gemma4_vision","hidden_activation":"gelu_pytorch_tanh","hidden_size":96,
-"num_hidden_layers":2,"num_attention_heads":3,"num_key_value_heads":3,"head_dim":32,"intermediate_size":160,
+"num_hidden_layers":2,"num_attention_heads":2,"num_key_value_heads":2,"head_dim":64,"intermediate_size":160,
 "patch_size":4,"pooling_kernel_size":2,"position_embedding_size":128,"rms_norm_eps":1e-06,
 "attention_bias":false,"attention_dropout":0.0,"standardize":false,"use_clipped_linears":false,
 "rope_parameters":{"rope_theta":100.0,"rope_type":"axial"}}"#;

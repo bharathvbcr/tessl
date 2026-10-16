@@ -807,13 +807,27 @@ fn embedgemma2_vision_offsets_are_widened() {
     for (needle, what) in [
         // The norm + axial RoPE + K/V store.
         ("const ulong unit = (ulong)tg * (tptg / 32u) + sg;", "simdgroup unit"),
-        ("if (unit >= (ulong)B * T * heads) return;", "unit bound"),
+        ("if (unit >= (ulong)B * T * per_row) return;", "unit bound"),
         ("if (t >= (ulong)kv_capacity) return;", "slot bound"),
         ("device const float *row = p + r * (ulong)ld_p;", "projection row"),
         ("const float pos_x = (float)positions[2ul * r];", "x position"),
         (
             "const ulong slot = ((b * kv_capacity + t) * Hkv + h) * (ulong)D;",
             "cache slot",
+        ),
+        // Both stored types run that one unit (the bf16 kernel is an
+        // instantiation, not a second copy of the arithmetic).
+        (
+            "VISION_QKV_KERNEL(vision_qkv_norm_rope_f32, float)",
+            "f32 instantiation",
+        ),
+        (
+            "VISION_QKV_KERNEL(vision_qkv_norm_rope_bf16, bfloat)",
+            "bf16 instantiation",
+        ),
+        (
+            "vision_qkv_norm_rope_unit(p, q_norm_w, k_norm_w, q_out, k_cache, v_cache,",
+            "kernels call the shared unit",
         ),
         // The position embedding add.
         ("const ulong o = (ulong)r * D + c;", "pos embed element"),

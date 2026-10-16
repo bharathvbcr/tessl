@@ -60,24 +60,44 @@
 //!
 //! # Precision
 //!
-//! As the text encoder: weights widened from bf16 exactly, every activation
-//! f32, every GEMM exact f32 (it refuses a runtime with relaxed f32 GEMMs on).
-//! A bf16 mode is a later step.
+//! As the text encoder ([`crate::embedgemma2`]), the mode is chosen when the
+//! tower is loaded ([`EmbedGemma2VisionModel::load_with`]).
+//!
+//! [`EmbedGemma2VisionModel::load`] is [`GemmOperands::ExactF32`]: weights
+//! widened from the checkpoint's bf16 exactly, every activation f32, every GEMM
+//! exact f32 (it refuses a runtime with relaxed f32 GEMMs on). Its results are
+//! unchanged by the bf16 path: the tiny checkpoint's and the real one's output
+//! hash identically before and after.
+//!
+//! [`GemmOperands::Bf16`] keeps every projection as the checkpoint stores it,
+//! bf16, on the device (no f32 copy), and runs every GEMM with bf16 operands and
+//! f32 accumulation. The inputs of the GEMMs are rounded to bf16 where they are
+//! produced when a kernel can write bf16 (the pixels, on the host as they are
+//! scaled; the norms; the GELU gate), and by one cast pass per layer where one
+//! cannot (the attention output, [`crate::embedgemma2::encoder_attn_bf16`]
+//! writes f32). q, k and v are stored bf16 by the axial kernel and the
+//! attention runs on bf16 tiles. The residual stream, the norms' arithmetic,
+//! the rotation, the pooling and the soft tokens stay f32. A runtime with
+//! relaxed f32 GEMMs on is accepted: no GEMM here is an f32 one. The audio tower
+//! has no such mode ([`crate::embedgemma2_audio`] stays exact f32).
 //!
 //! # Kernels
 //!
-//! New, in `kernels/embedgemma2_vision.metal`: `vision_qkv_norm_rope_f32`
-//! ([`axial_qkv_norm_rope`]), `vision_pos_embed_add_f32`
+//! New, in `kernels/embedgemma2_vision.metal`: `vision_qkv_norm_rope_f32` and
+//! `_bf16` ([`axial_qkv_norm_rope`], [`axial_qkv_norm_rope_bf16`]: one body,
+//! two stored types), `vision_pos_embed_add_f32`
 //! ([`patch_position_embed_add`]) and `vision_pool_members_f32`
 //! ([`pool_by_members`]). The 1-D RoPE path ([`crate::qwen35`]'s) rotates a
 //! head by one position per token and is paired with a backward kernel that
 //! must stay its transpose, so the axial mode is its own kernel rather than a
-//! mode of that one. Everything else is tessl's: exact-f32 GEMMs,
-//! [`crate::nn::rms_norm_f32`] (the embedder's weightless norm is the same
-//! kernel with a weight of ones, which multiplies exactly),
+//! mode of that one. Everything else is tessl's: GEMMs (exact f32, or bf16
+//! operands), [`crate::nn::rms_norm_f32`] ([`crate::nn::rms_norm_bf16`] into a
+//! bf16 GEMM's input; the embedder's weightless norm is the same kernel with a
+//! weight of ones, which multiplies exactly),
 //! [`crate::nn::rms_norm_residual_add_f32`], [`crate::qwen35::gated_act`] and
-//! [`crate::embedgemma2::encoder_attn`] at head dim 64 (window 0, scale 1.0:
-//! every real key of the image, none past its length).
+//! [`crate::embedgemma2::encoder_attn`] ([`crate::embedgemma2::encoder_attn_bf16`])
+//! at head dim 64 (window 0, scale 1.0: every real key of the image, none past
+//! its length).
 //!
 //! # Waiting
 //!
@@ -118,6 +138,17 @@ pub const MAX_BATCH_PATCHES: usize = 16_384;
 // ---------------------------------------------------------------------------
 // Kernels
 // ---------------------------------------------------------------------------
+
+/// The largest head dim [`axial_qkv_norm_rope`] takes: the kernel keeps a
+/// head's rotation table (one cos/sin pair per rotated pair, a lane's share of
+/// `head_dim / 2`) in registers, sized for 512 (the checkpoint's is 64).
+const MAX_ROPE_HEAD_DIM: u32 = 512;
+
+/// Consecutive heads of one kind (q, k or v) of one row that one simdgroup of
+/// `vision_qkv_norm_rope_*` takes: the rotation depends on the patch and not
+/// the head, so they share one table of `cos`/`sin` (the dominant arithmetic)
+/// that one simdgroup per head formed again for each.
+const ROPE_HEADS_PER_UNIT: u32 = 6;
 
 /// Shape of one [`axial_qkv_norm_rope`] call.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -214,10 +245,16 @@ fn axial_qkv_norm_rope_to(
 ) -> Result<(), String> {
     const WHAT: &str = "embedgemma2_vision::axial_qkv_norm_rope";
     let s = shape;
-    if s.head_dim == 0 || s.head_dim % 4 != 0 || s.q_heads == 0 || s.kv_heads == 0 || s.q_heads % s.kv_heads != 0 {
+    if s.head_dim == 0
+        || s.head_dim % 4 != 0
+        || s.head_dim > MAX_ROPE_HEAD_DIM
+        || s.q_heads == 0
+        || s.kv_heads == 0
+        || s.q_heads % s.kv_heads != 0
+    {
         return Err(format!(
-            "{WHAT}: head_dim must be a positive multiple of 4 and q_heads a multiple of kv_heads, got \
-             head_dim {}, q_heads {}, kv_heads {}",
+            "{WHAT}: head_dim must be a positive multiple of 4 up to {MAX_ROPE_HEAD_DIM} and q_heads a multiple of \
+             kv_heads, got head_dim {}, q_heads {}, kv_heads {}",
             s.head_dim, s.q_heads, s.kv_heads
         ));
     }
@@ -275,7 +312,8 @@ fn axial_qkv_norm_rope_to(
     )?;
     // One simdgroup per (row, head); eight per threadgroup.
     const SIMDGROUPS: usize = 8;
-    let units = rows as usize * (s.q_heads + 2 * s.kv_heads) as usize;
+    let units = rows as usize
+        * (s.q_heads.div_ceil(ROPE_HEADS_PER_UNIT) + 2 * s.kv_heads.div_ceil(ROPE_HEADS_PER_UNIT)) as usize;
     let p = rt.pipeline(if bf16 {
         "vision_qkv_norm_rope_bf16"
     } else {
@@ -301,6 +339,7 @@ fn axial_qkv_norm_rope_to(
         set_u32(bnd, kv_capacity, 16);
         bind_rope_inv_freq(bnd, s.head_dim / 4, s.head_dim / 2, theta, 17);
         set_f32(bnd, eps, 18);
+        set_u32(bnd, ROPE_HEADS_PER_UNIT, 19);
     })
 }
 

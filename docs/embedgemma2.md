@@ -139,7 +139,7 @@ named as such by the Python binding.
 
 | Entry | Does |
 |---|---|
-| `tessl_embedgemma2_load_multimodal(runtime, dir, dir_len, operands, &out, err, err_len)` | `tessl_embedgemma2_load` with the vision and audio towers as well: one read of `config.json`, one open of `model.safetensors`. `operands` is `TESSL_OPERANDS_EXACT_F32` (0) or `TESSL_OPERANDS_BF16` (1) and applies to the **text encoder only**; the towers are exact f32 under either (they have no bf16 mode). The handle takes every text entry too, and `_free` |
+| `tessl_embedgemma2_load_multimodal(runtime, dir, dir_len, operands, &out, err, err_len)` | `tessl_embedgemma2_load` with the vision and audio towers as well: one read of `config.json`, one open of `model.safetensors`. `operands` is `TESSL_OPERANDS_EXACT_F32` (0) or `TESSL_OPERANDS_BF16` (1) and applies to the **text encoder and the vision tower**; the audio tower is exact f32 under either (it has no bf16 mode). The handle takes every text entry too, and `_free` |
 | `tessl_embedgemma2_encode_images(model, pixel_values, pixel_values_len, position_ids, position_ids_len, offsets, n_images, truncate_dim, out, out_len, err, err_len)` | `pixel_values` f32 `[offsets[n_images], patch_dim]` and `position_ids` i32 `[offsets[n_images], 2]`, the processor's `pixel_values` and `image_position_ids` with the images laid end to end (padding patches `(-1, -1)` included), `offsets` CSR-style `u64` over patch rows; `out` is f32 `[n_images, dim]`, one row per image |
 | `tessl_embedgemma2_encode_audio(model, input_features, input_features_len, input_features_mask, mask_len, offsets, n_clips, truncate_dim, out, out_len, err, err_len)` | `input_features` f32 `[offsets[n_clips], mel_bins]` and the mask one byte per frame (0 or 1; any other byte is refused), `offsets` over frames; one row per clip |
 
@@ -166,7 +166,7 @@ From Python (needs only numpy and the built library; `transformers` is not
 imported and not a dependency):
 
 ```python
-model = EmbedGemma2.from_pretrained(snapshot_dir, multimodal=True)    # operands="bf16" for the text encoder
+model = EmbedGemma2.from_pretrained(snapshot_dir, multimodal=True)    # operands="bf16" for the text encoder and the vision tower
 out = processor(images=images, return_tensors="np")                   # your transformers processor
 emb = model.encode_images(out["pixel_values"], out["image_position_ids"])   # float32 [n, 768]
 emb = model.embed_images(images, processor)                           # the same two lines in one call
@@ -335,9 +335,14 @@ let out = m.encode(&items, Some(256))?;       // EncodeOutput: one row per item,
   (vision, audio, text). One wait would need the text encoder to take the
   towers' device buffers instead of host rows; that GPU-resident hand-off is not
   done here (follow-up below).
-* **Precision.** `GemmOperands` applies to the text encoder (`ExactF32` or
-  `Bf16`). The towers are exact f32 under both; there is no tower bf16 mode and
-  none was invented. The call refuses a runtime with relaxed f32 GEMMs on.
+* **Precision.** One `GemmOperands` (`ExactF32` or `Bf16`) configures the text
+  encoder and the vision tower alike (`EmbedGemma2VisionModel::load_with`, [Vision
+  tower](#vision-tower)): it is one flag because both make one precision claim to
+  the caller, and a caller composing the models by hand (`from_parts`) can still
+  mix them. The audio tower is exact f32 under both: it has no bf16 mode (lane I
+  owns it). The call refuses a runtime with relaxed f32 GEMMs on when it holds
+  clips or the mode is `ExactF32`; a `Bf16` call of text and images runs no f32
+  GEMM and accepts it.
 * **Refusals** come before any allocation or wait: the batch size, each
   tower's input checks, the text checks, the placeholder counts. A refused call
   leaves the facade usable.

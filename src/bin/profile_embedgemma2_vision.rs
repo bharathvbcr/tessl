@@ -10,7 +10,11 @@
 //!
 //! A replica of `EmbedGemma2VisionModel`'s forward built from the library's
 //! public kernels, loaded from the real checkpoint (all 16 layers, so the
-//! weights cycle through the caches as they do in a call). The replica runs in
+//! weights cycle through the caches as they do in a call). `PROFILE_OPERANDS`
+//! (`f32`, the default, or `bf16`) picks the operand precision the library is
+//! loaded with and the replica mirrors (`load_with`); under `bf16` the attention
+//! output's cast to bf16 is a class of its own and under `f32` it has no
+//! dispatch and is left out of the report. The replica runs in
 //! async mode, `reps` calls queued per host wait, and each stage is a *class*
 //! that a bit mask switches on or off. Per workload it times, interleaved and
 //! min-of-`PROFILE_ROUNDS`:
@@ -47,17 +51,17 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 
-use tessl::embedgemma2::{encoder_attn, EncoderAttnDims};
+use tessl::embedgemma2::{encoder_attn, encoder_attn_bf16, EncoderAttnDims};
 use tessl::embedgemma2_vision::{
-    axial_qkv_norm_rope, patch_position_embed_add, plan_pooling, pool_by_members, AxialQkvShape,
-    EmbedGemma2VisionModel, ImageInput, VisionConfig, MAX_BATCH_PATCHES, MAX_IMAGES,
+    axial_qkv_norm_rope, axial_qkv_norm_rope_bf16, patch_position_embed_add, plan_pooling, pool_by_members,
+    AxialQkvShape, EmbedGemma2VisionModel, ImageInput, VisionConfig, MAX_BATCH_PATCHES, MAX_IMAGES,
 };
-use tessl::gemm::{gemm, GemmBackend};
-use tessl::nn::{rms_norm_f32, rms_norm_residual_add_f32};
+use tessl::gemm::{cast_f32_to_bf16_into, gemm, GemmBackend, GemmOperands};
+use tessl::nn::{rms_norm_bf16, rms_norm_f32, rms_norm_residual_add_f32};
 use tessl::npy::read_npy;
 use tessl::qwen35::{self, AttnTargets, Cols, GatedAct, OutCols};
 use tessl::safetensors::SafeTensors;
-use tessl::tensor::{DType, GpuBuffer, Tensor};
+use tessl::tensor::{f32_to_bf16_bits_gpu, DType, GpuBuffer, Tensor};
 use tessl::GpuRuntime;
 
 use common::{
@@ -83,6 +87,7 @@ enum C {
     QkvGemm,
     QkvNormRope,
     Attention,
+    AttnCast,
     OGemm,
     NormResid,
     GateUpGemm,
@@ -93,13 +98,14 @@ enum C {
     EmbedGemm,
 }
 
-const NAMES: [&str; 14] = [
+const NAMES: [&str; 15] = [
     "patch embed GEMM",
     "pos-embed add",
     "rms_norm (input, pre-ffn)",
     "qkv GEMM",
     "qk-norm+axial rope+kv store",
     "attention (hd64)",
+    "attn output cast f32->bf16",
     "o GEMM",
     "norm+residual (post-attn, post-ffn)",
     "gate|up GEMM",
@@ -152,36 +158,54 @@ fn norm_buf(rt: &Arc<GpuRuntime>, st: &SafeTensors, name: &str, dim: usize) -> R
 }
 
 /// `nn.Linear` weights `[out_i, in]` packed side by side into `[in, sum(out_i)]`,
-/// widened to f32.
+/// widened to f32, or kept as the checkpoint stores them (bf16) with `bf16`.
 fn pack_linear(
     rt: &Arc<GpuRuntime>,
     st: &SafeTensors,
     prefix: &str,
     parts: &[(String, usize)],
     inf: usize,
+    bf16: bool,
 ) -> Result<Tensor, String> {
     let total: usize = parts.iter().map(|p| p.1).sum();
-    let t = rt.alloc_tensor_f32_hot(&[inf, total])?;
-    let mut dst = t.buffer.try_contents_f32()?;
+    let t = if bf16 {
+        rt.alloc_tensor_bf16_hot(&[inf, total])?
+    } else {
+        rt.alloc_tensor_f32_hot(&[inf, total])?
+    };
     let mut col0 = 0;
     for (name, out) in parts {
-        let (shape, w) = st.read_f32(&format!("{prefix}{name}"))?;
-        if shape != [*out, inf] {
-            return Err(format!("{name}: shape {shape:?}, expected [{out}, {inf}]"));
-        }
-        for o in 0..*out {
-            for i in 0..inf {
-                dst[i * total + col0 + o] = w[o * inf + i];
+        let full = format!("{prefix}{name}");
+        if bf16 {
+            let (shape, w) = st.read_bf16_bits(&full)?;
+            if shape != [*out, inf] {
+                return Err(format!("{name}: shape {shape:?}, expected [{out}, {inf}]"));
+            }
+            let mut dst = t.buffer.try_contents_u16()?;
+            for o in 0..*out {
+                for i in 0..inf {
+                    dst[i * total + col0 + o] = w[o * inf + i];
+                }
+            }
+        } else {
+            let (shape, w) = st.read_f32(&full)?;
+            if shape != [*out, inf] {
+                return Err(format!("{name}: shape {shape:?}, expected [{out}, {inf}]"));
+            }
+            let mut dst = t.buffer.try_contents_f32()?;
+            for o in 0..*out {
+                for i in 0..inf {
+                    dst[i * total + col0 + o] = w[o * inf + i];
+                }
             }
         }
         col0 += out;
     }
-    drop(dst);
     Ok(t)
 }
 
 impl Weights {
-    fn load(rt: &Arc<GpuRuntime>, st: &SafeTensors, cfg: &VisionConfig) -> Result<Self, String> {
+    fn load(rt: &Arc<GpuRuntime>, st: &SafeTensors, cfg: &VisionConfig, bf16: bool) -> Result<Self, String> {
         let (h, inter, pd, text_h) = (
             cfg.hidden as usize,
             cfg.intermediate as usize,
@@ -191,7 +215,7 @@ impl Weights {
         let qw = (cfg.heads * cfg.head_dim) as usize;
         let d = cfg.head_dim as usize;
         let one = |n: &str, out: usize| vec![(n.to_string(), out)];
-        let patch_proj = pack_linear(rt, st, TOWER, &one("patch_embedder.input_proj.weight", h), pd)?;
+        let patch_proj = pack_linear(rt, st, TOWER, &one("patch_embedder.input_proj.weight", h), pd, bf16)?;
         let size = cfg.position_embedding_size as usize;
         let pos_table = rt.alloc_tensor_bf16_hot(&[2, size, h])?;
         let (shape, bits) = st.read_bf16_bits(&format!("{TOWER}patch_embedder.position_embedding_table"))?;
@@ -204,7 +228,7 @@ impl Weights {
             let p = |s: &str| format!("encoder.layers.{i}.{s}");
             let lin = |names: &[(&str, usize)], inf: usize| {
                 let parts: Vec<(String, usize)> = names.iter().map(|&(n, o)| (p(n), o)).collect();
-                pack_linear(rt, st, TOWER, &parts, inf)
+                pack_linear(rt, st, TOWER, &parts, inf, bf16)
             };
             layers.push(LayerW {
                 input_norm: norm_buf(rt, st, &p("input_layernorm.weight"), h)?,
@@ -232,7 +256,7 @@ impl Weights {
                 down: lin(&[("mlp.down_proj.linear.weight", h)], inter)?,
             });
         }
-        let embed_proj = pack_linear(rt, st, EMBED, &one("embedding_projection.weight", text_h), h)?;
+        let embed_proj = pack_linear(rt, st, EMBED, &one("embedding_projection.weight", text_h), h, bf16)?;
         let ones = rt.alloc_buffer_hot(h * 4)?;
         ones.try_write_f32(&vec![1.0f32; h])?;
         Ok(Self {
@@ -317,6 +341,7 @@ fn make_io(
     imgs: &[ImageInput<'_>],
     valid: &[usize],
     chunk: &[usize],
+    bf16: bool,
 ) -> Result<Io, String> {
     let pd = cfg.patch_dim() as usize;
     let seq = valid[chunk[0]];
@@ -350,10 +375,23 @@ fn make_io(
         rows_out.push(plan.cells.len());
     }
     let pooled_rows = offsets.len() - 1;
+    let pix = if bf16 {
+        // Rounded on the host as the library does: two bf16 to a word.
+        let words: Vec<u32> = pix
+            .chunks(2)
+            .map(|c| {
+                let half = |bits: u32| u32::from(f32_to_bf16_bits_gpu(f32::from_bits(bits)));
+                half(c[0]) | c.get(1).map_or(0, |&b| half(b) << 16)
+            })
+            .collect();
+        Tensor::from_buffer(rt, rt.alloc_buffer_from_u32(&words)?, &[rows, pd], DType::BF16, 0)?
+    } else {
+        Tensor::from_buffer(rt, rt.alloc_buffer_from_u32(&pix)?, &[rows, pd], DType::F32, 0)?
+    };
     Ok(Io {
         nb: chunk.len() as u32,
         seq: seq as u32,
-        pix: Tensor::from_buffer(rt, rt.alloc_buffer_from_u32(&pix)?, &[rows, pd], DType::F32, 0)?,
+        pix,
         positions: rt.alloc_buffer_from_u32(&pos)?,
         lens: rt.alloc_buffer_from_u32(&lens)?,
         offsets: rt.alloc_buffer_from_u32(&offsets)?,
@@ -381,26 +419,48 @@ struct Acts {
     gate_up: Tensor,
     pooled: Tensor,
     normed: Tensor,
+    /// Under bf16: the rounded attention output, then the MLP's activation.
+    wide: Option<Tensor>,
 }
 
 impl Acts {
-    /// Zeroed, so a skipped stage never feeds a NaN downstream.
-    fn new(rt: &Arc<GpuRuntime>, cfg: &VisionConfig, rows: usize, pooled_rows: usize) -> Result<Self, String> {
+    /// Zeroed, so a skipped stage never feeds a NaN downstream. Under `bf16`
+    /// the layout of the library's `Acts`: bf16 x, q, k, v and normed, f32 attn
+    /// of the attention's width, and the bf16 `wide`.
+    fn new(
+        rt: &Arc<GpuRuntime>,
+        cfg: &VisionConfig,
+        rows: usize,
+        pooled_rows: usize,
+        bf16: bool,
+    ) -> Result<Self, String> {
         let (h, inter) = (cfg.hidden as usize, cfg.intermediate as usize);
         let qw = (cfg.heads * cfg.head_dim) as usize;
         let f = |shape: &[usize]| rt.alloc_tensor_f32(shape);
+        let operand = |shape: &[usize]| {
+            if bf16 {
+                rt.alloc_tensor_bf16(shape)
+            } else {
+                rt.alloc_tensor_f32(shape)
+            }
+        };
         Ok(Self {
             resid: f(&[rows, h])?,
-            x: f(&[rows, h])?,
+            x: operand(&[rows, h])?,
             qkv: f(&[rows, 3 * qw])?,
-            q: f(&[rows, qw])?,
-            k: f(&[rows, qw])?,
-            v: f(&[rows, qw])?,
-            attn: f(&[rows, qw.max(inter)])?,
+            q: operand(&[rows, qw])?,
+            k: operand(&[rows, qw])?,
+            v: operand(&[rows, qw])?,
+            attn: f(&[rows, if bf16 { qw } else { qw.max(inter) }])?,
             y: f(&[rows, h])?,
             gate_up: f(&[rows, 2 * inter])?,
             pooled: f(&[pooled_rows, h])?,
-            normed: f(&[pooled_rows, h])?,
+            normed: operand(&[pooled_rows, h])?,
+            wide: if bf16 {
+                Some(rt.alloc_tensor_bf16(&[rows, qw.max(inter)])?)
+            } else {
+                None
+            },
         })
     }
 }
@@ -415,6 +475,15 @@ struct Cx<'a> {
     w: &'a Weights,
     a: &'a Acts,
     ios: &'a [Io],
+    operands: GemmOperands,
+}
+
+/// `out = a @ w` at `operands`' precision (the library's `project`).
+fn project_with(operands: GemmOperands, a: &Tensor, w: &Tensor, out: &Tensor) -> Result<(), String> {
+    match operands {
+        GemmOperands::ExactF32 => gemm(a, w, out, BACKEND),
+        GemmOperands::Bf16 => GemmOperands::Bf16.nn(a, w, out),
+    }
 }
 
 /// Queue one forward over `io` (src/embedgemma2_vision.rs `forward`, op for
@@ -430,11 +499,22 @@ fn forward(cx: &Cx<'_>, io: &Io, mask: u32) -> Result<(), String> {
     let inter = cfg.intermediate;
     let on = |c: C| mask & bit(c) != 0;
     let at = |t: &Tensor, cols: u32| view(t, rows_u, cols);
-    let (resid, x, y) = (at(&a.resid, h)?, at(&a.x, h)?, at(&a.y, h)?);
-    let (qkv, gate_up, mid) = (at(&a.qkv, 3 * qw)?, at(&a.gate_up, 2 * inter)?, at(&a.attn, inter)?);
+    let bf = a.wide.as_ref();
+    let project = |a_in: &Tensor, w: &Tensor, out: &Tensor| project_with(cx.operands, a_in, w, out);
+    let (resid, y) = (at(&a.resid, h)?, at(&a.y, h)?);
+    let x_in = at(&a.x, h)?;
+    let (qkv, gate_up) = (at(&a.qkv, 3 * qw)?, at(&a.gate_up, 2 * inter)?);
+    let mid = match bf {
+        Some(wide) => at(wide, inter)?,
+        None => at(&a.attn, inter)?,
+    };
+    let norm_x_in = |weight: &GpuBuffer| match bf {
+        Some(_) => rms_norm_bf16(rt, &resid.buffer, weight, &x_in.buffer, rows_u, h, eps),
+        None => rms_norm_f32(rt, &resid.buffer, weight, &x_in.buffer, rows_u, h, eps),
+    };
 
     if on(C::PatchGemm) {
-        gemm(&io.pix, &w.patch_proj, &resid, BACKEND)?;
+        project(&io.pix, &w.patch_proj, &resid)?;
     }
     if on(C::PosEmbed) {
         patch_position_embed_add(
@@ -449,13 +529,18 @@ fn forward(cx: &Cx<'_>, io: &Io, mask: u32) -> Result<(), String> {
     }
     for layer in &w.layers {
         if on(C::RmsNorm) {
-            rms_norm_f32(rt, &resid.buffer, &layer.input_norm, &x.buffer, rows_u, h, eps)?;
+            norm_x_in(&layer.input_norm)?;
         }
         if on(C::QkvGemm) {
-            gemm(&x, &layer.w_qkv, &qkv, BACKEND)?;
+            project(&x_in, &layer.w_qkv, &qkv)?;
         }
         if on(C::QkvNormRope) {
-            axial_qkv_norm_rope(
+            let rope = if bf.is_some() {
+                axial_qkv_norm_rope_bf16
+            } else {
+                axial_qkv_norm_rope
+            };
+            rope(
                 rt,
                 &AxialQkvShape {
                     batch: nb,
@@ -480,7 +565,8 @@ fn forward(cx: &Cx<'_>, io: &Io, mask: u32) -> Result<(), String> {
             )?;
         }
         if on(C::Attention) {
-            encoder_attn(
+            let attend = if bf.is_some() { encoder_attn_bf16 } else { encoder_attn };
+            attend(
                 rt,
                 &a.q.buffer,
                 &a.k.buffer,
@@ -498,17 +584,28 @@ fn forward(cx: &Cx<'_>, io: &Io, mask: u32) -> Result<(), String> {
                 },
             )?;
         }
+        let attn = at(&a.attn, qw)?;
+        let o_in = match bf {
+            Some(wide) => {
+                let attn_in = at(wide, qw)?;
+                if on(C::AttnCast) {
+                    cast_f32_to_bf16_into(&attn, &attn_in)?;
+                }
+                attn_in
+            }
+            None => attn,
+        };
         if on(C::OGemm) {
-            gemm(&at(&a.attn, qw)?, &layer.w_o, &y, BACKEND)?;
+            project(&o_in, &layer.w_o, &y)?;
         }
         if on(C::NormResid) {
             rms_norm_residual_add_f32(rt, &y.buffer, &layer.post_attn_norm, &resid.buffer, rows_u, h, eps, 1.0)?;
         }
         if on(C::RmsNorm) {
-            rms_norm_f32(rt, &resid.buffer, &layer.pre_ffn_norm, &x.buffer, rows_u, h, eps)?;
+            norm_x_in(&layer.pre_ffn_norm)?;
         }
         if on(C::GateUpGemm) {
-            gemm(&x, &layer.gate_up, &gate_up, BACKEND)?;
+            project(&x_in, &layer.gate_up, &gate_up)?;
         }
         if on(C::GeluMlp) {
             let window = |off: u32| Cols {
@@ -523,14 +620,14 @@ fn forward(cx: &Cx<'_>, io: &Io, mask: u32) -> Result<(), String> {
                 window(inter),
                 OutCols {
                     cols: Cols::dense(&mid.buffer, inter),
-                    dtype: DType::F32,
+                    dtype: mid.dtype,
                 },
                 rows_u,
                 inter,
             )?;
         }
         if on(C::DownGemm) {
-            gemm(&mid, &layer.down, &y, BACKEND)?;
+            project(&mid, &layer.down, &y)?;
         }
         if on(C::NormResid) {
             rms_norm_residual_add_f32(rt, &y.buffer, &layer.post_ffn_norm, &resid.buffer, rows_u, h, eps, 1.0)?;
@@ -555,10 +652,13 @@ fn forward(cx: &Cx<'_>, io: &Io, mask: u32) -> Result<(), String> {
         )?;
     }
     if on(C::EmbedNorm) {
-        rms_norm_f32(rt, &pooled.buffer, &w.ones, &normed.buffer, pooled_rows, h, eps)?;
+        match bf {
+            Some(_) => rms_norm_bf16(rt, &pooled.buffer, &w.ones, &normed.buffer, pooled_rows, h, eps)?,
+            None => rms_norm_f32(rt, &pooled.buffer, &w.ones, &normed.buffer, pooled_rows, h, eps)?,
+        }
     }
     if on(C::EmbedGemm) {
-        gemm(&normed, &w.embed_proj, &soft, BACKEND)?;
+        project(&normed, &w.embed_proj, &soft)?;
     }
     Ok(())
 }
@@ -582,14 +682,15 @@ struct Cost {
     bytes: f64,
 }
 
-fn gemm_cost(m: usize, k: usize, n: usize, count: usize) -> Cost {
+/// `eb`: bytes an operand element takes (4, or 2 under bf16); the output is f32.
+fn gemm_cost(m: usize, k: usize, n: usize, count: usize, eb: f64) -> Cost {
     Cost {
         flops: 2.0 * m as f64 * k as f64 * n as f64 * count as f64,
-        bytes: 4.0 * (k * n + m * k + m * n) as f64 * count as f64,
+        bytes: (eb * (k * n + m * k) as f64 + 4.0 * (m * n) as f64) * count as f64,
     }
 }
 
-fn class_costs(cfg: &VisionConfig, ios: &[Io]) -> [Cost; N_CLASSES] {
+fn class_costs(cfg: &VisionConfig, ios: &[Io], eb: f64) -> [Cost; N_CLASSES] {
     let (h, inter, pd) = (cfg.hidden as usize, cfg.intermediate as usize, cfg.patch_dim() as usize);
     let (l, qw, d, heads) = (
         cfg.layers as usize,
@@ -607,7 +708,7 @@ fn class_costs(cfg: &VisionConfig, ios: &[Io]) -> [Cost; N_CLASSES] {
         let (nb, seq) = (io.nb as usize, io.seq as usize);
         let rows = nb * seq;
         let s = io.soft.shape()[0];
-        add(&mut c[C::PatchGemm as usize], gemm_cost(rows, pd, h, 1));
+        add(&mut c[C::PatchGemm as usize], gemm_cost(rows, pd, h, 1, eb));
         add(
             &mut c[C::PosEmbed as usize],
             Cost {
@@ -619,25 +720,32 @@ fn class_costs(cfg: &VisionConfig, ios: &[Io]) -> [Cost; N_CLASSES] {
             &mut c[C::RmsNorm as usize],
             Cost {
                 flops: 0.0,
-                bytes: 2.0 * l as f64 * el(2 * rows * h),
+                bytes: l as f64 * 2.0 * (el(rows * h) + eb * (rows * h) as f64),
             },
         );
-        add(&mut c[C::QkvGemm as usize], gemm_cost(rows, h, 3 * qw, l));
+        add(&mut c[C::QkvGemm as usize], gemm_cost(rows, h, 3 * qw, l, eb));
         add(
             &mut c[C::QkvNormRope as usize],
             Cost {
                 flops: 0.0,
-                bytes: l as f64 * 2.0 * el(rows * 3 * qw),
+                bytes: l as f64 * (el(rows * 3 * qw) + eb * (rows * 3 * qw) as f64),
             },
         );
         add(
             &mut c[C::Attention as usize],
             Cost {
                 flops: l as f64 * 4.0 * (nb * heads * d) as f64 * (seq * seq) as f64,
-                bytes: l as f64 * el(4 * rows * qw),
+                bytes: l as f64 * (eb * (3 * rows * qw) as f64 + el(rows * qw)),
             },
         );
-        add(&mut c[C::OGemm as usize], gemm_cost(rows, qw, h, l));
+        add(
+            &mut c[C::AttnCast as usize],
+            Cost {
+                flops: 0.0,
+                bytes: l as f64 * (el(rows * qw) + 2.0 * (rows * qw) as f64),
+            },
+        );
+        add(&mut c[C::OGemm as usize], gemm_cost(rows, qw, h, l, eb));
         add(
             &mut c[C::NormResid as usize],
             Cost {
@@ -645,15 +753,15 @@ fn class_costs(cfg: &VisionConfig, ios: &[Io]) -> [Cost; N_CLASSES] {
                 bytes: 2.0 * l as f64 * el(3 * rows * h),
             },
         );
-        add(&mut c[C::GateUpGemm as usize], gemm_cost(rows, h, 2 * inter, l));
+        add(&mut c[C::GateUpGemm as usize], gemm_cost(rows, h, 2 * inter, l, eb));
         add(
             &mut c[C::GeluMlp as usize],
             Cost {
                 flops: 0.0,
-                bytes: l as f64 * el(rows * 3 * inter),
+                bytes: l as f64 * (el(rows * 2 * inter) + eb * (rows * inter) as f64),
             },
         );
-        add(&mut c[C::DownGemm as usize], gemm_cost(rows, inter, h, l));
+        add(&mut c[C::DownGemm as usize], gemm_cost(rows, inter, h, l, eb));
         add(
             &mut c[C::Pool as usize],
             Cost {
@@ -665,12 +773,12 @@ fn class_costs(cfg: &VisionConfig, ios: &[Io]) -> [Cost; N_CLASSES] {
             &mut c[C::EmbedNorm as usize],
             Cost {
                 flops: 0.0,
-                bytes: el(2 * s * h),
+                bytes: el(s * h) + eb * (s * h) as f64,
             },
         );
         add(
             &mut c[C::EmbedGemm as usize],
-            gemm_cost(s, h, cfg.text_hidden as usize, 1),
+            gemm_cost(s, h, cfg.text_hidden as usize, 1, eb),
         );
     }
     c
@@ -731,14 +839,20 @@ fn main() -> Result<(), String> {
     let rounds = env_usize("PROFILE_ROUNDS", 5, 1)?;
     let with_skip = std::env::var("PROFILE_SKIP").as_deref() != Ok("0");
     let out_path = std::env::var("PROFILE_JSON").unwrap_or_else(|_| "target/profile_vision.json".into());
+    let operands = match std::env::var("PROFILE_OPERANDS").as_deref() {
+        Err(_) | Ok("f32") => GemmOperands::ExactF32,
+        Ok("bf16") => GemmOperands::Bf16,
+        Ok(other) => return Err(format!("PROFILE_OPERANDS={other:?}: expected f32 or bf16")),
+    };
+    let bf16 = operands == GemmOperands::Bf16;
 
     let cfg = VisionConfig::from_config_file(&snap.join("config.json"))?;
     let st = SafeTensors::open(&snap.join("model.safetensors"))?;
     let goldens = [golden(&refs, 0)?, golden(&refs, 1)?];
     let rt = GpuRuntime::new_inference()?;
     rt.set_async_encode(true)?;
-    let model = EmbedGemma2VisionModel::load(&rt, &st, cfg.clone())?;
-    let weights = Weights::load(&rt, &st, &cfg)?;
+    let model = EmbedGemma2VisionModel::load_with(&rt, &st, cfg.clone(), operands)?;
+    let weights = Weights::load(&rt, &st, &cfg, bf16)?;
     let util0 = gpu_utilization();
     eprintln!("gpu utilization at start: {util0}%");
 
@@ -768,10 +882,22 @@ fn main() -> Result<(), String> {
             .into_iter()
             .max()
             .unwrap_or(1);
-        let acts = Acts::new(&rt, &cfg, rows, pooled_rows)?;
+        let acts = Acts::new(&rt, &cfg, rows, pooled_rows, bf16)?;
+        // The host side of the call (pixel scaling, rounding, upload, the pooling
+        // plans), as the library's `forward_io` does it: min of five.
+        let mut host_io_ms = f64::INFINITY;
+        for _ in 0..5 {
+            let t0 = Instant::now();
+            let again: Vec<Io> = chunks
+                .iter()
+                .map(|c| make_io(&rt, &cfg, &imgs, &valid, c, bf16))
+                .collect::<Result<_, _>>()?;
+            host_io_ms = host_io_ms.min(t0.elapsed().as_secs_f64() * 1e3);
+            drop(again);
+        }
         let ios: Vec<Io> = chunks
             .iter()
-            .map(|c| make_io(&rt, &cfg, &imgs, &valid, c))
+            .map(|c| make_io(&rt, &cfg, &imgs, &valid, c, bf16))
             .collect::<Result<_, _>>()?;
         let cx = Cx {
             rt: &rt,
@@ -779,8 +905,9 @@ fn main() -> Result<(), String> {
             w: &weights,
             a: &acts,
             ios: &ios,
+            operands,
         };
-        let costs = class_costs(&cfg, &ios);
+        let costs = class_costs(&cfg, &ios, if bf16 { 2.0 } else { 4.0 });
         let total_rows: usize = ios.iter().map(|io| (io.nb * io.seq) as usize).sum();
 
         // Validation: the replica reproduces the library's soft tokens.
@@ -898,11 +1025,12 @@ fn main() -> Result<(), String> {
         let none = min_of(&variants[1].samples_ms);
         let enc_min = min_of(&encode_samples);
         println!(
-            "== workload {name} ({} forward(s), {total_rows} padded rows, {dispatch_full} dispatches/call, {reps} calls per wait, {rounds} rounds)",
+            "== workload {name}, operands {} ({} forward(s), {total_rows} padded rows, {dispatch_full} dispatches/call, {reps} calls per wait, {rounds} rounds)",
+            if bf16 { "bf16" } else { "f32" },
             ios.len()
         );
         println!(
-            "   full replica {full:.3} ms (min) / {:.3} (median); encode_images() {enc_min:.3} ms (min); empty wait {none:.3} ms; host encode time of full {:.3} ms",
+            "   full replica {full:.3} ms (min) / {:.3} (median); encode_images() {enc_min:.3} ms (min); empty wait {none:.3} ms; host encode time of full {:.3} ms; host io build (pixels, upload, plans) {host_io_ms:.3} ms",
             median_of(&variants[0].samples_ms),
             min_of(&variants[0].enc_ms)
         );
@@ -910,7 +1038,14 @@ fn main() -> Result<(), String> {
             "   {:<38} {:>5} {:>9} {:>6} {:>10} {:>6} {:>9} {:>8} {:>8}",
             "class", "disp", "only ms", "%full", "full-skip", "%full", "us/disp", "GB/s", "TFLOP/s"
         );
-        let mut order: Vec<usize> = (0..N_CLASSES).collect();
+        let dispatches_of = |c: usize| {
+            variants
+                .iter()
+                .find(|v| v.kind == "only" && v.class == Some(c))
+                .map_or(0, |v| v.dispatches)
+        };
+        // A class that dispatches nothing in this mode (the bf16 cast under f32) is not a row.
+        let mut order: Vec<usize> = (0..N_CLASSES).filter(|&c| dispatches_of(c) > 0).collect();
         let only_ms = |c: usize| {
             min_of(
                 &variants
@@ -1004,9 +1139,11 @@ fn main() -> Result<(), String> {
             })
             .collect();
         json_wl.push(format!(
-            "{{\"workload\":{},\"images\":{n},\"forwards\":{},\"padded_rows\":{total_rows},\"reps_per_wait\":{reps},\"rounds\":{rounds},\"dispatches_full\":{dispatch_full},\"replica_vs_encode_images\":{{\"values\":{values},\"bit_equal\":{bit_equal}}},\"encode_images_ms\":{},\"encode_images_raw_ms\":{},\"encode_images_contended\":{},\"samples_contended\":{n_contended},\"samples_total\":{n_samples},\"samples_resampled\":{n_resampled},\"gpu_util_start_pct\":{},\"gpu_util_end_pct\":{},\"costs\":[{}],\"variants\":[{}]}}",
+            "{{\"workload\":{},\"operands\":{},\"images\":{n},\"forwards\":{},\"padded_rows\":{total_rows},\"reps_per_wait\":{reps},\"rounds\":{rounds},\"dispatches_full\":{dispatch_full},\"host_io_ms\":{},\"replica_vs_encode_images\":{{\"values\":{values},\"bit_equal\":{bit_equal}}},\"encode_images_ms\":{},\"encode_images_raw_ms\":{},\"encode_images_contended\":{},\"samples_contended\":{n_contended},\"samples_total\":{n_samples},\"samples_resampled\":{n_resampled},\"gpu_util_start_pct\":{},\"gpu_util_end_pct\":{},\"costs\":[{}],\"variants\":[{}]}}",
             jstr(&name),
+            jstr(if bf16 { "bf16" } else { "f32" }),
             ios.len(),
+            jnum(host_io_ms),
             jarr(&encode_samples),
             jarr(&encode_raw),
             jbools(&encode_contended),

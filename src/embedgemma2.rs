@@ -96,7 +96,7 @@ use crate::json::{self, Json, Syntax};
 use crate::loader::Loader;
 use crate::nn::{
     dispatch_tg_1d, reduce_tptg, require, require_disjoint_writes, rms_norm_bf16, rms_norm_f32,
-    rms_norm_residual_add_f32, scale_f32_inplace,
+    rms_norm_residual_add_f32,
 };
 use crate::qwen35::{self, AttnShape, AttnTargets, Cols, GatedAct, LmHead, OutCols, QkvColumns};
 use crate::qwen35_bwd::copy_cols;
@@ -169,6 +169,12 @@ pub enum EncoderAttnKernel {
     /// [`encoder_attn_kernel`]: the caller owns the operand dtype
     /// ([`encoder_attn_bf16`]).
     TiledBf16,
+    /// [`Self::TiledBf16`] storing the output as bf16 as well
+    /// (`encoder_attn_tiled_bf16o_*`, [`encoder_attn_bf16_out`]): the kernel
+    /// rounds the normalized accumulator to nearest even at the store, the
+    /// value a cast pass after [`Self::TiledBf16`] makes. Never picked by
+    /// [`encoder_attn_kernel`].
+    TiledBf16Out,
 }
 
 /// The kernel [`encoder_attn`] picks: [`EncoderAttnKernel::Tiled`] where it
@@ -204,6 +210,16 @@ fn encoder_attn_tiled_bf16_entry(head_dim: u32) -> Option<(&'static str, usize, 
     }
 }
 
+/// [`encoder_attn_tiled_bf16_entry`] for [`EncoderAttnKernel::TiledBf16Out`].
+fn encoder_attn_tiled_bf16o_entry(head_dim: u32) -> Option<(&'static str, usize, usize)> {
+    match head_dim {
+        64 => Some(("encoder_attn_tiled_bf16o_h64_q32_k32_sg2", 32, 2)),
+        256 => Some(("encoder_attn_tiled_bf16o_h256_q32_k64_sg4", 32, 4)),
+        512 => Some(("encoder_attn_tiled_bf16o_h512_q32_k128_sg8", 32, 8)),
+        _ => None,
+    }
+}
+
 /// Whether [`encoder_attn_bf16`] has a kernel for `head_dim` (64, 256 or 512),
 /// so a model that runs its attention in bf16 can refuse a config at load
 /// rather than at its first forward.
@@ -230,8 +246,8 @@ pub(crate) fn project(operands: GemmOperands, a: &Tensor, w: &Tensor, out: &Tens
 /// `q`/`o`: `[batch, seq, heads, head_dim]`; `k`/`v`: `[batch, capacity,
 /// heads_kv, head_dim]` with `capacity >= seq` derived from their size
 /// ([`crate::nn::attn_kv_capacity`], as the K/V writer derives it), all f32
-/// (the bf16-operand form is [`encoder_attn_bf16`]; there is no bf16 output).
-/// `lens`: `[batch]` u32,
+/// (the bf16-operand forms are [`encoder_attn_bf16`] and
+/// [`encoder_attn_bf16_out`]). `lens`: `[batch]` u32,
 /// each sequence's live length. Keys at or past a row's length are masked,
 /// and every query at or past it is written as zeros. The lengths are device
 /// values the host cannot see; the kernel clamps each to `seq`, and a length
@@ -269,9 +285,28 @@ pub fn encoder_attn_bf16(
     encoder_attn_with(rt, q, k, v, o, lens, dims, EncoderAttnKernel::TiledBf16)
 }
 
+/// [`encoder_attn_bf16`] with `o` a bf16 buffer too
+/// ([`EncoderAttnKernel::TiledBf16Out`]): the output is the f32 kernel's
+/// accumulator rounded to nearest even as it is stored, bit for bit what
+/// [`encoder_attn_bf16`] followed by a cast to bf16 gives. The bf16 forward
+/// feeds it straight to the output projection.
+#[allow(clippy::too_many_arguments)]
+pub fn encoder_attn_bf16_out(
+    rt: &Arc<GpuRuntime>,
+    q: &GpuBuffer,
+    k: &GpuBuffer,
+    v: &GpuBuffer,
+    o: &GpuBuffer,
+    lens: &GpuBuffer,
+    dims: EncoderAttnDims,
+) -> Result<(), String> {
+    encoder_attn_with(rt, q, k, v, o, lens, dims, EncoderAttnKernel::TiledBf16Out)
+}
+
 /// [`encoder_attn`] on a named kernel (for the tests and the paired
 /// benchmark that compare them). The contract and the checks are the same,
-/// except that [`EncoderAttnKernel::TiledBf16`] takes bf16 `q`, `k` and `v`.
+/// except that [`EncoderAttnKernel::TiledBf16`] takes bf16 `q`, `k` and `v`,
+/// and [`EncoderAttnKernel::TiledBf16Out`] a bf16 `o` as well.
 #[allow(clippy::too_many_arguments)]
 pub fn encoder_attn_with(
     rt: &Arc<GpuRuntime>,
@@ -296,13 +331,18 @@ pub fn encoder_attn_with(
         return Err(format!("{WHAT}: scale must be finite"));
     }
     let q_elems = elems(&[dims.batch, dims.seq, dims.heads, dims.head_dim], WHAT)?;
-    let bf16 = kernel == EncoderAttnKernel::TiledBf16;
+    let bf16_out = kernel == EncoderAttnKernel::TiledBf16Out;
+    let bf16 = bf16_out || kernel == EncoderAttnKernel::TiledBf16;
     if bf16 {
         require::<u16>(rt, q, q_elems, "encoder_attn q (bf16)")?;
     } else {
         require::<f32>(rt, q, q_elems, "encoder_attn q")?;
     }
-    require::<f32>(rt, o, q_elems, "encoder_attn o")?;
+    if bf16_out {
+        require::<u16>(rt, o, q_elems, "encoder_attn o (bf16)")?;
+    } else {
+        require::<f32>(rt, o, q_elems, "encoder_attn o")?;
+    }
     require::<u32>(rt, lens, dims.batch as usize, "encoder_attn lens")?;
     if q_elems == 0 {
         return Ok(());
@@ -321,7 +361,12 @@ pub fn encoder_attn_with(
     require_disjoint_writes(WHAT, &[("o", o)], &[("q", q), ("k", k), ("v", v), ("lens", lens)])?;
     if kernel != EncoderAttnKernel::Rows {
         let (entry, bq, sg) = if bf16 {
-            encoder_attn_tiled_bf16_entry(dims.head_dim).ok_or_else(|| {
+            let table = if bf16_out {
+                encoder_attn_tiled_bf16o_entry
+            } else {
+                encoder_attn_tiled_bf16_entry
+            };
+            table(dims.head_dim).ok_or_else(|| {
                 format!(
                     "{WHAT}: the bf16 tiled kernel is compiled for head dims 64, 256 and 512, not {}",
                     dims.head_dim
@@ -469,6 +514,239 @@ pub fn l2_normalize_rows(rt: &Arc<GpuRuntime>, x: &GpuBuffer, rows: u32, dim: u3
         set_u32(bnd, rows, 1);
         set_u32(bnd, dim, 2);
         set_u32(bnd, ld, 3);
+    })
+}
+
+/// Launch `entry` (one of `kernels/embedgemma2_text.metal`'s row passes) with
+/// one threadgroup per row, at the width `nn::rms_norm_f32` gives a row of the
+/// same `dim`: the fused passes reduce a row in the same lane order, so their
+/// sums are the unfused kernels' sums (see that file's header).
+fn dispatch_row_pass(
+    rt: &Arc<GpuRuntime>,
+    entry: &str,
+    rows: u32,
+    dim: u32,
+    bind: impl FnOnce(&mut crate::dispatch::Binder<'_>),
+) -> Result<(), String> {
+    let p = rt.pipeline(entry)?;
+    let tptg = reduce_tptg(p.maxTotalThreadsPerThreadgroup(), dim as usize);
+    dispatch_tg_1d(rt, &p, rows as usize, tptg, None, bind)
+}
+
+/// The checks every fused row pass shares: a finite `layer_scale`, a valid
+/// `eps` and `dim`, and `[rows, dim]` f32 buffers (`n` elements) for `y` and
+/// `resid`.
+#[allow(clippy::too_many_arguments)]
+fn check_row_pass(
+    what: &str,
+    rt: &GpuRuntime,
+    y: &GpuBuffer,
+    resid: &GpuBuffer,
+    n: usize,
+    dim: u32,
+    eps: f32,
+    layer_scale: f32,
+) -> Result<(), String> {
+    crate::nn::validate_rms_scalars(dim, eps, what)?;
+    if !layer_scale.is_finite() {
+        return Err(format!("{what}: layer_scale must be finite"));
+    }
+    require::<f32>(rt, y, n, "fused row pass y").map_err(|e| format!("{what}: {e}"))?;
+    require::<f32>(rt, resid, n, "fused row pass resid").map_err(|e| format!("{what}: {e}"))
+}
+
+/// `resid = layer_scale * (resid + rms_norm(y) * w_post)` in place, then
+/// `out = rms_norm(resid) * w_next` (`[rows, dim]`, f32 `out`): the post-norm
+/// residual add and the norm after it in one launch,
+/// [`crate::nn::rms_norm_residual_add_f32`] then [`crate::nn::rms_norm_f32`] with
+/// bit-identical results. `out` must not alias `resid` or `y`.
+#[allow(clippy::too_many_arguments)]
+pub fn resid_add_norm_f32(
+    rt: &Arc<GpuRuntime>,
+    y: &GpuBuffer,
+    w_post: &GpuBuffer,
+    resid: &GpuBuffer,
+    w_next: &GpuBuffer,
+    out: &GpuBuffer,
+    rows: u32,
+    dim: u32,
+    eps: f32,
+    layer_scale: f32,
+) -> Result<(), String> {
+    const WHAT: &str = "embedgemma2::resid_add_norm_f32";
+    resid_add_norm(
+        rt,
+        WHAT,
+        "eg2t_resid_norm_f32",
+        y,
+        w_post,
+        resid,
+        w_next,
+        out,
+        rows,
+        dim,
+        eps,
+        layer_scale,
+        4,
+    )
+}
+
+/// [`resid_add_norm_f32`] writing `out` as bf16 (`[rows, dim]`, rounded to
+/// nearest even as [`crate::nn::rms_norm_bf16`] rounds), for the next GEMM of a
+/// [`GemmOperands::Bf16`] forward.
+#[allow(clippy::too_many_arguments)]
+pub fn resid_add_norm_bf16(
+    rt: &Arc<GpuRuntime>,
+    y: &GpuBuffer,
+    w_post: &GpuBuffer,
+    resid: &GpuBuffer,
+    w_next: &GpuBuffer,
+    out: &GpuBuffer,
+    rows: u32,
+    dim: u32,
+    eps: f32,
+    layer_scale: f32,
+) -> Result<(), String> {
+    const WHAT: &str = "embedgemma2::resid_add_norm_bf16";
+    resid_add_norm(
+        rt,
+        WHAT,
+        "eg2t_resid_norm_bf16",
+        y,
+        w_post,
+        resid,
+        w_next,
+        out,
+        rows,
+        dim,
+        eps,
+        layer_scale,
+        2,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn resid_add_norm(
+    rt: &Arc<GpuRuntime>,
+    what: &str,
+    entry: &str,
+    y: &GpuBuffer,
+    w_post: &GpuBuffer,
+    resid: &GpuBuffer,
+    w_next: &GpuBuffer,
+    out: &GpuBuffer,
+    rows: u32,
+    dim: u32,
+    eps: f32,
+    layer_scale: f32,
+    out_elem_bytes: usize,
+) -> Result<(), String> {
+    let n = elems(&[rows, dim], what)?;
+    check_row_pass(what, rt, y, resid, n, dim, eps, layer_scale)?;
+    let weight = |w: &GpuBuffer, name: &str| {
+        require::<f32>(rt, w, dim as usize, "fused row pass weight").map_err(|e| format!("{what} {name}: {e}"))
+    };
+    weight(w_post, "w_post")?;
+    weight(w_next, "w_next")?;
+    // `u8`: the capacity is in bytes, which is f32's or bf16's elements times their width.
+    let out_bytes = n
+        .checked_mul(out_elem_bytes)
+        .ok_or_else(|| format!("{what}: out size overflows usize"))?;
+    require::<u8>(rt, out, out_bytes, "fused row pass out").map_err(|e| format!("{what}: {e}"))?;
+    if rows == 0 {
+        return Ok(());
+    }
+    require_disjoint_writes(
+        what,
+        &[("resid", resid), ("out", out)],
+        &[("y", y), ("w_post", w_post), ("w_next", w_next)],
+    )?;
+    dispatch_row_pass(rt, entry, rows, dim, |bnd| {
+        set_gpu_buf(bnd, y, 0);
+        set_gpu_buf(bnd, w_post, 1);
+        set_gpu_buf(bnd, resid, 2);
+        set_gpu_buf(bnd, w_next, 3);
+        set_gpu_buf(bnd, out, 4);
+        set_u32(bnd, rows, 5);
+        set_u32(bnd, dim, 6);
+        crate::dispatch::set_f32(bnd, eps, 7);
+        crate::dispatch::set_f32(bnd, layer_scale, 8);
+    })
+}
+
+/// `resid = layer_scale * (resid + rms_norm(y) * w_post)` in place and
+/// `copy = bf16(resid)` (`[rows, dim]`, rounded to nearest even):
+/// [`crate::nn::rms_norm_residual_add_f32`] then a cast to bf16 in one launch,
+/// bit-identical to the pair. The bf16 forward's feed-forward residual add, whose
+/// result its per-layer-input gate reads rounded.
+#[allow(clippy::too_many_arguments)]
+pub fn resid_add_bf16_copy(
+    rt: &Arc<GpuRuntime>,
+    y: &GpuBuffer,
+    w_post: &GpuBuffer,
+    resid: &GpuBuffer,
+    copy: &GpuBuffer,
+    rows: u32,
+    dim: u32,
+    eps: f32,
+    layer_scale: f32,
+) -> Result<(), String> {
+    const WHAT: &str = "embedgemma2::resid_add_bf16_copy";
+    let n = elems(&[rows, dim], WHAT)?;
+    check_row_pass(WHAT, rt, y, resid, n, dim, eps, layer_scale)?;
+    require::<f32>(rt, w_post, dim as usize, "resid_add_bf16_copy w_post")?;
+    require::<u16>(rt, copy, n, "resid_add_bf16_copy copy")?;
+    if rows == 0 {
+        return Ok(());
+    }
+    require_disjoint_writes(
+        WHAT,
+        &[("resid", resid), ("copy", copy)],
+        &[("y", y), ("w_post", w_post)],
+    )?;
+    dispatch_row_pass(rt, "eg2t_resid_add_bf16_copy", rows, dim, |bnd| {
+        set_gpu_buf(bnd, y, 0);
+        set_gpu_buf(bnd, w_post, 1);
+        set_gpu_buf(bnd, resid, 2);
+        set_gpu_buf(bnd, copy, 3);
+        set_u32(bnd, rows, 4);
+        set_u32(bnd, dim, 5);
+        crate::dispatch::set_f32(bnd, eps, 6);
+        crate::dispatch::set_f32(bnd, layer_scale, 7);
+    })
+}
+
+/// In place over `[rows, dim]`: `x = rms_norm(x * scale) * w`
+/// ([`crate::nn::scale_f32_inplace`] then [`crate::nn::rms_norm_f32`] with
+/// bit-identical results): the per-layer inputs' scale and norm in one launch.
+pub fn scale_rms_norm_inplace(
+    rt: &Arc<GpuRuntime>,
+    x: &GpuBuffer,
+    w: &GpuBuffer,
+    rows: u32,
+    dim: u32,
+    eps: f32,
+    scale: f32,
+) -> Result<(), String> {
+    const WHAT: &str = "embedgemma2::scale_rms_norm_inplace";
+    crate::nn::validate_rms_scalars(dim, eps, WHAT)?;
+    if !scale.is_finite() {
+        return Err(format!("{WHAT}: scale must be finite"));
+    }
+    let n = elems(&[rows, dim], WHAT)?;
+    require::<f32>(rt, x, n, "scale_rms_norm_inplace x")?;
+    require::<f32>(rt, w, dim as usize, "scale_rms_norm_inplace w")?;
+    if rows == 0 {
+        return Ok(());
+    }
+    require_disjoint_writes(WHAT, &[("x", x)], &[("w", w)])?;
+    dispatch_row_pass(rt, "eg2t_scale_rms_norm_f32", rows, dim, |bnd| {
+        set_gpu_buf(bnd, x, 0);
+        set_gpu_buf(bnd, w, 1);
+        set_u32(bnd, rows, 2);
+        set_u32(bnd, dim, 3);
+        crate::dispatch::set_f32(bnd, eps, 4);
+        crate::dispatch::set_f32(bnd, scale, 5);
     })
 }
 
@@ -2005,12 +2283,18 @@ impl EmbedGemma2Model {
         let inter = cfg.intermediate;
         // Under `Bf16`, each GEMM input that has a bf16 staging reads that
         // instead of its f32 buffer. Each costs the kernel that writes it
-        // nothing (a norm or a GELU gate writes bf16 in place of f32) or one
-        // elementwise cast pass: the attention output and the residual stream
-        // once per layer, the embeddings and the pooled vectors once per forward.
-        // A cast reads 4 bytes and writes 2 per element, against the GEMM
-        // reading the operand at half the width and no per-GEMM copy: the
-        // rounded copies are made once, into these buffers, never allocated.
+        // nothing (a norm, the attention, the feed-forward residual add or a
+        // GELU gate writes bf16 in place of f32) or one elementwise cast pass:
+        // the embeddings and the pooled vectors once per forward. A cast reads
+        // 4 bytes and writes 2 per element, against the GEMM reading the
+        // operand at half the width and no per-GEMM copy: the rounded copies
+        // are made once, into these buffers, never allocated.
+        //
+        // The row passes between the GEMMs are fused (`kernels/embedgemma2_text.metal`):
+        // a layer's residual add and the norm that follows it are one launch
+        // (the attention's add with the pre-feed-forward norm, the per-layer
+        // block's add with the next layer's input norm, the last layer's with the
+        // final norm), so only layer 0's input norm stands alone.
         let bf = a.bf16.as_ref();
         let (x_in, embeds_in) = match bf {
             Some(b) => (at(&b.x, h)?, at(&b.embeds, h)?),
@@ -2052,19 +2336,35 @@ impl EmbedGemma2Model {
         if bf.is_some() {
             cast_f32_to_bf16_into(&embeds, &embeds_in)?;
         }
-        // The normed input of the GEMMs that read `x_in`: bf16 straight from
-        // the norm under `Bf16`.
-        let norm_x_in = |weight: &GpuBuffer| match bf {
-            Some(_) => rms_norm_bf16(rt, &resid.buffer, weight, &x_in.buffer, rows_u, h, eps),
-            None => rms_norm_f32(rt, &resid.buffer, weight, &x_in.buffer, rows_u, h, eps),
-        };
+        // Layer 0's normed input, for the GEMMs that read `x_in`: bf16
+        // straight from the norm under `Bf16`. Every later layer's is written
+        // by the previous layer's last residual add.
+        match bf {
+            Some(_) => rms_norm_bf16(
+                rt,
+                &resid.buffer,
+                &self.layers[0].input_norm,
+                &x_in.buffer,
+                rows_u,
+                h,
+                eps,
+            ),
+            None => rms_norm_f32(
+                rt,
+                &resid.buffer,
+                &self.layers[0].input_norm,
+                &x_in.buffer,
+                rows_u,
+                h,
+                eps,
+            ),
+        }?;
 
         let mut out_trace = Vec::new();
         let ple_scale = (h as f32).powf(-0.5);
         for (i, layer) in self.layers.iter().enumerate() {
             let s = layer.spec;
             // Attention.
-            norm_x_in(&layer.input_norm)?;
             let qkv_width = (cfg.q_heads + 2 * s.kv_heads) * s.head_dim;
             let qkv = at(&a.qkv, qkv_width)?;
             self.project(&x_in, &layer.w_qkv, &qkv, &a.attn)?;
@@ -2109,30 +2409,50 @@ impl EmbedGemma2Model {
                 window: if s.sliding { cfg.sliding_window } else { 0 },
                 scale: 1.0,
             };
-            let attend = if bf.is_some() { encoder_attn_bf16 } else { encoder_attn };
-            attend(
-                rt,
-                &a.q.buffer,
-                &a.k.buffer,
-                &a.v.buffer,
-                &a.attn.buffer,
-                &io.lens,
-                attn_dims,
-            )?;
             let attn_width = cfg.q_heads * s.head_dim;
-            let attn = at(&a.attn, attn_width)?;
+            // The output projection reads the attention's output: under `Bf16`
+            // the kernel stores it bf16, rounded as a cast pass would.
             match bf {
                 Some(b) => {
                     let attn_in = view(&b.wide, rows_u, attn_width)?;
-                    cast_f32_to_bf16_into(&attn, &attn_in)?;
+                    encoder_attn_bf16_out(
+                        rt,
+                        &a.q.buffer,
+                        &a.k.buffer,
+                        &a.v.buffer,
+                        &attn_in.buffer,
+                        &io.lens,
+                        attn_dims,
+                    )?;
                     self.project(&attn_in, &layer.w_o, &y, &a.qkv)?;
                 }
-                None => self.project(&attn, &layer.w_o, &y, &a.qkv)?,
+                None => {
+                    encoder_attn(
+                        rt,
+                        &a.q.buffer,
+                        &a.k.buffer,
+                        &a.v.buffer,
+                        &a.attn.buffer,
+                        &io.lens,
+                        attn_dims,
+                    )?;
+                    let attn = at(&a.attn, attn_width)?;
+                    self.project(&attn, &layer.w_o, &y, &a.qkv)?;
+                }
             }
-            rms_norm_residual_add_f32(rt, &y.buffer, &layer.post_attn_norm, &resid.buffer, rows_u, h, eps, 1.0)?;
+            // The attention's residual add and the pre-feed-forward norm: one
+            // launch, the normed row written where the GEMM reads it.
+            self.add_norm(
+                &y,
+                &layer.post_attn_norm,
+                &resid,
+                &layer.pre_ffn_norm,
+                &x_in,
+                rows_u,
+                1.0,
+            )?;
 
             // MLP.
-            norm_x_in(&layer.pre_ffn_norm)?;
             self.project(&x_in, &layer.gate_up, &gate_up, &a.attn)?;
             let window = |off: u32| Cols {
                 buf: &gate_up.buffer,
@@ -2152,12 +2472,30 @@ impl EmbedGemma2Model {
                 inter,
             )?;
             self.project(&mid, &layer.down, &y, &a.qkv)?;
-            rms_norm_residual_add_f32(rt, &y.buffer, &layer.post_ffn_norm, &resid.buffer, rows_u, h, eps, 1.0)?;
+            match bf {
+                // The residual stream stays f32; `x_in` is free again (the
+                // GEMMs that read the normed input have), so the add leaves
+                // the rounded copy the gate projection reads there.
+                Some(_) => resid_add_bf16_copy(
+                    rt,
+                    &y.buffer,
+                    &layer.post_ffn_norm,
+                    &resid.buffer,
+                    &x_in.buffer,
+                    rows_u,
+                    h,
+                    eps,
+                    1.0,
+                )?,
+                None => {
+                    rms_norm_residual_add_f32(rt, &y.buffer, &layer.post_ffn_norm, &resid.buffer, rows_u, h, eps, 1.0)?
+                }
+            }
 
             // Per-layer input: at the first layer of each run, one GEMM over
             // the embeddings for the whole run, `rms_norm(embeds @ Wpleᵀ *
-            // hidden^-0.5) * ple_norm.w` in place; then this layer's block
-            // reads its column window.
+            // hidden^-0.5) * ple_norm.w` in place (the scale and the norm one
+            // launch); then this layer's block reads its column window.
             if i % run == 0 {
                 let k = run.min(n_layers - i);
                 ple_ld = (k * pd) as u32;
@@ -2167,25 +2505,18 @@ impl EmbedGemma2Model {
                     GemmOperands::ExactF32 => gemm_nt_f32(&embeds_in, &w, &out, BACKEND)?,
                     GemmOperands::Bf16 => GemmOperands::Bf16.nt(&embeds_in, &w, &out)?,
                 }
-                scale_f32_inplace(rt, &out.buffer, ple_scale, rows_u * ple_ld)?;
-                rms_norm_f32(
+                scale_rms_norm_inplace(
                     rt,
                     &out.buffer,
                     &self.ple_norm,
-                    &out.buffer,
                     rows_u * k as u32,
                     cfg.ple_dim,
                     eps,
+                    ple_scale,
                 )?;
             }
             match bf {
-                // The residual stream stays f32; `x_in` is free again (the
-                // GEMMs that read the normed input have), so it holds the
-                // rounded copy the gate projection reads.
-                Some(_) => {
-                    cast_f32_to_bf16_into(&resid, &x_in)?;
-                    self.project(&x_in, &layer.ple_gate, &ple_gate, &a.qkv)?;
-                }
+                Some(_) => self.project(&x_in, &layer.ple_gate, &ple_gate, &a.qkv)?,
                 None => self.project(&resid, &layer.ple_gate, &ple_gate, &a.qkv)?,
             }
             qwen35::gated_act(
@@ -2205,16 +2536,33 @@ impl EmbedGemma2Model {
                 cfg.ple_dim,
             )?;
             self.project(&ple_mid, &layer.ple_out, &y, &a.qkv)?;
-            rms_norm_residual_add_f32(
-                rt,
-                &y.buffer,
-                &layer.post_ple_norm,
-                &resid.buffer,
-                rows_u,
-                h,
-                eps,
-                layer.layer_scalar,
-            )?;
+            // The layer's last residual add (with its layer scalar) and the
+            // norm that follows it: the next layer's input norm into `x_in`, or
+            // after the last layer the final norm into `x` (f32 under both
+            // modes: the pooling reads it).
+            match self.layers.get(i + 1) {
+                Some(next) => self.add_norm(
+                    &y,
+                    &layer.post_ple_norm,
+                    &resid,
+                    &next.input_norm,
+                    &x_in,
+                    rows_u,
+                    layer.layer_scalar,
+                )?,
+                None => resid_add_norm_f32(
+                    rt,
+                    &y.buffer,
+                    &layer.post_ple_norm,
+                    &resid.buffer,
+                    &self.final_norm,
+                    &x.buffer,
+                    rows_u,
+                    h,
+                    eps,
+                    layer.layer_scalar,
+                )?,
+            }
             if trace {
                 rt.synchronize()?;
                 out_trace.push(resid.buffer.try_contents_f32()?[..rows * h as usize].to_vec());
@@ -2222,7 +2570,6 @@ impl EmbedGemma2Model {
         }
 
         let (pooled, out) = (view(&a.pooled, nb, h)?, view(&io.out, nb, cfg.embedding_dim)?);
-        rms_norm_f32(rt, &resid.buffer, &self.final_norm, &x.buffer, rows_u, h, eps)?;
         segment_mean_rows(rt, &x.buffer, &io.segments, &pooled.buffer, nb, rows_u, h)?;
         match bf {
             Some(b) => {
@@ -2239,6 +2586,39 @@ impl EmbedGemma2Model {
             out_trace.push(x.buffer.try_contents_f32()?[..rows * h as usize].to_vec());
         }
         Ok(out_trace)
+    }
+
+    /// A residual add and the norm after it ([`resid_add_norm_f32`], or
+    /// [`resid_add_norm_bf16`] under `Bf16`, so `out` is in the mode's
+    /// activation dtype): `resid = layer_scale * (resid + rms_norm(y) * w_post)`
+    /// in place, then `out = rms_norm(resid) * w_next`.
+    #[allow(clippy::too_many_arguments)]
+    fn add_norm(
+        &self,
+        y: &Tensor,
+        w_post: &GpuBuffer,
+        resid: &Tensor,
+        w_next: &GpuBuffer,
+        out: &Tensor,
+        rows: u32,
+        layer_scale: f32,
+    ) -> Result<(), String> {
+        let pass = match self.operands {
+            GemmOperands::ExactF32 => resid_add_norm_f32,
+            GemmOperands::Bf16 => resid_add_norm_bf16,
+        };
+        pass(
+            &self.rt,
+            &y.buffer,
+            w_post,
+            &resid.buffer,
+            w_next,
+            &out.buffer,
+            rows,
+            self.cfg.hidden,
+            self.cfg.rms_norm_eps,
+            layer_scale,
+        )
     }
 
     /// `out = a @ w` at the model's operand precision. `a` is in the mode's

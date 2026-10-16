@@ -43,6 +43,7 @@ const ENCODER_ATTN_TILED_H: &str = include_str!("../kernels/encoder_attn_tiled.h
 const EMBED_POOL: &str = include_str!("../kernels/embed_pool.metal");
 const EMBEDGEMMA2_VISION: &str = include_str!("../kernels/embedgemma2_vision.metal");
 const EMBEDGEMMA2_AUDIO: &str = include_str!("../kernels/embedgemma2_audio.metal");
+const EMBEDGEMMA2_TEXT: &str = include_str!("../kernels/embedgemma2_text.metal");
 const MTL_TENSOR: &str = include_str!("../kernels/mtl_tensor.metal");
 const BERT: &str = include_str!("../kernels/bert.metal");
 const QWEN35_TRAIN_STORAGE: &str = include_str!("../kernels/qwen35_train_storage.metal");
@@ -59,6 +60,7 @@ const INSPECTED_KERNELS: &[&str] = &[
     "embed_pool.metal",
     "embedgemma2_vision.metal",
     "embedgemma2_audio.metal",
+    "embedgemma2_text.metal",
     "encoder_attn.metal",
     "flash_attn_decode.metal",
     "flash_attn_global_h512.metal",
@@ -738,10 +740,11 @@ fn encoder_attn_offsets_are_widened() {
     ] {
         require(ENCODER_ATTN, needle, what);
     }
-    // No encoder has a bf16 path: the kernels take no `out_bf16` argument and
-    // hand the shared bodies a literal 0, and the K/V capacity is slot 10.
-    // (The bf16 *operand* kernels are not a bf16 output: O is f32 in every
-    // entry and the body's flag is the literal 0u.)
+    // No encoder entry takes an `out_bf16` argument: each hands the shared
+    // body a literal store-type flag, and the K/V capacity is slot 10. (The
+    // bf16 *operand* kernels store O as f32 and pass the literal 0u; only the
+    // `bf16o` entries store bf16, through the same macro with `bfloat` and the
+    // literal 1u, asserted below.)
     for (src, name) in [
         (ENCODER_ATTN, "encoder_attn.metal"),
         (ENCODER_ATTN_TILED_H, "encoder_attn_tiled.h"),
@@ -765,12 +768,41 @@ fn encoder_attn_offsets_are_widened() {
         2,
         "the f32 and the bf16 tiled entries each clamp the device length"
     );
+    // The f32-operand entry passes the literal 0u; the bf16-operand body takes
+    // the flag from its macro parameter, and its three instantiations are
+    // fixed: float output (`0u`) for the operand kernels, bfloat output (`1u`)
+    // for the `bf16o` ones.
     assert_eq!(
         ENCODER_ATTN_TILED_H
             .matches("0ul, 0ul, 0u, kv_capacity, window")
             .count(),
-        2,
-        "the tiled entries pass no position offsets and no bf16 output"
+        1,
+        "the f32 tiled entry passes no position offsets and no bf16 output"
+    );
+    assert_eq!(
+        ENCODER_ATTN_TILED_H
+            .matches("0ul, 0ul, OBF, kv_capacity, window")
+            .count(),
+        1,
+        "the bf16 tiled body passes no position offsets and its macro's store flag"
+    );
+    for (needle, what) in [
+        ("P, float, 0u)", "bf16 operand entries store f32"),
+        ("P, bfloat, 1u)", "bf16o entries store bf16"),
+        ("S, float, 0u)", "mixed-operand entries store f32"),
+    ] {
+        assert_eq!(
+            ENCODER_ATTN_TILED_H.matches(needle).count(),
+            1,
+            "{what}: one macro each"
+        );
+    }
+    assert_eq!(
+        ENCODER_ATTN
+            .matches("ENCODER_TILED_BF16_OUT_KERNEL(encoder_attn_tiled_bf16o_")
+            .count(),
+        3,
+        "one bf16-output entry per bf16 head dim"
     );
     // The store is `attn_rows.h`'s, shared with `flash_attn_rows`.
     require(
@@ -908,6 +940,31 @@ fn embedgemma2_audio_offsets_are_widened() {
     ] {
         require(EMBEDGEMMA2_AUDIO, needle, what);
     }
+}
+
+/// The text encoder's fused row passes take `rows` up to 32,768 sequences'
+/// padded tokens (the per-layer-input norm sees `rows * layers` rows of 512),
+/// so every row base is formed in 64 bits before it is multiplied by `dim`,
+/// and the per-lane column scans cannot roll a `uint` counter over.
+#[test]
+fn embedgemma2_text_offsets_are_widened() {
+    for (needle, what) in [
+        (
+            "device const float *yin = y + (ulong)row * dim;",
+            "residual add input row",
+        ),
+        ("device float *rrow = resid + (ulong)row * dim;", "residual row"),
+        ("device OUT_T *orow = out + (ulong)row * dim;", "normed output row"),
+        ("device bfloat *crow = copy + (ulong)row * dim;", "bf16 copy row"),
+        ("device float *xrow = x + (ulong)row * dim;", "scaled row"),
+        ("for (ulong d = lid; d < (ulong)dim; d += tptg)", "column scan"),
+    ] {
+        require(EMBEDGEMMA2_TEXT, needle, what);
+    }
+    assert!(
+        !EMBEDGEMMA2_TEXT.contains("for (uint d = lid; d < dim; d += tptg)"),
+        "a 32-bit column counter could roll over on a wide row"
+    );
 }
 
 /// The bound-tensor probes index the tensor only inside its own extents, and

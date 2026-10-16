@@ -154,3 +154,10 @@ ENCODER_TILED_KERNEL(encoder_attn_tiled_h64_q32_k32_sg2, 64, 32, 32, 2)
 ENCODER_TILED_BF16_KERNEL(encoder_attn_tiled_bf16_h64_q32_k32_sg2, 64, 32, 32, 2)
 ENCODER_TILED_BF16_KERNEL(encoder_attn_tiled_bf16_h256_q32_k64_sg4, 256, 32, 64, 4)
 ENCODER_TILED_BF16_KERNEL(encoder_attn_tiled_bf16_h512_q32_k128_sg8, 512, 32, 128, 8)
+
+// The same three storing O as bf16 (`encoder_attn_bf16_out`): the geometry and
+// the body of each f32-output entry above, so the result is that entry's
+// rounded to nearest even at the store, the value a cast pass would make.
+ENCODER_TILED_BF16_OUT_KERNEL(encoder_attn_tiled_bf16o_h64_q32_k32_sg2, 64, 32, 32, 2)
+ENCODER_TILED_BF16_OUT_KERNEL(encoder_attn_tiled_bf16o_h256_q32_k64_sg4, 256, 32, 64, 4)
+ENCODER_TILED_BF16_OUT_KERNEL(encoder_attn_tiled_bf16o_h512_q32_k128_sg8, 512, 32, 128, 8)

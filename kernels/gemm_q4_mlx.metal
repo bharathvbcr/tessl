@@ -1,4 +1,5 @@
-// DFlash verify thin Q4 GEMM (M≤8). Standalone so gemv_q4_mlx.metal edits do not drop it.
+// Thin Q4 (MLX-layout) GEMM for small M (M≤8), dispatched by `nn::gemm_q4_mlx`. Standalone so
+// gemv_q4_mlx.metal edits do not drop it.
 #include <metal_stdlib>
 #include "q4_mlx_dot.h"
 using namespace metal;

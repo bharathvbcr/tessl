@@ -49,13 +49,12 @@ fn tape(rt: &GpuRuntime, markers: [bool; CMDS]) -> DecodeIcb {
                 threads_per_tg: tptg,
                 binds: vec![bind(0, &src), bind(1, &dst), bind(2, &n_buf)],
                 tg_mem: None,
-                owned_immediates: Vec::new(),
                 barrier_after,
                 incomplete_binds: 0,
             }
         })
         .collect();
-    DecodeIcb::from_commands_ex(rt, cmds, false).expect("tape")
+    DecodeIcb::from_commands(rt, cmds).expect("tape")
 }
 
 fn replay_barriers(markers: [bool; CMDS]) -> u64 {

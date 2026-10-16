@@ -1,4 +1,5 @@
-// Causal sliding-window FlashAttention @ head_dim=128 (DFlash draft stub) (FA-2 tiled).
+// Causal sliding-window FlashAttention @ head_dim=128 (FA-2 tiled); dispatched by `nn::flash_attn_swa`
+// for 128-wide heads.
 // Q: [B,Tq,H,D], K/V: [B,kv_capacity,Hkv,D], O: [B,Tq,H,D]
 // Tkv is the live prefix; kv_capacity is the fixed per-batch K/V stride.
 // Absolute positions: q_abs = q_pos_offset + t_q, k_abs = kv_pos_offset + t_k.

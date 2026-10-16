@@ -10,8 +10,8 @@
 //!
 //! ## Flag
 //!
-//! Default **OFF**. Enable with `METAL_RUNTIME_ICB_SMOKE=1` or
-//! `GEMMA_METAL_ICB_SMOKE=1`, or [`set_icb_smoke`] in tests. The smoke helpers
+//! Default **OFF**. Enable with `TESSL_ICB_SMOKE=1` or
+//! `METAL_RUNTIME_ICB_SMOKE=1`, or [`set_icb_smoke`] in tests. The smoke helpers
 //! themselves do not require the flag (tests call them directly); the flag is
 //! the opt-in gate for any future session wiring.
 
@@ -37,10 +37,7 @@ pub fn set_icb_smoke(on: bool) {
 
 /// Opt-in gate for ICB smoke wiring. Default OFF.
 pub fn icb_smoke_enabled() -> bool {
-    ICB_SMOKE.get(
-        &["TESSL_ICB_SMOKE", "METAL_RUNTIME_ICB_SMOKE", "GEMMA_METAL_ICB_SMOKE"],
-        || false,
-    )
+    ICB_SMOKE.get(&["TESSL_ICB_SMOKE", "METAL_RUNTIME_ICB_SMOKE"], || false)
 }
 
 /// Bind bridge mode for the mini ICB smoke.
@@ -263,7 +260,7 @@ impl IcbCopySmoke {
                 IcbBindBridge::InheritArgTable => {
                     // Bind via MTL4 argument table; ICB inherits at execute time.
                     // Note: still host bind traffic per execute — freezes *dispatch*
-                    // (pipeline + grid), not resource slots unless freeze-binds.
+                    // (pipeline + grid), not resource slots.
                     bnd.set_pipeline(&pipe);
                     bnd.bind_gpu_buf(&src, 0);
                     bnd.bind_gpu_buf(&dst, 1);
@@ -378,10 +375,6 @@ mod tests {
         assert!(smoke.encoded());
         assert_eq!(smoke.execute_count(), 2);
         assert_eq!(smoke.bridge(), IcbBindBridge::InheritArgTable);
-        let mut stub = crate::IcbReplayStub::new();
-        stub.mark_smoke_proven();
-        assert!(stub.smoke_proven);
-        assert_eq!(stub.phase, crate::IcbStubPhase::SmokeProven);
         eprintln!("icb_mini_copy_smoke: {}", smoke.status_line());
     }
 

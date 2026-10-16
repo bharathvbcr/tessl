@@ -4,10 +4,8 @@
 //! matter, and the unsafe direction is the one that looks like free speed:
 //! - always-on Device barrier after each dispatch (golden-safe)
 //!
-//! Env names are canonically `TESSL_*`. The legacy `METAL_RUNTIME_*`,
-//! `METAL_NATIVE_*` and (for coarse barriers only) `GEMMA_METAL_*` spellings are
-//! still read, after the canonical one, so scripts written against either former
-//! crate keep working after the rename. The first name whose value *parses* wins;
+//! Env names are canonically `TESSL_*`. The legacy `METAL_RUNTIME_*` spelling is
+//! still read, after the canonical one. The first name whose value *parses* wins;
 //! a name set to anything outside the recognised spellings below is skipped and
 //! the next name is tried, and if no name parses the compiled-in default applies.
 //! The recognised spellings are exact and case-sensitive (`1/true/TRUE/yes` and
@@ -16,27 +14,13 @@
 
 use std::sync::atomic::{AtomicI8, Ordering};
 
-// Env name lists, canonical `TESSL_*` first and legacy spellings after. They are
-// named constants rather than inline literals because the *order* is the part
-// that has silently broken before: `coarse_barriers` used to read
-// `GEMMA_METAL_COARSE_BARRIERS` ahead of its own canonical name, so the one flag
-// whose doc promised "TESSL_* first" was the one flag that did not do it. A test
-// pins the invariant for every list at once.
-const ENV_HAZARD_BARRIERS: &[&str] = &[
-    "TESSL_HAZARD_BARRIERS",
-    "METAL_RUNTIME_HAZARD_BARRIERS",
-    "METAL_NATIVE_HAZARD_BARRIERS",
-];
-// `GEMMA_METAL_COARSE_BARRIERS` keeps its slot ahead of `METAL_RUNTIME_*` (that
-// was its relative order before) but now sits behind the canonical name; nothing
-// in this workspace sets it, so the reorder can only matter to a caller that sets
-// both names to conflicting values, and for that caller `TESSL_*` winning is what
-// the module doc has always promised.
-const ENV_COARSE_BARRIERS: &[&str] = &[
-    "TESSL_COARSE_BARRIERS",
-    "GEMMA_METAL_COARSE_BARRIERS",
-    "METAL_RUNTIME_COARSE_BARRIERS",
-];
+// Env name lists, canonical `TESSL_*` first and the legacy spelling after. They
+// are named constants rather than inline literals because the *order* is the
+// part that has silently broken before (`coarse_barriers` once read a legacy
+// name ahead of its canonical one). A test pins the invariant for every list at
+// once.
+const ENV_HAZARD_BARRIERS: &[&str] = &["TESSL_HAZARD_BARRIERS", "METAL_RUNTIME_HAZARD_BARRIERS"];
+const ENV_COARSE_BARRIERS: &[&str] = &["TESSL_COARSE_BARRIERS", "METAL_RUNTIME_COARSE_BARRIERS"];
 
 /// The recognised spellings, exact and case-sensitive. `None` means "this value
 /// does not decide the flag" — for an unset name *and* for a set-but-unrecognised
@@ -69,16 +53,13 @@ pub(crate) fn env_truthy(names: &[&str]) -> Option<bool> {
     resolve(names, |name| std::env::var(name).ok())
 }
 
-/// One process-global tri-state flag: unset (env not read yet), off, on, and a
-/// fourth "env unset, follow a default" state. Every `*_enabled()` getter in
+/// One process-global tri-state flag: unset (env not read yet), off, on. Every `*_enabled()` getter in
 /// the crate is this struct plus its env name list, so the latch and the
 /// override rules live once. A `set` always wins over the env.
 pub(crate) struct TriFlag(AtomicI8);
 
 impl TriFlag {
     const UNSET: i8 = -1;
-    /// Env had no recognised value; the default decides, re-evaluated per read.
-    const FOLLOW: i8 = 2;
 
     pub(crate) const fn new() -> Self {
         Self(AtomicI8::new(Self::UNSET))
@@ -110,30 +91,12 @@ impl TriFlag {
     /// at most once.
     pub(crate) fn get(&self, names: &[&str], default: impl FnOnce() -> bool) -> bool {
         let v = self.0.load(Ordering::Relaxed);
-        if v >= 0 && v != Self::FOLLOW {
+        if v >= 0 {
             return v == 1;
         }
         let on = env_truthy(names).unwrap_or_else(default);
         self.set(on);
         on
-    }
-
-    /// Like [`Self::get`], but when no name parses the answer is not latched:
-    /// `default()` is asked on every read, so the flag keeps following whatever
-    /// it follows. "No name parses" itself is latched, so the env is read once.
-    pub(crate) fn get_following(&self, names: &[&str], default: impl Fn() -> bool) -> bool {
-        match self.0.load(Ordering::Relaxed) {
-            0 => return false,
-            1 => return true,
-            Self::FOLLOW => return default(),
-            _ => {}
-        }
-        if let Some(on) = env_truthy(names) {
-            self.set(on);
-            return on;
-        }
-        self.0.store(Self::FOLLOW, Ordering::Relaxed);
-        default()
     }
 }
 
@@ -176,7 +139,7 @@ fn coarse_default(from_env: Option<bool>, hazard: bool) -> bool {
 /// Coarsen decode RAW barriers to phase edges (fewer Device drains).
 /// Default: on when [`hazard_barriers`] is true (see `coarse_default`, private).
 /// Override with `TESSL_COARSE_BARRIERS=0|1` (legacy:
-/// `GEMMA_METAL_COARSE_BARRIERS`, `METAL_RUNTIME_COARSE_BARRIERS`).
+/// `METAL_RUNTIME_COARSE_BARRIERS`).
 pub fn coarse_barriers() -> bool {
     // `get` is latching and its default runs once: coarse inherits the hazard
     // flag as of this first read (see `need_barrier_from`).
@@ -241,7 +204,7 @@ mod tests {
     /// `TriFlag` on private instances, with names no env sets, so nothing here
     /// touches the real flags or the environment.
     #[test]
-    fn tri_flag_latches_forces_and_follows() {
+    fn tri_flag_latches_and_forces() {
         const NONE: &[&str] = &["TESSL_TRI_FLAG_TEST_UNSET_A", "TESSL_TRI_FLAG_TEST_UNSET_B"];
         let f = TriFlag::new();
         assert!(!f.is_latched());
@@ -250,20 +213,6 @@ mod tests {
         assert!(f.get(NONE, || false), "and the first answer is latched");
         f.set(false);
         assert!(!f.get(NONE, || true), "a forced value beats the default");
-
-        let follow = std::cell::Cell::new(false);
-        let g = TriFlag::new();
-        assert!(!g.get_following(NONE, || follow.get()));
-        follow.set(true);
-        assert!(g.get_following(NONE, || follow.get()), "unset env keeps following");
-        g.set(false);
-        assert!(
-            !g.get_following(NONE, || follow.get()),
-            "a forced value stops following"
-        );
-        g.set(true);
-        follow.set(false);
-        assert!(g.get_following(NONE, || follow.get()));
     }
 
     /// A `resolve` lookup over a fixed table, recording which names it was asked
@@ -354,9 +303,9 @@ mod tests {
     }
 
     /// The regression this module has actually suffered: `coarse_barriers` read
-    /// `GEMMA_METAL_COARSE_BARRIERS` ahead of `TESSL_COARSE_BARRIERS`, so the one
-    /// flag whose doc promised "canonical name first" was the one flag that did
-    /// not do it. Every list must lead with its `TESSL_*` name.
+    /// a legacy name ahead of `TESSL_COARSE_BARRIERS`, so the one flag whose doc
+    /// promised "canonical name first" was the one flag that did not do it.
+    /// Every list must lead with its `TESSL_*` name.
     #[test]
     fn every_flag_reads_its_canonical_tessl_name_first() {
         let lists: &[(&str, &[&str])] = &[

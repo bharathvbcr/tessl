@@ -5,8 +5,8 @@
 //! its own environment. The oracle is the pre-refactor logic from gp/wave6:
 //! the first name whose value is exactly one of 1/true/TRUE/yes (on) or
 //! 0/false/FALSE/no (off) decides; otherwise the default (false), except
-//! `icb_coarse_ranges_enabled`, which then follows `icb_range_batch_enabled`,
-//! and `coarse_barriers`, which then inherits `hazard_barriers`.
+//! `coarse_barriers`, which then inherits `hazard_barriers`. The retired
+//! `GEMMA_METAL_*` / `METAL_NATIVE_*` spellings must not decide any getter.
 
 use std::process::Command;
 
@@ -24,11 +24,8 @@ fn first(names: &[&str], env: &[(&str, &str)]) -> Option<bool> {
         .find_map(|n| parse(env.iter().find(|(k, _)| k == n).map(|(_, v)| *v)))
 }
 
-const GETTERS: [&str; 10] = [
+const GETTERS: [&str; 7] = [
     "decode_icb",
-    "freeze",
-    "range_batch",
-    "coarse_ranges",
     "execute",
     "triage",
     "pipelines",
@@ -40,9 +37,6 @@ const GETTERS: [&str; 10] = [
 fn report() -> Vec<bool> {
     vec![
         tessl::decode_icb_enabled(),
-        tessl::icb_freeze_binds_enabled(),
-        tessl::icb_range_batch_enabled(),
-        tessl::icb_coarse_ranges_enabled(),
         tessl::icb_execute_enabled(),
         tessl::icb_triage_enabled(),
         tessl::icb_pipelines_enabled(),
@@ -68,33 +62,26 @@ fn run_child(env: &[(&str, &str)]) -> Vec<bool> {
     for var in [
         "TESSL_DECODE_ICB",
         "METAL_RUNTIME_DECODE_ICB",
-        "GEMMA_METAL_DECODE_ICB",
-        "TESSL_ICB_FREEZE_BINDS",
-        "METAL_RUNTIME_ICB_FREEZE_BINDS",
-        "GEMMA_METAL_ICB_FREEZE_BINDS",
-        "TESSL_ICB_RANGE_BATCH",
-        "METAL_RUNTIME_ICB_RANGE_BATCH",
-        "GEMMA_METAL_ICB_RANGE_BATCH",
-        "TESSL_ICB_COARSE_RANGES",
-        "METAL_RUNTIME_ICB_COARSE_RANGES",
-        "GEMMA_METAL_ICB_COARSE_RANGES",
         "TESSL_ICB_EXECUTE",
         "METAL_RUNTIME_ICB_EXECUTE",
-        "GEMMA_METAL_ICB_EXECUTE",
         "TESSL_ICB_TRIAGE",
-        "GEMMA_METAL_ICB_TRIAGE",
         "TESSL_ICB_PIPELINES",
         "METAL_RUNTIME_ICB_PIPELINES",
-        "GEMMA_METAL_ICB_PIPELINES",
         "TESSL_ICB_SMOKE",
         "METAL_RUNTIME_ICB_SMOKE",
-        "GEMMA_METAL_ICB_SMOKE",
         "TESSL_HAZARD_BARRIERS",
         "METAL_RUNTIME_HAZARD_BARRIERS",
-        "METAL_NATIVE_HAZARD_BARRIERS",
         "TESSL_COARSE_BARRIERS",
-        "GEMMA_METAL_COARSE_BARRIERS",
         "METAL_RUNTIME_COARSE_BARRIERS",
+        // Retired aliases: still scrubbed so an ambient value cannot leak into
+        // the child, and covered by `retired_aliases_decide_nothing`.
+        "GEMMA_METAL_DECODE_ICB",
+        "GEMMA_METAL_ICB_EXECUTE",
+        "GEMMA_METAL_ICB_TRIAGE",
+        "GEMMA_METAL_ICB_PIPELINES",
+        "GEMMA_METAL_ICB_SMOKE",
+        "GEMMA_METAL_COARSE_BARRIERS",
+        "METAL_NATIVE_HAZARD_BARRIERS",
     ] {
         cmd.env_remove(var);
     }
@@ -116,62 +103,32 @@ fn run_child(env: &[(&str, &str)]) -> Vec<bool> {
     line.split(',').map(|s| s == "true").collect()
 }
 
+/// Aliases removed with the GEMMA_METAL_/METAL_NATIVE_ retirement, paired with
+/// the getter index each one used to feed.
+const RETIRED: [(usize, &str); 7] = [
+    (0, "GEMMA_METAL_DECODE_ICB"),
+    (1, "GEMMA_METAL_ICB_EXECUTE"),
+    (2, "GEMMA_METAL_ICB_TRIAGE"),
+    (3, "GEMMA_METAL_ICB_PIPELINES"),
+    (4, "GEMMA_METAL_ICB_SMOKE"),
+    (5, "METAL_NATIVE_HAZARD_BARRIERS"),
+    (6, "GEMMA_METAL_COARSE_BARRIERS"),
+];
+
 const VALUES: [&str; 14] = [
     "", "0", "1", "true", "TRUE", "True", "yes", "no", "false", "FALSE", "2", "garbage", " 1", "on",
 ];
 
-/// (getter index, names in precedence order, default).
+/// (getter index, names in precedence order). Getter 6 (`coarse_barriers`)
+/// inherits hazard and is covered separately below.
 fn table() -> Vec<(usize, Vec<&'static str>)> {
     vec![
-        (
-            0,
-            vec!["TESSL_DECODE_ICB", "METAL_RUNTIME_DECODE_ICB", "GEMMA_METAL_DECODE_ICB"],
-        ),
-        (
-            1,
-            vec![
-                "TESSL_ICB_FREEZE_BINDS",
-                "METAL_RUNTIME_ICB_FREEZE_BINDS",
-                "GEMMA_METAL_ICB_FREEZE_BINDS",
-            ],
-        ),
-        (
-            2,
-            vec![
-                "TESSL_ICB_RANGE_BATCH",
-                "METAL_RUNTIME_ICB_RANGE_BATCH",
-                "GEMMA_METAL_ICB_RANGE_BATCH",
-            ],
-        ),
-        (
-            4,
-            vec![
-                "TESSL_ICB_EXECUTE",
-                "METAL_RUNTIME_ICB_EXECUTE",
-                "GEMMA_METAL_ICB_EXECUTE",
-            ],
-        ),
-        (5, vec!["TESSL_ICB_TRIAGE", "GEMMA_METAL_ICB_TRIAGE"]),
-        (
-            6,
-            vec![
-                "TESSL_ICB_PIPELINES",
-                "METAL_RUNTIME_ICB_PIPELINES",
-                "GEMMA_METAL_ICB_PIPELINES",
-            ],
-        ),
-        (
-            7,
-            vec!["TESSL_ICB_SMOKE", "METAL_RUNTIME_ICB_SMOKE", "GEMMA_METAL_ICB_SMOKE"],
-        ),
-        (
-            8,
-            vec![
-                "TESSL_HAZARD_BARRIERS",
-                "METAL_RUNTIME_HAZARD_BARRIERS",
-                "METAL_NATIVE_HAZARD_BARRIERS",
-            ],
-        ),
+        (0, vec!["TESSL_DECODE_ICB", "METAL_RUNTIME_DECODE_ICB"]),
+        (1, vec!["TESSL_ICB_EXECUTE", "METAL_RUNTIME_ICB_EXECUTE"]),
+        (2, vec!["TESSL_ICB_TRIAGE"]),
+        (3, vec!["TESSL_ICB_PIPELINES", "METAL_RUNTIME_ICB_PIPELINES"]),
+        (4, vec!["TESSL_ICB_SMOKE", "METAL_RUNTIME_ICB_SMOKE"]),
+        (5, vec!["TESSL_HAZARD_BARRIERS", "METAL_RUNTIME_HAZARD_BARRIERS"]),
     ]
 }
 
@@ -182,9 +139,11 @@ fn every_getter_matches_the_old_env_semantics() {
             // Each name alone, then the first name garbage with a later name set
             // (the first PARSING name wins), then two parsing names (first wins).
             let mut cases: Vec<Vec<(&str, &str)>> = names.iter().map(|n| vec![(*n, v)]).collect();
-            cases.push(vec![(names[0], "garbage"), (names[1], v)]);
-            cases.push(vec![(names[0], v), (names[1], "1")]);
-            cases.push(vec![(names[0], v), (names[1], "0")]);
+            if let Some(second) = names.get(1) {
+                cases.push(vec![(names[0], "garbage"), (*second, v)]);
+                cases.push(vec![(names[0], v), (*second, "1")]);
+                cases.push(vec![(names[0], v), (*second, "0")]);
+            }
             for env in cases {
                 let got = run_child(&env)[idx];
                 // Both oracle paths are the same fold the old getters used.
@@ -195,34 +154,23 @@ fn every_getter_matches_the_old_env_semantics() {
     }
 }
 
+/// A retired alias, set alone to every value, must leave its getter at the
+/// default. Against the pre-removal code `GEMMA_METAL_DECODE_ICB=1` turns
+/// `decode_icb_enabled` on.
 #[test]
-fn coarse_ranges_follows_range_batch_only_when_its_env_does_not_parse() {
-    let coarse = [
-        "TESSL_ICB_COARSE_RANGES",
-        "METAL_RUNTIME_ICB_COARSE_RANGES",
-        "GEMMA_METAL_ICB_COARSE_RANGES",
-    ];
-    for cv in VALUES {
-        for rv in VALUES {
-            for name in coarse {
-                let env = [(name, cv), ("TESSL_ICB_RANGE_BATCH", rv)];
-                let r = run_child(&env);
-                let range = first(&["TESSL_ICB_RANGE_BATCH"], &env).unwrap_or(false);
-                let want = first(&coarse, &env).unwrap_or(range);
-                assert_eq!(r[3], want, "coarse_ranges: env {env:?}");
-                assert_eq!(r[2], range, "range_batch: env {env:?}");
-            }
+fn retired_aliases_decide_nothing() {
+    for (idx, name) in RETIRED {
+        for v in ["1", "true", "yes", "0"] {
+            let got = run_child(&[(name, v)]);
+            let default = vec![false; GETTERS.len()];
+            assert_eq!(got, default, "{name}={v} must not move {}", GETTERS[idx]);
         }
     }
 }
 
 #[test]
 fn coarse_barriers_inherits_hazard_only_when_its_env_does_not_parse() {
-    let coarse = [
-        "TESSL_COARSE_BARRIERS",
-        "GEMMA_METAL_COARSE_BARRIERS",
-        "METAL_RUNTIME_COARSE_BARRIERS",
-    ];
+    let coarse = ["TESSL_COARSE_BARRIERS", "METAL_RUNTIME_COARSE_BARRIERS"];
     for cv in VALUES {
         for hv in VALUES {
             for name in coarse {
@@ -230,7 +178,7 @@ fn coarse_barriers_inherits_hazard_only_when_its_env_does_not_parse() {
                 let r = run_child(&env);
                 let hazard = first(&["TESSL_HAZARD_BARRIERS"], &env).unwrap_or(false);
                 let want = first(&coarse, &env).unwrap_or(hazard);
-                assert_eq!(r[9], want, "coarse_barriers: env {env:?}");
+                assert_eq!(r[6], want, "coarse_barriers: env {env:?}");
             }
         }
     }

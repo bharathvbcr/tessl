@@ -1,4 +1,4 @@
-// Fused gate×up with SiLU / swish (DFlash / Qwen3 draft MLP).
+// Fused gate×up with SiLU / swish (the gated-MLP activation), dispatched by `nn::mlp_silu`.
 // silu(x) = x * sigmoid(x), the crate's overflow-free one (act.h).
 #include <metal_stdlib>
 #include "act.h"

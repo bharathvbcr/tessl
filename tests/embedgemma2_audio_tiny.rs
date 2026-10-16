@@ -28,12 +28,13 @@
 mod common;
 
 use common::embedgemma2_audio::{audio_forward, AudioRef, Weights};
+use common::embedgemma2_mm::{audio_weights as random_weights, TowerWeight as Weight};
 use common::{with_gpu, SplitMix};
 use tessl::embedgemma2_audio::{
     sub_rows, AudioConfig, AudioInput, AudioOutput, EmbedGemma2Audio, MAX_FRAMES_PER_FORWARD,
 };
 use tessl::safetensors::SafeTensors;
-use tessl::tensor::{bf16_bits_to_f32, f32_slice_to_bf16};
+use tessl::tensor::f32_slice_to_bf16;
 
 const LAYER_REL: f64 = 1e-4;
 const SOFT_ABS: f64 = 1e-4;
@@ -51,122 +52,6 @@ const WIDE: &str = r#"{"text_config":{"hidden_size":24},"audio_config":{
 "gradient_clipping":3.0,"hidden_act":"silu","hidden_size":256,"model_type":"gemma4_audio",
 "num_attention_heads":2,"num_hidden_layers":1,"output_proj_dims":48,"residual_weight":0.5,
 "rms_norm_eps":1e-06,"subsampling_conv_channels":[32,32],"use_clipped_linears":true}}"#;
-
-/// A tensor of the tiny checkpoint, kept already rounded to bf16.
-struct Weight {
-    name: String,
-    shape: Vec<usize>,
-    data: Vec<f64>,
-}
-
-fn round_bf16(v: f64) -> f64 {
-    f64::from(bf16_bits_to_f32(f32_slice_to_bf16(&[v as f32])[0]))
-}
-
-/// Every tensor the tower and the embedder read, with the names and shapes of
-/// the real checkpoint.
-fn random_weights(cfg: &AudioConfig, seed: u64) -> Vec<Weight> {
-    struct Gen {
-        r: SplitMix,
-        out: Vec<Weight>,
-    }
-    impl Gen {
-        /// `offset + unit * scale` per element, rounded to bf16.
-        fn push(&mut self, name: String, shape: Vec<usize>, scale: f64, offset: f64) {
-            let n: usize = shape.iter().product();
-            let data = (0..n)
-                .map(|_| round_bf16(offset + f64::from(self.r.unit()) * scale))
-                .collect();
-            self.out.push(Weight { name, shape, data });
-        }
-
-        /// A clipped linear: its weight and four bounds that clip a visible
-        /// share of the values (inputs and outputs are O(1)).
-        fn clipped(&mut self, name: String, out_f: usize, in_f: usize) {
-            self.push(
-                format!("{name}.linear.weight"),
-                vec![out_f, in_f],
-                1.7 * (in_f as f64).powf(-0.5),
-                0.0,
-            );
-            for (s, sign, lo, spread) in [
-                ("input_min", -1.0, 1.3, 0.5),
-                ("input_max", 1.0, 1.3, 0.5),
-                ("output_min", -1.0, 1.6, 0.8),
-                ("output_max", 1.0, 1.6, 0.8),
-            ] {
-                self.push(format!("{name}.{s}"), vec![], spread, lo);
-                let last = self.out.last_mut().expect("just pushed");
-                last.data.iter_mut().for_each(|v| *v *= sign);
-            }
-        }
-    }
-    let mut g = Gen {
-        r: SplitMix::new(seed),
-        out: Vec::new(),
-    };
-    let (h, hd, k) = (cfg.hidden as usize, cfg.head_dim() as usize, cfg.conv_kernel as usize);
-    let (c0, c1) = (cfg.sub_channels[0] as usize, cfg.sub_channels[1] as usize);
-    let lin = |fan_in: usize| 1.7 * (fan_in as f64).powf(-0.5);
-    let sub = |s: &str| format!("audio_tower.subsample_conv_projection.{s}");
-    g.push(sub("layer0.conv.weight"), vec![c0, 1, 3, 3], 0.5, 0.0);
-    g.push(sub("layer0.norm.weight"), vec![c0], 0.3, 1.0);
-    g.push(sub("layer1.conv.weight"), vec![c1, c0, 3, 3], lin(9 * c0), 0.0);
-    g.push(sub("layer1.norm.weight"), vec![c1], 0.3, 1.0);
-    g.push(
-        sub("input_proj_linear.weight"),
-        vec![h, cfg.proj_in() as usize],
-        lin(cfg.proj_in() as usize),
-        0.0,
-    );
-    for li in 0..cfg.layers as usize {
-        let p = |s: &str| format!("audio_tower.layers.{li}.{s}");
-        for ff in ["feed_forward1", "feed_forward2"] {
-            g.clipped(p(&format!("{ff}.ffw_layer_1")), 4 * h, h);
-            g.clipped(p(&format!("{ff}.ffw_layer_2")), h, 4 * h);
-        }
-        for n in ["q_proj", "k_proj", "v_proj", "post"] {
-            g.clipped(p(&format!("self_attn.{n}")), h, h);
-        }
-        g.clipped(p("lconv1d.linear_start"), 2 * h, h);
-        g.clipped(p("lconv1d.linear_end"), h, h);
-        for ff in ["feed_forward1", "feed_forward2"] {
-            g.push(p(&format!("{ff}.pre_layer_norm.weight")), vec![h], 0.3, 1.0);
-            g.push(p(&format!("{ff}.post_layer_norm.weight")), vec![h], 0.3, 1.0);
-        }
-        for n in [
-            "norm_pre_attn",
-            "norm_post_attn",
-            "norm_out",
-            "lconv1d.pre_layer_norm",
-            "lconv1d.conv_norm",
-        ] {
-            g.push(p(&format!("{n}.weight")), vec![h], 0.3, 1.0);
-        }
-        g.push(p("self_attn.relative_k_proj.weight"), vec![h, h], lin(h), 0.0);
-        g.push(p("self_attn.per_dim_scale"), vec![hd], 0.6, 0.0);
-        g.push(p("lconv1d.depthwise_conv1d.weight"), vec![h, 1, k], 0.6, 0.0);
-    }
-    g.push(
-        "audio_tower.output_proj.weight".into(),
-        vec![cfg.out_dims as usize, h],
-        lin(h),
-        0.0,
-    );
-    g.push(
-        "audio_tower.output_proj.bias".into(),
-        vec![cfg.out_dims as usize],
-        0.2,
-        0.0,
-    );
-    g.push(
-        "embed_audio.embedding_projection.weight".into(),
-        vec![cfg.embed_dim as usize, cfg.out_dims as usize],
-        lin(cfg.out_dims as usize),
-        0.0,
-    );
-    g.out
-}
 
 fn reference_weights(w: &[Weight]) -> Weights {
     w.iter().map(|t| (t.name.clone(), t.data.clone())).collect()
@@ -586,22 +471,11 @@ fn load_refuses_a_checkpoint_that_does_not_match() {
         let missing: Vec<Weight> = w
             .iter()
             .filter(|t| t.name != "audio_tower.layers.1.lconv1d.conv_norm.weight")
-            .map(|t| Weight {
-                name: t.name.clone(),
-                shape: t.shape.clone(),
-                data: t.data.clone(),
-            })
+            .cloned()
             .collect();
         let e = load("missing", &missing, &[]).expect("accepted");
         assert!(e.contains("lconv1d.conv_norm"), "{e}");
-        let mut reshaped: Vec<Weight> = w
-            .iter()
-            .map(|t| Weight {
-                name: t.name.clone(),
-                shape: t.shape.clone(),
-                data: t.data.clone(),
-            })
-            .collect();
+        let mut reshaped: Vec<Weight> = w.to_vec();
         let t = reshaped
             .iter_mut()
             .find(|t| t.name == "audio_tower.output_proj.bias")

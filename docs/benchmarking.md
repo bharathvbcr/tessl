@@ -222,12 +222,14 @@ What each script did, and where it went:
 | `bench/attn_tune.py` knob sweeps | Unchanged, not replaced: it sweeps knobs through `bench_flash_attn`, it does not pair runtimes. |
 
 The old Python evidence module is gone. Its last helper, `embedded_metallib_path`,
-scanned binaries for a path none carries; `bench/kernel_coverage.py` now has
-`bench_gemm_sweep --dump-metallib PATH` write the embedded bytes and reads those.
+scanned binaries for a path none carries; the `kernel_coverage` bin (Rust, which
+replaced a Python script of that name) has `bench_gemm_sweep --dump-metallib PATH`
+write the embedded bytes and reads those.
 
-### `kernel_coverage.py` exit status
+### `kernel_coverage` exit status
 
-`python3 bench/kernel_coverage.py --check` (the same table is in `--help`):
+`cargo run --release --bin kernel_coverage -- --check` (the same table is in `--help`;
+run it after `cargo build --release --bins`, it measures the binaries in `target/release`):
 
 | Exit | Meaning |
 |---|---|
@@ -786,7 +788,8 @@ tf32-relaxed lane sits between at 1.5e-3.
 
 - `gemm_align_probe_m5pro.txt` (264 pass/fail runs, all bit-identical),
   `kernel_coverage_m5pro.json` (regenerated 2026-10-14 by
-  `bench/kernel_coverage.py --check` against the metallib the binaries embed:
+  `kernel_coverage --check` (then a Python script of the same name, whose report the
+  Rust bin reproduces byte for byte) against the metallib the binaries embed:
   266 entry points, 116 dispatched, 150 never dispatched, so `--check` exits
   non-zero; the old "147 covered, none missing" predated most kernels) and
   `fp_contract.txt` (single-shot, "noise, not a speedup") are correctness

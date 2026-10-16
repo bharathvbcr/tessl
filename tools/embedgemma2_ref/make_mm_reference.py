@@ -18,13 +18,18 @@ under eager, and Gemma4AudioAttention.forward fills mask.logical_not(), so
 the visible keys are the ones blanked); tests/embedgemma2_audio_model.rs pins
 that disagreement against an eager directory. Text and vision differ between
 the two only by rounding. The processor's own outputs are saved as the
-model received them, so tessl's towers start from exactly those tensors
-(preprocessing stays the caller's, as tokenization does).
+model received them, so tessl's towers can start from exactly those tensors; the
+raw inputs are saved beside them, so tessl's own preprocessing
+(src/embedgemma2_pre.rs) can be checked against the processor's outputs and
+carried through the towers to the embedding.
 
 For input n of kind k (image or audio), prefix `{k}{n}_`:
 
   ids.npy              the token ids the model received, placeholders included
   attention_mask.npy   the text attention mask
+  raw.npy              the raw input the processor received: image [H, W, 3]
+                       RGB bytes as int64, audio [N] float32 at 16 kHz (the input of
+                       tessl's native preprocessing, src/embedgemma2_pre.rs)
   image:  pixel_values.npy [1, P, 768], image_position_ids.npy [1, P, 2]
           (x, y; padding patches are (-1, -1))
           patch_embed.npy  [P, 768]  patch embedder output (projection + 2D
@@ -184,6 +189,15 @@ def main():
             assert len(cap["layers"]) == expect, (prefix, len(cap["layers"]), expect)
             save(prefix, "ids", kw["input_ids"][0].cpu().numpy().astype(np.int64))
             save(prefix, "attention_mask", kw["attention_mask"][0].cpu().numpy().astype(np.int64))
+            # The raw input the processor received, for tessl's native preprocessing
+            # (src/embedgemma2_pre.rs): the image as HWC RGB bytes (stored as int64,
+            # the one integer dtype tessl's npy reader takes), the clip as mono
+            # float32 at 16 kHz.
+            if kind == "image":
+                save(prefix, "raw", np.asarray(item.convert("RGB"), dtype=np.uint8).astype(np.int64))
+            else:
+                assert item["sampling_rate"] == SR
+                save(prefix, "raw", np.asarray(item["array"], dtype=np.float32))
             if kind == "image":
                 save(prefix, "pixel_values", f32(kw["pixel_values"]))
                 save(prefix, "image_position_ids", kw["image_position_ids"].cpu().numpy().astype(np.int64))

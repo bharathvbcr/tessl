@@ -14,6 +14,7 @@ is selected; each bench binary prints its trace on exit, on every exit path.
 
   python3 bench/kernel_coverage.py            # report
   python3 bench/kernel_coverage.py --check    # gate: see the exit status below
+  python3 bench/kernel_coverage.py --audit-allowlist   # no GPU: allowlist vs the census
 
 Exit status (the same on every path; documented in docs/benchmarking.md):
   0   the check ran and every kernel entry point is dispatched by a bench or
@@ -481,10 +482,24 @@ def run():
         help="explicit compiled metallib to inventory (default: the library bench_gemm_sweep embeds, via --dump-metallib)",
     )
     ap.add_argument("--out")
+    ap.add_argument("--audit-allowlist", action="store_true",
+                    help="runs no benchmark: exit 1 if an allowlist entry is not a kernel in the "
+                         "census (what a runner with the Metal toolchain but no GPU can check; "
+                         "77 if the toolchain is missing)")
     ap.add_argument("--allowlist", default=ALLOWLIST,
                     help="kernels no bench dispatches, each with a reason (default: %(default)s)")
     args = ap.parse_args()
     allowed = load_allowlist(args.allowlist)  # a malformed list stops here, before any suite runs
+
+    if args.audit_allowlist:
+        # The census is the preprocessor's, so it needs no binary; an explicit
+        # --metallib is still cross-checked.
+        names, _ = inventory(metallib=args.metallib, require_metallib=False)
+        stale, _ = audit_allowlist(allowed, names, set())
+        if stale:
+            raise SystemExit(f"{len(stale)} allowlist entr(ies) are not kernels any more: {stale}")
+        print(f"allowlist: {len(allowed)} entries, every one a kernel of the {len(names)}-entry census")
+        return
 
     tmp = tempfile.mkdtemp(prefix="kernel-coverage-")
     try:

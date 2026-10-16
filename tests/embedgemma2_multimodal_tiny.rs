@@ -103,7 +103,7 @@ impl ByHand {
         Self {
             text: EmbedGemma2Model::load_with(rt, &f.st, PREFIX, f.c.text.clone(), operands).unwrap(),
             vision: EmbedGemma2VisionModel::load_with(rt, &f.st, f.c.vision.clone(), operands).unwrap(),
-            audio: EmbedGemma2Audio::load(rt, &f.st, "", f.c.audio.clone()).unwrap(),
+            audio: EmbedGemma2Audio::load_with(rt, &f.st, "", f.c.audio.clone(), operands).unwrap(),
         }
     }
 

@@ -317,7 +317,8 @@ fn consecutive_vision_calls_hold_one_activation_set_in_process() {
     }
 }
 
-/// The same for the audio tower (exact f32 under either text mode).
+/// The same for the audio tower, in both modes (`Bf16` also holds its operands
+/// in bf16 buffers of the same set).
 #[test]
 fn consecutive_audio_calls_hold_one_activation_set() {
     in_child(
@@ -330,36 +331,38 @@ fn consecutive_audio_calls_hold_one_activation_set() {
 fn consecutive_audio_calls_hold_one_activation_set_in_process() {
     let c = configs();
     let (_, clips) = tower_media(&c);
-    let st = open("memory_audio", checkpoint_bytes(&c, 17, GemmOperands::ExactF32));
-    with_gpu(|rt| {
-        let model = EmbedGemma2Audio::load(rt, &st, "", c.audio.clone()).unwrap();
-        rt.synchronize().unwrap();
-        let base = rt.current_allocated_bytes();
-        let first = model.encode_audio(&clips, false).unwrap();
-        assert_eq!(first.forwards, 1, "test bug: the call split");
-        // The forward's output holds every tower row, kept or not.
-        let rows: usize = first.out_masks.iter().map(Vec::len).sum();
-        let out_bucket = cold(rows * c.audio.embed_dim as usize * 4);
-        let after_first = rt.current_allocated_bytes();
-        let set = after_first - base;
-        assert!(
-            set > 20 * out_bucket,
-            "the first call allocated {set} bytes: too few to tell a set from its output"
-        );
-        rt.reset_peak_allocated_bytes();
-        for call in 2..=4 {
-            let again = model.encode_audio(&clips, false).unwrap();
-            for (a, b) in again.soft_tokens.iter().zip(&first.soft_tokens) {
-                assert_eq!(bits_of(a), bits_of(b), "call {call} changed a bit");
+    for operands in MODES {
+        let st = open("memory_audio", checkpoint_bytes(&c, 17, operands));
+        with_gpu(|rt| {
+            let model = EmbedGemma2Audio::load_with(rt, &st, "", c.audio.clone(), operands).unwrap();
+            rt.synchronize().unwrap();
+            let base = rt.current_allocated_bytes();
+            let first = model.encode_audio(&clips, false).unwrap();
+            assert_eq!(first.forwards, 1, "test bug: the call split");
+            // The forward's output holds every tower row, kept or not.
+            let rows: usize = first.out_masks.iter().map(Vec::len).sum();
+            let out_bucket = cold(rows * c.audio.embed_dim as usize * 4);
+            let after_first = rt.current_allocated_bytes();
+            let set = after_first - base;
+            assert!(
+                set > 20 * out_bucket,
+                "{operands:?}: the first call allocated {set} bytes: too few to tell a set from its output"
+            );
+            rt.reset_peak_allocated_bytes();
+            for call in 2..=4 {
+                let again = model.encode_audio(&clips, false).unwrap();
+                for (a, b) in again.soft_tokens.iter().zip(&first.soft_tokens) {
+                    assert_eq!(bits_of(a), bits_of(b), "{operands:?}: call {call} changed a bit");
+                }
             }
-        }
-        let extra = rt.peak_allocated_bytes() - after_first;
-        assert!(
-            extra <= out_bucket,
-            "three more audio calls reached {extra} bytes above the first ({set} bytes of activations); \
-             more than one {out_bucket}-byte output means a second set was live"
-        );
-    });
+            let extra = rt.peak_allocated_bytes() - after_first;
+            assert!(
+                extra <= out_bucket,
+                "{operands:?}: three more audio calls reached {extra} bytes above the first ({set} bytes of \
+                 activations); more than one {out_bucket}-byte output means a second set was live"
+            );
+        });
+    }
 }
 
 /// Consecutive mixed calls of the facade (text, an image, a clip and a

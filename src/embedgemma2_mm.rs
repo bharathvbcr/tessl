@@ -74,20 +74,23 @@
 //! # Precision
 //!
 //! One [`GemmOperands`] ([`EmbedGemma2Multimodal::load`]'s `operands`)
-//! configures the **text encoder and the vision tower** alike. Under `Bf16`
-//! both keep their projections as the checkpoint stores them, run every GEMM
-//! with bf16 operands and f32 accumulation and the attention on bf16 tiles; the
-//! residual streams, the norms, the pooling and the soft tokens stay f32, and
-//! the soft tokens enter the text encoder as its embeddings do and are rounded
-//! where its GEMMs round them. It is one flag because both models make one
-//! precision claim to the caller, and a mixed pair (a bf16 tower into an exact
-//! text model, or the reverse) is a different forward that a caller composing
-//! the models by hand ([`EmbedGemma2Multimodal::from_parts`]) can still build.
+//! configures the **text encoder, the vision tower and the audio tower** alike.
+//! Under `Bf16` all three keep their projections as the checkpoint stores them
+//! and run every GEMM with bf16 operands and f32 accumulation; the text
+//! encoder's and the vision tower's attention runs on bf16 tiles, the audio
+//! tower's (chunked, with relative-position logits and a softcap, which the
+//! tile kernel does not have) stays its f32 kernel and stores its output bf16;
+//! the residual streams, the norms, the convolutions, the pooling and the soft
+//! tokens stay f32, and the soft tokens enter the text encoder as its
+//! embeddings do and are rounded where its GEMMs round them. It is one flag
+//! because the models make one precision claim to the caller, and a mixed set
+//! (a bf16 tower into an exact text model, or the reverse) is a different
+//! forward that a caller composing the models by hand
+//! ([`EmbedGemma2Multimodal::from_parts`]) can still build.
 //!
-//! The **audio tower** is exact f32 in either mode: it has no bf16 operand path
-//! (that is its own piece of work), so a call with clips refuses a runtime whose
-//! relaxed f32 GEMMs are on whatever the flag, while a call of text and images
-//! under `Bf16` runs none of them and accepts it.
+//! Under `Bf16` no GEMM of any model is an f32 one, so a call accepts a
+//! runtime whose relaxed f32 GEMMs are on; under `ExactF32` every call that
+//! runs a model refuses it.
 
 use std::borrow::Cow;
 use std::io::Read;
@@ -170,8 +173,9 @@ impl EmbedGemma2Multimodal {
     /// Load from a Hugging Face snapshot directory: its `config.json` (read
     /// once, bounded) and its single-file `model.safetensors` (opened once),
     /// all three models from them. `operands` is the text encoder's
-    /// ([`EmbedGemma2Model::load_with`]) and the vision tower's
-    /// ([`EmbedGemma2VisionModel::load_with`]); the audio tower is exact f32.
+    /// ([`EmbedGemma2Model::load_with`]), the vision tower's
+    /// ([`EmbedGemma2VisionModel::load_with`]) and the audio tower's
+    /// ([`EmbedGemma2Audio::load_with`]).
     pub fn load(rt: &Arc<GpuRuntime>, snapshot_dir: &Path, operands: GemmOperands) -> Result<Self, String> {
         let config = read_config_text(&snapshot_dir.join("config.json"))?;
         let st = SafeTensors::open(&snapshot_dir.join("model.safetensors"))?;
@@ -196,7 +200,7 @@ impl EmbedGemma2Multimodal {
         text_cfg.special_tokens.multimodal("EmbedGemma2Multimodal::load")?;
         let text = EmbedGemma2Model::load_with(rt, st, TEXT_PREFIX, text_cfg, operands)?;
         let vision = EmbedGemma2VisionModel::load_with(rt, st, vision_cfg, operands)?;
-        let audio = EmbedGemma2Audio::load(rt, st, "", audio_cfg)?;
+        let audio = EmbedGemma2Audio::load_with(rt, st, "", audio_cfg, operands)?;
         Self::from_parts(text, vision, audio)
     }
 

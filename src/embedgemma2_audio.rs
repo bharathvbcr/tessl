@@ -49,11 +49,30 @@
 //!
 //! # Precision
 //!
-//! Weights are widened from the checkpoint's bf16 to f32 exactly, every
-//! activation is f32 and every GEMM is exact f32: transformers' fp32 forward up
-//! to operation order. It needs the runtime's relaxed-f32 GEMM switched off
-//! (the default). A clip bound of infinity (the module's untrained default) is
-//! held as `+-f32::MAX`, which clamps nothing.
+//! [`EmbedGemma2Audio::load`] is [`GemmOperands::ExactF32`]: weights widened from
+//! the checkpoint's bf16 to f32 exactly, every activation f32 and every GEMM
+//! exact f32, transformers' fp32 forward up to operation order. It needs the
+//! runtime's relaxed-f32 GEMM switched off (the default). Its output is
+//! unchanged by the bf16 path below (the kernels' f32 arithmetic is the same
+//! code). A clip bound of infinity (the module's untrained default) is held as
+//! `+-f32::MAX`, which clamps nothing.
+//!
+//! [`EmbedGemma2Audio::load_with`] with [`GemmOperands::Bf16`] keeps every
+//! projection as the checkpoint stores it, bf16, on the device (half the
+//! weight bytes, [`EmbedGemma2Audio::weight_bytes`]) and runs every GEMM with
+//! bf16 operands and f32 accumulation. The operand of each GEMM is stored bf16
+//! by the pass that produces it ([`ActStore`]: the row passes, the feed-forward
+//! activation, the light conv and the attention), with no cast per GEMM; the
+//! two ends of the forward, which no audio pass writes, take one cast each (the
+//! subsampling's output into the input projection, the last layer's residual
+//! stream into the output projection). The residual stream, the norms' and
+//! clamps' arithmetic, the convolutions, the soft tokens and every GEMM's
+//! output stay f32. The attention is not the text and vision towers' bf16 tile
+//! kernel (`encoder_attn_bf16`): it is chunked with relative-position logits,
+//! a softcap and a window mask, which that kernel does not have, so it stays
+//! the scalar f32 kernel [`attention`] reading the projection's f32 output, and
+//! only stores its result bf16. No GEMM of this forward is an f32 one, so it
+//! accepts a runtime with relaxed f32 GEMMs on.
 //!
 //! # Rows
 //!
@@ -76,11 +95,14 @@
 //! norm after it are one launch), [`ew`] (the clamp, SiLU and clamp between a
 //! feed-forward's linears), [`lconv`] (the GLU, the depthwise conv and the
 //! conv norm of the light conv in one pass) and [`attention`]. The matmuls are
-//! tessl's exact-f32 [`gemm`]; `gemm_epilogue` has no exact-f32 path, so the
-//! clamps are not fused into them. q, k and v are one `[hidden, 3 * hidden]`
-//! GEMM on one clamped input whenever their input clamps are equal (every layer
-//! of the checkpoint). The sinusoidal table, `relative_k_proj` of it and the
-//! query scale are computed once per layer at load.
+//! tessl's [`gemm`] (exact f32) or `gemm_bf16`; `gemm_epilogue` has no
+//! exact-f32 path, so the clamps are not fused into them. The passes that feed
+//! a GEMM take the type of their output from the host ([`ActStore`]) in the
+//! same entry, so the bf16 mode adds no kernel entry. q, k and v are one
+//! `[hidden, 3 * hidden]` GEMM on one clamped input whenever their input clamps
+//! are equal (every layer of the checkpoint). The sinusoidal table,
+//! `relative_k_proj` of it and the query scale are computed once per layer at
+//! load.
 
 use std::borrow::Borrow;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -90,7 +112,7 @@ use objc2_metal::MTLComputePipelineState;
 
 use crate::dispatch::{dispatch_1d, dispatch_2d_tg, set_gpu_buf, set_u32};
 use crate::embedgemma2::SoftSegment;
-use crate::gemm::{gemm, select_backend, GemmBackend};
+use crate::gemm::{cast_f32_to_bf16_into, gemm, select_backend, GemmBackend, GemmOperands};
 use crate::json::{self, Json, Syntax};
 use crate::loader::Loader;
 use crate::nn::{dispatch_tg_1d, reduce_tptg, require, require_disjoint_writes};
@@ -487,6 +509,33 @@ impl AudioConfig {
 
 const WHAT: &str = "embedgemma2_audio";
 
+/// The element type a pass stores its output in: f32, or bf16 where the output
+/// is the operand of a bf16 GEMM ([`GemmOperands::Bf16`]), rounded to nearest
+/// even as the GPU's own cast does. A bf16 output is a buffer of its own: a
+/// pass refuses one that is also an input, or the f32 output of the same
+/// launch (two bf16 elements share a word, so an in-place store would race
+/// with the reads of its neighbour).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ActStore {
+    #[default]
+    F32,
+    Bf16,
+}
+
+impl ActStore {
+    fn is_bf16(self) -> bool {
+        self == ActStore::Bf16
+    }
+
+    /// The device buffer `buf` holds `n` elements of this type.
+    fn require(self, rt: &GpuRuntime, buf: &GpuBuffer, n: usize, what: &str) -> Result<(), String> {
+        match self {
+            ActStore::F32 => require::<f32>(rt, buf, n, what),
+            ActStore::Bf16 => require::<u16>(rt, buf, n, what),
+        }
+    }
+}
+
 /// A clamp `[lo, hi]`. "No bound" is `+-f32::MAX`: the kernels never see an
 /// infinity (fast math may assume there is none).
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -805,11 +854,13 @@ impl<'a> RmsNorm<'a> {
 const STAGE_WORDS: usize = 13;
 
 /// A stage's checked kernel words, for an input of `n` elements in rows of
-/// `dim`; `posts` are the clamps of its outputs (one to three).
+/// `dim`; `posts` are the clamps of its outputs (one to three) and `stores`
+/// their element types.
 fn stage_words(
     rt: &GpuRuntime,
     spec: &RmsNorm<'_>,
     posts: &[Clamp],
+    stores: &[ActStore],
     n: usize,
     dim: u32,
     e: &str,
@@ -840,6 +891,11 @@ fn stage_words(
     if !spec.norm {
         flags |= 8;
     }
+    for (i, s) in stores.iter().enumerate().take(3) {
+        if s.is_bf16() {
+            flags |= 32 << i;
+        }
+    }
     let mut w = [0u32; STAGE_WORDS];
     w[..5].copy_from_slice(&[
         word(spec.eps),
@@ -867,7 +923,44 @@ pub fn rms_norm(
     dim: u32,
     spec: &RmsNorm<'_>,
 ) -> Result<(), String> {
-    norm_launch(rt, "embedgemma2_audio::rms_norm", x, out, rows, dim, spec, None)
+    norm_launch(
+        rt,
+        "embedgemma2_audio::rms_norm",
+        x,
+        out,
+        rows,
+        dim,
+        spec,
+        ActStore::F32,
+        None,
+        [ActStore::F32; 3],
+    )
+}
+
+/// [`rms_norm`] storing `out` as `store`. A bf16 `out` is the operand of the
+/// GEMM that reads it and is a buffer of its own (not `x`, and not `spec`'s
+/// residual).
+pub fn rms_norm_store(
+    rt: &Arc<GpuRuntime>,
+    x: &GpuBuffer,
+    out: &GpuBuffer,
+    rows: u32,
+    dim: u32,
+    spec: &RmsNorm<'_>,
+    store: ActStore,
+) -> Result<(), String> {
+    norm_launch(
+        rt,
+        "embedgemma2_audio::rms_norm_store",
+        x,
+        out,
+        rows,
+        dim,
+        spec,
+        store,
+        None,
+        [ActStore::F32; 3],
+    )
 }
 
 /// A second row stage chained after [`rms_norm`]'s, and where it writes.
@@ -905,7 +998,39 @@ pub fn rms_norm_then(
         rows,
         dim,
         first,
+        ActStore::F32,
         Some(then),
+        [ActStore::F32; 3],
+    )
+}
+
+/// [`rms_norm_then`] storing the second stage's outputs as `stores` (`stores[i]`
+/// is the element type of `then.outs[i]`; entries past the outputs are unused).
+/// The first stage's `out` stays f32, since the second stage reads it. A bf16
+/// output is a buffer of its own: not `x`, `out`, a residual, or another
+/// output.
+#[allow(clippy::too_many_arguments)]
+pub fn rms_norm_then_store(
+    rt: &Arc<GpuRuntime>,
+    x: &GpuBuffer,
+    out: &GpuBuffer,
+    rows: u32,
+    dim: u32,
+    first: &RmsNorm<'_>,
+    then: &NormThen<'_>,
+    stores: [ActStore; 3],
+) -> Result<(), String> {
+    norm_launch(
+        rt,
+        "embedgemma2_audio::rms_norm_then_store",
+        x,
+        out,
+        rows,
+        dim,
+        first,
+        ActStore::F32,
+        Some(then),
+        stores,
     )
 }
 
@@ -918,12 +1043,26 @@ fn norm_launch(
     rows: u32,
     dim: u32,
     first: &RmsNorm<'_>,
+    first_store: ActStore,
     then: Option<&NormThen<'_>>,
+    then_stores: [ActStore; 3],
 ) -> Result<(), String> {
     let n = elems(&[rows, dim], e)?;
     require::<f32>(rt, x, n, "rms_norm x")?;
-    require::<f32>(rt, out, n, "rms_norm out")?;
-    let a = stage_words(rt, first, &[first.post], n, dim, e)?;
+    first_store.require(rt, out, n, "rms_norm out")?;
+    // A chained launch's first output is read back by the second stage as
+    // f32, so only a lone stage stores its output bf16 (`rms_norm_then_store`
+    // has no way to ask otherwise).
+    debug_assert!(then.is_none() || !first_store.is_bf16());
+    if first_store.is_bf16() {
+        // A bf16 element shares its word with its neighbour: no in-place store.
+        let mut reads = vec![("x", x)];
+        reads.extend(first.resid.map(|r| ("resid", r)));
+        reads.extend(first.bias.map(|b| ("bias", b)));
+        reads.extend(first.weight.map(|w| ("weight", w)));
+        require_disjoint_writes(e, &[("out", out)], &reads)?;
+    }
+    let a = stage_words(rt, first, &[first.post], &[first_store], n, dim, e)?;
     let (b, outs) = match then {
         None => ([0u32; STAGE_WORDS], &[][..]),
         Some(t) => {
@@ -936,11 +1075,14 @@ fn norm_launch(
                     "{e}: the second stage's clamp, scale and add belong to the first stage and the outputs"
                 ));
             }
-            for &(o, _) in &t.outs {
-                require::<f32>(rt, o, n, "rms_norm_then output")?;
+            for (&(o, _), st) in t.outs.iter().zip(then_stores) {
+                st.require(rt, o, n, "rms_norm_then output")?;
             }
             let posts: Vec<Clamp> = t.outs.iter().map(|&(_, c)| c).collect();
-            (stage_words(rt, s, &posts, n, dim, e)?, &t.outs[..])
+            (
+                stage_words(rt, s, &posts, &then_stores[..t.outs.len()], n, dim, e)?,
+                &t.outs[..],
+            )
         }
     };
     if rows == 0 {
@@ -977,6 +1119,15 @@ fn norm_launch(
         let mut others = reads.clone();
         others.extend(t.outs.iter().enumerate().skip(1).map(|(j, &(b, _))| (NAMES[j], b)));
         require_disjoint_writes(e, &[(NAMES[0], t.outs[0].0)], &others)?;
+        // A bf16 output is read by no stage of the launch: it overlaps neither
+        // the input, the first stage's output nor its residual.
+        for (k, (&(o, _), st)) in t.outs.iter().zip(then_stores).enumerate() {
+            if st.is_bf16() {
+                let mut inputs = vec![("x", x), ("out", out)];
+                inputs.extend(first.resid.map(|r| ("resid", r)));
+                require_disjoint_writes(e, &[(NAMES[k], o)], &inputs)?;
+            }
+        }
     }
     require_disjoint_writes(e, &[("out", out)], &reads)?;
     let p = rt.pipeline("eg2a_rms_norm")?;
@@ -1009,8 +1160,26 @@ pub struct Ew {
 
 /// [`Ew`] over `n` elements, `x` into `out` (`out` may be `x`).
 pub fn ew(rt: &Arc<GpuRuntime>, x: &GpuBuffer, out: &GpuBuffer, n: u32, spec: &Ew) -> Result<(), String> {
+    ew_store(rt, x, out, n, spec, ActStore::F32)
+}
+
+/// [`ew`] storing `out` as `store`. A bf16 `out` is a buffer of its own, not
+/// `x`: the second feed-forward GEMM's operand, from the first one's f32
+/// output.
+pub fn ew_store(
+    rt: &Arc<GpuRuntime>,
+    x: &GpuBuffer,
+    out: &GpuBuffer,
+    n: u32,
+    spec: &Ew,
+    store: ActStore,
+) -> Result<(), String> {
+    const E: &str = "embedgemma2_audio::ew_store";
     require::<f32>(rt, x, n as usize, "ew x")?;
-    require::<f32>(rt, out, n as usize, "ew out")?;
+    store.require(rt, out, n as usize, "ew out")?;
+    if store.is_bf16() {
+        require_disjoint_writes(E, &[("out", out)], &[("x", x)])?;
+    }
     if n == 0 {
         return Ok(());
     }
@@ -1021,7 +1190,7 @@ pub fn ew(rt: &Arc<GpuRuntime>, x: &GpuBuffer, out: &GpuBuffer, n: u32, spec: &E
         word(spec.pre.hi),
         word(spec.post.lo),
         word(spec.post.hi),
-        if spec.silu { 2 } else { 0 },
+        (if spec.silu { 2 } else { 0 }) | (if store.is_bf16() { 4 } else { 0 }),
     ]);
     dispatch_1d(rt, &p, n as usize, |bnd| {
         set_gpu_buf(bnd, x, 0);
@@ -1063,6 +1232,23 @@ pub fn lconv(
     taps: u32,
     spec: &Lconv<'_>,
 ) -> Result<(), String> {
+    lconv_store(rt, x, w, out, clips, hidden, taps, spec, ActStore::F32)
+}
+
+/// [`lconv`] storing `out` as `store`: the output of the light conv's middle is
+/// `linear_end`'s GEMM operand.
+#[allow(clippy::too_many_arguments)]
+pub fn lconv_store(
+    rt: &Arc<GpuRuntime>,
+    x: &GpuBuffer,
+    w: &GpuBuffer,
+    out: &GpuBuffer,
+    clips: &ClipTable,
+    hidden: u32,
+    taps: u32,
+    spec: &Lconv<'_>,
+    store: ActStore,
+) -> Result<(), String> {
     const E: &str = "embedgemma2_audio::lconv";
     if hidden == 0 || hidden > MAX_HIDDEN || taps == 0 || !(spec.eps > 0.0 && spec.eps.is_finite()) {
         return Err(format!(
@@ -1073,7 +1259,7 @@ pub fn lconv(
     check_table(rt, clips, E)?;
     let rows = clips.rows as u32;
     require::<f32>(rt, x, elems(&[rows, hidden, 2], E)?, "lconv x")?;
-    require::<f32>(rt, out, elems(&[rows, hidden], E)?, "lconv out")?;
+    store.require(rt, out, elems(&[rows, hidden], E)?, "lconv out")?;
     require::<f32>(rt, w, elems(&[hidden, taps], E)?, "lconv w")?;
     require::<f32>(rt, spec.norm_weight, hidden as usize, "lconv norm weight")?;
     require_disjoint_writes(
@@ -1098,6 +1284,7 @@ pub fn lconv(
         word(spec.pre.hi),
         word(spec.post.lo),
         word(spec.post.hi),
+        u32::from(store.is_bf16()),
     ]);
     dispatch_2d_tg(rt, &p, clips.max_rows(), clips.clips.len(), tptg, |bnd| {
         set_gpu_buf(bnd, x, 0);
@@ -1165,6 +1352,27 @@ pub fn attention(
     clips: &ClipTable,
     spec: &AttentionSpec,
 ) -> Result<(), String> {
+    attention_store(rt, q, k, v, rel, q_mult, omask, out, clips, spec, ActStore::F32)
+}
+
+/// [`attention`] storing `out` as `store`: the output projection's GEMM
+/// operand. `q`, `k` and `v` are f32 either way (the projection GEMM's
+/// accumulators are f32 and the kernel is not a tile kernel: it has the
+/// relative-position logits, the softcap and the window mask).
+#[allow(clippy::too_many_arguments)]
+pub fn attention_store(
+    rt: &Arc<GpuRuntime>,
+    q: &GpuBuffer,
+    k: &GpuBuffer,
+    v: &GpuBuffer,
+    rel: &GpuBuffer,
+    q_mult: &GpuBuffer,
+    omask: &GpuBuffer,
+    out: &GpuBuffer,
+    clips: &ClipTable,
+    spec: &AttentionSpec,
+    store: ActStore,
+) -> Result<(), String> {
     const E: &str = "embedgemma2_audio::attention";
     let ctx = spec.chunk + spec.past;
     let rel_rows = ctx / 2 + 1;
@@ -1198,7 +1406,7 @@ pub fn attention(
     for (b, name) in [(q, "q"), (k, "k"), (v, "v")] {
         require::<f32>(rt, b, n_in, name)?;
     }
-    require::<f32>(rt, out, n, "out")?;
+    store.require(rt, out, n, "out")?;
     require::<f32>(rt, rel, elems(&[rel_rows, hidden], E)?, "rel")?;
     require::<f32>(rt, q_mult, spec.head_dim as usize, "q_mult")?;
     require::<u32>(rt, omask, clips.rows, "omask")?;
@@ -1237,6 +1445,7 @@ pub fn attention(
         spec.q_off,
         spec.k_off,
         spec.v_off,
+        u32::from(store.is_bf16()),
     ]);
     dispatch_2d_tg(
         rt,
@@ -1340,6 +1549,9 @@ pub struct EmbedGemma2Audio {
     split_qkv: bool,
     /// Which [`AudioStage`]s a forward runs (all, unless a profiler narrowed it).
     stage_mask: AtomicU32,
+    /// How the projections are held and the GEMMs run
+    /// ([`EmbedGemma2Audio::load_with`]).
+    operands: GemmOperands,
 }
 
 /// One dispatch group of the forward, so a profiler can run a stage alone or
@@ -1496,11 +1708,6 @@ struct Acts {
     sub: Tensor,
     /// The residual stream.
     x: Tensor,
-    /// The norms' outputs, then the attention's and the GLU's.
-    n: Tensor,
-    /// The attention norm, clamped for q's input (k's and v's are in `tower` and
-    /// `emb`, free until the tail of the forward).
-    c: Tensor,
     y: Tensor,
     /// q, k and v of a split projection (see [`QkvWeights`]); `None` when
     /// every layer fuses them, which then land in a prefix of `big`.
@@ -1508,8 +1715,49 @@ struct Acts {
     /// The feed-forward's `[rows, 4 * hidden]`; the GLU's input is its
     /// `[rows, 2 * hidden]` prefix.
     big: Tensor,
+    /// `[rows, out_dims]` (under `ExactF32` `hidden` wide at least: k's clamped
+    /// input of a split projection is in it, free until the tail).
     tower: Tensor,
+    /// The GEMM operands under [`GemmOperands::ExactF32`]; `None` under `Bf16`.
+    ex: Option<ExactActs>,
+    /// The GEMM operands under [`GemmOperands::Bf16`]; `None` under `ExactF32`.
+    bf: Option<Bf16Acts>,
+}
+
+/// The f32 operands of the exact forward's GEMMs.
+struct ExactActs {
+    /// The norms' outputs, then the attention's and the GLU's.
+    n: Tensor,
+    /// The attention norm, clamped for q's input (k's and v's are in `tower`
+    /// and `emb`).
+    c: Tensor,
+    /// The embedder's normed input; also v's clamped input of a split
+    /// projection, free until the tail (`[rows, max(hidden, out_dims)]`).
     emb: Tensor,
+}
+
+/// The bf16 operands of the GEMMs, each written by the pass that produces it
+/// (see [`ActStore`]), except the input and output projections' (one cast of
+/// the subsampling's output and of the residual stream per forward). A GEMM's
+/// output stays in the f32 buffers of [`Acts`].
+struct Bf16Acts {
+    /// `[rows, max(proj_in, hidden, out_dims)]`: the operand of whichever GEMM
+    /// is next of the ones that read a `[rows, hidden]`-wide norm or pass
+    /// output (the feed-forwards' and the attention output's and light conv's
+    /// linears), and at the ends of the forward the input projection's (the
+    /// subsampling's output cast) and the output projection's (the residual
+    /// stream cast) and the embedder's (the weightless norm's output).
+    /// Each is read by its GEMM before the next is written: the runtime separates
+    /// dispatches with barriers, and the f32 forward reuses its `n` the same way.
+    n: Tensor,
+    /// q's clamped attention input; a split projection's k's and v's are `ck`
+    /// and `cv` (`None` when every layer fuses them).
+    c: Tensor,
+    ck: Option<Tensor>,
+    cv: Option<Tensor>,
+    /// The feed-forwards' activation, `[rows, 4 * hidden]`: the down
+    /// projection's operand.
+    big: Tensor,
 }
 
 /// What one forward alone owns, because the host writes it before the forward
@@ -1697,15 +1945,55 @@ impl EmbedGemma2Audio {
     /// `{prefix}audio_tower.*` and `{prefix}embed_audio.*`. Every tensor's
     /// shape is checked against `cfg`; a missing one is an error, and so is
     /// any tensor under either prefix the forward does not read.
+    ///
+    /// This is [`GemmOperands::ExactF32`] ([`Self::load_with`]): every
+    /// projection widened to f32 and every GEMM exact f32.
     pub fn load(rt: &Arc<GpuRuntime>, st: &SafeTensors, prefix: &str, cfg: AudioConfig) -> Result<Self, String> {
+        Self::load_with(rt, st, prefix, cfg, GemmOperands::ExactF32)
+    }
+
+    /// [`Self::load`] with the operand precision chosen (the module docs,
+    /// Precision).
+    ///
+    /// * [`GemmOperands::ExactF32`]: every projection widened to f32 on the
+    ///   device, every GEMM exact f32 (transformers' fp32 forward up to
+    ///   operation order). `encode_audio` refuses a runtime whose relaxed f32
+    ///   GEMMs are on.
+    /// * [`GemmOperands::Bf16`]: every projection (the input projection, each
+    ///   layer's feed-forwards, q|k|v, the attention output and the light
+    ///   conv's two linears, the output projection and the embedder's) kept as
+    ///   the checkpoint stores it, bf16, with no f32 copy, and every GEMM run
+    ///   with bf16 operands and f32 accumulation. The passes that feed a GEMM
+    ///   store its operand bf16 themselves ([`ActStore`]), so no cast pass is
+    ///   added per GEMM. The checkpoint's projections must be bf16 (a tensor
+    ///   stored in another dtype is refused by name rather than rounded) and
+    ///   the device needs TensorOps. `encode_audio` accepts a runtime with
+    ///   relaxed f32 GEMMs on, which no GEMM of this forward uses.
+    pub fn load_with(
+        rt: &Arc<GpuRuntime>,
+        st: &SafeTensors,
+        prefix: &str,
+        cfg: AudioConfig,
+        operands: GemmOperands,
+    ) -> Result<Self, String> {
         cfg.validate()?;
+        let proj = match operands {
+            GemmOperands::ExactF32 => Precision::F32,
+            GemmOperands::Bf16 => {
+                if !rt.has_tensorops() {
+                    return Err(
+                        "EmbedGemma2Audio::load_with: bf16 operands need TensorOps, which this device lacks".into(),
+                    );
+                }
+                Precision::Bf16
+            }
+        };
         let tower_prefix = format!("{prefix}{PREFIX_TOWER}");
         let embed_prefix = format!("{prefix}{PREFIX_EMBED}");
         let ld = Loader::new(rt, st, &tower_prefix);
         let le = Loader::new(rt, st, &embed_prefix);
         let (h, hd) = (cfg.hidden as usize, cfg.head_dim() as usize);
         let (c0, c1) = (cfg.sub_channels[0] as usize, cfg.sub_channels[1] as usize);
-        let f32p = Precision::F32;
 
         let sub = |s: &str| format!("subsample_conv_projection.{s}");
         let conv0_w = ld.buf(&ld.f32(&sub("layer0.conv.weight"), &[c0, 1, 3, 3])?)?;
@@ -1722,7 +2010,7 @@ impl EmbedGemma2Audio {
         }
         let conv1_w = ld.buf(&w1p)?;
         let conv1_norm = ld.norm(&sub("layer1.norm.weight"), c1)?;
-        let input_proj = ld.linear(&[(&sub("input_proj_linear.weight"), h)], cfg.proj_in() as usize, f32p)?;
+        let input_proj = ld.linear(&[(&sub("input_proj_linear.weight"), h)], cfg.proj_in() as usize, proj)?;
 
         let bound = |name: &str| -> Result<Bounds, String> {
             if !cfg.clipped_linears {
@@ -1745,7 +2033,7 @@ impl EmbedGemma2Audio {
         };
         let clipped = |name: &str, out: usize, inp: usize| -> Result<Linear, String> {
             Ok(Linear {
-                w: ld.linear(&[(&format!("{name}.linear.weight"), out)], inp, f32p)?,
+                w: ld.linear(&[(&format!("{name}.linear.weight"), out)], inp, proj)?,
                 bounds: bound(name)?,
             })
         };
@@ -1757,12 +2045,12 @@ impl EmbedGemma2Audio {
             let bounds = [bound(&names[0])?, bound(&names[1])?, bound(&names[2])?];
             let [wq, wk, wv] = names.map(|n| format!("{n}.linear.weight"));
             let w = if bounds[0].input == bounds[1].input && bounds[1].input == bounds[2].input {
-                QkvWeights::Fused(ld.linear(&[(&wq, h), (&wk, h), (&wv, h)], h, f32p)?)
+                QkvWeights::Fused(ld.linear(&[(&wq, h), (&wk, h), (&wv, h)], h, proj)?)
             } else {
                 QkvWeights::Split([
-                    ld.linear(&[(&wq, h)], h, f32p)?,
-                    ld.linear(&[(&wk, h)], h, f32p)?,
-                    ld.linear(&[(&wv, h)], h, f32p)?,
+                    ld.linear(&[(&wq, h)], h, proj)?,
+                    ld.linear(&[(&wk, h)], h, proj)?,
+                    ld.linear(&[(&wv, h)], h, proj)?,
                 ])
             };
             Ok(Qkv { bounds, w })
@@ -1807,12 +2095,12 @@ impl EmbedGemma2Audio {
             });
         }
         let out_dims = cfg.out_dims as usize;
-        let output_proj = ld.linear(&[("output_proj.weight", out_dims)], h, f32p)?;
+        let output_proj = ld.linear(&[("output_proj.weight", out_dims)], h, proj)?;
         let output_bias = ld.norm("output_proj.bias", out_dims)?;
         let embed_proj = le.linear(
             &[("embedding_projection.weight", cfg.embed_dim as usize)],
             out_dims,
-            f32p,
+            proj,
         )?;
         ld.refuse_unread()?;
         le.refuse_unread()?;
@@ -1832,11 +2120,65 @@ impl EmbedGemma2Audio {
             embed_proj,
             split_qkv,
             stage_mask: AtomicU32::new(AudioStage::MASK_ALL),
+            operands,
         })
     }
 
     pub fn config(&self) -> &AudioConfig {
         &self.cfg
+    }
+
+    /// The operand precision this model was loaded with.
+    pub fn operands(&self) -> GemmOperands {
+        self.operands
+    }
+
+    /// Bytes of weights held on the device: every projection in the dtype the
+    /// mode holds it in (f32 or bf16), the convolutions, the norms, the
+    /// relative-key tables and the query scales (f32). The activations are not
+    /// counted.
+    pub fn weight_bytes(&self) -> usize {
+        let t = |t: &Tensor| t.nbytes_logical();
+        let b = |b: &GpuBuffer| b.nbytes();
+        let ffn = |f: &Ffn| b(&f.pre_norm) + b(&f.post_norm) + t(&f.l1.w) + t(&f.l2.w);
+        let layers: usize = self
+            .layers
+            .iter()
+            .map(|l| {
+                let qkv = match &l.qkv.w {
+                    QkvWeights::Fused(w) => t(w),
+                    QkvWeights::Split(ws) => ws.iter().map(t).sum(),
+                };
+                ffn(&l.ff1)
+                    + ffn(&l.ff2)
+                    + [
+                        &l.norm_pre_attn,
+                        &l.norm_post_attn,
+                        &l.norm_out,
+                        &l.lc_pre_norm,
+                        &l.lc_conv_norm,
+                    ]
+                    .into_iter()
+                    .map(b)
+                    .sum::<usize>()
+                    + qkv
+                    + t(&l.post.w)
+                    + b(&l.rel)
+                    + b(&l.q_mult)
+                    + t(&l.lc_start.w)
+                    + b(&l.lc_conv)
+                    + t(&l.lc_end.w)
+            })
+            .sum();
+        b(&self.conv0_w)
+            + b(&self.conv0_norm)
+            + b(&self.conv1_w)
+            + b(&self.conv1_norm)
+            + t(&self.input_proj)
+            + layers
+            + t(&self.output_proj)
+            + b(&self.output_bias)
+            + t(&self.embed_proj)
     }
 
     /// A profiler's switch: later forwards run only the [`AudioStage`]s whose
@@ -1874,7 +2216,8 @@ impl EmbedGemma2Audio {
 
     /// Everything [`Self::encode_audio`] checks before it touches the device,
     /// with no allocation and no wait: the batch is non-empty and within
-    /// [`MAX_CLIPS`], the runtime's f32 GEMMs are exact, and each clip has
+    /// [`MAX_CLIPS`], the runtime's f32 GEMMs are exact (under
+    /// [`GemmOperands::ExactF32`]; a bf16 forward runs none), and each clip has
     /// frames (at most [`MAX_FRAMES_PER_FORWARD`]), `frames * mel_bins` finite
     /// features. Returns the number of soft tokens each clip will produce (the
     /// true entries of its tower mask), which is what a caller needs to lay out
@@ -1900,7 +2243,9 @@ impl EmbedGemma2Audio {
                 clips.len()
             ));
         }
-        if self.rt.f32_gemm_runs_relaxed() {
+        // No GEMM of the bf16 forward is an f32 one, so the switch does not
+        // touch it.
+        if self.operands == GemmOperands::ExactF32 && self.rt.f32_gemm_runs_relaxed() {
             return Err(format!(
                 "{what}: the forward needs exact-f32 GEMMs; switch the runtime's relaxed precision off"
             ));
@@ -2065,8 +2410,7 @@ impl EmbedGemma2Audio {
                 4 * h.max(cfg.out_dims as usize)
             ));
         }
-        // `tower` and `emb` also hold k's and v's clamped input, `hidden` wide.
-        let tail_w = (cfg.out_dims as usize).max(h);
+        let out_dims = cfg.out_dims as usize;
         let narrowed = self.stage_mask.load(Ordering::Acquire) & PROFILED != 0;
         let f32s = |shape: &[usize]| {
             if narrowed {
@@ -2075,12 +2419,39 @@ impl EmbedGemma2Audio {
                 rt.alloc_tensor_unzeroed(shape, DType::F32)
             }
         };
+        let bf16s = |shape: &[usize]| {
+            if narrowed {
+                rt.alloc_tensor_bf16(shape)
+            } else {
+                rt.alloc_tensor_unzeroed(shape, DType::BF16)
+            }
+        };
+        let (ex, bf, tower_w) = match self.operands {
+            // `tower` and `emb` also hold k's and v's clamped input, `hidden` wide.
+            GemmOperands::ExactF32 => {
+                let tail_w = out_dims.max(h);
+                let ex = ExactActs {
+                    n: f32s(&[rows, h])?,
+                    c: f32s(&[rows, h])?,
+                    emb: f32s(&[rows, tail_w])?,
+                };
+                (Some(ex), None, tail_w)
+            }
+            GemmOperands::Bf16 => {
+                let bf = Bf16Acts {
+                    n: bf16s(&[rows, (cfg.proj_in() as usize).max(h).max(out_dims)])?,
+                    c: bf16s(&[rows, h])?,
+                    ck: if self.split_qkv { Some(bf16s(&[rows, h])?) } else { None },
+                    cv: if self.split_qkv { Some(bf16s(&[rows, h])?) } else { None },
+                    big: bf16s(&[rows, 4 * h])?,
+                };
+                (None, Some(bf), out_dims)
+            }
+        };
         Ok(Acts {
             mid: f32s(&[mid, mels1 * cfg.sub_channels[0] as usize])?,
             sub: f32s(&[rows, cfg.proj_in() as usize])?,
             x: f32s(&[rows, h])?,
-            n: f32s(&[rows, h])?,
-            c: f32s(&[rows, h])?,
             y: f32s(&[rows, h])?,
             split: if self.split_qkv {
                 Some([f32s(&[rows, h])?, f32s(&[rows, h])?, f32s(&[rows, h])?])
@@ -2088,8 +2459,9 @@ impl EmbedGemma2Audio {
                 None
             },
             big: f32s(&[rows, 4 * h])?,
-            tower: f32s(&[rows, tail_w])?,
-            emb: f32s(&[rows, tail_w])?,
+            tower: f32s(&[rows, tower_w])?,
+            ex,
+            bf,
         })
     }
 
@@ -2139,10 +2511,38 @@ impl EmbedGemma2Audio {
         let (h, rows_u) = (cfg.hidden, rows as u32);
         let (eps, hd) = (cfg.eps, cfg.head_dim());
         let at = |t: &Tensor, cols: u32| t.try_view(&[rows, cols as usize], 0);
-        let (x, n, y) = (at(&a.x, h)?, at(&a.n, h)?, at(&a.y, h)?);
-        // The attention norm, clamped for q's input; a split projection also
-        // has k's and v's (in `tower` and `emb`, free until the tail).
-        let (cq, ck, cv) = (at(&a.c, h)?, at(&a.tower, h)?, at(&a.emb, h)?);
+        let (x, y) = (at(&a.x, h)?, at(&a.y, h)?);
+        // What each GEMM reads, in the mode's operand type: f32 buffers that
+        // the passes fill under `ExactF32`, bf16 ones under `Bf16` (every pass
+        // that feeds a GEMM stores its output in `store`'s type, so no GEMM
+        // reads a buffer cast for it, except at the two ends of the forward).
+        //   n    the norm and pass outputs the feed-forwards', the attention
+        //        output's and the light conv's linears read;
+        //   cq, ck, cv  the attention norm, clamped for q's, k's and v's input
+        //        (k's and v's only for a split projection);
+        //   act  the feed-forward's activation, the down projection's operand.
+        let store = if a.bf.is_some() { ActStore::Bf16 } else { ActStore::F32 };
+        let (n, cq, ck, cv, act_buf, emb_wide) = match (&a.ex, &a.bf) {
+            // Under `ExactF32`, k's and v's clamped input of a split projection
+            // are in `tower` and `emb`, free until the tail of the forward.
+            (Some(ex), None) => (
+                at(&ex.n, h)?,
+                at(&ex.c, h)?,
+                Some(at(&a.tower, h)?),
+                Some(at(&ex.emb, h)?),
+                at(&a.big, 4 * h)?,
+                at(&ex.emb, cfg.out_dims)?,
+            ),
+            (None, Some(bf)) => (
+                at(&bf.n, h)?,
+                at(&bf.c, h)?,
+                bf.ck.as_ref().map(|t| at(t, h)).transpose()?,
+                bf.cv.as_ref().map(|t| at(t, h)).transpose()?,
+                at(&bf.big, 4 * h)?,
+                at(&bf.n, cfg.out_dims)?,
+            ),
+            _ => return Err("EmbedGemma2Audio: the activations do not match the operand precision".into()),
+        };
         // The fused projection's output q | k | v lands in a prefix of `big`;
         // a split one's in three buffers of their own.
         let qkv_fused = at(&a.big, 3 * h)?;
@@ -2150,8 +2550,30 @@ impl EmbedGemma2Audio {
             Some([q, k, v]) => Some([at(q, h)?, at(k, h)?, at(v, h)?]),
             None => None,
         };
+        // The feed-forward's up projection's output (f32), and where the
+        // activation pass leaves its result: in place under `ExactF32`, in its
+        // own bf16 buffer under `Bf16`.
         let big = at(&a.big, 4 * h)?;
         let big2 = at(&a.big, 2 * h)?;
+        let operands = self.operands;
+        // `out = inp @ w` at the mode's precision. Under `Bf16` the operand
+        // must already be bf16: `gemm_bf16` would cast an f32 one into a
+        // temporary, which is a dispatch and an allocation this forward has
+        // none of.
+        let mm = |inp: &Tensor, w: &Tensor, out: &Tensor| -> Result<(), String> {
+            match operands {
+                GemmOperands::ExactF32 => gemm(inp, w, out, backend),
+                GemmOperands::Bf16 => {
+                    if inp.dtype != DType::BF16 {
+                        return Err(format!(
+                            "EmbedGemma2Audio::forward: a bf16 GEMM was handed an {:?} operand",
+                            inp.dtype
+                        ));
+                    }
+                    GemmOperands::Bf16.nn(inp, w, out)
+                }
+            }
+        };
         let gc = Clamp::symmetric(cfg.gradient_clip);
         let none = Clamp::NONE;
         let mels = cfg.mel_bins();
@@ -2194,7 +2616,16 @@ impl EmbedGemma2Audio {
             )?;
         }
         if on(AudioStage::InputProj) {
-            gemm(&sub_t, &self.input_proj, &x, backend)?;
+            match &a.bf {
+                None => mm(&sub_t, &self.input_proj, &x)?,
+                // The convolution stage's output, rounded for the GEMM: one
+                // pass for the forward.
+                Some(bf) => {
+                    let op = at(&bf.n, cfg.proj_in())?;
+                    cast_f32_to_bf16_into(&sub_t, &op)?;
+                    mm(&op, &self.input_proj, &x)?;
+                }
+            }
         }
         if let Some(t) = io.trace.first() {
             gpu_copy(&x, t)?;
@@ -2204,30 +2635,43 @@ impl EmbedGemma2Audio {
         // SiLU and clamp between them.
         let ffn_mid = |f: &Ffn| -> Result<(), String> {
             if on(AudioStage::FfnUp) {
-                gemm(&n, &f.l1.w, &big, backend)?;
+                mm(&n, &f.l1.w, &big)?;
             }
             if on(AudioStage::FfnAct) {
-                ew(
+                ew_store(
                     rt,
                     &big.buffer,
-                    &big.buffer,
+                    &act_buf.buffer,
                     rows_u * 4 * h,
                     &Ew {
                         pre: f.l1.bounds.output,
                         silu: true,
                         post: f.l2.bounds.input,
                     },
+                    store,
                 )?;
             }
             if on(AudioStage::FfnDown) {
-                gemm(&big, &f.l2.w, &y, backend)?;
+                mm(&act_buf, &f.l2.w, &y)?;
             }
             Ok(())
         };
 
+        const NO_SPLIT: &str = "EmbedGemma2Audio: a split q/k/v projection without its activations";
+        // k's and v's clamped inputs of a split projection.
+        let split_inputs = ck.as_ref().zip(cv.as_ref());
+
         for (li, l) in self.layers.iter().enumerate() {
             if on(AudioStage::FfnNormPre) {
-                rms_norm(rt, &x.buffer, &n.buffer, rows_u, h, &ffn_pre_norm(&l.ff1, eps, gc))?;
+                rms_norm_store(
+                    rt,
+                    &x.buffer,
+                    &n.buffer,
+                    rows_u,
+                    h,
+                    &ffn_pre_norm(&l.ff1, eps, gc),
+                    store,
+                )?;
             }
             ffn_mid(&l.ff1)?;
 
@@ -2240,10 +2684,11 @@ impl EmbedGemma2Audio {
                 attn_norm.pre = [gc, none];
                 let mut outs = vec![(&cq.buffer, l.qkv.bounds[0].input)];
                 if !fused {
+                    let (ck, cv) = split_inputs.ok_or(NO_SPLIT)?;
                     outs.push((&ck.buffer, l.qkv.bounds[1].input));
                     outs.push((&cv.buffer, l.qkv.bounds[2].input));
                 }
-                rms_norm_then(
+                rms_norm_then_store(
                     rt,
                     &y.buffer,
                     &x.buffer,
@@ -2251,21 +2696,21 @@ impl EmbedGemma2Audio {
                     h,
                     &ffn_post_norm(&l.ff1, eps, gc, cfg.residual_weight, &x.buffer),
                     &NormThen { spec: attn_norm, outs },
+                    [store; 3],
                 )?;
             }
 
             // Attention.
             if on(AudioStage::QkvGemm) {
                 match (&l.qkv.w, &split) {
-                    (QkvWeights::Fused(w), _) => gemm(&cq, w, &qkv_fused, backend)?,
+                    (QkvWeights::Fused(w), _) => mm(&cq, w, &qkv_fused)?,
                     (QkvWeights::Split(ws), Some(outs)) => {
-                        for ((src, w), dst) in [&cq, &ck, &cv].into_iter().zip(ws).zip(outs) {
-                            gemm(src, w, dst, backend)?;
+                        let (ck, cv) = split_inputs.ok_or(NO_SPLIT)?;
+                        for ((src, w), dst) in [&cq, ck, cv].into_iter().zip(ws).zip(outs) {
+                            mm(src, w, dst)?;
                         }
                     }
-                    (QkvWeights::Split(_), None) => {
-                        return Err("EmbedGemma2Audio: a split q/k/v projection without its activations".into())
-                    }
+                    (QkvWeights::Split(_), None) => return Err(NO_SPLIT.into()),
                 }
             }
             if on(AudioStage::Attention) {
@@ -2281,7 +2726,7 @@ impl EmbedGemma2Audio {
                         [0, h, 2 * h],
                     ),
                 };
-                attention(
+                attention_store(
                     rt,
                     q,
                     k,
@@ -2308,10 +2753,11 @@ impl EmbedGemma2Audio {
                         k_off: offs[1],
                         v_off: offs[2],
                     },
+                    store,
                 )?;
             }
             if on(AudioStage::AttnOutGemm) {
-                gemm(&n, &l.post.w, &y, backend)?;
+                mm(&n, &l.post.w, &y)?;
             }
 
             // The attention's post-norm, then the light conv's pre-norm.
@@ -2321,7 +2767,7 @@ impl EmbedGemma2Audio {
                 post.resid = Some(&x.buffer);
                 let mut lc_norm = RmsNorm::new(eps, Some(&l.lc_pre_norm));
                 lc_norm.pre = [none, none];
-                rms_norm_then(
+                rms_norm_then_store(
                     rt,
                     &y.buffer,
                     &x.buffer,
@@ -2332,15 +2778,16 @@ impl EmbedGemma2Audio {
                         spec: lc_norm,
                         outs: vec![(&n.buffer, l.lc_start.bounds.input)],
                     },
+                    [store; 3],
                 )?;
             }
 
             // Light conv.
             if on(AudioStage::LconvStart) {
-                gemm(&n, &l.lc_start.w, &big2, backend)?;
+                mm(&n, &l.lc_start.w, &big2)?;
             }
             if on(AudioStage::Lconv) {
-                lconv(
+                lconv_store(
                     rt,
                     &big2.buffer,
                     &l.lc_conv,
@@ -2355,10 +2802,11 @@ impl EmbedGemma2Audio {
                         pre: gc,
                         post: l.lc_end.bounds.input,
                     },
+                    store,
                 )?;
             }
             if on(AudioStage::LconvEnd) {
-                gemm(&n, &l.lc_end.w, &y, backend)?;
+                mm(&n, &l.lc_end.w, &y)?;
             }
 
             // `linear_end`'s output clamp and the residual add, then the second
@@ -2368,7 +2816,7 @@ impl EmbedGemma2Audio {
                 add.norm = false;
                 add.pre = [l.lc_end.bounds.output, none];
                 add.resid = Some(&x.buffer);
-                rms_norm_then(
+                rms_norm_then_store(
                     rt,
                     &y.buffer,
                     &x.buffer,
@@ -2382,6 +2830,7 @@ impl EmbedGemma2Audio {
                         },
                         outs: vec![(&n.buffer, l.ff2.l1.bounds.input)],
                     },
+                    [store; 3],
                 )?;
             }
 
@@ -2411,16 +2860,26 @@ impl EmbedGemma2Audio {
         // Output projection (with bias) and the multimodal embedder.
         let tower = at(&a.tower, cfg.out_dims)?;
         if on(AudioStage::OutProj) {
-            gemm(&x, &self.output_proj, &tower, backend)?;
+            match &a.bf {
+                None => mm(&x, &self.output_proj, &tower)?,
+                // The residual stream, rounded for the GEMM: the last
+                // layer's `norm_out` is the one GEMM input that is also the
+                // next layer's f32 input, so it is cast once, here.
+                Some(bf) => {
+                    let op = at(&bf.n, h)?;
+                    cast_f32_to_bf16_into(&x, &op)?;
+                    mm(&op, &self.output_proj, &tower)?;
+                }
+            }
         }
-        let emb = at(&a.emb, cfg.out_dims)?;
+        let emb = emb_wide;
         if on(AudioStage::OutBias) {
             // The bias in place on `tower` (the tower's output, traced below),
             // then the embedder's weightless norm of it.
             let mut bias = RmsNorm::new(eps, None);
             bias.norm = false;
             bias.bias = Some(&self.output_bias);
-            rms_norm_then(
+            rms_norm_then_store(
                 rt,
                 &tower.buffer,
                 &tower.buffer,
@@ -2431,13 +2890,14 @@ impl EmbedGemma2Audio {
                     spec: RmsNorm::new(eps, None),
                     outs: vec![(&emb.buffer, none)],
                 },
+                [store; 3],
             )?;
         }
         if let Some(t) = io.trace.last() {
             gpu_copy(&tower, t)?;
         }
         if on(AudioStage::EmbedProj) {
-            gemm(&emb, &self.embed_proj, &io.soft, backend)?;
+            mm(&emb, &self.embed_proj, &io.soft)?;
         }
         Ok(())
     }

@@ -24,9 +24,9 @@
 //! * host waits: the mixed call, a call of media alone and a call of texts
 //!   alone each make exactly 1 (2 for the first two until the towers' soft rows
 //!   stayed on the device; the bound changed because the behaviour did);
-//! * `GemmOperands::Bf16` for the text encoder and the vision tower (the audio
-//!   tower stays exact f32): the four media rows at cosine
-//!   `0.9999` or better against the fp32 reference, the floor
+//! * `GemmOperands::Bf16` for the text encoder and both towers (the audio tower
+//!   too: its GEMMs and the passes that feed them): the four media rows at
+//!   cosine `0.9999` or better against the fp32 reference, the floor
 //!   `tests/embedgemma2_mm_model.rs` holds a bf16 forward to.
 
 mod common;
@@ -223,10 +223,15 @@ fn one_call_over_texts_images_and_clips_matches_sentence_transformers() {
         assert!(max_abs(&cut.embeddings, &want) <= BATCH_ABS, "truncate_dim 256");
     });
 
-    // The text encoder and the vision tower in bf16, the audio tower as it was.
+    // The text encoder and both towers in bf16. Measured (Apple M5 Pro, sdpa
+    // goldens, snapshot 914f7f89), cosine against the fp32 reference: image 0
+    // 0.999987688, image 1 0.999988499, clip 0 0.999993428, clip 1 0.999985708;
+    // with the audio tower exact the clips were 0.999995 and 0.999994.
     with_gpu(|rt| {
         let m = EmbedGemma2Multimodal::load(rt, &snap, GemmOperands::Bf16).unwrap();
         assert_eq!(m.text().operands(), GemmOperands::Bf16);
+        assert_eq!(m.vision().operands(), GemmOperands::Bf16);
+        assert_eq!(m.audio().operands(), GemmOperands::Bf16);
         let media: Vec<MmItem<'_>> = vec![
             image_item(0),
             image_item(1),
@@ -236,7 +241,7 @@ fn one_call_over_texts_images_and_clips_matches_sentence_transformers() {
         let out = m.encode(&media, None).unwrap();
         for (k, name) in IMAGES.iter().chain(CLIPS.iter()).enumerate() {
             let cos = cosine(&out.embeddings[k * dim..(k + 1) * dim], &media_ref[k]);
-            eprintln!("{name} bf16 text encoder + vision tower: cosine vs fp32 {cos:.9}");
+            eprintln!("{name} bf16 text encoder + both towers: cosine vs fp32 {cos:.9}");
             assert!(cos >= BF16_COS, "{name}: bf16 cosine {cos:.9} (bound {BF16_COS})");
         }
     });

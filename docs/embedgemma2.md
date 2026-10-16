@@ -154,7 +154,7 @@ named as such by the Python binding.
 
 | Entry | Does |
 |---|---|
-| `tessl_embedgemma2_load_multimodal(runtime, dir, dir_len, operands, &out, err, err_len)` | `tessl_embedgemma2_load` with the vision and audio towers as well: one read of `config.json`, one open of `model.safetensors`. `operands` is `TESSL_OPERANDS_EXACT_F32` (0) or `TESSL_OPERANDS_BF16` (1) and applies to the **text encoder and the vision tower**; the audio tower is exact f32 under either (it has no bf16 mode). The handle takes every text entry too, and `_free` |
+| `tessl_embedgemma2_load_multimodal(runtime, dir, dir_len, operands, &out, err, err_len)` | `tessl_embedgemma2_load` with the vision and audio towers as well: one read of `config.json`, one open of `model.safetensors`. `operands` is `TESSL_OPERANDS_EXACT_F32` (0) or `TESSL_OPERANDS_BF16` (1) and applies to the **text encoder and both towers** (the audio tower since [Audio tower bf16 and speed](#audio-tower-bf16-and-speed)). The handle takes every text entry too, and `_free` |
 | `tessl_embedgemma2_encode_images(model, pixel_values, pixel_values_len, position_ids, position_ids_len, offsets, n_images, truncate_dim, out, out_len, err, err_len)` | `pixel_values` f32 `[offsets[n_images], patch_dim]` and `position_ids` i32 `[offsets[n_images], 2]`, the processor's `pixel_values` and `image_position_ids` with the images laid end to end (padding patches `(-1, -1)` included), `offsets` CSR-style `u64` over patch rows; `out` is f32 `[n_images, dim]`, one row per image |
 | `tessl_embedgemma2_encode_audio(model, input_features, input_features_len, input_features_mask, mask_len, offsets, n_clips, truncate_dim, out, out_len, err, err_len)` | `input_features` f32 `[offsets[n_clips], mel_bins]` and the mask one byte per frame (0 or 1; any other byte is refused), `offsets` over frames; one row per clip |
 
@@ -391,13 +391,13 @@ let out = m.encode(&items, Some(256))?;       // EncodeOutput: one row per item,
   finite pixels that overflow the patch projection). The check cannot name the
   tower row or column.
 * **Precision.** One `GemmOperands` (`ExactF32` or `Bf16`) configures the text
-  encoder and the vision tower alike (`EmbedGemma2VisionModel::load_with`, [Vision
-  tower](#vision-tower)): it is one flag because both make one precision claim to
-  the caller, and a caller composing the models by hand (`from_parts`) can still
-  mix them. The audio tower is exact f32 under both: it has no bf16 mode (lane I
-  owns it). The call refuses a runtime with relaxed f32 GEMMs on when it holds
-  clips or the mode is `ExactF32`; a `Bf16` call of text and images runs no f32
-  GEMM and accepts it.
+  encoder and both towers alike (`EmbedGemma2VisionModel::load_with`, [Vision
+  tower](#vision-tower); `EmbedGemma2Audio::load_with`, [Audio tower bf16 and
+  speed](#audio-tower-bf16-and-speed)): it is one flag because they make one
+  precision claim to the caller, and a caller composing the models by hand
+  (`from_parts`) can still mix them. The call refuses a runtime with relaxed f32
+  GEMMs on when the mode is `ExactF32`; a `Bf16` call runs no f32 GEMM in any of
+  the three models and accepts it.
 * **Refusals** come before any allocation or wait: the batch size, each
   tower's input checks, the text checks, the placeholder counts. A refused call
   leaves the facade usable.
@@ -427,7 +427,7 @@ Pro, 2026-10-15, sdpa goldens, snapshot `914f7f89`:
 | 8 texts (10 to 6147 tokens), 2 images, 2 clips in one call, vs `emb_f32` | max abs `1e-4`, cosine `>= 0.99999` | texts `1.2e-7` to `3.0e-7`, images `1.3e-7` / `2.1e-7`, clips `2.2e-7` / `2.5e-7`; cosine 1.000000000; 5 text forwards, 1 wait (27a0407: the same errors digit for digit, 2 waits) |
 | each image and clip alone vs inside that call | `1e-5` | 0 (bit for bit) |
 | media alone, mixed call, texts alone: waits | exact | 1; 1; 1 (media alone and mixed were 2) |
-| text encoder and vision tower `Bf16`, audio tower exact, 4 media rows vs fp32 | cosine `>= 0.9999` | 0.999987 to 0.999995 (images 0.999988, 0.999988; clips 0.999995, 0.999994) |
+| text encoder and both towers `Bf16`, 4 media rows vs fp32 | cosine `>= 0.9999` | 0.999986 to 0.999993 (images 0.999988, 0.999988; clips 0.999993, 0.999986; the clips were 0.999995, 0.999994 with the audio tower exact) |
 | Python, `encode_images` / `encode_audio`, alone and in one call | `1e-4`, `0.99999`; alone vs batch `1e-5` | `2.2e-7` to `3.8e-7`, cosine 1.000000000; alone vs batch 0 |
 | Python, `embed_images` / `embed_audio` with transformers 5.19's processor on the generator's inputs | processor tensors vs saved `1e-6`, then the same embedding bounds | tensors identical (0), `3.8e-7` and `3.0e-7`, cosine 1.000000000 |
 
@@ -908,12 +908,11 @@ norms do not bound it), so the layer-15 absolute error of `3e-2` is the same
 
 `EmbedGemma2VisionModel::load_with(rt, st, cfg, operands)` takes the text
 encoder's `GemmOperands`; `load` is `load_with(.., ExactF32)`. One flag covers
-the text encoder and the vision tower of the facade
+the text encoder and both towers of the facade
 (`EmbedGemma2Multimodal::load(.., operands)`, `tessl_embedgemma2_load_multimodal`'s
 `operands`, `EmbedGemma2.from_pretrained(.., multimodal=True, operands="bf16")`).
-The audio tower stays exact f32 under either flag: its bf16 mode belongs to its
-own lane (the audio tower's section below), and until it lands a `Bf16` load
-runs the audio tower exactly as `ExactF32` does.
+The audio tower follows it too since its bf16 mode ([Audio tower bf16 and
+speed](#audio-tower-bf16-and-speed)).
 
 **`ExactF32` is bit for bit what it was.** Checked by hashing the output bits
 (FNV-1a over the soft tokens) before and after on the same inputs: the tiny
@@ -1967,3 +1966,159 @@ on an idle host is the run that settles it.
   `tests/embedgemma2_small_m.rs` assert.
 - GEMMs that write bf16 directly would drop the remaining casts but change the bits the
   `Bf16` hashes pin, so they need their own bound.
+
+## Audio tower bf16 and speed
+
+`EmbedGemma2Audio::load_with(rt, st, prefix, cfg, operands)` takes the same
+`GemmOperands` as the text encoder and the vision tower; `load` is `load_with(..,
+ExactF32)`. The facade passes its one flag to all three models
+(`EmbedGemma2Multimodal::load(.., operands)`, so `tessl_embedgemma2_load_multimodal`
+and `EmbedGemma2.from_pretrained(.., multimodal=True, operands="bf16")` too):
+a `Bf16` facade call runs no f32 GEMM anywhere, and accepts a runtime whose
+relaxed f32 GEMMs are on.
+
+**What `Bf16` is.** Every projection of the tower (the input projection; per
+layer the two feed-forwards, q|k|v, the attention output, the light conv's
+`linear_start` and `linear_end`; the output projection and the embedder's) stays
+bf16 on the device as the checkpoint stores it, with no f32 copy
+(`weight_bytes`: 587,121,792 bytes, 559.9 MiB, against 1,172,751,488, 1118.4 MiB,
+widened to f32), and every GEMM is `gemm_bf16` (bf16 x bf16, f32 accumulation,
+f32 output). The operand of each GEMM is stored bf16 by the pass that makes it,
+in the pass's existing kernel entry, by a flag the host sets (`ActStore`,
+`ega_store` in the shader), so the mode adds no kernel entry and no cast per
+GEMM:
+
+| GEMM | its operand is written by | as |
+|---|---|---|
+| feed-forward up (x2 per layer) | `rms_norm_store` (the pre-norm, with the first linear's input clamp) | bf16 |
+| feed-forward down (x2) | `ew_store` (the first linear's output clamp, SiLU, the second's input clamp), into its own bf16 buffer | bf16 |
+| q\|k\|v (one GEMM, or three when the input clamps differ) | `rms_norm_then_store` (the attention norm's one to three clamped outputs) | bf16 |
+| attention output | `attention_store` | bf16 |
+| light conv `linear_start`, `linear_end` | `rms_norm_then_store` (the attention post-norm and the conv pre-norm); `lconv_store` | bf16 |
+| input projection | one `cast_f32_to_bf16_into` of the second subsampling conv's output | per forward |
+| output projection | one cast of the last layer's residual stream | per forward |
+| embedding projection | `rms_norm_then_store` (the output bias, then the embedder's weightless norm) | bf16 |
+
+An operand is rounded to nearest even as the GPU's own cast rounds it. What is
+**not** bf16: the residual stream, the norms' and clamps' arithmetic, the two
+subsampling convolutions, the light conv's depthwise conv, every GEMM's output
+(so q, k and v), the relative-key table and the query scale (host constants),
+and the soft tokens. The attention is the f32 `eg2a_attn` kernel and stays so:
+the text and vision towers' bf16 tile kernel (`encoder_attn_bf16`) computes
+`softmax(q.k)` over a full or windowed row, and this attention has
+Transformer-XL relative-position logits, a softcap of 50, a block-shifted window
+mask and per-key clamps, so it is not that kernel's shape; it reads the
+projection's f32 output and stores its result bf16 (3 % of the f32 forward, the
+GEMMs are the cost). A bf16 operand is never stored in place (two bf16 elements
+share a word, so a thread storing one races with its neighbour's read of the f32
+it overwrites): every `*_store` entry refuses a bf16 output that is also an
+input, and `ew` writes its bf16 output to its own buffer (the f32 pass stays in
+place). `EmbedGemma2Audio::forward` refuses to hand `gemm_bf16` an f32 operand
+(it would cast it into a temporary, a dispatch and an allocation the forward has
+none of).
+
+**`ExactF32` is bit for bit what it was.** The shader's f32 arithmetic is the same
+code (one branch on the store type per element), and the host's f32 entries are
+the old ones (`rms_norm`, `rms_norm_then`, `ew`, `lconv`, `attention` keep their
+signatures and call the `_store` entries with `ActStore::F32`). Checked on the
+real checkpoint against the tree this work started from (`5229a1c`, built in a
+detached worktree): the facade's `media_only` and `mixed_short` embeddings
+(two images and two clips; the twelve-item batch) hash the same (FNV-1a over the
+bits, `bench_embedgemma2_mm`'s `HASH` line: `c37bcf8a3961f5e5`,
+`5d800d44bfda33e1`, f32 mode, before and after), the tower's soft-token error
+against transformers on both golden clips is the same to all 17 digits
+(`3.8057482766826946e-6`, `2.2770603099052907e-5`), and every number the
+existing tiny, kernel, fixture and real-checkpoint tests print is unchanged
+(the `--nocapture` output of the fixture, kernel, tiny, `mm_tiny` and
+`multimodal_tiny` tests, compared line by line with the same run on `5229a1c`:
+every line of the old run is in the new one except the test counts, which grew
+with the `Bf16` tests).
+
+**Accuracy.** Tiny towers against the f64 forward (`tests/embedgemma2_audio_tiny.rs`,
+both configurations, split and fused q|k|v, every mask pattern), bound fixed from
+the first measurement and set at about twice the worst: each stage within `2e-2`
+of its largest magnitude (observed worst `1.05e-2`, tiny clip 0 layer 1; wide
+`4.7e-3`) and the soft tokens within `4e-2` max abs (observed `1.9e-2`); the exact
+path's bounds are `1e-4`, observed `5e-7`, so a `Bf16` run that was secretly exact
+would pass these, and `bf16_mode_is_not_the_exact_forward` is the test that shows
+it is not (soft tokens `1.9e-2` from the exact ones, `2.7e-6` from the reference
+when exact). A clip alone, in a batch, reordered, traced, across a split into two
+forwards and with every unzeroed activation poisoned with NaN: bit-identical under
+`Bf16` too (the bf16 GEMM sums K in the same order whatever M is). Each store pass
+is held to its f32 pass exactly, element by element
+(`tests/embedgemma2_audio_kernels.rs`): a bf16 output is the f32 output rounded,
+and an output left f32 beside it is the f32 pass's bits.
+
+Real checkpoint (`tests/embedgemma2_audio_model.rs`, opt-in, Apple M5 Pro, sdpa
+goldens, snapshot `914f7f89`):
+
+| Check | Bound | Observed |
+|---|---|---|
+| tower soft tokens, `Bf16`, vs transformers fp32, clips 0 and 1 | cosine `>= 0.9997` | `0.999951`, `0.999922` (max abs over max `\|ref\|` `4.4e-2`, `8.9e-2`) |
+| tower stages vs the fp32 goldens | reported, not gated | subsample `2.2e-4` / `3.1e-4`; layers `1.7e-4` to `1.0e-3` through layer 9, then `5.6e-3` / `7.8e-3` (layer 10), `9.2e-3` / `1.7e-2` (layer 11), tower output `2.3e-2` / `4.5e-2` (the relative error grows over the last layers) |
+| two 90 s clips (2250 tokens each, 9000 frames, two forwards), `Bf16` vs `ExactF32`, token by token | every token cosine `>= 0.99` | whole clips `0.999904`, `0.999911`; worst single token `0.994434`, `0.996582` |
+| clip embeddings end to end (facade, text encoder and both towers `Bf16`) vs fp32 | cosine `>= 0.9999` | `0.99999343`, `0.99998571` |
+| the same vs transformers' own bf16 forward | cosine `>= 0.9996` | `0.99980337`, `0.99968055` (transformers bf16 vs fp32: `0.99982002`, `0.99968966`) |
+| mean `1 - cos` vs fp32, over the two clips | at most transformers' bf16 (`2.45e-4`) | `1.04e-5` |
+| each clip alone vs both in one call (tower, and embedding) | bit-identical (embedding `1e-5`) | bit-identical |
+| facade `Bf16` (text, vision and audio), 4 media rows vs fp32 | cosine `>= 0.9999` | images `0.999988`, `0.999988`; clips `0.999993`, `0.999986` (clips were `0.999995`, `0.999994` with the audio tower exact) |
+| weight bytes, `Bf16` against `ExactF32` | less | `587,121,792` (559.9 MiB) against `1,172,751,488` (1118.4 MiB): 50.1 % |
+
+The error grows over the last layers and the long-clip worst token is about
+`5e-3` from 1, so a consumer that compares individual soft tokens (not pooled
+embeddings) sees a bf16 error of that size at the tail of a 90 s clip; the
+pooled clip embedding is at `0.99998` or better from fp32 on both golden clips.
+
+### Speed: measured, and refused by the drift gate
+
+The speed of `Bf16` against `ExactF32` on the tower is **not published here**:
+`bench_paired` refused every attempt. The benchmark (`bench_embedgemma2_audio`
+under `bench_paired --evidence --max-spread 1.25 --clean-env`, 8 rounds, the
+lane order reversed on alternate rounds, min over 20 iterations per round, 3
+warm-up iterations) has four lanes: the commit before lane I's merge (`433e659`,
+the audio tower as it was: exact f32, no store flag), built in a detached
+worktree with the benchmark's one `load_with(.., operands)` call replaced by
+`load(..)`; a control, a copy of that `433e659` binary run as the second lane
+(so against the first lane it should read 1.0, the machine's drift between lanes
+shows up as its ratio, and a control ratio over the gate refuses the series);
+the head at `ExactF32`; the head at `Bf16`. Workloads: one 1 s clip, 4 clips of 5 s, 8 clips
+of 10 s, one clip of `MAX_FRAMES_PER_FORWARD` frames (163.84 s). A ratio series
+whose per-round ratio moves by more than `1.25x` between its best and worst
+round is not reported; any refused series means the run exits with status 3 and
+writes no result.
+
+| Attempt (start, CDT, Oct 16) | Ratio series refused | Spread of the refused series (max / min per-round ratio) | 1-minute load average at start |
+|---|---|---|---|
+| tower 1, 08:58 | 12 | `1.27x` to `1.85x` | 83 |
+| tower 2, 09:20 | 17 | `1.27x` to `18.1x` | 77 |
+| tower 3, 09:45 | 20 | `1.71x` to `12.3x` | 113 |
+| facade (audio items only) 1, 10:04 | 9 | `2.45x` to `7.16x` | 105 |
+| facade 2, 10:27 | 4 (all `Bf16`) | `1.30x` to `1.44x` | 119 |
+| facade 3, 10:45 | 9 | `2.5x` to `10.7x` | 73 |
+
+The attempts were at least ten minutes apart, on an Apple M5 Pro that other
+sessions' builds, tests and benchmarks were using at the same time (the
+1-minute load average read between 41 and 119 at the start and end of the
+attempts). The control lane is a copy of the first lane's binary (the tower benchmark: the
+`433e659` build; the facade benchmark: the head at `ExactF32`, which is its first
+lane; the facade control was copied before the head binary was rebuilt for the
+last time; the two files differ in bytes, and that the code is the same, the
+source changes in between being comments, is inferred, not checked), so it should read 1.0 against it; its series are among the refused ones in five of the
+six attempts (spreads up to `8.3x`, tower 3, 1 s clip), which is how the gate
+shows that the machine, not the code, moved. In facade attempt 2 only the `Bf16`
+series moved (up to `1.44x`, control and `ExactF32` within the gate): a repeat
+on a quiet machine is the way to tell whether that is the machine or the mode.
+Nothing about the speed of `Bf16` is claimed. What is measured and does not
+depend on timing: the weights are 50.1 % of the bytes (above), and
+`tests/embedgemma2_memory.rs` holds the activation allocation of both modes to
+one set across consecutive calls.
+
+To reproduce when the machine is quiet: build `bench_embedgemma2_audio`,
+`bench_embedgemma2_mm` and `bench_paired` (`cargo build --release --bins`), and
+run `bench_paired --rounds 8 --evidence --max-spread 1.25 --clean-env` with one
+lane per binary and `BENCH_PRECISION=f32` or `bf16`, `BENCH_ITERS`,
+`BENCH_WARMUP` and `BENCH_WORKLOADS=clip_1.0s,batch_4x5s,batch_8x10s,clip_max`
+(the facade: `BENCH_WORKLOADS=audio_only,audio_4x5s,audio_8x10s`) in each lane's
+environment; the layout of a published result is
+`bench/results/embedgemma2_final_m5pro.txt`'s. The per-stage profile is
+`profile_embedgemma2_audio` with `PROFILE_OPERANDS=bf16`.

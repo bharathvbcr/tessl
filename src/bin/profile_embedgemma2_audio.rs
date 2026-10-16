@@ -30,7 +30,10 @@
 //! the host encoding the forward plus the GPU running it, ended by the wait;
 //! at 25 rows the host is the limit and `only` of a stage then measures its
 //! dispatch count, which the table shows beside it. `PROFILE_SKIP=0` leaves
-//! out the `skip:` variants. `PROFILE_JSON` names the output file. Other tessl
+//! out the `skip:` variants. `PROFILE_OPERANDS=f32|bf16` (default `f32`) is the
+//! tower's operand precision ([`GemmOperands`]): the stage names are the same
+//! in both, and under `bf16` `input_proj GEMM` and `output_proj GEMM` include
+//! the one cast pass that rounds their operand. `PROFILE_JSON` names the output file. Other tessl
 //! GPU processes seen before or after a sample flag it `contended`; the
 //! statistics use every sample (min-of-N discards a contended one only when a
 //! quiet one exists).
@@ -44,12 +47,16 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 use tessl::embedgemma2_audio::{sub_rows, AudioConfig, AudioStage, EmbedGemma2Audio};
+use tessl::gemm::GemmOperands;
 use tessl::safetensors::SafeTensors;
 use tessl::GpuRuntime;
 
 use common::{env_usize, gpu_utilization, others_running, round_order};
 
 const SOFT_BOUND: f64 = 1e-4;
+/// A bf16 forward's soft tokens against transformers' fp32 ones (the floor of
+/// `tests/embedgemma2_audio_model.rs`).
+const SOFT_COS_FLOOR: f64 = 0.9997;
 
 struct Variant {
     name: String,
@@ -114,6 +121,11 @@ fn main() -> Result<(), String> {
     );
     let workloads = audio_workloads::selected("PROFILE_WORKLOADS")?;
     let rounds = env_usize("PROFILE_ROUNDS", 5, 1)?;
+    let operands = match std::env::var("PROFILE_OPERANDS").as_deref() {
+        Err(_) | Ok("f32") => GemmOperands::ExactF32,
+        Ok("bf16") => GemmOperands::Bf16,
+        Ok(other) => return Err(format!("PROFILE_OPERANDS={other:?}: expected f32 or bf16")),
+    };
     let with_skip = std::env::var("PROFILE_SKIP").as_deref() != Ok("0");
     let out_path = std::env::var("PROFILE_JSON").unwrap_or_else(|_| "target/profile_audio.json".into());
 
@@ -121,7 +133,7 @@ fn main() -> Result<(), String> {
     let st = SafeTensors::open(&snap.join("model.safetensors"))?;
     let rt = GpuRuntime::new_inference()?;
     rt.set_async_encode(true)?;
-    let model = EmbedGemma2Audio::load(&rt, &st, "", cfg.clone())?;
+    let model = EmbedGemma2Audio::load_with(&rt, &st, "", cfg.clone(), operands)?;
     let util0 = gpu_utilization();
     eprintln!("gpu utilization at start: {util0}%");
 
@@ -140,9 +152,16 @@ fn main() -> Result<(), String> {
 
         model.clear_stage_mask();
         let out = model.encode_audio(&w.clips, false)?;
-        let err = audio_workloads::json_opt(audio_workloads::check(w, &out.soft_tokens, SOFT_BOUND)?);
+        let err = match operands {
+            GemmOperands::ExactF32 => {
+                audio_workloads::json_opt(audio_workloads::check(w, &out.soft_tokens, SOFT_BOUND)?)
+            }
+            GemmOperands::Bf16 => audio_workloads::json_opt(
+                audio_workloads::check_cosine(w, &out.soft_tokens, SOFT_COS_FLOOR)?.map(|(e, _)| e),
+            ),
+        };
         eprintln!(
-            "{}: {} frames, {rows} tower rows, {} forward(s); soft tokens within {err} of transformers (null: no reference)",
+            "{}: {} frames, {rows} tower rows, {} forward(s); soft tokens within {err} of transformers (null: no reference; relative to its largest magnitude)",
             w.name,
             w.frames(),
             out.forwards
@@ -292,9 +311,10 @@ fn main() -> Result<(), String> {
             })
             .collect();
         json_wl.push(format!(
-            "{{\"workload\":\"{}\",\"frames\":{},\"rows\":{rows},\"iters\":{iters},\"rounds\":{rounds},\"soft_err\":{err},\"gpu_util_start\":\"{util_a}\",\"gpu_util_end\":\"{util_b}\",\"stages\":[{}],\"variants\":[{}]}}",
+            "{{\"workload\":\"{}\",\"frames\":{},\"rows\":{rows},\"iters\":{iters},\"rounds\":{rounds},\"precision\":\"{}\",\"soft_err\":{err},\"gpu_util_start\":\"{util_a}\",\"gpu_util_end\":\"{util_b}\",\"stages\":[{}],\"variants\":[{}]}}",
             w.name,
             w.frames(),
+            if operands == GemmOperands::Bf16 { "bf16" } else { "f32" },
             stage_json.join(","),
             var_json.join(",")
         ));

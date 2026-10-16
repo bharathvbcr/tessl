@@ -23,7 +23,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-use crate::json::{self, Json, Syntax};
+use crate::json::{self, Json, NumForm, Syntax};
 use crate::pyjson::{float_str, fmt_e, median, obj, quote, quote_list, Doc};
 
 // ------------------------------------------------------------------ precision
@@ -173,7 +173,11 @@ pub fn load_manifest(dir: &Path) -> Result<Manifest, String> {
     let mut dims = [0usize; 3];
     for (slot, key) in dims.iter_mut().zip(["m", "n", "k"]) {
         match man.get(key) {
-            Some(Json::Num { uint: Some(v), .. }) if *v > 0 && *v <= usize::MAX as u64 => *slot = *v as usize,
+            Some(Json::Num {
+                int: v,
+                form: NumForm::Uint,
+                ..
+            }) if *v > 0 && *v <= usize::MAX as u64 => *slot = *v as usize,
             _ => return Err(format!("parity_manifest.json: '{key}' must be a positive integer")),
         }
     }

@@ -57,23 +57,45 @@ fn small_st(path: &Path) {
     std::fs::write(path, b).unwrap();
 }
 
+/// Physical memory as the default budget sees it (the test must not depend on
+/// the host's RAM).
+fn physical_memory() -> u64 {
+    // SAFETY: `sysconf` takes an integer name and has no memory preconditions.
+    let (pages, page) = unsafe { (libc::sysconf(libc::_SC_PHYS_PAGES), libc::sysconf(libc::_SC_PAGESIZE)) };
+    u64::try_from(pages)
+        .unwrap()
+        .saturating_mul(u64::try_from(page).unwrap())
+}
+
 #[test]
-fn a_512_gib_declaration_is_refused_at_open_by_name() {
+fn a_declaration_above_physical_memory_is_refused_at_open_by_name() {
     let s = Scratch::new("sparse");
     let p = s.path("huge.safetensors");
-    sparse_st(&p, "t", 512 * GIB);
-    // Default budget: this machine's physical memory. Only `open` runs; on
-    // the unfixed code it succeeds, which is the gate that let a read go on
-    // to fill memory.
+    // One byte more than this host's memory (saturating), so the default
+    // budget refuses on any machine. Only `open` runs; on the unfixed code it
+    // succeeds, which is the gate that let a read go on to fill memory.
+    let declared = physical_memory().saturating_add(GIB);
+    sparse_st(&p, "t", declared);
     let e = SafeTensors::open(&p).unwrap_err();
     assert!(e.contains("payload budget exceeded"), "{e}");
     assert!(e.contains("physical memory"), "{e}");
-    assert!(e.contains(&(512 * GIB).to_string()), "{e}");
-    // The view and the explicit limit go through the same owner.
+    assert!(e.contains(&declared.to_string()), "{e}");
     let e = CheckpointView::open(&p).unwrap_err();
     assert!(e.contains("payload budget exceeded"), "{e}");
+}
+
+#[test]
+fn a_512_gib_declaration_is_refused_by_an_explicit_limit() {
+    let s = Scratch::new("sparse512");
+    let p = s.path("huge.safetensors");
+    sparse_st(&p, "t", 512 * GIB);
     let e = SafeTensors::open_with_limit(&p, Some(GIB)).unwrap_err();
-    assert!(e.contains("the caller's limit of 1073741824"), "{e}");
+    assert!(
+        e.contains("the caller's limit of 1073741824") && e.contains(&(512 * GIB).to_string()),
+        "{e}"
+    );
+    let e = CheckpointView::open_with_limit(&p, Some(64 * GIB)).unwrap_err();
+    assert!(e.contains("payload budget exceeded"), "{e}");
 }
 
 #[test]
@@ -156,14 +178,23 @@ fn npy_headers_follow_the_format_spec_in_every_version() {
             vec![1],
             "v{v}"
         );
-        // Aligned to 16 only (NumPy before 1.14 wrote that; the spec says 64).
-        let b16 = npy(v, DICT, 16, true, &PAYLOAD);
-        if (b16.len() - PAYLOAD.len()) % 64 != 0 {
-            assert!(npy_result(&s, &b16).unwrap_err().contains("multiple of 64"), "v{v}");
+        // Aligned to 16 only (NumPy before 1.14 wrote that): it reads.
+        let prefix = if v == 1 { 10 } else { 12 };
+        assert_eq!(
+            npy_result(&s, &npy(v, DICT, 16, true, &PAYLOAD)).unwrap(),
+            vec![1],
+            "v{v} 16-aligned"
+        );
+        // Correct space padding but 15 past a multiple of 16: refused.
+        let mut h = DICT.to_string();
+        while (prefix + h.len() + 1) % 16 != 15 {
+            h.push(' ');
         }
+        let e = npy_result(&s, &npy(v, &h, 0, true, &PAYLOAD)).unwrap_err();
+        assert!(e.contains("multiple of 16"), "v{v}: {e}");
         // No padding, no newline.
         let e = npy_result(&s, &npy(v, DICT, 0, false, &PAYLOAD)).unwrap_err();
-        assert!(e.contains("multiple of 64") || e.contains("newline"), "v{v}: {e}");
+        assert!(e.contains("multiple of 16") || e.contains("newline"), "v{v}: {e}");
         // Aligned but without the terminator: the last pad byte is a space.
         let mut h = DICT.to_string();
         let prefix = if v == 1 { 10 } else { 12 };
@@ -201,7 +232,7 @@ fn npy_payload_budget_refuses_before_allocating() {
     assert!(read_npy_with_limit(&p, Some(4)).is_ok());
     let e = read_npy_with_limit(&p, Some(3)).unwrap_err();
     assert!(e.contains("payload budget exceeded") && e.contains("declares 4"), "{e}");
-    // A sparse file declaring 512 GiB of f4: refused by the default budget
+    // A sparse file declaring 512 GiB of f4: refused by an explicit limit
     // without a read (the file's length matches the shape, so it reaches the
     // budget check, the last gate before the allocation).
     let dict = format!(
@@ -214,7 +245,7 @@ fn npy_payload_budget_refuses_before_allocating() {
     f.write_all(&bytes).unwrap();
     f.seek(SeekFrom::Start(0)).unwrap();
     f.set_len(hdr_len + 512 * GIB).unwrap();
-    let e = read_npy(&p).unwrap_err();
+    let e = read_npy_with_limit(&p, Some(64 * GIB)).unwrap_err();
     assert!(e.contains("payload budget exceeded"), "{e}");
 }
 

@@ -67,9 +67,11 @@ impl NpyArray {
 /// from allocating gigabytes before anything is checked.
 pub const MAX_NPY_HEADER_BYTES: usize = 1 << 20;
 
-/// The format spec's alignment of the data start (magic, version, length
-/// field and header together are a multiple of this many bytes).
-const NPY_ALIGN: u64 = 64;
+/// The alignment the reader requires of the data start (magic, version, length
+/// field and header together are a multiple of this many bytes). The spec says
+/// 64 and the writer writes 64, but NumPy before 1.14 wrote 16 and NumPy's own
+/// reader checks neither, so the reader accepts every multiple of 16 (64 is one).
+const NPY_ALIGN: u64 = 16;
 
 /// [`read_npy_with_limit`] with the default budget (physical memory).
 pub fn read_npy(path: &Path) -> Result<NpyArray, String> {
@@ -80,7 +82,7 @@ pub fn read_npy(path: &Path) -> Result<NpyArray, String> {
 /// payload exceeds `limit` bytes, or physical memory when `None`.
 ///
 /// The header must be as the format spec has it: for v1.0 `10 + HEADER_LEN`,
-/// for v2.0 and v3.0 `12 + HEADER_LEN`, is a multiple of 64; it ends in `\n`
+/// for v2.0 and v3.0 `12 + HEADER_LEN`, is a multiple of 16 (the writer pads to 64); it ends in `\n`
 /// preceded only by space padding after the closing `}` of the dict; and it is
 /// ASCII for v1.0 and v2.0 (UTF-8 for v3.0).
 pub fn read_npy_with_limit(path: &Path, limit: Option<u64>) -> Result<NpyArray, String> {
@@ -175,7 +177,8 @@ pub fn read_npy_with_limit(path: &Path, limit: Option<u64>) -> Result<NpyArray, 
     }
 }
 
-/// The npy format's header framing: 64-byte alignment of the data start, a
+/// The npy format's header framing: 16-byte alignment of the data start (see
+/// [`NPY_ALIGN`]; the writer's 64 passes), a
 /// trailing `\n` after space-only padding, a dict closed by `}`, and ASCII
 /// unless the version is 3.
 fn check_header_framing(what: &str, version: u8, prefix: u64, header: &str) -> Result<(), String> {

@@ -221,9 +221,12 @@ fn header_len(what: &str, len8: [u8; 8], total: u64) -> Result<u64, String> {
 }
 
 impl SafeTensors {
-    /// Open and validate `path`'s header. No tensor data is read. Refuses a
-    /// file declaring more tensor bytes than this machine's physical memory
-    /// (see [`Self::open_with_limit`]).
+    /// Open and validate `path`'s header. No tensor data is read.
+    ///
+    /// The payload budget defaults to this machine's physical memory
+    /// (`sysconf(_SC_PHYS_PAGES) * _SC_PAGESIZE`): a file declaring more
+    /// tensor bytes is refused at open, before any payload allocation. To use
+    /// another budget, call [`Self::open_with_limit`] with `Some(bytes)`.
     pub fn open(path: &Path) -> Result<Self, String> {
         Self::open_with_limit(path, None)
     }
@@ -511,8 +514,11 @@ impl CheckpointView {
     /// (or any `*.json` index), or a checkpoint directory holding an index
     /// or, failing that, `model.safetensors`.
     ///
-    /// Refuses a checkpoint whose shards declare more tensor bytes in total
-    /// than this machine's physical memory; see [`Self::open_with_limit`].
+    /// The payload budget defaults to this machine's physical memory
+    /// (`sysconf(_SC_PHYS_PAGES) * _SC_PAGESIZE`) and applies to the shards'
+    /// declared tensor bytes in total: a larger checkpoint is refused at open.
+    /// To use another budget, call [`Self::open_with_limit`] with
+    /// `Some(bytes)`.
     pub fn open(path: &Path) -> Result<Self, String> {
         Self::open_with_limit(path, None)
     }

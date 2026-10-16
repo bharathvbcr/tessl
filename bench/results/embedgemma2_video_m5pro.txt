@@ -1,5 +1,5 @@
 bench_embedgemma2_video, Apple M5 Pro (18 cores), 2026-10-16, branch worktree-agent-a7751fb151981d840
-on f8ce932 (lane V), release build, real checkpoint google/embeddinggemma-2 snapshot 914f7f89.
+at 2bb687a on base f8ce932 (lane V), release build, real checkpoint google/embeddinggemma-2 snapshot 914f7f89.
 
 One video: 32 synthetic 640x360 frames (the processor's frame cap), resized to 384x720
 (24 x 45 patches), 120 soft tokens a frame, 3906 ids.

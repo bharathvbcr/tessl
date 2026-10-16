@@ -94,7 +94,9 @@ restore_files() {
   for f in "${touched[@]:-}"; do
     [ -n "$f" ] || continue
     if [ -f "$bakdir/$f" ]; then
-      cp -p "$bakdir/$f" "$f" || rc=1
+      # Not cp -p: the restored file must look *newer* than the build output, or cargo
+      # (which compares mtimes) keeps the mutated metallib it built from the patch.
+      cp "$bakdir/$f" "$f" || rc=1
       cmp -s "$bakdir/$f" "$f" || { echo "fault_inject: RESTORE FAILED for $f" >&2; rc=1; }
     fi
   done
@@ -151,12 +153,21 @@ self_test() {
   local first
   first=$(sed -n '1p' "$manifest" | cut -d'|' -f1)
   first=$(grep -v '^#' "$manifest" | head -n1 | cut -d'|' -f1)
+  marker=$(mktemp); sleep 1
   if apply_fault "$first"; then
     after=$(kernel_hashes)
     [ "$before" != "$after" ] && ok "applying $first changes a kernel" || bad "applying $first changed nothing"
     restore_files
     after=$(kernel_hashes)
     [ "$before" = "$after" ] && ok "restore_files returns kernels/ to its pre-run hash" || bad "restore left a difference"
+    local f
+    for f in $(patch_files "scripts/faults/$first.patch"); do
+      if [ "$f" -nt "$marker" ]; then
+        ok "restore bumps $f mtime past the build output (cargo rebuilds the clean kernel)"
+      else
+        bad "restored $f kept an old mtime: cargo would reuse the mutated metallib"
+      fi
+    done
   else
     bad "the first manifest patch ($first) does not apply to this tree"
   fi
@@ -233,6 +244,9 @@ if [ "${TESSL_FAULT_ALLOW_DIRTY:-0}" != 1 ] && ! git diff --quiet HEAD -- kernel
   die "kernels/ differs from HEAD; refusing to run (TESSL_FAULT_ALLOW_DIRTY=1 to apply on top of it)"
 fi
 pre_hash=$(kernel_hashes)
+# A metallib left by an earlier run may carry a fault (an old-mtime restore, a killed run):
+# make every kernel newer than the build output so the baseline is built from clean sources.
+find kernels -type f -exec touch {} +
 
 lock_dir=${MAC_HEAVY_LOCK:-/Users/bharath/Code/research/Lappi-decision/build/mac-heavy.lock.d}
 {

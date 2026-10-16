@@ -80,7 +80,11 @@ and `python/tessl_torch/embedgemma2.py` carry the text entries
 and the multimodal ones (`tessl_embedgemma2_{load_multimodal,encode_images,encode_audio}`),
 additive at ABI 11; see `docs/embedgemma2.md`, From Python / C. The towers
 (G8) are in `tessl::embedgemma2_vision` / `embedgemma2_audio` and compose with
-the text encoder in `tessl::embedgemma2_mm`.
+the text encoder in `tessl::embedgemma2_mm`. **One wait (lane K):** a call with
+media waited twice (the towers' soft tokens were read back and uploaded again
+as host rows); the text encoder's scatter now reads the towers' output buffers
+directly, so every `EmbedGemma2Multimodal::encode` call, the C entries and the
+Python methods included, waits once. See `docs/embedgemma2.md`, One call.
 
 ### G4. Tokenization is the caller's
 
@@ -164,16 +168,26 @@ without it:
   inferred. `one_encode_allocates_the_itemized_set` (to the byte, both modes)
   fails on 16f5190.
 
-Not fixed, and why: the vision and audio towers (`embedgemma2_vision.rs`
-`encode`, `embedgemma2_audio.rs` `encode`) hold their activations across their
-own `synchronize` in the same shape, so a tower call followed by another
-leaves the same second set; their files belong to live lanes F and I. The
-repair is the same one line in each: build the `outs` from `pending`'s outputs
-and `drop(acts)` before the wait. The class fix in the pool (recycle at
-allocation time when no command buffer is open and the lifetime event has
-caught up) would cover every caller but changes when Qwen3.5's buffers
+**Fixed for the towers (lane K).** The vision and audio towers
+(`embedgemma2_vision.rs`, `embedgemma2_audio.rs`) held their activations across
+their own `synchronize` in the same shape, so a tower call followed by another
+left the same second set. `queue_images` / `queue_audio` now build the
+pending call from the forwards' outputs and `drop(acts)` (and each forward's
+uploaded inputs) before returning, so the wait recycles them.
+`consecutive_vision_calls_hold_one_activation_set` (both modes) and
+`consecutive_audio_calls_hold_one_activation_set`
+(`tests/embedgemma2_memory.rs`, tiny checkpoint) fail on 27a0407 (three more
+calls reach 1,769,472 and 540,672 bytes above the first against bounds of one
+8,192- and one 16,384-byte output) and pass now; a facade call is covered by
+`consecutive_facade_calls_hold_one_activation_set` (passes on both: the old
+facade's text wait recycled the towers' set before the next call, so its fix
+was the peak inside the call, which is unchanged: a tower's set and the text
+encoder's are live together until the one wait, **verified** by the device peak
+in `bench/results/embedgemma2_mm_onewait_m5pro.txt`). The class fix in the pool
+(recycle at allocation time when no command buffer is open and the lifetime
+event has caught up) would cover every caller but changes when Qwen3.5's buffers
 return to the freelist, and needs the re-entrancy care `flush_residency`
-already shows (`active_m4` may be held); it is a follow-up, not bundled.
+already shows (`active_m4` may be held); it is still a follow-up, not bundled.
 
 ### G7. Many small elementwise dispatches per layer
 

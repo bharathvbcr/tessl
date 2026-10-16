@@ -52,15 +52,24 @@
 //!
 //! # Waiting
 //!
-//! A call with media waits for the GPU **twice**, a call of text items once.
-//! The towers' forwards are queued together ([`EmbedGemma2VisionModel::queue_images`],
-//! [`EmbedGemma2Audio::queue_audio`]) under one [`crate::runtime::GpuRuntime::async_scope`]
-//! behind one wait; the soft tokens are then read back and handed to the text
-//! encoder as host rows, whose own forwards are queued behind its one wait. The
-//! second wait is the cost of the host round trip: the text encoder takes its
-//! soft rows as host slices, so the towers' output must reach the host first.
-//! Handing the towers' device buffers to the text encoder directly would make
-//! it one wait; that is not done here (see `docs/embedgemma2.md`).
+//! A call waits for the GPU **once**, with or without media. The towers'
+//! forwards ([`EmbedGemma2VisionModel::queue_images`],
+//! [`EmbedGemma2Audio::queue_audio`]) and then the text encoder's are queued
+//! under one [`crate::runtime::GpuRuntime::async_scope`] behind one wait. The
+//! towers' soft tokens stay on the device: each item's soft rows are described
+//! as runs of rows of the towers' output buffers (a vision image's rows are one
+//! run; an audio clip's are one run per maximal stretch its output mask keeps)
+//! and the text encoder's scatter copies them over the placeholder rows where
+//! the towers wrote them. Nothing is compacted: the same runs a host caller's
+//! rows make are what the scatter takes. The placeholder counts are known before
+//! any tower runs ([`EmbedGemma2VisionModel::check_images`],
+//! [`EmbedGemma2Audio::check_clips`]), so the layout is checked first and every
+//! refusal still happens before any GPU work.
+//!
+//! A host caller's soft rows are checked finite before any GPU work; the
+//! towers' are not read back before the text encoder runs, so a media item's
+//! embedding is checked finite after the wait instead (an overflowing tower is
+//! an error naming the item, not a NaN row).
 //!
 //! # Precision
 //!

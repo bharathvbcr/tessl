@@ -19,6 +19,7 @@ you changed in the kernel.**
 | `probe_gdn_scan` | Gated delta net chunk scan probe; `--paired` times paired 32- vs 16-col widths. |
 | `probe_gemm_bits` | Bit snapshot of every production GEMM entry point (FNV-1a per output); diff two builds' snapshots before claiming a kernel change is bit-identical (`bench/results/gemm_coop_header_bits_m5pro.txt`). |
 | `bench_embedgemma2` | EmbeddingGemma 2 `encode` latency and device/process peak memory on the real checkpoint, uniform and ragged batches, JSON out. |
+| `bench_embedgemma2_mm` | EmbeddingGemma 2 multimodal facade `encode` (texts, images and clips in one call) on the real checkpoint: three workloads, JSON out (`bench_paired --format workloads`), a HASH line per workload and the host waits of one call. |
 | `bench_paired` | The one paired-round driver. Alternates any lanes round by round and reports per-round ratios with their spread: `bench_embedgemma2`'s JSON (`--format workloads`), `METRIC name value` lines (`--format metrics`: frozen before/after binaries, `bench_qwen35_train --step` configurations), or JSON rows compared across processes (`--format rows:KEY,VARIANT,VALUE`: tessl against PyTorch MPS / MLX). `--evidence` adds the drift gate, provenance and atomic publication for a quotable artifact. See "Paired rounds" below. |
 | `bench_qwen35_train` | Qwen3.5-2B training ops, and with the checkpoint one whole `train_step` (`--step`, `--async`, `--storage=bf16` for the bf16 tower), a clipped optimizer step (`--clip`), or a row-by-row batch (`--batch`), each with its host waits and device peak. |
 

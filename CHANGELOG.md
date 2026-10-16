@@ -6,7 +6,56 @@ All notable changes to `tessl` are recorded here. The format follows
 
 ## [Unreleased]
 
+### Changed
+
+- **EmbeddingGemma 2 multimodal call: one host wait, towers' soft tokens stay on
+  the device** (audit gaps G6, G8; `EmbedGemma2Multimodal::encode`, so the C
+  `tessl_embedgemma2_{encode_images, encode_audio}` entries and Python's
+  `encode_images` / `encode_audio` / `embed_*` too; no signature or layout
+  changed). A call with media waited twice: the towers' soft tokens were read back,
+  concatenated per item on the host and uploaded again as host rows for the text
+  encoder. The facade now queues the towers and then the text encoder behind one
+  `synchronize`, and the text encoder's scatter reads the towers' output buffers
+  where they were written: the soft source is one shape, per sequence a list of
+  `(buffer, first row, rows)` segments in placeholder order, for a host caller's
+  `MmSequence::soft` (uploaded as one buffer) and for the towers alike, so there
+  is one `soft_io` / `soft_runs` / `scatter_soft` path, not two. A vision image's
+  rows are one segment; an audio clip's are one per maximal run of rows its output
+  mask keeps; nothing is compacted (`copy_cols` already takes runs). The text
+  encoder's `encode_impl` is split into `queue_impl` (a `PendingEncode` holding
+  only each forward's output) and `finish`; `encode` and `encode_multimodal` are
+  queue + wait + finish. The host path's finiteness check of soft values cannot run
+  on device rows, so a media item's embedding is checked finite after the wait
+  (an overflowing tower is an error naming the item). Every refusal still
+  happens before any GPU work. Host waits: 2 -> 1 for a call with media (text
+  alone and the by-hand composition's 1 and 3 unchanged); embeddings bit for bit
+  the two-wait path's on the tiny checkpoint in both operand modes and on the real
+  one (hashes `922bb84e7eb7eef9` / `3f25a99974a7687c` / `c37bcf8a3961f5e5` for
+  the three benchmark workloads, equal at 27a0407). The multimodal tests' wait
+  bounds changed from 2 to 1 because the behaviour did. **No speedup is
+  claimed**: interleaved against 27a0407 (8 rounds, control lane) the calls are
+  1089 / 414 / 401 ms against 1092 / 413 / 391, medians 1.003x / 0.995x / 1.023x
+  with ranges straddling 1 and the control's own spread as wide
+  (`bench/results/embedgemma2_mm_onewait_m5pro.{txt,json,png}`); the removed wait
+  is about a millisecond of a 380 to 1070 ms call.
+- **EmbeddingGemma 2 towers release their activations before their wait**
+  (`queue_images` / `queue_audio`; audit G6, the part lane H left): a tower call
+  followed by another held two activation sets because the pending call kept
+  `acts` and the uploaded inputs until `collect`, after its wait; they are now
+  handed to the runtime's deferred release before the call returns, so the wait
+  recycles them, and only each forward's output is kept. Tiny checkpoint, calls
+  2 to 4 above the first: 1,769,472 B (vision) and 540,672 B (audio) against
+  bounds of one output (8,192 and 16,384 B) before, within them after;
+  `tests/embedgemma2_memory.rs` fails on 27a0407 for both towers. The facade's
+  own device peak is unchanged (one tower's set and the text encoder's are live
+  together until the wait): 628.6 -> 628.5, 653.8 -> 653.6 MiB.
+
 ### Added
+
+- **`bench_embedgemma2_mm`** (`src/bin/bench_embedgemma2_mm.rs`): the facade's
+  `encode` on the real checkpoint, three workloads (`mixed_full`, `mixed_short`,
+  `media_only`), `bench_paired` format, a HASH line per workload and the
+  `sync_waits` of a call.
 
 - **EmbeddingGemma 2 vision tower: a `GemmOperands::Bf16` mode, measured and
   sped up** (`EmbedGemma2VisionModel::load_with(rt, st, cfg, operands)`; `load`

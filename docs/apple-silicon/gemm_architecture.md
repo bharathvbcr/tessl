@@ -229,7 +229,7 @@ in well under 1% of cases and it never dispatched those kernels at all.
 
 The A/B rig (`kernels/tune/`) is **not** in the default metallib. It
 sits in a subdirectory so build.rs's top-level directory glob cannot pick it up
-by accident. A tune build adds its 71 measurement-only entry points to the
+by accident. A tune build adds its 152 measurement-only entry points to the
 default library (`tests/docs_name_real_tools.rs` derives that count with
 `xcrun metal-nm` and fails when this paragraph quotes another). Opt in, with the
 variable on every `cargo` command, `cargo run` included: build.rs reruns when

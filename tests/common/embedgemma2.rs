@@ -305,50 +305,77 @@ pub fn random_weights(cfg: &EmbedGemma2Config, seed: u64, bf16_proj: bool) -> We
     Weights(out)
 }
 
-/// safetensors bytes: every weight under `PREFIX`, plus `extra` tensors named
-/// as given (f32 zeros of the given shape).
-pub fn safetensors_bytes(w: &Weights, extra: &[(&str, &[usize])]) -> Vec<u8> {
-    let mut entries: Vec<(String, &str, Vec<usize>, Vec<u8>)> = Vec::new();
-    for t in &w.0 {
-        let bytes: Vec<u8> = if t.bf16 {
-            f32_slice_to_bf16(&t.data.iter().map(|&v| v as f32).collect::<Vec<_>>())
-                .iter()
-                .flat_map(|b| b.to_le_bytes())
-                .collect()
-        } else {
-            t.data.iter().flat_map(|&v| (v as f32).to_le_bytes()).collect()
-        };
-        entries.push((
-            format!("{PREFIX}{}", t.name),
-            if t.bf16 { "BF16" } else { "F32" },
-            t.shape.clone(),
-            bytes,
-        ));
-    }
-    for &(name, shape) in extra {
-        let n: usize = shape.iter().product();
-        entries.push((name.to_string(), "F32", shape.to_vec(), vec![0u8; n * 4]));
-    }
+/// One tensor as a safetensors file holds it: full name, dtype tag, shape,
+/// little-endian bytes.
+pub struct RawTensor {
+    pub name: String,
+    pub dtype: &'static str,
+    pub shape: Vec<usize>,
+    pub bytes: Vec<u8>,
+}
+
+/// Every weight under `PREFIX`, as the file holds it.
+pub fn text_tensors(w: &Weights) -> Vec<RawTensor> {
+    w.0.iter()
+        .map(|t| {
+            let bytes: Vec<u8> = if t.bf16 {
+                f32_slice_to_bf16(&t.data.iter().map(|&v| v as f32).collect::<Vec<_>>())
+                    .iter()
+                    .flat_map(|b| b.to_le_bytes())
+                    .collect()
+            } else {
+                t.data.iter().flat_map(|&v| (v as f32).to_le_bytes()).collect()
+            };
+            RawTensor {
+                name: format!("{PREFIX}{}", t.name),
+                dtype: if t.bf16 { "BF16" } else { "F32" },
+                shape: t.shape.clone(),
+                bytes,
+            }
+        })
+        .collect()
+}
+
+/// safetensors bytes of `tensors`, in order.
+pub fn pack_safetensors(tensors: &[RawTensor]) -> Vec<u8> {
     let mut header = String::from("{");
     let mut data = Vec::new();
-    for (i, (name, dtype, shape, bytes)) in entries.iter().enumerate() {
-        let shape: Vec<String> = shape.iter().map(usize::to_string).collect();
+    for (i, t) in tensors.iter().enumerate() {
+        let shape: Vec<String> = t.shape.iter().map(usize::to_string).collect();
         if i > 0 {
             header.push(',');
         }
         header.push_str(&format!(
-            "\"{name}\":{{\"dtype\":\"{dtype}\",\"shape\":[{}],\"data_offsets\":[{},{}]}}",
+            "\"{}\":{{\"dtype\":\"{}\",\"shape\":[{}],\"data_offsets\":[{},{}]}}",
+            t.name,
+            t.dtype,
             shape.join(","),
             data.len(),
-            data.len() + bytes.len()
+            data.len() + t.bytes.len()
         ));
-        data.extend_from_slice(bytes);
+        data.extend_from_slice(&t.bytes);
     }
     header.push('}');
     let mut out = (header.len() as u64).to_le_bytes().to_vec();
     out.extend_from_slice(header.as_bytes());
     out.extend_from_slice(&data);
     out
+}
+
+/// safetensors bytes: every weight under `PREFIX`, plus `extra` tensors named
+/// as given (f32 zeros of the given shape).
+pub fn safetensors_bytes(w: &Weights, extra: &[(&str, &[usize])]) -> Vec<u8> {
+    let mut tensors = text_tensors(w);
+    for &(name, shape) in extra {
+        let n: usize = shape.iter().product();
+        tensors.push(RawTensor {
+            name: name.to_string(),
+            dtype: "F32",
+            shape: shape.to_vec(),
+            bytes: vec![0u8; n * 4],
+        });
+    }
+    pack_safetensors(&tensors)
 }
 
 // ---------------------------------------------------------------------------

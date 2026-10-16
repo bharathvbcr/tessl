@@ -39,12 +39,18 @@ mod common;
 use std::path::PathBuf;
 
 use common::with_gpu;
+use tessl::embedgemma2_mm::{EmbedGemma2Multimodal, MmItem};
 use tessl::embedgemma2_vision::{EmbedGemma2VisionModel, ImageInput, VisionConfig};
+use tessl::gemm::GemmOperands;
 use tessl::npy::read_npy;
 use tessl::safetensors::SafeTensors;
 
 const REL: f64 = 1e-4;
 const LAYERS: usize = 16;
+// The bf16 end-to-end bounds (tests/embedgemma2_mm_model.rs's).
+const BF16_COS_FLOOR: f64 = 0.9999;
+const BF16_VS_HF_COS: f64 = 0.9996;
+const BATCH_ABS: f64 = 1e-5;
 
 fn ref_dir() -> PathBuf {
     PathBuf::from(
@@ -224,6 +230,199 @@ fn embedgemma2_vision_matches_sentence_transformers() {
             }
         }
 
+        assert!(
+            failures.is_empty(),
+            "{} bound(s) exceeded:\n{}",
+            failures.len(),
+            failures.join("\n")
+        );
+    });
+}
+
+fn cosine(a: &[f32], b: &[f32]) -> f64 {
+    let dot: f64 = a.iter().zip(b).map(|(x, y)| f64::from(*x) * f64::from(*y)).sum();
+    let na: f64 = a.iter().map(|x| f64::from(*x).powi(2)).sum::<f64>().sqrt();
+    let nb: f64 = b.iter().map(|x| f64::from(*x).powi(2)).sum::<f64>().sqrt();
+    dot / (na * nb)
+}
+
+/// `GemmOperands::Bf16` on the real checkpoint, the tower alone: each image
+/// alone, both in one forward and in the reverse order, bit for bit (the bound
+/// is equality: the bf16 GEMM sums K in the same order whatever M is, the
+/// padded keys are masked and the padded rows are zero). The tower's own error
+/// against the fp32 goldens is reported per stage and not gated here: its gate
+/// is the end-to-end embedding below, which is what the tower exists to feed.
+#[test]
+#[ignore]
+fn embedgemma2_vision_bf16_is_batch_independent_and_reports_its_error() {
+    let snap = snapshot();
+    let cfg = VisionConfig::from_config_file(&snap.join("config.json")).unwrap();
+    let st = SafeTensors::open(&snap.join("model.safetensors")).unwrap();
+    let h = cfg.hidden as usize;
+    let goldens = [golden(0), golden(1)];
+    let inputs: Vec<ImageInput<'_>> = goldens
+        .iter()
+        .map(|g| ImageInput {
+            pixel_values: &g.pixels,
+            position_ids: &g.positions,
+        })
+        .collect();
+
+    with_gpu(|rt| {
+        let exact_bytes = EmbedGemma2VisionModel::load(rt, &st, cfg.clone())
+            .unwrap()
+            .weight_bytes();
+        let model = EmbedGemma2VisionModel::load_with(rt, &st, cfg.clone(), GemmOperands::Bf16).unwrap();
+        assert_eq!(model.operands(), GemmOperands::Bf16);
+        eprintln!(
+            "weight bytes: bf16 {} ({:.1} MiB), exact f32 {} ({:.1} MiB), {:.1}%",
+            model.weight_bytes(),
+            model.weight_bytes() as f64 / (1 << 20) as f64,
+            exact_bytes,
+            exact_bytes as f64 / (1 << 20) as f64,
+            100.0 * model.weight_bytes() as f64 / exact_bytes as f64
+        );
+        assert!(model.weight_bytes() < exact_bytes);
+
+        let rel = |got: &[f32], want: &[f32]| {
+            let scale = want.iter().map(|v| f64::from(v.abs())).fold(0.0, f64::max);
+            max_abs(got, want) / scale
+        };
+        let mut alone: Vec<Vec<f32>> = Vec::new();
+        for (n, g) in goldens.iter().enumerate() {
+            let out = model.encode_images(&[inputs[n]], true).unwrap();
+            let rows = |name: &str| -> Vec<f32> {
+                let (_, all) = npy_f32(name);
+                all[..g.real * h].to_vec()
+            };
+            let layers: Vec<String> = (0..LAYERS)
+                .map(|l| {
+                    format!(
+                        "{:.1e}",
+                        rel(&out.trace.layers[l][0], &rows(&format!("image{n}_layer{l}.npy")))
+                    )
+                })
+                .collect();
+            eprintln!(
+                "image {n} (bf16 vs fp32 golden, max abs over max |ref|): patch_embed {:.1e}, layers [{}], pooled {:.1e}, soft {:.1e}",
+                rel(&out.trace.patch_embed[0], &rows(&format!("image{n}_patch_embed.npy"))),
+                layers.join(" "),
+                rel(&out.trace.pooled[0], &npy_f32(&format!("image{n}_pooled.npy")).1),
+                rel(&out.soft[0], &npy_f32(&format!("image{n}_soft.npy")).1),
+            );
+            assert!(
+                out.soft[0].iter().all(|v| v.is_finite()),
+                "image {n}: non-finite soft token"
+            );
+            alone.push(out.soft.into_iter().next().unwrap());
+        }
+
+        let batched = model.encode_images(&inputs, false).unwrap();
+        assert_eq!(batched.forwards, 1, "the two images must share one forward");
+        let rev = model.encode_images(&[inputs[1], inputs[0]], false).unwrap();
+        for (n, a) in alone.iter().enumerate() {
+            assert_eq!(
+                bits(a),
+                bits(&batched.soft[n]),
+                "image {n}: batched differs from alone (max abs {:.3e})",
+                max_abs(a, &batched.soft[n])
+            );
+            assert_eq!(
+                bits(a),
+                bits(&rev.soft[1 - n]),
+                "image {n}: reversed call differs from alone"
+            );
+        }
+    });
+}
+
+/// The image embeddings end to end with both models in bf16 (`GemmOperands::Bf16`
+/// through the facade: the tower and the text encoder; the audio tower is not
+/// in these calls), against sentence-transformers' fp32 embeddings and its own
+/// bf16 forward, the pattern `tests/embedgemma2_mm_model.rs` holds the text
+/// encoder to. Bounds, fixed before the first run (that test's):
+///
+/// * each image at cosine `0.9999` or better against `image{n}_emb_f32.npy`;
+/// * each image at cosine `0.9996` or better against `image{n}_emb_bf16.npy`
+///   (the triangle inequality over two forwards each within `1 - cos <= 1e-4`
+///   of fp32);
+/// * over the two images the mean of `1 - cos` against fp32 at most that of
+///   transformers' bf16 forward (`emb_bf16.npy` against `emb_f32.npy`);
+/// * each image alone within `1e-5` max abs of itself inside one call of both
+///   (the text encoder's bound; the tower alone is held to bit equality by the
+///   test above, and whether the embeddings are bit-identical is reported).
+#[test]
+#[ignore]
+fn embedgemma2_multimodal_bf16_images_are_no_worse_than_transformers_bf16() {
+    let snap = snapshot();
+    let goldens = [golden(0), golden(1)];
+    let emb = |n: usize, kind: &str| npy_f32(&format!("image{n}_emb_{kind}.npy")).1;
+    let (f32_ref, bf16_ref): (Vec<_>, Vec<_>) = (0..2).map(|n| (emb(n, "f32"), emb(n, "bf16"))).unzip();
+    with_gpu(|rt| {
+        let m = EmbedGemma2Multimodal::load(rt, &snap, GemmOperands::Bf16).unwrap();
+        assert_eq!(m.text().operands(), GemmOperands::Bf16);
+        assert_eq!(m.vision().operands(), GemmOperands::Bf16);
+        let item = |n: usize| {
+            MmItem::Image(ImageInput {
+                pixel_values: &goldens[n].pixels,
+                position_ids: &goldens[n].positions,
+            })
+        };
+        let dim = f32_ref[0].len();
+        let mut failures: Vec<String> = Vec::new();
+        let (mut deficit_ours, mut deficit_hf) = (0.0f64, 0.0f64);
+        let mut alone: Vec<Vec<f32>> = Vec::new();
+        for n in 0..2 {
+            let e = m.encode(&[item(n)], None).unwrap().embeddings;
+            let (cos_f, cos_h, cos_hf) = (
+                cosine(&e, &f32_ref[n]),
+                cosine(&e, &bf16_ref[n]),
+                cosine(&bf16_ref[n], &f32_ref[n]),
+            );
+            eprintln!(
+                "image {n}: tessl bf16 (tower + text) vs fp32 cosine {cos_f:.8} (max abs {:.2e}); vs transformers bf16 \
+                 cosine {cos_h:.8}; transformers bf16 vs fp32 cosine {cos_hf:.8}",
+                max_abs(&e, &f32_ref[n])
+            );
+            deficit_ours += 1.0 - cos_f;
+            deficit_hf += 1.0 - cos_hf;
+            if cos_f < BF16_COS_FLOOR {
+                failures.push(format!("image {n}: cosine vs fp32 {cos_f:.8} < {BF16_COS_FLOOR}"));
+            }
+            if cos_h < BF16_VS_HF_COS {
+                failures.push(format!(
+                    "image {n}: cosine vs transformers bf16 {cos_h:.8} < {BF16_VS_HF_COS}"
+                ));
+            }
+            let norm = e.iter().map(|v| f64::from(*v).powi(2)).sum::<f64>().sqrt();
+            assert!((norm - 1.0).abs() < 1e-5, "image {n}: norm {norm}");
+            alone.push(e);
+        }
+        eprintln!(
+            "mean 1 - cos vs fp32: tessl bf16 {:.3e}, transformers bf16 {:.3e}",
+            deficit_ours / 2.0,
+            deficit_hf / 2.0
+        );
+        if deficit_ours > deficit_hf {
+            failures.push(format!(
+                "tessl bf16 is further from fp32 (mean 1 - cos {:.3e}) than transformers' bf16 forward ({:.3e})",
+                deficit_ours / 2.0,
+                deficit_hf / 2.0
+            ));
+        }
+        let both = m.encode(&[item(0), item(1)], None).unwrap().embeddings;
+        for (n, a) in alone.iter().enumerate() {
+            let drift = max_abs(a, &both[n * dim..(n + 1) * dim]);
+            eprintln!(
+                "image {n}: alone vs both in one call max abs {drift:.3e} (bit-identical: {})",
+                bits(a) == bits(&both[n * dim..(n + 1) * dim])
+            );
+            if drift > BATCH_ABS {
+                failures.push(format!(
+                    "image {n}: alone vs inside one call max abs {drift:.3e} > {BATCH_ABS:.0e}"
+                ));
+            }
+        }
         assert!(
             failures.is_empty(),
             "{} bound(s) exceeded:\n{}",

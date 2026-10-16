@@ -32,7 +32,7 @@
 //! - `nnsmall`: the small-M exact-f32 NN lane, at EmbeddingGemma 2's GEMM shapes
 //!   (`BENCH_SHAPES`: names, default the forward's; the `audio *` ones are the small-B shapes) and `BENCH_ROWS` rows
 //!   (default 1,16,32,64), weights cycled over 24 copies as in a forward.
-//!   Arms: the plain single dispatch (raw), production (`gemm`, whatever it
+//!   Arms: the plain single dispatch (raw), production (`gemm_small_m`, whatever it
 //!   routes to), and the parallel split-K at `BENCH_WIDTHS` (default
 //!   64,128,256,512,1024, those under K). Every arm's output is checked against
 //!   the plain one before anything is timed.
@@ -51,8 +51,8 @@ mod common;
 use objc2_metal::MTLComputePipelineState;
 use std::sync::Arc;
 use tessl::gemm::{
-    cast_f32_to_bf16, cast_f32_to_f16, gemm, gemm_batched, gemm_epilogue, gemm_nn_splitk_par_f32, gemm_tiled,
-    gemm_tn_bf16, Activation, BatchStrides, BatchedGemm, EpiTile, Epilogue, GemmBackend, GemmOperands,
+    cast_f32_to_bf16, cast_f32_to_f16, gemm, gemm_batched, gemm_epilogue, gemm_nn_splitk_par_f32, gemm_small_m,
+    gemm_tiled, gemm_tn_bf16, Activation, BatchStrides, BatchedGemm, EpiTile, Epilogue, GemmBackend, GemmOperands,
 };
 use tessl::runtime::{mtl_size, GpuRuntime};
 use tessl::tensor::Tensor;
@@ -669,7 +669,7 @@ fn nnsmall_lane(rt: &Arc<GpuRuntime>, run: &Run) -> Result<(), String> {
                 .collect::<Result<_, _>>()?;
             // Every arm computes the same product, up to the summation order.
             plain_nn(rt, &a, &ws[0], &cs[0], (m, n, k))?;
-            gemm(&a, &ws[0], &cs[1], GemmBackend::TensorOps)?;
+            gemm_small_m(&a, &ws[0], &cs[1], GemmBackend::TensorOps, None)?;
             for (i, &w) in live.iter().enumerate() {
                 gemm_nn_splitk_par_f32(&a, &ws[0], &cs[2 + i], w)?;
             }
@@ -697,7 +697,7 @@ fn nnsmall_lane(rt: &Arc<GpuRuntime>, run: &Run) -> Result<(), String> {
             let c_prod = &cs[1];
             arms.push(arm("production", rt, reps, move || {
                 i += 1;
-                gemm(a_ref, &ws_ref[i % LAYERS], c_prod, GemmBackend::TensorOps)
+                gemm_small_m(a_ref, &ws_ref[i % LAYERS], c_prod, GemmBackend::TensorOps, None)
             }));
             for (j, &w) in live.iter().enumerate() {
                 let mut i = 0usize;

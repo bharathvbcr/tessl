@@ -23,8 +23,8 @@ use common::embedgemma2_audio::{
 };
 use common::{buf, buf_u32, seeded, with_gpu, SplitMix};
 use tessl::embedgemma2_audio::{
-    attention, dwconv1d_causal, ew, glu, rms_norm, sub_conv0_ln_relu, sub_conv1_ln_relu, AttentionSpec, Clamp,
-    ClipTable, Ew, EwAdd, RmsNorm,
+    attention, ew, lconv, rms_norm, rms_norm_then, sub_conv0_ln_relu, sub_conv1_ln_relu, AttentionSpec, Clamp,
+    ClipTable, Ew, Lconv, NormThen, RmsNorm,
 };
 use tessl::tensor::GpuBuffer;
 use tessl::GpuRuntime;
@@ -433,118 +433,406 @@ fn rms_norm_adds_into_its_residual_in_place() {
     });
 }
 
-#[allow(clippy::too_many_arguments)]
-fn ew_case(rt: &Arc<GpuRuntime>, n: usize, pre: Clamp, silu_on: bool, post: Clamp, add: u8, cols: usize, seed: u64) {
+fn ew_case(rt: &Arc<GpuRuntime>, n: usize, pre: Clamp, silu_on: bool, post: Clamp, seed: u64) {
     let mut r = SplitMix::new(seed);
     let x = rand(&mut r, n, 4.0, 0.0);
-    let aux = rand(&mut r, if add == 2 { cols } else { n }, 2.0, 0.0);
-    let (xb, ab) = (buf(rt, &x), buf(rt, &aux));
+    let xb = buf(rt, &x);
     let spec = Ew {
         pre,
         silu: silu_on,
         post,
-        add: match add {
-            0 => EwAdd::None,
-            1 => EwAdd::Residual(&ab),
-            _ => EwAdd::Bias(&ab, cols as u32),
-        },
     };
     let out = seeded(rt, n, UNWRITTEN);
     ew(rt, &xb, &out, n as u32, &spec).unwrap();
     let want: Vec<f64> = x
         .iter()
-        .enumerate()
-        .map(|(i, &v)| {
+        .map(|&v| {
             let a = clamp(f64::from(v), f64::from(pre.lo), f64::from(pre.hi));
             let a = if silu_on { silu(a) } else { a };
-            let a = clamp(a, f64::from(post.lo), f64::from(post.hi));
-            a + match add {
-                0 => 0.0,
-                1 => f64::from(aux[i]),
-                _ => f64::from(aux[i % cols]),
-            }
+            clamp(a, f64::from(post.lo), f64::from(post.hi))
         })
         .collect();
-    assert_close(&format!("ew n {n} silu {silu_on} add {add}"), &read(rt, &out, n), &want);
+    assert_close(&format!("ew n {n} silu {silu_on}"), &read(rt, &out, n), &want);
 }
 
 #[test]
 fn ew_matches_the_f64_reference() {
     let c = |lo: f32, hi: f32| Clamp::new(lo, hi).unwrap();
     with_gpu(|rt| {
-        for (n, cols) in [(37usize, 1usize), (64, 8), (7 * 4096, 4096), (13 * 1536, 1536)] {
-            ew_case(rt, n, Clamp::NONE, false, Clamp::NONE, 0, cols, 1);
+        for n in [37usize, 64, 7 * 4096, 13 * 1536] {
+            ew_case(rt, n, Clamp::NONE, false, Clamp::NONE, 1);
             // The feed-forward's middle: output clamp, SiLU, next input clamp.
-            ew_case(rt, n, c(-2.5, 3.0), true, c(-1.0, 4.0), 0, cols, 2);
+            ew_case(rt, n, c(-2.5, 3.0), true, c(-1.0, 4.0), 2);
             // A bound inside SiLU's minimum (-0.278) and one past a huge input.
-            ew_case(rt, n, c(-100.0, 100.0), true, c(-0.1, 0.1), 0, cols, 3);
-            // The light conv's end: output clamp plus the residual.
-            ew_case(rt, n, c(-1.0, 1.5), false, Clamp::NONE, 1, cols, 4);
-            // The output projection's bias.
-            ew_case(rt, n, Clamp::NONE, false, Clamp::NONE, 2, cols, 5);
+            ew_case(rt, n, c(-100.0, 100.0), true, c(-0.1, 0.1), 3);
         }
     });
 }
 
+/// A stage without a norm (`RmsNorm::norm = false`) is what the light conv's
+/// end and the output projection were as `ew`'s residual and bias modes: the
+/// clamp plus `resid[row, d]`, the clamp plus `bias[d]`. Same sizes, seeds and
+/// reference arithmetic as the `ew` cases they replace.
 #[test]
-fn glu_matches_the_f64_reference() {
+fn rms_norm_without_a_norm_adds_a_residual_or_a_bias() {
+    let c = |lo: f32, hi: f32| Clamp::new(lo, hi).unwrap();
     with_gpu(|rt| {
-        for (rows, hidden) in [(3usize, 5usize), (11, 64), (25, 1024)] {
-            let mut r = SplitMix::new(rows as u64);
-            let x = rand(&mut r, rows * 2 * hidden, 6.0, 0.0);
-            let clamp_to = Clamp::new(-3.0, 4.0).unwrap();
-            let out = seeded(rt, rows * hidden, UNWRITTEN);
-            glu(rt, &buf(rt, &x), &out, rows as u32, hidden as u32, clamp_to).unwrap();
-            let want: Vec<f64> = (0..rows * hidden)
-                .map(|i| {
-                    let (rw, c) = (i / hidden, i % hidden);
-                    let a = clamp(f64::from(x[rw * 2 * hidden + c]), -3.0, 4.0);
-                    let b = clamp(f64::from(x[rw * 2 * hidden + hidden + c]), -3.0, 4.0);
-                    a * sigmoid(b)
+        for (rows, dim) in [(37usize, 1usize), (8, 8), (7, 4096), (13, 1536)] {
+            let n = rows * dim;
+            for (seed, bias, pre) in [(4u64, false, c(-1.0, 1.5)), (5, true, Clamp::NONE)] {
+                let mut r = SplitMix::new(seed);
+                let x = rand(&mut r, n, 4.0, 0.0);
+                let aux = rand(&mut r, if bias { dim } else { n }, 2.0, 0.0);
+                let (xb, ab) = (buf(rt, &x), buf(rt, &aux));
+                let mut spec = RmsNorm::new(1e-6, None);
+                spec.norm = false;
+                spec.pre = [pre, Clamp::NONE];
+                if bias {
+                    spec.bias = Some(&ab);
+                } else {
+                    spec.resid = Some(&ab);
+                }
+                let out = seeded(rt, n, UNWRITTEN);
+                rms_norm(rt, &xb, &out, rows as u32, dim as u32, &spec).unwrap();
+                let want: Vec<f64> = x
+                    .iter()
+                    .enumerate()
+                    .map(|(i, &v)| {
+                        clamp(f64::from(v), f64::from(pre.lo), f64::from(pre.hi))
+                            + f64::from(if bias { aux[i % dim] } else { aux[i] })
+                    })
+                    .collect();
+                assert_close(
+                    &format!("no-norm stage {rows}x{dim} bias {bias}"),
+                    &read(rt, &out, n),
+                    &want,
+                );
+            }
+        }
+    });
+}
+
+/// `lconv` is the GLU, the depthwise causal conv and the conv norm in one pass.
+/// The reference is each of the three written out in f64 (the GLU after the
+/// clipped linear's output clamp, `F.pad(x, (taps - 1, 0))` then conv1d, the
+/// weighted norm after the gradient clamp, SiLU, the next linear's input
+/// clamp), over clips shorter than the taps, a single row, and the
+/// checkpoint's shape. The shapes and seeds are those of the `glu` and
+/// `dwconv1d_causal` cases this replaces.
+#[allow(clippy::too_many_arguments)]
+fn lconv_case(
+    rt: &Arc<GpuRuntime>,
+    frames: &[usize],
+    hidden: usize,
+    taps: usize,
+    eps: f32,
+    glu_c: Clamp,
+    pre: Clamp,
+    post: Clamp,
+    seed: u64,
+) {
+    let mut r = SplitMix::new(seed);
+    let table = ClipTable::new(rt, frames).unwrap();
+    let x = rand(&mut r, table.rows * 2 * hidden, 6.0, 0.0);
+    let w = rand(&mut r, hidden * taps, 0.7, 0.0);
+    let nw = rand(&mut r, hidden, 0.3, 1.0);
+    let n = table.rows * hidden;
+    let out = seeded(rt, n, UNWRITTEN);
+    let (xb, wb, nwb) = (buf(rt, &x), buf(rt, &w), buf(rt, &nw));
+    lconv(
+        rt,
+        &xb,
+        &wb,
+        &out,
+        &table,
+        hidden as u32,
+        taps as u32,
+        &Lconv {
+            eps,
+            norm_weight: &nwb,
+            glu: glu_c,
+            pre,
+            post,
+        },
+    )
+    .unwrap();
+
+    let g = |row: usize, ch: usize| {
+        let at = |c: usize| {
+            clamp(
+                f64::from(x[row * 2 * hidden + c]),
+                f64::from(glu_c.lo),
+                f64::from(glu_c.hi),
+            )
+        };
+        at(ch) * sigmoid(at(hidden + ch))
+    };
+    let mut want = vec![0.0; n];
+    for c in &table.clips {
+        for t in 0..c.rows {
+            let conv: Vec<f64> = (0..hidden)
+                .map(|ch| {
+                    (0..taps)
+                        .filter_map(|j| {
+                            let src = t as i64 + j as i64 - (taps as i64 - 1);
+                            (src >= 0).then(|| f64::from(w[ch * taps + j]) * g(c.row0 + src as usize, ch))
+                        })
+                        .sum()
                 })
                 .collect();
-            assert_close(&format!("glu {rows}x{hidden}"), &read(rt, &out, rows * hidden), &want);
+            let v: Vec<f64> = conv
+                .iter()
+                .map(|&y| clamp(y, f64::from(pre.lo), f64::from(pre.hi)))
+                .collect();
+            let normed = rms_eps(&v, Some(&f64s(&nw)), f64::from(eps));
+            for (ch, y) in normed.into_iter().enumerate() {
+                want[(c.row0 + t) * hidden + ch] = clamp(silu(y), f64::from(post.lo), f64::from(post.hi));
+            }
         }
-    });
+    }
+    assert_close(
+        &format!("lconv {} rows hidden {hidden} taps {taps}", table.rows),
+        &read(rt, &out, n),
+        &want,
+    );
 }
 
 #[test]
-fn dwconv1d_causal_matches_the_f64_reference() {
+fn lconv_matches_the_f64_reference() {
+    let c = |lo: f32, hi: f32| Clamp::new(lo, hi).unwrap();
     with_gpu(|rt| {
+        let (glu_c, pre, post) = (c(-3.0, 4.0), c(-1.5, 2.0), c(-0.5, 0.9));
         // Clips shorter than the taps, a single row, and the checkpoint's.
-        for (frames, hidden, taps) in [
-            (vec![3usize, 12, 1, 7], 9usize, 5usize),
-            (vec![99, 330, 4], 1024, 5),
-            (vec![6, 2], 16, 1),
+        lconv_case(rt, &[3, 12, 1, 7], 9, 5, 1e-6, glu_c, pre, post, 9);
+        lconv_case(rt, &[99, 330, 4], 1024, 5, 1e-6, glu_c, pre, post, 1024);
+        lconv_case(rt, &[6, 2], 16, 1, 1e-5, glu_c, pre, post, 16);
+        // No clamp bites, then every one does; a width past a threadgroup's
+        // threads (four channels per thread) and the widest the kernel holds.
+        lconv_case(rt, &[11, 5], 64, 4, 1e-6, Clamp::NONE, Clamp::NONE, Clamp::NONE, 64);
+        lconv_case(rt, &[9, 2], 64, 3, 1e-6, c(-0.3, 0.4), c(-0.2, 0.25), c(-0.1, 0.15), 65);
+        lconv_case(rt, &[6, 3], 4096, 5, 1e-6, glu_c, pre, post, 4096);
+    });
+}
+
+/// The first stage of the chained cases: clamped, scaled, and a residual, a
+/// bias or neither added; with `no_norm` it has no norm and no weight.
+fn first_stage<'a>(
+    w: &'a GpuBuffer,
+    resid: Option<&'a GpuBuffer>,
+    bias: Option<&'a GpuBuffer>,
+    no_norm: bool,
+) -> RmsNorm<'a> {
+    let mut s = RmsNorm::new(1e-6, (!no_norm).then_some(w));
+    s.pre = [Clamp::new(-2.0, 2.5).unwrap(), Clamp::NONE];
+    s.scale = 0.5;
+    s.norm = !no_norm;
+    s.resid = resid;
+    s.bias = bias;
+    s
+}
+
+/// A weighted norm after a `Clamp::symmetric(1.5)`.
+fn second_stage(w: &GpuBuffer) -> RmsNorm<'_> {
+    let mut s = RmsNorm::new(1e-6, Some(w));
+    s.pre = [Clamp::symmetric(1.5), Clamp::NONE];
+    s
+}
+
+/// The feed-forward's post-norm and residual add, as the layer writes them.
+fn stream_post_norm<'a>(w: &'a GpuBuffer, resid: &'a GpuBuffer) -> RmsNorm<'a> {
+    let mut s = RmsNorm::new(1e-6, Some(w));
+    s.pre = [Clamp::new(-2.0, 2.5).unwrap(), Clamp::symmetric(9.0)];
+    s.scale = 0.5;
+    s.resid = Some(resid);
+    s
+}
+
+/// `norm_out`.
+fn stream_norm_out(w: &GpuBuffer) -> RmsNorm<'_> {
+    let mut s = RmsNorm::new(1e-6, Some(w));
+    s.pre = [Clamp::symmetric(9.0), Clamp::NONE];
+    s
+}
+
+/// Two stages in one launch are the two kernels in sequence, bit for bit (the
+/// reductions have the same shape), and each of a fan-out's outputs is the
+/// second stage under its own clamp. Covers the layer's uses: a residual add
+/// then a norm into three clamped copies, into one, the norm in place on the
+/// residual stream, a no-norm stage then a norm, and a bias then a weightless
+/// norm.
+#[test]
+fn rms_norm_then_is_two_rms_norms_in_one_launch() {
+    let c = |lo: f32, hi: f32| Clamp::new(lo, hi).unwrap();
+    with_gpu(|rt| {
+        for (rows, dim, seed) in [
+            (5usize, 64usize, 1u64),
+            (3, 7, 2),
+            (9, 1024, 3),
+            (6, 1536, 4),
+            (2, 4096, 5),
         ] {
-            let mut r = SplitMix::new(hidden as u64);
-            let table = ClipTable::new(rt, &frames).unwrap();
-            let x = rand(&mut r, table.rows * hidden, 2.0, 0.0);
-            let w = rand(&mut r, hidden * taps, 0.7, 0.0);
-            let n = table.rows * hidden;
-            let out = seeded(rt, n, UNWRITTEN);
-            dwconv1d_causal(rt, &buf(rt, &x), &buf(rt, &w), &out, &table, hidden as u32, taps as u32).unwrap();
-            let mut want = vec![0.0; n];
-            for c in &table.clips {
-                for t in 0..c.rows {
-                    for ch in 0..hidden {
-                        let mut s = 0.0;
-                        for j in 0..taps {
-                            // F.pad(x, (taps - 1, 0)) then conv1d (correlation).
-                            let src = t as i64 + j as i64 - (taps as i64 - 1);
-                            if src >= 0 {
-                                s += f64::from(w[ch * taps + j]) * f64::from(x[(c.row0 + src as usize) * hidden + ch]);
-                            }
-                        }
-                        want[(c.row0 + t) * hidden + ch] = s;
+            let n = rows * dim;
+            let mut r = SplitMix::new(seed);
+            let y = rand(&mut r, n, 3.0, 0.0);
+            let x = rand(&mut r, n, 2.0, 0.0);
+            let (w1, w2) = (rand(&mut r, dim, 0.3, 1.0), rand(&mut r, dim, 0.3, 1.0));
+            let bias = rand(&mut r, dim, 1.0, 0.0);
+            let (yb, w1b, w2b, biasb) = (buf(rt, &y), buf(rt, &w1), buf(rt, &w2), buf(rt, &bias));
+            let posts = [c(-1.1, 1.3), c(-0.7, 0.9), c(-2.0, 0.4)];
+            let (rows_u, dim_u) = (rows as u32, dim as u32);
+
+            // The first stage's variants, each followed by a weighted norm.
+            for (what, resid_in_place, bias_stage, no_norm) in [
+                ("residual add then norm", true, false, false),
+                ("no-norm residual then norm", true, false, true),
+                ("bias then norm", false, true, true),
+                ("plain norm then norm", false, false, false),
+            ] {
+                // Sequential: stage one into `mid`, stage two out of it.
+                let xs = buf(rt, &x);
+                let mid = seeded(rt, n, UNWRITTEN);
+                let seq: Vec<GpuBuffer> = (0..3).map(|_| seeded(rt, n, UNWRITTEN)).collect();
+                let first = first_stage(
+                    &w1b,
+                    resid_in_place.then_some(&xs),
+                    bias_stage.then_some(&biasb),
+                    no_norm,
+                );
+                rms_norm(rt, &yb, &mid, rows_u, dim_u, &first).unwrap();
+                for (o, &p) in seq.iter().zip(&posts) {
+                    let mut second = second_stage(&w2b);
+                    second.post = p;
+                    rms_norm(rt, &mid, o, rows_u, dim_u, &second).unwrap();
+                }
+                let want_mid = read(rt, &mid, n);
+                let want: Vec<Vec<f64>> = seq.iter().map(|o| read(rt, o, n)).collect();
+
+                // Chained, one to three outputs.
+                for k in 1..=3usize {
+                    let xs = buf(rt, &x);
+                    let mid2 = seeded(rt, n, UNWRITTEN);
+                    let outs: Vec<GpuBuffer> = (0..k).map(|_| seeded(rt, n, UNWRITTEN)).collect();
+                    let then = NormThen {
+                        spec: second_stage(&w2b),
+                        outs: outs.iter().zip(&posts).map(|(o, &p)| (o, p)).collect(),
+                    };
+                    let first = first_stage(
+                        &w1b,
+                        resid_in_place.then_some(&xs),
+                        bias_stage.then_some(&biasb),
+                        no_norm,
+                    );
+                    rms_norm_then(rt, &yb, &mid2, rows_u, dim_u, &first, &then).unwrap();
+                    assert_eq!(
+                        read(rt, &mid2, n),
+                        want_mid,
+                        "{what} {rows}x{dim}: first stage's output"
+                    );
+                    for (i, o) in outs.iter().enumerate() {
+                        assert_eq!(
+                            read(rt, o, n),
+                            want[i],
+                            "{what} {rows}x{dim}: output {i} of {k} differs from the sequential launches"
+                        );
                     }
                 }
             }
-            assert_close(
-                &format!("dwconv {} rows hidden {hidden} taps {taps}", table.rows),
-                &read(rt, &out, n),
-                &want,
+
+            // The layer's in-place uses, against the out-of-place chain: the
+            // residual add into the stream then `norm_out` in place on it.
+            let xs = buf(rt, &x);
+            let ys = buf(rt, &y);
+            let stream = seeded(rt, n, UNWRITTEN);
+            let xs2 = buf(rt, &x);
+            rms_norm(rt, &ys, &stream, rows_u, dim_u, &stream_post_norm(&w1b, &xs2)).unwrap();
+            let want_stream = {
+                let o = seeded(rt, n, UNWRITTEN);
+                rms_norm(rt, &stream, &o, rows_u, dim_u, &stream_norm_out(&w2b)).unwrap();
+                read(rt, &o, n)
+            };
+            rms_norm_then(
+                rt,
+                &ys,
+                &xs,
+                rows_u,
+                dim_u,
+                &stream_post_norm(&w1b, &xs),
+                &NormThen {
+                    spec: stream_norm_out(&w2b),
+                    outs: vec![(&xs, Clamp::NONE)],
+                },
+            )
+            .unwrap();
+            assert_eq!(
+                read(rt, &xs, n),
+                want_stream,
+                "{rows}x{dim}: residual add then norm_out, in place"
             );
+        }
+    });
+}
+
+/// The chained launch against the f64 reference: the fan-out's three clamps
+/// applied to one normed value, as the attention norm feeds q, k and v.
+#[test]
+fn rms_norm_then_matches_the_f64_reference() {
+    with_gpu(|rt| {
+        let (rows, dim) = (7usize, 1024usize);
+        let n = rows * dim;
+        let mut r = SplitMix::new(77);
+        let y = rand(&mut r, n, 3.0, 0.0);
+        let x = rand(&mut r, n, 2.0, 0.0);
+        let (w1, w2) = (rand(&mut r, dim, 0.3, 1.0), rand(&mut r, dim, 0.3, 1.0));
+        let (yb, xb, w1b, w2b) = (buf(rt, &y), buf(rt, &x), buf(rt, &w1), buf(rt, &w2));
+        let mid = seeded(rt, n, UNWRITTEN);
+        let posts = [
+            Clamp::new(-1.1, 1.3).unwrap(),
+            Clamp::new(-0.7, 0.9).unwrap(),
+            Clamp::new(-2.0, 0.4).unwrap(),
+        ];
+        let outs: Vec<GpuBuffer> = (0..3).map(|_| seeded(rt, n, UNWRITTEN)).collect();
+        let mut first = RmsNorm::new(1e-6, Some(&w1b));
+        first.pre = [Clamp::new(-2.0, 2.5).unwrap(), Clamp::symmetric(9.0)];
+        first.scale = 0.5;
+        first.resid = Some(&xb);
+        let mut second = RmsNorm::new(1e-6, Some(&w2b));
+        second.pre = [Clamp::symmetric(1.5), Clamp::NONE];
+        rms_norm_then(
+            rt,
+            &yb,
+            &mid,
+            rows as u32,
+            dim as u32,
+            &first,
+            &NormThen {
+                spec: second,
+                outs: outs.iter().zip(&posts).map(|(o, &p)| (o, p)).collect(),
+            },
+        )
+        .unwrap();
+
+        let (mut want_mid, mut want_out) = (Vec::new(), vec![Vec::new(), Vec::new(), Vec::new()]);
+        for row in 0..rows {
+            let span = row * dim..(row + 1) * dim;
+            let v: Vec<f64> = y[span.clone()]
+                .iter()
+                .map(|&t| clamp(clamp(f64::from(t), -2.0, 2.5), -9.0, 9.0))
+                .collect();
+            let m: Vec<f64> = rms_eps(&v, Some(&f64s(&w1)), 1e-6)
+                .into_iter()
+                .zip(&x[span])
+                .map(|(a, &res)| a * 0.5 + f64::from(res))
+                .collect();
+            let v2: Vec<f64> = m.iter().map(|&t| clamp(t, -1.5, 1.5)).collect();
+            let normed = rms_eps(&v2, Some(&f64s(&w2)), 1e-6);
+            for (k, p) in posts.iter().enumerate() {
+                want_out[k].extend(normed.iter().map(|&t| clamp(t, f64::from(p.lo), f64::from(p.hi))));
+            }
+            want_mid.extend(m);
+        }
+        assert_close("rms_norm_then first stage", &read(rt, &mid, n), &want_mid);
+        for (k, o) in outs.iter().enumerate() {
+            assert_close(&format!("rms_norm_then output {k}"), &read(rt, o, n), &want_out[k]);
         }
     });
 }
@@ -600,22 +888,59 @@ fn attn_case(rt: &Arc<GpuRuntime>, a: &AttnCase, frames: &[usize], seed: u64) {
         k: ck,
         v: cv,
         out: co,
+        stride: hidden as u32,
+        q_off: 0,
+        k_off: 0,
+        v_off: 0,
     };
+    let (rel_b, qm_b, om_b) = (buf(rt, &rel32), buf(rt, &qm32), buf_u32(rt, &mask_u32(&oms)));
+    // q, k, v in three buffers of their own, and in one fused q | k | v
+    // projection's output (`3 * hidden` per row) read at their columns.
     let out = seeded(rt, rows * hidden, UNWRITTEN);
     attention(
         rt,
         &buf(rt, &q),
         &buf(rt, &k),
         &buf(rt, &v),
-        &buf(rt, &rel32),
-        &buf(rt, &qm32),
-        &buf_u32(rt, &mask_u32(&oms)),
+        &rel_b,
+        &qm_b,
+        &om_b,
         &out,
         &table,
         &spec,
     )
     .unwrap();
     let got = read(rt, &out, rows * hidden);
+    let mut packed = vec![0.0f32; rows * 3 * hidden];
+    for row in 0..rows {
+        let dst = &mut packed[row * 3 * hidden..(row + 1) * 3 * hidden];
+        dst[..hidden].copy_from_slice(&q[row * hidden..(row + 1) * hidden]);
+        dst[hidden..2 * hidden].copy_from_slice(&k[row * hidden..(row + 1) * hidden]);
+        dst[2 * hidden..].copy_from_slice(&v[row * hidden..(row + 1) * hidden]);
+    }
+    let pb = buf(rt, &packed);
+    let out_fused = seeded(rt, rows * hidden, UNWRITTEN);
+    attention(
+        rt,
+        &pb,
+        &pb,
+        &pb,
+        &rel_b,
+        &qm_b,
+        &om_b,
+        &out_fused,
+        &table,
+        &AttentionSpec {
+            stride: 3 * hidden as u32,
+            q_off: 0,
+            k_off: hidden as u32,
+            v_off: 2 * hidden as u32,
+            ..spec
+        },
+    )
+    .unwrap();
+    let got_fused = read(rt, &out_fused, rows * hidden);
+    assert_eq!(got_fused, got, "fused q|k|v layout differs from three buffers");
 
     let cl = |v: &[f32], c: Clamp| -> Vec<f64> {
         v.iter()
@@ -749,19 +1074,34 @@ fn the_wrappers_refuse_what_the_kernels_cannot_run() {
             }
         ))
         .contains("scale"));
-        assert!(err(ew(
+        // A bias that is not one row wide, a residual and a bias at once.
+        let five = buf(rt, &[0.0; 5]);
+        assert!(err(rms_norm(
             rt,
             &ok,
             &ok,
-            12,
-            &Ew {
-                pre: Clamp::NONE,
-                silu: false,
-                post: Clamp::NONE,
-                add: EwAdd::Bias(&ok, 5)
+            3,
+            8,
+            &RmsNorm {
+                bias: Some(&five),
+                norm: false,
+                ..RmsNorm::new(1e-6, None)
             }
         ))
         .contains("bias"));
+        assert!(err(rms_norm(
+            rt,
+            &ok,
+            &ok,
+            3,
+            4,
+            &RmsNorm {
+                bias: Some(&ok),
+                resid: Some(&ok),
+                ..RmsNorm::new(1e-6, None)
+            }
+        ))
+        .contains("not both"));
         assert!(err(ew(
             rt,
             &small,
@@ -771,13 +1111,77 @@ fn the_wrappers_refuse_what_the_kernels_cannot_run() {
                 pre: Clamp::NONE,
                 silu: false,
                 post: Clamp::NONE,
-                add: EwAdd::None
             }
         ))
         .contains("ew x"));
         assert!(Clamp::new(f32::NAN, 0.0).is_err());
-        assert!(err(glu(rt, &small, &ok, 2, 4, Clamp::NONE)).contains("glu"));
-        assert!(err(dwconv1d_causal(rt, &ok, &ok, &ok, &table, 4, 0)).contains("taps"));
+        // The chained launch: output counts, a second stage that carries what
+        // belongs to the first, outputs that alias what they must not.
+        let first = RmsNorm::new(1e-6, None);
+        let chain = |outs: Vec<(&GpuBuffer, Clamp)>| {
+            rms_norm_then(
+                rt,
+                &ok,
+                &ok,
+                4,
+                4,
+                &first,
+                &NormThen {
+                    spec: RmsNorm::new(1e-6, None),
+                    outs,
+                },
+            )
+        };
+        assert!(err(chain(vec![])).contains("outputs"));
+        let more: Vec<GpuBuffer> = (0..4).map(|_| buf(rt, &vec![0.0; 100])).collect();
+        assert!(err(chain(more.iter().map(|b| (b, Clamp::NONE)).collect())).contains("outputs"));
+        assert!(err(rms_norm_then(
+            rt,
+            &ok,
+            &ok,
+            4,
+            4,
+            &first,
+            &NormThen {
+                spec: RmsNorm {
+                    scale: 2.0,
+                    ..RmsNorm::new(1e-6, None)
+                },
+                outs: vec![(&more[0], Clamp::NONE)],
+            }
+        ))
+        .contains("second stage"));
+        // An extra output that is the first stage's output, or another output.
+        assert!(chain(vec![(&more[0], Clamp::NONE), (&ok, Clamp::NONE)]).is_err());
+        assert!(chain(vec![
+            (&more[0], Clamp::NONE),
+            (&more[1], Clamp::NONE),
+            (&more[1], Clamp::NONE)
+        ])
+        .is_err());
+        // Light conv: hidden and taps limits, undersized buffers.
+        let norm_w = buf(rt, &[1.0; 4]);
+        let lc = |hidden: u32, taps: u32, x: &GpuBuffer| {
+            lconv(
+                rt,
+                x,
+                &ok,
+                &more[0],
+                &table,
+                hidden,
+                taps,
+                &Lconv {
+                    eps: 1e-6,
+                    norm_weight: &norm_w,
+                    glu: Clamp::NONE,
+                    pre: Clamp::NONE,
+                    post: Clamp::NONE,
+                },
+            )
+        };
+        assert!(err(lc(4, 0, &ok)).contains("taps"));
+        assert!(err(lc(4097, 5, &ok)).contains("hidden"));
+        assert!(err(lc(4, 5, &small)).contains("lconv"));
         // Attention: the window the kernel is compiled for, head dim, cap.
         let spec = AttentionSpec {
             heads: 2,
@@ -791,8 +1195,27 @@ fn the_wrappers_refuse_what_the_kernels_cannot_run() {
             k: Clamp::NONE,
             v: Clamp::NONE,
             out: Clamp::NONE,
+            stride: 8,
+            q_off: 0,
+            k_off: 0,
+            v_off: 0,
         };
         let call = |s: &AttentionSpec| attention(rt, &ok, &ok, &ok, &ok, &ok, &mask, &ok, &table, s);
+        // More past frames than the kernel carries partial logits for; a
+        // masked logit too near the unmasked ones for a weight of exactly 0;
+        // a column that does not fit the row stride.
+        assert!(err(call(&AttentionSpec {
+            past: 17,
+            chunk: 1,
+            ..spec
+        }))
+        .contains("unsupported"));
+        assert!(err(call(&AttentionSpec {
+            invalid: -100.0,
+            ..spec
+        }))
+        .contains("unsupported"));
+        assert!(err(call(&AttentionSpec { k_off: 1, ..spec })).contains("row stride"));
         let rows_bad = AttentionSpec { head_dim: 257, ..spec };
         assert!(err(call(&rows_bad)).contains("unsupported"));
         assert!(err(call(&AttentionSpec { chunk: 60, ..spec })).contains("unsupported"));

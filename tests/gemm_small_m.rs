@@ -18,7 +18,8 @@
 //! * the lane repeats bit for bit (no atomics, a fixed reduction order);
 //! * a poisoned scratch changes nothing (every element of every slice is
 //!   written before the reduce reads it);
-//! * routing: the traced kernel counts per shape, in a child process.
+//! * routing: the traced kernel counts per shape, in a child process, with and
+//!   without the opt-in (`gemm_small_m` against `gemm`).
 
 mod common;
 
@@ -27,7 +28,7 @@ use common::{
     with_gpu, Layout, Reference,
 };
 use std::sync::Arc;
-use tessl::gemm::{gemm_nn_splitk_par_f32, GemmOperands};
+use tessl::gemm::{gemm_nn_splitk_par_f32, gemm_small_m, GemmOperands};
 use tessl::runtime::traced_kernel_count;
 use tessl::{gemm, GemmBackend, GpuRuntime, Tensor};
 
@@ -73,7 +74,7 @@ fn the_lane_matches_f64_at_the_forward_shapes() {
                 let want = reference(Layout::Nn, &a_h, &b_h, m, n, k);
                 let c = rt.alloc_tensor_f32(&[m, n]).unwrap();
 
-                gemm(&a, &b, &c, GemmBackend::TensorOps).unwrap();
+                gemm_small_m(&a, &b, &c, GemmBackend::TensorOps, None).unwrap();
                 rt.synchronize().unwrap();
                 let got = c.buffer.read_f32();
                 assert_within_bound(&format!("gemm {name} M={m}"), &got, &want, k, 0.0);
@@ -174,7 +175,7 @@ fn the_lane_writes_every_slice_element() {
                 let (a, b, a_h, b_h) = operands(rt, m, n, k, 0xdead ^ (m + n) as u64);
                 let want = reference(Layout::Nn, &a_h, &b_h, m, n, k);
                 let c = rt.alloc_tensor_f32(&[m, n]).unwrap();
-                gemm(&a, &b, &c, GemmBackend::TensorOps).unwrap();
+                gemm_small_m(&a, &b, &c, GemmBackend::TensorOps, None).unwrap();
                 rt.synchronize().unwrap();
                 assert_within_bound(&format!("poisoned {name} M={m}"), &c.buffer.read_f32(), &want, k, 0.0);
             }
@@ -194,7 +195,7 @@ fn the_lane_repeats_bit_identically() {
         let c = rt.alloc_tensor_f32(&[m, n]).unwrap();
         let mut first: Option<Vec<f32>> = None;
         for run in 0..48 {
-            gemm(&a, &b, &c, GemmBackend::TensorOps).unwrap();
+            gemm_small_m(&a, &b, &c, GemmBackend::TensorOps, None).unwrap();
             rt.synchronize().unwrap();
             let got = c.buffer.read_f32();
             match &first {
@@ -231,12 +232,17 @@ fn count(name: &str) -> u64 {
     traced_kernel_count(name)
 }
 
-/// Which kernels one `gemm` call dispatches, by pipeline requests.
-fn route(rt: &Arc<GpuRuntime>, m: usize, n: usize, k: usize) -> (u64, u64, u64, u64) {
+/// Which kernels one `gemm` call (`opt_in`: `gemm_small_m`) dispatches, by
+/// pipeline requests.
+fn route(rt: &Arc<GpuRuntime>, m: usize, n: usize, k: usize, opt_in: bool) -> (u64, u64, u64, u64) {
     let (a, b, _, _) = operands(rt, m, n, k, 0x1 ^ (m + n + k) as u64);
     let c = rt.alloc_tensor_f32(&[m, n]).unwrap();
     let before = (count(PAR), count(REDUCE), count(PLAIN), count(SEQ_SPLIT));
-    gemm(&a, &b, &c, GemmBackend::TensorOps).unwrap();
+    if opt_in {
+        gemm_small_m(&a, &b, &c, GemmBackend::TensorOps, None).unwrap();
+    } else {
+        gemm(&a, &b, &c, GemmBackend::TensorOps).unwrap();
+    }
     rt.synchronize().unwrap();
     (
         count(PAR) - before.0,
@@ -288,8 +294,65 @@ fn routing_by_shape() {
                 ),
                 (4096, 768, 50_304, seq, "the LM head's input gradient"),
             ] {
-                assert_eq!(route(rt, m, n, k), want, "{why}: {m}x{n}x{k}");
+                assert_eq!(route(rt, m, n, k, true), want, "{why}: {m}x{n}x{k}");
+                // Without the opt-in no shape takes the lane: `gemm` keeps
+                // the route it had (the lane's shapes take the plain kernel).
+                let default = if want == lane { plain } else { want };
+                assert_eq!(route(rt, m, n, k, false), default, "no opt-in, {why}: {m}x{n}x{k}");
             }
+        });
+    });
+}
+
+/// A caller's scratch: big enough, the lane runs in it and gives the bits a
+/// pool scratch gives, whatever the buffer held (it is filled with NaN
+/// first); too small, the call keeps the single dispatch and the plain
+/// kernel's bits; of another dtype, it is an error.
+#[test]
+fn a_callers_scratch_is_used_or_refused() {
+    let _ = in_traced_child("a_callers_scratch_is_used_or_refused", || {
+        with_gpu(|rt| {
+            let (m, n, k) = (16usize, 512usize, 2048usize);
+            let parts = 8usize; // K 2048 at N 512: 8 partitions of 256
+            let (a, b, _, _) = operands(rt, m, n, k, 0x5c8a);
+            let read = |c: &Tensor| {
+                rt.synchronize().unwrap();
+                c.buffer.read_f32()[..m * n]
+                    .iter()
+                    .map(|x| x.to_bits())
+                    .collect::<Vec<_>>()
+            };
+            let go = |scratch: Option<&Tensor>| {
+                let c = rt.alloc_tensor_f32(&[m, n]).unwrap();
+                let before = (count(PAR), count(PLAIN));
+                gemm_small_m(&a, &b, &c, GemmBackend::TensorOps, scratch).unwrap();
+                let bits = read(&c);
+                (bits, count(PAR) - before.0, count(PLAIN) - before.1)
+            };
+            let (pooled, par, _) = go(None);
+            assert_eq!(par, 1);
+            let big = rt.alloc_tensor_f32(&[parts * m * n]).unwrap();
+            big.buffer.write_f32(&vec![f32::NAN; parts * m * n]);
+            let (mine, par, plain) = go(Some(&big));
+            assert_eq!((par, plain), (1, 0), "a big enough scratch runs the lane");
+            assert_eq!(mine, pooled, "the caller's scratch gives the pool scratch's bits");
+            let small = rt.alloc_tensor_f32(&[parts * m * n - 1]).unwrap();
+            let (single, par, plain) = go(Some(&small));
+            assert_eq!(
+                (par, plain),
+                (0, 1),
+                "a scratch one element short keeps the single dispatch"
+            );
+            let (default, _, _) = {
+                let c = rt.alloc_tensor_f32(&[m, n]).unwrap();
+                gemm(&a, &b, &c, GemmBackend::TensorOps).unwrap();
+                (read(&c), 0, 0)
+            };
+            assert_eq!(single, default, "and is exactly what `gemm` computes");
+            let wrong = tessl::gemm::cast_f32_to_bf16(&big).unwrap();
+            let c = rt.alloc_tensor_f32(&[m, n]).unwrap();
+            let err = gemm_small_m(&a, &b, &c, GemmBackend::TensorOps, Some(&wrong)).unwrap_err();
+            assert!(err.contains("scratch"), "{err}");
         });
     });
 }

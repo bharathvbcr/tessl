@@ -5,15 +5,20 @@
 //! ([`fill`], [`fill_dist`]), the median ([`median`], which refuses an empty or
 //! non-finite sample set), the environment contract ([`env_usize`], which
 //! refuses a malformed or below-minimum count), and the interleaved A/B
-//! statistics ([`run_paired`], [`ratio_stats`], [`self_spread`]). A binary
+//! statistics ([`run_paired`], [`ratio_stats`], [`self_spread`]), and the
+//! profile binaries' quiet-machine gate ([`gated`], [`others_running`]) with
+//! their JSON scalar writers ([`jnum`], [`jarr`]). A binary
 //! that needs one adds it here; it does not carry a copy.
 //!
 //! Declared with `mod common;` by (`rg -l '^mod common;' src/bin`):
-//! bench_embedgemma2, bench_flash_attn, bench_gemm_coop_tile,
+//! bench_embedgemma2, bench_embedgemma2_vision, bench_encoder_attn, bench_flash_attn, bench_gemm_coop_tile,
 //! bench_gemm_routes, bench_gemm_sweep, bench_gemm_tile_tune,
 //! bench_gemm_tnnt_tune, bench_gemm_variants, bench_nn_kernels, bench_paired,
 //! bench_qwen35_layers, bench_qwen35_train, probe_gdn_scan, probe_gemm_bits,
-//! probe_gemm_parity, probe_load_memory, profile_embedgemma2.
+//! probe_gemm_parity, probe_load_memory, profile_embedgemma2, bench_embedgemma2_audio,
+//! profile_embedgemma2_audio, profile_embedgemma2_vision (profile_embedgemma2 still
+//! carries its own copy of the gate and the scalar writers, which this module took
+//! from it).
 //!
 //! Not a `src/bin/*.rs` file: cargo would build it as its own binary. A
 //! directory without `main.rs` is not a target, which is the same trick
@@ -428,6 +433,159 @@ pub fn exit_if_unstable(bin: &str, unstable: &[String]) {
         );
         std::process::exit(3);
     }
+}
+
+// ---------------------------------------------------------------------------
+// Quiet-machine gating and JSON scalars for the profile binaries
+// ---------------------------------------------------------------------------
+
+/// Other tessl processes that may be using the GPU: test and bench binaries
+/// under a `tessl*` checkout's `target/`, other than this one. Other sessions
+/// share this machine; a sample taken while one runs is flagged, not trusted.
+/// A GPU user this does not see (a display, a browser) stays in the baseline,
+/// which [`gpu_utilization`] records.
+pub fn others_running() -> Vec<String> {
+    /// `PROC_ALL_PIDS` of `<sys/proc_info.h>`; the `libc` crate does not export it.
+    const PROC_ALL_PIDS: u32 = 1;
+    let me = std::process::id() as libc::pid_t;
+    // SAFETY: with a null buffer `proc_listpids` only returns the bytes needed.
+    let need = unsafe { libc::proc_listpids(PROC_ALL_PIDS, 0, std::ptr::null_mut(), 0) };
+    if need <= 0 {
+        return vec!["proc_listpids failed".to_string()];
+    }
+    let mut pids = vec![0 as libc::pid_t; need as usize / std::mem::size_of::<libc::pid_t>() + 64];
+    let bytes = (pids.len() * std::mem::size_of::<libc::pid_t>()) as libc::c_int;
+    // SAFETY: `pids` is a live buffer of `bytes` bytes.
+    let got = unsafe { libc::proc_listpids(PROC_ALL_PIDS, 0, pids.as_mut_ptr().cast(), bytes) };
+    if got <= 0 {
+        return vec!["proc_listpids failed".to_string()];
+    }
+    let n = got as usize / std::mem::size_of::<libc::pid_t>();
+    let mut found = Vec::new();
+    for &pid in &pids[..n.min(pids.len())] {
+        if pid <= 0 || pid == me {
+            continue;
+        }
+        let mut buf = [0u8; 4096];
+        // SAFETY: `buf` is a live buffer of the length passed.
+        let len = unsafe { libc::proc_pidpath(pid, buf.as_mut_ptr().cast(), buf.len() as u32) };
+        if len <= 0 {
+            continue;
+        }
+        let path = String::from_utf8_lossy(&buf[..len as usize]).into_owned();
+        let in_target =
+            path.contains("/research/tessl") && (path.contains("/target/release/") || path.contains("/target/debug/"));
+        let file = path.rsplit('/').next().unwrap_or("");
+        let gpu_bin = path.contains("/deps/")
+            || file.starts_with("bench_")
+            || file.starts_with("probe_")
+            || file.starts_with("profile_");
+        if in_target && gpu_bin {
+            found.push(file.to_string());
+        }
+    }
+    found
+}
+
+/// Milliseconds this process has spent waiting for a quiet machine.
+static WAITED_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Wait for [`others_running`] to be empty, for at most `PROFILE_WAIT_S`
+/// seconds (default 1800) in total over the whole run; false if it was not
+/// empty when the budget ran out.
+pub fn wait_quiet() -> bool {
+    use std::sync::atomic::Ordering::Relaxed;
+    let budget_ms = 1000
+        * std::env::var("PROFILE_WAIT_S")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(1800);
+    while !others_running().is_empty() {
+        if WAITED_MS.load(Relaxed) >= budget_ms {
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1000));
+        WAITED_MS.fetch_add(1000, Relaxed);
+    }
+    true
+}
+
+/// `run` once the machine is quiet, retaken (up to 3 times) when another tessl
+/// GPU process appears during it: (result, contended, retakes).
+pub fn gated<T>(mut run: impl FnMut() -> Result<T, String>) -> Result<(T, bool, usize), String> {
+    let mut retakes = 0;
+    loop {
+        let quiet = wait_quiet();
+        let r = run()?;
+        let seen_after = !others_running().is_empty();
+        if !seen_after && quiet {
+            return Ok((r, false, retakes));
+        }
+        if retakes >= 3 || !quiet {
+            return Ok((r, true, retakes));
+        }
+        retakes += 1;
+    }
+}
+
+/// The samples of `v` taken while the machine was quiet, or all of them when
+/// none was.
+pub fn clean_or_all(v: &[f64], contended: &[bool]) -> Vec<f64> {
+    let clean: Vec<f64> = v.iter().zip(contended).filter(|(_, &c)| !c).map(|(&x, _)| x).collect();
+    if clean.is_empty() {
+        v.to_vec()
+    } else {
+        clean
+    }
+}
+
+/// The device's GPU utilization as `ioreg` reports it, for the machine-state
+/// record (other sessions share this GPU).
+pub fn gpu_utilization() -> String {
+    let out = std::process::Command::new("ioreg")
+        .args(["-r", "-d", "1", "-c", "IOAccelerator"])
+        .output();
+    match out {
+        Ok(o) => {
+            let s = String::from_utf8_lossy(&o.stdout);
+            s.split("\"Device Utilization %\"=")
+                .nth(1)
+                .and_then(|t| t.split(|c: char| !c.is_ascii_digit()).next())
+                .unwrap_or("unknown")
+                .to_string()
+        }
+        Err(e) => format!("ioreg failed: {e}"),
+    }
+}
+
+pub fn min_of(v: &[f64]) -> f64 {
+    v.iter().copied().fold(f64::INFINITY, f64::min)
+}
+
+pub fn median_of(v: &[f64]) -> f64 {
+    let mut s = v.to_vec();
+    s.sort_by(f64::total_cmp);
+    s[s.len() / 2]
+}
+
+pub fn jnum(x: f64) -> String {
+    if x.is_finite() {
+        format!("{x:.6}")
+    } else {
+        "null".to_string()
+    }
+}
+
+pub fn jarr(v: &[f64]) -> String {
+    format!("[{}]", v.iter().map(|&x| jnum(x)).collect::<Vec<_>>().join(","))
+}
+
+pub fn jbools(v: &[bool]) -> String {
+    format!("[{}]", v.iter().map(|b| b.to_string()).collect::<Vec<_>>().join(","))
+}
+
+pub fn jstr(s: &str) -> String {
+    format!("{s:?}")
 }
 
 #[cfg(test)]

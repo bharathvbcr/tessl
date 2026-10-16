@@ -74,6 +74,14 @@ who hold the tokenizer, cannot reach the encoder. **verified**.
 In flight beside it: `gp/w9-capi` (ABI 12, async entry, ft-ba1413a0)
 changes `capi.rs`, so new exports belong in their own module.
 
+**Resolved** (lane C, text; lane F, images and audio): `src/capi_embedgemma2.rs`
+and `python/tessl_torch/embedgemma2.py` carry the text entries
+(`tessl_embedgemma2_{load,free,embedding_dim,max_tokens,set_max_tokens,encode}`)
+and the multimodal ones (`tessl_embedgemma2_{load_multimodal,encode_images,encode_audio}`),
+additive at ABI 11; see `docs/embedgemma2.md`, From Python / C. The towers
+(G8) are in `tessl::embedgemma2_vision` / `embedgemma2_audio` and compose with
+the text encoder in `tessl::embedgemma2_mm`.
+
 ### G4. Tokenization is the caller's
 
 There is no tokenizer in tessl (`rg -l tokeniz src` finds only doc comments).
@@ -107,6 +115,65 @@ MiB, 736 with a commit between calls), and the three rows are one number
 carried by the freelist cache. Fixes: release before returning, a 16 MiB
 per-layer-input run (no measurable time), and aliasing qkv with gate|up
 (inferred 96 MiB).
+
+**Fixed (lane H)**; numbers in `embedgemma2_memory_m5pro.txt`, fresh process
+per cell, identical on a second run, **verified**:
+
+| Peak above the model, ExactF32 | 16f5190 | now |
+|---|---|---|
+| one encode, 32x256 / 8x1024 / 2x4096 | 736.5 / 736.3 / 736.3 MiB | 400.5 / 400.3 / 400.3 MiB |
+| four encodes back to back, same | 1472.7 / 1472.4 / 1472.3 MiB | 400.6 / 400.4 / 400.3 MiB |
+| four encodes back to back, 64x32 | 433.0 MiB | 112.9 MiB |
+| four encodes back to back, 1x16 | 4.25 MiB | 2.00 MiB |
+
+Bf16 goes 1456.4 → 392.4 MiB at 8x1024 (its set is 8 MiB smaller than
+ExactF32's: the half-width Q, K, V and per-layer gate save more than the four
+bf16 operand copies add). The three changes, each with the test that fails
+without it:
+
+* **Release before the wait** (the owner is `encode_impl`, not the pool). A
+  dropped pooled buffer waits in the runtime's deferred-release queue for the
+  next waiting commit; `encode` dropped its activations after its own wait,
+  so the next `encode` found the freelist empty and allocated a second set.
+  Dropping them (and each forward's uploaded inputs) before the wait lets that
+  same wait recycle them, and the deferred queue's strong reference keeps them
+  alive until it has finished. The pool's deferral is right (a buffer dropped
+  mid-batch may be bound by the open command buffer) and every other caller
+  relies on it; changing it would touch Qwen3.5 training and inference for a
+  fix `encode` can make alone. One host wait per `encode` is unchanged
+  (`tests/async_scope.rs`, `embedgemma2_tiny`'s wait and commit counts).
+  `consecutive_encodes_hold_one_activation_set` (`tests/embedgemma2_memory.rs`)
+  fails on 16f5190 (three more calls reach 2,981,888 bytes above the first, the
+  activations being 3,244,032) and passes now.
+* **`PLE_RUN_BYTES` 256 → 16 MiB.** The embeddings do not move one bit (real
+  checkpoint, both modes, six workloads; tiny model); time against the 256 MiB
+  bound, one binary, is 0.96 to 1.03 (median of rounds) and 0.90 to 1.00
+  (min-of-N) at 1024 to 8192 rows, inside the limits fixed in advance (one cell
+  read 1.0303 on a loaded series and 1.005 on its 12-round repeat). The whole
+  change against 16f5190 is min-of-N 0.86 to 1.05 over three paired series, but
+  the machine's round spread (1.2 to 28) is too wide to verify a 3 % bound
+  there: **unverified** at that precision, as the results file records. `the_per_layer_input_run_is_bounded_at_the_default` (a
+  device-free unit test in `embedgemma2::tests`) fails on 16f5190.
+* **qkv aliased with gate|up** (one buffer, `Acts::qkv` a clone of
+  `Acts::gate_up`). Safe because within a layer the q/k-norm-RoPE kernel is the
+  last reader of the first before the MLP's GEMM writes the second, the next
+  layer's q|k|v GEMM writes it again only after `gated_act` has read gate|up,
+  every dispatch is barriered against the one before, and both GEMM outputs are
+  f32 in both `GemmOperands` modes (the bf16 change moved only Q, K and V and
+  the per-layer gate, not these). Measured saving 96 MiB at 8192 rows, as
+  inferred. `one_encode_allocates_the_itemized_set` (to the byte, both modes)
+  fails on 16f5190.
+
+Not fixed, and why: the vision and audio towers (`embedgemma2_vision.rs`
+`encode`, `embedgemma2_audio.rs` `encode`) hold their activations across their
+own `synchronize` in the same shape, so a tower call followed by another
+leaves the same second set; their files belong to live lanes F and I. The
+repair is the same one line in each: build the `outs` from `pending`'s outputs
+and `drop(acts)` before the wait. The class fix in the pool (recycle at
+allocation time when no command buffer is open and the lifetime event has
+caught up) would cover every caller but changes when Qwen3.5's buffers
+return to the freelist, and needs the re-entrancy care `flush_residency`
+already shows (`active_m4` may be held); it is a follow-up, not bundled.
 
 ### G7. Many small elementwise dispatches per layer
 

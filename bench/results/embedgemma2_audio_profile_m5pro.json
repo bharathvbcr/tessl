@@ -1,0 +1,5029 @@
+{
+ "before": {
+  "workloads": [
+   {
+    "workload": "clip_1.0s",
+    "frames": 99,
+    "rows": 25,
+    "iters": 12,
+    "rounds": 5,
+    "soft_err": 5.679526480187018e-06,
+    "gpu_util_start": "90",
+    "gpu_util_end": "90",
+    "stages": [
+     {
+      "stage": "ffn down GEMM (4096->1024)",
+      "dispatches": 24,
+      "alone_ms": 4.889084,
+      "marginal_ms": 4.670624,
+      "tflops": 1.02947
+     },
+     {
+      "stage": "ffn up GEMM (1024->4096)",
+      "dispatches": 24,
+      "alone_ms": 2.290876,
+      "marginal_ms": 1.967707,
+      "tflops": 2.197048
+     },
+     {
+      "stage": "q/k/v GEMMs",
+      "dispatches": 36,
+      "alone_ms": 2.180126,
+      "marginal_ms": 1.785125,
+      "tflops": 0.865747
+     },
+     {
+      "stage": "lconv start GEMM (1024->2048)",
+      "dispatches": 12,
+      "alone_ms": 0.97175,
+      "marginal_ms": 0.441957,
+      "tflops": 1.294871
+     },
+     {
+      "stage": "lconv end GEMM",
+      "dispatches": 12,
+      "alone_ms": 0.846501,
+      "marginal_ms": 0.53975,
+      "tflops": 0.743231
+     },
+     {
+      "stage": "attn out GEMM",
+      "dispatches": 12,
+      "alone_ms": 0.839918,
+      "marginal_ms": 0.481582,
+      "tflops": 0.749056
+     },
+     {
+      "stage": "attention",
+      "dispatches": 12,
+      "alone_ms": 0.493167,
+      "marginal_ms": 0.349249,
+      "tflops": null
+     },
+     {
+      "stage": "subsample conv1+ln+relu",
+      "dispatches": 1,
+      "alone_ms": 0.413209,
+      "marginal_ms": 0.045333,
+      "tflops": null
+     },
+     {
+      "stage": "ffn clamp+silu",
+      "dispatches": 24,
+      "alone_ms": 0.221417,
+      "marginal_ms": 0.0,
+      "tflops": null
+     },
+     {
+      "stage": "output_proj GEMM",
+      "dispatches": 1,
+      "alone_ms": 0.212209,
+      "marginal_ms": 0.0,
+      "tflops": 0.370593
+     },
+     {
+      "stage": "embedding_projection GEMM",
+      "dispatches": 1,
+      "alone_ms": 0.211084,
+      "marginal_ms": 0.0,
+      "tflops": 0.186284
+     },
+     {
+      "stage": "ffn post-norm+resid",
+      "dispatches": 24,
+      "alone_ms": 0.210959,
+      "marginal_ms": 0.0,
+      "tflops": null
+     },
+     {
+      "stage": "q/k/v input clamps",
+      "dispatches": 36,
+      "alone_ms": 0.202167,
+      "marginal_ms": 0.132,
+      "tflops": null
+     },
+     {
+      "stage": "ffn pre-norm",
+      "dispatches": 24,
+      "alone_ms": 0.198042,
+      "marginal_ms": 0.0,
+      "tflops": null
+     },
+     {
+      "stage": "norm_out",
+      "dispatches": 12,
+      "alone_ms": 0.197959,
+      "marginal_ms": 0.0,
+      "tflops": null
+     },
+     {
+      "stage": "input_proj GEMM",
+      "dispatches": 1,
+      "alone_ms": 0.189792,
+      "marginal_ms": 0.0,
+      "tflops": 0.276243
+     },
+     {
+      "stage": "lconv depthwise conv",
+      "dispatches": 12,
+      "alone_ms": 0.174918,
+      "marginal_ms": 0.0,
+      "tflops": null
+     },
+     {
+      "stage": "lconv clamp+resid",
+      "dispatches": 12,
+      "alone_ms": 0.170459,
+      "marginal_ms": 0.0,
+      "tflops": null
+     },
+     {
+      "stage": "attn post-norm+resid",
+      "dispatches": 12,
+      "alone_ms": 0.169543,
+      "marginal_ms": 0.003707,
+      "tflops": null
+     },
+     {
+      "stage": "lconv conv-norm+silu",
+      "dispatches": 12,
+      "alone_ms": 0.169292,
+      "marginal_ms": 0.0,
+      "tflops": null
+     },
+     {
+      "stage": "subsample conv0+ln+relu",
+      "dispatches": 1,
+      "alone_ms": 0.165209,
+      "marginal_ms": 0.0,
+      "tflops": null
+     },
+     {
+      "stage": "lconv pre-norm",
+      "dispatches": 12,
+      "alone_ms": 0.162959,
+      "marginal_ms": 0.0,
+      "tflops": null
+     },
+     {
+      "stage": "attn pre-norm",
+      "dispatches": 12,
+      "alone_ms": 0.159209,
+      "marginal_ms": 0.013375,
+      "tflops": null
+     },
+     {
+      "stage": "lconv glu",
+      "dispatches": 12,
+      "alone_ms": 0.158251,
+      "marginal_ms": 0.0,
+      "tflops": null
+     },
+     {
+      "stage": "output bias",
+      "dispatches": 1,
+      "alone_ms": 0.133709,
+      "marginal_ms": 0.0,
+      "tflops": null
+     },
+     {
+      "stage": "embedder rms-norm",
+      "dispatches": 1,
+      "alone_ms": 0.129917,
+      "marginal_ms": 0.0,
+      "tflops": null
+     }
+    ],
+    "variants": [
+     {
+      "name": "encode",
+      "kind": "encode",
+      "dispatches": 343,
+      "contended_rounds": 5,
+      "rounds_ms": [
+       13.19125,
+       12.5065,
+       12.685708,
+       12.997708,
+       13.276542
+      ]
+     },
+     {
+      "name": "full",
+      "kind": "full",
+      "dispatches": 343,
+      "contended_rounds": 5,
+      "rounds_ms": [
+       13.6065,
+       12.496666,
+       13.3165,
+       12.938916,
+       13.369542
+      ]
+     },
+     {
+      "name": "none",
+      "kind": "none",
+      "dispatches": 0,
+      "contended_rounds": 5,
+      "rounds_ms": [
+       0.058542,
+       0.06275,
+       0.055416,
+       0.074625,
+       0.055417
+      ]
+     },
+     {
+      "name": "only:subsample conv0+ln+relu",
+      "kind": "only",
+      "dispatches": 1,
+      "contended_rounds": 5,
+      "rounds_ms": [
+       0.238875,
+       0.282583,
+       0.220625,
+       0.252584,
+       0.311416
+      ]
+     },
+     {
+      "name": "only:subsample conv1+ln+relu",
+      "kind": "only",
+      "dispatches": 1,
+      "contended_rounds": 5,
+      "rounds_ms": [
+       0.468625,
+       0.496084,
+       0.499583,
+       0.491333,
+       0.529
+      ]
+     },
+     {
+      "name": "only:input_proj GEMM",
+      "kind": "only",
+      "dispatches": 1,
+      "contended_rounds": 5,
+      "rounds_ms": [
+       0.293791,
+       0.245208,
+       0.323958,
+       0.250375,
+       0.28475
+      ]
+     },
+     {
+      "name": "only:ffn pre-norm",
+      "kind": "only",
+      "dispatches": 24,
+      "contended_rounds": 5,
+      "rounds_ms": [
+       0.338834,
+       0.253458,
+       0.421209,
+       0.318791,
+       0.347042
+      ]
+     },
+     {
+      "name": "only:ffn up GEMM (1024->4096)",
+      "kind": "only",
+      "dispatches": 24,
+      "contended_rounds": 5,
+      "rounds_ms": [
+       2.468625,
+       2.376125,
+       2.346292,
+       2.504875,
+       2.973125
+      ]
+     },
+     {
+      "name": "only:ffn clamp+silu",
+      "kind": "only",
+      "dispatches": 24,
+      "contended_rounds": 5,
+      "rounds_ms": [
+       0.318834,
+       0.276833,
+       0.298625,
+       0.299792,
+       0.33625
+      ]
+     },
+     {
+      "name": "only:ffn down GEMM (4096->1024)",
+      "kind": "only",
+      "dispatches": 24,
+      "contended_rounds": 5,
+      "rounds_ms": [
+       5.155,
+       4.971375,
+       4.9445,
+       5.321458,
+       5.356875
+      ]
+     },
+     {
+      "name": "only:ffn post-norm+resid",
+      "kind": "only",
+      "dispatches": 24,
+      "contended_rounds": 5,
+      "rounds_ms": [
+       0.344167,
+       0.356541,
+       0.266375,
+       0.28375,
+       0.386375
+      ]
+     },
+     {
+      "name": "only:attn pre-norm",
+      "kind": "only",
+      "dispatches": 12,
+      "contended_rounds": 5,
+      "rounds_ms": [
+       0.227167,
+       0.226666,
+       0.214625,
+       0.281125,
+       0.487667
+      ]
+     },
+     {
+      "name": "only:q/k/v input clamps",
+      "kind": "only",
+      "dispatches": 36,
+      "contended_rounds": 5,
+      "rounds_ms": [
+       0.265125,
+       0.3005,
+       0.257583,
+       0.285791,
+       0.592875
+      ]
+     },
+     {
+      "name": "only:q/k/v GEMMs",
+      "kind": "only",
+      "dispatches": 36,
+      "contended_rounds": 5,
+      "rounds_ms": [
+       2.311125,
+       2.257333,
+       2.290375,
+       2.235542,
+       3.07075
+      ]
+     },
+     {
+      "name": "only:attention",
+      "kind": "only",
+      "dispatches": 12,
+      "contended_rounds": 5,
+      "rounds_ms": [
+       0.571583,
+       0.577834,
+       0.548583,
+       0.62425,
+       1.331667
+      ]
+     },
+     {
+      "name": "only:attn out GEMM",
+      "kind": "only",
+      "dispatches": 12,
+      "contended_rounds": 5,
+      "rounds_ms": [
+       1.153584,
+       0.895334,
+       1.553917,
+       0.928042,
+       1.334792
+      ]
+     },
+     {
+      "name": "only:attn post-norm+resid",
+      "kind": "only",
+      "dispatches": 12,
+      "contended_rounds": 5,
+      "rounds_ms": [
+       0.234167,
+       0.224959,
+       0.312583,
+       0.274458,
+       0.309541
+      ]
+     },
+     {
+      "name": "only:lconv pre-norm",
+      "kind": "only",
+      "dispatches": 12,
+      "contended_rounds": 5,
+      "rounds_ms": [
+       0.228375,
+       0.218375,
+       0.347292,
+       0.261125,
+       0.306625
+      ]
+     },
+     {
+      "name": "only:lconv start GEMM (1024->2048)",
+      "kind": "only",
+      "dispatches": 12,
+      "contended_rounds": 5,
+      "rounds_ms": [
+       1.027166,
+       1.037125,
+       2.627708,
+       1.094833,
+       1.200625
+      ]
+     },
+     {
+      "name": "only:lconv glu",
+      "kind": "only",
+      "dispatches": 12,
+      "contended_rounds": 5,
+      "rounds_ms": [
+       0.362792,
+       0.213667,
+       0.378709,
+       0.254,
+       0.239791
+      ]
+     },
+     {
+      "name": "only:lconv depthwise conv",
+      "kind": "only",
+      "dispatches": 12,
+      "contended_rounds": 5,
+      "rounds_ms": [
+       0.351291,
+       0.230334,
+       0.411541,
+       0.269042,
+       0.292375
+      ]
+     },
+     {
+      "name": "only:lconv conv-norm+silu",
+      "kind": "only",
+      "dispatches": 12,
+      "contended_rounds": 5,
+      "rounds_ms": [
+       0.346458,
+       0.224708,
+       0.324625,
+       0.274042,
+       0.315084
+      ]
+     },
+     {
+      "name": "only:lconv end GEMM",
+      "kind": "only",
+      "dispatches": 12,
+      "contended_rounds": 5,
+      "rounds_ms": [
+       1.00825,
+       0.901917,
+       1.30025,
+       0.960791,
+       1.147875
+      ]
+     },
+     {
+      "name": "only:lconv clamp+resid",
+      "kind": "only",
+      "dispatches": 12,
+      "contended_rounds": 5,
+      "rounds_ms": [
+       0.302,
+       0.249417,
+       0.225875,
+       0.278667,
+       0.324875
+      ]
+     },
+     {
+      "name": "only:norm_out",
+      "kind": "only",
+      "dispatches": 12,
+      "contended_rounds": 5,
+      "rounds_ms": [
+       0.34475,
+       0.2555,
+       0.253375,
+       0.308125,
+       0.309625
+      ]
+     },
+     {
+      "name": "only:output_proj GEMM",
+      "kind": "only",
+      "dispatches": 1,
+      "contended_rounds": 5,
+      "rounds_ms": [
+       0.302333,
+       0.267625,
+       0.556417,
+       0.319666,
+       0.296041
+      ]
+     },
+     {
+      "name": "only:output bias",
+      "kind": "only",
+      "dispatches": 1,
+      "contended_rounds": 5,
+      "rounds_ms": [
+       0.236875,
+       0.262917,
+       0.189125,
+       0.245334,
+       2.149458
+      ]
+     },
+     {
+      "name": "only:embedder rms-norm",
+      "kind": "only",
+      "dispatches": 1,
+      "contended_rounds": 5,
+      "rounds_ms": [
+       0.185333,
+       0.212,
+       0.473875,
+       0.32075,
+       0.305584
+      ]
+     },
+     {
+      "name": "only:embedding_projection GEMM",
+      "kind": "only",
+      "dispatches": 1,
+      "contended_rounds": 5,
+      "rounds_ms": [
+       0.305375,
+       0.2665,
+       0.4875,
+       0.287875,
+       0.535416
+      ]
+     },
+     {
+      "name": "skip:subsample conv0+ln+relu",
+      "kind": "skip",
+      "dispatches": 342,
+      "contended_rounds": 5,
+      "rounds_ms": [
+       13.369708,
+       12.659416,
+       13.173875,
+       12.750417,
+       12.963292
+      ]
+     },
+     {
+      "name": "skip:subsample conv1+ln+relu",
+      "kind": "skip",
+      "dispatches": 342,
+      "contended_rounds": 5,
+      "rounds_ms": [
+       13.514291,
+       12.570333,
+       12.463667,
+       12.451333,
+       12.741667
+      ]
+     },
+     {
+      "name": "skip:input_proj GEMM",
+      "kind": "skip",
+      "dispatches": 342,
+      "contended_rounds": 5,
+      "rounds_ms": [
+       13.423166,
+       13.089334,
+       12.986,
+       12.6165,
+       12.820875
+      ]
+     },
+     {
+      "name": "skip:ffn pre-norm",
+      "kind": "skip",
+      "dispatches": 319,
+      "contended_rounds": 5,
+      "rounds_ms": [
+       13.380041,
+       12.964791,
+       12.970042,
+       13.42,
+       12.891
+      ]
+     },
+     {
+      "name": "skip:ffn up GEMM (1024->4096)",
+      "kind": "skip",
+      "dispatches": 319,
+      "contended_rounds": 5,
+      "rounds_ms": [
+       10.976334,
+       10.598709,
+       10.528959,
+       10.95875,
+       10.667375
+      ]
+     },
+     {
+      "name": "skip:ffn clamp+silu",
+      "kind": "skip",
+      "dispatches": 319,
+      "contended_rounds": 5,
+      "rounds_ms": [
+       13.07925,
+       13.878584,
+       12.816542,
+       13.27875,
+       12.675333
+      ]
+     },
+     {
+      "name": "skip:ffn down GEMM (4096->1024)",
+      "kind": "skip",
+      "dispatches": 319,
+      "contended_rounds": 5,
+      "rounds_ms": [
+       8.084584,
+       7.892708,
+       7.826042,
+       8.085125,
+       8.160625
+      ]
+     },
+     {
+      "name": "skip:ffn post-norm+resid",
+      "kind": "skip",
+      "dispatches": 319,
+      "contended_rounds": 5,
+      "rounds_ms": [
+       13.056,
+       12.65675,
+       12.539375,
+       13.215333,
+       12.575875
+      ]
+     },
+     {
+      "name": "skip:attn pre-norm",
+      "kind": "skip",
+      "dispatches": 331,
+      "contended_rounds": 5,
+      "rounds_ms": [
+       12.999041,
+       12.943833,
+       12.483291,
+       13.118625,
+       12.727
+      ]
+     },
+     {
+      "name": "skip:q/k/v input clamps",
+      "kind": "skip",
+      "dispatches": 307,
+      "contended_rounds": 5,
+      "rounds_ms": [
+       12.78175,
+       12.917875,
+       12.364666,
+       13.090917,
+       12.497334
+      ]
+     },
+     {
+      "name": "skip:q/k/v GEMMs",
+      "kind": "skip",
+      "dispatches": 307,
+      "contended_rounds": 5,
+      "rounds_ms": [
+       11.312958,
+       10.884833,
+       10.711541,
+       10.962375,
+       11.082708
+      ]
+     },
+     {
+      "name": "skip:attention",
+      "kind": "skip",
+      "dispatches": 331,
+      "contended_rounds": 5,
+      "rounds_ms": [
+       12.266417,
+       12.410542,
+       12.452208,
+       12.785542,
+       12.147417
+      ]
+     },
+     {
+      "name": "skip:attn out GEMM",
+      "kind": "skip",
+      "dispatches": 331,
+      "contended_rounds": 5,
+      "rounds_ms": [
+       12.313833,
+       12.243292,
+       12.184709,
+       12.383417,
+       12.015084
+      ]
+     },
+     {
+      "name": "skip:attn post-norm+resid",
+      "kind": "skip",
+      "dispatches": 331,
+      "contended_rounds": 5,
+      "rounds_ms": [
+       12.990458,
+       12.930666,
+       12.747708,
+       13.40225,
+       12.492959
+      ]
+     },
+     {
+      "name": "skip:lconv pre-norm",
+      "kind": "skip",
+      "dispatches": 331,
+      "contended_rounds": 5,
+      "rounds_ms": [
+       12.987458,
+       12.870292,
+       12.806333,
+       12.749209,
+       12.880458
+      ]
+     },
+     {
+      "name": "skip:lconv start GEMM (1024->2048)",
+      "kind": "skip",
+      "dispatches": 331,
+      "contended_rounds": 5,
+      "rounds_ms": [
+       12.206666,
+       12.054709,
+       12.084417,
+       12.440875,
+       12.367834
+      ]
+     },
+     {
+      "name": "skip:lconv glu",
+      "kind": "skip",
+      "dispatches": 331,
+      "contended_rounds": 5,
+      "rounds_ms": [
+       12.91575,
+       13.157042,
+       12.937625,
+       12.875583,
+       13.493416
+      ]
+     },
+     {
+      "name": "skip:lconv depthwise conv",
+      "kind": "skip",
+      "dispatches": 331,
+      "contended_rounds": 5,
+      "rounds_ms": [
+       13.679166,
+       12.629041,
+       12.789959,
+       13.036125,
+       12.727667
+      ]
+     },
+     {
+      "name": "skip:lconv conv-norm+silu",
+      "kind": "skip",
+      "dispatches": 331,
+      "contended_rounds": 5,
+      "rounds_ms": [
+       13.025958,
+       12.796458,
+       12.64575,
+       12.648959,
+       12.7255
+      ]
+     },
+     {
+      "name": "skip:lconv end GEMM",
+      "kind": "skip",
+      "dispatches": 331,
+      "contended_rounds": 5,
+      "rounds_ms": [
+       12.142458,
+       12.326458,
+       11.956916,
+       12.302292,
+       12.625209
+      ]
+     },
+     {
+      "name": "skip:lconv clamp+resid",
+      "kind": "skip",
+      "dispatches": 331,
+      "contended_rounds": 5,
+      "rounds_ms": [
+       13.316125,
+       13.140084,
+       12.996375,
+       12.753,
+       15.468833
+      ]
+     },
+     {
+      "name": "skip:norm_out",
+      "kind": "skip",
+      "dispatches": 331,
+      "contended_rounds": 5,
+      "rounds_ms": [
+       13.29775,
+       12.669542,
+       12.847667,
+       12.682041,
+       12.796
+      ]
+     },
+     {
+      "name": "skip:output_proj GEMM",
+      "kind": "skip",
+      "dispatches": 342,
+      "contended_rounds": 5,
+      "rounds_ms": [
+       12.844833,
+       12.701416,
+       13.041667,
+       12.782458,
+       13.126292
+      ]
+     },
+     {
+      "name": "skip:output bias",
+      "kind": "skip",
+      "dispatches": 342,
+      "contended_rounds": 5,
+      "rounds_ms": [
+       12.781459,
+       12.866042,
+       12.836333,
+       12.619875,
+       13.094708
+      ]
+     },
+     {
+      "name": "skip:embedder rms-norm",
+      "kind": "skip",
+      "dispatches": 342,
+      "contended_rounds": 5,
+      "rounds_ms": [
+       12.756875,
+       12.96075,
+       12.7375,
+       12.766,
+       12.95725
+      ]
+     },
+     {
+      "name": "skip:embedding_projection GEMM",
+      "kind": "skip",
+      "dispatches": 342,
+      "contended_rounds": 5,
+      "rounds_ms": [
+       12.876792,
+       13.272708,
+       12.812917,
+       12.861125,
+       12.624042
+      ]
+     }
+    ]
+   },
+   {
+    "workload": "clip_3.3s",
+    "frames": 330,
+    "rows": 83,
+    "iters": 12,
+    "rounds": 5,
+    "soft_err": 2.0829430995781158e-05,
+    "gpu_util_start": "90",
+    "gpu_util_end": "91",
+    "stages": [
+     {
+      "stage": "ffn down GEMM (4096->1024)",
+      "dispatches": 24,
+      "alone_ms": 4.970042,
+      "marginal_ms": 4.7315,
+      "tflops": 3.362166
+     },
+     {
+      "stage": "ffn up GEMM (1024->4096)",
+      "dispatches": 24,
+      "alone_ms": 3.7405,
+      "marginal_ms": 3.275083,
+      "tflops": 4.467346
+     },
+     {
+      "stage": "q/k/v GEMMs",
+      "dispatches": 36,
+      "alone_ms": 2.228708,
+      "marginal_ms": 1.081583,
+      "tflops": 2.811625
+     },
+     {
+      "stage": "lconv start GEMM (1024->2048)",
+      "dispatches": 12,
+      "alone_ms": 1.106292,
+      "marginal_ms": 0.596625,
+      "tflops": 3.776152
+     },
+     {
+      "stage": "subsample conv1+ln+relu",
+      "dispatches": 1,
+      "alone_ms": 1.07,
+      "marginal_ms": 1.189167,
+      "tflops": null
+     },
+     {
+      "stage": "attn out GEMM",
+      "dispatches": 12,
+      "alone_ms": 0.914584,
+      "marginal_ms": 0.0,
+      "tflops": 2.28384
+     },
+     {
+      "stage": "lconv end GEMM",
+      "dispatches": 12,
+      "alone_ms": 0.84475,
+      "marginal_ms": 0.0,
+      "tflops": 2.472641
+     },
+     {
+      "stage": "attention",
+      "dispatches": 12,
+      "alone_ms": 0.601042,
+      "marginal_ms": 0.0,
+      "tflops": null
+     },
+     {
+      "stage": "ffn clamp+silu",
+      "dispatches": 24,
+      "alone_ms": 0.50975,
+      "marginal_ms": 0.0,
+      "tflops": null
+     },
+     {
+      "stage": "subsample conv0+ln+relu",
+      "dispatches": 1,
+      "alone_ms": 0.356166,
+      "marginal_ms": 0.534208,
+      "tflops": null
+     },
+     {
+      "stage": "ffn pre-norm",
+      "dispatches": 24,
+      "alone_ms": 0.349292,
+      "marginal_ms": 0.502833,
+      "tflops": null
+     },
+     {
+      "stage": "ffn post-norm+resid",
+      "dispatches": 24,
+      "alone_ms": 0.348125,
+      "marginal_ms": 0.22425,
+      "tflops": null
+     },
+     {
+      "stage": "q/k/v input clamps",
+      "dispatches": 36,
+      "alone_ms": 0.338541,
+      "marginal_ms": 0.177708,
+      "tflops": null
+     },
+     {
+      "stage": "lconv depthwise conv",
+      "dispatches": 12,
+      "alone_ms": 0.296833,
+      "marginal_ms": 0.0,
+      "tflops": null
+     },
+     {
+      "stage": "embedding_projection GEMM",
+      "dispatches": 1,
+      "alone_ms": 0.2935,
+      "marginal_ms": 0.0,
+      "tflops": 0.444796
+     },
+     {
+      "stage": "output_proj GEMM",
+      "dispatches": 1,
+      "alone_ms": 0.278209,
+      "marginal_ms": 0.0,
+      "tflops": 0.938487
+     },
+     {
+      "stage": "norm_out",
+      "dispatches": 12,
+      "alone_ms": 0.274375,
+      "marginal_ms": 0.0,
+      "tflops": null
+     },
+     {
+      "stage": "input_proj GEMM",
+      "dispatches": 1,
+      "alone_ms": 0.272375,
+      "marginal_ms": 0.627542,
+      "tflops": 0.639059
+     },
+     {
+      "stage": "attn pre-norm",
+      "dispatches": 12,
+      "alone_ms": 0.272291,
+      "marginal_ms": 0.0,
+      "tflops": null
+     },
+     {
+      "stage": "lconv pre-norm",
+      "dispatches": 12,
+      "alone_ms": 0.270375,
+      "marginal_ms": 0.0,
+      "tflops": null
+     },
+     {
+      "stage": "lconv conv-norm+silu",
+      "dispatches": 12,
+      "alone_ms": 0.26975,
+      "marginal_ms": 0.0,
+      "tflops": null
+     },
+     {
+      "stage": "attn post-norm+resid",
+      "dispatches": 12,
+      "alone_ms": 0.267208,
+      "marginal_ms": 0.0,
+      "tflops": null
+     },
+     {
+      "stage": "lconv clamp+resid",
+      "dispatches": 12,
+      "alone_ms": 0.26025,
+      "marginal_ms": 0.0,
+      "tflops": null
+     },
+     {
+      "stage": "lconv glu",
+      "dispatches": 12,
+      "alone_ms": 0.253125,
+      "marginal_ms": 0.0,
+      "tflops": null
+     },
+     {
+      "stage": "output bias",
+      "dispatches": 1,
+      "alone_ms": 0.221208,
+      "marginal_ms": 0.0,
+      "tflops": null
+     },
+     {
+      "stage": "embedder rms-norm",
+      "dispatches": 1,
+      "alone_ms": 0.204792,
+      "marginal_ms": 0.0,
+      "tflops": null
+     }
+    ],
+    "variants": [
+     {
+      "name": "encode",
+      "kind": "encode",
+      "dispatches": 343,
+      "contended_rounds": 5,
+      "rounds_ms": [
+       15.456833,
+       15.691208,
+       15.430084,
+       16.135958,
+       16.019042
+      ]
+     },
+     {
+      "name": "full",
+      "kind": "full",
+      "dispatches": 343,
+      "contended_rounds": 5,
+      "rounds_ms": [
+       15.869209,
+       15.418625,
+       15.734958,
+       16.110666,
+       16.321917
+      ]
+     },
+     {
+      "name": "none",
+      "kind": "none",
+      "dispatches": 0,
+      "contended_rounds": 5,
+      "rounds_ms": [
+       0.188625,
+       0.17825,
+       0.182416,
+       0.196667,
+       0.183208
+      ]
+     },
+     {
+      "name": "only:subsample conv0+ln+relu",
+      "kind": "only",
+      "dispatches": 1,
+      "contended_rounds": 5,
+      "rounds_ms": [
+       0.583042,
+       0.604958,
+       0.5715,
+       0.534416,
+       0.653792
+      ]
+     },
+     {
+      "name": "only:subsample conv1+ln+relu",
+      "kind": "only",
+      "dispatches": 1,
+      "contended_rounds": 5,
+      "rounds_ms": [
+       1.359875,
+       1.249292,
+       1.24825,
+       1.258333,
+       1.323125
+      ]
+     },
+     {
+      "name": "only:input_proj GEMM",
+      "kind": "only",
+      "dispatches": 1,
+      "contended_rounds": 5,
+      "rounds_ms": [
+       0.481958,
+       0.495916,
+       0.566375,
+       0.450625,
+       0.461375
+      ]
+     },
+     {
+      "name": "only:ffn pre-norm",
+      "kind": "only",
+      "dispatches": 24,
+      "contended_rounds": 5,
+      "rounds_ms": [
+       0.563875,
+       0.527542,
+       0.61075,
+       0.599792,
+       0.549625
+      ]
+     },
+     {
+      "name": "only:ffn up GEMM (1024->4096)",
+      "kind": "only",
+      "dispatches": 24,
+      "contended_rounds": 5,
+      "rounds_ms": [
+       4.100791,
+       3.981458,
+       3.91875,
+       4.153875,
+       4.29925
+      ]
+     },
+     {
+      "name": "only:ffn clamp+silu",
+      "kind": "only",
+      "dispatches": 24,
+      "contended_rounds": 5,
+      "rounds_ms": [
+       1.407708,
+       0.738459,
+       0.728584,
+       0.688,
+       0.743084
+      ]
+     },
+     {
+      "name": "only:ffn down GEMM (4096->1024)",
+      "kind": "only",
+      "dispatches": 24,
+      "contended_rounds": 5,
+      "rounds_ms": [
+       5.15725,
+       5.281583,
+       5.20225,
+       5.148292,
+       5.191333
+      ]
+     },
+     {
+      "name": "only:ffn post-norm+resid",
+      "kind": "only",
+      "dispatches": 24,
+      "contended_rounds": 5,
+      "rounds_ms": [
+       3.866959,
+       0.526375,
+       0.535542,
+       0.549042,
+       0.568042
+      ]
+     },
+     {
+      "name": "only:attn pre-norm",
+      "kind": "only",
+      "dispatches": 12,
+      "contended_rounds": 5,
+      "rounds_ms": [
+       0.520584,
+       0.477958,
+       0.450541,
+       0.454416,
+       0.490959
+      ]
+     },
+     {
+      "name": "only:q/k/v input clamps",
+      "kind": "only",
+      "dispatches": 36,
+      "contended_rounds": 5,
+      "rounds_ms": [
+       0.537166,
+       0.537958,
+       0.516791,
+       0.596042,
+       0.57725
+      ]
+     },
+     {
+      "name": "only:q/k/v GEMMs",
+      "kind": "only",
+      "dispatches": 36,
+      "contended_rounds": 5,
+      "rounds_ms": [
+       2.601292,
+       2.446,
+       2.698708,
+       2.406958,
+       2.500959
+      ]
+     },
+     {
+      "name": "only:attention",
+      "kind": "only",
+      "dispatches": 12,
+      "contended_rounds": 5,
+      "rounds_ms": [
+       0.932375,
+       0.779292,
+       0.858667,
+       0.787958,
+       0.806917
+      ]
+     },
+     {
+      "name": "only:attn out GEMM",
+      "kind": "only",
+      "dispatches": 12,
+      "contended_rounds": 5,
+      "rounds_ms": [
+       1.508084,
+       1.092834,
+       1.144625,
+       1.1295,
+       1.112875
+      ]
+     },
+     {
+      "name": "only:attn post-norm+resid",
+      "kind": "only",
+      "dispatches": 12,
+      "contended_rounds": 5,
+      "rounds_ms": [
+       0.586417,
+       0.445458,
+       0.505042,
+       0.485708,
+       0.518833
+      ]
+     },
+     {
+      "name": "only:lconv pre-norm",
+      "kind": "only",
+      "dispatches": 12,
+      "contended_rounds": 5,
+      "rounds_ms": [
+       0.631458,
+       0.458709,
+       0.474959,
+       0.448625,
+       0.472458
+      ]
+     },
+     {
+      "name": "only:lconv start GEMM (1024->2048)",
+      "kind": "only",
+      "dispatches": 12,
+      "contended_rounds": 5,
+      "rounds_ms": [
+       3.012084,
+       1.400167,
+       1.366667,
+       1.373958,
+       1.284542
+      ]
+     },
+     {
+      "name": "only:lconv glu",
+      "kind": "only",
+      "dispatches": 12,
+      "contended_rounds": 5,
+      "rounds_ms": [
+       0.559959,
+       0.557917,
+       0.431375,
+       0.960959,
+       0.454083
+      ]
+     },
+     {
+      "name": "only:lconv depthwise conv",
+      "kind": "only",
+      "dispatches": 12,
+      "contended_rounds": 5,
+      "rounds_ms": [
+       0.564833,
+       0.475625,
+       0.513208,
+       0.538375,
+       0.475083
+      ]
+     },
+     {
+      "name": "only:lconv conv-norm+silu",
+      "kind": "only",
+      "dispatches": 12,
+      "contended_rounds": 5,
+      "rounds_ms": [
+       1.093458,
+       0.538167,
+       0.448,
+       0.483334,
+       0.453708
+      ]
+     },
+     {
+      "name": "only:lconv end GEMM",
+      "kind": "only",
+      "dispatches": 12,
+      "contended_rounds": 5,
+      "rounds_ms": [
+       2.857375,
+       1.166334,
+       1.023,
+       1.298167,
+       1.109792
+      ]
+     },
+     {
+      "name": "only:lconv clamp+resid",
+      "kind": "only",
+      "dispatches": 12,
+      "contended_rounds": 5,
+      "rounds_ms": [
+       0.478291,
+       0.485958,
+       0.459708,
+       0.4385,
+       0.500167
+      ]
+     },
+     {
+      "name": "only:norm_out",
+      "kind": "only",
+      "dispatches": 12,
+      "contended_rounds": 5,
+      "rounds_ms": [
+       0.637583,
+       0.467625,
+       0.452625,
+       0.456958,
+       0.561542
+      ]
+     },
+     {
+      "name": "only:output_proj GEMM",
+      "kind": "only",
+      "dispatches": 1,
+      "contended_rounds": 5,
+      "rounds_ms": [
+       0.633208,
+       0.549125,
+       0.456459,
+       0.4795,
+       0.505667
+      ]
+     },
+     {
+      "name": "only:output bias",
+      "kind": "only",
+      "dispatches": 1,
+      "contended_rounds": 5,
+      "rounds_ms": [
+       0.416875,
+       0.437583,
+       0.399458,
+       0.416292,
+       0.416292
+      ]
+     },
+     {
+      "name": "only:embedder rms-norm",
+      "kind": "only",
+      "dispatches": 1,
+      "contended_rounds": 5,
+      "rounds_ms": [
+       0.383042,
+       0.482417,
+       0.419417,
+       0.432708,
+       0.470708
+      ]
+     },
+     {
+      "name": "only:embedding_projection GEMM",
+      "kind": "only",
+      "dispatches": 1,
+      "contended_rounds": 5,
+      "rounds_ms": [
+       0.644791,
+       0.508334,
+       0.559875,
+       0.47175,
+       0.642375
+      ]
+     },
+     {
+      "name": "skip:subsample conv0+ln+relu",
+      "kind": "skip",
+      "dispatches": 342,
+      "contended_rounds": 5,
+      "rounds_ms": [
+       14.929083,
+       15.574125,
+       14.884417,
+       16.701834,
+       15.767209
+      ]
+     },
+     {
+      "name": "skip:subsample conv1+ln+relu",
+      "kind": "skip",
+      "dispatches": 342,
+      "contended_rounds": 5,
+      "rounds_ms": [
+       14.229458,
+       15.523542,
+       14.967791,
+       15.783833,
+       14.863667
+      ]
+     },
+     {
+      "name": "skip:input_proj GEMM",
+      "kind": "skip",
+      "dispatches": 342,
+      "contended_rounds": 5,
+      "rounds_ms": [
+       14.791083,
+       15.777,
+       15.189584,
+       16.509958,
+       15.806875
+      ]
+     },
+     {
+      "name": "skip:ffn pre-norm",
+      "kind": "skip",
+      "dispatches": 319,
+      "contended_rounds": 5,
+      "rounds_ms": [
+       14.915792,
+       16.226417,
+       15.206083,
+       16.934583,
+       16.166833
+      ]
+     },
+     {
+      "name": "skip:ffn up GEMM (1024->4096)",
+      "kind": "skip",
+      "dispatches": 319,
+      "contended_rounds": 5,
+      "rounds_ms": [
+       12.143542,
+       12.807875,
+       12.395625,
+       12.938,
+       12.726334
+      ]
+     },
+     {
+      "name": "skip:ffn clamp+silu",
+      "kind": "skip",
+      "dispatches": 319,
+      "contended_rounds": 5,
+      "rounds_ms": [
+       15.558083,
+       16.374458,
+       15.821416,
+       16.557958,
+       16.704875
+      ]
+     },
+     {
+      "name": "skip:ffn down GEMM (4096->1024)",
+      "kind": "skip",
+      "dispatches": 319,
+      "contended_rounds": 5,
+      "rounds_ms": [
+       10.687125,
+       11.590208,
+       11.055167,
+       11.964875,
+       10.976708
+      ]
+     },
+     {
+      "name": "skip:ffn post-norm+resid",
+      "kind": "skip",
+      "dispatches": 319,
+      "contended_rounds": 5,
+      "rounds_ms": [
+       15.194375,
+       16.649959,
+       16.503958,
+       16.848666,
+       15.917583
+      ]
+     },
+     {
+      "name": "skip:attn pre-norm",
+      "kind": "skip",
+      "dispatches": 331,
+      "contended_rounds": 5,
+      "rounds_ms": [
+       15.957209,
+       16.846334,
+       16.303416,
+       16.928208,
+       18.78775
+      ]
+     },
+     {
+      "name": "skip:q/k/v input clamps",
+      "kind": "skip",
+      "dispatches": 307,
+      "contended_rounds": 5,
+      "rounds_ms": [
+       15.240917,
+       16.338209,
+       16.085083,
+       17.3225,
+       16.528833
+      ]
+     },
+     {
+      "name": "skip:q/k/v GEMMs",
+      "kind": "skip",
+      "dispatches": 307,
+      "contended_rounds": 5,
+      "rounds_ms": [
+       14.37375,
+       14.516875,
+       14.337042,
+       15.632791,
+       15.371375
+      ]
+     },
+     {
+      "name": "skip:attention",
+      "kind": "skip",
+      "dispatches": 331,
+      "contended_rounds": 5,
+      "rounds_ms": [
+       15.93775,
+       16.229916,
+       15.918625,
+       15.490292,
+       18.19375
+      ]
+     },
+     {
+      "name": "skip:attn out GEMM",
+      "kind": "skip",
+      "dispatches": 331,
+      "contended_rounds": 5,
+      "rounds_ms": [
+       15.849875,
+       15.655958,
+       15.504292,
+       17.3745,
+       18.280625
+      ]
+     },
+     {
+      "name": "skip:attn post-norm+resid",
+      "kind": "skip",
+      "dispatches": 331,
+      "contended_rounds": 5,
+      "rounds_ms": [
+       16.528166,
+       16.558208,
+       16.5305,
+       17.901792,
+       18.3355
+      ]
+     },
+     {
+      "name": "skip:lconv pre-norm",
+      "kind": "skip",
+      "dispatches": 331,
+      "contended_rounds": 5,
+      "rounds_ms": [
+       16.975167,
+       15.778833,
+       16.038084,
+       18.180041,
+       17.943833
+      ]
+     },
+     {
+      "name": "skip:lconv start GEMM (1024->2048)",
+      "kind": "skip",
+      "dispatches": 331,
+      "contended_rounds": 5,
+      "rounds_ms": [
+       15.836583,
+       14.822,
+       15.135125,
+       17.369042,
+       16.135
+      ]
+     },
+     {
+      "name": "skip:lconv glu",
+      "kind": "skip",
+      "dispatches": 331,
+      "contended_rounds": 5,
+      "rounds_ms": [
+       17.148208,
+       16.074125,
+       15.697333,
+       18.510083,
+       17.590959
+      ]
+     },
+     {
+      "name": "skip:lconv depthwise conv",
+      "kind": "skip",
+      "dispatches": 331,
+      "contended_rounds": 5,
+      "rounds_ms": [
+       17.018417,
+       15.876292,
+       16.463334,
+       17.761375,
+       17.595375
+      ]
+     },
+     {
+      "name": "skip:lconv conv-norm+silu",
+      "kind": "skip",
+      "dispatches": 331,
+      "contended_rounds": 5,
+      "rounds_ms": [
+       17.085417,
+       16.028416,
+       16.361833,
+       16.547833,
+       16.521583
+      ]
+     },
+     {
+      "name": "skip:lconv end GEMM",
+      "kind": "skip",
+      "dispatches": 331,
+      "contended_rounds": 5,
+      "rounds_ms": [
+       16.210875,
+       16.293125,
+       15.744083,
+       15.863458,
+       16.299958
+      ]
+     },
+     {
+      "name": "skip:lconv clamp+resid",
+      "kind": "skip",
+      "dispatches": 331,
+      "contended_rounds": 5,
+      "rounds_ms": [
+       17.114458,
+       16.754042,
+       16.6615,
+       16.656209,
+       16.880292
+      ]
+     },
+     {
+      "name": "skip:norm_out",
+      "kind": "skip",
+      "dispatches": 331,
+      "contended_rounds": 5,
+      "rounds_ms": [
+       16.390709,
+       17.209958,
+       16.356916,
+       15.9455,
+       16.812625
+      ]
+     },
+     {
+      "name": "skip:output_proj GEMM",
+      "kind": "skip",
+      "dispatches": 342,
+      "contended_rounds": 5,
+      "rounds_ms": [
+       16.86925,
+       16.75525,
+       16.29275,
+       16.012042,
+       16.929084
+      ]
+     },
+     {
+      "name": "skip:output bias",
+      "kind": "skip",
+      "dispatches": 342,
+      "contended_rounds": 5,
+      "rounds_ms": [
+       16.516958,
+       16.732708,
+       16.276292,
+       16.186958,
+       17.366708
+      ]
+     },
+     {
+      "name": "skip:embedder rms-norm",
+      "kind": "skip",
+      "dispatches": 342,
+      "contended_rounds": 5,
+      "rounds_ms": [
+       16.855667,
+       16.811833,
+       16.406833,
+       16.198042,
+       17.251042
+      ]
+     },
+     {
+      "name": "skip:embedding_projection GEMM",
+      "kind": "skip",
+      "dispatches": 342,
+      "contended_rounds": 5,
+      "rounds_ms": [
+       17.1855,
+       16.423,
+       16.570584,
+       16.66875,
+       17.061833
+      ]
+     }
+    ]
+   },
+   {
+    "workload": "batch_8x30s",
+    "frames": 24000,
+    "rows": 6000,
+    "iters": 2,
+    "rounds": 5,
+    "soft_err": null,
+    "gpu_util_start": "99",
+    "gpu_util_end": "99",
+    "stages": [
+     {
+      "stage": "ffn up GEMM (1024->4096)",
+      "dispatches": 48,
+      "alone_ms": 182.214625,
+      "marginal_ms": 209.999667,
+      "tflops": 6.629323
+     },
+     {
+      "stage": "ffn down GEMM (4096->1024)",
+      "dispatches": 48,
+      "alone_ms": 168.244416,
+      "marginal_ms": 157.798292,
+      "tflops": 7.17979
+     },
+     {
+      "stage": "q/k/v GEMMs",
+      "dispatches": 72,
+      "alone_ms": 89.093042,
+      "marginal_ms": 56.654167,
+      "tflops": 5.084402
+     },
+     {
+      "stage": "subsample conv1+ln+relu",
+      "dispatches": 2,
+      "alone_ms": 64.064291,
+      "marginal_ms": 110.460625,
+      "tflops": null
+     },
+     {
+      "stage": "lconv start GEMM (1024->2048)",
+      "dispatches": 24,
+      "alone_ms": 47.95875,
+      "marginal_ms": 2.51375,
+      "tflops": 6.296867
+     },
+     {
+      "stage": "lconv end GEMM",
+      "dispatches": 24,
+      "alone_ms": 32.935374,
+      "marginal_ms": 0.0,
+      "tflops": 4.584583
+     },
+     {
+      "stage": "attn out GEMM",
+      "dispatches": 24,
+      "alone_ms": 28.291625,
+      "marginal_ms": 16.998791,
+      "tflops": 5.33709
+     },
+     {
+      "stage": "ffn clamp+silu",
+      "dispatches": 48,
+      "alone_ms": 21.800542,
+      "marginal_ms": 0.0,
+      "tflops": null
+     },
+     {
+      "stage": "lconv depthwise conv",
+      "dispatches": 24,
+      "alone_ms": 21.669708,
+      "marginal_ms": 0.0,
+      "tflops": null
+     },
+     {
+      "stage": "attention",
+      "dispatches": 24,
+      "alone_ms": 21.447749,
+      "marginal_ms": 0.0,
+      "tflops": null
+     },
+     {
+      "stage": "subsample conv0+ln+relu",
+      "dispatches": 2,
+      "alone_ms": 17.010625,
+      "marginal_ms": 98.771708,
+      "tflops": null
+     },
+     {
+      "stage": "attn post-norm+resid",
+      "dispatches": 24,
+      "alone_ms": 13.022833,
+      "marginal_ms": 0.0,
+      "tflops": null
+     },
+     {
+      "stage": "output_proj GEMM",
+      "dispatches": 2,
+      "alone_ms": 9.951083,
+      "marginal_ms": 0.0,
+      "tflops": 1.896715
+     },
+     {
+      "stage": "ffn post-norm+resid",
+      "dispatches": 48,
+      "alone_ms": 9.589041,
+      "marginal_ms": 0.0,
+      "tflops": null
+     },
+     {
+      "stage": "output bias",
+      "dispatches": 2,
+      "alone_ms": 9.055375,
+      "marginal_ms": 0.0,
+      "tflops": null
+     },
+     {
+      "stage": "norm_out",
+      "dispatches": 24,
+      "alone_ms": 8.9385,
+      "marginal_ms": 0.0,
+      "tflops": null
+     },
+     {
+      "stage": "q/k/v input clamps",
+      "dispatches": 72,
+      "alone_ms": 8.224667,
+      "marginal_ms": 0.0,
+      "tflops": null
+     },
+     {
+      "stage": "ffn pre-norm",
+      "dispatches": 48,
+      "alone_ms": 6.958292,
+      "marginal_ms": 0.0,
+      "tflops": null
+     },
+     {
+      "stage": "lconv clamp+resid",
+      "dispatches": 24,
+      "alone_ms": 6.393708,
+      "marginal_ms": 0.0,
+      "tflops": null
+     },
+     {
+      "stage": "lconv pre-norm",
+      "dispatches": 24,
+      "alone_ms": 5.958416,
+      "marginal_ms": 0.0,
+      "tflops": null
+     },
+     {
+      "stage": "embedder rms-norm",
+      "dispatches": 2,
+      "alone_ms": 5.474375,
+      "marginal_ms": 0.0,
+      "tflops": null
+     },
+     {
+      "stage": "embedding_projection GEMM",
+      "dispatches": 2,
+      "alone_ms": 5.205375,
+      "marginal_ms": 0.0,
+      "tflops": 1.812969
+     },
+     {
+      "stage": "lconv glu",
+      "dispatches": 24,
+      "alone_ms": 4.881666,
+      "marginal_ms": 0.0,
+      "tflops": null
+     },
+     {
+      "stage": "input_proj GEMM",
+      "dispatches": 2,
+      "alone_ms": 4.707916,
+      "marginal_ms": 8.214167,
+      "tflops": 2.672714
+     },
+     {
+      "stage": "attn pre-norm",
+      "dispatches": 24,
+      "alone_ms": 3.954208,
+      "marginal_ms": 0.0,
+      "tflops": null
+     },
+     {
+      "stage": "lconv conv-norm+silu",
+      "dispatches": 24,
+      "alone_ms": 3.558833,
+      "marginal_ms": 0.0,
+      "tflops": null
+     }
+    ],
+    "variants": [
+     {
+      "name": "encode",
+      "kind": "encode",
+      "dispatches": 686,
+      "contended_rounds": 5,
+      "rounds_ms": [
+       801.214417,
+       861.276,
+       854.517416,
+       925.9405,
+       927.358667
+      ]
+     },
+     {
+      "name": "full",
+      "kind": "full",
+      "dispatches": 686,
+      "contended_rounds": 5,
+      "rounds_ms": [
+       782.15575,
+       793.3015,
+       849.261125,
+       869.528834,
+       929.495166
+      ]
+     },
+     {
+      "name": "none",
+      "kind": "none",
+      "dispatches": 0,
+      "contended_rounds": 5,
+      "rounds_ms": [
+       19.072167,
+       43.298042,
+       19.629875,
+       15.220292,
+       20.929541
+      ]
+     },
+     {
+      "name": "only:subsample conv0+ln+relu",
+      "kind": "only",
+      "dispatches": 2,
+      "contended_rounds": 5,
+      "rounds_ms": [
+       33.234292,
+       32.519208,
+       32.230917,
+       40.488417,
+       34.529
+      ]
+     },
+     {
+      "name": "only:subsample conv1+ln+relu",
+      "kind": "only",
+      "dispatches": 2,
+      "contended_rounds": 5,
+      "rounds_ms": [
+       79.284583,
+       80.140042,
+       89.387167,
+       89.87675,
+       89.575
+      ]
+     },
+     {
+      "name": "only:input_proj GEMM",
+      "kind": "only",
+      "dispatches": 2,
+      "contended_rounds": 5,
+      "rounds_ms": [
+       19.928208,
+       27.277292,
+       37.307292,
+       22.293959,
+       23.809666
+      ]
+     },
+     {
+      "name": "only:ffn pre-norm",
+      "kind": "only",
+      "dispatches": 48,
+      "contended_rounds": 5,
+      "rounds_ms": [
+       22.178584,
+       22.38575,
+       65.040625,
+       24.69825,
+       37.332375
+      ]
+     },
+     {
+      "name": "only:ffn up GEMM (1024->4096)",
+      "kind": "only",
+      "dispatches": 48,
+      "contended_rounds": 5,
+      "rounds_ms": [
+       197.434917,
+       228.558042,
+       252.28775,
+       280.648542,
+       250.769708
+      ]
+     },
+     {
+      "name": "only:ffn clamp+silu",
+      "kind": "only",
+      "dispatches": 48,
+      "contended_rounds": 5,
+      "rounds_ms": [
+       37.020834,
+       39.580583,
+       43.131125,
+       118.805,
+       44.510209
+      ]
+     },
+     {
+      "name": "only:ffn down GEMM (4096->1024)",
+      "kind": "only",
+      "dispatches": 48,
+      "contended_rounds": 5,
+      "rounds_ms": [
+       183.464708,
+       218.619,
+       214.7305,
+       294.617458,
+       233.045167
+      ]
+     },
+     {
+      "name": "only:ffn post-norm+resid",
+      "kind": "only",
+      "dispatches": 48,
+      "contended_rounds": 5,
+      "rounds_ms": [
+       25.891542,
+       24.809333,
+       28.967375,
+       37.692666,
+       38.830416
+      ]
+     },
+     {
+      "name": "only:attn pre-norm",
+      "kind": "only",
+      "dispatches": 24,
+      "contended_rounds": 5,
+      "rounds_ms": [
+       19.1745,
+       54.111583,
+       25.402625,
+       33.198167,
+       29.237167
+      ]
+     },
+     {
+      "name": "only:q/k/v input clamps",
+      "kind": "only",
+      "dispatches": 72,
+      "contended_rounds": 5,
+      "rounds_ms": [
+       28.206292,
+       23.444959,
+       58.168,
+       74.839375,
+       34.102208
+      ]
+     },
+     {
+      "name": "only:q/k/v GEMMs",
+      "kind": "only",
+      "dispatches": 72,
+      "contended_rounds": 5,
+      "rounds_ms": [
+       129.012,
+       104.313334,
+       105.499542,
+       154.877541,
+       105.5315
+      ]
+     },
+     {
+      "name": "only:attention",
+      "kind": "only",
+      "dispatches": 24,
+      "contended_rounds": 5,
+      "rounds_ms": [
+       36.668041,
+       51.833666,
+       52.935875,
+       74.897334,
+       49.458208
+      ]
+     },
+     {
+      "name": "only:attn out GEMM",
+      "kind": "only",
+      "dispatches": 24,
+      "contended_rounds": 5,
+      "rounds_ms": [
+       47.027958,
+       43.511917,
+       44.334125,
+       68.00925,
+       51.374541
+      ]
+     },
+     {
+      "name": "only:attn post-norm+resid",
+      "kind": "only",
+      "dispatches": 24,
+      "contended_rounds": 5,
+      "rounds_ms": [
+       36.406833,
+       46.035917,
+       30.467833,
+       31.971084,
+       28.243125
+      ]
+     },
+     {
+      "name": "only:lconv pre-norm",
+      "kind": "only",
+      "dispatches": 24,
+      "contended_rounds": 5,
+      "rounds_ms": [
+       21.178708,
+       23.159458,
+       23.613209,
+       31.264333,
+       24.381625
+      ]
+     },
+     {
+      "name": "only:lconv start GEMM (1024->2048)",
+      "kind": "only",
+      "dispatches": 24,
+      "contended_rounds": 5,
+      "rounds_ms": [
+       63.179042,
+       150.33275,
+       76.425125,
+       107.882083,
+       77.079667
+      ]
+     },
+     {
+      "name": "only:lconv glu",
+      "kind": "only",
+      "dispatches": 24,
+      "contended_rounds": 5,
+      "rounds_ms": [
+       20.101958,
+       29.480792,
+       24.079959,
+       41.679959,
+       44.7385
+      ]
+     },
+     {
+      "name": "only:lconv depthwise conv",
+      "kind": "only",
+      "dispatches": 24,
+      "contended_rounds": 5,
+      "rounds_ms": [
+       52.930458,
+       51.275125,
+       71.883125,
+       40.1745,
+       36.89
+      ]
+     },
+     {
+      "name": "only:lconv conv-norm+silu",
+      "kind": "only",
+      "dispatches": 24,
+      "contended_rounds": 5,
+      "rounds_ms": [
+       26.027458,
+       21.979667,
+       19.549791,
+       32.025167,
+       18.779125
+      ]
+     },
+     {
+      "name": "only:lconv end GEMM",
+      "kind": "only",
+      "dispatches": 24,
+      "contended_rounds": 5,
+      "rounds_ms": [
+       48.155666,
+       50.473792,
+       55.767667,
+       81.740667,
+       49.820834
+      ]
+     },
+     {
+      "name": "only:lconv clamp+resid",
+      "kind": "only",
+      "dispatches": 24,
+      "contended_rounds": 5,
+      "rounds_ms": [
+       21.614,
+       56.93775,
+       46.459584,
+       37.443666,
+       31.159625
+      ]
+     },
+     {
+      "name": "only:norm_out",
+      "kind": "only",
+      "dispatches": 24,
+      "contended_rounds": 5,
+      "rounds_ms": [
+       42.427625,
+       76.034,
+       40.692459,
+       26.832875,
+       24.158792
+      ]
+     },
+     {
+      "name": "only:output_proj GEMM",
+      "kind": "only",
+      "dispatches": 2,
+      "contended_rounds": 5,
+      "rounds_ms": [
+       25.171375,
+       28.264584,
+       39.495833,
+       29.636125,
+       26.166792
+      ]
+     },
+     {
+      "name": "only:output bias",
+      "kind": "only",
+      "dispatches": 2,
+      "contended_rounds": 5,
+      "rounds_ms": [
+       34.249541,
+       54.414792,
+       31.542917,
+       25.223333,
+       24.275667
+      ]
+     },
+     {
+      "name": "only:embedder rms-norm",
+      "kind": "only",
+      "dispatches": 2,
+      "contended_rounds": 5,
+      "rounds_ms": [
+       23.298459,
+       20.694667,
+       28.460375,
+       21.252958,
+       27.952792
+      ]
+     },
+     {
+      "name": "only:embedding_projection GEMM",
+      "kind": "only",
+      "dispatches": 2,
+      "contended_rounds": 5,
+      "rounds_ms": [
+       30.054667,
+       20.425667,
+       46.657459,
+       26.00025,
+       26.71575
+      ]
+     },
+     {
+      "name": "skip:subsample conv0+ln+relu",
+      "kind": "skip",
+      "dispatches": 684,
+      "contended_rounds": 5,
+      "rounds_ms": [
+       683.384042,
+       842.485666,
+       792.446875,
+       1456.757541,
+       865.391792
+      ]
+     },
+     {
+      "name": "skip:subsample conv1+ln+relu",
+      "kind": "skip",
+      "dispatches": 684,
+      "contended_rounds": 5,
+      "rounds_ms": [
+       671.695125,
+       788.397417,
+       773.72175,
+       1319.791292,
+       871.931416
+      ]
+     },
+     {
+      "name": "skip:input_proj GEMM",
+      "kind": "skip",
+      "dispatches": 684,
+      "contended_rounds": 5,
+      "rounds_ms": [
+       773.941583,
+       852.660667,
+       862.402834,
+       938.502459,
+       945.366416
+      ]
+     },
+     {
+      "name": "skip:ffn pre-norm",
+      "kind": "skip",
+      "dispatches": 638,
+      "contended_rounds": 5,
+      "rounds_ms": [
+       804.55425,
+       841.794542,
+       846.713125,
+       1636.201541,
+       997.253667
+      ]
+     },
+     {
+      "name": "skip:ffn up GEMM (1024->4096)",
+      "kind": "skip",
+      "dispatches": 638,
+      "contended_rounds": 5,
+      "rounds_ms": [
+       572.156083,
+       616.84225,
+       611.066292,
+       1281.0425,
+       1276.092625
+      ]
+     },
+     {
+      "name": "skip:ffn clamp+silu",
+      "kind": "skip",
+      "dispatches": 638,
+      "contended_rounds": 5,
+      "rounds_ms": [
+       856.773,
+       814.8985,
+       819.137,
+       1645.839333,
+       1206.0825
+      ]
+     },
+     {
+      "name": "skip:ffn down GEMM (4096->1024)",
+      "kind": "skip",
+      "dispatches": 638,
+      "contended_rounds": 5,
+      "rounds_ms": [
+       624.357458,
+       629.483666,
+       629.111916,
+       1249.651833,
+       675.193625
+      ]
+     },
+     {
+      "name": "skip:ffn post-norm+resid",
+      "kind": "skip",
+      "dispatches": 638,
+      "contended_rounds": 5,
+      "rounds_ms": [
+       836.211833,
+       849.496667,
+       832.153958,
+       1799.164709,
+       1492.698083
+      ]
+     },
+     {
+      "name": "skip:attn pre-norm",
+      "kind": "skip",
+      "dispatches": 662,
+      "contended_rounds": 5,
+      "rounds_ms": [
+       800.605208,
+       855.638667,
+       850.986458,
+       1678.381,
+       924.850917
+      ]
+     },
+     {
+      "name": "skip:q/k/v input clamps",
+      "kind": "skip",
+      "dispatches": 614,
+      "contended_rounds": 5,
+      "rounds_ms": [
+       841.805916,
+       847.486833,
+       848.3985,
+       1580.512625,
+       929.603208
+      ]
+     },
+     {
+      "name": "skip:q/k/v GEMMs",
+      "kind": "skip",
+      "dispatches": 614,
+      "contended_rounds": 5,
+      "rounds_ms": [
+       725.501583,
+       771.137542,
+       785.031125,
+       1161.364833,
+       1299.008083
+      ]
+     },
+     {
+      "name": "skip:attention",
+      "kind": "skip",
+      "dispatches": 662,
+      "contended_rounds": 5,
+      "rounds_ms": [
+       808.473875,
+       830.368167,
+       822.095,
+       915.864666,
+       1632.105917
+      ]
+     },
+     {
+      "name": "skip:attn out GEMM",
+      "kind": "skip",
+      "dispatches": 662,
+      "contended_rounds": 5,
+      "rounds_ms": [
+       765.156959,
+       832.937541,
+       828.163958,
+       1423.901167,
+       909.778625
+      ]
+     },
+     {
+      "name": "skip:attn post-norm+resid",
+      "kind": "skip",
+      "dispatches": 662,
+      "contended_rounds": 5,
+      "rounds_ms": [
+       816.632833,
+       853.507791,
+       847.898958,
+       1415.383084,
+       1646.5995
+      ]
+     },
+     {
+      "name": "skip:lconv pre-norm",
+      "kind": "skip",
+      "dispatches": 662,
+      "contended_rounds": 5,
+      "rounds_ms": [
+       825.955667,
+       852.21075,
+       851.747166,
+       1370.234042,
+       958.388583
+      ]
+     },
+     {
+      "name": "skip:lconv start GEMM (1024->2048)",
+      "kind": "skip",
+      "dispatches": 662,
+      "contended_rounds": 5,
+      "rounds_ms": [
+       779.642,
+       797.582167,
+       792.742375,
+       954.166375,
+       1265.6835
+      ]
+     },
+     {
+      "name": "skip:lconv glu",
+      "kind": "skip",
+      "dispatches": 662,
+      "contended_rounds": 5,
+      "rounds_ms": [
+       831.198458,
+       858.104,
+       844.029458,
+       894.109416,
+       906.156916
+      ]
+     },
+     {
+      "name": "skip:lconv depthwise conv",
+      "kind": "skip",
+      "dispatches": 662,
+      "contended_rounds": 5,
+      "rounds_ms": [
+       838.368,
+       891.503208,
+       850.224833,
+       1504.0505,
+       1413.847583
+      ]
+     },
+     {
+      "name": "skip:lconv conv-norm+silu",
+      "kind": "skip",
+      "dispatches": 662,
+      "contended_rounds": 5,
+      "rounds_ms": [
+       840.699708,
+       842.419541,
+       848.590209,
+       1825.970375,
+       2040.408292
+      ]
+     },
+     {
+      "name": "skip:lconv end GEMM",
+      "kind": "skip",
+      "dispatches": 662,
+      "contended_rounds": 5,
+      "rounds_ms": [
+       809.48925,
+       819.663833,
+       828.40275,
+       1835.005667,
+       931.735084
+      ]
+     },
+     {
+      "name": "skip:lconv clamp+resid",
+      "kind": "skip",
+      "dispatches": 662,
+      "contended_rounds": 5,
+      "rounds_ms": [
+       841.531667,
+       847.759916,
+       846.765833,
+       1673.174416,
+       2049.932875
+      ]
+     },
+     {
+      "name": "skip:norm_out",
+      "kind": "skip",
+      "dispatches": 662,
+      "contended_rounds": 5,
+      "rounds_ms": [
+       848.235709,
+       847.32275,
+       850.459833,
+       1546.125375,
+       944.221542
+      ]
+     },
+     {
+      "name": "skip:output_proj GEMM",
+      "kind": "skip",
+      "dispatches": 684,
+      "contended_rounds": 5,
+      "rounds_ms": [
+       847.691666,
+       845.519292,
+       848.626125,
+       1504.587334,
+       959.543708
+      ]
+     },
+     {
+      "name": "skip:output bias",
+      "kind": "skip",
+      "dispatches": 684,
+      "contended_rounds": 5,
+      "rounds_ms": [
+       850.647292,
+       848.66625,
+       850.916958,
+       875.662042,
+       934.875708
+      ]
+     },
+     {
+      "name": "skip:embedder rms-norm",
+      "kind": "skip",
+      "dispatches": 684,
+      "contended_rounds": 5,
+      "rounds_ms": [
+       849.326875,
+       851.798625,
+       853.866916,
+       864.246708,
+       988.01025
+      ]
+     },
+     {
+      "name": "skip:embedding_projection GEMM",
+      "kind": "skip",
+      "dispatches": 684,
+      "contended_rounds": 5,
+      "rounds_ms": [
+       851.056167,
+       859.127958,
+       854.836917,
+       863.8435,
+       919.735542
+      ]
+     }
+    ]
+   }
+  ]
+ },
+ "after": {
+  "workloads": [
+   {
+    "workload": "clip_1.0s",
+    "frames": 99,
+    "rows": 25,
+    "iters": 12,
+    "rounds": 7,
+    "soft_err": 3.8057482766826946e-06,
+    "gpu_util_start": "99",
+    "gpu_util_end": "99",
+    "stages": [
+     {
+      "stage": "ffn down GEMM (4096->1024)",
+      "dispatches": 24,
+      "alone_ms": 8.56375,
+      "marginal_ms": 11.005125,
+      "tflops": 0.587729
+     },
+     {
+      "stage": "ffn up GEMM (1024->4096)",
+      "dispatches": 24,
+      "alone_ms": 3.309125,
+      "marginal_ms": 2.303875,
+      "tflops": 1.520996
+     },
+     {
+      "stage": "q/k/v GEMMs",
+      "dispatches": 12,
+      "alone_ms": 1.739917,
+      "marginal_ms": 3.970125,
+      "tflops": 1.084786
+     },
+     {
+      "stage": "lconv start GEMM (1024->2048)",
+      "dispatches": 12,
+      "alone_ms": 1.548291,
+      "marginal_ms": 6.812042,
+      "tflops": 0.812697
+     },
+     {
+      "stage": "attn out GEMM",
+      "dispatches": 12,
+      "alone_ms": 1.425375,
+      "marginal_ms": 6.682791,
+      "tflops": 0.44139
+     },
+     {
+      "stage": "lconv end GEMM",
+      "dispatches": 12,
+      "alone_ms": 1.241208,
+      "marginal_ms": 0.0,
+      "tflops": 0.506882
+     },
+     {
+      "stage": "attention",
+      "dispatches": 12,
+      "alone_ms": 0.742333,
+      "marginal_ms": 6.022417,
+      "tflops": null
+     },
+     {
+      "stage": "subsample conv1+ln+relu",
+      "dispatches": 1,
+      "alone_ms": 0.620625,
+      "marginal_ms": 0.0075,
+      "tflops": null
+     },
+     {
+      "stage": "ffn clamp+silu",
+      "dispatches": 24,
+      "alone_ms": 0.589417,
+      "marginal_ms": 5.778,
+      "tflops": null
+     },
+     {
+      "stage": "lconv glu+dwconv+norm+silu",
+      "dispatches": 12,
+      "alone_ms": 0.498458,
+      "marginal_ms": 5.169375,
+      "tflops": null
+     },
+     {
+      "stage": "ffn1 pre-norm",
+      "dispatches": 12,
+      "alone_ms": 0.483583,
+      "marginal_ms": 1.054667,
+      "tflops": null
+     },
+     {
+      "stage": "embedding_projection GEMM",
+      "dispatches": 1,
+      "alone_ms": 0.481292,
+      "marginal_ms": 0.55625,
+      "tflops": 0.0817
+     },
+     {
+      "stage": "ffn post-norm+resid (+next norm)",
+      "dispatches": 24,
+      "alone_ms": 0.472375,
+      "marginal_ms": 5.10625,
+      "tflops": null
+     },
+     {
+      "stage": "output_proj GEMM",
+      "dispatches": 1,
+      "alone_ms": 0.456292,
+      "marginal_ms": 0.0,
+      "tflops": 0.172353
+     },
+     {
+      "stage": "subsample conv0+ln+relu",
+      "dispatches": 1,
+      "alone_ms": 0.438,
+      "marginal_ms": 0.0,
+      "tflops": null
+     },
+     {
+      "stage": "lconv resid (+ffn2 pre-norm)",
+      "dispatches": 12,
+      "alone_ms": 0.415417,
+      "marginal_ms": 0.0,
+      "tflops": null
+     },
+     {
+      "stage": "input_proj GEMM",
+      "dispatches": 1,
+      "alone_ms": 0.4135,
+      "marginal_ms": 0.0,
+      "tflops": 0.126793
+     },
+     {
+      "stage": "attn post-norm+resid (+lconv norm)",
+      "dispatches": 12,
+      "alone_ms": 0.351833,
+      "marginal_ms": 6.219375,
+      "tflops": null
+     },
+     {
+      "stage": "output bias (+embedder norm)",
+      "dispatches": 1,
+      "alone_ms": 0.23925,
+      "marginal_ms": 0.0,
+      "tflops": null
+     }
+    ],
+    "variants": [
+     {
+      "name": "encode",
+      "kind": "encode",
+      "dispatches": 210,
+      "contended_rounds": 7,
+      "rounds_ms": [
+       31.781667,
+       23.1015,
+       23.374916,
+       22.259584,
+       19.997875,
+       55.23325,
+       21.649791
+      ]
+     },
+     {
+      "name": "full",
+      "kind": "full",
+      "dispatches": 210,
+      "contended_rounds": 7,
+      "rounds_ms": [
+       42.372958,
+       23.977208,
+       25.314125,
+       19.217666,
+       26.1055,
+       25.4715,
+       18.98225
+      ]
+     },
+     {
+      "name": "none",
+      "kind": "none",
+      "dispatches": 0,
+      "contended_rounds": 7,
+      "rounds_ms": [
+       0.080417,
+       0.102083,
+       0.08,
+       0.08475,
+       0.081458,
+       0.084375,
+       0.080166
+      ]
+     },
+     {
+      "name": "only:subsample conv0+ln+relu",
+      "kind": "only",
+      "dispatches": 1,
+      "contended_rounds": 7,
+      "rounds_ms": [
+       1.093459,
+       0.630375,
+       0.718625,
+       0.7685,
+       0.518,
+       0.790833,
+       0.766792
+      ]
+     },
+     {
+      "name": "only:subsample conv1+ln+relu",
+      "kind": "only",
+      "dispatches": 1,
+      "contended_rounds": 7,
+      "rounds_ms": [
+       0.849083,
+       0.700625,
+       0.855417,
+       1.451917,
+       0.720708,
+       1.335583,
+       0.854167
+      ]
+     },
+     {
+      "name": "only:input_proj GEMM",
+      "kind": "only",
+      "dispatches": 1,
+      "contended_rounds": 7,
+      "rounds_ms": [
+       0.74075,
+       0.641459,
+       0.5275,
+       0.561625,
+       0.4935,
+       0.629083,
+       0.9145
+      ]
+     },
+     {
+      "name": "only:ffn1 pre-norm",
+      "kind": "only",
+      "dispatches": 12,
+      "contended_rounds": 7,
+      "rounds_ms": [
+       0.723292,
+       0.599833,
+       0.681291,
+       0.749667,
+       0.563583,
+       0.85825,
+       0.715416
+      ]
+     },
+     {
+      "name": "only:ffn up GEMM (1024->4096)",
+      "kind": "only",
+      "dispatches": 24,
+      "contended_rounds": 7,
+      "rounds_ms": [
+       5.205292,
+       3.389125,
+       4.991042,
+       7.742958,
+       4.622959,
+       4.360417,
+       4.713
+      ]
+     },
+     {
+      "name": "only:ffn clamp+silu",
+      "kind": "only",
+      "dispatches": 24,
+      "contended_rounds": 7,
+      "rounds_ms": [
+       0.689875,
+       0.669417,
+       0.679417,
+       0.753541,
+       0.797375,
+       0.871167,
+       1.426959
+      ]
+     },
+     {
+      "name": "only:ffn down GEMM (4096->1024)",
+      "kind": "only",
+      "dispatches": 24,
+      "contended_rounds": 7,
+      "rounds_ms": [
+       8.64375,
+       8.897375,
+       9.247125,
+       13.641,
+       12.312625,
+       9.195583,
+       8.768333
+      ]
+     },
+     {
+      "name": "only:ffn post-norm+resid (+next norm)",
+      "kind": "only",
+      "dispatches": 24,
+      "contended_rounds": 7,
+      "rounds_ms": [
+       0.807125,
+       0.807917,
+       0.766916,
+       0.703917,
+       0.552375,
+       0.891291,
+       0.845583
+      ]
+     },
+     {
+      "name": "only:q/k/v GEMMs",
+      "kind": "only",
+      "dispatches": 12,
+      "contended_rounds": 7,
+      "rounds_ms": [
+       1.960875,
+       2.447125,
+       2.642833,
+       2.179875,
+       2.678583,
+       2.642917,
+       1.819917
+      ]
+     },
+     {
+      "name": "only:attention",
+      "kind": "only",
+      "dispatches": 12,
+      "contended_rounds": 7,
+      "rounds_ms": [
+       1.087083,
+       1.4075,
+       1.164416,
+       1.37225,
+       0.919708,
+       0.915167,
+       0.822333
+      ]
+     },
+     {
+      "name": "only:attn out GEMM",
+      "kind": "only",
+      "dispatches": 12,
+      "contended_rounds": 7,
+      "rounds_ms": [
+       2.058458,
+       1.889083,
+       1.505375,
+       2.112042,
+       2.442625,
+       1.804958,
+       1.579042
+      ]
+     },
+     {
+      "name": "only:attn post-norm+resid (+lconv norm)",
+      "kind": "only",
+      "dispatches": 12,
+      "contended_rounds": 7,
+      "rounds_ms": [
+       1.237917,
+       0.879708,
+       0.684667,
+       0.869,
+       0.431833,
+       0.880333,
+       0.911958
+      ]
+     },
+     {
+      "name": "only:lconv start GEMM (1024->2048)",
+      "kind": "only",
+      "dispatches": 12,
+      "contended_rounds": 7,
+      "rounds_ms": [
+       2.848542,
+       2.149833,
+       1.628291,
+       1.715708,
+       2.183167,
+       1.868375,
+       1.789542
+      ]
+     },
+     {
+      "name": "only:lconv glu+dwconv+norm+silu",
+      "kind": "only",
+      "dispatches": 12,
+      "contended_rounds": 7,
+      "rounds_ms": [
+       1.731542,
+       0.578458,
+       0.809334,
+       0.592583,
+       0.5835,
+       1.29,
+       0.71925
+      ]
+     },
+     {
+      "name": "only:lconv end GEMM",
+      "kind": "only",
+      "dispatches": 12,
+      "contended_rounds": 7,
+      "rounds_ms": [
+       2.982917,
+       1.93525,
+       1.890791,
+       2.232458,
+       1.664208,
+       1.841334,
+       1.321208
+      ]
+     },
+     {
+      "name": "only:lconv resid (+ffn2 pre-norm)",
+      "kind": "only",
+      "dispatches": 12,
+      "contended_rounds": 7,
+      "rounds_ms": [
+       1.7795,
+       0.842333,
+       1.352333,
+       0.772625,
+       0.495417,
+       0.942667,
+       0.70075
+      ]
+     },
+     {
+      "name": "only:output_proj GEMM",
+      "kind": "only",
+      "dispatches": 1,
+      "contended_rounds": 7,
+      "rounds_ms": [
+       0.748083,
+       0.536292,
+       0.756541,
+       0.7605,
+       0.90575,
+       0.764792,
+       0.63025
+      ]
+     },
+     {
+      "name": "only:output bias (+embedder norm)",
+      "kind": "only",
+      "dispatches": 1,
+      "contended_rounds": 7,
+      "rounds_ms": [
+       0.492,
+       0.31925,
+       0.784875,
+       0.512625,
+       0.773625,
+       0.793916,
+       0.554167
+      ]
+     },
+     {
+      "name": "only:embedding_projection GEMM",
+      "kind": "only",
+      "dispatches": 1,
+      "contended_rounds": 7,
+      "rounds_ms": [
+       0.8875,
+       0.561292,
+       0.961334,
+       0.869084,
+       0.759875,
+       0.862666,
+       0.917375
+      ]
+     },
+     {
+      "name": "skip:subsample conv0+ln+relu",
+      "kind": "skip",
+      "dispatches": 209,
+      "contended_rounds": 7,
+      "rounds_ms": [
+       23.980125,
+       49.492708,
+       25.629792,
+       30.366625,
+       21.002625,
+       25.383625,
+       21.137208
+      ]
+     },
+     {
+      "name": "skip:subsample conv1+ln+relu",
+      "kind": "skip",
+      "dispatches": 209,
+      "contended_rounds": 7,
+      "rounds_ms": [
+       41.34825,
+       18.97475,
+       31.846166,
+       22.32275,
+       19.249041,
+       47.681125,
+       44.892541
+      ]
+     },
+     {
+      "name": "skip:input_proj GEMM",
+      "kind": "skip",
+      "dispatches": 209,
+      "contended_rounds": 7,
+      "rounds_ms": [
+       23.363458,
+       20.789375,
+       39.528375,
+       22.6115,
+       19.666541,
+       21.851958,
+       20.077125
+      ]
+     },
+     {
+      "name": "skip:ffn1 pre-norm",
+      "kind": "skip",
+      "dispatches": 198,
+      "contended_rounds": 7,
+      "rounds_ms": [
+       22.430542,
+       23.642333,
+       17.927583,
+       25.415166,
+       21.31775,
+       18.796292,
+       18.269958
+      ]
+     },
+     {
+      "name": "skip:ffn up GEMM (1024->4096)",
+      "kind": "skip",
+      "dispatches": 186,
+      "contended_rounds": 7,
+      "rounds_ms": [
+       18.214666,
+       17.9875,
+       17.108458,
+       27.559875,
+       36.452,
+       17.491667,
+       16.678375
+      ]
+     },
+     {
+      "name": "skip:ffn clamp+silu",
+      "kind": "skip",
+      "dispatches": 186,
+      "contended_rounds": 7,
+      "rounds_ms": [
+       24.509125,
+       46.063666,
+       21.075708,
+       13.20425,
+       25.352375,
+       22.139542,
+       21.037458
+      ]
+     },
+     {
+      "name": "skip:ffn down GEMM (4096->1024)",
+      "kind": "skip",
+      "dispatches": 186,
+      "contended_rounds": 7,
+      "rounds_ms": [
+       13.801542,
+       17.278834,
+       11.827167,
+       7.977125,
+       14.95075,
+       14.620541,
+       27.627916
+      ]
+     },
+     {
+      "name": "skip:ffn post-norm+resid (+next norm)",
+      "kind": "skip",
+      "dispatches": 186,
+      "contended_rounds": 7,
+      "rounds_ms": [
+       37.026916,
+       27.666333,
+       24.538625,
+       13.876,
+       22.8185,
+       47.282083,
+       35.011625
+      ]
+     },
+     {
+      "name": "skip:q/k/v GEMMs",
+      "kind": "skip",
+      "dispatches": 198,
+      "contended_rounds": 7,
+      "rounds_ms": [
+       19.51725,
+       22.63725,
+       35.318958,
+       15.012125,
+       23.720458,
+       22.062875,
+       23.189041
+      ]
+     },
+     {
+      "name": "skip:attention",
+      "kind": "skip",
+      "dispatches": 198,
+      "contended_rounds": 7,
+      "rounds_ms": [
+       19.9105,
+       20.05325,
+       25.244333,
+       12.959833,
+       43.031417,
+       20.678625,
+       24.331416
+      ]
+     },
+     {
+      "name": "skip:attn out GEMM",
+      "kind": "skip",
+      "dispatches": 198,
+      "contended_rounds": 7,
+      "rounds_ms": [
+       20.409667,
+       44.191541,
+       21.854917,
+       12.299459,
+       21.548084,
+       18.34075,
+       24.7725
+      ]
+     },
+     {
+      "name": "skip:attn post-norm+resid (+lconv norm)",
+      "kind": "skip",
+      "dispatches": 198,
+      "contended_rounds": 7,
+      "rounds_ms": [
+       21.553625,
+       21.696541,
+       24.401542,
+       12.762875,
+       22.974625,
+       20.758584,
+       38.838375
+      ]
+     },
+     {
+      "name": "skip:lconv start GEMM (1024->2048)",
+      "kind": "skip",
+      "dispatches": 198,
+      "contended_rounds": 7,
+      "rounds_ms": [
+       20.914,
+       20.804584,
+       25.292,
+       12.170208,
+       17.949041,
+       39.728334,
+       18.903
+      ]
+     },
+     {
+      "name": "skip:lconv glu+dwconv+norm+silu",
+      "kind": "skip",
+      "dispatches": 198,
+      "contended_rounds": 7,
+      "rounds_ms": [
+       39.723708,
+       23.539292,
+       29.001541,
+       13.812875,
+       22.319125,
+       24.968125,
+       20.1605
+      ]
+     },
+     {
+      "name": "skip:lconv end GEMM",
+      "kind": "skip",
+      "dispatches": 198,
+      "contended_rounds": 7,
+      "rounds_ms": [
+       28.15825,
+       20.72025,
+       39.013666,
+       20.629417,
+       28.114833,
+       24.442417,
+       19.663375
+      ]
+     },
+     {
+      "name": "skip:lconv resid (+ffn2 pre-norm)",
+      "kind": "skip",
+      "dispatches": 198,
+      "contended_rounds": 7,
+      "rounds_ms": [
+       29.257083,
+       51.777458,
+       25.852125,
+       20.243042,
+       45.074292,
+       21.516958,
+       19.942083
+      ]
+     },
+     {
+      "name": "skip:output_proj GEMM",
+      "kind": "skip",
+      "dispatches": 209,
+      "contended_rounds": 7,
+      "rounds_ms": [
+       24.760792,
+       20.714375,
+       24.324875,
+       24.043583,
+       20.830542,
+       33.463708,
+       49.115792
+      ]
+     },
+     {
+      "name": "skip:output bias (+embedder norm)",
+      "kind": "skip",
+      "dispatches": 209,
+      "contended_rounds": 7,
+      "rounds_ms": [
+       46.726209,
+       23.499375,
+       26.071375,
+       22.672041,
+       20.874541,
+       34.078042,
+       23.58975
+      ]
+     },
+     {
+      "name": "skip:embedding_projection GEMM",
+      "kind": "skip",
+      "dispatches": 209,
+      "contended_rounds": 7,
+      "rounds_ms": [
+       23.65075,
+       22.753833,
+       39.197417,
+       26.304959,
+       22.545917,
+       22.524333,
+       18.426
+      ]
+     }
+    ]
+   },
+   {
+    "workload": "clip_3.3s",
+    "frames": 330,
+    "rows": 83,
+    "iters": 12,
+    "rounds": 7,
+    "soft_err": 2.2770603099052907e-05,
+    "gpu_util_start": "100",
+    "gpu_util_end": "98",
+    "stages": [
+     {
+      "stage": "ffn down GEMM (4096->1024)",
+      "dispatches": 24,
+      "alone_ms": 7.30675,
+      "marginal_ms": 7.746042,
+      "tflops": 2.286941
+     },
+     {
+      "stage": "ffn up GEMM (1024->4096)",
+      "dispatches": 24,
+      "alone_ms": 4.693583,
+      "marginal_ms": 9.888792,
+      "tflops": 3.560203
+     },
+     {
+      "stage": "q/k/v GEMMs",
+      "dispatches": 12,
+      "alone_ms": 2.214375,
+      "marginal_ms": 2.026,
+      "tflops": 2.829823
+     },
+     {
+      "stage": "lconv start GEMM (1024->2048)",
+      "dispatches": 12,
+      "alone_ms": 1.430583,
+      "marginal_ms": 0.388876,
+      "tflops": 2.920157
+     },
+     {
+      "stage": "attn out GEMM",
+      "dispatches": 12,
+      "alone_ms": 1.329583,
+      "marginal_ms": 0.0,
+      "tflops": 1.570991
+     },
+     {
+      "stage": "lconv end GEMM",
+      "dispatches": 12,
+      "alone_ms": 1.067375,
+      "marginal_ms": 0.0,
+      "tflops": 1.956916
+     },
+     {
+      "stage": "attention",
+      "dispatches": 12,
+      "alone_ms": 0.7655,
+      "marginal_ms": 1.006292,
+      "tflops": null
+     },
+     {
+      "stage": "subsample conv0+ln+relu",
+      "dispatches": 1,
+      "alone_ms": 0.612958,
+      "marginal_ms": 6.469042,
+      "tflops": null
+     },
+     {
+      "stage": "subsample conv1+ln+relu",
+      "dispatches": 1,
+      "alone_ms": 0.541,
+      "marginal_ms": 5.630875,
+      "tflops": null
+     },
+     {
+      "stage": "input_proj GEMM",
+      "dispatches": 1,
+      "alone_ms": 0.534708,
+      "marginal_ms": 7.087208,
+      "tflops": 0.32553
+     },
+     {
+      "stage": "ffn clamp+silu",
+      "dispatches": 24,
+      "alone_ms": 0.503333,
+      "marginal_ms": 5.753958,
+      "tflops": null
+     },
+     {
+      "stage": "ffn post-norm+resid (+next norm)",
+      "dispatches": 24,
+      "alone_ms": 0.491709,
+      "marginal_ms": 0.0,
+      "tflops": null
+     },
+     {
+      "stage": "lconv resid (+ffn2 pre-norm)",
+      "dispatches": 12,
+      "alone_ms": 0.434042,
+      "marginal_ms": 0.0,
+      "tflops": null
+     },
+     {
+      "stage": "lconv glu+dwconv+norm+silu",
+      "dispatches": 12,
+      "alone_ms": 0.39925,
+      "marginal_ms": 0.0,
+      "tflops": null
+     },
+     {
+      "stage": "ffn1 pre-norm",
+      "dispatches": 12,
+      "alone_ms": 0.392083,
+      "marginal_ms": 6.988375,
+      "tflops": null
+     },
+     {
+      "stage": "output_proj GEMM",
+      "dispatches": 1,
+      "alone_ms": 0.317875,
+      "marginal_ms": 0.0,
+      "tflops": 0.821378
+     },
+     {
+      "stage": "attn post-norm+resid (+lconv norm)",
+      "dispatches": 12,
+      "alone_ms": 0.31525,
+      "marginal_ms": 0.0,
+      "tflops": null
+     },
+     {
+      "stage": "embedding_projection GEMM",
+      "dispatches": 1,
+      "alone_ms": 0.310125,
+      "marginal_ms": 1.43575,
+      "tflops": 0.420952
+     },
+     {
+      "stage": "output bias (+embedder norm)",
+      "dispatches": 1,
+      "alone_ms": 0.263875,
+      "marginal_ms": 0.0,
+      "tflops": null
+     }
+    ],
+    "variants": [
+     {
+      "name": "encode",
+      "kind": "encode",
+      "dispatches": 210,
+      "contended_rounds": 7,
+      "rounds_ms": [
+       28.016042,
+       24.718,
+       27.637208,
+       25.557417,
+       33.621209,
+       26.1215,
+       26.31225
+      ]
+     },
+     {
+      "name": "full",
+      "kind": "full",
+      "dispatches": 210,
+      "contended_rounds": 7,
+      "rounds_ms": [
+       34.923041,
+       21.653542,
+       24.631625,
+       24.236667,
+       24.717958,
+       28.658167,
+       25.187708
+      ]
+     },
+     {
+      "name": "none",
+      "kind": "none",
+      "dispatches": 0,
+      "contended_rounds": 7,
+      "rounds_ms": [
+       0.250875,
+       0.237792,
+       0.2505,
+       0.266209,
+       0.23075,
+       0.238959,
+       0.241416
+      ]
+     },
+     {
+      "name": "only:subsample conv0+ln+relu",
+      "kind": "only",
+      "dispatches": 1,
+      "contended_rounds": 7,
+      "rounds_ms": [
+       0.985833,
+       0.843708,
+       0.9675,
+       0.939,
+       0.905792,
+       0.923125,
+       0.985458
+      ]
+     },
+     {
+      "name": "only:subsample conv1+ln+relu",
+      "kind": "only",
+      "dispatches": 1,
+      "contended_rounds": 7,
+      "rounds_ms": [
+       0.943416,
+       0.882041,
+       0.77175,
+       0.978458,
+       0.938625,
+       0.882542,
+       1.289292
+      ]
+     },
+     {
+      "name": "only:input_proj GEMM",
+      "kind": "only",
+      "dispatches": 1,
+      "contended_rounds": 7,
+      "rounds_ms": [
+       0.890125,
+       0.868542,
+       0.87425,
+       0.766125,
+       0.931208,
+       0.885417,
+       0.765458
+      ]
+     },
+     {
+      "name": "only:ffn1 pre-norm",
+      "kind": "only",
+      "dispatches": 12,
+      "contended_rounds": 7,
+      "rounds_ms": [
+       0.622833,
+       0.849209,
+       0.894416,
+       0.673709,
+       0.868917,
+       0.927625,
+       1.035459
+      ]
+     },
+     {
+      "name": "only:ffn up GEMM (1024->4096)",
+      "kind": "only",
+      "dispatches": 24,
+      "contended_rounds": 7,
+      "rounds_ms": [
+       9.60025,
+       6.008833,
+       4.924333,
+       9.623708,
+       5.229583,
+       5.542167,
+       5.337333
+      ]
+     },
+     {
+      "name": "only:ffn clamp+silu",
+      "kind": "only",
+      "dispatches": 24,
+      "contended_rounds": 7,
+      "rounds_ms": [
+       0.734083,
+       1.139458,
+       0.9925,
+       1.044292,
+       0.950833,
+       1.009125,
+       1.057958
+      ]
+     },
+     {
+      "name": "only:ffn down GEMM (4096->1024)",
+      "kind": "only",
+      "dispatches": 24,
+      "contended_rounds": 7,
+      "rounds_ms": [
+       10.020292,
+       13.251666,
+       7.776542,
+       13.202875,
+       7.5375,
+       8.529,
+       8.900916
+      ]
+     },
+     {
+      "name": "only:ffn post-norm+resid (+next norm)",
+      "kind": "only",
+      "dispatches": 24,
+      "contended_rounds": 7,
+      "rounds_ms": [
+       0.722459,
+       1.135583,
+       1.009917,
+       0.841541,
+       0.886958,
+       0.890708,
+       0.936125
+      ]
+     },
+     {
+      "name": "only:q/k/v GEMMs",
+      "kind": "only",
+      "dispatches": 12,
+      "contended_rounds": 7,
+      "rounds_ms": [
+       2.820833,
+       3.715291,
+       3.001083,
+       2.596167,
+       2.861,
+       2.979542,
+       2.445125
+      ]
+     },
+     {
+      "name": "only:attention",
+      "kind": "only",
+      "dispatches": 12,
+      "contended_rounds": 7,
+      "rounds_ms": [
+       0.99625,
+       1.655459,
+       1.773333,
+       1.872333,
+       1.28575,
+       1.03525,
+       1.839958
+      ]
+     },
+     {
+      "name": "only:attn out GEMM",
+      "kind": "only",
+      "dispatches": 12,
+      "contended_rounds": 7,
+      "rounds_ms": [
+       1.672541,
+       2.704042,
+       2.964208,
+       1.714375,
+       2.035292,
+       1.560333,
+       2.754709
+      ]
+     },
+     {
+      "name": "only:attn post-norm+resid (+lconv norm)",
+      "kind": "only",
+      "dispatches": 12,
+      "contended_rounds": 7,
+      "rounds_ms": [
+       0.828083,
+       0.546,
+       0.672792,
+       0.959708,
+       0.8205,
+       0.958875,
+       1.290333
+      ]
+     },
+     {
+      "name": "only:lconv start GEMM (1024->2048)",
+      "kind": "only",
+      "dispatches": 12,
+      "contended_rounds": 7,
+      "rounds_ms": [
+       2.231709,
+       2.191708,
+       1.661333,
+       2.013875,
+       3.138583,
+       2.201917,
+       2.7125
+      ]
+     },
+     {
+      "name": "only:lconv glu+dwconv+norm+silu",
+      "kind": "only",
+      "dispatches": 12,
+      "contended_rounds": 7,
+      "rounds_ms": [
+       0.763625,
+       0.893291,
+       0.63,
+       0.859167,
+       0.830625,
+       1.043,
+       0.746084
+      ]
+     },
+     {
+      "name": "only:lconv end GEMM",
+      "kind": "only",
+      "dispatches": 12,
+      "contended_rounds": 7,
+      "rounds_ms": [
+       1.599708,
+       1.782708,
+       1.298125,
+       1.7135,
+       2.0565,
+       2.772583,
+       1.812
+      ]
+     },
+     {
+      "name": "only:lconv resid (+ffn2 pre-norm)",
+      "kind": "only",
+      "dispatches": 12,
+      "contended_rounds": 7,
+      "rounds_ms": [
+       0.745416,
+       0.921667,
+       0.664792,
+       0.731041,
+       0.801791,
+       1.108333,
+       1.183917
+      ]
+     },
+     {
+      "name": "only:output_proj GEMM",
+      "kind": "only",
+      "dispatches": 1,
+      "contended_rounds": 7,
+      "rounds_ms": [
+       0.964583,
+       0.933917,
+       0.548625,
+       0.958292,
+       0.751625,
+       0.715583,
+       1.286375
+      ]
+     },
+     {
+      "name": "only:output bias (+embedder norm)",
+      "kind": "only",
+      "dispatches": 1,
+      "contended_rounds": 7,
+      "rounds_ms": [
+       0.948167,
+       0.942042,
+       0.494625,
+       0.846208,
+       0.69025,
+       0.795417,
+       1.574125
+      ]
+     },
+     {
+      "name": "only:embedding_projection GEMM",
+      "kind": "only",
+      "dispatches": 1,
+      "contended_rounds": 7,
+      "rounds_ms": [
+       0.905166,
+       0.935166,
+       0.540875,
+       0.953417,
+       0.942917,
+       0.782,
+       0.866167
+      ]
+     },
+     {
+      "name": "skip:subsample conv0+ln+relu",
+      "kind": "skip",
+      "dispatches": 209,
+      "contended_rounds": 7,
+      "rounds_ms": [
+       27.794417,
+       23.40375,
+       15.1845,
+       24.482333,
+       24.481292,
+       28.763375,
+       28.00425
+      ]
+     },
+     {
+      "name": "skip:subsample conv1+ln+relu",
+      "kind": "skip",
+      "dispatches": 209,
+      "contended_rounds": 7,
+      "rounds_ms": [
+       30.422709,
+       25.648209,
+       16.022667,
+       28.024541,
+       25.109833,
+       23.246667,
+       23.4105
+      ]
+     },
+     {
+      "name": "skip:input_proj GEMM",
+      "kind": "skip",
+      "dispatches": 209,
+      "contended_rounds": 7,
+      "rounds_ms": [
+       29.506042,
+       23.815791,
+       14.566334,
+       23.283625,
+       35.730375,
+       25.258125,
+       25.034416
+      ]
+     },
+     {
+      "name": "skip:ffn1 pre-norm",
+      "kind": "skip",
+      "dispatches": 198,
+      "contended_rounds": 7,
+      "rounds_ms": [
+       49.229417,
+       23.667333,
+       14.665167,
+       22.100042,
+       25.448667,
+       28.527625,
+       24.6665
+      ]
+     },
+     {
+      "name": "skip:ffn up GEMM (1024->4096)",
+      "kind": "skip",
+      "dispatches": 186,
+      "contended_rounds": 7,
+      "rounds_ms": [
+       21.846958,
+       16.202334,
+       11.76475,
+       41.62275,
+       15.746375,
+       22.348375,
+       22.013333
+      ]
+     },
+     {
+      "name": "skip:ffn clamp+silu",
+      "kind": "skip",
+      "dispatches": 186,
+      "contended_rounds": 7,
+      "rounds_ms": [
+       30.955416,
+       43.908708,
+       15.899584,
+       24.125292,
+       23.136666,
+       31.984625,
+       24.679209
+      ]
+     },
+     {
+      "name": "skip:ffn down GEMM (4096->1024)",
+      "kind": "skip",
+      "dispatches": 186,
+      "contended_rounds": 7,
+      "rounds_ms": [
+       18.837167,
+       19.604917,
+       15.365916,
+       16.5465,
+       19.134416,
+       13.9075,
+       21.65725
+      ]
+     },
+     {
+      "name": "skip:ffn post-norm+resid (+next norm)",
+      "kind": "skip",
+      "dispatches": 186,
+      "contended_rounds": 7,
+      "rounds_ms": [
+       29.307041,
+       23.061041,
+       26.819333,
+       26.617167,
+       26.682458,
+       28.235166,
+       26.909375
+      ]
+     },
+     {
+      "name": "skip:q/k/v GEMMs",
+      "kind": "skip",
+      "dispatches": 198,
+      "contended_rounds": 7,
+      "rounds_ms": [
+       27.951208,
+       25.03575,
+       39.234625,
+       20.660958,
+       40.427083,
+       19.627542,
+       21.386292
+      ]
+     },
+     {
+      "name": "skip:attention",
+      "kind": "skip",
+      "dispatches": 198,
+      "contended_rounds": 7,
+      "rounds_ms": [
+       28.0045,
+       27.740333,
+       22.043167,
+       20.64725,
+       21.157875,
+       28.662583,
+       26.727625
+      ]
+     },
+     {
+      "name": "skip:attn out GEMM",
+      "kind": "skip",
+      "dispatches": 198,
+      "contended_rounds": 7,
+      "rounds_ms": [
+       28.988875,
+       24.361083,
+       27.396583,
+       24.855459,
+       27.822458,
+       23.713209,
+       30.640792
+      ]
+     },
+     {
+      "name": "skip:attn post-norm+resid (+lconv norm)",
+      "kind": "skip",
+      "dispatches": 198,
+      "contended_rounds": 7,
+      "rounds_ms": [
+       31.189833,
+       30.801834,
+       26.0825,
+       30.144959,
+       38.7455,
+       27.176042,
+       26.430625
+      ]
+     },
+     {
+      "name": "skip:lconv start GEMM (1024->2048)",
+      "kind": "skip",
+      "dispatches": 198,
+      "contended_rounds": 7,
+      "rounds_ms": [
+       29.48925,
+       26.688042,
+       24.679208,
+       24.879708,
+       23.354333,
+       32.877917,
+       21.264666
+      ]
+     },
+     {
+      "name": "skip:lconv glu+dwconv+norm+silu",
+      "kind": "skip",
+      "dispatches": 198,
+      "contended_rounds": 7,
+      "rounds_ms": [
+       31.208625,
+       21.685291,
+       25.705083,
+       25.826041,
+       26.375333,
+       30.126208,
+       41.689916
+      ]
+     },
+     {
+      "name": "skip:lconv end GEMM",
+      "kind": "skip",
+      "dispatches": 198,
+      "contended_rounds": 7,
+      "rounds_ms": [
+       28.9125,
+       26.206083,
+       25.25875,
+       28.633541,
+       27.256375,
+       27.173708,
+       22.356792
+      ]
+     },
+     {
+      "name": "skip:lconv resid (+ffn2 pre-norm)",
+      "kind": "skip",
+      "dispatches": 198,
+      "contended_rounds": 7,
+      "rounds_ms": [
+       30.5295,
+       32.565792,
+       24.735333,
+       27.730375,
+       22.846583,
+       28.963125,
+       27.67825
+      ]
+     },
+     {
+      "name": "skip:output_proj GEMM",
+      "kind": "skip",
+      "dispatches": 209,
+      "contended_rounds": 7,
+      "rounds_ms": [
+       31.204042,
+       26.077708,
+       24.191792,
+       25.0685,
+       23.038625,
+       25.584375,
+       36.29325
+      ]
+     },
+     {
+      "name": "skip:output bias (+embedder norm)",
+      "kind": "skip",
+      "dispatches": 209,
+      "contended_rounds": 7,
+      "rounds_ms": [
+       35.037,
+       29.387042,
+       29.843209,
+       26.213042,
+       28.416958,
+       22.801208,
+       24.753833
+      ]
+     },
+     {
+      "name": "skip:embedding_projection GEMM",
+      "kind": "skip",
+      "dispatches": 209,
+      "contended_rounds": 7,
+      "rounds_ms": [
+       27.918791,
+       28.291416,
+       29.710917,
+       24.727541,
+       26.269125,
+       26.997541,
+       20.217792
+      ]
+     }
+    ]
+   },
+   {
+    "workload": "batch_8x30s",
+    "frames": 24000,
+    "rows": 6000,
+    "iters": 2,
+    "rounds": 7,
+    "soft_err": null,
+    "gpu_util_start": "99",
+    "gpu_util_end": "99",
+    "stages": [
+     {
+      "stage": "ffn up GEMM (1024->4096)",
+      "dispatches": 48,
+      "alone_ms": 177.565333,
+      "marginal_ms": 191.925792,
+      "tflops": 6.802902
+     },
+     {
+      "stage": "ffn down GEMM (4096->1024)",
+      "dispatches": 48,
+      "alone_ms": 162.228083,
+      "marginal_ms": 206.30975,
+      "tflops": 7.446057
+     },
+     {
+      "stage": "q/k/v GEMMs",
+      "dispatches": 24,
+      "alone_ms": 69.636583,
+      "marginal_ms": 87.565791,
+      "tflops": 6.504984
+     },
+     {
+      "stage": "lconv start GEMM (1024->2048)",
+      "dispatches": 24,
+      "alone_ms": 49.744625,
+      "marginal_ms": 53.951333,
+      "tflops": 6.070804
+     },
+     {
+      "stage": "lconv end GEMM",
+      "dispatches": 24,
+      "alone_ms": 27.168791,
+      "marginal_ms": 54.965875,
+      "tflops": 5.557662
+     },
+     {
+      "stage": "attn out GEMM",
+      "dispatches": 24,
+      "alone_ms": 24.356375,
+      "marginal_ms": 69.323208,
+      "tflops": 6.199401
+     },
+     {
+      "stage": "ffn clamp+silu",
+      "dispatches": 48,
+      "alone_ms": 23.078291,
+      "marginal_ms": 14.752583,
+      "tflops": null
+     },
+     {
+      "stage": "attention",
+      "dispatches": 24,
+      "alone_ms": 20.63375,
+      "marginal_ms": 37.974208,
+      "tflops": null
+     },
+     {
+      "stage": "subsample conv1+ln+relu",
+      "dispatches": 2,
+      "alone_ms": 13.917666,
+      "marginal_ms": 0.0,
+      "tflops": null
+     },
+     {
+      "stage": "ffn post-norm+resid (+next norm)",
+      "dispatches": 48,
+      "alone_ms": 13.80025,
+      "marginal_ms": 33.236667,
+      "tflops": null
+     },
+     {
+      "stage": "subsample conv0+ln+relu",
+      "dispatches": 2,
+      "alone_ms": 12.283791,
+      "marginal_ms": 55.55325,
+      "tflops": null
+     },
+     {
+      "stage": "lconv glu+dwconv+norm+silu",
+      "dispatches": 24,
+      "alone_ms": 7.755083,
+      "marginal_ms": 19.765459,
+      "tflops": null
+     },
+     {
+      "stage": "lconv resid (+ffn2 pre-norm)",
+      "dispatches": 24,
+      "alone_ms": 6.329209,
+      "marginal_ms": 24.213042,
+      "tflops": null
+     },
+     {
+      "stage": "attn post-norm+resid (+lconv norm)",
+      "dispatches": 24,
+      "alone_ms": 6.269084,
+      "marginal_ms": 33.164292,
+      "tflops": null
+     },
+     {
+      "stage": "input_proj GEMM",
+      "dispatches": 2,
+      "alone_ms": 3.547292,
+      "marginal_ms": 0.0,
+      "tflops": 3.547188
+     },
+     {
+      "stage": "ffn1 pre-norm",
+      "dispatches": 24,
+      "alone_ms": 3.099917,
+      "marginal_ms": 0.0,
+      "tflops": null
+     },
+     {
+      "stage": "embedding_projection GEMM",
+      "dispatches": 2,
+      "alone_ms": 2.9505,
+      "marginal_ms": 0.0,
+      "tflops": 3.198503
+     },
+     {
+      "stage": "output_proj GEMM",
+      "dispatches": 2,
+      "alone_ms": 2.694833,
+      "marginal_ms": 11.364084,
+      "tflops": 7.00391
+     },
+     {
+      "stage": "output bias (+embedder norm)",
+      "dispatches": 2,
+      "alone_ms": 0.605834,
+      "marginal_ms": 0.0,
+      "tflops": null
+     }
+    ],
+    "variants": [
+     {
+      "name": "encode",
+      "kind": "encode",
+      "dispatches": 420,
+      "contended_rounds": 7,
+      "rounds_ms": [
+       1437.224292,
+       763.922208,
+       764.897375,
+       1085.091417,
+       1237.297208,
+       1902.488417,
+       1967.6095
+      ]
+     },
+     {
+      "name": "full",
+      "kind": "full",
+      "dispatches": 420,
+      "contended_rounds": 7,
+      "rounds_ms": [
+       1458.373125,
+       704.92225,
+       769.650375,
+       888.565166,
+       1282.369375,
+       1905.325458,
+       1618.759458
+      ]
+     },
+     {
+      "name": "none",
+      "kind": "none",
+      "dispatches": 0,
+      "contended_rounds": 7,
+      "rounds_ms": [
+       17.561375,
+       17.442625,
+       19.379458,
+       20.8575,
+       34.540292,
+       17.622709,
+       28.101375
+      ]
+     },
+     {
+      "name": "only:subsample conv0+ln+relu",
+      "kind": "only",
+      "dispatches": 2,
+      "contended_rounds": 7,
+      "rounds_ms": [
+       47.612,
+       30.171709,
+       31.120792,
+       29.726416,
+       76.227125,
+       80.309458,
+       71.184916
+      ]
+     },
+     {
+      "name": "only:subsample conv1+ln+relu",
+      "kind": "only",
+      "dispatches": 2,
+      "contended_rounds": 7,
+      "rounds_ms": [
+       55.202959,
+       31.360291,
+       33.713375,
+       45.366917,
+       70.391208,
+       88.886375,
+       50.14525
+      ]
+     },
+     {
+      "name": "only:input_proj GEMM",
+      "kind": "only",
+      "dispatches": 2,
+      "contended_rounds": 7,
+      "rounds_ms": [
+       28.88,
+       20.989917,
+       22.463709,
+       31.001542,
+       89.738333,
+       38.375333,
+       27.005542
+      ]
+     },
+     {
+      "name": "only:ffn1 pre-norm",
+      "kind": "only",
+      "dispatches": 24,
+      "contended_rounds": 7,
+      "rounds_ms": [
+       39.885542,
+       22.446917,
+       22.382708,
+       20.542542,
+       70.82075,
+       30.850375,
+       34.63825
+      ]
+     },
+     {
+      "name": "only:ffn up GEMM (1024->4096)",
+      "kind": "only",
+      "dispatches": 48,
+      "contended_rounds": 7,
+      "rounds_ms": [
+       291.379042,
+       216.5775,
+       213.991291,
+       195.007958,
+       360.25675,
+       495.89575,
+       509.824458
+      ]
+     },
+     {
+      "name": "only:ffn clamp+silu",
+      "kind": "only",
+      "dispatches": 48,
+      "contended_rounds": 7,
+      "rounds_ms": [
+       81.661542,
+       45.099625,
+       40.520916,
+       46.229667,
+       69.234084,
+       209.910708,
+       80.963583
+      ]
+     },
+     {
+      "name": "only:ffn down GEMM (4096->1024)",
+      "kind": "only",
+      "dispatches": 48,
+      "contended_rounds": 7,
+      "rounds_ms": [
+       431.847916,
+       198.55325,
+       212.72625,
+       179.670708,
+       219.821334,
+       406.369959,
+       487.256083
+      ]
+     },
+     {
+      "name": "only:ffn post-norm+resid (+next norm)",
+      "kind": "only",
+      "dispatches": 48,
+      "contended_rounds": 7,
+      "rounds_ms": [
+       42.441792,
+       32.181083,
+       33.276708,
+       31.242875,
+       67.8635,
+       43.177917,
+       59.678917
+      ]
+     },
+     {
+      "name": "only:q/k/v GEMMs",
+      "kind": "only",
+      "dispatches": 24,
+      "contended_rounds": 7,
+      "rounds_ms": [
+       197.525666,
+       87.079208,
+       97.594166,
+       89.701875,
+       116.784167,
+       297.098709,
+       166.816292
+      ]
+     },
+     {
+      "name": "only:attention",
+      "kind": "only",
+      "dispatches": 24,
+      "contended_rounds": 7,
+      "rounds_ms": [
+       60.061917,
+       38.076375,
+       39.571958,
+       52.178875,
+       71.514416,
+       97.025083,
+       80.550042
+      ]
+     },
+     {
+      "name": "only:attn out GEMM",
+      "kind": "only",
+      "dispatches": 24,
+      "contended_rounds": 7,
+      "rounds_ms": [
+       58.452625,
+       43.145417,
+       44.708417,
+       41.799,
+       80.292833,
+       93.024667,
+       88.983
+      ]
+     },
+     {
+      "name": "only:attn post-norm+resid (+lconv norm)",
+      "kind": "only",
+      "dispatches": 24,
+      "contended_rounds": 7,
+      "rounds_ms": [
+       27.93075,
+       23.711709,
+       24.292083,
+       59.225583,
+       28.687917,
+       78.117292,
+       40.690542
+      ]
+     },
+     {
+      "name": "only:lconv start GEMM (1024->2048)",
+      "kind": "only",
+      "dispatches": 24,
+      "contended_rounds": 7,
+      "rounds_ms": [
+       96.671625,
+       67.18725,
+       68.885666,
+       74.5715,
+       90.227209,
+       147.945459,
+       142.692958
+      ]
+     },
+     {
+      "name": "only:lconv glu+dwconv+norm+silu",
+      "kind": "only",
+      "dispatches": 24,
+      "contended_rounds": 7,
+      "rounds_ms": [
+       35.177,
+       27.5515,
+       25.197708,
+       76.344959,
+       57.758375,
+       36.690041,
+       44.187917
+      ]
+     },
+     {
+      "name": "only:lconv end GEMM",
+      "kind": "only",
+      "dispatches": 24,
+      "contended_rounds": 7,
+      "rounds_ms": [
+       67.2855,
+       46.550291,
+       44.611416,
+       85.532875,
+       76.832125,
+       128.804291,
+       71.367542
+      ]
+     },
+     {
+      "name": "only:lconv resid (+ffn2 pre-norm)",
+      "kind": "only",
+      "dispatches": 24,
+      "contended_rounds": 7,
+      "rounds_ms": [
+       31.796958,
+       23.771834,
+       24.3465,
+       40.343458,
+       36.595541,
+       72.938875,
+       38.183125
+      ]
+     },
+     {
+      "name": "only:output_proj GEMM",
+      "kind": "only",
+      "dispatches": 2,
+      "contended_rounds": 7,
+      "rounds_ms": [
+       25.115667,
+       22.959791,
+       20.137458,
+       111.037959,
+       25.085875,
+       32.86375,
+       32.392333
+      ]
+     },
+     {
+      "name": "only:output bias (+embedder norm)",
+      "kind": "only",
+      "dispatches": 2,
+      "contended_rounds": 7,
+      "rounds_ms": [
+       20.544417,
+       19.011041,
+       18.048459,
+       25.677959,
+       51.335042,
+       119.165083,
+       18.614583
+      ]
+     },
+     {
+      "name": "only:embedding_projection GEMM",
+      "kind": "only",
+      "dispatches": 2,
+      "contended_rounds": 7,
+      "rounds_ms": [
+       21.088458,
+       21.642834,
+       20.393125,
+       33.218792,
+       30.686709,
+       35.242583,
+       24.760167
+      ]
+     },
+     {
+      "name": "skip:subsample conv0+ln+relu",
+      "kind": "skip",
+      "dispatches": 418,
+      "contended_rounds": 7,
+      "rounds_ms": [
+       1312.715791,
+       736.670916,
+       656.878708,
+       1189.995,
+       649.369,
+       1282.053292,
+       1846.239667
+      ]
+     },
+     {
+      "name": "skip:subsample conv1+ln+relu",
+      "kind": "skip",
+      "dispatches": 418,
+      "contended_rounds": 7,
+      "rounds_ms": [
+       1275.162792,
+       765.238292,
+       744.679625,
+       1347.016334,
+       994.657333,
+       1850.670083,
+       1637.853292
+      ]
+     },
+     {
+      "name": "skip:input_proj GEMM",
+      "kind": "skip",
+      "dispatches": 418,
+      "contended_rounds": 7,
+      "rounds_ms": [
+       1394.221916,
+       762.334666,
+       735.791416,
+       1111.483208,
+       1263.800583,
+       1814.744208,
+       1762.189667
+      ]
+     },
+     {
+      "name": "skip:ffn1 pre-norm",
+      "kind": "skip",
+      "dispatches": 396,
+      "contended_rounds": 7,
+      "rounds_ms": [
+       1279.948209,
+       727.480042,
+       779.32475,
+       1058.8895,
+       1249.53875,
+       1822.614292,
+       1526.201916
+      ]
+     },
+     {
+      "name": "skip:ffn up GEMM (1024->4096)",
+      "kind": "skip",
+      "dispatches": 372,
+      "contended_rounds": 7,
+      "rounds_ms": [
+       545.844792,
+       643.405625,
+       512.996458,
+       641.147834,
+       1003.509375,
+       1374.681667,
+       1234.006459
+      ]
+     },
+     {
+      "name": "skip:ffn clamp+silu",
+      "kind": "skip",
+      "dispatches": 372,
+      "contended_rounds": 7,
+      "rounds_ms": [
+       755.92,
+       1440.514625,
+       754.866,
+       690.169667,
+       819.36075,
+       1517.949459,
+       1674.077083
+      ]
+     },
+     {
+      "name": "skip:ffn down GEMM (4096->1024)",
+      "kind": "skip",
+      "dispatches": 372,
+      "contended_rounds": 7,
+      "rounds_ms": [
+       908.067833,
+       989.353542,
+       518.707208,
+       509.276875,
+       498.6125,
+       889.912542,
+       1547.557
+      ]
+     },
+     {
+      "name": "skip:ffn post-norm+resid (+next norm)",
+      "kind": "skip",
+      "dispatches": 372,
+      "contended_rounds": 7,
+      "rounds_ms": [
+       1341.850291,
+       1247.062334,
+       714.193292,
+       691.23375,
+       671.685583,
+       1133.044417,
+       1664.125542
+      ]
+     },
+     {
+      "name": "skip:q/k/v GEMMs",
+      "kind": "skip",
+      "dispatches": 396,
+      "contended_rounds": 6,
+      "rounds_ms": [
+       1240.274334,
+       1217.324167,
+       684.188375,
+       658.23825,
+       617.356459,
+       1575.199708,
+       1765.246333
+      ]
+     },
+     {
+      "name": "skip:attention",
+      "kind": "skip",
+      "dispatches": 396,
+      "contended_rounds": 6,
+      "rounds_ms": [
+       1430.176,
+       1237.369834,
+       732.98975,
+       666.948042,
+       883.744875,
+       1722.90675,
+       1175.271291
+      ]
+     },
+     {
+      "name": "skip:attn out GEMM",
+      "kind": "skip",
+      "dispatches": 396,
+      "contended_rounds": 6,
+      "rounds_ms": [
+       1404.146166,
+       1362.201167,
+       685.804334,
+       635.599042,
+       945.506625,
+       1709.751167,
+       1364.801541
+      ]
+     },
+     {
+      "name": "skip:attn post-norm+resid (+lconv norm)",
+      "kind": "skip",
+      "dispatches": 396,
+      "contended_rounds": 6,
+      "rounds_ms": [
+       1457.398167,
+       1342.977417,
+       719.151625,
+       671.757958,
+       1220.457625,
+       1514.074583,
+       1553.814042
+      ]
+     },
+     {
+      "name": "skip:lconv start GEMM (1024->2048)",
+      "kind": "skip",
+      "dispatches": 396,
+      "contended_rounds": 6,
+      "rounds_ms": [
+       1355.872375,
+       1414.540167,
+       663.916458,
+       650.970917,
+       1169.7335,
+       1326.344917,
+       1626.354292
+      ]
+     },
+     {
+      "name": "skip:lconv glu+dwconv+norm+silu",
+      "kind": "skip",
+      "dispatches": 396,
+      "contended_rounds": 6,
+      "rounds_ms": [
+       1486.1225,
+       1469.141875,
+       685.156791,
+       703.971583,
+       1195.874708,
+       944.419625,
+       1746.584875
+      ]
+     },
+     {
+      "name": "skip:lconv end GEMM",
+      "kind": "skip",
+      "dispatches": 396,
+      "contended_rounds": 6,
+      "rounds_ms": [
+       1472.372458,
+       1401.731875,
+       700.130042,
+       669.29325,
+       676.906958,
+       649.956375,
+       1744.494917
+      ]
+     },
+     {
+      "name": "skip:lconv resid (+ffn2 pre-norm)",
+      "kind": "skip",
+      "dispatches": 396,
+      "contended_rounds": 6,
+      "rounds_ms": [
+       1474.207375,
+       1501.869417,
+       730.379875,
+       680.709208,
+       685.382292,
+       687.61825,
+       1180.67625
+      ]
+     },
+     {
+      "name": "skip:output_proj GEMM",
+      "kind": "skip",
+      "dispatches": 418,
+      "contended_rounds": 5,
+      "rounds_ms": [
+       1430.392125,
+       1417.731083,
+       732.845667,
+       712.582167,
+       693.558166,
+       1293.692458,
+       1598.913708
+      ]
+     },
+     {
+      "name": "skip:output bias (+embedder norm)",
+      "kind": "skip",
+      "dispatches": 418,
+      "contended_rounds": 5,
+      "rounds_ms": [
+       1394.63175,
+       1361.549375,
+       752.301167,
+       721.332125,
+       921.962875,
+       1193.163166,
+       1809.613083
+      ]
+     },
+     {
+      "name": "skip:embedding_projection GEMM",
+      "kind": "skip",
+      "dispatches": 418,
+      "contended_rounds": 5,
+      "rounds_ms": [
+       1442.398084,
+       1429.97475,
+       733.522333,
+       729.420083,
+       1085.755333,
+       1252.821666,
+       1761.70325
+      ]
+     }
+    ]
+   }
+  ]
+ }
+}

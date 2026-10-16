@@ -73,7 +73,7 @@
 //! # Kernels
 //!
 //! New for this model: [`encoder_attn`] (`kernels/encoder_attn.metal`: the
-//! TensorOps tiled kernel of `kernels/attn_tiled.h` at head dims 256 and 512,
+//! TensorOps tiled kernel of `kernels/attn_tiled.h` (head dims 32 to 512; bf16 operand tiles at 64, 256 and 512),
 //! or one simdgroup per query row), [`segment_mean_rows`] and
 //! [`l2_normalize_rows`] (`kernels/embed_pool.metal`). The rest are tessl's:
 //! GEMMs, exact f32 or bf16 (NN, and NT for the per-layer-input projection),
@@ -91,7 +91,7 @@ use std::sync::Arc;
 use objc2_metal::MTLComputePipelineState;
 
 use crate::dispatch::{dispatch_1d, dispatch_2d_tg, set_gpu_buf, set_u32};
-use crate::gemm::{cast_f32_to_bf16_into, gemm, gemm_nt_f32, GemmBackend, GemmOperands};
+use crate::gemm::{cast_f32_to_bf16_into, gemm, gemm_nt_f32, gemm_small_m, GemmBackend, GemmOperands};
 use crate::json::{self, Json, Syntax};
 use crate::loader::Loader;
 use crate::nn::{
@@ -158,9 +158,17 @@ pub enum EncoderAttnKernel {
     /// head dim.
     Rows,
     /// FlashAttention-2 on the TensorOps matrix units
-    /// (`encoder_attn_tiled_*`, `kernels/qwen35_attn_tiled.metal`'s body):
-    /// head dims 256 and 512, on a device with TensorOps.
+    /// (`encoder_attn_tiled_*`, `kernels/attn_tiled.h`'s body in its encoder
+    /// mode, the one `kernels/qwen35_attn_tiled.metal` runs causally): head
+    /// dims 32, 64, 256 and 512, f32 operands, on a device with TensorOps.
     Tiled,
+    /// [`Self::Tiled`] with bf16 operand tiles (`encoder_attn_tiled_bf16_*`):
+    /// Q, K and V are bf16 buffers, and so is the probability tile that
+    /// multiplies V; scores, the online softmax, the accumulator and the
+    /// output stay f32. Head dims 64, 256 and 512. Never picked by
+    /// [`encoder_attn_kernel`]: the caller owns the operand dtype
+    /// ([`encoder_attn_bf16`]).
+    TiledBf16,
 }
 
 /// The kernel [`encoder_attn`] picks: [`EncoderAttnKernel::Tiled`] where it
@@ -174,12 +182,45 @@ pub fn encoder_attn_kernel(rt: &GpuRuntime, head_dim: u32) -> EncoderAttnKernel 
 }
 
 /// (entry, queries per threadgroup, simdgroups per threadgroup) as compiled;
-/// the entry spells its geometry.
+/// the entry spells its geometry. Each head dim's geometry is the winner of
+/// the sweep in `bench/results/embedgemma2_attention_m5pro.txt`.
 fn encoder_attn_tiled_entry(head_dim: u32) -> Option<(&'static str, usize, usize)> {
     match head_dim {
+        32 => Some(("encoder_attn_tiled_h32_q16_k32_sg1", 16, 1)),
+        64 => Some(("encoder_attn_tiled_h64_q32_k32_sg2", 32, 2)),
         256 => Some(("encoder_attn_tiled_h256_q32_k32_sg4", 32, 4)),
         512 => Some(("encoder_attn_tiled_h512_q32_k32_sg8", 32, 8)),
         _ => None,
+    }
+}
+
+/// [`encoder_attn_tiled_entry`] for [`EncoderAttnKernel::TiledBf16`].
+fn encoder_attn_tiled_bf16_entry(head_dim: u32) -> Option<(&'static str, usize, usize)> {
+    match head_dim {
+        64 => Some(("encoder_attn_tiled_bf16_h64_q32_k32_sg2", 32, 2)),
+        256 => Some(("encoder_attn_tiled_bf16_h256_q32_k64_sg4", 32, 4)),
+        512 => Some(("encoder_attn_tiled_bf16_h512_q32_k128_sg8", 32, 8)),
+        _ => None,
+    }
+}
+
+/// Whether [`encoder_attn_bf16`] has a kernel for `head_dim` (64, 256 or 512),
+/// so a model that runs its attention in bf16 can refuse a config at load
+/// rather than at its first forward.
+pub fn encoder_attn_bf16_supports(head_dim: u32) -> bool {
+    encoder_attn_tiled_bf16_entry(head_dim).is_some()
+}
+
+/// `out = a @ w` at `operands`' precision, the one GEMM entry every
+/// EmbeddingGemma 2 forward (the text encoder's, the vision tower's) calls.
+/// `a` is in the mode's activation dtype (f32, or bf16 under
+/// [`GemmOperands::Bf16`], as the forward stages it), so neither lane rounds
+/// or allocates anything of its own here. The exact lane does not check the
+/// runtime's relaxed-f32 switch: the model's `encode` does, once per call.
+pub(crate) fn project(operands: GemmOperands, a: &Tensor, w: &Tensor, out: &Tensor) -> Result<(), String> {
+    match operands {
+        GemmOperands::ExactF32 => gemm(a, w, out, BACKEND),
+        GemmOperands::Bf16 => GemmOperands::Bf16.nn(a, w, out),
     }
 }
 
@@ -189,7 +230,8 @@ fn encoder_attn_tiled_entry(head_dim: u32) -> Option<(&'static str, usize, usize
 /// `q`/`o`: `[batch, seq, heads, head_dim]`; `k`/`v`: `[batch, capacity,
 /// heads_kv, head_dim]` with `capacity >= seq` derived from their size
 /// ([`crate::nn::attn_kv_capacity`], as the K/V writer derives it), all f32
-/// (there is no bf16 output: no encoder has a bf16 path). `lens`: `[batch]` u32,
+/// (the bf16-operand form is [`encoder_attn_bf16`]; there is no bf16 output).
+/// `lens`: `[batch]` u32,
 /// each sequence's live length. Keys at or past a row's length are masked,
 /// and every query at or past it is written as zeros. The lengths are device
 /// values the host cannot see; the kernel clamps each to `seq`, and a length
@@ -209,8 +251,27 @@ pub fn encoder_attn(
     encoder_attn_with(rt, q, k, v, o, lens, dims, kernel)
 }
 
+/// [`encoder_attn`] with bf16 operand tiles ([`EncoderAttnKernel::TiledBf16`]):
+/// `q`, `k` and `v` are bf16 buffers (same shapes, `k`/`v` capacity derived
+/// by [`crate::nn::attn_kv_capacity_bf16`]), `o` stays f32. Needs a TensorOps
+/// device and head dim 64, 256 or 512; anything else is an error, never a
+/// silent fall back to a different precision.
+#[allow(clippy::too_many_arguments)]
+pub fn encoder_attn_bf16(
+    rt: &Arc<GpuRuntime>,
+    q: &GpuBuffer,
+    k: &GpuBuffer,
+    v: &GpuBuffer,
+    o: &GpuBuffer,
+    lens: &GpuBuffer,
+    dims: EncoderAttnDims,
+) -> Result<(), String> {
+    encoder_attn_with(rt, q, k, v, o, lens, dims, EncoderAttnKernel::TiledBf16)
+}
+
 /// [`encoder_attn`] on a named kernel (for the tests and the paired
-/// benchmark that compare the two). The contract and the checks are the same.
+/// benchmark that compare them). The contract and the checks are the same,
+/// except that [`EncoderAttnKernel::TiledBf16`] takes bf16 `q`, `k` and `v`.
 #[allow(clippy::too_many_arguments)]
 pub fn encoder_attn_with(
     rt: &Arc<GpuRuntime>,
@@ -235,13 +296,22 @@ pub fn encoder_attn_with(
         return Err(format!("{WHAT}: scale must be finite"));
     }
     let q_elems = elems(&[dims.batch, dims.seq, dims.heads, dims.head_dim], WHAT)?;
-    require::<f32>(rt, q, q_elems, "encoder_attn q")?;
+    let bf16 = kernel == EncoderAttnKernel::TiledBf16;
+    if bf16 {
+        require::<u16>(rt, q, q_elems, "encoder_attn q (bf16)")?;
+    } else {
+        require::<f32>(rt, q, q_elems, "encoder_attn q")?;
+    }
     require::<f32>(rt, o, q_elems, "encoder_attn o")?;
     require::<u32>(rt, lens, dims.batch as usize, "encoder_attn lens")?;
     if q_elems == 0 {
         return Ok(());
     }
-    let kv_capacity = crate::nn::attn_kv_capacity(k, v, dims.batch, dims.heads_kv, dims.head_dim)?;
+    let kv_capacity = if bf16 {
+        crate::nn::attn_kv_capacity_bf16(k, v, dims.batch, dims.heads_kv, dims.head_dim)?
+    } else {
+        crate::nn::attn_kv_capacity(k, v, dims.batch, dims.heads_kv, dims.head_dim)?
+    };
     if kv_capacity < dims.seq {
         return Err(format!(
             "{WHAT}: K/V hold {kv_capacity} positions per sequence; need at least seq = {}",
@@ -249,13 +319,22 @@ pub fn encoder_attn_with(
         ));
     }
     require_disjoint_writes(WHAT, &[("o", o)], &[("q", q), ("k", k), ("v", v), ("lens", lens)])?;
-    if kernel == EncoderAttnKernel::Tiled {
-        let (entry, bq, sg) = encoder_attn_tiled_entry(dims.head_dim).ok_or_else(|| {
-            format!(
-                "{WHAT}: the tiled kernel is compiled for head dims 256 and 512, not {}",
-                dims.head_dim
-            )
-        })?;
+    if kernel != EncoderAttnKernel::Rows {
+        let (entry, bq, sg) = if bf16 {
+            encoder_attn_tiled_bf16_entry(dims.head_dim).ok_or_else(|| {
+                format!(
+                    "{WHAT}: the bf16 tiled kernel is compiled for head dims 64, 256 and 512, not {}",
+                    dims.head_dim
+                )
+            })?
+        } else {
+            encoder_attn_tiled_entry(dims.head_dim).ok_or_else(|| {
+                format!(
+                    "{WHAT}: the tiled kernel is compiled for head dims 32, 64, 256 and 512, not {}",
+                    dims.head_dim
+                )
+            })?
+        };
         if !rt.has_tensorops() {
             return Err(format!(
                 "{WHAT}: the tiled kernel needs TensorOps, which this device lacks"
@@ -861,10 +940,24 @@ pub struct EncodeOutput {
 
 /// Bytes of per-layer inputs one GEMM forms: every layer's at once would be
 /// `rows * n_layers * ple_dim` floats, 1.5 GiB at [`MAX_BATCH_TOKENS`] with
-/// the checkpoint's 24 layers of 512. Under this bound a forward of up to
-/// 5461 rows forms all 24 in one GEMM; at 32768 rows it takes 6 (4 layers
-/// each), against 24 one-layer GEMMs before.
-pub const PLE_RUN_BYTES: usize = 256 << 20;
+/// the checkpoint's 24 layers of 512. A layer's inputs are 2 KiB a row, so
+/// under this bound a forward of up to 341 rows forms all 24 in one GEMM,
+/// one of 2048 rows 4 layers per GEMM, and one of 8192 rows or more one layer
+/// per GEMM (the buffer is never smaller than one layer's: 16 MiB at 8192
+/// rows, 64 MiB at 32768).
+///
+/// It is 16 MiB, not the 256 MiB it was: the buffer is part of every
+/// forward's activation set, and at 8192 rows 256 MiB of the set's 736 MiB
+/// was this one (240 MiB more than a layer needs). The bound moves no output
+/// bit and no measurable time (`bench/results/embedgemma2_memory_m5pro.txt`).
+pub const PLE_RUN_BYTES: usize = 16 << 20;
+
+/// Elements of the per-layer-input buffer for a forward of `rows` padded
+/// rows: as many layers' worth as fit in `run_bytes`, at least one layer's,
+/// at most every layer's.
+fn ple_run_elements(run_bytes: usize, rows: usize, ple_dim: usize, n_layers: usize) -> usize {
+    (run_bytes / 4).max(rows * ple_dim).min(rows * ple_dim * n_layers)
+}
 
 /// A forward's fixed cost in padded rows, for [`pack_forwards`], measured as
 /// the intercept over the slope of `encode` time against padded rows (short
@@ -951,6 +1044,15 @@ struct Acts {
     embeds: Tensor,
     resid: Tensor,
     x: Tensor,
+    /// The `q|k|v` GEMM's output, `[rows, qkv_width]`. The same buffer as
+    /// `gate_up` (this is a clone of it, [`Self::gate_up`]'s width or wider):
+    /// the q/k-norm-RoPE kernel is the last reader of `qkv` in a layer, and
+    /// the MLP's `gate | up` GEMM is the next writer of that storage, after
+    /// the attention and the output projection; the next layer's `q|k|v`
+    /// GEMM writes it again only after the gated activation has read
+    /// `gate | up`. Each dispatch is barriered against the one before it, so
+    /// the two live ranges never overlap, in either [`GemmOperands`] mode
+    /// (both outputs are f32 in both).
     qkv: Tensor,
     q: Tensor,
     /// K and normed V, `[batch, capacity, kv_heads, head_dim]`, sized for
@@ -967,7 +1069,9 @@ struct Acts {
     /// [`Bf16Acts::wide`] and this is the attention output's width only.
     attn: Tensor,
     y: Tensor,
-    /// The MLP's `gate | up`, `[rows, 2 * intermediate]`, from one GEMM.
+    /// The MLP's `gate | up`, `[rows, 2 * intermediate]`, from one GEMM; sized
+    /// for the wider of that and the `q|k|v` row it shares its storage with
+    /// ([`Self::qkv`]).
     gate_up: Tensor,
     /// The normed per-layer inputs of a run of layers, `[rows, run * ple_dim]`
     /// (see [`PLE_RUN_BYTES`]).
@@ -1022,8 +1126,10 @@ fn queue_forwards<Io>(
 
 /// What one forward alone owns, because the host writes it before the forward
 /// runs and reads it after: a later forward must not rewrite it while the GPU
-/// may still be reading it, so each gets its own (small) set, and
-/// [`EmbedGemma2Model::encode`] keeps it alive until its one wait.
+/// may still be reading it, so each gets its own (small) set.
+/// [`EmbedGemma2Model::encode`] keeps all of it until the forwards are
+/// queued, then releases everything but `out` to the runtime's deferred
+/// queue, which holds it until its one wait has finished; `out` it reads after.
 struct ForwardIo {
     /// The ids as the embedding gather reads them: padding is id 0, and under
     /// [`EmbedGemma2Model::encode_multimodal`] each placeholder is `pad_token_id`.
@@ -1135,6 +1241,19 @@ impl EmbedGemma2Model {
                         "EmbedGemma2Model::load_with: bf16 operands need TensorOps, which this device lacks".into(),
                     );
                 }
+                // The attention's operands are bf16 too, and its bf16 kernel
+                // is compiled for these head dims only.
+                if let Some(s) = cfg
+                    .layers
+                    .iter()
+                    .find(|s| encoder_attn_tiled_bf16_entry(s.head_dim).is_none())
+                {
+                    return Err(format!(
+                        "EmbedGemma2Model::load_with: bf16 operands have no attention kernel for head dim {} \
+                         (64, 256 and 512 are compiled)",
+                        s.head_dim
+                    ));
+                }
                 Precision::Bf16
             }
         };
@@ -1214,6 +1333,11 @@ impl EmbedGemma2Model {
 
     pub fn config(&self) -> &EmbedGemma2Config {
         &self.cfg
+    }
+
+    /// The runtime this model was loaded on.
+    pub(crate) fn runtime(&self) -> &Arc<GpuRuntime> {
+        &self.rt
     }
 
     /// The operand precision this model was loaded with.
@@ -1343,6 +1467,78 @@ impl EmbedGemma2Model {
         self.encode_impl(WHAT, batch, Some(tokens), truncate_dim, trace)
     }
 
+    /// Everything about a batch of id sequences that [`Self::encode`] and
+    /// [`Self::encode_multimodal`] refuse before any GPU work, without
+    /// allocating or waiting: `truncate_dim` in range, a non-empty batch of at
+    /// most [`MAX_BATCH`] sequences, `trace` only for one, exact-f32 GEMMs when
+    /// loaded `ExactF32`, `pad_token_id` inside the vocabulary (`tokens` given),
+    /// and for each sequence: non-empty, at most [`Self::max_tokens`], every
+    /// id inside the vocabulary (a placeholder id is exempt when `tokens` is
+    /// given, since it is never looked up). Returns each sequence's count of
+    /// placeholder ids (zero for all when `tokens` is `None`), which the
+    /// caller matches against its soft rows. The multimodal composition
+    /// ([`crate::embedgemma2_mm`]) runs this before it queues a tower.
+    pub(crate) fn check_sequences(
+        &self,
+        what: &str,
+        ids: &[&[u32]],
+        tokens: Option<MmTokens>,
+        truncate_dim: Option<u32>,
+        trace: bool,
+    ) -> Result<Vec<usize>, String> {
+        let cfg = &self.cfg;
+        let dim_out = truncate_dim.unwrap_or(cfg.embedding_dim);
+        if dim_out == 0 || dim_out > cfg.embedding_dim {
+            return Err(format!(
+                "{what}: truncate_dim {dim_out} must be in 1..={}",
+                cfg.embedding_dim
+            ));
+        }
+        if ids.is_empty() {
+            return Err(format!("{what}: empty batch"));
+        }
+        if ids.len() > MAX_BATCH {
+            return Err(format!(
+                "{what}: {} sequences exceeds the batch limit {MAX_BATCH}",
+                ids.len()
+            ));
+        }
+        if trace && ids.len() != 1 {
+            return Err(format!("{what}: trace takes one sequence, got {}", ids.len()));
+        }
+        if self.operands == GemmOperands::ExactF32 && self.rt.f32_gemm_runs_relaxed() {
+            return Err(format!(
+                "{what}: the forward needs exact-f32 GEMMs; switch the runtime's relaxed precision off"
+            ));
+        }
+        if let Some(t) = &tokens {
+            if t.pad >= cfg.vocab {
+                return Err(format!("{what}: pad_token_id {} >= vocab {}", t.pad, cfg.vocab));
+            }
+        }
+        // A placeholder is looked up as the pad id, so only the other ids are
+        // bounded by the vocabulary.
+        let is_ph = |id: u32| tokens.is_some_and(|t| t.is_placeholder(id));
+        let mut placeholders = Vec::with_capacity(ids.len());
+        for (b, seq) in ids.iter().enumerate() {
+            if seq.is_empty() {
+                return Err(format!("{what}: sequence {b} is empty"));
+            }
+            if seq.len() > self.max_tokens as usize {
+                return Err(format!(
+                    "{what}: sequence {b} has {} tokens; the limit is {} (truncate it, or raise it with set_max_tokens)",
+                    seq.len(),
+                    self.max_tokens
+                ));
+            }
+            if let Some(&bad) = seq.iter().find(|&&id| id >= cfg.vocab && !is_ph(id)) {
+                return Err(format!("{what}: sequence {b}: token id {bad} >= vocab {}", cfg.vocab));
+            }
+            placeholders.push(seq.iter().filter(|&&id| is_ph(id)).count());
+        }
+        Ok(placeholders)
+    }
+
     /// The batching, packing and queueing of [`Self::encode`] and
     /// [`Self::encode_multimodal`] (`tokens`: `Some` for the latter, whose
     /// placeholders and soft rows it then checks and applies; `None` for the
@@ -1357,53 +1553,10 @@ impl EmbedGemma2Model {
     ) -> Result<EncodeOutput, String> {
         let cfg = &self.cfg;
         let hidden = cfg.hidden as usize;
+        let ids: Vec<&[u32]> = batch.iter().map(|s| s.ids).collect();
+        let placeholders = self.check_sequences(what, &ids, tokens, truncate_dim, trace)?;
         let dim_out = truncate_dim.unwrap_or(cfg.embedding_dim);
-        if dim_out == 0 || dim_out > cfg.embedding_dim {
-            return Err(format!(
-                "{what}: truncate_dim {dim_out} must be in 1..={}",
-                cfg.embedding_dim
-            ));
-        }
-        if batch.is_empty() {
-            return Err(format!("{what}: empty batch"));
-        }
-        if batch.len() > MAX_BATCH {
-            return Err(format!(
-                "{what}: {} sequences exceeds the batch limit {MAX_BATCH}",
-                batch.len()
-            ));
-        }
-        if trace && batch.len() != 1 {
-            return Err(format!("{what}: trace takes one sequence, got {}", batch.len()));
-        }
-        if self.operands == GemmOperands::ExactF32 && self.rt.f32_gemm_runs_relaxed() {
-            return Err(format!(
-                "{what}: the forward needs exact-f32 GEMMs; switch the runtime's relaxed precision off"
-            ));
-        }
-        if let Some(t) = &tokens {
-            if t.pad >= cfg.vocab {
-                return Err(format!("{what}: pad_token_id {} >= vocab {}", t.pad, cfg.vocab));
-            }
-        }
         for (b, s) in batch.iter().enumerate() {
-            let ids = s.ids;
-            if ids.is_empty() {
-                return Err(format!("{what}: sequence {b} is empty"));
-            }
-            if ids.len() > self.max_tokens as usize {
-                return Err(format!(
-                    "{what}: sequence {b} has {} tokens; the limit is {} (truncate it, or raise it with set_max_tokens)",
-                    ids.len(),
-                    self.max_tokens
-                ));
-            }
-            // A placeholder is looked up as the pad id, so only the other ids
-            // are bounded by the vocabulary.
-            let is_ph = |id: u32| tokens.is_some_and(|t| t.is_placeholder(id));
-            if let Some(&bad) = ids.iter().find(|&&id| id >= cfg.vocab && !is_ph(id)) {
-                return Err(format!("{what}: sequence {b}: token id {bad} >= vocab {}", cfg.vocab));
-            }
             if s.soft.len() % hidden != 0 {
                 return Err(format!(
                     "{what}: sequence {b}: {} soft values is not a multiple of hidden {hidden}",
@@ -1418,10 +1571,10 @@ impl EmbedGemma2Model {
                     i % hidden
                 ));
             }
-            let placeholders = ids.iter().filter(|&&id| is_ph(id)).count();
-            if placeholders != s.soft.len() / hidden {
+            if placeholders[b] != s.soft.len() / hidden {
                 return Err(format!(
-                    "{what}: sequence {b} has {placeholders} placeholder ids but {} soft rows",
+                    "{what}: sequence {b} has {} placeholder ids but {} soft rows",
+                    placeholders[b],
                     s.soft.len() / hidden
                 ));
             }
@@ -1476,17 +1629,29 @@ impl EmbedGemma2Model {
                 Ok(())
             },
         );
-        // Wait even when queuing failed: the buffers in `pending` (the failed
-        // forward's included, which `queue_forwards` registers before running
-        // it) and `acts` must outlive every command already queued on them (Metal 4 command
-        // buffers do not retain what they bind).
+        // Hand everything the GPU only reads back to the runtime *before* the
+        // wait: `acts` and each forward's uploaded inputs. A dropped pooled
+        // buffer is parked in the runtime's deferred-release queue, which holds
+        // it (the buffer outlives every queued command, though Metal 4 command
+        // buffers do not retain what they bind) until a waiting commit has seen
+        // the GPU finish, and that same wait then returns it to the pool's
+        // freelist. Dropped after the wait instead, the buffers reach the
+        // freelist only at the *next* commit, which the next `encode` comes
+        // after its `acts()` allocation: two sets of activations were live
+        // across consecutive calls (1472 MiB at 8192 rows, 736 with a wait in
+        // between). Only the output of each forward stays, to be read below.
+        let outs: Vec<(Vec<usize>, Tensor)> = pending.into_iter().map(|(chunk, io)| (chunk, io.out)).collect();
+        drop(acts);
+        // Wait even when queuing failed: the failed forward's io (which
+        // `queue_forwards` registers before running it) and `acts` are held by
+        // the runtime as above until the wait ends or the runtime is dropped.
         let waited = self.rt.synchronize();
         drop(scope);
         queued?;
         waited?;
-        for (chunk, io) in &pending {
+        for (chunk, out) in &outs {
             // Read the prefix columns straight from the mapping: one copy.
-            let out = io.out.buffer.try_contents_f32()?;
+            let out = out.buffer.try_contents_f32()?;
             for (n, &i) in chunk.iter().enumerate() {
                 embeddings[i * dim..(i + 1) * dim].copy_from_slice(&out[n * full..n * full + dim]);
             }
@@ -1703,7 +1868,7 @@ impl EmbedGemma2Model {
             norm_x_in(&layer.input_norm)?;
             let qkv_width = (cfg.q_heads + 2 * s.kv_heads) * s.head_dim;
             let qkv = at(&a.qkv, qkv_width)?;
-            self.project(&x_in, &layer.w_qkv, &qkv)?;
+            self.project(&x_in, &layer.w_qkv, &qkv, &a.attn)?;
             qwen35::attn_qk_norm_rope_columns(
                 rt,
                 &AttnShape {
@@ -1729,26 +1894,31 @@ impl EmbedGemma2Model {
                     k_cache: &a.k.buffer,
                     v_cache: &a.v.buffer,
                 },
+                a.q.dtype,
                 0,
                 s.rope_theta,
                 eps,
             )?;
-            encoder_attn(
+            // Q, K and V are in the attention's operand type: f32, or under
+            // `Bf16` the writer above stored them bf16.
+            let attn_dims = EncoderAttnDims {
+                batch: nb,
+                seq,
+                heads: cfg.q_heads,
+                heads_kv: s.kv_heads,
+                head_dim: s.head_dim,
+                window: if s.sliding { cfg.sliding_window } else { 0 },
+                scale: 1.0,
+            };
+            let attend = if bf.is_some() { encoder_attn_bf16 } else { encoder_attn };
+            attend(
                 rt,
                 &a.q.buffer,
                 &a.k.buffer,
                 &a.v.buffer,
                 &a.attn.buffer,
                 &io.lens,
-                EncoderAttnDims {
-                    batch: nb,
-                    seq,
-                    heads: cfg.q_heads,
-                    heads_kv: s.kv_heads,
-                    head_dim: s.head_dim,
-                    window: if s.sliding { cfg.sliding_window } else { 0 },
-                    scale: 1.0,
-                },
+                attn_dims,
             )?;
             let attn_width = cfg.q_heads * s.head_dim;
             let attn = at(&a.attn, attn_width)?;
@@ -1756,15 +1926,15 @@ impl EmbedGemma2Model {
                 Some(b) => {
                     let attn_in = view(&b.wide, rows_u, attn_width)?;
                     cast_f32_to_bf16_into(&attn, &attn_in)?;
-                    self.project(&attn_in, &layer.w_o, &y)?;
+                    self.project(&attn_in, &layer.w_o, &y, &a.qkv)?;
                 }
-                None => self.project(&attn, &layer.w_o, &y)?,
+                None => self.project(&attn, &layer.w_o, &y, &a.qkv)?,
             }
             rms_norm_residual_add_f32(rt, &y.buffer, &layer.post_attn_norm, &resid.buffer, rows_u, h, eps, 1.0)?;
 
             // MLP.
             norm_x_in(&layer.pre_ffn_norm)?;
-            self.project(&x_in, &layer.gate_up, &gate_up)?;
+            self.project(&x_in, &layer.gate_up, &gate_up, &a.attn)?;
             let window = |off: u32| Cols {
                 buf: &gate_up.buffer,
                 ld: 2 * inter,
@@ -1782,7 +1952,7 @@ impl EmbedGemma2Model {
                 rows_u,
                 inter,
             )?;
-            self.project(&mid, &layer.down, &y)?;
+            self.project(&mid, &layer.down, &y, &a.qkv)?;
             rms_norm_residual_add_f32(rt, &y.buffer, &layer.post_ffn_norm, &resid.buffer, rows_u, h, eps, 1.0)?;
 
             // Per-layer input: at the first layer of each run, one GEMM over
@@ -1815,9 +1985,9 @@ impl EmbedGemma2Model {
                 // rounded copy the gate projection reads.
                 Some(_) => {
                     cast_f32_to_bf16_into(&resid, &x_in)?;
-                    self.project(&x_in, &layer.ple_gate, &ple_gate)?;
+                    self.project(&x_in, &layer.ple_gate, &ple_gate, &a.qkv)?;
                 }
-                None => self.project(&resid, &layer.ple_gate, &ple_gate)?,
+                None => self.project(&resid, &layer.ple_gate, &ple_gate, &a.qkv)?,
             }
             qwen35::gated_act(
                 rt,
@@ -1835,7 +2005,7 @@ impl EmbedGemma2Model {
                 rows_u,
                 cfg.ple_dim,
             )?;
-            self.project(&ple_mid, &layer.ple_out, &y)?;
+            self.project(&ple_mid, &layer.ple_out, &y, &a.qkv)?;
             rms_norm_residual_add_f32(
                 rt,
                 &y.buffer,
@@ -1859,9 +2029,9 @@ impl EmbedGemma2Model {
             Some(b) => {
                 let pooled_in = view(&b.pooled, nb, h)?;
                 cast_f32_to_bf16_into(&pooled, &pooled_in)?;
-                self.project(&pooled_in, &self.projection, &out)?;
+                self.project(&pooled_in, &self.projection, &out, &a.qkv)?;
             }
-            None => self.project(&pooled, &self.projection, &out)?,
+            None => self.project(&pooled, &self.projection, &out, &a.qkv)?,
         }
         // A Matryoshka prefix normalizes its own columns; the rest are not read.
         l2_normalize_rows(rt, &out.buffer, nb, dim_out, cfg.embedding_dim)?;
@@ -1875,10 +2045,24 @@ impl EmbedGemma2Model {
     /// `out = a @ w` at the model's operand precision. `a` is in the mode's
     /// activation dtype (f32, or bf16 under `Bf16`, as `forward` stages it), so
     /// neither lane rounds or allocates anything of its own here.
-    fn project(&self, a: &Tensor, w: &Tensor, out: &Tensor) -> Result<(), String> {
+    ///
+    /// This is the text encoder's own entry and the only caller that opts in
+    /// to the small-M split-K ([`gemm_small_m`]): at 16 rows the down, o and
+    /// per-layer-input GEMMs run 2-3x faster, and the exact-f32 sum moves only
+    /// in its order (alone against batched, within `BATCH_ABS` of
+    /// `tests/embedgemma2_model.rs`). The free [`project`] the vision tower
+    /// calls keeps the default route, so its clips stay bit for bit what they
+    /// are alone. `Bf16` takes the route it always had.
+    ///
+    /// `scratch` is a buffer of the forward's activations that is idle at this
+    /// GEMM (neither its input nor its output, and nothing reads it after):
+    /// the lane's K-partition slices go there, so a forward holds no device
+    /// memory beyond [`Acts`]. One too small for the shape's partitions keeps
+    /// the single dispatch.
+    fn project(&self, a: &Tensor, w: &Tensor, out: &Tensor, scratch: &Tensor) -> Result<(), String> {
         match self.operands {
-            GemmOperands::ExactF32 => gemm(a, w, out, BACKEND),
-            GemmOperands::Bf16 => GemmOperands::Bf16.nn(a, w, out),
+            GemmOperands::ExactF32 => gemm_small_m(a, w, out, BACKEND, Some(scratch)),
+            GemmOperands::Bf16 => project(self.operands, a, w, out),
         }
     }
 
@@ -1902,23 +2086,27 @@ impl EmbedGemma2Model {
         let f32s = |shape: &[usize]| rt.alloc_tensor_unzeroed(shape, DType::F32);
         let bf16 = self.operands == GemmOperands::Bf16;
         let bf16s = |shape: &[usize]| rt.alloc_tensor_unzeroed(shape, DType::BF16);
+        let gate_up = f32s(&[r, qkv_w.max(2 * inter)])?;
         Ok(Acts {
             rows: r,
             nb,
             embeds: f32s(&[r, h])?,
             resid: f32s(&[r, h])?,
             x: f32s(&[r, h])?,
-            qkv: f32s(&[r, qkv_w])?,
-            q: f32s(&[r, q_w])?,
-            k: f32s(&[r, kv_w])?,
-            v: f32s(&[r, kv_w])?,
+            qkv: gate_up.clone(),
+            // The attention's operands: bf16 under `Bf16`, written so by the
+            // q/k-norm-RoPE kernel (no cast pass, and half the bytes read
+            // back by the attention).
+            q: if bf16 { bf16s(&[r, q_w])? } else { f32s(&[r, q_w])? },
+            k: if bf16 { bf16s(&[r, kv_w])? } else { f32s(&[r, kv_w])? },
+            v: if bf16 { bf16s(&[r, kv_w])? } else { f32s(&[r, kv_w])? },
             // Under `Bf16` the MLP's activation lives in `Bf16Acts::wide`.
             attn: f32s(&[r, if bf16 { q_w } else { q_w.max(inter) }])?,
             y: f32s(&[r, h])?,
-            gate_up: f32s(&[r, 2 * inter])?,
+            gate_up,
             // A run of per-layer inputs: within `ple_run_bytes`, or one layer's
             // when even that is larger, and never more than every layer's.
-            ple: f32s(&[(self.ple_run_bytes / 4).max(r * ple).min(r * ple * cfg.layers.len())])?,
+            ple: f32s(&[ple_run_elements(self.ple_run_bytes, r, ple, cfg.layers.len())])?,
             ple_gate: f32s(&[r, ple])?,
             ple_mid: if bf16 { bf16s(&[r, ple])? } else { f32s(&[r, ple])? },
             pooled: f32s(&[nb, h])?,
@@ -2188,6 +2376,37 @@ mod tests {
         );
         assert_eq!(r, Err("alloc".to_string()));
         assert_eq!(pending.len(), 1);
+    }
+
+    /// The per-layer-input buffer at the checkpoint's shape (24 layers of
+    /// 512) under the default bound: one layer's 16 MiB at 8192 rows, never
+    /// more than one layer's from there up, every layer's at a few hundred
+    /// rows. The default was 256 MiB, which at 8192 rows was 256 of the
+    /// activation set's 736 MiB.
+    #[test]
+    fn the_per_layer_input_run_is_bounded_at_the_default() {
+        use super::{ple_run_elements, PLE_RUN_BYTES};
+        const MIB: usize = 1 << 20;
+        let at = |rows: usize| ple_run_elements(PLE_RUN_BYTES, rows, 512, 24) * 4;
+        assert_eq!(PLE_RUN_BYTES, 16 * MIB);
+        assert_eq!(at(8192), 16 * MIB, "one layer at the largest single forward");
+        assert_eq!(at(2048), 16 * MIB, "4 layers of 4 MiB");
+        assert_eq!(at(341), 341 * 2048 * 24, "every layer fits");
+        assert_eq!(at(342), 16 * MIB, "one row more and the 24th layer no longer does");
+        assert_eq!(at(16), 16 * 2048 * 24, "a short query holds all 24 layers' inputs");
+        assert_eq!(at(32768), 64 * MIB, "the floor is one layer, however many rows");
+        // The old default, for contrast: this is what the bound removed.
+        assert_eq!(ple_run_elements(256 * MIB, 8192, 512, 24) * 4, 256 * MIB);
+        // Whatever the bound, one layer at least and every layer at most.
+        for bound in [1usize, 4, 1 << 20, usize::MAX / 8] {
+            for rows in [1usize, 7, 8192] {
+                let n = ple_run_elements(bound, rows, 512, 24);
+                assert!(
+                    (rows * 512..=rows * 512 * 24).contains(&n),
+                    "bound {bound} rows {rows}: {n}"
+                );
+            }
+        }
     }
 
     /// Each tiled entry's name spells the geometry the host builds its grid

@@ -33,10 +33,11 @@ using namespace metal;
 
 /// Normalize one head row with a zero-centred weight and apply transformers'
 /// partial RoPE, reading `src` and writing `dst` (never the same row).
+template <typename OT>
 inline void qwen35_norm_rope_row(
     device const float *src,
     device const float *weight,
-    device float *dst,
+    device OT *dst,
     uint D,
     uint rotary_dim,
     uint pos,
@@ -61,11 +62,11 @@ inline void qwen35_norm_rope_row(
         const float c = precise::cos(angle);
         const float s = precise::sin(angle);
         // Half-split: x * cos + cat(-x2, x1) * sin on the rotary slice.
-        dst[p] = x0 * c - x1 * s;
-        dst[p + half_rot] = x1 * c + x0 * s;
+        dst[p] = (OT)(x0 * c - x1 * s);
+        dst[p + half_rot] = (OT)(x1 * c + x0 * s);
     }
     for (uint d = rotary_dim + lane; d < D; d += 32u) {
-        dst[d] = src[d] * inv * (weight_bias + weight[d]);
+        dst[d] = (OT)(src[d] * inv * (weight_bias + weight[d]));
     }
 }
 
@@ -81,13 +82,14 @@ inline void qwen35_norm_rope_row(
 /// Row b's offset is `pos_ptr[b * pos_stride]` when `pos_ptr` is given (the
 /// `_posbuf` kernel; stride 0 shares one offset, 1 gives each row its own, for
 /// ragged continuations) and `pos_scalar` otherwise.
+template <typename OT>
 inline void qk_norm_rope_unit(
     device const float *p,
     device const float *q_norm_w,
     device const float *k_norm_w,
-    device float *q_out,
-    device float *k_cache,
-    device float *v_cache,
+    device OT *q_out,
+    device OT *k_cache,
+    device OT *v_cache,
     uint B, uint T, uint Hq, uint Hkv, uint D, uint rotary_dim,
     uint ld_p, uint q_off, uint k_off, uint v_off,
     device const uint *pos_ptr, uint pos_stride, ulong pos_scalar,
@@ -136,7 +138,7 @@ inline void qk_norm_rope_unit(
             inv = rsqrt(simd_sum(ss) / (float)D + eps);
         }
         for (uint d = lane; d < D; d += 32u) {
-            v_cache[slot + d] = src[d] * inv;   // `* 1` is exact when not normed
+            v_cache[slot + d] = (OT)(src[d] * inv);   // `* 1` is exact when not normed
         }
     }
 }
@@ -164,42 +166,52 @@ inline void qk_norm_rope_unit(
 /// as torch computes them (`nn::rope_inv_freq`); see `qwen35_rope_angle`.
 ///
 /// One simdgroup per (token, head) over Hq query, Hkv key and Hkv value heads.
-kernel void qwen35_attn_qk_norm_rope(
-    device const float *p [[buffer(0)]],
-    device const float *q_norm_w [[buffer(1)]],
-    device const float *k_norm_w [[buffer(2)]],
-    device float *q_out [[buffer(3)]],
-    device float *k_cache [[buffer(4)]],
-    device float *v_cache [[buffer(5)]],
-    constant uint &B [[buffer(6)]],
-    constant uint &T [[buffer(7)]],
-    constant uint &Hq [[buffer(8)]],
-    constant uint &Hkv [[buffer(9)]],
-    constant uint &D [[buffer(10)]],
-    constant uint &rotary_dim [[buffer(11)]],
-    constant uint &ld_p [[buffer(12)]],
-    constant uint &q_off [[buffer(13)]],
-    constant uint &k_off [[buffer(14)]],
-    constant uint &v_off [[buffer(15)]],
-    constant uint &pos_offset [[buffer(16)]],
-    constant uint &kv_capacity [[buffer(17)]],
-    constant float *inv_freq [[buffer(18)]],
-    constant float &eps [[buffer(19)]],
-    constant uint &slot_base [[buffer(20)]],
-    constant uint &pos_stride [[buffer(21)]],
-    constant uint &q_head_stride [[buffer(22)]],
-    constant float &weight_bias [[buffer(23)]],
-    constant uint &v_norm [[buffer(24)]],
-    uint tg [[threadgroup_position_in_grid]],
-    uint sg [[simdgroup_index_in_threadgroup]],
-    uint lane [[thread_index_in_simdgroup]],
-    uint tptg [[threads_per_threadgroup]])
-{
-    qk_norm_rope_unit(p, q_norm_w, k_norm_w, q_out, k_cache, v_cache, B, T, Hq, Hkv, D,
-                      rotary_dim, ld_p, q_off, k_off, v_off, nullptr, pos_stride, (ulong)pos_offset,
-                      slot_base, kv_capacity,
-                      inv_freq, eps, q_head_stride, weight_bias, v_norm, tg, sg, lane, tptg);
+#define QK_NORM_ROPE_KERNEL(NAME, OUT_T) \
+kernel void NAME( \
+    device const float *p [[buffer(0)]], \
+    device const float *q_norm_w [[buffer(1)]], \
+    device const float *k_norm_w [[buffer(2)]], \
+    device OUT_T *q_out [[buffer(3)]], \
+    device OUT_T *k_cache [[buffer(4)]], \
+    device OUT_T *v_cache [[buffer(5)]], \
+    constant uint &B [[buffer(6)]], \
+    constant uint &T [[buffer(7)]], \
+    constant uint &Hq [[buffer(8)]], \
+    constant uint &Hkv [[buffer(9)]], \
+    constant uint &D [[buffer(10)]], \
+    constant uint &rotary_dim [[buffer(11)]], \
+    constant uint &ld_p [[buffer(12)]], \
+    constant uint &q_off [[buffer(13)]], \
+    constant uint &k_off [[buffer(14)]], \
+    constant uint &v_off [[buffer(15)]], \
+    constant uint &pos_offset [[buffer(16)]], \
+    constant uint &kv_capacity [[buffer(17)]], \
+    constant float *inv_freq [[buffer(18)]], \
+    constant float &eps [[buffer(19)]], \
+    constant uint &slot_base [[buffer(20)]], \
+    constant uint &pos_stride [[buffer(21)]], \
+    constant uint &q_head_stride [[buffer(22)]], \
+    constant float &weight_bias [[buffer(23)]], \
+    constant uint &v_norm [[buffer(24)]], \
+    uint tg [[threadgroup_position_in_grid]], \
+    uint sg [[simdgroup_index_in_threadgroup]], \
+    uint lane [[thread_index_in_simdgroup]], \
+    uint tptg [[threads_per_threadgroup]]) \
+{ \
+    qk_norm_rope_unit(p, q_norm_w, k_norm_w, q_out, k_cache, v_cache, B, T, Hq, Hkv, D, \
+                      rotary_dim, ld_p, q_off, k_off, v_off, nullptr, pos_stride, (ulong)pos_offset, \
+                      slot_base, kv_capacity, \
+                      inv_freq, eps, q_head_stride, weight_bias, v_norm, tg, sg, lane, tptg); \
 }
+
+QK_NORM_ROPE_KERNEL(qwen35_attn_qk_norm_rope, float)
+
+/// [`qwen35_attn_qk_norm_rope`] storing q, k and v as bf16 (rounded to nearest
+/// even from the f32 result of the norm and RoPE, the one rounding a cast pass
+/// would apply, with no pass): the operands of the bf16 encoder attention
+/// (`encoder_attn_tiled_bf16_*`). Same slots and contract; `q_out`, `k_cache`
+/// and `v_cache` are bf16 buffers.
+QK_NORM_ROPE_KERNEL(qwen35_attn_qk_norm_rope_bf16, bfloat)
 
 /// [`qwen35_attn_qk_norm_rope`] with the position offset read from a device
 /// buffer (`*pos_offset_ptr`) instead of bound as a scalar, like

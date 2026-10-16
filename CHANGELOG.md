@@ -8,40 +8,110 @@ All notable changes to `tessl` are recorded here. The format follows
 
 ### Added
 
-- **A small-M exact-f32 NN GEMM lane: parallel K-partitions**
-  (`gemm_nn_splitk_par_f32`, kernel `matmul2d_tensorops_nn_splitk_par_f32`,
-  `bench_gemm_routes` lane `nnsmall`, `profile_embedgemma2` `PROFILE_ROWS`). An
-  exact-f32 NN GEMM whose C is a few tiles (N up to 512, K of 512 or more,
-  under 64 tiles of 32x32: M up to 96 at N 512) used to run one
-  single-simdgroup threadgroup per tile, each walking all of K, so its time was
-  that walk's latency (EmbeddingGemma 2 at 1x16: the down, o and
-  per-layer-input GEMMs at 17-22 % of the copy bandwidth). It now runs every
-  K-partition's tiles in one dispatch into an unzeroed scratch of one slice
-  per partition and `reduce_partitions_f32` adds the slices in partition
-  order: the parallel TN split-K's design (whose binder it shares, now
-  `splitk_par` over `par_shape`, the one owner of its `u32` and scratch
-  limits) for the NN layout, in `gemm`. The width is sized from one tile row,
-  so it does not move with M inside the gate. The long-K split-K keeps the
-  shapes it had (`nn_f32_route` asks it first); bf16, f16, relaxed f32, a
-  forced tile, TN, NT, every N over 512, every K under 512 and every shape
-  with 64 or more tiles are unchanged. The sum is rounded in another order
-  than the single dispatch, so the bits differ at these shapes and **a row's
-  bits depend on M across the gate** (M up to 96 and M of 97 or more at N 512;
-  the result is deterministic), within the f32 dot-product bound
-  `gamma_(K+8) * sum|a.b|` every exact-f32 GEMM is held to: the worst of the
-  tests' results used 0.0039 of it (`tests/gemm_small_m.rs`: M in {1, 7, 16,
-  63, 64} at K/N of 2048/512, 1024/512 and 512/512, ragged and offset views, a
-  poisoned scratch, bit-for-bit repeats, rank-one operands, the route by
-  traced kernel). Measured on an M5 Pro with the interleaved `bench_paired`
-  (`bench/results/embedgemma2_small_m_m5pro.txt`): EmbeddingGemma 2's 1x16
-  encode takes 0.63x of the time (1.6x faster), 1x64 0.73x; 64x32 and 8x1024
-  are unchanged (1.001x, 0.996x). Known conflict: the audio tower's soft-token
-  projection (K 1536, N 512) is inside the gate, so
-  `embedgemma2_audio_model` `audio_tower_matches_transformers_sdpa`, which
-  pins each clip's soft tokens bit for bit alone against batched, reads 7.6e-6
-  and 9.5e-6 of drift and fails. A bf16 form of the lane was built and
-  removed (it moved the bf16 text test's alone-against-batched check by
-  2.4e-4 to 5.7e-4; commit `b85f5e1`).
+- **EmbeddingGemma 2 vision tower: a `GemmOperands::Bf16` mode, measured and
+  sped up** (`EmbedGemma2VisionModel::load_with(rt, st, cfg, operands)`; `load`
+  is `ExactF32`, bit for bit what it was: tiny hash `a1e38036581d2780`, real
+  checkpoint 1 image `d9a0d85dd2f8f279` and 8 images `4f48fd6b310f86a5`, equal
+  to the build at `433e659`). `Bf16` keeps the 16 layers' projections bf16 on the
+  device (335.6 MB against 639.6 MB), runs every GEMM bf16 x bf16 with f32
+  accumulation through the text encoder's own `embedgemma2::project`, the
+  attention on `encoder_attn_bf16` (head dim 64), and keeps the residual stream,
+  norms, RoPE arithmetic, pool and embedder norm f32; new kernel
+  `vision_qkv_norm_rope_bf16` stores bf16 with the f32 kernel's rounding (bit
+  equal to rounding its output). The facade's one `GemmOperands` now covers the
+  text encoder and the vision tower (the audio tower stays exact f32; the C ABI
+  `operands` and Python `operands=` documentation say so). Held to the f64
+  forward over the same bf16 weights on a tiny checkpoint (relative bounds
+  `2e-2` patch embedder, `5e-2` layers and soft tokens, token cosine `0.999`,
+  fixed before the first run; observed `9.5e-4`, `6.7e-3`, `5.7e-3`, `0.99998`;
+  batched, reversed and split calls bit-identical) and, on the real
+  checkpoint, image embeddings end to end (bf16 tower and text encoder) at
+  cosine `0.99998769` and `0.99998850` against fp32 (bound `0.9999`), mean
+  `1 - cos` `1.19e-5` against transformers' own bf16 run's `2.61e-5`. New bins
+  `bench_embedgemma2_vision` and `profile_embedgemma2_vision` (a replica of the
+  forward checked bit-equal to `encode_images`, with the quiet-machine gate
+  that now lives in `src/bin/common`). Speed on an Apple M5 Pro, real
+  checkpoint, paired interleaved rounds on a shared GPU: `Bf16` is 2.8x to 3.1x
+  faster than `ExactF32` (1 image 63.5 against 187 ms, 8 images 547 against
+  1683 ms over 8 rounds, spreads and the contended rounds in
+  `bench/results/embedgemma2_vision_speed_m5pro.txt`); the rope kernel, formerly
+  one `cos`/`sin` table per head, now forms one per patch for up to six heads
+  (8.4 to 3.1 ms at one image, output bits unchanged). Stage ranking before and
+  after: `bench/results/embedgemma2_vision_profile_m5pro.txt`. The multimodal
+  tiny fixture's vision tower is two heads of 64 (the bf16 attention is not
+  compiled for 32).
+- **EmbeddingGemma 2, text, images and audio in one call, from Rust, C and
+  Python** (`tessl::embedgemma2_mm`: `EmbedGemma2Multimodal::{load, load_from,
+  from_parts, encode, text, vision, audio}`, `MmItem`; audit gaps G3, G8). One
+  `config.json` read and one safetensors open load the text encoder and both
+  towers; `encode` embeds a batch of text ids, images, clips and caller ids
+  with placeholders (`MmItem::Media`, the `j`-th image or audio placeholder
+  takes the `j`-th soft row of that modality) in one call, with every refusal
+  before any allocation or wait. It is a composition of the existing owners:
+  the towers gain `check_images` / `check_clips` (their pre-GPU checks, as a
+  soft-token count per item), `queue_images` / `queue_audio` (no wait;
+  `PendingImages` / `PendingAudio` hold the buffers, wait on drop, and
+  `collect`) and `encode_images` / `encode_audio` become queue + wait +
+  collect, now queued under a `GpuRuntime::async_scope` (before, a runtime in
+  its default mode committed and waited per dispatch);
+  `EmbedGemma2Model::check_sequences` is `encode`'s id checks, shared. A call
+  with media waits twice (the towers, then the text encoder: the soft tokens
+  cross the host), a call of texts once, three for the by-hand composition;
+  the GPU-resident hand-off that would make it one is not done. `GemmOperands`
+  applies to the text encoder and, from the vision-tower bf16 entry below, the vision tower; the audio tower stays exact f32.
+  C ABI, additive (ABI 11 unchanged): `tessl_embedgemma2_load_multimodal` and
+  `tessl_embedgemma2_{encode_images, encode_audio}` take a processor's
+  `pixel_values` / `image_position_ids` / `input_features` / mask as flat
+  arrays with CSR offsets, bound every length before it sizes a slice, and
+  write the output only on success; `tests/capi_contract.rs` holds them to the
+  signature rules (it learned `c_uint8`). Python: `EmbedGemma2.from_pretrained(dir,
+  multimodal=True)`, `encode_images`, `encode_audio` (numpy or torch, duck-typed,
+  never imported) and `embed_images` / `embed_audio` (a processor you pass in);
+  no new dependency. Bit for bit the by-hand composition on a tiny checkpoint;
+  on the real one (opt-in) texts, images and clips in one call within 3.8e-7 of
+  sentence-transformers, cosine 1.000000000, in Rust and Python. See
+  `docs/embedgemma2.md`, One call.
+- **An opt-in small-M exact-f32 NN GEMM path: parallel K-partitions**
+  (`gemm_small_m`, `gemm_nn_splitk_par_f32`, kernel
+  `matmul2d_tensorops_nn_splitk_par_f32`, `bench_gemm_routes` lane `nnsmall`,
+  `profile_embedgemma2` `PROFILE_ROWS`). An exact-f32 NN GEMM whose C is a few
+  tiles (N up to 512, K of 512 or more, under 64 tiles of 32x32: M up to 96 at
+  N 512) used to run one single-simdgroup threadgroup per tile, each walking
+  all of K, so its time was that walk's latency (EmbeddingGemma 2 at 1x16: the
+  down, o and per-layer-input GEMMs at 17-22 % of the copy bandwidth). A call
+  to `gemm_small_m` now runs every K-partition's tiles in one dispatch into a
+  scratch of one slice per partition and `reduce_partitions_f32` adds the
+  slices in partition order: the parallel TN split-K's design (whose binder it
+  shares, now `splitk_par` over `par_shape`, the one owner of its `u32` and
+  scratch limits) for the NN layout. The width is sized from one tile row, so
+  it does not move with M inside the gate. **The opt-in is the call's**, a
+  parameter and not a setting of the runtime or the process: `gemm`,
+  `gemm_tiled`, `GemmOperands::ExactF32.nn`, bf16, f16, relaxed f32, TN, NT and
+  every other entry are unchanged and compute the bits they did, so the vision
+  and audio towers (through the shared `embedgemma2::project`), Qwen3.5 and
+  external consumers are untouched. The scratch is the caller's
+  (`scratch: Some(tensor)`, an idle f32 tensor of at least `ceil(K / k_tile) *
+  M * N` elements; one too small keeps the single dispatch) or, with `None`, a
+  pool allocation. `EmbedGemma2Model`'s text encoder is the one caller that
+  opts in (`ExactF32` only), with its idle `qkv | gate_up` buffer as the
+  scratch, so a forward allocates nothing more
+  (`tests/embedgemma2_small_m.rs`). The sum is rounded in another order than
+  the single dispatch, so **the text encoder's bits at these shapes depend on
+  M across the gate** (M up to 96 and M of 97 or more at N 512; the result is
+  deterministic), within the f32 dot-product bound `gamma_(K+8) * sum|a.b|`
+  every exact-f32 GEMM is held to (worst result 0.0039 of it,
+  `tests/gemm_small_m.rs`: M in {1, 7, 16, 63, 64} at K/N of 2048/512,
+  1024/512 and 512/512, ragged and offset views, a poisoned scratch, a
+  caller's scratch, bit-for-bit repeats, rank-one operands, the route by
+  traced kernel with and without the opt-in) and within the existing
+  alone-against-batched bounds (a text alone against batched: 0 to 1.7e-7 on
+  the real checkpoint, 8.9e-8 to 1.3e-7 at the real GEMM shapes with synthetic
+  weights, against `BATCH_ABS` 1e-5). Measured on an M5 Pro with the
+  interleaved `bench_paired` (`bench/results/embedgemma2_small_m_m5pro.txt`):
+  EmbeddingGemma 2's 1x16 encode takes 0.60x of the time (1.66x faster), 1x64
+  0.70x; 64x32 and 8x1024 are unchanged (1.000x), the real checkpoint's device
+  peak too. A bf16 form of the lane was built and removed (it moved the bf16
+  text alone-against-batched check by 2.4e-4 to 5.7e-4; commit `b85f5e1`).
 
 - **EmbeddingGemma 2's multimodal merge** (`EmbedGemma2Model::encode_multimodal`,
   `MmSequence`, `EmbedGemma2Config::{image_sequence, audio_sequence,
@@ -63,7 +133,31 @@ All notable changes to `tessl` are recorded here. The format follows
   better against fp32) and to an f64 forward with an `inputs_embeds`
   override (`tests/embedgemma2_mm_tiny.rs`). The f64 host forward and its
   bounds moved from `tests/embedgemma2_tiny.rs` to `tests/common/embedgemma2.rs`
-  to be shared. The C and Python entries still embed text only.
+  to be shared. (The C and Python entries then embedded text only; see the
+  entry above.)
+- **bf16 operand tiles for the encoder attention, and the matrix-unit kernel at
+  head dims 32 and 64** (`kernels/encoder_attn_tiled.h`, `encoder_attn.metal`,
+  `kernels/tune/encoder_attn_tune.metal`; `embedgemma2::encoder_attn_bf16`,
+  `EncoderAttnKernel::TiledBf16`, `nn::attn_kv_capacity_bf16`).
+  `attn_tiled.h`'s template now takes its Q/K/V element type and its P tile
+  type separately; the f32 instantiations (Qwen3.5 prefill, the training LSE
+  forward, the ExactF32 encoder) compile to the same IR as before.
+  Under `GemmOperands::Bf16` the EmbeddingGemma 2 attention reads bf16 Q, K and
+  V and keeps scores, softmax, accumulator and output f32; P is rounded to
+  bf16 and the row sum is taken over the rounded weights. The q/k-norm-RoPE
+  writer emits bf16 directly (`qwen35_attn_qk_norm_rope_bf16`), so there is no
+  cast pass. Geometries come from a measured sweep (BQ x BK x NSG): D=64 f32
+  and bf16 `q32_k32_sg2`, D=32 f32 `q16_k32_sg1`, D=256 bf16 `q32_k64_sg4`,
+  D=512 bf16 `q32_k128_sg8`. `encoder_attn` now routes head dims 32 and 64 to
+  the tiled kernel (2.3x and 2.8-2.9x over the rows kernel). Measured on an M5
+  Pro, the bf16 kernel is 3.0-3.1x (D=256), 3.6-3.8x (D=512) and 2.5-2.6x
+  (vision D=64) faster than the f32 tiled kernel; the bf16 model forward is
+  0.87x / 0.66x / 0.54x the time at 32x256 / 8x1024 / 2x4096. ExactF32 output
+  hashes are unchanged. New bench `bench_encoder_attn` (paired, min-of-N,
+  `BENCH_SWEEP=1` for the tune candidates); numbers and method in
+  `bench/results/embedgemma2_attention_m5pro.txt`. The bf16 kernel is held to
+  an error bound derived from the bf16 unit roundoff in
+  `tests/embedgemma2_kernels.rs`.
 - **A bf16-operand EmbeddingGemma 2** (`EmbedGemma2Model::load_with(.., GemmOperands::Bf16)`,
   `operands`, `weight_bytes`; `load` stays `ExactF32`, bit-for-bit unchanged).
   The projections stay bf16 on the device (517 MiB of weights against 778 MiB
@@ -118,6 +212,25 @@ All notable changes to `tessl` are recorded here. The format follows
   (`EMBEDGEMMA2_MM_ATTN=eager` keeps the old references, which disagree from
   layer 0; text and vision change only by rounding).
   See `docs/embedgemma2.md`.
+- **The audio tower's stages are profiled and the top ones fixed**
+  (`profile_embedgemma2_audio`, `bench_embedgemma2_audio`; `AudioStage` and
+  `EmbedGemma2Audio::{set_stage_mask, clear_stage_mask}` are `#[doc(hidden)]`
+  for the profiler). The second subsampling conv is an 8x8 simdgroup-MMA kernel
+  (64 → 14 ms on a batch of 8 clips of 30 s, stage alone, two profile runs that
+  were not interleaved); the residual adds and
+  norms, the GLU with the depthwise conv, norm and SiLU, and the q/k/v input
+  clamps are fused (`eg2a_rms_norm` takes two row stages, `eg2a_lconv` replaces
+  `eg2a_glu` and `eg2a_dwconv1d_causal`); q, k and v are one GEMM when their
+  clamps are equal (they are in all 12 layers of the checkpoint); the attention
+  computes only the visible candidates, one butterfly reduce-scatter for the
+  logits, and reads the fused projection in place: 28 → 17 dispatches a layer,
+  results inside the unchanged bounds, a clip still bit for bit the same alone
+  or batched. `AudioConfig::validate` and the attention now refuse more than 16
+  past frames and a masked-logit value above `-(cap + 104)`. The end-to-end
+  interleaved benchmark was inside the noise of a shared GPU (the control moved
+  as much as the change), so no speedup is claimed; the profile shows the
+  non-GEMM share of the forward falling from 29 % to 17 % on the batch. See
+  `docs/embedgemma2.md` "Speed" and `bench/results/embedgemma2_audio_*`.
 - **Per-entry host reads and writes of the Qwen3.5 parameter table**
   (`Qwen35Model::{read_parameter_host, write_parameter_host,
   read_gradient_host, read_adamw_moment_host, write_adamw_moment_host}`).
@@ -580,6 +693,10 @@ All notable changes to `tessl` are recorded here. The format follows
 
 ### Changed (breaking)
 
+- **`qwen35::attn_qk_norm_rope_columns` takes an output `DType`** (after
+  `targets`): `DType::F32` is the previous behaviour, `DType::BF16` (scalar
+  `RopePos` only) writes the rounded values for the bf16 attention kernels.
+
 - **`GpuRuntime::shared_event()` returns a handoff event, not the lifetime
   event.** The allocator reset, const-arena rewind, pool recycling and the
   drop wait now read a crate-private event only tessl's queue signals;
@@ -800,6 +917,31 @@ All notable changes to `tessl` are recorded here. The format follows
 
 ### Changed
 
+- `embedgemma2_vision::axial_qkv_norm_rope` (and the new `_bf16`) refuse a head dim over 512 (the shared rope table holds 8 pairs per lane); the config parser already limited `vision_config.head_dim` to 32, 64, 256 or 512, so no config loads differently.
+- README and the crate docs count 282 kernel entry points (the vision tower's bf16 rope kernel is the new one).
+- **EmbeddingGemma 2's device peak is 400 MiB above the model at 8192 rows,
+  not 1472** (audit gap G6; `bench/results/embedgemma2_memory_m5pro.{txt,json,png}`).
+  Three changes, no output bit moved (hashes of the real checkpoint's embeddings
+  and the tiny model's, in both `GemmOperands` modes, equal 16f5190's), and no
+  slowdown the shared machine's noise lets through (min-of-N against 16f5190
+  0.86 to 1.05 over three paired series; the run-to-run spread there, 1.2 to 28,
+  is too wide to verify a 3 % bound, and the results file says so; the
+  per-layer-input bound alone, measured on one binary, is 0.96 to 1.03):
+  `encode` hands its activations and each forward's uploaded inputs to the
+  runtime before its one wait, so that wait recycles them and the next call's
+  allocations find them (they were recycled a call late, and two sets were
+  live across consecutive calls); `PLE_RUN_BYTES` is 16 MiB, not 256 (a run
+  is one layer's inputs from 8192 rows, `-240 MiB` a set); and the `q|k|v`
+  GEMM's output shares a buffer with the MLP's `gate | up` (`-96 MiB`). One
+  encode and four back to back now peak at the same figure: 400.3 to 400.6 MiB
+  at 32x256, 8x1024 and 2x4096 (736 and 1472 before), 112.9 MiB at 64x32 (433),
+  2.0 MiB at 1x16 (4.25); Bf16 392.4 at 8x1024 (1456.4). The towers' `encode`s
+  still hold their activations across the wait (see the audit). New:
+  `tests/embedgemma2_memory.rs` (consecutive calls hold one set; one encode's
+  device bytes equal the itemized set to the byte, both modes; an ignored
+  hash printer), a `ple_run_elements` unit test, `profile_embedgemma2`'s
+  `memory-table`, `hash` and `PROFILE_OPERANDS`, and `bench_embedgemma2`'s
+  `BENCH_PLE_RUN_BYTES`.
 - **GDN training reads q/k/v where the model keeps them.**
   `gdn_train_forward_windowed` / `gdn_train_backward_windowed` take `(ld, off)`
   column windows of the conv output and write `dq`/`dk`/`dv` back the same way,

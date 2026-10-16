@@ -401,7 +401,51 @@ pub(crate) fn use_relaxed_f32(rt: &GpuRuntime, backend: GemmBackend) -> bool {
 /// than 64 tiles of 128×64; 128×64 otherwise (`coop_narrow`). Both
 /// geometries are the same cooperative helper and give the same bits.
 pub fn gemm(a: &Tensor, b: &Tensor, c: &Tensor, backend: GemmBackend) -> Result<(), String> {
-    gemm_dispatch(a, b, c, backend, None)
+    gemm_dispatch(a, b, c, backend, None, Route::Default, None)
+}
+
+/// [`gemm`] with the call opting in to the parallel small-M split-K: an
+/// exact-f32 NN whose C is a few tiles (N up to 512, K of 512 or more, under
+/// 64 tiles of 32×32, `nn_small_par_k_tile`) runs every K-partition in one
+/// dispatch into a scratch and `reduce_partitions_f32` adds the slices in
+/// partition order, 2-3× faster than the single dispatch at 16 rows.
+///
+/// The opt-in is the call's, never a setting of the runtime or the process:
+/// [`gemm`] and every other entry keep the route they had, so a caller that
+/// pins bits (the vision and audio towers, Qwen3.5, external consumers) is
+/// untouched. The sum is rounded in another order than the single dispatch,
+/// so a row's bits at these shapes depend on M across the gate (M up to 96
+/// and M of 97 or more at N 512), within the f32 dot-product bound every
+/// exact-f32 GEMM meets; the result is deterministic. Operands other than
+/// exact f32 (bf16, f16, relaxed f32) and the simdgroup backend take the
+/// route [`gemm`] gives them.
+///
+/// `scratch` is where the K-partitions' slices go: `None` takes a pool
+/// allocation of `ceil(K / k_tile) * M * N` f32 per call (not recycled until
+/// the next commit, so a forward of many such GEMMs holds them all); `Some`
+/// is a caller's f32 tensor that is idle at this point, of which the lane
+/// overwrites the first `ceil(K / k_tile) * M * N` elements (nothing in it is
+/// read first) and which must not be bound by the dispatches around it as
+/// anything the lane would race with. A scratch too small for the shape's
+/// partitions takes the single dispatch instead; one of another dtype or
+/// runtime is an error.
+pub fn gemm_small_m(
+    a: &Tensor,
+    b: &Tensor,
+    c: &Tensor,
+    backend: GemmBackend,
+    scratch: Option<&Tensor>,
+) -> Result<(), String> {
+    gemm_dispatch(a, b, c, backend, None, Route::SmallM, scratch)
+}
+
+/// What a call asks of the exact-f32 NN's routing, beyond the shape.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Route {
+    /// The route every caller had before the small-M split-K.
+    Default,
+    /// The call opted in to the small-M split-K ([`gemm_small_m`]).
+    SmallM,
 }
 
 /// [`gemm`] on an explicit cooperative tile.
@@ -411,7 +455,7 @@ pub fn gemm(a: &Tensor, b: &Tensor, c: &Tensor, backend: GemmBackend) -> Result<
 /// simdgroup backend have no cooperative tile and are refused. The call
 /// validates with the same checks as [`gemm`] before a kernel is chosen.
 pub fn gemm_tiled(a: &Tensor, b: &Tensor, c: &Tensor, backend: GemmBackend, tile: EpiTile) -> Result<(), String> {
-    gemm_dispatch(a, b, c, backend, Some(tile))
+    gemm_dispatch(a, b, c, backend, Some(tile), Route::Default, None)
 }
 
 fn gemm_dispatch(
@@ -420,6 +464,8 @@ fn gemm_dispatch(
     c: &Tensor,
     backend: GemmBackend,
     tile: Option<EpiTile>,
+    route: Route,
+    scratch: Option<&Tensor>,
 ) -> Result<(), String> {
     let (m, n, k) = validate_gemm(
         a,
@@ -464,10 +510,17 @@ fn gemm_dispatch(
             let pipeline = rt.pipeline(kernel)?;
             dispatch_tensorops_nn_coop(rt, &pipeline, a, b, c, m, n, k, geom)?;
         }
-        GemmBackend::TensorOps => match nn_f32_route(m, n, k) {
+        GemmBackend::TensorOps => match nn_f32_route(m, n, k, route) {
             NnF32Route::SequentialSplit(k_tile) => gemm_nn_splitk_f32(a, b, c, (m, n, k), k_tile)?,
-            NnF32Route::SmallPar(k_tile) => splitk_par(a, b, c, (m, n, k), k_tile, SplitKPar::NnF32, false, "gemm")?,
-            NnF32Route::Single => {
+            // A caller's scratch too small for the partitions keeps the
+            // single dispatch (a dtype or runtime mismatch is the binder's
+            // error to report).
+            NnF32Route::SmallPar(k_tile)
+                if scratch.is_none_or(|s| s.dtype != DType::F32 || s.numel() >= k.div_ceil(k_tile) * m * n) =>
+            {
+                splitk_par_in(a, b, c, (m, n, k), k_tile, SplitKPar::NnF32, false, "gemm", scratch)?
+            }
+            NnF32Route::Single | NnF32Route::SmallPar(_) => {
                 let pipeline = rt.pipeline(backend.kernel_name_f32())?;
                 // Zero-tax: pack C-zero + matmul into one binder (~−1 binder/GEMM).
                 dispatch_tensorops_nn(rt, &pipeline, a, b, c, m, n, k, TILE_F32)?;
@@ -1649,7 +1702,7 @@ fn tn_par_k_tile(m: usize, n: usize, k: usize) -> Option<usize> {
 /// does not move with M: inside the gate a row sums K in the same partitions,
 /// in the same order, alone or in any batch. Across the gate (the single
 /// dispatch above it) the order differs, the one place a row's bits depend
-/// on M.
+/// on M; only a call that opted in ([`gemm_small_m`]) reaches the gate.
 ///
 /// The gate, measured on the M5 Pro by `bench_gemm_routes` lane `nnsmall`
 /// (bench/results/embedgemma2_small_m_m5pro.txt):
@@ -1689,23 +1742,18 @@ fn nn_small_par_k_tile(m: usize, n: usize, k: usize) -> Option<usize> {
 /// forward's smallest). Below it the lane measured 1.15-1.45x on the audio
 /// tower's K 256 GEMMs of 11-16 µs (`bench_gemm_routes` lane `nnsmall`,
 /// shapes `audio *`), a saving of 3-5 µs each, against 1.8-3x and 15-60 µs
-/// from K 512; those shapes are left on the one route, which also keeps the
-/// tiny audio configurations' clips bit for bit alone and batched (their
-/// GEMMs are K 256 and under).
+/// from K 512; those shapes are left on the one route.
 const NN_SMALL_PAR_MIN_K: usize = 512;
 
 /// The widest N the lane takes: 16 tile columns, the range measured (every
-/// GEMM it speeds up has N 512). A row's bits depend on M across the gate (the
-/// single dispatch sums K in one pass, the lane in partitions), so the lane is
-/// kept to what was measured rather than reaching every few-tile GEMM. Known
-/// cost: the audio tower's soft-token projection (K 1536, N 512) is in range,
-/// and `tests/embedgemma2_audio_model.rs` pins each clip's soft tokens bit
-/// for bit alone (about 25 rows, the lane) against batched (over 96 rows, one
-/// dispatch); it drifts by 1e-5.
+/// GEMM it speeds up has N 512). The lane is kept to what was measured rather
+/// than reaching every few-tile GEMM: past it the single dispatch already
+/// fills the GPU at 16 rows (qkv, gate|up), and the forced lane measured
+/// 0.6-1.2x there.
 const NN_SMALL_PAR_MAX_N: usize = 512;
 
 /// The path an exact-f32 NN takes: [`gemm`]'s one routing decision for the
-/// non-cooperative lane.
+/// non-cooperative lane. [`Route::Default`] never returns `SmallPar`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum NnF32Route {
     /// One dispatch over all of K, C zeroed first (`matmul2d_tensorops_f32`).
@@ -1722,10 +1770,10 @@ enum NnF32Route {
 /// first, so the shapes it already took (the LM head's input gradient, and
 /// the ragged ones `tests/gemm_ragged_shapes.rs` pins) keep their kernel even
 /// where their C is also a few tiles; the small-M lane takes what is left.
-fn nn_f32_route(m: usize, n: usize, k: usize) -> NnF32Route {
+fn nn_f32_route(m: usize, n: usize, k: usize, route: Route) -> NnF32Route {
     if let Some(k_tile) = nn_splitk_k_tile(m, n, k) {
         NnF32Route::SequentialSplit(k_tile)
-    } else if let Some(k_tile) = nn_small_par_k_tile(m, n, k) {
+    } else if let Some(k_tile) = nn_small_par_k_tile(m, n, k).filter(|_| route == Route::SmallM) {
         NnF32Route::SmallPar(k_tile)
     } else {
         NnF32Route::Single
@@ -1735,8 +1783,8 @@ fn nn_f32_route(m: usize, n: usize, k: usize) -> NnF32Route {
 /// `C [M, N] = A · B` for `A [M, K]` and `B [K, N]`, exact f32, as
 /// `ceil(K / k_tile)` K-partitions computed in one dispatch into a scratch
 /// and added in partition order (`matmul2d_tensorops_nn_splitk_par_f32`, then
-/// `reduce_partitions_f32`). [`gemm`] routes the small-M shapes here by
-/// [`nn_small_par_k_tile`]; this entry takes the width, so a bench can sweep
+/// `reduce_partitions_f32`). [`gemm_small_m`] routes the small-M shapes here
+/// by `nn_small_par_k_tile`; this entry takes the width, so a bench can sweep
 /// it and a test can force the lane at any shape.
 pub fn gemm_nn_splitk_par_f32(a: &Tensor, b: &Tensor, c: &Tensor, k_tile: usize) -> Result<(), String> {
     const WHAT: &str = "gemm_nn_splitk_par_f32";
@@ -1881,11 +1929,31 @@ fn splitk_par(
     a_km: &Tensor,
     b_kn: &Tensor,
     c: &Tensor,
+    dims: (usize, usize, usize),
+    k_tile: usize,
+    lane: SplitKPar,
+    accumulate: bool,
+    what: &str,
+) -> Result<(), String> {
+    splitk_par_in(a_km, b_kn, c, dims, k_tile, lane, accumulate, what, None)
+}
+
+/// [`splitk_par`] with the scratch the caller's own: `Some(scratch)` is used
+/// in place of a pool allocation (f32, at least `ceil(K / k_tile) * M * N`
+/// elements, none of it read before it is written), so a caller that holds a
+/// buffer idle at that point (the text encoder's `qkv | gate_up`) adds no
+/// device memory for the lane.
+#[allow(clippy::too_many_arguments)]
+fn splitk_par_in(
+    a_km: &Tensor,
+    b_kn: &Tensor,
+    c: &Tensor,
     (m, n, k): (usize, usize, usize),
     k_tile: usize,
     lane: SplitKPar,
     accumulate: bool,
     what: &str,
+    scratch_in: Option<&Tensor>,
 ) -> Result<(), String> {
     let rt = a_km.runtime();
     let (kernel, tile) = lane.kernel();
@@ -1909,9 +1977,25 @@ fn splitk_par(
     // (`nn_small_par_lane_writes_every_slice_element` poisons the scratch to
     // show it) and the reduce reads nothing else, so it takes the unzeroed
     // allocation: no host pass over the scratch ahead of a latency-bound GEMM.
-    let scratch = match lane {
-        SplitKPar::NnF32 => rt.alloc_tensor_unzeroed(&[scratch_len], DType::F32)?,
-        SplitKPar::F32 | SplitKPar::Bf16 => rt.alloc_temp_f32(&[scratch_len])?,
+    let owned;
+    let scratch = match scratch_in {
+        Some(s) => {
+            if s.dtype != DType::F32 || s.numel() < scratch_len || !std::sync::Arc::ptr_eq(s.runtime(), rt) {
+                return Err(format!(
+                    "{what}: the caller's scratch ({:?}, {} elements) does not hold {scratch_len} f32 on this runtime",
+                    s.dtype,
+                    s.numel()
+                ));
+            }
+            s
+        }
+        None => {
+            owned = match lane {
+                SplitKPar::NnF32 => rt.alloc_tensor_unzeroed(&[scratch_len], DType::F32)?,
+                SplitKPar::F32 | SplitKPar::Bf16 => rt.alloc_temp_f32(&[scratch_len])?,
+            };
+            &owned
+        }
     };
     let gemm_p = rt.pipeline(kernel)?;
     let reduce_p = rt.pipeline(if accumulate {
@@ -1927,7 +2011,7 @@ fn splitk_par(
         bnd.set_pipeline(&gemm_p);
         bnd.bind_tensor(a_km, 0);
         bnd.bind_tensor(b_kn, 1);
-        bnd.bind_tensor(&scratch, 2);
+        bnd.bind_tensor(scratch, 2);
         bnd.bind_u32(m_u, 3);
         bnd.bind_u32(n_u, 4);
         bnd.bind_u32(k_u, 5);
@@ -1941,7 +2025,7 @@ fn splitk_par(
             bnd.barrier();
         }
         bnd.set_pipeline(&reduce_p);
-        bnd.bind_tensor(&scratch, 0);
+        bnd.bind_tensor(scratch, 0);
         bnd.bind_tensor(c, 1);
         bnd.bind_u32(numel_u, 2);
         bnd.bind_u32(parts_u, 3);
@@ -3587,7 +3671,7 @@ mod stress_tests {
         fn single_dispatch(self, m: usize, n: usize, k: usize) -> bool {
             match self {
                 Self::TnBf16 => !prefer_tn_splitk(m, n, k),
-                Self::NnF32 => nn_f32_route(m, n, k) == NnF32Route::Single,
+                Self::NnF32 => nn_f32_route(m, n, k, Route::Default) == NnF32Route::Single,
                 Self::TnF32 => tn_par_k_tile(m, n, k).is_none(),
                 _ => true,
             }
@@ -4437,7 +4521,7 @@ mod small_m_select {
             (0, 512, 2048, Single),
             (16, 0, 2048, Single),
             // N past 512 is outside the measured range and keeps one route at
-            // every M (the audio tower's wide GEMMs, pinned bit for bit alone and batched).
+            // every M.
             (16, 1024, 4096, Single),
             (25, 1024, 1024, Single),
             (16, 513, 2048, Single),
@@ -4448,12 +4532,22 @@ mod small_m_select {
             (33, 768, 11_008, SequentialSplit(2560)),
             (4096, 768, 50_304, SequentialSplit(2560)),
         ] {
-            assert_eq!(nn_f32_route(m, n, k), want, "{m}x{n}x{k}");
+            assert_eq!(nn_f32_route(m, n, k, Route::SmallM), want, "{m}x{n}x{k}");
+            // Without the opt-in the route is the one every caller had: the
+            // lane's shapes take the single dispatch, the rest are as above.
+            let default = if matches!(want, SmallPar(_)) { Single } else { want };
+            assert_eq!(nn_f32_route(m, n, k, Route::Default), default, "default {m}x{n}x{k}");
         }
         // The forward's table, as the lane's gate sees it.
         for &(name, k, n) in FORWARD {
             for (m, lane) in [(16usize, n <= 512), (2048, false)] {
-                assert_eq!(matches!(nn_f32_route(m, n, k), SmallPar(_)), lane, "{name} at {m} rows");
+                let route = nn_f32_route(m, n, k, Route::SmallM);
+                assert_eq!(matches!(route, SmallPar(_)), lane, "{name} at {m} rows");
+                assert_eq!(
+                    nn_f32_route(m, n, k, Route::Default),
+                    Single,
+                    "{name} at {m} rows, no opt-in"
+                );
             }
         }
     }

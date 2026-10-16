@@ -27,11 +27,12 @@ use common::embedgemma2::rms;
 use common::embedgemma2_vision::{pool_dense, rope_axial};
 use common::{with_gpu, SplitMix};
 use tessl::embedgemma2_vision::{
-    axial_qkv_norm_rope, patch_position_embed_add, plan_pooling, pool_by_members, AxialQkvShape, PoolPlan,
+    axial_qkv_norm_rope, axial_qkv_norm_rope_bf16, patch_position_embed_add, plan_pooling, pool_by_members,
+    AxialQkvShape, PoolPlan,
 };
 use tessl::nn::rope_inv_freq;
 use tessl::qwen35::{AttnTargets, Cols};
-use tessl::tensor::{bf16_bits_to_f32, f32_slice_to_bf16, GpuBuffer};
+use tessl::tensor::{bf16_bits_to_f32, f32_slice_to_bf16, f32_to_bf16_bits_gpu, GpuBuffer};
 use tessl::GpuRuntime;
 
 const KERNEL_REL: f64 = 2e-5;
@@ -550,6 +551,11 @@ fn axial_rope_refuses_what_it_cannot_run() {
             call(&AxialQkvShape { head_dim: 30, ..shape }, dense, &q, &k, &pos, 100.0).is_err(),
             "head_dim 30"
         );
+        // A head wider than the rotation table a lane holds (512).
+        assert!(
+            call(&AxialQkvShape { head_dim: 516, ..shape }, dense, &q, &k, &pos, 100.0).is_err(),
+            "head_dim 516"
+        );
         assert!(
             call(&AxialQkvShape { q_heads: 3, ..shape }, dense, &q, &k, &pos, 100.0).is_err(),
             "3 q heads over 1 kv head"
@@ -621,6 +627,229 @@ fn axial_rope_refuses_what_it_cannot_run() {
             )
             .is_err(),
             "caches shorter than seq"
+        );
+    });
+}
+
+/// One simdgroup takes up to six heads of a kind of a row and they share one
+/// table of `cos`/`sin` (a lane's pairs of the head's rotated channels): head
+/// counts that are not a multiple of six (a partial last chunk of q, of k and of
+/// v), grouped-query counts, and head dims whose `D / 2` pairs take half a lane's
+/// worth (`D = 32`: 16 pairs for 32 lanes), one, two, four and eight pairs per
+/// lane (`D = 64 .. 512`), against the same f64 reference.
+#[test]
+fn axial_rope_matches_the_reference_across_head_chunks_and_head_dims() {
+    with_gpu(|rt| {
+        for (q_heads, kv_heads, d) in [
+            (13, 13, 32),
+            (7, 7, 64),
+            (8, 4, 32),
+            (12, 12, 64),
+            (6, 6, 64),
+            (5, 5, 256),
+            (12, 4, 128),
+            (3, 3, 512),
+        ] {
+            let c = RopeCase {
+                batch: 2,
+                seq: 19,
+                q_heads,
+                kv_heads,
+                d,
+                cap: 23,
+                real: vec![19, 11],
+                grid_w: 5,
+            };
+            let (positions, proj) = rope_inputs(&c, 300 + d as u64);
+            let (qw, kw) = norm_weights(d, 11);
+            run_rope(rt, &c, &positions, &proj, &qw, &kw, 100.0);
+        }
+    });
+}
+
+/// `vision_qkv_norm_rope_bf16` is the f32 kernel's body with a bf16 store: what
+/// it writes is the f32 kernel's result rounded to nearest even
+/// (`f32_to_bf16_bits_gpu`), element for element, in q and in both caches, with
+/// the cache slots past `seq` untouched and the padded rows' zeros kept.
+/// Bound, fixed before the first run: equality of bits.
+#[test]
+fn the_bf16_rope_kernel_stores_the_f32_kernels_result_rounded() {
+    with_gpu(|rt| {
+        for (q_heads, kv_heads, d) in [(2, 2, 32), (13, 13, 32), (12, 12, 64), (8, 4, 128)] {
+            let c = RopeCase {
+                batch: 2,
+                seq: 23,
+                q_heads,
+                kv_heads,
+                d,
+                cap: 29,
+                real: vec![23, 14],
+                grid_w: 5,
+            };
+            let width = (q_heads + 2 * kv_heads) * d;
+            let rows = c.batch * c.seq;
+            let (positions, proj) = rope_inputs(&c, 400 + d as u64);
+            let (qw, kw) = norm_weights(d, 13);
+            let (pb, pos) = (buf_f32(rt, &proj), buf_i32(rt, &positions));
+            let (qb, kb) = (buf_f32(rt, &qw), buf_f32(rt, &kw));
+            let shape = AxialQkvShape {
+                batch: c.batch as u32,
+                seq: c.seq as u32,
+                q_heads: q_heads as u32,
+                kv_heads: kv_heads as u32,
+                head_dim: d as u32,
+            };
+            let cache_elems = c.batch * c.cap * kv_heads * d;
+            let nan = |n: usize| buf_f32(rt, &vec![f32::NAN; n]);
+            let nan16 = |n: usize| {
+                let b = rt.alloc_buffer(n * 2).unwrap();
+                b.try_contents_u16().unwrap().fill(0x7fc0);
+                b
+            };
+            let (q32, k32, v32) = (nan(rows * q_heads * d), nan(cache_elems), nan(cache_elems));
+            let (q16, k16, v16) = (nan16(rows * q_heads * d), nan16(cache_elems), nan16(cache_elems));
+            let dense = Cols::dense(&pb, width as u32);
+            let (k_col, v_col) = ((q_heads * d) as u32, ((q_heads + kv_heads) * d) as u32);
+            axial_qkv_norm_rope(
+                rt,
+                &shape,
+                dense,
+                k_col,
+                v_col,
+                &qb,
+                &kb,
+                &AttnTargets {
+                    q_out: &q32,
+                    k_cache: &k32,
+                    v_cache: &v32,
+                },
+                &pos,
+                100.0,
+                1e-6,
+            )
+            .unwrap();
+            axial_qkv_norm_rope_bf16(
+                rt,
+                &shape,
+                dense,
+                k_col,
+                v_col,
+                &qb,
+                &kb,
+                &AttnTargets {
+                    q_out: &q16,
+                    k_cache: &k16,
+                    v_cache: &v16,
+                },
+                &pos,
+                100.0,
+                1e-6,
+            )
+            .unwrap();
+            rt.synchronize().unwrap();
+            let tag = format!("h{q_heads}/{kv_heads} d{d}");
+            for (name, f, b, n) in [
+                ("q", &q32, &q16, rows * q_heads * d),
+                ("k", &k32, &k16, cache_elems),
+                ("v", &v32, &v16, cache_elems),
+            ] {
+                let (f, b) = (f.read_f32(), b.try_contents_u16().unwrap().to_vec());
+                assert!(f.len() >= n && b.len() >= n, "{tag} {name}: length");
+                let mut checked = 0;
+                for i in 0..n {
+                    if f[i].is_nan() {
+                        // Not the kernel's (a cache slot past seq): the bf16 poison too.
+                        assert_eq!(b[i], 0x7fc0, "{tag} {name}[{i}]: the bf16 kernel wrote past seq");
+                        continue;
+                    }
+                    assert_eq!(
+                        b[i],
+                        f32_to_bf16_bits_gpu(f[i]),
+                        "{tag} {name}[{i}]: bf16 {:#06x}, f32 kernel's {} rounds to {:#06x}",
+                        b[i],
+                        f[i],
+                        f32_to_bf16_bits_gpu(f[i])
+                    );
+                    checked += 1;
+                }
+                assert!(checked > 0, "{tag} {name}: nothing checked");
+            }
+        }
+    });
+}
+
+/// The bf16 kernel's buffers are sized as bf16 and checked: the f32 kernel on
+/// bf16-sized buffers, short bf16 buffers and K/V of different capacities are
+/// refused, not misread. (A buffer carries no dtype, so an f32 buffer, which is
+/// big enough, cannot be told from a bf16 one and is not what this checks.)
+#[test]
+fn the_rope_kernels_refuse_the_other_stored_type() {
+    with_gpu(|rt| {
+        let (d, seq) = (64usize, 4usize);
+        let width = 3 * d;
+        let proj = buf_f32(rt, &vec![0.5; seq * width]);
+        let w = buf_f32(rt, &vec![1.0; d]);
+        let pos = buf_i32(rt, &vec![0; 2 * seq]);
+        let f = |n: usize| buf_f32(rt, &vec![0.0; n]);
+        let h = |n: usize| rt.alloc_buffer(n * 2).unwrap();
+        let shape = AxialQkvShape {
+            batch: 1,
+            seq: seq as u32,
+            q_heads: 1,
+            kv_heads: 1,
+            head_dim: d as u32,
+        };
+        let dense = Cols::dense(&proj, width as u32);
+        let n = seq * d;
+        type Kernel = fn(
+            &Arc<GpuRuntime>,
+            &AxialQkvShape,
+            Cols<'_>,
+            u32,
+            u32,
+            &GpuBuffer,
+            &GpuBuffer,
+            &AttnTargets<'_>,
+            &GpuBuffer,
+            f32,
+            f32,
+        ) -> Result<(), String>;
+        let run = |kernel: Kernel, q: &GpuBuffer, k: &GpuBuffer, v: &GpuBuffer| {
+            kernel(
+                rt,
+                &shape,
+                dense,
+                d as u32,
+                2 * d as u32,
+                &w,
+                &w,
+                &AttnTargets {
+                    q_out: q,
+                    k_cache: k,
+                    v_cache: v,
+                },
+                &pos,
+                100.0,
+                1e-6,
+            )
+        };
+        run(axial_qkv_norm_rope, &f(n), &f(n), &f(n)).expect("f32 buffers on the f32 kernel");
+        run(axial_qkv_norm_rope_bf16, &h(n), &h(n), &h(n)).expect("bf16 buffers on the bf16 kernel");
+        assert!(
+            run(axial_qkv_norm_rope, &h(n), &h(n), &h(n)).is_err(),
+            "bf16 buffers, f32 kernel"
+        );
+        assert!(
+            run(axial_qkv_norm_rope_bf16, &h(n - 1), &h(n), &h(n)).is_err(),
+            "short bf16 q_out"
+        );
+        assert!(
+            run(axial_qkv_norm_rope_bf16, &h(n), &h(n - 1), &h(n - 1)).is_err(),
+            "bf16 caches shorter than seq"
+        );
+        assert!(
+            run(axial_qkv_norm_rope_bf16, &h(n), &h(n), &h(n + d)).is_err(),
+            "K and V of different capacities"
         );
     });
 }

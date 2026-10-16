@@ -384,6 +384,62 @@ fn wide_audio_tower_has_the_checkpoints_attention_geometry() {
     check_against_reference("wide", &cfg, &random_weights(&cfg, 7), 1);
 }
 
+/// Gives layer `li`'s k and v projections q's four bounds, so the model fuses
+/// that layer's q, k and v into one GEMM on one clamped input.
+fn share_qkv_bounds(w: &mut [Weight], li: usize) {
+    for s in ["input_min", "input_max", "output_min", "output_max"] {
+        let q = w
+            .iter()
+            .find(|t| t.name == format!("audio_tower.layers.{li}.self_attn.q_proj.{s}"))
+            .expect("q bound")
+            .data
+            .clone();
+        for n in ["k_proj", "v_proj"] {
+            let name = format!("audio_tower.layers.{li}.self_attn.{n}.{s}");
+            w.iter_mut().find(|t| t.name == name).expect("bound").data = q.clone();
+        }
+    }
+}
+
+fn fused_layers(cfg: &AudioConfig, w: &[Weight]) -> usize {
+    let st = open("fused", safetensors_bytes(w, &[("vision_tower.unused.weight", &[3])]));
+    with_gpu(|rt| {
+        EmbedGemma2Audio::load(rt, &st, "", cfg.clone())
+            .unwrap()
+            .fused_qkv_layers()
+    })
+}
+
+/// The real checkpoint's q, k and v share their clamps, so the model runs one
+/// fused projection on one clamped input; the random towers above give each
+/// its own, which takes the three-GEMM path. These hold the fused path (every
+/// layer) and a mix (layer 0 fused, layer 1 not) to the same f64 forward, the
+/// same bounds, and clip alone equals clip in a batch bit for bit.
+#[test]
+fn shared_qkv_clamps_run_as_one_fused_projection() {
+    let cfg = AudioConfig::from_config_json(TINY).unwrap();
+    let plain = random_weights(&cfg, 2026);
+    assert_eq!(fused_layers(&cfg, &plain), 0, "random bounds must take the split path");
+
+    let mut all = random_weights(&cfg, 2026);
+    for li in 0..cfg.layers as usize {
+        share_qkv_bounds(&mut all, li);
+    }
+    assert_eq!(fused_layers(&cfg, &all), cfg.layers as usize);
+    check_against_reference("tiny, fused q|k|v", &cfg, &all, 1);
+
+    let mut mixed = random_weights(&cfg, 2026);
+    share_qkv_bounds(&mut mixed, 0);
+    assert_eq!(fused_layers(&cfg, &mixed), 1);
+    check_against_reference("tiny, one fused layer", &cfg, &mixed, 1);
+
+    let wide = AudioConfig::from_config_json(WIDE).unwrap();
+    let mut w = random_weights(&wide, 7);
+    share_qkv_bounds(&mut w, 0);
+    assert_eq!(fused_layers(&wide, &w), 1);
+    check_against_reference("wide, fused q|k|v", &wide, &w, 1);
+}
+
 /// The clamps, the gradient clip and the softcap are not decoration: with each
 /// relaxed in the reference its output is far from the real one.
 #[test]

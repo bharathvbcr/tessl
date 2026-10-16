@@ -26,7 +26,10 @@
 //! carries `"async":0|1`. `BENCH_SERIALIZED=1` (`set_serialized_dispatch`)
 //! makes every dispatch commit and wait, which is how `encode` ran on a
 //! default runtime before the scope: the baseline for what queueing is worth.
-//! Each object carries `"serialized":0|1`. `BENCH_PRECISION=f32|bf16` (default `f32`) picks the
+//! Each object carries `"serialized":0|1`. `BENCH_PLE_RUN_BYTES` (default the
+//! library's `PLE_RUN_BYTES`) calls `EmbedGemma2Model::set_ple_run_bytes`, to
+//! measure the per-layer-input bound's time and memory cost in one build.
+//! `BENCH_PRECISION=f32|bf16` (default `f32`) picks the
 //! operand precision the model is loaded with
 //! ([`EmbedGemma2Model::load_with`]: `GemmOperands::ExactF32` or `Bf16`); the
 //! object's `backend` says which (`tessl-f32`, `tessl-bf16`) and `weight_mib`
@@ -139,7 +142,11 @@ fn main() -> Result<(), String> {
         Ok("bf16") => (GemmOperands::Bf16, "tessl-bf16"),
         Ok(other) => return Err(format!("BENCH_PRECISION={other:?}: expected f32 or bf16")),
     };
-    let model = EmbedGemma2Model::load_with(&rt, &st, "language_model.", cfg.clone(), operands)?;
+    let mut model = EmbedGemma2Model::load_with(&rt, &st, "language_model.", cfg.clone(), operands)?;
+    if let Ok(v) = std::env::var("BENCH_PLE_RUN_BYTES") {
+        let n: usize = v.parse().map_err(|e| format!("BENCH_PLE_RUN_BYTES={v:?}: {e}"))?;
+        model.set_ple_run_bytes(n)?;
+    }
     let weight_mib = model.weight_bytes() as f64 / MIB;
     let dim = cfg.embedding_dim as usize;
     let loaded = rt.current_allocated_bytes();

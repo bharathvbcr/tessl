@@ -39,18 +39,24 @@
 //!   `PROFILE_STEPS` is a comma list of `E` (encode), `S` (synchronize), `A` (allocate the
 //!   activation set `acts()` makes, by the same formulas), `O` (the same for
 //!   2a7cb8b's), `F` (free what `A`/`O` allocated); `PROFILE_PLE_BYTES` overrides
-//!   `set_ple_run_bytes`. Prints one JSON object with the allocated bytes above
+//!   `set_ple_run_bytes`; `PROFILE_OPERANDS=f32|bf16` (default `f32`) picks the
+//!   model's `GemmOperands`. Prints one JSON object with the allocated bytes above
 //!   the loaded model and the device peak after each step.
 //!   `PROFILE_PRELUDE` (workloads) encodes each twice first, as
 //!   `bench_embedgemma2` does before the workload whose peak it reports.
 //! * `memory-sweep`: runs `memory` in a fresh child process per configuration.
 //! * `ledger`: one synchronous replica forward with `synchronize` and a peak
 //!   reset around every stage: the device bytes each stage allocated fresh.
+//! * `memory-table`: `memory` for each workload under both `GemmOperands`:
+//!   one `encode`, back-to-back `encode`s, `encode`s with a `synchronize`
+//!   between (see `mode_memory_table`).
 //! * `layout`: the activation set itemized, HEAD against 2a7cb8b, with the
 //!   bytes the pool charges for each. No GPU.
 //! * `alloc`: what allocating and dropping `encode`'s activation set costs
 //!   per call, with no forward.
 //! * `ple`: `encode` timed at several `set_ple_run_bytes`.
+//! * `hash`: FNV-1a hashes of `encode`'s embeddings per workload under both
+//!   `GemmOperands` (see `mode_hash`), to diff two builds bit for bit.
 //!
 //! `stages` also times `full, fresh ... activations per call` (the forward on
 //! a new activation set per call, zeroed and unzeroed, as `encode` makes it),
@@ -76,14 +82,14 @@ use std::time::Instant;
 use tessl::embedgemma2::{
     l2_normalize_rows, segment_mean_rows, EmbedGemma2Config, EmbedGemma2Model, EncoderAttnDims, LayerSpec,
 };
-use tessl::gemm::{gemm, gemm_bf16, gemm_nt_f32, GemmBackend};
+use tessl::gemm::{gemm, gemm_bf16, gemm_nt_f32, GemmBackend, GemmOperands};
 use tessl::nn::{rms_norm_f32, rms_norm_residual_add_f32, scale_f32_inplace};
 use tessl::qwen35::{self, AttnShape, AttnTargets, Cols, GatedAct, LmHead, OutCols, QkvColumns};
 use tessl::safetensors::SafeTensors;
 use tessl::tensor::{gpu_copy, DType, GpuBuffer, Tensor};
 use tessl::{BufferKind, GpuRuntime};
 
-use common::{env_usize, round_order};
+use common::{env_usize, gpu_utilization, others_running, round_order};
 
 const BACKEND: GemmBackend = GemmBackend::TensorOps;
 const MIB: f64 = (1u64 << 20) as f64;
@@ -324,13 +330,14 @@ fn acts_layout(cfg: &EmbedGemma2Config, nb: usize, rows: usize, ple_run_bytes: u
         ("embeds", r * h),
         ("resid", r * h),
         ("x", r * h),
-        ("qkv", r * qkv_w),
         ("q", r * q_w),
         ("k", r * kv_w),
         ("v", r * kv_w),
         ("attn (+mlp mid)", r * q_w.max(inter)),
         ("y", r * h),
-        ("gate_up", r * 2 * inter),
+        // One buffer: the q|k|v GEMM's output, then the MLP's gate|up
+        // (`Acts::qkv` is a clone of `Acts::gate_up`).
+        ("gate_up (= qkv)", r * qkv_w.max(2 * inter)),
         (
             "ple run",
             (ple_run_bytes / 4).max(r * ple).min(r * ple * cfg.layers.len()),
@@ -642,6 +649,7 @@ fn forward(cx: &Cx<'_>, mask: u32) -> Result<(), String> {
                     k_cache: &a.k.buffer,
                     v_cache: &a.v.buffer,
                 },
+                DType::F32,
                 0,
                 s.rope_theta,
                 eps,
@@ -946,25 +954,6 @@ fn median_of(v: &[f64]) -> f64 {
     s[s.len() / 2]
 }
 
-/// The device's GPU utilization as `ioreg` reports it, for the machine-state
-/// record (other sessions share this GPU).
-fn gpu_utilization() -> String {
-    let out = std::process::Command::new("ioreg")
-        .args(["-r", "-d", "1", "-c", "IOAccelerator"])
-        .output();
-    match out {
-        Ok(o) => {
-            let s = String::from_utf8_lossy(&o.stdout);
-            s.split("\"Device Utilization %\"=")
-                .nth(1)
-                .and_then(|t| t.split(|c: char| !c.is_ascii_digit()).next())
-                .unwrap_or("unknown")
-                .to_string()
-        }
-        Err(e) => format!("ioreg failed: {e}"),
-    }
-}
-
 fn write_json(path: &str, body: &str) -> Result<(), String> {
     common::atomic_write(std::path::Path::new(path), body.as_bytes())
 }
@@ -991,54 +980,6 @@ struct Variant {
     /// Samples thrown away and retaken because another process appeared.
     resampled: usize,
     dispatches: usize,
-}
-
-/// Other tessl processes that may be using the GPU: test and bench binaries
-/// under a `tessl*` checkout's `target/`, other than this one. Other sessions
-/// share this machine; a sample taken while one runs is flagged, not trusted.
-/// A GPU user this does not see (a display, a browser) stays in the baseline,
-/// which the `ioreg` utilization reading records.
-fn others_running() -> Vec<String> {
-    /// `PROC_ALL_PIDS` of `<sys/proc_info.h>`; the `libc` crate does not export it.
-    const PROC_ALL_PIDS: u32 = 1;
-    let me = std::process::id() as libc::pid_t;
-    // SAFETY: with a null buffer `proc_listpids` only returns the bytes needed.
-    let need = unsafe { libc::proc_listpids(PROC_ALL_PIDS, 0, std::ptr::null_mut(), 0) };
-    if need <= 0 {
-        return vec!["proc_listpids failed".to_string()];
-    }
-    let mut pids = vec![0 as libc::pid_t; need as usize / std::mem::size_of::<libc::pid_t>() + 64];
-    let bytes = (pids.len() * std::mem::size_of::<libc::pid_t>()) as libc::c_int;
-    // SAFETY: `pids` is a live buffer of `bytes` bytes.
-    let got = unsafe { libc::proc_listpids(PROC_ALL_PIDS, 0, pids.as_mut_ptr().cast(), bytes) };
-    if got <= 0 {
-        return vec!["proc_listpids failed".to_string()];
-    }
-    let n = got as usize / std::mem::size_of::<libc::pid_t>();
-    let mut found = Vec::new();
-    for &pid in &pids[..n.min(pids.len())] {
-        if pid <= 0 || pid == me {
-            continue;
-        }
-        let mut buf = [0u8; 4096];
-        // SAFETY: `buf` is a live buffer of the length passed.
-        let len = unsafe { libc::proc_pidpath(pid, buf.as_mut_ptr().cast(), buf.len() as u32) };
-        if len <= 0 {
-            continue;
-        }
-        let path = String::from_utf8_lossy(&buf[..len as usize]).into_owned();
-        let in_target =
-            path.contains("/research/tessl") && (path.contains("/target/release/") || path.contains("/target/debug/"));
-        let file = path.rsplit('/').next().unwrap_or("");
-        let gpu_bin = path.contains("/deps/")
-            || file.starts_with("bench_")
-            || file.starts_with("probe_")
-            || file.starts_with("profile_");
-        if in_target && gpu_bin {
-            found.push(file.to_string());
-        }
-    }
-    found
 }
 
 /// Milliseconds this process has spent waiting for a quiet machine.
@@ -1637,7 +1578,12 @@ fn mode_memory() -> Result<(), String> {
     let st = SafeTensors::open(&snap.join("model.safetensors"))?;
     let rt = GpuRuntime::new_inference()?;
     rt.set_async_encode(async_encode)?;
-    let mut model = EmbedGemma2Model::load(&rt, &st, PREFIX, cfg.clone())?;
+    let operands = match std::env::var("PROFILE_OPERANDS").as_deref() {
+        Ok("f32") | Err(_) => GemmOperands::ExactF32,
+        Ok("bf16") => GemmOperands::Bf16,
+        Ok(other) => return Err(format!("PROFILE_OPERANDS={other:?}: expected f32 or bf16")),
+    };
+    let mut model = EmbedGemma2Model::load_with(&rt, &st, PREFIX, cfg.clone(), operands)?;
     let ple_bytes = match std::env::var("PROFILE_PLE_BYTES") {
         Ok(v) => {
             let n: usize = v.parse().map_err(|e| format!("PROFILE_PLE_BYTES={v:?}: {e}"))?;
@@ -1702,8 +1648,9 @@ fn mode_memory() -> Result<(), String> {
         rt.reset_peak_allocated_bytes();
     }
     println!(
-        "{{\"workload\":{},\"rows\":{rows},\"async\":{},\"ple_run_bytes\":{ple_bytes},\"steps\":{},\"forwards\":{forwards},\"prelude_cached_mib\":{:.2},\"peak_above_model_mib\":{:.2},\"trace\":[{}]}}",
+        "{{\"workload\":{},\"operands\":{},\"rows\":{rows},\"async\":{},\"ple_run_bytes\":{ple_bytes},\"steps\":{},\"forwards\":{forwards},\"prelude_cached_mib\":{:.2},\"peak_above_model_mib\":{:.2},\"trace\":[{}]}}",
         jstr(&wl),
+        jstr(if operands == GemmOperands::Bf16 { "bf16" } else { "f32" }),
         u8::from(async_encode),
         jstr(&steps),
         (prelude_cached as f64 - loaded as f64) / MIB,
@@ -1763,6 +1710,59 @@ fn mode_memory_sweep() -> Result<(), String> {
     write_json(
         &out_path,
         &format!("{{\"mode\":\"memory-sweep\",\"runs\":[{}]}}", results.join(",")),
+    )?;
+    Ok(())
+}
+
+/// Mode `memory-table`: the device peak above the loaded model of each
+/// workload (`BENCH_WORKLOADS`) under both `GemmOperands`, one fresh child
+/// process per cell, for one `encode`, for back-to-back `encode`s with no
+/// wait between, and for `encode`s with an explicit `synchronize` between
+/// (`single`, `back-to-back`, `sync-between`: the first, the last of four, and
+/// the last of three). It uses only the library's public API, so the same
+/// binary source measures a build before and after a memory change.
+/// `PROFILE_JSON` names the output.
+fn mode_memory_table() -> Result<(), String> {
+    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    let out_path = std::env::var("PROFILE_JSON").unwrap_or_else(|_| "target/profile_memory_table.json".into());
+    let spec = std::env::var("BENCH_WORKLOADS").unwrap_or_else(|_| DEFAULT_WORKLOADS.into());
+    let configs: [(&str, &str); 3] = [
+        ("single", "E"),
+        ("back-to-back", "E,E,E,E"),
+        ("sync-between", "E,S,E,S,E"),
+    ];
+    let mut results = Vec::new();
+    for operands in ["f32", "bf16"] {
+        for wl in spec.split(',').map(str::trim) {
+            for (label, steps) in configs {
+                let out = std::process::Command::new(&exe)
+                    .env("PROFILE_MODE", "memory")
+                    .env("PROFILE_WORKLOAD", wl)
+                    .env("PROFILE_STEPS", steps)
+                    .env("PROFILE_OPERANDS", operands)
+                    .env_remove("PROFILE_PRELUDE")
+                    .env_remove("PROFILE_PLE_BYTES")
+                    .output()
+                    .map_err(|e| format!("spawn: {e}"))?;
+                if !out.status.success() {
+                    return Err(format!(
+                        "{operands} {wl} {label}: child failed: {}",
+                        String::from_utf8_lossy(&out.stderr)
+                    ));
+                }
+                let line = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                println!("{operands:<5} {label:<13} {line}");
+                results.push(format!(
+                    "{{\"operands\":{},\"label\":{},\"result\":{line}}}",
+                    jstr(operands),
+                    jstr(label)
+                ));
+            }
+        }
+    }
+    write_json(
+        &out_path,
+        &format!("{{\"mode\":\"memory-table\",\"runs\":[{}]}}", results.join(",")),
     )?;
     Ok(())
 }
@@ -2047,8 +2047,60 @@ fn mode_ple() -> Result<(), String> {
     Ok(())
 }
 
+/// FNV-1a over the bit patterns of `v`: two runs agree bit for bit exactly
+/// when their hashes do (up to a 2^-64 collision).
+fn fnv1a_bits(v: &[f32]) -> u64 {
+    v.iter().fold(0xcbf2_9ce4_8422_2325u64, |h, x| {
+        x.to_bits()
+            .to_le_bytes()
+            .iter()
+            .fold(h, |h, &b| (h ^ u64::from(b)).wrapping_mul(0x0000_0100_0000_01b3))
+    })
+}
+
+/// Mode `hash`: the embeddings of each workload (`BENCH_WORKLOADS`; `+` joins
+/// uniform `BxT` terms into one ragged batch) under both `GemmOperands`, each as
+/// an FNV-1a hash of the f32 bit patterns, from three consecutive `encode`
+/// calls (the second and third must reproduce the first, bit for bit) and one
+/// `truncate_dim` 128 call. The tool for "an optimisation changed no output
+/// bit": run it on two builds and `diff` the lines.
+fn mode_hash() -> Result<(), String> {
+    let snap = snapshot()?;
+    let spec =
+        std::env::var("BENCH_WORKLOADS").unwrap_or_else(|_| "1x16,64x32,32x256,8x1024,2x4096,1x4096+63x32".into());
+    let cfg = EmbedGemma2Config::from_config_file(&snap.join("config.json"))?;
+    let st = SafeTensors::open(&snap.join("model.safetensors"))?;
+    let rt = GpuRuntime::new_inference()?;
+    for (label, operands) in [("f32", GemmOperands::ExactF32), ("bf16", GemmOperands::Bf16)] {
+        let mut model = EmbedGemma2Model::load_with(&rt, &st, PREFIX, cfg.clone(), operands)?;
+        if let Ok(v) = std::env::var("PROFILE_PLE_BYTES") {
+            let n: usize = v.parse().map_err(|e| format!("PROFILE_PLE_BYTES={v:?}: {e}"))?;
+            model.set_ple_run_bytes(n)?;
+        }
+        for wl in spec.split(',').map(str::trim) {
+            let mut seqs: Vec<Vec<u32>> = Vec::new();
+            for term in wl.split('+') {
+                let (b, t) = parse_workload(term)?;
+                seqs.extend((0..b).map(|s| ids(s, t)));
+            }
+            let batch: Vec<&[u32]> = seqs.iter().map(Vec::as_slice).collect();
+            let runs: Vec<u64> = (0..3)
+                .map(|_| model.encode(&batch, None, false).map(|o| fnv1a_bits(&o.embeddings)))
+                .collect::<Result<_, _>>()?;
+            let trunc = fnv1a_bits(&model.encode(&batch, Some(128), false)?.embeddings);
+            let stable = runs.iter().all(|&h| h == runs[0]);
+            println!(
+                "HASH {label} {wl} {:016x} trunc128 {trunc:016x} repeat_stable={stable}",
+                runs[0]
+            );
+        }
+    }
+    Ok(())
+}
+
 fn main() -> Result<(), String> {
     match std::env::var("PROFILE_MODE").as_deref() {
+        Ok("hash") => mode_hash(),
         Ok("ple") => mode_ple(),
         Ok("alloc") => mode_alloc(),
         Ok("layout") => mode_layout(),
@@ -2056,9 +2108,10 @@ fn main() -> Result<(), String> {
         Ok("gemm") => mode_gemm(),
         Ok("memory") => mode_memory(),
         Ok("memory-sweep") => mode_memory_sweep(),
+        Ok("memory-table") => mode_memory_table(),
         Ok("ledger") => mode_ledger(),
         Ok(other) => Err(format!(
-            "PROFILE_MODE={other:?}: expected stages, gemm, memory, memory-sweep or ledger"
+            "PROFILE_MODE={other:?}: expected stages, gemm, memory, memory-sweep, memory-table, ledger, layout, alloc, ple or hash"
         )),
     }
 }

@@ -6,7 +6,8 @@
 //   vision_qkv_norm_rope_f32   q/k RMSNorm with `* w`, the 2-D axial RoPE, the
 //                              weightless V RMSNorm and the K/V store
 //                              (`Gemma4VisionAttention.forward`, up to the
-//                              attention itself).
+//                              attention itself); `_bf16` stores q, k and v as
+//                              bf16, the operands of the bf16 attention.
 //   vision_pos_embed_add_f32   the patch embedder's `+ position_embeddings`
 //                              (`Gemma4VisionPatchEmbedder._position_embeddings`).
 //   vision_pool_members_f32    the pooler's k x k average by patch position,
@@ -34,10 +35,16 @@ using namespace metal;
 /// (`position_ids[..., None].float() * inv_freq`); `inv_freq` comes from the
 /// host (`nn::rope_inv_freq`), never a device `pow` (see `qwen35_rope_angle`).
 /// A padding patch's (-1, -1) rotates by -1: finite, and its keys are masked.
+///
+/// `OT` is the stored type: `float`, or `bfloat` for the operands of the bf16
+/// encoder attention, rounded to nearest even from the f32 result (the one
+/// rounding a cast pass would apply, with no pass). The arithmetic before the
+/// store is the same in both, and `(float)` of a float is the identity.
+template <typename OT>
 inline void vision_norm_rope_row(
     device const float *src,
     device const float *weight,
-    device float *dst,
+    device OT *dst,
     uint D,
     float pos_x,
     float pos_y,
@@ -62,14 +69,16 @@ inline void vision_norm_rope_row(
         const float angle = (axis == 0u ? pos_x : pos_y) * inv_freq[p];
         const float c = precise::cos(angle);
         const float s = precise::sin(angle);
-        dst[base + p] = x0 * c - x1 * s;
-        dst[base + p + half_w] = x1 * c + x0 * s;
+        dst[base + p] = (OT)(x0 * c - x1 * s);
+        dst[base + p + half_w] = (OT)(x1 * c + x0 * s);
     }
 }
 
-/// Q/K norm + axial RoPE, the weightless V norm and the K/V store, straight from
-/// the fused projection `[q | k | v]` (columns `q_off`, `k_off`, `v_off`, rows
-/// `ld_p` apart; head `h` of each at `h * D`).
+/// One simdgroup's unit of `vision_qkv_norm_rope_*`: Q/K norm + axial RoPE, the
+/// weightless V norm and the K/V store, straight from the fused projection
+/// `[q | k | v]` (columns `q_off`, `k_off`, `v_off`, rows `ld_p` apart; head
+/// `h` of each at `h * D`). Shared by the f32 and bf16 kernels so they cannot
+/// drift apart; `OT` is the stored type of q, k and v.
 ///
 /// Row `r = b * T + t` of the projection is patch `t` of image `b`, at
 /// `positions[2r] = x`, `positions[2r + 1] = y`. q goes to `q_out`
@@ -77,30 +86,19 @@ inline void vision_norm_rope_row(
 /// (the layout `encoder_attn` reads); a token whose slot is past `kv_capacity`
 /// is skipped. One simdgroup per (row, head) over Hq query, Hkv key and Hkv
 /// value heads.
-kernel void vision_qkv_norm_rope_f32(
-    device const float *p [[buffer(0)]],
-    device const float *q_norm_w [[buffer(1)]],
-    device const float *k_norm_w [[buffer(2)]],
-    device float *q_out [[buffer(3)]],
-    device float *k_cache [[buffer(4)]],
-    device float *v_cache [[buffer(5)]],
-    device const int *positions [[buffer(6)]],
-    constant uint &B [[buffer(7)]],
-    constant uint &T [[buffer(8)]],
-    constant uint &Hq [[buffer(9)]],
-    constant uint &Hkv [[buffer(10)]],
-    constant uint &D [[buffer(11)]],
-    constant uint &ld_p [[buffer(12)]],
-    constant uint &q_off [[buffer(13)]],
-    constant uint &k_off [[buffer(14)]],
-    constant uint &v_off [[buffer(15)]],
-    constant uint &kv_capacity [[buffer(16)]],
-    constant float *inv_freq [[buffer(17)]],
-    constant float &eps [[buffer(18)]],
-    uint tg [[threadgroup_position_in_grid]],
-    uint sg [[simdgroup_index_in_threadgroup]],
-    uint lane [[thread_index_in_simdgroup]],
-    uint tptg [[threads_per_threadgroup]])
+template <typename OT>
+inline void vision_qkv_norm_rope_unit(
+    device const float *p,
+    device const float *q_norm_w,
+    device const float *k_norm_w,
+    device OT *q_out,
+    device OT *k_cache,
+    device OT *v_cache,
+    device const int *positions,
+    uint B, uint T, uint Hq, uint Hkv, uint D,
+    uint ld_p, uint q_off, uint k_off, uint v_off,
+    uint kv_capacity, constant float *inv_freq, float eps,
+    uint tg, uint sg, uint lane, uint tptg)
 {
     const ulong heads = (ulong)Hq + 2ul * Hkv;
     const ulong unit = (ulong)tg * (tptg / 32u) + sg;
@@ -133,10 +131,50 @@ kernel void vision_qkv_norm_rope_f32(
         }
         const float inv = rsqrt(simd_sum(ss) / (float)D + eps);
         for (uint d = lane; d < D; d += 32u) {
-            v_cache[slot + d] = src[d] * inv;
+            v_cache[slot + d] = (OT)(src[d] * inv);
         }
     }
 }
+
+#define VISION_QKV_KERNEL(NAME, OUT_T) \
+kernel void NAME( \
+    device const float *p [[buffer(0)]], \
+    device const float *q_norm_w [[buffer(1)]], \
+    device const float *k_norm_w [[buffer(2)]], \
+    device OUT_T *q_out [[buffer(3)]], \
+    device OUT_T *k_cache [[buffer(4)]], \
+    device OUT_T *v_cache [[buffer(5)]], \
+    device const int *positions [[buffer(6)]], \
+    constant uint &B [[buffer(7)]], \
+    constant uint &T [[buffer(8)]], \
+    constant uint &Hq [[buffer(9)]], \
+    constant uint &Hkv [[buffer(10)]], \
+    constant uint &D [[buffer(11)]], \
+    constant uint &ld_p [[buffer(12)]], \
+    constant uint &q_off [[buffer(13)]], \
+    constant uint &k_off [[buffer(14)]], \
+    constant uint &v_off [[buffer(15)]], \
+    constant uint &kv_capacity [[buffer(16)]], \
+    constant float *inv_freq [[buffer(17)]], \
+    constant float &eps [[buffer(18)]], \
+    uint tg [[threadgroup_position_in_grid]], \
+    uint sg [[simdgroup_index_in_threadgroup]], \
+    uint lane [[thread_index_in_simdgroup]], \
+    uint tptg [[threads_per_threadgroup]]) \
+{ \
+    vision_qkv_norm_rope_unit(p, q_norm_w, k_norm_w, q_out, k_cache, v_cache, \
+                              positions, B, T, Hq, Hkv, D, ld_p, q_off, k_off, v_off, kv_capacity, \
+                              inv_freq, eps, tg, sg, lane, tptg); \
+}
+
+VISION_QKV_KERNEL(vision_qkv_norm_rope_f32, float)
+
+/// [`vision_qkv_norm_rope_f32`] storing q, k and v as bf16 (rounded to nearest
+/// even from the f32 result of the norm and RoPE, the one rounding a cast pass
+/// would apply, with no pass): the operands of the bf16 encoder attention
+/// (`encoder_attn_tiled_bf16_*`). Same slots and contract; `q_out`,
+/// `k_cache` and `v_cache` are bf16 buffers.
+VISION_QKV_KERNEL(vision_qkv_norm_rope_bf16, bfloat)
 
 /// `h[r, :] += table[0][x_r] + table[1][y_r]` for a patch at `positions[2r] = x`,
 /// `positions[2r + 1] = y`, and `h[r, :] = +0` for a padding patch (both

@@ -29,7 +29,7 @@ bin kernel_fast_math 13
 bin metallib_clean_time_script 18
 bin npy_hardening 4
 bin parser_mutation 13
-bin qwen35_config 5
+bin qwen35_config 6
 bin relaxed_predicate 1
 bin safetensors 12
 bin shader_index_arithmetic 20

@@ -938,6 +938,7 @@ fn random_config(r: &mut Rng) -> Qwen35Config {
         rotary_dim: r.pick(&[2u32, 64, 128, 256]),
         rope_theta: r.pick(&[1e4f32, 1e7]),
         rms_norm_eps: 1e-6,
+        tie_word_embeddings: true,
     }
 }
 
@@ -1227,19 +1228,23 @@ fn argument_refusals_encode_nothing() {
 
 // ------------------------------------------ unread tensors and config keys ---
 
-/// `st`'s tensors plus `extra` `(name, shape)` F32 zeros, as a checkpoint.
-fn checkpoint_with(st: &SafeTensors, extra: &[(&str, &[usize])]) -> SafeTensors {
-    let mut entries: Vec<(String, String, Vec<usize>, Vec<u8>)> = Vec::new();
-    for name in st.names() {
-        let (info, bytes) = st.read_raw(name).unwrap();
-        let dtype = format!("{:?}", info.dtype).to_uppercase();
-        assert!(dtype == "F32" || dtype == "BF16", "{name}: fixture dtype {dtype}");
-        entries.push((name.to_string(), dtype, info.shape, bytes));
-    }
-    for &(name, shape) in extra {
-        let n: usize = shape.iter().product();
-        entries.push((name.to_string(), "F32".into(), shape.to_vec(), vec![0u8; n * 4]));
-    }
+/// A checkpoint tensor: name, safetensors dtype name, shape, bytes.
+type Entry = (String, String, Vec<usize>, Vec<u8>);
+
+/// Every tensor of `st`, in name order.
+fn entries_of(st: &SafeTensors) -> Vec<Entry> {
+    st.names()
+        .map(|name| {
+            let (info, bytes) = st.read_raw(name).unwrap();
+            let dtype = format!("{:?}", info.dtype).to_uppercase();
+            assert!(dtype == "F32" || dtype == "BF16", "{name}: fixture dtype {dtype}");
+            (name.to_string(), dtype, info.shape, bytes)
+        })
+        .collect()
+}
+
+/// The bytes of a `.safetensors` file holding `entries` in the order given.
+fn safetensors_bytes(entries: &[Entry]) -> Vec<u8> {
     let (mut header, mut data) = (String::from("{"), Vec::new());
     for (i, (name, dtype, shape, bytes)) in entries.iter().enumerate() {
         let dims: Vec<String> = shape.iter().map(usize::to_string).collect();
@@ -1256,7 +1261,21 @@ fn checkpoint_with(st: &SafeTensors, extra: &[(&str, &[usize])]) -> SafeTensors 
     let mut out = (header.len() as u64).to_le_bytes().to_vec();
     out.extend_from_slice(header.as_bytes());
     out.extend_from_slice(&data);
-    SafeTensors::from_bytes("qwen35 loader test", out).unwrap()
+    out
+}
+
+fn checkpoint_of(entries: &[Entry]) -> SafeTensors {
+    SafeTensors::from_bytes("qwen35 loader test", safetensors_bytes(entries)).unwrap()
+}
+
+/// `st`'s tensors plus `extra` `(name, shape)` F32 zeros, as a checkpoint.
+fn checkpoint_with(st: &SafeTensors, extra: &[(&str, &[usize])]) -> SafeTensors {
+    let mut entries = entries_of(st);
+    for &(name, shape) in extra {
+        let n: usize = shape.iter().product();
+        entries.push((name.to_string(), "F32".into(), shape.to_vec(), vec![0u8; n * 4]));
+    }
+    checkpoint_of(&entries)
 }
 
 /// A tensor under the prefix the model never reads is refused by name, for
@@ -1397,5 +1416,391 @@ fn sessions_refuse_to_continue_across_a_per_entry_host_write() {
         assert_eq!(rt.take_dispatch_count(), 0, "a refused call encoded work");
         let (mut dec, _) = model.prefill(&ids[..4], 2).unwrap();
         dec.step(ids[4]).unwrap();
+    });
+}
+
+// ------------------------------------------------------------ untied head ---
+
+/// `make_train_fixture.py tiny --untied`: the tiny model with
+/// `tie_word_embeddings: false`, a separate `lm_head.weight` at the
+/// checkpoint root, and transformers' float32 logits (`logits.npy`).
+fn untied_fixture() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/qwen35_train_untied")
+}
+
+fn untied_config() -> Qwen35Config {
+    let cfg = Qwen35Config::from_config_file(&untied_fixture().join("config.json")).unwrap();
+    assert!(!cfg.tie_word_embeddings);
+    cfg
+}
+
+fn untied_ids() -> Vec<u32> {
+    let a = read_npy(&untied_fixture().join("ids.npy")).unwrap();
+    a.i64_slice().unwrap().iter().map(|&x| x as u32).collect()
+}
+
+fn untied_logits() -> Vec<f32> {
+    let a = read_npy(&untied_fixture().join("logits.npy")).unwrap();
+    assert_eq!(a.shape, [untied_ids().len(), 64]);
+    a.f32_slice().unwrap().to_vec()
+}
+
+fn untied_checkpoint() -> SafeTensors {
+    SafeTensors::open(&untied_fixture().join("model.safetensors")).unwrap()
+}
+
+/// An untied checkpoint's logits are transformers' (f32 to the existing
+/// bound, bf16 to its own), through the head GEMM over `lm_head.weight`, not
+/// the embedding: the fixture's head and embedding differ everywhere.
+#[test]
+fn untied_forward_matches_transformers_logits() {
+    let st = untied_checkpoint();
+    let ids = untied_ids();
+    let want: Vec<f32> = untied_logits();
+    with_gpu(|rt| {
+        for precision in [Precision::F32, Precision::Bf16] {
+            let model = Qwen35Model::load(rt, &st, "model.", untied_config(), precision).unwrap();
+            let got = model.forward(&ids, false).unwrap().logits;
+            let r = rel32(&got, &want);
+            let b = bound(precision);
+            eprintln!("untied {precision:?}: logits rel err {r:.3e} (bound {b:.0e})");
+            assert!(r <= b, "untied {precision:?}: logits rel err {r:.3e} > {b:.0e}");
+            assert!(
+                model.describe().contains(match precision {
+                    Precision::F32 => "untied",
+                    Precision::Bf16 => "packed bf16 copy",
+                }),
+                "{}",
+                model.describe()
+            );
+        }
+    });
+}
+
+/// Every head consumer reads `lm_head.weight`: prefill then decode (the
+/// decode step's head), chosen rows, `Staged::logits`, and `score_answers`
+/// on a full model and on a tower, each against `forward`'s transformers-
+/// checked logits.
+#[test]
+fn untied_decode_rows_and_answers_use_the_own_head() {
+    let st = untied_checkpoint();
+    let ids = untied_ids();
+    let want = untied_logits();
+    let (v, t) = (64usize, ids.len());
+    let n_layers = untied_config().layers.len();
+    let answers = [3u32, 17, 42, 63];
+    with_gpu(|rt| {
+        for precision in [Precision::F32, Precision::Bf16] {
+            let b = bound(precision);
+            let model = Qwen35Model::load(rt, &st, "model.", untied_config(), precision).unwrap();
+            let tower = Qwen35Model::load_tower(rt, &st, "model.", untied_config(), precision).unwrap();
+            // prefill N, then decode: the last row of forward(N + k).
+            let n = t - 3;
+            let (mut dec, first) = model.prefill(&ids[..n], 3).unwrap();
+            let mut got = vec![first];
+            for k in 0..3 {
+                got.push(dec.step(ids[n + k]).unwrap());
+            }
+            for (k, row) in got.iter().enumerate() {
+                let p = n + k - 1;
+                let r = rel32(row, &want[p * v..(p + 1) * v]);
+                assert!(r <= b, "untied {precision:?}: decoded {k}: rel err {r:.3e} > {b:.0e}");
+            }
+            // chosen rows and Staged::logits.
+            let picks = [t as u32 - 1, 0, 30];
+            let rows = model.forward_rows(&ids, LogitRows::Rows(&picks), false).unwrap().logits;
+            let expect: Vec<f32> = picks
+                .iter()
+                .flat_map(|&p| want[p as usize * v..(p as usize + 1) * v].to_vec())
+                .collect();
+            let r = rel32(&rows, &expect);
+            assert!(r <= b, "untied {precision:?}: forward_rows rel err {r:.3e}");
+            let mut s = model.begin(&ids).unwrap();
+            s.advance_to(n_layers).unwrap();
+            let staged = s.logits(LogitRows::Last).unwrap();
+            assert!(
+                rel32(&staged, &want[(t - 1) * v..]) <= b,
+                "untied {precision:?}: Staged::logits"
+            );
+            // score_answers, full and tower.
+            for m in [&model, &tower] {
+                let mut s = m.begin(&ids).unwrap();
+                s.advance_to(n_layers).unwrap();
+                let sc = s.score_answers(&[t as u32 - 1, 0], &answers).unwrap();
+                for (i, &p) in [t - 1, 0].iter().enumerate() {
+                    let row = &want[p * v..(p + 1) * v];
+                    let peak = row.iter().fold(0.0f64, |m, &x| m.max(f64::from(x).abs()));
+                    for (j, &a) in answers.iter().enumerate() {
+                        let err = (f64::from(sc.logits[i * answers.len() + j]) - f64::from(row[a as usize])).abs();
+                        assert!(
+                            err <= b * peak,
+                            "untied {precision:?}: score_answers [{p}, {a}]: {err:.3e}"
+                        );
+                    }
+                }
+            }
+        }
+    });
+}
+
+/// A checkpoint and its config must agree on the head, in both directions:
+/// an untied config needs `lm_head.weight`; a tied config refuses a
+/// checkpoint carrying one (nothing would read it). Neither loads anything.
+#[test]
+fn head_and_config_must_agree() {
+    let tied_st = SafeTensors::open(&fixture().join("model.safetensors")).unwrap();
+    let untied_st = untied_checkpoint();
+    with_gpu(|rt| {
+        for precision in [Precision::F32, Precision::Bf16] {
+            let e = Qwen35Model::load(rt, &tied_st, "model.", untied_config(), precision)
+                .err()
+                .expect("an untied config over a checkpoint with no lm_head.weight");
+            assert!(e.contains("lm_head.weight"), "{e}");
+            let e = Qwen35Model::load(rt, &untied_st, "model.", tiny_config(), precision)
+                .err()
+                .expect("a tied config over a checkpoint with lm_head.weight");
+            assert!(e.contains("lm_head.weight") && e.contains("ties"), "{e}");
+            let e = Qwen35Model::load_tower(rt, &untied_st, "model.", tiny_config(), precision)
+                .err()
+                .expect("the same through load_tower");
+            assert!(e.contains("lm_head.weight"), "{e}");
+        }
+        // A head of the wrong shape is refused by name and shape.
+        let mut cfg = untied_config();
+        cfg.vocab = 63;
+        let e = Qwen35Model::load(rt, &untied_st, "model.", cfg, Precision::F32)
+            .err()
+            .unwrap();
+        assert!(e.contains("shape"), "{e}");
+        // The tied layout is untouched: the same fixture loads tied as before.
+        Qwen35Model::load(rt, &tied_st, "model.", tiny_config(), Precision::F32).unwrap();
+    });
+}
+
+/// `random`'s untied head is its own table, drawn after the tower: the
+/// tower's weights are the tied model's, the logits are not, and the bf16
+/// packed head (from `lm_head`) agrees with the f32 model's.
+#[test]
+fn random_untied_model_has_its_own_head() {
+    with_gpu(|rt| {
+        let tied = grouped_config();
+        let untied = Qwen35Config {
+            tie_word_embeddings: false,
+            ..grouped_config()
+        };
+        let ids = seq(9);
+        let a = Qwen35Model::random(rt, tied.clone(), Precision::F32, 11).unwrap();
+        let b = Qwen35Model::random(rt, untied.clone(), Precision::F32, 11).unwrap();
+        let tower = Qwen35Model::random_tower(rt, untied.clone(), Precision::F32, 11).unwrap();
+        let (fa, fb) = (a.forward(&ids, true).unwrap(), b.forward(&ids, true).unwrap());
+        // The same tower: the traces (every layer and the final norm) are bit-equal.
+        assert_eq!(fa.trace.len(), fb.trace.len());
+        for (x, y) in fa.trace.iter().zip(&fb.trace) {
+            assert!(
+                x.iter().zip(y).all(|(p, q)| p.to_bits() == q.to_bits()),
+                "tower differs"
+            );
+        }
+        assert!(
+            rel32(&fa.logits, &fb.logits) > 0.1,
+            "an untied head is not the embedding"
+        );
+        let mut s = tower.begin(&ids).unwrap();
+        s.advance_to(untied.layers.len()).unwrap();
+        let sc = s.score_answers(&[8], &[1, 2, 3]).unwrap();
+        let v = untied.vocab as usize;
+        for (j, &id) in [1usize, 2, 3].iter().enumerate() {
+            let want = fb.logits[8 * v + id];
+            assert!(
+                (sc.logits[j] - want).abs() <= 1e-4 * want.abs().max(1.0),
+                "score {j}: {} vs {want}",
+                sc.logits[j]
+            );
+        }
+        let bf = Qwen35Model::random(rt, untied, Precision::Bf16, 11).unwrap();
+        let fbf = bf.forward(&ids, false).unwrap();
+        assert!(rel32(&fbf.logits, &fb.logits) <= 2e-2, "bf16 packed head vs f32");
+    });
+}
+
+// ------------------------------------------- untied head: layout refusals ---
+
+const HEAD: &str = "lm_head.weight";
+
+/// The untied fixture's entries with `lm_head.weight` replaced by `head`.
+fn untied_entries_with_head(head: Option<Entry>) -> Vec<Entry> {
+    let mut entries: Vec<Entry> = entries_of(&untied_checkpoint())
+        .into_iter()
+        .filter(|e| e.0 != HEAD)
+        .collect();
+    entries.extend(head);
+    entries
+}
+
+fn untied_head_entry() -> Entry {
+    entries_of(&untied_checkpoint())
+        .into_iter()
+        .find(|e| e.0 == HEAD)
+        .unwrap()
+}
+
+fn load_err(st: &dyn tessl::safetensors::TensorSource, prefix: &str, p: Precision) -> String {
+    with_gpu(|rt| {
+        Qwen35Model::load(rt, st, prefix, untied_config(), p)
+            .err()
+            .expect("this checkpoint must be refused")
+    })
+}
+
+/// A head stored in a dtype the model's precision does not read is refused by
+/// name and dtype, not widened or narrowed: bf16 reads bf16 bits only, and f32
+/// reads F32, BF16 and F16 only (I32 here).
+#[test]
+fn an_untied_head_in_the_wrong_dtype_is_refused() {
+    let (_, _, shape, bytes) = untied_head_entry();
+    let n: usize = shape.iter().product();
+    assert_eq!(bytes.len(), n * 2, "the fixture's head is bf16");
+    let as_f32: Vec<u8> = bytes
+        .chunks(2)
+        .flat_map(|b| (f32::from_bits(u32::from(u16::from_le_bytes([b[0], b[1]])) << 16)).to_le_bytes())
+        .collect();
+    let f32_head = checkpoint_of(&untied_entries_with_head(Some((
+        HEAD.into(),
+        "F32".into(),
+        shape.clone(),
+        as_f32,
+    ))));
+    let e = load_err(&f32_head, "model.", Precision::Bf16);
+    assert!(
+        e.contains(HEAD) && e.contains("expected BF16") && e.contains("F32"),
+        "{e}"
+    );
+    let i32_head = checkpoint_of(&untied_entries_with_head(Some((
+        HEAD.into(),
+        "I32".into(),
+        shape.clone(),
+        vec![0u8; n * 4],
+    ))));
+    let e = load_err(&i32_head, "model.", Precision::F32);
+    assert!(e.contains(HEAD) && e.contains("cannot read"), "{e}");
+    // The same checkpoint with the head in its own dtype loads.
+    let good = checkpoint_of(&untied_entries_with_head(Some(untied_head_entry())));
+    with_gpu(|rt| {
+        Qwen35Model::load(rt, &good, "model.", untied_config(), Precision::Bf16).unwrap();
+    });
+}
+
+/// `lm_head.weight` lives at the checkpoint root. One inside the tower's
+/// prefix (`model.language_model.lm_head.weight`, the real checkpoints'
+/// prefix) is not read: with none at the root the load fails for the missing
+/// head, and beside the root's it is refused as an unread tensor, by name.
+#[test]
+fn a_head_inside_the_tower_prefix_is_refused_as_unread() {
+    const P: &str = "model.language_model.";
+    let renamed = |entries: Vec<Entry>| -> Vec<Entry> {
+        entries
+            .into_iter()
+            .map(|(n, d, s, b)| match n.strip_prefix("model.") {
+                Some(rest) => (format!("{P}{rest}"), d, s, b),
+                None => (n, d, s, b),
+            })
+            .collect()
+    };
+    let (_, dtype, shape, bytes) = untied_head_entry();
+    let in_tower: Entry = (format!("{P}{HEAD}"), dtype, shape, bytes);
+    // The real layout (tower under the prefix, head at the root) loads.
+    let real = checkpoint_of(&renamed(untied_entries_with_head(Some(untied_head_entry()))));
+    with_gpu(|rt| {
+        Qwen35Model::load(rt, &real, P, untied_config(), Precision::F32).unwrap();
+    });
+    // Head only inside the tower prefix: the root has none.
+    let only_in_tower = checkpoint_of(
+        &renamed(untied_entries_with_head(None))
+            .into_iter()
+            .chain([in_tower.clone()])
+            .collect::<Vec<_>>(),
+    );
+    let e = load_err(&only_in_tower, P, Precision::F32);
+    assert!(e.contains(HEAD), "{e}");
+    // Both: the root's is read, the tower's is an unread tensor under the prefix.
+    let both = checkpoint_of(
+        &renamed(untied_entries_with_head(Some(untied_head_entry())))
+            .into_iter()
+            .chain([in_tower])
+            .collect::<Vec<_>>(),
+    );
+    let e = load_err(&both, P, Precision::F32);
+    assert!(e.contains(&format!("{P}{HEAD}")) && e.contains("not part of the model"), "{e}");
+}
+
+struct Scratch(PathBuf);
+
+impl Scratch {
+    fn new(tag: &str) -> Self {
+        let dir = std::env::temp_dir().join(format!("tessl-qwen35-untied-{}-{tag}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        Scratch(dir)
+    }
+}
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// A sharded checkpoint whose `lm_head.weight` is in a different shard from
+/// `embed_tokens.weight` loads, and is the single file's model bit for bit
+/// (parameters, then logits), in both precisions.
+#[test]
+fn a_head_in_another_shard_than_the_embedding_loads() {
+    let sc = Scratch::new("shards");
+    let all = entries_of(&untied_checkpoint());
+    let (head, rest): (Vec<Entry>, Vec<Entry>) = all.iter().cloned().partition(|e| e.0 == HEAD);
+    assert!(head.len() == 1 && rest.iter().any(|e| e.0 == "model.embed_tokens.weight"));
+    let (f1, f2) = ("model-00001-of-00002.safetensors", "model-00002-of-00002.safetensors");
+    std::fs::write(sc.0.join(f1), safetensors_bytes(&rest)).unwrap();
+    std::fs::write(sc.0.join(f2), safetensors_bytes(&head)).unwrap();
+    let map: Vec<String> = rest
+        .iter()
+        .map(|e| format!("{:?}:{f1:?}", e.0))
+        .chain([format!("{HEAD:?}:{f2:?}")])
+        .collect();
+    std::fs::write(
+        sc.0.join(tessl::safetensors::INDEX_FILE_NAME),
+        format!(
+            "{{\"metadata\":{{\"total_size\":1}},\"weight_map\":{{{}}}}}",
+            map.join(",")
+        ),
+    )
+    .unwrap();
+    let view = tessl::safetensors::CheckpointView::open(&sc.0).unwrap();
+    assert_eq!(view.shard_count(), 2);
+    let single = untied_checkpoint();
+    let ids = untied_ids();
+    with_gpu(|rt| {
+        for precision in [Precision::F32, Precision::Bf16] {
+            let a = Qwen35Model::load(rt, &single, "model.", untied_config(), precision).unwrap();
+            let b = Qwen35Model::load(rt, &view, "model.", untied_config(), precision).unwrap();
+            let table = a.parameter_table().unwrap();
+            assert_eq!(table.last().unwrap().name, HEAD);
+            for (i, p) in table.iter().enumerate() {
+                let n: usize = p.shape.iter().product();
+                let (mut x, mut y) = (vec![0f32; n], vec![0f32; n]);
+                a.read_parameter_host(i, &mut x).unwrap();
+                b.read_parameter_host(i, &mut y).unwrap();
+                assert!(
+                    x.iter().zip(&y).all(|(p, q)| p.to_bits() == q.to_bits()),
+                    "{precision:?} {}: sharded load differs",
+                    p.name
+                );
+            }
+            let (la, lb) = (
+                a.forward(&ids, false).unwrap().logits,
+                b.forward(&ids, false).unwrap().logits,
+            );
+            assert!(la == lb, "{precision:?}: sharded logits differ");
+        }
     });
 }

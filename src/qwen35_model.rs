@@ -4,7 +4,7 @@
 //!
 //! Each kernel is checked against transformers on its own (`docs/qwen35.md`);
 //! this is the composition: the layer order, norm offsets, weight layouts and
-//! tied LM head of inference, written once in `Qwen35Model::layer` for the
+//! LM head of inference, written once in `Qwen35Model::layer` for the
 //! prefill, the staged prefill and decode alike, and what
 //! `tests/qwen35_model.rs` checks end to end against transformers' logits.
 //! Training ([`crate::qwen35_train`]) runs its own layer forward, on the
@@ -20,8 +20,10 @@
 //! resid += down(silu(gate(x)) * up(x))
 //! ```
 //!
-//! and after the last layer `logits = rms_norm(resid) * (1 + norm.w) @ embedᵀ`
-//! (Qwen3.5 ties the LM head to the embedding). Zero-centred norm weights are
+//! and after the last layer `logits = rms_norm(resid) * (1 + norm.w) @ headᵀ`
+//! (Qwen3.5 up to the 4B ties the LM head to the embedding, so `head` is
+//! `embed`; the 9B's `tie_word_embeddings: false` gives it its own
+//! `lm_head.weight`, read from the checkpoint root). Zero-centred norm weights are
 //! stored as the checkpoint holds them, `w`, and their kernels form `1 + w`
 //! in f32 as transformers does (the residual norms in `qwen35_rms_norm_*`,
 //! the attention Q/K norms in theirs); the GDN gated norm's weight is used
@@ -35,7 +37,9 @@
 //! the config's, a projection bias, an extra norm. Such a tensor is a
 //! parameter of a model this forward does not implement, and ignoring it would
 //! return the wrong model's logits without a word. Tensors outside the prefix
-//! (the vision tower, `mtp.`) are not looked at.
+//! (the vision tower, `mtp.`) are not looked at, except `lm_head.weight`: an
+//! untied config requires it and a tied one refuses a checkpoint that carries
+//! it.
 //!
 //! # Precision
 //!
@@ -124,7 +128,18 @@ pub struct Qwen35Config {
     pub rotary_dim: u32,
     pub rope_theta: f32,
     pub rms_norm_eps: f32,
+    /// `tie_word_embeddings`: the LM head is the embedding (Qwen3.5-0.8B to
+    /// 4B). `false` (the 9B and up) gives the model its own `lm_head.weight`,
+    /// a `[vocab, hidden]` parameter beside `embed_tokens.weight` that the
+    /// loader reads from the checkpoint root (outside the tower's prefix, as
+    /// transformers names it) and that the gradients, optimizer and
+    /// parameter table carry as an entry of its own.
+    pub tie_word_embeddings: bool,
 }
+
+/// The checkpoint tensor that is an untied model's LM head, at the
+/// checkpoint root. A tied checkpoint holds none.
+pub const LM_HEAD_NAME: &str = "lm_head.weight";
 
 impl Qwen35Config {
     /// `Qwen/Qwen3.5-2B-Base`'s `config.json` `text_config`: 24 layers, every
@@ -151,6 +166,7 @@ impl Qwen35Config {
             rotary_dim: 64,
             rope_theta: 1e7,
             rms_norm_eps: 1e-6,
+            tie_word_embeddings: true,
         };
         cfg.validate()?;
         Ok(cfg)
@@ -161,8 +177,7 @@ impl Qwen35Config {
     /// root (a text-only one, `model_type: "qwen3_5_text"`).
     ///
     /// Everything the forward depends on is read, and everything it does not
-    /// implement is refused by name rather than ignored: untied embeddings,
-    /// MoE, attention bias, an ungated attention output, an activation other
+    /// implement is refused by name rather than ignored: MoE, attention bias, an ungated attention output, an activation other
     /// than SiLU, `mlp_only_layers`, a RoPE other than the default, a
     /// `mamba_ssm_dtype` other than `"float32"`, a non-zero `attention_dropout`,
     /// and key or head dims the kernels are not compiled for.
@@ -215,26 +230,32 @@ impl Qwen35Config {
             }
         };
 
-        // Features the forward does not implement.
-        // Every tie_word_embeddings present (root and text_config) must be
-        // true, and at least one must be.
-        let ties = [root.get("tie_word_embeddings"), c.get("tie_word_embeddings")];
-        for t in ties.iter().flatten() {
-            match t {
-                Json::Bool(true) => {}
-                Json::Bool(false) => {
-                    return Err("config.json: untied embeddings (a separate lm_head) are not supported".into())
-                }
-                v => {
-                    return Err(format!(
-                        "config.json: tie_word_embeddings must be true or false, got {v:?}"
-                    ))
-                }
+        // `tie_word_embeddings`, at the root and in `text_config`: whichever
+        // are present must be booleans and agree, and one must be present
+        // (transformers 5.17.0's `Qwen3_5Config` and `Qwen3_5TextConfig` both
+        // default it to False, configuration_qwen3_5.py:184 and :93, while
+        // the tied checkpoints state it, as the published 2B-Base config
+        // does; so a config that is silent could be either layout, and is
+        // refused rather than guessed: the head is the whole difference
+        // between the two checkpoint layouts).
+        let mut tie: Option<bool> = None;
+        for t in [root.get("tie_word_embeddings"), c.get("tie_word_embeddings")]
+            .into_iter()
+            .flatten()
+        {
+            let Json::Bool(b) = t else {
+                return Err(format!(
+                    "config.json: tie_word_embeddings must be true or false, got {t:?}"
+                ));
+            };
+            if tie.replace(*b).is_some_and(|prev| prev != *b) {
+                return Err("config.json: tie_word_embeddings disagrees between the root and text_config".into());
             }
         }
-        if ties.iter().all(Option::is_none) {
-            return Err("config.json: tie_word_embeddings is not set; the forward needs a tied LM head".into());
-        }
+        let tie_word_embeddings =
+            tie.ok_or("config.json: tie_word_embeddings is not set; the LM head must be stated as tied or untied")?;
+
+        // Features the forward does not implement.
         for k in ["num_experts", "num_local_experts", "moe_intermediate_size"] {
             if c.get(k).is_some() {
                 return Err(format!(
@@ -373,6 +394,7 @@ impl Qwen35Config {
             rotary_dim: rotary as u32,
             rope_theta: theta as f32,
             rms_norm_eps: eps as f32,
+            tie_word_embeddings,
         };
         cfg.validate()?;
         Ok(cfg)
@@ -474,11 +496,16 @@ pub struct Qwen35Model {
     pub(crate) cfg: Qwen35Config,
     pub(crate) precision: Precision,
     pub(crate) rt: Arc<GpuRuntime>,
-    /// `[vocab, hidden]` in the forward's precision: the tied embedding (the
-    /// gather's table; in f32 also the head GEMM's transposed operand, and
-    /// what training reads and writes).
+    /// `[vocab, hidden]` in the forward's precision: the embedding (the
+    /// gather's table; tied, also the head, in f32 the head GEMM's transposed
+    /// operand, and what training reads and writes).
     pub(crate) embed: Tensor,
-    /// Bf16 only: the tied head packed `[hidden, vocab]` for an NN GEMM,
+    /// An untied model's own LM head (`lm_head.weight`), `[vocab, hidden]` in
+    /// the forward's precision; `None` when tied, where `embed` is the head.
+    /// Read through [`Self::head_table`]: the head GEMM (f32), the packed
+    /// bf16 copy's source, `score_answers` and training's cross-entropy.
+    pub(crate) lm_head: Option<Tensor>,
+    /// Bf16 only: the head (the tied embedding, or `lm_head`) packed `[hidden, vocab]` for an NN GEMM,
     /// which measured faster than the NT GEMM over `embed` at the 2B's
     /// head, even with the NT tile tuned for it (5-11%,
     /// `bench/results/bf16_nt_lm_head_m5pro.txt`). The
@@ -620,34 +647,34 @@ impl Qwen35Model {
         let ld = Loader::new(rt, st, prefix);
         let (h, inter, vocab) = (cfg.hidden as usize, cfg.intermediate as usize, cfg.vocab as usize);
 
-        // The tied embedding: one [vocab, hidden] table in the model's
-        // precision, which the gather reads by row and the LM head as the
-        // transposed right operand of one GEMM.
-        let (embed, lm_head_bf16) = match precision {
-            Precision::Bf16 => {
-                let t = rt.alloc_tensor_bf16_hot(&[vocab, h])?;
-                let head = if with_head {
-                    // One host copy of the table, placed into both device
-                    // tensors and dropped; never a second, packed host copy.
-                    let bits = ld.bf16("embed_tokens.weight", &[vocab, h])?;
-                    t.buffer
-                        .try_write_bf16_bits(&bits)
-                        .map_err(|e| format!("Qwen35Model::load: embed_tokens: {e}"))?;
-                    Some(Self::pack_head(rt, &bits, vocab, h)?)
-                } else {
-                    // No head to transpose into: read straight into the table.
-                    ld.bf16_into("embed_tokens.weight", &[vocab, h], &t)?;
-                    None
-                };
-                (t, head)
-            }
-            Precision::F32 => {
-                // Widened straight into the table: no host copy at all.
-                let t = rt.alloc_tensor_f32_hot(&[vocab, h])?;
-                ld.f32_into("embed_tokens.weight", &[vocab, h], &t)?;
-                (t, None)
-            }
+        // The embedding: one [vocab, hidden] table in the model's precision,
+        // which the gather reads by row and, tied, the LM head as the
+        // transposed right operand of one GEMM. Untied, the head is its own
+        // table read from the checkpoint root; a tied checkpoint carrying one
+        // is refused (it would be read by nothing).
+        let tied = cfg.tie_word_embeddings;
+        if tied && ld.has_root(LM_HEAD_NAME) {
+            return Err(format!(
+                "Qwen35Model::load: the config ties the word embeddings but the checkpoint carries {LM_HEAD_NAME}; \
+                 the tied forward would ignore it (tie_word_embeddings is false for such a model)"
+            ));
+        }
+        let (embed, tied_head_bf16) = Self::load_table(
+            rt,
+            &ld,
+            "embed_tokens.weight",
+            false,
+            [vocab, h],
+            precision,
+            with_head && tied,
+        )?;
+        let (lm_head, untied_head_bf16) = if tied {
+            (None, None)
+        } else {
+            let (t, packed) = Self::load_table(rt, &ld, LM_HEAD_NAME, true, [vocab, h], precision, with_head)?;
+            (Some(t), packed)
         };
+        let lm_head_bf16 = tied_head_bf16.or(untied_head_bf16);
         let final_norm = ld.norm("norm.weight", h)?;
 
         let (g, a) = (cfg.gdn, cfg.attn);
@@ -724,6 +751,7 @@ impl Qwen35Model {
             precision,
             rt: Arc::clone(rt),
             embed,
+            lm_head,
             lm_head_bf16,
             final_norm,
             layers,
@@ -732,6 +760,59 @@ impl Qwen35Model {
             layer_fault: AtomicUsize::new(usize::MAX),
             read_fault: AtomicUsize::new(usize::MAX),
         })
+    }
+
+    /// One `[vocab, hidden]` table (the embedding, or an untied head at the
+    /// checkpoint `root`) read into a device tensor in `precision`; with
+    /// `pack` at bf16, also packed `[hidden, vocab]` for the head's NN GEMM.
+    /// The one place a table is read, so the embedding and an untied head
+    /// cannot load differently.
+    fn load_table(
+        rt: &Arc<GpuRuntime>,
+        ld: &Loader<'_>,
+        name: &str,
+        root: bool,
+        shape: [usize; 2],
+        precision: Precision,
+        pack: bool,
+    ) -> Result<(Tensor, Option<Tensor>), String> {
+        let [vocab, h] = shape;
+        match precision {
+            Precision::Bf16 => {
+                let t = rt.alloc_tensor_bf16_hot(&[vocab, h])?;
+                if pack {
+                    // One host copy of the table, placed into both device
+                    // tensors and dropped; never a second, packed host copy.
+                    let bits = if root {
+                        ld.bf16_root(name, &[vocab, h])?
+                    } else {
+                        ld.bf16(name, &[vocab, h])?
+                    };
+                    t.buffer
+                        .try_write_bf16_bits(&bits)
+                        .map_err(|e| format!("Qwen35Model::load: {name}: {e}"))?;
+                    Ok((t, Some(Self::pack_head(rt, &bits, vocab, h)?)))
+                } else {
+                    // No head to transpose into: read straight into the table.
+                    if root {
+                        ld.bf16_into_root(name, &[vocab, h], &t)?;
+                    } else {
+                        ld.bf16_into(name, &[vocab, h], &t)?;
+                    }
+                    Ok((t, None))
+                }
+            }
+            Precision::F32 => {
+                // Widened straight into the table: no host copy at all.
+                let t = rt.alloc_tensor_f32_hot(&[vocab, h])?;
+                if root {
+                    ld.f32_into_root(name, &[vocab, h], &t)?;
+                } else {
+                    ld.f32_into(name, &[vocab, h], &t)?;
+                }
+                Ok((t, None))
+            }
+        }
     }
 
     /// The tied head packed `[hidden, vocab]` from the embedding's bf16 `bits`
@@ -824,7 +905,9 @@ impl Qwen35Model {
         };
         let (g, a) = (cfg.gdn, cfg.attn);
         let embed = upload(&[vocab, h], precision, &embed_data)?;
-        let lm_head_bf16 = if with_head && precision == Precision::Bf16 {
+        // Tied, the head is the embedding's own draw; an untied head is drawn
+        // after every layer, so the tower's weights are the tied model's.
+        let tied_head_bf16 = if with_head && cfg.tie_word_embeddings && precision == Precision::Bf16 {
             Some(Self::pack_head(
                 rt,
                 &crate::tensor::f32_slice_to_bf16(&embed_data),
@@ -866,12 +949,24 @@ impl Qwen35Model {
             });
         }
         let final_norm = zeros(h)?;
+        let (lm_head, lm_head_bf16) = if cfg.tie_word_embeddings {
+            (None, tied_head_bf16)
+        } else {
+            let data = uniform(vocab * h);
+            let packed = if with_head && precision == Precision::Bf16 {
+                Some(Self::pack_head(rt, &crate::tensor::f32_slice_to_bf16(&data), vocab, h)?)
+            } else {
+                None
+            };
+            (Some(upload(&[vocab, h], precision, &data)?), packed)
+        };
         rt.synchronize()?;
         Ok(Self {
             cfg,
             precision,
             rt: Arc::clone(rt),
             embed,
+            lm_head,
             lm_head_bf16,
             final_norm,
             layers,
@@ -922,7 +1017,11 @@ impl Qwen35Model {
             if self.lm_head_bf16.is_some() {
                 "packed bf16 copy"
             } else if self.precision == Precision::F32 {
-                "tied to the embedding"
+                if self.lm_head.is_some() {
+                    "untied (its own table)"
+                } else {
+                    "tied to the embedding"
+                }
             } else {
                 "none (load_tower / random_tower; only begin / Staged::score_answers read it)"
             }
@@ -1247,16 +1346,22 @@ impl Qwen35Model {
         }
     }
 
-    /// `out = (rms_norm(resid) * (1 + norm.w)) @ embedᵀ` for every row of
+    /// `out = (rms_norm(resid) * (1 + norm.w)) @ headᵀ` for every row of
     /// `resid` (f32 `[rows, hidden]`), through `x` (`[rows, hidden]` in the
-    /// activation dtype): the final norm and the tied LM head. `out` is f32
+    /// activation dtype): the final norm and the LM head (tied to the embedding, or its own). `out` is f32
     /// `[rows, vocab]`. Encoded, not waited for.
     fn head(&self, resid: &Tensor, x: &Tensor, out: &Tensor) -> Result<(), String> {
         self.norm(resid, &self.final_norm, x)?;
         match &self.lm_head_bf16 {
             Some(head) => gemm(x, head, out, BACKEND),
-            None => gemm_nt_f32(x, &self.embed, out, BACKEND),
+            None => gemm_nt_f32(x, self.head_table(), out, BACKEND),
         }
+    }
+
+    /// The `[vocab, hidden]` table the LM head reads: an untied model's own
+    /// `lm_head`, else the tied embedding.
+    pub(crate) fn head_table(&self) -> &Tensor {
+        self.lm_head.as_ref().unwrap_or(&self.embed)
     }
 
     /// `out = rms_norm(x) * (1 + w)` in the forward's activation dtype.
@@ -1773,7 +1878,7 @@ impl Staged<'_> {
     /// The `answers` tokens' logits at positions `rows`, and their
     /// log-softmax over the answers alone, from the residual stream at the
     /// layer reached: [`qwen35::score_answer_rows`], which applies the final
-    /// norm and dots each row with only the answers' rows of the tied head,
+    /// norm and dots each row with only the answers' rows of the LM head,
     /// in f32 (a bf16 embedding is read as stored; the activations are not
     /// rounded to bf16 as [`Self::logits`]' bf16 GEMM rounds them). No
     /// logits row is formed, so it runs on a [`Qwen35Model::load_tower`]
@@ -1815,8 +1920,8 @@ impl Staged<'_> {
             1.0,
             cfg.rms_norm_eps,
             LmHead {
-                weight: &m.embed.buffer,
-                dtype: m.embed.dtype,
+                weight: &m.head_table().buffer,
+                dtype: m.head_table().dtype,
                 vocab: cfg.vocab,
             },
             &ans,

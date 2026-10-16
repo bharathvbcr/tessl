@@ -57,9 +57,43 @@ impl<'a> Loader<'a> {
 
     /// `rest`'s full name, recorded as read.
     fn take(&self, rest: &str) -> String {
-        let name = format!("{}{rest}", self.prefix);
-        self.read.borrow_mut().insert(name.clone());
-        name
+        self.take_root(&format!("{}{rest}", self.prefix))
+    }
+
+    /// `name` as the checkpoint spells it (no prefix), recorded as read.
+    fn take_root(&self, name: &str) -> String {
+        self.read.borrow_mut().insert(name.to_string());
+        name.to_string()
+    }
+
+    /// Whether the checkpoint holds a tensor named `name` exactly (no
+    /// prefix): for a tensor that lives at the root, beside the tower, such
+    /// as an untied model's `lm_head.weight`.
+    pub(crate) fn has_root(&self, name: &str) -> bool {
+        self.st.names().any(|n| n == name)
+    }
+
+    /// [`Self::bf16`] for a tensor named `name` as the checkpoint spells it.
+    pub(crate) fn bf16_root(&self, name: &str, shape: &[usize]) -> Result<Vec<u16>, String> {
+        let name = self.take_root(name);
+        let (got, bits) = self.st.read_bf16_bits(&name)?;
+        if got != shape {
+            return Err(format!("{name}: shape {got:?}, expected {shape:?}"));
+        }
+        Ok(bits)
+    }
+
+    /// [`Self::f32_into`] for a tensor named `name` as the checkpoint spells it.
+    pub(crate) fn f32_into_root(&self, name: &str, shape: &[usize], t: &Tensor) -> Result<(), String> {
+        let name = self.take_root(name);
+        self.st.read_f32_into(&name, shape, &mut t.buffer.try_contents_f32()?)
+    }
+
+    /// [`Self::bf16_into`] for a tensor named `name` as the checkpoint spells it.
+    pub(crate) fn bf16_into_root(&self, name: &str, shape: &[usize], t: &Tensor) -> Result<(), String> {
+        let name = self.take_root(name);
+        self.st
+            .read_bf16_bits_into(&name, shape, &mut t.buffer.try_contents_u16()?)
     }
 
     /// A tensor widened to f32, with its shape checked.

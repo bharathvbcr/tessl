@@ -401,6 +401,7 @@ fn consecutive_facade_calls_hold_one_activation_set_in_process() {
                     ids: &ids,
                     images: &imgs,
                     audio: one_clip,
+                    videos: &[],
                 },
             ];
             let out_bucket = cold(items.len() * m.text().config().embedding_dim as usize * 4);

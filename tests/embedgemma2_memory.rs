@@ -14,8 +14,12 @@
 mod common;
 
 use common::embedgemma2::{open, safetensors_bytes, weights_for, CONFIG, PREFIX};
+use common::embedgemma2_mm::{checkpoint_bytes, clip, config_json, configs, Configs, Image, AUDIO, IMAGE};
 use common::with_gpu;
 use tessl::embedgemma2::{EmbedGemma2Config, EmbedGemma2Model, PLE_RUN_BYTES};
+use tessl::embedgemma2_audio::{AudioInput, EmbedGemma2Audio};
+use tessl::embedgemma2_mm::{EmbedGemma2Multimodal, MmItem};
+use tessl::embedgemma2_vision::{EmbedGemma2VisionModel, ImageInput};
 use tessl::gemm::GemmOperands;
 use tessl::{BufferKind, GpuRuntime};
 
@@ -200,6 +204,180 @@ fn one_encode_allocates_the_itemized_set() {
                 (want..=want + slack).contains(&got),
                 "{operands:?}: one encode took {got} bytes, the itemized set is {want} (+ up to {slack} \
                  for buffers under 16 KiB)"
+            );
+        });
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The towers and the facade (tiny checkpoint of `tests/common/embedgemma2_mm.rs`)
+// ---------------------------------------------------------------------------
+//
+// Bounds, fixed before the towers' lifetime change was written: consecutive
+// tower calls of one forward each hold one activation set, so calls 2 to 4
+// reach at most one fresh `soft` output above the first call's peak (the
+// previous call's is still waiting for a commit when the next allocates); the
+// facade's consecutive mixed calls reach at most one fresh text-encoder output
+// above the first call's.
+
+fn tower_media(c: &Configs) -> (Vec<Image>, Vec<AudioInput>) {
+    let pd = c.vision.patch_dim() as usize;
+    (
+        vec![
+            Image::new(8, 6, 16, pd, 1),
+            Image::new(5, 4, 28, pd, 2),
+            Image::new(1, 1, 3, pd, 3),
+            Image::new(2, 2, 0, pd, 4),
+        ],
+        vec![
+            clip(&c.audio, 41, 1, |_| true),
+            clip(&c.audio, 58, 2, |f| f < 45),
+            clip(&c.audio, 30, 3, |f| !(8..16).contains(&f)),
+        ],
+    )
+}
+
+fn bits_of(v: &[f32]) -> Vec<u32> {
+    v.iter().map(|x| x.to_bits()).collect()
+}
+
+/// Four vision calls in a row hold one activation set, in both modes. The
+/// tower dropped its activations and inputs at `collect`, after its wait, so
+/// the pool recycled them at the next call's first commit, after that call had
+/// allocated its own: two sets were live across consecutive calls. It now
+/// releases them before the wait, so the wait recycles them.
+#[test]
+fn consecutive_vision_calls_hold_one_activation_set() {
+    let c = configs();
+    let (images, _) = tower_media(&c);
+    let inputs: Vec<ImageInput<'_>> = images.iter().map(Image::input).collect();
+    for operands in MODES {
+        let st = open("memory_vision", checkpoint_bytes(&c, 17, operands));
+        with_gpu(|rt| {
+            let model = EmbedGemma2VisionModel::load_with(rt, &st, c.vision.clone(), operands).unwrap();
+            rt.synchronize().unwrap();
+            let soft_rows: usize = model.check_images(&inputs).unwrap().iter().sum();
+            let out_bucket = cold(soft_rows * c.vision.text_hidden as usize * 4);
+            let base = rt.current_allocated_bytes();
+            let first = model.encode_images(&inputs, false).unwrap();
+            assert_eq!(first.forwards, 1, "test bug: the call split");
+            let after_first = rt.current_allocated_bytes();
+            let set = after_first - base;
+            assert!(
+                set > 20 * out_bucket,
+                "{operands:?}: the first call allocated {set} bytes: too few to tell a set from its output"
+            );
+            rt.reset_peak_allocated_bytes();
+            for call in 2..=4 {
+                let again = model.encode_images(&inputs, false).unwrap();
+                for (a, b) in again.soft.iter().zip(&first.soft) {
+                    assert_eq!(bits_of(a), bits_of(b), "{operands:?}: call {call} changed a bit");
+                }
+            }
+            let extra = rt.peak_allocated_bytes() - after_first;
+            assert!(
+                extra <= out_bucket,
+                "{operands:?}: three more vision calls reached {extra} bytes above the first ({set} bytes of \
+                 activations); more than one {out_bucket}-byte output means a second set was live"
+            );
+        });
+    }
+}
+
+/// The same for the audio tower (exact f32 under either text mode).
+#[test]
+fn consecutive_audio_calls_hold_one_activation_set() {
+    let c = configs();
+    let (_, clips) = tower_media(&c);
+    let st = open("memory_audio", checkpoint_bytes(&c, 17, GemmOperands::ExactF32));
+    with_gpu(|rt| {
+        let model = EmbedGemma2Audio::load(rt, &st, "", c.audio.clone()).unwrap();
+        rt.synchronize().unwrap();
+        let base = rt.current_allocated_bytes();
+        let first = model.encode_audio(&clips, false).unwrap();
+        assert_eq!(first.forwards, 1, "test bug: the call split");
+        // The forward's output holds every tower row, kept or not.
+        let rows: usize = first.out_masks.iter().map(Vec::len).sum();
+        let out_bucket = cold(rows * c.audio.embed_dim as usize * 4);
+        let after_first = rt.current_allocated_bytes();
+        let set = after_first - base;
+        assert!(
+            set > 20 * out_bucket,
+            "the first call allocated {set} bytes: too few to tell a set from its output"
+        );
+        rt.reset_peak_allocated_bytes();
+        for call in 2..=4 {
+            let again = model.encode_audio(&clips, false).unwrap();
+            for (a, b) in again.soft_tokens.iter().zip(&first.soft_tokens) {
+                assert_eq!(bits_of(a), bits_of(b), "call {call} changed a bit");
+            }
+        }
+        let extra = rt.peak_allocated_bytes() - after_first;
+        assert!(
+            extra <= out_bucket,
+            "three more audio calls reached {extra} bytes above the first ({set} bytes of activations); \
+             more than one {out_bucket}-byte output means a second set was live"
+        );
+    });
+}
+
+/// Consecutive mixed calls of the facade (text, an image, a clip and a
+/// caller-built item holding two images and a clip) hold one set of each
+/// model's activations: calls 2 to 4 reach at most one fresh text-encoder
+/// output above the first. The towers' soft rows stay on the device between
+/// the towers and the text encoder and are released with everything else
+/// before the call's one wait.
+#[test]
+fn consecutive_facade_calls_hold_one_activation_set() {
+    let c = configs();
+    let (images, clips) = tower_media(&c);
+    let text_ids: Vec<u32> = (0..24u32).map(|i| 3 + i % 40).collect();
+    for operands in MODES {
+        let st = open("memory_facade", checkpoint_bytes(&c, 17, operands));
+        with_gpu(|rt| {
+            let m = EmbedGemma2Multimodal::load_from(rt, &st, &config_json(), operands).unwrap();
+            let imgs = [images[0].input(), images[1].input()];
+            let one_clip = std::slice::from_ref(&clips[0]);
+            let tokens_i = m.vision().check_images(&imgs).unwrap();
+            let tokens_a = m.audio().check_clips(one_clip).unwrap()[0];
+            let mut ids = vec![1u32];
+            ids.extend(std::iter::repeat_n(IMAGE, tokens_i[0] + tokens_i[1]));
+            ids.extend(std::iter::repeat_n(AUDIO, tokens_a));
+            ids.push(2);
+            let items = [
+                MmItem::Text(&text_ids),
+                MmItem::Image(images[2].input()),
+                MmItem::Audio(&clips[1]),
+                MmItem::Media {
+                    ids: &ids,
+                    images: &imgs,
+                    audio: one_clip,
+                },
+            ];
+            let out_bucket = cold(items.len() * m.text().config().embedding_dim as usize * 4);
+            rt.synchronize().unwrap();
+            let base = rt.current_allocated_bytes();
+            let first = m.encode(&items, None).unwrap();
+            let after_first = rt.current_allocated_bytes();
+            let set = after_first - base;
+            assert!(
+                set > 20 * out_bucket,
+                "{operands:?}: the first call allocated {set} bytes: too few to tell a set from its output"
+            );
+            rt.reset_peak_allocated_bytes();
+            for call in 2..=4 {
+                let again = m.encode(&items, None).unwrap();
+                assert_eq!(
+                    bits_of(&again.embeddings),
+                    bits_of(&first.embeddings),
+                    "{operands:?}: call {call} changed a bit"
+                );
+            }
+            let extra = rt.peak_allocated_bytes() - after_first;
+            assert!(
+                extra <= out_bucket,
+                "{operands:?}: three more facade calls reached {extra} bytes above the first ({set} bytes of \
+                 activations); more than one {out_bucket}-byte output means a second set was live"
             );
         });
     }

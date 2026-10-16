@@ -21,8 +21,9 @@
 //!   cosine `0.99999` or better;
 //! * each image and clip alone vs inside the mixed call within `1e-5` (the
 //!   mixed call needs several text forwards, since one text has 6147 tokens);
-//! * host waits: the mixed call and a call of media alone make exactly 2, a
-//!   call of texts alone exactly 1;
+//! * host waits: the mixed call, a call of media alone and a call of texts
+//!   alone each make exactly 1 (2 for the first two until the towers' soft rows
+//!   stayed on the device; the bound changed because the behaviour did);
 //! * `GemmOperands::Bf16` for the text encoder and the vision tower (the audio
 //!   tower stays exact f32): the four media rows at cosine
 //!   `0.9999` or better against the fp32 reference, the floor
@@ -163,7 +164,7 @@ fn one_call_over_texts_images_and_clips_matches_sentence_transformers() {
             out.forwards, t.sync_waits
         );
         assert!(out.forwards >= 2, "test bug: the batch is one forward");
-        assert_eq!(t.sync_waits, 2, "texts, images and clips in one call");
+        assert_eq!(t.sync_waits, 1, "texts, images and clips in one call");
 
         let mut failures = Vec::new();
         let mut check = |what: String, got: &[f32], want: &[f32]| {
@@ -198,7 +199,7 @@ fn one_call_over_texts_images_and_clips_matches_sentence_transformers() {
         }
         let media: Vec<MmItem<'_>> = media_at.iter().map(|&k| items[k]).collect();
         let (only, t) = traced(|| m.encode(&media, None).unwrap());
-        assert_eq!(t.sync_waits, 2, "media alone");
+        assert_eq!(t.sync_waits, 1, "media alone");
         for (k, &at) in media_at.iter().enumerate() {
             let d = max_abs(&only.embeddings[k * dim..(k + 1) * dim], row(at));
             assert!(d <= BATCH_ABS, "media row {k}: media-only call vs mixed call {d:.3e}");

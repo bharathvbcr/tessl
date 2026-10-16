@@ -86,9 +86,11 @@ use std::ops::Range;
 use std::path::Path;
 use std::sync::Arc;
 
-use crate::embedgemma2::{EmbedGemma2Config, EmbedGemma2Model, EncodeOutput, MmSequence, MmTokens, MAX_BATCH};
-use crate::embedgemma2_audio::{AudioConfig, AudioInput, EmbedGemma2Audio};
-use crate::embedgemma2_vision::{EmbedGemma2VisionModel, ImageInput, VisionConfig};
+use crate::embedgemma2::{
+    EmbedGemma2Config, EmbedGemma2Model, EncodeOutput, MmTokens, Seq, SoftSegment, SoftSource, MAX_BATCH,
+};
+use crate::embedgemma2_audio::{AudioConfig, AudioInput, EmbedGemma2Audio, PendingAudio};
+use crate::embedgemma2_vision::{EmbedGemma2VisionModel, ImageInput, PendingImages, VisionConfig};
 use crate::gemm::GemmOperands;
 use crate::runtime::GpuRuntime;
 use crate::safetensors::SafeTensors;
@@ -267,7 +269,6 @@ impl EmbedGemma2Multimodal {
             ));
         }
         let cfg = self.text.config();
-        let hidden = cfg.hidden as usize;
         let tokens = self.tokens;
 
         // The call's media, flat, with where each item's sit.
@@ -356,67 +357,129 @@ impl EmbedGemma2Multimodal {
             }
         }
 
-        // The towers, queued together behind one wait, then read back.
-        let (mut image_soft, mut clip_soft): (Vec<Vec<f32>>, Vec<Vec<f32>>) = (Vec::new(), Vec::new());
-        if !images.is_empty() || !clips.is_empty() {
-            let scope = self.rt.async_scope();
-            // A tower queued before a failure is dropped (and so waited for)
-            // when this returns.
-            let queued = (|| {
-                let v = if images.is_empty() {
-                    None
-                } else {
-                    Some(self.vision.queue_images(&images, false)?)
-                };
-                let a = if clips.is_empty() {
-                    None
-                } else {
-                    Some(self.audio.queue_audio(&clips, false)?)
-                };
-                Ok::<_, String>((v, a))
-            })();
-            let (v, a) = queued?;
-            self.rt.synchronize()?;
-            drop(scope);
-            image_soft = v.map(|p| p.collect()).transpose()?.map(|o| o.soft).unwrap_or_default();
-            clip_soft = a
-                .map(|p| p.collect())
-                .transpose()?
-                .map(|o| o.soft_tokens)
-                .unwrap_or_default();
-        }
+        // Every forward of the call, towers then text encoder, queued under one
+        // scope behind one wait. The towers' soft rows are not read back: the
+        // text encoder's scatter reads them where the towers wrote them.
+        let has_media = !images.is_empty() || !clips.is_empty();
+        let scope = self.rt.async_scope();
+        // A tower queued before a failure is dropped (and so waited for) when
+        // this returns.
+        let queued = (|| {
+            let v = if images.is_empty() {
+                None
+            } else {
+                Some(self.vision.queue_images(&images, false)?)
+            };
+            let a = if clips.is_empty() {
+                None
+            } else {
+                Some(self.audio.queue_audio(&clips, false)?)
+            };
+            Ok::<_, String>((v, a))
+        })();
+        let (v, a) = queued?;
+        let image_soft: Vec<SoftSegment> = v.map(PendingImages::into_device).unwrap_or_default();
+        let clip_soft: Vec<Vec<SoftSegment>> = a.map(PendingAudio::into_device).unwrap_or_default();
+        // From here the towers' work is queued and nothing waits for it but
+        // the wait below, which is made whatever follows: the runtime holds
+        // their buffers until it, and a text-encoder call that fails while
+        // queuing holds its own the same way.
+        let text = (|| {
+            // Each item's soft rows, in the order of its placeholder ids.
+            let softs = items
+                .iter()
+                .zip(&spans)
+                .zip(&id_refs)
+                .enumerate()
+                .map(|(b, ((item, span), ids))| match item {
+                    MmItem::Text(_) => Ok(Vec::new()),
+                    _ => item_segments(
+                        ids,
+                        &tokens,
+                        &image_soft[span.images.clone()],
+                        &clip_soft[span.clips.clone()],
+                    )
+                    .map_err(|e| format!("{WHAT}: item {b}: {e}")),
+                })
+                .collect::<Result<Vec<_>, String>>()?;
+            let seqs: Vec<Seq<'_>> = id_refs
+                .iter()
+                .zip(&softs)
+                .map(|(ids, soft)| Seq {
+                    ids,
+                    soft: SoftSource::Device(soft),
+                })
+                .collect();
+            self.text.queue_multimodal(WHAT, &seqs, truncate_dim)
+        })();
+        // The device rows are the text encoder's now; release ours with the
+        // rest before the wait.
+        drop((image_soft, clip_soft));
+        drop(scope);
+        let text = match text {
+            Err(e) if !has_media => return Err(e),
+            other => other,
+        };
+        let waited = self.rt.synchronize();
+        let out = text?.finish(waited)?;
 
-        // Each item's soft rows, in the order of its placeholder ids.
-        let mut softs: Vec<Vec<f32>> = Vec::with_capacity(items.len());
-        for (b, (item, span)) in items.iter().zip(&spans).enumerate() {
-            softs.push(match item {
-                MmItem::Text(_) => Vec::new(),
-                MmItem::Image(_) => std::mem::take(&mut image_soft[span.images.start]),
-                MmItem::Audio(_) => std::mem::take(&mut clip_soft[span.clips.start]),
-                MmItem::Media { .. } => {
-                    let img: Vec<f32> = image_soft[span.images.clone()].concat();
-                    let aud: Vec<f32> = clip_soft[span.clips.clone()].concat();
-                    let (mut ic, mut ac) = (0usize, 0usize);
-                    let mut out = Vec::with_capacity(img.len() + aud.len());
-                    for &id in id_refs[b] {
-                        if id == tokens.image {
-                            out.extend_from_slice(&img[ic * hidden..(ic + 1) * hidden]);
-                            ic += 1;
-                        } else if id == tokens.audio {
-                            out.extend_from_slice(&aud[ac * hidden..(ac + 1) * hidden]);
-                            ac += 1;
-                        }
-                    }
-                    debug_assert_eq!((ic * hidden, ac * hidden), (img.len(), aud.len()));
-                    out
-                }
-            });
+        // A host caller's soft rows are checked finite before any GPU work;
+        // the towers' are on the device, so the rows they produced are checked
+        // through what they made of the embeddings: a non-finite soft token
+        // makes its item's embedding non-finite.
+        let dim = out.embeddings.len() / items.len();
+        for (b, item) in items.iter().enumerate() {
+            let media = !matches!(item, MmItem::Text(_));
+            if media && out.embeddings[b * dim..(b + 1) * dim].iter().any(|v| !v.is_finite()) {
+                return Err(format!(
+                    "{WHAT}: item {b}: the embedding is not finite; a tower's soft tokens were not"
+                ));
+            }
         }
-        let seqs: Vec<MmSequence<'_>> = id_refs
-            .iter()
-            .zip(&softs)
-            .map(|(ids, soft)| MmSequence { ids, soft })
-            .collect();
-        self.text.encode_multimodal(&seqs, truncate_dim, false)
+        Ok(out)
     }
+}
+
+/// An item's soft rows as device segments, in the order of its placeholder
+/// ids: the `j`-th image placeholder takes the `j`-th row of the item's
+/// images laid end to end, the audio placeholders likewise from its clips
+/// (`masked_scatter` per modality). Consecutive rows of one buffer are one
+/// segment, so an item with one image or clip is one segment per run the
+/// tower wrote, however its placeholders interleave with text.
+fn item_segments(
+    ids: &[u32],
+    tokens: &MmTokens,
+    images: &[SoftSegment],
+    clips: &[Vec<SoftSegment>],
+) -> Result<Vec<SoftSegment>, String> {
+    let mut img = images
+        .iter()
+        .flat_map(|s| (s.row..s.row + s.rows).map(move |r| (&s.buf, r)));
+    let mut aud = clips
+        .iter()
+        .flatten()
+        .flat_map(|s| (s.row..s.row + s.rows).map(move |r| (&s.buf, r)));
+    let mut out: Vec<SoftSegment> = Vec::new();
+    for &id in ids {
+        let next = if id == tokens.image {
+            img.next()
+        } else if id == tokens.audio {
+            aud.next()
+        } else {
+            continue;
+        };
+        let (buf, row) = next.ok_or_else(|| "more placeholder ids than soft rows".to_string())?;
+        match out.last_mut() {
+            Some(last) if last.buf.aliases(buf) && last.row + last.rows == row => last.rows += 1,
+            _ => out.push(SoftSegment {
+                buf: buf.clone(),
+                row,
+                rows: 1,
+            }),
+        }
+    }
+    if img.next().is_some() || aud.next().is_some() {
+        return Err("more soft rows than placeholder ids".to_string());
+    }
+    Ok(out)
 }

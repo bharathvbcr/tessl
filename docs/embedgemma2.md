@@ -139,7 +139,7 @@ named as such by the Python binding.
 
 | Entry | Does |
 |---|---|
-| `tessl_embedgemma2_load_multimodal(runtime, dir, dir_len, operands, &out, err, err_len)` | `tessl_embedgemma2_load` with the vision and audio towers as well: one read of `config.json`, one open of `model.safetensors`. `operands` is `TESSL_OPERANDS_EXACT_F32` (0) or `TESSL_OPERANDS_BF16` (1) and applies to the **text encoder only**; the towers are exact f32 under either (they have no bf16 mode). The handle takes every text entry too, and `_free` |
+| `tessl_embedgemma2_load_multimodal(runtime, dir, dir_len, operands, &out, err, err_len)` | `tessl_embedgemma2_load` with the vision and audio towers as well: one read of `config.json`, one open of `model.safetensors`. `operands` is `TESSL_OPERANDS_EXACT_F32` (0) or `TESSL_OPERANDS_BF16` (1) and applies to the **text encoder and the vision tower**; the audio tower is exact f32 under either (it has no bf16 mode). The handle takes every text entry too, and `_free` |
 | `tessl_embedgemma2_encode_images(model, pixel_values, pixel_values_len, position_ids, position_ids_len, offsets, n_images, truncate_dim, out, out_len, err, err_len)` | `pixel_values` f32 `[offsets[n_images], patch_dim]` and `position_ids` i32 `[offsets[n_images], 2]`, the processor's `pixel_values` and `image_position_ids` with the images laid end to end (padding patches `(-1, -1)` included), `offsets` CSR-style `u64` over patch rows; `out` is f32 `[n_images, dim]`, one row per image |
 | `tessl_embedgemma2_encode_audio(model, input_features, input_features_len, input_features_mask, mask_len, offsets, n_clips, truncate_dim, out, out_len, err, err_len)` | `input_features` f32 `[offsets[n_clips], mel_bins]` and the mask one byte per frame (0 or 1; any other byte is refused), `offsets` over frames; one row per clip |
 
@@ -166,7 +166,7 @@ From Python (needs only numpy and the built library; `transformers` is not
 imported and not a dependency):
 
 ```python
-model = EmbedGemma2.from_pretrained(snapshot_dir, multimodal=True)    # operands="bf16" for the text encoder
+model = EmbedGemma2.from_pretrained(snapshot_dir, multimodal=True)    # operands="bf16" for the text encoder and the vision tower
 out = processor(images=images, return_tensors="np")                   # your transformers processor
 emb = model.encode_images(out["pixel_values"], out["image_position_ids"])   # float32 [n, 768]
 emb = model.embed_images(images, processor)                           # the same two lines in one call
@@ -335,9 +335,14 @@ let out = m.encode(&items, Some(256))?;       // EncodeOutput: one row per item,
   (vision, audio, text). One wait would need the text encoder to take the
   towers' device buffers instead of host rows; that GPU-resident hand-off is not
   done here (follow-up below).
-* **Precision.** `GemmOperands` applies to the text encoder (`ExactF32` or
-  `Bf16`). The towers are exact f32 under both; there is no tower bf16 mode and
-  none was invented. The call refuses a runtime with relaxed f32 GEMMs on.
+* **Precision.** One `GemmOperands` (`ExactF32` or `Bf16`) configures the text
+  encoder and the vision tower alike (`EmbedGemma2VisionModel::load_with`, [Vision
+  tower](#vision-tower)): it is one flag because both make one precision claim to
+  the caller, and a caller composing the models by hand (`from_parts`) can still
+  mix them. The audio tower is exact f32 under both: it has no bf16 mode (lane I
+  owns it). The call refuses a runtime with relaxed f32 GEMMs on when it holds
+  clips or the mode is `ExactF32`; a `Bf16` call of text and images runs no f32
+  GEMM and accepts it.
 * **Refusals** come before any allocation or wait: the batch size, each
   tower's input checks, the text checks, the placeholder counts. A refused call
   leaves the facade usable.
@@ -360,7 +365,7 @@ Pro, 2026-10-15, sdpa goldens, snapshot `914f7f89`:
 | 8 texts (10 to 6147 tokens), 2 images, 2 clips in one call, vs `emb_f32` | max abs `1e-4`, cosine `>= 0.99999` | texts `1.2e-7` to `3.0e-7`, images `2.2e-7` / `3.8e-7`, clips `3.0e-7` / `2.5e-7`; cosine 1.000000000; 5 text forwards, 2 waits |
 | each image and clip alone vs inside that call | `1e-5` | 0 (bit for bit) |
 | media alone: 2 waits; texts alone: 1 wait | exact | 2; 1 |
-| text encoder `Bf16`, towers exact, 4 media rows vs fp32 | cosine `>= 0.9999` | 0.999994 to 0.999999 |
+| text encoder and vision tower `Bf16`, audio tower exact, 4 media rows vs fp32 | cosine `>= 0.9999` | 0.999987 to 0.999995 (images 0.999988, 0.999988; clips 0.999995, 0.999994) |
 | Python, `encode_images` / `encode_audio`, alone and in one call | `1e-4`, `0.99999`; alone vs batch `1e-5` | `2.2e-7` to `3.8e-7`, cosine 1.000000000; alone vs batch 0 |
 | Python, `embed_images` / `embed_audio` with transformers 5.19's processor on the generator's inputs | processor tensors vs saved `1e-6`, then the same embedding bounds | tensors identical (0), `3.8e-7` and `3.0e-7`, cosine 1.000000000 |
 
@@ -640,6 +645,12 @@ are therefore about as far apart as `emb_bf16.npy` is from fp32.
 > `tools/embedgemma2_ref/make_mm_reference.py`: fp32, eager attention, CPU).
 > The real-checkpoint test passed again on `eg2/integrate` at the merge
 > (`6eedd5a`).
+>
+> **Update (lane J, Apple M5 Pro, 2026-10-15, branch
+> `worktree-agent-ad119ed6f8584407f` on `433e659`):** a `GemmOperands::Bf16` mode
+> ([Precision](#vision-tower-precision)), the tower profiled stage by stage and
+> sped up ([Speed](#vision-tower-speed)). `load` and `GemmOperands::ExactF32`
+> are unchanged bit for bit (hashes below).
 
 `tessl::embedgemma2_vision` (`src/embedgemma2_vision.rs`) is the 167M-parameter
 vision tower (`vision_tower.*`, transformers 5.19's `Gemma4VisionModel`) and
@@ -653,6 +664,7 @@ tokenization does.
 
 ```text
 let model = EmbedGemma2VisionModel::load(rt, &st, VisionConfig::from_config_file(..)?)?;
+// or: EmbedGemma2VisionModel::load_with(rt, &st, cfg, GemmOperands::Bf16)?  (see Precision)
 let out = model.encode_images(&[ImageInput { pixel_values, position_ids }, ..], trace)?;
 // out.soft[i]: [S_i, 512] f32; out.tokens[i] = S_i; out.trace (per layer) when asked
 ```
@@ -700,12 +712,12 @@ the kernel sums each cell's rows in patch order.
 
 | Kernel | File | New? |
 |---|---|---|
-| `vision_qkv_norm_rope_f32` | `kernels/embedgemma2_vision.metal` | new: q/k RMSNorm (`* w`), the two-axis RoPE, the weightless v norm and the K/V store, one simdgroup per (patch, head). Its own kernel, not a mode of `qwen35_attn_qk_norm_rope`: that one rotates a head by one position per token and its row routine is mirrored by the training backward, whose inverse rotation must stay its exact transpose |
+| `vision_qkv_norm_rope_f32`, `vision_qkv_norm_rope_bf16` | `kernels/embedgemma2_vision.metal` | new: q/k RMSNorm (`* w`), the two-axis RoPE, the weightless v norm and the K/V store. One simdgroup takes up to six heads of one kind of one patch (`ROPE_HEADS_PER_UNIT`) and forms the patch's `cos`/`sin` table once for all of them (the angle depends on the patch and the pair, not the head; `precise::cos`/`sin` dominated the old per-head kernel). The bf16 instantiation is the same body storing bf16, rounded to nearest even from the f32 result (what a cast pass would do, with no pass) for `encoder_attn_bf16`; head dims up to 512 (`MAX_ROPE_HEAD_DIM`). Its own kernel, not a mode of `qwen35_attn_qk_norm_rope`: that one rotates a head by one position per token and its row routine is mirrored by the training backward, whose inverse rotation must stay its exact transpose |
 | `vision_pos_embed_add_f32` | same | new: `proj + (x_emb + y_emb)` from the bf16 table, exactly `+0` on padding. The `+0` guarantee lives here and at the pool's output; the rope kernel does not special-case padding (a zero row rotated by -1 may come out `-0.0`), and its padded q/k/v slots are masked or overwritten by `encoder_attn` |
 | `vision_pool_members_f32` | same | new: the pooler's cell sums, weighted `1/k²`, times `sqrt(hidden)` |
 | weightless RMSNorm | `nn::rms_norm_f32` with a hot `[768]` buffer of ones | reused (the multiply by `1.0` is exact) |
-| attention | `embedgemma2::encoder_attn`, tiled kernel `encoder_attn_tiled_h64_q32_k32_sg2` on TensorOps devices (rows kernel `encoder_attn_rows_h64_r4_g16` otherwise) | reused |
-| RMSNorm, residual add, GELU-tanh gate, GEMM | `nn::rms_norm_f32`, `nn::rms_norm_residual_add_f32`, `qwen35::gated_act`, exact-f32 TensorOps GEMM | reused |
+| attention | `embedgemma2::encoder_attn`, tiled kernel `encoder_attn_tiled_h64_q32_k32_sg2` on TensorOps devices (rows kernel `encoder_attn_rows_h64_r4_g16` otherwise); under `Bf16`, `encoder_attn_bf16` (head dim 64, TensorOps only) | reused |
+| RMSNorm, residual add, GELU-tanh gate, GEMM | `nn::rms_norm_f32` / `rms_norm_bf16`, `nn::rms_norm_residual_add_f32`, `qwen35::gated_act` (dtype of the stored mid), exact-f32 TensorOps GEMM, or under `Bf16` the bf16 x bf16 GEMM (`embedgemma2::project`, shared with the text encoder) | reused |
 
 **Bounds and observed errors.** Fixed before the first run; the tiny and
 kernel tests run in the plain GPU suite, the model test is opt-in.
@@ -751,17 +763,176 @@ The residual stream reaches magnitudes near 1000 by layer 15 (the checkpoint's
 norms do not bound it), so the layer-15 absolute error of `3e-2` is the same
 `3e-5` relative. Nothing needed tuning: the bounds held on the first run.
 
-**Speed follow-ups.** (1) Done after this section's measurements: `encoder_attn`
-routes head dim 64 to the tiled TensorOps kernel (lane E, see
-[Speed](#speed)), measured 2.8-2.9x over the rows kernel at the vision shape
-(2520 rows x 12 heads) for the attention kernel alone; the real-checkpoint
-vision test passes on it at the same bounds. The tower's own end-to-end time
-is not measured. (2) The 16 layers' f32 weights are 600 MiB resident; a bf16
-operand path (a later step) halves that. (3) The pos-embed add, the pool and
-the rope kernel each take one pass over the hidden state that the neighbouring
-norm or GEMM epilogue could absorb. (4) Images are padded to the longest of a
-forward; the greedy longest-first cut does not weigh a per-forward fixed cost
-as the text packer does.
+### Vision tower precision
+
+`EmbedGemma2VisionModel::load_with(rt, st, cfg, operands)` takes the text
+encoder's `GemmOperands`; `load` is `load_with(.., ExactF32)`. One flag covers
+the text encoder and the vision tower of the facade
+(`EmbedGemma2Multimodal::load(.., operands)`, `tessl_embedgemma2_load_multimodal`'s
+`operands`, `EmbedGemma2.from_pretrained(.., multimodal=True, operands="bf16")`).
+The audio tower stays exact f32 under either flag: its bf16 mode belongs to its
+own lane (the audio tower's section below), and until it lands a `Bf16` load
+runs the audio tower exactly as `ExactF32` does.
+
+**`ExactF32` is bit for bit what it was.** Checked by hashing the output bits
+(FNV-1a over the soft tokens) before and after on the same inputs: the tiny
+fixture (`tests/embedgemma2_vision_tiny.rs`, hash `a1e38036581d2780` before and
+after) and the real checkpoint (`bench_embedgemma2_vision`, `HASH`: image 0 alone
+`d9a0d85dd2f8f279`, the 8-image call `4f48fd6b310f86a5`, the same from the build
+at `433e659` and from this branch). The rope kernel changed (one `cos`/`sin`
+table per patch for up to six heads); it writes the two products of each output
+as `fma(x0, c, -(x1 * s))` and `fma(x0, s, x1 * c)`, the contraction the
+compiler had chosen for the plain expression, so the bits did not move. (The
+form matters: with the plain expression the compiler fused the chunked kernel
+differently, `fma(x1, c, x0 * s)` for the second product, and the tiny hash
+moved to `c033b6dfa23990f9`; `fma(-x1, s, x0 * c)` with `fma(x0, s, x1 * c)`
+gave a third hash, `addc2d9b50726a23`. All three pass the tolerance tests: only
+the hash sees it.)
+
+**What `Bf16` does.**
+
+| | `ExactF32` | `Bf16` |
+|---|---|---|
+| the 16 layers' q/k/v/o/gate/up/down weights | f32 on the device (widened from the checkpoint's bf16 at load) | bf16, the checkpoint's own bytes (one copy) |
+| patch embedding, `embedding_projection` | f32 GEMM | bf16 x bf16 GEMM, f32 accumulate |
+| pixels `2 * (p - 0.5)` | f32 | f32 on the host, rounded to bf16 on the host with the GPU's rounding (the GEMM input) |
+| residual stream, norms (`rms_norm`), the pos-embed add, the pool | f32 | f32; the norms read f32 and write the bf16 GEMM operand |
+| q/k RMSNorm, axial RoPE, v norm | f32, `vision_qkv_norm_rope_f32` | f32 arithmetic, stored bf16 (`vision_qkv_norm_rope_bf16`) |
+| attention | `encoder_attn` (f32 tiles) | `encoder_attn_bf16` at head dim 64: bf16 q/k/v tiles, f32 scores, softmax and output |
+| attention output into the `o` GEMM | f32 | cast to bf16 (one pass) |
+| MLP gate and up GEMM, GELU-tanh product | f32 | bf16 GEMM (f32 out); the gated product is stored bf16 (the `down` GEMM operand) |
+| soft tokens | f32 | f32 |
+
+Resident weights: 335,621,120 B (320.1 MiB) against 639,577,088 B (609.9 MiB),
+52.5% (`weight_bytes()`, measured by `bench_embedgemma2_vision`'s `weight_mib`).
+The peaks fall by less (the activations are bf16 only where they feed a GEMM or
+the attention): process footprint 1029 to 685 MiB at one image, 2996 to 2329 MiB
+at eight; device peak 302 to 254 and 2192 to 1820 MiB (`bench_embedgemma2_vision`).
+
+`load_with(.., Bf16)` refuses what it cannot run, naming it: a device without
+TensorOps, a head dim `encoder_attn_bf16` is not compiled for (only 64), and a checkpoint with any projection
+stored in another dtype than bf16 (an f32 checkpoint is not rounded at load).
+The rope kernel entry points (`axial_qkv_norm_rope`, `_bf16`) now refuse a head dim over 512 in either mode (its table holds 8 pairs per lane; before they took any multiple of 4). No config loads differently: the config parser only admits head dims 32, 64, 256 and 512, so `load` accepts what it accepted, and "bit for bit" holds for every config that loads.
+
+`ExactF32` keeps refusing relaxed-f32 GEMM selections (`TESSL_*`); `Bf16`'s
+GEMM is the one the text encoder runs, so the exactness check does not apply.
+
+**Bounds, fixed before the first bf16 run.**
+
+Tiny test (`tests/embedgemma2_vision_tiny.rs`, 2 layers, 2 heads of 64, every
+projection stored bf16, four images of 48, 20, 1 and 4 real patches), against
+the f64 forward over exactly those weights, so that only the activations round.
+Derived in the test's module docs: one bf16 rounding is a relative error of at
+most `2^-8` (3.9e-3) and the stream passes a few dozen of them.
+
+| Check | Bound | Observed |
+|---|---|---|
+| patch embedder, max abs over max | `2e-2` | `9.5e-4` |
+| each layer, pooled output, max abs over max | `5e-2` | layers up to `6.65e-3`, pooled `4.73e-3` |
+| soft tokens, max abs over max | `5e-2` | `5.7e-3` |
+| soft tokens, worst cosine over all tokens | `>= 0.999` | `0.99998285` |
+| bf16 soft tokens vs the `ExactF32` ones (same weights) | `5e-2` | `3.94e-3` |
+| batched vs alone, reversed order, a call split into two forwards, every unzeroed activation poisoned with NaN | bit-identical | bit-identical |
+| `ExactF32` on the same fixture | the exact bounds above (layers `1e-4`, soft `1e-4` abs) | unchanged |
+
+Real checkpoint (opt-in, `EMBEDGEMMA2_SNAPSHOT` + `EMBEDGEMMA2_MM_REF_DIR`),
+`tests/embedgemma2_vision_model.rs`; the goldens are fp32 sentence-transformers:
+
+| Check | Bound | Observed |
+|---|---|---|
+| image embedding end to end (bf16 vision tower + bf16 text encoder, through the facade) vs `image{0,1}_emb_f32.npy`, cosine | `>= 0.9999` | `0.99998769`, `0.99998850` (max abs `6.4e-4`, `6.6e-4`) |
+| the same embeddings vs transformers' bf16 run (`image{0,1}_emb_bf16.npy`), cosine | `>= 0.9996` | `0.99997923`, `0.99997317` |
+| mean `1 - cos` vs fp32, against transformers' own bf16 run (`image{0,1}_emb_bf16.npy`) | `<=` transformers' | `1.191e-5` against `2.612e-5` (transformers bf16 vs fp32: `0.99997775`, `0.99997001`) |
+| the tower: each image alone vs both in one forward, vs reversed order | bit-identical | bit-identical |
+| the embeddings: each image alone vs inside one call of both | `1e-5` max abs (the text encoder's batch bound) | bit-identical |
+| the tower alone, bf16 vs the fp32 goldens, max abs over max (reported, not gated) | - | patch embedder `1.4e-3`, `1.6e-3`; layers `1.3e-3` to `8.8e-3` up to layer 10, growing to `7.9e-2` and `7.4e-2` at layer 15; pooled `3.2e-2`, `2.8e-2`; soft tokens `5.9e-2`, `8.0e-2` |
+
+The tower's own error against the fp32 goldens is large in max-abs terms (the
+residual stream's few outlier channels reach 1000 and one bf16 rounding there is
+4) and small where it counts: the embedding that comes out of the text encoder
+is closer to the fp32 reference than transformers' own bf16 run is. The tower
+bounds are not gated on those max-abs figures for that reason; the gate is the
+embedding.
+
+### Vision tower speed
+
+Measured on an Apple M5 Pro, 2026-10-15, on the real checkpoint, on a GPU other
+sessions shared (so every figure carries its spread). Tools:
+`profile_embedgemma2_vision` (a bit-checked replica of the forward, each stage
+alone on the real shapes and weights, `PROFILE_OPERANDS=f32|bf16`) and
+`bench_embedgemma2_vision` under `bench_paired` (interleaved fresh processes,
+order reversed on alternate rounds, min-of-20 per process, 8 rounds). Data,
+plot and method: `bench/results/embedgemma2_vision_{profile,speed}_m5pro.*`.
+
+**Stage ranking** (one image, 2304 real patches padded to 2520, each stage's
+share of the sum of the stages run alone, the 16 layers together; one pass per
+label):
+
+| Stage | before, `ExactF32` | after, `ExactF32` | after, `Bf16` |
+|---|---|---|---|
+| gate and up GEMM | 59.7 ms, 31% | 58.2 ms, 33% | 13.4 ms, 23% |
+| attention (head dim 64) | 49.9 ms, 26% | 47.4 ms, 27% | 17.6 ms, 30% |
+| down GEMM | 28.0 ms, 15% | 27.1 ms, 15% | 7.1 ms, 12% |
+| qkv GEMM | 22.2 ms, 12% | 21.3 ms, 12% | 5.0 ms, 9% |
+| qk-norm, axial rope, K/V store | 8.4 ms, 4.4% | 3.1 ms, 1.8% | 2.6 ms, 4.4% |
+| o GEMM | 8.1 ms | 7.6 ms | 1.9 ms |
+| gelu * up | 6.3 ms | 6.0 ms | 4.6 ms, 8.0% |
+| norm + residual, rms_norm | 5.2 ms | 4.4 ms | 4.1 ms |
+| attention output cast f32 to bf16 | - | - | 0.8 ms |
+| patch embed, pos-embed, pool, embedder | 3.2 ms | 1.8 ms | 0.9 ms |
+| full forward (the replica, one wait) | 183.1 ms | 166.6 ms | 57.5 ms |
+
+The f32 GEMMs run at 5.7 to 6.5 TFLOP/s, the bf16 GEMMs at 22 to 26 (the
+text encoder's own bf16 GEMM, shared through `embedgemma2::project`). At 8
+images (two forwards, 18,864 padded rows) the ranking is the same: attention and
+the GEMMs are 91% of the exact forward's stage time and attention is the largest stage under
+`Bf16` (161 of 502 ms).
+
+**What was fixed, and why only that.** The rope kernel was the one stage where
+the ranking and the arithmetic agreed that work was owed: it formed `precise::cos`
+and `precise::sin` once per (patch, head), 24 times for the same patch and pair
+(12 q, 12 k heads; v takes none), 4.4% of the exact forward and, in a first bf16
+profile taken while the GPU was contended, 11% of the bf16 one. A simdgroup now
+takes up to six heads of one kind and forms the table once (`ROPE_HEADS_PER_UNIT`;
+head dims up to `MAX_ROPE_HEAD_DIM = 512`, at most 8 pairs per lane): 8.4 to 3.1 ms at one image
+and 85.9 to 24.8 ms at 8 (single passes at different moments; the paired
+end-to-end ratio below agrees but is at the limit of what that run resolves).
+Output bits are unchanged (above). The GEMMs, the attention and the residual
+passes were not touched: the GEMMs are lane G's (`src/gemm*.rs`), the attention
+kernel is shared with the text encoder, and the bf16 operand mode is itself the
+fix for the top four stages.
+
+**End to end** (`encode_images`, host pixels to host soft tokens; median over 8
+paired rounds of the per-process min-of-20, `vs` is the median per-round ratio
+with the lowest and highest round):
+
+| Workload | before (`433e659`) | `ExactF32`, after | `Bf16` | `Bf16` vs `ExactF32` |
+|---|---|---|---|---|
+| 1 image | 261 ms | 187 ms | 63.5 ms | 0.353x [0.184, 0.783] |
+| 8 images | 1693 ms | 1683 ms | 547 ms | 0.325x [0.260, 0.366] |
+
+Several of the 8 rounds were contended (the 1-image before lane reads 340 to
+407 ms in four rounds and 163 to 182 in the other four), which is what the wide
+1-image spread is. On the four clean 1-image rounds: 173.6 ms before, 169.3 ms
+`ExactF32` after (0.974x, a 3% gain that is the rope's), 58.2 ms `Bf16` (0.349x
+of `ExactF32`, 2.9x faster, range 0.342 to 0.355); the 8-image `Bf16` ratio is
+0.354 over the same rounds (0.348 to 0.366). The `ExactF32` before and after
+8-image spread [0.849, 1.286] crosses 1.0: that comparison alone is not a
+result. Measured by the same bench: process peak footprint 1029 to 685 MiB at
+one image and 2996 to 2329 MiB at eight, device peak 302 to 254 MiB and 2192 to
+1820 MiB (`ExactF32` to `Bf16`); resident weights 609.9 to 320.1 MiB.
+
+**Where the rest of the time is** (not done, with the evidence): under `Bf16`
+the bf16 attention (`encoder_attn_bf16`, 13.5 to 14.9 TFLOP/s against the GEMMs'
+25 to 26) is the largest stage at 30%, and it is the text encoder's kernel; the
+per-layer attention-output cast (1.4%) goes away if `encoder_attn` stores bf16
+(an `out_bf16` mode); the three f32 elementwise passes around each GEMM (norms,
+the residual add, `gelu * up`) and the cast are 17% of the bf16 forward at 177 to
+309 GB/s.
+The pos-embed add, the pool and the embedder are under 1% each. Images are still
+padded to the longest of a forward and the greedy longest-first cut does not
+weigh a per-forward fixed cost as the text packer does.
+
 
 ## Audio tower
 

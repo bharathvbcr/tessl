@@ -204,6 +204,26 @@ fn encoder_attn_tiled_bf16_entry(head_dim: u32) -> Option<(&'static str, usize, 
     }
 }
 
+/// Whether [`encoder_attn_bf16`] has a kernel for `head_dim` (64, 256 or 512),
+/// so a model that runs its attention in bf16 can refuse a config at load
+/// rather than at its first forward.
+pub fn encoder_attn_bf16_supports(head_dim: u32) -> bool {
+    encoder_attn_tiled_bf16_entry(head_dim).is_some()
+}
+
+/// `out = a @ w` at `operands`' precision, the one GEMM entry every
+/// EmbeddingGemma 2 forward (the text encoder's, the vision tower's) calls.
+/// `a` is in the mode's activation dtype (f32, or bf16 under
+/// [`GemmOperands::Bf16`], as the forward stages it), so neither lane rounds
+/// or allocates anything of its own here. The exact lane does not check the
+/// runtime's relaxed-f32 switch: the model's `encode` does, once per call.
+pub(crate) fn project(operands: GemmOperands, a: &Tensor, w: &Tensor, out: &Tensor) -> Result<(), String> {
+    match operands {
+        GemmOperands::ExactF32 => gemm(a, w, out, BACKEND),
+        GemmOperands::Bf16 => GemmOperands::Bf16.nn(a, w, out),
+    }
+}
+
 /// Bidirectional attention over right-padded sequences, on the kernel
 /// [`encoder_attn_kernel`] picks ([`encoder_attn_with`] names one).
 ///
@@ -1987,10 +2007,7 @@ impl EmbedGemma2Model {
     /// activation dtype (f32, or bf16 under `Bf16`, as `forward` stages it), so
     /// neither lane rounds or allocates anything of its own here.
     fn project(&self, a: &Tensor, w: &Tensor, out: &Tensor) -> Result<(), String> {
-        match self.operands {
-            GemmOperands::ExactF32 => gemm(a, w, out, BACKEND),
-            GemmOperands::Bf16 => GemmOperands::Bf16.nn(a, w, out),
-        }
+        project(self.operands, a, w, out)
     }
 
     /// [`Acts`] for forwards of up to `rows` padded rows over up to `nb`

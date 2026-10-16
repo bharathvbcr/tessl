@@ -60,24 +60,44 @@
 //!
 //! # Precision
 //!
-//! As the text encoder: weights widened from bf16 exactly, every activation
-//! f32, every GEMM exact f32 (it refuses a runtime with relaxed f32 GEMMs on).
-//! A bf16 mode is a later step.
+//! As the text encoder ([`crate::embedgemma2`]), the mode is chosen when the
+//! tower is loaded ([`EmbedGemma2VisionModel::load_with`]).
+//!
+//! [`EmbedGemma2VisionModel::load`] is [`GemmOperands::ExactF32`]: weights
+//! widened from the checkpoint's bf16 exactly, every activation f32, every GEMM
+//! exact f32 (it refuses a runtime with relaxed f32 GEMMs on). Its results are
+//! unchanged by the bf16 path: the tiny checkpoint's and the real one's output
+//! hash identically before and after.
+//!
+//! [`GemmOperands::Bf16`] keeps every projection as the checkpoint stores it,
+//! bf16, on the device (no f32 copy), and runs every GEMM with bf16 operands and
+//! f32 accumulation. The inputs of the GEMMs are rounded to bf16 where they are
+//! produced when a kernel can write bf16 (the pixels, on the host as they are
+//! scaled; the norms; the GELU gate), and by one cast pass per layer where one
+//! cannot (the attention output, [`crate::embedgemma2::encoder_attn_bf16`]
+//! writes f32). q, k and v are stored bf16 by the axial kernel and the
+//! attention runs on bf16 tiles. The residual stream, the norms' arithmetic,
+//! the rotation, the pooling and the soft tokens stay f32. A runtime with
+//! relaxed f32 GEMMs on is accepted: no GEMM here is an f32 one. The audio tower
+//! has no such mode ([`crate::embedgemma2_audio`] stays exact f32).
 //!
 //! # Kernels
 //!
-//! New, in `kernels/embedgemma2_vision.metal`: `vision_qkv_norm_rope_f32`
-//! ([`axial_qkv_norm_rope`]), `vision_pos_embed_add_f32`
+//! New, in `kernels/embedgemma2_vision.metal`: `vision_qkv_norm_rope_f32` and
+//! `_bf16` ([`axial_qkv_norm_rope`], [`axial_qkv_norm_rope_bf16`]: one body,
+//! two stored types), `vision_pos_embed_add_f32`
 //! ([`patch_position_embed_add`]) and `vision_pool_members_f32`
 //! ([`pool_by_members`]). The 1-D RoPE path ([`crate::qwen35`]'s) rotates a
 //! head by one position per token and is paired with a backward kernel that
 //! must stay its transpose, so the axial mode is its own kernel rather than a
-//! mode of that one. Everything else is tessl's: exact-f32 GEMMs,
-//! [`crate::nn::rms_norm_f32`] (the embedder's weightless norm is the same
-//! kernel with a weight of ones, which multiplies exactly),
+//! mode of that one. Everything else is tessl's: GEMMs (exact f32, or bf16
+//! operands), [`crate::nn::rms_norm_f32`] ([`crate::nn::rms_norm_bf16`] into a
+//! bf16 GEMM's input; the embedder's weightless norm is the same kernel with a
+//! weight of ones, which multiplies exactly),
 //! [`crate::nn::rms_norm_residual_add_f32`], [`crate::qwen35::gated_act`] and
-//! [`crate::embedgemma2::encoder_attn`] at head dim 64 (window 0, scale 1.0:
-//! every real key of the image, none past its length).
+//! [`crate::embedgemma2::encoder_attn`] ([`crate::embedgemma2::encoder_attn_bf16`])
+//! at head dim 64 (window 0, scale 1.0: every real key of the image, none past
+//! its length).
 //!
 //! # Waiting
 //!
@@ -92,18 +112,19 @@
 use std::sync::Arc;
 
 use crate::dispatch::{dispatch_2d, dispatch_2d_tg, set_f32, set_gpu_buf, set_u32};
-use crate::embedgemma2::{encoder_attn, EncoderAttnDims};
-use crate::gemm::{gemm, GemmBackend};
+use crate::embedgemma2::{encoder_attn, encoder_attn_bf16, encoder_attn_bf16_supports, project, EncoderAttnDims};
+use crate::gemm::{cast_f32_to_bf16_into, GemmOperands};
 use crate::json::{self, Json, Syntax};
 use crate::loader::Loader;
-use crate::nn::{bind_rope_inv_freq, require, require_disjoint_writes, rms_norm_f32, rms_norm_residual_add_f32};
+use crate::nn::{
+    attn_kv_capacity, attn_kv_capacity_bf16, bind_rope_inv_freq, require, require_disjoint_writes, rms_norm_bf16,
+    rms_norm_f32, rms_norm_residual_add_f32,
+};
 use crate::qwen35::{self, AttnTargets, Cols, GatedAct, OutCols};
 use crate::qwen35_model::Precision;
 use crate::runtime::GpuRuntime;
 use crate::safetensors::SafeTensors;
-use crate::tensor::{DType, GpuBuffer, Tensor};
-
-const BACKEND: GemmBackend = GemmBackend::TensorOps;
+use crate::tensor::{f32_to_bf16_bits_gpu, DType, GpuBuffer, Tensor};
 
 /// Images per [`EmbedGemma2VisionModel::encode_images`] call.
 pub const MAX_IMAGES: usize = 256;
@@ -117,6 +138,17 @@ pub const MAX_BATCH_PATCHES: usize = 16_384;
 // ---------------------------------------------------------------------------
 // Kernels
 // ---------------------------------------------------------------------------
+
+/// The largest head dim [`axial_qkv_norm_rope`] takes: the kernel keeps a
+/// head's rotation table (one cos/sin pair per rotated pair, a lane's share of
+/// `head_dim / 2`) in registers, sized for 512 (the checkpoint's is 64).
+const MAX_ROPE_HEAD_DIM: u32 = 512;
+
+/// Consecutive heads of one kind (q, k or v) of one row that one simdgroup of
+/// `vision_qkv_norm_rope_*` takes: the rotation depends on the patch and not
+/// the head, so they share one table of `cos`/`sin` (the dominant arithmetic)
+/// that one simdgroup per head formed again for each.
+const ROPE_HEADS_PER_UNIT: u32 = 6;
 
 /// Shape of one [`axial_qkv_norm_rope`] call.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -149,6 +181,9 @@ pub struct AxialQkvShape {
 /// The frequencies are `nn::rope_inv_freq(head_dim / 4, head_dim / 2, theta)`,
 /// computed on the host (a device `pow` is an ulp off at most pairs, which the
 /// position multiplies).
+///
+/// `q_out`, `k_cache` and `v_cache` are f32; [`axial_qkv_norm_rope_bf16`] is
+/// this with bf16 outputs.
 #[allow(clippy::too_many_arguments)]
 pub fn axial_qkv_norm_rope(
     rt: &Arc<GpuRuntime>,
@@ -163,12 +198,63 @@ pub fn axial_qkv_norm_rope(
     theta: f32,
     eps: f32,
 ) -> Result<(), String> {
+    axial_qkv_norm_rope_to(
+        rt, shape, proj, k_col, v_col, q_norm_w, k_norm_w, targets, positions, theta, eps, false,
+    )
+}
+
+/// [`axial_qkv_norm_rope`] storing q, k and v as bf16 (`vision_qkv_norm_rope_bf16`):
+/// rounded to nearest even from the f32 result of the norm and the rotation,
+/// the one rounding a cast pass would apply, with no pass. These are the
+/// operands of [`encoder_attn_bf16`]; `targets`' buffers are bf16 (two bytes an
+/// element) and the caches' capacity is derived from them as bf16
+/// ([`crate::nn::attn_kv_capacity_bf16`]).
+#[allow(clippy::too_many_arguments)]
+pub fn axial_qkv_norm_rope_bf16(
+    rt: &Arc<GpuRuntime>,
+    shape: &AxialQkvShape,
+    proj: Cols<'_>,
+    k_col: u32,
+    v_col: u32,
+    q_norm_w: &GpuBuffer,
+    k_norm_w: &GpuBuffer,
+    targets: &AttnTargets<'_>,
+    positions: &GpuBuffer,
+    theta: f32,
+    eps: f32,
+) -> Result<(), String> {
+    axial_qkv_norm_rope_to(
+        rt, shape, proj, k_col, v_col, q_norm_w, k_norm_w, targets, positions, theta, eps, true,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn axial_qkv_norm_rope_to(
+    rt: &Arc<GpuRuntime>,
+    shape: &AxialQkvShape,
+    proj: Cols<'_>,
+    k_col: u32,
+    v_col: u32,
+    q_norm_w: &GpuBuffer,
+    k_norm_w: &GpuBuffer,
+    targets: &AttnTargets<'_>,
+    positions: &GpuBuffer,
+    theta: f32,
+    eps: f32,
+    bf16: bool,
+) -> Result<(), String> {
     const WHAT: &str = "embedgemma2_vision::axial_qkv_norm_rope";
     let s = shape;
-    if s.head_dim == 0 || s.head_dim % 4 != 0 || s.q_heads == 0 || s.kv_heads == 0 || s.q_heads % s.kv_heads != 0 {
+    if s.head_dim == 0
+        || s.head_dim % 4 != 0
+        || s.head_dim > MAX_ROPE_HEAD_DIM
+        || s.q_heads == 0
+        || s.kv_heads == 0
+        || s.q_heads % s.kv_heads != 0
+    {
         return Err(format!(
-            "{WHAT}: head_dim must be a positive multiple of 4 and q_heads a multiple of kv_heads, got \
-             head_dim {}, q_heads {}, kv_heads {}",
+            "{WHAT}: head_dim must be a positive multiple of 4 up to {MAX_ROPE_HEAD_DIM} and q_heads a multiple of \
+             kv_heads, got head_dim {}, q_heads {}, kv_heads {}",
             s.head_dim, s.q_heads, s.kv_heads
         ));
     }
@@ -185,7 +271,11 @@ pub fn axial_qkv_norm_rope(
         .max(u64::from(v_col) + span(s.kv_heads));
     let rows = u64::from(s.batch) * u64::from(s.seq);
     qwen35::require_window::<f32>(rt, proj, rows, width, "axial_qkv_norm_rope proj")?;
-    let kv_capacity = crate::nn::attn_kv_capacity(targets.k_cache, targets.v_cache, s.batch, s.kv_heads, s.head_dim)?;
+    let kv_capacity = if bf16 {
+        attn_kv_capacity_bf16(targets.k_cache, targets.v_cache, s.batch, s.kv_heads, s.head_dim)?
+    } else {
+        attn_kv_capacity(targets.k_cache, targets.v_cache, s.batch, s.kv_heads, s.head_dim)?
+    };
     if kv_capacity < s.seq {
         return Err(format!(
             "{WHAT}: the caches hold {kv_capacity} positions per image; need at least seq = {}",
@@ -197,9 +287,15 @@ pub fn axial_qkv_norm_rope(
     require::<u32>(rt, positions, 2 * rows as usize, "axial_qkv_norm_rope positions")?;
     let q_elems = rows as usize * s.q_heads as usize * s.head_dim as usize;
     let cache_elems = s.batch as usize * kv_capacity as usize * s.kv_heads as usize * s.head_dim as usize;
-    require::<f32>(rt, targets.q_out, q_elems, "axial_qkv_norm_rope q_out")?;
-    require::<f32>(rt, targets.k_cache, cache_elems, "axial_qkv_norm_rope k_cache")?;
-    require::<f32>(rt, targets.v_cache, cache_elems, "axial_qkv_norm_rope v_cache")?;
+    if bf16 {
+        require::<u16>(rt, targets.q_out, q_elems, "axial_qkv_norm_rope q_out (bf16)")?;
+        require::<u16>(rt, targets.k_cache, cache_elems, "axial_qkv_norm_rope k_cache (bf16)")?;
+        require::<u16>(rt, targets.v_cache, cache_elems, "axial_qkv_norm_rope v_cache (bf16)")?;
+    } else {
+        require::<f32>(rt, targets.q_out, q_elems, "axial_qkv_norm_rope q_out")?;
+        require::<f32>(rt, targets.k_cache, cache_elems, "axial_qkv_norm_rope k_cache")?;
+        require::<f32>(rt, targets.v_cache, cache_elems, "axial_qkv_norm_rope v_cache")?;
+    }
     require_disjoint_writes(
         WHAT,
         &[
@@ -216,8 +312,13 @@ pub fn axial_qkv_norm_rope(
     )?;
     // One simdgroup per (row, head); eight per threadgroup.
     const SIMDGROUPS: usize = 8;
-    let units = rows as usize * (s.q_heads + 2 * s.kv_heads) as usize;
-    let p = rt.pipeline("vision_qkv_norm_rope_f32")?;
+    let units = rows as usize
+        * (s.q_heads.div_ceil(ROPE_HEADS_PER_UNIT) + 2 * s.kv_heads.div_ceil(ROPE_HEADS_PER_UNIT)) as usize;
+    let p = rt.pipeline(if bf16 {
+        "vision_qkv_norm_rope_bf16"
+    } else {
+        "vision_qkv_norm_rope_f32"
+    })?;
     dispatch_2d_tg(rt, &p, units.div_ceil(SIMDGROUPS), 1, SIMDGROUPS * 32, |bnd| {
         set_gpu_buf(bnd, proj.buf, 0);
         set_gpu_buf(bnd, q_norm_w, 1);
@@ -238,6 +339,7 @@ pub fn axial_qkv_norm_rope(
         set_u32(bnd, kv_capacity, 16);
         bind_rope_inv_freq(bnd, s.head_dim / 4, s.head_dim / 2, theta, 17);
         set_f32(bnd, eps, 18);
+        set_u32(bnd, ROPE_HEADS_PER_UNIT, 19);
     })
 }
 
@@ -672,6 +774,9 @@ fn pack_images(valid: &[usize]) -> Vec<Vec<usize>> {
 // Model
 // ---------------------------------------------------------------------------
 
+/// The projections (`w_*`, `gate_up`, `down`) are f32 under
+/// [`GemmOperands::ExactF32`] and bf16 under [`GemmOperands::Bf16`]; the norms
+/// are f32 under both.
 struct Layer {
     input_norm: GpuBuffer,
     post_attn_norm: GpuBuffer,
@@ -701,8 +806,12 @@ pub struct EmbedGemma2VisionModel {
     layers: Vec<Layer>,
     /// `[hidden, text_hidden]`.
     embed_proj: Tensor,
-    /// `[hidden]` ones: the embedder's weightless norm through `rms_norm_f32`.
+    /// `[hidden]` ones: the embedder's weightless norm through `rms_norm_f32`
+    /// (`rms_norm_bf16` under [`GemmOperands::Bf16`]).
     ones: GpuBuffer,
+    /// How the projections are held and the GEMMs run
+    /// ([`EmbedGemma2VisionModel::load_with`]).
+    operands: GemmOperands,
 }
 
 /// Per-layer residuals and the pooled pre-embedder output of an
@@ -748,27 +857,42 @@ struct Acts {
     nb: usize,
     pooled_rows: usize,
     resid: Tensor,
+    /// The normed input of the `q|k|v` and `gate|up` GEMMs: f32, or bf16 under
+    /// `Bf16` (the norms write it so).
     x: Tensor,
     qkv: Tensor,
+    /// The attention operands q, k and normed v: f32, or bf16 under `Bf16` (the
+    /// axial kernel stores them so, with no cast pass).
     q: Tensor,
     /// K and normed V, `[batch, capacity, heads, head_dim]`: the capacity both
     /// the K/V writer and [`encoder_attn`] derive from the buffer's size.
     k: Tensor,
     v: Tensor,
-    /// The attention output; then, once the output projection has read it,
-    /// the MLP's `gelu_tanh(gate) * up`.
+    /// The attention output; then, under [`GemmOperands::ExactF32`], once the
+    /// output projection has read it, the MLP's `gelu_tanh(gate) * up` (sized
+    /// for the wider of the two). Under `Bf16` the MLP's lives in
+    /// [`Acts::wide`] and this is the attention output's width only.
     attn: Tensor,
     y: Tensor,
     gate_up: Tensor,
     pooled: Tensor,
+    /// The embedder's normed input: f32, or bf16 under `Bf16`.
     normed: Tensor,
+    /// Under [`GemmOperands::Bf16`]: `[rows, max(heads * head_dim,
+    /// intermediate)]` bf16, the rounded attention output and then, once the
+    /// output projection has read it, the MLP's `gelu_tanh(gate) * up`
+    /// (written bf16 by the gate kernel). `None` under `ExactF32`, whose
+    /// `attn` holds both in turn.
+    wide: Option<Tensor>,
 }
 
 /// What one forward alone owns, because the host writes it before the forward
 /// runs and reads it after: each forward gets its own set, kept alive until
 /// the call's one wait.
 struct ForwardIo {
-    /// `[rows, patch_dim]` scaled pixels, padded rows zero.
+    /// `[rows, patch_dim]` scaled pixels, padded rows zero: f32, or under
+    /// `Bf16` rounded to bf16 on the host as they are written (the GPU's
+    /// rounding, [`f32_to_bf16_bits_gpu`]), the patch GEMM's operand.
     pix: Tensor,
     /// `[rows, 2]` i32 positions as u32 bits, padded rows `(-1, -1)`.
     positions: GpuBuffer,
@@ -893,10 +1017,56 @@ impl EmbedGemma2VisionModel {
     /// Every tensor's shape is checked against `cfg`; a missing one is an
     /// error, and so is any tensor under either prefix the forward does not
     /// read.
+    ///
+    /// This is [`GemmOperands::ExactF32`] ([`Self::load_with`]): the
+    /// projections widened to f32, the GEMMs exact f32.
     pub fn load(rt: &Arc<GpuRuntime>, st: &SafeTensors, cfg: VisionConfig) -> Result<Self, String> {
+        Self::load_with(rt, st, cfg, GemmOperands::ExactF32)
+    }
+
+    /// [`Self::load`] with the operand precision chosen (the module docs,
+    /// Precision).
+    ///
+    /// * [`GemmOperands::ExactF32`]: every projection widened to f32 on the
+    ///   device, every GEMM exact f32 (transformers' fp32 forward up to
+    ///   operation order). `encode_images` refuses a runtime whose relaxed f32
+    ///   GEMMs are on.
+    /// * [`GemmOperands::Bf16`]: every projection kept as the checkpoint stores
+    ///   it, bf16, with no f32 copy, and every GEMM run with bf16 operands and
+    ///   f32 accumulation; the attention runs on bf16 tiles
+    ///   ([`encoder_attn_bf16`]). The checkpoint's projections must be bf16 (a
+    ///   tensor stored in another dtype is refused by name rather than
+    ///   rounded), the device needs TensorOps, and the head dim must be one the
+    ///   bf16 attention is compiled for (64, 256 or 512). `encode_images`
+    ///   accepts a runtime with relaxed f32 GEMMs on, which no GEMM of this
+    ///   forward uses.
+    pub fn load_with(
+        rt: &Arc<GpuRuntime>,
+        st: &SafeTensors,
+        cfg: VisionConfig,
+        operands: GemmOperands,
+    ) -> Result<Self, String> {
+        let proj = match operands {
+            GemmOperands::ExactF32 => Precision::F32,
+            GemmOperands::Bf16 => {
+                if !rt.has_tensorops() {
+                    return Err(
+                        "EmbedGemma2VisionModel::load_with: bf16 operands need TensorOps, which this device lacks"
+                            .into(),
+                    );
+                }
+                if !encoder_attn_bf16_supports(cfg.head_dim) {
+                    return Err(format!(
+                        "EmbedGemma2VisionModel::load_with: bf16 operands have no attention kernel for head dim {} \
+                         (64, 256 and 512 are compiled)",
+                        cfg.head_dim
+                    ));
+                }
+                Precision::Bf16
+            }
+        };
         let tower = Loader::new(rt, st, "vision_tower.");
         let embed = Loader::new(rt, st, "embed_vision.");
-        let f32p = Precision::F32;
         let (h, inter, patch_dim, text_h) = (
             cfg.hidden as usize,
             cfg.intermediate as usize,
@@ -906,7 +1076,7 @@ impl EmbedGemma2VisionModel {
         let qw = (cfg.heads * cfg.head_dim) as usize;
         let d = cfg.head_dim as usize;
 
-        let patch_proj = tower.linear(&[("patch_embedder.input_proj.weight", h)], patch_dim, f32p)?;
+        let patch_proj = tower.linear(&[("patch_embedder.input_proj.weight", h)], patch_dim, proj)?;
         let size = cfg.position_embedding_size as usize;
         // Read straight into the device table: no host copy.
         let pos_table = rt.alloc_tensor_bf16_hot(&[2, size, h])?;
@@ -927,9 +1097,9 @@ impl EmbedGemma2VisionModel {
                         (&p("self_attn.v_proj.linear.weight"), qw),
                     ],
                     h,
-                    f32p,
+                    proj,
                 )?,
-                w_o: tower.linear(&[(&p("self_attn.o_proj.linear.weight"), h)], qw, f32p)?,
+                w_o: tower.linear(&[(&p("self_attn.o_proj.linear.weight"), h)], qw, proj)?,
                 q_norm: tower.norm(&p("self_attn.q_norm.weight"), d)?,
                 k_norm: tower.norm(&p("self_attn.k_norm.weight"), d)?,
                 gate_up: tower.linear(
@@ -938,12 +1108,12 @@ impl EmbedGemma2VisionModel {
                         (&p("mlp.up_proj.linear.weight"), inter),
                     ],
                     h,
-                    f32p,
+                    proj,
                 )?,
-                down: tower.linear(&[(&p("mlp.down_proj.linear.weight"), h)], inter, f32p)?,
+                down: tower.linear(&[(&p("mlp.down_proj.linear.weight"), h)], inter, proj)?,
             });
         }
-        let embed_proj = embed.linear(&[("embedding_projection.weight", text_h)], h, f32p)?;
+        let embed_proj = embed.linear(&[("embedding_projection.weight", text_h)], h, proj)?;
         tower.refuse_unread()?;
         embed.refuse_unread()?;
         let ones = tower.buf(&vec![1.0f32; h])?;
@@ -956,11 +1126,46 @@ impl EmbedGemma2VisionModel {
             layers,
             embed_proj,
             ones,
+            operands,
         })
     }
 
     pub fn config(&self) -> &VisionConfig {
         &self.cfg
+    }
+
+    /// The operand precision this model was loaded with.
+    pub fn operands(&self) -> GemmOperands {
+        self.operands
+    }
+
+    /// Bytes of weights held on the device: the position table, every
+    /// projection in the dtype the mode holds it in, and the norms (f32). The
+    /// activations are not counted.
+    pub fn weight_bytes(&self) -> usize {
+        let t = |t: &Tensor| t.nbytes_logical();
+        let layers: usize = self
+            .layers
+            .iter()
+            .map(|l| {
+                [&l.w_qkv, &l.w_o, &l.gate_up, &l.down]
+                    .into_iter()
+                    .map(t)
+                    .sum::<usize>()
+                    + [
+                        &l.input_norm,
+                        &l.post_attn_norm,
+                        &l.pre_ffn_norm,
+                        &l.post_ffn_norm,
+                        &l.q_norm,
+                        &l.k_norm,
+                    ]
+                    .into_iter()
+                    .map(GpuBuffer::nbytes)
+                    .sum::<usize>()
+            })
+            .sum();
+        t(&self.patch_proj) + t(&self.pos_table) + t(&self.embed_proj) + self.ones.nbytes() + layers
     }
 
     /// The runtime this model was loaded on.
@@ -1045,7 +1250,9 @@ impl EmbedGemma2VisionModel {
                 images.len()
             ));
         }
-        if self.rt.f32_gemm_runs_relaxed() {
+        // No GEMM of the bf16 forward is an f32 one, so the switch does not
+        // touch it.
+        if self.operands == GemmOperands::ExactF32 && self.rt.f32_gemm_runs_relaxed() {
             return Err(format!(
                 "{what}: the forward needs exact-f32 GEMMs; switch the runtime's relaxed precision off"
             ));
@@ -1196,8 +1403,26 @@ impl EmbedGemma2VisionModel {
             offsets.extend(p.plan.offsets[1..].iter().map(|&o| base + o));
         }
         let pooled_rows = offsets.len() - 1;
+        let pix = match self.operands {
+            GemmOperands::ExactF32 => {
+                Tensor::from_buffer(rt, rt.alloc_buffer_from_u32(&pix)?, &[rows, pd], DType::F32, 0)?
+            }
+            // The patch GEMM's operand is bf16: round the scaled pixels as the
+            // GPU's cast would, two to a word (little endian, the first in the
+            // low half), so there is no cast pass and half the upload.
+            GemmOperands::Bf16 => {
+                let words: Vec<u32> = pix
+                    .chunks(2)
+                    .map(|c| {
+                        let half = |bits: u32| u32::from(f32_to_bf16_bits_gpu(f32::from_bits(bits)));
+                        half(c[0]) | c.get(1).map_or(0, |&b| half(b) << 16)
+                    })
+                    .collect();
+                Tensor::from_buffer(rt, rt.alloc_buffer_from_u32(&words)?, &[rows, pd], DType::BF16, 0)?
+            }
+        };
         Ok(ForwardIo {
-            pix: Tensor::from_buffer(rt, rt.alloc_buffer_from_u32(&pix)?, &[rows, pd], DType::F32, 0)?,
+            pix,
             positions: rt.alloc_buffer_from_u32(&pos)?,
             lens: rt.alloc_buffer_from_u32(&lens)?,
             offsets: rt.alloc_buffer_from_u32(&offsets)?,
@@ -1228,12 +1453,29 @@ impl EmbedGemma2VisionModel {
         let qw = cfg.heads * cfg.head_dim;
         let inter = cfg.intermediate;
         let at = |t: &Tensor, cols: u32| view(t, rows_u, cols);
-        let (resid, x, y) = (at(&a.resid, h)?, at(&a.x, h)?, at(&a.y, h)?);
-        let (qkv, gate_up, mid) = (at(&a.qkv, 3 * qw)?, at(&a.gate_up, 2 * inter)?, at(&a.attn, inter)?);
+        let (resid, y) = (at(&a.resid, h)?, at(&a.y, h)?);
+        // Under `Bf16`, each GEMM input that has a bf16 staging reads that
+        // instead of its f32 buffer: the norms (`rms_norm_bf16`) and the GELU
+        // gate write bf16 directly, at no extra dispatch, and one cast pass
+        // per layer covers the attention output (`encoder_attn` writes f32
+        // only). The rounded copies are made once, into `a.bf16`'s buffers.
+        let bf = a.wide.as_ref();
+        let x_in = at(&a.x, h)?;
+        let (qkv, gate_up) = (at(&a.qkv, 3 * qw)?, at(&a.gate_up, 2 * inter)?);
+        let mid = match bf {
+            Some(wide) => at(wide, inter)?,
+            None => at(&a.attn, inter)?,
+        };
+        // The normed input of the GEMMs that read `x_in`: bf16 straight from
+        // the norm under `Bf16`.
+        let norm_x_in = |weight: &GpuBuffer| match bf {
+            Some(_) => rms_norm_bf16(rt, &resid.buffer, weight, &x_in.buffer, rows_u, h, eps),
+            None => rms_norm_f32(rt, &resid.buffer, weight, &x_in.buffer, rows_u, h, eps),
+        };
 
         // Patch embedder: the projection of the scaled pixels (zero rows give
         // zero rows), plus the position embeddings (zero on padding).
-        gemm(&io.pix, &self.patch_proj, &resid, BACKEND)?;
+        project(self.operands, &io.pix, &self.patch_proj, &resid)?;
         patch_position_embed_add(
             rt,
             &resid.buffer,
@@ -1255,9 +1497,16 @@ impl EmbedGemma2VisionModel {
 
         for layer in &self.layers {
             // Attention.
-            rms_norm_f32(rt, &resid.buffer, &layer.input_norm, &x.buffer, rows_u, h, eps)?;
-            gemm(&x, &layer.w_qkv, &qkv, BACKEND)?;
-            axial_qkv_norm_rope(
+            norm_x_in(&layer.input_norm)?;
+            project(self.operands, &x_in, &layer.w_qkv, &qkv)?;
+            // Q, K and V are in the attention's operand type: f32, or under
+            // `Bf16` the writer stores them bf16.
+            let rope = if bf.is_some() {
+                axial_qkv_norm_rope_bf16
+            } else {
+                axial_qkv_norm_rope
+            };
+            rope(
                 rt,
                 &AxialQkvShape {
                     batch: nb,
@@ -1280,7 +1529,8 @@ impl EmbedGemma2VisionModel {
                 cfg.rope_theta,
                 eps,
             )?;
-            encoder_attn(
+            let attend = if bf.is_some() { encoder_attn_bf16 } else { encoder_attn };
+            attend(
                 rt,
                 &a.q.buffer,
                 &a.k.buffer,
@@ -1298,12 +1548,19 @@ impl EmbedGemma2VisionModel {
                 },
             )?;
             let attn = at(&a.attn, qw)?;
-            gemm(&attn, &layer.w_o, &y, BACKEND)?;
+            match bf {
+                Some(wide) => {
+                    let attn_in = at(wide, qw)?;
+                    cast_f32_to_bf16_into(&attn, &attn_in)?;
+                    project(self.operands, &attn_in, &layer.w_o, &y)?;
+                }
+                None => project(self.operands, &attn, &layer.w_o, &y)?,
+            }
             rms_norm_residual_add_f32(rt, &y.buffer, &layer.post_attn_norm, &resid.buffer, rows_u, h, eps, 1.0)?;
 
             // MLP.
-            rms_norm_f32(rt, &resid.buffer, &layer.pre_ffn_norm, &x.buffer, rows_u, h, eps)?;
-            gemm(&x, &layer.gate_up, &gate_up, BACKEND)?;
+            norm_x_in(&layer.pre_ffn_norm)?;
+            project(self.operands, &x_in, &layer.gate_up, &gate_up)?;
             let window = |off: u32| Cols {
                 buf: &gate_up.buffer,
                 ld: 2 * inter,
@@ -1316,12 +1573,12 @@ impl EmbedGemma2VisionModel {
                 window(inter),
                 OutCols {
                     cols: Cols::dense(&mid.buffer, inter),
-                    dtype: DType::F32,
+                    dtype: mid.dtype,
                 },
                 rows_u,
                 inter,
             )?;
-            gemm(&mid, &layer.down, &y, BACKEND)?;
+            project(self.operands, &mid, &layer.down, &y)?;
             rms_norm_residual_add_f32(rt, &y.buffer, &layer.post_ffn_norm, &resid.buffer, rows_u, h, eps, 1.0)?;
             if let Some(t) = raw.as_mut() {
                 rt.synchronize()?;
@@ -1350,8 +1607,11 @@ impl EmbedGemma2VisionModel {
         )?;
         // `EmbeddingGemma2MultimodalEmbedder`: a weightless RMSNorm (the norm
         // kernel with a weight of ones), then the projection.
-        rms_norm_f32(rt, &pooled.buffer, &self.ones, &normed.buffer, pooled_rows, h, eps)?;
-        gemm(&normed, &self.embed_proj, &soft, BACKEND)?;
+        match bf {
+            Some(_) => rms_norm_bf16(rt, &pooled.buffer, &self.ones, &normed.buffer, pooled_rows, h, eps)?,
+            None => rms_norm_f32(rt, &pooled.buffer, &self.ones, &normed.buffer, pooled_rows, h, eps)?,
+        }
+        project(self.operands, &normed, &self.embed_proj, &soft)?;
         if let Some(t) = raw.as_mut() {
             rt.synchronize()?;
             t.pooled = pooled.buffer.try_contents_f32()?[..pooled_rows as usize * h as usize].to_vec();
@@ -1368,21 +1628,26 @@ impl EmbedGemma2VisionModel {
         let (h, inter) = (cfg.hidden as usize, cfg.intermediate as usize);
         let qw = (cfg.heads * cfg.head_dim) as usize;
         let f32s = |shape: &[usize]| rt.alloc_tensor_unzeroed(shape, DType::F32);
+        let bf16 = self.operands == GemmOperands::Bf16;
+        let bf16s = |shape: &[usize]| rt.alloc_tensor_unzeroed(shape, DType::BF16);
+        // A GEMM input or attention operand: bf16 under `Bf16`, else f32.
+        let operand = |shape: &[usize]| if bf16 { bf16s(shape) } else { f32s(shape) };
         Ok(Acts {
             rows: r,
             nb,
             pooled_rows: s,
             resid: f32s(&[r, h])?,
-            x: f32s(&[r, h])?,
+            x: operand(&[r, h])?,
             qkv: f32s(&[r, 3 * qw])?,
-            q: f32s(&[r, qw])?,
-            k: f32s(&[r, qw])?,
-            v: f32s(&[r, qw])?,
-            attn: f32s(&[r, qw.max(inter)])?,
+            q: operand(&[r, qw])?,
+            k: operand(&[r, qw])?,
+            v: operand(&[r, qw])?,
+            attn: f32s(&[r, if bf16 { qw } else { qw.max(inter) }])?,
             y: f32s(&[r, h])?,
             gate_up: f32s(&[r, 2 * inter])?,
             pooled: f32s(&[s, h])?,
-            normed: f32s(&[s, h])?,
+            normed: operand(&[s, h])?,
+            wide: if bf16 { Some(bf16s(&[r, qw.max(inter)])?) } else { None },
         })
     }
 }

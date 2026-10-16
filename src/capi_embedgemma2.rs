@@ -53,8 +53,10 @@
 //! (`AudioInput` owns its rows) after its length was bounded.
 //!
 //! The runtime must not have relaxed precision switched on (`encode` refuses
-//! it by name); nothing in the C ABI turns it on. The towers are exact f32
-//! whatever `operands` the text encoder was loaded with.
+//! it by name, unless the handle holds `operands` bf16 and the call has no
+//! clips: the text encoder and the vision tower then run no f32 GEMM); nothing
+//! in the C ABI turns it on. The audio tower is exact f32 whatever `operands`
+//! the handle was loaded with.
 
 use std::ffi::c_char;
 use std::panic::{catch_unwind, AssertUnwindSafe};
@@ -255,10 +257,10 @@ pub unsafe extern "C" fn tessl_embedgemma2_load(
 /// of `model.safetensors`; about 1.7 GB of weights on the device where the text
 /// encoder alone is 0.8 GB.
 ///
-/// `operands` is the text encoder's GEMM operands
+/// `operands` is the GEMM operands of the text encoder and the vision tower
 /// ([`crate::capi::TESSL_OPERANDS_EXACT_F32`] or
-/// [`crate::capi::TESSL_OPERANDS_BF16`]; anything else is refused). The towers
-/// are exact f32 under either: they have no bf16 mode.
+/// [`crate::capi::TESSL_OPERANDS_BF16`]; anything else is refused). The audio
+/// tower is exact f32 under either: it has no bf16 mode.
 ///
 /// # Safety
 /// As [`tessl_embedgemma2_load`].

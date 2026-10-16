@@ -8,6 +8,38 @@ All notable changes to `tessl` are recorded here. The format follows
 
 ### Added
 
+- **EmbeddingGemma 2 vision tower: a `GemmOperands::Bf16` mode, measured and
+  sped up** (`EmbedGemma2VisionModel::load_with(rt, st, cfg, operands)`; `load`
+  is `ExactF32`, bit for bit what it was: tiny hash `a1e38036581d2780`, real
+  checkpoint 1 image `d9a0d85dd2f8f279` and 8 images `4f48fd6b310f86a5`, equal
+  to the build at `433e659`). `Bf16` keeps the 16 layers' projections bf16 on the
+  device (335.6 MB against 639.6 MB), runs every GEMM bf16 x bf16 with f32
+  accumulation through the text encoder's own `embedgemma2::project`, the
+  attention on `encoder_attn_bf16` (head dim 64), and keeps the residual stream,
+  norms, RoPE arithmetic, pool and embedder norm f32; new kernel
+  `vision_qkv_norm_rope_bf16` stores bf16 with the f32 kernel's rounding (bit
+  equal to rounding its output). The facade's one `GemmOperands` now covers the
+  text encoder and the vision tower (the audio tower stays exact f32; the C ABI
+  `operands` and Python `operands=` documentation say so). Held to the f64
+  forward over the same bf16 weights on a tiny checkpoint (relative bounds
+  `2e-2` patch embedder, `5e-2` layers and soft tokens, token cosine `0.999`,
+  fixed before the first run; observed `9.5e-4`, `6.7e-3`, `5.7e-3`, `0.99998`;
+  batched, reversed and split calls bit-identical) and, on the real
+  checkpoint, image embeddings end to end (bf16 tower and text encoder) at
+  cosine `0.99998769` and `0.99998850` against fp32 (bound `0.9999`), mean
+  `1 - cos` `1.19e-5` against transformers' own bf16 run's `2.61e-5`. New bins
+  `bench_embedgemma2_vision` and `profile_embedgemma2_vision` (a replica of the
+  forward checked bit-equal to `encode_images`, with the quiet-machine gate
+  that now lives in `src/bin/common`). Speed on an Apple M5 Pro, real
+  checkpoint, paired interleaved rounds on a shared GPU: `Bf16` is 2.8x to 3.1x
+  faster than `ExactF32` (1 image 63.5 against 187 ms, 8 images 547 against
+  1683 ms over 8 rounds, spreads and the contended rounds in
+  `bench/results/embedgemma2_vision_speed_m5pro.txt`); the rope kernel, formerly
+  one `cos`/`sin` table per head, now forms one per patch for up to six heads
+  (8.4 to 3.1 ms at one image, output bits unchanged). Stage ranking before and
+  after: `bench/results/embedgemma2_vision_profile_m5pro.txt`. The multimodal
+  tiny fixture's vision tower is two heads of 64 (the bf16 attention is not
+  compiled for 32).
 - **EmbeddingGemma 2, text, images and audio in one call, from Rust, C and
   Python** (`tessl::embedgemma2_mm`: `EmbedGemma2Multimodal::{load, load_from,
   from_parts, encode, text, vision, audio}`, `MmItem`; audit gaps G3, G8). One
@@ -26,7 +58,7 @@ All notable changes to `tessl` are recorded here. The format follows
   with media waits twice (the towers, then the text encoder: the soft tokens
   cross the host), a call of texts once, three for the by-hand composition;
   the GPU-resident hand-off that would make it one is not done. `GemmOperands`
-  applies to the text encoder; the towers stay exact f32 (no tower bf16 mode).
+  applies to the text encoder and, from the vision-tower bf16 entry below, the vision tower; the audio tower stays exact f32.
   C ABI, additive (ABI 11 unchanged): `tessl_embedgemma2_load_multimodal` and
   `tessl_embedgemma2_{encode_images, encode_audio}` take a processor's
   `pixel_values` / `image_position_ids` / `input_features` / mask as flat
@@ -843,6 +875,8 @@ All notable changes to `tessl` are recorded here. The format follows
 
 ### Changed
 
+- `embedgemma2_vision::axial_qkv_norm_rope` (and the new `_bf16`) refuse a head dim over 512 (the shared rope table holds 8 pairs per lane); the config parser already limited `vision_config.head_dim` to 32, 64, 256 or 512, so no config loads differently.
+- README and the crate docs count 283 kernel entry points (the vision tower's bf16 rope kernel is the new one).
 - **GDN training reads q/k/v where the model keeps them.**
   `gdn_train_forward_windowed` / `gdn_train_backward_windowed` take `(ld, off)`
   column windows of the conv output and write `dq`/`dk`/`dv` back the same way,

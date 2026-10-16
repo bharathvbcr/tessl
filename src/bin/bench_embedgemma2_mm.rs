@@ -16,11 +16,22 @@
 //!   (the text side needs several forwards);
 //! * `mixed_short`: the same twelve items with every text cut to its first 48
 //!   ids, so the towers are most of the call;
-//! * `media_only`: the two images and the two clips.
+//! * `media_only`: the two images and the two clips;
+//! * `audio_only`: the two golden clips alone (99 and 330 frames), one item
+//!   each;
+//! * `audio_4x5s`, `audio_8x10s`: the audio tower's synthetic batches of
+//!   `common/audio_workloads.rs` (4 clips of 5 s, 8 of 10 s) as one item per
+//!   clip, so the call is the audio tower and a text encoder over its soft
+//!   tokens (25 per second of audio). Neither is in the default set: name
+//!   them.
 //!
 //! `BENCH_ITERS` (default 10) and `BENCH_WARMUP` (default 3) are per workload.
 //! `BENCH_PRECISION=f32|bf16` (default `f32`) is the operand precision of the
-//! text encoder and the vision tower ([`GemmOperands`]).
+//! text encoder and both towers ([`GemmOperands`]; the audio tower follows it
+//! since the audio bf16 mode, so the audio workloads of one build differ by
+//! this knob only). The `bf16` mode's embeddings are not within `1e-4` of the
+//! fp32 references, so `mixed_full` refuses it, and the audio workloads with a
+//! reference are held to cosine `0.9999` there.
 //!
 //! What is timed: one `encode` call from host ids, pixels and features to host
 //! embeddings. Not timed: the model load and the goldens' read.
@@ -42,6 +53,9 @@
 
 mod common;
 
+#[path = "common/audio_workloads.rs"]
+mod audio_workloads;
+
 use std::path::PathBuf;
 use std::time::Instant;
 
@@ -56,7 +70,12 @@ use tessl::GpuRuntime;
 use common::env_usize;
 
 const MIB: f64 = (1u64 << 20) as f64;
+/// The workloads a run without `BENCH_WORKLOADS` covers.
 const WORKLOADS: [&str; 3] = ["mixed_full", "mixed_short", "media_only"];
+/// Named only: the audio calls.
+const AUDIO_WORKLOADS: [&str; 3] = ["audio_only", "audio_4x5s", "audio_8x10s"];
+/// A bf16 forward's embedding against the fp32 reference: the floor of `tests/embedgemma2_multimodal_model.rs`.
+const BF16_COS: f64 = 0.9999;
 const EMB_BOUND: f64 = 1e-4;
 const SHORT_TOKENS: usize = 48;
 
@@ -81,6 +100,12 @@ fn fnv1a(v: &[f32]) -> u64 {
             .iter()
             .fold(h, |h, &b| (h ^ u64::from(b)).wrapping_mul(0x0000_0100_0000_01b3))
     })
+}
+
+fn cosine(a: &[f32], b: &[f32]) -> f64 {
+    let dot: f64 = a.iter().zip(b).map(|(x, y)| f64::from(*x) * f64::from(*y)).sum();
+    let norm = |v: &[f32]| v.iter().map(|x| f64::from(*x).powi(2)).sum::<f64>().sqrt();
+    dot / (norm(a) * norm(b))
 }
 
 fn max_abs(a: &[f32], b: &[f32]) -> f64 {
@@ -170,8 +195,13 @@ fn main() -> Result<(), String> {
     let snap = env_dir("EMBEDGEMMA2_SNAPSHOT", "the google/embeddinggemma-2 snapshot directory")?;
     let spec = std::env::var("BENCH_WORKLOADS").unwrap_or_else(|_| WORKLOADS.join(","));
     let names: Vec<String> = spec.split(',').map(|s| s.trim().to_string()).collect();
-    if let Some(bad) = names.iter().find(|n| !WORKLOADS.contains(&n.as_str())) {
-        return Err(format!("unknown workload {bad:?}; expected one of {WORKLOADS:?}"));
+    if let Some(bad) = names
+        .iter()
+        .find(|n| !WORKLOADS.contains(&n.as_str()) && !AUDIO_WORKLOADS.contains(&n.as_str()))
+    {
+        return Err(format!(
+            "unknown workload {bad:?}; expected one of {WORKLOADS:?} or {AUDIO_WORKLOADS:?}"
+        ));
     }
     let iters = env_usize("BENCH_ITERS", 10, 1)?;
     let warmup = env_usize("BENCH_WARMUP", 3, 0)?;
@@ -195,9 +225,17 @@ fn main() -> Result<(), String> {
 
     let mut rows = Vec::new();
     for name in &names {
+        // The synthetic clips of an audio batch (owned here, borrowed by the items).
+        let synthetic: Vec<AudioInput> = match name.as_str() {
+            "audio_4x5s" => audio_workloads::workload("batch_4x5s")?.clips,
+            "audio_8x10s" => audio_workloads::workload("batch_8x10s")?.clips,
+            _ => Vec::new(),
+        };
         let items: Vec<MmItem<'_>> = match name.as_str() {
             "mixed_full" => g.layout(&g.texts),
             "mixed_short" => g.layout(&short),
+            "audio_only" => g.clips.iter().map(MmItem::Audio).collect(),
+            "audio_4x5s" | "audio_8x10s" => synthetic.iter().map(MmItem::Audio).collect(),
             _ => vec![
                 g.image(0),
                 g.image(1),
@@ -219,7 +257,32 @@ fn main() -> Result<(), String> {
             for (k, at) in [0, 2 + n, 1, 3 + n].into_iter().enumerate() {
                 worst = worst.max(max_abs(row(at), &g.media_emb[k]));
             }
+            if operands == GemmOperands::Bf16 {
+                return Err(format!(
+                    "{name}: a bf16 forward is not within {EMB_BOUND:e} of the fp32 reference; use the f32 precision"
+                ));
+            }
             if worst.is_nan() || worst > EMB_BOUND {
+                return Err(format!(
+                    "{name}: an embedding is {worst:.3e} from the reference (bound {EMB_BOUND:e})"
+                ));
+            }
+            format!("{worst:e}")
+        } else if name == "audio_only" {
+            // The two golden clips: exact within the bound, bf16 within the cosine floor.
+            let mut worst = 0.0f64;
+            for k in 0..2 {
+                let row = &out.embeddings[k * dim..(k + 1) * dim];
+                let want = &g.media_emb[2 + k];
+                worst = worst.max(max_abs(row, want));
+                let cos = cosine(row, want);
+                if operands == GemmOperands::Bf16 && (cos.is_nan() || cos < BF16_COS) {
+                    return Err(format!(
+                        "{name}: clip {k} is at cosine {cos:.8} from the reference (floor {BF16_COS})"
+                    ));
+                }
+            }
+            if operands == GemmOperands::ExactF32 && (worst.is_nan() || worst > EMB_BOUND) {
                 return Err(format!(
                     "{name}: an embedding is {worst:.3e} from the reference (bound {EMB_BOUND:e})"
                 ));

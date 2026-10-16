@@ -1473,6 +1473,7 @@ Reproduce: `scripts/gen_embedgemma2_pre_fixtures.py` (fixtures; with
 `cargo test --release --test embedgemma2_pre`, and with the checkpoint
 `tools/embedgemma2_ref/make_mm_reference.py` (now also saves `*_raw.npy`) then
 `cargo test --release --test embedgemma2_pre_model -- --ignored --test-threads=1`.
+
 ## Tokenizer
 
 `tessl::embedgemma2_tok` turns a text into the ids the encoder takes, from the

@@ -67,8 +67,9 @@
 //! the residual stream both read, so the rest of the forward is unchanged.
 //! [`EmbedGemma2Model::encode`] is the case with no soft rows and no
 //! placeholder ids (a text id equal to a placeholder id is an ordinary token
-//! there, as before). [`EmbedGemma2Config::image_sequence`] and
-//! [`EmbedGemma2Config::audio_sequence`] build the processor's id layout.
+//! there, as before). [`EmbedGemma2Config::image_sequence`],
+//! [`EmbedGemma2Config::audio_sequence`] and
+//! [`EmbedGemma2Config::video_sequence`] build the processor's id layout.
 //!
 //! # Kernels
 //!
@@ -911,6 +912,48 @@ impl EmbedGemma2Config {
             ],
         )?;
         Self::framed("audio_sequence", [bos, boa], audio, [eoa, eos], n_soft)
+    }
+
+    /// The processor's ids for one video whose frames have `soft_per_frame[f]`
+    /// soft tokens: `[<bos>, (<boi>, <video> x n_f, <eoi>) for each frame,
+    /// <eos>]`, with no separator and no timestamps, which is
+    /// `EmbeddingGemma2Processor.replace_video_token` under
+    /// `add_timestamps = false` (the snapshot's setting) wrapped in the
+    /// tokenizer's `<bos>` and `<eos>`. Refused as [`Self::image_sequence`] is,
+    /// and for a video of no frames or a frame of no soft tokens.
+    pub fn video_sequence(&self, soft_per_frame: &[usize]) -> Result<Vec<u32>, String> {
+        const WHAT: &str = "video_sequence";
+        let t = &self.special_tokens;
+        let [bos, boi, video, eoi, eos] = SpecialTokens::all(
+            WHAT,
+            [
+                ("text_config.bos_token_id", t.bos),
+                ("boi_token_id", t.boi),
+                ("video_token_id", t.video),
+                ("eoi_token_id", t.eoi),
+                ("text_config.eos_token_id", t.eos),
+            ],
+        )?;
+        if soft_per_frame.is_empty() {
+            return Err(format!("{WHAT}: the video has no frames"));
+        }
+        if let Some(f) = soft_per_frame.iter().position(|&n| n == 0) {
+            return Err(format!("{WHAT}: frame {f} has no soft tokens"));
+        }
+        let len = soft_per_frame
+            .iter()
+            .try_fold(2usize, |acc, &n| acc.checked_add(n)?.checked_add(2))
+            .ok_or_else(|| format!("{WHAT}: the sequence length overflows"))?;
+        let mut ids = Vec::with_capacity(len);
+        ids.push(bos);
+        for &n in soft_per_frame {
+            ids.push(boi);
+            ids.resize(ids.len() + n, video);
+            ids.push(eoi);
+        }
+        ids.push(eos);
+        debug_assert_eq!(ids.len(), len);
+        Ok(ids)
     }
 
     fn framed(what: &str, head: [u32; 2], placeholder: u32, tail: [u32; 2], n_soft: usize) -> Result<Vec<u32>, String> {

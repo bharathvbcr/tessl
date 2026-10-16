@@ -7,8 +7,9 @@
 //! `model.safetensors`, and [`EmbedGemma2Multimodal::encode`] runs what the
 //! three already do, in the order the checkpoint's reference does:
 //!
-//! 1. every image of the call through the vision tower and every clip through
-//!    the audio tower (the soft tokens that replace an item's placeholder ids);
+//! 1. every image and video frame of the call through the vision tower and
+//!    every clip through the audio tower (the soft tokens that replace an
+//!    item's placeholder ids);
 //! 2. the items' ids, with those soft tokens in place of their placeholders,
 //!    through the text encoder ([`EmbedGemma2Model::encode_multimodal`]):
 //!    mean pool and normalize, one row per item, in the order given.
@@ -31,13 +32,21 @@
 //!   [`crate::embedgemma2::EmbedGemma2Config::image_sequence`] or
 //!   [`audio_sequence`](crate::embedgemma2::EmbedGemma2Config::audio_sequence)
 //!   of the tower's soft-token count.
+//! * [`MmItem::Video`]: one video as its sampled frames, each the processor's
+//!   patch tensors (what [`crate::embedgemma2_pre::preprocess_video`] makes).
+//!   Every frame goes through the vision tower, in the same batch as the call's
+//!   images, and its soft tokens are the rows of one `<boi> <video> x n <eoi>`
+//!   block; the sequence is
+//!   [`crate::embedgemma2::EmbedGemma2Config::video_sequence`] of the frames'
+//!   soft-token counts, which must be equal, as the processor's single
+//!   `num_soft_tokens_per_video` has it.
 //! * [`MmItem::Media`]: ids a caller built (a prompt around an image, an
-//!   image and a clip in one sequence) with the media their placeholders
-//!   stand for. The `j`-th image placeholder takes the `j`-th soft row of the
-//!   item's images laid end to end, and the audio placeholders likewise from
-//!   the item's clips, as transformers' `masked_scatter` does per modality. The
-//!   counts must match exactly. A video placeholder is refused: there is no
-//!   video tower.
+//!   image and a clip in one sequence, timestamps between a video's frames)
+//!   with the media their placeholders stand for. The `j`-th image placeholder
+//!   takes the `j`-th soft row of the item's images laid end to end, the video
+//!   placeholders likewise from the frames of its videos and the audio
+//!   placeholders from its clips, as transformers' `masked_scatter` does per
+//!   modality. The counts must match exactly.
 //!
 //! # Refusals
 //!
@@ -48,7 +57,10 @@
 //! `truncate_dim`, the batch size) and the facade's own (placeholder counts
 //! against soft-token counts). A refused call allocates nothing and waits for
 //! nothing. Media are numbered across the call in item order in the towers'
-//! messages (`image 2` is the third image of the call, not of its item).
+//! messages (`image 2` is the third image of the call, not of its item), and a
+//! video's frames are images to the vision tower: they are numbered with the
+//! images, in the order of the items, and count toward its batch limit
+//! ([`crate::embedgemma2_vision::MAX_IMAGES`], 256 images and frames per call).
 //!
 //! # Waiting
 //!
@@ -143,6 +155,12 @@ pub enum MmItem<'a> {
     Image(ImageInput<'a>),
     /// One clip, in the processor's sequence layout.
     Audio(&'a AudioInput),
+    /// One video, in the processor's sequence layout
+    /// ([`crate::embedgemma2::EmbedGemma2Config::video_sequence`]): its sampled
+    /// frames, each as the processor's patch tensors, in order. Every frame
+    /// must make the same number of soft tokens, as the processor's single
+    /// `num_soft_tokens_per_video` has it.
+    Video(&'a [ImageInput<'a>]),
     /// Caller-built ids and the media their placeholders stand for.
     Media {
         /// The ids, placeholders included.
@@ -151,12 +169,20 @@ pub enum MmItem<'a> {
         images: &'a [ImageInput<'a>],
         /// The clips whose soft tokens fill the audio placeholders, in order.
         audio: &'a [AudioInput],
+        /// The videos, each as its frames, whose soft tokens fill the video
+        /// placeholders, the frames of all of them laid end to end in order
+        /// (what a caller needs to place timestamps between frames: the ids
+        /// are theirs).
+        videos: &'a [&'a [ImageInput<'a>]],
     },
 }
 
-/// Where an item's media sit in the call's flat image and clip lists.
+/// Where an item's media sit in the call's flat picture and clip lists. The
+/// pictures are the vision tower's inputs: an item's images, then the frames
+/// of its videos.
 struct Span {
     images: Range<usize>,
+    frames: Range<usize>,
     clips: Range<usize>,
 }
 
@@ -284,25 +310,47 @@ impl EmbedGemma2Multimodal {
         let cfg = self.text.config();
         let tokens = self.tokens;
 
-        // The call's media, flat, with where each item's sit.
+        // The call's media, flat, with where each item's sit. The vision
+        // tower's inputs are one list: every image, and every frame of every
+        // video, so a call queues one tower batch whatever it holds.
         let mut images: Vec<ImageInput<'_>> = Vec::new();
         let mut clips: Vec<&AudioInput> = Vec::new();
         let mut spans: Vec<Span> = Vec::with_capacity(items.len());
         for item in items {
             let (i0, c0) = (images.len(), clips.len());
-            match item {
-                MmItem::Text(_) => {}
-                MmItem::Image(img) => images.push(*img),
-                MmItem::Audio(clip) => clips.push(*clip),
+            // Where the item's images end and its video frames begin.
+            let frames_from = match item {
+                MmItem::Text(_) => i0,
+                MmItem::Image(img) => {
+                    images.push(*img);
+                    images.len()
+                }
+                MmItem::Audio(clip) => {
+                    clips.push(*clip);
+                    i0
+                }
+                MmItem::Video(frames) => {
+                    images.extend_from_slice(frames);
+                    i0
+                }
                 MmItem::Media {
-                    images: im, audio: au, ..
+                    images: im,
+                    audio: au,
+                    videos,
+                    ..
                 } => {
                     images.extend_from_slice(im);
+                    let frames_from = images.len();
+                    for frames in *videos {
+                        images.extend_from_slice(frames);
+                    }
                     clips.extend(au.iter());
+                    frames_from
                 }
-            }
+            };
             spans.push(Span {
-                images: i0..images.len(),
+                images: i0..frames_from,
+                frames: frames_from..images.len(),
                 clips: c0..clips.len(),
             });
         }
@@ -326,6 +374,19 @@ impl EmbedGemma2Multimodal {
                 MmItem::Media { ids, .. } => Cow::Borrowed(*ids),
                 MmItem::Image(_) => Cow::Owned(cfg.image_sequence(image_tokens[span.images.start]).map_err(at)?),
                 MmItem::Audio(_) => Cow::Owned(cfg.audio_sequence(clip_tokens[span.clips.start]).map_err(at)?),
+                MmItem::Video(_) => {
+                    let per_frame = &image_tokens[span.frames.clone()];
+                    // The processor has one soft-token count per video.
+                    if let Some(j) = per_frame.iter().position(|&n| n != per_frame[0]) {
+                        return Err(format!(
+                            "{WHAT}: item {b}: frame {j} makes {} soft tokens but frame 0 makes {}; the \
+                             processor lays out one count for a video (MmItem::Media takes frames of \
+                             different sizes with ids of your own)",
+                            per_frame[j], per_frame[0]
+                        ));
+                    }
+                    Cow::Owned(cfg.video_sequence(per_frame).map_err(at)?)
+                }
             });
         }
         let id_refs: Vec<&[u32]> = ids.iter().map(AsRef::as_ref).collect();
@@ -335,6 +396,7 @@ impl EmbedGemma2Multimodal {
             let count = |id: u32| id_refs[b].iter().filter(|&&t| t == id).count();
             let (n_image, n_audio, n_video) = (count(tokens.image), count(tokens.audio), count(tokens.video));
             let have_image: usize = image_tokens[span.images.clone()].iter().sum();
+            let have_video: usize = image_tokens[span.frames.clone()].iter().sum();
             let have_audio: usize = clip_tokens[span.clips.clone()].iter().sum();
             if matches!(item, MmItem::Text(_)) && n_image + n_audio + n_video > 0 {
                 return Err(format!(
@@ -346,10 +408,12 @@ impl EmbedGemma2Multimodal {
                     tokens.video
                 ));
             }
-            if n_video > 0 {
+            if n_video != have_video {
                 return Err(format!(
-                    "{WHAT}: item {b} has {n_video} video placeholder ids (id {}); there is no video tower",
-                    tokens.video
+                    "{WHAT}: item {b} has {n_video} video placeholder ids (id {}) but its {} video frame(s) make \
+                     {have_video} soft tokens",
+                    tokens.video,
+                    span.frames.len()
                 ));
             }
             if n_image != have_image {
@@ -410,6 +474,7 @@ impl EmbedGemma2Multimodal {
                         ids,
                         &tokens,
                         &image_soft[span.images.clone()],
+                        &image_soft[span.frames.clone()],
                         &clip_soft[span.clips.clone()],
                     )
                     .map_err(|e| format!("{WHAT}: item {b}: {e}")),
@@ -455,17 +520,24 @@ impl EmbedGemma2Multimodal {
 
 /// An item's soft rows as device segments, in the order of its placeholder
 /// ids: the `j`-th image placeholder takes the `j`-th row of the item's
-/// images laid end to end, the audio placeholders likewise from its clips
-/// (`masked_scatter` per modality). Consecutive rows of one buffer are one
-/// segment, so an item with one image or clip is one segment per run the
-/// tower wrote, however its placeholders interleave with text.
+/// images laid end to end, the video placeholders likewise from its video
+/// frames (the vision tower's rows, one segment per frame) and the audio
+/// placeholders from its clips (`masked_scatter` per modality). Consecutive
+/// rows of one buffer are one segment, so an item with one image or clip is
+/// one segment per run the tower wrote, however its placeholders interleave
+/// with text, and the frames of a video that one tower forward made are one
+/// segment per placeholder run.
 fn item_segments(
     ids: &[u32],
     tokens: &MmTokens,
     images: &[SoftSegment],
+    frames: &[SoftSegment],
     clips: &[Vec<SoftSegment>],
 ) -> Result<Vec<SoftSegment>, String> {
     let mut img = images
+        .iter()
+        .flat_map(|s| (s.row..s.row + s.rows).map(move |r| (&s.buf, r)));
+    let mut vid = frames
         .iter()
         .flat_map(|s| (s.row..s.row + s.rows).map(move |r| (&s.buf, r)));
     let mut aud = clips
@@ -476,6 +548,8 @@ fn item_segments(
     for &id in ids {
         let next = if id == tokens.image {
             img.next()
+        } else if id == tokens.video {
+            vid.next()
         } else if id == tokens.audio {
             aud.next()
         } else {
@@ -491,7 +565,7 @@ fn item_segments(
             }),
         }
     }
-    if img.next().is_some() || aud.next().is_some() {
+    if img.next().is_some() || vid.next().is_some() || aud.next().is_some() {
         return Err("more soft rows than placeholder ids".to_string());
     }
     Ok(out)

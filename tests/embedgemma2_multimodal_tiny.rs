@@ -271,6 +271,7 @@ fn media_items_take_each_modality_in_placeholder_order() {
                 ids: &ids,
                 images: &imgs,
                 audio: &clips,
+                videos: &[],
             };
             let (got, t) = traced(|| m.encode(&[item], None).unwrap());
             assert_eq!(bits(&got.embeddings), bits(&want), "{operands:?}");
@@ -285,6 +286,7 @@ fn media_items_take_each_modality_in_placeholder_order() {
                         ids: &ids,
                         images: &swapped,
                         audio: &clips,
+                        videos: &[],
                     }],
                     None,
                 )
@@ -304,6 +306,7 @@ fn media_items_take_each_modality_in_placeholder_order() {
                         ids: &one,
                         images: &imgs[..1],
                         audio: &[],
+                        videos: &[],
                     }],
                     None,
                 )
@@ -344,6 +347,7 @@ fn a_mixed_batch_equals_each_item_alone() {
                     ids: &ids,
                     images: &imgs,
                     audio: &[],
+                    videos: &[],
                 },
                 MmItem::Image(md.images[3].input()),
                 MmItem::Audio(&md.clips[1]),
@@ -625,6 +629,7 @@ fn refusals_do_no_gpu_work_and_leave_the_facade_usable() {
                     ids: &too_few,
                     images: &imgs,
                     audio: &[],
+                    videos: &[],
                 }],
                 None,
                 "image placeholder ids",
@@ -635,6 +640,7 @@ fn refusals_do_no_gpu_work_and_leave_the_facade_usable() {
                     ids: &too_many,
                     images: &imgs,
                     audio: &[],
+                    videos: &[],
                 }],
                 None,
                 "image placeholder ids",
@@ -645,6 +651,7 @@ fn refusals_do_no_gpu_work_and_leave_the_facade_usable() {
                     ids: &no_media,
                     images: &[],
                     audio: &[],
+                    videos: &[],
                 }],
                 None,
                 "has 1 image placeholder ids",
@@ -655,6 +662,7 @@ fn refusals_do_no_gpu_work_and_leave_the_facade_usable() {
                     ids: &with_audio_ph,
                     images: &[],
                     audio: &[],
+                    videos: &[],
                 }],
                 None,
                 "audio placeholder ids",
@@ -665,19 +673,21 @@ fn refusals_do_no_gpu_work_and_leave_the_facade_usable() {
                     ids: &audio_for_none,
                     images: &imgs,
                     audio: &[],
+                    videos: &[],
                 }],
                 None,
                 "image placeholder ids",
             ),
             (
-                "a video placeholder",
+                "a video placeholder without frames",
                 vec![MmItem::Media {
                     ids: &with_video,
                     images: &[],
                     audio: &[],
+                    videos: &[],
                 }],
                 None,
-                "no video tower",
+                "has 1 video placeholder ids",
             ),
             (
                 "a bad image after a good one",

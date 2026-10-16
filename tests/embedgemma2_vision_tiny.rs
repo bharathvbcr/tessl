@@ -63,12 +63,13 @@
 
 mod common;
 
+use common::embedgemma2::{pack_safetensors, RawTensor};
+use common::embedgemma2_mm::{vision_weights, TowerWeight, VisionStorage};
 use common::embedgemma2_vision::{vision_forward, VisionDims, VisionRef};
 use common::{with_gpu, SplitMix};
 use tessl::embedgemma2_vision::{EmbedGemma2VisionModel, ImageInput, VisionConfig, MAX_BATCH_PATCHES};
 use tessl::gemm::GemmOperands;
 use tessl::safetensors::SafeTensors;
-use tessl::tensor::{bf16_bits_to_f32, f32_slice_to_bf16};
 
 const LAYER_REL: f64 = 1e-4;
 const SOFT_ABS: f64 = 1e-4;
@@ -88,17 +89,9 @@ const CONFIG: &str = r#"{"model_type":"embedding_gemma2",
 "attention_bias":false,"attention_dropout":0.0,"standardize":false,"use_clipped_linears":false,
 "rope_parameters":{"rope_theta":100.0,"rope_type":"axial"}}}"#;
 
-/// A tensor of the tiny checkpoint: full name, shape, values. `bf16` tensors
-/// are stored as bf16 and kept here already rounded to it.
-#[derive(Clone)]
-struct Weight {
-    name: String,
-    shape: Vec<usize>,
-    data: Vec<f64>,
-    bf16: bool,
-}
-
-struct Weights(Vec<Weight>);
+/// The tiny checkpoint's tensors (`common::embedgemma2_mm::vision_weights`),
+/// with the values the device reads for the host reference.
+struct Weights(Vec<TowerWeight>);
 
 impl Weights {
     fn get(&self, name: &str) -> &[f64] {
@@ -127,155 +120,38 @@ fn dims(cfg: &VisionConfig) -> VisionDims {
 }
 
 /// A random checkpoint. The patch projection and the position table are bf16, as the
-/// real one stores them; with `all_bf16` so is every other projection (the
-/// real checkpoint stores them all bf16), which `GemmOperands::Bf16` needs.
+/// real one stores them; with `all_bf16` so is every projection (the real
+/// checkpoint stores them all bf16), which `GemmOperands::Bf16` needs. The
+/// norm weights are f32 in both.
 fn random_weights(cfg: &VisionConfig, seed: u64, all_bf16: bool) -> Weights {
-    let mut r = SplitMix::new(seed);
-    let mut out = Vec::new();
-    let mut push = |name: String, shape: Vec<usize>, scale: f64, offset: f64, bf16: bool| {
-        let n: usize = shape.iter().product();
-        let mut data: Vec<f64> = (0..n).map(|_| offset + f64::from(r.unit()) * scale).collect();
-        if bf16 {
-            let bits = f32_slice_to_bf16(&data.iter().map(|&v| v as f32).collect::<Vec<_>>());
-            data = bits.iter().map(|&b| f64::from(bf16_bits_to_f32(b))).collect();
-        }
-        out.push(Weight {
-            name,
-            shape,
-            data,
-            bf16,
-        });
-    };
-    let (h, inter, pd, d) = (
-        cfg.hidden as usize,
-        cfg.intermediate as usize,
-        cfg.patch_dim() as usize,
-        cfg.head_dim as usize,
-    );
-    let qw = (cfg.heads * cfg.head_dim) as usize;
-    let lin_scale = |fan_in: usize| (fan_in as f64).powf(-0.5);
-    // Patch pixels are in [-1, 1] after scaling; unit-scale projection keeps h O(1).
-    push(
-        "vision_tower.patch_embedder.input_proj.weight".into(),
-        vec![h, pd],
-        lin_scale(pd),
-        0.0,
-        true,
-    );
-    push(
-        "vision_tower.patch_embedder.position_embedding_table".into(),
-        vec![2, cfg.position_embedding_size as usize, h],
-        0.5,
-        0.0,
-        true,
-    );
-    for i in 0..cfg.layers {
-        let p = |n: &str| format!("vision_tower.encoder.layers.{i}.{n}");
-        for n in [
-            "input_layernorm",
-            "post_attention_layernorm",
-            "pre_feedforward_layernorm",
-            "post_feedforward_layernorm",
-        ] {
-            push(p(&format!("{n}.weight")), vec![h], 0.3, 1.0, false);
-        }
-        for n in ["q_proj", "k_proj", "v_proj"] {
-            push(
-                p(&format!("self_attn.{n}.linear.weight")),
-                vec![qw, h],
-                lin_scale(h),
-                0.0,
-                all_bf16,
-            );
-        }
-        push(
-            p("self_attn.o_proj.linear.weight"),
-            vec![h, qw],
-            lin_scale(qw),
-            0.0,
-            all_bf16,
-        );
-        // Scale 1.0 attention over RMS-normed d-wide heads: weights near
-        // d^-0.25 keep q.k O(1), so the softmax spreads over the keys.
-        let qk = (d as f64).powf(-0.25);
-        push(p("self_attn.q_norm.weight"), vec![d], 0.3 * qk, qk, false);
-        push(p("self_attn.k_norm.weight"), vec![d], 0.3 * qk, qk, false);
-        push(
-            p("mlp.gate_proj.linear.weight"),
-            vec![inter, h],
-            lin_scale(h),
-            0.0,
-            all_bf16,
-        );
-        push(
-            p("mlp.up_proj.linear.weight"),
-            vec![inter, h],
-            lin_scale(h),
-            0.0,
-            all_bf16,
-        );
-        push(
-            p("mlp.down_proj.linear.weight"),
-            vec![h, inter],
-            lin_scale(inter),
-            0.0,
-            all_bf16,
-        );
-    }
-    push(
-        "embed_vision.embedding_projection.weight".into(),
-        vec![cfg.text_hidden as usize, h],
-        lin_scale(h),
-        0.0,
-        all_bf16,
-    );
-    Weights(out)
+    Weights(vision_weights(
+        cfg,
+        seed,
+        VisionStorage {
+            projections_bf16: all_bf16,
+            norms_bf16: false,
+        },
+    ))
 }
 
 /// safetensors bytes: every weight, plus `extra` tensors named as given (f32
 /// zeros of the given shape), minus the ones named in `skip`.
 fn safetensors_bytes(w: &Weights, extra: &[(&str, &[usize])], skip: &[&str]) -> Vec<u8> {
-    let mut entries: Vec<(String, &str, Vec<usize>, Vec<u8>)> = Vec::new();
-    for t in w.0.iter().filter(|t| !skip.contains(&t.name.as_str())) {
-        let bytes: Vec<u8> = if t.bf16 {
-            f32_slice_to_bf16(&t.data.iter().map(|&v| v as f32).collect::<Vec<_>>())
-                .iter()
-                .flat_map(|b| b.to_le_bytes())
-                .collect()
-        } else {
-            t.data.iter().flat_map(|&v| (v as f32).to_le_bytes()).collect()
-        };
-        entries.push((
-            t.name.clone(),
-            if t.bf16 { "BF16" } else { "F32" },
-            t.shape.clone(),
-            bytes,
-        ));
-    }
+    let mut tensors: Vec<RawTensor> =
+        w.0.iter()
+            .filter(|t| !skip.contains(&t.name.as_str()))
+            .map(TowerWeight::raw)
+            .collect();
     for &(name, shape) in extra {
         let n: usize = shape.iter().product();
-        entries.push((name.to_string(), "F32", shape.to_vec(), vec![0u8; n * 4]));
+        tensors.push(RawTensor {
+            name: name.to_string(),
+            dtype: "F32",
+            shape: shape.to_vec(),
+            bytes: vec![0u8; n * 4],
+        });
     }
-    let mut header = String::from("{");
-    let mut data = Vec::new();
-    for (i, (name, dtype, shape, bytes)) in entries.iter().enumerate() {
-        let shape: Vec<String> = shape.iter().map(usize::to_string).collect();
-        if i > 0 {
-            header.push(',');
-        }
-        header.push_str(&format!(
-            "\"{name}\":{{\"dtype\":\"{dtype}\",\"shape\":[{}],\"data_offsets\":[{},{}]}}",
-            shape.join(","),
-            data.len(),
-            data.len() + bytes.len()
-        ));
-        data.extend_from_slice(bytes);
-    }
-    header.push('}');
-    let mut out = (header.len() as u64).to_le_bytes().to_vec();
-    out.extend_from_slice(header.as_bytes());
-    out.extend_from_slice(&data);
-    out
+    pack_safetensors(&tensors)
 }
 
 fn open(tag: &str, bytes: Vec<u8>) -> SafeTensors {

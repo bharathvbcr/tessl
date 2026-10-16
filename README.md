@@ -214,7 +214,7 @@ flowchart TD
 ```
 
 - **`BufferKind::Hot`**: Persistent allocations (model weights, optimizer state, KV cache banks). Added to the `MTLResidencySet` once at initialization and retained across steps. Retired via `pending_retirement` on `Drop` after GPU in-flight completion.
-- **`BufferKind::Cold`**: Intermediate activations. Managed via an active freelist pool with a default 2 GiB cap (`DEFAULT_POOL_CACHE_BYTES`). Unused slabs are evicted via `removeAllocation` upon command buffer completion (`pending_cold_recycle`).
+- **`BufferKind::Cold`**: Intermediate activations. Managed via an active freelist pool with a default 2 GiB cap (`DEFAULT_POOL_CACHE_BYTES`). Unused slabs are evicted via `removeAllocation` upon command buffer completion (`pending_cold_recycle`). A buffer dropped after a wait is also released by the next allocation, when no command buffer is open and the GPU has finished everything submitted, so it serves that allocation without a commit in between.
 - **`BufferKind::Bump`**: Ephemeral scratch memory allocated linearly from pre-committed slabs. Bump cursors are reset at synchronization points without individual buffer deallocations.
 - **`BufferKind::External`**: Caller-owned `MTLBuffer` allocations wrapped through [`Tensor::from_mtl_buffer`](https://docs.rs/tessl). Stays resident in the working set without entering the cold freelist upon drop.
 - **Constant Arena (16 MiB)**: Eliminates per-dispatch host allocation overhead for scalars and small metadata buffers by writing directly into a shared staging buffer at 16-byte aligned offsets into the 31-slot argument table.

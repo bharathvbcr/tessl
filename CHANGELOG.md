@@ -792,6 +792,29 @@ All notable changes to `tessl` are recorded here. The format follows
 
 ### Changed
 
+- **EmbeddingGemma 2's device peak is 400 MiB above the model at 8192 rows,
+  not 1472** (audit gap G6; `bench/results/embedgemma2_memory_m5pro.{txt,json,png}`).
+  Three changes, no output bit moved (hashes of the real checkpoint's embeddings
+  and the tiny model's, in both `GemmOperands` modes, equal 16f5190's), and no
+  slowdown the shared machine's noise lets through (min-of-N against 16f5190
+  0.86 to 1.05 over three paired series; the run-to-run spread there, 1.2 to 28,
+  is too wide to verify a 3 % bound, and the results file says so; the
+  per-layer-input bound alone, measured on one binary, is 0.96 to 1.03):
+  `encode` hands its activations and each forward's uploaded inputs to the
+  runtime before its one wait, so that wait recycles them and the next call's
+  allocations find them (they were recycled a call late, and two sets were
+  live across consecutive calls); `PLE_RUN_BYTES` is 16 MiB, not 256 (a run
+  is one layer's inputs from 8192 rows, `-240 MiB` a set); and the `q|k|v`
+  GEMM's output shares a buffer with the MLP's `gate | up` (`-96 MiB`). One
+  encode and four back to back now peak at the same figure: 400.3 to 400.6 MiB
+  at 32x256, 8x1024 and 2x4096 (736 and 1472 before), 112.9 MiB at 64x32 (433),
+  2.0 MiB at 1x16 (4.25); Bf16 392.4 at 8x1024 (1456.4). The towers' `encode`s
+  still hold their activations across the wait (see the audit). New:
+  `tests/embedgemma2_memory.rs` (consecutive calls hold one set; one encode's
+  device bytes equal the itemized set to the byte, both modes; an ignored
+  hash printer), a `ple_run_elements` unit test, `profile_embedgemma2`'s
+  `memory-table`, `hash` and `PROFILE_OPERANDS`, and `bench_embedgemma2`'s
+  `BENCH_PLE_RUN_BYTES`.
 - **GDN training reads q/k/v where the model keeps them.**
   `gdn_train_forward_windowed` / `gdn_train_backward_windowed` take `(ld, off)`
   column windows of the conv output and write `dq`/`dk`/`dv` back the same way,

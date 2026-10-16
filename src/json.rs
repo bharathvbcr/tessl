@@ -16,10 +16,15 @@ pub(crate) enum Json {
     Array(Vec<Json>),
     Str(String),
     /// A number, with its exact value when it is a non-negative integer that
-    /// fits `u64`.
+    /// fits `u64`. `integral` says it was written without a fraction or an
+    /// exponent (`-5` and `5` are, `5.0` and `5e0` are not), and `int` holds
+    /// that integer exactly, negative ones included, when it fits `i128`, for a
+    /// reader that has to tell `5` from `5.0` and write it back as it was.
     Num {
         value: f64,
         uint: Option<u64>,
+        integral: bool,
+        int: Option<i128>,
     },
     Bool(bool),
     Null,
@@ -193,10 +198,14 @@ impl Parser<'_> {
         }
         let int_start = self.i;
         let mut uint: Option<u64> = Some(0);
+        let mut magnitude: Option<i128> = Some(0);
         while let Some(&c @ b'0'..=b'9') = self.s.get(self.i) {
             uint = uint
                 .and_then(|v| v.checked_mul(10))
                 .and_then(|v| v.checked_add(u64::from(c - b'0')));
+            magnitude = magnitude
+                .and_then(|v| v.checked_mul(10))
+                .and_then(|v| v.checked_add(i128::from(c - b'0')));
             self.i += 1;
         }
         let digits = self.i - int_start;
@@ -249,7 +258,17 @@ impl Parser<'_> {
             ));
         }
         let uint = if integral && !negative { uint } else { None };
-        Ok(Json::Num { value, uint })
+        let int = if integral {
+            magnitude.map(|m| if negative { -m } else { m })
+        } else {
+            None
+        };
+        Ok(Json::Num {
+            value,
+            uint,
+            integral,
+            int,
+        })
     }
 
     fn string(&mut self) -> Result<String, String> {
@@ -356,17 +375,50 @@ mod tests {
 
     #[test]
     fn numbers_follow_the_rfc_grammar() {
-        for (text, value, uint) in [
-            ("0", 0.0, Some(0)),
-            ("-0", -0.0, None),
-            ("10000000", 1e7, Some(10_000_000)),
-            ("1e-06", 1e-6, None),
-            ("0.25", 0.25, None),
-            ("-1.5E+3", -1500.0, None),
-            ("18446744073709551615", 18446744073709551615.0, Some(u64::MAX)),
-            ("18446744073709551616", 18446744073709551616.0, None),
+        // (text, value, uint, integral, int)
+        for (text, value, uint, integral, int) in [
+            ("0", 0.0, Some(0), true, Some(0)),
+            ("-0", -0.0, None, true, Some(0)),
+            ("-5", -5.0, None, true, Some(-5)),
+            ("5.0", 5.0, None, false, None),
+            ("5e0", 5.0, None, false, None),
+            ("10000000", 1e7, Some(10_000_000), true, Some(10_000_000)),
+            ("1e-06", 1e-6, None, false, None),
+            ("0.25", 0.25, None, false, None),
+            ("-1.5E+3", -1500.0, None, false, None),
+            (
+                "18446744073709551615",
+                18446744073709551615.0,
+                Some(u64::MAX),
+                true,
+                Some(i128::from(u64::MAX)),
+            ),
+            (
+                "18446744073709551616",
+                18446744073709551616.0,
+                None,
+                true,
+                Some(i128::from(u64::MAX) + 1),
+            ),
+            (
+                "-170141183460469231731687303715884105728",
+                -170141183460469231731687303715884105728.0,
+                None,
+                true,
+                None,
+            ),
+            ("1000000000000000000000000000000000000000", 1e39, None, true, None),
         ] {
-            assert_eq!(num(text).unwrap(), Json::Num { value, uint }, "{text}");
+            assert_eq!(
+                num(text).unwrap(),
+                Json::Num {
+                    value,
+                    uint,
+                    integral,
+                    int
+                },
+                "{text}"
+            );
         }
         for bad in [
             "01", "1.", ".5", "1e", "1e+", "-", "+1", "--1", "1.e3", "0x10", "NaN", "1e400",

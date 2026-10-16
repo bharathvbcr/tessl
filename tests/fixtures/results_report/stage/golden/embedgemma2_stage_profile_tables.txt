@@ -1,0 +1,89 @@
+Whole forward: replica (async, forwards queued) against EmbedGemma2Model::encode, and the sum of its stages
+  workload    rows  replica ms           per-pass min  encode() ms  sum(stages) ms  sum/replica
+  1x16          16        7.86                7.9 8.0         0.30            8.21      104.5%
+  64x32       2048        0.30 0.3 12345678901234568.0       112.22          120.51    40168.5%
+
+Ranking by stage group: ms per forward (best over passes) and % of the replica's forward
+  group                                                          1x16            64x32
+  down GEMM                                               2.21  28.1%     16.29 5430.4%
+  per-layer-input GEMMs (proj, ple_gate, ple_out)         1.60  20.4%     16.83 5610.9%
+  gate|up GEMM                                            1.14  14.5%     36.97 12324.4%
+  qkv GEMMs (sliding + global)                            0.94  12.0%     20.33 6776.4%
+  o GEMMs (sliding + global)                              0.68   8.7%      3.81 1269.5%
+  rms_norm x48 + norm-residual x72                        0.50   6.4%      6.95 2317.8%
+  attention sliding (hd256)                               0.27   3.5%      2.97 989.6%
+  per-layer-input scale+norm, gelu*input                  0.23   2.9%      4.22 1407.9%
+  qk-norm + rope + kv store                               0.20   2.6%      4.34 1446.9%
+  gelu*up (mlp)                                           0.16   2.1%      5.82 1938.8%
+  gather, final norm, pool, projection, l2                0.14   1.7%      1.67 555.8%
+  attention global (hd512)                                0.13   1.7%      0.30 100.0%
+
+Top 5 groups at each workload
+  1x16     down GEMM 28.1%; per-layer-input GEMMs (proj, ple_gate, ple_out) 20.4%; gate|up GEMM 14.5%; qkv GEMMs (sliding + global) 12.0%; o GEMMs (sliding + global) 8.7%
+  64x32    gate|up GEMM 12324.4%; qkv GEMMs (sliding + global) 6776.4%; per-layer-input GEMMs (proj, ple_gate, ple_out) 5610.9%; down GEMM 5430.4%; rms_norm x48 + norm-residual x72 2317.8%
+
+Per class, 1x16 (16 rows, 369 dispatches per forward); only = that class alone, best over passes [lowest, highest per-pass minimum]
+  class                              disp   only ms % of fwd       pass range  us/disp   GB/s  TFLOP/s
+  down GEMM                            24     2.209    28.1%    2.209-2.299       92.0     47     0.36
+  gate|up GEMM                         24     1.140    14.5%    1.140-1.169       47.5    183     1.41
+  qkv GEMM sliding                     20     0.718     9.1%    0.718-0.752       35.9    121     0.93
+  ple_out GEMM                         24     0.695     8.8%    0.695-0.710       29.0     38     0.29
+  ple_gate GEMM                        24     0.686     8.7%    0.686-0.700       28.6     39     0.29
+  o GEMM global                         4     0.380     4.8%    0.380-0.437       95.0     46     0.35
+  o GEMM sliding                       20     0.300     3.8%    0.300-1.044       15.0    146     1.12
+  attention sliding (hd256)            20     0.274     3.5%    0.274-0.295       13.7     14     0.08
+  qkv GEMM global                       4     0.223     2.8%    0.223-0.230       55.8    117     0.90
+  PLE projection GEMM (NT)              1     0.218     2.8%    0.218-0.272      218.1    119     0.92
+  qk-norm+rope+kv store                24     0.201     2.6%    0.201-0.210        8.4     34      nan
+  rms_norm (input, pre-ffn)            48     0.178     2.3%    0.178-0.187        3.7     18      nan
+  gelu*up (mlp)                        24     0.164     2.1%    0.164-0.188        6.8     58      nan
+  ple gelu*input                       24     0.138     1.8%    0.138-0.146        5.7     17      nan
+  attention global (hd512)              4     0.134     1.7%    0.134-0.146       33.6     10     0.06
+  norm+residual (post-attn)            24     0.124     1.6%    0.124-0.133        5.2     19      nan
+  norm+residual (post-ffn)             24     0.115     1.5%    0.115-0.884        4.8     20      nan
+  tail (final norm, pool, proj, l2)     4     0.105     1.3%    0.105-0.108       26.2     16     0.01
+  PLE scale+norm                        2     0.092     1.2%    0.092-0.108       46.0     34      nan
+  norm+residual*scalar (post-ple)      24     0.084     1.1%    0.084-0.132        3.5     28      nan
+  gather+copy                           2     0.032     0.4%    0.032-0.080       15.9      4      nan
+
+Per class, 64x32 (2048 rows, 369 dispatches per forward); only = that class alone, best over passes [lowest, highest per-pass minimum]
+  class                              disp   only ms % of fwd       pass range  us/disp   GB/s  TFLOP/s
+  gate|up GEMM                         24    36.973 12324.4%   36.973-127.621   1540.5     30     5.58
+  down GEMM                            24    16.291  5430.4%   16.291-17.324     678.8     37     6.33
+  qkv GEMM sliding                     20    15.141  5047.2%   15.141-16.018     757.1     33     5.67
+  PLE projection GEMM (NT)              1     5.947  1982.2%    5.947-6.038     5946.7     22     4.33
+  gelu*up (mlp)                        24     5.816  1938.8%    5.816-5.919      242.4    208      nan
+  ple_out GEMM                         24     5.535  1845.1%    5.535-6.000      230.6     41     4.66
+  ple_gate GEMM                        24     5.351  1783.5%    5.351-5.601      222.9     42     4.82
+  qkv GEMM global                       4     5.188  1729.3%    5.188-5.239     1296.9     27     4.97
+  qk-norm+rope+kv store                24     4.341  1446.9%    4.341-4.767      180.9    201      nan
+  o GEMM global                         4     3.809  1269.5%    3.809-3.929      952.1     26     4.51
+  attention sliding (hd256)            20     2.969   989.6%    2.969-3.065      148.4    170     1.81
+  PLE scale+norm                        2     2.512   837.4%    2.512-2.619     1256.2    160      nan
+  rms_norm (input, pre-ffn)            48     2.407   802.4%    2.407-2.495       50.1    167      nan
+  norm+residual (post-ffn)             24     1.910   636.6%    1.910-2.064       79.6    158      nan
+  ple gelu*input                       24     1.711   570.4%    1.711-2.537       71.3    176      nan
+  norm+residual*scalar (post-ple)      24     1.572   524.0%    1.572-1.685       65.5    192      nan
+  norm+residual (post-attn)            24     1.065   354.8%    1.065-1.520       44.4    284      nan
+  tail (final norm, pool, proj, l2)     4     0.844   281.4%    0.844-1.032      211.0     17     0.06
+  gather+copy                           2     0.823   274.5%    0.823-0.949      411.7     18      nan
+  attention global (hd512)              4     0.300   100.0%    0.300-1.588       75.0    559     7.16
+  o GEMM sliding                       20     0.000     0.0%    0.000-7.900        0.0 35788667 5235370.77
+
+Ablation cross-check, pass stages_p3, 1x16: full 8.0 ms; for the six largest stages, full - skip against the stage alone
+    down GEMM                          alone     2.30   full-skip     2.19
+    gate|up GEMM                       alone     1.17   full-skip     0.96
+    o GEMM sliding                     alone     1.04   full-skip     0.94
+    norm+residual (post-ffn)           alone     0.88   full-skip    -0.13
+    qkv GEMM sliding                   alone     0.75   full-skip     0.59
+    ple_out GEMM                       alone     0.71   full-skip     0.70
+    sum over all 21 stages of full-skip: 15.1 ms = 188% of full
+Ablation cross-check, pass stages_p3, 64x32: full 12345678901234568.0 ms; for the six largest stages, full - skip against the stage alone
+    gate|up GEMM                       alone    36.97   full-skip 12345678901234488.00
+    down GEMM                          alone    17.32   full-skip 12345678901234468.00
+    qkv GEMM sliding                   alone    15.14   full-skip 12345678901234468.00
+    o GEMM sliding                     alone     7.90   full-skip 12345678901234460.00
+    PLE projection GEMM (NT)           alone     6.04   full-skip 12345678901234568.00
+    gelu*up (mlp)                      alone     5.82   full-skip 12345678901234458.00
+    sum over all 21 stages of full-skip: 259259256925923712.0 ms = 2100% of full
+

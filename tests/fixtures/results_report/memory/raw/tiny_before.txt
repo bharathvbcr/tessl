@@ -1,0 +1,6 @@
+TINY ExactF32 three 7d9a58743d139661
+TINY ExactF32 ragged e5b660fded3b14cb
+TINY ExactF32 three-trunc48 c40f6431c8fd6122
+TINY Bf16 three 82a22b39f0392f8e
+TINY Bf16 ragged 6e9c7c3abf39976b
+TINY Bf16 three-trunc48 6b8f6505f013e97b

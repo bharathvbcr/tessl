@@ -366,7 +366,9 @@ fn parse_metrics(lane: &str, stdout: &str) -> Res<LaneRun> {
 fn scalar_text(v: &Json) -> Option<String> {
     match v {
         Json::Str(s) => Some(s.clone()),
-        Json::Num { value, uint: Some(u) } if value.is_finite() => Some(u.to_string()),
+        Json::Num {
+            value, uint: Some(u), ..
+        } if value.is_finite() => Some(u.to_string()),
         Json::Num { value, .. } if value.is_finite() => Some(value.to_string()),
         _ => None,
     }

@@ -1,0 +1,13 @@
+diff --git a/kernels/attn_rows.h b/kernels/attn_rows.h
+index f543207..6dc2448 100644
+--- a/kernels/attn_rows.h
++++ b/kernels/attn_rows.h
+@@ -50,7 +50,7 @@ inline void attn_rows_step(
+     const float s = live ? part * scale : -FLT_MAX;
+     const float m_new = max(m_i, s);
+     const float alpha = (l_i > 0.0f) ? exp(m_i - m_new) : 0.0f;
+-    const float p = live ? exp(s - m_new) : 0.0f;
++    const float p = exp(s - m_new);
+     for (uint j = 0; j < DPV; ++j) {
+         acc[j] = acc[j] * alpha + p * V4[dl + j * R];
+     }

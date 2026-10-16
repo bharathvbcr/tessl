@@ -1,0 +1,13 @@
+diff --git a/kernels/attn_tiled.h b/kernels/attn_tiled.h
+index 88c95ad..42cb6e8 100644
+--- a/kernels/attn_tiled.h
++++ b/kernels/attn_tiled.h
+@@ -172,7 +172,7 @@ inline void attn_tiled_body(
+     // backward treats as "no probability anywhere in this row".
+     if (lse != nullptr && tid < nq) {
+         const float l = l_row[tid];
+-        lse[(ulong)bh * Tq + q0 + tid] = (l > 0.0f) ? m_row[tid] + precise::log(l) : FLT_MAX;
++        lse[(ulong)bh * Tq + q0 + tid] = (l > 0.0f) ? m_row[tid] + l : FLT_MAX;
+     }
+     if (out_bf16 != 0u) {
+         auto mO = tensor((device bfloat *)O + q_base, dextents<int, 2>{D, (int)Tq},

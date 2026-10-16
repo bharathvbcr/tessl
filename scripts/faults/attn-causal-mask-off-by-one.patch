@@ -1,0 +1,13 @@
+diff --git a/kernels/attn_tiled.h b/kernels/attn_tiled.h
+index 88c95ad..fe4112d 100644
+--- a/kernels/attn_tiled.h
++++ b/kernels/attn_tiled.h
+@@ -116,7 +116,7 @@ inline void attn_tiled_body(
+                     && (window == 0u
+                         || ((ulong)t + window >= q_abs && (ulong)t <= q_abs + window));
+             } else {
+-                live[j] = row_live && t < t_end && kv_off + (ulong)t <= q_abs;
++                live[j] = row_live && t < t_end && kv_off + (ulong)t < q_abs;
+             }
+             s_loc[j] = live[j] ? S[r * (uint)BK + c] * scale : -FLT_MAX;
+             mx = max(mx, s_loc[j]);

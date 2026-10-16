@@ -14,8 +14,9 @@
 //!   64x64   TILE_COOP_NARROW  -- NN with N <= 512; bf16 also when M < 128
 //!   128x64  TILE_COOP_DEFAULT -- N > 512, except bf16 with M < 128
 //!   128x64  TILE_COOP_TN_NT   -- bf16 TN / NT descriptors
-//!   tiles_n * tiles_m >= 2048 -- column-panel swizzle (coop NN, 8-row bands)
-//!   N * K >= 2^23             -- column-panel walk (exact f32, 16-row bands)
+//!   tiles_n * tiles_m >= 2048 -- the retired grid gate of the coop NN panel swizzle
+//!                                (the walk is now gated on B, like the next line)
+//!   N * K >= 2^23             -- column-panel walk (exact f32: 16-row bands; coop: 512 rows)
 
 mod common;
 
@@ -667,6 +668,42 @@ fn misaligned_views_name_the_entry_and_the_rule() {
             assert!(
                 err.starts_with(&format!("{entry}: operand {operand} byte_offset")) && err.contains("16-byte"),
                 "{entry}: {err}"
+            );
+        }
+    });
+}
+
+/// The bf16 coop kernels take the column-panel walk when B (N x K) reaches 2^23
+/// elements and the tile grid is not a square power of two (`tile_walk` in
+/// `gemm_coop.h`). `nn_bf16_column_panel_swizzle_covers_a_partial_band` above was
+/// written for the retired grid-size gate (2048 tiles) and no longer reaches the
+/// panel walk: its B is 512 elements. Fault injection found it out: a corrupted
+/// `tile_from_linear_panel` passed it. These shapes engage the walk on both coop
+/// tiles with a final band shorter than the band height (`PANEL_BAND_ROWS / SM`
+/// tile rows: 4 for the 128-row tile, 8 for the 64-row one), where a remap that
+/// does not clamp to the short band drops tiles.
+#[test]
+fn nn_bf16_column_panels_cover_a_partial_band_at_the_b_size_gate() {
+    with_gpu(|rt| {
+        // (M, N, K, tile): M = 200 fills a 128-row tile and the grid has >= 64
+        // tiles, so the wide tile runs with tiles_m = 2 < 4; M = 100 < 128 selects
+        // the narrow tile, with tiles_m = 2 < 8.
+        for &(m, n, k, tile) in &[(200usize, 16_384usize, 512usize, "128x64"), (100, 512, 16_384, "64x64")] {
+            assert!(n * k >= 1 << 23, "panel walk not engaged at N={n} K={k}");
+            let a_host = round_trip_bf16(&random_f32(m * k, 0xb0a1 ^ m as u64));
+            let b_host = round_trip_bf16(&random_f32(k * n, 0xb0a2 ^ n as u64));
+            let expect = reference(Layout::Nn, &a_host, &b_host, m, n, k);
+            let a = tensor_bf16(rt, &[m, k], &a_host);
+            let b = tensor_bf16(rt, &[k, n], &b_host);
+            let c = rt.alloc_tensor_f32(&[m, n]).unwrap();
+            gemm(&a, &b, &c, GemmBackend::TensorOps).unwrap();
+            rt.synchronize().unwrap();
+            assert_within_bound(
+                &format!("bf16 NN panel walk, {tile} tile, {m}x{k}@{k}x{n}"),
+                &c.buffer.read_f32(),
+                &expect,
+                k,
+                0.0,
             );
         }
     });

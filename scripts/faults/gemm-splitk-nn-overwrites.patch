@@ -1,0 +1,13 @@
+diff --git a/kernels/matmul_tensorops.metal b/kernels/matmul_tensorops.metal
+index 3c78a46..ab319c3 100644
+--- a/kernels/matmul_tensorops.metal
++++ b/kernels/matmul_tensorops.metal
+@@ -183,7 +183,7 @@ kernel void matmul2d_tensorops_nn_splitk_f32(
+ {
+     constexpr int SM = 32;
+     constexpr int SN = 32;
+-    constexpr auto mmul_mode = matmul2d_descriptor::mode::multiply_accumulate;
++    constexpr auto mmul_mode = matmul2d_descriptor::mode::multiply;
+     constexpr auto desc =
+         matmul2d_descriptor(SM, SN, dynamic_length_v<int>, false, false, false, mmul_mode);
+     matmul2d<desc, execution_simdgroup> op;

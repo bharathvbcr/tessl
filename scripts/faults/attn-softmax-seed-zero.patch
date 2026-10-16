@@ -1,0 +1,13 @@
+diff --git a/kernels/attn_tiled.h b/kernels/attn_tiled.h
+index 88c95ad..5165ce8 100644
+--- a/kernels/attn_tiled.h
++++ b/kernels/attn_tiled.h
+@@ -84,7 +84,7 @@ inline void attn_tiled_body(
+     // 1 after that), and a masked score's weight is zeroed by its mask, never
+     // by comparing the score against a sentinel.
+     if (tid < (uint)BQ) {
+-        m_row[tid] = -FLT_MAX;
++        m_row[tid] = 0.0f;
+         l_row[tid] = 0.0f;
+     }
+     threadgroup_barrier(mem_flags::mem_threadgroup);

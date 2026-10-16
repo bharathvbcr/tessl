@@ -1,0 +1,13 @@
+diff --git a/kernels/gemm_coop.h b/kernels/gemm_coop.h
+index 4c884c8..f3ca61b 100644
+--- a/kernels/gemm_coop.h
++++ b/kernels/gemm_coop.h
+@@ -300,7 +300,7 @@ inline void coop_tile(thread Op &op, thread VA &tA, thread VB &tB, thread VC &tC
+         }
+     }
+     if (EPILOGUE) {
+-        if (beta != 0.0f) {
++        if (true) {
+             auto prevT = op.template get_destination_cooperative_tensor<TA, TB, float>();
+             prevT.load(tC);
+ #pragma clang loop unroll(full)

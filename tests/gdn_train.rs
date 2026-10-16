@@ -22,7 +22,7 @@ use common::qwen35::{gdn_f64, sigmoid, softplus, GdnProblem, GdnShape};
 use common::{random_f32, with_gpu};
 use tessl::gdn_train::{
     gdn_train_backward, gdn_train_forward, gdn_train_forward_with, GdnTrainDims, GdnTrainGrads, GdnTrainInputs,
-    GdnTrainKernel, GdnTrainWorkspace,
+    GdnTrainKernel, GdnTrainWorkspace, GDN_TRAIN_PRODUCTION,
 };
 
 /// Both kernels, each held to the f64 reference: the token-sequential one is
@@ -1087,7 +1087,17 @@ fn the_chunked_kernels_match_the_sequential_ones_on_grouped_windows() {
                     sentinel(rt, &[b, t, hv]),
                     sentinel(rt, &[b, hv, dk, dv]),
                 );
-                let ws = GdnTrainWorkspace::new_for(rt, dims, kernel).unwrap();
+                // The chunked workspace sized by key heads (the production
+                // constructor for a grouped model); never larger than the dense one.
+                let ws = if kernel == GdnTrainKernel::Chunked && GDN_TRAIN_PRODUCTION == GdnTrainKernel::Chunked {
+                    assert!(
+                        GdnTrainWorkspace::bytes_for_grouped(dims, hk as u32) < GdnTrainWorkspace::bytes_for(dims)
+                            || hk == hv
+                    );
+                    GdnTrainWorkspace::new_grouped(rt, dims, hk as u32).unwrap()
+                } else {
+                    GdnTrainWorkspace::new_for(rt, dims, kernel).unwrap()
+                };
                 gdn_train_backward_windowed(
                     rt,
                     dims,
@@ -1138,6 +1148,36 @@ fn the_chunked_kernels_match_the_sequential_ones_on_grouped_windows() {
                 &run(GdnTrainKernel::Chunked),
                 &oracle,
             );
+            if hk > 1 && GDN_TRAIN_PRODUCTION == GdnTrainKernel::Chunked {
+                // A workspace sized for fewer key heads than the call has is refused.
+                let small = GdnTrainWorkspace::new_grouped(rt, dims, 1).unwrap();
+                let ck = sentinel(rt, &dims.checkpoint_shape());
+                let dconv = sentinel(rt, &[tokens, ld]);
+                let (dg, db, ds0) = (
+                    sentinel(rt, &[b, t, hv]),
+                    sentinel(rt, &[b, t, hv]),
+                    sentinel(rt, &[b, hv, dk, dv]),
+                );
+                let e = gdn_train_backward_windowed(
+                    rt,
+                    dims,
+                    xw,
+                    &ck,
+                    &d_o,
+                    Some(&dfin),
+                    &small,
+                    GdnTrainWindowedGrads {
+                        dq: win!(&dconv, PAD),
+                        dk: win!(&dconv, PAD + qw),
+                        dv: win!(&dconv, PAD + 2 * qw),
+                        dg: &dg,
+                        dbeta: &db,
+                        ds0: Some(&ds0),
+                    },
+                )
+                .expect_err("a workspace for one key head must refuse two");
+                assert!(e.contains("key heads"), "{e}");
+            }
         }
     });
 }

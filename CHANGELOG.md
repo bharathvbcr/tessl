@@ -83,6 +83,24 @@ All notable changes to `tessl` are recorded here. The format follows
   (`EMBEDGEMMA2_MM_ATTN=eager` keeps the old references, which disagree from
   layer 0; text and vision change only by rounding).
   See `docs/embedgemma2.md`.
+- **The audio tower's stages are profiled and the top ones fixed**
+  (`profile_embedgemma2_audio`, `bench_embedgemma2_audio`; `AudioStage` and
+  `EmbedGemma2Audio::{set_stage_mask, clear_stage_mask}` are `#[doc(hidden)]`
+  for the profiler). The second subsampling conv is an 8x8 simdgroup-MMA kernel
+  (64 → 14 ms on a batch of 8 clips of 30 s, stage alone); the residual adds and
+  norms, the GLU with the depthwise conv, norm and SiLU, and the q/k/v input
+  clamps are fused (`eg2a_rms_norm` takes two row stages, `eg2a_lconv` replaces
+  `eg2a_glu` and `eg2a_dwconv1d_causal`); q, k and v are one GEMM when their
+  clamps are equal (they are in all 12 layers of the checkpoint); the attention
+  computes only the visible candidates, one butterfly reduce-scatter for the
+  logits, and reads the fused projection in place: 28 → 17 dispatches a layer,
+  results inside the unchanged bounds, a clip still bit for bit the same alone
+  or batched. `AudioConfig::validate` and the attention now refuse more than 16
+  past frames and a masked-logit value above `-(cap + 104)`. The end-to-end
+  interleaved benchmark was inside the noise of a shared GPU (the control moved
+  as much as the change), so no speedup is claimed; the profile shows the
+  non-GEMM share of the forward falling from 29 % to 17 % on the batch. See
+  `docs/embedgemma2.md` "Speed" and `bench/results/embedgemma2_audio_*`.
 - **Per-entry host reads and writes of the Qwen3.5 parameter table**
   (`Qwen35Model::{read_parameter_host, write_parameter_host,
   read_gradient_host, read_adamw_moment_host, write_adamw_moment_host}`).

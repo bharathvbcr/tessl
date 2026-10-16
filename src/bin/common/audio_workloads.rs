@@ -142,7 +142,7 @@ pub fn check(w: &Workload, soft_tokens: &[Vec<f32>], bound: f64) -> Result<Optio
         }
         if let Some(r) = w.reference.get(i) {
             let e = rel_max_err(s, r)?;
-            if !(e <= bound) {
+            if e.is_nan() || e > bound {
                 return Err(format!(
                     "{}: clip {i}'s soft tokens are {e:.3e} of max from transformers (bound {bound:.0e})",
                     w.name

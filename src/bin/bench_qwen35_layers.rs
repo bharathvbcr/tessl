@@ -1291,6 +1291,14 @@ fn bounded_tokens(n: usize, what: &str) -> Result<usize, String> {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Every exit path, an error included, prints the kernel trace (a no-op
+    // unless `TESSL_KERNEL_TRACE` is set; `bench/kernel_coverage.py` reads it).
+    let outcome = run();
+    common::emit_kernel_trace();
+    outcome
+}
+
+fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut check_only = false;
     let mut paired_attn = false;
     let mut attn_tiles = false;

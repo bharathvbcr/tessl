@@ -16,9 +16,12 @@ is selected; each bench binary prints its trace on exit, on every exit path.
   python3 bench/kernel_coverage.py --check    # gate: see the exit status below
 
 Exit status (the same on every path; documented in docs/benchmarking.md):
-  0   the check ran and every kernel entry point is dispatched
-  1   the check ran and found gaps (undispatched kernels, a census that
-      disagrees with the metallib, a kernel traced that is not in the census)
+  0   the check ran and every kernel entry point is dispatched by a bench or
+      listed in bench/kernel_coverage_allowlist.txt
+  1   the check ran and found gaps (undispatched kernels that are not
+      allowlisted, an allowlist entry that is stale or that a bench dispatches
+      after all, a malformed allowlist, a census that disagrees with the
+      metallib, a kernel traced that is not in the census)
   77  the check could not run: no toolchain (`xcrun metal` / `metal-nm`), no
       binary, a stale binary, no metallib, a suite that failed or printed no
       trace. 77 is the repo's SKIPPED status (scripts/check_kernel_ir.sh) and is
@@ -31,6 +34,12 @@ the entry points are read from the preprocessed text (comments, `#if 0`, and
 disabled `#ifdef` blocks are gone; macro stamping, `##` pasting, and
 `[[host_name]]` / `template` instantiations are resolved). It is not
 reimplemented here, so a toolchain that is missing is "could not run".
+
+Kernels that only a test or a diagnostic reaches are listed, each with a
+reason, in `bench/kernel_coverage_allowlist.txt` (format and classes: see
+`load_allowlist`). The list fails the check when an entry is stale (no longer a
+kernel) or redundant (a bench dispatches it), so it cannot outlive the fact it
+records and cannot hide a kernel that gained a lane.
 
 The census is cross-checked against the metallib the binaries run. The runtime embeds the
 library's bytes (`include_bytes!`), so no binary carries a path to look up;
@@ -53,6 +62,12 @@ KDIR = os.path.join(CRATE, "kernels")
 
 EXIT_GAPS = 1
 EXIT_CANNOT_RUN = 77
+
+ALLOWLIST = os.path.join(HERE, "kernel_coverage_allowlist.txt")
+# What may stand in for a bench lane. Each says why no bench dispatches the
+# kernel; the detail after the colon starts with a repo path that exists (the
+# test, probe, or source file that is the kernel's only caller).
+ALLOW_CLASSES = ("test-only", "probe", "one-shot", "tune-variant")
 
 
 class CannotRun(SystemExit):
@@ -287,6 +302,47 @@ def dump_embedded_metallib(binary, directory):
     return out
 
 
+def load_allowlist(path=ALLOWLIST, crate=None):
+    """`{kernel: reason}` from the committed allowlist.
+
+    One entry per line, `kernel: class: path detail`, `#` starts a comment.
+    `class` is one of ALLOW_CLASSES and the detail's first word is a path under
+    the crate that exists, so a reason names the file that is the kernel's only
+    caller ("test-only" alone is not a reason). A missing file is an empty
+    allowlist; a malformed line or a repeated kernel is an error, never skipped.
+    """
+    crate = crate or CRATE
+    out = {}
+    if not os.path.exists(path):
+        return out
+    with open(path) as fh:
+        for n, raw in enumerate(fh, 1):
+            line = raw.split("#", 1)[0].strip()
+            if not line:
+                continue
+            where = f"{os.path.basename(path)}:{n}"
+            name, sep, rest = (x.strip() for x in line.partition(":"))
+            klass, sep2, detail = (x.strip() for x in rest.partition(":"))
+            if not (sep and sep2 and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name)):
+                raise SystemExit(f"{where}: expected `kernel: class: path detail`, got {line!r}")
+            if klass not in ALLOW_CLASSES:
+                raise SystemExit(f"{where}: {name}: class {klass!r} is not one of {ALLOW_CLASSES}")
+            words = detail.split()
+            if not words or not os.path.exists(os.path.join(crate, words[0])):
+                raise SystemExit(f"{where}: {name}: the reason must start with a path that exists "
+                                 f"under the crate, got {detail!r}")
+            if name in out:
+                raise SystemExit(f"{where}: {name} is listed twice")
+            out[name] = f"{klass}: {detail}"
+    return out
+
+
+def audit_allowlist(allowed, names, traced):
+    """(stale, redundant): allowlisted names that are not kernels, and
+    allowlisted names a bench dispatches. Either one fails `--check`."""
+    return sorted(set(allowed) - names), sorted(set(allowed) & traced)
+
+
 # Benchmarks to run, and the arguments that make them cover their own breadth.
 # Kept small: this is a coverage probe, not a measurement.
 SUITES = [
@@ -338,6 +394,29 @@ SUITES = [
     # which no other suite reaches. One round, so the drift gate cannot fire.
     ("bench_gemm_routes", [], dict(BENCH_REPS="1", BENCH_ITERS="1",
                                    BENCH_WARMUP="0", BENCH_ROUNDS="1")),
+    # Qwen3.5 inference at the 2B's shapes on random weights (no checkpoint):
+    # prefill (the chunked GDN rule, both attention routes), the other GDN
+    # scan slice, per-token decode, the attention tile variants, the paired
+    # attention and recurrent-rule lanes. T = 256 is past the short-prefix
+    # route, so the tiled prefill attention runs.
+    ("bench_qwen35_layers", ["256", "--iters=1"], {}),
+    ("bench_qwen35_layers", ["--gdn-scan32", "256", "--iters=1"], {}),
+    ("bench_qwen35_layers", ["--decode=64", "--iters=1"], {}),
+    ("bench_qwen35_layers", ["--attn-tiles", "256"], {}),
+    ("bench_qwen35_layers", ["--paired-attn", "256"], {}),
+    ("bench_qwen35_layers", ["--paired-gdn-recurrent", "1"], {}),
+    # Qwen3.5 training: the per-op gate (every forward and backward op at the
+    # 2B's shapes, f32 and bf16 operands), whole steps and a clipped optimizer
+    # step on the test fixture's tiny tower (f32 and bf16 storage), a padded
+    # batch with a span row, and every AdamW step kernel.
+    ("bench_qwen35_train", ["64", "--check-only"], {}),
+    ("bench_qwen35_train", ["64", "--check-only", "--bf16"], {}),
+    ("bench_qwen35_train", ["64", "--step=64", "--clip=64", "--batch=2,16,1",
+                            "--random-config={crate}/tests/fixtures/qwen35_train/config.json"], {}),
+    ("bench_qwen35_train", ["64", "--storage=bf16", "--step=64", "--clip=64",
+                            "--random-config={crate}/tests/fixtures/qwen35_train/config.json"], {}),
+    ("bench_qwen35_train", ["64", "--adamw-matrix",
+                            "--random-config={crate}/tests/fixtures/qwen35_train/config.json"], {}),
 ]
 
 
@@ -354,7 +433,8 @@ def run_suites(tmp):
         except CannotRun as exc:
             failures.append(exc.message)
             continue
-        argv = [a.replace("{tmp}", tmp) for a in argv]
+        label = " ".join(a for a in argv if "{tmp}" not in a)
+        argv = [a.replace("{tmp}", tmp).replace("{crate}", CRATE) for a in argv]
         e = dict(os.environ, TESSL_KERNEL_TRACE="1", **env)
         r = subprocess.run([binary] + argv, env=e, capture_output=True, text=True)
         if r.returncode != 0:
@@ -372,7 +452,8 @@ def run_suites(tmp):
                        if k.startswith("TESSL_") or k in ("BENCH_ATTN_ROWS_R",
                                  "BENCH_ATTN_ROWS_SGT", "BENCH_ATTN_DECODE_CHUNK",
                                  "BENCH_ATTN_DECODE_R"))
-        key = f"{name}{' ' + argv[0] if argv else ''}{' ' + tag if tag else ''}"
+        key = f"{name}{' ' + label if label else ''}{' ' + tag if tag else ''}"
+        key = re.sub(r"--random-config=\S*/", "--random-config=", key)
         per_suite[key] = got
         traced |= got
     return traced, per_suite, failures
@@ -393,13 +474,17 @@ def run():
                "toolchain, binary, metallib or trace, a stale binary, or a failed "
                "suite); 2 bad command line.")
     ap.add_argument("--check", action="store_true",
-                    help="exit 1 if any kernel is never dispatched (77 if the check cannot run)")
+                    help="exit 1 if a kernel is neither dispatched by a bench nor allowlisted, or "
+                         "an allowlist entry is stale or redundant (77 if the check cannot run)")
     ap.add_argument(
         "--metallib",
         help="explicit compiled metallib to inventory (default: the library bench_gemm_sweep embeds, via --dump-metallib)",
     )
     ap.add_argument("--out")
+    ap.add_argument("--allowlist", default=ALLOWLIST,
+                    help="kernels no bench dispatches, each with a reason (default: %(default)s)")
     args = ap.parse_args()
+    allowed = load_allowlist(args.allowlist)  # a malformed list stops here, before any suite runs
 
     tmp = tempfile.mkdtemp(prefix="kernel-coverage-")
     try:
@@ -428,27 +513,42 @@ def run():
 
     covered = sorted(traced)
     missing = sorted(names - traced)
+    stale, redundant = audit_allowlist(allowed, names, traced)
+    gaps = [k for k in missing if k not in allowed]
     print(f"kernel entry points : {len(names)}")
     print(f"dispatched by a bench: {len(covered)}  ({100 * len(covered) / len(names):.0f}%)")
-    print(f"never dispatched     : {len(missing)}\n")
+    print(f"allowlisted          : {len(allowed) - len(stale) - len(redundant)}")
+    print(f"remaining            : {len(gaps)}\n")
     for suite, got in per_suite.items():
         print(f"  {suite:<40}{len(got):>4} kernels")
-    if missing:
-        print("\nuncovered, by file:")
+    if gaps:
+        print("\nuncovered and not allowlisted, by file:")
         for f, ks in sorted(by_file.items()):
-            gap = sorted(ks - traced)
+            gap = sorted(ks - traced - set(allowed))
             if gap:
                 print(f"  {f:<24}{len(gap):>3}  {', '.join(gap[:4])}"
                       f"{' ...' if len(gap) > 4 else ''}")
     doc = dict(entry_points=len(names), covered=covered, missing=missing,
+               allowlisted={k: allowed[k] for k in missing if k in allowed},
+               unallowlisted_missing=gaps, stale_allowlist=stale, redundant_allowlist=redundant,
                per_suite={k: sorted(v) for k, v in per_suite.items()})
     if args.out:
         with open(args.out, "w") as f:
             f.write(json.dumps(doc, indent=2))
-    if args.check and missing:
-        raise SystemExit(f"\n{len(missing)} kernel(s) have no timing lane")  # EXIT_GAPS
-    print("\nPASS: every kernel entry point is dispatched by a benchmark"
-          if not missing else "")
+    problems = []
+    if gaps:
+        problems.append(f"{len(gaps)} kernel(s) have no timing lane and are not allowlisted: {gaps}")
+    if stale:
+        problems.append(f"{len(stale)} allowlist entr(ies) are not kernels any more: {stale}")
+    if redundant:
+        problems.append(f"{len(redundant)} allowlisted kernel(s) are dispatched by a bench; "
+                        f"remove them from the allowlist: {redundant}")
+    if args.check and problems:
+        raise SystemExit("\n" + "\n".join(problems))  # EXIT_GAPS
+    if problems:
+        print("\n" + "\n".join(problems))
+    else:
+        print("\nPASS: every kernel entry point is dispatched by a benchmark or allowlisted")
 
 
 if __name__ == "__main__":
